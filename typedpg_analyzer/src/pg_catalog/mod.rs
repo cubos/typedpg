@@ -207,6 +207,8 @@ pub struct PgCatalog {
     /// column type that `cookDefault` adds) — what ALTER COLUMN TYPE
     /// re-coerces (PG keeps the expression in `pg_attrdef`).
     pub(crate) attr_default_types: HashMap<(PgClassOid, i16), PgTypeOid>,
+    /// The `check_function_bodies` GUC (pg_dump output turns it off).
+    pub(crate) check_function_bodies: bool,
     next_oid: std::num::NonZeroU32,
 
     /// Lazy-initialized PG sanity mirror used by the `pg_sanity` feature to
@@ -439,6 +441,7 @@ impl PgCatalog {
             search_path_guc: Default::default(),
             domain_constraints: HashMap::new(),
             attr_default_types: HashMap::new(),
+            check_function_bodies: true,
             next_oid: USER_OID_START_NZ,
             #[cfg(feature = "pg_sanity")]
             pg_sanity: None,

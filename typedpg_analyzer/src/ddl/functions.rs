@@ -219,7 +219,7 @@ pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Res
     }
 
     let oid = PgProcOid::from_nonzero(interp.alloc_oid()?);
-    interp.insert_pg_proc(PgProc {
+    let proc = PgProc {
         oid,
         proname: name,
         pronamespace: nsoid,
@@ -234,7 +234,11 @@ pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Res
         proargmodes,
         proargnames,
         provolatile,
-    });
+    };
+    interp.insert_pg_proc(proc.clone());
+    // fmgr_sql_validator: the body is checked with the function already in
+    // the catalog, so a recursive SQL function resolves.
+    super::function_body::validate_sql_function(interp, stmt, &proc)?;
 
     Ok(())
 }

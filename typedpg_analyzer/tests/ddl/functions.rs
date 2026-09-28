@@ -477,3 +477,62 @@ fn create_function_pct_type_errors() {
         "relation \"nosuchrel\" does not exist",
     );
 }
+
+// ── SQL function bodies (fmgr_sql_validator) ────────────────────────────────
+
+#[test]
+fn sql_function_bodies_are_validated() {
+    for (sql, msg) in [
+        (
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'select a from nosuch';",
+            "relation \"nosuch\" does not exist",
+        ),
+        (
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS $$ select 'a'::text $$;",
+            "return type mismatch in function declared to return integer",
+        ),
+        (
+            "CREATE FUNCTION f(x int) RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT nosuchcol; END;",
+            "column \"nosuchcol\" does not exist",
+        ),
+        (
+            "CREATE FUNCTION f5() RETURNS int LANGUAGE sql AS 'select 1, 2';",
+            "return type mismatch in function declared to return integer",
+        ),
+        (
+            "CREATE TABLE t (a int, b int);
+             CREATE FUNCTION f7(x int) RETURNS int LANGUAGE sql AS 'insert into t values (x)';",
+            "return type mismatch in function declared to return integer",
+        ),
+        (
+            "CREATE TABLE t (a int, b int);
+             CREATE FUNCTION f11() RETURNS int LANGUAGE sql AS 'select 1 from t where nosuchcol = 1';",
+            "column \"nosuchcol\" does not exist",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", sql)]).expect_err(sql);
+        assert!(err.to_string().starts_with(msg), "{sql}\n  got: {err}");
+    }
+}
+
+#[test]
+fn valid_sql_function_bodies_are_accepted() {
+    // PG 18 accepts all of these: parameters by name and number, an
+    // assignment-castable result, DML, recursion, and bodies left unchecked
+    // under check_function_bodies = false.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int, b int);
+         CREATE FUNCTION f2(x int) RETURNS int LANGUAGE sql RETURN x + 1;
+         CREATE FUNCTION f3(x int, y text) RETURNS text LANGUAGE sql AS 'select y || $1::text';
+         CREATE FUNCTION f4() RETURNS int LANGUAGE sql AS 'select 1::bigint';
+         CREATE FUNCTION f6(x int) RETURNS void LANGUAGE sql AS 'insert into t values (x)';
+         CREATE FUNCTION f8(a int) RETURNS int LANGUAGE sql AS 'select a from t';
+         CREATE FUNCTION f9(n int) RETURNS int LANGUAGE sql
+             AS 'select case when n <= 0 then 0 else f9(n - 1) end';
+         SET check_function_bodies = false;
+         CREATE FUNCTION f10() RETURNS int LANGUAGE sql AS 'select a from nosuch';
+         RESET check_function_bodies;",
+    )]);
+    assert_cols(&db.analyze("SELECT f2(1)").unwrap(), vec![cn("f2", int4())]);
+}

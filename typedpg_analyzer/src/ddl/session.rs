@@ -111,6 +111,24 @@ pub(crate) fn variable_set(interp: &mut PgCatalog, stmt: &VariableSetStmt) -> Re
     let kind = VariableSetKind::try_from(stmt.kind).unwrap_or(VariableSetKind::Undefined);
     if kind == VariableSetKind::VarResetAll {
         interp.set_search_path(None, false);
+        interp.check_function_bodies = true;
+        return Ok(());
+    }
+    if stmt.name.eq_ignore_ascii_case("check_function_bodies") {
+        interp.check_function_bodies = match kind {
+            VariableSetKind::VarSetValue => stmt.args.first().is_none_or(|arg| {
+                !matches!(arg.node.as_ref(), Some(node::Node::AConst(c)) if match c.val.as_ref() {
+                    Some(a_const::Val::Sval(s)) => matches!(
+                        s.sval.to_ascii_lowercase().as_str(),
+                        "off" | "false" | "no" | "0" | "f" | "n"
+                    ),
+                    Some(a_const::Val::Ival(i)) => i.ival == 0,
+                    Some(a_const::Val::Boolval(b)) => !b.boolval,
+                    _ => false,
+                })
+            }),
+            _ => true,
+        };
         return Ok(());
     }
     if !stmt.name.eq_ignore_ascii_case("search_path") {

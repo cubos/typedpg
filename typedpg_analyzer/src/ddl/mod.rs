@@ -10,6 +10,7 @@ pub mod collations;
 mod defaults;
 pub mod drop;
 pub mod extensions;
+mod function_body;
 pub mod functions;
 pub mod indexes;
 pub mod operators;
