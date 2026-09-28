@@ -415,3 +415,8 @@ pub(crate) fn resolve_index_opclass(
     }
     Ok(())
 }
+
+/// Whether `typ` has a default btree operator class (CreateStatistics).
+pub(crate) fn has_default_btree_opclass(interp: &PgCatalog, typ: PgTypeOid) -> bool {
+    matches!(default_opclass(interp, typ, "btree"), Ok(Some(_)))
+}

@@ -25,6 +25,7 @@ mod rules;
 pub mod schema_stmt;
 pub mod sequences;
 pub(crate) mod session;
+pub(crate) mod statistics;
 pub mod tables;
 pub(crate) mod triggers;
 mod txblock;
@@ -216,6 +217,8 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         node::Node::AlterPolicyStmt(s) => policies::alter_policy(db, s),
         node::Node::RuleStmt(s) => rules::create_rule(db, s),
         node::Node::CreateAmStmt(s) => opclass::create_am(db, s),
+        node::Node::CreateStatsStmt(s) => statistics::create_statistics(db, s),
+        node::Node::AlterStatsStmt(s) => statistics::alter_statistics(db, s),
         node::Node::CreateOpClassStmt(s) => opclass::create_opclass(db, s),
         node::Node::CreateOpFamilyStmt(s) => opclass::create_opfamily(db, s),
         node::Node::TruncateStmt(s) => maintenance::truncate(db, s),
@@ -256,8 +259,6 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         | node::Node::ClosePortalStmt(_)
         | node::Node::CheckPointStmt(_)
         | node::Node::LoadStmt(_)
-        | node::Node::CreateStatsStmt(_)
-        | node::Node::AlterStatsStmt(_)
         | node::Node::AlterDatabaseStmt(_)
         | node::Node::AlterDatabaseSetStmt(_)
         | node::Node::AlterDatabaseRefreshCollStmt(_)

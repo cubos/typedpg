@@ -236,6 +236,16 @@ pub(crate) fn resolve_object(
                 _ => {}
             }
         }
+        ObjectType::ObjectStatisticExt => {
+            if let node::Node::List(l) = object
+                && !super::statistics::statistics_exist(interp, &l.items)
+            {
+                return Err(DdlError::TypeNotFound(format!(
+                    "statistics object \"{}\" does not exist",
+                    names(object).join(".")
+                )));
+            }
+        }
         ObjectType::ObjectCollation => {
             let parts = names(object);
             let (schema, name) = match parts.as_slice() {

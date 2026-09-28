@@ -688,6 +688,7 @@ pub(crate) fn drop_column(
     }
 
     interp.attr_default_types.remove(&(relid, target.attnum));
+    crate::ddl::statistics::drop_column_statistics(interp, relid, target.attnum);
     crate::ddl::defaults::forget_default_dependencies(interp, relid, target.attnum);
     if let Some(attrs) = interp.pg_attribute.get_mut(&relid) {
         attrs.retain(|a| a.attname != cmd.name);

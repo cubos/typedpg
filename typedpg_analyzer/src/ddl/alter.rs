@@ -39,6 +39,7 @@ pub fn rename(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlError>
         ObjectType::ObjectTrigger => crate::ddl::triggers::rename_trigger(interp, stmt),
         ObjectType::ObjectPolicy => crate::ddl::policies::rename_policy(interp, stmt),
         ObjectType::ObjectRule => crate::ddl::rules::rename_rule(interp, stmt),
+        ObjectType::ObjectStatisticExt => crate::ddl::statistics::rename_statistics(interp, stmt),
         _ => Ok(()),
     }
 }

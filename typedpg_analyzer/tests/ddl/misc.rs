@@ -2211,3 +2211,120 @@ fn access_methods_and_operator_classes() {
         ),
     ]);
 }
+
+#[test]
+fn extended_statistics_are_validated_and_tracked() {
+    // PG 18 CreateStatistics / AlterStatistics / get_statistics_object_oid.
+    let setup = "CREATE TABLE t (a int, b int, c int, j json);
+                 CREATE VIEW v AS SELECT 1 AS a, 2 AS b;
+                 CREATE TABLE u (x int, y int);
+                 CREATE SCHEMA s2;
+                 CREATE STATISTICS st ON a, b FROM t;
+                 CREATE STATISTICS ON a, b FROM t;";
+    for (stmt, msg) in [
+        (
+            "CREATE STATISTICS s1 ON a, b FROM v;",
+            "cannot define statistics for relation \"v\"",
+        ),
+        (
+            "CREATE STATISTICS s2 ON a, b FROM t, u;",
+            "only a single relation is allowed in CREATE STATISTICS",
+        ),
+        (
+            "CREATE STATISTICS s0 ON a, b FROM nosuch;",
+            "relation \"nosuch\" does not exist",
+        ),
+        (
+            "CREATE STATISTICS s3 ON a, a FROM t;",
+            "duplicate column name in statistics definition",
+        ),
+        (
+            "CREATE STATISTICS s3 ON (a + 1), (a + 1) FROM t;",
+            "duplicate expression in statistics definition",
+        ),
+        (
+            "CREATE STATISTICS s4 ON a, ctid FROM t;",
+            "statistics creation on system columns is not supported",
+        ),
+        (
+            "CREATE STATISTICS s5 ON a, j FROM t;",
+            "column \"j\" cannot be used in statistics because its type json has no default btree \
+             operator class",
+        ),
+        (
+            "CREATE STATISTICS s6 (nosuch) ON a, b FROM t;",
+            "unrecognized statistics kind \"nosuch\"",
+        ),
+        (
+            "CREATE STATISTICS s8 (ndistinct) ON (a + 1) FROM t;",
+            "when building statistics on a single expression, statistics kinds may not be specified",
+        ),
+        (
+            "CREATE STATISTICS s9 ON a FROM t;",
+            "extended statistics require at least 2 columns",
+        ),
+        (
+            "CREATE STATISTICS s9 ON a, nosuch FROM t;",
+            "column \"nosuch\" does not exist",
+        ),
+        (
+            "CREATE STATISTICS st ON a, c FROM t;",
+            "statistics object \"st\" already exists",
+        ),
+        (
+            "CREATE STATISTICS t_a_b_stat ON a, c FROM t;",
+            "statistics object \"t_a_b_stat\" already exists",
+        ),
+        (
+            "DROP STATISTICS nosuch;",
+            "statistics object \"nosuch\" does not exist",
+        ),
+        (
+            "ALTER STATISTICS nosuch SET STATISTICS 5;",
+            "statistics object \"nosuch\" does not exist",
+        ),
+        (
+            "ALTER STATISTICS st RENAME TO t_a_b_stat;",
+            "statistics object \"t_a_b_stat\" already exists in schema \"public\"",
+        ),
+        (
+            "COMMENT ON STATISTICS nosuch IS 'x';",
+            "statistics object \"nosuch\" does not exist",
+        ),
+        (
+            "ALTER STATISTICS nosuch OWNER TO postgres;",
+            "statistics object \"nosuch\" does not exist",
+        ),
+        (
+            "ALTER TABLE t DROP COLUMN b; DROP STATISTICS st;",
+            "statistics object \"st\" does not exist",
+        ),
+        (
+            "DROP TABLE t; DROP STATISTICS st;",
+            "statistics object \"st\" does not exist",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "CREATE STATISTICS ON a, b FROM t;
+             DROP STATISTICS t_a_b_stat1;
+             CREATE STATISTICS s2.st ON a, b FROM t;
+             CREATE STATISTICS IF NOT EXISTS st ON a, b FROM t;
+             CREATE STATISTICS s7 ON (a + 1) FROM t;
+             CREATE STATISTICS ON (a + 1), (b + 1) FROM t;
+             CREATE STATISTICS (ndistinct, mcv) ON a, (b + 1) FROM t;
+             ALTER STATISTICS st SET STATISTICS 5;
+             ALTER STATISTICS IF EXISTS nosuch SET STATISTICS 5;
+             ALTER STATISTICS st RENAME TO st2;
+             COMMENT ON STATISTICS st2 IS 'x';
+             ALTER TABLE t DROP COLUMN c;
+             DROP STATISTICS st2, t_a_b_stat, t_expr_expr_stat, t_a_expr_stat, s7, s2.st;
+             DROP STATISTICS IF EXISTS nosuch;",
+        ),
+    ]);
+}

@@ -63,6 +63,9 @@ pub fn drop_objects(interp: &mut PgCatalog, stmt: &DropStmt) -> Result<(), DdlEr
             | ObjectType::ObjectOpfamily => {
                 super::opclass::drop_am_object(interp, obj_type, obj_node, stmt.missing_ok)?;
             }
+            ObjectType::ObjectStatisticExt => {
+                super::statistics::drop_statistics(interp, obj_node, stmt.missing_ok)?;
+            }
             ObjectType::ObjectRule => {
                 super::rules::drop_rule(interp, obj_node, stmt.missing_ok)?;
             }
