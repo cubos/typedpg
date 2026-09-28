@@ -918,3 +918,142 @@ fn check_constraints_are_inherited() {
         "got: {err}"
     );
 }
+
+#[test]
+fn typed_tables_follow_their_type() {
+    // PG 18 check_of_type / ATExecAddOf / ATExecDropOf /
+    // ATTypedTableRecursion / find_typed_table_dependencies.
+    let setup = "CREATE TYPE ct AS (a int, b text);
+                 CREATE TABLE t9 OF ct;
+                 CREATE TABLE p (a int);
+                 CREATE TABLE t1 (a int, b text);
+                 CREATE TABLE t2 (b text, a int);
+                 CREATE TABLE t3 (a bigint, b text);
+                 CREATE TABLE t4 (a int);
+                 CREATE TABLE t5 (a int, b text, c int);
+                 CREATE TABLE t6 (a int, b text COLLATE \"C\");
+                 CREATE TABLE t7 (a int, b text) INHERITS (p);";
+    for (stmt, msg) in [
+        (
+            "ALTER TABLE t9 DROP COLUMN a;",
+            "cannot drop column from typed table",
+        ),
+        (
+            "ALTER TABLE t9 ADD COLUMN z int;",
+            "cannot add column to typed table",
+        ),
+        (
+            "ALTER TABLE t9 ALTER COLUMN a TYPE bigint;",
+            "cannot alter column type of typed table",
+        ),
+        (
+            "ALTER TABLE t9 RENAME COLUMN a TO z;",
+            "cannot rename column of typed table",
+        ),
+        (
+            "ALTER TYPE ct ADD ATTRIBUTE c int;",
+            "cannot alter type \"ct\" because it is the type of a typed table",
+        ),
+        (
+            "ALTER TYPE ct DROP ATTRIBUTE b;",
+            "cannot alter type \"ct\" because it is the type of a typed table",
+        ),
+        (
+            "ALTER TYPE ct RENAME ATTRIBUTE a TO z;",
+            "cannot alter type \"ct\" because it is the type of a typed table",
+        ),
+        (
+            "DROP TYPE ct;",
+            "cannot drop type ct because other objects depend on it",
+        ),
+        (
+            "CREATE TABLE x OF p;",
+            "type p is the row type of another table",
+        ),
+        (
+            "ALTER TABLE t1 OF int4;",
+            "type integer is not a composite type",
+        ),
+        (
+            "ALTER TABLE t1 OF p;",
+            "type p is the row type of another table",
+        ),
+        (
+            "ALTER TABLE t2 OF ct;",
+            "table has column \"b\" where type requires \"a\"",
+        ),
+        (
+            "ALTER TABLE t3 OF ct;",
+            "table \"t3\" has different type for column \"a\"",
+        ),
+        ("ALTER TABLE t4 OF ct;", "table is missing column \"b\""),
+        ("ALTER TABLE t5 OF ct;", "table has extra column \"c\""),
+        (
+            "ALTER TABLE t6 OF ct;",
+            "table \"t6\" has different type for column \"b\"",
+        ),
+        ("ALTER TABLE t7 OF ct;", "typed tables cannot inherit"),
+        ("ALTER TABLE t1 NOT OF;", "\"t1\" is not a typed table"),
+        (
+            "ALTER TABLE t1 OF ct; ALTER TABLE t1 ADD COLUMN z int;",
+            "cannot add column to typed table",
+        ),
+        (
+            "ALTER TYPE ct ADD ATTRIBUTE c int CASCADE; ALTER TABLE t9 ADD COLUMN c int;",
+            "cannot add column to typed table",
+        ),
+        (
+            "ALTER TYPE ct RENAME ATTRIBUTE a TO z CASCADE; ALTER TABLE t9 DROP COLUMN a;",
+            "cannot drop column from typed table",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    let db = build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "ALTER TABLE t1 OF ct;
+             ALTER TABLE t1 NOT OF;
+             ALTER TABLE t1 ADD COLUMN extra int;
+             ALTER TYPE ct ADD ATTRIBUTE c int CASCADE;
+             ALTER TYPE ct RENAME ATTRIBUTE a TO z CASCADE;
+             ALTER TYPE ct DROP ATTRIBUTE b CASCADE;
+             ALTER TYPE ct ALTER ATTRIBUTE c TYPE bigint CASCADE;
+             CREATE TABLE t10 OF ct;
+             DROP TYPE ct CASCADE;",
+        ),
+    ]);
+    let seed = db.to_seed();
+    assert!(
+        seed.pg_class
+            .iter()
+            .all(|c| c.relname != "t9" && c.relname != "t10")
+    );
+    // The CASCADE changes reached the typed table before it was dropped.
+    let db = build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "ALTER TYPE ct ADD ATTRIBUTE c int CASCADE;
+             ALTER TYPE ct RENAME ATTRIBUTE a TO z CASCADE;
+             ALTER TYPE ct DROP ATTRIBUTE b CASCADE;
+             ALTER TYPE ct ALTER ATTRIBUTE c TYPE bigint CASCADE;",
+        ),
+    ]);
+    let seed = db.to_seed();
+    let t9 = seed
+        .pg_class
+        .iter()
+        .find(|c| c.relname == "t9")
+        .unwrap()
+        .oid;
+    let cols: Vec<(String, u32)> = seed
+        .pg_attribute
+        .iter()
+        .filter(|a| a.attrelid == t9)
+        .map(|a| (a.attname.clone(), a.atttypid.get()))
+        .collect();
+    assert_eq!(cols, vec![("z".to_owned(), 23), ("c".to_owned(), 20)]);
+}

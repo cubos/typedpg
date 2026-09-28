@@ -153,25 +153,7 @@ fn of_type_columns(
     entries: &mut Vec<Entry>,
 ) -> Result<(), DdlError> {
     let type_oid = lookup_type_name(tn, interp)?;
-    // `check_of_type`: only a standalone composite type qualifies, not the
-    // row type of a table or view.
-    let relid = interp
-        .pg_type
-        .get(&type_oid)
-        .filter(|t| t.typtype == TypType::Composite)
-        .and_then(|t| t.typrelid)
-        .filter(|relid| {
-            interp
-                .pg_class
-                .get(relid)
-                .is_some_and(|c| c.relkind == RelKind::CompositeType)
-        });
-    let Some(relid) = relid else {
-        return Err(DdlError::Parse(format!(
-            "type {} is not a composite type",
-            format_type_for_message(interp, type_oid)
-        )));
-    };
+    let relid = super::typed::check_of_type(interp, type_oid)?;
     for attr in interp.attributes_of(relid) {
         entries.push(Entry {
             col: ParsedColumn {

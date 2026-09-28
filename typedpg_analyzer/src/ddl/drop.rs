@@ -468,6 +468,22 @@ fn drop_type(
         })
         .collect();
 
+    // Typed tables (`reloftype`) depend on their type.
+    let typed_tables = crate::ddl::tables::typed::typed_tables_of(interp, type_oid);
+    if let Some(&table) = typed_tables.first()
+        && !cascade
+    {
+        return Err(DdlError::DependencyError(format!(
+            "cannot drop type {name} because other objects depend on it (table {} depends \
+             on type {name})",
+            interp
+                .pg_class
+                .get(&table)
+                .map(|c| c.relname.as_str())
+                .unwrap_or("?")
+        )));
+    }
+
     if !dependent_relations.is_empty() && !cascade {
         let dep_names: Vec<String> = dependent_relations
             .iter()
@@ -514,6 +530,9 @@ fn drop_type(
     }
 
     if cascade {
+        for &table in &typed_tables {
+            drop_relation_by_oid(interp, table);
+        }
         for relid in &dependent_relations {
             if let Some(attrs) = interp.pg_attribute.get_mut(relid) {
                 attrs.retain(|a| {

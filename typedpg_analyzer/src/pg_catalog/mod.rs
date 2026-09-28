@@ -228,6 +228,8 @@ pub struct PgCatalog {
     pub(crate) triggers: HashMap<PgClassOid, Vec<crate::ddl::triggers::Trigger>>,
     /// `pg_policy`: each relation's row-security policy names.
     pub(crate) policies: HashMap<PgClassOid, Vec<String>>,
+    /// `pg_class.reloftype` of typed tables (`CREATE TABLE ... OF type`).
+    pub(crate) typed_tables: HashMap<PgClassOid, PgTypeOid>,
     /// CHECK constraints' expressions and `connoinherit`.
     pub(crate) check_defs: HashMap<PgConstraintOid, crate::ddl::tables::check_inherit::CheckDef>,
     /// `pg_type.typsubscript` of user base types, as the handler function's
@@ -476,6 +478,7 @@ impl PgCatalog {
             partition_keys: HashMap::new(),
             triggers: HashMap::new(),
             policies: HashMap::new(),
+            typed_tables: HashMap::new(),
             check_defs: HashMap::new(),
             type_subscript: HashMap::new(),
             next_oid: USER_OID_START_NZ,
@@ -1086,6 +1089,7 @@ impl PgCatalog {
         self.partition_keys.remove(&oid);
         self.triggers.remove(&oid);
         self.policies.remove(&oid);
+        self.typed_tables.remove(&oid);
         let row = self.pg_class.remove(&oid)?;
         self.class_by_qname
             .remove(&(row.relnamespace, row.relname.clone()));

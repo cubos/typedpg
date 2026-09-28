@@ -192,7 +192,19 @@ fn rename_column(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlErr
         ));
     };
 
-    rename_column_in(interp, relid, &stmt.subname, &stmt.newname, rv.inh, false)
+    // renameatt_check / find_typed_table_dependencies.
+    if interp.typed_tables.contains_key(&relid) {
+        return Err(DdlError::Parse(
+            "cannot rename column of typed table".into(),
+        ));
+    }
+    let cascade = stmt.behavior == pg_query::protobuf::DropBehavior::DropCascade as i32;
+    let typed = crate::ddl::tables::typed::typed_table_dependents(interp, relid, cascade)?;
+    rename_column_in(interp, relid, &stmt.subname, &stmt.newname, rv.inh, false)?;
+    for table in typed {
+        rename_column_in(interp, table, &stmt.subname, &stmt.newname, true, true)?;
+    }
+    Ok(())
 }
 
 /// `renameatt_internal` (tablecmds.c): the column must exist and the new

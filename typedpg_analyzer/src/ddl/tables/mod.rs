@@ -251,6 +251,10 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
         },
         reltype: Some(composite_oid),
     });
+    if let Some(tn) = stmt.of_typename.as_ref() {
+        let of_type = lookup_type_name(tn, interp)?;
+        typed::set_of_type(interp, class_oid, of_type);
+    }
     for (i, col) in columns.iter().enumerate() {
         interp.insert_pg_attribute(PgAttribute {
             attrelid: class_oid,
@@ -520,7 +524,39 @@ fn apply_alter_cmd(
 ) -> Result<(), DdlError> {
     let subtype = AlterTableType::try_from(cmd.subtype).unwrap_or(AlterTableType::Undefined);
     check_alter_target(interp, relid, subtype)?;
+    let mut typed_dependents = Vec::new();
+    if !rec.recursing {
+        typed::check_typed_table_cmd(interp, relid, subtype)?;
+        // ATTypedTableRecursion: ALTER TYPE of a composite reaches its
+        // typed tables only with CASCADE.
+        if matches!(
+            subtype,
+            AlterTableType::AtAddColumn
+                | AlterTableType::AtDropColumn
+                | AlterTableType::AtAlterColumnType
+        ) {
+            let cascade = cmd.behavior == DropBehavior::DropCascade as i32;
+            typed_dependents = typed::typed_table_dependents(interp, relid, cascade)?;
+        }
+    }
+    apply_alter_subtype(interp, relid, cmd, rec, subtype)?;
+    for table in typed_dependents {
+        let rec = inherit::Recursion {
+            recurse: true,
+            recursing: true,
+        };
+        apply_alter_subtype(interp, table, cmd, rec, subtype)?;
+    }
+    Ok(())
+}
 
+fn apply_alter_subtype(
+    interp: &mut PgCatalog,
+    relid: PgClassOid,
+    cmd: &AlterTableCmd,
+    rec: inherit::Recursion,
+    subtype: AlterTableType,
+) -> Result<(), DdlError> {
     match subtype {
         AlterTableType::AtAddColumn | AlterTableType::AtAddColumnToView => {
             add_column(interp, relid, cmd, rec)
@@ -545,6 +581,8 @@ fn apply_alter_cmd(
             column_options::alter_column_setting(interp, relid, cmd, subtype)
         }
         AlterTableType::AtClusterOn => object_refs::cluster_on(interp, relid, cmd),
+        AlterTableType::AtAddOf => typed::add_of(interp, relid, cmd),
+        AlterTableType::AtDropOf => typed::drop_of(interp, relid),
         AlterTableType::AtReplicaIdentity => object_refs::replica_identity(interp, relid, cmd),
         AlterTableType::AtAlterConstraint => object_refs::alter_constraint(interp, relid, cmd),
         AlterTableType::AtValidateConstraint => {
@@ -623,6 +661,8 @@ fn check_alter_target(
             "ALTER COLUMN ... SET COMPRESSION",
         ),
         At::AtAddConstraint => (table_like, "ADD CONSTRAINT"),
+        At::AtAddOf => (class.relkind == RelKind::Table, "OF"),
+        At::AtDropOf => (class.relkind == RelKind::Table, "NOT OF"),
         At::AtDropConstraint => (table_like, "DROP CONSTRAINT"),
         _ => (true, ""),
     };
@@ -651,6 +691,7 @@ mod constraints;
 pub(crate) mod inherit;
 mod merge;
 mod object_refs;
+pub(crate) mod typed;
 
 use columns::*;
 pub(crate) use columns::{column_collation, type_collation};
