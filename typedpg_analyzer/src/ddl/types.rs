@@ -746,11 +746,20 @@ pub fn define_type(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), DdlE
         // Full definition after shell type — just confirm it exists.
         return Ok(());
     }
+    create_base_type(interp, nsoid, &name)?;
+    Ok(())
+}
 
+/// Register a user-defined base type (shell or full) with its array type.
+pub(crate) fn create_base_type(
+    interp: &mut PgCatalog,
+    nsoid: PgNamespaceOid,
+    name: &str,
+) -> Result<PgTypeOid, DdlError> {
     let oid = PgTypeOid::from_nonzero(interp.alloc_oid()?);
     interp.insert_pg_type(PgType {
         oid,
-        typname: name.clone(),
+        typname: name.to_owned(),
         typnamespace: nsoid,
         typtype: TypType::Base,
         typcategory: TypCategory::UserDefined,
@@ -763,8 +772,8 @@ pub fn define_type(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), DdlE
         typtypmod: None,
         typcollation: None,
     });
-    register_array_type(interp, nsoid, &name, oid)?;
-    Ok(())
+    register_array_type(interp, nsoid, name, oid)?;
+    Ok(oid)
 }
 
 // ─── CREATE CAST ────────────────────────────────────────────────────────────

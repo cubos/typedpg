@@ -303,7 +303,8 @@ fn apply_with_schema(
             // EXTENSION` already went there once and PGlite handles its
             // own internal scripts. Our embedded scripts also use
             // `MODULE_PATHNAME` placeholders that PGlite would reject.
-            result = super::apply_sql_to(interp, sql);
+            let sql = substitute_extschema(interp, schema, sql);
+            result = super::apply_sql_to(interp, &sql);
             if result.is_err() {
                 break;
             }
@@ -312,6 +313,46 @@ fn apply_with_schema(
 
     interp.restore_search_path(original);
     result
+}
+
+/// `execute_extension_script` (extension.c) replaces `@extschema@` with the
+/// extension's schema and `@extschema:name@` with the schema of the required
+/// extension `name`, both as quoted identifiers.
+fn substitute_extschema(interp: &PgCatalog, schema: &str, sql: &str) -> String {
+    // `quote_identifier`: bare when a plain lowercase identifier.
+    let quote = |s: &str| {
+        let plain = s
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+            && s.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '$');
+        if plain {
+            s.to_owned()
+        } else {
+            format!("\"{}\"", s.replace('"', "\"\""))
+        }
+    };
+    let mut out = sql.replace("@extschema@", &quote(schema));
+    while let Some(start) = out.find("@extschema:") {
+        let rest = &out[start + "@extschema:".len()..];
+        let Some(end) = rest.find('@') else {
+            break;
+        };
+        let ext = &rest[..end];
+        let ext_schema = interp
+            .extension_by_name
+            .get(ext)
+            .and_then(|oid| interp.pg_extension.get(oid))
+            .and_then(|e| interp.namespace_name(e.extnamespace))
+            .unwrap_or(schema)
+            .to_owned();
+        out.replace_range(
+            start..start + "@extschema:".len() + end + 1,
+            &quote(&ext_schema),
+        );
+    }
+    out
 }
 
 /// Extract a string option from CREATE/ALTER EXTENSION options.

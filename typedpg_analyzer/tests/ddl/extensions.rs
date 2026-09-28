@@ -318,3 +318,33 @@ fn param_only_in_order_by_is_inferred() {
         }
     );
 }
+
+#[test]
+fn create_extension_hstore_ltree_cube_isn() {
+    // PG 18 installs all of these; their scripts use ALTER TYPE ... SET
+    // (subscript / receive / ...) and many same-named I/O functions.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE EXTENSION hstore;
+         CREATE EXTENSION ltree;
+         CREATE EXTENSION cube;
+         CREATE EXTENSION earthdistance;
+         CREATE EXTENSION isn;
+         CREATE TABLE t (h hstore, l ltree, c cube, e ean13);",
+    )]);
+    let info = db.analyze("SELECT h, l, c, e FROM t").unwrap();
+    let names: Vec<String> = info
+        .columns
+        .iter()
+        .map(|c| c.pg_type.cast_name().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            "public.hstore",
+            "public.ltree",
+            "public.cube",
+            "public.ean13"
+        ]
+    );
+}

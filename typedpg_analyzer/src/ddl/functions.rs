@@ -85,7 +85,24 @@ pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Res
     // Resolve return type. PG synthesizes one when there's no explicit
     // RETURNS but OUT/INOUT params are present.
     let explicit_return_oid = match stmt.return_type.as_ref() {
-        Some(tn) => Some(lookup_type_name(tn, interp)?),
+        Some(tn) => Some(match lookup_type_name(tn, interp) {
+            Ok(oid) => oid,
+            // compute_return_type (functioncmds.c): a C / internal function
+            // may return a not-yet-defined type — PG creates it as a shell
+            // (`NOTICE: type "x" is not yet defined`), which is how
+            // extension scripts declare a type's I/O functions before the
+            // type itself.
+            Err(DdlError::TypeNotFound(msg))
+                if msg.starts_with("type \"")
+                    && tn.array_bounds.is_empty()
+                    && !tn.pct_type
+                    && matches!(function_language(stmt).as_deref(), Some("c" | "internal")) =>
+            {
+                let (nsoid, name) = super::util::ensure_qualified_name(interp, &tn.names)?;
+                super::types::create_base_type(interp, nsoid, &name)?
+            }
+            Err(e) => return Err(e),
+        }),
         None => None,
     };
     let out_count = proargmodes
@@ -220,4 +237,20 @@ pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Res
     });
 
     Ok(())
+}
+
+/// The `LANGUAGE` of a CREATE FUNCTION, lowercased.
+fn function_language(stmt: &CreateFunctionStmt) -> Option<String> {
+    stmt.options.iter().find_map(|n| {
+        let node::Node::DefElem(de) = n.node.as_ref()? else {
+            return None;
+        };
+        if de.defname != "language" {
+            return None;
+        }
+        let node::Node::String(s) = de.arg.as_deref()?.node.as_ref()? else {
+            return None;
+        };
+        Some(s.sval.to_ascii_lowercase())
+    })
 }
