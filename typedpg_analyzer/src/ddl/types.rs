@@ -8,7 +8,7 @@ use pg_query::protobuf::{
 use crate::oid::{PgCastOid, PgClassOid, PgEnumOid, PgNamespaceOid, PgTypeOid};
 use crate::pg_catalog::{
     CastContext, CastMethod, PgAttribute, PgCast, PgClass, PgEnum, PgRange, PgType, RelKind,
-    TypCategory, TypType,
+    TypCategory, TypStorage, TypType,
 };
 
 use super::DdlError;
@@ -93,6 +93,11 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
             .get(&base_type_oid)
             .and_then(|t| t.typcollation)
     };
+    // DefineDomain: a domain stores its values like its base type.
+    let domain_storage = interp
+        .pg_type
+        .get(&base_type_oid)
+        .map_or(TypStorage::Plain, |t| t.typstorage);
 
     let oid = PgTypeOid::from_nonzero(interp.alloc_oid()?);
     interp.insert_pg_type(PgType {
@@ -109,6 +114,7 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
         typnotnull,
         typtypmod,
         typcollation: domain_collation,
+        typstorage: domain_storage,
     });
 
     register_array_type(interp, nsoid, &name, oid)?;
@@ -389,6 +395,7 @@ pub fn create_enum(interp: &mut PgCatalog, stmt: &CreateEnumStmt) -> Result<(), 
         typnotnull: false,
         typtypmod: None,
         typcollation: None,
+        typstorage: TypStorage::Plain,
     });
     for (i, label) in labels.into_iter().enumerate() {
         let enum_oid = PgEnumOid::from_nonzero(interp.alloc_oid()?);
@@ -493,6 +500,7 @@ pub fn create_composite(interp: &mut PgCatalog, stmt: &CompositeTypeStmt) -> Res
         typnotnull: false,
         typtypmod: None,
         typcollation: None,
+        typstorage: TypStorage::Extended,
     });
 
     register_array_type(interp, nsoid, &name, type_oid)?;
@@ -580,6 +588,7 @@ pub fn create_range(interp: &mut PgCatalog, stmt: &CreateRangeStmt) -> Result<()
         typnotnull: false,
         typtypmod: None,
         typcollation: None,
+        typstorage: TypStorage::Extended,
     });
     let range_array = register_array_type(interp, nsoid, &name, oid)?;
 
@@ -598,6 +607,7 @@ pub fn create_range(interp: &mut PgCatalog, stmt: &CreateRangeStmt) -> Result<()
         typnotnull: false,
         typtypmod: None,
         typcollation: None,
+        typstorage: TypStorage::Extended,
     });
     register_array_type(interp, mr_nsoid, &mr_name, mr_oid)?;
     interp.insert_pg_range(PgRange {
@@ -815,6 +825,26 @@ fn record_type_options(
         let Some(node::Node::DefElem(de)) = opt.node.as_ref() else {
             continue;
         };
+        if de.defname.eq_ignore_ascii_case("storage") {
+            // DefineType: `STORAGE = plain | external | extended | main`.
+            let storage = match de.arg.as_deref().and_then(|a| a.node.as_ref()) {
+                Some(node::Node::TypeName(tn)) => {
+                    tn.names.last().and_then(super::util::node_string)
+                }
+                Some(node::Node::String(s)) => Some(s.sval.as_str()),
+                _ => None,
+            };
+            let storage = match storage.map(str::to_ascii_lowercase).as_deref() {
+                Some("external") => TypStorage::External,
+                Some("extended") => TypStorage::Extended,
+                Some("main") => TypStorage::Main,
+                _ => TypStorage::Plain,
+            };
+            if let Some(t) = interp.pg_type.get_mut(&oid) {
+                t.typstorage = storage;
+            }
+            continue;
+        }
         if !de.defname.eq_ignore_ascii_case("subscript") {
             continue;
         }
@@ -886,6 +916,7 @@ pub(crate) fn create_base_type(
         typnotnull: false,
         typtypmod: None,
         typcollation: None,
+        typstorage: TypStorage::Plain,
     });
     register_array_type(interp, nsoid, name, oid)?;
     Ok(oid)
@@ -1019,6 +1050,7 @@ fn register_array_type(
         typnotnull: false,
         typtypmod: None,
         typcollation: None,
+        typstorage: TypStorage::Extended,
     });
     if let Some(elem) = interp.pg_type.get_mut(&element_oid) {
         elem.typarray = Some(array_oid);

@@ -21,7 +21,7 @@ use typedpg_analyzer::{
     PgCollation, PgCollationOid, PgConstraint, PgConstraintOid, PgDepend, PgEnum, PgEnumOid,
     PgExtension, PgExtensionOid, PgGenericOid, PgIndex, PgInherits, PgNamespace, PgNamespaceOid,
     PgOperator, PgOperatorOid, PgProc, PgProcOid, PgRange, PgType, PgTypeOid, ProKind, ProVolatile,
-    QualifiedName, RelKind, TypCategory, TypType,
+    QualifiedName, RelKind, TypCategory, TypStorage, TypType,
 };
 
 fn main() {
@@ -195,7 +195,8 @@ fn export_namespaces(client: &mut postgres::Client) -> Result<Vec<PgNamespace>, 
 fn export_types(client: &mut postgres::Client) -> Result<Vec<PgType>, postgres::Error> {
     let rows = client.query(
         "SELECT oid, typname, typnamespace, typtype, typcategory, typispreferred, \
-                typrelid, typelem, typarray, typbasetype, typnotnull, typtypmod, typcollation \
+                typrelid, typelem, typarray, typbasetype, typnotnull, typtypmod, typcollation, \
+                typstorage \
          FROM pg_catalog.pg_type ORDER BY oid",
         &[],
     )?;
@@ -226,6 +227,12 @@ fn export_types(client: &mut postgres::Client) -> Result<Vec<PgType>, postgres::
                 typnotnull: r.get(10),
                 typtypmod: (typtypmod_raw >= 0).then_some(typtypmod_raw),
                 typcollation: PgCollationOid::new(typcollation),
+                typstorage: match r.get::<_, i8>(13) as u8 {
+                    b'e' => TypStorage::External,
+                    b'm' => TypStorage::Main,
+                    b'x' => TypStorage::Extended,
+                    _ => TypStorage::Plain,
+                },
             }
         })
         .collect())

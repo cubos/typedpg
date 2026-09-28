@@ -582,3 +582,119 @@ fn index_expressions_and_predicates_are_analyzed() {
         ),
     ]);
 }
+
+#[test]
+fn alter_column_settings_are_validated() {
+    // PG 18 ATExecSetStatistics / ATExecSetStorage / ATExecSetCompression /
+    // ATExecSetOptions.
+    let setup = "CREATE TABLE t (a int, b text, c int[]);
+                 CREATE VIEW v AS SELECT 1 AS x;
+                 CREATE INDEX ti ON t ((a + 1), b);";
+    for (stmt, msg) in [
+        (
+            "ALTER TABLE t ALTER COLUMN nosuch SET STATISTICS 100;",
+            "column \"nosuch\" of relation \"t\" does not exist",
+        ),
+        (
+            "ALTER TABLE t ALTER COLUMN a SET STATISTICS -5;",
+            "statistics target -5 is too low",
+        ),
+        (
+            "ALTER TABLE t ALTER COLUMN ctid SET STATISTICS 5;",
+            "cannot alter system column \"ctid\"",
+        ),
+        (
+            "ALTER TABLE t ALTER COLUMN 1 SET STATISTICS 5;",
+            "cannot refer to non-index column by number",
+        ),
+        (
+            "ALTER INDEX ti ALTER COLUMN 2 SET STATISTICS 5;",
+            "cannot alter statistics on non-expression column \"b\" of index \"ti\"",
+        ),
+        (
+            "ALTER INDEX ti ALTER COLUMN 3 SET STATISTICS 5;",
+            "column number 3 of relation \"ti\" does not exist",
+        ),
+        (
+            "ALTER TABLE v ALTER COLUMN x SET STATISTICS 5;",
+            "ALTER action ALTER COLUMN ... SET STATISTICS cannot be performed on relation \"v\"",
+        ),
+        (
+            "ALTER TABLE t ALTER COLUMN nosuch SET STORAGE EXTERNAL;",
+            "column \"nosuch\" of relation \"t\" does not exist",
+        ),
+        (
+            "ALTER TABLE t ALTER COLUMN a SET STORAGE EXTERNAL;",
+            "column data type integer can only have storage PLAIN",
+        ),
+        (
+            "ALTER TABLE t ALTER COLUMN b SET STORAGE nosuch;",
+            "invalid storage type \"nosuch\"",
+        ),
+        (
+            "ALTER TABLE t ALTER COLUMN nosuch SET COMPRESSION pglz;",
+            "column \"nosuch\" of relation \"t\" does not exist",
+        ),
+        (
+            "ALTER TABLE t ALTER COLUMN a SET COMPRESSION pglz;",
+            "column data type integer does not support compression",
+        ),
+        (
+            "ALTER TABLE t ALTER COLUMN b SET COMPRESSION nosuch;",
+            "invalid compression method \"nosuch\"",
+        ),
+        (
+            "ALTER TABLE t ALTER COLUMN nosuch SET (n_distinct = 1);",
+            "column \"nosuch\" of relation \"t\" does not exist",
+        ),
+        (
+            "ALTER TABLE t ALTER COLUMN a SET (nosuchopt = 1);",
+            "unrecognized parameter \"nosuchopt\"",
+        ),
+        (
+            "ALTER TABLE t ALTER COLUMN a SET (n_distinct = -2);",
+            "value -2 out of bounds for option \"n_distinct\"",
+        ),
+        (
+            "ALTER TABLE t ALTER COLUMN a SET (n_distinct = 'abc');",
+            "invalid value for floating point option \"n_distinct\": abc",
+        ),
+        (
+            "ALTER TABLE t ALTER COLUMN a SET (n_distinct);",
+            "invalid value for floating point option \"n_distinct\": true",
+        ),
+        (
+            "ALTER TABLE t ALTER COLUMN a SET (x.y = 1);",
+            "unrecognized parameter namespace \"x\"",
+        ),
+        (
+            "ALTER TABLE t ALTER COLUMN a SET (n_distinct = 5, n_distinct = 6);",
+            "parameter \"n_distinct\" specified more than once",
+        ),
+        (
+            "ALTER TABLE t ALTER COLUMN nosuch RESET (n_distinct);",
+            "column \"nosuch\" of relation \"t\" does not exist",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "ALTER TABLE t ALTER COLUMN a SET STATISTICS 100000;
+             ALTER TABLE t ALTER COLUMN a SET STATISTICS DEFAULT;
+             ALTER TABLE t ALTER COLUMN a SET STATISTICS -1;
+             ALTER TABLE t ALTER COLUMN a SET STORAGE PLAIN;
+             ALTER TABLE t ALTER COLUMN a SET STORAGE DEFAULT;
+             ALTER TABLE t ALTER COLUMN b SET STORAGE EXTERNAL;
+             ALTER TABLE t ALTER COLUMN c SET STORAGE MAIN;
+             ALTER TABLE t ALTER COLUMN a SET COMPRESSION default;
+             ALTER TABLE t ALTER COLUMN b SET COMPRESSION lz4;
+             ALTER TABLE t ALTER COLUMN a SET (n_distinct = -1, n_distinct_inherited = 5);
+             ALTER TABLE t ALTER COLUMN a RESET (nosuch);
+             ALTER INDEX ti ALTER COLUMN 1 SET STATISTICS 5;",
+        ),
+    ]);
+}

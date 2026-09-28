@@ -7,7 +7,7 @@ use pg_query::protobuf::{
 use crate::oid::{PgClassOid, PgConstraintOid, PgTypeOid};
 use crate::pg_catalog::{
     AttGenerated, AttIdentity, ConType, PgAttribute, PgClass, PgConstraint, PgIndex, PgInherits,
-    PgType, RelKind, TypCategory, TypType,
+    PgType, RelKind, TypCategory, TypStorage, TypType,
 };
 
 use super::DdlError;
@@ -273,6 +273,7 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
         typnotnull: false,
         typtypmod: None,
         typcollation: None,
+        typstorage: TypStorage::Extended,
     });
     register_composite_to_record_cast(interp, composite_oid)?;
 
@@ -291,6 +292,7 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
         typnotnull: false,
         typtypmod: None,
         typcollation: None,
+        typstorage: TypStorage::Extended,
     });
 
     for (i, col) in columns.iter().enumerate() {
@@ -526,6 +528,13 @@ fn apply_alter_cmd(
         AlterTableType::AtDropIdentity => drop_identity(interp, relid, cmd),
         AlterTableType::AtDropExpression => drop_expression(interp, relid, cmd, rec),
         AlterTableType::AtSetExpression => set_expression(interp, relid, cmd, rec),
+        AlterTableType::AtSetStatistics
+        | AlterTableType::AtSetStorage
+        | AlterTableType::AtSetCompression
+        | AlterTableType::AtSetOptions
+        | AlterTableType::AtResetOptions => {
+            column_options::alter_column_setting(interp, relid, cmd, subtype)
+        }
         // Other subtypes are no-ops for schema analysis.
         _ => Ok(()),
     }
@@ -567,6 +576,33 @@ fn check_alter_target(
         At::AtDropNotNull => (table_like, "ALTER COLUMN ... DROP NOT NULL"),
         At::AtSetExpression => (table_like, "ALTER COLUMN ... SET EXPRESSION"),
         At::AtDropExpression => (table_like, "ALTER COLUMN ... DROP EXPRESSION"),
+        At::AtSetStatistics => (
+            table_like
+                || matches!(
+                    class.relkind,
+                    RelKind::MaterializedView | RelKind::Index | RelKind::PartitionedIndex
+                ),
+            "ALTER COLUMN ... SET STATISTICS",
+        ),
+        At::AtSetOptions => (
+            table_like || class.relkind == RelKind::MaterializedView,
+            "ALTER COLUMN ... SET",
+        ),
+        At::AtResetOptions => (
+            table_like || class.relkind == RelKind::MaterializedView,
+            "ALTER COLUMN ... RESET",
+        ),
+        At::AtSetStorage => (
+            table_like || class.relkind == RelKind::MaterializedView,
+            "ALTER COLUMN ... SET STORAGE",
+        ),
+        At::AtSetCompression => (
+            matches!(
+                class.relkind,
+                RelKind::Table | RelKind::Partitioned | RelKind::MaterializedView
+            ),
+            "ALTER COLUMN ... SET COMPRESSION",
+        ),
         At::AtAddConstraint => (table_like, "ADD CONSTRAINT"),
         At::AtDropConstraint => (table_like, "DROP CONSTRAINT"),
         _ => (true, ""),
@@ -589,6 +625,7 @@ fn check_alter_target(
     )))
 }
 
+mod column_options;
 mod columns;
 mod constraints;
 pub(crate) mod inherit;

@@ -35,6 +35,21 @@ pub enum TypType {
     Multirange,
 }
 
+/// `pg_type.typstorage`: `p` plain, `e` external, `m` main, `x` extended.
+/// A `p` type is not TOAST-able — its columns can only have storage PLAIN
+/// and take no compression method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TypStorage {
+    #[serde(rename = "p")]
+    Plain,
+    #[serde(rename = "e")]
+    External,
+    #[serde(rename = "m")]
+    Main,
+    #[serde(rename = "x")]
+    Extended,
+}
+
 /// `pg_type.typcategory`. PG chars: A array, B boolean, C composite, D
 /// date/time, E enum, G geometric, I network, N numeric, P pseudo, R range, S
 /// string, T timespan, U user-defined, V bit-string, X unknown, Z internal.
@@ -305,6 +320,8 @@ pub struct PgType {
     /// own collation.
     #[serde(with = "crate::oid::oid_or_zero")]
     pub typcollation: Option<PgCollationOid>,
+    /// `pg_type.typstorage`.
+    pub typstorage: TypStorage,
 }
 
 /// `pg_enum`: one row per enum label.

@@ -20,7 +20,7 @@ use crate::oid::{PgClassOid, PgGenericOid, PgNamespaceOid, PgProcOid, PgRewriteO
 use crate::pg_catalog::{
     AstBinding, DepType, EvEnabled, EvType, PG_CLASS_RELID, PG_PROC_RELID, PG_TYPE_RELID,
     PgAttribute, PgClass, PgDepend, PgRewrite, PgType, RelKind, SerializedAst, TypCategory,
-    TypType,
+    TypStorage, TypType,
 };
 
 use super::DdlError;
@@ -419,6 +419,7 @@ fn install_relation(
         typnotnull: false,
         typtypmod: None,
         typcollation: None,
+        typstorage: TypStorage::Extended,
     });
     interp.insert_pg_type(PgType {
         oid: array_oid,
@@ -434,6 +435,7 @@ fn install_relation(
         typnotnull: false,
         typtypmod: None,
         typcollation: None,
+        typstorage: TypStorage::Extended,
     });
 
     record_view_dependencies(interp, class_oid, &deps);
