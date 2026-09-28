@@ -1541,3 +1541,52 @@ fn string_category_operators_with_an_untyped_side_resolve_like_pg() {
     let s = db.analyze("SELECT vc FROM t WHERE vc = $p").unwrap();
     assert_params(&s, vec![p(text())]);
 }
+
+// ── Qualified-name lookups: schema first, PG wording ────────────────────────
+
+#[test]
+fn qualified_names_report_missing_schemas_and_collations_like_pg() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE tq (s text NOT NULL); CREATE TYPE comp AS (a int, b text);")
+        .unwrap();
+    for (sql, msg) in [
+        ("SELECT '(1,x)'::comp.a", "schema \"comp\" does not exist"),
+        (
+            "SELECT 1 OPERATOR(nope.+) 2",
+            "schema \"nope\" does not exist",
+        ),
+        (
+            "SELECT s COLLATE nope.nosuch FROM tq",
+            "schema \"nope\" does not exist",
+        ),
+    ] {
+        assert_err_prefix!(db.analyze(sql), AnalyzeError::UndefinedSchema(_), msg);
+    }
+    for (sql, msg) in [
+        (
+            "SELECT s COLLATE \"nosuch\" FROM tq",
+            "collation \"nosuch\" for encoding \"UTF8\" does not exist",
+        ),
+        (
+            "SELECT s COLLATE pg_catalog.nosuch FROM tq",
+            "collation \"pg_catalog.nosuch\" for encoding \"UTF8\" does not exist",
+        ),
+    ] {
+        assert_err_prefix!(db.analyze(sql), AnalyzeError::UndefinedObject(_), msg);
+    }
+    // A schema-qualified operator resolves within that schema.
+    let s = db
+        .analyze("SELECT 1 OPERATOR(pg_catalog.+) 2 AS a")
+        .unwrap();
+    assert_cols(&s, vec![c("a", int4())]);
+    assert_err_prefix!(
+        db.analyze("SELECT 1 OPERATOR(pg_catalog.+) true"),
+        AnalyzeError::UndefinedOperator(_),
+        "operator does not exist: integer pg_catalog.+ boolean"
+    );
+    assert_err_prefix!(
+        db.analyze("SELECT 1 OPERATOR(public.+) 2"),
+        AnalyzeError::UndefinedOperator(_),
+        "operator does not exist: integer public.+ integer"
+    );
+}

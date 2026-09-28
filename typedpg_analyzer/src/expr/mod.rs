@@ -635,9 +635,16 @@ pub(crate) fn infer_expr(
             let resolved_collation = if parts.is_empty() {
                 None
             } else {
-                let r = snapshot.resolve_collation(schema, name).ok_or_else(|| {
-                    AnalyzeError::Invalid(format!("collation \"{name}\" does not exist"))
-                })?;
+                if let Some(schema) = schema
+                    && snapshot.namespace_oid(schema).is_none()
+                {
+                    return Err(
+                        crate::pgmsg::schema_does_not_exist(schema, None).finalize_implicit()
+                    );
+                }
+                let r = snapshot
+                    .resolve_collation(schema, name)
+                    .ok_or_else(|| crate::pgmsg::collation_does_not_exist(&parts.join(".")))?;
                 Some(r.oid)
             };
             let result = infer_expr(arg, ctx, params, goal)?;
@@ -1023,6 +1030,13 @@ fn resolve_type_name(
     };
 
     let is_array = !tn.array_bounds.is_empty();
+
+    // LookupTypeName: a qualified name's schema must exist first.
+    if let Some(schema) = schema
+        && snapshot.namespace_oid(schema).is_none()
+    {
+        return Err(crate::pgmsg::schema_does_not_exist(schema, None).finalize_implicit());
+    }
 
     let type_entry = snapshot.resolve_type_by_name(schema, name).ok_or_else(|| {
         // Build a snippet + "did you mean" hint for the unknown type name.

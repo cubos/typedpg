@@ -809,6 +809,15 @@ pub(crate) fn subquery_must_return_one_column(span: Option<SourceSpan>) -> RawEr
     )
 }
 
+/// `collation "x" for encoding "UTF8" does not exist` — SQLSTATE 42704
+/// (get_collation_oid). `name` is the collation name as written, qualified
+/// names joined with a dot (NameListToString).
+pub(crate) fn collation_does_not_exist(name: &str) -> AnalyzeError {
+    AnalyzeError::UndefinedObject(format!(
+        "collation \"{name}\" for encoding \"UTF8\" does not exist"
+    ))
+}
+
 /// `cannot subscript type T because it does not support subscripting` —
 /// SQLSTATE 42804: the (domain-unwrapped) container type has no subscript
 /// handler (PG's transformContainerSubscripts).
