@@ -32,6 +32,8 @@ mod expressions;
 mod join_rules;
 #[path = "query/joins.rs"]
 mod joins;
+#[path = "query/json_table.rs"]
+mod json_table;
 #[path = "query/literal_input.rs"]
 mod literal_input;
 #[path = "query/merge.rs"]

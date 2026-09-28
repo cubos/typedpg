@@ -179,6 +179,9 @@ pub(crate) fn process_from_item(
             process_from_item(relation, scope, null_ctx, snapshot, cte_scopes, params)?;
             process_tablesample(ts, scope, snapshot, params)?;
         }
+        node::Node::JsonTable(jt) => {
+            process_json_table(jt, scope, null_ctx, snapshot, params)?;
+        }
         _ => {
             return Err(AnalyzeError::Unsupported(format!(
                 "FROM item type: {:?}",
@@ -1079,6 +1082,227 @@ fn process_tablesample(
     }
     if let Some(seed) = ts.repeatable.as_deref() {
         coerce(seed, oid::FLOAT8, "REPEATABLE", params)?;
+    }
+    Ok(())
+}
+
+/// `JSON_TABLE(ctx, path [AS name] [PASSING …] COLUMNS (…)) [AS alias(…)]`
+/// (PG 17), following `transformJsonTable` (parse_jsontable.c):
+///
+/// - the context item sees the FROM items to its left (JSON_TABLE is always
+///   LATERAL); it must be json / jsonb or a string type read as JSON (an
+///   untyped parameter becomes text), otherwise `cannot cast type X to
+///   jsonb`. PASSING values are plain expressions;
+/// - columns: `FOR ORDINALITY` is integer; regular, `FORMAT JSON` and
+///   `EXISTS` columns take their declared type (with typmod); `NESTED PATH`
+///   contributes its own columns. Column and path names must be unique
+///   (42712 `duplicate JSON_TABLE column or path name`). OMIT QUOTES with a
+///   wrapper is 42601, and a DEFAULT behavior must be a constant expression
+///   coercible to the column (42804 / the input function's error);
+/// - every column is nullable (no match, ON EMPTY / ON ERROR, sibling
+///   nested paths) except the top-level ordinality;
+/// - the RTE is named by the alias (default `json_table`), whose column
+///   list renames positionally.
+fn process_json_table(
+    jt: &protobuf::JsonTable,
+    scope: &mut Scope,
+    null_ctx: &NullabilityContext,
+    snapshot: &PgCatalog,
+    params: &mut ParamCollector,
+) -> Result<(), AnalyzeError> {
+    let arg_scope = srf_arg_scope(scope);
+    let ctx = expr::Ctx::new(&arg_scope, null_ctx, snapshot);
+
+    if let Some(item) = jt
+        .context_item
+        .as_deref()
+        .and_then(|v| v.raw_expr.as_deref())
+    {
+        let t = expr::infer_expr(item, ctx, params, TypeGoal::NONE)?;
+        if t.type_oid == oid::UNKNOWN {
+            if let Some(node::Node::ParamRef(p)) = item.node.as_ref()
+                && params.get(p.number) == oid::UNKNOWN
+            {
+                params.record(p.number, oid::TEXT);
+            }
+        } else {
+            let base = snapshot.unwrap_domain(t.type_oid);
+            let ok = snapshot.get_type(base).is_some_and(|te| {
+                te.typcategory == TypCategory::String
+                    || te.typname == "json"
+                    || te.typname == "jsonb"
+            });
+            if !ok {
+                let from = crate::ddl::util::format_type_for_message(snapshot, t.type_oid);
+                return Err(AnalyzeError::Invalid(format!(
+                    "cannot cast type {from} to jsonb"
+                )));
+            }
+        }
+    }
+    for arg in &jt.passing {
+        if let Some(node::Node::JsonArgument(ja)) = arg.node.as_ref()
+            && let Some(val) = ja.val.as_deref().and_then(|v| v.raw_expr.as_deref())
+        {
+            let t = expr::infer_expr(val, ctx, params, TypeGoal::NONE)?;
+            if t.type_oid == oid::UNKNOWN
+                && let Some(node::Node::ParamRef(p)) = val.node.as_ref()
+                && params.get(p.number) == oid::UNKNOWN
+            {
+                params.record(p.number, oid::TEXT);
+            }
+        }
+    }
+
+    // Column and path names share one namespace.
+    let mut names: Vec<String> = Vec::new();
+    if let Some(ps) = jt.pathspec.as_deref()
+        && !ps.name.is_empty()
+    {
+        names.push(ps.name.clone());
+    }
+    let alias_owned = jt
+        .alias
+        .as_ref()
+        .map(|a| a.aliasname.clone())
+        .unwrap_or_else(|| "json_table".to_owned());
+    let alias = alias_owned.as_str();
+    let mut cols: Vec<ScopeColumn> = Vec::new();
+    json_table_columns(&jt.columns, true, alias, &mut names, &mut cols, ctx, params)?;
+
+    let col_aliases = jt
+        .alias
+        .as_ref()
+        .map(|a| expr::extract_string_fields(&a.colnames))
+        .unwrap_or_default();
+    if col_aliases.len() > cols.len() {
+        return Err(
+            crate::pgmsg::too_many_column_aliases(alias, cols.len(), col_aliases.len())
+                .finalize_implicit(),
+        );
+    }
+    for (c, n) in cols.iter_mut().zip(col_aliases) {
+        c.name = n;
+    }
+    scope.add_derived(alias, cols, crate::scope::SourceKind::Other)
+}
+
+/// The columns of one JSON_TABLE `COLUMNS (…)` list, recursing into
+/// `NESTED PATH` lists.
+fn json_table_columns(
+    columns: &[protobuf::Node],
+    top_level: bool,
+    alias: &str,
+    names: &mut Vec<String>,
+    out: &mut Vec<ScopeColumn>,
+    ctx: Ctx<'_>,
+    params: &mut ParamCollector,
+) -> Result<(), AnalyzeError> {
+    use protobuf::JsonTableColumnType as Kind;
+    let snapshot = ctx.snapshot;
+    let claim = |name: &str, names: &mut Vec<String>| -> Result<(), AnalyzeError> {
+        if names.iter().any(|n| n == name) {
+            return Err(crate::error::RawError::new(
+                AnalyzeError::DuplicateAlias(format!(
+                    "duplicate JSON_TABLE column or path name: {name}"
+                )),
+                None,
+                None,
+            )
+            .finalize_implicit());
+        }
+        names.push(name.to_owned());
+        Ok(())
+    };
+    for n in columns {
+        let Some(node::Node::JsonTableColumn(col)) = n.node.as_ref() else {
+            continue;
+        };
+        let kind = Kind::try_from(col.coltype).unwrap_or(Kind::Undefined);
+        if kind == Kind::JtcNested {
+            if let Some(ps) = col.pathspec.as_deref()
+                && !ps.name.is_empty()
+            {
+                claim(&ps.name, names)?;
+            }
+            json_table_columns(&col.columns, false, alias, names, out, ctx, params)?;
+            continue;
+        }
+        claim(&col.name, names)?;
+        let (type_oid, typmod) = if kind == Kind::JtcForOrdinality {
+            (oid::INT4, None)
+        } else {
+            let tn = col.type_name.as_ref().ok_or_else(|| {
+                AnalyzeError::Unsupported("JSON_TABLE column without a type".into())
+            })?;
+            let t = crate::ddl::util::lookup_type_name(tn, snapshot).map_err(|e| match e {
+                crate::ddl::DdlError::TypeNotFound(msg) => AnalyzeError::UndefinedType(msg),
+                other => AnalyzeError::Invalid(other.to_string()),
+            })?;
+            let m = crate::typmod::encode(snapshot, t, &tn.typmods)
+                .map_err(|e| AnalyzeError::Invalid(e.to_string()))?;
+            (t, m)
+        };
+        let with_wrapper = matches!(
+            protobuf::JsonWrapper::try_from(col.wrapper),
+            Ok(protobuf::JsonWrapper::JswConditional | protobuf::JsonWrapper::JswUnconditional)
+        );
+        if with_wrapper
+            && protobuf::JsonQuotes::try_from(col.quotes) == Ok(protobuf::JsonQuotes::JsQuotesOmit)
+        {
+            return Err(crate::error::RawError::new(
+                AnalyzeError::SyntaxError(
+                    "SQL/JSON QUOTES behavior must not be specified when WITH WRAPPER is used"
+                        .into(),
+                ),
+                None,
+                None,
+            )
+            .finalize_implicit());
+        }
+        for behavior in [col.on_empty.as_deref(), col.on_error.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            let Some(default) = behavior.expr.as_deref() else {
+                continue;
+            };
+            // transformJsonBehavior: the DEFAULT must not reference
+            // columns or parameters.
+            let mut volatile = false;
+            visit_same_level(default, &mut |e| {
+                if matches!(
+                    e.node.as_ref(),
+                    Some(
+                        node::Node::ColumnRef(_) | node::Node::ParamRef(_) | node::Node::SubLink(_)
+                    )
+                ) {
+                    volatile = true;
+                }
+            });
+            if volatile {
+                return Err(crate::error::RawError::new(
+                    AnalyzeError::DatatypeMismatch(
+                        "can only specify a constant, non-aggregate function, or operator \
+                         expression for DEFAULT"
+                            .into(),
+                    ),
+                    None,
+                    None,
+                )
+                .finalize_implicit());
+            }
+            expr::coerce_unknown_to(default, ctx, params, type_oid)?;
+        }
+        out.push(ScopeColumn {
+            name: col.name.clone(),
+            type_oid,
+            base_not_null: top_level && kind == Kind::JtcForOrdinality,
+            typmod: snapshot.effective_typmod(type_oid, typmod),
+            collation: None,
+            table_alias: alias.to_owned(),
+            record_fields: None,
+        });
     }
     Ok(())
 }
