@@ -30,6 +30,7 @@ pub(crate) fn serial_base_type(tn: &pg_query::protobuf::TypeName) -> Option<PgTy
 /// CREATE TABLE and ALTER TABLE ADD COLUMN paths).
 pub(crate) fn parse_column_def(
     interp: &PgCatalog,
+    relname: &str,
     cd: &pg_query::protobuf::ColumnDef,
     pk_columns: &[String],
 ) -> Result<ParsedColumn, DdlError> {
@@ -78,10 +79,20 @@ pub(crate) fn parse_column_def(
         is_generated = true;
     }
 
+    let mut nn_name: Option<String> = None;
+    let mut saw_null = false;
+    let mut saw_not_null = cd.is_not_null;
     for c_node in &cd.constraints {
         if let Some(node::Node::Constraint(c)) = c_node.node.as_ref() {
             match ConstrType::try_from(c.contype) {
-                Ok(ConstrType::ConstrNotnull) => not_null = true,
+                Ok(ConstrType::ConstrNotnull) => {
+                    not_null = true;
+                    saw_not_null = true;
+                    if !c.conname.is_empty() {
+                        nn_name = Some(c.conname.clone());
+                    }
+                }
+                Ok(ConstrType::ConstrNull) => saw_null = true,
                 Ok(ConstrType::ConstrPrimary) => {
                     not_null = true;
                 }
@@ -122,6 +133,14 @@ pub(crate) fn parse_column_def(
                 _ => {}
             }
         }
+    }
+
+    // transformColumnDefinition rejects `NULL` together with `NOT NULL`.
+    if saw_null && saw_not_null {
+        return Err(DdlError::Parse(format!(
+            "conflicting NULL/NOT NULL declarations for column \"{}\" of table \"{relname}\"",
+            cd.colname
+        )));
     }
 
     if pk_columns.iter().any(|pk| pk == &cd.colname) {
@@ -173,6 +192,12 @@ pub(crate) fn parse_column_def(
         } else {
             None
         },
+        nn_local: not_null,
+        nn_name,
+        nn_inhcount: 0,
+        nn_inh_name: None,
+        is_local: true,
+        inhcount: 0,
     })
 }
 
@@ -311,10 +336,14 @@ pub(crate) fn drop_identity(
     Ok(())
 }
 
+/// `ALTER TABLE ... ADD COLUMN` (`ATExecAddColumn`). Recurses into the
+/// children, where a same-named column is merged (the types must agree)
+/// instead of added; `ONLY` is refused while children exist.
 pub(crate) fn add_column(
     interp: &mut PgCatalog,
     relid: PgClassOid,
     cmd: &AlterTableCmd,
+    rec: inherit::Recursion,
 ) -> Result<(), DdlError> {
     let Some(def) = cmd.def.as_deref() else {
         return Ok(());
@@ -322,12 +351,35 @@ pub(crate) fn add_column(
     let Some(node::Node::ColumnDef(cd)) = def.node.as_ref() else {
         return Ok(());
     };
+    let children = inherit::children_of(interp, relid);
+    if !rec.recurse && !children.is_empty() {
+        return Err(DdlError::Parse(
+            "column must be added to child tables too".into(),
+        ));
+    }
 
-    if interp
-        .attributes_of(relid)
-        .iter()
-        .any(|a| a.attname == cd.colname)
-    {
+    let col = parse_column_def(interp, &relname_of(interp, relid), cd, &[])?;
+
+    if let Some(existing) = interp.attribute_by_name(relid, &cd.colname).cloned() {
+        if rec.recursing {
+            // Merge into the child's own column.
+            if existing.atttypid != col.type_oid || existing.atttypmod != col.typmod {
+                return Err(DdlError::Parse(format!(
+                    "child table \"{}\" has different type for column \"{}\"",
+                    relname_of(interp, relid),
+                    cd.colname
+                )));
+            }
+            if let Some(attrs) = interp.pg_attribute.get_mut(&relid)
+                && let Some(a) = attrs.iter_mut().find(|a| a.attnum == existing.attnum)
+            {
+                a.attinhcount += 1;
+            }
+            if col.not_null {
+                inherit::set_not_null(interp, relid, &cd.colname, None, rec)?;
+            }
+            return Ok(());
+        }
         if cmd.missing_ok {
             return Ok(());
         }
@@ -338,7 +390,6 @@ pub(crate) fn add_column(
         )));
     }
 
-    let col = parse_column_def(interp, cd, &[])?;
     let next_attnum = interp
         .attributes_of(relid)
         .iter()
@@ -351,15 +402,30 @@ pub(crate) fn add_column(
         attname: col.name.clone(),
         atttypid: col.type_oid,
         attnum: next_attnum,
-        attnotnull: col.not_null,
+        attnotnull: false,
         atthasdef: col.has_default,
         attgenerated: col.is_generated.then_some(AttGenerated::Stored),
         atttypmod: col.typmod,
-        attidentity: col.identity,
+        // Identity is not inherited by regular children.
+        attidentity: col.identity.filter(|_| !rec.recursing),
         attcollation: col.collation,
+        attislocal: !rec.recursing,
+        attinhcount: i16::from(rec.recursing),
     });
-    if let Some(deptype) = col.owned_sequence {
+    if col.not_null {
+        let local = inherit::Recursion {
+            recurse: false,
+            recursing: rec.recursing,
+        };
+        inherit::set_not_null(interp, relid, &col.name, col.nn_name.as_deref(), local)?;
+    }
+    if !rec.recursing
+        && let Some(deptype) = col.owned_sequence
+    {
         crate::ddl::sequences::create_owned_sequence(interp, relid, next_attnum, deptype)?;
+    }
+    for child in children {
+        add_column(interp, child, cmd, rec.child())?;
     }
     Ok(())
 }
@@ -368,17 +434,21 @@ pub(crate) fn drop_column(
     interp: &mut PgCatalog,
     relid: PgClassOid,
     cmd: &AlterTableCmd,
+    rec: inherit::Recursion,
 ) -> Result<(), DdlError> {
-    if !interp
-        .attributes_of(relid)
-        .iter()
-        .any(|a| a.attname == cmd.name)
-    {
+    let Some(target) = interp.attribute_by_name(relid, &cmd.name).cloned() else {
         if cmd.missing_ok {
             return Ok(());
         }
         return Err(DdlError::Parse(column_not_found_msg(
             interp, relid, &cmd.name,
+        )));
+    };
+    // ATExecDropColumn: an inherited column only goes away with its parent.
+    if !rec.recursing && target.attinhcount > 0 {
+        return Err(DdlError::Parse(format!(
+            "cannot drop inherited column \"{}\"",
+            cmd.name
         )));
     }
 
@@ -517,67 +587,44 @@ pub(crate) fn drop_column(
         attrs.retain(|a| a.attname != cmd.name);
     }
 
-    // Cascade DROP COLUMN through pg_inherits: every direct (and transitive)
-    // child that inherited the same column name loses it too. PG actually
-    // tracks this with `attinhcount`; we approximate by walking pg_inherits
-    // and removing the matching column from each descendant.
-    cascade_drop_column_to_children(interp, relid, &cmd.name);
-
-    Ok(())
-}
-
-/// Recursively remove a dropped column from every child relation that
-/// inherits from `parent_oid`. Skips children that don't carry the column —
-/// they may have it locally or have already had it dropped earlier in the
-/// same operation.
-fn cascade_drop_column_to_children(interp: &mut PgCatalog, parent_oid: PgClassOid, col_name: &str) {
-    let direct_children: Vec<PgClassOid> = interp
-        .pg_inherits
-        .iter()
-        .filter(|i| i.inhparent == parent_oid)
-        .map(|i| i.inhrelid)
-        .collect();
-    for child in direct_children {
-        let had_col = interp
-            .attributes_of(child)
-            .iter()
-            .any(|a| a.attname == col_name);
-        if !had_col {
+    // Children (ATExecDropColumn's recursion): a column inherited only from
+    // this parent goes too; one that is also local or inherited from another
+    // parent stays, with one inheritance fewer. Under ONLY the children's
+    // copies become local.
+    for child in inherit::children_of(interp, relid) {
+        let Some(child_col) = interp.attribute_by_name(child, &cmd.name).cloned() else {
             continue;
+        };
+        if rec.recurse && child_col.attinhcount == 1 && !child_col.attislocal {
+            drop_column(interp, child, cmd, rec.child())?;
+        } else if let Some(attrs) = interp.pg_attribute.get_mut(&child)
+            && let Some(a) = attrs.iter_mut().find(|a| a.attnum == child_col.attnum)
+        {
+            a.attinhcount = (a.attinhcount - 1).max(0);
+            if !rec.recurse {
+                a.attislocal = true;
+            }
         }
-        if let Some(attrs) = interp.pg_attribute.get_mut(&child) {
-            attrs.retain(|a| a.attname != col_name);
-        }
-        cascade_drop_column_to_children(interp, child, col_name);
     }
-}
 
-pub(crate) fn set_not_null(
-    interp: &mut PgCatalog,
-    relid: PgClassOid,
-    col_name: &str,
-    not_null: bool,
-) -> Result<(), DdlError> {
-    let rel = relname_of(interp, relid);
-    let Some(attrs) = interp.pg_attribute.get_mut(&relid) else {
-        return Err(DdlError::TableNotFound(format!(
-            "relation \"{rel}\" does not exist"
-        )));
-    };
-    let Some(col) = attrs.iter_mut().find(|c| c.attname == col_name) else {
-        return Err(DdlError::Parse(format!(
-            "column \"{col_name}\" of relation \"{rel}\" does not exist"
-        )));
-    };
-    col.attnotnull = not_null;
     Ok(())
 }
 
+/// `ALTER COLUMN c { SET | DROP } DEFAULT`, recursing into the children
+/// unless `ONLY` (`ATSimpleRecursion`).
 pub(crate) fn set_default(
     interp: &mut PgCatalog,
     relid: PgClassOid,
     cmd: &AlterTableCmd,
+    rec: inherit::Recursion,
 ) -> Result<(), DdlError> {
+    if rec.recurse {
+        for child in inherit::children_of(interp, relid) {
+            if interp.attribute_by_name(child, &cmd.name).is_some() {
+                set_default(interp, child, cmd, rec.child())?;
+            }
+        }
+    }
     let rel = relname_of(interp, relid);
     let Some(attrs) = interp.pg_attribute.get_mut(&relid) else {
         return Err(DdlError::TableNotFound(format!(
@@ -594,10 +641,14 @@ pub(crate) fn set_default(
     Ok(())
 }
 
+/// `ALTER COLUMN c TYPE t` (`ATPrepAlterColumnType`): an inherited column
+/// is only retyped through its parent, and the parent's change reaches every
+/// child (`ONLY` is refused while a child has the column).
 pub(crate) fn alter_column_type(
     interp: &mut PgCatalog,
     relid: PgClassOid,
     cmd: &AlterTableCmd,
+    rec: inherit::Recursion,
 ) -> Result<(), DdlError> {
     let Some(def) = cmd.def.as_deref() else {
         return Ok(());
@@ -605,6 +656,28 @@ pub(crate) fn alter_column_type(
     let Some(node::Node::ColumnDef(cd)) = def.node.as_ref() else {
         return Ok(());
     };
+    if let Some(attr) = interp.attribute_by_name(relid, &cmd.name)
+        && !rec.recursing
+        && attr.attinhcount > 0
+    {
+        return Err(DdlError::Parse(format!(
+            "cannot alter inherited column \"{}\"",
+            cmd.name
+        )));
+    }
+    let children: Vec<PgClassOid> = inherit::children_of(interp, relid)
+        .into_iter()
+        .filter(|&c| interp.attribute_by_name(c, &cmd.name).is_some())
+        .collect();
+    if !rec.recurse && !children.is_empty() {
+        return Err(DdlError::Parse(format!(
+            "type of inherited column \"{}\" must be changed in child tables too",
+            cmd.name
+        )));
+    }
+    for child in children {
+        alter_column_type(interp, child, cmd, rec.child())?;
+    }
 
     let new_type_oid = match cd.type_name.as_ref() {
         Some(tn) => lookup_type_name(tn, interp)?,

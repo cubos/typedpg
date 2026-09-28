@@ -71,6 +71,8 @@ pub(crate) fn insert_sequence_relation(
             atttypmod: None,
             attidentity: None,
             attcollation: None,
+            attislocal: true,
+            attinhcount: 0,
         });
     }
     Ok(class_oid)

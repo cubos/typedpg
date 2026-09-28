@@ -507,3 +507,78 @@ fn drop_table_with_no_fk_target_succeeds() {
         "constraints should be cleaned up: {cons:?}"
     );
 }
+
+// ── PG 18 not-null constraints ──────────────────────────────────────────────
+
+#[test]
+fn not_null_constraints_can_be_dropped_by_name() {
+    // PG 18: t_id_not_null (generated) and x_nn (explicit) are pg_constraint
+    // rows; dropping them makes the columns nullable.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (id int NOT NULL, x int CONSTRAINT x_nn NOT NULL);
+         ALTER TABLE t DROP CONSTRAINT t_id_not_null;
+         ALTER TABLE t DROP CONSTRAINT x_nn;",
+    )]);
+    assert_cols(
+        &db.analyze("SELECT * FROM t").unwrap(),
+        vec![cn("id", int4()), cn("x", int4())],
+    );
+}
+
+#[test]
+fn not_null_constraint_names_follow_pg() {
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (id int NOT NULL, pk int PRIMARY KEY, s serial);
+         ALTER TABLE t ADD COLUMN y int;
+         ALTER TABLE t ALTER COLUMN y SET NOT NULL;",
+    )]);
+    let mut names: Vec<String> = db
+        .pg_constraint_names_for_table("public", "t")
+        .into_iter()
+        .filter(|n| n.ends_with("_not_null"))
+        .collect();
+    names.sort();
+    // (`ADD CONSTRAINT name NOT NULL col` is PG 18 grammar the libpg_query
+    // 17 parser rejects.)
+    assert_eq!(
+        names,
+        vec![
+            "t_id_not_null",
+            "t_pk_not_null",
+            "t_s_not_null",
+            "t_y_not_null"
+        ]
+    );
+}
+
+#[test]
+fn primary_key_columns_keep_not_null() {
+    // PG 18: 42P16 column "pk" is in a primary key (DROP CONSTRAINT and
+    // DROP NOT NULL alike).
+    for stmt in [
+        "ALTER TABLE t DROP CONSTRAINT t_pk_not_null;",
+        "ALTER TABLE t ALTER COLUMN pk DROP NOT NULL;",
+    ] {
+        assert_ddl_err!(
+            try_apply(&[
+                ("0001.sql", "CREATE TABLE t (pk int PRIMARY KEY);"),
+                ("0002.sql", stmt),
+            ]),
+            DdlError::Parse(_),
+            "column \"pk\" is in a primary key",
+        );
+    }
+}
+
+#[test]
+fn conflicting_null_declarations_are_rejected() {
+    // PG 18: 42601 conflicting NULL/NOT NULL declarations for column "a".
+    let err = try_apply(&[("0001.sql", "CREATE TABLE t (a int NOT NULL NULL);")]).unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("conflicting NULL/NOT NULL declarations for column \"a\""),
+        "{err}"
+    );
+}

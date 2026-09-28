@@ -169,6 +169,8 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
                 conkey,
                 confrelid: None,
                 confkey: Vec::new(),
+                conislocal: true,
+                coninhcount: 0,
             });
         }
     }

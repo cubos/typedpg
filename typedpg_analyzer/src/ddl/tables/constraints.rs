@@ -193,6 +193,8 @@ fn emit_constraint_with_backing_index(
         conkey: conkey.clone(),
         confrelid,
         confkey,
+        conislocal: true,
+        coninhcount: 0,
     });
     if matches!(contype, ConType::PrimaryKey | ConType::Unique) {
         let table_ns = interp
@@ -549,6 +551,7 @@ pub(crate) fn drop_constraint(
     interp: &mut PgCatalog,
     relid: PgClassOid,
     cmd: &AlterTableCmd,
+    rec: super::inherit::Recursion,
 ) -> Result<(), DdlError> {
     let conname = &cmd.name;
     let found_oid = interp
@@ -556,6 +559,13 @@ pub(crate) fn drop_constraint(
         .values()
         .find(|c| c.conrelid == relid && &c.conname == conname)
         .map(|c| c.oid);
+    if let Some(con) = found_oid
+        .and_then(|oid| interp.pg_constraint.get(&oid))
+        .filter(|c| c.contype == ConType::NotNull)
+        .cloned()
+    {
+        return super::inherit::drop_not_null_constraint(interp, &con, rec);
+    }
     let Some(oid) = found_oid else {
         if cmd.missing_ok {
             return Ok(());
@@ -642,6 +652,7 @@ pub(crate) fn add_constraint(
     interp: &mut PgCatalog,
     relid: PgClassOid,
     cmd: &AlterTableCmd,
+    rec: super::inherit::Recursion,
 ) -> Result<(), DdlError> {
     let Some(def) = cmd.def.as_deref() else {
         return Ok(());
@@ -662,11 +673,14 @@ pub(crate) fn add_constraint(
                 }
             })
             .collect();
-        if let Some(attrs) = interp.pg_attribute.get_mut(&relid) {
-            for col in attrs.iter_mut() {
-                if pk_cols.contains(&col.attname) {
-                    col.attnotnull = true;
-                }
+        // A primary key's columns get (local) not-null constraints.
+        for col in &pk_cols {
+            if interp.attribute_by_name(relid, col).is_some() {
+                let only_here = super::inherit::Recursion {
+                    recurse: false,
+                    recursing: false,
+                };
+                super::inherit::set_not_null(interp, relid, col, None, only_here)?;
             }
         }
         let attnums: Vec<i16> = pk_cols
@@ -749,11 +763,8 @@ pub(crate) fn add_constraint(
                 }
             })
             .unwrap_or_else(|| cmd.name.clone());
-        if let Some(attrs) = interp.pg_attribute.get_mut(&relid)
-            && let Some(col) = attrs.iter_mut().find(|col| col.attname == col_name)
-        {
-            col.attnotnull = true;
-        }
+        let explicit = (!c.conname.is_empty()).then_some(c.conname.as_str());
+        super::inherit::set_not_null(interp, relid, &col_name, explicit, rec)?;
     }
 
     if c.contype == ConstrType::ConstrCheck as i32
@@ -927,6 +938,8 @@ pub(crate) fn copy_like_constraints(
                 conkey,
                 confrelid: None,
                 confkey: Vec::new(),
+                conislocal: true,
+                coninhcount: 0,
             });
         }
     }

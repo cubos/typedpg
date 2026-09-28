@@ -333,9 +333,8 @@ pub struct PgRange {
 
 /// `pg_constraint.contype`. PG chars: `c` check, `f` foreign key, `n` not
 /// null (PG18+), `p` primary key, `u` unique, `t` constraint trigger, `x`
-/// exclusion. We carry the four kinds the analyzer actually consults
-/// (CHECK, FOREIGN KEY, PRIMARY KEY, UNIQUE) and map the rest to
-/// `Other` so the row still round-trips through the seed.
+/// exclusion. Constraint triggers and any future kind map to `Other` so the
+/// row still round-trips through the seed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConType {
     #[serde(rename = "c")]
@@ -348,8 +347,11 @@ pub enum ConType {
     Unique,
     #[serde(rename = "x")]
     Exclusion,
-    /// Catch-all for `n` (not-null), `t` (constraint trigger), and any
-    /// future variants.
+    /// PG 18 not-null constraint (`conkey` = the one column). The column's
+    /// `attnotnull` mirrors whether it has one.
+    #[serde(rename = "n")]
+    NotNull,
+    /// Catch-all for `t` (constraint trigger) and any future variants.
     #[serde(other)]
     Other,
 }
@@ -380,6 +382,11 @@ pub struct PgConstraint {
     /// Attnums (1-based) of the columns on the target relation that the
     /// FK references. Empty for non-FK constraints.
     pub confkey: Vec<i16>,
+    /// The constraint is defined locally on the relation (not only
+    /// inherited from a parent).
+    pub conislocal: bool,
+    /// Number of parents the constraint is inherited from.
+    pub coninhcount: i16,
 }
 
 /// `pg_index`: one row per index. Keyed by `indexrelid` — PG models the index
@@ -588,6 +595,12 @@ pub struct PgAttribute {
     /// DDL parser assign explicit `COLLATE "x"` decorations.
     #[serde(with = "crate::oid::oid_or_zero")]
     pub attcollation: Option<PgCollationOid>,
+    /// The column is defined locally (not only inherited from a parent).
+    pub attislocal: bool,
+    /// Number of parents (inheritance or partitioning) the column is
+    /// inherited from; such a column can't be dropped, renamed or retyped on
+    /// its own.
+    pub attinhcount: i16,
 }
 
 /// `pg_proc`: a function, aggregate, window function, or procedure.

@@ -207,6 +207,8 @@ fn check_domain_check_expression(
         atttypmod: None,
         attidentity: None,
         attcollation: None,
+        attislocal: true,
+        attinhcount: 0,
     };
     let mut scope = Scope::default();
     scope.add_dml_target(
@@ -425,6 +427,8 @@ pub fn create_composite(interp: &mut PgCatalog, stmt: &CompositeTypeStmt) -> Res
             atttypmod: ftypmod,
             attidentity: None,
             attcollation: None,
+            attislocal: true,
+            attinhcount: 0,
         });
     }
     interp.insert_pg_type(PgType {

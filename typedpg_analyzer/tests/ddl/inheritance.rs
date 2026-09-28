@@ -327,3 +327,154 @@ fn partition_accepts_inserts_into_parent_columns() {
     db.analyze("INSERT INTO m_2024 (id, d, x) VALUES (1, '2024-05-01', 'a')")
         .unwrap();
 }
+
+// ── ALTER TABLE recursion into children (ATSimpleRecursion & co.) ───────────
+
+#[test]
+fn alter_parent_reaches_inheritance_children() {
+    // PG 18 `\d c` after the parent's ALTERs: z bigint not null, b text not
+    // null default 'x'.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE p (a int);
+         CREATE TABLE c () INHERITS (p);
+         ALTER TABLE p ALTER COLUMN a TYPE bigint;
+         ALTER TABLE p ADD COLUMN b text NOT NULL DEFAULT 'x';
+         ALTER TABLE p ALTER COLUMN a SET NOT NULL;
+         ALTER TABLE p RENAME COLUMN a TO z;",
+    )]);
+    assert_cols(
+        &db.analyze("SELECT * FROM c").unwrap(),
+        vec![c("z", int8()), c("b", text())],
+    );
+    db.analyze("INSERT INTO c (z) VALUES (1)").unwrap();
+}
+
+#[test]
+fn alter_parent_reaches_partitions() {
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE m (id int, d date) PARTITION BY RANGE (d);
+         CREATE TABLE m1 PARTITION OF m FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+         ALTER TABLE m ADD COLUMN note text;
+         ALTER TABLE m ALTER COLUMN id SET NOT NULL;",
+    )]);
+    assert_cols(
+        &db.analyze("SELECT * FROM m1").unwrap(),
+        vec![c("id", int4()), cn("d", date()), cn("note", text())],
+    );
+}
+
+#[test]
+fn drop_not_null_on_parent_keeps_local_child_constraints() {
+    // PG 18: c (inherited only) becomes nullable, c2 (also local) stays NOT
+    // NULL; DROP NOT NULL on the child itself is refused.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE p (a int NOT NULL);
+         CREATE TABLE c () INHERITS (p);
+         CREATE TABLE c2 (a int NOT NULL) INHERITS (p);
+         ALTER TABLE p ALTER a DROP NOT NULL;",
+    )]);
+    assert_cols(
+        &db.analyze("SELECT a FROM p").unwrap(),
+        vec![cn("a", int4())],
+    );
+    assert_cols(
+        &db.analyze("SELECT a FROM c").unwrap(),
+        vec![cn("a", int4())],
+    );
+    assert_cols(
+        &db.analyze("SELECT a FROM c2").unwrap(),
+        vec![c("a", int4())],
+    );
+    assert_ddl_err!(
+        try_apply(&[(
+            "0001.sql",
+            "CREATE TABLE p (a int NOT NULL);
+             CREATE TABLE c () INHERITS (p);
+             ALTER TABLE c ALTER a DROP NOT NULL;",
+        )]),
+        DdlError::Parse(_),
+        "cannot drop inherited constraint \"p_a_not_null\" of relation \"c\"",
+    );
+}
+
+#[test]
+fn add_column_merges_into_a_child_column_of_the_same_type() {
+    // PG 18: NOTICE merging definition of column "b" for child "qc";
+    // a different type is `child table "rc" has different type for column "b"`.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE q (a int);
+         CREATE TABLE qc (b text) INHERITS (q);
+         ALTER TABLE q ADD COLUMN b text;",
+    )]);
+    assert_cols(
+        &db.analyze("SELECT * FROM qc").unwrap(),
+        vec![cn("a", int4()), cn("b", text())],
+    );
+    assert_ddl_err!(
+        try_apply(&[(
+            "0001.sql",
+            "CREATE TABLE r (a int);
+             CREATE TABLE rc (b int) INHERITS (r);
+             ALTER TABLE r ADD COLUMN b text;",
+        )]),
+        DdlError::Parse(_),
+        "child table \"rc\" has different type for column \"b\"",
+    );
+}
+
+#[test]
+fn inherited_columns_change_only_through_the_parent() {
+    // PG 18: 42P16 for every one of these.
+    let base = "CREATE TABLE p (z int);
+                CREATE TABLE c () INHERITS (p);";
+    for (stmt, msg) in [
+        (
+            "ALTER TABLE ONLY p ADD COLUMN w int;",
+            "column must be added to child tables too",
+        ),
+        (
+            "ALTER TABLE ONLY p RENAME COLUMN z TO zz;",
+            "inherited column \"z\" must be renamed in child tables too",
+        ),
+        (
+            "ALTER TABLE c RENAME COLUMN z TO zz;",
+            "cannot rename inherited column \"z\"",
+        ),
+        (
+            "ALTER TABLE c ALTER COLUMN z TYPE bigint;",
+            "cannot alter inherited column \"z\"",
+        ),
+        (
+            "ALTER TABLE c DROP COLUMN z;",
+            "cannot drop inherited column \"z\"",
+        ),
+    ] {
+        let result = try_apply(&[("0001.sql", base), ("0002.sql", stmt)]);
+        let err = result.expect_err(stmt);
+        assert_eq!(err.to_string(), msg, "{stmt}");
+    }
+}
+
+#[test]
+fn drop_column_on_parent_keeps_a_child_local_column() {
+    // PG 18: c2 declared `z` itself, so it keeps it; c loses it.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE p (z int, k int);
+         CREATE TABLE c () INHERITS (p);
+         CREATE TABLE c2 (z int) INHERITS (p);
+         ALTER TABLE p DROP COLUMN z;",
+    )]);
+    assert_cols(
+        &db.analyze("SELECT * FROM c").unwrap(),
+        vec![cn("k", int4())],
+    );
+    assert_cols(
+        &db.analyze("SELECT * FROM c2").unwrap(),
+        vec![cn("z", int4()), cn("k", int4())],
+    );
+}

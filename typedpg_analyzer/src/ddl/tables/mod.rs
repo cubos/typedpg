@@ -99,16 +99,25 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
             continue;
         };
         let is_primary = c.contype == ConstrType::ConstrPrimary as i32;
-        if !is_primary && c.contype != ConstrType::ConstrUnique as i32 {
+        let is_not_null = c.contype == ConstrType::ConstrNotnull as i32;
+        if !is_primary && !is_not_null && c.contype != ConstrType::ConstrUnique as i32 {
             continue;
         }
         for key in c.keys.iter().filter_map(super::util::node_string) {
             let Some(col) = columns.iter_mut().find(|col| col.name == key) else {
-                return Err(DdlError::Parse(format!(
-                    "column \"{key}\" named in key does not exist"
-                )));
+                return Err(DdlError::Parse(if is_not_null {
+                    format!("column \"{key}\" of relation \"{name}\" does not exist")
+                } else {
+                    format!("column \"{key}\" named in key does not exist")
+                }));
             };
-            col.not_null |= is_primary;
+            if is_primary || is_not_null {
+                col.not_null = true;
+                col.nn_local = true;
+            }
+            if is_not_null && !c.conname.is_empty() {
+                col.nn_name = Some(c.conname.clone());
+            }
         }
     }
 
@@ -141,6 +150,8 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
             atttypmod: col.typmod,
             attidentity: col.identity,
             attcollation: col.collation,
+            attislocal: col.is_local,
+            attinhcount: col.inhcount,
         });
     }
     interp.insert_pg_type(PgType {
@@ -177,6 +188,11 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
         typcollation: None,
     });
 
+    for (i, col) in columns.iter().enumerate() {
+        if col.not_null {
+            inherit::record_not_null(interp, class_oid, (i + 1) as i16, col)?;
+        }
+    }
     for (i, col) in columns.iter().enumerate() {
         if let Some(deptype) = col.owned_sequence {
             super::sequences::create_owned_sequence(interp, class_oid, (i + 1) as i16, deptype)?;
@@ -219,11 +235,24 @@ struct ParsedColumn {
     /// Implicit sequence the column owns: `Auto` for serial columns,
     /// `Internal` for identity columns.
     owned_sequence: Option<crate::pg_catalog::DepType>,
+    /// The column has a local NOT NULL (explicit, PRIMARY KEY, serial,
+    /// identity) — PG 18 records it as a local not-null constraint.
+    nn_local: bool,
+    /// Explicit name of that local constraint (`CONSTRAINT x NOT NULL`).
+    nn_name: Option<String>,
+    /// Parents contributing a not-null constraint, and the first one's name
+    /// (the name an inherited-only constraint keeps).
+    nn_inhcount: i16,
+    nn_inh_name: Option<String>,
+    /// `attislocal` / `attinhcount`.
+    is_local: bool,
+    inhcount: i16,
 }
 
 // ─── ALTER TABLE ────────────────────────────────────────────────────────────
 
 pub fn alter_table(interp: &mut PgCatalog, stmt: &AlterTableStmt) -> Result<(), DdlError> {
+    let recurse = stmt.relation.as_ref().is_none_or(|rv| rv.inh);
     let rv = stmt
         .relation
         .as_ref()
@@ -254,7 +283,11 @@ pub fn alter_table(interp: &mut PgCatalog, stmt: &AlterTableStmt) -> Result<(), 
         let Some(node::Node::AlterTableCmd(cmd)) = cmd_node.node.as_ref() else {
             continue;
         };
-        apply_alter_cmd(interp, class_oid, cmd)?;
+        let rec = inherit::Recursion {
+            recurse,
+            recursing: false,
+        };
+        apply_alter_cmd(interp, class_oid, cmd, rec)?;
     }
 
     Ok(())
@@ -264,20 +297,21 @@ fn apply_alter_cmd(
     interp: &mut PgCatalog,
     relid: PgClassOid,
     cmd: &AlterTableCmd,
+    rec: inherit::Recursion,
 ) -> Result<(), DdlError> {
     let subtype = AlterTableType::try_from(cmd.subtype).unwrap_or(AlterTableType::Undefined);
 
     match subtype {
         AlterTableType::AtAddColumn | AlterTableType::AtAddColumnToView => {
-            add_column(interp, relid, cmd)
+            add_column(interp, relid, cmd, rec)
         }
-        AlterTableType::AtDropColumn => drop_column(interp, relid, cmd),
-        AlterTableType::AtSetNotNull => set_not_null(interp, relid, &cmd.name, true),
-        AlterTableType::AtDropNotNull => set_not_null(interp, relid, &cmd.name, false),
-        AlterTableType::AtColumnDefault => set_default(interp, relid, cmd),
-        AlterTableType::AtAlterColumnType => alter_column_type(interp, relid, cmd),
-        AlterTableType::AtAddConstraint => add_constraint(interp, relid, cmd),
-        AlterTableType::AtDropConstraint => drop_constraint(interp, relid, cmd),
+        AlterTableType::AtDropColumn => drop_column(interp, relid, cmd, rec),
+        AlterTableType::AtSetNotNull => inherit::set_not_null(interp, relid, &cmd.name, None, rec),
+        AlterTableType::AtDropNotNull => inherit::drop_not_null(interp, relid, &cmd.name, rec),
+        AlterTableType::AtColumnDefault => set_default(interp, relid, cmd, rec),
+        AlterTableType::AtAlterColumnType => alter_column_type(interp, relid, cmd, rec),
+        AlterTableType::AtAddConstraint => add_constraint(interp, relid, cmd, rec),
+        AlterTableType::AtDropConstraint => drop_constraint(interp, relid, cmd, rec),
         AlterTableType::AtAddIdentity => set_identity(interp, relid, cmd),
         AlterTableType::AtSetIdentity => set_identity(interp, relid, cmd),
         AlterTableType::AtDropIdentity => drop_identity(interp, relid, cmd),
@@ -288,6 +322,7 @@ fn apply_alter_cmd(
 
 mod columns;
 mod constraints;
+pub(crate) mod inherit;
 mod merge;
 
 use columns::*;

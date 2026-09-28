@@ -226,7 +226,21 @@ fn check_view_columns(
                 old_col.attname, new_col.name
             )));
         }
-        if old_col.atttypid != new_col.type_oid || old_col.atttypmod != new_col.typmod {
+        // A domain-typed column may carry the domain's own typmod on one
+        // side and none on the other; both mean "the domain's typmod".
+        let effective_typmod = |type_oid: PgTypeOid, typmod: Option<i32>| {
+            typmod.or_else(|| {
+                interp
+                    .pg_type
+                    .get(&type_oid)
+                    .filter(|t| t.typtype == TypType::Domain)
+                    .and_then(|t| t.typtypmod)
+            })
+        };
+        if old_col.atttypid != new_col.type_oid
+            || effective_typmod(old_col.atttypid, old_col.atttypmod)
+                != effective_typmod(new_col.type_oid, new_col.typmod)
+        {
             return Err(DdlError::Parse(format!(
                 "cannot change data type of view column \"{}\" from {} to {}",
                 old_col.attname,
@@ -266,6 +280,8 @@ fn replace_view(
             atttypmod: col.typmod,
             attidentity: None,
             attcollation: None,
+            attislocal: true,
+            attinhcount: 0,
         })
         .collect();
     interp.pg_attribute.insert(view_oid, attrs);
@@ -353,6 +369,8 @@ fn install_relation(
             atttypmod: col.typmod,
             attidentity: None,
             attcollation: None,
+            attislocal: true,
+            attinhcount: 0,
         });
     }
     interp.insert_pg_type(PgType {

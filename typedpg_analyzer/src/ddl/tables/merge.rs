@@ -53,6 +53,7 @@ pub(crate) fn assemble_columns(
     pk_columns: &[String],
 ) -> Result<AssembledColumns, DdlError> {
     let is_partition = stmt.partbound.is_some();
+    let relname = stmt.relation.as_ref().map_or("", |rv| rv.relname.as_str());
     let mut entries: Vec<Entry> = Vec::new();
     let mut likes: Vec<LikeCopy> = Vec::new();
 
@@ -63,7 +64,7 @@ pub(crate) fn assemble_columns(
     for elt in &stmt.table_elts {
         match elt.node.as_ref() {
             Some(node::Node::ColumnDef(cd)) => entries.push(Entry {
-                col: parse_column_def(interp, cd, pk_columns)?,
+                col: parse_column_def(interp, relname, cd, pk_columns)?,
                 has_type: cd.type_name.is_some(),
                 is_from_type: false,
             }),
@@ -103,6 +104,8 @@ pub(crate) fn assemble_columns(
             target.col.is_generated = opt.is_generated;
             target.col.identity = opt.identity;
             target.col.owned_sequence = opt.owned_sequence;
+            target.col.nn_local = opt.nn_local;
+            target.col.nn_name = opt.nn_name;
             target.is_from_type = false;
         }
         i += 1;
@@ -181,6 +184,12 @@ fn of_type_columns(
                 identity: None,
                 collation: attr.attcollation,
                 owned_sequence: None,
+                nn_local: false,
+                nn_name: None,
+                nn_inhcount: 0,
+                nn_inh_name: None,
+                is_local: true,
+                inhcount: 0,
             },
             has_type: true,
             is_from_type: true,
@@ -235,6 +244,12 @@ fn expand_like(
                 identity,
                 collation: attr.attcollation,
                 owned_sequence: identity.map(|_| crate::pg_catalog::DepType::Internal),
+                nn_local: copy_not_null && attr.attnotnull,
+                nn_name: None,
+                nn_inhcount: 0,
+                nn_inh_name: None,
+                is_local: true,
+                inhcount: 0,
             },
             has_type: true,
             is_from_type: false,
@@ -317,6 +332,9 @@ fn inherited_columns(
 
         for attr in interp.attributes_of(parent) {
             let identity = if is_partition { attr.attidentity } else { None };
+            let parent_nn = attr
+                .attnotnull
+                .then(|| super::inherit::not_null_name(interp, parent, attr.attnum));
             let has_default = attr.atthasdef && (attr.attidentity.is_none() || identity.is_some());
             if let Some(existing) = columns.iter_mut().find(|c| c.name == attr.attname) {
                 if existing.type_oid != attr.atttypid || existing.typmod != attr.atttypmod {
@@ -334,6 +352,11 @@ fn inherited_columns(
                 existing.not_null |= attr.attnotnull;
                 existing.has_default |= has_default;
                 existing.is_generated |= attr.attgenerated.is_some();
+                existing.inhcount += 1;
+                if let Some(nn) = parent_nn {
+                    existing.nn_inhcount += 1;
+                    existing.nn_inh_name.get_or_insert(nn);
+                }
                 continue;
             }
             columns.push(ParsedColumn {
@@ -346,6 +369,12 @@ fn inherited_columns(
                 identity,
                 collation: attr.attcollation,
                 owned_sequence: None,
+                nn_local: false,
+                nn_name: None,
+                nn_inhcount: i16::from(parent_nn.is_some()),
+                nn_inh_name: parent_nn,
+                is_local: false,
+                inhcount: 1,
             });
         }
     }
@@ -369,6 +398,11 @@ fn merge_child_column(inh: &mut ParsedColumn, local: ParsedColumn) -> Result<(),
         )));
     }
     inh.not_null |= local.not_null;
+    inh.nn_local |= local.nn_local;
+    if local.nn_name.is_some() {
+        inh.nn_name = local.nn_name;
+    }
+    inh.is_local = true;
     if local.has_default {
         inh.has_default = true;
     }
@@ -384,6 +418,10 @@ fn merge_child_column(inh: &mut ParsedColumn, local: ParsedColumn) -> Result<(),
 /// column.
 fn merge_partition_column(inh: &mut ParsedColumn, local: ParsedColumn) {
     inh.not_null |= local.not_null;
+    inh.nn_local |= local.nn_local;
+    if local.nn_name.is_some() {
+        inh.nn_name = local.nn_name;
+    }
     if local.has_default {
         inh.has_default = true;
     }

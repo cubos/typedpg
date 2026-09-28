@@ -306,7 +306,8 @@ fn export_attributes(client: &mut postgres::Client) -> Result<Vec<PgAttribute>, 
     // stay stable. No relkind filter: we mirror every relation's columns.
     let rows = client.query(
         "SELECT a.attrelid, a.attname, a.atttypid, a.attnum, a.attnotnull, a.atthasdef, \
-                a.attgenerated, a.atttypmod, a.attidentity, a.attcollation \
+                a.attgenerated, a.atttypmod, a.attidentity, a.attcollation, \
+                a.attislocal, a.attinhcount::int2 \
          FROM pg_catalog.pg_attribute a \
          WHERE a.attnum > 0 \
            AND NOT a.attisdropped \
@@ -333,6 +334,8 @@ fn export_attributes(client: &mut postgres::Client) -> Result<Vec<PgAttribute>, 
                 atttypmod: (atttypmod_raw >= 0).then_some(atttypmod_raw),
                 attidentity: char_to_attidentity(attidentity as u8 as char),
                 attcollation: PgCollationOid::new(attcollation),
+                attislocal: r.get(10),
+                attinhcount: r.get(11),
             }
         })
         .collect())
@@ -515,7 +518,8 @@ fn export_constraints(client: &mut postgres::Client) -> Result<Vec<PgConstraint>
     // No contype filter — `ConType::Other` is a catch-all so unknown chars
     // round-trip without panicking.
     let rows = client.query(
-        "SELECT oid, conname, conrelid, contype, conkey, confrelid, confkey \
+        "SELECT oid, conname, conrelid, contype, conkey, confrelid, confkey, \
+                conislocal, coninhcount::int2 \
          FROM pg_catalog.pg_constraint \
          ORDER BY oid",
         &[],
@@ -538,6 +542,8 @@ fn export_constraints(client: &mut postgres::Client) -> Result<Vec<PgConstraint>
                 conkey: conkey.unwrap_or_default(),
                 confrelid: PgClassOid::new(confrelid),
                 confkey: confkey.unwrap_or_default(),
+                conislocal: r.get(7),
+                coninhcount: r.get(8),
             })
         })
         .collect())
@@ -550,6 +556,7 @@ fn char_to_contype(c: char) -> ConType {
         'f' => ConType::ForeignKey,
         'c' => ConType::Check,
         'x' => ConType::Exclusion,
+        'n' => ConType::NotNull,
         _ => ConType::Other,
     }
 }

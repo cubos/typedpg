@@ -176,12 +176,58 @@ fn rename_column(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlErr
         ));
     };
 
-    if let Some(attrs) = interp.pg_attribute.get_mut(&relid)
-        && let Some(col) = attrs.iter_mut().find(|c| c.attname == stmt.subname)
-    {
-        col.attname = stmt.newname.clone();
+    rename_column_in(interp, relid, &stmt.subname, &stmt.newname, rv.inh, false)
+}
+
+/// `renameatt_internal` (tablecmds.c): the column must exist and the new
+/// name be free; an inherited column is renamed only through its parent,
+/// whose rename reaches every child (`ONLY` is refused while a child has
+/// the column).
+fn rename_column_in(
+    interp: &mut PgCatalog,
+    relid: crate::oid::PgClassOid,
+    old: &str,
+    new: &str,
+    recurse: bool,
+    recursing: bool,
+) -> Result<(), DdlError> {
+    let relname = interp
+        .pg_class
+        .get(&relid)
+        .map(|c| c.relname.clone())
+        .unwrap_or_default();
+    let Some(attr) = interp.attribute_by_name(relid, old).cloned() else {
+        return Err(DdlError::Parse(format!("column \"{old}\" does not exist")));
+    };
+    if !recursing && attr.attinhcount > 0 {
+        return Err(DdlError::Parse(format!(
+            "cannot rename inherited column \"{old}\""
+        )));
     }
-    views::rewrite_views_on_column_rename(interp, relid, &stmt.subname, &stmt.newname);
+    if interp.attribute_by_name(relid, new).is_some() {
+        return Err(DdlError::DuplicateObject(format!(
+            "column \"{new}\" of relation \"{relname}\" already exists"
+        )));
+    }
+    let children: Vec<crate::oid::PgClassOid> =
+        crate::ddl::tables::inherit::children_of(interp, relid)
+            .into_iter()
+            .filter(|&c| interp.attribute_by_name(c, old).is_some())
+            .collect();
+    if !recurse && !children.is_empty() {
+        return Err(DdlError::Parse(format!(
+            "inherited column \"{old}\" must be renamed in child tables too"
+        )));
+    }
+    for child in children {
+        rename_column_in(interp, child, old, new, true, true)?;
+    }
+    if let Some(attrs) = interp.pg_attribute.get_mut(&relid)
+        && let Some(col) = attrs.iter_mut().find(|c| c.attname == old)
+    {
+        col.attname = new.to_owned();
+    }
+    views::rewrite_views_on_column_rename(interp, relid, old, new);
     Ok(())
 }
 
