@@ -671,3 +671,25 @@ fn iso_date_field_overflow_rejected() {
         db.analyze(sql).unwrap();
     }
 }
+
+// ── record-typed literals and polymorphic defaults ──────────────────────────
+
+#[test]
+fn anonymous_record_literal_input_rejected() {
+    // record_in has no row type to parse into (PG 18: 0A000 at prepare).
+    let db = setup();
+    for sql in [
+        "SELECT min('(1,2)'::record) AS c",
+        "SELECT '(1,2)'::record AS c",
+        "SELECT ROW(1, 2) = '(1,2)' AS c",
+    ] {
+        let err = db.analyze(sql).expect_err(sql);
+        assert!(
+            err.to_string()
+                .starts_with("input of anonymous composite types is not implemented"),
+            "{sql}: {err}"
+        );
+    }
+    // An empty record[] literal never calls record_in.
+    db.analyze("SELECT '{}'::record[] AS c").unwrap();
+}

@@ -44,6 +44,11 @@ pub(crate) fn validate(
         oid::FLOAT4 => return validate_float(content, "real"),
         oid::FLOAT8 => return validate_float(content, "double precision"),
         oid::NUMERIC => return validate_numeric(content),
+        // record_in (rowtypes.c) can't build a value without a row type:
+        // `'(1,2)'::record` fails whatever the content (0A000).
+        oid::RECORD => {
+            return Err("input of anonymous composite types is not implemented".to_string());
+        }
         _ => {}
     }
 
