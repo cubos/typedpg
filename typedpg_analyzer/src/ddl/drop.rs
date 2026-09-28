@@ -58,6 +58,11 @@ pub fn drop_objects(interp: &mut PgCatalog, stmt: &DropStmt) -> Result<(), DdlEr
             ObjectType::ObjectPolicy => {
                 super::policies::drop_policy(interp, obj_node, stmt.missing_ok)?;
             }
+            ObjectType::ObjectAccessMethod
+            | ObjectType::ObjectOpclass
+            | ObjectType::ObjectOpfamily => {
+                super::opclass::drop_am_object(interp, obj_type, obj_node, stmt.missing_ok)?;
+            }
             ObjectType::ObjectRule => {
                 super::rules::drop_rule(interp, obj_node, stmt.missing_ok)?;
             }

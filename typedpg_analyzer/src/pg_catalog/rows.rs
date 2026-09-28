@@ -482,6 +482,37 @@ pub struct PgCollation {
     pub collencoding: i32,
 }
 
+/// `pg_am`: an index or table access method, by name (`amtype` `i` / `t`).
+#[derive(Debug, Clone, Serialize_tuple, Deserialize_tuple)]
+pub struct PgAm {
+    pub amname: String,
+    pub amtype: String,
+}
+
+/// `pg_opfamily`: an operator family of an access method.
+#[derive(Debug, Clone, Serialize_tuple, Deserialize_tuple)]
+pub struct PgOpfamily {
+    pub opfname: String,
+    /// FK `pg_namespace.oid`.
+    pub opfnamespace: PgNamespaceOid,
+    /// The access method's `amname`.
+    pub opfmethod: String,
+}
+
+/// `pg_opclass`: an operator class — the index behavior of a type under an
+/// access method; `opcdefault` ones are used when an index names none.
+#[derive(Debug, Clone, Serialize_tuple, Deserialize_tuple)]
+pub struct PgOpclass {
+    pub opcname: String,
+    /// FK `pg_namespace.oid`.
+    pub opcnamespace: PgNamespaceOid,
+    /// The access method's `amname`.
+    pub opcmethod: String,
+    /// FK `pg_type.oid`: the input type.
+    pub opcintype: PgTypeOid,
+    pub opcdefault: bool,
+}
+
 /// `pg_class`: a relation (table, view, matview, partitioned table, composite
 /// type's row type, sequence, index, …).
 ///

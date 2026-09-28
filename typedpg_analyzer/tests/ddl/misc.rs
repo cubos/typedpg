@@ -2067,3 +2067,147 @@ fn rename_constraint_needs_a_free_name() {
         ),
     ]);
 }
+
+#[test]
+fn access_methods_and_operator_classes() {
+    // PG 18 CreateAccessMethod / CreateOpFamily / DefineOpClass /
+    // DefineIndex / ResolveOpClass / GetDefaultOpClass.
+    let setup = "CREATE TABLE t (a int, j json, v int[], e text, r int4range);
+                 CREATE TYPE mood AS ENUM ('a', 'b');
+                 CREATE TABLE m (x mood);
+                 CREATE OPERATOR FAMILY f1 USING btree;";
+    for (stmt, msg) in [
+        (
+            "CREATE ACCESS METHOD x TYPE INDEX HANDLER nosuch;",
+            "function nosuch(internal) does not exist",
+        ),
+        (
+            "CREATE ACCESS METHOD y TYPE INDEX HANDLER heap_tableam_handler;",
+            "function heap_tableam_handler must return type index_am_handler",
+        ),
+        (
+            "CREATE ACCESS METHOD heap2 TYPE TABLE HANDLER heap_tableam_handler;
+             CREATE ACCESS METHOD heap2 TYPE TABLE HANDLER heap_tableam_handler;",
+            "access method \"heap2\" already exists",
+        ),
+        (
+            "CREATE OPERATOR CLASS c1 FOR TYPE int4 USING nosuch AS OPERATOR 1 <;",
+            "access method \"nosuch\" does not exist",
+        ),
+        (
+            "CREATE OPERATOR CLASS c1 FOR TYPE nosuch USING btree AS OPERATOR 1 <;",
+            "type \"nosuch\" does not exist",
+        ),
+        (
+            "CREATE OPERATOR CLASS c2 DEFAULT FOR TYPE int4 USING btree AS OPERATOR 1 <;",
+            "could not make operator class \"c2\" be default for type int4",
+        ),
+        (
+            "CREATE OPERATOR CLASS c3 FOR TYPE int4 USING btree FAMILY nosuch AS OPERATOR 1 <;",
+            "operator family \"nosuch\" does not exist for access method \"btree\"",
+        ),
+        (
+            "CREATE OPERATOR FAMILY f1 USING btree;",
+            "operator family \"f1\" for access method \"btree\" already exists",
+        ),
+        (
+            "CREATE OPERATOR FAMILY f2 USING nosuch;",
+            "access method \"nosuch\" does not exist",
+        ),
+        (
+            "CREATE OPERATOR CLASS c4 FOR TYPE int4 USING btree AS OPERATOR 1 <;
+             CREATE OPERATOR CLASS c4 FOR TYPE int4 USING btree AS OPERATOR 1 <;",
+            "operator class \"c4\" for access method \"btree\" already exists",
+        ),
+        (
+            "DROP OPERATOR CLASS nosuch USING btree;",
+            "operator class \"nosuch\" does not exist for access method \"btree\"",
+        ),
+        (
+            "DROP OPERATOR FAMILY nosuch USING btree;",
+            "operator family \"nosuch\" does not exist for access method \"btree\"",
+        ),
+        (
+            "DROP ACCESS METHOD nosuch;",
+            "access method \"nosuch\" does not exist",
+        ),
+        (
+            "DROP OPERATOR CLASS c4 USING nosuch;",
+            "access method \"nosuch\" does not exist",
+        ),
+        (
+            "CREATE INDEX ON t USING nosuch (a);",
+            "access method \"nosuch\" does not exist",
+        ),
+        (
+            "CREATE INDEX ON t (a nosuch_ops);",
+            "operator class \"nosuch_ops\" does not exist for access method \"btree\"",
+        ),
+        (
+            "CREATE INDEX ON t (a text_ops);",
+            "operator class \"text_ops\" does not accept data type integer",
+        ),
+        (
+            "CREATE INDEX ON t (j);",
+            "data type json has no default operator class for access method \"btree\"",
+        ),
+        (
+            "CREATE INDEX ON t USING gist (a);",
+            "data type integer has no default operator class for access method \"gist\"",
+        ),
+        (
+            "CREATE INDEX ON t USING hash (a DESC);",
+            "access method \"hash\" does not support ASC/DESC options",
+        ),
+        (
+            "CREATE INDEX ON t USING hash (a NULLS FIRST);",
+            "access method \"hash\" does not support NULLS FIRST/LAST options",
+        ),
+        (
+            "CREATE INDEX ON t USING gin (v) INCLUDE (a);",
+            "access method \"gin\" does not support included columns",
+        ),
+        (
+            "CREATE INDEX ON t USING spgist (e, a);",
+            "access method \"spgist\" does not support multicolumn indexes",
+        ),
+        (
+            "CREATE UNIQUE INDEX ON t USING hash (a);",
+            "access method \"hash\" does not support unique indexes",
+        ),
+        (
+            "CREATE INDEX ON t (a) INCLUDE (nosuch);",
+            "column \"nosuch\" does not exist",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "CREATE OPERATOR CLASS c4 FOR TYPE int4 USING btree FAMILY f1 AS OPERATOR 1 <;
+             DROP OPERATOR CLASS c4 USING btree;
+             DROP OPERATOR FAMILY f1 USING btree;
+             DROP OPERATOR CLASS IF EXISTS nosuch USING btree;
+             CREATE INDEX ON t (a);
+             CREATE INDEX ON t (e varchar_ops);
+             CREATE INDEX ON t USING gin (v);
+             CREATE INDEX ON t (v);
+             CREATE INDEX ON t (r);
+             CREATE INDEX ON t USING gist (r);
+             CREATE INDEX ON t USING brin (a);
+             CREATE INDEX ON t USING spgist (e);
+             CREATE INDEX ON t USING hash (e);
+             CREATE INDEX ON t (a DESC NULLS LAST) INCLUDE (e);
+             CREATE INDEX ON t ((a + 1));
+             CREATE INDEX ON t ((j->>'k'));
+             CREATE INDEX ON m (x);
+             CREATE EXTENSION pg_trgm;
+             CREATE INDEX ON t USING gin (e gin_trgm_ops);
+             CREATE EXTENSION btree_gist;
+             CREATE INDEX ON t USING gist (a);",
+        ),
+    ]);
+}

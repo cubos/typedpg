@@ -18,6 +18,7 @@ pub(crate) mod function_body;
 pub mod functions;
 pub mod indexes;
 mod maintenance;
+mod opclass;
 pub mod operators;
 mod policies;
 mod rules;
@@ -214,6 +215,9 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         node::Node::CreatePolicyStmt(s) => policies::create_policy(db, s),
         node::Node::AlterPolicyStmt(s) => policies::alter_policy(db, s),
         node::Node::RuleStmt(s) => rules::create_rule(db, s),
+        node::Node::CreateAmStmt(s) => opclass::create_am(db, s),
+        node::Node::CreateOpClassStmt(s) => opclass::create_opclass(db, s),
+        node::Node::CreateOpFamilyStmt(s) => opclass::create_opfamily(db, s),
         node::Node::TruncateStmt(s) => maintenance::truncate(db, s),
         node::Node::ClusterStmt(s) => maintenance::cluster(db, s),
         node::Node::ReindexStmt(s) => maintenance::reindex(db, s),
@@ -225,7 +229,6 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         | node::Node::ConstraintsSetStmt(_)
         | node::Node::CreateRoleStmt(_)
         | node::Node::AlterRoleStmt(_)
-        | node::Node::CreateOpClassStmt(_)
         | node::Node::AlterOpFamilyStmt(_)
         | node::Node::AlterOperatorStmt(_)
         | node::Node::DoStmt(_)
@@ -237,7 +240,6 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         | node::Node::ListenStmt(_)
         | node::Node::UnlistenStmt(_)
         | node::Node::AlterExtensionContentsStmt(_)
-        | node::Node::CreateAmStmt(_)
         // Statements PG accepts in a migration that don't change anything the
         // static analysis reads: DML and procedure calls (like the SELECT /
         // INSERT above), prepared statements and cursors, statistics,
@@ -271,7 +273,6 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         | node::Node::CreateSubscriptionStmt(_)
         | node::Node::AlterSubscriptionStmt(_)
         | node::Node::DropSubscriptionStmt(_)
-        | node::Node::CreateOpFamilyStmt(_)
         | node::Node::AlterTsconfigurationStmt(_)
         | node::Node::AlterTsdictionaryStmt(_)
         | node::Node::CreateFdwStmt(_)

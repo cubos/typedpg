@@ -17,11 +17,12 @@ use testcontainers::runners::SyncRunner;
 use testcontainers_modules::postgres::Postgres;
 use typedpg_analyzer::{
     AggKind, ArgMode, AttGenerated, AttIdentity, CastContext, CastMethod, ConType, DepType,
-    PgAggregate, PgAttribute, PgCast, PgCastOid, PgCatalog, PgCatalogSeed, PgClass, PgClassOid,
-    PgCollation, PgCollationOid, PgConstraint, PgConstraintOid, PgDepend, PgEnum, PgEnumOid,
-    PgExtension, PgExtensionOid, PgGenericOid, PgIndex, PgInherits, PgNamespace, PgNamespaceOid,
-    PgOperator, PgOperatorOid, PgProc, PgProcOid, PgRange, PgType, PgTypeOid, ProKind, ProVolatile,
-    QualifiedName, RelKind, TypCategory, TypStorage, TypType,
+    PgAggregate, PgAm, PgAttribute, PgCast, PgCastOid, PgCatalog, PgCatalogSeed, PgClass,
+    PgClassOid, PgCollation, PgCollationOid, PgConstraint, PgConstraintOid, PgDepend, PgEnum,
+    PgEnumOid, PgExtension, PgExtensionOid, PgGenericOid, PgIndex, PgInherits, PgNamespace,
+    PgNamespaceOid, PgOpclass, PgOperator, PgOperatorOid, PgOpfamily, PgProc, PgProcOid, PgRange,
+    PgType, PgTypeOid, ProKind, ProVolatile, QualifiedName, RelKind, TypCategory, TypStorage,
+    TypType,
 };
 
 fn main() {
@@ -112,6 +113,7 @@ fn export_catalog(client: &mut postgres::Client) -> Result<PgCatalogSeed, postgr
     let pg_collation = export_collations(client)?;
     let search_path = export_search_path(client, &pg_namespace)?;
     let sql_function_defs = export_sql_function_defs(client)?;
+    let (pg_am, pg_opfamily, pg_opclass) = export_access_methods(client)?;
 
     let _ = nsname_by_oid;
 
@@ -141,6 +143,9 @@ fn export_catalog(client: &mut postgres::Client) -> Result<PgCatalogSeed, postgr
         pg_collation,
         search_path,
         sql_function_defs,
+        pg_am,
+        pg_opfamily,
+        pg_opclass,
     };
     let scratch = PgCatalog::from_seed(seed.clone());
     seed.pg_index = export_indexes(client, &scratch)?;
@@ -799,6 +804,62 @@ fn export_depends(client: &mut postgres::Client) -> Result<Vec<PgDepend>, postgr
 }
 
 // ─── View definitions (second pass) ────────────────────────────────────────────
+
+/// `pg_am`, `pg_opfamily` and `pg_opclass` rows.
+type AccessMethodRows = (Vec<PgAm>, Vec<PgOpfamily>, Vec<PgOpclass>);
+
+/// Access methods, operator families and operator classes (by access
+/// method name).
+fn export_access_methods(
+    client: &mut postgres::Client,
+) -> Result<AccessMethodRows, postgres::Error> {
+    let am = client
+        .query(
+            "SELECT amname::text, amtype::text FROM pg_catalog.pg_am ORDER BY oid",
+            &[],
+        )?
+        .iter()
+        .map(|r| PgAm {
+            amname: r.get(0),
+            amtype: r.get(1),
+        })
+        .collect();
+    let opfamily = client
+        .query(
+            "SELECT f.opfname::text, f.opfnamespace, a.amname::text \
+             FROM pg_catalog.pg_opfamily f JOIN pg_catalog.pg_am a ON a.oid = f.opfmethod \
+             ORDER BY f.oid",
+            &[],
+        )?
+        .iter()
+        .filter_map(|r| {
+            Some(PgOpfamily {
+                opfname: r.get(0),
+                opfnamespace: PgNamespaceOid::new(r.get::<_, u32>(1))?,
+                opfmethod: r.get(2),
+            })
+        })
+        .collect();
+    let opclass = client
+        .query(
+            "SELECT c.opcname::text, c.opcnamespace, a.amname::text, c.opcintype, c.opcdefault \
+             FROM pg_catalog.pg_opclass c JOIN pg_catalog.pg_am a ON a.oid = c.opcmethod \
+             ORDER BY c.oid",
+            &[],
+        )?
+        .iter()
+        .filter_map(|r| {
+            Some(PgOpclass {
+                opcname: r.get(0),
+                opcnamespace: PgNamespaceOid::new(r.get::<_, u32>(1))?,
+                opcmethod: r.get(2),
+                opcintype: PgTypeOid::new(r.get::<_, u32>(3))?,
+                opcdefault: r.get(4),
+            })
+        })
+        .collect();
+    Ok((am, opfamily, opclass))
+}
 
 /// `pg_get_functiondef` of each non-set-returning `LANGUAGE sql` function;
 /// the analyzer keeps the inlinable ones' bodies (`inline_function`).

@@ -139,6 +139,12 @@ pub struct PgCatalogSeed {
     /// STABLE `textanycat` behind `text || anynonarray`.
     #[serde(default)]
     pub sql_function_defs: Vec<(PgProcOid, String)>,
+    #[serde(default)]
+    pub pg_am: Vec<PgAm>,
+    #[serde(default)]
+    pub pg_opfamily: Vec<PgOpfamily>,
+    #[serde(default)]
+    pub pg_opclass: Vec<PgOpclass>,
 }
 
 // ─── In-memory catalog ─────────────────────────────────────────────────────
@@ -175,6 +181,9 @@ pub struct PgCatalog {
     pub(crate) pg_index: HashMap<PgClassOid, PgIndex>,
     pg_rewrite: HashMap<PgRewriteOid, PgRewrite>,
     pub(crate) pg_collation: HashMap<PgCollationOid, PgCollation>,
+    pub(crate) pg_am: Vec<PgAm>,
+    pub(crate) pg_opfamily: Vec<PgOpfamily>,
+    pub(crate) pg_opclass: Vec<PgOpclass>,
 
     // ── Name-keyed indexes (built by `from_seed`, maintained by DDL) ──
     pub(crate) namespace_by_name: HashMap<String, PgNamespaceOid>,
@@ -435,6 +444,9 @@ impl PgCatalog {
             cat.pg_collation.insert(c.oid, c);
         }
         cat.search_path = seed.search_path;
+        cat.pg_am = seed.pg_am;
+        cat.pg_opfamily = seed.pg_opfamily;
+        cat.pg_opclass = seed.pg_opclass;
         for (oid, definition) in seed.sql_function_defs {
             cat.add_sql_function_def(oid, definition);
         }
@@ -469,6 +481,9 @@ impl PgCatalog {
             pg_index: HashMap::new(),
             pg_rewrite: HashMap::new(),
             pg_collation: HashMap::new(),
+            pg_am: Vec::new(),
+            pg_opfamily: Vec::new(),
+            pg_opclass: Vec::new(),
             namespace_by_name: HashMap::new(),
             type_by_qname: HashMap::new(),
             class_by_qname: HashMap::new(),
@@ -592,6 +607,9 @@ impl PgCatalog {
             pg_rewrite,
             pg_collation,
             search_path: self.search_path.clone(),
+            pg_am: self.pg_am.clone(),
+            pg_opfamily: self.pg_opfamily.clone(),
+            pg_opclass: self.pg_opclass.clone(),
             sql_function_defs: {
                 let mut defs: Vec<_> = self
                     .sql_function_defs

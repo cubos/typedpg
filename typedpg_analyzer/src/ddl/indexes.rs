@@ -48,6 +48,36 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
         }
     }
 
+    // DefineIndex: the access method and what it supports.
+    let am = if stmt.access_method.is_empty() {
+        "btree"
+    } else {
+        stmt.access_method.as_str()
+    };
+    if !super::opclass::am_exists(db, am) {
+        return Err(DdlError::TypeNotFound(format!(
+            "access method \"{am}\" does not exist"
+        )));
+    }
+    let caps = super::opclass::am_caps(am);
+    if let Some(caps) = caps.as_ref() {
+        if stmt.unique && !caps.can_unique {
+            return Err(DdlError::UnsupportedDdl(format!(
+                "access method \"{am}\" does not support unique indexes"
+            )));
+        }
+        if !stmt.index_including_params.is_empty() && !caps.can_include {
+            return Err(DdlError::UnsupportedDdl(format!(
+                "access method \"{am}\" does not support included columns"
+            )));
+        }
+        if stmt.index_params.len() > 1 && !caps.can_multicol {
+            return Err(DdlError::UnsupportedDdl(format!(
+                "access method \"{am}\" does not support multicolumn indexes"
+            )));
+        }
+    }
+
     if let Some(pred) = stmt.where_clause.as_deref() {
         super::expr_kind::check_expr_kind(db, pred, super::expr_kind::ExprKind::IndexPredicate)?;
         // transformWhereClause: a boolean over the table's row.
@@ -106,15 +136,54 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
         let Some(node::Node::IndexElem(elem)) = param.node.as_ref() else {
             continue;
         };
-        if !elem.name.is_empty() {
+        let column_type = if !elem.name.is_empty() {
             // ComputeIndexAttrs: `column "x" does not exist`.
             let an = *attnum_by_name.get(&elem.name).ok_or_else(|| {
                 DdlError::Parse(format!("column \"{}\" does not exist", elem.name))
             })?;
             indkey.push(an);
+            db.attribute_by_name(indrelid, &elem.name)
+                .map(|a| a.atttypid)
         } else if let Some(expr) = elem.expr.as_deref() {
             indkey.push(0);
             indexprs.push(serialize_node(expr));
+            match super::volatile::infer_over_relation(db, indrelid, expr, None) {
+                Some(Ok(t)) => Some(t.type_oid),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        // ResolveOpClass, then the ordering options (amcanorder).
+        if let Some(typ) = column_type {
+            super::opclass::resolve_index_opclass(db, &elem.opclass, typ, am)?;
+        }
+        if let Some(caps) = caps.as_ref()
+            && !caps.can_order
+        {
+            use pg_query::protobuf::{SortByDir, SortByNulls};
+            if elem.ordering != SortByDir::SortbyDefault as i32 {
+                return Err(DdlError::UnsupportedDdl(format!(
+                    "access method \"{am}\" does not support ASC/DESC options"
+                )));
+            }
+            if elem.nulls_ordering != SortByNulls::SortbyNullsDefault as i32 {
+                return Err(DdlError::UnsupportedDdl(format!(
+                    "access method \"{am}\" does not support NULLS FIRST/LAST options"
+                )));
+            }
+        }
+    }
+    // INCLUDE columns must exist.
+    for param in &stmt.index_including_params {
+        if let Some(node::Node::IndexElem(elem)) = param.node.as_ref()
+            && !elem.name.is_empty()
+            && !attnum_by_name.contains_key(&elem.name)
+        {
+            return Err(DdlError::Parse(format!(
+                "column \"{}\" does not exist",
+                elem.name
+            )));
         }
     }
     let indpred = stmt.where_clause.as_deref().map(serialize_node);
