@@ -295,3 +295,59 @@ fn comment_on_requires_an_existing_target() {
          COMMENT ON SCHEMA public IS 'p';",
     )]);
 }
+
+#[test]
+fn grant_targets_must_exist() {
+    // PG 18 resolves every object a GRANT / REVOKE names.
+    let setup = "CREATE TABLE t (a int);";
+    for (stmt, msg) in [
+        (
+            "GRANT SELECT ON nosuch TO public;",
+            "relation \"nosuch\" does not exist",
+        ),
+        (
+            "REVOKE ALL ON nosuch FROM public;",
+            "relation \"nosuch\" does not exist",
+        ),
+        (
+            "GRANT SELECT ON ALL TABLES IN SCHEMA nosch TO public;",
+            "schema \"nosch\" does not exist",
+        ),
+        (
+            "GRANT EXECUTE ON FUNCTION nosuch(int) TO public;",
+            "function nosuch(integer) does not exist",
+        ),
+        (
+            "GRANT USAGE ON SCHEMA nosch TO public;",
+            "schema \"nosch\" does not exist",
+        ),
+        (
+            "GRANT USAGE ON SEQUENCE nosuch TO public;",
+            "relation \"nosuch\" does not exist",
+        ),
+        (
+            "GRANT SELECT (nosuchcol) ON t TO public;",
+            "column \"nosuchcol\" of relation \"t\" does not exist",
+        ),
+        (
+            "GRANT USAGE ON TYPE nosuch TO public;",
+            "type \"nosuch\" does not exist",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int); CREATE SEQUENCE s;
+         CREATE FUNCTION f(int) RETURNS int LANGUAGE sql AS 'select 1';
+         GRANT SELECT, INSERT ON t TO public;
+         GRANT SELECT (a) ON t TO public;
+         GRANT USAGE ON SEQUENCE s TO public;
+         GRANT EXECUTE ON FUNCTION f(int) TO public;
+         GRANT EXECUTE ON FUNCTION f TO public;
+         GRANT USAGE ON SCHEMA public TO public;
+         GRANT SELECT ON ALL TABLES IN SCHEMA public TO public;
+         REVOKE ALL ON t FROM public;",
+    )]);
+}

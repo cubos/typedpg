@@ -4,6 +4,7 @@
 //! This module parses SQL migration files using `pg_query` and mutates the
 //! snapshot as if the DDL had been executed against a real PostgreSQL instance.
 
+mod acl;
 pub mod aggregates;
 pub mod alter;
 pub mod collations;
@@ -192,7 +193,8 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         // ── No-ops (irrelevant for type analysis) ───────────────────
         node::Node::CommentStmt(s) => comment::comment_on(db, s),
         node::Node::CreateTrigStmt(s) => triggers::create_trigger(db, s),
-        node::Node::GrantStmt(_)
+        node::Node::GrantStmt(s) => acl::grant(db, s),
+        node::Node::GrantRoleStmt(_)
         | node::Node::RuleStmt(_)
         | node::Node::ConstraintsSetStmt(_)
         | node::Node::CreatePolicyStmt(_)
@@ -201,7 +203,6 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         | node::Node::AlterDefaultPrivilegesStmt(_)
         | node::Node::CreateRoleStmt(_)
         | node::Node::AlterRoleStmt(_)
-        | node::Node::GrantRoleStmt(_)
         | node::Node::CreateOpClassStmt(_)
         | node::Node::AlterOpFamilyStmt(_)
         | node::Node::AlterOperatorStmt(_)
