@@ -82,6 +82,21 @@ fn names_select_the_overload() {
 }
 
 #[test]
+fn overloads_matching_the_names_alike_are_not_unique() {
+    let mut db = setup();
+    db.apply_sql(
+        "CREATE FUNCTION pk(a INT) RETURNS TEXT AS $$ SELECT 'one' $$ LANGUAGE sql;
+         CREATE FUNCTION pk(a INT, b TEXT DEFAULT 'x') RETURNS INT AS $$ SELECT 2 $$ LANGUAGE sql;",
+    )
+    .unwrap();
+    assert_err_starts_with(
+        &db,
+        "SELECT pk(a => 1)",
+        "function pk(a => integer) is not unique",
+    );
+}
+
+#[test]
 fn types_select_among_same_named_overloads() {
     let db = setup();
     let s = db

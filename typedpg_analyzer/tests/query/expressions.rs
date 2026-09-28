@@ -1130,6 +1130,123 @@ fn variadic_any_with_one_variadic_arg_accepted() {
     );
 }
 
+/// User-defined variadic overloads shared by the expansion tests below.
+fn setup_variadic() -> PgCatalog {
+    let mut db = setup();
+    db.apply_sql(
+        "CREATE FUNCTION f_var(VARIADIC xs INT[]) RETURNS INT
+             AS $$ SELECT array_length(xs, 1) $$ LANGUAGE sql;
+         CREATE FUNCTION f_var_any(VARIADIC xs anyarray) RETURNS anyelement
+             AS $$ SELECT xs[1] $$ LANGUAGE sql;
+         CREATE FUNCTION ov(a INT) RETURNS TEXT AS $$ SELECT 'plain' $$ LANGUAGE sql;
+         CREATE FUNCTION ov(VARIADIC a INT[]) RETURNS INT AS $$ SELECT 1 $$ LANGUAGE sql;
+         CREATE FUNCTION ov2(a INT, VARIADIC b INT[]) RETURNS TEXT
+             AS $$ SELECT 'x' $$ LANGUAGE sql;
+         CREATE FUNCTION ov2(VARIADIC a INT[]) RETURNS INT AS $$ SELECT 1 $$ LANGUAGE sql;",
+    )
+    .unwrap();
+    db
+}
+
+#[test]
+fn variadic_tail_takes_the_element_type() {
+    // Unknown literals and params in the variadic tail are coerced to the
+    // element type (`text`), not the declared `text[]`.
+    let db = setup();
+    let s = db
+        .analyze(
+            "SELECT jsonb_extract_path('{}'::jsonb, 'a', 'b') AS p,
+                    jsonb_extract_path_text('{}'::jsonb, $x, $y) AS t",
+        )
+        .unwrap();
+    assert_eq!(col(&s, "p").pg_type, jsonb());
+    assert_eq!(col(&s, "t").pg_type, text());
+    assert_eq!(
+        s.params
+            .iter()
+            .map(|p| p.pg_type.clone())
+            .collect::<Vec<_>>(),
+        vec![text(), text()]
+    );
+    assert_err_prefix(
+        &db,
+        "SELECT jsonb_extract_path('{}'::jsonb)",
+        "function jsonb_extract_path(jsonb) does not exist",
+    );
+}
+
+#[test]
+fn user_variadic_functions_expand_to_the_call() {
+    let db = setup_variadic();
+    let s = db
+        .analyze(
+            "SELECT f_var(1, 2, 3) AS a, f_var_any(1, 2) AS b,
+                    f_var(VARIADIC ARRAY[1, 2]) AS c,
+                    f_var_any(VARIADIC ARRAY['a'::text]) AS d",
+        )
+        .unwrap();
+    assert_cols(
+        &s,
+        vec![
+            cn("a", int4()),
+            cn("b", int4()),
+            cn("c", int4()),
+            cn("d", text()),
+        ],
+    );
+    // No variadic element, or the array passed without the keyword.
+    assert_err_prefix(&db, "SELECT f_var()", "function f_var() does not exist");
+    assert_err_prefix(
+        &db,
+        "SELECT f_var(ARRAY[1, 2])",
+        "function f_var(integer[]) does not exist",
+    );
+    assert_err_prefix(
+        &db,
+        "SELECT f_var(VARIADIC 1)",
+        "function f_var(integer) does not exist",
+    );
+}
+
+#[test]
+fn variadic_keyword_on_a_plain_function_is_a_positional_call() {
+    let db = setup();
+    let s = db.analyze("SELECT upper(VARIADIC 'a') AS u").unwrap();
+    assert_eq!(col(&s, "u").pg_type, text());
+    assert_err_prefix(
+        &db,
+        "SELECT upper(VARIADIC ARRAY['a'])",
+        "function upper(text[]) does not exist",
+    );
+}
+
+#[test]
+fn non_variadic_overload_beats_an_equal_variadic_expansion() {
+    let db = setup_variadic();
+    let s = db
+        .analyze("SELECT ov(1) AS plain, ov(1, 2) AS spread, ov2(1) AS one")
+        .unwrap();
+    assert_cols(
+        &s,
+        vec![cn("plain", text()), cn("spread", int4()), cn("one", int4())],
+    );
+    // Two variadic expansions with the same signature stay tied.
+    assert_err_prefix(
+        &db,
+        "SELECT ov2(1, 2)",
+        "function ov2(integer, integer) is not unique",
+    );
+}
+
+#[track_caller]
+fn assert_err_prefix(db: &PgCatalog, sql: &str, expected: &str) {
+    let err = db.analyze(sql).unwrap_err();
+    assert!(
+        err.to_string().starts_with(expected),
+        "expected `{expected}` for `{sql}`, got: {err}"
+    );
+}
+
 // ── Ambiguous overload resolution (SQLSTATE 42725) ──────────────────────────
 
 #[test]

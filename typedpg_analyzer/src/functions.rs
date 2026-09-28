@@ -1,5 +1,7 @@
 //! Function and aggregate resolution.
 
+use std::borrow::Cow;
+
 use crate::error::AnalyzeError;
 use crate::oid::PgTypeOid;
 use crate::pg_catalog::{ArgMode, PgCatalog, PgProc, ProKind, TypCategory, TypType, oid};
@@ -135,18 +137,21 @@ pub(crate) fn resolve_function(
     _is_agg_star: bool,
     span: Option<crate::error::SourceSpan>,
 ) -> Result<ResolvedFunction, AnalyzeError> {
-    let mut all_matches = snapshot.find_functions(schema, name);
-    // A named/mixed-notation call only reaches the overloads whose parameter
-    // names fit it; each survivor is re-ordered into the call's argument
-    // order, so every positional matching pass below applies unchanged.
-    let named_matches: Vec<PgProc>;
-    if !notation.names.is_empty() {
-        named_matches = all_matches
+    let found = snapshot.find_functions(schema, name);
+    // Each overload is turned into the signature it offers this call — a
+    // named/mixed-notation call re-orders the parameters its names fit, a
+    // variadic function is expanded to the call's arity — so every matching
+    // pass below compares plain positional signatures.
+    let effective = drop_shadowed(if notation.names.is_empty() {
+        expand_variadic_candidates(&found, arg_types.len(), notation.variadic)
+    } else {
+        found
             .iter()
             .filter_map(|f| match_named_call(f, arg_types.len(), notation))
-            .collect();
-        all_matches = named_matches.iter().collect();
-    }
+            .map(|f| (Cow::Owned(f), false))
+            .collect()
+    });
+    let all_matches: Vec<&PgProc> = effective.iter().map(|f| &**f).collect();
     let candidates: Vec<&PgProc> = all_matches
         .iter()
         .copied()
@@ -178,7 +183,13 @@ pub(crate) fn resolve_function(
         })
         .collect::<Vec<_>>()
         .join(", ");
-    if candidates.is_empty() {
+    // Functions (not procedures) of this name at all, before any overload
+    // was filtered out for not fitting the call.
+    let functions_named = found
+        .iter()
+        .filter(|f| !matches!(f.prokind, ProKind::Procedure))
+        .count();
+    if functions_named == 0 {
         // PG distinguishes "function not found at all" from "the name
         // resolves but only to a procedure" (SQLSTATE 42809). Mirror that
         // so the sanity check matches PG verbatim.
@@ -235,8 +246,22 @@ pub(crate) fn resolve_function(
         .collect();
     let match_types = match_types.as_slice();
 
-    if let Some(f) = find_exact_match(&candidates, match_types) {
-        return Ok(make_resolved(f, snapshot));
+    // Several exact matches only arise from repeated signatures (variadic
+    // expansions, named notation); PG can't choose between them either.
+    match candidates
+        .iter()
+        .filter(|f| f.proargtypes == match_types)
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
+        [] => {}
+        [f] => return Ok(make_resolved(f, snapshot)),
+        _ => {
+            return Err(
+                crate::pgmsg::function_is_not_unique(&qualified, &arg_list_actual, span)
+                    .finalize_implicit(),
+            );
+        }
     }
     if let Some(f) = find_unknown_compatible_match(&candidates, match_types) {
         return Ok(make_resolved(f, snapshot));
@@ -298,38 +323,6 @@ pub(crate) fn resolve_function(
     // concrete parameter with a non-coercible actual is NOT accepted — that's a
     // genuine `does not exist`, e.g. `jsonb_typeof(numeric)`, which PG rejects.
     let args_fit = |f: &PgProc| {
-        if let Some(var_elem) = f.provariadic {
-            // Variadic: the first N-1 declared params are fixed and the trailing
-            // slot absorbs args of the variadic element type (`provariadic`).
-            // The fixed params must still match — so `concat_ws(integer)` is
-            // rejected (its `text` separator can't take an int), while
-            // `concat_ws(text, int, …)` is accepted.
-            let n = f.proargtypes.len();
-            if n == 0 {
-                return true;
-            }
-            let fixed = n - 1;
-            // A `VARIADIC "any"` function is NOT expanded like an array
-            // variadic: PG requires at least one argument in the variadic
-            // position, so the minimum call arity is N, not N-1. That's why
-            // `concat()` and `concat_ws('x')` don't exist, while array-element
-            // variadics may take zero trailing args.
-            let var_is_any = snapshot
-                .get_type(var_elem)
-                .is_some_and(|t| t.typname == "any");
-            let min_args = if var_is_any { n } else { fixed };
-            if arg_types.len() < min_args {
-                return false;
-            }
-            let fixed_ok = f.proargtypes[..fixed]
-                .iter()
-                .zip(arg_types)
-                .all(|(&p, &a)| param_accepts(p, a));
-            let tail_ok = arg_types[fixed..]
-                .iter()
-                .all(|&a| param_accepts(var_elem, a));
-            return fixed_ok && tail_ok;
-        }
         f.proargtypes.len() == arg_types.len()
             && f.proargtypes
                 .iter()
@@ -364,7 +357,7 @@ pub(crate) fn resolve_function(
         name,
         format!(
             "function {qualified}({arg_list_actual}) does not exist (found {} candidate(s))",
-            candidates.len()
+            functions_named
         ),
         span,
     ))
@@ -381,6 +374,72 @@ pub(crate) fn undefined_function_error(
     let hint = crate::suggest::suggest_similar(name, snapshot.visible_function_names(schema))
         .map(|c| format!("did you mean \"{c}\"?"));
     crate::error::RawError::undefined_function(message, span, hint).finalize_implicit()
+}
+
+/// PG's variadic handling in `FuncnameGetCandidates` (namespace.c) for a
+/// positional call with `nargs` arguments. Without the `VARIADIC` keyword a
+/// variadic function only matches calls supplying at least one variadic
+/// element, as if declared with that many parameters of its element type
+/// (`provariadic`); with the keyword every function is matched on its
+/// declared signature. Each candidate is paired with whether it is a
+/// variadic expansion.
+fn expand_variadic_candidates<'a>(
+    found: &[&'a PgProc],
+    nargs: usize,
+    variadic_keyword: bool,
+) -> Vec<(Cow<'a, PgProc>, bool)> {
+    found
+        .iter()
+        .filter_map(|&f| match f.provariadic {
+            None => Some((Cow::Borrowed(f), false)),
+            Some(_) if variadic_keyword => {
+                let mut plain = f.clone();
+                plain.provariadic = None;
+                Some((Cow::Owned(plain), false))
+            }
+            Some(elem) => {
+                let fixed = f.proargtypes.len() - 1;
+                if nargs <= fixed {
+                    return None;
+                }
+                let mut spread = f.clone();
+                spread.proargtypes.truncate(fixed);
+                spread.proargtypes.resize(nargs, elem);
+                spread.provariadic = None;
+                Some((Cow::Owned(spread), true))
+            }
+        })
+        .collect()
+}
+
+/// PG's duplicate-signature rule in `FuncnameGetCandidates`, over candidates
+/// in search-path order paired with whether each is a variadic expansion:
+/// when a signature repeats, the schema earlier on the search path wins, and
+/// within one schema a non-variadic function beats a variadic expansion.
+/// Other same-schema duplicates stay, and resolution reports them as
+/// `is not unique`.
+fn drop_shadowed<'a>(candidates: Vec<(Cow<'a, PgProc>, bool)>) -> Vec<Cow<'a, PgProc>> {
+    let mut out: Vec<(Cow<'a, PgProc>, bool)> = Vec::new();
+    for (candidate, expanded) in candidates {
+        if let Some(prev) = out
+            .iter()
+            .position(|(c, _)| c.proargtypes == candidate.proargtypes)
+        {
+            if out[prev].0.pronamespace != candidate.pronamespace {
+                continue;
+            }
+            match (out[prev].1, expanded) {
+                (true, false) => {
+                    out[prev] = (candidate, false);
+                    continue;
+                }
+                (false, true) => continue,
+                _ => {}
+            }
+        }
+        out.push((candidate, expanded));
+    }
+    out.into_iter().map(|(c, _)| c).collect()
 }
 
 /// PG's `MatchNamedCall` (namespace.c): map a named/mixed-notation call
@@ -460,13 +519,6 @@ fn find_unknown_compatible_match<'a>(
     } else {
         None
     }
-}
-
-fn find_exact_match<'a>(candidates: &[&'a PgProc], arg_types: &[PgTypeOid]) -> Option<&'a PgProc> {
-    candidates
-        .iter()
-        .find(|f| f.proargtypes == arg_types)
-        .copied()
 }
 
 fn find_default_args_match<'a>(
