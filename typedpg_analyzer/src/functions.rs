@@ -86,6 +86,9 @@ pub(crate) struct ResolvedFunction {
     /// matched `pg_proc`'s `proallargtypes`/`proargmodes`/`proargnames`.
     /// Empty for plain scalar returns.
     pub out_args: Vec<OutArg>,
+    /// `proname(typname,…)` of the matched overload's declared
+    /// `proargtypes` — the key of the builtin nullability tables.
+    pub signature: String,
 }
 
 /// What a call resolved to — PG's `FuncDetailCode` for the successful
@@ -95,35 +98,6 @@ pub(crate) enum FuncDetail {
     Routine(ResolvedFunction),
     Coercion(PgTypeOid),
 }
-
-/// pg_catalog strict functions that can still return NULL with non-null inputs.
-const NULLABLE_STRICT_PG_CATALOG_FUNCTIONS: &[&str] = &[
-    "array_position",
-    "array_upper",
-    "array_lower",
-    "array_length",
-    "regexp_match",
-    "regexp_matches",
-    "substring",
-    "json_object_field",
-    "json_object_field_text",
-    "json_array_element",
-    "json_array_element_text",
-    "jsonb_object_field",
-    "jsonb_object_field_text",
-    "jsonb_array_element",
-    "jsonb_array_element_text",
-    "jsonb_path_query_first",
-    "jsonb_path_match",
-    "jsonb_extract_path",
-    "jsonb_extract_path_text",
-    "json_extract_path",
-    "json_extract_path_text",
-    "nullif",
-    "obj_description",
-    "col_description",
-    "shobj_description",
-];
 
 /// pg_catalog operators that can return NULL with non-null inputs.
 const NULLABLE_PG_CATALOG_OPERATORS: &[&str] = &["->", "->>", "#>", "#>>"];
@@ -331,6 +305,18 @@ pub(crate) fn func_get_detail(
         is_window: matches!(f.prokind, ProKind::Window),
         is_strict: f.proisstrict,
         out_args,
+        signature: format!(
+            "{}({})",
+            f.proname,
+            f.proargtypes
+                .iter()
+                .map(|t| snapshot
+                    .get_type(*t)
+                    .map(|ty| ty.typname.as_str())
+                    .unwrap_or("?"))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
     }))
 }
 
@@ -723,63 +709,33 @@ fn aggregate_final_return(f: &PgProc, snapshot: &PgCatalog) -> Option<PgTypeOid>
     snapshot.pg_proc.get(&final_oid).map(|p| p.prorettype)
 }
 
-pub(crate) fn is_nullable_strict_exception(name: &str) -> bool {
-    NULLABLE_STRICT_PG_CATALOG_FUNCTIONS.contains(&name)
-}
-
 pub(crate) fn is_nullable_operator(name: &str) -> bool {
     NULLABLE_PG_CATALOG_OPERATORS.contains(&name)
 }
 
-const NOT_NULL_NONSTRICT_PG_CATALOG_FUNCTIONS: &[&str] = &[
-    "concat",
-    "format",
-    "now",
-    "transaction_timestamp",
-    "statement_timestamp",
-    "clock_timestamp",
-    "timeofday",
-    "current_timestamp",
-    "current_date",
-    "localtime",
-    "localtimestamp",
-    "current_user",
-    "session_user",
-    "current_schema",
-    "current_database",
-    "current_catalog",
-    "inet_client_addr",
-    "inet_server_addr",
-    "pg_backend_pid",
-    "pg_postmaster_start_time",
-    "version",
-    "random",
-    "gen_random_uuid",
-    "setseed",
-    "nextval",
-    "currval",
-    "lastval",
-    "setval",
-    "txid_current",
-    "txid_current_if_assigned",
-    "array_cat",
-    "array_append",
-    "array_prepend",
-    "coalesce",
-    "greatest",
-    "least",
-    "json_build_object",
-    "jsonb_build_object",
-    "json_build_array",
-    "jsonb_build_array",
-    "row_number",
-    "rank",
-    "dense_rank",
-    "percent_rank",
-    "cume_dist",
-    "ntile",
-];
-
-pub(crate) fn is_not_null_nonstrict(name: &str) -> bool {
-    NOT_NULL_NONSTRICT_PG_CATALOG_FUNCTIONS.contains(&name)
+/// Whether a `pg_catalog` routine's result can be NULL, given which of the
+/// call's arguments can be (`builtin_nullability` has the derivation). A
+/// strict function is NULL exactly on a NULL argument unless it is one of
+/// the known NULL-returning overloads; a non-strict one is nullable unless
+/// known never to be, or to be NULL only on NULL arguments.
+pub(crate) fn builtin_result_nullable(
+    resolved: &ResolvedFunction,
+    args_nullable: &[bool],
+    variadic_keyword: bool,
+) -> bool {
+    use crate::builtin_nullability::*;
+    let sig = resolved.signature.as_str();
+    let any_nullable = args_nullable.iter().any(|&n| n);
+    if resolved.is_strict {
+        any_nullable || NULLABLE_STRICT.contains(&sig)
+    } else if NEVER_NULL_NONSTRICT.contains(&sig) {
+        false
+    } else if NULL_ONLY_ON_VARIADIC_NULL.contains(&sig) {
+        variadic_keyword && any_nullable
+    } else if sig == "concat_ws(text,any)" {
+        // A NULL separator makes the result NULL; other NULLs are skipped.
+        args_nullable.first() == Some(&true) || (variadic_keyword && any_nullable)
+    } else {
+        !NULL_ONLY_ON_NULL_ARG.contains(&sig) || any_nullable
+    }
 }

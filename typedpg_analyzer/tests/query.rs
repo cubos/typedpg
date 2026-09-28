@@ -58,6 +58,8 @@ mod arrays;
 mod collation;
 #[path = "query/full_text_search.rs"]
 mod full_text_search;
+#[path = "query/function_nullability.rs"]
+mod function_nullability;
 #[path = "query/function_resolution.rs"]
 mod function_resolution;
 #[path = "query/grouping_sets.rs"]

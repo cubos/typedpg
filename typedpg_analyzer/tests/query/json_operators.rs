@@ -201,13 +201,12 @@ fn jsonb_set_lax_two_arg_defaults() {
     let db = setup();
     // `jsonb_set_lax` has 2 trailing default args (`create_if_missing` and
     // `null_value_treatment`); the 3-required-arg call must resolve.
-    // PG marks `jsonb_set_lax` as non-strict, so the analyzer is allowed
-    // to keep the result nullable (a NULL new_value can yield NULL via
-    // the default `null_value_treatment = 'use_json_null'`).
+    // `jsonb_set_lax` is non-strict, but its only NULL results come from
+    // NULL arguments, so non-NULL arguments give a non-NULL result.
     let s = db
         .analyze("SELECT jsonb_set_lax(meta, '{a}', '1'::jsonb) AS m FROM users")
         .unwrap();
-    assert_cols(&s, vec![cn("m", jsonb())]);
+    assert_cols(&s, vec![c("m", jsonb())]);
 }
 
 // ── Subscripting: data['key'], data[0], chained ─────────────────────────────

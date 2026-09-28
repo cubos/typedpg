@@ -361,6 +361,59 @@ fn walk_func_modifiers(
     Ok(())
 }
 
+/// `EXTRACT(field FROM ts)` / `date_part('field', ts)` over a timestamp or
+/// date is NULL only for an infinite input with a field that has no
+/// infinite value (`month`, `day`, …); the fields PG's
+/// `NonFiniteTimestampTzPart` maps to ±Infinity (`year`, `epoch`, … in any
+/// of `datetime.c`'s spellings) never are. With such a literal field the
+/// call is NULL exactly when an argument is.
+fn extract_unit_is_infinite_safe(
+    func: &protobuf::FuncCall,
+    resolved: &functions::ResolvedFunction,
+) -> bool {
+    const INFINITE_FIELDS: &[&str] = &[
+        "epoch",
+        "isoyear",
+        "j",
+        "jd",
+        "julian",
+        "y",
+        "year",
+        "years",
+        "yr",
+        "yrs",
+        "c",
+        "cent",
+        "centuries",
+        "century",
+        "dec",
+        "decade",
+        "decades",
+        "decs",
+        "mil",
+        "millennia",
+        "millennium",
+        "mils",
+    ];
+    let over_timestamp = matches!(
+        resolved.signature.as_str(),
+        "extract(text,timestamp)"
+            | "extract(text,timestamptz)"
+            | "extract(text,date)"
+            | "date_part(text,timestamp)"
+            | "date_part(text,timestamptz)"
+            | "date_part(text,date)"
+    );
+    over_timestamp
+        && matches!(
+            func.args.first().and_then(|a| a.node.as_ref()),
+            Some(node::Node::AConst(protobuf::AConst {
+                val: Some(pg_query::protobuf::a_const::Val::Sval(sv)),
+                ..
+            })) if INFINITE_FIELDS.contains(&sv.sval.to_lowercase().as_str())
+        )
+}
+
 /// Decide whether a function/aggregate/window call's result is nullable.
 ///
 /// Covers value-window edge NULLs (`lag`/`lead`/…), aggregate emptiness
@@ -417,19 +470,12 @@ fn resolve_func_nullability(
             // Without GROUP BY, non-COUNT aggregates return NULL for empty tables.
             true
         }
-    } else if resolved.is_strict && resolved.schema == "pg_catalog" {
-        if functions::is_nullable_strict_exception(name) {
-            true
-        } else {
-            args.any_nullable
-        }
-    } else if resolved.schema == "pg_catalog" && name == "concat_ws" {
-        // `concat_ws(sep, …)` is non-strict for the variadic args (NULLs are
-        // skipped), but a NULL separator makes the whole result NULL.
-        arg_is_nullable(0)
+    } else if resolved.schema == "pg_catalog" && extract_unit_is_infinite_safe(func, resolved) {
+        args.any_nullable
+    } else if resolved.schema == "pg_catalog" {
+        functions::builtin_result_nullable(resolved, &args.nullable, func.func_variadic)
     } else {
-        !(!resolved.is_strict
-            && resolved.schema == "pg_catalog"
-            && functions::is_not_null_nonstrict(name))
+        // A user-defined function can return NULL whatever its inputs.
+        true
     }
 }

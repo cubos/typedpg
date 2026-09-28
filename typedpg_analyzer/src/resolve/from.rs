@@ -754,8 +754,12 @@ fn srf_function_columns(
         // Strict pg_catalog SRFs (e.g. `unnest`) propagate NOT NULL from their
         // arguments — `FROM unnest(int4[] NOT NULL)` produces NOT NULL int4
         // elements, just like `SELECT unnest(arr)` in the projection.
-        let strict_not_null =
-            resolved.is_strict && resolved.schema == "pg_catalog" && !args.any_nullable;
+        let strict_not_null = resolved.schema == "pg_catalog"
+            && !functions::builtin_result_nullable(
+                &resolved,
+                &[args.any_nullable],
+                func_call.func_variadic,
+            );
         // PG names a lone scalar function's column after the alias:
         // `FROM generate_series(1, 3) AS g` exposes column `g`. With several
         // `ROWS FROM` functions each column keeps its function's name.

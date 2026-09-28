@@ -658,7 +658,8 @@ fn extract_unresolved_reports_pg_catalog_qualified_name() {
 fn sql_value_functions_infer_types() {
     // pg_query emits these as `SQLValueFunction` (with a 0 result OID in the raw
     // tree); the analyzer used to reject every one with "expression node type
-    // not supported". Each maps to a concrete, NOT-NULL type.
+    // not supported". Each maps to a concrete, NOT-NULL type — except
+    // CURRENT_SCHEMA, NULL when no search-path schema exists.
     let db = setup();
     let s = db
         .analyze(
@@ -676,7 +677,7 @@ fn sql_value_functions_infer_types() {
             c("lts", timestamp()),
             c("lt", time_ty()),
             c("u", name_ty()),
-            c("sch", name_ty()),
+            cn("sch", name_ty()),
             c("cat", name_ty()),
             c("su", name_ty()),
         ],

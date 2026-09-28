@@ -720,7 +720,7 @@ pub(crate) fn infer_expr(
             // SQL value functions: `CURRENT_DATE`, `CURRENT_TIMESTAMP`,
             // `CURRENT_USER`, `CURRENT_SCHEMA`, `LOCALTIME`, … pg_query leaves
             // the result OID at 0 in the raw tree, so map the op ourselves
-            // (PG's gram.y assigns these). All are non-strict and never NULL.
+            // (PG's gram.y assigns these). All but CURRENT_SCHEMA are never NULL.
             use protobuf::SqlValueFunctionOp as Op;
             let op = protobuf::SqlValueFunctionOp::try_from(svf.op)
                 .unwrap_or(Op::SqlvalueFunctionOpUndefined);
@@ -748,7 +748,10 @@ pub(crate) fn infer_expr(
             // `any{time,timestamp}_typmod_check`; we don't — that's the same
             // per-value validation family we defer elsewhere.)
             let typmod = (svf.typmod >= 0).then_some(svf.typmod);
-            Ok(ExprType::scalar_with_typmod(type_oid, false, typmod))
+            // `CURRENT_SCHEMA` evaluates `current_schema()`, which is NULL
+            // when no schema on the search path exists.
+            let nullable = op == Op::SvfopCurrentSchema;
+            Ok(ExprType::scalar_with_typmod(type_oid, nullable, typmod))
         }
         _ => Err(AnalyzeError::Unsupported(format!(
             "expression node type not supported: {:?}",
