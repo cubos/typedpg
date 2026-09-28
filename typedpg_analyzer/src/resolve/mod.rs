@@ -558,6 +558,7 @@ pub(crate) struct RawColumn {
 /// Return type for analyze_* functions: columns + optional pre-sorted params.
 type AnalyzeResult = Result<(Vec<RawColumn>, Option<Vec<(i32, PgTypeOid, bool)>>), AnalyzeError>;
 
+mod assign;
 mod cte;
 mod dml;
 mod from;
@@ -572,6 +573,7 @@ mod walk;
 // (e.g. `crate::resolve::analyze_correlated_select`) and the dispatcher in
 // this module resolve them transparently. Function names are unique across
 // the former monolith, so these globs never collide.
+pub(crate) use assign::*;
 pub(crate) use cte::*;
 pub(crate) use dml::*;
 pub(crate) use from::*;

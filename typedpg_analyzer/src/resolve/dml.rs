@@ -53,7 +53,7 @@ pub(crate) fn analyze_insert_with_outer_ctes(
     let ret_null_ctx = NullabilityContext::default();
     ret_scope.add_dml_target(
         snapshot,
-        &relation.relname,
+        insert_target_alias(relation),
         crate::qualified_name::QualifiedName::new(&tgt.nsname, &tgt.relname),
         &tgt.attrs,
     );
@@ -67,6 +67,17 @@ pub(crate) fn analyze_insert_with_outer_ctes(
     Ok((columns, None))
 }
 
+/// The name ON CONFLICT and RETURNING use for the INSERT target:
+/// `INSERT INTO t AS a` makes it `a` (PG's `transformInsertStmt` adds the
+/// target RTE under its alias).
+fn insert_target_alias(relation: &protobuf::RangeVar) -> &str {
+    relation
+        .alias
+        .as_ref()
+        .map(|a| a.aliasname.as_str())
+        .unwrap_or(&relation.relname)
+}
+
 /// The resolved INSERT target: the catalog table plus the data the per-clause
 /// analyzers below all need (the declared column list and the
 /// `OVERRIDING SYSTEM VALUE` flag).
@@ -77,8 +88,13 @@ struct InsertTarget {
     attrs: Vec<crate::pg_catalog::PgAttribute>,
     /// Columns named in `INSERT INTO t (a, b, …)`; empty means "all columns".
     col_names: Vec<String>,
-    /// `OVERRIDING SYSTEM VALUE` was requested.
-    overriding_system: bool,
+    /// The indirection (`arr[1]`, `p.x`) of each named column, parallel to
+    /// `col_names`.
+    col_indirection: Vec<Vec<protobuf::Node>>,
+    /// `OVERRIDING SYSTEM VALUE` or `OVERRIDING USER VALUE` was requested —
+    /// either lets a value be written to a GENERATED ALWAYS identity column
+    /// (USER VALUE then discards it in favour of the sequence).
+    overriding: bool,
 }
 
 /// Resolve the INSERT target relation, validate that every column named in the
@@ -138,6 +154,15 @@ fn resolve_insert_target(
             ));
         }
     }
+    check_insert_target_duplicates(&ins.cols)?;
+    let col_indirection = ins
+        .cols
+        .iter()
+        .filter_map(|n| match n.node.as_ref() {
+            Some(node::Node::ResTarget(rt)) => Some(rt.indirection.clone()),
+            _ => None,
+        })
+        .collect();
 
     // PG enum for `Insert.override`:
     //   1 = OVERRIDING_NOT_SET, 2 = USER_VALUE, 3 = SYSTEM_VALUE.
@@ -151,7 +176,8 @@ fn resolve_insert_target(
         nsname: table_nsname,
         attrs: table_attrs,
         col_names,
-        overriding_system: ins.r#override == 3,
+        col_indirection,
+        overriding: ins.r#override == 2 || ins.r#override == 3,
     })
 }
 
@@ -189,6 +215,21 @@ fn target_col_at(tgt: &InsertTarget, i: usize) -> Option<&crate::pg_catalog::PgA
             .get(i)
             .and_then(|cn| tgt.attrs.iter().find(|c| &c.attname == cn))
     }
+}
+
+/// The assignment target at position `i`: the column's type, or the element
+/// / field type an indirected column (`arr[1]`) expects.
+fn target_at(
+    tgt: &InsertTarget,
+    i: usize,
+    ctx: Ctx<'_>,
+    params: &mut ParamCollector,
+) -> Result<Option<AssignTarget>, AnalyzeError> {
+    let Some(tc) = target_col_at(tgt, i) else {
+        return Ok(None);
+    };
+    let indirection = tgt.col_indirection.get(i).map(Vec::as_slice).unwrap_or(&[]);
+    assignment_target(tc, indirection, ctx, params).map(Some)
 }
 
 /// The number of values each row must supply: the explicit column count, or
@@ -245,6 +286,10 @@ fn analyze_insert_values(
         }
         for (i, val) in list.items.iter().enumerate() {
             let target_col = target_col_at(tgt, i);
+            let target = target_at(tgt, i, expr::Ctx::new(&scope, &null_ctx, snapshot), params)?;
+            // A value stored *inside* the column (`arr[1]`) is not subject to
+            // the column-level NOT NULL / typmod checks.
+            let indirected = target.as_ref().is_some_and(|t| t.indirected);
             // The matching `ResTarget` in `ins.cols` for column `i` — used to
             // build a `source_span` so a type mismatch surfaces a secondary
             // label at the column reference (not just at the value).
@@ -256,12 +301,14 @@ fn analyze_insert_values(
                 }
             });
             if let Some(tc) = target_col
+                && !indirected
                 && is_sql_null_literal(val)
                 && let Some(err) = null_assignment_error(tc, snapshot, &tgt.relname, "insert")
             {
                 return Err(err);
             }
             if let Some(tc) = target_col
+                && !indirected
                 && let Some(err) = crate::typmod::check_literal_assignment(
                     snapshot,
                     tc.atttypid,
@@ -284,7 +331,7 @@ fn analyze_insert_values(
             if let Some(tc) = target_col
                 && tc.attidentity == Some(AttIdentity::Always)
                 && !is_set_to_default(val)
-                && !tgt.overriding_system
+                && !tgt.overriding
             {
                 return Err(AnalyzeError::Invalid(format!(
                     "cannot insert a non-DEFAULT value into column \"{}\" \
@@ -293,23 +340,25 @@ fn analyze_insert_values(
                     tc.attname, tgt.relname,
                 )));
             }
-            let goal = target_col
-                .map(|tc| TypeGoal::assignment(tc.atttypid).with_source_column(&tc.attname))
-                .unwrap_or(TypeGoal::NONE);
+            let goal = match (target_col, &target) {
+                (Some(tc), Some(t)) => {
+                    TypeGoal::assignment(t.type_oid).with_source_column(&tc.attname)
+                }
+                _ => TypeGoal::NONE,
+            };
             let goal = match target_loc {
                 Some(s) => goal.with_source(s),
                 None => goal,
             };
-            expr::infer_expr(
-                val,
-                expr::Ctx::new(&scope, &null_ctx, snapshot),
-                params,
-                goal,
-            )?;
+            let ctx = expr::Ctx::new(&scope, &null_ctx, snapshot);
+            match &target {
+                Some(t) => t.infer_value(val, goal, ctx, params)?,
+                None => expr::infer_expr(val, ctx, params, goal)?,
+            };
 
             if let Some(node::Node::ParamRef(p)) = val.node.as_ref()
                 && let Some(tc) = target_col
-                && !tc.attnotnull
+                && (!tc.attnotnull || indirected)
             {
                 params.infer_nullable(p.number, true);
             }
@@ -345,7 +394,7 @@ fn analyze_insert_select(
     // INSERT ... SELECT cannot supply `DEFAULT`, so any target column that is
     // `GENERATED ALWAYS AS IDENTITY` is rejected unless the user requested
     // OVERRIDING SYSTEM VALUE.
-    if !tgt.overriding_system {
+    if !tgt.overriding {
         for i in 0..val_sel.target_list.len() {
             if let Some(tc) = target_col_at(tgt, i)
                 && tc.attidentity == Some(AttIdentity::Always)
@@ -373,11 +422,28 @@ fn analyze_insert_select(
     // target-list boundary; PG instead coerces them through the target's
     // input function, so for those we validate the literal *content* (and
     // accept) rather than comparing the placeholder text type.
+    let empty_scope = Scope {
+        ctes: cte_scopes.clone(),
+        ..Scope::default()
+    };
+    let empty_null = NullabilityContext::default();
+    let mut target_types: Vec<Option<PgTypeOid>> = Vec::with_capacity(sel_cols.len());
+    for i in 0..sel_cols.len() {
+        let t = target_at(
+            tgt,
+            i,
+            expr::Ctx::new(&empty_scope, &empty_null, snapshot),
+            params,
+        )?;
+        target_types.push(t.map(|t| t.type_oid));
+    }
     for (i, sel_col) in sel_cols.iter().enumerate() {
-        let Some(tc) = target_col_at(tgt, i) else {
+        let (Some(tc), Some(Some(target_oid))) = (target_col_at(tgt, i), target_types.get(i))
+        else {
             continue;
         };
-        if sel_col.type_oid == oid::UNKNOWN || sel_col.type_oid == tc.atttypid {
+        let target_oid = *target_oid;
+        if sel_col.type_oid == oid::UNKNOWN || sel_col.type_oid == target_oid {
             continue;
         }
         let literal = val_sel.target_list.get(i).and_then(|t| {
@@ -393,18 +459,18 @@ fn analyze_insert_select(
             }
         });
         if let Some(text) = literal {
-            if let Err(msg) = crate::literal_input::validate(text, tc.atttypid, snapshot) {
+            if let Err(msg) = crate::literal_input::validate(text, target_oid, snapshot) {
                 return Err(crate::error::RawError::invalid_literal(msg, None).finalize_implicit());
             }
             continue;
         }
         if !crate::coerce::can_coerce(
             sel_col.type_oid,
-            tc.atttypid,
+            target_oid,
             crate::coerce::CoercionContext::Assignment,
             snapshot,
         ) {
-            let expected = crate::ddl::util::format_type_for_message(snapshot, tc.atttypid);
+            let expected = crate::ddl::util::format_type_for_message(snapshot, target_oid);
             let actual = crate::ddl::util::format_type_for_message(snapshot, sel_col.type_oid);
             return Err(crate::error::RawError::invalid(
                 format!(
@@ -424,13 +490,17 @@ fn analyze_insert_select(
         if let Some(node::Node::ResTarget(rt)) = target.node.as_ref()
             && let Some(val) = &rt.val
             && let Some(node::Node::ParamRef(p)) = val.node.as_ref()
-            && let Some(col_name) = tgt.col_names.get(i)
-            && let Some(tc) = tgt.attrs.iter().find(|c| &c.attname == col_name)
+            && let Some(tc) = target_col_at(tgt, i)
+            && let Some(Some(target_oid)) = target_types.get(i)
         {
             if params.get(p.number) == oid::UNKNOWN {
-                params.record(p.number, tc.atttypid);
+                params.record(p.number, *target_oid);
             }
-            if !tc.attnotnull {
+            let indirected = tgt
+                .col_indirection
+                .get(i)
+                .is_some_and(|ind| !ind.is_empty());
+            if !tc.attnotnull || indirected {
                 params.infer_nullable(p.number, true);
             }
         }
@@ -463,43 +533,22 @@ fn analyze_insert_on_conflict(
         ..Scope::default()
     };
     let target_qn = crate::qualified_name::QualifiedName::new(&tgt.nsname, &tgt.relname);
-    conflict_scope.add_dml_target(snapshot, &relation.relname, target_qn.clone(), &tgt.attrs);
+    conflict_scope.add_dml_target(
+        snapshot,
+        insert_target_alias(relation),
+        target_qn.clone(),
+        &tgt.attrs,
+    );
     conflict_scope.add_dml_target(snapshot, "excluded", target_qn, &tgt.attrs);
     let conflict_null_ctx = NullabilityContext::default();
-    for set_item in &on_conflict.target_list {
-        if let Some(node::Node::ResTarget(rt)) = set_item.node.as_ref()
-            && let Some(val) = &rt.val
-        {
-            if let Some(tc) = tgt.attrs.iter().find(|c| c.attname == rt.name) {
-                if tc.attgenerated.is_some() && !is_set_to_default(val) {
-                    return Err(AnalyzeError::Invalid(format!(
-                        "column \"{}\" can only be updated to DEFAULT \
-                         (generated column on `{}`)",
-                        tc.attname, tgt.relname,
-                    )));
-                }
-                if tc.attidentity == Some(AttIdentity::Always) && !is_set_to_default(val) {
-                    return Err(AnalyzeError::Invalid(format!(
-                        "column \"{}\" can only be updated to DEFAULT \
-                         (identity column on `{}` defined as GENERATED ALWAYS)",
-                        tc.attname, tgt.relname,
-                    )));
-                }
-            }
-            let goal = tgt
-                .attrs
-                .iter()
-                .find(|c| c.attname == rt.name)
-                .map(|tc| TypeGoal::assignment(tc.atttypid))
-                .unwrap_or(TypeGoal::NONE);
-            expr::infer_expr(
-                val,
-                expr::Ctx::new(&conflict_scope, &conflict_null_ctx, snapshot),
-                params,
-                goal,
-            )?;
-        }
-    }
+    analyze_set_clause(
+        &on_conflict.target_list,
+        &tgt.attrs,
+        &tgt.relname,
+        expr::Ctx::new(&conflict_scope, &conflict_null_ctx, snapshot),
+        params,
+        false,
+    )?;
     if let Some(where_clause) = &on_conflict.where_clause {
         expr::infer_expr(
             where_clause,
@@ -603,78 +652,15 @@ pub(crate) fn analyze_update_with_outer_ctes(
         params,
     )?;
 
-    // Infer param types from SET column = expr — assignment context.
-    for target in &upd.target_list {
-        if let Some(node::Node::ResTarget(rt)) = target.node.as_ref()
-            && let Some(val) = &rt.val
-        {
-            // Same reasoning as analyze_insert: reject unknown columns up
-            // front instead of letting the parameter fall back to text via
-            // the UNKNOWN path.
-            let tc = table_attrs
-                .iter()
-                .find(|c| c.attname == rt.name)
-                .ok_or_else(|| {
-                    crate::scope::undefined_dml_column_error(
-                        &rt.name,
-                        &table_relname,
-                        &table_attrs,
-                        crate::error::SourceSpan::from_node_qname(rt.location),
-                    )
-                })?;
-            // Catch `UPDATE … SET not_null_col = NULL` statically — PG
-            // raises a runtime `null value in column … violates not-null
-            // constraint` error, and we can do better by failing the macro
-            // at compile time.
-            if is_sql_null_literal(val)
-                && let Some(err) = null_assignment_error(tc, snapshot, &table_relname, "assign")
-            {
-                return Err(err);
-            }
-            if let Some(err) = crate::typmod::check_literal_assignment(
-                snapshot,
-                tc.atttypid,
-                snapshot.effective_typmod(tc.atttypid, tc.atttypmod),
-                val,
-            ) {
-                return Err(err);
-            }
-            if tc.attgenerated.is_some() && !is_set_to_default(val) {
-                return Err(AnalyzeError::Invalid(format!(
-                    "column \"{}\" can only be updated to DEFAULT \
-                     (generated column on `{}`)",
-                    tc.attname, table_relname,
-                )));
-            }
-            if tc.attidentity == Some(AttIdentity::Always) && !is_set_to_default(val) {
-                return Err(AnalyzeError::Invalid(format!(
-                    "column \"{}\" can only be updated to DEFAULT \
-                     (identity column on `{}` defined as GENERATED ALWAYS)",
-                    tc.attname, table_relname,
-                )));
-            }
-            let goal = TypeGoal::assignment(tc.atttypid).with_source_column(&tc.attname);
-            // Attach the target column's reference span so a TypeMismatch
-            // surfaces a secondary label pointing at the `col =` site.
-            let goal = if let Some(s) = crate::error::SourceSpan::from_node_qname(rt.location) {
-                goal.with_source(s)
-            } else {
-                goal
-            };
-            expr::infer_expr(
-                val,
-                expr::Ctx::new(&scope, &null_ctx, snapshot),
-                params,
-                goal,
-            )?;
-
-            if let Some(node::Node::ParamRef(p)) = val.node.as_ref()
-                && !tc.attnotnull
-            {
-                params.infer_nullable(p.number, true);
-            }
-        }
-    }
+    // SET col = expr / (a, b) = (…) / col[i] = expr — assignment context.
+    analyze_set_clause(
+        &upd.target_list,
+        &table_attrs,
+        &table_relname,
+        expr::Ctx::new(&scope, &null_ctx, snapshot),
+        params,
+        true,
+    )?;
 
     // WHERE — BOOL goal with assignment coercion.
     if let Some(where_clause) = &upd.where_clause {

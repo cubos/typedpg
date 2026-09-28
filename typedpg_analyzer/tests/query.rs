@@ -14,6 +14,8 @@ mod common;
 // ── Feature files ────────────────────────────────────────────────────────────
 #[path = "query/aggregates.rs"]
 mod aggregates;
+#[path = "query/assignments.rs"]
+mod assignments;
 #[path = "query/casts_and_coercion.rs"]
 mod casts_and_coercion;
 #[path = "query/cte_rules.rs"]

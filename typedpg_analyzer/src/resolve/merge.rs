@@ -220,9 +220,8 @@ fn walk_merge_when_clause(
     }
 }
 
-/// `WHEN MATCHED THEN UPDATE SET col = expr [, …]` — each entry is a
-/// `ResTarget` with `name = column` and `val = expression`. Validate the
-/// column exists, then walk the value with an assignment goal.
+/// `WHEN MATCHED THEN UPDATE SET col = expr [, …]` — the shared UPDATE
+/// SET analysis against the target table.
 fn merge_when_update(
     when: &protobuf::MergeWhenClause,
     ctx: Ctx<'_>,
@@ -230,58 +229,14 @@ fn merge_when_update(
     table_attrs: &[crate::pg_catalog::PgAttribute],
     table_relname: &str,
 ) -> Result<(), AnalyzeError> {
-    let snapshot = ctx.snapshot;
-    for set_item in &when.target_list {
-        let Some(node::Node::ResTarget(rt)) = set_item.node.as_ref() else {
-            continue;
-        };
-        let Some(val) = &rt.val else { continue };
-        let tc = table_attrs
-            .iter()
-            .find(|c| c.attname == rt.name)
-            .ok_or_else(|| {
-                crate::scope::undefined_dml_column_error(
-                    &rt.name,
-                    table_relname,
-                    table_attrs,
-                    crate::error::SourceSpan::from_node_qname(rt.location),
-                )
-            })?;
-        if is_sql_null_literal(val)
-            && let Some(err) = null_assignment_error(tc, snapshot, table_relname, "assign")
-        {
-            return Err(err);
-        }
-        if let Some(err) = crate::typmod::check_literal_assignment(
-            snapshot,
-            tc.atttypid,
-            snapshot.effective_typmod(tc.atttypid, tc.atttypmod),
-            val,
-        ) {
-            return Err(err);
-        }
-        if tc.attgenerated.is_some() && !is_set_to_default(val) {
-            return Err(AnalyzeError::Invalid(format!(
-                "column \"{}\" can only be updated to DEFAULT \
-                 (generated column on `{}`)",
-                tc.attname, table_relname,
-            )));
-        }
-        if tc.attidentity == Some(AttIdentity::Always) && !is_set_to_default(val) {
-            return Err(AnalyzeError::Invalid(format!(
-                "column \"{}\" can only be updated to DEFAULT \
-                 (identity column on `{}` defined as GENERATED ALWAYS)",
-                tc.attname, table_relname,
-            )));
-        }
-        expr::infer_expr(val, ctx, params, TypeGoal::assignment(tc.atttypid))?;
-        if let Some(node::Node::ParamRef(p)) = val.node.as_ref()
-            && !tc.attnotnull
-        {
-            params.infer_nullable(p.number, true);
-        }
-    }
-    Ok(())
+    analyze_set_clause(
+        &when.target_list,
+        table_attrs,
+        table_relname,
+        ctx,
+        params,
+        true,
+    )
 }
 
 /// `WHEN NOT MATCHED THEN INSERT (cols…) VALUES (vals…)` — `target_list` holds
