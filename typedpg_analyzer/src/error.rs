@@ -106,6 +106,18 @@ pub enum AnalyzeError {
     #[error("{0}")]
     SyntaxError(String),
 
+    /// A column name defined twice where names must be unique (a column
+    /// definition list, an INSERT target list). Equivalent to PG
+    /// `duplicate_column` (SQLSTATE 42701).
+    #[error("{0}")]
+    DuplicateColumn(String),
+
+    /// A recursive CTE that violates PG's structural rules for recursion
+    /// (`recursive reference to query "r" must not appear within an outer
+    /// join`, …). Equivalent to PG `invalid_recursion` (SQLSTATE 42P19).
+    #[error("{0}")]
+    InvalidRecursion(String),
+
     /// A type referenced in the query is not in the catalog. Equivalent to
     /// PG `undefined_object` (SQLSTATE 42704) when the lookup was by name,
     /// or surfaces an internal OID mismatch when the lookup was by OID.
@@ -233,6 +245,8 @@ impl AnalyzeError {
             UndefinedType(_) | UndefinedObject(_) => Some("42704"),
             UndefinedSchema(_) => Some("3F000"),
             FeatureNotSupported(_) => Some("0A000"),
+            DuplicateColumn(_) => Some("42701"),
+            InvalidRecursion(_) => Some("42P19"),
             UndefinedFunction(_) | UndefinedOperator(_) => Some("42883"),
             AmbiguousFunction(_) => Some("42725"),
             WrongObjectType(_) => Some("42809"),
@@ -928,6 +942,8 @@ fn replace_message(e: AnalyzeError, rendered: String) -> AnalyzeError {
         AnalyzeError::SyntaxError(_) => AnalyzeError::SyntaxError(rendered),
         AnalyzeError::UndefinedSchema(_) => AnalyzeError::UndefinedSchema(rendered),
         AnalyzeError::FeatureNotSupported(_) => AnalyzeError::FeatureNotSupported(rendered),
+        AnalyzeError::DuplicateColumn(_) => AnalyzeError::DuplicateColumn(rendered),
+        AnalyzeError::InvalidRecursion(_) => AnalyzeError::InvalidRecursion(rendered),
         AnalyzeError::TypeMismatch {
             actual, expected, ..
         } => AnalyzeError::TypeMismatch {

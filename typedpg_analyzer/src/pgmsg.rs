@@ -632,6 +632,117 @@ pub(crate) fn anycompatible_range_mismatch(
     ))
 }
 
+/// `a column definition list is required for functions returning "record"`
+/// — SQLSTATE 42601 (`addRangeTableEntryForFunction`).
+pub(crate) fn coldeflist_required() -> RawError {
+    RawError::new(
+        AnalyzeError::SyntaxError(
+            "a column definition list is required for functions returning \"record\"".into(),
+        ),
+        None,
+        Some("add one after the alias, e.g. `AS x(a int, b text)`".into()),
+    )
+}
+
+/// `a column definition list is only allowed for functions returning
+/// "record"` — SQLSTATE 42601.
+pub(crate) fn coldeflist_only_for_record() -> RawError {
+    RawError::new(
+        AnalyzeError::SyntaxError(
+            "a column definition list is only allowed for functions returning \"record\"".into(),
+        ),
+        None,
+        None,
+    )
+}
+
+/// `a column definition list is redundant for a function with OUT
+/// parameters` — SQLSTATE 42601.
+pub(crate) fn coldeflist_redundant_out_params() -> RawError {
+    RawError::new(
+        AnalyzeError::SyntaxError(
+            "a column definition list is redundant for a function with OUT parameters".into(),
+        ),
+        None,
+        None,
+    )
+}
+
+/// `a column definition list is redundant for a function returning a named
+/// composite type` — SQLSTATE 42601.
+pub(crate) fn coldeflist_redundant_composite() -> RawError {
+    RawError::new(
+        AnalyzeError::SyntaxError(
+            "a column definition list is redundant for a function returning a named composite type"
+                .into(),
+        ),
+        None,
+        None,
+    )
+}
+
+/// `ROWS FROM() with multiple functions cannot have a column definition
+/// list` — SQLSTATE 42601 (`transformRangeFunction`).
+pub(crate) fn rows_from_multiple_coldeflist() -> RawError {
+    RawError::new(
+        AnalyzeError::SyntaxError(
+            "ROWS FROM() with multiple functions cannot have a column definition list".into(),
+        ),
+        None,
+        Some("Put a separate column definition list for each function inside ROWS FROM().".into()),
+    )
+}
+
+/// `UNNEST() with multiple arguments cannot have a column definition list`
+/// — SQLSTATE 42601.
+pub(crate) fn unnest_multiple_coldeflist() -> RawError {
+    RawError::new(
+        AnalyzeError::SyntaxError(
+            "UNNEST() with multiple arguments cannot have a column definition list".into(),
+        ),
+        None,
+        Some(
+            "Use separate UNNEST() calls inside ROWS FROM(), and attach a column definition \
+             list to each one."
+                .into(),
+        ),
+    )
+}
+
+/// `WITH ORDINALITY cannot be used with a column definition list` —
+/// SQLSTATE 42601.
+pub(crate) fn ordinality_with_coldeflist() -> RawError {
+    RawError::new(
+        AnalyzeError::SyntaxError(
+            "WITH ORDINALITY cannot be used with a column definition list".into(),
+        ),
+        None,
+        Some("Put the column definition list inside ROWS FROM().".into()),
+    )
+}
+
+/// `multiple column definition lists are not allowed for the same function`
+/// — SQLSTATE 42601.
+pub(crate) fn multiple_coldeflists() -> RawError {
+    RawError::new(
+        AnalyzeError::SyntaxError(
+            "multiple column definition lists are not allowed for the same function".into(),
+        ),
+        None,
+        None,
+    )
+}
+
+/// `column name "a" specified more than once` — SQLSTATE 42701
+/// (`duplicate_column`, `CheckAttributeNamesTypes`).
+pub(crate) fn duplicate_column_name(name: &str) -> RawError {
+    RawError::new(
+        AnalyzeError::DuplicateColumn(format!("column name \"{name}\" specified more than once")),
+        None,
+        None,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -742,6 +853,15 @@ mod tests {
                 recursive_query_column_type("r", 1, "integer", "text").kind,
                 "42804",
             ),
+            (coldeflist_required().kind, "42601"),
+            (coldeflist_only_for_record().kind, "42601"),
+            (coldeflist_redundant_out_params().kind, "42601"),
+            (coldeflist_redundant_composite().kind, "42601"),
+            (rows_from_multiple_coldeflist().kind, "42601"),
+            (unnest_multiple_coldeflist().kind, "42601"),
+            (ordinality_with_coldeflist().kind, "42601"),
+            (multiple_coldeflists().kind, "42601"),
+            (duplicate_column_name("a").kind, "42701"),
         ];
         for (err, want) in cases {
             assert_eq!(

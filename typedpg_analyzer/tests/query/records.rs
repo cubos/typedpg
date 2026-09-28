@@ -493,8 +493,9 @@ fn returns_record_in_from_without_coldeflist_is_rejected() {
     .unwrap();
     assert_analyze_err!(
         db.analyze("SELECT pair FROM pair()"),
-        AnalyzeError::Invalid(_),
-        "a column definition list is required for functions returning \"record\"",
+        AnalyzeError::SyntaxError(_),
+        "a column definition list is required for functions returning \"record\"\n  \
+         help: add one after the alias, e.g. `AS x(a int, b text)`\n",
     );
 }
 

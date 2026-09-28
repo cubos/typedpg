@@ -421,7 +421,7 @@ fn unnest_in_from_multi_arg_non_array_errors() {
         db.analyze("SELECT * FROM unnest(ARRAY[1, 2], 'oops'::text) AS t(a, b)"),
         AnalyzeError::UndefinedFunction(_),
         concat!(
-            "function pg_catalog.unnest(text) does not exist (unnest argument 2 is not an array)\n",
+            "function pg_catalog.unnest(text) does not exist (found 3 candidate(s))\n",
             "  ╭────\n",
             "1 │ SELECT * FROM unnest(ARRAY[1, 2], 'oops'::text) AS t(a, b)\n",
             "  ·               ───┬──\n",

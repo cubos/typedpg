@@ -183,17 +183,23 @@ pub(crate) fn process_from_item(
     Ok(())
 }
 
-/// `FROM func(args)` — resolve the SRF and populate `scope` with its output
-/// columns. Handles three cases:
-/// - Function has `out_args` (TABLE/OUT) → one scope column per out_arg.
-/// - Function returns a registered composite type → expand the composite's
-///   fields as scope columns.
-/// - Otherwise (scalar or plain `record`) → a single scope column named after
-///   the relation alias (the function's name when unaliased, as in PG), typed
-///   with its return OID.
+/// `FROM func(args)` / `ROWS FROM (f1(…), f2(…) AS (…))` — a function RTE.
 ///
-/// Also honors `WITH ORDINALITY` by adding a trailing `ordinality BIGINT NOT NULL`
-/// column when the flag is set.
+/// Mirrors PG's `transformRangeFunction` (parse_clause.c) and
+/// `addRangeTableEntryForFunction` (parse_relation.c):
+/// - the SQL-standard multi-argument `unnest(a, b, …)` (unqualified, no
+///   decoration, no column definition list) is rewritten into one
+///   `pg_catalog.unnest()` call per argument;
+/// - an outer column definition list (`f() AS x(a int)`) attaches to the
+///   single function, and is rejected with several functions or with
+///   `WITH ORDINALITY`;
+/// - each function contributes its columns: OUT parameters, a named
+///   composite's attributes, the column definition list for `record`, or
+///   one scalar column (named after the alias when it is the only function);
+/// - with several functions the shorter results are padded with NULL, so
+///   every column but `ordinality` is nullable;
+/// - `WITH ORDINALITY` appends `ordinality bigint NOT NULL`, and the alias'
+///   column list renames positionally (42P10 when it is too long).
 fn process_range_function(
     rf: &protobuf::RangeFunction,
     scope: &mut Scope,
@@ -201,101 +207,90 @@ fn process_range_function(
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
 ) -> Result<(), AnalyzeError> {
-    let _ = rf.lateral;
-    // Each entry in `functions` is a 2-element `List` — [FuncCall, coldeflist].
-    // We support only the simple form: a single function call, no explicit
-    // column definitions. `ROWS FROM (…)` with multiple functions or user-
-    // supplied coldeflists are rarer and fall through to Unsupported so we
-    // don't silently lose column shape.
-    let list = rf
-        .functions
-        .first()
-        .and_then(|n| n.node.as_ref())
-        .and_then(|n| {
-            if let node::Node::List(l) = n {
-                Some(l)
-            } else {
-                None
-            }
-        })
-        .ok_or_else(|| AnalyzeError::Unsupported("RangeFunction without function call".into()))?;
-
-    let func_call_node = list
-        .items
-        .first()
-        .ok_or_else(|| AnalyzeError::Unsupported("RangeFunction function list is empty".into()))?;
-    let func_call = match func_call_node.node.as_ref() {
-        Some(node::Node::FuncCall(fc)) => fc,
-        _ => {
+    let mut funcs: Vec<RteFunction<'_>> = Vec::with_capacity(rf.functions.len());
+    for item in &rf.functions {
+        let Some(node::Node::List(pair)) = item.node.as_ref() else {
             return Err(AnalyzeError::Unsupported(
-                "RangeFunction item is not a FuncCall".into(),
+                "RangeFunction without function call".into(),
             ));
+        };
+        let call = match pair.items.first().and_then(|n| n.node.as_ref()) {
+            Some(node::Node::FuncCall(fc)) => fc.as_ref(),
+            _ => {
+                return Err(AnalyzeError::Unsupported(
+                    "RangeFunction item is not a FuncCall".into(),
+                ));
+            }
+        };
+        let coldeflist: &[protobuf::Node] = match pair.items.get(1).and_then(|n| n.node.as_ref()) {
+            Some(node::Node::List(l)) => &l.items,
+            _ => &[],
+        };
+        if coldeflist.is_empty() && is_sql_standard_unnest(call) {
+            for arg in &call.args {
+                let mut single = call.clone();
+                single.funcname = ["pg_catalog", "unnest"]
+                    .into_iter()
+                    .map(|s| protobuf::Node {
+                        node: Some(node::Node::String(protobuf::String { sval: s.into() })),
+                    })
+                    .collect();
+                single.args = vec![arg.clone()];
+                funcs.push(RteFunction {
+                    call: std::borrow::Cow::Owned(single),
+                    coldeflist: &[],
+                });
+            }
+            continue;
         }
-    };
+        funcs.push(RteFunction {
+            call: std::borrow::Cow::Borrowed(call),
+            coldeflist,
+        });
+    }
 
-    // Alias: `FROM f() AS t(col1, col2)` gives aliases both for the relation
-    // and for its columns. Fall back to the function's last name component.
-    let func_name_parts = expr::extract_string_fields(&func_call.funcname);
-    let default_alias = func_name_parts
-        .last()
-        .cloned()
-        .unwrap_or_else(|| "_srf".into());
-    let alias_owned = rf
-        .alias
-        .as_ref()
-        .map(|a| a.aliasname.clone())
-        .unwrap_or_else(|| default_alias.clone());
+    if !rf.coldeflist.is_empty() {
+        if funcs.len() != 1 {
+            return Err(if rf.is_rowsfrom {
+                crate::pgmsg::rows_from_multiple_coldeflist()
+            } else {
+                crate::pgmsg::unnest_multiple_coldeflist()
+            }
+            .finalize_implicit());
+        }
+        if rf.ordinality {
+            return Err(crate::pgmsg::ordinality_with_coldeflist().finalize_implicit());
+        }
+        if !funcs[0].coldeflist.is_empty() {
+            return Err(crate::pgmsg::multiple_coldeflists().finalize_implicit());
+        }
+        funcs[0].coldeflist = &rf.coldeflist;
+    }
+
+    // The RTE's name: the alias, else the first function's FigureColname.
+    let alias_owned = match rf.alias.as_ref() {
+        Some(a) => a.aliasname.clone(),
+        None => funcs
+            .first()
+            .and_then(|f| expr::extract_string_fields(&f.call.funcname).pop())
+            .unwrap_or_else(|| "_srf".into()),
+    };
     let alias = alias_owned.as_str();
-    let col_aliases: Vec<String> = rf
-        .alias
-        .as_ref()
-        .map(|a| {
-            a.colnames
-                .iter()
-                .filter_map(|n| match n.node.as_ref()? {
-                    node::Node::String(s) => Some(s.sval.clone()),
-                    _ => None,
-                })
-                .collect()
-        })
-        .unwrap_or_default();
 
     let arg_scope = srf_arg_scope(scope);
     let arg_ctx = expr::Ctx::new(&arg_scope, null_ctx, snapshot);
-    let (arg_types, arg_nullable) = infer_srf_arg_types(rf, func_call, arg_ctx, params)?;
-    let any_arg_nullable = arg_nullable.iter().any(|&n| n);
-
-    let (schema, name) = match func_name_parts.as_slice() {
-        [n] => (None, n.as_str()),
-        [s, n] => (Some(s.as_str()), n.as_str()),
-        _ => {
-            return Err(AnalyzeError::UndefinedFunction(format!(
-                "invalid function name in FROM: {func_name_parts:?}"
-            )));
+    let nfuncs = funcs.len();
+    let mut cols: Vec<ScopeColumn> = Vec::new();
+    for f in &funcs {
+        cols.extend(function_rte_columns(f, rf, alias, nfuncs, arg_ctx, params)?);
+    }
+    if nfuncs > 1 {
+        // nodeFunctionscan.c pads every function that runs out of rows
+        // first with NULLs.
+        for c in &mut cols {
+            c.base_not_null = false;
         }
-    };
-
-    // `unnest(arr1, arr2, …)` in FROM is a special PG-only multi-array form
-    // (parsed as a regular FuncCall but transformed by PG into ROWS FROM
-    // (unnest(arr1), unnest(arr2), …)). Each argument contributes one column
-    // of its element type, aligned row-wise (zip with NULL-padding).
-    let is_pg_unnest = (schema.is_none() || schema == Some("pg_catalog")) && name == "unnest";
-    let mut cols: Vec<ScopeColumn> = if is_pg_unnest && arg_types.len() > 1 {
-        unnest_multi_arg_columns(&arg_types, alias, snapshot, func_call)?
-    } else {
-        srf_function_columns(
-            SrfCall { schema, name },
-            SrfArgs {
-                types: &arg_types,
-                any_nullable: any_arg_nullable,
-            },
-            alias,
-            rf,
-            func_call,
-            arg_ctx,
-            params,
-        )?
-    };
+    }
 
     // WITH ORDINALITY appends a trailing BIGINT NOT NULL row number. Do this
     // before the alias override so `AS t(val, ord)` can rename the ordinality
@@ -312,15 +307,45 @@ fn process_range_function(
         });
     }
 
-    // User-supplied column aliases override the names above, in order.
-    for (i, alias_name) in col_aliases.iter().enumerate() {
-        if let Some(c) = cols.get_mut(i) {
-            c.name = alias_name.clone();
-        }
+    // `buildRelationAliases`: the alias' column list renames positionally
+    // and may not be longer than the column list.
+    let col_aliases = rf
+        .alias
+        .as_ref()
+        .map(|a| expr::extract_string_fields(&a.colnames))
+        .unwrap_or_default();
+    if col_aliases.len() > cols.len() {
+        return Err(
+            crate::pgmsg::too_many_column_aliases(alias, cols.len(), col_aliases.len())
+                .finalize_implicit(),
+        );
+    }
+    for (c, alias_name) in cols.iter_mut().zip(col_aliases) {
+        c.name = alias_name;
     }
 
     scope.add_virtual_table(alias, cols)?;
     Ok(())
+}
+
+/// One function of a function RTE after `transformRangeFunction`'s
+/// preprocessing: the call and the column definition list attached to it.
+struct RteFunction<'a> {
+    call: std::borrow::Cow<'a, protobuf::FuncCall>,
+    coldeflist: &'a [protobuf::Node],
+}
+
+/// PG rewrites `unnest(a, b, …)` into `ROWS FROM (unnest(a), unnest(b), …)`
+/// only for the undecorated, unqualified SQL-standard spelling.
+fn is_sql_standard_unnest(fc: &protobuf::FuncCall) -> bool {
+    matches!(expr::extract_string_fields(&fc.funcname).as_slice(), [n] if n == "unnest")
+        && fc.args.len() > 1
+        && fc.agg_order.is_empty()
+        && fc.agg_filter.is_none()
+        && fc.over.is_none()
+        && !fc.agg_star
+        && !fc.agg_distinct
+        && !fc.func_variadic
 }
 
 /// The contiguous run of `scope.sources` contributed by one side of a JOIN.
@@ -627,61 +652,6 @@ fn infer_srf_arg_types(
     Ok((arg_types, arg_nullable))
 }
 
-/// Columns for the multi-argument `unnest(arr1, arr2, …)` FROM form: each
-/// argument contributes one column of its element type.
-fn unnest_multi_arg_columns(
-    arg_types: &[PgTypeOid],
-    alias: &str,
-    snapshot: &PgCatalog,
-    func_call: &protobuf::FuncCall,
-) -> Result<Vec<ScopeColumn>, AnalyzeError> {
-    let mut col_specs = Vec::with_capacity(arg_types.len());
-    for (i, &type_oid) in arg_types.iter().enumerate() {
-        let type_entry = snapshot.get_type(type_oid).ok_or_else(|| {
-            AnalyzeError::UndefinedType(format!(
-                "internal: unnest argument {} has unknown type OID {}",
-                i + 1,
-                type_oid.get()
-            ))
-        })?;
-        let elem = (type_entry.typcategory == TypCategory::Array)
-            .then_some(type_entry.typelem)
-            .flatten()
-            .ok_or_else(|| {
-                // Match PG's wording: when an `unnest` arg isn't an array, PG's
-                // resolver emits `function pg_catalog.unnest(<type>) does not
-                // exist` (it searches for a single-arg overload of the
-                // offending type). Mirror that and append our richer detail.
-                let typname = type_entry.typname.clone();
-                crate::functions::undefined_function_error(
-                    snapshot,
-                    Some("pg_catalog"),
-                    "unnest",
-                    format!(
-                        "function pg_catalog.unnest({typname}) does not exist \
-                         (unnest argument {} is not an array)",
-                        i + 1,
-                    ),
-                    crate::error::SourceSpan::from_node_qname(func_call.location),
-                )
-            })?;
-        // PG rewrites the multi-argument form into `ROWS FROM (unnest(a),
-        // unnest(b), …)`, which pads the shorter results with NULL
-        // (`ExecFunctionScan` / nodeFunctionscan.c), and the elements
-        // themselves may be NULL — every column is nullable.
-        col_specs.push(ScopeColumn {
-            name: "unnest".to_owned(),
-            type_oid: elem,
-            base_not_null: false,
-            table_alias: alias.to_owned(),
-            typmod: None,
-            collation: None,
-            record_fields: None,
-        });
-    }
-    Ok(col_specs)
-}
-
 /// Nullability of the elements a strict `pg_catalog` set-returning function
 /// emits, or `None` when `resolved` is not one (the caller keeps its
 /// scalar-function rules).
@@ -734,41 +704,45 @@ pub(crate) fn srf_elements_nullable(
     ))
 }
 
-/// The resolved name of a function called in FROM.
-struct SrfCall<'a> {
-    schema: Option<&'a str>,
-    name: &'a str,
-}
-
-/// The inferred argument types of an SRF call plus whether any is nullable.
-struct SrfArgs<'a> {
-    types: &'a [PgTypeOid],
-    any_nullable: bool,
-}
-
-/// Columns for an ordinary set-returning / OUT-arg / composite-returning
-/// function in FROM: resolve the overload, then expand its row shape (OUT
-/// args, composite attributes, or a single scalar column).
-fn srf_function_columns(
-    call: SrfCall<'_>,
-    args: SrfArgs<'_>,
-    alias: &str,
+/// Columns one function contributes to a function RTE, following
+/// `addRangeTableEntryForFunction`'s `get_expr_result_type` classes: OUT
+/// parameters and named composites expose their own row (a column
+/// definition list is redundant there), `record` requires one, and a
+/// scalar result is a single column (a column definition list is not
+/// allowed).
+fn function_rte_columns(
+    f: &RteFunction<'_>,
     rf: &protobuf::RangeFunction,
-    func_call: &protobuf::FuncCall,
+    alias: &str,
+    nfuncs: usize,
     arg_ctx: Ctx<'_>,
-    params: &ParamCollector,
+    params: &mut ParamCollector,
 ) -> Result<Vec<ScopeColumn>, AnalyzeError> {
     let snapshot = arg_ctx.snapshot;
-    let SrfCall { schema, name } = call;
+    let func_call: &protobuf::FuncCall = &f.call;
+    let func_name_parts = expr::extract_string_fields(&func_call.funcname);
+    let (schema, name) = match func_name_parts.as_slice() {
+        [n] => (None, n.as_str()),
+        [s, n] => (Some(s.as_str()), n.as_str()),
+        _ => {
+            return Err(AnalyzeError::UndefinedFunction(format!(
+                "invalid function name in FROM: {func_name_parts:?}"
+            )));
+        }
+    };
+    let (arg_types, arg_nullable) = infer_srf_arg_types(rf, func_call, arg_ctx, params)?;
+    let any_arg_nullable = arg_nullable.iter().any(|&n| n);
+
     let resolved = functions::resolve_function(
         snapshot,
         schema,
         name,
-        args.types,
+        &arg_types,
         &functions::CallNotation::of(func_call)?,
         false,
         crate::error::SourceSpan::from_node_qname(func_call.location),
     )?;
+    let has_coldeflist = !f.coldeflist.is_empty();
 
     // A strict catalog SRF with a single OUT column (`jsonb_array_elements`
     // → `value`) emits exactly its elements; wider OUT rows keep the
@@ -778,9 +752,11 @@ fn srf_function_columns(
         .flatten()
         .map(|nullable| !nullable);
 
-    // Build the scope columns.
     if !resolved.out_args.is_empty() {
-        Ok(resolved
+        if has_coldeflist {
+            return Err(crate::pgmsg::coldeflist_redundant_out_params().finalize_implicit());
+        }
+        return Ok(resolved
             .out_args
             .iter()
             .map(|f| ScopeColumn {
@@ -792,13 +768,17 @@ fn srf_function_columns(
                 table_alias: alias.to_owned(),
                 record_fields: None,
             })
-            .collect())
-    } else if let Some(typrelid) = snapshot.get_type(resolved.return_type_oid).and_then(|t| {
+            .collect());
+    }
+    if let Some(typrelid) = snapshot.get_type(resolved.return_type_oid).and_then(|t| {
         (t.typtype == TypType::Composite)
             .then_some(t.typrelid)
             .flatten()
     }) {
-        Ok(snapshot
+        if has_coldeflist {
+            return Err(crate::pgmsg::coldeflist_redundant_composite().finalize_implicit());
+        }
+        return Ok(snapshot
             .attributes_of(typrelid)
             .iter()
             .map(|f| ScopeColumn {
@@ -816,42 +796,86 @@ fn srf_function_columns(
                 table_alias: alias.to_owned(),
                 record_fields: None,
             })
-            .collect())
-    } else if resolved.return_type_oid == oid::RECORD && rf.coldeflist.is_empty() {
-        // `RETURNS RECORD` without OUT args needs a column-definition list at
-        // the call site so PG knows what shape to expose. Mirror PG's exact
-        // wording so the analyzer's diagnostic is pg_sanity-aligned.
-        Err(AnalyzeError::Invalid(
-            "a column definition list is required for functions returning \"record\"".to_owned(),
-        ))
-    } else {
-        // A strict catalog SRF's elements are NOT NULL unless the function
-        // emits NULLs itself (`unnest` of an array with NULL elements); other
-        // catalog functions follow their derived builtin nullability.
-        let strict_not_null =
-            match srf_elements_nullable(&resolved, name, &func_call.args, arg_ctx, params) {
-                Some(nullable) => !nullable,
-                None => {
-                    resolved.schema == "pg_catalog"
-                        && !functions::builtin_result_nullable(
-                            &resolved,
-                            &[args.any_nullable],
-                            func_call.func_variadic,
-                        )
-                }
-            };
-        // PG names a lone scalar function's column after the alias:
-        // `FROM generate_series(1, 3) AS g` exposes column `g`. With several
-        // `ROWS FROM` functions each column keeps its function's name.
-        let col_name = if rf.functions.len() == 1 { alias } else { name };
-        Ok(vec![ScopeColumn {
-            name: col_name.to_owned(),
-            type_oid: resolved.return_type_oid,
-            base_not_null: strict_not_null,
-            table_alias: alias.to_owned(),
-            typmod: None,
-            collation: None,
-            record_fields: None,
-        }])
+            .collect());
     }
+    if resolved.return_type_oid == oid::RECORD {
+        if !has_coldeflist {
+            return Err(crate::pgmsg::coldeflist_required().finalize_implicit());
+        }
+        return coldeflist_columns(f.coldeflist, alias, snapshot);
+    }
+    if has_coldeflist {
+        return Err(crate::pgmsg::coldeflist_only_for_record().finalize_implicit());
+    }
+
+    // A strict catalog SRF's elements are NOT NULL unless the function
+    // emits NULLs itself (`unnest` of an array with NULL elements); other
+    // catalog functions follow their derived builtin nullability.
+    let not_null = match srf_elements_nullable(&resolved, name, &func_call.args, arg_ctx, params) {
+        Some(nullable) => !nullable,
+        None => {
+            resolved.schema == "pg_catalog"
+                && !functions::builtin_result_nullable(
+                    &resolved,
+                    &[any_arg_nullable],
+                    func_call.func_variadic,
+                )
+        }
+    };
+    // `chooseScalarFunctionAlias`: a lone scalar function's column is named
+    // after the RTE alias (`FROM generate_series(1, 3) AS g` exposes `g`);
+    // with several functions each column keeps its function's name.
+    let col_name = if nfuncs == 1 { alias } else { name };
+    Ok(vec![ScopeColumn {
+        name: col_name.to_owned(),
+        type_oid: resolved.return_type_oid,
+        base_not_null: not_null,
+        table_alias: alias.to_owned(),
+        typmod: None,
+        collation: None,
+        record_fields: None,
+    }])
+}
+
+/// The columns a column definition list (`AS x(a int, b varchar(3))`)
+/// declares for a `record`-returning function: PG resolves each type with
+/// its typmod (`typenameTypeIdAndMod`), then rejects duplicate names
+/// (`CheckAttributeNamesTypes`, 42701). The values are unconstrained, so
+/// every column is nullable.
+fn coldeflist_columns(
+    coldeflist: &[protobuf::Node],
+    alias: &str,
+    snapshot: &PgCatalog,
+) -> Result<Vec<ScopeColumn>, AnalyzeError> {
+    let mut cols: Vec<ScopeColumn> = Vec::with_capacity(coldeflist.len());
+    for n in coldeflist {
+        let Some(node::Node::ColumnDef(cd)) = n.node.as_ref() else {
+            continue;
+        };
+        let tn = cd
+            .type_name
+            .as_ref()
+            .ok_or_else(|| AnalyzeError::Unsupported("column definition without a type".into()))?;
+        let type_oid = crate::ddl::util::lookup_type_name(tn, snapshot).map_err(|e| match e {
+            crate::ddl::DdlError::TypeNotFound(msg) => AnalyzeError::UndefinedType(msg),
+            other => AnalyzeError::Invalid(other.to_string()),
+        })?;
+        let typmod = crate::typmod::encode(snapshot, type_oid, &tn.typmods)
+            .map_err(|e| AnalyzeError::Invalid(e.to_string()))?;
+        cols.push(ScopeColumn {
+            name: cd.colname.clone(),
+            type_oid,
+            base_not_null: false,
+            typmod: snapshot.effective_typmod(type_oid, typmod),
+            collation: None,
+            table_alias: alias.to_owned(),
+            record_fields: None,
+        });
+    }
+    for (i, c) in cols.iter().enumerate() {
+        if cols[..i].iter().any(|p| p.name == c.name) {
+            return Err(crate::pgmsg::duplicate_column_name(&c.name).finalize_implicit());
+        }
+    }
+    Ok(cols)
 }

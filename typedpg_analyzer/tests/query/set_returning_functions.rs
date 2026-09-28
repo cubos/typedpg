@@ -148,3 +148,180 @@ fn composite_srf_columns_ignore_table_not_null() {
     let s = db.analyze("SELECT * FROM f_setof_r()").unwrap();
     assert_cols(&s, vec![cn("id", int4()), cn("s", text())]);
 }
+
+// ── Column definition lists (`AS x(a int, b text)`) ──────────────────────────
+
+fn setup_rte() -> PgCatalog {
+    let mut db = setup();
+    db.apply_sql(
+        "CREATE FUNCTION f_rec() RETURNS SETOF record AS $$ SELECT 1, 'x'::text $$ LANGUAGE sql;
+         CREATE FUNCTION f_tab(a int) RETURNS TABLE (k int, v text) AS $$ SELECT a, 'x' $$ LANGUAGE sql;
+         CREATE TABLE tt (id int, s text);
+         CREATE FUNCTION f_comp() RETURNS SETOF tt AS $$ SELECT 1, 'x' $$ LANGUAGE sql;",
+    )
+    .unwrap();
+    db
+}
+
+#[test]
+fn coldeflist_defines_record_function_columns() {
+    let db = setup_rte();
+    let s = db
+        .analyze("SELECT * FROM f_rec() AS x(a int, b text)")
+        .unwrap();
+    assert_cols(&s, vec![cn("a", int4()), cn("b", text())]);
+    let s = db
+        .analyze("SELECT a, b FROM f_rec() AS x(a int, b text)")
+        .unwrap();
+    assert_cols(&s, vec![cn("a", int4()), cn("b", text())]);
+    let s = db
+        .analyze("SELECT * FROM jsonb_to_record('{}') AS x(a int, b text)")
+        .unwrap();
+    assert_cols(&s, vec![cn("a", int4()), cn("b", text())]);
+    let s = db
+        .analyze("SELECT * FROM json_to_recordset('[{\"a\":1}]') AS x(a int)")
+        .unwrap();
+    assert_cols(&s, vec![cn("a", int4())]);
+    let s = db
+        .analyze("SELECT * FROM f_rec() AS x(a varchar(3), b numeric(5,2))")
+        .unwrap();
+    assert_cols(&s, vec![cn("a", varchar_n(3)), cn("b", numeric_ps(5, 2))]);
+}
+
+#[test]
+fn coldeflist_rejected_on_non_record_functions() {
+    let db = setup_rte();
+    assert_analyze_err!(
+        db.analyze("SELECT * FROM generate_series(1,2) AS g(a int)"),
+        AnalyzeError::SyntaxError(_),
+        "a column definition list is only allowed for functions returning \"record\""
+    );
+    assert_analyze_err!(
+        db.analyze("SELECT * FROM f_tab(1) AS g(a int)"),
+        AnalyzeError::SyntaxError(_),
+        "a column definition list is redundant for a function with OUT parameters"
+    );
+    assert_analyze_err!(
+        db.analyze("SELECT * FROM f_comp() AS g(a int)"),
+        AnalyzeError::SyntaxError(_),
+        "a column definition list is redundant for a function returning a named composite type"
+    );
+    assert_analyze_err!(
+        db.analyze("SELECT * FROM f_rec()"),
+        AnalyzeError::SyntaxError(_),
+        "a column definition list is required for functions returning \"record\"\n  \
+         help: add one after the alias, e.g. `AS x(a int, b text)`\n"
+    );
+}
+
+#[test]
+fn coldeflist_errors() {
+    let db = setup_rte();
+    assert_analyze_err!(
+        db.analyze("SELECT * FROM f_rec() AS x(a int, a text)"),
+        AnalyzeError::DuplicateColumn(_),
+        "column name \"a\" specified more than once"
+    );
+    let err = db
+        .analyze("SELECT * FROM f_rec() AS x(a int, b nosuchtype)")
+        .unwrap_err();
+    assert!(matches!(err, AnalyzeError::UndefinedType(_)), "{err:?}");
+    assert!(
+        err.to_string()
+            .starts_with("type \"nosuchtype\" does not exist"),
+        "{err}"
+    );
+    assert_analyze_err!(
+        db.analyze("SELECT * FROM unnest(ARRAY[1], ARRAY[2]) AS x(a int, b int)"),
+        AnalyzeError::SyntaxError(_),
+        "UNNEST() with multiple arguments cannot have a column definition list\n  \
+         help: Use separate UNNEST() calls inside ROWS FROM(), and attach a column definition list to each one.\n"
+    );
+    assert_analyze_err!(
+        db.analyze("SELECT * FROM ROWS FROM (f_rec(), f_rec()) AS x(a int, b text)"),
+        AnalyzeError::SyntaxError(_),
+        "ROWS FROM() with multiple functions cannot have a column definition list\n  \
+         help: Put a separate column definition list for each function inside ROWS FROM().\n"
+    );
+    assert_analyze_err!(
+        db.analyze("SELECT * FROM f_rec() WITH ORDINALITY AS x(a int, b text)"),
+        AnalyzeError::SyntaxError(_),
+        "WITH ORDINALITY cannot be used with a column definition list\n  \
+         help: Put the column definition list inside ROWS FROM().\n"
+    );
+}
+
+// ── ROWS FROM (…) ────────────────────────────────────────────────────────────
+
+/// Every function contributes its columns; the shorter results are padded
+/// with NULL (PG 18: row 3 of the first query is `(3, NULL)`).
+#[test]
+fn rows_from_keeps_every_function() {
+    let db = setup_rte();
+    let s = db
+        .analyze(
+            "SELECT * FROM ROWS FROM (generate_series(1, 3), unnest(ARRAY['a', 'b'])) AS r(a, b)",
+        )
+        .unwrap();
+    assert_cols(&s, vec![cn("a", int4()), cn("b", text())]);
+    let s = db
+        .analyze("SELECT * FROM ROWS FROM (generate_series(1, 3), f_tab(1)) WITH ORDINALITY")
+        .unwrap();
+    assert_cols(
+        &s,
+        vec![
+            cn("generate_series", int4()),
+            cn("k", int4()),
+            cn("v", text()),
+            c("ordinality", int8()),
+        ],
+    );
+    let s = db
+        .analyze("SELECT * FROM ROWS FROM (f_rec() AS (a int, b text), generate_series(1,2)) x")
+        .unwrap();
+    assert_cols(
+        &s,
+        vec![
+            cn("a", int4()),
+            cn("b", text()),
+            cn("generate_series", int4()),
+        ],
+    );
+    let s = db
+        .analyze("SELECT * FROM ROWS FROM (f_rec()) AS x(a int, b text)")
+        .unwrap();
+    assert_cols(&s, vec![cn("a", int4()), cn("b", text())]);
+    let s = db
+        .analyze("SELECT * FROM ROWS FROM (unnest(ARRAY[1,2], ARRAY[3]))")
+        .unwrap();
+    assert_cols(&s, vec![cn("unnest", int4()), cn("unnest", int4())]);
+    // A lone function keeps its own nullability and the alias names it.
+    let s = db
+        .analyze("SELECT * FROM ROWS FROM (generate_series(1,2)) AS g")
+        .unwrap();
+    assert_cols(&s, vec![c("g", int4())]);
+}
+
+// ── Column alias count ───────────────────────────────────────────────────────
+
+#[test]
+fn too_many_column_aliases_for_function_rte() {
+    let db = setup_rte();
+    assert_analyze_err!(
+        db.analyze("SELECT * FROM generate_series(1, 3) AS g(a, b)"),
+        AnalyzeError::InvalidColumnReference(_),
+        "table \"g\" has 1 columns available but 2 columns specified"
+    );
+    assert_analyze_err!(
+        db.analyze("SELECT * FROM f_tab(1) AS ft(a, b, c)"),
+        AnalyzeError::InvalidColumnReference(_),
+        "table \"ft\" has 2 columns available but 3 columns specified"
+    );
+    assert_analyze_err!(
+        db.analyze(
+            "SELECT * FROM ROWS FROM (generate_series(1, 3), f_tab(1)) WITH ORDINALITY AS r(a,b,c,d,e)"
+        ),
+        AnalyzeError::InvalidColumnReference(_),
+        "table \"r\" has 4 columns available but 5 columns specified"
+    );
+}
