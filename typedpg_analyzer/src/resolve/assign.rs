@@ -45,49 +45,12 @@ pub(crate) fn assignment_target(
                     run.push(ai);
                     i += 1;
                 }
-                let base = snapshot.unwrap_domain(ty);
-                let te = snapshot.get_type(base);
-                let (elem, index_goal) = if let Some(e) = te
-                    .filter(|t| t.typcategory == TypCategory::Array)
-                    .and_then(|t| t.typelem)
-                {
-                    let slice = run.iter().any(|a| a.is_slice);
-                    ((if slice { base } else { e }), Some(oid::INT4))
-                } else if te.is_some_and(|t| t.typname == "jsonb") {
-                    // jsonb's subscript handler yields jsonb.
-                    (base, None)
-                } else {
-                    let t = crate::ddl::util::format_type_for_message(snapshot, ty);
-                    return Err(crate::error::RawError::new(
-                        AnalyzeError::DatatypeMismatch(format!(
-                            "cannot subscript type {t} because it does not support subscripting"
-                        )),
-                        None,
-                        None,
-                    )
-                    .finalize_implicit());
-                };
-                for ai in run {
-                    for idx in [ai.lidx.as_deref(), ai.uidx.as_deref()]
-                        .into_iter()
-                        .flatten()
-                    {
-                        let goal = match index_goal {
-                            Some(t) => TypeGoal::implicit(t),
-                            None => TypeGoal::NONE,
-                        };
-                        let e = expr::infer_expr(idx, ctx, params, goal)?;
-                        // jsonb's subscript handler reads an untyped
-                        // subscript as text (`jsonb_subscript_transform`).
-                        if index_goal.is_none()
-                            && let Some(node::Node::ParamRef(p)) = idx.node.as_ref()
-                            && e.type_oid == oid::UNKNOWN
-                            && params.get(p.number) == oid::UNKNOWN
-                        {
-                            params.record(p.number, oid::TEXT);
-                        }
-                    }
-                }
+                // transformContainerSubscripts serves assignments too: the
+                // same subscriptability, slice and subscript-type rules, and
+                // the value lands in the element (or slice) type.
+                let container = expr::ExprType::scalar(ty, true);
+                let elem =
+                    expr::transform_container_subscripts(&container, &run, ctx, params)?.type_oid;
                 ty = elem;
                 last_step = Some((true, target_name.clone()));
             }

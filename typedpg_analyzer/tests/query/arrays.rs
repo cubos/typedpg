@@ -453,3 +453,99 @@ fn array_ndims_on_scalar_rejected() {
         ),
     );
 }
+
+// ── Subscript runs (PG's transformContainerSubscripts) ──────────────────────
+
+fn subscript_db() -> PgCatalog {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE DOMAIN posint AS int CHECK (VALUE > 0);
+         CREATE DOMAIN ia AS int[];
+         CREATE TABLE t (
+            arr int[] NOT NULL,
+            vca varchar(5)[] NOT NULL,
+            p   posint NOT NULL,
+            d   ia NOT NULL
+         );",
+    )
+    .unwrap();
+    db
+}
+
+#[test]
+fn slice_anywhere_in_a_subscript_run_makes_it_a_slice() {
+    // One `lo:hi` in a run of subscripts makes every subscript a slice, so
+    // the result keeps the array type (verified on PG 18).
+    let db = subscript_db();
+    let s = db
+        .analyze("SELECT arr[1:2][1] AS a, arr[:][1] AS b, arr[1][1:1] AS c FROM t")
+        .unwrap();
+    assert_cols(
+        &s,
+        vec![
+            c("a", array_of(int4())),
+            c("b", array_of(int4())),
+            c("c", array_of(int4())),
+        ],
+    );
+}
+
+#[test]
+fn subscripts_unwrap_domains() {
+    // A domain over an array subscripts as its base type.
+    let db = subscript_db();
+    let s = db.analyze("SELECT d[1] AS g, d[1:1] AS h FROM t").unwrap();
+    assert_cols(&s, vec![cn("g", int4()), c("h", array_of(int4()))]);
+}
+
+#[test]
+fn subscript_errors_match_pg() {
+    let db = subscript_db();
+    // A domain over a scalar is reported under its base type.
+    assert_err_prefix!(
+        db.analyze("SELECT p[1] FROM t"),
+        AnalyzeError::DatatypeMismatch(_),
+        "cannot subscript type integer because it does not support subscripting"
+    );
+    assert_err_prefix!(
+        db.analyze("SELECT arr[true] FROM t"),
+        AnalyzeError::DatatypeMismatch(_),
+        "array subscript must have type integer"
+    );
+    assert_err_prefix!(
+        db.analyze("SELECT arr['x'] FROM t"),
+        AnalyzeError::InvalidLiteral(_),
+        "invalid input syntax for type integer: \"x\""
+    );
+    assert_err_prefix!(
+        db.analyze("SELECT arr[1][1][1][1][1][1][1] FROM t"),
+        AnalyzeError::Invalid(_),
+        "number of array dimensions (7) exceeds the maximum allowed (6)"
+    );
+}
+
+#[test]
+fn update_array_element_assignment_expects_the_element_type() {
+    // `SET arr[1] = …` assigns an element (transformAssignmentIndirection),
+    // `SET arr[1:2] = …` a slice of the array type.
+    let db = subscript_db();
+    db.analyze("UPDATE t SET arr[1] = 5").unwrap();
+    db.analyze("UPDATE t SET arr[1:2] = ARRAY[5, 6]").unwrap();
+    let s = db.analyze("UPDATE t SET arr[1] = $v").unwrap();
+    assert_params(&s, vec![pn(int4())]);
+    assert_err_prefix!(
+        db.analyze("UPDATE t SET arr[1] = 'x'::text"),
+        AnalyzeError::DatatypeMismatch(_),
+        "subscripted assignment to \"arr\" requires type integer but expression is of type text"
+    );
+    assert_err_prefix!(
+        db.analyze("UPDATE t SET arr[1:2] = 5"),
+        AnalyzeError::DatatypeMismatch(_),
+        "subscripted assignment to \"arr\" requires type integer[] but expression is of type integer"
+    );
+    assert_err_prefix!(
+        db.analyze("UPDATE t SET p[1] = 1"),
+        AnalyzeError::DatatypeMismatch(_),
+        "cannot subscript type integer because it does not support subscripting"
+    );
+}

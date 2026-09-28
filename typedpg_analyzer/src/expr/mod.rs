@@ -971,6 +971,7 @@ use column_refs::*;
 use conditional::*;
 pub(crate) use func_call::check_window_clause;
 use func_call::*;
+pub(crate) use indirection::transform_container_subscripts;
 use indirection::*;
 use literals::*;
 use operators::*;

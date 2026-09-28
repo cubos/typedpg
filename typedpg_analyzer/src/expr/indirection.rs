@@ -99,133 +99,28 @@ pub(crate) fn infer_indirection(
         None
     };
 
-    for (idx, step) in ind.indirection.iter().enumerate().skip(start_step) {
-        match step.node.as_ref() {
+    let steps = &ind.indirection[start_step..];
+    let mut i = 0;
+    while i < steps.len() {
+        match steps[i].node.as_ref() {
             Some(node::Node::String(s)) => {
-                let alias_hint = if idx == start_step {
-                    arg_is_bare_alias
-                } else {
-                    None
-                };
+                let alias_hint = if i == 0 { arg_is_bare_alias } else { None };
                 current = resolve_composite_field(&current, &s.sval, snapshot, alias_hint)?;
+                i += 1;
             }
-            Some(node::Node::AIndices(ai)) => {
-                // `jsonb` subscripting (PG 14+): `data['key']`, `data[0]`,
-                // chained. Each non-slice step yields `jsonb` and is always
-                // nullable — a missing key/index produces NULL. Only `jsonb`
-                // has a subscript handler in PG; the plain `json` type does
-                // not, so it falls through to the array path below, which
-                // rejects non-array types with PG's wording.
-                let jsonb_base_oid = snapshot.unwrap_domain(current.type_oid);
-                let current_is_jsonb = snapshot
-                    .get_type(jsonb_base_oid)
-                    .is_some_and(|t| t.typname == "jsonb");
-                if current_is_jsonb {
-                    if ai.is_slice {
-                        // PG's jsonb subscript handler rejects slices —
-                        // verbatim message for the sanity prefix match.
-                        return Err(AnalyzeError::Unsupported(
-                            "jsonb subscript does not support slices".into(),
-                        ));
-                    }
-                    // The subscript key is coerced by PG to `text` (an
-                    // object key) or `int4` (an array index) — both are
-                    // accepted, so infer the bounds without forcing a goal.
-                    for bound in [&ai.lidx, &ai.uidx].into_iter().flatten() {
-                        infer_expr(bound, ctx, params, TypeGoal::NONE)?;
-                    }
-                    let jsonb_oid = snapshot
-                        .resolve_type_by_name(None, "jsonb")
-                        .map(|j| j.oid)
-                        .unwrap_or(jsonb_base_oid);
-                    current = ExprType::scalar(jsonb_oid, true);
-                    continue;
-                }
-
-                // PG validates the container's subscriptability *before*
-                // coercing the index expressions (`('…'::json)['a']` reports
-                // `cannot subscript type json …`, not an index-type error),
-                // so check it up front for both the slice and element paths.
-                if snapshot
-                    .get_type(current.type_oid)
-                    .is_some_and(|t| t.typcategory != TypCategory::Array || t.typelem.is_none())
-                {
-                    return Err(AnalyzeError::Unsupported(format!(
-                        "cannot subscript type {} because it does not support subscripting",
-                        crate::ddl::util::format_type_for_message(snapshot, current.type_oid)
-                    )));
-                }
-
-                // Walk both bounds with an int4 goal so params and column
-                // refs inside `arr[lo:hi]` / `arr[i]` get typed and
-                // validated (PG coerces subscripts to int4 in assignment
-                // context). A coercion failure gets PG's exact wording.
-                // Track nullability so slice results propagate NULL from
-                // any NULL bound.
-                let mut any_bound_nullable = false;
-                for bound in [&ai.lidx, &ai.uidx].into_iter().flatten() {
-                    let t = match infer_expr(bound, ctx, params, TypeGoal::assignment(oid::INT4)) {
-                        Ok(t) => t,
-                        Err(AnalyzeError::TypeMismatch { .. }) => {
-                            let span = crate::error::node_location(bound)
-                                .and_then(crate::error::SourceSpan::from_node_qname);
-                            return Err(crate::error::RawError::invalid(
-                                "array subscript must have type integer".to_string(),
-                                span,
-                                None,
-                            )
-                            .with_primary_label("this is not an integer")
-                            .finalize_implicit());
-                        }
-                        Err(e) => return Err(e),
-                    };
-                    any_bound_nullable = any_bound_nullable || t.nullable;
-                }
-
-                if ai.is_slice {
-                    let type_entry = snapshot.get_type(current.type_oid).ok_or_else(|| {
-                        AnalyzeError::UndefinedType(format!(
-                            "internal: array slice over unknown type OID {}",
-                            current.type_oid.get()
-                        ))
-                    })?;
-                    if type_entry.typcategory != TypCategory::Array {
-                        return Err(AnalyzeError::Unsupported(format!(
-                            "cannot subscript type {} because it does not support subscripting",
-                            crate::ddl::util::format_type_for_message(snapshot, current.type_oid,)
-                        )));
-                    }
-                    // `arr[lo:hi]` keeps the array type. Result is NULL iff
-                    // the array is NULL or any bound is NULL — out-of-range
-                    // bounds yield an empty (non-null) array.
-                    current =
-                        ExprType::scalar(current.type_oid, current.nullable || any_bound_nullable);
-                } else {
-                    // Adjacent non-slice subscripts (`arr[i][j]`) keep the
-                    // array type for all but the last step. PG accepts an
-                    // arbitrary number of subscripts on any array (multi-dim
-                    // arrays collapse into the same type OID), so we mirror
-                    // that by reducing to the element type only when no
-                    // further `[…]` step follows in the same chain.
-                    let next_is_subscript = ind.indirection.get(idx + 1).is_some_and(|s| {
-                        matches!(
-                            s.node.as_ref(),
-                            Some(node::Node::AIndices(next)) if !next.is_slice
-                        )
-                    });
-                    if next_is_subscript {
-                        current = ExprType::scalar(current.type_oid, true);
-                    } else {
-                        // `arr[i]` is always nullable (out-of-bounds → NULL,
-                        // even with non-null array and non-null index).
-                        current = resolve_array_element(&current, snapshot)?;
-                    }
-                }
+            Some(node::Node::AIndices(_)) => {
+                // PG's transformIndirection gathers every consecutive
+                // subscript into one list and hands the whole run to
+                // transformContainerSubscripts, so e.g. a slice anywhere in
+                // `arr[1:2][1]` makes the entire run a slice.
+                let run = subscript_run(&steps[i..]);
+                i += run.len();
+                current = transform_container_subscripts(&current, &run, ctx, params)?;
             }
             _ => {
                 return Err(AnalyzeError::Unsupported(format!(
                     "unsupported indirection step: {:?}",
-                    step.node.as_ref().map(std::mem::discriminant)
+                    steps[i].node.as_ref().map(std::mem::discriminant)
                 )));
             }
         }
@@ -466,32 +361,140 @@ pub(crate) fn infer_array_expr(
     Ok(ExprType::scalar(array_oid, false))
 }
 
-/// `arr[i]` — the result is an element of the array. Nullable because SQL
-/// subscripts out of bounds return NULL rather than erroring.
-fn resolve_array_element(
-    current: &ExprType,
-    snapshot: &PgCatalog,
+/// The leading run of consecutive `[…]` steps of an indirection list.
+pub(crate) fn subscript_run(steps: &[protobuf::Node]) -> Vec<&protobuf::AIndices> {
+    steps
+        .iter()
+        .map_while(|s| match s.node.as_ref() {
+            Some(node::Node::AIndices(ai)) => Some(&**ai),
+            _ => None,
+        })
+        .collect()
+}
+
+/// PG's `MAXDIM`: the most subscripts an array reference can carry.
+const MAXDIM: usize = 6;
+
+/// Apply one run of subscripts to a container value — PG's
+/// `transformContainerSubscripts` (parse_node.c) followed by the type's
+/// subscript handler (`array_subscript_transform` in arraysubs.c or
+/// `jsonb_subscript_transform` in jsonbsubs.c). The same transform serves
+/// fetches and assignments (`UPDATE … SET arr[1] = …`): the returned type is
+/// both the fetched value's type and the type an assigned value must have.
+///
+/// - A domain subscripts as its base type (`transformContainerType`).
+/// - A type is subscriptable iff it has a subscript handler: every type with
+///   a `typelem` (true arrays, `int2vector`, `name`, `point`, …) uses the
+///   array handler, and `jsonb` its own. Anything else is `cannot subscript
+///   type T because it does not support subscripting` (42804).
+/// - `is_slice` is decided for the whole run: one `lo:hi` makes every
+///   subscript a slice (a plain `[i]` then means `[1:i]`).
+/// - Arrays coerce each bound to int4 in assignment context; a slice keeps
+///   the array type, an element fetch yields the element type, and both keep
+///   the array's typmod.
+/// - jsonb rejects slices and accepts a subscript coercible (implicitly) to
+///   int4 or text, trying int4 first; an unknown one becomes text.
+pub(crate) fn transform_container_subscripts(
+    container: &ExprType,
+    subscripts: &[&protobuf::AIndices],
+    ctx: Ctx<'_>,
+    params: &mut ParamCollector,
 ) -> Result<ExprType, AnalyzeError> {
-    let type_entry = snapshot.get_type(current.type_oid).ok_or_else(|| {
-        AnalyzeError::UndefinedType(format!(
-            "internal: array subscript over unknown type OID {}",
-            current.type_oid.get()
-        ))
-    })?;
-    // PG (SQLSTATE 42804) rejects subscripting a type with no subscript
-    // handler with this verbatim wording; keep it exact for the sanity
-    // prefix match. `jsonb` is handled before reaching here.
-    let not_subscriptable = || {
-        AnalyzeError::Unsupported(format!(
-            "cannot subscript type {} because it does not support subscripting",
-            crate::ddl::util::format_type_for_message(snapshot, current.type_oid)
-        ))
+    let snapshot = ctx.snapshot;
+    let base = snapshot.unwrap_domain(container.type_oid);
+    let typmod = if base == container.type_oid {
+        container.typmod
+    } else {
+        snapshot.effective_typmod(container.type_oid, None)
     };
-    let Some(elem) = type_entry.typelem else {
-        return Err(not_subscriptable());
+    let entry = snapshot.get_type(base);
+    let is_slice = subscripts.iter().any(|ai| ai.is_slice);
+    let bound_span = |bound: &protobuf::Node| {
+        crate::error::node_location(bound).and_then(crate::error::SourceSpan::from_node_qname)
     };
-    if type_entry.typcategory != TypCategory::Array {
-        return Err(not_subscriptable());
+
+    if entry.is_some_and(|t| {
+        t.typname == "jsonb" && snapshot.namespace_name(t.typnamespace) == Some("pg_catalog")
+    }) {
+        for ai in subscripts {
+            if is_slice {
+                let span = ai
+                    .uidx
+                    .as_deref()
+                    .or(ai.lidx.as_deref())
+                    .and_then(bound_span);
+                return Err(
+                    crate::pgmsg::jsonb_subscript_does_not_support_slices(span).finalize_implicit()
+                );
+            }
+            let Some(bound) = ai.uidx.as_deref() else {
+                continue;
+            };
+            let t = infer_expr(bound, ctx, params, TypeGoal::NONE)?;
+            if t.type_oid == oid::UNKNOWN {
+                coerce_unknown_to(bound, ctx, params, oid::TEXT)?;
+            } else if !can_coerce(t.type_oid, oid::INT4, CoercionContext::Implicit, snapshot)
+                && !can_coerce(t.type_oid, oid::TEXT, CoercionContext::Implicit, snapshot)
+            {
+                let name = crate::ddl::util::format_type_for_message(snapshot, t.type_oid);
+                return Err(
+                    crate::pgmsg::subscript_type_not_supported(&name, bound_span(bound))
+                        .finalize_implicit(),
+                );
+            }
+        }
+        return Ok(ExprType::scalar(base, true));
     }
-    Ok(ExprType::scalar(elem, true))
+
+    let Some(elem) = entry.and_then(|t| t.typelem) else {
+        let name = crate::ddl::util::format_type_for_message(snapshot, base);
+        return Err(crate::pgmsg::cannot_subscript_type(&name).finalize_implicit());
+    };
+
+    let mut any_bound_nullable = false;
+    for ai in subscripts {
+        // A non-slice subscript inside a slice run means `[1:i]`: its
+        // implicit lower bound is the constant 1, so only `uidx` is walked.
+        let lower = if is_slice { ai.lidx.as_deref() } else { None };
+        for bound in [lower, ai.uidx.as_deref()].into_iter().flatten() {
+            let t = match infer_expr(bound, ctx, params, TypeGoal::assignment(oid::INT4)) {
+                Ok(t) => t,
+                Err(AnalyzeError::TypeMismatch { .. }) => {
+                    return Err(
+                        crate::pgmsg::array_subscript_must_be_integer(bound_span(bound))
+                            .with_primary_label("this is not an integer")
+                            .finalize_implicit(),
+                    );
+                }
+                Err(e) => return Err(e),
+            };
+            any_bound_nullable = any_bound_nullable || t.nullable;
+        }
+    }
+    if subscripts.len() > MAXDIM {
+        return Err(AnalyzeError::Invalid(format!(
+            "number of array dimensions ({}) exceeds the maximum allowed ({MAXDIM})",
+            subscripts.len()
+        )));
+    }
+
+    if is_slice {
+        // `arr[lo:hi]` keeps the (base) array type. NULL iff the array or a
+        // bound is NULL — out-of-range bounds yield an empty array.
+        Ok(ExprType::scalar_with_collation(
+            base,
+            container.nullable || any_bound_nullable,
+            typmod,
+            container.collation,
+        ))
+    } else {
+        // `arr[i]` is always nullable (out-of-bounds → NULL, even with a
+        // non-null array and index).
+        Ok(ExprType::scalar_with_collation(
+            elem,
+            true,
+            typmod,
+            container.collation,
+        ))
+    }
 }

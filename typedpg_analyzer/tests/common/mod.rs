@@ -591,3 +591,36 @@ macro_rules! assert_ddl_err {
 // test file in this binary can invoke them as `assert_ddl_err!(...)` — no
 // `use` needed, and `mod common;` in the binary's entry file is enough to
 // make them visible.
+
+/// Like [`assert_analyze_err!`] but only requires the rendered message to
+/// *start with* the expected PG-verbatim wording (diagnostics append spans
+/// and hints after it).
+#[macro_export]
+macro_rules! assert_err_prefix {
+    ($result:expr, $variant:pat, $expected_prefix:expr $(,)?) => {{
+        match &$result {
+            Err(err) => {
+                assert!(
+                    matches!(err, $variant),
+                    "expected {} but got: {:?}",
+                    stringify!($variant),
+                    err
+                );
+                let msg = err.to_string();
+                let expected: &str = $expected_prefix;
+                assert!(
+                    msg.starts_with(expected),
+                    "error message mismatch\n  expected prefix: {:?}\n              got: {:?}",
+                    expected,
+                    msg,
+                );
+            }
+            Ok(info) => panic!(
+                "expected {} with message {:?}, got Ok: {:?}",
+                stringify!($variant),
+                $expected_prefix,
+                info,
+            ),
+        }
+    }};
+}

@@ -263,7 +263,7 @@ fn jsonb_slice_subscript_is_rejected() {
     // PG verbatim.
     assert_analyze_err!(
         db.analyze("SELECT meta['a':'b'] AS v FROM users"),
-        AnalyzeError::Unsupported(_),
+        AnalyzeError::DatatypeMismatch(_),
         "jsonb subscript does not support slices",
     );
 }
@@ -275,7 +275,99 @@ fn json_subscript_is_rejected() {
     // does not, so subscripting it is an error — message matches PG.
     assert_analyze_err!(
         db.analyze("SELECT ('{\"a\":1}'::json)['a'] AS v"),
-        AnalyzeError::Unsupported(_),
+        AnalyzeError::DatatypeMismatch(_),
         "cannot subscript type json because it does not support subscripting",
+    );
+}
+
+// ── jsonb subscripts (PG's jsonb_subscript_transform) ───────────────────────
+
+fn jsonb_subscript_db() -> PgCatalog {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE t (id int PRIMARY KEY, j jsonb NOT NULL, js json);")
+        .unwrap();
+    db
+}
+
+#[test]
+fn jsonb_subscript_accepts_int_and_text_coercible_keys() {
+    let db = jsonb_subscript_db();
+    let s = db
+        .analyze("SELECT j['a'] AS i, j[1::int2] AS k, j['a'::varchar] AS l, j[NULL] AS m FROM t")
+        .unwrap();
+    assert_cols(
+        &s,
+        vec![
+            cn("i", jsonb()),
+            cn("k", jsonb()),
+            cn("l", jsonb()),
+            cn("m", jsonb()),
+        ],
+    );
+    // An untyped subscript becomes text, a typed int an array index.
+    let s = db
+        .analyze("SELECT j[$k] AS a, j[$i + 1] AS b FROM t")
+        .unwrap();
+    assert_params(&s, vec![p(text()), p(int4())]);
+}
+
+#[test]
+fn jsonb_subscript_rejects_other_key_types() {
+    let db = jsonb_subscript_db();
+    for (sql, ty) in [
+        ("SELECT j[true] AS a FROM t", "boolean"),
+        ("SELECT j[1.5] AS a FROM t", "numeric"),
+        ("SELECT j[1::int8] AS a FROM t", "bigint"),
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::DatatypeMismatch(_),
+            &format!("subscript type {ty} is not supported")
+        );
+    }
+}
+
+#[test]
+fn jsonb_subscript_slices_rejected_with_42804() {
+    let db = jsonb_subscript_db();
+    for sql in [
+        "SELECT j['a':'b'] FROM t",
+        "SELECT j['a'][1:2] FROM t",
+        "SELECT j[1:] FROM t",
+        "UPDATE t SET j[1:2] = '1'",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::DatatypeMismatch(_),
+            "jsonb subscript does not support slices"
+        );
+    }
+    assert_err_prefix!(
+        db.analyze("UPDATE t SET j[true] = '1'"),
+        AnalyzeError::DatatypeMismatch(_),
+        "subscript type boolean is not supported"
+    );
+}
+
+#[test]
+fn json_is_not_subscriptable_42804() {
+    let db = jsonb_subscript_db();
+    assert_err_prefix!(
+        db.analyze("SELECT js['a'] FROM t"),
+        AnalyzeError::DatatypeMismatch(_),
+        "cannot subscript type json because it does not support subscripting"
+    );
+}
+
+#[test]
+fn update_jsonb_subscript_assigns_jsonb() {
+    let db = jsonb_subscript_db();
+    db.analyze("UPDATE t SET j['a'] = '1'").unwrap();
+    let s = db.analyze("UPDATE t SET j['a'] = $v").unwrap();
+    assert_params(&s, vec![pn(jsonb())]);
+    assert_err_prefix!(
+        db.analyze("UPDATE t SET j.a = '1'"),
+        AnalyzeError::DatatypeMismatch(_),
+        "cannot assign to field \"a\" of column \"j\" because its type jsonb is not a composite type"
     );
 }

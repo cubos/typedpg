@@ -809,6 +809,47 @@ pub(crate) fn subquery_must_return_one_column(span: Option<SourceSpan>) -> RawEr
     )
 }
 
+/// `cannot subscript type T because it does not support subscripting` —
+/// SQLSTATE 42804: the (domain-unwrapped) container type has no subscript
+/// handler (PG's transformContainerSubscripts).
+pub(crate) fn cannot_subscript_type(type_name: &str) -> RawError {
+    RawError::new(
+        AnalyzeError::DatatypeMismatch(format!(
+            "cannot subscript type {type_name} because it does not support subscripting"
+        )),
+        None,
+        None,
+    )
+}
+
+/// `jsonb subscript does not support slices` — SQLSTATE 42804.
+pub(crate) fn jsonb_subscript_does_not_support_slices(span: Option<SourceSpan>) -> RawError {
+    RawError::new(
+        AnalyzeError::DatatypeMismatch("jsonb subscript does not support slices".to_string()),
+        span,
+        None,
+    )
+}
+
+/// `subscript type T is not supported` — SQLSTATE 42804: a jsonb subscript
+/// coercible to neither integer nor text.
+pub(crate) fn subscript_type_not_supported(type_name: &str, span: Option<SourceSpan>) -> RawError {
+    RawError::new(
+        AnalyzeError::DatatypeMismatch(format!("subscript type {type_name} is not supported")),
+        span,
+        Some("jsonb subscript must be coercible to either integer or text.".to_string()),
+    )
+}
+
+/// `array subscript must have type integer` — SQLSTATE 42804.
+pub(crate) fn array_subscript_must_be_integer(span: Option<SourceSpan>) -> RawError {
+    RawError::new(
+        AnalyzeError::DatatypeMismatch("array subscript must have type integer".to_string()),
+        span,
+        None,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
