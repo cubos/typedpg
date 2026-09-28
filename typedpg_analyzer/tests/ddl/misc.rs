@@ -2453,3 +2453,64 @@ fn storage_parameters_are_validated() {
         ),
     ]);
 }
+
+#[test]
+fn partitioned_indexes_reach_the_partitions() {
+    // PG 18 DefineIndex recursion / AttachPartitionEnsureIndexes: every
+    // partition gets (or attaches) a copy of each partitioned index, with
+    // an inherited constraint for constraint indexes.
+    let setup = "CREATE TABLE p (a int PRIMARY KEY, b int) PARTITION BY LIST (a);
+                 CREATE TABLE p1 PARTITION OF p FOR VALUES IN (1);
+                 CREATE UNIQUE INDEX pb ON p (a, b);
+                 CREATE TABLE p2 (a int NOT NULL, b int);
+                 ALTER TABLE p ATTACH PARTITION p2 FOR VALUES IN (2);
+                 CREATE TABLE p3 (a int NOT NULL, b int);
+                 CREATE UNIQUE INDEX p3_own ON p3 (a, b);
+                 ALTER TABLE p ATTACH PARTITION p3 FOR VALUES IN (3);";
+    for (stmt, msg) in [
+        (
+            "ALTER TABLE p1 DROP CONSTRAINT p1_pkey;",
+            "cannot drop inherited constraint \"p1_pkey\" of relation \"p1\"",
+        ),
+        (
+            "DROP INDEX p1_pkey;",
+            "cannot drop index p1_pkey because index p_pkey requires it",
+        ),
+        (
+            "DROP INDEX p1_a_b_idx;",
+            "cannot drop index p1_a_b_idx because index pb requires it",
+        ),
+        (
+            "DROP INDEX p3_own;",
+            "cannot drop index p3_own because index pb requires it",
+        ),
+        (
+            "DROP INDEX pb; INSERT INTO p1 VALUES (1) ON CONFLICT (a, b) DO NOTHING;",
+            "there is no unique or exclusion constraint matching the ON CONFLICT specification",
+        ),
+        (
+            "ALTER TABLE p DROP CONSTRAINT p_pkey; INSERT INTO p1 VALUES (1) ON CONFLICT (a) DO NOTHING;",
+            "there is no unique or exclusion constraint matching the ON CONFLICT specification",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "INSERT INTO p1 VALUES (1, 1) ON CONFLICT (a, b) DO NOTHING;
+             INSERT INTO p1 VALUES (1, 1) ON CONFLICT (a) DO NOTHING;
+             INSERT INTO p2 VALUES (2) ON CONFLICT (a) DO NOTHING;
+             INSERT INTO p3 VALUES (3) ON CONFLICT (a, b) DO NOTHING;
+             CREATE INDEX pbb ON p (b);
+             DROP INDEX pbb;
+             ALTER TABLE p DETACH PARTITION p2;
+             ALTER TABLE p2 DROP CONSTRAINT p2_pkey;
+             DROP INDEX p2_a_b_idx;
+             CREATE TABLE p4 PARTITION OF p FOR VALUES IN (4);
+             INSERT INTO p4 VALUES (4) ON CONFLICT (a) DO NOTHING;",
+        ),
+    ]);
+}

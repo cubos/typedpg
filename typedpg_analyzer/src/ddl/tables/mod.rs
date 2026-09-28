@@ -442,6 +442,15 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
     // dependency checks can consult them later. FK validation runs here.
     emit_constraints(interp, class_oid, &name, stmt)?;
     check_inherit::inherit_parent_checks(interp, class_oid)?;
+    if stmt.partbound.is_some()
+        && let Some(parent) = interp
+            .pg_inherits
+            .iter()
+            .find(|i| i.inhrelid == class_oid)
+            .map(|i| i.inhparent)
+    {
+        partidx::clone_parent_indexes(interp, parent, class_oid)?;
+    }
     for like in &likes {
         copy_like_constraints(interp, class_oid, &name, like)?;
     }
@@ -793,6 +802,7 @@ mod merge;
 mod object_refs;
 pub(crate) use object_refs::check_clusterable_index;
 pub(crate) mod partbound;
+pub(crate) mod partidx;
 pub(crate) mod typed;
 
 use columns::*;

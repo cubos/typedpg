@@ -409,6 +409,23 @@ fn drop_index(
         )));
     }
 
+    // A partition's copy of a partitioned index goes only with its parent
+    // (findDependentObjects); the parent takes its copies along.
+    if let Some(parent) = crate::ddl::tables::partidx::parent_index_of(interp, class_oid) {
+        let parent_name = interp
+            .pg_class
+            .get(&parent)
+            .map(|c| c.relname.clone())
+            .unwrap_or_default();
+        return Err(DdlError::DependencyError(format!(
+            "cannot drop index {name} because index {parent_name} requires it (You can drop \
+             index {parent_name} instead.)"
+        )));
+    }
+    for child in crate::ddl::tables::partidx::child_indexes(interp, class_oid) {
+        interp.remove_pg_index(child);
+        interp.remove_pg_class(child);
+    }
     interp.remove_pg_index(class_oid);
     // Drop the synthesized UNIQUE pg_constraint row that ON CONFLICT
     // matching consults — its `conname` mirrors the index name and

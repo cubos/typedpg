@@ -382,7 +382,9 @@ pub(super) fn attach_partition(
     if let Some(bound) = pc.bound.as_ref() {
         super::partbound::add_partition_bound(interp, parent, attach, bound)?;
     }
-    create_inheritance(interp, attach, parent, &attach_name, true)
+    create_inheritance(interp, attach, parent, &attach_name, true)?;
+    // AttachPartitionEnsureIndexes.
+    super::partidx::clone_parent_indexes(interp, parent, attach)
 }
 
 /// `ALTER TABLE parent DETACH PARTITION name` (ATExecDetachPartition).
@@ -400,6 +402,7 @@ pub(super) fn detach_partition(
     };
     let part = super::super::util::lookup_relation(interp, rv)?.1;
     remove_inheritance(interp, part, parent, "partition")?;
+    super::partidx::detach_partition_indexes(interp, part);
     interp.partition_bounds.remove(&part);
     Ok(())
 }

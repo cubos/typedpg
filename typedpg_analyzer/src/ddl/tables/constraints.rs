@@ -348,6 +348,7 @@ fn emit_constraint_with_backing_index(
             indexprs: Vec::new(),
             indpred: None,
         });
+        super::partidx::propagate_new_index(interp, relid, indexrelid)?;
     }
     Ok(oid)
 }
@@ -844,6 +845,18 @@ pub(crate) fn drop_constraint(
         )));
     };
 
+    // A partition's copy of a partitioned table's constraint goes only
+    // with the parent's (dropconstraint_internal).
+    if let Some(con) = interp.pg_constraint.get(&oid)
+        && con.coninhcount > 0
+        && !rec.recursing
+    {
+        return Err(DdlError::DependencyError(format!(
+            "cannot drop inherited constraint \"{conname}\" of relation \"{}\"",
+            relname_of(interp, relid)
+        )));
+    }
+
     // Refuse to drop a UNIQUE/PK constraint that an FK depends on.
     let is_pkey_or_unique = interp
         .pg_constraint
@@ -900,6 +913,16 @@ pub(crate) fn drop_constraint(
                 Some(RelKind::Index)
             )
         {
+            // The partitions' copies and their constraints go too.
+            for child in super::partidx::child_indexes(interp, idx_oid) {
+                let child_name = interp.pg_class.get(&child).map(|c| c.relname.clone());
+                let child_table = interp.pg_index.get(&child).map(|i| i.indrelid);
+                interp.pg_constraint.retain(|_, c| {
+                    Some(c.conrelid) != child_table || Some(&c.conname) != child_name.as_ref()
+                });
+                interp.remove_pg_index(child);
+                interp.remove_pg_class(child);
+            }
             interp.remove_pg_index(idx_oid);
             interp.remove_pg_class(idx_oid);
             let obj = crate::oid::PgGenericOid::from_nonzero(idx_oid.into_nonzero());

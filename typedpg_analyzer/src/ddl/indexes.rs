@@ -268,6 +268,10 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
         indexprs,
         indpred,
     });
+    // DefineIndex on a partitioned table recurses (not under ONLY).
+    if rv.inh {
+        super::tables::partidx::propagate_new_index(db, indrelid, indexrelid)?;
+    }
 
     Ok(())
 }
