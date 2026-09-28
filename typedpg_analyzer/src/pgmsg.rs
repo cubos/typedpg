@@ -798,6 +798,17 @@ pub(crate) fn duplicate_column_name(name: &str) -> RawError {
     )
 }
 
+/// `subquery must return only one column` — SQLSTATE 42601: a scalar
+/// `(SELECT …)` or `ARRAY(SELECT …)` sublink whose subquery has more than
+/// one output column (PG's transformSubLink).
+pub(crate) fn subquery_must_return_one_column(span: Option<SourceSpan>) -> RawError {
+    RawError::new(
+        AnalyzeError::SyntaxError("subquery must return only one column".to_string()),
+        span,
+        None,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -520,3 +520,64 @@ fn name_repeated_inside_one_from_entry_is_ambiguous() {
     let s = db.analyze("SELECT * FROM (SELECT 1 a, 2 a) s").unwrap();
     assert_eq!(s.columns.len(), 2);
 }
+
+// ── ARRAY(SELECT …) over array / unknown columns, one-column rule ───────────
+
+#[test]
+fn array_sublink_over_array_and_unknown_columns() {
+    // PG (transformSubLink): ARRAY(SELECT arr) over an array column is the
+    // same array type (a multi-dimensional result), and an unknown-typed
+    // target is resolved to text first (resolveTargetListUnknowns).
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE t (arr int[] NOT NULL, tarr text[] NOT NULL);")
+        .unwrap();
+    let s = db
+        .analyze(
+            "SELECT ARRAY(SELECT arr FROM t) AS a, ARRAY(SELECT tarr FROM t) AS b, \
+             ARRAY(SELECT NULL) AS c, (SELECT NULL) AS d, (SELECT 'x') AS e",
+        )
+        .unwrap();
+    assert_cols(
+        &s,
+        vec![
+            c("a", array_of(int4())),
+            c("b", array_of(text())),
+            c("c", array_of(text())),
+            cn("d", text()),
+            cn("e", text()),
+        ],
+    );
+    // The unknown target of a subquery is text, so comparing it to an int
+    // fails exactly like PG: `operator does not exist: text = integer`.
+    let err = db.analyze("SELECT (SELECT NULL) = 1").unwrap_err();
+    assert!(matches!(err, AnalyzeError::UndefinedOperator(_)), "{err:?}");
+    assert!(
+        err.to_string()
+            .starts_with("operator does not exist: text = integer"),
+        "{err}"
+    );
+    let s = db.analyze("SELECT ARRAY(SELECT $p) AS a").unwrap();
+    assert_cols(&s, vec![c("a", array_of(text()))]);
+    assert_params(&s, vec![p(text())]);
+}
+
+#[test]
+fn scalar_and_array_sublinks_require_one_column() {
+    let db = setup();
+    for sql in [
+        "SELECT (SELECT 1, 2)",
+        "SELECT ARRAY(SELECT id, name FROM users) AS a",
+        "SELECT id FROM users WHERE id = (SELECT 1, 2)",
+    ] {
+        let err = db.analyze(sql).unwrap_err();
+        assert!(
+            matches!(err, AnalyzeError::SyntaxError(_)),
+            "{sql}: {err:?}"
+        );
+        assert!(
+            err.to_string()
+                .starts_with("subquery must return only one column"),
+            "{sql}: {err}"
+        );
+    }
+}

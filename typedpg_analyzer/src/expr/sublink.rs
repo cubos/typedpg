@@ -33,18 +33,15 @@ pub(crate) fn infer_sublink(
             if let Some(subselect) = &sub.subselect
                 && let Some(node::Node::SelectStmt(sel)) = subselect.node.as_ref()
             {
-                let (cols, _) =
-                    crate::resolve::analyze_correlated_select(sel, snapshot, params, scope)?;
-                if let Some(first) = cols.first() {
-                    let guaranteed_one_row = sel.group_clause.is_empty()
-                        && has_aggregate_target(&sel.target_list, snapshot);
-                    let nullable = if guaranteed_one_row {
-                        first.nullable
-                    } else {
-                        true
-                    };
-                    return Ok(ExprType::scalar(first.type_oid, nullable));
-                }
+                let first = single_sublink_column(sub, sel, ctx, params)?;
+                let guaranteed_one_row =
+                    sel.group_clause.is_empty() && has_aggregate_target(&sel.target_list, snapshot);
+                let nullable = if guaranteed_one_row {
+                    first.nullable
+                } else {
+                    true
+                };
+                return Ok(ExprType::scalar(first.type_oid, nullable));
             }
             Ok(ExprType::scalar(oid::UNKNOWN, true))
         }
@@ -139,20 +136,30 @@ pub(crate) fn infer_sublink(
         }
         protobuf::SubLinkType::ArraySublink => {
             // `ARRAY(SELECT expr FROM …)` — returns an array of the subquery's
-            // first output column. The array itself is always NOT NULL (an
+            // single output column. The array itself is always NOT NULL (an
             // empty result produces `{}`, not NULL), even though individual
-            // elements may be nullable.
-            let mut elem_oid = oid::UNKNOWN;
+            // elements may be nullable. PG (transformSubLink): when the
+            // element is itself an array the result is that same array type
+            // (a multi-dimensional array), otherwise its array type.
+            let mut array_oid = oid::UNKNOWN;
             if let Some(subselect) = &sub.subselect
                 && let Some(node::Node::SelectStmt(sel)) = subselect.node.as_ref()
             {
-                let (cols, _) =
-                    crate::resolve::analyze_correlated_select(sel, snapshot, params, scope)?;
-                if let Some(first) = cols.first() {
-                    elem_oid = first.type_oid;
-                }
+                let first = single_sublink_column(sub, sel, ctx, params)?;
+                let elem = first.type_oid;
+                let elem_is_array = snapshot
+                    .get_type(elem)
+                    .is_some_and(|t| t.typcategory == TypCategory::Array && t.typelem.is_some());
+                array_oid = if elem_is_array {
+                    elem
+                } else {
+                    snapshot.array_type_of(elem).ok_or_else(|| {
+                        crate::pgmsg::no_array_type_for(&crate::ddl::util::format_type_for_message(
+                            snapshot, elem,
+                        ))
+                    })?
+                };
             }
-            let array_oid = snapshot.array_type_of(elem_oid).unwrap_or(oid::UNKNOWN);
             Ok(ExprType::scalar(array_oid, false))
         }
         _ => Err(AnalyzeError::Unsupported(format!(
@@ -160,4 +167,44 @@ pub(crate) fn infer_sublink(
             sub_type
         ))),
     }
+}
+
+/// The single output column of an EXPR / ARRAY sublink's subquery, as PG's
+/// `transformSubLink` requires: no column is `subquery must return a column`,
+/// more than one is `subquery must return only one column` (both 42601).
+/// An unknown-typed target (`SELECT NULL`, `SELECT 'x'`, `SELECT $1`) has
+/// already been resolved to text by the subquery's own
+/// `resolveTargetListUnknowns`, so a bare untyped param is pinned to text.
+fn single_sublink_column(
+    sub: &protobuf::SubLink,
+    sel: &protobuf::SelectStmt,
+    ctx: Ctx<'_>,
+    params: &mut ParamCollector,
+) -> Result<crate::resolve::RawColumn, AnalyzeError> {
+    let (cols, _) =
+        crate::resolve::analyze_correlated_select(sel, ctx.snapshot, params, ctx.scope)?;
+    let span = crate::error::SourceSpan::from_location(sub.location);
+    let mut cols = cols.into_iter();
+    let Some(mut first) = cols.next() else {
+        return Err(crate::error::RawError::new(
+            AnalyzeError::SyntaxError("subquery must return a column".to_string()),
+            span,
+            None,
+        )
+        .finalize_implicit());
+    };
+    if cols.next().is_some() {
+        return Err(crate::pgmsg::subquery_must_return_one_column(span).finalize_implicit());
+    }
+    if first.type_oid == oid::UNKNOWN {
+        if let [target] = sel.target_list.as_slice()
+            && let Some(node::Node::ResTarget(rt)) = target.node.as_ref()
+            && let Some(node::Node::ParamRef(p)) = rt.val.as_deref().and_then(|v| v.node.as_ref())
+            && params.get(p.number) == oid::UNKNOWN
+        {
+            params.record(p.number, oid::TEXT);
+        }
+        first.type_oid = oid::TEXT;
+    }
+    Ok(first)
 }
