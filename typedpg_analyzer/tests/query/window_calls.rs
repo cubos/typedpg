@@ -219,3 +219,22 @@ fn aggregate_and_window_modifier_rules() {
         assert_err_kind!(db, sql, AnalyzeError::FeatureNotSupported(_), msg);
     }
 }
+
+// ── Frame clauses (#62) ──────────────────────────────────────────────────────
+
+#[test]
+fn frame_bound_errors_are_windowing_errors() {
+    let db = setup();
+    for (sql, msg) in [
+        (
+            "SELECT sum(x) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND 1 PRECEDING) FROM t",
+            "frame starting from current row cannot have preceding rows",
+        ),
+        (
+            "SELECT sum(x) OVER (ORDER BY id ROWS UNBOUNDED FOLLOWING) FROM t",
+            "frame start cannot be UNBOUNDED FOLLOWING",
+        ),
+    ] {
+        assert_err_kind!(db, sql, AnalyzeError::WindowingError(_), msg);
+    }
+}

@@ -226,7 +226,8 @@ pub(crate) fn analyze_static(
     sql: &str,
     param_nullability: &[Option<bool>],
 ) -> Result<(Vec<AnalyzedColumn>, Vec<ParamInfo>, bool), AnalyzeError> {
-    let parsed = pg_query::parse(sql).map_err(|e| AnalyzeError::Parse(parse_error_message(&e)))?;
+    let parsed =
+        pg_query::parse(sql).map_err(|e| crate::pgmsg::grammar_error(parse_error_message(&e)))?;
 
     let stmt = parsed
         .protobuf

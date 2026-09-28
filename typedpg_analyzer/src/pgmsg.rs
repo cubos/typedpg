@@ -290,6 +290,29 @@ pub(crate) fn recursive_query_column_type(
     )
 }
 
+/// A parse error from `pg_query`, which carries PG's message but not its
+/// SQLSTATE. Most grammar errors are `syntax_error` (42601), but gram.y
+/// raises a few with another code; those messages (from PG 18's gram.y,
+/// the query-level ones) get the variant carrying that code — the frame
+/// bound checks of `opt_frame_clause` are `windowing_error` (42P20).
+pub(crate) fn grammar_error(message: String) -> AnalyzeError {
+    const WINDOWING: &[&str] = &[
+        "frame start cannot be UNBOUNDED FOLLOWING",
+        "frame starting from following row cannot end with current row",
+        "frame end cannot be UNBOUNDED PRECEDING",
+        "frame starting from current row cannot have preceding rows",
+        "frame starting from following row cannot have preceding rows",
+    ];
+    const FEATURE_NOT_SUPPORTED: &[&str] = &["UNIQUE predicate is not yet implemented"];
+    if WINDOWING.iter().any(|m| message.starts_with(m)) {
+        AnalyzeError::WindowingError(message)
+    } else if FEATURE_NOT_SUPPORTED.iter().any(|m| message.starts_with(m)) {
+        AnalyzeError::FeatureNotSupported(message)
+    } else {
+        AnalyzeError::Parse(message)
+    }
+}
+
 /// `schema "s" does not exist` — SQLSTATE 3F000 (`invalid_schema_name`):
 /// a qualified function/operator name whose schema is missing.
 pub(crate) fn schema_does_not_exist(schema: &str, span: Option<SourceSpan>) -> RawError {

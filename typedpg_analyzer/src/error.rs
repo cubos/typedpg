@@ -926,6 +926,8 @@ fn replace_message(e: AnalyzeError, rendered: String) -> AnalyzeError {
         AnalyzeError::GroupingError(_) => AnalyzeError::GroupingError(rendered),
         AnalyzeError::WindowingError(_) => AnalyzeError::WindowingError(rendered),
         AnalyzeError::SyntaxError(_) => AnalyzeError::SyntaxError(rendered),
+        AnalyzeError::UndefinedSchema(_) => AnalyzeError::UndefinedSchema(rendered),
+        AnalyzeError::FeatureNotSupported(_) => AnalyzeError::FeatureNotSupported(rendered),
         AnalyzeError::TypeMismatch {
             actual, expected, ..
         } => AnalyzeError::TypeMismatch {
