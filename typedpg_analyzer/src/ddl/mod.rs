@@ -128,6 +128,7 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         node::Node::CompositeTypeStmt(s) => types::create_composite(db, s),
         node::Node::CreateRangeStmt(s) => types::create_range(db, s),
         node::Node::AlterEnumStmt(s) => types::alter_enum(db, s),
+        node::Node::AlterDomainStmt(s) => types::alter_domain(db, s),
 
         // ── Drop ────────────────────────────────────────────────────
         node::Node::DropStmt(s) => drop::drop_objects(db, s),
@@ -211,7 +212,6 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         | node::Node::DiscardStmt(_)
         | node::Node::ExplainStmt(_)
         | node::Node::AlterFunctionStmt(_)
-        | node::Node::AlterDomainStmt(_)
         | node::Node::NotifyStmt(_)
         | node::Node::ListenStmt(_)
         | node::Node::UnlistenStmt(_)

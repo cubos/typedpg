@@ -46,12 +46,16 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
     // `CREATE DOMAIN d AS T NOT NULL` lands in `stmt.constraints` as a
     // `Constraint { contype = CONSTR_NOTNULL }`. PG also forbids null defaults
     // on a NOT NULL domain, but the analyzer doesn't model defaults yet.
-    let typnotnull = stmt.constraints.iter().any(|n| {
-        matches!(
-            n.node.as_ref(),
-            Some(node::Node::Constraint(c)) if c.contype == ConstrType::ConstrNotnull as i32
-        )
-    });
+    let mut constraints: Vec<DomainConstraint> = Vec::new();
+    for n in &stmt.constraints {
+        let Some(node::Node::Constraint(c)) = n.node.as_ref() else {
+            continue;
+        };
+        add_domain_constraint(interp, &name, base_type_oid, c, &mut constraints)?;
+    }
+    let typnotnull = constraints
+        .iter()
+        .any(|c| c.kind == DomainConstraintKind::NotNull);
 
     // `CREATE DOMAIN d AS T COLLATE "x"` pins the domain's default
     // collation. PG validates the name and stores the resolved oid in
@@ -101,6 +105,221 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
     });
 
     register_array_type(interp, nsoid, &name, oid)?;
+    interp.domain_constraints.insert(oid, constraints);
+    Ok(())
+}
+
+/// A named domain constraint (`pg_constraint` row with `contypid` set).
+#[derive(Clone, Debug)]
+pub(crate) struct DomainConstraint {
+    pub(crate) name: String,
+    pub(crate) kind: DomainConstraintKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DomainConstraintKind {
+    NotNull,
+    Check,
+}
+
+/// Validate and record one domain constraint (`domainAddCheckConstraint` /
+/// `domainAddNotNullConstraint`, typecmds.c). Unnamed ones get PG's
+/// generated names: `<domain>_not_null`, `<domain>_check` (numbered on
+/// collision, `ChooseConstraintName`). Other constraint kinds (DEFAULT,
+/// NULL) carry no name.
+fn add_domain_constraint(
+    interp: &PgCatalog,
+    domain: &str,
+    base_type: PgTypeOid,
+    c: &pg_query::protobuf::Constraint,
+    existing: &mut Vec<DomainConstraint>,
+) -> Result<(), DdlError> {
+    let kind = match ConstrType::try_from(c.contype) {
+        Ok(ConstrType::ConstrNotnull) => DomainConstraintKind::NotNull,
+        Ok(ConstrType::ConstrCheck) => {
+            if let Some(expr) = c.raw_expr.as_deref() {
+                check_domain_check_expression(interp, base_type, expr)?;
+            }
+            DomainConstraintKind::Check
+        }
+        _ => return Ok(()),
+    };
+    // A second NOT NULL on a domain that has one is a no-op.
+    if kind == DomainConstraintKind::NotNull
+        && existing
+            .iter()
+            .any(|x| x.kind == DomainConstraintKind::NotNull)
+    {
+        return Ok(());
+    }
+    let name = if c.conname.is_empty() {
+        let label = match kind {
+            DomainConstraintKind::NotNull => "not_null",
+            DomainConstraintKind::Check => "check",
+        };
+        let mut pass = 0;
+        loop {
+            let label = if pass == 0 {
+                label.to_owned()
+            } else {
+                format!("{label}{pass}")
+            };
+            let candidate = super::util::make_object_name(domain, "", &label);
+            if !existing.iter().any(|x| x.name == candidate) {
+                break candidate;
+            }
+            pass += 1;
+        }
+    } else {
+        if existing.iter().any(|x| x.name == c.conname) {
+            return Err(DdlError::DuplicateObject(format!(
+                "constraint \"{}\" for domain \"{domain}\" already exists",
+                c.conname
+            )));
+        }
+        c.conname.clone()
+    };
+    existing.push(DomainConstraint { name, kind });
+    Ok(())
+}
+
+/// A domain CHECK expression sees `VALUE` as a value of the base type and
+/// must yield boolean (`domainAddCheckConstraint`).
+fn check_domain_check_expression(
+    interp: &PgCatalog,
+    base_type: PgTypeOid,
+    expr: &pg_query::protobuf::Node,
+) -> Result<(), DdlError> {
+    use crate::expr::{TypeGoal, infer_expr};
+    use crate::nullability::NullabilityContext;
+    use crate::param_collector::ParamCollector;
+    use crate::pg_catalog::oid;
+    use crate::scope::Scope;
+
+    let value = PgAttribute {
+        attrelid: crate::pg_catalog::PG_CLASS_RELID,
+        attname: "value".to_owned(),
+        atttypid: base_type,
+        attnum: 1,
+        attnotnull: false,
+        atthasdef: false,
+        attgenerated: None,
+        atttypmod: None,
+        attidentity: None,
+        attcollation: None,
+    };
+    let mut scope = Scope::default();
+    scope.add_dml_target(
+        interp,
+        "",
+        crate::qualified_name::QualifiedName::new("", ""),
+        std::slice::from_ref(&value),
+    );
+    let null_ctx = NullabilityContext::default();
+    let mut params = ParamCollector::default();
+    let result = infer_expr(
+        expr,
+        crate::expr::Ctx::new(&scope, &null_ctx, interp),
+        &mut params,
+        TypeGoal::NONE,
+    )
+    .map_err(|e| DdlError::UnsupportedDdl(format!("{e} (in domain CHECK constraint)")))?;
+    if result.type_oid != oid::BOOL && result.type_oid != oid::UNKNOWN {
+        return Err(DdlError::UnsupportedDdl(format!(
+            "argument of CHECK must be type boolean, not type {}",
+            super::util::format_type_for_message(interp, result.type_oid)
+        )));
+    }
+    Ok(())
+}
+
+// ─── ALTER DOMAIN ───────────────────────────────────────────────────────────
+
+/// `ALTER DOMAIN d { SET | DROP } NOT NULL | ADD constraint | DROP
+/// CONSTRAINT name | { SET | DROP } DEFAULT | VALIDATE CONSTRAINT name`
+/// (`AlterDomainNotNull` / `AlterDomainAddConstraint` /
+/// `AlterDomainDropConstraint`, typecmds.c). NOT NULL changes flip
+/// `pg_type.typnotnull`, which every column of the domain reads.
+pub fn alter_domain(
+    interp: &mut PgCatalog,
+    stmt: &pg_query::protobuf::AlterDomainStmt,
+) -> Result<(), DdlError> {
+    let parts: Vec<&str> = stmt.type_name.iter().filter_map(node_string).collect();
+    let (schema, name) = match parts.as_slice() {
+        [schema, name] => (Some(*schema), *name),
+        [name] => (None, *name),
+        _ => return Ok(()),
+    };
+    let Some(type_oid) = interp.resolve_type_by_name(schema, name).map(|t| t.oid) else {
+        return Err(DdlError::TypeNotFound(format!(
+            "type \"{}\" does not exist",
+            parts.join(".")
+        )));
+    };
+    if interp.pg_type.get(&type_oid).map(|t| t.typtype) != Some(TypType::Domain) {
+        return Err(DdlError::Parse(format!(
+            "{} is not a domain",
+            super::util::format_type_for_message(interp, type_oid)
+        )));
+    }
+    let base_type = interp
+        .pg_type
+        .get(&type_oid)
+        .and_then(|t| t.typbasetype)
+        .unwrap_or(type_oid);
+    let mut constraints = interp
+        .domain_constraints
+        .get(&type_oid)
+        .cloned()
+        .unwrap_or_default();
+
+    match stmt.subtype.as_str() {
+        // SET NOT NULL / DROP NOT NULL
+        "O" => {
+            let nn = pg_query::protobuf::Constraint {
+                contype: ConstrType::ConstrNotnull as i32,
+                ..Default::default()
+            };
+            add_domain_constraint(interp, name, base_type, &nn, &mut constraints)?;
+        }
+        "N" => constraints.retain(|c| c.kind != DomainConstraintKind::NotNull),
+        // ADD constraint
+        "C" => {
+            if let Some(node::Node::Constraint(c)) =
+                stmt.def.as_deref().and_then(|d| d.node.as_ref())
+            {
+                add_domain_constraint(interp, name, base_type, c, &mut constraints)?;
+            }
+        }
+        // DROP CONSTRAINT / VALIDATE CONSTRAINT name
+        "X" | "V" => {
+            let before = constraints.len();
+            if stmt.subtype == "X" {
+                constraints.retain(|c| c.name != stmt.name);
+            }
+            let found = if stmt.subtype == "X" {
+                constraints.len() != before
+            } else {
+                constraints.iter().any(|c| c.name == stmt.name)
+            };
+            if !found && !stmt.missing_ok {
+                return Err(DdlError::TypeNotFound(format!(
+                    "constraint \"{}\" of domain \"{name}\" does not exist",
+                    stmt.name
+                )));
+            }
+        }
+        // SET / DROP DEFAULT: no effect on typing.
+        _ => {}
+    }
+
+    let typnotnull = constraints
+        .iter()
+        .any(|c| c.kind == DomainConstraintKind::NotNull);
+    if let Some(t) = interp.pg_type.get_mut(&type_oid) {
+        t.typnotnull = typnotnull;
+    }
+    interp.domain_constraints.insert(type_oid, constraints);
     Ok(())
 }
 

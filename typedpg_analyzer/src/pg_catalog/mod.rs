@@ -197,6 +197,11 @@ pub struct PgCatalog {
     /// PG keeps the GUC as a list of names and resolves it lazily, so a path
     /// may name a schema that is only created later.
     pub(crate) search_path_guc: crate::ddl::session::SearchPathGuc,
+    /// Named constraints of user domains (PG keeps them in `pg_constraint`
+    /// with `contypid` set): what `ALTER DOMAIN ... DROP CONSTRAINT name`
+    /// resolves against. The domain's effective NOT NULL lives in
+    /// `pg_type.typnotnull`.
+    pub(crate) domain_constraints: HashMap<PgTypeOid, Vec<crate::ddl::types::DomainConstraint>>,
     next_oid: std::num::NonZeroU32,
 
     /// Lazy-initialized PG sanity mirror used by the `pg_sanity` feature to
@@ -427,6 +432,7 @@ impl PgCatalog {
             collation_by_qname: HashMap::new(),
             search_path: Vec::new(),
             search_path_guc: Default::default(),
+            domain_constraints: HashMap::new(),
             next_oid: USER_OID_START_NZ,
             #[cfg(feature = "pg_sanity")]
             pg_sanity: None,
@@ -978,6 +984,7 @@ impl PgCatalog {
         // pg_depend rows that named this type.
         self.pg_enum.remove(&oid);
         self.pg_range.remove(&oid);
+        self.domain_constraints.remove(&oid);
         Some(row)
     }
 

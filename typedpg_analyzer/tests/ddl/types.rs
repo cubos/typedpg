@@ -292,3 +292,114 @@ fn create_domain_with_unknown_base_type_is_rejected() {
         "type \"nosuchtype\" does not exist",
     );
 }
+
+// ── ALTER DOMAIN ────────────────────────────────────────────────────────────
+
+#[test]
+fn alter_domain_drop_not_null_makes_columns_nullable() {
+    // PG 18: after DROP NOT NULL the domain's typnotnull is false.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE DOMAIN d AS int NOT NULL;
+         CREATE TABLE t (a d);
+         ALTER DOMAIN d DROP NOT NULL;",
+    )]);
+    assert_cols(
+        &db.analyze("SELECT * FROM t").unwrap(),
+        vec![cn("a", domain("public", "d", int4()))],
+    );
+}
+
+#[test]
+fn alter_domain_set_not_null_and_named_constraints() {
+    // PG 18: SET NOT NULL / ADD CONSTRAINT nn NOT NULL set typnotnull;
+    // DROP CONSTRAINT d_not_null (the generated name) clears it.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE DOMAIN d AS int;
+         CREATE TABLE t (a d);
+         ALTER DOMAIN d SET NOT NULL;",
+    )]);
+    assert_cols(
+        &db.analyze("SELECT * FROM t").unwrap(),
+        vec![c("a", domain("public", "d", int4()))],
+    );
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE DOMAIN d AS int NOT NULL;
+         CREATE TABLE t (a d);
+         ALTER DOMAIN d DROP CONSTRAINT d_not_null;
+         CREATE DOMAIN d2 AS int CONSTRAINT myname NOT NULL;
+         CREATE TABLE t2 (a d2);
+         ALTER DOMAIN d2 DROP CONSTRAINT myname;
+         CREATE DOMAIN d3 AS int;
+         CREATE TABLE t3 (a d3);
+         ALTER DOMAIN d3 ADD CONSTRAINT nn NOT NULL;
+         ALTER DOMAIN d3 ADD CONSTRAINT c CHECK (VALUE > 0);
+         ALTER DOMAIN d3 DROP CONSTRAINT c;
+         ALTER DOMAIN d3 DROP CONSTRAINT IF EXISTS zz;
+         ALTER DOMAIN d3 SET DEFAULT 1;
+         ALTER DOMAIN d3 DROP DEFAULT;",
+    )]);
+    assert_cols(
+        &db.analyze("SELECT a FROM t").unwrap(),
+        vec![cn("a", domain("public", "d", int4()))],
+    );
+    assert_cols(
+        &db.analyze("SELECT a FROM t2").unwrap(),
+        vec![cn("a", domain("public", "d2", int4()))],
+    );
+    assert_cols(
+        &db.analyze("SELECT a FROM t3").unwrap(),
+        vec![c("a", domain("public", "d3", int4()))],
+    );
+}
+
+#[test]
+fn alter_domain_errors() {
+    // PG 18: 42704 type "nosuch" does not exist; 42809 t is not a domain;
+    // 42704 constraint "zz" of domain "d" does not exist.
+    assert_ddl_err!(
+        try_apply(&[("0001.sql", "ALTER DOMAIN nosuch SET NOT NULL;")]),
+        DdlError::TypeNotFound(_),
+        "type \"nosuch\" does not exist",
+    );
+    assert_ddl_err!(
+        try_apply(&[(
+            "0001.sql",
+            "CREATE TABLE t (a int); ALTER DOMAIN t SET NOT NULL;",
+        )]),
+        DdlError::Parse(_),
+        "t is not a domain",
+    );
+    assert_ddl_err!(
+        try_apply(&[(
+            "0001.sql",
+            "CREATE DOMAIN d AS int; ALTER DOMAIN d DROP CONSTRAINT zz;",
+        )]),
+        DdlError::TypeNotFound(_),
+        "constraint \"zz\" of domain \"d\" does not exist",
+    );
+    assert_ddl_err!(
+        try_apply(&[(
+            "0001.sql",
+            "CREATE DOMAIN d AS int; ALTER DOMAIN d ADD CONSTRAINT c2 CHECK (VALUE + 1);",
+        )]),
+        DdlError::UnsupportedDdl(_),
+        "argument of CHECK must be type boolean, not type integer",
+    );
+}
+
+#[test]
+fn create_domain_check_must_be_boolean() {
+    // PG 18: 42804 argument of CHECK must be type boolean, not type integer.
+    assert_ddl_err!(
+        try_apply(&[("0001.sql", "CREATE DOMAIN d AS int CHECK (VALUE + 1);")]),
+        DdlError::UnsupportedDdl(_),
+        "argument of CHECK must be type boolean, not type integer",
+    );
+    build_db(&[(
+        "0001.sql",
+        "CREATE DOMAIN pos AS int CHECK (VALUE > 0) CHECK (VALUE < 100);",
+    )]);
+}
