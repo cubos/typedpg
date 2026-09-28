@@ -63,6 +63,7 @@ pub(crate) fn infer_func_call(
     )? {
         functions::FuncDetail::Routine(r) => r,
         functions::FuncDetail::Coercion(target) => {
+            check_call_shape(func, None, &args, &notation, ctx)?;
             // Same literal-content validation an explicit cast performs.
             if let Some(node::Node::AConst(ac)) = func.args[0].node.as_ref()
                 && !ac.isnull
@@ -77,49 +78,12 @@ pub(crate) fn infer_func_call(
         }
     };
 
-    // PG supports named notation for an aggregate only when it's called as
-    // a window function.
-    if resolved.is_aggregate && func.over.is_none() && !notation.names.is_empty() {
-        return Err(crate::error::RawError::new(
-            AnalyzeError::Invalid("aggregates cannot use named arguments".into()),
-            crate::error::SourceSpan::from_node_qname(func.location),
-            None,
-        )
-        .finalize_implicit());
-    }
+    check_call_shape(func, Some(&resolved), &args, &notation, ctx)?;
 
     if func.over.is_some() {
         check_no_nested_windows(func, snapshot)?;
     } else if resolved.is_aggregate {
         check_no_nested_aggregates(func, snapshot)?;
-    }
-
-    // PG's OVER-clause placement rules (parse_func.c): a true window
-    // function (`prokind = 'w'`) is only callable with an OVER clause, and
-    // OVER itself is only attachable to window functions and aggregates.
-    // Messages verbatim; PG renders the name as written (qualified iff the
-    // call was qualified).
-    let written_name = func_name_parts.join(".");
-    if resolved.is_window && func.over.is_none() {
-        // PG classifies both placement failures as wrong_object_type (42809).
-        return Err(crate::error::RawError::new(
-            AnalyzeError::WrongObjectType(format!(
-                "window function {written_name} requires an OVER clause"
-            )),
-            crate::error::SourceSpan::from_node_qname(func.location),
-            Some("add `OVER ()` (or a window definition) after the call".into()),
-        )
-        .finalize_implicit());
-    }
-    if func.over.is_some() && !resolved.is_window && !resolved.is_aggregate {
-        return Err(crate::error::RawError::new(
-            AnalyzeError::WrongObjectType(format!(
-                "OVER specified, but {written_name} is not a window function nor an aggregate function"
-            )),
-            crate::error::SourceSpan::from_node_qname(func.location),
-            None,
-        )
-        .finalize_implicit());
     }
 
     // The pseudo-type `"any"` (plain and VARIADIC, e.g. `concat`,
@@ -135,12 +99,28 @@ pub(crate) fn infer_func_call(
             None => resolved.arg_types.last() == Some(&ANY_PSEUDO),
         }
     };
+    // (A hypothetical-set aggregate's `"any"` arguments are the exception:
+    // `unify_hypothetical_args` types them below.)
+    let hypothetical = matches!(
+        resolved.aggregate,
+        Some((crate::pg_catalog::AggKind::Hypothetical, _))
+    );
     for (i, arg) in func.args.iter().enumerate() {
         if declared_any(i)
+            && !hypothetical
             && let Some(node::Node::ParamRef(p)) = functions::call_arg_value(arg).node.as_ref()
         {
             params.mark_indeterminate_locked(p.number);
         }
+    }
+
+    // A hypothetical-set aggregate (`rank(3) WITHIN GROUP (ORDER BY x)`)
+    // types each hypothetical direct argument like its ordering column.
+    if matches!(
+        resolved.aggregate,
+        Some((crate::pg_catalog::AggKind::Hypothetical, _))
+    ) {
+        unify_hypothetical_args(func, &args, ctx, params)?;
     }
 
     // Pass 2: back-fill UNKNOWN args from the resolved signature.
@@ -181,22 +161,252 @@ pub(crate) fn infer_func_call(
     })
 }
 
-/// `WITHIN GROUP (ORDER BY …)` marks an ordered-set aggregate. PG forbids
-/// combining it with `OVER` or `DISTINCT`; reject those up front so the error
-/// points at the actual conflict instead of a misleading overload-resolution
-/// failure.
-fn validate_within_group(func: &protobuf::FuncCall) -> Result<(), AnalyzeError> {
-    if func.agg_within_group {
+/// PG's checks in `ParseFuncOrColumn` / `transformAggregateCall` that the
+/// call's modifiers (`(*)`, DISTINCT, ORDER BY, WITHIN GROUP, FILTER, OVER,
+/// named arguments) suit the kind of routine it resolved to. `resolved` is
+/// `None` for a function-style cast. Names render as written (PG's
+/// `NameListToString`).
+fn check_call_shape(
+    func: &protobuf::FuncCall,
+    resolved: Option<&functions::ResolvedFunction>,
+    args: &FuncArgs,
+    notation: &functions::CallNotation,
+    ctx: Ctx<'_>,
+) -> Result<(), AnalyzeError> {
+    use crate::pg_catalog::AggKind;
+    use crate::pgmsg;
+    let w = extract_string_fields(&func.funcname).join(".");
+    let span = crate::error::SourceSpan::from_node_qname(func.location);
+    let fail = |e: crate::error::RawError| Err(e.finalize_implicit());
+    let is_aggregate = resolved.is_some_and(|r| r.is_aggregate);
+    let is_window = resolved.is_some_and(|r| r.is_window);
+
+    if let Some(filter) = &func.agg_filter {
+        let kinds = detect_func_kinds(filter, ctx.snapshot);
+        if kinds.has_aggregate {
+            return fail(pgmsg::aggregate_in_filter(span));
+        }
+        if kinds.has_window {
+            return fail(pgmsg::window_in_filter(span));
+        }
+    }
+
+    if !is_aggregate && !is_window {
+        let modifier = if func.agg_star {
+            Some(format!("{w}(*)"))
+        } else if func.agg_distinct {
+            Some("DISTINCT".into())
+        } else if func.agg_within_group {
+            Some("WITHIN GROUP".into())
+        } else if !func.agg_order.is_empty() {
+            Some("ORDER BY".into())
+        } else if func.agg_filter.is_some() {
+            Some("FILTER".into())
+        } else {
+            None
+        };
+        if let Some(m) = modifier {
+            return fail(pgmsg::not_an_aggregate(&m, &w, span));
+        }
         if func.over.is_some() {
-            return Err(AnalyzeError::Invalid(
-                "WITHIN GROUP cannot be used with OVER".into(),
+            // PG classifies both placement failures as wrong_object_type.
+            return fail(crate::error::RawError::new(
+                AnalyzeError::WrongObjectType(format!(
+                    "OVER specified, but {w} is not a window function nor an aggregate function"
+                )),
+                span,
+                None,
             ));
         }
-        if func.agg_distinct {
-            return Err(AnalyzeError::Invalid(
-                "DISTINCT is not implemented for ordered-set aggregates".into(),
+        return Ok(());
+    }
+    let Some(resolved) = resolved else {
+        return Ok(());
+    };
+
+    if is_window {
+        if func.over.is_none() {
+            return fail(crate::error::RawError::new(
+                AnalyzeError::WrongObjectType(format!(
+                    "window function {w} requires an OVER clause"
+                )),
+                span,
+                Some("add `OVER ()` (or a window definition) after the call".into()),
             ));
         }
+        if func.agg_within_group {
+            return fail(pgmsg::window_function_within_group(&w, span));
+        }
+    } else if let Some((kind, direct)) = resolved.aggregate {
+        if matches!(kind, AggKind::OrderedSet | AggKind::Hypothetical) {
+            if !func.agg_within_group {
+                return fail(pgmsg::within_group_required(&w, span));
+            }
+            if func.over.is_some() {
+                return fail(pgmsg::call_shape_not_implemented(
+                    &format!("OVER is not supported for ordered-set aggregate {w}"),
+                    span,
+                ));
+            }
+            // func_get_detail matched the undifferentiated argument list;
+            // the split into direct and aggregated arguments must fit too.
+            let nargs = args.types.len();
+            let aggregated = func.agg_order.len();
+            let num_direct = nargs - aggregated;
+            let direct = direct as usize;
+            let fits = if resolved.provariadic.is_none() {
+                num_direct == direct
+            } else {
+                let pronargs = nargs - resolved.nvargs.saturating_sub(1);
+                if direct < pronargs {
+                    num_direct == direct
+                } else if kind == AggKind::Hypothetical {
+                    resolved.nvargs == 2 * aggregated
+                } else {
+                    resolved.nvargs > aggregated
+                }
+            };
+            if !fits {
+                let sig = args
+                    .types
+                    .iter()
+                    .map(|&t| crate::ddl::util::format_type_for_message(ctx.snapshot, t))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(functions::undefined_function_error(
+                    ctx.snapshot,
+                    None,
+                    &w,
+                    format!("function {w}({sig}) does not exist"),
+                    span,
+                ));
+            }
+        } else if func.agg_within_group {
+            return fail(pgmsg::not_an_ordered_set_aggregate(&w, span));
+        }
+    }
+
+    if func.over.is_none() {
+        if func.args.is_empty() && !func.agg_star && !func.agg_within_group {
+            return fail(pgmsg::parameterless_aggregate_needs_star(&w, span));
+        }
+        if !notation.names.is_empty() {
+            return fail(pgmsg::call_shape_not_implemented(
+                "aggregates cannot use named arguments",
+                span,
+            ));
+        }
+        // transformAggregateCall: with DISTINCT, every ORDER BY expression
+        // must be one of the arguments.
+        if func.agg_distinct && !func.agg_within_group {
+            for item in &func.agg_order {
+                if let Some(node::Node::SortBy(sb)) = item.node.as_ref()
+                    && let Some(inner) = sb.node.as_deref()
+                    && !func.args.iter().any(|a| same_expression(a, inner, ctx))
+                {
+                    return fail(pgmsg::distinct_aggregate_order_by_not_in_args(
+                        crate::error::node_location(inner)
+                            .and_then(crate::error::SourceSpan::from_node_qname),
+                    ));
+                }
+            }
+        }
+    } else {
+        let message = if func.agg_distinct {
+            Some("DISTINCT is not implemented for window functions")
+        } else if is_aggregate && !func.agg_order.is_empty() {
+            Some("aggregate ORDER BY is not implemented for window functions")
+        } else if !is_aggregate && func.agg_filter.is_some() {
+            Some("FILTER is not implemented for non-aggregate window functions")
+        } else {
+            None
+        };
+        if let Some(m) = message {
+            return fail(pgmsg::call_shape_not_implemented(m, span));
+        }
+        if is_aggregate && func.args.is_empty() && !func.agg_star {
+            return fail(pgmsg::parameterless_aggregate_needs_star(&w, span));
+        }
+    }
+    Ok(())
+}
+
+/// Whether two argument/sort expressions are the same (PG compares the
+/// transformed trees with `equal()`): structurally equal ignoring source
+/// locations, or column references resolving to the same column.
+fn same_expression(a: &protobuf::Node, b: &protobuf::Node, ctx: Ctx<'_>) -> bool {
+    if let (Some(node::Node::ColumnRef(ca)), Some(node::Node::ColumnRef(cb))) =
+        (a.node.as_ref(), b.node.as_ref())
+    {
+        let resolve = |cr: &protobuf::ColumnRef| {
+            let parts = extract_string_fields(&cr.fields);
+            let (table, col) = match parts.as_slice() {
+                [c] => (None, c.as_str()),
+                [t, c] => (Some(t.as_str()), c.as_str()),
+                _ => return None,
+            };
+            ctx.scope
+                .resolve_column(table, col, None)
+                .ok()
+                .map(|c| (c.table_alias.clone(), c.name.clone()))
+        };
+        if let (Some(x), Some(y)) = (resolve(ca), resolve(cb)) {
+            return x == y;
+        }
+    }
+    crate::resolve::node_fingerprint(a) == crate::resolve::node_fingerprint(b)
+}
+
+/// PG's `unify_hypothetical_args` (parse_func.c): each hypothetical direct
+/// argument of a hypothetical-set aggregate and its ordering column are
+/// coerced to their common type — `rank($1) WITHIN GROUP (ORDER BY
+/// int_col)` types `$1` as integer, `rank('a') …` validates `'a'` as one.
+fn unify_hypothetical_args(
+    func: &protobuf::FuncCall,
+    args: &FuncArgs,
+    ctx: Ctx<'_>,
+    params: &mut ParamCollector,
+) -> Result<(), AnalyzeError> {
+    let aggregated = func.agg_order.len();
+    let num_direct = args.direct_count;
+    let Some(first_hypothetical) = num_direct.checked_sub(aggregated) else {
+        return Ok(());
+    };
+    for (k, harg) in func.args[first_hypothetical..num_direct].iter().enumerate() {
+        let (ht, at) = (
+            args.types[first_hypothetical + k],
+            args.types[num_direct + k],
+        );
+        // The aggregated argument's type is preferred: coerce the direct
+        // argument once rather than every aggregated value.
+        let Some(common) = crate::coerce::find_common_type(&[at, ht], ctx.snapshot) else {
+            let name = |t| crate::ddl::util::format_type_for_message(ctx.snapshot, t);
+            return Err(crate::pgmsg::types_cannot_be_matched(
+                "WITHIN GROUP",
+                &name(at),
+                &name(ht),
+                "",
+                None,
+            )
+            .finalize_implicit());
+        };
+        if ht == oid::UNKNOWN {
+            coerce_unknown_to(harg, ctx, params, common)?;
+        }
+    }
+    Ok(())
+}
+
+/// `WITHIN GROUP (ORDER BY …)` marks an ordered-set aggregate. PG's grammar
+/// forbids combining it with `DISTINCT`; reject that up front so the error
+/// points at the actual conflict instead of a misleading overload-resolution
+/// failure. (`OVER` is rejected after resolution, by [`check_call_shape`],
+/// with the wording that depends on what the call resolved to.)
+fn validate_within_group(func: &protobuf::FuncCall) -> Result<(), AnalyzeError> {
+    if func.agg_within_group && func.agg_distinct {
+        return Err(AnalyzeError::Invalid(
+            "DISTINCT is not implemented for ordered-set aggregates".into(),
+        ));
     }
     Ok(())
 }

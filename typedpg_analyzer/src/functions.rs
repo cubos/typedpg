@@ -89,6 +89,13 @@ pub(crate) struct ResolvedFunction {
     /// `proname(typname,…)` of the matched overload's declared
     /// `proargtypes` — the key of the builtin nullability tables.
     pub signature: String,
+    /// `pg_aggregate.aggkind` / `aggnumdirectargs` of an aggregate.
+    pub aggregate: Option<(crate::pg_catalog::AggKind, i16)>,
+    /// How many call arguments a variadic parameter absorbed (PG's
+    /// `nvargs`; 0 when not expanded).
+    pub nvargs: usize,
+    /// `pg_proc.provariadic` of the matched routine (PG's `vatype`).
+    pub provariadic: Option<PgTypeOid>,
 }
 
 /// What a call resolved to — PG's `FuncDetailCode` for the successful
@@ -295,6 +302,12 @@ pub(crate) fn func_get_detail(
         })
         .collect();
     Ok(FuncDetail::Routine(ResolvedFunction {
+        aggregate: snapshot
+            .pg_aggregate
+            .get(&f.oid)
+            .map(|a| (a.aggkind, a.aggnumdirectargs)),
+        nvargs: cand.nvargs,
+        provariadic: f.provariadic,
         return_type_oid,
         arg_types: declared,
         schema: snapshot

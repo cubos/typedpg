@@ -16,11 +16,11 @@ use testcontainers::core::Mount;
 use testcontainers::runners::SyncRunner;
 use testcontainers_modules::postgres::Postgres;
 use typedpg_analyzer::{
-    ArgMode, AttGenerated, AttIdentity, CastContext, CastMethod, ConType, DepType, PgAggregate,
-    PgAttribute, PgCast, PgCastOid, PgCatalog, PgCatalogSeed, PgClass, PgClassOid, PgCollation,
-    PgCollationOid, PgConstraint, PgConstraintOid, PgDepend, PgEnum, PgEnumOid, PgExtension,
-    PgExtensionOid, PgGenericOid, PgIndex, PgInherits, PgNamespace, PgNamespaceOid, PgOperator,
-    PgOperatorOid, PgProc, PgProcOid, PgRange, PgType, PgTypeOid, ProKind, ProVolatile,
+    AggKind, ArgMode, AttGenerated, AttIdentity, CastContext, CastMethod, ConType, DepType,
+    PgAggregate, PgAttribute, PgCast, PgCastOid, PgCatalog, PgCatalogSeed, PgClass, PgClassOid,
+    PgCollation, PgCollationOid, PgConstraint, PgConstraintOid, PgDepend, PgEnum, PgEnumOid,
+    PgExtension, PgExtensionOid, PgGenericOid, PgIndex, PgInherits, PgNamespace, PgNamespaceOid,
+    PgOperator, PgOperatorOid, PgProc, PgProcOid, PgRange, PgType, PgTypeOid, ProKind, ProVolatile,
     QualifiedName, RelKind, TypCategory, TypType,
 };
 
@@ -419,7 +419,9 @@ fn export_aggregates(client: &mut postgres::Client) -> Result<Vec<PgAggregate>, 
     // and we shouldn't desync from it.
     let rows = client.query(
         "SELECT aggfnoid::int4 AS aggfnoid, \
-                aggfinalfn::int4 AS aggfinalfn \
+                aggfinalfn::int4 AS aggfinalfn, \
+                aggkind::text AS aggkind, \
+                aggnumdirectargs \
          FROM pg_catalog.pg_aggregate \
          ORDER BY aggfnoid",
         &[],
@@ -429,9 +431,16 @@ fn export_aggregates(client: &mut postgres::Client) -> Result<Vec<PgAggregate>, 
         .map(|r| {
             let aggfnoid: i32 = r.get(0);
             let aggfinalfn: i32 = r.get(1);
+            let aggkind: String = r.get(2);
             PgAggregate {
                 aggfnoid: PgProcOid::new(aggfnoid as u32).expect("aggfnoid is non-zero"),
                 aggfinalfn: PgProcOid::new(aggfinalfn as u32),
+                aggkind: match aggkind.as_str() {
+                    "o" => AggKind::OrderedSet,
+                    "h" => AggKind::Hypothetical,
+                    _ => AggKind::Normal,
+                },
+                aggnumdirectargs: r.get(3),
             }
         })
         .collect())

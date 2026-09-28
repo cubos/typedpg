@@ -56,6 +56,14 @@ pub enum AnalyzeError {
     #[error("{0}")]
     UndefinedSchema(String),
 
+    /// A construct PostgreSQL parses but deliberately doesn't implement
+    /// (`DISTINCT is not implemented for window functions`, named
+    /// arguments to an aggregate). Equivalent to PG `feature_not_supported`
+    /// (SQLSTATE 0A000) — unlike [`Self::Unsupported`], which is the
+    /// *analyzer* lacking support.
+    #[error("{0}")]
+    FeatureNotSupported(String),
+
     /// An object of the wrong kind was used: a procedure called in an
     /// expression, `OVER` on a plain function, a window function without
     /// `OVER`. Equivalent to PG `wrong_object_type` (SQLSTATE 42809).
@@ -224,6 +232,7 @@ impl AnalyzeError {
             AmbiguousColumn(_) => Some("42702"),
             UndefinedType(_) | UndefinedObject(_) => Some("42704"),
             UndefinedSchema(_) => Some("3F000"),
+            FeatureNotSupported(_) => Some("0A000"),
             UndefinedFunction(_) | UndefinedOperator(_) => Some("42883"),
             AmbiguousFunction(_) => Some("42725"),
             WrongObjectType(_) => Some("42809"),

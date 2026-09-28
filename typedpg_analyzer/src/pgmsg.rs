@@ -310,6 +310,121 @@ pub(crate) fn variadic_argument_must_be_array(span: Option<SourceSpan>) -> RawEr
     )
 }
 
+// ── Call modifiers on the wrong kind of routine (ParseFuncOrColumn) ──────
+
+/// `DISTINCT specified, but lower is not an aggregate function` (also
+/// `lower(*) specified`, `WITHIN GROUP`, `ORDER BY`, `FILTER`) — SQLSTATE
+/// 42809.
+pub(crate) fn not_an_aggregate(modifier: &str, name: &str, span: Option<SourceSpan>) -> RawError {
+    RawError::new(
+        AnalyzeError::WrongObjectType(format!(
+            "{modifier} specified, but {name} is not an aggregate function"
+        )),
+        span,
+        None,
+    )
+}
+
+/// `WITHIN GROUP is required for ordered-set aggregate mode` — 42809.
+pub(crate) fn within_group_required(name: &str, span: Option<SourceSpan>) -> RawError {
+    RawError::new(
+        AnalyzeError::WrongObjectType(format!(
+            "WITHIN GROUP is required for ordered-set aggregate {name}"
+        )),
+        span,
+        None,
+    )
+}
+
+/// `count is not an ordered-set aggregate, so it cannot have WITHIN GROUP`
+/// — 42809.
+pub(crate) fn not_an_ordered_set_aggregate(name: &str, span: Option<SourceSpan>) -> RawError {
+    RawError::new(
+        AnalyzeError::WrongObjectType(format!(
+            "{name} is not an ordered-set aggregate, so it cannot have WITHIN GROUP"
+        )),
+        span,
+        None,
+    )
+}
+
+/// `window function rank cannot have WITHIN GROUP` — 42809.
+pub(crate) fn window_function_within_group(name: &str, span: Option<SourceSpan>) -> RawError {
+    RawError::new(
+        AnalyzeError::WrongObjectType(format!("window function {name} cannot have WITHIN GROUP")),
+        span,
+        None,
+    )
+}
+
+/// `count(*) must be used to call a parameterless aggregate function` —
+/// 42809.
+pub(crate) fn parameterless_aggregate_needs_star(name: &str, span: Option<SourceSpan>) -> RawError {
+    RawError::new(
+        AnalyzeError::WrongObjectType(format!(
+            "{name}(*) must be used to call a parameterless aggregate function"
+        )),
+        span,
+        None,
+    )
+}
+
+/// A PG `feature_not_supported` (0A000) message for aggregate / window
+/// call shapes the parser accepts but PG doesn't implement — the wording is
+/// one of [`NOT_IMPLEMENTED_CALL_SHAPES`].
+pub(crate) fn call_shape_not_implemented(message: &str, span: Option<SourceSpan>) -> RawError {
+    debug_assert!(
+        NOT_IMPLEMENTED_CALL_SHAPES
+            .iter()
+            .any(|m| message.starts_with(m))
+    );
+    RawError::new(
+        AnalyzeError::FeatureNotSupported(message.into()),
+        span,
+        None,
+    )
+}
+
+/// PG's 0A000 wordings for aggregate / window call shapes.
+pub(crate) const NOT_IMPLEMENTED_CALL_SHAPES: &[&str] = &[
+    "DISTINCT is not implemented for window functions",
+    "aggregate ORDER BY is not implemented for window functions",
+    "FILTER is not implemented for non-aggregate window functions",
+    "aggregates cannot use named arguments",
+    "OVER is not supported for ordered-set aggregate ",
+];
+
+/// `in an aggregate with DISTINCT, ORDER BY expressions must appear in
+/// argument list` — SQLSTATE 42P10.
+pub(crate) fn distinct_aggregate_order_by_not_in_args(span: Option<SourceSpan>) -> RawError {
+    RawError::new(
+        AnalyzeError::InvalidColumnReference(
+            "in an aggregate with DISTINCT, ORDER BY expressions must appear in argument list"
+                .into(),
+        ),
+        span,
+        None,
+    )
+}
+
+/// `aggregate functions are not allowed in FILTER` — SQLSTATE 42803.
+pub(crate) fn aggregate_in_filter(span: Option<SourceSpan>) -> RawError {
+    RawError::new(
+        AnalyzeError::GroupingError("aggregate functions are not allowed in FILTER".into()),
+        span,
+        None,
+    )
+}
+
+/// `window functions are not allowed in FILTER` — SQLSTATE 42P20.
+pub(crate) fn window_in_filter(span: Option<SourceSpan>) -> RawError {
+    RawError::new(
+        AnalyzeError::WindowingError("window functions are not allowed in FILTER".into()),
+        span,
+        None,
+    )
+}
+
 // ── Polymorphic argument resolution (`enforce_generic_type_consistency`) ──
 // Every message below is SQLSTATE 42804 (`datatype_mismatch`).
 
@@ -433,6 +548,21 @@ mod tests {
                 "42725",
             ),
             (schema_does_not_exist("s", None).kind, "3F000"),
+            (not_an_aggregate("DISTINCT", "lower", None).kind, "42809"),
+            (within_group_required("mode", None).kind, "42809"),
+            (not_an_ordered_set_aggregate("count", None).kind, "42809"),
+            (window_function_within_group("rank", None).kind, "42809"),
+            (
+                parameterless_aggregate_needs_star("count", None).kind,
+                "42809",
+            ),
+            (
+                call_shape_not_implemented(NOT_IMPLEMENTED_CALL_SHAPES[0], None).kind,
+                "0A000",
+            ),
+            (distinct_aggregate_order_by_not_in_args(None).kind, "42P10"),
+            (aggregate_in_filter(None).kind, "42803"),
+            (window_in_filter(None).kind, "42P20"),
             (variadic_argument_must_be_array(None).kind, "42804"),
             (polymorphic_type_from_unknown(None), "42804"),
             (polymorphic_args_not_alike("anyelement"), "42804"),

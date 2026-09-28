@@ -99,3 +99,123 @@ fn window_calls_over_grouped_rows_see_only_grouped_columns() {
     db.analyze("SELECT sum(g) OVER (PARTITION BY g ORDER BY max(x)) FROM t GROUP BY g")
         .unwrap();
 }
+
+// ── Call modifiers on the wrong kind of routine (#55) ────────────────────────
+
+#[test]
+fn aggregate_modifiers_on_a_plain_function() {
+    let db = setup();
+    for (sql, msg) in [
+        (
+            "SELECT lower(DISTINCT s) FROM t",
+            "DISTINCT specified, but lower is not an aggregate function",
+        ),
+        (
+            "SELECT lower(s ORDER BY s) FROM t",
+            "ORDER BY specified, but lower is not an aggregate function",
+        ),
+        (
+            "SELECT lower(s) FILTER (WHERE true) FROM t",
+            "FILTER specified, but lower is not an aggregate function",
+        ),
+        (
+            "SELECT int4(DISTINCT '1')",
+            "DISTINCT specified, but int4 is not an aggregate function",
+        ),
+    ] {
+        assert_err_kind!(db, sql, AnalyzeError::WrongObjectType(_), msg);
+    }
+}
+
+#[test]
+fn ordered_set_and_plain_aggregate_call_shapes() {
+    let db = setup();
+    for (sql, msg) in [
+        (
+            "SELECT count() FROM t",
+            "count(*) must be used to call a parameterless aggregate function",
+        ),
+        (
+            "SELECT count(*) WITHIN GROUP (ORDER BY x) FROM t",
+            "count is not an ordered-set aggregate, so it cannot have WITHIN GROUP",
+        ),
+        (
+            "SELECT mode(x) FROM t",
+            "WITHIN GROUP is required for ordered-set aggregate mode",
+        ),
+        (
+            "SELECT rank(1) OVER () FROM t",
+            "WITHIN GROUP is required for ordered-set aggregate rank",
+        ),
+    ] {
+        assert_err_kind!(db, sql, AnalyzeError::WrongObjectType(_), msg);
+    }
+    assert_err_kind!(
+        db,
+        "SELECT rank(3, 4) WITHIN GROUP (ORDER BY x) FROM t",
+        AnalyzeError::UndefinedFunction(_),
+        "function rank(integer, integer, integer) does not exist"
+    );
+    assert_err_kind!(
+        db,
+        "SELECT mode() WITHIN GROUP (ORDER BY x) OVER () FROM t",
+        AnalyzeError::FeatureNotSupported(_),
+        "OVER is not supported for ordered-set aggregate mode"
+    );
+}
+
+#[test]
+fn hypothetical_arguments_take_the_ordering_column_type() {
+    let db = setup();
+    let s = db
+        .analyze("SELECT rank($p) WITHIN GROUP (ORDER BY x) AS r FROM t")
+        .unwrap();
+    assert_cols(&s, vec![cn("r", int8())]);
+    assert_params(&s, vec![p(int4())]);
+    assert_err_starts_with(
+        &db,
+        "SELECT rank('a') WITHIN GROUP (ORDER BY x) FROM t",
+        "invalid input syntax for type integer: \"a\"",
+    );
+}
+
+#[test]
+fn aggregate_and_window_modifier_rules() {
+    let db = setup();
+    assert_err_kind!(
+        db,
+        "SELECT array_agg(DISTINCT x ORDER BY y) FROM t",
+        AnalyzeError::InvalidColumnReference(_),
+        "in an aggregate with DISTINCT, ORDER BY expressions must appear in argument list"
+    );
+    db.analyze("SELECT array_agg(DISTINCT t.x ORDER BY x) FROM t")
+        .unwrap();
+    assert_err_kind!(
+        db,
+        "SELECT count(*) FILTER (WHERE count(*) > 1) FROM t",
+        AnalyzeError::GroupingError(_),
+        "aggregate functions are not allowed in FILTER"
+    );
+    assert_err_kind!(
+        db,
+        "SELECT count(*) FILTER (WHERE row_number() OVER () > 1) FROM t",
+        AnalyzeError::WindowingError(_),
+        "window functions are not allowed in FILTER"
+    );
+    for (sql, msg) in [
+        (
+            "SELECT sum(DISTINCT x) OVER () FROM t",
+            "DISTINCT is not implemented for window functions",
+        ),
+        (
+            "SELECT array_agg(x ORDER BY x) OVER () FROM t",
+            "aggregate ORDER BY is not implemented for window functions",
+        ),
+        (
+            "SELECT row_number() FILTER (WHERE true) OVER () FROM t",
+            "FILTER is not implemented for non-aggregate window functions",
+        ),
+    ] {
+        assert_err_kind!(db, sql, AnalyzeError::FeatureNotSupported(_), msg);
+    }
+}

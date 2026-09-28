@@ -9,7 +9,7 @@
 use pg_query::protobuf::{DefineStmt, FunctionParameterMode, node};
 
 use crate::oid::{PgProcOid, PgTypeOid};
-use crate::pg_catalog::{PgAggregate, PgProc, ProKind};
+use crate::pg_catalog::{AggKind, PgAggregate, PgProc, ProKind};
 
 use super::DdlError;
 use super::util::{ensure_qualified_name, resolve_type_name};
@@ -150,9 +150,27 @@ pub fn define_aggregate(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(),
         // GENERATED / index context anyway.
         provolatile: crate::pg_catalog::ProVolatile::Immutable,
     });
+    // gram.y's `aggr_args` pairs the argument list with the number of
+    // direct arguments: -1 for a plain aggregate, >= 0 for an ordered-set
+    // one (`agg(direct ORDER BY aggregated)`); HYPOTHETICAL marks a
+    // hypothetical-set aggregate (PG's DefineAggregate).
+    let num_direct_args = match stmt.args.get(1).and_then(|n| n.node.as_ref()) {
+        Some(node::Node::Integer(i)) if stmt.args.len() == 2 => i.ival,
+        _ => -1,
+    };
+    let hypothetical = stmt.definition.iter().any(|opt| {
+        matches!(opt.node.as_ref(), Some(node::Node::DefElem(de))
+            if de.defname.eq_ignore_ascii_case("hypothetical"))
+    });
     interp.insert_pg_aggregate(PgAggregate {
         aggfnoid: proc_oid,
         aggfinalfn: finalfn,
+        aggkind: match (num_direct_args >= 0, hypothetical) {
+            (false, _) => AggKind::Normal,
+            (true, false) => AggKind::OrderedSet,
+            (true, true) => AggKind::Hypothetical,
+        },
+        aggnumdirectargs: num_direct_args.max(0) as i16,
     });
 
     Ok(())

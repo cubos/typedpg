@@ -74,11 +74,11 @@ pub use oid::{
 };
 #[cfg(any(test, feature = "internal"))]
 pub use pg_catalog::{
-    ArgMode, AstBinding, AttGenerated, AttIdentity, CastContext, CastMethod, ConType, DepType,
-    EvEnabled, EvType, PgAggregate, PgAttribute, PgCast, PgCatalogSeed, PgClass, PgCollation,
-    PgConstraint, PgDepend, PgEnum, PgExtension, PgIndex, PgInherits, PgNamespace, PgOperator,
-    PgProc, PgRange, PgRewrite, PgType, ProKind, ProVolatile, RelKind, SerializedAst, TypCategory,
-    TypType,
+    AggKind, ArgMode, AstBinding, AttGenerated, AttIdentity, CastContext, CastMethod, ConType,
+    DepType, EvEnabled, EvType, PgAggregate, PgAttribute, PgCast, PgCatalogSeed, PgClass,
+    PgCollation, PgConstraint, PgDepend, PgEnum, PgExtension, PgIndex, PgInherits, PgNamespace,
+    PgOperator, PgProc, PgRange, PgRewrite, PgType, ProKind, ProVolatile, RelKind, SerializedAst,
+    TypCategory, TypType,
 };
 
 pub use ddl::DdlError;

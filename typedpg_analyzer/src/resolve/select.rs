@@ -450,7 +450,7 @@ fn ordinal_of(node: &protobuf::Node) -> Option<i64> {
 /// neutralized — `Debug` output with every `location: N` span removed. Used
 /// to compare an ORDER BY expression against the projection entries (PG's
 /// "appears in select list" test), where byte positions necessarily differ.
-fn node_fingerprint(node: &protobuf::Node) -> String {
+pub(crate) fn node_fingerprint(node: &protobuf::Node) -> String {
     let dbg = format!("{node:?}");
     let mut out = String::with_capacity(dbg.len());
     let mut rest = dbg.as_str();

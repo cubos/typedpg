@@ -644,6 +644,23 @@ pub struct PgAggregate {
     /// effective return type instead of caching it on the row.
     #[serde(with = "crate::oid::oid_or_zero")]
     pub aggfinalfn: Option<PgProcOid>,
+    /// Plain, ordered-set (`WITHIN GROUP`) or hypothetical-set aggregate.
+    pub aggkind: AggKind,
+    /// Number of direct (non-`WITHIN GROUP`) arguments of an ordered-set
+    /// aggregate — a variadic one counts as one; 0 for plain aggregates.
+    pub aggnumdirectargs: i16,
+}
+
+/// `pg_aggregate.aggkind`. PG chars: `n` normal, `o` ordered-set, `h`
+/// hypothetical-set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AggKind {
+    #[serde(rename = "n")]
+    Normal,
+    #[serde(rename = "o")]
+    OrderedSet,
+    #[serde(rename = "h")]
+    Hypothetical,
 }
 
 /// `pg_operator`: a registered operator.
