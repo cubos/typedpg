@@ -281,6 +281,26 @@ fn default_outside_insert_is_rejected() {
     }
 }
 
+#[test]
+fn default_nested_in_an_expression_is_rejected() {
+    // Only a bare DEFAULT (parentheses allowed) is an assignment's default;
+    // inside a larger expression it is PG's parse-time 42601.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE d (id int PRIMARY KEY, x int);")
+        .unwrap();
+    for sql in [
+        "INSERT INTO d VALUES (DEFAULT + 1, 1)",
+        "UPDATE d SET x = DEFAULT + 1",
+    ] {
+        let err = assert_err_prefix(&db, sql, "DEFAULT is not allowed in this context");
+        assert!(
+            matches!(err, AnalyzeError::SyntaxError(_)),
+            "{sql}: {err:?}"
+        );
+    }
+    db.analyze("INSERT INTO d VALUES (1, (DEFAULT))").unwrap();
+}
+
 // ── SELECT INTO ──────────────────────────────────────────────────────────────
 
 /// `SELECT … INTO` is CREATE TABLE AS: no result rows.
