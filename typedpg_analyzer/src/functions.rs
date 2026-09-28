@@ -1,11 +1,8 @@
 //! Function and aggregate resolution.
 
-use std::borrow::Cow;
-
 use crate::error::AnalyzeError;
 use crate::oid::PgTypeOid;
-use crate::pg_catalog::{ArgMode, PgCatalog, PgProc, ProKind, TypCategory, TypType, oid};
-use crate::polymorphic::*;
+use crate::pg_catalog::{ArgMode, PgCatalog, PgProc, ProKind, TypCategory, oid};
 
 /// One output column of a SRF / OUT-arg function. Mirrors the named-field
 /// shape that the analyzer needs from `pg_proc`'s `proallargtypes` /
@@ -75,7 +72,9 @@ pub(crate) fn call_arg_value(arg: &pg_query::protobuf::Node) -> &pg_query::proto
 /// Resolved function call result.
 pub(crate) struct ResolvedFunction {
     pub return_type_oid: PgTypeOid,
-    /// The resolved argument types from the matched function signature.
+    /// The coercion target of each call argument, in call order: the
+    /// matched signature with its polymorphic parameters resolved (PG's
+    /// `declared_arg_types` after `enforce_generic_type_consistency`).
     pub arg_types: Vec<PgTypeOid>,
     pub schema: String,
     pub is_aggregate: bool,
@@ -87,6 +86,14 @@ pub(crate) struct ResolvedFunction {
     /// matched `pg_proc`'s `proallargtypes`/`proargmodes`/`proargnames`.
     /// Empty for plain scalar returns.
     pub out_args: Vec<OutArg>,
+}
+
+/// What a call resolved to — PG's `FuncDetailCode` for the successful
+/// cases: a routine, or (for a one-argument call named after a type) a
+/// function-style cast `typename(x)`.
+pub(crate) enum FuncDetail {
+    Routine(ResolvedFunction),
+    Coercion(PgTypeOid),
 }
 
 /// pg_catalog strict functions that can still return NULL with non-null inputs.
@@ -121,7 +128,8 @@ const NULLABLE_STRICT_PG_CATALOG_FUNCTIONS: &[&str] = &[
 /// pg_catalog operators that can return NULL with non-null inputs.
 const NULLABLE_PG_CATALOG_OPERATORS: &[&str] = &["->", "->>", "#>", "#>>"];
 
-/// Resolve a function call by name and argument types.
+/// Resolve a function call by name and argument types, without the
+/// function-style cast interpretation (see [`func_get_detail`]).
 ///
 /// `span` covers the function reference in the original SQL — usually
 /// produced by `SourceSpan::from_node_qname(FuncCall.location)`. When
@@ -137,26 +145,57 @@ pub(crate) fn resolve_function(
     _is_agg_star: bool,
     span: Option<crate::error::SourceSpan>,
 ) -> Result<ResolvedFunction, AnalyzeError> {
-    let found = snapshot.find_functions(schema, name);
-    // Each overload is turned into the signature it offers this call — a
-    // named/mixed-notation call re-orders the parameters its names fit, a
-    // variadic function is expanded to the call's arity — so every matching
-    // pass below compares plain positional signatures.
-    let effective = drop_shadowed(if notation.names.is_empty() {
-        expand_variadic_candidates(&found, arg_types.len(), notation.variadic)
-    } else {
-        found
-            .iter()
-            .filter_map(|f| match_named_call(f, arg_types.len(), notation))
-            .map(|f| (Cow::Owned(f), false))
-            .collect()
-    });
-    let all_matches: Vec<&PgProc> = effective.iter().map(|f| &**f).collect();
-    let candidates: Vec<&PgProc> = all_matches
-        .iter()
-        .copied()
-        .filter(|f| !matches!(f.prokind, ProKind::Procedure))
-        .collect();
+    match func_get_detail(snapshot, schema, name, arg_types, notation, None, span)? {
+        FuncDetail::Routine(f) => Ok(f),
+        FuncDetail::Coercion(_) => unreachable!("coercion interpretation not requested"),
+    }
+}
+
+/// One entry of PG's `FuncCandidateList`: an overload as it would take this
+/// call — named arguments re-ordered into call order, a variadic parameter
+/// expanded into `nvargs` copies of its element type, parameters the call
+/// omits (filled from defaults) appended after the call's own.
+struct Candidate<'a> {
+    proc: &'a PgProc,
+    /// Parameter types in call order; the first `nargs` line up with the
+    /// call's arguments, the remaining `ndargs` come from defaults.
+    args: Vec<PgTypeOid>,
+    ndargs: usize,
+    nvargs: usize,
+    /// Index of the candidate's schema on the search path.
+    pathpos: usize,
+    /// Two same-schema overloads offered this exact signature (PG marks
+    /// the survivor with an invalid OID): choosing it is `not unique`.
+    ambiguous: bool,
+}
+
+/// PG's `func_get_detail` (parse_func.c) plus the argument checks
+/// `ParseFuncOrColumn` makes right after it: gather the candidates
+/// ([`func_candidates`]), take an exact match, else — for a one-argument
+/// call named after a type — a function-style cast, else the candidates
+/// the arguments coerce to ([`func_match_argtypes`]), narrowed by
+/// [`func_select_candidate`]. The winner's polymorphic parameters are then
+/// resolved by `enforce_generic_type_consistency`.
+///
+/// `coercion_arg` enables the cast interpretation: `Some(is_unknown_const)`
+/// says whether the lone argument is an untyped literal (always a cast).
+pub(crate) fn func_get_detail(
+    snapshot: &PgCatalog,
+    schema: Option<&str>,
+    name: &str,
+    arg_types: &[PgTypeOid],
+    notation: &CallNotation,
+    coercion_arg: Option<bool>,
+    span: Option<crate::error::SourceSpan>,
+) -> Result<FuncDetail, AnalyzeError> {
+    if let Some(s) = schema
+        && snapshot.namespace_oid(s).is_none()
+    {
+        return Err(crate::pgmsg::schema_does_not_exist(s, span).finalize_implicit());
+    }
+    let nargs = arg_types.len();
+    let candidates = func_candidates(snapshot, schema, name, nargs, notation);
+
     // PG's wording keeps the user's schema qualifier — match it so the
     // sanity-check prefix passes. `QualifiedName::Display` handles
     // identifier quoting (and round-trips through PG's rules).
@@ -166,8 +205,8 @@ pub(crate) fn resolve_function(
     };
     // Render the call's actual arg types in PG-style names (int4 → integer,
     // …), named arguments as `name => type`, so the message matches PG
-    // verbatim (`funcname_signature_string`).
-    let first_named = arg_types.len().saturating_sub(notation.names.len());
+    // verbatim (`func_signature_string`).
+    let first_named = nargs.saturating_sub(notation.names.len());
     let arg_list_actual = arg_types
         .iter()
         .enumerate()
@@ -183,184 +222,142 @@ pub(crate) fn resolve_function(
         })
         .collect::<Vec<_>>()
         .join(", ");
-    // Functions (not procedures) of this name at all, before any overload
-    // was filtered out for not fitting the call.
-    let functions_named = found
+    let not_unique = || {
+        crate::pgmsg::function_is_not_unique(&qualified, &arg_list_actual, span).finalize_implicit()
+    };
+
+    let exact = candidates
         .iter()
-        .filter(|f| !matches!(f.prokind, ProKind::Procedure))
-        .count();
-    if functions_named == 0 {
-        // PG distinguishes "function not found at all" from "the name
-        // resolves but only to a procedure" (SQLSTATE 42809). Mirror that
-        // so the sanity check matches PG verbatim.
-        if let Some(proc) = all_matches
-            .iter()
-            .find(|f| matches!(f.prokind, ProKind::Procedure))
-        {
-            let arg_list = proc
-                .proargtypes
-                .iter()
-                .map(|oid| {
-                    snapshot
-                        .pg_type
-                        .get(oid)
-                        .map(|t| match t.typname.as_str() {
-                            "int2" => "smallint".to_string(),
-                            "int4" => "integer".to_string(),
-                            "int8" => "bigint".to_string(),
-                            "float4" => "real".to_string(),
-                            "float8" => "double precision".to_string(),
-                            other => other.to_string(),
-                        })
-                        .unwrap_or_default()
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            // PG classifies a procedure in an expression as wrong_object_type
-            // (42809), not undefined_function.
-            return Err(crate::error::RawError::new(
-                AnalyzeError::WrongObjectType(format!("{qualified}({arg_list}) is a procedure")),
-                span,
-                Some("to call a procedure, use CALL".into()),
+        .position(|c| c.args[..nargs] == *arg_types);
+    let best = match exact {
+        Some(i) => Some(i),
+        None => {
+            if let Some(unknown_const) = coercion_arg
+                && nargs == 1
+                && notation.names.is_empty()
+                && let Some(target) =
+                    func_name_as_coercion(snapshot, schema, name, arg_types[0], unknown_const)
+            {
+                return Ok(FuncDetail::Coercion(target));
+            }
+            let arg_lists: Vec<&[PgTypeOid]> =
+                candidates.iter().map(|c| &c.args[..nargs]).collect();
+            let matching = func_match_argtypes(arg_types, &arg_lists, snapshot);
+            match matching.as_slice() {
+                [] => None,
+                [one] => Some(*one),
+                _ => {
+                    let narrowed: Vec<&[PgTypeOid]> =
+                        matching.iter().map(|&i| arg_lists[i]).collect();
+                    match func_select_candidate(arg_types, &narrowed, snapshot) {
+                        Some(j) => Some(matching[j]),
+                        None => return Err(not_unique()),
+                    }
+                }
+            }
+        }
+    };
+    let Some(best) = best else {
+        let functions_named = snapshot.find_functions(schema, name).len();
+        // PG's wording: `function name(arg_types_joined) does not exist`.
+        // Match it verbatim so pg_sanity's prefix check passes; append the
+        // candidate count as a suffix for the macro caller's diagnostic.
+        let message = if functions_named == 0 {
+            format!("function {qualified}({arg_list_actual}) does not exist")
+        } else {
+            format!(
+                "function {qualified}({arg_list_actual}) does not exist (found {functions_named} candidate(s))"
             )
-            .finalize_implicit());
-        }
+        };
         return Err(undefined_function_error(
-            snapshot,
-            schema,
-            name,
-            format!("function {qualified}({arg_list_actual}) does not exist"),
-            span,
+            snapshot, schema, name, message, span,
         ));
-    }
-
-    // PG smashes a domain argument to its base type for function/aggregate
-    // overload resolution (so `max(email)` matches `max(text)` exactly and
-    // `sum(pos)` — a domain over int4 — resolves to `sum(int4)` like a plain
-    // int, not to some arbitrary implicit-cast candidate). Match against the
-    // unwrapped types; the original `arg_types` is still used for the
-    // "does not exist" wording so it shows the domain the user wrote.
-    let match_types: Vec<PgTypeOid> = arg_types
-        .iter()
-        .map(|&o| snapshot.unwrap_domain(o))
-        .collect();
-    let match_types = match_types.as_slice();
-
-    // Several exact matches only arise from repeated signatures (variadic
-    // expansions, named notation); PG can't choose between them either.
-    match candidates
-        .iter()
-        .filter(|f| f.proargtypes == match_types)
-        .collect::<Vec<_>>()
-        .as_slice()
-    {
-        [] => {}
-        [f] => return Ok(make_resolved(f, snapshot)),
-        _ => {
-            return Err(
-                crate::pgmsg::function_is_not_unique(&qualified, &arg_list_actual, span)
-                    .finalize_implicit(),
-            );
-        }
-    }
-    if let Some(f) = find_unknown_compatible_match(&candidates, match_types) {
-        return Ok(make_resolved(f, snapshot));
-    }
-    if let Some(f) = find_default_args_match(&candidates, match_types, snapshot) {
-        return Ok(make_resolved(f, snapshot));
-    }
-    match find_cast_match(&candidates, match_types, snapshot) {
-        CastMatch::Match(f) => return Ok(make_resolved(f, snapshot)),
-        CastMatch::Ambiguous => {
-            // PG (SQLSTATE 42725): `function name(types) is not unique` —
-            // several candidates survived every tiebreak; choosing one
-            // could silently mistype the call.
-            return Err(
-                crate::pgmsg::function_is_not_unique(&qualified, &arg_list_actual, span)
-                    .finalize_implicit(),
-            );
-        }
-        CastMatch::NoMatch => {}
-    }
-    if let Some(f) = find_polymorphic_match(&candidates, match_types, snapshot) {
-        return Ok(make_resolved_polymorphic(f, match_types, snapshot));
-    }
-
-    // Whether a single declared parameter `p` plausibly accepts actual `a`. A
-    // polymorphic pseudo-type (anyarray, anyenum, …) only accepts actuals that
-    // satisfy its shape constraint — `array_ndims(integer)` must NOT match
-    // `anyarray`. Other pseudo-types (`"any"` for `count(x)`, the `"any"`
-    // element of a `VARIADIC "any"`, …) accept anything.
-    let param_accepts = |p: PgTypeOid, a: PgTypeOid| {
-        if p == a || a == oid::UNKNOWN {
-            return true;
-        }
-        if is_polymorphic(p) {
-            return matches_polymorphic(p, a, snapshot);
-        }
-        // The `record` pseudo-type only accepts an actual composite/record
-        // value — NOT an arbitrary scalar. `max(record)` exists, but
-        // `max(boolean)` must still fail (PG: `function max(boolean) does not
-        // exist`). Other non-polymorphic pseudo-types (`"any"` for `count(x)`,
-        // the `"any"` element of a `VARIADIC "any"`, …) accept anything.
-        if p == oid::RECORD {
-            let base = snapshot.unwrap_domain(a);
-            return base == oid::RECORD
-                || snapshot
-                    .get_type(base)
-                    .is_some_and(|t| t.typtype == TypType::Composite);
-        }
-        if snapshot
-            .get_type(p)
-            .is_some_and(|t| t.typtype == TypType::Pseudo)
-        {
-            return true;
-        }
-        casts_implicitly(a, p, snapshot)
     };
-
-    // Whether `f`'s parameters can plausibly accept the actual `arg_types`. A
-    // concrete parameter with a non-coercible actual is NOT accepted — that's a
-    // genuine `does not exist`, e.g. `jsonb_typeof(numeric)`, which PG rejects.
-    let args_fit = |f: &PgProc| {
-        f.proargtypes.len() == arg_types.len()
-            && f.proargtypes
-                .iter()
-                .zip(arg_types)
-                .all(|(&p, &a)| param_accepts(p, a))
-    };
-
-    // A lone aggregate candidate is accepted only when its parameters actually
-    // fit the call — a single `bool_or(boolean)` overload must still reject
-    // `bool_or(numeric)` and `bool_or(text, timestamptz)` (wrong arity), which
-    // PG reports as `function bool_or(...) does not exist`.
-    let agg_candidates: Vec<_> = candidates
-        .iter()
-        .filter(|f| matches!(f.prokind, ProKind::Aggregate))
-        .collect();
-    if agg_candidates.len() == 1 && args_fit(agg_candidates[0]) {
-        return Ok(make_resolved(agg_candidates[0], snapshot));
+    let cand = &candidates[best];
+    if cand.ambiguous {
+        return Err(not_unique());
+    }
+    let f = cand.proc;
+    if matches!(f.prokind, ProKind::Procedure) {
+        // PG classifies a procedure in an expression as wrong_object_type
+        // (42809), not undefined_function.
+        return Err(crate::error::RawError::new(
+            AnalyzeError::WrongObjectType(format!("{qualified}({arg_list_actual}) is a procedure")),
+            span,
+            Some("to call a procedure, use CALL".into()),
+        )
+        .finalize_implicit());
     }
 
-    // Last-resort single-candidate match across all (non-procedure) candidates.
-    let count_matches: Vec<_> = candidates.iter().filter(|f| args_fit(f)).collect();
-    if count_matches.len() == 1 {
-        return Ok(make_resolved(count_matches[0], snapshot));
-    }
-
-    // PG's wording: `function name(arg_types_joined) does not exist`. Match
-    // it verbatim so pg_sanity's prefix check passes; append the candidate
-    // count we computed as a suffix for the macro caller's diagnostic.
-    Err(undefined_function_error(
+    // `ParseFuncOrColumn`: resolve the polymorphic parameters (defaults
+    // contribute no actual type — we don't model their expressions).
+    let mut declared = cand.args.clone();
+    let rettype = aggregate_final_return(f, snapshot).unwrap_or(f.prorettype);
+    let (return_type_oid, poly) = crate::polymorphic::enforce_generic_type_consistency(
+        arg_types,
+        &mut declared,
+        rettype,
         snapshot,
-        schema,
-        name,
-        format!(
-            "function {qualified}({arg_list_actual}) does not exist (found {} candidate(s))",
-            functions_named
-        ),
-        span,
-    ))
+    )
+    .map_err(|e| crate::error::RawError::new(e, span, None).finalize_implicit())?;
+    declared.truncate(nargs);
+
+    // An explicit `VARIADIC` argument to a `VARIADIC "any"` function must
+    // be an array (`ParseFuncOrColumn`).
+    const ANY: PgTypeOid = PgTypeOid::from_raw(2276);
+    if notation.variadic
+        && f.provariadic == Some(ANY)
+        && let Some(&last) = arg_types.last()
+        && crate::coerce::element_type(snapshot.unwrap_domain(last), snapshot).is_none()
+    {
+        return Err(crate::pgmsg::variadic_argument_must_be_array(None).finalize_implicit());
+    }
+
+    let out_args = build_out_args(f)
+        .into_iter()
+        .map(|field| OutArg {
+            type_oid: poly.resolve(field.type_oid, snapshot),
+            ..field
+        })
+        .collect();
+    Ok(FuncDetail::Routine(ResolvedFunction {
+        return_type_oid,
+        arg_types: declared,
+        schema: snapshot
+            .namespace_name(f.pronamespace)
+            .map(str::to_owned)
+            .unwrap_or_default(),
+        is_aggregate: matches!(f.prokind, ProKind::Aggregate),
+        is_window: matches!(f.prokind, ProKind::Window),
+        is_strict: f.proisstrict,
+        out_args,
+    }))
+}
+
+/// PG's function-style cast rule in `func_get_detail`: a one-argument call
+/// with no exact match, named after a type, is a cast when the argument is
+/// an untyped literal or the explicit coercion is a relabeling or an I/O
+/// conversion (except record → string). Function-backed casts are left to
+/// the type's conversion functions (`int4(numeric)` exists in `pg_proc`).
+fn func_name_as_coercion(
+    snapshot: &PgCatalog,
+    schema: Option<&str>,
+    name: &str,
+    source: PgTypeOid,
+    unknown_const: bool,
+) -> Option<PgTypeOid> {
+    use crate::coerce::{CoercionContext, CoercionPath, coercion_pathway};
+    let target = snapshot.resolve_type_by_name(schema, name)?.oid;
+    let is_coercion = (source == oid::UNKNOWN && unknown_const)
+        || match coercion_pathway(target, source, CoercionContext::Explicit, snapshot) {
+            Some(CoercionPath::Relabel) => true,
+            Some(CoercionPath::CoerceViaIo) => {
+                !((source == oid::RECORD || crate::coerce::is_complex(source, snapshot))
+                    && crate::coerce::type_category(target, snapshot) == Some(TypCategory::String))
+            }
+            _ => false,
+        };
+    is_coercion.then_some(target)
 }
 
 /// Build the public-facing `UndefinedFunction` error with snippet + hint.
@@ -376,89 +373,121 @@ pub(crate) fn undefined_function_error(
     crate::error::RawError::undefined_function(message, span, hint).finalize_implicit()
 }
 
-/// PG's variadic handling in `FuncnameGetCandidates` (namespace.c) for a
-/// positional call with `nargs` arguments. Without the `VARIADIC` keyword a
-/// variadic function only matches calls supplying at least one variadic
-/// element, as if declared with that many parameters of its element type
-/// (`provariadic`); with the keyword every function is matched on its
-/// declared signature. Each candidate is paired with whether it is a
-/// variadic expansion.
-fn expand_variadic_candidates<'a>(
-    found: &[&'a PgProc],
+/// PG's `FuncnameGetCandidates` (namespace.c) for a call with `nargs`
+/// arguments: every overload that can take that many — as written, with a
+/// variadic parameter expanded (unless the call used `VARIADIC`), or with
+/// trailing parameters filled from defaults — in search-path order.
+///
+/// When two overloads offer the same signature (ignoring defaulted
+/// parameters), the one earlier on the search path wins; within one schema
+/// a non-variadic match beats a variadic expansion, and any other tie
+/// (`f(int)` vs `f(int, text DEFAULT …)`) leaves an *ambiguous* entry that
+/// fails the call as `not unique` if chosen.
+fn func_candidates<'a>(
+    snapshot: &'a PgCatalog,
+    schema: Option<&str>,
+    name: &str,
     nargs: usize,
-    variadic_keyword: bool,
-) -> Vec<(Cow<'a, PgProc>, bool)> {
-    found
-        .iter()
-        .filter_map(|&f| match f.provariadic {
-            None => Some((Cow::Borrowed(f), false)),
-            Some(_) if variadic_keyword => {
-                let mut plain = f.clone();
-                plain.provariadic = None;
-                Some((Cow::Owned(plain), false))
-            }
-            Some(elem) => {
-                let fixed = f.proargtypes.len() - 1;
-                if nargs <= fixed {
-                    return None;
-                }
-                let mut spread = f.clone();
-                spread.proargtypes.truncate(fixed);
-                spread.proargtypes.resize(nargs, elem);
-                spread.provariadic = None;
-                Some((Cow::Owned(spread), true))
-            }
-        })
-        .collect()
-}
-
-/// PG's duplicate-signature rule in `FuncnameGetCandidates`, over candidates
-/// in search-path order paired with whether each is a variadic expansion:
-/// when a signature repeats, the schema earlier on the search path wins, and
-/// within one schema a non-variadic function beats a variadic expansion.
-/// Other same-schema duplicates stay, and resolution reports them as
-/// `is not unique`.
-fn drop_shadowed<'a>(candidates: Vec<(Cow<'a, PgProc>, bool)>) -> Vec<Cow<'a, PgProc>> {
-    let mut out: Vec<(Cow<'a, PgProc>, bool)> = Vec::new();
-    for (candidate, expanded) in candidates {
-        if let Some(prev) = out
+    notation: &CallNotation,
+) -> Vec<Candidate<'a>> {
+    let path = snapshot.schemas_for_lookup(schema);
+    let mut out: Vec<Candidate<'a>> = Vec::new();
+    for f in snapshot.find_functions(schema, name) {
+        let pathpos = path
             .iter()
-            .position(|(c, _)| c.proargtypes == candidate.proargtypes)
-        {
-            if out[prev].0.pronamespace != candidate.pronamespace {
+            .position(|&ns| ns == f.pronamespace)
+            .unwrap_or(0);
+        let pronargs = f.proargtypes.len();
+        let defaults = f.pronargdefaults.max(0) as usize;
+        let expand_variadic = !notation.variadic;
+        let cand = if !notation.names.is_empty() {
+            // Named notation can reach a variadic function only through an
+            // explicit `VARIADIC` argument: expanded elements have no name.
+            if f.provariadic.is_some() && expand_variadic {
                 continue;
             }
-            match (out[prev].1, expanded) {
-                (true, false) => {
-                    out[prev] = (candidate, false);
-                    continue;
-                }
-                (false, true) => continue,
-                _ => {}
+            if pronargs < nargs || (pronargs > nargs && nargs + defaults < pronargs) {
+                continue;
             }
+            let Some(args) = match_named_call(f, nargs, notation) else {
+                continue;
+            };
+            Candidate {
+                proc: f,
+                args,
+                ndargs: pronargs - nargs,
+                nvargs: 0,
+                pathpos,
+                ambiguous: false,
+            }
+        } else {
+            let variadic_elem = f
+                .provariadic
+                .filter(|_| pronargs <= nargs && expand_variadic);
+            let use_defaults = pronargs > nargs;
+            if use_defaults && nargs + defaults < pronargs {
+                continue;
+            }
+            if pronargs != nargs && variadic_elem.is_none() && !use_defaults {
+                continue;
+            }
+            let mut args = f.proargtypes.clone();
+            let mut nvargs = 0;
+            if let Some(elem) = variadic_elem {
+                nvargs = nargs - pronargs + 1;
+                args.truncate(pronargs - 1);
+                args.resize(nargs, elem);
+            }
+            Candidate {
+                proc: f,
+                args,
+                ndargs: pronargs.saturating_sub(nargs),
+                nvargs,
+                pathpos,
+                ambiguous: false,
+            }
+        };
+
+        let cmp = cand.args.len() - cand.ndargs;
+        let prev = out
+            .iter()
+            .position(|p| p.args.len() - p.ndargs == cmp && p.args[..cmp] == cand.args[..cmp]);
+        let Some(prev) = prev else {
+            out.push(cand);
+            continue;
+        };
+        // `preference` > 0 keeps the earlier entry, < 0 replaces it, 0
+        // marks it ambiguous.
+        let preference: isize = if cand.pathpos != out[prev].pathpos {
+            cand.pathpos as isize - out[prev].pathpos as isize
+        } else if cand.nvargs > 0 && out[prev].nvargs == 0 {
+            1
+        } else if cand.nvargs == 0 && out[prev].nvargs > 0 {
+            -1
+        } else {
+            0
+        };
+        match preference.cmp(&0) {
+            std::cmp::Ordering::Greater => {}
+            std::cmp::Ordering::Less => {
+                out.remove(prev);
+                out.push(cand);
+            }
+            std::cmp::Ordering::Equal => out[prev].ambiguous = true,
         }
-        out.push((candidate, expanded));
     }
-    out.into_iter().map(|(c, _)| c).collect()
+    out
 }
 
 /// PG's `MatchNamedCall` (namespace.c): map a named/mixed-notation call
-/// with `nargs` arguments onto `f`'s input parameters. Returns a copy of `f`
-/// whose `proargtypes` are re-ordered into the call's argument order (the
-/// omitted, defaulted parameters dropped), or `None` when the names don't
-/// fit — an unknown name, a name repeating a positional argument, or an
-/// omitted parameter without a default.
-fn match_named_call(f: &PgProc, nargs: usize, notation: &CallNotation) -> Option<PgProc> {
-    // Named notation can reach a variadic function only through an explicit
-    // `VARIADIC` argument: the expanded variadic elements have no name.
-    if f.provariadic.is_some() && !notation.variadic {
-        return None;
-    }
+/// with `nargs` arguments onto `f`'s input parameters. Returns `f`'s
+/// parameter types in the call's argument order, followed by the omitted
+/// (defaulted) parameters in declaration order, or `None` when the names
+/// don't fit — an unknown name, a name repeating a positional argument, or
+/// an omitted parameter without a default.
+fn match_named_call(f: &PgProc, nargs: usize, notation: &CallNotation) -> Option<Vec<PgTypeOid>> {
     let pronargs = f.proargtypes.len();
     let defaults = f.pronargdefaults.max(0) as usize;
-    if nargs > pronargs || nargs + defaults < pronargs {
-        return None;
-    }
     // Input-parameter names in `proargtypes` order. With `proargmodes` set,
     // `proargnames` parallels `proallargtypes` and OUT/TABLE entries are
     // skipped; without it, every parameter is an input.
@@ -486,358 +515,171 @@ fn match_named_call(f: &PgProc, nargs: usize, notation: &CallNotation) -> Option
     }
     // Every parameter the call leaves out must have a default — and only
     // the trailing `pronargdefaults` ones do.
-    let first_default = pronargs - defaults;
-    if (positional..pronargs).any(|pp| !given[pp] && pp < first_default) {
-        return None;
-    }
-    let mut matched = f.clone();
-    matched.proargtypes = order.iter().map(|&pp| f.proargtypes[pp]).collect();
-    matched.pronargdefaults = 0;
-    matched.provariadic = None;
-    Some(matched)
-}
-
-fn find_unknown_compatible_match<'a>(
-    candidates: &[&'a PgProc],
-    arg_types: &[PgTypeOid],
-) -> Option<&'a PgProc> {
-    if !arg_types.contains(&oid::UNKNOWN) {
-        return None;
-    }
-    let matches: Vec<_> = candidates
-        .iter()
-        .filter(|f| {
-            f.proargtypes.len() == arg_types.len()
-                && f.proargtypes
-                    .iter()
-                    .zip(arg_types.iter())
-                    .all(|(&expected, &actual)| expected == actual || actual == oid::UNKNOWN)
-        })
-        .collect();
-    if matches.len() == 1 {
-        Some(matches[0])
-    } else {
-        None
-    }
-}
-
-fn find_default_args_match<'a>(
-    candidates: &[&'a PgProc],
-    arg_types: &[PgTypeOid],
-    snapshot: &PgCatalog,
-) -> Option<&'a PgProc> {
-    let provided = arg_types.len();
-    let matching: Vec<&PgProc> = candidates
-        .iter()
-        .filter(|f| {
-            let total = f.proargtypes.len();
-            let defaults = f.pronargdefaults.max(0) as usize;
-            total >= provided
-                && defaults >= total - provided
-                && f.proargtypes
-                    .iter()
-                    .take(provided)
-                    .zip(arg_types.iter())
-                    .all(|(&expected, &actual)| {
-                        expected == actual
-                            || actual == oid::UNKNOWN
-                            || snapshot.has_implicit_cast(actual, expected)
-                    })
-        })
-        .copied()
-        .collect();
-    if matching.len() == 1 {
-        Some(matching[0])
-    } else {
-        None
-    }
-}
-
-/// `has_implicit_cast` extended with PG's element-wise rule for arrays:
-/// `numeric[] → float8[]` is allowed because `numeric → float8` is. This is
-/// only used by overload resolution; the bare `has_implicit_cast` query
-/// stays strict so explicit cast lookups don't get accidentally relaxed.
-fn casts_implicitly(source: PgTypeOid, target: PgTypeOid, snapshot: &PgCatalog) -> bool {
-    if snapshot.has_implicit_cast(source, target) {
-        return true;
-    }
-    let (Some(s), Some(t)) = (snapshot.get_type(source), snapshot.get_type(target)) else {
-        return false;
-    };
-    if s.typcategory != TypCategory::Array || t.typcategory != TypCategory::Array {
-        return false;
-    }
-    let (Some(se), Some(te)) = (s.typelem, t.typelem) else {
-        return false;
-    };
-    snapshot.has_implicit_cast(se, te)
-}
-
-fn find_polymorphic_match<'a>(
-    candidates: &[&'a PgProc],
-    arg_types: &[PgTypeOid],
-    snapshot: &PgCatalog,
-) -> Option<&'a PgProc> {
-    // First pass: only exact / UNKNOWN / polymorphic matches — what PG calls
-    // a "type-conformant" candidate without any cast.
-    let strict: Vec<&PgProc> = candidates
-        .iter()
-        .filter(|f| f.proargtypes.len() == arg_types.len())
-        .filter(|f| {
-            f.proargtypes
-                .iter()
-                .zip(arg_types.iter())
-                .all(|(&expected, &actual)| {
-                    expected == actual
-                        || actual == oid::UNKNOWN
-                        || matches_polymorphic(expected, actual, snapshot)
-                })
-        })
-        // Per-position matching passed; the call as a whole must also
-        // unify (anyelement == the range's subtype, etc.).
-        .filter(|f| unify_polymorphic_call(&f.proargtypes, arg_types, snapshot).is_some())
-        .copied()
-        .collect();
-    if strict.len() == 1 {
-        return Some(strict[0]);
-    }
-    if !strict.is_empty() {
-        return None;
-    }
-
-    // Second pass: allow implicit casts on the non-polymorphic args. This is
-    // what makes `percentile_disc(0.5) WITHIN GROUP (ORDER BY int_col)`
-    // resolve — the direct arg is `numeric` but the candidate expects
-    // `float8`, while the ordered arg matches the polymorphic `anyelement`.
-    let lax: Vec<&PgProc> = candidates
-        .iter()
-        .filter(|f| f.proargtypes.len() == arg_types.len())
-        .filter(|f| {
-            f.proargtypes
-                .iter()
-                .zip(arg_types.iter())
-                .all(|(&expected, &actual)| {
-                    expected == actual
-                        || actual == oid::UNKNOWN
-                        || matches_polymorphic(expected, actual, snapshot)
-                        || (!is_polymorphic(expected)
-                            && casts_implicitly(actual, expected, snapshot))
-                })
-        })
-        .copied()
-        .collect();
-    if lax.len() == 1 { Some(lax[0]) } else { None }
-}
-
-/// Outcome of the implicit-cast overload filter: a unique winner, no
-/// surviving candidate, or several candidates left tied after every
-/// tiebreak — PG reports the last as `function X(…) is not unique`
-/// (SQLSTATE 42725) rather than picking one arbitrarily.
-enum CastMatch<'a> {
-    Match(&'a PgProc),
-    NoMatch,
-    Ambiguous,
-}
-
-fn find_cast_match<'a>(
-    candidates: &[&'a PgProc],
-    arg_types: &[PgTypeOid],
-    snapshot: &PgCatalog,
-) -> CastMatch<'a> {
-    let matching: Vec<&PgProc> = candidates
-        .iter()
-        .filter(|f| f.proargtypes.len() == arg_types.len())
-        .filter(|f| {
-            f.proargtypes
-                .iter()
-                .zip(arg_types.iter())
-                .all(|(&expected, &actual)| {
-                    expected == actual
-                        || actual == oid::UNKNOWN
-                        || casts_implicitly(actual, expected, snapshot)
-                })
-        })
-        .copied()
-        .collect();
-
-    if matching.is_empty() {
-        return CastMatch::NoMatch;
-    }
-    if matching.len() == 1 {
-        return CastMatch::Match(matching[0]);
-    }
-
-    if !arg_types.contains(&oid::UNKNOWN) {
-        // PG §10.3 step 4c/4d for concretely-typed arguments: keep the
-        // candidates with the most exact type matches, then those accepting
-        // the preferred type of each argument's category at the most
-        // converted positions. This is what makes `floor(bigint)` resolve to
-        // `floor(double precision)` (float8 is the preferred numeric type),
-        // not `floor(numeric)`.
-        let exact = |f: &PgProc| -> usize {
-            f.proargtypes
-                .iter()
-                .zip(arg_types)
-                .filter(|&(p, a)| p == a)
-                .count()
-        };
-        let best_exact = matching.iter().copied().map(exact).max().unwrap_or(0);
-        let mut narrowed: Vec<&PgProc> = matching
-            .iter()
-            .copied()
-            .filter(|f| exact(f) == best_exact)
-            .collect();
-        if narrowed.len() > 1 {
-            // "Accepts the preferred type" — shared with operator resolution,
-            // see `PgCatalog::is_preferred_for`.
-            let preferred_hits = |f: &PgProc| -> usize {
-                f.proargtypes
-                    .iter()
-                    .zip(arg_types)
-                    .filter(|&(&p, &a)| snapshot.is_preferred_for(p, a))
-                    .count()
-            };
-            let best_pref = narrowed
-                .iter()
-                .copied()
-                .map(preferred_hits)
-                .max()
-                .unwrap_or(0);
-            if best_pref > 0 {
-                narrowed.retain(|f| preferred_hits(f) == best_pref);
+    let first_default = pronargs - defaults.min(pronargs);
+    for (pp, &was_given) in given.iter().enumerate().skip(positional) {
+        if !was_given {
+            if pp < first_default {
+                return None;
             }
+            order.push(pp);
         }
-        // PG fails with `is not unique` when several candidates survive its
-        // tiebreaks; picking one would risk silently mistyping the call
-        // (`mod(int2,int2)` vs `mod(int8,int8)` for smallint inputs differ
-        // in result type).
-        return match narrowed.len() {
-            0 => CastMatch::NoMatch,
-            1 => CastMatch::Match(narrowed[0]),
-            _ => CastMatch::Ambiguous,
-        };
     }
+    Some(order.iter().map(|&pp| f.proargtypes[pp]).collect())
+}
 
-    // Unknown-argument resolution (PG's func_select_candidate): prefer
-    // candidates accepting the STRING category at every unknown position…
-    let string_compatible: Vec<&PgProc> = matching
-        .iter()
-        .filter(|f| {
-            f.proargtypes
-                .iter()
-                .zip(arg_types.iter())
-                .all(|(&param_oid, &actual)| {
-                    if actual != oid::UNKNOWN {
-                        return true;
-                    }
-                    snapshot
-                        .get_type(param_oid)
-                        .is_some_and(|t| t.typcategory == TypCategory::String)
-                })
-        })
-        .copied()
-        .collect();
-
-    if string_compatible.len() == 1 {
-        return CastMatch::Match(string_compatible[0]);
-    }
-    if string_compatible.len() > 1 {
-        let preferred: Vec<&PgProc> = string_compatible
-            .iter()
-            .filter(|f| {
-                f.proargtypes
-                    .iter()
-                    .zip(arg_types.iter())
-                    .all(|(&param_oid, &actual)| {
-                        if actual != oid::UNKNOWN {
-                            return true;
-                        }
-                        snapshot
-                            .get_type(param_oid)
-                            .is_some_and(|t| t.typispreferred)
-                    })
-            })
-            .copied()
-            .collect();
-        return match preferred.len() {
-            1 => CastMatch::Match(preferred[0]),
-            // Several string-accepting candidates left — PG gives up with
-            // `is not unique` instead of guessing.
-            _ => CastMatch::Ambiguous,
-        };
-    }
-
-    // …otherwise every unknown slot's candidates must agree on a single
-    // type category; within it, candidates carrying the category's
-    // *preferred* type win (this is what resolves `round('1.5')` to
-    // `round(float8)` while `mod('5','2')` — int/numeric variants only,
-    // none preferred — stays ambiguous).
-    let unknown_slots: Vec<usize> = arg_types
+/// PG's `func_match_argtypes` (parse_func.c): the candidates (indexes into
+/// `candidates`) whose parameters the actual arguments can be implicitly
+/// coerced to (`can_coerce_type`).
+pub(crate) fn func_match_argtypes(
+    inputs: &[PgTypeOid],
+    candidates: &[&[PgTypeOid]],
+    snapshot: &PgCatalog,
+) -> Vec<usize> {
+    candidates
         .iter()
         .enumerate()
-        .filter(|&(_, &a)| a == oid::UNKNOWN)
+        .filter(|(_, args)| crate::coerce::can_coerce_types(inputs, args, snapshot))
         .map(|(i, _)| i)
+        .collect()
+}
+
+/// PG's `IsPreferredType`: `t` is its category's preferred type and in
+/// `category` (a missing category matches any).
+fn is_preferred_type(category: Option<TypCategory>, t: PgTypeOid, snapshot: &PgCatalog) -> bool {
+    let (cat, preferred) = crate::coerce::type_category_preferred(t, snapshot);
+    (category.is_none() || category == cat) && preferred
+}
+
+/// PG's `func_select_candidate` (parse_func.c), shared by function and
+/// operator resolution: pick one of several `candidates` (parameter lists,
+/// all accepting `inputs`) or `None` when the call is ambiguous. With
+/// domains smashed to their base types, keep the candidates with the most
+/// exact matches, then with the most exact-or-preferred matches at known
+/// positions; then give each unknown position a type category (STRING if
+/// any candidate takes one there, else the one all candidates agree on)
+/// and keep the candidates taking that category (its preferred type, when
+/// one does); last, if all known inputs share one type, assume the unknowns
+/// have it too.
+pub(crate) fn func_select_candidate(
+    inputs: &[PgTypeOid],
+    candidates: &[&[PgTypeOid]],
+    snapshot: &PgCatalog,
+) -> Option<usize> {
+    use crate::coerce::{type_category, type_category_preferred};
+    let nargs = inputs.len();
+    let base: Vec<PgTypeOid> = inputs
+        .iter()
+        .map(|&t| {
+            if t == oid::UNKNOWN {
+                t
+            } else {
+                snapshot.unwrap_domain(t)
+            }
+        })
         .collect();
-    let mut narrowed = matching.clone();
-    for &i in &unknown_slots {
-        let categories: Vec<Option<TypCategory>> = narrowed
-            .iter()
-            .map(|f| {
-                f.proargtypes
-                    .get(i)
-                    .and_then(|&p| snapshot.get_type(p))
-                    .map(|t| t.typcategory)
-            })
-            .collect();
-        if categories.windows(2).any(|w| w[0] != w[1]) {
-            // Candidates disagree on the unknown slot's category — PG's
-            // func_select_candidate returns "multiple" here.
-            return CastMatch::Ambiguous;
-        }
-        let has_preferred = narrowed.iter().any(|f| {
-            f.proargtypes
-                .get(i)
-                .and_then(|&p| snapshot.get_type(p))
-                .is_some_and(|t| t.typispreferred)
-        });
-        if has_preferred {
-            narrowed.retain(|f| {
-                f.proargtypes
-                    .get(i)
-                    .and_then(|&p| snapshot.get_type(p))
-                    .is_some_and(|t| t.typispreferred)
-            });
-        }
-    }
-    if narrowed.len() == 1 {
-        return CastMatch::Match(narrowed[0]);
+    let nunknowns = base.iter().filter(|&&t| t == oid::UNKNOWN).count();
+    let mut live: Vec<usize> = (0..candidates.len()).collect();
+    let keep_best = |live: &mut Vec<usize>, score: &dyn Fn(usize) -> usize| {
+        let best = live.iter().map(|&c| score(c)).max().unwrap_or(0);
+        live.retain(|&c| score(c) == best);
+    };
+
+    // Most exact matches on the known inputs.
+    keep_best(&mut live, &|c| {
+        (0..nargs)
+            .filter(|&i| base[i] != oid::UNKNOWN && candidates[c][i] == base[i])
+            .count()
+    });
+    if let [one] = live[..] {
+        return Some(one);
     }
 
-    // Last-gasp rule: when every *known* argument shares one type, assume
-    // the unknowns are of that type too and look for the single candidate
-    // that accepts it everywhere.
-    let known: Vec<PgTypeOid> = arg_types
-        .iter()
-        .copied()
-        .filter(|&a| a != oid::UNKNOWN)
-        .collect();
-    if let Some(&t) = known.first()
-        && known.iter().all(|&k| k == t)
-    {
-        let assumed: Vec<&PgProc> = narrowed
-            .iter()
-            .filter(|f| {
-                unknown_slots
-                    .iter()
-                    .all(|&i| f.proargtypes.get(i) == Some(&t))
+    // Most exact-or-preferred matches (preferred within the input's own
+    // category) on the known inputs.
+    let slot_category: Vec<Option<TypCategory>> =
+        base.iter().map(|&t| type_category(t, snapshot)).collect();
+    keep_best(&mut live, &|c| {
+        (0..nargs)
+            .filter(|&i| {
+                base[i] != oid::UNKNOWN
+                    && (candidates[c][i] == base[i]
+                        || is_preferred_type(slot_category[i], candidates[c][i], snapshot))
             })
+            .count()
+    });
+    if let [one] = live[..] {
+        return Some(one);
+    }
+    if nunknowns == 0 {
+        return None;
+    }
+
+    // Resolve a category for every unknown position.
+    let mut slots: Vec<(usize, Option<TypCategory>, bool)> = Vec::new();
+    let mut resolved_unknowns = true;
+    for i in (0..nargs).filter(|&i| base[i] == oid::UNKNOWN) {
+        let mut category: Option<Option<TypCategory>> = None;
+        let mut has_preferred = false;
+        let mut conflict = false;
+        for &c in &live {
+            let (cat, preferred) = type_category_preferred(candidates[c][i], snapshot);
+            match category {
+                None => {
+                    category = Some(cat);
+                    has_preferred = preferred;
+                }
+                Some(sc) if sc == cat => has_preferred |= preferred,
+                Some(_) if cat == Some(TypCategory::String) => {
+                    // STRING always wins if available.
+                    category = Some(cat);
+                    has_preferred = preferred;
+                }
+                Some(_) => conflict = true,
+            }
+        }
+        let category = category.flatten();
+        if conflict && category != Some(TypCategory::String) {
+            resolved_unknowns = false;
+            break;
+        }
+        slots.push((i, category, has_preferred));
+    }
+    if resolved_unknowns {
+        let kept: Vec<usize> = live
+            .iter()
             .copied()
+            .filter(|&c| {
+                slots.iter().all(|&(i, category, has_preferred)| {
+                    let (cat, preferred) = type_category_preferred(candidates[c][i], snapshot);
+                    cat == category && (!has_preferred || preferred)
+                })
+            })
             .collect();
-        if assumed.len() == 1 {
-            return CastMatch::Match(assumed[0]);
+        if !kept.is_empty() {
+            live = kept;
+        }
+        if let [one] = live[..] {
+            return Some(one);
         }
     }
-    CastMatch::Ambiguous
+
+    // Last gasp: all known inputs share one type — assume the unknowns
+    // have it too and look for a unique candidate accepting that.
+    if nunknowns < nargs {
+        let mut known = base.iter().copied().filter(|&t| t != oid::UNKNOWN);
+        let first = known.next()?;
+        if known.all(|t| t == first) {
+            let assumed = vec![first; nargs];
+            let mut fits = live
+                .iter()
+                .copied()
+                .filter(|&c| crate::coerce::can_coerce_types(&assumed, candidates[c], snapshot));
+            if let (Some(one), None) = (fits.next(), fits.next()) {
+                return Some(one);
+            }
+        }
+    }
+    None
 }
 
 /// Build the named output-argument list for an SRF / OUT-arg function from
@@ -879,58 +721,6 @@ fn aggregate_final_return(f: &PgProc, snapshot: &PgCatalog) -> Option<PgTypeOid>
     let agg = snapshot.pg_aggregate.get(&f.oid)?;
     let final_oid = agg.aggfinalfn?;
     snapshot.pg_proc.get(&final_oid).map(|p| p.prorettype)
-}
-
-fn make_resolved(f: &PgProc, snapshot: &PgCatalog) -> ResolvedFunction {
-    let agg_final = aggregate_final_return(f, snapshot);
-    ResolvedFunction {
-        return_type_oid: agg_final.unwrap_or(f.prorettype),
-        arg_types: f.proargtypes.clone(),
-        schema: snapshot
-            .namespace_name(f.pronamespace)
-            .map(str::to_owned)
-            .unwrap_or_default(),
-        is_aggregate: matches!(f.prokind, ProKind::Aggregate),
-        is_window: matches!(f.prokind, ProKind::Window),
-        is_strict: f.proisstrict,
-        out_args: build_out_args(f),
-    }
-}
-
-fn make_resolved_polymorphic(
-    f: &PgProc,
-    actual_args: &[PgTypeOid],
-    snapshot: &PgCatalog,
-) -> ResolvedFunction {
-    let mut bindings = PolyBindings::default();
-    for (&expected, &actual) in f.proargtypes.iter().zip(actual_args.iter()) {
-        bind_polymorphic_from(expected, actual, snapshot, &mut bindings);
-    }
-
-    let agg_final = aggregate_final_return(f, snapshot);
-    let return_type_oid =
-        substitute_polymorphic(agg_final.unwrap_or(f.prorettype), &bindings, snapshot);
-    let out_args = build_out_args(f)
-        .into_iter()
-        .map(|field| OutArg {
-            name: field.name,
-            type_oid: substitute_polymorphic(field.type_oid, &bindings, snapshot),
-            not_null: field.not_null,
-        })
-        .collect();
-
-    ResolvedFunction {
-        return_type_oid,
-        arg_types: f.proargtypes.clone(),
-        schema: snapshot
-            .namespace_name(f.pronamespace)
-            .map(str::to_owned)
-            .unwrap_or_default(),
-        is_aggregate: matches!(f.prokind, ProKind::Aggregate),
-        is_window: matches!(f.prokind, ProKind::Window),
-        is_strict: f.proisstrict,
-        out_args,
-    }
 }
 
 pub(crate) fn is_nullable_strict_exception(name: &str) -> bool {

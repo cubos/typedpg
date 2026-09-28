@@ -43,57 +43,37 @@ pub(crate) fn infer_func_call(
     let args = collect_arg_types(func, ctx, params)?;
     let notation = functions::CallNotation::of(func)?;
 
-    // Resolve function with inferred arg types (UNKNOWN treated as wildcard).
-    let resolved = match functions::resolve_function(
+    // Resolve the call (PG's func_get_detail). A single-argument call named
+    // after a type with no exact match may instead be a function-style cast
+    // (FUNCDETAIL_COERCION) — `text(123)`, `pg_catalog."numeric"('1')`;
+    // an untyped literal argument always makes it one.
+    let unknown_const = args.types.first() == Some(&oid::UNKNOWN)
+        && matches!(
+            func.args.first().and_then(|a| a.node.as_ref()),
+            Some(node::Node::AConst(_))
+        );
+    let resolved = match functions::func_get_detail(
         snapshot,
         schema,
         name,
         &args.types,
         &notation,
-        func.agg_star,
+        Some(unknown_const),
         crate::error::SourceSpan::from_node_qname(func.location),
-    ) {
-        Ok(r) => r,
-        Err(e) => {
-            // PG's function-call-as-cast rule (func_get_detail →
-            // FUNCDETAIL_COERCION): a single-argument call whose name is a
-            // type name, with no matching function and a legal explicit
-            // cast path, is a cast — `float8(x)`, `text(123)`,
-            // `pg_catalog."numeric"(v)`. Modifier syntax (OVER, DISTINCT,
-            // FILTER, …) and named notation rule the interpretation out.
-            if func.args.len() == 1
-                && notation.names.is_empty()
-                && func.over.is_none()
-                && !func.agg_star
-                && !func.agg_distinct
-                && !func.agg_within_group
-                && func.agg_filter.is_none()
-                && func.agg_order.is_empty()
-                && let Some(te) = snapshot.resolve_type_by_name(schema, name)
-                && crate::coerce::can_cast_explicit(args.types[0], te.oid, snapshot)
+    )? {
+        functions::FuncDetail::Routine(r) => r,
+        functions::FuncDetail::Coercion(target) => {
+            // Same literal-content validation an explicit cast performs.
+            if let Some(node::Node::AConst(ac)) = func.args[0].node.as_ref()
+                && !ac.isnull
+                && let Some(pg_query::protobuf::a_const::Val::Sval(sv)) = &ac.val
+                && let Err(msg) = crate::literal_input::validate(&sv.sval, target, snapshot)
             {
-                let target = te.oid;
-                // Same literal-content validation an explicit cast performs.
-                if let Some(node::Node::AConst(ac)) = func.args[0].node.as_ref()
-                    && !ac.isnull
-                    && let Some(pg_query::protobuf::a_const::Val::Sval(sv)) = &ac.val
-                    && let Err(msg) = crate::literal_input::validate(&sv.sval, target, snapshot)
-                {
-                    let span = crate::error::node_location(&func.args[0])
-                        .and_then(crate::error::SourceSpan::from_node_token);
-                    return Err(
-                        crate::error::RawError::invalid_literal(msg, span).finalize_implicit()
-                    );
-                }
-                // A bare `$N` argument adopts the cast target, like `$N::T`.
-                if let Some(node::Node::ParamRef(p)) = func.args[0].node.as_ref()
-                    && params.get(p.number) == oid::UNKNOWN
-                {
-                    params.record(p.number, target);
-                }
-                return Ok(ExprType::scalar(target, args.nullable[0]));
+                let span = crate::error::node_location(&func.args[0])
+                    .and_then(crate::error::SourceSpan::from_node_token);
+                return Err(crate::error::RawError::invalid_literal(msg, span).finalize_implicit());
             }
-            return Err(e);
+            return Ok(ExprType::scalar(target, args.nullable[0]));
         }
     };
 

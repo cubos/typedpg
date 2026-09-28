@@ -51,6 +51,11 @@ pub enum AnalyzeError {
     #[error("{0}")]
     UndefinedObject(String),
 
+    /// A schema qualifier names no existing schema (`nosuchschema.f(1)`).
+    /// Equivalent to PG `invalid_schema_name` (SQLSTATE 3F000).
+    #[error("{0}")]
+    UndefinedSchema(String),
+
     /// An object of the wrong kind was used: a procedure called in an
     /// expression, `OVER` on a plain function, a window function without
     /// `OVER`. Equivalent to PG `wrong_object_type` (SQLSTATE 42809).
@@ -218,6 +223,7 @@ impl AnalyzeError {
             UndefinedColumn(_) => Some("42703"),
             AmbiguousColumn(_) => Some("42702"),
             UndefinedType(_) | UndefinedObject(_) => Some("42704"),
+            UndefinedSchema(_) => Some("3F000"),
             UndefinedFunction(_) | UndefinedOperator(_) => Some("42883"),
             AmbiguousFunction(_) => Some("42725"),
             WrongObjectType(_) => Some("42809"),

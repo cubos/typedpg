@@ -1,11 +1,15 @@
 //! PostgreSQL polymorphic pseudo-type handling (`anyelement`,
-//! `anyarray`, `anyrange`, `anycompatible`, …): matching actual args
-//! against a pseudo-type, binding the concrete types implied by a call,
-//! and substituting them back into a result type.
+//! `anyarray`, `anyrange`, `anycompatible`, …): PG's
+//! `check_generic_type_consistency` (does a candidate's set of polymorphic
+//! parameters accept the call's actual types?) and
+//! `enforce_generic_type_consistency` (resolve them to concrete types, or
+//! fail), both from parse_coerce.c.
 //!
 //! Shared by both function resolution ([`crate::functions`]) and operator
 //! resolution ([`crate::lookup`]) — PG applies the same rules to both.
 
+use crate::coerce::{element_type, select_common_type_from_oids, verify_common_type_from_oids};
+use crate::error::AnalyzeError;
 use crate::oid::PgTypeOid;
 use crate::pg_catalog::{PgCatalog, TypCategory, TypType, oid};
 
@@ -43,54 +47,6 @@ pub(crate) fn variadic_element_type(
     }
 }
 
-/// The concrete types a polymorphic call binds, one slot per pseudo-type
-/// family. Binding any slot derives the related ones where the catalog
-/// knows the relation (array → element, range → subtype element,
-/// multirange → range → element), mirroring PG's
-/// `enforce_generic_type_consistency`.
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct PolyBindings {
-    pub element: Option<PgTypeOid>,
-    pub array: Option<PgTypeOid>,
-    pub range: Option<PgTypeOid>,
-    pub multirange: Option<PgTypeOid>,
-}
-
-/// Is `expected` a polymorphic pseudo-type that PG would accept `actual` for?
-pub(crate) fn matches_polymorphic(
-    expected: PgTypeOid,
-    actual: PgTypeOid,
-    snapshot: &PgCatalog,
-) -> bool {
-    const INT2VECTOR: PgTypeOid = PgTypeOid::from_raw(22);
-    const OIDVECTOR: PgTypeOid = PgTypeOid::from_raw(30);
-
-    let actual_is_array = matches!(
-        snapshot.get_type(actual).map(|t| t.typcategory),
-        Some(TypCategory::Array)
-    ) || actual == INT2VECTOR
-        || actual == OIDVECTOR;
-
-    match expected {
-        ANYELEMENT | ANYCOMPATIBLE => true,
-        ANYARRAY | ANYCOMPATIBLEARRAY => actual_is_array,
-        ANYNONARRAY | ANYCOMPATIBLENONARRAY => !actual_is_array,
-        ANYENUM => matches!(
-            snapshot.get_type(actual).map(|t| t.typtype),
-            Some(TypType::Enum)
-        ),
-        ANYRANGE | ANYCOMPATIBLERANGE => matches!(
-            snapshot.get_type(actual).map(|t| t.typtype),
-            Some(TypType::Range)
-        ),
-        ANYMULTIRANGE | ANYCOMPATIBLEMULTIRANGE => matches!(
-            snapshot.get_type(actual).map(|t| t.typtype),
-            Some(TypType::Multirange)
-        ),
-        _ => false,
-    }
-}
-
 pub(crate) fn is_polymorphic(oid: PgTypeOid) -> bool {
     matches!(
         oid,
@@ -108,130 +64,638 @@ pub(crate) fn is_polymorphic(oid: PgTypeOid) -> bool {
     )
 }
 
-pub(crate) fn polymorphic_specificity(oid: PgTypeOid) -> u8 {
-    match oid {
-        ANYELEMENT | ANYCOMPATIBLE => 1,
-        ANYARRAY | ANYNONARRAY | ANYCOMPATIBLEARRAY | ANYCOMPATIBLENONARRAY => 2,
-        ANYENUM | ANYRANGE | ANYMULTIRANGE | ANYCOMPATIBLERANGE | ANYCOMPATIBLEMULTIRANGE => 3,
-        _ => 10,
-    }
+/// PG's `type_is_array_domain`: an array, or a domain over one.
+fn type_is_array_domain(t: PgTypeOid, snapshot: &PgCatalog) -> bool {
+    element_type(snapshot.unwrap_domain(t), snapshot).is_some()
 }
 
-pub(crate) fn bind_polymorphic_from(
-    expected: PgTypeOid,
-    actual: PgTypeOid,
-    snapshot: &PgCatalog,
-    bindings: &mut PolyBindings,
-) {
-    // PG (`enforce_generic_type_consistency`) skips UNKNOWN actuals when
-    // unifying polymorphic args — the unknown is coerced to the resolved
-    // polymorphic type *after* binding, so letting it land as the bound
-    // type would freeze the resolution at UNKNOWN and propagate to the
-    // other side (e.g. `'admin'::unknown = role::user_role` would resolve
-    // both anyenum slots to UNKNOWN instead of `user_role`).
-    if actual == oid::UNKNOWN {
-        return;
-    }
-    match expected {
-        ANYELEMENT | ANYNONARRAY | ANYENUM | ANYCOMPATIBLE | ANYCOMPATIBLENONARRAY => {
-            bindings.element.get_or_insert(actual);
-        }
-        ANYARRAY | ANYCOMPATIBLEARRAY => {
-            bindings.array.get_or_insert(actual);
-            if let Some(t) = snapshot.get_type(actual)
-                && t.typcategory == TypCategory::Array
-                && let Some(elem) = t.typelem
-            {
-                bindings.element.get_or_insert(elem);
-            }
-        }
-        ANYRANGE | ANYCOMPATIBLERANGE => {
-            bindings.range.get_or_insert(actual);
-            if let Some(sub) = snapshot.range_subtype(actual) {
-                bindings.element.get_or_insert(sub);
-            }
-        }
-        ANYMULTIRANGE | ANYCOMPATIBLEMULTIRANGE => {
-            bindings.multirange.get_or_insert(actual);
-            if let Some(r) = snapshot.range_of_multirange(actual) {
-                bindings.range.get_or_insert(r);
-                if let Some(sub) = snapshot.range_subtype(r) {
-                    bindings.element.get_or_insert(sub);
-                }
-            }
-        }
-        _ => {}
-    }
+/// PG's `type_is_enum` (a domain over an enum is *not* an enum).
+fn type_is_enum(t: PgTypeOid, snapshot: &PgCatalog) -> bool {
+    snapshot
+        .get_type(t)
+        .is_some_and(|ty| ty.typtype == TypType::Enum)
 }
 
-pub(crate) fn substitute_polymorphic(
-    oid: PgTypeOid,
-    bindings: &PolyBindings,
-    snapshot: &PgCatalog,
-) -> PgTypeOid {
-    match oid {
-        ANYELEMENT | ANYNONARRAY | ANYENUM | ANYCOMPATIBLE | ANYCOMPATIBLENONARRAY => {
-            bindings.element.unwrap_or(oid)
-        }
-        ANYARRAY | ANYCOMPATIBLEARRAY => bindings
-            .array
-            .or_else(|| bindings.element.and_then(|e| snapshot.array_type_of(e)))
-            .unwrap_or(oid),
-        ANYRANGE | ANYCOMPATIBLERANGE => bindings.range.unwrap_or(oid),
-        ANYMULTIRANGE | ANYCOMPATIBLEMULTIRANGE => bindings
-            .multirange
-            .or_else(|| bindings.range.and_then(|r| snapshot.multirange_of_range(r)))
-            .unwrap_or(oid),
-        _ => oid,
-    }
-}
-
-/// PG's `enforce_generic_type_consistency` for the strict (non-
-/// `anycompatible`) family: once the call's bindings are known, a
-/// *concrete* actual at a polymorphic position must be the resolved type
-/// itself or implicitly castable to it. This is what rejects
-/// `tstzrange @> 1` (anyelement resolves to `timestamptz`, no implicit
-/// `integer` cast) while keeping `array_position(int8[], int4)` (implicit
-/// int4 → int8). The `anycompatible*` family instead promotes through
-/// `select_common_type` and is not checked here. UNKNOWN actuals are
-/// always consistent — they're coerced to the resolved type afterwards.
-fn binding_consistent(
-    expected: PgTypeOid,
-    actual: PgTypeOid,
-    bindings: &PolyBindings,
+/// PG's `check_generic_type_consistency` (parse_coerce.c): do the call's
+/// actual types satisfy the candidate's polymorphic parameters *jointly*?
+/// Family-1 (`anyelement`, `anyarray`, `anyrange`, …) positions must agree
+/// on one element type exactly — no implicit casts; family-2
+/// (`anycompatible*`) positions must have a common supertype every input
+/// casts to. Unknown actuals impose nothing, but an `anyenum` that only
+/// sees unknowns fails (no element type is an enum).
+pub(crate) fn check_generic_type_consistency(
+    actuals: &[PgTypeOid],
+    declared: &[PgTypeOid],
     snapshot: &PgCatalog,
 ) -> bool {
-    if actual == oid::UNKNOWN {
-        return true;
-    }
-    match expected {
-        ANYELEMENT | ANYNONARRAY | ANYENUM | ANYARRAY | ANYRANGE | ANYMULTIRANGE => {
-            let resolved = substitute_polymorphic(expected, bindings, snapshot);
-            resolved == actual
-                || (resolved != expected && snapshot.has_implicit_cast(actual, resolved))
+    let base = |t: PgTypeOid| snapshot.unwrap_domain(t);
+    let mut elem: Option<PgTypeOid> = None;
+    let mut array: Option<PgTypeOid> = None;
+    let mut range: Option<PgTypeOid> = None;
+    let mut multirange: Option<PgTypeOid> = None;
+    let mut compat_range: Option<(PgTypeOid, PgTypeOid)> = None;
+    let mut compat_multirange: Option<(PgTypeOid, PgTypeOid)> = None;
+    let mut have_anynonarray = false;
+    let mut have_anyenum = false;
+    let mut have_compat_nonarray = false;
+    let mut compat_actuals: Vec<PgTypeOid> = Vec::new();
+
+    // Record `actual` into a same-type-only slot.
+    fn same(slot: &mut Option<PgTypeOid>, actual: PgTypeOid) -> bool {
+        match *slot {
+            Some(s) if s != actual => false,
+            _ => {
+                *slot = Some(actual);
+                true
+            }
         }
-        _ => true,
+    }
+
+    for (&decl, &actual) in declared.iter().zip(actuals) {
+        match decl {
+            ANYELEMENT | ANYNONARRAY | ANYENUM => {
+                have_anynonarray |= decl == ANYNONARRAY;
+                have_anyenum |= decl == ANYENUM;
+                if actual != oid::UNKNOWN && !same(&mut elem, actual) {
+                    return false;
+                }
+            }
+            ANYARRAY if actual != oid::UNKNOWN => {
+                if !same(&mut array, base(actual)) {
+                    return false;
+                }
+            }
+            ANYRANGE if actual != oid::UNKNOWN => {
+                if !same(&mut range, base(actual)) {
+                    return false;
+                }
+            }
+            ANYMULTIRANGE if actual != oid::UNKNOWN => {
+                if !same(&mut multirange, base(actual)) {
+                    return false;
+                }
+            }
+            ANYCOMPATIBLE | ANYCOMPATIBLENONARRAY => {
+                have_compat_nonarray |= decl == ANYCOMPATIBLENONARRAY;
+                if actual != oid::UNKNOWN {
+                    compat_actuals.push(actual);
+                }
+            }
+            ANYCOMPATIBLEARRAY if actual != oid::UNKNOWN => {
+                let Some(e) = element_type(base(actual), snapshot) else {
+                    return false;
+                };
+                compat_actuals.push(e);
+            }
+            ANYCOMPATIBLERANGE if actual != oid::UNKNOWN => {
+                let actual = base(actual);
+                match compat_range {
+                    Some((r, _)) if r != actual => return false,
+                    Some(_) => {}
+                    None => {
+                        let Some(sub) = snapshot.range_subtype(actual) else {
+                            return false;
+                        };
+                        compat_range = Some((actual, sub));
+                        compat_actuals.push(sub);
+                    }
+                }
+            }
+            ANYCOMPATIBLEMULTIRANGE if actual != oid::UNKNOWN => {
+                let actual = base(actual);
+                match compat_multirange {
+                    Some((m, _)) if m != actual => return false,
+                    Some(_) => {}
+                    None => {
+                        let Some(r) = snapshot.range_of_multirange(actual) else {
+                            return false;
+                        };
+                        compat_multirange = Some((actual, r));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(a) = array
+        && a != ANYARRAY
+    {
+        let Some(ae) = element_type(a, snapshot) else {
+            return false;
+        };
+        if !same(&mut elem, ae) {
+            return false;
+        }
+    }
+    if let Some(m) = multirange {
+        let Some(mr) = snapshot.range_of_multirange(m) else {
+            return false;
+        };
+        match range {
+            None => {
+                if snapshot.range_subtype(mr).is_none() {
+                    return false;
+                }
+                range = Some(mr);
+            }
+            Some(r) if r != mr => return false,
+            Some(_) => {}
+        }
+    }
+    if let Some(r) = range {
+        let Some(sub) = snapshot.range_subtype(r) else {
+            return false;
+        };
+        if !same(&mut elem, sub) {
+            return false;
+        }
+    }
+    if have_anynonarray && elem.is_some_and(|e| type_is_array_domain(e, snapshot)) {
+        return false;
+    }
+    if have_anyenum && !elem.is_some_and(|e| type_is_enum(e, snapshot)) {
+        return false;
+    }
+
+    if let Some((_, mr)) = compat_multirange {
+        match compat_range {
+            Some((r, _)) if r != mr => return false,
+            Some(_) => {}
+            None => {
+                let Some(sub) = snapshot.range_subtype(mr) else {
+                    return false;
+                };
+                compat_range = Some((mr, sub));
+                compat_actuals.push(sub);
+            }
+        }
+    }
+    if !compat_actuals.is_empty() {
+        let Some(common) = select_common_type_from_oids(&compat_actuals, snapshot) else {
+            return false;
+        };
+        if !verify_common_type_from_oids(common, &compat_actuals, snapshot) {
+            return false;
+        }
+        if have_compat_nonarray && type_is_array_domain(common, snapshot) {
+            return false;
+        }
+        if let Some((_, sub)) = compat_range
+            && sub != common
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// The concrete types a call's polymorphic parameters resolved to, one
+/// per pseudo-type (as `enforce_generic_type_consistency` settles them).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct PolyTypes {
+    elem: Option<PgTypeOid>,
+    array: Option<PgTypeOid>,
+    range: Option<PgTypeOid>,
+    multirange: Option<PgTypeOid>,
+    compat: Option<PgTypeOid>,
+    compat_array: Option<PgTypeOid>,
+    compat_range: Option<PgTypeOid>,
+    compat_multirange: Option<PgTypeOid>,
+}
+
+impl PolyTypes {
+    /// `t` with a polymorphic pseudo-type replaced by what it resolved to
+    /// (derived on demand: `anyarray` from the element, `anymultirange`
+    /// from the range, …). Returns `t` itself when it isn't polymorphic or
+    /// its family wasn't bound — PG's `resolve_polymorphic_tupdesc` leaves
+    /// such an OUT column as the pseudo-type too.
+    pub(crate) fn resolve(&self, t: PgTypeOid, snapshot: &PgCatalog) -> PgTypeOid {
+        let r = match t {
+            ANYELEMENT | ANYNONARRAY | ANYENUM => self.elem,
+            ANYARRAY => self
+                .array
+                .or_else(|| self.elem.and_then(|e| snapshot.array_type_of(e))),
+            ANYRANGE => self.range,
+            ANYMULTIRANGE => self
+                .multirange
+                .or_else(|| self.range.and_then(|r| snapshot.multirange_of_range(r))),
+            ANYCOMPATIBLE | ANYCOMPATIBLENONARRAY => self.compat,
+            ANYCOMPATIBLEARRAY => self
+                .compat_array
+                .or_else(|| self.compat.and_then(|e| snapshot.array_type_of(e))),
+            ANYCOMPATIBLERANGE => self.compat_range,
+            ANYCOMPATIBLEMULTIRANGE => self.compat_multirange.or_else(|| {
+                self.compat_range
+                    .and_then(|r| snapshot.multirange_of_range(r))
+            }),
+            _ => None,
+        };
+        r.unwrap_or(t)
     }
 }
 
-/// Bind every polymorphic position of a call and verify the strict-family
-/// consistency rule across all of them. Returns the bindings on success,
-/// `None` when some concrete actual contradicts the resolution.
-pub(crate) fn unify_polymorphic_call(
-    declared: &[PgTypeOid],
+/// PG's `enforce_generic_type_consistency` (parse_coerce.c, with
+/// `allow_poly = false` as `ParseFuncOrColumn`/`make_op` call it): once a
+/// candidate is chosen, resolve its polymorphic parameters from the actual
+/// argument types, rewriting `declared` in place to the concrete coercion
+/// targets (unknown actuals included — that is what types a bare `$1` in a
+/// polymorphic slot), and return the concrete result type. Fails with PG's
+/// wording when the actuals conflict or leave a family unresolvable (all
+/// inputs `unknown`).
+///
+/// `declared` may be longer than `actuals` (parameters filled in from
+/// defaults); those trailing positions contribute no actual type.
+pub(crate) fn enforce_generic_type_consistency(
     actuals: &[PgTypeOid],
+    declared: &mut [PgTypeOid],
+    rettype: PgTypeOid,
     snapshot: &PgCatalog,
-) -> Option<PolyBindings> {
-    let mut bindings = PolyBindings::default();
-    for (&expected, &actual) in declared.iter().zip(actuals.iter()) {
-        if is_polymorphic(expected) {
-            bind_polymorphic_from(expected, actual, snapshot, &mut bindings);
+) -> Result<(PgTypeOid, PolyTypes), AnalyzeError> {
+    use crate::pgmsg;
+    let fmt = |t: PgTypeOid| crate::ddl::util::format_type_for_message(snapshot, t);
+    let base = |t: PgTypeOid| snapshot.unwrap_domain(t);
+
+    let mut p = PolyTypes::default();
+    let mut have_poly_anycompatible = false;
+    let mut have_poly_unknowns = false;
+    let mut have_anynonarray = rettype == ANYNONARRAY;
+    let mut have_anyenum = rettype == ANYENUM;
+    let have_anymultirange = rettype == ANYMULTIRANGE;
+    let mut have_compat_nonarray = rettype == ANYCOMPATIBLENONARRAY;
+    let mut have_compat_array = rettype == ANYCOMPATIBLEARRAY;
+    let mut have_compat_range = rettype == ANYCOMPATIBLERANGE;
+    let mut have_compat_multirange = rettype == ANYCOMPATIBLEMULTIRANGE;
+    let mut n_poly_args = 0usize;
+    let mut compat_actuals: Vec<PgTypeOid> = Vec::new();
+    let mut compat_range_elem: Option<PgTypeOid> = None;
+    let mut compat_multirange_range: Option<PgTypeOid> = None;
+
+    // A same-type-only slot of the family-1 resolution.
+    let alike = |slot: &mut Option<PgTypeOid>, actual: PgTypeOid, name: &str| {
+        match *slot {
+            Some(s) if s != actual => return Err(pgmsg::polymorphic_args_not_alike(name)),
+            _ => *slot = Some(actual),
+        }
+        Ok(())
+    };
+
+    for (&decl, &actual) in declared.iter().zip(actuals) {
+        match decl {
+            ANYELEMENT | ANYNONARRAY | ANYENUM => {
+                n_poly_args += 1;
+                have_anynonarray |= decl == ANYNONARRAY;
+                have_anyenum |= decl == ANYENUM;
+                if actual == oid::UNKNOWN {
+                    have_poly_unknowns = true;
+                    continue;
+                }
+                alike(&mut p.elem, actual, "anyelement")?;
+            }
+            ANYARRAY | ANYRANGE | ANYMULTIRANGE => {
+                n_poly_args += 1;
+                if actual == oid::UNKNOWN {
+                    have_poly_unknowns = true;
+                    continue;
+                }
+                let (slot, name) = match decl {
+                    ANYARRAY => (&mut p.array, "anyarray"),
+                    ANYRANGE => (&mut p.range, "anyrange"),
+                    _ => (&mut p.multirange, "anymultirange"),
+                };
+                alike(slot, base(actual), name)?;
+            }
+            ANYCOMPATIBLE | ANYCOMPATIBLENONARRAY => {
+                have_poly_anycompatible = true;
+                have_compat_nonarray |= decl == ANYCOMPATIBLENONARRAY;
+                if actual != oid::UNKNOWN {
+                    compat_actuals.push(actual);
+                }
+            }
+            ANYCOMPATIBLEARRAY => {
+                have_poly_anycompatible = true;
+                have_compat_array = true;
+                if actual == oid::UNKNOWN {
+                    continue;
+                }
+                let actual = base(actual);
+                let Some(e) = element_type(actual, snapshot) else {
+                    return Err(pgmsg::polymorphic_arg_wrong_kind(
+                        "anycompatiblearray",
+                        "an array",
+                        &fmt(actual),
+                    ));
+                };
+                compat_actuals.push(e);
+            }
+            ANYCOMPATIBLERANGE => {
+                have_poly_anycompatible = true;
+                have_compat_range = true;
+                if actual == oid::UNKNOWN {
+                    continue;
+                }
+                let actual = base(actual);
+                match p.compat_range {
+                    Some(r) if r != actual => {
+                        return Err(pgmsg::polymorphic_args_not_alike("anycompatiblerange"));
+                    }
+                    Some(_) => {}
+                    None => {
+                        let Some(sub) = snapshot.range_subtype(actual) else {
+                            return Err(pgmsg::polymorphic_arg_wrong_kind(
+                                "anycompatiblerange",
+                                "a range type",
+                                &fmt(actual),
+                            ));
+                        };
+                        p.compat_range = Some(actual);
+                        compat_range_elem = Some(sub);
+                        compat_actuals.push(sub);
+                    }
+                }
+            }
+            ANYCOMPATIBLEMULTIRANGE => {
+                have_poly_anycompatible = true;
+                have_compat_multirange = true;
+                if actual == oid::UNKNOWN {
+                    continue;
+                }
+                let actual = base(actual);
+                match p.compat_multirange {
+                    Some(m) if m != actual => {
+                        return Err(pgmsg::polymorphic_args_not_alike("anycompatiblemultirange"));
+                    }
+                    Some(_) => {}
+                    None => {
+                        let Some(r) = snapshot.range_of_multirange(actual) else {
+                            return Err(pgmsg::polymorphic_arg_wrong_kind(
+                                "anycompatiblemultirange",
+                                "a multirange type",
+                                &fmt(actual),
+                            ));
+                        };
+                        p.compat_multirange = Some(actual);
+                        compat_multirange_range = Some(r);
+                    }
+                }
+            }
+            _ => {}
         }
     }
-    for (&expected, &actual) in declared.iter().zip(actuals.iter()) {
-        if is_polymorphic(expected) && !binding_consistent(expected, actual, &bindings, snapshot) {
-            return None;
+
+    // Fast track: no polymorphic arguments, so nothing to resolve.
+    if n_poly_args == 0 && !have_poly_anycompatible {
+        return Ok((rettype, p));
+    }
+
+    if n_poly_args > 0 {
+        if let Some(a) = p.array {
+            let elem = if a == ANYARRAY {
+                // An `anyarray` actual (e.g. `pg_stats.most_common_vals`)
+                // is only usable when nothing else needs its element type.
+                if n_poly_args != 1 || (rettype != ANYARRAY && is_family1(rettype)) {
+                    return Err(pgmsg::anyarray_element_undetermined());
+                }
+                ANYELEMENT
+            } else {
+                element_type(a, snapshot).ok_or_else(|| {
+                    pgmsg::polymorphic_arg_wrong_kind("anyarray", "an array", &fmt(a))
+                })?
+            };
+            match p.elem {
+                None => p.elem = Some(elem),
+                Some(e) if e != elem => {
+                    return Err(pgmsg::polymorphic_args_inconsistent(
+                        "anyarray",
+                        "anyelement",
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+        if let Some(m) = p.multirange {
+            let mr = snapshot.range_of_multirange(m).ok_or_else(|| {
+                pgmsg::polymorphic_arg_wrong_kind("anymultirange", "a multirange type", &fmt(m))
+            })?;
+            match p.range {
+                None => p.range = Some(mr),
+                Some(r) if r != mr => {
+                    return Err(pgmsg::polymorphic_args_inconsistent(
+                        "anymultirange",
+                        "anyrange",
+                    ));
+                }
+                Some(_) => {}
+            }
+        } else if have_anymultirange && let Some(r) = p.range {
+            p.multirange = snapshot.multirange_of_range(r);
+        }
+        if let Some(r) = p.range {
+            let sub = snapshot.range_subtype(r).ok_or_else(|| {
+                pgmsg::polymorphic_arg_wrong_kind("anyrange", "a range type", &fmt(r))
+            })?;
+            match p.elem {
+                None => p.elem = Some(sub),
+                Some(e) if e != sub => {
+                    return Err(pgmsg::polymorphic_args_inconsistent(
+                        "anyrange",
+                        "anyelement",
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+        // Only reachable when every family-1 argument is unknown.
+        let Some(elem) = p.elem else {
+            return Err(pgmsg::polymorphic_type_from_unknown(None));
+        };
+        if have_anynonarray && elem != ANYELEMENT && type_is_array_domain(elem, snapshot) {
+            return Err(pgmsg::polymorphic_match_wrong_kind(
+                "anynonarray",
+                "is an array type",
+                &fmt(elem),
+            ));
+        }
+        if have_anyenum && elem != ANYELEMENT && !type_is_enum(elem, snapshot) {
+            return Err(pgmsg::polymorphic_match_wrong_kind(
+                "anyenum",
+                "is not an enum type",
+                &fmt(elem),
+            ));
         }
     }
-    Some(bindings)
+
+    if have_poly_anycompatible {
+        if let Some(mr) = compat_multirange_range {
+            match p.compat_range {
+                Some(r) if r != mr => {
+                    return Err(pgmsg::polymorphic_args_inconsistent(
+                        "anycompatiblemultirange",
+                        "anycompatiblerange",
+                    ));
+                }
+                Some(_) => {}
+                None => {
+                    let sub = snapshot.range_subtype(mr).ok_or_else(|| {
+                        pgmsg::polymorphic_arg_wrong_kind(
+                            "anycompatiblemultirange",
+                            "a multirange type",
+                            &fmt(mr),
+                        )
+                    })?;
+                    p.compat_range = Some(mr);
+                    compat_range_elem = Some(sub);
+                    compat_actuals.push(sub);
+                }
+            }
+        } else if have_compat_multirange && let Some(r) = p.compat_range {
+            p.compat_multirange = snapshot.multirange_of_range(r);
+        }
+
+        if !compat_actuals.is_empty() {
+            let common = select_common_type_from_oids(&compat_actuals, snapshot)
+                .filter(|&c| verify_common_type_from_oids(c, &compat_actuals, snapshot))
+                .ok_or_else(pgmsg::anycompatible_no_common_type)?;
+            if have_compat_array {
+                p.compat_array = Some(
+                    snapshot
+                        .array_type_of(common)
+                        .ok_or_else(|| pgmsg::no_array_type_for(&fmt(common)))?,
+                );
+            }
+            if have_compat_range {
+                let Some(r) = p.compat_range else {
+                    return Err(pgmsg::polymorphic_type_from_unknown(Some(
+                        "anycompatiblerange",
+                    )));
+                };
+                if compat_range_elem != Some(common) {
+                    return Err(pgmsg::anycompatible_range_mismatch(
+                        "anycompatiblerange",
+                        &fmt(r),
+                        &fmt(common),
+                    ));
+                }
+            }
+            if have_compat_multirange {
+                let Some(m) = p.compat_multirange else {
+                    return Err(pgmsg::polymorphic_type_from_unknown(Some(
+                        "anycompatiblemultirange",
+                    )));
+                };
+                if compat_range_elem != Some(common) {
+                    return Err(pgmsg::anycompatible_range_mismatch(
+                        "anycompatiblemultirange",
+                        &fmt(m),
+                        &fmt(common),
+                    ));
+                }
+            }
+            if have_compat_nonarray && type_is_array_domain(common, snapshot) {
+                return Err(pgmsg::polymorphic_match_wrong_kind(
+                    "anycompatiblenonarray",
+                    "is an array type",
+                    &fmt(common),
+                ));
+            }
+            p.compat = Some(common);
+        } else {
+            // All family-2 inputs are unknown: resolve to text, like
+            // `select_common_type` — which doesn't license a text range.
+            if have_compat_range {
+                return Err(pgmsg::polymorphic_type_from_unknown(Some(
+                    "anycompatiblerange",
+                )));
+            }
+            if have_compat_multirange {
+                return Err(pgmsg::polymorphic_type_from_unknown(Some(
+                    "anycompatiblemultirange",
+                )));
+            }
+            p.compat = Some(oid::TEXT);
+            p.compat_array = snapshot.array_type_of(oid::TEXT);
+        }
+        for d in declared.iter_mut() {
+            if matches!(
+                *d,
+                ANYCOMPATIBLE
+                    | ANYCOMPATIBLENONARRAY
+                    | ANYCOMPATIBLEARRAY
+                    | ANYCOMPATIBLERANGE
+                    | ANYCOMPATIBLEMULTIRANGE
+            ) {
+                *d = p.resolve(*d, snapshot);
+            }
+        }
+    }
+
+    // Unknown actuals in family-1 positions adopt the resolved types.
+    if have_poly_unknowns {
+        for (d, &actual) in declared.iter_mut().zip(actuals) {
+            if actual != oid::UNKNOWN {
+                continue;
+            }
+            match *d {
+                ANYELEMENT | ANYNONARRAY | ANYENUM => *d = p.elem.unwrap_or(*d),
+                ANYARRAY => {
+                    if p.array.is_none() {
+                        let elem = p.elem.unwrap_or(ANYELEMENT);
+                        p.array = Some(
+                            snapshot
+                                .array_type_of(elem)
+                                .ok_or_else(|| pgmsg::no_array_type_for(&fmt(elem)))?,
+                        );
+                    }
+                    *d = p.array.unwrap_or(*d);
+                }
+                ANYRANGE => {
+                    *d = p
+                        .range
+                        .ok_or_else(|| pgmsg::polymorphic_type_from_unknown(Some("anyrange")))?;
+                }
+                ANYMULTIRANGE => {
+                    *d = p.multirange.ok_or_else(|| {
+                        pgmsg::polymorphic_type_from_unknown(Some("anymultirange"))
+                    })?;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // The result type.
+    let ret = match rettype {
+        ANYARRAY if p.array.is_none() => {
+            let elem = p.elem.unwrap_or(ANYELEMENT);
+            let a = snapshot
+                .array_type_of(elem)
+                .ok_or_else(|| pgmsg::no_array_type_for(&fmt(elem)))?;
+            p.array = Some(a);
+            a
+        }
+        ANYCOMPATIBLEARRAY if p.compat_array.is_none() => {
+            let elem = p.compat.unwrap_or(ANYCOMPATIBLE);
+            let a = snapshot
+                .array_type_of(elem)
+                .ok_or_else(|| pgmsg::no_array_type_for(&fmt(elem)))?;
+            p.compat_array = Some(a);
+            a
+        }
+        ANYRANGE if p.range.is_none() => {
+            return Err(pgmsg::polymorphic_type_from_unknown(Some("anyrange")));
+        }
+        ANYMULTIRANGE if p.multirange.is_none() => {
+            return Err(pgmsg::polymorphic_type_from_unknown(Some("anymultirange")));
+        }
+        t => p.resolve(t, snapshot),
+    };
+    Ok((ret, p))
+}
+
+/// PG's `IsPolymorphicTypeFamily1`.
+fn is_family1(t: PgTypeOid) -> bool {
+    matches!(
+        t,
+        ANYELEMENT | ANYARRAY | ANYNONARRAY | ANYENUM | ANYRANGE | ANYMULTIRANGE
+    )
 }

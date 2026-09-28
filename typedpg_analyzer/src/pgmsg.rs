@@ -267,6 +267,94 @@ pub(crate) fn recursive_query_column_type(
     )
 }
 
+/// `schema "s" does not exist` — SQLSTATE 3F000 (`invalid_schema_name`):
+/// a qualified function/operator name whose schema is missing.
+pub(crate) fn schema_does_not_exist(schema: &str, span: Option<SourceSpan>) -> RawError {
+    RawError::new(
+        AnalyzeError::UndefinedSchema(format!("schema \"{schema}\" does not exist")),
+        span,
+        None,
+    )
+}
+
+/// `VARIADIC argument must be an array` — SQLSTATE 42804: an explicit
+/// `VARIADIC` argument to a `VARIADIC "any"` function that isn't an array.
+pub(crate) fn variadic_argument_must_be_array(span: Option<SourceSpan>) -> RawError {
+    RawError::new(
+        AnalyzeError::DatatypeMismatch("VARIADIC argument must be an array".into()),
+        span,
+        None,
+    )
+}
+
+// ── Polymorphic argument resolution (`enforce_generic_type_consistency`) ──
+// Every message below is SQLSTATE 42804 (`datatype_mismatch`).
+
+/// `could not determine polymorphic type because input has type unknown`,
+/// or with a family name (`… polymorphic type anycompatiblerange because
+/// …`) for the families that can't fall back to `text`.
+pub(crate) fn polymorphic_type_from_unknown(family: Option<&str>) -> AnalyzeError {
+    AnalyzeError::DatatypeMismatch(match family {
+        None => "could not determine polymorphic type because input has type unknown".into(),
+        Some(f) => {
+            format!("could not determine polymorphic type {f} because input has type unknown")
+        }
+    })
+}
+
+/// `arguments declared "anyelement" are not all alike`.
+pub(crate) fn polymorphic_args_not_alike(declared: &str) -> AnalyzeError {
+    AnalyzeError::DatatypeMismatch(format!(
+        "arguments declared \"{declared}\" are not all alike"
+    ))
+}
+
+/// `argument declared anyarray is not consistent with argument declared
+/// anyelement`.
+pub(crate) fn polymorphic_args_inconsistent(declared: &str, other: &str) -> AnalyzeError {
+    AnalyzeError::DatatypeMismatch(format!(
+        "argument declared {declared} is not consistent with argument declared {other}"
+    ))
+}
+
+/// `argument declared anyarray is not an array but type integer` (`kind`
+/// is `an array`, `a range type` or `a multirange type`).
+pub(crate) fn polymorphic_arg_wrong_kind(declared: &str, kind: &str, actual: &str) -> AnalyzeError {
+    AnalyzeError::DatatypeMismatch(format!(
+        "argument declared {declared} is not {kind} but type {actual}"
+    ))
+}
+
+/// `type matched to anynonarray is an array type: integer[]` /
+/// `type matched to anyenum is not an enum type: integer`.
+pub(crate) fn polymorphic_match_wrong_kind(declared: &str, what: &str, ty: &str) -> AnalyzeError {
+    AnalyzeError::DatatypeMismatch(format!("type matched to {declared} {what}: {ty}"))
+}
+
+/// `cannot determine element type of "anyarray" argument`.
+pub(crate) fn anyarray_element_undetermined() -> AnalyzeError {
+    AnalyzeError::DatatypeMismatch("cannot determine element type of \"anyarray\" argument".into())
+}
+
+/// `arguments of anycompatible family cannot be cast to a common type`.
+pub(crate) fn anycompatible_no_common_type() -> AnalyzeError {
+    AnalyzeError::DatatypeMismatch(
+        "arguments of anycompatible family cannot be cast to a common type".into(),
+    )
+}
+
+/// `anycompatiblerange type int4range does not match anycompatible type
+/// numeric` (also for `anycompatiblemultirange`).
+pub(crate) fn anycompatible_range_mismatch(
+    family: &str,
+    range: &str,
+    common: &str,
+) -> AnalyzeError {
+    AnalyzeError::DatatypeMismatch(format!(
+        "{family} type {range} does not match anycompatible type {common}"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,6 +401,28 @@ mod tests {
             ),
             (set_op_column_count("UNION", 2, 1).kind, "42601"),
             (no_array_type_for("integer[]"), "42704"),
+            (schema_does_not_exist("s", None).kind, "3F000"),
+            (variadic_argument_must_be_array(None).kind, "42804"),
+            (polymorphic_type_from_unknown(None), "42804"),
+            (polymorphic_args_not_alike("anyelement"), "42804"),
+            (
+                polymorphic_args_inconsistent("anyarray", "anyelement"),
+                "42804",
+            ),
+            (
+                polymorphic_arg_wrong_kind("anyarray", "an array", "integer"),
+                "42804",
+            ),
+            (
+                polymorphic_match_wrong_kind("anyenum", "is not an enum type", "integer"),
+                "42804",
+            ),
+            (anyarray_element_undetermined(), "42804"),
+            (anycompatible_no_common_type(), "42804"),
+            (
+                anycompatible_range_mismatch("anycompatiblerange", "int4range", "numeric"),
+                "42804",
+            ),
             (
                 recursive_query_column_type("r", 1, "integer", "text").kind,
                 "42804",

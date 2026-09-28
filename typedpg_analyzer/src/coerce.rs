@@ -1,7 +1,7 @@
 //! Type coercion and common-type resolution.
 
 use crate::oid::PgTypeOid;
-use crate::pg_catalog::{CastContext, PgCatalog, TypCategory, oid};
+use crate::pg_catalog::{CastContext, CastMethod, PgCatalog, TypCategory, oid};
 
 /// Describes the level of implicit coercion allowed in a given context.
 ///
@@ -11,10 +11,14 @@ use crate::pg_catalog::{CastContext, PgCatalog, TypCategory, oid};
 /// - `Assignment`: implicit **and** assignment casts are allowed
 ///   (used for INSERT/UPDATE target columns, WHERE, LIMIT, OFFSET —
 ///   matches PG's `COERCION_ASSIGNMENT`).
+/// - `Explicit`: every `pg_cast` entry plus I/O conversion from a string
+///   type (a `CAST`, or a function-style `typename(x)`); only consulted by
+///   [`coercion_pathway`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CoercionContext {
     Implicit,
     Assignment,
+    Explicit,
 }
 
 /// Check whether a cast from `source` to `target` is permitted under
@@ -65,6 +69,226 @@ pub(crate) fn can_coerce(
         }
         _ => false,
     }
+}
+
+/// `pg_type.typcategory` of `t` — PG's `TypeCategory`: `unknown` is
+/// category `X`, a type missing from the catalog has none.
+pub(crate) fn type_category(t: PgTypeOid, snapshot: &PgCatalog) -> Option<TypCategory> {
+    snapshot.get_type(t).map(|ty| ty.typcategory)
+}
+
+/// `(typcategory, typispreferred)` of `t` — PG's
+/// `get_type_category_preferred`.
+pub(crate) fn type_category_preferred(
+    t: PgTypeOid,
+    snapshot: &PgCatalog,
+) -> (Option<TypCategory>, bool) {
+    match snapshot.get_type(t) {
+        Some(ty) => (Some(ty.typcategory), ty.typispreferred),
+        None => (None, false),
+    }
+}
+
+/// Element type of a *true* array type — PG's `get_element_type`, which
+/// requires `typelem` and the array subscript handler (category `A`: the
+/// `_foo` arrays plus `int2vector`/`oidvector`, but not `name` or `point`,
+/// whose `typelem` only drives raw subscripting).
+pub(crate) fn element_type(t: PgTypeOid, snapshot: &PgCatalog) -> Option<PgTypeOid> {
+    snapshot
+        .get_type(t)
+        .filter(|ty| ty.typcategory == TypCategory::Array)
+        .and_then(|ty| ty.typelem)
+}
+
+/// PG's `ISCOMPLEX` (`typeOrDomainTypeRelid`): a composite type, or a
+/// domain over one.
+pub(crate) fn is_complex(t: PgTypeOid, snapshot: &PgCatalog) -> bool {
+    snapshot
+        .get_type(snapshot.unwrap_domain(t))
+        .is_some_and(|ty| ty.typrelid.is_some())
+}
+
+/// The kind of coercion [`coercion_pathway`] found — PG's
+/// `CoercionPathType` (minus `COERCION_PATH_NONE`, which is `None`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CoercionPath {
+    /// Binary-compatible relabeling (also domain <-> base).
+    Relabel,
+    /// A `pg_cast` function.
+    Func,
+    /// Element-wise coercion of an array.
+    ArrayCoerce,
+    /// Output/input function round-trip.
+    CoerceViaIo,
+}
+
+/// PG's `find_coercion_pathway` (parse_coerce.c): domains are smashed to
+/// their base types (a domain always coerces to and from its base), a
+/// `pg_cast` row counts when its context is allowed, and — only without a
+/// `pg_cast` row — an element-wise array coercion or the I/O conversion
+/// (to a string type from assignment up, from one when explicit) applies.
+pub(crate) fn coercion_pathway(
+    target: PgTypeOid,
+    source: PgTypeOid,
+    context: CoercionContext,
+    snapshot: &PgCatalog,
+) -> Option<CoercionPath> {
+    let source = snapshot.unwrap_domain(source);
+    let target = snapshot.unwrap_domain(target);
+    if source == target {
+        return Some(CoercionPath::Relabel);
+    }
+    if let Some(cast) = snapshot
+        .cast_by_pair
+        .get(&(source, target))
+        .and_then(|oid| snapshot.pg_cast.get(oid))
+    {
+        let allowed = match cast.castcontext {
+            CastContext::Implicit => true,
+            CastContext::Assignment => context != CoercionContext::Implicit,
+            CastContext::Explicit => context == CoercionContext::Explicit,
+        };
+        return allowed.then_some(match cast.castmethod {
+            CastMethod::Function => CoercionPath::Func,
+            CastMethod::Binary => CoercionPath::Relabel,
+            CastMethod::InOut => CoercionPath::CoerceViaIo,
+        });
+    }
+    const INT2VECTOR: PgTypeOid = PgTypeOid::from_raw(22);
+    const OIDVECTOR: PgTypeOid = PgTypeOid::from_raw(30);
+    if target != OIDVECTOR
+        && target != INT2VECTOR
+        && let (Some(te), Some(se)) = (
+            element_type(target, snapshot),
+            element_type(source, snapshot),
+        )
+        && coercion_pathway(te, se, context, snapshot).is_some()
+    {
+        return Some(CoercionPath::ArrayCoerce);
+    }
+    let io = (context != CoercionContext::Implicit
+        && type_category(target, snapshot) == Some(TypCategory::String))
+        || (context == CoercionContext::Explicit
+            && type_category(source, snapshot) == Some(TypCategory::String));
+    io.then_some(CoercionPath::CoerceViaIo)
+}
+
+/// PG's `can_coerce_type` (parse_coerce.c) under `COERCION_IMPLICIT`: can
+/// every `inputs[i]` be coerced to `targets[i]`? Unknown inputs coerce to
+/// anything, `"any"` accepts anything, polymorphic targets are accepted
+/// position-wise and then cross-checked together by
+/// [`crate::polymorphic::check_generic_type_consistency`], and `record`
+/// relabels to and from composites.
+pub(crate) fn can_coerce_types(
+    inputs: &[PgTypeOid],
+    targets: &[PgTypeOid],
+    snapshot: &PgCatalog,
+) -> bool {
+    const ANY: PgTypeOid = PgTypeOid::from_raw(2276);
+    const RECORDARRAY: PgTypeOid = PgTypeOid::from_raw(2287);
+    let mut have_generics = false;
+    for (&input, &target) in inputs.iter().zip(targets) {
+        if input == target || target == ANY {
+            continue;
+        }
+        if crate::polymorphic::is_polymorphic(target) {
+            have_generics = true;
+            continue;
+        }
+        if input == oid::UNKNOWN
+            || coercion_pathway(target, input, CoercionContext::Implicit, snapshot).is_some()
+            || (input == oid::RECORD && is_complex(target, snapshot))
+            || (target == oid::RECORD && is_complex(input, snapshot))
+            || (target == RECORDARRAY
+                && element_type(input, snapshot).is_some_and(|e| is_complex(e, snapshot)))
+            || type_inherits_from(input, target, snapshot)
+        {
+            continue;
+        }
+        return false;
+    }
+    !have_generics || crate::polymorphic::check_generic_type_consistency(inputs, targets, snapshot)
+}
+
+/// PG's `typeInheritsFrom`: `sub` is the row type of a table that inherits
+/// (transitively) from the table whose row type is `sup`.
+fn type_inherits_from(sub: PgTypeOid, sup: PgTypeOid, snapshot: &PgCatalog) -> bool {
+    let relid = |t: PgTypeOid| snapshot.get_type(t).and_then(|ty| ty.typrelid);
+    let (Some(sub_rel), Some(sup_rel)) = (relid(sub), relid(sup)) else {
+        return false;
+    };
+    let mut frontier = vec![sub_rel];
+    let mut seen = Vec::new();
+    while let Some(rel) = frontier.pop() {
+        for inh in snapshot.pg_inherits.iter().filter(|i| i.inhrelid == rel) {
+            if inh.inhparent == sup_rel {
+                return true;
+            }
+            if !seen.contains(&inh.inhparent) {
+                seen.push(inh.inhparent);
+                frontier.push(inh.inhparent);
+            }
+        }
+    }
+    false
+}
+
+/// PG's `select_common_type_from_oids` (parse_coerce.c) in `noerror` mode:
+/// the common supertype of `types`, or `None` when two inputs fall in
+/// different type categories. Identical inputs keep their type (domains
+/// included); otherwise domains are smashed and the running choice moves
+/// to a later type only when it isn't preferred and the implicit cast is
+/// one-way. All-unknown resolves to `text`.
+pub(crate) fn select_common_type_from_oids(
+    types: &[PgTypeOid],
+    snapshot: &PgCatalog,
+) -> Option<PgTypeOid> {
+    let first = *types.first()?;
+    let mut i = 1;
+    if first != oid::UNKNOWN {
+        while i < types.len() && types[i] == first {
+            i += 1;
+        }
+        if i == types.len() {
+            return Some(first);
+        }
+    }
+    let mut ptype = snapshot.unwrap_domain(first);
+    let (mut pcategory, mut pispreferred) = type_category_preferred(ptype, snapshot);
+    for &t in &types[i..] {
+        let ntype = snapshot.unwrap_domain(t);
+        if ntype == oid::UNKNOWN || ntype == ptype {
+            continue;
+        }
+        let (ncategory, nispreferred) = type_category_preferred(ntype, snapshot);
+        if ptype == oid::UNKNOWN {
+            (ptype, pcategory, pispreferred) = (ntype, ncategory, nispreferred);
+        } else if ncategory != pcategory {
+            return None;
+        } else if !pispreferred
+            && can_coerce_types(&[ptype], &[ntype], snapshot)
+            && !can_coerce_types(&[ntype], &[ptype], snapshot)
+        {
+            (ptype, pcategory, pispreferred) = (ntype, ncategory, nispreferred);
+        }
+    }
+    Some(if ptype == oid::UNKNOWN {
+        oid::TEXT
+    } else {
+        ptype
+    })
+}
+
+/// PG's `verify_common_type_from_oids`: every input coerces implicitly to
+/// `common`.
+pub(crate) fn verify_common_type_from_oids(
+    common: PgTypeOid,
+    types: &[PgTypeOid],
+    snapshot: &PgCatalog,
+) -> bool {
+    types
+        .iter()
+        .all(|&t| t == common || can_coerce_types(&[t], &[common], snapshot))
 }
 
 /// Whether an *explicit* cast (`x::T` / `CAST(x AS T)`) from `source` to

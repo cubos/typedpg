@@ -658,6 +658,7 @@ fn infer_generic_binary_op(
                     .finalize_implicit(),
             );
         }
+        crate::lookup::OperatorMatch::Error(e) => return Err(e),
         crate::lookup::OperatorMatch::NotFound => {}
     }
 

@@ -58,6 +58,8 @@ mod arrays;
 mod collation;
 #[path = "query/full_text_search.rs"]
 mod full_text_search;
+#[path = "query/function_resolution.rs"]
+mod function_resolution;
 #[path = "query/grouping_sets.rs"]
 mod grouping_sets;
 #[path = "query/json_operators.rs"]
