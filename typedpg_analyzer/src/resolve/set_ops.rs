@@ -73,8 +73,39 @@ pub(crate) fn analyze_set_operation(
         }
     }
 
+    // PG keeps an arm's untyped string literal as `unknown` (set-operation
+    // arms don't resolve unknowns) and coerces it to the other arm's type,
+    // running that type's input function on the literal (22P02 for
+    // `SELECT 1 UNION SELECT 'x'`).
+    let left_lits: Vec<Option<&str>> = (0..left_cols.len())
+        .map(|i| arm_unknown_literal(left, i))
+        .collect();
+    let right_lits: Vec<Option<&str>> = (0..right_cols.len())
+        .map(|i| arm_unknown_literal(right, i))
+        .collect();
+
     let mut columns = Vec::with_capacity(left_cols.len());
-    for (l, r) in left_cols.into_iter().zip(right_cols) {
+    for (i, (mut l, mut r)) in left_cols.into_iter().zip(right_cols).enumerate() {
+        if left_lits[i].is_some() {
+            l.type_oid = oid::UNKNOWN;
+        }
+        if right_lits[i].is_some() {
+            r.type_oid = oid::UNKNOWN;
+        }
+        let target = if l.type_oid == oid::UNKNOWN {
+            r.type_oid
+        } else {
+            l.type_oid
+        };
+        if target != oid::UNKNOWN {
+            for lit in [left_lits[i], right_lits[i]].into_iter().flatten() {
+                if let Err(msg) = crate::literal_input::validate(lit, target, snapshot) {
+                    return Err(
+                        crate::error::RawError::invalid_literal(msg, None).finalize_implicit()
+                    );
+                }
+            }
+        }
         // When both sides carry concrete types (not UNKNOWN), their common
         // type must exist — PG rejects `SELECT 1 UNION SELECT 'x'` with
         // `UNION types integer and text cannot be matched`.
@@ -101,7 +132,9 @@ pub(crate) fn analyze_set_operation(
                 )
                 .finalize_implicit());
             }
-            (None, false) => l.type_oid,
+            // Both arms unknown: select_common_type resolves to text.
+            (None, false) if l.type_oid == oid::UNKNOWN && r.type_oid == oid::UNKNOWN => oid::TEXT,
+            (None, false) => target,
         };
         let typmod = if l.typmod == r.typmod { l.typmod } else { None };
         // UNION arms only carry collation forward when both sides agree
@@ -124,4 +157,31 @@ pub(crate) fn analyze_set_operation(
     }
 
     Ok((columns, None))
+}
+
+/// The untyped string literal an arm projects at position `i`, when the arm
+/// is a plain SELECT whose target entries line up with its output.
+fn arm_unknown_literal(arm: &protobuf::SelectStmt, i: usize) -> Option<&str> {
+    if arm.op != SetOperation::SetopNone as i32 || !arm.values_lists.is_empty() {
+        return None;
+    }
+    let has_star = arm.target_list.iter().any(|t| {
+        matches!(t.node.as_ref(), Some(node::Node::ResTarget(rt))
+            if matches!(rt.val.as_deref().and_then(|v| v.node.as_ref()),
+                Some(node::Node::ColumnRef(cr)) if cr.fields.iter().any(|f|
+                    matches!(f.node.as_ref(), Some(node::Node::AStar(_))))))
+    });
+    if has_star {
+        return None;
+    }
+    let Some(node::Node::ResTarget(rt)) = arm.target_list.get(i)?.node.as_ref() else {
+        return None;
+    };
+    match rt.val.as_deref()?.node.as_ref()? {
+        node::Node::AConst(ac) if !ac.isnull => match &ac.val {
+            Some(pg_query::protobuf::a_const::Val::Sval(sv)) => Some(sv.sval.as_str()),
+            _ => None,
+        },
+        _ => None,
+    }
 }

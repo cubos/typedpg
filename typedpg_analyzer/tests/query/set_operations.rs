@@ -20,19 +20,14 @@ fn union_with_incompatible_concrete_types_rejected() {
 
 #[test]
 fn union_with_incompatible_unknown_literal_rejected() {
-    // `'text'` is an untyped string literal; the target-list boundary binds
-    // it to `text`, so the UNION sees int4 vs text. PG raises a runtime
-    // cast error here (`invalid input syntax for type integer`) instead of
-    // the analyzer's static UNION-types message — opt out.
-    let mut db = setup();
-    db.skip_pg_sanity();
+    // `'text'` is an untyped string literal: PG keeps it `unknown` in a
+    // set-operation arm and coerces it to the other arm's integer, which
+    // fails in the input function.
+    let db = setup();
     assert_analyze_err!(
         db.analyze("SELECT 1 UNION SELECT 'text'"),
-        AnalyzeError::DatatypeMismatch(_),
-        concat!(
-            "UNION types integer and text cannot be matched (column `?column?`)\n",
-            "  help: cast both sides to a common type, e.g. `?column?::integer`\n",
-        ),
+        AnalyzeError::InvalidLiteral(_),
+        "invalid input syntax for type integer: \"text\"",
     );
 }
 

@@ -147,6 +147,7 @@ pub(crate) fn analyze_values_lists(
     let empty_null = NullabilityContext::default();
 
     let mut column_types: Vec<Vec<PgTypeOid>> = vec![Vec::new(); arity];
+    let mut column_typmods: Vec<Vec<Option<i32>>> = vec![Vec::new(); arity];
     let mut column_nullable: Vec<bool> = vec![false; arity];
 
     for row_node in values_lists {
@@ -170,6 +171,7 @@ pub(crate) fn analyze_values_lists(
                 TypeGoal::NONE,
             )?;
             column_types[i].push(t.type_oid);
+            column_typmods[i].push(t.typmod);
             column_nullable[i] |= t.nullable;
         }
     }
@@ -211,7 +213,15 @@ pub(crate) fn analyze_values_lists(
             name: format!("column{}", i + 1),
             type_oid: common[i],
             nullable: column_nullable[i],
-            typmod: None,
+            // `select_common_typmod`: rows agreeing on type *and* typmod
+            // keep it (`VALUES ('x'::varchar(3)), ('yy'::varchar(3))` is
+            // varchar(3)).
+            typmod: column_types[i]
+                .iter()
+                .all(|&t| t == common[i])
+                .then(|| column_typmods[i].first().copied().flatten())
+                .flatten()
+                .filter(|m| column_typmods[i].iter().all(|x| *x == Some(*m))),
             // VALUES literals don't carry a column-level collation — PG
             // leaves it indeterminate and lets a surrounding `INSERT INTO
             // table (cols)` re-attach the target column's attcollation.
