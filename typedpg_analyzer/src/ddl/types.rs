@@ -362,6 +362,16 @@ pub fn create_enum(interp: &mut PgCatalog, stmt: &CreateEnumStmt) -> Result<(), 
         .iter()
         .filter_map(|n| node_string(n).map(|s| s.to_owned()))
         .collect();
+    // EnumValuesCreate inserts the labels one by one; a repeat trips
+    // pg_enum's unique index.
+    for (i, label) in labels.iter().enumerate() {
+        if labels[..i].contains(label) {
+            return Err(DdlError::DuplicateObject(
+                "duplicate key value violates unique constraint \"pg_enum_typid_label_index\""
+                    .into(),
+            ));
+        }
+    }
 
     let oid = PgTypeOid::from_nonzero(interp.alloc_oid()?);
     interp.insert_pg_type(PgType {
@@ -682,14 +692,36 @@ pub fn alter_enum(interp: &mut PgCatalog, stmt: &AlterEnumStmt) -> Result<(), Dd
         )));
     };
 
+    // checkEnumOwner.
     if !matches!(
         interp.pg_type.get(&oid).map(|t| t.typtype),
         Some(TypType::Enum)
     ) {
+        return Err(DdlError::Parse(format!(
+            "{} is not an enum",
+            super::util::format_type_for_message(interp, oid)
+        )));
+    }
+
+    let not_a_label =
+        |label: &str| DdlError::Parse(format!("\"{label}\" is not an existing enum label"));
+    let labels = interp.pg_enum.entry(oid).or_default();
+
+    // `RENAME VALUE old TO new` (RenameEnumLabel).
+    if !stmt.old_val.is_empty() {
+        if labels.iter().any(|e| e.enumlabel == stmt.new_val) {
+            return Err(DdlError::DuplicateObject(format!(
+                "enum label \"{}\" already exists",
+                stmt.new_val
+            )));
+        }
+        let Some(label) = labels.iter_mut().find(|e| e.enumlabel == stmt.old_val) else {
+            return Err(not_a_label(&stmt.old_val));
+        };
+        label.enumlabel = stmt.new_val.clone();
         return Ok(());
     }
 
-    let labels = interp.pg_enum.entry(oid).or_default();
     if labels.iter().any(|e| e.enumlabel == stmt.new_val) {
         if stmt.skip_if_new_val_exists {
             return Ok(());
@@ -736,11 +768,7 @@ pub fn alter_enum(interp: &mut PgCatalog, stmt: &AlterEnumStmt) -> Result<(), Dd
             }
         }
     } else {
-        labels
-            .iter()
-            .map(|e| e.enumsortorder)
-            .fold(0.0_f32, f32::max)
-            + 1.0
+        return Err(not_a_label(&stmt.new_val_neighbor));
     };
 
     let enum_oid = PgEnumOid::from_nonzero(interp.alloc_oid()?);

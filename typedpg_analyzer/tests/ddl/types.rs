@@ -513,3 +513,50 @@ fn composite_type_attributes_follow_alter_type() {
         "CREATE TYPE c AS (x int); ALTER TYPE c ALTER ATTRIBUTE x TYPE text;",
     )]);
 }
+
+// ── Enum labels (EnumValuesCreate / AddEnumLabel / RenameEnumLabel) ─────────
+
+#[test]
+fn enum_label_changes_follow_pg() {
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TYPE e AS ENUM ('a', 'b');
+         ALTER TYPE e RENAME VALUE 'a' TO 'z';
+         ALTER TYPE e ADD VALUE IF NOT EXISTS 'b' BEFORE 'nosuch';",
+    )]);
+    let e = db.resolve_type_by_name(None, "e").unwrap();
+    assert_eq!(db.enum_labels_of(e.oid), vec!["z", "b"]);
+    for (stmt, msg) in [
+        (
+            "ALTER TYPE e RENAME VALUE 'a' TO 'b';",
+            "enum label \"b\" already exists",
+        ),
+        (
+            "ALTER TYPE e RENAME VALUE 'q' TO 'z';",
+            "\"q\" is not an existing enum label",
+        ),
+        (
+            "ALTER TYPE e ADD VALUE 'c' BEFORE 'zz';",
+            "\"zz\" is not an existing enum label",
+        ),
+        ("ALTER TYPE t ADD VALUE 'x';", "t is not an enum"),
+        (
+            "ALTER TYPE nosuch ADD VALUE 'x';",
+            "type \"nosuch\" does not exist",
+        ),
+        (
+            "CREATE TYPE e2 AS ENUM ('a', 'a');",
+            "duplicate key value violates unique constraint \"pg_enum_typid_label_index\"",
+        ),
+    ] {
+        let err = try_apply(&[
+            (
+                "0001.sql",
+                "CREATE TYPE e AS ENUM ('a', 'b'); CREATE TABLE t (a int);",
+            ),
+            ("0002.sql", stmt),
+        ])
+        .expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+}
