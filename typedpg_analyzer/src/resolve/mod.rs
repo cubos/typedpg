@@ -334,6 +334,7 @@ pub(crate) fn analyze_raw_node(
         node::Node::UpdateStmt(upd) => analyze_update(upd, snapshot, &mut params)?,
         node::Node::DeleteStmt(del) => analyze_delete(del, snapshot, &mut params)?,
         node::Node::MergeStmt(merge) => analyze_merge(merge, snapshot, &mut params)?,
+        node::Node::CallStmt(call) => analyze_call(call, snapshot, &mut params)?,
         // `EXPLAIN <query>` — recurse into the wrapped statement so its
         // parameters are harvested into the outer `ParamCollector`, then
         // replace the column list with PG's fixed `QUERY PLAN` row
@@ -639,6 +640,7 @@ pub(crate) struct RawColumn {
 type AnalyzeResult = Result<(Vec<RawColumn>, Option<Vec<(i32, PgTypeOid, bool)>>), AnalyzeError>;
 
 mod assign;
+mod call;
 mod cte;
 mod dml;
 mod from;
@@ -654,6 +656,7 @@ mod walk;
 // this module resolve them transparently. Function names are unique across
 // the former monolith, so these globs never collide.
 pub(crate) use assign::*;
+pub(crate) use call::*;
 pub(crate) use cte::*;
 pub(crate) use dml::*;
 pub(crate) use from::*;
