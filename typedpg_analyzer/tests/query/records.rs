@@ -2305,3 +2305,43 @@ fn row_equals_any_array_of_rows() {
         .unwrap();
     assert_eq!(s.columns[0].pg_type, bool_ty());
 }
+
+// ── (composite).* expansion (ExpandIndirectionStar) ─────────────────────────
+
+#[test]
+fn composite_star_expands_to_its_fields() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TYPE comp AS (a int, b varchar(3));
+         CREATE TABLE tc (id int PRIMARY KEY, cc comp NOT NULL, nm text NOT NULL);",
+    )
+    .unwrap();
+    for sql in [
+        "SELECT (cc).* FROM tc",
+        "SELECT (tc.cc).* FROM tc",
+        "SELECT (ROW(1, 'x')::comp).*",
+    ] {
+        let s = db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        assert_cols(&s, vec![cn("a", int4()), cn("b", varchar_n(3))]);
+    }
+    // A whole-row reference expands to the table's own columns.
+    let s = db.analyze("SELECT (t).* FROM tc t").unwrap();
+    let names: Vec<_> = s.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["id", "cc", "nm"]);
+    assert_eq!(s.columns[0].pg_type, int4());
+    assert_err_prefix!(
+        db.analyze("SELECT (nm).* FROM tc"),
+        AnalyzeError::WrongObjectType(_),
+        "type text is not composite"
+    );
+    for sql in [
+        "SELECT (cc).* = 1 FROM tc",
+        "SELECT id FROM tc WHERE (cc).* IS NULL",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::Invalid(_),
+            "row expansion via \"*\" is not supported here"
+        );
+    }
+}

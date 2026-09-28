@@ -65,6 +65,27 @@ pub(crate) fn resolve_target_list(
             continue;
         }
 
+        // `(expr).*` expands to one column per field (ExpandIndirectionStar).
+        if let Some(node::Node::AIndirection(ind)) = val.node.as_ref()
+            && let Some(fields) = expr::expand_indirection_star(
+                ind,
+                expr::Ctx::new(scope, null_ctx, snapshot),
+                params,
+            )?
+        {
+            for (name, t) in fields {
+                columns.push(RawColumn {
+                    name,
+                    type_oid: t.type_oid,
+                    nullable: t.nullable,
+                    typmod: t.typmod,
+                    collation: t.collation,
+                    record_fields: t.record_fields,
+                });
+            }
+            continue;
+        }
+
         // No type expectation for SELECT expressions.
         let expr_type = expr::infer_expr(
             val,

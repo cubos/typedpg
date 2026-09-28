@@ -117,6 +117,13 @@ pub(crate) fn infer_indirection(
                 i += run.len();
                 current = transform_container_subscripts(&current, &run, ctx, params)?;
             }
+            // `(expr).*` only expands in a SELECT list (see
+            // `expand_indirection_star`); anywhere else PG refuses it.
+            Some(node::Node::AStar(_)) => {
+                return Err(AnalyzeError::Invalid(
+                    "row expansion via \"*\" is not supported here".into(),
+                ));
+            }
             _ => {
                 return Err(AnalyzeError::Unsupported(format!(
                     "unsupported indirection step: {:?}",
@@ -271,9 +278,10 @@ fn resolve_composite_field(
             AnalyzeError::UndefinedColumn(msg)
         })?;
 
-    Ok(ExprType::scalar(
+    Ok(ExprType::scalar_with_typmod(
         field.atttypid,
         current.nullable || !field.attnotnull,
+        field.atttypmod,
     ))
 }
 
@@ -447,6 +455,80 @@ pub(crate) fn transform_array_expr(
     // An ARRAY[...] constructor is never NULL itself — it's always at least
     // an empty array.
     Ok(ExprType::scalar_with_typmod(array_type, false, typmod))
+}
+
+/// PG's `ExpandIndirectionStar` for a SELECT-list `(expr).*`: one output
+/// column per field of the composite value `expr` (named after the field),
+/// each typed like `(expr).field`. `Ok(None)` when the indirection does not
+/// end in `.*`. The value must have a known row shape: a composite type
+/// (domains unwrapped) or an anonymous record whose fields are known.
+pub(crate) fn expand_indirection_star(
+    ind: &protobuf::AIndirection,
+    ctx: Ctx<'_>,
+    params: &mut ParamCollector,
+) -> Result<Option<Vec<(String, ExprType)>>, AnalyzeError> {
+    let snapshot = ctx.snapshot;
+    let Some((last, prefix)) = ind.indirection.split_last() else {
+        return Ok(None);
+    };
+    if !matches!(last.node.as_ref(), Some(node::Node::AStar(_))) {
+        return Ok(None);
+    }
+    let arg = ind
+        .arg
+        .as_deref()
+        .ok_or_else(|| AnalyzeError::Unsupported("indirection without arg".into()))?;
+    let container = if prefix.is_empty() {
+        infer_expr(arg, ctx, params, TypeGoal::NONE)?
+    } else {
+        let inner = protobuf::AIndirection {
+            arg: ind.arg.clone(),
+            indirection: prefix.to_vec(),
+        };
+        infer_indirection(&inner, ctx, params)?
+    };
+
+    if let Some(fields) = &container.record_fields {
+        return Ok(Some(
+            fields
+                .iter()
+                .map(|f| {
+                    let mut ty = f.ty.clone();
+                    ty.nullable |= container.nullable;
+                    (f.name.clone(), ty)
+                })
+                .collect(),
+        ));
+    }
+    let base = snapshot.unwrap_domain(container.type_oid);
+    let relid = snapshot
+        .get_type(base)
+        .filter(|t| t.typtype == TypType::Composite)
+        .and_then(|t| t.typrelid);
+    let Some(relid) = relid else {
+        // get_expr_result_tupdesc: an anonymous record of unknown shape vs.
+        // a scalar.
+        let msg = if base == oid::RECORD {
+            "record type has not been registered".to_string()
+        } else {
+            format!(
+                "type {} is not composite",
+                crate::ddl::util::format_type_for_message(snapshot, base)
+            )
+        };
+        return Err(AnalyzeError::WrongObjectType(msg));
+    };
+    let mut out = Vec::new();
+    for attr in snapshot
+        .attributes_of(relid)
+        .iter()
+        .filter(|a| a.attnum > 0)
+    {
+        let mut ty = resolve_composite_field(&container, &attr.attname, snapshot, None)?;
+        ty.typmod = attr.atttypmod;
+        out.push((attr.attname.clone(), ty));
+    }
+    Ok(Some(out))
 }
 
 /// The leading run of consecutive `[…]` steps of an indirection list.
