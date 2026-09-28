@@ -463,12 +463,23 @@ fn validate_on_conflict_target(
     if !infer.conname.is_empty() {
         let found = snapshot
             .pg_constraint_values()
-            .any(|c| c.conrelid == table_oid && c.conname == infer.conname);
-        if !found {
+            .find(|c| c.conrelid == table_oid && c.conname == infer.conname);
+        let Some(found) = found else {
             return Err(AnalyzeError::Invalid(format!(
                 "constraint \"{}\" for table \"{}\" does not exist",
                 infer.conname, table_relname,
             )));
+        };
+        // transformOnConflictArbiter: the constraint must be backed by an
+        // index (PRIMARY KEY / UNIQUE / EXCLUDE), not a CHECK, FOREIGN KEY
+        // or NOT NULL one.
+        if !matches!(
+            found.contype,
+            ConType::PrimaryKey | ConType::Unique | ConType::Exclusion
+        ) {
+            return Err(AnalyzeError::WrongObjectType(
+                "constraint in ON CONFLICT clause has no associated index".into(),
+            ));
         }
         return Ok(());
     }

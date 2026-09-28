@@ -775,3 +775,25 @@ fn generated_constraint_names_follow_pg() {
         .collect();
     assert_eq!(names, vec!["x_pkey1"]);
 }
+
+#[test]
+fn on_conflict_on_constraint_needs_an_index_backed_constraint() {
+    // PG 18: 42809 constraint in ON CONFLICT clause has no associated index
+    // (NOT NULL and CHECK constraints); a PRIMARY KEY / UNIQUE one works.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int NOT NULL, b int CHECK (b > 0), c int UNIQUE);",
+    )]);
+    for name in ["t_a_not_null", "t_b_check"] {
+        let sql = format!("INSERT INTO t VALUES (1) ON CONFLICT ON CONSTRAINT {name} DO NOTHING");
+        let err = db.analyze(&sql).unwrap_err();
+        assert!(matches!(err, AnalyzeError::WrongObjectType(_)), "{err:?}");
+        assert!(
+            err.to_string()
+                .starts_with("constraint in ON CONFLICT clause has no associated index"),
+            "{err}"
+        );
+    }
+    db.analyze("INSERT INTO t VALUES (1) ON CONFLICT ON CONSTRAINT t_c_key DO NOTHING")
+        .unwrap();
+}
