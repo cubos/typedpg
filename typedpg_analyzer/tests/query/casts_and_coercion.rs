@@ -554,3 +554,22 @@ fn jsonb_to_scalar_casts_are_nullable() {
         ],
     );
 }
+
+#[test]
+fn jsonpath_operators_are_nullable() {
+    // jsonb_path_exists_opr / jsonb_path_match_opr return NULL when the
+    // path evaluation fails ('{}'::jsonb @? 'strict $.a' IS NULL on PG 18).
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE tj (j jsonb NOT NULL, t tsvector NOT NULL);")
+        .unwrap();
+    let s = db
+        .analyze(
+            "SELECT j @? 'strict $.a' AS a, j @@ '$.a == 1' AS b, \
+             t @@ 'x'::tsquery AS c FROM tj",
+        )
+        .unwrap();
+    assert_cols(
+        &s,
+        vec![cn("a", bool_ty()), cn("b", bool_ty()), c("c", bool_ty())],
+    );
+}

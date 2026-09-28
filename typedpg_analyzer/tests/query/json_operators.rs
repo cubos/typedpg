@@ -116,12 +116,12 @@ fn json_build_array_returns_json() {
 #[test]
 fn jsonb_jsonpath_exists_returns_bool() {
     let db = setup();
-    // `@?` takes (jsonb, jsonpath) and returns bool. NOT NULL because the
-    // operator is strict on a NOT NULL `meta`.
+    // `@?` takes (jsonb, jsonpath) and returns bool — NULL when the path
+    // evaluation fails, even on a NOT NULL `meta`.
     let s = db
         .analyze("SELECT meta @? '$.a'::jsonpath AS exists FROM users")
         .unwrap();
-    assert_cols(&s, vec![c("exists", bool_ty())]);
+    assert_cols(&s, vec![cn("exists", bool_ty())]);
 }
 
 #[test]
@@ -131,7 +131,7 @@ fn jsonb_jsonpath_match_returns_bool() {
     let s = db
         .analyze("SELECT meta @@ '$.a > 0'::jsonpath AS m FROM users")
         .unwrap();
-    assert_cols(&s, vec![c("m", bool_ty())]);
+    assert_cols(&s, vec![cn("m", bool_ty())]);
 }
 
 #[test]

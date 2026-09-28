@@ -698,7 +698,15 @@ fn infer_generic_binary_op(
                 op.result_type_oid,
                 snapshot,
             )?;
-            return Ok(ExprType::scalar(op.result_type_oid, nullable).with_collation(state));
+            // `jsonb @? jsonpath` / `jsonb @@ jsonpath` (jsonb_path_exists_opr
+            // / jsonb_path_match_opr) return NULL when the path evaluation
+            // fails (`'{}'::jsonb @? 'strict $.a'`); `tsvector @@ tsquery`
+            // never does.
+            const JSONPATH: PgTypeOid = PgTypeOid::from_raw(4072);
+            let jsonpath_op = matches!(op_name, "@?" | "@@") && op.right_type_oid == JSONPATH;
+            return Ok(
+                ExprType::scalar(op.result_type_oid, nullable || jsonpath_op).with_collation(state),
+            );
         }
         crate::lookup::OperatorMatch::Ambiguous => {
             // PG (SQLSTATE 42725): `operator is not unique: <left> <op>
