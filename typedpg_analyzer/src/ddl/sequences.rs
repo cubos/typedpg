@@ -25,14 +25,10 @@ pub fn create_sequence(interp: &mut PgCatalog, stmt: &CreateSeqStmt) -> Result<(
 
     let (nsoid, name) = ensure_range_var(interp, rv)?;
 
-    if interp.class_by_qname.contains_key(&(nsoid, name.clone())) {
-        if stmt.if_not_exists {
-            return Ok(());
-        }
-        return Err(DdlError::DuplicateObject(format!(
-            "relation \"{name}\" already exists"
-        )));
+    if interp.class_by_qname.contains_key(&(nsoid, name.clone())) && stmt.if_not_exists {
+        return Ok(());
     }
+    super::util::check_relation_name_free(interp, nsoid, &name)?;
 
     let seq_oid = insert_sequence_relation(interp, nsoid, name)?;
     for opt in &stmt.options {

@@ -40,17 +40,7 @@ pub fn create_view(interp: &mut PgCatalog, stmt: &ViewStmt) -> Result<(), DdlErr
     )
     .to_string();
 
-    let aliases: Vec<String> = stmt
-        .aliases
-        .iter()
-        .filter_map(|n| {
-            if let Some(node::Node::String(s)) = n.node.as_ref() {
-                Some(s.sval.clone())
-            } else {
-                None
-            }
-        })
-        .collect();
+    let aliases = string_list(&stmt.aliases);
 
     let resolved = match stmt.query.as_deref() {
         Some(query_node) => {
@@ -64,48 +54,238 @@ pub fn create_view(interp: &mut PgCatalog, stmt: &ViewStmt) -> Result<(), DdlErr
         }
         None => ResolvedView::default(),
     };
+    // DefineView (view.c): the alias list may not outnumber the columns.
+    if aliases.len() > resolved.columns.len() {
+        return Err(DdlError::Parse(
+            "CREATE VIEW specifies more column names than columns".into(),
+        ));
+    }
+    check_duplicate_columns(&resolved.columns)?;
 
-    if stmt.replace
-        && let Some(existing_oid) = interp.class_by_qname.get(&(nsoid, name.clone())).copied()
-    {
-        super::drop::drop_relation_by_oid(interp, existing_oid);
+    // DefineVirtualRelation: OR REPLACE redefines an existing *view* in
+    // place (keeping its OID, so dependents stay attached); any other
+    // existing relation is an error.
+    if let Some(existing_oid) = interp.class_by_qname.get(&(nsoid, name.clone())).copied() {
+        if !stmt.replace {
+            return Err(DdlError::DuplicateObject(format!(
+                "relation \"{name}\" already exists"
+            )));
+        }
+        if interp.pg_class.get(&existing_oid).map(|c| c.relkind) != Some(RelKind::View) {
+            return Err(DdlError::DuplicateObject(format!(
+                "\"{name}\" is not a view"
+            )));
+        }
+        check_view_columns(interp, existing_oid, &resolved.columns)?;
+        replace_view(interp, existing_oid, resolved)?;
+        return Ok(());
     }
 
+    super::util::check_relation_name_free(interp, nsoid, &name)?;
     install_relation(interp, nsoid, name, RelKind::View, resolved)?;
     Ok(())
 }
 
 pub fn create_table_as(interp: &mut PgCatalog, stmt: &CreateTableAsStmt) -> Result<(), DdlError> {
-    let rv = stmt
+    let into = stmt
         .into
-        .as_ref()
-        .and_then(|ia| ia.rel.as_ref())
+        .as_deref()
         .ok_or_else(|| DdlError::Parse("CREATE TABLE AS without target".into()))?;
-
     let kind = match ObjectType::try_from(stmt.objtype) {
         Ok(ObjectType::ObjectMatview) => RelKind::MaterializedView,
         _ => RelKind::Table,
     };
+    create_relation_as(
+        interp,
+        into,
+        stmt.query.as_deref(),
+        kind,
+        stmt.if_not_exists,
+    )
+}
 
+/// `SELECT ... INTO [TABLE] name FROM ...`: the same as `CREATE TABLE name
+/// AS SELECT ...` (`transformSelectStmt` turns it into a CreateTableAsStmt).
+pub fn select_into(interp: &mut PgCatalog, stmt: &protobuf::SelectStmt) -> Result<(), DdlError> {
+    let Some(into) = stmt.into_clause.as_deref() else {
+        return Ok(());
+    };
+    let mut query = stmt.clone();
+    query.into_clause = None;
+    let query_node = protobuf::Node {
+        node: Some(node::Node::SelectStmt(Box::new(query))),
+    };
+    create_relation_as(interp, into, Some(&query_node), RelKind::Table, false)
+}
+
+/// Shared body of CREATE TABLE AS / CREATE MATERIALIZED VIEW / SELECT INTO
+/// (`ExecCreateTableAs` + `intorel_startup`, createas.c).
+fn create_relation_as(
+    interp: &mut PgCatalog,
+    into: &protobuf::IntoClause,
+    query: Option<&protobuf::Node>,
+    kind: RelKind,
+    if_not_exists: bool,
+) -> Result<(), DdlError> {
+    let rv = into
+        .rel
+        .as_ref()
+        .ok_or_else(|| DdlError::Parse("CREATE TABLE AS without target".into()))?;
     let (nsoid, name) = ensure_range_var(interp, rv)?;
+
+    // CreateTableAsRelExists: checked before the query runs, so IF NOT
+    // EXISTS skips the whole statement (NOTICE ... already exists, skipping).
+    if interp.class_by_qname.contains_key(&(nsoid, name.clone())) {
+        if if_not_exists {
+            return Ok(());
+        }
+        return Err(DdlError::DuplicateObject(format!(
+            "relation \"{name}\" already exists"
+        )));
+    }
+
     let qn_label = crate::qualified_name::QualifiedName::new(
         interp.namespace_name(nsoid).unwrap_or("?"),
         name.clone(),
     )
     .to_string();
-
-    let resolved = match stmt.query.as_deref() {
-        Some(query_node) => resolve_view_now(interp, query_node, &[]).map_err(|e| match e {
-            DdlError::ViewAnalysis { source, .. } => DdlError::ViewAnalysis {
-                view: qn_label.clone(),
-                source,
-            },
-            other => other,
-        })?,
+    let aliases = string_list(&into.col_names);
+    let mut resolved = match query {
+        Some(query_node) => {
+            resolve_view_now(interp, query_node, &aliases).map_err(|e| match e {
+                DdlError::ViewAnalysis { source, .. } => DdlError::ViewAnalysis {
+                    view: qn_label.clone(),
+                    source,
+                },
+                other => other,
+            })?
+        }
         None => ResolvedView::default(),
     };
+    if aliases.len() > resolved.columns.len() {
+        return Err(DdlError::Parse(
+            "too many column names were specified".into(),
+        ));
+    }
+    check_duplicate_columns(&resolved.columns)?;
+    super::util::check_relation_name_free(interp, nsoid, &name)?;
+
+    // A table created from a query is an ordinary table: its columns carry
+    // no NOT NULL constraint, whatever the query's nullability. (A matview
+    // can only ever hold its query's rows, so it keeps the inferred one.)
+    if kind == RelKind::Table {
+        for col in &mut resolved.columns {
+            col.not_null = false;
+        }
+    }
 
     install_relation(interp, nsoid, name, kind, resolved)?;
+    Ok(())
+}
+
+/// The `String` values of a name list (view aliases, CTAS column names).
+fn string_list(nodes: &[protobuf::Node]) -> Vec<String> {
+    nodes
+        .iter()
+        .filter_map(|n| match n.node.as_ref() {
+            Some(node::Node::String(s)) => Some(s.sval.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The relation's columns go through `MergeAttributes`, which rejects a
+/// repeated name.
+fn check_duplicate_columns(columns: &[ResolvedColumn]) -> Result<(), DdlError> {
+    for (i, col) in columns.iter().enumerate() {
+        if columns[..i].iter().any(|c| c.name == col.name) {
+            return Err(DdlError::DuplicateObject(format!(
+                "column \"{}\" specified more than once",
+                col.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// `checkViewColumns` (view.c): CREATE OR REPLACE VIEW may only add
+/// columns at the end — existing ones keep their name, type and typmod.
+fn check_view_columns(
+    interp: &PgCatalog,
+    view_oid: PgClassOid,
+    new_columns: &[ResolvedColumn],
+) -> Result<(), DdlError> {
+    let old = interp.attributes_of(view_oid);
+    if new_columns.len() < old.len() {
+        return Err(DdlError::Parse("cannot drop columns from view".into()));
+    }
+    for (old_col, new_col) in old.iter().zip(new_columns) {
+        if old_col.attname != new_col.name {
+            return Err(DdlError::Parse(format!(
+                "cannot change name of view column \"{}\" to \"{}\"",
+                old_col.attname, new_col.name
+            )));
+        }
+        if old_col.atttypid != new_col.type_oid || old_col.atttypmod != new_col.typmod {
+            return Err(DdlError::Parse(format!(
+                "cannot change data type of view column \"{}\" from {} to {}",
+                old_col.attname,
+                super::util::format_type_with_typmod(interp, old_col.atttypid, old_col.atttypmod),
+                super::util::format_type_with_typmod(interp, new_col.type_oid, new_col.typmod),
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Redefine an existing view in place: same OID and row type, the column
+/// list extended / refreshed, the `_RETURN` rule and `pg_depend` edges
+/// replaced.
+fn replace_view(
+    interp: &mut PgCatalog,
+    view_oid: PgClassOid,
+    resolved: ResolvedView,
+) -> Result<(), DdlError> {
+    let ResolvedView {
+        columns,
+        bindings,
+        ast,
+        deps,
+    } = resolved;
+    let attrs: Vec<PgAttribute> = columns
+        .iter()
+        .enumerate()
+        .map(|(i, col)| PgAttribute {
+            attrelid: view_oid,
+            attname: col.name.clone(),
+            atttypid: col.type_oid,
+            attnum: (i + 1) as i16,
+            attnotnull: col.not_null,
+            atthasdef: false,
+            attgenerated: None,
+            atttypmod: col.typmod,
+            attidentity: None,
+            attcollation: None,
+        })
+        .collect();
+    interp.pg_attribute.insert(view_oid, attrs);
+    interp.remove_pg_rewrites_of(view_oid);
+    let rewrite_oid = PgRewriteOid::from_nonzero(interp.alloc_oid()?);
+    interp.insert_pg_rewrite(PgRewrite {
+        oid: rewrite_oid,
+        rulename: "_RETURN".to_owned(),
+        ev_class: view_oid,
+        ev_type: EvType::Select,
+        ev_enabled: EvEnabled::Origin,
+        is_instead: true,
+        ev_qual: None,
+        ev_action: SerializedAst { ast, bindings },
+    });
+    interp.remove_dependencies_of(
+        PG_CLASS_RELID,
+        PgGenericOid::from_nonzero(view_oid.into_nonzero()),
+    );
+    record_view_dependencies(interp, view_oid, &deps);
     Ok(())
 }
 

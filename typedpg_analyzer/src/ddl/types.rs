@@ -166,6 +166,10 @@ pub fn create_composite(interp: &mut PgCatalog, stmt: &CompositeTypeStmt) -> Res
             "type \"{name}\" already exists"
         )));
     }
+    // A composite type is backed by a relation (DefineCompositeType →
+    // DefineRelation), which must not collide either — e.g. with a
+    // sequence, which has no row type.
+    super::util::check_relation_name_free(interp, nsoid, &name)?;
 
     // Collect column definitions before mutating, so we can resolve type
     // names against the catalog without holding a mutable borrow.

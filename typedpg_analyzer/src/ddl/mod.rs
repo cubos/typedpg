@@ -172,6 +172,7 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         // ── Session state (search_path) ─────────────────────────────
         node::Node::VariableSetStmt(s) => session::variable_set(db, s),
         node::Node::TransactionStmt(s) => session::transaction(db, s),
+        node::Node::SelectStmt(s) if s.into_clause.is_some() => views::select_into(db, s),
         node::Node::SelectStmt(s) => session::select_side_effects(db, s),
 
         // ── Indexes ─────────────────────────────────────────────────

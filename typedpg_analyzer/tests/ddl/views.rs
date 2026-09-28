@@ -952,3 +952,236 @@ fn drop_function_unused_by_view_succeeds() {
     ]);
     assert!(snap.find_functions(None, "shout").is_empty());
 }
+
+// ── Name collisions (heap_create_with_catalog / DefineVirtualRelation) ──────
+
+#[test]
+fn create_view_over_an_existing_table_is_rejected() {
+    // PG 18: 42P07 relation "t" already exists.
+    assert_ddl_err!(
+        try_apply(&[(
+            "0001.sql",
+            "CREATE TABLE t (a int); CREATE VIEW t AS SELECT 'x'::text AS b;",
+        )]),
+        DdlError::DuplicateObject(_),
+        "relation \"t\" already exists",
+    );
+}
+
+#[test]
+fn create_or_replace_view_requires_an_existing_view() {
+    // PG 18: 42809 "v" is not a view (a table, a matview).
+    assert_ddl_err!(
+        try_apply(&[(
+            "0001.sql",
+            "CREATE TABLE v (a int); CREATE OR REPLACE VIEW v AS SELECT 'x'::text AS b;",
+        )]),
+        DdlError::DuplicateObject(_),
+        "\"v\" is not a view",
+    );
+    assert_ddl_err!(
+        try_apply(&[(
+            "0001.sql",
+            "CREATE MATERIALIZED VIEW mvv AS SELECT 1 AS a;
+             CREATE OR REPLACE VIEW mvv AS SELECT 1 AS a;",
+        )]),
+        DdlError::DuplicateObject(_),
+        "\"mvv\" is not a view",
+    );
+}
+
+#[test]
+fn relation_names_collide_with_type_names() {
+    // PG 18: 42710 type "e" already exists — for tables, views, matviews,
+    // CTAS and sequences alike.
+    for stmt in [
+        "CREATE TABLE e (a int);",
+        "CREATE VIEW e AS SELECT 1 AS x;",
+        "CREATE TABLE e AS SELECT 1 AS x;",
+        "CREATE MATERIALIZED VIEW e AS SELECT 1 AS x;",
+        "CREATE SEQUENCE e;",
+    ] {
+        assert_ddl_err!(
+            try_apply(&[
+                ("0001.sql", "CREATE TYPE e AS ENUM ('a');"),
+                ("0002.sql", stmt)
+            ]),
+            DdlError::DuplicateObject(_),
+            "type \"e\" already exists",
+        );
+    }
+}
+
+#[test]
+fn create_or_replace_view_keeps_existing_columns() {
+    // PG 18 checkViewColumns: 42P16 for dropping, renaming or retyping.
+    let base = "CREATE TABLE t (a int, b text); CREATE VIEW v AS SELECT a, b FROM t;";
+    assert_ddl_err!(
+        try_apply(&[
+            ("0001.sql", base),
+            ("0002.sql", "CREATE OR REPLACE VIEW v AS SELECT a FROM t;"),
+        ]),
+        DdlError::Parse(_),
+        "cannot drop columns from view",
+    );
+    assert_ddl_err!(
+        try_apply(&[
+            ("0001.sql", base),
+            (
+                "0002.sql",
+                "CREATE OR REPLACE VIEW v AS SELECT b AS a, b FROM t;"
+            ),
+        ]),
+        DdlError::Parse(_),
+        "cannot change data type of view column \"a\" from integer to text",
+    );
+    assert_ddl_err!(
+        try_apply(&[
+            ("0001.sql", base),
+            (
+                "0002.sql",
+                "CREATE OR REPLACE VIEW v AS SELECT a AS z, b FROM t;"
+            ),
+        ]),
+        DdlError::Parse(_),
+        "cannot change name of view column \"a\" to \"z\"",
+    );
+    assert_ddl_err!(
+        try_apply(&[
+            (
+                "0001.sql",
+                "CREATE TABLE t (a varchar(5)); CREATE VIEW vt AS SELECT a FROM t;",
+            ),
+            (
+                "0002.sql",
+                "CREATE OR REPLACE VIEW vt AS SELECT a::varchar(6) AS a FROM t;",
+            ),
+        ]),
+        DdlError::Parse(_),
+        "cannot change data type of view column \"a\" from character varying(5) to character varying(6)",
+    );
+}
+
+#[test]
+fn create_or_replace_view_may_append_columns_and_keeps_dependents() {
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int, b text);
+         CREATE VIEW v AS SELECT a FROM t;
+         CREATE VIEW w AS SELECT a FROM v;
+         CREATE OR REPLACE VIEW v AS SELECT a, b FROM t;",
+    )]);
+    assert_cols(
+        &db.analyze("SELECT * FROM v").unwrap(),
+        vec![cn("a", int4()), cn("b", text())],
+    );
+    // `w` still depends on `v`: dropping `v` without CASCADE is refused.
+    let mut db = db;
+    assert!(db.apply_sql("DROP VIEW v;").is_err());
+}
+
+#[test]
+fn create_view_column_name_checks() {
+    // PG 18: 42601 more column names than columns; 42701 duplicate name.
+    assert_ddl_err!(
+        try_apply(&[("0001.sql", "CREATE VIEW v2 (x, y) AS SELECT 1 AS a;")]),
+        DdlError::Parse(_),
+        "CREATE VIEW specifies more column names than columns",
+    );
+    assert_ddl_err!(
+        try_apply(&[("0001.sql", "CREATE VIEW v9 AS SELECT 1 AS a, 2 AS a;")]),
+        DdlError::DuplicateObject(_),
+        "column \"a\" specified more than once",
+    );
+}
+
+// ── CREATE TABLE AS / SELECT INTO ───────────────────────────────────────────
+
+#[test]
+fn create_table_as_columns_are_nullable() {
+    // PG 18: CTAS columns have attnotnull = f, so NULL can be inserted.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int NOT NULL); CREATE TABLE t2 AS SELECT a FROM t;",
+    )]);
+    assert_cols(
+        &db.analyze("SELECT * FROM t2").unwrap(),
+        vec![cn("a", int4())],
+    );
+    db.analyze("INSERT INTO t2 VALUES (NULL)").unwrap();
+}
+
+#[test]
+fn create_table_as_applies_the_column_name_list() {
+    // PG 18 `\d t3`: x integer, y text; `\d t6`: x integer, b integer.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int NOT NULL);
+         CREATE TABLE t3 (x, y) AS SELECT a, a::text FROM t;
+         CREATE TABLE t6 (x) AS SELECT a, a AS b FROM t;
+         CREATE MATERIALIZED VIEW mv2 (q) AS SELECT 1 AS a;",
+    )]);
+    assert_cols(
+        &db.analyze("SELECT * FROM t3").unwrap(),
+        vec![cn("x", int4()), cn("y", text())],
+    );
+    assert_cols(
+        &db.analyze("SELECT * FROM t6").unwrap(),
+        vec![cn("x", int4()), cn("b", int4())],
+    );
+    assert_eq!(
+        db.analyze("SELECT * FROM mv2").unwrap().columns[0].name,
+        "q"
+    );
+    assert_ddl_err!(
+        try_apply(&[(
+            "0001.sql",
+            "CREATE TABLE t (a int); CREATE TABLE t5 (x, y, z) AS SELECT a, a FROM t;",
+        )]),
+        DdlError::Parse(_),
+        "too many column names were specified",
+    );
+    assert_ddl_err!(
+        try_apply(&[("0001.sql", "CREATE TABLE t8 AS SELECT 1 AS a, 2 AS a;")]),
+        DdlError::DuplicateObject(_),
+        "column \"a\" specified more than once",
+    );
+}
+
+#[test]
+fn create_table_as_if_not_exists_keeps_the_existing_relation() {
+    // PG 18: NOTICE relation "t4" already exists, skipping — t4 keeps `a`.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t4 AS SELECT 1 AS a;
+         CREATE TABLE IF NOT EXISTS t4 AS SELECT 'x' AS b;
+         CREATE MATERIALIZED VIEW mv AS SELECT 1 AS a;
+         CREATE MATERIALIZED VIEW IF NOT EXISTS mv AS SELECT 'x' AS b;",
+    )]);
+    assert_cols(
+        &db.analyze("SELECT * FROM t4").unwrap(),
+        vec![cn("a", int4())],
+    );
+    assert_eq!(db.analyze("SELECT * FROM mv").unwrap().columns[0].name, "a");
+    assert_ddl_err!(
+        try_apply(&[(
+            "0001.sql",
+            "CREATE TABLE t4 AS SELECT 1 AS a; CREATE TABLE t4 AS SELECT 1 AS a;",
+        )]),
+        DdlError::DuplicateObject(_),
+        "relation \"t4\" already exists",
+    );
+}
+
+#[test]
+fn select_into_creates_a_table() {
+    // PG 18 `\d t7`: a integer (nullable).
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int NOT NULL); SELECT a INTO t7 FROM t;",
+    )]);
+    assert_cols(
+        &db.analyze("SELECT * FROM t7").unwrap(),
+        vec![cn("a", int4())],
+    );
+}

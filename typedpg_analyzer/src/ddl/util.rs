@@ -461,6 +461,73 @@ pub fn index_name_addition(colnames: &[String]) -> String {
     out
 }
 
+/// `heap_create_with_catalog`'s name checks for a new relation: no relation
+/// of that name may exist in the schema, and neither may a type (every
+/// relation with a row type claims the name in `pg_type` too). An
+/// auto-generated array type is not a conflict — PG renames it out of the
+/// way.
+pub fn check_relation_name_free(
+    snapshot: &PgCatalog,
+    nsoid: PgNamespaceOid,
+    name: &str,
+) -> Result<(), DdlError> {
+    if snapshot
+        .class_by_qname
+        .contains_key(&(nsoid, name.to_owned()))
+    {
+        return Err(DdlError::DuplicateObject(format!(
+            "relation \"{name}\" already exists"
+        )));
+    }
+    if let Some(t) = snapshot
+        .type_by_qname
+        .get(&(nsoid, name.to_owned()))
+        .and_then(|oid| snapshot.pg_type.get(oid))
+    {
+        let is_auto_array = t.typcategory == crate::pg_catalog::TypCategory::Array
+            && t.typelem
+                .is_some_and(|e| snapshot.array_type_of(e) == Some(t.oid));
+        if !is_auto_array {
+            return Err(DdlError::DuplicateObject(format!(
+                "type \"{name}\" already exists"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// PG's `format_type_with_typemod`: [`format_type_for_message`] plus the
+/// type modifier, e.g. `character varying(5)`, `numeric(10,2)`,
+/// `timestamp(3) without time zone`.
+pub fn format_type_with_typmod(
+    snapshot: &PgCatalog,
+    oid: PgTypeOid,
+    typmod: Option<i32>,
+) -> String {
+    use crate::typmod::DecodedTypmod;
+    let base = format_type_for_message(snapshot, oid);
+    let modifier = match crate::typmod::decode(snapshot, oid, typmod) {
+        DecodedTypmod::None => return base,
+        DecodedTypmod::Length(n) | DecodedTypmod::Precision(n) | DecodedTypmod::VectorDim(n) => {
+            format!("({n})")
+        }
+        DecodedTypmod::Numeric { precision, scale } => format!("({precision},{scale})"),
+        DecodedTypmod::Other(n) => format!("({n})"),
+    };
+    // The datetime types carry the modifier before their zone suffix.
+    for (head, tail) in [
+        ("timestamp", " without time zone"),
+        ("timestamp", " with time zone"),
+        ("time", " without time zone"),
+        ("time", " with time zone"),
+    ] {
+        if base == format!("{head}{tail}") {
+            return format!("{head}{modifier}{tail}");
+        }
+    }
+    format!("{base}{modifier}")
+}
+
 /// Extract a string value from a Node.
 pub fn node_string(n: &Node) -> Option<&str> {
     match n.node.as_ref()? {
