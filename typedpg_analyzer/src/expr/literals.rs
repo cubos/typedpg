@@ -189,8 +189,44 @@ pub(crate) fn infer_type_cast(
     // T(n), and `x::T` is T with typmod -1 even when x already was a T(n)
     // (coerce_type_typmod relabels to the target typmod).
     let state = derive_collation([&inner_type], target_oid, snapshot)?;
-    Ok(
-        ExprType::scalar_with_typmod(target_oid, inner_type.nullable, written_typmod)
-            .with_collation(state),
-    )
+    let nullable = inner_type.nullable
+        || cast_function_can_return_null(inner_type.type_oid, target_oid, snapshot);
+    Ok(ExprType::scalar_with_typmod(target_oid, nullable, written_typmod).with_collation(state))
+}
+
+/// Whether the cast from `source` to `target` runs a cast function that can
+/// return NULL for a non-NULL input — `int4(jsonb)` and the other jsonb →
+/// scalar casts yield NULL for a JSON null. PG names a built-in cast
+/// function after its target type (`pg_cast.castfunc` isn't in the
+/// snapshot), and its nullability comes from the per-overload table.
+fn cast_function_can_return_null(
+    source: PgTypeOid,
+    target: PgTypeOid,
+    snapshot: &PgCatalog,
+) -> bool {
+    let (source, target) = (
+        snapshot.unwrap_domain(source),
+        snapshot.unwrap_domain(target),
+    );
+    let Some(cast) = snapshot
+        .cast_by_pair
+        .get(&(source, target))
+        .and_then(|oid| snapshot.pg_cast.get(oid))
+    else {
+        return false;
+    };
+    if cast.castmethod != crate::pg_catalog::CastMethod::Function {
+        return false;
+    }
+    let (Some(src), Some(tgt)) = (snapshot.get_type(source), snapshot.get_type(target)) else {
+        return false;
+    };
+    snapshot
+        .find_functions(Some("pg_catalog"), &tgt.typname)
+        .iter()
+        .find(|f| f.proargtypes.first() == Some(&source) && f.prorettype == target)
+        .is_some_and(|f| {
+            let sig = format!("{}({})", f.proname, src.typname);
+            f.proisstrict && crate::builtin_nullability::NULLABLE_STRICT.contains(&sig.as_str())
+        })
 }

@@ -522,3 +522,35 @@ fn typename_followed_by_a_parameter_is_a_syntax_error() {
         db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
 }
+
+// ── Nullability of casts and operators whose function can yield NULL ──────
+
+#[test]
+fn jsonb_to_scalar_casts_are_nullable() {
+    // int4(jsonb) & co. return NULL for a JSON null (PG 18:
+    // 'null'::jsonb::int4 IS NULL); jsonb → text is I/O and never NULL.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE tj (j jsonb NOT NULL);").unwrap();
+    let s = db
+        .analyze(
+            "SELECT 'null'::jsonb::int4 AS a, j::int4 AS b, j::bool AS c, j::numeric AS d, \
+             j::float8 AS e, j::int8 AS f, j::int2 AS g, j::float4 AS h, j::text AS i, \
+             j::json AS k FROM tj",
+        )
+        .unwrap();
+    assert_cols(
+        &s,
+        vec![
+            cn("a", int4()),
+            cn("b", int4()),
+            cn("c", bool_ty()),
+            cn("d", numeric()),
+            cn("e", float8()),
+            cn("f", int8()),
+            cn("g", int2()),
+            cn("h", float4()),
+            c("i", text()),
+            c("k", json_ty()),
+        ],
+    );
+}
