@@ -121,6 +121,8 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         // ── Tables ──────────────────────────────────────────────────
         node::Node::CreateStmt(s) => tables::create_table(db, s),
         node::Node::AlterTableStmt(s) => tables::alter_table(db, s),
+        node::Node::CreateForeignTableStmt(s) => tables::create_foreign_table(db, s),
+        node::Node::RefreshMatViewStmt(s) => views::refresh_materialized_view(db, s),
 
         // ── Types ───────────────────────────────────────────────────
         node::Node::CreateDomainStmt(s) => types::create_domain(db, s),
@@ -216,7 +218,63 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         | node::Node::ListenStmt(_)
         | node::Node::UnlistenStmt(_)
         | node::Node::AlterExtensionContentsStmt(_)
-        | node::Node::CreateAmStmt(_) => Ok(()),
+        | node::Node::CreateAmStmt(_)
+        // Statements PG accepts in a migration that don't change anything the
+        // static analysis reads: DML and procedure calls (like the SELECT /
+        // INSERT above), prepared statements and cursors, statistics,
+        // database / role / system settings, ownership, publications and
+        // subscriptions, event triggers, operator families, text search
+        // configuration, foreign-data wrappers / servers / user mappings,
+        // tablespaces, conversions, languages, transforms, security labels,
+        // and type property changes (`ALTER TYPE t SET (...)`).
+        | node::Node::CallStmt(_)
+        | node::Node::MergeStmt(_)
+        | node::Node::PrepareStmt(_)
+        | node::Node::ExecuteStmt(_)
+        | node::Node::DeallocateStmt(_)
+        | node::Node::DeclareCursorStmt(_)
+        | node::Node::FetchStmt(_)
+        | node::Node::ClosePortalStmt(_)
+        | node::Node::CheckPointStmt(_)
+        | node::Node::LoadStmt(_)
+        | node::Node::CreateStatsStmt(_)
+        | node::Node::AlterStatsStmt(_)
+        | node::Node::AlterDatabaseStmt(_)
+        | node::Node::AlterDatabaseSetStmt(_)
+        | node::Node::AlterDatabaseRefreshCollStmt(_)
+        | node::Node::AlterRoleSetStmt(_)
+        | node::Node::AlterSystemStmt(_)
+        | node::Node::DropRoleStmt(_)
+        | node::Node::ReassignOwnedStmt(_)
+        | node::Node::DropOwnedStmt(_)
+        | node::Node::CreateEventTrigStmt(_)
+        | node::Node::AlterEventTrigStmt(_)
+        | node::Node::CreatePublicationStmt(_)
+        | node::Node::AlterPublicationStmt(_)
+        | node::Node::CreateSubscriptionStmt(_)
+        | node::Node::AlterSubscriptionStmt(_)
+        | node::Node::DropSubscriptionStmt(_)
+        | node::Node::CreateOpFamilyStmt(_)
+        | node::Node::AlterTsconfigurationStmt(_)
+        | node::Node::AlterTsdictionaryStmt(_)
+        | node::Node::CreateFdwStmt(_)
+        | node::Node::AlterFdwStmt(_)
+        | node::Node::CreateForeignServerStmt(_)
+        | node::Node::AlterForeignServerStmt(_)
+        | node::Node::CreateUserMappingStmt(_)
+        | node::Node::AlterUserMappingStmt(_)
+        | node::Node::DropUserMappingStmt(_)
+        | node::Node::ImportForeignSchemaStmt(_)
+        | node::Node::CreateTableSpaceStmt(_)
+        | node::Node::DropTableSpaceStmt(_)
+        | node::Node::AlterTableSpaceOptionsStmt(_)
+        | node::Node::CreateConversionStmt(_)
+        | node::Node::CreatePlangStmt(_)
+        | node::Node::CreateTransformStmt(_)
+        | node::Node::AlterCollationStmt(_)
+        | node::Node::AlterObjectDependsStmt(_)
+        | node::Node::SecLabelStmt(_)
+        | node::Node::AlterTypeStmt(_) => Ok(()),
 
         // ── Unknown DDL — surface as an error ───────────────────────
         other => Err(DdlError::UnsupportedDdl(format!("{other:?}"))),

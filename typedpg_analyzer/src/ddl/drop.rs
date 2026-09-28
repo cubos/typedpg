@@ -24,7 +24,8 @@ pub fn drop_objects(interp: &mut PgCatalog, stmt: &DropStmt) -> Result<(), DdlEr
             ObjectType::ObjectTable
             | ObjectType::ObjectView
             | ObjectType::ObjectMatview
-            | ObjectType::ObjectSequence => {
+            | ObjectType::ObjectSequence
+            | ObjectType::ObjectForeignTable => {
                 drop_relation(interp, obj_node, stmt.missing_ok, cascade, obj_type)?;
             }
             ObjectType::ObjectType | ObjectType::ObjectDomain => {
@@ -51,10 +52,7 @@ pub fn drop_objects(interp: &mut PgCatalog, stmt: &DropStmt) -> Result<(), DdlEr
             ObjectType::ObjectIndex => {
                 drop_index(interp, obj_node, stmt.missing_ok)?;
             }
-            ObjectType::ObjectTrigger
-            | ObjectType::ObjectRule
-            | ObjectType::ObjectPolicy
-            | ObjectType::ObjectForeignTable => {}
+            ObjectType::ObjectTrigger | ObjectType::ObjectRule | ObjectType::ObjectPolicy => {}
             _ => {}
         }
     }
@@ -81,6 +79,7 @@ fn drop_relation(
         ObjectType::ObjectView => "view",
         ObjectType::ObjectMatview => "materialized view",
         ObjectType::ObjectSequence => "sequence",
+        ObjectType::ObjectForeignTable => "foreign table",
         _ => "table",
     };
 
@@ -110,6 +109,7 @@ fn drop_relation(
         Some(RelKind::View) => "view",
         Some(RelKind::MaterializedView) => "materialized view",
         Some(RelKind::Sequence) => "sequence",
+        Some(RelKind::ForeignTable) => "foreign table",
         _ => "table",
     };
 
@@ -119,6 +119,7 @@ fn drop_relation(
         ObjectType::ObjectView => actual_relkind == Some(RelKind::View),
         ObjectType::ObjectMatview => actual_relkind == Some(RelKind::MaterializedView),
         ObjectType::ObjectSequence => actual_relkind == Some(RelKind::Sequence),
+        ObjectType::ObjectForeignTable => actual_relkind == Some(RelKind::ForeignTable),
         _ => matches!(actual_relkind, Some(RelKind::Table | RelKind::Partitioned)),
     };
     if !kind_matches {

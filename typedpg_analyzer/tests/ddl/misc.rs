@@ -167,3 +167,78 @@ fn complex_real_world_migration_chain() {
     let projects = snap.resolve_table(None, "projects").unwrap();
     assert_eq!(snap.attributes_of(projects.oid).len(), 7);
 }
+
+// ── Statements PG accepts that don't reshape the catalog ────────────────────
+
+#[test]
+fn common_migration_statements_are_accepted() {
+    // PG 18 accepts each of these; none changes a relation's shape.
+    build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int, b int);
+         CREATE MATERIALIZED VIEW mv AS SELECT a FROM t;
+         CREATE PROCEDURE p(x int) LANGUAGE sql AS 'insert into t values (x)';
+         REFRESH MATERIALIZED VIEW mv;
+         REFRESH MATERIALIZED VIEW mv WITH NO DATA;
+         CALL p(1);
+         MERGE INTO t USING (SELECT 1 x) s ON t.a = s.x
+             WHEN NOT MATCHED THEN INSERT VALUES (s.x);
+         CREATE STATISTICS st ON a, b FROM t;
+         ALTER STATISTICS st SET STATISTICS 100;
+         ALTER DATABASE postgres SET timezone TO 'UTC';
+         ALTER DATABASE postgres RESET timezone;
+         CREATE ROLE r;
+         ALTER ROLE r SET search_path = public;
+         REASSIGN OWNED BY r TO postgres;
+         DROP OWNED BY r;
+         DROP ROLE r;
+         PREPARE q AS SELECT 1;
+         EXECUTE q;
+         DEALLOCATE q;
+         CREATE PUBLICATION pub FOR TABLE t;
+         CREATE OPERATOR FAMILY f USING btree;
+         CREATE TEXT SEARCH CONFIGURATION my_cfg (COPY = english);
+         ALTER TEXT SEARCH CONFIGURATION my_cfg ALTER MAPPING FOR word WITH simple;
+         CHECKPOINT;",
+    )]);
+}
+
+#[test]
+fn refresh_materialized_view_requires_one() {
+    // PG 18: 0A000 "t" is not a materialized view; 42P01 for a missing one.
+    assert_ddl_err!(
+        try_apply(&[(
+            "0001.sql",
+            "CREATE TABLE t (a int); REFRESH MATERIALIZED VIEW t;"
+        )]),
+        DdlError::Parse(_),
+        "\"t\" is not a materialized view",
+    );
+    assert_ddl_err!(
+        try_apply(&[("0001.sql", "REFRESH MATERIALIZED VIEW nosuch;")]),
+        DdlError::TableNotFound(_),
+        "relation \"nosuch\" does not exist",
+    );
+}
+
+#[test]
+fn foreign_tables_are_relations() {
+    // PG 18: the foreign table has its declared columns; DROP TABLE on it is
+    // refused, DROP FOREIGN TABLE works.
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE FOREIGN DATA WRAPPER w;
+         CREATE SERVER srv FOREIGN DATA WRAPPER w;
+         CREATE FOREIGN TABLE ft (a int NOT NULL, b text) SERVER srv;",
+    )]);
+    assert_cols(
+        &db.analyze("SELECT * FROM ft").unwrap(),
+        vec![c("a", int4()), cn("b", text())],
+    );
+    let err = db.apply_sql("DROP TABLE ft;").unwrap_err();
+    assert!(
+        err.to_string().starts_with("\"ft\" is not a table"),
+        "{err}"
+    );
+    db.apply_sql("DROP FOREIGN TABLE ft;").unwrap();
+}

@@ -221,6 +221,39 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
     Ok(())
 }
 
+/// `CREATE FOREIGN TABLE name (...) SERVER s`: a relation like a table
+/// (columns, NOT NULL, defaults, inheritance) with relkind 'f'. The rows live
+/// elsewhere; the server and options don't affect typing.
+pub fn create_foreign_table(
+    interp: &mut PgCatalog,
+    stmt: &pg_query::protobuf::CreateForeignTableStmt,
+) -> Result<(), DdlError> {
+    let Some(base) = stmt.base_stmt.as_ref() else {
+        return Ok(());
+    };
+    let existed = base.relation.as_ref().and_then(|rv| {
+        let (schema, name) = range_var_names(rv, interp);
+        interp
+            .namespace_oid(&schema)
+            .and_then(|ns| interp.class_by_qname.get(&(ns, name)).copied())
+    });
+    create_table(interp, base)?;
+    if existed.is_some() {
+        return Ok(());
+    }
+    if let Some(rv) = base.relation.as_ref() {
+        let (schema, name) = range_var_names(rv, interp);
+        if let Some(oid) = interp
+            .namespace_oid(&schema)
+            .and_then(|ns| interp.class_by_qname.get(&(ns, name)).copied())
+            && let Some(class) = interp.pg_class.get_mut(&oid)
+        {
+            class.relkind = RelKind::ForeignTable;
+        }
+    }
+    Ok(())
+}
+
 /// Parsed column definition shared between `CREATE TABLE` and `ALTER TABLE`.
 #[derive(Clone)]
 struct ParsedColumn {
