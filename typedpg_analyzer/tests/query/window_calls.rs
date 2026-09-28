@@ -340,6 +340,40 @@ fn range_offsets_need_in_range_support() {
 }
 
 #[test]
+fn range_offset_errors_name_the_sort_opclass_input_type() {
+    // PG names the btree opclass input type of the sort key, not the
+    // column's own type.
+    let mut db = window_setup();
+    db.apply_sql(
+        "CREATE DOMAIN dv AS varchar(5);
+         CREATE TABLE r (arr int[], v varchar(10), d dv, c char(3), n name, x int);",
+    )
+    .unwrap();
+    for (key, shown) in [
+        ("arr", "anyarray"),
+        ("v", "text"),
+        ("d", "text"),
+        ("c", "character"),
+        ("n", "name"),
+    ] {
+        let sql = format!(
+            "SELECT sum(x) OVER (ORDER BY {key} RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM r"
+        );
+        assert_err_kind!(
+            db,
+            &sql,
+            AnalyzeError::FeatureNotSupported(_),
+            &format!(
+                "RANGE with offset PRECEDING/FOLLOWING is not supported for column type {shown}"
+            )
+        );
+    }
+    // Keys with in_range support are unaffected.
+    db.analyze("SELECT sum(x) OVER (ORDER BY x RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM r")
+        .unwrap();
+}
+
+#[test]
 fn range_offset_params_take_the_in_range_offset_type() {
     let db = window_setup();
     for (sql, param) in [

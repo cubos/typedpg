@@ -20,6 +20,11 @@ use crate::pg_catalog::{
 #[derive(Debug, Clone)]
 pub struct ResolvedOperator {
     pub left_type_oid: Option<PgTypeOid>,
+    /// The operator's declared left operand (`oprleft`), before polymorphic
+    /// resolution. For an ordering operator this is its btree opclass's
+    /// input type (`opcintype`): `text` for a `varchar` key, `anyarray` for
+    /// an array.
+    pub declared_left_type_oid: Option<PgTypeOid>,
     pub right_type_oid: PgTypeOid,
     pub result_type_oid: PgTypeOid,
 }
@@ -455,6 +460,7 @@ impl PgCatalog {
         ) {
             Ok((result_type_oid, _)) => OperatorMatch::Found(ResolvedOperator {
                 left_type_oid: chosen.oprleft.map(|_| declared[0]),
+                declared_left_type_oid: chosen.oprleft,
                 right_type_oid: *declared.last().unwrap_or(&chosen.oprright),
                 result_type_oid,
             }),

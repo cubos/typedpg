@@ -811,10 +811,16 @@ fn transform_window_def(
 }
 
 /// `transformFrameOffset`'s RANGE branch: among the btree `in_range`
-/// support functions for the sort key's type (in `pg_catalog`, each
-/// `in_range(key, key, offset, bool, bool)` is one), keep those whose
-/// offset type the offset coerces to implicitly and pick one — preferring
-/// the offset's own type, or the key's type for an unknown offset.
+/// support functions for the sort key's opclass input type (in
+/// `pg_catalog`, each `in_range(key, key, offset, bool, bool)` is one), keep
+/// those whose offset type the offset coerces to implicitly and pick one —
+/// preferring the offset's own type, or the key's type for an unknown
+/// offset.
+///
+/// PG takes that input type (`opcintype`) from the ORDER BY's sort operator
+/// and also names it in its errors; without `pg_opclass` it is the declared
+/// left operand of the key's `<` operator — `text` for a `varchar` or a
+/// domain over it, `anyarray` for an array.
 fn in_range_offset_type(
     key: PgTypeOid,
     offset_type: PgTypeOid,
@@ -823,6 +829,10 @@ fn in_range_offset_type(
 ) -> Result<PgTypeOid, AnalyzeError> {
     let snapshot = ctx.snapshot;
     let key = snapshot.unwrap_domain(key);
+    let key = snapshot
+        .find_operator("<", Some(key), key)
+        .and_then(|op| op.declared_left_type_oid)
+        .unwrap_or(key);
     let span =
         crate::error::node_location(offset).and_then(crate::error::SourceSpan::from_node_qname);
     let fmt = |t| crate::ddl::util::format_type_for_message(snapshot, t);
