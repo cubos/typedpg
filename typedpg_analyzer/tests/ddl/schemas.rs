@@ -75,3 +75,119 @@ fn drop_schema_missing_errors_without_if_exists() {
         "schema \"nonexistent\" does not exist"
     );
 }
+
+// ── search_path set by migrations ───────────────────────────────────────────
+
+#[test]
+fn set_search_path_directs_where_objects_are_created() {
+    // PG 18: app.t exists with column a integer; public.t does not (42P01).
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE SCHEMA app;
+         SET search_path = app, public;
+         CREATE TABLE t (a int);
+         RESET search_path;",
+    )]);
+    let info = db.analyze("SELECT * FROM app.t").unwrap();
+    assert_cols(&info, vec![cn("a", int4())]);
+    let err = db.analyze("SELECT * FROM public.t").unwrap_err();
+    assert!(matches!(err, AnalyzeError::UndefinedTable(_)), "{err:?}");
+    assert!(
+        err.to_string()
+            .starts_with("relation \"public.t\" does not exist"),
+        "{err}"
+    );
+}
+
+#[test]
+fn set_search_path_resolves_unqualified_types() {
+    // PG 18: app.t2.m is app.mood.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE SCHEMA app;
+         CREATE TYPE app.mood AS ENUM ('x');
+         SET search_path = app;
+         CREATE TABLE t2 (m mood);
+         RESET search_path;",
+    )]);
+    let info = db.analyze("SELECT m FROM app.t2").unwrap();
+    assert_cols(&info, vec![cn("m", enum_ty("app", "mood", &["x"]))]);
+}
+
+#[test]
+fn search_path_may_name_a_schema_created_later() {
+    let db = build_db(&[(
+        "0001.sql",
+        "SET search_path = later, public;
+         CREATE SCHEMA later;
+         CREATE TABLE t3 (a int);
+         RESET search_path;",
+    )]);
+    let info = db.analyze("SELECT * FROM later.t3").unwrap();
+    assert_cols(&info, vec![cn("a", int4())]);
+}
+
+#[test]
+fn set_config_search_path_in_select_is_applied() {
+    // The form pg_dump emits.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE SCHEMA app;
+         SELECT pg_catalog.set_config('search_path', 'app, public', false);
+         CREATE TABLE t4 (b text);
+         RESET search_path;",
+    )]);
+    let info = db.analyze("SELECT * FROM app.t4").unwrap();
+    assert_cols(&info, vec![cn("b", text())]);
+}
+
+#[test]
+fn empty_search_path_has_no_creation_schema() {
+    // PG 18: ERROR 3F000 no schema has been selected to create in.
+    assert_ddl_err!(
+        try_apply(&[("0001.sql", "SET search_path = ''; CREATE TABLE t5 (a int);",)]),
+        DdlError::Parse(_),
+        "no schema has been selected to create in",
+    );
+}
+
+#[test]
+fn set_local_search_path_ends_with_the_transaction() {
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE SCHEMA app;
+         BEGIN; SET LOCAL search_path = app; CREATE TABLE t6 (a int); COMMIT;
+         CREATE TABLE t7 (a int);",
+    )]);
+    assert_cols(
+        &db.analyze("SELECT * FROM app.t6").unwrap(),
+        vec![cn("a", int4())],
+    );
+    assert_cols(
+        &db.analyze("SELECT * FROM public.t7").unwrap(),
+        vec![cn("a", int4())],
+    );
+}
+
+#[test]
+fn alter_table_finds_relations_along_the_search_path() {
+    // PG 18: both ALTERs succeed — `t` resolves to app.t, `t4` to public.t4.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE SCHEMA app;
+         CREATE TABLE app.t (a int);
+         CREATE TABLE public.t4 (b text);
+         SET search_path = app, public;
+         ALTER TABLE t ADD COLUMN z int;
+         ALTER TABLE t4 ADD COLUMN y int;
+         RESET search_path;",
+    )]);
+    assert_cols(
+        &db.analyze("SELECT * FROM app.t").unwrap(),
+        vec![cn("a", int4()), cn("z", int4())],
+    );
+    assert_cols(
+        &db.analyze("SELECT * FROM public.t4").unwrap(),
+        vec![cn("b", text()), cn("y", int4())],
+    );
+}

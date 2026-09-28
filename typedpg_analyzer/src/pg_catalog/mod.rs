@@ -192,6 +192,11 @@ pub struct PgCatalog {
     // ── Session state (non-PG) ──
     /// Namespace OIDs in search order (analog of PG's `search_path` GUC).
     pub(crate) search_path: Vec<PgNamespaceOid>,
+    /// Textual `search_path` settings behind [`Self::search_path`], which is
+    /// re-derived from them whenever they or the set of schemas change —
+    /// PG keeps the GUC as a list of names and resolves it lazily, so a path
+    /// may name a schema that is only created later.
+    pub(crate) search_path_guc: crate::ddl::session::SearchPathGuc,
     next_oid: std::num::NonZeroU32,
 
     /// Lazy-initialized PG sanity mirror used by the `pg_sanity` feature to
@@ -381,6 +386,12 @@ impl PgCatalog {
             cat.pg_collation.insert(c.oid, c);
         }
         cat.search_path = seed.search_path;
+        cat.search_path_guc = crate::ddl::session::SearchPathGuc::with_default(
+            cat.search_path
+                .iter()
+                .filter_map(|&oid| cat.namespace_name(oid).map(str::to_owned))
+                .collect(),
+        );
         cat
     }
 
@@ -415,6 +426,7 @@ impl PgCatalog {
             extension_by_name: HashMap::new(),
             collation_by_qname: HashMap::new(),
             search_path: Vec::new(),
+            search_path_guc: Default::default(),
             next_oid: USER_OID_START_NZ,
             #[cfg(feature = "pg_sanity")]
             pg_sanity: None,
@@ -519,6 +531,9 @@ impl PgCatalog {
     /// Parse and apply all DDL statements in `sql`, mutating the catalog.
     pub fn apply_sql(&mut self, sql: &str) -> Result<(), DdlError> {
         let result = apply_sql_to(self, sql);
+        // One `apply_sql` call is one migration, which the runner wraps in
+        // its own transaction: `SET LOCAL` values end with it.
+        self.end_transaction_scope();
         #[cfg(feature = "pg_sanity")]
         {
             if sql_touches_extension(sql) {
@@ -925,14 +940,18 @@ impl PgCatalog {
 // rather than writing the HashMaps directly.
 
 impl PgCatalog {
+    // Schema changes re-resolve the textual search_path: a path entry may
+    // name a schema that only now exists (or no longer does).
     pub(crate) fn insert_pg_namespace(&mut self, row: PgNamespace) {
         self.namespace_by_name.insert(row.nspname.clone(), row.oid);
         self.pg_namespace.insert(row.oid, row);
+        self.refresh_search_path();
     }
 
     pub(crate) fn remove_pg_namespace(&mut self, oid: PgNamespaceOid) -> Option<PgNamespace> {
         let row = self.pg_namespace.remove(&oid)?;
         self.namespace_by_name.remove(&row.nspname);
+        self.refresh_search_path();
         Some(row)
     }
 
@@ -942,6 +961,7 @@ impl PgCatalog {
             row.nspname = new_name.clone();
             self.namespace_by_name.insert(new_name, oid);
         }
+        self.refresh_search_path();
     }
 
     pub(crate) fn insert_pg_type(&mut self, row: PgType) {

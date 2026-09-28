@@ -20,14 +20,7 @@ pub fn define_operator(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), 
         })
         .collect();
     let (schema, op_name) = match parts.as_slice() {
-        [name] => (
-            interp
-                .search_path
-                .first()
-                .and_then(|&oid| interp.namespace_name(oid).map(str::to_owned))
-                .unwrap_or_else(|| "public".to_owned()),
-            name.clone(),
-        ),
+        [name] => (super::util::creation_schema(interp)?, name.clone()),
         [schema, name] => (schema.clone(), name.clone()),
         _ => return Ok(()),
     };

@@ -109,15 +109,7 @@ fn rename_relation(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlE
     let Some(rv) = stmt.relation.as_ref() else {
         return Ok(());
     };
-    let schema_name = if rv.schemaname.is_empty() {
-        interp
-            .search_path
-            .first()
-            .and_then(|&oid| interp.namespace_name(oid).map(str::to_owned))
-            .unwrap_or_else(|| "public".to_owned())
-    } else {
-        rv.schemaname.clone()
-    };
+    let schema_name = crate::ddl::util::range_var_names(rv, interp).0;
     let Some(nsoid) = interp.namespace_oid(&schema_name) else {
         if stmt.missing_ok {
             return Ok(());
@@ -162,15 +154,7 @@ fn rename_column(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlErr
     let Some(rv) = stmt.relation.as_ref() else {
         return Ok(());
     };
-    let schema_name = if rv.schemaname.is_empty() {
-        interp
-            .search_path
-            .first()
-            .and_then(|&oid| interp.namespace_name(oid).map(str::to_owned))
-            .unwrap_or_else(|| "public".to_owned())
-    } else {
-        rv.schemaname.clone()
-    };
+    let schema_name = crate::ddl::util::range_var_names(rv, interp).0;
     let Some(nsoid) = interp.namespace_oid(&schema_name) else {
         if stmt.missing_ok {
             return Ok(());
@@ -256,14 +240,10 @@ fn rename_type_obj(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlE
 
     let (schema_name, old_name) = match parts.as_slice() {
         [s, n] => ((*s).to_owned(), (*n).to_owned()),
-        [n] => {
-            let s = interp
-                .search_path
-                .first()
-                .and_then(|&oid| interp.namespace_name(oid).map(str::to_owned))
-                .unwrap_or_else(|| "public".to_owned());
-            (s, (*n).to_owned())
-        }
+        [n] => (
+            crate::ddl::util::type_lookup_schema(interp, n),
+            (*n).to_owned(),
+        ),
         _ => return Ok(()),
     };
 
@@ -344,15 +324,7 @@ fn set_relation_schema(
     let Some(rv) = stmt.relation.as_ref() else {
         return Ok(());
     };
-    let old_schema = if rv.schemaname.is_empty() {
-        interp
-            .search_path
-            .first()
-            .and_then(|&oid| interp.namespace_name(oid).map(str::to_owned))
-            .unwrap_or_else(|| "public".to_owned())
-    } else {
-        rv.schemaname.clone()
-    };
+    let old_schema = crate::ddl::util::range_var_names(rv, interp).0;
     let Some(old_nsoid) = interp.namespace_oid(&old_schema) else {
         if stmt.missing_ok {
             return Ok(());
@@ -447,14 +419,10 @@ fn set_type_schema(
     };
     let (old_schema, name) = match parts.as_slice() {
         [s, n] => ((*s).to_owned(), (*n).to_owned()),
-        [n] => {
-            let s = interp
-                .search_path
-                .first()
-                .and_then(|&oid| interp.namespace_name(oid).map(str::to_owned))
-                .unwrap_or_else(|| "public".to_owned());
-            (s, (*n).to_owned())
-        }
+        [n] => (
+            crate::ddl::util::type_lookup_schema(interp, n),
+            (*n).to_owned(),
+        ),
         _ => return Ok(()),
     };
 

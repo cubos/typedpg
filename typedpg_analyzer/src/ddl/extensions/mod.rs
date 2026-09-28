@@ -292,11 +292,8 @@ fn apply_with_schema(
     schema: &str,
     scripts: &[&str],
 ) -> Result<(), DdlError> {
-    let original = interp.search_path.clone();
-    let target_oid = ensure_namespace(interp, schema)?;
-    if interp.search_path.first().copied() != Some(target_oid) {
-        interp.search_path.insert(0, target_oid);
-    }
+    ensure_namespace(interp, schema)?;
+    let original = interp.push_extension_search_path(schema);
 
     let mut result = Ok(());
     for sql in scripts {
@@ -313,7 +310,7 @@ fn apply_with_schema(
         }
     }
 
-    interp.search_path = original;
+    interp.restore_search_path(original);
     result
 }
 

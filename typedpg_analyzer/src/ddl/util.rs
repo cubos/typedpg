@@ -9,41 +9,70 @@ use crate::pg_catalog::{
 };
 use crate::qualified_name::QualifiedName;
 
-/// Extract the (schema, name) pair from a `RangeVar`.
-/// If no schema is specified, defaults to the first entry in `search_path`.
+/// Schema an unqualified new object is created in: PG's creation namespace,
+/// i.e. the first schema of the effective `search_path` that exists
+/// (`RangeVarGetCreationNamespace` / `QualifiedNameGetCreationNamespace`).
+pub fn creation_schema(snapshot: &PgCatalog) -> Result<String, DdlError> {
+    snapshot
+        .search_path
+        .first()
+        .and_then(|&oid| snapshot.namespace_name(oid).map(str::to_owned))
+        .ok_or_else(|| DdlError::Parse("no schema has been selected to create in".into()))
+}
+
+/// Schema to report / probe for an unqualified name that does not resolve:
+/// the creation namespace, or `public` when the search path is empty.
+fn fallback_schema(snapshot: &PgCatalog) -> String {
+    creation_schema(snapshot).unwrap_or_else(|_| "public".to_owned())
+}
+
+/// Extract the (schema, name) pair of an *existing* relation from a
+/// `RangeVar`. An unqualified name is looked up along the search path (with
+/// `pg_catalog` implicitly first, as `RangeVarGetRelid` does); when nothing
+/// matches, the creation namespace is returned so the caller reports the
+/// relation as missing.
 pub fn range_var_names(rv: &RangeVar, snapshot: &PgCatalog) -> (String, String) {
     let schema = if rv.schemaname.is_empty() {
         snapshot
-            .search_path
-            .first()
-            .and_then(|&oid| snapshot.namespace_name(oid).map(str::to_owned))
-            .unwrap_or_else(|| "public".to_owned())
+            .resolve_table(None, &rv.relname)
+            .and_then(|c| snapshot.namespace_name(c.relnamespace).map(str::to_owned))
+            .unwrap_or_else(|| fallback_schema(snapshot))
     } else {
         rv.schemaname.clone()
     };
     (schema, rv.relname.clone())
 }
 
-/// Extract (schema, name) from a list of name nodes (e.g., `domainname`,
-/// `type_name` in DDL). Handles both `["name"]` and `["schema", "name"]`
-/// forms.
+/// Schema of the type an unqualified `name` resolves to along the search
+/// path, or the creation namespace when no such type exists.
+pub fn type_lookup_schema(snapshot: &PgCatalog, name: &str) -> String {
+    snapshot
+        .resolve_type_by_name(None, name)
+        .and_then(|t| snapshot.namespace_name(t.typnamespace).map(str::to_owned))
+        .unwrap_or_else(|| fallback_schema(snapshot))
+}
+
+/// Extract (schema, name) of an *existing* relation or type from a list of
+/// name nodes (e.g. `DROP TABLE` / `DROP TYPE` objects). Handles both
+/// `["name"]` and `["schema", "name"]`; an unqualified name is looked up
+/// along the search path, relations first, then types.
 pub fn extract_names(names: &[Node], snapshot: &PgCatalog) -> (String, String) {
-    let parts: Vec<&str> = names
-        .iter()
-        .filter_map(|n| match n.node.as_ref()? {
-            node::Node::String(s) => Some(s.sval.as_str()),
-            _ => None,
-        })
-        .collect();
+    let parts: Vec<&str> = names.iter().filter_map(node_string).collect();
 
     match parts.as_slice() {
         [schema, name] => ((*schema).to_owned(), (*name).to_owned()),
         [name] => {
-            let schema = snapshot
-                .search_path
-                .first()
-                .and_then(|&oid| snapshot.namespace_name(oid).map(str::to_owned))
-                .unwrap_or_else(|| "public".to_owned());
+            let found = snapshot
+                .resolve_table(None, name)
+                .map(|c| c.relnamespace)
+                .or_else(|| {
+                    snapshot
+                        .resolve_type_by_name(None, name)
+                        .map(|t| t.typnamespace)
+                });
+            let schema = found
+                .and_then(|ns| snapshot.namespace_name(ns).map(str::to_owned))
+                .unwrap_or_else(|| fallback_schema(snapshot));
             (schema, (*name).to_owned())
         }
         _ => ("public".to_owned(), String::new()),
@@ -82,7 +111,12 @@ pub fn ensure_qualified_name(
     interp: &mut PgCatalog,
     names: &[Node],
 ) -> Result<(PgNamespaceOid, String), DdlError> {
-    let (schema, name) = extract_names(names, interp);
+    let parts: Vec<&str> = names.iter().filter_map(node_string).collect();
+    let (schema, name) = match parts.as_slice() {
+        [schema, name] => ((*schema).to_owned(), (*name).to_owned()),
+        [name] => (creation_schema(interp)?, (*name).to_owned()),
+        _ => ("public".to_owned(), String::new()),
+    };
     Ok((ensure_namespace(interp, &schema)?, name))
 }
 
@@ -91,8 +125,12 @@ pub fn ensure_range_var(
     interp: &mut PgCatalog,
     rv: &RangeVar,
 ) -> Result<(PgNamespaceOid, String), DdlError> {
-    let (schema, name) = range_var_names(rv, interp);
-    Ok((ensure_namespace(interp, &schema)?, name))
+    let schema = if rv.schemaname.is_empty() {
+        creation_schema(interp)?
+    } else {
+        rv.schemaname.clone()
+    };
+    Ok((ensure_namespace(interp, &schema)?, rv.relname.clone()))
 }
 
 /// Resolve a `TypeName` AST node to a type OID in the snapshot.

@@ -13,7 +13,7 @@ use crate::pg_catalog::{
 
 use super::DdlError;
 use super::util::{
-    ensure_namespace, ensure_qualified_name, lookup_type_name, names_key, node_string,
+    ensure_qualified_name, lookup_type_name, names_key, node_string,
     register_composite_to_record_cast, resolve_type_name,
 };
 use crate::pg_catalog::PgCatalog;
@@ -159,17 +159,7 @@ pub fn create_composite(interp: &mut PgCatalog, stmt: &CompositeTypeStmt) -> Res
         .as_ref()
         .ok_or_else(|| DdlError::Parse("CREATE TYPE without name".into()))?;
 
-    let schema = if rv.schemaname.is_empty() {
-        interp
-            .search_path
-            .first()
-            .and_then(|&oid| interp.namespace_name(oid).map(str::to_owned))
-            .unwrap_or_else(|| "public".to_owned())
-    } else {
-        rv.schemaname.clone()
-    };
-    let nsoid = ensure_namespace(interp, &schema)?;
-    let name = rv.relname.clone();
+    let (nsoid, name) = super::util::ensure_range_var(interp, rv)?;
 
     if interp.type_by_qname.contains_key(&(nsoid, name.clone())) {
         return Err(DdlError::DuplicateObject(format!(

@@ -14,6 +14,7 @@ pub mod indexes;
 pub mod operators;
 pub mod schema_stmt;
 pub mod sequences;
+pub(crate) mod session;
 pub mod tables;
 pub mod types;
 pub mod util;
@@ -168,6 +169,11 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         node::Node::RenameStmt(s) => alter::rename(db, s),
         node::Node::AlterObjectSchemaStmt(s) => alter::set_schema(db, s),
 
+        // ── Session state (search_path) ─────────────────────────────
+        node::Node::VariableSetStmt(s) => session::variable_set(db, s),
+        node::Node::TransactionStmt(s) => session::transaction(db, s),
+        node::Node::SelectStmt(s) => session::select_side_effects(db, s),
+
         // ── Indexes ─────────────────────────────────────────────────
         // Indexes don't change query result types, but expression indexes
         // forbid VOLATILE functions (CREATE INDEX walks the expression
@@ -190,11 +196,9 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         | node::Node::CreateOpClassStmt(_)
         | node::Node::AlterOpFamilyStmt(_)
         | node::Node::AlterOperatorStmt(_)
-        | node::Node::SelectStmt(_)
         | node::Node::InsertStmt(_)
         | node::Node::UpdateStmt(_)
         | node::Node::DeleteStmt(_)
-        | node::Node::TransactionStmt(_)
         | node::Node::DoStmt(_)
         | node::Node::TruncateStmt(_)
         | node::Node::CopyStmt(_)
@@ -202,7 +206,6 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         | node::Node::VacuumStmt(_)
         | node::Node::ReindexStmt(_)
         | node::Node::LockStmt(_)
-        | node::Node::VariableSetStmt(_)
         | node::Node::VariableShowStmt(_)
         | node::Node::DiscardStmt(_)
         | node::Node::ExplainStmt(_)
