@@ -693,3 +693,21 @@ fn anonymous_record_literal_input_rejected() {
     // An empty record[] literal never calls record_in.
     db.analyze("SELECT '{}'::record[] AS c").unwrap();
 }
+
+#[test]
+fn polymorphic_function_with_defaulted_trailing_args() {
+    // json_populate_record(base anyelement, from_json json,
+    // use_json_as_text bool DEFAULT false): PG prepares both calls (the
+    // NULL::record one only fails at execution) and types the result as
+    // `base`'s type.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TYPE comp AS (a int);").unwrap();
+    let s = db
+        .analyze("SELECT json_populate_record(NULL::record, '{}') IS NULL AS b")
+        .unwrap();
+    assert_cols(&s, vec![c("b", bool_ty())]);
+    let s = db
+        .analyze("SELECT (json_populate_record(NULL::comp, '{}')).a AS a")
+        .unwrap();
+    assert_cols(&s, vec![cn("a", int4())]);
+}
