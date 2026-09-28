@@ -59,10 +59,25 @@ pub fn define_operator(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), 
         return Ok(());
     };
 
-    let Some(result_oid) = procedure.as_ref().and_then(|(schema, name)| {
-        resolve_procedure_return(interp, schema.as_deref(), name, left_type, right_oid)
-    }) else {
-        return Ok(());
+    // OperatorCreate: the implementing function must exist with the
+    // operand types (`function f(integer, integer) does not exist`).
+    let Some((schema, fname)) = procedure else {
+        return Err(DdlError::Parse(
+            "operator function must be specified".into(),
+        ));
+    };
+    let Some((proc_oid, result_oid)) =
+        resolve_procedure(interp, schema.as_deref(), &fname, left_type, right_oid)
+    else {
+        let args = left_type
+            .into_iter()
+            .chain(std::iter::once(right_oid))
+            .map(|t| super::util::format_type_for_message(interp, t))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(DdlError::TypeNotFound(format!(
+            "function {fname}({args}) does not exist"
+        )));
     };
 
     let oid = PgOperatorOid::from_nonzero(interp.alloc_oid()?);
@@ -73,6 +88,7 @@ pub fn define_operator(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), 
         oprleft: left_type,
         oprright: right_oid,
         oprresult: Some(result_oid),
+        oprcode: Some(proc_oid),
     });
 
     Ok(())
@@ -109,13 +125,13 @@ fn parse_func_name(arg: &pg_query::protobuf::Node) -> Option<(Option<String>, St
 }
 
 /// Look up a procedure in the snapshot and return its result type.
-fn resolve_procedure_return(
+fn resolve_procedure(
     interp: &PgCatalog,
     schema: Option<&str>,
     name: &str,
     left: Option<PgTypeOid>,
     right: PgTypeOid,
-) -> Option<PgTypeOid> {
+) -> Option<(crate::oid::PgProcOid, PgTypeOid)> {
     let candidates = interp.find_functions(schema, name);
     candidates
         .into_iter()
@@ -124,5 +140,5 @@ fn resolve_procedure_return(
             (None, [a]) => *a == right,
             _ => false,
         })
-        .map(|f| f.prorettype)
+        .map(|f| (f.oid, f.prorettype))
 }

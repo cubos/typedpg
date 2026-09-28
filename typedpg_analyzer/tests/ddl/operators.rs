@@ -66,3 +66,41 @@ fn alter_operator_is_noop_but_does_not_crash() {
          ALTER OPERATOR <=> (vector, vector) SET (RESTRICT = scalarlesel);",
     )]);
 }
+
+// ── CREATE OPERATOR / CREATE CAST validation ────────────────────────────────
+
+#[test]
+fn create_operator_and_cast_require_their_functions() {
+    // PG 18: 42883 function nosuch(integer, integer) does not exist /
+    // function nosuch(integer) does not exist; 42710 for a repeated cast.
+    for (sql, msg) in [
+        (
+            "CREATE OPERATOR === (LEFTARG = int, RIGHTARG = int, FUNCTION = nosuch);",
+            "function nosuch(integer, integer) does not exist",
+        ),
+        (
+            "CREATE CAST (int AS text) WITH FUNCTION nosuch(int);",
+            "function nosuch(integer) does not exist",
+        ),
+        (
+            "CREATE CAST (int AS bigint) WITH INOUT;",
+            "cast from type integer to type bigint already exists",
+        ),
+        (
+            "CREATE CAST (nosuch AS text) WITH INOUT;",
+            "type \"nosuch\" does not exist",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", sql)]).expect_err(sql);
+        assert!(err.to_string().starts_with(msg), "{sql}\n  got: {err}");
+    }
+    build_db(&[(
+        "0001.sql",
+        "CREATE FUNCTION eq3(int, int) RETURNS bool LANGUAGE sql IMMUTABLE AS 'select $1 = $2';
+         CREATE OPERATOR === (LEFTARG = int, RIGHTARG = int, FUNCTION = eq3);
+         CREATE TYPE mood AS ENUM ('a');
+         CREATE FUNCTION mood_int(mood) RETURNS int LANGUAGE sql AS 'select 1';
+         CREATE CAST (mood AS int) WITH FUNCTION mood_int(mood);",
+    )]);
+}
+

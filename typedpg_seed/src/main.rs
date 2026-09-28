@@ -471,7 +471,7 @@ fn export_operators(client: &mut postgres::Client) -> Result<Vec<PgOperator>, po
     // No filter — shell operators (oprresult = 0) round-trip too. Operator
     // resolution skips them at lookup time.
     let rows = client.query(
-        "SELECT oid, oprname, oprnamespace, oprleft, oprright, oprresult \
+        "SELECT oid, oprname, oprnamespace, oprleft, oprright, oprresult, oprcode::oid \
          FROM pg_catalog.pg_operator \
          ORDER BY oid",
         &[],
@@ -484,6 +484,7 @@ fn export_operators(client: &mut postgres::Client) -> Result<Vec<PgOperator>, po
             let oprleft: u32 = r.get(3);
             let oprright: u32 = r.get(4);
             let oprresult: u32 = r.get(5);
+            let oprcode: u32 = r.get(6);
             PgOperator {
                 oid: PgOperatorOid::new(oid).expect("pg_operator.oid is non-zero"),
                 oprname: r.get(1),
@@ -491,6 +492,7 @@ fn export_operators(client: &mut postgres::Client) -> Result<Vec<PgOperator>, po
                 oprleft: PgTypeOid::new(oprleft),
                 oprright: PgTypeOid::new(oprright).expect("oprright is non-zero"),
                 oprresult: PgTypeOid::new(oprresult),
+                oprcode: PgProcOid::new(oprcode),
             }
         })
         .collect())
@@ -498,7 +500,7 @@ fn export_operators(client: &mut postgres::Client) -> Result<Vec<PgOperator>, po
 
 fn export_casts(client: &mut postgres::Client) -> Result<Vec<PgCast>, postgres::Error> {
     let rows = client.query(
-        "SELECT oid, castsource, casttarget, castcontext, castmethod \
+        "SELECT oid, castsource, casttarget, castcontext, castmethod, castfunc \
          FROM pg_catalog.pg_cast \
          ORDER BY oid",
         &[],
@@ -511,12 +513,14 @@ fn export_casts(client: &mut postgres::Client) -> Result<Vec<PgCast>, postgres::
             let oid: u32 = r.get(0);
             let castsource: u32 = r.get(1);
             let casttarget: u32 = r.get(2);
+            let castfunc: u32 = r.get(5);
             PgCast {
                 oid: PgCastOid::new(oid).expect("pg_cast.oid is non-zero"),
                 castsource: PgTypeOid::new(castsource).expect("castsource is non-zero"),
                 casttarget: PgTypeOid::new(casttarget).expect("casttarget is non-zero"),
                 castcontext: char_to_castcontext(ctx as u8 as char),
                 castmethod: char_to_castmethod(method as u8 as char),
+                castfunc: PgProcOid::new(castfunc),
             }
         })
         .collect())

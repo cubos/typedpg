@@ -580,6 +580,7 @@ pub fn register_composite_to_record_cast(
         casttarget: builtin_oid::RECORD,
         castcontext: CastContext::Implicit,
         castmethod: CastMethod::Binary,
+        castfunc: None,
     });
     Ok(())
 }

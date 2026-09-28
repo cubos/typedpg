@@ -692,6 +692,10 @@ pub struct PgOperator {
     /// FK `pg_type.oid`. `None` for shell operators (PG: `0`).
     #[serde(with = "crate::oid::oid_or_zero")]
     pub oprresult: Option<PgTypeOid>,
+    /// FK `pg_proc.oid` of the implementing function. `None` for shell
+    /// operators (PG: `0`).
+    #[serde(with = "crate::oid::oid_or_zero")]
+    pub oprcode: Option<PgProcOid>,
 }
 
 /// `pg_cast`: a cast rule between two types.
@@ -704,6 +708,10 @@ pub struct PgCast {
     pub casttarget: PgTypeOid,
     pub castcontext: CastContext,
     pub castmethod: CastMethod,
+    /// FK `pg_proc.oid` of the cast function (`castmethod = 'f'`); `None`
+    /// for binary / I/O casts (PG: `0`).
+    #[serde(with = "crate::oid::oid_or_zero")]
+    pub castfunc: Option<PgProcOid>,
 }
 
 /// `pg_extension`: an installed extension.

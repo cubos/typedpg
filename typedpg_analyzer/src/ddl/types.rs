@@ -14,7 +14,7 @@ use crate::pg_catalog::{
 use super::DdlError;
 use super::util::{
     ensure_qualified_name, lookup_type_name, names_key, node_string,
-    register_composite_to_record_cast, resolve_type_name,
+    register_composite_to_record_cast,
 };
 use crate::pg_catalog::PgCatalog;
 
@@ -893,17 +893,47 @@ pub(crate) fn create_base_type(
 // ─── CREATE CAST ────────────────────────────────────────────────────────────
 
 pub fn create_cast(interp: &mut PgCatalog, stmt: &CreateCastStmt) -> Result<(), DdlError> {
-    let source_oid = stmt
-        .sourcetype
-        .as_ref()
-        .and_then(|tn| resolve_type_name(tn, interp));
-    let target_oid = stmt
-        .targettype
-        .as_ref()
-        .and_then(|tn| resolve_type_name(tn, interp));
-
-    let (Some(src), Some(tgt)) = (source_oid, target_oid) else {
+    // CreateCast: both types must exist, the pair must not have a cast yet,
+    // and WITH FUNCTION names an existing function.
+    let (Some(source), Some(target)) = (stmt.sourcetype.as_ref(), stmt.targettype.as_ref()) else {
         return Ok(());
+    };
+    let src = lookup_type_name(source, interp)?;
+    let tgt = lookup_type_name(target, interp)?;
+    if interp.cast_by_pair.contains_key(&(src, tgt)) {
+        return Err(DdlError::DuplicateObject(format!(
+            "cast from type {} to type {} already exists",
+            super::util::format_type_for_message(interp, src),
+            super::util::format_type_for_message(interp, tgt)
+        )));
+    }
+    let castfunc = match stmt.func.as_ref() {
+        Some(func) => {
+            let object = Some(Box::new(pg_query::protobuf::Node {
+                node: Some(node::Node::ObjectWithArgs(func.clone())),
+            }));
+            let Some((schema, name, arg_oids)) = super::alter::extract_func_target(&object, interp)
+            else {
+                return Ok(());
+            };
+            let wanted = arg_oids.clone();
+            let Some((_, oid)) =
+                super::alter::find_proc(interp, schema.as_deref(), &name, &move |p| {
+                    p.proargtypes == wanted
+                })
+            else {
+                let args = arg_oids
+                    .iter()
+                    .map(|&t| super::util::format_type_for_message(interp, t))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(DdlError::TypeNotFound(format!(
+                    "function {name}({args}) does not exist"
+                )));
+            };
+            Some(oid)
+        }
+        None => None,
     };
 
     let castcontext = match CoercionContext::try_from(stmt.context) {
@@ -953,6 +983,7 @@ pub fn create_cast(interp: &mut PgCatalog, stmt: &CreateCastStmt) -> Result<(), 
         casttarget: tgt,
         castcontext,
         castmethod,
+        castfunc,
     });
     Ok(())
 }
