@@ -40,6 +40,7 @@ mod error;
 mod expr;
 mod functions;
 mod grouping;
+mod jsonpath_input;
 mod lexer;
 mod literal_input;
 mod lookup;

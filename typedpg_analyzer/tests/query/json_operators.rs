@@ -371,3 +371,61 @@ fn update_jsonb_subscript_assigns_jsonb() {
         "cannot assign to field \"a\" of column \"j\" because its type jsonb is not a composite type"
     );
 }
+
+// ── jsonpath literals (PG's jsonpath_in) ────────────────────────────────────
+
+#[test]
+fn invalid_jsonpath_literals_rejected() {
+    // jsonpath_in runs when the unknown literal is coerced to jsonpath, both
+    // for an explicit cast and for an operator argument (verified on PG 18).
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE t (id int PRIMARY KEY, j jsonb NOT NULL);")
+        .unwrap();
+    for (sql, msg) in [
+        (
+            "SELECT j @? 'x' AS a FROM t",
+            "syntax error at end of jsonpath input",
+        ),
+        (
+            "SELECT '$.a.bad('::jsonpath AS p",
+            "syntax error at or near \"(\" of jsonpath input",
+        ),
+        (
+            "SELECT jsonb_path_query(j, '$.a ? (@.b == 1 == 2)') FROM t",
+            "syntax error at or near \"==\" of jsonpath input",
+        ),
+        (
+            "SELECT '@.a'::jsonpath",
+            "@ is not allowed in root expressions",
+        ),
+        (
+            "SELECT '$.a ? (last == 1)'::jsonpath",
+            "LAST is allowed only in array subscripts",
+        ),
+        (
+            "SELECT '1a'::jsonpath",
+            "trailing junk after numeric literal at or near \"1a\" of jsonpath input",
+        ),
+        (
+            "SELECT ''::jsonpath",
+            "invalid input syntax for type jsonpath: \"\"",
+        ),
+    ] {
+        assert_err_prefix!(db.analyze(sql), AnalyzeError::InvalidLiteral(_), msg);
+    }
+}
+
+#[test]
+fn valid_jsonpath_literals_accepted() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE t (id int PRIMARY KEY, j jsonb NOT NULL);")
+        .unwrap();
+    let s = db
+        .analyze(
+            "SELECT j @? '$.a[*] ? (@.b > 1 && @.c like_regex \"^x\" flag \"i\")' AS a, \
+             j @@ 'strict $.a.size() == 2' AS b, \
+             '$.**{1 to last}.datetime(\"yyyy\")'::jsonpath AS c FROM t",
+        )
+        .unwrap();
+    assert_col!(&s, "c", basic("pg_catalog", "jsonpath"), nullable = false);
+}

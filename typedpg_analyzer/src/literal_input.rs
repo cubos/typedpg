@@ -112,6 +112,7 @@ pub(crate) fn validate(
     match t.typname.as_str() {
         "uuid" => validate_uuid(content),
         "json" | "jsonb" => validate_json(content),
+        "jsonpath" => crate::jsonpath_input::validate(content),
         // The object-resolving reg* family parses the value as a (possibly
         // qualified) SQL identifier and resolves it at parse time. An
         // empty/whitespace-only string is never a valid name; for the two
