@@ -750,6 +750,9 @@ pub(crate) fn infer_expr(
             Ok(ExprType::scalar_with_typmod(type_oid, nullable, typmod))
         }
         node::Node::MergeSupportFunc(f) => crate::resolve::infer_merge_support_func(f),
+        // `WHERE CURRENT OF cursor` (UPDATE / DELETE only, by grammar): a
+        // boolean test against the cursor's current row.
+        node::Node::CurrentOfExpr(_) => Ok(ExprType::scalar(oid::BOOL, false)),
         _ => Err(AnalyzeError::Unsupported(format!(
             "expression node type not supported: {:?}",
             std::mem::discriminant(inner)

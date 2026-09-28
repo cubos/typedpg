@@ -282,3 +282,16 @@ fn on_conflict_do_update_requires_a_target() {
         "{err}"
     );
 }
+
+// ── WHERE CURRENT OF ─────────────────────────────────────────────────────────
+
+#[test]
+fn where_current_of_cursor() {
+    let db = setup();
+    let s = db.analyze("DELETE FROM t WHERE CURRENT OF cur").unwrap();
+    assert_cols(&s, vec![]);
+    let s = db
+        .analyze("UPDATE t SET a = 1 WHERE CURRENT OF cur RETURNING *")
+        .unwrap();
+    assert_cols(&s, vec![c("id", int4()), c("a", int4()), cn("b", text())]);
+}
