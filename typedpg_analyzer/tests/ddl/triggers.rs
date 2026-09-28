@@ -67,3 +67,31 @@ fn create_trigger_is_validated() {
         ),
     ]);
 }
+
+#[test]
+fn alter_trigger_rename_is_tracked() {
+    let setup = "CREATE TABLE t (a int);
+                 CREATE FUNCTION tf() RETURNS trigger LANGUAGE plpgsql AS 'begin return new; end';
+                 CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION tf();
+                 CREATE TRIGGER tr2 BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION tf();";
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "ALTER TRIGGER tr ON t RENAME TO x; DROP TRIGGER x ON t;",
+        ),
+    ]);
+    for (stmt, msg) in [
+        (
+            "ALTER TRIGGER tr ON t RENAME TO tr2;",
+            "trigger \"tr2\" for relation \"t\" already exists",
+        ),
+        (
+            "ALTER TRIGGER nosuch ON t RENAME TO z;",
+            "trigger \"nosuch\" for table \"t\" does not exist",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+}

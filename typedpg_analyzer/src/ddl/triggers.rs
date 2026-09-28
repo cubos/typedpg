@@ -155,3 +155,33 @@ pub(crate) fn triggers_using_function(
         })
         .collect()
 }
+
+/// `ALTER TRIGGER name ON table RENAME TO new` (renametrig).
+pub(crate) fn rename_trigger(
+    interp: &mut PgCatalog,
+    stmt: &pg_query::protobuf::RenameStmt,
+) -> Result<(), DdlError> {
+    let Some(rv) = stmt.relation.as_ref() else {
+        return Ok(());
+    };
+    let relid = match super::util::lookup_relation(interp, rv) {
+        Ok((_, oid)) => oid,
+        Err(_) if stmt.missing_ok => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let triggers = interp.triggers.entry(relid).or_default();
+    if triggers.iter().any(|t| t.name == stmt.newname) {
+        return Err(DdlError::DuplicateObject(format!(
+            "trigger \"{}\" for relation \"{}\" already exists",
+            stmt.newname, rv.relname
+        )));
+    }
+    let Some(trigger) = triggers.iter_mut().find(|t| t.name == stmt.subname) else {
+        return Err(DdlError::TypeNotFound(format!(
+            "trigger \"{}\" for table \"{}\" does not exist",
+            stmt.subname, rv.relname
+        )));
+    };
+    trigger.name = stmt.newname.clone();
+    Ok(())
+}

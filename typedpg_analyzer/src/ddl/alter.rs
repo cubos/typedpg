@@ -37,6 +37,7 @@ pub fn rename(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlError>
         ObjectType::ObjectTabconstraint | ObjectType::ObjectDomconstraint => {
             rename_constraint(interp, stmt)
         }
+        ObjectType::ObjectTrigger => crate::ddl::triggers::rename_trigger(interp, stmt),
         _ => Ok(()),
     }
 }
