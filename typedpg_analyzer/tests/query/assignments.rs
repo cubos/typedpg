@@ -225,3 +225,60 @@ fn insert_select_arity_uses_output_columns() {
         "{err}"
     );
 }
+
+// ── ON CONFLICT arbiter inference ────────────────────────────────────────────
+
+fn setup_arbiters() -> PgCatalog {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE k (a int NOT NULL, b int NOT NULL, c text, UNIQUE (a, b), CONSTRAINT k_c_key UNIQUE (c));
+         CREATE UNIQUE INDEX k_part ON k (a) WHERE c IS NULL;
+         CREATE UNIQUE INDEX k_expr ON k (lower(c));",
+    )
+    .unwrap();
+    db
+}
+
+/// PG's infer_arbiter_indexes: a partial unique index is an arbiter when the
+/// ON CONFLICT WHERE implies its predicate; an expression index matches the
+/// same inference expression.
+#[test]
+fn on_conflict_infers_partial_and_expression_indexes() {
+    let db = setup_arbiters();
+    for sql in [
+        "INSERT INTO k (a,b,c) VALUES (1,2,'x') ON CONFLICT (a) WHERE c IS NULL DO NOTHING",
+        "INSERT INTO k (a,b,c) VALUES (1,2,'x') ON CONFLICT (a) WHERE c IS NULL AND b > 0 DO NOTHING",
+        "INSERT INTO k (a,b,c) VALUES (1,2,'x') ON CONFLICT (lower(c)) DO NOTHING",
+        "INSERT INTO k (a,b,c) VALUES (1,2,'x') ON CONFLICT (a, b) WHERE b > 0 DO NOTHING",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    for sql in [
+        "INSERT INTO k (a,b,c) VALUES (1,2,'x') ON CONFLICT (a) DO NOTHING",
+        "INSERT INTO k (a,b,c) VALUES (1,2,'x') ON CONFLICT (upper(c)) DO NOTHING",
+    ] {
+        let err = db.analyze(sql).unwrap_err();
+        assert!(matches!(err, AnalyzeError::Invalid(_)), "{sql}: {err:?}");
+        assert!(
+            err.to_string().starts_with(
+                "there is no unique or exclusion constraint matching the ON CONFLICT specification"
+            ),
+            "{sql}: {err}"
+        );
+    }
+}
+
+#[test]
+fn on_conflict_do_update_requires_a_target() {
+    let db = setup_arbiters();
+    let err = db
+        .analyze("INSERT INTO k (a,b,c) VALUES (1,2,'x') ON CONFLICT DO UPDATE SET a = 1")
+        .unwrap_err();
+    assert!(matches!(err, AnalyzeError::SyntaxError(_)), "{err:?}");
+    assert!(
+        err.to_string().starts_with(
+            "ON CONFLICT DO UPDATE requires inference specification or constraint name"
+        ),
+        "{err}"
+    );
+}

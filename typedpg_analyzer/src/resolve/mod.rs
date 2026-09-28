@@ -425,20 +425,36 @@ fn is_set_to_default(node: &protobuf::Node) -> bool {
     matches!(node.node.as_ref(), Some(node::Node::SetToDefault(_)))
 }
 
-/// Walk an `ON CONFLICT` clause's `infer` target and verify it matches a
-/// real `PRIMARY KEY` / `UNIQUE` constraint on the target relation. PG
-/// rejects an unmatched target with `there is no unique or exclusion
-/// constraint matching the ON CONFLICT specification` (column-list form)
-/// or `constraint "name" for table "rel" does not exist` (named form).
+/// Validate an `ON CONFLICT` clause's arbiter specification like PG:
+/// `transformOnConflictArbiter` requires a target for DO UPDATE (42601), a
+/// named constraint must exist on the table, and a column / expression
+/// list must be inferable to a unique index (`infer_arbiter_indexes`,
+/// plancat.c — 42P10 otherwise): the index's key columns and key
+/// expressions equal the inference elements, and a partial index only
+/// qualifies when the ON CONFLICT WHERE implies its predicate.
+///
+/// Predicate implication is approximated structurally: every conjunct of
+/// the index predicate must appear among the WHERE clause's conjuncts
+/// (PG's `predicate_implied_by` also proves weaker implications).
 fn validate_on_conflict_target(
     on_conflict: &protobuf::OnConflictClause,
     snapshot: &PgCatalog,
     table_oid: crate::oid::PgClassOid,
     table_relname: &str,
 ) -> Result<(), AnalyzeError> {
-    // No `infer` clause → `ON CONFLICT DO NOTHING` without target. PG
-    // accepts this — it matches any conflict.
     let Some(infer) = on_conflict.infer.as_deref() else {
+        if on_conflict.action() == protobuf::OnConflictAction::OnconflictUpdate {
+            return Err(crate::error::RawError::new(
+                AnalyzeError::SyntaxError(
+                    "ON CONFLICT DO UPDATE requires inference specification or constraint name"
+                        .into(),
+                ),
+                None,
+                Some("For example, ON CONFLICT (column_name).".into()),
+            )
+            .finalize_implicit());
+        }
+        // `ON CONFLICT DO NOTHING` without a target matches any conflict.
         return Ok(());
     };
 
@@ -456,8 +472,10 @@ fn validate_on_conflict_target(
         return Ok(());
     }
 
-    // `ON CONFLICT (col1, col2, …)` — collect target attnums.
-    let mut targets: Vec<i16> = Vec::new();
+    // The inference elements: plain columns (by attnum) and expressions
+    // (by location-free fingerprint).
+    let mut target_cols: std::collections::BTreeSet<i16> = Default::default();
+    let mut target_exprs: Vec<String> = Vec::new();
     for elem in &infer.index_elems {
         let Some(node::Node::IndexElem(ie)) = elem.node.as_ref() else {
             continue;
@@ -469,7 +487,9 @@ fn validate_on_conflict_target(
                 .find(|a| a.attname == ie.name)
                 .map(|a| a.attnum);
             match attnum {
-                Some(an) => targets.push(an),
+                Some(an) => {
+                    target_cols.insert(an);
+                }
                 None => {
                     // PG runtime wording: `column "ghost" does not exist`.
                     // Append the ON CONFLICT context as a suffix so the
@@ -481,28 +501,79 @@ fn validate_on_conflict_target(
                     )));
                 }
             }
+        } else if let Some(e) = ie.expr.as_deref() {
+            target_exprs.push(node_fingerprint(e));
         }
     }
+    target_exprs.sort();
 
-    // PG matches the target set against constraints whose conkey is
-    // exactly the same set (ordering doesn't matter).
-    let target_set: std::collections::BTreeSet<i16> = targets.iter().copied().collect();
-    let any_match = snapshot.pg_constraint_values().any(|c| {
-        c.conrelid == table_oid
-            && matches!(c.contype, ConType::PrimaryKey | ConType::Unique)
-            && c.conkey
-                .iter()
-                .copied()
-                .collect::<std::collections::BTreeSet<_>>()
-                == target_set
+    let decode = |ast: &crate::pg_catalog::SerializedAst| -> Option<protobuf::Node> {
+        use prost::Message;
+        protobuf::Node::decode(ast.ast.as_slice()).ok()
+    };
+    let where_conjuncts: Vec<String> = on_conflict
+        .infer
+        .as_deref()
+        .and_then(|i| i.where_clause.as_deref())
+        .map(conjunct_fingerprints)
+        .unwrap_or_default();
+
+    let index_matches = snapshot.pg_index.values().any(|idx| {
+        if idx.indrelid != table_oid || !idx.indisunique {
+            return false;
+        }
+        let key = &idx.indkey[..usize::try_from(idx.indnkeyatts)
+            .unwrap_or(0)
+            .min(idx.indkey.len())];
+        let cols: std::collections::BTreeSet<i16> =
+            key.iter().copied().filter(|&a| a != 0).collect();
+        let mut exprs: Vec<String> = idx
+            .indexprs
+            .iter()
+            .filter_map(|a| decode(a).map(|n| node_fingerprint(&n)))
+            .collect();
+        exprs.sort();
+        if cols != target_cols || exprs != target_exprs {
+            return false;
+        }
+        match idx.indpred.as_ref() {
+            None => true,
+            Some(pred) => decode(pred).is_some_and(|p| {
+                conjunct_fingerprints(&p)
+                    .iter()
+                    .all(|c| where_conjuncts.contains(c))
+            }),
+        }
     });
-    if !any_match {
+    // Constraint-backed keys, for catalogs whose constraints carry no
+    // pg_index row.
+    let constraint_matches = target_exprs.is_empty()
+        && snapshot.pg_constraint_values().any(|c| {
+            c.conrelid == table_oid
+                && matches!(c.contype, ConType::PrimaryKey | ConType::Unique)
+                && c.conkey
+                    .iter()
+                    .copied()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    == target_cols
+        });
+    if !index_matches && !constraint_matches {
         return Err(AnalyzeError::Invalid(format!(
             "there is no unique or exclusion constraint matching the ON CONFLICT \
              specification on table \"{table_relname}\""
         )));
     }
     Ok(())
+}
+
+/// The location-free fingerprints of `node`'s top-level AND conjuncts.
+fn conjunct_fingerprints(node: &protobuf::Node) -> Vec<String> {
+    match node.node.as_ref() {
+        Some(node::Node::BoolExpr(b)) if b.boolop() == protobuf::BoolExprType::AndExpr => {
+            b.args.iter().flat_map(conjunct_fingerprints).collect()
+        }
+        _ => vec![node_fingerprint(node)],
+    }
 }
 
 /// If assigning a literal `NULL` to `tc` would violate a NOT-NULL guarantee
