@@ -1073,6 +1073,85 @@ fn small_integer_literal_stays_int4() {
 }
 
 #[test]
+fn radix_and_underscore_integer_literals_typed_by_magnitude() {
+    // libpg_query hands non-int4 hex/octal/binary/underscore integers over
+    // as `Float` text; PG's make_const re-parses them with pg_strtoint64,
+    // which understands the prefixes and underscores (verified on PG 18).
+    let db = setup();
+    let s = db
+        .analyze(
+            "SELECT 0x80000000 AS a, 0xFFFFFFFFFF AS b, 0x7FFFFFFFFFFFFFFF AS c, \
+             10_000_000_000 AS d, 0o77777777777 AS e, -0x80000000 AS f, \
+             -0x8000000000000000 AS g, 0x8000000000000000 AS h, 1_000 AS i, \
+             0b101 AS j, 1_000.5 AS k",
+        )
+        .unwrap();
+    assert_cols(
+        &s,
+        vec![
+            c("a", int8()),
+            c("b", int8()),
+            c("c", int8()),
+            c("d", int8()),
+            c("e", int8()),
+            c("f", int4()),
+            c("g", int8()),
+            c("h", numeric()),
+            c("i", int4()),
+            c("j", int4()),
+            c("k", numeric()),
+        ],
+    );
+}
+
+// ── Bit-string literals (B'…' / X'…') → bit ─────────────────────────────────
+
+fn bit() -> Type {
+    basic("pg_catalog", "bit")
+}
+
+#[test]
+fn bit_string_literals_are_bit() {
+    // PG's make_const types a T_BitString as `bit` (typmod -1), not bytea.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE m (bits bit(8));").unwrap();
+    let s = db
+        .analyze(
+            "SELECT B'101' AS a, X'1F' AS b, B'101' | B'011' AS c, \
+             B'101'::varbit AS e",
+        )
+        .unwrap();
+    assert_cols(
+        &s,
+        vec![
+            c("a", bit()),
+            c("b", bit()),
+            c("c", bit()),
+            c("e", basic("pg_catalog", "varbit")),
+        ],
+    );
+    let s = db.analyze("SELECT bits & B'00000001' AS a FROM m").unwrap();
+    assert_cols(&s, vec![cn("a", bit())]);
+}
+
+#[test]
+fn bit_string_literal_contents_validated() {
+    // PG runs bit_in on the literal in make_const (22P02).
+    let db = setup();
+    for (sql, msg) in [
+        ("SELECT B'102'", "\"2\" is not a valid binary digit"),
+        ("SELECT X'1G'", "\"G\" is not a valid hexadecimal digit"),
+    ] {
+        let err = db.analyze(sql).expect_err(sql);
+        assert!(
+            matches!(err, AnalyzeError::InvalidLiteral(_)),
+            "{sql}: {err:?}"
+        );
+        assert!(err.to_string().starts_with(msg), "{sql}: {err}");
+    }
+}
+
+#[test]
 fn variadic_any_requires_at_least_one_variadic_arg() {
     // `VARIADIC "any"` functions need ≥1 arg in the variadic slot, so
     // `concat_ws(text)` and `concat()` do not exist — only the fixed params

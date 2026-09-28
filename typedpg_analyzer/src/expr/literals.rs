@@ -14,7 +14,17 @@ pub(crate) fn infer_a_const(a_const: &protobuf::AConst) -> Result<ExprType, Anal
         Some(a_const::Val::Fval(f)) => fval_const_type(&f.fval),
         Some(a_const::Val::Boolval(_)) => oid::BOOL,
         Some(a_const::Val::Sval(_)) => oid::UNKNOWN, // untyped string literal
-        Some(a_const::Val::Bsval(_)) => oid::BYTEA,
+        // `B'…'` / `X'…'`: PG's make_const types a T_BitString as `bit` and
+        // runs `bit_in` on it right away, so a bad digit is a parse-time
+        // 22P02. The lexer keeps the radix marker (`b101` / `x1F`), which is
+        // exactly the form bit_in accepts.
+        Some(a_const::Val::Bsval(b)) => {
+            if let Err(msg) = crate::literal_input::validate_bit(&b.bsval) {
+                let span = crate::error::SourceSpan::from_node_token(a_const.location);
+                return Err(crate::error::RawError::invalid_literal(msg, span).finalize_implicit());
+            }
+            BIT
+        }
         None => oid::UNKNOWN,
     };
 
@@ -28,11 +38,15 @@ pub(crate) fn infer_a_const(a_const: &protobuf::AConst) -> Result<ExprType, Anal
 /// PG re-parses it: an all-integer value is `int4`/`int8` (by magnitude, or
 /// `numeric` if it overflows `int8`); anything with a decimal point or
 /// exponent is `numeric`. So `9999999999` is `bigint`, not `numeric`.
+///
+/// The re-parse is `pg_strtoint64_safe`, which accepts the `0x`/`0o`/`0b`
+/// prefixes and `_` digit separators, so `0x80000000` and `10_000_000_000`
+/// are `bigint` and `-0x80000000` (negation folds into the token) `integer`.
 fn fval_const_type(fval: &str) -> PgTypeOid {
-    match fval.parse::<i64>() {
-        Ok(v) if (i32::MIN as i64..=i32::MAX as i64).contains(&v) => oid::INT4,
-        Ok(_) => oid::INT8,
-        Err(_) => oid::NUMERIC,
+    match crate::literal_input::parse_pg_integer(fval) {
+        Some(v) if (i32::MIN as i128..=i32::MAX as i128).contains(&v) => oid::INT4,
+        Some(v) if (i64::MIN as i128..=i64::MAX as i128).contains(&v) => oid::INT8,
+        _ => oid::NUMERIC,
     }
 }
 

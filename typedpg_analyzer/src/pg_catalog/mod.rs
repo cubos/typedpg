@@ -35,7 +35,6 @@ pub(crate) mod oid {
     use crate::oid::PgTypeOid;
 
     pub const BOOL: PgTypeOid = PgTypeOid::from_raw(16);
-    pub const BYTEA: PgTypeOid = PgTypeOid::from_raw(17);
     pub const NAME: PgTypeOid = PgTypeOid::from_raw(19);
     pub const INT8: PgTypeOid = PgTypeOid::from_raw(20);
     pub const INT2: PgTypeOid = PgTypeOid::from_raw(21);

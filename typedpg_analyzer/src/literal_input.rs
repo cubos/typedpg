@@ -392,6 +392,33 @@ fn validate_int(content: &str, min: i128, max: i128, type_name: &str) -> Result<
     }
 }
 
+/// The value of an integer written in `pg_strtoint64`'s syntax (numutils.c):
+/// optional surrounding whitespace, an optional sign, then decimal digits or
+/// a `0x`/`0o`/`0b` radix prefix, underscores allowed between digits.
+/// `None` on a syntax error or a magnitude beyond `i128` (so beyond every
+/// PG integer type). PG's `make_const` uses this to type the integer-shaped
+/// `T_Float` constants the lexer hands over (anything not fitting int4).
+pub(crate) fn parse_pg_integer(content: &str) -> Option<i128> {
+    let mut s = content.trim_matches(|c: char| c.is_ascii_whitespace());
+    let negative = match s.as_bytes().first() {
+        Some(b'-') => {
+            s = &s[1..];
+            true
+        }
+        Some(b'+') => {
+            s = &s[1..];
+            false
+        }
+        _ => false,
+    };
+    let (radix, digits) = parse_radix_digits(&mut s)?;
+    if !s.is_empty() {
+        return None;
+    }
+    let v = i128::from_str_radix(&digits, radix).ok()?;
+    Some(if negative { -v } else { v })
+}
+
 /// `0x`/`0o`/`0b`-prefixed or decimal digit run (with underscore rules).
 /// Returns `(radix, digits)`; leaves `s` positioned after the run.
 fn parse_radix_digits(s: &mut &str) -> Option<(u32, String)> {
@@ -1141,7 +1168,7 @@ fn decode_date_field(digits: &str) -> Result<(), bool> {
 /// from the first character. Whitespace is *not* trimmed (a space is just an
 /// invalid digit). Length-vs-typmod mismatches are a different error owned
 /// by the typmod layer and not modeled here.
-fn validate_bit(content: &str) -> Result<(), String> {
+pub(crate) fn validate_bit(content: &str) -> Result<(), String> {
     let (digits, hex) = match content.as_bytes().first() {
         Some(b'b' | b'B') => (&content[1..], false),
         Some(b'x' | b'X') => (&content[1..], true),

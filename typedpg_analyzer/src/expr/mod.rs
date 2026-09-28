@@ -23,6 +23,10 @@ use crate::param_collector::ParamCollector;
 use crate::pg_catalog::{PgCatalog, TypCategory, TypType, oid};
 use crate::scope::Scope;
 
+// Built-in type OIDs the expression layer needs beyond `pg_catalog::oid`
+// (fixed by PG's `pg_type.dat`).
+pub(crate) const BIT: PgTypeOid = PgTypeOid::from_raw(1560);
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Inference context
 // ──────────────────────────────────────────────────────────────────────────────
