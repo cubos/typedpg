@@ -1248,3 +1248,38 @@ fn view_over_renamed_column_becomes_nullable_conservatively() {
     let info = db.analyze("SELECT b FROM v").unwrap();
     assert_cols(&info, vec![cn("b", int4())]);
 }
+
+#[test]
+fn star_views_depend_on_every_expanded_column() {
+    // PG 18: 2BP01 cannot drop column c of table t because other objects
+    // depend on it (view vs depends on column c of table t) — the view's
+    // `*` was expanded to every column. Same for `t.*` and ALTER TYPE.
+    for view in [
+        "CREATE VIEW vs AS SELECT * FROM t;",
+        "CREATE VIEW vs AS SELECT t.* FROM t;",
+        "CREATE VIEW vs AS SELECT x.* FROM t AS x;",
+    ] {
+        let err = try_apply(&[
+            ("0001.sql", "CREATE TABLE t (a int, c int);"),
+            ("0002.sql", view),
+            ("0003.sql", "ALTER TABLE t DROP COLUMN c;"),
+        ])
+        .expect_err(view);
+        assert!(
+            err.to_string()
+                .starts_with("cannot drop column c of table t because other objects depend on it"),
+            "{view}\n  got: {err}"
+        );
+    }
+    let err = try_apply(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int, c int); CREATE VIEW vs AS SELECT * FROM t;
+         ALTER TABLE t ALTER COLUMN c TYPE bigint;",
+    )])
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("cannot alter type of a column used by a view or rule"),
+        "{err}"
+    );
+}

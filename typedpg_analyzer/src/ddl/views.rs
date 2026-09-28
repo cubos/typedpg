@@ -645,6 +645,10 @@ struct FromSource {
 #[derive(Default)]
 pub(crate) struct BindingWalker {
     bindings: Vec<AstBinding>,
+    /// The columns a `*` / `alias.*` expands to. Not name slots (the star
+    /// stays one `Unresolved` binding), but the view depends on each of
+    /// them, as PG records for the expanded target list.
+    star_columns: Vec<(PgClassOid, i16)>,
 }
 
 impl BindingWalker {
@@ -662,7 +666,10 @@ fn collect_view_bindings_and_deps(
     let mut walker = BindingWalker::default();
     let scope_stack: Vec<Vec<FromSource>> = Vec::new();
     walker.walk_node(query_node, snapshot, &scope_stack);
-    let deps = derive_deps_from_bindings(&walker.bindings);
+    let mut deps = derive_deps_from_bindings(&walker.bindings);
+    deps.column_refs.extend(walker.star_columns);
+    deps.column_refs.sort();
+    deps.column_refs.dedup();
     (walker.bindings, deps)
 }
 
@@ -1033,10 +1040,38 @@ impl BindingWalker {
             })
             .collect();
 
+        let is_star = matches!(
+            cr.fields.last().and_then(|f| f.node.as_ref()),
+            Some(node::Node::AStar(_))
+        );
+        if is_star {
+            // `*` expands to every column of the query level's FROM items,
+            // `alias.*` to that item's.
+            let sources: Vec<&FromSource> = match parts.as_slice() {
+                [] => stack.last().map(|f| f.iter().collect()).unwrap_or_default(),
+                [.., alias] => stack
+                    .iter()
+                    .rev()
+                    .find_map(|f| f.iter().find(|s| &s.alias == alias))
+                    .into_iter()
+                    .collect(),
+            };
+            for source in sources {
+                if let Some(relid) = source.relid {
+                    self.star_columns.extend(
+                        snapshot
+                            .attributes_of(relid)
+                            .iter()
+                            .map(|a| (relid, a.attnum)),
+                    );
+                }
+            }
+        }
+
         let resolved: Option<(PgClassOid, i16)> = match parts.as_slice() {
-            [col] => resolve_column_unqualified(col, snapshot, stack),
-            [alias, col] => resolve_column_aliased(alias, col, snapshot, stack),
-            [schema, relation, col] => {
+            [col] if !is_star => resolve_column_unqualified(col, snapshot, stack),
+            [alias, col] if !is_star => resolve_column_aliased(alias, col, snapshot, stack),
+            [schema, relation, col] if !is_star => {
                 resolve_column_qualified(schema, relation, col, snapshot, stack)
             }
             _ => None,
