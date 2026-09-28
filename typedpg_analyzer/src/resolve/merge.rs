@@ -52,6 +52,7 @@ pub(crate) fn analyze_merge_with_outer_ctes(
     params: &mut ParamCollector,
     outer_ctes: &HashMap<String, Vec<ScopeColumn>>,
 ) -> AnalyzeResult {
+    let _level = QueryLevel::enter();
     let relation = merge
         .relation
         .as_ref()
@@ -98,12 +99,7 @@ pub(crate) fn analyze_merge_with_outer_ctes(
     // ON + every WHEN branch).
     let mut cte_scopes: HashMap<String, Vec<ScopeColumn>> = outer_ctes.clone();
     if let Some(with) = &merge.with_clause {
-        for cte_node in &with.ctes {
-            if let Some(node::Node::CommonTableExpr(cte)) = cte_node.node.as_ref() {
-                let cte_columns = analyze_cte(cte, with.recursive, snapshot, params, &cte_scopes)?;
-                cte_scopes.insert(cte.ctename.clone(), cte_columns);
-            }
-        }
+        cte_scopes = analyze_with_clause(with, snapshot, params, &cte_scopes)?;
     }
 
     // The target alone, and the source's FROM item alone.

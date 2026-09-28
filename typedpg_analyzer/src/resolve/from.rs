@@ -43,6 +43,7 @@ pub(crate) fn process_from_item(
             if rv.schemaname.is_empty()
                 && let Some(cte_cols) = cte_scopes.get(&rv.relname)
             {
+                check_cte_reference(cte_scopes, &rv.relname)?;
                 let cols: Vec<ScopeColumn> = cte_cols
                     .iter()
                     .cloned()

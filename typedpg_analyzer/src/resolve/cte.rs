@@ -26,13 +26,16 @@ pub(crate) fn analyze_cte(
     // (2) register those columns in a temporary scope, (3) analyze the
     // recursive arm against that scope, (4) unify the two arms' column
     // types via `find_common_type` — matching PG's common-type resolution.
-    if with_recursive
+    let self_referencing = with_recursive && is_self_referencing(cte);
+    if self_referencing && let node::Node::SelectStmt(sel) = cte_query {
+        check_well_formed_recursion(cte, sel)?;
+    }
+    if self_referencing
         && let node::Node::SelectStmt(sel) = cte_query
-        && sel.op != SetOperation::SetopNone as i32
         && let (Some(larg), Some(rarg)) = (sel.larg.as_ref(), sel.rarg.as_ref())
     {
         let (seed_cols, _) = analyze_select_with_ctes(larg, snapshot, params, existing_ctes)?;
-        let seed_cols = apply_cte_column_aliases(seed_cols, &cte.aliascolnames);
+        let seed_cols = apply_cte_column_aliases(&cte.ctename, seed_cols, &cte.aliascolnames)?;
 
         // Register the CTE against its seed types so the recursive arm can
         // resolve `FROM t`.
@@ -53,6 +56,7 @@ pub(crate) fn analyze_cte(
         scopes_with_self.insert(cte.ctename.clone(), self_scope);
 
         let (rec_cols, _) = analyze_select_with_ctes(rarg, snapshot, params, &scopes_with_self)?;
+        check_no_aggregates_in_recursive_term(rarg, snapshot)?;
         if seed_cols.len() != rec_cols.len() {
             return Err(AnalyzeError::Unsupported(
                 "recursive CTE branches have different column counts".into(),
@@ -128,7 +132,7 @@ pub(crate) fn analyze_cte(
         node::Node::SelectStmt(sel) => {
             let (mut cols, _) = analyze_select_with_ctes(sel, snapshot, params, existing_ctes)?;
             resolve_unknown_outputs(sel, &mut cols, params);
-            let cols = apply_cte_column_aliases(cols, &cte.aliascolnames);
+            let cols = apply_cte_column_aliases(&cte.ctename, cols, &cte.aliascolnames)?;
             Ok(cols
                 .into_iter()
                 .map(|rc| ScopeColumn {
@@ -319,27 +323,436 @@ fn append_search_cycle_columns(
 
 /// Rename `cols` using the `aliascolnames` from `WITH name(col1, col2) AS …`
 /// if present. PG uses positional matching; if the CTE has fewer aliases
-/// than columns, the trailing columns keep their inner names.
-fn apply_cte_column_aliases(cols: Vec<RawColumn>, aliases: &[protobuf::Node]) -> Vec<RawColumn> {
-    if aliases.is_empty() {
-        return cols;
+/// than columns, the trailing columns keep their inner names, and more
+/// aliases than columns is 42P10 (`analyzeCTETargetList`).
+fn apply_cte_column_aliases(
+    cte_name: &str,
+    cols: Vec<RawColumn>,
+    aliases: &[protobuf::Node],
+) -> Result<Vec<RawColumn>, AnalyzeError> {
+    let names = expr::extract_string_fields(aliases);
+    if names.len() > cols.len() {
+        return Err(crate::error::RawError::new(
+            AnalyzeError::InvalidColumnReference(format!(
+                "WITH query \"{cte_name}\" has {} columns available but {} columns specified",
+                cols.len(),
+                names.len()
+            )),
+            None,
+            None,
+        )
+        .finalize_implicit());
     }
-    let names: Vec<String> = aliases
-        .iter()
-        .filter_map(|n| match n.node.as_ref()? {
-            node::Node::String(s) => Some(s.sval.clone()),
-            _ => None,
-        })
-        .collect();
-    cols.into_iter()
+    Ok(cols
+        .into_iter()
         .enumerate()
         .map(|(i, c)| RawColumn {
             name: names.get(i).cloned().unwrap_or(c.name),
-            type_oid: c.type_oid,
-            nullable: c.nullable,
-            typmod: c.typmod,
-            collation: c.collation,
-            record_fields: c.record_fields,
+            ..c
         })
-        .collect()
+        .collect())
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// WITH-clause rules
+// ──────────────────────────────────────────────────────────────────────────────
+
+thread_local! {
+    /// Nesting depth of the query being analyzed: 1 for the statement
+    /// itself, more inside subqueries, sublinks, set-operation arms and CTE
+    /// bodies. PG only accepts a data-modifying CTE at depth 1.
+    static QUERY_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// RAII marker for one query level (see [`QUERY_DEPTH`]).
+pub(crate) struct QueryLevel;
+
+impl QueryLevel {
+    pub(crate) fn enter() -> Self {
+        QUERY_DEPTH.with(|d| d.set(d.get() + 1));
+        QueryLevel
+    }
+}
+
+impl Drop for QueryLevel {
+    fn drop(&mut self) {
+        QUERY_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+/// The CTE-map key marking `name` as a data-modifying CTE without
+/// RETURNING: it may be defined but not referenced.
+fn no_returning_marker(name: &str) -> String {
+    format!("\u{1}no-returning:{name}")
+}
+
+/// PG (`addRangeTableEntryForCTE`, 0A000): referencing a data-modifying CTE
+/// that has no RETURNING clause.
+pub(crate) fn check_cte_reference(
+    ctes: &HashMap<String, Vec<ScopeColumn>>,
+    name: &str,
+) -> Result<(), AnalyzeError> {
+    if ctes.contains_key(&no_returning_marker(name)) {
+        return Err(crate::error::RawError::new(
+            AnalyzeError::FeatureNotSupported(format!(
+                "WITH query \"{name}\" does not have a RETURNING clause"
+            )),
+            None,
+            None,
+        )
+        .finalize_implicit());
+    }
+    Ok(())
+}
+
+/// Analyze a `WITH` clause on top of the CTEs already visible, following
+/// PG's `transformWithClause` / `analyzeCTE`: names must be unique within
+/// the clause (42712), a data-modifying CTE is only allowed on the
+/// top-level statement (0A000), and each CTE is analyzed in order, seeing
+/// the ones before it.
+pub(crate) fn analyze_with_clause(
+    with: &protobuf::WithClause,
+    snapshot: &PgCatalog,
+    params: &mut ParamCollector,
+    outer_ctes: &HashMap<String, Vec<ScopeColumn>>,
+) -> Result<HashMap<String, Vec<ScopeColumn>>, AnalyzeError> {
+    let ctes: Vec<&protobuf::CommonTableExpr> = with
+        .ctes
+        .iter()
+        .filter_map(|n| match n.node.as_ref()? {
+            node::Node::CommonTableExpr(cte) => Some(cte.as_ref()),
+            _ => None,
+        })
+        .collect();
+    for (i, cte) in ctes.iter().enumerate() {
+        if ctes[..i].iter().any(|c| c.ctename == cte.ctename) {
+            return Err(crate::error::RawError::new(
+                AnalyzeError::DuplicateAlias(format!(
+                    "WITH query name \"{}\" specified more than once",
+                    cte.ctename
+                )),
+                None,
+                None,
+            )
+            .finalize_implicit());
+        }
+    }
+    let top_level = QUERY_DEPTH.with(|d| d.get()) <= 1;
+    let mut cte_scopes = outer_ctes.clone();
+    for cte in ctes {
+        let returning = match cte.ctequery.as_deref().and_then(|q| q.node.as_ref()) {
+            Some(node::Node::InsertStmt(s)) => Some(!s.returning_list.is_empty()),
+            Some(node::Node::UpdateStmt(s)) => Some(!s.returning_list.is_empty()),
+            Some(node::Node::DeleteStmt(s)) => Some(!s.returning_list.is_empty()),
+            Some(node::Node::MergeStmt(s)) => Some(!s.returning_list.is_empty()),
+            _ => None,
+        };
+        if returning.is_some() && !top_level {
+            return Err(crate::error::RawError::new(
+                AnalyzeError::FeatureNotSupported(
+                    "WITH clause containing a data-modifying statement must be at the top level"
+                        .into(),
+                ),
+                None,
+                None,
+            )
+            .finalize_implicit());
+        }
+        let cte_columns = analyze_cte(cte, with.recursive, snapshot, params, &cte_scopes)?;
+        let marker = no_returning_marker(&cte.ctename);
+        if returning == Some(false) {
+            cte_scopes.insert(marker, Vec::new());
+        } else {
+            cte_scopes.remove(&marker);
+        }
+        cte_scopes.insert(cte.ctename.clone(), cte_columns);
+    }
+    Ok(cte_scopes)
+}
+
+/// Where a recursive self-reference sits (PG's `RecursionContext`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RecursionContext {
+    Ok,
+    NonRecursiveTerm,
+    Sublink,
+    OuterJoin,
+    Intersect,
+    Except,
+}
+
+impl RecursionContext {
+    fn complaint(self) -> &'static str {
+        match self {
+            RecursionContext::Ok => "",
+            RecursionContext::NonRecursiveTerm => "within its non-recursive term",
+            RecursionContext::Sublink => "within a subquery",
+            RecursionContext::OuterJoin => "within an outer join",
+            RecursionContext::Intersect => "within INTERSECT",
+            RecursionContext::Except => "within EXCEPT",
+        }
+    }
+}
+
+/// PG's `checkWellFormedRecursionWalker` over one query: every reference to
+/// the CTE `name` is counted; one outside an `Ok` context, or a second one,
+/// is 42P19. With `check` off it only counts (self-reference detection).
+struct RecursionWalker<'a> {
+    name: &'a str,
+    check: bool,
+    refs: usize,
+}
+
+impl RecursionWalker<'_> {
+    fn error(&self, msg: String) -> AnalyzeError {
+        crate::error::RawError::new(AnalyzeError::InvalidRecursion(msg), None, None)
+            .finalize_implicit()
+    }
+
+    fn reference(&mut self, ctx: RecursionContext) -> Result<(), AnalyzeError> {
+        if self.check {
+            if ctx != RecursionContext::Ok {
+                return Err(self.error(format!(
+                    "recursive reference to query \"{}\" must not appear {}",
+                    self.name,
+                    ctx.complaint()
+                )));
+            }
+            if self.refs > 0 {
+                return Err(self.error(format!(
+                    "recursive reference to query \"{}\" must not appear more than once",
+                    self.name
+                )));
+            }
+        }
+        self.refs += 1;
+        Ok(())
+    }
+
+    fn select(
+        &mut self,
+        sel: &protobuf::SelectStmt,
+        ctx: RecursionContext,
+    ) -> Result<(), AnalyzeError> {
+        // A WITH inside the query that redefines the name shadows it.
+        if let Some(with) = &sel.with_clause {
+            if with.ctes.iter().any(|n| {
+                matches!(n.node.as_ref(), Some(node::Node::CommonTableExpr(c)) if c.ctename == self.name)
+            }) {
+                return Ok(());
+            }
+            for n in &with.ctes {
+                if let Some(node::Node::CommonTableExpr(c)) = n.node.as_ref()
+                    && let Some(node::Node::SelectStmt(s)) =
+                        c.ctequery.as_deref().and_then(|q| q.node.as_ref())
+                {
+                    self.select(s, ctx)?;
+                }
+            }
+        }
+        match SetOperation::try_from(sel.op) {
+            Ok(SetOperation::SetopNone) | Err(_) => {}
+            Ok(op) => {
+                let (l, r) = match op {
+                    SetOperation::SetopIntersect => {
+                        (RecursionContext::Intersect, RecursionContext::Intersect)
+                    }
+                    SetOperation::SetopExcept => (ctx, RecursionContext::Except),
+                    _ => (ctx, ctx),
+                };
+                if let Some(larg) = &sel.larg {
+                    self.select(larg, if ctx == RecursionContext::Ok { l } else { ctx })?;
+                }
+                if let Some(rarg) = &sel.rarg {
+                    self.select(rarg, if ctx == RecursionContext::Ok { r } else { ctx })?;
+                }
+                return Ok(());
+            }
+        }
+        for item in &sel.from_clause {
+            self.visit_from_item(item, ctx)?;
+        }
+        let exprs = sel
+            .target_list
+            .iter()
+            .chain(sel.where_clause.as_deref())
+            .chain(sel.group_clause.iter())
+            .chain(sel.having_clause.as_deref())
+            .chain(sel.sort_clause.iter());
+        for e in exprs {
+            self.expr(e)?;
+        }
+        for row in &sel.values_lists {
+            self.expr(row)?;
+        }
+        Ok(())
+    }
+
+    fn visit_from_item(
+        &mut self,
+        n: &protobuf::Node,
+        ctx: RecursionContext,
+    ) -> Result<(), AnalyzeError> {
+        match n.node.as_ref() {
+            Some(node::Node::RangeVar(rv)) => {
+                if rv.schemaname.is_empty() && rv.relname == self.name {
+                    self.reference(ctx)?;
+                }
+            }
+            Some(node::Node::JoinExpr(j)) => {
+                let outer = RecursionContext::OuterJoin;
+                let pick = |side_nullable: bool| {
+                    if side_nullable && ctx == RecursionContext::Ok {
+                        outer
+                    } else {
+                        ctx
+                    }
+                };
+                let (l_null, r_null) = match JoinType::try_from(j.jointype) {
+                    Ok(JoinType::JoinLeft) => (false, true),
+                    Ok(JoinType::JoinRight) => (true, false),
+                    Ok(JoinType::JoinFull) => (true, true),
+                    _ => (false, false),
+                };
+                if let Some(l) = j.larg.as_deref() {
+                    self.visit_from_item(l, pick(l_null))?;
+                }
+                if let Some(r) = j.rarg.as_deref() {
+                    self.visit_from_item(r, pick(r_null))?;
+                }
+                if let Some(q) = j.quals.as_deref() {
+                    self.expr(q)?;
+                }
+            }
+            Some(node::Node::RangeSubselect(rs)) => {
+                if let Some(node::Node::SelectStmt(s)) =
+                    rs.subquery.as_deref().and_then(|q| q.node.as_ref())
+                {
+                    self.select(s, ctx)?;
+                }
+            }
+            Some(node::Node::RangeFunction(rf)) => {
+                for f in &rf.functions {
+                    self.expr(f)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn expr(&mut self, n: &protobuf::Node) -> Result<(), AnalyzeError> {
+        let mut sublinks: Vec<&protobuf::SelectStmt> = Vec::new();
+        visit_same_level(n, &mut |e| {
+            if let Some(node::Node::SubLink(sl)) = e.node.as_ref()
+                && let Some(node::Node::SelectStmt(s)) =
+                    sl.subselect.as_deref().and_then(|q| q.node.as_ref())
+            {
+                sublinks.push(s);
+            }
+        });
+        for s in sublinks {
+            self.select(s, RecursionContext::Sublink)?;
+        }
+        Ok(())
+    }
+}
+
+/// Whether a `WITH RECURSIVE` CTE's body references the CTE itself (PG's
+/// `cterecursive`).
+fn is_self_referencing(cte: &protobuf::CommonTableExpr) -> bool {
+    let Some(node::Node::SelectStmt(sel)) = cte.ctequery.as_deref().and_then(|q| q.node.as_ref())
+    else {
+        return false;
+    };
+    let mut w = RecursionWalker {
+        name: &cte.ctename,
+        check: false,
+        refs: 0,
+    };
+    w.select(sel, RecursionContext::Ok).is_ok() && w.refs > 0
+}
+
+/// PG's `checkWellFormedRecursion`: a self-referencing CTE must be
+/// `non-recursive-term UNION [ALL] recursive-term` without ORDER BY /
+/// OFFSET / LIMIT / FOR UPDATE, the non-recursive term may not reference
+/// it, and the recursive term references it exactly once, outside
+/// sublinks, outer-join nullable sides, INTERSECT and EXCEPT.
+fn check_well_formed_recursion(
+    cte: &protobuf::CommonTableExpr,
+    sel: &protobuf::SelectStmt,
+) -> Result<(), AnalyzeError> {
+    let unsupported = |what: &str| {
+        crate::error::RawError::new(
+            AnalyzeError::FeatureNotSupported(format!(
+                "{what} in a recursive query is not implemented"
+            )),
+            None,
+            None,
+        )
+        .finalize_implicit()
+    };
+    if sel.op != SetOperation::SetopUnion as i32 {
+        return Err(crate::error::RawError::new(
+            AnalyzeError::InvalidRecursion(format!(
+                "recursive query \"{}\" does not have the form non-recursive-term UNION [ALL] \
+                 recursive-term",
+                cte.ctename
+            )),
+            None,
+            None,
+        )
+        .finalize_implicit());
+    }
+    if !sel.sort_clause.is_empty() {
+        return Err(unsupported("ORDER BY"));
+    }
+    if sel.limit_offset.is_some() {
+        return Err(unsupported("OFFSET"));
+    }
+    if sel.limit_count.is_some() {
+        return Err(unsupported("LIMIT"));
+    }
+    if !sel.locking_clause.is_empty() {
+        return Err(unsupported("FOR UPDATE/SHARE"));
+    }
+    let mut w = RecursionWalker {
+        name: &cte.ctename,
+        check: true,
+        refs: 0,
+    };
+    if let Some(larg) = &sel.larg {
+        w.select(larg, RecursionContext::NonRecursiveTerm)?;
+    }
+    if let Some(rarg) = &sel.rarg {
+        w.select(rarg, RecursionContext::Ok)?;
+    }
+    Ok(())
+}
+
+/// PG (parse_agg.c, 42P19): no aggregates in the recursive term.
+fn check_no_aggregates_in_recursive_term(
+    rarg: &protobuf::SelectStmt,
+    snapshot: &PgCatalog,
+) -> Result<(), AnalyzeError> {
+    let has_agg = rarg
+        .target_list
+        .iter()
+        .filter_map(|t| match t.node.as_ref()? {
+            node::Node::ResTarget(rt) => rt.val.as_deref(),
+            _ => None,
+        })
+        .chain(rarg.having_clause.as_deref())
+        .any(|n| expr::detect_func_kinds(n, snapshot).has_aggregate);
+    if has_agg {
+        return Err(crate::error::RawError::new(
+            AnalyzeError::InvalidRecursion(
+                "aggregate functions are not allowed in a recursive query's recursive term".into(),
+            ),
+            None,
+            None,
+        )
+        .finalize_implicit());
+    }
+    Ok(())
 }

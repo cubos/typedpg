@@ -218,3 +218,99 @@ fn search_cycle_validation() {
         assert!(err.to_string().starts_with(msg), "{sql}: {err}");
     }
 }
+
+// ── WITH validation ──────────────────────────────────────────────────────────
+
+#[test]
+fn with_clause_validation() {
+    let db = setup();
+    let cases: &[(&str, &str)] = &[
+        (
+            "WITH ins AS (INSERT INTO t (id, a, c) VALUES (1, 2, 'x')) SELECT * FROM ins",
+            "WITH query \"ins\" does not have a RETURNING clause",
+        ),
+        (
+            "SELECT * FROM (WITH ins AS (INSERT INTO t (id, a, c) VALUES (1, 2, 'x') RETURNING id) \
+             SELECT * FROM ins) s",
+            "WITH clause containing a data-modifying statement must be at the top level",
+        ),
+        (
+            "SELECT (WITH d AS (DELETE FROM t RETURNING id) SELECT count(*) FROM d)",
+            "WITH clause containing a data-modifying statement must be at the top level",
+        ),
+        (
+            "WITH x AS (WITH d AS (DELETE FROM t RETURNING id) SELECT * FROM d) SELECT * FROM x",
+            "WITH clause containing a data-modifying statement must be at the top level",
+        ),
+        (
+            "WITH w AS (SELECT a FROM t), w AS (SELECT 1) SELECT * FROM w",
+            "WITH query name \"w\" specified more than once",
+        ),
+        (
+            "WITH w(z, zz) AS (SELECT a FROM t) SELECT z FROM w",
+            "WITH query \"w\" has 1 columns available but 2 columns specified",
+        ),
+    ];
+    for (sql, msg) in cases {
+        let err = db.analyze(sql).unwrap_err();
+        assert!(err.to_string().starts_with(msg), "{sql}: {err}");
+    }
+    // An unreferenced data-modifying CTE needs no RETURNING.
+    db.analyze("WITH ins AS (INSERT INTO t (id, a, c) VALUES (1, 2, 'x')) SELECT 1")
+        .unwrap();
+}
+
+// ── Recursive-query structure ────────────────────────────────────────────────
+
+#[test]
+fn recursive_query_structure_rules() {
+    let db = setup();
+    let cases: &[(&str, &str)] = &[
+        (
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT count(*)::int FROM r) SELECT n FROM r",
+            "aggregate functions are not allowed in a recursive query's recursive term",
+        ),
+        (
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT r.n FROM r, r r2) SELECT n FROM r",
+            "recursive reference to query \"r\" must not appear more than once",
+        ),
+        (
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r ORDER BY 1) SELECT n FROM r",
+            "ORDER BY in a recursive query is not implemented",
+        ),
+        (
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r LIMIT 3) SELECT n FROM r",
+            "LIMIT in a recursive query is not implemented",
+        ),
+        (
+            "WITH RECURSIVE r(n) AS (SELECT 1 INTERSECT SELECT n + 1 FROM r) SELECT n FROM r",
+            "recursive query \"r\" does not have the form non-recursive-term UNION [ALL] recursive-term",
+        ),
+        (
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t LEFT JOIN r ON true) SELECT n FROM r",
+            "recursive reference to query \"r\" must not appear within an outer join",
+        ),
+        (
+            "WITH RECURSIVE r(n) AS (SELECT n FROM r UNION ALL SELECT 1) SELECT n FROM r",
+            "recursive reference to query \"r\" must not appear within its non-recursive term",
+        ),
+        (
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE a IN (SELECT n FROM r)) SELECT n FROM r",
+            "recursive reference to query \"r\" must not appear within a subquery",
+        ),
+    ];
+    for (sql, msg) in cases {
+        let err = db.analyze(sql).unwrap_err();
+        assert!(err.to_string().starts_with(msg), "{sql}: {err}");
+    }
+    for sql in [
+        // Not self-referencing: an ordinary INTERSECT.
+        "WITH RECURSIVE r(n) AS (SELECT 1 INTERSECT SELECT 2) SELECT n FROM r",
+        // The CTE on the preserved side of an outer join, or in a FROM
+        // subquery, is fine.
+        "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r LEFT JOIN t ON true WHERE n < 3) SELECT n FROM r",
+        "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM (SELECT * FROM r) s WHERE n < 3) SELECT n FROM r",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}

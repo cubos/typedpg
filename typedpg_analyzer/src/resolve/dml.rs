@@ -22,6 +22,7 @@ pub(crate) fn analyze_insert_with_outer_ctes(
     params: &mut ParamCollector,
     outer_ctes: &HashMap<String, Vec<ScopeColumn>>,
 ) -> AnalyzeResult {
+    let _level = QueryLevel::enter();
     let relation = ins
         .relation
         .as_ref()
@@ -195,12 +196,7 @@ fn build_insert_cte_scopes(
 ) -> Result<HashMap<String, Vec<ScopeColumn>>, AnalyzeError> {
     let mut cte_scopes: HashMap<String, Vec<ScopeColumn>> = outer_ctes.clone();
     if let Some(with) = &ins.with_clause {
-        for cte_node in &with.ctes {
-            if let Some(node::Node::CommonTableExpr(cte)) = cte_node.node.as_ref() {
-                let cte_columns = analyze_cte(cte, with.recursive, snapshot, params, &cte_scopes)?;
-                cte_scopes.insert(cte.ctename.clone(), cte_columns);
-            }
-        }
+        cte_scopes = analyze_with_clause(with, snapshot, params, &cte_scopes)?;
     }
     Ok(cte_scopes)
 }
@@ -590,6 +586,7 @@ pub(crate) fn analyze_update_with_outer_ctes(
     params: &mut ParamCollector,
     outer_ctes: &HashMap<String, Vec<ScopeColumn>>,
 ) -> AnalyzeResult {
+    let _level = QueryLevel::enter();
     let relation = upd
         .relation
         .as_ref()
@@ -630,12 +627,7 @@ pub(crate) fn analyze_update_with_outer_ctes(
     // reasoning as the corresponding block in `analyze_insert`.
     let mut cte_scopes: HashMap<String, Vec<ScopeColumn>> = outer_ctes.clone();
     if let Some(with) = &upd.with_clause {
-        for cte_node in &with.ctes {
-            if let Some(node::Node::CommonTableExpr(cte)) = cte_node.node.as_ref() {
-                let cte_columns = analyze_cte(cte, with.recursive, snapshot, params, &cte_scopes)?;
-                cte_scopes.insert(cte.ctename.clone(), cte_columns);
-            }
-        }
+        cte_scopes = analyze_with_clause(with, snapshot, params, &cte_scopes)?;
     }
 
     // Build scope with target table + FROM clause tables.
@@ -710,6 +702,7 @@ pub(crate) fn analyze_delete_with_outer_ctes(
     params: &mut ParamCollector,
     outer_ctes: &HashMap<String, Vec<ScopeColumn>>,
 ) -> AnalyzeResult {
+    let _level = QueryLevel::enter();
     let relation = del
         .relation
         .as_ref()
@@ -748,12 +741,7 @@ pub(crate) fn analyze_delete_with_outer_ctes(
     // with the collector and the CTE alias is visible to the USING clause.
     let mut cte_scopes: HashMap<String, Vec<ScopeColumn>> = outer_ctes.clone();
     if let Some(with) = &del.with_clause {
-        for cte_node in &with.ctes {
-            if let Some(node::Node::CommonTableExpr(cte)) = cte_node.node.as_ref() {
-                let cte_columns = analyze_cte(cte, with.recursive, snapshot, params, &cte_scopes)?;
-                cte_scopes.insert(cte.ctename.clone(), cte_columns);
-            }
-        }
+        cte_scopes = analyze_with_clause(with, snapshot, params, &cte_scopes)?;
     }
 
     let mut scope = Scope {

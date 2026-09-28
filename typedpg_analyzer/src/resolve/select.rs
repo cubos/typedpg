@@ -107,17 +107,13 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
     correlated_sources: &[crate::scope::TableSource],
     shadowed_sources: &[crate::scope::TableSource],
 ) -> AnalyzeResult {
+    let _level = QueryLevel::enter();
     // Start with outer CTEs (from parent WITH clause).
     let mut cte_scopes: HashMap<String, Vec<ScopeColumn>> = outer_ctes.clone();
 
     // Process this SELECT's own CTEs (before UNION check, since WITH wraps UNION).
     if let Some(with) = &sel.with_clause {
-        for cte_node in &with.ctes {
-            if let Some(node::Node::CommonTableExpr(cte)) = cte_node.node.as_ref() {
-                let cte_columns = analyze_cte(cte, with.recursive, snapshot, params, &cte_scopes)?;
-                cte_scopes.insert(cte.ctename.clone(), cte_columns);
-            }
-        }
+        cte_scopes = analyze_with_clause(with, snapshot, params, &cte_scopes)?;
     }
 
     // Handle UNION/INTERSECT/EXCEPT.
