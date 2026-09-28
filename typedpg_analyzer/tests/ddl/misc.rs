@@ -351,3 +351,90 @@ fn grant_targets_must_exist() {
          REVOKE ALL ON t FROM public;",
     )]);
 }
+
+#[test]
+fn policies_are_validated_and_tracked() {
+    // PG 18 CreatePolicy / AlterPolicy / rename_policy / DROP POLICY.
+    let setup = "CREATE TABLE t (a int);
+                 CREATE POLICY p ON t USING (a > 0);
+                 CREATE POLICY p2 ON t USING (true);
+                 CREATE SEQUENCE s;
+                 CREATE VIEW v AS SELECT 1 AS x;";
+    for (stmt, msg) in [
+        (
+            "CREATE POLICY q ON nosuch USING (true);",
+            "relation \"nosuch\" does not exist",
+        ),
+        (
+            "CREATE POLICY q ON t USING (a);",
+            "argument of POLICY must be type boolean, not type integer",
+        ),
+        (
+            "CREATE POLICY q ON t USING (a > 0) WITH CHECK (a);",
+            "argument of POLICY must be type boolean, not type integer",
+        ),
+        (
+            "CREATE POLICY q ON t USING (nosuchcol > 0);",
+            "column \"nosuchcol\" does not exist",
+        ),
+        (
+            "CREATE POLICY q ON t USING (sum(a) > 0);",
+            "aggregate functions are not allowed in policy expressions",
+        ),
+        (
+            "CREATE POLICY p ON t USING (true);",
+            "policy \"p\" for table \"t\" already exists",
+        ),
+        ("CREATE POLICY q ON s USING (true);", "\"s\" is not a table"),
+        ("CREATE POLICY q ON v USING (true);", "\"v\" is not a table"),
+        (
+            "ALTER POLICY nosuch ON t USING (true);",
+            "policy \"nosuch\" for table \"t\" does not exist",
+        ),
+        (
+            "ALTER POLICY p ON t USING (a);",
+            "argument of POLICY must be type boolean, not type integer",
+        ),
+        (
+            "DROP POLICY nosuch ON t;",
+            "policy \"nosuch\" for table \"t\" does not exist",
+        ),
+        (
+            "DROP POLICY p ON nosuch;",
+            "relation \"nosuch\" does not exist",
+        ),
+        (
+            "ALTER POLICY p ON t RENAME TO p2;",
+            "policy \"p2\" for table \"t\" already exists",
+        ),
+        (
+            "ALTER POLICY nosuch ON t RENAME TO z;",
+            "policy \"nosuch\" for table \"t\" does not exist",
+        ),
+        (
+            "ALTER POLICY p ON t RENAME TO q; DROP POLICY p ON t;",
+            "policy \"p\" for table \"t\" does not exist",
+        ),
+        (
+            "DROP POLICY p ON t; ALTER POLICY p ON t USING (true);",
+            "policy \"p\" for table \"t\" does not exist",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "CREATE POLICY p3 ON t USING (t.a > 0) WITH CHECK ((SELECT count(*) FROM t) > 0);
+             CREATE POLICY p4 ON t USING (null);
+             DROP POLICY IF EXISTS nosuch ON t;
+             DROP POLICY IF EXISTS nosuch ON nosuch;
+             ALTER POLICY p ON t RENAME TO q;
+             ALTER POLICY q ON t USING (a < 0);
+             DROP POLICY q ON t;
+             CREATE POLICY p ON t USING (true);",
+        ),
+    ]);
+}

@@ -218,6 +218,8 @@ pub struct PgCatalog {
     pub(crate) partition_keys: HashMap<PgClassOid, Vec<i16>>,
     /// `pg_trigger`: each relation's triggers (name and function).
     pub(crate) triggers: HashMap<PgClassOid, Vec<crate::ddl::triggers::Trigger>>,
+    /// `pg_policy`: each relation's row-security policy names.
+    pub(crate) policies: HashMap<PgClassOid, Vec<String>>,
     /// `pg_type.typsubscript` of user base types, as the handler function's
     /// name (`hstore_subscript_handler`), set by `CREATE TYPE (SUBSCRIPT =
     /// …)` / `ALTER TYPE … SET (SUBSCRIPT = …)`. Built-in types aren't
@@ -459,6 +461,7 @@ impl PgCatalog {
             inline_sql_bodies: HashMap::new(),
             partition_keys: HashMap::new(),
             triggers: HashMap::new(),
+            policies: HashMap::new(),
             type_subscript: HashMap::new(),
             next_oid: USER_OID_START_NZ,
             #[cfg(feature = "pg_sanity")]
@@ -1041,6 +1044,7 @@ impl PgCatalog {
             .retain(|(relid, _), _| *relid != oid);
         self.partition_keys.remove(&oid);
         self.triggers.remove(&oid);
+        self.policies.remove(&oid);
         let row = self.pg_class.remove(&oid)?;
         self.class_by_qname
             .remove(&(row.relnamespace, row.relname.clone()));
