@@ -388,6 +388,7 @@ fn rename_check_at(
             "cannot rename inherited constraint \"{old}\""
         )));
     }
+    crate::ddl::alter::check_constraint_name_free(interp, relid, new, &relname_of(interp, relid))?;
     if let Some(row) = interp.pg_constraint.get_mut(&con.oid) {
         row.conname = new.to_owned();
     }

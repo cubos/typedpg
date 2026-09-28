@@ -34,9 +34,8 @@ pub fn rename(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlError>
         // RENAME ATTRIBUTE of a composite type is a column rename of its
         // relation.
         ObjectType::ObjectColumn | ObjectType::ObjectAttribute => rename_column(interp, stmt),
-        ObjectType::ObjectTabconstraint | ObjectType::ObjectDomconstraint => {
-            rename_constraint(interp, stmt)
-        }
+        ObjectType::ObjectTabconstraint => rename_constraint(interp, stmt),
+        ObjectType::ObjectDomconstraint => rename_domain_constraint(interp, stmt),
         ObjectType::ObjectTrigger => crate::ddl::triggers::rename_trigger(interp, stmt),
         ObjectType::ObjectPolicy => crate::ddl::policies::rename_policy(interp, stmt),
         ObjectType::ObjectRule => crate::ddl::rules::rename_rule(interp, stmt),
@@ -89,6 +88,20 @@ fn rename_constraint(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), Dd
     };
 
     let old_name = stmt.subname.clone();
+    let is_index_backed = matches!(
+        interp.pg_constraint.get(&target_oid).map(|c| c.contype),
+        Some(
+            crate::pg_catalog::ConType::PrimaryKey
+                | crate::pg_catalog::ConType::Unique
+                | crate::pg_catalog::ConType::Exclusion
+        )
+    );
+    // An index-backed constraint renames its index first
+    // (RenameRelationInternal), then RenameConstraintById.
+    if is_index_backed {
+        crate::ddl::util::check_relation_name_free(interp, nsoid, &stmt.newname)?;
+    }
+    check_constraint_name_free(interp, class_oid, &stmt.newname, &relname)?;
     if interp.pg_constraint.get(&target_oid).map(|c| c.contype)
         == Some(crate::pg_catalog::ConType::Check)
     {
@@ -119,6 +132,55 @@ fn rename_constraint(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), Dd
     {
         interp.rename_pg_class(idx_oid, stmt.newname.clone(), nsoid);
     }
+    Ok(())
+}
+
+/// RenameConstraintById: the new name must be free among the relation's
+/// constraints.
+pub(crate) fn check_constraint_name_free(
+    interp: &PgCatalog,
+    relid: crate::oid::PgClassOid,
+    name: &str,
+    relname: &str,
+) -> Result<(), DdlError> {
+    if interp
+        .pg_constraint
+        .values()
+        .any(|c| c.conrelid == relid && c.conname == name)
+    {
+        return Err(DdlError::DuplicateObject(format!(
+            "constraint \"{name}\" for relation \"{relname}\" already exists"
+        )));
+    }
+    Ok(())
+}
+
+/// `ALTER DOMAIN d RENAME CONSTRAINT old TO new` (get_domain_constraint_oid,
+/// RenameConstraintById).
+fn rename_domain_constraint(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlError> {
+    let Some(node::Node::List(l)) = stmt.object.as_deref().and_then(|o| o.node.as_ref()) else {
+        return Ok(());
+    };
+    let tn = pg_query::protobuf::TypeName {
+        names: l.items.clone(),
+        ..Default::default()
+    };
+    let type_oid = crate::ddl::util::lookup_type_name(&tn, interp)?;
+    let domain = crate::ddl::util::format_type_for_message(interp, type_oid);
+    let constraints = interp.domain_constraints.entry(type_oid).or_default();
+    let Some(pos) = constraints.iter().position(|c| c.name == stmt.subname) else {
+        return Err(DdlError::TypeNotFound(format!(
+            "constraint \"{}\" for domain {domain} does not exist",
+            stmt.subname
+        )));
+    };
+    if constraints.iter().any(|c| c.name == stmt.newname) {
+        return Err(DdlError::DuplicateObject(format!(
+            "constraint \"{}\" for domain {domain} already exists",
+            stmt.newname
+        )));
+    }
+    constraints[pos].name = stmt.newname.clone();
     Ok(())
 }
 

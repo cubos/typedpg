@@ -2010,3 +2010,60 @@ fn transaction_block_rules_follow_the_migration_runner() {
         build_db(&[("0001.sql", setup), ("0002.sql", ok)]);
     }
 }
+
+#[test]
+fn rename_constraint_needs_a_free_name() {
+    // PG 18 RenameConstraintById / RenameRelationInternal /
+    // get_domain_constraint_oid.
+    let setup = "CREATE TABLE t (a int, b int, CONSTRAINT c1 CHECK (a > 0),
+                                 CONSTRAINT c2 CHECK (b > 0), CONSTRAINT u UNIQUE (a));
+                 CREATE INDEX ti ON t (b);
+                 CREATE DOMAIN d AS int CONSTRAINT d1 CHECK (VALUE > 0) CONSTRAINT d2 CHECK (VALUE < 9);";
+    for (stmt, msg) in [
+        (
+            "ALTER TABLE t RENAME CONSTRAINT c1 TO c2;",
+            "constraint \"c2\" for relation \"t\" already exists",
+        ),
+        (
+            "ALTER TABLE t RENAME CONSTRAINT u TO ti;",
+            "relation \"ti\" already exists",
+        ),
+        (
+            "ALTER TABLE t RENAME CONSTRAINT c1 TO u;",
+            "constraint \"u\" for relation \"t\" already exists",
+        ),
+        (
+            "ALTER TABLE t RENAME CONSTRAINT u TO c2;",
+            "constraint \"c2\" for relation \"t\" already exists",
+        ),
+        (
+            "ALTER DOMAIN d RENAME CONSTRAINT nosuch TO z;",
+            "constraint \"nosuch\" for domain d does not exist",
+        ),
+        (
+            "ALTER DOMAIN d RENAME CONSTRAINT d1 TO d2;",
+            "constraint \"d2\" for domain d already exists",
+        ),
+        (
+            "ALTER DOMAIN d RENAME CONSTRAINT d1 TO d3; ALTER DOMAIN d DROP CONSTRAINT d1;",
+            "constraint \"d1\" of domain \"d\" does not exist",
+        ),
+        (
+            "ALTER DOMAIN nosuch RENAME CONSTRAINT d1 TO d3;",
+            "type \"nosuch\" does not exist",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "ALTER TABLE t RENAME CONSTRAINT c1 TO c3;
+             ALTER TABLE t RENAME CONSTRAINT u TO u2;
+             ALTER DOMAIN d RENAME CONSTRAINT d1 TO d3;
+             ALTER DOMAIN d DROP CONSTRAINT d3;",
+        ),
+    ]);
+}
