@@ -26,6 +26,10 @@ pub struct ResolvedOperator {
     pub declared_left_type_oid: Option<PgTypeOid>,
     pub right_type_oid: PgTypeOid,
     pub result_type_oid: PgTypeOid,
+    /// The implementing function (`oprcode`) is a user-defined (or
+    /// extension) one that is not STRICT: it runs on NULL operands and can
+    /// return NULL whatever they are.
+    pub user_defined_non_strict: bool,
 }
 
 /// Outcome of [`PgCatalog::find_operator_detailed`]: a unique winner, no
@@ -451,6 +455,12 @@ impl PgCatalog {
                 declared_left_type_oid: chosen.oprleft,
                 right_type_oid: *declared.last().unwrap_or(&chosen.oprright),
                 result_type_oid,
+                user_defined_non_strict: chosen
+                    .oprcode
+                    .and_then(|code| self.pg_proc.get(&code))
+                    .is_some_and(|f| {
+                        Some(f.pronamespace) != self.pg_catalog_oid() && !f.proisstrict
+                    }),
             }),
             Err(e) => OperatorMatch::Error(e),
         }

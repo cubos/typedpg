@@ -704,9 +704,11 @@ fn infer_generic_binary_op(
             // never does.
             const JSONPATH: PgTypeOid = PgTypeOid::from_raw(4072);
             let jsonpath_op = matches!(op_name, "@?" | "@@") && op.right_type_oid == JSONPATH;
-            return Ok(
-                ExprType::scalar(op.result_type_oid, nullable || jsonpath_op).with_collation(state),
-            );
+            return Ok(ExprType::scalar(
+                op.result_type_oid,
+                nullable || jsonpath_op || op.user_defined_non_strict,
+            )
+            .with_collation(state));
         }
         crate::lookup::OperatorMatch::Ambiguous => {
             // PG (SQLSTATE 42725): `operator is not unique: <left> <op>
