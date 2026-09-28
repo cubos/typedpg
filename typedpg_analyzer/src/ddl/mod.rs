@@ -16,6 +16,7 @@ mod expr_kind;
 pub mod extensions;
 pub(crate) mod function_body;
 pub mod functions;
+mod guc;
 pub mod indexes;
 mod maintenance;
 pub(crate) mod opclass;

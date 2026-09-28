@@ -133,7 +133,7 @@ fn value_string(de: &pg_query::protobuf::DefElem) -> Option<String> {
 
 /// parse_bool: `true`/`false`/`yes`/`no`/`on`/`off`/`1`/`0` and their
 /// unambiguous prefixes.
-fn parse_bool(s: &str) -> Option<bool> {
+pub(crate) fn parse_bool(s: &str) -> Option<bool> {
     let v = s.trim().to_ascii_lowercase();
     if v.is_empty() {
         return None;

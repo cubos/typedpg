@@ -114,6 +114,20 @@ pub(crate) fn variable_set(interp: &mut PgCatalog, stmt: &VariableSetStmt) -> Re
         interp.check_function_bodies = true;
         return Ok(());
     }
+    // The parameter must exist and be settable, and a new value valid.
+    if matches!(
+        kind,
+        VariableSetKind::VarSetValue
+            | VariableSetKind::VarSetDefault
+            | VariableSetKind::VarSetCurrent
+            | VariableSetKind::VarReset
+    ) && let Some(setting) = super::guc::check_settable(interp, &stmt.name)?.cloned()
+        && kind == VariableSetKind::VarSetValue
+        && let [arg] = stmt.args.as_slice()
+        && let Some(value) = const_arg_string(arg)
+    {
+        super::guc::check_value(interp, &setting, &value)?;
+    }
     if stmt.name.eq_ignore_ascii_case("check_function_bodies") {
         interp.check_function_bodies = match kind {
             VariableSetKind::VarSetValue => stmt.args.first().is_none_or(|arg| {
@@ -194,11 +208,56 @@ pub(crate) fn select_side_effects(
         let Some(node::Node::FuncCall(fc)) = rt.val.as_deref().and_then(|v| v.node.as_ref()) else {
             continue;
         };
+        if let Some((setting, value)) = constant_set_config(fc)
+            && let Some(known) = super::guc::check_settable(interp, &setting)?.cloned()
+        {
+            super::guc::check_value(interp, &known, &value)?;
+        }
         if let Some((value, is_local)) = constant_search_path_set_config(fc) {
             interp.set_search_path(Some(split_identifier_string(&value)), is_local);
         }
     }
     Ok(())
+}
+
+/// A constant `SET` argument as the string GUC code parses.
+fn const_arg_string(arg: &pg_query::protobuf::Node) -> Option<String> {
+    match arg.node.as_ref() {
+        Some(node::Node::AConst(c)) => match c.val.as_ref()? {
+            a_const::Val::Ival(i) => Some(i.ival.to_string()),
+            a_const::Val::Fval(f) => Some(f.fval.clone()),
+            a_const::Val::Sval(s) => Some(s.sval.clone()),
+            a_const::Val::Boolval(b) => Some(b.boolval.to_string()),
+            a_const::Val::Bsval(_) => None,
+        },
+        _ => None,
+    }
+}
+
+/// `set_config('<name>', '<value>', ...)` with constant name and value.
+fn constant_set_config(fc: &FuncCall) -> Option<(String, String)> {
+    let name: Vec<&str> = fc
+        .funcname
+        .iter()
+        .filter_map(super::util::node_string)
+        .collect();
+    if !matches!(
+        name.as_slice(),
+        ["set_config"] | ["pg_catalog", "set_config"]
+    ) {
+        return None;
+    }
+    let [setting, value, _] = fc.args.as_slice() else {
+        return None;
+    };
+    let as_str = |n: &pg_query::protobuf::Node| match n.node.as_ref() {
+        Some(node::Node::AConst(c)) => match c.val.as_ref() {
+            Some(a_const::Val::Sval(s)) => Some(s.sval.clone()),
+            _ => None,
+        },
+        _ => None,
+    };
+    Some((as_str(setting)?, as_str(value)?))
 }
 
 fn constant_search_path_set_config(fc: &FuncCall) -> Option<(String, bool)> {

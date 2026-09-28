@@ -2564,3 +2564,110 @@ fn table_access_methods_are_resolved() {
         ),
     ]);
 }
+
+#[test]
+fn configuration_parameters_are_validated() {
+    // PG 18 set_config_with_handle / parse_and_validate_value /
+    // assignable_custom_variable_name.
+    let setup = "CREATE TABLE t (a int);";
+    for (stmt, msg) in [
+        (
+            "SET nosuch_param = 1;",
+            "unrecognized configuration parameter \"nosuch_param\"",
+        ),
+        (
+            "RESET nosuch_param;",
+            "unrecognized configuration parameter \"nosuch_param\"",
+        ),
+        (
+            "SET LOCAL nosuch = 1;",
+            "unrecognized configuration parameter \"nosuch\"",
+        ),
+        (
+            "SELECT set_config('nosuch', '1', false);",
+            "unrecognized configuration parameter \"nosuch\"",
+        ),
+        (
+            "SET statement_timeout = 'abc';",
+            "invalid value for parameter \"statement_timeout\": \"abc\"",
+        ),
+        (
+            "SET statement_timeout = -5;",
+            "-5 ms is outside the valid range for parameter \"statement_timeout\" (0 ms .. 2147483647 ms)",
+        ),
+        (
+            "SET enable_seqscan = maybe;",
+            "parameter \"enable_seqscan\" requires a Boolean value",
+        ),
+        (
+            "SET client_min_messages = loud;",
+            "invalid value for parameter \"client_min_messages\": \"loud\"",
+        ),
+        (
+            "SET shared_buffers = '1GB';",
+            "parameter \"shared_buffers\" cannot be changed without restarting the server",
+        ),
+        (
+            "SET wal_level = minimal;",
+            "parameter \"wal_level\" cannot be changed without restarting the server",
+        ),
+        (
+            "SET default_table_access_method = nosuch;",
+            "invalid value for parameter \"default_table_access_method\": \"nosuch\"",
+        ),
+        (
+            "SET seq_page_cost = -1;",
+            "-1 is outside the valid range for parameter \"seq_page_cost\" (0 .. 1.79769e+308)",
+        ),
+        (
+            "SET work_mem = 32;",
+            "32 kB is outside the valid range for parameter \"work_mem\" (64 kB .. 2147483647 kB)",
+        ),
+        (
+            "SET work_mem = '10 parsecs';",
+            "invalid value for parameter \"work_mem\": \"10 parsecs\"",
+        ),
+        (
+            "SET work_mem = '5s';",
+            "invalid value for parameter \"work_mem\": \"5s\"",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    // What pg_dump emits, and other common settings.
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "SET statement_timeout = 0;
+             SET lock_timeout = 0;
+             SET idle_in_transaction_session_timeout = 0;
+             SET transaction_timeout = 0;
+             SET client_encoding = 'UTF8';
+             SET standard_conforming_strings = on;
+             SELECT pg_catalog.set_config('search_path', '', false);
+             SET check_function_bodies = false;
+             SET xmloption = content;
+             SET client_min_messages = warning;
+             SET row_security = off;
+             SET default_tablespace = '';
+             SET default_table_access_method = heap;
+             SET app.custom = 'x';
+             SET statement_timeout = '5s';
+             SET work_mem = '1TB';
+             SET work_mem = '64MB';
+             SET TIME ZONE 'UTC';
+             SET timezone = 'UTC';
+             SET datestyle = 'ISO, MDY';
+             SET session_replication_role = replica;
+             SET constraint_exclusion = true;
+             SET client_min_messages = info;
+             SET LOCAL lock_timeout = '10s';
+             RESET lock_timeout;
+             SET enable_seqscan TO DEFAULT;
+             SET search_path TO public;
+             RESET ALL;",
+        ),
+    ]);
+}

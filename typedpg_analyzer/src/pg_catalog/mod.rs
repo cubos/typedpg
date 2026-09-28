@@ -145,6 +145,8 @@ pub struct PgCatalogSeed {
     pub pg_opfamily: Vec<PgOpfamily>,
     #[serde(default)]
     pub pg_opclass: Vec<PgOpclass>,
+    #[serde(default)]
+    pub pg_settings: Vec<PgSetting>,
 }
 
 // ─── In-memory catalog ─────────────────────────────────────────────────────
@@ -184,6 +186,7 @@ pub struct PgCatalog {
     pub(crate) pg_am: Vec<PgAm>,
     pub(crate) pg_opfamily: Vec<PgOpfamily>,
     pub(crate) pg_opclass: Vec<PgOpclass>,
+    pub(crate) pg_settings: Vec<PgSetting>,
 
     // ── Name-keyed indexes (built by `from_seed`, maintained by DDL) ──
     pub(crate) namespace_by_name: HashMap<String, PgNamespaceOid>,
@@ -455,6 +458,7 @@ impl PgCatalog {
         cat.pg_am = seed.pg_am;
         cat.pg_opfamily = seed.pg_opfamily;
         cat.pg_opclass = seed.pg_opclass;
+        cat.pg_settings = seed.pg_settings;
         for (oid, definition) in seed.sql_function_defs {
             cat.add_sql_function_def(oid, definition);
         }
@@ -492,6 +496,7 @@ impl PgCatalog {
             pg_am: Vec::new(),
             pg_opfamily: Vec::new(),
             pg_opclass: Vec::new(),
+            pg_settings: Vec::new(),
             namespace_by_name: HashMap::new(),
             type_by_qname: HashMap::new(),
             class_by_qname: HashMap::new(),
@@ -621,6 +626,7 @@ impl PgCatalog {
             pg_am: self.pg_am.clone(),
             pg_opfamily: self.pg_opfamily.clone(),
             pg_opclass: self.pg_opclass.clone(),
+            pg_settings: self.pg_settings.clone(),
             sql_function_defs: {
                 let mut defs: Vec<_> = self
                     .sql_function_defs

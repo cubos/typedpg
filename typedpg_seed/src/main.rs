@@ -21,8 +21,8 @@ use typedpg_analyzer::{
     PgClassOid, PgCollation, PgCollationOid, PgConstraint, PgConstraintOid, PgDepend, PgEnum,
     PgEnumOid, PgExtension, PgExtensionOid, PgGenericOid, PgIndex, PgInherits, PgNamespace,
     PgNamespaceOid, PgOpclass, PgOperator, PgOperatorOid, PgOpfamily, PgProc, PgProcOid, PgRange,
-    PgType, PgTypeOid, ProKind, ProVolatile, QualifiedName, RelKind, TypCategory, TypStorage,
-    TypType,
+    PgSetting, PgType, PgTypeOid, ProKind, ProVolatile, QualifiedName, RelKind, TypCategory,
+    TypStorage, TypType,
 };
 
 fn main() {
@@ -114,6 +114,7 @@ fn export_catalog(client: &mut postgres::Client) -> Result<PgCatalogSeed, postgr
     let search_path = export_search_path(client, &pg_namespace)?;
     let sql_function_defs = export_sql_function_defs(client)?;
     let (pg_am, pg_opfamily, pg_opclass) = export_access_methods(client)?;
+    let pg_settings = export_settings(client)?;
 
     let _ = nsname_by_oid;
 
@@ -146,6 +147,7 @@ fn export_catalog(client: &mut postgres::Client) -> Result<PgCatalogSeed, postgr
         pg_am,
         pg_opfamily,
         pg_opclass,
+        pg_settings,
     };
     let scratch = PgCatalog::from_seed(seed.clone());
     seed.pg_index = export_indexes(client, &scratch)?;
@@ -804,6 +806,28 @@ fn export_depends(client: &mut postgres::Client) -> Result<Vec<PgDepend>, postgr
 }
 
 // ─── View definitions (second pass) ────────────────────────────────────────────
+
+/// The configuration parameters (`pg_settings`) of a stock server.
+fn export_settings(client: &mut postgres::Client) -> Result<Vec<PgSetting>, postgres::Error> {
+    Ok(client
+        .query(
+            "SELECT name, vartype, context, coalesce(unit, ''), coalesce(min_val, ''), \
+                    coalesce(max_val, ''), coalesce(enumvals, '{}') \
+             FROM pg_catalog.pg_settings ORDER BY name",
+            &[],
+        )?
+        .iter()
+        .map(|r| PgSetting {
+            name: r.get(0),
+            vartype: r.get(1),
+            context: r.get(2),
+            unit: r.get(3),
+            min_val: r.get(4),
+            max_val: r.get(5),
+            enumvals: r.get(6),
+        })
+        .collect())
+}
 
 /// `pg_am`, `pg_opfamily` and `pg_opclass` rows.
 type AccessMethodRows = (Vec<PgAm>, Vec<PgOpfamily>, Vec<PgOpclass>);

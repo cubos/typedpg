@@ -482,6 +482,23 @@ pub struct PgCollation {
     pub collencoding: i32,
 }
 
+/// A configuration parameter (`pg_settings`): its type, when it can be
+/// set, and its valid values (`min_val` / `max_val` in `unit`,
+/// `enumvals`).
+#[derive(Debug, Clone, Serialize_tuple, Deserialize_tuple)]
+pub struct PgSetting {
+    pub name: String,
+    /// `bool`, `integer`, `real`, `string` or `enum`.
+    pub vartype: String,
+    /// `internal`, `postmaster`, `sighup`, `superuser-backend`, `backend`,
+    /// `superuser` or `user`.
+    pub context: String,
+    pub unit: String,
+    pub min_val: String,
+    pub max_val: String,
+    pub enumvals: Vec<String>,
+}
+
 /// `pg_am`: an index or table access method, by name (`amtype` `i` / `t`).
 #[derive(Debug, Clone, Serialize_tuple, Deserialize_tuple)]
 pub struct PgAm {
