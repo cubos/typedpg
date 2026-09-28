@@ -458,3 +458,146 @@ pub(crate) fn inlinable_body(stmt: &CreateFunctionStmt, proc: &PgProc) -> Option
         _ => None,
     }
 }
+
+/// `plpgsql_validator` (pl_handler.c): with `check_function_bodies` on, a
+/// `LANGUAGE plpgsql` body is compiled at CREATE FUNCTION — its syntax and
+/// variable references checked by the PL/pgSQL grammar (the same one
+/// libpg_query embeds), and the declared variables' types looked up.
+pub(crate) fn validate_plpgsql_function(
+    interp: &PgCatalog,
+    stmt: &CreateFunctionStmt,
+) -> Result<(), DdlError> {
+    let is_plpgsql = stmt.options.iter().any(|n| {
+        matches!(n.node.as_ref(), Some(node::Node::DefElem(de))
+            if de.defname == "language"
+                && matches!(de.arg.as_deref().and_then(|a| a.node.as_ref()),
+                    Some(node::Node::String(s)) if s.sval.eq_ignore_ascii_case("plpgsql")))
+    });
+    if !is_plpgsql || !interp.check_function_bodies {
+        return Ok(());
+    }
+    let sql = deparse(node::Node::CreateFunctionStmt(Box::new(stmt.clone())))?;
+    let parsed = pg_query::parse_plpgsql(&sql).map_err(|e| match e {
+        pg_query::Error::Parse(msg) => DdlError::Parse(msg),
+        other => DdlError::Parse(other.to_string()),
+    })?;
+    // Declared variables: `datums[].PLpgSQL_var.datatype.PLpgSQL_type.typname`
+    // as written (libpg_query doesn't look types up).
+    let datums = parsed
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|f| f.get("PLpgSQL_function")?.get("datums")?.as_array())
+        .flatten();
+    for datum in datums {
+        let Some(var) = datum.get("PLpgSQL_var") else {
+            continue;
+        };
+        // The implicit FOUND variable has no line number.
+        if var.get("lineno").is_none() {
+            continue;
+        }
+        let Some(typname) = var
+            .get("datatype")
+            .and_then(|d| d.get("PLpgSQL_type"))
+            .and_then(|t| t.get("typname"))
+            .and_then(|t| t.as_str())
+        else {
+            continue;
+        };
+        check_declared_type(interp, typname)?;
+    }
+    Ok(())
+}
+
+/// Resolve a PL/pgSQL variable's declared type: `x%TYPE` names a column,
+/// `r%ROWTYPE` a relation, anything else is an ordinary type name.
+fn check_declared_type(interp: &PgCatalog, typname: &str) -> Result<(), DdlError> {
+    let trimmed = typname.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if let Some(prefix) = lower
+        .strip_suffix("%rowtype")
+        .map(|_| &trimmed[..trimmed.len() - "%rowtype".len()])
+    {
+        let names = split_dotted(prefix);
+        let (schema, name) = match names.as_slice() {
+            [name] => (None, name.as_str()),
+            [schema, name] => (Some(schema.as_str()), name.as_str()),
+            _ => return Ok(()),
+        };
+        if interp.resolve_table(schema, name).is_none() {
+            return Err(DdlError::TableNotFound(format!(
+                "relation \"{}\" does not exist",
+                names.join(".")
+            )));
+        }
+        return Ok(());
+    }
+    if lower.ends_with("%type") {
+        // A variable's own %TYPE (`x other_var%TYPE`) can't be told apart
+        // from a column reference here; only check `rel.col%TYPE`.
+        let names = split_dotted(&trimmed[..trimmed.len() - "%type".len()]);
+        if names.len() < 2 {
+            return Ok(());
+        }
+        let tn = pg_query::protobuf::TypeName {
+            names: names
+                .into_iter()
+                .map(|n| pg_query::protobuf::Node {
+                    node: Some(node::Node::String(pg_query::protobuf::String { sval: n })),
+                })
+                .collect(),
+            pct_type: true,
+            ..Default::default()
+        };
+        super::util::lookup_type_name(&tn, interp)?;
+        return Ok(());
+    }
+    let Ok(parsed) = pg_query::parse(&format!("SELECT NULL::{trimmed}")) else {
+        return Ok(());
+    };
+    let tn = parsed
+        .protobuf
+        .nodes()
+        .into_iter()
+        .find_map(|(n, ..)| match n {
+            pg_query::NodeRef::TypeCast(tc) => tc.type_name.clone(),
+            _ => None,
+        });
+    if let Some(tn) = tn {
+        super::util::lookup_type_name(&tn, interp)?;
+    }
+    Ok(())
+}
+
+/// Split `a.b."C"` into identifiers (quoted ones as written, bare ones
+/// downcased).
+fn split_dotted(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut chars = text.trim().chars().peekable();
+    loop {
+        let mut part = String::new();
+        if chars.next_if_eq(&'"').is_some() {
+            while let Some(c) = chars.next() {
+                if c == '"' {
+                    if chars.next_if_eq(&'"').is_some() {
+                        part.push('"');
+                    } else {
+                        break;
+                    }
+                } else {
+                    part.push(c);
+                }
+            }
+        } else {
+            while let Some(c) = chars.next_if(|&c| c != '.') {
+                part.push(c.to_ascii_lowercase());
+            }
+        }
+        out.push(part.trim().to_owned());
+        if chars.next_if_eq(&'.').is_none() {
+            break;
+        }
+    }
+    out
+}

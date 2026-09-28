@@ -780,3 +780,43 @@ fn drop_function_lookup_follows_lookup_func_with_args() {
          DROP FUNCTION IF EXISTS nosuch(int);",
     )]);
 }
+
+#[test]
+fn plpgsql_function_bodies_are_compiled() {
+    // PG 18 (plpgsql_validator): syntax errors, unknown declared types.
+    for (sql, msg) in [
+        (
+            "CREATE FUNCTION pf() RETURNS int LANGUAGE plpgsql AS 'begin retrun 1; end';",
+            "syntax error at or near \"retrun\"",
+        ),
+        (
+            "CREATE FUNCTION pf2() RETURNS int LANGUAGE plpgsql AS 'declare x nosuchtype; begin return 1; end';",
+            "type \"nosuchtype\" does not exist",
+        ),
+        (
+            "CREATE FUNCTION pf4() RETURNS int LANGUAGE plpgsql AS 'begin select 1 +; end';",
+            "syntax error at end of input",
+        ),
+        (
+            "CREATE FUNCTION pf5() RETURNS int LANGUAGE plpgsql AS 'begin return 1 end';",
+            "syntax error at end of input",
+        ),
+        (
+            "CREATE FUNCTION pf6() RETURNS int LANGUAGE plpgsql AS 'declare r nosuch%ROWTYPE; begin return 1; end';",
+            "relation \"nosuch\" does not exist",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", sql)]).expect_err(sql);
+        assert!(err.to_string().starts_with(msg), "{sql}\n  got: {err}");
+    }
+    // Bodies PG accepts (a missing relation inside a query is only found at
+    // run time), and anything under check_function_bodies = false.
+    build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a bigint);
+         CREATE FUNCTION ok1() RETURNS int LANGUAGE plpgsql
+             AS 'declare x int; y t.a%TYPE; r t%ROWTYPE; rr record; begin return (select a from nosuch); end';
+         SET check_function_bodies = false;
+         CREATE FUNCTION ok2() RETURNS int LANGUAGE plpgsql AS 'begin retrun 1; end';",
+    )]);
+}
