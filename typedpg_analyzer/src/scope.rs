@@ -146,6 +146,25 @@ fn lateral_blocked_error(alias: &str, span: Option<SourceSpan>) -> AnalyzeError 
     .finalize_implicit()
 }
 
+/// PG (42702): `column reference "id" is ambiguous`, listing where the name
+/// was found.
+fn ambiguous_column_error(
+    column: &str,
+    candidates: &[String],
+    span: Option<SourceSpan>,
+) -> AnalyzeError {
+    RawError::new(
+        AnalyzeError::AmbiguousColumn(format!(
+            "column reference \"{column}\" is ambiguous (could be: {})",
+            candidates.join(", ")
+        )),
+        span,
+        None,
+    )
+    .with_primary_label("ambiguous reference")
+    .finalize_implicit()
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Scope {
     pub sources: Vec<TableSource>,
@@ -395,12 +414,19 @@ impl Scope {
                 if source.lateral_blocked {
                     return Err(lateral_blocked_error(t, span));
                 }
-                if let Some(col) = source
+                // A name the entry exposes twice (an aliased join over two
+                // `id`s, a subquery `SELECT 1 a, 2 a`) is ambiguous even
+                // when qualified — PG's `scanRTEForColumn`.
+                let mut found = source
                     .columns
                     .iter()
                     .chain(source.system_columns.iter())
-                    .find(|c| c.name == column)
-                {
+                    .filter(|c| c.name == column);
+                if let Some(col) = found.next() {
+                    if found.next().is_some() {
+                        let qn = QualifiedName::new(t, column).to_string();
+                        return Err(ambiguous_column_error(column, &[qn.clone(), qn], span));
+                    }
                     return Ok(col);
                 }
             }
@@ -457,12 +483,14 @@ impl Scope {
                 // Columns merged away by JOIN USING / NATURAL are only
                 // reachable qualified; the synthetic merged column stands in
                 // for unqualified references.
-                if let Some(col) = source.visible_columns().find(|c| c.name == column) {
+                // Every match counts: one entry exposing the name twice is
+                // as ambiguous as two entries exposing it once.
+                for col in source.visible_columns().filter(|c| c.name == column) {
                     matches.push((source, col));
                 }
             }
             if matches.len() > 1 {
-                let candidates = matches
+                let candidates: Vec<String> = matches
                     .iter()
                     .map(|(s, _)| {
                         if is_hidden_alias(&s.alias) {
@@ -471,18 +499,8 @@ impl Scope {
                             QualifiedName::new(&s.alias, column).to_string()
                         }
                     })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                // PG classifies this as ambiguous_column (42702).
-                return Err(crate::error::RawError::new(
-                    AnalyzeError::AmbiguousColumn(format!(
-                        "column reference \"{column}\" is ambiguous (could be: {candidates})"
-                    )),
-                    span,
-                    None,
-                )
-                .with_primary_label("ambiguous reference")
-                .finalize_implicit());
+                    .collect();
+                return Err(ambiguous_column_error(column, &candidates, span));
             }
             if let Some((source, col)) = matches.first() {
                 if source.lateral_blocked {

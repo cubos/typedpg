@@ -496,3 +496,27 @@ fn lateral_two_same_level_sources_are_ambiguous() {
         "got: {err}"
     );
 }
+
+#[test]
+fn name_repeated_inside_one_from_entry_is_ambiguous() {
+    // PG's scanRTEForColumn: two columns of one entry sharing the name make
+    // a reference to it ambiguous, qualified or not; `*` still lists both.
+    let db = setup();
+    for sql in [
+        "SELECT s.a FROM (SELECT 1 a, 2 a) s",
+        "SELECT a FROM (SELECT 1 a, 2 a) s",
+    ] {
+        let err = db.analyze(sql).unwrap_err();
+        assert!(
+            matches!(err, AnalyzeError::AmbiguousColumn(_)),
+            "{sql}: {err:?}"
+        );
+        assert!(
+            err.to_string()
+                .starts_with("column reference \"a\" is ambiguous"),
+            "{sql}: {err}"
+        );
+    }
+    let s = db.analyze("SELECT * FROM (SELECT 1 a, 2 a) s").unwrap();
+    assert_eq!(s.columns.len(), 2);
+}
