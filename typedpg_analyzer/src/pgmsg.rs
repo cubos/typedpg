@@ -62,6 +62,29 @@ pub(crate) fn operator_is_not_unique(
     )
 }
 
+/// `operator does not exist: <op> <right>` — SQLSTATE 42883, the prefix
+/// form (PG's `op_signature_string` omits the missing left operand).
+pub(crate) fn prefix_operator_does_not_exist(
+    op: &str,
+    right: &str,
+    span: Option<SourceSpan>,
+) -> RawError {
+    RawError::undefined_operator(format!("operator does not exist: {op} {right}"), span, None)
+}
+
+/// `operator is not unique: <op> <right>` — SQLSTATE 42725, prefix form.
+pub(crate) fn prefix_operator_is_not_unique(
+    op: &str,
+    right: &str,
+    span: Option<SourceSpan>,
+) -> RawError {
+    RawError::new(
+        AnalyzeError::AmbiguousFunction(format!("operator is not unique: {op} {right}")),
+        span,
+        Some("add an explicit type cast to the operand, e.g. `expr::int4`".into()),
+    )
+}
+
 /// `function name(types) is not unique` — SQLSTATE 42725.
 pub(crate) fn function_is_not_unique(
     qualified_name: &str,
@@ -401,6 +424,14 @@ mod tests {
             ),
             (set_op_column_count("UNION", 2, 1).kind, "42601"),
             (no_array_type_for("integer[]"), "42704"),
+            (
+                prefix_operator_does_not_exist("-", "text", None).kind,
+                "42883",
+            ),
+            (
+                prefix_operator_is_not_unique("-", "unknown", None).kind,
+                "42725",
+            ),
             (schema_does_not_exist("s", None).kind, "3F000"),
             (variadic_argument_must_be_array(None).kind, "42804"),
             (polymorphic_type_from_unknown(None), "42804"),

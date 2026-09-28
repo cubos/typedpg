@@ -645,18 +645,21 @@ fn infer_generic_binary_op(
             // PG (SQLSTATE 42725): `operator is not unique: <left> <op>
             // <right>` — several overloads survived the unknown-side
             // tiebreaks (`bday + $1`, `$1 + $2`, `NULL + NULL`).
-            let left_pg = crate::ddl::util::format_type_for_message(
-                snapshot,
-                left_oid_resolved.unwrap_or(oid::UNKNOWN),
-            );
             let right_pg = crate::ddl::util::format_type_for_message(snapshot, right_oid_resolved);
             let span = (expr.location >= 0).then(|| {
                 crate::error::SourceSpan::at_length(expr.location as usize, op_name.len())
             });
-            return Err(
-                crate::pgmsg::operator_is_not_unique(&left_pg, op_name, &right_pg, span)
-                    .finalize_implicit(),
-            );
+            // A prefix operator has no left operand to render.
+            let err = match left_oid_resolved {
+                Some(l) => crate::pgmsg::operator_is_not_unique(
+                    &crate::ddl::util::format_type_for_message(snapshot, l),
+                    op_name,
+                    &right_pg,
+                    span,
+                ),
+                None => crate::pgmsg::prefix_operator_is_not_unique(op_name, &right_pg, span),
+            };
+            return Err(err.finalize_implicit());
         }
         crate::lookup::OperatorMatch::Error(e) => return Err(e),
         crate::lookup::OperatorMatch::NotFound => {}
@@ -665,17 +668,19 @@ fn infer_generic_binary_op(
     // PG (SQLSTATE 42883): `operator does not exist: <left> <op> <right>`.
     // Use PG's user-facing type names (`integer`, `bigint`, …) so the
     // sanity-check prefix match passes.
-    let left_pg = crate::ddl::util::format_type_for_message(
-        snapshot,
-        left_oid_resolved.unwrap_or(oid::UNKNOWN),
-    );
     let right_pg = crate::ddl::util::format_type_for_message(snapshot, right_oid_resolved);
     // `AExpr.location` points at the operator token; cover its length
     // so the caret spans the operator symbol/name.
     let span = (expr.location >= 0)
         .then(|| crate::error::SourceSpan::at_length(expr.location as usize, op_name.len()));
-    Err(
-        crate::pgmsg::operator_does_not_exist(&left_pg, op_name, &right_pg, span)
-            .finalize_implicit(),
-    )
+    let err = match left_oid_resolved {
+        Some(l) => crate::pgmsg::operator_does_not_exist(
+            &crate::ddl::util::format_type_for_message(snapshot, l),
+            op_name,
+            &right_pg,
+            span,
+        ),
+        None => crate::pgmsg::prefix_operator_does_not_exist(op_name, &right_pg, span),
+    };
+    Err(err.finalize_implicit())
 }

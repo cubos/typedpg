@@ -333,3 +333,73 @@ fn variadic_any_argument_must_be_an_array() {
         );
     }
 }
+
+// ── Operators: qualified names and prefix wording (#7, #27) ──────────────────
+
+#[test]
+fn schema_qualified_operator_syntax() {
+    let mut db = setup();
+    db.apply_sql("CREATE TABLE t7 (n int NOT NULL, s text NOT NULL)")
+        .unwrap();
+    let s = db
+        .analyze("SELECT 1 OPERATOR(pg_catalog.+) 2 AS a")
+        .unwrap();
+    assert_cols(&s, vec![c("a", int4())]);
+    let s = db
+        .analyze("SELECT n FROM t7 WHERE n OPERATOR(pg_catalog.=) 1")
+        .unwrap();
+    assert_cols(&s, vec![c("n", int4())]);
+    let s = db
+        .analyze("SELECT s OPERATOR(pg_catalog.||) 'x' AS a FROM t7")
+        .unwrap();
+    assert_cols(&s, vec![c("a", text())]);
+    assert_err_kind!(
+        db,
+        "SELECT 1 OPERATOR(nope.+) 2",
+        AnalyzeError::UndefinedSchema(_),
+        "schema \"nope\" does not exist"
+    );
+    assert_err_kind!(
+        db,
+        "SELECT 1 OPERATOR(pg_catalog.+) 'x'::text",
+        AnalyzeError::UndefinedOperator(_),
+        "operator does not exist: integer pg_catalog.+ text"
+    );
+    assert_err_kind!(
+        db,
+        "SELECT OPERATOR(pg_catalog.||) 'x'",
+        AnalyzeError::UndefinedOperator(_),
+        "operator does not exist: pg_catalog.|| unknown"
+    );
+}
+
+#[test]
+fn prefix_operator_errors_have_no_left_operand() {
+    let db = setup();
+    assert_err_kind!(
+        db,
+        "SELECT -x::text FROM t",
+        AnalyzeError::UndefinedOperator(_),
+        "operator does not exist: - text"
+    );
+    assert_err_kind!(
+        db,
+        "SELECT !! 5",
+        AnalyzeError::UndefinedOperator(_),
+        "operator does not exist: !! integer"
+    );
+    assert_err_kind!(
+        db,
+        "SELECT @ 'x'::text",
+        AnalyzeError::UndefinedOperator(_),
+        "operator does not exist: @ text"
+    );
+    for sql in ["SELECT - '1'", "SELECT -$p"] {
+        assert_err_kind!(
+            db,
+            sql,
+            AnalyzeError::AmbiguousFunction(_),
+            "operator is not unique: - unknown"
+        );
+    }
+}
