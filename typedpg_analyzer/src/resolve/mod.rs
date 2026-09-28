@@ -276,6 +276,9 @@ fn can_run_as_subquery(stmt: &node::Node) -> bool {
     let node::Node::SelectStmt(sel) = stmt else {
         return false;
     };
+    if sel.into_clause.is_some() {
+        return false;
+    }
     let Some(with) = &sel.with_clause else {
         return true;
     };
@@ -320,6 +323,12 @@ pub(crate) fn analyze_raw_node(
     }
 
     let (raw_columns, raw_params) = match stmt {
+        // `SELECT … INTO t` is CREATE TABLE AS (transformSelectStmt turns it
+        // into a CreateTableAsStmt): it returns no rows.
+        node::Node::SelectStmt(sel) if sel.into_clause.is_some() => {
+            let (_, p) = analyze_select(sel, snapshot, &mut params)?;
+            (Vec::new(), p)
+        }
         node::Node::SelectStmt(sel) => analyze_select(sel, snapshot, &mut params)?,
         node::Node::InsertStmt(ins) => analyze_insert(ins, snapshot, &mut params)?,
         node::Node::UpdateStmt(upd) => analyze_update(upd, snapshot, &mut params)?,
