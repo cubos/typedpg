@@ -607,8 +607,14 @@ fn infer_srf_arg_types(
             // `FROM a, f(a.col)` without LATERAL — PG rejects with `invalid
             // reference to FROM-clause entry for table "a"`. The scope we
             // built above is empty precisely so this fails; don't let the
-            // old `.unwrap_or(UNKNOWN)` swallow it.
-            Err(e @ AnalyzeError::UndefinedColumn(_)) if !rf.lateral => return Err(e),
+            // old `.unwrap_or(UNKNOWN)` swallow it. Likewise a qualifier
+            // naming a FROM item that isn't visible yet (`FROM f(t.c), t`):
+            // `missing FROM-clause entry for table "t"`.
+            Err(e @ (AnalyzeError::UndefinedColumn(_) | AnalyzeError::UndefinedTable(_)))
+                if !rf.lateral =>
+            {
+                return Err(e);
+            }
             Err(_) => (oid::UNKNOWN, true),
         };
         arg_types.push(t);

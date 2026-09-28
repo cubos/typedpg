@@ -319,6 +319,19 @@ fn missing_schema_qualifier_is_reported() {
 }
 
 #[test]
+fn from_function_argument_referencing_a_later_from_item() {
+    let mut db = setup();
+    db.apply_sql("CREATE TABLE ta (id int PRIMARY KEY, arr int[] NOT NULL)")
+        .unwrap();
+    assert_err_kind!(
+        db,
+        "SELECT * FROM unnest(ta.arr), ta",
+        AnalyzeError::UndefinedTable(_),
+        "missing FROM-clause entry for table \"ta\""
+    );
+}
+
+#[test]
 fn variadic_any_argument_must_be_an_array() {
     let db = setup();
     for sql in [
