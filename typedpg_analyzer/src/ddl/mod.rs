@@ -19,6 +19,7 @@ pub mod schema_stmt;
 pub mod sequences;
 pub(crate) mod session;
 pub mod tables;
+pub(crate) mod triggers;
 pub mod types;
 pub mod util;
 pub mod views;
@@ -190,8 +191,8 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
 
         // ── No-ops (irrelevant for type analysis) ───────────────────
         node::Node::CommentStmt(s) => comment::comment_on(db, s),
+        node::Node::CreateTrigStmt(s) => triggers::create_trigger(db, s),
         node::Node::GrantStmt(_)
-        | node::Node::CreateTrigStmt(_)
         | node::Node::RuleStmt(_)
         | node::Node::ConstraintsSetStmt(_)
         | node::Node::CreatePolicyStmt(_)

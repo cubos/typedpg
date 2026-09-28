@@ -216,6 +216,8 @@ pub struct PgCatalog {
     /// `pg_partitioned_table.partattrs` of each partitioned table: the
     /// partition key's attnums, `0` for an expression.
     pub(crate) partition_keys: HashMap<PgClassOid, Vec<i16>>,
+    /// `pg_trigger`: each relation's triggers (name and function).
+    pub(crate) triggers: HashMap<PgClassOid, Vec<crate::ddl::triggers::Trigger>>,
     /// `pg_type.typsubscript` of user base types, as the handler function's
     /// name (`hstore_subscript_handler`), set by `CREATE TYPE (SUBSCRIPT =
     /// …)` / `ALTER TYPE … SET (SUBSCRIPT = …)`. Built-in types aren't
@@ -456,6 +458,7 @@ impl PgCatalog {
             check_function_bodies: true,
             inline_sql_bodies: HashMap::new(),
             partition_keys: HashMap::new(),
+            triggers: HashMap::new(),
             type_subscript: HashMap::new(),
             next_oid: USER_OID_START_NZ,
             #[cfg(feature = "pg_sanity")]
@@ -1037,6 +1040,7 @@ impl PgCatalog {
         self.attr_default_types
             .retain(|(relid, _), _| *relid != oid);
         self.partition_keys.remove(&oid);
+        self.triggers.remove(&oid);
         let row = self.pg_class.remove(&oid)?;
         self.class_by_qname
             .remove(&(row.relnamespace, row.relname.clone()));

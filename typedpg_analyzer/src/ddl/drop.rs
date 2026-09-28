@@ -52,7 +52,10 @@ pub fn drop_objects(interp: &mut PgCatalog, stmt: &DropStmt) -> Result<(), DdlEr
             ObjectType::ObjectIndex => {
                 drop_index(interp, obj_node, stmt.missing_ok)?;
             }
-            ObjectType::ObjectTrigger | ObjectType::ObjectRule | ObjectType::ObjectPolicy => {}
+            ObjectType::ObjectTrigger => {
+                super::triggers::drop_trigger(interp, obj_node, stmt.missing_ok)?;
+            }
+            ObjectType::ObjectRule | ObjectType::ObjectPolicy => {}
             _ => {}
         }
     }
@@ -700,6 +703,26 @@ fn drop_function(
     let target = Some(target);
 
     if let Some(oid) = target {
+        // A trigger depends on its function.
+        let dependent_triggers = super::triggers::triggers_using_function(interp, oid);
+        if let Some((relid, trigger)) = dependent_triggers.first()
+            && !cascade
+        {
+            let table = interp
+                .pg_class
+                .get(relid)
+                .map(|c| c.relname.clone())
+                .unwrap_or_default();
+            return Err(DdlError::DependencyError(format!(
+                "cannot drop {kind_word} {signature} because other objects depend on it \
+                 (trigger {trigger} on table {table} depends on {kind_word} {signature})"
+            )));
+        }
+        for (relid, trigger) in dependent_triggers {
+            if let Some(ts) = interp.triggers.get_mut(&relid) {
+                ts.retain(|t| t.name != trigger);
+            }
+        }
         let dependent_views = views::find_views_depending_on_function(interp, oid);
         if !dependent_views.is_empty() && !cascade {
             let view_names = format_view_list(interp, &dependent_views);
