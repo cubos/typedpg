@@ -180,6 +180,20 @@ pub(crate) fn check_no_aggregates_or_windows(
         .with_primary_label("aggregate not allowed here")
         .finalize_implicit());
     }
+    if kinds.has_grouping {
+        let span = kinds
+            .grouping_location
+            .and_then(crate::error::SourceSpan::from_node_qname);
+        return Err(crate::error::RawError::new(
+            AnalyzeError::GroupingError(format!(
+                "grouping operations are not allowed in {context}"
+            )),
+            span,
+            None,
+        )
+        .with_primary_label("GROUPING not allowed here")
+        .finalize_implicit());
+    }
     if kinds.has_window {
         let span = kinds
             .window_location

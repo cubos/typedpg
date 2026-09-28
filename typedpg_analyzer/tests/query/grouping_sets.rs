@@ -144,3 +144,74 @@ fn ungrouped_column_with_rollup_rejected() {
     db.analyze("SELECT region, product FROM sales GROUP BY GROUPING SETS ((region), (product))")
         .unwrap();
 }
+
+// ── GROUPING() placement and argument rules (parse_agg.c) ──────────────────
+
+#[test]
+fn grouping_arguments_must_be_grouping_expressions() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE tg (n int NOT NULL, ni int);")
+        .unwrap();
+    for sql in [
+        "SELECT GROUPING(ni) FROM tg GROUP BY n",
+        "SELECT GROUPING(n) FROM tg",
+        "SELECT n FROM tg GROUP BY n HAVING GROUPING(ni) = 0",
+        "SELECT n FROM tg GROUP BY n ORDER BY GROUPING(ni)",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::GroupingError(_),
+            "arguments to GROUPING must be grouping expressions of the associated query level"
+        );
+    }
+    for sql in [
+        "SELECT GROUPING(tg.n) AS a, GROUPING(n + 1) AS b FROM tg GROUP BY n, n + 1",
+        "SELECT GROUPING(n) AS g FROM tg GROUP BY ROLLUP(n)",
+        "SELECT n, GROUPING(n) AS g FROM tg GROUP BY 1",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
+
+#[test]
+fn grouping_placement_rules() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE tg (n int NOT NULL, ni int);")
+        .unwrap();
+    for (sql, msg) in [
+        (
+            "SELECT n FROM tg WHERE GROUPING(n) = 0 GROUP BY n",
+            "grouping operations are not allowed in WHERE",
+        ),
+        (
+            "SELECT n FROM tg GROUP BY n, GROUPING(n)",
+            "grouping operations are not allowed in GROUP BY",
+        ),
+        (
+            "SELECT tg.n FROM tg JOIN tg t2 ON GROUPING(tg.n) = 0 GROUP BY tg.n",
+            "grouping operations are not allowed in JOIN conditions",
+        ),
+        (
+            "SELECT 1 FROM tg JOIN tg t2 ON count(*) > 0",
+            "aggregate functions are not allowed in JOIN conditions",
+        ),
+        (
+            "SELECT n, sum(GROUPING(n)) FROM tg GROUP BY n",
+            "aggregate function calls cannot be nested",
+        ),
+        (
+            "SELECT GROUPING(n) AS g FROM tg GROUP BY 1",
+            "aggregate functions are not allowed in GROUP BY",
+        ),
+        (
+            "SELECT GROUPING(n) AS g FROM tg GROUP BY g",
+            "aggregate functions are not allowed in GROUP BY",
+        ),
+        (
+            "SELECT count(*) AS c FROM tg GROUP BY 1",
+            "aggregate functions are not allowed in GROUP BY",
+        ),
+    ] {
+        assert_err_prefix!(db.analyze(sql), AnalyzeError::GroupingError(_), msg);
+    }
+}

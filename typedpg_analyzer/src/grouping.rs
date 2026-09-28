@@ -234,14 +234,16 @@ pub(crate) fn check_grouping(
 ) -> Result<(), AnalyzeError> {
     use std::collections::HashSet;
 
-    // Grouped query?
+    check_grouping_func_args(sel, scope)?;
+
+    // Grouped query? (A GROUPING(…) call makes it one, like an aggregate.)
     let mut grouped = !sel.group_clause.is_empty() || sel.having_clause.is_some();
     if !grouped {
         grouped = sel.target_list.iter().any(|t| match t.node.as_ref() {
-            Some(node::Node::ResTarget(rt)) => rt
-                .val
-                .as_deref()
-                .is_some_and(|v| expr::detect_func_kinds(v, snapshot).has_aggregate),
+            Some(node::Node::ResTarget(rt)) => rt.val.as_deref().is_some_and(|v| {
+                let kinds = expr::detect_func_kinds(v, snapshot);
+                kinds.has_aggregate || kinds.has_grouping
+            }),
             _ => false,
         });
     }
@@ -359,6 +361,170 @@ pub(crate) fn check_grouping(
 /// them; the empty set has no content and is trivially fine). Returns
 /// `false` when a leaf isn't a resolvable plain column — the caller then
 /// skips the whole check rather than risk a false 42803.
+/// PG's `finalize_grouping_exprs` (parse_agg.c): every argument of a
+/// `GROUPING(…)` call of this query level (projection, HAVING, ORDER BY)
+/// must be one of the GROUP BY expressions — `arguments to GROUPING must be
+/// grouping expressions of the associated query level` (42803) otherwise.
+///
+/// PG compares transformed expressions with `equal()`. Modeled exactly for
+/// a column argument: it can only equal a GROUP BY entry that is the same
+/// column (directly, or via a projection ordinal / alias whose expression is
+/// that column). Other arguments are only rejected when there is no GROUP BY
+/// at all, and nothing is rejected when a GROUP BY entry can't be resolved.
+fn check_grouping_func_args(sel: &protobuf::SelectStmt, scope: &Scope) -> Result<(), AnalyzeError> {
+    let mut calls: Vec<&protobuf::GroupingFunc> = Vec::new();
+    for t in &sel.target_list {
+        if let Some(node::Node::ResTarget(rt)) = t.node.as_ref()
+            && let Some(v) = &rt.val
+        {
+            collect_grouping_funcs(v, &mut calls);
+        }
+    }
+    if let Some(h) = &sel.having_clause {
+        collect_grouping_funcs(h, &mut calls);
+    }
+    for sb in &sel.sort_clause {
+        collect_grouping_funcs(sb, &mut calls);
+    }
+    if calls.is_empty() {
+        return Ok(());
+    }
+
+    // The GROUP BY entries that are plain columns; `unresolved` when some
+    // entry that could be a column couldn't be resolved.
+    let mut columns: HashSet<(String, String)> = HashSet::new();
+    let mut unresolved = false;
+    let mut stack: Vec<&protobuf::Node> = sel.group_clause.iter().collect();
+    while let Some(g) = stack.pop() {
+        match g.node.as_ref() {
+            Some(node::Node::GroupingSet(gs)) => stack.extend(gs.content.iter()),
+            Some(node::Node::ColumnRef(_)) => match resolve_group_column(g, scope) {
+                Some(key) => {
+                    columns.insert(key);
+                }
+                None => {
+                    // Possibly an output-column alias (SQL92 rule).
+                    let target = alias_target(g, sel);
+                    match target.and_then(|t| resolve_group_column(t, scope)) {
+                        Some(key) => {
+                            columns.insert(key);
+                        }
+                        None if target.is_some() => {}
+                        None => unresolved = true,
+                    }
+                }
+            },
+            Some(node::Node::AConst(ac)) => {
+                if let Some(protobuf::a_const::Val::Ival(i)) = &ac.val
+                    && let Some(node::Node::ResTarget(rt)) = sel
+                        .target_list
+                        .get((i.ival as usize).wrapping_sub(1))
+                        .and_then(|t| t.node.as_ref())
+                    && let Some(v) = &rt.val
+                    && let Some(key) = resolve_group_column(v, scope)
+                {
+                    columns.insert(key);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let error = || {
+        AnalyzeError::GroupingError(
+            "arguments to GROUPING must be grouping expressions of the associated query level"
+                .into(),
+        )
+    };
+    for call in calls {
+        for arg in &call.args {
+            if sel.group_clause.is_empty() {
+                return Err(error());
+            }
+            if matches!(arg.node.as_ref(), Some(node::Node::ColumnRef(_)))
+                && !unresolved
+                && let Some(key) = resolve_group_column(arg, scope)
+                && !columns.contains(&key)
+            {
+                return Err(error());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The projection expression a bare GROUP BY name refers to as an output
+/// alias, if any.
+fn alias_target<'a>(
+    g: &protobuf::Node,
+    sel: &'a protobuf::SelectStmt,
+) -> Option<&'a protobuf::Node> {
+    let Some(node::Node::ColumnRef(cr)) = g.node.as_ref() else {
+        return None;
+    };
+    let [name] = cr.fields.as_slice() else {
+        return None;
+    };
+    let Some(node::Node::String(name)) = name.node.as_ref() else {
+        return None;
+    };
+    sel.target_list.iter().find_map(|t| match t.node.as_ref() {
+        Some(node::Node::ResTarget(rt)) if rt.name == name.sval => rt.val.as_deref(),
+        _ => None,
+    })
+}
+
+/// `GROUPING(…)` calls of this query level inside `n` (not descending into
+/// sub-selects, which are their own level).
+fn collect_grouping_funcs<'a>(n: &'a protobuf::Node, out: &mut Vec<&'a protobuf::GroupingFunc>) {
+    let each = |ns: &'a [protobuf::Node], out: &mut Vec<&'a protobuf::GroupingFunc>| {
+        for n in ns {
+            collect_grouping_funcs(n, out);
+        }
+    };
+    match n.node.as_ref() {
+        Some(node::Node::GroupingFunc(g)) => out.push(g),
+        Some(node::Node::AExpr(e)) => {
+            for x in [&e.lexpr, &e.rexpr].into_iter().flatten() {
+                collect_grouping_funcs(x, out);
+            }
+        }
+        Some(node::Node::BoolExpr(b)) => each(&b.args, out),
+        Some(node::Node::FuncCall(f)) => each(&f.args, out),
+        Some(node::Node::TypeCast(c)) => {
+            if let Some(a) = &c.arg {
+                collect_grouping_funcs(a, out);
+            }
+        }
+        Some(node::Node::CoalesceExpr(c)) => each(&c.args, out),
+        Some(node::Node::MinMaxExpr(m)) => each(&m.args, out),
+        Some(node::Node::RowExpr(r)) => each(&r.args, out),
+        Some(node::Node::List(l)) => each(&l.items, out),
+        Some(node::Node::NullTest(t)) => {
+            if let Some(a) = &t.arg {
+                collect_grouping_funcs(a, out);
+            }
+        }
+        Some(node::Node::CaseExpr(c)) => {
+            for x in [&c.arg, &c.defresult].into_iter().flatten() {
+                collect_grouping_funcs(x, out);
+            }
+            each(&c.args, out);
+        }
+        Some(node::Node::CaseWhen(w)) => {
+            for x in [&w.expr, &w.result].into_iter().flatten() {
+                collect_grouping_funcs(x, out);
+            }
+        }
+        Some(node::Node::SortBy(sb)) => {
+            if let Some(x) = &sb.node {
+                collect_grouping_funcs(x, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn collect_grouped_columns(
     node: &protobuf::Node,
     scope: &Scope,

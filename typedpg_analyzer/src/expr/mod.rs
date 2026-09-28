@@ -257,6 +257,10 @@ pub(crate) struct FuncKindPresence {
     /// error can point its caret at the offending call.
     pub agg_location: Option<i32>,
     pub window_location: Option<i32>,
+    /// A `GROUPING(…)` call — aggregate-like for PG's placement rules, but
+    /// with its own wording (`grouping operations are not allowed in …`).
+    pub has_grouping: bool,
+    pub grouping_location: Option<i32>,
 }
 
 /// Walk an expression AST and report whether it contains aggregate calls
@@ -313,6 +317,10 @@ fn walk(node: &protobuf::Node, snapshot: &PgCatalog, out: &mut FuncKindPresence)
             if let Some(a) = &na.arg {
                 walk(a, snapshot, out);
             }
+        }
+        node::Node::GroupingFunc(g) => {
+            out.has_grouping = true;
+            out.grouping_location.get_or_insert(g.location);
         }
         node::Node::AExpr(e) => {
             if let Some(l) = &e.lexpr {

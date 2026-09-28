@@ -218,7 +218,7 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
             expr::Ctx::new(&scope, &null_ctx, snapshot),
             params,
             &select_aliases,
-            sel.target_list.len(),
+            &sel.target_list,
         )?;
     }
 
@@ -554,13 +554,14 @@ fn walk_group_clause_node(
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
     select_aliases: &std::collections::HashSet<String>,
-    n_targets: usize,
+    targets: &[protobuf::Node],
 ) -> Result<(), AnalyzeError> {
     let Ctx {
         scope,
         null_ctx,
         snapshot,
     } = ctx;
+    let n_targets = targets.len();
     if let Some(node::Node::GroupingSet(gs)) = group_node.node.as_ref() {
         for inner in &gs.content {
             walk_group_clause_node(
@@ -568,7 +569,7 @@ fn walk_group_clause_node(
                 expr::Ctx::new(scope, null_ctx, snapshot),
                 params,
                 select_aliases,
-                n_targets,
+                targets,
             )?;
         }
         return Ok(());
@@ -585,7 +586,9 @@ fn walk_group_clause_node(
             )
             .finalize_implicit());
         }
-        return Ok(());
+        // checkTargetlistEntrySQL92: the referenced target must not
+        // contain aggregates (GROUPING included).
+        return check_group_target_has_no_aggregates(targets.get(ord as usize - 1), snapshot);
     }
     // PG transforms the expression first (bottom-up resolution errors win)
     // and raises the no-aggregates placement error afterwards.
@@ -594,11 +597,41 @@ fn walk_group_clause_node(
         expr::Ctx::new(scope, null_ctx, snapshot),
         params,
         TypeGoal::NONE,
-    ) && !is_select_alias_reference(group_node, select_aliases, &e)
-    {
-        return Err(e);
+    ) {
+        if !is_select_alias_reference(group_node, select_aliases, &e) {
+            return Err(e);
+        }
+        let alias = expr::extract_string_fields(match group_node.node.as_ref() {
+            Some(node::Node::ColumnRef(cr)) => &cr.fields,
+            _ => &[],
+        });
+        let target = targets.iter().find(|t| {
+            matches!(t.node.as_ref(), Some(node::Node::ResTarget(rt)) if Some(&rt.name) == alias.first())
+        });
+        return check_group_target_has_no_aggregates(target, snapshot);
     }
     crate::clause::check_no_aggregates_or_windows(group_node, snapshot, "GROUP BY")?;
+    Ok(())
+}
+
+/// PG's checkTargetlistEntrySQL92 for GROUP BY: a projection entry referenced
+/// by ordinal or alias must not contain aggregate calls — `GROUPING(…)`
+/// counts (contain_aggs_of_level) — else `aggregate functions are not
+/// allowed in GROUP BY` (42803).
+fn check_group_target_has_no_aggregates(
+    target: Option<&protobuf::Node>,
+    snapshot: &crate::pg_catalog::PgCatalog,
+) -> Result<(), AnalyzeError> {
+    if let Some(node::Node::ResTarget(rt)) = target.and_then(|t| t.node.as_ref())
+        && let Some(val) = &rt.val
+    {
+        let kinds = expr::detect_func_kinds(val, snapshot);
+        if kinds.has_aggregate || kinds.has_grouping {
+            return Err(AnalyzeError::GroupingError(
+                "aggregate functions are not allowed in GROUP BY".into(),
+            ));
+        }
+    }
     Ok(())
 }
 

@@ -480,7 +480,8 @@ fn check_no_nested_aggregates(
 ) -> Result<(), AnalyzeError> {
     for arg in &func.args {
         let kinds = detect_func_kinds(arg, snapshot);
-        if kinds.has_aggregate {
+        // A GROUPING(…) inside an aggregate is an aggregate nesting too.
+        if kinds.has_aggregate || kinds.has_grouping {
             return Err(AnalyzeError::GroupingError(
                 "aggregate function calls cannot be nested".into(),
             ));
