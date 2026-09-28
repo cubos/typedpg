@@ -15,6 +15,61 @@ pub(crate) struct OutArg {
     pub not_null: bool,
 }
 
+/// How a call spells its arguments: the names of its trailing
+/// named-notation arguments (`f(1, b => 2)` → `["b"]`, PG's `fargnames`)
+/// and whether it used the `VARIADIC` keyword.
+#[derive(Debug, Default)]
+pub(crate) struct CallNotation {
+    pub names: Vec<String>,
+    pub variadic: bool,
+}
+
+impl CallNotation {
+    /// Read `fc`'s notation, enforcing PG's parse-time rules on named
+    /// arguments (`ParseFuncOrColumn`): a name may be used only once, and no
+    /// positional argument may follow a named one.
+    pub(crate) fn of(fc: &pg_query::protobuf::FuncCall) -> Result<Self, AnalyzeError> {
+        use pg_query::protobuf::node::Node;
+        let mut names: Vec<String> = Vec::new();
+        for arg in &fc.args {
+            let span = || {
+                crate::error::node_location(arg).and_then(crate::error::SourceSpan::from_node_token)
+            };
+            match arg.node.as_ref() {
+                Some(Node::NamedArgExpr(na)) => {
+                    if names.contains(&na.name) {
+                        return Err(crate::pgmsg::argument_name_used_more_than_once(
+                            &na.name,
+                            span(),
+                        )
+                        .finalize_implicit());
+                    }
+                    names.push(na.name.clone());
+                }
+                _ if !names.is_empty() => {
+                    return Err(
+                        crate::pgmsg::positional_argument_after_named(span()).finalize_implicit()
+                    );
+                }
+                _ => {}
+            }
+        }
+        Ok(Self {
+            names,
+            variadic: fc.func_variadic,
+        })
+    }
+}
+
+/// The value expression of a call argument — the `x` of a named argument
+/// `a => x`, the node itself otherwise.
+pub(crate) fn call_arg_value(arg: &pg_query::protobuf::Node) -> &pg_query::protobuf::Node {
+    match arg.node.as_ref() {
+        Some(pg_query::protobuf::node::Node::NamedArgExpr(na)) => na.arg.as_deref().unwrap_or(arg),
+        _ => arg,
+    }
+}
+
 /// Resolved function call result.
 pub(crate) struct ResolvedFunction {
     pub return_type_oid: PgTypeOid,
@@ -76,10 +131,22 @@ pub(crate) fn resolve_function(
     schema: Option<&str>,
     name: &str,
     arg_types: &[PgTypeOid],
+    notation: &CallNotation,
     _is_agg_star: bool,
     span: Option<crate::error::SourceSpan>,
 ) -> Result<ResolvedFunction, AnalyzeError> {
-    let all_matches = snapshot.find_functions(schema, name);
+    let mut all_matches = snapshot.find_functions(schema, name);
+    // A named/mixed-notation call only reaches the overloads whose parameter
+    // names fit it; each survivor is re-ordered into the call's argument
+    // order, so every positional matching pass below applies unchanged.
+    let named_matches: Vec<PgProc>;
+    if !notation.names.is_empty() {
+        named_matches = all_matches
+            .iter()
+            .filter_map(|f| match_named_call(f, arg_types.len(), notation))
+            .collect();
+        all_matches = named_matches.iter().collect();
+    }
     let candidates: Vec<&PgProc> = all_matches
         .iter()
         .copied()
@@ -93,10 +160,22 @@ pub(crate) fn resolve_function(
         None => name.to_string(),
     };
     // Render the call's actual arg types in PG-style names (int4 → integer,
-    // …) so the message matches PG verbatim.
+    // …), named arguments as `name => type`, so the message matches PG
+    // verbatim (`funcname_signature_string`).
+    let first_named = arg_types.len().saturating_sub(notation.names.len());
     let arg_list_actual = arg_types
         .iter()
-        .map(|&oid| crate::ddl::util::format_type_for_message(snapshot, oid))
+        .enumerate()
+        .map(|(i, &oid)| {
+            let ty = crate::ddl::util::format_type_for_message(snapshot, oid);
+            match i
+                .checked_sub(first_named)
+                .and_then(|j| notation.names.get(j))
+            {
+                Some(n) => format!("{n} => {ty}"),
+                None => ty,
+            }
+        })
         .collect::<Vec<_>>()
         .join(", ");
     if candidates.is_empty() {
@@ -171,13 +250,8 @@ pub(crate) fn resolve_function(
             // PG (SQLSTATE 42725): `function name(types) is not unique` —
             // several candidates survived every tiebreak; choosing one
             // could silently mistype the call.
-            let arg_list = arg_types
-                .iter()
-                .map(|&oid| crate::ddl::util::format_type_for_message(snapshot, oid))
-                .collect::<Vec<_>>()
-                .join(", ");
             return Err(
-                crate::pgmsg::function_is_not_unique(&qualified, &arg_list, span)
+                crate::pgmsg::function_is_not_unique(&qualified, &arg_list_actual, span)
                     .finalize_implicit(),
             );
         }
@@ -284,17 +358,12 @@ pub(crate) fn resolve_function(
     // PG's wording: `function name(arg_types_joined) does not exist`. Match
     // it verbatim so pg_sanity's prefix check passes; append the candidate
     // count we computed as a suffix for the macro caller's diagnostic.
-    let arg_list = arg_types
-        .iter()
-        .map(|&oid| crate::ddl::util::format_type_for_message(snapshot, oid))
-        .collect::<Vec<_>>()
-        .join(", ");
     Err(undefined_function_error(
         snapshot,
         schema,
         name,
         format!(
-            "function {qualified}({arg_list}) does not exist (found {} candidate(s))",
+            "function {qualified}({arg_list_actual}) does not exist (found {} candidate(s))",
             candidates.len()
         ),
         span,
@@ -312,6 +381,61 @@ pub(crate) fn undefined_function_error(
     let hint = crate::suggest::suggest_similar(name, snapshot.visible_function_names(schema))
         .map(|c| format!("did you mean \"{c}\"?"));
     crate::error::RawError::undefined_function(message, span, hint).finalize_implicit()
+}
+
+/// PG's `MatchNamedCall` (namespace.c): map a named/mixed-notation call
+/// with `nargs` arguments onto `f`'s input parameters. Returns a copy of `f`
+/// whose `proargtypes` are re-ordered into the call's argument order (the
+/// omitted, defaulted parameters dropped), or `None` when the names don't
+/// fit — an unknown name, a name repeating a positional argument, or an
+/// omitted parameter without a default.
+fn match_named_call(f: &PgProc, nargs: usize, notation: &CallNotation) -> Option<PgProc> {
+    // Named notation can reach a variadic function only through an explicit
+    // `VARIADIC` argument: the expanded variadic elements have no name.
+    if f.provariadic.is_some() && !notation.variadic {
+        return None;
+    }
+    let pronargs = f.proargtypes.len();
+    let defaults = f.pronargdefaults.max(0) as usize;
+    if nargs > pronargs || nargs + defaults < pronargs {
+        return None;
+    }
+    // Input-parameter names in `proargtypes` order. With `proargmodes` set,
+    // `proargnames` parallels `proallargtypes` and OUT/TABLE entries are
+    // skipped; without it, every parameter is an input.
+    let input_names: Vec<&str> = if f.proargmodes.is_empty() {
+        f.proargnames.iter().map(String::as_str).collect()
+    } else {
+        f.proargmodes
+            .iter()
+            .zip(&f.proargnames)
+            .filter(|(m, _)| matches!(m, ArgMode::In | ArgMode::InOut | ArgMode::Variadic))
+            .map(|(_, n)| n.as_str())
+            .collect()
+    };
+    let positional = nargs - notation.names.len();
+    let mut given = vec![false; pronargs];
+    given[..positional].fill(true);
+    let mut order: Vec<usize> = (0..positional).collect();
+    for name in &notation.names {
+        let pp = input_names.iter().position(|n| n == name)?;
+        if pp >= pronargs || given[pp] {
+            return None;
+        }
+        given[pp] = true;
+        order.push(pp);
+    }
+    // Every parameter the call leaves out must have a default — and only
+    // the trailing `pronargdefaults` ones do.
+    let first_default = pronargs - defaults;
+    if (positional..pronargs).any(|pp| !given[pp] && pp < first_default) {
+        return None;
+    }
+    let mut matched = f.clone();
+    matched.proargtypes = order.iter().map(|&pp| f.proargtypes[pp]).collect();
+    matched.pronargdefaults = 0;
+    matched.provariadic = None;
+    Some(matched)
 }
 
 fn find_unknown_compatible_match<'a>(

@@ -41,6 +41,7 @@ pub(crate) fn infer_func_call(
 
     // Pass 1: infer argument types bottom-up.
     let args = collect_arg_types(func, ctx, params)?;
+    let notation = functions::CallNotation::of(func)?;
 
     // Resolve function with inferred arg types (UNKNOWN treated as wildcard).
     let resolved = match functions::resolve_function(
@@ -48,6 +49,7 @@ pub(crate) fn infer_func_call(
         schema,
         name,
         &args.types,
+        &notation,
         func.agg_star,
         crate::error::SourceSpan::from_node_qname(func.location),
     ) {
@@ -58,8 +60,9 @@ pub(crate) fn infer_func_call(
             // type name, with no matching function and a legal explicit
             // cast path, is a cast — `float8(x)`, `text(123)`,
             // `pg_catalog."numeric"(v)`. Modifier syntax (OVER, DISTINCT,
-            // FILTER, …) rules the interpretation out.
+            // FILTER, …) and named notation rule the interpretation out.
             if func.args.len() == 1
+                && notation.names.is_empty()
                 && func.over.is_none()
                 && !func.agg_star
                 && !func.agg_distinct
@@ -93,6 +96,17 @@ pub(crate) fn infer_func_call(
             return Err(e);
         }
     };
+
+    // PG supports named notation for an aggregate only when it's called as
+    // a window function.
+    if resolved.is_aggregate && func.over.is_none() && !notation.names.is_empty() {
+        return Err(crate::error::RawError::new(
+            AnalyzeError::Invalid("aggregates cannot use named arguments".into()),
+            crate::error::SourceSpan::from_node_qname(func.location),
+            None,
+        )
+        .finalize_implicit());
+    }
 
     if resolved.is_aggregate {
         check_no_nested_aggregates(func, snapshot)?;
@@ -141,7 +155,7 @@ pub(crate) fn infer_func_call(
     };
     for (i, arg) in func.args.iter().enumerate() {
         if declared_any(i)
-            && let Some(node::Node::ParamRef(p)) = arg.node.as_ref()
+            && let Some(node::Node::ParamRef(p)) = functions::call_arg_value(arg).node.as_ref()
         {
             params.mark_indeterminate_locked(p.number);
         }
@@ -300,7 +314,7 @@ fn backfill_func_args(
             // Speculative re-walk: ordinary failures are swallowed, but a
             // literal-content rejection is the parse-time error PG itself
             // raises from this argument coercion (`sqrt('x')`).
-            coerce_unknown_to(arg, ctx, params, expected)?;
+            coerce_unknown_to(functions::call_arg_value(arg), ctx, params, expected)?;
         }
     }
     Ok(())

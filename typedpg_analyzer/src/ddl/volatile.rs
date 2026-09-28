@@ -118,6 +118,11 @@ fn walk(node: &protobuf::Node, loc: ExprLocation, snapshot: &PgCatalog) -> Resul
                 walk(arg, loc, snapshot)?;
             }
         }
+        node::Node::NamedArgExpr(na) => {
+            if let Some(arg) = na.arg.as_deref() {
+                walk(arg, loc, snapshot)?;
+            }
+        }
         node::Node::CollateClause(cc) => {
             if let Some(arg) = cc.arg.as_deref() {
                 walk(arg, loc, snapshot)?;

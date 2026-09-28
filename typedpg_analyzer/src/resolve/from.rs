@@ -704,6 +704,7 @@ fn srf_function_columns(
         schema,
         name,
         args.types,
+        &functions::CallNotation::of(func_call)?,
         false,
         crate::error::SourceSpan::from_node_qname(func_call.location),
     )?;

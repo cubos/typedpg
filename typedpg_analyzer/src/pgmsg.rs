@@ -77,6 +77,25 @@ pub(crate) fn function_is_not_unique(
     )
 }
 
+/// `argument name "a" used more than once` — SQLSTATE 42601: the same
+/// name given twice in one named-notation call.
+pub(crate) fn argument_name_used_more_than_once(name: &str, span: Option<SourceSpan>) -> RawError {
+    RawError::new(
+        AnalyzeError::SyntaxError(format!("argument name \"{name}\" used more than once")),
+        span,
+        None,
+    )
+}
+
+/// `positional argument cannot follow named argument` — SQLSTATE 42601.
+pub(crate) fn positional_argument_after_named(span: Option<SourceSpan>) -> RawError {
+    RawError::new(
+        AnalyzeError::SyntaxError("positional argument cannot follow named argument".into()),
+        span,
+        None,
+    )
+}
+
 /// `GROUP BY position N is not in select list` / `ORDER BY position N is
 /// not in select list` — SQLSTATE 42P10 (`invalid_column_reference`).
 pub(crate) fn position_not_in_select_list(

@@ -492,6 +492,10 @@ fn find_ungrouped(
             .arg
             .as_deref()
             .and_then(|a| find_ungrouped(a, scope, snapshot, grouped, local, fully_grouped)),
+        node::Node::NamedArgExpr(na) => na
+            .arg
+            .as_deref()
+            .and_then(|a| find_ungrouped(a, scope, snapshot, grouped, local, fully_grouped)),
         node::Node::NullTest(t) => t
             .arg
             .as_deref()

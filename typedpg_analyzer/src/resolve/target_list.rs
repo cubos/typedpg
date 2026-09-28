@@ -249,8 +249,10 @@ fn resolve_funccall_record_fields(
         .unwrap_or(oid::UNKNOWN);
         arg_types.push(t);
     }
+    let notation = functions::CallNotation::of(fc).ok()?;
     let resolved =
-        functions::resolve_function(snapshot, schema, name, &arg_types, false, None).ok()?;
+        functions::resolve_function(snapshot, schema, name, &arg_types, &notation, false, None)
+            .ok()?;
     if resolved.out_args.is_empty() {
         None
     } else {

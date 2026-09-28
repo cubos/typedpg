@@ -521,6 +521,11 @@ impl BindingWalker {
                     self.walk_node(arg, snapshot, stack);
                 }
             }
+            node::Node::NamedArgExpr(na) => {
+                if let Some(arg) = na.arg.as_deref() {
+                    self.walk_node(arg, snapshot, stack);
+                }
+            }
             node::Node::CoalesceExpr(c) => {
                 for arg in &c.args {
                     self.walk_node(arg, snapshot, stack);

@@ -26,6 +26,8 @@ mod expressions;
 mod joins;
 #[path = "query/literal_input.rs"]
 mod literal_input;
+#[path = "query/named_args.rs"]
+mod named_args;
 #[path = "query/params.rs"]
 mod params;
 #[path = "query/records.rs"]

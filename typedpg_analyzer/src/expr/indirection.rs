@@ -280,11 +280,15 @@ fn resolve_funccall_out_args(
         arg_types.push(t);
     }
 
-    let resolved =
-        match crate::functions::resolve_function(snapshot, schema, name, &arg_types, false, None) {
-            Ok(r) => r,
-            Err(_) => return Ok(None),
-        };
+    let Ok(notation) = crate::functions::CallNotation::of(fc) else {
+        return Ok(None);
+    };
+    let resolved = match crate::functions::resolve_function(
+        snapshot, schema, name, &arg_types, &notation, false, None,
+    ) {
+        Ok(r) => r,
+        Err(_) => return Ok(None),
+    };
     if resolved.out_args.is_empty() {
         Ok(None)
     } else {

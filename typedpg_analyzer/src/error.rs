@@ -468,6 +468,7 @@ pub(crate) fn node_location(node: &pg_query::protobuf::Node) -> Option<i32> {
         Node::CaseExpr(n) => n.location,
         Node::SubLink(n) => n.location,
         Node::TypeName(n) => n.location,
+        Node::NamedArgExpr(n) => n.location,
         _ => return None,
     };
     if loc < 0 { None } else { Some(loc) }

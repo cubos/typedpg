@@ -23,6 +23,8 @@ pub fn define_aggregate(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(),
     //   CREATE AGGREGATE name (a int, b int)        — FunctionParameter list
     //   CREATE AGGREGATE name (* )                  — zero-arg aggregate
     let mut arg_types: Vec<PgTypeOid> = Vec::new();
+    // Parallel to `arg_types`; `""` for an unnamed argument.
+    let mut arg_names: Vec<String> = Vec::new();
     let mut variadic_oid: Option<PgTypeOid> = None;
     let arg_nodes: Vec<&pg_query::protobuf::Node> = if stmt.args.len() == 2
         && let Some(node::Node::List(list)) = stmt.args[0].node.as_ref()
@@ -48,10 +50,12 @@ pub fn define_aggregate(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(),
                     variadic_oid = Some(resolved);
                 }
                 arg_types.push(resolved);
+                arg_names.push(fp.name.clone());
             }
             Some(node::Node::TypeName(tn)) => {
                 if let Some(oid) = resolve_type_name(tn, interp) {
                     arg_types.push(oid);
+                    arg_names.push(String::new());
                 }
             }
             _ => {}
@@ -127,7 +131,12 @@ pub fn define_aggregate(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(),
         pronargdefaults: 0,
         proallargtypes: Vec::new(),
         proargmodes: Vec::new(),
-        proargnames: Vec::new(),
+        // PG stores no `proargnames` when every argument is unnamed.
+        proargnames: if arg_names.iter().all(String::is_empty) {
+            Vec::new()
+        } else {
+            arg_names
+        },
         // PG aggregates are conventionally IMMUTABLE w.r.t. their input —
         // the analyzer never traverses an aggregate body in a CHECK /
         // GENERATED / index context anyway.

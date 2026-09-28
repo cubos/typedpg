@@ -373,6 +373,11 @@ fn check_window_refs(
                 check_window_refs(a, defined)?;
             }
         }
+        node::Node::NamedArgExpr(na) => {
+            if let Some(a) = &na.arg {
+                check_window_refs(a, defined)?;
+            }
+        }
         node::Node::CaseExpr(c) => {
             for w in &c.args {
                 check_window_refs(w, defined)?;

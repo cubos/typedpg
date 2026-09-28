@@ -305,6 +305,11 @@ fn walk(node: &protobuf::Node, snapshot: &PgCatalog, out: &mut FuncKindPresence)
                 walk(o, snapshot, out);
             }
         }
+        node::Node::NamedArgExpr(na) => {
+            if let Some(a) = &na.arg {
+                walk(a, snapshot, out);
+            }
+        }
         node::Node::AExpr(e) => {
             if let Some(l) = &e.lexpr {
                 walk(l, snapshot, out);
@@ -395,6 +400,14 @@ pub(crate) fn infer_expr(
         node::Node::AConst(a_const) => infer_a_const(a_const),
         node::Node::TypeCast(cast) => infer_type_cast(cast, ctx, params),
         node::Node::FuncCall(func) => infer_func_call(func, ctx, params),
+        // `name => value` only occurs as a function-call argument; its type is
+        // the value's. The enclosing call resolves the name.
+        node::Node::NamedArgExpr(na) => match na.arg.as_deref() {
+            Some(arg) => infer_expr(arg, ctx, params, goal.clone()),
+            None => Err(AnalyzeError::Unsupported(
+                "named argument without a value".into(),
+            )),
+        },
         node::Node::GroupingFunc(g) => {
             // `GROUPING(expr, …)` — returns int4 indicating which of the
             // listed expressions are *missing* from the current grouping
