@@ -82,6 +82,30 @@ impl ConName {
     }
 }
 
+/// A CHECK constraint's `conkey`: the columns its expression reads, in
+/// attnum order (StoreRelCheck / pull_varattnos). DROP COLUMN drops the
+/// constraints whose key contains the column.
+fn check_conkey(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+    expr: Option<&pg_query::protobuf::Node>,
+) -> Vec<i16> {
+    let mut attnums: Vec<i16> = Vec::new();
+    if let Some(inner) = expr.and_then(|e| e.node.as_ref()) {
+        for (n, ..) in inner.nodes() {
+            if let pg_query::NodeRef::ColumnRef(cr) = n
+                && let Some(name) = cr.fields.last().and_then(super::util::node_string)
+                && let Some(attr) = interp.attribute_by_name(relid, name)
+                && !attnums.contains(&attr.attnum)
+            {
+                attnums.push(attr.attnum);
+            }
+        }
+    }
+    attnums.sort_unstable();
+    attnums
+}
+
 /// The name addition for a CHECK constraint (AddRelationNewConstraints):
 /// the one column its expression reads, or nothing when it reads none or
 /// several.

@@ -1057,3 +1057,47 @@ fn typed_tables_follow_their_type() {
         .collect();
     assert_eq!(cols, vec![("z".to_owned(), 23), ("c".to_owned(), 20)]);
 }
+
+#[test]
+fn drop_column_drops_the_check_constraints_that_read_it() {
+    // PG 18: a CHECK constraint's conkey lists the columns its expression
+    // reads, and dropping one of them drops the constraint.
+    let setup = "CREATE TABLE t (a int CHECK (a > 1), b int CHECK (a < b),
+                                 CONSTRAINT one CHECK (a > 0), CONSTRAINT two CHECK (a > b),
+                                 CONSTRAINT k CHECK (b > 0));
+                 ALTER TABLE t ADD CONSTRAINT three CHECK (a < 100);
+                 CREATE TABLE p (x int);
+                 CREATE TABLE c () INHERITS (p);
+                 ALTER TABLE p ADD COLUMN y int CONSTRAINT yc CHECK (y > 0);
+                 ALTER TABLE t DROP COLUMN a;
+                 ALTER TABLE p DROP COLUMN y;";
+    for (stmt, msg) in [
+        (
+            "ALTER TABLE t DROP CONSTRAINT one;",
+            "constraint \"one\" of relation \"t\" does not exist",
+        ),
+        (
+            "ALTER TABLE t DROP CONSTRAINT two;",
+            "constraint \"two\" of relation \"t\" does not exist",
+        ),
+        (
+            "ALTER TABLE t DROP CONSTRAINT three;",
+            "constraint \"three\" of relation \"t\" does not exist",
+        ),
+        (
+            "ALTER TABLE t DROP CONSTRAINT t_check;",
+            "constraint \"t_check\" of relation \"t\" does not exist",
+        ),
+        (
+            "ALTER TABLE c DROP CONSTRAINT yc;",
+            "constraint \"yc\" of relation \"c\" does not exist",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        ("0002.sql", "ALTER TABLE t DROP CONSTRAINT k;"),
+    ]);
+}

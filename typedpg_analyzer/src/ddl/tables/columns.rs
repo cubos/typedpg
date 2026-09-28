@@ -519,13 +519,17 @@ fn add_column_to(
                 )?;
             }
         }
-        add_column_constraints(interp, relid, cd)?;
     }
     for child in children {
         let nn = col
             .not_null
             .then(|| inherit::not_null_name(interp, relid, next_attnum));
         add_column_to(interp, child, cmd, rec.child(), nn)?;
+    }
+    // The column's constraints run as later subcommands
+    // (transformAlterTableStmt), once every child has the column.
+    if !rec.recursing {
+        add_column_constraints(interp, relid, cd)?;
     }
     Ok(())
 }

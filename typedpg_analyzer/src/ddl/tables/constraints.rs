@@ -92,7 +92,7 @@ pub(crate) fn emit_constraints(
                             },
                         ),
                         ConType::Check,
-                        vec![an],
+                        check_conkey(interp, relid, c.raw_expr.as_deref()),
                         None,
                         Vec::new(),
                         Some(check_inherit::CheckDef {
@@ -177,7 +177,7 @@ pub(crate) fn emit_constraints(
                         },
                     ),
                     ConType::Check,
-                    columns,
+                    check_conkey(interp, relid, c.raw_expr.as_deref()),
                     None,
                     Vec::new(),
                     Some(check_inherit::CheckDef {
@@ -1137,7 +1137,7 @@ fn add_constraint_node(
             expr,
             c.is_no_inherit,
             rec,
-            Vec::new(),
+            check_conkey(interp, relid, Some(expr)),
         )?;
     }
 
