@@ -723,7 +723,6 @@ fn srf_arg_scope(scope: &Scope) -> Scope {
 /// bound by the enclosing query (e.g. `pg_stats_ext` does
 /// `(SELECT … FROM unnest(s.stxkeys) …)` where `s` is from the outer FROM).
 fn infer_srf_arg_types(
-    rf: &protobuf::RangeFunction,
     func_call: &protobuf::FuncCall,
     arg_ctx: Ctx<'_>,
     params: &mut ParamCollector,
@@ -731,23 +730,11 @@ fn infer_srf_arg_types(
     let mut arg_types = Vec::with_capacity(func_call.args.len());
     let mut arg_nullable = Vec::with_capacity(func_call.args.len());
     for arg in &func_call.args {
-        let (t, n) = match expr::infer_expr(arg, arg_ctx, params, crate::expr::TypeGoal::NONE) {
-            Ok(e) => (e.type_oid, e.nullable),
-            // `FROM a, f(a.col)` without LATERAL — PG rejects with `invalid
-            // reference to FROM-clause entry for table "a"`. The scope we
-            // built above is empty precisely so this fails; don't let the
-            // old `.unwrap_or(UNKNOWN)` swallow it. Likewise a qualifier
-            // naming a FROM item that isn't visible yet (`FROM f(t.c), t`):
-            // `missing FROM-clause entry for table "t"`.
-            Err(e @ (AnalyzeError::UndefinedColumn(_) | AnalyzeError::UndefinedTable(_)))
-                if !rf.lateral =>
-            {
-                return Err(e);
-            }
-            // A RIGHT / FULL join's left side is never a legal reference.
-            Err(e @ AnalyzeError::InvalidColumnReference(_)) => return Err(e),
-            Err(_) => (oid::UNKNOWN, true),
-        };
+        // Any error transforming an argument aborts the query, as in PG's
+        // `transformRangeFunction`: an unknown column, a FROM item that isn't
+        // visible yet (`FROM f(t.c), t`), the left side of a RIGHT / FULL join.
+        let e = expr::infer_expr(arg, arg_ctx, params, crate::expr::TypeGoal::NONE)?;
+        let (t, n) = (e.type_oid, e.nullable);
         arg_types.push(t);
         arg_nullable.push(n);
     }
@@ -832,7 +819,7 @@ fn function_rte_columns(
             )));
         }
     };
-    let (arg_types, arg_nullable) = infer_srf_arg_types(rf, func_call, arg_ctx, params)?;
+    let (arg_types, arg_nullable) = infer_srf_arg_types(func_call, arg_ctx, params)?;
     // nodeFunctionscan.c evaluates only the top-level call as a set.
     if func_call
         .args

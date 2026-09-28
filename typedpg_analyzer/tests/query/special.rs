@@ -204,6 +204,23 @@ fn range_function_scalar_srf_exposes_single_column() {
 }
 
 #[test]
+fn range_function_argument_errors_are_not_swallowed() {
+    // LATERAL or not, an argument that doesn't transform aborts the query —
+    // it must not degrade to an `unknown` argument.
+    let db = setup();
+    for sql in [
+        "SELECT g FROM users u, LATERAL generate_series(1, u.nope) AS g",
+        "SELECT g FROM users u, LATERAL unnest(u.nope) AS g",
+    ] {
+        let err = db.analyze(sql).unwrap_err();
+        assert!(
+            err.to_string().starts_with("column u.nope does not exist"),
+            "{sql}: {err}"
+        );
+    }
+}
+
+#[test]
 fn range_function_scalar_column_takes_the_relation_alias() {
     let db = setup();
     let info = db
