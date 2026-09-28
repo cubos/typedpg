@@ -180,6 +180,28 @@ fn unknown_or_missing_names_do_not_exist() {
 }
 
 #[test]
+fn argument_names_render_unquoted_in_messages() {
+    // Unlike type and relation names, PG prints argument names verbatim —
+    // no quoting even when the name needs it.
+    let db = setup();
+    assert_err_starts_with(
+        &db,
+        r#"SELECT f("X y" => 1)"#,
+        "function f(X y => integer) does not exist",
+    );
+    assert_err_starts_with(
+        &db,
+        r#"SELECT f("select" => 1)"#,
+        "function f(select => integer) does not exist",
+    );
+    assert_err_starts_with(
+        &db,
+        r#"SELECT f("a""b" => 1)"#,
+        r#"function f(a"b => integer) does not exist"#,
+    );
+}
+
+#[test]
 fn named_notation_is_never_a_cast() {
     let db = setup();
     assert_err_starts_with(
