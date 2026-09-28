@@ -6,10 +6,10 @@
 //!
 //! | typname                                       | encoding                                  |
 //! |-----------------------------------------------|-------------------------------------------|
-//! | `varchar`, `bpchar`, `char`                   | `n + 4` (VARHDRSZ)                        |
+//! | `varchar`, `bpchar`                           | `n + 4` (VARHDRSZ)                        |
 //! | `numeric`                                     | `((p << 16) \| (s & 0xFFFF)) + 4`         |
-//! | `time`, `timetz`, `timestamp`, `timestamptz`  | `p` (precision, 0–6)                      |
-//! | `interval`                                    | `p` (we ignore the field-mask bits)       |
+//! | `time`, `timetz`, `timestamp`, `timestamptz`  | `p` (precision, clamped to 0–6)           |
+//! | `interval`                                    | `(fields << 16) \| p` (`p` = 0xFFFF: none) |
 //! | `bit`, `varbit`                               | `n`                                       |
 //! | `vector` (pgvector)                           | `n` (dimension)                           |
 //!
@@ -22,9 +22,11 @@
 //! Decoding is mostly used for diagnostics (overflow messages) and to surface
 //! structured info (precision, scale, dimension) to consumers.
 //!
-//! Behaviour when the type is not in the table above: encoding silently
-//! returns `Ok(None)` so users of custom types with their own typmodin
-//! function don't break the migration; we just don't track typmod for those.
+//! Behaviour when the type is not in the table above: a type PG knows has
+//! no `typmodin` (the rest of `pg_catalog`, domains, enums, composites, …)
+//! is rejected like PG does; a non-`pg_catalog` base type silently returns
+//! `Ok(None)` so custom types with their own typmodin function don't break
+//! the migration — we just don't track typmod for those.
 
 use pg_query::protobuf::{Node, node};
 
@@ -35,8 +37,11 @@ use crate::pg_catalog::{PgCatalog, oid as builtin_oid};
 
 const VARHDRSZ: i32 = 4;
 const MAX_NUMERIC_PRECISION: i32 = 1000;
-const MAX_TIMESTAMP_PRECISION: i32 = 6;
+pub(crate) const MAX_TIMESTAMP_PRECISION: i32 = 6;
 const MAX_VECTOR_DIM: i32 = 16000;
+/// `MaxAttrSize` (10 MB): the upper bound of a character / bit length.
+const MAX_ATTR_SIZE: i32 = 10 * 1024 * 1024;
+const BITS_PER_BYTE: i32 = 8;
 
 /// Decoded view of a typmod, type-aware. `None` and the catch-all
 /// `Other(i32)` keep the structure honest for types we don't model.
@@ -57,11 +62,17 @@ pub enum DecodedTypmod {
     Other(i32),
 }
 
-/// Encode an AST `typmods: Vec<Node>` into the packed `i32` PG would store.
+/// Encode an AST `typmods: Vec<Node>` into the packed `i32` PG would store —
+/// the analyzer's port of the type's `typmodin` function, reached like PG's
+/// `typenameTypeMod`.
 ///
-/// `Ok(None)` means either (a) no typmods supplied (`varchar` plain) or (b)
-/// the type is not in our supported table. `Ok(Some(v))` is the encoded
-/// value. `Err` is for invalid inputs (wrong arity, out of range).
+/// `Ok(None)` means either (a) no typmods supplied (`varchar` plain), (b) a
+/// modifier that PG itself reduces to `-1` (`interval` over the full
+/// range), or (c) a non-`pg_catalog` base type whose `typmodin` we don't
+/// model. `Ok(Some(v))` is the encoded value. `Err` is for inputs PG
+/// rejects: a type without a `typmodin` (`type modifier is not allowed for
+/// type "text"`), the wrong modifier count, or an out-of-range value.
+/// An array type uses its element's `typmodin` (so `varchar(5)[]` is 9).
 pub fn encode(
     snapshot: &PgCatalog,
     type_oid: PgTypeOid,
@@ -70,35 +81,53 @@ pub fn encode(
     if typmods.is_empty() {
         return Ok(None);
     }
-
-    let typname = snapshot.get_type(type_oid).map(|t| t.typname.as_str());
-    let pgvector = is_pgvector_type(snapshot, type_oid);
+    let Some(t) = snapshot.get_type(type_oid) else {
+        return Ok(None);
+    };
+    if t.typcategory == crate::pg_catalog::TypCategory::Array
+        && let Some(elem) = t.typelem
+        && snapshot.array_type_of(elem) == Some(type_oid)
+    {
+        return encode(snapshot, elem, typmods);
+    }
 
     // Pull integer values out of each typmod node. PG's parser only emits
     // `AConst::Integer` for numeric typmods; anything else is invalid.
     let raw: Result<Vec<i32>, DdlError> = typmods.iter().map(extract_int).collect();
     let raw = raw?;
 
-    if pgvector {
+    if is_pgvector_type(snapshot, type_oid) {
         return encode_vector(&raw).map(Some);
     }
 
-    match (type_oid, typname) {
-        // PG distinguishes `varchar` and `character` (bpchar) in the
-        // length-validation error: `length for type varchar must be at
-        // least 1` vs `length for type character …`. Mirror that so the
-        // `pglite_sanity` mirror's prefix check matches.
-        (builtin_oid::VARCHAR, _) => encode_length(&raw, "varchar").map(Some),
-        (builtin_oid::BPCHAR, _) => encode_length(&raw, "character").map(Some),
-        (_, Some("char")) => encode_length(&raw, "character").map(Some),
-        (builtin_oid::NUMERIC, _) => encode_numeric(&raw).map(Some),
-        (_, Some("time" | "timetz" | "timestamp" | "timestamptz" | "interval")) => {
-            encode_precision(&raw).map(Some)
+    let in_pg_catalog = snapshot.namespace_name(t.typnamespace) == Some("pg_catalog");
+    let typname = t.typname.as_str();
+    match (type_oid, in_pg_catalog.then_some(typname)) {
+        // `anychar_typmodin` names bpchar `char` in its messages.
+        (builtin_oid::VARCHAR, _) => {
+            encode_length(&raw, "varchar", MAX_ATTR_SIZE, VARHDRSZ).map(Some)
         }
-        (_, Some("bit" | "varbit")) => encode_length(&raw, "bit").map(Some),
-        // Unknown / user-defined parametric type — silently drop the typmod
-        // so we don't fail migrations using bespoke typmodin functions.
-        _ => Ok(None),
+        (builtin_oid::BPCHAR, _) => encode_length(&raw, "char", MAX_ATTR_SIZE, VARHDRSZ).map(Some),
+        (builtin_oid::NUMERIC, _) => encode_numeric(&raw).map(Some),
+        (_, Some("time")) => encode_precision(&raw, "TIME", "").map(Some),
+        (_, Some("timetz")) => encode_precision(&raw, "TIME", " WITH TIME ZONE").map(Some),
+        (_, Some("timestamp")) => encode_precision(&raw, "TIMESTAMP", "").map(Some),
+        (_, Some("timestamptz")) => {
+            encode_precision(&raw, "TIMESTAMP", " WITH TIME ZONE").map(Some)
+        }
+        (_, Some("interval")) => encode_interval(&raw),
+        // `anybit_typmodin`: the length itself, no VARHDRSZ.
+        (_, Some(name @ ("bit" | "varbit"))) => {
+            encode_length(&raw, name, MAX_ATTR_SIZE * BITS_PER_BYTE, 0).map(Some)
+        }
+        // A non-pg_catalog base type (extension / user C type) may have a
+        // typmodin we don't model — drop the typmod rather than reject.
+        (_, None) if t.typtype == crate::pg_catalog::TypType::Base => Ok(None),
+        // Everything else has no typmodin: pg_catalog types outside the
+        // list above, domains, enums, composites, ranges, pseudo-types.
+        _ => Err(DdlError::UnsupportedDdl(format!(
+            "type modifier is not allowed for type \"{typname}\""
+        ))),
     }
 }
 
@@ -116,7 +145,6 @@ pub fn decode(snapshot: &PgCatalog, type_oid: PgTypeOid, typmod: Option<i32>) ->
     let typname = snapshot.get_type(type_oid).map(|x| x.typname.as_str());
     match (type_oid, typname) {
         (builtin_oid::VARCHAR | builtin_oid::BPCHAR, _) => DecodedTypmod::Length(t - VARHDRSZ),
-        (_, Some("char")) => DecodedTypmod::Length(t - VARHDRSZ),
         (builtin_oid::NUMERIC, _) => {
             let inner = t - VARHDRSZ;
             let precision = (inner >> 16) & 0xFFFF;
@@ -130,8 +158,11 @@ pub fn decode(snapshot: &PgCatalog, type_oid: PgTypeOid, typmod: Option<i32>) ->
             };
             DecodedTypmod::Numeric { precision, scale }
         }
-        (_, Some("time" | "timetz" | "timestamp" | "timestamptz" | "interval")) => {
-            DecodedTypmod::Precision(t)
+        (_, Some("time" | "timetz" | "timestamp" | "timestamptz")) => DecodedTypmod::Precision(t),
+        // INTERVAL_TYPMOD(precision, range): the low 16 bits are the
+        // precision (0xFFFF when only the field range is restricted).
+        (_, Some("interval")) if t & 0xFFFF != INTERVAL_FULL_PRECISION => {
+            DecodedTypmod::Precision(t & 0xFFFF)
         }
         (_, Some("bit" | "varbit")) => DecodedTypmod::Length(t),
         _ => DecodedTypmod::Other(t),
@@ -140,30 +171,36 @@ pub fn decode(snapshot: &PgCatalog, type_oid: PgTypeOid, typmod: Option<i32>) ->
 
 // ─── Per-type encoders ─────────────────────────────────────────────────────
 
-fn encode_length(raw: &[i32], kind: &str) -> Result<i32, DdlError> {
-    if raw.len() != 1 {
-        return Err(DdlError::UnsupportedDdl(format!(
-            "{kind} type takes exactly one length argument, got {}",
-            raw.len()
-        )));
-    }
-    let n = raw[0];
+/// `anychar_typmodin` / `anybit_typmodin`: exactly one length in
+/// `1..=max`, stored as `n + header`.
+fn encode_length(raw: &[i32], kind: &str, max: i32, header: i32) -> Result<i32, DdlError> {
+    let [n] = raw else {
+        return Err(DdlError::UnsupportedDdl("invalid type modifier".into()));
+    };
+    let n = *n;
     if n < 1 {
         return Err(DdlError::UnsupportedDdl(format!(
             "length for type {kind} must be at least 1 (got {n})"
         )));
     }
-    Ok(n + VARHDRSZ)
+    if n > max {
+        return Err(DdlError::UnsupportedDdl(format!(
+            "length for type {kind} cannot exceed {max}"
+        )));
+    }
+    Ok(n + header)
 }
 
+/// `numerictypmodin`: `(p)` or `(p, s)` with `p` in 1..=1000 and (PG 15+)
+/// `s` in -1000..=1000 — the scale may exceed the precision.
 fn encode_numeric(raw: &[i32]) -> Result<i32, DdlError> {
-    let (precision, scale) = match raw.len() {
-        1 => (raw[0], 0),
-        2 => (raw[0], raw[1]),
-        n => {
-            return Err(DdlError::UnsupportedDdl(format!(
-                "numeric type takes 1 or 2 arguments, got {n}"
-            )));
+    let (precision, scale) = match raw {
+        [p] => (*p, 0),
+        [p, s] => (*p, *s),
+        _ => {
+            return Err(DdlError::UnsupportedDdl(
+                "invalid NUMERIC type modifier".into(),
+            ));
         }
     };
     if !(1..=MAX_NUMERIC_PRECISION).contains(&precision) {
@@ -171,29 +208,95 @@ fn encode_numeric(raw: &[i32]) -> Result<i32, DdlError> {
             "NUMERIC precision {precision} must be between 1 and {MAX_NUMERIC_PRECISION}"
         )));
     }
-    if scale < -MAX_NUMERIC_PRECISION || scale > precision {
+    if !(-MAX_NUMERIC_PRECISION..=MAX_NUMERIC_PRECISION).contains(&scale) {
         return Err(DdlError::UnsupportedDdl(format!(
-            "NUMERIC scale {scale} must be between {} and {precision}",
+            "NUMERIC scale {scale} must be between {} and {MAX_NUMERIC_PRECISION}",
             -MAX_NUMERIC_PRECISION
         )));
     }
     Ok(((precision << 16) | (scale & 0xFFFF)) + VARHDRSZ)
 }
 
-fn encode_precision(raw: &[i32]) -> Result<i32, DdlError> {
-    if raw.len() != 1 {
+/// `anytime_typmod_check` / `anytimestamp_typmod_check`: one non-negative
+/// precision; above 6 PG only warns (`… precision reduced to maximum
+/// allowed, 6`) and clamps.
+fn encode_precision(raw: &[i32], label: &str, suffix: &str) -> Result<i32, DdlError> {
+    let [p] = raw else {
+        return Err(DdlError::UnsupportedDdl("invalid type modifier".into()));
+    };
+    clamp_time_precision(*p, label, suffix)
+}
+
+/// The shared precision rule of the time family, also applied to the
+/// `CURRENT_TIME(p)` / `LOCALTIMESTAMP(p)` value functions.
+pub(crate) fn clamp_time_precision(p: i32, label: &str, suffix: &str) -> Result<i32, DdlError> {
+    if p < 0 {
         return Err(DdlError::UnsupportedDdl(format!(
-            "type takes exactly one precision argument, got {}",
-            raw.len()
+            "{label}({p}){suffix} precision must not be negative"
         )));
     }
-    let p = raw[0];
-    if !(0..=MAX_TIMESTAMP_PRECISION).contains(&p) {
-        return Err(DdlError::UnsupportedDdl(format!(
-            "precision {p} must be between 0 and {MAX_TIMESTAMP_PRECISION}"
-        )));
+    Ok(p.min(MAX_TIMESTAMP_PRECISION))
+}
+
+// `INTERVAL_MASK` bits (datetime.h) and the typmod packing of timestamp.h.
+const INTERVAL_MONTH: i32 = 1 << 1;
+const INTERVAL_YEAR: i32 = 1 << 2;
+const INTERVAL_DAY: i32 = 1 << 3;
+const INTERVAL_HOUR: i32 = 1 << 10;
+const INTERVAL_MINUTE: i32 = 1 << 11;
+const INTERVAL_SECOND: i32 = 1 << 12;
+const INTERVAL_FULL_RANGE: i32 = 0x7FFF;
+const INTERVAL_FULL_PRECISION: i32 = 0xFFFF;
+
+/// `INTERVAL_TYPMOD(p, r)`.
+fn interval_typmod(precision: i32, range: i32) -> i32 {
+    (range << 16) | (precision & 0xFFFF)
+}
+
+/// `intervaltypmodin`: the grammar hands over `[fields]` or
+/// `[fields, precision]` (`interval(3)` is `[FULL_RANGE, 3]`, `interval
+/// day` is `[DAY]`, `interval day to second(2)` is `[DAY|…|SECOND, 2]`).
+/// The field mask must be one of the SQL-standard ranges; an unqualified
+/// `interval` over the full range with no precision is `-1`.
+fn encode_interval(raw: &[i32]) -> Result<Option<i32>, DdlError> {
+    let invalid = || DdlError::UnsupportedDdl("invalid INTERVAL type modifier".into());
+    let range = *raw.first().ok_or_else(invalid)?;
+    const VALID: [i32; 14] = [
+        INTERVAL_YEAR,
+        INTERVAL_MONTH,
+        INTERVAL_DAY,
+        INTERVAL_HOUR,
+        INTERVAL_MINUTE,
+        INTERVAL_SECOND,
+        INTERVAL_YEAR | INTERVAL_MONTH,
+        INTERVAL_DAY | INTERVAL_HOUR,
+        INTERVAL_DAY | INTERVAL_HOUR | INTERVAL_MINUTE,
+        INTERVAL_DAY | INTERVAL_HOUR | INTERVAL_MINUTE | INTERVAL_SECOND,
+        INTERVAL_HOUR | INTERVAL_MINUTE,
+        INTERVAL_HOUR | INTERVAL_MINUTE | INTERVAL_SECOND,
+        INTERVAL_MINUTE | INTERVAL_SECOND,
+        INTERVAL_FULL_RANGE,
+    ];
+    if !VALID.contains(&range) {
+        return Err(invalid());
     }
-    Ok(p)
+    match raw {
+        [_] if range == INTERVAL_FULL_RANGE => Ok(None),
+        [_] => Ok(Some(interval_typmod(INTERVAL_FULL_PRECISION, range))),
+        [_, p] => {
+            if *p < 0 {
+                return Err(DdlError::UnsupportedDdl(format!(
+                    "INTERVAL({p}) precision must not be negative"
+                )));
+            }
+            // Above the maximum PG warns and clamps.
+            Ok(Some(interval_typmod(
+                (*p).min(MAX_TIMESTAMP_PRECISION),
+                range,
+            )))
+        }
+        _ => Err(invalid()),
+    }
 }
 
 fn encode_vector(raw: &[i32]) -> Result<i32, DdlError> {
@@ -258,7 +361,7 @@ pub fn check_literal_assignment(
                     type_oid,
                     snapshot.get_type(type_oid).map(|t| t.typname.as_str())
                 ),
-                (builtin_oid::VARCHAR | builtin_oid::BPCHAR, _) | (_, Some("char"))
+                (builtin_oid::VARCHAR | builtin_oid::BPCHAR, _)
             ) =>
         {
             let s = string_literal(value)?;

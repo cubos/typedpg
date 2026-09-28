@@ -744,10 +744,11 @@ pub(crate) fn infer_expr(
             };
             // The `(n)` precision variants carry a typmod; the base type is
             // unchanged. Forward it so e.g. `current_time(3)` keeps its typmod.
-            // (PG additionally range-checks the precision via
-            // `any{time,timestamp}_typmod_check`; we don't — that's the same
-            // per-value validation family we defer elsewhere.)
-            let typmod = (svf.typmod >= 0).then_some(svf.typmod);
+            // PG's transformSQLValueFunction runs it through
+            // `any{time,timestamp}_typmod_check`, which only warns above the
+            // maximum and clamps (`CURRENT_TIMESTAMP(7)` is timestamptz(6)).
+            let typmod =
+                (svf.typmod >= 0).then_some(svf.typmod.min(crate::typmod::MAX_TIMESTAMP_PRECISION));
             // `CURRENT_SCHEMA` evaluates `current_schema()`, which is NULL
             // when no schema on the search path exists.
             let nullable = op == Op::SvfopCurrentSchema;
