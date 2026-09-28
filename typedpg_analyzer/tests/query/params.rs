@@ -1024,3 +1024,95 @@ fn escape_string_does_not_swallow_params() {
     let s = db.analyze("SELECT E'it\\'s' || $p1 FROM users").unwrap();
     assert_params(&s, vec![p(text())]);
 }
+
+// ── BETWEEN / IN / ARRAY[…]::T[] context typing (transformAExprBetween,
+//    transformAExprIn, transformArrayExpr) ────────────────────────────────
+
+#[test]
+fn param_typed_by_between_in_list_and_array_cast() {
+    // Parameter types as reported by PG 18's pg_prepared_statements.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE t (n int NOT NULL, s text NOT NULL, ni int);")
+        .unwrap();
+    for (sql, expected) in [
+        ("SELECT $p BETWEEN 1 AND 5 AS a", vec![int4()]),
+        ("SELECT $p IN (1, 2) AS a", vec![int4()]),
+        ("SELECT $p IN (n, 2) AS a FROM t", vec![int4()]),
+        ("SELECT $p NOT IN (n, ni) AS a FROM t", vec![int4()]),
+        ("SELECT ARRAY[$p]::int[] AS a", vec![int4()]),
+        ("SELECT ARRAY[$p, $q]::int8[] AS a", vec![int8(), int8()]),
+        ("SELECT ARRAY[ARRAY[$p]]::int[] AS a", vec![int4()]),
+        ("SELECT $p IN (1, 2.5) AS a", vec![numeric()]),
+        ("SELECT $p BETWEEN SYMMETRIC 1 AND 2.5 AS a", vec![int4()]),
+        (
+            "SELECT n BETWEEN $a AND $b AS a FROM t",
+            vec![int4(), int4()],
+        ),
+        ("SELECT n IN ($a, $b) AS a FROM t", vec![int4(), int4()]),
+        ("SELECT ARRAY[$p, 1] AS a", vec![int4()]),
+    ] {
+        let s = db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let got: Vec<_> = s.params.iter().map(|p| p.pg_type.clone()).collect();
+        assert_eq!(got, expected, "{sql}");
+    }
+    let s = db
+        .analyze("SELECT ARRAY[]::int[] AS a, ARRAY[1.5]::int[] AS b, ARRAY[true]::int[] AS c")
+        .unwrap();
+    assert_cols(
+        &s,
+        vec![
+            c("a", array_of(int4())),
+            c("b", array_of(int4())),
+            c("c", array_of(int4())),
+        ],
+    );
+}
+
+#[test]
+fn between_and_in_list_errors_come_from_the_rewritten_comparisons() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE t (n int NOT NULL, s text NOT NULL);")
+        .unwrap();
+    assert_err_prefix!(
+        db.analyze("SELECT s BETWEEN 1 AND 2 FROM t"),
+        AnalyzeError::UndefinedOperator(_),
+        "operator does not exist: text >= integer"
+    );
+    assert_err_prefix!(
+        db.analyze("SELECT s IN (1, 2) FROM t"),
+        AnalyzeError::UndefinedOperator(_),
+        "operator does not exist: text = integer"
+    );
+    assert_err_prefix!(
+        db.analyze("SELECT n IN ('a', 'b') FROM t"),
+        AnalyzeError::InvalidLiteral(_),
+        "invalid input syntax for type integer: \"a\""
+    );
+}
+
+#[test]
+fn array_constructor_type_errors_match_pg() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE t (n int NOT NULL, s text NOT NULL);")
+        .unwrap();
+    assert_err_prefix!(
+        db.analyze("SELECT ARRAY[]"),
+        AnalyzeError::IndeterminateType(_),
+        "cannot determine type of empty array"
+    );
+    assert_err_prefix!(
+        db.analyze("SELECT ARRAY[ARRAY[1], ARRAY['2']]"),
+        AnalyzeError::Invalid(_),
+        "ARRAY could not convert type text[] to integer[]"
+    );
+    assert_err_prefix!(
+        db.analyze("SELECT ARRAY[n, s] FROM t"),
+        AnalyzeError::DatatypeMismatch(_),
+        "ARRAY types integer and text cannot be matched"
+    );
+    assert_err_prefix!(
+        db.analyze("SELECT ARRAY[1, 'x']"),
+        AnalyzeError::InvalidLiteral(_),
+        "invalid input syntax for type integer: \"x\""
+    );
+}

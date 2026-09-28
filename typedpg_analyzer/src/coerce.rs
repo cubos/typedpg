@@ -376,15 +376,35 @@ pub(crate) fn can_cast_explicit(
 /// category mismatch — or a survivor some input can't implicitly reach —
 /// yields `None`, which callers render as PG's "X and Y cannot be matched".
 pub(crate) fn find_common_type(types: &[PgTypeOid], snapshot: &PgCatalog) -> Option<PgTypeOid> {
+    select_common_type(types, snapshot).ok()
+}
+
+/// Why [`select_common_type`] found no common type — the two ways PG fails.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum CommonTypeError {
+    /// Two inputs of different categories (base types): select_common_type's
+    /// own `X types A and B cannot be matched`.
+    Mismatch(PgTypeOid, PgTypeOid),
+    /// Every category agrees, but input `from` has no implicit cast to the
+    /// selected type `to`: PG picks `to` and the later coerce_to_common_type
+    /// fails with `X could not convert type A to B`.
+    CannotConvert { from: PgTypeOid, to: PgTypeOid },
+}
+
+/// [`find_common_type`] with PG's failure detail.
+pub(crate) fn select_common_type(
+    types: &[PgTypeOid],
+    snapshot: &PgCatalog,
+) -> Result<PgTypeOid, CommonTypeError> {
     if types.is_empty() {
-        return None;
+        return Err(CommonTypeError::Mismatch(oid::UNKNOWN, oid::UNKNOWN));
     }
 
     // PG's first pass: when *every* input — unknowns/NULLs included — is the
     // exact same type, keep it as-is. This is the only path that preserves a
     // domain: `COALESCE(d, d)` is `d`.
     if types[0] != oid::UNKNOWN && types.iter().all(|&t| t == types[0]) {
-        return Some(types[0]);
+        return Ok(types[0]);
     }
 
     let concrete: Vec<PgTypeOid> = types
@@ -393,7 +413,7 @@ pub(crate) fn find_common_type(types: &[PgTypeOid], snapshot: &PgCatalog) -> Opt
         .filter(|&t| t != oid::UNKNOWN)
         .collect();
     if concrete.is_empty() {
-        return Some(oid::TEXT);
+        return Ok(oid::TEXT);
     }
 
     // Any mixed input — even just a NULL alongside a single domain — goes
@@ -406,20 +426,20 @@ pub(crate) fn find_common_type(types: &[PgTypeOid], snapshot: &PgCatalog) -> Opt
         .collect();
 
     if concrete.iter().all(|&t| t == concrete[0]) {
-        return Some(concrete[0]);
+        return Ok(concrete[0]);
     }
 
     let category = |t: PgTypeOid| snapshot.get_type(t).map(|ty| ty.typcategory);
     let preferred = |t: PgTypeOid| snapshot.get_type(t).is_some_and(|ty| ty.typispreferred);
 
     let mut ptype = concrete[0];
-    let pcategory = category(ptype)?;
+    let pcategory = category(ptype).ok_or(CommonTypeError::Mismatch(ptype, ptype))?;
     for &n in &concrete[1..] {
         if n == ptype {
             continue;
         }
         if category(n) != Some(pcategory) {
-            return None;
+            return Err(CommonTypeError::Mismatch(ptype, n));
         }
         if !preferred(ptype)
             && snapshot.has_implicit_cast(ptype, n)
@@ -429,15 +449,13 @@ pub(crate) fn find_common_type(types: &[PgTypeOid], snapshot: &PgCatalog) -> Opt
         }
     }
 
-    // PG defers this check to the per-value coercion step; folding it in here
-    // keeps the callers' single "cannot be matched" path for same-category
-    // pairs with no implicit route (e.g. two different enum types).
-    if concrete
+    // PG defers this check to the per-value coercion step (callers that only
+    // need a yes/no fold it into `None`; see `CommonTypeError`).
+    match concrete
         .iter()
-        .all(|&t| t == ptype || snapshot.has_implicit_cast(t, ptype))
+        .find(|&&t| t != ptype && !snapshot.has_implicit_cast(t, ptype))
     {
-        Some(ptype)
-    } else {
-        None
+        None => Ok(ptype),
+        Some(&from) => Err(CommonTypeError::CannotConvert { from, to: ptype }),
     }
 }

@@ -841,6 +841,27 @@ pub(crate) fn subscript_type_not_supported(type_name: &str, span: Option<SourceS
     )
 }
 
+/// `cannot determine type of empty array` — SQLSTATE 42P18: an `ARRAY[]`
+/// with no cast to give it a type.
+pub(crate) fn cannot_determine_type_of_empty_array(span: Option<SourceSpan>) -> RawError {
+    RawError::new(
+        AnalyzeError::IndeterminateType("cannot determine type of empty array".to_string()),
+        span,
+        Some("Explicitly cast to the desired type, for example ARRAY[]::integer[].".to_string()),
+    )
+}
+
+/// `<CONTEXT> could not convert type A to B` — SQLSTATE 42846
+/// (`cannot_coerce`, no dedicated variant): PG's coerce_to_common_type
+/// after select_common_type chose B for a construct (ARRAY, CASE, …).
+pub(crate) fn could_not_convert_type(context: &str, from: &str, to: &str) -> RawError {
+    RawError::new(
+        AnalyzeError::Invalid(format!("{context} could not convert type {from} to {to}")),
+        None,
+        None,
+    )
+}
+
 /// `array subscript must have type integer` — SQLSTATE 42804.
 pub(crate) fn array_subscript_must_be_integer(span: Option<SourceSpan>) -> RawError {
     RawError::new(

@@ -192,86 +192,66 @@ fn handle_distinct_from(
 }
 
 /// `expr [NOT] BETWEEN lo AND hi` (and the SYM variants) — rexpr is a
-/// `Node::List` holding the two bounds. The generic Pass 1 walks rexpr as a
-/// single expression, hits the `_` fallback for List, and silently drops any
-/// `$N` placeholders inside. Handle it up front: infer the lhs first, then
-/// re-enter each bound with the lhs type as the inference goal so param OIDs
-/// resolve correctly.
+/// `Node::List` holding the two bounds. PG's `transformAExprBetween`
+/// rewrites the construct into plain comparisons and transforms those:
+///
+/// - `a BETWEEN b AND c` → `a >= b AND a <= c`
+/// - `a NOT BETWEEN b AND c` → `a < b OR a > c`
+/// - `a BETWEEN SYMMETRIC b AND c` → `(a >= b AND a <= c) OR (a >= c AND a <= b)`
+/// - `a NOT BETWEEN SYMMETRIC b AND c` → `(a < b OR a > c) AND (a < c OR a > b)`
+///
+/// Each comparison goes through ordinary operator resolution, in that
+/// order, so an untyped side is typed by its peer (`$p BETWEEN 1 AND 5`
+/// pins `$p` to int4 in the first comparison).
 fn handle_between(
     expr: &protobuf::AExpr,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<Option<ExprType>, AnalyzeError> {
+    use protobuf::AExprKind as Kind;
+    let kind = protobuf::AExprKind::try_from(expr.kind);
     if !matches!(
-        protobuf::AExprKind::try_from(expr.kind),
-        Ok(protobuf::AExprKind::AexprBetween)
-            | Ok(protobuf::AExprKind::AexprNotBetween)
-            | Ok(protobuf::AExprKind::AexprBetweenSym)
-            | Ok(protobuf::AExprKind::AexprNotBetweenSym)
+        kind,
+        Ok(Kind::AexprBetween
+            | Kind::AexprNotBetween
+            | Kind::AexprBetweenSym
+            | Kind::AexprNotBetweenSym)
     ) {
         return Ok(None);
     }
-    let Ctx { snapshot, .. } = ctx;
-    let negated = matches!(
-        protobuf::AExprKind::try_from(expr.kind),
-        Ok(protobuf::AExprKind::AexprNotBetween) | Ok(protobuf::AExprKind::AexprNotBetweenSym)
-    );
-    let left = expr
-        .lexpr
-        .as_ref()
-        .map(|n| infer_expr(n, ctx, params, TypeGoal::NONE))
-        .transpose()?;
-    let left_oid = left.as_ref().map(|l| l.type_oid).unwrap_or(oid::UNKNOWN);
-
-    let mut any_bound_nullable = false;
-    if let Some(rexpr) = &expr.rexpr
-        && let Some(node::Node::List(list)) = rexpr.node.as_ref()
-    {
-        for (i, item) in list.items.iter().enumerate() {
-            // PG transforms `x BETWEEN lo AND hi` into `x >= lo AND x <= hi`
-            // (`x < lo OR x > hi` for NOT BETWEEN) and resolves each
-            // comparison operator independently — so a concrete bound only
-            // needs an operator overload, NOT a coercion to the lhs type
-            // (`age BETWEEN 18 AND 3.14` is valid: int4 <= numeric exists).
-            // An UNKNOWN bound is assumed to be the lhs type (pins params,
-            // validates literal content).
-            let t = infer_expr(item, ctx, params, TypeGoal::NONE)?;
-            any_bound_nullable = any_bound_nullable || t.nullable;
-            if left_oid == oid::UNKNOWN {
-                continue;
-            }
-            if t.type_oid == oid::UNKNOWN {
-                coerce_unknown_to(item, ctx, params, snapshot.unwrap_domain(left_oid))?;
-            } else {
-                let op = match (negated, i) {
-                    (false, 0) => ">=",
-                    (false, _) => "<=",
-                    (true, 0) => "<",
-                    (true, _) => ">",
-                };
-                if snapshot
-                    .find_operator(op, Some(left_oid), t.type_oid)
-                    .is_none()
-                {
-                    let l = crate::ddl::util::format_type_for_message(snapshot, left_oid);
-                    let r = crate::ddl::util::format_type_for_message(snapshot, t.type_oid);
-                    return Err(
-                        crate::pgmsg::operator_does_not_exist(&l, op, &r, None).finalize_implicit()
-                    );
-                }
-            }
-        }
+    let (Some(a), Some(rexpr)) = (expr.lexpr.as_deref(), expr.rexpr.as_deref()) else {
+        return Err(AnalyzeError::Internal("BETWEEN without operands".into()));
+    };
+    let Some(node::Node::List(list)) = rexpr.node.as_ref() else {
+        return Err(AnalyzeError::Internal(
+            "BETWEEN bounds are not a list".into(),
+        ));
+    };
+    let [b, c] = list.items.as_slice() else {
+        return Err(AnalyzeError::Internal("BETWEEN needs two bounds".into()));
+    };
+    let comparisons: &[(&str, &protobuf::Node)] = match kind {
+        Ok(Kind::AexprBetween) => &[(">=", b), ("<=", c)],
+        Ok(Kind::AexprNotBetween) => &[("<", b), (">", c)],
+        Ok(Kind::AexprBetweenSym) => &[(">=", b), ("<=", c), (">=", c), ("<=", b)],
+        _ => &[("<", b), (">", c), ("<", c), (">", b)],
+    };
+    let mut nullable = false;
+    for &(op, bound) in comparisons {
+        let t = infer_synthetic_op(op, a, bound, expr.location, ctx, params)?;
+        nullable |= t.nullable;
     }
-
-    let any_nullable = left.as_ref().is_some_and(|l| l.nullable) || any_bound_nullable;
-    Ok(Some(ExprType::scalar(oid::BOOL, any_nullable)))
+    Ok(Some(ExprType::scalar(oid::BOOL, nullable)))
 }
 
-/// `col IN ($1, $2, ...)` / `col NOT IN (...)`: rexpr is a Node::List whose
-/// items need to be inferred with the left side's type as the goal so any
-/// untyped params inside the list get their OID resolved. The generic Pass 1
-/// calls `infer_expr` on the List node itself, which hits the `_` fallback and
-/// silently errors (swallowed by the WHERE-clause helper).
+/// `a IN (x, y, …)` / `a NOT IN (…)` (pg_query tags NOT IN with op `<>`) —
+/// PG's `transformAExprIn`. When more than one list item is free of Vars of
+/// the current query level, PG tries to fold those into one
+/// `a op ANY(ARRAY[…])`: it selects the common type of `a` and those items
+/// (`a` first, so it wins ties such as all-unknown items), coerces them to
+/// it and resolves `a op common`. Every other item (all of them when that
+/// fails) becomes its own `a op item` comparison, resolved like any binary
+/// operator — which is what types `$p` in `$p IN (n, 2)` as int4.
 fn handle_in_list(
     expr: &protobuf::AExpr,
     ctx: Ctx<'_>,
@@ -284,47 +264,123 @@ fn handle_in_list(
         return Ok(None);
     }
     let Ctx { snapshot, .. } = ctx;
-    let left = expr
-        .lexpr
-        .as_ref()
-        .map(|n| infer_expr(n, ctx, params, TypeGoal::NONE))
-        .transpose()?;
-    let left_oid = left.as_ref().map(|l| l.type_oid).unwrap_or(oid::UNKNOWN);
-
-    // PG transforms `x IN (a, b)` into `x = a OR x = b` (resolved per item;
-    // `<>` for NOT IN, which pg_query tags with op name "<>"). A concrete
-    // item only needs an operator overload — coercing it to the lhs type
-    // would wrongly reject `age IN (18, 3.14)`. UNKNOWN items are assumed
-    // to be the lhs type (pins params, validates literal content).
+    let (Some(a), Some(rexpr)) = (expr.lexpr.as_deref(), expr.rexpr.as_deref()) else {
+        return Err(AnalyzeError::Internal("IN without operands".into()));
+    };
+    let Some(node::Node::List(list)) = rexpr.node.as_ref() else {
+        return Err(AnalyzeError::Internal("IN list is not a list".into()));
+    };
     let op_name = extract_string_fields(&expr.name).join(".");
     let op = if op_name == "<>" { "<>" } else { "=" };
-    let mut any_right_nullable = false;
-    if let Some(rexpr) = &expr.rexpr
-        && let Some(node::Node::List(list)) = rexpr.node.as_ref()
-    {
-        for item in &list.items {
-            let t = infer_expr(item, ctx, params, TypeGoal::NONE)?;
-            any_right_nullable = any_right_nullable || t.nullable;
-            if left_oid == oid::UNKNOWN {
-                continue;
-            }
-            if t.type_oid == oid::UNKNOWN {
-                coerce_unknown_to(item, ctx, params, snapshot.unwrap_domain(left_oid))?;
-            } else if snapshot
-                .find_operator(op, Some(left_oid), t.type_oid)
-                .is_none()
-            {
-                let l = crate::ddl::util::format_type_for_message(snapshot, left_oid);
-                let r = crate::ddl::util::format_type_for_message(snapshot, t.type_oid);
-                return Err(
-                    crate::pgmsg::operator_does_not_exist(&l, op, &r, None).finalize_implicit()
-                );
-            }
-        }
+
+    let left = infer_expr(a, ctx, params, TypeGoal::NONE)?;
+    let mut nullable = left.nullable;
+    let mut items = Vec::with_capacity(list.items.len());
+    for item in &list.items {
+        let t = infer_expr(item, ctx, params, TypeGoal::NONE)?;
+        nullable |= t.nullable;
+        items.push((item, t, contains_level0_column_ref(item)));
     }
 
-    let any_nullable = left.as_ref().is_some_and(|l| l.nullable) || any_right_nullable;
-    Ok(Some(ExprType::scalar(oid::BOOL, any_nullable)))
+    let nonvars: Vec<usize> = (0..items.len()).filter(|&i| !items[i].2).collect();
+    let mut folded = vec![false; items.len()];
+    if nonvars.len() > 1 {
+        let mut all = vec![left.type_oid];
+        all.extend(nonvars.iter().map(|&i| items[i].1.type_oid));
+        if let Some(common) = coerce::find_common_type(&all, snapshot)
+            && common != oid::RECORD
+            && snapshot.array_type_of(common).is_some()
+        {
+            for &i in &nonvars {
+                if items[i].1.type_oid == oid::UNKNOWN {
+                    coerce_unknown_to(items[i].0, ctx, params, common)?;
+                }
+                folded[i] = true;
+            }
+            // `a op ANY(common[])` resolves `a op common`.
+            infer_synthetic_op(op, a, &typed_null(common), expr.location, ctx, params)?;
+        }
+    }
+    for (i, (item, _, _)) in items.iter().enumerate() {
+        if !folded[i] {
+            infer_synthetic_op(op, a, item, expr.location, ctx, params)?;
+        }
+    }
+    Ok(Some(ExprType::scalar(oid::BOOL, nullable)))
+}
+
+/// Resolve `l op r` exactly as a written binary operator would be — the
+/// rewrite target of BETWEEN / IN (PG's `makeSimpleA_Expr` + transform).
+fn infer_synthetic_op(
+    op: &str,
+    l: &protobuf::Node,
+    r: &protobuf::Node,
+    location: i32,
+    ctx: Ctx<'_>,
+    params: &mut ParamCollector,
+) -> Result<ExprType, AnalyzeError> {
+    let e = protobuf::AExpr {
+        kind: protobuf::AExprKind::AexprOp as i32,
+        name: vec![protobuf::Node {
+            node: Some(node::Node::String(protobuf::String { sval: op.into() })),
+        }],
+        lexpr: Some(Box::new(l.clone())),
+        rexpr: Some(Box::new(r.clone())),
+        location,
+    };
+    infer_a_expr(&e, ctx, params)
+}
+
+/// A `NULL::T` node standing for "some value of type T" (the folded array
+/// element of an IN list).
+fn typed_null(t: PgTypeOid) -> protobuf::Node {
+    let null = protobuf::Node {
+        node: Some(node::Node::AConst(protobuf::AConst {
+            isnull: true,
+            ..Default::default()
+        })),
+    };
+    protobuf::Node {
+        node: Some(node::Node::TypeCast(Box::new(protobuf::TypeCast {
+            arg: Some(Box::new(null)),
+            type_name: Some(protobuf::TypeName {
+                type_oid: t.get(),
+                location: -1,
+                ..Default::default()
+            }),
+            location: -1,
+        }))),
+    }
+}
+
+/// Approximates PG's `contain_vars_of_level(expr, 0)`: a column reference
+/// outside any sub-select. (A correlated reference *inside* a sub-select
+/// would also count in PG; treating those items as Var-free only changes
+/// which IN items get folded together.)
+fn contains_level0_column_ref(n: &protobuf::Node) -> bool {
+    let any = |ns: &[protobuf::Node]| ns.iter().any(contains_level0_column_ref);
+    let opt =
+        |n: &Option<Box<protobuf::Node>>| n.as_deref().is_some_and(contains_level0_column_ref);
+    match n.node.as_ref() {
+        Some(node::Node::ColumnRef(_)) => true,
+        Some(node::Node::AExpr(e)) => opt(&e.lexpr) || opt(&e.rexpr),
+        Some(node::Node::BoolExpr(b)) => any(&b.args),
+        Some(node::Node::FuncCall(f)) => any(&f.args) || opt(&f.agg_filter),
+        Some(node::Node::NamedArgExpr(na)) => opt(&na.arg),
+        Some(node::Node::TypeCast(c)) => opt(&c.arg),
+        Some(node::Node::CollateClause(c)) => opt(&c.arg),
+        Some(node::Node::NullTest(t)) => opt(&t.arg),
+        Some(node::Node::BooleanTest(t)) => opt(&t.arg),
+        Some(node::Node::CoalesceExpr(c)) => any(&c.args),
+        Some(node::Node::MinMaxExpr(m)) => any(&m.args),
+        Some(node::Node::RowExpr(r)) => any(&r.args),
+        Some(node::Node::AArrayExpr(a)) => any(&a.elements),
+        Some(node::Node::AIndirection(i)) => opt(&i.arg),
+        Some(node::Node::List(l)) => any(&l.items),
+        Some(node::Node::CaseExpr(c)) => opt(&c.arg) || any(&c.args) || opt(&c.defresult),
+        Some(node::Node::CaseWhen(w)) => opt(&w.expr) || opt(&w.result),
+        _ => false,
+    }
 }
 
 /// `col = ANY($arr)` / `col = ALL($arr)`: lexpr is scalar, rexpr is array.

@@ -277,88 +277,176 @@ fn resolve_composite_field(
     ))
 }
 
-/// `ARRAY[expr1, expr2, …]` literal — result type is the common element type
-/// promoted to its array. Empty arrays fall back to `UNKNOWN` so that the
-/// enclosing cast (`ARRAY[]::text[]`) takes over.
+/// `ARRAY[expr1, expr2, …]` with no target type (see [`transform_array_expr`]).
 pub(crate) fn infer_array_expr(
     arr: &protobuf::AArrayExpr,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<ExprType, AnalyzeError> {
+    transform_array_expr(arr, ctx, params, None)
+}
+
+/// The array type an `ARRAY[…]` is being cast to (`ARRAY[…]::T[]`): the
+/// (domain-unwrapped) array type, its element type, and the target typmod.
+#[derive(Clone, Copy)]
+pub(crate) struct ArrayTarget {
+    pub array_type: PgTypeOid,
+    pub element_type: PgTypeOid,
+    pub typmod: Option<i32>,
+}
+
+/// PG's `transformArrayExpr` (parse_expr.c). Elements that are themselves
+/// `ARRAY[…]` (or any array-typed value, except `int2vector`/`oidvector`)
+/// make the result multi-dimensional, and the element type is then the
+/// sub-arrays' array type.
+///
+/// - With a `target` (the array is the operand of a cast to an array type,
+///   see `transformTypeCast`), every element is coerced *explicitly* to the
+///   target element type (the target array type for sub-arrays): an
+///   untyped element or `$N` takes that type, a typed one needs an explicit
+///   cast path (`cannot cast type X to Y`). `ARRAY[]::int[]` is fine.
+/// - Without one, the element type is the common type of the elements
+///   (`ARRAY types X and Y cannot be matched` / `ARRAY could not convert
+///   type X to Y`), and an empty `ARRAY[]` is `cannot determine type of
+///   empty array`.
+///
+/// The result's typmod is the one every element agrees on (PG's
+/// `exprTypmod` of an ArrayExpr), or the target's.
+pub(crate) fn transform_array_expr(
+    arr: &protobuf::AArrayExpr,
+    ctx: Ctx<'_>,
+    params: &mut ParamCollector,
+    target: Option<ArrayTarget>,
+) -> Result<ExprType, AnalyzeError> {
     let Ctx { snapshot, .. } = ctx;
-    if arr.elements.is_empty() {
-        return Ok(ExprType::scalar(oid::UNKNOWN, false));
-    }
-    let mut element_types = Vec::with_capacity(arr.elements.len());
-    let mut any_nullable = false;
+    let mut elems = Vec::with_capacity(arr.elements.len());
+    let mut multidims = false;
     for elem in &arr.elements {
-        let t = infer_expr(elem, ctx, params, TypeGoal::NONE)?;
-        element_types.push(t.type_oid);
-        any_nullable |= t.nullable;
+        let t = if let Some(node::Node::AArrayExpr(sub)) = elem.node.as_ref() {
+            multidims = true;
+            transform_array_expr(sub, ctx, params, target)?
+        } else {
+            let t = infer_expr(elem, ctx, params, TypeGoal::NONE)?;
+            if !multidims
+                && !matches!(
+                    snapshot.get_type(t.type_oid).map(|e| e.typname.as_str()),
+                    Some("int2vector" | "oidvector")
+                )
+                && snapshot
+                    .get_type(t.type_oid)
+                    .is_some_and(|e| e.typcategory == TypCategory::Array && e.typelem.is_some())
+            {
+                multidims = true;
+            }
+            t
+        };
+        elems.push(t);
     }
-    let common = match coerce::find_common_type(&element_types, snapshot) {
-        Some(t) => t,
+
+    let name = |t: PgTypeOid| crate::ddl::util::format_type_for_message(snapshot, t);
+    let (array_type, coerce_type, hard) = match target {
+        Some(tg) => (
+            tg.array_type,
+            if multidims {
+                tg.array_type
+            } else {
+                tg.element_type
+            },
+            true,
+        ),
         None => {
-            // PG: `ARRAY types <X> and <Y> cannot be matched`. Use the
-            // first two distinct concrete types in the message so the
-            // diagnostic is stable regardless of ordering tie-breaks.
-            let mut concrete: Vec<PgTypeOid> = element_types
-                .iter()
-                .copied()
-                .filter(|&t| t != oid::UNKNOWN)
-                .collect();
-            concrete.dedup();
-            let names: Vec<String> = concrete
-                .iter()
-                .take(2)
-                .map(|&t| crate::ddl::util::format_type_for_message(snapshot, t))
-                .collect();
-            // PG (SQLSTATE 42804) emits this exactly as `ARRAY types A and
-            // B cannot be matched`. We keep the same wording so the
-            // `pglite_sanity` mirror passes; demote to `Invalid` so the
-            // generic `type mismatch: …` prefix from `TypeMismatch::Display`
-            // doesn't leak in front of it.
-            let a = names.first().map(String::as_str).unwrap_or("?");
-            let b = names.get(1).map(String::as_str).unwrap_or("?");
-            return Err(crate::pgmsg::types_cannot_be_matched(
+            if elems.is_empty() {
+                return Err(crate::pgmsg::cannot_determine_type_of_empty_array(
+                    crate::error::SourceSpan::from_location(arr.location),
+                )
+                .finalize_implicit());
+            }
+            let types: Vec<PgTypeOid> = elems.iter().map(|t| t.type_oid).collect();
+            let common = match coerce::select_common_type(&types, snapshot) {
+                Ok(t) => t,
+                Err(coerce::CommonTypeError::Mismatch(a, b)) => {
+                    let (a, b) = (name(a), name(b));
+                    return Err(crate::pgmsg::types_cannot_be_matched(
+                        "ARRAY",
+                        &a,
+                        &b,
+                        "",
+                        Some(format!(
+                            "cast the elements to a common type, e.g. `elem::{a}`"
+                        )),
+                    )
+                    .finalize_implicit());
+                }
+                Err(coerce::CommonTypeError::CannotConvert { from, to }) => {
+                    return Err(crate::pgmsg::could_not_convert_type(
+                        "ARRAY",
+                        &name(from),
+                        &name(to),
+                    )
+                    .finalize_implicit());
+                }
+            };
+            let array_type = if multidims {
+                if snapshot.get_type(common).and_then(|t| t.typelem).is_none() {
+                    return Err(AnalyzeError::UndefinedObject(format!(
+                        "could not find element type for data type {}",
+                        name(common)
+                    )));
+                }
+                common
+            } else {
+                snapshot
+                    .array_type_of(common)
+                    .ok_or_else(|| crate::pgmsg::no_array_type_for(&name(common)))?
+            };
+            (array_type, common, false)
+        }
+    };
+
+    for (elem, t) in arr.elements.iter().zip(&elems) {
+        if t.type_oid == oid::UNKNOWN {
+            coerce_unknown_to(elem, ctx, params, coerce_type)?;
+        } else if hard {
+            if !coerce::can_cast_explicit(t.type_oid, coerce_type, snapshot) {
+                let span = crate::error::node_location(elem)
+                    .and_then(crate::error::SourceSpan::from_node_qname);
+                return Err(crate::error::RawError::invalid(
+                    format!(
+                        "cannot cast type {} to {}",
+                        name(t.type_oid),
+                        name(coerce_type)
+                    ),
+                    span,
+                    None,
+                )
+                .finalize_implicit());
+            }
+        } else if t.type_oid != coerce_type
+            && !can_coerce(t.type_oid, coerce_type, CoercionContext::Implicit, snapshot)
+        {
+            return Err(crate::pgmsg::could_not_convert_type(
                 "ARRAY",
-                a,
-                b,
-                "",
-                Some(format!(
-                    "cast the elements to a common type, e.g. `elem::{a}`"
-                )),
+                &name(t.type_oid),
+                &name(coerce_type),
             )
             .finalize_implicit());
         }
-    };
-    // Pass 2: back-fill UNKNOWN elements with the resolved common type so
-    // embedded params get pinned and string-literal contents are validated
-    // (PG rejects `ARRAY[1, 'x']` at parse time with `invalid input syntax`).
-    if common != oid::UNKNOWN {
-        for (elem, &t) in arr.elements.iter().zip(&element_types) {
-            if t == oid::UNKNOWN {
-                coerce_unknown_to(elem, ctx, params, common)?;
-            }
-        }
     }
-    // PG collapses array dimensions into the same type OID:
-    // `ARRAY[ARRAY[1,2], ARRAY[3,4]]` is `int4[]`, not `int4[][]`. So if the
-    // common element type is already an array, reuse it instead of trying to
-    // wrap it (`array_type_of` on an array type returns `None`).
-    let common_is_array = snapshot
-        .get_type(common)
-        .is_some_and(|t| t.typcategory == TypCategory::Array);
-    let array_oid = if common_is_array {
-        common
-    } else {
-        snapshot.array_type_of(common).unwrap_or(oid::UNKNOWN)
+
+    let typmod = match (target, elems.first()) {
+        (_, None) => None,
+        (Some(tg), _) => tg.typmod,
+        // Coercing an element to a different type drops its typmod, so only
+        // elements already of the common type can agree on one.
+        (None, Some(first)) => elems
+            .iter()
+            .all(|t| t.type_oid == coerce_type && t.typmod == first.typmod)
+            .then_some(first.typmod)
+            .flatten(),
     };
     // An ARRAY[...] constructor is never NULL itself — it's always at least
-    // an empty array. Element nullability is tracked separately by Rust's
-    // `Option<T>` inside `Vec<T>`.
-    let _ = any_nullable;
-    Ok(ExprType::scalar(array_oid, false))
+    // an empty array.
+    Ok(ExprType::scalar_with_typmod(array_type, false, typmod))
 }
 
 /// The leading run of consecutive `[…]` steps of an indirection list.

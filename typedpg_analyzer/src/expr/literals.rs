@@ -66,6 +66,15 @@ pub(crate) fn infer_type_cast(
         .ok_or_else(|| AnalyzeError::Unsupported("TypeCast without arg".into()))?;
 
     let target_oid = resolve_type_name(cast.type_name.as_ref(), snapshot)?;
+    // typenameTypeIdAndMod: the target's typmod is resolved (and validated)
+    // before the operand is transformed.
+    let written_typmod = match cast.type_name.as_ref() {
+        Some(tn) if !tn.typmods.is_empty() => {
+            crate::typmod::encode(snapshot, target_oid, &tn.typmods)
+                .map_err(|e| AnalyzeError::Invalid(e.to_string()))?
+        }
+        _ => None,
+    };
 
     // PG validates the *content* of an untyped string literal against the
     // target's input function at parse time (`'x'::int` fails prepare with
@@ -100,7 +109,36 @@ pub(crate) fn infer_type_cast(
         }
         _ => TypeGoal::NONE,
     };
-    let inner_type = infer_expr(inner, ctx, params, inner_goal)?;
+    // transformTypeCast: an `ARRAY[…]` operand of a cast to an array type
+    // (or a domain over one) is transformed against the target's element
+    // type, so its untyped elements and params take that type
+    // (`ARRAY[$1]::int[]` makes `$1` an integer).
+    let target_base = snapshot.unwrap_domain(target_oid);
+    let array_target = match inner.node.as_ref() {
+        Some(node::Node::AArrayExpr(arr)) => snapshot
+            .get_type(target_base)
+            .filter(|t| t.typcategory == TypCategory::Array)
+            .and_then(|t| t.typelem)
+            .map(|element_type| {
+                (
+                    arr,
+                    ArrayTarget {
+                        array_type: target_base,
+                        element_type,
+                        typmod: if target_base == target_oid {
+                            written_typmod
+                        } else {
+                            snapshot.effective_typmod(target_oid, None)
+                        },
+                    },
+                )
+            }),
+        _ => None,
+    };
+    let inner_type = match array_target {
+        Some((arr, target)) => transform_array_expr(arr, ctx, params, Some(target))?,
+        None => infer_expr(inner, ctx, params, inner_goal)?,
+    };
 
     if let Some(node::Node::ParamRef(p)) = inner.node.as_ref()
         && params.get(p.number) == oid::UNKNOWN
@@ -131,10 +169,7 @@ pub(crate) fn infer_type_cast(
     // When the cast omits typmods (`x::T`), keep the operand's typmod only
     // when the type OID is unchanged — coercing across types strips it.
     let target_typmod = match cast.type_name.as_ref() {
-        Some(tn) if !tn.typmods.is_empty() => {
-            crate::typmod::encode(snapshot, target_oid, &tn.typmods)
-                .map_err(|e| AnalyzeError::Invalid(e.to_string()))?
-        }
+        Some(tn) if !tn.typmods.is_empty() => written_typmod,
         _ if target_oid == inner_type.type_oid => inner_type.typmod,
         _ => None,
     };
