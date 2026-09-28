@@ -382,10 +382,23 @@ fn resolve_fk_target(
         nums
     };
 
-    // PG: referenced columns must be covered by a UNIQUE/PK constraint
-    // (set-equality).
+    // transformFkeyCheckAttrs: the referenced columns must be exactly the
+    // key of a unique, non-partial, non-expression index (a PRIMARY KEY /
+    // UNIQUE constraint's, or a plain CREATE UNIQUE INDEX).
     let target_set: std::collections::BTreeSet<i16> = target_attnums.iter().copied().collect();
-    let covered = interp.pg_constraint.values().any(|x| {
+    let covered = interp.pg_index.values().any(|idx| {
+        idx.indrelid == target_oid
+            && idx.indisunique
+            && idx.indpred.is_none()
+            && idx.indexprs.is_empty()
+            && idx.indkey[..usize::try_from(idx.indnkeyatts)
+                .unwrap_or(0)
+                .min(idx.indkey.len())]
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                == target_set
+    }) || interp.pg_constraint.values().any(|x| {
         x.conrelid == target_oid
             && matches!(x.contype, ConType::PrimaryKey | ConType::Unique)
             && x.conkey

@@ -703,3 +703,35 @@ fn unnamed_indexes_are_named_like_pg() {
     )
     .unwrap();
 }
+
+#[test]
+fn create_unique_index_is_not_a_constraint() {
+    // PG 18: a plain unique index is an ON CONFLICT (a) arbiter and an FK
+    // target, but not a constraint: ON CONSTRAINT / DROP CONSTRAINT by its
+    // name fail with 42704.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE u (a int);
+         CREATE UNIQUE INDEX ui ON u (a);
+         CREATE TABLE r (x int REFERENCES u (a));",
+    )]);
+    db.analyze("INSERT INTO u VALUES (1) ON CONFLICT (a) DO NOTHING")
+        .unwrap();
+    let err = db
+        .analyze("INSERT INTO u VALUES (1) ON CONFLICT ON CONSTRAINT ui DO NOTHING")
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("constraint \"ui\" for table \"u\" does not exist"),
+        "{err}"
+    );
+    assert_ddl_err!(
+        try_apply(&[(
+            "0001.sql",
+            "CREATE TABLE u (a int); CREATE UNIQUE INDEX ui ON u (a);
+             ALTER TABLE u DROP CONSTRAINT ui;",
+        )]),
+        DdlError::DependencyError(_),
+        "constraint \"ui\" of relation \"u\" does not exist",
+    );
+}

@@ -7,11 +7,10 @@
 //!
 //! 1. **Volatility check** — PG forbids VOLATILE callees in expression
 //!    indexes, since the index would otherwise never agree with itself.
-//! 2. **`pg_constraint` for `ON CONFLICT`** — PG treats a non-partial
-//!    `UNIQUE INDEX` on column names exactly like a `UNIQUE` constraint
-//!    for the purposes of `ON CONFLICT (cols)` matching, so we mirror
-//!    that here. Partial unique indexes (with a `WHERE`) are *not*
-//!    valid `ON CONFLICT` targets and so we deliberately skip them.
+//! 2. **`ON CONFLICT` / FOREIGN KEY targets** — a unique index (with its
+//!    key columns, expressions and partial-index predicate) is what arbiter
+//!    inference and FK target checks match against. Like PG, a plain
+//!    `CREATE UNIQUE INDEX` creates no `pg_constraint` row.
 //! 3. **DROP INDEX / DROP TABLE cascade** — index rows live as their own
 //!    pg_class entries; dropping the underlying table tears down the
 //!    indexes via `pg_index.indrelid`.
@@ -22,10 +21,8 @@ use prost::Message;
 use super::DdlError;
 use super::util::range_var_names;
 use super::volatile::{ExprLocation, check_no_volatile};
-use crate::oid::{PgClassOid, PgConstraintOid};
-use crate::pg_catalog::{
-    AstBinding, ConType, PgCatalog, PgClass, PgConstraint, PgIndex, RelKind, SerializedAst,
-};
+use crate::oid::PgClassOid;
+use crate::pg_catalog::{AstBinding, PgCatalog, PgClass, PgIndex, RelKind, SerializedAst};
 
 pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError> {
     // ── Volatility check on expression indexes ──
@@ -144,39 +141,6 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
         indexprs,
         indpred,
     });
-
-    // ── pg_constraint emission for non-partial UNIQUE INDEX ──
-    //
-    // PG only treats a unique index as a valid `ON CONFLICT` target when
-    // it has no predicate (or a predicate that covers every row). A
-    // partial unique index `WHERE deleted_at IS NULL` doesn't qualify
-    // for the generic insert. By skipping rows with a `where_clause` we
-    // make `ON CONFLICT (slug)` correctly fail to find a match for a
-    // partial-unique-only schema.
-    if stmt.unique && stmt.where_clause.is_none() {
-        let idx = db.pg_index.get(&indexrelid).ok_or_else(|| {
-            DdlError::Internal(format!(
-                "create_index expects pg_index row for indexrelid={indexrelid} just inserted to be present"
-            ))
-        })?;
-        // Expression-based UNIQUE INDEXes never line up with a
-        // column-list ON CONFLICT, so skip those.
-        if idx.indexprs.is_empty() && !idx.indkey.is_empty() {
-            let conkey: Vec<i16> = idx.indkey.clone();
-            let oid = PgConstraintOid::from_nonzero(db.alloc_oid()?);
-            db.insert_pg_constraint(PgConstraint {
-                oid,
-                conname: conname.clone(),
-                conrelid: indrelid,
-                contype: ConType::Unique,
-                conkey,
-                confrelid: None,
-                confkey: Vec::new(),
-                conislocal: true,
-                coninhcount: 0,
-            });
-        }
-    }
 
     Ok(())
 }
