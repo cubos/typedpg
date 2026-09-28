@@ -110,8 +110,18 @@ pub(crate) fn analyze_cte(
                 }
             })
             .collect();
-        append_search_cycle_columns(cte, &mut unified, snapshot);
+        append_search_cycle_columns(cte, &mut unified, snapshot, params)?;
         return Ok(unified);
+    }
+
+    // PG (42601): SEARCH / CYCLE need a recursive query.
+    if cte.search_clause.is_some() || cte.cycle_clause.is_some() {
+        return Err(crate::error::RawError::new(
+            AnalyzeError::SyntaxError("WITH query is not recursive".into()),
+            None,
+            None,
+        )
+        .finalize_implicit());
     }
 
     match cte_query {
@@ -197,69 +207,113 @@ pub(crate) fn analyze_cte(
     }
 }
 
-/// Append synthetic columns introduced by `SEARCH BREADTH/DEPTH FIRST BY
-/// … SET col` and `CYCLE … SET mark USING path` clauses on a recursive
-/// CTE. PG defines each clause as adding one or two named, NOT NULL
-/// columns to the CTE's output:
+/// Validate a recursive CTE's `SEARCH` / `CYCLE` clauses and append the
+/// columns they add, following PG's `analyzeCTE` (parse_cte.c):
 ///
-/// - `SEARCH BFS BY k SET ord` → `ord record NOT NULL` (a row of
-///   `(integer, k...)` PG materializes during recursion).
-/// - `CYCLE k SET is_cycle USING path` → `is_cycle <mark_type> NOT NULL`
-///   (defaults to bool when the user didn't specify `TO/DEFAULT`) and
-///   `path record[] NOT NULL` (an array of `(k...)` rows).
+/// - every `SEARCH … BY` / `CYCLE` column must be one of the CTE's columns;
+/// - the mark and path column names must differ;
+/// - `SEARCH DEPTH FIRST BY k SET ord` adds `ord record[]` (the path of
+///   visited rows), `BREADTH FIRST` adds `ord record`;
+/// - `CYCLE k SET mark [TO v DEFAULT d] USING path` adds `mark` typed as the
+///   common type of `v` and `d` (`CYCLE types X and Y cannot be matched`
+///   otherwise; the grammar defaults them to `true` / `false`) and
+///   `path record[]`.
 ///
-/// Without this, downstream `SELECT id, ord, is_cycle, path FROM cte`
-/// fails with `column "ord" does not exist`.
+/// All added columns are NOT NULL.
 fn append_search_cycle_columns(
     cte: &protobuf::CommonTableExpr,
     cols: &mut Vec<ScopeColumn>,
     snapshot: &PgCatalog,
-) {
-    if let Some(search) = cte.search_clause.as_ref()
-        && !search.search_seq_column.is_empty()
-    {
-        cols.push(ScopeColumn {
-            name: search.search_seq_column.clone(),
-            type_oid: oid::RECORD,
-            base_not_null: true,
-            table_alias: cte.ctename.clone(),
-            typmod: None,
-            collation: None,
-            record_fields: None,
-        });
+    params: &mut ParamCollector,
+) -> Result<(), AnalyzeError> {
+    let syntax = |msg: String| {
+        crate::error::RawError::new(AnalyzeError::SyntaxError(msg), None, None).finalize_implicit()
+    };
+    let synthetic = |name: &str, type_oid: PgTypeOid| ScopeColumn {
+        name: name.to_owned(),
+        type_oid,
+        base_not_null: true,
+        table_alias: cte.ctename.clone(),
+        typmod: None,
+        collation: None,
+        record_fields: None,
+    };
+    let record_array = snapshot.array_type_of(oid::RECORD).unwrap_or(oid::UNKNOWN);
+    let mut added: Vec<ScopeColumn> = Vec::new();
+    if let Some(search) = cte.search_clause.as_ref() {
+        for name in expr::extract_string_fields(&search.search_col_list) {
+            if !cols.iter().any(|c| c.name == name) {
+                return Err(syntax(format!(
+                    "search column \"{name}\" not in WITH query column list"
+                )));
+            }
+        }
+        if !search.search_seq_column.is_empty() {
+            let seq_type = if search.search_breadth_first {
+                oid::RECORD
+            } else {
+                record_array
+            };
+            added.push(synthetic(&search.search_seq_column, seq_type));
+        }
     }
     if let Some(cycle) = cte.cycle_clause.as_ref() {
-        if !cycle.cycle_mark_column.is_empty() {
-            // PG: when `TO/DEFAULT` are omitted the mark column is bool;
-            // otherwise the AST exposes the inferred type via `cycle_mark_type`.
-            let mark_oid = PgTypeOid::new(cycle.cycle_mark_type).unwrap_or(oid::BOOL);
-            cols.push(ScopeColumn {
-                name: cycle.cycle_mark_column.clone(),
-                type_oid: mark_oid,
-                base_not_null: true,
-                table_alias: cte.ctename.clone(),
-                typmod: None,
-                collation: None,
-                record_fields: None,
-            });
+        for name in expr::extract_string_fields(&cycle.cycle_col_list) {
+            if !cols.iter().any(|c| c.name == name) {
+                return Err(syntax(format!(
+                    "cycle column \"{name}\" not in WITH query column list"
+                )));
+            }
         }
-        if !cycle.cycle_path_column.is_empty() {
-            // The path column is `record[]` — let `array_type_of(RECORD)`
-            // walk the snapshot's `pg_type.typarray` link instead of
-            // hardcoding the OID, mirroring how PG resolves the
-            // automatic `_record` array type.
-            let path_oid = snapshot.array_type_of(oid::RECORD).unwrap_or(oid::UNKNOWN);
-            cols.push(ScopeColumn {
-                name: cycle.cycle_path_column.clone(),
-                type_oid: path_oid,
-                base_not_null: true,
-                table_alias: cte.ctename.clone(),
-                typmod: None,
-                collation: None,
-                record_fields: None,
-            });
+        if cycle.cycle_mark_column == cycle.cycle_path_column {
+            return Err(syntax(
+                "cycle mark column name and cycle path column name are the same".into(),
+            ));
         }
+        let scope = Scope::default();
+        let null_ctx = NullabilityContext::default();
+        let ctx = expr::Ctx::new(&scope, &null_ctx, snapshot);
+        let values: Vec<&protobuf::Node> = [
+            cycle.cycle_mark_value.as_deref(),
+            cycle.cycle_mark_default.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let mut types = Vec::with_capacity(values.len());
+        for v in &values {
+            types.push(expr::infer_expr(v, ctx, params, TypeGoal::NONE)?.type_oid);
+        }
+        let mark_type = if types.is_empty() {
+            oid::BOOL
+        } else if types.iter().all(|&t| t == oid::UNKNOWN) {
+            // select_common_type resolves all-unknown inputs to text.
+            oid::TEXT
+        } else {
+            let concrete: Vec<PgTypeOid> = types
+                .iter()
+                .copied()
+                .filter(|&t| t != oid::UNKNOWN)
+                .collect();
+            crate::coerce::find_common_type(&concrete, snapshot).ok_or_else(|| {
+                let a = crate::ddl::util::format_type_for_message(snapshot, concrete[0]);
+                let b = crate::ddl::util::format_type_for_message(
+                    snapshot,
+                    *concrete.last().unwrap_or(&concrete[0]),
+                );
+                crate::pgmsg::types_cannot_be_matched("CYCLE", &a, &b, "", None).finalize_implicit()
+            })?
+        };
+        // Coercing the values to the mark type validates literal content
+        // (`TO 1 DEFAULT 'x'` → invalid input syntax for type integer).
+        for v in values {
+            expr::coerce_unknown_to(v, ctx, params, mark_type)?;
+        }
+        added.push(synthetic(&cycle.cycle_mark_column, mark_type));
+        added.push(synthetic(&cycle.cycle_path_column, record_array));
     }
+    cols.extend(added);
+    Ok(())
 }
 
 /// Rename `cols` using the `aliascolnames` from `WITH name(col1, col2) AS …`
