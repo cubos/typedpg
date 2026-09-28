@@ -25,6 +25,25 @@ fn create_function_basic() {
     assert_eq!(f.prorettype, int4_oid);
 }
 
+#[test]
+fn create_function_defaults_let_calls_omit_trailing_args() {
+    let snap = build(&[(
+        "0001.sql",
+        "CREATE FUNCTION f(a INT, b TEXT DEFAULT 'x', OUT o TEXT, c INT DEFAULT 1)
+             AS $$ SELECT b $$ LANGUAGE sql;",
+    )]);
+
+    // OUT parameters take no default and aren't counted.
+    assert_eq!(snap.find_functions(None, "f")[0].pronargdefaults, 2);
+    let s = snap
+        .analyze("SELECT f(1) AS one, f(1, 'y') AS two, f(1, 'y', 2) AS three")
+        .unwrap();
+    assert_cols(
+        &s,
+        vec![cn("one", text()), cn("two", text()), cn("three", text())],
+    );
+}
+
 // ── CREATE / DROP AGGREGATE ─────────────────────────────────────────────────
 
 #[test]

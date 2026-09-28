@@ -19,6 +19,9 @@ pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Res
     let mut proargmodes: Vec<ArgMode> = Vec::new();
     let mut proargnames: Vec<String> = Vec::new();
     let mut variadic_oid: Option<PgTypeOid> = None;
+    // Input parameters declared with a DEFAULT — PG only allows them as a
+    // trailing run, so the count alone locates them.
+    let mut pronargdefaults: i16 = 0;
     for param_node in &stmt.parameters {
         let Some(node::Node::FunctionParameter(fp)) = param_node.node.as_ref() else {
             continue;
@@ -43,6 +46,9 @@ pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Res
             FunctionParameterMode::FuncParamTable => ArgMode::Table,
         };
 
+        if fp.defexpr.is_some() && !matches!(arg_mode, ArgMode::Out | ArgMode::Table) {
+            pronargdefaults += 1;
+        }
         match arg_mode {
             ArgMode::In => proargtypes.push(resolved_oid),
             ArgMode::Variadic => {
@@ -197,7 +203,7 @@ pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Res
         proretset,
         provariadic: variadic_oid,
         proisstrict,
-        pronargdefaults: 0,
+        pronargdefaults,
         proallargtypes,
         proargmodes,
         proargnames,
