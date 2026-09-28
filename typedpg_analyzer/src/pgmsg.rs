@@ -169,6 +169,23 @@ pub(crate) fn too_many_column_aliases(alias: &str, available: usize, specified: 
     )
 }
 
+/// `join expression "j" has 4 columns available but 5 columns specified` —
+/// SQLSTATE 42P10 (`addRangeTableEntryForJoin`): an aliased JOIN's column
+/// alias list is longer than its output.
+pub(crate) fn too_many_join_column_aliases(
+    alias: &str,
+    available: usize,
+    specified: usize,
+) -> RawError {
+    RawError::new(
+        AnalyzeError::InvalidColumnReference(format!(
+            "join expression \"{alias}\" has {available} columns available but {specified} columns specified"
+        )),
+        None,
+        None,
+    )
+}
+
 /// `VALUES lists must all be the same length` — SQLSTATE 42601
 /// (`syntax_error`).
 pub(crate) fn values_lists_length(first_arity: usize, row_arity: usize) -> RawError {

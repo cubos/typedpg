@@ -222,3 +222,97 @@ fn several_unaliased_subqueries() {
         .unwrap();
     assert_cols(&s, vec![c("a", int4()), c("x", text())]);
 }
+
+// ── Aliased joins: `(a JOIN b …) AS j` ───────────────────────────────────────
+
+#[track_caller]
+fn assert_err_starts_with(db: &PgCatalog, sql: &str, expected: &str) {
+    let err = db.analyze(sql).unwrap_err();
+    assert!(
+        err.to_string().starts_with(expected),
+        "expected `{expected}` for `{sql}`, got: {err}"
+    );
+}
+
+#[test]
+fn aliased_join_is_one_from_entry() {
+    let db = setup();
+    let s = db
+        .analyze("SELECT j.a, j.x, b FROM (t JOIN u ON t.id = u.t_id) AS j")
+        .unwrap();
+    assert_cols(&s, vec![c("a", int4()), c("x", text()), cn("b", text())]);
+    // The column alias list renames the join's output, in PG's order.
+    let s = db
+        .analyze("SELECT j.* FROM (nn JOIN big ON true) AS j(p, q)")
+        .unwrap();
+    assert_cols(
+        &s,
+        vec![
+            cn("p", int4()),
+            c("q", int4()),
+            c("id", int8()),
+            cn("z", int4()),
+        ],
+    );
+    // Merged USING columns come first.
+    let s = db
+        .analyze("SELECT j.* FROM (t JOIN u USING (id)) AS j")
+        .unwrap();
+    assert_eq!(s.columns[0].name, "id");
+    // The alias may reuse an inner relation's name.
+    db.analyze("SELECT * FROM (t JOIN u ON true) AS t").unwrap();
+}
+
+#[test]
+fn aliased_join_keeps_its_outer_join_nullability() {
+    let db = setup();
+    let s = db
+        .analyze("SELECT j.x FROM (t LEFT JOIN u ON t.id = u.t_id) AS j")
+        .unwrap();
+    assert_cols(&s, vec![cn("x", text())]);
+    let s = db
+        .analyze("SELECT j.x FROM (t JOIN u ON t.id = u.t_id) AS j JOIN k ON j.a = k.a")
+        .unwrap();
+    assert_cols(&s, vec![c("x", text())]);
+}
+
+#[test]
+fn aliased_join_hides_the_relations_inside() {
+    let db = setup();
+    assert_err_starts_with(
+        &db,
+        "SELECT t.a FROM (t JOIN u ON t.id = u.t_id) AS j",
+        "invalid reference to FROM-clause entry for table \"t\"",
+    );
+    // `id` comes from both sides.
+    for sql in [
+        "SELECT j.id FROM (t JOIN u ON t.id = u.t_id) AS j",
+        "SELECT id FROM (t JOIN u ON t.id = u.t_id) AS j",
+    ] {
+        let err = db.analyze(sql).unwrap_err();
+        assert!(
+            matches!(err, AnalyzeError::AmbiguousColumn(_)),
+            "{sql}: {err:?}"
+        );
+        assert!(
+            err.to_string()
+                .starts_with("column reference \"id\" is ambiguous"),
+            "{sql}: {err}"
+        );
+    }
+}
+
+#[test]
+fn aliased_join_alias_errors() {
+    let db = setup();
+    assert_err_starts_with(
+        &db,
+        "SELECT * FROM (nn JOIN big ON true) AS j(a, b, c, d, e)",
+        "join expression \"j\" has 4 columns available but 5 columns specified",
+    );
+    assert_err_starts_with(
+        &db,
+        "SELECT * FROM (nn JOIN big ON true) AS j, (t JOIN u ON true) AS j",
+        "table name \"j\" specified more than once",
+    );
+}

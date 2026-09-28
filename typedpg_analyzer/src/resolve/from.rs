@@ -512,6 +512,7 @@ fn process_join_expr(
         other => return Err(AnalyzeError::UnsupportedJoinType(other as i32)),
     }
 
+    let merged_inserted = merged.is_some();
     if let Some(merged) = merged {
         // `USING (…) AS j` (PG 14) names the merged columns; otherwise they
         // live in an unreferencable synthetic source.
@@ -537,6 +538,65 @@ fn process_join_expr(
             },
         );
     }
+
+    if let Some(alias) = &join.alias {
+        let end = right.end + usize::from(merged_inserted);
+        alias_join(scope, null_ctx, alias, left.start, end)?;
+    }
+    Ok(())
+}
+
+/// `(a JOIN b …) AS j [(c1, …)]`, as PG's `transformFromClauseItem` /
+/// `addRangeTableEntryForJoin`: the join becomes one FROM entry `j` whose
+/// columns are its output — merged USING columns, then the left side's,
+/// then the right side's — renamed by the alias list, with the join's
+/// nullability baked in. The entries inside are no longer referencable
+/// (`a.x` → `invalid reference to FROM-clause entry for table "a"`), and a
+/// name repeated across the sides is ambiguous even as `j.id`.
+fn alias_join(
+    scope: &mut Scope,
+    null_ctx: &NullabilityContext,
+    alias: &protobuf::Alias,
+    start: usize,
+    end: usize,
+) -> Result<(), AnalyzeError> {
+    let inner: Vec<crate::scope::TableSource> = scope.sources.drain(start..end).collect();
+    let mut columns: Vec<ScopeColumn> = inner
+        .iter()
+        .flat_map(|s| s.visible_columns())
+        .map(|c| ScopeColumn {
+            base_not_null: !null_ctx.is_nullable(&c.table_alias, &c.name, c.base_not_null),
+            table_alias: alias.aliasname.clone(),
+            ..c.clone()
+        })
+        .collect();
+    let colnames = expr::extract_string_fields(&alias.colnames);
+    if colnames.len() > columns.len() {
+        return Err(crate::pgmsg::too_many_join_column_aliases(
+            &alias.aliasname,
+            columns.len(),
+            colnames.len(),
+        )
+        .finalize_implicit());
+    }
+    for (c, name) in columns.iter_mut().zip(colnames) {
+        c.name = name;
+    }
+    if scope.sources.iter().any(|s| s.alias == alias.aliasname) {
+        return Err(crate::pgmsg::duplicate_table_alias(&alias.aliasname).finalize_implicit());
+    }
+    scope.shadowed_sources.extend(
+        inner
+            .into_iter()
+            .filter(|s| !crate::scope::is_hidden_alias(&s.alias)),
+    );
+    scope.sources.insert(
+        start,
+        crate::scope::TableSource {
+            kind: crate::scope::SourceKind::Join,
+            ..crate::scope::TableSource::derived(&alias.aliasname, columns)
+        },
+    );
     Ok(())
 }
 
