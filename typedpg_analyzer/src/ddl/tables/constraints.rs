@@ -20,6 +20,19 @@ pub(crate) fn emit_constraints(
     let atttype_of = |name: &str| attinfo_by_name.get(name).map(|(_, t)| *t);
 
     let mut to_emit: Vec<PendingConstraint> = Vec::new();
+    // FOREIGN KEYs are resolved only after this table's own PRIMARY KEY /
+    // UNIQUE constraints exist, so a self-reference finds them — PG likewise
+    // adds FKs after creating the table and its indexes
+    // (transformFKConstraints queues them as ALTER TABLE ADD CONSTRAINT).
+    // `(constraint, local columns, their types, their attnums, default name)`.
+    type PendingFk<'a> = (
+        &'a pg_query::protobuf::Constraint,
+        Vec<String>,
+        Vec<PgTypeOid>,
+        Vec<i16>,
+        String,
+    );
+    let mut pending_fks: Vec<PendingFk> = Vec::new();
 
     // Column-level constraints.
     for elt in &stmt.table_elts {
@@ -65,15 +78,12 @@ pub(crate) fn emit_constraints(
                     ));
                 }
                 Ok(ConstrType::ConstrForeign) => {
-                    let local_names = [cd.colname.clone()];
-                    let (target_oid, target_attnums) =
-                        resolve_fk_target(interp, c, relname, &local_names, &[my_type])?;
-                    to_emit.push((
-                        constraint_name(&c.conname, || format!("{relname}_{}_fkey", cd.colname)),
-                        ConType::ForeignKey,
+                    pending_fks.push((
+                        c,
+                        vec![cd.colname.clone()],
+                        vec![my_type],
                         vec![an],
-                        Some(target_oid),
-                        target_attnums,
+                        format!("{relname}_{}_fkey", cd.colname),
                     ));
                 }
                 _ => {}
@@ -144,17 +154,8 @@ pub(crate) fn emit_constraints(
                     )));
                 }
                 let fk_columns: Vec<i16> = fk_names.iter().filter_map(|n| attnum_of(n)).collect();
-                let (target_oid, target_attnums) =
-                    resolve_fk_target(interp, c, relname, &fk_names, &local_types)?;
-                to_emit.push((
-                    constraint_name(&c.conname, || {
-                        format!("{relname}_{}_fkey", fk_names.join("_"))
-                    }),
-                    ConType::ForeignKey,
-                    fk_columns,
-                    Some(target_oid),
-                    target_attnums,
-                ));
+                let default_name = format!("{relname}_{}_fkey", fk_names.join("_"));
+                pending_fks.push((c, fk_names, local_types, fk_columns, default_name));
             }
             _ => {}
         }
@@ -163,6 +164,19 @@ pub(crate) fn emit_constraints(
     for (conname, contype, conkey, confrelid, confkey) in to_emit {
         emit_constraint_with_backing_index(
             interp, relid, conname, contype, conkey, confrelid, confkey,
+        )?;
+    }
+    for (c, local_names, local_types, conkey, default_name) in pending_fks {
+        let (target_oid, target_attnums) =
+            resolve_fk_target(interp, c, relname, &local_names, &local_types)?;
+        emit_constraint_with_backing_index(
+            interp,
+            relid,
+            constraint_name(&c.conname, || default_name),
+            ConType::ForeignKey,
+            conkey,
+            Some(target_oid),
+            target_attnums,
         )?;
     }
     Ok(())

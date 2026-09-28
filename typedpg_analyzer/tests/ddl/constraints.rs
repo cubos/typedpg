@@ -582,3 +582,29 @@ fn conflicting_null_declarations_are_rejected() {
         "{err}"
     );
 }
+
+// ── Self-referencing foreign keys ───────────────────────────────────────────
+
+#[test]
+fn self_referencing_foreign_keys_are_accepted() {
+    // PG 18: all three succeed — the table's own keys exist by the time
+    // its FOREIGN KEYs are added.
+    build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (id int PRIMARY KEY, parent int REFERENCES t(id));
+         CREATE TABLE t2 (id int PRIMARY KEY, parent int REFERENCES t2);
+         CREATE TABLE t3 (id int, u int UNIQUE, p int, FOREIGN KEY (p) REFERENCES t3(u));",
+    )]);
+}
+
+#[test]
+fn self_referencing_foreign_key_still_needs_a_key() {
+    assert_ddl_err!(
+        try_apply(&[(
+            "0001.sql",
+            "CREATE TABLE t4 (id int, p int REFERENCES t4(id));",
+        )]),
+        DdlError::DependencyError(_),
+        "there is no unique constraint matching given keys for referenced table \"t4\"",
+    );
+}
