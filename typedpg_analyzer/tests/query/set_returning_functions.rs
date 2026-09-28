@@ -121,3 +121,30 @@ fn select_list_srfs_in_lockstep_are_nullable() {
         .unwrap();
     assert_cols(&s, vec![cn("a", int4()), cn("b", int4())]);
 }
+
+// ── Composite-returning functions in FROM ────────────────────────────────────
+
+/// A row-type value does not enforce its table's NOT NULL constraints —
+/// PG 18: `SELECT * FROM jsonb_populate_record(NULL::t, '{}')` returns
+/// `id IS NULL` and `s IS NULL` both true.
+#[test]
+fn composite_srf_columns_ignore_table_not_null() {
+    let mut db = setup();
+    db.apply_sql(
+        "CREATE TABLE r (id int PRIMARY KEY, s text NOT NULL);
+         CREATE FUNCTION f_setof_r() RETURNS SETOF r AS $$ SELECT NULL::int, NULL::text $$ LANGUAGE sql;",
+    )
+    .unwrap();
+    let s = db
+        .analyze("SELECT * FROM jsonb_populate_record(NULL::r, '{}')")
+        .unwrap();
+    assert_cols(&s, vec![cn("id", int4()), cn("s", text())]);
+    let s = db
+        .analyze("SELECT id, s FROM jsonb_populate_recordset(NULL::r, '[{}]')")
+        .unwrap();
+    assert_cols(&s, vec![cn("id", int4()), cn("s", text())]);
+    let s = db.analyze("SELECT * FROM unnest(ARRAY[NULL::r])").unwrap();
+    assert_cols(&s, vec![cn("id", int4()), cn("s", text())]);
+    let s = db.analyze("SELECT * FROM f_setof_r()").unwrap();
+    assert_cols(&s, vec![cn("id", int4()), cn("s", text())]);
+}

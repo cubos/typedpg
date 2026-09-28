@@ -804,7 +804,13 @@ fn srf_function_columns(
             .map(|f| ScopeColumn {
                 name: f.attname.clone(),
                 type_oid: f.atttypid,
-                base_not_null: f.attnotnull || snapshot.type_is_not_null(f.atttypid),
+                // A row-type *value* does not enforce its relation's NOT
+                // NULL constraints — `jsonb_populate_record(NULL::t, '{}')`
+                // and a `RETURNS SETOF t` function can both yield NULL
+                // fields, and a NULL row reads as all-NULL fields. PG's
+                // function RTE (`addRangeTableEntryForFunction`) takes only
+                // the tuple descriptor's names and types.
+                base_not_null: false,
                 typmod: snapshot.effective_typmod(f.atttypid, f.atttypmod),
                 collation: f.attcollation,
                 table_alias: alias.to_owned(),
