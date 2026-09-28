@@ -282,3 +282,13 @@ fn alter_enum_add_value_if_not_exists_on_missing_type_errors() {
         "type \"nonexistent\" does not exist"
     );
 }
+
+#[test]
+fn create_domain_with_unknown_base_type_is_rejected() {
+    // PG 18: ERROR 42704 type "nosuchtype" does not exist.
+    assert_ddl_err!(
+        try_apply(&[("0001.sql", "CREATE DOMAIN d AS nosuchtype;")]),
+        DdlError::TypeNotFound(_),
+        "type \"nosuchtype\" does not exist",
+    );
+}

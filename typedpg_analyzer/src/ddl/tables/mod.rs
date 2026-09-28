@@ -12,8 +12,8 @@ use crate::pg_catalog::{
 
 use super::DdlError;
 use super::util::{
-    ensure_range_var, format_type_for_message, range_var_names, register_composite_to_record_cast,
-    resolve_type_name,
+    ensure_range_var, format_type_for_message, lookup_type_name, range_var_names,
+    register_composite_to_record_cast,
 };
 use super::views;
 use crate::pg_catalog::PgCatalog;

@@ -717,3 +717,87 @@ fn param_in_group_by_and_having_is_inferred() {
         }
     );
 }
+
+// ── Type name resolution (PG `typenameTypeId`) ──────────────────────────────
+
+#[test]
+fn unknown_column_type_is_rejected() {
+    // PG 18: ERROR 42704 type "nosuchtype" does not exist.
+    assert_ddl_err!(
+        try_apply(&[("0001.sql", "CREATE TABLE t (a nosuchtype);")]),
+        DdlError::TypeNotFound(_),
+        "type \"nosuchtype\" does not exist",
+    );
+    assert_ddl_err!(
+        try_apply(&[("0001.sql", "CREATE TABLE t (a nosuch[]);")]),
+        DdlError::TypeNotFound(_),
+        "type \"nosuch[]\" does not exist",
+    );
+    assert_ddl_err!(
+        try_apply(&[("0001.sql", "CREATE TABLE t (a public.nosuch);")]),
+        DdlError::TypeNotFound(_),
+        "type \"public.nosuch\" does not exist",
+    );
+    assert_ddl_err!(
+        try_apply(&[("0001.sql", "CREATE TABLE t (a nosch.typ);")]),
+        DdlError::TypeNotFound(_),
+        "schema \"nosch\" does not exist",
+    );
+    // A quoted keyword spelling is a plain identifier, not the int4 alias.
+    assert_ddl_err!(
+        try_apply(&[("0001.sql", "CREATE TABLE t (a \"integer\");")]),
+        DdlError::TypeNotFound(_),
+        "type \"integer\" does not exist",
+    );
+}
+
+#[test]
+fn type_outside_search_path_is_not_visible() {
+    // PG 18: the enum lives in `s`, which is not on the search path.
+    assert_ddl_err!(
+        try_apply(&[(
+            "0001.sql",
+            "CREATE SCHEMA s; CREATE TYPE s.mood AS ENUM ('a'); CREATE TABLE t2 (m mood);",
+        )]),
+        DdlError::TypeNotFound(_),
+        "type \"mood\" does not exist",
+    );
+}
+
+#[test]
+fn alter_table_with_unknown_type_is_rejected() {
+    assert_ddl_err!(
+        try_apply(&[(
+            "0001.sql",
+            "CREATE TABLE t3 (a int); ALTER TABLE t3 ADD COLUMN b nosuchtype;",
+        )]),
+        DdlError::TypeNotFound(_),
+        "type \"nosuchtype\" does not exist",
+    );
+    assert_ddl_err!(
+        try_apply(&[(
+            "0001.sql",
+            "CREATE TABLE t3 (a int); ALTER TABLE t3 ALTER COLUMN a TYPE nosuchtype;",
+        )]),
+        DdlError::TypeNotFound(_),
+        "type \"nosuchtype\" does not exist",
+    );
+}
+
+#[test]
+fn quoted_char_is_the_internal_single_byte_type() {
+    // PG 18 `\d t`: a "char", b character(1), c bpchar.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a \"char\", b char, c \"bpchar\");",
+    )]);
+    let info = db.analyze("SELECT a, b, c FROM t").unwrap();
+    assert_cols(
+        &info,
+        vec![
+            cn("a", basic("pg_catalog", "char")),
+            cn("b", basic_with_typmod("pg_catalog", "bpchar", 5)),
+            cn("c", bpchar()),
+        ],
+    );
+}

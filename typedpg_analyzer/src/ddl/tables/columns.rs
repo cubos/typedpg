@@ -73,6 +73,32 @@ pub(crate) fn apply_inherits(
     Ok(())
 }
 
+/// The integer type behind a `smallserial` / `serial` / `bigserial` column
+/// type, or `None` for any other type name. Mirrors the check at the top of
+/// `transformColumnDefinition` (`parse_utilcmd.c`): the name must be
+/// unqualified or `pg_catalog`-qualified, with no array bounds.
+pub(crate) fn serial_base_type(tn: &pg_query::protobuf::TypeName) -> Option<PgTypeOid> {
+    use crate::pg_catalog::oid;
+    if !tn.array_bounds.is_empty() || tn.pct_type {
+        return None;
+    }
+    let parts: Vec<&str> = tn
+        .names
+        .iter()
+        .filter_map(super::super::util::node_string)
+        .collect();
+    let name = match parts.as_slice() {
+        [name] | ["pg_catalog", name] => *name,
+        _ => return None,
+    };
+    match name {
+        "smallserial" | "serial2" => Some(oid::INT2),
+        "serial" | "serial4" => Some(oid::INT4),
+        "bigserial" | "serial8" => Some(oid::INT8),
+        _ => None,
+    }
+}
+
 /// Parse a `ColumnDef` AST node into a `ParsedColumn` (shared between
 /// CREATE TABLE and ALTER TABLE ADD COLUMN paths).
 pub(crate) fn parse_column_def(
@@ -82,18 +108,14 @@ pub(crate) fn parse_column_def(
 ) -> Result<ParsedColumn, DdlError> {
     // Detect SERIAL/BIGSERIAL/SMALLSERIAL from type name — pg_query keeps the
     // original name and does NOT rewrite to int4 + nextval(...).
-    let is_serial = cd.type_name.as_ref().is_some_and(|tn| {
-        tn.names.iter().any(|n| {
-            matches!(n.node.as_ref(), Some(node::Node::String(s))
-                if matches!(s.sval.as_str(), "serial" | "bigserial" | "smallserial"))
-        })
-    });
+    let serial_type = cd.type_name.as_ref().and_then(serial_base_type);
+    let is_serial = serial_type.is_some();
 
-    let type_oid = cd
-        .type_name
-        .as_ref()
-        .and_then(|tn| resolve_type_name(tn, interp))
-        .unwrap_or(crate::pg_catalog::oid::UNKNOWN);
+    let type_oid = match (serial_type, cd.type_name.as_ref()) {
+        (Some(oid), _) => oid,
+        (None, Some(tn)) => lookup_type_name(tn, interp)?,
+        (None, None) => crate::pg_catalog::oid::UNKNOWN,
+    };
 
     // Encode any `(n)` / `(p,s)` modifier sitting next to the type name.
     // Empty `typmods` (`varchar` plain) yields `None`.
@@ -588,11 +610,10 @@ pub(crate) fn alter_column_type(
         return Ok(());
     };
 
-    let new_type_oid = cd
-        .type_name
-        .as_ref()
-        .and_then(|tn| resolve_type_name(tn, interp))
-        .unwrap_or(crate::pg_catalog::oid::UNKNOWN);
+    let new_type_oid = match cd.type_name.as_ref() {
+        Some(tn) => lookup_type_name(tn, interp)?,
+        None => return Ok(()),
+    };
 
     let new_typmod = match cd.type_name.as_ref() {
         Some(tn) => crate::typmod::encode(interp, new_type_oid, &tn.typmods)?,

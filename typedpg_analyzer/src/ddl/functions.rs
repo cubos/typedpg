@@ -6,7 +6,7 @@ use crate::oid::{PgProcOid, PgTypeOid};
 use crate::pg_catalog::{ArgMode, PgProc, ProKind, oid as builtin_oid};
 
 use super::DdlError;
-use super::util::{ensure_qualified_name, resolve_type_name};
+use super::util::{ensure_qualified_name, lookup_type_name, type_name_to_string};
 use crate::pg_catalog::PgCatalog;
 
 pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Result<(), DdlError> {
@@ -28,13 +28,18 @@ pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Res
         };
         let mode =
             FunctionParameterMode::try_from(fp.mode).unwrap_or(FunctionParameterMode::FuncParamIn);
-        let Some(resolved_oid) = fp
-            .arg_type
-            .as_ref()
-            .and_then(|tn| resolve_type_name(tn, interp))
-        else {
+        let Some(tn) = fp.arg_type.as_ref() else {
             continue;
         };
+        // `interpret_function_parameter_list` (functioncmds.c) reports an
+        // unknown parameter type with the name unquoted, unlike every other
+        // `type "x" does not exist` site.
+        let resolved_oid = lookup_type_name(tn, interp).map_err(|e| match e {
+            DdlError::TypeNotFound(msg) if msg.starts_with("type \"") => {
+                DdlError::TypeNotFound(format!("type {} does not exist", type_name_to_string(tn)))
+            }
+            other => other,
+        })?;
 
         let arg_mode = match mode {
             FunctionParameterMode::FuncParamIn
@@ -79,10 +84,10 @@ pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Res
 
     // Resolve return type. PG synthesizes one when there's no explicit
     // RETURNS but OUT/INOUT params are present.
-    let explicit_return_oid = stmt
-        .return_type
-        .as_ref()
-        .and_then(|tn| resolve_type_name(tn, interp));
+    let explicit_return_oid = match stmt.return_type.as_ref() {
+        Some(tn) => Some(lookup_type_name(tn, interp)?),
+        None => None,
+    };
     let out_count = proargmodes
         .iter()
         .filter(|m| matches!(m, ArgMode::Out | ArgMode::InOut | ArgMode::Table))

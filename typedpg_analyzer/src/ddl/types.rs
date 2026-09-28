@@ -13,7 +13,7 @@ use crate::pg_catalog::{
 
 use super::DdlError;
 use super::util::{
-    ensure_namespace, ensure_qualified_name, names_key, node_string,
+    ensure_namespace, ensure_qualified_name, lookup_type_name, names_key, node_string,
     register_composite_to_record_cast, resolve_type_name,
 };
 use crate::pg_catalog::PgCatalog;
@@ -33,8 +33,7 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
         .type_name
         .as_ref()
         .ok_or_else(|| DdlError::TypeNotFound("domain base type".into()))?;
-    let base_type_oid = resolve_type_name(base_type_name, interp)
-        .ok_or_else(|| DdlError::TypeNotFound("domain base type".into()))?;
+    let base_type_oid = lookup_type_name(base_type_name, interp)?;
     let typtypmod = crate::typmod::encode(interp, base_type_oid, &base_type_name.typmods)?;
 
     // Domains inherit category/preferred from their base type.
@@ -184,8 +183,8 @@ pub fn create_composite(interp: &mut PgCatalog, stmt: &CompositeTypeStmt) -> Res
     for col_node in &stmt.coldeflist {
         if let Some(node::Node::ColumnDef(cd)) = col_node.node.as_ref()
             && let Some(tn) = cd.type_name.as_ref()
-            && let Some(type_oid) = resolve_type_name(tn, interp)
         {
+            let type_oid = lookup_type_name(tn, interp)?;
             let typmod = crate::typmod::encode(interp, type_oid, &tn.typmods)?;
             field_defs.push((cd.colname.clone(), type_oid, typmod, cd.is_not_null));
         }
@@ -256,7 +255,7 @@ pub fn create_range(interp: &mut PgCatalog, stmt: &CreateRangeStmt) -> Result<()
             && let Some(arg) = de.arg.as_deref()
             && let Some(node::Node::TypeName(tn)) = arg.node.as_ref()
         {
-            subtype_oid = resolve_type_name(tn, interp);
+            subtype_oid = Some(lookup_type_name(tn, interp)?);
         }
     }
     let Some(subtype_oid) = subtype_oid else {

@@ -414,3 +414,66 @@ fn full_blog_schema() {
     let labels = snap.enum_labels_of(ps.oid);
     assert_eq!(labels, vec!["draft", "published", "archived", "deleted"]);
 }
+
+#[test]
+fn create_function_with_unknown_types_is_rejected() {
+    // PG 18: the parameter-list message leaves the name unquoted
+    // (interpret_function_parameter_list), the return type one quotes it.
+    assert_ddl_err!(
+        try_apply(&[(
+            "0001.sql",
+            "CREATE FUNCTION f(a nosuchtype) RETURNS int LANGUAGE sql AS 'select 1';",
+        )]),
+        DdlError::TypeNotFound(_),
+        "type nosuchtype does not exist",
+    );
+    assert_ddl_err!(
+        try_apply(&[(
+            "0001.sql",
+            "CREATE FUNCTION f() RETURNS nosuchtype LANGUAGE sql AS 'select 1';",
+        )]),
+        DdlError::TypeNotFound(_),
+        "type \"nosuchtype\" does not exist",
+    );
+    assert_ddl_err!(
+        try_apply(&[(
+            "0001.sql",
+            "CREATE FUNCTION f() RETURNS SETOF nosuchtype LANGUAGE sql AS 'select 1';",
+        )]),
+        DdlError::TypeNotFound(_),
+        "type \"nosuchtype\" does not exist",
+    );
+}
+
+#[test]
+fn create_function_pct_type_resolves_to_column_type() {
+    // PG 18: NOTICE type reference t.a%TYPE converted to bigint; f(1) is bigint.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a bigint);
+         CREATE FUNCTION f(x t.a%TYPE) RETURNS t.a%TYPE LANGUAGE sql AS 'select x';",
+    )]);
+    let info = db.analyze("SELECT f(1)").unwrap();
+    assert_cols(&info, vec![cn("f", int8())]);
+}
+
+#[test]
+fn create_function_pct_type_errors() {
+    assert_ddl_err!(
+        try_apply(&[(
+            "0001.sql",
+            "CREATE TABLE t3 (a int);
+             CREATE FUNCTION g2(x t3.zz%TYPE) RETURNS int LANGUAGE sql AS 'select 1';",
+        )]),
+        DdlError::Parse(_),
+        "column \"zz\" of relation \"t3\" does not exist",
+    );
+    assert_ddl_err!(
+        try_apply(&[(
+            "0001.sql",
+            "CREATE FUNCTION g3(x nosuchrel.zz%TYPE) RETURNS int LANGUAGE sql AS 'select 1';",
+        )]),
+        DdlError::TableNotFound(_),
+        "relation \"nosuchrel\" does not exist",
+    );
+}

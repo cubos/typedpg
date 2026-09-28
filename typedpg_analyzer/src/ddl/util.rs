@@ -103,6 +103,22 @@ pub fn ensure_range_var(
 /// - Array bounds: `int4[]` → array element type OID
 /// - Shorthand aliases: `integer` → `int4`, `bigint` → `int8`, etc.
 pub fn resolve_type_name(tn: &TypeName, snapshot: &PgCatalog) -> Option<PgTypeOid> {
+    lookup_type_name(tn, snapshot).ok()
+}
+
+/// Resolve a `TypeName` the way PG's `typenameTypeId` does
+/// (`src/backend/parser/parse_type.c`, `LookupTypeNameExtended`), returning
+/// PG's own error when the name does not resolve.
+///
+/// The name is looked up verbatim: the grammar already rewrites the
+/// SQL-standard keyword types (`integer`, `char(n)`, `double precision`, …)
+/// to their `pg_catalog.<name>` spelling, so an unqualified `"char"` is the
+/// internal single-byte type and a quoted `"integer"` does not exist — just
+/// like in PG. `tbl.col%TYPE` references resolve to the column's type.
+pub fn lookup_type_name(tn: &TypeName, snapshot: &PgCatalog) -> Result<PgTypeOid, DdlError> {
+    if let Some(oid) = PgTypeOid::new(tn.type_oid) {
+        return Ok(oid);
+    }
     let parts: Vec<&str> = tn
         .names
         .iter()
@@ -112,22 +128,110 @@ pub fn resolve_type_name(tn: &TypeName, snapshot: &PgCatalog) -> Option<PgTypeOi
         })
         .collect();
 
-    let (schema, raw_name) = match parts.as_slice() {
-        [schema, name] => (Some(*schema), *name),
-        [name] => (None, *name),
-        _ => return None,
+    let base_oid = if tn.pct_type {
+        lookup_pct_type(&parts, snapshot)?
+    } else {
+        let (schema, name) = match parts.as_slice() {
+            [name] => (None, *name),
+            [schema, name] => (Some(*schema), *name),
+            // `catalog.schema.name`: PG only accepts the current database,
+            // which the analyzer has no notion of.
+            _ => {
+                return Err(DdlError::Parse(format!(
+                    "improper qualified name (too many dotted names): {}",
+                    parts.join(".")
+                )));
+            }
+        };
+        if let Some(schema) = schema
+            && snapshot.namespace_oid(schema).is_none()
+        {
+            return Err(DdlError::TypeNotFound(format!(
+                "schema \"{schema}\" does not exist"
+            )));
+        }
+        match snapshot.resolve_type_by_name(schema, name) {
+            Some(t) => t.oid,
+            None => {
+                return Err(DdlError::TypeNotFound(format!(
+                    "type \"{}\" does not exist",
+                    type_name_to_string(tn)
+                )));
+            }
+        }
     };
 
-    let name = normalize_type_name(raw_name);
-    let base_oid = snapshot.resolve_type_by_name(schema, name).map(|t| t.oid)?;
-
     if !tn.array_bounds.is_empty() {
-        return snapshot.array_type_of(base_oid);
+        return snapshot.array_type_of(base_oid).ok_or_else(|| {
+            DdlError::TypeNotFound(format!(
+                "could not find array type for data type {}",
+                format_type_for_message(snapshot, base_oid)
+            ))
+        });
     }
-    Some(base_oid)
+    Ok(base_oid)
 }
 
-/// Normalize PostgreSQL type name aliases to their canonical form.
+/// `rel.col%TYPE` / `schema.rel.col%TYPE`: the referenced column's type.
+/// Mirrors the `typeName->pct_type` branch of `LookupTypeNameExtended`.
+fn lookup_pct_type(parts: &[&str], snapshot: &PgCatalog) -> Result<PgTypeOid, DdlError> {
+    let (schema, rel, col) = match parts {
+        [rel, col] => (None, *rel, *col),
+        [schema, rel, col] => (Some(*schema), *rel, *col),
+        [_db, schema, rel, col] => (Some(*schema), *rel, *col),
+        _ => {
+            return Err(DdlError::Parse(format!(
+                "improper %TYPE reference (too few dotted names): {}",
+                parts.join(".")
+            )));
+        }
+    };
+    if let Some(schema) = schema
+        && snapshot.namespace_oid(schema).is_none()
+    {
+        return Err(DdlError::TypeNotFound(format!(
+            "schema \"{schema}\" does not exist"
+        )));
+    }
+    let class = snapshot.resolve_table(schema, rel).ok_or_else(|| {
+        let shown = match schema {
+            Some(s) => QualifiedName::new(s, rel).to_string(),
+            None => rel.to_owned(),
+        };
+        DdlError::TableNotFound(format!("relation \"{shown}\" does not exist"))
+    })?;
+    snapshot
+        .attribute_by_name(class.oid, col)
+        .map(|a| a.atttypid)
+        .ok_or_else(|| {
+            DdlError::Parse(format!(
+                "column \"{col}\" of relation \"{rel}\" does not exist"
+            ))
+        })
+}
+
+/// PG's `TypeNameToString`: the dotted name list (unquoted), `%TYPE` for
+/// column references and `[]` when array bounds are present.
+pub fn type_name_to_string(tn: &TypeName) -> String {
+    let mut out = tn
+        .names
+        .iter()
+        .filter_map(node_string)
+        .collect::<Vec<_>>()
+        .join(".");
+    if tn.pct_type {
+        out.push_str("%TYPE");
+    }
+    if !tn.array_bounds.is_empty() {
+        out.push_str("[]");
+    }
+    out
+}
+
+/// Normalize PostgreSQL type name aliases to their canonical form, the way
+/// the SQL grammar would for a bare keyword. Only meaningful for type names
+/// that went through no grammar at all (e.g. the text of a `regtype`
+/// literal); `TypeName` nodes from `pg_query` are already canonical.
 pub(crate) fn normalize_type_name(name: &str) -> &str {
     match name {
         "integer" | "int" => "int4",
