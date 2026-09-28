@@ -132,10 +132,6 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
         params,
     )?;
 
-    // `FOR UPDATE OF alias` (and FOR SHARE / NO KEY UPDATE / KEY SHARE):
-    // every named relation must be a FROM entry of *this* query level.
-    check_locking_clause(&sel.locking_clause, &scope)?;
-
     // Expand `GROUPING SETS` / `ROLLUP` / `CUBE`: promote columns that
     // some grouping set omits to nullable, and remember whether any
     // grouping set is empty (drives aggregate-result nullability).
@@ -328,6 +324,10 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
     // grouped or aggregated (PG SQLSTATE 42803). Checked after the target list
     // so undefined-column errors surface first, matching PG's order.
     crate::grouping::check_grouping(sel, &scope, snapshot)?;
+
+    // `FOR UPDATE [OF …]` (and FOR SHARE / NO KEY UPDATE / KEY SHARE) —
+    // PG checks it last in transformSelectStmt.
+    check_locking_clause(sel, &scope, &null_ctx, snapshot)?;
 
     Ok((columns, None))
 }
@@ -584,29 +584,139 @@ fn is_select_alias_reference(
     aliases.contains(&s.sval)
 }
 
-/// Validate `FOR UPDATE OF a, b` (and the other lock strengths): PG
-/// requires every named relation to be an entry of the current query
-/// level's FROM clause — `relation "x" in FOR UPDATE clause not found in
-/// FROM clause` (SQLSTATE 42P01) otherwise.
+/// PG's `LCS_asString`: the clause's spelling in messages.
+pub(crate) fn lock_strength_name(lc: &protobuf::LockingClause) -> &'static str {
+    match lc.strength() {
+        pg_query::protobuf::LockClauseStrength::LcsForkeyshare => "FOR KEY SHARE",
+        pg_query::protobuf::LockClauseStrength::LcsForshare => "FOR SHARE",
+        pg_query::protobuf::LockClauseStrength::LcsFornokeyupdate => "FOR NO KEY UPDATE",
+        _ => "FOR UPDATE",
+    }
+}
+
+/// The first `CheckSelectLocking` (analyze.c) violation of `sel`: the
+/// construct a locking clause is not allowed with.
+fn select_lock_blocker(sel: &protobuf::SelectStmt, snapshot: &PgCatalog) -> Option<&'static str> {
+    if sel.op != SetOperation::SetopNone as i32 {
+        return Some("UNION/INTERSECT/EXCEPT");
+    }
+    if !sel.distinct_clause.is_empty() {
+        return Some("DISTINCT clause");
+    }
+    if !sel.group_clause.is_empty() {
+        return Some("GROUP BY clause");
+    }
+    if sel.having_clause.is_some() {
+        return Some("HAVING clause");
+    }
+    let level_exprs: Vec<&protobuf::Node> = sel
+        .target_list
+        .iter()
+        .filter_map(|t| match t.node.as_ref()? {
+            node::Node::ResTarget(rt) => rt.val.as_deref(),
+            _ => None,
+        })
+        .chain(
+            sel.sort_clause
+                .iter()
+                .filter_map(|n| match n.node.as_ref()? {
+                    node::Node::SortBy(sb) => sb.node.as_deref(),
+                    _ => None,
+                }),
+        )
+        .collect();
+    let kinds: Vec<_> = level_exprs
+        .iter()
+        .map(|e| expr::detect_func_kinds(e, snapshot))
+        .collect();
+    if kinds.iter().any(|k| k.has_aggregate) {
+        return Some("aggregate functions");
+    }
+    if kinds.iter().any(|k| k.has_window) {
+        return Some("window functions");
+    }
+    if count_srf_calls(&sel.target_list, snapshot) > 0 {
+        return Some("set-returning functions in the target list");
+    }
+    None
+}
+
+/// The blocker a locking clause pushed down into FROM subquery `sel` would
+/// hit: PG's `transformLockingClause` applies an unqualified (or naming)
+/// clause to the subquery, which re-runs `CheckSelectLocking` there and
+/// pushes further into *its* FROM subqueries.
+pub(crate) fn subquery_lock_blocker(
+    sel: &protobuf::SelectStmt,
+    snapshot: &PgCatalog,
+) -> Option<&'static str> {
+    fn from_item_blocker(n: &protobuf::Node, snapshot: &PgCatalog) -> Option<&'static str> {
+        match n.node.as_ref()? {
+            node::Node::RangeSubselect(rs) => match rs.subquery.as_deref()?.node.as_ref()? {
+                node::Node::SelectStmt(s) => subquery_lock_blocker(s, snapshot),
+                _ => None,
+            },
+            node::Node::JoinExpr(j) => j
+                .larg
+                .as_deref()
+                .and_then(|l| from_item_blocker(l, snapshot))
+                .or_else(|| {
+                    j.rarg
+                        .as_deref()
+                        .and_then(|r| from_item_blocker(r, snapshot))
+                }),
+            _ => None,
+        }
+    }
+    select_lock_blocker(sel, snapshot).or_else(|| {
+        sel.from_clause
+            .iter()
+            .find_map(|n| from_item_blocker(n, snapshot))
+    })
+}
+
+/// Validate a SELECT's locking clauses like PG: `CheckSelectLocking` (the
+/// query may not use DISTINCT / GROUP BY / HAVING / aggregates / window
+/// functions / target-list SRFs), then `transformLockingClause` — each
+/// named entry must be a FROM entry of this level (42P01) and lockable
+/// (not a WITH query, function or join; a subquery takes the clause
+/// itself), and an unqualified clause applies to every table and
+/// subquery. Locking a table on the nullable side of an outer join is the
+/// planner's `make_outerjoininfo` error. All but the missing entry are
+/// 0A000.
 fn check_locking_clause(
-    locking_clause: &[protobuf::Node],
+    sel: &protobuf::SelectStmt,
     scope: &Scope,
+    null_ctx: &NullabilityContext,
+    snapshot: &PgCatalog,
 ) -> Result<(), AnalyzeError> {
-    for node in locking_clause {
+    use crate::scope::SourceKind;
+    let unsupported = |msg: String| {
+        crate::error::RawError::new(AnalyzeError::FeatureNotSupported(msg), None, None)
+            .finalize_implicit()
+    };
+    for node in &sel.locking_clause {
         let Some(node::Node::LockingClause(lc)) = node.node.as_ref() else {
             continue;
         };
-        let clause = match lc.strength() {
-            pg_query::protobuf::LockClauseStrength::LcsForkeyshare => "FOR KEY SHARE",
-            pg_query::protobuf::LockClauseStrength::LcsForshare => "FOR SHARE",
-            pg_query::protobuf::LockClauseStrength::LcsFornokeyupdate => "FOR NO KEY UPDATE",
-            _ => "FOR UPDATE",
-        };
+        let clause = lock_strength_name(lc);
+        if let Some(blocker) = select_lock_blocker(sel, snapshot) {
+            return Err(unsupported(format!(
+                "{clause} is not allowed with {blocker}"
+            )));
+        }
+        let mut locked: Vec<&crate::scope::TableSource> = Vec::new();
+        if lc.locked_rels.is_empty() {
+            locked.extend(
+                scope.sources.iter().filter(|s| {
+                    matches!(s.kind, SourceKind::Relation | SourceKind::Subquery { .. })
+                }),
+            );
+        }
         for rel in &lc.locked_rels {
             let Some(node::Node::RangeVar(rv)) = rel.node.as_ref() else {
                 continue;
             };
-            if scope.find_source(&rv.relname).is_none() {
+            let Some(source) = scope.sources.iter().find(|s| s.alias == rv.relname) else {
                 return Err(crate::error::RawError::new(
                     AnalyzeError::UndefinedTable(format!(
                         "relation \"{}\" in {clause} clause not found in FROM clause",
@@ -616,6 +726,35 @@ fn check_locking_clause(
                     None,
                 )
                 .finalize_implicit());
+            };
+            let what = match source.kind {
+                SourceKind::Cte => Some("a WITH query"),
+                SourceKind::Function => Some("a function"),
+                SourceKind::Join => Some("a join"),
+                _ => None,
+            };
+            if let Some(what) = what {
+                return Err(unsupported(format!("{clause} cannot be applied to {what}")));
+            }
+            locked.push(source);
+        }
+        for source in &locked {
+            if let SourceKind::Subquery {
+                lock_blocker: Some(blocker),
+            } = source.kind
+            {
+                return Err(unsupported(format!(
+                    "{clause} is not allowed with {blocker}"
+                )));
+            }
+        }
+        for source in &locked {
+            if matches!(source.kind, SourceKind::Relation)
+                && null_ctx.is_nullable(&source.alias, "", true)
+            {
+                return Err(unsupported(format!(
+                    "{clause} cannot be applied to the nullable side of an outer join"
+                )));
             }
         }
     }

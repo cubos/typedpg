@@ -29,6 +29,21 @@ pub(crate) fn analyze_set_operation(
         _ => "UNION",
     };
 
+    // PG's CheckSelectLocking: a set operation can't be locked (0A000).
+    if let Some(node::Node::LockingClause(lc)) =
+        sel.locking_clause.first().and_then(|n| n.node.as_ref())
+    {
+        return Err(crate::error::RawError::new(
+            AnalyzeError::FeatureNotSupported(format!(
+                "{} is not allowed with UNION/INTERSECT/EXCEPT",
+                lock_strength_name(lc)
+            )),
+            None,
+            None,
+        )
+        .finalize_implicit());
+    }
+
     if left_cols.len() != right_cols.len() {
         return Err(
             crate::pgmsg::set_op_column_count(op_label, left_cols.len(), right_cols.len())

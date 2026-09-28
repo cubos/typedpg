@@ -42,6 +42,8 @@ mod params;
 mod records;
 #[path = "query/select.rs"]
 mod select;
+#[path = "query/select_rules.rs"]
+mod select_rules;
 #[path = "query/set_operations.rs"]
 mod set_operations;
 #[path = "query/set_returning_functions.rs"]

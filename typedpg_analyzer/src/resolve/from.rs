@@ -51,7 +51,7 @@ pub(crate) fn process_from_item(
                         c
                     })
                     .collect();
-                scope.add_virtual_table(alias, cols)?;
+                scope.add_derived(alias, cols, crate::scope::SourceKind::Cte)?;
                 apply_alias_column_names(scope, rv.alias.as_ref())?;
                 return Ok(());
             }
@@ -154,7 +154,13 @@ pub(crate) fn process_from_item(
                         c.name = alias_name.clone();
                     }
                 }
-                scope.add_virtual_table(alias, scope_cols)?;
+                scope.add_derived(
+                    alias,
+                    scope_cols,
+                    crate::scope::SourceKind::Subquery {
+                        lock_blocker: subquery_lock_blocker(sel, snapshot),
+                    },
+                )?;
             }
         }
         node::Node::RangeFunction(rf) => {
@@ -321,7 +327,7 @@ fn process_range_function(
         c.name = alias_name;
     }
 
-    scope.add_virtual_table(alias, cols)?;
+    scope.add_derived(alias, cols, crate::scope::SourceKind::Function)?;
     Ok(())
 }
 
@@ -518,7 +524,10 @@ fn process_join_expr(
         }
         scope.sources.insert(
             left.start,
-            crate::scope::TableSource::derived(&alias, columns),
+            crate::scope::TableSource {
+                kind: crate::scope::SourceKind::Join,
+                ..crate::scope::TableSource::derived(&alias, columns)
+            },
         );
     }
     Ok(())

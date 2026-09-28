@@ -67,6 +67,29 @@ pub(crate) struct TableSource {
     /// side: PG keeps it in the namespace but rejects any reference to it
     /// (`check_lateral_ref_ok`, 42P10).
     pub lateral_blocked: bool,
+    /// What kind of range-table entry PG would build for this FROM item —
+    /// drives the locking-clause rules (`transformLockingClause`).
+    pub kind: SourceKind,
+}
+
+/// The RTE kind behind a [`TableSource`].
+#[derive(Debug, Clone, Default)]
+pub(crate) enum SourceKind {
+    /// A table or view (`RTE_RELATION`).
+    Relation,
+    /// A FROM subquery (`RTE_SUBQUERY`). `lock_blocker` is the first
+    /// `CheckSelectLocking` violation a locking clause pushed into it would
+    /// hit (`"DISTINCT clause"`, …).
+    Subquery { lock_blocker: Option<&'static str> },
+    /// A CTE reference (`RTE_CTE`).
+    Cte,
+    /// A FROM function (`RTE_FUNCTION`).
+    Function,
+    /// A JOIN's merged USING columns (`RTE_JOIN`).
+    Join,
+    /// Anything else (VALUES lists, the INSERT `excluded` pseudo-relation).
+    #[default]
+    Other,
 }
 
 /// First character of the synthetic aliases given to FROM items PG exposes
@@ -98,6 +121,7 @@ impl TableSource {
             source_qn: None,
             join_hidden: Default::default(),
             lateral_blocked: false,
+            kind: SourceKind::Other,
         }
     }
 
@@ -270,19 +294,25 @@ impl Scope {
         self.sources.push(TableSource {
             system_columns: system_columns_for(alias),
             source_qn: Some(QualifiedName::new(nspname, relname)),
+            kind: SourceKind::Relation,
             ..TableSource::derived(alias, columns)
         });
         Ok(())
     }
 
-    /// Add a virtual table (CTE, subquery result).
-    pub fn add_virtual_table(
+    /// Add a derived source (CTE, subquery, function result) of the given
+    /// RTE kind.
+    pub fn add_derived(
         &mut self,
         alias: &str,
         columns: Vec<ScopeColumn>,
+        kind: SourceKind,
     ) -> Result<(), AnalyzeError> {
         self.check_duplicate_alias(alias)?;
-        self.sources.push(TableSource::derived(alias, columns));
+        self.sources.push(TableSource {
+            kind,
+            ..TableSource::derived(alias, columns)
+        });
         Ok(())
     }
 
@@ -309,6 +339,7 @@ impl Scope {
         self.sources.push(TableSource {
             system_columns: system_columns_for(alias),
             source_qn: Some(qn),
+            kind: SourceKind::Relation,
             ..TableSource::derived(alias, cols)
         });
     }
