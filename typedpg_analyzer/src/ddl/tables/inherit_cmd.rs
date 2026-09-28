@@ -379,6 +379,9 @@ pub(super) fn attach_partition(
             )));
         }
     }
+    if let Some(bound) = pc.bound.as_ref() {
+        super::partbound::add_partition_bound(interp, parent, attach, bound)?;
+    }
     create_inheritance(interp, attach, parent, &attach_name, true)
 }
 
@@ -396,7 +399,9 @@ pub(super) fn detach_partition(
         return Ok(());
     };
     let part = super::super::util::lookup_relation(interp, rv)?.1;
-    remove_inheritance(interp, part, parent, "partition")
+    remove_inheritance(interp, part, parent, "partition")?;
+    interp.partition_bounds.remove(&part);
+    Ok(())
 }
 
 /// RemoveInheritance: drop the `pg_inherits` row and give back the

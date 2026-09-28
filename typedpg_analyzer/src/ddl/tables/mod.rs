@@ -391,6 +391,9 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
             inhseqno: (i + 1) as i32,
         });
     }
+    if let (Some(bound), Some(&parent)) = (stmt.partbound.as_ref(), parents.first()) {
+        partbound::add_partition_bound(interp, parent, class_oid, bound)?;
+    }
 
     // ComputePartitionAttrs: a partition key column must exist.
     if let Some(spec) = stmt.partspec.as_ref() {
@@ -415,6 +418,7 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
             key.push(attnum);
         }
         interp.partition_keys.insert(class_oid, key);
+        partbound::record_partition_spec(interp, class_oid, spec);
     }
 
     // Type-check CHECK and `GENERATED ... STORED` expressions against the
@@ -726,6 +730,7 @@ pub(crate) mod inherit;
 mod inherit_cmd;
 mod merge;
 mod object_refs;
+pub(crate) mod partbound;
 pub(crate) mod typed;
 
 use columns::*;

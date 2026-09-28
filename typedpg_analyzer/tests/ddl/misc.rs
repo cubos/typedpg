@@ -1345,3 +1345,165 @@ fn attach_and_detach_partition() {
         ),
     ]);
 }
+
+#[test]
+fn partition_bounds_are_validated() {
+    // PG 18 transformPartitionBound / transformPartitionBoundValue /
+    // validateInfiniteBounds / check_new_partition_bound.
+    let setup = "CREATE TABLE pl (a int, b text) PARTITION BY LIST (a);
+                 CREATE TABLE pr (a int, b int) PARTITION BY RANGE (a, b);
+                 CREATE TABLE ph (a int) PARTITION BY HASH (a);
+                 CREATE TABLE pd (d date) PARTITION BY RANGE (d);
+                 CREATE TABLE ps (s text) PARTITION BY LIST (s);
+                 CREATE TABLE l3 PARTITION OF pl FOR VALUES IN (1, 2);
+                 CREATE TABLE l5 PARTITION OF pl DEFAULT;
+                 CREATE TABLE l7 PARTITION OF pl FOR VALUES IN (NULL);
+                 CREATE TABLE l9 PARTITION OF pl FOR VALUES IN (1 + 4);
+                 CREATE TABLE r4 PARTITION OF pr FOR VALUES FROM (1, 1) TO (5, 5);
+                 CREATE TABLE r7 PARTITION OF pr FOR VALUES FROM (5, 5) TO (MAXVALUE, MAXVALUE);
+                 CREATE TABLE h3 PARTITION OF ph FOR VALUES WITH (MODULUS 4, REMAINDER 1);
+                 CREATE TABLE d1 PARTITION OF pd FOR VALUES FROM ('2024-01-01') TO ('2024-02-01');
+                 CREATE TABLE s1 PARTITION OF ps FOR VALUES IN ('x', 'x');
+                 CREATE TABLE free (a int, b text);";
+    for (stmt, msg) in [
+        (
+            "CREATE TABLE x PARTITION OF pl FOR VALUES FROM (1) TO (2);",
+            "invalid bound specification for a list partition",
+        ),
+        (
+            "CREATE TABLE x PARTITION OF pl FOR VALUES IN ('x');",
+            "invalid input syntax for type integer: \"x\"",
+        ),
+        (
+            "CREATE TABLE x PARTITION OF pl FOR VALUES IN (2);",
+            "partition \"x\" would overlap partition \"l3\"",
+        ),
+        (
+            "CREATE TABLE x PARTITION OF pl FOR VALUES IN (5);",
+            "partition \"x\" would overlap partition \"l9\"",
+        ),
+        (
+            "CREATE TABLE x PARTITION OF pl DEFAULT;",
+            "partition \"x\" conflicts with existing default partition \"l5\"",
+        ),
+        (
+            "CREATE TABLE x PARTITION OF pl FOR VALUES IN (NULL);",
+            "partition \"x\" would overlap partition \"l7\"",
+        ),
+        (
+            "CREATE TABLE x PARTITION OF pl FOR VALUES IN ((SELECT 1));",
+            "cannot use subquery in partition bound",
+        ),
+        (
+            "CREATE TABLE x PARTITION OF pl FOR VALUES IN (sum(1));",
+            "aggregate functions are not allowed in partition bound",
+        ),
+        (
+            "CREATE TABLE x PARTITION OF pl FOR VALUES IN (b);",
+            "cannot use column reference in partition bound expression",
+        ),
+        (
+            "CREATE TABLE x PARTITION OF pl FOR VALUES IN (MINVALUE);",
+            "cannot use column reference in partition bound expression",
+        ),
+        (
+            "CREATE TABLE x PARTITION OF pl FOR VALUES IN (now());",
+            "specified value cannot be cast to type integer for column \"a\"",
+        ),
+        (
+            "CREATE TABLE x PARTITION OF pr FOR VALUES IN (1);",
+            "invalid bound specification for a range partition",
+        ),
+        (
+            "CREATE TABLE x PARTITION OF pr FOR VALUES FROM (1) TO (2);",
+            "FROM must specify exactly one value per partitioning column",
+        ),
+        (
+            "CREATE TABLE x PARTITION OF pr FOR VALUES FROM (1, 1) TO (2);",
+            "TO must specify exactly one value per partitioning column",
+        ),
+        (
+            "CREATE TABLE x PARTITION OF pr FOR VALUES FROM (7, 1) TO (7, 1);",
+            "empty range bound specified for partition \"x\"",
+        ),
+        (
+            "CREATE TABLE x PARTITION OF pr FOR VALUES FROM (4, 0) TO (9, 9);",
+            "partition \"x\" would overlap partition \"r4\"",
+        ),
+        (
+            "CREATE TABLE x PARTITION OF pr FOR VALUES FROM (MINVALUE, 0) TO (1, 0);",
+            "every bound following MINVALUE must also be MINVALUE",
+        ),
+        (
+            "CREATE TABLE x PARTITION OF pr FOR VALUES FROM (0, 0) TO (MAXVALUE, 1);",
+            "every bound following MAXVALUE must also be MAXVALUE",
+        ),
+        (
+            "CREATE TABLE x PARTITION OF pr FOR VALUES FROM (NULL, 1) TO (1, 1);",
+            "cannot specify NULL in range bound",
+        ),
+        (
+            "CREATE TABLE x PARTITION OF pr FOR VALUES FROM ('x', 1) TO (9, 9);",
+            "invalid input syntax for type integer: \"x\"",
+        ),
+        (
+            "CREATE TABLE x PARTITION OF pd FOR VALUES FROM ('2024-01-15') TO ('2024-03-01');",
+            "partition \"x\" would overlap partition \"d1\"",
+        ),
+        (
+            "CREATE TABLE x PARTITION OF ph FOR VALUES WITH (MODULUS 4, REMAINDER 5);",
+            "remainder for hash partition must be less than modulus",
+        ),
+        (
+            "CREATE TABLE x PARTITION OF ph FOR VALUES WITH (MODULUS 0, REMAINDER 0);",
+            "modulus for hash partition must be an integer value greater than zero",
+        ),
+        (
+            "CREATE TABLE x PARTITION OF ph FOR VALUES WITH (MODULUS 4, REMAINDER 1);",
+            "partition \"x\" would overlap partition \"h3\"",
+        ),
+        (
+            "CREATE TABLE x PARTITION OF ph FOR VALUES WITH (MODULUS 3, REMAINDER 1);",
+            "every hash partition modulus must be a factor of the next larger modulus",
+        ),
+        (
+            "CREATE TABLE x PARTITION OF ph FOR VALUES WITH (MODULUS 8, REMAINDER 5);",
+            "partition \"x\" would overlap partition \"h3\"",
+        ),
+        (
+            "CREATE TABLE x PARTITION OF ph DEFAULT;",
+            "a hash-partitioned table may not have a default partition",
+        ),
+        (
+            "CREATE TABLE x PARTITION OF ph FOR VALUES IN (1);",
+            "invalid bound specification for a hash partition",
+        ),
+        (
+            "CREATE TABLE x PARTITION OF ps FOR VALUES IN ('x');",
+            "partition \"x\" would overlap partition \"s1\"",
+        ),
+        (
+            "ALTER TABLE pl ATTACH PARTITION free FOR VALUES IN (2);",
+            "partition \"free\" would overlap partition \"l3\"",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "CREATE TABLE a1 PARTITION OF pl FOR VALUES IN (3, 3, 4);
+             CREATE TABLE a2 PARTITION OF pr FOR VALUES FROM (MINVALUE, MINVALUE) TO (1, 1);
+             CREATE TABLE a3 PARTITION OF pd FOR VALUES FROM ('2024-02-01') TO ('2024-03-01');
+             CREATE TABLE a4 PARTITION OF ph FOR VALUES WITH (MODULUS 8, REMAINDER 3);
+             CREATE TABLE a5 PARTITION OF ps FOR VALUES IN (1);
+             ALTER TABLE pl ATTACH PARTITION free FOR VALUES IN (6);
+             ALTER TABLE pl DETACH PARTITION free;
+             ALTER TABLE pl ATTACH PARTITION free FOR VALUES IN (6, 7);
+             DROP TABLE l3;
+             CREATE TABLE a6 PARTITION OF pl FOR VALUES IN (2);",
+        ),
+    ]);
+}
