@@ -228,6 +228,8 @@ pub struct PgCatalog {
     pub(crate) triggers: HashMap<PgClassOid, Vec<crate::ddl::triggers::Trigger>>,
     /// `pg_policy`: each relation's row-security policy names.
     pub(crate) policies: HashMap<PgClassOid, Vec<String>>,
+    /// CHECK constraints' expressions and `connoinherit`.
+    pub(crate) check_defs: HashMap<PgConstraintOid, crate::ddl::tables::check_inherit::CheckDef>,
     /// `pg_type.typsubscript` of user base types, as the handler function's
     /// name (`hstore_subscript_handler`), set by `CREATE TYPE (SUBSCRIPT =
     /// …)` / `ALTER TYPE … SET (SUBSCRIPT = …)`. Built-in types aren't
@@ -474,6 +476,7 @@ impl PgCatalog {
             partition_keys: HashMap::new(),
             triggers: HashMap::new(),
             policies: HashMap::new(),
+            check_defs: HashMap::new(),
             type_subscript: HashMap::new(),
             next_oid: USER_OID_START_NZ,
             #[cfg(feature = "pg_sanity")]

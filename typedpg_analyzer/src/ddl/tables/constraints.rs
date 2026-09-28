@@ -63,6 +63,7 @@ pub(crate) fn emit_constraints(
                         vec![an],
                         None,
                         Vec::new(),
+                        None,
                     ));
                 }
                 Ok(ConstrType::ConstrUnique) => {
@@ -78,6 +79,7 @@ pub(crate) fn emit_constraints(
                         vec![an],
                         None,
                         Vec::new(),
+                        None,
                     ));
                 }
                 Ok(ConstrType::ConstrCheck) => {
@@ -93,6 +95,12 @@ pub(crate) fn emit_constraints(
                         vec![an],
                         None,
                         Vec::new(),
+                        Some(check_inherit::CheckDef {
+                            expr: check_inherit::check_expr_text(
+                                &c.raw_expr.clone().map(|b| *b).unwrap_or_default(),
+                            ),
+                            no_inherit: c.is_no_inherit,
+                        }),
                     ));
                 }
                 Ok(ConstrType::ConstrForeign) => {
@@ -140,6 +148,7 @@ pub(crate) fn emit_constraints(
                     columns,
                     None,
                     Vec::new(),
+                    None,
                 ));
             }
             Ok(ConstrType::ConstrUnique) if !columns.is_empty() => {
@@ -155,6 +164,7 @@ pub(crate) fn emit_constraints(
                     columns,
                     None,
                     Vec::new(),
+                    None,
                 ));
             }
             Ok(ConstrType::ConstrCheck) => {
@@ -170,6 +180,12 @@ pub(crate) fn emit_constraints(
                     columns,
                     None,
                     Vec::new(),
+                    Some(check_inherit::CheckDef {
+                        expr: check_inherit::check_expr_text(
+                            &c.raw_expr.clone().map(|b| *b).unwrap_or_default(),
+                        ),
+                        no_inherit: c.is_no_inherit,
+                    }),
                 ));
             }
             Ok(ConstrType::ConstrExclusion) => {
@@ -186,6 +202,7 @@ pub(crate) fn emit_constraints(
                     keys,
                     None,
                     Vec::new(),
+                    None,
                 ));
             }
             Ok(ConstrType::ConstrForeign) => {
@@ -235,11 +252,14 @@ pub(crate) fn emit_constraints(
             _ => kept.push(pending),
         }
     }
-    for (conname, contype, conkey, confrelid, confkey) in kept {
+    for (conname, contype, conkey, confrelid, confkey, check) in kept {
         let conname = conname.resolve(interp, relid);
-        emit_constraint_with_backing_index(
+        let oid = emit_constraint_with_backing_index(
             interp, relid, conname, contype, conkey, confrelid, confkey,
         )?;
+        if let Some(def) = check {
+            interp.check_defs.insert(oid, def);
+        }
     }
     for (c, local_names, local_types, conkey, default_name) in pending_fks {
         let (target_oid, target_attnums) =
@@ -273,7 +293,7 @@ fn emit_constraint_with_backing_index(
     conkey: Vec<i16>,
     confrelid: Option<PgClassOid>,
     confkey: Vec<i16>,
-) -> Result<(), DdlError> {
+) -> Result<PgConstraintOid, DdlError> {
     if matches!(contype, ConType::PrimaryKey | ConType::Unique) {
         let label = if contype == ConType::PrimaryKey {
             "PRIMARY KEY"
@@ -329,7 +349,7 @@ fn emit_constraint_with_backing_index(
             indpred: None,
         });
     }
-    Ok(())
+    Ok(oid)
 }
 
 /// DefineIndex (indexcmds.c): a unique index on a partitioned table must
@@ -803,6 +823,13 @@ pub(crate) fn drop_constraint(
     {
         return super::inherit::drop_not_null_constraint(interp, &con, rec);
     }
+    if let Some(con) = found_oid
+        .and_then(|oid| interp.pg_constraint.get(&oid))
+        .filter(|c| c.contype == ConType::Check)
+        .cloned()
+    {
+        return super::check_inherit::drop_check(interp, &con, rec);
+    }
     let Some(oid) = found_oid else {
         if cmd.missing_ok {
             return Ok(());
@@ -928,7 +955,15 @@ pub(crate) fn add_column_constraints(
                 c.keys = vec![colname_node.clone()];
             }
             Ok(ConstrType::ConstrForeign) => c.fk_attrs = vec![colname_node.clone()],
-            Ok(ConstrType::ConstrCheck) => {}
+            Ok(ConstrType::ConstrCheck) => {
+                // The column reaches the children, and so does its CHECK.
+                let rec = super::inherit::Recursion {
+                    recurse: true,
+                    recursing: false,
+                };
+                add_constraint_node(interp, relid, &c, &cd.colname, rec)?;
+                continue;
+            }
             _ => continue,
         }
         add_constraint_node(interp, relid, &c, &cd.colname, only_here)?;
@@ -1095,13 +1130,13 @@ fn add_constraint_node(
             },
         )
         .resolve(interp, relid);
-        emit_constraint_with_backing_index(
+        super::check_inherit::add_check(
             interp,
             relid,
-            conname,
-            ConType::Check,
-            Vec::new(),
-            None,
+            &conname,
+            expr,
+            c.is_no_inherit,
+            rec,
             Vec::new(),
         )?;
     }
@@ -1345,6 +1380,9 @@ pub(crate) fn copy_like_constraints(
         for c in checks {
             let conkey = c.conkey.iter().map(|&an| new_attnum(interp, an)).collect();
             let oid = PgConstraintOid::from_nonzero(interp.alloc_oid()?);
+            if let Some(def) = interp.check_defs.get(&c.oid).cloned() {
+                interp.check_defs.insert(oid, def);
+            }
             interp.insert_pg_constraint(PgConstraint {
                 oid,
                 conname: c.conname,

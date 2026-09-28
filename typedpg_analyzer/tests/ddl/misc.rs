@@ -801,3 +801,120 @@ fn alter_table_object_references_are_resolved() {
         ),
     ]);
 }
+
+#[test]
+fn check_constraints_are_inherited() {
+    // PG 18 MergeCheckConstraint / MergeWithExistingConstraint /
+    // ATAddCheckNNConstraint / dropconstraint_internal /
+    // rename_constraint_internal.
+    let setup = "CREATE TABLE p (a int CONSTRAINT pc CHECK (a > 0));
+                 CREATE TABLE p2 (a int CONSTRAINT pc CHECK (a > 1));
+                 CREATE TABLE p3 (a int CONSTRAINT pc CHECK (a > 0));
+                 CREATE TABLE c () INHERITS (p);
+                 CREATE TABLE c2 () INHERITS (p, p3);";
+    for (stmt, msg) in [
+        (
+            "CREATE TABLE x () INHERITS (p, p2);",
+            "check constraint name \"pc\" appears multiple times but with different expressions",
+        ),
+        (
+            "CREATE TABLE x (CONSTRAINT pc CHECK (a > 5)) INHERITS (p);",
+            "constraint \"pc\" for relation \"x\" already exists",
+        ),
+        (
+            "CREATE TABLE x (CONSTRAINT pc CHECK (a > 0) NO INHERIT) INHERITS (p);",
+            "constraint \"pc\" conflicts with inherited constraint on relation \"x\"",
+        ),
+        (
+            "ALTER TABLE c DROP CONSTRAINT pc;",
+            "cannot drop inherited constraint \"pc\" of relation \"c\"",
+        ),
+        (
+            "ALTER TABLE c ADD CONSTRAINT pc CHECK (a > 5);",
+            "constraint \"pc\" for relation \"c\" already exists",
+        ),
+        (
+            "ALTER TABLE p ADD CONSTRAINT pc2 CHECK (a > 1); ALTER TABLE c DROP CONSTRAINT pc2;",
+            "cannot drop inherited constraint \"pc2\" of relation \"c\"",
+        ),
+        (
+            "ALTER TABLE ONLY p ADD CONSTRAINT q CHECK (a < 100);",
+            "constraint must be added to child tables too",
+        ),
+        (
+            "ALTER TABLE c ADD CONSTRAINT z CHECK (a < 5); ALTER TABLE p ADD CONSTRAINT z CHECK (a < 6);",
+            "constraint \"z\" for relation \"c\" already exists",
+        ),
+        (
+            "ALTER TABLE p ADD CONSTRAINT k CHECK (a < 9); ALTER TABLE p ADD CONSTRAINT k CHECK (a < 9);",
+            "constraint \"k\" for relation \"p\" already exists",
+        ),
+        (
+            "ALTER TABLE c ADD CONSTRAINT z CHECK (a < 5) NO INHERIT; ALTER TABLE p ADD CONSTRAINT z CHECK (a < 5);",
+            "constraint \"z\" conflicts with non-inherited constraint on relation \"c\"",
+        ),
+        (
+            "ALTER TABLE c RENAME CONSTRAINT pc TO pz;",
+            "cannot rename inherited constraint \"pc\"",
+        ),
+        (
+            "ALTER TABLE ONLY p RENAME CONSTRAINT pc TO pz;",
+            "inherited constraint \"pc\" must be renamed in child tables too",
+        ),
+        (
+            // c2 inherits pc from p3 as well.
+            "ALTER TABLE p RENAME CONSTRAINT pc TO pz;",
+            "cannot rename inherited constraint \"pc\"",
+        ),
+        (
+            "ALTER TABLE p ADD CONSTRAINT y CHECK (a < 7);
+             ALTER TABLE p RENAME CONSTRAINT y TO w; ALTER TABLE c DROP CONSTRAINT w;",
+            "cannot drop inherited constraint \"w\" of relation \"c\"",
+        ),
+        (
+            "ALTER TABLE p DROP CONSTRAINT pc; ALTER TABLE c2 DROP CONSTRAINT pc;",
+            "cannot drop inherited constraint \"pc\" of relation \"c2\"",
+        ),
+        (
+            "ALTER TABLE p DROP CONSTRAINT pc; ALTER TABLE c DROP CONSTRAINT pc;",
+            "constraint \"pc\" of relation \"c\" does not exist",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "CREATE TABLE c4 (CONSTRAINT pc CHECK (a>0)) INHERITS (p);
+             ALTER TABLE ONLY p ADD CONSTRAINT q CHECK (a < 100) NO INHERIT;
+             ALTER TABLE c ADD CONSTRAINT z CHECK (a < 5);
+             ALTER TABLE p ADD CONSTRAINT z CHECK (a < 5);
+             ALTER TABLE c VALIDATE CONSTRAINT pc;
+             ALTER TABLE ONLY p DROP CONSTRAINT z;
+             ALTER TABLE c DROP CONSTRAINT z;
+             ALTER TABLE c4 DROP CONSTRAINT z;
+             ALTER TABLE p ADD CONSTRAINT y CHECK (a < 7);
+             ALTER TABLE p RENAME CONSTRAINT y TO w;
+             ALTER TABLE p DROP CONSTRAINT w;
+             ALTER TABLE p DROP CONSTRAINT pc;
+             ALTER TABLE c4 DROP CONSTRAINT pc;",
+        ),
+    ]);
+    // A CHECK added with a new column reaches the children.
+    let err = try_apply(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "ALTER TABLE p ADD COLUMN b int CONSTRAINT bc CHECK (b > 0);
+             ALTER TABLE c DROP CONSTRAINT bc;",
+        ),
+    ])
+    .expect_err("ADD COLUMN CHECK");
+    assert!(
+        err.to_string()
+            .starts_with("cannot drop inherited constraint \"bc\" of relation \"c\""),
+        "got: {err}"
+    );
+}

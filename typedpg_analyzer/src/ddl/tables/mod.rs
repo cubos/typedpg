@@ -22,7 +22,15 @@ use crate::qualified_name::QualifiedName;
 /// Pending `pg_constraint` row built up while walking a `CreateStmt`:
 /// `(conname, contype, conkey, confrelid, confkey)`. Materialized into
 /// real catalog rows after all FK targets have been validated.
-type PendingConstraint = (ConName, ConType, Vec<i16>, Option<PgClassOid>, Vec<i16>);
+/// CHECK constraints also carry their definition.
+type PendingConstraint = (
+    ConName,
+    ConType,
+    Vec<i16>,
+    Option<PgClassOid>,
+    Vec<i16>,
+    Option<check_inherit::CheckDef>,
+);
 
 /// A constraint's name: the explicit one, or PG's generated
 /// `<table>[_<addition>]_<label>` — unique among the schema's relations for
@@ -389,6 +397,7 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
     // Emit pg_constraint rows so ON CONFLICT, DROP CASCADE, and FK
     // dependency checks can consult them later. FK validation runs here.
     emit_constraints(interp, class_oid, &name, stmt)?;
+    check_inherit::inherit_parent_checks(interp, class_oid)?;
     for like in &likes {
         copy_like_constraints(interp, class_oid, &name, like)?;
     }
@@ -635,6 +644,7 @@ fn check_alter_target(
     )))
 }
 
+pub(crate) mod check_inherit;
 mod column_options;
 mod columns;
 mod constraints;

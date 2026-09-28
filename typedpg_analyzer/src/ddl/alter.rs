@@ -88,6 +88,17 @@ fn rename_constraint(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), Dd
     };
 
     let old_name = stmt.subname.clone();
+    if interp.pg_constraint.get(&target_oid).map(|c| c.contype)
+        == Some(crate::pg_catalog::ConType::Check)
+    {
+        return crate::ddl::tables::check_inherit::rename_check(
+            interp,
+            class_oid,
+            &old_name,
+            &stmt.newname,
+            rv.inh,
+        );
+    }
     let is_pkey_or_unique = matches!(
         interp.pg_constraint.get(&target_oid).map(|c| c.contype),
         Some(crate::pg_catalog::ConType::PrimaryKey | crate::pg_catalog::ConType::Unique)
