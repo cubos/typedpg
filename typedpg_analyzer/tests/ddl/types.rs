@@ -481,3 +481,35 @@ fn create_range_requires_a_subtype() {
         "type attribute \"subtype\" is required",
     );
 }
+
+// ── ALTER TYPE ... ATTRIBUTE on composite types ────────────────────────────
+
+#[test]
+fn composite_type_attributes_follow_alter_type() {
+    // PG 18: ADD / DROP / RENAME ATTRIBUTE are allowed even while a table
+    // uses the type; ALTER ATTRIBUTE ... TYPE is not.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TYPE c AS (x int);
+         CREATE TABLE tc (v c);
+         ALTER TYPE c ADD ATTRIBUTE z int;
+         ALTER TYPE c RENAME ATTRIBUTE x TO w;",
+    )]);
+    let info = db.analyze("SELECT (v).w, (v).z FROM tc").unwrap();
+    assert_eq!(info.columns.len(), 2);
+    let err = try_apply(&[(
+        "0001.sql",
+        "CREATE TYPE c AS (x int); CREATE TABLE tc (v c);
+         ALTER TYPE c ALTER ATTRIBUTE x TYPE text;",
+    )])
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("cannot alter type \"c\" because column \"tc.v\" uses it"),
+        "{err}"
+    );
+    build_db(&[(
+        "0001.sql",
+        "CREATE TYPE c AS (x int); ALTER TYPE c ALTER ATTRIBUTE x TYPE text;",
+    )]);
+}

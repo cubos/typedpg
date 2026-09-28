@@ -772,6 +772,41 @@ pub(crate) fn alter_column_type(
         .attribute_by_name(relid, &cmd.name)
         .cloned()
         .ok_or_else(|| DdlError::Parse(column_not_found_msg(interp, relid, &cmd.name)))?;
+    // find_composite_type_dependencies: a composite type's attribute can't
+    // change type while a table column stores values of the type.
+    if let Some(class) = interp.pg_class.get(&relid)
+        && class.relkind == RelKind::CompositeType
+        && let Some(row_type) = class.reltype
+    {
+        let array = interp.array_type_of(row_type);
+        let user = interp
+            .pg_attribute
+            .iter()
+            .filter(|(user_rel, _)| {
+                interp.pg_class.get(user_rel).is_some_and(|c| {
+                    matches!(
+                        c.relkind,
+                        RelKind::Table
+                            | RelKind::Partitioned
+                            | RelKind::ForeignTable
+                            | RelKind::MaterializedView
+                    )
+                })
+            })
+            .find_map(|(user_rel, attrs)| {
+                attrs
+                    .iter()
+                    .find(|a| a.atttypid == row_type || Some(a.atttypid) == array)
+                    .map(|a| (*user_rel, a.attname.clone()))
+            });
+        if let Some((user_rel, column)) = user {
+            return Err(DdlError::Parse(format!(
+                "cannot alter type \"{}\" because column \"{}.{column}\" uses it",
+                class.relname,
+                relname_of(interp, user_rel)
+            )));
+        }
+    }
     // GetColumnDefCollation: an explicit COLLATE, else the new type's
     // default — the old column's collation does not carry over.
     let new_collation = column_collation(interp, cd, new_type_oid)?

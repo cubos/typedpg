@@ -31,7 +31,9 @@ pub fn rename(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlError>
         }
         ObjectType::ObjectType | ObjectType::ObjectDomain => rename_type_obj(interp, stmt),
         ObjectType::ObjectSchema => rename_schema(interp, stmt),
-        ObjectType::ObjectColumn => rename_column(interp, stmt),
+        // RENAME ATTRIBUTE of a composite type is a column rename of its
+        // relation.
+        ObjectType::ObjectColumn | ObjectType::ObjectAttribute => rename_column(interp, stmt),
         ObjectType::ObjectTabconstraint | ObjectType::ObjectDomconstraint => {
             rename_constraint(interp, stmt)
         }
