@@ -1507,3 +1507,110 @@ fn partition_bounds_are_validated() {
         ),
     ]);
 }
+
+#[test]
+fn rules_are_validated_and_tracked() {
+    // PG 18 transformRuleStmt / DefineQueryRewrite / InsertRule /
+    // RenameRewriteRule / get_rewrite_oid / EnableDisableRule.
+    let setup = "CREATE TABLE t (a int);
+                 CREATE VIEW v AS SELECT 1 AS a;
+                 CREATE TABLE pt (a int) PARTITION BY LIST (a);
+                 CREATE SEQUENCE s;
+                 CREATE MATERIALIZED VIEW mv AS SELECT 1 AS a;
+                 CREATE RULE r AS ON INSERT TO t DO INSTEAD NOTHING;
+                 CREATE RULE q AS ON DELETE TO t DO INSTEAD NOTHING;";
+    for (stmt, msg) in [
+        (
+            "CREATE RULE x AS ON INSERT TO nosuch DO INSTEAD NOTHING;",
+            "relation \"nosuch\" does not exist",
+        ),
+        (
+            "CREATE RULE r AS ON INSERT TO t DO INSTEAD NOTHING;",
+            "rule \"r\" for relation \"t\" already exists",
+        ),
+        (
+            "CREATE RULE x AS ON INSERT TO s DO INSTEAD NOTHING;",
+            "relation \"s\" cannot have rules",
+        ),
+        (
+            "CREATE RULE x AS ON INSERT TO mv DO INSTEAD NOTHING;",
+            "rules on materialized views are not supported",
+        ),
+        (
+            "CREATE RULE x AS ON INSERT TO t WHERE nosuch > 0 DO INSTEAD NOTHING;",
+            "column \"nosuch\" does not exist",
+        ),
+        (
+            "CREATE RULE x AS ON INSERT TO t WHERE new.a DO INSTEAD NOTHING;",
+            "argument of WHERE must be type boolean, not type integer",
+        ),
+        (
+            "CREATE RULE x AS ON INSERT TO t WHERE old.a > 0 DO INSTEAD NOTHING;",
+            "invalid reference to FROM-clause entry for table \"old\"",
+        ),
+        (
+            "CREATE RULE x AS ON DELETE TO t DO INSTEAD SELECT new.a;",
+            "ON DELETE rule cannot use NEW",
+        ),
+        (
+            "CREATE RULE x AS ON INSERT TO t DO INSTEAD SELECT old.a;",
+            "ON INSERT rule cannot use OLD",
+        ),
+        (
+            "CREATE RULE x AS ON DELETE TO t WHERE new.a > 0 DO INSTEAD NOTHING;",
+            "invalid reference to FROM-clause entry for table \"new\"",
+        ),
+        (
+            "CREATE RULE x AS ON INSERT TO t DO INSTEAD INSERT INTO nosuch VALUES (1);",
+            "relation \"nosuch\" does not exist",
+        ),
+        (
+            "CREATE RULE \"_RETURN\" AS ON SELECT TO t DO INSTEAD SELECT 1 AS a;",
+            "relation \"t\" cannot have ON SELECT rules",
+        ),
+        (
+            "ALTER RULE nosuch ON t RENAME TO z;",
+            "rule \"nosuch\" for relation \"t\" does not exist",
+        ),
+        (
+            "ALTER RULE r ON t RENAME TO q;",
+            "rule \"q\" for relation \"t\" already exists",
+        ),
+        (
+            "ALTER TABLE t DISABLE RULE nosuch;",
+            "rule \"nosuch\" for relation \"t\" does not exist",
+        ),
+        (
+            "ALTER TABLE t ENABLE RULE nosuch;",
+            "rule \"nosuch\" for relation \"t\" does not exist",
+        ),
+        (
+            "DROP RULE nosuch ON t;",
+            "rule \"nosuch\" for relation \"t\" does not exist",
+        ),
+        (
+            "ALTER RULE r ON t RENAME TO rr; DROP RULE r ON t;",
+            "rule \"r\" for relation \"t\" does not exist",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "CREATE OR REPLACE RULE r AS ON UPDATE TO t DO INSTEAD NOTHING;
+             CREATE RULE vr AS ON INSERT TO v DO INSTEAD NOTHING;
+             CREATE RULE pr AS ON INSERT TO pt DO INSTEAD NOTHING;
+             CREATE RULE w AS ON UPDATE TO t WHERE old.a <> new.a DO ALSO
+                 WITH c AS (SELECT 1) SELECT * FROM c;
+             ALTER RULE r ON t RENAME TO rr;
+             ALTER TABLE t DISABLE RULE rr;
+             ALTER TABLE t ENABLE ALWAYS RULE rr;
+             DROP RULE IF EXISTS nosuch ON t;
+             DROP RULE IF EXISTS nosuch ON nosuch;
+             DROP RULE rr ON t;",
+        ),
+    ]);
+}

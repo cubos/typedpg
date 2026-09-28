@@ -18,6 +18,7 @@ pub mod functions;
 pub mod indexes;
 pub mod operators;
 mod policies;
+mod rules;
 pub mod schema_stmt;
 pub mod sequences;
 pub(crate) mod session;
@@ -198,8 +199,8 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         node::Node::GrantStmt(s) => acl::grant(db, s),
         node::Node::CreatePolicyStmt(s) => policies::create_policy(db, s),
         node::Node::AlterPolicyStmt(s) => policies::alter_policy(db, s),
+        node::Node::RuleStmt(s) => rules::create_rule(db, s),
         node::Node::GrantRoleStmt(_)
-        | node::Node::RuleStmt(_)
         | node::Node::ConstraintsSetStmt(_)
         | node::Node::AlterOwnerStmt(_)
         | node::Node::AlterDefaultPrivilegesStmt(_)

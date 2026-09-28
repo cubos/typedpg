@@ -620,6 +620,12 @@ fn apply_alter_subtype(
         AlterTableType::AtValidateConstraint => {
             object_refs::validate_constraint(interp, relid, cmd)
         }
+        AlterTableType::AtEnableRule
+        | AlterTableType::AtEnableAlwaysRule
+        | AlterTableType::AtEnableReplicaRule
+        | AlterTableType::AtDisableRule => {
+            crate::ddl::rules::check_rule_exists(interp, relid, &cmd.name)
+        }
         AlterTableType::AtEnableTrig
         | AlterTableType::AtEnableAlwaysTrig
         | AlterTableType::AtEnableReplicaTrig
