@@ -403,3 +403,81 @@ fn create_domain_check_must_be_boolean() {
         "CREATE DOMAIN pos AS int CHECK (VALUE > 0) CHECK (VALUE < 100);",
     )]);
 }
+
+// ── CREATE TYPE ... AS RANGE: multirange + constructors ─────────────────────
+
+#[test]
+fn create_range_creates_the_multirange_type() {
+    // PG 18: floatrange → floatmultirange, fr → fr_multirange,
+    // multirange_type_name overrides.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TYPE floatrange AS RANGE (subtype = float8, subtype_diff = float8mi);
+         CREATE TYPE fr AS RANGE (subtype = float8);
+         CREATE TYPE textrng AS RANGE (subtype = text, multirange_type_name = tmr);
+         CREATE TABLE t (r floatrange, m floatmultirange, m2 fr_multirange, m3 tmr);",
+    )]);
+    let info = db.analyze("SELECT * FROM t").unwrap();
+    let names: Vec<String> = info
+        .columns
+        .iter()
+        .map(|c| c.pg_type.cast_name().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            "public.floatrange",
+            "public.floatmultirange",
+            "public.fr_multirange",
+            "public.tmr"
+        ]
+    );
+}
+
+#[test]
+fn create_range_creates_the_constructor_functions() {
+    // PG 18: fr(...) returns fr; multirange(r) returns floatmultirange;
+    // fr_multirange() / fr_multirange(fr) / fr_multirange(VARIADIC) exist.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TYPE floatrange AS RANGE (subtype = float8);
+         CREATE TYPE fr AS RANGE (subtype = float8);
+         CREATE TABLE t (r floatrange);",
+    )]);
+    let info = db
+        .analyze(
+            "SELECT fr(1.0::float8, 2.0::float8) AS a, fr(1, 2, '[]') AS b,
+                    multirange(r) AS c, fr_multirange() AS d,
+                    fr_multirange(fr(1, 2)) AS e, fr_multirange(fr(1, 2), fr(3, 4)) AS f
+             FROM t",
+        )
+        .unwrap();
+    let names: Vec<String> = info
+        .columns
+        .iter()
+        .map(|c| c.pg_type.cast_name().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            "public.fr",
+            "public.fr",
+            "public.floatmultirange",
+            "public.fr_multirange",
+            "public.fr_multirange",
+            "public.fr_multirange"
+        ]
+    );
+}
+
+#[test]
+fn create_range_requires_a_subtype() {
+    assert_ddl_err!(
+        try_apply(&[(
+            "0001.sql",
+            "CREATE TYPE r AS RANGE (subtype_diff = float8mi);"
+        )]),
+        DdlError::Parse(_),
+        "type attribute \"subtype\" is required",
+    );
+}

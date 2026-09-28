@@ -464,20 +464,58 @@ pub fn create_range(interp: &mut PgCatalog, stmt: &CreateRangeStmt) -> Result<()
         )));
     }
 
-    // Extract subtype from params (look for DefElem with defname="subtype").
+    // DefineRange (typecmds.c): `subtype` is required; `multirange_type_name`
+    // overrides the derived multirange name.
     let mut subtype_oid: Option<PgTypeOid> = None;
+    let mut multirange_names: Option<Vec<String>> = None;
     for param_node in &stmt.params {
-        if let Some(node::Node::DefElem(de)) = param_node.node.as_ref()
-            && de.defname == "subtype"
-            && let Some(arg) = de.arg.as_deref()
-            && let Some(node::Node::TypeName(tn)) = arg.node.as_ref()
-        {
-            subtype_oid = Some(lookup_type_name(tn, interp)?);
+        let Some(node::Node::DefElem(de)) = param_node.node.as_ref() else {
+            continue;
+        };
+        let arg = de.arg.as_deref().and_then(|a| a.node.as_ref());
+        match (de.defname.as_str(), arg) {
+            ("subtype", Some(node::Node::TypeName(tn))) => {
+                subtype_oid = Some(lookup_type_name(tn, interp)?);
+            }
+            ("multirange_type_name", Some(node::Node::TypeName(tn))) => {
+                multirange_names = Some(
+                    tn.names
+                        .iter()
+                        .filter_map(node_string)
+                        .map(str::to_owned)
+                        .collect(),
+                );
+            }
+            ("multirange_type_name", Some(node::Node::List(l))) => {
+                multirange_names = Some(
+                    l.items
+                        .iter()
+                        .filter_map(node_string)
+                        .map(str::to_owned)
+                        .collect(),
+                );
+            }
+            _ => {}
         }
     }
     let Some(subtype_oid) = subtype_oid else {
-        return Ok(());
+        return Err(DdlError::Parse(
+            "type attribute \"subtype\" is required".into(),
+        ));
     };
+    let (mr_nsoid, mr_name) = match multirange_names.as_deref() {
+        Some([schema, mr]) => (super::util::ensure_namespace(interp, schema)?, mr.clone()),
+        Some([mr]) => (nsoid, mr.clone()),
+        _ => (nsoid, make_multirange_type_name(&name)),
+    };
+    if interp
+        .type_by_qname
+        .contains_key(&(mr_nsoid, mr_name.clone()))
+    {
+        return Err(DdlError::DuplicateObject(format!(
+            "type \"{mr_name}\" already exists"
+        )));
+    }
 
     let oid = PgTypeOid::from_nonzero(interp.alloc_oid()?);
     interp.insert_pg_type(PgType {
@@ -495,17 +533,94 @@ pub fn create_range(interp: &mut PgCatalog, stmt: &CreateRangeStmt) -> Result<()
         typtypmod: None,
         typcollation: None,
     });
-    // TODO: PG also auto-creates the companion multirange type
-    // (`<name>_multirange` / MULTIRANGE_TYPE_NAME); the DDL interpreter
-    // does not yet, so user-defined ranges have no rngmultitypid.
+    let range_array = register_array_type(interp, nsoid, &name, oid)?;
+
+    let mr_oid = PgTypeOid::from_nonzero(interp.alloc_oid()?);
+    interp.insert_pg_type(PgType {
+        oid: mr_oid,
+        typname: mr_name.clone(),
+        typnamespace: mr_nsoid,
+        typtype: TypType::Multirange,
+        typcategory: TypCategory::Range,
+        typispreferred: false,
+        typrelid: None,
+        typelem: None,
+        typarray: None,
+        typbasetype: None,
+        typnotnull: false,
+        typtypmod: None,
+        typcollation: None,
+    });
+    register_array_type(interp, mr_nsoid, &mr_name, mr_oid)?;
     interp.insert_pg_range(PgRange {
         rngtypid: oid,
         rngsubtype: subtype_oid,
-        rngmultitypid: None,
+        rngmultitypid: Some(mr_oid),
     });
 
-    register_array_type(interp, nsoid, &name, oid)?;
+    // makeRangeConstructors / makeMultirangeConstructors: `name(sub, sub)`
+    // and `name(sub, sub, text)` (not strict — NULL bounds mean infinite),
+    // `mr()`, `mr(range)` and `mr(VARIADIC range[])` (strict).
+    use crate::pg_catalog::oid as builtin;
+    let constructors = [
+        (
+            &name,
+            nsoid,
+            vec![subtype_oid, subtype_oid],
+            oid,
+            false,
+            false,
+        ),
+        (
+            &name,
+            nsoid,
+            vec![subtype_oid, subtype_oid, builtin::TEXT],
+            oid,
+            false,
+            false,
+        ),
+        (&mr_name, mr_nsoid, vec![], mr_oid, true, false),
+        (&mr_name, mr_nsoid, vec![oid], mr_oid, true, false),
+        (&mr_name, mr_nsoid, vec![range_array], mr_oid, true, true),
+    ];
+    for (proname, pronamespace, proargtypes, prorettype, proisstrict, variadic) in constructors {
+        let proc_oid = crate::oid::PgProcOid::from_nonzero(interp.alloc_oid()?);
+        interp.insert_pg_proc(crate::pg_catalog::PgProc {
+            oid: proc_oid,
+            proname: proname.to_owned(),
+            pronamespace,
+            prokind: crate::pg_catalog::ProKind::Function,
+            proallargtypes: if variadic {
+                proargtypes.clone()
+            } else {
+                Vec::new()
+            },
+            proargmodes: if variadic {
+                vec![crate::pg_catalog::ArgMode::Variadic]
+            } else {
+                Vec::new()
+            },
+            proargtypes,
+            prorettype,
+            proretset: false,
+            provariadic: variadic.then_some(oid),
+            proisstrict,
+            pronargdefaults: 0,
+            proargnames: Vec::new(),
+            provolatile: crate::pg_catalog::ProVolatile::Immutable,
+        });
+    }
     Ok(())
+}
+
+/// PG's `makeMultirangeTypeName`: the first `range` in the range type's
+/// name becomes `multirange` (`floatrange` → `floatmultirange`); a name
+/// without it gets `_multirange` appended (`fr` → `fr_multirange`).
+fn make_multirange_type_name(range_name: &str) -> String {
+    match range_name.find("range") {
+        Some(pos) => format!("{}multi{}", &range_name[..pos], &range_name[pos..]),
+        None => super::util::make_object_name(range_name, "", "multirange"),
+    }
 }
 
 // ─── ALTER TYPE ... ADD VALUE (enum) ────────────────────────────────────────
