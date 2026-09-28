@@ -163,6 +163,13 @@ fn handle_distinct_from(
             node: Some(node::Node::NullTest(Box::new(t))),
         };
         infer_expr(&n, ctx, params, TypeGoal::NONE)?;
+    } else if let (Some(node::Node::RowExpr(l)), Some(node::Node::RowExpr(r))) =
+        (lexpr.node.as_ref(), rexpr.node.as_ref())
+    {
+        // make_row_distinct_op: a pairwise `=` per column.
+        row_pairwise_op("=", &l.args, &r.args, expr.location, ctx, params, |_| {
+            "IS DISTINCT FROM requires = operator to yield boolean".to_string()
+        })?;
     } else {
         infer_synthetic_op("=", lexpr, rexpr, expr.location, ctx, params)?;
     }
@@ -309,6 +316,30 @@ pub(crate) fn infer_synthetic_op(
     infer_a_expr(&e, ctx, params)
 }
 
+/// Resolve `l op r` as PG's `make_op` does on already-transformed operands:
+/// the plain operator lookup, with no row-constructor special case — so the
+/// columns of a row comparison that are themselves `ROW(…)` compare as
+/// `record = record` and their contents are not typed pairwise.
+fn infer_plain_op(
+    op: &str,
+    l: &protobuf::Node,
+    r: &protobuf::Node,
+    location: i32,
+    ctx: Ctx<'_>,
+    params: &mut ParamCollector,
+) -> Result<ExprType, AnalyzeError> {
+    let e = protobuf::AExpr {
+        kind: protobuf::AExprKind::AexprOp as i32,
+        name: vec![protobuf::Node {
+            node: Some(node::Node::String(protobuf::String { sval: op.into() })),
+        }],
+        lexpr: Some(Box::new(l.clone())),
+        rexpr: Some(Box::new(r.clone())),
+        location,
+    };
+    infer_generic_binary_op(&e, op, ctx, params)
+}
+
 /// A `NULL::T` node standing for "some value of type T" (the folded array
 /// element of an IN list).
 pub(crate) fn typed_null(t: PgTypeOid) -> protobuf::Node {
@@ -394,11 +425,7 @@ fn handle_any_all(
     // before any operator resolution: `1 = ANY(42)` and
     // `1 = ANY('{}'::jsonb)` both fail with this exact wording (42809).
     // UNKNOWN right sides are excluded: they get coerced to `T[]` below.
-    if right_oid != oid::UNKNOWN
-        && !snapshot
-            .get_type(snapshot.unwrap_domain(right_oid))
-            .is_some_and(|t| t.typcategory == TypCategory::Array)
-    {
+    if right_oid != oid::UNKNOWN && array_element_type(snapshot, right_oid).is_none() {
         let span = crate::error::SourceSpan::from_location(expr.location);
         return Err(crate::error::RawError::invalid(
             "op ANY/ALL (array) requires array on right side".to_string(),
@@ -431,13 +458,7 @@ fn handle_any_all(
     // right is concrete T[], left is unknown → left must be the element type T.
     if right_oid != oid::UNKNOWN
         && left_oid == oid::UNKNOWN
-        && let Some(elem_oid) = snapshot.get_type(right_oid).and_then(|t| {
-            if t.typcategory == TypCategory::Array {
-                t.typelem
-            } else {
-                None
-            }
-        })
+        && let Some(elem_oid) = array_element_type(snapshot, right_oid)
         && let Some(lexpr) = &expr.lexpr
     {
         coerce_unknown_to(lexpr, ctx, params, elem_oid)?;
@@ -452,15 +473,7 @@ fn handle_any_all(
     // out of scope.
     if left_oid != oid::UNKNOWN
         && right_oid != oid::UNKNOWN
-        && let Some(elem_oid) = snapshot
-            .get_type(snapshot.unwrap_domain(right_oid))
-            .and_then(|t| {
-                if t.typcategory == TypCategory::Array {
-                    t.typelem
-                } else {
-                    None
-                }
-            })
+        && let Some(elem_oid) = array_element_type(snapshot, right_oid)
     {
         let op_name = extract_string_fields(&expr.name).join(".");
         if !op_name.is_empty()
@@ -482,25 +495,19 @@ fn handle_any_all(
     Ok(Some(ExprType::scalar(oid::BOOL, any_nullable)))
 }
 
-/// Record-record comparison pre-pass.
-///
-/// `ROW(a, b) = ROW(c, d)` and the implicit `(a, b) = (c, d)` both parse as
-/// AExpr with two RowExpr children. The generic resolver can't handle them:
-/// `find_operator` looks for a `record OP record` overload but neither side
-/// carries enough type info for params to be pinned, so `$p1`/`$p2` fall
-/// through as text. Instead, walk both rows once to collect shapes, then
-/// back-fill each ROW element with the peer's concrete OID as a goal — exactly
-/// mirroring how PG types each component before reaching the row-compare
-/// operator.
+/// `ROW(a, b) op ROW(c, d)` (also the implicit `(a, b) op (c, d)`), for any
+/// operator — PG's `make_row_comparison_op`, reached whenever both raw
+/// operands are row constructors. Each column pair is resolved with the
+/// ordinary operator machinery (`make_op`), so `(n, s) = (1, 2)` is
+/// `operator does not exist: text = integer` and untyped elements are typed
+/// by their peer; every pairwise operator must yield boolean. (The btree
+/// opfamily check PG applies to multi-column rows is not modeled.)
 fn handle_row_row(
     expr: &protobuf::AExpr,
     op_name: &str,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<Option<ExprType>, AnalyzeError> {
-    if !matches!(op_name, "=" | "<>" | "<" | ">" | "<=" | ">=") {
-        return Ok(None);
-    }
     let (Some(lexpr), Some(rexpr)) = (expr.lexpr.as_deref(), expr.rexpr.as_deref()) else {
         return Ok(None);
     };
@@ -509,42 +516,52 @@ fn handle_row_row(
     else {
         return Ok(None);
     };
+    row_pairwise_op(
+        op_name,
+        &lrow.args,
+        &rrow.args,
+        expr.location,
+        ctx,
+        params,
+        |t| format!("row comparison operator must yield type boolean, not type {t}"),
+    )
+    .map(Some)
+}
 
-    // PG (parse_analyze): `unequal number of entries in row expressions`
-    // when the two ROWs have different arity. Catch it up front so the
-    // back-fill loop below can assume aligned positions.
-    if lrow.args.len() != rrow.args.len() {
-        return Err(AnalyzeError::Invalid(
+/// The pairwise core of `make_row_comparison_op` / `make_row_distinct_op`:
+/// equal arity (`unequal number of entries in row expressions`), at least
+/// one column (`cannot compare rows of zero length`), and each pair's
+/// operator resolved and required to return boolean (`not_bool` renders
+/// the construct's wording). The result is bool, nullable if any column is.
+pub(crate) fn row_pairwise_op(
+    op_name: &str,
+    largs: &[protobuf::Node],
+    rargs: &[protobuf::Node],
+    location: i32,
+    ctx: Ctx<'_>,
+    params: &mut ParamCollector,
+    not_bool: impl Fn(&str) -> String,
+) -> Result<ExprType, AnalyzeError> {
+    if largs.len() != rargs.len() {
+        return Err(AnalyzeError::SyntaxError(
             "unequal number of entries in row expressions".to_owned(),
         ));
     }
-    // Pass 1: collect element types for each side with no goal.
-    let mut left_types = Vec::with_capacity(lrow.args.len());
-    let mut right_types = Vec::with_capacity(rrow.args.len());
-    let mut any_nullable = false;
-    for la in &lrow.args {
-        let t = infer_expr(la, ctx, params, TypeGoal::NONE)?;
-        any_nullable = any_nullable || t.nullable;
-        left_types.push(t);
+    if largs.is_empty() {
+        return Err(AnalyzeError::Invalid(
+            "cannot compare rows of zero length".to_owned(),
+        ));
     }
-    for ra in &rrow.args {
-        let t = infer_expr(ra, ctx, params, TypeGoal::NONE)?;
-        any_nullable = any_nullable || t.nullable;
-        right_types.push(t);
-    }
-
-    // Pass 2: back-fill — when one side is concrete and the other is
-    // UNKNOWN at the same position, re-walk the unknown side with the
-    // concrete OID as goal so embedded params get pinned.
-    for (i, (l, r)) in left_types.iter().zip(right_types.iter()).enumerate() {
-        if l.type_oid != oid::UNKNOWN && r.type_oid == oid::UNKNOWN {
-            coerce_unknown_to(&rrow.args[i], ctx, params, l.type_oid)?;
-        } else if r.type_oid != oid::UNKNOWN && l.type_oid == oid::UNKNOWN {
-            coerce_unknown_to(&lrow.args[i], ctx, params, r.type_oid)?;
+    let mut nullable = false;
+    for (l, r) in largs.iter().zip(rargs) {
+        let t = infer_plain_op(op_name, l, r, location, ctx, params)?;
+        if t.type_oid != oid::BOOL {
+            let name = crate::ddl::util::format_type_for_message(ctx.snapshot, t.type_oid);
+            return Err(AnalyzeError::DatatypeMismatch(not_bool(&name)));
         }
+        nullable |= t.nullable;
     }
-
-    Ok(Some(ExprType::scalar(oid::BOOL, any_nullable)))
+    Ok(ExprType::scalar(oid::BOOL, nullable))
 }
 
 /// `ROW(...)` compared against a sub-SELECT: PG counts columns at the subquery

@@ -757,7 +757,7 @@ fn row_compare_mismatched_arity_is_rejected() {
     let db = setup();
     assert_analyze_err!(
         db.analyze("SELECT ROW(1) = ROW(1, 2) AS e"),
-        AnalyzeError::Invalid(_),
+        AnalyzeError::SyntaxError(_),
         "unequal number of entries in row expressions",
     );
 }
@@ -2234,4 +2234,74 @@ fn cast_record_and_text_to_composite_accepted() {
     let db = setup();
     assert!(db.analyze("SELECT ROW(1.0, 2.0)::point2d AS c").is_ok());
     assert!(db.analyze("SELECT ('(1,2)'::text)::point2d AS c").is_ok());
+}
+
+// ── Row comparisons (make_row_comparison_op / make_row_distinct_op) ────────
+
+#[test]
+fn row_comparisons_resolve_each_column_pair() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE t (n int NOT NULL, s text NOT NULL, ni int);")
+        .unwrap();
+    for (sql, msg) in [
+        (
+            "SELECT (n, s) = (1, 2) FROM t",
+            "operator does not exist: text = integer",
+        ),
+        (
+            "SELECT (n, s) < (1, 2) FROM t",
+            "operator does not exist: text < integer",
+        ),
+        (
+            "SELECT (n, s) IS DISTINCT FROM (1, 2) FROM t",
+            "operator does not exist: text = integer",
+        ),
+        (
+            "SELECT (n, s) IN ((1, 2)) FROM t",
+            "operator does not exist: text = integer",
+        ),
+        (
+            "SELECT ROW(n, n) ~ ROW(1, 2) FROM t",
+            "operator does not exist: integer ~ integer",
+        ),
+    ] {
+        assert_err_prefix!(db.analyze(sql), AnalyzeError::UndefinedOperator(_), msg);
+    }
+    assert_err_prefix!(
+        db.analyze("SELECT ROW(n, n) + ROW(1, 2) FROM t"),
+        AnalyzeError::DatatypeMismatch(_),
+        "row comparison operator must yield type boolean, not type integer"
+    );
+    assert_err_prefix!(
+        db.analyze("SELECT ROW() = ROW()"),
+        AnalyzeError::Invalid(_),
+        "cannot compare rows of zero length"
+    );
+    assert_err_prefix!(
+        db.analyze("SELECT ROW(1, 2) = ROW(1)"),
+        AnalyzeError::SyntaxError(_),
+        "unequal number of entries in row expressions"
+    );
+    // Untyped elements are typed by their peer column.
+    for sql in [
+        "SELECT (n, s) = ($a, $b) AS r FROM t",
+        "SELECT (n, s) IN (($a, 'x'), (2, $b)) AS r FROM t",
+        "SELECT (n, s) IS DISTINCT FROM ($a, $b) AS r FROM t",
+    ] {
+        let q = db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let got: Vec<_> = q.params.iter().map(|p| p.pg_type.clone()).collect();
+        assert_eq!(got, vec![int4(), text()], "{sql}");
+    }
+}
+
+#[test]
+fn row_equals_any_array_of_rows() {
+    // ARRAY[ROW(…)] is record[] (`_record`, category P) — still a true array.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE t (n int NOT NULL, ni int);")
+        .unwrap();
+    let s = db
+        .analyze("SELECT ROW(n, ni) = ANY(ARRAY[ROW(1, 2)]) AS a FROM t")
+        .unwrap();
+    assert_eq!(s.columns[0].pg_type, bool_ty());
 }

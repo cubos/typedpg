@@ -904,6 +904,18 @@ fn type_display_name(oid: PgTypeOid, snapshot: &PgCatalog) -> String {
         .unwrap_or_else(|| format!("oid:{}", oid.get()))
 }
 
+/// PG's `get_base_element_type`: the element type of a (domain over a)
+/// true array type — one with a `typelem` and the array subscript handler.
+/// That includes `_record` (category P) but not `point` / `name`, whose
+/// `typelem` makes them subscriptable without being arrays.
+pub(crate) fn array_element_type(snapshot: &PgCatalog, t: PgTypeOid) -> Option<PgTypeOid> {
+    let base = snapshot.unwrap_domain(t);
+    let entry = snapshot.get_type(base)?;
+    let elem = entry.typelem?;
+    (entry.typcategory == TypCategory::Array || snapshot.array_type_of(elem) == Some(base))
+        .then_some(elem)
+}
+
 /// Return `text` when `node` is an untyped string literal (`'x'`) and its
 /// inferred type is still UNKNOWN. Used by constructs that need to treat a
 /// bare string constant as text for type-compatibility checks — NULLIF,
