@@ -378,9 +378,15 @@ fn analyze_insert_select(
     params: &mut ParamCollector,
     cte_scopes: &HashMap<String, Vec<ScopeColumn>>,
 ) -> Result<(), AnalyzeError> {
+    // Walk the SELECT side of `INSERT … SELECT` so its params are registered
+    // and any undefined-column / typo errors inside the SELECT propagate
+    // cleanly. PG (transformInsertStmt) analyzes the SELECT first and only
+    // then compares its *output* width — after `*` expansion and set
+    // operations — with the target list.
+    let (sel_cols, _) = analyze_select_with_ctes(val_sel, snapshot, params, cte_scopes)?;
     let expected_len = insert_arity(tgt);
-    if val_sel.target_list.len() != expected_len {
-        let pg_msg = if val_sel.target_list.len() > expected_len {
+    if sel_cols.len() != expected_len {
+        let pg_msg = if sel_cols.len() > expected_len {
             "INSERT has more expressions than target columns"
         } else {
             "INSERT has more target columns than expressions"
@@ -388,14 +394,28 @@ fn analyze_insert_select(
         return Err(AnalyzeError::Invalid(format!(
             "{pg_msg} (table `{}` expects {expected_len}, SELECT produces {})",
             tgt.relname,
-            val_sel.target_list.len(),
+            sel_cols.len(),
         )));
     }
+    // The SELECT's target entries line up with its output columns only for
+    // a plain SELECT without `*`.
+    let direct_targets: &[protobuf::Node] = if val_sel.op == SetOperation::SetopNone as i32
+        && val_sel.values_lists.is_empty()
+        && !val_sel.target_list.iter().any(|t| {
+            matches!(t.node.as_ref(), Some(node::Node::ResTarget(rt))
+                if matches!(rt.val.as_deref().and_then(|v| v.node.as_ref()),
+                    Some(node::Node::ColumnRef(cr)) if cr.fields.iter().any(|f|
+                        matches!(f.node.as_ref(), Some(node::Node::AStar(_))))))
+        }) {
+        &val_sel.target_list
+    } else {
+        &[]
+    };
     // INSERT ... SELECT cannot supply `DEFAULT`, so any target column that is
     // `GENERATED ALWAYS AS IDENTITY` is rejected unless the user requested
     // OVERRIDING SYSTEM VALUE.
     if !tgt.overriding {
-        for i in 0..val_sel.target_list.len() {
+        for i in 0..sel_cols.len() {
             if let Some(tc) = target_col_at(tgt, i)
                 && tc.attidentity == Some(AttIdentity::Always)
             {
@@ -408,13 +428,6 @@ fn analyze_insert_select(
             }
         }
     }
-    // Walk the SELECT side of `INSERT … SELECT` so its params are registered
-    // and any undefined-column / typo errors inside the SELECT propagate
-    // cleanly. Earlier this swallowed the error with `let _ =`, which masked
-    // typos in JOIN ON or in the SELECT target list as a downstream
-    // `param count mismatch` invariant failure.
-    let (sel_cols, _) = analyze_select_with_ctes(val_sel, snapshot, params, cte_scopes)?;
-
     // Each SELECT output column must be assignment-coercible to its target
     // column — PG rejects `INSERT INTO t (int8_col) SELECT jsonb_col …` at
     // parse time with `column "X" is of type Y but expression is of type Z`.
@@ -446,7 +459,7 @@ fn analyze_insert_select(
         if sel_col.type_oid == oid::UNKNOWN || sel_col.type_oid == target_oid {
             continue;
         }
-        let literal = val_sel.target_list.get(i).and_then(|t| {
+        let literal = direct_targets.get(i).and_then(|t| {
             if let Some(node::Node::ResTarget(rt)) = t.node.as_ref()
                 && let Some(val) = &rt.val
                 && let Some(node::Node::AConst(ac)) = val.node.as_ref()
@@ -486,7 +499,7 @@ fn analyze_insert_select(
         }
     }
 
-    for (i, target) in val_sel.target_list.iter().enumerate() {
+    for (i, target) in direct_targets.iter().enumerate() {
         if let Some(node::Node::ResTarget(rt)) = target.node.as_ref()
             && let Some(val) = &rt.val
             && let Some(node::Node::ParamRef(p)) = val.node.as_ref()

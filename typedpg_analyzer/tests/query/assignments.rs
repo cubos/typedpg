@@ -200,3 +200,28 @@ fn overriding_user_value_on_generated_always_identity() {
     db.analyze("INSERT INTO g (id, v) OVERRIDING USER VALUE SELECT 1, 2")
         .unwrap();
 }
+
+// ── INSERT … SELECT arity ────────────────────────────────────────────────────
+
+/// The arity check counts the SELECT's *output* columns (after `*`
+/// expansion and set operations), not its raw target entries.
+#[test]
+fn insert_select_arity_uses_output_columns() {
+    let db = setup();
+    for sql in [
+        "INSERT INTO t (id, a, b) SELECT 1, 2, 'x' UNION ALL SELECT 2, 3, 'y'",
+        "INSERT INTO t SELECT * FROM t",
+        "INSERT INTO t (id, a, b) SELECT * FROM (VALUES (1, 2, 'x')) v",
+        "INSERT INTO t (id, a, b) SELECT v.* FROM (VALUES (1, 2, 'x')) v",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    let err = db
+        .analyze("INSERT INTO t SELECT u.*, 1 FROM u")
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("INSERT has more expressions than target columns"),
+        "{err}"
+    );
+}
