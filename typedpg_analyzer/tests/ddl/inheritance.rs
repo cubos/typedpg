@@ -478,3 +478,23 @@ fn drop_column_on_parent_keeps_a_child_local_column() {
         vec![cn("z", int4()), cn("k", int4())],
     );
 }
+
+#[test]
+fn add_column_not_null_is_inherited_under_the_parent_name() {
+    // PG 18: c inherits p_b_not_null; c2 keeps its own c2_b_not_null.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE p (a int);
+         CREATE TABLE c () INHERITS (p);
+         CREATE TABLE c2 (b int NOT NULL) INHERITS (p);
+         ALTER TABLE p ADD COLUMN b int NOT NULL;",
+    )]);
+    assert_eq!(
+        db.pg_constraint_names_for_table("public", "c"),
+        vec!["p_b_not_null"]
+    );
+    assert_eq!(
+        db.pg_constraint_names_for_table("public", "c2"),
+        vec!["c2_b_not_null"]
+    );
+}

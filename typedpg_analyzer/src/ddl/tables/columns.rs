@@ -378,6 +378,19 @@ pub(crate) fn add_column(
     cmd: &AlterTableCmd,
     rec: inherit::Recursion,
 ) -> Result<(), DdlError> {
+    add_column_to(interp, relid, cmd, rec, None)
+}
+
+/// [`add_column`] for one relation of the recursion; `parent_nn` is the
+/// name of the parent's new not-null constraint, which a child inheriting
+/// it keeps.
+fn add_column_to(
+    interp: &mut PgCatalog,
+    relid: PgClassOid,
+    cmd: &AlterTableCmd,
+    rec: inherit::Recursion,
+    parent_nn: Option<String>,
+) -> Result<(), DdlError> {
     let Some(def) = cmd.def.as_deref() else {
         return Ok(());
     };
@@ -422,7 +435,7 @@ pub(crate) fn add_column(
                 a.attinhcount += 1;
             }
             if col.not_null {
-                inherit::set_not_null(interp, relid, &cd.colname, None, rec)?;
+                inherit::set_not_null(interp, relid, &cd.colname, parent_nn.as_deref(), rec)?;
             }
             return Ok(());
         }
@@ -474,7 +487,12 @@ pub(crate) fn add_column(
             recurse: false,
             recursing: rec.recursing,
         };
-        inherit::set_not_null(interp, relid, &col.name, col.nn_name.as_deref(), local)?;
+        let name = if rec.recursing {
+            parent_nn.as_deref()
+        } else {
+            col.nn_name.as_deref()
+        };
+        inherit::set_not_null(interp, relid, &col.name, name, local)?;
     }
     if !rec.recursing
         && let Some(deptype) = col.owned_sequence
@@ -485,7 +503,10 @@ pub(crate) fn add_column(
         add_column_constraints(interp, relid, cd)?;
     }
     for child in children {
-        add_column(interp, child, cmd, rec.child())?;
+        let nn = col
+            .not_null
+            .then(|| inherit::not_null_name(interp, relid, next_attnum));
+        add_column_to(interp, child, cmd, rec.child(), nn)?;
     }
     Ok(())
 }
