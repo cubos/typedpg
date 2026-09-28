@@ -801,3 +801,162 @@ fn quoted_char_is_the_internal_single_byte_type() {
         ],
     );
 }
+
+// ── CREATE TABLE ... OF type / LIKE ─────────────────────────────────────────
+
+#[test]
+fn typed_table_gets_the_type_columns() {
+    // PG 18 `\d people`: name text not null, age integer.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TYPE person AS (name text, age int);
+         CREATE TABLE people OF person (name NOT NULL);
+         CREATE TABLE people4 OF person (name WITH OPTIONS DEFAULT 'x', age PRIMARY KEY);",
+    )]);
+    assert_cols(
+        &db.analyze("SELECT * FROM people").unwrap(),
+        vec![c("name", text()), cn("age", int4())],
+    );
+    assert_cols(
+        &db.analyze("SELECT * FROM people4").unwrap(),
+        vec![cn("name", text()), c("age", int4())],
+    );
+}
+
+#[test]
+fn typed_table_errors() {
+    // PG 18: 42703 column "extra" does not exist; 42809 type integer is not
+    // a composite type.
+    assert_ddl_err!(
+        try_apply(&[(
+            "0001.sql",
+            "CREATE TYPE person AS (name text, age int);
+             CREATE TABLE people2 OF person (extra NOT NULL);",
+        )]),
+        DdlError::Parse(_),
+        "column \"extra\" does not exist",
+    );
+    assert_ddl_err!(
+        try_apply(&[("0001.sql", "CREATE TABLE people3 OF int4;")]),
+        DdlError::Parse(_),
+        "type integer is not a composite type",
+    );
+}
+
+#[test]
+fn like_copies_the_source_columns() {
+    // PG 18: u has a integer not null, b integer — with or without INCLUDING.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int NOT NULL, b int);
+         CREATE TABLE u (LIKE t INCLUDING ALL);
+         CREATE TABLE u2 (LIKE t);
+         CREATE TABLE u3 (x int, LIKE t, y text);",
+    )]);
+    let expected = vec![c("a", int4()), cn("b", int4())];
+    assert_cols(&db.analyze("SELECT * FROM u").unwrap(), expected.clone());
+    assert_cols(&db.analyze("SELECT a, b FROM u2").unwrap(), expected);
+    assert_cols(
+        &db.analyze("SELECT * FROM u3").unwrap(),
+        vec![
+            cn("x", int4()),
+            c("a", int4()),
+            cn("b", int4()),
+            cn("y", text()),
+        ],
+    );
+}
+
+#[test]
+fn like_copies_defaults_generated_and_identity_only_when_included() {
+    // PG 18: plain LIKE drops the default, generation expression and
+    // identity (a NOT NULL stays), so `b` becomes an ordinary column and
+    // `i` must be supplied. INCLUDING ALL keeps them.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE p (a int NOT NULL DEFAULT 1,
+                         b text GENERATED ALWAYS AS ('x') STORED,
+                         i int GENERATED ALWAYS AS IDENTITY);
+         CREATE TABLE lk (LIKE p);
+         CREATE TABLE lk2 (LIKE p INCLUDING ALL);",
+    )]);
+    let lk = class_oid(&db, Some("public"), "lk");
+    let attrs = db.attributes_of(lk);
+    assert!(attrs.iter().all(|a| !a.atthasdef), "{attrs:?}");
+    assert!(attrs.iter().all(|a| a.attgenerated.is_none()));
+    assert!(attrs.iter().all(|a| a.attidentity.is_none()));
+    assert!(attrs.iter().find(|a| a.attname == "i").unwrap().attnotnull);
+    let lk2 = class_oid(&db, Some("public"), "lk2");
+    let attrs = db.attributes_of(lk2);
+    assert!(attrs.iter().find(|a| a.attname == "a").unwrap().atthasdef);
+    assert!(
+        attrs
+            .iter()
+            .find(|a| a.attname == "b")
+            .unwrap()
+            .attgenerated
+            .is_some()
+    );
+    assert!(
+        attrs
+            .iter()
+            .find(|a| a.attname == "i")
+            .unwrap()
+            .attidentity
+            .is_some()
+    );
+    // The generated column is writable in the plain copy.
+    db.analyze("INSERT INTO lk (a, b, i) VALUES (1, 'y', 2)")
+        .unwrap();
+}
+
+#[test]
+fn like_including_indexes_copies_the_keys() {
+    // PG 18 `\d w`: "w_pkey" PRIMARY KEY (a), "w_b_key" UNIQUE CONSTRAINT (b).
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE u (a int PRIMARY KEY, b int UNIQUE, c int CHECK (c > 0));
+         CREATE TABLE w (LIKE u INCLUDING ALL);",
+    )]);
+    db.analyze(
+        "INSERT INTO w (a, b, c) VALUES (1, 2, 3) ON CONFLICT ON CONSTRAINT w_pkey DO NOTHING",
+    )
+    .unwrap();
+    db.analyze("INSERT INTO w (a, b, c) VALUES (1, 2, 3) ON CONFLICT (b) DO NOTHING")
+        .unwrap();
+}
+
+#[test]
+fn like_errors() {
+    assert_ddl_err!(
+        try_apply(&[("0001.sql", "CREATE TABLE lk7 (LIKE nosuch);")]),
+        DdlError::TableNotFound(_),
+        "relation \"nosuch\" does not exist",
+    );
+    assert_ddl_err!(
+        try_apply(&[(
+            "0001.sql",
+            "CREATE SEQUENCE sq; CREATE TABLE lk6 (LIKE sq);",
+        )]),
+        DdlError::Parse(_),
+        "relation \"sq\" is invalid in LIKE clause",
+    );
+    assert_ddl_err!(
+        try_apply(&[(
+            "0001.sql",
+            "CREATE TABLE p (a int); CREATE TABLE lk3 (a int, LIKE p);",
+        )]),
+        DdlError::DuplicateObject(_),
+        "column \"a\" specified more than once",
+    );
+}
+
+#[test]
+fn primary_key_on_missing_column_is_rejected() {
+    // PG 18: 42703 column "b" named in key does not exist.
+    assert_ddl_err!(
+        try_apply(&[("0001.sql", "CREATE TABLE t (a int, PRIMARY KEY (b));")]),
+        DdlError::Parse(_),
+        "column \"b\" named in key does not exist",
+    );
+}

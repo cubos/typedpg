@@ -882,3 +882,133 @@ fn validate_check_expression_for_table(
     }
     Ok(())
 }
+
+/// Copy what `LIKE source INCLUDING CONSTRAINTS / INDEXES` asks for onto the
+/// freshly-created relation (`transformTableLikeClause` /
+/// `expandTableLikeClause`): CHECK constraints keep their names, indexes are
+/// cloned (`generateClonedIndexStmt`) under names chosen like
+/// `ChooseIndexName` — `<rel>_pkey`, `<rel>_<cols>_key` for constraint
+/// indexes, `<rel>_<cols>_idx` otherwise.
+pub(crate) fn copy_like_constraints(
+    interp: &mut PgCatalog,
+    relid: PgClassOid,
+    relname: &str,
+    like: &super::merge::LikeCopy,
+) -> Result<(), DdlError> {
+    use super::merge::{LIKE_CONSTRAINTS, LIKE_INDEXES};
+    use crate::ddl::util::{choose_relation_name, index_name_addition};
+
+    let source_attrs = interp.attributes_of(like.source).to_vec();
+    let new_attnum = |interp: &PgCatalog, attnum: i16| -> i16 {
+        source_attrs
+            .iter()
+            .find(|a| a.attnum == attnum)
+            .and_then(|a| interp.attribute_by_name(relid, &a.attname))
+            .map(|a| a.attnum)
+            .unwrap_or(0)
+    };
+
+    if like.options & LIKE_CONSTRAINTS != 0 {
+        let mut checks: Vec<PgConstraint> = interp
+            .pg_constraint
+            .values()
+            .filter(|c| c.conrelid == like.source && c.contype == ConType::Check)
+            .cloned()
+            .collect();
+        checks.sort_by_key(|c| c.oid);
+        for c in checks {
+            let conkey = c.conkey.iter().map(|&an| new_attnum(interp, an)).collect();
+            let oid = PgConstraintOid::from_nonzero(interp.alloc_oid()?);
+            interp.insert_pg_constraint(PgConstraint {
+                oid,
+                conname: c.conname,
+                conrelid: relid,
+                contype: ConType::Check,
+                conkey,
+                confrelid: None,
+                confkey: Vec::new(),
+            });
+        }
+    }
+
+    if like.options & LIKE_INDEXES != 0 {
+        let nsoid = interp
+            .pg_class
+            .get(&relid)
+            .map(|c| c.relnamespace)
+            .ok_or_else(|| DdlError::Internal(format!("LIKE target relid={relid} missing")))?;
+        let mut indexes: Vec<PgIndex> = interp
+            .pg_index
+            .values()
+            .filter(|i| i.indrelid == like.source)
+            .cloned()
+            .collect();
+        indexes.sort_by_key(|i| i.indexrelid);
+        for idx in indexes {
+            let idxname = relname_of(interp, idx.indexrelid);
+            let backing = interp
+                .pg_constraint
+                .values()
+                .find(|c| {
+                    c.conrelid == like.source
+                        && c.conname == idxname
+                        && matches!(c.contype, ConType::PrimaryKey | ConType::Unique)
+                })
+                .map(|c| c.contype);
+            let indkey: Vec<i16> = idx
+                .indkey
+                .iter()
+                .map(|&an| if an == 0 { 0 } else { new_attnum(interp, an) })
+                .collect();
+            let colnames: Vec<String> = idx
+                .indkey
+                .iter()
+                .map(|&an| {
+                    source_attrs
+                        .iter()
+                        .find(|a| an != 0 && a.attnum == an)
+                        .map(|a| a.attname.clone())
+                        .unwrap_or_else(|| "expr".to_owned())
+                })
+                .collect();
+            let addition = index_name_addition(&colnames);
+            match backing {
+                Some(contype) => {
+                    let name = match contype {
+                        ConType::PrimaryKey => {
+                            choose_relation_name(interp, nsoid, relname, "", "pkey")
+                        }
+                        _ => choose_relation_name(interp, nsoid, relname, &addition, "key"),
+                    };
+                    emit_constraint_with_backing_index(
+                        interp,
+                        relid,
+                        name,
+                        contype,
+                        indkey,
+                        None,
+                        Vec::new(),
+                    )?;
+                }
+                None => {
+                    let name = choose_relation_name(interp, nsoid, relname, &addition, "idx");
+                    let indexrelid = PgClassOid::from_nonzero(interp.alloc_oid()?);
+                    interp.insert_pg_class(PgClass {
+                        oid: indexrelid,
+                        relname: name,
+                        relnamespace: nsoid,
+                        relkind: RelKind::Index,
+                        reltype: None,
+                    });
+                    interp.insert_pg_index(PgIndex {
+                        indexrelid,
+                        indrelid: relid,
+                        indkey,
+                        ..idx
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}

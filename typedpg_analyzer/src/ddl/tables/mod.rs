@@ -66,7 +66,6 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
         )));
     }
 
-    let mut columns: Vec<ParsedColumn> = Vec::new();
     let mut pk_columns: Vec<String> = Vec::new();
 
     // First pass: extract table-level PRIMARY KEY constraint keys, and
@@ -89,22 +88,32 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
         }
     }
 
-    // Second pass: process columns.
-    let mut seen_names = std::collections::HashSet::new();
-    for elt in &stmt.table_elts {
-        let Some(node::Node::ColumnDef(cd)) = elt.node.as_ref() else {
+    // Assemble the column list: OF type, LIKE, INHERITS / PARTITION OF.
+    let merge::AssembledColumns {
+        mut columns,
+        parents,
+        likes,
+    } = merge::assemble_columns(interp, stmt, &pk_columns)?;
+
+    // Key columns of table-level PRIMARY KEY / UNIQUE constraints must
+    // exist (inherited and LIKE columns count); PRIMARY KEY marks them NOT
+    // NULL (`transformIndexConstraint`).
+    for elt in stmt.constraints.iter().chain(stmt.table_elts.iter()) {
+        let Some(node::Node::Constraint(c)) = elt.node.as_ref() else {
             continue;
         };
-
-        if !seen_names.insert(cd.colname.clone()) {
-            return Err(DdlError::DuplicateObject(format!(
-                "column \"{}\" specified more than once",
-                cd.colname
-            )));
+        let is_primary = c.contype == ConstrType::ConstrPrimary as i32;
+        if !is_primary && c.contype != ConstrType::ConstrUnique as i32 {
+            continue;
         }
-
-        let col = parse_column_def(interp, cd, &pk_columns)?;
-        columns.push(col);
+        for key in c.keys.iter().filter_map(super::util::node_string) {
+            let Some(col) = columns.iter_mut().find(|col| col.name == key) else {
+                return Err(DdlError::Parse(format!(
+                    "column \"{key}\" named in key does not exist"
+                )));
+            };
+            col.not_null |= is_primary;
+        }
     }
 
     // Allocate OIDs for the relation row, its composite type, and the array
@@ -117,7 +126,11 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
         oid: class_oid,
         relname: name.clone(),
         relnamespace: nsoid,
-        relkind: RelKind::Table,
+        relkind: if stmt.partspec.is_some() {
+            RelKind::Partitioned
+        } else {
+            RelKind::Table
+        },
         reltype: Some(composite_oid),
     });
     for (i, col) in columns.iter().enumerate() {
@@ -168,12 +181,12 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
         typcollation: None,
     });
 
-    // `CREATE TABLE child () INHERITS (p1, p2, …)` (NOT `PARTITION OF`).
-    // PG also reuses `inh_relations` for partitioned children, but those
-    // additionally set `partbound`; we skip them here — the analyzer
-    // doesn't model row-level partition routing.
-    if !stmt.inh_relations.is_empty() && stmt.partbound.is_none() {
-        apply_inherits(interp, class_oid, &stmt.inh_relations)?;
+    for (i, &parent) in parents.iter().enumerate() {
+        interp.pg_inherits.push(PgInherits {
+            inhrelid: class_oid,
+            inhparent: parent,
+            inhseqno: (i + 1) as i32,
+        });
     }
 
     // Type-check CHECK and `GENERATED ... STORED` expressions against the
@@ -184,6 +197,9 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
     // Emit pg_constraint rows so ON CONFLICT, DROP CASCADE, and FK
     // dependency checks can consult them later. FK validation runs here.
     emit_constraints(interp, class_oid, &name, stmt)?;
+    for like in &likes {
+        copy_like_constraints(interp, class_oid, &name, like)?;
+    }
 
     Ok(())
 }
@@ -268,6 +284,7 @@ fn apply_alter_cmd(
 
 mod columns;
 mod constraints;
+mod merge;
 
 use columns::*;
 use constraints::*;

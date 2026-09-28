@@ -362,6 +362,105 @@ pub fn format_type_for_message(snapshot: &PgCatalog, oid: PgTypeOid) -> String {
     t.typname.clone()
 }
 
+/// PG's `NAMEDATALEN - 1`: the longest identifier, in bytes.
+const MAX_IDENTIFIER_BYTES: usize = 63;
+
+/// Truncate `s` to at most `max` bytes on a char boundary (`pg_mbcliplen`).
+fn clip_bytes(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// PG's `makeObjectName` (`indexcmds.c`): `name1[_name2][_label]`, with the
+/// longer of `name1` / `name2` shortened until the result fits in an
+/// identifier.
+pub fn make_object_name(name1: &str, name2: &str, label: &str) -> String {
+    let mut overhead = 0;
+    if !name2.is_empty() {
+        overhead += 1;
+    }
+    if !label.is_empty() {
+        overhead += label.len() + 1;
+    }
+    let avail = MAX_IDENTIFIER_BYTES.saturating_sub(overhead);
+    let (mut n1, mut n2) = (name1.len(), name2.len());
+    while n1 + n2 > avail {
+        if n1 > n2 {
+            n1 -= 1;
+        } else {
+            n2 -= 1;
+        }
+    }
+    let mut out = clip_bytes(name1, n1).to_owned();
+    if !name2.is_empty() {
+        out.push('_');
+        out.push_str(clip_bytes(name2, n2));
+    }
+    if !label.is_empty() {
+        out.push('_');
+        out.push_str(label);
+    }
+    out
+}
+
+/// PG's `ChooseRelationName`: [`make_object_name`], appending a counter to
+/// the label (`t_a_key1`, `t_a_key2`, …) until no relation in the schema
+/// has the name.
+pub fn choose_relation_name(
+    snapshot: &PgCatalog,
+    nsoid: PgNamespaceOid,
+    name1: &str,
+    name2: &str,
+    label: &str,
+) -> String {
+    let mut pass = 0;
+    loop {
+        let modlabel = if pass == 0 {
+            label.to_owned()
+        } else {
+            format!("{label}{pass}")
+        };
+        let name = make_object_name(name1, name2, &modlabel);
+        if !snapshot.class_by_qname.contains_key(&(nsoid, name.clone())) {
+            return name;
+        }
+        pass += 1;
+    }
+}
+
+/// PG's `ChooseIndexColumnNames` + `ChooseIndexNameAddition`: the index
+/// columns' names (`expr` for expressions, deduplicated with a counter),
+/// joined with `_`.
+pub fn index_name_addition(colnames: &[String]) -> String {
+    let mut chosen: Vec<String> = Vec::new();
+    for base in colnames {
+        let mut name = base.clone();
+        let mut i = 0;
+        while chosen.contains(&name) {
+            i += 1;
+            name = format!("{base}{i}");
+        }
+        chosen.push(name);
+    }
+    let mut out = String::new();
+    for name in &chosen {
+        if !out.is_empty() {
+            out.push('_');
+        }
+        out.push_str(name);
+        if out.len() > MAX_IDENTIFIER_BYTES {
+            break;
+        }
+    }
+    out
+}
+
 /// Extract a string value from a Node.
 pub fn node_string(n: &Node) -> Option<&str> {
     match n.node.as_ref()? {
