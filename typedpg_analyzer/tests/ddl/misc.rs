@@ -524,3 +524,19 @@ fn ddl_expression_kinds_reject_aggregates_windows_and_subqueries() {
         assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
     }
 }
+
+#[test]
+fn builtin_sql_functions_count_by_their_inlined_body() {
+    // PG 18: `text || int` runs the STABLE LANGUAGE sql textanycat, which
+    // expression_planner inlines to `$1 || $2::text` before
+    // CheckMutability, so generation and index expressions accept it.
+    build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (
+             a int,
+             b text GENERATED ALWAYS AS (a::text || 1) STORED,
+             c text GENERATED ALWAYS AS (quote_literal(a)) STORED
+         );
+         CREATE INDEX ON t ((1 || a::text));",
+    )]);
+}

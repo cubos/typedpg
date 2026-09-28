@@ -111,6 +111,7 @@ fn export_catalog(client: &mut postgres::Client) -> Result<PgCatalogSeed, postgr
     let pg_constraint = export_constraints(client)?;
     let pg_collation = export_collations(client)?;
     let search_path = export_search_path(client, &pg_namespace)?;
+    let sql_function_defs = export_sql_function_defs(client)?;
 
     let _ = nsname_by_oid;
 
@@ -139,6 +140,7 @@ fn export_catalog(client: &mut postgres::Client) -> Result<PgCatalogSeed, postgr
         pg_rewrite: Vec::new(),
         pg_collation,
         search_path,
+        sql_function_defs,
     };
     let scratch = PgCatalog::from_seed(seed.clone());
     seed.pg_index = export_indexes(client, &scratch)?;
@@ -790,6 +792,29 @@ fn export_depends(client: &mut postgres::Client) -> Result<Vec<PgDepend>, postgr
 }
 
 // ─── View definitions (second pass) ────────────────────────────────────────────
+
+/// `pg_get_functiondef` of each non-set-returning `LANGUAGE sql` function;
+/// the analyzer keeps the inlinable ones' bodies (`inline_function`).
+fn export_sql_function_defs(
+    client: &mut postgres::Client,
+) -> Result<Vec<(PgProcOid, String)>, postgres::Error> {
+    let rows = client.query(
+        "SELECT p.oid, pg_catalog.pg_get_functiondef(p.oid) \
+         FROM pg_catalog.pg_proc p \
+         WHERE p.prolang = (SELECT oid FROM pg_catalog.pg_language WHERE lanname = 'sql') \
+           AND p.prokind = 'f' AND NOT p.proretset \
+         ORDER BY p.oid",
+        &[],
+    )?;
+    Ok(rows
+        .iter()
+        .filter_map(|r| {
+            let oid = PgProcOid::new(r.get::<_, u32>(0))?;
+            let definition: String = r.get(1);
+            Some((oid, definition))
+        })
+        .collect())
+}
 
 fn export_view_definitions(
     client: &mut postgres::Client,

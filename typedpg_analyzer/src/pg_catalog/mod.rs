@@ -134,6 +134,11 @@ pub struct PgCatalogSeed {
     /// Namespace OIDs in search order. Non-PG (PG keeps this in a GUC).
     #[serde(default, with = "crate::oid::vec_oid")]
     pub search_path: Vec<PgNamespaceOid>,
+    /// `pg_get_functiondef` of every `LANGUAGE sql` function, so the ones
+    /// PG would inline (`inline_function`) count by their body — e.g. the
+    /// STABLE `textanycat` behind `text || anynonarray`.
+    #[serde(default)]
+    pub sql_function_defs: Vec<(PgProcOid, String)>,
 }
 
 // ─── In-memory catalog ─────────────────────────────────────────────────────
@@ -213,6 +218,9 @@ pub struct PgCatalog {
     /// which PG substitutes for the call before checking an index or
     /// generation expression's mutability.
     pub(crate) inline_sql_bodies: HashMap<PgProcOid, pg_query::protobuf::Node>,
+    /// Seeded `pg_get_functiondef` sources behind `inline_sql_bodies`,
+    /// kept so `to_seed` round-trips them.
+    sql_function_defs: HashMap<PgProcOid, String>,
     /// `pg_partitioned_table.partattrs` of each partitioned table: the
     /// partition key's attnums, `0` for an expression.
     pub(crate) partition_keys: HashMap<PgClassOid, Vec<i16>>,
@@ -414,6 +422,9 @@ impl PgCatalog {
             cat.pg_collation.insert(c.oid, c);
         }
         cat.search_path = seed.search_path;
+        for (oid, definition) in seed.sql_function_defs {
+            cat.add_sql_function_def(oid, definition);
+        }
         cat.search_path_guc = crate::ddl::session::SearchPathGuc::with_default(
             cat.search_path
                 .iter()
@@ -459,6 +470,7 @@ impl PgCatalog {
             attr_default_types: HashMap::new(),
             check_function_bodies: true,
             inline_sql_bodies: HashMap::new(),
+            sql_function_defs: HashMap::new(),
             partition_keys: HashMap::new(),
             triggers: HashMap::new(),
             policies: HashMap::new(),
@@ -561,7 +573,33 @@ impl PgCatalog {
             pg_rewrite,
             pg_collation,
             search_path: self.search_path.clone(),
+            sql_function_defs: {
+                let mut defs: Vec<_> = self
+                    .sql_function_defs
+                    .iter()
+                    .map(|(&oid, d)| (oid, d.clone()))
+                    .collect();
+                defs.sort_by_key(|(oid, _)| *oid);
+                defs
+            },
         }
+    }
+
+    /// Record a seeded SQL function's definition and, when PG would inline
+    /// it, the expression it stands for.
+    fn add_sql_function_def(&mut self, oid: PgProcOid, definition: String) {
+        let stmt = pg_query::parse(&definition).ok().and_then(|p| {
+            match p.protobuf.stmts.first()?.stmt.as_ref()?.node.as_ref()? {
+                pg_query::protobuf::node::Node::CreateFunctionStmt(s) => Some(s.clone()),
+                _ => None,
+            }
+        });
+        if let (Some(stmt), Some(proc)) = (stmt, self.pg_proc.get(&oid))
+            && let Some(body) = crate::ddl::function_body::inlinable_body(&stmt, proc)
+        {
+            self.inline_sql_bodies.insert(oid, body);
+        }
+        self.sql_function_defs.insert(oid, definition);
     }
 
     /// Parse and apply all DDL statements in `sql`, mutating the catalog.
@@ -1097,6 +1135,7 @@ impl PgCatalog {
 
     pub(crate) fn remove_pg_proc(&mut self, oid: PgProcOid) -> Option<PgProc> {
         self.inline_sql_bodies.remove(&oid);
+        self.sql_function_defs.remove(&oid);
         let row = self.pg_proc.remove(&oid)?;
         if let Some(v) = self
             .proc_by_qname

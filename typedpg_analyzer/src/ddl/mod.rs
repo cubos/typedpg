@@ -13,7 +13,7 @@ mod defaults;
 pub mod drop;
 mod expr_kind;
 pub mod extensions;
-mod function_body;
+pub(crate) mod function_body;
 pub mod functions;
 pub mod indexes;
 pub mod operators;
