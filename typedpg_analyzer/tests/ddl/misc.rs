@@ -242,3 +242,56 @@ fn foreign_tables_are_relations() {
     );
     db.apply_sql("DROP FOREIGN TABLE ft;").unwrap();
 }
+
+// ── COMMENT ON resolves its target (get_object_address) ─────────────────────
+
+#[test]
+fn comment_on_requires_an_existing_target() {
+    let setup = "CREATE TABLE t (a int);";
+    for (stmt, msg) in [
+        (
+            "COMMENT ON TABLE nosuch IS 'x';",
+            "relation \"nosuch\" does not exist",
+        ),
+        (
+            "COMMENT ON COLUMN t.nosuch IS 'x';",
+            "column \"nosuch\" of relation \"t\" does not exist",
+        ),
+        (
+            "COMMENT ON COLUMN nosuch.a IS 'x';",
+            "relation \"nosuch\" does not exist",
+        ),
+        (
+            "COMMENT ON TYPE nosuch IS 'x';",
+            "type \"nosuch\" does not exist",
+        ),
+        (
+            "COMMENT ON FUNCTION nosuch(int) IS 'x';",
+            "function nosuch(integer) does not exist",
+        ),
+        (
+            "COMMENT ON SCHEMA nosuch IS 'x';",
+            "schema \"nosuch\" does not exist",
+        ),
+        (
+            "COMMENT ON CONSTRAINT nosuch ON t IS 'x';",
+            "constraint \"nosuch\" for table \"t\" does not exist",
+        ),
+        ("COMMENT ON VIEW t IS 'x';", "\"t\" is not a view"),
+        (
+            "COMMENT ON INDEX nosuch IS 'x';",
+            "relation \"nosuch\" does not exist",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int PRIMARY KEY);
+         COMMENT ON TABLE t IS 'x';
+         COMMENT ON COLUMN t.a IS NULL;
+         COMMENT ON CONSTRAINT t_pkey ON t IS 'pk';
+         COMMENT ON SCHEMA public IS 'p';",
+    )]);
+}

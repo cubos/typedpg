@@ -7,6 +7,7 @@
 pub mod aggregates;
 pub mod alter;
 pub mod collations;
+mod comment;
 mod defaults;
 pub mod drop;
 pub mod extensions;
@@ -188,8 +189,8 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         node::Node::IndexStmt(s) => indexes::create_index(db, s),
 
         // ── No-ops (irrelevant for type analysis) ───────────────────
+        node::Node::CommentStmt(s) => comment::comment_on(db, s),
         node::Node::GrantStmt(_)
-        | node::Node::CommentStmt(_)
         | node::Node::CreateTrigStmt(_)
         | node::Node::RuleStmt(_)
         | node::Node::ConstraintsSetStmt(_)
