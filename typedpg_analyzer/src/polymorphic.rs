@@ -22,6 +22,27 @@ const ANYCOMPATIBLENONARRAY: PgTypeOid = PgTypeOid::from_raw(5079);
 const ANYCOMPATIBLERANGE: PgTypeOid = PgTypeOid::from_raw(5080);
 const ANYCOMPATIBLEMULTIRANGE: PgTypeOid = PgTypeOid::from_raw(4538);
 
+/// The `provariadic` element type of a parameter declared `VARIADIC t`, as
+/// PG's `CreateFunction` derives it: the element of an array type, with the
+/// polymorphic arrays mapping to their element pseudo-types and `"any"`
+/// standing for itself. `None` when `t` is not an array — PG rejects that
+/// declaration (`VARIADIC parameter must be an array`).
+pub(crate) fn variadic_element_type(
+    declared: PgTypeOid,
+    snapshot: &PgCatalog,
+) -> Option<PgTypeOid> {
+    const ANY: PgTypeOid = PgTypeOid::from_raw(2276);
+    match declared {
+        ANYARRAY => Some(ANYELEMENT),
+        ANYCOMPATIBLEARRAY => Some(ANYCOMPATIBLE),
+        ANY => Some(ANY),
+        _ => snapshot
+            .get_type(declared)
+            .filter(|t| t.typcategory == TypCategory::Array)
+            .and_then(|t| t.typelem),
+    }
+}
+
 /// The concrete types a polymorphic call binds, one slot per pseudo-type
 /// family. Binding any slot derives the related ones where the catalog
 /// knows the relation (array → element, range → subtype element,

@@ -44,6 +44,39 @@ fn create_function_defaults_let_calls_omit_trailing_args() {
     );
 }
 
+#[test]
+fn create_function_variadic_records_the_element_type() {
+    let snap = build(&[(
+        "0001.sql",
+        "CREATE FUNCTION f_var(VARIADIC xs INT[]) RETURNS INT
+             AS $$ SELECT array_length(xs, 1) $$ LANGUAGE sql;
+         CREATE FUNCTION f_var_any(VARIADIC xs anyarray) RETURNS anyelement
+             AS $$ SELECT xs[1] $$ LANGUAGE sql;",
+    )]);
+    let provariadic = |name: &str| {
+        let t = snap.find_functions(None, name)[0].provariadic.unwrap();
+        snap.get_type(t).unwrap().typname.clone()
+    };
+    assert_eq!(provariadic("f_var"), "int4");
+    assert_eq!(provariadic("f_var_any"), "anyelement");
+    let s = snap.analyze("SELECT f_var(1, 2, 3) AS a").unwrap();
+    assert_cols(&s, vec![cn("a", int4())]);
+}
+
+#[test]
+fn create_function_variadic_non_array_is_rejected() {
+    let err = try_apply(&[(
+        "0001.sql",
+        "CREATE FUNCTION bad(VARIADIC x INT) RETURNS INT AS $$ SELECT 1 $$ LANGUAGE sql;",
+    )])
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("VARIADIC parameter must be an array"),
+        "got: {err}"
+    );
+}
+
 // ── CREATE / DROP AGGREGATE ─────────────────────────────────────────────────
 
 #[test]

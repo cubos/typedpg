@@ -53,7 +53,11 @@ pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Res
             ArgMode::In => proargtypes.push(resolved_oid),
             ArgMode::Variadic => {
                 proargtypes.push(resolved_oid);
-                variadic_oid = Some(resolved_oid);
+                variadic_oid = Some(
+                    crate::polymorphic::variadic_element_type(resolved_oid, interp).ok_or_else(
+                        || DdlError::UnsupportedDdl("VARIADIC parameter must be an array".into()),
+                    )?,
+                );
             }
             ArgMode::InOut => proargtypes.push(resolved_oid),
             ArgMode::Out | ArgMode::Table => {}

@@ -47,7 +47,15 @@ pub fn define_aggregate(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(),
                     continue;
                 };
                 if mode == FunctionParameterMode::FuncParamVariadic {
-                    variadic_oid = Some(resolved);
+                    variadic_oid = Some(
+                        crate::polymorphic::variadic_element_type(resolved, interp).ok_or_else(
+                            || {
+                                DdlError::UnsupportedDdl(
+                                    "VARIADIC parameter must be an array".into(),
+                                )
+                            },
+                        )?,
+                    );
                 }
                 arg_types.push(resolved);
                 arg_names.push(fp.name.clone());
