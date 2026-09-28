@@ -195,6 +195,7 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
 
         // ── No-ops (irrelevant for type analysis) ───────────────────
         node::Node::CommentStmt(s) => comment::comment_on(db, s),
+        node::Node::AlterOwnerStmt(s) => comment::alter_owner(db, s),
         node::Node::CreateTrigStmt(s) => triggers::create_trigger(db, s),
         node::Node::GrantStmt(s) => acl::grant(db, s),
         node::Node::CreatePolicyStmt(s) => policies::create_policy(db, s),
@@ -202,7 +203,6 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         node::Node::RuleStmt(s) => rules::create_rule(db, s),
         node::Node::GrantRoleStmt(_)
         | node::Node::ConstraintsSetStmt(_)
-        | node::Node::AlterOwnerStmt(_)
         | node::Node::AlterDefaultPrivilegesStmt(_)
         | node::Node::CreateRoleStmt(_)
         | node::Node::AlterRoleStmt(_)

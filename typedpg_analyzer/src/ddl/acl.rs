@@ -70,51 +70,8 @@ fn check_object(
         }
         (
             ObjectType::ObjectFunction | ObjectType::ObjectProcedure | ObjectType::ObjectRoutine,
-            Some(node::Node::ObjectWithArgs(owa)),
-        ) => {
-            let object = Some(Box::new(pg_query::protobuf::Node {
-                node: Some(node::Node::ObjectWithArgs(owa.clone())),
-            }));
-            let Some((schema, name, arg_oids)) = super::alter::extract_func_target(&object, interp)
-            else {
-                return Ok(());
-            };
-            let kind = match objtype {
-                ObjectType::ObjectProcedure => "procedure",
-                ObjectType::ObjectRoutine => "routine",
-                _ => "function",
-            };
-            if owa.args_unspecified {
-                match interp.find_functions(schema.as_deref(), &name).len() {
-                    0 => {
-                        return Err(DdlError::TypeNotFound(format!(
-                            "could not find a {kind} named \"{name}\""
-                        )));
-                    }
-                    1 => {}
-                    _ => {
-                        return Err(DdlError::DependencyError(format!(
-                            "{kind} name \"{name}\" is not unique"
-                        )));
-                    }
-                }
-            } else {
-                let wanted = arg_oids.clone();
-                let found = super::alter::find_proc(interp, schema.as_deref(), &name, &move |p| {
-                    p.proargtypes == wanted
-                });
-                if found.is_none() {
-                    let args = arg_oids
-                        .iter()
-                        .map(|&t| super::util::format_type_for_message(interp, t))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    return Err(DdlError::TypeNotFound(format!(
-                        "{kind} {name}({args}) does not exist"
-                    )));
-                }
-            }
-        }
+            Some(inner @ node::Node::ObjectWithArgs(_)),
+        ) => super::comment::resolve_object(interp, objtype, inner)?,
         (ObjectType::ObjectSchema, _) => {
             if let Some(schema) = node_string(obj)
                 && interp.namespace_oid(schema).is_none()

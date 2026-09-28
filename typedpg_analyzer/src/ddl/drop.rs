@@ -940,7 +940,7 @@ fn drop_operator(
     Ok(())
 }
 
-fn find_operator(
+pub(crate) fn find_operator(
     snapshot: &PgCatalog,
     schema: Option<&str>,
     name: &str,

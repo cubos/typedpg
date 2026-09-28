@@ -1614,3 +1614,148 @@ fn rules_are_validated_and_tracked() {
         ),
     ]);
 }
+
+#[test]
+fn alter_owner_and_comment_resolve_their_target() {
+    // PG 18 get_object_address / LookupFuncWithArgs / AlterTypeOwner /
+    // get_collation_oid / get_trigger_oid / get_relation_policy_oid /
+    // get_rewrite_oid / LookupOperName.
+    let setup = "CREATE TABLE t (a int);
+                 CREATE FUNCTION f(int) RETURNS int LANGUAGE sql AS 'select 1';
+                 CREATE FUNCTION g(int) RETURNS int LANGUAGE sql AS 'select 1';
+                 CREATE FUNCTION g(text) RETURNS int LANGUAGE sql AS 'select 1';
+                 CREATE PROCEDURE pr(int) LANGUAGE sql AS 'select 1';";
+    for (stmt, msg) in [
+        (
+            "ALTER FUNCTION nosuch(int) OWNER TO postgres;",
+            "function nosuch(integer) does not exist",
+        ),
+        (
+            "ALTER FUNCTION nosuch OWNER TO postgres;",
+            "could not find a function named \"nosuch\"",
+        ),
+        (
+            "ALTER FUNCTION g OWNER TO postgres;",
+            "function name \"g\" is not unique",
+        ),
+        (
+            "ALTER PROCEDURE nosuch() OWNER TO postgres;",
+            "procedure nosuch() does not exist",
+        ),
+        (
+            "ALTER ROUTINE nosuch() OWNER TO postgres;",
+            "function nosuch() does not exist",
+        ),
+        (
+            "ALTER AGGREGATE nosuch(int) OWNER TO postgres;",
+            "aggregate nosuch(integer) does not exist",
+        ),
+        (
+            "ALTER AGGREGATE f(int) OWNER TO postgres;",
+            "function f(integer) is not an aggregate",
+        ),
+        (
+            "ALTER PROCEDURE f(int) OWNER TO postgres;",
+            "f(integer) is not a procedure",
+        ),
+        (
+            "ALTER FUNCTION pr(int) OWNER TO postgres;",
+            "pr(integer) is not a function",
+        ),
+        (
+            "COMMENT ON FUNCTION pr(int) IS 'x';",
+            "pr(integer) is not a function",
+        ),
+        (
+            "GRANT EXECUTE ON FUNCTION pr(int) TO public;",
+            "pr(integer) is not a function",
+        ),
+        (
+            "GRANT EXECUTE ON PROCEDURE f(int) TO public;",
+            "f(integer) is not a procedure",
+        ),
+        (
+            "ALTER SCHEMA nosuch OWNER TO postgres;",
+            "schema \"nosuch\" does not exist",
+        ),
+        (
+            "ALTER TYPE nosuch OWNER TO postgres;",
+            "type \"nosuch\" does not exist",
+        ),
+        (
+            "ALTER TYPE public.nosuch OWNER TO postgres;",
+            "type \"public.nosuch\" does not exist",
+        ),
+        (
+            "ALTER DOMAIN nosuch OWNER TO postgres;",
+            "type \"nosuch\" does not exist",
+        ),
+        (
+            "ALTER COLLATION nosuch OWNER TO postgres;",
+            "collation \"nosuch\" for encoding \"UTF8\" does not exist",
+        ),
+        (
+            "ALTER OPERATOR +(int, nosuch) OWNER TO postgres;",
+            "type \"nosuch\" does not exist",
+        ),
+        (
+            "ALTER OPERATOR ###(int, int) OWNER TO postgres;",
+            "operator does not exist: integer ### integer",
+        ),
+        (
+            "ALTER SEQUENCE nosuch OWNER TO postgres;",
+            "relation \"nosuch\" does not exist",
+        ),
+        (
+            "ALTER VIEW nosuch OWNER TO postgres;",
+            "relation \"nosuch\" does not exist",
+        ),
+        (
+            "COMMENT ON AGGREGATE nosuch(int) IS 'x';",
+            "aggregate nosuch(integer) does not exist",
+        ),
+        (
+            "COMMENT ON COLLATION nosuch IS 'x';",
+            "collation \"nosuch\" for encoding \"UTF8\" does not exist",
+        ),
+        (
+            "COMMENT ON TRIGGER nosuch ON t IS 'x';",
+            "trigger \"nosuch\" for table \"t\" does not exist",
+        ),
+        (
+            "COMMENT ON POLICY nosuch ON t IS 'x';",
+            "policy \"nosuch\" for table \"t\" does not exist",
+        ),
+        (
+            "COMMENT ON RULE nosuch ON t IS 'x';",
+            "rule \"nosuch\" for relation \"t\" does not exist",
+        ),
+        (
+            "COMMENT ON OPERATOR ###(int, int) IS 'x';",
+            "operator does not exist: integer ### integer",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "ALTER FUNCTION f(int) OWNER TO postgres;
+             ALTER FUNCTION f OWNER TO postgres;
+             ALTER ROUTINE f(int) OWNER TO postgres;
+             ALTER AGGREGATE count(*) OWNER TO postgres;
+             ALTER SCHEMA public OWNER TO postgres;
+             ALTER TYPE int4 OWNER TO postgres;
+             ALTER OPERATOR +(int, int) OWNER TO postgres;
+             ALTER COLLATION \"C\" OWNER TO postgres;
+             COMMENT ON OPERATOR -(NONE, int) IS 'x';
+             COMMENT ON COLLATION \"C\" IS 'x';
+             COMMENT ON AGGREGATE sum(int) IS 'x';
+             ALTER FUNCTION sum(int) OWNER TO postgres;
+             ALTER ROUTINE pr(int) OWNER TO postgres;
+             GRANT EXECUTE ON ROUTINE pr(int) TO public;",
+        ),
+    ]);
+}
