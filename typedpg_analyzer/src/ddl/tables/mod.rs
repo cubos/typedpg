@@ -22,7 +22,83 @@ use crate::qualified_name::QualifiedName;
 /// Pending `pg_constraint` row built up while walking a `CreateStmt`:
 /// `(conname, contype, conkey, confrelid, confkey)`. Materialized into
 /// real catalog rows after all FK targets have been validated.
-type PendingConstraint = (String, ConType, Vec<i16>, Option<PgClassOid>, Vec<i16>);
+type PendingConstraint = (ConName, ConType, Vec<i16>, Option<PgClassOid>, Vec<i16>);
+
+/// A constraint's name: the explicit one, or PG's generated
+/// `<table>[_<addition>]_<label>` — unique among the schema's relations for
+/// an index-backed constraint (ChooseRelationName), among its constraints
+/// otherwise (ChooseConstraintName).
+#[derive(Clone, Debug)]
+enum ConName {
+    Explicit(String),
+    Relation {
+        addition: String,
+        label: &'static str,
+    },
+    Constraint {
+        addition: String,
+        label: &'static str,
+    },
+}
+
+impl ConName {
+    fn from_explicit(conname: &str, default: ConName) -> ConName {
+        if conname.is_empty() {
+            default
+        } else {
+            ConName::Explicit(conname.to_owned())
+        }
+    }
+
+    fn is_explicit(&self) -> bool {
+        matches!(self, ConName::Explicit(_))
+    }
+
+    fn resolve(&self, interp: &PgCatalog, relid: PgClassOid) -> String {
+        match self {
+            ConName::Explicit(name) => name.clone(),
+            ConName::Relation { addition, label } => {
+                let nsoid = interp.pg_class.get(&relid).map(|c| c.relnamespace);
+                let relname = relname_of(interp, relid);
+                match nsoid {
+                    Some(ns) => {
+                        super::util::choose_relation_name(interp, ns, &relname, addition, label)
+                    }
+                    None => super::util::make_object_name(&relname, addition, label),
+                }
+            }
+            ConName::Constraint { addition, label } => {
+                inherit::choose_constraint_name(interp, relid, addition, label)
+            }
+        }
+    }
+}
+
+/// The name addition for a CHECK constraint (AddRelationNewConstraints):
+/// the one column its expression reads, or nothing when it reads none or
+/// several.
+fn check_name_addition(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+    expr: Option<&pg_query::protobuf::Node>,
+) -> String {
+    let mut columns: Vec<String> = Vec::new();
+    if let Some(inner) = expr.and_then(|e| e.node.as_ref()) {
+        for (n, ..) in inner.nodes() {
+            if let pg_query::NodeRef::ColumnRef(cr) = n
+                && let Some(name) = cr.fields.last().and_then(super::util::node_string)
+                && interp.attribute_by_name(relid, name).is_some()
+                && !columns.iter().any(|c| c == name)
+            {
+                columns.push(name.to_owned());
+            }
+        }
+    }
+    match columns.as_slice() {
+        [one] => one.clone(),
+        _ => String::new(),
+    }
+}
 
 /// Look up the `pg_class.relname` for `relid`. Used to produce PG-aligned
 /// error messages of the form `column "X" of relation "T" does not exist` —

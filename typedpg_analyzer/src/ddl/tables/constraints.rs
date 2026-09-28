@@ -30,7 +30,7 @@ pub(crate) fn emit_constraints(
         Vec<String>,
         Vec<PgTypeOid>,
         Vec<i16>,
-        String,
+        ConName,
     );
     let mut pending_fks: Vec<PendingFk> = Vec::new();
 
@@ -52,7 +52,13 @@ pub(crate) fn emit_constraints(
             match ConstrType::try_from(c.contype) {
                 Ok(ConstrType::ConstrPrimary) => {
                     to_emit.push((
-                        constraint_name(&c.conname, || format!("{relname}_pkey")),
+                        ConName::from_explicit(
+                            &c.conname,
+                            ConName::Relation {
+                                addition: String::new(),
+                                label: "pkey",
+                            },
+                        ),
                         ConType::PrimaryKey,
                         vec![an],
                         None,
@@ -61,7 +67,13 @@ pub(crate) fn emit_constraints(
                 }
                 Ok(ConstrType::ConstrUnique) => {
                     to_emit.push((
-                        constraint_name(&c.conname, || format!("{relname}_{}_key", cd.colname)),
+                        ConName::from_explicit(
+                            &c.conname,
+                            ConName::Relation {
+                                addition: cd.colname.clone(),
+                                label: "key",
+                            },
+                        ),
                         ConType::Unique,
                         vec![an],
                         None,
@@ -70,7 +82,13 @@ pub(crate) fn emit_constraints(
                 }
                 Ok(ConstrType::ConstrCheck) => {
                     to_emit.push((
-                        constraint_name(&c.conname, || format!("{relname}_{}_check", cd.colname)),
+                        ConName::from_explicit(
+                            &c.conname,
+                            ConName::Constraint {
+                                addition: check_name_addition(interp, relid, c.raw_expr.as_deref()),
+                                label: "check",
+                            },
+                        ),
                         ConType::Check,
                         vec![an],
                         None,
@@ -83,7 +101,10 @@ pub(crate) fn emit_constraints(
                         vec![cd.colname.clone()],
                         vec![my_type],
                         vec![an],
-                        format!("{relname}_{}_fkey", cd.colname),
+                        ConName::Constraint {
+                            addition: cd.colname.clone(),
+                            label: "fkey",
+                        },
                     ));
                 }
                 _ => {}
@@ -108,7 +129,13 @@ pub(crate) fn emit_constraints(
         match ConstrType::try_from(c.contype) {
             Ok(ConstrType::ConstrPrimary) if !columns.is_empty() => {
                 to_emit.push((
-                    constraint_name(&c.conname, || format!("{relname}_pkey")),
+                    ConName::from_explicit(
+                        &c.conname,
+                        ConName::Relation {
+                            addition: String::new(),
+                            label: "pkey",
+                        },
+                    ),
                     ConType::PrimaryKey,
                     columns,
                     None,
@@ -117,9 +144,13 @@ pub(crate) fn emit_constraints(
             }
             Ok(ConstrType::ConstrUnique) if !columns.is_empty() => {
                 to_emit.push((
-                    constraint_name(&c.conname, || {
-                        format!("{relname}_{}_key", column_names.join("_"))
-                    }),
+                    ConName::from_explicit(
+                        &c.conname,
+                        ConName::Relation {
+                            addition: crate::ddl::util::index_name_addition(&column_names),
+                            label: "key",
+                        },
+                    ),
                     ConType::Unique,
                     columns,
                     None,
@@ -128,7 +159,13 @@ pub(crate) fn emit_constraints(
             }
             Ok(ConstrType::ConstrCheck) => {
                 to_emit.push((
-                    constraint_name(&c.conname, || format!("{relname}_check")),
+                    ConName::from_explicit(
+                        &c.conname,
+                        ConName::Constraint {
+                            addition: check_name_addition(interp, relid, c.raw_expr.as_deref()),
+                            label: "check",
+                        },
+                    ),
                     ConType::Check,
                     columns,
                     None,
@@ -138,13 +175,13 @@ pub(crate) fn emit_constraints(
             Ok(ConstrType::ConstrExclusion) => {
                 let (keys, names) = exclusion_keys(interp, relid, c)?;
                 to_emit.push((
-                    constraint_name(&c.conname, || {
-                        crate::ddl::util::make_object_name(
-                            relname,
-                            &crate::ddl::util::index_name_addition(&names),
-                            "excl",
-                        )
-                    }),
+                    ConName::from_explicit(
+                        &c.conname,
+                        ConName::Relation {
+                            addition: crate::ddl::util::index_name_addition(&names),
+                            label: "excl",
+                        },
+                    ),
                     ConType::Exclusion,
                     keys,
                     None,
@@ -170,14 +207,36 @@ pub(crate) fn emit_constraints(
                     )));
                 }
                 let fk_columns: Vec<i16> = fk_names.iter().filter_map(|n| attnum_of(n)).collect();
-                let default_name = format!("{relname}_{}_fkey", fk_names.join("_"));
+                let default_name = ConName::Constraint {
+                    addition: crate::ddl::util::index_name_addition(&fk_names),
+                    label: "fkey",
+                };
                 pending_fks.push((c, fk_names, local_types, fk_columns, default_name));
             }
             _ => {}
         }
     }
 
-    for (conname, contype, conkey, confrelid, confkey) in to_emit {
+    // transformIndexConstraints drops a PRIMARY KEY / UNIQUE spec that
+    // repeats an earlier one's key (an unnamed duplicate; a PRIMARY KEY wins
+    // over a UNIQUE).
+    let mut kept: Vec<PendingConstraint> = Vec::new();
+    for pending in to_emit {
+        let index_backed = |t: ConType| matches!(t, ConType::PrimaryKey | ConType::Unique);
+        let dup = kept
+            .iter()
+            .position(|k| index_backed(k.1) && index_backed(pending.1) && k.2 == pending.2);
+        match dup {
+            Some(i) if !pending.0.is_explicit() || !kept[i].0.is_explicit() => {
+                if pending.1 == ConType::PrimaryKey && kept[i].1 == ConType::Unique {
+                    kept[i] = pending;
+                }
+            }
+            _ => kept.push(pending),
+        }
+    }
+    for (conname, contype, conkey, confrelid, confkey) in kept {
+        let conname = conname.resolve(interp, relid);
         emit_constraint_with_backing_index(
             interp, relid, conname, contype, conkey, confrelid, confkey,
         )?;
@@ -185,10 +244,11 @@ pub(crate) fn emit_constraints(
     for (c, local_names, local_types, conkey, default_name) in pending_fks {
         let (target_oid, target_attnums) =
             resolve_fk_target(interp, c, relname, &local_names, &local_types)?;
+        let conname = ConName::from_explicit(&c.conname, default_name).resolve(interp, relid);
         emit_constraint_with_backing_index(
             interp,
             relid,
-            constraint_name(&c.conname, || default_name),
+            conname,
             ConType::ForeignKey,
             conkey,
             Some(target_oid),
@@ -816,14 +876,13 @@ pub(crate) fn add_constraint(
     let Some(node::Node::Constraint(c)) = def.node.as_ref() else {
         return Ok(());
     };
-    add_constraint_node(interp, relid, c, &cmd.name, None, rec)
+    add_constraint_node(interp, relid, c, &cmd.name, rec)
 }
 
 /// The constraints written inline on an `ALTER TABLE ... ADD COLUMN`
 /// definition (PRIMARY KEY, UNIQUE, CHECK, REFERENCES): like
 /// `transformColumnDefinition`, attach the column as the constraint's key and
-/// add each as if by `ADD CONSTRAINT` (column-level CHECKs are named
-/// `<table>_<column>_check`).
+/// add each as if by `ADD CONSTRAINT`.
 pub(crate) fn add_column_constraints(
     interp: &mut PgCatalog,
     relid: PgClassOid,
@@ -851,8 +910,7 @@ pub(crate) fn add_column_constraints(
             Ok(ConstrType::ConstrCheck) => {}
             _ => continue,
         }
-        let check_name = format!("{}_{}_check", relname_of(interp, relid), cd.colname);
-        add_constraint_node(interp, relid, &c, &cd.colname, Some(check_name), only_here)?;
+        add_constraint_node(interp, relid, &c, &cd.colname, only_here)?;
     }
     Ok(())
 }
@@ -863,7 +921,6 @@ fn add_constraint_node(
     relid: PgClassOid,
     c: &pg_query::protobuf::Constraint,
     cmd_name: &str,
-    default_check_name: Option<String>,
     rec: super::inherit::Recursion,
 ) -> Result<(), DdlError> {
     // `ADD {PRIMARY KEY | UNIQUE} USING INDEX idx` turns an existing unique
@@ -874,14 +931,14 @@ fn add_constraint_node(
 
     if c.contype == ConstrType::ConstrExclusion as i32 {
         let (keys, names) = exclusion_keys(interp, relid, c)?;
-        let relname = relname_of(interp, relid);
-        let conname = constraint_name(&c.conname, || {
-            crate::ddl::util::make_object_name(
-                &relname,
-                &crate::ddl::util::index_name_addition(&names),
-                "excl",
-            )
-        });
+        let conname = ConName::from_explicit(
+            &c.conname,
+            ConName::Relation {
+                addition: crate::ddl::util::index_name_addition(&names),
+                label: "excl",
+            },
+        )
+        .resolve(interp, relid);
         emit_constraint_with_backing_index(
             interp,
             relid,
@@ -926,12 +983,14 @@ fn add_constraint_node(
             })
             .collect();
         if !attnums.is_empty() {
-            let relname = interp
-                .pg_class
-                .get(&relid)
-                .map(|c| c.relname.clone())
-                .unwrap_or_default();
-            let conname = constraint_name(&c.conname, || format!("{relname}_pkey"));
+            let conname = ConName::from_explicit(
+                &c.conname,
+                ConName::Relation {
+                    addition: String::new(),
+                    label: "pkey",
+                },
+            )
+            .resolve(interp, relid);
             emit_constraint_with_backing_index(
                 interp,
                 relid,
@@ -964,13 +1023,14 @@ fn add_constraint_node(
             })
             .collect();
         if !attnums.is_empty() {
-            let relname = interp
-                .pg_class
-                .get(&relid)
-                .map(|c| c.relname.clone())
-                .unwrap_or_default();
-            let conname =
-                constraint_name(&c.conname, || format!("{relname}_{}_key", cols.join("_")));
+            let conname = ConName::from_explicit(
+                &c.conname,
+                ConName::Relation {
+                    addition: crate::ddl::util::index_name_addition(&cols),
+                    label: "key",
+                },
+            )
+            .resolve(interp, relid);
             emit_constraint_with_backing_index(
                 interp,
                 relid,
@@ -1006,14 +1066,14 @@ fn add_constraint_node(
         // DDL time, only the type-must-be-bool check below has teeth.
         validate_check_expression_for_table(interp, relid, expr)?;
         // Emit pg_constraint row for the CHECK so future inspections see it.
-        let relname = interp
-            .pg_class
-            .get(&relid)
-            .map(|cls| cls.relname.clone())
-            .unwrap_or_default();
-        let conname = constraint_name(&c.conname, || {
-            default_check_name.unwrap_or_else(|| format!("{relname}_check"))
-        });
+        let conname = ConName::from_explicit(
+            &c.conname,
+            ConName::Constraint {
+                addition: check_name_addition(interp, relid, Some(expr)),
+                label: "check",
+            },
+        )
+        .resolve(interp, relid);
         emit_constraint_with_backing_index(
             interp,
             relid,
@@ -1057,9 +1117,14 @@ fn add_constraint_node(
             .unwrap_or_default();
         let (target_oid, target_attnums) =
             resolve_fk_target(interp, c, &relname_owned, &column_names, &local_types)?;
-        let conname = constraint_name(&c.conname, || {
-            format!("{relname_owned}_{}_fkey", column_names.join("_"))
-        });
+        let conname = ConName::from_explicit(
+            &c.conname,
+            ConName::Constraint {
+                addition: crate::ddl::util::index_name_addition(&column_names),
+                label: "fkey",
+            },
+        )
+        .resolve(interp, relid);
         emit_constraint_with_backing_index(
             interp,
             relid,

@@ -735,3 +735,43 @@ fn create_unique_index_is_not_a_constraint() {
         "constraint \"ui\" of relation \"u\" does not exist",
     );
 }
+
+#[test]
+fn generated_constraint_names_follow_pg() {
+    // PG 18: a CHECK is named after the one column it reads (else just
+    // `_check`), names are numbered on collision, and an unnamed UNIQUE
+    // repeating another key is dropped.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int, b int CHECK (a > 0), c int CHECK (c > b), CHECK (a > 1),
+                         UNIQUE (a), UNIQUE (a), CONSTRAINT k UNIQUE (b), UNIQUE (b),
+                         FOREIGN KEY (c) REFERENCES t (a));
+         ALTER TABLE t ADD CHECK (b < 100);
+         ALTER TABLE t ADD UNIQUE (c);
+         ALTER TABLE t ADD FOREIGN KEY (b) REFERENCES t (a);
+         CREATE TABLE x_pkey (y int);
+         CREATE TABLE x (a int PRIMARY KEY);",
+    )]);
+    let mut names = db.pg_constraint_names_for_table("public", "t");
+    names.sort();
+    assert_eq!(
+        names,
+        vec![
+            "k",
+            "t_a_check",
+            "t_a_check1",
+            "t_a_key",
+            "t_b_check",
+            "t_b_fkey",
+            "t_c_fkey",
+            "t_c_key",
+            "t_check"
+        ]
+    );
+    let names: Vec<String> = db
+        .pg_constraint_names_for_table("public", "x")
+        .into_iter()
+        .filter(|n| !n.ends_with("_not_null"))
+        .collect();
+    assert_eq!(names, vec!["x_pkey1"]);
+}
