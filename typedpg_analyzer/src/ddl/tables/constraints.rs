@@ -135,6 +135,22 @@ pub(crate) fn emit_constraints(
                     Vec::new(),
                 ));
             }
+            Ok(ConstrType::ConstrExclusion) => {
+                let (keys, names) = exclusion_keys(interp, relid, c)?;
+                to_emit.push((
+                    constraint_name(&c.conname, || {
+                        crate::ddl::util::make_object_name(
+                            relname,
+                            &crate::ddl::util::index_name_addition(&names),
+                            "excl",
+                        )
+                    }),
+                    ConType::Exclusion,
+                    keys,
+                    None,
+                    Vec::new(),
+                ));
+            }
             Ok(ConstrType::ConstrForeign) => {
                 // Table-level FK uses `fk_attrs` for the local columns;
                 // `keys` only carries column lists on PK / UNIQUE.
@@ -210,7 +226,10 @@ fn emit_constraint_with_backing_index(
         conislocal: true,
         coninhcount: 0,
     });
-    if matches!(contype, ConType::PrimaryKey | ConType::Unique) {
+    if matches!(
+        contype,
+        ConType::PrimaryKey | ConType::Unique | ConType::Exclusion
+    ) {
         let table_ns = interp
             .pg_class
             .get(&relid)
@@ -234,7 +253,8 @@ fn emit_constraint_with_backing_index(
             indrelid: relid,
             indnatts,
             indnkeyatts: indnatts,
-            indisunique: true,
+            // An exclusion constraint's index is not a unique one.
+            indisunique: contype != ConType::Exclusion,
             indisprimary: matches!(contype, ConType::PrimaryKey),
             indkey: conkey,
             indexprs: Vec::new(),
@@ -242,6 +262,44 @@ fn emit_constraint_with_backing_index(
         });
     }
     Ok(())
+}
+
+/// The key columns of an `EXCLUDE (elem WITH op, ...)` constraint: each
+/// element's attnum (`0` for an expression) and the names PG's
+/// `ChooseIndexColumnNames` uses for the default constraint name.
+fn exclusion_keys(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+    c: &pg_query::protobuf::Constraint,
+) -> Result<(Vec<i16>, Vec<String>), DdlError> {
+    let mut attnums = Vec::new();
+    let mut names = Vec::new();
+    for pair in &c.exclusions {
+        let Some(node::Node::List(l)) = pair.node.as_ref() else {
+            continue;
+        };
+        let Some(node::Node::IndexElem(elem)) = l.items.first().and_then(|n| n.node.as_ref())
+        else {
+            continue;
+        };
+        if elem.name.is_empty() {
+            attnums.push(0);
+            names.push("expr".to_owned());
+        } else {
+            let attnum = interp
+                .attribute_by_name(relid, &elem.name)
+                .map(|a| a.attnum)
+                .ok_or_else(|| {
+                    DdlError::Parse(format!(
+                        "column \"{}\" named in key does not exist",
+                        elem.name
+                    ))
+                })?;
+            attnums.push(attnum);
+            names.push(elem.name.clone());
+        }
+    }
+    Ok((attnums, names))
 }
 
 /// Resolve a `FOREIGN KEY` target: returns `(target_class_oid, target_attnums)`.
@@ -674,6 +732,82 @@ pub(crate) fn add_constraint(
     let Some(node::Node::Constraint(c)) = def.node.as_ref() else {
         return Ok(());
     };
+    add_constraint_node(interp, relid, c, &cmd.name, None, rec)
+}
+
+/// The constraints written inline on an `ALTER TABLE ... ADD COLUMN`
+/// definition (PRIMARY KEY, UNIQUE, CHECK, REFERENCES): like
+/// `transformColumnDefinition`, attach the column as the constraint's key and
+/// add each as if by `ADD CONSTRAINT` (column-level CHECKs are named
+/// `<table>_<column>_check`).
+pub(crate) fn add_column_constraints(
+    interp: &mut PgCatalog,
+    relid: PgClassOid,
+    cd: &pg_query::protobuf::ColumnDef,
+) -> Result<(), DdlError> {
+    let colname_node = pg_query::protobuf::Node {
+        node: Some(node::Node::String(pg_query::protobuf::String {
+            sval: cd.colname.clone(),
+        })),
+    };
+    let only_here = super::inherit::Recursion {
+        recurse: false,
+        recursing: false,
+    };
+    for c_node in &cd.constraints {
+        let Some(node::Node::Constraint(c)) = c_node.node.as_ref() else {
+            continue;
+        };
+        let mut c = c.clone();
+        match ConstrType::try_from(c.contype) {
+            Ok(ConstrType::ConstrPrimary | ConstrType::ConstrUnique) => {
+                c.keys = vec![colname_node.clone()];
+            }
+            Ok(ConstrType::ConstrForeign) => c.fk_attrs = vec![colname_node.clone()],
+            Ok(ConstrType::ConstrCheck) => {}
+            _ => continue,
+        }
+        let check_name = format!("{}_{}_check", relname_of(interp, relid), cd.colname);
+        add_constraint_node(interp, relid, &c, &cd.colname, Some(check_name), only_here)?;
+    }
+    Ok(())
+}
+
+/// `ADD CONSTRAINT` of one constraint node (`ATExecAddConstraint`).
+fn add_constraint_node(
+    interp: &mut PgCatalog,
+    relid: PgClassOid,
+    c: &pg_query::protobuf::Constraint,
+    cmd_name: &str,
+    default_check_name: Option<String>,
+    rec: super::inherit::Recursion,
+) -> Result<(), DdlError> {
+    // `ADD {PRIMARY KEY | UNIQUE} USING INDEX idx` turns an existing unique
+    // index into the constraint (ATExecAddIndexConstraint).
+    if !c.indexname.is_empty() {
+        return add_index_constraint(interp, relid, c);
+    }
+
+    if c.contype == ConstrType::ConstrExclusion as i32 {
+        let (keys, names) = exclusion_keys(interp, relid, c)?;
+        let relname = relname_of(interp, relid);
+        let conname = constraint_name(&c.conname, || {
+            crate::ddl::util::make_object_name(
+                &relname,
+                &crate::ddl::util::index_name_addition(&names),
+                "excl",
+            )
+        });
+        emit_constraint_with_backing_index(
+            interp,
+            relid,
+            conname,
+            ConType::Exclusion,
+            keys,
+            None,
+            Vec::new(),
+        )?;
+    }
 
     if c.contype == ConstrType::ConstrPrimary as i32 {
         let pk_cols: Vec<String> = c
@@ -776,7 +910,7 @@ pub(crate) fn add_constraint(
                     None
                 }
             })
-            .unwrap_or_else(|| cmd.name.clone());
+            .unwrap_or_else(|| cmd_name.to_owned());
         let explicit = (!c.conname.is_empty()).then_some(c.conname.as_str());
         super::inherit::set_not_null(interp, relid, &col_name, explicit, rec)?;
     }
@@ -793,7 +927,9 @@ pub(crate) fn add_constraint(
             .get(&relid)
             .map(|cls| cls.relname.clone())
             .unwrap_or_default();
-        let conname = constraint_name(&c.conname, || format!("{relname}_check"));
+        let conname = constraint_name(&c.conname, || {
+            default_check_name.unwrap_or_else(|| format!("{relname}_check"))
+        });
         emit_constraint_with_backing_index(
             interp,
             relid,
@@ -851,6 +987,96 @@ pub(crate) fn add_constraint(
         )?;
     }
 
+    Ok(())
+}
+
+/// `ALTER TABLE t ADD [CONSTRAINT name] {PRIMARY KEY | UNIQUE} USING INDEX
+/// idx` (`ATExecAddIndexConstraint`, index.c `index_constraint_create`):
+/// the unique index becomes the constraint's index — renamed to the
+/// constraint name when one is given — and a PRIMARY KEY marks its columns
+/// NOT NULL.
+fn add_index_constraint(
+    interp: &mut PgCatalog,
+    relid: PgClassOid,
+    c: &pg_query::protobuf::Constraint,
+) -> Result<(), DdlError> {
+    let nsoid = interp
+        .pg_class
+        .get(&relid)
+        .map(|cls| cls.relnamespace)
+        .ok_or_else(|| DdlError::Internal(format!("relation oid {relid} missing")))?;
+    let index_oid = interp
+        .class_by_qname
+        .get(&(nsoid, c.indexname.clone()))
+        .copied()
+        .filter(|oid| interp.pg_index.contains_key(oid))
+        .ok_or_else(|| {
+            DdlError::TableNotFound(format!("index \"{}\" does not exist", c.indexname))
+        })?;
+    let Some(index) = interp.pg_index.get(&index_oid).cloned() else {
+        return Ok(());
+    };
+    if index.indrelid != relid {
+        return Err(DdlError::Parse(format!(
+            "index \"{}\" does not belong to table \"{}\"",
+            c.indexname,
+            relname_of(interp, relid)
+        )));
+    }
+    if !index.indisunique {
+        return Err(DdlError::Parse(format!(
+            "\"{}\" is not a unique index",
+            c.indexname
+        )));
+    }
+    let is_primary = c.contype == ConstrType::ConstrPrimary as i32;
+    let conname = if c.conname.is_empty() {
+        c.indexname.clone()
+    } else {
+        c.conname.clone()
+    };
+    if conname != c.indexname {
+        interp.rename_pg_class(index_oid, conname.clone(), nsoid);
+    }
+    // The fake UNIQUE row CREATE UNIQUE INDEX records for ON CONFLICT is
+    // superseded by the real constraint.
+    interp
+        .pg_constraint
+        .retain(|_, x| !(x.conrelid == relid && x.conname == c.indexname));
+    if let Some(idx) = interp.pg_index.get_mut(&index_oid) {
+        idx.indisprimary = is_primary;
+    }
+    if is_primary {
+        let only_here = super::inherit::Recursion {
+            recurse: false,
+            recursing: false,
+        };
+        for attnum in index.indkey.iter().copied().filter(|&an| an > 0) {
+            let colname = interp
+                .attributes_of(relid)
+                .iter()
+                .find(|a| a.attnum == attnum)
+                .map(|a| a.attname.clone())
+                .unwrap_or_default();
+            super::inherit::set_not_null(interp, relid, &colname, None, only_here)?;
+        }
+    }
+    let oid = PgConstraintOid::from_nonzero(interp.alloc_oid()?);
+    interp.insert_pg_constraint(PgConstraint {
+        oid,
+        conname,
+        conrelid: relid,
+        contype: if is_primary {
+            ConType::PrimaryKey
+        } else {
+            ConType::Unique
+        },
+        conkey: index.indkey,
+        confrelid: None,
+        confkey: Vec::new(),
+        conislocal: true,
+        coninhcount: 0,
+    });
     Ok(())
 }
 

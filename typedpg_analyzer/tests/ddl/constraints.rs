@@ -608,3 +608,98 @@ fn self_referencing_foreign_key_still_needs_a_key() {
         "there is no unique constraint matching given keys for referenced table \"t4\"",
     );
 }
+
+// ── Constraints recorded for ADD COLUMN, EXCLUDE, USING INDEX ───────────────
+
+fn sorted_constraint_names(db: &PgCatalog, table: &str) -> Vec<String> {
+    let mut names = db.pg_constraint_names_for_table("public", table);
+    names.sort();
+    names
+}
+
+#[test]
+fn add_column_records_its_inline_constraints() {
+    // PG 18: t1_c_check, t1_c_fkey, t1_email_key, t1_k_not_null, t1_pkey.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t1 (id int);
+         ALTER TABLE t1 ADD COLUMN email text UNIQUE;
+         ALTER TABLE t1 ADD COLUMN k int PRIMARY KEY;
+         ALTER TABLE t1 ADD COLUMN c int CHECK (c > 0) REFERENCES t1(k);",
+    )]);
+    assert_eq!(
+        sorted_constraint_names(&db, "t1"),
+        vec![
+            "t1_c_check",
+            "t1_c_fkey",
+            "t1_email_key",
+            "t1_k_not_null",
+            "t1_pkey"
+        ]
+    );
+    db.analyze("INSERT INTO t1 (email) VALUES ('x') ON CONFLICT (email) DO NOTHING")
+        .unwrap();
+    db.analyze("INSERT INTO t1 (k) VALUES (1) ON CONFLICT (k) DO NOTHING")
+        .unwrap();
+}
+
+#[test]
+fn exclusion_constraints_are_recorded() {
+    // PG 18: t4_r_excl (generated name), myex (explicit).
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t4 (r int4range, EXCLUDE USING gist (r WITH &&));
+         CREATE TABLE t5 (r int4range);
+         ALTER TABLE t5 ADD CONSTRAINT myex EXCLUDE USING gist (r WITH &&);",
+    )]);
+    assert_eq!(sorted_constraint_names(&db, "t4"), vec!["t4_r_excl"]);
+    assert_eq!(sorted_constraint_names(&db, "t5"), vec!["myex"]);
+    db.analyze(
+        "INSERT INTO t4 (r) VALUES ('[1,2)') ON CONFLICT ON CONSTRAINT t4_r_excl DO NOTHING",
+    )
+    .unwrap();
+}
+
+#[test]
+fn add_constraint_using_index_adopts_the_index() {
+    // PG 18: NOTICE ... will rename index "ui" to "tu"; the PRIMARY KEY
+    // variant makes the column NOT NULL.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE u (a int);
+         CREATE UNIQUE INDEX ui ON u (a);
+         ALTER TABLE u ADD CONSTRAINT tu UNIQUE USING INDEX ui;
+         CREATE TABLE u2 (a int);
+         CREATE UNIQUE INDEX u2i ON u2 (a);
+         ALTER TABLE u2 ADD PRIMARY KEY USING INDEX u2i;",
+    )]);
+    assert_eq!(sorted_constraint_names(&db, "u"), vec!["tu"]);
+    db.analyze("INSERT INTO u (a) VALUES (1) ON CONFLICT ON CONSTRAINT tu DO NOTHING")
+        .unwrap();
+    assert_cols(
+        &db.analyze("SELECT a FROM u2").unwrap(),
+        vec![c("a", int4())],
+    );
+    assert!(sorted_constraint_names(&db, "u2").contains(&"u2i".to_owned()));
+}
+
+#[test]
+fn unnamed_indexes_are_named_like_pg() {
+    // PG 18: t_expr_idx, t_lower_idx, t_b_idx, t_a_idx, t_a_idx1, t_a_a1_idx
+    // (a unique index is `_idx` too — only constraints get `_key`).
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int, b text);
+         CREATE INDEX ON t ((a+1));
+         CREATE INDEX ON t (lower(b));
+         CREATE INDEX ON t ((b::varchar));
+         CREATE UNIQUE INDEX ON t (a);
+         CREATE INDEX ON t (a);
+         CREATE INDEX ON t (a, a);",
+    )]);
+    db.apply_sql(
+        "DROP INDEX t_expr_idx; DROP INDEX t_lower_idx; DROP INDEX t_b_idx;
+         DROP INDEX t_a_idx; DROP INDEX t_a_idx1; DROP INDEX t_a_a1_idx;",
+    )
+    .unwrap();
+}

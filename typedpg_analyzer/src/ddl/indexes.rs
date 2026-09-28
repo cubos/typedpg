@@ -83,23 +83,26 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
 
     // ── Pick a name for the index ──
     //
-    // PG generates `<table>_<col1>_<col2>_..._<key|idx>` when the user
-    // omits the name. Unique indexes get `_key`, plain indexes get `_idx`.
-    let suffix = if stmt.unique { "key" } else { "idx" };
+    // ChooseIndexName (indexcmds.c): an unnamed index that isn't a
+    // constraint's is `<table>_<columns>_idx` — unique or not — numbered
+    // when taken; expression columns are named like FigureIndexColname.
     let conname = if stmt.idxname.is_empty() {
-        let mut parts: Vec<String> = Vec::new();
-        for param in &stmt.index_params {
-            if let Some(node::Node::IndexElem(elem)) = param.node.as_ref()
-                && !elem.name.is_empty()
-            {
-                parts.push(elem.name.clone());
-            }
-        }
-        if parts.is_empty() {
-            format!("{table_name}_{suffix}")
-        } else {
-            format!("{table_name}_{}_{}", parts.join("_"), suffix)
-        }
+        let colnames: Vec<String> = stmt
+            .index_params
+            .iter()
+            .filter_map(|param| match param.node.as_ref()? {
+                node::Node::IndexElem(elem) if !elem.name.is_empty() => Some(elem.name.clone()),
+                node::Node::IndexElem(elem) => Some(figure_index_colname(elem.expr.as_deref())),
+                _ => None,
+            })
+            .collect();
+        super::util::choose_relation_name(
+            db,
+            nsoid,
+            &table_name,
+            &super::util::index_name_addition(&colnames),
+            if stmt.primary { "pkey" } else { "idx" },
+        )
     } else {
         stmt.idxname.clone()
     };
@@ -176,6 +179,27 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
     }
 
     Ok(())
+}
+
+/// `FigureIndexColname`: a function call is named after the function, a
+/// column reference after the column (through casts), anything else `expr`.
+fn figure_index_colname(expr: Option<&pg_query::protobuf::Node>) -> String {
+    match expr.and_then(|e| e.node.as_ref()) {
+        Some(node::Node::FuncCall(fc)) => fc
+            .funcname
+            .last()
+            .and_then(super::util::node_string)
+            .unwrap_or("expr")
+            .to_owned(),
+        Some(node::Node::ColumnRef(cr)) => cr
+            .fields
+            .last()
+            .and_then(super::util::node_string)
+            .unwrap_or("expr")
+            .to_owned(),
+        Some(node::Node::TypeCast(tc)) => figure_index_colname(tc.arg.as_deref()),
+        _ => "expr".to_owned(),
+    }
 }
 
 /// Encode a `pg_query::Node` as a `SerializedAst` (protobuf bytes + an

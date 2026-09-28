@@ -424,6 +424,9 @@ pub(crate) fn add_column(
     {
         crate::ddl::sequences::create_owned_sequence(interp, relid, next_attnum, deptype)?;
     }
+    if !rec.recursing {
+        add_column_constraints(interp, relid, cd)?;
+    }
     for child in children {
         add_column(interp, child, cmd, rec.child())?;
     }
