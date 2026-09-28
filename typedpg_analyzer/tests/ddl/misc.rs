@@ -1101,3 +1101,140 @@ fn drop_column_drops_the_check_constraints_that_read_it() {
         ("0002.sql", "ALTER TABLE t DROP CONSTRAINT k;"),
     ]);
 }
+
+#[test]
+fn alter_table_inherit_and_no_inherit() {
+    // PG 18 ATPrepAddInherit / ATExecAddInherit / CreateInheritance /
+    // MergeAttributesIntoExisting / MergeConstraintsIntoExisting /
+    // RemoveInheritance.
+    let setup = "CREATE TABLE p (a int NOT NULL, b text, CONSTRAINT pc CHECK (a > 0));
+                 CREATE VIEW v AS SELECT 1 AS a;
+                 CREATE TABLE c1 (x int);
+                 CREATE TABLE c2 (a bigint, b text);
+                 CREATE TABLE c3 (a int, b text);
+                 CREATE TABLE c4 (a int NOT NULL, b text);
+                 CREATE TABLE c5 (a int NOT NULL, b text, CONSTRAINT pc CHECK (a > 1));
+                 CREATE TABLE c6 (a int NOT NULL, b text COLLATE \"C\", CONSTRAINT pc CHECK (a > 0));
+                 CREATE TABLE c7 (a int NOT NULL, b text, extra int, CONSTRAINT pc CHECK (a > 0));
+                 CREATE TABLE c8 (a int NOT NULL, b text, CONSTRAINT pc CHECK (a > 0) NO INHERIT);
+                 CREATE TABLE c9 (a int NOT NULL, b text GENERATED ALWAYS AS ('x') STORED,
+                                  CONSTRAINT pc CHECK (a > 0));
+                 CREATE TABLE pt (a int NOT NULL, b text) PARTITION BY LIST (a);
+                 CREATE TABLE part PARTITION OF pt FOR VALUES IN (1);
+                 CREATE TYPE ct AS (a int, b text);
+                 CREATE TABLE tt OF ct;";
+    for (stmt, msg) in [
+        (
+            "ALTER TABLE c1 INHERIT p;",
+            "child table is missing column \"a\"",
+        ),
+        (
+            "ALTER TABLE c2 INHERIT p;",
+            "child table \"c2\" has different type for column \"a\"",
+        ),
+        (
+            "ALTER TABLE c3 INHERIT p;",
+            "column \"a\" in child table \"c3\" must be marked NOT NULL",
+        ),
+        (
+            "ALTER TABLE c4 INHERIT p;",
+            "child table is missing constraint \"pc\"",
+        ),
+        (
+            "ALTER TABLE c5 INHERIT p;",
+            "child table \"c5\" has different definition for check constraint \"pc\"",
+        ),
+        (
+            "ALTER TABLE c6 INHERIT p;",
+            "child table \"c6\" has different collation for column \"b\"",
+        ),
+        (
+            "ALTER TABLE c8 INHERIT p;",
+            "constraint \"pc\" conflicts with non-inherited constraint on child table \"c8\"",
+        ),
+        (
+            "ALTER TABLE c9 INHERIT p;",
+            "column \"b\" in child table must not be a generated column",
+        ),
+        (
+            "ALTER TABLE c7 INHERIT p; ALTER TABLE c7 INHERIT p;",
+            "relation \"p\" would be inherited from more than once",
+        ),
+        (
+            "ALTER TABLE c7 INHERIT p; ALTER TABLE p INHERIT c7;",
+            "circular inheritance not allowed",
+        ),
+        (
+            "ALTER TABLE c7 INHERIT c7;",
+            "circular inheritance not allowed",
+        ),
+        (
+            "ALTER TABLE c7 INHERIT v;",
+            "ALTER action INHERIT cannot be performed on relation \"v\"",
+        ),
+        (
+            "ALTER TABLE tt INHERIT p;",
+            "cannot change inheritance of typed table",
+        ),
+        (
+            "ALTER TABLE part INHERIT p;",
+            "cannot change inheritance of a partition",
+        ),
+        (
+            "ALTER TABLE part NO INHERIT pt;",
+            "cannot change inheritance of a partition",
+        ),
+        (
+            "ALTER TABLE c1 INHERIT pt;",
+            "cannot inherit from partitioned table \"pt\"",
+        ),
+        (
+            "ALTER TABLE pt INHERIT c1;",
+            "cannot change inheritance of partitioned table",
+        ),
+        (
+            "ALTER TABLE c7 INHERIT part;",
+            "cannot inherit from a partition",
+        ),
+        (
+            "ALTER TABLE c7 INHERIT nosuch;",
+            "relation \"nosuch\" does not exist",
+        ),
+        (
+            "ALTER TABLE c7 NO INHERIT nosuch;",
+            "relation \"nosuch\" does not exist",
+        ),
+        (
+            "ALTER TABLE c7 NO INHERIT p;",
+            "relation \"p\" is not a parent of relation \"c7\"",
+        ),
+        (
+            "ALTER TABLE c7 INHERIT p; ALTER TABLE c7 DROP COLUMN a;",
+            "cannot drop inherited column \"a\"",
+        ),
+        (
+            "ALTER TABLE c7 INHERIT p; ALTER TABLE c7 DROP CONSTRAINT pc;",
+            "cannot drop inherited constraint \"pc\" of relation \"c7\"",
+        ),
+        (
+            "ALTER TABLE c7 INHERIT p; ALTER TABLE ONLY p ADD CONSTRAINT q CHECK (a < 9);",
+            "constraint must be added to child tables too",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "ALTER TABLE c7 INHERIT p;
+             ALTER TABLE p ADD COLUMN z int;
+             ALTER TABLE c7 NO INHERIT p;
+             ALTER TABLE c7 DROP CONSTRAINT pc;
+             ALTER TABLE c7 DROP COLUMN a;
+             ALTER TABLE c7 DROP COLUMN z;
+             ALTER TABLE ONLY p ADD CONSTRAINT q CHECK (a < 9);",
+        ),
+    ]);
+}

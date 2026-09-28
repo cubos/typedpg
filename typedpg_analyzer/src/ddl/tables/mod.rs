@@ -606,6 +606,8 @@ fn apply_alter_subtype(
         }
         AlterTableType::AtClusterOn => object_refs::cluster_on(interp, relid, cmd),
         AlterTableType::AtAddOf => typed::add_of(interp, relid, cmd),
+        AlterTableType::AtAddInherit => inherit_cmd::add_inherit(interp, relid, cmd),
+        AlterTableType::AtDropInherit => inherit_cmd::drop_inherit(interp, relid, cmd),
         AlterTableType::AtDropOf => typed::drop_of(interp, relid),
         AlterTableType::AtReplicaIdentity => object_refs::replica_identity(interp, relid, cmd),
         AlterTableType::AtAlterConstraint => object_refs::alter_constraint(interp, relid, cmd),
@@ -686,6 +688,8 @@ fn check_alter_target(
         ),
         At::AtAddConstraint => (table_like, "ADD CONSTRAINT"),
         At::AtAddOf => (class.relkind == RelKind::Table, "OF"),
+        At::AtAddInherit => (table_like, "INHERIT"),
+        At::AtDropInherit => (table_like, "NO INHERIT"),
         At::AtDropOf => (class.relkind == RelKind::Table, "NOT OF"),
         At::AtDropConstraint => (table_like, "DROP CONSTRAINT"),
         _ => (true, ""),
@@ -713,6 +717,7 @@ mod column_options;
 mod columns;
 mod constraints;
 pub(crate) mod inherit;
+mod inherit_cmd;
 mod merge;
 mod object_refs;
 pub(crate) mod typed;

@@ -1,0 +1,358 @@
+//! `ALTER TABLE ... INHERIT parent` / `NO INHERIT parent`
+//! (ATExecAddInherit / CreateInheritance, ATExecDropInherit /
+//! RemoveInheritance): an existing table joins or leaves a parent. Its
+//! columns and CHECK / not-null constraints must already match the
+//! parent's; they are then counted as inherited.
+
+use super::*;
+
+fn is_partition(interp: &PgCatalog, relid: PgClassOid) -> bool {
+    interp.pg_inherits.iter().any(|i| {
+        i.inhrelid == relid
+            && interp
+                .pg_class
+                .get(&i.inhparent)
+                .is_some_and(|c| c.relkind == RelKind::Partitioned)
+    })
+}
+
+fn parent_rangevar(cmd: &AlterTableCmd) -> Option<&pg_query::protobuf::RangeVar> {
+    match cmd.def.as_deref().and_then(|d| d.node.as_ref()) {
+        Some(node::Node::RangeVar(rv)) => Some(rv),
+        _ => None,
+    }
+}
+
+/// `relid` and all its descendants (find_all_inheritors).
+fn all_inheritors(interp: &PgCatalog, relid: PgClassOid) -> Vec<PgClassOid> {
+    let mut tree = vec![relid];
+    let mut i = 0;
+    while i < tree.len() {
+        for child in inherit::children_of(interp, tree[i]) {
+            if !tree.contains(&child) {
+                tree.push(child);
+            }
+        }
+        i += 1;
+    }
+    tree
+}
+
+pub(super) fn add_inherit(
+    interp: &mut PgCatalog,
+    relid: PgClassOid,
+    cmd: &AlterTableCmd,
+) -> Result<(), DdlError> {
+    let Some(rv) = parent_rangevar(cmd) else {
+        return Ok(());
+    };
+    // ATPrepAddInherit.
+    if is_partition(interp, relid) {
+        return Err(DdlError::Parse(
+            "cannot change inheritance of a partition".into(),
+        ));
+    }
+    if interp.pg_class.get(&relid).map(|c| c.relkind) == Some(RelKind::Partitioned) {
+        return Err(DdlError::Parse(
+            "cannot change inheritance of partitioned table".into(),
+        ));
+    }
+    let parent = super::super::util::lookup_relation(interp, rv)?.1;
+    let parent_class = interp.pg_class.get(&parent).cloned();
+    match parent_class.as_ref().map(|c| c.relkind) {
+        Some(RelKind::Table | RelKind::ForeignTable) => {}
+        Some(RelKind::Partitioned) => {
+            return Err(DdlError::Parse(format!(
+                "cannot inherit from partitioned table \"{}\"",
+                rv.relname
+            )));
+        }
+        Some(kind) => {
+            let kinds = match kind {
+                RelKind::View => "views",
+                RelKind::MaterializedView => "materialized views",
+                RelKind::Sequence => "sequences",
+                RelKind::Index | RelKind::PartitionedIndex => "indexes",
+                RelKind::CompositeType => "composite types",
+                _ => "this relation",
+            };
+            return Err(DdlError::Parse(format!(
+                "ALTER action INHERIT cannot be performed on relation \"{}\" (This operation \
+                 is not supported for {kinds}.)",
+                rv.relname
+            )));
+        }
+        None => return Ok(()),
+    }
+    if is_partition(interp, parent) {
+        return Err(DdlError::Parse("cannot inherit from a partition".into()));
+    }
+    let child_name = relname_of(interp, relid);
+    let parent_name = relname_of(interp, parent);
+    if all_inheritors(interp, relid).contains(&parent) {
+        return Err(DdlError::DuplicateObject(format!(
+            "circular inheritance not allowed (\"{parent_name}\" is already a child of \
+             \"{child_name}\".)"
+        )));
+    }
+    // CreateInheritance.
+    if interp
+        .pg_inherits
+        .iter()
+        .any(|i| i.inhrelid == relid && i.inhparent == parent)
+    {
+        return Err(DdlError::DuplicateObject(format!(
+            "relation \"{parent_name}\" would be inherited from more than once"
+        )));
+    }
+    merge_attributes_into_existing(interp, relid, parent, &child_name)?;
+    merge_constraints_into_existing(interp, relid, parent, &child_name)?;
+    let inhseqno = interp
+        .pg_inherits
+        .iter()
+        .filter(|i| i.inhrelid == relid)
+        .map(|i| i.inhseqno)
+        .max()
+        .unwrap_or(0)
+        + 1;
+    interp.pg_inherits.push(PgInherits {
+        inhrelid: relid,
+        inhparent: parent,
+        inhseqno,
+    });
+    Ok(())
+}
+
+/// MergeAttributesIntoExisting: every parent column must exist in the child
+/// with the same type, collation, NOT NULL-ness and generation.
+fn merge_attributes_into_existing(
+    interp: &mut PgCatalog,
+    child: PgClassOid,
+    parent: PgClassOid,
+    child_name: &str,
+) -> Result<(), DdlError> {
+    let parent_attrs = interp.attributes_of(parent).to_vec();
+    for pa in &parent_attrs {
+        let Some(ca) = interp.attribute_by_name(child, &pa.attname).cloned() else {
+            return Err(DdlError::Parse(format!(
+                "child table is missing column \"{}\"",
+                pa.attname
+            )));
+        };
+        if ca.atttypid != pa.atttypid || ca.atttypmod != pa.atttypmod {
+            return Err(DdlError::Parse(format!(
+                "child table \"{child_name}\" has different type for column \"{}\"",
+                pa.attname
+            )));
+        }
+        if ca.attcollation != pa.attcollation {
+            return Err(DdlError::Parse(format!(
+                "child table \"{child_name}\" has different collation for column \"{}\"",
+                pa.attname
+            )));
+        }
+        if pa.attnotnull && !ca.attnotnull {
+            return Err(DdlError::Parse(format!(
+                "column \"{}\" in child table \"{child_name}\" must be marked NOT NULL",
+                pa.attname
+            )));
+        }
+        match (pa.attgenerated.is_some(), ca.attgenerated.is_some()) {
+            (true, false) => {
+                return Err(DdlError::Parse(format!(
+                    "column \"{}\" in child table must be a generated column",
+                    pa.attname
+                )));
+            }
+            (false, true) => {
+                return Err(DdlError::Parse(format!(
+                    "column \"{}\" in child table must not be a generated column",
+                    pa.attname
+                )));
+            }
+            _ => {}
+        }
+    }
+    if let Some(attrs) = interp.pg_attribute.get_mut(&child) {
+        for a in attrs.iter_mut() {
+            if parent_attrs.iter().any(|pa| pa.attname == a.attname) {
+                a.attinhcount += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// MergeConstraintsIntoExisting: every inheritable CHECK of the parent
+/// must exist in the child with the same definition; the child's matching
+/// CHECK and not-null constraints become inherited.
+fn merge_constraints_into_existing(
+    interp: &mut PgCatalog,
+    child: PgClassOid,
+    parent: PgClassOid,
+    child_name: &str,
+) -> Result<(), DdlError> {
+    let mut parent_cons: Vec<PgConstraint> = interp
+        .pg_constraint
+        .values()
+        .filter(|c| c.conrelid == parent && matches!(c.contype, ConType::Check | ConType::NotNull))
+        .cloned()
+        .collect();
+    parent_cons.sort_by(|a, b| a.conname.cmp(&b.conname));
+    let mut merged = Vec::new();
+    for pc in &parent_cons {
+        let parent_def = interp.check_defs.get(&pc.oid).cloned();
+        if parent_def.as_ref().is_some_and(|d| d.no_inherit) {
+            continue;
+        }
+        let child_con = if pc.contype == ConType::NotNull {
+            // Not-null constraints match by column.
+            let Some(colname) = pc.conkey.first().and_then(|&an| {
+                interp
+                    .attributes_of(parent)
+                    .iter()
+                    .find(|a| a.attnum == an)
+                    .map(|a| a.attname.clone())
+            }) else {
+                continue;
+            };
+            let Some(attnum) = interp.attribute_by_name(child, &colname).map(|a| a.attnum) else {
+                continue;
+            };
+            let Some(con) = inherit::not_null_constraint(interp, child, attnum) else {
+                continue;
+            };
+            con.clone()
+        } else {
+            let Some(con) = interp
+                .pg_constraint
+                .values()
+                .find(|c| {
+                    c.conrelid == child && c.contype == ConType::Check && c.conname == pc.conname
+                })
+                .cloned()
+            else {
+                return Err(DdlError::Parse(format!(
+                    "child table is missing constraint \"{}\"",
+                    pc.conname
+                )));
+            };
+            let child_def = interp.check_defs.get(&con.oid);
+            if let (Some(p), Some(c)) = (parent_def.as_ref(), child_def)
+                && p.expr != c.expr
+            {
+                return Err(DdlError::Parse(format!(
+                    "child table \"{child_name}\" has different definition for check \
+                     constraint \"{}\"",
+                    pc.conname
+                )));
+            }
+            if child_def.is_some_and(|d| d.no_inherit) {
+                return Err(DdlError::UnsupportedDdl(format!(
+                    "constraint \"{}\" conflicts with non-inherited constraint on child table \
+                     \"{child_name}\"",
+                    pc.conname
+                )));
+            }
+            con
+        };
+        merged.push(child_con.oid);
+    }
+    for oid in merged {
+        if let Some(row) = interp.pg_constraint.get_mut(&oid) {
+            row.coninhcount += 1;
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn drop_inherit(
+    interp: &mut PgCatalog,
+    relid: PgClassOid,
+    cmd: &AlterTableCmd,
+) -> Result<(), DdlError> {
+    let Some(rv) = parent_rangevar(cmd) else {
+        return Ok(());
+    };
+    if is_partition(interp, relid) {
+        return Err(DdlError::Parse(
+            "cannot change inheritance of a partition".into(),
+        ));
+    }
+    let parent = super::super::util::lookup_relation(interp, rv)?.1;
+    let Some(pos) = interp
+        .pg_inherits
+        .iter()
+        .position(|i| i.inhrelid == relid && i.inhparent == parent)
+    else {
+        return Err(DdlError::TableNotFound(format!(
+            "relation \"{}\" is not a parent of relation \"{}\"",
+            relname_of(interp, parent),
+            relname_of(interp, relid)
+        )));
+    };
+    interp.pg_inherits.remove(pos);
+
+    // The columns the parent contributed.
+    let parent_cols: Vec<String> = interp
+        .attributes_of(parent)
+        .iter()
+        .map(|a| a.attname.clone())
+        .collect();
+    if let Some(attrs) = interp.pg_attribute.get_mut(&relid) {
+        for a in attrs.iter_mut() {
+            if a.attinhcount > 0 && parent_cols.contains(&a.attname) {
+                a.attinhcount -= 1;
+                if a.attinhcount == 0 {
+                    a.attislocal = true;
+                }
+            }
+        }
+    }
+
+    // Its CHECK constraints (by name) and not-null constraints (by column).
+    let parent_cons: Vec<PgConstraint> = interp
+        .pg_constraint
+        .values()
+        .filter(|c| c.conrelid == parent && matches!(c.contype, ConType::Check | ConType::NotNull))
+        .filter(|c| !interp.check_defs.get(&c.oid).is_some_and(|d| d.no_inherit))
+        .cloned()
+        .collect();
+    let mut targets = Vec::new();
+    for pc in &parent_cons {
+        let child_con = if pc.contype == ConType::NotNull {
+            pc.conkey
+                .first()
+                .and_then(|&an| {
+                    let name = &interp
+                        .attributes_of(parent)
+                        .iter()
+                        .find(|a| a.attnum == an)?
+                        .attname;
+                    interp.attribute_by_name(relid, name).map(|a| a.attnum)
+                })
+                .and_then(|attnum| inherit::not_null_constraint(interp, relid, attnum))
+                .map(|c| c.oid)
+        } else {
+            interp
+                .pg_constraint
+                .values()
+                .find(|c| {
+                    c.conrelid == relid && c.contype == ConType::Check && c.conname == pc.conname
+                })
+                .map(|c| c.oid)
+        };
+        targets.extend(child_con);
+    }
+    for oid in targets {
+        if let Some(row) = interp.pg_constraint.get_mut(&oid)
+            && row.coninhcount > 0
+        {
+            row.coninhcount -= 1;
+            if row.coninhcount == 0 {
+                row.conislocal = true;
+            }
+        }
+    }
+    Ok(())
+}
