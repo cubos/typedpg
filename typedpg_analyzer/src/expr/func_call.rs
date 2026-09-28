@@ -12,6 +12,9 @@ struct FuncArgs {
     nullable: Vec<bool>,
     /// `true` if any argument is nullable.
     any_nullable: bool,
+    /// Each argument's inferred type with its collation state, for the
+    /// call's collation derivation.
+    exprs: Vec<ExprType>,
     /// Number of *direct* args (`func.args`); for ordered-set aggregates the
     /// `WITHIN GROUP (ORDER BY …)` exprs are appended to `types` after these.
     direct_count: usize,
@@ -144,6 +147,9 @@ pub(crate) fn infer_func_call(
     } else {
         Some(RecordField::from_out_args(&resolved.out_args))
     };
+    // The result's collation derives from the arguments' (assign_collations).
+    let (collation, explicit_collation) =
+        derive_collation(&args.exprs, resolved.return_type_oid, snapshot)?;
     Ok(ExprType {
         type_oid: resolved.return_type_oid,
         nullable,
@@ -151,15 +157,8 @@ pub(crate) fn infer_func_call(
         // argument's typmod (PG matching: `lower(varchar(20))` returns
         // varchar, not varchar(20)).
         typmod: None,
-        // Collation derivation through function calls is PG's most
-        // intricate area (see "collation derivation" in the docs). For
-        // the common case of `lower(text_col)` / `upper(text_col)` the
-        // input collation flows through, but exhaustive support
-        // requires the per-function `proargcollation`/`procollation`
-        // we don't model. Conservatively drop collation through
-        // calls — the compiler still propagates COLLATE-decorated
-        // column refs for the surrounding context.
-        collation: None,
+        collation,
+        explicit_collation,
         record_fields,
     })
 }
@@ -426,11 +425,13 @@ fn collect_arg_types(
     let mut types = Vec::with_capacity(func.args.len());
     let mut nullable = Vec::with_capacity(func.args.len());
     let mut any_nullable = false;
+    let mut exprs = Vec::with_capacity(func.args.len());
     for arg in &func.args {
         let t = infer_expr(arg, ctx, params, TypeGoal::NONE)?;
         any_nullable = any_nullable || t.nullable;
         nullable.push(t.nullable);
         types.push(t.type_oid);
+        exprs.push(t);
     }
 
     let direct_count = types.len();
@@ -454,6 +455,7 @@ fn collect_arg_types(
         types,
         nullable,
         any_nullable,
+        exprs,
         direct_count,
     })
 }

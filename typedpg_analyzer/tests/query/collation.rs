@@ -137,11 +137,18 @@ fn collate_on_text_domain_accepted() {
 fn collate_in_concat_expression() {
     let db = setup();
     // `name || (nick COLLATE "C")` — collate on the nullable side; the
-    // concat is strict so the result is nullable.
+    // concat is strict so the result is nullable, and the explicit
+    // collation is the operator result's (PG's assign_collations).
     let s = db
         .analyze("SELECT name || (nick COLLATE \"C\") AS combined FROM users")
         .unwrap();
-    assert_cols(&s, vec![cn("combined", text())]);
+    assert_cols(
+        &s,
+        vec![cn(
+            "combined",
+            basic_with_collation("pg_catalog", "text", "C"),
+        )],
+    );
 }
 
 #[test]
@@ -150,7 +157,11 @@ fn collate_in_case_branch() {
     let s = db
         .analyze("SELECT CASE WHEN id > 0 THEN name COLLATE \"C\" ELSE 'x' END AS v FROM users")
         .unwrap();
-    assert_cols(&s, vec![c("v", text())]);
+    // The branch's explicit collation is the CASE result's.
+    assert_cols(
+        &s,
+        vec![c("v", basic_with_collation("pg_catalog", "text", "C"))],
+    );
 }
 
 // ── Collation registry — `pg_collation` / `attcollation` not modeled ────────
@@ -279,5 +290,81 @@ fn collate_on_array_of_collatable_element_accepted() {
         err.to_string()
             .starts_with("collations are not supported by type integer[]"),
         "got: {err}"
+    );
+}
+
+// ── Collation derivation (assign_collations / merge_collation_state) ───────
+
+fn collation_db() -> PgCatalog {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE tc (s text NOT NULL, sn text, sc text COLLATE \"C\", \
+         sp text COLLATE \"POSIX\", n int);",
+    )
+    .unwrap();
+    db
+}
+
+#[test]
+fn conflicting_explicit_collations_rejected() {
+    let db = collation_db();
+    for sql in [
+        "SELECT s COLLATE \"C\" < sn COLLATE \"POSIX\" FROM tc",
+        "SELECT s COLLATE \"C\" = 'x' COLLATE \"POSIX\" FROM tc",
+        "SELECT sc COLLATE \"C\" || sp COLLATE \"POSIX\" FROM tc",
+        "SELECT upper(s COLLATE \"C\") = s COLLATE \"POSIX\" FROM tc",
+        "SELECT CASE WHEN n > 0 THEN s COLLATE \"C\" ELSE s COLLATE \"POSIX\" END FROM tc",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::CollationMismatch(_),
+            "collation mismatch between explicit collations \"C\" and \"POSIX\""
+        );
+    }
+}
+
+#[test]
+fn collation_flows_through_functions_operators_and_constructs() {
+    // attcollation of the equivalent view columns on PG 18.
+    let db = collation_db();
+    let s = db
+        .analyze(
+            "SELECT upper(s COLLATE \"C\") AS a, s COLLATE \"C\" || 'x' AS b, sc AS c, \
+             upper(sc) AS d, sc || s AS e, COALESCE(sc, s) AS f, \
+             CASE WHEN n > 0 THEN sc ELSE s END AS g, (s COLLATE \"C\")::varchar AS h, \
+             n::text AS i, NULLIF(sc, 'x') AS k, (sc || sp) COLLATE \"C\" AS m, \
+             GREATEST(sc, s) AS o, sc COLLATE \"POSIX\" AS p, lower(sp) AS q FROM tc",
+        )
+        .unwrap();
+    let got: Vec<(String, Option<String>)> = s
+        .columns
+        .iter()
+        .map(|c| {
+            let coll = match &c.pg_type {
+                Type::Basic { collation, .. } => collation.clone(),
+                _ => None,
+            };
+            (c.name.clone(), coll)
+        })
+        .collect();
+    let want = |n: &str, c: Option<&str>| (n.to_string(), c.map(str::to_string));
+    assert_eq!(
+        got,
+        vec![
+            want("a", Some("C")),
+            want("b", Some("C")),
+            want("c", Some("C")),
+            want("d", Some("C")),
+            want("e", Some("C")),
+            want("f", Some("C")),
+            want("g", Some("C")),
+            want("h", Some("C")),
+            want("i", None),
+            want("k", Some("C")),
+            want("m", Some("C")),
+            want("o", Some("C")),
+            want("p", Some("POSIX")),
+            want("q", Some("POSIX")),
+        ]
     );
 }

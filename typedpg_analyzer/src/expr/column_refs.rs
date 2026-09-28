@@ -55,6 +55,7 @@ pub(crate) fn infer_column_ref(
                 // `COLLATE "x"` decoration on the surrounding expression
                 // does.
                 collation: col.collation,
+                explicit_collation: false,
                 // Carry the column's record shape forward so downstream
                 // `(col).field` indirection and ROW-vs-shape coercion can
                 // see through to the field types.
@@ -143,6 +144,7 @@ fn infer_star_ref(
                 nullable: !c.base_not_null,
                 typmod: c.typmod,
                 collation: c.collation,
+                explicit_collation: false,
                 record_fields: c.record_fields.clone(),
             },
         })
@@ -152,6 +154,7 @@ fn infer_star_ref(
         nullable: false,
         typmod: None,
         collation: None,
+        explicit_collation: false,
         record_fields: Some(fields),
     })
 }

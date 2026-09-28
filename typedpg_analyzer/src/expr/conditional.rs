@@ -121,11 +121,10 @@ pub(crate) fn infer_coalesce(
         }
     }
 
-    Ok(ExprType::scalar_with_typmod(
-        type_oid,
-        all_nullable,
-        agreed_typmod(&args, type_oid),
-    ))
+    Ok(
+        ExprType::scalar_with_typmod(type_oid, all_nullable, agreed_typmod(&args, type_oid))
+            .with_collation(derive_collation(&args, type_oid, snapshot)?),
+    )
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -224,9 +223,10 @@ pub(crate) fn infer_case(
     }
 
     let nullable = inputs.iter().any(|t| t.nullable);
-    Ok(ExprType::scalar_with_typmod(
-        type_oid,
-        nullable,
-        agreed_typmod(&inputs, type_oid),
-    ))
+    // Collations merge in tree order: THEN results, then ELSE.
+    let collation = derive_collation(inputs[1..].iter().chain(&inputs[..1]), type_oid, snapshot)?;
+    Ok(
+        ExprType::scalar_with_typmod(type_oid, nullable, agreed_typmod(&inputs, type_oid))
+            .with_collation(collation),
+    )
 }

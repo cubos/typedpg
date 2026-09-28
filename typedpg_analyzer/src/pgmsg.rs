@@ -818,6 +818,14 @@ pub(crate) fn collation_does_not_exist(name: &str) -> AnalyzeError {
     ))
 }
 
+/// `collation mismatch between explicit collations "A" and "B"` — SQLSTATE
+/// 42P21: merge_collation_state meeting two different COLLATE clauses.
+pub(crate) fn collation_mismatch_explicit(a: &str, b: &str) -> AnalyzeError {
+    AnalyzeError::CollationMismatch(format!(
+        "collation mismatch between explicit collations \"{a}\" and \"{b}\""
+    ))
+}
+
 /// `cannot subscript type T because it does not support subscripting` —
 /// SQLSTATE 42804: the (domain-unwrapped) container type has no subscript
 /// handler (PG's transformContainerSubscripts).

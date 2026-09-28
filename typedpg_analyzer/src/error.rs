@@ -64,6 +64,11 @@ pub enum AnalyzeError {
     #[error("{0}")]
     FeatureNotSupported(String),
 
+    /// Two different explicit `COLLATE` collations meet in one expression.
+    /// Equivalent to PG `collation_mismatch` (SQLSTATE 42P21).
+    #[error("{0}")]
+    CollationMismatch(String),
+
     /// An object of the wrong kind was used: a procedure called in an
     /// expression, `OVER` on a plain function, a window function without
     /// `OVER`. Equivalent to PG `wrong_object_type` (SQLSTATE 42809).
@@ -247,6 +252,7 @@ impl AnalyzeError {
             FeatureNotSupported(_) => Some("0A000"),
             DuplicateColumn(_) => Some("42701"),
             InvalidRecursion(_) => Some("42P19"),
+            CollationMismatch(_) => Some("42P21"),
             UndefinedFunction(_) | UndefinedOperator(_) => Some("42883"),
             AmbiguousFunction(_) => Some("42725"),
             WrongObjectType(_) => Some("42809"),

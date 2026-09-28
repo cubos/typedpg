@@ -188,9 +188,9 @@ pub(crate) fn infer_type_cast(
     // PG: the cast result has exactly the written typmod — `x::T(n)` is
     // T(n), and `x::T` is T with typmod -1 even when x already was a T(n)
     // (coerce_type_typmod relabels to the target typmod).
-    Ok(ExprType::scalar_with_typmod(
-        target_oid,
-        inner_type.nullable,
-        written_typmod,
-    ))
+    let state = derive_collation([&inner_type], target_oid, snapshot)?;
+    Ok(
+        ExprType::scalar_with_typmod(target_oid, inner_type.nullable, written_typmod)
+            .with_collation(state),
+    )
 }

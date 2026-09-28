@@ -164,6 +164,11 @@ pub(crate) struct ExprType {
     /// derivation rules ("explicit > implicit > none") are approximated
     /// here as "left-or-right wins" in binary contexts.
     pub collation: Option<crate::oid::PgCollationOid>,
+    /// Whether `collation` was derived from an explicit `COLLATE` clause
+    /// (PG's COLLATE_EXPLICIT strength) rather than implicitly from a
+    /// column. Explicit collations win over implicit ones, and two
+    /// different explicit ones meeting in one expression are an error.
+    pub explicit_collation: bool,
     pub record_fields: Option<Vec<RecordField>>,
 }
 
@@ -205,6 +210,7 @@ impl ExprType {
             nullable,
             typmod: None,
             collation: None,
+            explicit_collation: false,
             record_fields: None,
         }
     }
@@ -218,6 +224,7 @@ impl ExprType {
             nullable,
             typmod,
             collation: None,
+            explicit_collation: false,
             record_fields: None,
         }
     }
@@ -237,9 +244,80 @@ impl ExprType {
             nullable,
             typmod,
             collation,
+            explicit_collation: false,
             record_fields: None,
         }
     }
+
+    /// The same value with the collation state PG's `assign_collations`
+    /// derives for it (see [`derive_collation`]).
+    pub fn with_collation(mut self, state: (Option<crate::oid::PgCollationOid>, bool)) -> Self {
+        (self.collation, self.explicit_collation) = state;
+        self
+    }
+}
+
+/// PG's `DEFAULT_COLLATION_OID`.
+const DEFAULT_COLLATION: crate::oid::PgCollationOid = crate::oid::PgCollationOid::from_raw(100);
+
+/// PG's collation derivation for one expression node (`assign_collations_walker`
+/// and `merge_collation_state`, parse_collate.c), given its inputs' states
+/// and its result type:
+///
+/// - explicit (`COLLATE`) inputs dominate; two different ones are `collation
+///   mismatch between explicit collations "A" and "B"` (42P21) whatever the
+///   result type;
+/// - otherwise a non-default implicit collation beats the default one, and
+///   two different non-default ones leave the collation undetermined (PG only
+///   fails later, if a collation is actually needed);
+/// - a non-collatable result has no collation.
+pub(crate) fn derive_collation<'a>(
+    inputs: impl IntoIterator<Item = &'a ExprType>,
+    result_type: PgTypeOid,
+    snapshot: &PgCatalog,
+) -> Result<(Option<crate::oid::PgCollationOid>, bool), AnalyzeError> {
+    let mut explicit: Option<crate::oid::PgCollationOid> = None;
+    let mut implicit: Option<crate::oid::PgCollationOid> = None;
+    let mut implicit_conflict = false;
+    for t in inputs {
+        let Some(c) = t.collation else {
+            continue;
+        };
+        if t.explicit_collation {
+            match explicit {
+                Some(e) if e != c => {
+                    let name = |o| {
+                        snapshot
+                            .pg_collation
+                            .get(&o)
+                            .map(|c| c.collname.clone())
+                            .unwrap_or_default()
+                    };
+                    return Err(crate::pgmsg::collation_mismatch_explicit(
+                        &name(e),
+                        &name(c),
+                    ));
+                }
+                _ => explicit = Some(c),
+            }
+        } else if c != DEFAULT_COLLATION {
+            match implicit {
+                Some(i) if i != c => implicit_conflict = true,
+                _ => implicit = Some(c),
+            }
+        }
+    }
+    let collatable = snapshot
+        .get_type(result_type)
+        .is_some_and(|t| t.typcollation.is_some());
+    if !collatable {
+        return Ok((None, false));
+    }
+    Ok(match explicit {
+        Some(e) => (Some(e), true),
+        None if implicit_conflict => (None, false),
+        None => (implicit, false),
+    })
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -601,7 +679,8 @@ pub(crate) fn infer_expr(
                 resolved_type,
                 nullable,
                 agreed_typmod(&args, resolved_type),
-            ))
+            )
+            .with_collation(derive_collation(&args, resolved_type, snapshot)?))
         }
         node::Node::AIndirection(ind) => infer_indirection(ind, ctx, params),
         node::Node::AArrayExpr(arr) => infer_array_expr(arr, ctx, params),
@@ -676,6 +755,7 @@ pub(crate) fn infer_expr(
                 nullable: false,
                 typmod: None,
                 collation: None,
+                explicit_collation: false,
                 record_fields: Some(fields),
             })
         }
@@ -778,12 +858,15 @@ pub(crate) fn infer_expr(
             }
             // Explicit COLLATE overrides whatever collation was inherited
             // from the inner expression (PG's "explicit" derivation tier).
-            return Ok(ExprType::scalar_with_collation(
-                result.type_oid,
-                result.nullable,
-                result.typmod,
-                resolved_collation,
-            ));
+            return Ok(ExprType {
+                explicit_collation: resolved_collation.is_some(),
+                ..ExprType::scalar_with_collation(
+                    result.type_oid,
+                    result.nullable,
+                    result.typmod,
+                    resolved_collation,
+                )
+            });
         }
         node::Node::SqlvalueFunction(svf) => {
             // SQL value functions: `CURRENT_DATE`, `CURRENT_TIMESTAMP`,

@@ -120,7 +120,10 @@ fn handle_nullif(
     let typmod = (result_oid == left.type_oid)
         .then_some(left.typmod)
         .flatten();
-    Ok(Some(ExprType::scalar_with_typmod(result_oid, true, typmod)))
+    let state = derive_collation([&left, &right], result_oid, snapshot)?;
+    Ok(Some(
+        ExprType::scalar_with_typmod(result_oid, true, typmod).with_collation(state),
+    ))
 }
 
 /// `expr IS [NOT] DISTINCT FROM other` — PG's `transformAExprDistinct`:
@@ -690,7 +693,12 @@ fn infer_generic_binary_op(
             {
                 coerce_unknown_to(rexpr, ctx, params, op.right_type_oid)?;
             }
-            return Ok(ExprType::scalar(op.result_type_oid, nullable));
+            let state = derive_collation(
+                left.iter().chain(right.iter()),
+                op.result_type_oid,
+                snapshot,
+            )?;
+            return Ok(ExprType::scalar(op.result_type_oid, nullable).with_collation(state));
         }
         crate::lookup::OperatorMatch::Ambiguous => {
             // PG (SQLSTATE 42725): `operator is not unique: <left> <op>

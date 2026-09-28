@@ -233,6 +233,7 @@ fn resolve_composite_field(
             nullable: current.nullable || field.ty.nullable,
             typmod: field.ty.typmod,
             collation: field.ty.collation,
+            explicit_collation: false,
             record_fields: field.ty.record_fields.clone(),
         });
     }
@@ -454,7 +455,8 @@ pub(crate) fn transform_array_expr(
     };
     // An ARRAY[...] constructor is never NULL itself — it's always at least
     // an empty array.
-    Ok(ExprType::scalar_with_typmod(array_type, false, typmod))
+    let state = derive_collation(&elems, array_type, snapshot)?;
+    Ok(ExprType::scalar_with_typmod(array_type, false, typmod).with_collation(state))
 }
 
 /// PG's `ExpandIndirectionStar` for a SELECT-list `(expr).*`: one output
