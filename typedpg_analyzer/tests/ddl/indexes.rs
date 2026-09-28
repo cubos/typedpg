@@ -489,3 +489,40 @@ fn alter_table_rename_constraint_renames_backing_index() {
     let renamed = db.resolve_table(None, "t_primary").unwrap();
     assert!(matches!(renamed.relkind, RelKind::Index));
 }
+
+// ── CREATE INDEX targets (DefineIndex / ComputeIndexAttrs) ──────────────────
+
+#[test]
+fn create_index_target_errors() {
+    for (sql, msg) in [
+        (
+            "CREATE INDEX ON nosuch (a);",
+            "relation \"nosuch\" does not exist",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS ix ON nosuch (a);",
+            "relation \"nosuch\" does not exist",
+        ),
+        (
+            "CREATE TABLE t (a int); CREATE INDEX ON t (nosuch);",
+            "column \"nosuch\" does not exist",
+        ),
+        (
+            "CREATE TABLE t (a int); CREATE VIEW v AS SELECT a FROM t; CREATE INDEX ON v (a);",
+            "cannot create index on relation \"v\"",
+        ),
+        (
+            "CREATE SEQUENCE s; CREATE INDEX ON s (last_value);",
+            "cannot create index on relation \"s\"",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", sql)]).expect_err(sql);
+        assert!(err.to_string().starts_with(msg), "{sql}\n  got: {err}");
+    }
+    build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int);
+         CREATE MATERIALIZED VIEW mv AS SELECT a FROM t;
+         CREATE INDEX ON mv (a);",
+    )]);
+}

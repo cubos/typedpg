@@ -19,12 +19,35 @@ use pg_query::protobuf::{IndexStmt, node};
 use prost::Message;
 
 use super::DdlError;
-use super::util::range_var_names;
 use super::volatile::{ExprLocation, check_no_volatile};
 use crate::oid::PgClassOid;
 use crate::pg_catalog::{AstBinding, PgCatalog, PgClass, PgIndex, RelKind, SerializedAst};
 
 pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError> {
+    let Some(rv) = stmt.relation.as_ref() else {
+        return Ok(());
+    };
+    // DefineIndex: the table must exist and be indexable.
+    let (nsoid, indrelid) = super::util::lookup_relation(db, rv)?;
+    let table_name = rv.relname.clone();
+    if let Some(class) = db.pg_class.get(&indrelid) {
+        let kinds = match class.relkind {
+            RelKind::View => Some("views"),
+            RelKind::Sequence => Some("sequences"),
+            RelKind::CompositeType => Some("composite types"),
+            RelKind::Index | RelKind::PartitionedIndex => Some("indexes"),
+            RelKind::ForeignTable => Some("foreign tables"),
+            _ => None,
+        };
+        if let Some(kinds) = kinds {
+            return Err(DdlError::Parse(format!(
+                "cannot create index on relation \"{}\" (This operation is not supported \
+                 for {kinds}.)",
+                class.relname
+            )));
+        }
+    }
+
     // ── Volatility check on expression indexes ──
     for param in &stmt.index_params {
         let Some(node::Node::IndexElem(elem)) = param.node.as_ref() else {
@@ -34,17 +57,6 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
             check_no_volatile(expr, ExprLocation::Index, db)?;
         }
     }
-
-    let Some(rv) = stmt.relation.as_ref() else {
-        return Ok(());
-    };
-    let (schema, table_name) = range_var_names(rv, db);
-    let Some(nsoid) = db.namespace_oid(&schema) else {
-        return Ok(());
-    };
-    let Some(indrelid) = db.class_by_qname.get(&(nsoid, table_name.clone())).copied() else {
-        return Ok(());
-    };
 
     // ── Resolve indkey + indexprs (one ast per expression slot) ──
     //
@@ -64,11 +76,9 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
             continue;
         };
         if !elem.name.is_empty() {
+            // ComputeIndexAttrs: `column "x" does not exist`.
             let an = *attnum_by_name.get(&elem.name).ok_or_else(|| {
-                DdlError::Parse(format!(
-                    "column \"{}\" named in index does not exist",
-                    elem.name
-                ))
+                DdlError::Parse(format!("column \"{}\" does not exist", elem.name))
             })?;
             indkey.push(an);
         } else if let Some(expr) = elem.expr.as_deref() {
