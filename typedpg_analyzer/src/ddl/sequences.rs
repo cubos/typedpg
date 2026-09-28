@@ -100,6 +100,10 @@ pub(crate) fn create_owned_sequence(
     let name = choose_relation_name(interp, class.relnamespace, &class.relname, &colname, "seq");
     let seq_oid = insert_sequence_relation(interp, class.relnamespace, name)?;
     record_ownership(interp, seq_oid, relid, attnum, deptype);
+    if deptype == DepType::Auto {
+        // serial's `DEFAULT nextval('<seq>')` depends on the sequence.
+        crate::ddl::defaults::record_default_sequence(interp, relid, attnum, seq_oid);
+    }
     Ok(())
 }
 

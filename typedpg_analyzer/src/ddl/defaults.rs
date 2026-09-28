@@ -204,3 +204,162 @@ fn check_default_kind(
     }
     Ok(())
 }
+
+/// Record what a column default depends on (PG's pg_attrdef dependencies
+/// that DDL consults): the sequences its `nextval` / `currval` / `setval`
+/// calls name through a regclass literal. Replaces any earlier record for
+/// the column.
+pub(crate) fn record_default_dependencies(
+    interp: &mut PgCatalog,
+    relid: crate::oid::PgClassOid,
+    attnum: i16,
+    expr: Option<&protobuf::Node>,
+) {
+    forget_default_dependencies(interp, relid, attnum);
+    let mut sequences = Vec::new();
+    if let Some(expr) = expr {
+        collect_sequence_refs(interp, expr, &mut sequences);
+    }
+    for seq in sequences {
+        record_default_sequence(interp, relid, attnum, seq);
+    }
+}
+
+/// The default of `relid.attnum` depends on sequence `seq` (serial's
+/// `nextval(...)`, or a written `nextval('s')`).
+pub(crate) fn record_default_sequence(
+    interp: &mut PgCatalog,
+    relid: crate::oid::PgClassOid,
+    attnum: i16,
+    seq: crate::oid::PgClassOid,
+) {
+    use crate::oid::PgGenericOid;
+    use crate::pg_catalog::{DepType, PG_CLASS_RELID, PgDepend};
+    interp.add_dependency(PgDepend {
+        classid: PG_CLASS_RELID,
+        objid: PgGenericOid::from_nonzero(relid.into_nonzero()),
+        objsubid: attnum,
+        refclassid: PG_CLASS_RELID,
+        refobjid: PgGenericOid::from_nonzero(seq.into_nonzero()),
+        refobjsubid: 0,
+        deptype: DepType::Normal,
+    });
+}
+
+/// Drop the recorded dependencies of the default of `relid.attnum`.
+pub(crate) fn forget_default_dependencies(
+    interp: &mut PgCatalog,
+    relid: crate::oid::PgClassOid,
+    attnum: i16,
+) {
+    use crate::pg_catalog::{DepType, PG_CLASS_RELID};
+    let rel_obj = crate::oid::PgGenericOid::from_nonzero(relid.into_nonzero());
+    interp.pg_depend.retain(|d| {
+        !(d.classid == PG_CLASS_RELID
+            && d.objid == rel_obj
+            && d.objsubid == attnum
+            && d.refclassid == PG_CLASS_RELID
+            && d.deptype == DepType::Normal)
+    });
+}
+
+fn collect_sequence_refs(
+    interp: &PgCatalog,
+    expr: &protobuf::Node,
+    out: &mut Vec<crate::oid::PgClassOid>,
+) {
+    let Some(inner) = expr.node.as_ref() else {
+        return;
+    };
+    match inner {
+        node::Node::FuncCall(fc) => {
+            let name: Vec<&str> = fc
+                .funcname
+                .iter()
+                .filter_map(super::util::node_string)
+                .collect();
+            let is_seq_fn = matches!(
+                name.as_slice(),
+                ["nextval" | "currval" | "setval"]
+                    | ["pg_catalog", "nextval" | "currval" | "setval"]
+            );
+            if is_seq_fn
+                && let Some(first) = fc.args.first()
+                && let Some(text) = regclass_literal(first)
+                && let Some(seq) = resolve_regclass(interp, text)
+            {
+                out.push(seq);
+            }
+            for arg in &fc.args {
+                collect_sequence_refs(interp, arg, out);
+            }
+        }
+        node::Node::TypeCast(tc) => {
+            if let Some(arg) = tc.arg.as_deref() {
+                collect_sequence_refs(interp, arg, out);
+            }
+        }
+        node::Node::AExpr(e) => {
+            for side in [e.lexpr.as_deref(), e.rexpr.as_deref()]
+                .into_iter()
+                .flatten()
+            {
+                collect_sequence_refs(interp, side, out);
+            }
+        }
+        node::Node::CoalesceExpr(c) => {
+            for arg in &c.args {
+                collect_sequence_refs(interp, arg, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The text of `'name'` or `'name'::regclass`.
+fn regclass_literal(node: &protobuf::Node) -> Option<&str> {
+    match node.node.as_ref()? {
+        node::Node::AConst(c) => match c.val.as_ref()? {
+            pg_query::protobuf::a_const::Val::Sval(s) => Some(s.sval.as_str()),
+            _ => None,
+        },
+        node::Node::TypeCast(tc) => regclass_literal(tc.arg.as_deref()?),
+        _ => None,
+    }
+}
+
+/// `regclassin`: a possibly schema-qualified, possibly quoted relation name.
+fn resolve_regclass(interp: &PgCatalog, text: &str) -> Option<crate::oid::PgClassOid> {
+    let mut parts: Vec<String> = Vec::new();
+    let mut chars = text.trim().chars().peekable();
+    loop {
+        let mut part = String::new();
+        if chars.next_if_eq(&'"').is_some() {
+            while let Some(c) = chars.next() {
+                if c == '"' {
+                    if chars.next_if_eq(&'"').is_some() {
+                        part.push('"');
+                    } else {
+                        break;
+                    }
+                } else {
+                    part.push(c);
+                }
+            }
+        } else {
+            while let Some(c) = chars.next_if(|&c| c != '.') {
+                part.push(c.to_ascii_lowercase());
+            }
+        }
+        parts.push(part);
+        if chars.next_if_eq(&'.').is_none() {
+            break;
+        }
+    }
+    let (schema, name) = match parts.as_slice() {
+        [name] => (None, name.as_str()),
+        [schema, name] => (Some(schema.as_str()), name.as_str()),
+        _ => return None,
+    };
+    interp.resolve_table(schema, name).map(|c| c.oid)
+}

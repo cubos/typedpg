@@ -419,6 +419,12 @@ pub(crate) fn add_column(
             .attr_default_types
             .insert((relid, next_attnum), default_type);
     }
+    crate::ddl::defaults::record_default_dependencies(
+        interp,
+        relid,
+        next_attnum,
+        column_default_expr(cd),
+    );
     if col.not_null {
         let local = inherit::Recursion {
             recurse: false,
@@ -594,6 +600,7 @@ pub(crate) fn drop_column(
     }
 
     interp.attr_default_types.remove(&(relid, target.attnum));
+    crate::ddl::defaults::forget_default_dependencies(interp, relid, target.attnum);
     if let Some(attrs) = interp.pg_attribute.get_mut(&relid) {
         attrs.retain(|a| a.attname != cmd.name);
     }
@@ -643,6 +650,12 @@ pub(crate) fn set_default(
                 interp.attr_default_types.remove(&(relid, attr.attnum));
             }
         }
+        crate::ddl::defaults::record_default_dependencies(
+            interp,
+            relid,
+            attr.attnum,
+            cmd.def.as_deref(),
+        );
     }
     if rec.recurse {
         for child in inherit::children_of(interp, relid) {

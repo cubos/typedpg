@@ -523,6 +523,12 @@ pub(crate) fn validate_constraint_expressions(
             interp
                 .attr_default_types
                 .insert((class_oid, attr.attnum), default_type);
+            crate::ddl::defaults::record_default_dependencies(
+                interp,
+                class_oid,
+                attr.attnum,
+                Some(expr),
+            );
         }
         for c_node in &cd.constraints {
             let Some(node::Node::Constraint(c)) = c_node.node.as_ref() else {

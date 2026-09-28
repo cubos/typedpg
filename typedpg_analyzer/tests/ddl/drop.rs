@@ -186,3 +186,102 @@ fn drop_extension_removes_its_functions() {
         "uuid_generate_v4 must not exist after DROP EXTENSION",
     );
 }
+
+// ── DROP dependency checks: functions and sequence defaults ─────────────────
+
+#[test]
+fn drop_type_cascade_drops_functions_using_it() {
+    // PG 18: NOTICE drop cascades to function fe(e); fe(NULL) no longer
+    // resolves. Without CASCADE the DROP is refused.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TYPE e AS ENUM ('a');
+         CREATE FUNCTION fe(e) RETURNS int LANGUAGE sql AS 'select 1';
+         DROP TYPE e CASCADE;",
+    )]);
+    let err = db.analyze("SELECT fe(NULL)").unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("function fe(unknown) does not exist"),
+        "{err}"
+    );
+    let err = try_apply(&[(
+        "0001.sql",
+        "CREATE TYPE e AS ENUM ('a');
+         CREATE FUNCTION fe(e) RETURNS int LANGUAGE sql AS 'select 1';
+         DROP TYPE e;",
+    )])
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("cannot drop type e because other objects depend on it"),
+        "{err}"
+    );
+}
+
+#[test]
+fn drop_table_whose_row_type_a_function_uses_is_refused() {
+    // PG 18: 2BP01 cannot drop table tt because other objects depend on it.
+    let err = try_apply(&[(
+        "0001.sql",
+        "CREATE TABLE tt (a int);
+         CREATE FUNCTION ft(tt) RETURNS int LANGUAGE sql AS 'select 1';
+         DROP TABLE tt;",
+    )])
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("cannot drop table tt because other objects depend on it"),
+        "{err}"
+    );
+    build_db(&[(
+        "0001.sql",
+        "CREATE TABLE tt (a int);
+         CREATE FUNCTION ft(tt) RETURNS int LANGUAGE sql AS 'select 1';
+         DROP TABLE tt CASCADE;
+         CREATE FUNCTION ft(int) RETURNS int LANGUAGE sql AS 'select 1';",
+    )]);
+}
+
+#[test]
+fn drop_sequence_used_by_a_default_is_refused() {
+    // PG 18: 2BP01 cannot drop sequence s because other objects depend on
+    // it (the column default); CASCADE drops just the default.
+    for setup in [
+        "CREATE SEQUENCE s; CREATE TABLE ts (a int DEFAULT nextval('s'));",
+        "CREATE SEQUENCE s; CREATE TABLE ts (a int); ALTER TABLE ts ALTER a SET DEFAULT nextval('s'::regclass);",
+        "CREATE TABLE ts (a serial); ALTER SEQUENCE ts_a_seq RENAME TO s;",
+    ] {
+        let err =
+            try_apply(&[("0001.sql", setup), ("0002.sql", "DROP SEQUENCE s;")]).expect_err(setup);
+        assert!(
+            err.to_string()
+                .starts_with("cannot drop sequence s because other objects depend on it"),
+            "{setup}\n  got: {err}"
+        );
+    }
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE SEQUENCE s; CREATE TABLE ts (a int NOT NULL DEFAULT nextval('s'));
+         DROP SEQUENCE s CASCADE;",
+    )]);
+    // The default is gone, so a NOT NULL column must now be supplied.
+    let ts = class_oid(&db, Some("public"), "ts");
+    assert!(!db.attributes_of(ts)[0].atthasdef);
+    build_db(&[(
+        "0001.sql",
+        "CREATE SEQUENCE s; CREATE TABLE ts (a int DEFAULT nextval('s'));
+         ALTER TABLE ts ALTER a DROP DEFAULT;
+         DROP SEQUENCE s;",
+    )]);
+}
+
+#[test]
+fn drop_type_reports_a_missing_type_like_pg() {
+    // PG 18: 42704 type "nosuch" does not exist.
+    assert_ddl_err!(
+        try_apply(&[("0001.sql", "DROP TYPE nosuch;")]),
+        DdlError::TypeNotFound(_),
+        "type \"nosuch\" does not exist",
+    );
+}

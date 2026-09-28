@@ -212,12 +212,28 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
             .chain(likes.iter().map(|l| &l.source))
             .find_map(|&src| {
                 let src_attnum = interp.attribute_by_name(src, &col.name)?.attnum;
-                interp.attr_default_types.get(&(src, src_attnum)).copied()
+                let default_type = interp.attr_default_types.get(&(src, src_attnum)).copied()?;
+                Some((src, src_attnum, default_type))
             });
-        if let Some(default_type) = inherited {
+        if let Some((src, src_attnum, default_type)) = inherited {
             interp
                 .attr_default_types
                 .insert((class_oid, attnum), default_type);
+            // The copied default expression names the same sequences.
+            let src_obj = crate::oid::PgGenericOid::from_nonzero(src.into_nonzero());
+            let sequences: Vec<PgClassOid> = interp
+                .iter_pg_depend()
+                .filter(|d| {
+                    d.classid == crate::pg_catalog::PG_CLASS_RELID
+                        && d.objid == src_obj
+                        && d.objsubid == src_attnum
+                        && d.deptype == crate::pg_catalog::DepType::Normal
+                })
+                .filter_map(|d| PgClassOid::new(d.refobjid.get()))
+                .collect();
+            for seq in sequences {
+                super::defaults::record_default_sequence(interp, class_oid, attnum, seq);
+            }
         }
     }
     for (i, col) in columns.iter().enumerate() {

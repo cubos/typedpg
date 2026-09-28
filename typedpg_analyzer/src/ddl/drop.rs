@@ -176,8 +176,57 @@ fn drop_relation(
         )));
     }
 
+    // Functions taking or returning the relation's row type.
+    let row_types: Vec<crate::oid::PgTypeOid> = interp
+        .pg_class
+        .get(&class_oid)
+        .and_then(|c| c.reltype)
+        .into_iter()
+        .flat_map(|t| std::iter::once(t).chain(interp.array_type_of(t)))
+        .collect();
+    let dependent_functions = functions_using_types(interp, &row_types);
+    if !dependent_functions.is_empty() && !cascade {
+        return Err(DdlError::DependencyError(format!(
+            "cannot drop {kind} {name} because other objects depend on it \
+             (function {} depends on type {name})",
+            describe_function(interp, dependent_functions[0]),
+        )));
+    }
+    // Column defaults using the sequence (`nextval('s')`).
+    let dependent_defaults = defaults_using_sequence(interp, class_oid);
+    if let Some(&(relid, attnum)) = dependent_defaults.first()
+        && !cascade
+    {
+        let table = interp
+            .pg_class
+            .get(&relid)
+            .map(|c| c.relname.clone())
+            .unwrap_or_default();
+        let column = interp
+            .attributes_of(relid)
+            .iter()
+            .find(|a| a.attnum == attnum)
+            .map(|a| a.attname.clone())
+            .unwrap_or_default();
+        return Err(DdlError::DependencyError(format!(
+            "cannot drop {kind} {name} because other objects depend on it \
+             (default value for column {column} of table {table} depends on {kind} {name})"
+        )));
+    }
+
     if !dependent_views.is_empty() {
         views::drop_views(interp, &dependent_views);
+    }
+    drop_functions_cascade(interp, &dependent_functions);
+    for (relid, attnum) in dependent_defaults {
+        // DROP ... CASCADE drops the default expression, not the column.
+        if let Some(attrs) = interp.pg_attribute.get_mut(&relid)
+            && let Some(a) = attrs.iter_mut().find(|a| a.attnum == attnum)
+        {
+            a.atthasdef = false;
+        }
+        interp.attr_default_types.remove(&(relid, attnum));
+        super::defaults::forget_default_dependencies(interp, relid, attnum);
     }
     if cascade && !dependent_fks.is_empty() {
         let fk_oids: Vec<_> = dependent_fks.iter().map(|(c, _)| c.oid).collect();
@@ -188,6 +237,73 @@ fn drop_relation(
 
     drop_relation_by_oid(interp, class_oid);
     Ok(())
+}
+
+/// Functions whose arguments or result use one of `types` — PG records a
+/// normal dependency from the function on each such type.
+fn functions_using_types(
+    interp: &PgCatalog,
+    types: &[crate::oid::PgTypeOid],
+) -> Vec<crate::oid::PgProcOid> {
+    if types.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<crate::oid::PgProcOid> = interp
+        .pg_proc
+        .values()
+        .filter(|p| {
+            types.contains(&p.prorettype)
+                || p.proargtypes.iter().any(|t| types.contains(t))
+                || p.proallargtypes.iter().any(|t| types.contains(t))
+        })
+        .map(|p| p.oid)
+        .collect();
+    out.sort();
+    out
+}
+
+/// `name(argtypes)` as PG's `getObjectDescription` shows a function.
+fn describe_function(interp: &PgCatalog, oid: crate::oid::PgProcOid) -> String {
+    let Some(p) = interp.pg_proc.get(&oid) else {
+        return String::new();
+    };
+    let args = p
+        .proargtypes
+        .iter()
+        .map(|&t| format_type_for_message(interp, t))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{}({args})", p.proname)
+}
+
+/// DROP ... CASCADE of functions: views calling them go too.
+fn drop_functions_cascade(interp: &mut PgCatalog, procs: &[crate::oid::PgProcOid]) {
+    for &proc_oid in procs {
+        let views_on = views::find_views_depending_on_function(interp, proc_oid);
+        if !views_on.is_empty() {
+            views::drop_views(interp, &views_on);
+        }
+        interp.remove_pg_proc(proc_oid);
+        let obj = crate::oid::PgGenericOid::from_nonzero(proc_oid.into_nonzero());
+        interp.remove_dependencies_of(PG_PROC_RELID, obj);
+        interp.remove_dependencies_on(PG_PROC_RELID, obj);
+    }
+}
+
+/// `(relid, attnum)` of the column defaults that reference sequence `seq`.
+fn defaults_using_sequence(interp: &PgCatalog, seq: PgClassOid) -> Vec<(PgClassOid, i16)> {
+    let seq_obj = crate::oid::PgGenericOid::from_nonzero(seq.into_nonzero());
+    interp
+        .iter_pg_depend()
+        .filter(|d| {
+            d.classid == PG_CLASS_RELID
+                && d.refclassid == PG_CLASS_RELID
+                && d.refobjid == seq_obj
+                && d.objsubid > 0
+                && matches!(d.deptype, crate::pg_catalog::DepType::Normal)
+        })
+        .filter_map(|d| Some((PgClassOid::new(d.objid.get())?, d.objsubid)))
+        .collect()
 }
 
 /// Remove a relation row + its `pg_attribute` rows + the composite type +
@@ -310,21 +426,27 @@ fn drop_type(
     };
 
     let (schema, name) = extract_names(names, interp);
+    // typenameType's wording: the name as written.
+    let written = names
+        .iter()
+        .filter_map(node_string)
+        .collect::<Vec<_>>()
+        .join(".");
     let Some(nsoid) = interp.namespace_oid(&schema) else {
         if missing_ok {
             return Ok(());
         }
-        return Err(DdlError::TypeNotFound(
-            QualifiedName::new(schema, name).to_string(),
-        ));
+        return Err(DdlError::TypeNotFound(format!(
+            "schema \"{schema}\" does not exist"
+        )));
     };
     let Some(type_oid) = interp.type_by_qname.get(&(nsoid, name.clone())).copied() else {
         if missing_ok {
             return Ok(());
         }
-        return Err(DdlError::TypeNotFound(
-            QualifiedName::new(schema, name).to_string(),
-        ));
+        return Err(DdlError::TypeNotFound(format!(
+            "type \"{written}\" does not exist"
+        )));
     };
     let array_oid = interp.array_type_of(type_oid);
 
@@ -369,6 +491,22 @@ fn drop_type(
         )));
     }
 
+    // Functions taking or returning the type depend on it too.
+    let dependent_functions = functions_using_types(
+        interp,
+        &[Some(type_oid), array_oid]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>(),
+    );
+    if !dependent_functions.is_empty() && !cascade {
+        return Err(DdlError::DependencyError(format!(
+            "cannot drop type {name} because other objects depend on it \
+             (function {} depends on type {name})",
+            describe_function(interp, dependent_functions[0]),
+        )));
+    }
+
     if cascade {
         for relid in &dependent_relations {
             if let Some(attrs) = interp.pg_attribute.get_mut(relid) {
@@ -380,6 +518,7 @@ fn drop_type(
         if !dependent_views.is_empty() {
             views::drop_views(interp, &dependent_views);
         }
+        drop_functions_cascade(interp, &dependent_functions);
     }
 
     if let Some(arr_oid) = array_oid {
