@@ -376,6 +376,54 @@ fn collate_on_a_non_collatable_column_is_rejected() {
 // ── DROP / SET EXPRESSION, relation lookups, renames ────────────────────────
 
 #[test]
+fn drop_expression_makes_the_column_writable() {
+    // PG 18: after DROP EXPRESSION `INSERT INTO t (a, b)` succeeds.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a * 2) STORED);
+         ALTER TABLE t ALTER COLUMN b DROP EXPRESSION;
+         ALTER TABLE t ALTER COLUMN a DROP EXPRESSION IF EXISTS;",
+    )]);
+    db.analyze("INSERT INTO t (a, b) VALUES (1, 2)").unwrap();
+    assert_ddl_err!(
+        try_apply(&[(
+            "0001.sql",
+            "CREATE TABLE t (a int); ALTER TABLE t ALTER COLUMN a DROP EXPRESSION;",
+        )]),
+        DdlError::Parse(_),
+        "column \"a\" of relation \"t\" is not a generated column",
+    );
+}
+
+#[test]
+fn set_expression_checks_the_column_and_expression() {
+    build_db(&[(
+        "0001.sql",
+        "CREATE TABLE u (a int, b int GENERATED ALWAYS AS (a * 2) STORED);
+         ALTER TABLE u ALTER COLUMN b SET EXPRESSION AS (a * 3);",
+    )]);
+    assert_ddl_err!(
+        try_apply(&[(
+            "0001.sql",
+            "CREATE TABLE u (a int); ALTER TABLE u ALTER COLUMN a SET EXPRESSION AS (1);",
+        )]),
+        DdlError::Parse(_),
+        "column \"a\" of relation \"u\" is not a generated column",
+    );
+    let err = try_apply(&[(
+        "0001.sql",
+        "CREATE TABLE u (a int, b int GENERATED ALWAYS AS (a * 2) STORED);
+         ALTER TABLE u ALTER COLUMN b SET EXPRESSION AS ('x');",
+    )])
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("invalid input syntax for type integer: \"x\""),
+        "{err}"
+    );
+}
+
+#[test]
 fn alter_index_rename_is_tracked() {
     // PG 18: after RENAME the index is known under its new name.
     build_db(&[(

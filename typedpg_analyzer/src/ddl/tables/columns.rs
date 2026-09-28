@@ -911,3 +911,153 @@ pub(crate) fn column_collation(
     }
     Ok(Some(resolved.oid))
 }
+
+/// The generated column `name` of `relid`, or PG's `column "x" of relation
+/// "t" is not a generated column` (`ATExecDropExpression` /
+/// `ATExecSetExpression`).
+fn generated_column(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+    name: &str,
+) -> Result<Option<PgAttribute>, DdlError> {
+    let attr = interp
+        .attribute_by_name(relid, name)
+        .cloned()
+        .ok_or_else(|| DdlError::Parse(column_not_found_msg(interp, relid, name)))?;
+    Ok(attr.attgenerated.is_some().then_some(attr))
+}
+
+fn not_generated_msg(interp: &PgCatalog, relid: PgClassOid, name: &str) -> String {
+    format!(
+        "column \"{name}\" of relation \"{}\" is not a generated column",
+        relname_of(interp, relid)
+    )
+}
+
+/// `ALTER COLUMN c DROP EXPRESSION [IF EXISTS]`: the column keeps its
+/// current values and becomes an ordinary column without a default; the
+/// change reaches the children too.
+pub(crate) fn drop_expression(
+    interp: &mut PgCatalog,
+    relid: PgClassOid,
+    cmd: &AlterTableCmd,
+    rec: inherit::Recursion,
+) -> Result<(), DdlError> {
+    let Some(attr) = generated_column(interp, relid, &cmd.name)? else {
+        if cmd.missing_ok {
+            return Ok(());
+        }
+        return Err(DdlError::Parse(not_generated_msg(interp, relid, &cmd.name)));
+    };
+    if let Some(attrs) = interp.pg_attribute.get_mut(&relid)
+        && let Some(a) = attrs.iter_mut().find(|a| a.attnum == attr.attnum)
+    {
+        a.attgenerated = None;
+        a.atthasdef = false;
+    }
+    interp.attr_default_types.remove(&(relid, attr.attnum));
+    if rec.recurse {
+        for child in inherit::children_of(interp, relid) {
+            if interp.attribute_by_name(child, &cmd.name).is_some() {
+                drop_expression(interp, child, cmd, rec.child())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `ALTER COLUMN c SET EXPRESSION AS (expr)`: only for a generated column;
+/// the new expression, evaluated over the row, must suit the column type.
+pub(crate) fn set_expression(
+    interp: &mut PgCatalog,
+    relid: PgClassOid,
+    cmd: &AlterTableCmd,
+    rec: inherit::Recursion,
+) -> Result<(), DdlError> {
+    let Some(attr) = generated_column(interp, relid, &cmd.name)? else {
+        return Err(DdlError::Parse(not_generated_msg(interp, relid, &cmd.name)));
+    };
+    if !rec.recursing
+        && let Some(expr) = cmd.def.as_deref()
+    {
+        crate::ddl::volatile::check_no_volatile(
+            expr,
+            crate::ddl::volatile::ExprLocation::Generated,
+            interp,
+        )?;
+        check_generation_expression(interp, relid, &attr, expr)?;
+    }
+    if rec.recurse {
+        for child in inherit::children_of(interp, relid) {
+            if interp.attribute_by_name(child, &cmd.name).is_some() {
+                set_expression(interp, child, cmd, rec.child())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A generation expression over the table's row must yield the column's
+/// type (`cookDefault` for generated columns): an untyped literal goes
+/// through the type's input, anything else must be assignment-coercible.
+fn check_generation_expression(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+    attr: &PgAttribute,
+    expr: &pg_query::protobuf::Node,
+) -> Result<(), DdlError> {
+    use crate::expr::{TypeGoal, infer_expr};
+    use crate::nullability::NullabilityContext;
+    use crate::param_collector::ParamCollector;
+    use crate::scope::Scope;
+
+    let relname = relname_of(interp, relid);
+    let nspname = interp
+        .pg_class
+        .get(&relid)
+        .and_then(|c| interp.namespace_name(c.relnamespace))
+        .unwrap_or("public")
+        .to_owned();
+    let attrs = interp.attributes_of(relid).to_vec();
+    let mut scope = Scope::default();
+    scope.add_dml_target(
+        interp,
+        &relname,
+        QualifiedName::new(nspname, relname.clone()),
+        &attrs,
+    );
+    let null_ctx = NullabilityContext::default();
+    let mut params = ParamCollector::default();
+    let wrap = |e: crate::error::AnalyzeError| DdlError::UnsupportedDdl(format!("{e}"));
+    let result = infer_expr(
+        expr,
+        crate::expr::Ctx::new(&scope, &null_ctx, interp),
+        &mut params,
+        TypeGoal::NONE,
+    )
+    .map_err(wrap)?;
+    if result.type_oid == crate::pg_catalog::oid::UNKNOWN {
+        infer_expr(
+            expr,
+            crate::expr::Ctx::new(&scope, &null_ctx, interp),
+            &mut params,
+            TypeGoal::assignment(attr.atttypid),
+        )
+        .map_err(wrap)?;
+        return Ok(());
+    }
+    if !crate::coerce::can_coerce(
+        result.type_oid,
+        attr.atttypid,
+        crate::coerce::CoercionContext::Assignment,
+        interp,
+    ) {
+        return Err(DdlError::UnsupportedDdl(format!(
+            "column \"{}\" is of type {} but default expression is of type {}",
+            attr.attname,
+            format_type_for_message(interp, attr.atttypid),
+            format_type_for_message(interp, result.type_oid)
+        )));
+    }
+    Ok(())
+}

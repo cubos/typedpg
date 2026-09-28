@@ -360,6 +360,8 @@ fn apply_alter_cmd(
         AlterTableType::AtAddIdentity => set_identity(interp, relid, cmd),
         AlterTableType::AtSetIdentity => set_identity(interp, relid, cmd),
         AlterTableType::AtDropIdentity => drop_identity(interp, relid, cmd),
+        AlterTableType::AtDropExpression => drop_expression(interp, relid, cmd, rec),
+        AlterTableType::AtSetExpression => set_expression(interp, relid, cmd, rec),
         // Other subtypes are no-ops for schema analysis.
         _ => Ok(()),
     }
