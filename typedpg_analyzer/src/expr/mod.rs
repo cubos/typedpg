@@ -682,7 +682,25 @@ pub(crate) fn infer_expr(
             )
             .with_collation(derive_collation(&args, resolved_type, snapshot)?))
         }
-        node::Node::AIndirection(ind) => infer_indirection(ind, ctx, params),
+        node::Node::AIndirection(ind) => {
+            let t = infer_indirection(ind, ctx, params)?;
+            // PG's coerce_type can implicitly convert an `unknown` literal or
+            // parameter, but not an `unknown` field selected from an
+            // anonymous record; only an explicit cast (via I/O) works.
+            if t.type_oid == oid::UNKNOWN
+                && goal.has_expectation()
+                && goal.coercion != CoercionContext::Explicit
+            {
+                let target = crate::ddl::util::format_type_for_message(snapshot, goal.type_oid);
+                return Err(crate::pgmsg::unknown_field_not_coercible(
+                    &target,
+                    crate::error::node_location(node)
+                        .and_then(crate::error::SourceSpan::from_node_qname),
+                )
+                .finalize_implicit());
+            }
+            Ok(t)
+        }
         node::Node::AArrayExpr(arr) => infer_array_expr(arr, ctx, params),
         node::Node::RowExpr(row) => {
             // `ROW(a, b, …)` constructs an anonymous composite. The ROW
@@ -957,10 +975,12 @@ pub(crate) fn infer_expr(
 /// function-argument back-fills): most failures there just mean the candidate
 /// goal didn't fit and are deliberately swallowed, but a literal-content
 /// rejection is exactly the error PG itself raises from that coercion, so it
-/// must survive. Returns `Err` only for [`AnalyzeError::InvalidLiteral`].
+/// must survive — as must `coerce_type`'s failure on an `unknown` value
+/// that is no literal ([`crate::pgmsg::unknown_field_not_coercible`]).
+/// Returns `Err` only for those two.
 fn swallow_unless_literal<T>(r: Result<T, AnalyzeError>) -> Result<(), AnalyzeError> {
     match r {
-        Err(e @ AnalyzeError::InvalidLiteral(_)) => Err(e),
+        Err(e @ (AnalyzeError::InvalidLiteral(_) | AnalyzeError::PgInternalError(_))) => Err(e),
         _ => Ok(()),
     }
 }

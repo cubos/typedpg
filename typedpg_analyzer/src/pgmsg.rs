@@ -200,6 +200,21 @@ pub(crate) fn no_on_conflict_arbiter(table: &str) -> RawError {
     )
 }
 
+/// `failed to find conversion function from unknown to text` — SQLSTATE
+/// XX000, raised by PG's `coerce_type` when an `unknown` value that is
+/// neither a literal nor a parameter must be coerced implicitly: a field
+/// selected from an anonymous record over an untyped literal,
+/// `(ROW(1, 'x')).f2`, used as an output column or an argument.
+pub(crate) fn unknown_field_not_coercible(target: &str, span: Option<SourceSpan>) -> RawError {
+    RawError::new(
+        AnalyzeError::PgInternalError(format!(
+            "failed to find conversion function from unknown to {target}"
+        )),
+        span,
+        Some("cast the field explicitly, e.g. `(r).f2::text`".into()),
+    )
+}
+
 /// `VALUES lists must all be the same length` — SQLSTATE 42601
 /// (`syntax_error`).
 pub(crate) fn values_lists_length(first_arity: usize, row_arity: usize) -> RawError {
@@ -924,6 +939,7 @@ mod tests {
             (duplicate_table_alias("u").kind, "42712"),
             (too_many_column_aliases("t", 1, 2).kind, "42P10"),
             (values_lists_length(2, 1).kind, "42601"),
+            (unknown_field_not_coercible("text", None).kind, "XX000"),
             (no_on_conflict_arbiter("t").kind, "42P10"),
             (window_does_not_exist("w").kind, "42704"),
             (using_column_missing("id", "left").kind, "42703"),

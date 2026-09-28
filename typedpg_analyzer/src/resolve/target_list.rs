@@ -74,6 +74,7 @@ pub(crate) fn resolve_target_list(
             )?
         {
             for (name, t) in fields {
+                unknown_field_output_check(val, t.type_oid)?;
                 columns.push(RawColumn {
                     name,
                     type_oid: t.type_oid,
@@ -126,6 +127,9 @@ pub(crate) fn resolve_target_list(
         // subquery reconciliation a concrete type to compare against so
         // `SELECT 1 UNION SELECT 'x'` fails instead of silently coercing.
         let type_oid = expr::unknown_literal_as_text(Some(val), expr_type.type_oid);
+        if matches!(val.node.as_ref(), Some(node::Node::AIndirection(_))) {
+            unknown_field_output_check(val, type_oid)?;
+        }
 
         columns.push(RawColumn {
             name,
@@ -138,6 +142,24 @@ pub(crate) fn resolve_target_list(
     }
 
     Ok(columns)
+}
+
+/// PG resolves an `unknown` output column to `text` (`resolveTargetListUnknowns`,
+/// or the set operation / INSERT target it feeds), which its `coerce_type`
+/// can't do for a field selected from an anonymous record over an untyped
+/// literal: `SELECT (ROW(1, 'x')).f2` fails to prepare.
+fn unknown_field_output_check(
+    val: &protobuf::Node,
+    type_oid: PgTypeOid,
+) -> Result<(), AnalyzeError> {
+    if type_oid != oid::UNKNOWN {
+        return Ok(());
+    }
+    Err(crate::pgmsg::unknown_field_not_coercible(
+        "text",
+        crate::error::node_location(val).and_then(crate::error::SourceSpan::from_node_qname),
+    )
+    .finalize_implicit())
 }
 
 /// Analyze a `VALUES (…), (…)` list. Each row must have the same arity;

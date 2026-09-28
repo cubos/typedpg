@@ -123,6 +123,13 @@ pub enum AnalyzeError {
     #[error("{0}")]
     InvalidRecursion(String),
 
+    /// A query PostgreSQL itself fails to prepare with `internal_error`
+    /// (SQLSTATE XX000) — not a rule it documents, but the analyzer must
+    /// still reject what the server rejects (e.g. implicitly coercing an
+    /// `unknown`-typed field of an anonymous record).
+    #[error("{0}")]
+    PgInternalError(String),
+
     /// A type referenced in the query is not in the catalog. Equivalent to
     /// PG `undefined_object` (SQLSTATE 42704) when the lookup was by name,
     /// or surfaces an internal OID mismatch when the lookup was by OID.
@@ -252,6 +259,7 @@ impl AnalyzeError {
             FeatureNotSupported(_) => Some("0A000"),
             DuplicateColumn(_) => Some("42701"),
             InvalidRecursion(_) => Some("42P19"),
+            PgInternalError(_) => Some("XX000"),
             CollationMismatch(_) => Some("42P21"),
             UndefinedFunction(_) | UndefinedOperator(_) => Some("42883"),
             AmbiguousFunction(_) => Some("42725"),
@@ -950,6 +958,7 @@ fn replace_message(e: AnalyzeError, rendered: String) -> AnalyzeError {
         AnalyzeError::FeatureNotSupported(_) => AnalyzeError::FeatureNotSupported(rendered),
         AnalyzeError::DuplicateColumn(_) => AnalyzeError::DuplicateColumn(rendered),
         AnalyzeError::InvalidRecursion(_) => AnalyzeError::InvalidRecursion(rendered),
+        AnalyzeError::PgInternalError(_) => AnalyzeError::PgInternalError(rendered),
         AnalyzeError::TypeMismatch {
             actual, expected, ..
         } => AnalyzeError::TypeMismatch {

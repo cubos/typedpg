@@ -2391,3 +2391,43 @@ fn functional_notation_projects_a_column() {
     }
     db.analyze("SELECT count(t) AS c FROM t").unwrap();
 }
+
+#[test]
+fn unknown_field_of_an_anonymous_record_is_not_coercible() {
+    // PG's coerce_type converts an `unknown` literal or parameter, but not a
+    // field selected from a ROW over one: any implicit coercion of it fails
+    // to prepare (XX000). Using it where no coercion happens, or casting it
+    // explicitly, works.
+    let db = PgCatalog::new().unwrap();
+    for sql in [
+        "SELECT (ROW(1, 'x')).*",
+        "SELECT (ROW(1, 'x')).f2",
+        "SELECT (ROW('a', 'x')).f1",
+        "SELECT (r).* FROM (SELECT ROW(1, 'x') AS r) s",
+        "SELECT 1 AS b WHERE (ROW(1, 'x')).f2 = 'x'",
+        "SELECT length((ROW(1, 'x')).f2) AS c",
+        "SELECT CASE WHEN true THEN (ROW(1, 'x')).f2 END AS f",
+        "SELECT count(*) AS g FROM (SELECT (ROW(1, 'x')).f2) s",
+    ] {
+        let err = db.analyze(sql).unwrap_err();
+        assert!(
+            matches!(err, AnalyzeError::PgInternalError(_)),
+            "{sql}: {err:?}"
+        );
+        assert!(
+            err.to_string()
+                .starts_with("failed to find conversion function from unknown to text"),
+            "{sql}: {err}"
+        );
+    }
+    for sql in [
+        "SELECT (ROW(1, 'x')).f1",
+        "SELECT (ROW(1, 'x'::text)).*",
+        "SELECT (ROW(1, 'x')).f2 IS NULL AS a",
+        "SELECT (ROW(1, 'x')).f2::text AS d",
+        "SELECT pg_typeof((ROW(1, 'x')).f2) AS e",
+        "SELECT (r).f1 FROM (SELECT ROW(1, 'x') AS r) s",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
