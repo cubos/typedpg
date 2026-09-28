@@ -557,3 +557,38 @@ fn stable_functions_are_not_immutable_in_indexes_or_generated_columns() {
          CREATE INDEX ON t (s1(a));",
     )]);
 }
+
+#[test]
+fn casts_and_operators_count_for_index_and_generated_mutability() {
+    // PG 18: timestamptz → date and timestamptz + interval run STABLE
+    // functions; date + int, int → text and AT TIME ZONE do not.
+    for (sql, msg) in [
+        (
+            "CREATE TABLE t (ts timestamptz); CREATE INDEX ON t ((ts::date));",
+            "functions in index expression must be marked IMMUTABLE",
+        ),
+        (
+            "CREATE TABLE t (ts timestamptz); CREATE INDEX ON t ((ts + interval '1 day'));",
+            "functions in index expression must be marked IMMUTABLE",
+        ),
+        (
+            "CREATE TABLE g (ts timestamptz, x date GENERATED ALWAYS AS (ts::date) STORED);",
+            "generation expression is not immutable",
+        ),
+        (
+            "CREATE TABLE g (ts timestamptz);
+             ALTER TABLE g ADD COLUMN x date GENERATED ALWAYS AS (ts::date) STORED;",
+            "generation expression is not immutable",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", sql)]).expect_err(sql);
+        assert!(err.to_string().starts_with(msg), "{sql}\n  got: {err}");
+    }
+    build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (ts timestamptz, d date, a int);
+         CREATE INDEX ON t ((d + 1));
+         CREATE INDEX ON t ((a::text));
+         CREATE INDEX ON t ((ts AT TIME ZONE 'UTC'));",
+    )]);
+}

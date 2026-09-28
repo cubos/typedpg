@@ -662,6 +662,12 @@ pub(crate) fn validate_constraint_expressions(
                 }
                 Ok(ConstrType::ConstrGenerated) => {
                     if let Some(expr) = c.raw_expr.as_deref() {
+                        crate::ddl::volatile::check_mutability(
+                            interp,
+                            class_oid,
+                            expr,
+                            crate::ddl::volatile::ExprLocation::Generated,
+                        )?;
                         // check_nested_generated: a generation expression
                         // may not read another generated column.
                         if let Some(inner) = expr.node.as_ref() {

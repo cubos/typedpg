@@ -30,6 +30,8 @@ pub struct ResolvedOperator {
     /// extension) one that is not STRICT: it runs on NULL operands and can
     /// return NULL whatever they are.
     pub user_defined_non_strict: bool,
+    /// The implementing function (`oprcode`).
+    pub code: Option<crate::oid::PgProcOid>,
 }
 
 /// Outcome of [`PgCatalog::find_operator_detailed`]: a unique winner, no
@@ -455,6 +457,7 @@ impl PgCatalog {
                 declared_left_type_oid: chosen.oprleft,
                 right_type_oid: *declared.last().unwrap_or(&chosen.oprright),
                 result_type_oid,
+                code: chosen.oprcode,
                 user_defined_non_strict: chosen
                     .oprcode
                     .and_then(|code| self.pg_proc.get(&code))

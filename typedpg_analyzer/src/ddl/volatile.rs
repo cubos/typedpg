@@ -84,6 +84,60 @@ pub(super) fn check_no_volatile(
     walk(node, location, snapshot, 0)
 }
 
+/// `CheckMutability` over the *typed* expression: analyze `expr` over the
+/// row of `relid`, recording every function it runs — called directly,
+/// through an operator or through an explicit cast — and fail on the first
+/// one that isn't IMMUTABLE. A simple SQL function counts by its inlined
+/// body (checked with the name-based walk). Analysis errors are left to the
+/// expression's own validation.
+pub(super) fn check_mutability(
+    interp: &PgCatalog,
+    relid: crate::oid::PgClassOid,
+    expr: &protobuf::Node,
+    loc: ExprLocation,
+) -> Result<(), DdlError> {
+    use crate::expr::{TypeGoal, infer_expr};
+    use crate::nullability::NullabilityContext;
+    use crate::param_collector::ParamCollector;
+    use crate::scope::Scope;
+
+    let Some(class) = interp.pg_class.get(&relid) else {
+        return Ok(());
+    };
+    let nspname = interp
+        .namespace_name(class.relnamespace)
+        .unwrap_or("public")
+        .to_owned();
+    let attrs = interp.attributes_of(relid).to_vec();
+    let mut scope = Scope::default();
+    scope.add_dml_target(
+        interp,
+        &class.relname,
+        crate::qualified_name::QualifiedName::new(nspname, class.relname.clone()),
+        &attrs,
+    );
+    let null_ctx = NullabilityContext::default();
+    let mut params = ParamCollector::default();
+    let used = std::cell::RefCell::new(Vec::new());
+    let ctx = crate::expr::Ctx::new(&scope, &null_ctx, interp).recording(&used);
+    if infer_expr(expr, ctx, &mut params, TypeGoal::NONE).is_err() {
+        return Ok(());
+    }
+    for oid in used.into_inner() {
+        let Some(proc) = interp.pg_proc.get(&oid) else {
+            continue;
+        };
+        if proc.provolatile == ProVolatile::Immutable {
+            continue;
+        }
+        match interp.inline_sql_bodies.get(&oid) {
+            Some(body) => walk(body, loc, interp, 1)?,
+            None => return Err(loc.error(&proc.proname)),
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 pub(super) enum ExprLocation {
     Generated,

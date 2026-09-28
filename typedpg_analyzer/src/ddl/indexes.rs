@@ -48,13 +48,14 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
         }
     }
 
-    // ── Volatility check on expression indexes ──
+    // ── Mutability check on expression indexes (ComputeIndexAttrs) ──
     for param in &stmt.index_params {
         let Some(node::Node::IndexElem(elem)) = param.node.as_ref() else {
             continue;
         };
         if let Some(expr) = elem.expr.as_deref() {
             check_no_volatile(expr, ExprLocation::Index, db)?;
+            super::volatile::check_mutability(db, indrelid, expr, ExprLocation::Index)?;
         }
     }
 

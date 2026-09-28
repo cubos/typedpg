@@ -71,6 +71,8 @@ pub(crate) fn call_arg_value(arg: &pg_query::protobuf::Node) -> &pg_query::proto
 
 /// Resolved function call result.
 pub(crate) struct ResolvedFunction {
+    /// The chosen routine's `pg_proc.oid`.
+    pub oid: crate::oid::PgProcOid,
     pub return_type_oid: PgTypeOid,
     /// The coercion target of each call argument, in call order: the
     /// matched signature with its polymorphic parameters resolved (PG's
@@ -313,6 +315,7 @@ pub(crate) fn func_get_detail(
         })
         .collect();
     Ok(FuncDetail::Routine(ResolvedFunction {
+        oid: f.oid,
         aggregate: snapshot
             .pg_aggregate
             .get(&f.oid)

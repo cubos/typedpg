@@ -22,7 +22,7 @@ pub mod tables;
 pub mod types;
 pub mod util;
 pub mod views;
-mod volatile;
+pub(crate) mod volatile;
 
 #[cfg(any(test, feature = "internal"))]
 pub(crate) use views::serialize_subnode;

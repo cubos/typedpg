@@ -12,6 +12,7 @@ pub(crate) fn infer_column_ref(
         scope,
         null_ctx,
         snapshot,
+        ..
     } = ctx;
     // Star expansion in expression context. `alias.*` in PG becomes the
     // composite type of the relation referenced by `alias`. `*` alone

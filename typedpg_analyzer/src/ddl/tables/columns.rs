@@ -500,6 +500,20 @@ fn add_column_to(
         crate::ddl::sequences::create_owned_sequence(interp, relid, next_attnum, deptype)?;
     }
     if !rec.recursing {
+        // The generation expression, now that the column exists.
+        for c_node in &cd.constraints {
+            if let Some(node::Node::Constraint(c)) = c_node.node.as_ref()
+                && c.contype == ConstrType::ConstrGenerated as i32
+                && let Some(expr) = c.raw_expr.as_deref()
+            {
+                crate::ddl::volatile::check_mutability(
+                    interp,
+                    relid,
+                    expr,
+                    crate::ddl::volatile::ExprLocation::Generated,
+                )?;
+            }
+        }
         add_column_constraints(interp, relid, cd)?;
     }
     for child in children {
@@ -1109,6 +1123,12 @@ pub(crate) fn set_expression(
             interp,
         )?;
         check_generation_expression(interp, relid, &attr, expr)?;
+        crate::ddl::volatile::check_mutability(
+            interp,
+            relid,
+            expr,
+            crate::ddl::volatile::ExprLocation::Generated,
+        )?;
     }
     if rec.recurse {
         for child in inherit::children_of(interp, relid) {

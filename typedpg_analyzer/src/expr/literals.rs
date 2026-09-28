@@ -188,6 +188,16 @@ pub(crate) fn infer_type_cast(
     // PG: the cast result has exactly the written typmod — `x::T(n)` is
     // T(n), and `x::T` is T with typmod -1 even when x already was a T(n)
     // (coerce_type_typmod relabels to the target typmod).
+    ctx.note_proc(
+        snapshot
+            .cast_by_pair
+            .get(&(
+                snapshot.unwrap_domain(inner_type.type_oid),
+                snapshot.unwrap_domain(target_oid),
+            ))
+            .and_then(|oid| snapshot.pg_cast.get(oid))
+            .and_then(|c| c.castfunc),
+    );
     let state = derive_collation([&inner_type], target_oid, snapshot)?;
     let nullable = inner_type.nullable
         || cast_function_can_return_null(inner_type.type_oid, target_oid, snapshot);

@@ -13,6 +13,7 @@ pub(crate) fn resolve_target_list(
         scope,
         null_ctx,
         snapshot,
+        ..
     } = ctx;
     let mut columns = Vec::new();
 

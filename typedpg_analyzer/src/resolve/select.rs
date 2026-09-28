@@ -560,6 +560,7 @@ fn walk_group_clause_node(
         scope,
         null_ctx,
         snapshot,
+        ..
     } = ctx;
     let n_targets = targets.len();
     if let Some(node::Node::GroupingSet(gs)) = group_node.node.as_ref() {

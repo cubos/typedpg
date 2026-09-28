@@ -679,6 +679,7 @@ fn infer_generic_binary_op(
     // the concrete peer's type.
     match snapshot.find_operator_detailed(op_name, left_oid_resolved, right_oid_resolved) {
         crate::lookup::OperatorMatch::Found(op) => {
+            ctx.note_proc(op.code);
             // Pass 2: back-fill still-UNKNOWN sides with the operator's
             // *declared* argument types — the coercion PG performs (this is
             // what pins `$1` in `prefs -> $1` to text, and validates literal

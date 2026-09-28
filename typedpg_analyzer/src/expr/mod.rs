@@ -42,6 +42,11 @@ pub(crate) struct Ctx<'a> {
     pub scope: &'a Scope,
     pub null_ctx: &'a NullabilityContext,
     pub snapshot: &'a PgCatalog,
+    /// When set, every function the expression runs — called directly,
+    /// through an operator or through an explicit cast — is recorded: what
+    /// DDL needs to check an index / generation expression's mutability
+    /// the way PG's CheckMutability does.
+    pub used_procs: Option<&'a std::cell::RefCell<Vec<crate::oid::PgProcOid>>>,
 }
 
 impl<'a> Ctx<'a> {
@@ -55,6 +60,22 @@ impl<'a> Ctx<'a> {
             scope,
             null_ctx,
             snapshot,
+            used_procs: None,
+        }
+    }
+
+    /// The same context, recording the functions the expression runs.
+    pub fn recording(self, used_procs: &'a std::cell::RefCell<Vec<crate::oid::PgProcOid>>) -> Self {
+        Ctx {
+            used_procs: Some(used_procs),
+            ..self
+        }
+    }
+
+    /// Record that the expression runs function `oid`.
+    pub fn note_proc(&self, oid: Option<crate::oid::PgProcOid>) {
+        if let (Some(cell), Some(oid)) = (self.used_procs, oid) {
+            cell.borrow_mut().push(oid);
         }
     }
 }
