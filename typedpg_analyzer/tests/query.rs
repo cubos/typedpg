@@ -66,6 +66,8 @@ mod user_types;
 mod utility_stmts;
 #[path = "query/where_clause.rs"]
 mod where_clause;
+#[path = "query/xml.rs"]
+mod xml;
 
 // ── Coverage gaps (empty; populate as features get covered) ──────────────────
 #[path = "query/aggregate_filter.rs"]

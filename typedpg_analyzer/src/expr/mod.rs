@@ -837,6 +837,8 @@ pub(crate) fn infer_expr(
         node::Node::JsonObjectAgg(a) => infer_json_objectagg(a, ctx, params),
         node::Node::JsonArrayAgg(a) => infer_json_arrayagg(a, ctx, params),
         node::Node::JsonIsPredicate(p) => infer_json_is_predicate(p, ctx, params),
+        node::Node::XmlExpr(x) => infer_xml_expr(x, ctx, params),
+        node::Node::XmlSerialize(xs) => infer_xml_serialize(xs, ctx, params),
         _ => Err(AnalyzeError::Unsupported(format!(
             "expression node type not supported: {:?}",
             std::mem::discriminant(inner)
@@ -1059,6 +1061,7 @@ mod json;
 mod literals;
 mod operators;
 mod sublink;
+mod xml;
 
 use column_refs::*;
 use conditional::*;
@@ -1070,6 +1073,7 @@ use json::*;
 use literals::*;
 use operators::*;
 use sublink::*;
+use xml::*;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Helpers

@@ -398,6 +398,23 @@ fn figure_colname(node: &protobuf::Node) -> (i32, Option<String>) {
         node::Node::RowExpr(_) => (2, Some("row".to_string())),
         node::Node::MergeSupportFunc(_) => (2, Some("merge_action".to_string())),
         node::Node::GroupingFunc(_) => (2, Some("grouping".to_string())),
+        // SQL/XML constructs act like the functions they're named after
+        // (IS DOCUMENT stays unnamed).
+        node::Node::XmlExpr(x) => {
+            use protobuf::XmlExprOp as Op;
+            let name = match protobuf::XmlExprOp::try_from(x.op) {
+                Ok(Op::IsXmlconcat) => "xmlconcat",
+                Ok(Op::IsXmlelement) => "xmlelement",
+                Ok(Op::IsXmlforest) => "xmlforest",
+                Ok(Op::IsXmlparse) => "xmlparse",
+                Ok(Op::IsXmlpi) => "xmlpi",
+                Ok(Op::IsXmlroot) => "xmlroot",
+                Ok(Op::IsXmlserialize) => "xmlserialize",
+                _ => return (0, None),
+            };
+            (2, Some(name.to_string()))
+        }
+        node::Node::XmlSerialize(_) => (2, Some("xmlserialize".to_string())),
         // SQL/JSON constructs act like the functions they're named after.
         node::Node::JsonParseExpr(_) => (2, Some("json".to_string())),
         node::Node::JsonScalarExpr(_) => (2, Some("json_scalar".to_string())),
