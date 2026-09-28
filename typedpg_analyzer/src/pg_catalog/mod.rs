@@ -214,6 +214,9 @@ pub struct PgCatalog {
     /// which PG substitutes for the call before checking an index or
     /// generation expression's mutability.
     pub(crate) inline_sql_bodies: HashMap<PgProcOid, pg_query::protobuf::Node>,
+    /// `pg_partitioned_table.partattrs` of each partitioned table: the
+    /// partition key's attnums, `0` for an expression.
+    pub(crate) partition_keys: HashMap<PgClassOid, Vec<i16>>,
     next_oid: std::num::NonZeroU32,
 
     /// Lazy-initialized PG sanity mirror used by the `pg_sanity` feature to
@@ -448,6 +451,7 @@ impl PgCatalog {
             attr_default_types: HashMap::new(),
             check_function_bodies: true,
             inline_sql_bodies: HashMap::new(),
+            partition_keys: HashMap::new(),
             next_oid: USER_OID_START_NZ,
             #[cfg(feature = "pg_sanity")]
             pg_sanity: None,
@@ -1027,6 +1031,7 @@ impl PgCatalog {
     pub(crate) fn remove_pg_class(&mut self, oid: PgClassOid) -> Option<PgClass> {
         self.attr_default_types
             .retain(|(relid, _), _| *relid != oid);
+        self.partition_keys.remove(&oid);
         let row = self.pg_class.remove(&oid)?;
         self.class_by_qname
             .remove(&(row.relnamespace, row.relname.clone()));

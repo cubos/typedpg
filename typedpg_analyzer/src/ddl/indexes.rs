@@ -77,6 +77,14 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
         }
     }
     let indpred = stmt.where_clause.as_deref().map(serialize_node);
+    if stmt.unique || stmt.primary {
+        let label = if stmt.primary {
+            "PRIMARY KEY"
+        } else {
+            "UNIQUE"
+        };
+        super::tables::check_unique_covers_partition_key(db, indrelid, &indkey, label)?;
+    }
 
     // ── Pick a name for the index ──
     //

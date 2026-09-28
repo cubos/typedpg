@@ -91,6 +91,35 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
         likes,
     } = merge::assemble_columns(interp, stmt, &pk_columns)?;
 
+    // transformIndexConstraints: one PRIMARY KEY at most.
+    let column_pks = stmt
+        .table_elts
+        .iter()
+        .filter_map(|e| match e.node.as_ref()? {
+            node::Node::ColumnDef(cd) => Some(cd),
+            _ => None,
+        })
+        .flat_map(|cd| cd.constraints.iter())
+        .filter(|n| {
+            matches!(n.node.as_ref(), Some(node::Node::Constraint(c))
+                if c.contype == ConstrType::ConstrPrimary as i32)
+        })
+        .count();
+    let table_pks = stmt
+        .constraints
+        .iter()
+        .chain(stmt.table_elts.iter())
+        .filter(|n| {
+            matches!(n.node.as_ref(), Some(node::Node::Constraint(c))
+                if c.contype == ConstrType::ConstrPrimary as i32)
+        })
+        .count();
+    if column_pks + table_pks > 1 {
+        return Err(DdlError::Parse(format!(
+            "multiple primary keys for table \"{name}\" are not allowed"
+        )));
+    }
+
     // Key columns of table-level PRIMARY KEY / UNIQUE constraints must
     // exist (inherited and LIKE columns count); PRIMARY KEY marks them NOT
     // NULL (`transformIndexConstraint`).
@@ -249,6 +278,31 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
         });
     }
 
+    // ComputePartitionAttrs: a partition key column must exist.
+    if let Some(spec) = stmt.partspec.as_ref() {
+        let mut key = Vec::new();
+        for elem in &spec.part_params {
+            let Some(node::Node::PartitionElem(pe)) = elem.node.as_ref() else {
+                continue;
+            };
+            if pe.name.is_empty() {
+                key.push(0);
+                continue;
+            }
+            let Some(attnum) = interp
+                .attribute_by_name(class_oid, &pe.name)
+                .map(|a| a.attnum)
+            else {
+                return Err(DdlError::Parse(format!(
+                    "column \"{}\" named in partition key does not exist",
+                    pe.name
+                )));
+            };
+            key.push(attnum);
+        }
+        interp.partition_keys.insert(class_oid, key);
+    }
+
     // Type-check CHECK and `GENERATED ... STORED` expressions against the
     // freshly-built table. CHECK must produce `bool`; the generated
     // expression must be assignable to the column's declared type.
@@ -390,4 +444,5 @@ mod merge;
 
 use columns::*;
 pub(crate) use columns::{column_collation, type_collation};
+pub(crate) use constraints::check_unique_covers_partition_key;
 use constraints::*;

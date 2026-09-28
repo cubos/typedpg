@@ -26,6 +26,13 @@ pub(crate) fn serial_base_type(tn: &pg_query::protobuf::TypeName) -> Option<PgTy
     }
 }
 
+/// Whether the column definition carries a constraint of kind `kind`.
+fn has_constraint(cd: &pg_query::protobuf::ColumnDef, kind: ConstrType) -> bool {
+    cd.constraints.iter().any(
+        |n| matches!(n.node.as_ref(), Some(node::Node::Constraint(c)) if c.contype == kind as i32),
+    )
+}
+
 /// The DEFAULT expression written on a column definition, if any.
 pub(crate) fn column_default_expr(
     cd: &pg_query::protobuf::ColumnDef,
@@ -147,6 +154,42 @@ pub(crate) fn parse_column_def(
                 _ => {}
             }
         }
+    }
+
+    // transformColumnDefinition: at most one of DEFAULT / GENERATED ... AS
+    // (expr) / GENERATED ... AS IDENTITY, and an identity column's type must
+    // suit a sequence (init_params).
+    let saw_default = cd.raw_default.is_some()
+        || cd.cooked_default.is_some()
+        || has_constraint(cd, ConstrType::ConstrDefault);
+    let saw_generated = !cd.generated.is_empty() || has_constraint(cd, ConstrType::ConstrGenerated);
+    let saw_identity = !cd.identity.is_empty() || has_constraint(cd, ConstrType::ConstrIdentity);
+    let both = |what: &str| {
+        DdlError::Parse(format!(
+            "both {what} specified for column \"{}\" of table \"{relname}\"",
+            cd.colname
+        ))
+    };
+    if saw_default && saw_identity {
+        return Err(both("default and identity"));
+    }
+    if saw_default && saw_generated {
+        return Err(both("default and generation expression"));
+    }
+    if saw_identity && saw_generated {
+        return Err(both("identity and generation expression"));
+    }
+    if saw_identity
+        && !matches!(
+            type_oid,
+            crate::pg_catalog::oid::INT2
+                | crate::pg_catalog::oid::INT4
+                | crate::pg_catalog::oid::INT8
+        )
+    {
+        return Err(DdlError::Parse(
+            "identity column type must be smallint, integer, or bigint".into(),
+        ));
     }
 
     // transformColumnDefinition rejects `NULL` together with `NOT NULL`.

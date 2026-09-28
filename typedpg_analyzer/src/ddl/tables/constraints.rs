@@ -214,6 +214,14 @@ fn emit_constraint_with_backing_index(
     confrelid: Option<PgClassOid>,
     confkey: Vec<i16>,
 ) -> Result<(), DdlError> {
+    if matches!(contype, ConType::PrimaryKey | ConType::Unique) {
+        let label = if contype == ConType::PrimaryKey {
+            "PRIMARY KEY"
+        } else {
+            "UNIQUE"
+        };
+        check_unique_covers_partition_key(interp, relid, &conkey, label)?;
+    }
     let oid = PgConstraintOid::from_nonzero(interp.alloc_oid()?);
     interp.insert_pg_constraint(PgConstraint {
         oid,
@@ -260,6 +268,31 @@ fn emit_constraint_with_backing_index(
             indexprs: Vec::new(),
             indpred: None,
         });
+    }
+    Ok(())
+}
+
+/// DefineIndex (indexcmds.c): a unique index on a partitioned table must
+/// contain every partition key column, and the key may not be an
+/// expression.
+pub(crate) fn check_unique_covers_partition_key(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+    key: &[i16],
+    label: &str,
+) -> Result<(), DdlError> {
+    let Some(part_key) = interp.partition_keys.get(&relid) else {
+        return Ok(());
+    };
+    if part_key.contains(&0) {
+        return Err(DdlError::Parse(format!(
+            "unsupported {label} constraint with partition key definition"
+        )));
+    }
+    if part_key.iter().any(|pk| !key.contains(pk)) {
+        return Err(DdlError::Parse(
+            "unique constraint on partitioned table must include all partitioning columns".into(),
+        ));
     }
     Ok(())
 }
@@ -569,6 +602,29 @@ pub(crate) fn validate_constraint_expressions(
                 }
                 Ok(ConstrType::ConstrGenerated) => {
                     if let Some(expr) = c.raw_expr.as_deref() {
+                        // check_nested_generated: a generation expression
+                        // may not read another generated column.
+                        if let Some(inner) = expr.node.as_ref() {
+                            for (n, ..) in inner.nodes() {
+                                let pg_query::NodeRef::ColumnRef(cr) = n else {
+                                    continue;
+                                };
+                                let Some(colname) =
+                                    cr.fields.last().and_then(crate::ddl::util::node_string)
+                                else {
+                                    continue;
+                                };
+                                if table_attrs
+                                    .iter()
+                                    .any(|a| a.attname == colname && a.attgenerated.is_some())
+                                {
+                                    return Err(DdlError::Parse(format!(
+                                        "cannot use generated column \"{colname}\" in column \
+                                         generation expression"
+                                    )));
+                                }
+                            }
+                        }
                         let col_type = table_attrs
                             .iter()
                             .find(|a| a.attname == cd.colname)
