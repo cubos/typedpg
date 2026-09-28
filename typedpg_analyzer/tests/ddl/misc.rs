@@ -2328,3 +2328,128 @@ fn extended_statistics_are_validated_and_tracked() {
         ),
     ]);
 }
+
+#[test]
+fn storage_parameters_are_validated() {
+    // PG 18 transformRelOptions / heap_reloptions / index_reloptions /
+    // view_reloptions / partitioned_table_reloptions / parse_one_reloption.
+    let setup = "CREATE TABLE t (a int);
+                 CREATE VIEW v AS SELECT a FROM t;
+                 CREATE INDEX ti ON t (a);
+                 CREATE INDEX tg ON t USING gin ((ARRAY[a]));";
+    for (stmt, msg) in [
+        (
+            "CREATE TABLE p (a int) PARTITION BY LIST (a) WITH (fillfactor = 50);",
+            "cannot specify storage parameters for a partitioned table",
+        ),
+        (
+            "CREATE TABLE x (a int) WITH (autovacuum_enabled = maybe);",
+            "invalid value for boolean option \"autovacuum_enabled\": maybe",
+        ),
+        (
+            "CREATE TABLE x (a int) WITH (fillfactor);",
+            "invalid value for integer option \"fillfactor\": true",
+        ),
+        (
+            "CREATE TABLE x (a int) WITH (oids = true);",
+            "tables declared WITH OIDS are not supported",
+        ),
+        (
+            "CREATE TABLE x (a int) WITH (toast.fillfactor = 50);",
+            "unrecognized parameter \"fillfactor\"",
+        ),
+        (
+            "CREATE TABLE x (a int) WITH (foo.fillfactor = 50);",
+            "unrecognized parameter namespace \"foo\"",
+        ),
+        (
+            "CREATE TABLE x (a int) WITH (autovacuum_vacuum_cost_delay = 200);",
+            "value 200 out of bounds for option \"autovacuum_vacuum_cost_delay\"",
+        ),
+        (
+            "CREATE TABLE x (a int) WITH (vacuum_index_cleanup = sometimes);",
+            "invalid value for enum option \"vacuum_index_cleanup\": sometimes",
+        ),
+        (
+            "CREATE TABLE x (a int) WITH (nosuchopt = 1);",
+            "unrecognized parameter \"nosuchopt\"",
+        ),
+        (
+            "CREATE TABLE x (a int) WITH (fillfactor = 50, fillfactor = 60);",
+            "parameter \"fillfactor\" specified more than once",
+        ),
+        (
+            "ALTER TABLE t SET (fillfactor = 5);",
+            "value 5 out of bounds for option \"fillfactor\"",
+        ),
+        (
+            "ALTER TABLE t SET (nosuchopt = 5);",
+            "unrecognized parameter \"nosuchopt\"",
+        ),
+        (
+            "ALTER TABLE t RESET (fillfactor = 5);",
+            "RESET must not include values for parameters",
+        ),
+        (
+            "CREATE INDEX ON t USING gist ((point(a, a))) WITH (buffering = maybe);",
+            "invalid value for enum option \"buffering\": maybe",
+        ),
+        (
+            "CREATE INDEX ON t (a) WITH (fillfactor = 5);",
+            "value 5 out of bounds for option \"fillfactor\"",
+        ),
+        (
+            "CREATE INDEX ON t (a) WITH (nosuchopt = 1);",
+            "unrecognized parameter \"nosuchopt\"",
+        ),
+        (
+            "CREATE INDEX ON t USING hash (a) WITH (deduplicate_items = off);",
+            "unrecognized parameter \"deduplicate_items\"",
+        ),
+        (
+            "ALTER INDEX ti SET (fastupdate = off);",
+            "unrecognized parameter \"fastupdate\"",
+        ),
+        (
+            "ALTER INDEX tg SET (fillfactor = 50);",
+            "unrecognized parameter \"fillfactor\"",
+        ),
+        (
+            "CREATE VIEW x WITH (fillfactor = 10) AS SELECT 1 AS a;",
+            "unrecognized parameter \"fillfactor\"",
+        ),
+        (
+            "ALTER VIEW v SET (security_barrier = maybe);",
+            "invalid value for boolean option \"security_barrier\": maybe",
+        ),
+        (
+            "CREATE MATERIALIZED VIEW x WITH (fillfactor = 5) AS SELECT 1 AS a;",
+            "value 5 out of bounds for option \"fillfactor\"",
+        ),
+        (
+            "CREATE TABLE x WITH (autovacuum_vacuum_scale_factor = 200) AS SELECT 1 AS a;",
+            "value 200 out of bounds for option \"autovacuum_vacuum_scale_factor\"",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "CREATE TABLE a1 (a int) WITH (oids = false);
+             CREATE TABLE a2 (a int) WITH (toast.autovacuum_enabled = off, autovacuum_vacuum_cost_delay = 20);
+             CREATE TABLE a3 (a int) WITH (fillfactor = 50.5, autovacuum_enabled = yes);
+             CREATE TABLE a4 (a int) WITH (fillfactor = '70', vacuum_index_cleanup = off);
+             ALTER TABLE t SET (fillfactor = 70, parallel_workers = 4);
+             ALTER TABLE t RESET (fillfactor, nosuch);
+             CREATE INDEX ON t (a) WITH (deduplicate_items = off, fillfactor = 90);
+             CREATE INDEX ON t USING brin (a) WITH (pages_per_range = 32, autosummarize = on);
+             ALTER INDEX ti SET (fillfactor = 80);
+             ALTER INDEX tg SET (fastupdate = off);
+             ALTER VIEW v SET (security_barrier = true, security_invoker = on);
+             CREATE MATERIALIZED VIEW m1 WITH (fillfactor = 50) AS SELECT 1 AS a;",
+        ),
+    ]);
+}

@@ -421,6 +421,18 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
         partbound::record_partition_spec(interp, class_oid, spec);
     }
 
+    // heap_reloptions / partitioned_table_reloptions.
+    crate::ddl::reloptions::check_reloptions(
+        &stmt.options,
+        if stmt.partspec.is_some() {
+            crate::ddl::reloptions::RelOptKind::Partitioned
+        } else {
+            crate::ddl::reloptions::RelOptKind::Heap
+        },
+        false,
+        true,
+    )?;
+
     // Type-check CHECK and `GENERATED ... STORED` expressions against the
     // freshly-built table. CHECK must produce `bool`; the generated
     // expression must be assignable to the column's declared type.
@@ -609,6 +621,9 @@ fn apply_alter_subtype(
             column_options::alter_column_setting(interp, relid, cmd, subtype)
         }
         AlterTableType::AtClusterOn => object_refs::cluster_on(interp, relid, cmd),
+        AlterTableType::AtSetRelOptions
+        | AlterTableType::AtResetRelOptions
+        | AlterTableType::AtReplaceRelOptions => set_reloptions(interp, relid, cmd, subtype),
         AlterTableType::AtDropCluster => {
             interp.clustered_indexes.remove(&relid);
             Ok(())
@@ -637,6 +652,42 @@ fn apply_alter_subtype(
         // Other subtypes are no-ops for schema analysis.
         _ => Ok(()),
     }
+}
+
+/// `ALTER ... SET / RESET (storage parameters)` (ATExecSetRelOptions): the
+/// options of the relation's kind.
+fn set_reloptions(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+    cmd: &AlterTableCmd,
+    subtype: AlterTableType,
+) -> Result<(), DdlError> {
+    use crate::ddl::reloptions::{IndexAm, RelOptKind};
+    let Some(node::Node::List(list)) = cmd.def.as_deref().and_then(|d| d.node.as_ref()) else {
+        return Ok(());
+    };
+    let kind = match interp.pg_class.get(&relid).map(|c| c.relkind) {
+        Some(RelKind::Table | RelKind::MaterializedView) => RelOptKind::Heap,
+        Some(RelKind::Partitioned) => RelOptKind::Partitioned,
+        Some(RelKind::View) => RelOptKind::View,
+        Some(RelKind::Index | RelKind::PartitionedIndex) => {
+            let am = interp
+                .index_access_methods
+                .get(&relid)
+                .map_or("btree", String::as_str);
+            match IndexAm::from_name(am) {
+                Some(am) => RelOptKind::Index(am),
+                None => return Ok(()),
+            }
+        }
+        _ => return Ok(()),
+    };
+    crate::ddl::reloptions::check_reloptions(
+        &list.items,
+        kind,
+        subtype == AlterTableType::AtResetRelOptions,
+        false,
+    )
 }
 
 /// `ATSimplePermissions` (tablecmds.c): which relation kinds each ALTER

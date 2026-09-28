@@ -21,6 +21,7 @@ mod maintenance;
 mod opclass;
 pub mod operators;
 mod policies;
+pub(crate) mod reloptions;
 mod rules;
 pub mod schema_stmt;
 pub mod sequences;

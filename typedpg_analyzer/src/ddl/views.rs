@@ -61,6 +61,12 @@ pub fn create_view(interp: &mut PgCatalog, stmt: &ViewStmt) -> Result<(), DdlErr
         ));
     }
     check_duplicate_columns(&resolved.columns)?;
+    super::reloptions::check_reloptions(
+        &stmt.options,
+        super::reloptions::RelOptKind::View,
+        false,
+        false,
+    )?;
 
     // DefineVirtualRelation: OR REPLACE redefines an existing *view* in
     // place (keeping its OID, so dependents stay attached); any other
@@ -169,6 +175,12 @@ fn create_relation_as(
     }
     check_duplicate_columns(&resolved.columns)?;
     super::util::check_relation_name_free(interp, nsoid, &name)?;
+    super::reloptions::check_reloptions(
+        &into.options,
+        super::reloptions::RelOptKind::Heap,
+        false,
+        true,
+    )?;
 
     // A table created from a query is an ordinary table: its columns carry
     // no NOT NULL constraint, whatever the query's nullability. (A matview

@@ -246,6 +246,9 @@ pub struct PgCatalog {
     pub(crate) clustered_indexes: HashMap<PgClassOid, PgClassOid>,
     /// `pg_statistic_ext`: extended statistics objects.
     pub(crate) statistics: Vec<crate::ddl::statistics::StatisticsObject>,
+    /// `relam` of indexes created with a non-default access method
+    /// (btree when absent).
+    pub(crate) index_access_methods: HashMap<PgClassOid, String>,
     /// `pg_partitioned_table`: strategy and key types.
     pub(crate) partition_specs: HashMap<PgClassOid, crate::ddl::tables::partbound::PartSpec>,
     /// `relpartbound` of each partition.
@@ -508,6 +511,7 @@ impl PgCatalog {
             typed_tables: HashMap::new(),
             clustered_indexes: HashMap::new(),
             statistics: Vec::new(),
+            index_access_methods: HashMap::new(),
             partition_specs: HashMap::new(),
             partition_bounds: HashMap::new(),
             check_defs: HashMap::new(),
@@ -1128,6 +1132,7 @@ impl PgCatalog {
         self.clustered_indexes.remove(&oid);
         self.clustered_indexes.retain(|_, index| *index != oid);
         self.statistics.retain(|s| s.relid != oid);
+        self.index_access_methods.remove(&oid);
         self.partition_specs.remove(&oid);
         self.partition_bounds.remove(&oid);
         let row = self.pg_class.remove(&oid)?;

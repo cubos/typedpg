@@ -60,6 +60,14 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
         )));
     }
     let caps = super::opclass::am_caps(am);
+    if let Some(index_am) = super::reloptions::IndexAm::from_name(am) {
+        super::reloptions::check_reloptions(
+            &stmt.options,
+            super::reloptions::RelOptKind::Index(index_am),
+            false,
+            false,
+        )?;
+    }
     if let Some(caps) = caps.as_ref() {
         if stmt.unique && !caps.can_unique {
             return Err(DdlError::UnsupportedDdl(format!(
@@ -237,6 +245,7 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
 
     // ── Allocate the index's pg_class oid + insert pg_index ──
     let indexrelid = PgClassOid::from_nonzero(db.alloc_oid()?);
+    db.index_access_methods.insert(indexrelid, am.to_owned());
     db.insert_pg_class(PgClass {
         oid: indexrelid,
         relname: conname.clone(),
