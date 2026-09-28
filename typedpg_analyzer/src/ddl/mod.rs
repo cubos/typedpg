@@ -275,8 +275,8 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         | node::Node::CreateTransformStmt(_)
         | node::Node::AlterCollationStmt(_)
         | node::Node::AlterObjectDependsStmt(_)
-        | node::Node::SecLabelStmt(_)
-        | node::Node::AlterTypeStmt(_) => Ok(()),
+        | node::Node::SecLabelStmt(_) => Ok(()),
+        node::Node::AlterTypeStmt(s) => types::alter_type(db, s),
 
         // ── Unknown DDL — surface as an error ───────────────────────
         other => Err(DdlError::UnsupportedDdl(format!("{other:?}"))),

@@ -216,6 +216,11 @@ pub struct PgCatalog {
     /// `pg_partitioned_table.partattrs` of each partitioned table: the
     /// partition key's attnums, `0` for an expression.
     pub(crate) partition_keys: HashMap<PgClassOid, Vec<i16>>,
+    /// `pg_type.typsubscript` of user base types, as the handler function's
+    /// name (`hstore_subscript_handler`), set by `CREATE TYPE (SUBSCRIPT =
+    /// …)` / `ALTER TYPE … SET (SUBSCRIPT = …)`. Built-in types aren't
+    /// listed: theirs follow from `typelem` (the array handlers) and jsonb.
+    pub(crate) type_subscript: HashMap<PgTypeOid, String>,
     next_oid: std::num::NonZeroU32,
 
     /// Lazy-initialized PG sanity mirror used by the `pg_sanity` feature to
@@ -451,6 +456,7 @@ impl PgCatalog {
             check_function_bodies: true,
             inline_sql_bodies: HashMap::new(),
             partition_keys: HashMap::new(),
+            type_subscript: HashMap::new(),
             next_oid: USER_OID_START_NZ,
             #[cfg(feature = "pg_sanity")]
             pg_sanity: None,

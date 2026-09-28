@@ -640,6 +640,28 @@ pub(crate) fn transform_container_subscripts(
     };
     let entry = snapshot.get_type(base);
     let is_slice = subscripts.iter().any(|ai| ai.is_slice);
+
+    // hstore_subscript_transform (hstore_subs.c): one text subscript, no
+    // slices; the result is text.
+    if snapshot.type_subscript.get(&base).map(String::as_str) == Some("hstore_subscript_handler") {
+        if is_slice || subscripts.len() != 1 {
+            return Err(AnalyzeError::FeatureNotSupported(
+                "hstore allows only one subscript".into(),
+            ));
+        }
+        if let Some(bound) = subscripts[0].uidx.as_deref() {
+            match infer_expr(bound, ctx, params, TypeGoal::assignment(oid::TEXT)) {
+                Ok(_) => {}
+                Err(AnalyzeError::TypeMismatch { .. }) => {
+                    return Err(AnalyzeError::DatatypeMismatch(
+                        "hstore subscript must have type text".into(),
+                    ));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        return Ok(ExprType::scalar(oid::TEXT, true));
+    }
     let bound_span = |bound: &protobuf::Node| {
         crate::error::node_location(bound).and_then(crate::error::SourceSpan::from_node_qname)
     };

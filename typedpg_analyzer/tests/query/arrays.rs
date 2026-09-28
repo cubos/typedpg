@@ -549,3 +549,34 @@ fn update_array_element_assignment_expects_the_element_type() {
         "cannot subscript type integer because it does not support subscripting"
     );
 }
+
+// ── hstore subscripts (hstore_subscript_handler) ───────────────────────────
+
+#[test]
+fn hstore_subscripts_like_hstore_subscript_transform() {
+    // hstore 1.8 sets SUBSCRIPT = hstore_subscript_handler: one text
+    // subscript, result text (PG 18).
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE EXTENSION hstore; CREATE TABLE th (h hstore NOT NULL, n int);")
+        .unwrap();
+    let s = db
+        .analyze("SELECT h['a'] AS a, h[1] AS b, h[true] AS c FROM th")
+        .unwrap();
+    assert_cols(&s, vec![cn("a", text()), cn("b", text()), cn("c", text())]);
+    let s = db.analyze("SELECT h[$k] AS a FROM th").unwrap();
+    assert_params(&s, vec![p(text())]);
+    for sql in ["SELECT h['a':'b'] FROM th", "SELECT h['a']['b'] FROM th"] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::FeatureNotSupported(_),
+            "hstore allows only one subscript"
+        );
+    }
+    for sql in [
+        "UPDATE th SET h['a'] = 'x'",
+        "UPDATE th SET h['a'] = 1",
+        "UPDATE th SET h['a'] = true",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}

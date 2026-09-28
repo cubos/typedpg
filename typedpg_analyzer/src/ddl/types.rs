@@ -766,11 +766,73 @@ pub fn define_type(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), DdlE
 
     let (nsoid, name) = ensure_qualified_name(interp, &stmt.defnames)?;
 
-    if interp.type_by_qname.contains_key(&(nsoid, name.clone())) {
-        // Full definition after shell type — just confirm it exists.
-        return Ok(());
+    let oid = match interp.type_by_qname.get(&(nsoid, name.clone())) {
+        // Full definition after shell type — the type already exists.
+        Some(&oid) => oid,
+        None => create_base_type(interp, nsoid, &name)?,
+    };
+    record_type_options(interp, oid, &stmt.definition);
+    Ok(())
+}
+
+/// Record the type options the analyzer uses (`SUBSCRIPT = handler`) from a
+/// `CREATE TYPE (...)` / `ALTER TYPE ... SET (...)` option list.
+fn record_type_options(
+    interp: &mut PgCatalog,
+    oid: PgTypeOid,
+    options: &[pg_query::protobuf::Node],
+) {
+    for opt in options {
+        let Some(node::Node::DefElem(de)) = opt.node.as_ref() else {
+            continue;
+        };
+        if !de.defname.eq_ignore_ascii_case("subscript") {
+            continue;
+        }
+        let handler = match de.arg.as_deref().and_then(|a| a.node.as_ref()) {
+            Some(node::Node::TypeName(tn)) => {
+                tn.names.iter().rev().find_map(|n| match n.node.as_ref() {
+                    Some(node::Node::String(s)) => Some(s.sval.clone()),
+                    _ => None,
+                })
+            }
+            Some(node::Node::String(s)) => Some(s.sval.clone()),
+            _ => None,
+        };
+        match handler {
+            Some(h) if !h.eq_ignore_ascii_case("none") => {
+                interp.type_subscript.insert(oid, h);
+            }
+            _ => {
+                interp.type_subscript.remove(&oid);
+            }
+        }
     }
-    create_base_type(interp, nsoid, &name)?;
+}
+
+/// `ALTER TYPE name SET (...)`: only the options the analyzer models
+/// (SUBSCRIPT) change anything.
+pub fn alter_type(
+    interp: &mut PgCatalog,
+    stmt: &pg_query::protobuf::AlterTypeStmt,
+) -> Result<(), DdlError> {
+    let parts: Vec<&str> = stmt
+        .type_name
+        .iter()
+        .filter_map(|n| match n.node.as_ref() {
+            Some(node::Node::String(s)) => Some(s.sval.as_str()),
+            _ => None,
+        })
+        .collect();
+    let (schema, name) = match parts.as_slice() {
+        [n] => (None, *n),
+        [s, n] => (Some(*s), *n),
+        _ => return Ok(()),
+    };
+    if let Some(t) = interp.resolve_type_by_name(schema, name) {
+        let oid = t.oid;
+        record_type_options(interp, oid, &stmt.options);
+    }
     Ok(())
 }
 
