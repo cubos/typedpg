@@ -353,6 +353,7 @@ fn analyze_insert_values(
             let ctx = expr::Ctx::new(&scope, &null_ctx, snapshot);
             match &target {
                 Some(t) => t.infer_value(val, goal, ctx, params)?,
+                None if is_set_to_default(val) => expr::ExprType::scalar(oid::UNKNOWN, false),
                 None => expr::infer_expr(val, ctx, params, goal)?,
             };
 

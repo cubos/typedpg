@@ -613,20 +613,16 @@ pub(crate) fn infer_expr(
                 record_fields: Some(fields),
             })
         }
-        node::Node::SetToDefault(_) => {
-            // `DEFAULT` placeholder in INSERT VALUES / UPDATE SET. The actual
-            // default expression lives on the column definition and is
-            // trusted to produce a valid value of the column's type, so we
-            // adopt the assignment goal here. Nullability defers to the
-            // goal's NOT NULL reasoning in the caller.
-            Ok(ExprType::scalar(
-                if goal.has_expectation() {
-                    goal.type_oid
-                } else {
-                    oid::UNKNOWN
-                },
-                false,
-            ))
+        node::Node::SetToDefault(d) => {
+            // `DEFAULT` is only meaningful as the whole value of an INSERT /
+            // UPDATE target, which the DML analyzers handle before reaching
+            // here; anywhere else PG's transformExprRecurse rejects it.
+            Err(crate::error::RawError::new(
+                AnalyzeError::SyntaxError("DEFAULT is not allowed in this context".into()),
+                crate::error::SourceSpan::from_node_token(d.location),
+                None,
+            )
+            .finalize_implicit())
         }
         node::Node::CollateClause(c) => {
             // `expr COLLATE "x"` is metadata-only — it changes how the

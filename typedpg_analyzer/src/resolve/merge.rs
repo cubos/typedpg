@@ -313,7 +313,9 @@ fn merge_when_insert(
         let goal = target_col
             .map(|tc| TypeGoal::assignment(tc.atttypid))
             .unwrap_or(TypeGoal::NONE);
-        expr::infer_expr(val, ctx, params, goal)?;
+        if !is_set_to_default(val) {
+            expr::infer_expr(val, ctx, params, goal)?;
+        }
         if let Some(node::Node::ParamRef(p)) = val.node.as_ref()
             && let Some(tc) = target_col
             && !tc.attnotnull

@@ -152,6 +152,11 @@ impl AssignTarget {
         ctx: Ctx<'_>,
         params: &mut ParamCollector,
     ) -> Result<expr::ExprType, AnalyzeError> {
+        // `DEFAULT` as the whole value takes the column default, which is
+        // trusted to fit the target.
+        if is_set_to_default(val) {
+            return Ok(expr::ExprType::scalar(self.type_oid, false));
+        }
         let Some((subscript, name)) = &self.last_step else {
             return expr::infer_expr(val, ctx, params, goal);
         };
