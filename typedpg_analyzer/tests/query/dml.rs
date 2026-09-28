@@ -588,7 +588,7 @@ fn on_conflict_on_non_unique_column_should_error() {
             "INSERT INTO users (name, email) VALUES ($p1, $p2) \
              ON CONFLICT (name) DO NOTHING",
         ),
-        AnalyzeError::Invalid(_),
+        AnalyzeError::InvalidColumnReference(_),
         "there is no unique or exclusion constraint matching the ON CONFLICT specification on table \"users\"",
     );
 }
@@ -709,7 +709,7 @@ fn on_conflict_on_partial_composite_unique_set_is_rejected() {
             "INSERT INTO t (a, b) VALUES ($p1, $p2) \
              ON CONFLICT (a) DO NOTHING"
         ),
-        AnalyzeError::Invalid(_),
+        AnalyzeError::InvalidColumnReference(_),
         "there is no unique or exclusion constraint matching the ON CONFLICT specification on table \"t\"",
     );
 }

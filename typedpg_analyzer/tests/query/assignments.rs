@@ -258,7 +258,10 @@ fn on_conflict_infers_partial_and_expression_indexes() {
         "INSERT INTO k (a,b,c) VALUES (1,2,'x') ON CONFLICT (upper(c)) DO NOTHING",
     ] {
         let err = db.analyze(sql).unwrap_err();
-        assert!(matches!(err, AnalyzeError::Invalid(_)), "{sql}: {err:?}");
+        assert!(
+            matches!(err, AnalyzeError::InvalidColumnReference(_)),
+            "{sql}: {err:?}"
+        );
         assert!(
             err.to_string().starts_with(
                 "there is no unique or exclusion constraint matching the ON CONFLICT specification"

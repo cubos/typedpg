@@ -186,6 +186,20 @@ pub(crate) fn too_many_join_column_aliases(
     )
 }
 
+/// `there is no unique or exclusion constraint matching the ON CONFLICT
+/// specification` — SQLSTATE 42P10 (`infer_arbiter_indexes`). The table
+/// name is our trailing detail; PG's message ends before it.
+pub(crate) fn no_on_conflict_arbiter(table: &str) -> RawError {
+    RawError::new(
+        AnalyzeError::InvalidColumnReference(format!(
+            "there is no unique or exclusion constraint matching the ON CONFLICT \
+             specification on table \"{table}\""
+        )),
+        None,
+        None,
+    )
+}
+
 /// `VALUES lists must all be the same length` — SQLSTATE 42601
 /// (`syntax_error`).
 pub(crate) fn values_lists_length(first_arity: usize, row_arity: usize) -> RawError {
@@ -820,6 +834,7 @@ mod tests {
             (duplicate_table_alias("u").kind, "42712"),
             (too_many_column_aliases("t", 1, 2).kind, "42P10"),
             (values_lists_length(2, 1).kind, "42601"),
+            (no_on_conflict_arbiter("t").kind, "42P10"),
             (window_does_not_exist("w").kind, "42704"),
             (using_column_missing("id", "left").kind, "42703"),
             (join_using_types_mismatch("integer", "point").kind, "42804"),

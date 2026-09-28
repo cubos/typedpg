@@ -111,7 +111,7 @@ fn on_conflict_against_partial_unique_index_should_error() {
             "INSERT INTO t (id, slug) VALUES ($p1, $p2) \
              ON CONFLICT (slug) DO NOTHING",
         ),
-        AnalyzeError::Invalid(_),
+        AnalyzeError::InvalidColumnReference(_),
         "there is no unique or exclusion constraint matching the ON CONFLICT specification on table \"t\"",
     );
 }
@@ -148,7 +148,7 @@ fn unique_index_does_not_match_against_distinct_columns() {
             "INSERT INTO t (a, b) VALUES ($p1, $p2) \
              ON CONFLICT (a) DO NOTHING"
         ),
-        AnalyzeError::Invalid(_),
+        AnalyzeError::InvalidColumnReference(_),
         "there is no unique or exclusion constraint matching the ON CONFLICT specification on table \"t\"",
     );
 }
@@ -174,7 +174,7 @@ fn expression_unique_index_does_not_match_column_on_conflict() {
             "INSERT INTO t (id, slug) VALUES ($p1, $p2) \
              ON CONFLICT (slug) DO NOTHING"
         ),
-        AnalyzeError::Invalid(_),
+        AnalyzeError::InvalidColumnReference(_),
         "there is no unique or exclusion constraint matching the ON CONFLICT specification on table \"t\"",
     );
 }
@@ -452,7 +452,7 @@ fn on_conflict_user_column_not_polluted_by_catalog_indexes() {
             "INSERT INTO my_objs (oid, name) VALUES ($p1, $p2) \
              ON CONFLICT (oid) DO NOTHING"
         ),
-        AnalyzeError::Invalid(_),
+        AnalyzeError::InvalidColumnReference(_),
         "there is no unique or exclusion constraint matching the ON CONFLICT specification on table \"my_objs\"",
     );
 }

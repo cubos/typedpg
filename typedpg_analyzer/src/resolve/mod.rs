@@ -559,10 +559,7 @@ fn validate_on_conflict_target(
                     == target_cols
         });
     if !index_matches && !constraint_matches {
-        return Err(AnalyzeError::Invalid(format!(
-            "there is no unique or exclusion constraint matching the ON CONFLICT \
-             specification on table \"{table_relname}\""
-        )));
+        return Err(crate::pgmsg::no_on_conflict_arbiter(table_relname).finalize_implicit());
     }
     Ok(())
 }
