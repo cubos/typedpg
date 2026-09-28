@@ -55,8 +55,11 @@ pub(crate) fn parse_column_def(
     let mut has_default = cd.raw_default.is_some() || cd.cooked_default.is_some();
     let mut is_generated = false;
 
+    // `transformColumnDefinition`: a serial column is its integer type
+    // with `DEFAULT nextval(...)` from an owned sequence and NOT NULL.
     if is_serial {
         has_default = true;
+        not_null = true;
     }
 
     let mut identity: Option<AttIdentity> = None;
@@ -163,6 +166,13 @@ pub(crate) fn parse_column_def(
         is_generated,
         identity,
         collation,
+        owned_sequence: if identity.is_some() {
+            Some(crate::pg_catalog::DepType::Internal)
+        } else if is_serial {
+            Some(crate::pg_catalog::DepType::Auto)
+        } else {
+            None
+        },
     })
 }
 
@@ -207,6 +217,7 @@ pub(crate) fn set_identity(
         _ => return Ok(()),
     };
 
+    let is_add = matches!(def.node.as_ref(), Some(node::Node::Constraint(_)));
     let rel = relname_of(interp, relid);
     let Some(attrs) = interp.pg_attribute.get_mut(&relid) else {
         return Err(DdlError::TableNotFound(format!(
@@ -219,10 +230,45 @@ pub(crate) fn set_identity(
             cmd.name
         )));
     };
+    // ATExecAddIdentity / ATExecSetIdentity (tablecmds.c).
+    if is_add {
+        if !col.attnotnull {
+            return Err(DdlError::Parse(format!(
+                "column \"{}\" of relation \"{rel}\" must be declared NOT NULL before \
+                 identity can be added",
+                cmd.name
+            )));
+        }
+        if col.attidentity.is_some() {
+            return Err(DdlError::Parse(format!(
+                "column \"{}\" of relation \"{rel}\" is already an identity column",
+                cmd.name
+            )));
+        }
+        if col.atthasdef {
+            return Err(DdlError::Parse(format!(
+                "column \"{}\" of relation \"{rel}\" already has a default value",
+                cmd.name
+            )));
+        }
+    } else if col.attidentity.is_none() {
+        return Err(DdlError::Parse(format!(
+            "column \"{}\" of relation \"{rel}\" is not an identity column",
+            cmd.name
+        )));
+    }
+    let attnum = col.attnum;
     if let Some(new_identity) = new_identity {
         col.attidentity = Some(new_identity);
-        col.attnotnull = true;
         col.atthasdef = true;
+    }
+    if is_add {
+        crate::ddl::sequences::create_owned_sequence(
+            interp,
+            relid,
+            attnum,
+            crate::pg_catalog::DepType::Internal,
+        )?;
     }
     Ok(())
 }
@@ -247,7 +293,21 @@ pub(crate) fn drop_identity(
             cmd.name
         )));
     };
-    col.attidentity = None;
+    if col.attidentity.take().is_none() {
+        if cmd.missing_ok {
+            return Ok(());
+        }
+        return Err(DdlError::Parse(format!(
+            "column \"{}\" of relation \"{rel}\" is not an identity column",
+            cmd.name
+        )));
+    }
+    col.atthasdef = false;
+    let attnum = col.attnum;
+    // The identity sequence is internal to the column and goes with it.
+    for seq in crate::ddl::sequences::identity_sequences(interp, relid, attnum) {
+        crate::ddl::drop::drop_relation_by_oid(interp, seq);
+    }
     Ok(())
 }
 
@@ -298,6 +358,9 @@ pub(crate) fn add_column(
         attidentity: col.identity,
         attcollation: col.collation,
     });
+    if let Some(deptype) = col.owned_sequence {
+        crate::ddl::sequences::create_owned_sequence(interp, relid, next_attnum, deptype)?;
+    }
     Ok(())
 }
 
@@ -442,6 +505,12 @@ pub(crate) fn drop_column(
 
     if !dependent_views.is_empty() {
         views::drop_views(interp, &dependent_views);
+    }
+
+    if let Some(an) = target_attnum {
+        for seq in crate::ddl::sequences::owned_sequences(interp, relid, Some(an)) {
+            crate::ddl::drop::drop_relation_by_oid(interp, seq);
+        }
     }
 
     if let Some(attrs) = interp.pg_attribute.get_mut(&relid) {

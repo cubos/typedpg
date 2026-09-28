@@ -102,6 +102,7 @@ pub(crate) fn assemble_columns(
             target.col.has_default = opt.has_default;
             target.col.is_generated = opt.is_generated;
             target.col.identity = opt.identity;
+            target.col.owned_sequence = opt.owned_sequence;
             target.is_from_type = false;
         }
         i += 1;
@@ -179,6 +180,7 @@ fn of_type_columns(
                 is_generated: false,
                 identity: None,
                 collation: attr.attcollation,
+                owned_sequence: None,
             },
             has_type: true,
             is_from_type: true,
@@ -232,6 +234,7 @@ fn expand_like(
                 is_generated: generated,
                 identity,
                 collation: attr.attcollation,
+                owned_sequence: identity.map(|_| crate::pg_catalog::DepType::Internal),
             },
             has_type: true,
             is_from_type: false,
@@ -342,6 +345,7 @@ fn inherited_columns(
                 is_generated: attr.attgenerated.is_some(),
                 identity,
                 collation: attr.attcollation,
+                owned_sequence: None,
             });
         }
     }
@@ -370,6 +374,7 @@ fn merge_child_column(inh: &mut ParsedColumn, local: ParsedColumn) -> Result<(),
     }
     if local.identity.is_some() {
         inh.identity = local.identity;
+        inh.owned_sequence = local.owned_sequence;
     }
     Ok(())
 }

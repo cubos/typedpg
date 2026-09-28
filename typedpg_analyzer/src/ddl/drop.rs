@@ -193,9 +193,14 @@ fn drop_relation(
 /// the array wrapping the composite. Mirrors what `DROP TABLE` /
 /// `DROP VIEW` does in PG.
 pub(crate) fn drop_relation_by_oid(interp: &mut PgCatalog, class_oid: PgClassOid) {
+    // Sequences the relation owns (serial / identity / OWNED BY) go with it.
+    let owned = super::sequences::owned_sequences(interp, class_oid, None);
     let Some(class) = interp.remove_pg_class(class_oid) else {
         return;
     };
+    for seq in owned {
+        drop_relation_by_oid(interp, seq);
+    }
     let class_obj = crate::oid::PgGenericOid::from_nonzero(class_oid.into_nonzero());
     interp.remove_dependencies_of(PG_CLASS_RELID, class_obj);
     interp.remove_dependencies_on(PG_CLASS_RELID, class_obj);

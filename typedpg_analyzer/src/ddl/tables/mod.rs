@@ -181,6 +181,11 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
         typcollation: None,
     });
 
+    for (i, col) in columns.iter().enumerate() {
+        if let Some(deptype) = col.owned_sequence {
+            super::sequences::create_owned_sequence(interp, class_oid, (i + 1) as i16, deptype)?;
+        }
+    }
     for (i, &parent) in parents.iter().enumerate() {
         interp.pg_inherits.push(PgInherits {
             inhrelid: class_oid,
@@ -215,6 +220,9 @@ struct ParsedColumn {
     is_generated: bool,
     identity: Option<AttIdentity>,
     collation: Option<crate::oid::PgCollationOid>,
+    /// Implicit sequence the column owns: `Auto` for serial columns,
+    /// `Internal` for identity columns.
+    owned_sequence: Option<crate::pg_catalog::DepType>,
 }
 
 // ─── ALTER TABLE ────────────────────────────────────────────────────────────

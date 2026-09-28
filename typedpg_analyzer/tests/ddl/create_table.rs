@@ -175,16 +175,15 @@ fn create_table_if_not_exists_different_schema_creates_both() {
 // ── SERIAL / BIGSERIAL / SMALLSERIAL ────────────────────────────────────────
 
 #[test]
-fn serial_without_pk_is_nullable() {
+fn serial_without_pk_is_not_null() {
     let snap = build(&[("0001.sql", "CREATE TABLE t (id SERIAL, name TEXT);")]);
 
     let table = snap.resolve_table(None, "t").unwrap();
     let attrs = snap.attributes_of(table.oid);
     let id_col = attrs.iter().find(|c| c.attname == "id").unwrap();
-    assert!(
-        !id_col.attnotnull,
-        "SERIAL without PRIMARY KEY should be nullable"
-    );
+    // PG 18 (transformColumnDefinition): serial implies NOT NULL even
+    // without a PRIMARY KEY — `attnotnull = t`.
+    assert!(id_col.attnotnull, "SERIAL is NOT NULL");
     assert!(id_col.atthasdef, "SERIAL should have a default");
 }
 
