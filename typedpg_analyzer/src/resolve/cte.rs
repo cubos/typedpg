@@ -126,7 +126,8 @@ pub(crate) fn analyze_cte(
 
     match cte_query {
         node::Node::SelectStmt(sel) => {
-            let (cols, _) = analyze_select_with_ctes(sel, snapshot, params, existing_ctes)?;
+            let (mut cols, _) = analyze_select_with_ctes(sel, snapshot, params, existing_ctes)?;
+            resolve_unknown_outputs(sel, &mut cols, params);
             let cols = apply_cte_column_aliases(cols, &cte.aliascolnames);
             Ok(cols
                 .into_iter()

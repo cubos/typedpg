@@ -119,7 +119,7 @@ pub(crate) fn process_from_item(
                 } else {
                     (Vec::new(), visible)
                 };
-                let (cols, _) = analyze_select_with_ctes_and_outer(
+                let (mut cols, _) = analyze_select_with_ctes_and_outer(
                     sel,
                     snapshot,
                     params,
@@ -128,6 +128,7 @@ pub(crate) fn process_from_item(
                     &[],
                     &shadowed_sources,
                 )?;
+                resolve_unknown_outputs(sel, &mut cols, params);
                 let mut scope_cols: Vec<ScopeColumn> = cols
                     .into_iter()
                     .map(|rc| ScopeColumn {

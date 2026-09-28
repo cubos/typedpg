@@ -32,7 +32,46 @@ pub(crate) fn analyze_correlated_select(
         .chain(outer_scope.lateral_sources.iter())
         .cloned()
         .collect();
-    analyze_select_with_ctes_and_outer(sel, snapshot, params, &outer_scope.ctes, &[], &outer, &[])
+    let (mut cols, p) = analyze_select_with_ctes_and_outer(
+        sel,
+        snapshot,
+        params,
+        &outer_scope.ctes,
+        &[],
+        &outer,
+        &[],
+    )?;
+    resolve_unknown_outputs(sel, &mut cols, params);
+    Ok((cols, p))
+}
+
+/// PG's `resolveTargetListUnknowns` for a subquery, sublink or CTE body:
+/// an output column still of type `unknown` (an untyped literal or a bare
+/// parameter nothing pinned) becomes `text`, and so does that parameter —
+/// `WHERE id = (SELECT $1)` is then `integer = text`, exactly like PG.
+/// Set-operation arms and INSERT … SELECT keep their unknowns (PG resolves
+/// those against the other arm / the target column) and don't come here.
+pub(crate) fn resolve_unknown_outputs(
+    sel: &protobuf::SelectStmt,
+    cols: &mut [RawColumn],
+    params: &mut ParamCollector,
+) {
+    let direct = sel.op == SetOperation::SetopNone as i32
+        && sel.values_lists.is_empty()
+        && sel.target_list.len() == cols.len();
+    for (i, col) in cols.iter_mut().enumerate() {
+        if col.type_oid != oid::UNKNOWN {
+            continue;
+        }
+        col.type_oid = oid::TEXT;
+        if direct
+            && let Some(node::Node::ResTarget(rt)) = sel.target_list[i].node.as_ref()
+            && let Some(node::Node::ParamRef(p)) = rt.val.as_deref().and_then(|v| v.node.as_ref())
+            && params.get(p.number) == oid::UNKNOWN
+        {
+            params.record(p.number, oid::TEXT);
+        }
+    }
 }
 
 pub(crate) fn analyze_select_with_ctes(

@@ -134,3 +134,231 @@ fn locking_clause_targets() {
         );
     }
 }
+
+// ── Set-operation ORDER BY / LIMIT ───────────────────────────────────────────
+
+fn setup_wide() -> PgCatalog {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE t (id int PRIMARY KEY, a int NOT NULL, b text, c varchar(10) NOT NULL, d numeric(10,2));",
+    )
+    .unwrap();
+    db
+}
+
+#[test]
+fn set_operation_order_by_and_limit_are_analyzed() {
+    let db = setup_wide();
+    let s = db
+        .analyze(
+            "SELECT * FROM t WHERE id = 1 UNION ALL SELECT * FROM t WHERE id = 2 \
+             ORDER BY id LIMIT $l",
+        )
+        .unwrap();
+    assert_params(&s, vec![p(int8())]);
+    let s = db
+        .analyze("SELECT a FROM t UNION SELECT a FROM t ORDER BY 1 OFFSET $o")
+        .unwrap();
+    assert_params(&s, vec![p(int8())]);
+    db.analyze("SELECT a AS z FROM t UNION SELECT a FROM t ORDER BY z DESC NULLS LAST")
+        .unwrap();
+}
+
+#[test]
+fn set_operation_order_by_errors() {
+    let db = setup_wide();
+    let err = assert_err_prefix(
+        &db,
+        "SELECT a FROM t UNION SELECT a FROM t ORDER BY b",
+        "column \"b\" does not exist",
+    );
+    assert!(matches!(err, AnalyzeError::UndefinedColumn(_)), "{err:?}");
+    let err = assert_err_prefix(
+        &db,
+        "SELECT a FROM t UNION SELECT a FROM t ORDER BY a + 1",
+        "invalid UNION/INTERSECT/EXCEPT ORDER BY clause",
+    );
+    assert!(
+        matches!(err, AnalyzeError::FeatureNotSupported(_)),
+        "{err:?}"
+    );
+    let err = assert_err_prefix(
+        &db,
+        "SELECT a FROM t UNION SELECT a FROM t ORDER BY t.a",
+        "missing FROM-clause entry for table \"t\"",
+    );
+    assert!(matches!(err, AnalyzeError::UndefinedTable(_)), "{err:?}");
+    let err = assert_err_prefix(
+        &db,
+        "SELECT a FROM t UNION SELECT a FROM t ORDER BY 2",
+        "ORDER BY position 2 is not in select list",
+    );
+    assert!(
+        matches!(err, AnalyzeError::InvalidColumnReference(_)),
+        "{err:?}"
+    );
+    let err = assert_err_prefix(
+        &db,
+        "SELECT a FROM t UNION SELECT a FROM t LIMIT a",
+        "column \"a\" does not exist",
+    );
+    assert!(matches!(err, AnalyzeError::UndefinedColumn(_)), "{err:?}");
+}
+
+// ── DISTINCT ON / ORDER BY USING / LIMIT / DEFAULT ───────────────────────────
+
+#[test]
+fn distinct_on_must_match_leading_order_by() {
+    let db = setup_wide();
+    for sql in [
+        "SELECT DISTINCT ON (a) a, b FROM t ORDER BY b",
+        "SELECT DISTINCT ON (a, b) a, b FROM t ORDER BY a, id, b",
+    ] {
+        let err = assert_err_prefix(
+            &db,
+            sql,
+            "SELECT DISTINCT ON expressions must match initial ORDER BY expressions",
+        );
+        assert!(
+            matches!(err, AnalyzeError::InvalidColumnReference(_)),
+            "{sql}: {err:?}"
+        );
+    }
+    for sql in [
+        "SELECT DISTINCT ON (a) a, b FROM t ORDER BY a, b",
+        "SELECT DISTINCT ON (a, b) a, b FROM t ORDER BY b, a, id",
+        "SELECT DISTINCT ON (a, b) a, b FROM t ORDER BY a",
+        "SELECT DISTINCT ON (1) a, b FROM t ORDER BY a",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
+
+#[test]
+fn order_by_using_needs_an_ordering_operator() {
+    let db = setup_wide();
+    let err = assert_err_prefix(
+        &db,
+        "SELECT a FROM t ORDER BY a USING @@@",
+        "operator does not exist: integer @@@ integer",
+    );
+    assert!(matches!(err, AnalyzeError::UndefinedOperator(_)), "{err:?}");
+    let err = assert_err_prefix(
+        &db,
+        "SELECT a FROM t ORDER BY a USING =",
+        "operator = is not a valid ordering operator",
+    );
+    assert!(matches!(err, AnalyzeError::WrongObjectType(_)), "{err:?}");
+    db.analyze("SELECT a FROM t ORDER BY a USING <").unwrap();
+    db.analyze("SELECT b FROM t ORDER BY b USING ~<~").unwrap();
+}
+
+#[test]
+fn limit_must_not_contain_variables() {
+    let db = setup_wide();
+    let err = assert_err_prefix(
+        &db,
+        "SELECT a FROM t LIMIT a",
+        "argument of LIMIT must not contain variables",
+    );
+    assert!(
+        matches!(err, AnalyzeError::InvalidColumnReference(_)),
+        "{err:?}"
+    );
+    db.analyze("SELECT a FROM t LIMIT (SELECT max(a) FROM t)")
+        .unwrap();
+}
+
+#[test]
+fn default_outside_insert_is_rejected() {
+    let db = setup_wide();
+    for sql in ["VALUES (DEFAULT)", "SELECT DEFAULT"] {
+        let err = assert_err_prefix(&db, sql, "DEFAULT is not allowed in this context");
+        assert!(
+            matches!(err, AnalyzeError::SyntaxError(_)),
+            "{sql}: {err:?}"
+        );
+    }
+}
+
+// ── SELECT INTO ──────────────────────────────────────────────────────────────
+
+/// `SELECT … INTO` is CREATE TABLE AS: no result rows.
+#[test]
+fn select_into_returns_no_rows() {
+    let db = setup_wide();
+    let s = db.analyze("SELECT * INTO newt FROM t").unwrap();
+    assert_cols(&s, vec![]);
+    let s = db.analyze("SELECT 'x' INTO TEMP tt").unwrap();
+    assert_cols(&s, vec![]);
+    assert!(!s.can_run_as_subquery);
+}
+
+// ── Unknown-typed outputs ────────────────────────────────────────────────────
+
+/// PG coerces a set-operation arm's untyped literal to the other arm's type.
+#[test]
+fn union_coerces_an_unknown_literal_to_the_other_arm() {
+    let db = setup_wide();
+    let err = assert_err_prefix(
+        &db,
+        "SELECT 1 UNION SELECT 'x'",
+        "invalid input syntax for type integer: \"x\"",
+    );
+    assert!(matches!(err, AnalyzeError::InvalidLiteral(_)), "{err:?}");
+    let s = db.analyze("SELECT 1 UNION SELECT '2'").unwrap();
+    assert_cols(&s, vec![c("?column?", int4())]);
+}
+
+#[test]
+fn values_keeps_a_common_typmod() {
+    let db = setup_wide();
+    let s = db
+        .analyze("VALUES ('x'::varchar(3)), ('yy'::varchar(3))")
+        .unwrap();
+    assert_cols(&s, vec![c("column1", varchar_n(3))]);
+}
+
+/// A sub-SELECT's untyped parameter output resolves to text, so using it as
+/// an integer fails like in PG (`operator does not exist: integer = text`).
+#[test]
+fn subquery_unknown_param_output_is_text() {
+    let db = setup_wide();
+    for (sql, msg) in [
+        (
+            "SELECT * FROM t WHERE id = (SELECT $p)",
+            "operator does not exist: integer = text",
+        ),
+        (
+            "SELECT (SELECT $p) + 1",
+            "operator does not exist: text + integer",
+        ),
+        (
+            "SELECT s.v + 1 FROM (SELECT $p AS v) s",
+            "operator does not exist: text + integer",
+        ),
+        (
+            "WITH w AS (SELECT $p AS v) SELECT v + 1 FROM w",
+            "operator does not exist: text + integer",
+        ),
+    ] {
+        let err = assert_err_prefix(&db, sql, msg);
+        assert!(
+            matches!(err, AnalyzeError::UndefinedOperator(_)),
+            "{sql}: {err:?}"
+        );
+    }
+    let s = db.analyze("SELECT (SELECT $p) AS v").unwrap();
+    assert_params(&s, vec![p(text())]);
+}
+
+// ── Implicit column names ────────────────────────────────────────────────────
+
+#[test]
+fn grouping_function_column_is_named_grouping() {
+    let db = setup_wide();
+    let s = db
+        .analyze("SELECT a, GROUPING(a) FROM t GROUP BY a")
+        .unwrap();
+    assert_eq!(s.columns[1].name, "grouping");
+}
