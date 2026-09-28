@@ -1938,3 +1938,32 @@ fn default_only_allowed_as_a_whole_assigned_value() {
         db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
 }
+
+#[test]
+fn insert_without_column_list_may_supply_fewer_values() {
+    // transformInsertRow: without a column list the trailing columns take
+    // their defaults; with one, every listed column needs a value (PG 18).
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE ta (j jsonb NOT NULL, n int NOT NULL DEFAULT 1, ni int);")
+        .unwrap();
+    for sql in [
+        "INSERT INTO ta VALUES ('{}')",
+        "INSERT INTO ta VALUES ('{}', 2), ('[]', 3)",
+        "INSERT INTO ta SELECT '{}'::jsonb",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    for (sql, msg) in [
+        (
+            "INSERT INTO ta (j, n) VALUES ('{}')",
+            "INSERT has more target columns than expressions",
+        ),
+        (
+            "INSERT INTO ta VALUES ('{}', 1, 2, 3)",
+            "INSERT has more expressions than target columns",
+        ),
+    ] {
+        let err = db.analyze(sql).expect_err(sql);
+        assert!(err.to_string().starts_with(msg), "{sql}: {err}");
+    }
+}

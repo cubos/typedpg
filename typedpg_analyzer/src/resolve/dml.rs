@@ -238,6 +238,13 @@ fn insert_arity(tgt: &InsertTarget) -> usize {
     }
 }
 
+/// PG's transformInsertRow arity rule: more values than target columns is
+/// always an error, fewer only with an explicit column list — without one
+/// the remaining columns take their defaults (`INSERT INTO t VALUES (1)`).
+fn arity_mismatch(tgt: &InsertTarget, given: usize, expected: usize) -> bool {
+    given > expected || (given < expected && !tgt.col_names.is_empty())
+}
+
 /// `INSERT … VALUES (…)`: infer each value with the column's type as goal,
 /// enforcing arity, NOT NULL / typmod literal checks, and the
 /// generated/identity-column restrictions.
@@ -264,7 +271,7 @@ fn analyze_insert_values(
         };
         // Arity check: the VALUES row must match the declared column list
         // (or, when no column list is given, the full table width).
-        if list.items.len() != expected_len {
+        if arity_mismatch(tgt, list.items.len(), expected_len) {
             // PG (SQLSTATE 42601) emits one of two messages:
             // `INSERT has more expressions than target columns` or
             // `INSERT has more target columns than expressions`. Mirror PG's
@@ -388,7 +395,7 @@ fn analyze_insert_select(
     // operations — with the target list.
     let (sel_cols, _) = analyze_select_with_ctes(val_sel, snapshot, params, cte_scopes)?;
     let expected_len = insert_arity(tgt);
-    if sel_cols.len() != expected_len {
+    if arity_mismatch(tgt, sel_cols.len(), expected_len) {
         let pg_msg = if sel_cols.len() > expected_len {
             "INSERT has more expressions than target columns"
         } else {
