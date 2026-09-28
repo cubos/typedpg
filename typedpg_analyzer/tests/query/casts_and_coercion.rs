@@ -500,3 +500,25 @@ fn type_name_call_acts_as_cast() {
         "got: {err}"
     );
 }
+
+#[test]
+fn typename_followed_by_a_parameter_is_a_syntax_error() {
+    // `int4 $1` parses only in libpg_query (a normalization extension);
+    // PG's grammar takes a string constant there (PG 18: syntax error).
+    let db = setup();
+    for sql in ["SELECT int4 $r", "SELECT interval $r AS a"] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::SyntaxError(_),
+            "syntax error at or near \"$1\""
+        );
+    }
+    // The ordinary casts still work.
+    for sql in [
+        "SELECT $r::int4 AS a",
+        "SELECT CAST($r AS int4) AS a",
+        "SELECT int4 '1' AS a",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}

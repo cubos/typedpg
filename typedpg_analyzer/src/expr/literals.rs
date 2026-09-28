@@ -65,6 +65,26 @@ pub(crate) fn infer_type_cast(
         .as_ref()
         .ok_or_else(|| AnalyzeError::Unsupported("TypeCast without arg".into()))?;
 
+    // `typename $1` (like `int4 '1'`, with the parameter in the constant's
+    // place) is a libpg_query grammar extension for query normalization;
+    // PG's own grammar only takes a string constant there. That form is
+    // the only TypeCast without a location whose type name precedes a
+    // parameter operand.
+    if let Some(node::Node::ParamRef(p)) = inner.node.as_ref()
+        && cast.location < 0
+        && cast
+            .type_name
+            .as_ref()
+            .is_some_and(|tn| tn.location >= 0 && tn.location < p.location)
+    {
+        return Err(crate::error::RawError::new(
+            AnalyzeError::SyntaxError(format!("syntax error at or near \"${}\"", p.number)),
+            crate::error::SourceSpan::from_node_token(p.location),
+            None,
+        )
+        .finalize_implicit());
+    }
+
     let target_oid = resolve_type_name(cast.type_name.as_ref(), snapshot)?;
     // typenameTypeIdAndMod: the target's typmod is resolved (and validated)
     // before the operand is transformed.
