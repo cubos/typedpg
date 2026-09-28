@@ -17,6 +17,7 @@ pub mod extensions;
 pub(crate) mod function_body;
 pub mod functions;
 pub mod indexes;
+mod maintenance;
 pub mod operators;
 mod policies;
 mod rules;
@@ -210,21 +211,22 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         node::Node::CreatePolicyStmt(s) => policies::create_policy(db, s),
         node::Node::AlterPolicyStmt(s) => policies::alter_policy(db, s),
         node::Node::RuleStmt(s) => rules::create_rule(db, s),
+        node::Node::TruncateStmt(s) => maintenance::truncate(db, s),
+        node::Node::ClusterStmt(s) => maintenance::cluster(db, s),
+        node::Node::ReindexStmt(s) => maintenance::reindex(db, s),
+        node::Node::VacuumStmt(s) => maintenance::vacuum(db, s),
+        node::Node::LockStmt(s) => maintenance::lock(db, s),
+        node::Node::SecLabelStmt(s) => maintenance::security_label(s),
+        node::Node::AlterDefaultPrivilegesStmt(s) => maintenance::alter_default_privileges(db, s),
         node::Node::GrantRoleStmt(_)
         | node::Node::ConstraintsSetStmt(_)
-        | node::Node::AlterDefaultPrivilegesStmt(_)
         | node::Node::CreateRoleStmt(_)
         | node::Node::AlterRoleStmt(_)
         | node::Node::CreateOpClassStmt(_)
         | node::Node::AlterOpFamilyStmt(_)
         | node::Node::AlterOperatorStmt(_)
         | node::Node::DoStmt(_)
-        | node::Node::TruncateStmt(_)
         | node::Node::CopyStmt(_)
-        | node::Node::ClusterStmt(_)
-        | node::Node::VacuumStmt(_)
-        | node::Node::ReindexStmt(_)
-        | node::Node::LockStmt(_)
         | node::Node::VariableShowStmt(_)
         | node::Node::DiscardStmt(_)
         | node::Node::ExplainStmt(_)
@@ -284,8 +286,7 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         | node::Node::CreatePlangStmt(_)
         | node::Node::CreateTransformStmt(_)
         | node::Node::AlterCollationStmt(_)
-        | node::Node::AlterObjectDependsStmt(_)
-        | node::Node::SecLabelStmt(_) => Ok(()),
+        | node::Node::AlterObjectDependsStmt(_) => Ok(()),
         node::Node::AlterTypeStmt(s) => types::alter_type(db, s),
 
         // ── Unknown DDL — surface as an error ───────────────────────

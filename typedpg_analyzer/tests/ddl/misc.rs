@@ -1829,3 +1829,111 @@ fn migration_queries_are_analyzed() {
         ),
     ]);
 }
+
+#[test]
+fn maintenance_statements_resolve_their_targets() {
+    // PG 18 ExecuteTruncate / cluster / ReindexIndex / vacuum /
+    // LockTableCommand / ExecSecLabelStmt / SetDefaultACLsInSchemas.
+    let setup = "CREATE TABLE r (id int PRIMARY KEY);
+                 CREATE TABLE f (x int REFERENCES r);
+                 CREATE VIEW v AS SELECT 1 AS a;
+                 CREATE SEQUENCE s;
+                 CREATE TABLE t (a int);
+                 CREATE MATERIALIZED VIEW mv AS SELECT 1 AS a;
+                 CREATE INDEX ti ON t (a);
+                 CREATE INDEX tp ON t (a) WHERE a > 0;";
+    for (stmt, msg) in [
+        ("TRUNCATE nosuch;", "relation \"nosuch\" does not exist"),
+        ("TRUNCATE v;", "\"v\" is not a table"),
+        ("TRUNCATE s;", "\"s\" is not a table"),
+        ("TRUNCATE mv;", "\"mv\" is not a table"),
+        (
+            "TRUNCATE r;",
+            "cannot truncate a table referenced in a foreign key constraint",
+        ),
+        ("CLUSTER nosuch;", "relation \"nosuch\" does not exist"),
+        (
+            "CLUSTER t;",
+            "there is no previously clustered index for table \"t\"",
+        ),
+        (
+            "CLUSTER mv;",
+            "there is no previously clustered index for table \"mv\"",
+        ),
+        (
+            "CLUSTER v USING ti;",
+            "\"v\" is not a table or materialized view",
+        ),
+        (
+            "CLUSTER t USING nosuch_idx;",
+            "index \"nosuch_idx\" for table \"t\" does not exist",
+        ),
+        (
+            "CLUSTER t USING tp;",
+            "cannot cluster on partial index \"tp\"",
+        ),
+        (
+            "ALTER TABLE t CLUSTER ON ti; ALTER TABLE t SET WITHOUT CLUSTER; CLUSTER t;",
+            "there is no previously clustered index for table \"t\"",
+        ),
+        (
+            "CLUSTER t USING ti; DROP INDEX ti; CLUSTER t;",
+            "there is no previously clustered index for table \"t\"",
+        ),
+        (
+            "REINDEX INDEX nosuch;",
+            "relation \"nosuch\" does not exist",
+        ),
+        ("REINDEX INDEX t;", "\"t\" is not an index"),
+        (
+            "REINDEX TABLE v;",
+            "\"v\" is not a table or materialized view",
+        ),
+        (
+            "REINDEX TABLE s;",
+            "\"s\" is not a table or materialized view",
+        ),
+        ("ANALYZE nosuch;", "relation \"nosuch\" does not exist"),
+        (
+            "ANALYZE t (nosuch);",
+            "column \"nosuch\" of relation \"t\" does not exist",
+        ),
+        (
+            "SELECT 1; LOCK TABLE nosuch;",
+            "relation \"nosuch\" does not exist",
+        ),
+        ("SELECT 1; LOCK TABLE s;", "cannot lock relation \"s\""),
+        ("SELECT 1; LOCK TABLE mv;", "cannot lock relation \"mv\""),
+        (
+            "SECURITY LABEL ON TABLE t IS 'x';",
+            "no security label providers have been loaded",
+        ),
+        (
+            "ALTER DEFAULT PRIVILEGES IN SCHEMA nosuch GRANT SELECT ON TABLES TO public;",
+            "schema \"nosuch\" does not exist",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "TRUNCATE r, f;
+             TRUNCATE r CASCADE;
+             TRUNCATE ONLY t;
+             CLUSTER t USING ti;
+             CLUSTER t;
+             ALTER TABLE t CLUSTER ON ti;
+             REINDEX TABLE t;
+             REINDEX INDEX ti;
+             REINDEX TABLE mv;
+             ANALYZE t;
+             ANALYZE t (a);
+             ANALYZE v;
+             LOCK TABLE t, v IN SHARE MODE;
+             ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO public;",
+        ),
+    ]);
+}

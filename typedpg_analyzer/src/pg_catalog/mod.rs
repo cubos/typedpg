@@ -232,6 +232,9 @@ pub struct PgCatalog {
     pub(crate) rules: HashMap<PgClassOid, Vec<String>>,
     /// `pg_class.reloftype` of typed tables (`CREATE TABLE ... OF type`).
     pub(crate) typed_tables: HashMap<PgClassOid, PgTypeOid>,
+    /// The `indisclustered` index of each table (CLUSTER ... USING,
+    /// ALTER TABLE ... CLUSTER ON).
+    pub(crate) clustered_indexes: HashMap<PgClassOid, PgClassOid>,
     /// `pg_partitioned_table`: strategy and key types.
     pub(crate) partition_specs: HashMap<PgClassOid, crate::ddl::tables::partbound::PartSpec>,
     /// `relpartbound` of each partition.
@@ -486,6 +489,7 @@ impl PgCatalog {
             policies: HashMap::new(),
             rules: HashMap::new(),
             typed_tables: HashMap::new(),
+            clustered_indexes: HashMap::new(),
             partition_specs: HashMap::new(),
             partition_bounds: HashMap::new(),
             check_defs: HashMap::new(),
@@ -1100,6 +1104,8 @@ impl PgCatalog {
         self.policies.remove(&oid);
         self.rules.remove(&oid);
         self.typed_tables.remove(&oid);
+        self.clustered_indexes.remove(&oid);
+        self.clustered_indexes.retain(|_, index| *index != oid);
         self.partition_specs.remove(&oid);
         self.partition_bounds.remove(&oid);
         let row = self.pg_class.remove(&oid)?;

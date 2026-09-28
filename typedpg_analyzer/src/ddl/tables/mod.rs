@@ -609,6 +609,10 @@ fn apply_alter_subtype(
             column_options::alter_column_setting(interp, relid, cmd, subtype)
         }
         AlterTableType::AtClusterOn => object_refs::cluster_on(interp, relid, cmd),
+        AlterTableType::AtDropCluster => {
+            interp.clustered_indexes.remove(&relid);
+            Ok(())
+        }
         AlterTableType::AtAddOf => typed::add_of(interp, relid, cmd),
         AlterTableType::AtAddInherit => inherit_cmd::add_inherit(interp, relid, cmd),
         AlterTableType::AtDropInherit => inherit_cmd::drop_inherit(interp, relid, cmd),
@@ -736,6 +740,7 @@ pub(crate) mod inherit;
 mod inherit_cmd;
 mod merge;
 mod object_refs;
+pub(crate) use object_refs::check_clusterable_index;
 pub(crate) mod partbound;
 pub(crate) mod typed;
 

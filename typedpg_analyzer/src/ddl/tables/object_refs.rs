@@ -29,19 +29,31 @@ fn table_index<'a>(
     }
 }
 
-/// `ALTER TABLE ... CLUSTER ON index` (check_index_is_clusterable).
-pub(super) fn cluster_on(
+/// check_index_is_clusterable: `name` must be a non-partial index of
+/// `relid`. Returns the index.
+pub(crate) fn check_clusterable_index(
     interp: &PgCatalog,
+    relid: PgClassOid,
+    name: &str,
+) -> Result<PgClassOid, DdlError> {
+    let index = table_index(interp, relid, name)?;
+    if index.indpred.is_some() {
+        return Err(DdlError::UnsupportedDdl(format!(
+            "cannot cluster on partial index \"{name}\""
+        )));
+    }
+    Ok(index.indexrelid)
+}
+
+/// `ALTER TABLE ... CLUSTER ON index` (ATExecClusterOn): marks the index
+/// `indisclustered`.
+pub(super) fn cluster_on(
+    interp: &mut PgCatalog,
     relid: PgClassOid,
     cmd: &AlterTableCmd,
 ) -> Result<(), DdlError> {
-    let index = table_index(interp, relid, &cmd.name)?;
-    if index.indpred.is_some() {
-        return Err(DdlError::UnsupportedDdl(format!(
-            "cannot cluster on partial index \"{}\"",
-            cmd.name
-        )));
-    }
+    let index = check_clusterable_index(interp, relid, &cmd.name)?;
+    interp.clustered_indexes.insert(relid, index);
     Ok(())
 }
 
