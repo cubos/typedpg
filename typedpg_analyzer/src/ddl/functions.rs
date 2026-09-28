@@ -200,11 +200,22 @@ pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Res
         })
         .unwrap_or(crate::pg_catalog::ProVolatile::Volatile);
 
+    // ProcedureCreate: a polymorphic result (or OUT parameter) needs a
+    // polymorphic input to be deduced from (check_valid_polymorphic_signature).
+    let input_types: Vec<PgTypeOid> = proargtypes.clone();
+    let out_types: Vec<PgTypeOid> = proargmodes
+        .iter()
+        .zip(&proallargtypes)
+        .filter(|(m, _)| matches!(m, ArgMode::Out | ArgMode::InOut | ArgMode::Table))
+        .map(|(_, &t)| t)
+        .collect();
+    for result in std::iter::once(prorettype).chain(out_types.iter().copied()) {
+        check_valid_polymorphic_signature(result, &input_types)?;
+    }
+
     // Check for an existing pg_proc row with the same (name, args) — PG
     // shares the function/procedure/aggregate namespace, so a duplicate
-    // signature collides regardless of prokind. CREATE OR REPLACE only
-    // overrides when the *kind* matches; otherwise it's still a hard
-    // duplicate (SQLSTATE 42723).
+    // signature collides regardless of prokind.
     let key = (nsoid, name.clone());
     if let Some(oids) = interp.proc_by_qname.get(&key).cloned() {
         let conflict = oids.iter().find(|&&oid| {
@@ -214,23 +225,10 @@ pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Res
                 .is_some_and(|p| p.proargtypes == proargtypes)
         });
         if let Some(&conflict_oid) = conflict {
-            let same_kind = interp.pg_proc.get(&conflict_oid).is_some_and(|p| {
-                std::mem::discriminant(&p.prokind) == std::mem::discriminant(&prokind)
-            });
-            if stmt.replace && same_kind {
-                // PG: `cannot change return type of existing function`
-                // (SQLSTATE 42P13). CREATE OR REPLACE FUNCTION must keep
-                // the same return type as the existing function — only the
-                // body can change.
-                if let Some(existing) = interp.pg_proc.get(&conflict_oid)
-                    && existing.prorettype != prorettype
-                {
-                    return Err(DdlError::DuplicateObject(
-                        "cannot change return type of existing function".into(),
-                    ));
-                }
-                interp.remove_pg_proc(conflict_oid);
-            } else {
+            let Some(existing) = interp.pg_proc.get(&conflict_oid).cloned() else {
+                return Ok(());
+            };
+            if !stmt.replace {
                 let kind = if matches!(prokind, ProKind::Procedure) {
                     "procedure"
                 } else {
@@ -240,6 +238,17 @@ pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Res
                     "{kind} \"{name}\" already exists with same argument types"
                 )));
             }
+            check_replacement(
+                &existing,
+                prokind,
+                prorettype,
+                proretset,
+                &proargmodes,
+                &proallargtypes,
+                &proargnames,
+                &proargdefaulttypes,
+            )?;
+            interp.remove_pg_proc(conflict_oid);
         }
     }
 
@@ -340,6 +349,120 @@ pub fn alter_function(
             ("strict", Some(node::Node::Integer(i))) => proc.proisstrict = i.ival != 0,
             _ => {}
         }
+    }
+    Ok(())
+}
+
+/// `check_valid_polymorphic_signature` (parse_coerce.c): a polymorphic
+/// result type is only allowed when an input can determine it.
+fn check_valid_polymorphic_signature(
+    result: PgTypeOid,
+    inputs: &[PgTypeOid],
+) -> Result<(), DdlError> {
+    use crate::polymorphic::is_polymorphic;
+    if !is_polymorphic(result) {
+        return Ok(());
+    }
+    // Type OIDs of the polymorphic pseudo-types (pg_type.dat).
+    let is = |t: PgTypeOid, oid: u32| t.get() == oid;
+    let range_family1 = |t: PgTypeOid| is(t, 3831) || is(t, 4537); // anyrange, anymultirange
+    let range_family2 = |t: PgTypeOid| is(t, 5080) || is(t, 4538); // anycompatible(multi)range
+    let family2 = |t: PgTypeOid| is(t, 5077) || is(t, 5078) || is(t, 5079) || range_family2(t);
+    let ok = if range_family1(result) {
+        // A range / multirange result needs a range or multirange input.
+        inputs.iter().any(|t| range_family1(*t))
+    } else if range_family2(result) {
+        inputs.iter().any(|t| range_family2(*t))
+    } else if family2(result) {
+        inputs.iter().any(|t| family2(*t))
+    } else {
+        inputs.iter().any(|t| is_polymorphic(*t) && !family2(*t))
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(DdlError::Parse("cannot determine result data type".into()))
+    }
+}
+
+/// ProcedureCreate's rules for CREATE OR REPLACE of an existing routine:
+/// same kind, same result (including SETOF and the OUT-parameter row), the
+/// input parameters keep their names, and existing defaults stay (with
+/// their types).
+#[allow(clippy::too_many_arguments)]
+fn check_replacement(
+    existing: &PgProc,
+    prokind: ProKind,
+    prorettype: PgTypeOid,
+    proretset: bool,
+    proargmodes: &[ArgMode],
+    proallargtypes: &[PgTypeOid],
+    proargnames: &[String],
+    proargdefaulttypes: &[PgTypeOid],
+) -> Result<(), DdlError> {
+    if std::mem::discriminant(&existing.prokind) != std::mem::discriminant(&prokind) {
+        return Err(DdlError::DuplicateObject(
+            "cannot change routine kind".into(),
+        ));
+    }
+    if existing.prorettype != prorettype || existing.proretset != proretset {
+        return Err(DdlError::DuplicateObject(
+            "cannot change return type of existing function".into(),
+        ));
+    }
+    let outs = |modes: &[ArgMode], types: &[PgTypeOid]| -> Vec<PgTypeOid> {
+        modes
+            .iter()
+            .zip(types)
+            .filter(|(m, _)| matches!(m, ArgMode::Out | ArgMode::InOut | ArgMode::Table))
+            .map(|(_, &t)| t)
+            .collect()
+    };
+    if prorettype == builtin_oid::RECORD
+        && outs(&existing.proargmodes, &existing.proallargtypes)
+            != outs(proargmodes, proallargtypes)
+    {
+        return Err(DdlError::DuplicateObject(
+            "cannot change return type of existing function".into(),
+        ));
+    }
+    // Input parameter names, in call order.
+    let input_names = |modes: &[ArgMode], names: &[String]| -> Vec<String> {
+        if modes.is_empty() {
+            return names.to_vec();
+        }
+        modes
+            .iter()
+            .zip(names)
+            .filter(|(m, _)| matches!(m, ArgMode::In | ArgMode::InOut | ArgMode::Variadic))
+            .map(|(_, n)| n.clone())
+            .collect()
+    };
+    let old_names = input_names(&existing.proargmodes, &existing.proargnames);
+    let new_names = input_names(proargmodes, proargnames);
+    for (i, old) in old_names.iter().enumerate() {
+        if !old.is_empty() && new_names.get(i) != Some(old) {
+            return Err(DdlError::DuplicateObject(format!(
+                "cannot change name of input parameter \"{old}\""
+            )));
+        }
+    }
+    let old_defaults = existing.pronargdefaults.max(0) as usize;
+    if proargdefaulttypes.len() < old_defaults {
+        return Err(DdlError::DuplicateObject(
+            "cannot remove parameter defaults from existing function".into(),
+        ));
+    }
+    // The overlapping (trailing) defaults must keep their types.
+    let new_tail = &proargdefaulttypes[proargdefaulttypes.len() - old_defaults..];
+    let old_tail = &existing.proargdefaulttypes[existing
+        .proargdefaulttypes
+        .len()
+        .saturating_sub(old_defaults)..];
+    if !old_tail.is_empty() && new_tail != old_tail {
+        return Err(DdlError::DuplicateObject(
+            "cannot change data type of existing parameter default value".into(),
+        ));
     }
     Ok(())
 }

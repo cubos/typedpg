@@ -689,3 +689,57 @@ fn parameter_defaults_are_checked() {
          CREATE FUNCTION f7(a text DEFAULT 5) RETURNS int LANGUAGE sql AS 'select 1';",
     )]);
 }
+
+// ── ProcedureCreate / LookupFuncWithArgs rules ─────────────────────────────
+
+#[test]
+fn create_function_signature_rules() {
+    for (sql, msg) in [
+        (
+            "CREATE FUNCTION bad(int) RETURNS anyelement LANGUAGE sql AS 'select 1';",
+            "cannot determine result data type",
+        ),
+        (
+            "CREATE FUNCTION bad2(anyelement) RETURNS anyrange LANGUAGE sql AS 'select null';",
+            "cannot determine result data type",
+        ),
+        (
+            "CREATE FUNCTION bad3(anyelement) RETURNS anycompatiblearray LANGUAGE sql AS 'select null';",
+            "cannot determine result data type",
+        ),
+        (
+            "CREATE FUNCTION f(a int) RETURNS int LANGUAGE sql AS 'select 1';
+             CREATE OR REPLACE FUNCTION f(b int) RETURNS int LANGUAGE sql AS 'select 1';",
+            "cannot change name of input parameter \"a\"",
+        ),
+        (
+            "CREATE FUNCTION f1(a int DEFAULT 1) RETURNS int LANGUAGE sql AS 'select 1';
+             CREATE OR REPLACE FUNCTION f1(a int) RETURNS int LANGUAGE sql AS 'select 1';",
+            "cannot remove parameter defaults from existing function",
+        ),
+        (
+            "CREATE FUNCTION f2(a int) RETURNS int LANGUAGE sql AS 'select 1';
+             CREATE OR REPLACE FUNCTION f2(a int) RETURNS SETOF int LANGUAGE sql AS 'select 1';",
+            "cannot change return type of existing function",
+        ),
+        (
+            "CREATE FUNCTION f4(a int) RETURNS int LANGUAGE sql AS 'select 1';
+             CREATE OR REPLACE PROCEDURE f4(a int) LANGUAGE sql AS 'select 1';",
+            "cannot change routine kind",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", sql)]).expect_err(sql);
+        assert!(err.to_string().starts_with(msg), "{sql}\n  got: {err}");
+    }
+    // Allowed replacements: new body, a newly named parameter, an added
+    // default.
+    build_db(&[(
+        "0001.sql",
+        "CREATE FUNCTION g(int) RETURNS int LANGUAGE sql AS 'select 1';
+         CREATE OR REPLACE FUNCTION g(a int DEFAULT 2) RETURNS int LANGUAGE sql AS 'select 2';
+         CREATE FUNCTION ok(anyarray) RETURNS anyelement LANGUAGE sql AS 'select $1[1]';
+         CREATE FUNCTION ok2(anycompatible, anycompatible) RETURNS anycompatiblearray
+             LANGUAGE sql AS 'select array[$1, $2]';",
+    )]);
+}
+
