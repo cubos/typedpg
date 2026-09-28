@@ -1937,3 +1937,76 @@ fn maintenance_statements_resolve_their_targets() {
         ),
     ]);
 }
+
+#[test]
+fn transaction_block_rules_follow_the_migration_runner() {
+    // PG 18 PreventInTransactionBlock / RequireTransactionBlock: a
+    // migration of several statements runs inside a transaction block
+    // (the runner's, or the implicit block of one multi-statement query).
+    let setup = "CREATE TABLE t (a int);
+                 CREATE TABLE pt (a int) PARTITION BY LIST (a);
+                 CREATE TABLE p1 PARTITION OF pt FOR VALUES IN (1);
+                 CREATE INDEX ti ON t (a);";
+    for (stmt, msg) in [
+        (
+            "SELECT 1; VACUUM t;",
+            "VACUUM cannot run inside a transaction block",
+        ),
+        (
+            "SELECT 1; CREATE INDEX CONCURRENTLY x ON t (a);",
+            "CREATE INDEX CONCURRENTLY cannot run inside a transaction block",
+        ),
+        (
+            "-- no-transaction\nSELECT 1; CREATE INDEX CONCURRENTLY x ON t (a);",
+            "CREATE INDEX CONCURRENTLY cannot run inside a transaction block",
+        ),
+        (
+            "SELECT 1; DROP INDEX CONCURRENTLY ti;",
+            "DROP INDEX CONCURRENTLY cannot run inside a transaction block",
+        ),
+        (
+            "SELECT 1; REINDEX INDEX CONCURRENTLY ti;",
+            "REINDEX CONCURRENTLY cannot run inside a transaction block",
+        ),
+        (
+            "SELECT 1; REINDEX SCHEMA public;",
+            "REINDEX SCHEMA cannot run inside a transaction block",
+        ),
+        (
+            "SELECT 1; CLUSTER;",
+            "CLUSTER cannot run inside a transaction block",
+        ),
+        (
+            "SELECT 1; ALTER TABLE pt DETACH PARTITION p1 CONCURRENTLY;",
+            "ALTER TABLE ... DETACH CONCURRENTLY cannot run inside a transaction block",
+        ),
+        (
+            "SELECT 1; DISCARD ALL;",
+            "DISCARD ALL cannot run inside a transaction block",
+        ),
+        (
+            "-- no-transaction\nLOCK TABLE t;",
+            "LOCK TABLE can only be used in transaction blocks",
+        ),
+        (
+            "-- no-transaction\nDECLARE c CURSOR FOR SELECT 1;",
+            "DECLARE CURSOR can only be used in transaction blocks",
+        ),
+        (
+            "-- no-transaction\nSAVEPOINT a;",
+            "SAVEPOINT can only be used in transaction blocks",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    for ok in [
+        "-- no-transaction\nCREATE INDEX CONCURRENTLY x ON t (a);",
+        "-- no-transaction\nVACUUM t;",
+        "-- no-transaction\nDROP INDEX CONCURRENTLY ti;",
+        "SELECT 1; LOCK TABLE t;",
+        "SELECT 1; ANALYZE t;",
+    ] {
+        build_db(&[("0001.sql", setup), ("0002.sql", ok)]);
+    }
+}
