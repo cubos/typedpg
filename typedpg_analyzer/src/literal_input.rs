@@ -1036,6 +1036,28 @@ fn validate_datetime_token(
         return Ok(());
     }
 
+    // ISO `yyyy-mm-dd` (a year of 3+ digits first): PG's DecodeDate takes
+    // the fields as year, month, day whatever the DateStyle, and
+    // ValidateDate rejects a month outside 1..12 or a day past the month's
+    // end as a field overflow. (Year 0 has its own BC rules — accept.)
+    if !is_time
+        && let [y, m, d] = t.split('-').collect::<Vec<_>>().as_slice()
+        && y.len() >= 3
+        && (1..=2).contains(&m.len())
+        && (1..=2).contains(&d.len())
+        && [y, m, d]
+            .iter()
+            .all(|f| f.chars().all(|c| c.is_ascii_digit()))
+        && let (Ok(y), Ok(m), Ok(d)) = (y.parse::<u32>(), m.parse::<u32>(), d.parse::<u32>())
+        && y > 0
+    {
+        return if valid_month_day(y, m, d) {
+            Ok(())
+        } else {
+            Err(range())
+        };
+    }
+
     // Pure digits: a single concatenated field.
     if !t.is_empty() && t.chars().all(|c| c.is_ascii_digit()) {
         return if is_time {
@@ -1114,6 +1136,21 @@ fn decode_time_field(digits: &str, _frac: Option<&str>) -> Result<(), bool> {
     Ok(())
 }
 
+/// PG's ValidateDate month/day check (Gregorian leap years).
+fn valid_month_day(y: u32, m: u32, d: u32) -> bool {
+    if !(1..=12).contains(&m) || d == 0 {
+        return false;
+    }
+    let leap = y.is_multiple_of(4) && (!y.is_multiple_of(100) || y.is_multiple_of(400));
+    let dim = match m {
+        2 if leap => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    d <= dim
+}
+
 /// A lone concatenated date field (PG `DecodeNumber`/`DecodeNumberField`):
 /// 6 digits is `yymmdd`, 8 is `yyyymmdd` (month/day validated, leap years
 /// included); 1–2 digits could only start a date (syntax when it fits a
@@ -1121,24 +1158,7 @@ fn decode_time_field(digits: &str, _frac: Option<&str>) -> Result<(), bool> {
 /// digits overflow the field. `Err(true)` = out of range, `Err(false)` =
 /// invalid syntax.
 fn decode_date_field(digits: &str) -> Result<(), bool> {
-    fn valid_md(y: u32, m: u32, d: u32) -> bool {
-        if !(1..=12).contains(&m) || d == 0 {
-            return false;
-        }
-        let leap = y.is_multiple_of(4) && (!y.is_multiple_of(100) || y.is_multiple_of(400));
-        let dim = match m {
-            2 => {
-                if leap {
-                    29
-                } else {
-                    28
-                }
-            }
-            4 | 6 | 9 | 11 => 30,
-            _ => 31,
-        };
-        d <= dim
-    }
+    let valid_md = valid_month_day;
     match digits.len() {
         1 | 2 => {
             let v: u32 = digits.parse().unwrap_or(0);

@@ -643,3 +643,31 @@ fn cast_empty_string_to_system_identifier_types_rejected() {
     // Non-empty contents stay unchecked (conservative).
     db.analyze("SELECT '42'::xid AS v").unwrap();
 }
+
+#[test]
+fn iso_date_field_overflow_rejected() {
+    // DecodeDate reads `yyyy-mm-dd` as year, month, day and ValidateDate
+    // rejects an impossible month / day (verified on PG 18).
+    let db = setup();
+    for sql in [
+        "SELECT CAST('2020-13-01' AS date) AS a",
+        "SELECT '2020-02-30'::date",
+        "SELECT '2021-02-29'::date",
+        "SELECT '1900-02-29'::timestamp",
+        "SELECT '2020-00-10'::timestamptz",
+    ] {
+        let err = db.analyze(sql).expect_err(sql);
+        assert!(
+            err.to_string()
+                .starts_with("date/time field value out of range: \""),
+            "{sql}: {err}"
+        );
+    }
+    for sql in [
+        "SELECT '2020-02-29'::date",
+        "SELECT '2000-02-29'::date",
+        "SELECT '99999-12-31'::date",
+    ] {
+        db.analyze(sql).unwrap();
+    }
+}
