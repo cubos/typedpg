@@ -393,6 +393,23 @@ pub fn alter_table(interp: &mut PgCatalog, stmt: &AlterTableStmt) -> Result<(), 
         Err(_) if stmt.missing_ok => return Ok(()),
         Err(e) => return Err(e),
     };
+    // RangeVarCallbackForAlterRelation: ALTER TABLE doesn't reach a
+    // composite type, and ALTER TYPE only reaches one.
+    let relkind = interp.pg_class.get(&class_oid).map(|c| c.relkind);
+    let via_alter_type = pg_query::protobuf::ObjectType::try_from(stmt.objtype)
+        == Ok(pg_query::protobuf::ObjectType::ObjectType);
+    if !via_alter_type && relkind == Some(RelKind::CompositeType) {
+        return Err(DdlError::Parse(format!(
+            "\"{}\" is a composite type",
+            rv.relname
+        )));
+    }
+    if via_alter_type && relkind != Some(RelKind::CompositeType) {
+        return Err(DdlError::Parse(format!(
+            "\"{}\" is not a composite type",
+            rv.relname
+        )));
+    }
 
     for cmd_node in &stmt.cmds {
         let Some(node::Node::AlterTableCmd(cmd)) = cmd_node.node.as_ref() else {
@@ -415,6 +432,7 @@ fn apply_alter_cmd(
     rec: inherit::Recursion,
 ) -> Result<(), DdlError> {
     let subtype = AlterTableType::try_from(cmd.subtype).unwrap_or(AlterTableType::Undefined);
+    check_alter_target(interp, relid, subtype)?;
 
     match subtype {
         AlterTableType::AtAddColumn | AlterTableType::AtAddColumnToView => {
@@ -435,6 +453,64 @@ fn apply_alter_cmd(
         // Other subtypes are no-ops for schema analysis.
         _ => Ok(()),
     }
+}
+
+/// `ATSimplePermissions` (tablecmds.c): which relation kinds each ALTER
+/// TABLE subcommand applies to.
+fn check_alter_target(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+    subtype: AlterTableType,
+) -> Result<(), DdlError> {
+    use AlterTableType as At;
+    let Some(class) = interp.pg_class.get(&relid) else {
+        return Ok(());
+    };
+    let table_like = matches!(
+        class.relkind,
+        RelKind::Table | RelKind::Partitioned | RelKind::ForeignTable
+    );
+    let (allowed, action) = match subtype {
+        At::AtAddColumn => (
+            table_like || class.relkind == RelKind::CompositeType,
+            "ADD COLUMN",
+        ),
+        At::AtDropColumn => (
+            table_like || class.relkind == RelKind::CompositeType,
+            "DROP COLUMN",
+        ),
+        At::AtAlterColumnType => (
+            table_like || class.relkind == RelKind::CompositeType,
+            "ALTER COLUMN ... SET DATA TYPE",
+        ),
+        At::AtColumnDefault => (
+            table_like || class.relkind == RelKind::View,
+            "ALTER COLUMN ... SET DEFAULT",
+        ),
+        At::AtSetNotNull => (table_like, "ALTER COLUMN ... SET NOT NULL"),
+        At::AtDropNotNull => (table_like, "ALTER COLUMN ... DROP NOT NULL"),
+        At::AtSetExpression => (table_like, "ALTER COLUMN ... SET EXPRESSION"),
+        At::AtDropExpression => (table_like, "ALTER COLUMN ... DROP EXPRESSION"),
+        At::AtAddConstraint => (table_like, "ADD CONSTRAINT"),
+        At::AtDropConstraint => (table_like, "DROP CONSTRAINT"),
+        _ => (true, ""),
+    };
+    if allowed {
+        return Ok(());
+    }
+    let kinds = match class.relkind {
+        RelKind::View => "views",
+        RelKind::MaterializedView => "materialized views",
+        RelKind::Sequence => "sequences",
+        RelKind::Index | RelKind::PartitionedIndex => "indexes",
+        RelKind::CompositeType => "composite types",
+        _ => "this relation",
+    };
+    Err(DdlError::Parse(format!(
+        "ALTER action {action} cannot be performed on relation \"{}\" \
+         (This operation is not supported for {kinds}.)",
+        class.relname
+    )))
 }
 
 mod columns;

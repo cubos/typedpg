@@ -495,3 +495,64 @@ fn rename_to_a_taken_name_is_rejected() {
         "column \"q\" does not exist",
     );
 }
+
+// ── ALTER TABLE subcommands per relation kind (ATSimplePermissions) ─────────
+
+#[test]
+fn alter_table_actions_are_limited_to_their_relation_kinds() {
+    let setup = "CREATE TABLE t (a int);
+                 CREATE VIEW v AS SELECT a FROM t;
+                 CREATE MATERIALIZED VIEW mv AS SELECT a FROM t;
+                 CREATE SEQUENCE s;
+                 CREATE TYPE c AS (x int);";
+    for (stmt, msg) in [
+        (
+            "ALTER TABLE v ADD COLUMN b int;",
+            "ALTER action ADD COLUMN cannot be performed on relation \"v\"",
+        ),
+        (
+            "ALTER TABLE v DROP COLUMN a;",
+            "ALTER action DROP COLUMN cannot be performed on relation \"v\"",
+        ),
+        (
+            "ALTER TABLE v ALTER COLUMN a TYPE bigint;",
+            "ALTER action ALTER COLUMN ... SET DATA TYPE cannot be performed on relation \"v\"",
+        ),
+        (
+            "ALTER TABLE v ALTER a SET NOT NULL;",
+            "ALTER action ALTER COLUMN ... SET NOT NULL cannot be performed on relation \"v\"",
+        ),
+        (
+            "ALTER TABLE v ADD CONSTRAINT k CHECK (a > 0);",
+            "ALTER action ADD CONSTRAINT cannot be performed on relation \"v\"",
+        ),
+        (
+            "ALTER TABLE mv ADD COLUMN b int;",
+            "ALTER action ADD COLUMN cannot be performed on relation \"mv\"",
+        ),
+        (
+            "ALTER TABLE mv ALTER COLUMN a SET DEFAULT 1;",
+            "ALTER action ALTER COLUMN ... SET DEFAULT cannot be performed on relation \"mv\"",
+        ),
+        (
+            "ALTER TABLE s ADD COLUMN b int;",
+            "ALTER action ADD COLUMN cannot be performed on relation \"s\"",
+        ),
+        (
+            "ALTER TABLE c ADD COLUMN y int;",
+            "\"c\" is a composite type",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    // What those relations do accept.
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "ALTER TABLE v ALTER COLUMN a SET DEFAULT 1;
+             ALTER TYPE c ADD ATTRIBUTE y int;",
+        ),
+    ]);
+}
