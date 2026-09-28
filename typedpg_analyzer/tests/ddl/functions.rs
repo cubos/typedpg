@@ -536,3 +536,61 @@ fn valid_sql_function_bodies_are_accepted() {
     )]);
     assert_cols(&db.analyze("SELECT f2(1)").unwrap(), vec![cn("f2", int4())]);
 }
+
+// ── ALTER FUNCTION, SQL-function inlining in index expressions ──────────────
+
+#[test]
+fn alter_function_volatility_is_applied() {
+    // PG 18: after ALTER FUNCTION ... IMMUTABLE the index is accepted; after
+    // ... VOLATILE it's rejected again.
+    build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int);
+         CREATE FUNCTION f(a int) RETURNS int LANGUAGE plpgsql AS $$ BEGIN RETURN a; END $$;
+         ALTER FUNCTION f(int) IMMUTABLE;
+         CREATE INDEX ON t (f(a));
+         ALTER FUNCTION f STABLE;",
+    )]);
+    let err = try_apply(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int);
+         CREATE FUNCTION f(a int) RETURNS int LANGUAGE plpgsql IMMUTABLE AS $$ BEGIN RETURN a; END $$;
+         ALTER FUNCTION f(int) VOLATILE;
+         CREATE INDEX ON t ((f(a) + 1));",
+    )])
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("functions in index expression must be marked IMMUTABLE"),
+        "{err}"
+    );
+    assert_ddl_err!(
+        try_apply(&[("0001.sql", "ALTER FUNCTION nosuch(int) IMMUTABLE;")]),
+        DdlError::TypeNotFound(_),
+        "function nosuch(integer) does not exist",
+    );
+}
+
+#[test]
+fn inlinable_sql_functions_are_judged_by_their_body() {
+    // PG 18: `select a` inlines to a plain column (accepted even though the
+    // function is VOLATILE); `select random()` stays volatile.
+    build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int);
+         CREATE FUNCTION g(a int) RETURNS int LANGUAGE sql AS 'select a';
+         CREATE INDEX ON t (g(a));",
+    )]);
+    let err = try_apply(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int);
+         CREATE FUNCTION h(a int) RETURNS float8 LANGUAGE sql AS 'select random()';
+         CREATE INDEX ON t (h(a));",
+    )])
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("functions in index expression must be marked IMMUTABLE"),
+        "{err}"
+    );
+}

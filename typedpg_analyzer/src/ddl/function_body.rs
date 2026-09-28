@@ -407,3 +407,54 @@ fn names_collide_with_columns(interp: &PgCatalog, sql: &str, named: &[(String, u
             })
     })
 }
+
+/// The expression an inlinable `LANGUAGE sql` function stands for
+/// (`inline_function`, optimizer/util/clauses.c): a non-set-returning
+/// function whose body is a single `SELECT expr` — no FROM, WHERE,
+/// grouping, ordering, limit, set operation or CTE — or `RETURN expr`.
+pub(crate) fn inlinable_body(stmt: &CreateFunctionStmt, proc: &PgProc) -> Option<protobuf::Node> {
+    if !language_is_sql(stmt) || proc.proretset {
+        return None;
+    }
+    if let Some(body) = stmt.sql_body.as_deref() {
+        return match body.node.as_ref()? {
+            node::Node::ReturnStmt(r) => r.returnval.as_deref().cloned(),
+            node::Node::List(l) if l.items.len() == 1 => match l.items[0].node.as_ref()? {
+                node::Node::ReturnStmt(r) => r.returnval.as_deref().cloned(),
+                _ => None,
+            },
+            _ => None,
+        };
+    }
+    let (statements, _) = body_statements(stmt).ok()??;
+    let [source] = statements.as_slice() else {
+        return None;
+    };
+    let parsed = pg_query::parse(source).ok()?;
+    let [raw] = parsed.protobuf.stmts.as_slice() else {
+        return None;
+    };
+    let node::Node::SelectStmt(sel) = raw.stmt.as_ref()?.node.as_ref()? else {
+        return None;
+    };
+    let simple = sel.from_clause.is_empty()
+        && sel.where_clause.is_none()
+        && sel.group_clause.is_empty()
+        && sel.having_clause.is_none()
+        && sel.sort_clause.is_empty()
+        && sel.limit_count.is_none()
+        && sel.limit_offset.is_none()
+        && sel.distinct_clause.is_empty()
+        && sel.window_clause.is_empty()
+        && sel.with_clause.is_none()
+        && sel.values_lists.is_empty()
+        && sel.larg.is_none()
+        && sel.target_list.len() == 1;
+    if !simple {
+        return None;
+    }
+    match sel.target_list[0].node.as_ref()? {
+        node::Node::ResTarget(rt) => rt.val.as_deref().cloned(),
+        _ => None,
+    }
+}

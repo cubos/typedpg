@@ -209,6 +209,11 @@ pub struct PgCatalog {
     pub(crate) attr_default_types: HashMap<(PgClassOid, i16), PgTypeOid>,
     /// The `check_function_bodies` GUC (pg_dump output turns it off).
     pub(crate) check_function_bodies: bool,
+    /// The single expression of each inlinable `LANGUAGE sql` function
+    /// (`SELECT expr` / `RETURN expr`, as `inline_function` requires),
+    /// which PG substitutes for the call before checking an index or
+    /// generation expression's mutability.
+    pub(crate) inline_sql_bodies: HashMap<PgProcOid, pg_query::protobuf::Node>,
     next_oid: std::num::NonZeroU32,
 
     /// Lazy-initialized PG sanity mirror used by the `pg_sanity` feature to
@@ -442,6 +447,7 @@ impl PgCatalog {
             domain_constraints: HashMap::new(),
             attr_default_types: HashMap::new(),
             check_function_bodies: true,
+            inline_sql_bodies: HashMap::new(),
             next_oid: USER_OID_START_NZ,
             #[cfg(feature = "pg_sanity")]
             pg_sanity: None,
@@ -1072,6 +1078,7 @@ impl PgCatalog {
     }
 
     pub(crate) fn remove_pg_proc(&mut self, oid: PgProcOid) -> Option<PgProc> {
+        self.inline_sql_bodies.remove(&oid);
         let row = self.pg_proc.remove(&oid)?;
         if let Some(v) = self
             .proc_by_qname

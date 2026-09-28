@@ -503,7 +503,7 @@ fn set_type_schema(
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 /// Extract `(schema_opt, name, arg_oids)` from an `ObjectWithArgs` target.
-fn extract_func_target(
+pub(crate) fn extract_func_target(
     object: &Option<Box<pg_query::protobuf::Node>>,
     interp: &PgCatalog,
 ) -> Option<(Option<String>, String, Vec<PgTypeOid>)> {
@@ -537,7 +537,7 @@ fn extract_func_target(
 
 /// Resolve `(nspoid, oid)` of a `pg_proc` row matching `predicate`, walking
 /// the search path when `schema` is `None`.
-fn find_proc(
+pub(crate) fn find_proc(
     snapshot: &PgCatalog,
     schema: Option<&str>,
     name: &str,

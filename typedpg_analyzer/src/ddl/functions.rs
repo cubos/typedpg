@@ -236,6 +236,9 @@ pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Res
         provolatile,
     };
     interp.insert_pg_proc(proc.clone());
+    if let Some(body) = super::function_body::inlinable_body(stmt, &proc) {
+        interp.inline_sql_bodies.insert(oid, body);
+    }
     // fmgr_sql_validator: the body is checked with the function already in
     // the catalog, so a recursive SQL function resolves.
     super::function_body::validate_sql_function(interp, stmt, &proc)?;
@@ -257,4 +260,60 @@ fn function_language(stmt: &CreateFunctionStmt) -> Option<String> {
         };
         Some(s.sval.to_ascii_lowercase())
     })
+}
+
+/// `ALTER FUNCTION / PROCEDURE name[(args)] action ...`
+/// (`AlterFunction`, functioncmds.c): the volatility and strictness
+/// actions update the pg_proc row; the rest (cost, security, SET ...) don't
+/// affect static analysis.
+pub fn alter_function(
+    interp: &mut PgCatalog,
+    stmt: &pg_query::protobuf::AlterFunctionStmt,
+) -> Result<(), DdlError> {
+    let Some(func) = stmt.func.as_ref() else {
+        return Ok(());
+    };
+    let object = Some(Box::new(pg_query::protobuf::Node {
+        node: Some(node::Node::ObjectWithArgs(func.clone())),
+    }));
+    let Some((schema, name, arg_oids)) = super::alter::extract_func_target(&object, interp) else {
+        return Ok(());
+    };
+    // Without an argument list the name must be unique.
+    let any_args = func.args_unspecified;
+    let matches = |p: &PgProc| any_args || p.proargtypes == arg_oids;
+    let Some((_, oid)) = super::alter::find_proc(interp, schema.as_deref(), &name, &matches) else {
+        let args = arg_oids
+            .iter()
+            .map(|&t| super::util::format_type_for_message(interp, t))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(DdlError::TypeNotFound(if any_args {
+            format!("could not find a function named \"{name}\"")
+        } else {
+            format!("function {name}({args}) does not exist")
+        }));
+    };
+    let Some(proc) = interp.pg_proc.get_mut(&oid) else {
+        return Ok(());
+    };
+    for action in &stmt.actions {
+        let Some(node::Node::DefElem(de)) = action.node.as_ref() else {
+            continue;
+        };
+        let arg = de.arg.as_deref().and_then(|a| a.node.as_ref());
+        match (de.defname.as_str(), arg) {
+            ("volatility", Some(node::Node::String(v))) => {
+                proc.provolatile = match v.sval.as_str() {
+                    "immutable" => crate::pg_catalog::ProVolatile::Immutable,
+                    "stable" => crate::pg_catalog::ProVolatile::Stable,
+                    _ => crate::pg_catalog::ProVolatile::Volatile,
+                };
+            }
+            ("strict", Some(node::Node::Boolean(b))) => proc.proisstrict = b.boolval,
+            ("strict", Some(node::Node::Integer(i))) => proc.proisstrict = i.ival != 0,
+            _ => {}
+        }
+    }
+    Ok(())
 }

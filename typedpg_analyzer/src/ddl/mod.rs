@@ -146,6 +146,7 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
 
         // ── Functions ───────────────────────────────────────────────
         node::Node::CreateFunctionStmt(s) => functions::create_function(db, s),
+        node::Node::AlterFunctionStmt(s) => functions::alter_function(db, s),
 
         // ── Views ───────────────────────────────────────────────────
         node::Node::ViewStmt(s) => views::create_view(db, s),
@@ -215,7 +216,6 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         | node::Node::VariableShowStmt(_)
         | node::Node::DiscardStmt(_)
         | node::Node::ExplainStmt(_)
-        | node::Node::AlterFunctionStmt(_)
         | node::Node::NotifyStmt(_)
         | node::Node::ListenStmt(_)
         | node::Node::UnlistenStmt(_)

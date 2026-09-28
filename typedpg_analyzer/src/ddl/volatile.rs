@@ -36,16 +36,23 @@ fn funcname_parts(funcname: &[protobuf::Node]) -> Option<(Option<&str>, &str)> {
 }
 
 /// Returns the volatility of a `FuncCall` by resolving it against
-/// `pg_proc` (any overload — provolatile is per-name in our scope).
-/// `None` if the call doesn't resolve to a known function.
-fn funcall_volatility(fc: &protobuf::FuncCall, snapshot: &PgCatalog) -> Option<ProVolatile> {
+/// `pg_proc` (any overload — provolatile is per-name in our scope), and the
+/// body PG would inline in its place, if any. `None` if the call doesn't
+/// resolve to a known function.
+fn funcall_volatility<'a>(
+    fc: &protobuf::FuncCall,
+    snapshot: &'a PgCatalog,
+) -> Option<(ProVolatile, Option<&'a protobuf::Node>)> {
     let (schema, name) = funcname_parts(&fc.funcname)?;
     snapshot
         .find_functions(schema, name)
         .into_iter()
         .next()
-        .map(|p| p.provolatile)
+        .map(|p| (p.provolatile, snapshot.inline_sql_bodies.get(&p.oid)))
 }
+
+/// Inlining depth cap: PG refuses to inline a function into itself.
+const MAX_INLINE_DEPTH: usize = 16;
 
 /// Walk `node` and return `Err` if any `FuncCall` resolves to a function
 /// marked `VOLATILE`. `location` selects PG's wording for that context.
@@ -54,7 +61,7 @@ pub(super) fn check_no_volatile(
     location: ExprLocation,
     snapshot: &PgCatalog,
 ) -> Result<(), DdlError> {
-    walk(node, location, snapshot)
+    walk(node, location, snapshot, 0)
 }
 
 #[derive(Clone, Copy)]
@@ -78,20 +85,34 @@ impl ExprLocation {
     }
 }
 
-fn walk(node: &protobuf::Node, loc: ExprLocation, snapshot: &PgCatalog) -> Result<(), DdlError> {
+fn walk(
+    node: &protobuf::Node,
+    loc: ExprLocation,
+    snapshot: &PgCatalog,
+    depth: usize,
+) -> Result<(), DdlError> {
+    let walk =
+        |n: &protobuf::Node, loc: ExprLocation, snapshot: &PgCatalog| walk(n, loc, snapshot, depth);
     let Some(inner) = node.node.as_ref() else {
         return Ok(());
     };
     match inner {
         node::Node::FuncCall(fc) => {
-            if matches!(
-                funcall_volatility(fc, snapshot),
-                Some(ProVolatile::Volatile)
-            ) {
-                let name = funcname_parts(&fc.funcname)
-                    .map(|(_, n)| n.to_owned())
-                    .unwrap_or_else(|| "<unknown>".into());
-                return Err(loc.error(&name));
+            if let Some((ProVolatile::Volatile, inline)) = funcall_volatility(fc, snapshot) {
+                // expression_planner inlines a simple SQL function before
+                // CheckMutability looks at it (inline_function): what
+                // counts is the body's volatility, not the declaration's.
+                match inline {
+                    Some(body) if depth < MAX_INLINE_DEPTH => {
+                        self::walk(body, loc, snapshot, depth + 1)?;
+                    }
+                    _ => {
+                        let name = funcname_parts(&fc.funcname)
+                            .map(|(_, n)| n.to_owned())
+                            .unwrap_or_else(|| "<unknown>".into());
+                        return Err(loc.error(&name));
+                    }
+                }
             }
             for arg in &fc.args {
                 walk(arg, loc, snapshot)?;
