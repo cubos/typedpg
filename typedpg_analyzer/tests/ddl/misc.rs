@@ -2671,3 +2671,37 @@ fn configuration_parameters_are_validated() {
         ),
     ]);
 }
+
+#[test]
+fn drop_index_refuses_constraint_indexes() {
+    // PG 18 findDependentObjects: a constraint's index goes only with the
+    // constraint.
+    let setup = "CREATE TABLE t (a int PRIMARY KEY, b int UNIQUE, c int);
+                 CREATE UNIQUE INDEX tc ON t (c);";
+    for (stmt, msg) in [
+        (
+            "DROP INDEX t_pkey;",
+            "cannot drop index t_pkey because constraint t_pkey on table t requires it",
+        ),
+        (
+            "DROP INDEX t_b_key;",
+            "cannot drop index t_b_key because constraint t_b_key on table t requires it",
+        ),
+        (
+            "ALTER TABLE t ADD CONSTRAINT tc UNIQUE USING INDEX tc; DROP INDEX tc;",
+            "cannot drop index tc because constraint tc on table t requires it",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "DROP INDEX tc;
+             ALTER TABLE t DROP CONSTRAINT t_b_key;
+             ALTER TABLE t DROP CONSTRAINT t_pkey;",
+        ),
+    ]);
+}

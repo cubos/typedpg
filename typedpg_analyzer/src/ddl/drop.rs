@@ -422,6 +422,29 @@ fn drop_index(
              index {parent_name} instead.)"
         )));
     }
+    // An index backing a constraint goes only with the constraint.
+    if let Some(table) = interp.pg_index.get(&class_oid).map(|i| i.indrelid)
+        && interp.pg_constraint.values().any(|c| {
+            c.conrelid == table
+                && c.conname == name
+                && matches!(
+                    c.contype,
+                    crate::pg_catalog::ConType::PrimaryKey
+                        | crate::pg_catalog::ConType::Unique
+                        | crate::pg_catalog::ConType::Exclusion
+                )
+        })
+    {
+        let table_name = interp
+            .pg_class
+            .get(&table)
+            .map(|c| c.relname.clone())
+            .unwrap_or_default();
+        return Err(DdlError::DependencyError(format!(
+            "cannot drop index {name} because constraint {name} on table {table_name} requires \
+             it (You can drop constraint {name} on table {table_name} instead.)"
+        )));
+    }
     for child in crate::ddl::tables::partidx::child_indexes(interp, class_oid) {
         interp.remove_pg_index(child);
         interp.remove_pg_class(child);
