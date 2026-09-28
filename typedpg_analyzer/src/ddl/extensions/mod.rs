@@ -66,9 +66,12 @@ pub fn create_extension(
         .iter()
         .find(|e| e.name == name.as_str())
         .ok_or_else(|| {
+            // PG (parse_extension_control_file): `extension "x" is not
+            // available`. The analyzer only knows the extensions bundled
+            // for static analysis, so say how to add one.
             DdlError::ExtensionError(format!(
-                "unknown extension '{name}': add a SQL file to typedpg_analyzer/src/extensions/ \
-                 to register it for static analysis"
+                "extension \"{name}\" is not available (unknown to the analyzer: add its SQL \
+                 script to typedpg_analyzer/src/extensions/ to register it for static analysis)"
             ))
         })?;
 

@@ -282,7 +282,7 @@ fn extension_unknown_is_error() {
     assert_ddl_err!(
         result,
         DdlError::ExtensionError(_),
-        "unknown extension 'some_unknown_ext': add a SQL file to typedpg_analyzer/src/extensions/ to register it for static analysis"
+        "extension \"some_unknown_ext\" is not available (unknown to the analyzer: add its SQL script to typedpg_analyzer/src/extensions/ to register it for static analysis)"
     );
 }
 
