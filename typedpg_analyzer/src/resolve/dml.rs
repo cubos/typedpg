@@ -35,18 +35,21 @@ pub(crate) fn analyze_insert_with_outer_ctes(
         && let Some(node::Node::SelectStmt(val_sel)) = select_node.node.as_ref()
     {
         if !val_sel.values_lists.is_empty() {
-            analyze_insert_values(ins, val_sel, &tgt, snapshot, params)?;
+            analyze_insert_values(ins, val_sel, &tgt, snapshot, params, &cte_scopes)?;
         } else {
             analyze_insert_select(val_sel, &tgt, snapshot, params, &cte_scopes)?;
         }
     }
 
     if let Some(on_conflict) = &ins.on_conflict_clause {
-        analyze_insert_on_conflict(on_conflict, relation, &tgt, snapshot, params)?;
+        analyze_insert_on_conflict(on_conflict, relation, &tgt, snapshot, params, &cte_scopes)?;
     }
 
     // Resolve RETURNING list.
-    let mut ret_scope = Scope::default();
+    let mut ret_scope = Scope {
+        ctes: cte_scopes.clone(),
+        ..Scope::default()
+    };
     let ret_null_ctx = NullabilityContext::default();
     ret_scope.add_dml_target(
         snapshot,
@@ -207,10 +210,14 @@ fn analyze_insert_values(
     tgt: &InsertTarget,
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
+    cte_scopes: &HashMap<String, Vec<ScopeColumn>>,
 ) -> Result<(), AnalyzeError> {
     // No table in scope for VALUES, but we need scope for possible
     // subqueries/functions inside an individual value expression.
-    let scope = Scope::default();
+    let scope = Scope {
+        ctes: cte_scopes.clone(),
+        ..Scope::default()
+    };
     let null_ctx = NullabilityContext::default();
     let expected_len = insert_arity(tgt);
 
@@ -443,6 +450,7 @@ fn analyze_insert_on_conflict(
     tgt: &InsertTarget,
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
+    cte_scopes: &HashMap<String, Vec<ScopeColumn>>,
 ) -> Result<(), AnalyzeError> {
     // Validate the conflict target (`ON CONFLICT (cols)` / `ON CONFLICT ON
     // CONSTRAINT name`) against pg_constraint. PG rejects targets that don't
@@ -450,7 +458,10 @@ fn analyze_insert_on_conflict(
     // accepts any column.
     validate_on_conflict_target(on_conflict, snapshot, tgt.oid, &tgt.relname)?;
 
-    let mut conflict_scope = Scope::default();
+    let mut conflict_scope = Scope {
+        ctes: cte_scopes.clone(),
+        ..Scope::default()
+    };
     let target_qn = crate::qualified_name::QualifiedName::new(&tgt.nsname, &tgt.relname);
     conflict_scope.add_dml_target(snapshot, &relation.relname, target_qn.clone(), &tgt.attrs);
     conflict_scope.add_dml_target(snapshot, "excluded", target_qn, &tgt.attrs);
@@ -505,6 +516,17 @@ pub(crate) fn analyze_update(
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
 ) -> AnalyzeResult {
+    analyze_update_with_outer_ctes(upd, snapshot, params, &HashMap::new())
+}
+
+/// [`analyze_update`] for an UPDATE that sees the CTEs of an enclosing
+/// `WITH` (a data-modifying CTE body).
+pub(crate) fn analyze_update_with_outer_ctes(
+    upd: &protobuf::UpdateStmt,
+    snapshot: &PgCatalog,
+    params: &mut ParamCollector,
+    outer_ctes: &HashMap<String, Vec<ScopeColumn>>,
+) -> AnalyzeResult {
     let relation = upd
         .relation
         .as_ref()
@@ -543,7 +565,7 @@ pub(crate) fn analyze_update(
     // Walk `UPDATE … WITH (cte) …` so parameters inside the CTE are seen by
     // the collector and the CTE alias is visible to the FROM clause. Same
     // reasoning as the corresponding block in `analyze_insert`.
-    let mut cte_scopes: HashMap<String, Vec<ScopeColumn>> = HashMap::new();
+    let mut cte_scopes: HashMap<String, Vec<ScopeColumn>> = outer_ctes.clone();
     if let Some(with) = &upd.with_clause {
         for cte_node in &with.ctes {
             if let Some(node::Node::CommonTableExpr(cte)) = cte_node.node.as_ref() {
@@ -554,7 +576,10 @@ pub(crate) fn analyze_update(
     }
 
     // Build scope with target table + FROM clause tables.
-    let mut scope = Scope::default();
+    let mut scope = Scope {
+        ctes: cte_scopes.clone(),
+        ..Scope::default()
+    };
     let mut null_ctx = NullabilityContext::default();
     let alias = relation
         .alias
@@ -674,6 +699,17 @@ pub(crate) fn analyze_delete(
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
 ) -> AnalyzeResult {
+    analyze_delete_with_outer_ctes(del, snapshot, params, &HashMap::new())
+}
+
+/// [`analyze_delete`] for a DELETE that sees the CTEs of an enclosing
+/// `WITH` (a data-modifying CTE body).
+pub(crate) fn analyze_delete_with_outer_ctes(
+    del: &protobuf::DeleteStmt,
+    snapshot: &PgCatalog,
+    params: &mut ParamCollector,
+    outer_ctes: &HashMap<String, Vec<ScopeColumn>>,
+) -> AnalyzeResult {
     let relation = del
         .relation
         .as_ref()
@@ -710,7 +746,7 @@ pub(crate) fn analyze_delete(
 
     // Walk `DELETE … WITH (cte) …` so parameters inside the CTE register
     // with the collector and the CTE alias is visible to the USING clause.
-    let mut cte_scopes: HashMap<String, Vec<ScopeColumn>> = HashMap::new();
+    let mut cte_scopes: HashMap<String, Vec<ScopeColumn>> = outer_ctes.clone();
     if let Some(with) = &del.with_clause {
         for cte_node in &with.ctes {
             if let Some(node::Node::CommonTableExpr(cte)) = cte_node.node.as_ref() {
@@ -720,7 +756,10 @@ pub(crate) fn analyze_delete(
         }
     }
 
-    let mut scope = Scope::default();
+    let mut scope = Scope {
+        ctes: cte_scopes.clone(),
+        ..Scope::default()
+    };
     let mut null_ctx = NullabilityContext::default();
     let alias = relation
         .alias

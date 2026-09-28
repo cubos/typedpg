@@ -692,6 +692,7 @@ fn srf_arg_scope(scope: &Scope) -> Scope {
         .lateral_sources
         .extend(scope.lateral_sources.clone());
     arg_scope.outer_sources.extend(scope.outer_sources.clone());
+    arg_scope.ctes = scope.ctes.clone();
     arg_scope
 }
 

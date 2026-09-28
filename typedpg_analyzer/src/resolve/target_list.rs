@@ -126,6 +126,7 @@ pub(crate) fn analyze_values_lists(
     values_lists: &[protobuf::Node],
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
+    ctes: &HashMap<String, Vec<ScopeColumn>>,
 ) -> Result<Vec<RawColumn>, AnalyzeError> {
     // Each entry in `values_lists` is a `List` of per-column expressions for
     // one row. An empty VALUES list would be a grammar error in PG, but we
@@ -139,7 +140,10 @@ pub(crate) fn analyze_values_lists(
         .ok_or_else(|| AnalyzeError::Unsupported("empty VALUES list".into()))?;
 
     let arity = first.items.len();
-    let empty_scope = Scope::default();
+    let empty_scope = Scope {
+        ctes: ctes.clone(),
+        ..Scope::default()
+    };
     let empty_null = NullabilityContext::default();
 
     let mut column_types: Vec<Vec<PgTypeOid>> = vec![Vec::new(); arity];

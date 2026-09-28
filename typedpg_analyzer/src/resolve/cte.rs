@@ -147,7 +147,7 @@ pub(crate) fn analyze_cte(
                 .collect())
         }
         node::Node::UpdateStmt(upd) => {
-            let (cols, _) = analyze_update(upd, snapshot, params)?;
+            let (cols, _) = analyze_update_with_outer_ctes(upd, snapshot, params, existing_ctes)?;
             Ok(cols
                 .into_iter()
                 .map(|rc| ScopeColumn {
@@ -162,7 +162,7 @@ pub(crate) fn analyze_cte(
                 .collect())
         }
         node::Node::DeleteStmt(del) => {
-            let (cols, _) = analyze_delete(del, snapshot, params)?;
+            let (cols, _) = analyze_delete_with_outer_ctes(del, snapshot, params, existing_ctes)?;
             Ok(cols
                 .into_iter()
                 .map(|rc| ScopeColumn {

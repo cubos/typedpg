@@ -143,6 +143,10 @@ pub(crate) struct Scope {
     /// being processed: a LATERAL item there sees them only as
     /// [`TableSource::lateral_blocked`] entries.
     pub lateral_blocked_aliases: std::collections::HashSet<String>,
+    /// CTEs visible at this query level (its own WITH plus the enclosing
+    /// ones). Sublinks and nested subqueries inherit them — PG resolves a
+    /// CTE name by walking up the parse-state chain (`scanNameSpaceForCTE`).
+    pub ctes: std::collections::HashMap<String, Vec<ScopeColumn>>,
 }
 
 /// Build the public-facing `UndefinedTable` error for a missing relation,

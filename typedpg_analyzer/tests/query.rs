@@ -16,6 +16,8 @@ mod common;
 mod aggregates;
 #[path = "query/casts_and_coercion.rs"]
 mod casts_and_coercion;
+#[path = "query/cte_rules.rs"]
+mod cte_rules;
 #[path = "query/ctes.rs"]
 mod ctes;
 #[path = "query/dml.rs"]

@@ -107,9 +107,15 @@ pub(crate) fn analyze_merge_with_outer_ctes(
     }
 
     // The target alone, and the source's FROM item alone.
-    let mut target_scope = Scope::default();
+    let mut target_scope = Scope {
+        ctes: cte_scopes.clone(),
+        ..Scope::default()
+    };
     target_scope.add_dml_target(snapshot, &target_alias, target_qn.clone(), &table_attrs);
-    let mut source_scope = Scope::default();
+    let mut source_scope = Scope {
+        ctes: cte_scopes.clone(),
+        ..Scope::default()
+    };
     let mut null_ctx = NullabilityContext::default();
     if let Some(source_relation) = &merge.source_relation {
         process_from_item(

@@ -32,7 +32,7 @@ pub(crate) fn analyze_correlated_select(
         .chain(outer_scope.lateral_sources.iter())
         .cloned()
         .collect();
-    analyze_select_with_ctes_and_outer(sel, snapshot, params, &HashMap::new(), &[], &outer, &[])
+    analyze_select_with_ctes_and_outer(sel, snapshot, params, &outer_scope.ctes, &[], &outer, &[])
 }
 
 pub(crate) fn analyze_select_with_ctes(
@@ -93,12 +93,15 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
     // at the RangeSubselect that wraps the VALUES.
     if !sel.values_lists.is_empty() {
         return Ok((
-            analyze_values_lists(&sel.values_lists, snapshot, params)?,
+            analyze_values_lists(&sel.values_lists, snapshot, params, &cte_scopes)?,
             None,
         ));
     }
 
-    let mut scope = Scope::default();
+    let mut scope = Scope {
+        ctes: cte_scopes.clone(),
+        ..Scope::default()
+    };
     // LATERAL: outer aliases resolve like outer references — the subquery's
     // own FROM wins first, they're excluded from `*` expansion, and two
     // lateral sources sharing a column name are ambiguous among themselves
