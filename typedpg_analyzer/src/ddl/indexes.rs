@@ -50,6 +50,23 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
 
     if let Some(pred) = stmt.where_clause.as_deref() {
         super::expr_kind::check_expr_kind(db, pred, super::expr_kind::ExprKind::IndexPredicate)?;
+        // transformWhereClause: a boolean over the table's row.
+        match super::volatile::infer_over_relation(db, indrelid, pred, None) {
+            Some(Err(e)) => return Err(DdlError::UnsupportedDdl(e.to_string())),
+            Some(Ok(t))
+                if t.type_oid != crate::pg_catalog::oid::BOOL
+                    && t.type_oid != crate::pg_catalog::oid::UNKNOWN =>
+            {
+                return Err(DdlError::UnsupportedDdl(format!(
+                    "argument of WHERE must be type boolean, not type {}",
+                    super::util::format_type_for_message(db, t.type_oid)
+                )));
+            }
+            _ => {}
+        }
+        // CheckPredicate: every function must be IMMUTABLE.
+        check_no_volatile(pred, ExprLocation::IndexPredicate, db)?;
+        super::volatile::check_mutability(db, indrelid, pred, ExprLocation::IndexPredicate)?;
     }
 
     // ── Mutability check on expression indexes (ComputeIndexAttrs) ──
@@ -63,6 +80,10 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
                 expr,
                 super::expr_kind::ExprKind::IndexExpression,
             )?;
+            // transformIndexStmt: the expression is analyzed over the row.
+            if let Some(Err(e)) = super::volatile::infer_over_relation(db, indrelid, expr, None) {
+                return Err(DdlError::UnsupportedDdl(e.to_string()));
+            }
             check_no_volatile(expr, ExprLocation::Index, db)?;
             super::volatile::check_mutability(db, indrelid, expr, ExprLocation::Index)?;
         }

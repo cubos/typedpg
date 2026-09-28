@@ -84,26 +84,21 @@ pub(super) fn check_no_volatile(
     walk(node, location, snapshot, 0)
 }
 
-/// `CheckMutability` over the *typed* expression: analyze `expr` over the
-/// row of `relid`, recording every function it runs — called directly,
-/// through an operator or through an explicit cast — and fail on the first
-/// one that isn't IMMUTABLE. A simple SQL function counts by its inlined
-/// body (checked with the name-based walk). Analysis errors are left to the
-/// expression's own validation.
-pub(super) fn check_mutability(
+/// Analyze `expr` with the row of `relid` in scope — the way PG
+/// transforms CHECK, index, generation and policy expressions — optionally
+/// recording the functions it runs. `None` if the relation is unknown.
+pub(crate) fn infer_over_relation(
     interp: &PgCatalog,
     relid: crate::oid::PgClassOid,
     expr: &protobuf::Node,
-    loc: ExprLocation,
-) -> Result<(), DdlError> {
+    used: Option<&std::cell::RefCell<Vec<crate::oid::PgProcOid>>>,
+) -> Option<Result<crate::expr::ExprType, crate::error::AnalyzeError>> {
     use crate::expr::{TypeGoal, infer_expr};
     use crate::nullability::NullabilityContext;
     use crate::param_collector::ParamCollector;
     use crate::scope::Scope;
 
-    let Some(class) = interp.pg_class.get(&relid) else {
-        return Ok(());
-    };
+    let class = interp.pg_class.get(&relid)?;
     let nspname = interp
         .namespace_name(class.relnamespace)
         .unwrap_or("public")
@@ -118,9 +113,30 @@ pub(super) fn check_mutability(
     );
     let null_ctx = NullabilityContext::default();
     let mut params = ParamCollector::default();
+    let mut ctx = crate::expr::Ctx::new(&scope, &null_ctx, interp);
+    if let Some(used) = used {
+        ctx = ctx.recording(used);
+    }
+    Some(infer_expr(expr, ctx, &mut params, TypeGoal::NONE))
+}
+
+/// `CheckMutability` over the *typed* expression: analyze `expr` over the
+/// row of `relid`, recording every function it runs — called directly,
+/// through an operator or through an explicit cast — and fail on the first
+/// one that isn't IMMUTABLE. A simple SQL function counts by its inlined
+/// body (checked with the name-based walk). Analysis errors are left to the
+/// expression's own validation.
+pub(super) fn check_mutability(
+    interp: &PgCatalog,
+    relid: crate::oid::PgClassOid,
+    expr: &protobuf::Node,
+    loc: ExprLocation,
+) -> Result<(), DdlError> {
     let used = std::cell::RefCell::new(Vec::new());
-    let ctx = crate::expr::Ctx::new(&scope, &null_ctx, interp).recording(&used);
-    if infer_expr(expr, ctx, &mut params, TypeGoal::NONE).is_err() {
+    if !matches!(
+        infer_over_relation(interp, relid, expr, Some(&used)),
+        Some(Ok(_))
+    ) {
         return Ok(());
     }
     for oid in used.into_inner() {
@@ -142,6 +158,8 @@ pub(super) fn check_mutability(
 pub(super) enum ExprLocation {
     Generated,
     Index,
+    /// CheckPredicate.
+    IndexPredicate,
 }
 
 impl ExprLocation {
@@ -150,6 +168,10 @@ impl ExprLocation {
             ExprLocation::Generated => DdlError::UnsupportedDdl(format!(
                 "generation expression is not immutable: \
                  function \"{fname}\" must be marked IMMUTABLE"
+            )),
+            ExprLocation::IndexPredicate => DdlError::UnsupportedDdl(format!(
+                "functions in index predicate must be marked IMMUTABLE \
+                 (function \"{fname}\" is not)"
             )),
             ExprLocation::Index => DdlError::UnsupportedDdl(format!(
                 "functions in index expression must be marked IMMUTABLE \

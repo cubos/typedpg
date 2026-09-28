@@ -540,3 +540,45 @@ fn builtin_sql_functions_count_by_their_inlined_body() {
          CREATE INDEX ON t ((1 || a::text));",
     )]);
 }
+
+#[test]
+fn index_expressions_and_predicates_are_analyzed() {
+    // PG 18 DefineIndex: the predicate is transformed as a boolean WHERE
+    // over the table's row, then CheckPredicate requires it to be
+    // IMMUTABLE; index expressions resolve their columns.
+    let setup = "CREATE TABLE t (a int);";
+    for (stmt, msg) in [
+        (
+            "CREATE INDEX ON t (a) WHERE a;",
+            "argument of WHERE must be type boolean, not type integer",
+        ),
+        (
+            "CREATE INDEX ON t (a) WHERE nosuch > 0;",
+            "column \"nosuch\" does not exist",
+        ),
+        (
+            "CREATE INDEX ON t (a) WHERE random() > 0.5;",
+            "functions in index predicate must be marked IMMUTABLE",
+        ),
+        (
+            "CREATE INDEX ON t (a) WHERE now() > '2020-01-01';",
+            "functions in index predicate must be marked IMMUTABLE",
+        ),
+        (
+            "CREATE INDEX ON t ((a + nosuch));",
+            "column \"nosuch\" does not exist",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "CREATE INDEX ON t (a) WHERE a > 0;
+             CREATE INDEX ON t ((a::text || 1));
+             CREATE INDEX ON t (a) WHERE t.a IS NOT NULL;",
+        ),
+    ]);
+}
