@@ -25,6 +25,10 @@ pub(crate) struct NullabilityContext {
     /// `ROLLUP(...)` and `CUBE(...)` always include the empty set; explicit
     /// `GROUPING SETS (..., ())` does too.
     pub has_empty_grouping_set: bool,
+    /// The select list holds more than one set-returning function call.
+    /// PG evaluates them in lockstep (`ProjectSet`) and pads the ones that
+    /// run out of rows first with NULL, so every SRF result is nullable.
+    pub srfs_in_lockstep: bool,
 }
 
 impl NullabilityContext {

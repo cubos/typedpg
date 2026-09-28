@@ -566,6 +566,7 @@ mod select;
 mod set_ops;
 mod target_list;
 mod type_resolution;
+mod walk;
 
 // Re-export submodule items at the `resolve` path so intra-crate callers
 // (e.g. `crate::resolve::analyze_correlated_select`) and the dispatcher in
@@ -579,3 +580,4 @@ pub(crate) use select::*;
 pub(crate) use set_ops::*;
 pub(crate) use target_list::*;
 pub(crate) use type_resolution::*;
+pub(crate) use walk::*;

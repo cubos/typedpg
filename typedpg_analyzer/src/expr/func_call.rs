@@ -22,9 +22,7 @@ pub(crate) fn infer_func_call(
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<ExprType, AnalyzeError> {
-    let Ctx {
-        null_ctx, snapshot, ..
-    } = ctx;
+    let Ctx { snapshot, .. } = ctx;
     let func_name_parts = extract_string_fields(&func.funcname);
     let (schema, name) = match func_name_parts.as_slice() {
         [name] => (None, name.as_str()),
@@ -130,7 +128,7 @@ pub(crate) fn infer_func_call(
     // are inferred and validated.
     walk_func_modifiers(func, ctx, params)?;
 
-    let nullable = resolve_func_nullability(func, name, &resolved, null_ctx, &args);
+    let nullable = resolve_func_nullability(func, name, &resolved, ctx, params, &args);
 
     // SRFs / OUT-arg functions carry a static row shape — propagate it as
     // `record_fields` so downstream `(call(...)).field` / `(scope_col).field`
@@ -1022,9 +1020,11 @@ fn resolve_func_nullability(
     func: &protobuf::FuncCall,
     name: &str,
     resolved: &functions::ResolvedFunction,
-    null_ctx: &NullabilityContext,
+    ctx: Ctx<'_>,
+    params: &ParamCollector,
     args: &FuncArgs,
 ) -> bool {
+    let null_ctx = ctx.null_ctx;
     let arg_is_nullable = |i: usize| args.nullable.get(i).copied().unwrap_or(false);
 
     // Value window functions (`lag`/`lead`/`first_value`/`last_value`/
@@ -1040,7 +1040,15 @@ fn resolve_func_nullability(
             "lag" | "lead" | "first_value" | "last_value" | "nth_value"
         );
 
-    if is_value_window {
+    if resolved.is_set_returning && null_ctx.srfs_in_lockstep {
+        // Several select-list SRFs run in lockstep; the shorter ones are
+        // padded with NULL (see `NullabilityContext::srfs_in_lockstep`).
+        true
+    } else if let Some(nullable) =
+        crate::resolve::srf_elements_nullable(resolved, name, &func.args, ctx, params)
+    {
+        nullable
+    } else if is_value_window {
         match name {
             "lag" | "lead" if func.args.len() >= 3 => {
                 arg_is_nullable(0) || arg_is_nullable(1) || arg_is_nullable(2)

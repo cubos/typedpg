@@ -206,8 +206,9 @@ fn unnest_in_select_list_text() {
 fn unnest_in_select_list_int() {
     let db = setup();
     let s = db.analyze("SELECT unnest(nums) AS n FROM users").unwrap();
-    // `nums` is NOT NULL, so the per-element projection is NOT NULL too.
-    assert_cols(&s, vec![c("n", int4())]);
+    // `nums` is NOT NULL, but its elements may still be NULL (PG 18:
+    // `unnest('{1,NULL}'::int[]) IS NULL` is true for the second row).
+    assert_cols(&s, vec![cn("n", int4())]);
 }
 
 // ── Slice extras ─────────────────────────────────────────────────────────────
@@ -333,7 +334,8 @@ fn unnest_in_from_two_arrays_aligned() {
     let s = db
         .analyze("SELECT t.a, t.b FROM unnest(ARRAY[1, 2], ARRAY['x'::text, 'y']) AS t(a, b)")
         .unwrap();
-    assert_cols(&s, vec![c("a", int4()), c("b", text())]);
+    // PG pads the shorter array with NULL, so both columns are nullable.
+    assert_cols(&s, vec![cn("a", int4()), cn("b", text())]);
 }
 
 #[test]
@@ -374,7 +376,10 @@ fn unnest_in_from_three_arrays_aligned() {
              ) AS t(a, b, c)",
         )
         .unwrap();
-    assert_cols(&s, vec![c("a", int4()), c("b", text()), c("c", bool_ty())]);
+    assert_cols(
+        &s,
+        vec![cn("a", int4()), cn("b", text()), cn("c", bool_ty())],
+    );
 }
 
 #[test]
@@ -388,7 +393,7 @@ fn unnest_in_from_two_arrays_with_ordinality() {
              FROM unnest(ARRAY[1, 2], ARRAY['x'::text, 'y']) WITH ORDINALITY AS t(a, b, ord)",
         )
         .unwrap();
-    assert_cols(&s, vec![c("a", int4()), c("b", text()), c("ord", int8())]);
+    assert_cols(&s, vec![cn("a", int4()), cn("b", text()), c("ord", int8())]);
 }
 
 #[test]
@@ -396,15 +401,15 @@ fn unnest_in_from_two_columns_lateral() {
     let db = setup();
     // `unnest(u.tags, u.nums)` — both columns from the same outer row are
     // visible thanks to implicit LATERAL on function-call FROM items.
-    // `u.nums` is NOT NULL → column `n` stays NOT NULL; `u.tags` is nullable
-    // → column `t` is nullable.
+    // Both columns are nullable: the shorter array is padded with NULL,
+    // and even the NOT NULL `u.nums` may hold NULL elements.
     let s = db
         .analyze(
             "SELECT u.id, x.t, x.n \
              FROM users u, unnest(u.tags, u.nums) AS x(t, n)",
         )
         .unwrap();
-    assert_cols(&s, vec![c("id", int8()), cn("t", text()), c("n", int4())]);
+    assert_cols(&s, vec![c("id", int8()), cn("t", text()), cn("n", int4())]);
 }
 
 #[test]

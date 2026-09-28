@@ -82,6 +82,8 @@ pub(crate) struct ResolvedFunction {
     /// `lag`, …), which *requires* an OVER clause at the call site.
     pub is_window: bool,
     pub is_strict: bool,
+    /// `pg_proc.proretset` — the function returns a set (SRF).
+    pub is_set_returning: bool,
     /// Named output columns for SRFs / OUT-arg functions, derived from the
     /// matched `pg_proc`'s `proallargtypes`/`proargmodes`/`proargnames`.
     /// Empty for plain scalar returns.
@@ -317,6 +319,7 @@ pub(crate) fn func_get_detail(
         is_aggregate: matches!(f.prokind, ProKind::Aggregate),
         is_window: matches!(f.prokind, ProKind::Window),
         is_strict: f.proisstrict,
+        is_set_returning: f.proretset,
         out_args,
         signature: format!(
             "{}({})",

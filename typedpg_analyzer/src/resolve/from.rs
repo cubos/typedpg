@@ -161,7 +161,7 @@ pub(crate) fn process_from_item(
             }
         }
         node::Node::RangeFunction(rf) => {
-            process_range_function(rf, scope, snapshot, params)?;
+            process_range_function(rf, scope, null_ctx, snapshot, params)?;
         }
         node::Node::RangeTableSample(ts) => {
             // `TABLESAMPLE` only changes how rows are picked at runtime —
@@ -197,6 +197,7 @@ pub(crate) fn process_from_item(
 fn process_range_function(
     rf: &protobuf::RangeFunction,
     scope: &mut Scope,
+    null_ctx: &NullabilityContext,
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
 ) -> Result<(), AnalyzeError> {
@@ -259,7 +260,9 @@ fn process_range_function(
         })
         .unwrap_or_default();
 
-    let (arg_types, arg_nullable) = infer_srf_arg_types(rf, func_call, scope, snapshot, params)?;
+    let arg_scope = srf_arg_scope(scope);
+    let arg_ctx = expr::Ctx::new(&arg_scope, null_ctx, snapshot);
+    let (arg_types, arg_nullable) = infer_srf_arg_types(rf, func_call, arg_ctx, params)?;
     let any_arg_nullable = arg_nullable.iter().any(|&n| n);
 
     let (schema, name) = match func_name_parts.as_slice() {
@@ -278,7 +281,7 @@ fn process_range_function(
     // of its element type, aligned row-wise (zip with NULL-padding).
     let is_pg_unnest = (schema.is_none() || schema == Some("pg_catalog")) && name == "unnest";
     let mut cols: Vec<ScopeColumn> = if is_pg_unnest && arg_types.len() > 1 {
-        unnest_multi_arg_columns(&arg_types, &arg_nullable, alias, snapshot, func_call)?
+        unnest_multi_arg_columns(&arg_types, alias, snapshot, func_call)?
     } else {
         srf_function_columns(
             SrfCall { schema, name },
@@ -289,7 +292,8 @@ fn process_range_function(
             alias,
             rf,
             func_call,
-            snapshot,
+            arg_ctx,
+            params,
         )?
     };
 
@@ -569,6 +573,20 @@ fn apply_alias_column_names(
     Ok(())
 }
 
+/// The scope a FROM function's arguments are resolved in: every FROM item
+/// to its left (PG treats function RTEs as implicitly LATERAL), the lateral
+/// refs this level received, and the correlated outer sources.
+fn srf_arg_scope(scope: &Scope) -> Scope {
+    let mut arg_scope = Scope::default();
+    arg_scope.sources.extend(scope.sources.clone());
+    arg_scope
+        .lateral_sources
+        .extend(scope.lateral_sources.clone());
+    arg_scope.outer_sources.extend(scope.outer_sources.clone());
+    arg_scope.join_hidden = scope.join_hidden.clone();
+    arg_scope
+}
+
 /// Infer the SRF's argument types (so overload resolution can pick the right
 /// function) and their nullability.
 ///
@@ -582,27 +600,13 @@ fn apply_alias_column_names(
 fn infer_srf_arg_types(
     rf: &protobuf::RangeFunction,
     func_call: &protobuf::FuncCall,
-    scope: &Scope,
-    snapshot: &PgCatalog,
+    arg_ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<(Vec<PgTypeOid>, Vec<bool>), AnalyzeError> {
-    // Non-LATERAL SRF args can't see the enclosing FROM; LATERAL args can.
-    let mut arg_scope = Scope::default();
-    arg_scope.sources.extend(scope.sources.clone());
-    arg_scope
-        .lateral_sources
-        .extend(scope.lateral_sources.clone());
-    arg_scope.outer_sources.extend(scope.outer_sources.clone());
-    let empty_null_ctx = NullabilityContext::default();
     let mut arg_types = Vec::with_capacity(func_call.args.len());
     let mut arg_nullable = Vec::with_capacity(func_call.args.len());
     for arg in &func_call.args {
-        let (t, n) = match expr::infer_expr(
-            arg,
-            expr::Ctx::new(&arg_scope, &empty_null_ctx, snapshot),
-            params,
-            crate::expr::TypeGoal::NONE,
-        ) {
+        let (t, n) = match expr::infer_expr(arg, arg_ctx, params, crate::expr::TypeGoal::NONE) {
             Ok(e) => (e.type_oid, e.nullable),
             // `FROM a, f(a.col)` without LATERAL — PG rejects with `invalid
             // reference to FROM-clause entry for table "a"`. The scope we
@@ -627,13 +631,12 @@ fn infer_srf_arg_types(
 /// argument contributes one column of its element type.
 fn unnest_multi_arg_columns(
     arg_types: &[PgTypeOid],
-    arg_nullable: &[bool],
     alias: &str,
     snapshot: &PgCatalog,
     func_call: &protobuf::FuncCall,
 ) -> Result<Vec<ScopeColumn>, AnalyzeError> {
     let mut col_specs = Vec::with_capacity(arg_types.len());
-    for (i, (&type_oid, &nullable)) in arg_types.iter().zip(arg_nullable.iter()).enumerate() {
+    for (i, &type_oid) in arg_types.iter().enumerate() {
         let type_entry = snapshot.get_type(type_oid).ok_or_else(|| {
             AnalyzeError::UndefinedType(format!(
                 "internal: unnest argument {} has unknown type OID {}",
@@ -662,17 +665,14 @@ fn unnest_multi_arg_columns(
                     crate::error::SourceSpan::from_node_qname(func_call.location),
                 )
             })?;
-        // Multi-arg unnest is strict: each output column is NOT NULL iff the
-        // corresponding input array is NOT NULL (a NULL array yields a single
-        // NULL row, not zero rows). Out-of-bounds positions are padded with
-        // NULLs because the arrays may have different lengths, so each column
-        // is conservatively nullable when any *other* arg is shorter — but we
-        // can only see that at runtime. Match PG's behavior: NOT NULL only
-        // when the array itself is.
+        // PG rewrites the multi-argument form into `ROWS FROM (unnest(a),
+        // unnest(b), …)`, which pads the shorter results with NULL
+        // (`ExecFunctionScan` / nodeFunctionscan.c), and the elements
+        // themselves may be NULL — every column is nullable.
         col_specs.push(ScopeColumn {
             name: "unnest".to_owned(),
             type_oid: elem,
-            base_not_null: !nullable,
+            base_not_null: false,
             table_alias: alias.to_owned(),
             typmod: None,
             collation: None,
@@ -680,6 +680,58 @@ fn unnest_multi_arg_columns(
         });
     }
     Ok(col_specs)
+}
+
+/// Nullability of the elements a strict `pg_catalog` set-returning function
+/// emits, or `None` when `resolved` is not one (the caller keeps its
+/// scalar-function rules).
+///
+/// A strict SRF is never *called* with a NULL argument — PG yields zero
+/// rows instead (`ExecMakeTableFunctionResult` / `ExecMakeFunctionResultSet`
+/// short-circuit on `fn_strict`), so the arguments' nullability says nothing
+/// about the output. What matters is whether the function itself emits SQL
+/// NULLs: `unnest(anyarray)` returns the array's elements, which may be NULL
+/// even when the array column is NOT NULL, and `json[b]_array_elements_text`
+/// maps a JSON `null` to SQL NULL. Every other strict catalog SRF
+/// (`generate_series`, `generate_subscripts`, `jsonb_array_elements`,
+/// `regexp_split_to_table`, `unnest(anymultirange)`, …) never does.
+///
+/// `unnest(ARRAY[e1, e2, …])` over a literal constructor whose elements are
+/// all NOT NULL is still provably NOT NULL; the elements are re-inferred
+/// against a throwaway parameter collector so the peek has no side effects.
+pub(crate) fn srf_elements_nullable(
+    resolved: &functions::ResolvedFunction,
+    name: &str,
+    args: &[protobuf::Node],
+    ctx: Ctx<'_>,
+    params: &ParamCollector,
+) -> Option<bool> {
+    if !(resolved.is_set_returning && resolved.is_strict && resolved.schema == "pg_catalog") {
+        return None;
+    }
+    let array_unnest = name == "unnest"
+        && ctx
+            .snapshot
+            .get_type(resolved.arg_types.first().copied().unwrap_or(oid::UNKNOWN))
+            .is_some_and(|t| t.typname == "anyarray");
+    if array_unnest {
+        let elements_not_null = match args
+            .first()
+            .map(functions::call_arg_value)
+            .and_then(|a| a.node.as_ref())
+        {
+            Some(node::Node::AArrayExpr(arr)) => arr.elements.iter().all(|e| {
+                let mut scratch = params.clone();
+                expr::infer_expr(e, ctx, &mut scratch, TypeGoal::NONE).is_ok_and(|t| !t.nullable)
+            }),
+            _ => false,
+        };
+        return Some(!elements_not_null);
+    }
+    Some(matches!(
+        name,
+        "json_array_elements_text" | "jsonb_array_elements_text"
+    ))
 }
 
 /// The resolved name of a function called in FROM.
@@ -703,8 +755,10 @@ fn srf_function_columns(
     alias: &str,
     rf: &protobuf::RangeFunction,
     func_call: &protobuf::FuncCall,
-    snapshot: &PgCatalog,
+    arg_ctx: Ctx<'_>,
+    params: &ParamCollector,
 ) -> Result<Vec<ScopeColumn>, AnalyzeError> {
+    let snapshot = arg_ctx.snapshot;
     let SrfCall { schema, name } = call;
     let resolved = functions::resolve_function(
         snapshot,
@@ -716,6 +770,14 @@ fn srf_function_columns(
         crate::error::SourceSpan::from_node_qname(func_call.location),
     )?;
 
+    // A strict catalog SRF with a single OUT column (`jsonb_array_elements`
+    // → `value`) emits exactly its elements; wider OUT rows keep the
+    // conservative per-column default.
+    let single_out_not_null = (resolved.out_args.len() == 1)
+        .then(|| srf_elements_nullable(&resolved, name, &func_call.args, arg_ctx, params))
+        .flatten()
+        .map(|nullable| !nullable);
+
     // Build the scope columns.
     if !resolved.out_args.is_empty() {
         Ok(resolved
@@ -724,7 +786,7 @@ fn srf_function_columns(
             .map(|f| ScopeColumn {
                 name: f.name.clone(),
                 type_oid: f.type_oid,
-                base_not_null: f.not_null,
+                base_not_null: single_out_not_null.unwrap_or(f.not_null),
                 typmod: None,
                 collation: None,
                 table_alias: alias.to_owned(),
@@ -757,15 +819,21 @@ fn srf_function_columns(
             "a column definition list is required for functions returning \"record\"".to_owned(),
         ))
     } else {
-        // Strict pg_catalog SRFs (e.g. `unnest`) propagate NOT NULL from their
-        // arguments — `FROM unnest(int4[] NOT NULL)` produces NOT NULL int4
-        // elements, just like `SELECT unnest(arr)` in the projection.
-        let strict_not_null = resolved.schema == "pg_catalog"
-            && !functions::builtin_result_nullable(
-                &resolved,
-                &[args.any_nullable],
-                func_call.func_variadic,
-            );
+        // A strict catalog SRF's elements are NOT NULL unless the function
+        // emits NULLs itself (`unnest` of an array with NULL elements); other
+        // catalog functions follow their derived builtin nullability.
+        let strict_not_null =
+            match srf_elements_nullable(&resolved, name, &func_call.args, arg_ctx, params) {
+                Some(nullable) => !nullable,
+                None => {
+                    resolved.schema == "pg_catalog"
+                        && !functions::builtin_result_nullable(
+                            &resolved,
+                            &[args.any_nullable],
+                            func_call.func_variadic,
+                        )
+                }
+            };
         // PG names a lone scalar function's column after the alias:
         // `FROM generate_series(1, 3) AS g` exposes column `g`. With several
         // `ROWS FROM` functions each column keeps its function's name.
