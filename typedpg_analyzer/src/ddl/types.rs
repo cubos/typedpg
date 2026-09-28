@@ -415,14 +415,30 @@ pub fn create_composite(interp: &mut PgCatalog, stmt: &CompositeTypeStmt) -> Res
 
     // Collect column definitions before mutating, so we can resolve type
     // names against the catalog without holding a mutable borrow.
-    let mut field_defs: Vec<(String, PgTypeOid, Option<i32>, bool)> = Vec::new();
+    // `(name, type, typmod, not null, collation)` per attribute.
+    type FieldDef = (
+        String,
+        PgTypeOid,
+        Option<i32>,
+        bool,
+        Option<crate::oid::PgCollationOid>,
+    );
+    let mut field_defs: Vec<FieldDef> = Vec::new();
     for col_node in &stmt.coldeflist {
         if let Some(node::Node::ColumnDef(cd)) = col_node.node.as_ref()
             && let Some(tn) = cd.type_name.as_ref()
         {
             let type_oid = lookup_type_name(tn, interp)?;
             let typmod = crate::typmod::encode(interp, type_oid, &tn.typmods)?;
-            field_defs.push((cd.colname.clone(), type_oid, typmod, cd.is_not_null));
+            let collation = super::tables::column_collation(interp, cd, type_oid)?
+                .or_else(|| super::tables::type_collation(interp, type_oid));
+            field_defs.push((
+                cd.colname.clone(),
+                type_oid,
+                typmod,
+                cd.is_not_null,
+                collation,
+            ));
         }
     }
 
@@ -436,7 +452,7 @@ pub fn create_composite(interp: &mut PgCatalog, stmt: &CompositeTypeStmt) -> Res
         relkind: RelKind::CompositeType,
         reltype: Some(type_oid),
     });
-    for (i, (fname, ftype, ftypmod, fnotnull)) in field_defs.into_iter().enumerate() {
+    for (i, (fname, ftype, ftypmod, fnotnull, fcollation)) in field_defs.into_iter().enumerate() {
         interp.insert_pg_attribute(PgAttribute {
             attrelid: class_oid,
             attname: fname,
@@ -447,7 +463,7 @@ pub fn create_composite(interp: &mut PgCatalog, stmt: &CompositeTypeStmt) -> Res
             attgenerated: None,
             atttypmod: ftypmod,
             attidentity: None,
-            attcollation: None,
+            attcollation: fcollation,
             attislocal: true,
             attinhcount: 0,
         });

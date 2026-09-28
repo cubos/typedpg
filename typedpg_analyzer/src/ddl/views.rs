@@ -279,7 +279,7 @@ fn replace_view(
             attgenerated: None,
             atttypmod: col.typmod,
             attidentity: None,
-            attcollation: None,
+            attcollation: col.collation,
             attislocal: true,
             attinhcount: 0,
         })
@@ -400,7 +400,7 @@ fn install_relation(
             attgenerated: None,
             atttypmod: col.typmod,
             attidentity: None,
-            attcollation: None,
+            attcollation: col.collation,
             attislocal: true,
             attinhcount: 0,
         });
@@ -494,6 +494,9 @@ struct ResolvedColumn {
     type_oid: PgTypeOid,
     typmod: Option<i32>,
     not_null: bool,
+    /// The expression's collation (`exprCollation`), which PG stores as the
+    /// view / CTAS column's `attcollation`.
+    collation: Option<crate::oid::PgCollationOid>,
 }
 
 #[derive(Default, Clone)]
@@ -542,6 +545,9 @@ fn resolve_view_now(
                 type_oid: col.type_oid,
                 typmod: col.typmod,
                 not_null: !col.nullable,
+                collation: col
+                    .collation
+                    .or_else(|| interp_type_collation(snapshot, col.type_oid)),
             }
         })
         .collect();
@@ -1373,4 +1379,12 @@ pub fn rewrite_views_on_schema_rename(
     _old_schema: &str,
     _new_schema: &str,
 ) {
+}
+
+/// The default collation of `type_oid` (`typcollation`).
+fn interp_type_collation(
+    snapshot: &PgCatalog,
+    type_oid: PgTypeOid,
+) -> Option<crate::oid::PgCollationOid> {
+    snapshot.pg_type.get(&type_oid).and_then(|t| t.typcollation)
 }

@@ -163,7 +163,8 @@ pub(crate) fn parse_column_def(
 
     // `COLLATE "name"` decoration on the column: PG rejects unknown names
     // and non-collatable types. The collation oid lands on pg_attribute.
-    let collation = column_collation(interp, cd, type_oid)?;
+    let collation =
+        column_collation(interp, cd, type_oid)?.or_else(|| type_collation(interp, type_oid));
 
     Ok(ParsedColumn {
         name: cd.colname.clone(),
@@ -730,7 +731,8 @@ pub(crate) fn alter_column_type(
         .ok_or_else(|| DdlError::Parse(column_not_found_msg(interp, relid, &cmd.name)))?;
     // GetColumnDefCollation: an explicit COLLATE, else the new type's
     // default — the old column's collation does not carry over.
-    let new_collation = column_collation(interp, cd, new_type_oid)?;
+    let new_collation = column_collation(interp, cd, new_type_oid)?
+        .or_else(|| type_collation(interp, new_type_oid));
 
     // ATPrepAlterColumnType: the old value (or the USING expression) must
     // be assignment-coercible to the new type.
@@ -878,6 +880,15 @@ fn check_using_expression(
         )));
     }
     Ok(())
+}
+
+/// A type's default collation (`typcollation`): a domain's own, else its
+/// base type's; `None` for non-collatable types.
+pub(crate) fn type_collation(
+    interp: &PgCatalog,
+    type_oid: PgTypeOid,
+) -> Option<crate::oid::PgCollationOid> {
+    interp.pg_type.get(&type_oid).and_then(|t| t.typcollation)
 }
 
 /// A column's collation (`GetColumnDefCollation`, parse_type.c): the

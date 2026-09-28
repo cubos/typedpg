@@ -1027,3 +1027,55 @@ fn assignment_compatible_defaults_are_accepted() {
                          j timestamptz DEFAULT now(), k uuid DEFAULT gen_random_uuid());",
     )]);
 }
+
+// ── Column collation defaults to the type's (GetColumnDefCollation) ─────────
+
+#[test]
+fn domain_collation_reaches_its_columns() {
+    // PG 18: t.a's attcollation is the domain's "C"; an explicit COLLATE
+    // wins.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE DOMAIN d AS varchar(5) COLLATE \"C\";
+         CREATE TABLE t (a d, b d COLLATE \"POSIX\");",
+    )]);
+    let info = db.analyze("SELECT a, b FROM t").unwrap();
+    let colls: Vec<Option<String>> = info
+        .columns
+        .iter()
+        .map(|c| match &c.pg_type {
+            Type::Domain { collation, .. } => collation.clone(),
+            other => panic!("expected a domain, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(colls, vec![Some("C".to_owned()), Some("POSIX".to_owned())]);
+}
+
+#[test]
+fn view_columns_keep_their_expression_collation() {
+    // PG 18: the view column has attcollation "C", like the table's.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE b (t text COLLATE \"C\");
+         CREATE VIEW vb AS SELECT t FROM b;
+         CREATE TYPE comp AS (n text COLLATE \"C\");",
+    )]);
+    let info = db.analyze("SELECT t FROM vb").unwrap();
+    assert_cols(
+        &info,
+        vec![cn("t", basic_with_collation("pg_catalog", "text", "C"))],
+    );
+}
+
+#[test]
+fn inherited_column_collation_must_match() {
+    // PG 18: 42P21 column "x" has a collation conflict ("C" versus "default").
+    assert_ddl_err!(
+        try_apply(&[(
+            "0001.sql",
+            "CREATE TABLE s2 (x text COLLATE \"C\"); CREATE TABLE c7 (x text) INHERITS (s2);",
+        )]),
+        DdlError::Parse(_),
+        "column \"x\" has a collation conflict",
+    );
+}

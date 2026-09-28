@@ -389,4 +389,5 @@ pub(crate) mod inherit;
 mod merge;
 
 use columns::*;
+pub(crate) use columns::{column_collation, type_collation};
 use constraints::*;
