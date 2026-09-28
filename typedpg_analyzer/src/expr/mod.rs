@@ -78,6 +78,26 @@ impl<'a> Ctx<'a> {
             cell.borrow_mut().push(oid);
         }
     }
+
+    /// Record the cast function an implicit coercion from `from` to `to`
+    /// runs (an argument coerced to a function's / operator's declared
+    /// type), if any.
+    pub fn note_coercion(&self, from: PgTypeOid, to: PgTypeOid) {
+        if self.used_procs.is_none() || from == to || from == oid::UNKNOWN {
+            return;
+        }
+        let key = (
+            self.snapshot.unwrap_domain(from),
+            self.snapshot.unwrap_domain(to),
+        );
+        self.note_proc(
+            self.snapshot
+                .cast_by_pair
+                .get(&key)
+                .and_then(|oid| self.snapshot.pg_cast.get(oid))
+                .and_then(|c| c.castfunc),
+        );
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

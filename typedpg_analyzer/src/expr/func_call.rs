@@ -86,6 +86,9 @@ pub(crate) fn infer_func_call(
 
     check_call_shape(func, Some(&resolved), &args, &notation, ctx)?;
     ctx.note_proc(Some(resolved.oid));
+    for (&actual, &declared) in args.types.iter().zip(&resolved.arg_types) {
+        ctx.note_coercion(actual, declared);
+    }
 
     if func.over.is_some() {
         check_no_nested_windows(func, snapshot)?;

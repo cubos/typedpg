@@ -592,3 +592,29 @@ fn casts_and_operators_count_for_index_and_generated_mutability() {
          CREATE INDEX ON t ((ts AT TIME ZONE 'UTC'));",
     )]);
 }
+
+#[test]
+fn implicit_argument_coercions_count_for_index_mutability() {
+    // PG 18: the timestamp → timestamptz coercion of the argument is STABLE,
+    // so the index is rejected although tz_g is IMMUTABLE.
+    let err = try_apply(&[(
+        "0001.sql",
+        "CREATE TABLE t (ts timestamp);
+         CREATE FUNCTION tz_g(timestamptz) RETURNS int IMMUTABLE LANGUAGE plpgsql
+             AS 'begin return 1; end';
+         CREATE INDEX ON t (tz_g(ts));",
+    )])
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("functions in index expression must be marked IMMUTABLE"),
+        "{err}"
+    );
+    build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int);
+         CREATE FUNCTION big(bigint) RETURNS bigint IMMUTABLE LANGUAGE plpgsql
+             AS 'begin return $1; end';
+         CREATE INDEX ON t (big(a));",
+    )]);
+}

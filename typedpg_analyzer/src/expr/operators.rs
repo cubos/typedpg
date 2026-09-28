@@ -680,6 +680,10 @@ fn infer_generic_binary_op(
     match snapshot.find_operator_detailed(op_name, left_oid_resolved, right_oid_resolved) {
         crate::lookup::OperatorMatch::Found(op) => {
             ctx.note_proc(op.code);
+            if let (Some(actual), Some(declared)) = (left_oid_resolved, op.left_type_oid) {
+                ctx.note_coercion(actual, declared);
+            }
+            ctx.note_coercion(right_oid_resolved, op.right_type_oid);
             // Pass 2: back-fill still-UNKNOWN sides with the operator's
             // *declared* argument types — the coercion PG performs (this is
             // what pins `$1` in `prefs -> $1` to text, and validates literal
