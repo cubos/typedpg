@@ -66,11 +66,13 @@ fn ntile_returns_int4() {
 #[test]
 fn sum_over_partition() {
     let db = setup();
+    // The frame always holds the current row, so a NOT NULL input gives a
+    // NOT NULL aggregate.
     // SUM over an int4 column promotes to int8 — same rule as non-window SUM.
     let s = db
         .analyze("SELECT id, SUM(views) OVER (PARTITION BY user_id) AS total FROM posts")
         .unwrap();
-    assert_cols(&s, vec![c("id", int8()), cn("total", int8())]);
+    assert_cols(&s, vec![c("id", int8()), c("total", int8())]);
 }
 
 #[test]
@@ -87,10 +89,12 @@ fn count_over_empty_partition() {
 #[test]
 fn avg_over_order_by() {
     let db = setup();
+    // The frame always holds the current row, so a NOT NULL input gives a
+    // NOT NULL aggregate.
     let s = db
         .analyze("SELECT AVG(views) OVER (ORDER BY id) AS running FROM posts")
         .unwrap();
-    assert_cols(&s, vec![cn("running", numeric())]);
+    assert_cols(&s, vec![c("running", numeric())]);
 }
 
 // ── Value window functions ───────────────────────────────────────────────────
@@ -227,6 +231,8 @@ fn named_window_clause() {
 #[test]
 fn rows_unbounded_preceding_to_current_row() {
     let db = setup();
+    // The frame always holds the current row, so a NOT NULL input gives a
+    // NOT NULL aggregate.
     let s = db
         .analyze(
             "SELECT id, SUM(views) OVER ( \
@@ -234,12 +240,14 @@ fn rows_unbounded_preceding_to_current_row() {
              ) AS running FROM posts",
         )
         .unwrap();
-    assert_cols(&s, vec![c("id", int8()), cn("running", int8())]);
+    assert_cols(&s, vec![c("id", int8()), c("running", int8())]);
 }
 
 #[test]
 fn rows_n_preceding_to_n_following() {
     let db = setup();
+    // The frame always holds the current row, so a NOT NULL input gives a
+    // NOT NULL aggregate.
     let s = db
         .analyze(
             "SELECT SUM(views) OVER ( \
@@ -247,23 +255,27 @@ fn rows_n_preceding_to_n_following() {
              ) AS s FROM posts",
         )
         .unwrap();
-    assert_cols(&s, vec![cn("s", int8())]);
+    assert_cols(&s, vec![c("s", int8())]);
 }
 
 #[test]
 fn range_unbounded_preceding_default() {
     let db = setup();
+    // The frame always holds the current row, so a NOT NULL input gives a
+    // NOT NULL aggregate.
     // `RANGE UNBOUNDED PRECEDING` is the implicit default; spelling it out
     // shouldn't change the result.
     let s = db
         .analyze("SELECT SUM(views) OVER (ORDER BY id RANGE UNBOUNDED PRECEDING) AS s FROM posts")
         .unwrap();
-    assert_cols(&s, vec![cn("s", int8())]);
+    assert_cols(&s, vec![c("s", int8())]);
 }
 
 #[test]
 fn range_between_with_value_offset() {
     let db = setup();
+    // The frame always holds the current row, so a NOT NULL input gives a
+    // NOT NULL aggregate.
     // RANGE with an interval offset against an int4 column.
     let s = db
         .analyze(
@@ -272,12 +284,14 @@ fn range_between_with_value_offset() {
              ) AS s FROM posts",
         )
         .unwrap();
-    assert_cols(&s, vec![cn("s", int8())]);
+    assert_cols(&s, vec![c("s", int8())]);
 }
 
 #[test]
 fn groups_frame_syntax() {
     let db = setup();
+    // The frame always holds the current row, so a NOT NULL input gives a
+    // NOT NULL aggregate.
     // GROUPS frame (PG 11+).
     let s = db
         .analyze(
@@ -286,7 +300,7 @@ fn groups_frame_syntax() {
              ) AS s FROM posts",
         )
         .unwrap();
-    assert_cols(&s, vec![cn("s", int8())]);
+    assert_cols(&s, vec![c("s", int8())]);
 }
 
 #[test]

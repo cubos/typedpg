@@ -414,6 +414,34 @@ fn extract_unit_is_infinite_safe(
         )
 }
 
+/// Whether a window frame always includes the current row (PG's
+/// `FRAMEOPTION_*` bits, parsenodes.h): it starts at or before it
+/// (UNBOUNDED/offset PRECEDING, CURRENT ROW), ends at or after it (CURRENT
+/// ROW, offset/UNBOUNDED FOLLOWING), and doesn't `EXCLUDE CURRENT ROW` or
+/// `EXCLUDE GROUP`. The default frame (RANGE UNBOUNDED PRECEDING to CURRENT
+/// ROW) does.
+fn frame_contains_current_row(options: i32) -> bool {
+    const NONDEFAULT: i32 = 0x1;
+    const BETWEEN: i32 = 0x10;
+    const START_UNBOUNDED_PRECEDING: i32 = 0x20;
+    const END_UNBOUNDED_FOLLOWING: i32 = 0x100;
+    const START_CURRENT_ROW: i32 = 0x200;
+    const END_CURRENT_ROW: i32 = 0x400;
+    const START_OFFSET_PRECEDING: i32 = 0x800;
+    const END_OFFSET_FOLLOWING: i32 = 0x4000;
+    const EXCLUDE_CURRENT_ROW: i32 = 0x8000;
+    const EXCLUDE_GROUP: i32 = 0x10000;
+    if options & NONDEFAULT == 0 {
+        return true;
+    }
+    let starts_before =
+        options & (START_UNBOUNDED_PRECEDING | START_CURRENT_ROW | START_OFFSET_PRECEDING) != 0;
+    // Without BETWEEN the frame ends at the current row.
+    let ends_after = options & BETWEEN == 0
+        || options & (END_CURRENT_ROW | END_OFFSET_FOLLOWING | END_UNBOUNDED_FOLLOWING) != 0;
+    starts_before && ends_after && options & (EXCLUDE_CURRENT_ROW | EXCLUDE_GROUP) == 0
+}
+
 /// Decide whether a function/aggregate/window call's result is nullable.
 ///
 /// Covers value-window edge NULLs (`lag`/`lead`/…), aggregate emptiness
@@ -433,8 +461,8 @@ fn resolve_func_nullability(
     // source column is NOT NULL — `lag(title) OVER (ORDER BY id)` produces
     // NULL for the first row of each partition. A 3-arg `lag(col, offset,
     // default)`/`lead(...)` replaces the boundary NULL with `default`, so
-    // the result is only nullable when the source column or the default
-    // themselves are nullable.
+    // the result is only nullable when the value, the offset (a NULL
+    // offset gives NULL) or the default are.
     let is_value_window = func.over.is_some()
         && matches!(
             name,
@@ -443,21 +471,35 @@ fn resolve_func_nullability(
 
     if is_value_window {
         match name {
-            "lag" | "lead" if func.args.len() >= 3 => arg_is_nullable(0) || arg_is_nullable(2),
+            "lag" | "lead" if func.args.len() >= 3 => {
+                arg_is_nullable(0) || arg_is_nullable(1) || arg_is_nullable(2)
+            }
             _ => true,
         }
     } else if resolved.is_aggregate {
-        // A FILTER clause can eliminate every row in the group, leaving the
-        // aggregate with an empty set. Every aggregate except COUNT returns
-        // NULL for an empty set, so FILTER forces non-COUNT aggregates to
-        // nullable even when the source column is NOT NULL and there's a
-        // GROUP BY.
-        let has_filter = func.agg_filter.is_some();
-        if name == "count" {
+        let builtin = resolved.schema == "pg_catalog";
+        // An aggregate over a non-empty set of rows: NULL only on NULL
+        // input, except for the builtins that are NULL for some non-empty
+        // inputs (a single row, zero variance) and user-defined aggregates,
+        // whose final/transition functions may return NULL at will.
+        let over_rows = || {
+            args.any_nullable
+                || !builtin
+                || crate::builtin_nullability::NULLABLE_AGGREGATES_OVER_ROWS.contains(&name)
+        };
+        if builtin && name == "count" {
             // COUNT is never NULL (returns 0 for empty input, even with FILTER).
             false
-        } else if has_filter {
+        } else if func.agg_filter.is_some() {
+            // A FILTER clause can eliminate every row in the group.
             true
+        } else if let Some(over) = &func.over {
+            // A window aggregate sees its frame: never empty when the frame
+            // contains the current row (every window input row exists), but
+            // `ROWS … 1 PRECEDING`, `… FOLLOWING`-only frames and `EXCLUDE
+            // CURRENT ROW / GROUP` can leave it empty. `OVER w` takes its
+            // frame from the WINDOW clause, not visible here.
+            !over.name.is_empty() || !frame_contains_current_row(over.frame_options) || over_rows()
         } else if null_ctx.has_empty_grouping_set {
             // GROUPING SETS / ROLLUP / CUBE include an empty grouping set
             // (or `GROUP BY ()` does explicitly). For that row the aggregate
@@ -465,7 +507,7 @@ fn resolve_func_nullability(
             // for non-COUNT aggregates.
             true
         } else if null_ctx.has_group_by {
-            args.any_nullable
+            over_rows()
         } else {
             // Without GROUP BY, non-COUNT aggregates return NULL for empty tables.
             true

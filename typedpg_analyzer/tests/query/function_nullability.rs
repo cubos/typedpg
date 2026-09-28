@@ -201,3 +201,92 @@ fn system_user_and_current_schema_can_be_null() {
         &[("a", true), ("b", true), ("c", true)],
     );
 }
+
+// ── Aggregates and window aggregates (#35, #36, #37) ─────────────────────────
+
+fn agg_setup() -> PgCatalog {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE ta (id int PRIMARY KEY, g int NOT NULL, x int NOT NULL, f float8 NOT NULL,
+                          y int);
+         CREATE FUNCTION f_sfunc_returning_null(int, int) RETURNS int
+             AS $$ SELECT NULL::int $$ LANGUAGE sql;
+         CREATE AGGREGATE my_nullagg(int) (SFUNC = f_sfunc_returning_null, STYPE = int,
+                                           INITCOND = '0');",
+    )
+    .unwrap();
+    db
+}
+
+#[test]
+fn sample_statistics_are_null_for_a_single_row_group() {
+    let db = agg_setup();
+    // A one-row group gives NULL for the sample statistics, and corr /
+    // regr_slope / regr_intercept / regr_r2 also for zero variance; avg and
+    // the population statistics are never NULL over rows.
+    assert_nullability(
+        &db,
+        "SELECT g, stddev(x) AS a, variance(x) AS b, stddev_samp(x) AS c, var_samp(x) AS d,
+                corr(x, f) AS e, covar_samp(x, f) AS h, regr_slope(f, x) AS i,
+                regr_intercept(f, x) AS k, regr_r2(f, x) AS l, avg(x) AS n, stddev_pop(x) AS o
+         FROM ta GROUP BY g",
+        &[
+            ("g", false),
+            ("a", true),
+            ("b", true),
+            ("c", true),
+            ("d", true),
+            ("e", true),
+            ("h", true),
+            ("i", true),
+            ("k", true),
+            ("l", true),
+            ("n", false),
+            ("o", false),
+        ],
+    );
+}
+
+#[test]
+fn user_defined_aggregate_can_return_null_for_a_group() {
+    let db = agg_setup();
+    assert_nullability(
+        &db,
+        "SELECT my_nullagg(x) AS m FROM ta GROUP BY g",
+        &[("m", true)],
+    );
+}
+
+#[test]
+fn window_aggregate_over_a_frame_that_can_be_empty() {
+    let db = agg_setup();
+    // `a` and `b` are NULL on the first row (the frame is empty), `c` on
+    // the last.
+    assert_nullability(
+        &db,
+        "SELECT g, max(g) OVER (ORDER BY g ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS a,
+                sum(g) OVER (ORDER BY g ROWS CURRENT ROW EXCLUDE CURRENT ROW) AS b,
+                sum(g) OVER (ORDER BY g ROWS BETWEEN 1 FOLLOWING AND 2 FOLLOWING) AS c,
+                sum(g) OVER (ORDER BY g ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS d
+         FROM ta GROUP BY g",
+        &[
+            ("g", false),
+            ("a", true),
+            ("b", true),
+            ("c", true),
+            ("d", false),
+        ],
+    );
+}
+
+#[test]
+fn lag_with_default_and_a_nullable_offset() {
+    let db = agg_setup();
+    // NULL when the offset y is NULL.
+    assert_nullability(
+        &db,
+        "SELECT lag(x, y, 0) OVER (ORDER BY id) AS a, lag(x, 1, 0) OVER (ORDER BY id) AS b
+         FROM ta",
+        &[("a", true), ("b", false)],
+    );
+}

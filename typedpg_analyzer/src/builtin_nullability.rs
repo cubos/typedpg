@@ -428,3 +428,22 @@ pub(crate) const NULL_ONLY_ON_VARIADIC_NULL: &[&str] = &[
     "num_nonnulls(any)",
     "num_nulls(any)",
 ];
+
+/// Builtin aggregates that can return NULL for a *non-empty* set of
+/// non-NULL inputs. From the same scan, applied to each aggregate's final
+/// function: of the NULL-return conditions found, `state == NULL`,
+/// `N == 0`, `count == 0` and `PG_ARGISNULL(0)` hold only for an empty (or
+/// all-NULL) set, while `N <= 1` / `N < 2` (sample statistics over one
+/// row) and `Sxx == 0` / `Syy == 0` (zero variance) hold for real rows.
+/// Confirmed on PG 18 with single-row groups.
+pub(crate) const NULLABLE_AGGREGATES_OVER_ROWS: &[&str] = &[
+    "corr",
+    "covar_samp",
+    "regr_intercept",
+    "regr_r2",
+    "regr_slope",
+    "stddev",
+    "stddev_samp",
+    "var_samp",
+    "variance",
+];
