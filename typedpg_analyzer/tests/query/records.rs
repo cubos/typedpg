@@ -2345,3 +2345,49 @@ fn composite_star_expands_to_its_fields() {
         );
     }
 }
+
+// ── Functional notation for column access: `col(rel)` ───────────────────────
+
+#[test]
+fn functional_notation_projects_a_column() {
+    // ParseFuncOrColumn: a one-argument call on a composite value with a
+    // field of that name is the column projection `(arg).field`.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE t (id int PRIMARY KEY, x int NOT NULL, s text NOT NULL, n numeric(5,2));
+         CREATE FUNCTION f_out(IN a int, OUT x int, OUT y text) AS $$ SELECT a, a::text $$ LANGUAGE sql;
+         CREATE TYPE comp AS (a int, b text);",
+    )
+    .unwrap();
+    let s = db
+        .analyze(
+            "SELECT x(t) AS a, s(t) AS b, x(f_out(1)) AS c, a(ROW(1,'x')::comp) AS d, \
+             n(t) AS e, x(t.*) AS f FROM t",
+        )
+        .unwrap();
+    assert_cols(
+        &s,
+        vec![
+            c("a", int4()),
+            c("b", text()),
+            cn("c", int4()),
+            cn("d", int4()),
+            cn("e", numeric_ps(5, 2)),
+            c("f", int4()),
+        ],
+    );
+    // No such field (or a qualified name): an ordinary function lookup.
+    for (sql, msg) in [
+        (
+            "SELECT nosuch(t) FROM t",
+            "function nosuch(t) does not exist",
+        ),
+        (
+            "SELECT public.x(t) FROM t",
+            "function public.x(t) does not exist",
+        ),
+    ] {
+        assert_err_prefix!(db.analyze(sql), AnalyzeError::UndefinedFunction(_), msg);
+    }
+    db.analyze("SELECT count(t) AS c FROM t").unwrap();
+}

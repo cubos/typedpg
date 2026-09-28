@@ -37,6 +37,11 @@ pub(crate) fn infer_func_call(
 
     validate_within_group(func)?;
 
+    // `x(t)` may be the column projection `(t).x` (tried before lookup).
+    if let Some(field) = try_column_projection(func, ctx, params)? {
+        return Ok(field);
+    }
+
     // Pass 1: infer argument types bottom-up.
     let args = collect_arg_types(func, ctx, params)?;
     let notation = functions::CallNotation::of(func)?;

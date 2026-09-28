@@ -531,6 +531,65 @@ pub(crate) fn expand_indirection_star(
     Ok(Some(out))
 }
 
+/// PG's column-projection reading of a one-argument call
+/// (`ParseFuncOrColumn` → `ParseComplexProjection`): `x(t)` with an
+/// unqualified name, no decoration and a composite / record argument is
+/// `(t).x` when the argument's row type has a field `x` — tried before any
+/// function lookup. `Ok(None)` when the call doesn't qualify or no such
+/// field exists (the caller goes on to function resolution).
+pub(crate) fn try_column_projection(
+    func: &protobuf::FuncCall,
+    ctx: Ctx<'_>,
+    params: &mut ParamCollector,
+) -> Result<Option<ExprType>, AnalyzeError> {
+    let snapshot = ctx.snapshot;
+    let [arg] = func.args.as_slice() else {
+        return Ok(None);
+    };
+    let [name] = func.funcname.as_slice() else {
+        return Ok(None);
+    };
+    let Some(node::Node::String(name)) = name.node.as_ref() else {
+        return Ok(None);
+    };
+    if !func.agg_order.is_empty()
+        || func.agg_filter.is_some()
+        || func.agg_star
+        || func.agg_distinct
+        || func.agg_within_group
+        || func.over.is_some()
+        || func.func_variadic
+        || matches!(arg.node.as_ref(), Some(node::Node::NamedArgExpr(_)))
+    {
+        return Ok(None);
+    }
+    let t = infer_expr(arg, ctx, params, TypeGoal::NONE)?;
+    let base = snapshot.unwrap_domain(t.type_oid);
+    let complex = base == oid::RECORD
+        || snapshot
+            .get_type(base)
+            .is_some_and(|e| e.typtype == TypType::Composite);
+    if !complex {
+        return Ok(None);
+    }
+    let has_field = match &t.record_fields {
+        Some(fields) => fields.iter().any(|f| f.name == name.sval),
+        None => snapshot
+            .get_type(base)
+            .and_then(|e| e.typrelid)
+            .is_some_and(|relid| {
+                snapshot
+                    .attributes_of(relid)
+                    .iter()
+                    .any(|a| a.attnum > 0 && a.attname == name.sval)
+            }),
+    };
+    if !has_field {
+        return Ok(None);
+    }
+    resolve_composite_field(&t, &name.sval, snapshot, None).map(Some)
+}
+
 /// The leading run of consecutive `[…]` steps of an indirection list.
 pub(crate) fn subscript_run(steps: &[protobuf::Node]) -> Vec<&protobuf::AIndices> {
     steps
