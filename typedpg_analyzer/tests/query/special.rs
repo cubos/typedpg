@@ -204,6 +204,24 @@ fn range_function_scalar_srf_exposes_single_column() {
 }
 
 #[test]
+fn range_function_scalar_column_takes_the_relation_alias() {
+    let db = setup();
+    let info = db
+        .analyze("SELECT g, g.g AS qualified FROM generate_series(1, 10) AS g")
+        .unwrap();
+    assert_cols(&info, vec![c("g", int4()), c("qualified", int4())]);
+    let info = db
+        .analyze("SELECT * FROM unnest(ARRAY[1]) WITH ORDINALITY AS u")
+        .unwrap();
+    assert_cols(&info, vec![c("u", int4()), c("ordinality", int8())]);
+    // A composite result keeps its field names.
+    let info = db
+        .analyze("SELECT * FROM pg_options_to_table(ARRAY['a=b']) AS o")
+        .unwrap();
+    assert_eq!(col(&info, "option_name").pg_type, text());
+}
+
+#[test]
 fn range_function_with_out_args_exposes_named_columns() {
     let db = setup();
     // pg_options_to_table(text[]) is declared with

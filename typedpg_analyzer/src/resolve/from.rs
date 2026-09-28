@@ -189,7 +189,8 @@ pub(crate) fn process_from_item(
 /// - Function returns a registered composite type → expand the composite's
 ///   fields as scope columns.
 /// - Otherwise (scalar or plain `record`) → a single scope column named after
-///   the function, typed with its return OID.
+///   the relation alias (the function's name when unaliased, as in PG), typed
+///   with its return OID.
 ///
 /// Also honors `WITH ORDINALITY` by adding a trailing `ordinality BIGINT NOT NULL`
 /// column when the flag is set.
@@ -755,8 +756,12 @@ fn srf_function_columns(
         // elements, just like `SELECT unnest(arr)` in the projection.
         let strict_not_null =
             resolved.is_strict && resolved.schema == "pg_catalog" && !args.any_nullable;
+        // PG names a lone scalar function's column after the alias:
+        // `FROM generate_series(1, 3) AS g` exposes column `g`. With several
+        // `ROWS FROM` functions each column keeps its function's name.
+        let col_name = if rf.functions.len() == 1 { alias } else { name };
         Ok(vec![ScopeColumn {
-            name: name.to_owned(),
+            name: col_name.to_owned(),
             type_oid: resolved.return_type_oid,
             base_not_null: strict_not_null,
             table_alias: alias.to_owned(),
