@@ -1899,3 +1899,42 @@ fn insert_select_unknown_literal_content_validated() {
     db.analyze("INSERT INTO posts (user_id) SELECT '42' FROM users")
         .unwrap();
 }
+
+// ── DEFAULT placement (transformAssignedExpr) ───────────────────────────────
+
+#[test]
+fn default_only_allowed_as_a_whole_assigned_value() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE td (n int PRIMARY KEY DEFAULT 1, ni int, arr int[]);")
+        .unwrap();
+    for sql in [
+        "SELECT DEFAULT",
+        "SELECT n FROM td WHERE ni = DEFAULT",
+        "INSERT INTO td (n) VALUES (DEFAULT + 1)",
+        "UPDATE td SET ni = COALESCE(DEFAULT, 1)",
+        "VALUES (DEFAULT)",
+        "INSERT INTO td (n, ni) SELECT 1, DEFAULT",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::SyntaxError(_),
+            "DEFAULT is not allowed in this context"
+        );
+    }
+    assert_err_prefix!(
+        db.analyze("UPDATE td SET arr[1] = DEFAULT"),
+        AnalyzeError::FeatureNotSupported(_),
+        "cannot set an array element to DEFAULT"
+    );
+    for sql in [
+        "INSERT INTO td VALUES (DEFAULT, DEFAULT, DEFAULT), (1, DEFAULT, NULL)",
+        "UPDATE td SET ni = DEFAULT",
+        "INSERT INTO td (n) VALUES ((DEFAULT))",
+        "INSERT INTO td (n) VALUES (1) ON CONFLICT (n) DO UPDATE SET ni = DEFAULT",
+        "MERGE INTO td USING (SELECT 1 AS x) s ON td.n = s.x \
+         WHEN MATCHED THEN UPDATE SET ni = DEFAULT \
+         WHEN NOT MATCHED THEN INSERT VALUES (DEFAULT)",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}

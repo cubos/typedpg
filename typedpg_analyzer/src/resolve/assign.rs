@@ -16,6 +16,9 @@ pub(crate) struct AssignTarget {
     /// `subscripted assignment to "x"` after a subscript step, `subfield
     /// "x"` after a field step.
     last_step: Option<(bool, String)>,
+    /// Whether the first indirection step is a subscript (`None` without
+    /// indirection) — PG words a DEFAULT assigned through it after it.
+    first_step_is_subscript: Option<bool>,
 }
 
 /// Walk `indirection` from column `tc` like PG's
@@ -101,6 +104,9 @@ pub(crate) fn assignment_target(
         type_oid: ty,
         indirected: !indirection.is_empty(),
         last_step,
+        first_step_is_subscript: indirection
+            .first()
+            .map(|n| matches!(n.node.as_ref(), Some(node::Node::AIndices(_)))),
     })
 }
 
@@ -118,6 +124,18 @@ impl AssignTarget {
         // `DEFAULT` as the whole value takes the column default, which is
         // trusted to fit the target.
         if is_set_to_default(val) {
+            // transformAssignedExpr: DEFAULT can't be assigned into an
+            // element or a field (0A000).
+            if let Some(subscript) = self.first_step_is_subscript {
+                return Err(AnalyzeError::FeatureNotSupported(
+                    if subscript {
+                        "cannot set an array element to DEFAULT"
+                    } else {
+                        "cannot set a subfield to DEFAULT"
+                    }
+                    .into(),
+                ));
+            }
             return Ok(expr::ExprType::scalar(self.type_oid, false));
         }
         let Some((subscript, name)) = &self.last_step else {
