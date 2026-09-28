@@ -47,12 +47,12 @@ pub(crate) fn infer_a_expr(
     infer_generic_binary_op(expr, op_name, ctx, params)
 }
 
-/// `NULLIF(v1, v2)` — represented as an AExpr with op_name "=" and a special
-/// kind. PG defines it as `CASE WHEN v1 = v2 THEN NULL ELSE v1 END`
-/// (src/backend/parser/parse_expr.c:transformAExprNullIf), so the result type
-/// is v1's type and the expression is always nullable. The generic path would
-/// return `bool` (from the `=` operator's result type), silently corrupting
-/// the result column, so handle it up front.
+/// `NULLIF(v1, v2)` — an AExpr of kind NULLIF with op `=`. PG's
+/// `transformAExprNullIf` resolves `v1 = v2` like any operator (`make_op`),
+/// requires it to yield boolean, and types the result as the operator's
+/// *coerced left input* — so `NULLIF(varchar_col, 'x')` is text (varchar
+/// has no `=` of its own; `text = text` is chosen) and keeps the left
+/// input's typmod only when it needed no coercion. Always nullable.
 fn handle_nullif(
     expr: &protobuf::AExpr,
     ctx: Ctx<'_>,
@@ -65,128 +65,106 @@ fn handle_nullif(
     ) {
         return Ok(None);
     }
-
-    // Both arms are inferred with NONE goal: a concrete-but-incompatible
-    // RHS would otherwise trip the generic `cannot coerce X to Y` error
-    // from the implicit goal before we get to the NULLIF-specific check
-    // below, swallowing the chance to emit PG's exact wording.
-    let left = expr
-        .lexpr
-        .as_ref()
-        .map(|n| infer_expr(n, ctx, params, TypeGoal::NONE))
-        .transpose()?;
-    let left_oid = left.as_ref().map(|l| l.type_oid).unwrap_or(oid::UNKNOWN);
-    let right = expr
-        .rexpr
-        .as_ref()
-        .map(|n| infer_expr(n, ctx, params, TypeGoal::NONE))
-        .transpose()?;
-    let right_oid = right.as_ref().map(|r| r.type_oid).unwrap_or(oid::UNKNOWN);
-
-    // Back-fill UNKNOWN side with the concrete side via implicit goal so
-    // params and bare unknowns get pinned. Errors here are non-fatal (a
-    // genuinely incompatible pair falls through to the operator check) —
-    // except a literal-content rejection, which is exactly the error PG
-    // raises from this coercion (`NULLIF(1, 'x')` → `invalid input syntax
-    // for type integer: "x"`).
-    let left_oid_final = if left_oid == oid::UNKNOWN && right_oid != oid::UNKNOWN {
-        if let Some(lexpr) = &expr.lexpr {
-            coerce_unknown_to(lexpr, ctx, params, right_oid)?;
-        }
-        // The coerced side now carries the peer's type — PG resolves the
-        // `=` over (peer, peer).
-        right_oid
-    } else {
-        left_oid
+    let (Some(lexpr), Some(rexpr)) = (expr.lexpr.as_deref(), expr.rexpr.as_deref()) else {
+        return Err(AnalyzeError::Internal("NULLIF without operands".into()));
     };
-    let right_oid_final = if right_oid == oid::UNKNOWN && left_oid_final != oid::UNKNOWN {
-        if let Some(rexpr) = &expr.rexpr {
-            coerce_unknown_to(rexpr, ctx, params, left_oid_final)?;
+    let left = infer_expr(lexpr, ctx, params, TypeGoal::NONE)?;
+    let right = infer_expr(rexpr, ctx, params, TypeGoal::NONE)?;
+    let name = |t: PgTypeOid| crate::ddl::util::format_type_for_message(snapshot, t);
+    let op = match snapshot.find_operator_detailed("=", Some(left.type_oid), right.type_oid) {
+        crate::lookup::OperatorMatch::Found(op) => op,
+        crate::lookup::OperatorMatch::Ambiguous => {
+            return Err(crate::pgmsg::operator_is_not_unique(
+                &name(left.type_oid),
+                "=",
+                &name(right.type_oid),
+                None,
+            )
+            .finalize_implicit());
         }
-        left_oid_final
-    } else {
-        right_oid
+        crate::lookup::OperatorMatch::NotFound => {
+            return Err(crate::pgmsg::nullif_types_mismatch(
+                &name(left.type_oid),
+                &name(right.type_oid),
+            ));
+        }
+        crate::lookup::OperatorMatch::Error(e) => return Err(e),
     };
-
-    // Validate: `=` must be defined between the two types.
-    if left_oid_final != oid::UNKNOWN
-        && right_oid_final != oid::UNKNOWN
-        && snapshot
-            .find_operator("=", Some(left_oid_final), right_oid_final)
-            .is_none()
-    {
-        // PG's wording is `operator does not exist: A = B`. We append the
-        // NULLIF context as a suffix so the macro caller still sees that
-        // it was a NULLIF-shape mismatch.
-        let l = crate::ddl::util::format_type_for_message(snapshot, left_oid_final);
-        let r = crate::ddl::util::format_type_for_message(snapshot, right_oid_final);
-        return Err(crate::pgmsg::nullif_types_mismatch(&l, &r));
+    // The coercion make_op performs: untyped sides take the declared types.
+    let declared_left = op.left_type_oid.unwrap_or(left.type_oid);
+    if left.type_oid == oid::UNKNOWN {
+        coerce_unknown_to(lexpr, ctx, params, declared_left)?;
     }
-
-    // Result type is the first arg's type (never bool). If the first arg
-    // is UNKNOWN and the second is concrete, use the second as a fallback
-    // so the result isn't a bare UNKNOWN dangling into the output.
-    let result_oid = if left_oid_final != oid::UNKNOWN {
-        left_oid_final
+    if right.type_oid == oid::UNKNOWN {
+        coerce_unknown_to(rexpr, ctx, params, op.right_type_oid)?;
+    }
+    if op.result_type_oid != oid::BOOL {
+        return Err(AnalyzeError::DatatypeMismatch(
+            "NULLIF requires = operator to yield boolean".into(),
+        ));
+    }
+    // A polymorphic / pseudo declared input (anyarray, anyenum, record, …)
+    // is coerced to the actual argument type, not to the pseudo-type.
+    let pseudo = snapshot
+        .get_type(declared_left)
+        .is_some_and(|t| t.typtype == TypType::Pseudo);
+    let result_oid = if pseudo || declared_left == oid::UNKNOWN {
+        if left.type_oid == oid::UNKNOWN {
+            right.type_oid
+        } else {
+            left.type_oid
+        }
     } else {
-        right_oid_final
+        declared_left
     };
-    Ok(Some(ExprType::scalar(result_oid, true)))
+    let typmod = (result_oid == left.type_oid)
+        .then_some(left.typmod)
+        .flatten();
+    Ok(Some(ExprType::scalar_with_typmod(result_oid, true, typmod)))
 }
 
-/// `expr IS [NOT] DISTINCT FROM other` — shares op_name "=" with ordinary
-/// equality but PG guarantees the result is ALWAYS bool NOT NULL (the whole
-/// point of the construct is NULL-aware comparison). Handled up front so
-/// operand nullability doesn't bleed into the result.
+/// `expr IS [NOT] DISTINCT FROM other` — PG's `transformAExprDistinct`:
+/// when either raw side is an undecorated `NULL` it becomes a NullTest of
+/// the other side (`$1 IS DISTINCT FROM NULL` is `$1 IS NOT NULL`, which
+/// leaves `$1` untypable); otherwise the `=` operator is resolved like any
+/// other. The result is always bool NOT NULL.
 fn handle_distinct_from(
     expr: &protobuf::AExpr,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<Option<ExprType>, AnalyzeError> {
-    let Ctx { snapshot, .. } = ctx;
     if !matches!(
         protobuf::AExprKind::try_from(expr.kind),
         Ok(protobuf::AExprKind::AexprDistinct) | Ok(protobuf::AExprKind::AexprNotDistinct)
     ) {
         return Ok(None);
     }
-    let left = expr
-        .lexpr
-        .as_ref()
-        .map(|n| infer_expr(n, ctx, params, TypeGoal::NONE))
-        .transpose()?;
-    let left_oid = left.as_ref().map(|l| l.type_oid).unwrap_or(oid::UNKNOWN);
-    let right = expr
-        .rexpr
-        .as_ref()
-        .map(|n| infer_expr(n, ctx, params, TypeGoal::NONE))
-        .transpose()?;
-    let right_oid = right.as_ref().map(|r| r.type_oid).unwrap_or(oid::UNKNOWN);
-
-    // PG transforms the construct through the `=` operator's resolution:
-    // an UNKNOWN side is assumed to be the concrete peer's type (re-infer to
-    // pin params / validate literal content); two concrete sides must have
-    // an actual `=` overload — a goal-driven coercion check would wrongly
-    // reject comparable pairs like `int4 IS DISTINCT FROM numeric`.
-    if left_oid != oid::UNKNOWN && right_oid == oid::UNKNOWN {
-        if let Some(rexpr) = &expr.rexpr {
-            coerce_unknown_to(rexpr, ctx, params, snapshot.unwrap_domain(left_oid))?;
-        }
-    } else if left_oid == oid::UNKNOWN && right_oid != oid::UNKNOWN {
-        if let Some(lexpr) = &expr.lexpr {
-            coerce_unknown_to(lexpr, ctx, params, snapshot.unwrap_domain(right_oid))?;
-        }
-    } else if left_oid != oid::UNKNOWN
-        && right_oid != oid::UNKNOWN
-        && snapshot
-            .find_operator("=", Some(left_oid), right_oid)
-            .is_none()
-    {
-        // PG: `operator does not exist: <left> = <right>` — domain names
-        // are reported as-is (`email = integer`), not unwrapped.
-        let l = crate::ddl::util::format_type_for_message(snapshot, left_oid);
-        let r = crate::ddl::util::format_type_for_message(snapshot, right_oid);
-        return Err(crate::pgmsg::operator_does_not_exist(&l, "=", &r, None).finalize_implicit());
+    let (Some(lexpr), Some(rexpr)) = (expr.lexpr.as_deref(), expr.rexpr.as_deref()) else {
+        return Err(AnalyzeError::Internal(
+            "IS DISTINCT FROM without operands".into(),
+        ));
+    };
+    let is_null_const =
+        |n: &protobuf::Node| matches!(n.node.as_ref(), Some(node::Node::AConst(c)) if c.isnull);
+    let null_test_of = if is_null_const(rexpr) {
+        Some(lexpr)
+    } else if is_null_const(lexpr) {
+        Some(rexpr)
+    } else {
+        None
+    };
+    if let Some(arg) = null_test_of {
+        let t = protobuf::NullTest {
+            arg: Some(Box::new(arg.clone())),
+            nulltesttype: protobuf::NullTestType::IsNotNull as i32,
+            ..Default::default()
+        };
+        let n = protobuf::Node {
+            node: Some(node::Node::NullTest(Box::new(t))),
+        };
+        infer_expr(&n, ctx, params, TypeGoal::NONE)?;
+    } else {
+        infer_synthetic_op("=", lexpr, rexpr, expr.location, ctx, params)?;
     }
     Ok(Some(ExprType::scalar(oid::BOOL, false)))
 }
@@ -311,7 +289,7 @@ fn handle_in_list(
 
 /// Resolve `l op r` exactly as a written binary operator would be — the
 /// rewrite target of BETWEEN / IN (PG's `makeSimpleA_Expr` + transform).
-fn infer_synthetic_op(
+pub(crate) fn infer_synthetic_op(
     op: &str,
     l: &protobuf::Node,
     r: &protobuf::Node,
@@ -333,7 +311,7 @@ fn infer_synthetic_op(
 
 /// A `NULL::T` node standing for "some value of type T" (the folded array
 /// element of an IN list).
-fn typed_null(t: PgTypeOid) -> protobuf::Node {
+pub(crate) fn typed_null(t: PgTypeOid) -> protobuf::Node {
     let null = protobuf::Node {
         node: Some(node::Node::AConst(protobuf::AConst {
             isnull: true,

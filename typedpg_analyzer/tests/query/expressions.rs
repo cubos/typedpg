@@ -341,7 +341,7 @@ fn simple_case_when_value_needs_equality_overload_not_coercion() {
 #[test]
 fn simple_case_when_value_without_equality_operator_rejected() {
     let db = setup();
-    assert_analyze_err!(
+    assert_err_prefix!(
         db.analyze("SELECT CASE age WHEN true THEN 'x' END FROM users"),
         AnalyzeError::UndefinedOperator(_),
         "operator does not exist: integer = boolean",
@@ -1372,6 +1372,150 @@ fn both_unknown_operator_with_many_overloads_is_not_unique() {
         "got: {err}"
     );
     db.analyze("SELECT NULL = NULL").unwrap();
+}
+
+// ── typmod through CASE / COALESCE / GREATEST / ARRAY / sublinks / casts ────
+
+#[test]
+fn typmod_follows_pg_expr_typmod_rules() {
+    // atttypmod of the equivalent view columns on PG 18.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE t (
+            vc varchar(10) NOT NULL, nm numeric(10,2) NOT NULL, c char(5) NOT NULL,
+            ts timestamp(3) NOT NULL, b bool NOT NULL, tarr text[] NOT NULL,
+            vc2 varchar(20)
+         );",
+    )
+    .unwrap();
+    let s = db
+        .analyze(
+            "SELECT (SELECT vc FROM t LIMIT 1) AS a, COALESCE(vc, vc) AS b, \
+             CASE WHEN b THEN vc ELSE vc END AS c, GREATEST(vc, vc) AS d, ARRAY[vc] AS e, \
+             vc::varchar AS f, nm::numeric AS g, c::bpchar AS h, ts::timestamp AS i, \
+             tarr::varchar(2)[] AS j, (SELECT nm FROM t LIMIT 1) AS k, \
+             COALESCE(vc, NULL) AS l, CASE WHEN b THEN vc END AS m, COALESCE(vc, vc2) AS n, \
+             ARRAY(SELECT vc FROM t) AS x \
+             FROM t",
+        )
+        .unwrap();
+    assert_cols(
+        &s,
+        vec![
+            cn("a", varchar_n(10)),
+            c("b", varchar_n(10)),
+            c("c", varchar_n(10)),
+            c("d", varchar_n(10)),
+            c("e", array_of(varchar_n(10))),
+            c("f", varchar()),
+            c("g", numeric()),
+            c("h", bpchar()),
+            c("i", timestamp()),
+            c("j", array_of(varchar_n(2))),
+            cn("k", numeric_ps(10, 2)),
+            c("l", varchar()),
+            cn("m", varchar()),
+            c("n", varchar()),
+            c("x", array_of(varchar_n(10))),
+        ],
+    );
+}
+
+#[test]
+fn nullif_result_is_the_operators_coerced_left_input() {
+    // transformAExprNullIf: the result type is the left input of the
+    // resolved `=` — varchar has no `=`, so `text = text` wins and the
+    // result is text; numeric's own `=` keeps numeric(10,2).
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE t (vc varchar(10) NOT NULL, nm numeric(10,2) NOT NULL, b bool NOT NULL);",
+    )
+    .unwrap();
+    let s = db
+        .analyze(
+            "SELECT NULLIF(vc, 'x') AS a, NULLIF(vc, vc) AS b, NULLIF(nm, 0) AS c, \
+             NULLIF(nm, 1.5) AS d FROM t",
+        )
+        .unwrap();
+    assert_cols(
+        &s,
+        vec![
+            cn("a", text()),
+            cn("b", text()),
+            cn("c", numeric_ps(10, 2)),
+            cn("d", numeric_ps(10, 2)),
+        ],
+    );
+    assert_err_prefix!(
+        db.analyze("SELECT NULLIF(b, 1) FROM t"),
+        AnalyzeError::UndefinedOperator(_),
+        "operator does not exist: boolean = integer"
+    );
+    assert_err_prefix!(
+        db.analyze("SELECT NULLIF(1, 'x')"),
+        AnalyzeError::InvalidLiteral(_),
+        "invalid input syntax for type integer: \"x\""
+    );
+}
+
+#[test]
+fn case_resolves_the_else_branch_first() {
+    // transformCaseExpr puts the ELSE result first in select_common_type.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE t (b bool NOT NULL, vc varchar(10) NOT NULL, c char(5) NOT NULL);")
+        .unwrap();
+    let s = db
+        .analyze("SELECT CASE WHEN b THEN vc ELSE c END AS a FROM t")
+        .unwrap();
+    assert_cols(&s, vec![c("a", bpchar())]);
+    assert_err_prefix!(
+        db.analyze("SELECT CASE WHEN b THEN 1 ELSE 'x'::text END FROM t"),
+        AnalyzeError::DatatypeMismatch(_),
+        "CASE types text and integer cannot be matched"
+    );
+    assert_err_prefix!(
+        db.analyze("SELECT CASE WHEN b THEN 1 WHEN b THEN 2.5 ELSE true END FROM t"),
+        AnalyzeError::DatatypeMismatch(_),
+        "CASE types boolean and integer cannot be matched"
+    );
+    assert_err_prefix!(
+        db.analyze("SELECT COALESCE(1, true)"),
+        AnalyzeError::DatatypeMismatch(_),
+        "COALESCE types integer and boolean cannot be matched"
+    );
+    assert_err_prefix!(
+        db.analyze("SELECT GREATEST(1, 'a'::text)"),
+        AnalyzeError::DatatypeMismatch(_),
+        "GREATEST types integer and text cannot be matched"
+    );
+}
+
+#[test]
+fn simple_case_untyped_test_is_text_and_distinct_from_null_is_a_null_test() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE t (vc varchar(10) NOT NULL);")
+        .unwrap();
+    // An untyped CASE test expression is forced to text.
+    assert_err_prefix!(
+        db.analyze("SELECT CASE $p WHEN 1 THEN 'a' END AS a"),
+        AnalyzeError::UndefinedOperator(_),
+        "operator does not exist: text = integer"
+    );
+    // `x IS DISTINCT FROM NULL` is `x IS NOT NULL`: nothing types $p.
+    assert_err_prefix!(
+        db.analyze("SELECT $p IS DISTINCT FROM NULL AS a"),
+        AnalyzeError::IndeterminateType(_),
+        "could not determine data type of parameter $1"
+    );
+    // WHEN values are typed by the `=` PG resolves against the test.
+    let s = db
+        .analyze("SELECT CASE 1 WHEN $p THEN 'a' END AS a")
+        .unwrap();
+    assert_params(&s, vec![p(int4())]);
+    let s = db
+        .analyze("SELECT CASE vc WHEN $p THEN 'a' END AS a FROM t")
+        .unwrap();
+    assert_params(&s, vec![p(text())]);
 }
 
 #[test]

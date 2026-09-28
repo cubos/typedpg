@@ -10,8 +10,7 @@
 use crate::oid::{PgClassOid, PgExtensionOid, PgNamespaceOid, PgTypeOid};
 use crate::pg_catalog::{
     CastContext, CastMethod, DepType, PG_CLASS_RELID, PG_EXTENSION_RELID, PG_TYPE_RELID,
-    PgAttribute, PgCast, PgCatalog, PgClass, PgDepend, PgOperator, PgProc, PgType, TypCategory,
-    TypType, oid,
+    PgAttribute, PgCast, PgCatalog, PgClass, PgDepend, PgOperator, PgProc, PgType, TypType, oid,
 };
 
 /// Result of operator resolution: operand and result OIDs with any
@@ -233,17 +232,6 @@ impl PgCatalog {
             .values()
             .find(|r| r.rngmultitypid == Some(multirange_oid))
             .map(|r| r.rngtypid)
-    }
-
-    /// The preferred type of a given `pg_type.typcategory`. Used when the
-    /// analyzer needs to pick a concrete type for an expression whose inputs
-    /// are all UNKNOWN (string-category literals default to `text`, numeric
-    /// literals to `numeric`, etc.).
-    pub(crate) fn preferred_type_in_category(&self, category: TypCategory) -> Option<PgTypeOid> {
-        self.pg_type
-            .values()
-            .find(|t| t.typcategory == category && t.typispreferred)
-            .map(|t| t.oid)
     }
 
     /// Check if an implicit cast exists from `source` to `target`.

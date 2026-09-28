@@ -165,18 +165,12 @@ pub(crate) fn infer_type_cast(
         .finalize_implicit());
     }
 
-    // PG: an explicit cast `x::T(n)` carries the target's typmod through.
-    // When the cast omits typmods (`x::T`), keep the operand's typmod only
-    // when the type OID is unchanged — coercing across types strips it.
-    let target_typmod = match cast.type_name.as_ref() {
-        Some(tn) if !tn.typmods.is_empty() => written_typmod,
-        _ if target_oid == inner_type.type_oid => inner_type.typmod,
-        _ => None,
-    };
-
+    // PG: the cast result has exactly the written typmod — `x::T(n)` is
+    // T(n), and `x::T` is T with typmod -1 even when x already was a T(n)
+    // (coerce_type_typmod relabels to the target typmod).
     Ok(ExprType::scalar_with_typmod(
         target_oid,
         inner_type.nullable,
-        target_typmod,
+        written_typmod,
     ))
 }

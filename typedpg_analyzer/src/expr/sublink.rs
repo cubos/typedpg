@@ -41,7 +41,11 @@ pub(crate) fn infer_sublink(
                 } else {
                     true
                 };
-                return Ok(ExprType::scalar(first.type_oid, nullable));
+                return Ok(ExprType::scalar_with_typmod(
+                    first.type_oid,
+                    nullable,
+                    first.typmod,
+                ));
             }
             Ok(ExprType::scalar(oid::UNKNOWN, true))
         }
@@ -142,10 +146,14 @@ pub(crate) fn infer_sublink(
             // element is itself an array the result is that same array type
             // (a multi-dimensional array), otherwise its array type.
             let mut array_oid = oid::UNKNOWN;
+            let mut typmod = None;
             if let Some(subselect) = &sub.subselect
                 && let Some(node::Node::SelectStmt(sel)) = subselect.node.as_ref()
             {
                 let first = single_sublink_column(sub, sel, ctx, params)?;
+                // The array carries the column's typmod (exprTypmod of an
+                // ARRAY sublink is its subquery column's).
+                typmod = first.typmod;
                 let elem = first.type_oid;
                 let elem_is_array = snapshot
                     .get_type(elem)
@@ -160,7 +168,7 @@ pub(crate) fn infer_sublink(
                     })?
                 };
             }
-            Ok(ExprType::scalar(array_oid, false))
+            Ok(ExprType::scalar_with_typmod(array_oid, false, typmod))
         }
         _ => Err(AnalyzeError::Unsupported(format!(
             "sublink type: {:?}",

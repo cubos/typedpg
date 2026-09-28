@@ -481,65 +481,34 @@ pub(crate) fn infer_expr(
             // doesn't fill in `minmaxtype` without full parse analysis —
             // we resolve the common type from the args and track per-arg
             // nullability.
-            let mut arg_oids = Vec::with_capacity(mm.args.len());
-            let mut all_nullable = true;
-            let mut any_arg = false;
+            let label = match protobuf::MinMaxOp::try_from(mm.op) {
+                Ok(protobuf::MinMaxOp::IsLeast) => "LEAST",
+                _ => "GREATEST",
+            };
+            let mut args = Vec::with_capacity(mm.args.len());
             for arg in &mm.args {
-                let t = infer_expr(arg, ctx, params, TypeGoal::NONE)?;
-                arg_oids.push(t.type_oid);
-                if !t.nullable {
-                    all_nullable = false;
-                }
-                any_arg = true;
+                args.push(infer_expr(arg, ctx, params, TypeGoal::NONE)?);
             }
+            let types: Vec<PgTypeOid> = args.iter().map(|t| t.type_oid).collect();
             let resolved_type = match PgTypeOid::new(mm.minmaxtype) {
                 Some(t) if t != oid::UNKNOWN => t,
-                _ => crate::coerce::find_common_type(&arg_oids, snapshot).ok_or_else(|| {
-                    // PG (SQLSTATE 42804): `GREATEST types X and Y cannot be
-                    // matched` — first/last concrete args, base type names
-                    // (domains resolve over their base), same shape as the
-                    // COALESCE wording.
-                    let label = match protobuf::MinMaxOp::try_from(mm.op) {
-                        Ok(protobuf::MinMaxOp::IsLeast) => "LEAST",
-                        _ => "GREATEST",
-                    };
-                    let concrete: Vec<PgTypeOid> = arg_oids
-                        .iter()
-                        .copied()
-                        .filter(|&t| t != oid::UNKNOWN)
-                        .collect();
-                    let first = crate::ddl::util::format_type_for_message(
-                        snapshot,
-                        snapshot.unwrap_domain(*concrete.first().unwrap_or(&oid::UNKNOWN)),
-                    );
-                    let last = crate::ddl::util::format_type_for_message(
-                        snapshot,
-                        snapshot.unwrap_domain(*concrete.last().unwrap_or(&oid::UNKNOWN)),
-                    );
-                    crate::pgmsg::types_cannot_be_matched(
-                        label,
-                        &first,
-                        &last,
-                        "",
-                        Some(format!(
-                            "add an explicit cast so the arguments share a type, e.g. `expr::{last}`"
-                        )),
-                    )
-                    .finalize_implicit()
-                })?,
+                _ => select_common_type(label, &types, snapshot)?,
             };
             // Back-fill UNKNOWN args with the resolved common type so
             // embedded params get pinned and string-literal contents are
             // validated (PG rejects `GREATEST(1, 'x')` at parse time).
-            if resolved_type != oid::UNKNOWN {
-                for (arg, &t) in mm.args.iter().zip(&arg_oids) {
-                    if t == oid::UNKNOWN {
-                        coerce_unknown_to(arg, ctx, params, resolved_type)?;
-                    }
+            for (arg, t) in mm.args.iter().zip(&args) {
+                if t.type_oid == oid::UNKNOWN {
+                    coerce_unknown_to(arg, ctx, params, resolved_type)?;
                 }
             }
             // GREATEST/LEAST over ≥1 NOT NULL arg are never NULL.
-            Ok(ExprType::scalar(resolved_type, !any_arg || all_nullable))
+            let nullable = args.is_empty() || args.iter().all(|t| t.nullable);
+            Ok(ExprType::scalar_with_typmod(
+                resolved_type,
+                nullable,
+                agreed_typmod(&args, resolved_type),
+            ))
         }
         node::Node::AIndirection(ind) => infer_indirection(ind, ctx, params),
         node::Node::AArrayExpr(arr) => infer_array_expr(arr, ctx, params),
