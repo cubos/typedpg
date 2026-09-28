@@ -526,3 +526,34 @@ fn create_index_target_errors() {
          CREATE INDEX ON mv (a);",
     )]);
 }
+
+#[test]
+fn stable_functions_are_not_immutable_in_indexes_or_generated_columns() {
+    // PG 18: CheckMutability rejects STABLE callees too; a STABLE SQL
+    // function that inlines to an immutable expression is fine.
+    for (sql, msg) in [
+        (
+            "CREATE TABLE t (a int); CREATE INDEX ON t ((now()));",
+            "functions in index expression must be marked IMMUTABLE",
+        ),
+        (
+            "CREATE TABLE t (ts timestamptz); CREATE INDEX ON t ((to_char(ts, 'YYYY')));",
+            "functions in index expression must be marked IMMUTABLE",
+        ),
+        (
+            "CREATE TABLE g (a timestamptz GENERATED ALWAYS AS (now()) STORED);",
+            "generation expression is not immutable",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", sql)]).expect_err(sql);
+        assert!(err.to_string().starts_with(msg), "{sql}\n  got: {err}");
+    }
+    build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int, d text);
+         CREATE INDEX ON t (lower(d));
+         CREATE INDEX ON t (abs(a));
+         CREATE FUNCTION s1(int) RETURNS int STABLE LANGUAGE sql AS 'select $1';
+         CREATE INDEX ON t (s1(a));",
+    )]);
+}

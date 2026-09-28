@@ -1,17 +1,15 @@
-//! Volatility check for DDL expressions.
+//! Mutability check for DDL expressions.
 //!
-//! PostgreSQL forbids `VOLATILE` (and in some contexts also `STABLE`)
-//! functions inside `CHECK` constraints, `GENERATED ... STORED`
-//! expressions, and index expressions — the constraint or generated
-//! value would otherwise return different results between rows or
-//! between scans, breaking the on-disk invariants those features rely
-//! on.
+//! PostgreSQL requires index expressions and `GENERATED ... STORED`
+//! expressions to be IMMUTABLE (`CheckMutability`, after
+//! `expression_planner` has inlined simple SQL functions): a VOLATILE *or
+//! STABLE* callee is rejected. CHECK constraints are not checked at DDL
+//! time.
 //!
-//! This module walks the expression AST, resolves each `FuncCall` to a
-//! `pg_proc` row in the catalog, and rejects callees whose
-//! `provolatile` is `Volatile`. STABLE callees are accepted today —
-//! PG actually rejects them too in CHECK / GENERATED / index, but we
-//! treat that gap as a separate todo.
+//! This module walks the expression AST and resolves each `FuncCall`
+//! against `pg_proc`. Without argument types at hand it takes the
+//! overloads that can take the call's argument count and rejects the call
+//! when none of them is IMMUTABLE.
 
 use pg_query::protobuf::{self, node};
 
@@ -35,20 +33,42 @@ fn funcname_parts(funcname: &[protobuf::Node]) -> Option<(Option<&str>, &str)> {
     }
 }
 
-/// Returns the volatility of a `FuncCall` by resolving it against
-/// `pg_proc` (any overload — provolatile is per-name in our scope), and the
-/// body PG would inline in its place, if any. `None` if the call doesn't
-/// resolve to a known function.
+/// The mutability of a `FuncCall`: whether every overload that can take
+/// the call's arguments is non-IMMUTABLE, and the body PG would inline in
+/// the call's place when exactly one overload fits and is inlinable.
+/// `None` if no function of that name fits.
 fn funcall_volatility<'a>(
     fc: &protobuf::FuncCall,
     snapshot: &'a PgCatalog,
 ) -> Option<(ProVolatile, Option<&'a protobuf::Node>)> {
     let (schema, name) = funcname_parts(&fc.funcname)?;
-    snapshot
+    let nargs = fc.args.len();
+    let fits: Vec<&crate::pg_catalog::PgProc> = snapshot
         .find_functions(schema, name)
         .into_iter()
-        .next()
-        .map(|p| (p.provolatile, snapshot.inline_sql_bodies.get(&p.oid)))
+        .filter(|p| {
+            let pronargs = p.proargtypes.len();
+            let defaults = p.pronargdefaults.max(0) as usize;
+            pronargs == nargs
+                || (pronargs > nargs && pronargs - defaults <= nargs)
+                || (p.provariadic.is_some() && nargs + 1 >= pronargs)
+        })
+        .collect();
+    if fits.is_empty() {
+        return None;
+    }
+    let least = if fits.iter().any(|p| p.provolatile == ProVolatile::Immutable) {
+        ProVolatile::Immutable
+    } else if fits.iter().any(|p| p.provolatile == ProVolatile::Stable) {
+        ProVolatile::Stable
+    } else {
+        ProVolatile::Volatile
+    };
+    let inline = match fits.as_slice() {
+        [only] => snapshot.inline_sql_bodies.get(&only.oid),
+        _ => None,
+    };
+    Some((least, inline))
 }
 
 /// Inlining depth cap: PG refuses to inline a function into itself.
@@ -98,7 +118,9 @@ fn walk(
     };
     match inner {
         node::Node::FuncCall(fc) => {
-            if let Some((ProVolatile::Volatile, inline)) = funcall_volatility(fc, snapshot) {
+            if let Some((ProVolatile::Volatile | ProVolatile::Stable, inline)) =
+                funcall_volatility(fc, snapshot)
+            {
                 // expression_planner inlines a simple SQL function before
                 // CheckMutability looks at it (inline_function): what
                 // counts is the body's volatility, not the declaration's.
