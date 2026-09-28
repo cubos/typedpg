@@ -22,6 +22,7 @@ pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Res
     // Input parameters declared with a DEFAULT — PG only allows them as a
     // trailing run, so the count alone locates them.
     let mut pronargdefaults: i16 = 0;
+    let mut proargdefaulttypes: Vec<PgTypeOid> = Vec::new();
     for param_node in &stmt.parameters {
         let Some(node::Node::FunctionParameter(fp)) = param_node.node.as_ref() else {
             continue;
@@ -51,8 +52,32 @@ pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Res
             FunctionParameterMode::FuncParamTable => ArgMode::Table,
         };
 
-        if fp.defexpr.is_some() && !matches!(arg_mode, ArgMode::Out | ArgMode::Table) {
-            pronargdefaults += 1;
+        // interpret_function_parameter_list: only input parameters take a
+        // DEFAULT, and once one does every later input parameter must too.
+        let is_input = !matches!(arg_mode, ArgMode::Out | ArgMode::Table);
+        match fp.defexpr.as_deref() {
+            Some(_) if !is_input => {
+                return Err(DdlError::Parse(
+                    "only input parameters can have default values".into(),
+                ));
+            }
+            Some(expr) => {
+                pronargdefaults += 1;
+                let polymorphic = crate::polymorphic::is_polymorphic(resolved_oid);
+                proargdefaulttypes.push(super::defaults::check_function_default(
+                    interp,
+                    expr,
+                    resolved_oid,
+                    polymorphic,
+                )?);
+            }
+            None if is_input && pronargdefaults > 0 => {
+                return Err(DdlError::Parse(
+                    "input parameters after one with a default value must also have defaults"
+                        .into(),
+                ));
+            }
+            None => {}
         }
         match arg_mode {
             ArgMode::In => proargtypes.push(resolved_oid),
@@ -234,6 +259,7 @@ pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Res
         proargmodes,
         proargnames,
         provolatile,
+        proargdefaulttypes,
     };
     interp.insert_pg_proc(proc.clone());
     if let Some(body) = super::function_body::inlinable_body(stmt, &proc) {

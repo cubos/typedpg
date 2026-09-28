@@ -594,3 +594,98 @@ fn inlinable_sql_functions_are_judged_by_their_body() {
         "{err}"
     );
 }
+
+// ── Parameter defaults (interpret_function_parameter_list / ParseFuncOrColumn)
+
+#[test]
+fn polymorphic_parameter_defaults_take_part_in_resolution() {
+    // PG 18: the default of a polymorphic parameter keeps its own type,
+    // and an omitted parameter's default type counts when the call's
+    // polymorphic types are resolved.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE FUNCTION pd(a anyelement, b anyelement DEFAULT 1) RETURNS anyelement
+             LANGUAGE sql AS 'select a';
+         CREATE FUNCTION pd2(a anyelement DEFAULT 1::int8) RETURNS anyelement
+             LANGUAGE sql AS 'select a';
+         CREATE FUNCTION pd3(a int, b anyelement DEFAULT 'x'::text) RETURNS anyelement
+             LANGUAGE sql AS 'select b';
+         CREATE FUNCTION pd4(a anyelement DEFAULT NULL) RETURNS anyelement
+             LANGUAGE sql AS 'select a';
+         CREATE FUNCTION pd5(a anycompatible, b anycompatible DEFAULT 1) RETURNS anycompatible
+             LANGUAGE sql AS 'select a';",
+    )]);
+    for (sql, msg) in [
+        (
+            "SELECT pd(1.5)",
+            "arguments declared \"anyelement\" are not all alike",
+        ),
+        (
+            "SELECT pd('x'::text)",
+            "arguments declared \"anyelement\" are not all alike",
+        ),
+        (
+            "SELECT pd4()",
+            "could not determine polymorphic type because input has type unknown",
+        ),
+    ] {
+        let err = db.analyze(sql).expect_err(sql);
+        assert!(err.to_string().starts_with(msg), "{sql}\n  got: {err}");
+    }
+    assert_cols(&db.analyze("SELECT pd(2)").unwrap(), vec![cn("pd", int4())]);
+    assert_cols(
+        &db.analyze("SELECT pd2()").unwrap(),
+        vec![cn("pd2", int8())],
+    );
+    assert_cols(
+        &db.analyze("SELECT pd2(1)").unwrap(),
+        vec![cn("pd2", int4())],
+    );
+    assert_cols(
+        &db.analyze("SELECT pd3(1)").unwrap(),
+        vec![cn("pd3", text())],
+    );
+    assert_cols(
+        &db.analyze("SELECT pd5(1.5)").unwrap(),
+        vec![cn("pd5", numeric())],
+    );
+}
+
+#[test]
+fn parameter_defaults_are_checked() {
+    for (sql, msg) in [
+        (
+            "CREATE FUNCTION f1(a int DEFAULT 'x') RETURNS int LANGUAGE sql AS 'select 1';",
+            "invalid input syntax for type integer: \"x\"",
+        ),
+        (
+            "CREATE FUNCTION f2(a int DEFAULT now()) RETURNS int LANGUAGE sql AS 'select 1';",
+            "argument of DEFAULT must be type integer, not type timestamp with time zone",
+        ),
+        (
+            "CREATE FUNCTION f4(a int DEFAULT 1, b int) RETURNS int LANGUAGE sql AS 'select 1';",
+            "input parameters after one with a default value must also have defaults",
+        ),
+        (
+            "CREATE FUNCTION f5(a int, b int DEFAULT a) RETURNS int LANGUAGE sql AS 'select 1';",
+            "column \"a\" does not exist",
+        ),
+        (
+            "CREATE FUNCTION f6(a int DEFAULT (select 1)) RETURNS int LANGUAGE sql AS 'select 1';",
+            "cannot use subquery in DEFAULT expression",
+        ),
+        (
+            "CREATE FUNCTION f9(OUT a int DEFAULT 1) RETURNS int LANGUAGE sql AS 'select 1';",
+            "only input parameters can have default values",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", sql)]).expect_err(sql);
+        assert!(err.to_string().starts_with(msg), "{sql}\n  got: {err}");
+    }
+    // Assignment-castable defaults are fine.
+    build_db(&[(
+        "0001.sql",
+        "CREATE FUNCTION f3(a int DEFAULT 1.5) RETURNS int LANGUAGE sql AS 'select 1';
+         CREATE FUNCTION f7(a text DEFAULT 5) RETURNS int LANGUAGE sql AS 'select 1';",
+    )]);
+}

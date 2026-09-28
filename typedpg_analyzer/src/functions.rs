@@ -144,6 +144,9 @@ struct Candidate<'a> {
     /// call's arguments, the remaining `ndargs` come from defaults.
     args: Vec<PgTypeOid>,
     ndargs: usize,
+    /// The `proargtypes` positions of the defaulted parameters, in the
+    /// order they follow the call's arguments in `args`.
+    default_params: Vec<usize>,
     nvargs: usize,
     /// Index of the candidate's schema on the search path.
     pathpos: usize,
@@ -272,12 +275,18 @@ pub(crate) fn func_get_detail(
         .finalize_implicit());
     }
 
-    // `ParseFuncOrColumn`: resolve the polymorphic parameters (defaults
-    // contribute no actual type — we don't model their expressions).
+    // `ParseFuncOrColumn`: resolve the polymorphic parameters, the omitted
+    // parameters taking part with their default expressions' types.
     let mut declared = cand.args.clone();
+    let mut actuals = arg_types.to_vec();
+    actuals.extend(
+        cand.default_params
+            .iter()
+            .map(|&pp| default_arg_type(f, pp)),
+    );
     let rettype = aggregate_final_return(f, snapshot).unwrap_or(f.prorettype);
     let (return_type_oid, poly) = crate::polymorphic::enforce_generic_type_consistency(
-        arg_types,
+        &actuals,
         &mut declared,
         rettype,
         snapshot,
@@ -411,12 +420,13 @@ fn func_candidates<'a>(
             if pronargs < nargs || (pronargs > nargs && nargs + defaults < pronargs) {
                 continue;
             }
-            let Some(args) = match_named_call(f, nargs, notation) else {
+            let Some(order) = match_named_call(f, nargs, notation) else {
                 continue;
             };
             Candidate {
                 proc: f,
-                args,
+                args: order.iter().map(|&pp| f.proargtypes[pp]).collect(),
+                default_params: order[nargs..].to_vec(),
                 ndargs: pronargs - nargs,
                 nvargs: 0,
                 pathpos,
@@ -444,6 +454,7 @@ fn func_candidates<'a>(
                 proc: f,
                 args,
                 ndargs: pronargs.saturating_sub(nargs),
+                default_params: (nargs..pronargs).collect(),
                 nvargs,
                 pathpos,
                 ambiguous: false,
@@ -482,12 +493,12 @@ fn func_candidates<'a>(
 }
 
 /// PG's `MatchNamedCall` (namespace.c): map a named/mixed-notation call
-/// with `nargs` arguments onto `f`'s input parameters. Returns `f`'s
-/// parameter types in the call's argument order, followed by the omitted
-/// (defaulted) parameters in declaration order, or `None` when the names
-/// don't fit — an unknown name, a name repeating a positional argument, or
-/// an omitted parameter without a default.
-fn match_named_call(f: &PgProc, nargs: usize, notation: &CallNotation) -> Option<Vec<PgTypeOid>> {
+/// with `nargs` arguments onto `f`'s input parameters. Returns the
+/// parameter positions in the call's argument order, followed by the
+/// omitted (defaulted) parameters in declaration order, or `None` when the
+/// names don't fit — an unknown name, a name repeating a positional
+/// argument, or an omitted parameter without a default.
+fn match_named_call(f: &PgProc, nargs: usize, notation: &CallNotation) -> Option<Vec<usize>> {
     let pronargs = f.proargtypes.len();
     let defaults = f.pronargdefaults.max(0) as usize;
     // Input-parameter names in `proargtypes` order. With `proargmodes` set,
@@ -526,7 +537,20 @@ fn match_named_call(f: &PgProc, nargs: usize, notation: &CallNotation) -> Option
             order.push(pp);
         }
     }
-    Some(order.iter().map(|&pp| f.proargtypes[pp]).collect())
+    Some(order)
+}
+
+/// The type of the default expression of `f`'s parameter `pp`
+/// (`proargdefaults` covers the trailing `pronargdefaults` parameters).
+fn default_arg_type(f: &PgProc, pp: usize) -> PgTypeOid {
+    let first_default = f
+        .proargtypes
+        .len()
+        .saturating_sub(f.pronargdefaults.max(0) as usize);
+    pp.checked_sub(first_default)
+        .and_then(|i| f.proargdefaulttypes.get(i))
+        .copied()
+        .unwrap_or(f.proargtypes[pp])
 }
 
 /// PG's `func_match_argtypes` (parse_func.c): the candidates (indexes into

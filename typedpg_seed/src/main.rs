@@ -347,7 +347,11 @@ fn export_procs(client: &mut postgres::Client) -> Result<Vec<PgProc>, postgres::
                 p.proargtypes::int4[]::int4[], p.prorettype, \
                 p.proretset, p.provariadic, p.proisstrict, p.pronargdefaults, \
                 p.proallargtypes::int4[], p.proargmodes, p.proargnames, \
-                p.provolatile \
+                p.provolatile, \
+                (SELECT coalesce(array_agg(t.typtype = 'p' AND t.typname LIKE 'any%' \
+                                           ORDER BY u.ord), '{}') \
+                   FROM unnest(p.proargtypes::oid[]) WITH ORDINALITY u(o, ord) \
+                   JOIN pg_catalog.pg_type t ON t.oid = u.o) \
          FROM pg_catalog.pg_proc p \
          ORDER BY p.oid",
         &[],
@@ -383,6 +387,22 @@ fn export_procs(client: &mut postgres::Client) -> Result<Vec<PgProc>, postgres::
             let pronamespace: u32 = r.get(2);
             let prorettype: u32 = r.get(5);
             let provariadic: u32 = r.get(7);
+            let pronargdefaults: i16 = r.get(9);
+            let polymorphic_args: Vec<bool> = r.get(14);
+            // The builtin defaults' types: a default of a non-polymorphic
+            // parameter was coerced to the parameter's type when the
+            // function was created, so its type is the declared one. A
+            // polymorphic parameter's default keeps its own type, which the
+            // catalog doesn't expose — refuse to guess.
+            let first_default = proargtypes.len().saturating_sub(pronargdefaults as usize);
+            if polymorphic_args.iter().skip(first_default).any(|&p| p) {
+                panic!(
+                    "pg_proc {oid} ({}) has a default on a polymorphic parameter; \
+                     typedpg_seed can't export its type",
+                    r.get::<_, String>(1)
+                );
+            }
+            let proargdefaulttypes = proargtypes[first_default..].to_vec();
             PgProc {
                 oid: PgProcOid::new(oid).expect("pg_proc.oid is non-zero"),
                 proname: r.get(1),
@@ -393,11 +413,12 @@ fn export_procs(client: &mut postgres::Client) -> Result<Vec<PgProc>, postgres::
                 proretset: r.get(6),
                 provariadic: PgTypeOid::new(provariadic),
                 proisstrict: r.get(8),
-                pronargdefaults: r.get(9),
+                pronargdefaults,
                 proallargtypes,
                 proargmodes,
                 proargnames: arg_names.unwrap_or_default(),
                 provolatile: char_to_provolatile(provolatile as u8 as char),
+                proargdefaulttypes,
             }
         })
         .collect())

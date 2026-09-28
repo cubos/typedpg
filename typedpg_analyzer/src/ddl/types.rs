@@ -629,6 +629,7 @@ pub fn create_range(interp: &mut PgCatalog, stmt: &CreateRangeStmt) -> Result<()
             pronargdefaults: 0,
             proargnames: Vec::new(),
             provolatile: crate::pg_catalog::ProVolatile::Immutable,
+            proargdefaulttypes: Vec::new(),
         });
     }
     Ok(())

@@ -631,6 +631,13 @@ pub struct PgProc {
     /// Volatility category. Drives DDL validation that requires IMMUTABLE
     /// callees (CHECK / GENERATED / index expressions).
     pub provolatile: ProVolatile,
+    /// Type of each `proargdefaults` expression, parallel to the trailing
+    /// `pronargdefaults` input parameters (`exprType` of the stored
+    /// default). A default of a non-polymorphic parameter is coerced to the
+    /// parameter's type at CREATE FUNCTION, so only a polymorphic
+    /// parameter's default can differ — and its type takes part in
+    /// resolving the call's polymorphic types (`ParseFuncOrColumn`).
+    pub proargdefaulttypes: Vec<PgTypeOid>,
 }
 
 /// `pg_aggregate`: extra metadata for aggregate `pg_proc` rows.

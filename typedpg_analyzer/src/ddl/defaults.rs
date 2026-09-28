@@ -26,7 +26,7 @@ pub(crate) fn check_default(
     name: &str,
     type_oid: PgTypeOid,
 ) -> Result<PgTypeOid, DdlError> {
-    check_default_kind(interp, expr)?;
+    check_default_kind(interp, expr, true)?;
 
     let scope = Scope::default();
     let null_ctx = NullabilityContext::default();
@@ -58,15 +58,63 @@ pub(crate) fn check_default(
     Ok(result.type_oid)
 }
 
+/// Check `expr` as the DEFAULT of a function parameter of type
+/// `param_type` (`interpret_function_parameter_list`): transformed in
+/// `EXPR_KIND_FUNCTION_DEFAULT`, then coerced to the parameter's type
+/// (`coerce_to_specific_type`, assignment rules) — unless the parameter is
+/// polymorphic, where the default keeps its own type. Returns the stored
+/// default's type.
+pub(crate) fn check_function_default(
+    interp: &PgCatalog,
+    expr: &protobuf::Node,
+    param_type: PgTypeOid,
+    polymorphic: bool,
+) -> Result<PgTypeOid, DdlError> {
+    check_default_kind(interp, expr, false)?;
+    let scope = Scope::default();
+    let null_ctx = NullabilityContext::default();
+    let mut params = ParamCollector::default();
+    let ctx = || crate::expr::Ctx::new(&scope, &null_ctx, interp);
+    let wrap = |e: crate::error::AnalyzeError| DdlError::UnsupportedDdl(format!("{e}"));
+    let result = infer_expr(expr, ctx(), &mut params, TypeGoal::NONE).map_err(wrap)?;
+    if polymorphic {
+        return Ok(result.type_oid);
+    }
+    if result.type_oid == oid::UNKNOWN {
+        infer_expr(expr, ctx(), &mut params, TypeGoal::assignment(param_type)).map_err(wrap)?;
+        return Ok(param_type);
+    }
+    if !can_coerce(
+        result.type_oid,
+        param_type,
+        CoercionContext::Assignment,
+        interp,
+    ) {
+        return Err(DdlError::UnsupportedDdl(format!(
+            "argument of DEFAULT must be type {}, not type {}",
+            super::util::format_type_for_message(interp, param_type),
+            super::util::format_type_for_message(interp, result.type_oid),
+        )));
+    }
+    Ok(param_type)
+}
+
 /// The `EXPR_KIND_COLUMN_DEFAULT` restrictions (`transformColumnRef`,
 /// `transformSubLink`, `check_agglevels_and_constraints`,
 /// `transformWindowFuncCall`).
-fn check_default_kind(interp: &PgCatalog, expr: &protobuf::Node) -> Result<(), DdlError> {
+fn check_default_kind(
+    interp: &PgCatalog,
+    expr: &protobuf::Node,
+    column_default: bool,
+) -> Result<(), DdlError> {
+    let check_default_kind = |e: &protobuf::Node| check_default_kind(interp, e, column_default);
     let Some(inner) = expr.node.as_ref() else {
         return Ok(());
     };
     match inner {
-        node::Node::ColumnRef(_) => {
+        // A parameter default has no columns in scope at all: the
+        // reference is simply `column "x" does not exist`.
+        node::Node::ColumnRef(_) if column_default => {
             return Err(DdlError::UnsupportedDdl(
                 "cannot use column reference in DEFAULT expression".into(),
             ));
@@ -104,7 +152,7 @@ fn check_default_kind(interp: &PgCatalog, expr: &protobuf::Node) -> Result<(), D
                 ));
             }
             for arg in &fc.args {
-                check_default_kind(interp, arg)?;
+                check_default_kind(arg)?;
             }
         }
         node::Node::AExpr(e) => {
@@ -112,44 +160,44 @@ fn check_default_kind(interp: &PgCatalog, expr: &protobuf::Node) -> Result<(), D
                 .into_iter()
                 .flatten()
             {
-                check_default_kind(interp, side)?;
+                check_default_kind(side)?;
             }
         }
         node::Node::BoolExpr(b) => {
             for arg in &b.args {
-                check_default_kind(interp, arg)?;
+                check_default_kind(arg)?;
             }
         }
         node::Node::TypeCast(tc) => {
             if let Some(arg) = tc.arg.as_deref() {
-                check_default_kind(interp, arg)?;
+                check_default_kind(arg)?;
             }
         }
         node::Node::CoalesceExpr(c) => {
             for arg in &c.args {
-                check_default_kind(interp, arg)?;
+                check_default_kind(arg)?;
             }
         }
         node::Node::CaseExpr(c) => {
             for part in c.arg.iter().chain(c.defresult.iter()) {
-                check_default_kind(interp, part)?;
+                check_default_kind(part)?;
             }
             for when in &c.args {
                 if let Some(node::Node::CaseWhen(w)) = when.node.as_ref() {
                     for part in w.expr.iter().chain(w.result.iter()) {
-                        check_default_kind(interp, part)?;
+                        check_default_kind(part)?;
                     }
                 }
             }
         }
         node::Node::ArrayExpr(a) => {
             for elem in &a.elements {
-                check_default_kind(interp, elem)?;
+                check_default_kind(elem)?;
             }
         }
         node::Node::RowExpr(r) => {
             for arg in &r.args {
-                check_default_kind(interp, arg)?;
+                check_default_kind(arg)?;
             }
         }
         _ => {}

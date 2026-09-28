@@ -149,6 +149,7 @@ pub fn define_aggregate(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(),
         // the analyzer never traverses an aggregate body in a CHECK /
         // GENERATED / index context anyway.
         provolatile: crate::pg_catalog::ProVolatile::Immutable,
+        proargdefaulttypes: Vec::new(),
     });
     // gram.y's `aggr_args` pairs the argument list with the number of
     // direct arguments: -1 for a plain aggregate, >= 0 for an ordered-set
