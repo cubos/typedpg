@@ -1185,3 +1185,66 @@ fn select_into_creates_a_table() {
         vec![cn("a", int4())],
     );
 }
+
+// ── View nullability follows the base tables (PG re-expands views) ──────────
+
+#[test]
+fn view_nullability_follows_drop_not_null() {
+    // PG 18: after DROP NOT NULL the view returns rows where b IS NULL.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int NOT NULL, b int NOT NULL);
+         CREATE VIEW v AS SELECT a, b FROM t;
+         CREATE VIEW vs AS SELECT * FROM t;
+         CREATE VIEW vv AS SELECT b FROM v;
+         CREATE MATERIALIZED VIEW mv AS SELECT a, b FROM t;
+         ALTER TABLE t ALTER COLUMN b DROP NOT NULL;",
+    )]);
+    assert_cols(
+        &db.analyze("SELECT a, b FROM v").unwrap(),
+        vec![c("a", int4()), cn("b", int4())],
+    );
+    assert_cols(
+        &db.analyze("SELECT a, b FROM vs").unwrap(),
+        vec![c("a", int4()), cn("b", int4())],
+    );
+    assert_cols(
+        &db.analyze("SELECT b FROM vv").unwrap(),
+        vec![cn("b", int4())],
+    );
+    assert_cols(
+        &db.analyze("SELECT a, b FROM mv").unwrap(),
+        vec![c("a", int4()), cn("b", int4())],
+    );
+}
+
+#[test]
+fn view_nullability_follows_set_not_null_and_domains() {
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE DOMAIN d AS int NOT NULL;
+         CREATE TABLE t (a int, x d);
+         CREATE VIEW v AS SELECT a, x FROM t;
+         ALTER TABLE t ALTER COLUMN a SET NOT NULL;
+         ALTER DOMAIN d DROP NOT NULL;",
+    )]);
+    assert_cols(
+        &db.analyze("SELECT a, x FROM v").unwrap(),
+        vec![c("a", int4()), cn("x", domain("public", "d", int4()))],
+    );
+}
+
+#[test]
+fn view_over_renamed_column_becomes_nullable_conservatively() {
+    // The stored body names the old column, so it can't be re-analyzed;
+    // DROP NOT NULL may have introduced NULLs, so the view goes nullable.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int NOT NULL, b int NOT NULL);
+         CREATE VIEW v AS SELECT a, b FROM t;
+         ALTER TABLE t RENAME COLUMN b TO c;
+         ALTER TABLE t ALTER COLUMN c DROP NOT NULL;",
+    )]);
+    let info = db.analyze("SELECT b FROM v").unwrap();
+    assert_cols(&info, vec![cn("b", int4())]);
+}

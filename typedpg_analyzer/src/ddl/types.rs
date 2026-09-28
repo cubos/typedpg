@@ -318,10 +318,24 @@ pub fn alter_domain(
     let typnotnull = constraints
         .iter()
         .any(|c| c.kind == DomainConstraintKind::NotNull);
+    let mut changed = false;
     if let Some(t) = interp.pg_type.get_mut(&type_oid) {
+        changed = t.typnotnull != typnotnull;
         t.typnotnull = typnotnull;
     }
     interp.domain_constraints.insert(type_oid, constraints);
+    if changed {
+        // Views over columns of the domain see the change too.
+        let relations: Vec<PgClassOid> = interp
+            .pg_attribute
+            .iter()
+            .filter(|(_, attrs)| attrs.iter().any(|a| a.atttypid == type_oid))
+            .map(|(&relid, _)| relid)
+            .collect();
+        for relid in relations {
+            super::views::refresh_dependent_view_nullability(interp, relid, !typnotnull);
+        }
+    }
     Ok(())
 }
 

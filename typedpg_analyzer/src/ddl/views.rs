@@ -1236,6 +1236,81 @@ pub fn drop_views(snapshot: &mut PgCatalog, view_oids: &[PgClassOid]) {
     }
 }
 
+// ─── Nullability refresh ────────────────────────────────────────────────────
+
+/// Re-derive the nullability of the views (and matviews) that read relation
+/// `relid`, and of the views reading those, after the NOT NULL-ness of one of
+/// its columns changed.
+///
+/// PG never freezes a view's column nullability: the rewriter re-expands the
+/// view over its base tables on every use, so `ALTER TABLE t ALTER b DROP NOT
+/// NULL` is immediately visible through `v`. The analyzer resolves views once
+/// at CREATE time, so it re-analyzes the stored body here. When that is not
+/// possible (the body no longer resolves, e.g. after a rename, or its shape
+/// changed) and the change can only have *added* NULLs (`relaxing`), every
+/// column of the view is conservatively marked nullable.
+///
+/// Relation-level dependencies are used (not column-level ones) because a
+/// `SELECT *` body records no column references.
+pub(crate) fn refresh_dependent_view_nullability(
+    interp: &mut PgCatalog,
+    relid: PgClassOid,
+    relaxing: bool,
+) {
+    use prost::Message;
+
+    let mut queue: std::collections::VecDeque<PgClassOid> =
+        find_dependent_views(interp, relid).into();
+    let mut seen = std::collections::HashSet::new();
+    while let Some(view) = queue.pop_front() {
+        if !seen.insert(view) {
+            continue;
+        }
+        let reanalyzed = interp
+            .view_body(view)
+            .and_then(|body| protobuf::Node::decode(body.ast.as_slice()).ok())
+            .and_then(|node| {
+                let inner = node.node.as_ref()?;
+                crate::resolve::analyze_raw_node(interp, inner, &[])
+                    .ok()
+                    .map(|(cols, _)| cols)
+            });
+        let attrs = interp.attributes_of(view).to_vec();
+        let new_not_null: Option<Vec<bool>> = reanalyzed.and_then(|cols| {
+            (cols.len() >= attrs.len()
+                && attrs
+                    .iter()
+                    .zip(&cols)
+                    .all(|(a, c)| a.atttypid == c.type_oid))
+            .then(|| attrs.iter().zip(&cols).map(|(_, c)| !c.nullable).collect())
+        });
+        let changed = match (new_not_null, relaxing) {
+            (Some(flags), _) => {
+                let changed = attrs.iter().zip(&flags).any(|(a, &nn)| a.attnotnull != nn);
+                if let Some(view_attrs) = interp.pg_attribute.get_mut(&view) {
+                    for (a, nn) in view_attrs.iter_mut().zip(flags) {
+                        a.attnotnull = nn;
+                    }
+                }
+                changed
+            }
+            (None, true) => {
+                let changed = attrs.iter().any(|a| a.attnotnull);
+                if let Some(view_attrs) = interp.pg_attribute.get_mut(&view) {
+                    for a in view_attrs.iter_mut() {
+                        a.attnotnull = false;
+                    }
+                }
+                changed
+            }
+            (None, false) => false,
+        };
+        if changed {
+            queue.extend(find_dependent_views(interp, view));
+        }
+    }
+}
+
 // ─── AST rewriting entry points (called from ALTER handlers) ────────────────
 //
 // With the OID-resolved binding side-table, these are now no-ops: a rename

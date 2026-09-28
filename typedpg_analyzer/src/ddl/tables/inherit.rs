@@ -143,10 +143,15 @@ fn insert_not_null(
 }
 
 fn set_attnotnull(interp: &mut PgCatalog, relid: PgClassOid, attnum: i16, value: bool) {
+    let mut changed = false;
     if let Some(attrs) = interp.pg_attribute.get_mut(&relid)
         && let Some(a) = attrs.iter_mut().find(|a| a.attnum == attnum)
     {
+        changed = a.attnotnull != value;
         a.attnotnull = value;
+    }
+    if changed {
+        views::refresh_dependent_view_nullability(interp, relid, !value);
     }
 }
 
