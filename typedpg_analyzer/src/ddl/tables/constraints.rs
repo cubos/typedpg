@@ -459,7 +459,7 @@ fn constraint_name(explicit: &str, fallback: impl FnOnce() -> String) -> String 
 /// table is even built; this pass only runs once the table exists in the
 /// catalog so the expression scope can resolve the column references.
 pub(crate) fn validate_constraint_expressions(
-    interp: &PgCatalog,
+    interp: &mut PgCatalog,
     class_oid: PgClassOid,
     relname: &str,
     stmt: &CreateStmt,
@@ -505,7 +505,11 @@ pub(crate) fn validate_constraint_expressions(
         if let Some(expr) = super::columns::column_default_expr(cd)
             && let Some(attr) = table_attrs.iter().find(|a| a.attname == cd.colname)
         {
-            crate::ddl::defaults::check_default(interp, expr, &cd.colname, attr.atttypid)?;
+            let default_type =
+                crate::ddl::defaults::check_default(interp, expr, &cd.colname, attr.atttypid)?;
+            interp
+                .attr_default_types
+                .insert((class_oid, attr.attnum), default_type);
         }
         for c_node in &cd.constraints {
             let Some(node::Node::Constraint(c)) = c_node.node.as_ref() else {

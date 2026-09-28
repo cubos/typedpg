@@ -17,13 +17,15 @@ use crate::pg_catalog::{PgCatalog, ProKind, oid};
 use crate::scope::Scope;
 
 /// Check `expr` as the DEFAULT of column (or domain) `name` of type
-/// `type_oid`.
+/// `type_oid`. Returns the type the stored default has once its implicit
+/// coercion to the column is stripped (the expression's own type; the
+/// column type for an untyped literal).
 pub(crate) fn check_default(
     interp: &PgCatalog,
     expr: &protobuf::Node,
     name: &str,
     type_oid: PgTypeOid,
-) -> Result<(), DdlError> {
+) -> Result<PgTypeOid, DdlError> {
     check_default_kind(interp, expr)?;
 
     let scope = Scope::default();
@@ -39,7 +41,7 @@ pub(crate) fn check_default(
         let mut goal = TypeGoal::assignment(type_oid);
         goal.source_col_name = Some(name.to_owned());
         infer_expr(expr, ctx(), &mut params, goal).map_err(wrap)?;
-        return Ok(());
+        return Ok(type_oid);
     }
     if !can_coerce(
         result.type_oid,
@@ -53,7 +55,7 @@ pub(crate) fn check_default(
             super::util::format_type_for_message(interp, result.type_oid),
         )));
     }
-    Ok(())
+    Ok(result.type_oid)
 }
 
 /// The `EXPR_KIND_COLUMN_DEFAULT` restrictions (`transformColumnRef`,

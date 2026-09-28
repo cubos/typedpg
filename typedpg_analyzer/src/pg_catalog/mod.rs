@@ -202,6 +202,11 @@ pub struct PgCatalog {
     /// resolves against. The domain's effective NOT NULL lives in
     /// `pg_type.typnotnull`.
     pub(crate) domain_constraints: HashMap<PgTypeOid, Vec<crate::ddl::types::DomainConstraint>>,
+    /// Type of each column DEFAULT expression as `strip_implicit_coercions`
+    /// sees it (the expression's own type, before the coercion to the
+    /// column type that `cookDefault` adds) — what ALTER COLUMN TYPE
+    /// re-coerces (PG keeps the expression in `pg_attrdef`).
+    pub(crate) attr_default_types: HashMap<(PgClassOid, i16), PgTypeOid>,
     next_oid: std::num::NonZeroU32,
 
     /// Lazy-initialized PG sanity mirror used by the `pg_sanity` feature to
@@ -433,6 +438,7 @@ impl PgCatalog {
             search_path: Vec::new(),
             search_path_guc: Default::default(),
             domain_constraints: HashMap::new(),
+            attr_default_types: HashMap::new(),
             next_oid: USER_OID_START_NZ,
             #[cfg(feature = "pg_sanity")]
             pg_sanity: None,
@@ -1010,6 +1016,8 @@ impl PgCatalog {
     }
 
     pub(crate) fn remove_pg_class(&mut self, oid: PgClassOid) -> Option<PgClass> {
+        self.attr_default_types
+            .retain(|(relid, _), _| *relid != oid);
         let row = self.pg_class.remove(&oid)?;
         self.class_by_qname
             .remove(&(row.relnamespace, row.relname.clone()));

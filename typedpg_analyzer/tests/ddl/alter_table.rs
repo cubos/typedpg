@@ -298,3 +298,77 @@ fn alter_column_type_on_nonexistent_column_errors() {
         "column \"ghost\" of relation \"t\" does not exist"
     );
 }
+
+// ── ALTER COLUMN TYPE validation (ATPrepAlterColumnType / ATExecAlterColumnType)
+
+#[test]
+fn alter_column_type_requires_an_assignment_cast_or_using() {
+    for (sql, msg) in [
+        (
+            "CREATE TABLE t (a text); ALTER TABLE t ALTER COLUMN a TYPE int;",
+            "column \"a\" cannot be cast automatically to type integer",
+        ),
+        (
+            "CREATE TABLE t4 (x text DEFAULT 'a'); ALTER TABLE t4 ALTER x TYPE int USING length(x);",
+            "default for column \"x\" cannot be cast automatically to type integer",
+        ),
+        (
+            "CREATE TABLE t5 (x int DEFAULT 1); ALTER TABLE t5 ALTER x TYPE bool USING x > 0;",
+            "default for column \"x\" cannot be cast automatically to type boolean",
+        ),
+        (
+            "CREATE TABLE t7 (x serial); ALTER TABLE t7 ALTER x TYPE bool USING x > 0;",
+            "default for column \"x\" cannot be cast automatically to type boolean",
+        ),
+        (
+            "CREATE TABLE t6 (x int); ALTER TABLE t6 ALTER x TYPE date USING 'abc';",
+            "invalid input syntax for type date: \"abc\"",
+        ),
+        (
+            "CREATE TABLE t6 (x int); ALTER TABLE t6 ALTER x TYPE int USING y;",
+            "column \"y\" does not exist",
+        ),
+        (
+            "CREATE TABLE t6 (x int); ALTER TABLE t6 ALTER x TYPE int COLLATE \"C\";",
+            "collations are not supported by type integer",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", sql)]).expect_err(sql);
+        assert!(err.to_string().starts_with(msg), "{sql}\n  got: {err}");
+    }
+    build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a text); ALTER TABLE t ALTER COLUMN a TYPE int USING a::int;
+         CREATE TABLE t5 (x int DEFAULT 1); ALTER TABLE t5 ALTER x TYPE bigint;
+         CREATE TABLE t6 (x int); ALTER TABLE t6 ALTER x TYPE date USING now();",
+    )]);
+}
+
+#[test]
+fn alter_column_type_sets_the_collation() {
+    // PG 18: COLLATE "C" is applied; without COLLATE the new type's default
+    // replaces the old explicit collation.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t2 (a varchar(5)); ALTER TABLE t2 ALTER COLUMN a TYPE text COLLATE \"C\";
+         CREATE TABLE t3 (a text COLLATE \"C\"); ALTER TABLE t3 ALTER a TYPE varchar(3);",
+    )]);
+    assert_cols(
+        &db.analyze("SELECT a FROM t2").unwrap(),
+        vec![cn("a", basic_with_collation("pg_catalog", "text", "C"))],
+    );
+    assert_cols(
+        &db.analyze("SELECT a FROM t3").unwrap(),
+        vec![cn("a", varchar_n(3))],
+    );
+}
+
+#[test]
+fn collate_on_a_non_collatable_column_is_rejected() {
+    // PG 18: 42804 collations are not supported by type integer.
+    assert_ddl_err!(
+        try_apply(&[("0001.sql", "CREATE TABLE t (a int COLLATE \"C\");")]),
+        DdlError::Parse(_),
+        "collations are not supported by type integer",
+    );
+}

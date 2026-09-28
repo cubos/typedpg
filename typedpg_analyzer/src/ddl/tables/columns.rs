@@ -161,34 +161,9 @@ pub(crate) fn parse_column_def(
         not_null = true;
     }
 
-    // `COLLATE "name"` decoration on the column. PG rejects unknown names
-    // up front; we mirror that. Collation oid lands on pg_attribute.
-    let collation = if let Some(coll) = cd.coll_clause.as_deref() {
-        let parts: Vec<&str> = coll
-            .collname
-            .iter()
-            .filter_map(|n| match n.node.as_ref()? {
-                node::Node::String(s) => Some(s.sval.as_str()),
-                _ => None,
-            })
-            .collect();
-        let (schema, name) = match parts.as_slice() {
-            [name] => (None, *name),
-            [schema, name] => (Some(*schema), *name),
-            _ => return Err(DdlError::Parse("malformed COLLATE clause".into())),
-        };
-        let resolved = interp.resolve_collation(schema, name).ok_or_else(|| {
-            // PG includes the encoding in the message: `collation "X" for
-            // encoding "UTF8" does not exist`. We don't model encoding so
-            // we hardcode UTF8 (real PG uses the database's encoding).
-            DdlError::Parse(format!(
-                "collation \"{name}\" for encoding \"UTF8\" does not exist"
-            ))
-        })?;
-        Some(resolved.oid)
-    } else {
-        None
-    };
+    // `COLLATE "name"` decoration on the column: PG rejects unknown names
+    // and non-collatable types. The collation oid lands on pg_attribute.
+    let collation = column_collation(interp, cd, type_oid)?;
 
     Ok(ParsedColumn {
         name: cd.colname.clone(),
@@ -373,11 +348,19 @@ pub(crate) fn add_column(
     }
 
     let col = parse_column_def(interp, &relname_of(interp, relid), cd, &[])?;
-    if !rec.recursing
-        && let Some(expr) = column_default_expr(cd)
-    {
-        crate::ddl::defaults::check_default(interp, expr, &cd.colname, col.type_oid)?;
-    }
+    let default_type = match column_default_expr(cd) {
+        Some(expr) => Some(crate::ddl::defaults::check_default(
+            interp,
+            expr,
+            &cd.colname,
+            col.type_oid,
+        )?),
+        // serial: `DEFAULT nextval(...)`, a bigint.
+        None if col.owned_sequence == Some(crate::pg_catalog::DepType::Auto) => {
+            Some(crate::pg_catalog::oid::INT8)
+        }
+        None => None,
+    };
 
     if let Some(existing) = interp.attribute_by_name(relid, &cd.colname).cloned() {
         if rec.recursing {
@@ -431,6 +414,11 @@ pub(crate) fn add_column(
         attislocal: !rec.recursing,
         attinhcount: i16::from(rec.recursing),
     });
+    if let Some(default_type) = default_type {
+        interp
+            .attr_default_types
+            .insert((relid, next_attnum), default_type);
+    }
     if col.not_null {
         let local = inherit::Recursion {
             recurse: false,
@@ -605,6 +593,7 @@ pub(crate) fn drop_column(
         }
     }
 
+    interp.attr_default_types.remove(&(relid, target.attnum));
     if let Some(attrs) = interp.pg_attribute.get_mut(&relid) {
         attrs.retain(|a| a.attname != cmd.name);
     }
@@ -640,12 +629,20 @@ pub(crate) fn set_default(
     cmd: &AlterTableCmd,
     rec: inherit::Recursion,
 ) -> Result<(), DdlError> {
-    if !rec.recursing
-        && let Some(expr) = cmd.def.as_deref()
-        && let Some(attr) = interp.attribute_by_name(relid, &cmd.name)
-    {
-        let type_oid = attr.atttypid;
-        crate::ddl::defaults::check_default(interp, expr, &cmd.name, type_oid)?;
+    let attr = interp.attribute_by_name(relid, &cmd.name).cloned();
+    if let Some(attr) = &attr {
+        match cmd.def.as_deref() {
+            Some(expr) => {
+                let default_type =
+                    crate::ddl::defaults::check_default(interp, expr, &cmd.name, attr.atttypid)?;
+                interp
+                    .attr_default_types
+                    .insert((relid, attr.attnum), default_type);
+            }
+            None => {
+                interp.attr_default_types.remove(&(relid, attr.attnum));
+            }
+        }
     }
     if rec.recurse {
         for child in inherit::children_of(interp, relid) {
@@ -704,10 +701,6 @@ pub(crate) fn alter_column_type(
             cmd.name
         )));
     }
-    for child in children {
-        alter_column_type(interp, child, cmd, rec.child())?;
-    }
-
     let new_type_oid = match cd.type_name.as_ref() {
         Some(tn) => lookup_type_name(tn, interp)?,
         None => return Ok(()),
@@ -718,12 +711,55 @@ pub(crate) fn alter_column_type(
         None => None,
     };
 
-    let old_type_oid = interp
-        .attributes_of(relid)
-        .iter()
-        .find(|a| a.attname == cmd.name)
-        .map(|a| a.atttypid)
+    let attr = interp
+        .attribute_by_name(relid, &cmd.name)
+        .cloned()
         .ok_or_else(|| DdlError::Parse(column_not_found_msg(interp, relid, &cmd.name)))?;
+    // GetColumnDefCollation: an explicit COLLATE, else the new type's
+    // default — the old column's collation does not carry over.
+    let new_collation = column_collation(interp, cd, new_type_oid)?;
+
+    // ATPrepAlterColumnType: the old value (or the USING expression) must
+    // be assignment-coercible to the new type.
+    if !rec.recursing {
+        match cd.raw_default.as_deref() {
+            Some(using) => check_using_expression(interp, relid, &attr, using, new_type_oid)?,
+            None => {
+                if !crate::coerce::can_coerce(
+                    attr.atttypid,
+                    new_type_oid,
+                    crate::coerce::CoercionContext::Assignment,
+                    interp,
+                ) {
+                    return Err(DdlError::Parse(format!(
+                        "column \"{}\" cannot be cast automatically to type {}",
+                        cmd.name,
+                        format_type_for_message(interp, new_type_oid)
+                    )));
+                }
+            }
+        }
+    }
+    // ATExecAlterColumnType: an existing default is re-coerced too.
+    if let Some(&default_type) = interp.attr_default_types.get(&(relid, attr.attnum))
+        && !crate::coerce::can_coerce(
+            default_type,
+            new_type_oid,
+            crate::coerce::CoercionContext::Assignment,
+            interp,
+        )
+    {
+        return Err(DdlError::Parse(format!(
+            "default for column \"{}\" cannot be cast automatically to type {}",
+            cmd.name,
+            format_type_for_message(interp, new_type_oid)
+        )));
+    }
+
+    for child in children {
+        alter_column_type(interp, child, cmd, rec.child())?;
+    }
+    let old_type_oid = attr.atttypid;
 
     let dependent_views = views::find_views_depending_on_column(interp, relid, &cmd.name);
     if !dependent_views.is_empty() {
@@ -759,8 +795,119 @@ pub(crate) fn alter_column_type(
     {
         col.atttypid = new_type_oid;
         col.atttypmod = new_typmod;
+        col.attcollation = new_collation;
     }
 
     let _ = old_type_oid;
     Ok(())
+}
+
+/// The USING expression of ALTER COLUMN TYPE: evaluated over the table's
+/// row, its result must be assignment-coercible to the new type (an untyped
+/// literal goes through the type's input).
+fn check_using_expression(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+    attr: &PgAttribute,
+    expr: &pg_query::protobuf::Node,
+    new_type: PgTypeOid,
+) -> Result<(), DdlError> {
+    use crate::expr::{TypeGoal, infer_expr};
+    use crate::nullability::NullabilityContext;
+    use crate::param_collector::ParamCollector;
+    use crate::scope::Scope;
+
+    let relname = relname_of(interp, relid);
+    let nspname = interp
+        .pg_class
+        .get(&relid)
+        .and_then(|c| interp.namespace_name(c.relnamespace))
+        .unwrap_or("public")
+        .to_owned();
+    let attrs = interp.attributes_of(relid).to_vec();
+    let mut scope = Scope::default();
+    scope.add_dml_target(
+        interp,
+        &relname,
+        QualifiedName::new(nspname, relname.clone()),
+        &attrs,
+    );
+    let null_ctx = NullabilityContext::default();
+    let mut params = ParamCollector::default();
+    let wrap = |e: crate::error::AnalyzeError| DdlError::UnsupportedDdl(format!("{e}"));
+    let result = infer_expr(
+        expr,
+        crate::expr::Ctx::new(&scope, &null_ctx, interp),
+        &mut params,
+        TypeGoal::NONE,
+    )
+    .map_err(wrap)?;
+    if result.type_oid == crate::pg_catalog::oid::UNKNOWN {
+        infer_expr(
+            expr,
+            crate::expr::Ctx::new(&scope, &null_ctx, interp),
+            &mut params,
+            TypeGoal::assignment(new_type),
+        )
+        .map_err(wrap)?;
+        return Ok(());
+    }
+    if !crate::coerce::can_coerce(
+        result.type_oid,
+        new_type,
+        crate::coerce::CoercionContext::Assignment,
+        interp,
+    ) {
+        return Err(DdlError::Parse(format!(
+            "result of USING clause for column \"{}\" cannot be cast automatically to type {}",
+            attr.attname,
+            format_type_for_message(interp, new_type)
+        )));
+    }
+    Ok(())
+}
+
+/// A column's collation (`GetColumnDefCollation`, parse_type.c): the
+/// explicit `COLLATE` — which the type must support — or none, meaning the
+/// type's default.
+pub(crate) fn column_collation(
+    interp: &PgCatalog,
+    cd: &pg_query::protobuf::ColumnDef,
+    type_oid: PgTypeOid,
+) -> Result<Option<crate::oid::PgCollationOid>, DdlError> {
+    let Some(coll) = cd.coll_clause.as_deref() else {
+        return Ok(None);
+    };
+    let parts: Vec<&str> = coll
+        .collname
+        .iter()
+        .filter_map(|n| match n.node.as_ref()? {
+            node::Node::String(s) => Some(s.sval.as_str()),
+            _ => None,
+        })
+        .collect();
+    let (schema, name) = match parts.as_slice() {
+        [name] => (None, *name),
+        [schema, name] => (Some(*schema), *name),
+        _ => return Err(DdlError::Parse("malformed COLLATE clause".into())),
+    };
+    let resolved = interp.resolve_collation(schema, name).ok_or_else(|| {
+        // PG includes the encoding in the message: `collation "X" for
+        // encoding "UTF8" does not exist`. We don't model encoding so
+        // we hardcode UTF8 (real PG uses the database's encoding).
+        DdlError::Parse(format!(
+            "collation \"{name}\" for encoding \"UTF8\" does not exist"
+        ))
+    })?;
+    let collatable = interp
+        .pg_type
+        .get(&interp.unwrap_domain(type_oid))
+        .is_some_and(|t| t.typcollation.is_some());
+    if !collatable && type_oid != crate::pg_catalog::oid::UNKNOWN {
+        return Err(DdlError::Parse(format!(
+            "collations are not supported by type {}",
+            format_type_for_message(interp, type_oid)
+        )));
+    }
+    Ok(Some(resolved.oid))
 }

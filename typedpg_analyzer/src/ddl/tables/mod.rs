@@ -193,6 +193,33 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
             inherit::record_not_null(interp, class_oid, (i + 1) as i16, col)?;
         }
     }
+    // Default expressions carried over from parents / LIKE sources (a
+    // local DEFAULT, recorded while validating below, overrides them), and
+    // serial's `nextval(...)`, a bigint.
+    for (i, col) in columns.iter().enumerate() {
+        let attnum = (i + 1) as i16;
+        if col.owned_sequence == Some(crate::pg_catalog::DepType::Auto) {
+            interp
+                .attr_default_types
+                .insert((class_oid, attnum), crate::pg_catalog::oid::INT8);
+            continue;
+        }
+        if !col.has_default || col.is_generated {
+            continue;
+        }
+        let inherited = parents
+            .iter()
+            .chain(likes.iter().map(|l| &l.source))
+            .find_map(|&src| {
+                let src_attnum = interp.attribute_by_name(src, &col.name)?.attnum;
+                interp.attr_default_types.get(&(src, src_attnum)).copied()
+            });
+        if let Some(default_type) = inherited {
+            interp
+                .attr_default_types
+                .insert((class_oid, attnum), default_type);
+        }
+    }
     for (i, col) in columns.iter().enumerate() {
         if let Some(deptype) = col.owned_sequence {
             super::sequences::create_owned_sequence(interp, class_oid, (i + 1) as i16, deptype)?;
