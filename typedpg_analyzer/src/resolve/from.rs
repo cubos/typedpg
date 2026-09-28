@@ -171,12 +171,13 @@ pub(crate) fn process_from_item(
         node::Node::RangeTableSample(ts) => {
             // `TABLESAMPLE` only changes how rows are picked at runtime —
             // it does not affect the relation's column shape or
-            // nullability. Pass through to the wrapped `relation` and
-            // ignore method/args/repeatable.
+            // nullability. Process the wrapped `relation`, then the
+            // sampling method and its arguments.
             let relation = ts.relation.as_ref().ok_or_else(|| {
                 AnalyzeError::Unsupported("RangeTableSample without relation".into())
             })?;
-            return process_from_item(relation, scope, null_ctx, snapshot, cte_scopes, params);
+            process_from_item(relation, scope, null_ctx, snapshot, cte_scopes, params)?;
+            process_tablesample(ts, scope, snapshot, params)?;
         }
         _ => {
             return Err(AnalyzeError::Unsupported(format!(
@@ -975,4 +976,93 @@ fn coldeflist_columns(
         }
     }
     Ok(cols)
+}
+
+/// `TABLESAMPLE method (args) [REPEATABLE (seed)]` — PG's
+/// `transformRangeTableSample` (parse_clause.c): the method names a
+/// `tsm_handler` function (42704 otherwise), the argument count must match
+/// the handler's parameter list (2202H), each argument is coerced to its
+/// parameter type and REPEATABLE's seed to double precision (42804 with
+/// PG's `argument of TABLESAMPLE must be type …` wording). The arguments
+/// can't reference the sampled relation or other FROM items.
+fn process_tablesample(
+    ts: &protobuf::RangeTableSample,
+    scope: &Scope,
+    snapshot: &PgCatalog,
+    params: &mut ParamCollector,
+) -> Result<(), AnalyzeError> {
+    let method_parts = expr::extract_string_fields(&ts.method);
+    let method = method_parts.join(".");
+    let (schema, name) = match method_parts.as_slice() {
+        [n] => (None, n.as_str()),
+        [s, n] => (Some(s.as_str()), n.as_str()),
+        _ => (None, method.as_str()),
+    };
+    let is_handler = snapshot.find_functions(schema, name).iter().any(|p| {
+        snapshot
+            .get_type(p.prorettype)
+            .is_some_and(|t| t.typname == "tsm_handler")
+    });
+    if !is_handler {
+        return Err(crate::error::RawError::new(
+            AnalyzeError::UndefinedObject(format!("tablesample method {method} does not exist")),
+            None,
+            None,
+        )
+        .finalize_implicit());
+    }
+    // The handlers' `TsmRoutine.parameterTypes`: the core methods and the
+    // contrib `tsm_system_*` ones.
+    let param_types: &[PgTypeOid] = match name {
+        "system_rows" => &[oid::INT8],
+        "system_time" => &[oid::FLOAT8],
+        _ => &[oid::FLOAT4],
+    };
+    if ts.args.len() != param_types.len() {
+        return Err(AnalyzeError::Invalid(format!(
+            "tablesample method {method} requires {} argument{}, not {}",
+            param_types.len(),
+            if param_types.len() == 1 { "" } else { "s" },
+            ts.args.len()
+        )));
+    }
+    let mut arg_scope = Scope {
+        ctes: scope.ctes.clone(),
+        ..Scope::default()
+    };
+    arg_scope.shadowed_sources = scope.sources.clone();
+    let null_ctx = NullabilityContext::default();
+    let ctx = expr::Ctx::new(&arg_scope, &null_ctx, snapshot);
+    let coerce = |arg: &protobuf::Node,
+                  target: PgTypeOid,
+                  clause: &str,
+                  params: &mut ParamCollector|
+     -> Result<(), AnalyzeError> {
+        match expr::infer_expr(arg, ctx, params, TypeGoal::assignment(target)) {
+            Err(AnalyzeError::TypeMismatch { .. }) => {
+                let mut scratch = params.clone();
+                let actual = expr::infer_expr(arg, ctx, &mut scratch, TypeGoal::NONE)
+                    .map(|e| e.type_oid)
+                    .unwrap_or(oid::UNKNOWN);
+                let want = crate::ddl::util::format_type_for_message(snapshot, target);
+                let got = crate::ddl::util::format_type_for_message(snapshot, actual);
+                Err(crate::error::RawError::new(
+                    AnalyzeError::DatatypeMismatch(format!(
+                        "argument of {clause} must be type {want}, not type {got}"
+                    )),
+                    None,
+                    None,
+                )
+                .finalize_implicit())
+            }
+            other => other.map(|_| ()),
+        }
+    };
+    for (arg, &target) in ts.args.iter().zip(param_types) {
+        coerce(arg, target, "TABLESAMPLE", params)?;
+    }
+    if let Some(seed) = ts.repeatable.as_deref() {
+        coerce(seed, oid::FLOAT8, "REPEATABLE", params)?;
+    }
+    Ok(())
 }

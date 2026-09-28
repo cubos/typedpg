@@ -362,3 +362,39 @@ fn grouping_function_column_is_named_grouping() {
         .unwrap();
     assert_eq!(s.columns[1].name, "grouping");
 }
+
+// ── TABLESAMPLE ──────────────────────────────────────────────────────────────
+
+#[test]
+fn tablesample_arguments_are_analyzed() {
+    let db = setup();
+    let s = db
+        .analyze("SELECT * FROM t TABLESAMPLE SYSTEM ($p) REPEATABLE ($s)")
+        .unwrap();
+    assert_params(&s, vec![p(float4()), p(float8())]);
+    let cases: &[(&str, &str)] = &[
+        (
+            "SELECT * FROM t TABLESAMPLE nosuch (10)",
+            "tablesample method nosuch does not exist",
+        ),
+        (
+            "SELECT * FROM t TABLESAMPLE SYSTEM ('x')",
+            "invalid input syntax for type real: \"x\"",
+        ),
+        (
+            "SELECT * FROM t TABLESAMPLE SYSTEM (1, 2)",
+            "tablesample method system requires 1 argument, not 2",
+        ),
+        (
+            "SELECT * FROM t TABLESAMPLE BERNOULLI (t.a)",
+            "invalid reference to FROM-clause entry for table \"t\"",
+        ),
+        (
+            "SELECT * FROM t TABLESAMPLE BERNOULLI (true)",
+            "argument of TABLESAMPLE must be type real, not type boolean",
+        ),
+    ];
+    for (sql, msg) in cases {
+        assert_err_prefix(&db, sql, msg);
+    }
+}
