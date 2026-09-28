@@ -1373,3 +1373,27 @@ fn both_unknown_operator_with_many_overloads_is_not_unique() {
     );
     db.analyze("SELECT NULL = NULL").unwrap();
 }
+
+#[test]
+fn string_category_operators_with_an_untyped_side_resolve_like_pg() {
+    // func_select_candidate keeps the candidates taking the preferred type
+    // of the known input's category (text for varchar/bpchar), and picks
+    // the string category at an unknown position.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE t (vc varchar(10) NOT NULL, c char(3) NOT NULL);")
+        .unwrap();
+    let s = db
+        .analyze("SELECT vc = 'x' AS a, c = 'x' AS b, c || 'x' AS d, vc || 'y' AS e FROM t")
+        .unwrap();
+    assert_cols(
+        &s,
+        vec![
+            c("a", bool_ty()),
+            c("b", bool_ty()),
+            c("d", text()),
+            c("e", text()),
+        ],
+    );
+    let s = db.analyze("SELECT vc FROM t WHERE vc = $p").unwrap();
+    assert_params(&s, vec![p(text())]);
+}
