@@ -18,7 +18,7 @@ pub(crate) mod function_body;
 pub mod functions;
 pub mod indexes;
 mod maintenance;
-mod opclass;
+pub(crate) mod opclass;
 pub mod operators;
 mod policies;
 pub(crate) mod reloptions;

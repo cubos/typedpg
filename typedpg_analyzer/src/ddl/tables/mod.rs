@@ -421,6 +421,10 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
         partbound::record_partition_spec(interp, class_oid, spec);
     }
 
+    // DefineRelation: the table access method.
+    if !stmt.access_method.is_empty() {
+        crate::ddl::opclass::check_table_am(interp, &stmt.access_method)?;
+    }
     // heap_reloptions / partitioned_table_reloptions.
     crate::ddl::reloptions::check_reloptions(
         &stmt.options,
@@ -630,6 +634,9 @@ fn apply_alter_subtype(
             column_options::alter_column_setting(interp, relid, cmd, subtype)
         }
         AlterTableType::AtClusterOn => object_refs::cluster_on(interp, relid, cmd),
+        AlterTableType::AtSetAccessMethod if !cmd.name.is_empty() => {
+            crate::ddl::opclass::check_table_am(interp, &cmd.name)
+        }
         AlterTableType::AtSetRelOptions
         | AlterTableType::AtResetRelOptions
         | AlterTableType::AtReplaceRelOptions => set_reloptions(interp, relid, cmd, subtype),
@@ -764,6 +771,13 @@ fn check_alter_target(
         ),
         At::AtAddConstraint => (table_like, "ADD CONSTRAINT"),
         At::AtAddOf => (class.relkind == RelKind::Table, "OF"),
+        At::AtSetAccessMethod => (
+            matches!(
+                class.relkind,
+                RelKind::Table | RelKind::Partitioned | RelKind::MaterializedView
+            ),
+            "SET ACCESS METHOD",
+        ),
         At::AtAddInherit => (table_like, "INHERIT"),
         At::AtAttachPartition => (class.relkind == RelKind::Partitioned, "ATTACH PARTITION"),
         At::AtDetachPartition => (class.relkind == RelKind::Partitioned, "DETACH PARTITION"),

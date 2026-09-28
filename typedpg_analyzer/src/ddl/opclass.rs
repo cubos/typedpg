@@ -420,3 +420,16 @@ pub(crate) fn resolve_index_opclass(
 pub(crate) fn has_default_btree_opclass(interp: &PgCatalog, typ: PgTypeOid) -> bool {
     matches!(default_opclass(interp, typ, "btree"), Ok(Some(_)))
 }
+
+/// get_table_am_oid: `name` must be a table access method.
+pub(crate) fn check_table_am(interp: &PgCatalog, name: &str) -> Result<(), DdlError> {
+    match interp.pg_am.iter().find(|a| a.amname == name) {
+        None => Err(DdlError::TypeNotFound(format!(
+            "access method \"{name}\" does not exist"
+        ))),
+        Some(am) if am.amtype != "t" => Err(DdlError::UnsupportedDdl(format!(
+            "access method \"{name}\" is not of type TABLE"
+        ))),
+        Some(_) => Ok(()),
+    }
+}

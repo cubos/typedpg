@@ -175,6 +175,9 @@ fn create_relation_as(
     }
     check_duplicate_columns(&resolved.columns)?;
     super::util::check_relation_name_free(interp, nsoid, &name)?;
+    if !into.access_method.is_empty() {
+        super::opclass::check_table_am(interp, &into.access_method)?;
+    }
     super::reloptions::check_reloptions(
         &into.options,
         super::reloptions::RelOptKind::Heap,

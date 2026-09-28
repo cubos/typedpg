@@ -2514,3 +2514,53 @@ fn partitioned_indexes_reach_the_partitions() {
         ),
     ]);
 }
+
+#[test]
+fn table_access_methods_are_resolved() {
+    // PG 18 get_table_am_oid: USING / SET ACCESS METHOD name a table AM.
+    let setup = "CREATE TABLE t (a int); CREATE VIEW v AS SELECT 1 AS a;";
+    for (stmt, msg) in [
+        (
+            "CREATE TABLE x (a int) USING nosuch;",
+            "access method \"nosuch\" does not exist",
+        ),
+        (
+            "CREATE TABLE x (a int) USING btree;",
+            "access method \"btree\" is not of type TABLE",
+        ),
+        (
+            "ALTER TABLE t SET ACCESS METHOD nosuch;",
+            "access method \"nosuch\" does not exist",
+        ),
+        (
+            "ALTER TABLE t SET ACCESS METHOD btree;",
+            "access method \"btree\" is not of type TABLE",
+        ),
+        (
+            "CREATE MATERIALIZED VIEW x USING nosuch AS SELECT 1;",
+            "access method \"nosuch\" does not exist",
+        ),
+        (
+            "CREATE TABLE x USING nosuch AS SELECT 1;",
+            "access method \"nosuch\" does not exist",
+        ),
+        (
+            "ALTER TABLE v SET ACCESS METHOD heap;",
+            "ALTER action SET ACCESS METHOD cannot be performed on relation \"v\"",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "CREATE TABLE a1 (a int) USING heap;
+             ALTER TABLE t SET ACCESS METHOD heap;
+             ALTER TABLE t SET ACCESS METHOD DEFAULT;
+             CREATE TABLE pt (a int) PARTITION BY LIST (a) USING heap;
+             CREATE MATERIALIZED VIEW m USING heap AS SELECT 1;",
+        ),
+    ]);
+}
