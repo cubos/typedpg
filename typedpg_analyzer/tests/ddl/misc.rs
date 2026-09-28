@@ -438,3 +438,89 @@ fn policies_are_validated_and_tracked() {
         ),
     ]);
 }
+
+#[test]
+fn ddl_expression_kinds_reject_aggregates_windows_and_subqueries() {
+    // PG 18 transformExpr with EXPR_KIND_CHECK_CONSTRAINT / DOMAIN_CHECK /
+    // INDEX_EXPRESSION / INDEX_PREDICATE / GENERATED_COLUMN: aggregates and
+    // window functions fail in check_agglevels_and_constraints /
+    // transformWindowFuncCall, sublinks in transformSubLink.
+    let setup = "CREATE TABLE t (a int); CREATE DOMAIN dd AS int;";
+    for (stmt, msg) in [
+        (
+            "CREATE TABLE c1 (a int CHECK (sum(a) > 0));",
+            "aggregate functions are not allowed in check constraints",
+        ),
+        (
+            "CREATE TABLE c2 (a int CHECK (row_number() over () > 0));",
+            "window functions are not allowed in check constraints",
+        ),
+        (
+            "CREATE TABLE c3 (a int CHECK ((select 1) > 0));",
+            "cannot use subquery in check constraint",
+        ),
+        (
+            "CREATE TABLE c4 (a int, CHECK (max(a) > 0));",
+            "aggregate functions are not allowed in check constraints",
+        ),
+        (
+            "ALTER TABLE t ADD CHECK (sum(a) > 0);",
+            "aggregate functions are not allowed in check constraints",
+        ),
+        (
+            "ALTER TABLE t ADD CHECK ((select true));",
+            "cannot use subquery in check constraint",
+        ),
+        (
+            "CREATE DOMAIN d AS int CHECK (sum(VALUE) > 0);",
+            "aggregate functions are not allowed in check constraints",
+        ),
+        (
+            "CREATE DOMAIN d2 AS int CHECK ((select true));",
+            "cannot use subquery in check constraint",
+        ),
+        (
+            "ALTER DOMAIN dd ADD CHECK (sum(VALUE) > 0);",
+            "aggregate functions are not allowed in check constraints",
+        ),
+        (
+            "CREATE INDEX ON t ((sum(a)));",
+            "aggregate functions are not allowed in index expressions",
+        ),
+        (
+            "CREATE INDEX ON t ((row_number() over ()));",
+            "window functions are not allowed in index expressions",
+        ),
+        (
+            "CREATE INDEX ON t (((select 1)));",
+            "cannot use subquery in index expression",
+        ),
+        (
+            "CREATE INDEX ON t (a) WHERE sum(a) > 0;",
+            "aggregate functions are not allowed in index predicates",
+        ),
+        (
+            "CREATE INDEX ON t (a) WHERE (select true);",
+            "cannot use subquery in index predicate",
+        ),
+        (
+            "CREATE TABLE g1 (a int, b int GENERATED ALWAYS AS (sum(a)) STORED);",
+            "aggregate functions are not allowed in column generation expressions",
+        ),
+        (
+            "CREATE TABLE g2 (a int, b bigint GENERATED ALWAYS AS (row_number() over ()) STORED);",
+            "window functions are not allowed in column generation expressions",
+        ),
+        (
+            "CREATE TABLE g3 (a int, b int GENERATED ALWAYS AS ((select 1)) STORED);",
+            "cannot use subquery in column generation expression",
+        ),
+        (
+            "CREATE POLICY p ON t USING (row_number() over () > 0);",
+            "window functions are not allowed in policy expressions",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+}

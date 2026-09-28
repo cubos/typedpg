@@ -630,6 +630,11 @@ pub(crate) fn validate_constraint_expressions(
             match ConstrType::try_from(c.contype) {
                 Ok(ConstrType::ConstrCheck) => {
                     if let Some(expr) = c.raw_expr.as_deref() {
+                        crate::ddl::expr_kind::check_expr_kind(
+                            interp,
+                            expr,
+                            crate::ddl::expr_kind::ExprKind::CheckConstraint,
+                        )?;
                         // Infer with no type goal so a non-bool result
                         // doesn't surface as a TypeMismatch — we want PG's
                         // exact wording (`argument of CHECK must be type
@@ -662,6 +667,11 @@ pub(crate) fn validate_constraint_expressions(
                 }
                 Ok(ConstrType::ConstrGenerated) => {
                     if let Some(expr) = c.raw_expr.as_deref() {
+                        crate::ddl::expr_kind::check_expr_kind(
+                            interp,
+                            expr,
+                            crate::ddl::expr_kind::ExprKind::GeneratedColumn,
+                        )?;
                         crate::ddl::volatile::check_mutability(
                             interp,
                             class_oid,
@@ -745,6 +755,11 @@ pub(crate) fn validate_constraint_expressions(
             && c.contype == ConstrType::ConstrCheck as i32
             && let Some(expr) = c.raw_expr.as_deref()
         {
+            crate::ddl::expr_kind::check_expr_kind(
+                interp,
+                expr,
+                crate::ddl::expr_kind::ExprKind::CheckConstraint,
+            )?;
             let result = infer_expr(
                 expr,
                 crate::expr::Ctx::new(&scope, &null_ctx, interp),
@@ -1272,6 +1287,11 @@ fn validate_check_expression_for_table(
     let null_ctx = NullabilityContext::default();
     let mut params = ParamCollector::default();
 
+    crate::ddl::expr_kind::check_expr_kind(
+        interp,
+        expr,
+        crate::ddl::expr_kind::ExprKind::CheckConstraint,
+    )?;
     let result = infer_expr(
         expr,
         crate::expr::Ctx::new(&scope, &null_ctx, interp),

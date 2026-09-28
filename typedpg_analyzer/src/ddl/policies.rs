@@ -186,9 +186,7 @@ fn check_policy_expression(
         TypeGoal::NONE,
     )
     .map_err(|e| DdlError::UnsupportedDdl(format!("{e}")))?;
-    // EXPR_KIND_POLICY forbids aggregates and window functions.
-    crate::clause::check_no_aggregates_or_windows(expr, interp, "policy expressions")
-        .map_err(|e| DdlError::UnsupportedDdl(format!("{e}")))?;
+    super::expr_kind::check_expr_kind(interp, expr, super::expr_kind::ExprKind::Policy)?;
     let bool_oid = crate::pg_catalog::oid::BOOL;
     if result.type_oid != bool_oid && result.type_oid != crate::pg_catalog::oid::UNKNOWN {
         return Err(DdlError::UnsupportedDdl(format!(

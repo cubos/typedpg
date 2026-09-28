@@ -506,6 +506,11 @@ fn add_column_to(
                 && c.contype == ConstrType::ConstrGenerated as i32
                 && let Some(expr) = c.raw_expr.as_deref()
             {
+                crate::ddl::expr_kind::check_expr_kind(
+                    interp,
+                    expr,
+                    crate::ddl::expr_kind::ExprKind::GeneratedColumn,
+                )?;
                 crate::ddl::volatile::check_mutability(
                     interp,
                     relid,
@@ -1117,6 +1122,11 @@ pub(crate) fn set_expression(
     if !rec.recursing
         && let Some(expr) = cmd.def.as_deref()
     {
+        crate::ddl::expr_kind::check_expr_kind(
+            interp,
+            expr,
+            crate::ddl::expr_kind::ExprKind::GeneratedColumn,
+        )?;
         crate::ddl::volatile::check_no_volatile(
             expr,
             crate::ddl::volatile::ExprLocation::Generated,

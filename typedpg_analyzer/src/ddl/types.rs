@@ -226,6 +226,7 @@ fn check_domain_check_expression(
     );
     let null_ctx = NullabilityContext::default();
     let mut params = ParamCollector::default();
+    super::expr_kind::check_expr_kind(interp, expr, super::expr_kind::ExprKind::CheckConstraint)?;
     let result = infer_expr(
         expr,
         crate::expr::Ctx::new(&scope, &null_ctx, interp),
