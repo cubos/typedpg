@@ -293,7 +293,7 @@ fn apply_with_schema(
     scripts: &[&str],
 ) -> Result<(), DdlError> {
     ensure_namespace(interp, schema)?;
-    let original = interp.push_extension_search_path(schema);
+    let original = interp.push_search_path_front(schema);
 
     let mut result = Ok(());
     for sql in scripts {

@@ -191,3 +191,51 @@ fn alter_table_finds_relations_along_the_search_path() {
         vec![cn("b", text()), cn("y", int4())],
     );
 }
+
+// ── CREATE SCHEMA elements / duplicates ─────────────────────────────────────
+
+#[test]
+fn create_schema_elements_are_created_in_the_new_schema() {
+    // PG 18: s.t (a integer), s.v (a integer); s4.v reads public.t.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE SCHEMA s CREATE TABLE t (a int) CREATE VIEW v AS SELECT a FROM t;
+         CREATE TABLE public.pt (b text);
+         CREATE SCHEMA s4 CREATE VIEW v AS SELECT * FROM pt;",
+    )]);
+    assert_cols(
+        &db.analyze("SELECT * FROM s.t").unwrap(),
+        vec![cn("a", int4())],
+    );
+    assert_cols(
+        &db.analyze("SELECT * FROM s.v").unwrap(),
+        vec![cn("a", int4())],
+    );
+    assert_cols(
+        &db.analyze("SELECT * FROM s4.v").unwrap(),
+        vec![cn("b", text())],
+    );
+    assert!(db.analyze("SELECT * FROM public.t").is_err());
+}
+
+#[test]
+fn create_schema_errors() {
+    // PG 18: 42P06 schema "s" already exists; 42P15 for a mismatched element.
+    assert_ddl_err!(
+        try_apply(&[("0001.sql", "CREATE SCHEMA s; CREATE SCHEMA s;")]),
+        DdlError::DuplicateObject(_),
+        "schema \"s\" already exists",
+    );
+    build_db(&[(
+        "0001.sql",
+        "CREATE SCHEMA s; CREATE SCHEMA IF NOT EXISTS s;",
+    )]);
+    assert_ddl_err!(
+        try_apply(&[(
+            "0001.sql",
+            "CREATE SCHEMA s3 CREATE TABLE public.y (a int);"
+        )]),
+        DdlError::Parse(_),
+        "CREATE specifies a schema (public) different from the one being created (s3)",
+    );
+}
