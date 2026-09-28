@@ -105,8 +105,20 @@ pub(super) fn add_inherit(
             "relation \"{parent_name}\" would be inherited from more than once"
         )));
     }
-    merge_attributes_into_existing(interp, relid, parent, &child_name)?;
-    merge_constraints_into_existing(interp, relid, parent, &child_name)?;
+    create_inheritance(interp, relid, parent, &child_name, false)
+}
+
+/// CreateInheritance: merge the child's columns and constraints into the
+/// parent's and record the `pg_inherits` row.
+fn create_inheritance(
+    interp: &mut PgCatalog,
+    relid: PgClassOid,
+    parent: PgClassOid,
+    child_name: &str,
+    partition: bool,
+) -> Result<(), DdlError> {
+    merge_attributes_into_existing(interp, relid, parent, child_name, partition)?;
+    merge_constraints_into_existing(interp, relid, parent, child_name, partition)?;
     let inhseqno = interp
         .pg_inherits
         .iter()
@@ -130,6 +142,7 @@ fn merge_attributes_into_existing(
     child: PgClassOid,
     parent: PgClassOid,
     child_name: &str,
+    partition: bool,
 ) -> Result<(), DdlError> {
     let parent_attrs = interp.attributes_of(parent).to_vec();
     for pa in &parent_attrs {
@@ -177,6 +190,10 @@ fn merge_attributes_into_existing(
         for a in attrs.iter_mut() {
             if parent_attrs.iter().any(|pa| pa.attname == a.attname) {
                 a.attinhcount += 1;
+                // A partition's columns are never local.
+                if partition {
+                    a.attislocal = false;
+                }
             }
         }
     }
@@ -191,6 +208,7 @@ fn merge_constraints_into_existing(
     child: PgClassOid,
     parent: PgClassOid,
     child_name: &str,
+    partition: bool,
 ) -> Result<(), DdlError> {
     let mut parent_cons: Vec<PgConstraint> = interp
         .pg_constraint
@@ -261,6 +279,9 @@ fn merge_constraints_into_existing(
     for oid in merged {
         if let Some(row) = interp.pg_constraint.get_mut(&oid) {
             row.coninhcount += 1;
+            if partition {
+                row.conislocal = false;
+            }
         }
     }
     Ok(())
@@ -280,15 +301,124 @@ pub(super) fn drop_inherit(
         ));
     }
     let parent = super::super::util::lookup_relation(interp, rv)?.1;
+    remove_inheritance(interp, relid, parent, "parent")
+}
+
+/// `ALTER TABLE parent ATTACH PARTITION name FOR VALUES ...`
+/// (ATExecAttachPartition).
+pub(super) fn attach_partition(
+    interp: &mut PgCatalog,
+    parent: PgClassOid,
+    cmd: &AlterTableCmd,
+) -> Result<(), DdlError> {
+    let Some(node::Node::PartitionCmd(pc)) = cmd.def.as_deref().and_then(|d| d.node.as_ref())
+    else {
+        return Ok(());
+    };
+    let Some(rv) = pc.name.as_ref() else {
+        return Ok(());
+    };
+    let attach = super::super::util::lookup_relation(interp, rv)?.1;
+    let attach_kind = interp.pg_class.get(&attach).map(|c| c.relkind);
+    if !matches!(
+        attach_kind,
+        Some(RelKind::Table | RelKind::Partitioned | RelKind::ForeignTable)
+    ) {
+        let kinds = match attach_kind {
+            Some(RelKind::View) => "views",
+            Some(RelKind::MaterializedView) => "materialized views",
+            Some(RelKind::Sequence) => "sequences",
+            Some(RelKind::Index | RelKind::PartitionedIndex) => "indexes",
+            Some(RelKind::CompositeType) => "composite types",
+            _ => "this relation",
+        };
+        return Err(DdlError::Parse(format!(
+            "ALTER action ATTACH PARTITION cannot be performed on relation \"{}\" (This \
+             operation is not supported for {kinds}.)",
+            rv.relname
+        )));
+    }
+    let attach_name = relname_of(interp, attach);
+    let parent_name = relname_of(interp, parent);
+    if is_partition(interp, attach) {
+        return Err(DdlError::Parse(format!(
+            "\"{attach_name}\" is already a partition"
+        )));
+    }
+    if interp.typed_tables.contains_key(&attach) {
+        return Err(DdlError::Parse(
+            "cannot attach a typed table as partition".into(),
+        ));
+    }
+    if interp.pg_inherits.iter().any(|i| i.inhrelid == attach) {
+        return Err(DdlError::Parse(
+            "cannot attach inheritance child as partition".into(),
+        ));
+    }
+    if interp.pg_inherits.iter().any(|i| i.inhparent == attach)
+        && attach_kind != Some(RelKind::Partitioned)
+    {
+        return Err(DdlError::Parse(
+            "cannot attach inheritance parent as partition".into(),
+        ));
+    }
+    if all_inheritors(interp, attach).contains(&parent) {
+        return Err(DdlError::DuplicateObject(format!(
+            "circular inheritance not allowed (\"{parent_name}\" is already a child of \
+             \"{attach_name}\".)"
+        )));
+    }
+    // The partition may only have the parent's columns.
+    for a in interp.attributes_of(attach) {
+        if interp.attribute_by_name(parent, &a.attname).is_none() {
+            return Err(DdlError::Parse(format!(
+                "table \"{attach_name}\" contains column \"{}\" not found in parent \
+                 \"{parent_name}\" (The new partition may contain only the columns present \
+                 in parent.)",
+                a.attname
+            )));
+        }
+    }
+    create_inheritance(interp, attach, parent, &attach_name, true)
+}
+
+/// `ALTER TABLE parent DETACH PARTITION name` (ATExecDetachPartition).
+pub(super) fn detach_partition(
+    interp: &mut PgCatalog,
+    parent: PgClassOid,
+    cmd: &AlterTableCmd,
+) -> Result<(), DdlError> {
+    let Some(node::Node::PartitionCmd(pc)) = cmd.def.as_deref().and_then(|d| d.node.as_ref())
+    else {
+        return Ok(());
+    };
+    let Some(rv) = pc.name.as_ref() else {
+        return Ok(());
+    };
+    let part = super::super::util::lookup_relation(interp, rv)?.1;
+    remove_inheritance(interp, part, parent, "partition")
+}
+
+/// RemoveInheritance: drop the `pg_inherits` row and give back the
+/// inherited columns and constraints to the child.
+fn remove_inheritance(
+    interp: &mut PgCatalog,
+    relid: PgClassOid,
+    parent: PgClassOid,
+    role: &str,
+) -> Result<(), DdlError> {
     let Some(pos) = interp
         .pg_inherits
         .iter()
         .position(|i| i.inhrelid == relid && i.inhparent == parent)
     else {
+        let (a, b) = if role == "partition" {
+            (relname_of(interp, relid), relname_of(interp, parent))
+        } else {
+            (relname_of(interp, parent), relname_of(interp, relid))
+        };
         return Err(DdlError::TableNotFound(format!(
-            "relation \"{}\" is not a parent of relation \"{}\"",
-            relname_of(interp, parent),
-            relname_of(interp, relid)
+            "relation \"{a}\" is not a {role} of relation \"{b}\""
         )));
     };
     interp.pg_inherits.remove(pos);

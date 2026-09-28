@@ -1238,3 +1238,110 @@ fn alter_table_inherit_and_no_inherit() {
         ),
     ]);
 }
+
+#[test]
+fn attach_and_detach_partition() {
+    // PG 18 ATExecAttachPartition / ATExecDetachPartition.
+    let setup = "CREATE TABLE pt (a int NOT NULL, b text, CONSTRAINT pc CHECK (a > 0))
+                     PARTITION BY LIST (a);
+                 CREATE TABLE x1 (a int NOT NULL, b text, CONSTRAINT pc CHECK (a > 0));
+                 CREATE TABLE x2 (a int, b text);
+                 CREATE TABLE x3 (a int NOT NULL, b text, c int);
+                 CREATE TABLE x4 (a int NOT NULL);
+                 CREATE TABLE x5 (a bigint NOT NULL, b text);
+                 CREATE TABLE x6 (a int NOT NULL, b text);
+                 CREATE TABLE plain (a int);
+                 CREATE TABLE ch (a int NOT NULL, b text, CONSTRAINT pc CHECK (a > 0));
+                 CREATE TABLE ih () INHERITS (ch);
+                 CREATE TYPE ct AS (a int, b text);
+                 CREATE TABLE tt OF ct;
+                 CREATE VIEW v AS SELECT 1 AS a, 'x'::text AS b;";
+    for (stmt, msg) in [
+        (
+            "ALTER TABLE pt ATTACH PARTITION x2 FOR VALUES IN (2);",
+            "column \"a\" in child table \"x2\" must be marked NOT NULL",
+        ),
+        (
+            "ALTER TABLE pt ATTACH PARTITION x3 FOR VALUES IN (3);",
+            "table \"x3\" contains column \"c\" not found in parent \"pt\"",
+        ),
+        (
+            "ALTER TABLE pt ATTACH PARTITION x4 FOR VALUES IN (4);",
+            "child table is missing column \"b\"",
+        ),
+        (
+            "ALTER TABLE pt ATTACH PARTITION x5 FOR VALUES IN (5);",
+            "child table \"x5\" has different type for column \"a\"",
+        ),
+        (
+            "ALTER TABLE pt ATTACH PARTITION x6 FOR VALUES IN (6);",
+            "child table is missing constraint \"pc\"",
+        ),
+        (
+            "ALTER TABLE pt ATTACH PARTITION nosuch FOR VALUES IN (7);",
+            "relation \"nosuch\" does not exist",
+        ),
+        (
+            "ALTER TABLE plain ATTACH PARTITION x1 FOR VALUES IN (1);",
+            "ALTER action ATTACH PARTITION cannot be performed on relation \"plain\"",
+        ),
+        (
+            "ALTER TABLE pt ATTACH PARTITION v FOR VALUES IN (1);",
+            "ALTER action ATTACH PARTITION cannot be performed on relation \"v\"",
+        ),
+        (
+            "ALTER TABLE pt ATTACH PARTITION x1 FOR VALUES IN (1);
+             ALTER TABLE pt ATTACH PARTITION x1 FOR VALUES IN (8);",
+            "\"x1\" is already a partition",
+        ),
+        (
+            "ALTER TABLE pt ATTACH PARTITION ih FOR VALUES IN (1);",
+            "cannot attach inheritance child as partition",
+        ),
+        (
+            "ALTER TABLE pt ATTACH PARTITION ch FOR VALUES IN (1);",
+            "cannot attach inheritance parent as partition",
+        ),
+        (
+            "ALTER TABLE pt ATTACH PARTITION tt FOR VALUES IN (1);",
+            "cannot attach a typed table as partition",
+        ),
+        (
+            "ALTER TABLE pt ATTACH PARTITION x1 FOR VALUES IN (1); ALTER TABLE x1 DROP CONSTRAINT pc;",
+            "cannot drop inherited constraint \"pc\" of relation \"x1\"",
+        ),
+        (
+            "ALTER TABLE pt ATTACH PARTITION x1 FOR VALUES IN (1); ALTER TABLE x1 DROP COLUMN b;",
+            "cannot drop inherited column \"b\"",
+        ),
+        (
+            "ALTER TABLE pt ATTACH PARTITION x1 FOR VALUES IN (1); ALTER TABLE x1 RENAME COLUMN a TO z;",
+            "cannot rename inherited column \"a\"",
+        ),
+        (
+            "ALTER TABLE pt DETACH PARTITION x6;",
+            "relation \"x6\" is not a partition of relation \"pt\"",
+        ),
+        (
+            "ALTER TABLE pt DETACH PARTITION nosuch;",
+            "relation \"nosuch\" does not exist",
+        ),
+        (
+            "ALTER TABLE plain DETACH PARTITION x1;",
+            "ALTER action DETACH PARTITION cannot be performed on relation \"plain\"",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "ALTER TABLE pt ATTACH PARTITION x1 FOR VALUES IN (1);
+             ALTER TABLE pt DETACH PARTITION x1;
+             ALTER TABLE x1 DROP CONSTRAINT pc;
+             ALTER TABLE x1 DROP COLUMN b;",
+        ),
+    ]);
+}

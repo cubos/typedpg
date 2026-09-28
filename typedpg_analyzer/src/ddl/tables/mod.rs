@@ -608,6 +608,8 @@ fn apply_alter_subtype(
         AlterTableType::AtAddOf => typed::add_of(interp, relid, cmd),
         AlterTableType::AtAddInherit => inherit_cmd::add_inherit(interp, relid, cmd),
         AlterTableType::AtDropInherit => inherit_cmd::drop_inherit(interp, relid, cmd),
+        AlterTableType::AtAttachPartition => inherit_cmd::attach_partition(interp, relid, cmd),
+        AlterTableType::AtDetachPartition => inherit_cmd::detach_partition(interp, relid, cmd),
         AlterTableType::AtDropOf => typed::drop_of(interp, relid),
         AlterTableType::AtReplicaIdentity => object_refs::replica_identity(interp, relid, cmd),
         AlterTableType::AtAlterConstraint => object_refs::alter_constraint(interp, relid, cmd),
@@ -689,6 +691,8 @@ fn check_alter_target(
         At::AtAddConstraint => (table_like, "ADD CONSTRAINT"),
         At::AtAddOf => (class.relkind == RelKind::Table, "OF"),
         At::AtAddInherit => (table_like, "INHERIT"),
+        At::AtAttachPartition => (class.relkind == RelKind::Partitioned, "ATTACH PARTITION"),
+        At::AtDetachPartition => (class.relkind == RelKind::Partitioned, "DETACH PARTITION"),
         At::AtDropInherit => (table_like, "NO INHERIT"),
         At::AtDropOf => (class.relkind == RelKind::Table, "NOT OF"),
         At::AtDropConstraint => (table_like, "DROP CONSTRAINT"),
@@ -698,6 +702,8 @@ fn check_alter_target(
         return Ok(());
     }
     let kinds = match class.relkind {
+        RelKind::Table => "tables",
+        RelKind::ForeignTable => "foreign tables",
         RelKind::View => "views",
         RelKind::MaterializedView => "materialized views",
         RelKind::Sequence => "sequences",
