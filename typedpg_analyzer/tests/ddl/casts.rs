@@ -122,3 +122,27 @@ fn create_cast_with_domain_without_function_is_rejected() {
         "domain data types must not be marked binary-compatible",
     );
 }
+
+#[test]
+fn user_cast_backed_by_a_non_strict_function_is_nullable() {
+    // The cast function runs on any input and may return NULL (a SQL
+    // function is CALLED ON NULL INPUT by default); a STRICT one is NULL only
+    // on a NULL input.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TYPE mood AS ENUM ('a');
+         CREATE FUNCTION mood_int(mood) RETURNS int LANGUAGE sql AS 'select null::int';
+         CREATE CAST (mood AS int) WITH FUNCTION mood_int(mood);
+         CREATE TYPE mood2 AS ENUM ('a');
+         CREATE FUNCTION mood2_int(mood2) RETURNS int LANGUAGE sql STRICT AS 'select 1';
+         CREATE CAST (mood2 AS int) WITH FUNCTION mood2_int(mood2);",
+    )]);
+    assert_cols(
+        &db.analyze("SELECT 'a'::mood::int AS m").unwrap(),
+        vec![cn("m", int4())],
+    );
+    assert_cols(
+        &db.analyze("SELECT 'a'::mood2::int AS m").unwrap(),
+        vec![c("m", int4())],
+    );
+}

@@ -228,6 +228,13 @@ fn cast_function_can_return_null(
     if cast.castmethod != crate::pg_catalog::CastMethod::Function {
         return false;
     }
+    // A user-defined cast function that isn't STRICT runs on any input and
+    // may return NULL, like any user-defined function.
+    if let Some(f) = cast.castfunc.and_then(|oid| snapshot.pg_proc.get(&oid))
+        && snapshot.namespace_name(f.pronamespace) != Some("pg_catalog")
+    {
+        return !f.proisstrict;
+    }
     let (Some(src), Some(tgt)) = (snapshot.get_type(source), snapshot.get_type(target)) else {
         return false;
     };
