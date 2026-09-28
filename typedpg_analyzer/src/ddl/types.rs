@@ -51,6 +51,13 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
         let Some(node::Node::Constraint(c)) = n.node.as_ref() else {
             continue;
         };
+        // domainAddDefault: cooked like a column default named after the
+        // domain, against the base type.
+        if c.contype == ConstrType::ConstrDefault as i32
+            && let Some(expr) = c.raw_expr.as_deref()
+        {
+            super::defaults::check_default(interp, expr, &name, base_type_oid)?;
+        }
         add_domain_constraint(interp, &name, base_type_oid, c, &mut constraints)?;
     }
     let typnotnull = constraints

@@ -26,6 +26,20 @@ pub(crate) fn serial_base_type(tn: &pg_query::protobuf::TypeName) -> Option<PgTy
     }
 }
 
+/// The DEFAULT expression written on a column definition, if any.
+pub(crate) fn column_default_expr(
+    cd: &pg_query::protobuf::ColumnDef,
+) -> Option<&pg_query::protobuf::Node> {
+    cd.raw_default.as_deref().or_else(|| {
+        cd.constraints.iter().find_map(|n| match n.node.as_ref()? {
+            node::Node::Constraint(c) if c.contype == ConstrType::ConstrDefault as i32 => {
+                c.raw_expr.as_deref()
+            }
+            _ => None,
+        })
+    })
+}
+
 /// Parse a `ColumnDef` AST node into a `ParsedColumn` (shared between
 /// CREATE TABLE and ALTER TABLE ADD COLUMN paths).
 pub(crate) fn parse_column_def(
@@ -359,6 +373,11 @@ pub(crate) fn add_column(
     }
 
     let col = parse_column_def(interp, &relname_of(interp, relid), cd, &[])?;
+    if !rec.recursing
+        && let Some(expr) = column_default_expr(cd)
+    {
+        crate::ddl::defaults::check_default(interp, expr, &cd.colname, col.type_oid)?;
+    }
 
     if let Some(existing) = interp.attribute_by_name(relid, &cd.colname).cloned() {
         if rec.recursing {
@@ -621,6 +640,13 @@ pub(crate) fn set_default(
     cmd: &AlterTableCmd,
     rec: inherit::Recursion,
 ) -> Result<(), DdlError> {
+    if !rec.recursing
+        && let Some(expr) = cmd.def.as_deref()
+        && let Some(attr) = interp.attribute_by_name(relid, &cmd.name)
+    {
+        let type_oid = attr.atttypid;
+        crate::ddl::defaults::check_default(interp, expr, &cmd.name, type_oid)?;
+    }
     if rec.recurse {
         for child in inherit::children_of(interp, relid) {
             if interp.attribute_by_name(child, &cmd.name).is_some() {

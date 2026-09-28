@@ -7,6 +7,7 @@
 pub mod aggregates;
 pub mod alter;
 pub mod collations;
+mod defaults;
 pub mod drop;
 pub mod extensions;
 pub mod functions;

@@ -959,3 +959,71 @@ fn primary_key_on_missing_column_is_rejected() {
         "column \"b\" named in key does not exist",
     );
 }
+
+// ── DEFAULT expressions (cookDefault) ───────────────────────────────────────
+
+#[test]
+fn default_expressions_are_type_checked() {
+    // PG 18 wording for each rejected DEFAULT.
+    for (sql, msg) in [
+        (
+            "CREATE TABLE t (a int DEFAULT now());",
+            "column \"a\" is of type integer but default expression is of type timestamp with time zone",
+        ),
+        (
+            "CREATE TABLE t (a int DEFAULT 'abc');",
+            "invalid input syntax for type integer: \"abc\"",
+        ),
+        (
+            "CREATE TABLE t (a int, b int DEFAULT a);",
+            "cannot use column reference in DEFAULT expression",
+        ),
+        (
+            "CREATE TABLE t (a int DEFAULT (SELECT 1));",
+            "cannot use subquery in DEFAULT expression",
+        ),
+        (
+            "CREATE TABLE t2 (a int DEFAULT count(*));",
+            "aggregate functions are not allowed in DEFAULT expressions",
+        ),
+        (
+            "CREATE TABLE t3 (a int DEFAULT nosuchfn());",
+            "function nosuchfn() does not exist",
+        ),
+        (
+            "CREATE TABLE a (x int); ALTER TABLE a ALTER COLUMN x SET DEFAULT 'abc';",
+            "invalid input syntax for type integer: \"abc\"",
+        ),
+        (
+            "CREATE TABLE a (x int); ALTER TABLE a ALTER COLUMN x SET DEFAULT now();",
+            "column \"x\" is of type integer but default expression is of type timestamp with time zone",
+        ),
+        (
+            "CREATE TABLE a (x int); ALTER TABLE a ADD COLUMN y int DEFAULT now();",
+            "column \"y\" is of type integer but default expression is of type timestamp with time zone",
+        ),
+        (
+            "CREATE DOMAIN d AS int DEFAULT 'abc';",
+            "invalid input syntax for type integer: \"abc\"",
+        ),
+        (
+            "CREATE DOMAIN d2 AS int DEFAULT now();",
+            "column \"d2\" is of type integer but default expression is of type timestamp with time zone",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", sql)]).expect_err(sql);
+        assert!(err.to_string().starts_with(msg), "{sql}\n  got: {err}");
+    }
+}
+
+#[test]
+fn assignment_compatible_defaults_are_accepted() {
+    // PG 18 accepts all of these (assignment casts, untyped literals, NULL).
+    build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int DEFAULT 1.5, b text DEFAULT 5, c int DEFAULT '7',
+                         d int[] DEFAULT '{}', e date DEFAULT now(), f bigint DEFAULT 1,
+                         g int DEFAULT NULL, h bool DEFAULT 'yes', i numeric DEFAULT 2::bigint,
+                         j timestamptz DEFAULT now(), k uuid DEFAULT gen_random_uuid());",
+    )]);
+}

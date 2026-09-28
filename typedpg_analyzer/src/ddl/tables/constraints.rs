@@ -502,6 +502,11 @@ pub(crate) fn validate_constraint_expressions(
         let Some(node::Node::ColumnDef(cd)) = elt.node.as_ref() else {
             continue;
         };
+        if let Some(expr) = super::columns::column_default_expr(cd)
+            && let Some(attr) = table_attrs.iter().find(|a| a.attname == cd.colname)
+        {
+            crate::ddl::defaults::check_default(interp, expr, &cd.colname, attr.atttypid)?;
+        }
         for c_node in &cd.constraints {
             let Some(node::Node::Constraint(c)) = c_node.node.as_ref() else {
                 continue;
