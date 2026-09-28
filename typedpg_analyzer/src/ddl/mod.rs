@@ -10,6 +10,7 @@ pub mod alter;
 pub mod collations;
 mod comment;
 mod defaults;
+mod dml;
 pub mod drop;
 mod expr_kind;
 pub mod extensions;
@@ -185,7 +186,15 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         node::Node::VariableSetStmt(s) => session::variable_set(db, s),
         node::Node::TransactionStmt(s) => session::transaction(db, s),
         node::Node::SelectStmt(s) if s.into_clause.is_some() => views::select_into(db, s),
-        node::Node::SelectStmt(s) => session::select_side_effects(db, s),
+        node::Node::SelectStmt(s) => {
+            dml::check_statement(db, stmt)?;
+            session::select_side_effects(db, s)
+        }
+        node::Node::InsertStmt(_)
+        | node::Node::UpdateStmt(_)
+        | node::Node::DeleteStmt(_)
+        | node::Node::MergeStmt(_)
+        | node::Node::CallStmt(_) => dml::check_statement(db, stmt),
 
         // ── Indexes ─────────────────────────────────────────────────
         // Indexes don't change query result types, but expression indexes
@@ -209,9 +218,6 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         | node::Node::CreateOpClassStmt(_)
         | node::Node::AlterOpFamilyStmt(_)
         | node::Node::AlterOperatorStmt(_)
-        | node::Node::InsertStmt(_)
-        | node::Node::UpdateStmt(_)
-        | node::Node::DeleteStmt(_)
         | node::Node::DoStmt(_)
         | node::Node::TruncateStmt(_)
         | node::Node::CopyStmt(_)
@@ -235,8 +241,6 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         // configuration, foreign-data wrappers / servers / user mappings,
         // tablespaces, conversions, languages, transforms, security labels,
         // and type property changes (`ALTER TYPE t SET (...)`).
-        | node::Node::CallStmt(_)
-        | node::Node::MergeStmt(_)
         | node::Node::PrepareStmt(_)
         | node::Node::ExecuteStmt(_)
         | node::Node::DeallocateStmt(_)

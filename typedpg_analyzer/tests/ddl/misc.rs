@@ -1759,3 +1759,73 @@ fn alter_owner_and_comment_resolve_their_target() {
         ),
     ]);
 }
+
+#[test]
+fn migration_queries_are_analyzed() {
+    // PG 18 runs parse analysis on every DML / SELECT / CALL statement of
+    // a migration.
+    let setup = "CREATE TABLE t (a int NOT NULL, b text);";
+    for (stmt, msg) in [
+        (
+            "INSERT INTO nosuch VALUES (1);",
+            "relation \"nosuch\" does not exist",
+        ),
+        (
+            "INSERT INTO t (nosuch) VALUES (1);",
+            "column \"nosuch\" of relation \"t\" does not exist",
+        ),
+        (
+            "INSERT INTO t VALUES ('x');",
+            "invalid input syntax for type integer: \"x\"",
+        ),
+        (
+            "INSERT INTO t VALUES (1, 'a', 3);",
+            "INSERT has more expressions than target columns",
+        ),
+        (
+            "UPDATE t SET nosuch = 1;",
+            "column \"nosuch\" of relation \"t\" does not exist",
+        ),
+        (
+            "UPDATE t SET a = 'x';",
+            "invalid input syntax for type integer: \"x\"",
+        ),
+        (
+            "DELETE FROM t WHERE nosuch = 1;",
+            "column \"nosuch\" does not exist",
+        ),
+        (
+            "DELETE FROM t WHERE a;",
+            "argument of WHERE must be type boolean, not type integer",
+        ),
+        ("SELECT nosuch FROM t;", "column \"nosuch\" does not exist"),
+        (
+            "SELECT * FROM nosuch;",
+            "relation \"nosuch\" does not exist",
+        ),
+        ("CALL nosuch();", "procedure nosuch() does not exist"),
+        (
+            "MERGE INTO t USING t AS s ON t.a = s.a WHEN MATCHED THEN UPDATE SET nosuch = 1;",
+            "column \"nosuch\" of relation \"t\" does not exist",
+        ),
+        (
+            "INSERT INTO t VALUES (1, 'x') RETURNING nosuch;",
+            "column \"nosuch\" does not exist",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "INSERT INTO t VALUES (1, 'x'), (2, NULL);
+             INSERT INTO t SELECT 1, 'x' WHERE false;
+             UPDATE t SET b = b || '!' WHERE a > 1;
+             DELETE FROM t WHERE b IS NULL;
+             SELECT set_config('search_path', 'public', false);
+             SELECT count(*) FROM t;",
+        ),
+    ]);
+}
