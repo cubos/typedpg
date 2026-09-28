@@ -372,3 +372,78 @@ fn collate_on_a_non_collatable_column_is_rejected() {
         "collations are not supported by type integer",
     );
 }
+
+// ── DROP / SET EXPRESSION, relation lookups, renames ────────────────────────
+
+#[test]
+fn alter_index_rename_is_tracked() {
+    // PG 18: after RENAME the index is known under its new name.
+    build_db(&[(
+        "0001.sql",
+        "CREATE TABLE i (a int);
+         CREATE INDEX ix ON i (a);
+         ALTER INDEX ix RENAME TO jx;
+         ALTER INDEX jx SET (fillfactor = 50);
+         DROP INDEX jx;
+         ALTER INDEX IF EXISTS nosuch RENAME TO z;
+         CREATE TABLE k (a int PRIMARY KEY);
+         ALTER INDEX k_pkey RENAME TO k_pk;
+         ALTER TABLE k DROP CONSTRAINT k_pk;",
+    )]);
+    assert_ddl_err!(
+        try_apply(&[("0001.sql", "ALTER INDEX nosuch RENAME TO z;")]),
+        DdlError::TableNotFound(_),
+        "relation \"nosuch\" does not exist",
+    );
+}
+
+#[test]
+fn missing_relations_are_reported_like_pg() {
+    // PG 18: 42P01 relation "nosuch" does not exist / 3F000 schema "nosuch"
+    // does not exist.
+    assert_ddl_err!(
+        try_apply(&[("0001.sql", "ALTER TABLE nosuch ADD COLUMN a int;")]),
+        DdlError::TableNotFound(_),
+        "relation \"nosuch\" does not exist",
+    );
+    assert_ddl_err!(
+        try_apply(&[("0001.sql", "ALTER TABLE nosuch.t ADD COLUMN a int;")]),
+        DdlError::TableNotFound(_),
+        "schema \"nosuch\" does not exist",
+    );
+    assert_ddl_err!(
+        try_apply(&[("0001.sql", "ALTER INDEX nosuch2 SET (fillfactor = 50);")]),
+        DdlError::TableNotFound(_),
+        "relation \"nosuch2\" does not exist",
+    );
+}
+
+#[test]
+fn rename_to_a_taken_name_is_rejected() {
+    // PG 18: 42P07 relation "b" already exists.
+    assert_ddl_err!(
+        try_apply(&[(
+            "0001.sql",
+            "CREATE TABLE a (x int); CREATE TABLE b (x int); ALTER TABLE a RENAME TO b;",
+        )]),
+        DdlError::DuplicateObject(_),
+        "relation \"b\" already exists",
+    );
+    // RENAME COLUMN to a taken name / of a missing column.
+    assert_ddl_err!(
+        try_apply(&[(
+            "0001.sql",
+            "CREATE TABLE a (x int, y int); ALTER TABLE a RENAME COLUMN x TO y;",
+        )]),
+        DdlError::DuplicateObject(_),
+        "column \"y\" of relation \"a\" already exists",
+    );
+    assert_ddl_err!(
+        try_apply(&[(
+            "0001.sql",
+            "CREATE TABLE a (x int); ALTER TABLE a RENAME COLUMN q TO z;",
+        )]),
+        DdlError::Parse(_),
+        "column \"q\" does not exist",
+    );
+}

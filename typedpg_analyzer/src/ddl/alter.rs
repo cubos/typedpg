@@ -24,7 +24,8 @@ pub fn rename(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlError>
         | ObjectType::ObjectView
         | ObjectType::ObjectMatview
         | ObjectType::ObjectSequence
-        | ObjectType::ObjectForeignTable => rename_relation(interp, stmt),
+        | ObjectType::ObjectForeignTable
+        | ObjectType::ObjectIndex => rename_relation(interp, stmt),
         ObjectType::ObjectFunction | ObjectType::ObjectProcedure | ObjectType::ObjectAggregate => {
             rename_function_like(interp, stmt, rename_type)
         }
@@ -109,39 +110,39 @@ fn rename_relation(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlE
     let Some(rv) = stmt.relation.as_ref() else {
         return Ok(());
     };
-    let schema_name = crate::ddl::util::range_var_names(rv, interp).0;
-    let Some(nsoid) = interp.namespace_oid(&schema_name) else {
-        if stmt.missing_ok {
-            return Ok(());
-        }
-        return Err(DdlError::TableNotFound(
-            QualifiedName::new(&schema_name, &rv.relname).to_string(),
-        ));
-    };
-    let Some(class_oid) = interp
-        .class_by_qname
-        .get(&(nsoid, rv.relname.clone()))
-        .copied()
-    else {
-        if stmt.missing_ok {
-            return Ok(());
-        }
-        return Err(DdlError::TableNotFound(
-            QualifiedName::new(&schema_name, &rv.relname).to_string(),
-        ));
+    let (schema_name, _) = crate::ddl::util::range_var_names(rv, interp);
+    let found = crate::ddl::util::lookup_relation(interp, rv);
+    let (nsoid, class_oid) = match found {
+        Ok(found) => found,
+        Err(_) if stmt.missing_ok => return Ok(()),
+        Err(e) => return Err(e),
     };
 
     let old_name = rv.relname.clone();
     let new_name = stmt.newname.clone();
+    // RenameRelationInternal: the new name must be free for the relation
+    // and for its row type.
+    crate::ddl::util::check_relation_name_free(interp, nsoid, &new_name)?;
 
+    let class = interp.pg_class.get(&class_oid).cloned();
     interp.rename_pg_class(class_oid, new_name.clone(), nsoid);
 
-    // Composite type mirroring the relation: rename it and the array.
-    if let Some(&type_oid) = interp.type_by_qname.get(&(nsoid, old_name.clone())) {
+    // The relation's row type (and its array) follow the rename.
+    if let Some(type_oid) = class.as_ref().and_then(|c| c.reltype) {
         interp.rename_pg_type(type_oid, new_name.clone(), nsoid);
-        let arr_old = format!("_{old_name}");
-        if let Some(&arr_oid) = interp.type_by_qname.get(&(nsoid, arr_old)) {
+        if let Some(arr_oid) = interp.array_type_of(type_oid) {
             interp.rename_pg_type(arr_oid, format!("_{new_name}"), nsoid);
+        }
+    }
+    // Renaming a constraint's index renames the constraint too
+    // (RenameRelationInternal → RenameConstraintById).
+    if class.as_ref().map(|c| c.relkind) == Some(crate::pg_catalog::RelKind::Index)
+        && let Some(indrelid) = interp.pg_index.get(&class_oid).map(|i| i.indrelid)
+    {
+        for c in interp.pg_constraint.values_mut() {
+            if c.conrelid == indrelid && c.conname == old_name {
+                c.conname = new_name.clone();
+            }
         }
     }
 

@@ -52,6 +52,35 @@ pub fn type_lookup_schema(snapshot: &PgCatalog, name: &str) -> String {
         .unwrap_or_else(|| fallback_schema(snapshot))
 }
 
+/// Resolve an existing relation named by a `RangeVar` to `(namespace,
+/// relation)`, with PG's errors (`RangeVarGetRelidExtended`): `schema "s"
+/// does not exist` for a missing qualifier, `relation "x" does not exist`
+/// (qualified as written) otherwise.
+pub fn lookup_relation(
+    snapshot: &PgCatalog,
+    rv: &RangeVar,
+) -> Result<(PgNamespaceOid, crate::oid::PgClassOid), DdlError> {
+    let (schema, name) = range_var_names(rv, snapshot);
+    let Some(nsoid) = snapshot.namespace_oid(&schema) else {
+        return Err(if rv.schemaname.is_empty() {
+            DdlError::TableNotFound(format!("relation \"{name}\" does not exist"))
+        } else {
+            DdlError::TableNotFound(format!("schema \"{schema}\" does not exist"))
+        });
+    };
+    match snapshot.class_by_qname.get(&(nsoid, name.clone())) {
+        Some(&oid) => Ok((nsoid, oid)),
+        None => Err(DdlError::TableNotFound(format!(
+            "relation \"{}\" does not exist",
+            if rv.schemaname.is_empty() {
+                name
+            } else {
+                format!("{schema}.{name}")
+            }
+        ))),
+    }
+}
+
 /// Extract (schema, name) of an *existing* relation or type from a list of
 /// name nodes (e.g. `DROP TABLE` / `DROP TYPE` objects). Handles both
 /// `["name"]` and `["schema", "name"]`; an unqualified name is looked up

@@ -318,25 +318,10 @@ pub fn alter_table(interp: &mut PgCatalog, stmt: &AlterTableStmt) -> Result<(), 
         .as_ref()
         .ok_or_else(|| DdlError::Parse("ALTER TABLE without relation".into()))?;
 
-    let (schema, name) = range_var_names(rv, interp);
-    let Some(nsoid) = interp.namespace_oid(&schema) else {
-        if stmt.missing_ok {
-            return Ok(());
-        }
-        return Err(DdlError::TableNotFound(
-            QualifiedName::new(schema, name).to_string(),
-        ));
-    };
-    let class_oid = match interp.class_by_qname.get(&(nsoid, name.clone())).copied() {
-        Some(oid) => oid,
-        None => {
-            if stmt.missing_ok {
-                return Ok(());
-            }
-            return Err(DdlError::TableNotFound(
-                QualifiedName::new(schema, name).to_string(),
-            ));
-        }
+    let class_oid = match super::util::lookup_relation(interp, rv) {
+        Ok((_, oid)) => oid,
+        Err(_) if stmt.missing_ok => return Ok(()),
+        Err(e) => return Err(e),
     };
 
     for cmd_node in &stmt.cmds {
