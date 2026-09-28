@@ -147,6 +147,10 @@ pub(crate) const NULLABLE_STRICT: &[&str] = &[
     "jsonb_extract_path_text(jsonb,_text)",
     "jsonb_object_field(jsonb,text)",
     "jsonb_object_field_text(jsonb,text)",
+    // jsonb_path_exists_internal: PG_RETURN_NULL() on a suppressed error.
+    "jsonb_path_exists(jsonb,jsonpath,jsonb,bool)",
+    "jsonb_path_exists_opr(jsonb,jsonpath)",
+    "jsonb_path_exists_tz(jsonb,jsonpath,jsonb,bool)",
     "jsonb_path_match(jsonb,jsonpath,jsonb,bool)",
     "jsonb_path_match_opr(jsonb,jsonpath)",
     "jsonb_path_match_tz(jsonb,jsonpath,jsonb,bool)",

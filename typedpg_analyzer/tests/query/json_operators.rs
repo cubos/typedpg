@@ -429,3 +429,18 @@ fn valid_jsonpath_literals_accepted() {
         .unwrap();
     assert_col!(&s, "c", basic("pg_catalog", "jsonpath"), nullable = false);
 }
+
+#[test]
+fn jsonb_path_exists_can_return_null() {
+    // With silent => true a failing strict path is NULL on PG 18
+    // (jsonb_path_exists('{}', 'strict $.a', '{}', true) IS NULL).
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE tj (j jsonb NOT NULL);").unwrap();
+    let s = db
+        .analyze(
+            "SELECT jsonb_path_exists(j, 'strict $.a', '{}', true) AS a, \
+             jsonb_path_exists_tz(j, 'strict $.a', '{}', true) AS b FROM tj",
+        )
+        .unwrap();
+    assert_cols(&s, vec![cn("a", bool_ty()), cn("b", bool_ty())]);
+}
