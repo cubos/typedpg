@@ -627,47 +627,77 @@ fn drop_function(
         _ => return Ok(()),
     };
 
-    let arg_oids: Vec<PgTypeOid> = owa
-        .objargs
-        .iter()
-        .filter_map(|n| {
-            if let Some(node::Node::TypeName(tn)) = n.node.as_ref() {
-                resolve_type_name(tn, interp)
-            } else {
-                None
+    // LookupFuncWithArgs (parse_func.c): the argument types must resolve,
+    // then the name + types pick exactly one routine of any kind, whose
+    // kind must match the command.
+    let mut arg_oids: Vec<PgTypeOid> = Vec::new();
+    for n in &owa.objargs {
+        if let Some(node::Node::TypeName(tn)) = n.node.as_ref() {
+            match super::util::lookup_type_name(tn, interp) {
+                Ok(oid) => arg_oids.push(oid),
+                Err(_) if missing_ok => return Ok(()),
+                Err(e) => return Err(e),
             }
-        })
-        .collect();
-
+        }
+    }
     let want_procedure = expected_kind == ObjectType::ObjectProcedure;
-    let arg_oids_for_match = arg_oids.clone();
-    let matches_overload = move |p: &PgProc| -> bool {
-        let kind_ok = matches!(
-            (p.prokind, want_procedure),
-            (ProKind::Function, false) | (ProKind::Window, false) | (ProKind::Procedure, true)
-        );
-        if !kind_ok {
-            return false;
+    let kind_word = if want_procedure {
+        "procedure"
+    } else {
+        "function"
+    };
+    let signature = format!("{name}({})", format_arg_oids(&arg_oids, interp));
+
+    let target = if owa.args_unspecified {
+        let all: Vec<PgProcOid> = interp
+            .find_functions(schema_opt.as_deref(), &name)
+            .iter()
+            .map(|p| p.oid)
+            .collect();
+        match all.as_slice() {
+            [] => None,
+            [one] => Some(*one),
+            _ => {
+                return Err(DdlError::DependencyError(format!(
+                    "{kind_word} name \"{name}\" is not unique"
+                )));
+            }
         }
-        if owa.objargs.is_empty() && owa.args_unspecified {
-            true
-        } else {
-            p.proargtypes == arg_oids_for_match
-        }
+    } else {
+        let wanted = arg_oids.clone();
+        find_proc(interp, schema_opt.as_deref(), &name, &move |p: &PgProc| {
+            p.proargtypes == wanted
+        })
     };
 
-    let target = find_proc(interp, schema_opt.as_deref(), &name, &matches_overload);
-
-    if target.is_none() && !missing_ok {
-        let kind = if want_procedure {
-            "procedure"
+    let Some(target) = target else {
+        if missing_ok {
+            return Ok(());
+        }
+        return Err(DdlError::DependencyError(if owa.args_unspecified {
+            format!("could not find a {kind_word} named \"{name}\"")
         } else {
-            "function"
-        };
-        return Err(DdlError::DependencyError(format!(
-            "{kind} {name} does not exist"
-        )));
+            format!("{kind_word} {signature} does not exist")
+        }));
+    };
+    let found_kind = interp.pg_proc.get(&target).map(|p| p.prokind);
+    match (found_kind, expected_kind) {
+        (Some(ProKind::Procedure), ObjectType::ObjectFunction) => {
+            return Err(DdlError::DependencyError(format!(
+                "{signature} is not a function"
+            )));
+        }
+        (
+            Some(ProKind::Function | ProKind::Window | ProKind::Aggregate),
+            ObjectType::ObjectProcedure,
+        ) => {
+            return Err(DdlError::DependencyError(format!(
+                "{signature} is not a procedure"
+            )));
+        }
+        _ => {}
     }
+    let target = Some(target);
 
     if let Some(oid) = target {
         let dependent_views = views::find_views_depending_on_function(interp, oid);

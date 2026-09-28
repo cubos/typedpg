@@ -743,3 +743,40 @@ fn create_function_signature_rules() {
     )]);
 }
 
+#[test]
+fn drop_function_lookup_follows_lookup_func_with_args() {
+    for (sql, msg) in [
+        (
+            "CREATE FUNCTION f3(int) RETURNS int LANGUAGE sql AS 'select 1';
+             CREATE FUNCTION f3(text) RETURNS int LANGUAGE sql AS 'select 1';
+             DROP FUNCTION f3;",
+            "function name \"f3\" is not unique",
+        ),
+        (
+            "DROP FUNCTION nosuch(int);",
+            "function nosuch(integer) does not exist",
+        ),
+        (
+            "CREATE PROCEDURE p(int) LANGUAGE sql AS 'select 1'; DROP FUNCTION p(int);",
+            "p(integer) is not a function",
+        ),
+        (
+            "CREATE FUNCTION q(int) RETURNS int LANGUAGE sql AS 'select 1'; DROP PROCEDURE q(int);",
+            "q(integer) is not a procedure",
+        ),
+        (
+            "DROP FUNCTION f(nosuchtype);",
+            "type \"nosuchtype\" does not exist",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", sql)]).expect_err(sql);
+        assert!(err.to_string().starts_with(msg), "{sql}\n  got: {err}");
+    }
+    build_db(&[(
+        "0001.sql",
+        "CREATE FUNCTION f(int) RETURNS int LANGUAGE sql AS 'select 1';
+         DROP FUNCTION f;
+         DROP FUNCTION IF EXISTS f(nosuchtype);
+         DROP FUNCTION IF EXISTS nosuch(int);",
+    )]);
+}
