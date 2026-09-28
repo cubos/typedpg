@@ -83,7 +83,8 @@ impl ClauseKind {
     fn aggregate_context(self) -> Option<&'static str> {
         match self {
             ClauseKind::Where => Some("WHERE"),
-            ClauseKind::JoinOn => Some("JOIN/ON"),
+            // PG's ParseExprKindName for EXPR_KIND_JOIN_ON.
+            ClauseKind::JoinOn => Some("JOIN conditions"),
             ClauseKind::Limit => Some("LIMIT"),
             ClauseKind::Offset => Some("OFFSET"),
             _ => None,

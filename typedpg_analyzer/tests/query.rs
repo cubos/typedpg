@@ -22,6 +22,8 @@ mod ctes;
 mod dml;
 #[path = "query/expressions.rs"]
 mod expressions;
+#[path = "query/join_rules.rs"]
+mod join_rules;
 #[path = "query/joins.rs"]
 mod joins;
 #[path = "query/literal_input.rs"]

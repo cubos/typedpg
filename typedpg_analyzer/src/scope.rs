@@ -57,6 +57,69 @@ pub(crate) struct TableSource {
     /// (CTE, subquery). Set for real tables/views so that `alias.*` in an
     /// expression context can look up the composite type of the relation.
     pub source_qn: Option<QualifiedName>,
+    /// Column names merged away by `JOIN USING` / `NATURAL JOIN`: hidden
+    /// from *unqualified* name resolution and from the bare `*` (the merged
+    /// column — a synthetic source — takes their place), but still reachable
+    /// qualified (`a.id`) and via `a.*`, exactly like PG. Kept on the source
+    /// so the rule travels with it into sublinks and LATERAL subqueries.
+    pub join_hidden: std::collections::HashSet<String>,
+    /// A left-side entry of a RIGHT / FULL join seen from its LATERAL right
+    /// side: PG keeps it in the namespace but rejects any reference to it
+    /// (`check_lateral_ref_ok`, 42P10).
+    pub lateral_blocked: bool,
+}
+
+/// First character of the synthetic aliases given to FROM items PG exposes
+/// without a referencable name (an unaliased subquery, the merged columns of
+/// an unaliased `JOIN USING`). No SQL identifier can spell it.
+const HIDDEN_ALIAS_MARK: char = '\u{1}';
+
+/// A fresh alias that no reference can name. Unique process-wide, so hidden
+/// sources never collide across scope tiers.
+pub(crate) fn hidden_alias(kind: &str) -> String {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{HIDDEN_ALIAS_MARK}{kind}{n}")
+}
+
+/// True for an alias produced by [`hidden_alias`].
+pub(crate) fn is_hidden_alias(alias: &str) -> bool {
+    alias.starts_with(HIDDEN_ALIAS_MARK)
+}
+
+impl TableSource {
+    /// A source that holds only `columns` (a CTE, subquery, function, or
+    /// merged USING columns).
+    pub(crate) fn derived(alias: &str, columns: Vec<ScopeColumn>) -> Self {
+        TableSource {
+            alias: alias.to_owned(),
+            columns,
+            system_columns: Vec::new(),
+            source_qn: None,
+            join_hidden: Default::default(),
+            lateral_blocked: false,
+        }
+    }
+
+    /// The columns an unqualified reference or the bare `*` can see.
+    pub(crate) fn visible_columns(&self) -> impl Iterator<Item = &ScopeColumn> {
+        self.columns
+            .iter()
+            .filter(|c| !self.join_hidden.contains(&c.name))
+    }
+}
+
+/// PG (42P10): a reference to a RIGHT / FULL join's left side from its
+/// LATERAL right side.
+fn lateral_blocked_error(alias: &str, span: Option<SourceSpan>) -> AnalyzeError {
+    RawError::new(
+        AnalyzeError::InvalidColumnReference(format!(
+            "invalid reference to FROM-clause entry for table \"{alias}\""
+        )),
+        span,
+        Some("The combining JOIN type must be INNER or LEFT for a LATERAL reference.".into()),
+    )
+    .finalize_implicit()
 }
 
 #[derive(Debug, Clone, Default)]
@@ -76,12 +139,10 @@ pub(crate) struct Scope {
     /// reference to FROM-clause entry for table "t"` instead of the generic
     /// `column "t.col" does not exist`. Never consulted for resolution.
     pub shadowed_sources: Vec<TableSource>,
-    /// `(alias, column)` pairs merged away by `JOIN USING` / `NATURAL JOIN`:
-    /// hidden from the *unqualified* `*` expansion and from unqualified
-    /// name resolution (the merged column — a synthetic empty-alias source —
-    /// takes their place), but still reachable qualified (`a.id`) and via
-    /// `a.*`, exactly like PG.
-    pub join_hidden: std::collections::HashSet<(String, String)>,
+    /// Aliases of the left side of the RIGHT / FULL join whose right side is
+    /// being processed: a LATERAL item there sees them only as
+    /// [`TableSource::lateral_blocked`] entries.
+    pub lateral_blocked_aliases: std::collections::HashSet<String>,
 }
 
 /// Build the public-facing `UndefinedTable` error for a missing relation,
@@ -156,7 +217,7 @@ impl Scope {
     /// distinct alias — `FROM users u, posts u` is rejected. The synthetic
     /// empty-alias sources produced by JOIN USING merging are exempt.
     fn check_duplicate_alias(&self, alias: &str) -> Result<(), AnalyzeError> {
-        if !alias.is_empty() && self.sources.iter().any(|s| s.alias == alias) {
+        if self.sources.iter().any(|s| s.alias == alias) {
             return Err(crate::pgmsg::duplicate_table_alias(alias).finalize_implicit());
         }
         Ok(())
@@ -203,10 +264,9 @@ impl Scope {
             .collect();
 
         self.sources.push(TableSource {
-            alias: alias.to_owned(),
-            columns,
             system_columns: system_columns_for(alias),
             source_qn: Some(QualifiedName::new(nspname, relname)),
+            ..TableSource::derived(alias, columns)
         });
         Ok(())
     }
@@ -218,12 +278,7 @@ impl Scope {
         columns: Vec<ScopeColumn>,
     ) -> Result<(), AnalyzeError> {
         self.check_duplicate_alias(alias)?;
-        self.sources.push(TableSource {
-            alias: alias.to_owned(),
-            columns,
-            system_columns: Vec::new(),
-            source_qn: None,
-        });
+        self.sources.push(TableSource::derived(alias, columns));
         Ok(())
     }
 
@@ -248,11 +303,37 @@ impl Scope {
             })
             .collect();
         self.sources.push(TableSource {
-            alias: alias.to_owned(),
-            columns: cols,
             system_columns: system_columns_for(alias),
             source_qn: Some(qn),
+            ..TableSource::derived(alias, cols)
         });
+    }
+
+    /// Every source this level can resolve against: its own FROM items, the
+    /// LATERAL tier, then the correlated outer tier.
+    fn all_tiers(&self) -> impl Iterator<Item = &TableSource> {
+        self.sources
+            .iter()
+            .chain(self.lateral_sources.iter())
+            .chain(self.outer_sources.iter())
+    }
+
+    /// The sources a LATERAL item (or a FROM function's arguments) at this
+    /// point may reference: this level's FROM items so far plus the lateral
+    /// tier it received, with a RIGHT / FULL join's left side marked
+    /// [`TableSource::lateral_blocked`].
+    pub fn lateral_visible(&self) -> Vec<TableSource> {
+        self.sources
+            .iter()
+            .chain(self.lateral_sources.iter())
+            .cloned()
+            .map(|mut s| {
+                if self.lateral_blocked_aliases.contains(&s.alias) {
+                    s.lateral_blocked = true;
+                }
+                s
+            })
+            .collect()
     }
 
     pub fn find_source(&self, alias: &str) -> Option<&TableSource> {
@@ -270,18 +351,20 @@ impl Scope {
         span: Option<SourceSpan>,
     ) -> Result<&ScopeColumn, AnalyzeError> {
         if let Some(t) = table {
-            for source in self
-                .sources
-                .iter()
-                .chain(self.lateral_sources.iter())
-                .chain(self.outer_sources.iter())
-            {
-                if source.alias == t
-                    && let Some(col) = source
-                        .columns
-                        .iter()
-                        .chain(source.system_columns.iter())
-                        .find(|c| c.name == column)
+            for source in self.all_tiers() {
+                if source.alias != t {
+                    continue;
+                }
+                // PG checks the entry's LATERAL visibility before looking
+                // the column up (`check_lateral_ref_ok`).
+                if source.lateral_blocked {
+                    return Err(lateral_blocked_error(t, span));
+                }
+                if let Some(col) = source
+                    .columns
+                    .iter()
+                    .chain(source.system_columns.iter())
+                    .find(|c| c.name == column)
                 {
                     return Ok(col);
                 }
@@ -290,12 +373,7 @@ impl Scope {
             // missing-column wording, formatted through identifier quoting
             // rules (`column t.col does not exist`, `column "T".col does
             // not exist` when `T` needs quoting).
-            let alias_exists = self
-                .sources
-                .iter()
-                .chain(self.lateral_sources.iter())
-                .chain(self.outer_sources.iter())
-                .any(|s| s.alias == t);
+            let alias_exists = self.all_tiers().any(|s| s.alias == t);
             if alias_exists {
                 return Err(undefined_column_error(
                     self,
@@ -312,10 +390,7 @@ impl Scope {
             // when the FROM entry gave it an alias (`SELECT users.id FROM
             // users u` — PG hints at the alias).
             let aliased_away = self
-                .sources
-                .iter()
-                .chain(self.lateral_sources.iter())
-                .chain(self.outer_sources.iter())
+                .all_tiers()
                 .any(|s| s.alias != t && s.source_qn.as_ref().is_some_and(|qn| qn.name == t));
             if aliased_away || self.shadowed_sources.iter().any(|s| s.alias == t) {
                 // PG classifies this as undefined_table (42P01): the entry
@@ -342,24 +417,25 @@ impl Scope {
         }
 
         for tier in [&self.sources, &self.lateral_sources, &self.outer_sources] {
-            let mut matches: Vec<&ScopeColumn> = Vec::new();
+            let mut matches: Vec<(&TableSource, &ScopeColumn)> = Vec::new();
             for source in tier {
-                if let Some(col) = source.columns.iter().find(|c| {
-                    c.name == column
-                        // Columns merged away by JOIN USING / NATURAL are
-                        // only reachable qualified; the synthetic merged
-                        // column stands in for unqualified references.
-                        && !self
-                            .join_hidden
-                            .contains(&(source.alias.clone(), c.name.clone()))
-                }) {
-                    matches.push(col);
+                // Columns merged away by JOIN USING / NATURAL are only
+                // reachable qualified; the synthetic merged column stands in
+                // for unqualified references.
+                if let Some(col) = source.visible_columns().find(|c| c.name == column) {
+                    matches.push((source, col));
                 }
             }
             if matches.len() > 1 {
                 let candidates = matches
                     .iter()
-                    .map(|c| QualifiedName::new(&c.table_alias, column).to_string())
+                    .map(|(s, _)| {
+                        if is_hidden_alias(&s.alias) {
+                            column.to_owned()
+                        } else {
+                            QualifiedName::new(&s.alias, column).to_string()
+                        }
+                    })
                     .collect::<Vec<_>>()
                     .join(", ");
                 // PG classifies this as ambiguous_column (42702).
@@ -373,7 +449,10 @@ impl Scope {
                 .with_primary_label("ambiguous reference")
                 .finalize_implicit());
             }
-            if let Some(col) = matches.first() {
+            if let Some((source, col)) = matches.first() {
+                if source.lateral_blocked {
+                    return Err(lateral_blocked_error(&source.alias, span));
+                }
                 return Ok(col);
             }
         }
@@ -397,13 +476,7 @@ impl Scope {
     pub fn star_columns(&self) -> Vec<&ScopeColumn> {
         self.sources
             .iter()
-            .flat_map(|s| {
-                s.columns.iter().filter(|c| {
-                    !self
-                        .join_hidden
-                        .contains(&(s.alias.clone(), c.name.clone()))
-                })
-            })
+            .flat_map(|s| s.visible_columns())
             .collect()
     }
 }

@@ -203,6 +203,30 @@ pub(crate) fn using_column_missing(column: &str, side: &str) -> RawError {
     )
 }
 
+/// `common column name "x" appears more than once in left table` (or
+/// `right table`) — SQLSTATE 42702 (`ambiguous_column`).
+pub(crate) fn using_column_ambiguous(column: &str, side: &str) -> RawError {
+    RawError::new(
+        AnalyzeError::AmbiguousColumn(format!(
+            "common column name \"{column}\" appears more than once in {side} table"
+        )),
+        None,
+        None,
+    )
+}
+
+/// `column name "x" appears more than once in USING clause` — SQLSTATE
+/// 42701 (`duplicate_column`).
+pub(crate) fn using_column_listed_twice(column: &str) -> RawError {
+    RawError::new(
+        AnalyzeError::DuplicateColumn(format!(
+            "column name \"{column}\" appears more than once in USING clause"
+        )),
+        None,
+        None,
+    )
+}
+
 /// `JOIN/USING types X and Y cannot be matched` — SQLSTATE 42804
 /// (`datatype_mismatch`).
 pub(crate) fn join_using_types_mismatch(left: &str, right: &str) -> RawError {
@@ -862,6 +886,8 @@ mod tests {
             (ordinality_with_coldeflist().kind, "42601"),
             (multiple_coldeflists().kind, "42601"),
             (duplicate_column_name("a").kind, "42701"),
+            (using_column_ambiguous("id", "left").kind, "42702"),
+            (using_column_listed_twice("id").kind, "42701"),
         ];
         for (err, want) in cases {
             assert_eq!(

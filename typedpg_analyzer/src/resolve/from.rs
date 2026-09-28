@@ -74,11 +74,13 @@ pub(crate) fn process_from_item(
             process_join_expr(join, scope, null_ctx, snapshot, cte_scopes, params)?;
         }
         node::Node::RangeSubselect(sub) => {
-            let alias = sub
-                .alias
-                .as_ref()
-                .map(|a| a.aliasname.as_str())
-                .unwrap_or("_subquery");
+            // PG 16+ accepts an unaliased subquery and gives it no
+            // referencable name.
+            let alias_owned = match sub.alias.as_ref() {
+                Some(a) => a.aliasname.clone(),
+                None => crate::scope::hidden_alias("subquery"),
+            };
+            let alias = alias_owned.as_str();
 
             // `AS foo(a, b, c)` overrides the subquery's own output names.
             // Common in information_schema views that rename columns at the
@@ -111,12 +113,7 @@ pub(crate) fn process_from_item(
                 // Lateral visibility is transitive: a LATERAL subquery nested
                 // inside another one still sees the outermost lateral refs,
                 // so pass the enclosing scope's own lateral tier along too.
-                let visible: Vec<_> = scope
-                    .sources
-                    .iter()
-                    .chain(scope.lateral_sources.iter())
-                    .cloned()
-                    .collect();
+                let visible = scope.lateral_visible();
                 let (lateral_sources, shadowed_sources): (Vec<_>, Vec<_>) = if sub.lateral {
                     (visible, Vec::new())
                 } else {
@@ -388,9 +385,11 @@ impl SourceSpan {
     }
 }
 
-/// `a JOIN b ON …` / `USING (…)` / `NATURAL …`: process both sides, walk the
-/// ON clause, apply outer-join nullability to the null-padded side(s), and
-/// merge USING/NATURAL columns.
+/// `a JOIN b ON …` / `USING (…)` / `NATURAL …`, following PG's
+/// `transformFromClauseItem` (parse_clause.c): process both sides (the right
+/// side's LATERAL items may reference the left side only for INNER / LEFT
+/// joins), walk the ON clause, build the USING / NATURAL merged columns, and
+/// apply outer-join nullability to the null-padded side(s).
 fn process_join_expr(
     join: &protobuf::JoinExpr,
     scope: &mut Scope,
@@ -399,14 +398,34 @@ fn process_join_expr(
     cte_scopes: &HashMap<String, Vec<ScopeColumn>>,
     params: &mut ParamCollector,
 ) -> Result<(), AnalyzeError> {
+    // Fail loudly on unknown join kinds rather than defaulting to INNER,
+    // which would silently produce wrong nullability for outer joins the
+    // parser couldn't classify.
+    let join_type = JoinType::try_from(join.jointype)
+        .map_err(|_| AnalyzeError::UnsupportedJoinType(join.jointype))?;
+
     let left = SourceSpan::capture(scope, |scope| match &join.larg {
         Some(larg) => process_from_item(larg, scope, null_ctx, snapshot, cte_scopes, params),
         None => Ok(()),
     })?;
+    // PG exposes the left side to a LATERAL right side, but a reference to
+    // it is an error unless the join is INNER or LEFT.
+    let lateral_ok = matches!(join_type, JoinType::JoinInner | JoinType::JoinLeft);
+    let blocked_before = scope.lateral_blocked_aliases.clone();
+    if !lateral_ok {
+        let left_aliases: Vec<String> = left
+            .sources(scope)
+            .iter()
+            .map(|s| s.alias.clone())
+            .collect();
+        scope.lateral_blocked_aliases.extend(left_aliases);
+    }
     let right = SourceSpan::capture(scope, |scope| match &join.rarg {
         Some(rarg) => process_from_item(rarg, scope, null_ctx, snapshot, cte_scopes, params),
         None => Ok(()),
-    })?;
+    });
+    scope.lateral_blocked_aliases = blocked_before;
+    let right = right?;
 
     // Walk the ON clause *before* applying outer-join nullability:
     // PG evaluates `ON` on paired rows where right-side columns are
@@ -426,12 +445,43 @@ fn process_join_expr(
         )?;
     }
 
-    // Apply JOIN nullability. Fail loudly on unknown join kinds rather
-    // than defaulting to INNER, which would silently produce wrong
-    // nullability for outer joins the parser couldn't classify.
-    let join_type = JoinType::try_from(join.jointype)
-        .map_err(|_| AnalyzeError::UnsupportedJoinType(join.jointype))?;
+    // `JOIN … USING (cols)` / `NATURAL JOIN` merge the join columns: the
+    // output has ONE column per name (placed before both sides' remaining
+    // columns in `*`), an unqualified reference resolves to it without
+    // ambiguity, and the constituents stay reachable qualified (`a.id`)
+    // and via `a.*`. Built before this join's own null-padding is applied:
+    // the merged value's nullability comes from the constituents as they
+    // are *inside* the join.
+    let using_names: Vec<String> = if join.is_natural {
+        // PG: every left-side output column name that also names a
+        // right-side output column, in left-side order.
+        let right_names: std::collections::HashSet<String> =
+            output_column_names(scope, right).into_iter().collect();
+        let mut names: Vec<String> = Vec::new();
+        for n in output_column_names(scope, left) {
+            if right_names.contains(&n) && !names.contains(&n) {
+                names.push(n);
+            }
+        }
+        names
+    } else {
+        expr::extract_string_fields(&join.using_clause)
+    };
+    let merged = if using_names.is_empty() {
+        None
+    } else {
+        Some(merge_using_columns(
+            scope,
+            null_ctx,
+            snapshot,
+            &using_names,
+            left,
+            right,
+            join_type,
+        )?)
+    };
 
+    // Apply JOIN nullability.
     match join_type {
         JoinType::JoinLeft => {
             let right_aliases = nullability::collect_aliases(right.sources(scope));
@@ -449,89 +499,126 @@ fn process_join_expr(
         other => return Err(AnalyzeError::UnsupportedJoinType(other as i32)),
     }
 
-    // `JOIN … USING (cols)` / `NATURAL JOIN` merge the join columns:
-    // the output has ONE column per name (placed before both sides'
-    // remaining columns in `*`), an unqualified reference resolves
-    // to it without ambiguity, and the constituents stay reachable
-    // qualified (`a.id`) and via `a.*`.
-    let using_names: Vec<String> = if join.is_natural {
-        // Common column names, in left-side column order.
-        let right_names: std::collections::HashSet<&str> = right
-            .sources(scope)
-            .iter()
-            .flat_map(|s| s.columns.iter().map(|c| c.name.as_str()))
+    if let Some(merged) = merged {
+        // `USING (…) AS j` (PG 14) names the merged columns; otherwise they
+        // live in an unreferencable synthetic source.
+        let alias = match join.join_using_alias.as_ref() {
+            Some(a) => a.aliasname.clone(),
+            None => crate::scope::hidden_alias("join"),
+        };
+        let columns: Vec<ScopeColumn> = merged
+            .into_iter()
+            .map(|mut c| {
+                c.table_alias = alias.clone();
+                c
+            })
             .collect();
-        left.sources(scope)
-            .iter()
-            .flat_map(|s| s.columns.iter().map(|c| c.name.clone()))
-            .filter(|n| right_names.contains(n.as_str()))
-            .collect()
-    } else {
-        expr::extract_string_fields(&join.using_clause)
-    };
-    if !using_names.is_empty() {
-        merge_using_columns(scope, snapshot, &using_names, left, right, join_type)?;
+        if scope.sources.iter().any(|s| s.alias == alias) {
+            return Err(crate::pgmsg::duplicate_table_alias(&alias).finalize_implicit());
+        }
+        scope.sources.insert(
+            left.start,
+            crate::scope::TableSource::derived(&alias, columns),
+        );
     }
     Ok(())
 }
 
-/// Build the merged columns for `JOIN USING` / `NATURAL JOIN` and splice
-/// them into the scope as a synthetic empty-alias source placed *before*
-/// both join sides — which is exactly where PG puts them in `*` expansion
-/// (`SELECT * FROM a JOIN b USING (id)` is `id, <a-rest>, <b-rest>`). The
-/// constituent columns are recorded in `scope.join_hidden` so unqualified
-/// resolution and the bare `*` skip them.
+/// The output column names of one join side, as PG's `l_colnames` /
+/// `r_colnames`: every source's columns minus those an inner USING join
+/// merged away.
+fn output_column_names(scope: &Scope, span: SourceSpan) -> Vec<String> {
+    span.sources(scope)
+        .iter()
+        .flat_map(|s| s.visible_columns().map(|c| c.name.clone()))
+        .collect()
+}
+
+/// Build the merged columns for `JOIN USING` / `NATURAL JOIN` and record
+/// the constituents in their sources' `join_hidden` so unqualified
+/// resolution and the bare `*` skip them. The caller splices the merged
+/// columns in *before* both join sides — exactly where PG puts them in `*`
+/// expansion (`SELECT * FROM a JOIN b USING (id)` is `id, <a-rest>,
+/// <b-rest>`).
 ///
-/// Merged-column semantics mirrored from PG:
-/// - missing name → `column "x" specified in USING clause does not exist
-///   in left/right table` (42703);
-/// - type: the sides' common type, else `JOIN/USING types X and Y cannot
-///   be matched` (42804);
-/// - nullability: the merged value is the left side's for INNER/LEFT (the
-///   preserved side), the right's for RIGHT, and `COALESCE(l, r)` for FULL
-///   — all computed from the columns' *base* nullability (the outer-join
-///   promotion applies to the constituent aliases, not the merged copy).
+/// Merged-column semantics mirrored from PG's `transformFromClauseItem`:
+/// - a name listed twice → `column name "x" appears more than once in USING
+///   clause` (42701);
+/// - a name missing on a side → `column "x" specified in USING clause does
+///   not exist in left/right table` (42703), present twice → `common column
+///   name "x" appears more than once in left/right table` (42702);
+/// - the join qual `l = r` must resolve (`transformJoinUsingClause`), else
+///   `operator does not exist: X = Y` (42883);
+/// - type: the sides' common type (`buildMergedJoinVar`), else `JOIN/USING
+///   types X and Y cannot be matched` (42804);
+/// - nullability: the left value for LEFT, the right one for RIGHT,
+///   `COALESCE(l, r)` for FULL (NOT NULL only when both sides are), and for
+///   INNER either NOT NULL side suffices (the strict `=` discards NULLs).
+///   Each side is taken with the nullability it has inside this join.
 fn merge_using_columns(
     scope: &mut Scope,
+    null_ctx: &NullabilityContext,
     snapshot: &PgCatalog,
     using_names: &[String],
     left: SourceSpan,
     right: SourceSpan,
     join_type: JoinType,
-) -> Result<(), AnalyzeError> {
-    let find_col = |span: SourceSpan, name: &str| -> Option<(String, ScopeColumn)> {
-        scope.sources[span.start..span.end].iter().find_map(|s| {
-            s.columns
-                .iter()
-                .find(|c| c.name == name)
-                .map(|c| (s.alias.clone(), c.clone()))
-        })
+) -> Result<Vec<ScopeColumn>, AnalyzeError> {
+    // `(source index, column)` of the unique visible column named `name`.
+    let find_col = |scope: &Scope,
+                    span: SourceSpan,
+                    name: &str,
+                    side: &str|
+     -> Result<(usize, ScopeColumn), AnalyzeError> {
+        let mut found: Option<(usize, ScopeColumn)> = None;
+        for (i, s) in scope.sources[span.start..span.end].iter().enumerate() {
+            for c in s.visible_columns().filter(|c| c.name == name) {
+                if found.is_some() {
+                    return Err(
+                        crate::pgmsg::using_column_ambiguous(name, side).finalize_implicit()
+                    );
+                }
+                found = Some((span.start + i, c.clone()));
+            }
+        }
+        found.ok_or_else(|| crate::pgmsg::using_column_missing(name, side).finalize_implicit())
     };
 
     let mut merged: Vec<ScopeColumn> = Vec::with_capacity(using_names.len());
-    for name in using_names {
-        let Some((l_alias, l)) = find_col(left, name) else {
-            return Err(crate::pgmsg::using_column_missing(name, "left").finalize_implicit());
-        };
-        let Some((r_alias, r)) = find_col(right, name) else {
-            return Err(crate::pgmsg::using_column_missing(name, "right").finalize_implicit());
-        };
+    let mut hide: Vec<(usize, String)> = Vec::new();
+    for (i, name) in using_names.iter().enumerate() {
+        if using_names[..i].contains(name) {
+            return Err(crate::pgmsg::using_column_listed_twice(name).finalize_implicit());
+        }
+        let (l_idx, l) = find_col(scope, left, name, "left")?;
+        let (r_idx, r) = find_col(scope, right, name, "right")?;
 
+        let lt = crate::ddl::util::format_type_for_message(snapshot, l.type_oid);
+        let rt = crate::ddl::util::format_type_for_message(snapshot, r.type_oid);
+        if l.type_oid != oid::UNKNOWN
+            && r.type_oid != oid::UNKNOWN
+            && snapshot
+                .find_operator("=", Some(l.type_oid), r.type_oid)
+                .is_none()
+        {
+            return Err(
+                crate::pgmsg::operator_does_not_exist(&lt, "=", &rt, None).finalize_implicit()
+            );
+        }
         let type_oid = if l.type_oid == r.type_oid {
             l.type_oid
         } else {
             crate::coerce::find_common_type(&[l.type_oid, r.type_oid], snapshot).ok_or_else(
-                || {
-                    let lt = crate::ddl::util::format_type_for_message(snapshot, l.type_oid);
-                    let rt = crate::ddl::util::format_type_for_message(snapshot, r.type_oid);
-                    crate::pgmsg::join_using_types_mismatch(&lt, &rt).finalize_implicit()
-                },
+                || crate::pgmsg::join_using_types_mismatch(&lt, &rt).finalize_implicit(),
             )?
         };
+        let l_not_null = !null_ctx.is_nullable(&l.table_alias, &l.name, l.base_not_null);
+        let r_not_null = !null_ctx.is_nullable(&r.table_alias, &r.name, r.base_not_null);
         let base_not_null = match join_type {
-            JoinType::JoinRight => r.base_not_null,
-            JoinType::JoinFull => l.base_not_null || r.base_not_null,
-            _ => l.base_not_null,
+            JoinType::JoinLeft => l_not_null,
+            JoinType::JoinRight => r_not_null,
+            JoinType::JoinFull => l_not_null && r_not_null,
+            _ => l_not_null || r_not_null,
         };
         merged.push(ScopeColumn {
             name: name.clone(),
@@ -543,25 +630,17 @@ fn merge_using_columns(
             } else {
                 None
             },
-            // The synthetic source's (empty) alias — never referenced
-            // qualified.
+            // Set by the caller once the source's alias is known.
             table_alias: String::new(),
             record_fields: None,
         });
-        scope.join_hidden.insert((l_alias, name.clone()));
-        scope.join_hidden.insert((r_alias, name.clone()));
+        hide.push((l_idx, name.clone()));
+        hide.push((r_idx, name.clone()));
     }
-
-    scope.sources.insert(
-        left.start,
-        crate::scope::TableSource {
-            alias: String::new(),
-            columns: merged,
-            system_columns: Vec::new(),
-            source_qn: None,
-        },
-    );
-    Ok(())
+    for (idx, name) in hide {
+        scope.sources[idx].join_hidden.insert(name);
+    }
+    Ok(merged)
 }
 
 /// Apply a FROM item's column-alias list (`users AS t(a, b, c)`) to the
@@ -603,12 +682,16 @@ fn apply_alias_column_names(
 /// refs this level received, and the correlated outer sources.
 fn srf_arg_scope(scope: &Scope) -> Scope {
     let mut arg_scope = Scope::default();
-    arg_scope.sources.extend(scope.sources.clone());
+    arg_scope
+        .sources
+        .extend(scope.sources.iter().cloned().map(|mut s| {
+            s.lateral_blocked |= scope.lateral_blocked_aliases.contains(&s.alias);
+            s
+        }));
     arg_scope
         .lateral_sources
         .extend(scope.lateral_sources.clone());
     arg_scope.outer_sources.extend(scope.outer_sources.clone());
-    arg_scope.join_hidden = scope.join_hidden.clone();
     arg_scope
 }
 
@@ -644,6 +727,8 @@ fn infer_srf_arg_types(
             {
                 return Err(e);
             }
+            // A RIGHT / FULL join's left side is never a legal reference.
+            Err(e @ AnalyzeError::InvalidColumnReference(_)) => return Err(e),
             Err(_) => (oid::UNKNOWN, true),
         };
         arg_types.push(t);
