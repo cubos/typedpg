@@ -291,7 +291,7 @@ fn process_range_function(
     let nfuncs = funcs.len();
     let mut cols: Vec<ScopeColumn> = Vec::new();
     for f in &funcs {
-        cols.extend(function_rte_columns(f, rf, alias, nfuncs, arg_ctx, params)?);
+        cols.extend(function_rte_columns(f, alias, nfuncs, arg_ctx, params)?);
     }
     if nfuncs > 1 {
         // nodeFunctionscan.c pads every function that runs out of rows
@@ -801,7 +801,6 @@ pub(crate) fn srf_elements_nullable(
 /// allowed).
 fn function_rte_columns(
     f: &RteFunction<'_>,
-    rf: &protobuf::RangeFunction,
     alias: &str,
     nfuncs: usize,
     arg_ctx: Ctx<'_>,
