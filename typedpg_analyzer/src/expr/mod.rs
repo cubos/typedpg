@@ -965,6 +965,7 @@ mod sublink;
 
 use column_refs::*;
 use conditional::*;
+pub(crate) use func_call::check_window_clause;
 use func_call::*;
 use indirection::*;
 use literals::*;

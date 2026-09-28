@@ -561,32 +561,17 @@ fn walk_func_modifiers(
             }
         }
     }
-    if let Some(over) = &func.over {
-        for item in &over.partition_clause {
-            infer_expr(item, ctx, params, TypeGoal::NONE)?;
-        }
-        for item in &over.order_clause {
-            // Window `ORDER BY` items are also `SortBy` nodes; unwrap.
-            if let Some(node::Node::SortBy(sb)) = item.node.as_ref()
-                && let Some(inner) = sb.node.as_deref()
-            {
-                infer_expr(inner, ctx, params, TypeGoal::NONE)?;
-            }
-        }
-        // Frame offsets: ROWS / GROUPS offsets are int8 in PG (so a bare
-        // `$N` there describes as bigint); RANGE offsets take the ORDER BY
-        // key's "distance" type (interval for timestamps, …) — left
-        // unconstrained. Bits from parsenodes.h: ROWS 0x4, GROUPS 0x8.
-        let offset_goal = if over.frame_options & 0x4 != 0 || over.frame_options & 0x8 != 0 {
-            TypeGoal::implicit(oid::INT8)
+    // An inline window (`OVER (…)`) is a window definition of its own; one
+    // inheriting from a named window (`OVER (w …)`) is checked against it
+    // with the SELECT's WINDOW clause ([`check_window_clause`]). `OVER w`
+    // defines nothing.
+    if let Some(over) = &func.over
+        && over.name.is_empty()
+    {
+        if over.refname.is_empty() {
+            transform_window_def(over, None, ctx, params)?;
         } else {
-            TypeGoal::NONE
-        };
-        if let Some(start) = &over.start_offset {
-            infer_expr(start, ctx, params, offset_goal.clone())?;
-        }
-        if let Some(end) = &over.end_offset {
-            infer_expr(end, ctx, params, offset_goal)?;
+            infer_window_exprs(over, ctx, params)?;
         }
     }
     Ok(())
@@ -671,6 +656,361 @@ fn frame_contains_current_row(options: i32) -> bool {
     let ends_after = options & BETWEEN == 0
         || options & (END_CURRENT_ROW | END_OFFSET_FOLLOWING | END_UNBOUNDED_FOLLOWING) != 0;
     starts_before && ends_after && options & (EXCLUDE_CURRENT_ROW | EXCLUDE_GROUP) == 0
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Window definitions (PG's transformWindowDefinitions / transformFrameOffset)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// `FRAMEOPTION_*` bits (parsenodes.h).
+const FRAME_RANGE: i32 = 0x2;
+const FRAME_ROWS: i32 = 0x4;
+const FRAME_GROUPS: i32 = 0x8;
+const FRAME_OFFSET: i32 = 0x800 | 0x1000 | 0x2000 | 0x4000;
+/// `FRAMEOPTION_DEFAULTS`: RANGE UNBOUNDED PRECEDING … CURRENT ROW, what
+/// the grammar stores when no frame clause is written.
+const FRAME_DEFAULTS: i32 = 0x2 | 0x20 | 0x400;
+
+/// The expressions of a window's `ORDER BY` items.
+fn window_order_exprs(wd: &protobuf::WindowDef) -> Vec<&protobuf::Node> {
+    wd.order_clause
+        .iter()
+        .filter_map(|o| match o.node.as_ref() {
+            Some(node::Node::SortBy(sb)) => sb.node.as_deref(),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Infer a window definition's PARTITION BY / ORDER BY expressions, so
+/// parameters are typed and column references validated.
+fn infer_window_exprs(
+    wd: &protobuf::WindowDef,
+    ctx: Ctx<'_>,
+    params: &mut ParamCollector,
+) -> Result<(), AnalyzeError> {
+    for e in wd.partition_clause.iter().chain(window_order_exprs(wd)) {
+        infer_expr(e, ctx, params, TypeGoal::NONE)?;
+    }
+    Ok(())
+}
+
+/// PG's per-window checks in `transformWindowDefinitions` plus
+/// `transformFrameOffset` (parse_clause.c), for a window definition `wd`
+/// — a WINDOW clause entry or an inline `OVER (…)` — optionally inheriting
+/// from the named window `base` (`OVER (w …)`, `WINDOW w2 AS (w …)`):
+///
+/// - no window functions inside it (42P20);
+/// - inheriting copies `base`'s PARTITION BY (it can't add one), may add
+///   an ORDER BY only if `base` has none, and `base` must have no frame
+///   clause (42P20);
+/// - a RANGE frame with an offset needs exactly one ORDER BY column (42P20)
+///   whose type has `in_range` support for the offset's type (0A000) — the
+///   offset is coerced to that support function's offset type, which is
+///   what types `$1` in `RANGE $1 PRECEDING` (integer for an integer key,
+///   interval for a timestamp);
+/// - GROUPS needs an ORDER BY (42P20); ROWS / GROUPS offsets are bigint;
+/// - no offset may reference a column (42P10).
+fn transform_window_def(
+    wd: &protobuf::WindowDef,
+    base: Option<&protobuf::WindowDef>,
+    ctx: Ctx<'_>,
+    params: &mut ParamCollector,
+) -> Result<(), AnalyzeError> {
+    use crate::pgmsg;
+    let span = crate::error::SourceSpan::from_node_qname(wd.location);
+    let fail = |e: crate::error::RawError| Err(e.finalize_implicit());
+    let offsets: Vec<&protobuf::Node> = wd
+        .start_offset
+        .as_deref()
+        .into_iter()
+        .chain(wd.end_offset.as_deref())
+        .collect();
+    let own_exprs = wd
+        .partition_clause
+        .iter()
+        .chain(window_order_exprs(wd))
+        .chain(offsets.iter().copied());
+    for e in own_exprs {
+        if detect_func_kinds(e, ctx.snapshot).has_window {
+            return fail(pgmsg::window_in_window_definition(span));
+        }
+    }
+    infer_window_exprs(wd, ctx, params)?;
+
+    let mut order = window_order_exprs(wd);
+    if let Some(base) = base {
+        if !wd.partition_clause.is_empty() {
+            return fail(pgmsg::cannot_override_window_clause(
+                "PARTITION BY",
+                &wd.refname,
+                span,
+            ));
+        }
+        if !order.is_empty() && !base.order_clause.is_empty() {
+            return fail(pgmsg::cannot_override_window_clause(
+                "ORDER BY",
+                &wd.refname,
+                span,
+            ));
+        }
+        if base.frame_options != FRAME_DEFAULTS {
+            // A bare `OVER (w)` gets a hint to drop the parentheses.
+            let bare_over =
+                wd.name.is_empty() && order.is_empty() && wd.frame_options == FRAME_DEFAULTS;
+            return fail(pgmsg::cannot_copy_window_with_frame(
+                &wd.refname,
+                bare_over,
+                span,
+            ));
+        }
+        if order.is_empty() {
+            order = window_order_exprs(base);
+        }
+    }
+
+    let options = wd.frame_options;
+    let mut range_key: Option<PgTypeOid> = None;
+    if options & FRAME_RANGE != 0 && options & FRAME_OFFSET != 0 {
+        let [key] = order.as_slice() else {
+            return fail(pgmsg::range_offset_needs_one_order_by(span));
+        };
+        range_key = Some(infer_expr(key, ctx, params, TypeGoal::NONE)?.type_oid);
+    }
+    if options & FRAME_GROUPS != 0 && order.is_empty() {
+        return fail(pgmsg::groups_needs_order_by(span));
+    }
+
+    for offset in offsets {
+        let construct = if options & FRAME_ROWS != 0 {
+            "ROWS"
+        } else if options & FRAME_GROUPS != 0 {
+            "GROUPS"
+        } else {
+            "RANGE"
+        };
+        match range_key {
+            Some(key) if construct == "RANGE" => {
+                let actual = infer_expr(offset, ctx, params, TypeGoal::NONE)?.type_oid;
+                let target = in_range_offset_type(key, actual, offset, ctx)?;
+                if actual == oid::UNKNOWN {
+                    coerce_unknown_to(offset, ctx, params, target)?;
+                }
+            }
+            _ => {
+                infer_expr(offset, ctx, params, TypeGoal::implicit(oid::INT8))?;
+            }
+        }
+        if contains_column_ref(offset) {
+            return fail(pgmsg::frame_offset_has_variables(
+                construct,
+                crate::error::node_location(offset)
+                    .and_then(crate::error::SourceSpan::from_node_qname),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `transformFrameOffset`'s RANGE branch: among the btree `in_range`
+/// support functions for the sort key's type (in `pg_catalog`, each
+/// `in_range(key, key, offset, bool, bool)` is one), keep those whose
+/// offset type the offset coerces to implicitly and pick one — preferring
+/// the offset's own type, or the key's type for an unknown offset.
+fn in_range_offset_type(
+    key: PgTypeOid,
+    offset_type: PgTypeOid,
+    offset: &protobuf::Node,
+    ctx: Ctx<'_>,
+) -> Result<PgTypeOid, AnalyzeError> {
+    let snapshot = ctx.snapshot;
+    let key = snapshot.unwrap_domain(key);
+    let span =
+        crate::error::node_location(offset).and_then(crate::error::SourceSpan::from_node_qname);
+    let fmt = |t| crate::ddl::util::format_type_for_message(snapshot, t);
+    let candidates: Vec<PgTypeOid> = snapshot
+        .find_functions(Some("pg_catalog"), "in_range")
+        .iter()
+        .filter(|f| f.proargtypes.len() == 5 && f.proargtypes[0] == key)
+        .map(|f| f.proargtypes[2])
+        .collect();
+    if candidates.is_empty() {
+        return Err(
+            crate::pgmsg::range_offset_unsupported(&fmt(key), None, span).finalize_implicit(),
+        );
+    }
+    let preferred = if offset_type == oid::UNKNOWN {
+        key
+    } else {
+        offset_type
+    };
+    let mut selected: Option<PgTypeOid> = None;
+    let mut matches = 0;
+    for t in candidates {
+        if !crate::coerce::can_coerce_types(&[offset_type], &[t], snapshot) {
+            continue;
+        }
+        matches += 1;
+        if selected != Some(preferred) {
+            selected = Some(t);
+        }
+    }
+    match selected {
+        None => {
+            Err(
+                crate::pgmsg::range_offset_unsupported(&fmt(key), Some(&fmt(offset_type)), span)
+                    .finalize_implicit(),
+            )
+        }
+        Some(t) if matches != 1 && t != preferred => {
+            Err(
+                crate::pgmsg::range_offset_ambiguous(&fmt(key), &fmt(offset_type), span)
+                    .finalize_implicit(),
+            )
+        }
+        Some(t) => Ok(t),
+    }
+}
+
+/// Whether an expression references a column of the current query (PG's
+/// `contain_vars_of_level(…, 0)` as used by `checkExprIsVarFree`).
+/// Subqueries are not descended into.
+fn contains_column_ref(node: &protobuf::Node) -> bool {
+    let Some(inner) = node.node.as_ref() else {
+        return false;
+    };
+    let any = |nodes: &[protobuf::Node]| nodes.iter().any(contains_column_ref);
+    let opt = |n: &Option<Box<protobuf::Node>>| n.as_deref().is_some_and(contains_column_ref);
+    match inner {
+        node::Node::ColumnRef(_) => true,
+        node::Node::AExpr(e) => opt(&e.lexpr) || opt(&e.rexpr),
+        node::Node::FuncCall(f) => any(&f.args),
+        node::Node::TypeCast(c) => opt(&c.arg),
+        node::Node::BoolExpr(b) => any(&b.args),
+        node::Node::CoalesceExpr(c) => any(&c.args),
+        node::Node::MinMaxExpr(m) => any(&m.args),
+        node::Node::NullTest(t) => opt(&t.arg),
+        node::Node::CaseExpr(c) => opt(&c.arg) || any(&c.args) || opt(&c.defresult),
+        node::Node::CaseWhen(w) => opt(&w.expr) || opt(&w.result),
+        node::Node::AArrayExpr(a) => any(&a.elements),
+        node::Node::RowExpr(r) => any(&r.args),
+        node::Node::AIndirection(i) => opt(&i.arg),
+        node::Node::List(l) => any(&l.items),
+        _ => false,
+    }
+}
+
+/// PG's `transformWindowDefinitions` over a SELECT's WINDOW clause and
+/// the inline windows inheriting from it: WINDOW entries are checked in
+/// order — a name may be defined once (42P20), and a reference must name
+/// an *earlier* entry (42704) — then every `OVER (w …)` in the target list
+/// and ORDER BY is checked against `w` (see [`transform_window_def`]).
+pub(crate) fn check_window_clause(
+    sel: &protobuf::SelectStmt,
+    ctx: Ctx<'_>,
+    params: &mut ParamCollector,
+) -> Result<(), AnalyzeError> {
+    let defs: Vec<&protobuf::WindowDef> = sel
+        .window_clause
+        .iter()
+        .filter_map(|n| match n.node.as_ref() {
+            Some(node::Node::WindowDef(w)) => Some(&**w),
+            _ => None,
+        })
+        .collect();
+    for (i, wd) in defs.iter().enumerate() {
+        let earlier = &defs[..i];
+        let span = crate::error::SourceSpan::from_node_qname(wd.location);
+        if earlier.iter().any(|d| d.name == wd.name) {
+            return Err(crate::pgmsg::window_already_defined(&wd.name, span).finalize_implicit());
+        }
+        let base = if wd.refname.is_empty() {
+            None
+        } else {
+            Some(
+                *earlier
+                    .iter()
+                    .find(|d| d.name == wd.refname)
+                    .ok_or_else(|| {
+                        crate::pgmsg::window_does_not_exist(&wd.refname).finalize_implicit()
+                    })?,
+            )
+        };
+        transform_window_def(wd, base, ctx, params)?;
+    }
+
+    let mut inline: Vec<&protobuf::WindowDef> = Vec::new();
+    for t in &sel.target_list {
+        if let Some(node::Node::ResTarget(rt)) = t.node.as_ref()
+            && let Some(val) = rt.val.as_deref()
+        {
+            collect_inheriting_windows(val, &mut inline);
+        }
+    }
+    for s in &sel.sort_clause {
+        if let Some(node::Node::SortBy(sb)) = s.node.as_ref()
+            && let Some(inner) = sb.node.as_deref()
+        {
+            collect_inheriting_windows(inner, &mut inline);
+        }
+    }
+    for wd in inline {
+        if let Some(base) = defs.iter().find(|d| d.name == wd.refname) {
+            transform_window_def(wd, Some(base), ctx, params)?;
+        }
+    }
+    Ok(())
+}
+
+/// Inline `OVER (w …)` windows of the window calls in an expression
+/// (subqueries excluded — their windows belong to the inner query).
+fn collect_inheriting_windows<'a>(
+    node: &'a protobuf::Node,
+    out: &mut Vec<&'a protobuf::WindowDef>,
+) {
+    let Some(inner) = node.node.as_ref() else {
+        return;
+    };
+    fn each<'a>(nodes: &'a [protobuf::Node], out: &mut Vec<&'a protobuf::WindowDef>) {
+        for n in nodes {
+            collect_inheriting_windows(n, out);
+        }
+    }
+    match inner {
+        node::Node::FuncCall(f) => {
+            if let Some(over) = f.over.as_deref()
+                && over.name.is_empty()
+                && !over.refname.is_empty()
+            {
+                out.push(over);
+            }
+            each(&f.args, out);
+        }
+        node::Node::AExpr(e) => {
+            for n in [&e.lexpr, &e.rexpr].into_iter().flatten() {
+                collect_inheriting_windows(n, out);
+            }
+        }
+        node::Node::TypeCast(c) => {
+            if let Some(a) = &c.arg {
+                collect_inheriting_windows(a, out);
+            }
+        }
+        node::Node::BoolExpr(b) => each(&b.args, out),
+        node::Node::CoalesceExpr(c) => each(&c.args, out),
+        node::Node::CaseExpr(c) => {
+            each(&c.args, out);
+            if let Some(d) = &c.defresult {
+                collect_inheriting_windows(d, out);
+            }
+        }
+        node::Node::CaseWhen(w) => {
+            for n in [&w.expr, &w.result].into_iter().flatten() {
+                collect_inheriting_windows(n, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Decide whether a function/aggregate/window call's result is nullable.

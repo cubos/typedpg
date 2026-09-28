@@ -448,6 +448,122 @@ pub(crate) fn window_in_filter(span: Option<SourceSpan>) -> RawError {
     )
 }
 
+// ── Window definitions (transformWindowDefinitions, transformFrameOffset) ─
+
+fn windowing(message: String, span: Option<SourceSpan>, hint: Option<String>) -> RawError {
+    RawError::new(AnalyzeError::WindowingError(message), span, hint)
+}
+
+/// `window functions are not allowed in window definitions` — 42P20.
+pub(crate) fn window_in_window_definition(span: Option<SourceSpan>) -> RawError {
+    windowing(
+        "window functions are not allowed in window definitions".into(),
+        span,
+        None,
+    )
+}
+
+/// `window "w" is already defined` — 42P20.
+pub(crate) fn window_already_defined(name: &str, span: Option<SourceSpan>) -> RawError {
+    windowing(format!("window \"{name}\" is already defined"), span, None)
+}
+
+/// `cannot override PARTITION BY clause of window "w"` (or `ORDER BY`) —
+/// 42P20.
+pub(crate) fn cannot_override_window_clause(
+    clause: &str,
+    window: &str,
+    span: Option<SourceSpan>,
+) -> RawError {
+    windowing(
+        format!("cannot override {clause} clause of window \"{window}\""),
+        span,
+        None,
+    )
+}
+
+/// `cannot copy window "w" because it has a frame clause` — 42P20; a bare
+/// `OVER (w)` gets PG's hint to drop the parentheses.
+pub(crate) fn cannot_copy_window_with_frame(
+    window: &str,
+    bare_over: bool,
+    span: Option<SourceSpan>,
+) -> RawError {
+    windowing(
+        format!("cannot copy window \"{window}\" because it has a frame clause"),
+        span,
+        bare_over.then(|| "Omit the parentheses in this OVER clause.".into()),
+    )
+}
+
+/// `RANGE with offset PRECEDING/FOLLOWING requires exactly one ORDER BY
+/// column` — 42P20.
+pub(crate) fn range_offset_needs_one_order_by(span: Option<SourceSpan>) -> RawError {
+    windowing(
+        "RANGE with offset PRECEDING/FOLLOWING requires exactly one ORDER BY column".into(),
+        span,
+        None,
+    )
+}
+
+/// `GROUPS mode requires an ORDER BY clause` — 42P20.
+pub(crate) fn groups_needs_order_by(span: Option<SourceSpan>) -> RawError {
+    windowing("GROUPS mode requires an ORDER BY clause".into(), span, None)
+}
+
+/// `argument of ROWS must not contain variables` (RANGE / GROUPS too) —
+/// SQLSTATE 42P10.
+pub(crate) fn frame_offset_has_variables(construct: &str, span: Option<SourceSpan>) -> RawError {
+    RawError::new(
+        AnalyzeError::InvalidColumnReference(format!(
+            "argument of {construct} must not contain variables"
+        )),
+        span,
+        None,
+    )
+}
+
+/// `RANGE with offset PRECEDING/FOLLOWING is not supported for column type
+/// text` (with `and offset type integer` when support exists for other
+/// offset types) — SQLSTATE 0A000.
+pub(crate) fn range_offset_unsupported(
+    key: &str,
+    offset: Option<&str>,
+    span: Option<SourceSpan>,
+) -> RawError {
+    let (message, hint) = match offset {
+        None => (
+            format!("RANGE with offset PRECEDING/FOLLOWING is not supported for column type {key}"),
+            None,
+        ),
+        Some(o) => (
+            format!(
+                "RANGE with offset PRECEDING/FOLLOWING is not supported for column type {key} \
+                 and offset type {o}"
+            ),
+            Some("Cast the offset value to an appropriate type.".into()),
+        ),
+    };
+    RawError::new(AnalyzeError::FeatureNotSupported(message), span, hint)
+}
+
+/// `RANGE with offset PRECEDING/FOLLOWING has multiple interpretations for
+/// column type X and offset type Y` — SQLSTATE 0A000.
+pub(crate) fn range_offset_ambiguous(
+    key: &str,
+    offset: &str,
+    span: Option<SourceSpan>,
+) -> RawError {
+    RawError::new(
+        AnalyzeError::FeatureNotSupported(format!(
+            "RANGE with offset PRECEDING/FOLLOWING has multiple interpretations for column \
+             type {key} and offset type {offset}"
+        )),
+        span,
+        Some("Cast the offset value to the exact intended type.".into()),
+    )
+}
+
 // ── Polymorphic argument resolution (`enforce_generic_type_consistency`) ──
 // Every message below is SQLSTATE 42804 (`datatype_mismatch`).
 
@@ -571,6 +687,21 @@ mod tests {
                 "42725",
             ),
             (schema_does_not_exist("s", None).kind, "3F000"),
+            (window_in_window_definition(None).kind, "42P20"),
+            (window_already_defined("w", None).kind, "42P20"),
+            (
+                cannot_override_window_clause("ORDER BY", "w", None).kind,
+                "42P20",
+            ),
+            (cannot_copy_window_with_frame("w", true, None).kind, "42P20"),
+            (range_offset_needs_one_order_by(None).kind, "42P20"),
+            (groups_needs_order_by(None).kind, "42P20"),
+            (frame_offset_has_variables("ROWS", None).kind, "42P10"),
+            (range_offset_unsupported("text", None, None).kind, "0A000"),
+            (
+                range_offset_ambiguous("integer", "numeric", None).kind,
+                "0A000",
+            ),
             (not_an_aggregate("DISTINCT", "lower", None).kind, "42809"),
             (within_group_required("mode", None).kind, "42809"),
             (not_an_ordered_set_aggregate("count", None).kind, "42809"),

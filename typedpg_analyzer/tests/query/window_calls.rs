@@ -238,3 +238,133 @@ fn frame_bound_errors_are_windowing_errors() {
         assert_err_kind!(db, sql, AnalyzeError::WindowingError(_), msg);
     }
 }
+
+// ── Window definitions (#56, #57) ────────────────────────────────────────────
+
+fn window_setup() -> PgCatalog {
+    let mut db = setup();
+    db.apply_sql("CREATE TABLE t56 (id int PRIMARY KEY, g int NOT NULL, x int NOT NULL, y int, s text NOT NULL, d date NOT NULL)")
+        .unwrap();
+    db
+}
+
+#[test]
+fn window_definition_rules() {
+    let db = window_setup();
+    for (sql, msg) in [
+        (
+            "SELECT sum(x) OVER (RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t56",
+            "RANGE with offset PRECEDING/FOLLOWING requires exactly one ORDER BY column",
+        ),
+        (
+            "SELECT sum(x) OVER (GROUPS 1 PRECEDING) FROM t56",
+            "GROUPS mode requires an ORDER BY clause",
+        ),
+        (
+            "SELECT sum(x) OVER (w ORDER BY id) FROM t56 WINDOW w AS (PARTITION BY g ORDER BY x)",
+            "cannot override ORDER BY clause of window \"w\"",
+        ),
+        (
+            "SELECT sum(x) OVER (w PARTITION BY id) FROM t56 WINDOW w AS (ORDER BY x)",
+            "cannot override PARTITION BY clause of window \"w\"",
+        ),
+        (
+            "SELECT sum(x) OVER (w) FROM t56 WINDOW w AS (ORDER BY x ROWS 1 PRECEDING)",
+            "cannot copy window \"w\" because it has a frame clause",
+        ),
+        (
+            "SELECT sum(x) OVER w FROM t56 WINDOW w AS (ORDER BY x), w AS (ORDER BY id)",
+            "window \"w\" is already defined",
+        ),
+        (
+            "SELECT sum(x) OVER (ORDER BY row_number() OVER ()) FROM t56",
+            "window functions are not allowed in window definitions",
+        ),
+    ] {
+        assert_err_kind!(db, sql, AnalyzeError::WindowingError(_), msg);
+    }
+    assert_err_kind!(
+        db,
+        "SELECT sum(x) OVER w2 FROM t56 WINDOW w AS (PARTITION BY g), w2 AS (w3)",
+        AnalyzeError::UndefinedObject(_),
+        "window \"w3\" does not exist"
+    );
+    for (sql, msg) in [
+        (
+            "SELECT sum(x) OVER (ORDER BY id ROWS BETWEEN y PRECEDING AND CURRENT ROW) FROM t56",
+            "argument of ROWS must not contain variables",
+        ),
+        (
+            "SELECT sum(x) OVER (ORDER BY id GROUPS BETWEEN y PRECEDING AND CURRENT ROW) FROM t56",
+            "argument of GROUPS must not contain variables",
+        ),
+        (
+            "SELECT sum(x) OVER (ORDER BY id RANGE BETWEEN y PRECEDING AND CURRENT ROW) FROM t56",
+            "argument of RANGE must not contain variables",
+        ),
+    ] {
+        assert_err_kind!(db, sql, AnalyzeError::InvalidColumnReference(_), msg);
+    }
+    // Inheriting only what the base window leaves open is fine.
+    db.analyze(
+        "SELECT sum(x) OVER w2 FROM t56 WINDOW w AS (PARTITION BY g),
+                w2 AS (w ORDER BY x RANGE BETWEEN 1 PRECEDING AND CURRENT ROW)",
+    )
+    .unwrap();
+}
+
+#[test]
+fn range_offsets_need_in_range_support() {
+    let db = window_setup();
+    for (sql, msg) in [
+        (
+            "SELECT sum(x) OVER (ORDER BY s RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t56",
+            "RANGE with offset PRECEDING/FOLLOWING is not supported for column type text",
+        ),
+        (
+            "SELECT sum(x) OVER (ORDER BY d RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t56",
+            "RANGE with offset PRECEDING/FOLLOWING is not supported for column type date and offset type integer",
+        ),
+        (
+            "SELECT sum(x) OVER (ORDER BY id RANGE BETWEEN 1.5 PRECEDING AND CURRENT ROW) FROM t56",
+            "RANGE with offset PRECEDING/FOLLOWING is not supported for column type integer and offset type numeric",
+        ),
+    ] {
+        assert_err_kind!(db, sql, AnalyzeError::FeatureNotSupported(_), msg);
+    }
+    assert_err_starts_with(
+        &db,
+        "SELECT sum(x) OVER (ORDER BY id RANGE BETWEEN 'x' PRECEDING AND CURRENT ROW) FROM t56",
+        "invalid input syntax for type integer: \"x\"",
+    );
+}
+
+#[test]
+fn range_offset_params_take_the_in_range_offset_type() {
+    let db = window_setup();
+    for (sql, param) in [
+        (
+            "SELECT sum(x) OVER (ORDER BY id RANGE BETWEEN $a PRECEDING AND CURRENT ROW) FROM t56",
+            int4(),
+        ),
+        (
+            "SELECT sum(x) OVER (ORDER BY ts RANGE BETWEEN $a PRECEDING AND CURRENT ROW) FROM t",
+            interval(),
+        ),
+        (
+            "SELECT sum(x) OVER (ORDER BY d RANGE BETWEEN $a PRECEDING AND CURRENT ROW) FROM t56",
+            interval(),
+        ),
+        (
+            "SELECT sum(x) OVER (ORDER BY x::numeric RANGE BETWEEN $a PRECEDING AND CURRENT ROW) FROM t56",
+            numeric(),
+        ),
+        (
+            "SELECT sum(x) OVER (ORDER BY id ROWS BETWEEN $a PRECEDING AND CURRENT ROW) FROM t56",
+            int8(),
+        ),
+    ] {
+        let s = db.analyze(sql).unwrap();
+        assert_params(&s, vec![p(param)]);
+    }
+}

@@ -292,6 +292,9 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
             check_window_refs(inner, &defined_windows)?;
         }
     }
+    // The WINDOW clause's own definitions, and the inline windows that
+    // inherit from them (PG's transformWindowDefinitions).
+    expr::check_window_clause(sel, expr::Ctx::new(&scope, &null_ctx, snapshot), params)?;
 
     // Process LIMIT / OFFSET — int8 coercion, placement rule, and PG's
     // wording all live in the shared clause walker.
