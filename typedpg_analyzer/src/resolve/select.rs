@@ -296,22 +296,7 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
     // inherit from them (PG's transformWindowDefinitions).
     expr::check_window_clause(sel, expr::Ctx::new(&scope, &null_ctx, snapshot), params)?;
 
-    // Process LIMIT / OFFSET — int8 coercion, placement rule, and PG's
-    // wording all live in the shared clause walker.
-    for (limit_node, kind) in [
-        (&sel.limit_count, crate::clause::ClauseKind::Limit),
-        (&sel.limit_offset, crate::clause::ClauseKind::Offset),
-    ] {
-        let Some(limit_node) = limit_node else {
-            continue;
-        };
-        crate::clause::coerce_clause_expr(
-            limit_node,
-            expr::Ctx::new(&scope, &null_ctx, snapshot),
-            params,
-            kind,
-        )?;
-    }
+    analyze_limit_offset(sel, expr::Ctx::new(&scope, &null_ctx, snapshot), params)?;
 
     // Resolve target list (SELECT expressions) — no type expectation.
     let columns = resolve_target_list(
@@ -324,6 +309,15 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
     // grouped or aggregated (PG SQLSTATE 42803). Checked after the target list
     // so undefined-column errors surface first, matching PG's order.
     crate::grouping::check_grouping(sel, &scope, snapshot)?;
+
+    check_order_by_using(
+        &sel.sort_clause,
+        &sel.target_list,
+        &columns,
+        expr::Ctx::new(&scope, &null_ctx, snapshot),
+        params,
+    )?;
+    check_distinct_on_matches_order_by(sel, &columns)?;
 
     // `FOR UPDATE [OF …]` (and FOR SHARE / NO KEY UPDATE / KEY SHARE) —
     // PG checks it last in transformSelectStmt.
@@ -757,6 +751,238 @@ fn check_locking_clause(
                 )));
             }
         }
+    }
+    Ok(())
+}
+
+/// LIMIT / OFFSET: coerced to bigint through the shared clause walker, then
+/// PG's `checkExprIsVarFree` — a reference to this level's columns is 42P10
+/// `argument of LIMIT must not contain variables` (outer references are
+/// fine).
+pub(crate) fn analyze_limit_offset(
+    sel: &protobuf::SelectStmt,
+    ctx: Ctx<'_>,
+    params: &mut ParamCollector,
+) -> Result<(), AnalyzeError> {
+    for (limit_node, kind, label) in [
+        (&sel.limit_count, crate::clause::ClauseKind::Limit, "LIMIT"),
+        (
+            &sel.limit_offset,
+            crate::clause::ClauseKind::Offset,
+            "OFFSET",
+        ),
+    ] {
+        let Some(limit_node) = limit_node else {
+            continue;
+        };
+        crate::clause::coerce_clause_expr(limit_node, ctx, params, kind)?;
+        let mut var: Option<i32> = None;
+        visit_same_level(limit_node, &mut |e| {
+            if var.is_none()
+                && let Some(node::Node::ColumnRef(cr)) = e.node.as_ref()
+                && references_local_column(cr, ctx.scope)
+            {
+                var = Some(cr.location);
+            }
+        });
+        if let Some(loc) = var {
+            return Err(crate::error::RawError::new(
+                AnalyzeError::InvalidColumnReference(format!(
+                    "argument of {label} must not contain variables"
+                )),
+                crate::error::SourceSpan::from_node_qname(loc),
+                None,
+            )
+            .finalize_implicit());
+        }
+    }
+    Ok(())
+}
+
+/// Whether `cr` resolves against this query level's own FROM items (as
+/// opposed to an enclosing query's).
+fn references_local_column(cr: &protobuf::ColumnRef, scope: &Scope) -> bool {
+    let parts = expr::extract_string_fields(&cr.fields);
+    match parts.as_slice() {
+        [col] => scope
+            .sources
+            .iter()
+            .any(|s| s.visible_columns().any(|c| &c.name == col)),
+        [tbl, ..] => scope.sources.iter().any(|s| &s.alias == tbl),
+        [] => false,
+    }
+}
+
+/// `ORDER BY expr USING op`: PG (`addTargetToSortList`) resolves `op` for
+/// the sort expression's type (42883 when it doesn't exist) and requires it
+/// to be the `<` or `>` member of a btree operator family (42809). The
+/// analyzer has no `pg_amop`, so it accepts the ordering operator names PG's
+/// btree families use.
+fn check_order_by_using(
+    sort_clause: &[protobuf::Node],
+    target_list: &[protobuf::Node],
+    columns: &[RawColumn],
+    ctx: Ctx<'_>,
+    params: &ParamCollector,
+) -> Result<(), AnalyzeError> {
+    let snapshot = ctx.snapshot;
+    for sort_node in sort_clause {
+        let Some(node::Node::SortBy(sb)) = sort_node.node.as_ref() else {
+            continue;
+        };
+        if sb.sortby_dir() != protobuf::SortByDir::SortbyUsing {
+            continue;
+        }
+        let Some(inner) = sb.node.as_deref() else {
+            continue;
+        };
+        let Some(ty) = sort_expr_type(inner, target_list, columns, ctx, params) else {
+            continue;
+        };
+        let op = expr::extract_string_fields(&sb.use_op)
+            .pop()
+            .unwrap_or_default();
+        let span = crate::error::SourceSpan::from_node_token(sb.location);
+        if snapshot.find_operator(&op, Some(ty), ty).is_none() {
+            let t = crate::ddl::util::format_type_for_message(snapshot, ty);
+            return Err(
+                crate::pgmsg::operator_does_not_exist(&t, &op, &t, span).finalize_implicit()
+            );
+        }
+        if !matches!(op.as_str(), "<" | ">" | "~<~" | "~>~") {
+            return Err(crate::error::RawError::new(
+                AnalyzeError::WrongObjectType(format!(
+                    "operator {op} is not a valid ordering operator"
+                )),
+                span,
+                Some(
+                    "Ordering operators must be \"<\" or \">\" members of btree operator families."
+                        .into(),
+                ),
+            )
+            .finalize_implicit());
+        }
+    }
+    Ok(())
+}
+
+/// The type of an ORDER BY item: a position or output-column name refers to
+/// the target list (`findTargetlistEntrySQL92`), anything else is inferred
+/// on a scratch parameter collector.
+fn sort_expr_type(
+    inner: &protobuf::Node,
+    target_list: &[protobuf::Node],
+    columns: &[RawColumn],
+    ctx: Ctx<'_>,
+    params: &ParamCollector,
+) -> Option<PgTypeOid> {
+    match sort_target_key(inner, target_list, columns) {
+        SortKey::Target(i) => columns.get(i).map(|c| c.type_oid),
+        SortKey::Expr(_) => {
+            let mut scratch = params.clone();
+            expr::infer_expr(inner, ctx, &mut scratch, TypeGoal::NONE)
+                .ok()
+                .map(|e| e.type_oid)
+        }
+    }
+}
+
+/// Which target entry an ORDER BY / DISTINCT ON item denotes.
+#[derive(PartialEq, Eq)]
+enum SortKey {
+    /// An entry of the select list (by position, output name, or equal
+    /// expression).
+    Target(usize),
+    /// A resjunk expression, identified by its location-free fingerprint.
+    Expr(String),
+}
+
+/// PG's `findTargetlistEntrySQL92`: an integer constant is a position, a
+/// bare name matching an output column is that column, and otherwise the
+/// expression matches a select-list entry it is equal to.
+fn sort_target_key(
+    inner: &protobuf::Node,
+    target_list: &[protobuf::Node],
+    columns: &[RawColumn],
+) -> SortKey {
+    if let Some(ord) = ordinal_of(inner)
+        && ord >= 1
+    {
+        return SortKey::Target(ord as usize - 1);
+    }
+    if let Some(node::Node::ColumnRef(cr)) = inner.node.as_ref()
+        && let [name] = expr::extract_string_fields(&cr.fields).as_slice()
+        && let Some(i) = columns.iter().position(|c| &c.name == name)
+    {
+        return SortKey::Target(i);
+    }
+    let fp = node_fingerprint(inner);
+    // Only a plain target list (no `*`) lines up with the output columns.
+    let has_star = target_list.iter().any(|t| {
+        matches!(t.node.as_ref(), Some(node::Node::ResTarget(rt))
+            if matches!(rt.val.as_deref().and_then(|v| v.node.as_ref()),
+                Some(node::Node::ColumnRef(cr)) if cr.fields.iter().any(|f|
+                    matches!(f.node.as_ref(), Some(node::Node::AStar(_))))))
+    });
+    if !has_star
+        && let Some(i) = target_list.iter().position(|t| {
+            matches!(t.node.as_ref(), Some(node::Node::ResTarget(rt))
+                if rt.val.as_deref().is_some_and(|v| node_fingerprint(v) == fp))
+        })
+    {
+        return SortKey::Target(i);
+    }
+    SortKey::Expr(fp)
+}
+
+/// `transformDistinctOnClause`: ORDER BY items that are DISTINCT ON items
+/// must come first — once an ORDER BY item outside the DISTINCT ON list has
+/// been skipped, a later DISTINCT ON item (in ORDER BY or not) is 42P10
+/// `SELECT DISTINCT ON expressions must match initial ORDER BY expressions`.
+fn check_distinct_on_matches_order_by(
+    sel: &protobuf::SelectStmt,
+    columns: &[RawColumn],
+) -> Result<(), AnalyzeError> {
+    let distinct: Vec<SortKey> = sel
+        .distinct_clause
+        .iter()
+        .filter(|n| n.node.is_some())
+        .map(|n| sort_target_key(n, &sel.target_list, columns))
+        .collect();
+    if distinct.is_empty() || sel.sort_clause.is_empty() {
+        return Ok(());
+    }
+    let err = || {
+        crate::error::RawError::new(
+            AnalyzeError::InvalidColumnReference(
+                "SELECT DISTINCT ON expressions must match initial ORDER BY expressions".into(),
+            ),
+            None,
+            None,
+        )
+        .finalize_implicit()
+    };
+    let mut skipped = false;
+    let mut covered: Vec<&SortKey> = Vec::new();
+    for sort_node in &sel.sort_clause {
+        let Some(node::Node::SortBy(sb)) = sort_node.node.as_ref() else {
+            continue;
+        };
+        let Some(inner) = sb.node.as_deref() else {
+            continue;
+        };
+        let key = sort_target_key(inner, &sel.target_list, columns);
+        if let Some(d) = distinct.iter().find(|d| **d == key) {
+            if skipped {
+                return Err(err());
+            }
+            covered.push(d);
+        } else {
+            skipped = true;
+        }
+    }
+    if skipped && distinct.iter().any(|d| !covered.contains(&d)) {
+        return Err(err());
     }
     Ok(())
 }

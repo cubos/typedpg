@@ -156,7 +156,92 @@ pub(crate) fn analyze_set_operation(
         });
     }
 
+    set_operation_sort_and_limit(sel, &columns, snapshot, params, cte_scopes)?;
+
     Ok((columns, None))
+}
+
+/// ORDER BY / LIMIT / OFFSET of a set operation (`transformSetOperationStmt`):
+/// ORDER BY sees only the result columns, by name or position — anything
+/// else is 0A000 `invalid UNION/INTERSECT/EXCEPT ORDER BY clause`; LIMIT and
+/// OFFSET see no columns at all.
+fn set_operation_sort_and_limit(
+    sel: &protobuf::SelectStmt,
+    columns: &[RawColumn],
+    snapshot: &PgCatalog,
+    params: &mut ParamCollector,
+    cte_scopes: &HashMap<String, Vec<ScopeColumn>>,
+) -> Result<(), AnalyzeError> {
+    let alias = crate::scope::hidden_alias("setop");
+    let result_cols: Vec<ScopeColumn> = columns
+        .iter()
+        .map(|c| ScopeColumn {
+            name: c.name.clone(),
+            type_oid: c.type_oid,
+            base_not_null: !c.nullable,
+            typmod: c.typmod,
+            collation: c.collation,
+            table_alias: alias.clone(),
+            record_fields: c.record_fields.clone(),
+        })
+        .collect();
+    let mut scope = Scope {
+        ctes: cte_scopes.clone(),
+        ..Scope::default()
+    };
+    scope.add_derived(&alias, result_cols, crate::scope::SourceKind::Other)?;
+    let null_ctx = NullabilityContext::default();
+    for sort_node in &sel.sort_clause {
+        let Some(node::Node::SortBy(sb)) = sort_node.node.as_ref() else {
+            continue;
+        };
+        let Some(inner) = sb.node.as_deref() else {
+            continue;
+        };
+        if let Some(node::Node::AConst(ac)) = inner.node.as_ref()
+            && let Some(pg_query::protobuf::a_const::Val::Ival(i)) = &ac.val
+        {
+            let ord = i.ival as i64;
+            if ord < 1 || ord as usize > columns.len() {
+                return Err(crate::pgmsg::position_not_in_select_list(
+                    "ORDER BY",
+                    ord,
+                    crate::error::node_location(inner)
+                        .and_then(crate::error::SourceSpan::from_node_token),
+                )
+                .finalize_implicit());
+            }
+            continue;
+        }
+        expr::infer_expr(
+            inner,
+            expr::Ctx::new(&scope, &null_ctx, snapshot),
+            params,
+            TypeGoal::NONE,
+        )?;
+        let is_result_column = matches!(inner.node.as_ref(),
+            Some(node::Node::ColumnRef(cr)) if cr.fields.len() == 1);
+        if !is_result_column {
+            return Err(crate::error::RawError::new(
+                AnalyzeError::FeatureNotSupported(
+                    "invalid UNION/INTERSECT/EXCEPT ORDER BY clause".into(),
+                ),
+                crate::error::node_location(inner)
+                    .and_then(crate::error::SourceSpan::from_node_token),
+                Some(
+                    "Add the expression/function to every SELECT, or move the UNION into a \
+                     FROM clause."
+                        .into(),
+                ),
+            )
+            .finalize_implicit());
+        }
+    }
+    let empty = Scope {
+        ctes: cte_scopes.clone(),
+        ..Scope::default()
+    };
+    analyze_limit_offset(sel, expr::Ctx::new(&empty, &null_ctx, snapshot), params)
 }
 
 /// The untyped string literal an arm projects at position `i`, when the arm
