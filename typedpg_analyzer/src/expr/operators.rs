@@ -366,7 +366,7 @@ pub(crate) fn typed_null(t: PgTypeOid) -> protobuf::Node {
 /// outside any sub-select. (A correlated reference *inside* a sub-select
 /// would also count in PG; treating those items as Var-free only changes
 /// which IN items get folded together.)
-fn contains_level0_column_ref(n: &protobuf::Node) -> bool {
+pub(crate) fn contains_level0_column_ref(n: &protobuf::Node) -> bool {
     let any = |ns: &[protobuf::Node]| ns.iter().any(contains_level0_column_ref);
     let opt =
         |n: &Option<Box<protobuf::Node>>| n.as_deref().is_some_and(contains_level0_column_ref);

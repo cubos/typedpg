@@ -398,6 +398,22 @@ fn figure_colname(node: &protobuf::Node) -> (i32, Option<String>) {
         node::Node::RowExpr(_) => (2, Some("row".to_string())),
         node::Node::MergeSupportFunc(_) => (2, Some("merge_action".to_string())),
         node::Node::GroupingFunc(_) => (2, Some("grouping".to_string())),
+        // SQL/JSON constructs act like the functions they're named after.
+        node::Node::JsonParseExpr(_) => (2, Some("json".to_string())),
+        node::Node::JsonScalarExpr(_) => (2, Some("json_scalar".to_string())),
+        node::Node::JsonSerializeExpr(_) => (2, Some("json_serialize".to_string())),
+        node::Node::JsonObjectConstructor(_) => (2, Some("json_object".to_string())),
+        node::Node::JsonArrayConstructor(_) | node::Node::JsonArrayQueryConstructor(_) => {
+            (2, Some("json_array".to_string()))
+        }
+        node::Node::JsonObjectAgg(_) => (2, Some("json_objectagg".to_string())),
+        node::Node::JsonArrayAgg(_) => (2, Some("json_arrayagg".to_string())),
+        node::Node::JsonFuncExpr(f) => match protobuf::JsonExprOp::try_from(f.op) {
+            Ok(protobuf::JsonExprOp::JsonExistsOp) => (2, Some("json_exists".to_string())),
+            Ok(protobuf::JsonExprOp::JsonQueryOp) => (2, Some("json_query".to_string())),
+            Ok(protobuf::JsonExprOp::JsonValueOp) => (2, Some("json_value".to_string())),
+            _ => (0, None),
+        },
         // SQL value functions are named after the keyword spelling (PG's
         // FigureColname): `SELECT current_date` → column `current_date`.
         node::Node::SqlvalueFunction(svf) => {

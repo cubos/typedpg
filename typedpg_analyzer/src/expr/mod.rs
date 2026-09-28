@@ -322,6 +322,91 @@ fn walk(node: &protobuf::Node, snapshot: &PgCatalog, out: &mut FuncKindPresence)
             out.has_grouping = true;
             out.grouping_location.get_or_insert(g.location);
         }
+        // JSON_OBJECTAGG / JSON_ARRAYAGG are aggregates (window functions
+        // with OVER).
+        node::Node::JsonObjectAgg(_) | node::Node::JsonArrayAgg(_) => {
+            let (ctor, args): (Option<&protobuf::JsonAggConstructor>, Vec<&protobuf::Node>) =
+                match inner {
+                    node::Node::JsonObjectAgg(a) => (
+                        a.constructor.as_deref(),
+                        a.arg
+                            .as_deref()
+                            .map(|kv| {
+                                kv.key
+                                    .as_deref()
+                                    .into_iter()
+                                    .chain(kv.value.as_deref().and_then(|v| v.raw_expr.as_deref()))
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                    ),
+                    node::Node::JsonArrayAgg(a) => (
+                        a.constructor.as_deref(),
+                        a.arg
+                            .as_deref()
+                            .and_then(|v| v.raw_expr.as_deref())
+                            .into_iter()
+                            .collect(),
+                    ),
+                    _ => (None, Vec::new()),
+                };
+            let location = ctor.map_or(-1, |c| c.location);
+            if ctor.is_some_and(|c| c.over.is_some()) {
+                out.has_window = true;
+                out.window_location.get_or_insert(location);
+            } else {
+                out.has_aggregate = true;
+                out.agg_location.get_or_insert(location);
+            }
+            for a in args {
+                walk(a, snapshot, out);
+            }
+        }
+        node::Node::JsonObjectConstructor(c) => {
+            for e in &c.exprs {
+                walk(e, snapshot, out);
+            }
+        }
+        node::Node::JsonArrayConstructor(c) => {
+            for e in &c.exprs {
+                walk(e, snapshot, out);
+            }
+        }
+        node::Node::JsonKeyValue(kv) => {
+            if let Some(k) = &kv.key {
+                walk(k, snapshot, out);
+            }
+            if let Some(v) = kv.value.as_deref().and_then(|v| v.raw_expr.as_deref()) {
+                walk(v, snapshot, out);
+            }
+        }
+        node::Node::JsonValueExpr(v) => {
+            if let Some(e) = &v.raw_expr {
+                walk(e, snapshot, out);
+            }
+        }
+        node::Node::JsonIsPredicate(p) => {
+            if let Some(e) = &p.expr {
+                walk(e, snapshot, out);
+            }
+        }
+        node::Node::JsonScalarExpr(s) => {
+            if let Some(e) = &s.expr {
+                walk(e, snapshot, out);
+            }
+        }
+        node::Node::JsonFuncExpr(f) => {
+            if let Some(e) = f
+                .context_item
+                .as_deref()
+                .and_then(|v| v.raw_expr.as_deref())
+            {
+                walk(e, snapshot, out);
+            }
+            if let Some(p) = &f.pathspec {
+                walk(p, snapshot, out);
+            }
+        }
         node::Node::AExpr(e) => {
             if let Some(l) = &e.lexpr {
                 walk(l, snapshot, out);
@@ -742,6 +827,16 @@ pub(crate) fn infer_expr(
         // `WHERE CURRENT OF cursor` (UPDATE / DELETE only, by grammar): a
         // boolean test against the cursor's current row.
         node::Node::CurrentOfExpr(_) => Ok(ExprType::scalar(oid::BOOL, false)),
+        node::Node::JsonFuncExpr(f) => infer_json_func_expr(f, ctx, params),
+        node::Node::JsonParseExpr(p) => infer_json_parse(p, ctx, params),
+        node::Node::JsonScalarExpr(s) => infer_json_scalar(s, ctx, params),
+        node::Node::JsonSerializeExpr(s) => infer_json_serialize(s, ctx, params),
+        node::Node::JsonObjectConstructor(c) => infer_json_object(c, ctx, params),
+        node::Node::JsonArrayConstructor(c) => infer_json_array(c, ctx, params),
+        node::Node::JsonArrayQueryConstructor(c) => infer_json_array_query(c, ctx, params),
+        node::Node::JsonObjectAgg(a) => infer_json_objectagg(a, ctx, params),
+        node::Node::JsonArrayAgg(a) => infer_json_arrayagg(a, ctx, params),
+        node::Node::JsonIsPredicate(p) => infer_json_is_predicate(p, ctx, params),
         _ => Err(AnalyzeError::Unsupported(format!(
             "expression node type not supported: {:?}",
             std::mem::discriminant(inner)
@@ -960,6 +1055,7 @@ mod column_refs;
 mod conditional;
 mod func_call;
 mod indirection;
+mod json;
 mod literals;
 mod operators;
 mod sublink;
@@ -970,6 +1066,7 @@ pub(crate) use func_call::check_window_clause;
 use func_call::*;
 use indirection::*;
 pub(crate) use indirection::{expand_indirection_star, transform_container_subscripts};
+use json::*;
 use literals::*;
 use operators::*;
 use sublink::*;

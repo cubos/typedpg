@@ -54,6 +54,8 @@ mod set_operations;
 mod set_returning_functions;
 #[path = "query/special.rs"]
 mod special;
+#[path = "query/sql_json.rs"]
+mod sql_json;
 #[path = "query/subqueries.rs"]
 mod subqueries;
 #[path = "query/typmod.rs"]
