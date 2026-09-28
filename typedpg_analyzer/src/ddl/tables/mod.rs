@@ -535,6 +535,16 @@ fn apply_alter_cmd(
         | AlterTableType::AtResetOptions => {
             column_options::alter_column_setting(interp, relid, cmd, subtype)
         }
+        AlterTableType::AtClusterOn => object_refs::cluster_on(interp, relid, cmd),
+        AlterTableType::AtReplicaIdentity => object_refs::replica_identity(interp, relid, cmd),
+        AlterTableType::AtAlterConstraint => object_refs::alter_constraint(interp, relid, cmd),
+        AlterTableType::AtValidateConstraint => {
+            object_refs::validate_constraint(interp, relid, cmd)
+        }
+        AlterTableType::AtEnableTrig
+        | AlterTableType::AtEnableAlwaysTrig
+        | AlterTableType::AtEnableReplicaTrig
+        | AlterTableType::AtDisableTrig => object_refs::enable_disable_trigger(interp, relid, cmd),
         // Other subtypes are no-ops for schema analysis.
         _ => Ok(()),
     }
@@ -630,6 +640,7 @@ mod columns;
 mod constraints;
 pub(crate) mod inherit;
 mod merge;
+mod object_refs;
 
 use columns::*;
 pub(crate) use columns::{column_collation, type_collation};

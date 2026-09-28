@@ -698,3 +698,106 @@ fn alter_column_settings_are_validated() {
         ),
     ]);
 }
+
+#[test]
+fn alter_table_object_references_are_resolved() {
+    // PG 18 check_index_is_clusterable / ATExecReplicaIdentity /
+    // ATExecAlterConstraint / ATExecValidateConstraint /
+    // EnableDisableTrigger.
+    let setup = "CREATE TABLE r (id int PRIMARY KEY);
+                 CREATE TABLE t (a int, b int REFERENCES r, c int, d int NOT NULL,
+                                 CONSTRAINT ck CHECK (a > 0), CONSTRAINT uq UNIQUE (c));
+                 CREATE INDEX t_a_idx ON t (a);
+                 CREATE UNIQUE INDEX t_part ON t (d) WHERE d > 0;
+                 CREATE UNIQUE INDEX t_expr ON t ((d + 1));
+                 CREATE UNIQUE INDEX t_c2 ON t (c);
+                 CREATE UNIQUE INDEX t_d ON t (d);
+                 CREATE INDEX r_idx ON r (id);
+                 CREATE FUNCTION tf() RETURNS trigger LANGUAGE plpgsql AS 'begin return new; end';
+                 CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION tf();";
+    for (stmt, msg) in [
+        (
+            "ALTER TABLE t CLUSTER ON nosuch_idx;",
+            "index \"nosuch_idx\" for table \"t\" does not exist",
+        ),
+        (
+            "ALTER TABLE t CLUSTER ON r_idx;",
+            "\"r_idx\" is not an index for table \"t\"",
+        ),
+        (
+            "ALTER TABLE t CLUSTER ON t_part;",
+            "cannot cluster on partial index \"t_part\"",
+        ),
+        (
+            "ALTER TABLE t REPLICA IDENTITY USING INDEX nosuch_idx;",
+            "index \"nosuch_idx\" for table \"t\" does not exist",
+        ),
+        (
+            "ALTER TABLE t REPLICA IDENTITY USING INDEX t_a_idx;",
+            "cannot use non-unique index \"t_a_idx\" as replica identity",
+        ),
+        (
+            "ALTER TABLE t REPLICA IDENTITY USING INDEX t_expr;",
+            "cannot use expression index \"t_expr\" as replica identity",
+        ),
+        (
+            "ALTER TABLE t REPLICA IDENTITY USING INDEX t_part;",
+            "cannot use partial index \"t_part\" as replica identity",
+        ),
+        (
+            "ALTER TABLE t REPLICA IDENTITY USING INDEX t_c2;",
+            "index \"t_c2\" cannot be used as replica identity because column \"c\" is nullable",
+        ),
+        (
+            "ALTER TABLE t REPLICA IDENTITY USING INDEX uq;",
+            "index \"uq\" cannot be used as replica identity because column \"c\" is nullable",
+        ),
+        (
+            "ALTER TABLE t ALTER CONSTRAINT nosuch DEFERRABLE;",
+            "constraint \"nosuch\" of relation \"t\" does not exist",
+        ),
+        (
+            "ALTER TABLE t ALTER CONSTRAINT ck DEFERRABLE;",
+            "constraint \"ck\" of relation \"t\" is not a foreign key constraint",
+        ),
+        (
+            "ALTER TABLE t VALIDATE CONSTRAINT nosuch;",
+            "constraint \"nosuch\" of relation \"t\" does not exist",
+        ),
+        (
+            "ALTER TABLE t VALIDATE CONSTRAINT uq;",
+            "cannot validate constraint \"uq\" of relation \"t\"",
+        ),
+        (
+            "ALTER TABLE t ENABLE TRIGGER nosuch;",
+            "trigger \"nosuch\" for table \"t\" does not exist",
+        ),
+        (
+            "ALTER TABLE t DISABLE TRIGGER nosuch;",
+            "trigger \"nosuch\" for table \"t\" does not exist",
+        ),
+        (
+            "ALTER TABLE t ENABLE REPLICA TRIGGER nosuch;",
+            "trigger \"nosuch\" for table \"t\" does not exist",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "ALTER TABLE t CLUSTER ON t_a_idx;
+             ALTER TABLE t REPLICA IDENTITY USING INDEX t_d;
+             ALTER TABLE t REPLICA IDENTITY FULL;
+             ALTER TABLE t ALTER CONSTRAINT t_b_fkey DEFERRABLE;
+             ALTER TABLE t VALIDATE CONSTRAINT ck;
+             ALTER TABLE t VALIDATE CONSTRAINT t_b_fkey;
+             ALTER TABLE t ENABLE TRIGGER ALL;
+             ALTER TABLE t DISABLE TRIGGER USER;
+             ALTER TABLE t DISABLE TRIGGER tr;
+             ALTER TABLE t ENABLE ALWAYS TRIGGER tr;",
+        ),
+    ]);
+}
