@@ -347,6 +347,12 @@ fn analyze_insert_values(
                 None => goal,
             };
             let ctx = expr::Ctx::new(&scope, &null_ctx, snapshot);
+            // A multi-row VALUES list is a VALUES RTE, where PG forbids
+            // set-returning functions; a single row is the INSERT's own
+            // target list.
+            if val_sel.values_lists.len() > 1 {
+                check_no_srf_in_clause(val, snapshot, "VALUES")?;
+            }
             match &target {
                 Some(t) => t.infer_value(val, goal, ctx, params)?,
                 None if is_set_to_default(val) => expr::ExprType::scalar(oid::UNKNOWN, false),
@@ -676,6 +682,7 @@ pub(crate) fn analyze_update_with_outer_ctes(
             params,
             crate::clause::ClauseKind::Where,
         )?;
+        check_no_srf_in_clause(where_clause, snapshot, "WHERE")?;
     }
 
     let columns = resolve_target_list(
@@ -780,6 +787,7 @@ pub(crate) fn analyze_delete_with_outer_ctes(
             params,
             crate::clause::ClauseKind::Where,
         )?;
+        check_no_srf_in_clause(where_clause, snapshot, "WHERE")?;
     }
 
     let columns = resolve_target_list(

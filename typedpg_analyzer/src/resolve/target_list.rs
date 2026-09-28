@@ -170,6 +170,7 @@ pub(crate) fn analyze_values_lists(
                 params,
                 TypeGoal::NONE,
             )?;
+            check_no_srf_in_clause(item, snapshot, "VALUES")?;
             column_types[i].push(t.type_oid);
             column_typmods[i].push(t.typmod);
             column_nullable[i] |= t.nullable;

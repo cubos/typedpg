@@ -325,3 +325,82 @@ fn too_many_column_aliases_for_function_rte() {
         "table \"r\" has 4 columns available but 5 columns specified"
     );
 }
+
+// ── Placement ────────────────────────────────────────────────────────────────
+
+/// PG's `check_srf_call_placement` and the CASE / COALESCE / aggregate /
+/// window nesting rules (all 0A000).
+#[test]
+fn srf_placement_rules() {
+    let db = setup();
+    let cases: &[(&str, &str)] = &[
+        (
+            "SELECT count(*) FROM t WHERE generate_series(1, 2) > 0",
+            "set-returning functions are not allowed in WHERE",
+        ),
+        (
+            "SELECT id FROM t GROUP BY id HAVING generate_series(1,2) > 0",
+            "set-returning functions are not allowed in HAVING",
+        ),
+        (
+            "SELECT CASE WHEN true THEN generate_series(1, 3) END",
+            "set-returning functions are not allowed in CASE",
+        ),
+        (
+            "SELECT COALESCE(generate_series(1, 3), 0)",
+            "set-returning functions are not allowed in COALESCE",
+        ),
+        (
+            "SELECT sum(generate_series(1, 3))",
+            "aggregate function calls cannot contain set-returning function calls",
+        ),
+        (
+            "SELECT lag(generate_series(1,2)) OVER ()",
+            "window function calls cannot contain set-returning function calls",
+        ),
+        (
+            "SELECT count(*) FILTER (WHERE generate_series(1,2) > 0) FROM t",
+            "set-returning functions are not allowed in FILTER",
+        ),
+        (
+            "SELECT * FROM t JOIN t t2 ON generate_series(1,2) = 1",
+            "set-returning functions are not allowed in JOIN conditions",
+        ),
+        (
+            "SELECT * FROM t LIMIT generate_series(1,2)",
+            "set-returning functions are not allowed in LIMIT",
+        ),
+        (
+            "VALUES (generate_series(1,2)), (1)",
+            "set-returning functions are not allowed in VALUES",
+        ),
+        (
+            "UPDATE n SET x = generate_series(1,2)",
+            "set-returning functions are not allowed in UPDATE",
+        ),
+        (
+            "DELETE FROM t WHERE generate_series(1,2) = 1",
+            "set-returning functions are not allowed in WHERE",
+        ),
+        (
+            "SELECT * FROM generate_series(1, generate_series(1,2))",
+            "set-returning functions must appear at top level of FROM",
+        ),
+    ];
+    for (sql, msg) in cases {
+        let err = db.analyze(sql).unwrap_err();
+        assert!(
+            matches!(err, AnalyzeError::FeatureNotSupported(_)),
+            "{sql}: {err:?}"
+        );
+        assert!(err.to_string().starts_with(msg), "{sql}: {err}");
+    }
+    for sql in [
+        "SELECT row_number() OVER (PARTITION BY generate_series(1,2))",
+        "SELECT id FROM t GROUP BY generate_series(1,2), id",
+        "INSERT INTO n VALUES (generate_series(1,2), 1)",
+        "SELECT generate_series(1, generate_series(1, 2))",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}

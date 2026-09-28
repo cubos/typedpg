@@ -189,6 +189,7 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
             params,
             crate::clause::ClauseKind::Where,
         )?;
+        check_no_srf_in_clause(where_clause, snapshot, "WHERE")?;
     }
 
     // Collect select-list aliases so GROUP BY / ORDER BY can fall back to
@@ -230,6 +231,7 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
             params,
             crate::clause::ClauseKind::Having,
         )?;
+        check_no_srf_in_clause(having, snapshot, "HAVING")?;
     }
 
     // Process ORDER BY expressions. Sort items are wrapped in `SortBy` nodes
@@ -343,6 +345,19 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
     // In a grouped query, every projected/HAVING/ORDER BY column must be
     // grouped or aggregated (PG SQLSTATE 42803). Checked after the target list
     // so undefined-column errors surface first, matching PG's order.
+    // CASE / COALESCE / aggregate and window arguments may not contain
+    // set-returning functions anywhere in this level.
+    for n in sel
+        .target_list
+        .iter()
+        .chain(sel.where_clause.as_deref())
+        .chain(sel.having_clause.as_deref())
+        .chain(sel.sort_clause.iter())
+        .chain(sel.group_clause.iter())
+    {
+        check_srf_nesting(n, snapshot)?;
+    }
+
     crate::grouping::check_grouping(sel, &scope, snapshot)?;
 
     check_order_by_using(
@@ -811,6 +826,7 @@ pub(crate) fn analyze_limit_offset(
             continue;
         };
         crate::clause::coerce_clause_expr(limit_node, ctx, params, kind)?;
+        check_no_srf_in_clause(limit_node, ctx.snapshot, label)?;
         let mut var: Option<i32> = None;
         visit_same_level(limit_node, &mut |e| {
             if var.is_none()

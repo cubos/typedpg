@@ -387,6 +387,7 @@ pub(crate) fn analyze_set_clause(
                     None => goal,
                 };
                 target.infer_value(val, goal, ctx, params)?;
+                check_no_srf_in_clause(val, snapshot, "UPDATE")?;
                 if let Some(node::Node::ParamRef(p)) = val.node.as_ref()
                     && (!tc.attnotnull || target.indirected)
                 {

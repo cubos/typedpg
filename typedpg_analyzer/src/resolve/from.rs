@@ -452,6 +452,7 @@ fn process_join_expr(
             params,
             crate::clause::ClauseKind::JoinOn,
         )?;
+        check_no_srf_in_clause(quals, snapshot, "JOIN conditions")?;
     }
 
     // `JOIN … USING (cols)` / `NATURAL JOIN` merge the join columns: the
@@ -829,6 +830,21 @@ fn function_rte_columns(
         }
     };
     let (arg_types, arg_nullable) = infer_srf_arg_types(rf, func_call, arg_ctx, params)?;
+    // nodeFunctionscan.c evaluates only the top-level call as a set.
+    if func_call
+        .args
+        .iter()
+        .any(|a| count_srf_calls(std::slice::from_ref(a), snapshot) > 0)
+    {
+        return Err(crate::error::RawError::new(
+            AnalyzeError::FeatureNotSupported(
+                "set-returning functions must appear at top level of FROM".into(),
+            ),
+            None,
+            None,
+        )
+        .finalize_implicit());
+    }
     let any_arg_nullable = arg_nullable.iter().any(|&n| n);
 
     let resolved = functions::resolve_function(
