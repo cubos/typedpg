@@ -176,6 +176,21 @@ pub(crate) fn analyze_cte(
                 })
                 .collect())
         }
+        node::Node::MergeStmt(merge) => {
+            let (cols, _) = analyze_merge_with_outer_ctes(merge, snapshot, params, existing_ctes)?;
+            Ok(cols
+                .into_iter()
+                .map(|rc| ScopeColumn {
+                    name: rc.name,
+                    type_oid: rc.type_oid,
+                    base_not_null: !rc.nullable,
+                    table_alias: cte.ctename.clone(),
+                    typmod: rc.typmod,
+                    collation: rc.collation,
+                    record_fields: rc.record_fields,
+                })
+                .collect())
+        }
         _ => Err(AnalyzeError::Unsupported(
             "CTE with unsupported statement type".into(),
         )),

@@ -1,13 +1,56 @@
+use std::cell::Cell;
+
 use super::*;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // MERGE (PG 15+)
 // ──────────────────────────────────────────────────────────────────────────────
 
+thread_local! {
+    /// Depth of MERGE RETURNING lists currently being analyzed. PG's
+    /// `transformMergeSupportFunc` accepts `merge_action()` when the current
+    /// parse state — or any parent, so sublinks count — is
+    /// `EXPR_KIND_MERGE_RETURNING`; this is that dynamic extent.
+    static MERGE_RETURNING_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+/// `merge_action()` (PG 17): `text NOT NULL` inside a MERGE RETURNING list
+/// (directly or in a sublink there), 42601 everywhere else.
+pub(crate) fn infer_merge_support_func(
+    f: &protobuf::MergeSupportFunc,
+) -> Result<expr::ExprType, AnalyzeError> {
+    if MERGE_RETURNING_DEPTH.with(Cell::get) == 0 {
+        return Err(crate::error::RawError::new(
+            AnalyzeError::SyntaxError(
+                "MERGE_ACTION() can only be used in the RETURNING list of a MERGE command".into(),
+            ),
+            crate::error::SourceSpan::from_node_qname(f.location),
+            None,
+        )
+        .finalize_implicit());
+    }
+    Ok(expr::ExprType::scalar(oid::TEXT, false))
+}
+
 pub(crate) fn analyze_merge(
     merge: &protobuf::MergeStmt,
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
+) -> AnalyzeResult {
+    analyze_merge_with_outer_ctes(merge, snapshot, params, &HashMap::new())
+}
+
+/// MERGE, mirroring `transformMergeStmt` (parse_merge.c): the source is a
+/// FROM item joined to the target; the ON condition sees both; each WHEN
+/// clause sees only the relations `setNamespaceForMergeWhen` leaves visible
+/// (MATCHED: both; NOT MATCHED [BY TARGET]: the source; NOT MATCHED BY
+/// SOURCE: the target), and RETURNING (PG 17) sees both — source first, as
+/// in `*` expansion.
+pub(crate) fn analyze_merge_with_outer_ctes(
+    merge: &protobuf::MergeStmt,
+    snapshot: &PgCatalog,
+    params: &mut ParamCollector,
+    outer_ctes: &HashMap<String, Vec<ScopeColumn>>,
 ) -> AnalyzeResult {
     let relation = merge
         .relation
@@ -53,7 +96,7 @@ pub(crate) fn analyze_merge(
 
     // Process the optional `WITH` clause first (CTEs visible to source +
     // ON + every WHEN branch).
-    let mut cte_scopes: HashMap<String, Vec<ScopeColumn>> = HashMap::new();
+    let mut cte_scopes: HashMap<String, Vec<ScopeColumn>> = outer_ctes.clone();
     if let Some(with) = &merge.with_clause {
         for cte_node in &with.ctes {
             if let Some(node::Node::CommonTableExpr(cte)) = cte_node.node.as_ref() {
@@ -63,19 +106,15 @@ pub(crate) fn analyze_merge(
         }
     }
 
-    // Build the scope shared by `ON`, every `WHEN ... THEN` action, and the
-    // `RETURNING` list: target table on the left, source on the right (so
-    // the source side is on the nullable arm of an outer-style join in
-    // `WHEN NOT MATCHED` rows, but PG handles that NULL semantically — we
-    // just need both visible for type/parameter inference).
-    let mut scope = Scope::default();
-    scope.add_dml_target(snapshot, &target_alias, target_qn.clone(), &table_attrs);
-
+    // The target alone, and the source's FROM item alone.
+    let mut target_scope = Scope::default();
+    target_scope.add_dml_target(snapshot, &target_alias, target_qn.clone(), &table_attrs);
+    let mut source_scope = Scope::default();
     let mut null_ctx = NullabilityContext::default();
     if let Some(source_relation) = &merge.source_relation {
         process_from_item(
             source_relation,
-            &mut scope,
+            &mut source_scope,
             &mut null_ctx,
             snapshot,
             &cte_scopes,
@@ -83,20 +122,47 @@ pub(crate) fn analyze_merge(
         )?;
     }
 
+    // Both relations: the ON condition and WHEN MATCHED arms.
+    let mut both = source_scope.clone();
+    both.sources.extend(target_scope.sources.iter().cloned());
+    // Each one-sided arm keeps the other relation as a shadowed entry, so a
+    // qualified reference to it reports PG's `invalid reference to
+    // FROM-clause entry for table "x"`.
+    let mut target_only = target_scope.clone();
+    target_only
+        .shadowed_sources
+        .extend(source_scope.sources.iter().cloned());
+    let mut source_only = source_scope.clone();
+    source_only
+        .shadowed_sources
+        .extend(target_scope.sources.iter().cloned());
+
     if let Some(join_condition) = &merge.join_condition {
         expr::infer_expr(
             join_condition,
-            expr::Ctx::new(&scope, &null_ctx, snapshot),
+            expr::Ctx::new(&both, &null_ctx, snapshot),
             params,
             TypeGoal::assignment(oid::BOOL),
         )?;
     }
 
+    let mut source_may_be_null = false;
     for when_node in &merge.merge_when_clauses {
         if let Some(node::Node::MergeWhenClause(when)) = when_node.node.as_ref() {
+            let when_scope = match protobuf::MergeMatchKind::try_from(when.match_kind) {
+                Ok(protobuf::MergeMatchKind::MergeWhenNotMatchedBySource) => {
+                    // Rows of the target without a source match: the source
+                    // side is NULL wherever such an action returns a row.
+                    source_may_be_null |= CmdType::try_from(when.command_type)
+                        .is_ok_and(|c| c != CmdType::CmdNothing);
+                    &target_only
+                }
+                Ok(protobuf::MergeMatchKind::MergeWhenNotMatchedByTarget) => &source_only,
+                _ => &both,
+            };
             walk_merge_when_clause(
                 when,
-                expr::Ctx::new(&scope, &null_ctx, snapshot),
+                expr::Ctx::new(when_scope, &null_ctx, snapshot),
                 params,
                 &table_attrs,
                 &table_relname,
@@ -104,19 +170,21 @@ pub(crate) fn analyze_merge(
         }
     }
 
-    // RETURNING (PG 17+) sees the target table only — `merge_action()` and
-    // source columns are also visible at runtime, but NULL-vs-not depends
-    // on which branch fired. Following the existing UPDATE/DELETE style,
-    // we project against the target with its base nullability.
-    let mut ret_scope = Scope::default();
-    ret_scope.add_dml_target(snapshot, &target_alias, target_qn, &table_attrs);
-    let ret_null_ctx = NullabilityContext::default();
+    // RETURNING sees the source and the target. The target columns are the
+    // inserted / updated / deleted row, so they keep their base
+    // nullability; the source is NULL for NOT MATCHED BY SOURCE actions.
+    let mut ret_null_ctx = null_ctx.clone();
+    if source_may_be_null {
+        ret_null_ctx.mark_all_nullable(&nullability::collect_aliases(&source_scope.sources));
+    }
+    MERGE_RETURNING_DEPTH.with(|d| d.set(d.get() + 1));
     let columns = resolve_target_list(
         &merge.returning_list,
-        expr::Ctx::new(&ret_scope, &ret_null_ctx, snapshot),
+        expr::Ctx::new(&both, &ret_null_ctx, snapshot),
         params,
-    )?;
-    Ok((columns, None))
+    );
+    MERGE_RETURNING_DEPTH.with(|d| d.set(d.get() - 1));
+    Ok((columns?, None))
 }
 
 fn walk_merge_when_clause(

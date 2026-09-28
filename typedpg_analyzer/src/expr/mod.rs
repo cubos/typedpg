@@ -753,6 +753,7 @@ pub(crate) fn infer_expr(
             let nullable = op == Op::SvfopCurrentSchema;
             Ok(ExprType::scalar_with_typmod(type_oid, nullable, typmod))
         }
+        node::Node::MergeSupportFunc(f) => crate::resolve::infer_merge_support_func(f),
         _ => Err(AnalyzeError::Unsupported(format!(
             "expression node type not supported: {:?}",
             std::mem::discriminant(inner)

@@ -360,6 +360,7 @@ fn figure_colname(node: &protobuf::Node) -> (i32, Option<String>) {
         // T_A_ArrayExpr arm).
         node::Node::AArrayExpr(_) => (2, Some("array".to_string())),
         node::Node::RowExpr(_) => (2, Some("row".to_string())),
+        node::Node::MergeSupportFunc(_) => (2, Some("merge_action".to_string())),
         // SQL value functions are named after the keyword spelling (PG's
         // FigureColname): `SELECT current_date` → column `current_date`.
         node::Node::SqlvalueFunction(svf) => {
