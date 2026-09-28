@@ -315,6 +315,13 @@ pub(crate) fn check_grouping(
             nodes.push(inner);
         }
     }
+    // Named windows: PG adds their PARTITION BY / ORDER BY expressions to
+    // the target list as resjunk entries, so they are checked too.
+    for w in &sel.window_clause {
+        if let Some(node::Node::WindowDef(wd)) = w.node.as_ref() {
+            nodes.extend(window_def_exprs(wd));
+        }
+    }
     for node in nodes {
         if let Some((alias, col, location)) = find_ungrouped(
             node,
@@ -403,11 +410,26 @@ fn column_ref_parts(cr: &protobuf::ColumnRef) -> Option<(Option<&str>, &str)> {
     }
 }
 
-/// Whether a `FuncCall` is an aggregate or a window call — its argument
+/// The PARTITION BY and ORDER BY expressions of a window definition.
+fn window_def_exprs(wd: &protobuf::WindowDef) -> impl Iterator<Item = &protobuf::Node> {
+    wd.partition_clause.iter().chain(
+        wd.order_clause
+            .iter()
+            .filter_map(|o| match o.node.as_ref() {
+                Some(node::Node::SortBy(sb)) => sb.node.as_deref(),
+                _ => None,
+            }),
+    )
+}
+
+/// Whether a `FuncCall` without `OVER` is an aggregate — its argument
 /// columns don't need to be grouped, so the grouping walk skips it entirely.
-fn is_aggregate_or_window(fc: &protobuf::FuncCall, snapshot: &PgCatalog) -> bool {
+/// A window call is *not* skipped: it runs over the grouped rows, so its
+/// arguments, FILTER and window clauses are checked like any expression
+/// (PG's `check_ungrouped_columns_walker` only stops at an `Aggref`).
+fn is_plain_aggregate(fc: &protobuf::FuncCall, snapshot: &PgCatalog) -> bool {
     if fc.over.is_some() {
-        return true;
+        return false;
     }
     let parts = expr::extract_string_fields(&fc.funcname);
     let (schema, name) = match parts.as_slice() {
@@ -446,11 +468,14 @@ fn find_ungrouped(
             }
         }
         node::Node::FuncCall(fc) => {
-            if is_aggregate_or_window(fc, snapshot) {
+            if is_plain_aggregate(fc, snapshot) {
                 return None;
             }
+            let window = fc.over.as_deref().into_iter().flat_map(window_def_exprs);
             fc.args
                 .iter()
+                .chain(fc.agg_filter.as_deref())
+                .chain(window)
                 .find_map(|a| find_ungrouped(a, scope, snapshot, grouped, local, fully_grouped))
         }
         node::Node::AExpr(e) => e

@@ -88,7 +88,9 @@ pub(crate) fn infer_func_call(
         .finalize_implicit());
     }
 
-    if resolved.is_aggregate {
+    if func.over.is_some() {
+        check_no_nested_windows(func, snapshot)?;
+    } else if resolved.is_aggregate {
         check_no_nested_aggregates(func, snapshot)?;
     }
 
@@ -241,6 +243,25 @@ fn collect_arg_types(
         any_nullable,
         direct_count,
     })
+}
+
+/// A window function's arguments may hold aggregates — `sum(sum(x)) OVER
+/// (…)` aggregates the grouped rows first — but not another window
+/// function (PG's `transformWindowFuncCall`, SQLSTATE 42P20).
+fn check_no_nested_windows(
+    func: &protobuf::FuncCall,
+    snapshot: &PgCatalog,
+) -> Result<(), AnalyzeError> {
+    if func
+        .args
+        .iter()
+        .any(|arg| detect_func_kinds(arg, snapshot).has_window)
+    {
+        return Err(AnalyzeError::WindowingError(
+            "window function calls cannot be nested".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// PG forbids aggregates / window functions nested inside aggregate arguments

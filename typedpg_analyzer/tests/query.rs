@@ -68,5 +68,7 @@ mod grouping_sets;
 mod json_operators;
 #[path = "query/recursive_ctes.rs"]
 mod recursive_ctes;
+#[path = "query/window_calls.rs"]
+mod window_calls;
 #[path = "query/window_functions.rs"]
 mod window_functions;
