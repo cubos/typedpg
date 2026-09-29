@@ -232,6 +232,7 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
 
         // ── Session state (search_path) ─────────────────────────────
         node::Node::VariableSetStmt(s) => session::variable_set(db, s),
+        node::Node::AlterDatabaseSetStmt(s) => session::alter_database_set(db, s),
         node::Node::TransactionStmt(s) => session::transaction(db, s),
         node::Node::SelectStmt(s) if s.into_clause.is_some() => views::select_into(db, s),
         node::Node::SelectStmt(s) => {
@@ -319,7 +320,6 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         | node::Node::CheckPointStmt(_)
         | node::Node::LoadStmt(_)
         | node::Node::AlterDatabaseStmt(_)
-        | node::Node::AlterDatabaseSetStmt(_)
         | node::Node::AlterDatabaseRefreshCollStmt(_)
         | node::Node::AlterRoleSetStmt(_)
         | node::Node::AlterSystemStmt(_)

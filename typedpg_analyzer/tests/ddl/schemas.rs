@@ -398,3 +398,80 @@ fn a_migration_session_search_path_does_not_reach_the_queries() {
         "{err}"
     );
 }
+
+#[test]
+fn alter_database_set_search_path_reaches_the_queries() {
+    // ALTER DATABASE ... SET is the setting of the database's new sessions:
+    // the application's, not the migrations' session running it. The
+    // database name can't be checked (nor matched against the oracle's
+    // scratch database), so any name is taken as the application's.
+    let apply = |sql: &str| {
+        let mut db = PgCatalog::new().unwrap();
+        db.skip_pg_sanity();
+        db.apply_sql(sql).map(|()| db)
+    };
+    let db = apply(
+        "CREATE SCHEMA app;
+         CREATE TABLE app.t (a int);
+         ALTER DATABASE appdb SET search_path = app, public;
+         CREATE TABLE u (x int);",
+    )
+    .unwrap();
+    assert!(db.analyze("SELECT a FROM t").is_ok());
+    // The migrations' session kept its own setting: u went to public.
+    assert!(db.analyze("SELECT x FROM public.u").is_ok());
+    assert!(db.analyze("SELECT x FROM app.u").is_err());
+
+    // It survives a seed round trip.
+    let seed = db.to_seed();
+    assert_eq!(seed.search_path, "\"app\", \"public\"");
+    assert!(
+        PgCatalog::from_seed(seed)
+            .analyze("SELECT a FROM t")
+            .is_ok()
+    );
+
+    // FROM CURRENT takes the session's value; RESET drops the setting.
+    let db = apply(
+        "CREATE SCHEMA app;
+         CREATE TABLE app.t (a int);
+         SET search_path = app;
+         ALTER DATABASE appdb SET search_path FROM CURRENT;
+         RESET search_path;",
+    )
+    .unwrap();
+    assert!(db.analyze("SELECT a FROM t").is_ok());
+    for reset in [
+        "ALTER DATABASE appdb RESET search_path;",
+        "ALTER DATABASE appdb RESET ALL;",
+        "ALTER DATABASE appdb SET search_path TO DEFAULT;",
+    ] {
+        let db = apply(&format!(
+            "CREATE SCHEMA app;
+             CREATE TABLE app.t (a int);
+             ALTER DATABASE appdb SET search_path = app;
+             {reset}"
+        ))
+        .unwrap();
+        let err = db.analyze("SELECT a FROM t").unwrap_err();
+        assert!(
+            err.to_string().starts_with("relation \"t\" does not exist"),
+            "{reset}: {err}"
+        );
+    }
+
+    // Parameters are checked as for SET.
+    for (sql, message) in [
+        (
+            "ALTER DATABASE appdb SET nosuch = 1;",
+            "unrecognized configuration parameter \"nosuch\"",
+        ),
+        (
+            "ALTER DATABASE appdb SET work_mem = 'lots';",
+            "invalid value for parameter \"work_mem\": \"lots\"",
+        ),
+    ] {
+        let err = apply(sql).err().expect(sql);
+        assert!(err.to_string().starts_with(message), "{sql}\n  got: {err}");
+    }
+}

@@ -113,6 +113,9 @@ pub(crate) struct SearchPathGuc {
     session: Option<Vec<String>>,
     /// Value set by `SET LOCAL search_path` / `set_config(..., true)`.
     local: Option<Vec<String>>,
+    /// Value `ALTER DATABASE ... SET search_path` gave the database's new
+    /// sessions — the application's, not the migrations' own session.
+    database: Option<Vec<String>>,
 }
 
 impl SearchPathGuc {
@@ -123,11 +126,25 @@ impl SearchPathGuc {
             default: split_identifier_string(setting),
             session: None,
             local: None,
+            database: None,
         }
     }
 
-    pub(crate) fn default_setting(&self) -> &str {
-        &self.default_setting
+    /// The setting a new session of the database starts with, as text
+    /// [`Self::with_default`] reads back.
+    pub(crate) fn new_session_setting(&self) -> String {
+        match &self.database {
+            None => self.default_setting.clone(),
+            Some(names) => names
+                .iter()
+                .map(|n| format!("\"{}\"", n.replace('"', "\"\"")))
+                .collect::<Vec<_>>()
+                .join(", "),
+        }
+    }
+
+    fn new_session(&self) -> &[String] {
+        self.database.as_deref().unwrap_or(&self.default)
     }
 
     fn effective(&self) -> &[String] {
@@ -143,15 +160,16 @@ impl PgCatalog {
     /// entry naming an existing schema, in order, without duplicates.
     /// `$user` and `pg_temp` never name a schema the analyzer models.
     ///
-    /// Outside the migrations the setting is the server's: the
-    /// application's queries run in sessions of their own, which a
-    /// migration's `SET search_path` doesn't reach.
+    /// Outside the migrations the setting is a new session's — the server's,
+    /// or the database's (`ALTER DATABASE ... SET`): the application's
+    /// queries run in sessions of their own, which a migration's `SET
+    /// search_path` doesn't reach.
     pub(crate) fn refresh_search_path(&mut self) {
         let mut resolved = Vec::new();
         let setting = if self.in_migration {
             self.search_path_guc.effective()
         } else {
-            &self.search_path_guc.default
+            self.search_path_guc.new_session()
         };
         for name in setting {
             // `$user` is the schema named after current_user — known only
@@ -318,21 +336,9 @@ pub(crate) fn variable_set(interp: &mut PgCatalog, stmt: &VariableSetStmt) -> Re
     }
     match kind {
         VariableSetKind::VarSetValue => {
-            // Each argument is one schema name: the grammar hands identifiers
-            // and string literals over alike, and `flatten_set_variable_args`
-            // quotes every one of them (search_path is GUC_LIST_QUOTE), so
-            // `SET search_path = 'a, b'` names a single schema `a, b`.
-            let mut names = Vec::new();
-            for arg in &stmt.args {
-                match arg.node.as_ref() {
-                    Some(node::Node::AConst(c)) => match c.val.as_ref() {
-                        Some(a_const::Val::Sval(s)) => names.push(s.sval.clone()),
-                        _ => return Ok(()),
-                    },
-                    _ => return Ok(()),
-                }
+            if let Some(names) = search_path_args(stmt) {
+                interp.set_search_path(Some(names), stmt.is_local);
             }
-            interp.set_search_path(Some(names), stmt.is_local);
         }
         VariableSetKind::VarSetDefault | VariableSetKind::VarReset => {
             interp.set_search_path(None, stmt.is_local);
@@ -340,6 +346,66 @@ pub(crate) fn variable_set(interp: &mut PgCatalog, stmt: &VariableSetStmt) -> Re
         _ => {}
     }
     Ok(())
+}
+
+/// `ALTER DATABASE name SET / RESET ...`: a setting for the database's new
+/// sessions (pg_db_role_setting). The analyzer can't tell which database
+/// the application connects to, so any name is taken as the migrations'
+/// own — the one the application uses. Only `search_path` matters.
+pub(crate) fn alter_database_set(
+    interp: &mut PgCatalog,
+    stmt: &typedpg_pg_query::protobuf::AlterDatabaseSetStmt,
+) -> Result<(), DdlError> {
+    let Some(set) = stmt.setstmt.as_ref() else {
+        return Ok(());
+    };
+    let kind = VariableSetKind::try_from(set.kind).unwrap_or(VariableSetKind::Undefined);
+    if kind == VariableSetKind::VarResetAll {
+        interp.search_path_guc.database = None;
+        interp.refresh_search_path();
+        return Ok(());
+    }
+    // The parameter must exist and be settable, and a new value valid, as
+    // for SET.
+    if let Some(setting) = super::guc::check_settable(interp, &set.name)?.cloned()
+        && kind == VariableSetKind::VarSetValue
+        && let [arg] = set.args.as_slice()
+        && let Some(value) = const_arg_string(arg)
+    {
+        super::guc::check_value(interp, &setting, &value)?;
+    }
+    if !set.name.eq_ignore_ascii_case("search_path") {
+        return Ok(());
+    }
+    interp.search_path_guc.database = match kind {
+        VariableSetKind::VarSetValue => match search_path_args(set) {
+            Some(names) => Some(names),
+            None => return Ok(()),
+        },
+        // FROM CURRENT: the session's value now.
+        VariableSetKind::VarSetCurrent => Some(interp.search_path_guc.effective().to_vec()),
+        _ => None,
+    };
+    interp.refresh_search_path();
+    Ok(())
+}
+
+/// The schema names of `SET search_path = ...`, when all are constants.
+fn search_path_args(stmt: &VariableSetStmt) -> Option<Vec<String>> {
+    // Each argument is one schema name: the grammar hands identifiers and
+    // string literals over alike, and `flatten_set_variable_args` quotes
+    // every one of them (search_path is GUC_LIST_QUOTE), so `SET
+    // search_path = 'a, b'` names a single schema `a, b`.
+    stmt.args
+        .iter()
+        .map(|arg| match arg.node.as_ref() {
+            Some(node::Node::AConst(c)) => match c.val.as_ref() {
+                Some(a_const::Val::Sval(s)) => Some(s.sval.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
 }
 
 /// `COMMIT` / `ROLLBACK` (and their prepared / savepoint-less variants) end

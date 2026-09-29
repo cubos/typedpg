@@ -716,7 +716,7 @@ impl PgCatalog {
             pg_index,
             pg_rewrite,
             pg_collation,
-            search_path: self.search_path_guc.default_setting().to_owned(),
+            search_path: self.search_path_guc.new_session_setting(),
             pg_am: self.pg_am.clone(),
             pg_opfamily: self.pg_opfamily.clone(),
             pg_opclass: self.pg_opclass.clone(),
