@@ -10,7 +10,7 @@ use typedpg_pg_query::protobuf::{AlterObjectSchemaStmt, ObjectType, RenameStmt, 
 use super::DdlError;
 use super::util::{node_string, resolve_type_name};
 use super::views;
-use crate::oid::{PgNamespaceOid, PgProcOid, PgTypeOid};
+use crate::oid::{PgClassOid, PgNamespaceOid, PgProcOid, PgTypeOid};
 use crate::pg_catalog::{PgCatalog, PgProc, ProKind};
 use crate::qualified_name::QualifiedName;
 
@@ -206,6 +206,12 @@ fn rename_relation(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlE
         Err(_) if stmt.missing_ok => return Ok(()),
         Err(e) => return Err(e),
     };
+    check_alter_relation_kind(
+        interp,
+        class_oid,
+        ObjectType::try_from(stmt.rename_type).unwrap_or(ObjectType::Undefined),
+        false,
+    )?;
 
     let old_name = rv.relname.clone();
     let new_name = stmt.newname.clone();
@@ -468,14 +474,20 @@ fn rename_schema(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlErr
 pub fn set_schema(interp: &mut PgCatalog, stmt: &AlterObjectSchemaStmt) -> Result<(), DdlError> {
     let object_type = ObjectType::try_from(stmt.object_type).unwrap_or(ObjectType::Undefined);
     let new_schema = stmt.newschema.clone();
+    // AlterTableNamespace looks the relation up before the new schema.
+    if matches!(
+        object_type,
+        ObjectType::ObjectTable
+            | ObjectType::ObjectView
+            | ObjectType::ObjectMatview
+            | ObjectType::ObjectForeignTable
+            | ObjectType::ObjectSequence
+    ) {
+        return set_relation_schema(interp, stmt, object_type, &new_schema);
+    }
     let new_nsoid = crate::ddl::util::existing_namespace(interp, &new_schema)?;
 
     match object_type {
-        ObjectType::ObjectTable
-        | ObjectType::ObjectView
-        | ObjectType::ObjectMatview
-        | ObjectType::ObjectForeignTable
-        | ObjectType::ObjectSequence => set_relation_schema(interp, stmt, new_nsoid, &new_schema),
         ObjectType::ObjectFunction | ObjectType::ObjectProcedure | ObjectType::ObjectAggregate => {
             set_function_like_schema(interp, stmt, new_nsoid, object_type)
         }
@@ -493,45 +505,186 @@ pub fn set_schema(interp: &mut PgCatalog, stmt: &AlterObjectSchemaStmt) -> Resul
     }
 }
 
+/// RangeVarCallbackForAlterRelation (tablecmds.c): the relation kinds an
+/// `ALTER {TABLE | VIEW | ...}` may name, and those SET SCHEMA can't move
+/// on their own.
+fn check_alter_relation_kind(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+    object_type: ObjectType,
+    set_schema: bool,
+) -> Result<(), DdlError> {
+    use crate::pg_catalog::RelKind;
+    let Some(class) = interp.pg_class.get(&relid) else {
+        return Ok(());
+    };
+    let name = &class.relname;
+    let wrong = |what: &str| Err(DdlError::Parse(format!("\"{name}\" is not {what}")));
+    match (object_type, class.relkind) {
+        (ObjectType::ObjectSequence, k) if k != RelKind::Sequence => return wrong("a sequence"),
+        (ObjectType::ObjectView, k) if k != RelKind::View => return wrong("a view"),
+        (ObjectType::ObjectMatview, k) if k != RelKind::MaterializedView => {
+            return wrong("a materialized view");
+        }
+        (ObjectType::ObjectForeignTable, k) if k != RelKind::ForeignTable => {
+            return wrong("a foreign table");
+        }
+        (_, RelKind::CompositeType) => {
+            return Err(DdlError::Parse(format!(
+                "\"{name}\" is a composite type (Use ALTER TYPE instead.)"
+            )));
+        }
+        (_, RelKind::Index | RelKind::PartitionedIndex) if set_schema => {
+            return Err(DdlError::Parse(format!(
+                "cannot change schema of index \"{name}\" (Change the schema of the table \
+                 instead.)"
+            )));
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// sequenceIsOwned: the table whose column owns sequence `seq` (an auto or
+/// internal dependency on the column: serial, identity, OWNED BY).
+fn sequence_owner(interp: &PgCatalog, seq: PgClassOid) -> Option<PgClassOid> {
+    use crate::pg_catalog::{DepType, PG_CLASS_RELID};
+    let seq_obj = crate::oid::PgGenericOid::from_nonzero(seq.into_nonzero());
+    interp
+        .iter_pg_depend()
+        .find(|d| {
+            d.classid == PG_CLASS_RELID
+                && d.objid == seq_obj
+                && d.objsubid == 0
+                && d.refclassid == PG_CLASS_RELID
+                && d.refobjsubid > 0
+                && matches!(d.deptype, DepType::Auto | DepType::Internal)
+        })
+        .and_then(|d| PgClassOid::new(d.refobjid.get()))
+}
+
+/// `ALTER TABLE ... SET SCHEMA` (AlterTableNamespace): the relation, its
+/// row type, its indexes and the sequences it owns move to the schema,
+/// whose names they may not clash with there. An owned sequence doesn't
+/// move by itself, and nothing moves in to or out of the temporary or
+/// TOAST schema.
 fn set_relation_schema(
     interp: &mut PgCatalog,
     stmt: &AlterObjectSchemaStmt,
-    new_nsoid: PgNamespaceOid,
+    object_type: ObjectType,
     new_schema: &str,
 ) -> Result<(), DdlError> {
     let Some(rv) = stmt.relation.as_ref() else {
         return Ok(());
     };
-    let old_schema = crate::ddl::util::range_var_names(rv, interp).0;
-    let Some(old_nsoid) = interp.namespace_oid(&old_schema) else {
-        if stmt.missing_ok {
-            return Ok(());
-        }
-        return Err(DdlError::TableNotFound(
-            QualifiedName::new(&old_schema, &rv.relname).to_string(),
-        ));
+    let (old_nsoid, class_oid) = match crate::ddl::util::lookup_relation(interp, rv) {
+        Ok(found) => found,
+        Err(_) if stmt.missing_ok => return Ok(()),
+        Err(e) => return Err(e),
     };
-    let Some(class_oid) = interp
-        .class_by_qname
-        .get(&(old_nsoid, rv.relname.clone()))
-        .copied()
-    else {
-        if stmt.missing_ok {
-            return Ok(());
-        }
-        return Err(DdlError::TableNotFound(
-            QualifiedName::new(&old_schema, &rv.relname).to_string(),
-        ));
+    check_alter_relation_kind(interp, class_oid, object_type, true)?;
+    let Some(class) = interp.pg_class.get(&class_oid).cloned() else {
+        return Ok(());
     };
+    if class.relkind == crate::pg_catalog::RelKind::Sequence
+        && let Some(table) = sequence_owner(interp, class_oid)
+    {
+        return Err(DdlError::UnsupportedDdl(format!(
+            "cannot move an owned sequence into another schema (Sequence \"{}\" is linked to \
+             table \"{}\".)",
+            class.relname,
+            interp
+                .pg_class
+                .get(&table)
+                .map(|c| c.relname.as_str())
+                .unwrap_or("?")
+        )));
+    }
+    // RangeVarGetAndCheckCreationNamespace, then CheckSetNamespace.
+    let temp_target = new_schema == "pg_temp";
+    let new_nsoid = if temp_target {
+        None
+    } else {
+        Some(crate::ddl::util::existing_namespace(interp, new_schema)?)
+    };
+    if temp_target
+        || interp.temp_namespace == Some(old_nsoid)
+        || (new_nsoid.is_some() && new_nsoid == interp.temp_namespace)
+    {
+        return Err(DdlError::Parse(
+            "cannot move objects into or out of temporary schemas".into(),
+        ));
+    }
+    let Some(new_nsoid) = new_nsoid else {
+        return Ok(());
+    };
+    let old_schema = interp.namespace_name(old_nsoid).unwrap_or_default().to_owned();
+    if new_schema == "pg_toast" || old_schema == "pg_toast" {
+        return Err(DdlError::Parse(
+            "cannot move objects into or out of TOAST schema".into(),
+        ));
+    }
+    if new_nsoid == old_nsoid {
+        return Ok(());
+    }
 
-    let name = rv.relname.clone();
+    // AlterTableNamespaceInternal: the relation, its row type (and its
+    // array), its indexes, its sequences — each name must be free there.
+    let mut indexes: Vec<PgClassOid> = interp
+        .pg_index
+        .values()
+        .filter(|i| i.indrelid == class_oid)
+        .map(|i| i.indexrelid)
+        .collect();
+    indexes.sort();
+    let sequences = crate::ddl::sequences::owned_sequences(interp, class_oid, None);
+    let relation_taken = |interp: &PgCatalog, relid: PgClassOid| -> Result<(), DdlError> {
+        let Some(c) = interp.pg_class.get(&relid) else {
+            return Ok(());
+        };
+        if interp
+            .class_by_qname
+            .contains_key(&(new_nsoid, c.relname.clone()))
+        {
+            return Err(DdlError::DuplicateObject(format!(
+                "relation \"{}\" already exists in schema \"{new_schema}\"",
+                c.relname
+            )));
+        }
+        Ok(())
+    };
+    relation_taken(interp, class_oid)?;
+    let row_types: Vec<crate::oid::PgTypeOid> = class
+        .reltype
+        .into_iter()
+        .flat_map(|t| std::iter::once(t).chain(interp.array_type_of(t)))
+        .collect();
+    for &t in &row_types {
+        if let Some(typ) = interp.pg_type.get(&t)
+            && interp
+                .type_by_qname
+                .contains_key(&(new_nsoid, typ.typname.clone()))
+        {
+            return Err(DdlError::DuplicateObject(format!(
+                "type \"{}\" already exists in schema \"{new_schema}\"",
+                typ.typname
+            )));
+        }
+    }
+    for &rel in indexes.iter().chain(sequences.iter()) {
+        relation_taken(interp, rel)?;
+    }
+
+    let name = class.relname.clone();
     interp.rename_pg_class(class_oid, name.clone(), new_nsoid);
-
-    if let Some(&type_oid) = interp.type_by_qname.get(&(old_nsoid, name.clone())) {
-        interp.rename_pg_type(type_oid, name.clone(), new_nsoid);
-        let arr_key = format!("_{name}");
-        if let Some(&arr_oid) = interp.type_by_qname.get(&(old_nsoid, arr_key.clone())) {
-            interp.rename_pg_type(arr_oid, arr_key, new_nsoid);
+    for t in row_types {
+        if let Some(typname) = interp.pg_type.get(&t).map(|t| t.typname.clone()) {
+            interp.rename_pg_type(t, typname, new_nsoid);
+        }
+    }
+    for rel in indexes.into_iter().chain(sequences) {
+        if let Some(relname) = interp.pg_class.get(&rel).map(|c| c.relname.clone()) {
+            interp.rename_pg_class(rel, relname, new_nsoid);
         }
     }
 

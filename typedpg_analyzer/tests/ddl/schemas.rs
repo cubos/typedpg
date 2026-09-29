@@ -475,3 +475,88 @@ fn alter_database_set_search_path_reaches_the_queries() {
         assert!(err.to_string().starts_with(message), "{sql}\n  got: {err}");
     }
 }
+
+#[test]
+fn set_schema_moves_a_relation_with_its_indexes_and_sequences() {
+    // AlterTableNamespace: the names must be free in the new schema — the
+    // relation's, its row type's, its indexes' and owned sequences'; an
+    // owned sequence moves only with its table; nothing moves in to or out
+    // of the temporary or TOAST schema.
+    let setup = "CREATE SCHEMA s;
+                 CREATE TABLE s.a (x int);
+                 CREATE TABLE a (x int);
+                 CREATE TYPE s.g AS ENUM ('x');
+                 CREATE TABLE g (x int);
+                 CREATE TABLE e (x int);
+                 CREATE INDEX d_idx ON e (x);
+                 CREATE TABLE s.d_idx (x int);
+                 CREATE SEQUENCE s.fseq;
+                 CREATE TABLE f (x serial);
+                 ALTER SEQUENCE f_x_seq RENAME TO fseq;
+                 CREATE TABLE c (x serial PRIMARY KEY);
+                 CREATE TYPE ct AS (x int);
+                 CREATE TEMP TABLE tt (x int);
+                 CREATE VIEW v AS SELECT 1 AS x;";
+    for (stmt, msg) in [
+        (
+            "ALTER TABLE a SET SCHEMA s;",
+            "relation \"a\" already exists in schema \"s\"",
+        ),
+        (
+            "ALTER TABLE g SET SCHEMA s;",
+            "type \"g\" already exists in schema \"s\"",
+        ),
+        (
+            "ALTER TABLE e SET SCHEMA s;",
+            "relation \"d_idx\" already exists in schema \"s\"",
+        ),
+        (
+            "ALTER TABLE f SET SCHEMA s;",
+            "relation \"fseq\" already exists in schema \"s\"",
+        ),
+        (
+            "ALTER SEQUENCE c_x_seq SET SCHEMA s;",
+            "cannot move an owned sequence into another schema",
+        ),
+        (
+            "ALTER TABLE c_pkey SET SCHEMA s;",
+            "cannot change schema of index \"c_pkey\"",
+        ),
+        ("ALTER TABLE ct SET SCHEMA s;", "\"ct\" is a composite type"),
+        ("ALTER SEQUENCE v SET SCHEMA s;", "\"v\" is not a sequence"),
+        (
+            "ALTER TABLE tt SET SCHEMA s;",
+            "cannot move objects into or out of temporary schemas",
+        ),
+        (
+            "ALTER TABLE s.a SET SCHEMA pg_temp;",
+            "cannot move objects into or out of temporary schemas",
+        ),
+        (
+            "ALTER TABLE a SET SCHEMA pg_toast;",
+            "cannot move objects into or out of TOAST schema",
+        ),
+        (
+            "ALTER TABLE nope SET SCHEMA s;",
+            "relation \"nope\" does not exist",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    // The index and the serial's sequence went along: their names are free
+    // in public again.
+    let db = build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "ALTER TABLE IF EXISTS nope SET SCHEMA nope2;
+             ALTER TABLE a SET SCHEMA public;
+             ALTER TABLE c SET SCHEMA s;
+             CREATE TABLE c_pkey (x int);
+             CREATE SEQUENCE c_x_seq;
+             ALTER VIEW v SET SCHEMA s;",
+        ),
+    ]);
+    db.analyze("SELECT x FROM s.c").unwrap();
+}

@@ -157,3 +157,28 @@ fn renaming_an_inherited_column_follows_renameatt_internal() {
     let t4 = db.resolve_table(None, "inht4").unwrap();
     assert!(db.attributes_of(t4.oid).iter().any(|a| a.attname == "aa"));
 }
+
+#[test]
+fn rename_checks_the_relation_kind() {
+    // RangeVarCallbackForAlterRelation: ALTER VIEW / SEQUENCE name one,
+    // ALTER TABLE doesn't reach a composite type; ALTER INDEX / TABLE may
+    // rename either.
+    let setup = "CREATE TABLE b (x int);
+                 CREATE INDEX bi ON b (x);
+                 CREATE TYPE ct AS (x int);";
+    for (stmt, msg) in [
+        ("ALTER TABLE ct RENAME TO ct2;", "\"ct\" is a composite type"),
+        ("ALTER VIEW b RENAME TO c;", "\"b\" is not a view"),
+        ("ALTER SEQUENCE b RENAME TO c;", "\"b\" is not a sequence"),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "ALTER TABLE bi RENAME TO bj; ALTER INDEX b RENAME TO c;",
+        ),
+    ]);
+}
