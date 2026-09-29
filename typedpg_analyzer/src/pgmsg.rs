@@ -366,6 +366,19 @@ pub(crate) fn duplicate_table_alias(alias: &str) -> RawError {
     )
 }
 
+/// `cannot assign to system column "ctid"` — SQLSTATE 0A000: an UPDATE /
+/// ON CONFLICT DO UPDATE / MERGE UPDATE SET item naming a system column
+/// (`transformAssignedExpr`).
+pub(crate) fn cannot_assign_to_system_column(column: &str, span: Option<SourceSpan>) -> RawError {
+    RawError::new(
+        AnalyzeError::FeatureNotSupported(format!(
+            "cannot assign to system column \"{column}\""
+        )),
+        span,
+        None,
+    )
+}
+
 /// `OLD cannot be specified multiple times` (or `NEW …`) — SQLSTATE 42601:
 /// a `RETURNING WITH (…)` list naming the same row twice
 /// (`transformReturningClause`).

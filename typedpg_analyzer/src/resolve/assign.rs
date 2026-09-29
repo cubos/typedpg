@@ -325,6 +325,19 @@ pub(crate) fn analyze_set_clause(
             .iter()
             .find(|c| c.attname == rt.name)
             .ok_or_else(|| {
+                // transformUpdateTargetList looks the name up with
+                // `attnameAttNum(…, sysColOK = true)`, so a system column
+                // is found — and then refused by transformAssignedExpr.
+                if crate::pg_catalog::SYSTEM_COLUMNS
+                    .iter()
+                    .any(|(n, ..)| *n == rt.name)
+                {
+                    return crate::pgmsg::cannot_assign_to_system_column(
+                        &rt.name,
+                        crate::error::SourceSpan::from_node_qname(rt.location),
+                    )
+                    .finalize_implicit();
+                }
                 crate::scope::undefined_dml_column_error(
                     &rt.name,
                     table_relname,

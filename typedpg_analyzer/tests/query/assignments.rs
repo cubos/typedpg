@@ -298,3 +298,28 @@ fn where_current_of_cursor() {
         .unwrap();
     assert_cols(&s, vec![c("id", int4()), c("a", int4()), cn("b", text())]);
 }
+
+// ── System columns ───────────────────────────────────────────────────────────
+
+/// transformUpdateTargetList finds a system column (`attnameAttNum` with
+/// `sysColOK`) and transformAssignedExpr refuses it (0A000) — in UPDATE,
+/// ON CONFLICT DO UPDATE and MERGE UPDATE alike.
+#[test]
+fn assigning_to_a_system_column_is_refused() {
+    let db = setup();
+    for sql in [
+        "UPDATE t SET ctid = '(0,1)'",
+        "INSERT INTO t (id, a) VALUES (1, 2) ON CONFLICT (id) DO UPDATE SET ctid = DEFAULT",
+        "MERGE INTO t USING u ON t.id = u.id WHEN MATCHED THEN UPDATE SET xmin = '1'",
+    ] {
+        let err = db.analyze(sql).unwrap_err();
+        assert!(
+            matches!(err, AnalyzeError::FeatureNotSupported(_)),
+            "{sql}: {err:?}"
+        );
+        assert!(
+            err.to_string().starts_with("cannot assign to system column"),
+            "{sql}: {err}"
+        );
+    }
+}
