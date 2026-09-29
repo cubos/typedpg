@@ -744,6 +744,17 @@ pub(crate) fn infer_expr(
         }
         node::Node::AArrayExpr(arr) => infer_array_expr(arr, ctx, params),
         node::Node::RowExpr(row) => {
+            let expanded;
+            let row: &protobuf::RowExpr = match expand_row_args(&row.args, ctx, params) {
+                std::borrow::Cow::Borrowed(_) => row,
+                std::borrow::Cow::Owned(args) => {
+                    expanded = protobuf::RowExpr {
+                        args,
+                        ..(**row).clone()
+                    };
+                    &expanded
+                }
+            };
             // `ROW(a, b, …)` constructs an anonymous composite. The ROW
             // value itself is never NULL — empty `ROW()` still yields a
             // record.
@@ -1143,6 +1154,82 @@ pub(crate) fn inconsistent_param_error(
         crate::error::SourceSpan::from_node_token(location),
     )
     .finalize_implicit()
+}
+
+/// PG's `transformExpressionList` for a `ROW(...)` constructor's arguments:
+/// a `rel.*` column reference expands to one reference per column of `rel`
+/// (`ExpandColumnRefStar`) and a `(expr).*` indirection to one field
+/// selection per field (`ExpandIndirectionStar`), so `ROW(t.*)` is
+/// `ROW(t.a, t.b, …)`, not a one-field record holding the whole row.
+/// Borrowed when no argument is a star.
+pub(crate) fn expand_row_args<'a>(
+    args: &'a [protobuf::Node],
+    ctx: Ctx<'_>,
+    params: &ParamCollector,
+) -> std::borrow::Cow<'a, [protobuf::Node]> {
+    let ends_in_star = |fields: &[protobuf::Node]| {
+        matches!(
+            fields.last().and_then(|f| f.node.as_ref()),
+            Some(node::Node::AStar(_))
+        )
+    };
+    let is_star = |a: &protobuf::Node| match a.node.as_ref() {
+        Some(node::Node::ColumnRef(cr)) => ends_in_star(&cr.fields),
+        Some(node::Node::AIndirection(ind)) => ends_in_star(&ind.indirection),
+        _ => false,
+    };
+    if !args.iter().any(is_star) {
+        return std::borrow::Cow::Borrowed(args);
+    }
+    let string = |s: &str| protobuf::Node {
+        node: Some(node::Node::String(protobuf::String { sval: s.to_owned() })),
+    };
+    let mut out = Vec::with_capacity(args.len());
+    for arg in args {
+        match arg.node.as_ref() {
+            Some(node::Node::ColumnRef(cr)) if ends_in_star(&cr.fields) => {
+                // The relation is named by the last qualifier (`s.t.*` → t);
+                // an unknown one stays as written so the column-reference
+                // walk reports PG's error for it.
+                let rel = cr.fields.iter().rev().find_map(|f| match f.node.as_ref()? {
+                    node::Node::String(s) => Some(s.sval.as_str()),
+                    _ => None,
+                });
+                match rel.and_then(|r| ctx.scope.find_source(r)) {
+                    Some(src) => out.extend(src.columns.iter().map(|c| protobuf::Node {
+                        node: Some(node::Node::ColumnRef(protobuf::ColumnRef {
+                            fields: vec![string(&src.alias), string(&c.name)],
+                            location: cr.location,
+                        })),
+                    })),
+                    None => out.push(arg.clone()),
+                }
+            }
+            Some(node::Node::AIndirection(ind)) if ends_in_star(&ind.indirection) => {
+                let mut scratch = params.clone();
+                match expand_indirection_star(ind, ctx, &mut scratch) {
+                    Ok(Some(fields)) => {
+                        let prefix = &ind.indirection[..ind.indirection.len() - 1];
+                        out.extend(fields.iter().map(|(name, _)| protobuf::Node {
+                            node: Some(node::Node::AIndirection(Box::new(
+                                protobuf::AIndirection {
+                                    arg: ind.arg.clone(),
+                                    indirection: prefix
+                                        .iter()
+                                        .cloned()
+                                        .chain(std::iter::once(string(name)))
+                                        .collect(),
+                                },
+                            ))),
+                        }));
+                    }
+                    _ => out.push(arg.clone()),
+                }
+            }
+            _ => out.push(arg.clone()),
+        }
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

@@ -631,6 +631,8 @@ pub(crate) fn row_pairwise_op(
     params: &mut ParamCollector,
     not_bool: impl Fn(&str) -> String,
 ) -> Result<ExprType, AnalyzeError> {
+    let largs = &*expand_row_args(largs, ctx, params);
+    let rargs = &*expand_row_args(rargs, ctx, params);
     if largs.len() != rargs.len() {
         return Err(AnalyzeError::SyntaxError(
             "unequal number of entries in row expressions".to_owned(),

@@ -2509,3 +2509,40 @@ fn whole_row_of_null_extended_side_is_nullable() {
         ],
     );
 }
+
+/// `transformExpressionList` expands star arguments of `ROW(...)`:
+/// `ROW(t.*)` is `ROW(t.id, t.name, …)` and `ROW((c).*)` has one field per
+/// field of `c` — not a one-field record holding the whole row.
+#[test]
+fn row_constructor_expands_star_arguments() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE t (id INT PRIMARY KEY, name TEXT NOT NULL, n INT, arr INT[], j JSONB,
+                         v VARCHAR(10), num NUMERIC(10,2) NOT NULL DEFAULT 0);
+         CREATE TYPE comp AS (a INT, b TEXT);
+         CREATE TABLE tc (id INT PRIMARY KEY, c comp);",
+    )
+    .unwrap();
+    let s = db.analyze("SELECT (ROW(t.*)).f2 AS x FROM t").unwrap();
+    assert_cols(&s, vec![c("x", text())]);
+    let s = db.analyze("SELECT (ROW(t.*, 1)).f8 AS x FROM t").unwrap();
+    assert_cols(&s, vec![c("x", int4())]);
+    let s = db.analyze("SELECT (ROW(public.t.*)).f1 AS x FROM t").unwrap();
+    assert_cols(&s, vec![c("x", int4())]);
+    let s = db.analyze("SELECT ROW(t.*)::t AS x FROM t").unwrap();
+    assert!(matches!(&s.columns[0].pg_type, Type::Composite { name, .. } if name == "t"));
+    let s = db
+        .analyze(
+            "SELECT ROW(t.*) = ROW(1, 'a', 1, '{}'::int[], '{}'::jsonb, 'x'::varchar, 1.0) AS x \
+             FROM t",
+        )
+        .unwrap();
+    assert_cols(&s, vec![cn("x", bool_ty())]);
+    let s = db.analyze("SELECT (ROW((tc.c).*)).f2 AS x FROM tc").unwrap();
+    assert_cols(&s, vec![cn("x", text())]);
+    assert_err_prefix!(
+        db.analyze("SELECT ROW(nosuch.*) FROM t"),
+        AnalyzeError::UndefinedTable(_),
+        "missing FROM-clause entry for table \"nosuch\""
+    );
+}
