@@ -72,10 +72,11 @@ fn check_referenced_attrs(
         }
     }
     let wanted: std::collections::BTreeSet<i16> = attnums.iter().copied().collect();
+    // transformFkeyCheckAttrs: invalid indexes are out.
     let mut indexes: Vec<&PgIndex> = interp
         .pg_index
         .values()
-        .filter(|i| i.indrelid == target)
+        .filter(|i| i.indrelid == target && !interp.invalid_indexes.contains(&i.indexrelid))
         .collect();
     indexes.sort_by_key(|i| i.indexrelid);
     let mut found_deferrable = false;
@@ -382,6 +383,7 @@ pub(super) fn add_foreign_key(
         false,
         Vec::new(),
         with_period,
+        false,
     )?;
     if let Some(row) = interp.pg_constraint.get_mut(&oid) {
         row.conenforced = c.is_enforced;

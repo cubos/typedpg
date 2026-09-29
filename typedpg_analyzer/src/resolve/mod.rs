@@ -620,7 +620,12 @@ fn validate_on_conflict_target(
     let index_matches = snapshot.pg_index.values().any(|idx| {
         // A WITHOUT OVERLAPS key is unique but really an exclusion
         // constraint: inference skips it.
-        if idx.indrelid != table_oid || !idx.indisunique || idx.indisexclusion {
+        // infer_arbiter_indexes skips invalid indexes too.
+        if idx.indrelid != table_oid
+            || !idx.indisunique
+            || idx.indisexclusion
+            || snapshot.invalid_indexes.contains(&idx.indexrelid)
+        {
             return false;
         }
         let key = &idx.indkey[..usize::try_from(idx.indnkeyatts)

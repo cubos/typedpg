@@ -274,6 +274,10 @@ pub struct PgCatalog {
     pub(crate) index_parents: HashMap<PgClassOid, PgClassOid>,
     /// Indexes of DEFERRABLE constraints (`pg_index.indimmediate = false`).
     pub(crate) nonimmediate_indexes: std::collections::HashSet<PgClassOid>,
+    /// Indexes with `pg_index.indisvalid = false`: a partitioned index
+    /// created ON ONLY a table with partitions, until every partition has
+    /// one attached.
+    pub(crate) invalid_indexes: std::collections::HashSet<PgClassOid>,
     /// `pg_sequence` rows of the sequences migrations create.
     pub(crate) sequence_params: HashMap<PgClassOid, crate::ddl::seqparams::SeqParams>,
     /// Foreign-data wrappers, servers, user mappings, foreign tables'
@@ -593,6 +597,7 @@ impl PgCatalog {
             index_access_methods: HashMap::new(),
             index_parents: HashMap::new(),
             nonimmediate_indexes: std::collections::HashSet::new(),
+            invalid_indexes: std::collections::HashSet::new(),
             sequence_params: HashMap::new(),
             foreign_data: Default::default(),
             installing_extension: None,
@@ -1277,6 +1282,7 @@ impl PgCatalog {
         self.index_access_methods.remove(&oid);
         self.index_parents.remove(&oid);
         self.nonimmediate_indexes.remove(&oid);
+        self.invalid_indexes.remove(&oid);
         self.sequence_params.remove(&oid);
         self.foreign_data.table_servers.remove(&oid);
         self.relpersistence.remove(&oid);

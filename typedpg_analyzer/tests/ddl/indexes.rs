@@ -618,3 +618,145 @@ fn implicit_argument_coercions_count_for_index_mutability() {
          CREATE INDEX ON t (big(a));",
     )]);
 }
+
+#[test]
+fn alter_index_attach_partition_follows_pg() {
+    // ATExecAttachPartitionIdx (PG 18): a partitioned index created ON ONLY
+    // a table with partitions is invalid until each partition has a
+    // matching index attached; each check reports PG's error.
+    let setup = "CREATE TABLE t (a int NOT NULL, b int, c text) PARTITION BY RANGE (a);
+                 CREATE TABLE t1 PARTITION OF t FOR VALUES FROM (0) TO (10);
+                 CREATE TABLE t2 PARTITION OF t FOR VALUES FROM (10) TO (20);
+                 CREATE UNIQUE INDEX t_a_idx ON ONLY t (a);
+                 CREATE UNIQUE INDEX t1_a_idx ON t1 (a);
+                 CREATE UNIQUE INDEX t1_b_idx ON t1 (b);
+                 CREATE UNIQUE INDEX t2_a_idx ON t2 (a);
+                 CREATE TABLE u (a int);
+                 CREATE UNIQUE INDEX u_a ON u (a);";
+    for (stmt, msg) in [
+        (
+            "ALTER INDEX t_a_idx ATTACH PARTITION t1_b_idx;",
+            "cannot attach index \"t1_b_idx\" as a partition of index \"t_a_idx\" (The index \
+             definitions do not match.)",
+        ),
+        (
+            "ALTER INDEX t_a_idx ATTACH PARTITION t1_a_idx;
+             CREATE UNIQUE INDEX t1_a2 ON t1 (a);
+             ALTER INDEX t_a_idx ATTACH PARTITION t1_a2;",
+            "cannot attach index \"t1_a2\" as a partition of index \"t_a_idx\" (Another index \
+             is already attached for partition \"t1\".)",
+        ),
+        (
+            "ALTER INDEX t1_a_idx ATTACH PARTITION t2_a_idx;",
+            "ALTER action ATTACH PARTITION cannot be performed on relation \"t1_a_idx\" (This \
+             operation is not supported for indexes.)",
+        ),
+        (
+            "ALTER INDEX t_a_idx ATTACH PARTITION t;",
+            "\"t\" is not an index",
+        ),
+        (
+            "ALTER INDEX t_a_idx ATTACH PARTITION nosuch;",
+            "relation \"nosuch\" does not exist",
+        ),
+        (
+            "ALTER INDEX t_a_idx ATTACH PARTITION u_a;",
+            "cannot attach index \"u_a\" as a partition of index \"t_a_idx\" (Index \"u_a\" is \
+             not an index on any partition of table \"t\".)",
+        ),
+        (
+            "ALTER TABLE t ADD CONSTRAINT t_uq UNIQUE USING INDEX t_a_idx;",
+            "index \"t_a_idx\" is not valid",
+        ),
+        (
+            "CREATE TABLE r (a int REFERENCES t (a));",
+            "there is no unique constraint matching given keys for referenced table \"t\"",
+        ),
+        (
+            "CREATE TABLE t4 (a int NOT NULL, b int, c text) PARTITION BY RANGE (a);
+             CREATE UNIQUE INDEX t4_a ON t4 (a);
+             ALTER TABLE t ATTACH PARTITION t4 FOR VALUES FROM (20) TO (30);
+             DROP INDEX t4_a;",
+            "cannot drop index t4_a because index t_a_idx requires it",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    // Attaching an index on every partition validates the parent index —
+    // the one AttachPartitionEnsureIndexes attached counts.
+    let mut db = build_db(&[("0001.sql", setup)]);
+    let conflict = "INSERT INTO t VALUES (1) ON CONFLICT (a) DO NOTHING";
+    let no_arbiter =
+        "there is no unique or exclusion constraint matching the ON CONFLICT specification";
+    assert!(
+        db.analyze(conflict)
+            .unwrap_err()
+            .to_string()
+            .starts_with(no_arbiter)
+    );
+    db.apply_sql(
+        "CREATE TABLE t4 (a int NOT NULL, b int, c text) PARTITION BY RANGE (a);
+         CREATE UNIQUE INDEX t4_a ON t4 (a);
+         ALTER TABLE t ATTACH PARTITION t4 FOR VALUES FROM (20) TO (30);
+         ALTER INDEX t_a_idx ATTACH PARTITION t1_a_idx;
+         ALTER INDEX t_a_idx ATTACH PARTITION t1_a_idx;",
+    )
+    .unwrap();
+    assert!(
+        db.analyze(conflict)
+            .unwrap_err()
+            .to_string()
+            .starts_with(no_arbiter)
+    );
+    db.apply_sql("ALTER INDEX t_a_idx ATTACH PARTITION t2_a_idx;")
+        .unwrap();
+    db.analyze(conflict).unwrap();
+    db.apply_sql("CREATE TABLE r (a int REFERENCES t (a));")
+        .unwrap();
+}
+
+#[test]
+fn attaching_indexes_of_constraints() {
+    // A constraint's partitioned index needs a constraint's index; a plain
+    // one takes a constraint index, whose constraint stays local.
+    let setup = "CREATE TABLE p (a int, b int) PARTITION BY LIST (a);
+                 CREATE TABLE p1 PARTITION OF p FOR VALUES IN (1);
+                 CREATE TABLE q (a int, b int) PARTITION BY LIST (a);
+                 CREATE TABLE q1 PARTITION OF q FOR VALUES IN (1);";
+    for (stmt, msg) in [
+        (
+            "ALTER TABLE ONLY p ADD CONSTRAINT p_uq UNIQUE (a);
+             CREATE UNIQUE INDEX p1_a ON p1 (a);
+             ALTER INDEX p_uq ATTACH PARTITION p1_a;",
+            "cannot attach index \"p1_a\" as a partition of index \"p_uq\" (The index \"p_uq\" \
+             belongs to a constraint in table \"p\" but no constraint exists for index \
+             \"p1_a\".)",
+        ),
+        (
+            "ALTER TABLE ONLY q1 ADD CONSTRAINT q1_a UNIQUE (a);
+             CREATE INDEX q_b ON ONLY q (b);
+             ALTER INDEX q_b ATTACH PARTITION q1_a;",
+            "cannot attach index \"q1_a\" as a partition of index \"q_b\" (The index \
+             definitions do not match.)",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    let db = build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "CREATE UNIQUE INDEX q_a ON ONLY q (a);
+             ALTER TABLE ONLY q1 ADD CONSTRAINT q1_a UNIQUE (a);
+             ALTER INDEX q_a ATTACH PARTITION q1_a;",
+        ),
+    ]);
+    let con = db
+        .constraints_of_table("q1")
+        .into_iter()
+        .find(|c| c.conname == "q1_a")
+        .unwrap();
+    assert!(con.conislocal && con.coninhcount == 0);
+}

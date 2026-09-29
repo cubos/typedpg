@@ -948,6 +948,9 @@ fn apply_alter_subtype(
         AlterTableType::AtAddOf => typed::add_of(interp, relid, cmd),
         AlterTableType::AtAddInherit => inherit_cmd::add_inherit(interp, relid, cmd),
         AlterTableType::AtDropInherit => inherit_cmd::drop_inherit(interp, relid, cmd),
+        AlterTableType::AtAttachPartition if partidx::is_partitioned_index(interp, relid) => {
+            partidx::attach_partition_index(interp, relid, cmd)
+        }
         AlterTableType::AtAttachPartition => inherit_cmd::attach_partition(interp, relid, cmd),
         AlterTableType::AtDetachPartition => inherit_cmd::detach_partition(interp, relid, cmd),
         AlterTableType::AtDropOf => typed::drop_of(interp, relid),
@@ -1133,7 +1136,10 @@ fn check_alter_target(
             "SET ACCESS METHOD",
         ),
         At::AtAddInherit => (table_like, "INHERIT"),
-        At::AtAttachPartition => (class.relkind == RelKind::Partitioned, "ATTACH PARTITION"),
+        At::AtAttachPartition => (
+            class.relkind == RelKind::Partitioned || partidx::is_partitioned_index(interp, relid),
+            "ATTACH PARTITION",
+        ),
         At::AtDetachPartition => (class.relkind == RelKind::Partitioned, "DETACH PARTITION"),
         At::AtDropInherit => (table_like, "NO INHERIT"),
         At::AtDropOf => (class.relkind == RelKind::Table, "NOT OF"),

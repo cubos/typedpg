@@ -281,7 +281,7 @@ pub(crate) fn emit_constraints(
         let conname = conname.resolve(interp, relid);
         let oid = emit_constraint_with_backing_index(
             interp, relid, conname, contype, conkey, confrelid, confkey, deferrable, include,
-            period,
+            period, false,
         )?;
         if let Some((def, enforced)) = check {
             // CREATE TABLE's constraints are valid unless NOT ENFORCED.
@@ -548,6 +548,7 @@ pub(super) fn emit_constraint_with_backing_index(
     deferrable: bool,
     include: Vec<i16>,
     period: bool,
+    index_only: bool,
 ) -> Result<PgConstraintOid, DdlError> {
     if period && contype != ConType::ForeignKey {
         check_without_overlaps_index(interp, relid, &conkey)?;
@@ -636,7 +637,13 @@ pub(super) fn emit_constraint_with_backing_index(
         if deferrable {
             interp.nonimmediate_indexes.insert(indexrelid);
         }
-        super::partidx::propagate_new_index(interp, relid, indexrelid)?;
+        if !index_only {
+            super::partidx::propagate_new_index(interp, relid, indexrelid)?;
+        } else if interp.pg_class.get(&relid).map(|c| c.relkind) == Some(RelKind::Partitioned)
+            && !super::inherit::children_of(interp, relid).is_empty()
+        {
+            interp.invalid_indexes.insert(indexrelid);
+        }
     }
     Ok(oid)
 }
@@ -1140,7 +1147,9 @@ pub(crate) fn add_constraint(
     let Some(node::Node::Constraint(c)) = def.node.as_ref() else {
         return Ok(());
     };
-    add_constraint_node(interp, relid, c, &cmd.name, rec)
+    // ALTER TABLE ONLY: a constraint index isn't built on the partitions
+    // (DefineIndex under ONLY).
+    add_constraint_node(interp, relid, c, &cmd.name, rec, !rec.recurse)
 }
 
 /// The constraints written inline on an `ALTER TABLE ... ADD COLUMN`
@@ -1173,12 +1182,12 @@ pub(crate) fn add_column_constraints(
                     recurse: true,
                     recursing: false,
                 };
-                add_constraint_node(interp, relid, &c, &cd.colname, rec)?;
+                add_constraint_node(interp, relid, &c, &cd.colname, rec, false)?;
                 continue;
             }
             _ => continue,
         }
-        add_constraint_node(interp, relid, &c, &cd.colname, only_here)?;
+        add_constraint_node(interp, relid, &c, &cd.colname, only_here, false)?;
     }
     Ok(())
 }
@@ -1190,6 +1199,7 @@ fn add_constraint_node(
     c: &typedpg_pg_query::protobuf::Constraint,
     cmd_name: &str,
     rec: super::inherit::Recursion,
+    index_only: bool,
 ) -> Result<(), DdlError> {
     // `ADD {PRIMARY KEY | UNIQUE} USING INDEX idx` turns an existing unique
     // index into the constraint (ATExecAddIndexConstraint).
@@ -1221,6 +1231,7 @@ fn add_constraint_node(
             c.deferrable,
             include.clone(),
             false,
+            index_only,
         )?;
     }
 
@@ -1272,6 +1283,7 @@ fn add_constraint_node(
                 c.deferrable,
                 include.clone(),
                 c.without_overlaps,
+                index_only,
             )?;
         }
     }
@@ -1326,6 +1338,7 @@ fn add_constraint_node(
                 c.deferrable,
                 include.clone(),
                 c.without_overlaps,
+                index_only,
             )?;
         }
     }
@@ -1448,6 +1461,12 @@ fn add_index_constraint(
             "index \"{}\" does not belong to table \"{}\"",
             c.indexname,
             relname_of(interp, relid)
+        )));
+    }
+    if interp.invalid_indexes.contains(&index_oid) {
+        return Err(DdlError::Parse(format!(
+            "index \"{}\" is not valid",
+            c.indexname
         )));
     }
     if !index.indisunique {
@@ -1728,6 +1747,7 @@ pub(crate) fn copy_like_constraints(
                         interp.nonimmediate_indexes.contains(&idx.indexrelid),
                         indkey[nkey..].to_vec(),
                         period,
+                        false,
                     )?;
                 }
                 None => {

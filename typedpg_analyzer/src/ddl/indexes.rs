@@ -304,9 +304,15 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
         indexprs,
         indpred,
     });
-    // DefineIndex on a partitioned table recurses (not under ONLY).
+    // DefineIndex on a partitioned table recurses — not under ONLY, where
+    // the index stays invalid while the table has partitions without one
+    // attached (ALTER INDEX ... ATTACH PARTITION validates it).
     if rv.inh {
         super::tables::partidx::propagate_new_index(db, indrelid, indexrelid)?;
+    } else if db.pg_class.get(&indrelid).map(|c| c.relkind) == Some(RelKind::Partitioned)
+        && !super::tables::inherit::children_of(db, indrelid).is_empty()
+    {
+        db.invalid_indexes.insert(indexrelid);
     }
 
     Ok(())
