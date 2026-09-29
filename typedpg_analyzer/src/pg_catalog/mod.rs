@@ -226,6 +226,10 @@ pub struct PgCatalog {
     /// column type that `cookDefault` adds) — what ALTER COLUMN TYPE
     /// re-coerces (PG keeps the expression in `pg_attrdef`).
     pub(crate) attr_default_types: HashMap<(PgClassOid, i16), PgTypeOid>,
+    /// Canonical text of each column DEFAULT / generation expression —
+    /// what MergeAttributes compares when several parents give a column a
+    /// default (PG compares the cooked `pg_attrdef` trees).
+    pub(crate) attr_default_exprs: HashMap<(PgClassOid, i16), String>,
     /// The columns each generation expression reads, by the generated
     /// column (PG records them as `pg_depend` rows of the column's
     /// `pg_attrdef` entry): DROP COLUMN of such a column needs CASCADE and
@@ -556,6 +560,7 @@ impl PgCatalog {
             search_path_guc: Default::default(),
             domain_constraints: HashMap::new(),
             attr_default_types: HashMap::new(),
+            attr_default_exprs: HashMap::new(),
             generated_refs: HashMap::new(),
             check_function_bodies: true,
             inline_sql_bodies: HashMap::new(),
@@ -1199,6 +1204,8 @@ impl PgCatalog {
         self.attr_default_types
             .retain(|(relid, _), _| *relid != oid);
         self.generated_refs.retain(|(relid, _), _| *relid != oid);
+        self.attr_default_exprs
+            .retain(|(relid, _), _| *relid != oid);
         self.partition_keys.remove(&oid);
         self.triggers.remove(&oid);
         self.policies.remove(&oid);

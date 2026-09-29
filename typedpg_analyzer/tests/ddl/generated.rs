@@ -524,3 +524,175 @@ fn partition_keys_may_not_read_generated_columns() {
         "partition key expressions cannot contain system column references",
     );
 }
+
+// ── Inheritance and partitions ──────────────────────────────────────────────
+
+const PARENT: &str = "CREATE TABLE gtest1 (a int, b int GENERATED ALWAYS AS (a * 2) VIRTUAL);
+    CREATE TABLE gtest_normal (a int, b int);";
+
+#[test]
+fn a_child_column_is_generated_exactly_when_its_parent_column_is() {
+    assert_err(
+        PARENT,
+        "CREATE TABLE c (a int, b int GENERATED ALWAYS AS (a * 2) VIRTUAL) INHERITS (gtest_normal);",
+        "child column \"b\" specifies generation expression",
+    );
+    assert_err(
+        PARENT,
+        "CREATE TABLE c (x int, b int DEFAULT 10) INHERITS (gtest1);",
+        "column \"b\" inherits from generated column but specifies default",
+    );
+    assert_err(
+        PARENT,
+        "CREATE TABLE c (x int, b int GENERATED ALWAYS AS IDENTITY) INHERITS (gtest1);",
+        "column \"b\" inherits from generated column but specifies identity",
+    );
+    assert_err(
+        PARENT,
+        "CREATE TABLE c (x int, b int GENERATED ALWAYS AS (a * 22) STORED) INHERITS (gtest1);",
+        "column \"b\" inherits from generated column of different kind",
+    );
+    // The child's own expression of the same kind overrides the parent's.
+    let db = build_db(&[
+        ("0001.sql", PARENT),
+        (
+            "0002.sql",
+            "CREATE TABLE c (x int, b int GENERATED ALWAYS AS (a * 22) VIRTUAL) INHERITS (gtest1);
+             CREATE TABLE d () INHERITS (gtest1);",
+        ),
+    ]);
+    assert_eq!(
+        generated_kinds(&db, "d")[1],
+        ("b".to_owned(), Some(AttGenerated::Virtual))
+    );
+}
+
+#[test]
+fn alter_inherit_checks_generation_of_each_column() {
+    let setup = format!(
+        "{PARENT}
+         CREATE TABLE gen_child (a int, b int GENERATED ALWAYS AS (a * 2) VIRTUAL);
+         CREATE TABLE plain_child (a int, b int);
+         CREATE TABLE stored_child (a int, b int GENERATED ALWAYS AS (a * 2) STORED);"
+    );
+    assert_err(
+        &setup,
+        "ALTER TABLE gen_child INHERIT gtest_normal;",
+        "column \"b\" in child table must not be a generated column",
+    );
+    assert_err(
+        &setup,
+        "ALTER TABLE plain_child INHERIT gtest1;",
+        "column \"b\" in child table must be a generated column",
+    );
+    assert_err(
+        &setup,
+        "ALTER TABLE stored_child INHERIT gtest1;",
+        "column \"b\" inherits from generated column of different kind",
+    );
+    build_db(&[
+        ("0001.sql", &setup),
+        ("0002.sql", "ALTER TABLE gen_child INHERIT gtest1;"),
+    ]);
+}
+
+#[test]
+fn several_parents_agree_on_generation_and_defaults() {
+    assert_err(
+        "CREATE TABLE p1 (a int, b int DEFAULT 10);
+         CREATE TABLE p2 (x int, b int GENERATED ALWAYS AS (x * 22) VIRTUAL);",
+        "CREATE TABLE c () INHERITS (p1, p2);",
+        "inherited column \"b\" has a generation conflict",
+    );
+    let conflicting = "CREATE TABLE p1 (a int, b int GENERATED ALWAYS AS (a * 2) VIRTUAL);
+         CREATE TABLE p2 (x int, b int GENERATED ALWAYS AS (x * 22) VIRTUAL);";
+    assert_err(
+        conflicting,
+        "CREATE TABLE c () INHERITS (p1, p2);",
+        "column \"b\" inherits conflicting generation expressions",
+    );
+    build_db(&[
+        ("0001.sql", conflicting),
+        (
+            "0002.sql",
+            "CREATE TABLE c (b int GENERATED ALWAYS AS (x + 1) VIRTUAL) INHERITS (p1, p2);",
+        ),
+    ]);
+    assert_err(
+        "CREATE TABLE p1 (a int DEFAULT 1); CREATE TABLE p2 (a int DEFAULT 2);",
+        "CREATE TABLE c () INHERITS (p1, p2);",
+        "column \"a\" inherits conflicting default values",
+    );
+    build_db(&[(
+        "0001.sql",
+        "CREATE TABLE p1 (a int DEFAULT 1); CREATE TABLE p2 (a int DEFAULT 1);
+         CREATE TABLE p3 (a int DEFAULT 2);
+         CREATE TABLE c1 () INHERITS (p1, p2);
+         CREATE TABLE c2 (a int DEFAULT 3) INHERITS (p1, p3);",
+    )]);
+}
+
+#[test]
+fn partitions_follow_the_parent_generation() {
+    let plain = "CREATE TABLE gp (f1 date NOT NULL, f2 bigint, f3 bigint) PARTITION BY RANGE (f1);";
+    assert_err(
+        plain,
+        "CREATE TABLE gc PARTITION OF gp (f3 WITH OPTIONS GENERATED ALWAYS AS (f2 * 2) VIRTUAL)
+         FOR VALUES FROM ('2016-07-01') TO ('2016-08-01');",
+        "child column \"f3\" specifies generation expression",
+    );
+    let generated = "CREATE TABLE gp (f1 date NOT NULL, f2 bigint,
+        f3 bigint GENERATED ALWAYS AS (f2 * 2) VIRTUAL) PARTITION BY RANGE (f1);";
+    let bounds = "FOR VALUES FROM ('2016-09-01') TO ('2016-10-01')";
+    assert_err(
+        generated,
+        &format!("CREATE TABLE gc PARTITION OF gp (f3 DEFAULT 42) {bounds};"),
+        "column \"f3\" inherits from generated column but specifies default",
+    );
+    assert_err(
+        generated,
+        &format!(
+            "CREATE TABLE gc PARTITION OF gp (f3 WITH OPTIONS GENERATED ALWAYS AS IDENTITY) {bounds};"
+        ),
+        "identity columns are not supported on partitions",
+    );
+    assert_err(
+        generated,
+        &format!(
+            "CREATE TABLE gc PARTITION OF gp (f3 GENERATED ALWAYS AS (f2 * 2) STORED) {bounds};"
+        ),
+        "column \"f3\" inherits from generated column of different kind",
+    );
+    for (f3, msg) in [
+        (
+            "bigint",
+            "column \"f3\" in child table must be a generated column",
+        ),
+        (
+            "bigint GENERATED ALWAYS AS IDENTITY",
+            "table \"gc\" being attached contains an identity column \"f3\"",
+        ),
+        (
+            "bigint GENERATED ALWAYS AS (f2 * 33) STORED",
+            "column \"f3\" inherits from generated column of different kind",
+        ),
+    ] {
+        assert_err(
+            &format!("{generated} CREATE TABLE gc (f1 date NOT NULL, f2 bigint, f3 {f3});"),
+            &format!("ALTER TABLE gp ATTACH PARTITION gc {bounds};"),
+            msg,
+        );
+    }
+    build_db(&[(
+        "0001.sql",
+        &format!(
+            "{generated}
+             CREATE TABLE gc1 PARTITION OF gp FOR VALUES FROM ('2016-07-01') TO ('2016-08-01');
+             CREATE TABLE gc2 PARTITION OF gp (f3 WITH OPTIONS GENERATED ALWAYS AS (f2 * 22) VIRTUAL)
+               FOR VALUES FROM ('2016-08-01') TO ('2016-09-01');
+             CREATE TABLE gc3 (f1 date NOT NULL, f2 bigint,
+               f3 bigint GENERATED ALWAYS AS (f2 * 33) VIRTUAL);
+             ALTER TABLE gp ATTACH PARTITION gc3 {bounds};"
+        ),
+    )]);
+}

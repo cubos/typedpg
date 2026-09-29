@@ -132,7 +132,7 @@ pub(crate) fn assemble_columns(
     let mut locals = Vec::new();
     for entry in entries {
         match columns.iter_mut().find(|c| c.name == entry.col.name) {
-            Some(inh) if is_partition => merge_partition_column(inh, entry.col),
+            Some(inh) if is_partition => merge_partition_column(inh, entry.col)?,
             Some(inh) => merge_child_column(inh, entry.col)?,
             None if is_partition => {
                 return Err(DdlError::Parse(format!(
@@ -144,6 +144,22 @@ pub(crate) fn assemble_columns(
         }
     }
     columns.extend(locals);
+    // Parents disagreeing on a default the child doesn't override.
+    if let Some(col) = columns.iter().find(|c| c.bogus_default) {
+        return Err(DdlError::Parse(if col.generated.is_some() {
+            format!(
+                "column \"{}\" inherits conflicting generation expressions (To resolve the \
+                 conflict, specify a generation expression explicitly.)",
+                col.name
+            )
+        } else {
+            format!(
+                "column \"{}\" inherits conflicting default values (To resolve the conflict, \
+                 specify a default explicitly.)",
+                col.name
+            )
+        }));
+    }
     Ok(AssembledColumns {
         columns,
         parents,
@@ -180,6 +196,9 @@ fn of_type_columns(
                 nn_inh_name: None,
                 is_local: true,
                 inhcount: 0,
+                local_default: false,
+                inherited_default: None,
+                bogus_default: false,
             },
             has_type: true,
             is_from_type: true,
@@ -250,6 +269,9 @@ fn expand_like(
                 nn_inh_name: None,
                 is_local: true,
                 inhcount: 0,
+                local_default: false,
+                inherited_default: None,
+                bogus_default: false,
             },
             has_type: true,
             is_from_type: false,
@@ -336,6 +358,10 @@ fn inherited_columns(
                 .attnotnull
                 .then(|| super::inherit::not_null_name(interp, parent, attr.attnum));
             let has_default = attr.atthasdef && (attr.attidentity.is_none() || identity.is_some());
+            let parent_default = interp
+                .attr_default_exprs
+                .get(&(parent, attr.attnum))
+                .cloned();
             if let Some(existing) = columns.iter_mut().find(|c| c.name == attr.attname) {
                 if existing.type_oid != attr.atttypid || existing.typmod != attr.atttypmod {
                     return Err(DdlError::Parse(format!(
@@ -349,10 +375,23 @@ fn inherited_columns(
                         attr.attname
                     )));
                 }
+                if existing.generated != attr.attgenerated {
+                    return Err(DdlError::Parse(format!(
+                        "inherited column \"{}\" has a generation conflict",
+                        attr.attname
+                    )));
+                }
                 existing.not_null |= attr.attnotnull;
                 existing.has_default |= has_default;
-                existing.generated = existing.generated.or(attr.attgenerated);
                 existing.inhcount += 1;
+                // A default from a prior parent must be the same one.
+                if let Some(this_default) = parent_default {
+                    match existing.inherited_default.as_ref() {
+                        None => existing.inherited_default = Some(this_default),
+                        Some(prev) if *prev != this_default => existing.bogus_default = true,
+                        Some(_) => {}
+                    }
+                }
                 if let Some(nn) = parent_nn {
                     existing.nn_inhcount += 1;
                     existing.nn_inh_name.get_or_insert(nn);
@@ -377,6 +416,9 @@ fn inherited_columns(
                 nn_inh_name: parent_nn,
                 is_local: false,
                 inhcount: 1,
+                local_default: false,
+                inherited_default: parent_default,
+                bogus_default: false,
             });
         }
     }
@@ -402,11 +444,16 @@ fn merge_child_column(inh: &mut ParsedColumn, local: ParsedColumn) -> Result<(),
     inh.not_null |= local.not_null;
     inh.nn_local |= local.nn_local;
     if local.nn_name.is_some() {
-        inh.nn_name = local.nn_name;
+        inh.nn_name = local.nn_name.clone();
     }
+    check_generation_merge(inh, &local)?;
     inh.is_local = true;
     if local.has_default {
         inh.has_default = true;
+    }
+    if local.local_default {
+        inh.bogus_default = false;
+        inh.local_default = true;
     }
     if local.identity.is_some() {
         inh.identity = local.identity;
@@ -415,10 +462,45 @@ fn merge_child_column(inh: &mut ParsedColumn, local: ParsedColumn) -> Result<(),
     Ok(())
 }
 
+/// The generation rules of MergeChildAttribute (and of partition column
+/// options in MergeAttributes): a child column is generated if and only if
+/// its parent's is, with the same kind — its own expression may differ —
+/// and a generated parent column takes no default or identity.
+fn check_generation_merge(inh: &ParsedColumn, local: &ParsedColumn) -> Result<(), DdlError> {
+    let kind_name = |g: AttGenerated| match g {
+        AttGenerated::Stored => "STORED",
+        AttGenerated::Virtual => "VIRTUAL",
+    };
+    match (inh.generated, local.generated) {
+        (Some(_), None) if local.local_default => Err(DdlError::Parse(format!(
+            "column \"{}\" inherits from generated column but specifies default",
+            local.name
+        ))),
+        (Some(_), _) if local.identity.is_some() => Err(DdlError::Parse(format!(
+            "column \"{}\" inherits from generated column but specifies identity",
+            local.name
+        ))),
+        (None, Some(_)) => Err(DdlError::Parse(format!(
+            "child column \"{}\" specifies generation expression (A child table column \
+             cannot be generated unless its parent column is.)",
+            local.name
+        ))),
+        (Some(parent), Some(child)) if parent != child => Err(DdlError::Parse(format!(
+            "column \"{}\" inherits from generated column of different kind (Parent column is \
+             {}, child column is {}.)",
+            local.name,
+            kind_name(parent),
+            kind_name(child)
+        ))),
+        _ => Ok(()),
+    }
+}
+
 /// Partition column options (`PARTITION OF parent (col WITH OPTIONS ...)`):
 /// they carry no type, only NOT NULL / DEFAULT to layer over the parent's
 /// column.
-fn merge_partition_column(inh: &mut ParsedColumn, local: ParsedColumn) {
+fn merge_partition_column(inh: &mut ParsedColumn, local: ParsedColumn) -> Result<(), DdlError> {
+    check_generation_merge(inh, &local)?;
     inh.not_null |= local.not_null;
     inh.nn_local |= local.nn_local;
     if local.nn_name.is_some() {
@@ -427,4 +509,8 @@ fn merge_partition_column(inh: &mut ParsedColumn, local: ParsedColumn) {
     if local.has_default {
         inh.has_default = true;
     }
+    if local.local_default {
+        inh.local_default = true;
+    }
+    Ok(())
 }

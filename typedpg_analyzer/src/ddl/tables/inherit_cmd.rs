@@ -170,17 +170,32 @@ fn merge_attributes_into_existing(
                 pa.attname
             )));
         }
-        match (pa.attgenerated.is_some(), ca.attgenerated.is_some()) {
-            (true, false) => {
+        // The child column is generated if and only if the parent column
+        // is, and of the same kind.
+        match (pa.attgenerated, ca.attgenerated) {
+            (Some(_), None) => {
                 return Err(DdlError::Parse(format!(
                     "column \"{}\" in child table must be a generated column",
                     pa.attname
                 )));
             }
-            (false, true) => {
+            (None, Some(_)) => {
                 return Err(DdlError::Parse(format!(
                     "column \"{}\" in child table must not be a generated column",
                     pa.attname
+                )));
+            }
+            (Some(parent_kind), Some(child_kind)) if parent_kind != child_kind => {
+                let kind_name = |g: AttGenerated| match g {
+                    AttGenerated::Stored => "STORED",
+                    AttGenerated::Virtual => "VIRTUAL",
+                };
+                return Err(DdlError::Parse(format!(
+                    "column \"{}\" inherits from generated column of different kind (Parent \
+                     column is {}, child column is {}.)",
+                    pa.attname,
+                    kind_name(parent_kind),
+                    kind_name(child_kind)
                 )));
             }
             _ => {}
@@ -368,8 +383,16 @@ pub(super) fn attach_partition(
              \"{attach_name}\".)"
         )));
     }
-    // The partition may only have the parent's columns.
+    // The partition may have neither an identity column nor columns the
+    // parent lacks.
     for a in interp.attributes_of(attach) {
+        if a.attidentity.is_some() {
+            return Err(DdlError::Parse(format!(
+                "table \"{attach_name}\" being attached contains an identity column \"{}\" \
+                 (The new partition may not contain an identity column.)",
+                a.attname
+            )));
+        }
         if interp.attribute_by_name(parent, &a.attname).is_none() {
             return Err(DdlError::Parse(format!(
                 "table \"{attach_name}\" contains column \"{}\" not found in parent \

@@ -953,6 +953,10 @@ pub(crate) fn validate_constraint_expressions(
             interp
                 .attr_default_types
                 .insert((class_oid, attr.attnum), default_type);
+            interp.attr_default_exprs.insert(
+                (class_oid, attr.attnum),
+                super::check_inherit::check_expr_text(expr),
+            );
             crate::ddl::defaults::record_default_dependencies(
                 interp,
                 class_oid,

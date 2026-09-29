@@ -26,6 +26,12 @@ pub(crate) fn serial_base_type(tn: &typedpg_pg_query::protobuf::TypeName) -> Opt
     }
 }
 
+/// The canonical text of a serial column's `nextval(...)` default: it
+/// names the column's own sequence, so it matches no other default.
+pub(crate) fn serial_default_text(relid: PgClassOid, attnum: i16) -> String {
+    format!("nextval(<sequence of {relid}.{attnum}>)")
+}
+
 /// The DEFAULT expression written on a column definition, if any.
 pub(crate) fn column_default_expr(
     cd: &typedpg_pg_query::protobuf::ColumnDef,
@@ -320,6 +326,9 @@ pub(crate) fn parse_column_def(
         nn_inh_name: None,
         is_local: true,
         inhcount: 0,
+        local_default: saw_default || saw_generated,
+        inherited_default: None,
+        bogus_default: false,
     })
 }
 
@@ -602,6 +611,13 @@ fn add_column_to(
         interp
             .attr_default_types
             .insert((relid, next_attnum), default_type);
+        interp.attr_default_exprs.insert(
+            (relid, next_attnum),
+            match column_default_expr(cd) {
+                Some(expr) => super::check_inherit::check_expr_text(expr),
+                None => serial_default_text(relid, next_attnum),
+            },
+        );
     }
     crate::ddl::defaults::record_default_dependencies(
         interp,
@@ -871,6 +887,7 @@ pub(crate) fn drop_column(
     }
 
     interp.attr_default_types.remove(&(relid, target.attnum));
+    interp.attr_default_exprs.remove(&(relid, target.attnum));
     crate::ddl::statistics::drop_column_statistics(interp, relid, target.attnum);
     crate::ddl::defaults::forget_default_dependencies(interp, relid, target.attnum);
     if let Some(attrs) = interp.pg_attribute.get_mut(&relid) {
@@ -946,9 +963,14 @@ pub(crate) fn set_default(
                 interp
                     .attr_default_types
                     .insert((relid, attr.attnum), default_type);
+                interp.attr_default_exprs.insert(
+                    (relid, attr.attnum),
+                    super::check_inherit::check_expr_text(expr),
+                );
             }
             None => {
                 interp.attr_default_types.remove(&(relid, attr.attnum));
+                interp.attr_default_exprs.remove(&(relid, attr.attnum));
             }
         }
         crate::ddl::defaults::record_default_dependencies(
@@ -1392,6 +1414,7 @@ pub(crate) fn drop_expression(
                 a.atthasdef = false;
             }
             interp.attr_default_types.remove(&(relid, attr.attnum));
+            interp.attr_default_exprs.remove(&(relid, attr.attnum));
             interp.generated_refs.remove(&(relid, attr.attnum));
         }
     }

@@ -269,6 +269,7 @@ fn drop_relation(
             a.atthasdef = false;
         }
         interp.attr_default_types.remove(&(relid, attnum));
+        interp.attr_default_exprs.remove(&(relid, attnum));
         super::defaults::forget_default_dependencies(interp, relid, attnum);
     }
     if cascade && !dependent_fks.is_empty() {

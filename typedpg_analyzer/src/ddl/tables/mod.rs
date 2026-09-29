@@ -399,9 +399,14 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
             interp
                 .attr_default_types
                 .insert((class_oid, attnum), crate::pg_catalog::oid::INT8);
+            interp.attr_default_exprs.insert(
+                (class_oid, attnum),
+                columns::serial_default_text(class_oid, attnum),
+            );
             continue;
         }
-        if !col.has_default || col.generated.is_some() {
+        // A generation expression written here is cooked below.
+        if !col.has_default || (col.generated.is_some() && col.local_default) {
             continue;
         }
         let inherited = parents
@@ -416,6 +421,26 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
             interp
                 .attr_default_types
                 .insert((class_oid, attnum), default_type);
+            if let Some(text) = interp.attr_default_exprs.get(&(src, src_attnum)).cloned() {
+                interp.attr_default_exprs.insert((class_oid, attnum), text);
+            }
+            // An inherited generation expression reads the same-named
+            // columns here (map_variable_attnos).
+            if let Some(refs) = interp.generated_refs.get(&(src, src_attnum)).cloned() {
+                let mapped: Vec<i16> = refs
+                    .iter()
+                    .filter_map(|&r| {
+                        let name = interp
+                            .attributes_of(src)
+                            .iter()
+                            .find(|a| a.attnum == r)?
+                            .attname
+                            .clone();
+                        interp.attribute_by_name(class_oid, &name).map(|a| a.attnum)
+                    })
+                    .collect();
+                interp.generated_refs.insert((class_oid, attnum), mapped);
+            }
             // The copied default expression names the same sequences.
             let src_obj = crate::oid::PgGenericOid::from_nonzero(src.into_nonzero());
             let sequences: Vec<PgClassOid> = interp
@@ -716,6 +741,14 @@ struct ParsedColumn {
     /// `attislocal` / `attinhcount`.
     is_local: bool,
     inhcount: i16,
+    /// The definition writes a DEFAULT or generation expression of its own
+    /// (`raw_default`), which overrides an inherited one.
+    local_default: bool,
+    /// The canonical text of the default / generation expression inherited
+    /// from the parents, and whether two parents disagree on it
+    /// (MergeAttributes' `bogus_marker`).
+    inherited_default: Option<String>,
+    bogus_default: bool,
 }
 
 // ─── ALTER TABLE ────────────────────────────────────────────────────────────
