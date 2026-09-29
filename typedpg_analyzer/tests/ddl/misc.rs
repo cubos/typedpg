@@ -4019,3 +4019,113 @@ fn publication_row_filters_are_validated() {
         ),
     ]);
 }
+
+#[test]
+fn publication_membership_rules() {
+    // PG 18 parse_publication_options / OpenTableList /
+    // TransformPubWhereClauses / CheckPubRelationColumnList /
+    // pub_collist_validate / PublicationDropTables / AlterPublicationSchemas
+    // / AlterPublicationOptions.
+    let setup = "CREATE TABLE t (a int, b int);
+                 CREATE TABLE pt (a int, b int) PARTITION BY LIST (a);
+                 CREATE VIEW v AS SELECT 1 AS a;
+                 CREATE PUBLICATION p FOR TABLE t;
+                 CREATE PUBLICATION r FOR TABLE pt WHERE (a > 1) WITH (publish_via_partition_root);
+                 CREATE PUBLICATION rc FOR TABLE pt (a) WITH (publish_via_partition_root);
+                 CREATE PUBLICATION h FOR TABLE t (a);";
+    for (stmt, msg) in [
+        (
+            "ALTER PUBLICATION p DROP TABLE t WHERE (a > 1);",
+            "cannot use a WHERE clause when removing a table from a publication",
+        ),
+        (
+            "ALTER PUBLICATION p DROP TABLE t (a);",
+            "column list must not be specified in ALTER PUBLICATION ... DROP",
+        ),
+        (
+            "ALTER PUBLICATION p DROP TABLE v;",
+            "relation \"v\" is not part of the publication",
+        ),
+        (
+            "CREATE PUBLICATION q FOR TABLE t WHERE (a > 1), t;",
+            "conflicting or redundant WHERE clauses for table \"t\"",
+        ),
+        (
+            "CREATE PUBLICATION q FOR TABLE t (a), t;",
+            "conflicting or redundant column lists for table \"t\"",
+        ),
+        (
+            "CREATE PUBLICATION q FOR TABLE pt WHERE (a > 1);",
+            "cannot use publication WHERE clause for relation \"pt\"",
+        ),
+        (
+            "CREATE PUBLICATION q; ALTER PUBLICATION q ADD TABLE pt WHERE (a > 1);",
+            "cannot use publication WHERE clause for relation \"pt\"",
+        ),
+        (
+            "CREATE PUBLICATION q FOR TABLE pt (a);",
+            "cannot use column list for relation \"public.pt\" in publication \"q\"",
+        ),
+        (
+            "CREATE PUBLICATION q FOR TABLES IN SCHEMA public, TABLE t (a);",
+            "cannot use column list for relation \"public.t\" in publication \"q\"",
+        ),
+        (
+            "CREATE PUBLICATION q FOR TABLE t (a, a);",
+            "duplicate column \"a\" in publication column list",
+        ),
+        (
+            "CREATE PUBLICATION q FOR TABLE t (ctid);",
+            "cannot use system column \"ctid\" in publication column list",
+        ),
+        (
+            "ALTER PUBLICATION h ADD TABLES IN SCHEMA public;",
+            "cannot add schema to publication \"h\"",
+        ),
+        (
+            "ALTER PUBLICATION r SET (publish_via_partition_root = false);",
+            "cannot set parameter \"publish_via_partition_root\" to false for publication \"r\"",
+        ),
+        (
+            "ALTER PUBLICATION rc SET (publish_via_partition_root = off);",
+            "cannot set parameter \"publish_via_partition_root\" to false for publication \"rc\"",
+        ),
+        (
+            "CREATE PUBLICATION q WITH (publish_via_partition_root = 'maybe');",
+            "publish_via_partition_root requires a Boolean value",
+        ),
+        (
+            "CREATE PUBLICATION q WITH (publish_via_partition_root = 'yes');",
+            "publish_via_partition_root requires a Boolean value",
+        ),
+        (
+            "CREATE PUBLICATION q WITH (publish_generated_columns = 'maybe');",
+            "invalid value for publication parameter \"publish_generated_columns\": \"maybe\"",
+        ),
+        (
+            "CREATE PUBLICATION q WITH (publish = 'insert', publish = 'update');",
+            "conflicting or redundant options",
+        ),
+        (
+            "CREATE PUBLICATION q WITH (publish);",
+            "publish requires a parameter",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "CREATE PUBLICATION q1 FOR TABLE t, t;
+             CREATE PUBLICATION q2 WITH (publish = 'INSERT', publish_generated_columns = 'STORED',
+                 publish_via_partition_root = 1);
+             CREATE PUBLICATION q3 WITH (publish_via_partition_root = 'ON');
+             ALTER PUBLICATION q3 ADD TABLE pt WHERE (a > 1), t, t;
+             ALTER PUBLICATION q3 SET TABLE t WHERE (a > 1), pt WHERE (b > 1);
+             ALTER PUBLICATION r SET (publish_via_partition_root = true);
+             ALTER PUBLICATION p SET (publish_via_partition_root = false);",
+        ),
+    ]);
+}
