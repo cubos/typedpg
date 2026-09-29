@@ -236,6 +236,7 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         node::Node::CreateOpClassStmt(s) => opclass::create_opclass(db, s),
         node::Node::CreateOpFamilyStmt(s) => opclass::create_opfamily(db, s),
         node::Node::TruncateStmt(s) => maintenance::truncate(db, s),
+        node::Node::CopyStmt(s) => maintenance::copy(db, s),
         node::Node::ClusterStmt(s) => maintenance::cluster(db, s),
         node::Node::ReindexStmt(s) => maintenance::reindex(db, s),
         node::Node::VacuumStmt(s) => maintenance::vacuum(db, s),
@@ -248,7 +249,6 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         | node::Node::AlterRoleStmt(_)
         | node::Node::AlterOpFamilyStmt(_)
         | node::Node::AlterOperatorStmt(_)
-        | node::Node::CopyStmt(_)
         | node::Node::VariableShowStmt(_)
         | node::Node::DiscardStmt(_)
         | node::Node::ExplainStmt(_)

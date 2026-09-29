@@ -3113,3 +3113,58 @@ fn do_blocks_are_compiled() {
         ),
     ]);
 }
+
+#[test]
+fn copy_resolves_its_relation_and_options() {
+    // PG 18 DoCopy / ProcessCopyOptions / BeginCopyTo / BeginCopyFrom.
+    let setup = "CREATE TABLE t (a int, b int);
+                 CREATE VIEW v AS SELECT 1 AS a;
+                 CREATE SEQUENCE s;
+                 CREATE MATERIALIZED VIEW mv AS SELECT 1 AS a;
+                 CREATE TABLE p (a int) PARTITION BY LIST (a);";
+    for (stmt, msg) in [
+        ("COPY v TO STDOUT;", "cannot copy from view \"v\""),
+        ("COPY s TO STDOUT;", "cannot copy from sequence \"s\""),
+        (
+            "COPY p TO STDOUT;",
+            "cannot copy from partitioned table \"p\"",
+        ),
+        (
+            "COPY t (a, a) TO STDOUT;",
+            "column \"a\" specified more than once",
+        ),
+        (
+            "COPY t (nosuch) TO STDOUT;",
+            "column \"nosuch\" of relation \"t\" does not exist",
+        ),
+        (
+            "COPY nosuch TO STDOUT;",
+            "relation \"nosuch\" does not exist",
+        ),
+        (
+            "COPY (SELECT nosuch FROM t) TO STDOUT;",
+            "column \"nosuch\" does not exist",
+        ),
+        (
+            "COPY t TO STDOUT (FORMAT nosuch);",
+            "COPY format \"nosuch\" not recognized",
+        ),
+        (
+            "COPY t TO STDOUT (nosuchopt 1);",
+            "option \"nosuchopt\" not recognized",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "COPY t TO STDOUT;
+             COPY t (a) TO STDOUT (FORMAT csv, HEADER);
+             COPY mv TO STDOUT;
+             COPY (SELECT * FROM v) TO STDOUT;",
+        ),
+    ]);
+}

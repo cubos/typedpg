@@ -248,3 +248,103 @@ pub fn alter_default_privileges(
     }
     Ok(())
 }
+
+/// COPY (DoCopy / ProcessCopyOptions / BeginCopyTo / BeginCopyFrom): the
+/// options must be known, the relation must suit the direction and the
+/// column list name its columns once; COPY (query) TO analyzes the query.
+/// The data itself (files, STDIN) isn't modeled.
+pub fn copy(interp: &PgCatalog, stmt: &pg_query::protobuf::CopyStmt) -> Result<(), DdlError> {
+    const OPTIONS: &[&str] = &[
+        "format",
+        "freeze",
+        "delimiter",
+        "null",
+        "default",
+        "header",
+        "quote",
+        "escape",
+        "force_quote",
+        "force_not_null",
+        "force_null",
+        "convert_selectively",
+        "encoding",
+        "on_error",
+        "reject_limit",
+        "log_verbosity",
+    ];
+    for opt in &stmt.options {
+        let Some(node::Node::DefElem(de)) = opt.node.as_ref() else {
+            continue;
+        };
+        if !OPTIONS.contains(&de.defname.as_str()) {
+            return Err(DdlError::Parse(format!(
+                "option \"{}\" not recognized",
+                de.defname
+            )));
+        }
+        if de.defname == "format"
+            && let Some(node::Node::String(s)) = de.arg.as_deref().and_then(|a| a.node.as_ref())
+            && !matches!(
+                s.sval.to_ascii_lowercase().as_str(),
+                "text" | "csv" | "binary"
+            )
+        {
+            return Err(DdlError::UnsupportedDdl(format!(
+                "COPY format \"{}\" not recognized",
+                s.sval
+            )));
+        }
+    }
+    if let Some(query) = stmt.query.as_deref().and_then(|q| q.node.as_ref()) {
+        return super::dml::check_statement(interp, query);
+    }
+    let Some(rv) = stmt.relation.as_ref() else {
+        return Ok(());
+    };
+    let (_, relid) = super::util::lookup_relation(interp, rv)?;
+    let kind = relkind(interp, relid);
+    let refused = if stmt.is_from {
+        match kind {
+            Some(RelKind::View) => Some(("cannot copy to view", "")),
+            Some(RelKind::MaterializedView) => Some(("cannot copy to materialized view", "")),
+            Some(RelKind::Sequence) => Some(("cannot copy to sequence", "")),
+            _ => None,
+        }
+    } else {
+        match kind {
+            Some(RelKind::View) => Some((
+                "cannot copy from view",
+                " (Try the COPY (SELECT ...) TO variant.)",
+            )),
+            Some(RelKind::Sequence) => Some(("cannot copy from sequence", "")),
+            Some(RelKind::Partitioned) => Some((
+                "cannot copy from partitioned table",
+                " (Try the COPY (SELECT ...) TO variant.)",
+            )),
+            Some(RelKind::ForeignTable) => Some((
+                "cannot copy from foreign table",
+                " (Try the COPY (SELECT ...) TO variant.)",
+            )),
+            _ => None,
+        }
+    };
+    if let Some((msg, hint)) = refused {
+        return Err(DdlError::Parse(format!("{msg} \"{}\"{hint}", rv.relname)));
+    }
+    let mut seen: Vec<&str> = Vec::new();
+    for col in stmt.attlist.iter().filter_map(super::util::node_string) {
+        if interp.attribute_by_name(relid, col).is_none() {
+            return Err(DdlError::Parse(format!(
+                "column \"{col}\" of relation \"{}\" does not exist",
+                rv.relname
+            )));
+        }
+        if seen.contains(&col) {
+            return Err(DdlError::DuplicateObject(format!(
+                "column \"{col}\" specified more than once"
+            )));
+        }
+        seen.push(col);
+    }
+    Ok(())
+}
