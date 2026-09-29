@@ -2581,3 +2581,26 @@ fn composite_casts_between_unrelated_types_are_rejected() {
 /// coerce_type leaves a composite value cast to `record` as it is, so the
 /// column keeps the composite type (and its fields stay selectable).
 #[test]
+fn composite_cast_to_record_keeps_its_type() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TYPE comp AS (a INT, b TEXT); CREATE TABLE ct (cs comp[]);")
+        .unwrap();
+    let s = db
+        .analyze("SELECT '(1,a)'::comp::record AS b, ('(1,a)'::comp::record).a AS a")
+        .unwrap();
+    assert!(matches!(&s.columns[0].pg_type, Type::Composite { name, .. } if name == "comp"));
+    assert_eq!(s.columns[1].pg_type, int4());
+    // An array of composites cast to `record[]` likewise — except an
+    // `ARRAY[...]` constructor, which is built against the target's element
+    // type directly.
+    let s = db
+        .analyze("SELECT cs::record[] AS b, ARRAY['(1,a)'::comp]::record[] AS c FROM ct")
+        .unwrap();
+    assert!(matches!(&s.columns[0].pg_type,
+        Type::Array { element } if matches!(&**element, Type::Composite { name, .. } if name == "comp")));
+}
+
+/// Selecting a field of a `record` whose shape is unknown (a `RETURNS
+/// record` function called without a column definition list) is PG's
+/// `could not identify column` (42703), not a "not a composite type" error.
+#[test]

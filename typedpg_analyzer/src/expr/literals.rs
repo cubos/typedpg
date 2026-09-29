@@ -135,10 +135,8 @@ pub(crate) fn infer_type_cast(
     // (`ARRAY[$1]::int[]` makes `$1` an integer).
     let target_base = snapshot.unwrap_domain(target_oid);
     let array_target = match inner.node.as_ref() {
-        Some(node::Node::AArrayExpr(arr)) => snapshot
-            .get_type(target_base)
-            .filter(|t| t.typcategory == TypCategory::Array)
-            .and_then(|t| t.typelem)
+        // (`get_element_type`: also `record[]`, a pseudo-type array.)
+        Some(node::Node::AArrayExpr(arr)) => array_element_type(snapshot, target_base)
             .map(|element_type| {
                 (
                     arr,
@@ -155,6 +153,7 @@ pub(crate) fn infer_type_cast(
             }),
         _ => None,
     };
+    let built_for_target = array_target.is_some();
     let inner_type = match array_target {
         Some((arr, target)) => transform_array_expr(arr, ctx, params, Some(target))?,
         None => infer_expr(inner, ctx, params, inner_goal)?,
@@ -183,6 +182,19 @@ pub(crate) fn infer_type_cast(
         )
         .with_primary_label(format!("this is {from}"))
         .finalize_implicit());
+    }
+
+    // coerce_type: a composite value cast to `record` (or an array of one to
+    // `record[]`) is left as it is — the result keeps the composite type.
+    // (An `ARRAY[...]` operand was built as the target array type above.)
+    const RECORDARRAY: PgTypeOid = PgTypeOid::from_raw(2287);
+    if (target_oid == oid::RECORD && coerce::is_complex(inner_type.type_oid, snapshot))
+        || (target_oid == RECORDARRAY
+            && !built_for_target
+            && coerce::element_type(inner_type.type_oid, snapshot)
+                .is_some_and(|e| coerce::is_complex(e, snapshot)))
+    {
+        return Ok(inner_type);
     }
 
     // PG: the cast result has exactly the written typmod — `x::T(n)` is
