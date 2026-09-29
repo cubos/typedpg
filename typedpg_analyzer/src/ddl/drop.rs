@@ -19,6 +19,20 @@ pub fn drop_objects(interp: &mut PgCatalog, stmt: &DropStmt) -> Result<(), DdlEr
         Ok(DropBehavior::DropCascade)
     );
 
+    // The relations one DROP names go together (performMultipleDeletions):
+    // dependencies among them need no CASCADE.
+    let named_relations: Vec<PgClassOid> = stmt
+        .objects
+        .iter()
+        .filter_map(|obj_node| match obj_node.node.as_ref() {
+            Some(node::Node::List(list)) => {
+                let (schema, name) = extract_names(&list.items, interp);
+                let nsoid = interp.namespace_oid(&schema)?;
+                interp.class_by_qname.get(&(nsoid, name)).copied()
+            }
+            _ => None,
+        })
+        .collect();
     for obj_node in &stmt.objects {
         match obj_type {
             ObjectType::ObjectTable
@@ -26,7 +40,14 @@ pub fn drop_objects(interp: &mut PgCatalog, stmt: &DropStmt) -> Result<(), DdlEr
             | ObjectType::ObjectMatview
             | ObjectType::ObjectSequence
             | ObjectType::ObjectForeignTable => {
-                drop_relation(interp, obj_node, stmt.missing_ok, cascade, obj_type)?;
+                drop_relation(
+                    interp,
+                    obj_node,
+                    stmt.missing_ok,
+                    cascade,
+                    obj_type,
+                    &named_relations,
+                )?;
             }
             ObjectType::ObjectType | ObjectType::ObjectDomain => {
                 drop_type(interp, obj_node, stmt.missing_ok, cascade)?;
@@ -109,6 +130,7 @@ fn drop_relation(
     missing_ok: bool,
     cascade: bool,
     requested: ObjectType,
+    named_relations: &[PgClassOid],
 ) -> Result<(), DdlError> {
     let names = match obj_node.node.as_ref() {
         Some(node::Node::List(list)) => &list.items,
@@ -170,6 +192,59 @@ fn drop_relation(
             "\"{name}\" is not a {requested_kind}"
         )));
     }
+    drop_relation_oid(interp, class_oid, &name, kind, cascade, named_relations)
+}
+
+/// Drop relation `class_oid` (named `name`, a `kind`) and what depends on
+/// it: its inheritance children need CASCADE (a partition goes with its
+/// parent regardless), and so do views, foreign keys in other tables,
+/// functions over its row type and defaults using it as a sequence —
+/// unless the same DROP names them too.
+fn drop_relation_oid(
+    interp: &mut PgCatalog,
+    class_oid: PgClassOid,
+    name: &str,
+    kind: &str,
+    cascade: bool,
+    named_relations: &[PgClassOid],
+) -> Result<(), DdlError> {
+    // Inheritance children depend on their parent (DEPENDENCY_NORMAL); a
+    // partition is part of it (DEPENDENCY_AUTO).
+    let partitioned =
+        interp.pg_class.get(&class_oid).map(|c| c.relkind) == Some(RelKind::Partitioned);
+    let children: Vec<PgClassOid> = super::tables::inherit::children_of(interp, class_oid);
+    if !partitioned
+        && !cascade
+        && let Some(&child) = children.iter().find(|c| !named_relations.contains(c))
+    {
+        let child_name = interp
+            .pg_class
+            .get(&child)
+            .map(|c| c.relname.clone())
+            .unwrap_or_default();
+        return Err(DdlError::DependencyError(format!(
+            "cannot drop {kind} {name} because other objects depend on it (table \
+             {child_name} depends on {kind} {name})"
+        )));
+    }
+    for child in children {
+        if named_relations.contains(&child) || !interp.pg_class.contains_key(&child) {
+            continue;
+        }
+        let child_name = interp
+            .pg_class
+            .get(&child)
+            .map(|c| c.relname.clone())
+            .unwrap_or_default();
+        drop_relation_oid(
+            interp,
+            child,
+            &child_name,
+            "table",
+            cascade,
+            named_relations,
+        )?;
+    }
 
     let dependent_views = views::find_dependent_views(interp, class_oid);
     if !dependent_views.is_empty() && !cascade {
@@ -197,6 +272,9 @@ fn drop_relation(
         .filter(|c| {
             matches!(c.contype, crate::pg_catalog::ConType::ForeignKey)
                 && c.confrelid == Some(class_oid)
+                // Its own foreign keys go with it.
+                && c.conrelid != class_oid
+                && !named_relations.contains(&c.conrelid)
         })
         .filter_map(|c| {
             let owner = interp.pg_class.get(&c.conrelid)?;

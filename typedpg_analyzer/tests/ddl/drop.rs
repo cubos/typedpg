@@ -285,3 +285,41 @@ fn drop_type_reports_a_missing_type_like_pg() {
         "type \"nosuch\" does not exist",
     );
 }
+
+#[test]
+fn drop_table_takes_inheritance_children_only_with_cascade() {
+    // PG 18: an inheritance child depends on its parent; a partition is
+    // part of it; a table's own foreign keys go with it.
+    let setup = "CREATE TABLE p (a int);
+                 CREATE TABLE c () INHERITS (p);
+                 CREATE TABLE c2 () INHERITS (c);";
+    let err = try_apply(&[("0001.sql", setup), ("0002.sql", "DROP TABLE p;")]).unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("cannot drop table p because other objects depend on it"),
+        "{err}"
+    );
+    let db = build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "DROP TABLE p CASCADE;
+             CREATE TABLE c (x int);
+             CREATE TABLE c2 (x int);
+             CREATE TABLE pp (a int) PARTITION BY LIST (a);
+             CREATE TABLE pp1 PARTITION OF pp FOR VALUES IN (1);
+             DROP TABLE pp;
+             CREATE TABLE pp1 (y int);
+             CREATE TABLE s (a int PRIMARY KEY, b int REFERENCES s);
+             DROP TABLE s;
+             CREATE TABLE m1 (a int);
+             CREATE TABLE m2 () INHERITS (m1);
+             DROP TABLE m1, m2;
+             CREATE TABLE m3 (a int);
+             CREATE TABLE m4 () INHERITS (m3);
+             DROP TABLE m4, m3;",
+        ),
+    ]);
+    assert!(db.resolve_table(None, "m2").is_none());
+    assert!(db.resolve_table(None, "m3").is_none());
+}
