@@ -3840,3 +3840,39 @@ fn functions_follow_pseudo_type_rules() {
         ),
     ]);
 }
+
+#[test]
+fn procedure_and_function_result_types() {
+    // PG 18 CreateFunction: a function without RETURNS needs OUT
+    // parameters; a procedure returns void, or record with OUT parameters.
+    let err = try_apply(&[(
+        "0001.sql",
+        "CREATE FUNCTION f() LANGUAGE sql AS 'select 1';",
+    )])
+    .expect_err("no result type");
+    assert!(
+        err.to_string()
+            .starts_with("function result type must be specified"),
+        "got: {err}"
+    );
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE PROCEDURE p0() LANGUAGE sql AS 'select 1';
+         CREATE PROCEDURE p1(OUT a int) LANGUAGE sql AS 'select 1';
+         CREATE PROCEDURE p2(OUT a int, OUT b int) LANGUAGE sql AS 'select 1, 2';
+         CREATE FUNCTION f1(OUT a int) LANGUAGE sql AS 'select 1';",
+    )]);
+    let seed = db.to_seed();
+    let rettype = |name: &str| {
+        let proc = seed.pg_proc.iter().find(|p| p.proname == name).unwrap();
+        seed.pg_type
+            .iter()
+            .find(|t| t.oid == proc.prorettype)
+            .map(|t| t.typname.clone())
+            .unwrap()
+    };
+    assert_eq!(rettype("p0"), "void");
+    assert_eq!(rettype("p1"), "record");
+    assert_eq!(rettype("p2"), "record");
+    assert_eq!(rettype("f1"), "int4");
+}

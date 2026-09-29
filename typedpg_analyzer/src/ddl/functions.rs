@@ -138,13 +138,25 @@ pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Res
         .iter()
         .filter(|m| matches!(m, ArgMode::Out | ArgMode::InOut | ArgMode::Table))
         .count();
+    // CreateFunction: a procedure returns void, or record with OUT
+    // parameters; a function needs RETURNS unless OUT parameters give it
+    // its result type.
+    const VOID: PgTypeOid = PgTypeOid::from_raw(2278);
     let prorettype = match explicit_return_oid {
         Some(oid) => oid,
+        None if stmt.is_procedure => {
+            if out_count == 0 {
+                VOID
+            } else {
+                builtin_oid::RECORD
+            }
+        }
         None => match out_count {
-            // Procedures + plain RETURNS-less functions: PG records void here.
-            // We don't have a void constant in `oid::*`, so fall back to
-            // UNKNOWN — these never appear as expression results anyway.
-            0 => builtin_oid::UNKNOWN,
+            0 => {
+                return Err(DdlError::Parse(
+                    "function result type must be specified".into(),
+                ));
+            }
             1 => proargmodes
                 .iter()
                 .zip(proallargtypes.iter())
