@@ -54,12 +54,7 @@ pub fn create_rule(interp: &mut PgCatalog, stmt: &RuleStmt) -> Result<(), DdlErr
         }
         Some(RelKind::Table | RelKind::Partitioned | RelKind::View | RelKind::ForeignTable) => {}
         Some(kind) => {
-            let kinds = match kind {
-                RelKind::Sequence => "sequences",
-                RelKind::Index | RelKind::PartitionedIndex => "indexes",
-                RelKind::CompositeType => "composite types",
-                _ => "this relation",
-            };
+            let kinds = kind.plural();
             return Err(DdlError::Parse(format!(
                 "relation \"{}\" cannot have rules (This operation is not supported for \
                  {kinds}.)",

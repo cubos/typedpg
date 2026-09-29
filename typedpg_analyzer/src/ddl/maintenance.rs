@@ -195,11 +195,8 @@ pub fn lock(interp: &PgCatalog, stmt: &LockStmt) -> Result<(), DdlError> {
             Some(RelKind::Table | RelKind::Partitioned | RelKind::View | RelKind::ForeignTable) => {
                 continue;
             }
-            Some(RelKind::Sequence) => "sequences",
-            Some(RelKind::MaterializedView) => "materialized views",
-            Some(RelKind::Index | RelKind::PartitionedIndex) => "indexes",
-            Some(RelKind::CompositeType) => "composite types",
-            _ => "this relation",
+            Some(kind) => kind.plural(),
+            None => "this relation",
         };
         return Err(DdlError::Parse(format!(
             "cannot lock relation \"{}\" (This operation is not supported for {kinds}.)",

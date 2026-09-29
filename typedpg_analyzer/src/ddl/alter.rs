@@ -138,7 +138,7 @@ fn rename_constraint(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), Dd
         && let Some(idx_oid) = interp.class_by_qname.get(&(nsoid, old_name)).copied()
         && matches!(
             interp.pg_class.get(&idx_oid).map(|c| c.relkind),
-            Some(crate::pg_catalog::RelKind::Index)
+            Some(crate::pg_catalog::RelKind::Index | crate::pg_catalog::RelKind::PartitionedIndex)
         )
     {
         interp.rename_pg_class(idx_oid, stmt.newname.clone(), nsoid);
@@ -225,8 +225,10 @@ fn rename_relation(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlE
     }
     // Renaming a constraint's index renames the constraint too
     // (RenameRelationInternal → RenameConstraintById).
-    if class.as_ref().map(|c| c.relkind) == Some(crate::pg_catalog::RelKind::Index)
-        && let Some(indrelid) = interp.pg_index.get(&class_oid).map(|i| i.indrelid)
+    if matches!(
+        class.as_ref().map(|c| c.relkind),
+        Some(crate::pg_catalog::RelKind::Index | crate::pg_catalog::RelKind::PartitionedIndex)
+    ) && let Some(indrelid) = interp.pg_index.get(&class_oid).map(|i| i.indrelid)
     {
         for c in interp.pg_constraint.values_mut() {
             if c.conrelid == indrelid && c.conname == old_name {

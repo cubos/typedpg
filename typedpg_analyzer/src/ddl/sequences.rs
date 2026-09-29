@@ -310,16 +310,7 @@ pub fn alter_sequence(interp: &mut PgCatalog, stmt: &AlterSeqStmt) -> Result<(),
     // validate_relation_kind (sequence.c).
     let relkind = interp.pg_class.get(&seq_oid).map(|c| c.relkind);
     if relkind != Some(RelKind::Sequence) {
-        let kinds = match relkind {
-            Some(RelKind::Table) => "tables",
-            Some(RelKind::Partitioned) => "partitioned tables",
-            Some(RelKind::View) => "views",
-            Some(RelKind::MaterializedView) => "materialized views",
-            Some(RelKind::Index | RelKind::PartitionedIndex) => "indexes",
-            Some(RelKind::CompositeType) => "composite types",
-            Some(RelKind::ForeignTable) => "foreign tables",
-            _ => "this relation",
-        };
+        let kinds = relkind.map_or("this relation", RelKind::plural);
         return Err(DdlError::Parse(format!(
             "cannot open relation \"{name}\" (This operation is not supported for {kinds}.)"
         )));

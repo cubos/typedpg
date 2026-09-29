@@ -32,11 +32,12 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
     let table_name = rv.relname.clone();
     if let Some(class) = db.pg_class.get(&indrelid) {
         let kinds = match class.relkind {
-            RelKind::View => Some("views"),
-            RelKind::Sequence => Some("sequences"),
-            RelKind::CompositeType => Some("composite types"),
-            RelKind::Index | RelKind::PartitionedIndex => Some("indexes"),
-            RelKind::ForeignTable => Some("foreign tables"),
+            RelKind::View
+            | RelKind::Sequence
+            | RelKind::CompositeType
+            | RelKind::Index
+            | RelKind::PartitionedIndex
+            | RelKind::ForeignTable => Some(class.relkind.plural()),
             _ => None,
         };
         if let Some(kinds) = kinds {
@@ -292,11 +293,12 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
     // ── Allocate the index's pg_class oid + insert pg_index ──
     let indexrelid = PgClassOid::from_nonzero(db.alloc_oid()?);
     db.index_access_methods.insert(indexrelid, am.to_owned());
+    let relkind = RelKind::index_on(db.pg_class.get(&indrelid).map(|c| c.relkind));
     db.insert_pg_class(PgClass {
         oid: indexrelid,
         relname: conname.clone(),
         relnamespace: nsoid,
-        relkind: RelKind::Index,
+        relkind,
         reltype: None,
     });
 

@@ -55,14 +55,7 @@ pub(super) fn add_inherit(
             )));
         }
         Some(kind) => {
-            let kinds = match kind {
-                RelKind::View => "views",
-                RelKind::MaterializedView => "materialized views",
-                RelKind::Sequence => "sequences",
-                RelKind::Index | RelKind::PartitionedIndex => "indexes",
-                RelKind::CompositeType => "composite types",
-                _ => "this relation",
-            };
+            let kinds = kind.plural();
             return Err(DdlError::Parse(format!(
                 "ALTER action INHERIT cannot be performed on relation \"{}\" (This operation \
                  is not supported for {kinds}.)",
@@ -358,14 +351,7 @@ pub(super) fn attach_partition(
         attach_kind,
         Some(RelKind::Table | RelKind::Partitioned | RelKind::ForeignTable)
     ) {
-        let kinds = match attach_kind {
-            Some(RelKind::View) => "views",
-            Some(RelKind::MaterializedView) => "materialized views",
-            Some(RelKind::Sequence) => "sequences",
-            Some(RelKind::Index | RelKind::PartitionedIndex) => "indexes",
-            Some(RelKind::CompositeType) => "composite types",
-            _ => "this relation",
-        };
+        let kinds = attach_kind.map_or("this relation", RelKind::plural);
         return Err(DdlError::Parse(format!(
             "ALTER action ATTACH PARTITION cannot be performed on relation \"{}\" (This \
              operation is not supported for {kinds}.)",

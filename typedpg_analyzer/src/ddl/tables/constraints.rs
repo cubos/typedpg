@@ -670,11 +670,12 @@ pub(super) fn emit_constraint_with_backing_index(
                 ))
             })?;
         let indexrelid = PgClassOid::from_nonzero(interp.alloc_oid()?);
+        let relkind = RelKind::index_on(interp.pg_class.get(&relid).map(|c| c.relkind));
         interp.insert_pg_class(PgClass {
             oid: indexrelid,
             relname: conname,
             relnamespace: table_ns,
-            relkind: RelKind::Index,
+            relkind,
             reltype: None,
         });
         // The INCLUDE columns follow the key columns.
@@ -1180,7 +1181,7 @@ pub(crate) fn drop_constraint(
                 .copied()
             && matches!(
                 interp.pg_class.get(&idx_oid).map(|c| c.relkind),
-                Some(RelKind::Index)
+                Some(RelKind::Index | RelKind::PartitionedIndex)
             )
         {
             // The partitions' copies and their constraints go too.
@@ -1826,11 +1827,12 @@ pub(crate) fn copy_like_constraints(
                 None => {
                     let name = choose_relation_name(interp, nsoid, relname, &addition, "idx");
                     let indexrelid = PgClassOid::from_nonzero(interp.alloc_oid()?);
+                    let relkind = RelKind::index_on(interp.pg_class.get(&relid).map(|c| c.relkind));
                     interp.insert_pg_class(PgClass {
                         oid: indexrelid,
                         relname: name,
                         relnamespace: nsoid,
-                        relkind: RelKind::Index,
+                        relkind,
                         reltype: None,
                     });
                     interp.insert_pg_index(PgIndex {

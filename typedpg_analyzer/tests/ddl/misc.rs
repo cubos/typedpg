@@ -4581,3 +4581,36 @@ fn grammar_errors_carry_pg_message_verbatim() {
         assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
     }
 }
+
+#[test]
+fn unsupported_relation_kinds_are_named_like_pg() {
+    // errdetail_relkind_not_supported names a partitioned index as such.
+    let setup = "CREATE TABLE pt (a int) PARTITION BY RANGE (a);
+                 CREATE INDEX pti ON pt (a);";
+    for (sql, message) in [
+        (
+            "ALTER SEQUENCE pti RESTART;",
+            "cannot open relation \"pti\" (This operation is not supported for partitioned indexes.)",
+        ),
+        (
+            "SELECT 1; LOCK TABLE pti;",
+            "cannot lock relation \"pti\" (This operation is not supported for partitioned indexes.)",
+        ),
+        (
+            "ALTER SEQUENCE pt RESTART;",
+            "cannot open relation \"pt\" (This operation is not supported for partitioned tables.)",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", sql)]).expect_err(sql);
+        assert_eq!(err.to_string(), message, "{sql}");
+    }
+    // A partitioned index (relkind I) is still an index to ALTER / DROP
+    // INDEX.
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "ALTER INDEX pti RENAME TO pti2; DROP INDEX pti2;",
+        ),
+    ]);
+}

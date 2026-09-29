@@ -152,7 +152,7 @@ fn create_clone(
         oid: index,
         relname: name.clone(),
         relnamespace: class.relnamespace,
-        relkind: RelKind::Index,
+        relkind: RelKind::index_on(Some(class.relkind)),
         reltype: None,
     });
     interp.insert_pg_index(PgIndex {

@@ -74,11 +74,8 @@ pub fn create_statistics(interp: &mut PgCatalog, stmt: &CreateStatsStmt) -> Resu
             | RelKind::ForeignTable
             | RelKind::MaterializedView,
         ) => None,
-        Some(RelKind::View) => Some("views"),
-        Some(RelKind::Sequence) => Some("sequences"),
-        Some(RelKind::Index | RelKind::PartitionedIndex) => Some("indexes"),
-        Some(RelKind::CompositeType) => Some("composite types"),
-        _ => Some("this relation"),
+        Some(kind) => Some(kind.plural()),
+        None => Some("this relation"),
     };
     if let Some(kinds) = kinds {
         return Err(DdlError::Parse(format!(

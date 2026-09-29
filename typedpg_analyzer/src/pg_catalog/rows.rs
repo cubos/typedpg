@@ -155,6 +155,35 @@ pub enum RelKind {
     PartitionedIndex,
 }
 
+impl RelKind {
+    /// The kind of an index on a relation of kind `table`: a partitioned
+    /// table's indexes are partitioned indexes.
+    pub(crate) fn index_on(table: Option<RelKind>) -> RelKind {
+        if table == Some(RelKind::Partitioned) {
+            RelKind::PartitionedIndex
+        } else {
+            RelKind::Index
+        }
+    }
+
+    /// The relations of this kind, as PG's errdetail_relkind_not_supported
+    /// names them (`This operation is not supported for ...`).
+    pub(crate) fn plural(self) -> &'static str {
+        match self {
+            RelKind::Table => "tables",
+            RelKind::Index => "indexes",
+            RelKind::Sequence => "sequences",
+            RelKind::ToastTable => "TOAST tables",
+            RelKind::View => "views",
+            RelKind::MaterializedView => "materialized views",
+            RelKind::CompositeType => "composite types",
+            RelKind::ForeignTable => "foreign tables",
+            RelKind::Partitioned => "partitioned tables",
+            RelKind::PartitionedIndex => "partitioned indexes",
+        }
+    }
+}
+
 /// `pg_proc.prokind`. PG chars: `f` normal function, `a` aggregate, `w`
 /// window, `p` procedure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

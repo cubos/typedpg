@@ -523,7 +523,7 @@ fn drop_index(
     // Reject if the resolved relation isn't an index — PG: `"X" is not an index`.
     if !matches!(
         interp.pg_class.get(&class_oid).map(|c| c.relkind),
-        Some(RelKind::Index)
+        Some(RelKind::Index | RelKind::PartitionedIndex)
     ) {
         return Err(DdlError::DependencyError(format!(
             "\"{name}\" is not an index"
