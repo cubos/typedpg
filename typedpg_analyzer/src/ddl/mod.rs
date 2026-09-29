@@ -127,8 +127,11 @@ impl std::error::Error for DdlError {
 /// Parse and apply all DDL statements in a SQL string.
 pub(crate) fn apply_sql_to(db: &mut PgCatalog, sql: &str) -> Result<(), DdlError> {
     let was_in_migration = std::mem::replace(&mut db.in_migration, true);
+    // `$user` resolves only in the migrations' session.
+    db.refresh_search_path();
     let result = apply_sql_statements(db, sql);
     db.in_migration = was_in_migration;
+    db.refresh_search_path();
     result
 }
 

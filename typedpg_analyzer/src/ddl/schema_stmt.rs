@@ -9,11 +9,40 @@ use crate::pg_catalog::PgCatalog;
 /// `CREATE SCHEMA [IF NOT EXISTS] name [AUTHORIZATION role] [elements]`
 /// (`CreateSchemaCommand`, schemacmds.c).
 pub fn create_schema(interp: &mut PgCatalog, stmt: &CreateSchemaStmt) -> Result<(), DdlError> {
+    // get_rolespec_oid: the owner role must exist — `public` never does.
+    // CURRENT_USER / CURRENT_ROLE / SESSION_USER are known once the
+    // migrations name them (SET ROLE / SET SESSION AUTHORIZATION).
+    use typedpg_pg_query::protobuf::RoleSpecType;
+    let role =
+        stmt.authrole
+            .as_ref()
+            .and_then(|r| match RoleSpecType::try_from(r.roletype).ok()? {
+                RoleSpecType::RolespecCstring => Some(Ok(r.rolename.clone())),
+                RoleSpecType::RolespecPublic => Some(Err("public".to_owned())),
+                RoleSpecType::RolespecCurrentRole | RoleSpecType::RolespecCurrentUser => interp
+                    .session_identity
+                    .current_user()
+                    .map(|u| Ok(u.to_owned())),
+                RoleSpecType::RolespecSessionUser => interp
+                    .session_identity
+                    .session_user()
+                    .map(|u| Ok(u.to_owned())),
+                RoleSpecType::Undefined => None,
+            });
+    let role = match role {
+        Some(Ok(name)) if super::session::role_may_exist(&name) => Some(name),
+        Some(Ok(name)) | Some(Err(name)) => {
+            return Err(DdlError::TypeNotFound(format!(
+                "role \"{name}\" does not exist"
+            )));
+        }
+        None => None,
+    };
     // `CREATE SCHEMA AUTHORIZATION role` names the schema after the role.
     let name = if stmt.schemaname.is_empty() {
-        match stmt.authrole.as_ref() {
-            Some(role) if !role.rolename.is_empty() => role.rolename.clone(),
-            _ => return Ok(()),
+        match role {
+            Some(role) => role,
+            None => return Ok(()),
         }
     } else {
         stmt.schemaname.clone()

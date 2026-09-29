@@ -239,3 +239,123 @@ fn create_schema_errors() {
         "CREATE specifies a schema (public) different from the one being created (s3)",
     );
 }
+
+// ── Session identity: SET ROLE / SET SESSION AUTHORIZATION ─────────────────
+
+#[test]
+fn set_role_and_session_authorization_are_accepted() {
+    // PG 18 accepts each of these for a role that exists (`postgres`, the
+    // predefined roles); `NONE` / DEFAULT / RESET go back to no role.
+    build_db(&[(
+        "0001.sql",
+        "SET ROLE postgres;
+         SET ROLE NONE;
+         SET ROLE 'none';
+         RESET ROLE;
+         SET ROLE TO DEFAULT;
+         SET role = 'postgres';
+         BEGIN;
+         SET LOCAL ROLE postgres;
+         COMMIT;
+         SET ROLE pg_read_all_data;
+         RESET ROLE;
+         SET SESSION AUTHORIZATION postgres;
+         SET SESSION AUTHORIZATION DEFAULT;
+         SET session_authorization = postgres;
+         RESET SESSION AUTHORIZATION;
+         SET session_authorization TO DEFAULT;
+         SELECT set_config('role', 'postgres', false);
+         SELECT set_config('role', 'none', false);
+         RESET ALL;",
+    )]);
+    // Roles that can't exist: `public` and `none` are reserved role names,
+    // and so is every `pg_` name but the predefined roles.
+    for stmt in [
+        "SET ROLE public;",
+        "SET ROLE \"public\";",
+        "SET ROLE pg_foo;",
+        "SET SESSION AUTHORIZATION none;",
+        "SET SESSION AUTHORIZATION public;",
+        "SET SESSION AUTHORIZATION pg_foo;",
+        "SELECT set_config('role', 'pg_foo', false);",
+        "CREATE SCHEMA AUTHORIZATION public;",
+        "CREATE SCHEMA s AUTHORIZATION pg_foo;",
+    ] {
+        let err = try_apply(&[("0001.sql", stmt)]).expect_err(stmt);
+        let role = if stmt.contains("none") {
+            "none"
+        } else if stmt.contains("public") {
+            "public"
+        } else {
+            "pg_foo"
+        };
+        assert!(
+            err.to_string()
+                .starts_with(&format!("role \"{role}\" does not exist")),
+            "{stmt}\n  got: {err}"
+        );
+    }
+}
+
+#[test]
+fn user_in_search_path_follows_the_migration_role() {
+    // PG 18: with the default search_path ("$user", public), a table
+    // created under SET ROLE / SET SESSION AUTHORIZATION goes to the schema
+    // named after the current user, when there is one.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE SCHEMA postgres;
+         SET ROLE postgres;
+         CREATE TABLE ut (a int);
+         RESET ROLE;
+         SET SESSION AUTHORIZATION postgres;
+         CREATE TABLE ut2 (a int);
+         RESET SESSION AUTHORIZATION;",
+    )]);
+    for table in ["postgres.ut", "postgres.ut2"] {
+        let info = db.analyze(&format!("SELECT * FROM {table}")).unwrap();
+        assert_cols(&info, vec![cn("a", int4())]);
+    }
+    let err = db.analyze("SELECT * FROM public.ut").unwrap_err();
+    assert!(matches!(err, AnalyzeError::UndefinedTable(_)), "{err:?}");
+}
+
+#[test]
+fn unverifiable_role_names_are_assumed_to_exist() {
+    // Roles live in the cluster, not in the catalog the migrations build:
+    // a name that could be a role is taken as one (PG would reject it only
+    // if the cluster has no such role, or the session may not take it).
+    let mut db = PgCatalog::new().unwrap();
+    db.skip_pg_sanity();
+    db.apply_sql(
+        "CREATE SCHEMA app_owner;
+         SET ROLE app_owner;
+         CREATE TABLE t (a int);",
+    )
+    .unwrap();
+    // CURRENT_ROLE is app_owner, whose schema exists.
+    let err = db
+        .apply_sql("CREATE SCHEMA AUTHORIZATION CURRENT_ROLE;")
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("schema \"app_owner\" already exists"),
+        "{err}"
+    );
+    db.apply_sql(
+        "SET SESSION AUTHORIZATION app_admin;
+         CREATE SCHEMA AUTHORIZATION SESSION_USER;
+         SET ROLE app_owner;
+         CREATE TABLE t2 (a int);",
+    )
+    .unwrap();
+    for table in ["app_owner.t", "app_owner.t2"] {
+        let info = db.analyze(&format!("SELECT * FROM {table}")).unwrap();
+        assert_cols(&info, vec![cn("a", int4())]);
+    }
+    assert!(db.resolve_table(Some("app_admin"), "t2").is_none());
+    assert!(db.namespace_oid("app_admin").is_some());
+    // The application's session is not the migrations': its `$user` is
+    // unknown.
+    assert!(db.resolve_table(None, "t2").is_none());
+}

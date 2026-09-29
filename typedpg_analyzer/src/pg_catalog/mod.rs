@@ -217,6 +217,8 @@ pub struct PgCatalog {
     /// PG keeps the GUC as a list of names and resolves it lazily, so a path
     /// may name a schema that is only created later.
     pub(crate) search_path_guc: crate::ddl::session::SearchPathGuc,
+    /// `SET ROLE` / `SET SESSION AUTHORIZATION` of the migrations' session.
+    pub(crate) session_identity: crate::ddl::session::SessionIdentity,
     /// Named constraints of user domains (PG keeps them in `pg_constraint`
     /// with `contypid` set): what `ALTER DOMAIN ... DROP CONSTRAINT name`
     /// resolves against. The domain's effective NOT NULL lives in
@@ -579,6 +581,7 @@ impl PgCatalog {
             collation_by_qname: HashMap::new(),
             search_path: Vec::new(),
             search_path_guc: Default::default(),
+            session_identity: Default::default(),
             domain_constraints: HashMap::new(),
             attr_default_types: HashMap::new(),
             attr_default_exprs: HashMap::new(),
