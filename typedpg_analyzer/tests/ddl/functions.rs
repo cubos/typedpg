@@ -986,3 +986,35 @@ fn plpgsql_bodies_compile_against_the_migration_catalog() {
         );
     }
 }
+
+#[test]
+fn sql_function_parameters_are_typed_params() {
+    // A SQL function's $n are Params of the argument types (not casts), and
+    // a $n beyond the arguments is PG's `there is no parameter $n`.
+    build_db(&[(
+        "0001.sql",
+        "CREATE FUNCTION q3(a int, b text) RETURNS text LANGUAGE sql AS $$ SELECT $2 || 'x' WHERE $1 > 0 $$;
+         CREATE FUNCTION q4(a int) RETURNS int LANGUAGE sql RETURN $1 + 1;
+         CREATE FUNCTION q5(a int) RETURNS text LANGUAGE sql AS $$ SELECT $1 || 'x' $$;",
+    )]);
+    for (function, message) in [
+        (
+            "CREATE FUNCTION q1(a int) RETURNS int LANGUAGE sql AS $$ SELECT $2 $$;",
+            "there is no parameter $2",
+        ),
+        (
+            "CREATE FUNCTION q2(a int) RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT $2; END;",
+            "there is no parameter $2",
+        ),
+        (
+            "CREATE FUNCTION q6(a text) RETURNS bool LANGUAGE sql AS $$ SELECT $1 = 1 $$;",
+            "operator does not exist: text = integer",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", function)]).expect_err(function);
+        assert!(
+            err.to_string().starts_with(message),
+            "{function}\n  got: {err}"
+        );
+    }
+}

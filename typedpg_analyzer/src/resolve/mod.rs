@@ -326,7 +326,28 @@ pub(crate) fn analyze_raw_node(
             params.set_nullable((i + 1) as i32, explicit);
         }
     }
+    analyze_raw_node_with(snapshot, stmt, params)
+}
 
+/// [`analyze_raw_node`] for a statement whose `$1…$n` already have types —
+/// a SQL function body, whose parameters are the function's arguments.
+pub(crate) fn analyze_raw_node_with_param_types(
+    snapshot: &PgCatalog,
+    stmt: &node::Node,
+    param_types: &[crate::oid::PgTypeOid],
+) -> Result<(Vec<RawColumn>, Vec<RawParam>), AnalyzeError> {
+    let mut params = ParamCollector::default();
+    for (i, &t) in param_types.iter().enumerate() {
+        params.record((i + 1) as i32, t);
+    }
+    analyze_raw_node_with(snapshot, stmt, params)
+}
+
+fn analyze_raw_node_with(
+    snapshot: &PgCatalog,
+    stmt: &node::Node,
+    mut params: ParamCollector,
+) -> Result<(Vec<RawColumn>, Vec<RawParam>), AnalyzeError> {
     let (raw_columns, raw_params) = match stmt {
         // `SELECT … INTO t` is CREATE TABLE AS (transformSelectStmt turns it
         // into a CreateTableAsStmt): it returns no rows.

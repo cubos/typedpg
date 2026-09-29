@@ -14,7 +14,7 @@
 //! ([`crate::expr::with_sql_function_params`]), after columns and relations,
 //! as PG's `sql_fn_post_column_ref` does.
 
-use typedpg_pg_query::protobuf::{self, CreateFunctionStmt, Token, node};
+use typedpg_pg_query::protobuf::{self, CreateFunctionStmt, node};
 
 use super::DdlError;
 use crate::coerce::{CoercionContext, can_coerce};
@@ -31,7 +31,7 @@ pub(crate) fn validate_sql_function(
     if !language_is_sql(stmt) {
         return Ok(());
     }
-    // The statements of the body, as SQL text.
+    // The statements of the body, parsed.
     let (statements, always_check) = match body_statements(stmt)? {
         Some(found) => found,
         None => return Ok(()),
@@ -54,40 +54,46 @@ pub(crate) fn validate_sql_function(
         name: proc.proname.clone(),
         params: params.clone(),
     };
+    let param_types: Vec<PgTypeOid> = params.iter().map(|(_, t)| *t).collect();
     let mut last: Option<LastStatement> = None;
-    for sql in &statements {
-        let rewritten = substitute_params(interp, sql, &params)?;
-        let parsed =
-            typedpg_pg_query::parse(&rewritten).map_err(|e| DdlError::Parse(e.to_string()))?;
-        for raw in &parsed.protobuf.stmts {
-            let Some(inner) = raw.stmt.as_ref().and_then(|n| n.node.as_ref()) else {
-                continue;
-            };
-            if !is_analyzable(inner) {
-                // A utility statement: PG runs it only at call time, and the
-                // statements after it may depend on what it creates.
-                return Ok(());
-            }
-            let analyzed = crate::expr::with_sql_function_params(namespace(), || {
-                crate::resolve::analyze_raw_node(interp, inner, &[])
-            });
-            let columns = match analyzed {
-                Ok((columns, _)) => Some(columns),
-                // A construct the analyzer doesn't model says nothing about
-                // the body; every other error is one PG's parse analysis
-                // raises too.
-                Err(
-                    AnalyzeError::Unsupported(_)
-                    | AnalyzeError::UnsupportedJoinType(_)
-                    | AnalyzeError::Internal(_),
-                ) => None,
-                Err(e) => return Err(DdlError::UnsupportedDdl(format!("{e}"))),
-            };
-            last = Some(LastStatement {
-                returns_rows: returns_rows(inner),
-                column_types: columns.map(|cols| cols.iter().map(|c| c.type_oid).collect()),
-            });
+    for inner in &statements {
+        if !is_analyzable(inner) {
+            // A utility statement: PG runs it only at call time, and the
+            // statements after it may depend on what it creates.
+            return Ok(());
         }
+        // sql_fn_param_ref: `$n` must name one of the arguments.
+        let highest = inner
+            .nodes()
+            .into_iter()
+            .filter_map(|(n, _)| match n {
+                typedpg_pg_query::NodeRef::ParamRef(p) => Some(p.number),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        if highest > param_types.len() as i32 {
+            return Err(DdlError::Parse(format!("there is no parameter ${highest}")));
+        }
+        let analyzed = crate::expr::with_sql_function_params(namespace(), || {
+            crate::resolve::analyze_raw_node_with_param_types(interp, inner, &param_types)
+        });
+        let columns = match analyzed {
+            Ok((columns, _)) => Some(columns),
+            // A construct the analyzer doesn't model says nothing about
+            // the body; every other error is one PG's parse analysis
+            // raises too.
+            Err(
+                AnalyzeError::Unsupported(_)
+                | AnalyzeError::UnsupportedJoinType(_)
+                | AnalyzeError::Internal(_),
+            ) => None,
+            Err(e) => return Err(DdlError::UnsupportedDdl(format!("{e}"))),
+        };
+        last = Some(LastStatement {
+            returns_rows: returns_rows(inner),
+            column_types: columns.map(|cols| cols.iter().map(|c| c.type_oid).collect()),
+        });
     }
     check_return_type(interp, proc, last.as_ref())
 }
@@ -223,13 +229,14 @@ fn language_is_sql(stmt: &CreateFunctionStmt) -> bool {
         })
 }
 
-/// The body's statements as SQL text, and whether PG always analyzes them
-/// (`BEGIN ATOMIC` / `RETURN` bodies are parsed with the CREATE FUNCTION
-/// itself; string bodies only under `check_function_bodies`).
-fn body_statements(stmt: &CreateFunctionStmt) -> Result<Option<(Vec<String>, bool)>, DdlError> {
+/// The body's statements, parsed, and whether PG always analyzes them
+/// (`BEGIN ATOMIC` / `RETURN` bodies come parsed with the CREATE FUNCTION
+/// itself; string bodies are parsed — and analyzed only under
+/// `check_function_bodies`).
+fn body_statements(stmt: &CreateFunctionStmt) -> Result<Option<(Vec<node::Node>, bool)>, DdlError> {
     if let Some(body) = stmt.sql_body.as_deref() {
         let mut out = Vec::new();
-        collect_atomic(body, &mut out)?;
+        collect_atomic(body, &mut out);
         return Ok(Some((out, true)));
     }
     let source = stmt.options.iter().find_map(|n| match n.node.as_ref()? {
@@ -240,20 +247,33 @@ fn body_statements(stmt: &CreateFunctionStmt) -> Result<Option<(Vec<String>, boo
         },
         _ => None,
     });
-    Ok(source.map(|s| (vec![s.to_owned()], false)))
+    let Some(source) = source else {
+        return Ok(None);
+    };
+    let parsed = typedpg_pg_query::parse(source).map_err(|e| match e {
+        typedpg_pg_query::Error::Parse(msg) => DdlError::Parse(msg),
+        other => DdlError::Parse(other.to_string()),
+    })?;
+    let statements = parsed
+        .protobuf
+        .stmts
+        .into_iter()
+        .filter_map(|raw| raw.stmt.and_then(|n| n.node))
+        .collect();
+    Ok(Some((statements, false)))
 }
 
-fn collect_atomic(node: &protobuf::Node, out: &mut Vec<String>) -> Result<(), DdlError> {
+fn collect_atomic(node: &protobuf::Node, out: &mut Vec<node::Node>) {
     match node.node.as_ref() {
         Some(node::Node::List(l)) => {
             for item in &l.items {
-                collect_atomic(item, out)?;
+                collect_atomic(item, out);
             }
         }
         // `RETURN expr` is `SELECT expr`.
         Some(node::Node::ReturnStmt(r)) => {
             if let Some(val) = r.returnval.as_deref() {
-                let select = protobuf::SelectStmt {
+                out.push(node::Node::SelectStmt(Box::new(protobuf::SelectStmt {
                     target_list: vec![protobuf::Node {
                         node: Some(node::Node::ResTarget(Box::new(protobuf::ResTarget {
                             val: Some(Box::new(val.clone())),
@@ -263,19 +283,12 @@ fn collect_atomic(node: &protobuf::Node, out: &mut Vec<String>) -> Result<(), Dd
                     limit_option: protobuf::LimitOption::Default as i32,
                     op: protobuf::SetOperation::SetopNone as i32,
                     ..Default::default()
-                };
-                out.push(deparse(node::Node::SelectStmt(Box::new(select)))?);
+                })));
             }
         }
-        Some(other) => out.push(deparse(other.clone())?),
+        Some(other) => out.push(other.clone()),
         None => {}
     }
-    Ok(())
-}
-
-fn deparse(node: node::Node) -> Result<String, DdlError> {
-    node.deparse()
-        .map_err(|e| DdlError::Internal(format!("deparse of SQL function body: {e}")))
 }
 
 /// Input parameters `(name, type)` in call order (IN, INOUT, VARIADIC).
@@ -350,63 +363,6 @@ fn returns_rows(stmt: &node::Node) -> bool {
     }
 }
 
-/// Rewrite every positional parameter reference `$n` to `($n::type)`.
-fn substitute_params(
-    interp: &PgCatalog,
-    sql: &str,
-    params: &[(String, PgTypeOid)],
-) -> Result<String, DdlError> {
-    let scan = typedpg_pg_query::scan(sql).map_err(|e| DdlError::Parse(e.to_string()))?;
-    let tokens = &scan.tokens;
-    let text = |t: &protobuf::ScanToken| &sql[t.start as usize..t.end as usize];
-    let typed = |n: usize| -> Option<String> {
-        let (_, t) = params.get(n.checked_sub(1)?)?;
-        let ty = interp.pg_type.get(t)?;
-        let schema = interp.namespace_name(ty.typnamespace)?;
-        Some(format!(
-            "(${n}::{})",
-            crate::qualified_name::QualifiedName::new(schema, &ty.typname)
-        ))
-    };
-
-    // The analyzer numbers query parameters densely, so the referenced
-    // parameters are renumbered in order of first use; the cast carries the
-    // declared type either way.
-    let mut renumbered: Vec<usize> = Vec::new();
-    let mut typed = |n: usize| -> Option<String> {
-        let cast = typed(n)?;
-        let k = match renumbered.iter().position(|&m| m == n) {
-            Some(k) => k + 1,
-            None => {
-                renumbered.push(n);
-                renumbered.len()
-            }
-        };
-        Some(cast.replacen(&format!("(${n}::"), &format!("(${k}::"), 1))
-    };
-    let mut out = String::with_capacity(sql.len() + 16);
-    let mut pos = 0usize;
-    for tok in tokens {
-        let kind = Token::try_from(tok.token).unwrap_or(Token::Nul);
-        let replacement = if kind == Token::Param {
-            text(tok)
-                .trim_start_matches('$')
-                .parse::<usize>()
-                .ok()
-                .and_then(&mut typed)
-        } else {
-            None
-        };
-        if let Some(rep) = replacement {
-            out.push_str(&sql[pos..tok.start as usize]);
-            out.push_str(&rep);
-            pos = tok.end as usize;
-        }
-    }
-    out.push_str(&sql[pos..]);
-    Ok(out)
-}
-
 /// The expression an inlinable `LANGUAGE sql` function stands for
 /// (`inline_function`, optimizer/util/clauses.c): a non-set-returning
 /// function whose body is a single `SELECT expr` — no FROM, WHERE,
@@ -426,14 +382,7 @@ pub(crate) fn inlinable_body(stmt: &CreateFunctionStmt, proc: &PgProc) -> Option
         };
     }
     let (statements, _) = body_statements(stmt).ok()??;
-    let [source] = statements.as_slice() else {
-        return None;
-    };
-    let parsed = typedpg_pg_query::parse(source).ok()?;
-    let [raw] = parsed.protobuf.stmts.as_slice() else {
-        return None;
-    };
-    let node::Node::SelectStmt(sel) = raw.stmt.as_ref()?.node.as_ref()? else {
+    let [node::Node::SelectStmt(sel)] = statements.as_slice() else {
         return None;
     };
     let simple = sel.from_clause.is_empty()
