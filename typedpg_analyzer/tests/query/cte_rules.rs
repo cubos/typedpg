@@ -219,6 +219,40 @@ fn search_cycle_validation() {
     }
 }
 
+// ── Outer references from CTE bodies ─────────────────────────────────────────
+
+/// A CTE body is a sub-level of the query owning the WITH: it sees the
+/// enclosing levels — a sublink's outer query, a LATERAL subquery's
+/// left-hand FROM items — as outer references.
+#[test]
+fn nested_cte_body_sees_enclosing_levels() {
+    let db = setup();
+    let s = db
+        .analyze("SELECT (WITH z AS (SELECT t.a) SELECT a FROM z) FROM t")
+        .unwrap();
+    assert_eq!(s.columns.len(), 1);
+    let s = db
+        .analyze("SELECT * FROM t, LATERAL (WITH z AS (SELECT t.a) SELECT * FROM z) q")
+        .unwrap();
+    assert_eq!(s.columns.len(), 6);
+    db.analyze("SELECT * FROM t WHERE EXISTS (WITH z AS (SELECT t.a) SELECT * FROM z)")
+        .unwrap();
+    db.analyze(
+        "SELECT (WITH RECURSIVE r(n) AS (SELECT t.a UNION ALL SELECT n + 1 FROM r WHERE n < 3) \
+         SELECT max(n) FROM r) FROM t",
+    )
+    .unwrap();
+    // The query's own FROM items are not visible to its CTEs.
+    let err = db
+        .analyze("WITH z AS (SELECT t.a) SELECT * FROM z, t")
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("missing FROM-clause entry for table \"t\""),
+        "{err}"
+    );
+}
+
 // ── WITH validation ──────────────────────────────────────────────────────────
 
 #[test]

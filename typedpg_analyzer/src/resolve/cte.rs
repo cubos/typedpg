@@ -4,13 +4,23 @@ use super::*;
 // CTE
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// Analyze one CTE body. `outer_sources` are the FROM entries of the
+/// enclosing query levels: a CTE body is a sub-level of the query owning
+/// the WITH (whose own FROM isn't transformed yet), so it may reference
+/// them as outer references.
 pub(crate) fn analyze_cte(
     cte: &protobuf::CommonTableExpr,
     with_recursive: bool,
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
     existing_ctes: &HashMap<String, Vec<ScopeColumn>>,
+    outer_sources: &[crate::scope::TableSource],
 ) -> Result<Vec<ScopeColumn>, AnalyzeError> {
+    let analyze_body = |sel: &protobuf::SelectStmt,
+                        params: &mut ParamCollector,
+                        ctes: &HashMap<String, Vec<ScopeColumn>>| {
+        analyze_select_with_ctes_and_outer(sel, snapshot, params, ctes, &[], outer_sources, &[])
+    };
     let cte_query = cte
         .ctequery
         .as_ref()
@@ -34,7 +44,7 @@ pub(crate) fn analyze_cte(
         && let node::Node::SelectStmt(sel) = cte_query
         && let (Some(larg), Some(rarg)) = (sel.larg.as_ref(), sel.rarg.as_ref())
     {
-        let (seed_cols, _) = analyze_select_with_ctes(larg, snapshot, params, existing_ctes)?;
+        let (seed_cols, _) = analyze_body(larg, params, existing_ctes)?;
         let seed_cols = apply_cte_column_aliases(&cte.ctename, seed_cols, &cte.aliascolnames)?;
 
         // Register the CTE against its seed types so the recursive arm can
@@ -55,7 +65,7 @@ pub(crate) fn analyze_cte(
             .collect();
         scopes_with_self.insert(cte.ctename.clone(), self_scope);
 
-        let (rec_cols, _) = analyze_select_with_ctes(rarg, snapshot, params, &scopes_with_self)?;
+        let (rec_cols, _) = analyze_body(rarg, params, &scopes_with_self)?;
         check_no_aggregates_in_recursive_term(rarg, snapshot)?;
         if seed_cols.len() != rec_cols.len() {
             return Err(AnalyzeError::Unsupported(
@@ -130,7 +140,7 @@ pub(crate) fn analyze_cte(
 
     match cte_query {
         node::Node::SelectStmt(sel) => {
-            let (mut cols, _) = analyze_select_with_ctes(sel, snapshot, params, existing_ctes)?;
+            let (mut cols, _) = analyze_body(sel, params, existing_ctes)?;
             resolve_unknown_outputs(sel, &mut cols, params);
             let cols = apply_cte_column_aliases(&cte.ctename, cols, &cte.aliascolnames)?;
             Ok(cols
@@ -410,11 +420,15 @@ pub(crate) fn check_cte_reference(
 /// the clause (42712), a data-modifying CTE is only allowed on the
 /// top-level statement (0A000), and each CTE is analyzed in order, seeing
 /// the ones before it.
+///
+/// `outer_sources` are the enclosing levels' FROM entries the CTE bodies
+/// may reference (see [`analyze_cte`]).
 pub(crate) fn analyze_with_clause(
     with: &protobuf::WithClause,
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
     outer_ctes: &HashMap<String, Vec<ScopeColumn>>,
+    outer_sources: &[crate::scope::TableSource],
 ) -> Result<HashMap<String, Vec<ScopeColumn>>, AnalyzeError> {
     let ctes: Vec<&protobuf::CommonTableExpr> = with
         .ctes
@@ -466,7 +480,14 @@ pub(crate) fn analyze_with_clause(
             )
             .finalize_implicit());
         }
-        let cte_columns = analyze_cte(cte, with.recursive, snapshot, params, &cte_scopes)?;
+        let cte_columns = analyze_cte(
+            cte,
+            with.recursive,
+            snapshot,
+            params,
+            &cte_scopes,
+            outer_sources,
+        )?;
         let marker = no_returning_marker(&cte.ctename);
         if returning == Some(false) {
             cte_scopes.insert(marker, Vec::new());

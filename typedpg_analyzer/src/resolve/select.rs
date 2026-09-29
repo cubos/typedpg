@@ -115,7 +115,13 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
 
     // Process this SELECT's own CTEs (before UNION check, since WITH wraps UNION).
     if let Some(with) = &sel.with_clause {
-        cte_scopes = analyze_with_clause(with, snapshot, params, &cte_scopes)?;
+        // The CTE bodies see the enclosing levels (LATERAL or correlated).
+        let outer: Vec<_> = lateral_sources
+            .iter()
+            .chain(correlated_sources)
+            .cloned()
+            .collect();
+        cte_scopes = analyze_with_clause(with, snapshot, params, &cte_scopes, &outer)?;
     }
 
     // Handle UNION/INTERSECT/EXCEPT.

@@ -63,7 +63,7 @@ pub(crate) fn analyze_merge_with_outer_ctes(
     // else.
     let mut cte_scopes: HashMap<String, Vec<ScopeColumn>> = outer_ctes.clone();
     if let Some(with) = &merge.with_clause {
-        cte_scopes = analyze_with_clause(with, snapshot, params, &cte_scopes)?;
+        cte_scopes = analyze_with_clause(with, snapshot, params, &cte_scopes, &[])?;
     }
 
     check_unreachable_when_clauses(&merge.merge_when_clauses)?;
