@@ -359,3 +359,21 @@ fn unverifiable_role_names_are_assumed_to_exist() {
     // unknown.
     assert!(db.resolve_table(None, "t2").is_none());
 }
+
+#[test]
+fn the_seed_keeps_the_server_search_path_setting() {
+    // The seed records the server's setting as text, `$user` included; a
+    // migration's SET lasts only for its session.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE SCHEMA app; SET search_path = app; CREATE TABLE t (a int);",
+    )]);
+    let mut seed = db.to_seed();
+    assert_eq!(seed.search_path, "\"$user\", public");
+
+    // Another server setting is honored, in order.
+    seed.search_path = "\"$user\", app, public".into();
+    let restored = PgCatalog::from_seed(seed);
+    let info = restored.analyze("SELECT a FROM t").unwrap();
+    assert_eq!(info.columns.len(), 1);
+}

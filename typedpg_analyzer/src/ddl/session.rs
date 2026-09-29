@@ -105,7 +105,9 @@ impl SessionIdentity {
 /// Textual `search_path` settings, from least to most specific.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SearchPathGuc {
-    /// Server default (the seed's resolved path).
+    /// The server's setting, as the seed recorded it.
+    default_setting: String,
+    /// Server default: [`Self::default_setting`]'s entries.
     default: Vec<String>,
     /// Value set by a plain `SET search_path` / `set_config(..., false)`.
     session: Option<Vec<String>>,
@@ -114,18 +116,18 @@ pub(crate) struct SearchPathGuc {
 }
 
 impl SearchPathGuc {
-    /// `resolved` is the seed's search path as `current_schemas` reports it,
-    /// which leaves out `$user` when no schema bears the user's name. The
-    /// seed comes from a stock server, whose setting is PG's default
-    /// `"$user", public`, so `$user` goes back in front.
-    pub(crate) fn with_default(resolved: Vec<String>) -> Self {
-        let mut default = vec!["$user".to_owned()];
-        default.extend(resolved.into_iter().filter(|n| n != "$user"));
+    /// The server's `search_path` setting, as text.
+    pub(crate) fn with_default(setting: &str) -> Self {
         Self {
-            default,
+            default_setting: setting.to_owned(),
+            default: split_identifier_string(setting),
             session: None,
             local: None,
         }
+    }
+
+    pub(crate) fn default_setting(&self) -> &str {
+        &self.default_setting
     }
 
     fn effective(&self) -> &[String] {

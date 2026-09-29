@@ -111,7 +111,7 @@ fn export_catalog(client: &mut postgres::Client) -> Result<PgCatalogSeed, postgr
     let pg_inherits = export_inherits(client)?;
     let pg_constraint = export_constraints(client)?;
     let pg_collation = export_collations(client)?;
-    let search_path = export_search_path(client, &pg_namespace)?;
+    let search_path = export_search_path(client)?;
     let sql_function_defs = export_sql_function_defs(client)?;
     let (pg_am, pg_opfamily, pg_opclass) = export_access_methods(client)?;
     let pg_settings = export_settings(client)?;
@@ -156,32 +156,8 @@ fn export_catalog(client: &mut postgres::Client) -> Result<PgCatalogSeed, postgr
     Ok(seed)
 }
 
-fn export_search_path(
-    client: &mut postgres::Client,
-    namespaces: &[PgNamespace],
-) -> Result<Vec<PgNamespaceOid>, postgres::Error> {
-    let row = client.query_one("SHOW search_path", &[])?;
-    let raw: String = row.get(0);
-    let by_name: HashMap<&str, PgNamespaceOid> = namespaces
-        .iter()
-        .map(|n| (n.nspname.as_str(), n.oid))
-        .collect();
-    let mut oids: Vec<PgNamespaceOid> = Vec::new();
-    let mut seen: std::collections::HashSet<PgNamespaceOid> = std::collections::HashSet::new();
-    for part in raw.split(',') {
-        let part = part.trim().trim_matches('"');
-        let name = if part == "$user" || part == "\"$user\"" {
-            "public"
-        } else {
-            part
-        };
-        if let Some(&oid) = by_name.get(name)
-            && seen.insert(oid)
-        {
-            oids.push(oid);
-        }
-    }
-    Ok(oids)
+fn export_search_path(client: &mut postgres::Client) -> Result<String, postgres::Error> {
+    Ok(client.query_one("SHOW search_path", &[])?.get(0))
 }
 
 fn export_namespaces(client: &mut postgres::Client) -> Result<Vec<PgNamespace>, postgres::Error> {

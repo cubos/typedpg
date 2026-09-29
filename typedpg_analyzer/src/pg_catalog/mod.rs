@@ -132,9 +132,10 @@ pub struct PgCatalogSeed {
     pub pg_rewrite: Vec<PgRewrite>,
     #[serde(default)]
     pub pg_collation: Vec<PgCollation>,
-    /// Namespace OIDs in search order. Non-PG (PG keeps this in a GUC).
-    #[serde(default, with = "crate::oid::vec_oid")]
-    pub search_path: Vec<PgNamespaceOid>,
+    /// The server's `search_path` setting, as `SHOW search_path` prints it
+    /// (`"$user", public` on a stock server).
+    #[serde(default = "default_search_path")]
+    pub search_path: String,
     /// `pg_get_functiondef` of every `LANGUAGE sql` function, so the ones
     /// PG would inline (`inline_function`) count by their body — e.g. the
     /// STABLE `textanycat` behind `text || anynonarray`.
@@ -527,7 +528,6 @@ impl PgCatalog {
                 .insert((c.collnamespace, c.collname.clone()), c.oid);
             cat.pg_collation.insert(c.oid, c);
         }
-        cat.search_path = seed.search_path;
         cat.pg_am = seed.pg_am;
         cat.pg_opfamily = seed.pg_opfamily;
         cat.pg_opclass = seed.pg_opclass;
@@ -536,12 +536,8 @@ impl PgCatalog {
         for (oid, definition) in seed.sql_function_defs {
             cat.add_sql_function_def(oid, definition);
         }
-        cat.search_path_guc = crate::ddl::session::SearchPathGuc::with_default(
-            cat.search_path
-                .iter()
-                .filter_map(|&oid| cat.namespace_name(oid).map(str::to_owned))
-                .collect(),
-        );
+        cat.search_path_guc = crate::ddl::session::SearchPathGuc::with_default(&seed.search_path);
+        cat.refresh_search_path();
         cat
     }
 
@@ -720,7 +716,7 @@ impl PgCatalog {
             pg_index,
             pg_rewrite,
             pg_collation,
-            search_path: self.search_path.clone(),
+            search_path: self.search_path_guc.default_setting().to_owned(),
             pg_am: self.pg_am.clone(),
             pg_opfamily: self.pg_opfamily.clone(),
             pg_opclass: self.pg_opclass.clone(),
@@ -1547,4 +1543,10 @@ impl PgCatalog {
         self.pg_depend
             .retain(|d| !(d.refclassid == refclassid && d.refobjid == refobjid));
     }
+}
+
+/// PostgreSQL's boot value of `search_path`, for a seed that predates the
+/// setting.
+fn default_search_path() -> String {
+    "\"$user\", public".to_owned()
 }
