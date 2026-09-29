@@ -21,8 +21,8 @@ use typedpg_analyzer::{
     PgClassOid, PgCollation, PgCollationOid, PgConstraint, PgConstraintOid, PgDepend, PgEnum,
     PgEnumOid, PgExtension, PgExtensionOid, PgGenericOid, PgIndex, PgInherits, PgNamespace,
     PgNamespaceOid, PgOpclass, PgOperator, PgOperatorOid, PgOpfamily, PgProc, PgProcOid, PgRange,
-    PgSetting, PgType, PgTypeOid, ProKind, ProVolatile, QualifiedName, RelKind, TypCategory,
-    TypStorage, TypType,
+    PgSetting, PgTsObject, PgType, PgTypeOid, ProKind, ProVolatile, QualifiedName, RelKind,
+    TypCategory, TypStorage, TypType,
 };
 
 fn main() {
@@ -115,6 +115,7 @@ fn export_catalog(client: &mut postgres::Client) -> Result<PgCatalogSeed, postgr
     let sql_function_defs = export_sql_function_defs(client)?;
     let (pg_am, pg_opfamily, pg_opclass) = export_access_methods(client)?;
     let pg_settings = export_settings(client)?;
+    let pg_ts_objects = export_ts_objects(client)?;
 
     let _ = nsname_by_oid;
 
@@ -148,6 +149,7 @@ fn export_catalog(client: &mut postgres::Client) -> Result<PgCatalogSeed, postgr
         pg_opfamily,
         pg_opclass,
         pg_settings,
+        pg_ts_objects,
     };
     let scratch = PgCatalog::from_seed(seed.clone());
     seed.pg_index = export_indexes(client, &scratch)?;
@@ -806,6 +808,28 @@ fn export_depends(client: &mut postgres::Client) -> Result<Vec<PgDepend>, postgr
 }
 
 // ─── View definitions (second pass) ────────────────────────────────────────────
+
+/// Text search configurations, dictionaries, parsers and templates.
+fn export_ts_objects(client: &mut postgres::Client) -> Result<Vec<PgTsObject>, postgres::Error> {
+    Ok(client
+        .query(
+            "SELECT 'c', cfgname::text, cfgnamespace FROM pg_catalog.pg_ts_config \
+             UNION ALL SELECT 'd', dictname::text, dictnamespace FROM pg_catalog.pg_ts_dict \
+             UNION ALL SELECT 'p', prsname::text, prsnamespace FROM pg_catalog.pg_ts_parser \
+             UNION ALL SELECT 't', tmplname::text, tmplnamespace FROM pg_catalog.pg_ts_template \
+             ORDER BY 1, 2",
+            &[],
+        )?
+        .iter()
+        .filter_map(|r| {
+            Some(PgTsObject {
+                kind: r.get(0),
+                name: r.get(1),
+                namespace: PgNamespaceOid::new(r.get::<_, u32>(2))?,
+            })
+        })
+        .collect())
+}
 
 /// The configuration parameters (`pg_settings`) of a stock server.
 fn export_settings(client: &mut postgres::Client) -> Result<Vec<PgSetting>, postgres::Error> {

@@ -159,7 +159,16 @@ pub(crate) fn validate(
             if trimmed != content {
                 return Ok(());
             }
-            if !matches!(name, "regclass" | "regproc" | "regtype") {
+            if !matches!(
+                name,
+                "regclass"
+                    | "regproc"
+                    | "regtype"
+                    | "regconfig"
+                    | "regdictionary"
+                    | "regnamespace"
+                    | "regcollation"
+            ) {
                 return Ok(());
             }
             // Quoted / qualified forms need real identifier parsing — skip.
@@ -211,6 +220,14 @@ pub(crate) fn validate(
                         Err(format!("type \"{folded}\" does not exist"))
                     }
                 }
+                "regconfig" => crate::ddl::text_search::check_reg_input(snapshot, "c", &folded),
+                "regdictionary" => crate::ddl::text_search::check_reg_input(snapshot, "d", &folded),
+                "regnamespace" if snapshot.namespace_oid(&folded).is_none() => {
+                    Err(format!("schema \"{folded}\" does not exist"))
+                }
+                "regcollation" if snapshot.resolve_collation(None, &folded).is_none() => Err(
+                    format!("collation \"{folded}\" for encoding \"UTF8\" does not exist"),
+                ),
                 _ => Ok(()),
             }
         }

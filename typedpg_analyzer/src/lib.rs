@@ -78,8 +78,8 @@ pub use pg_catalog::{
     AggKind, ArgMode, AstBinding, AttGenerated, AttIdentity, CastContext, CastMethod, ConType,
     DepType, EvEnabled, EvType, PgAggregate, PgAm, PgAttribute, PgCast, PgCatalogSeed, PgClass,
     PgCollation, PgConstraint, PgDepend, PgEnum, PgExtension, PgIndex, PgInherits, PgNamespace,
-    PgOpclass, PgOperator, PgOpfamily, PgProc, PgRange, PgRewrite, PgSetting, PgType, ProKind,
-    ProVolatile, RelKind, SerializedAst, TypCategory, TypStorage, TypType,
+    PgOpclass, PgOperator, PgOpfamily, PgProc, PgRange, PgRewrite, PgSetting, PgTsObject, PgType,
+    ProKind, ProVolatile, RelKind, SerializedAst, TypCategory, TypStorage, TypType,
 };
 
 pub use ddl::DdlError;

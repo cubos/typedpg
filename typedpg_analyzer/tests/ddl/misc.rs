@@ -3544,3 +3544,78 @@ fn temporary_relations_belong_to_the_migration_session() {
     let p = db.resolve_table(None, "p").expect("p");
     assert_eq!(db.namespace_name(p.relnamespace), Some("public"));
 }
+
+#[test]
+fn text_search_objects_are_tracked() {
+    // PG 18 tsearchcmds.c and the regconfig / regdictionary /
+    // regnamespace / regcollation input functions.
+    let setup = "CREATE TABLE t (a text);
+                 CREATE TEXT SEARCH CONFIGURATION c3 (COPY = english);";
+    for (stmt, msg) in [
+        (
+            "CREATE TEXT SEARCH CONFIGURATION c1 (COPY = nosuch);",
+            "text search configuration \"nosuch\" does not exist",
+        ),
+        (
+            "CREATE TEXT SEARCH CONFIGURATION c2 (PARSER = nosuch);",
+            "text search parser \"nosuch\" does not exist",
+        ),
+        (
+            "CREATE TEXT SEARCH CONFIGURATION c3 (COPY = english);",
+            "duplicate key value violates unique constraint \"pg_ts_config_cfgname_index\"",
+        ),
+        (
+            "ALTER TEXT SEARCH CONFIGURATION nosuch ADD MAPPING FOR word WITH simple;",
+            "text search configuration \"nosuch\" does not exist",
+        ),
+        (
+            "ALTER TEXT SEARCH CONFIGURATION c3 ALTER MAPPING FOR word WITH nosuch;",
+            "text search dictionary \"nosuch\" does not exist",
+        ),
+        (
+            "CREATE TEXT SEARCH DICTIONARY d1 (TEMPLATE = nosuch);",
+            "text search template \"nosuch\" does not exist",
+        ),
+        (
+            "DROP TEXT SEARCH CONFIGURATION nosuch;",
+            "text search configuration \"nosuch\" does not exist",
+        ),
+        (
+            "SELECT to_tsvector('nosuch', 'x');",
+            "text search configuration \"nosuch\" does not exist",
+        ),
+        (
+            "SELECT 'nosuch'::regdictionary;",
+            "text search dictionary \"nosuch\" does not exist",
+        ),
+        (
+            "SELECT 'nosuch'::regnamespace;",
+            "schema \"nosuch\" does not exist",
+        ),
+        (
+            "SELECT 'nosuch'::regcollation;",
+            "collation \"nosuch\" for encoding \"UTF8\" does not exist",
+        ),
+        (
+            "DROP TEXT SEARCH CONFIGURATION c3; SELECT to_tsvector('c3', 'x');",
+            "text search configuration \"c3\" does not exist",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "CREATE TEXT SEARCH DICTIONARY d2 (TEMPLATE = simple);
+             ALTER TEXT SEARCH CONFIGURATION c3 ALTER MAPPING FOR word WITH d2, simple;
+             ALTER TEXT SEARCH DICTIONARY d2 (STOPWORDS = english);
+             SELECT to_tsvector('c3', 'x'), 'english'::regconfig, 'simple'::regdictionary,
+                    'public'::regnamespace;
+             COMMENT ON TEXT SEARCH CONFIGURATION c3 IS 'x';
+             DROP TEXT SEARCH CONFIGURATION c3;
+             DROP TEXT SEARCH DICTIONARY IF EXISTS nosuch;",
+        ),
+    ]);
+}

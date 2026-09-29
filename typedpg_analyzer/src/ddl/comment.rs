@@ -236,6 +236,20 @@ pub(crate) fn resolve_object(
                 _ => {}
             }
         }
+        ObjectType::ObjectTsconfiguration
+        | ObjectType::ObjectTsdictionary
+        | ObjectType::ObjectTsparser
+        | ObjectType::ObjectTstemplate => {
+            let kind = match objtype {
+                ObjectType::ObjectTsconfiguration => "c",
+                ObjectType::ObjectTsdictionary => "d",
+                ObjectType::ObjectTsparser => "p",
+                _ => "t",
+            };
+            let parts = names(object);
+            let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
+            super::text_search::find(interp, kind, &parts)?;
+        }
         ObjectType::ObjectForeignServer => {
             if let node::Node::String(s) = object {
                 super::fdw::check_server(interp, &s.sval)?;

@@ -33,6 +33,7 @@ pub mod sequences;
 pub(crate) mod session;
 pub(crate) mod statistics;
 pub mod tables;
+pub(crate) mod text_search;
 pub(crate) mod triggers;
 mod txblock;
 pub mod types;
@@ -190,6 +191,10 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
                 ObjectType::ObjectOperator => operators::define_operator(db, s),
                 ObjectType::ObjectAggregate => aggregates::define_aggregate(db, s),
                 ObjectType::ObjectCollation => collations::define_collation(db, s),
+                ObjectType::ObjectTsconfiguration
+                | ObjectType::ObjectTsdictionary
+                | ObjectType::ObjectTsparser
+                | ObjectType::ObjectTstemplate => text_search::define(db, s),
                 // Other DefineStmt kinds (text search, etc.) are irrelevant
                 // for static type analysis.
                 _ => Ok(()),
@@ -230,6 +235,8 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         node::Node::AlterPolicyStmt(s) => policies::alter_policy(db, s),
         node::Node::RuleStmt(s) => rules::create_rule(db, s),
         node::Node::CreateAmStmt(s) => opclass::create_am(db, s),
+        node::Node::AlterTsconfigurationStmt(s) => text_search::alter_configuration(db, s),
+        node::Node::AlterTsdictionaryStmt(s) => text_search::alter_dictionary(db, s),
         node::Node::CreateEventTrigStmt(s) => event_triggers::create_event_trigger(db, s),
         node::Node::AlterEventTrigStmt(s) => event_triggers::alter_event_trigger(db, s),
         node::Node::CreatePublicationStmt(s) => publications::create_publication(db, s),
@@ -295,8 +302,6 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         | node::Node::CreateSubscriptionStmt(_)
         | node::Node::AlterSubscriptionStmt(_)
         | node::Node::DropSubscriptionStmt(_)
-        | node::Node::AlterTsconfigurationStmt(_)
-        | node::Node::AlterTsdictionaryStmt(_)
         | node::Node::CreateTableSpaceStmt(_)
         | node::Node::DropTableSpaceStmt(_)
         | node::Node::AlterTableSpaceOptionsStmt(_)

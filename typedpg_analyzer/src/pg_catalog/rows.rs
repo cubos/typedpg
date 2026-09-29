@@ -499,6 +499,17 @@ pub struct PgSetting {
     pub enumvals: Vec<String>,
 }
 
+/// A text search object: `kind` `c` configuration (`pg_ts_config`), `d`
+/// dictionary (`pg_ts_dict`), `p` parser (`pg_ts_parser`) or `t` template
+/// (`pg_ts_template`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize_tuple, Deserialize_tuple)]
+pub struct PgTsObject {
+    pub kind: String,
+    pub name: String,
+    /// FK `pg_namespace.oid`.
+    pub namespace: PgNamespaceOid,
+}
+
 /// `pg_am`: an index or table access method, by name (`amtype` `i` / `t`).
 #[derive(Debug, Clone, Serialize_tuple, Deserialize_tuple)]
 pub struct PgAm {
