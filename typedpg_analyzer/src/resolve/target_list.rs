@@ -318,11 +318,44 @@ pub(crate) fn analyze_values_lists(
         }
     }
 
-    let common: Vec<PgTypeOid> = (0..arity)
-        .map(|i| {
-            crate::coerce::find_common_type(&column_types[i], snapshot).unwrap_or(oid::UNKNOWN)
-        })
-        .collect();
+    // transformValuesClause: select_common_type("VALUES") per column — rows
+    // whose types have none are `VALUES types X and Y cannot be matched`.
+    let mut common: Vec<PgTypeOid> = Vec::with_capacity(arity);
+    for types in &column_types {
+        if let Some(t) = crate::coerce::find_common_type(types, snapshot) {
+            common.push(t);
+            continue;
+        }
+        let concrete: Vec<PgTypeOid> = types
+            .iter()
+            .copied()
+            .filter(|&t| t != oid::UNKNOWN)
+            .collect();
+        if concrete.is_empty() {
+            common.push(oid::UNKNOWN);
+            continue;
+        }
+        let name = |t| crate::ddl::util::format_type_for_message(snapshot, t);
+        match crate::coerce::select_common_type(&concrete, snapshot) {
+            Ok(t) => common.push(t),
+            Err(crate::coerce::CommonTypeError::Mismatch(a, b)) => {
+                return Err(crate::pgmsg::types_cannot_be_matched(
+                    "VALUES",
+                    &name(a),
+                    &name(b),
+                    "",
+                    None,
+                )
+                .finalize_implicit());
+            }
+            Err(crate::coerce::CommonTypeError::CannotConvert { from, to }) => {
+                return Err(
+                    crate::pgmsg::could_not_convert_type("VALUES", &name(from), &name(to))
+                        .finalize_implicit(),
+                );
+            }
+        }
+    }
 
     // Back-fill: re-walk cells whose type stayed UNKNOWN with the column's
     // resolved common type as the goal, so `(VALUES (42), ($1))` pins the

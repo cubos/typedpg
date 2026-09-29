@@ -685,6 +685,33 @@ fn values_list_order_by_and_limit() {
     assert_cols(&s, vec![c("column1", int4())]);
 }
 
+/// transformValuesClause: select_common_type over each column's rows.
+#[test]
+fn values_rows_need_a_common_column_type() {
+    let db = setup();
+    for (sql, msg) in [
+        (
+            "SELECT a0 FROM (VALUES (-1), (42), (false)) v(a0)",
+            "VALUES types integer and boolean cannot be matched",
+        ),
+        (
+            "VALUES (1::int), ('2020-01-01'::date)",
+            "VALUES types integer and date cannot be matched",
+        ),
+        (
+            "VALUES (ARRAY[1]), (1)",
+            "VALUES types integer[] and integer cannot be matched",
+        ),
+    ] {
+        let err = assert_err_prefix(&db, sql, msg);
+        assert!(matches!(err, AnalyzeError::DatatypeMismatch(_)), "{err:?}");
+    }
+    let s = db
+        .analyze("VALUES (1, NULL), (1.5, 'x'), (2::bigint, NULL)")
+        .unwrap();
+    assert_cols(&s, vec![c("column1", numeric()), cn("column2", text())]);
+}
+
 /// A bare name matching several output columns with different expressions
 /// is ambiguous (42702) — in GROUP BY only when no input column has it.
 #[test]
