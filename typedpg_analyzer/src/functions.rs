@@ -114,9 +114,6 @@ pub(crate) enum FuncDetail {
     Coercion(PgTypeOid),
 }
 
-/// pg_catalog operators that can return NULL with non-null inputs.
-const NULLABLE_PG_CATALOG_OPERATORS: &[&str] = &["->", "->>", "#>", "#>>"];
-
 /// Resolve a function call by name and argument types, without the
 /// function-style cast interpretation (see [`func_get_detail`]).
 ///
@@ -337,19 +334,25 @@ pub(crate) fn func_get_detail(
         is_strict: f.proisstrict,
         is_set_returning: f.proretset,
         out_args,
-        signature: format!(
-            "{}({})",
-            f.proname,
-            f.proargtypes
-                .iter()
-                .map(|t| snapshot
-                    .get_type(*t)
-                    .map(|ty| ty.typname.as_str())
-                    .unwrap_or("?"))
-                .collect::<Vec<_>>()
-                .join(",")
-        ),
+        signature: proc_signature(f, snapshot),
     }))
+}
+
+/// `proname(typname,…)` over the declared `proargtypes` — the key of the
+/// [`crate::builtin_nullability`] tables.
+fn proc_signature(f: &PgProc, snapshot: &PgCatalog) -> String {
+    format!(
+        "{}({})",
+        f.proname,
+        f.proargtypes
+            .iter()
+            .map(|t| snapshot
+                .get_type(*t)
+                .map(|ty| ty.typname.as_str())
+                .unwrap_or("?"))
+            .collect::<Vec<_>>()
+            .join(",")
+    )
 }
 
 /// PG's function-style cast rule in `func_get_detail`: a one-argument call
@@ -756,8 +759,29 @@ fn aggregate_final_return(f: &PgProc, snapshot: &PgCatalog) -> Option<PgTypeOid>
     snapshot.pg_proc.get(&final_oid).map(|p| p.prorettype)
 }
 
-pub(crate) fn is_nullable_operator(name: &str) -> bool {
-    NULLABLE_PG_CATALOG_OPERATORS.contains(&name)
+/// Whether an operator's result can be NULL, given which operands can be:
+/// the nullability of its implementing function (`pg_operator.oprcode`),
+/// like any call of it — `box # box` is `box_intersect`, NULL for disjoint
+/// boxes; `jsonb -> text` is `jsonb_object_field`, NULL for a missing key.
+/// Outside `pg_catalog` the function's body is unknown: one that isn't
+/// STRICT may return NULL on any input, and the extension operators named
+/// like the JSON lookups (hstore's `->`, …) return NULL for a missing key.
+pub(crate) fn operator_result_nullable(
+    snapshot: &PgCatalog,
+    op_name: &str,
+    code: Option<crate::oid::PgProcOid>,
+    args_nullable: &[bool],
+) -> bool {
+    let any_nullable = args_nullable.iter().any(|&n| n);
+    let Some(f) = code.and_then(|c| snapshot.pg_proc.get(&c)) else {
+        return any_nullable;
+    };
+    if Some(f.pronamespace) != snapshot.pg_catalog_oid() {
+        return any_nullable
+            || !f.proisstrict
+            || matches!(op_name, "->" | "->>" | "#>" | "#>>");
+    }
+    builtin_signature_nullable(&proc_signature(f, snapshot), f.proisstrict, args_nullable, false)
 }
 
 /// Whether a `pg_catalog` routine's result can be NULL, given which of the
@@ -770,10 +794,24 @@ pub(crate) fn builtin_result_nullable(
     args_nullable: &[bool],
     variadic_keyword: bool,
 ) -> bool {
+    builtin_signature_nullable(
+        &resolved.signature,
+        resolved.is_strict,
+        args_nullable,
+        variadic_keyword,
+    )
+}
+
+/// [`builtin_result_nullable`] keyed by the routine's signature.
+fn builtin_signature_nullable(
+    sig: &str,
+    is_strict: bool,
+    args_nullable: &[bool],
+    variadic_keyword: bool,
+) -> bool {
     use crate::builtin_nullability::*;
-    let sig = resolved.signature.as_str();
     let any_nullable = args_nullable.iter().any(|&n| n);
-    if resolved.is_strict {
+    if is_strict {
         any_nullable || NULLABLE_STRICT.contains(&sig)
     } else if NEVER_NULL_NONSTRICT.contains(&sig) {
         false

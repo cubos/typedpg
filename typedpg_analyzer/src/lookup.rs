@@ -26,10 +26,6 @@ pub struct ResolvedOperator {
     pub declared_left_type_oid: Option<PgTypeOid>,
     pub right_type_oid: PgTypeOid,
     pub result_type_oid: PgTypeOid,
-    /// The implementing function (`oprcode`) is a user-defined (or
-    /// extension) one that is not STRICT: it runs on NULL operands and can
-    /// return NULL whatever they are.
-    pub user_defined_non_strict: bool,
     /// The implementing function (`oprcode`).
     pub code: Option<crate::oid::PgProcOid>,
     /// The operator chosen (`pg_operator.oid`).
@@ -73,7 +69,7 @@ impl PgCatalog {
 
     /// OID of the `pg_catalog` schema (looked up once per call). Returns
     /// `None` only on an empty catalog.
-    fn pg_catalog_oid(&self) -> Option<PgNamespaceOid> {
+    pub(crate) fn pg_catalog_oid(&self) -> Option<PgNamespaceOid> {
         self.namespace_oid(PG_CATALOG_SCHEMA)
     }
 
@@ -475,12 +471,6 @@ impl PgCatalog {
                 result_type_oid,
                 code: chosen.oprcode,
                 oid: chosen.oid,
-                user_defined_non_strict: chosen
-                    .oprcode
-                    .and_then(|code| self.pg_proc.get(&code))
-                    .is_some_and(|f| {
-                        Some(f.pronamespace) != self.pg_catalog_oid() && !f.proisstrict
-                    }),
             }),
             Err(e) => OperatorMatch::Error(e),
         }

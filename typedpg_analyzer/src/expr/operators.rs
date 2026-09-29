@@ -510,22 +510,30 @@ fn handle_any_all(
     // is a different PG error ("op ANY/ALL (array) requires array on right
     // side") with riskier corner cases (jsonb, record), so that check stays
     // out of scope.
+    let mut op_nullable = false;
     if left_oid != oid::UNKNOWN
         && right_oid != oid::UNKNOWN
         && let Some(elem_oid) = array_element_type(snapshot, right_oid)
     {
         let op_name = extract_string_fields(&expr.name).join(".");
-        if !op_name.is_empty()
-            && !op_name.contains('.')
-            && snapshot
-                .find_operator(&op_name, Some(left_oid), elem_oid)
-                .is_none()
-        {
-            let l = crate::ddl::util::format_type_for_message(snapshot, left_oid);
-            let r = crate::ddl::util::format_type_for_message(snapshot, elem_oid);
-            return Err(
-                crate::pgmsg::operator_does_not_exist(&l, &op_name, &r, None).finalize_implicit(),
-            );
+        if !op_name.is_empty() && !op_name.contains('.') {
+            match snapshot.find_operator(&op_name, Some(left_oid), elem_oid) {
+                // The per-element operator call can itself yield NULL.
+                Some(op) => {
+                    op_nullable = functions::operator_result_nullable(
+                        snapshot,
+                        &op_name,
+                        op.code,
+                        &[false, false],
+                    );
+                }
+                None => {
+                    let l = crate::ddl::util::format_type_for_message(snapshot, left_oid);
+                    let r = crate::ddl::util::format_type_for_message(snapshot, elem_oid);
+                    return Err(crate::pgmsg::operator_does_not_exist(&l, &op_name, &r, None)
+                        .finalize_implicit());
+                }
+            }
         }
     }
 
@@ -534,7 +542,8 @@ fn handle_any_all(
     // besides a NULL operand the array's *elements* matter — and those are
     // only provably NOT NULL for an ARRAY[...] constructor over NOT NULL
     // elements (or a literal without NULL elements).
-    let any_nullable = left.as_ref().is_some_and(|l| l.nullable)
+    let any_nullable = op_nullable
+        || left.as_ref().is_some_and(|l| l.nullable)
         || right.as_ref().is_some_and(|r| r.nullable)
         || expr
             .rexpr
@@ -745,10 +754,7 @@ fn infer_generic_binary_op(
     let left_oid_resolved = left_oid;
     let right_oid_resolved = right_oid;
 
-    let any_nullable =
-        left.as_ref().is_some_and(|l| l.nullable) || right.as_ref().is_some_and(|r| r.nullable);
-    let op_always_nullable = functions::is_nullable_operator(op_name);
-    let nullable = any_nullable || op_always_nullable;
+    let args_nullable: Vec<bool> = left.iter().chain(right.iter()).map(|t| t.nullable).collect();
 
     // Operator lookup with the bottom-up types — UNKNOWN sides are resolved
     // by `find_operator`'s own rules (homogeneous probe, category and text
@@ -780,17 +786,12 @@ fn infer_generic_binary_op(
                 op.result_type_oid,
                 snapshot,
             )?;
-            // `jsonb @? jsonpath` / `jsonb @@ jsonpath` (jsonb_path_exists_opr
-            // / jsonb_path_match_opr) return NULL when the path evaluation
-            // fails (`'{}'::jsonb @? 'strict $.a'`); `tsvector @@ tsquery`
-            // never does.
-            const JSONPATH: PgTypeOid = PgTypeOid::from_raw(4072);
-            let jsonpath_op = matches!(op_name, "@?" | "@@") && op.right_type_oid == JSONPATH;
-            return Ok(ExprType::scalar(
-                op.result_type_oid,
-                nullable || jsonpath_op || op.user_defined_non_strict,
-            )
-            .with_collation(state));
+            // The operator is a call of its function: `box # box`
+            // (box_intersect) is NULL for disjoint boxes, `jsonb @? jsonpath`
+            // (jsonb_path_exists_opr) when the path evaluation fails.
+            let nullable =
+                functions::operator_result_nullable(snapshot, op_name, op.code, &args_nullable);
+            return Ok(ExprType::scalar(op.result_type_oid, nullable).with_collation(state));
         }
         crate::lookup::OperatorMatch::Ambiguous => {
             // PG (SQLSTATE 42725): `operator is not unique: <left> <op>

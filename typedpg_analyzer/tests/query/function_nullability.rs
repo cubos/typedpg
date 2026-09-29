@@ -146,6 +146,38 @@ fn extract_fields_with_infinite_values_are_not_null() {
     );
 }
 
+/// An operator is a call of its `oprcode`, so it inherits that function's
+/// nullability: `box # box` (box_intersect) is NULL for disjoint boxes,
+/// `lseg # lseg` (lseg_interpt) for parallel segments, `##` (close_lseg),
+/// `path + path` (path_add) for mismatched paths — on NOT NULL operands.
+#[test]
+fn operators_backed_by_null_returning_functions_are_nullable() {
+    let mut db = setup();
+    db.apply_sql("CREATE TABLE g (p point NOT NULL, pa path NOT NULL, b box NOT NULL);")
+        .unwrap();
+    assert_nullability(
+        &db,
+        "SELECT lseg(p, p) # lseg(p, p) AS a, b # b AS b, lseg(p, p) ## lseg(p, p) AS c,
+                pa + pa AS d, box '((0,0),(1,1))' # box '((5,5),(6,6))' AS e,
+                p <-> p AS f, b && b AS g, j @? '$.a' AS h, j -> 'k' AS i,
+                j @> '{}' AS k, 1 = ANY(ARRAY[1, 2]) AS l
+         FROM g, t",
+        &[
+            ("a", true),
+            ("b", true),
+            ("c", true),
+            ("d", true),
+            ("e", true),
+            ("f", false),
+            ("g", false),
+            ("h", true),
+            ("i", true),
+            ("k", false),
+            ("l", false),
+        ],
+    );
+}
+
 // ── Non-strict builtins (#34) and SQL value functions (#13) ──────────────────
 
 #[test]
