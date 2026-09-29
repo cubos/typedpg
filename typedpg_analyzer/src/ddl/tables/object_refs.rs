@@ -80,6 +80,12 @@ pub(super) fn replica_identity(
             "cannot use non-unique index \"{name}\" as replica identity"
         )));
     }
+    // ATExecReplicaIdentity: deferred uniqueness checks aren't usable.
+    if interp.nonimmediate_indexes.contains(&index.indexrelid) {
+        return Err(DdlError::Parse(format!(
+            "cannot use non-immediate index \"{name}\" as replica identity"
+        )));
+    }
     if index.indkey.contains(&0) {
         return Err(DdlError::UnsupportedDdl(format!(
             "cannot use expression index \"{name}\" as replica identity"

@@ -3912,3 +3912,46 @@ fn conversions_are_validated_and_tracked() {
         ),
     ]);
 }
+
+#[test]
+fn deferrable_constraint_indexes_are_non_immediate() {
+    // PG 18 ATExecReplicaIdentity: a DEFERRABLE constraint's index has
+    // indimmediate = false — including the partition clones, LIKE copies
+    // and indexes adopted by ADD CONSTRAINT ... USING INDEX ... DEFERRABLE.
+    let setup = "CREATE TABLE t (a int NOT NULL, CONSTRAINT u UNIQUE (a) DEFERRABLE INITIALLY IMMEDIATE);
+                 CREATE TABLE c (a int NOT NULL UNIQUE DEFERRABLE);
+                 CREATE TABLE p (a int NOT NULL, CONSTRAINT pu UNIQUE (a) DEFERRABLE) PARTITION BY LIST (a);
+                 CREATE TABLE p1 PARTITION OF p FOR VALUES IN (1);
+                 CREATE TABLE l (LIKE t INCLUDING INDEXES);
+                 CREATE TABLE s (a int NOT NULL);
+                 CREATE UNIQUE INDEX ui ON s (a);
+                 ALTER TABLE s ADD CONSTRAINT uc UNIQUE USING INDEX ui DEFERRABLE;
+                 CREATE TABLE k (a int NOT NULL);
+                 ALTER TABLE k ADD CONSTRAINT kp PRIMARY KEY (a) DEFERRABLE;";
+    for (stmt, index) in [
+        ("ALTER TABLE t REPLICA IDENTITY USING INDEX u;", "u"),
+        (
+            "ALTER TABLE c REPLICA IDENTITY USING INDEX c_a_key;",
+            "c_a_key",
+        ),
+        (
+            "ALTER TABLE p1 REPLICA IDENTITY USING INDEX p1_a_key;",
+            "p1_a_key",
+        ),
+        (
+            "ALTER TABLE l REPLICA IDENTITY USING INDEX l_a_key;",
+            "l_a_key",
+        ),
+        ("ALTER TABLE s REPLICA IDENTITY USING INDEX uc;", "uc"),
+        ("ALTER TABLE k REPLICA IDENTITY USING INDEX kp;", "kp"),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        let msg = format!("cannot use non-immediate index \"{index}\" as replica identity");
+        assert!(err.to_string().starts_with(&msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int NOT NULL, CONSTRAINT u UNIQUE (a) NOT DEFERRABLE);
+         ALTER TABLE t REPLICA IDENTITY USING INDEX u;",
+    )]);
+}

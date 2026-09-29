@@ -83,7 +83,13 @@ pub(crate) fn ensure_partition_index(
             }
             index
         }
-        None => create_clone(interp, &pi, parent_con.as_ref(), part, indkey, am)?,
+        None => {
+            let clone = create_clone(interp, &pi, parent_con.as_ref(), part, indkey, am)?;
+            if interp.nonimmediate_indexes.contains(&parent_index) {
+                interp.nonimmediate_indexes.insert(clone);
+            }
+            clone
+        }
     };
     interp.index_parents.insert(child_index, parent_index);
 

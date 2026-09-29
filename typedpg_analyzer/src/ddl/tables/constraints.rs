@@ -35,20 +35,24 @@ pub(crate) fn emit_constraints(
     let mut pending_fks: Vec<PendingFk> = Vec::new();
 
     // Column-level constraints.
-    for elt in &stmt.table_elts {
-        let Some(node::Node::ColumnDef(cd)) = elt.node.as_ref() else {
-            continue;
-        };
+    let column_constraints: Vec<(&pg_query::protobuf::ColumnDef, Vec<_>)> = stmt
+        .table_elts
+        .iter()
+        .filter_map(|elt| match elt.node.as_ref() {
+            Some(node::Node::ColumnDef(cd)) => {
+                Some((&**cd, fold_constraint_attrs(&cd.constraints)))
+            }
+            _ => None,
+        })
+        .collect();
+    for (cd, constraints) in &column_constraints {
         let Some(an) = attnum_of(&cd.colname) else {
             continue;
         };
         let Some(my_type) = atttype_of(&cd.colname) else {
             continue;
         };
-        for c_node in &cd.constraints {
-            let Some(node::Node::Constraint(c)) = c_node.node.as_ref() else {
-                continue;
-            };
+        for c in constraints {
             match ConstrType::try_from(c.contype) {
                 Ok(ConstrType::ConstrPrimary) => {
                     to_emit.push((
@@ -64,6 +68,7 @@ pub(crate) fn emit_constraints(
                         None,
                         Vec::new(),
                         None,
+                        c.deferrable,
                     ));
                 }
                 Ok(ConstrType::ConstrUnique) => {
@@ -80,6 +85,7 @@ pub(crate) fn emit_constraints(
                         None,
                         Vec::new(),
                         None,
+                        c.deferrable,
                     ));
                 }
                 Ok(ConstrType::ConstrCheck) => {
@@ -101,6 +107,7 @@ pub(crate) fn emit_constraints(
                             ),
                             no_inherit: c.is_no_inherit,
                         }),
+                        c.deferrable,
                     ));
                 }
                 Ok(ConstrType::ConstrForeign) => {
@@ -149,6 +156,7 @@ pub(crate) fn emit_constraints(
                     None,
                     Vec::new(),
                     None,
+                    c.deferrable,
                 ));
             }
             Ok(ConstrType::ConstrUnique) if !columns.is_empty() => {
@@ -165,6 +173,7 @@ pub(crate) fn emit_constraints(
                     None,
                     Vec::new(),
                     None,
+                    c.deferrable,
                 ));
             }
             Ok(ConstrType::ConstrCheck) => {
@@ -186,6 +195,7 @@ pub(crate) fn emit_constraints(
                         ),
                         no_inherit: c.is_no_inherit,
                     }),
+                    c.deferrable,
                 ));
             }
             Ok(ConstrType::ConstrExclusion) => {
@@ -203,6 +213,7 @@ pub(crate) fn emit_constraints(
                     None,
                     Vec::new(),
                     None,
+                    c.deferrable,
                 ));
             }
             Ok(ConstrType::ConstrForeign) => {
@@ -252,10 +263,10 @@ pub(crate) fn emit_constraints(
             _ => kept.push(pending),
         }
     }
-    for (conname, contype, conkey, confrelid, confkey, check) in kept {
+    for (conname, contype, conkey, confrelid, confkey, check, deferrable) in kept {
         let conname = conname.resolve(interp, relid);
         let oid = emit_constraint_with_backing_index(
-            interp, relid, conname, contype, conkey, confrelid, confkey,
+            interp, relid, conname, contype, conkey, confrelid, confkey, deferrable,
         )?;
         if let Some(def) = check {
             interp.check_defs.insert(oid, def);
@@ -274,9 +285,59 @@ pub(crate) fn emit_constraints(
             conkey,
             Some(target_oid),
             target_attnums,
+            false,
         )?;
     }
     Ok(())
+}
+
+/// transformConstraintAttrs (parse_utilcmd.c): a column's `[NOT]
+/// DEFERRABLE` / `INITIALLY {DEFERRED | IMMEDIATE}` clauses arrive as
+/// separate attribute nodes that apply to the constraint before them; a
+/// lone INITIALLY DEFERRED implies DEFERRABLE.
+pub(super) fn fold_constraint_attrs(
+    constraints: &[pg_query::protobuf::Node],
+) -> Vec<pg_query::protobuf::Constraint> {
+    let mut out: Vec<pg_query::protobuf::Constraint> = Vec::new();
+    let mut saw_deferrability = false;
+    for n in constraints {
+        let Some(node::Node::Constraint(c)) = n.node.as_ref() else {
+            continue;
+        };
+        let attr = ConstrType::try_from(c.contype);
+        let is_attr = matches!(
+            attr,
+            Ok(ConstrType::ConstrAttrDeferrable
+                | ConstrType::ConstrAttrNotDeferrable
+                | ConstrType::ConstrAttrDeferred
+                | ConstrType::ConstrAttrImmediate)
+        );
+        let Some(last) = out.last_mut().filter(|_| is_attr) else {
+            if !is_attr {
+                saw_deferrability = false;
+                out.push((**c).clone());
+            }
+            continue;
+        };
+        match attr {
+            Ok(ConstrType::ConstrAttrDeferrable) => {
+                last.deferrable = true;
+                saw_deferrability = true;
+            }
+            Ok(ConstrType::ConstrAttrNotDeferrable) => {
+                last.deferrable = false;
+                saw_deferrability = true;
+            }
+            Ok(ConstrType::ConstrAttrDeferred) => {
+                last.initdeferred = true;
+                if !saw_deferrability {
+                    last.deferrable = true;
+                }
+            }
+            _ => last.initdeferred = false,
+        }
+    }
+    out
 }
 
 /// Insert a `pg_constraint` row and, for PK/UNIQUE, the backing
@@ -286,6 +347,7 @@ pub(crate) fn emit_constraints(
 /// both a constraint and an index, sharing one name. Mirror that so DROP
 /// COLUMN / DROP TABLE cascade through `pg_index` and `ON CONFLICT ON
 /// CONSTRAINT name` finds the index by its conname.
+#[allow(clippy::too_many_arguments)] // one field per pg_constraint column
 fn emit_constraint_with_backing_index(
     interp: &mut PgCatalog,
     relid: PgClassOid,
@@ -294,6 +356,7 @@ fn emit_constraint_with_backing_index(
     conkey: Vec<i16>,
     confrelid: Option<PgClassOid>,
     confkey: Vec<i16>,
+    deferrable: bool,
 ) -> Result<PgConstraintOid, DdlError> {
     if matches!(contype, ConType::PrimaryKey | ConType::Unique) {
         let label = if contype == ConType::PrimaryKey {
@@ -349,6 +412,11 @@ fn emit_constraint_with_backing_index(
             indexprs: Vec::new(),
             indpred: None,
         });
+        // index_create: indimmediate = !deferrable (before the partition
+        // clones copy it).
+        if deferrable {
+            interp.nonimmediate_indexes.insert(indexrelid);
+        }
         super::partidx::propagate_new_index(interp, relid, indexrelid)?;
     }
     Ok(oid)
@@ -1006,11 +1074,7 @@ pub(crate) fn add_column_constraints(
         recurse: false,
         recursing: false,
     };
-    for c_node in &cd.constraints {
-        let Some(node::Node::Constraint(c)) = c_node.node.as_ref() else {
-            continue;
-        };
-        let mut c = c.clone();
+    for mut c in fold_constraint_attrs(&cd.constraints) {
         match ConstrType::try_from(c.contype) {
             Ok(ConstrType::ConstrPrimary | ConstrType::ConstrUnique) => {
                 c.keys = vec![colname_node.clone()];
@@ -1064,6 +1128,7 @@ fn add_constraint_node(
             keys,
             None,
             Vec::new(),
+            c.deferrable,
         )?;
     }
 
@@ -1116,6 +1181,7 @@ fn add_constraint_node(
                 attnums,
                 None,
                 Vec::new(),
+                c.deferrable,
             )?;
         }
     }
@@ -1156,6 +1222,7 @@ fn add_constraint_node(
                 attnums,
                 None,
                 Vec::new(),
+                c.deferrable,
             )?;
         }
     }
@@ -1251,6 +1318,7 @@ fn add_constraint_node(
             attnums,
             Some(target_oid),
             target_attnums,
+            false,
         )?;
     }
 
@@ -1312,6 +1380,11 @@ fn add_index_constraint(
         .retain(|_, x| !(x.conrelid == relid && x.conname == c.indexname));
     if let Some(idx) = interp.pg_index.get_mut(&index_oid) {
         idx.indisprimary = is_primary;
+    }
+    // index_constraint_create: a DEFERRABLE constraint clears the adopted
+    // index's indimmediate.
+    if c.deferrable {
+        interp.nonimmediate_indexes.insert(index_oid);
     }
     if is_primary {
         let only_here = super::inherit::Recursion {
@@ -1516,6 +1589,9 @@ pub(crate) fn copy_like_constraints(
                         indkey,
                         None,
                         Vec::new(),
+                        // generateClonedIndexStmt copies the constraint's
+                        // deferrability.
+                        interp.nonimmediate_indexes.contains(&idx.indexrelid),
                     )?;
                 }
                 None => {

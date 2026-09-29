@@ -22,7 +22,8 @@ use crate::qualified_name::QualifiedName;
 /// Pending `pg_constraint` row built up while walking a `CreateStmt`:
 /// `(conname, contype, conkey, confrelid, confkey)`. Materialized into
 /// real catalog rows after all FK targets have been validated.
-/// CHECK constraints also carry their definition.
+/// CHECK constraints also carry their definition; the last field is
+/// DEFERRABLE.
 type PendingConstraint = (
     ConName,
     ConType,
@@ -30,6 +31,7 @@ type PendingConstraint = (
     Option<PgClassOid>,
     Vec<i16>,
     Option<check_inherit::CheckDef>,
+    bool,
 );
 
 /// A constraint's name: the explicit one, or PG's generated
