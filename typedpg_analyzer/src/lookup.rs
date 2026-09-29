@@ -52,7 +52,17 @@ impl PgCatalog {
     // ── Namespace helpers ───────────────────────────────────────────────
 
     pub fn namespace_oid(&self, name: &str) -> Option<PgNamespaceOid> {
-        self.namespace_by_name.get(name).copied()
+        // `pg_temp` names the session's temporary schema, which only the
+        // migrations' session has.
+        let temp = self.temp_namespace.filter(|_| self.in_migration);
+        if name == "pg_temp" {
+            return temp;
+        }
+        let oid = self.namespace_by_name.get(name).copied()?;
+        if Some(oid) == self.temp_namespace && temp.is_none() {
+            return None;
+        }
+        Some(oid)
     }
 
     pub fn namespace_name(&self, oid: PgNamespaceOid) -> Option<&str> {
@@ -80,7 +90,11 @@ impl PgCatalog {
         if let Some(name) = schema {
             return self.namespace_oid(name).into_iter().collect();
         }
-        let mut out = Vec::with_capacity(self.search_path.len() + 1);
+        let mut out = Vec::with_capacity(self.search_path.len() + 2);
+        // The temporary schema is searched first (recomputeNamespacePath).
+        if let Some(temp) = self.temp_namespace.filter(|_| self.in_migration) {
+            out.push(temp);
+        }
         if !self.search_path_includes_pg_catalog()
             && let Some(pg_oid) = self.pg_catalog_oid()
         {

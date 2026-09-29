@@ -3470,3 +3470,77 @@ fn unlogged_tables_follow_persistence_rules() {
         ),
     ]);
 }
+
+#[test]
+fn temporary_relations_belong_to_the_migration_session() {
+    // PG 18: temporary relations live in the session's pg_temp schema,
+    // searched first; ON COMMIT needs a temporary table; a view reading a
+    // temporary relation is temporary; foreign keys don't cross
+    // persistence.
+    let setup = "CREATE TABLE p (id int PRIMARY KEY);
+                 CREATE TEMP TABLE t1 (a int);";
+    for (stmt, msg) in [
+        (
+            "CREATE TEMP TABLE public.t2 (a int);",
+            "cannot create temporary relation in non-temporary schema",
+        ),
+        (
+            "CREATE TABLE t4 (a int) ON COMMIT DROP;",
+            "ON COMMIT can only be used on temporary tables",
+        ),
+        (
+            "CREATE TEMP TABLE t5 (a int REFERENCES p);",
+            "constraints on temporary tables may reference only temporary tables",
+        ),
+        (
+            "CREATE TABLE t6 (a int REFERENCES t1);",
+            "constraints on permanent tables may reference only permanent tables",
+        ),
+        (
+            "CREATE TEMP TABLE p (x int); SELECT id FROM p;",
+            "column \"id\" does not exist",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    let db = build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "CREATE TABLE pg_temp.t3 (a int);
+             INSERT INTO t1 VALUES (1);
+             INSERT INTO pg_temp.t3 SELECT a FROM t1;
+             CREATE VIEW v1 AS SELECT * FROM t1;
+             CREATE TEMP SEQUENCE ts;
+             CREATE INDEX ON t1 (a);
+             CREATE TEMP VIEW tv AS SELECT 1 AS x;
+             CREATE TEMP TABLE t8 (a int) ON COMMIT DELETE ROWS;
+             CREATE TEMP TABLE p (x int);
+             SELECT x FROM p;",
+        ),
+        ("0003.sql", "SELECT a FROM t1; SELECT * FROM v1;"),
+    ]);
+    // ON COMMIT DROP: gone once the migration's transaction commits.
+    let err = try_apply(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "CREATE TEMP TABLE t7 (a int) ON COMMIT DROP; INSERT INTO t7 VALUES (1);",
+        ),
+        ("0003.sql", "INSERT INTO t7 VALUES (1);"),
+    ])
+    .expect_err("ON COMMIT DROP");
+    assert!(
+        err.to_string()
+            .starts_with("relation \"t7\" does not exist"),
+        "got: {err}"
+    );
+    // The application's sessions don't see the migrations' temporary
+    // relations.
+    for name in ["t1", "t3", "v1", "ts", "tv", "t8"] {
+        assert!(db.resolve_table(None, name).is_none(), "{name} is visible");
+    }
+    let p = db.resolve_table(None, "p").expect("p");
+    assert_eq!(db.namespace_name(p.relnamespace), Some("public"));
+}

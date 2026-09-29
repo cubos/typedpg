@@ -122,6 +122,13 @@ impl std::error::Error for DdlError {
 
 /// Parse and apply all DDL statements in a SQL string.
 pub(crate) fn apply_sql_to(db: &mut PgCatalog, sql: &str) -> Result<(), DdlError> {
+    let was_in_migration = std::mem::replace(&mut db.in_migration, true);
+    let result = apply_sql_statements(db, sql);
+    db.in_migration = was_in_migration;
+    result
+}
+
+fn apply_sql_statements(db: &mut PgCatalog, sql: &str) -> Result<(), DdlError> {
     let parsed = pg_query::parse(sql).map_err(|e| DdlError::Parse(e.to_string()))?;
     let tx = txblock::TxContext::of(sql, &parsed.protobuf.stmts);
 

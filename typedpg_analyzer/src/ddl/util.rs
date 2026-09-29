@@ -133,6 +133,23 @@ pub fn ensure_namespace(interp: &mut PgCatalog, name: &str) -> Result<PgNamespac
     Ok(oid)
 }
 
+/// The session's temporary schema, created on first use
+/// (InitTempTableNamespace).
+pub fn temp_namespace(interp: &mut PgCatalog) -> Result<PgNamespaceOid, DdlError> {
+    if let Some(oid) = interp.temp_namespace {
+        return Ok(oid);
+    }
+    let oid = ensure_namespace(interp, "pg_temp_1")?;
+    interp.temp_namespace = Some(oid);
+    Ok(oid)
+}
+
+/// Whether `relid` lives in the temporary schema.
+pub fn is_temp_relation(interp: &PgCatalog, relid: crate::oid::PgClassOid) -> bool {
+    interp.temp_namespace.is_some()
+        && interp.pg_class.get(&relid).map(|c| c.relnamespace) == interp.temp_namespace
+}
+
 /// LookupCreationNamespace: the schema a new object goes in must exist.
 pub fn existing_namespace(interp: &PgCatalog, name: &str) -> Result<PgNamespaceOid, DdlError> {
     interp
@@ -162,6 +179,16 @@ pub fn ensure_range_var(
     interp: &mut PgCatalog,
     rv: &RangeVar,
 ) -> Result<(PgNamespaceOid, String), DdlError> {
+    // A temporary relation goes in the session's temporary schema; an
+    // explicit `pg_temp` makes the relation temporary.
+    if rv.relpersistence == "t" || rv.schemaname == "pg_temp" {
+        if !rv.schemaname.is_empty() && rv.schemaname != "pg_temp" {
+            return Err(DdlError::UnsupportedDdl(
+                "cannot create temporary relation in non-temporary schema".into(),
+            ));
+        }
+        return Ok((temp_namespace(interp)?, rv.relname.clone()));
+    }
     let schema = if rv.schemaname.is_empty() {
         creation_schema(interp)?
     } else {

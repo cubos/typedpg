@@ -100,8 +100,30 @@ pub fn create_view(interp: &mut PgCatalog, stmt: &ViewStmt) -> Result<(), DdlErr
         return Ok(());
     }
 
+    // DefineView: a view reading a temporary relation is temporary
+    // ("view ... will be a temporary view").
+    let reads_temp = resolved
+        .deps
+        .relation_refs
+        .iter()
+        .chain(resolved.deps.column_refs.iter().map(|(r, _)| r))
+        .any(|&r| super::util::is_temp_relation(interp, r));
+    let nsoid = if reads_temp && rv.schemaname.is_empty() {
+        super::util::temp_namespace(interp)?
+    } else if reads_temp && Some(nsoid) != interp.temp_namespace {
+        return Err(DdlError::UnsupportedDdl(
+            "cannot create temporary relation in non-temporary schema".into(),
+        ));
+    } else {
+        nsoid
+    };
     super::util::check_relation_name_free(interp, nsoid, &name)?;
-    install_relation(interp, nsoid, name, RelKind::View, resolved)?;
+    install_relation(interp, nsoid, name.clone(), RelKind::View, resolved)?;
+    if Some(nsoid) == interp.temp_namespace
+        && let Some(&oid) = interp.class_by_qname.get(&(nsoid, name))
+    {
+        interp.relpersistence.insert(oid, 't');
+    }
     Ok(())
 }
 

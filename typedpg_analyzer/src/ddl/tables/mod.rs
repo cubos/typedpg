@@ -290,8 +290,25 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
         let of_type = lookup_type_name(tn, interp)?;
         typed::set_of_type(interp, class_oid, of_type);
     }
-    if let Some(p @ ('u' | 't')) = rv.relpersistence.chars().next() {
-        interp.relpersistence.insert(class_oid, p);
+    if Some(nsoid) == interp.temp_namespace {
+        interp.relpersistence.insert(class_oid, 't');
+    } else if rv.relpersistence == "u" {
+        interp.relpersistence.insert(class_oid, 'u');
+    }
+    // ON COMMIT applies to temporary tables only (transformCreateStmt).
+    use pg_query::protobuf::OnCommitAction;
+    match OnCommitAction::try_from(stmt.oncommit) {
+        Ok(OnCommitAction::OncommitNoop | OnCommitAction::Undefined) | Err(_) => {}
+        Ok(action) => {
+            if Some(nsoid) != interp.temp_namespace {
+                return Err(DdlError::UnsupportedDdl(
+                    "ON COMMIT can only be used on temporary tables".into(),
+                ));
+            }
+            if action == OnCommitAction::OncommitDrop {
+                interp.on_commit_drop.push(class_oid);
+            }
+        }
     }
     for (i, col) in columns.iter().enumerate() {
         interp.insert_pg_attribute(PgAttribute {

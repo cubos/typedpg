@@ -262,9 +262,9 @@ pub(crate) fn emit_constraints(
         }
     }
     for (c, local_names, local_types, conkey, default_name) in pending_fks {
+        check_fk_persistence(interp, relid, c)?;
         let (target_oid, target_attnums) =
             resolve_fk_target(interp, c, relname, &local_names, &local_types)?;
-        check_fk_persistence(interp, relid, target_oid)?;
         let conname = ConName::from_explicit(&c.conname, default_name).resolve(interp, relid);
         emit_constraint_with_backing_index(
             interp,
@@ -428,8 +428,17 @@ pub(crate) fn persistence(interp: &PgCatalog, relid: PgClassOid) -> char {
 fn check_fk_persistence(
     interp: &PgCatalog,
     relid: PgClassOid,
-    target: PgClassOid,
+    c: &pg_query::protobuf::Constraint,
 ) -> Result<(), DdlError> {
+    // The referenced table (its errors are resolve_fk_target's to report).
+    let Some(target) = c
+        .pktable
+        .as_ref()
+        .and_then(|rv| crate::ddl::util::lookup_relation(interp, rv).ok())
+        .map(|(_, oid)| oid)
+    else {
+        return Ok(());
+    };
     let msg = match (persistence(interp, relid), persistence(interp, target)) {
         ('p', t) if t != 'p' => {
             "constraints on permanent tables may reference only permanent tables"
@@ -1223,9 +1232,9 @@ fn add_constraint_node(
             .get(&relid)
             .map(|c| c.relname.clone())
             .unwrap_or_default();
+        check_fk_persistence(interp, relid, c)?;
         let (target_oid, target_attnums) =
             resolve_fk_target(interp, c, &relname_owned, &column_names, &local_types)?;
-        check_fk_persistence(interp, relid, target_oid)?;
         let conname = ConName::from_explicit(
             &c.conname,
             ConName::Constraint {

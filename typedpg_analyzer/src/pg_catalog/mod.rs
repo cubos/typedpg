@@ -267,6 +267,15 @@ pub struct PgCatalog {
     /// `relpersistence` of unlogged (`u`) and temporary (`t`) relations;
     /// absent means permanent.
     pub(crate) relpersistence: HashMap<PgClassOid, char>,
+    /// The migration session's temporary schema (`pg_temp`), once a
+    /// temporary relation was created.
+    pub(crate) temp_namespace: Option<PgNamespaceOid>,
+    /// Whether migrations are being applied. Temporary objects belong to
+    /// the migration runner's session: queries analyzed afterwards (in an
+    /// application session) don't see them.
+    pub(crate) in_migration: bool,
+    /// `ON COMMIT DROP` temporary tables of the current transaction.
+    pub(crate) on_commit_drop: Vec<PgClassOid>,
     /// Event triggers and the function each executes.
     pub(crate) event_triggers: Vec<(String, crate::oid::PgProcOid)>,
     /// Enum labels added in the current transaction to a type created
@@ -547,6 +556,9 @@ impl PgCatalog {
             publications: Vec::new(),
             event_triggers: Vec::new(),
             relpersistence: HashMap::new(),
+            temp_namespace: None,
+            in_migration: false,
+            on_commit_drop: Vec::new(),
             uncommitted_enum_labels: Default::default(),
             enums_created_in_transaction: Default::default(),
             partition_specs: HashMap::new(),
