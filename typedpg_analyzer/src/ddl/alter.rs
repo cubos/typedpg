@@ -274,55 +274,77 @@ fn rename_column(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlErr
     }
     let cascade = stmt.behavior == typedpg_pg_query::protobuf::DropBehavior::DropCascade as i32;
     let typed = crate::ddl::tables::typed::typed_table_dependents(interp, relid, cascade)?;
-    rename_column_in(interp, relid, &stmt.subname, &stmt.newname, rv.inh, false)?;
+    rename_column_in(interp, relid, &stmt.subname, &stmt.newname, rv.inh, 0)?;
     for table in typed {
-        rename_column_in(interp, table, &stmt.subname, &stmt.newname, true, true)?;
+        rename_column_in(interp, table, &stmt.subname, &stmt.newname, true, 0)?;
     }
     Ok(())
 }
 
-/// `renameatt_internal` (tablecmds.c): the column must exist and the new
-/// name be free; an inherited column is renamed only through its parent,
-/// whose rename reaches every child (`ONLY` is refused while a child has
-/// the column).
+/// `renameatt_internal` (tablecmds.c): with recursion, every descendant is
+/// renamed first — refused where the column also comes from a parent
+/// outside the tree (`expected_parents`); without it, no child may have
+/// the column. Then the column must exist, not be a system column, not be
+/// inherited from elsewhere, and the new name must be free.
 fn rename_column_in(
     interp: &mut PgCatalog,
     relid: crate::oid::PgClassOid,
     old: &str,
     new: &str,
     recurse: bool,
-    recursing: bool,
+    expected_parents: i16,
 ) -> Result<(), DdlError> {
     let relname = interp
         .pg_class
         .get(&relid)
         .map(|c| c.relname.clone())
         .unwrap_or_default();
+    if recurse {
+        let tree = crate::ddl::tables::inherit::all_inheritors(interp, relid);
+        for &child in &tree[1..] {
+            let numparents = interp
+                .pg_inherits
+                .iter()
+                .filter(|h| h.inhrelid == child && tree.contains(&h.inhparent))
+                .count() as i16;
+            rename_column_in(interp, child, old, new, false, numparents)?;
+        }
+    } else if expected_parents == 0
+        && !crate::ddl::tables::inherit::children_of(interp, relid).is_empty()
+    {
+        return Err(DdlError::Parse(format!(
+            "inherited column \"{old}\" must be renamed in child tables too"
+        )));
+    }
     let Some(attr) = interp.attribute_by_name(relid, old).cloned() else {
+        if crate::pg_catalog::SYSTEM_COLUMNS
+            .iter()
+            .any(|(n, ..)| *n == old)
+        {
+            return Err(DdlError::UnsupportedDdl(format!(
+                "cannot rename system column \"{old}\""
+            )));
+        }
         return Err(DdlError::Parse(format!("column \"{old}\" does not exist")));
     };
-    if !recursing && attr.attinhcount > 0 {
+    if attr.attinhcount > expected_parents {
         return Err(DdlError::Parse(format!(
             "cannot rename inherited column \"{old}\""
         )));
     }
+    // check_for_column_name_collision.
     if interp.attribute_by_name(relid, new).is_some() {
         return Err(DdlError::DuplicateObject(format!(
             "column \"{new}\" of relation \"{relname}\" already exists"
         )));
     }
-    let children: Vec<crate::oid::PgClassOid> =
-        crate::ddl::tables::inherit::children_of(interp, relid)
-            .into_iter()
-            .filter(|&c| interp.attribute_by_name(c, old).is_some())
-            .collect();
-    if !recurse && !children.is_empty() {
-        return Err(DdlError::Parse(format!(
-            "inherited column \"{old}\" must be renamed in child tables too"
+    if crate::pg_catalog::SYSTEM_COLUMNS
+        .iter()
+        .any(|(n, ..)| *n == new)
+    {
+        return Err(DdlError::DuplicateObject(format!(
+            "column name \"{new}\" conflicts with a system column name"
         )));
-    }
-    for child in children {
-        rename_column_in(interp, child, old, new, true, true)?;
     }
     if let Some(attrs) = interp.pg_attribute.get_mut(&relid)
         && let Some(col) = attrs.iter_mut().find(|c| c.attname == old)
@@ -332,7 +354,6 @@ fn rename_column_in(
     views::rewrite_views_on_column_rename(interp, relid, old, new);
     Ok(())
 }
-
 fn rename_function_like(
     interp: &mut PgCatalog,
     stmt: &RenameStmt,

@@ -110,3 +110,50 @@ fn rename_schema_rewrites_view_ast() {
     assert!(table_deps.contains(&new));
     assert!(!table_deps.iter().any(|k| k.schema == "app"));
 }
+
+#[test]
+fn renaming_an_inherited_column_follows_renameatt_internal() {
+    // PG 18: ONLY is refused while a child exists — before the column is
+    // even looked up — and a column a child also inherits from outside the
+    // renamed tree can't be renamed.
+    let setup = "CREATE TABLE inht1 (a int, b int);
+                 CREATE TABLE inht2 (x int) INHERITS (inht1);
+                 CREATE TABLE inht3 (y int) INHERITS (inht1);
+                 CREATE TABLE inht4 (z int) INHERITS (inht2, inht3);
+                 CREATE TABLE other (x int);
+                 CREATE TABLE both_ (q int) INHERITS (inht2, other);";
+    for (stmt, msg) in [
+        (
+            "ALTER TABLE ONLY inht1 RENAME nosuch TO c;",
+            "inherited column \"nosuch\" must be renamed in child tables too",
+        ),
+        (
+            "ALTER TABLE inht2 RENAME a TO aa;",
+            "cannot rename inherited column \"a\"",
+        ),
+        (
+            "ALTER TABLE inht2 RENAME x TO xx;",
+            "cannot rename inherited column \"x\"",
+        ),
+        (
+            "ALTER TABLE inht1 RENAME xmin TO c;",
+            "cannot rename system column \"xmin\"",
+        ),
+        (
+            "ALTER TABLE inht1 RENAME a TO ctid;",
+            "column name \"ctid\" conflicts with a system column name",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    let db = build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "ALTER TABLE inht1 RENAME a TO aa; ALTER TABLE inht3 RENAME y TO yy;",
+        ),
+    ]);
+    let t4 = db.resolve_table(None, "inht4").unwrap();
+    assert!(db.attributes_of(t4.oid).iter().any(|a| a.attname == "aa"));
+}
