@@ -99,15 +99,27 @@ pub(crate) fn check_function_default(
     Ok(param_type)
 }
 
-/// The `EXPR_KIND_COLUMN_DEFAULT` restrictions (`transformColumnRef`,
-/// `transformSubLink`, `check_agglevels_and_constraints`,
-/// `transformWindowFuncCall`).
+/// The `EXPR_KIND_COLUMN_DEFAULT` / `EXPR_KIND_FUNCTION_DEFAULT`
+/// restrictions (`transformColumnRef`, `transformSubLink`,
+/// `check_agglevels_and_constraints`, `transformWindowFuncCall`,
+/// `check_srf_call_placement`).
 fn check_default_kind(
     interp: &PgCatalog,
     expr: &protobuf::Node,
     column_default: bool,
 ) -> Result<(), DdlError> {
-    let check_default_kind = |e: &protobuf::Node| check_default_kind(interp, e, column_default);
+    check_default_kind_node(interp, expr, column_default)?;
+    crate::resolve::check_no_srf_in_clause(expr, interp, "DEFAULT expressions")
+        .map_err(|e| DdlError::UnsupportedDdl(e.to_string()))
+}
+
+fn check_default_kind_node(
+    interp: &PgCatalog,
+    expr: &protobuf::Node,
+    column_default: bool,
+) -> Result<(), DdlError> {
+    let check_default_kind =
+        |e: &protobuf::Node| check_default_kind_node(interp, e, column_default);
     let Some(inner) = expr.node.as_ref() else {
         return Ok(());
     };
