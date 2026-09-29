@@ -56,6 +56,8 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
     }
     check_index_max_keys(stmt.index_params.len() + stmt.index_including_params.len())?;
 
+    // DefineIndex: not in pg_global.
+    super::tables::check_tablespace_placement(&stmt.table_space)?;
     // DefineIndex: the access method, what it supports, and its options.
     let am = if stmt.access_method.is_empty() {
         "btree"

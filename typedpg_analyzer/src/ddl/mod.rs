@@ -335,6 +335,7 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         | node::Node::AlterCollationStmt(_)
         | node::Node::AlterObjectDependsStmt(_) => Ok(()),
         node::Node::AlterTypeStmt(s) => types::alter_type(db, s),
+        node::Node::AlterTableMoveAllStmt(s) => tables::alter_table_move_all(db, s),
 
         // ── Unknown DDL — surface as an error ───────────────────────
         other => Err(DdlError::UnsupportedDdl(format!("{other:?}"))),

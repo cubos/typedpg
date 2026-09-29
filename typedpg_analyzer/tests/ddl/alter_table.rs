@@ -812,3 +812,66 @@ fn toast_storage_parameters_are_checked_only_with_a_toast_table() {
         );
     }
 }
+
+#[test]
+fn user_relations_stay_out_of_pg_global() {
+    // DefineRelation / DefineIndex / ATExecSetTableSpace and
+    // AlterTableMoveAll: pg_global holds only shared catalogs.
+    let setup = "CREATE TABLE a (x int);
+                 CREATE INDEX i ON a (x);
+                 CREATE MATERIALIZED VIEW m AS SELECT 1 AS x;
+                 CREATE SEQUENCE s;";
+    let placed = "only shared relations can be placed in pg_global tablespace";
+    for (stmt, msg) in [
+        ("ALTER TABLE a SET TABLESPACE pg_global;", placed),
+        ("ALTER INDEX i SET TABLESPACE pg_global;", placed),
+        ("ALTER MATERIALIZED VIEW m SET TABLESPACE pg_global;", placed),
+        ("CREATE TABLE b (x int) TABLESPACE pg_global;", placed),
+        (
+            "CREATE TABLE p (x int) PARTITION BY RANGE (x) TABLESPACE pg_global;",
+            placed,
+        ),
+        ("CREATE TABLE c TABLESPACE pg_global AS SELECT 1 AS x;", placed),
+        ("CREATE INDEX j ON a (x) TABLESPACE pg_global;", placed),
+        (
+            "CREATE TABLE u (x int, UNIQUE (x) USING INDEX TABLESPACE pg_global);",
+            placed,
+        ),
+        (
+            "ALTER TABLE a ADD PRIMARY KEY (x) USING INDEX TABLESPACE pg_global;",
+            placed,
+        ),
+        (
+            "ALTER TABLE a SET TABLESPACE pg_default, SET TABLESPACE pg_default;",
+            "cannot have multiple SET TABLESPACE subcommands",
+        ),
+        (
+            "ALTER SEQUENCE s SET TABLESPACE pg_default;",
+            "ALTER action SET TABLESPACE cannot be performed on relation \"s\"",
+        ),
+        (
+            "ALTER TABLE ALL IN TABLESPACE pg_default SET TABLESPACE pg_global;",
+            "cannot move relations in to or out of pg_global tablespace",
+        ),
+        (
+            "ALTER INDEX ALL IN TABLESPACE pg_global SET TABLESPACE pg_default;",
+            "cannot move relations in to or out of pg_global tablespace",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "ALTER TABLE a SET TABLESPACE pg_default;
+             ALTER INDEX i SET TABLESPACE pg_default;
+             ALTER TABLE ALL IN TABLESPACE pg_default SET TABLESPACE pg_default;
+             ALTER MATERIALIZED VIEW ALL IN TABLESPACE pg_default
+                 SET TABLESPACE pg_default NOWAIT;
+             ALTER TABLE ALL IN TABLESPACE pg_default OWNED BY current_user
+                 SET TABLESPACE pg_default;",
+        ),
+    ]);
+}

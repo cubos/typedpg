@@ -185,6 +185,22 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
         ));
     }
     super::util::check_relation_name_free(interp, nsoid, &name)?;
+    check_tablespace_placement(&stmt.tablespacename)?;
+    // The indexes of its PRIMARY KEY / UNIQUE / EXCLUDE constraints
+    // (USING INDEX TABLESPACE), created by DefineIndex.
+    for elt in stmt.constraints.iter().chain(stmt.table_elts.iter()) {
+        match elt.node.as_ref() {
+            Some(node::Node::Constraint(c)) => check_tablespace_placement(&c.indexspace)?,
+            Some(node::Node::ColumnDef(cd)) => {
+                for c in &cd.constraints {
+                    if let Some(node::Node::Constraint(c)) = c.node.as_ref() {
+                        check_tablespace_placement(&c.indexspace)?;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 
     let mut pk_columns: Vec<String> = Vec::new();
 
@@ -776,6 +792,47 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
     Ok(())
 }
 
+/// DefineRelation / ATExecSetTableSpace: pg_global holds only the shared
+/// system catalogs. (Other tablespaces are cluster objects the analyzer
+/// doesn't see: any name is taken to exist.)
+pub(crate) fn check_tablespace_placement(tablespace: &str) -> Result<(), DdlError> {
+    if tablespace == "pg_global" {
+        return Err(DdlError::Parse(
+            "only shared relations can be placed in pg_global tablespace".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// `ALTER {TABLE | INDEX | MATERIALIZED VIEW} ALL IN TABLESPACE a [OWNED
+/// BY role, ...] SET TABLESPACE b` (AlterTableMoveAll): relations move
+/// neither in to nor out of pg_global, and the roles must exist. Nothing
+/// the analyzer models changes.
+pub fn alter_table_move_all(
+    _interp: &PgCatalog,
+    stmt: &typedpg_pg_query::protobuf::AlterTableMoveAllStmt,
+) -> Result<(), DdlError> {
+    if stmt.orig_tablespacename == "pg_global" || stmt.new_tablespacename == "pg_global" {
+        return Err(DdlError::Parse(
+            "cannot move relations in to or out of pg_global tablespace".into(),
+        ));
+    }
+    // roleSpecsToIds.
+    for role in &stmt.roles {
+        if let Some(node::Node::RoleSpec(r)) = role.node.as_ref()
+            && typedpg_pg_query::protobuf::RoleSpecType::try_from(r.roletype)
+                == Ok(typedpg_pg_query::protobuf::RoleSpecType::RolespecCstring)
+            && !super::session::role_may_exist(&r.rolename)
+        {
+            return Err(DdlError::Parse(format!(
+                "role \"{}\" does not exist",
+                r.rolename
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// CheckAttributeNamesTypes (heap.c) for a relation with storage: a column
 /// may not take a system column's name, and its type must pass
 /// CheckAttributeType.
@@ -925,6 +982,20 @@ pub fn alter_table(interp: &mut PgCatalog, stmt: &AlterTableStmt) -> Result<(), 
         )));
     }
 
+    // ATPrepSetTableSpace: one new tablespace per relation.
+    let set_tablespaces = stmt
+        .cmds
+        .iter()
+        .filter(|n| {
+            matches!(n.node.as_ref(), Some(node::Node::AlterTableCmd(c))
+                if c.subtype == AlterTableType::AtSetTableSpace as i32)
+        })
+        .count();
+    if set_tablespaces > 1 {
+        return Err(DdlError::Parse(
+            "cannot have multiple SET TABLESPACE subcommands".into(),
+        ));
+    }
     // The TOAST tables the earlier statements made: SET (toast.*) reads
     // them, and a column this statement drops or retypes keeps one.
     toast::note_toast_tables(interp);
@@ -992,7 +1063,14 @@ fn apply_alter_subtype(
         AlterTableType::AtDropNotNull => inherit::drop_not_null(interp, relid, &cmd.name, rec),
         AlterTableType::AtColumnDefault => set_default(interp, relid, cmd, rec),
         AlterTableType::AtAlterColumnType => alter_column_type(interp, relid, cmd, rec),
-        AlterTableType::AtAddConstraint => add_constraint(interp, relid, cmd, rec),
+        AlterTableType::AtAddConstraint => {
+            // DefineIndex, for a constraint's USING INDEX TABLESPACE.
+            if let Some(node::Node::Constraint(c)) = cmd.def.as_deref().and_then(|d| d.node.as_ref())
+            {
+                check_tablespace_placement(&c.indexspace)?;
+            }
+            add_constraint(interp, relid, cmd, rec)
+        }
         AlterTableType::AtDropConstraint => drop_constraint(interp, relid, cmd, rec),
         AlterTableType::AtAddIdentity => set_identity(interp, relid, cmd),
         AlterTableType::AtSetIdentity => set_identity(interp, relid, cmd),
@@ -1020,6 +1098,7 @@ fn apply_alter_subtype(
             interp.clustered_indexes.remove(&relid);
             Ok(())
         }
+        AlterTableType::AtSetTableSpace => check_tablespace_placement(&cmd.name),
         AlterTableType::AtAddOf => typed::add_of(interp, relid, cmd),
         AlterTableType::AtAddInherit => inherit_cmd::add_inherit(interp, relid, cmd),
         AlterTableType::AtDropInherit => inherit_cmd::drop_inherit(interp, relid, cmd),
@@ -1234,6 +1313,17 @@ fn check_alter_target(
         At::AtDropInherit => (table_like, "NO INHERIT"),
         At::AtDropOf => (class.relkind == RelKind::Table, "NOT OF"),
         At::AtDropConstraint => (table_like, "DROP CONSTRAINT"),
+        At::AtSetTableSpace => (
+            matches!(
+                class.relkind,
+                RelKind::Table
+                    | RelKind::Partitioned
+                    | RelKind::MaterializedView
+                    | RelKind::Index
+                    | RelKind::PartitionedIndex
+            ),
+            "SET TABLESPACE",
+        ),
         At::AtSetLogged => (
             matches!(class.relkind, RelKind::Table | RelKind::Sequence),
             "SET LOGGED",

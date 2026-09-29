@@ -657,6 +657,12 @@ fn add_column_to(
     let Some(node::Node::ColumnDef(cd)) = def.node.as_ref() else {
         return Ok(());
     };
+    // DefineIndex, for a column constraint's USING INDEX TABLESPACE.
+    for c in &cd.constraints {
+        if let Some(node::Node::Constraint(c)) = c.node.as_ref() {
+            super::check_tablespace_placement(&c.indexspace)?;
+        }
+    }
     // ATExecAddColumn: a partition's columns are its parent's.
     if !rec.recursing && super::inherit_cmd::is_partition(interp, relid) {
         return Err(DdlError::Parse("cannot add column to a partition".into()));
