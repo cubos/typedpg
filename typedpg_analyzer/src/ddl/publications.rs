@@ -111,12 +111,8 @@ fn resolve_objects(
                         )));
                     }
                 }
-                if check_filters
-                    && let Some(filter) = pt.where_clause.as_deref()
-                    && let Some(Err(e)) =
-                        super::volatile::infer_over_relation(interp, relid, filter, None)
-                {
-                    return Err(DdlError::UnsupportedDdl(e.to_string()));
+                if check_filters && let Some(filter) = pt.where_clause.as_deref() {
+                    check_row_filter(interp, relid, filter)?;
                 }
                 out.push(Object::Table(relid, rv.relname.clone()));
             }
@@ -139,6 +135,176 @@ fn resolve_objects(
         }
     }
     Ok(out)
+}
+
+/// First OID of objects not created by initdb (`FirstNormalObjectId`).
+const FIRST_NORMAL_OBJECT_ID: u32 = 16384;
+
+/// TransformPubWhereClauses: the row filter is transformed as a WHERE
+/// clause (`transformWhereClause` with EXPR_KIND_WHERE, coerced to
+/// boolean) and then limited by `check_simple_rowfilter_expr`.
+fn check_row_filter(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+    filter: &pg_query::protobuf::Node,
+) -> Result<(), DdlError> {
+    let unsupported = |e: crate::error::AnalyzeError| DdlError::UnsupportedDdl(e.to_string());
+    let used = std::cell::RefCell::new(Vec::new());
+    let Some(result) = super::volatile::infer_over_relation(interp, relid, filter, Some(&used))
+    else {
+        return Ok(());
+    };
+    let result = result.map_err(unsupported)?;
+    crate::clause::check_no_aggregates_or_windows(filter, interp, "WHERE").map_err(unsupported)?;
+    crate::resolve::check_no_srf_in_clause(filter, interp, "WHERE").map_err(unsupported)?;
+    // coerce_to_boolean.
+    if result.type_oid != crate::pg_catalog::oid::BOOL
+        && result.type_oid != crate::pg_catalog::oid::UNKNOWN
+    {
+        return Err(DdlError::UnsupportedDdl(format!(
+            "argument of PUBLICATION WHERE must be type boolean, not type {}",
+            super::util::format_type_for_message(interp, result.type_oid)
+        )));
+    }
+    check_simple_rowfilter_expr(interp, relid, filter)?;
+    // check_functions_in_node(contain_mutable_or_user_functions_checker)
+    // over every function the filter runs, operators' included.
+    let mutable = used.into_inner().into_iter().any(|oid| {
+        oid.get() >= FIRST_NORMAL_OBJECT_ID
+            || interp
+                .pg_proc
+                .get(&oid)
+                .is_some_and(|p| p.provolatile != crate::pg_catalog::ProVolatile::Immutable)
+    });
+    if mutable {
+        return Err(invalid_row_filter(
+            "User-defined or built-in mutable functions are not allowed.",
+        ));
+    }
+    Ok(())
+}
+
+fn invalid_row_filter(detail: &str) -> DdlError {
+    DdlError::UnsupportedDdl(format!("invalid publication WHERE expression ({detail})"))
+}
+
+/// check_simple_rowfilter_expr_walker, over the raw expression: only the
+/// node kinds that transform into the whitelisted executable nodes (Var,
+/// Const, OpExpr, FuncExpr, BoolExpr, RelabelType, CollateExpr, CaseExpr,
+/// ArrayExpr, RowExpr, CoalesceExpr, MinMaxExpr, XmlExpr, NullTest,
+/// BooleanTest, ...), no system columns and no user-defined types. A cast
+/// is allowed only when it becomes a cast function or a relabeling (not a
+/// CoerceViaIO / ArrayCoerceExpr / CoerceToDomain).
+fn check_simple_rowfilter_expr(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+    node: &pg_query::protobuf::Node,
+) -> Result<(), DdlError> {
+    const ONLY_SIMPLE: &str = "Only columns, constants, built-in operators, built-in data types, \
+                               built-in collations, and immutable built-in functions are allowed.";
+    let Some(inner) = node.node.as_ref() else {
+        return Ok(());
+    };
+    let type_of = |n: &pg_query::protobuf::Node| {
+        super::volatile::infer_over_relation(interp, relid, n, None)
+            .and_then(Result::ok)
+            .map(|t| t.type_oid)
+    };
+    let user_type =
+        |t: Option<crate::oid::PgTypeOid>| t.is_some_and(|t| t.get() >= FIRST_NORMAL_OBJECT_ID);
+    fn opt(n: &Option<Box<pg_query::protobuf::Node>>) -> Vec<&pg_query::protobuf::Node> {
+        n.as_deref().into_iter().collect()
+    }
+    let children: Vec<&pg_query::protobuf::Node> = match inner {
+        node::Node::ColumnRef(cr) => {
+            let Some(name) = cr.fields.last().and_then(super::util::node_string) else {
+                return Err(invalid_row_filter(ONLY_SIMPLE));
+            };
+            if interp.attribute_by_name(relid, name).is_none()
+                && crate::pg_catalog::SYSTEM_COLUMNS
+                    .iter()
+                    .any(|(n, ..)| *n == name)
+            {
+                return Err(invalid_row_filter("System columns are not allowed."));
+            }
+            Vec::new()
+        }
+        node::Node::AConst(_) => Vec::new(),
+        node::Node::TypeCast(tc) => {
+            let arg = tc.arg.as_deref();
+            let target = type_of(node);
+            if user_type(target) {
+                return Err(invalid_row_filter("User-defined types are not allowed."));
+            }
+            // A cast literal folds into a Const.
+            let literal = matches!(
+                arg.and_then(|a| a.node.as_ref()),
+                Some(node::Node::AConst(_))
+            );
+            if !literal
+                && let (Some(target), Some(source)) = (target, arg.and_then(type_of))
+                && !matches!(
+                    crate::coerce::coercion_pathway(
+                        target,
+                        source,
+                        crate::coerce::CoercionContext::Explicit,
+                        interp,
+                    ),
+                    Some(crate::coerce::CoercionPath::Func | crate::coerce::CoercionPath::Relabel)
+                )
+            {
+                return Err(invalid_row_filter(ONLY_SIMPLE));
+            }
+            arg.into_iter().collect()
+        }
+        node::Node::AExpr(e) => {
+            let mut c: Vec<_> = opt(&e.lexpr);
+            c.extend(opt(&e.rexpr));
+            c
+        }
+        node::Node::List(l) => l.items.iter().collect(),
+        node::Node::BoolExpr(b) => b.args.iter().collect(),
+        node::Node::NullTest(t) => opt(&t.arg),
+        node::Node::BooleanTest(t) => opt(&t.arg),
+        node::Node::CaseExpr(c) => {
+            let mut out: Vec<_> = opt(&c.arg);
+            out.extend(c.args.iter());
+            out.extend(opt(&c.defresult));
+            out
+        }
+        node::Node::CaseWhen(w) => {
+            let mut out: Vec<_> = opt(&w.expr);
+            out.extend(opt(&w.result));
+            out
+        }
+        node::Node::CoalesceExpr(c) => c.args.iter().collect(),
+        node::Node::MinMaxExpr(m) => m.args.iter().collect(),
+        node::Node::RowExpr(r) => r.args.iter().collect(),
+        node::Node::AArrayExpr(a) => a.elements.iter().collect(),
+        node::Node::XmlExpr(x) => x.named_args.iter().chain(x.args.iter()).collect(),
+        node::Node::CollateClause(c) => opt(&c.arg),
+        node::Node::FuncCall(f) => f.args.iter().collect(),
+        node::Node::NamedArgExpr(n) => opt(&n.arg),
+        // ResTarget: an XMLELEMENT / XMLFOREST named argument.
+        node::Node::ResTarget(r) => opt(&r.val),
+        _ => return Err(invalid_row_filter(ONLY_SIMPLE)),
+    };
+    if matches!(
+        inner,
+        node::Node::ColumnRef(_)
+            | node::Node::AExpr(_)
+            | node::Node::FuncCall(_)
+            | node::Node::CaseExpr(_)
+            | node::Node::CoalesceExpr(_)
+            | node::Node::MinMaxExpr(_)
+    ) && user_type(type_of(node))
+    {
+        return Err(invalid_row_filter("User-defined types are not allowed."));
+    }
+    for child in children {
+        check_simple_rowfilter_expr(interp, relid, child)?;
+    }
+    Ok(())
 }
 
 pub fn create_publication(

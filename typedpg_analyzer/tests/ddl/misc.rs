@@ -3955,3 +3955,67 @@ fn deferrable_constraint_indexes_are_non_immediate() {
          ALTER TABLE t REPLICA IDENTITY USING INDEX u;",
     )]);
 }
+
+#[test]
+fn publication_row_filters_are_validated() {
+    // PG 18 TransformPubWhereClauses: the filter is a WHERE clause
+    // (EXPR_KIND_WHERE, coerced to boolean) limited by
+    // check_simple_rowfilter_expr to columns, constants, built-in operators,
+    // types and collations, and immutable built-in functions.
+    let setup = "CREATE TYPE e AS ENUM ('x');
+                 CREATE TABLE t (a int, b text, c e, d int[], j jsonb);
+                 CREATE FUNCTION f(int) RETURNS bool IMMUTABLE LANGUAGE sql AS 'select true';";
+    let invalid = "invalid publication WHERE expression";
+    for (filter, msg) in [
+        (
+            "a + 1",
+            "argument of PUBLICATION WHERE must be type boolean, not type integer",
+        ),
+        ("nosuch > 1", "column \"nosuch\" does not exist"),
+        (
+            "count(*) > 1",
+            "aggregate functions are not allowed in WHERE",
+        ),
+        (
+            "row_number() over () > 1",
+            "window functions are not allowed in WHERE",
+        ),
+        (
+            "generate_series(1, 2) > 1",
+            "set-returning functions are not allowed in WHERE",
+        ),
+        ("random() > 0.5", invalid),
+        ("now() > '2020-01-01'", invalid),
+        ("current_date > '2020-01-01'", invalid),
+        ("f(a)", invalid),
+        ("a > (select 1)", invalid),
+        ("a::text = '1'", invalid),
+        ("b::int = 1", invalid),
+        ("c = 'x'", invalid),
+        ("d[1] = 1", invalid),
+        ("ctid > '(0,1)'", invalid),
+    ] {
+        let stmt = format!("CREATE PUBLICATION p FOR TABLE t WHERE ({filter});");
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", &stmt)]).expect_err(&stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+        let stmt =
+            format!("CREATE PUBLICATION p; ALTER PUBLICATION p ADD TABLE t WHERE ({filter});");
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", &stmt)]).expect_err(&stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "CREATE PUBLICATION p1 FOR TABLE t WHERE (a::bigint = 1);
+             CREATE PUBLICATION p2 FOR TABLE t WHERE (b LIKE 'x%' AND a IN (1, 2)
+                 AND a IS NOT NULL AND coalesce(a, 1) = 1 AND j->>'k' = 'v');
+             CREATE PUBLICATION p3 FOR TABLE t WHERE ('t');
+             CREATE PUBLICATION p4 FOR TABLE t WHERE (b = 'x' COLLATE \"C\");
+             CREATE PUBLICATION p5 FOR TABLE t WHERE (CASE WHEN a > 1 THEN true
+                 ELSE a BETWEEN 1 AND 3 END AND greatest(a, 2) > 1
+                 AND a IS DISTINCT FROM 3 AND nullif(a, 1) > 0 AND a = ANY (ARRAY[1, 2])
+                 AND ROW(a, b) = ROW(1, 'x') AND length(b) > 1 AND b::varchar = 'x');",
+        ),
+    ]);
+}
