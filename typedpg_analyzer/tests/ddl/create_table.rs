@@ -927,6 +927,31 @@ fn like_including_indexes_copies_the_keys() {
 }
 
 #[test]
+fn like_including_indexes_copies_exclusion_constraints() {
+    // generateClonedIndexStmt: the copy is an exclusion constraint again,
+    // named `<table>_<columns>_excl`, with the source's access method.
+    let setup = "CREATE TABLE s (r int4range, EXCLUDE USING gist (r WITH &&));
+                 CREATE TABLE t (LIKE s INCLUDING INDEXES);";
+    let db = build_db(&[("0001.sql", setup)]);
+    assert!(
+        db.constraints_of_table("t")
+            .iter()
+            .any(|c| c.conname == "t_r_excl" && c.contype == typedpg_analyzer::ConType::Exclusion)
+    );
+    let err = try_apply(&[
+        ("0001.sql", setup),
+        ("0002.sql", "CREATE INDEX t_r_excl ON t (r);"),
+    ])
+    .unwrap_err();
+    assert_eq!(err.to_string(), "relation \"t_r_excl\" already exists");
+    // The copied index keeps its access method (GiST clusters).
+    build_db(&[
+        ("0001.sql", setup),
+        ("0002.sql", "ALTER TABLE t CLUSTER ON t_r_excl;"),
+    ]);
+}
+
+#[test]
 fn like_errors() {
     assert_ddl_err!(
         try_apply(&[("0001.sql", "CREATE TABLE lk7 (LIKE nosuch);")]),

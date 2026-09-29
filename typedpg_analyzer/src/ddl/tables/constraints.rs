@@ -1914,7 +1914,10 @@ pub(crate) fn copy_like_constraints(
                 .find(|c| {
                     c.conrelid == like.source
                         && c.conname == idxname
-                        && matches!(c.contype, ConType::PrimaryKey | ConType::Unique)
+                        && matches!(
+                            c.contype,
+                            ConType::PrimaryKey | ConType::Unique | ConType::Exclusion
+                        )
                 })
                 .map(|c| (c.contype, c.conperiod));
             let indkey: Vec<i16> = idx
@@ -1939,6 +1942,10 @@ pub(crate) fn copy_like_constraints(
                     let name = match contype {
                         ConType::PrimaryKey => crate::ddl::util::choose_constraint_index_name(
                             interp, nsoid, relname, "", "pkey",
+                        ),
+                        // ChooseIndexName: an exclusion constraint's index.
+                        ConType::Exclusion => crate::ddl::util::choose_constraint_index_name(
+                            interp, nsoid, relname, &addition, "excl",
                         ),
                         _ => crate::ddl::util::choose_constraint_index_name(
                             interp, nsoid, relname, &addition, "key",
@@ -1991,8 +1998,18 @@ pub(crate) fn copy_like_constraints(
 }
 
 /// generateClonedIndexStmt: a LIKE copy of an index keeps its access
-/// method and its key columns' operator classes, collations and options.
+/// method, its key columns' operator classes, collations and options, and
+/// its expressions and predicate.
 fn copy_index_details_to(interp: &mut PgCatalog, source: PgClassOid, index: PgClassOid) {
+    if let Some((exprs, pred)) = interp
+        .pg_index
+        .get(&source)
+        .map(|i| (i.indexprs.clone(), i.indpred.clone()))
+        && let Some(copy) = interp.pg_index.get_mut(&index)
+    {
+        copy.indexprs = exprs;
+        copy.indpred = pred;
+    }
     if let Some(am) = interp.index_access_methods.get(&source).cloned() {
         interp.index_access_methods.insert(index, am);
     }
