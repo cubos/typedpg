@@ -977,6 +977,49 @@ fn index_column_collations_are_validated() {
 }
 
 #[test]
+fn index_max_keys_limits_indexes_partition_keys_and_foreign_keys() {
+    let cols = |n: usize| vec!["a"; n].join(", ");
+    let setup = "CREATE TABLE t (a int, b int); CREATE TABLE pk (a int PRIMARY KEY);";
+    let too_many_index = "cannot use more than 32 columns in an index";
+    assert_rejected(
+        setup,
+        &[
+            (
+                &format!("CREATE INDEX ON t ({});", cols(33)),
+                too_many_index,
+            ),
+            (
+                &format!("CREATE INDEX ON t ({}) INCLUDE (a, b);", cols(31)),
+                too_many_index,
+            ),
+            (
+                &format!(
+                    "CREATE TABLE u (a int, b int, UNIQUE (a) INCLUDE ({}));",
+                    cols(32)
+                ),
+                too_many_index,
+            ),
+            (
+                &format!("CREATE TABLE p (a int) PARTITION BY RANGE ({});", cols(33)),
+                "cannot partition using more than 32 columns",
+            ),
+            (
+                &format!("CREATE TABLE p (a int) PARTITION BY LIST ({});", cols(33)),
+                "cannot partition using more than 32 columns",
+            ),
+            (
+                &format!(
+                    "CREATE TABLE f (a int, FOREIGN KEY ({}) REFERENCES pk);",
+                    cols(33)
+                ),
+                "cannot have more than 32 keys in a foreign key",
+            ),
+        ],
+    );
+    assert_accepted(setup, &[&format!("CREATE INDEX ON t ({});", cols(32))]);
+}
+
+#[test]
 fn an_index_cannot_use_a_table_access_method() {
     // GetIndexAmRoutine: heap_tableam_handler (oid 3) returns no
     // IndexAmRoutine.

@@ -27,7 +27,15 @@ fn column_attnums(
 ) -> Result<Vec<(i16, PgTypeOid)>, DdlError> {
     names
         .iter()
-        .map(|name| match interp.attribute_by_name(relid, name) {
+        .enumerate()
+        .map(|(i, name)| match interp.attribute_by_name(relid, name) {
+            // transformColumnNameList: at most INDEX_MAX_KEYS columns.
+            Some(_) if i >= crate::ddl::indexes::INDEX_MAX_KEYS => {
+                Err(DdlError::UnsupportedDdl(format!(
+                    "cannot have more than {} keys in a foreign key",
+                    crate::ddl::indexes::INDEX_MAX_KEYS
+                )))
+            }
             Some(a) => Ok((a.attnum, a.atttypid)),
             None if crate::pg_catalog::SYSTEM_COLUMNS
                 .iter()

@@ -536,6 +536,13 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
     if let Some(spec) = stmt.partspec.as_ref() {
         use typedpg_pg_query::protobuf::PartitionStrategy;
         let strategy = PartitionStrategy::try_from(spec.strategy).ok();
+        // DefineRelation: PARTITION_MAX_KEYS (= INDEX_MAX_KEYS).
+        if spec.part_params.len() > crate::ddl::indexes::INDEX_MAX_KEYS {
+            return Err(DdlError::UnsupportedDdl(format!(
+                "cannot partition using more than {} columns",
+                crate::ddl::indexes::INDEX_MAX_KEYS
+            )));
+        }
         if strategy == Some(PartitionStrategy::List) && spec.part_params.len() > 1 {
             return Err(DdlError::Parse(
                 "cannot use \"list\" partition strategy with more than one column".into(),

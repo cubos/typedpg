@@ -48,6 +48,7 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
             )));
         }
     }
+    check_index_max_keys(stmt.index_params.len() + stmt.index_including_params.len())?;
 
     // DefineIndex: the access method, what it supports, and its options.
     let am = if stmt.access_method.is_empty() {
@@ -308,6 +309,10 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
     Ok(())
 }
 
+/// INDEX_MAX_KEYS (pg_config_manual.h): the most columns an index — key
+/// and INCLUDE ones — a partition key or a foreign key may have.
+pub(crate) const INDEX_MAX_KEYS: usize = 32;
+
 /// What `pg_index` keeps of one key column beyond `indkey`.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct IndexKeyColumn {
@@ -332,6 +337,17 @@ pub(crate) struct IndexKeyColumn {
 pub(crate) struct IndexKeys {
     pub(crate) columns: Vec<IndexKeyColumn>,
     pub(crate) nulls_not_distinct: bool,
+}
+
+/// DefineIndex: an index has at most INDEX_MAX_KEYS columns, key and
+/// INCLUDE ones together (54011).
+fn check_index_max_keys(natts: usize) -> Result<(), DdlError> {
+    if natts > INDEX_MAX_KEYS {
+        return Err(DdlError::UnsupportedDdl(format!(
+            "cannot use more than {INDEX_MAX_KEYS} columns in an index"
+        )));
+    }
+    Ok(())
 }
 
 /// DefineIndex: the access method must exist and be an index one (a table
@@ -586,6 +602,7 @@ pub(crate) fn define_constraint_index(
 ) -> Result<(String, IndexKeys), DdlError> {
     use typedpg_pg_query::protobuf::ConstrType;
     let exclusion = c.contype == ConstrType::ConstrExclusion as i32;
+    check_index_max_keys(conkey.len() + include.len())?;
     let am = if exclusion && !c.access_method.is_empty() {
         c.access_method.clone()
     } else if period {
