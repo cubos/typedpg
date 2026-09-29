@@ -85,6 +85,23 @@ pub(crate) fn prefix_operator_is_not_unique(
     )
 }
 
+/// `procedure p(args) is not unique` — SQLSTATE 42725: a `CALL` whose
+/// overload resolution left several candidates (ParseFuncOrColumn with
+/// `proc_call`).
+pub(crate) fn procedure_is_not_unique(
+    qualified_name: &str,
+    arg_list: &str,
+    span: Option<SourceSpan>,
+) -> RawError {
+    RawError::new(
+        AnalyzeError::AmbiguousFunction(format!(
+            "procedure {qualified_name}({arg_list}) is not unique"
+        )),
+        span,
+        Some("add explicit type casts to the arguments to select one overload".into()),
+    )
+}
+
 /// `function name(types) is not unique` — SQLSTATE 42725.
 pub(crate) fn function_is_not_unique(
     qualified_name: &str,
@@ -1231,6 +1248,10 @@ mod tests {
             ),
             (
                 function_is_not_unique("mod", "unknown, unknown", None).kind,
+                "42725",
+            ),
+            (
+                procedure_is_not_unique("p", "unknown", None).kind,
                 "42725",
             ),
             (

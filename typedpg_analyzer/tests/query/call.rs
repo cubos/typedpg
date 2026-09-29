@@ -54,3 +54,52 @@ fn call_errors() {
         assert!(err.to_string().starts_with(msg), "{sql}: {err}");
     }
 }
+
+/// CALL resolves through ParseFuncOrColumn like any call — defaults, named
+/// notation, VARIADIC, polymorphism and the unknown-literal preference
+/// rules — over candidates whose OUT parameters take arguments.
+#[test]
+fn call_resolves_like_a_function_call() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE PROCEDURE p_def(a int, b int DEFAULT 2) LANGUAGE plpgsql AS 'begin end';
+         CREATE PROCEDURE p_named(a int, b text) LANGUAGE plpgsql AS 'begin end';
+         CREATE PROCEDURE p_var(VARIADIC a int[]) LANGUAGE plpgsql AS 'begin end';
+         CREATE PROCEDURE p_poly(a anyelement, INOUT b anyelement)
+             LANGUAGE plpgsql AS 'begin end';
+         CREATE PROCEDURE p_ov(a int) LANGUAGE plpgsql AS 'begin end';
+         CREATE PROCEDURE p_ov(a text) LANGUAGE plpgsql AS 'begin end';
+         CREATE PROCEDURE p_out_named(a int, OUT b int) LANGUAGE plpgsql AS 'begin end';",
+    )
+    .unwrap();
+    for sql in [
+        "CALL p_def(1)",
+        "CALL p_def(1, 3)",
+        "CALL p_def(b => 3, a => 1)",
+        "CALL p_named(b => 'x'::text, a => 1)",
+        "CALL p_var(1, 2, 3)",
+        "CALL p_var(VARIADIC ARRAY[1, 2])",
+        "CALL p_ov('x')",
+    ] {
+        let s = db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        assert_cols(&s, vec![]);
+    }
+    let s = db.analyze("CALL p_poly(1, 2)").unwrap();
+    assert_cols(&s, vec![cn("b", int4())]);
+    let s = db.analyze("CALL p_out_named(b => NULL, a => $a)").unwrap();
+    assert_cols(&s, vec![cn("b", int4())]);
+    assert_params(&s, vec![p(int4())]);
+    let s = db.analyze("CALL p_def($x)").unwrap();
+    assert_params(&s, vec![p(int4())]);
+    assert_err_prefix!(
+        db.analyze("CALL p_ov(1.5)"),
+        AnalyzeError::UndefinedFunction(_),
+        "procedure p_ov(numeric) does not exist"
+    );
+    // An unknown argument prefers the string category, as for functions.
+    let s = db.analyze("CALL p_ov($x)").unwrap();
+    assert_params(&s, vec![p(text())]);
+}
+
+/// Native positional placeholders (`$1`) are PG parameters too.
+#[test]
