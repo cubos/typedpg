@@ -24,6 +24,8 @@ pub(crate) enum ExprKind {
     Policy,
     /// EXPR_KIND_PARTITION_BOUND.
     PartitionBound,
+    /// EXPR_KIND_PARTITION_EXPRESSION.
+    PartitionExpression,
 }
 
 impl ExprKind {
@@ -37,6 +39,7 @@ impl ExprKind {
             ExprKind::GeneratedColumn => "column generation expressions",
             ExprKind::Policy => "policy expressions",
             ExprKind::PartitionBound => "partition bound",
+            ExprKind::PartitionExpression => "partition key expressions",
         }
     }
 
@@ -50,6 +53,7 @@ impl ExprKind {
             ExprKind::GeneratedColumn => Some("column generation expression"),
             ExprKind::Policy => None,
             ExprKind::PartitionBound => Some("partition bound"),
+            ExprKind::PartitionExpression => Some("partition key expression"),
         }
     }
 }

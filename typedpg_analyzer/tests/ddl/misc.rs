@@ -2705,3 +2705,72 @@ fn drop_index_refuses_constraint_indexes() {
         ),
     ]);
 }
+
+#[test]
+fn partition_keys_are_validated() {
+    // PG 18 transformCreateStmt / transformPartitionSpec /
+    // ComputePartitionAttrs.
+    let setup = "CREATE TABLE t (a int);";
+    for (stmt, msg) in [
+        (
+            "CREATE TABLE u (a int) INHERITS (t) PARTITION BY LIST (a);",
+            "cannot create partitioned table as inheritance child",
+        ),
+        (
+            "CREATE TABLE p (a int, b int) PARTITION BY LIST (a, b);",
+            "cannot use \"list\" partition strategy with more than one column",
+        ),
+        (
+            "CREATE TABLE p (a int) PARTITION BY RANGE ((1));",
+            "cannot use constant expression as partition key",
+        ),
+        (
+            "CREATE TABLE p (j json) PARTITION BY RANGE (j);",
+            "data type json has no default operator class for access method \"btree\"",
+        ),
+        (
+            "CREATE TABLE p (j json) PARTITION BY HASH (j);",
+            "data type json has no default operator class for access method \"hash\"",
+        ),
+        (
+            "CREATE TABLE p (a int) PARTITION BY RANGE (ctid);",
+            "cannot use system column \"ctid\" in partition key",
+        ),
+        (
+            "CREATE TABLE p (a int, g int GENERATED ALWAYS AS (a * 2) STORED) PARTITION BY RANGE (g);",
+            "cannot use generated column in partition key",
+        ),
+        (
+            "CREATE TABLE p (a int) PARTITION BY RANGE (a text_ops);",
+            "operator class \"text_ops\" does not accept data type integer",
+        ),
+        (
+            "CREATE TABLE p (a int) PARTITION BY RANGE ((a + random()::int));",
+            "functions in partition key expression must be marked IMMUTABLE",
+        ),
+        (
+            "CREATE TABLE p (a int) PARTITION BY RANGE ((sum(a)));",
+            "aggregate functions are not allowed in partition key expressions",
+        ),
+        (
+            "CREATE TABLE p (a int) PARTITION BY RANGE ((a + nosuch));",
+            "column \"nosuch\" does not exist",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "CREATE TABLE p7 (a int) PARTITION BY RANGE (a int4_ops);
+             CREATE TABLE p11 (a text) PARTITION BY RANGE (a COLLATE \"C\");
+             CREATE TABLE p12 (a int) PARTITION BY RANGE (a, a);
+             CREATE TABLE p14 (a int[]) PARTITION BY LIST (a);
+             CREATE TABLE p15 (a int) PARTITION BY LIST ((a > 0));
+             CREATE TABLE p16 (a int, b int) PARTITION BY LIST (a);
+             CREATE TABLE p17 PARTITION OF p16 FOR VALUES IN (1) PARTITION BY RANGE (b);",
+        ),
+    ]);
+}

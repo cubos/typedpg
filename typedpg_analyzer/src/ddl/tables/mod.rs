@@ -168,6 +168,12 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
     if interp.class_by_qname.contains_key(&(nsoid, name.clone())) && stmt.if_not_exists {
         return Ok(());
     }
+    // transformCreateStmt.
+    if stmt.partspec.is_some() && !stmt.inh_relations.is_empty() && stmt.partbound.is_none() {
+        return Err(DdlError::Parse(
+            "cannot create partitioned table as inheritance child".into(),
+        ));
+    }
     super::util::check_relation_name_free(interp, nsoid, &name)?;
 
     let mut pk_columns: Vec<String> = Vec::new();
@@ -395,27 +401,95 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
         partbound::add_partition_bound(interp, parent, class_oid, bound)?;
     }
 
-    // ComputePartitionAttrs: a partition key column must exist.
+    // transformPartitionSpec / ComputePartitionAttrs: the key columns and
+    // expressions, and their operator classes.
     if let Some(spec) = stmt.partspec.as_ref() {
+        use pg_query::protobuf::PartitionStrategy;
+        let strategy = PartitionStrategy::try_from(spec.strategy).ok();
+        if strategy == Some(PartitionStrategy::List) && spec.part_params.len() > 1 {
+            return Err(DdlError::Parse(
+                "cannot use \"list\" partition strategy with more than one column".into(),
+            ));
+        }
+        let am = if strategy == Some(PartitionStrategy::Hash) {
+            "hash"
+        } else {
+            "btree"
+        };
         let mut key = Vec::new();
         for elem in &spec.part_params {
             let Some(node::Node::PartitionElem(pe)) = elem.node.as_ref() else {
                 continue;
             };
-            if pe.name.is_empty() {
+            let key_type = if pe.name.is_empty() {
                 key.push(0);
-                continue;
-            }
-            let Some(attnum) = interp
-                .attribute_by_name(class_oid, &pe.name)
-                .map(|a| a.attnum)
-            else {
-                return Err(DdlError::Parse(format!(
-                    "column \"{}\" named in partition key does not exist",
-                    pe.name
-                )));
+                let Some(expr) = pe.expr.as_deref() else {
+                    continue;
+                };
+                crate::ddl::expr_kind::check_expr_kind(
+                    interp,
+                    expr,
+                    crate::ddl::expr_kind::ExprKind::PartitionExpression,
+                )?;
+                let typ = match crate::ddl::volatile::infer_over_relation(
+                    interp, class_oid, expr, None,
+                ) {
+                    Some(Err(e)) => return Err(DdlError::UnsupportedDdl(e.to_string())),
+                    Some(Ok(t)) => Some(t.type_oid),
+                    None => None,
+                };
+                let reads_columns = expr.node.as_ref().is_some_and(|inner| {
+                    inner
+                        .nodes()
+                        .into_iter()
+                        .any(|(n, ..)| matches!(n, pg_query::NodeRef::ColumnRef(_)))
+                });
+                if !reads_columns {
+                    return Err(DdlError::Parse(
+                        "cannot use constant expression as partition key".into(),
+                    ));
+                }
+                crate::ddl::volatile::check_no_volatile(
+                    expr,
+                    crate::ddl::volatile::ExprLocation::PartitionKey,
+                    interp,
+                )?;
+                crate::ddl::volatile::check_mutability(
+                    interp,
+                    class_oid,
+                    expr,
+                    crate::ddl::volatile::ExprLocation::PartitionKey,
+                )?;
+                typ
+            } else {
+                if crate::pg_catalog::SYSTEM_COLUMNS
+                    .iter()
+                    .any(|(n, ..)| *n == pe.name)
+                {
+                    return Err(DdlError::Parse(format!(
+                        "cannot use system column \"{}\" in partition key",
+                        pe.name
+                    )));
+                }
+                let Some(attr) = interp.attribute_by_name(class_oid, &pe.name).cloned() else {
+                    return Err(DdlError::Parse(format!(
+                        "column \"{}\" named in partition key does not exist",
+                        pe.name
+                    )));
+                };
+                if attr.attgenerated.is_some() {
+                    return Err(DdlError::Parse(format!(
+                        "cannot use generated column in partition key (Column \"{}\" is a \
+                         generated column.)",
+                        pe.name
+                    )));
+                }
+                key.push(attr.attnum);
+                Some(attr.atttypid)
             };
-            key.push(attnum);
+            if let Some(typ) = key_type {
+                crate::ddl::opclass::resolve_index_opclass(interp, &pe.opclass, typ, am)?;
+            }
         }
         interp.partition_keys.insert(class_oid, key);
         partbound::record_partition_spec(interp, class_oid, spec);

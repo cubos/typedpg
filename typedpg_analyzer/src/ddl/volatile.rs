@@ -76,7 +76,7 @@ const MAX_INLINE_DEPTH: usize = 16;
 
 /// Walk `node` and return `Err` if any `FuncCall` resolves to a function
 /// marked `VOLATILE`. `location` selects PG's wording for that context.
-pub(super) fn check_no_volatile(
+pub(crate) fn check_no_volatile(
     node: &protobuf::Node,
     location: ExprLocation,
     snapshot: &PgCatalog,
@@ -126,7 +126,7 @@ pub(crate) fn infer_over_relation(
 /// one that isn't IMMUTABLE. A simple SQL function counts by its inlined
 /// body (checked with the name-based walk). Analysis errors are left to the
 /// expression's own validation.
-pub(super) fn check_mutability(
+pub(crate) fn check_mutability(
     interp: &PgCatalog,
     relid: crate::oid::PgClassOid,
     expr: &protobuf::Node,
@@ -155,11 +155,13 @@ pub(super) fn check_mutability(
 }
 
 #[derive(Clone, Copy)]
-pub(super) enum ExprLocation {
+pub(crate) enum ExprLocation {
     Generated,
     Index,
     /// CheckPredicate.
     IndexPredicate,
+    /// ComputePartitionAttrs.
+    PartitionKey,
 }
 
 impl ExprLocation {
@@ -168,6 +170,10 @@ impl ExprLocation {
             ExprLocation::Generated => DdlError::UnsupportedDdl(format!(
                 "generation expression is not immutable: \
                  function \"{fname}\" must be marked IMMUTABLE"
+            )),
+            ExprLocation::PartitionKey => DdlError::UnsupportedDdl(format!(
+                "functions in partition key expression must be marked IMMUTABLE \
+                 (function \"{fname}\" is not)"
             )),
             ExprLocation::IndexPredicate => DdlError::UnsupportedDdl(format!(
                 "functions in index predicate must be marked IMMUTABLE \
