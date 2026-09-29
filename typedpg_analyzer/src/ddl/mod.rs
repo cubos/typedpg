@@ -133,7 +133,13 @@ pub(crate) fn apply_sql_to(db: &mut PgCatalog, sql: &str) -> Result<(), DdlError
 }
 
 fn apply_sql_statements(db: &mut PgCatalog, sql: &str) -> Result<(), DdlError> {
-    let parsed = typedpg_pg_query::parse(sql).map_err(|e| DdlError::Parse(e.to_string()))?;
+    // A grammar error carries PG's message verbatim.
+    let parsed = typedpg_pg_query::parse(sql).map_err(|e| {
+        DdlError::Parse(match e {
+            typedpg_pg_query::Error::Parse(msg) => msg,
+            other => other.to_string(),
+        })
+    })?;
     let tx = txblock::TxContext::of(sql, &parsed.protobuf.stmts);
 
     for raw_stmt in &parsed.protobuf.stmts {
