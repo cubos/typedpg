@@ -11,7 +11,7 @@ use super::DdlError;
 use super::util::{node_string, resolve_type_name};
 use super::views;
 use crate::oid::{PgClassOid, PgNamespaceOid, PgProcOid, PgTypeOid};
-use crate::pg_catalog::{PgCatalog, PgProc, ProKind};
+use crate::pg_catalog::{PgCatalog, PgProc};
 use crate::qualified_name::QualifiedName;
 
 // ─── ALTER ... RENAME TO ────────────────────────────────────────────────────
@@ -26,9 +26,10 @@ pub fn rename(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlError>
         | ObjectType::ObjectSequence
         | ObjectType::ObjectForeignTable
         | ObjectType::ObjectIndex => rename_relation(interp, stmt),
-        ObjectType::ObjectFunction | ObjectType::ObjectProcedure | ObjectType::ObjectAggregate => {
-            rename_function_like(interp, stmt, rename_type)
-        }
+        ObjectType::ObjectFunction
+        | ObjectType::ObjectProcedure
+        | ObjectType::ObjectRoutine
+        | ObjectType::ObjectAggregate => rename_function_like(interp, stmt, rename_type),
         ObjectType::ObjectType | ObjectType::ObjectDomain => rename_type_obj(interp, stmt),
         ObjectType::ObjectSchema => rename_schema(interp, stmt),
         // RENAME ATTRIBUTE of a composite type is a column rename of its
@@ -400,42 +401,7 @@ fn rename_function_like(
     stmt: &RenameStmt,
     expected: ObjectType,
 ) -> Result<(), DdlError> {
-    let Some((schema_opt, old_name, arg_oids)) = extract_func_target(&stmt.object, interp) else {
-        return Ok(());
-    };
-
-    let want_kind = match expected {
-        ObjectType::ObjectAggregate => ProKind::Aggregate,
-        ObjectType::ObjectProcedure => ProKind::Procedure,
-        _ => ProKind::Function,
-    };
-    let matches_kind = move |k: ProKind| {
-        matches!(
-            (want_kind, k),
-            (ProKind::Function, ProKind::Function)
-                | (ProKind::Function, ProKind::Window)
-                | (ProKind::Procedure, ProKind::Procedure)
-                | (ProKind::Aggregate, ProKind::Aggregate)
-        )
-    };
-    let matches = move |p: &PgProc| matches_kind(p.prokind) && p.proargtypes == arg_oids;
-
-    let Some((nsoid, oid)) = find_proc(interp, schema_opt.as_deref(), &old_name, &matches) else {
-        if stmt.missing_ok {
-            return Ok(());
-        }
-        return Err(DdlError::DependencyError(format!(
-            "{} {old_name} does not exist for the requested argument types",
-            match expected {
-                ObjectType::ObjectAggregate => "aggregate",
-                ObjectType::ObjectProcedure => "procedure",
-                _ => "function",
-            }
-        )));
-    };
-
-    interp.rename_pg_proc(oid, stmt.newname.clone(), nsoid);
-    Ok(())
+    crate::ddl::functions::rename_routine(interp, stmt, expected)
 }
 
 fn rename_type_obj(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlError> {
@@ -528,7 +494,10 @@ pub fn set_schema(interp: &mut PgCatalog, stmt: &AlterObjectSchemaStmt) -> Resul
     let new_nsoid = crate::ddl::util::existing_namespace(interp, &new_schema)?;
 
     match object_type {
-        ObjectType::ObjectFunction | ObjectType::ObjectProcedure | ObjectType::ObjectAggregate => {
+        ObjectType::ObjectFunction
+        | ObjectType::ObjectProcedure
+        | ObjectType::ObjectRoutine
+        | ObjectType::ObjectAggregate => {
             set_function_like_schema(interp, stmt, new_nsoid, object_type)
         }
         ObjectType::ObjectType | ObjectType::ObjectDomain => {
@@ -747,41 +716,7 @@ fn set_function_like_schema(
     new_nsoid: PgNamespaceOid,
     expected: ObjectType,
 ) -> Result<(), DdlError> {
-    let Some((schema_opt, name, arg_oids)) = extract_func_target(&stmt.object, interp) else {
-        return Ok(());
-    };
-    let want_kind = match expected {
-        ObjectType::ObjectAggregate => ProKind::Aggregate,
-        ObjectType::ObjectProcedure => ProKind::Procedure,
-        _ => ProKind::Function,
-    };
-    let matches_kind = move |k: ProKind| {
-        matches!(
-            (want_kind, k),
-            (ProKind::Function, ProKind::Function)
-                | (ProKind::Function, ProKind::Window)
-                | (ProKind::Procedure, ProKind::Procedure)
-                | (ProKind::Aggregate, ProKind::Aggregate)
-        )
-    };
-    let matches = move |p: &PgProc| matches_kind(p.prokind) && p.proargtypes == arg_oids;
-
-    let Some((_, oid)) = find_proc(interp, schema_opt.as_deref(), &name, &matches) else {
-        if stmt.missing_ok {
-            return Ok(());
-        }
-        return Err(DdlError::DependencyError(format!(
-            "{} {name} does not exist for the requested argument types",
-            match expected {
-                ObjectType::ObjectAggregate => "aggregate",
-                ObjectType::ObjectProcedure => "procedure",
-                _ => "function",
-            }
-        )));
-    };
-
-    interp.rename_pg_proc(oid, name, new_nsoid);
-    Ok(())
+    crate::ddl::functions::set_routine_schema(interp, stmt, new_nsoid, expected)
 }
 
 fn set_type_schema(

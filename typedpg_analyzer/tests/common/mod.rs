@@ -624,3 +624,24 @@ macro_rules! assert_err_prefix {
         }
     }};
 }
+
+/// Each `(setup, statement, message)`: on a fresh catalog `setup` applies,
+/// then `statement` is rejected with an error that starts with `message`
+/// (PG's wording).
+#[track_caller]
+pub fn assert_ddl_rejections(cases: &[(&str, &str, &str)]) {
+    for (setup, statement, message) in cases {
+        let mut db = PgCatalog::new().unwrap();
+        if !setup.is_empty() {
+            db.apply_sql(setup)
+                .unwrap_or_else(|e| panic!("setup failed: {setup}\n  {e}"));
+        }
+        match db.apply_sql(statement) {
+            Err(err) => assert!(
+                err.to_string().starts_with(message),
+                "{statement}\n  expected: {message}\n  got: {err}"
+            ),
+            Ok(()) => panic!("{statement}\n  expected: {message}\n  got: Ok"),
+        }
+    }
+}

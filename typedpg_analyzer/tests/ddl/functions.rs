@@ -171,7 +171,7 @@ fn drop_aggregate_missing_errors_without_if_exists() {
     let result = try_apply(&[("0001.sql", "DROP AGGREGATE nonexistent(int4);")]);
     assert_ddl_err!(
         result,
-        DdlError::DependencyError(_),
+        DdlError::TypeNotFound(_),
         "aggregate nonexistent(integer) does not exist",
     );
 }
@@ -1017,4 +1017,219 @@ fn sql_function_parameters_are_typed_params() {
             "{function}\n  got: {err}"
         );
     }
+}
+
+#[test]
+fn inline_body_in_another_language_is_rejected_without_aborting() {
+    // libpg_query's PL/pgSQL entry point used to fail a C assert (and abort
+    // the process) on a routine with no string body.
+    assert_ddl_rejections(&[
+        (
+            "",
+            "CREATE FUNCTION f(a int) RETURNS int LANGUAGE plpgsql RETURN a + 1;",
+            "inline SQL function body only valid for language SQL",
+        ),
+        (
+            "",
+            "CREATE PROCEDURE p() LANGUAGE plpgsql BEGIN ATOMIC SELECT 1; END;",
+            "inline SQL function body only valid for language SQL",
+        ),
+        (
+            "",
+            "CREATE FUNCTION f() RETURNS int LANGUAGE plpgsql;",
+            "no function body specified",
+        ),
+        (
+            "",
+            "CREATE FUNCTION f(a anyelement) RETURNS int LANGUAGE sql RETURN 1;",
+            "SQL function with unquoted function body cannot have polymorphic arguments",
+        ),
+        (
+            "",
+            "CREATE FUNCTION f() RETURNS int AS 'select 1';",
+            "no language specified",
+        ),
+    ]);
+    // Without LANGUAGE an inline body is SQL.
+    build(&[("0001.sql", "CREATE FUNCTION f() RETURNS int RETURN 1;")]);
+}
+
+#[test]
+fn create_function_validates_options_and_parameters() {
+    let f = "CREATE FUNCTION f13(int) RETURNS int LANGUAGE sql AS 'select 1';";
+    assert_ddl_rejections(&[
+        (
+            "",
+            "CREATE FUNCTION f(a int, a int) RETURNS int LANGUAGE sql AS 'select 1';",
+            "parameter name \"a\" used more than once",
+        ),
+        (
+            "",
+            "CREATE FUNCTION f(INOUT a int, OUT a int) LANGUAGE sql AS 'select 1, 1';",
+            "parameter name \"a\" used more than once",
+        ),
+        (
+            "",
+            "CREATE FUNCTION f(VARIADIC a int[], b int) RETURNS int LANGUAGE sql AS 'select 1';",
+            "VARIADIC parameter must be the last input parameter",
+        ),
+        (
+            "",
+            "CREATE PROCEDURE p(VARIADIC a int[], OUT b int) LANGUAGE sql AS 'select 1';",
+            "VARIADIC parameter must be the last parameter",
+        ),
+        (
+            "",
+            "CREATE PROCEDURE p(a int DEFAULT 1, OUT b int) LANGUAGE sql AS 'select 1';",
+            "procedure OUT parameters cannot appear after one with a default value",
+        ),
+        (
+            "",
+            "CREATE FUNCTION f(setof int) RETURNS int LANGUAGE sql AS 'select 1';",
+            "functions cannot accept set arguments",
+        ),
+        (
+            "",
+            "CREATE FUNCTION f(OUT a int) RETURNS text LANGUAGE sql AS 'select 1';",
+            "function result type must be integer because of OUT parameters",
+        ),
+        (
+            "",
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql COST 0 AS 'select 1';",
+            "COST must be positive",
+        ),
+        (
+            "",
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql ROWS 10 AS 'select 1';",
+            "ROWS is not applicable when function does not return a set",
+        ),
+        (
+            "",
+            "CREATE FUNCTION f() RETURNS SETOF int LANGUAGE sql ROWS 0 AS 'select 1';",
+            "ROWS must be positive",
+        ),
+        (
+            "",
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql IMMUTABLE VOLATILE AS 'select 1';",
+            "conflicting or redundant options",
+        ),
+        (
+            "",
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'select 1' AS 'select 2';",
+            "conflicting or redundant options",
+        ),
+        (
+            "",
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql PARALLEL bogus AS 'select 1';",
+            "parameter \"parallel\" must be SAFE, RESTRICTED, or UNSAFE",
+        ),
+        (
+            "",
+            "CREATE FUNCTION f() RETURNS int LANGUAGE internal AS 'nosuchfn';",
+            "there is no built-in function named \"nosuchfn\"",
+        ),
+        (
+            "",
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql TRANSFORM FOR TYPE int AS 'select 1';",
+            "transform for type integer language \"sql\" does not exist",
+        ),
+        (
+            "",
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql SUPPORT nosuch AS 'select 1';",
+            "function nosuch(internal) does not exist",
+        ),
+        (
+            "",
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql SET work_mem = 'abc' AS 'select 1';",
+            "invalid value for parameter \"work_mem\": \"abc\"",
+        ),
+        (
+            "",
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql SET max_connections = 5 AS 'select 1';",
+            "parameter \"max_connections\" cannot be changed without restarting the server",
+        ),
+        (
+            "",
+            "CREATE PROCEDURE p() LANGUAGE sql STRICT AS 'select 1';",
+            "invalid attribute in procedure definition",
+        ),
+        (
+            "CREATE PROCEDURE p() LANGUAGE sql AS 'select 1';",
+            "ALTER PROCEDURE p() IMMUTABLE;",
+            "invalid attribute in procedure definition",
+        ),
+        (
+            "",
+            "CREATE FUNCTION f() RETURNS int AS '' LANGUAGE sql;",
+            "return type mismatch in function declared to return integer",
+        ),
+        (
+            // PostgreSQL 18 analyzes every statement of the body; the
+            // CREATE TABLE only runs when the function does.
+            "",
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'create table x(a int); select a from x';",
+            "relation \"x\" does not exist",
+        ),
+        (
+            f,
+            "ALTER FUNCTION f13(int) SET nonexistent_guc = 1;",
+            "unrecognized configuration parameter \"nonexistent_guc\"",
+        ),
+        (
+            f,
+            "ALTER FUNCTION f13(int) ROWS 10;",
+            "ROWS is not applicable when function does not return a set",
+        ),
+        (
+            "CREATE FUNCTION f13(int) RETURNS int LANGUAGE sql AS 'select 1';
+             CREATE FUNCTION g(int) RETURNS int LANGUAGE sql AS 'select 1';",
+            "ALTER FUNCTION f13 RENAME TO g;",
+            "function g(integer) already exists in schema \"public\"",
+        ),
+    ]);
+    build(&[(
+        "0001.sql",
+        "CREATE FUNCTION f1() RETURNS int LANGUAGE sql SET a.b = 5 AS 'select 1';
+         CREATE FUNCTION f2() RETURNS int LANGUAGE internal AS 'int4pl';
+         CREATE FUNCTION f3(a int, OUT a int) LANGUAGE sql AS 'select 1';",
+    )]);
+}
+
+#[test]
+fn create_or_replace_function_keeps_out_names_and_routine_kind() {
+    assert_ddl_rejections(&[
+        (
+            "CREATE FUNCTION h(OUT a int, OUT b int) LANGUAGE sql AS 'select 1, 2';",
+            "CREATE OR REPLACE FUNCTION h(OUT a int, OUT c int) LANGUAGE sql AS 'select 1, 2';",
+            "cannot change return type of existing function",
+        ),
+        (
+            "CREATE FUNCTION w(int) RETURNS int LANGUAGE sql AS 'select 1';",
+            "CREATE OR REPLACE FUNCTION w(int) RETURNS int WINDOW LANGUAGE internal \
+             AS 'window_row_number';",
+            "cannot change routine kind",
+        ),
+        (
+            "CREATE FUNCTION f(a int) RETURNS int LANGUAGE sql AS 'select 1';",
+            "CREATE OR REPLACE FUNCTION f(int) RETURNS int LANGUAGE sql AS 'select 1';",
+            "cannot change name of input parameter \"a\"",
+        ),
+    ]);
+}
+
+#[test]
+fn alter_function_without_arguments_needs_a_unique_name() {
+    let db = build(&[(
+        "0001.sql",
+        "CREATE FUNCTION f(a int) RETURNS int LANGUAGE sql AS 'select 1';
+         ALTER FUNCTION f RENAME TO g;
+         ALTER ROUTINE g IMMUTABLE;",
+    )]);
+    assert_eq!(db.find_functions(None, "g").len(), 1);
+    assert_ddl_rejections(&[(
+        "CREATE FUNCTION f(int) RETURNS int LANGUAGE sql AS 'select 1';
+         CREATE FUNCTION f(text) RETURNS int LANGUAGE sql AS 'select 1';",
+        "ALTER FUNCTION f RENAME TO g;",
+        "function name \"f\" is not unique",
+    )]);
 }

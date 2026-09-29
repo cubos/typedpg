@@ -5,6 +5,7 @@
 use typedpg_pg_query::protobuf::{CreatePLangStmt, CreateTransformStmt};
 
 use super::DdlError;
+use crate::oid::PgTypeOid;
 use crate::pg_catalog::PgCatalog;
 
 /// The languages of a stock database.
@@ -125,7 +126,8 @@ pub(crate) fn rename_language(
 }
 
 /// CREATE [OR REPLACE] TRANSFORM FOR type LANGUAGE lang (...)
-/// (CreateTransform).
+/// (CreateTransform): the type and language must exist, and a transform
+/// for the pair is recorded.
 pub fn create_transform(
     interp: &mut PgCatalog,
     stmt: &CreateTransformStmt,
@@ -135,10 +137,7 @@ pub fn create_transform(
     };
     let typ = super::util::lookup_type_name(tn, interp)?;
     check(interp, &stmt.lang)?;
-    let exists = interp
-        .transforms
-        .iter()
-        .any(|(t, l)| *t == typ && *l == stmt.lang);
+    let exists = transform_exists(interp, typ, &stmt.lang);
     if exists && !stmt.replace {
         return Err(DdlError::DuplicateObject(format!(
             "transform for type {} language \"{}\" already exists",
@@ -150,6 +149,14 @@ pub fn create_transform(
         interp.transforms.push((typ, stmt.lang.clone()));
     }
     Ok(())
+}
+
+/// Whether a transform for `typeid` and `language` exists (get_transform_oid).
+pub(crate) fn transform_exists(interp: &PgCatalog, typeid: PgTypeOid, language: &str) -> bool {
+    interp
+        .transforms
+        .iter()
+        .any(|(t, l)| *t == typeid && l == language)
 }
 
 /// get_transform_oid: the object of `DROP / COMMENT ON TRANSFORM FOR type

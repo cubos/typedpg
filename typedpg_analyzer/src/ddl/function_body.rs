@@ -58,9 +58,14 @@ pub(crate) fn validate_sql_function(
     let mut last: Option<LastStatement> = None;
     for inner in &statements {
         if !is_analyzable(inner) {
-            // A utility statement: PG runs it only at call time, and the
-            // statements after it may depend on what it creates.
-            return Ok(());
+            // A utility statement: parse analysis has nothing to check in
+            // it — it runs only at call time, so the statements after it
+            // don't see what it would create.
+            last = Some(LastStatement {
+                returns_rows: false,
+                column_types: None,
+            });
+            continue;
         }
         // sql_fn_param_ref: `$n` must name one of the arguments.
         let highest = inner
@@ -165,16 +170,14 @@ fn check_return_type(
             super::util::format_type_for_message(interp, rettype)
         ))
     };
-    let Some(last) = last else {
-        return Ok(());
-    };
-    if !last.returns_rows {
+    // An empty body has no final statement to return the result.
+    if !last.is_some_and(|l| l.returns_rows) {
         return Err(mismatch(
             "Function's final statement must be SELECT or INSERT/UPDATE/DELETE/MERGE RETURNING."
                 .into(),
         ));
     }
-    let Some(column_types) = last.column_types.as_deref() else {
+    let Some(column_types) = last.and_then(|l| l.column_types.as_deref()) else {
         return Ok(());
     };
     let fits = |actual: PgTypeOid, declared: PgTypeOid| {
