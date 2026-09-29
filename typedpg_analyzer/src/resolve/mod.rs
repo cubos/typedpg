@@ -353,9 +353,15 @@ fn analyze_raw_node_with(
         // into a CreateTableAsStmt): it returns no rows.
         node::Node::SelectStmt(sel) if sel.into_clause.is_some() => {
             let (_, p) = analyze_select(sel, snapshot, &mut params)?;
+            expr::resolve_untyped_output_params(sel, snapshot, &mut params)?;
             (Vec::new(), p)
         }
-        node::Node::SelectStmt(sel) => analyze_select(sel, snapshot, &mut params)?,
+        node::Node::SelectStmt(sel) => {
+            let r = analyze_select(sel, snapshot, &mut params)?;
+            // The statement-level `resolveTargetListUnknowns`.
+            expr::resolve_untyped_output_params(sel, snapshot, &mut params)?;
+            r
+        }
         node::Node::InsertStmt(ins) => analyze_insert(ins, snapshot, &mut params)?,
         node::Node::UpdateStmt(upd) => analyze_update(upd, snapshot, &mut params)?,
         node::Node::DeleteStmt(del) => analyze_delete(del, snapshot, &mut params)?,

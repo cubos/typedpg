@@ -1116,3 +1116,81 @@ fn array_constructor_type_errors_match_pg() {
         "invalid input syntax for type integer: \"x\""
     );
 }
+
+/// PG transforms the select list before WHERE/HAVING/ORDER BY, so a bare
+/// `$N` output typed only by a later clause (or a later output) is still
+/// `unknown` there; `resolveTargetListUnknowns` then coerces it to text and
+/// `variable_coerce_param_hook` rejects the disagreement (42P08).
+#[test]
+fn untyped_output_param_typed_later_is_inconsistent() {
+    let db = setup();
+    for sql in [
+        "SELECT $a AS x FROM users WHERE age = $a",
+        "SELECT $a, $a::int",
+        "SELECT $a, $a + 1",
+        "SELECT $a AS x FROM users ORDER BY $a::int",
+        "SELECT $a FROM users GROUP BY $a HAVING $a = 1",
+        "SELECT id FROM users WHERE id IN (SELECT $a FROM posts WHERE user_id = $a)",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::AmbiguousParameter(_),
+            "inconsistent types deduced for parameter $1"
+        );
+    }
+    // Typed *before* the bare output (or consistently text): accepted.
+    let s = db.analyze("SELECT $a::int, $a").unwrap();
+    assert_params(&s, vec![p(int4())]);
+    let s = db
+        .analyze("SELECT $a AS x FROM users WHERE name = $a")
+        .unwrap();
+    assert_cols(&s, vec![c("x", text())]);
+    assert_params(&s, vec![p(text())]);
+    // INSERT … SELECT and set-operation arms coerce the unknown to the
+    // target column / the other arm's type instead of text.
+    let s = db
+        .analyze("INSERT INTO users (id, name, email) SELECT $a, 'n', 'e' WHERE $a = 1::bigint")
+        .unwrap();
+    assert_params(&s, vec![p(int8())]);
+    for sql in [
+        "INSERT INTO users (id, name, email) SELECT $a, 'n', 'e' WHERE $a = 1",
+        "SELECT $a UNION SELECT 1::bigint WHERE $a = 1",
+        "SELECT $a WHERE $a = 1 UNION SELECT 'x'::text",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::AmbiguousParameter(_),
+            "inconsistent types deduced for parameter $1"
+        );
+    }
+}
+
+/// `$1 IN (a, b)` compares a copy of the once-transformed, still-untyped
+/// parameter against each non-foldable item, so the items deducing
+/// different types is 42P08 rather than an operator error.
+#[test]
+fn untyped_param_in_list_with_mixed_types_is_inconsistent() {
+    let db = setup();
+    for sql in [
+        "SELECT id FROM users WHERE $a IN (age, name)",
+        "SELECT id FROM users WHERE $a NOT IN (age, name)",
+        "SELECT id FROM users WHERE $a IN (1, 'x'::text)",
+        "SELECT id FROM users WHERE $a IN (age, id)",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::AmbiguousParameter(_),
+            "inconsistent types deduced for parameter $1"
+        );
+    }
+    let s = db
+        .analyze("SELECT id FROM users WHERE $a IN (age, id::int)")
+        .unwrap();
+    assert_params(&s, vec![p(int4())]);
+    // Folded into `= ANY(int[])` first, which types `$1` in place.
+    assert_err_prefix!(
+        db.analyze("SELECT id FROM users WHERE $a IN (1, 2, name)"),
+        AnalyzeError::UndefinedOperator(_),
+        "operator does not exist: integer = text"
+    );
+}

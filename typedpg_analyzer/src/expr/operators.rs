@@ -289,9 +289,39 @@ fn handle_in_list(
             infer_synthetic_op(op, a, &typed_null(common), expr.location, ctx, params)?;
         }
     }
+    // transformAExprIn builds each remaining comparison over a *copy* of
+    // the once-transformed left operand. A bare parameter that was still
+    // untyped then (and was not coerced in place by the folded `= ANY`
+    // above) stays `unknown` in every copy, so each comparison coerces it
+    // afresh through `variable_coerce_param_hook` — and two comparisons
+    // deducing different types is `inconsistent types deduced for
+    // parameter $N` (`$1 IN (int_col, text_col)`), not an operator error.
+    let untyped_param = match a.node.as_ref() {
+        Some(node::Node::ParamRef(p))
+            if left.type_oid == oid::UNKNOWN && !folded.iter().any(|&f| f) =>
+        {
+            Some(p)
+        }
+        _ => None,
+    };
     for (i, (item, _, _)) in items.iter().enumerate() {
-        if !folded[i] {
+        if folded[i] {
+            continue;
+        }
+        let Some(p) = untyped_param else {
             infer_synthetic_op(op, a, item, expr.location, ctx, params)?;
+            continue;
+        };
+        let (r, deduced) = params.with_param_untyped(p.number, |scratch| {
+            infer_synthetic_op(op, a, item, expr.location, ctx, scratch)
+        });
+        r?;
+        if deduced != oid::UNKNOWN
+            && let Err(prev) = params.coerce_untyped(p.number, deduced)
+        {
+            return Err(inconsistent_param_error(
+                p.number, prev, deduced, p.location, ctx.snapshot,
+            ));
         }
     }
     Ok(Some(ExprType::scalar(oid::BOOL, nullable)))

@@ -32,6 +32,11 @@ pub(crate) struct ParamCollector {
     /// [`Self::indeterminate_required`], this fails finalization regardless
     /// of any type recorded afterwards.
     indeterminate_locked: HashSet<i32>,
+    /// Source locations of bare `$N` output columns that PG transformed
+    /// while the parameter was still untyped (see
+    /// [`Self::mark_untyped_output`]). PG's `resolveTargetListUnknowns`
+    /// later coerces exactly those occurrences to `text`.
+    untyped_outputs: HashSet<i32>,
 }
 
 impl ParamCollector {
@@ -92,6 +97,61 @@ impl ParamCollector {
         if !self.constraints.contains_key(&param_num) {
             self.indeterminate_locked.insert(param_num);
         }
+    }
+
+    /// PG's `variable_coerce_param_hook` for a parameter *occurrence* that
+    /// was transformed while the parameter was still untyped (its `Param`
+    /// node is `unknown`) and is now being coerced to `target`: the first
+    /// such coercion deduces the parameter's type, and every later one must
+    /// agree with it. On disagreement returns the already-deduced type —
+    /// the caller reports `inconsistent types deduced for parameter $N`
+    /// ([`crate::pgmsg::inconsistent_parameter_types`]).
+    pub fn coerce_untyped(&mut self, param_num: i32, target: PgTypeOid) -> Result<(), PgTypeOid> {
+        self.seen.insert(param_num);
+        match self.get(param_num) {
+            t if t == oid::UNKNOWN => {
+                self.record(param_num, target);
+                Ok(())
+            }
+            t if t == target => Ok(()),
+            t => Err(t),
+        }
+    }
+
+    /// Run `f` against a copy of the collector in which `param_num` is
+    /// untyped again, and return what `f` produced plus the type the copy
+    /// deduced for the parameter (`UNKNOWN` if none). Every other parameter
+    /// the closure typed is kept. Used where PG coerces one already
+    /// transformed, still-`unknown` parameter node several times — the
+    /// shared left operand of an `IN (…)` list — so each coercion can be
+    /// checked with [`Self::coerce_untyped`].
+    pub fn with_param_untyped<T>(
+        &mut self,
+        param_num: i32,
+        f: impl FnOnce(&mut ParamCollector) -> T,
+    ) -> (T, PgTypeOid) {
+        let mut scratch = self.clone();
+        scratch.constraints.remove(&param_num);
+        let out = f(&mut scratch);
+        let deduced = scratch.get(param_num);
+        match self.constraints.get(&param_num) {
+            Some(&t) => scratch.constraints.insert(param_num, t),
+            None => scratch.constraints.remove(&param_num),
+        };
+        *self = scratch;
+        (out, deduced)
+    }
+
+    /// Remember that the bare `$N` output column at `location` was
+    /// transformed while `$N` was untyped (PG leaves such a target list
+    /// entry `unknown` until `resolveTargetListUnknowns`).
+    pub fn mark_untyped_output(&mut self, location: i32) {
+        self.untyped_outputs.insert(location);
+    }
+
+    /// Whether [`Self::mark_untyped_output`] recorded `location`.
+    pub fn is_untyped_output(&self, location: i32) -> bool {
+        self.untyped_outputs.contains(&location)
     }
 
     /// Return all parameters in order, validating that every seen param has a type.

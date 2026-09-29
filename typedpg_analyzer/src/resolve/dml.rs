@@ -518,6 +518,21 @@ fn analyze_insert_select(
             continue;
         };
         let target_oid = *target_oid;
+        // A bare `$N` output PG transformed while `$N` was untyped is still
+        // `unknown` here and is coerced to the column's type through
+        // `variable_coerce_param_hook` (42P08 if WHERE & co. deduced
+        // another type — see `expr::note_untyped_output_params`).
+        if let Some(node::Node::ResTarget(rt)) = direct_targets.get(i).and_then(|t| t.node.as_ref())
+            && let Some(node::Node::ParamRef(p)) = rt.val.as_deref().and_then(|v| v.node.as_ref())
+            && params.is_untyped_output(p.location)
+        {
+            if let Err(prev) = params.coerce_untyped(p.number, target_oid) {
+                return Err(expr::inconsistent_param_error(
+                    p.number, prev, target_oid, p.location, snapshot,
+                ));
+            }
+            continue;
+        }
         if sel_col.type_oid == oid::UNKNOWN || sel_col.type_oid == target_oid {
             continue;
         }

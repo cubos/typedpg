@@ -1180,6 +1180,26 @@ pub(crate) fn could_not_convert_type(context: &str, from: &str, to: &str) -> Raw
     )
 }
 
+/// `inconsistent types deduced for parameter $N` — SQLSTATE 42P08
+/// (`ambiguous_parameter`): PG's `variable_coerce_param_hook` coercing an
+/// untyped parameter occurrence to `target` after an earlier coercion
+/// already deduced `deduced`. PG's DETAIL (`integer versus text`) is
+/// carried as the hint.
+pub(crate) fn inconsistent_parameter_types(
+    num: i32,
+    deduced: &str,
+    target: &str,
+    span: Option<SourceSpan>,
+) -> RawError {
+    RawError::new(
+        AnalyzeError::AmbiguousParameter(format!(
+            "inconsistent types deduced for parameter ${num}"
+        )),
+        span,
+        Some(format!("{deduced} versus {target}")),
+    )
+}
+
 /// `array subscript must have type integer` — SQLSTATE 42804.
 pub(crate) fn array_subscript_must_be_integer(span: Option<SourceSpan>) -> RawError {
     RawError::new(
@@ -1332,6 +1352,10 @@ mod tests {
             (duplicate_column_name("a").kind, "42701"),
             (using_column_ambiguous("id", "left").kind, "42702"),
             (using_column_listed_twice("id").kind, "42701"),
+            (
+                inconsistent_parameter_types(1, "integer", "text", None).kind,
+                "42P08",
+            ),
         ];
         for (err, want) in cases {
             assert_eq!(

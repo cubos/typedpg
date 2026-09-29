@@ -62,15 +62,24 @@ pub(crate) fn analyze_set_operation(
         (right, &right_cols, &left_cols),
     ] {
         for (i, target) in branch.target_list.iter().enumerate() {
+            // A bare `$N` the arm transformed while `$N` was untyped stays
+            // `unknown` even if a later clause of the arm deduced a type,
+            // and its coercion then fails with 42P08
+            // (`expr::note_untyped_output_params`).
             if let Some(node::Node::ResTarget(rt)) = target.node.as_ref()
                 && let Some(val) = &rt.val
                 && let Some(node::Node::ParamRef(p)) = val.node.as_ref()
-                && own_cols.get(i).is_some_and(|c| c.type_oid == oid::UNKNOWN)
+                && (own_cols.get(i).is_some_and(|c| c.type_oid == oid::UNKNOWN)
+                    || params.is_untyped_output(p.location))
                 && let Some(peer) = peer_cols.get(i)
                 && peer.type_oid != oid::UNKNOWN
-                && params.get(p.number) == oid::UNKNOWN
             {
-                params.record(p.number, snapshot.unwrap_domain(peer.type_oid));
+                let target = snapshot.unwrap_domain(peer.type_oid);
+                if let Err(prev) = params.coerce_untyped(p.number, target) {
+                    return Err(expr::inconsistent_param_error(
+                        p.number, prev, target, p.location, snapshot,
+                    ));
+                }
             }
         }
     }

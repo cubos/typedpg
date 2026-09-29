@@ -157,7 +157,7 @@ pub(crate) fn process_from_item(
                     &enclosing,
                     &shadowed_sources,
                 )?;
-                resolve_unknown_outputs(sel, &mut cols, params);
+                resolve_unknown_outputs(sel, &mut cols, params, snapshot)?;
                 let mut scope_cols: Vec<ScopeColumn> = cols
                     .into_iter()
                     .map(|rc| ScopeColumn {

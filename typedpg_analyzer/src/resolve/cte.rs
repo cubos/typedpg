@@ -76,7 +76,7 @@ pub(crate) fn analyze_cte(
             // analyzeCTETargetList: a recursive CTE exposes an `unknown`
             // column (an untyped literal or parameter) as text before the
             // recursive term is looked at.
-            resolve_unknown_outputs(larg, &mut seed_cols, params);
+            resolve_unknown_outputs(larg, &mut seed_cols, params, snapshot)?;
             let seed_cols = apply_cte_column_aliases(&cte.ctename, seed_cols, &cte.aliascolnames)?;
 
             // Register the CTE against its seed types (plus the SEARCH /
@@ -158,7 +158,7 @@ pub(crate) fn analyze_cte(
         }
         node::Node::SelectStmt(sel) => {
             let (mut cols, _) = analyze_body(sel, params, existing_ctes)?;
-            resolve_unknown_outputs(sel, &mut cols, params);
+            resolve_unknown_outputs(sel, &mut cols, params, snapshot)?;
             let cols = apply_cte_column_aliases(&cte.ctename, cols, &cte.aliascolnames)?;
             cols.into_iter().map(to_scope).collect()
         }

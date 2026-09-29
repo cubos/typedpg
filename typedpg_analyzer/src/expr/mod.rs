@@ -1052,6 +1052,99 @@ pub(crate) fn coerce_unknown_to(
     swallow_unless_literal(infer_expr(node, ctx, params, TypeGoal::implicit(target)))
 }
 
+/// The bare `$N` output columns of a SELECT list that PG transforms while
+/// `$N` is still untyped. PG transforms the target list right after FROM
+/// (`transformSelectStmt`), left to right, so a parameter first typed by
+/// WHERE, GROUP BY, HAVING, ORDER BY — or by a *later* target entry — is
+/// still `unknown` when a bare `$N` entry is transformed, and that entry
+/// stays `unknown` until `resolveTargetListUnknowns`. The analyzer walks
+/// those clauses in a different order, so this replays the target list on a
+/// scratch collector at PG's point (the caller runs it right after FROM) and
+/// records each such occurrence ([`ParamCollector::mark_untyped_output`]);
+/// [`resolve_untyped_output_params`] then applies PG's coercion to text.
+pub(crate) fn note_untyped_output_params(
+    target_list: &[protobuf::Node],
+    ctx: Ctx<'_>,
+    params: &mut ParamCollector,
+) {
+    let mut scratch = params.clone();
+    for target in target_list {
+        let Some(node::Node::ResTarget(rt)) = target.node.as_ref() else {
+            continue;
+        };
+        let Some(val) = rt.val.as_deref() else {
+            continue;
+        };
+        if let Some(node::Node::ParamRef(p)) = val.node.as_ref() {
+            if scratch.get(p.number) == oid::UNKNOWN {
+                params.mark_untyped_output(p.location);
+            }
+            scratch.see(p.number);
+            continue;
+        }
+        // Only the types this entry deduces matter; its errors surface when
+        // the target list is analyzed for real.
+        let _ = infer_expr(val, ctx, &mut scratch, TypeGoal::NONE);
+    }
+}
+
+/// PG's `resolveTargetListUnknowns` for the bare-parameter output columns
+/// [`note_untyped_output_params`] recorded: each such occurrence is coerced
+/// to `text` through `variable_coerce_param_hook`, which fails with
+/// `inconsistent types deduced for parameter $N` when a later clause already
+/// deduced another type (`SELECT $1 FROM t WHERE id = $1`). Only for the
+/// contexts that resolve unknowns to text — a top-level SELECT, a subquery,
+/// a sublink or a CTE body; set-operation arms and `INSERT … SELECT` coerce
+/// their unknowns to another type instead.
+pub(crate) fn resolve_untyped_output_params(
+    sel: &protobuf::SelectStmt,
+    snapshot: &PgCatalog,
+    params: &mut ParamCollector,
+) -> Result<(), AnalyzeError> {
+    if sel.op != protobuf::SetOperation::SetopNone as i32 || !sel.values_lists.is_empty() {
+        return Ok(());
+    }
+    for target in &sel.target_list {
+        let Some(node::Node::ResTarget(rt)) = target.node.as_ref() else {
+            continue;
+        };
+        let Some(node::Node::ParamRef(p)) = rt.val.as_deref().and_then(|v| v.node.as_ref()) else {
+            continue;
+        };
+        if !params.is_untyped_output(p.location) {
+            continue;
+        }
+        if let Err(deduced) = params.coerce_untyped(p.number, oid::TEXT) {
+            return Err(inconsistent_param_error(
+                p.number,
+                deduced,
+                oid::TEXT,
+                p.location,
+                snapshot,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// [`crate::pgmsg::inconsistent_parameter_types`] with PG's type names,
+/// pointing at the parameter occurrence being coerced.
+pub(crate) fn inconsistent_param_error(
+    num: i32,
+    deduced: PgTypeOid,
+    target: PgTypeOid,
+    location: i32,
+    snapshot: &PgCatalog,
+) -> AnalyzeError {
+    crate::pgmsg::inconsistent_parameter_types(
+        num,
+        &crate::ddl::util::format_type_for_message(snapshot, deduced),
+        &crate::ddl::util::format_type_for_message(snapshot, target),
+        crate::error::SourceSpan::from_node_token(location),
+    )
+    .finalize_implicit()
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Goal compatibility check
 // ──────────────────────────────────────────────────────────────────────────────

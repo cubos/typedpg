@@ -43,7 +43,7 @@ pub(crate) fn analyze_correlated_select(
         // searches every enclosing range table).
         &outer_scope.shadowed_sources,
     )?;
-    resolve_unknown_outputs(sel, &mut cols, params);
+    resolve_unknown_outputs(sel, &mut cols, params, snapshot)?;
     Ok((cols, p))
 }
 
@@ -57,7 +57,9 @@ pub(crate) fn resolve_unknown_outputs(
     sel: &protobuf::SelectStmt,
     cols: &mut [RawColumn],
     params: &mut ParamCollector,
-) {
+    snapshot: &PgCatalog,
+) -> Result<(), AnalyzeError> {
+    expr::resolve_untyped_output_params(sel, snapshot, params)?;
     let direct = sel.op == SetOperation::SetopNone as i32
         && sel.values_lists.is_empty()
         && sel.target_list.len() == cols.len();
@@ -74,6 +76,7 @@ pub(crate) fn resolve_unknown_outputs(
             params.record(p.number, oid::TEXT);
         }
     }
+    Ok(())
 }
 
 pub(crate) fn analyze_select_with_ctes(
@@ -174,6 +177,14 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
         &cte_scopes,
         params,
     )?;
+
+    // PG transforms the target list right after FROM; note which bare `$N`
+    // outputs it sees untyped before WHERE & co. can type them.
+    expr::note_untyped_output_params(
+        &sel.target_list,
+        expr::Ctx::new(&scope, &null_ctx, snapshot),
+        params,
+    );
 
     // Expand `GROUPING SETS` / `ROLLUP` / `CUBE`: promote columns that
     // some grouping set omits to nullable, and remember whether any
