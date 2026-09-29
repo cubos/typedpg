@@ -783,7 +783,15 @@ fn set_reloptions(
         kind,
         subtype == AlterTableType::AtResetRelOptions,
         false,
-    )
+    )?;
+    if kind == RelOptKind::View
+        && subtype != AlterTableType::AtResetRelOptions
+        && crate::ddl::views::sets_check_option(&list.items)
+        && let Some(query) = crate::ddl::views::view_query(interp, relid)
+    {
+        crate::ddl::views::check_option_allowed(interp, &query)?;
+    }
+    Ok(())
 }
 
 /// `ATSimplePermissions` (tablecmds.c): which relation kinds each ALTER

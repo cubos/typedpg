@@ -3204,3 +3204,74 @@ fn new_enum_labels_are_unusable_until_committed() {
         ),
     ]);
 }
+
+#[test]
+fn check_option_needs_an_auto_updatable_view() {
+    // PG 18 DefineView / ATExecSetRelOptions / view_query_is_auto_updatable.
+    let setup = "CREATE TABLE t (a int, b int);
+                 CREATE VIEW v12 AS SELECT a FROM t;
+                 CREATE VIEW v13 AS SELECT a + 1 AS x FROM t;";
+    let reason = |r: &str| {
+        format!("WITH CHECK OPTION is supported only on automatically updatable views ({r}")
+    };
+    for (stmt, msg) in [
+        (
+            "CREATE VIEW v AS SELECT DISTINCT a FROM t WITH CHECK OPTION;",
+            reason("Views containing DISTINCT"),
+        ),
+        (
+            "CREATE VIEW v AS SELECT a FROM t GROUP BY a WITH CHECK OPTION;",
+            reason("Views containing GROUP BY"),
+        ),
+        (
+            "CREATE VIEW v AS SELECT a + 1 AS x FROM t WITH CHECK OPTION;",
+            reason("Views that have no updatable columns"),
+        ),
+        (
+            "CREATE VIEW v AS SELECT 1 AS x WITH CHECK OPTION;",
+            reason("Views that do not select from a single table or view"),
+        ),
+        (
+            "CREATE VIEW v AS SELECT a, generate_series(1, 2) FROM t WITH CHECK OPTION;",
+            reason("Views that return set-returning functions"),
+        ),
+        (
+            "CREATE VIEW v AS SELECT a FROM t LIMIT 1 WITH CHECK OPTION;",
+            reason("Views containing LIMIT or OFFSET"),
+        ),
+        (
+            "CREATE VIEW v AS SELECT a FROM t UNION SELECT b FROM t WITH CHECK OPTION;",
+            reason("Views containing UNION, INTERSECT, or EXCEPT"),
+        ),
+        (
+            "CREATE VIEW v AS SELECT count(*) FROM t WITH CHECK OPTION;",
+            reason("Views that return aggregate functions"),
+        ),
+        (
+            "CREATE VIEW v AS SELECT t.a FROM t, t u WITH CHECK OPTION;",
+            reason("Views that do not select from a single table or view"),
+        ),
+        (
+            "ALTER VIEW v13 SET (check_option = local);",
+            reason("Views that have no updatable columns"),
+        ),
+        (
+            "CREATE VIEW v WITH (check_option = sometimes) AS SELECT a FROM t;",
+            "invalid value for enum option \"check_option\": sometimes".to_owned(),
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(&msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "CREATE VIEW v6 AS SELECT a FROM t WHERE a > 0 WITH CASCADED CHECK OPTION;
+             CREATE VIEW v7 AS SELECT * FROM v6 WITH LOCAL CHECK OPTION;
+             CREATE VIEW v15 AS SELECT a, a + 1 AS y FROM t WITH CHECK OPTION;
+             ALTER VIEW v12 SET (check_option = local);
+             ALTER VIEW v13 RESET (check_option);",
+        ),
+    ]);
+}

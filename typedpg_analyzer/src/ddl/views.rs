@@ -61,6 +61,13 @@ pub fn create_view(interp: &mut PgCatalog, stmt: &ViewStmt) -> Result<(), DdlErr
         ));
     }
     check_duplicate_columns(&resolved.columns)?;
+    // DefineView: WITH CHECK OPTION needs an automatically updatable view
+    // (checked before the options are parsed).
+    let check_option = stmt.with_check_option > protobuf::ViewCheckOption::NoCheckOption as i32
+        || sets_check_option(&stmt.options);
+    if check_option && let Some(query) = stmt.query.as_deref() {
+        check_option_allowed(interp, query)?;
+    }
     super::reloptions::check_reloptions(
         &stmt.options,
         super::reloptions::RelOptKind::View,
@@ -1439,4 +1446,155 @@ fn interp_type_collation(
     type_oid: PgTypeOid,
 ) -> Option<crate::oid::PgCollationOid> {
     snapshot.pg_type.get(&type_oid).and_then(|t| t.typcollation)
+}
+
+/// view_query_is_auto_updatable (view.c / rewriteHandler.c) with
+/// `check_cols`: why `query` isn't automatically updatable, if it isn't.
+fn not_auto_updatable_reason(interp: &PgCatalog, query: &protobuf::Node) -> Option<&'static str> {
+    let Some(node::Node::SelectStmt(sel)) = query.node.as_ref() else {
+        return None;
+    };
+    if sel.op != protobuf::SetOperation::SetopNone as i32 {
+        return Some(
+            "Views containing UNION, INTERSECT, or EXCEPT are not automatically updatable.",
+        );
+    }
+    if !sel.distinct_clause.is_empty() {
+        return Some("Views containing DISTINCT are not automatically updatable.");
+    }
+    if !sel.group_clause.is_empty() {
+        return Some("Views containing GROUP BY are not automatically updatable.");
+    }
+    if sel.having_clause.is_some() {
+        return Some("Views containing HAVING are not automatically updatable.");
+    }
+    if sel.with_clause.is_some() {
+        return Some("Views containing WITH are not automatically updatable.");
+    }
+    if sel.limit_count.is_some() || sel.limit_offset.is_some() {
+        return Some("Views containing LIMIT or OFFSET are not automatically updatable.");
+    }
+    let mut kinds = crate::expr::FuncKindPresence::default();
+    let mut srf = false;
+    for target in &sel.target_list {
+        let Some(node::Node::ResTarget(rt)) = target.node.as_ref() else {
+            continue;
+        };
+        let Some(val) = rt.val.as_deref() else {
+            continue;
+        };
+        let found = crate::expr::detect_func_kinds(val, interp);
+        kinds.has_aggregate |= found.has_aggregate;
+        kinds.has_window |= found.has_window;
+        srf |= returns_set(interp, val);
+    }
+    if kinds.has_aggregate {
+        return Some("Views that return aggregate functions are not automatically updatable.");
+    }
+    if kinds.has_window {
+        return Some("Views that return window functions are not automatically updatable.");
+    }
+    if srf {
+        return Some("Views that return set-returning functions are not automatically updatable.");
+    }
+    let single_table =
+        "Views that do not select from a single table or view are not automatically updatable.";
+    let [from] = sel.from_clause.as_slice() else {
+        return Some(single_table);
+    };
+    let Some(node::Node::RangeVar(rv)) = from.node.as_ref() else {
+        return Some(single_table);
+    };
+    let base = super::util::lookup_relation(interp, rv).ok()?.1;
+    if !matches!(
+        interp.pg_class.get(&base).map(|c| c.relkind),
+        Some(RelKind::Table | RelKind::Partitioned | RelKind::View | RelKind::ForeignTable)
+    ) {
+        return Some(single_table);
+    }
+    // check_cols: some output column must be a plain column of the base
+    // relation.
+    let updatable = sel.target_list.iter().any(|target| {
+        let Some(node::Node::ResTarget(rt)) = target.node.as_ref() else {
+            return false;
+        };
+        let Some(node::Node::ColumnRef(cr)) = rt.val.as_deref().and_then(|v| v.node.as_ref())
+        else {
+            return false;
+        };
+        match cr.fields.last().and_then(|f| f.node.as_ref()) {
+            Some(node::Node::AStar(_)) => true,
+            Some(node::Node::String(s)) => interp.attribute_by_name(base, &s.sval).is_some(),
+            _ => false,
+        }
+    });
+    if !updatable {
+        return Some("Views that have no updatable columns are not automatically updatable.");
+    }
+    None
+}
+
+/// Whether `node` calls a set-returning function outside a sub-select.
+fn returns_set(interp: &PgCatalog, node: &protobuf::Node) -> bool {
+    let Some(inner) = node.node.as_ref() else {
+        return false;
+    };
+    match inner {
+        node::Node::SubLink(_) => false,
+        node::Node::FuncCall(fc) => {
+            let parts: Vec<&str> = fc
+                .funcname
+                .iter()
+                .filter_map(super::util::node_string)
+                .collect();
+            let (schema, name) = match parts.as_slice() {
+                [name] => (None, *name),
+                [schema, name] => (Some(*schema), *name),
+                _ => return false,
+            };
+            let candidates = interp.find_functions(schema, name);
+            (!candidates.is_empty() && candidates.iter().all(|p| p.proretset))
+                || fc.args.iter().any(|a| returns_set(interp, a))
+        }
+        other => other.nodes().into_iter().skip(1).any(|(n, ..)| match n {
+            pg_query::NodeRef::FuncCall(fc) => returns_set(
+                interp,
+                &protobuf::Node {
+                    node: Some(node::Node::FuncCall(Box::new(fc.clone()))),
+                },
+            ),
+            _ => false,
+        }),
+    }
+}
+
+/// DefineView / ATExecSetRelOptions: a view with a check option must be
+/// automatically updatable.
+pub(crate) fn check_option_allowed(
+    interp: &PgCatalog,
+    query: &protobuf::Node,
+) -> Result<(), DdlError> {
+    match not_auto_updatable_reason(interp, query) {
+        Some(reason) => Err(DdlError::UnsupportedDdl(format!(
+            "WITH CHECK OPTION is supported only on automatically updatable views ({reason})"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// Whether a `WITH (...)` / `SET (...)` option list sets `check_option`.
+pub(crate) fn sets_check_option(options: &[protobuf::Node]) -> bool {
+    options.iter().any(|o| {
+        matches!(o.node.as_ref(), Some(node::Node::DefElem(de)) if de.defname == "check_option")
+    })
+}
+
+/// The stored SELECT of view `relid`.
+pub(crate) fn view_query(
+    interp: &PgCatalog,
+    relid: crate::oid::PgClassOid,
+) -> Option<protobuf::Node> {
+    use prost::Message;
+    let body = interp.view_body(relid)?;
+    protobuf::Node::decode(body.ast.as_slice()).ok()
 }
