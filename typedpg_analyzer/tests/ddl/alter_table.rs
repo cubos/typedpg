@@ -1021,3 +1021,82 @@ fn detach_concurrently_and_finalize() {
         ),
     ]);
 }
+
+#[test]
+fn system_columns_can_be_neither_dropped_nor_altered() {
+    // A relation with storage has system columns in pg_attribute: DROP
+    // COLUMN finds them (IF EXISTS doesn't skip) and refuses; ALTER COLUMN
+    // subcommands say "cannot alter system column"; a not-null constraint
+    // or an index key on one is refused. Views and composite types have
+    // none.
+    let setup = "CREATE TABLE t (a int);
+                 CREATE TABLE p (a int) PARTITION BY RANGE (a);
+                 CREATE TYPE ct AS (x int);
+                 CREATE VIEW v AS SELECT 1 AS a;";
+    for (stmt, msg) in [
+        ("ALTER TABLE t DROP COLUMN ctid;", "cannot drop system column \"ctid\""),
+        (
+            "ALTER TABLE t DROP COLUMN IF EXISTS xmin;",
+            "cannot drop system column \"xmin\"",
+        ),
+        (
+            "ALTER TABLE p DROP COLUMN tableoid;",
+            "cannot drop system column \"tableoid\"",
+        ),
+        (
+            "CREATE TABLE t2 (a int, NOT NULL ctid);",
+            "cannot add not-null constraint on system column \"ctid\"",
+        ),
+        (
+            "ALTER TABLE t ADD CONSTRAINT n NOT NULL ctid;",
+            "cannot add not-null constraint on system column \"ctid\"",
+        ),
+        (
+            "ALTER TABLE t ADD PRIMARY KEY (ctid);",
+            "cannot add not-null constraint on system column \"ctid\"",
+        ),
+        (
+            "CREATE TABLE t4 (a int, PRIMARY KEY (ctid));",
+            "index creation on system columns is not supported",
+        ),
+        (
+            "ALTER TABLE t ADD UNIQUE (a, ctid);",
+            "index creation on system columns is not supported",
+        ),
+        (
+            "ALTER TABLE t ALTER COLUMN ctid SET DEFAULT 1;",
+            "cannot alter system column \"ctid\"",
+        ),
+        (
+            "ALTER TABLE t ALTER COLUMN ctid DROP NOT NULL;",
+            "cannot alter system column \"ctid\"",
+        ),
+        (
+            "ALTER TABLE t ALTER COLUMN xmin TYPE text;",
+            "cannot alter system column \"xmin\"",
+        ),
+        (
+            "ALTER TABLE t ALTER COLUMN xmin DROP IDENTITY;",
+            "cannot alter system column \"xmin\"",
+        ),
+        (
+            "ALTER TABLE t ALTER COLUMN xmin SET GENERATED ALWAYS;",
+            "cannot alter system column \"xmin\"",
+        ),
+        (
+            "ALTER TABLE t ALTER COLUMN xmin ADD GENERATED ALWAYS AS IDENTITY;",
+            "identity column type must be smallint, integer, or bigint",
+        ),
+        (
+            "ALTER TYPE ct DROP ATTRIBUTE ctid;",
+            "column \"ctid\" of relation \"ct\" does not exist",
+        ),
+        (
+            "ALTER VIEW v ALTER COLUMN ctid SET DEFAULT 1;",
+            "column \"ctid\" of relation \"v\" does not exist",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+}

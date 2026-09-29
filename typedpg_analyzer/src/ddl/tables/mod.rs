@@ -279,6 +279,20 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
             continue;
         }
         for key in c.keys.iter().filter_map(super::util::node_string) {
+            // transformIndexConstraint takes a system column as found, and
+            // DefineIndex refuses it; AddRelationNotNullConstraints refuses
+            // a not-null constraint on one.
+            if !columns.iter().any(|col| col.name == key)
+                && crate::pg_catalog::SYSTEM_COLUMNS
+                    .iter()
+                    .any(|(n, ..)| *n == key)
+            {
+                return Err(DdlError::UnsupportedDdl(if is_not_null {
+                    format!("cannot add not-null constraint on system column \"{key}\"")
+                } else {
+                    "index creation on system columns is not supported".to_owned()
+                }));
+            }
             let Some(col) = columns.iter_mut().find(|col| col.name == key) else {
                 return Err(DdlError::Parse(if is_not_null {
                     format!("column \"{key}\" of relation \"{name}\" does not exist")
@@ -855,6 +869,34 @@ fn check_attribute_names_types(
     Ok(())
 }
 
+/// `name` is a system column of `relid` (`attnum < 0` in pg_attribute):
+/// every relation with storage has them, views and composite types don't.
+pub(crate) fn is_system_column_of(interp: &PgCatalog, relid: PgClassOid, name: &str) -> bool {
+    interp
+        .pg_class
+        .get(&relid)
+        .is_some_and(|c| !matches!(c.relkind, RelKind::View | RelKind::CompositeType))
+        && crate::pg_catalog::SYSTEM_COLUMNS
+            .iter()
+            .any(|(n, ..)| *n == name)
+}
+
+/// ATExecColumnDefault / ATPrepAlterColumnType / ATExecDropIdentity / ...:
+/// "cannot alter system column" for a system column of `relid`.
+pub(crate) fn check_not_system_column(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+    name: &str,
+) -> Result<(), DdlError> {
+    if interp.attribute_by_name(relid, name).is_none() && is_system_column_of(interp, relid, name)
+    {
+        return Err(DdlError::UnsupportedDdl(format!(
+            "cannot alter system column \"{name}\""
+        )));
+    }
+    Ok(())
+}
+
 /// The system column name check of CheckAttributeNamesTypes and
 /// check_for_column_name_collision (tablecmds.c).
 pub(crate) fn check_system_column_name(name: &str) -> Result<(), DdlError> {
@@ -1091,6 +1133,27 @@ fn apply_alter_subtype(
             if let Some(node::Node::Constraint(c)) = cmd.def.as_deref().and_then(|d| d.node.as_ref())
             {
                 check_tablespace_placement(&c.indexspace)?;
+                // transformIndexConstraint takes a system column as found:
+                // a PRIMARY KEY's not-null constraint on it is refused
+                // first, else DefineIndex refuses the index.
+                let is_pk = c.contype == ConstrType::ConstrPrimary as i32;
+                if (is_pk || c.contype == ConstrType::ConstrUnique as i32)
+                    && let Some(key) = c
+                        .keys
+                        .iter()
+                        .chain(c.including.iter())
+                        .filter_map(super::util::node_string)
+                        .find(|k| {
+                            interp.attribute_by_name(relid, k).is_none()
+                                && is_system_column_of(interp, relid, k)
+                        })
+                {
+                    return Err(DdlError::UnsupportedDdl(if is_pk {
+                        format!("cannot add not-null constraint on system column \"{key}\"")
+                    } else {
+                        "index creation on system columns is not supported".to_owned()
+                    }));
+                }
             }
             add_constraint(interp, relid, cmd, rec)
         }

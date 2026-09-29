@@ -496,6 +496,19 @@ pub(crate) fn set_identity(
     };
 
     let is_add = matches!(def.node.as_ref(), Some(node::Node::Constraint(_)));
+    // transformAlterTableStmt checks an added identity's type (a system
+    // column's is never an integer) before ATExecAddIdentity sees the
+    // column.
+    if interp.attribute_by_name(relid, &cmd.name).is_none()
+        && super::is_system_column_of(interp, relid, &cmd.name)
+    {
+        if is_add {
+            return Err(DdlError::Parse(
+                "identity column type must be smallint, integer, or bigint".into(),
+            ));
+        }
+        super::check_not_system_column(interp, relid, &cmd.name)?;
+    }
     let rel = relname_of(interp, relid);
     // ATExecAddIdentity: the column's not-null constraint must be valid.
     if is_add
@@ -599,6 +612,7 @@ pub(crate) fn drop_identity(
     relid: PgClassOid,
     cmd: &AlterTableCmd,
 ) -> Result<(), DdlError> {
+    super::check_not_system_column(interp, relid, &cmd.name)?;
     let rel = relname_of(interp, relid);
     let Some(attrs) = interp.pg_attribute.get_mut(&relid) else {
         return Err(DdlError::TableNotFound(format!(
@@ -852,6 +866,14 @@ pub(crate) fn drop_column(
     rec: inherit::Recursion,
 ) -> Result<(), DdlError> {
     let Some(target) = interp.attribute_by_name(relid, &cmd.name).cloned() else {
+        // ATExecDropColumn: a system column is found (IF EXISTS doesn't
+        // skip it) and can't be dropped.
+        if super::is_system_column_of(interp, relid, &cmd.name) {
+            return Err(DdlError::UnsupportedDdl(format!(
+                "cannot drop system column \"{}\"",
+                cmd.name
+            )));
+        }
         if cmd.missing_ok {
             return Ok(());
         }
@@ -1099,6 +1121,7 @@ pub(crate) fn set_default(
     cmd: &AlterTableCmd,
     rec: inherit::Recursion,
 ) -> Result<(), DdlError> {
+    super::check_not_system_column(interp, relid, &cmd.name)?;
     let attr = interp.attribute_by_name(relid, &cmd.name).cloned();
     // ATExecColumnDefault: an identity or generated column's default is
     // its identity / generation expression.
@@ -1192,6 +1215,7 @@ pub(crate) fn alter_column_type(
     let Some(node::Node::ColumnDef(cd)) = def.node.as_ref() else {
         return Ok(());
     };
+    super::check_not_system_column(interp, relid, &cmd.name)?;
     // ATPrepAlterColumnType: USING would contradict the generation
     // expression.
     if let Some(attr) = interp.attribute_by_name(relid, &cmd.name)
@@ -1541,14 +1565,7 @@ fn alter_target_column(
     if let Some(attr) = interp.attribute_by_name(relid, name) {
         return Ok(attr.clone());
     }
-    if crate::pg_catalog::SYSTEM_COLUMNS
-        .iter()
-        .any(|(n, ..)| *n == name)
-    {
-        return Err(DdlError::UnsupportedDdl(format!(
-            "cannot alter system column \"{name}\""
-        )));
-    }
+    super::check_not_system_column(interp, relid, name)?;
     Err(DdlError::Parse(column_not_found_msg(interp, relid, name)))
 }
 

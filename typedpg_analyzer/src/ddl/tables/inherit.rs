@@ -635,6 +635,7 @@ pub(crate) fn drop_not_null(
     col: &str,
     rec: Recursion,
 ) -> Result<(), DdlError> {
+    super::check_not_system_column(interp, relid, col)?;
     let attnum = attnum_or_err(interp, relid, col)?;
     let rel = relname_of(interp, relid);
     let Some(attr) = interp.attribute_by_name(relid, col).cloned() else {
