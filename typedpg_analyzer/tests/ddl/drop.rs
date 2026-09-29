@@ -351,3 +351,51 @@ fn drop_type_of_a_range_takes_its_multirange_and_constructors() {
         "{err}"
     );
 }
+
+#[test]
+fn drop_table_needs_cascade_for_what_uses_its_row_type() {
+    // The row type is internal to the table: a column of another relation
+    // holding it (or its array), a domain over it and a view naming it all
+    // depend on the table.
+    for (setup, dropped) in [
+        ("CREATE TABLE a (x int); CREATE TABLE b (c a);", "a"),
+        ("CREATE TABLE a (x int); CREATE TABLE b (c a[]);", "a"),
+        ("CREATE TABLE a (x int); CREATE TYPE ct AS (y a);", "a"),
+        ("CREATE TABLE a (x int); CREATE DOMAIN d AS a;", "a"),
+        (
+            "CREATE TABLE a (x int); CREATE VIEW v AS SELECT NULL::a AS c;",
+            "a",
+        ),
+    ] {
+        let stmt = format!("DROP TABLE {dropped};");
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", &stmt)]).expect_err(setup);
+        assert!(
+            err.to_string()
+                .starts_with("cannot drop table a because other objects depend on it"),
+            "{setup}\n  got: {err}"
+        );
+    }
+    // CASCADE drops the columns (not their tables) and the domain; a DROP
+    // naming both tables needs none.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE a (x int);
+         CREATE TABLE b (c a[], k int);
+         CREATE DOMAIN d AS a;
+         CREATE TABLE z (c d, k int);
+         DROP TABLE a CASCADE;
+         CREATE TABLE p (x int);
+         CREATE TABLE q (c p);
+         DROP TABLE p, q;",
+    )]);
+    for table in ["b", "z"] {
+        let oid = db.resolve_table(None, table).unwrap().oid;
+        let names: Vec<&str> = db
+            .attributes_of(oid)
+            .iter()
+            .map(|a| a.attname.as_str())
+            .collect();
+        assert_eq!(names, ["k"], "{table}");
+    }
+    assert!(db.resolve_type_by_name(None, "d").is_none());
+}

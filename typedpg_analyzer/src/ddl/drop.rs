@@ -231,7 +231,18 @@ fn drop_relation_oid(
         )));
     }
 
-    let dependent_views = views::find_dependent_views(interp, class_oid);
+    // Views reading the relation, or naming its row type (a cast, a typed
+    // literal).
+    let mut dependent_views = views::find_dependent_views(interp, class_oid);
+    if let Some(row_type) = interp.pg_class.get(&class_oid).and_then(|c| c.reltype) {
+        for t in std::iter::once(row_type).chain(interp.array_type_of(row_type)) {
+            for v in views::find_views_depending_on_type(interp, t) {
+                if v != class_oid && !dependent_views.contains(&v) {
+                    dependent_views.push(v);
+                }
+            }
+        }
+    }
     if !dependent_views.is_empty() && !cascade {
         let view_names: Vec<String> = dependent_views
             .iter()
@@ -316,6 +327,64 @@ fn drop_relation_oid(
             describe_function(interp, dependent_functions[0]),
         )));
     }
+    // Columns of other relations holding the row type (or its array), and
+    // domains / range types over it: each depends on the type, which is
+    // internal to the relation.
+    let mut dependent_columns: Vec<(PgClassOid, String)> = interp
+        .pg_attribute
+        .iter()
+        .filter(|(relid, _)| **relid != class_oid && !named_relations.contains(relid))
+        .filter(|(relid, _)| {
+            interp
+                .pg_class
+                .get(relid)
+                .is_some_and(|c| c.relkind != RelKind::View)
+        })
+        .flat_map(|(&relid, attrs)| {
+            attrs
+                .iter()
+                .filter(|a| row_types.contains(&a.atttypid))
+                .map(move |a| (relid, a.attname.clone()))
+        })
+        .collect();
+    dependent_columns.sort();
+    let mut dependent_types: Vec<crate::oid::PgTypeOid> = interp
+        .pg_type
+        .values()
+        .filter(|t| t.typbasetype.is_some_and(|b| row_types.contains(&b)))
+        .map(|t| t.oid)
+        .chain(
+            interp
+                .pg_range
+                .values()
+                .filter(|r| row_types.contains(&r.rngsubtype))
+                .map(|r| r.rngtypid),
+        )
+        .collect();
+    dependent_types.sort();
+    if !cascade {
+        if let Some((relid, column)) = dependent_columns.first() {
+            let owner = interp.pg_class.get(relid);
+            let owner_kind = match owner.map(|c| c.relkind) {
+                Some(RelKind::CompositeType) => "composite type",
+                Some(RelKind::MaterializedView) => "materialized view",
+                Some(RelKind::ForeignTable) => "foreign table",
+                _ => "table",
+            };
+            return Err(DdlError::DependencyError(format!(
+                "cannot drop {kind} {name} because other objects depend on it (column {column} \
+                 of {owner_kind} {} depends on type {name})",
+                owner.map(|c| c.relname.as_str()).unwrap_or("?"),
+            )));
+        }
+        if let Some(t) = dependent_types.first() {
+            return Err(DdlError::DependencyError(format!(
+                "cannot drop {kind} {name} because other objects depend on it (type {} depends \
+                 on type {name})",
+                format_type_for_message(interp, *t),
+            )));
+        }
+    }
     // Column defaults using the sequence (`nextval('s')`).
     let dependent_defaults = defaults_using_sequence(interp, class_oid);
     if let Some(&(relid, attnum)) = dependent_defaults.first()
@@ -342,6 +411,35 @@ fn drop_relation_oid(
         views::drop_views(interp, &dependent_views);
     }
     drop_functions_cascade(interp, &dependent_functions);
+    // CASCADE drops those columns (not their relations) and types.
+    for (relid, column) in dependent_columns {
+        if let Some(attrs) = interp.pg_attribute.get_mut(&relid) {
+            attrs.retain(|a| a.attname != column);
+        }
+    }
+    for t in dependent_types {
+        let Some(typ) = interp.pg_type.get(&t) else {
+            continue;
+        };
+        let schema = interp
+            .namespace_name(typ.typnamespace)
+            .unwrap_or_default()
+            .to_owned();
+        let type_name = typedpg_pg_query::protobuf::Node {
+            node: Some(node::Node::TypeName(typedpg_pg_query::protobuf::TypeName {
+                names: [schema, typ.typname.clone()]
+                    .into_iter()
+                    .map(|s| typedpg_pg_query::protobuf::Node {
+                        node: Some(node::Node::String(typedpg_pg_query::protobuf::String {
+                            sval: s,
+                        })),
+                    })
+                    .collect(),
+                ..Default::default()
+            })),
+        };
+        drop_type(interp, &type_name, true, true)?;
+    }
     for (relid, attnum) in dependent_defaults {
         // DROP ... CASCADE drops the default expression, not the column.
         if let Some(attrs) = interp.pg_attribute.get_mut(&relid)
