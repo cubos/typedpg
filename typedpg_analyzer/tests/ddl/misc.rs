@@ -4311,3 +4311,37 @@ fn like_including_identity_copies_the_sequence_options() {
         ("0002.sql", "ALTER TABLE l ALTER COLUMN id RESTART WITH 10;"),
     ]);
 }
+
+#[test]
+fn conversion_encodings_must_exist() {
+    // PG 18 CreateConversionCommand: pg_char_to_encoding over the cleaned
+    // name (alphanumerics, lowercased) and its alias table; SQL_ASCII can't
+    // be converted.
+    for (stmt, msg) in [
+        (
+            "CREATE CONVERSION c FOR 'nosuch' TO 'UTF8' FROM iso8859_1_to_utf8;",
+            "source encoding \"nosuch\" does not exist",
+        ),
+        (
+            "CREATE CONVERSION c FOR 'LATIN1' TO 'utf16' FROM iso8859_1_to_utf8;",
+            "destination encoding \"utf16\" does not exist",
+        ),
+        (
+            "CREATE CONVERSION c FOR 'SQL_ASCII' TO 'UTF8' FROM iso8859_1_to_utf8;",
+            "encoding conversion to or from \"SQL_ASCII\" is not supported",
+        ),
+        (
+            "CREATE CONVERSION c FOR 'LATIN1' TO 'sql-ascii' FROM iso8859_1_to_utf8;",
+            "encoding conversion to or from \"SQL_ASCII\" is not supported",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[(
+        "0001.sql",
+        "CREATE CONVERSION c1 FOR 'latin-1' TO 'utf-8' FROM iso8859_1_to_utf8;
+         CREATE CONVERSION c2 FOR 'ISO_8859_1' TO 'unicode' FROM iso8859_1_to_utf8;
+         CREATE CONVERSION c3 FOR 'Windows1252' TO 'UTF8' FROM win_to_utf8;",
+    )]);
+}

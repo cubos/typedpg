@@ -1,7 +1,6 @@
-//! Encoding conversions (conversioncmds.c): CREATE CONVERSION names a
-//! conversion function with the fixed signature, conversion names are
-//! unique per schema. The encoding names themselves aren't checked (PG
-//! accepts many spellings of each).
+//! Encoding conversions (conversioncmds.c): CREATE CONVERSION names two
+//! existing encodings and a conversion function with the fixed signature,
+//! conversion names are unique per schema.
 
 use pg_query::protobuf::CreateConversionStmt;
 
@@ -9,6 +8,106 @@ use super::DdlError;
 use super::util::node_string;
 use crate::oid::{PgNamespaceOid, PgTypeOid};
 use crate::pg_catalog::PgCatalog;
+
+/// pg_encname_tbl (encnames.c): every accepted spelling, cleaned, with
+/// its encoding's canonical name.
+const ENCODING_NAMES: &[(&str, &str)] = &[
+    ("abc", "WIN1258"),
+    ("alt", "WIN866"),
+    ("big5", "BIG5"),
+    ("euccn", "EUC_CN"),
+    ("eucjis2004", "EUC_JIS_2004"),
+    ("eucjp", "EUC_JP"),
+    ("euckr", "EUC_KR"),
+    ("euctw", "EUC_TW"),
+    ("gb18030", "GB18030"),
+    ("gbk", "GBK"),
+    ("iso88591", "LATIN1"),
+    ("iso885910", "LATIN6"),
+    ("iso885913", "LATIN7"),
+    ("iso885914", "LATIN8"),
+    ("iso885915", "LATIN9"),
+    ("iso885916", "LATIN10"),
+    ("iso88592", "LATIN2"),
+    ("iso88593", "LATIN3"),
+    ("iso88594", "LATIN4"),
+    ("iso88595", "ISO_8859_5"),
+    ("iso88596", "ISO_8859_6"),
+    ("iso88597", "ISO_8859_7"),
+    ("iso88598", "ISO_8859_8"),
+    ("iso88599", "LATIN5"),
+    ("johab", "JOHAB"),
+    ("koi8", "KOI8R"),
+    ("koi8r", "KOI8R"),
+    ("koi8u", "KOI8U"),
+    ("latin1", "LATIN1"),
+    ("latin10", "LATIN10"),
+    ("latin2", "LATIN2"),
+    ("latin3", "LATIN3"),
+    ("latin4", "LATIN4"),
+    ("latin5", "LATIN5"),
+    ("latin6", "LATIN6"),
+    ("latin7", "LATIN7"),
+    ("latin8", "LATIN8"),
+    ("latin9", "LATIN9"),
+    ("mskanji", "SJIS"),
+    ("muleinternal", "MULE_INTERNAL"),
+    ("shiftjis", "SJIS"),
+    ("shiftjis2004", "SHIFT_JIS_2004"),
+    ("sjis", "SJIS"),
+    ("sqlascii", "SQL_ASCII"),
+    ("tcvn", "WIN1258"),
+    ("tcvn5712", "WIN1258"),
+    ("uhc", "UHC"),
+    ("unicode", "UTF8"),
+    ("utf8", "UTF8"),
+    ("vscii", "WIN1258"),
+    ("win", "WIN1251"),
+    ("win1250", "WIN1250"),
+    ("win1251", "WIN1251"),
+    ("win1252", "WIN1252"),
+    ("win1253", "WIN1253"),
+    ("win1254", "WIN1254"),
+    ("win1255", "WIN1255"),
+    ("win1256", "WIN1256"),
+    ("win1257", "WIN1257"),
+    ("win1258", "WIN1258"),
+    ("win866", "WIN866"),
+    ("win874", "WIN874"),
+    ("win932", "SJIS"),
+    ("win936", "GBK"),
+    ("win949", "UHC"),
+    ("win950", "BIG5"),
+    ("windows1250", "WIN1250"),
+    ("windows1251", "WIN1251"),
+    ("windows1252", "WIN1252"),
+    ("windows1253", "WIN1253"),
+    ("windows1254", "WIN1254"),
+    ("windows1255", "WIN1255"),
+    ("windows1256", "WIN1256"),
+    ("windows1257", "WIN1257"),
+    ("windows1258", "WIN1258"),
+    ("windows866", "WIN866"),
+    ("windows874", "WIN874"),
+    ("windows932", "SJIS"),
+    ("windows936", "GBK"),
+    ("windows949", "UHC"),
+    ("windows950", "BIG5"),
+];
+
+/// pg_char_to_encoding: the canonical name of the encoding `name` spells
+/// (clean_encoding_name keeps the lowercased alphanumerics).
+fn encoding(name: &str) -> Option<&'static str> {
+    let clean: String = name
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    ENCODING_NAMES
+        .iter()
+        .find(|(alias, _)| *alias == clean)
+        .map(|(_, canonical)| *canonical)
+}
 
 /// `(int4, int4, cstring, internal, int4, bool)`.
 const SIGNATURE: [u32; 6] = [23, 23, 2275, 2281, 23, 16];
@@ -18,6 +117,24 @@ pub fn create_conversion(
     stmt: &CreateConversionStmt,
 ) -> Result<(), DdlError> {
     let (nsoid, name) = super::util::ensure_qualified_name(interp, &stmt.conversion_name)?;
+    let Some(from) = encoding(&stmt.for_encoding_name) else {
+        return Err(DdlError::TypeNotFound(format!(
+            "source encoding \"{}\" does not exist",
+            stmt.for_encoding_name
+        )));
+    };
+    let Some(to) = encoding(&stmt.to_encoding_name) else {
+        return Err(DdlError::TypeNotFound(format!(
+            "destination encoding \"{}\" does not exist",
+            stmt.to_encoding_name
+        )));
+    };
+    // SQL_ASCII conversions would be no-ops.
+    if from == "SQL_ASCII" || to == "SQL_ASCII" {
+        return Err(DdlError::Parse(
+            "encoding conversion to or from \"SQL_ASCII\" is not supported".into(),
+        ));
+    }
     let parts: Vec<&str> = stmt.func_name.iter().filter_map(node_string).collect();
     let (schema, func) = match parts.as_slice() {
         [schema, func] => (Some(*schema), *func),
