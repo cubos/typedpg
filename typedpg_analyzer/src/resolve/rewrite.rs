@@ -198,6 +198,22 @@ fn rewrite_level(
     };
     let relname = class.relname.as_str();
     let is_view = class.relkind == RelKind::View;
+
+    // CheckValidResultRel (ExecInitModifyTable): the executor never
+    // changes a materialized view or a sequence — every execution fails,
+    // whatever the rows.
+    let unchangeable = match class.relkind {
+        RelKind::MaterializedView => Some("materialized view"),
+        RelKind::Sequence => Some("sequence"),
+        _ => None,
+    };
+    if let Some(kind) = unchangeable
+        && !rw.merge
+        && execution_error.is_none()
+    {
+        *execution_error =
+            Some(crate::pgmsg::cannot_change_relation(kind, relname).finalize_implicit());
+    }
     let attrs = snapshot.attributes_of(relid);
 
     // rewriteTargetListIU.

@@ -79,6 +79,17 @@ pub(crate) fn analyze_merge_with_outer_ctes(
                 crate::error::SourceSpan::from_node_qname(relation.location),
             )
         })?;
+    crate::scope::check_relation_opens(table)?;
+    if !matches!(
+        table.relkind,
+        crate::pg_catalog::RelKind::Table
+            | crate::pg_catalog::RelKind::Partitioned
+            | crate::pg_catalog::RelKind::View
+    ) {
+        return Err(
+            crate::pgmsg::merge_on_relation_kind(&table.relname, table.relkind).finalize_implicit(),
+        );
+    }
 
     let table_oid = table.oid;
     let table_relname = table.relname.clone();

@@ -184,6 +184,7 @@ fn resolve_insert_target(
                 crate::error::SourceSpan::from_node_qname(relation.location),
             )
         })?;
+    crate::scope::check_relation_opens(table)?;
 
     let col_names: Vec<String> = ins
         .cols
@@ -659,6 +660,7 @@ pub(crate) fn analyze_update_with_outer_ctes(
                 crate::error::SourceSpan::from_node_qname(relation.location),
             )
         })?;
+    crate::scope::check_relation_opens(table)?;
 
     let table_oid = table.oid;
     let table_relname = table.relname.clone();
@@ -781,6 +783,7 @@ pub(crate) fn analyze_delete_with_outer_ctes(
                 crate::error::SourceSpan::from_node_qname(relation.location),
             )
         })?;
+    crate::scope::check_relation_opens(table)?;
 
     let table_oid = table.oid;
     let table_relname = table.relname.clone();

@@ -230,6 +230,43 @@ pub(crate) fn merge_view_partial_instead_triggers(view: &str) -> RawError {
     )
 }
 
+/// validate_relation_kind (table_open): `cannot open relation "i"` for an
+/// index or a composite type — SQLSTATE 42809.
+pub(crate) fn cannot_open_relation(relation: &str, kind: crate::pg_catalog::RelKind) -> RawError {
+    RawError::new(
+        AnalyzeError::WrongObjectType(format!(
+            "cannot open relation \"{relation}\" (This operation is not supported for {}.)",
+            kind.plural()
+        )),
+        None,
+        None,
+    )
+}
+
+/// transformMergeStmt: `cannot execute MERGE on relation "r"` for a
+/// relation other than a table or a view — SQLSTATE 0A000.
+pub(crate) fn merge_on_relation_kind(relation: &str, kind: crate::pg_catalog::RelKind) -> RawError {
+    RawError::new(
+        AnalyzeError::FeatureNotSupported(format!(
+            "cannot execute MERGE on relation \"{relation}\" (This operation is not supported \
+             for {}.)",
+            kind.plural()
+        )),
+        None,
+        None,
+    )
+}
+
+/// CheckValidResultRel: `cannot change materialized view "mv"` / `cannot
+/// change sequence "s"` — SQLSTATE 42809.
+pub(crate) fn cannot_change_relation(kind: &str, relation: &str) -> RawError {
+    RawError::new(
+        AnalyzeError::WrongObjectType(format!("cannot change {kind} \"{relation}\"")),
+        None,
+        None,
+    )
+}
+
 /// RewriteQuery: `infinite recursion detected in rules for relation "r"` —
 /// SQLSTATE 42P17.
 pub(crate) fn infinite_rule_recursion(relation: &str) -> RawError {
@@ -1137,6 +1174,7 @@ mod tests {
             (insert_non_default_into_generated("g", false).kind, "428C9"),
             (update_generated_to_non_default("g", true).kind, "428C9"),
             (infinite_rule_recursion("t").kind, "42P17"),
+            (cannot_change_relation("sequence", "s").kind, "42809"),
             (
                 view_not_updatable(crate::resolve::DmlEvent::Insert, "v", "x", false).kind,
                 "55000",

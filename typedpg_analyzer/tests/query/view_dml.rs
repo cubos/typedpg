@@ -477,3 +477,75 @@ fn rules_that_fire_themselves_are_infinite_recursion() {
         );
     }
 }
+
+#[test]
+fn statements_the_executor_always_refuses_are_rejected() {
+    // CheckValidResultRel (ExecInitModifyTable): a materialized view or a
+    // sequence can't be changed — PREPARE succeeds, every execution fails,
+    // whatever the rows; typedpg reports it at compile time.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE t (a int);
+         CREATE MATERIALIZED VIEW mv AS SELECT a FROM t;
+         CREATE SEQUENCE s;
+         CREATE TYPE ct AS (x int);
+         CREATE INDEX ti ON t (a);
+         CREATE TABLE logged (a int);
+         CREATE RULE rl AS ON INSERT TO logged DO ALSO DELETE FROM mv;",
+    )
+    .unwrap();
+    for (sql, message) in [
+        (
+            "INSERT INTO mv VALUES (1)",
+            "cannot change materialized view \"mv\"",
+        ),
+        (
+            "UPDATE mv SET a = 1",
+            "cannot change materialized view \"mv\"",
+        ),
+        ("DELETE FROM mv", "cannot change materialized view \"mv\""),
+        (
+            "INSERT INTO mv SELECT a FROM t WHERE false RETURNING a",
+            "cannot change materialized view \"mv\"",
+        ),
+        (
+            "WITH x AS (DELETE FROM mv RETURNING a) SELECT * FROM x",
+            "cannot change materialized view \"mv\"",
+        ),
+        (
+            "INSERT INTO logged VALUES (1)",
+            "cannot change materialized view \"mv\"",
+        ),
+        (
+            "INSERT INTO s VALUES (1, 1, false)",
+            "cannot change sequence \"s\"",
+        ),
+        (
+            "UPDATE s SET last_value = 1",
+            "cannot change sequence \"s\"",
+        ),
+        ("DELETE FROM s", "cannot change sequence \"s\""),
+        (
+            "MERGE INTO mv USING t ON true WHEN MATCHED THEN DELETE",
+            "cannot execute MERGE on relation \"mv\"",
+        ),
+        (
+            "MERGE INTO s USING t ON true WHEN MATCHED THEN DELETE",
+            "cannot execute MERGE on relation \"s\"",
+        ),
+        ("INSERT INTO ct VALUES (1)", "cannot open relation \"ct\""),
+        ("INSERT INTO ti VALUES (1)", "cannot open relation \"ti\""),
+        ("DELETE FROM ti", "cannot open relation \"ti\""),
+        ("SELECT * FROM ti", "cannot open relation \"ti\""),
+        ("SELECT * FROM ct", "cannot open relation \"ct\""),
+    ] {
+        let err = assert_prefix(&db, sql, message);
+        assert!(
+            matches!(
+                err,
+                AnalyzeError::WrongObjectType(_) | AnalyzeError::FeatureNotSupported(_)
+            ),
+            "{sql}: {err:?}"
+        );
+    }
+}

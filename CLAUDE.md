@@ -125,6 +125,13 @@ go through a `pgmsg` constructor that picks the variant carrying the right
 code; multi-code buckets (`Invalid`, `InvalidLiteral`, `TypeMismatch`)
 return `None` and are compared on wording only.
 
+**Errors that every execution raises.** A query PG prepares but can never
+execute successfully (e.g. `INSERT INTO` a materialized view: PREPARE
+succeeds, `CheckValidResultRel` fails every execution, whatever the rows)
+is rejected at compile time with the error the execution raises. That is
+stricter than PREPARE, and correct: the oracle's execute fallback runs such
+a query and compares against the runtime error.
+
 When a query has **multiple simultaneous errors**, we deliberately do **not**
 require the analyzer to pick the *same* error PG reports first. PG's
 error-reporting order follows its own parse/transform sequence (it resolves an

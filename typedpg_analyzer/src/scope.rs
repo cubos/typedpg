@@ -269,6 +269,21 @@ pub(crate) fn with_rule_pseudo_relations<R>(
     out
 }
 
+/// parserOpenTable → table_open (validate_relation_kind): an index or a
+/// composite type has no rows to read or write.
+pub(crate) fn check_relation_opens(class: &crate::pg_catalog::PgClass) -> Result<(), AnalyzeError> {
+    match class.relkind {
+        crate::pg_catalog::RelKind::Index
+        | crate::pg_catalog::RelKind::PartitionedIndex
+        | crate::pg_catalog::RelKind::CompositeType => Err(crate::pgmsg::cannot_open_relation(
+            &class.relname,
+            class.relkind,
+        )
+        .finalize_implicit()),
+        _ => Ok(()),
+    }
+}
+
 impl Default for Scope {
     fn default() -> Self {
         Scope {
@@ -362,6 +377,8 @@ impl Scope {
 
     /// Add a table from the catalog.
     ///
+    /// Only relations with rows open (see [`check_relation_opens`]).
+    ///
     /// `span` covers the relation reference in the original SQL — usually
     /// produced by `SourceSpan::from_node_qname(RangeVar.location)`. Pass
     /// `None` when no AST location is available; the resulting
@@ -379,6 +396,7 @@ impl Scope {
         let table = snapshot
             .resolve_table(schema, name)
             .ok_or_else(|| undefined_table_error(snapshot, schema, name, span))?;
+        check_relation_opens(table)?;
         let table_oid = table.oid;
         let nspname = snapshot
             .namespace_name(table.relnamespace)
