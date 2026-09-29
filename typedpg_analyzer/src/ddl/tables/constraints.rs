@@ -397,6 +397,9 @@ fn emit_constraint_with_backing_index(
     deferrable: bool,
     include: Vec<i16>,
 ) -> Result<PgConstraintOid, DdlError> {
+    if contype == ConType::PrimaryKey {
+        check_no_primary_key(interp, relid)?;
+    }
     if matches!(contype, ConType::PrimaryKey | ConType::Unique) {
         let label = if contype == ConType::PrimaryKey {
             "PRIMARY KEY"
@@ -461,6 +464,21 @@ fn emit_constraint_with_backing_index(
         super::partidx::propagate_new_index(interp, relid, indexrelid)?;
     }
     Ok(oid)
+}
+
+/// index_check_primary_key (index.c): a table has at most one primary key.
+fn check_no_primary_key(interp: &PgCatalog, relid: PgClassOid) -> Result<(), DdlError> {
+    if interp
+        .pg_index
+        .values()
+        .any(|i| i.indrelid == relid && i.indisprimary)
+    {
+        return Err(DdlError::Parse(format!(
+            "multiple primary keys for table \"{}\" are not allowed",
+            relname_of(interp, relid)
+        )));
+    }
+    Ok(())
 }
 
 /// An index's key columns, without its INCLUDE columns.
@@ -1421,6 +1439,9 @@ fn add_index_constraint(
         )));
     }
     let is_primary = c.contype == ConstrType::ConstrPrimary as i32;
+    if is_primary {
+        check_no_primary_key(interp, relid)?;
+    }
     let conname = if c.conname.is_empty() {
         c.indexname.clone()
     } else {

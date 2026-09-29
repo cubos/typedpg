@@ -4240,3 +4240,41 @@ fn index_include_columns_are_modeled() {
         .unwrap();
     assert!(!b.attnotnull);
 }
+
+#[test]
+fn a_table_has_at_most_one_primary_key() {
+    // PG 18 index_check_primary_key, reached by every PRIMARY KEY added
+    // after the table exists (or copied by LIKE INCLUDING INDEXES).
+    let setup = "CREATE TABLE k (a int PRIMARY KEY, b int NOT NULL);
+                 CREATE UNIQUE INDEX kb ON k (b);
+                 CREATE TABLE m (a int, b int);";
+    for (stmt, table) in [
+        ("ALTER TABLE k ADD PRIMARY KEY (b);", "k"),
+        ("ALTER TABLE k ADD PRIMARY KEY USING INDEX kb;", "k"),
+        (
+            "ALTER TABLE m ADD PRIMARY KEY (a), ADD PRIMARY KEY (b);",
+            "m",
+        ),
+        (
+            "CREATE TABLE l (LIKE k INCLUDING INDEXES, PRIMARY KEY (b));",
+            "l",
+        ),
+        (
+            "CREATE TABLE l2 (LIKE k INCLUDING INDEXES); ALTER TABLE l2 ADD PRIMARY KEY (b);",
+            "l2",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        let msg = format!("multiple primary keys for table \"{table}\" are not allowed");
+        assert!(err.to_string().starts_with(&msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "ALTER TABLE m ADD PRIMARY KEY (a);
+             ALTER TABLE k DROP CONSTRAINT k_pkey;
+             ALTER TABLE k ADD PRIMARY KEY USING INDEX kb;",
+        ),
+    ]);
+}
