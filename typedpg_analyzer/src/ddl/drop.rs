@@ -81,6 +81,9 @@ pub fn drop_objects(interp: &mut PgCatalog, stmt: &DropStmt) -> Result<(), DdlEr
             | ObjectType::ObjectTstemplate => {
                 super::text_search::drop(interp, obj_type, obj_node, stmt.missing_ok)?;
             }
+            ObjectType::ObjectConversion => {
+                super::conversions::drop_conversion(interp, obj_node, stmt.missing_ok)?;
+            }
             ObjectType::ObjectLanguage => {
                 super::languages::drop_language(interp, obj_node, stmt.missing_ok)?;
             }

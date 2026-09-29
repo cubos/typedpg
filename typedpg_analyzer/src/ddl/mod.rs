@@ -9,6 +9,7 @@ pub mod aggregates;
 pub mod alter;
 pub mod collations;
 mod comment;
+pub(crate) mod conversions;
 mod defaults;
 mod dml;
 pub mod drop;
@@ -236,6 +237,7 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         node::Node::AlterPolicyStmt(s) => policies::alter_policy(db, s),
         node::Node::RuleStmt(s) => rules::create_rule(db, s),
         node::Node::CreateAmStmt(s) => opclass::create_am(db, s),
+        node::Node::CreateConversionStmt(s) => conversions::create_conversion(db, s),
         node::Node::CreatePlangStmt(s) => languages::create_language(db, s),
         node::Node::CreateTransformStmt(s) => languages::create_transform(db, s),
         node::Node::AlterTsconfigurationStmt(s) => text_search::alter_configuration(db, s),
@@ -308,7 +310,6 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         | node::Node::CreateTableSpaceStmt(_)
         | node::Node::DropTableSpaceStmt(_)
         | node::Node::AlterTableSpaceOptionsStmt(_)
-        | node::Node::CreateConversionStmt(_)
         | node::Node::AlterCollationStmt(_)
         | node::Node::AlterObjectDependsStmt(_) => Ok(()),
         node::Node::AlterTypeStmt(s) => types::alter_type(db, s),

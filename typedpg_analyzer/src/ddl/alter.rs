@@ -43,6 +43,7 @@ pub fn rename(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlError>
         ObjectType::ObjectFdw => crate::ddl::fdw::rename_foreign_object(interp, true, stmt),
         ObjectType::ObjectPublication => crate::ddl::publications::rename_publication(interp, stmt),
         ObjectType::ObjectLanguage => crate::ddl::languages::rename_language(interp, stmt),
+        ObjectType::ObjectConversion => crate::ddl::conversions::rename_conversion(interp, stmt),
         ObjectType::ObjectEventTrigger => {
             crate::ddl::event_triggers::rename_event_trigger(interp, stmt)
         }

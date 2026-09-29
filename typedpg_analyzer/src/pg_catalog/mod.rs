@@ -283,6 +283,8 @@ pub struct PgCatalog {
     /// renamed away.
     pub(crate) languages: Vec<String>,
     pub(crate) dropped_languages: Vec<String>,
+    /// Encoding conversions created by migrations.
+    pub(crate) conversions: Vec<(String, PgNamespaceOid)>,
     /// Event triggers and the function each executes.
     pub(crate) event_triggers: Vec<(String, crate::oid::PgProcOid)>,
     /// Enum labels added in the current transaction to a type created
@@ -570,6 +572,7 @@ impl PgCatalog {
             on_commit_drop: Vec::new(),
             languages: Vec::new(),
             dropped_languages: Vec::new(),
+            conversions: Vec::new(),
             uncommitted_enum_labels: Default::default(),
             enums_created_in_transaction: Default::default(),
             partition_specs: HashMap::new(),

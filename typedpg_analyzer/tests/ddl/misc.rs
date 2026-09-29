@@ -3876,3 +3876,39 @@ fn procedure_and_function_result_types() {
     assert_eq!(rettype("p2"), "record");
     assert_eq!(rettype("f1"), "int4");
 }
+
+#[test]
+fn conversions_are_validated_and_tracked() {
+    // PG 18 CreateConversionCommand / get_conversion_oid.
+    let setup = "CREATE CONVERSION cv FOR 'LATIN1' TO 'UTF8' FROM iso8859_1_to_utf8;";
+    for (stmt, msg) in [
+        (
+            "CREATE CONVERSION cv FOR 'LATIN1' TO 'UTF8' FROM iso8859_1_to_utf8;",
+            "conversion \"cv\" already exists",
+        ),
+        (
+            "CREATE CONVERSION cv2 FOR 'LATIN1' TO 'UTF8' FROM nosuch;",
+            "function nosuch(integer, integer, cstring, internal, integer, boolean) does not exist",
+        ),
+        (
+            "DROP CONVERSION nosuch;",
+            "conversion \"nosuch\" does not exist",
+        ),
+        (
+            "ALTER CONVERSION nosuch RENAME TO x;",
+            "conversion \"nosuch\" does not exist",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "ALTER CONVERSION cv RENAME TO cv2;
+             DROP CONVERSION cv2;
+             DROP CONVERSION IF EXISTS nosuch;",
+        ),
+    ]);
+}
