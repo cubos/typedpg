@@ -118,6 +118,25 @@ fn read_ident(chars: &[char], start: usize) -> &[char] {
 /// assert_eq!(output.params[1].name, "name");
 /// ```
 pub(crate) fn lex(sql: &str) -> Result<LexOutput, LexError> {
+    // Native `$N` placeholders keep their numbers, so named parameters are
+    // numbered after the highest one: lex once to find it, and again with
+    // that base when both kinds are present.
+    let (out, max_native) = lex_with_base(sql, 0)?;
+    let only_native = out.params.iter().all(|p| p.name.parse::<usize>().is_ok());
+    if max_native == 0 || only_native {
+        return Ok(out);
+    }
+    Ok(lex_with_base(sql, max_native)?.0)
+}
+
+/// Highest native placeholder number PG accepts (`MaxAllocSize` bounds the
+/// parameter array; PG's wire protocol caps a statement at 65535).
+const MAX_NATIVE_PARAM: usize = 65535;
+
+/// [`lex`] with named parameters numbered from `base + 1`. Native `$N`
+/// placeholders are kept as written and fill param slots `1..=N` (named
+/// after their number). Returns the output and the highest native number.
+fn lex_with_base(sql: &str, base: usize) -> Result<(LexOutput, usize), LexError> {
     let chars: Vec<char> = sql.chars().collect();
     let len = chars.len();
     let mut state = LexState::Normal;
@@ -128,6 +147,15 @@ pub(crate) fn lex(sql: &str) -> Result<LexOutput, LexError> {
     // Map from param name to its 1-based positional index
     let mut param_indices: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
+    let mut max_native = 0usize;
+    // Slots `1..=base` belong to native placeholders.
+    for n in 1..=base {
+        params.push(Param {
+            name: n.to_string(),
+            nullable: None,
+            sql_offsets: Vec::new(),
+        });
+    }
     let mut i = 0;
     // Track byte position incrementally (avoids a separate Vec<usize> allocation).
     let char_byte_lens: Vec<u8> = sql.chars().map(|c| c.len_utf8() as u8).collect();
@@ -279,7 +307,7 @@ pub(crate) fn lex(sql: &str) -> Result<LexOutput, LexError> {
                             let next_idx = if let Some(&idx) = param_indices.get(&ident) {
                                 idx
                             } else {
-                                let idx = param_indices.len() + 1;
+                                let idx = base + param_indices.len() + 1;
                                 param_indices.insert(ident.clone(), idx);
                                 params.push(Param {
                                     name: ident,
@@ -303,8 +331,39 @@ pub(crate) fn lex(sql: &str) -> Result<LexOutput, LexError> {
                             params[next_idx - 1].sql_offsets.push(out.len());
                             i = consume_to;
                         }
+                    } else if i + 1 < len && chars[i + 1].is_ascii_digit() {
+                        // Native PG placeholder `$N`: kept as written; it is
+                        // parameter N like any other.
+                        let mut end = i + 1;
+                        while end < len && chars[end].is_ascii_digit() {
+                            end += 1;
+                        }
+                        let digits: String = chars[i + 1..end].iter().collect();
+                        out.push('$');
+                        out.push_str(&digits);
+                        match digits.parse::<usize>() {
+                            Ok(n) if (1..=MAX_NATIVE_PARAM).contains(&n) => {
+                                max_native = max_native.max(n);
+                                // In the first pass (base 0) the slots are
+                                // only created when no named param exists.
+                                while params.len() < n && param_indices.is_empty() {
+                                    params.push(Param {
+                                        name: (params.len() + 1).to_string(),
+                                        nullable: None,
+                                        sql_offsets: Vec::new(),
+                                    });
+                                }
+                                if let Some(p) = params.get_mut(n - 1)
+                                    && p.name == n.to_string()
+                                {
+                                    p.sql_offsets.push(out.len());
+                                }
+                            }
+                            _ => {}
+                        }
+                        i = end;
                     } else {
-                        // Literal $ (e.g., $1 native PG placeholder)
+                        // Literal `$`.
                         out.push('$');
                         i += 1;
                     }
@@ -460,12 +519,15 @@ pub(crate) fn lex(sql: &str) -> Result<LexOutput, LexError> {
         }
     }
 
-    Ok(LexOutput {
-        sql: out,
-        params,
-        spreads,
-        rewrites,
-    })
+    Ok((
+        LexOutput {
+            sql: out,
+            params,
+            spreads,
+            rewrites,
+        },
+        max_native,
+    ))
 }
 
 #[cfg(test)]
@@ -619,7 +681,16 @@ mod tests {
     fn native_pg_placeholder_preserved() {
         let out = lex("SELECT * FROM t WHERE id = $1 AND name = $2").unwrap();
         assert_eq!(out.sql, "SELECT * FROM t WHERE id = $1 AND name = $2");
-        assert!(out.params.is_empty());
+        let names: Vec<&str> = out.params.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["1", "2"]);
+    }
+
+    #[test]
+    fn named_params_are_numbered_after_native_ones() {
+        let out = lex("SELECT $name, $2, $name, $other").unwrap();
+        assert_eq!(out.sql, "SELECT $3, $2, $3, $4");
+        let names: Vec<&str> = out.params.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["1", "2", "name", "other"]);
     }
 
     #[test]

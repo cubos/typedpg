@@ -296,6 +296,23 @@ pub fn expand(input: QueryInput) -> Result<proc_macro2::TokenStream, syn::Error>
         .analyze(&sql_str)
         .map_err(|e| syn::Error::new(input.sql.span(), e.to_string()))?;
 
+    // A native `$1` placeholder is a valid PG parameter, but it has no name
+    // an argument could bind to.
+    if let Some(p) = analyzed
+        .params
+        .iter()
+        .find(|p| p.name.starts_with(|c: char| c.is_ascii_digit()))
+    {
+        return Err(syn::Error::new(
+            input.sql.span(),
+            format!(
+                "positional placeholder `${}` is not supported in sql!: name the parameter \
+                 (e.g. `$id`) so it can be bound",
+                p.name
+            ),
+        ));
+    }
+
     // 4. Validate that all assignments match SQL params/spreads.
     for assignment in &input.assignments {
         if !analyzed.params.iter().any(|p| p.name == assignment.name)

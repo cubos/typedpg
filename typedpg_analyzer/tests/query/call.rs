@@ -103,3 +103,18 @@ fn call_resolves_like_a_function_call() {
 
 /// Native positional placeholders (`$1`) are PG parameters too.
 #[test]
+fn call_with_native_positional_parameter() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE PROCEDURE p_io1(INOUT a int) LANGUAGE plpgsql AS 'begin end';")
+        .unwrap();
+    let s = db.analyze("CALL p_io1($1)").unwrap();
+    assert_cols(&s, vec![cn("a", int4())]);
+    assert_params(&s, vec![p(int4())]);
+    let s = db.analyze("SELECT $1::int + $x AS v").unwrap();
+    assert_params(&s, vec![p(int4()), p(int4())]);
+    assert_err_prefix!(
+        db.analyze("SELECT $2::int"),
+        AnalyzeError::IndeterminateType(_),
+        "could not determine data type of parameter $1"
+    );
+}

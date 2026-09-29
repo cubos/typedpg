@@ -209,11 +209,13 @@ impl ParamCollector {
             .collect();
         params.sort_by_key(|(num, _, _)| *num);
 
-        // Verify parameter numbers are contiguous starting from 1.
+        // Parameter numbers must be contiguous from 1: a native `$2` with no
+        // `$1` leaves `$1` unused, and PG cannot type an unused parameter
+        // (42P18).
         for (i, (num, _, _)) in params.iter().enumerate() {
             if *num != (i as i32 + 1) {
-                return Err(AnalyzeError::Unsupported(format!(
-                    "parameter gap: expected ${} but next is ${num}",
+                return Err(AnalyzeError::IndeterminateType(format!(
+                    "could not determine data type of parameter ${}",
                     i + 1
                 )));
             }
