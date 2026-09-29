@@ -923,6 +923,35 @@ pub(crate) fn check_drop_concurrently(
     Ok(())
 }
 
+/// RangeVarCallbackForAlterRelation (tablecmds.c): ALTER TABLE reaches most
+/// relations, but ALTER SEQUENCE / VIEW / MATERIALIZED VIEW / FOREIGN TABLE
+/// / INDEX must name a relation of that kind (42809).
+pub(crate) fn check_alter_relation_kind(
+    objtype: i32,
+    relkind: Option<RelKind>,
+    relname: &str,
+) -> Result<(), DdlError> {
+    use typedpg_pg_query::protobuf::ObjectType;
+    let Some(relkind) = relkind else {
+        return Ok(());
+    };
+    let expected = match ObjectType::try_from(objtype) {
+        Ok(ObjectType::ObjectSequence) if relkind != RelKind::Sequence => "a sequence",
+        Ok(ObjectType::ObjectView) if relkind != RelKind::View => "a view",
+        Ok(ObjectType::ObjectMatview) if relkind != RelKind::MaterializedView => {
+            "a materialized view"
+        }
+        Ok(ObjectType::ObjectForeignTable) if relkind != RelKind::ForeignTable => "a foreign table",
+        Ok(ObjectType::ObjectIndex)
+            if !matches!(relkind, RelKind::Index | RelKind::PartitionedIndex) =>
+        {
+            "an index"
+        }
+        _ => return Ok(()),
+    };
+    Err(DdlError::Parse(format!("\"{relname}\" is not {expected}")))
+}
+
 /// The (negative) attnum of system column `name`.
 fn system_attnum(name: &str) -> Option<i16> {
     crate::pg_catalog::SYSTEM_COLUMNS

@@ -1060,6 +1060,44 @@ fn concurrent_index_builds_and_drops_follow_pg_restrictions() {
 }
 
 #[test]
+fn alter_index_and_friends_need_a_relation_of_their_kind() {
+    // RangeVarCallbackForAlterRelation (42809).
+    assert_rejected(
+        "CREATE TABLE t (a int); CREATE VIEW v AS SELECT 1 AS a;",
+        &[
+            (
+                "ALTER INDEX t SET (fillfactor = 50);",
+                "\"t\" is not an index",
+            ),
+            (
+                "ALTER INDEX v ALTER COLUMN a SET STATISTICS 5;",
+                "\"v\" is not an index",
+            ),
+            ("ALTER VIEW t OWNER TO CURRENT_USER;", "\"t\" is not a view"),
+            (
+                "ALTER MATERIALIZED VIEW t OWNER TO CURRENT_USER;",
+                "\"t\" is not a materialized view",
+            ),
+            (
+                "ALTER FOREIGN TABLE t OWNER TO CURRENT_USER;",
+                "\"t\" is not a foreign table",
+            ),
+            (
+                "ALTER SEQUENCE t OWNER TO CURRENT_USER;",
+                "\"t\" is not a sequence",
+            ),
+        ],
+    );
+    assert_accepted(
+        "CREATE TABLE t (a int); CREATE INDEX i ON t (a);",
+        &[
+            "ALTER INDEX i SET (fillfactor = 50);",
+            "ALTER INDEX t RENAME TO t2;",
+        ],
+    );
+}
+
+#[test]
 fn an_index_cannot_use_a_table_access_method() {
     // GetIndexAmRoutine: heap_tableam_handler (oid 3) returns no
     // IndexAmRoutine.

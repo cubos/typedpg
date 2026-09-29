@@ -842,6 +842,7 @@ pub fn alter_table(interp: &mut PgCatalog, stmt: &AlterTableStmt) -> Result<(), 
     // RangeVarCallbackForAlterRelation: ALTER TABLE doesn't reach a
     // composite type, and ALTER TYPE only reaches one.
     let relkind = interp.pg_class.get(&class_oid).map(|c| c.relkind);
+    super::indexes::check_alter_relation_kind(stmt.objtype, relkind, &rv.relname)?;
     let via_alter_type = typedpg_pg_query::protobuf::ObjectType::try_from(stmt.objtype)
         == Ok(typedpg_pg_query::protobuf::ObjectType::ObjectType);
     if !via_alter_type && relkind == Some(RelKind::CompositeType) {
