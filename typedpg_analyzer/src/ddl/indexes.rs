@@ -748,6 +748,118 @@ fn check_exclusion_covers_partition_key(
     Ok(())
 }
 
+/// ATPostAlterTypeCleanup (tablecmds.c): after ALTER COLUMN TYPE, every
+/// index over the column is rebuilt from its definition as
+/// pg_get_indexdef prints it — an operator class only when it isn't the
+/// old type's default, a COLLATE only when it isn't the column's — so its
+/// operator classes (and exclusion operators) are resolved again for the
+/// new type. `old_type` / `old_collation` are the column's before the
+/// change, whose new type is already recorded.
+pub(crate) fn rebuild_indexes_for_column_type(
+    db: &mut PgCatalog,
+    relid: PgClassOid,
+    attnum: i16,
+    old_type: crate::oid::PgTypeOid,
+    old_collation: Option<crate::oid::PgCollationOid>,
+) -> Result<(), DdlError> {
+    let Some(attr) = db
+        .attributes_of(relid)
+        .iter()
+        .find(|a| a.attnum == attnum)
+        .cloned()
+    else {
+        return Ok(());
+    };
+    let mut indexes: Vec<PgIndex> = db
+        .pg_index
+        .values()
+        .filter(|i| i.indrelid == relid)
+        .cloned()
+        .collect();
+    indexes.sort_by_key(|i| i.indexrelid);
+    for index in indexes {
+        let Some(mut keys) = db.index_keys.get(&index.indexrelid).cloned() else {
+            continue;
+        };
+        let am = db
+            .index_access_methods
+            .get(&index.indexrelid)
+            .cloned()
+            .unwrap_or_else(|| "btree".to_owned());
+        let mut exprs = index.indexprs.iter();
+        let mut changed = false;
+        for (i, key) in keys.columns.iter_mut().enumerate() {
+            let Some(&k) = index.indkey.get(i) else {
+                break;
+            };
+            let (new_type, prior_type) = if k == attnum {
+                (attr.atttypid, old_type)
+            } else if k == 0 {
+                // An expression: re-analyzed when it reads the column.
+                let Some(expr) = exprs.next().and_then(|e| {
+                    <typedpg_pg_query::protobuf::Node as Message>::decode(e.ast.as_slice()).ok()
+                }) else {
+                    continue;
+                };
+                let reads = expr.node.as_ref().is_some_and(|inner| {
+                    inner.nodes().into_iter().any(|(n, ..)| {
+                        matches!(n, typedpg_pg_query::NodeRef::ColumnRef(cr)
+                            if cr.fields.last().and_then(super::util::node_string)
+                                == Some(attr.attname.as_str()))
+                    })
+                });
+                let Some(prior) = key.typ.filter(|_| reads) else {
+                    continue;
+                };
+                match super::volatile::infer_over_relation(db, relid, &expr, None) {
+                    Some(Ok(t)) => (t.type_oid, prior),
+                    Some(Err(e)) => return Err(DdlError::UnsupportedDdl(e.to_string())),
+                    None => continue,
+                }
+            } else {
+                continue;
+            };
+            // pg_get_indexdef's COLLATE: an explicit one must suit the new
+            // type.
+            let column_collation = if k == attnum { old_collation } else { None };
+            if key.collation.is_some() && key.collation != column_collation {
+                let collatable = db
+                    .pg_type
+                    .get(&db.unwrap_domain(new_type))
+                    .is_some_and(|t| t.typcollation.is_some());
+                if !collatable {
+                    return Err(DdlError::Parse(format!(
+                        "collations are not supported by type {}",
+                        super::util::format_type_for_message(db, new_type)
+                    )));
+                }
+            } else if k == attnum {
+                key.collation = attr.attcollation;
+            }
+            let explicit = key.opclass.clone().filter(|class| {
+                super::opclass::default_opclass_id(db, prior_type, &am).as_ref() != Some(class)
+            });
+            let opclass = match explicit.as_ref().and_then(|c| c.get(db)) {
+                Some(class) => {
+                    super::opclass::check_opclass_accepts(db, class, new_type)?;
+                    explicit
+                }
+                None => super::opclass::resolve_index_opclass(db, &[], new_type, &am)?,
+            };
+            if let Some(names) = key.exclusion_op.as_deref() {
+                check_exclusion_operator(db, names, new_type, opclass.as_ref())?;
+            }
+            key.typ = Some(new_type);
+            key.opclass = opclass;
+            changed = true;
+        }
+        if changed {
+            db.index_keys.insert(index.indexrelid, keys);
+        }
+    }
+    Ok(())
+}
+
 /// The (negative) attnum of system column `name`.
 fn system_attnum(name: &str) -> Option<i16> {
     crate::pg_catalog::SYSTEM_COLUMNS

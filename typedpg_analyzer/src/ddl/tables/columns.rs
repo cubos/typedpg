@@ -1362,8 +1362,13 @@ pub(crate) fn alter_column_type(
         col.atttypmod = new_typmod;
         col.attcollation = new_collation;
     }
-
-    let _ = old_type_oid;
+    crate::ddl::indexes::rebuild_indexes_for_column_type(
+        interp,
+        relid,
+        attr.attnum,
+        old_type_oid,
+        attr.attcollation,
+    )?;
     Ok(())
 }
 

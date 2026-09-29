@@ -995,3 +995,68 @@ fn an_index_cannot_use_a_table_access_method() {
         ],
     );
 }
+
+#[test]
+fn alter_column_type_resolves_index_operator_classes_again() {
+    // ATPostAlterTypeCleanup rebuilds each index from pg_get_indexdef,
+    // which names an operator class only when it isn't the old type's
+    // default.
+    let setup = "CREATE TABLE t (a varchar, b int, c int, d int, e text, f text, g int, h int);
+                 CREATE INDEX ON t (a); CREATE INDEX ON t (b int4_ops);
+                 CREATE INDEX ON t (c) INCLUDE (d); CREATE INDEX ON t ((h + 1));
+                 CREATE INDEX ON t ((COALESCE(g, g)));
+                 CREATE INDEX ON t (e text_pattern_ops);
+                 CREATE INDEX ON t (f COLLATE \"C\");
+                 CREATE TABLE u (a int UNIQUE, b int, EXCLUDE USING hash (b WITH =));";
+    let no_btree = "data type point has no default operator class for access method \"btree\"";
+    assert_rejected(
+        setup,
+        &[
+            (
+                "ALTER TABLE t ALTER b TYPE point USING point(b, b);",
+                no_btree,
+            ),
+            (
+                "ALTER TABLE t ALTER c TYPE point USING point(c, c);",
+                no_btree,
+            ),
+            (
+                "ALTER TABLE t ALTER g TYPE point USING point(g, g);",
+                no_btree,
+            ),
+            (
+                "ALTER TABLE t ALTER h TYPE point USING point(h, h);",
+                "operator does not exist: point + integer",
+            ),
+            (
+                "ALTER TABLE t ALTER e TYPE int USING 1;",
+                "operator class \"text_pattern_ops\" does not accept data type integer",
+            ),
+            (
+                "ALTER TABLE t ALTER f TYPE int USING 1;",
+                "collations are not supported by type integer",
+            ),
+            (
+                "ALTER TABLE u ALTER a TYPE point USING point(a, a);",
+                no_btree,
+            ),
+            (
+                "ALTER TABLE u ALTER b TYPE point USING point(b, b);",
+                "data type point has no default operator class for access method \"hash\"",
+            ),
+        ],
+    );
+    assert_accepted(
+        setup,
+        &[
+            "ALTER TABLE t ALTER a TYPE int USING a::int;",
+            "ALTER TABLE t ALTER b TYPE bigint;",
+            "ALTER TABLE t ALTER d TYPE point USING point(d, d);",
+            "ALTER TABLE t ALTER e TYPE varchar;",
+            "ALTER TABLE u ALTER b TYPE text;",
+            "ALTER TABLE t ALTER g TYPE bigint; ALTER TABLE t ALTER h TYPE numeric;",
+            "ALTER TABLE t ALTER a TYPE int USING a::int; ALTER TABLE t ALTER a TYPE text; \
+             ALTER TABLE t ALTER e TYPE varchar; ALTER TABLE t ALTER e TYPE text;",
+        ],
+    );
+}
