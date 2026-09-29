@@ -883,6 +883,26 @@ pub(crate) fn rebuild_indexes_for_column_type(
     Ok(())
 }
 
+/// check_index_is_clusterable (cluster.c): the index's access method must
+/// support clustering (`amclusterable`: btree and GiST).
+pub(crate) fn check_am_clusterable(
+    db: &PgCatalog,
+    index: PgClassOid,
+    name: &str,
+) -> Result<(), DdlError> {
+    let am = db
+        .index_access_methods
+        .get(&index)
+        .map_or("btree", String::as_str);
+    if super::opclass::am_caps(am).is_some_and(|caps| !caps.can_cluster) {
+        return Err(DdlError::UnsupportedDdl(format!(
+            "cannot cluster on index \"{name}\" because access method does not support \
+             clustering"
+        )));
+    }
+    Ok(())
+}
+
 /// RemoveRelations (tablecmds.c): DROP INDEX CONCURRENTLY drops a single
 /// index, without CASCADE — and not a partitioned one, unless it is
 /// temporary (a temporary relation is never dropped concurrently).

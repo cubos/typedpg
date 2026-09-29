@@ -1118,6 +1118,31 @@ fn an_index_cannot_use_a_table_access_method() {
 }
 
 #[test]
+fn cluster_needs_an_access_method_that_supports_clustering() {
+    let setup = "CREATE TABLE t (a int); CREATE INDEX h ON t USING hash (a); \
+                 CREATE INDEX br ON t USING brin (a); \
+                 CREATE INDEX g ON t USING gist (point(a, a)); CREATE INDEX b ON t (a);";
+    let message = |name: &str| {
+        format!(
+            "cannot cluster on index \"{name}\" because access method does not support clustering"
+        )
+    };
+    let (h, br) = (message("h"), message("br"));
+    assert_rejected(
+        setup,
+        &[
+            ("ALTER TABLE t CLUSTER ON h;", &h),
+            ("CLUSTER t USING h;", &h),
+            ("ALTER TABLE t CLUSTER ON br;", &br),
+        ],
+    );
+    assert_accepted(
+        setup,
+        &["ALTER TABLE t CLUSTER ON g;", "CLUSTER t USING b;"],
+    );
+}
+
+#[test]
 fn alter_column_type_resolves_index_operator_classes_again() {
     // ATPostAlterTypeCleanup rebuilds each index from pg_get_indexdef,
     // which names an operator class only when it isn't the old type's

@@ -37,6 +37,7 @@ pub(crate) fn check_clusterable_index(
     name: &str,
 ) -> Result<PgClassOid, DdlError> {
     let index = table_index(interp, relid, name)?;
+    crate::ddl::indexes::check_am_clusterable(interp, index.indexrelid, name)?;
     if index.indpred.is_some() {
         return Err(DdlError::UnsupportedDdl(format!(
             "cannot cluster on partial index \"{name}\""
