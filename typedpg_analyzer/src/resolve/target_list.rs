@@ -4,6 +4,85 @@ use super::*;
 // Target list (SELECT columns)
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// One output column of the *expanded* target list.
+#[derive(Clone, Copy)]
+pub(crate) enum ExpandedTarget<'a> {
+    /// A plain select-list entry.
+    Expr(&'a protobuf::ResTarget),
+    /// A column contributed by `*` / `t.*` (`column: Some((alias, name))`)
+    /// or by `(row).*` (`None` — a field, not a range-table column);
+    /// `location` is the star expression's.
+    StarColumn {
+        column: Option<(&'a str, &'a str)>,
+        location: i32,
+    },
+}
+
+/// The shape of the *expanded* target list, one entry per output column.
+/// PG expands stars in `transformTargetList` before any clause runs, so
+/// ordinals in ORDER BY / GROUP BY / DISTINCT ON (`findTargetlistEntrySQL92`)
+/// count every column a star contributes. Types are not needed here;
+/// `(row).*` is inferred on a scratch collector so the real parameter
+/// numbering is left to [`resolve_target_list`].
+pub(crate) fn expanded_target_entries<'a>(
+    target_list: &'a [protobuf::Node],
+    scope: &'a Scope,
+    ctx: Ctx<'_>,
+    params: &ParamCollector,
+) -> Vec<ExpandedTarget<'a>> {
+    let mut out = Vec::new();
+    for target in target_list {
+        let Some(node::Node::ResTarget(rt)) = target.node.as_ref() else {
+            continue;
+        };
+        let Some(val) = &rt.val else {
+            continue;
+        };
+        match val.node.as_ref() {
+            Some(node::Node::ColumnRef(cr))
+                if cr
+                    .fields
+                    .iter()
+                    .any(|f| matches!(f.node.as_ref(), Some(node::Node::AStar(_)))) =>
+            {
+                let table_filter = cr.fields.iter().rev().find_map(|f| match f.node.as_ref()? {
+                    node::Node::String(s) => Some(s.sval.as_str()),
+                    _ => None,
+                });
+                let cols: Vec<&ScopeColumn> = match table_filter {
+                    Some(tbl) => scope
+                        .find_source(tbl)
+                        .map(|s| s.columns.iter().collect())
+                        .unwrap_or_default(),
+                    None => scope.star_columns(),
+                };
+                out.extend(cols.into_iter().map(|c| ExpandedTarget::StarColumn {
+                    column: Some((c.table_alias.as_str(), c.name.as_str())),
+                    location: cr.location,
+                }));
+                continue;
+            }
+            Some(node::Node::AIndirection(ind)) => {
+                let mut scratch = params.clone();
+                if let Some(fields) = expr::expand_indirection_star(ind, ctx, &mut scratch)
+                    .ok()
+                    .flatten()
+                {
+                    let location = crate::error::node_location(val).unwrap_or(-1);
+                    out.extend(fields.iter().map(|_| ExpandedTarget::StarColumn {
+                        column: None,
+                        location,
+                    }));
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        out.push(ExpandedTarget::Expr(rt));
+    }
+    out
+}
+
 pub(crate) fn resolve_target_list(
     target_list: &[protobuf::Node],
     ctx: Ctx<'_>,

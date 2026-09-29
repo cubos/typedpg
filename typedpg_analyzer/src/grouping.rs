@@ -19,6 +19,7 @@ use typedpg_pg_query::protobuf::{self, GroupingSetKind, node};
 use crate::error::AnalyzeError;
 use crate::expr;
 use crate::pg_catalog::{ConType, PgCatalog};
+use crate::resolve::ExpandedTarget;
 use crate::scope::Scope;
 
 /// Result of expanding a `GROUP BY` clause that contains
@@ -44,6 +45,7 @@ pub(crate) struct GroupingExpansion {
 pub(crate) fn expand_grouping_sets(
     group_clause: &[protobuf::Node],
     scope: &Scope,
+    targets: &[ExpandedTarget<'_>],
 ) -> GroupingExpansion {
     if group_clause.is_empty() {
         return GroupingExpansion::default();
@@ -54,7 +56,7 @@ pub(crate) fn expand_grouping_sets(
     let mut per_entry: Vec<Vec<HashSet<(String, String)>>> = Vec::new();
     let mut saw_grouping_set = false;
     for node in group_clause {
-        let alts = alternatives_for(node, scope, &mut saw_grouping_set);
+        let alts = alternatives_for(node, scope, targets, &mut saw_grouping_set);
         per_entry.push(alts);
     }
 
@@ -103,20 +105,22 @@ pub(crate) fn expand_grouping_sets(
 fn alternatives_for(
     node: &protobuf::Node,
     scope: &Scope,
+    targets: &[ExpandedTarget<'_>],
     saw_grouping_set: &mut bool,
 ) -> Vec<HashSet<(String, String)>> {
     match node.node.as_ref() {
         Some(node::Node::GroupingSet(gs)) => {
             *saw_grouping_set = true;
-            alternatives_for_grouping_set(gs, scope, saw_grouping_set)
+            alternatives_for_grouping_set(gs, scope, targets, saw_grouping_set)
         }
-        _ => vec![singleton_set(node, scope)],
+        _ => vec![singleton_set(node, scope, targets)],
     }
 }
 
 fn alternatives_for_grouping_set(
     gs: &protobuf::GroupingSet,
     scope: &Scope,
+    targets: &[ExpandedTarget<'_>],
     saw_grouping_set: &mut bool,
 ) -> Vec<HashSet<(String, String)>> {
     let kind = GroupingSetKind::try_from(gs.kind).unwrap_or(GroupingSetKind::Undefined);
@@ -126,14 +130,17 @@ fn alternatives_for_grouping_set(
             // `(a, b)` — a single set with the union of its members.
             let mut set = HashSet::new();
             for item in &gs.content {
-                set.extend(singleton_set(item, scope));
+                set.extend(singleton_set(item, scope, targets));
             }
             vec![set]
         }
         GroupingSetKind::GroupingSetRollup => {
             // ROLLUP(a, b, c) → [{a,b,c}, {a,b}, {a}, {}]
-            let items: Vec<HashSet<(String, String)>> =
-                gs.content.iter().map(|n| singleton_set(n, scope)).collect();
+            let items: Vec<HashSet<(String, String)>> = gs
+                .content
+                .iter()
+                .map(|n| singleton_set(n, scope, targets))
+                .collect();
             let mut alts = Vec::with_capacity(items.len() + 1);
             for cut in (0..=items.len()).rev() {
                 let mut s = HashSet::new();
@@ -146,8 +153,11 @@ fn alternatives_for_grouping_set(
         }
         GroupingSetKind::GroupingSetCube => {
             // CUBE(a, b) → powerset — 2^n sets.
-            let items: Vec<HashSet<(String, String)>> =
-                gs.content.iter().map(|n| singleton_set(n, scope)).collect();
+            let items: Vec<HashSet<(String, String)>> = gs
+                .content
+                .iter()
+                .map(|n| singleton_set(n, scope, targets))
+                .collect();
             let n = items.len();
             let mut alts = Vec::with_capacity(1usize << n.min(16));
             for mask in 0..(1u32 << n) {
@@ -167,7 +177,7 @@ fn alternatives_for_grouping_set(
             // alt = singleton) or a nested `GroupingSet`.
             let mut alts = Vec::new();
             for child in &gs.content {
-                alts.extend(alternatives_for(child, scope, saw_grouping_set));
+                alts.extend(alternatives_for(child, scope, targets, saw_grouping_set));
             }
             if alts.is_empty() {
                 vec![HashSet::new()]
@@ -179,33 +189,78 @@ fn alternatives_for_grouping_set(
     }
 }
 
-/// Resolve a node as a single column reference. Returns a singleton set
-/// `{(table_alias, column_name)}` if the node is a `ColumnRef` that scope
-/// can resolve, or an empty set otherwise (opaque expression — does not
-/// drive nullability promotion).
-fn singleton_set(node: &protobuf::Node, scope: &Scope) -> HashSet<(String, String)> {
-    let mut out = HashSet::new();
-    let Some(node::Node::ColumnRef(cr)) = node.node.as_ref() else {
-        return out;
-    };
-    let parts: Vec<&str> = cr
-        .fields
-        .iter()
-        .filter_map(|f| match f.node.as_ref()? {
-            node::Node::String(s) => Some(s.sval.as_str()),
-            _ => None,
-        })
-        .collect();
-    let (table, column) = match parts.as_slice() {
-        [col] => (None, *col),
-        [tbl, col] => (Some(*tbl), *col),
-        [_schema, tbl, col] => (Some(*tbl), *col),
-        _ => return out,
-    };
-    if let Ok(col) = scope.resolve_column(table, column, None) {
-        out.insert((col.table_alias.clone(), col.name.clone()));
+/// Resolve a GROUP BY leaf as a single column. Returns a singleton set
+/// `{(table_alias, column_name)}` when the leaf denotes a column — directly,
+/// or through a projection ordinal / output alias ([`group_leaf`]) — or an
+/// empty set otherwise (opaque expression — does not drive nullability
+/// promotion).
+fn singleton_set(
+    node: &protobuf::Node,
+    scope: &Scope,
+    targets: &[ExpandedTarget<'_>],
+) -> HashSet<(String, String)> {
+    match group_leaf(node, scope, targets) {
+        GroupLeaf::Column(key) => HashSet::from([key]),
+        GroupLeaf::Other | GroupLeaf::Unresolved => HashSet::new(),
     }
-    out
+}
+
+/// What a GROUP BY leaf denotes.
+enum GroupLeaf {
+    /// A plain column `(table_alias, column_name)`.
+    Column((String, String)),
+    /// Some other expression (or an out-of-range ordinal, reported elsewhere).
+    Other,
+    /// A column reference that neither resolves nor names an output column.
+    Unresolved,
+}
+
+/// PG's `findTargetlistEntrySQL92` for a GROUP BY leaf: an integer constant
+/// is a position in the (star-expanded) target list, a bare name is an
+/// input column first and an output-column alias otherwise, anything else is
+/// an expression of its own.
+fn group_leaf(node: &protobuf::Node, scope: &Scope, targets: &[ExpandedTarget<'_>]) -> GroupLeaf {
+    let target_column = |rt: &protobuf::ResTarget| {
+        rt.val
+            .as_deref()
+            .and_then(|v| resolve_group_column(v, scope))
+            .map_or(GroupLeaf::Other, GroupLeaf::Column)
+    };
+    match node.node.as_ref() {
+        Some(node::Node::AConst(ac)) => match &ac.val {
+            Some(protobuf::a_const::Val::Ival(i)) => {
+                match targets.get((i.ival as usize).wrapping_sub(1)) {
+                    Some(ExpandedTarget::Expr(rt)) => target_column(rt),
+                    Some(ExpandedTarget::StarColumn {
+                        column: Some((alias, col)),
+                        ..
+                    }) => GroupLeaf::Column((alias.to_string(), col.to_string())),
+                    _ => GroupLeaf::Other,
+                }
+            }
+            _ => GroupLeaf::Other,
+        },
+        Some(node::Node::ColumnRef(cr)) => {
+            if let Some(key) = resolve_group_column(node, scope) {
+                return GroupLeaf::Column(key);
+            }
+            let alias = match cr.fields.as_slice() {
+                [f] => match f.node.as_ref() {
+                    Some(node::Node::String(s)) => Some(s.sval.as_str()),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let target = alias.and_then(|a| {
+                targets.iter().find_map(|t| match t {
+                    ExpandedTarget::Expr(rt) if rt.name == a => Some(*rt),
+                    _ => None,
+                })
+            });
+            target.map_or(GroupLeaf::Unresolved, target_column)
+        }
+        _ => GroupLeaf::Other,
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -230,11 +285,12 @@ fn singleton_set(node: &protobuf::Node, scope: &Scope) -> HashSet<(String, Strin
 pub(crate) fn check_grouping(
     sel: &protobuf::SelectStmt,
     scope: &Scope,
+    targets: &[ExpandedTarget<'_>],
     snapshot: &PgCatalog,
 ) -> Result<(), AnalyzeError> {
     use std::collections::HashSet;
 
-    check_grouping_func_args(sel, scope)?;
+    check_grouping_func_args(sel, scope, targets)?;
 
     // Grouped query? (A GROUPING(…) call makes it one, like an aggregate.)
     let mut grouped = !sel.group_clause.is_empty() || sel.having_clause.is_some();
@@ -257,7 +313,7 @@ pub(crate) fn check_grouping(
     // any non-plain-column leaf.
     let mut grouped_cols: HashSet<(String, String)> = HashSet::new();
     for g in &sel.group_clause {
-        if !collect_grouped_columns(g, scope, &mut grouped_cols) {
+        if !collect_grouped_columns(g, scope, targets, &mut grouped_cols) {
             return Ok(());
         }
     }
@@ -298,15 +354,32 @@ pub(crate) fn check_grouping(
     }
 
     // The first ungrouped column in the projection / HAVING / ORDER BY is the
-    // error PG reports.
+    // error PG reports. The projection is the star-expanded one: each column
+    // a `*` contributes is a plain column reference of its own.
+    let mut star_ungrouped = None;
     let mut nodes: Vec<&protobuf::Node> = Vec::new();
-    for t in &sel.target_list {
-        if let Some(node::Node::ResTarget(rt)) = t.node.as_ref()
-            && let Some(val) = rt.val.as_deref()
-        {
-            nodes.push(val);
+    for t in targets {
+        match *t {
+            ExpandedTarget::Expr(rt) => nodes.extend(rt.val.as_deref()),
+            ExpandedTarget::StarColumn {
+                column: Some((alias, col)),
+                location,
+            } => {
+                let key = (alias.to_string(), col.to_string());
+                if local_cols.contains(&key)
+                    && !grouped_cols.contains(&key)
+                    && !fully_grouped.contains(alias)
+                {
+                    star_ungrouped = Some((key.0, key.1, location));
+                    break;
+                }
+            }
+            ExpandedTarget::StarColumn { column: None, .. } => {}
         }
     }
+    // Only the target-list expressions before an offending star column can
+    // precede it.
+    let n_target_nodes = nodes.len();
     if let Some(having) = sel.having_clause.as_deref() {
         nodes.push(having);
     }
@@ -324,31 +397,40 @@ pub(crate) fn check_grouping(
             nodes.extend(window_def_exprs(wd));
         }
     }
-    for node in nodes {
-        if let Some((alias, col, location)) = find_ungrouped(
-            node,
-            scope,
-            snapshot,
-            &grouped_cols,
-            &local_cols,
-            &fully_grouped,
-        ) {
-            // Point the caret at the offending column reference and hint at the
-            // fix — PG reports the same message but with only a cursor position.
-            let span = crate::error::SourceSpan::from_node_qname(location);
-            return Err(crate::error::RawError::new(
-                AnalyzeError::GroupingError(format!(
-                    "column \"{alias}.{col}\" must appear in the GROUP BY clause \
-                     or be used in an aggregate function"
-                )),
-                span,
-                Some(format!(
-                    "add `{alias}.{col}` to the GROUP BY clause, or wrap it in an aggregate like max({col})"
-                )),
+    let searched = if star_ungrouped.is_some() {
+        &nodes[..n_target_nodes]
+    } else {
+        &nodes[..]
+    };
+    let ungrouped = searched
+        .iter()
+        .find_map(|node| {
+            find_ungrouped(
+                node,
+                scope,
+                snapshot,
+                &grouped_cols,
+                &local_cols,
+                &fully_grouped,
             )
-            .with_primary_label("not in GROUP BY")
-            .finalize_implicit());
-        }
+        })
+        .or(star_ungrouped);
+    if let Some((alias, col, location)) = ungrouped {
+        // Point the caret at the offending column reference and hint at the
+        // fix — PG reports the same message but with only a cursor position.
+        let span = crate::error::SourceSpan::from_node_qname(location);
+        return Err(crate::error::RawError::new(
+            AnalyzeError::GroupingError(format!(
+                "column \"{alias}.{col}\" must appear in the GROUP BY clause \
+                 or be used in an aggregate function"
+            )),
+            span,
+            Some(format!(
+                "add `{alias}.{col}` to the GROUP BY clause, or wrap it in an aggregate like max({col})"
+            )),
+        )
+        .with_primary_label("not in GROUP BY")
+        .finalize_implicit());
     }
     Ok(())
 }
@@ -371,7 +453,11 @@ pub(crate) fn check_grouping(
 /// column (directly, or via a projection ordinal / alias whose expression is
 /// that column). Other arguments are only rejected when there is no GROUP BY
 /// at all, and nothing is rejected when a GROUP BY entry can't be resolved.
-fn check_grouping_func_args(sel: &protobuf::SelectStmt, scope: &Scope) -> Result<(), AnalyzeError> {
+fn check_grouping_func_args(
+    sel: &protobuf::SelectStmt,
+    scope: &Scope,
+    targets: &[ExpandedTarget<'_>],
+) -> Result<(), AnalyzeError> {
     let mut calls: Vec<&protobuf::GroupingFunc> = Vec::new();
     for t in &sel.target_list {
         if let Some(node::Node::ResTarget(rt)) = t.node.as_ref()
@@ -398,35 +484,13 @@ fn check_grouping_func_args(sel: &protobuf::SelectStmt, scope: &Scope) -> Result
     while let Some(g) = stack.pop() {
         match g.node.as_ref() {
             Some(node::Node::GroupingSet(gs)) => stack.extend(gs.content.iter()),
-            Some(node::Node::ColumnRef(_)) => match resolve_group_column(g, scope) {
-                Some(key) => {
+            _ => match group_leaf(g, scope, targets) {
+                GroupLeaf::Column(key) => {
                     columns.insert(key);
                 }
-                None => {
-                    // Possibly an output-column alias (SQL92 rule).
-                    let target = alias_target(g, sel);
-                    match target.and_then(|t| resolve_group_column(t, scope)) {
-                        Some(key) => {
-                            columns.insert(key);
-                        }
-                        None if target.is_some() => {}
-                        None => unresolved = true,
-                    }
-                }
+                GroupLeaf::Unresolved => unresolved = true,
+                GroupLeaf::Other => {}
             },
-            Some(node::Node::AConst(ac)) => {
-                if let Some(protobuf::a_const::Val::Ival(i)) = &ac.val
-                    && let Some(node::Node::ResTarget(rt)) = sel
-                        .target_list
-                        .get((i.ival as usize).wrapping_sub(1))
-                        .and_then(|t| t.node.as_ref())
-                    && let Some(v) = &rt.val
-                    && let Some(key) = resolve_group_column(v, scope)
-                {
-                    columns.insert(key);
-                }
-            }
-            _ => {}
         }
     }
 
@@ -451,27 +515,6 @@ fn check_grouping_func_args(sel: &protobuf::SelectStmt, scope: &Scope) -> Result
         }
     }
     Ok(())
-}
-
-/// The projection expression a bare GROUP BY name refers to as an output
-/// alias, if any.
-fn alias_target<'a>(
-    g: &protobuf::Node,
-    sel: &'a protobuf::SelectStmt,
-) -> Option<&'a protobuf::Node> {
-    let Some(node::Node::ColumnRef(cr)) = g.node.as_ref() else {
-        return None;
-    };
-    let [name] = cr.fields.as_slice() else {
-        return None;
-    };
-    let Some(node::Node::String(name)) = name.node.as_ref() else {
-        return None;
-    };
-    sel.target_list.iter().find_map(|t| match t.node.as_ref() {
-        Some(node::Node::ResTarget(rt)) if rt.name == name.sval => rt.val.as_deref(),
-        _ => None,
-    })
 }
 
 /// `GROUPING(…)` calls of this query level inside `n` (not descending into
@@ -528,20 +571,21 @@ fn collect_grouping_funcs<'a>(n: &'a protobuf::Node, out: &mut Vec<&'a protobuf:
 fn collect_grouped_columns(
     node: &protobuf::Node,
     scope: &Scope,
+    targets: &[ExpandedTarget<'_>],
     out: &mut std::collections::HashSet<(String, String)>,
 ) -> bool {
     if let Some(node::Node::GroupingSet(gs)) = node.node.as_ref() {
         return gs
             .content
             .iter()
-            .all(|inner| collect_grouped_columns(inner, scope, out));
+            .all(|inner| collect_grouped_columns(inner, scope, targets, out));
     }
-    match resolve_group_column(node, scope) {
-        Some(key) => {
+    match group_leaf(node, scope, targets) {
+        GroupLeaf::Column(key) => {
             out.insert(key);
             true
         }
-        None => false,
+        GroupLeaf::Other | GroupLeaf::Unresolved => false,
     }
 }
 

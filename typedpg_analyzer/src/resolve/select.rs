@@ -170,7 +170,14 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
     // Expand `GROUPING SETS` / `ROLLUP` / `CUBE`: promote columns that
     // some grouping set omits to nullable, and remember whether any
     // grouping set is empty (drives aggregate-result nullability).
-    let expansion = grouping::expand_grouping_sets(&sel.group_clause, &scope);
+    // Ordinals index the star-expanded target list (findTargetlistEntrySQL92).
+    let targets = expanded_target_entries(
+        &sel.target_list,
+        &scope,
+        expr::Ctx::new(&scope, &null_ctx, snapshot),
+        params,
+    );
+    let expansion = grouping::expand_grouping_sets(&sel.group_clause, &scope, &targets);
     null_ctx.grouping_omitted = expansion.omitted;
     null_ctx.has_empty_grouping_set = expansion.has_empty_set;
 
@@ -218,7 +225,7 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
             expr::Ctx::new(&scope, &null_ctx, snapshot),
             params,
             &select_aliases,
-            &sel.target_list,
+            &targets,
         )?;
     }
 
@@ -242,7 +249,7 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
     // scope (PG resolution rule); suppress `UndefinedColumn` only in that
     // exact shape so typos still surface. Integer literals are *ordinals*:
     // they reference a projection position and must be in range (42P10).
-    let n_targets = sel.target_list.len();
+    let n_targets = targets.len();
     // `SELECT DISTINCT` (the plain form parses as one empty node) restricts
     // ORDER BY to expressions that appear in the select list.
     let plain_distinct =
@@ -290,6 +297,18 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
     // referenced only inside DISTINCT ON was never registered with the
     // collector and analysis died on the param-count invariant.
     for distinct_node in &sel.distinct_clause {
+        if let Some(ord) = ordinal_of(distinct_node) {
+            if ord < 1 || ord as usize > n_targets {
+                return Err(crate::pgmsg::position_not_in_select_list(
+                    "DISTINCT ON",
+                    ord,
+                    crate::error::node_location(distinct_node)
+                        .and_then(crate::error::SourceSpan::from_node_token),
+                )
+                .finalize_implicit());
+            }
+            continue;
+        }
         if distinct_node.node.is_some()
             && let Err(e) = expr::infer_expr(
                 distinct_node,
@@ -358,7 +377,7 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
         check_srf_nesting(n, snapshot)?;
     }
 
-    crate::grouping::check_grouping(sel, &scope, snapshot)?;
+    crate::grouping::check_grouping(sel, &scope, &targets, snapshot)?;
 
     check_order_by_using(
         &sel.sort_clause,
@@ -554,7 +573,7 @@ fn walk_group_clause_node(
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
     select_aliases: &std::collections::HashSet<String>,
-    targets: &[protobuf::Node],
+    targets: &[ExpandedTarget<'_>],
 ) -> Result<(), AnalyzeError> {
     let Ctx {
         scope,
@@ -589,7 +608,10 @@ fn walk_group_clause_node(
         }
         // checkTargetlistEntrySQL92: the referenced target must not
         // contain aggregates (GROUPING included).
-        return check_group_target_has_no_aggregates(targets.get(ord as usize - 1), snapshot);
+        return match targets[ord as usize - 1] {
+            ExpandedTarget::Expr(rt) => check_group_target_has_no_aggregates(Some(rt), snapshot),
+            ExpandedTarget::StarColumn { .. } => Ok(()),
+        };
     }
     // PG transforms the expression first (bottom-up resolution errors win)
     // and raises the no-aggregates placement error afterwards.
@@ -606,8 +628,9 @@ fn walk_group_clause_node(
             Some(node::Node::ColumnRef(cr)) => &cr.fields,
             _ => &[],
         });
-        let target = targets.iter().find(|t| {
-            matches!(t.node.as_ref(), Some(node::Node::ResTarget(rt)) if Some(&rt.name) == alias.first())
+        let target = targets.iter().find_map(|t| match t {
+            ExpandedTarget::Expr(rt) if Some(&rt.name) == alias.first() => Some(*rt),
+            _ => None,
         });
         return check_group_target_has_no_aggregates(target, snapshot);
     }
@@ -620,10 +643,10 @@ fn walk_group_clause_node(
 /// counts (contain_aggs_of_level) — else `aggregate functions are not
 /// allowed in GROUP BY` (42803).
 fn check_group_target_has_no_aggregates(
-    target: Option<&protobuf::Node>,
+    target: Option<&protobuf::ResTarget>,
     snapshot: &crate::pg_catalog::PgCatalog,
 ) -> Result<(), AnalyzeError> {
-    if let Some(node::Node::ResTarget(rt)) = target.and_then(|t| t.node.as_ref())
+    if let Some(rt) = target
         && let Some(val) = &rt.val
     {
         let kinds = expr::detect_func_kinds(val, snapshot);

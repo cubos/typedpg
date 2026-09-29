@@ -215,3 +215,46 @@ fn grouping_placement_rules() {
         assert_err_prefix!(db.analyze(sql), AnalyzeError::GroupingError(_), msg);
     }
 }
+
+/// GROUP BY ordinals name entries of the star-expanded select list, inside
+/// grouping sets too — a column grouped by position behaves exactly like one
+/// grouped by name (nullability promotion, GROUPING arguments).
+#[test]
+fn grouping_by_ordinal_over_expanded_targets() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE tg (n int NOT NULL, ni int);")
+        .unwrap();
+    let q = db
+        .analyze("SELECT *, GROUPING(n) AS g FROM tg GROUP BY 1, 2")
+        .unwrap();
+    assert_cols(&q, vec![c("n", int4()), cn("ni", int4()), c("g", int4())]);
+    let q = db
+        .analyze("SELECT n, sum(ni) FROM tg GROUP BY ROLLUP(1)")
+        .unwrap();
+    assert_cols(&q, vec![cn("n", int4()), cn("sum", int8())]);
+    let q = db
+        .analyze("SELECT *, count(*) FROM tg GROUP BY ROLLUP(1, 2)")
+        .unwrap();
+    assert_cols(
+        &q,
+        vec![cn("n", int4()), cn("ni", int4()), c("count", int8())],
+    );
+    let q = db
+        .analyze("SELECT n FROM tg GROUP BY GROUPING SETS ((1), ())")
+        .unwrap();
+    assert_cols(&q, vec![cn("n", int4())]);
+    let q = db
+        .analyze("SELECT n AS x, sum(ni) FROM tg GROUP BY ROLLUP(x)")
+        .unwrap();
+    assert_cols(&q, vec![cn("x", int4()), cn("sum", int8())]);
+    for sql in [
+        "SELECT *, count(*) FROM tg GROUP BY 1",
+        "SELECT n AS x, ni FROM tg GROUP BY x",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::GroupingError(_),
+            "column \"tg.ni\" must appear in the GROUP BY clause or be used in an aggregate function"
+        );
+    }
+}

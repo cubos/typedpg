@@ -418,3 +418,51 @@ fn tablesample_arguments_are_analyzed() {
         assert_err_prefix(&db, sql, msg);
     }
 }
+
+// ── Ordinals over a star-expanded select list ────────────────────────────────
+
+/// `findTargetlistEntrySQL92` counts the *expanded* target list: every
+/// column a `*` / `t.*` / `(row).*` contributes is its own position.
+#[test]
+fn ordinals_count_star_expanded_targets() {
+    let db = setup();
+    for sql in [
+        "SELECT tableoid::regclass, * FROM t ORDER BY 1, 2, 3, 4",
+        "SELECT * FROM t GROUP BY 1, 2, 3",
+        "SELECT (t).*, 1 FROM t ORDER BY 4",
+        "SELECT DISTINCT ON (3) * FROM t ORDER BY 3",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    for (sql, msg) in [
+        (
+            "SELECT tableoid::regclass, t.* FROM t ORDER BY 5",
+            "ORDER BY position 5 is not in select list",
+        ),
+        (
+            "SELECT (t).*, 1 FROM t ORDER BY 5",
+            "ORDER BY position 5 is not in select list",
+        ),
+        (
+            "SELECT DISTINCT ON (5) * FROM t",
+            "DISTINCT ON position 5 is not in select list",
+        ),
+        (
+            "SELECT DISTINCT ON (2) a FROM t",
+            "DISTINCT ON position 2 is not in select list",
+        ),
+    ] {
+        let err = assert_err_prefix(&db, sql, msg);
+        assert!(
+            matches!(err, AnalyzeError::InvalidColumnReference(_)),
+            "{err:?}"
+        );
+    }
+    // The ordinal lands on the aggregate past the star's columns.
+    let err = assert_err_prefix(
+        &db,
+        "SELECT *, count(*) FROM t GROUP BY 1, 4",
+        "aggregate functions are not allowed in GROUP BY",
+    );
+    assert!(matches!(err, AnalyzeError::GroupingError(_)), "{err:?}");
+}
