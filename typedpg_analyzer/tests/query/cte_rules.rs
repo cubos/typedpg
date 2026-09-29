@@ -569,10 +569,10 @@ fn search_cycle_column_names() {
     );
     // The recursive term sees the added columns but `*` there leaves them
     // out; so does every reference below the WITH's own level.
-    db.analyze(&format!(
+    db.analyze(
         "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE o IS NOT NULL \
-         AND n < 5) SEARCH DEPTH FIRST BY n SET o SELECT * FROM r"
-    ))
+         AND n < 5) SEARCH DEPTH FIRST BY n SET o SELECT * FROM r",
+    )
     .unwrap();
     for (sql, width) in [
         (

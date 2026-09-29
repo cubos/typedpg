@@ -730,10 +730,11 @@ impl<'a> CteRefWalker<'a> {
         use typedpg_pg_query::NodeRef;
         let with = match n {
             NodeRef::RangeVar(rv) => {
-                if rv.schemaname.is_empty() && !captured(&self.innerwiths, &rv.relname) {
-                    if let Some(i) = self.names.iter().position(|&c| c == rv.relname) {
-                        self.found.insert(i);
-                    }
+                if rv.schemaname.is_empty()
+                    && !captured(&self.innerwiths, &rv.relname)
+                    && let Some(i) = self.names.iter().position(|&c| c == rv.relname)
+                {
+                    self.found.insert(i);
                 }
                 return Ok(());
             }
