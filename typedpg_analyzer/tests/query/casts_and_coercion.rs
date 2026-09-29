@@ -573,3 +573,39 @@ fn jsonpath_operators_are_nullable() {
         vec![cn("a", bool_ty()), cn("b", bool_ty()), c("c", bool_ty())],
     );
 }
+
+/// `find_coercion_pathway` coerces arrays element-wise when their element
+/// types coerce (`ArrayCoerceExpr`), so common-type constructs over
+/// `integer[]` and `numeric[]` resolve to `numeric[]` and an assignment
+/// may narrow `numeric[]` into an `integer[]` column.
+#[test]
+fn arrays_coerce_element_wise() {
+    let mut db = setup();
+    db.apply_sql("CREATE TABLE ta (id INT PRIMARY KEY, arr INT[]);")
+        .unwrap();
+    let numeric_arr = array_of(numeric());
+    for sql in [
+        "SELECT COALESCE(ARRAY[1], ARRAY[2.5]) AS a",
+        "SELECT CASE WHEN true THEN ARRAY[1] ELSE ARRAY[2.5] END AS a",
+        "SELECT ARRAY[1] AS a UNION SELECT ARRAY[2.5]",
+        "SELECT GREATEST(ARRAY[1], ARRAY[2.5]) AS a",
+    ] {
+        let s = db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        assert_eq!(s.columns[0].pg_type, numeric_arr, "{sql}");
+    }
+    for sql in [
+        "SELECT ARRAY[ARRAY[1], ARRAY[2.5]] AS a",
+        "SELECT ARRAY[[1], [2.5]] AS a",
+        "SELECT ARRAY[arr, ARRAY[1.5]] AS a FROM ta",
+    ] {
+        let s = db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        assert_eq!(s.columns[0].pg_type, numeric_arr, "{sql}");
+    }
+    let s = db
+        .analyze("SELECT ARRAY[ARRAY[1]::int[], ARRAY[2]::bigint[]] AS a")
+        .unwrap();
+    assert_cols(&s, vec![c("a", array_of(int8()))]);
+    db.analyze("INSERT INTO ta (id, arr) VALUES (1, ARRAY[1.5])")
+        .unwrap();
+    db.analyze("UPDATE ta SET arr = ARRAY[1.5]::numeric[]").unwrap();
+}

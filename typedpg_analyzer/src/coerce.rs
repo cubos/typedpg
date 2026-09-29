@@ -22,53 +22,25 @@ pub(crate) enum CoercionContext {
 }
 
 /// Check whether a cast from `source` to `target` is permitted under
-/// the given coercion context, consulting the snapshot's cast catalog.
+/// the given coercion context — PG's `can_coerce_type` for one concrete
+/// pair, i.e. whether [`coercion_pathway`] finds a path.
+///
+/// Domains are smashed to their base types on *both* sides, which makes two
+/// distinct domains over the same base coercible to each other. That
+/// matches PG (verified on 18): `find_coercion_pathway` reduces the source
+/// domain to its base, and coercing the base *to* the target domain is
+/// "allowed whenever a coercion to the base type would be". Beyond the
+/// `pg_cast` rows this includes element-wise array coercion (`int[]` to
+/// `numeric[]` implicitly, `numeric[]` to `int[]` on assignment) and, from
+/// assignment up, the I/O conversion to a string-category target
+/// (`UPDATE t SET text_col = 780`).
 pub(crate) fn can_coerce(
     source: PgTypeOid,
     target: PgTypeOid,
     context: CoercionContext,
     snapshot: &PgCatalog,
 ) -> bool {
-    if source == target {
-        return true;
-    }
-    // Smashing *both* sides to their base types makes two distinct domains
-    // over the same base implicitly coercible to each other. That matches
-    // PG (verified on 18): `find_coercion_pathway` reduces the source
-    // domain to its base, and coercing the base *to* the target domain is
-    // "allowed whenever a coercion to the base type would be" — so a
-    // function taking domain `d2` accepts a `d1` argument when both wrap
-    // the same base.
-    let source = snapshot.unwrap_domain(source);
-    let target_unwrapped = snapshot.unwrap_domain(target);
-    if source == target_unwrapped {
-        return true;
-    }
-    let cast = snapshot
-        .cast_by_pair
-        .get(&(source, target_unwrapped))
-        .and_then(|oid| snapshot.pg_cast.get(oid));
-    match (context, cast) {
-        (_, Some(c)) if matches!(c.castcontext, CastContext::Implicit) => true,
-        (CoercionContext::Assignment, Some(c))
-            if matches!(c.castcontext, CastContext::Assignment) =>
-        {
-            true
-        }
-        // PG's coerce-via-I/O fallback (`find_coercion_pathway`): in assignment
-        // context, any type may be coerced to a **string-category** target via
-        // its I/O functions (`UPDATE t SET text_col = 780` is valid). The rule
-        // is asymmetric — a string *source* to a non-string target needs an
-        // *explicit* cast, so we deliberately only check the target side here.
-        (CoercionContext::Assignment, _)
-            if snapshot
-                .get_type(target_unwrapped)
-                .is_some_and(|t| t.typcategory == TypCategory::String) =>
-        {
-            true
-        }
-        _ => false,
-    }
+    source == target || coercion_pathway(target, source, context, snapshot).is_some()
 }
 
 /// `pg_type.typcategory` of `t` — PG's `TypeCategory`: `unknown` is
@@ -441,9 +413,11 @@ pub(crate) fn select_common_type(
         if category(n) != Some(pcategory) {
             return Err(CommonTypeError::Mismatch(ptype, n));
         }
+        // can_coerce_type under COERCION_IMPLICIT — `pg_cast` rows plus
+        // element-wise array coercion (`integer[]` → `numeric[]`).
         if !preferred(ptype)
-            && snapshot.has_implicit_cast(ptype, n)
-            && !snapshot.has_implicit_cast(n, ptype)
+            && can_coerce_types(&[ptype], &[n], snapshot)
+            && !can_coerce_types(&[n], &[ptype], snapshot)
         {
             ptype = n;
         }
@@ -453,7 +427,7 @@ pub(crate) fn select_common_type(
     // need a yes/no fold it into `None`; see `CommonTypeError`).
     match concrete
         .iter()
-        .find(|&&t| t != ptype && !snapshot.has_implicit_cast(t, ptype))
+        .find(|&&t| t != ptype && !can_coerce_types(&[t], &[ptype], snapshot))
     {
         None => Ok(ptype),
         Some(&from) => Err(CommonTypeError::CannotConvert { from, to: ptype }),
