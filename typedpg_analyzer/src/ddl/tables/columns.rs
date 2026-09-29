@@ -1382,6 +1382,11 @@ fn check_using_expression(
     use crate::param_collector::ParamCollector;
     use crate::scope::Scope;
 
+    crate::ddl::expr_kind::check_expr_kind(
+        interp,
+        expr,
+        crate::ddl::expr_kind::ExprKind::AlterColTransform,
+    )?;
     let relname = relname_of(interp, relid);
     let nspname = interp
         .pg_class

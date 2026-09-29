@@ -1240,3 +1240,57 @@ fn string_partition_bounds_order_under_code_point_collations() {
         assert!(err.to_string().starts_with(message), "{sql}\n  got: {err}");
     }
 }
+
+#[test]
+fn set_returning_functions_are_rejected_in_ddl_expression_kinds() {
+    // check_srf_call_placement: CHECK, index, partition, domain CHECK and
+    // policy expressions all forbid set-returning functions (0A000).
+    let setup = "CREATE TABLE t (a int);
+                 CREATE TABLE p (a int) PARTITION BY RANGE (a);";
+    for (sql, message) in [
+        (
+            "CREATE TABLE x (a int CHECK (generate_series(1, a) > 0));",
+            "set-returning functions are not allowed in check constraints",
+        ),
+        (
+            "ALTER TABLE t ADD CHECK (generate_series(1, a) > 0);",
+            "set-returning functions are not allowed in check constraints",
+        ),
+        (
+            "CREATE INDEX ON t ((generate_series(1, a)));",
+            "set-returning functions are not allowed in index expressions",
+        ),
+        (
+            "CREATE INDEX ON t (a) WHERE generate_series(1, a) > 0;",
+            "set-returning functions are not allowed in index predicates",
+        ),
+        (
+            "CREATE TABLE p2 (a int) PARTITION BY RANGE ((generate_series(1, a)));",
+            "set-returning functions are not allowed in partition key expressions",
+        ),
+        (
+            "CREATE TABLE c PARTITION OF p FOR VALUES FROM (generate_series(1, 2)) TO (10);",
+            "set-returning functions are not allowed in partition bound",
+        ),
+        (
+            "CREATE DOMAIN d AS int CHECK (generate_series(1, VALUE) > 0);",
+            "set-returning functions are not allowed in check constraints",
+        ),
+        (
+            "CREATE POLICY pol ON t USING (generate_series(1, a) > 0);",
+            "set-returning functions are not allowed in policy expressions",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", sql)]).expect_err(sql);
+        assert!(err.to_string().starts_with(message), "{sql}\n  got: {err}");
+    }
+    // A set-returning function inside a policy's sub-select is another
+    // query level.
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "CREATE POLICY pol ON t USING (a IN (SELECT generate_series(1, 3)));",
+        ),
+    ]);
+}

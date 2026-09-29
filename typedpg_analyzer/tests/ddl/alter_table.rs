@@ -679,3 +679,31 @@ fn set_logged_applies_to_tables_and_sequences_only() {
         ),
     ]);
 }
+
+#[test]
+fn alter_column_type_using_rejects_what_transform_expressions_forbid() {
+    // EXPR_KIND_ALTER_COL_TRANSFORM: no set-returning function, aggregate,
+    // window function or sub-select in the USING expression.
+    for (sql, message) in [
+        (
+            "ALTER TABLE t ALTER COLUMN a TYPE bigint USING generate_series(1, a);",
+            "set-returning functions are not allowed in transform expressions",
+        ),
+        (
+            "ALTER TABLE t ALTER COLUMN a TYPE bigint USING sum(a);",
+            "aggregate functions are not allowed in transform expressions",
+        ),
+        (
+            "ALTER TABLE t ALTER COLUMN a TYPE bigint USING row_number() OVER ();",
+            "window functions are not allowed in transform expressions",
+        ),
+        (
+            "ALTER TABLE t ALTER COLUMN a TYPE bigint USING (SELECT 1);",
+            "cannot use subquery in transform expression",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", "CREATE TABLE t (a int);"), ("0002.sql", sql)])
+            .expect_err(sql);
+        assert!(err.to_string().starts_with(message), "{sql}\n  got: {err}");
+    }
+}
