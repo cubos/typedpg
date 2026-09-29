@@ -271,6 +271,127 @@ fn on_conflict_infers_partial_and_expression_indexes() {
     }
 }
 
+fn setup_inference() -> PgCatalog {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE t (id int PRIMARY KEY, v int NOT NULL, w text, z int);
+         CREATE UNIQUE INDEX t_z_expr ON t ((z + 1));
+         CREATE UNIQUE INDEX t_w_part ON t (w) WHERE v > 0;",
+    )
+    .unwrap();
+    db
+}
+
+/// transformOnConflictArbiter transforms the inference WHERE as an index
+/// predicate against the target alone: parameters are typed, bad columns,
+/// aggregates, SRFs, sub-selects and EXCLUDED are rejected.
+#[test]
+fn on_conflict_inference_where_is_analyzed() {
+    let db = setup_inference();
+    let s = db
+        .analyze("INSERT INTO t (id, v) VALUES (1, 1) ON CONFLICT (id) WHERE id > $a DO NOTHING")
+        .unwrap();
+    assert_params(&s, vec![p(int4())]);
+    let cases: &[(&str, &str)] = &[
+        ("WHERE nope > 0", "column \"nope\" does not exist"),
+        (
+            "WHERE sum(1) > 0",
+            "aggregate functions are not allowed in index predicates",
+        ),
+        (
+            "WHERE generate_series(1, 2) > 0",
+            "set-returning functions are not allowed in index predicates",
+        ),
+        ("WHERE (SELECT true)", "cannot use subquery in index predicate"),
+        (
+            "WHERE excluded.v > 0",
+            "missing FROM-clause entry for table \"excluded\"",
+        ),
+    ];
+    for (clause, msg) in cases {
+        let sql = format!("INSERT INTO t (id, v) VALUES (1, 1) ON CONFLICT (id) {clause} DO NOTHING");
+        let err = db.analyze(&sql).unwrap_err();
+        assert!(err.to_string().starts_with(msg), "{sql}: {err}");
+    }
+    // Under DO UPDATE, EXCLUDED is in the range table but not referencable.
+    let err = db
+        .analyze(
+            "INSERT INTO t (id, v) VALUES (1, 1) ON CONFLICT (id) WHERE excluded.v > 0 \
+             DO UPDATE SET v = 2",
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("invalid reference to FROM-clause entry for table \"excluded\""),
+        "{err}"
+    );
+}
+
+/// infer_arbiter_indexes accepts a partial index whose predicate the ON
+/// CONFLICT WHERE implies (predicate_implied_by), not only a verbatim copy.
+#[test]
+fn on_conflict_partial_index_predicate_is_implied() {
+    let db = setup_inference();
+    for clause in [
+        "WHERE v > 0",
+        "WHERE v > 1",
+        "WHERE 0 < v",
+        "WHERE v >= 1",
+        "WHERE v = 5",
+        "WHERE t.v > 0 AND w IS NOT NULL",
+        "WHERE (v > 3 OR v = 1)",
+    ] {
+        let sql = format!("INSERT INTO t (id, v) VALUES (1, 1) ON CONFLICT (w) {clause} DO NOTHING");
+        db.analyze(&sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    for clause in ["", "WHERE v >= 0", "WHERE v < 5", "WHERE v <> 0", "WHERE v > 0 OR id > 0"] {
+        let sql = format!("INSERT INTO t (id, v) VALUES (1, 1) ON CONFLICT (w) {clause} DO NOTHING");
+        let err = db.analyze(&sql).unwrap_err();
+        assert!(
+            matches!(err, AnalyzeError::InvalidColumnReference(_)),
+            "{sql}: {err:?}"
+        );
+    }
+}
+
+/// resolve_unique_index_expr: no ordering options, index expressions are
+/// transformed (so their errors are PG's), operator classes must exist,
+/// and a system column is a valid (never matching) element.
+#[test]
+fn on_conflict_inference_elements() {
+    let db = setup_inference();
+    let cases: &[(&str, &str)] = &[
+        ("(id DESC)", "ASC/DESC is not allowed in ON CONFLICT clause"),
+        (
+            "(id NULLS FIRST)",
+            "NULLS FIRST/LAST is not allowed in ON CONFLICT clause",
+        ),
+        (
+            "(w nope_ops)",
+            "operator class \"nope_ops\" does not exist for access method \"btree\"",
+        ),
+        ("((nope + 1))", "column \"nope\" does not exist"),
+        ("((id + 'x'))", "invalid input syntax for type integer: \"x\""),
+        (
+            "(ctid)",
+            "there is no unique or exclusion constraint matching the ON CONFLICT specification",
+        ),
+        (
+            "(t)",
+            "whole row unique index inference specifications are not supported",
+        ),
+    ];
+    for (target, msg) in cases {
+        let sql = format!("INSERT INTO t (id, v) VALUES (1, 1) ON CONFLICT {target} DO NOTHING");
+        let err = db.analyze(&sql).unwrap_err();
+        assert!(err.to_string().starts_with(msg), "{sql}: {err}");
+    }
+    db.analyze("INSERT INTO t (id, v) VALUES (1, 1) ON CONFLICT ((z + 1)) DO NOTHING")
+        .unwrap();
+    db.analyze("INSERT INTO t (id, v) VALUES (1, 1) ON CONFLICT (id int4_ops) DO NOTHING")
+        .unwrap();
+}
+
 #[test]
 fn on_conflict_do_update_requires_a_target() {
     let db = setup_arbiters();

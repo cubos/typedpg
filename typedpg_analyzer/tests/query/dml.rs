@@ -688,7 +688,7 @@ fn on_conflict_on_nonexistent_constraint_name_should_error() {
             "INSERT INTO t (id, slug) VALUES ($p1, $p2) \
              ON CONFLICT ON CONSTRAINT nope DO NOTHING",
         ),
-        AnalyzeError::Invalid(_),
+        AnalyzeError::UndefinedObject(_),
         "constraint \"nope\" for table \"t\" does not exist",
     );
 }
@@ -728,7 +728,7 @@ fn on_conflict_on_unknown_column_is_rejected() {
              ON CONFLICT (ghost) DO NOTHING",
         ),
         AnalyzeError::UndefinedColumn(_),
-        "column \"ghost\" does not exist (referenced in ON CONFLICT)",
+        "column \"ghost\" does not exist",
     );
 }
 

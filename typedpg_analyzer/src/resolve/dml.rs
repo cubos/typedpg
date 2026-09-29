@@ -74,9 +74,12 @@ pub(crate) fn analyze_insert_with_outer_ctes(
         }
     }
 
-    if let Some(on_conflict) = &ins.on_conflict_clause {
-        analyze_insert_on_conflict(on_conflict, relation, &tgt, snapshot, params, &cte_scopes)?;
-    }
+    let arbiter = match &ins.on_conflict_clause {
+        Some(on_conflict) => {
+            analyze_insert_on_conflict(on_conflict, relation, &tgt, snapshot, params, &cte_scopes)?
+        }
+        None => None,
+    };
 
     // Resolve RETURNING list.
     let mut ret_scope = Scope {
@@ -132,6 +135,10 @@ pub(crate) fn analyze_insert_with_outer_ctes(
         }
     });
     check_rewrite(snapshot, tgt.oid, &rw)?;
+    // The planner infers the arbiter index after the rewriter ran.
+    if let (Some(on_conflict), Some(arbiter)) = (&ins.on_conflict_clause, &arbiter) {
+        validate_on_conflict_target(on_conflict, arbiter, snapshot, tgt.oid, &tgt.relname)?;
+    }
 
     Ok((columns, None))
 }
@@ -576,12 +583,17 @@ fn analyze_insert_select(
     Ok(sel_cols.len())
 }
 
-/// `ON CONFLICT (…) DO UPDATE SET …` / `DO NOTHING`.
+/// `ON CONFLICT (…) DO UPDATE SET …` / `DO NOTHING`, following
+/// `transformOnConflictClause`: the arbiter specification is transformed
+/// against the target alone (EXCLUDED is in the range table but not yet
+/// referencable), then DO UPDATE's SET list and WHERE see a virtual
+/// `EXCLUDED` relation holding the proposed row. We model it in scope as a
+/// second alias over the target table: the columns share names and types,
+/// and nullability follows the real columns because PG rejects an INSERT
+/// that violates NOT NULL before the conflict handler runs.
 ///
-/// DO UPDATE exposes a virtual `EXCLUDED` relation holding the proposed row.
-/// We model it in scope as a second alias over the target table: the columns
-/// share names and types, and nullability follows the real columns because PG
-/// rejects an INSERT that violates NOT NULL before the conflict handler runs.
+/// Returns the transformed arbiter for the planner-stage check
+/// ([`validate_on_conflict_target`]), `None` without an inference clause.
 fn analyze_insert_on_conflict(
     on_conflict: &protobuf::OnConflictClause,
     relation: &protobuf::RangeVar,
@@ -589,31 +601,64 @@ fn analyze_insert_on_conflict(
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
     cte_scopes: &HashMap<String, Vec<ScopeColumn>>,
-) -> Result<(), AnalyzeError> {
-    // Validate the conflict target (`ON CONFLICT (cols)` / `ON CONFLICT ON
-    // CONSTRAINT name`) against pg_constraint. PG rejects targets that don't
-    // match a unique/primary-key index; without this check the analyzer
-    // accepts any column.
-    validate_on_conflict_target(on_conflict, snapshot, tgt.oid, &tgt.relname)?;
-
-    let mut conflict_scope = Scope {
+) -> Result<Option<Arbiter>, AnalyzeError> {
+    let update = on_conflict.action() == protobuf::OnConflictAction::OnconflictUpdate;
+    let target_qn = crate::qualified_name::QualifiedName::new(&tgt.nsname, &tgt.relname);
+    let mut target_scope = Scope {
         ctes: cte_scopes.clone(),
         ..Scope::default()
     };
-    let target_qn = crate::qualified_name::QualifiedName::new(&tgt.nsname, &tgt.relname);
-    conflict_scope.add_dml_target(
+    target_scope.add_dml_target(
         snapshot,
         insert_target_alias(relation),
         target_qn.clone(),
         &tgt.attrs,
     );
-    conflict_scope.add_dml_target(snapshot, "excluded", target_qn, &tgt.attrs);
+    let mut excluded_holder = Scope::default();
+    excluded_holder.add_dml_target(snapshot, "excluded", target_qn, &tgt.attrs);
     // transformOnConflictClause marks the EXCLUDED RTE as
     // RELKIND_COMPOSITE_TYPE, so scanNSItemForColumn offers it no system
     // columns: `excluded.ctid` does not exist.
-    if let Some(excluded) = conflict_scope.sources.last_mut() {
-        excluded.system_columns.clear();
+    for s in &mut excluded_holder.sources {
+        s.system_columns.clear();
+        s.dml_target = false;
     }
+
+    // transformOnConflictArbiter.
+    if update && on_conflict.infer.is_none() {
+        return Err(crate::error::RawError::new(
+            AnalyzeError::SyntaxError(
+                "ON CONFLICT DO UPDATE requires inference specification or constraint name".into(),
+            ),
+            None,
+            Some("For example, ON CONFLICT (column_name).".into()),
+        )
+        .finalize_implicit());
+    }
+    let arbiter = match on_conflict.infer.as_deref() {
+        None => None,
+        Some(infer) => {
+            let mut arbiter_scope = target_scope.clone();
+            if update {
+                arbiter_scope
+                    .shadowed_sources
+                    .extend(excluded_holder.sources.iter().cloned());
+            }
+            Some(transform_on_conflict_arbiter(
+                infer,
+                insert_target_alias(relation),
+                tgt,
+                expr::Ctx::new(&arbiter_scope, &NullabilityContext::default(), snapshot),
+                params,
+            )?)
+        }
+    };
+
+    if !update {
+        return Ok(arbiter);
+    }
+    let mut conflict_scope = target_scope;
+    conflict_scope.sources.extend(excluded_holder.sources);
     let conflict_null_ctx = NullabilityContext::default();
     analyze_set_clause(
         &on_conflict.target_list,
@@ -633,7 +678,155 @@ fn analyze_insert_on_conflict(
         crate::clause::check_no_aggregates_or_windows(where_clause, snapshot, "WHERE")?;
         check_no_srf_in_clause(where_clause, snapshot, "WHERE")?;
     }
-    Ok(())
+    Ok(arbiter)
+}
+
+/// PG's `transformOnConflictArbiter` / `resolve_unique_index_expr`: each
+/// inference element is a column or an expression transformed as an index
+/// expression (EXPR_KIND_INDEX_EXPRESSION) against the target, without
+/// ordering options and with an existing collation / btree operator class;
+/// the WHERE is transformed as an index predicate; a named constraint must
+/// exist on the table.
+fn transform_on_conflict_arbiter(
+    infer: &protobuf::InferClause,
+    target_alias: &str,
+    tgt: &InsertTarget,
+    ctx: Ctx<'_>,
+    params: &mut ParamCollector,
+) -> Result<Arbiter, AnalyzeError> {
+    let snapshot = ctx.snapshot;
+    let mut arbiter = Arbiter {
+        cols: Default::default(),
+        exprs: Vec::new(),
+        whole_row: false,
+        where_clause: None,
+    };
+    let invalid = |msg: &str| {
+        crate::error::RawError::new(
+            AnalyzeError::InvalidColumnReference(msg.into()),
+            None,
+            None,
+        )
+        .finalize_implicit()
+    };
+    for elem in &infer.index_elems {
+        let Some(node::Node::IndexElem(ie)) = elem.node.as_ref() else {
+            continue;
+        };
+        if !matches!(
+            ie.ordering(),
+            protobuf::SortByDir::SortbyDefault | protobuf::SortByDir::Undefined
+        ) {
+            return Err(invalid("ASC/DESC is not allowed in ON CONFLICT clause"));
+        }
+        if !matches!(
+            ie.nulls_ordering(),
+            protobuf::SortByNulls::SortbyNullsDefault | protobuf::SortByNulls::Undefined
+        ) {
+            return Err(invalid("NULLS FIRST/LAST is not allowed in ON CONFLICT clause"));
+        }
+        if !ie.name.is_empty() {
+            // A plain column becomes a ColumnRef transformed like any
+            // other: a user or system column, else a whole-row reference to
+            // the target, else an unknown column.
+            if let Some(a) = tgt.attrs.iter().find(|a| a.attname == ie.name) {
+                arbiter.cols.insert(a.attnum);
+            } else if let Some(&(_, _, attnum)) = crate::pg_catalog::SYSTEM_COLUMNS
+                .iter()
+                .find(|(n, ..)| *n == ie.name)
+            {
+                arbiter.cols.insert(attnum);
+            } else if ie.name == target_alias {
+                arbiter.whole_row = true;
+            } else {
+                ctx.scope.resolve_column(None, &ie.name, None)?;
+            }
+        } else if let Some(e) = ie.expr.as_deref() {
+            check_index_expr_kind(e, snapshot, "index expressions", "index expression")?;
+            expr::infer_expr(e, ctx, params, TypeGoal::NONE)?;
+            check_index_expr_kind(e, snapshot, "index expressions", "index expression")?;
+            arbiter.exprs.push(e.clone());
+        }
+        if !ie.collation.is_empty() {
+            let parts = expr::extract_string_fields(&ie.collation);
+            let (schema, name) = match parts.as_slice() {
+                [n] => (None, n.as_str()),
+                [s, n] => (Some(s.as_str()), n.as_str()),
+                _ => (None, ""),
+            };
+            if snapshot.resolve_collation(schema, name).is_none() {
+                return Err(crate::pgmsg::collation_does_not_exist(&parts.join(".")));
+            }
+        }
+        if !ie.opclass.is_empty() {
+            let parts = expr::extract_string_fields(&ie.opclass);
+            let (schema, name) = match parts.as_slice() {
+                [n] => (None, n.as_str()),
+                [s, n] => (Some(s.as_str()), n.as_str()),
+                _ => (None, ""),
+            };
+            if crate::ddl::opclass::find_opclass(snapshot, schema, name, "btree").is_none() {
+                return Err(crate::error::RawError::new(
+                    AnalyzeError::UndefinedObject(format!(
+                        "operator class \"{name}\" does not exist for access method \"btree\""
+                    )),
+                    None,
+                    None,
+                )
+                .finalize_implicit());
+            }
+        }
+    }
+    if let Some(w) = infer.where_clause.as_deref() {
+        check_index_expr_kind(w, snapshot, "index predicates", "index predicate")?;
+        expr::infer_expr(w, ctx, params, TypeGoal::NONE)?;
+        check_index_expr_kind(w, snapshot, "index predicates", "index predicate")?;
+        arbiter.where_clause = Some(w.clone());
+    }
+    if !infer.conname.is_empty()
+        && !snapshot
+            .pg_constraint_values()
+            .any(|c| c.conrelid == tgt.oid && c.conname == infer.conname)
+    {
+        return Err(crate::error::RawError::new(
+            AnalyzeError::UndefinedObject(format!(
+                "constraint \"{}\" for table \"{}\" does not exist",
+                infer.conname, tgt.relname,
+            )),
+            None,
+            None,
+        )
+        .finalize_implicit());
+    }
+    Ok(arbiter)
+}
+
+/// The constructs an index expression / predicate forbids
+/// (EXPR_KIND_INDEX_EXPRESSION / EXPR_KIND_INDEX_PREDICATE): a sub-select
+/// (transformSubLink, 0A000), aggregates and window functions, and
+/// set-returning functions.
+fn check_index_expr_kind(
+    e: &protobuf::Node,
+    snapshot: &PgCatalog,
+    kind: &str,
+    subquery_context: &str,
+) -> Result<(), AnalyzeError> {
+    let mut has_sublink = false;
+    visit_same_level(e, &mut |n| {
+        has_sublink |= matches!(n.node.as_ref(), Some(node::Node::SubLink(_)));
+    });
+    if has_sublink {
+        return Err(crate::error::RawError::new(
+            AnalyzeError::FeatureNotSupported(format!(
+                "cannot use subquery in {subquery_context}"
+            )),
+            None,
+            None,
+        )
+        .finalize_implicit());
+    }
+    crate::clause::check_no_aggregates_or_windows(e, snapshot, kind)?;
+    check_no_srf_in_clause(e, snapshot, kind)
 }
 
 pub(crate) fn analyze_update(
