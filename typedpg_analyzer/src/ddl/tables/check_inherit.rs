@@ -98,6 +98,10 @@ fn insert_check(
         confkey: Vec::new(),
         conislocal,
         coninhcount,
+        conenforced: true,
+        convalidated: true,
+        connoinherit: def.as_ref().is_some_and(|d| d.no_inherit),
+        conperiod: false,
     });
     if let Some(def) = def {
         interp.check_defs.insert(oid, def);

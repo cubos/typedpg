@@ -404,6 +404,17 @@ pub struct PgConstraint {
     pub conislocal: bool,
     /// Number of parents the constraint is inherited from.
     pub coninhcount: i16,
+    /// The constraint is enforced (PG 18's `NOT ENFORCED` clears it; only
+    /// CHECK and FOREIGN KEY constraints can be not enforced).
+    pub conenforced: bool,
+    /// The constraint has been validated against the existing rows (`NOT
+    /// VALID` clears it until `VALIDATE CONSTRAINT`).
+    pub convalidated: bool,
+    /// The constraint is `NO INHERIT` (CHECK and not-null constraints).
+    pub connoinherit: bool,
+    /// PG 18's temporal constraints: a PRIMARY KEY / UNIQUE with `WITHOUT
+    /// OVERLAPS` or a FOREIGN KEY with `PERIOD`.
+    pub conperiod: bool,
 }
 
 /// `pg_index`: one row per index. Keyed by `indexrelid` — PG models the index
@@ -431,6 +442,9 @@ pub struct PgIndex {
     pub indnkeyatts: i16,
     pub indisunique: bool,
     pub indisprimary: bool,
+    /// The index backs an exclusion constraint — an `EXCLUDE` one, or PG
+    /// 18's PRIMARY KEY / UNIQUE `WITHOUT OVERLAPS`.
+    pub indisexclusion: bool,
     /// Attnums of the indexed columns. `0` means the slot is an expression
     /// (consumed in order from `indexprs`).
     pub indkey: Vec<i16>,

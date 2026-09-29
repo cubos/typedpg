@@ -571,7 +571,8 @@ fn export_constraints(client: &mut postgres::Client) -> Result<Vec<PgConstraint>
     // round-trip without panicking.
     let rows = client.query(
         "SELECT oid, conname, conrelid, contype, conkey, confrelid, confkey, \
-                conislocal, coninhcount::int2 \
+                conislocal, coninhcount::int2, conenforced, convalidated, \
+                connoinherit, conperiod \
          FROM pg_catalog.pg_constraint \
          ORDER BY oid",
         &[],
@@ -596,6 +597,10 @@ fn export_constraints(client: &mut postgres::Client) -> Result<Vec<PgConstraint>
                 confkey: confkey.unwrap_or_default(),
                 conislocal: r.get(7),
                 coninhcount: r.get(8),
+                conenforced: r.get(9),
+                convalidated: r.get(10),
+                connoinherit: r.get(11),
+                conperiod: r.get(12),
             })
         })
         .collect())
@@ -628,7 +633,7 @@ fn export_indexes(
 ) -> Result<Vec<PgIndex>, postgres::Error> {
     let rows = client.query(
         "SELECT i.indexrelid, i.indrelid, i.indnatts, i.indnkeyatts, \
-                i.indisunique, i.indisprimary, \
+                i.indisunique, i.indisprimary, i.indisexclusion, \
                 i.indkey::int2[]::int4[] AS indkey, \
                 i.indexprs IS NOT NULL AS has_exprs, \
                 CASE WHEN i.indpred IS NOT NULL \
@@ -647,9 +652,10 @@ fn export_indexes(
         let indnkeyatts: i16 = r.get(3);
         let indisunique: bool = r.get(4);
         let indisprimary: bool = r.get(5);
-        let indkey_raw: Vec<i32> = r.get(6);
-        let has_exprs: bool = r.get(7);
-        let pred_sql: Option<String> = r.get(8);
+        let indisexclusion: bool = r.get(6);
+        let indkey_raw: Vec<i32> = r.get(7);
+        let has_exprs: bool = r.get(8);
+        let pred_sql: Option<String> = r.get(9);
         let indkey: Vec<i16> = indkey_raw.into_iter().map(|n| n as i16).collect();
 
         // Pull each expression slot's SQL via pg_get_indexdef(idx, slot, false).
@@ -713,6 +719,7 @@ fn export_indexes(
             indnkeyatts,
             indisunique,
             indisprimary,
+            indisexclusion,
             indkey,
             indexprs,
             indpred,

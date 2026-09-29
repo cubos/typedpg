@@ -137,6 +137,10 @@ fn insert_not_null(
         confkey: Vec::new(),
         conislocal,
         coninhcount,
+        conenforced: true,
+        convalidated: true,
+        connoinherit: false,
+        conperiod: false,
     });
     set_attnotnull(interp, relid, attnum, true);
     Ok(())

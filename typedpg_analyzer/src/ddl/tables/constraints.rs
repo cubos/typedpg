@@ -503,6 +503,10 @@ fn emit_constraint_with_backing_index(
         confkey,
         conislocal: true,
         coninhcount: 0,
+        conenforced: true,
+        convalidated: true,
+        connoinherit: false,
+        conperiod: false,
     });
     if matches!(
         contype,
@@ -536,6 +540,7 @@ fn emit_constraint_with_backing_index(
             // An exclusion constraint's index is not a unique one.
             indisunique: contype != ConType::Exclusion,
             indisprimary: matches!(contype, ConType::PrimaryKey),
+            indisexclusion: contype == ConType::Exclusion,
             indkey,
             indexprs: Vec::new(),
             indpred: None,
@@ -1581,6 +1586,10 @@ fn add_index_constraint(
         confkey: Vec::new(),
         conislocal: true,
         coninhcount: 0,
+        conenforced: true,
+        convalidated: true,
+        connoinherit: false,
+        conperiod: false,
     });
     Ok(())
 }
@@ -1693,6 +1702,10 @@ pub(crate) fn copy_like_constraints(
                 confkey: Vec::new(),
                 conislocal: true,
                 coninhcount: 0,
+                conenforced: c.conenforced,
+                convalidated: c.convalidated,
+                connoinherit: c.connoinherit,
+                conperiod: false,
             });
         }
     }

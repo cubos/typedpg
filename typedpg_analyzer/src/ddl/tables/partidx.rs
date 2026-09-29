@@ -151,6 +151,7 @@ fn create_clone(
         indnkeyatts: pi.indnkeyatts,
         indisunique: pi.indisunique,
         indisprimary: pi.indisprimary,
+        indisexclusion: pi.indisexclusion,
         indkey: indkey.clone(),
         indexprs: pi.indexprs.clone(),
         indpred: pi.indpred.clone(),
@@ -170,6 +171,10 @@ fn create_clone(
             confkey: Vec::new(),
             conislocal: false,
             coninhcount: 1,
+            conenforced: con.conenforced,
+            convalidated: con.convalidated,
+            connoinherit: con.connoinherit,
+            conperiod: con.conperiod,
         });
     }
     Ok(index)

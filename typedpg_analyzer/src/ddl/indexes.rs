@@ -299,6 +299,7 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
         indnkeyatts,
         indisunique: stmt.unique,
         indisprimary: stmt.primary,
+        indisexclusion: false,
         indkey,
         indexprs,
         indpred,
