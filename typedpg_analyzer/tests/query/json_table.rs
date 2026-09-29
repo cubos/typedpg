@@ -132,3 +132,19 @@ fn json_table_non_constant_path_is_not_supported() {
 /// a NESTED PATH — becomes a jsonpath constant at parse time, so its
 /// content is parsed by jsonpath_in.
 #[test]
+fn json_table_paths_are_parsed_as_jsonpath() {
+    let db = setup();
+    for sql in [
+        "SELECT * FROM JSON_TABLE(jsonb '[1]', '$[*' COLUMNS (a int)) jt",
+        "SELECT * FROM JSON_TABLE(jsonb '[1]', '$[*]' COLUMNS (a int PATH '$[*')) jt",
+        "SELECT * FROM JSON_TABLE(jsonb '[1]', '$[*]' COLUMNS (a int EXISTS PATH '$[*')) jt",
+        "SELECT * FROM JSON_TABLE(jsonb '[1]', '$[*]' \
+         COLUMNS (NESTED PATH '$[*' COLUMNS (a int))) jt",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::InvalidLiteral(_),
+            "syntax error at end of jsonpath input"
+        );
+    }
+}

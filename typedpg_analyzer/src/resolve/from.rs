@@ -1308,6 +1308,8 @@ fn process_json_table(
         }
     }
 
+    json_table_path_literal(jt.pathspec.as_deref(), ctx, params)?;
+
     // Column and path names share one namespace.
     let mut names: Vec<String> = Vec::new();
     if let Some(ps) = jt.pathspec.as_deref()
@@ -1339,6 +1341,22 @@ fn process_json_table(
         c.name = n;
     }
     scope.add_derived(alias, cols, crate::scope::SourceKind::Other)
+}
+
+/// A JSON_TABLE path (the row pattern, a column's `PATH` / `EXISTS PATH`,
+/// a `NESTED PATH`): the grammar only admits a string constant, which
+/// transformJsonTable makes a `jsonpath` constant — so its content is
+/// parsed by jsonpath_in at parse time, like any path argument.
+fn json_table_path_literal(
+    pathspec: Option<&protobuf::JsonTablePathSpec>,
+    ctx: Ctx<'_>,
+    params: &mut ParamCollector,
+) -> Result<(), AnalyzeError> {
+    const JSONPATH: PgTypeOid = PgTypeOid::from_raw(4072);
+    match pathspec.and_then(|ps| ps.string.as_deref()) {
+        Some(path) => expr::coerce_unknown_to(path, ctx, params, JSONPATH),
+        None => Ok(()),
+    }
 }
 
 /// The columns of one JSON_TABLE `COLUMNS (…)` list, recursing into
@@ -1373,6 +1391,7 @@ fn json_table_columns(
             continue;
         };
         let kind = Kind::try_from(col.coltype).unwrap_or(Kind::Undefined);
+        json_table_path_literal(col.pathspec.as_deref(), ctx, params)?;
         if kind == Kind::JtcNested {
             if let Some(ps) = col.pathspec.as_deref()
                 && !ps.name.is_empty()
