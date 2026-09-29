@@ -3074,3 +3074,42 @@ fn extensions_follow_create_extension_rules() {
         ),
     ]);
 }
+
+#[test]
+fn do_blocks_are_compiled() {
+    // PG 18 ExecuteDoStmt / plpgsql_inline_handler compiles the block.
+    let setup = "CREATE TABLE t (a int);";
+    for (stmt, msg) in [
+        (
+            "DO $$ BEGIN PERFORM 1; END $$ LANGUAGE sql;",
+            "language \"sql\" does not support inline code execution",
+        ),
+        (
+            "DO $$ BEGIN PERFORM 1; END $$ LANGUAGE nosuch;",
+            "language \"nosuch\" does not exist",
+        ),
+        (
+            "DO $$ DECLARE x nosuchtype; BEGIN PERFORM 1; END $$;",
+            "type \"nosuchtype\" does not exist",
+        ),
+        (
+            "DO $$ BEGIN RAISE NOTICE 'x' $$;",
+            "syntax error at end of input",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "DO $$ BEGIN PERFORM 1; END $$;
+             DO LANGUAGE plpgsql $$ DECLARE r t%ROWTYPE; n int := 0; BEGIN
+               FOR r IN SELECT * FROM t LOOP n := n + 1; END LOOP;
+               RAISE NOTICE 'rows: %', n;
+             END $$;
+             DO $body$ BEGIN IF true THEN RAISE NOTICE '$$'; END IF; END $body$;",
+        ),
+    ]);
+}

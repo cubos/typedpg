@@ -221,6 +221,7 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         node::Node::AlterPolicyStmt(s) => policies::alter_policy(db, s),
         node::Node::RuleStmt(s) => rules::create_rule(db, s),
         node::Node::CreateAmStmt(s) => opclass::create_am(db, s),
+        node::Node::DoStmt(s) => function_body::do_block(db, s),
         node::Node::AlterExtensionContentsStmt(s) => extensions::alter_extension_contents(db, s),
         node::Node::CreateFdwStmt(s) => fdw::create_fdw(db, s),
         node::Node::AlterFdwStmt(s) => fdw::alter_fdw(db, s),
@@ -247,7 +248,6 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         | node::Node::AlterRoleStmt(_)
         | node::Node::AlterOpFamilyStmt(_)
         | node::Node::AlterOperatorStmt(_)
-        | node::Node::DoStmt(_)
         | node::Node::CopyStmt(_)
         | node::Node::VariableShowStmt(_)
         | node::Node::DiscardStmt(_)

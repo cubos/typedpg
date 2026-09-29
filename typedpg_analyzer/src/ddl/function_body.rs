@@ -477,7 +477,63 @@ pub(crate) fn validate_plpgsql_function(
         return Ok(());
     }
     let sql = deparse(node::Node::CreateFunctionStmt(Box::new(stmt.clone())))?;
-    let parsed = pg_query::parse_plpgsql(&sql).map_err(|e| match e {
+    compile_plpgsql(interp, &sql)
+}
+
+/// `DO [LANGUAGE lang] 'code'` (ExecuteDoStmt): the language must exist and
+/// support inline code; a PL/pgSQL block is compiled (syntax and declared
+/// types) before it runs. What the block does when it runs isn't modeled.
+pub(crate) fn do_block(
+    interp: &PgCatalog,
+    stmt: &pg_query::protobuf::DoStmt,
+) -> Result<(), DdlError> {
+    let mut code = None;
+    let mut language = "plpgsql".to_owned();
+    for arg in &stmt.args {
+        let Some(node::Node::DefElem(de)) = arg.node.as_ref() else {
+            continue;
+        };
+        let Some(node::Node::String(s)) = de.arg.as_deref().and_then(|a| a.node.as_ref()) else {
+            continue;
+        };
+        match de.defname.as_str() {
+            "as" => code = Some(s.sval.clone()),
+            "language" => language = s.sval.to_ascii_lowercase(),
+            _ => {}
+        }
+    }
+    match language.as_str() {
+        "plpgsql" => {}
+        "sql" | "c" | "internal" => {
+            return Err(DdlError::UnsupportedDdl(format!(
+                "language \"{language}\" does not support inline code execution"
+            )));
+        }
+        _ => {
+            return Err(DdlError::TypeNotFound(format!(
+                "language \"{language}\" does not exist"
+            )));
+        }
+    }
+    let Some(code) = code else {
+        return Ok(());
+    };
+    // Wrap the block as a function body, dollar-quoted with a tag the code
+    // doesn't contain.
+    let mut tag = String::from("do");
+    while code.contains(&format!("${tag}$")) {
+        tag.push('x');
+    }
+    let sql = format!(
+        "CREATE FUNCTION inline_code_block() RETURNS void LANGUAGE plpgsql AS ${tag}${code}${tag}$"
+    );
+    compile_plpgsql(interp, &sql)
+}
+
+/// Compile a `CREATE FUNCTION ... LANGUAGE plpgsql` statement with the
+/// PL/pgSQL grammar and resolve its declared variables' types.
+fn compile_plpgsql(interp: &PgCatalog, sql: &str) -> Result<(), DdlError> {
+    let parsed = pg_query::parse_plpgsql(sql).map_err(|e| match e {
         pg_query::Error::Parse(msg) => DdlError::Parse(msg),
         other => DdlError::Parse(other.to_string()),
     })?;
