@@ -2604,3 +2604,15 @@ fn composite_cast_to_record_keeps_its_type() {
 /// record` function called without a column definition list) is PG's
 /// `could not identify column` (42703), not a "not a composite type" error.
 #[test]
+fn field_of_opaque_record_function_is_unidentified_column() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE FUNCTION f_rec() RETURNS record LANGUAGE sql AS $$ SELECT 1, 'a' $$;",
+    )
+    .unwrap();
+    assert_err_prefix!(
+        db.analyze("SELECT (f_rec()).a"),
+        AnalyzeError::UndefinedColumn(_),
+        "could not identify column \"a\" in record data type"
+    );
+}

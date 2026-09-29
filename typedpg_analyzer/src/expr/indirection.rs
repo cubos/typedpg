@@ -240,6 +240,14 @@ pub(super) fn resolve_composite_field(
 
     // Domain-over-composite needs unwrapping to see the composite fields.
     let base_oid = snapshot.unwrap_domain(current.type_oid);
+    // A `record` whose row shape is unknown here (a `RETURNS record`
+    // function without a column definition list): ParseFuncOrColumn finds
+    // no field and reports the column, not the type (42703).
+    if base_oid == oid::RECORD {
+        return Err(AnalyzeError::UndefinedColumn(format!(
+            "could not identify column \"{field_name}\" in record data type"
+        )));
+    }
     let type_entry = snapshot.get_type(base_oid).ok_or_else(|| {
         AnalyzeError::UndefinedType(format!(
             "internal: composite field access .{field_name} over unknown type OID {}",
