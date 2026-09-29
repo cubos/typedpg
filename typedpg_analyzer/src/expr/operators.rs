@@ -529,9 +529,50 @@ fn handle_any_all(
         }
     }
 
-    let any_nullable =
-        left.as_ref().is_some_and(|l| l.nullable) || right.as_ref().is_some_and(|r| r.nullable);
+    // ExecEvalScalarArrayOp: with no element deciding the result, a NULL
+    // element makes the whole `op ANY/ALL` NULL (`3 = ANY('{1,NULL}')`), so
+    // besides a NULL operand the array's *elements* matter — and those are
+    // only provably NOT NULL for an ARRAY[...] constructor over NOT NULL
+    // elements (or a literal without NULL elements).
+    let any_nullable = left.as_ref().is_some_and(|l| l.nullable)
+        || right.as_ref().is_some_and(|r| r.nullable)
+        || expr
+            .rexpr
+            .as_deref()
+            .is_none_or(|r| array_elements_may_be_null(r, ctx, params));
     Ok(Some(ExprType::scalar(oid::BOOL, any_nullable)))
+}
+
+/// Whether the array value `node` evaluates to may contain NULL elements.
+/// `false` only when provable: an `ARRAY[...]` constructor (possibly cast)
+/// whose scalar elements are all NOT NULL, recursing into nested
+/// sub-array constructors, or an array literal with no NULL element. Array
+/// columns, parameters and function results can always hold NULLs — PG has
+/// no NOT NULL constraint on elements. The elements are re-inferred against
+/// a throwaway collector, so the peek has no side effects.
+pub(crate) fn array_elements_may_be_null(
+    node: &protobuf::Node,
+    ctx: Ctx<'_>,
+    params: &ParamCollector,
+) -> bool {
+    match node.node.as_ref() {
+        Some(node::Node::AArrayExpr(arr)) => arr.elements.iter().any(|e| {
+            if matches!(e.node.as_ref(), Some(node::Node::AArrayExpr(_))) {
+                return array_elements_may_be_null(e, ctx, params);
+            }
+            let mut scratch = params.clone();
+            // An array-valued element makes a multi-dimensional array whose
+            // inner elements are that value's — unknown here.
+            !infer_expr(e, ctx, &mut scratch, TypeGoal::NONE).is_ok_and(|t| {
+                !t.nullable && array_element_type(ctx.snapshot, t.type_oid).is_none()
+            })
+        }),
+        Some(node::Node::TypeCast(c)) => c
+            .arg
+            .as_deref()
+            .is_none_or(|a| array_elements_may_be_null(a, ctx, params)),
+        _ => true,
+    }
 }
 
 /// `ROW(a, b) op ROW(c, d)` (also the implicit `(a, b) op (c, d)`), for any

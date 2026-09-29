@@ -128,6 +128,37 @@ fn eq_any_param_array() {
     assert_params(&s, vec![p(array_of(int8()))]);
 }
 
+/// `x op ANY/ALL (array)` is NULL when no element decides the result and
+/// some element is NULL (`3 = ANY('{1,NULL}')`), so it is NOT NULL only
+/// when the operands are and the elements provably are too.
+#[test]
+fn any_all_nullable_through_null_elements() {
+    let db = setup();
+    let s = db
+        .analyze(
+            "SELECT 3 = ANY(nums) AS a, 3 <> ALL(nums) AS b, \
+                    id = ANY('{1,NULL}'::int8[]) AS c, id = ANY(ARRAY[1, NULL]) AS d, \
+                    id = ANY($arr) AS e, \
+                    id = ANY(ARRAY[1, 2]) AS f, id <> ALL(ARRAY[[1], [2]]::int8[]) AS g, \
+                    id = ANY(ARRAY[nums[1]]) AS h \
+             FROM users",
+        )
+        .unwrap();
+    assert_cols(
+        &s,
+        vec![
+            cn("a", bool_ty()),
+            cn("b", bool_ty()),
+            cn("c", bool_ty()),
+            cn("d", bool_ty()),
+            cn("e", bool_ty()),
+            c("f", bool_ty()),
+            c("g", bool_ty()),
+            cn("h", bool_ty()),
+        ],
+    );
+}
+
 // ── Array concatenation `||` ─────────────────────────────────────────────────
 
 #[test]
