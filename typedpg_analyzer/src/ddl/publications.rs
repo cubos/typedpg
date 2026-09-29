@@ -9,7 +9,7 @@ use pg_query::protobuf::{
 
 use super::DdlError;
 use crate::oid::{PgClassOid, PgNamespaceOid};
-use crate::pg_catalog::{PgCatalog, RelKind};
+use crate::pg_catalog::{PgCatalog, RelKind, TypType};
 use crate::qualified_name::QualifiedName;
 
 /// A publication (`pg_publication`, `pg_publication_rel`,
@@ -421,14 +421,25 @@ fn check_simple_rowfilter_expr(
         node::Node::TypeCast(tc) => {
             let arg = tc.arg.as_deref();
             let target = type_of(node);
-            if user_type(target) {
-                return Err(invalid_row_filter("User-defined types are not allowed."));
+            // The walker judges the node kind before its type: a cast to a
+            // domain is a CoerceToDomain (a literal's too), which is not
+            // allowed at all.
+            if target
+                .and_then(|t| interp.get_type(t))
+                .is_some_and(|t| t.typtype == TypType::Domain)
+            {
+                return Err(invalid_row_filter(ONLY_SIMPLE));
             }
-            // A cast literal folds into a Const.
-            let literal = matches!(
-                arg.and_then(|a| a.node.as_ref()),
-                Some(node::Node::AConst(_))
-            );
+            // A cast literal folds into a Const, and a cast `ARRAY[…]`
+            // constructor is built with the target type directly
+            // (transformTypeCast) — neither leaves a coercion node.
+            let literal = match arg.and_then(|a| a.node.as_ref()) {
+                Some(node::Node::AConst(_)) => true,
+                Some(node::Node::AArrayExpr(_)) => target
+                    .and_then(|t| interp.get_type(t))
+                    .is_some_and(|t| t.typcategory == crate::pg_catalog::TypCategory::Array),
+                _ => false,
+            };
             if !literal
                 && let (Some(target), Some(source)) = (target, arg.and_then(type_of))
                 && !matches!(
@@ -442,6 +453,9 @@ fn check_simple_rowfilter_expr(
                 )
             {
                 return Err(invalid_row_filter(ONLY_SIMPLE));
+            }
+            if user_type(target) {
+                return Err(invalid_row_filter("User-defined types are not allowed."));
             }
             arg.into_iter().collect()
         }

@@ -4426,3 +4426,107 @@ fn rule_actions_see_whole_row_and_star_new_old() {
         assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
     }
 }
+
+#[test]
+fn publication_row_filters_judge_node_kind_then_type() {
+    // PG 18's check_simple_rowfilter_expr_walker: the node kind first (a
+    // cast to a domain is a disallowed CoerceToDomain, a cast through I/O
+    // too), then whether its type is user-defined; a cast literal or
+    // `ARRAY[…]` constructor leaves no coercion node behind.
+    let setup = "CREATE TYPE mood AS ENUM ('a', 'b');
+                 CREATE TYPE pair AS (a int, b text);
+                 CREATE DOMAIN d AS int;
+                 CREATE TABLE pt (id int PRIMARY KEY, m mood, n int, dd d);";
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "CREATE PUBLICATION p FOR TABLE pt WHERE (n > 1);",
+        ),
+    ]);
+    for (filter, detail) in [
+        (
+            r#"greatest(m, m) = 'a'"#,
+            r#"User-defined types are not allowed."#,
+        ),
+        (r#"m = 'a'"#, r#"User-defined types are not allowed."#),
+        (
+            r#"coalesce(m, 'b') IS NULL"#,
+            r#"User-defined types are not allowed."#,
+        ),
+        (
+            r#"'a'::mood IS NULL"#,
+            r#"User-defined types are not allowed."#,
+        ),
+        (
+            r#"(CASE WHEN n > 0 THEN m END) IS NULL"#,
+            r#"User-defined types are not allowed."#,
+        ),
+        (
+            r#"(ARRAY[m])[1] IS NULL"#,
+            r#"Only columns, constants, built-in operators, built-in data types, built-in collations, and immutable built-in functions are allowed."#,
+        ),
+        (
+            r#"m IN ('a', 'b')"#,
+            r#"User-defined types are not allowed."#,
+        ),
+        (
+            r#"ROW(m, n) IS NULL"#,
+            r#"User-defined types are not allowed."#,
+        ),
+        (
+            r#"n = 1 OR m IS NULL"#,
+            r#"User-defined types are not allowed."#,
+        ),
+        (
+            r#"m::text = 'a'"#,
+            r#"Only columns, constants, built-in operators, built-in data types, built-in collations, and immutable built-in functions are allowed."#,
+        ),
+        (
+            r#"n::text = 'a'"#,
+            r#"Only columns, constants, built-in operators, built-in data types, built-in collations, and immutable built-in functions are allowed."#,
+        ),
+        (
+            r#"ARRAY['a']::mood[] IS NULL"#,
+            r#"User-defined types are not allowed."#,
+        ),
+        (r#"dd > 1"#, r#"User-defined types are not allowed."#),
+        (r#"dd::int > 1"#, r#"User-defined types are not allowed."#),
+        (
+            r#"(n::d) > 1"#,
+            r#"Only columns, constants, built-in operators, built-in data types, built-in collations, and immutable built-in functions are allowed."#,
+        ),
+        (
+            r#"nullif(m, 'a') IS NULL"#,
+            r#"User-defined types are not allowed."#,
+        ),
+        (
+            r#"ARRAY[m] IS NULL"#,
+            r#"User-defined types are not allowed."#,
+        ),
+        (
+            r#"(ROW(1, 'x')::pair).a = 1"#,
+            r#"Only columns, constants, built-in operators, built-in data types, built-in collations, and immutable built-in functions are allowed."#,
+        ),
+        (
+            r#"1::d > 1"#,
+            r#"Only columns, constants, built-in operators, built-in data types, built-in collations, and immutable built-in functions are allowed."#,
+        ),
+        (
+            r#"(n::d)::int > 1"#,
+            r#"Only columns, constants, built-in operators, built-in data types, built-in collations, and immutable built-in functions are allowed."#,
+        ),
+        (
+            r#"'a'::mood::text = 'a'"#,
+            r#"Only columns, constants, built-in operators, built-in data types, built-in collations, and immutable built-in functions are allowed."#,
+        ),
+    ] {
+        let stmt = format!("CREATE PUBLICATION p FOR TABLE pt WHERE ({});", filter);
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", &stmt)]).expect_err(filter);
+        assert!(
+            err.to_string()
+                .starts_with(&format!("invalid publication WHERE expression ({detail})")),
+            "{filter}\n  got: {err}"
+        );
+    }
+}
