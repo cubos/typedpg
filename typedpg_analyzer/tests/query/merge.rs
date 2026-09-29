@@ -198,3 +198,84 @@ fn merge_returning_as_cte_body() {
         .unwrap();
     assert_cols(&s, vec![c("id", int4()), c("a", text())]);
 }
+
+// ── transformMergeStmt's structural rules ────────────────────────────────────
+
+/// transformInsertRow's arity rule applies to a WHEN NOT MATCHED INSERT.
+#[test]
+fn merge_insert_values_must_match_the_target_columns() {
+    let db = setup();
+    let err = db
+        .analyze("MERGE INTO t USING s ON t.id = s.id WHEN NOT MATCHED THEN INSERT (id, v) VALUES (1)")
+        .unwrap_err();
+    assert!(matches!(err, AnalyzeError::SyntaxError(_)), "{err:?}");
+    assert!(
+        err.to_string()
+            .starts_with("INSERT has more target columns than expressions"),
+        "{err}"
+    );
+    let err = db
+        .analyze(
+            "MERGE INTO t USING s ON t.id = s.id WHEN NOT MATCHED THEN INSERT VALUES (1, 2, 'x', 4)",
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("INSERT has more expressions than target columns"),
+        "{err}"
+    );
+    // Without a column list, the missing trailing columns take defaults.
+    db.analyze("MERGE INTO t USING s ON t.id = s.id WHEN NOT MATCHED THEN INSERT VALUES (s.id, 1)")
+        .unwrap();
+    db.analyze("MERGE INTO t USING s ON t.id = s.id WHEN NOT MATCHED THEN INSERT DEFAULT VALUES")
+        .unwrap();
+}
+
+/// A WHEN clause after an unconditional one of the same match kind can
+/// never run; other match kinds are unaffected.
+#[test]
+fn merge_rejects_unreachable_when_clauses() {
+    let db = setup();
+    for sql in [
+        "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN UPDATE SET v = 1 \
+         WHEN MATCHED THEN DELETE",
+        "MERGE INTO t USING s ON t.id = s.id WHEN NOT MATCHED BY SOURCE THEN DELETE \
+         WHEN NOT MATCHED BY SOURCE AND t.v > 0 THEN DO NOTHING",
+    ] {
+        let err = db.analyze(sql).unwrap_err();
+        assert!(matches!(err, AnalyzeError::SyntaxError(_)), "{sql}: {err:?}");
+        assert!(
+            err.to_string().starts_with(
+                "unreachable WHEN clause specified after unconditional WHEN clause"
+            ),
+            "{sql}: {err}"
+        );
+    }
+    db.analyze(
+        "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED AND s.v > 0 THEN DELETE \
+         WHEN MATCHED THEN DO NOTHING WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.v) \
+         WHEN NOT MATCHED BY SOURCE THEN DELETE",
+    )
+    .unwrap();
+}
+
+/// The target and the data source may not share a name.
+#[test]
+fn merge_target_and_source_need_distinct_names() {
+    let db = setup();
+    for sql in [
+        "MERGE INTO t USING t ON true WHEN MATCHED THEN DELETE",
+        "MERGE INTO t USING s AS t ON true WHEN MATCHED THEN DELETE",
+        "MERGE INTO t AS x USING (SELECT 1 AS id) x ON true WHEN MATCHED THEN DELETE",
+    ] {
+        let err = db.analyze(sql).unwrap_err();
+        assert!(matches!(err, AnalyzeError::DuplicateAlias(_)), "{sql}: {err:?}");
+        assert!(
+            err.to_string().starts_with("name \"")
+                && err.to_string().contains("\" specified more than once"),
+            "{sql}: {err}"
+        );
+    }
+    db.analyze("MERGE INTO t AS x USING t ON x.id = t.id WHEN MATCHED THEN DELETE")
+        .unwrap();
+}

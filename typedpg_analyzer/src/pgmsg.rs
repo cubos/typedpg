@@ -379,6 +379,51 @@ pub(crate) fn cannot_assign_to_system_column(column: &str, span: Option<SourceSp
     )
 }
 
+/// `name "t" specified more than once` — SQLSTATE 42712: a MERGE whose
+/// target and data source share a name (`transformMergeStmt`).
+pub(crate) fn merge_name_specified_twice(name: &str) -> RawError {
+    RawError::new(
+        AnalyzeError::DuplicateAlias(format!(
+            "name \"{name}\" specified more than once (The name is used both as MERGE target \
+             table and data source.)"
+        )),
+        None,
+        None,
+    )
+}
+
+/// `unreachable WHEN clause specified after unconditional WHEN clause` —
+/// SQLSTATE 42601 (`transformMergeStmt`).
+pub(crate) fn merge_unreachable_when_clause() -> RawError {
+    RawError::new(
+        AnalyzeError::SyntaxError(
+            "unreachable WHEN clause specified after unconditional WHEN clause".into(),
+        ),
+        None,
+        None,
+    )
+}
+
+/// `INSERT has more expressions than target columns` — SQLSTATE 42601
+/// (`transformInsertRow`).
+pub(crate) fn insert_more_expressions_than_targets() -> RawError {
+    RawError::new(
+        AnalyzeError::SyntaxError("INSERT has more expressions than target columns".into()),
+        None,
+        None,
+    )
+}
+
+/// `INSERT has more target columns than expressions` — SQLSTATE 42601
+/// (`transformInsertRow`).
+pub(crate) fn insert_more_targets_than_expressions() -> RawError {
+    RawError::new(
+        AnalyzeError::SyntaxError("INSERT has more target columns than expressions".into()),
+        None,
+        None,
+    )
+}
+
 /// `OLD cannot be specified multiple times` (or `NEW …`) — SQLSTATE 42601:
 /// a `RETURNING WITH (…)` list naming the same row twice
 /// (`transformReturningClause`).

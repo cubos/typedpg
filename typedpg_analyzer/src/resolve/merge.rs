@@ -58,6 +58,16 @@ pub(crate) fn analyze_merge_with_outer_ctes(
         .as_ref()
         .ok_or_else(|| AnalyzeError::Unsupported("MERGE without relation".into()))?;
 
+    // Process the optional `WITH` clause first (CTEs visible to source +
+    // ON + every WHEN branch) — transformMergeStmt does it before anything
+    // else.
+    let mut cte_scopes: HashMap<String, Vec<ScopeColumn>> = outer_ctes.clone();
+    if let Some(with) = &merge.with_clause {
+        cte_scopes = analyze_with_clause(with, snapshot, params, &cte_scopes)?;
+    }
+
+    check_unreachable_when_clauses(&merge.merge_when_clauses)?;
+
     let table = snapshot
         .resolve_table(
             if relation.schemaname.is_empty() {
@@ -106,13 +116,6 @@ pub(crate) fn analyze_merge_with_outer_ctes(
         .to_owned();
     let target_qn = crate::qualified_name::QualifiedName::new(&table_nsname, &table_relname);
 
-    // Process the optional `WITH` clause first (CTEs visible to source +
-    // ON + every WHEN branch).
-    let mut cte_scopes: HashMap<String, Vec<ScopeColumn>> = outer_ctes.clone();
-    if let Some(with) = &merge.with_clause {
-        cte_scopes = analyze_with_clause(with, snapshot, params, &cte_scopes)?;
-    }
-
     // The target alone, and the source's FROM item alone.
     let mut target_scope = Scope {
         ctes: cte_scopes.clone(),
@@ -133,6 +136,11 @@ pub(crate) fn analyze_merge_with_outer_ctes(
             &cte_scopes,
             params,
         )?;
+        // transformMergeStmt: the target and the source RTE may not share a
+        // name (a dedicated checkNameSpaceConflicts, 42712).
+        if from_item_refname(source_relation).as_deref() == Some(target_alias.as_str()) {
+            return Err(crate::pgmsg::merge_name_specified_twice(&target_alias).finalize_implicit());
+        }
     }
 
     // Both relations: the ON condition and WHEN MATCHED arms.
@@ -408,5 +416,62 @@ fn merge_when_insert(
             params.infer_nullable(p.number, true);
         }
     }
+    // transformInsertRow, after the values are transformed: more values
+    // than target columns is always an error, fewer only with an explicit
+    // column list (`INSERT DEFAULT VALUES` has no values at all).
+    if !when.values.is_empty() {
+        if when.values.len() > target_attrs.len() {
+            return Err(crate::pgmsg::insert_more_expressions_than_targets().finalize_implicit());
+        }
+        if !res_targets.is_empty() && when.values.len() < target_attrs.len() {
+            return Err(crate::pgmsg::insert_more_targets_than_expressions().finalize_implicit());
+        }
+    }
     Ok(())
+}
+
+/// transformMergeStmt's first pass over the WHEN clauses: once a match kind
+/// has an unconditional clause, a later clause of the same kind can never
+/// run (42601).
+fn check_unreachable_when_clauses(clauses: &[protobuf::Node]) -> Result<(), AnalyzeError> {
+    let mut terminal: Vec<i32> = Vec::new();
+    for n in clauses {
+        let Some(node::Node::MergeWhenClause(when)) = n.node.as_ref() else {
+            continue;
+        };
+        if terminal.contains(&when.match_kind) {
+            return Err(crate::pgmsg::merge_unreachable_when_clause().finalize_implicit());
+        }
+        if when.condition.is_none() {
+            terminal.push(when.match_kind);
+        }
+    }
+    Ok(())
+}
+
+/// The name a FROM item's range-table entry is known by (its `eref`
+/// alias): the alias when given, else the relation / CTE name, the first
+/// function's name, `json_table`, or PG's `unnamed_subquery` /
+/// `unnamed_join` placeholders.
+fn from_item_refname(item: &protobuf::Node) -> Option<String> {
+    let alias = |a: &Option<protobuf::Alias>| a.as_ref().map(|a| a.aliasname.clone());
+    match item.node.as_ref()? {
+        node::Node::RangeVar(rv) => alias(&rv.alias).or_else(|| Some(rv.relname.clone())),
+        node::Node::RangeSubselect(rs) => {
+            alias(&rs.alias).or_else(|| Some("unnamed_subquery".into()))
+        }
+        node::Node::JoinExpr(j) => alias(&j.alias).or_else(|| Some("unnamed_join".into())),
+        node::Node::RangeFunction(rf) => alias(&rf.alias).or_else(|| {
+            let Some(node::Node::List(pair)) = rf.functions.first()?.node.as_ref() else {
+                return None;
+            };
+            match pair.items.first()?.node.as_ref()? {
+                node::Node::FuncCall(fc) => expr::extract_string_fields(&fc.funcname).pop(),
+                _ => None,
+            }
+        }),
+        node::Node::JsonTable(jt) => alias(&jt.alias).or_else(|| Some("json_table".into())),
+        node::Node::RangeTableSample(ts) => from_item_refname(ts.relation.as_deref()?),
+        _ => None,
+    }
 }
