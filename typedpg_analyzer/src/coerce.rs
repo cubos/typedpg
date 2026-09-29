@@ -310,12 +310,14 @@ pub(crate) fn can_cast_explicit(
     if pseudo_or_unknown(scat) || pseudo_or_unknown(tcat) {
         return true;
     }
-    // Casting *to* a composite is allowed from `record`/another composite
-    // (a pseudo source, handled above) or a string type (handled above), but
-    // NOT from an arbitrary scalar — `numeric::some_composite` is a clear
-    // refusal PG rejects (`cannot cast type numeric to <composite>`).
+    // Casting *to* a composite is allowed from `record` (a pseudo source,
+    // handled above), a string type (handled above), or the row type of a
+    // table inheriting from the target's (`typeInheritsFrom`, a
+    // ConvertRowtypeExpr) — never from an unrelated composite or a scalar:
+    // `(u.*)::t` and `numeric::some_composite` are `cannot cast type X to
+    // Y` (can_coerce_type has no other composite rule and pg_cast no rows).
     if tcat == Some(TypCategory::Composite) {
-        return scat == Some(TypCategory::Composite);
+        return scat == Some(TypCategory::Composite) && type_inherits_from(s, t, snapshot);
     }
     // A composite *source* to a non-composite target is rare; err toward
     // allowing (composite→record/text are already covered above).

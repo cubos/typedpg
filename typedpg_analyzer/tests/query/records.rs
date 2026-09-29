@@ -2546,3 +2546,38 @@ fn row_constructor_expands_star_arguments() {
         "missing FROM-clause entry for table \"nosuch\""
     );
 }
+
+/// can_coerce_type relates composites only through `record`, the string
+/// types (I/O) and inheritance (`typeInheritsFrom`): a row of one table or
+/// type cannot be cast to an unrelated composite, while a child table's
+/// row casts to its parent's.
+#[test]
+fn composite_casts_between_unrelated_types_are_rejected() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE t (id INT PRIMARY KEY, name TEXT NOT NULL);
+         CREATE TABLE u (id INT PRIMARY KEY, tid INT NOT NULL, x TEXT);
+         CREATE TYPE comp AS (a INT, b TEXT);
+         CREATE TABLE parent (id INT);
+         CREATE TABLE child (extra TEXT) INHERITS (parent);",
+    )
+    .unwrap();
+    assert_err_prefix!(
+        db.analyze("SELECT (u.*)::t FROM u"),
+        AnalyzeError::Invalid(_),
+        "cannot cast type u to t"
+    );
+    assert_err_prefix!(
+        db.analyze("SELECT ('(1,a)'::comp)::t"),
+        AnalyzeError::Invalid(_),
+        "cannot cast type comp to t"
+    );
+    let s = db.analyze("SELECT (child.*)::parent AS p FROM child").unwrap();
+    assert!(matches!(&s.columns[0].pg_type, Type::Composite { name, .. } if name == "parent"));
+    db.analyze("SELECT (t.*)::text, 'x'::text::comp FROM t")
+        .unwrap();
+}
+
+/// coerce_type leaves a composite value cast to `record` as it is, so the
+/// column keeps the composite type (and its fields stay selectable).
+#[test]
