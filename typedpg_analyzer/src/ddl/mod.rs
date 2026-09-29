@@ -8,6 +8,7 @@ mod acl;
 pub mod aggregates;
 pub mod alter;
 pub(crate) mod coldeps;
+pub(crate) mod cmdtag;
 pub mod collations;
 mod comment;
 mod conversion_procs;
@@ -126,48 +127,95 @@ impl std::error::Error for DdlError {
 
 // ─── Dispatcher ─────────────────────────────────────────────────────────────
 
-/// Parse and apply all DDL statements in a SQL string.
+/// Apply one migration: its statements, in the transactions the migration
+/// runner gives them ([`txblock::Transaction`]).
+pub(crate) fn apply_migration(db: &mut PgCatalog, sql: &str) -> Result<(), DdlError> {
+    in_migration(db, |db| {
+        let parsed = parse(sql)?;
+        let mut tx = txblock::Transaction::start(db, sql, &parsed.protobuf.stmts);
+        for raw_stmt in &parsed.protobuf.stmts {
+            let Some(stmt) = raw_stmt.stmt.as_ref().and_then(|n| n.node.as_ref()) else {
+                continue;
+            };
+            let result = tx
+                .check(db, stmt)
+                .and_then(|()| tx.check_setting(stmt))
+                .and_then(|()| {
+                    with_statement_sql(db, sql, raw_stmt, |db| match stmt {
+                        node::Node::TransactionStmt(t) => tx.control(db, t),
+                        _ => apply_statement(db, stmt),
+                    })
+                });
+            if let Err(e) = result {
+                tx.abort(db);
+                return Err(e);
+            }
+            tx.after(stmt);
+        }
+        tx.finish(db);
+        Ok(())
+    })
+}
+
+/// Parse and apply all DDL statements in a SQL string that runs inside
+/// another statement (an extension's scripts).
 pub(crate) fn apply_sql_to(db: &mut PgCatalog, sql: &str) -> Result<(), DdlError> {
+    in_migration(db, |db| {
+        let parsed = parse(sql)?;
+        for raw_stmt in &parsed.protobuf.stmts {
+            let Some(stmt) = raw_stmt.stmt.as_ref().and_then(|n| n.node.as_ref()) else {
+                continue;
+            };
+            with_statement_sql(db, sql, raw_stmt, |db| apply_statement(db, stmt))?;
+        }
+        Ok(())
+    })
+}
+
+/// Run `f` in the migrations' session.
+fn in_migration(
+    db: &mut PgCatalog,
+    f: impl FnOnce(&mut PgCatalog) -> Result<(), DdlError>,
+) -> Result<(), DdlError> {
     let was_in_migration = std::mem::replace(&mut db.in_migration, true);
     // `$user` resolves only in the migrations' session.
     db.refresh_search_path();
-    let result = apply_sql_statements(db, sql);
+    let result = f(db);
     db.in_migration = was_in_migration;
     db.refresh_search_path();
     result
 }
 
-fn apply_sql_statements(db: &mut PgCatalog, sql: &str) -> Result<(), DdlError> {
+fn parse(sql: &str) -> Result<typedpg_pg_query::ParseResult, DdlError> {
     // A grammar error carries PG's message verbatim.
-    let parsed = typedpg_pg_query::parse(sql).map_err(|e| {
+    typedpg_pg_query::parse(sql).map_err(|e| {
         DdlError::Parse(match e {
             typedpg_pg_query::Error::Parse(msg) => msg,
             other => other.to_string(),
         })
-    })?;
-    let tx = txblock::TxContext::of(sql, &parsed.protobuf.stmts);
+    })
+}
 
-    for raw_stmt in &parsed.protobuf.stmts {
-        let Some(stmt) = raw_stmt.stmt.as_ref().and_then(|n| n.node.as_ref()) else {
-            continue;
-        };
-        tx.check(stmt)?;
-        // stmt_len 0 means "to the end of the input".
-        let start = usize::try_from(raw_stmt.stmt_location).unwrap_or(0);
-        let end = match usize::try_from(raw_stmt.stmt_len) {
-            Ok(0) | Err(_) => sql.len(),
-            Ok(len) => start + len,
-        };
-        let text = sql.get(start..end).map(str::to_owned);
-        // Statements may apply nested SQL (extension scripts): restore the
-        // outer statement's text afterwards.
-        let outer = std::mem::replace(&mut db.statement_sql, text);
-        let result = apply_statement(db, stmt);
-        db.statement_sql = outer;
-        result?;
-    }
-
-    Ok(())
+/// Run `f` with [`PgCatalog::statement_sql`] set to the text of `raw_stmt`.
+fn with_statement_sql(
+    db: &mut PgCatalog,
+    sql: &str,
+    raw_stmt: &typedpg_pg_query::protobuf::RawStmt,
+    f: impl FnOnce(&mut PgCatalog) -> Result<(), DdlError>,
+) -> Result<(), DdlError> {
+    // stmt_len 0 means "to the end of the input".
+    let start = usize::try_from(raw_stmt.stmt_location).unwrap_or(0);
+    let end = match usize::try_from(raw_stmt.stmt_len) {
+        Ok(0) | Err(_) => sql.len(),
+        Ok(len) => start + len,
+    };
+    let text = sql.get(start..end).map(str::to_owned);
+    // Statements may apply nested SQL (extension scripts): restore the
+    // outer statement's text afterwards.
+    let outer = std::mem::replace(&mut db.statement_sql, text);
+    let result = f(db);
+    db.statement_sql = outer;
+    result
 }
 
 /// Dispatch a single parsed statement.
@@ -235,6 +283,9 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         // ── Session state (search_path) ─────────────────────────────
         node::Node::VariableSetStmt(s) => session::variable_set(db, s),
         node::Node::AlterDatabaseSetStmt(s) => session::alter_database_set(db, s),
+        // Top-level transaction control goes through the migration's
+        // `txblock::Transaction`; this is what one nested in another
+        // statement's SQL does.
         node::Node::TransactionStmt(s) => session::transaction(db, s),
         node::Node::SelectStmt(s) if s.into_clause.is_some() => views::select_into(db, s),
         node::Node::SelectStmt(s) => {
@@ -300,8 +351,8 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         node::Node::LockStmt(s) => maintenance::lock(db, s),
         node::Node::SecLabelStmt(s) => maintenance::security_label(s),
         node::Node::AlterDefaultPrivilegesStmt(s) => maintenance::alter_default_privileges(db, s),
+        node::Node::ConstraintsSetStmt(s) => session::set_constraints(db, s),
         node::Node::GrantRoleStmt(_)
-        | node::Node::ConstraintsSetStmt(_)
         | node::Node::CreateRoleStmt(_)
         | node::Node::AlterRoleStmt(_)
         | node::Node::AlterOperatorStmt(_)

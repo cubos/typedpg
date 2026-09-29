@@ -560,6 +560,11 @@ pub(crate) struct FkDetails {
 }
 
 impl FkDetails {
+    /// `condeferrable`.
+    pub(crate) fn deferrable(&self) -> bool {
+        self.deferrable
+    }
+
     fn of(c: &typedpg_pg_query::protobuf::Constraint) -> Self {
         let or = |s: &str, default: &str| {
             if s.is_empty() {

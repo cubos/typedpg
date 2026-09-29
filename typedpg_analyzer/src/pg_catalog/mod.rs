@@ -16,7 +16,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ddl::{DdlError, apply_sql_to};
+use crate::ddl::DdlError;
 use crate::error::AnalyzeError;
 use crate::lexer::lex;
 use crate::oid::{
@@ -315,6 +315,11 @@ pub struct PgCatalog {
     /// (PL/pgSQL compilation). `None` outside `apply_sql`.
     pub(crate) statement_sql: Option<String>,
     pub(crate) in_migration: bool,
+    /// The migration runner wraps each migration in a transaction of its
+    /// own (`use_transaction`), unless the file opts out with
+    /// `-- no-transaction`. Off by default: each migration is then sent as
+    /// a bare simple query, as `batch_execute` alone does.
+    pub(crate) migrations_use_transaction: bool,
     /// `ON COMMIT DROP` temporary tables of the current transaction.
     pub(crate) on_commit_drop: Vec<PgClassOid>,
     /// Languages added by CREATE LANGUAGE, and built-in ones dropped or
@@ -629,6 +634,7 @@ impl PgCatalog {
             relpersistence: HashMap::new(),
             temp_namespace: None,
             in_migration: false,
+            migrations_use_transaction: false,
             statement_sql: None,
             on_commit_drop: Vec::new(),
             languages: Vec::new(),
@@ -779,11 +785,11 @@ impl PgCatalog {
     }
 
     /// Parse and apply all DDL statements in `sql`, mutating the catalog.
+    /// `sql` is one migration: its transactions commit or roll back as the
+    /// runner's would, and a migration that fails leaves the catalog as its
+    /// last transaction found it.
     pub fn apply_sql(&mut self, sql: &str) -> Result<(), DdlError> {
-        let result = apply_sql_to(self, sql);
-        // One `apply_sql` call is one migration, which the runner wraps in
-        // its own transaction: `SET LOCAL` values end with it.
-        self.end_transaction_scope();
+        let result = crate::ddl::apply_migration(self, sql);
         #[cfg(feature = "pg_sanity")]
         {
             if sql_touches_extension(sql) {
@@ -1104,6 +1110,44 @@ impl PgCatalog {
             self.pg_sanity_skip = true;
         }
     }
+
+    /// Whether the migration runner wraps each migration in a transaction
+    /// (its `use_transaction` setting; off by default). A wrapped migration
+    /// runs in an explicit transaction block — savepoints work, statements
+    /// that can't run in a block fail — while an unwrapped one runs as a
+    /// bare simple query.
+    pub fn set_migrations_use_transaction(&mut self, use_transaction: bool) {
+        self.migrations_use_transaction = use_transaction;
+    }
+
+    /// A copy of the catalog to roll back to: the state a transaction or a
+    /// savepoint started from.
+    pub(crate) fn snapshot(&self) -> Box<PgCatalog> {
+        Box::new(self.clone())
+    }
+
+    /// Roll the catalog back to `snapshot` (ROLLBACK, ROLLBACK TO
+    /// SAVEPOINT, a failed statement). What isn't transactional stays: the
+    /// OID counter (PG never hands an OID out twice), and the state of the
+    /// statement being applied and of the sanity mirror.
+    pub(crate) fn roll_back_to(&mut self, snapshot: &PgCatalog) {
+        let next_oid = self.next_oid;
+        let statement_sql = self.statement_sql.take();
+        let in_migration = self.in_migration;
+        let installing_extension = self.installing_extension.take();
+        #[cfg(feature = "pg_sanity")]
+        let (tainted, skip) = (self.pg_sanity_tainted, self.pg_sanity_skip);
+        *self = snapshot.clone();
+        self.next_oid = next_oid.max(self.next_oid);
+        self.statement_sql = statement_sql;
+        self.in_migration = in_migration;
+        self.installing_extension = installing_extension;
+        #[cfg(feature = "pg_sanity")]
+        {
+            self.pg_sanity_tainted = tainted;
+            self.pg_sanity_skip = skip;
+        }
+    }
 }
 
 // ─── PG sanity sanity check (feature-gated) ───────────────────────────────────
@@ -1205,7 +1249,7 @@ impl PgCatalog {
         &mut self,
         sql: &str,
     ) -> (Result<(), DdlError>, Option<crate::pg_sanity::Divergence>) {
-        let result = apply_sql_to(self, sql);
+        let result = crate::ddl::apply_migration(self, sql);
         if sql_touches_extension(sql) {
             self.pg_sanity_tainted = true;
             return (result, None);

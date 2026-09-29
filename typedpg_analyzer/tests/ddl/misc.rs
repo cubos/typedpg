@@ -2012,6 +2012,203 @@ fn transaction_block_rules_follow_the_migration_runner() {
 }
 
 #[test]
+fn transaction_control_follows_the_transaction_block() {
+    // PG 18 xact.c (DefineSavepoint, ReleaseSavepoint, RollbackToSavepoint,
+    // EndTransactionBlock, PrepareTransactionBlock), PreventCommandIfReadOnly
+    // / ExecCheckXactReadOnly, and AfterTriggerSetState (SET CONSTRAINTS).
+    let setup = "CREATE TABLE t (a int UNIQUE);
+                 CREATE TABLE d (a int UNIQUE DEFERRABLE);";
+    for (stmt, msg) in [
+        (
+            "SAVEPOINT sp;",
+            "SAVEPOINT can only be used in transaction blocks",
+        ),
+        (
+            "SELECT 1; SAVEPOINT sp;",
+            "SAVEPOINT can only be used in transaction blocks",
+        ),
+        (
+            "SELECT 1; RELEASE SAVEPOINT sp;",
+            "RELEASE SAVEPOINT can only be used in transaction blocks",
+        ),
+        (
+            "BEGIN; ROLLBACK TO SAVEPOINT nosp; COMMIT;",
+            "savepoint \"nosp\" does not exist",
+        ),
+        (
+            "BEGIN; SAVEPOINT a; RELEASE SAVEPOINT a; RELEASE SAVEPOINT a; COMMIT;",
+            "savepoint \"a\" does not exist",
+        ),
+        (
+            "BEGIN; DISCARD ALL; COMMIT;",
+            "DISCARD ALL cannot run inside a transaction block",
+        ),
+        (
+            "BEGIN; VACUUM t; COMMIT;",
+            "VACUUM cannot run inside a transaction block",
+        ),
+        (
+            "BEGIN READ ONLY; CREATE TABLE u (a int); COMMIT;",
+            "cannot execute CREATE TABLE in a read-only transaction",
+        ),
+        (
+            "BEGIN READ ONLY; CREATE TEMP TABLE u (a int); COMMIT;",
+            "cannot execute CREATE TABLE in a read-only transaction",
+        ),
+        (
+            "BEGIN READ ONLY; INSERT INTO t VALUES (1); COMMIT;",
+            "cannot execute INSERT in a read-only transaction",
+        ),
+        (
+            "SET TRANSACTION READ ONLY; COMMENT ON TABLE t IS 'x';",
+            "cannot execute COMMENT in a read-only transaction",
+        ),
+        (
+            "BEGIN READ ONLY; SELECT 1; SET TRANSACTION READ WRITE; COMMIT;",
+            "transaction read-write mode must be set before any query",
+        ),
+        (
+            "SET CONSTRAINTS nosuch IMMEDIATE;",
+            "constraint \"nosuch\" does not exist",
+        ),
+        (
+            "SET CONSTRAINTS nosch.t_a_key IMMEDIATE;",
+            "schema \"nosch\" does not exist",
+        ),
+        (
+            "BEGIN; SET CONSTRAINTS t_a_key DEFERRED; COMMIT;",
+            "constraint \"t_a_key\" is not deferrable",
+        ),
+        (
+            "SELECT 1; COMMIT AND CHAIN;",
+            "COMMIT AND CHAIN can only be used in transaction blocks",
+        ),
+        (
+            "BEGIN; CREATE TABLE u (a int); PREPARE TRANSACTION 'x';",
+            "prepared transactions are disabled",
+        ),
+        (
+            "COMMIT PREPARED 'x';",
+            "prepared transaction with identifier \"x\" does not exist",
+        ),
+        (
+            "SELECT 1; ROLLBACK PREPARED 'x';",
+            "ROLLBACK PREPARED cannot run inside a transaction block",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    for ok in [
+        "BEGIN; SAVEPOINT a; SAVEPOINT a; RELEASE SAVEPOINT a; RELEASE SAVEPOINT a; COMMIT;",
+        "BEGIN READ ONLY; SELECT a FROM t; SET TRANSACTION READ ONLY; COMMIT;",
+        "BEGIN READ ONLY; SET transaction_read_only = off; CREATE TABLE u (a int); COMMIT;",
+        "BEGIN; SET CONSTRAINTS d_a_key, t_a_key IMMEDIATE; SET CONSTRAINTS d_a_key DEFERRED; COMMIT;",
+        "SET CONSTRAINTS ALL DEFERRED;",
+        "SET TRANSACTION READ ONLY;",
+        "PREPARE TRANSACTION 'x';",
+        "BEGIN; CREATE TABLE u (a int); COMMIT AND CHAIN; CREATE TABLE w (a int); COMMIT;",
+    ] {
+        build_db(&[("0001.sql", setup), ("0002.sql", ok)]);
+    }
+}
+
+#[test]
+fn rollback_undoes_the_catalog_changes_of_its_transaction() {
+    // PG 18: ROLLBACK and ROLLBACK TO SAVEPOINT undo everything since the
+    // transaction / savepoint started — catalog changes and settings alike.
+    let db = build_db(&[
+        ("0001.sql", "BEGIN; CREATE TABLE t (a int); ROLLBACK;"),
+        ("0002.sql", "CREATE TABLE t (b int);"),
+        (
+            "0003.sql",
+            "BEGIN; SET search_path = pg_catalog; ROLLBACK; CREATE TABLE u (a int);",
+        ),
+        (
+            "0004.sql",
+            "BEGIN;
+             CREATE TABLE v (a int);
+             SAVEPOINT sp;
+             CREATE TABLE w (a int);
+             SET LOCAL search_path = pg_catalog;
+             ROLLBACK TO SAVEPOINT sp;
+             CREATE TABLE w (b int);
+             COMMIT;",
+        ),
+        // ROLLBACK in the implicit block of a multi-statement query aborts
+        // it too.
+        (
+            "0005.sql",
+            "CREATE TABLE x (a int); ROLLBACK; CREATE TABLE x (b int);",
+        ),
+    ]);
+    for sql in [
+        "SELECT b FROM t",
+        "SELECT a FROM public.u",
+        "SELECT a FROM v",
+        "SELECT b FROM public.w",
+        "SELECT b FROM x",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
+
+#[test]
+fn a_failed_migration_leaves_no_trace() {
+    // PG 18: the failing statement aborts the migration's transaction, and
+    // with it every statement since the last COMMIT.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE t (a int); CREATE TABLE t (a int);")
+        .expect_err("duplicate table");
+    let err = db
+        .analyze("SELECT a FROM t")
+        .expect_err("t was rolled back");
+    assert!(
+        err.to_string().starts_with("relation \"t\" does not exist"),
+        "got: {err}"
+    );
+    // What a COMMIT made durable stays.
+    db.apply_sql("CREATE TABLE c (a int); COMMIT; CREATE TABLE d (a int); CREATE TABLE c (a int);")
+        .expect_err("duplicate table");
+    db.analyze("SELECT a FROM c").unwrap();
+    let err = db
+        .analyze("SELECT a FROM d")
+        .expect_err("d was rolled back");
+    assert!(
+        err.to_string().starts_with("relation \"d\" does not exist"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn migrations_the_runner_wraps_in_a_transaction() {
+    // With `use_transaction`, the runner runs each migration inside a
+    // transaction block of its own: savepoints work, and statements that
+    // can't run in a block need `-- no-transaction`. (The sanity mirror
+    // sends migrations unwrapped.)
+    let wrapped = |sql: &str| {
+        let mut db = PgCatalog::new().unwrap();
+        db.skip_pg_sanity();
+        db.set_migrations_use_transaction(true);
+        db.apply_sql("CREATE TABLE t (a int);").unwrap();
+        db.apply_sql(sql).map(|()| db)
+    };
+    let db = wrapped("SAVEPOINT sp; CREATE TABLE u (a int); ROLLBACK TO SAVEPOINT sp;").unwrap();
+    assert!(db.resolve_table(None, "u").is_none());
+    wrapped("SAVEPOINT sp;").unwrap();
+    wrapped("LOCK TABLE t;").unwrap();
+    wrapped("-- no-transaction\nCREATE INDEX CONCURRENTLY ON t (a);").unwrap();
+    let Err(err) = wrapped("CREATE INDEX CONCURRENTLY ON t (a);") else {
+        panic!("CREATE INDEX CONCURRENTLY ran in the runner's transaction");
+    };
+    assert!(
+        err.to_string()
+            .starts_with("CREATE INDEX CONCURRENTLY cannot run inside a transaction block"),
+        "got: {err}"
+    );
+}
+
+#[test]
 fn rename_constraint_needs_a_free_name() {
     // PG 18 RenameConstraintById / RenameRelationInternal /
     // get_domain_constraint_oid.

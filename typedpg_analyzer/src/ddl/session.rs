@@ -609,3 +609,91 @@ fn split_identifier_string(value: &str) -> Vec<String> {
     }
     out
 }
+
+/// `SET CONSTRAINTS { ALL | name [, ...] } { DEFERRED | IMMEDIATE }`
+/// (AfterTriggerSetState): each name must match a constraint in its schema
+/// — or, unqualified, in the first schema of the search path that has one
+/// — and SET ... DEFERRED needs every match to be deferrable.
+pub(crate) fn set_constraints(
+    interp: &PgCatalog,
+    stmt: &typedpg_pg_query::protobuf::ConstraintsSetStmt,
+) -> Result<(), DdlError> {
+    for constraint in &stmt.constraints {
+        let Some(node::Node::RangeVar(rv)) = constraint.node.as_ref() else {
+            continue;
+        };
+        let namespaces = if rv.schemaname.is_empty() {
+            interp.schemas_for_lookup(None)
+        } else {
+            vec![super::util::existing_namespace(interp, &rv.schemaname)?]
+        };
+        let mut found = false;
+        for ns in namespaces {
+            for deferrable in constraint_deferrability(interp, ns, &rv.relname) {
+                if !deferrable && stmt.deferred {
+                    return Err(DdlError::UnsupportedDdl(format!(
+                        "constraint \"{}\" is not deferrable",
+                        rv.relname
+                    )));
+                }
+                found = true;
+            }
+            if found {
+                break;
+            }
+        }
+        if !found {
+            return Err(DdlError::TypeNotFound(format!(
+                "constraint \"{}\" does not exist",
+                rv.relname
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// `condeferrable` of every constraint named `name` in schema `ns`
+/// (`pg_constraint.connamespace`): table constraints, domain constraints
+/// and constraint triggers.
+fn constraint_deferrability(
+    interp: &PgCatalog,
+    ns: crate::oid::PgNamespaceOid,
+    name: &str,
+) -> Vec<bool> {
+    use crate::pg_catalog::ConType;
+    let mut out = Vec::new();
+    for c in interp.pg_constraint.values() {
+        if c.conname != name || interp.pg_class.get(&c.conrelid).map(|r| r.relnamespace) != Some(ns)
+        {
+            continue;
+        }
+        out.push(match c.contype {
+            ConType::ForeignKey => interp
+                .fk_details
+                .get(&c.oid)
+                .is_some_and(|fk| fk.deferrable()),
+            // The constraint's index carries its name (indimmediate).
+            ConType::PrimaryKey | ConType::Unique | ConType::Exclusion => interp
+                .class_by_qname
+                .get(&(ns, c.conname.clone()))
+                .is_some_and(|index| interp.nonimmediate_indexes.contains(index)),
+            _ => false,
+        });
+    }
+    for (domain, constraints) in &interp.domain_constraints {
+        if interp.pg_type.get(domain).map(|t| t.typnamespace) == Some(ns) {
+            out.extend(constraints.iter().filter(|c| c.name == name).map(|_| false));
+        }
+    }
+    for (relid, triggers) in &interp.triggers {
+        if interp.pg_class.get(relid).map(|r| r.relnamespace) == Some(ns) {
+            out.extend(
+                triggers
+                    .iter()
+                    .filter(|t| t.name == name)
+                    .filter_map(|t| t.constraint_deferrable),
+            );
+        }
+    }
+    out
+}

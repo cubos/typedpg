@@ -17,6 +17,9 @@ pub(crate) struct Trigger {
     /// an `INSTEAD OF ... FOR EACH ROW` trigger, else 0 — what the
     /// relcache's `trig_*_instead_row` flags are made of.
     pub(crate) instead_row_events: i32,
+    /// A constraint trigger's `pg_constraint.condeferrable`; `None` for a
+    /// plain trigger.
+    pub(crate) constraint_deferrable: Option<bool>,
 }
 
 impl Trigger {
@@ -256,6 +259,7 @@ pub fn create_trigger(interp: &mut PgCatalog, stmt: &CreateTrigStmt) -> Result<(
         name: stmt.trigname.clone(),
         function,
         instead_row_events,
+        constraint_deferrable: stmt.isconstraint.then_some(stmt.deferrable),
     });
     Ok(())
 }

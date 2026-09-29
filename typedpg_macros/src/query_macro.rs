@@ -21,6 +21,8 @@ struct CachedPgCatalog {
     catalog: PgCatalog,
     /// Cache key: migration hash.
     migration_hash: String,
+    /// Cache key: the runner's `use_transaction` setting.
+    use_transaction: bool,
 }
 
 thread_local! {
@@ -28,14 +30,18 @@ thread_local! {
 }
 
 /// Build (or retrieve from cache) a [`PgCatalog`] from migration files.
+/// `use_transaction` is the migration runner's setting: whether it wraps
+/// each migration in a transaction.
 fn get_or_build_pg_catalog(
     migrations_dirs: &[&Path],
     migration_hash: &str,
+    use_transaction: bool,
 ) -> Result<PgCatalog, syn::Error> {
     CACHED_PG_CATALOG.with(|cell| {
         let borrow = cell.borrow();
         if let Some(cached) = borrow.as_ref()
             && cached.migration_hash == migration_hash
+            && cached.use_transaction == use_transaction
         {
             return Ok(cached.catalog.clone());
         }
@@ -48,6 +54,7 @@ fn get_or_build_pg_catalog(
                 format!("failed to load embedded PG catalog seed: {e}"),
             )
         })?;
+        catalog.set_migrations_use_transaction(use_transaction);
         for (filename, sql) in &migrations {
             catalog.apply_sql(sql).map_err(|e| {
                 syn::Error::new(
@@ -60,6 +67,7 @@ fn get_or_build_pg_catalog(
         cell.borrow_mut().replace(CachedPgCatalog {
             catalog: catalog.clone(),
             migration_hash: migration_hash.to_string(),
+            use_transaction,
         });
 
         Ok(catalog)
@@ -289,7 +297,11 @@ pub fn expand(input: QueryInput) -> Result<proc_macro2::TokenStream, syn::Error>
         syn::Error::new(Span::call_site(), format!("failed to hash migrations: {e}"))
     })?;
 
-    let catalog = get_or_build_pg_catalog(&all_dirs, &migration_hash)?;
+    let catalog = get_or_build_pg_catalog(
+        &all_dirs,
+        &migration_hash,
+        config.migrations.use_transaction,
+    )?;
 
     // 3. Analyze the SQL (lex + type inference in one pass).
     let analyzed = catalog
