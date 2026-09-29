@@ -29,6 +29,9 @@ pub(crate) struct NullabilityContext {
     /// PG evaluates them in lockstep (`ProjectSet`) and pads the ones that
     /// run out of rows first with NULL, so every SRF result is nullable.
     pub srfs_in_lockstep: bool,
+    /// The frame options (`FRAMEOPTION_*` bits) of each window the SELECT's
+    /// WINDOW clause names — what `OVER w` runs over.
+    pub window_frames: std::collections::HashMap<String, i32>,
 }
 
 impl NullabilityContext {
@@ -36,6 +39,19 @@ impl NullabilityContext {
     pub fn mark_all_nullable(&mut self, aliases: &[String]) {
         for a in aliases {
             self.nullable_aliases.insert(a.clone());
+        }
+    }
+
+    /// The frame options a window call's `OVER` clause runs over: its own,
+    /// or — for `OVER w` — those of the named window (`None` when unknown).
+    pub fn window_frame_options(
+        &self,
+        over: &typedpg_pg_query::protobuf::WindowDef,
+    ) -> Option<i32> {
+        if over.name.is_empty() {
+            Some(over.frame_options)
+        } else {
+            self.window_frames.get(&over.name).copied()
         }
     }
 

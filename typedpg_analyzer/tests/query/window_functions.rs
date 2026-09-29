@@ -146,15 +146,56 @@ fn lead_over_not_null_column_is_nullable() {
     assert_cols(&s, vec![cn("next", int4())]);
 }
 
+/// FIRST_VALUE / LAST_VALUE read a row of the frame: one exists whenever
+/// the frame holds the current row, so they are NULL only for a NULL
+/// value — or a frame that can be empty.
 #[test]
-fn first_value_is_nullable() {
+fn first_and_last_value_follow_the_frame() {
     let db = setup();
     let s = db
         .analyze(
-            "SELECT FIRST_VALUE(title) OVER (PARTITION BY user_id ORDER BY id) AS first FROM posts",
+            "SELECT FIRST_VALUE(title) OVER (PARTITION BY user_id ORDER BY id) AS first, \
+             LAST_VALUE(title) OVER w AS last, \
+             FIRST_VALUE(title) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND 1 PRECEDING) \
+             AS gap, \
+             LAST_VALUE(title) OVER (ORDER BY id ROWS UNBOUNDED PRECEDING EXCLUDE CURRENT ROW) \
+             AS excl \
+             FROM posts WINDOW w AS (ORDER BY id)",
         )
         .unwrap();
-    assert_cols(&s, vec![cn("first", text())]);
+    assert_cols(
+        &s,
+        vec![
+            c("first", text()),
+            c("last", text()),
+            cn("gap", text()),
+            cn("excl", text()),
+        ],
+    );
+}
+
+/// A window aggregate over `OVER w` takes the frame of the WINDOW clause's
+/// `w`, exactly like the same window written inline.
+#[test]
+fn named_window_frame_decides_aggregate_nullability() {
+    let db = setup();
+    let s = db
+        .analyze(
+            "SELECT sum(views) OVER w AS a, max(views) OVER p AS b, sum(views) OVER e AS c, \
+             sum(views) OVER (w) AS d \
+             FROM posts WINDOW w AS (ORDER BY id), p AS (PARTITION BY id), \
+             e AS (ORDER BY id ROWS BETWEEN 2 PRECEDING AND 1 PRECEDING)",
+        )
+        .unwrap();
+    assert_cols(
+        &s,
+        vec![
+            c("a", int8()),
+            c("b", int4()),
+            cn("c", int8()),
+            c("d", int8()),
+        ],
+    );
 }
 
 /// transformFrameOffset: a ROWS / GROUPS offset is coerced to bigint by

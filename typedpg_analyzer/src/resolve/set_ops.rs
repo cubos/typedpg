@@ -199,7 +199,14 @@ pub(crate) fn analyze_set_operation(
         columns.push(RawColumn {
             name: l.name,
             type_oid,
-            nullable: l.nullable || r.nullable,
+            // EXCEPT only emits left rows; INTERSECT only left rows equal
+            // (NULLs not distinct) to a right one — a NULL there needs
+            // both sides to have one.
+            nullable: match op_label {
+                "EXCEPT" => l.nullable,
+                "INTERSECT" => l.nullable && r.nullable,
+                _ => l.nullable || r.nullable,
+            },
             typmod,
             collation,
             record_fields: None,

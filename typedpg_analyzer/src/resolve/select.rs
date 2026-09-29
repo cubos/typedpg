@@ -214,6 +214,14 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
     let mut null_ctx = NullabilityContext::default();
     null_ctx.has_group_by = !sel.group_clause.is_empty();
     null_ctx.srfs_in_lockstep = count_srf_calls(&sel.target_list, snapshot) > 1;
+    null_ctx.window_frames = sel
+        .window_clause
+        .iter()
+        .filter_map(|w| match w.node.as_ref()? {
+            node::Node::WindowDef(wd) => Some((wd.name.clone(), wd.frame_options)),
+            _ => None,
+        })
+        .collect();
 
     // Process FROM clause. An aggregate of this level inside it (in a
     // LATERAL subquery) is PG's EXPR_KIND_FROM_SUBSELECT error; JOIN

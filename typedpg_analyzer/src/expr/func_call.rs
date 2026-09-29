@@ -1106,6 +1106,16 @@ fn resolve_func_nullability(
             "lag" | "lead" if func.args.len() >= 3 => {
                 arg_is_nullable(0) || arg_is_nullable(1) || arg_is_nullable(2)
             }
+            // The first / last row of the frame: one exists whenever the
+            // frame holds the current row.
+            "first_value" | "last_value" => {
+                arg_is_nullable(0)
+                    || !func
+                        .over
+                        .as_deref()
+                        .and_then(|over| null_ctx.window_frame_options(over))
+                        .is_some_and(frame_contains_current_row)
+            }
             _ => true,
         }
     } else if resolved.is_aggregate {
@@ -1130,8 +1140,11 @@ fn resolve_func_nullability(
             // contains the current row (every window input row exists), but
             // `ROWS … 1 PRECEDING`, `… FOLLOWING`-only frames and `EXCLUDE
             // CURRENT ROW / GROUP` can leave it empty. `OVER w` takes its
-            // frame from the WINDOW clause, not visible here.
-            !over.name.is_empty() || !frame_contains_current_row(over.frame_options) || over_rows()
+            // frame from the WINDOW clause.
+            !null_ctx
+                .window_frame_options(over)
+                .is_some_and(frame_contains_current_row)
+                || over_rows()
         } else if null_ctx.has_empty_grouping_set {
             // GROUPING SETS / ROLLUP / CUBE include an empty grouping set
             // (or `GROUP BY ()` does explicitly). For that row the aggregate

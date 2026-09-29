@@ -222,3 +222,23 @@ fn set_op_column_count_mismatch_uses_pg_wording() {
         "got: {err}"
     );
 }
+
+/// EXCEPT only emits left rows, and INTERSECT only left rows matched by a
+/// right one (NULLs match each other): a column is NULL only when the left
+/// arm's is — and for INTERSECT, the right arm's too.
+#[test]
+fn except_and_intersect_nullability_follows_the_left_arm() {
+    let db = setup();
+    let s = db
+        .analyze("SELECT name AS a, age AS b FROM users EXCEPT SELECT NULL, 1")
+        .unwrap();
+    assert_cols(&s, vec![c("a", text()), cn("b", int4())]);
+    let s = db
+        .analyze("SELECT name AS a, age AS b, age AS c FROM users INTERSECT SELECT NULL, 1, age FROM users")
+        .unwrap();
+    assert_cols(&s, vec![c("a", text()), c("b", int4()), cn("c", int4())]);
+    let s = db
+        .analyze("SELECT name AS a FROM users UNION SELECT NULL")
+        .unwrap();
+    assert_cols(&s, vec![cn("a", text())]);
+}
