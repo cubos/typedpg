@@ -276,6 +276,9 @@ pub struct PgCatalog {
     pub(crate) foreign_data: crate::ddl::fdw::ForeignData,
     /// The extension whose scripts are running.
     pub(crate) installing_extension: Option<String>,
+    /// The index of each table's `REPLICA IDENTITY USING INDEX`
+    /// (`relreplident = 'i'`).
+    pub(crate) replica_identity_indexes: HashMap<PgClassOid, PgClassOid>,
     /// Logical-replication publications.
     pub(crate) publications: Vec<crate::ddl::publications::Publication>,
     /// `relpersistence` of unlogged (`u`) and temporary (`t`) relations;
@@ -578,6 +581,7 @@ impl PgCatalog {
             sequence_params: HashMap::new(),
             foreign_data: Default::default(),
             installing_extension: None,
+            replica_identity_indexes: HashMap::new(),
             publications: Vec::new(),
             event_triggers: Vec::new(),
             relpersistence: HashMap::new(),
@@ -757,6 +761,23 @@ impl PgCatalog {
     pub fn serialize_expression(&self, expr_sql: &str) -> Result<SerializedAst, DdlError> {
         let select = format!("SELECT {expr_sql}");
         crate::ddl::serialize_subnode(self, &select, crate::ddl::views::extract_first_target)
+    }
+
+    /// The `pg_constraint` rows of relation `name` (unqualified names go by
+    /// the search path), in OID order. Tests assert constraint flags with it.
+    #[cfg(any(test, feature = "internal"))]
+    pub fn constraints_of_table(&self, name: &str) -> Vec<PgConstraint> {
+        let Some(class) = self.resolve_table(None, name) else {
+            return Vec::new();
+        };
+        let mut rows: Vec<PgConstraint> = self
+            .pg_constraint
+            .values()
+            .filter(|c| c.conrelid == class.oid)
+            .cloned()
+            .collect();
+        rows.sort_by_key(|c| c.oid);
+        rows
     }
 
     // ── Introspection for the differential fuzzer (type-directed generation) ──
@@ -1009,6 +1030,25 @@ impl PgCatalog {
     /// CONFLICT target matching, which real PG rejects at planning time but
     /// PG sanity's `prepare` skips. Without the feature this is a no-op so
     /// callers can always invoke it without `#[cfg]`.
+    /// Whether a query can rely on column `attr` never being NULL. PG 18
+    /// sets `attnotnull` for a NOT VALID not-null constraint too, but rows
+    /// that predate it may still be NULL, so only a validated constraint
+    /// counts (the planner's `attnullability == ATTNULLABLE_VALID`). A
+    /// column without a constraint row (a seed relation) goes by
+    /// `attnotnull`.
+    pub(crate) fn attr_proven_not_null(&self, attr: &PgAttribute) -> bool {
+        attr.attnotnull
+            && self
+                .pg_constraint
+                .values()
+                .find(|c| {
+                    c.conrelid == attr.attrelid
+                        && c.contype == ConType::NotNull
+                        && c.conkey == [attr.attnum]
+                })
+                .is_none_or(|c| c.convalidated)
+    }
+
     pub fn skip_pg_sanity(&mut self) {
         #[cfg(feature = "pg_sanity")]
         {
@@ -1206,6 +1246,8 @@ impl PgCatalog {
         self.generated_refs.retain(|(relid, _), _| *relid != oid);
         self.attr_default_exprs
             .retain(|(relid, _), _| *relid != oid);
+        self.replica_identity_indexes
+            .retain(|table, index| *table != oid && *index != oid);
         self.partition_keys.remove(&oid);
         self.triggers.remove(&oid);
         self.policies.remove(&oid);

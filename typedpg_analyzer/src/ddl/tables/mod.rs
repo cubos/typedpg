@@ -262,13 +262,49 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
                     format!("column \"{key}\" named in key does not exist")
                 }));
             };
+            // AddRelationNotNullConstraints: a column's not-null
+            // specifications (column-level first, then table-level) merge
+            // into one constraint; their names and NO INHERIT flags must
+            // agree.
+            if is_not_null && col.nn_local {
+                if col.nn_no_inherit != c.is_no_inherit {
+                    return Err(DdlError::Parse(format!(
+                        "conflicting NO INHERIT declaration for not-null constraint on column \
+                         \"{key}\""
+                    )));
+                }
+                if let Some(existing) = col.nn_name.as_ref()
+                    && !c.conname.is_empty()
+                    && *existing != c.conname
+                {
+                    return Err(DdlError::Parse(format!(
+                        "conflicting not-null constraint names \"{existing}\" and \"{}\"",
+                        c.conname
+                    )));
+                }
+            }
+            if is_not_null {
+                col.nn_no_inherit = c.is_no_inherit;
+                if !c.conname.is_empty() {
+                    col.nn_name = Some(c.conname.clone());
+                }
+            }
             if is_primary || is_not_null {
                 col.not_null = true;
                 col.nn_local = true;
             }
-            if is_not_null && !c.conname.is_empty() {
-                col.nn_name = Some(c.conname.clone());
+        }
+    }
+    // Two columns' not-null constraints may not share a given name.
+    let mut given_names: Vec<&str> = Vec::new();
+    for col in &columns {
+        if let Some(n) = col.nn_name.as_deref() {
+            if given_names.contains(&n) {
+                return Err(DdlError::DuplicateObject(format!(
+                    "constraint \"{n}\" for relation \"{name}\" already exists"
+                )));
             }
+            given_names.push(n);
         }
     }
 
@@ -843,7 +879,7 @@ fn apply_alter_subtype(
             add_column(interp, relid, cmd, rec)
         }
         AlterTableType::AtDropColumn => drop_column(interp, relid, cmd, rec),
-        AlterTableType::AtSetNotNull => inherit::set_not_null(interp, relid, &cmd.name, None, rec),
+        AlterTableType::AtSetNotNull => inherit::set_not_null(interp, relid, &cmd.name, rec),
         AlterTableType::AtDropNotNull => inherit::drop_not_null(interp, relid, &cmd.name, rec),
         AlterTableType::AtColumnDefault => set_default(interp, relid, cmd, rec),
         AlterTableType::AtAlterColumnType => alter_column_type(interp, relid, cmd, rec),
@@ -882,9 +918,9 @@ fn apply_alter_subtype(
         AlterTableType::AtDetachPartition => inherit_cmd::detach_partition(interp, relid, cmd),
         AlterTableType::AtDropOf => typed::drop_of(interp, relid),
         AlterTableType::AtReplicaIdentity => object_refs::replica_identity(interp, relid, cmd),
-        AlterTableType::AtAlterConstraint => object_refs::alter_constraint(interp, relid, cmd),
+        AlterTableType::AtAlterConstraint => object_refs::alter_constraint(interp, relid, cmd, rec),
         AlterTableType::AtValidateConstraint => {
-            object_refs::validate_constraint(interp, relid, cmd)
+            object_refs::validate_constraint(interp, relid, cmd, rec)
         }
         AlterTableType::AtEnableRule
         | AlterTableType::AtEnableAlwaysRule

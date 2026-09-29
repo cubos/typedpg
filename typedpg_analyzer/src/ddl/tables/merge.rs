@@ -354,8 +354,14 @@ fn inherited_columns(
 
         for attr in interp.attributes_of(parent) {
             let identity = if is_partition { attr.attidentity } else { None };
-            let parent_nn = attr
-                .attnotnull
+            // RelationGetNotNullConstraints(include_noinh = false): a NO
+            // INHERIT not-null constraint stays with the parent.
+            let inherits_not_null =
+                match super::inherit::not_null_constraint(interp, parent, attr.attnum) {
+                    Some(con) => !con.connoinherit,
+                    None => attr.attnotnull,
+                };
+            let parent_nn = inherits_not_null
                 .then(|| super::inherit::not_null_name(interp, parent, attr.attnum));
             let has_default = attr.atthasdef && (attr.attidentity.is_none() || identity.is_some());
             let parent_default = interp
@@ -381,7 +387,7 @@ fn inherited_columns(
                         attr.attname
                     )));
                 }
-                existing.not_null |= attr.attnotnull;
+                existing.not_null |= inherits_not_null;
                 existing.has_default |= has_default;
                 existing.inhcount += 1;
                 // A default from a prior parent must be the same one.
@@ -402,7 +408,7 @@ fn inherited_columns(
                 name: attr.attname.clone(),
                 type_oid: attr.atttypid,
                 typmod: attr.atttypmod,
-                not_null: attr.attnotnull,
+                not_null: inherits_not_null,
                 has_default,
                 generated: attr.attgenerated,
                 identity,
@@ -443,6 +449,7 @@ fn merge_child_column(inh: &mut ParsedColumn, local: ParsedColumn) -> Result<(),
     }
     inh.not_null |= local.not_null;
     inh.nn_local |= local.nn_local;
+    inh.nn_no_inherit |= local.nn_no_inherit;
     if local.nn_name.is_some() {
         inh.nn_name = local.nn_name.clone();
     }
@@ -503,6 +510,7 @@ fn merge_partition_column(inh: &mut ParsedColumn, local: ParsedColumn) -> Result
     check_generation_merge(inh, &local)?;
     inh.not_null |= local.not_null;
     inh.nn_local |= local.nn_local;
+    inh.nn_no_inherit |= local.nn_no_inherit;
     if local.nn_name.is_some() {
         inh.nn_name = local.nn_name;
     }

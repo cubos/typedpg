@@ -30,6 +30,8 @@ mod functions;
 mod generated;
 #[path = "ddl/misc.rs"]
 mod misc;
+#[path = "ddl/not_null.rs"]
+mod not_null;
 #[path = "ddl/operators.rs"]
 mod operators;
 #[path = "ddl/procedures.rs"]

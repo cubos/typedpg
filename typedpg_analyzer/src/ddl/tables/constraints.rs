@@ -280,6 +280,9 @@ pub(crate) fn emit_constraints(
             interp, relid, conname, contype, conkey, confrelid, confkey, deferrable, include,
         )?;
         if let Some(def) = check {
+            if let Some(row) = interp.pg_constraint.get_mut(&oid) {
+                row.connoinherit = def.no_inherit;
+            }
             interp.check_defs.insert(oid, def);
         }
     }
@@ -571,7 +574,7 @@ fn check_no_primary_key(interp: &PgCatalog, relid: PgClassOid) -> Result<(), Ddl
 }
 
 /// An index's key columns, without its INCLUDE columns.
-fn key_columns(index: &PgIndex) -> &[i16] {
+pub(super) fn key_columns(index: &PgIndex) -> &[i16] {
     let n = usize::try_from(index.indnkeyatts).unwrap_or(0);
     &index.indkey[..n.min(index.indkey.len())]
 }
@@ -1305,15 +1308,10 @@ fn add_constraint_node(
                 }
             })
             .collect();
-        // A primary key's columns get (local) not-null constraints.
+        // ATPrepAddPrimaryKey: a primary key's columns get not-null
+        // constraints.
         for col in &pk_cols {
-            if interp.attribute_by_name(relid, col).is_some() {
-                let only_here = super::inherit::Recursion {
-                    recurse: false,
-                    recursing: false,
-                };
-                super::inherit::set_not_null(interp, relid, col, None, only_here)?;
-            }
+            super::inherit::require_pk_not_null(interp, relid, col, rec.recurse)?;
         }
         let attnums: Vec<i16> = pk_cols
             .iter()
@@ -1404,8 +1402,12 @@ fn add_constraint_node(
                 }
             })
             .unwrap_or_else(|| cmd_name.to_owned());
-        let explicit = (!c.conname.is_empty()).then_some(c.conname.as_str());
-        super::inherit::set_not_null(interp, relid, &col_name, explicit, rec)?;
+        let spec = super::inherit::NotNullSpec {
+            name: (!c.conname.is_empty()).then_some(c.conname.as_str()),
+            no_inherit: c.is_no_inherit,
+            not_valid: c.skip_validation,
+        };
+        super::inherit::add_not_null(interp, relid, &col_name, spec, rec)?;
     }
 
     if c.contype == ConstrType::ConstrCheck as i32
@@ -1556,11 +1558,9 @@ fn add_index_constraint(
     if c.deferrable {
         interp.nonimmediate_indexes.insert(index_oid);
     }
+    // transformIndexConstraint names the index's columns as the key, and
+    // ATPrepAddPrimaryKey gives them not-null constraints.
     if is_primary {
-        let only_here = super::inherit::Recursion {
-            recurse: false,
-            recursing: false,
-        };
         for attnum in key_columns(&index).iter().copied().filter(|&an| an > 0) {
             let colname = interp
                 .attributes_of(relid)
@@ -1568,7 +1568,7 @@ fn add_index_constraint(
                 .find(|a| a.attnum == attnum)
                 .map(|a| a.attname.clone())
                 .unwrap_or_default();
-            super::inherit::set_not_null(interp, relid, &colname, None, only_here)?;
+            super::inherit::require_pk_not_null(interp, relid, &colname, true)?;
         }
     }
     let oid = PgConstraintOid::from_nonzero(interp.alloc_oid()?);

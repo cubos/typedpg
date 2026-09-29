@@ -60,7 +60,7 @@ pub(super) fn cluster_on(
 /// `ALTER TABLE ... REPLICA IDENTITY USING INDEX index`
 /// (ATExecReplicaIdentity).
 pub(super) fn replica_identity(
-    interp: &PgCatalog,
+    interp: &mut PgCatalog,
     relid: PgClassOid,
     cmd: &AlterTableCmd,
 ) -> Result<(), DdlError> {
@@ -71,6 +71,7 @@ pub(super) fn replica_identity(
     };
     // REPLICA_IDENTITY_INDEX.
     if ri.identity_type != "i" {
+        interp.replica_identity_indexes.remove(&relid);
         return Ok(());
     }
     let name = &ri.name;
@@ -111,7 +112,20 @@ pub(super) fn replica_identity(
             )));
         }
     }
+    let index_oid = index.indexrelid;
+    interp.replica_identity_indexes.insert(relid, index_oid);
     Ok(())
+}
+
+/// The key columns of the table's replica identity index
+/// (`INDEX_ATTR_BITMAP_IDENTITY_KEY`).
+pub(crate) fn replica_identity_columns(interp: &PgCatalog, relid: PgClassOid) -> Vec<i16> {
+    interp
+        .replica_identity_indexes
+        .get(&relid)
+        .and_then(|index| interp.pg_index.get(index))
+        .map(|index| key_columns(index).to_vec())
+        .unwrap_or_default()
 }
 
 fn table_constraint<'a>(
@@ -134,19 +148,28 @@ fn table_constraint<'a>(
 /// `ALTER TABLE ... ALTER CONSTRAINT name [NOT] DEFERRABLE ... | [NOT]
 /// ENFORCED | [NO] INHERIT` (ATExecAlterConstraint): deferrability and
 /// enforceability change only on a foreign key, inheritability only on a
-/// not-null constraint.
+/// not-null constraint — not to NO INHERIT on a partitioned table or for an
+/// inherited constraint.
 pub(super) fn alter_constraint(
-    interp: &PgCatalog,
+    interp: &mut PgCatalog,
     relid: PgClassOid,
     cmd: &AlterTableCmd,
+    rec: inherit::Recursion,
 ) -> Result<(), DdlError> {
     let Some(node::Node::AtalterConstraint(alter)) =
         cmd.def.as_deref().and_then(|d| d.node.as_ref())
     else {
         return Ok(());
     };
-    let con = table_constraint(interp, relid, &alter.conname)?;
     let relname = relname_of(interp, relid);
+    let partitioned = interp.pg_class.get(&relid).map(|c| c.relkind) == Some(RelKind::Partitioned);
+    if partitioned && !rec.recurse {
+        return Err(DdlError::Parse(
+            "constraint must be altered in child tables too (Do not specify the ONLY keyword.)"
+                .into(),
+        ));
+    }
+    let con = table_constraint(interp, relid, &alter.conname)?.clone();
     if alter.alter_deferrability && con.contype != ConType::ForeignKey {
         return Err(DdlError::Parse(format!(
             "constraint \"{}\" of relation \"{relname}\" is not a foreign key constraint",
@@ -165,17 +188,43 @@ pub(super) fn alter_constraint(
             alter.conname
         )));
     }
+    if alter.alter_inheritability && alter.noinherit && partitioned {
+        return Err(DdlError::UnsupportedDdl(format!(
+            "not-null constraint \"{}\" on partitioned table \"{relname}\" cannot be NO INHERIT",
+            alter.conname
+        )));
+    }
+    if alter.alter_inheritability && alter.noinherit && con.coninhcount > 0 {
+        return Err(DdlError::Parse(format!(
+            "cannot alter inherited constraint \"{}\" on relation \"{relname}\"",
+            alter.conname
+        )));
+    }
+    // AlterConstrUpdateConstraintEntry: a constraint made ENFORCED is
+    // validated; a NOT ENFORCED one is not valid.
+    if alter.alter_enforceability
+        && let Some(c) = interp.pg_constraint.get_mut(&con.oid)
+    {
+        c.conenforced = alter.is_enforced;
+        c.convalidated = alter.is_enforced;
+    }
+    if alter.alter_inheritability {
+        inherit::alter_not_null_inheritability(interp, &con, alter.noinherit)?;
+    }
     Ok(())
 }
 
 /// `ALTER TABLE ... VALIDATE CONSTRAINT name` (ATExecValidateConstraint):
-/// foreign key, CHECK and not-null constraints can be validated.
+/// foreign key, CHECK and not-null constraints can be validated, not a NOT
+/// ENFORCED one. A CHECK or not-null constraint is validated on every
+/// descendant too (not under ONLY while there are any) unless NO INHERIT.
 pub(super) fn validate_constraint(
-    interp: &PgCatalog,
+    interp: &mut PgCatalog,
     relid: PgClassOid,
     cmd: &AlterTableCmd,
+    rec: inherit::Recursion,
 ) -> Result<(), DdlError> {
-    let con = table_constraint(interp, relid, &cmd.name)?;
+    let con = table_constraint(interp, relid, &cmd.name)?.clone();
     if !matches!(
         con.contype,
         ConType::ForeignKey | ConType::Check | ConType::NotNull
@@ -187,9 +236,55 @@ pub(super) fn validate_constraint(
             relname_of(interp, relid)
         )));
     }
-    Ok(())
+    if !con.conenforced {
+        return Err(DdlError::Parse(
+            "cannot validate NOT ENFORCED constraint".into(),
+        ));
+    }
+    if con.convalidated {
+        return Ok(());
+    }
+    match con.contype {
+        ConType::NotNull => inherit::validate_not_null(interp, &con, rec),
+        ConType::Check => {
+            // QueueCheckConstraintValidation: the descendants' copies first.
+            if !rec.recursing && !con.connoinherit {
+                for child in inherit::all_inheritors(interp, relid) {
+                    if child == relid {
+                        continue;
+                    }
+                    if !rec.recurse {
+                        return Err(DdlError::Parse(
+                            "constraint must be validated on child tables too".into(),
+                        ));
+                    }
+                    let child_con = interp
+                        .pg_constraint
+                        .values()
+                        .find(|c| {
+                            c.conrelid == child
+                                && c.contype == ConType::Check
+                                && c.conname == con.conname
+                        })
+                        .map(|c| c.oid);
+                    if let Some(c) = child_con.and_then(|oid| interp.pg_constraint.get_mut(&oid)) {
+                        c.convalidated = true;
+                    }
+                }
+            }
+            if let Some(c) = interp.pg_constraint.get_mut(&con.oid) {
+                c.convalidated = true;
+            }
+            Ok(())
+        }
+        _ => {
+            if let Some(c) = interp.pg_constraint.get_mut(&con.oid) {
+                c.convalidated = true;
+            }
+            Ok(())
+        }
+    }
 }
-
 /// `ALTER TABLE ... ENABLE / DISABLE [ALWAYS | REPLICA] TRIGGER name`
 /// (EnableDisableTrigger).
 pub(super) fn enable_disable_trigger(

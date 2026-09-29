@@ -23,20 +23,7 @@ fn parent_rangevar(cmd: &AlterTableCmd) -> Option<&typedpg_pg_query::protobuf::R
     }
 }
 
-/// `relid` and all its descendants (find_all_inheritors).
-fn all_inheritors(interp: &PgCatalog, relid: PgClassOid) -> Vec<PgClassOid> {
-    let mut tree = vec![relid];
-    let mut i = 0;
-    while i < tree.len() {
-        for child in inherit::children_of(interp, tree[i]) {
-            if !tree.contains(&child) {
-                tree.push(child);
-            }
-        }
-        i += 1;
-    }
-    tree
-}
+use super::inherit::all_inheritors;
 
 pub(super) fn add_inherit(
     interp: &mut PgCatalog,
@@ -164,7 +151,12 @@ fn merge_attributes_into_existing(
                 pa.attname
             )));
         }
-        if pa.attnotnull && !ca.attnotnull {
+        // A parent's inheritable not-null constraint needs one here.
+        if pa.attnotnull
+            && !ca.attnotnull
+            && inherit::not_null_constraint(interp, parent, pa.attnum)
+                .is_none_or(|c| !c.connoinherit)
+        {
             return Err(DdlError::Parse(format!(
                 "column \"{}\" in child table \"{child_name}\" must be marked NOT NULL",
                 pa.attname
@@ -234,10 +226,11 @@ fn merge_constraints_into_existing(
     parent_cons.sort_by(|a, b| a.conname.cmp(&b.conname));
     let mut merged = Vec::new();
     for pc in &parent_cons {
-        let parent_def = interp.check_defs.get(&pc.oid).cloned();
-        if parent_def.as_ref().is_some_and(|d| d.no_inherit) {
+        // A NO INHERIT constraint is not inherited.
+        if pc.connoinherit {
             continue;
         }
+        let parent_def = interp.check_defs.get(&pc.oid).cloned();
         let child_con = if pc.contype == ConType::NotNull {
             // Not-null constraints match by column.
             let Some(colname) = pc.conkey.first().and_then(|&an| {
@@ -249,13 +242,16 @@ fn merge_constraints_into_existing(
             }) else {
                 continue;
             };
-            let Some(attnum) = interp.attribute_by_name(child, &colname).map(|a| a.attnum) else {
-                continue;
+            let found = interp
+                .attribute_by_name(child, &colname)
+                .and_then(|a| inherit::not_null_constraint(interp, child, a.attnum))
+                .cloned();
+            let Some(con) = found else {
+                return Err(DdlError::Parse(format!(
+                    "column \"{colname}\" in child table \"{child_name}\" must be marked NOT NULL"
+                )));
             };
-            let Some(con) = inherit::not_null_constraint(interp, child, attnum) else {
-                continue;
-            };
-            con.clone()
+            con
         } else {
             let Some(con) = interp
                 .pg_constraint
@@ -280,15 +276,29 @@ fn merge_constraints_into_existing(
                     pc.conname
                 )));
             }
-            if child_def.is_some_and(|d| d.no_inherit) {
-                return Err(DdlError::UnsupportedDdl(format!(
-                    "constraint \"{}\" conflicts with non-inherited constraint on child table \
-                     \"{child_name}\"",
-                    pc.conname
-                )));
-            }
             con
         };
+        if child_con.connoinherit {
+            return Err(DdlError::UnsupportedDdl(format!(
+                "constraint \"{}\" conflicts with non-inherited constraint on child table \
+                 \"{child_name}\"",
+                child_con.conname
+            )));
+        }
+        if pc.convalidated && child_con.conenforced && !child_con.convalidated {
+            return Err(DdlError::UnsupportedDdl(format!(
+                "constraint \"{}\" conflicts with NOT VALID constraint on child table \
+                 \"{child_name}\"",
+                child_con.conname
+            )));
+        }
+        if pc.conenforced && !child_con.conenforced {
+            return Err(DdlError::UnsupportedDdl(format!(
+                "constraint \"{}\" conflicts with NOT ENFORCED constraint on child table \
+                 \"{child_name}\"",
+                child_con.conname
+            )));
+        }
         merged.push(child_con.oid);
     }
     for oid in merged {

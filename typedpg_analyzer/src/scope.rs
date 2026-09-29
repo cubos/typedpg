@@ -394,7 +394,8 @@ impl Scope {
             .map(|c| ScopeColumn {
                 name: c.attname.clone(),
                 type_oid: c.atttypid,
-                base_not_null: c.attnotnull || snapshot.type_is_not_null(c.atttypid),
+                base_not_null: snapshot.attr_proven_not_null(c)
+                    || snapshot.type_is_not_null(c.atttypid),
                 typmod: snapshot.effective_typmod(c.atttypid, c.atttypmod),
                 collation: c.attcollation,
                 table_alias: alias.to_owned(),
@@ -444,7 +445,8 @@ impl Scope {
             .map(|c| ScopeColumn {
                 name: c.attname.clone(),
                 type_oid: c.atttypid,
-                base_not_null: c.attnotnull || snapshot.type_is_not_null(c.atttypid),
+                base_not_null: snapshot.attr_proven_not_null(c)
+                    || snapshot.type_is_not_null(c.atttypid),
                 typmod: snapshot.effective_typmod(c.atttypid, c.atttypmod),
                 collation: c.attcollation,
                 table_alias: alias.to_owned(),
