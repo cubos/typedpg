@@ -219,6 +219,32 @@ fn create_schema_elements_are_created_in_the_new_schema() {
 }
 
 #[test]
+fn create_schema_elements_run_grouped_by_kind() {
+    // PG 18 transformCreateSchemaStmtElements: sequences, tables, views,
+    // indexes, triggers, then grants, whatever order they are written in.
+    let db = build_db(&[
+        (
+            "0001.sql",
+            "CREATE FUNCTION tf() RETURNS trigger LANGUAGE plpgsql AS 'begin return new; end';",
+        ),
+        (
+            "0002.sql",
+            "CREATE SCHEMA s
+                 GRANT SELECT ON v TO PUBLIC
+                 CREATE TRIGGER tr AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION public.tf()
+                 CREATE INDEX i ON t (a)
+                 CREATE VIEW v AS SELECT a, b FROM t
+                 CREATE TABLE t (a int, b bigint DEFAULT nextval('sq'))
+                 CREATE SEQUENCE sq;",
+        ),
+    ]);
+    assert_cols(
+        &db.analyze("SELECT * FROM s.v").unwrap(),
+        vec![cn("a", int4()), cn("b", int8())],
+    );
+}
+
+#[test]
 fn create_schema_errors() {
     // PG 18: 42P06 schema "s" already exists; 42P15 for a mismatched element.
     assert_ddl_err!(

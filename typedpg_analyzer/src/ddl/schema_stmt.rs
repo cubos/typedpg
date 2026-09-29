@@ -79,14 +79,29 @@ pub fn create_schema(interp: &mut PgCatalog, stmt: &CreateSchemaStmt) -> Result<
             )));
         }
     }
+    // transformCreateSchemaStmtElements runs them grouped by kind so that
+    // no element refers to one created later: sequences, tables, views,
+    // indexes, triggers, then grants — each group in the order given.
+    let rank = |node: &node::Node| match node {
+        node::Node::CreateSeqStmt(_) => 0,
+        node::Node::CreateStmt(_) => 1,
+        node::Node::ViewStmt(_) => 2,
+        node::Node::IndexStmt(_) => 3,
+        node::Node::CreateTrigStmt(_) => 4,
+        _ => 5,
+    };
+    let mut elements: Vec<&node::Node> = stmt
+        .schema_elts
+        .iter()
+        .filter_map(|elt| elt.node.as_ref())
+        .collect();
+    elements.sort_by_key(|node| rank(node));
     let saved = interp.push_search_path_front(&name);
     let mut result = Ok(());
-    for elt in &stmt.schema_elts {
-        if let Some(node) = elt.node.as_ref() {
-            result = super::apply_statement(interp, node);
-            if result.is_err() {
-                break;
-            }
+    for node in elements {
+        result = super::apply_statement(interp, node);
+        if result.is_err() {
+            break;
         }
     }
     interp.restore_search_path(saved);
