@@ -461,7 +461,14 @@ impl Scope {
         span: Option<SourceSpan>,
     ) -> Result<&ScopeColumn, AnalyzeError> {
         if let Some(t) = table {
-            for source in self.all_tiers() {
+            // PG's `refnameNamespaceItem` stops at the nearest level whose
+            // namespace has an entry of that name: an inner `u` hides an
+            // outer one even when only the outer has the column.
+            let nearest = [&self.sources, &self.lateral_sources, &self.outer_sources]
+                .into_iter()
+                .find(|tier| tier.iter().any(|s| s.alias == t))
+                .map_or(&[][..], |tier| tier.as_slice());
+            for source in nearest {
                 if source.alias != t {
                     continue;
                 }

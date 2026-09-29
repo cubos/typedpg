@@ -581,3 +581,20 @@ fn scalar_and_array_sublinks_require_one_column() {
         );
     }
 }
+
+#[test]
+fn qualified_reference_stops_at_nearest_entry_of_that_name() {
+    // PG's `refnameNamespaceItem`: the sublink's own `u` hides the outer
+    // `u`, even though only the outer one has a column `v`.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE t (id int PRIMARY KEY, v int NOT NULL);
+         CREATE TABLE o (id int, z int);",
+    )
+    .unwrap();
+    assert_err_prefix!(
+        db.analyze("SELECT (SELECT u.v FROM o AS u LIMIT 1) FROM t AS u"),
+        AnalyzeError::UndefinedColumn(_),
+        "column u.v does not exist"
+    );
+}
