@@ -4637,3 +4637,20 @@ fn truncate_ignores_not_enforced_foreign_keys() {
     }
     build_db(&[("0001.sql", setup), ("0002.sql", "TRUNCATE a;")]);
 }
+
+#[test]
+fn truncate_only_refuses_a_partitioned_table() {
+    // ExecuteTruncate: ONLY on a partitioned table would truncate nothing.
+    let setup = "CREATE TABLE p (x int) PARTITION BY RANGE (x);
+                 CREATE TABLE c PARTITION OF p FOR VALUES FROM (1) TO (2);
+                 CREATE TABLE q (x int) PARTITION BY LIST (x);";
+    for stmt in ["TRUNCATE ONLY p;", "TRUNCATE ONLY q;"] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(
+            err.to_string()
+                .starts_with("cannot truncate only a partitioned table"),
+            "{stmt}\n  got: {err}"
+        );
+    }
+    build_db(&[("0001.sql", setup), ("0002.sql", "TRUNCATE p; TRUNCATE ONLY c;")]);
+}

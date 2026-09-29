@@ -44,6 +44,14 @@ pub fn truncate(interp: &PgCatalog, stmt: &TruncateStmt) -> Result<(), DdlError>
                 rv.relname
             )));
         }
+        // ExecuteTruncate: ONLY on a partitioned table truncates nothing.
+        if !rv.inh && relkind(interp, relid) == Some(RelKind::Partitioned) {
+            return Err(DdlError::Parse(
+                "cannot truncate only a partitioned table (Do not specify the ONLY keyword, or \
+                 use TRUNCATE ONLY on the partitions directly.)"
+                    .into(),
+            ));
+        }
         targets.push(relid);
         if rv.inh {
             let mut i = targets.len() - 1;
