@@ -227,7 +227,15 @@ fn expand_like(
                 identity,
                 collation: attr.attcollation,
                 owned_sequence: identity.map(|_| crate::pg_catalog::DepType::Internal),
-                identity_options: Vec::new(),
+                // transformTableLikeClause: the source sequence's options.
+                identity_options: identity
+                    .and_then(|_| {
+                        crate::ddl::sequences::identity_sequences(interp, source, attr.attnum)
+                            .first()
+                            .and_then(|seq| interp.sequence_params.get(seq))
+                            .map(crate::ddl::seqparams::SeqParams::as_options)
+                    })
+                    .unwrap_or_default(),
                 nn_local: copy_not_null && attr.attnotnull,
                 nn_name: None,
                 nn_inhcount: 0,

@@ -44,6 +44,36 @@ impl SeqParams {
     }
 }
 
+impl SeqParams {
+    /// sequence_options (sequence.c): these parameters as the option list
+    /// that recreates them.
+    pub(crate) fn as_options(&self) -> Vec<pg_query::protobuf::Node> {
+        use pg_query::protobuf::{DefElem, Float, Integer, Node};
+        let def = |name: &str, value: i128| {
+            let arg = match i32::try_from(value) {
+                Ok(ival) => node::Node::Integer(Integer { ival }),
+                Err(_) => node::Node::Float(Float {
+                    fval: value.to_string(),
+                }),
+            };
+            Node {
+                node: Some(node::Node::DefElem(Box::new(DefElem {
+                    defname: name.to_owned(),
+                    arg: Some(Box::new(Node { node: Some(arg) })),
+                    ..Default::default()
+                }))),
+            }
+        };
+        vec![
+            def("cache", self.cache),
+            def("increment", self.increment),
+            def("maxvalue", self.max),
+            def("minvalue", self.min),
+            def("start", self.start),
+        ]
+    }
+}
+
 fn numeric_arg(de: &pg_query::protobuf::DefElem) -> Option<i128> {
     match de.arg.as_deref().and_then(|a| a.node.as_ref())? {
         node::Node::Integer(i) => Some(i128::from(i.ival)),
