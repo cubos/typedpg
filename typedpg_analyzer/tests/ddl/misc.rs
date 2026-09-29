@@ -4129,3 +4129,46 @@ fn publication_membership_rules() {
         ),
     ]);
 }
+
+#[test]
+fn index_columns_are_named_for_set_statistics() {
+    // PG 18 ATExecSetStatistics over the index's own attributes, named by
+    // ChooseIndexColumnNames (the column name, or "expr", made unique with
+    // a numeric suffix).
+    let setup = "CREATE TABLE t (a int, b int);
+                 CREATE INDEX i ON t (a, (b + 1), (a * 2), a);";
+    for (stmt, msg) in [
+        (
+            "ALTER INDEX i ALTER COLUMN a SET STATISTICS 100;",
+            "cannot alter statistics on non-expression column \"a\" of index \"i\"",
+        ),
+        (
+            "ALTER INDEX i ALTER COLUMN a1 SET STATISTICS 100;",
+            "cannot alter statistics on non-expression column \"a1\" of index \"i\"",
+        ),
+        (
+            "ALTER INDEX i ALTER COLUMN 4 SET STATISTICS 100;",
+            "cannot alter statistics on non-expression column \"a1\" of index \"i\"",
+        ),
+        (
+            "ALTER INDEX i ALTER COLUMN b SET STATISTICS 100;",
+            "column \"b\" of relation \"i\" does not exist",
+        ),
+        (
+            "ALTER TABLE t ALTER COLUMN 1 SET STATISTICS 100;",
+            "cannot refer to non-index column by number",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "ALTER INDEX i ALTER COLUMN expr SET STATISTICS 100;
+             ALTER INDEX i ALTER COLUMN expr1 SET STATISTICS 100;
+             ALTER INDEX i ALTER COLUMN 3 SET STATISTICS 100;",
+        ),
+    ]);
+}

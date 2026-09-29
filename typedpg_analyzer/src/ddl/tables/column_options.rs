@@ -109,37 +109,72 @@ pub(super) fn alter_column_setting(
     Ok(())
 }
 
-/// `ALTER INDEX ... ALTER COLUMN n SET STATISTICS`: only expression
-/// columns of the index carry their own statistics.
+/// ChooseIndexColumnNames (indexcmds.c): an index column is named after
+/// its table column, or "expr", with a numeric suffix appended until it is
+/// unique among the earlier ones.
+fn index_column_names(interp: &PgCatalog, index: &crate::pg_catalog::PgIndex) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for &key in &index.indkey {
+        let origname = interp
+            .attributes_of(index.indrelid)
+            .iter()
+            .find(|a| key != 0 && a.attnum == key)
+            .map_or_else(|| "expr".to_owned(), |a| a.attname.clone());
+        let mut name = origname.clone();
+        let mut i = 1;
+        while names.contains(&name) {
+            let suffix = i.to_string();
+            let mut base = origname.clone();
+            // NAMEDATALEN - 1 bytes in all.
+            while base.len() + suffix.len() > 63 {
+                base.pop();
+            }
+            name = base + &suffix;
+            i += 1;
+        }
+        names.push(name);
+    }
+    names
+}
+
+/// `ALTER INDEX ... ALTER COLUMN {n | name} SET STATISTICS`
+/// (ATExecSetStatistics): only expression key columns of the index carry
+/// their own statistics.
 fn check_index_statistics_column(
     interp: &PgCatalog,
     relid: PgClassOid,
     relname: &str,
     cmd: &AlterTableCmd,
 ) -> Result<(), DdlError> {
-    if !cmd.name.is_empty() {
-        // Index column names (ChooseIndexColumnNames) aren't modeled.
-        return Ok(());
-    }
     let Some(index) = interp.pg_index.get(&relid) else {
         return Ok(());
     };
-    let num = cmd.num;
-    let Some(&key) = usize::try_from(num - 1)
-        .ok()
-        .and_then(|i| index.indkey.get(i))
-    else {
-        return Err(DdlError::Parse(format!(
-            "column number {num} of relation \"{relname}\" does not exist"
-        )));
+    let names = index_column_names(interp, index);
+    let position = if cmd.name.is_empty() {
+        let num = cmd.num;
+        usize::try_from(num - 1)
+            .ok()
+            .filter(|&i| i < names.len())
+            .ok_or_else(|| {
+                DdlError::Parse(format!(
+                    "column number {num} of relation \"{relname}\" does not exist"
+                ))
+            })?
+    } else {
+        names.iter().position(|n| *n == cmd.name).ok_or_else(|| {
+            DdlError::Parse(format!(
+                "column \"{}\" of relation \"{relname}\" does not exist",
+                cmd.name
+            ))
+        })?
     };
-    if key != 0 {
-        let colname = interp
-            .attributes_of(index.indrelid)
-            .iter()
-            .find(|a| a.attnum == key)
-            .map(|a| a.attname.clone())
-            .unwrap_or_default();
+    let colname = &names[position];
+    if position >= usize::try_from(index.indnkeyatts).unwrap_or(0) {
+        return Err(DdlError::UnsupportedDdl(format!(
+            "cannot alter statistics on included column \"{colname}\" of index \"{relname}\""
+        )));
+    }
+    if index.indkey[position] != 0 {
         return Err(DdlError::UnsupportedDdl(format!(
             "cannot alter statistics on non-expression column \"{colname}\" of index \
              \"{relname}\" (Alter statistics on table column instead.)"
