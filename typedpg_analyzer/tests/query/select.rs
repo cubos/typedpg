@@ -948,3 +948,28 @@ fn unqualified_system_columns_resolve_on_tables_only() {
         assert!(err.to_string().starts_with(msg), "{sql}\n  got: {err}");
     }
 }
+
+#[test]
+fn qualified_star_expands_any_visible_entry() {
+    // PG's ExpandColumnRefStar resolves `t.*` like any qualifier: a LATERAL
+    // or outer entry works, `schema.t.*` names the table, and an unknown
+    // name is a missing FROM-clause entry, not an empty expansion.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE src (id int PRIMARY KEY, name text NOT NULL, amount int);")
+        .unwrap();
+    let s = db
+        .analyze("SELECT * FROM src s2, LATERAL (SELECT s2.*) l")
+        .unwrap();
+    assert_eq!(s.columns.len(), 6);
+    let s = db.analyze("SELECT public.src.* FROM src").unwrap();
+    assert_cols(
+        &s,
+        vec![c("id", int4()), c("name", text()), cn("amount", int4())],
+    );
+    let err = db.analyze("SELECT nosuch.* FROM src").unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("missing FROM-clause entry for table \"nosuch\""),
+        "{err}"
+    );
+}

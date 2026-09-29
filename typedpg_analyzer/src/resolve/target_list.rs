@@ -36,18 +36,29 @@ pub(crate) fn resolve_target_list(
                 .any(|f| matches!(f.node.as_ref(), Some(node::Node::AStar(_))))
         {
             // Star expansion.
-            let table_filter = cr.fields.iter().find_map(|f| match f.node.as_ref()? {
+            // `t.*` / `schema.t.*`: the entry is named by the last name part.
+            let table_filter = cr.fields.iter().rev().find_map(|f| match f.node.as_ref()? {
                 node::Node::String(s) => Some(s.sval.as_str()),
                 _ => None,
             });
 
             let star_cols: Vec<&ScopeColumn> = if let Some(tbl) = table_filter {
-                scope
-                    .sources
-                    .iter()
-                    .filter(|s| s.alias == tbl)
-                    .flat_map(|s| s.columns.iter())
-                    .collect()
+                // Any entry the reference can see — this level's, a LATERAL
+                // one, or an outer query's (PG's `ExpandColumnRefStar`
+                // resolves the name like any qualifier).
+                match scope.find_source(tbl) {
+                    Some(src) => src.columns.iter().collect(),
+                    None => {
+                        // No such entry: the qualified lookup reports PG's
+                        // `missing FROM-clause entry` / `invalid reference`.
+                        scope.resolve_column(
+                            Some(tbl),
+                            "*",
+                            crate::error::SourceSpan::from_node_qname(cr.location),
+                        )?;
+                        Vec::new()
+                    }
+                }
             } else {
                 scope.star_columns()
             };
