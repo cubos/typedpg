@@ -1407,3 +1407,52 @@ fn indexes_record_their_operator_classes_and_collations() {
         )
     );
 }
+
+#[test]
+fn partition_indexes_match_on_collation_and_operator_family() {
+    // CompareIndexInfo compares the key columns' collations and operator
+    // families: ATTACH PARTITION adopts only a matching index (a
+    // varchar_pattern_ops one for text_pattern_ops — same family), and
+    // ALTER INDEX ... ATTACH PARTITION refuses the others.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE p (a int, b text) PARTITION BY RANGE (a);
+         CREATE INDEX pi ON p (b COLLATE \"C\");
+         CREATE INDEX pj ON p (b text_pattern_ops);
+         CREATE TABLE p1 (a int, b text);
+         CREATE INDEX p1_b ON p1 (b);
+         CREATE INDEX p1_bp ON p1 (b varchar_pattern_ops);
+         ALTER TABLE p ATTACH PARTITION p1 FOR VALUES FROM (0) TO (10);",
+    )]);
+    let mut names: Vec<String> = db
+        .pg_index_values()
+        .filter(|i| {
+            db.pg_class()
+                .get(&i.indrelid)
+                .is_some_and(|c| c.relname == "p1")
+        })
+        .map(|i| db.pg_class()[&i.indexrelid].relname.clone())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["p1_b", "p1_b_idx", "p1_bp"]);
+    let setup = "CREATE TABLE q (a int, b text) PARTITION BY RANGE (a);
+                 CREATE TABLE q1 PARTITION OF q FOR VALUES FROM (0) TO (10);
+                 CREATE INDEX q1_b ON q1 (b);
+                 CREATE INDEX q1_bp ON q1 (b varchar_pattern_ops);
+                 CREATE INDEX qi ON ONLY q (b COLLATE \"C\");
+                 CREATE INDEX qj ON ONLY q (b text_pattern_ops);";
+    assert_rejected(
+        setup,
+        &[
+            (
+                "ALTER INDEX qi ATTACH PARTITION q1_b;",
+                "cannot attach index \"q1_b\" as a partition of index \"qi\"",
+            ),
+            (
+                "ALTER INDEX qj ATTACH PARTITION q1_b;",
+                "cannot attach index \"q1_b\" as a partition of index \"qj\"",
+            ),
+        ],
+    );
+    assert_accepted(setup, &["ALTER INDEX qj ATTACH PARTITION q1_bp;"]);
+}

@@ -66,6 +66,7 @@ pub(crate) fn ensure_partition_index(
                 && i.indkey == indkey
                 && i.indexprs == pi.indexprs
                 && i.indpred == pi.indpred
+                && same_key_classes(interp, &pi, i)
                 && interp.index_access_methods.get(&i.indexrelid) == am.as_ref()
                 && !interp.index_parents.contains_key(&i.indexrelid)
                 && !interp.invalid_indexes.contains(&i.indexrelid)
@@ -276,12 +277,39 @@ pub(crate) fn child_indexes(interp: &PgCatalog, index: PgClassOid) -> Vec<PgClas
     out
 }
 
+/// CompareIndexInfo: the key columns have the same collations and
+/// operator families (not necessarily the same operator classes:
+/// varchar_pattern_ops and text_pattern_ops share one). A column the
+/// analyzer couldn't resolve an operator class for matches any.
+fn same_key_classes(interp: &PgCatalog, parent: &PgIndex, child: &PgIndex) -> bool {
+    let family = |class: Option<crate::oid::PgOpclassOid>| {
+        class
+            .and_then(|c| crate::ddl::opclass::opclass_by_oid(interp, c))
+            .map(|c| {
+                (
+                    c.opcfamilynamespace,
+                    c.opcfamily.clone(),
+                    c.opcmethod.clone(),
+                )
+            })
+    };
+    parent.indcollation == child.indcollation
+        && parent.indclass.len() == child.indclass.len()
+        && parent.indclass.iter().zip(&child.indclass).all(|(&p, &c)| {
+            match (family(p), family(c)) {
+                (Some(p), Some(c)) => p == c,
+                _ => true,
+            }
+        })
+}
+
 /// CompareIndexInfo: `child` (an index of a partition) has the definition
 /// of `parent` (an index of the partitioned table) — uniqueness, access
-/// method, key and INCLUDE columns (matched by name), expressions and
-/// predicate.
+/// method, key and INCLUDE columns (matched by name), their collations and
+/// operator families, expressions and predicate.
 fn index_definitions_match(interp: &PgCatalog, parent: &PgIndex, child: &PgIndex) -> bool {
-    child.indisunique == parent.indisunique
+    same_key_classes(interp, parent, child)
+        && child.indisunique == parent.indisunique
         && child.indnatts == parent.indnatts
         && child.indnkeyatts == parent.indnkeyatts
         && child.indkey == map_attnums(interp, parent.indrelid, child.indrelid, &parent.indkey)
