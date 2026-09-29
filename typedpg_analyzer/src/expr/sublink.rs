@@ -61,14 +61,14 @@ pub(crate) fn infer_sublink(
                 // requires the LHS and the subquery to match column counts.
                 // PG rejects mismatches with `subquery has too many columns`
                 // or `subquery has too few columns`.
-                let lhs_arity = sub
-                    .testexpr
-                    .as_ref()
-                    .map(|n| match n.node.as_ref() {
-                        Some(node::Node::RowExpr(r)) => r.args.len(),
-                        _ => 1,
-                    })
-                    .unwrap_or(1);
+                // A ROW's arguments go through transformExpressionList,
+                // which expands `t.*` / `(expr).*` into their columns.
+                let lhs_row: Option<std::borrow::Cow<'_, [protobuf::Node]>> =
+                    match sub.testexpr.as_deref().and_then(|n| n.node.as_ref()) {
+                        Some(node::Node::RowExpr(r)) => Some(expand_row_args(&r.args, ctx, params)),
+                        _ => None,
+                    };
+                let lhs_arity = lhs_row.as_ref().map_or(1, |r| r.len());
                 if lhs_arity != cols.len() {
                     let pg_msg = if cols.len() < lhs_arity {
                         "subquery has too few columns"
@@ -88,11 +88,10 @@ pub(crate) fn infer_sublink(
                 // `operator does not exist: integer = text`. The LHS lives in
                 // `testexpr` and is *only* reachable through this SubLink, so we
                 // must walk it here — that also pins LHS params/columns.
-                let lhs_nodes: Vec<&protobuf::Node> =
-                    match sub.testexpr.as_deref().and_then(|n| n.node.as_ref()) {
-                        Some(node::Node::RowExpr(r)) => r.args.iter().collect(),
-                        _ => sub.testexpr.as_deref().into_iter().collect(),
-                    };
+                let lhs_nodes: Vec<&protobuf::Node> = match &lhs_row {
+                    Some(r) => r.iter().collect(),
+                    None => sub.testexpr.as_deref().into_iter().collect(),
+                };
                 // `oper_name` is `=` for `IN`, or the written operator for
                 // `<op> ANY/ALL`. Default to `=` if the parser left it empty.
                 let op_name = {

@@ -725,3 +725,36 @@ fn scalar_subquery_named_after_its_first_output_column() {
     let names: Vec<&str> = s.columns.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(names, ["a", "b", "?column?", "count", "column1"]);
 }
+
+/// A ROW compared with a subquery expands its `t.*` / `(expr).*` items
+/// (transformExpressionList) before the column counts are matched.
+#[test]
+fn row_star_items_expand_in_row_sublink_comparisons() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE t (id int PRIMARY KEY, a int NOT NULL, w text);
+         CREATE TYPE pr AS (x int, y text);
+         CREATE TABLE c (id int PRIMARY KEY, p pr);",
+    )
+    .unwrap();
+    for sql in [
+        "SELECT ROW(t.*) IN (SELECT id, a, w FROM t) FROM t",
+        "SELECT ROW(t.*) = (SELECT id, a, w FROM t LIMIT 1) FROM t",
+        "SELECT ROW(t.*) = ANY (SELECT id, a, w FROM t) FROM t",
+        "SELECT ROW(t.*, 1) IN (SELECT id, a, w, 2 FROM t) FROM t",
+        "SELECT ROW((c.p).*) IN (SELECT 1, 'x') FROM c",
+        "SELECT ROW((c.p).*) = (SELECT 1, 'x') FROM c",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    for sql in [
+        "SELECT ROW(t.*) IN (SELECT id, a FROM t) FROM t",
+        "SELECT ROW(t.*) IN (SELECT t2 FROM t t2) FROM t",
+    ] {
+        let err = db.analyze(sql).unwrap_err();
+        assert!(
+            err.to_string().starts_with("subquery has too few columns"),
+            "{sql}: {err}"
+        );
+    }
+}

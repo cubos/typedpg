@@ -705,12 +705,14 @@ fn handle_row_subselect(
         return Ok(None);
     };
 
-    for la in &lrow.args {
+    // transformExpressionList expands the ROW's `t.*` / `(expr).*` items.
+    let largs = expand_row_args(&lrow.args, ctx, params);
+    for la in largs.iter() {
         let _ = infer_expr(la, ctx, params, TypeGoal::NONE);
     }
     let (cols, _) = crate::resolve::analyze_correlated_select(sel, snapshot, params, scope)?;
-    if cols.len() != lrow.args.len() {
-        let pg_msg = if cols.len() < lrow.args.len() {
+    if cols.len() != largs.len() {
+        let pg_msg = if cols.len() < largs.len() {
             "subquery has too few columns"
         } else {
             "subquery has too many columns"
@@ -718,7 +720,7 @@ fn handle_row_subselect(
         return Err(AnalyzeError::Invalid(format!(
             "{pg_msg} (subquery has {}, lhs has {})",
             cols.len(),
-            lrow.args.len(),
+            largs.len(),
         )));
     }
     Ok(Some(ExprType::scalar(oid::BOOL, true)))
