@@ -34,6 +34,7 @@
 mod builtin_nullability;
 mod clause;
 mod coerce;
+mod datetime_input;
 mod ddl;
 mod diagnostic;
 mod error;

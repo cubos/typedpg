@@ -536,7 +536,7 @@ fn datetime_keywords_accepted() {
         "SELECT 'allballs'::time AS v",
         "SELECT 'now'::timetz AS v",
         "SELECT 'infinity'::interval AS v",
-        // Digits / punctuation are accepted unchecked (conservative).
+        // Multi-field values are decoded like PG's datetime parser.
         "SELECT '2024-01-01'::date AS v",
         "SELECT '1 day'::interval AS v",
         "SELECT 'now()'::date AS v",
@@ -710,4 +710,126 @@ fn polymorphic_function_with_defaulted_trailing_args() {
         .analyze("SELECT (json_populate_record(NULL::comp, '{}')).a AS a")
         .unwrap();
     assert_cols(&s, vec![cn("a", int4())]);
+}
+
+// ── Datetime decoding (a port of PG's datetime.c) ──────────────────────────
+
+#[test]
+fn time_field_out_of_range_rejected() {
+    let db = setup();
+    assert_first_line!(
+        db.analyze("SELECT '12:61'::time"),
+        "date/time field value out of range: \"12:61\""
+    );
+    assert_first_line!(
+        db.analyze("SELECT '25:00'::time"),
+        "date/time field value out of range: \"25:00\""
+    );
+    // 24:00:00 and a leap second are valid; anything past midnight isn't.
+    db.analyze("SELECT '24:00:00'::time AS v").unwrap();
+    db.analyze("SELECT '23:59:60'::time AS v").unwrap();
+    assert_first_line!(
+        db.analyze("SELECT '24:00:01'::time"),
+        "date/time field value out of range: \"24:00:01\""
+    );
+}
+
+#[test]
+fn interval_unknown_unit_rejected() {
+    let db = setup();
+    assert_first_line!(
+        db.analyze("SELECT '1 fortnight'::interval"),
+        "invalid input syntax for type interval: \"1 fortnight\""
+    );
+    assert_first_line!(
+        db.analyze("SELECT '1 xday'::interval"),
+        "invalid input syntax for type interval: \"1 xday\""
+    );
+}
+
+#[test]
+fn window_range_offset_interval_literal_validated() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE ev (id INT, ts TIMESTAMPTZ);")
+        .unwrap();
+    db.analyze("SELECT sum(id) OVER (ORDER BY ts RANGE '1 day' PRECEDING) AS s FROM ev")
+        .unwrap();
+    assert_first_line!(
+        db.analyze("SELECT sum(id) OVER (ORDER BY ts RANGE '1 xday' PRECEDING) AS s FROM ev"),
+        "invalid input syntax for type interval: \"1 xday\""
+    );
+}
+
+#[test]
+fn generate_series_step_interval_literal_validated() {
+    let db = setup();
+    db.analyze("SELECT generate_series('2020-01-01'::timestamptz, '2020-02-01', '1 day') AS g")
+        .unwrap();
+    assert_first_line!(
+        db.analyze(
+            "SELECT generate_series('2020-01-01'::timestamptz, '2020-02-01', '1 xday') AS g"
+        ),
+        "invalid input syntax for type interval: \"1 xday\""
+    );
+}
+
+#[test]
+fn timestamptz_minus_unknown_literal_validated_as_timestamptz() {
+    // `timestamptz - unknown` resolves to `timestamptz - timestamptz`, so
+    // the literal is timestamptz input, not an interval.
+    let db = setup();
+    assert_first_line!(
+        db.analyze("SELECT now() - '1 day'"),
+        "invalid input syntax for type timestamp with time zone: \"1 day\""
+    );
+    db.analyze("SELECT now() - '2024-01-01 12:00+02' AS v")
+        .unwrap();
+    db.analyze("SELECT now() - '1 day'::interval AS v").unwrap();
+}
+
+#[test]
+fn datetime_multi_field_values_decoded() {
+    let db = setup();
+    for q in [
+        "SELECT '2024-02-29'::date AS v",
+        "SELECT 'Jan 15, 2024 BC'::date AS v",
+        "SELECT 'J2451187'::date AS v",
+        "SELECT '2024-01-15T12:30:45.5Z'::timestamptz AS v",
+        "SELECT '2024-01-15 12:30 America/Sao_Paulo'::timestamptz AS v",
+        "SELECT '12:30 pm'::time AS v",
+        "SELECT 'yesterday 10:00'::timestamp AS v",
+        "SELECT 'P1Y2M3DT4H5M6S'::interval AS v",
+        "SELECT '@ 1 day ago'::interval AS v",
+        "SELECT '1 2:03:04'::interval AS v",
+    ] {
+        db.analyze(q).unwrap_or_else(|e| panic!("{q}: {e}"));
+    }
+    assert_first_line!(
+        db.analyze("SELECT '2023-02-29'::date"),
+        "date/time field value out of range: \"2023-02-29\""
+    );
+    assert_first_line!(
+        db.analyze("SELECT '2024-01-15 12:00 +16'::timestamptz"),
+        "time zone displacement out of range: \"2024-01-15 12:00 +16\""
+    );
+    assert_first_line!(
+        db.analyze("SELECT '2024-01-15 12:00 Foo/Bar'::timestamptz"),
+        "time zone \"foo/bar\" not recognized"
+    );
+    assert_first_line!(
+        db.analyze("SELECT '5874898-01-01'::date"),
+        "date out of range: \"5874898-01-01\""
+    );
+    assert_first_line!(
+        db.analyze("SELECT '294277-01-01'::timestamp"),
+        "timestamp out of range: \"294277-01-01\""
+    );
+    assert_first_line!(
+        db.analyze("SELECT '2147483648 days'::interval"),
+        "interval field value out of range: \"2147483648 days\""
+    );
+    assert_first_line!(
+        db.analyze("SELECT '178956971 years'::interval"),
+        "interval out of range"
+    );
 }
