@@ -25,6 +25,7 @@ mod policies;
 pub(crate) mod reloptions;
 mod rules;
 pub mod schema_stmt;
+pub(crate) mod seqparams;
 pub mod sequences;
 pub(crate) mod session;
 pub(crate) mod statistics;

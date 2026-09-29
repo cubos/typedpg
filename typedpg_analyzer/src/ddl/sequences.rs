@@ -29,8 +29,10 @@ pub fn create_sequence(interp: &mut PgCatalog, stmt: &CreateSeqStmt) -> Result<(
         return Ok(());
     }
     super::util::check_relation_name_free(interp, nsoid, &name)?;
+    let params = super::seqparams::init_params(interp, &stmt.options, None)?;
 
     let seq_oid = insert_sequence_relation(interp, nsoid, name)?;
+    interp.sequence_params.insert(seq_oid, params);
     for opt in &stmt.options {
         apply_owned_by(interp, seq_oid, opt)?;
     }
@@ -99,6 +101,15 @@ pub(crate) fn create_owned_sequence(
         .unwrap_or_default();
     let name = choose_relation_name(interp, class.relnamespace, &class.relname, &colname, "seq");
     let seq_oid = insert_sequence_relation(interp, class.relnamespace, name)?;
+    // A serial / identity sequence has its column's integer type.
+    let column_type = interp
+        .attributes_of(relid)
+        .iter()
+        .find(|a| a.attnum == attnum)
+        .map_or(oid::INT8, |a| a.atttypid);
+    interp
+        .sequence_params
+        .insert(seq_oid, super::seqparams::SeqParams::defaults(column_type));
     record_ownership(interp, seq_oid, relid, attnum, deptype);
     if deptype == DepType::Auto {
         // serial's `DEFAULT nextval('<seq>')` depends on the sequence.
@@ -257,6 +268,30 @@ pub fn alter_sequence(interp: &mut PgCatalog, stmt: &AlterSeqStmt) -> Result<(),
             "relation \"{name}\" does not exist"
         )));
     };
+    // validate_relation_kind (sequence.c).
+    let relkind = interp.pg_class.get(&seq_oid).map(|c| c.relkind);
+    if relkind != Some(RelKind::Sequence) {
+        let kinds = match relkind {
+            Some(RelKind::Table) => "tables",
+            Some(RelKind::Partitioned) => "partitioned tables",
+            Some(RelKind::View) => "views",
+            Some(RelKind::MaterializedView) => "materialized views",
+            Some(RelKind::Index | RelKind::PartitionedIndex) => "indexes",
+            Some(RelKind::CompositeType) => "composite types",
+            Some(RelKind::ForeignTable) => "foreign tables",
+            _ => "this relation",
+        };
+        return Err(DdlError::Parse(format!(
+            "cannot open relation \"{name}\" (This operation is not supported for {kinds}.)"
+        )));
+    }
+    let current = interp
+        .sequence_params
+        .get(&seq_oid)
+        .copied()
+        .unwrap_or(super::seqparams::SeqParams::defaults(oid::INT8));
+    let params = super::seqparams::init_params(interp, &stmt.options, Some(current))?;
+    interp.sequence_params.insert(seq_oid, params);
     for opt in &stmt.options {
         apply_owned_by(interp, seq_oid, opt)?;
     }

@@ -2774,3 +2774,82 @@ fn partition_keys_are_validated() {
         ),
     ]);
 }
+
+#[test]
+fn sequence_parameters_are_validated() {
+    // PG 18 init_params (sequence.c).
+    let setup = "CREATE SEQUENCE s10 AS int;
+                 CREATE TABLE t (a smallserial, b int);";
+    for (stmt, msg) in [
+        (
+            "CREATE SEQUENCE s MAXVALUE 5 START 10;",
+            "START value (10) cannot be greater than MAXVALUE (5)",
+        ),
+        (
+            "CREATE SEQUENCE s AS text;",
+            "sequence type must be smallint, integer, or bigint",
+        ),
+        (
+            "CREATE SEQUENCE s AS nosuch;",
+            "type \"nosuch\" does not exist",
+        ),
+        (
+            "CREATE SEQUENCE s INCREMENT 0;",
+            "INCREMENT must not be zero",
+        ),
+        (
+            "CREATE SEQUENCE s MINVALUE 10 MAXVALUE 5;",
+            "MINVALUE (10) must be less than MAXVALUE (5)",
+        ),
+        (
+            "CREATE SEQUENCE s CACHE 0;",
+            "CACHE (0) must be greater than zero",
+        ),
+        (
+            "CREATE SEQUENCE s START 0;",
+            "START value (0) cannot be less than MINVALUE (1)",
+        ),
+        (
+            "CREATE SEQUENCE s AS smallint MAXVALUE 100000;",
+            "MAXVALUE (100000) is out of range for sequence data type smallint",
+        ),
+        (
+            "CREATE SEQUENCE s INCREMENT 1 INCREMENT 2;",
+            "conflicting or redundant options",
+        ),
+        (
+            "ALTER SEQUENCE s10 MAXVALUE 5 RESTART 10;",
+            "RESTART value (10) cannot be greater than MAXVALUE (5)",
+        ),
+        (
+            "CREATE SEQUENCE s INCREMENT -1 START 5;",
+            "START value (5) cannot be greater than MAXVALUE (-1)",
+        ),
+        (
+            "ALTER SEQUENCE t_a_seq MAXVALUE 100000;",
+            "MAXVALUE (100000) is out of range for sequence data type smallint",
+        ),
+        ("ALTER SEQUENCE t MAXVALUE 5;", "cannot open relation \"t\""),
+        (
+            "ALTER SEQUENCE s10 START 0;",
+            "START value (0) cannot be less than MINVALUE (1)",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "ALTER SEQUENCE s10 AS smallint;
+             ALTER SEQUENCE s10 MAXVALUE 3;
+             CREATE SEQUENCE s11 INCREMENT -1;
+             CREATE SEQUENCE s12 AS bigint MAXVALUE 9223372036854775807;
+             CREATE SEQUENCE s13 MINVALUE -10 START -5 CACHE 20 CYCLE;
+             ALTER SEQUENCE s13 RESTART;
+             ALTER SEQUENCE s13 NO MAXVALUE;
+             ALTER SEQUENCE t_a_seq MAXVALUE 1000;",
+        ),
+    ]);
+}
