@@ -159,6 +159,21 @@ pub fn create_conversion(
             "encoding conversion function {func} must return type integer"
         )));
     }
+    // CreateConversionCommand calls the function once, and a built-in C
+    // conversion function rejects encodings it doesn't implement.
+    if interp.namespace_name(proc.pronamespace) == Some("pg_catalog")
+        && let Some((_, pairs)) = super::conversion_procs::ACCEPTED_PAIRS
+            .iter()
+            .find(|(n, _)| *n == proc.proname)
+        && !pairs.contains(&(from, to))
+    {
+        return Err(DdlError::Parse(conversion_rejection(
+            &proc.proname,
+            pairs,
+            from,
+            to,
+        )));
+    }
     if interp
         .conversions
         .iter()
@@ -170,6 +185,39 @@ pub fn create_conversion(
     }
     interp.conversions.push((name, nsoid));
     Ok(())
+}
+
+/// The error a built-in conversion function raises for an encoding pair it
+/// doesn't accept: `CHECK_ENCODING_CONVERSION_ARGS` checks a fixed source,
+/// then a fixed destination; the ISO 8859 / WIN family functions then look
+/// the family member up (`unexpected encoding ID N for … character sets`).
+fn conversion_rejection(proname: &str, pairs: &[(&str, &str)], from: &str, to: &str) -> String {
+    let sources: Vec<&str> = pairs.iter().map(|&(s, _)| s).collect();
+    let destinations: Vec<&str> = pairs.iter().map(|&(_, d)| d).collect();
+    fn fixed<'a>(side: &[&'a str]) -> Option<&'a str> {
+        side.iter().all(|&e| e == side[0]).then_some(side[0])
+    }
+    if let Some(src) = fixed(&sources)
+        && src != from
+    {
+        return format!("expected source encoding \"{src}\", but got \"{from}\"");
+    }
+    if let Some(dst) = fixed(&destinations)
+        && dst != to
+    {
+        return format!("expected destination encoding \"{dst}\", but got \"{to}\"");
+    }
+    let member = if fixed(&sources).is_none() { from } else { to };
+    let id = super::conversion_procs::ENCODING_IDS
+        .iter()
+        .find(|(n, _)| *n == member)
+        .map_or(0, |&(_, id)| id);
+    let family = if proname.contains("iso8859") {
+        "ISO 8859"
+    } else {
+        "WIN"
+    };
+    format!("unexpected encoding ID {id} for {family} character sets")
 }
 
 fn find(interp: &PgCatalog, names: &[&str]) -> Option<(String, PgNamespaceOid)> {

@@ -9,6 +9,7 @@ pub mod aggregates;
 pub mod alter;
 pub mod collations;
 mod comment;
+mod conversion_procs;
 pub(crate) mod conversions;
 mod defaults;
 mod dml;

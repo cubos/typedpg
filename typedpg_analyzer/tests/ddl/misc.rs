@@ -4530,3 +4530,35 @@ fn publication_row_filters_judge_node_kind_then_type() {
         );
     }
 }
+
+#[test]
+fn conversion_function_must_handle_the_encoding_pair() {
+    // PG 18 runs the conversion function once; the built-in C functions
+    // reject pairs they don't implement. Messages as PG raises them.
+    for (stmt, msg) in [
+        (
+            "CREATE CONVERSION c FOR 'LATIN1' TO 'UTF8' FROM utf8_to_iso8859_1;",
+            "expected source encoding \"UTF8\", but got \"LATIN1\"",
+        ),
+        (
+            "CREATE CONVERSION c FOR 'KOI8R' TO 'EUC_JP' FROM koi8r_to_mic;",
+            "expected destination encoding \"MULE_INTERNAL\", but got \"EUC_JP\"",
+        ),
+        (
+            "CREATE CONVERSION c FOR 'UTF8' TO 'EUC_JP' FROM utf8_to_iso8859;",
+            "unexpected encoding ID 1 for ISO 8859 character sets",
+        ),
+        (
+            "CREATE CONVERSION c FOR 'UTF8' TO 'EUC_JP' FROM utf8_to_win;",
+            "unexpected encoding ID 1 for WIN character sets",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[(
+        "0001.sql",
+        "CREATE CONVERSION c1 FOR 'LATIN2' TO 'UTF8' FROM iso8859_to_utf8;
+         CREATE CONVERSION c2 FOR 'WIN1252' TO 'UTF8' FROM win_to_utf8;",
+    )]);
+}
