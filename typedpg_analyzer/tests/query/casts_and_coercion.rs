@@ -609,3 +609,20 @@ fn arrays_coerce_element_wise() {
         .unwrap();
     db.analyze("UPDATE ta SET arr = ARRAY[1.5]::numeric[]").unwrap();
 }
+
+/// gram.y rejects an out-of-range `float(p)` precision itself, with
+/// `invalid_parameter_value` rather than a syntax error.
+#[test]
+fn float_precision_out_of_range_is_a_grammar_error() {
+    let db = setup();
+    assert_err_prefix!(
+        db.analyze("SELECT 1::float(0)"),
+        AnalyzeError::Invalid(_),
+        "precision for type float must be at least 1 bit"
+    );
+    assert_err_prefix!(
+        db.analyze("SELECT 1::float(60)"),
+        AnalyzeError::Invalid(_),
+        "precision for type float must be less than 54 bits"
+    );
+}

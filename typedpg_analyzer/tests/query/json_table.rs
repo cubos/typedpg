@@ -115,3 +115,20 @@ fn json_table_errors() {
         assert!(err.to_string().starts_with(msg), "{sql}: {err}");
     }
 }
+
+/// A non-constant JSON_TABLE path is rejected by the grammar as a feature
+/// not supported (0A000), not as a syntax error.
+#[test]
+fn json_table_non_constant_path_is_not_supported() {
+    let db = setup();
+    assert_err_prefix!(
+        db.analyze("SELECT * FROM JSON_TABLE(jsonb '[]', $p COLUMNS (a int)) jt"),
+        AnalyzeError::FeatureNotSupported(_),
+        "only string constants are supported in JSON_TABLE path specification"
+    );
+}
+
+/// Every JSON_TABLE path — the row pattern, a column's PATH / EXISTS PATH,
+/// a NESTED PATH — becomes a jsonpath constant at parse time, so its
+/// content is parsed by jsonpath_in.
+#[test]

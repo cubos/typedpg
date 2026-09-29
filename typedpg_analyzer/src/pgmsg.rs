@@ -667,7 +667,8 @@ pub(crate) fn recursive_query_column_type(
 /// SQLSTATE. Most grammar errors are `syntax_error` (42601), but gram.y
 /// raises a few with another code; those messages (from PG 18's gram.y,
 /// the query-level ones) get the variant carrying that code — the frame
-/// bound checks of `opt_frame_clause` are `windowing_error` (42P20).
+/// bound checks of `opt_frame_clause` are `windowing_error` (42P20), a
+/// non-constant JSON_TABLE path `feature_not_supported` (0A000).
 pub(crate) fn grammar_error(message: String) -> AnalyzeError {
     const WINDOWING: &[&str] = &[
         "frame start cannot be UNBOUNDED FOLLOWING",
@@ -676,11 +677,23 @@ pub(crate) fn grammar_error(message: String) -> AnalyzeError {
         "frame starting from current row cannot have preceding rows",
         "frame starting from following row cannot have preceding rows",
     ];
-    const FEATURE_NOT_SUPPORTED: &[&str] = &["UNIQUE predicate is not yet implemented"];
+    const FEATURE_NOT_SUPPORTED: &[&str] = &[
+        "UNIQUE predicate is not yet implemented",
+        "only string constants are supported in JSON_TABLE path specification",
+    ];
+    // `invalid_parameter_value` (22023) has no dedicated variant: the
+    // multi-code `Invalid` bucket is compared on wording only.
+    const INVALID_PARAMETER_VALUE: &[&str] = &[
+        "precision for type float must be at least 1 bit",
+        "precision for type float must be less than 54 bits",
+        "unrecognized JSON encoding: ",
+    ];
     if WINDOWING.iter().any(|m| message.starts_with(m)) {
         AnalyzeError::WindowingError(message)
     } else if FEATURE_NOT_SUPPORTED.iter().any(|m| message.starts_with(m)) {
         AnalyzeError::FeatureNotSupported(message)
+    } else if INVALID_PARAMETER_VALUE.iter().any(|m| message.starts_with(m)) {
+        AnalyzeError::Invalid(message)
     } else {
         AnalyzeError::Parse(message)
     }
