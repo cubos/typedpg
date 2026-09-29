@@ -262,6 +262,8 @@ pub struct PgCatalog {
     pub(crate) foreign_data: crate::ddl::fdw::ForeignData,
     /// The extension whose scripts are running.
     pub(crate) installing_extension: Option<String>,
+    /// Logical-replication publications.
+    pub(crate) publications: Vec<crate::ddl::publications::Publication>,
     /// Enum labels added in the current transaction to a type created
     /// before it: unusable until committed (check_safe_enum_use).
     pub(crate) uncommitted_enum_labels: std::collections::HashSet<(PgTypeOid, String)>,
@@ -537,6 +539,7 @@ impl PgCatalog {
             sequence_params: HashMap::new(),
             foreign_data: Default::default(),
             installing_extension: None,
+            publications: Vec::new(),
             uncommitted_enum_labels: Default::default(),
             enums_created_in_transaction: Default::default(),
             partition_specs: HashMap::new(),
@@ -1164,6 +1167,9 @@ impl PgCatalog {
         self.index_parents.remove(&oid);
         self.sequence_params.remove(&oid);
         self.foreign_data.table_servers.remove(&oid);
+        for p in &mut self.publications {
+            p.forget_relation(oid);
+        }
         self.index_parents.retain(|_, parent| *parent != oid);
         self.partition_specs.remove(&oid);
         self.partition_bounds.remove(&oid);

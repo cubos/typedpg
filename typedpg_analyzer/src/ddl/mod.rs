@@ -23,6 +23,7 @@ mod maintenance;
 pub(crate) mod opclass;
 pub mod operators;
 mod policies;
+pub(crate) mod publications;
 pub(crate) mod reloptions;
 mod rules;
 pub mod schema_stmt;
@@ -221,6 +222,8 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         node::Node::AlterPolicyStmt(s) => policies::alter_policy(db, s),
         node::Node::RuleStmt(s) => rules::create_rule(db, s),
         node::Node::CreateAmStmt(s) => opclass::create_am(db, s),
+        node::Node::CreatePublicationStmt(s) => publications::create_publication(db, s),
+        node::Node::AlterPublicationStmt(s) => publications::alter_publication(db, s),
         node::Node::DoStmt(s) => function_body::do_block(db, s),
         node::Node::AlterExtensionContentsStmt(s) => extensions::alter_extension_contents(db, s),
         node::Node::CreateFdwStmt(s) => fdw::create_fdw(db, s),
@@ -281,8 +284,6 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         | node::Node::DropOwnedStmt(_)
         | node::Node::CreateEventTrigStmt(_)
         | node::Node::AlterEventTrigStmt(_)
-        | node::Node::CreatePublicationStmt(_)
-        | node::Node::AlterPublicationStmt(_)
         | node::Node::CreateSubscriptionStmt(_)
         | node::Node::AlterSubscriptionStmt(_)
         | node::Node::DropSubscriptionStmt(_)

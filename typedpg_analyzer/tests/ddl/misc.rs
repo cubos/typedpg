@@ -3275,3 +3275,89 @@ fn check_option_needs_an_auto_updatable_view() {
         ),
     ]);
 }
+
+#[test]
+fn publications_are_validated_and_tracked() {
+    // PG 18 CreatePublication / AlterPublication / parse_publication_options
+    // / check_publication_add_relation.
+    let setup = "CREATE TABLE t (a int PRIMARY KEY, b int);
+                 CREATE TABLE u (x int);
+                 CREATE VIEW v AS SELECT 1 AS a;
+                 CREATE PUBLICATION p FOR TABLE t;";
+    for (stmt, msg) in [
+        (
+            "CREATE PUBLICATION q FOR TABLE nosuch;",
+            "relation \"nosuch\" does not exist",
+        ),
+        (
+            "CREATE PUBLICATION q FOR TABLE v;",
+            "cannot add relation \"v\" to publication",
+        ),
+        (
+            "CREATE PUBLICATION q FOR TABLE t (nosuch);",
+            "column \"nosuch\" of relation \"t\" does not exist",
+        ),
+        (
+            "CREATE PUBLICATION q FOR TABLES IN SCHEMA nosuch;",
+            "schema \"nosuch\" does not exist",
+        ),
+        (
+            "CREATE PUBLICATION q FOR TABLE t WHERE (nosuch > 0);",
+            "column \"nosuch\" does not exist",
+        ),
+        (
+            "CREATE PUBLICATION q FOR TABLE t WITH (publish = 'bogus');",
+            "unrecognized value for publication option \"publish\": \"bogus\"",
+        ),
+        (
+            "CREATE PUBLICATION q FOR TABLE t WITH (nosuch = 1);",
+            "unrecognized publication parameter: \"nosuch\"",
+        ),
+        (
+            "CREATE PUBLICATION p FOR TABLE u;",
+            "publication \"p\" already exists",
+        ),
+        (
+            "ALTER PUBLICATION nosuch ADD TABLE t;",
+            "publication \"nosuch\" does not exist",
+        ),
+        (
+            "ALTER PUBLICATION p ADD TABLE t;",
+            "relation \"t\" is already member of publication \"p\"",
+        ),
+        (
+            "ALTER PUBLICATION p DROP TABLE nosuch;",
+            "relation \"nosuch\" does not exist",
+        ),
+        (
+            "ALTER PUBLICATION p DROP TABLE u;",
+            "relation \"u\" is not part of the publication",
+        ),
+        (
+            "DROP PUBLICATION nosuch;",
+            "publication \"nosuch\" does not exist",
+        ),
+        (
+            "CREATE PUBLICATION q FOR TABLE t, nosuch;",
+            "relation \"nosuch\" does not exist",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "CREATE PUBLICATION q FOR TABLE t (a, b) WHERE (a > 0), u WITH (publish = 'insert, update');
+             CREATE PUBLICATION r FOR TABLES IN SCHEMA public;
+             CREATE PUBLICATION s FOR ALL TABLES;
+             ALTER PUBLICATION p ADD TABLE u;
+             ALTER PUBLICATION p DROP TABLE t;
+             ALTER PUBLICATION p SET TABLE t, u;
+             ALTER PUBLICATION p RENAME TO p2;
+             DROP PUBLICATION p2, q;
+             DROP PUBLICATION IF EXISTS nosuch;",
+        ),
+    ]);
+}

@@ -72,6 +72,9 @@ pub fn drop_objects(interp: &mut PgCatalog, stmt: &DropStmt) -> Result<(), DdlEr
                     cascade,
                 )?;
             }
+            ObjectType::ObjectPublication => {
+                super::publications::drop_publication(interp, obj_node, stmt.missing_ok)?;
+            }
             ObjectType::ObjectStatisticExt => {
                 super::statistics::drop_statistics(interp, obj_node, stmt.missing_ok)?;
             }
