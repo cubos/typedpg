@@ -27,16 +27,10 @@ pub(crate) fn infer_func_call(
 ) -> Result<ExprType, AnalyzeError> {
     let Ctx { snapshot, .. } = ctx;
     let func_name_parts = extract_string_fields(&func.funcname);
-    let (schema, name) = match func_name_parts.as_slice() {
-        [name] => (None, name.as_str()),
-        [schema, name] => (Some(schema.as_str()), name.as_str()),
-        _ => {
-            return Err(AnalyzeError::UndefinedFunction(format!(
-                "invalid function name: {:?}",
-                func_name_parts
-            )));
-        }
-    };
+    let (schema, name) = deconstruct_qualified_name(
+        &func_name_parts,
+        crate::error::SourceSpan::from_node_qname(func.location),
+    )?;
 
     validate_within_group(func)?;
 

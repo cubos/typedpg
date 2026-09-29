@@ -114,6 +114,7 @@ pub(crate) fn resolve_target_list(
                 .iter()
                 .any(|f| matches!(f.node.as_ref(), Some(node::Node::AStar(_))))
         {
+            expr::check_column_ref_length(cr)?;
             // Star expansion.
             // `t.*` / `schema.t.*`: the entry is named by the last name part.
             let table_filter = cr.fields.iter().rev().find_map(|f| match f.node.as_ref()? {

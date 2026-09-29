@@ -699,6 +699,36 @@ pub(crate) fn grammar_error(message: String) -> AnalyzeError {
     }
 }
 
+/// `cross-database references are not implemented: a.b.c` — SQLSTATE
+/// 0A000: a name qualified by a database (catalog) name. PG accepts the
+/// qualifier only when it names the current database, which the analyzer
+/// cannot know — the application's database name is not part of its
+/// migrations — so every catalog qualifier is taken as another database.
+pub(crate) fn cross_database_reference(name: &str, span: Option<SourceSpan>) -> RawError {
+    RawError::new(
+        AnalyzeError::FeatureNotSupported(format!(
+            "cross-database references are not implemented: {name}"
+        )),
+        span,
+        Some(
+            "drop the database qualifier: typedpg cannot tell whether it names the              application's database"
+                .into(),
+        ),
+    )
+}
+
+/// `improper qualified name (too many dotted names): a.b.c.d` — SQLSTATE
+/// 42601 (DeconstructQualifiedName, transformColumnRef).
+pub(crate) fn improper_qualified_name(name: &str, span: Option<SourceSpan>) -> RawError {
+    RawError::new(
+        AnalyzeError::SyntaxError(format!(
+            "improper qualified name (too many dotted names): {name}"
+        )),
+        span,
+        None,
+    )
+}
+
 /// `schema "s" does not exist` — SQLSTATE 3F000 (`invalid_schema_name`):
 /// a qualified function/operator name whose schema is missing.
 pub(crate) fn schema_does_not_exist(schema: &str, span: Option<SourceSpan>) -> RawError {
@@ -1267,6 +1297,8 @@ mod tests {
                 procedure_is_not_unique("p", "unknown", None).kind,
                 "42725",
             ),
+            (cross_database_reference("x.s.t", None).kind, "0A000"),
+            (improper_qualified_name("a.b.c.d", None).kind, "42601"),
             (
                 position_not_in_select_list("GROUP BY", 9, None).kind,
                 "42P10",

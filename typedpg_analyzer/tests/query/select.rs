@@ -973,3 +973,37 @@ fn qualified_star_expands_any_visible_entry() {
         "{err}"
     );
 }
+
+/// A database-qualified name (`db.schema.table.column`, `db.schema.type`,
+/// `db.schema.function`) is a cross-database reference unless `db` is the
+/// current database — which the analyzer cannot know, so it takes every
+/// qualifier as another database; more dotted names never resolve.
+#[test]
+fn database_qualified_names_are_cross_database_references() {
+    let db = setup();
+    for (sql, msg) in [
+        (
+            "SELECT x.public.users.id FROM users",
+            "cross-database references are not implemented: x.public.users.id",
+        ),
+        (
+            "SELECT x.public.users.* FROM users",
+            "cross-database references are not implemented: x.public.users.*",
+        ),
+        (
+            "SELECT 1::x.public.int4",
+            "cross-database references are not implemented: x.public.int4",
+        ),
+        (
+            "SELECT x.public.lower('a')",
+            "cross-database references are not implemented: x.public.lower",
+        ),
+    ] {
+        assert_err_prefix!(db.analyze(sql), AnalyzeError::FeatureNotSupported(_), msg);
+    }
+    assert_err_prefix!(
+        db.analyze("SELECT a.b.c.d.e FROM users"),
+        AnalyzeError::SyntaxError(_),
+        "improper qualified name (too many dotted names): a.b.c.d.e"
+    );
+}

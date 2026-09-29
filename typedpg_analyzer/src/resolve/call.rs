@@ -22,15 +22,10 @@ pub(crate) fn analyze_call(
         .as_deref()
         .ok_or_else(|| AnalyzeError::Unsupported("CALL without a procedure call".into()))?;
     let parts = expr::extract_string_fields(&fc.funcname);
-    let (schema, name) = match parts.as_slice() {
-        [n] => (None, n.as_str()),
-        [s, n] => (Some(s.as_str()), n.as_str()),
-        _ => {
-            return Err(AnalyzeError::UndefinedFunction(format!(
-                "invalid procedure name: {parts:?}"
-            )));
-        }
-    };
+    let (schema, name) = expr::deconstruct_qualified_name(
+        &parts,
+        crate::error::SourceSpan::from_node_qname(fc.location),
+    )?;
 
     let scope = Scope::default();
     let null_ctx = NullabilityContext::default();

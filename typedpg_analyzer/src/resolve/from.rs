@@ -965,15 +965,10 @@ fn function_rte_columns(
     let snapshot = arg_ctx.snapshot;
     let func_call: &protobuf::FuncCall = &f.call;
     let func_name_parts = expr::extract_string_fields(&func_call.funcname);
-    let (schema, name) = match func_name_parts.as_slice() {
-        [n] => (None, n.as_str()),
-        [s, n] => (Some(s.as_str()), n.as_str()),
-        _ => {
-            return Err(AnalyzeError::UndefinedFunction(format!(
-                "invalid function name in FROM: {func_name_parts:?}"
-            )));
-        }
-    };
+    let (schema, name) = expr::deconstruct_qualified_name(
+        &func_name_parts,
+        crate::error::SourceSpan::from_node_qname(func_call.location),
+    )?;
     let (arg_types, arg_nullable) = infer_srf_arg_types(func_call, arg_ctx, params)?;
     // nodeFunctionscan.c evaluates only the top-level call as a set.
     if func_call

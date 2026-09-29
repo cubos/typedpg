@@ -1388,7 +1388,7 @@ mod sublink;
 mod xml;
 
 use column_refs::*;
-pub(crate) use column_refs::{SqlFunctionParams, with_sql_function_params};
+pub(crate) use column_refs::{SqlFunctionParams, check_column_ref_length, with_sql_function_params};
 use conditional::*;
 pub(crate) use func_call::{backfill_call_args, check_window_clause};
 use func_call::*;
@@ -1432,6 +1432,25 @@ pub(crate) fn extract_string_fields(nodes: &[protobuf::Node]) -> Vec<String> {
         .collect()
 }
 
+/// PG's `DeconstructQualifiedName` over an already-split name (a function
+/// or type name): `name`, `schema.name`, or `catalog.schema.name` — whose
+/// catalog must be the current database (see
+/// [`crate::pgmsg::cross_database_reference`]); anything longer is an
+/// improper qualified name.
+pub(crate) fn deconstruct_qualified_name(
+    parts: &[String],
+    span: Option<crate::error::SourceSpan>,
+) -> Result<(Option<&str>, &str), AnalyzeError> {
+    match parts {
+        [name] => Ok((None, name.as_str())),
+        [schema, name] => Ok((Some(schema.as_str()), name.as_str())),
+        [_, _, _] => {
+            Err(crate::pgmsg::cross_database_reference(&parts.join("."), span).finalize_implicit())
+        }
+        _ => Err(crate::pgmsg::improper_qualified_name(&parts.join("."), span).finalize_implicit()),
+    }
+}
+
 /// Resolve a TypeName to a type OID.
 fn resolve_type_name(
     type_name: Option<&protobuf::TypeName>,
@@ -1444,16 +1463,7 @@ fn resolve_type_name(
     }
 
     let parts = extract_string_fields(&tn.names);
-    let (schema, name) = match parts.as_slice() {
-        [name] => (None, name.as_str()),
-        [schema, name] => (Some(schema.as_str()), name.as_str()),
-        _ => {
-            return Err(AnalyzeError::Unsupported(format!(
-                "complex type name: {:?}",
-                parts
-            )));
-        }
-    };
+    let (schema, name) = deconstruct_qualified_name(&parts, None)?;
 
     let is_array = !tn.array_bounds.is_empty();
 

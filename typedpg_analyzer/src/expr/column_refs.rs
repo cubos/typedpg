@@ -4,6 +4,32 @@ use super::*;
 // Column references
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// transformColumnRef's field-count rules: four fields are
+/// `db.schema.table.column` (or `.*`), valid only when `db` is the current
+/// database (see [`crate::pgmsg::cross_database_reference`]); more is
+/// never a valid reference. Also applies to select-list `db.s.t.*`.
+pub(crate) fn check_column_ref_length(col_ref: &protobuf::ColumnRef) -> Result<(), AnalyzeError> {
+    if col_ref.fields.len() < 4 {
+        return Ok(());
+    }
+    let written = col_ref
+        .fields
+        .iter()
+        .map(|f| match f.node.as_ref() {
+            Some(node::Node::String(s)) => s.sval.clone(),
+            _ => "*".to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join(".");
+    let span = crate::error::SourceSpan::from_node_qname(col_ref.location);
+    let err = if col_ref.fields.len() == 4 {
+        crate::pgmsg::cross_database_reference(&written, span)
+    } else {
+        crate::pgmsg::improper_qualified_name(&written, span)
+    };
+    Err(err.finalize_implicit())
+}
+
 pub(crate) fn infer_column_ref(
     col_ref: &protobuf::ColumnRef,
     ctx: Ctx<'_>,
@@ -18,6 +44,7 @@ pub(crate) fn infer_column_ref(
     // composite type of the relation referenced by `alias`. `*` alone
     // (no qualifier) could expand to a ROW of every visible source but
     // the semantic is ambiguous enough that we leave it unsupported.
+    check_column_ref_length(col_ref)?;
     let has_star = col_ref
         .fields
         .iter()
@@ -33,9 +60,8 @@ pub(crate) fn infer_column_ref(
         [tbl, col] => (Some(tbl.as_str()), col.as_str()),
         [_schema, tbl, col] => (Some(tbl.as_str()), col.as_str()),
         _ => {
-            return Err(AnalyzeError::UndefinedColumn(format!(
-                "invalid column ref: {:?}",
-                parts
+            return Err(AnalyzeError::Internal(format!(
+                "column reference with a non-name field: {parts:?}"
             )));
         }
     };
