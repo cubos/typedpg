@@ -46,6 +46,17 @@ pub(crate) fn operator_does_not_exist(
     )
 }
 
+/// `operator is only a shell: <left> <op> <right>` — SQLSTATE 42883
+/// (`undefined_function`): the chosen operator was only named as another
+/// one's commutator or negator (`make_op`). A prefix operator has no left.
+pub(crate) fn operator_is_only_a_shell(left: Option<&str>, op: &str, right: &str) -> RawError {
+    let signature = match left {
+        Some(left) => format!("{left} {op} {right}"),
+        None => format!("{op} {right}"),
+    };
+    RawError::undefined_operator(format!("operator is only a shell: {signature}"), None, None)
+}
+
 /// `operator is not unique: <left> <op> <right>` — SQLSTATE 42725
 /// (`ambiguous_function`): several overloads survived every resolution
 /// tiebreak.

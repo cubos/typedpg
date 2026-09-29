@@ -478,10 +478,19 @@ impl PgCatalog {
             }
         };
 
-        // `make_op`: resolve polymorphic operands and the result.
+        // `make_op`: a shell operator (made by a COMMUTATOR / NEGATOR
+        // reference) has no implementation yet.
         let mut declared = args_of(chosen);
-        let Some(result) = chosen.oprresult else {
-            return OperatorMatch::NotFound;
+        let (Some(result), Some(_)) = (chosen.oprresult, chosen.oprcode) else {
+            let shown = |t: PgTypeOid| crate::ddl::util::format_type_for_message(self, t);
+            return OperatorMatch::Error(
+                crate::pgmsg::operator_is_only_a_shell(
+                    chosen.oprleft.map(shown).as_deref(),
+                    opname,
+                    &shown(chosen.oprright),
+                )
+                .finalize_implicit(),
+            );
         };
         match crate::polymorphic::enforce_generic_type_consistency(
             &actuals,
@@ -505,8 +514,8 @@ impl PgCatalog {
     /// requested kind (prefix or binary) in `schema`, or along the search
     /// path (plus `pg_catalog` when not listed explicitly). An operator
     /// whose operand types repeat one from a schema earlier on the path is
-    /// hidden by it. Shell operators (`oprresult = None` — implementation
-    /// not linked yet) can't appear in queries and are skipped.
+    /// hidden by it. Shell operators (implementation not linked yet) are
+    /// candidates too; choosing one is an error (`make_op`).
     fn operator_candidates(
         &self,
         schema: Option<&str>,
@@ -521,7 +530,6 @@ impl PgCatalog {
             let first_of_schema = out.len();
             for &oid in oids {
                 if let Some(op) = self.pg_operator.get(&oid)
-                    && op.oprresult.is_some()
                     && op.oprleft.is_none() == prefix
                     && !out[..first_of_schema]
                         .iter()

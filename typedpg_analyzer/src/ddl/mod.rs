@@ -365,10 +365,10 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         node::Node::CreateSubscriptionStmt(s) => cluster::create_subscription(db, s),
         node::Node::AlterSubscriptionStmt(s) => cluster::alter_subscription(db, &s.subname),
         node::Node::DropSubscriptionStmt(s) => cluster::drop_subscription(db, s),
+        node::Node::AlterOperatorStmt(s) => operators::alter_operator(db, s),
         node::Node::GrantRoleStmt(_)
         | node::Node::CreateRoleStmt(_)
         | node::Node::AlterRoleStmt(_)
-        | node::Node::AlterOperatorStmt(_)
         | node::Node::VariableShowStmt(_)
         | node::Node::NotifyStmt(_)
         | node::Node::ListenStmt(_)

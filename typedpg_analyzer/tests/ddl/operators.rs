@@ -59,12 +59,23 @@ fn drop_operator_missing_errors_without_if_exists() {
 // ── ALTER OPERATOR ──────────────────────────────────────────────────────────
 
 #[test]
-fn alter_operator_is_noop_but_does_not_crash() {
+fn alter_operator_sets_estimators_of_boolean_operators_only() {
     let _snap = build(&[(
+        "0001.sql",
+        "CREATE EXTENSION vector;
+         ALTER OPERATOR < (vector, vector) SET (RESTRICT = scalarltsel);",
+    )]);
+    // `<=>` is a distance (float8): OperatorValidateParams refuses it.
+    let result = try_apply(&[(
         "0001.sql",
         "CREATE EXTENSION vector;
          ALTER OPERATOR <=> (vector, vector) SET (RESTRICT = scalarlesel);",
     )]);
+    assert_ddl_err!(
+        result,
+        DdlError::Parse(_),
+        "only boolean operators can have restriction selectivity"
+    );
 }
 
 // ── CREATE OPERATOR / CREATE CAST validation ────────────────────────────────
@@ -123,5 +134,56 @@ fn user_operator_backed_by_a_non_strict_function_is_nullable() {
     assert_cols(
         &db.analyze("SELECT 1 ==== 2 AS e").unwrap(),
         vec![c("e", bool_ty())],
+    );
+}
+
+#[test]
+fn create_operator_follows_operator_create_checks() {
+    let setup = "CREATE FUNCTION myeq(int, int) RETURNS bool LANGUAGE sql AS 'select $1 = $2';
+                 CREATE FUNCTION myf(int, int) RETURNS int LANGUAGE sql AS 'select $1';";
+    let with_op = format!(
+        "{setup} CREATE OPERATOR === (leftarg = int, rightarg = int, function = myeq);
+                 CREATE OPERATOR ==> (leftarg = int, rightarg = int, function = myf);"
+    );
+    assert_ddl_rejections(&[
+        (
+            &with_op,
+            "CREATE OPERATOR === (leftarg = int, rightarg = int, function = myeq);",
+            "operator === already exists",
+        ),
+        (
+            setup,
+            "CREATE OPERATOR =!= (leftarg = int, rightarg = int, function = myeq, negator = =!=);",
+            "operator cannot be its own negator",
+        ),
+        (
+            setup,
+            "CREATE OPERATOR ==> (leftarg = int, rightarg = int, function = myf, restrict = eqsel);",
+            "only boolean operators can have restriction selectivity",
+        ),
+        (
+            setup,
+            "CREATE OPERATOR ==> (leftarg = int, function = myf);",
+            "operator right argument type must be specified",
+        ),
+        (
+            &with_op,
+            "ALTER OPERATOR ==> (int, int) SET (restrict = eqsel);",
+            "only boolean operators can have restriction selectivity",
+        ),
+    ]);
+}
+
+#[test]
+fn a_commutator_reference_makes_a_shell_operator() {
+    let db = build(&[(
+        "0001.sql",
+        "CREATE FUNCTION myte(int, text) RETURNS bool LANGUAGE sql AS 'select true';
+         CREATE OPERATOR <=> (leftarg = int, rightarg = text, function = myte, commutator = <==>);",
+    )]);
+    assert_err_prefix!(
+        db.analyze("SELECT 'x'::text <==> 1 AS x"),
+        AnalyzeError::UndefinedOperator(_),
+        "operator is only a shell: text <==> integer"
     );
 }
