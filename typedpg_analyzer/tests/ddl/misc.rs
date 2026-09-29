@@ -4654,3 +4654,24 @@ fn truncate_only_refuses_a_partitioned_table() {
     }
     build_db(&[("0001.sql", setup), ("0002.sql", "TRUNCATE p; TRUNCATE ONLY c;")]);
 }
+
+#[test]
+fn truncate_refuses_a_system_catalog() {
+    // truncate_check_rel: a relation with a pinned OID is a system catalog,
+    // off limits even to a superuser without allow_system_table_mods; the
+    // information_schema tables aren't.
+    for (stmt, msg) in [
+        (
+            "TRUNCATE pg_class;",
+            "permission denied: \"pg_class\" is a system catalog",
+        ),
+        (
+            "TRUNCATE ONLY pg_catalog.pg_largeobject;",
+            "permission denied: \"pg_largeobject\" is a system catalog",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[("0001.sql", "TRUNCATE information_schema.sql_features;")]);
+}

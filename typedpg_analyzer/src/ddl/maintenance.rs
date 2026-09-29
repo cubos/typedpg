@@ -27,6 +27,9 @@ fn relname(interp: &PgCatalog, relid: PgClassOid) -> String {
 /// TRUNCATE (ExecuteTruncate): tables only, and no foreign key from a
 /// table left out may reference one being truncated
 /// (heap_truncate_check_FKs), unless CASCADE.
+/// `FirstUnpinnedObjectId` (transam.h).
+const FIRST_UNPINNED_OBJECT_ID: u32 = 12000;
+
 pub fn truncate(interp: &PgCatalog, stmt: &TruncateStmt) -> Result<(), DdlError> {
     let mut targets: Vec<PgClassOid> = Vec::new();
     for rel in &stmt.relations {
@@ -42,6 +45,15 @@ pub fn truncate(interp: &PgCatalog, stmt: &TruncateStmt) -> Result<(), DdlError>
             return Err(DdlError::Parse(format!(
                 "\"{}\" is not a table",
                 rv.relname
+            )));
+        }
+        // truncate_check_rel: a system catalog (a pinned OID,
+        // IsCatalogRelationOid) is off limits without
+        // allow_system_table_mods.
+        if relid.get() < FIRST_UNPINNED_OBJECT_ID {
+            return Err(DdlError::Parse(format!(
+                "permission denied: \"{}\" is a system catalog",
+                relname(interp, relid)
             )));
         }
         // ExecuteTruncate: ONLY on a partitioned table truncates nothing.
