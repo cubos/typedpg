@@ -281,7 +281,7 @@ pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Res
     // fmgr_sql_validator: the body is checked with the function already in
     // the catalog, so a recursive SQL function resolves.
     super::function_body::validate_sql_function(interp, stmt, &proc)?;
-    super::function_body::validate_plpgsql_function(interp, stmt)?;
+    super::function_body::validate_plpgsql_function(interp, stmt, &proc)?;
 
     Ok(())
 }

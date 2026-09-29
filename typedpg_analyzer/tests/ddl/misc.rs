@@ -3668,3 +3668,60 @@ fn languages_must_exist() {
         ),
     ]);
 }
+
+#[test]
+fn plpgsql_return_statements_follow_the_function_result() {
+    // PG 18 make_return_stmt (pl_gram.y).
+    let setup = "CREATE TABLE t (a int);";
+    for (stmt, msg) in [
+        (
+            "CREATE PROCEDURE pr() LANGUAGE plpgsql AS $$ BEGIN RETURN 1; END $$;",
+            "RETURN cannot have a parameter in a procedure",
+        ),
+        (
+            "CREATE FUNCTION fv() RETURNS void LANGUAGE plpgsql AS $$ BEGIN RETURN 1; END $$;",
+            "RETURN cannot have a parameter in function returning void",
+        ),
+        (
+            "CREATE FUNCTION fi() RETURNS int LANGUAGE plpgsql AS $$ BEGIN RETURN; END $$;",
+            "missing expression at or near \";\"",
+        ),
+        (
+            "CREATE FUNCTION fs() RETURNS SETOF int LANGUAGE plpgsql AS $$ BEGIN RETURN 1; END $$;",
+            "RETURN cannot have a parameter in function returning set",
+        ),
+        (
+            "CREATE FUNCTION fo(OUT a int) LANGUAGE plpgsql AS $$ BEGIN RETURN 1; END $$;",
+            "RETURN cannot have a parameter in function with OUT parameters",
+        ),
+        (
+            "CREATE FUNCTION ft() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN; END $$;",
+            "missing expression at or near \";\"",
+        ),
+        (
+            "CREATE FUNCTION fe() RETURNS event_trigger LANGUAGE plpgsql AS $$ BEGIN RETURN 1; END $$;",
+            "RETURN cannot have a parameter in function returning void",
+        ),
+        (
+            "DO $$ BEGIN RETURN 1; END $$;",
+            "RETURN cannot have a parameter in function returning void",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "CREATE FUNCTION a1() RETURNS int LANGUAGE plpgsql AS $$ BEGIN RETURN 1; END $$;
+             CREATE FUNCTION a2() RETURNS void LANGUAGE plpgsql AS $$ BEGIN RETURN; END $$;
+             CREATE FUNCTION a3() RETURNS SETOF int LANGUAGE plpgsql AS $$
+               BEGIN RETURN NEXT 1; RETURN QUERY SELECT 2; RETURN; END $$;
+             CREATE FUNCTION a4(INOUT a int) LANGUAGE plpgsql AS $$ BEGIN RETURN; END $$;
+             CREATE PROCEDURE a5(INOUT a int) LANGUAGE plpgsql AS $$ BEGIN RETURN; END $$;
+             CREATE FUNCTION a6() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;
+             DO $$ BEGIN RETURN; END $$;",
+        ),
+    ]);
+}

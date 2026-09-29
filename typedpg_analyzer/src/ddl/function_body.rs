@@ -466,6 +466,7 @@ pub(crate) fn inlinable_body(stmt: &CreateFunctionStmt, proc: &PgProc) -> Option
 pub(crate) fn validate_plpgsql_function(
     interp: &PgCatalog,
     stmt: &CreateFunctionStmt,
+    proc: &PgProc,
 ) -> Result<(), DdlError> {
     let is_plpgsql = stmt.options.iter().any(|n| {
         matches!(n.node.as_ref(), Some(node::Node::DefElem(de))
@@ -477,7 +478,77 @@ pub(crate) fn validate_plpgsql_function(
         return Ok(());
     }
     let sql = deparse(node::Node::CreateFunctionStmt(Box::new(stmt.clone())))?;
-    compile_plpgsql(interp, &sql)
+    let void = interp
+        .pg_type
+        .get(&proc.prorettype)
+        .is_some_and(|t| matches!(t.typname.as_str(), "void" | "event_trigger"));
+    let returns = if proc.proretset {
+        ReturnKind::Set
+    } else if proc.prokind == crate::pg_catalog::ProKind::Procedure {
+        ReturnKind::Procedure
+    } else if void {
+        ReturnKind::Void
+    } else if proc
+        .proargmodes
+        .iter()
+        .any(|m| matches!(m, ArgMode::Out | ArgMode::InOut | ArgMode::Table))
+    {
+        ReturnKind::OutParams
+    } else {
+        ReturnKind::Value
+    };
+    compile_plpgsql(interp, &sql, returns)
+}
+
+/// What a PL/pgSQL function returns, for make_return_stmt's checks.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReturnKind {
+    Set,
+    Procedure,
+    Void,
+    OutParams,
+    Value,
+}
+
+/// make_return_stmt (pl_gram.y): whether `RETURN` takes an expression.
+fn check_returns(json: &serde_json::Value, returns: ReturnKind) -> Result<(), DdlError> {
+    match json {
+        serde_json::Value::Object(map) => {
+            if let Some(ret) = map.get("PLpgSQL_stmt_return") {
+                let has_expr = ret.get("expr").is_some() || ret.get("retvarno").is_some();
+                let msg = match (returns, has_expr) {
+                    (ReturnKind::Set, true) => Some(
+                        "RETURN cannot have a parameter in function returning set (Use RETURN \
+                         NEXT or RETURN QUERY.)",
+                    ),
+                    (ReturnKind::Procedure, true) => {
+                        Some("RETURN cannot have a parameter in a procedure")
+                    }
+                    (ReturnKind::Void, true) => {
+                        Some("RETURN cannot have a parameter in function returning void")
+                    }
+                    (ReturnKind::OutParams, true) => {
+                        Some("RETURN cannot have a parameter in function with OUT parameters")
+                    }
+                    (ReturnKind::Value, false) => Some("missing expression at or near \";\""),
+                    _ => None,
+                };
+                if let Some(msg) = msg {
+                    return Err(DdlError::Parse(msg.into()));
+                }
+            }
+            for value in map.values() {
+                check_returns(value, returns)?;
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                check_returns(item, returns)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// `DO [LANGUAGE lang] 'code'` (ExecuteDoStmt): the language must exist and
@@ -526,12 +597,12 @@ pub(crate) fn do_block(
     let sql = format!(
         "CREATE FUNCTION inline_code_block() RETURNS void LANGUAGE plpgsql AS ${tag}${code}${tag}$"
     );
-    compile_plpgsql(interp, &sql)
+    compile_plpgsql(interp, &sql, ReturnKind::Void)
 }
 
 /// Compile a `CREATE FUNCTION ... LANGUAGE plpgsql` statement with the
 /// PL/pgSQL grammar and resolve its declared variables' types.
-fn compile_plpgsql(interp: &PgCatalog, sql: &str) -> Result<(), DdlError> {
+fn compile_plpgsql(interp: &PgCatalog, sql: &str, returns: ReturnKind) -> Result<(), DdlError> {
     let parsed = pg_query::parse_plpgsql(sql).map_err(|e| match e {
         pg_query::Error::Parse(msg) => DdlError::Parse(msg),
         other => DdlError::Parse(other.to_string()),
@@ -562,7 +633,7 @@ fn compile_plpgsql(interp: &PgCatalog, sql: &str) -> Result<(), DdlError> {
         };
         check_declared_type(interp, typname)?;
     }
-    Ok(())
+    check_returns(&parsed, returns)
 }
 
 /// Resolve a PL/pgSQL variable's declared type: `x%TYPE` names a column,
