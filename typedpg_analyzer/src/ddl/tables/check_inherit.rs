@@ -129,6 +129,11 @@ fn insert_check(
     Ok(())
 }
 
+/// A CHECK constraint the parents give a new table: (name, conkey on the
+/// table, definition, how many parents contribute it, enforced by any of
+/// them).
+type InheritedCheck = (String, Vec<i16>, Option<CheckDef>, i16, bool);
+
 /// CREATE TABLE ... INHERITS / PARTITION OF: the parents' inheritable CHECK
 /// constraints, merged by name (MergeCheckConstraint), then merged with the
 /// table's own ones (MergeWithExistingConstraint).
@@ -144,9 +149,7 @@ pub(super) fn inherit_parent_checks(
     parents.sort_by_key(|i| i.inhseqno);
     let parents: Vec<PgClassOid> = parents.iter().map(|i| i.inhparent).collect();
 
-    // (name, conkey on relid, definition, how many parents contribute it,
-    // enforced by any of them)
-    let mut inherited: Vec<(String, Vec<i16>, Option<CheckDef>, i16, bool)> = Vec::new();
+    let mut inherited: Vec<InheritedCheck> = Vec::new();
     for parent in parents {
         let mut checks: Vec<PgConstraint> = interp
             .pg_constraint

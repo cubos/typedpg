@@ -416,6 +416,19 @@ pub(crate) fn resolve_index_opclass(
     Ok(())
 }
 
+/// The declared input type (`opcintype`) of `typ`'s default operator class
+/// for `am`, if it has one.
+pub(crate) fn default_opclass_intype(
+    interp: &PgCatalog,
+    typ: PgTypeOid,
+    am: &str,
+) -> Option<PgTypeOid> {
+    default_opclass(interp, typ, am)
+        .ok()
+        .flatten()
+        .map(|c| c.opcintype)
+}
+
 /// Whether `typ` has a default btree operator class (CreateStatistics).
 pub(crate) fn has_default_btree_opclass(interp: &PgCatalog, typ: PgTypeOid) -> bool {
     matches!(default_opclass(interp, typ, "btree"), Ok(Some(_)))

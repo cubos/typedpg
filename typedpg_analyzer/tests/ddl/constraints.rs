@@ -112,7 +112,7 @@ fn create_table_references_unknown_column_is_rejected() {
              );"
         )]),
         DdlError::Parse(_),
-        "column \"ghost\" referenced in foreign key constraint does not exist on \"p\"",
+        "column \"ghost\" referenced in foreign key constraint does not exist",
     );
 }
 
@@ -146,7 +146,9 @@ fn create_table_references_with_incompatible_type_is_rejected() {
              );"
         )]),
         DdlError::DependencyError(_),
-        "foreign key constraint \"c_p_id_fkey\" cannot be implemented (key columns of \"c\" and \"p\" are of incompatible types: text and bigint)",
+        "foreign key constraint \"c_p_id_fkey\" cannot be implemented (Key columns \"p_id\" of the \
+         referencing table and \"id\" of the referenced table are of incompatible types: text and \
+         bigint.)",
     );
 }
 
@@ -203,7 +205,7 @@ fn create_table_table_level_foreign_key_arity_mismatch_is_rejected() {
              );"
         )]),
         DdlError::Parse(_),
-        "number of referencing and referenced columns for foreign key disagree (constraint \"c_pa_fkey\": 1 local column(s) vs 2 on \"p\")",
+        "number of referencing and referenced columns for foreign key disagree",
     );
 }
 
@@ -818,4 +820,70 @@ fn check_constraints_read_no_system_column_but_tableoid() {
         "0001.sql",
         "CREATE TABLE t (a text, CHECK (tableoid::regclass::text = 't'));",
     )]);
+}
+
+#[test]
+fn foreign_key_columns_pair_through_the_referenced_opclass() {
+    // ATAddForeignKeyConstraint (PG 18): a cross-type member of the
+    // referenced column's btree family, or implicit casts of both types to
+    // the opclass type; polymorphic opclasses (arrays) need the same type.
+    let setup = "CREATE TABLE p (id bigint PRIMARY KEY, t text UNIQUE, n numeric UNIQUE,
+                   d date UNIQUE, arr int[] UNIQUE, f float8 UNIQUE);
+                 CREATE TABLE pd (id int PRIMARY KEY DEFERRABLE);
+                 CREATE TABLE pu (id int UNIQUE DEFERRABLE);
+                 CREATE VIEW v AS SELECT 1 AS a;";
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "CREATE TABLE c1 (pid int REFERENCES p);
+             CREATE TABLE c2 (x name REFERENCES p (t));
+             CREATE TABLE c3 (x int REFERENCES p (n));
+             CREATE TABLE c4 (x timestamp REFERENCES p (d));
+             CREATE TABLE c6 (x float4 REFERENCES p (f));
+             CREATE TABLE c7 (x varchar REFERENCES p (t));
+             CREATE TABLE c12 (x smallint REFERENCES p (n));",
+        ),
+    ]);
+    for (stmt, msg) in [
+        (
+            "CREATE TABLE c5 (x bigint[] REFERENCES p (arr));",
+            "foreign key constraint \"c5_x_fkey\" cannot be implemented",
+        ),
+        (
+            "CREATE TABLE c8 (x text REFERENCES p (id));",
+            "foreign key constraint \"c8_x_fkey\" cannot be implemented",
+        ),
+        (
+            "CREATE TABLE c9 (a bigint, b bigint, FOREIGN KEY (a, b) REFERENCES p (id, id));",
+            "foreign key referenced-columns list must not contain duplicates",
+        ),
+        (
+            "CREATE TABLE c10 (x int REFERENCES pd);",
+            "cannot use a deferrable primary key for referenced table \"pd\"",
+        ),
+        (
+            "CREATE TABLE c11 (x int REFERENCES pu (id));",
+            "cannot use a deferrable unique constraint for referenced table \"pu\"",
+        ),
+        (
+            "CREATE TABLE c13 (x int, FOREIGN KEY (x) REFERENCES p (id) ON DELETE SET NULL (nosuch));",
+            "column \"nosuch\" referenced in foreign key constraint does not exist",
+        ),
+        (
+            "CREATE TABLE c14 (x int, y int, FOREIGN KEY (x) REFERENCES p (id) ON DELETE SET NULL (y));",
+            "column \"y\" referenced in ON DELETE SET action must be part of foreign key",
+        ),
+        (
+            "CREATE TABLE c15 (x int REFERENCES v (a));",
+            "referenced relation \"v\" is not a table",
+        ),
+        (
+            "CREATE TABLE c16 (x int, FOREIGN KEY (xmin) REFERENCES p (id));",
+            "system columns cannot be used in foreign keys",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
 }

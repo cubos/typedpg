@@ -42,6 +42,8 @@ mod procedures;
 mod rename;
 #[path = "ddl/schemas.rs"]
 mod schemas;
+#[path = "ddl/temporal.rs"]
+mod temporal;
 #[path = "ddl/types.rs"]
 mod types;
 #[path = "ddl/views.rs"]

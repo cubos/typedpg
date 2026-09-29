@@ -454,7 +454,8 @@ pub(crate) fn require_pk_not_null(
         )))
     };
     let Some(attnum) = interp.attribute_by_name(relid, col).map(|a| a.attnum) else {
-        return Ok(());
+        // AddRelationNewConstraints on the queued not-null constraint.
+        return Err(DdlError::Parse(column_not_found_msg(interp, relid, col)));
     };
     if let Some(con) = not_null_constraint(interp, relid, attnum) {
         return incompatible(interp, con);

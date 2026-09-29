@@ -486,6 +486,16 @@ fn validate_on_conflict_target(
                 "constraint in ON CONFLICT clause has no associated index".into(),
             ));
         }
+        // infer_arbiter_indexes: an exclusion constraint's index — an
+        // EXCLUDE one, or PG 18's WITHOUT OVERLAPS key — can't arbitrate
+        // an update.
+        if on_conflict.action() == protobuf::OnConflictAction::OnconflictUpdate
+            && (found.contype == ConType::Exclusion || found.conperiod)
+        {
+            return Err(AnalyzeError::WrongObjectType(
+                "ON CONFLICT DO UPDATE not supported with exclusion constraints".into(),
+            ));
+        }
         return Ok(());
     }
 
@@ -536,7 +546,9 @@ fn validate_on_conflict_target(
         .unwrap_or_default();
 
     let index_matches = snapshot.pg_index.values().any(|idx| {
-        if idx.indrelid != table_oid || !idx.indisunique {
+        // A WITHOUT OVERLAPS key is unique but really an exclusion
+        // constraint: inference skips it.
+        if idx.indrelid != table_oid || !idx.indisunique || idx.indisexclusion {
             return false;
         }
         let key = &idx.indkey[..usize::try_from(idx.indnkeyatts)
@@ -568,6 +580,7 @@ fn validate_on_conflict_target(
         && snapshot.pg_constraint_values().any(|c| {
             c.conrelid == table_oid
                 && matches!(c.contype, ConType::PrimaryKey | ConType::Unique)
+                && !c.conperiod
                 && c.conkey
                     .iter()
                     .copied()

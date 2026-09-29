@@ -23,7 +23,8 @@ use crate::qualified_name::QualifiedName;
 /// `(conname, contype, conkey, confrelid, confkey)`. Materialized into
 /// real catalog rows after all FK targets have been validated.
 /// CHECK constraints also carry their definition and whether they are
-/// ENFORCED; then come DEFERRABLE and the INCLUDE columns.
+/// ENFORCED; then come DEFERRABLE, the INCLUDE columns, and whether a key
+/// is WITHOUT OVERLAPS.
 type PendingConstraint = (
     ConName,
     ConType,
@@ -33,6 +34,7 @@ type PendingConstraint = (
     Option<(check_inherit::CheckDef, bool)>,
     bool,
     Vec<i16>,
+    bool,
 );
 
 /// A constraint's name: the explicit one, or PG's generated
@@ -1136,6 +1138,7 @@ pub(crate) mod check_inherit;
 mod column_options;
 mod columns;
 mod constraints;
+mod foreign_keys;
 mod generated;
 pub(crate) mod inherit;
 mod inherit_cmd;

@@ -17,19 +17,16 @@ pub(crate) fn emit_constraints(
         .map(|a| (a.attname.clone(), (a.attnum, a.atttypid)))
         .collect();
     let attnum_of = |name: &str| attinfo_by_name.get(name).map(|(an, _)| *an);
-    let atttype_of = |name: &str| attinfo_by_name.get(name).map(|(_, t)| *t);
 
     let mut to_emit: Vec<PendingConstraint> = Vec::new();
     // FOREIGN KEYs are resolved only after this table's own PRIMARY KEY /
     // UNIQUE constraints exist, so a self-reference finds them — PG likewise
     // adds FKs after creating the table and its indexes
     // (transformFKConstraints queues them as ALTER TABLE ADD CONSTRAINT).
-    // `(constraint, local columns, their types, their attnums, default name)`.
+    // `(constraint, local columns, default name)`.
     type PendingFk<'a> = (
         &'a typedpg_pg_query::protobuf::Constraint,
         Vec<String>,
-        Vec<PgTypeOid>,
-        Vec<i16>,
         ConName,
     );
     let mut pending_fks: Vec<PendingFk> = Vec::new();
@@ -43,9 +40,6 @@ pub(crate) fn emit_constraints(
     }
     for (cd, constraints) in &column_constraints {
         let Some(an) = attnum_of(&cd.colname) else {
-            continue;
-        };
-        let Some(my_type) = atttype_of(&cd.colname) else {
             continue;
         };
         for c in constraints {
@@ -66,6 +60,7 @@ pub(crate) fn emit_constraints(
                         None,
                         c.deferrable,
                         include_attnums(interp, relid, c)?.0,
+                        false,
                     ));
                 }
                 Ok(ConstrType::ConstrUnique) => {
@@ -84,6 +79,7 @@ pub(crate) fn emit_constraints(
                         None,
                         c.deferrable,
                         include_attnums(interp, relid, c)?.0,
+                        false,
                     ));
                 }
                 Ok(ConstrType::ConstrCheck) => {
@@ -110,14 +106,13 @@ pub(crate) fn emit_constraints(
                         )),
                         c.deferrable,
                         include_attnums(interp, relid, c)?.0,
+                        false,
                     ));
                 }
                 Ok(ConstrType::ConstrForeign) => {
                     pending_fks.push((
                         c,
                         vec![cd.colname.clone()],
-                        vec![my_type],
-                        vec![an],
                         ConName::Constraint {
                             addition: cd.colname.clone(),
                             label: "fkey",
@@ -145,6 +140,7 @@ pub(crate) fn emit_constraints(
         let columns: Vec<i16> = column_names.iter().filter_map(|n| attnum_of(n)).collect();
         match ConstrType::try_from(c.contype) {
             Ok(ConstrType::ConstrPrimary) if !columns.is_empty() => {
+                check_key_column_list(interp, relid, c, &column_names)?;
                 to_emit.push((
                     ConName::from_explicit(
                         &c.conname,
@@ -160,9 +156,11 @@ pub(crate) fn emit_constraints(
                     None,
                     c.deferrable,
                     include_attnums(interp, relid, c)?.0,
+                    c.without_overlaps,
                 ));
             }
             Ok(ConstrType::ConstrUnique) if !columns.is_empty() => {
+                check_key_column_list(interp, relid, c, &column_names)?;
                 to_emit.push((
                     ConName::from_explicit(
                         &c.conname,
@@ -184,6 +182,7 @@ pub(crate) fn emit_constraints(
                     None,
                     c.deferrable,
                     include_attnums(interp, relid, c)?.0,
+                    c.without_overlaps,
                 ));
             }
             Ok(ConstrType::ConstrCheck) => {
@@ -210,6 +209,7 @@ pub(crate) fn emit_constraints(
                     )),
                     c.deferrable,
                     include_attnums(interp, relid, c)?.0,
+                    false,
                 ));
             }
             Ok(ConstrType::ConstrExclusion) => {
@@ -231,6 +231,7 @@ pub(crate) fn emit_constraints(
                     None,
                     c.deferrable,
                     include_attnums(interp, relid, c)?.0,
+                    false,
                 ));
             }
             Ok(ConstrType::ConstrForeign) => {
@@ -244,19 +245,11 @@ pub(crate) fn emit_constraints(
                         _ => None,
                     })
                     .collect();
-                let local_types: Vec<PgTypeOid> =
-                    fk_names.iter().filter_map(|n| atttype_of(n)).collect();
-                if local_types.len() != fk_names.len() {
-                    return Err(DdlError::Parse(format!(
-                        "foreign key on {relname} references unknown local column"
-                    )));
-                }
-                let fk_columns: Vec<i16> = fk_names.iter().filter_map(|n| attnum_of(n)).collect();
                 let default_name = ConName::Constraint {
                     addition: crate::ddl::util::index_name_addition(&fk_names),
                     label: "fkey",
                 };
-                pending_fks.push((c, fk_names, local_types, fk_columns, default_name));
+                pending_fks.push((c, fk_names, default_name));
             }
             _ => {}
         }
@@ -269,7 +262,11 @@ pub(crate) fn emit_constraints(
     for pending in to_emit {
         let index_backed = |t: ConType| matches!(t, ConType::PrimaryKey | ConType::Unique);
         let dup = kept.iter().position(|k| {
-            index_backed(k.1) && index_backed(pending.1) && k.2 == pending.2 && k.7 == pending.7
+            index_backed(k.1)
+                && index_backed(pending.1)
+                && k.2 == pending.2
+                && k.7 == pending.7
+                && k.8 == pending.8
         });
         match dup {
             Some(i) if !pending.0.is_explicit() || !kept[i].0.is_explicit() => {
@@ -280,10 +277,11 @@ pub(crate) fn emit_constraints(
             _ => kept.push(pending),
         }
     }
-    for (conname, contype, conkey, confrelid, confkey, check, deferrable, include) in kept {
+    for (conname, contype, conkey, confrelid, confkey, check, deferrable, include, period) in kept {
         let conname = conname.resolve(interp, relid);
         let oid = emit_constraint_with_backing_index(
             interp, relid, conname, contype, conkey, confrelid, confkey, deferrable, include,
+            period,
         )?;
         if let Some((def, enforced)) = check {
             // CREATE TABLE's constraints are valid unless NOT ENFORCED.
@@ -295,29 +293,85 @@ pub(crate) fn emit_constraints(
             interp.check_defs.insert(oid, def);
         }
     }
-    for (c, local_names, local_types, conkey, default_name) in pending_fks {
-        check_fk_persistence(interp, relid, c)?;
-        let (target_oid, target_attnums) =
-            resolve_fk_target(interp, c, relname, &local_names, &local_types)?;
-        check_fk_generated_columns(interp, relid, c, &conkey)?;
-        let conname = ConName::from_explicit(&c.conname, default_name).resolve(interp, relid);
-        let oid = emit_constraint_with_backing_index(
-            interp,
-            relid,
-            conname,
-            ConType::ForeignKey,
-            conkey,
-            Some(target_oid),
-            target_attnums,
-            false,
-            Vec::new(),
-        )?;
-        // transformFKConstraints: CREATE TABLE's foreign keys are valid
-        // unless NOT ENFORCED.
-        if let Some(row) = interp.pg_constraint.get_mut(&oid) {
-            row.conenforced = c.is_enforced;
-            row.convalidated = c.is_enforced;
+    for (c, local_names, default_name) in pending_fks {
+        super::foreign_keys::add_foreign_key(interp, relid, c, &local_names, default_name, true)?;
+    }
+    let _ = relname;
+    Ok(())
+}
+
+/// transformIndexConstraint's checks of a PRIMARY KEY / UNIQUE column
+/// list: no column twice, and for WITHOUT OVERLAPS at least two columns,
+/// the last a range or multirange (or a domain over one). A column that
+/// doesn't exist is left to DefineIndex.
+fn check_key_column_list(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+    c: &typedpg_pg_query::protobuf::Constraint,
+    names: &[String],
+) -> Result<(), DdlError> {
+    let what = if c.contype == ConstrType::ConstrPrimary as i32 {
+        "primary key constraint"
+    } else {
+        "unique constraint"
+    };
+    for (i, name) in names.iter().enumerate() {
+        if names[..i].contains(name) {
+            return Err(DdlError::DuplicateObject(format!(
+                "column \"{name}\" appears twice in {what}"
+            )));
         }
+        if c.without_overlaps
+            && i == names.len() - 1
+            && let Some(attr) = interp.attribute_by_name(relid, name)
+        {
+            let base = interp.unwrap_domain(attr.atttypid);
+            let range_like = interp
+                .pg_type
+                .get(&base)
+                .is_some_and(|t| matches!(t.typtype, TypType::Range | TypType::Multirange));
+            if !range_like {
+                return Err(DdlError::Parse(format!(
+                    "column \"{name}\" in WITHOUT OVERLAPS is not a range or multirange type"
+                )));
+            }
+        }
+    }
+    if c.without_overlaps && names.len() < 2 {
+        return Err(DdlError::Parse(
+            "constraint using WITHOUT OVERLAPS needs at least two columns".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// DefineIndex for a WITHOUT OVERLAPS key's GiST index: every key column
+/// needs a default GiST operator class (a scalar one only has it through
+/// btree_gist), and a partition key column can't be the WITHOUT OVERLAPS
+/// one — its operator is `&&`, not the partitioning equality.
+fn check_without_overlaps_index(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+    attnums: &[i16],
+) -> Result<(), DdlError> {
+    let attrs = interp.attributes_of(relid);
+    for attnum in attnums {
+        if let Some(attr) = attrs.iter().find(|a| a.attnum == *attnum) {
+            crate::ddl::opclass::resolve_index_opclass(interp, &[], attr.atttypid, "gist")?;
+        }
+    }
+    if let (Some(part_key), Some(period)) = (interp.partition_keys.get(&relid), attnums.last())
+        && part_key.contains(period)
+    {
+        let name = attrs
+            .iter()
+            .find(|a| a.attnum == *period)
+            .map(|a| a.attname.clone())
+            .unwrap_or_default();
+        return Err(DdlError::UnsupportedDdl(format!(
+            "cannot match partition key to index on column \"{name}\" using non-equal operator \
+             \"&&\""
+        )));
     }
     Ok(())
 }
@@ -475,7 +529,7 @@ pub(super) fn fold_constraint_attrs(
 /// COLUMN / DROP TABLE cascade through `pg_index` and `ON CONFLICT ON
 /// CONSTRAINT name` finds the index by its conname.
 #[allow(clippy::too_many_arguments)] // one field per pg_constraint column
-fn emit_constraint_with_backing_index(
+pub(super) fn emit_constraint_with_backing_index(
     interp: &mut PgCatalog,
     relid: PgClassOid,
     conname: String,
@@ -485,7 +539,11 @@ fn emit_constraint_with_backing_index(
     confkey: Vec<i16>,
     deferrable: bool,
     include: Vec<i16>,
+    period: bool,
 ) -> Result<PgConstraintOid, DdlError> {
+    if period && contype != ConType::ForeignKey {
+        check_without_overlaps_index(interp, relid, &conkey)?;
+    }
     if contype == ConType::PrimaryKey {
         check_no_primary_key(interp, relid)?;
     }
@@ -524,7 +582,7 @@ fn emit_constraint_with_backing_index(
         conenforced: true,
         convalidated: true,
         connoinherit: false,
-        conperiod: false,
+        conperiod: period,
     });
     if matches!(
         contype,
@@ -558,7 +616,9 @@ fn emit_constraint_with_backing_index(
             // An exclusion constraint's index is not a unique one.
             indisunique: contype != ConType::Exclusion,
             indisprimary: matches!(contype, ConType::PrimaryKey),
-            indisexclusion: contype == ConType::Exclusion,
+            // A WITHOUT OVERLAPS key's GiST index backs an exclusion
+            // constraint too.
+            indisexclusion: contype == ConType::Exclusion || period,
             indkey,
             indexprs: Vec::new(),
             indpred: None,
@@ -686,7 +746,7 @@ pub(crate) fn persistence(interp: &PgCatalog, relid: PgClassOid) -> char {
 /// ATAddForeignKeyConstraint: a permanent table references only
 /// permanent tables, an unlogged one permanent or unlogged ones, a
 /// temporary one only temporary ones.
-fn check_fk_persistence(
+pub(super) fn check_fk_persistence(
     interp: &PgCatalog,
     relid: PgClassOid,
     c: &typedpg_pg_query::protobuf::Constraint,
@@ -718,7 +778,7 @@ fn check_fk_persistence(
 /// ATAddForeignKeyConstraint: what a foreign key may do over generated
 /// columns — no action that writes the referencing column (per the SQL
 /// standard), and no virtual column at all.
-fn check_fk_generated_columns(
+pub(super) fn check_fk_generated_columns(
     interp: &PgCatalog,
     relid: PgClassOid,
     c: &typedpg_pg_query::protobuf::Constraint,
@@ -753,168 +813,6 @@ fn check_fk_generated_columns(
         }
     }
     Ok(())
-}
-
-/// Resolve a `FOREIGN KEY` target: returns `(target_class_oid, target_attnums)`.
-///
-/// Validates the same things PG does at CREATE/ALTER time:
-/// - Target relation exists.
-/// - Target columns exist.
-/// - When the column list is omitted, defaults to the target's PRIMARY KEY.
-/// - Target columns are covered exactly by a `PRIMARY KEY` or `UNIQUE`
-///   constraint on the target relation.
-/// - Local and target column types match (after domain unwrapping).
-fn resolve_fk_target(
-    interp: &PgCatalog,
-    c: &typedpg_pg_query::protobuf::Constraint,
-    relname: &str,
-    local_col_names: &[String],
-    local_types: &[PgTypeOid],
-) -> Result<(PgClassOid, Vec<i16>), DdlError> {
-    // Match PG's auto-naming: explicit `CONSTRAINT <name>` if given, otherwise
-    // `<relname>_<col1>_<col2>_..._fkey`. Used as the prefix on error
-    // messages so `pglite_sanity` matches PG's `foreign key constraint
-    // "<name>" cannot be implemented`.
-    let fk_name = constraint_name(&c.conname, || {
-        format!("{relname}_{}_fkey", local_col_names.join("_"))
-    });
-    let pkrv = c
-        .pktable
-        .as_ref()
-        .ok_or_else(|| DdlError::Parse(format!("FOREIGN KEY on {relname} without REFERENCES")))?;
-    let (target_schema, target_name) = range_var_names(pkrv, interp);
-    let target_nsoid = interp.namespace_oid(&target_schema).ok_or_else(|| {
-        DdlError::TableNotFound(format!(
-            "relation \"{}\" does not exist (referenced \
-             by foreign key constraint \"{fk_name}\")",
-            QualifiedName::new(&target_schema, &target_name),
-        ))
-    })?;
-    let target_oid = interp
-        .class_by_qname
-        .get(&(target_nsoid, target_name.clone()))
-        .copied()
-        .ok_or_else(|| {
-            DdlError::TableNotFound(format!(
-                "relation \"{target_name}\" does not exist (referenced by foreign key \
-                 constraint \"{fk_name}\")"
-            ))
-        })?;
-
-    // No explicit column list → default to the target's PRIMARY KEY.
-    let target_attnums: Vec<i16> = if c.pk_attrs.is_empty() {
-        let pk = interp
-            .pg_constraint
-            .values()
-            .find(|x| x.conrelid == target_oid && matches!(x.contype, ConType::PrimaryKey))
-            .ok_or_else(|| {
-                DdlError::DependencyError(format!(
-                    "there is no primary key for referenced table \"{target_name}\""
-                ))
-            })?;
-        pk.conkey.clone()
-    } else {
-        let target_attrs = interp.attributes_of(target_oid);
-        let mut nums = Vec::new();
-        for k in &c.pk_attrs {
-            if let Some(node::Node::String(s)) = k.node.as_ref() {
-                let Some(an) = target_attrs
-                    .iter()
-                    .find(|a| a.attname == s.sval)
-                    .map(|a| a.attnum)
-                else {
-                    return Err(DdlError::Parse(format!(
-                        "column \"{}\" referenced in foreign key constraint does not exist \
-                         on \"{target_name}\"",
-                        s.sval
-                    )));
-                };
-                nums.push(an);
-            }
-        }
-        nums
-    };
-
-    // transformFkeyCheckAttrs: the referenced columns must be exactly the
-    // key of a unique, non-partial, non-expression index (a PRIMARY KEY /
-    // UNIQUE constraint's, or a plain CREATE UNIQUE INDEX).
-    let target_set: std::collections::BTreeSet<i16> = target_attnums.iter().copied().collect();
-    let covered = interp.pg_index.values().any(|idx| {
-        idx.indrelid == target_oid
-            && idx.indisunique
-            && idx.indpred.is_none()
-            && idx.indexprs.is_empty()
-            && idx.indkey[..usize::try_from(idx.indnkeyatts)
-                .unwrap_or(0)
-                .min(idx.indkey.len())]
-                .iter()
-                .copied()
-                .collect::<std::collections::BTreeSet<_>>()
-                == target_set
-    }) || interp.pg_constraint.values().any(|x| {
-        x.conrelid == target_oid
-            && matches!(x.contype, ConType::PrimaryKey | ConType::Unique)
-            && x.conkey
-                .iter()
-                .copied()
-                .collect::<std::collections::BTreeSet<_>>()
-                == target_set
-    });
-    if !covered {
-        return Err(DdlError::DependencyError(format!(
-            "there is no unique constraint matching given keys for referenced table \
-             \"{target_name}\""
-        )));
-    }
-
-    // Type compatibility — local vs target after domain unwrapping.
-    let target_attrs = interp.attributes_of(target_oid);
-    let target_types: Vec<PgTypeOid> = target_attnums
-        .iter()
-        .filter_map(|&an| {
-            target_attrs
-                .iter()
-                .find(|a| a.attnum == an)
-                .map(|a| a.atttypid)
-        })
-        .collect();
-    if target_types.len() != target_attnums.len() {
-        return Err(DdlError::Parse(format!(
-            "foreign key constraint \"{fk_name}\" cannot be implemented \
-             (references an unknown column on \"{target_name}\")"
-        )));
-    }
-    if target_types.len() != local_types.len() {
-        return Err(DdlError::Parse(format!(
-            "number of referencing and referenced columns for foreign key disagree \
-             (constraint \"{fk_name}\": {} local column(s) vs {} on \"{target_name}\")",
-            local_types.len(),
-            target_types.len()
-        )));
-    }
-    for (lt, tt) in local_types.iter().zip(target_types.iter()) {
-        if interp.unwrap_domain(*lt) != interp.unwrap_domain(*tt) {
-            let lt_name = format_type_for_message(interp, *lt);
-            let tt_name = format_type_for_message(interp, *tt);
-            return Err(DdlError::DependencyError(format!(
-                "foreign key constraint \"{fk_name}\" cannot be implemented \
-                 (key columns of \"{relname}\" and \"{target_name}\" are of incompatible \
-                 types: {lt_name} and {tt_name})"
-            )));
-        }
-    }
-
-    Ok((target_oid, target_attnums))
-}
-
-/// Pick a constraint name: explicit one when supplied, otherwise the
-/// PG-style auto-generated form provided by the caller's closure.
-fn constraint_name(explicit: &str, fallback: impl FnOnce() -> String) -> String {
-    if explicit.is_empty() {
-        fallback()
-    } else {
-        explicit.to_owned()
-    }
 }
 
 /// Walk every CHECK / `GENERATED STORED` expression in a `CREATE TABLE` and
@@ -1310,6 +1208,7 @@ fn add_constraint_node(
             Vec::new(),
             c.deferrable,
             include.clone(),
+            false,
         )?;
     }
 
@@ -1325,6 +1224,7 @@ fn add_constraint_node(
                 }
             })
             .collect();
+        check_key_column_list(interp, relid, c, &pk_cols)?;
         // ATPrepAddPrimaryKey: a primary key's columns get not-null
         // constraints.
         for col in &pk_cols {
@@ -1359,6 +1259,7 @@ fn add_constraint_node(
                 Vec::new(),
                 c.deferrable,
                 include.clone(),
+                c.without_overlaps,
             )?;
         }
     }
@@ -1372,6 +1273,15 @@ fn add_constraint_node(
                 _ => None,
             })
             .collect();
+        check_key_column_list(interp, relid, c, &cols)?;
+        if let Some(missing) = cols
+            .iter()
+            .find(|n| interp.attribute_by_name(relid, n).is_none())
+        {
+            return Err(DdlError::Parse(format!(
+                "column \"{missing}\" named in key does not exist"
+            )));
+        }
         let attnums: Vec<i16> = cols
             .iter()
             .filter_map(|n| {
@@ -1403,6 +1313,7 @@ fn add_constraint_node(
                 Vec::new(),
                 c.deferrable,
                 include.clone(),
+                c.without_overlaps,
             )?;
         }
     }
@@ -1476,52 +1387,11 @@ fn add_constraint_node(
                 _ => None,
             })
             .collect();
-        let attrs = interp.attributes_of(relid).to_vec();
-        let local_types: Vec<PgTypeOid> = column_names
-            .iter()
-            .filter_map(|n| attrs.iter().find(|a| &a.attname == n).map(|a| a.atttypid))
-            .collect();
-        if local_types.len() != column_names.len() {
-            return Err(DdlError::Parse(
-                "ALTER TABLE ADD FOREIGN KEY references unknown local column".to_string(),
-            ));
-        }
-        let attnums: Vec<i16> = column_names
-            .iter()
-            .filter_map(|n| attrs.iter().find(|a| &a.attname == n).map(|a| a.attnum))
-            .collect();
-        let relname_owned = interp
-            .pg_class
-            .get(&relid)
-            .map(|c| c.relname.clone())
-            .unwrap_or_default();
-        check_fk_persistence(interp, relid, c)?;
-        let (target_oid, target_attnums) =
-            resolve_fk_target(interp, c, &relname_owned, &column_names, &local_types)?;
-        check_fk_generated_columns(interp, relid, c, &attnums)?;
-        let conname = ConName::from_explicit(
-            &c.conname,
-            ConName::Constraint {
-                addition: crate::ddl::util::index_name_addition(&column_names),
-                label: "fkey",
-            },
-        )
-        .resolve(interp, relid);
-        let oid = emit_constraint_with_backing_index(
-            interp,
-            relid,
-            conname,
-            ConType::ForeignKey,
-            attnums,
-            Some(target_oid),
-            target_attnums,
-            false,
-            Vec::new(),
-        )?;
-        if let Some(row) = interp.pg_constraint.get_mut(&oid) {
-            row.conenforced = c.is_enforced;
-            row.convalidated = c.initially_valid;
-        }
+        let default_name = ConName::Constraint {
+            addition: crate::ddl::util::index_name_addition(&column_names),
+            label: "fkey",
+        };
+        super::foreign_keys::add_foreign_key(interp, relid, c, &column_names, default_name, false)?;
     }
 
     Ok(())
@@ -1798,7 +1668,7 @@ pub(crate) fn copy_like_constraints(
                         && c.conname == idxname
                         && matches!(c.contype, ConType::PrimaryKey | ConType::Unique)
                 })
-                .map(|c| c.contype);
+                .map(|c| (c.contype, c.conperiod));
             let indkey: Vec<i16> = idx
                 .indkey
                 .iter()
@@ -1817,7 +1687,7 @@ pub(crate) fn copy_like_constraints(
                 .collect();
             let addition = index_name_addition(&colnames);
             match backing {
-                Some(contype) => {
+                Some((contype, period)) => {
                     let name = match contype {
                         ConType::PrimaryKey => {
                             choose_relation_name(interp, nsoid, relname, "", "pkey")
@@ -1837,6 +1707,7 @@ pub(crate) fn copy_like_constraints(
                         // deferrability.
                         interp.nonimmediate_indexes.contains(&idx.indexrelid),
                         indkey[nkey..].to_vec(),
+                        period,
                     )?;
                 }
                 None => {
