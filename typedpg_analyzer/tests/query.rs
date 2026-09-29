@@ -90,6 +90,8 @@ mod json_operators;
 mod recursive_ctes;
 #[path = "query/returning_old_new.rs"]
 mod returning_old_new;
+#[path = "query/virtual_generated.rs"]
+mod virtual_generated;
 #[path = "query/window_calls.rs"]
 mod window_calls;
 #[path = "query/window_functions.rs"]

@@ -444,19 +444,26 @@ fn analyze_insert_select(
     };
     // INSERT ... SELECT cannot supply `DEFAULT`, so any target column that is
     // `GENERATED ALWAYS AS IDENTITY` is rejected unless the user requested
-    // OVERRIDING SYSTEM VALUE.
-    if !tgt.overriding {
-        for i in 0..sel_cols.len() {
-            if let Some(tc) = target_col_at(tgt, i)
-                && tc.attidentity == Some(AttIdentity::Always)
-            {
-                return Err(AnalyzeError::Invalid(format!(
-                    "cannot insert a non-DEFAULT value into column \"{}\" \
-                     (identity column on `{}` defined as GENERATED ALWAYS \
-                     — hint: use OVERRIDING SYSTEM VALUE to override)",
-                    tc.attname, tgt.relname,
-                )));
-            }
+    // OVERRIDING SYSTEM VALUE, and a generated column (stored or virtual)
+    // always is — PG's `rewriteTargetListIU` checks both per column.
+    for i in 0..sel_cols.len() {
+        let Some(tc) = target_col_at(tgt, i) else {
+            continue;
+        };
+        if tc.attidentity == Some(AttIdentity::Always) && !tgt.overriding {
+            return Err(AnalyzeError::Invalid(format!(
+                "cannot insert a non-DEFAULT value into column \"{}\" \
+                 (identity column on `{}` defined as GENERATED ALWAYS \
+                 — hint: use OVERRIDING SYSTEM VALUE to override)",
+                tc.attname, tgt.relname,
+            )));
+        }
+        if tc.attgenerated.is_some() {
+            return Err(AnalyzeError::Invalid(format!(
+                "cannot insert a non-DEFAULT value into column \"{}\" \
+                 (generated column on `{}`)",
+                tc.attname, tgt.relname,
+            )));
         }
     }
     // Each SELECT output column must be assignment-coercible to its target
