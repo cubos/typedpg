@@ -153,7 +153,7 @@ fn lookup_namespaces(interp: &PgCatalog, schema: Option<&str>) -> Vec<PgNamespac
     interp.schemas_for_lookup(schema)
 }
 
-fn find_opfamily<'a>(
+pub(crate) fn find_opfamily<'a>(
     interp: &'a PgCatalog,
     schema: Option<&str>,
     name: &str,

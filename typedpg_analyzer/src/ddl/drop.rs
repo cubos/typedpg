@@ -123,6 +123,9 @@ pub fn drop_objects(interp: &mut PgCatalog, stmt: &DropStmt) -> Result<(), DdlEr
             ObjectType::ObjectRule => {
                 super::rules::drop_rule(interp, obj_node, stmt.missing_ok)?;
             }
+            ObjectType::ObjectTransform => {
+                super::languages::drop_transform(interp, obj_node, stmt.missing_ok)?;
+            }
             _ => {}
         }
     }

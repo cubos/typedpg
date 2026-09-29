@@ -124,10 +124,80 @@ pub(crate) fn rename_language(
     Ok(())
 }
 
-/// CREATE TRANSFORM FOR type LANGUAGE lang (...) (CreateTransform).
-pub fn create_transform(interp: &PgCatalog, stmt: &CreateTransformStmt) -> Result<(), DdlError> {
-    if let Some(tn) = stmt.type_name.as_ref() {
-        super::util::lookup_type_name(tn, interp)?;
+/// CREATE [OR REPLACE] TRANSFORM FOR type LANGUAGE lang (...)
+/// (CreateTransform).
+pub fn create_transform(
+    interp: &mut PgCatalog,
+    stmt: &CreateTransformStmt,
+) -> Result<(), DdlError> {
+    let Some(tn) = stmt.type_name.as_ref() else {
+        return Ok(());
+    };
+    let typ = super::util::lookup_type_name(tn, interp)?;
+    check(interp, &stmt.lang)?;
+    let exists = interp
+        .transforms
+        .iter()
+        .any(|(t, l)| *t == typ && *l == stmt.lang);
+    if exists && !stmt.replace {
+        return Err(DdlError::DuplicateObject(format!(
+            "transform for type {} language \"{}\" already exists",
+            super::util::format_type_for_message(interp, typ),
+            stmt.lang
+        )));
     }
-    check(interp, &stmt.lang)
+    if !exists {
+        interp.transforms.push((typ, stmt.lang.clone()));
+    }
+    Ok(())
+}
+
+/// get_transform_oid: the object of `DROP / COMMENT ON TRANSFORM FOR type
+/// LANGUAGE lang` (a `[TypeName, lang]` list). Returns where it is.
+pub(crate) fn find_transform(
+    interp: &PgCatalog,
+    object: &typedpg_pg_query::protobuf::Node,
+) -> Result<Option<usize>, DdlError> {
+    use typedpg_pg_query::protobuf::node;
+    let Some(node::Node::List(l)) = object.node.as_ref() else {
+        return Ok(None);
+    };
+    let [typ, lang] = l.items.as_slice() else {
+        return Ok(None);
+    };
+    let (Some(node::Node::TypeName(tn)), Some(lang)) =
+        (typ.node.as_ref(), super::util::node_string(lang))
+    else {
+        return Ok(None);
+    };
+    let typ = super::util::lookup_type_name(tn, interp)?;
+    check(interp, lang)?;
+    match interp
+        .transforms
+        .iter()
+        .position(|(t, l)| *t == typ && l == lang)
+    {
+        Some(at) => Ok(Some(at)),
+        None => Err(DdlError::TypeNotFound(format!(
+            "transform for type {} language \"{lang}\" does not exist",
+            super::util::format_type_for_message(interp, typ)
+        ))),
+    }
+}
+
+/// DROP TRANSFORM [IF EXISTS] FOR type LANGUAGE lang.
+pub(crate) fn drop_transform(
+    interp: &mut PgCatalog,
+    object: &typedpg_pg_query::protobuf::Node,
+    missing_ok: bool,
+) -> Result<(), DdlError> {
+    match find_transform(interp, object) {
+        Ok(Some(at)) => {
+            interp.transforms.remove(at);
+            Ok(())
+        }
+        Ok(None) => Ok(()),
+        Err(_) if missing_ok => Ok(()),
+        Err(e) => Err(e),
+    }
 }

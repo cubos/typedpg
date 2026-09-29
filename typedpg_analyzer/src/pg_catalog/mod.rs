@@ -198,6 +198,10 @@ pub struct PgCatalog {
     /// Parsers, templates and options of the text search objects migrations
     /// create.
     pub(crate) ts_definitions: crate::ddl::text_search::TsDefinitions,
+    /// Tablespaces, subscriptions and large objects migrations create.
+    pub(crate) cluster_objects: crate::ddl::cluster::ClusterObjects,
+    /// Transforms (`pg_transform`) migrations create: `(type, language)`.
+    pub(crate) transforms: Vec<(PgTypeOid, String)>,
 
     // ── Name-keyed indexes (built by `from_seed`, maintained by DDL) ──
     pub(crate) namespace_by_name: HashMap<String, PgNamespaceOid>,
@@ -598,6 +602,8 @@ impl PgCatalog {
             pg_settings: Vec::new(),
             pg_ts_objects: Vec::new(),
             ts_definitions: Default::default(),
+            cluster_objects: Default::default(),
+            transforms: Vec::new(),
             namespace_by_name: HashMap::new(),
             type_by_qname: HashMap::new(),
             class_by_qname: HashMap::new(),

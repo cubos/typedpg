@@ -457,6 +457,7 @@ pub(crate) fn select_side_effects(
         let Some(node::Node::FuncCall(fc)) = rt.val.as_deref().and_then(|v| v.node.as_ref()) else {
             continue;
         };
+        super::cluster::large_object_calls(interp, fc);
         if let Some((setting, value, is_local)) = constant_identity_set_config(fc) {
             set_identity(interp, &setting, Some(&value), is_local)?;
             continue;

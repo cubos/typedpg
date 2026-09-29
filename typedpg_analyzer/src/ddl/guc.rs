@@ -14,6 +14,13 @@ fn find<'a>(interp: &'a PgCatalog, name: &str) -> Option<&'a PgSetting> {
         .find(|s| s.name.eq_ignore_ascii_case(name))
 }
 
+/// Whether `name` is a parameter a GRANT ... ON PARAMETER may name
+/// (check_GUC_name_for_parameter_acl): a known one, or a custom
+/// `prefix.name` one.
+pub(crate) fn exists(interp: &PgCatalog, name: &str) -> bool {
+    find(interp, name).is_some() || name.contains('.')
+}
+
 fn invalid(err: String) -> Result<(), DdlError> {
     Err(DdlError::UnsupportedDdl(err))
 }

@@ -7,6 +7,7 @@
 mod acl;
 pub mod aggregates;
 pub mod alter;
+pub(crate) mod cluster;
 pub(crate) mod cmdtag;
 pub(crate) mod coldeps;
 pub mod collations;
@@ -355,8 +356,13 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         node::Node::VacuumStmt(s) => maintenance::vacuum(db, s),
         node::Node::LockStmt(s) => maintenance::lock(db, s),
         node::Node::SecLabelStmt(s) => maintenance::security_label(s),
-        node::Node::AlterDefaultPrivilegesStmt(s) => maintenance::alter_default_privileges(db, s),
+        node::Node::AlterDefaultPrivilegesStmt(s) => acl::alter_default_privileges(db, s),
         node::Node::ConstraintsSetStmt(s) => session::set_constraints(db, s),
+        node::Node::CreateTableSpaceStmt(s) => cluster::create_tablespace(db, s),
+        node::Node::DropTableSpaceStmt(s) => cluster::drop_tablespace(db, s),
+        node::Node::CreateSubscriptionStmt(s) => cluster::create_subscription(db, s),
+        node::Node::AlterSubscriptionStmt(s) => cluster::alter_subscription(db, &s.subname),
+        node::Node::DropSubscriptionStmt(s) => cluster::drop_subscription(db, s),
         node::Node::GrantRoleStmt(_)
         | node::Node::CreateRoleStmt(_)
         | node::Node::AlterRoleStmt(_)
@@ -386,11 +392,6 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         | node::Node::DropRoleStmt(_)
         | node::Node::ReassignOwnedStmt(_)
         | node::Node::DropOwnedStmt(_)
-        | node::Node::CreateSubscriptionStmt(_)
-        | node::Node::AlterSubscriptionStmt(_)
-        | node::Node::DropSubscriptionStmt(_)
-        | node::Node::CreateTableSpaceStmt(_)
-        | node::Node::DropTableSpaceStmt(_)
         | node::Node::AlterTableSpaceOptionsStmt(_)
         | node::Node::AlterCollationStmt(_)
         | node::Node::AlterObjectDependsStmt(_) => Ok(()),

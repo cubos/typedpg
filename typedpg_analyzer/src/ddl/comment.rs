@@ -9,12 +9,42 @@ use super::DdlError;
 use super::util::node_string;
 use crate::pg_catalog::{PgCatalog, RelKind};
 
+/// COMMENT ON (CommentObject): the object must exist, and a column's
+/// relation must be one whose columns can carry comments.
 pub fn comment_on(interp: &PgCatalog, stmt: &CommentStmt) -> Result<(), DdlError> {
     let Some(object) = stmt.object.as_deref().and_then(|o| o.node.as_ref()) else {
         return Ok(());
     };
     let objtype = ObjectType::try_from(stmt.objtype).unwrap_or(ObjectType::Undefined);
-    resolve_object(interp, objtype, object)
+    resolve_object(interp, objtype, object)?;
+    if objtype == ObjectType::ObjectColumn
+        && let node::Node::List(l) = object
+    {
+        let parts: Vec<&str> = l.items.iter().filter_map(node_string).collect();
+        let (schema, name) = match parts.as_slice() {
+            [schema, name, _] => (Some(*schema), *name),
+            [name, _] => (None, *name),
+            _ => return Ok(()),
+        };
+        if let Some(class) = interp.resolve_table(schema, name)
+            && !matches!(
+                class.relkind,
+                RelKind::Table
+                    | RelKind::View
+                    | RelKind::MaterializedView
+                    | RelKind::CompositeType
+                    | RelKind::ForeignTable
+                    | RelKind::Partitioned
+            )
+        {
+            return Err(DdlError::Parse(format!(
+                "cannot set comment on relation \"{name}\" (This operation is not supported for \
+                 {}.)",
+                class.relkind.plural()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// `ALTER <object> ... OWNER TO role` (ExecAlterOwnerStmt). The new owner
@@ -120,11 +150,19 @@ pub(crate) fn resolve_object(
         }
         ObjectType::ObjectColumn => {
             let parts = names(object);
+            // get_object_address_attribute.
+            if parts.len() < 2 {
+                return Err(DdlError::Parse("column name must be qualified".into()));
+            }
             let Some((column, rel)) = parts.split_last() else {
                 return Ok(());
             };
             let oid = relation(rel)?;
-            if interp.attribute_by_name(oid, column).is_none() {
+            // get_attnum: system columns count.
+            let system = crate::pg_catalog::SYSTEM_COLUMNS
+                .iter()
+                .any(|(n, ..)| n == column);
+            if interp.attribute_by_name(oid, column).is_none() && !system {
                 return Err(DdlError::Parse(format!(
                     "column \"{column}\" of relation \"{}\" does not exist",
                     rel.last().cloned().unwrap_or_default()
@@ -346,6 +384,148 @@ pub(crate) fn resolve_object(
                     "operator does not exist: {left_name} {name} {}",
                     super::util::format_type_for_message(interp, right)
                 )));
+            }
+        }
+        ObjectType::ObjectCast => {
+            let node::Node::List(l) = object else {
+                return Ok(());
+            };
+            let [Some(node::Node::TypeName(source)), Some(target)] = [
+                l.items.first().and_then(|n| n.node.as_ref()),
+                l.items.get(1).and_then(|n| n.node.as_ref()),
+            ] else {
+                return Ok(());
+            };
+            let node::Node::TypeName(target) = target else {
+                return Ok(());
+            };
+            let source = super::util::lookup_type_name(source, interp)?;
+            let target = super::util::lookup_type_name(target, interp)?;
+            if !interp.cast_by_pair.contains_key(&(source, target)) {
+                return Err(DdlError::TypeNotFound(format!(
+                    "cast from type {} to type {} does not exist",
+                    super::util::format_type_for_message(interp, source),
+                    super::util::format_type_for_message(interp, target)
+                )));
+            }
+        }
+        ObjectType::ObjectOpclass | ObjectType::ObjectOpfamily => {
+            // `[access method, name...]`.
+            let parts = names(object);
+            let Some((am, rest)) = parts.split_first() else {
+                return Ok(());
+            };
+            if !super::opclass::am_exists(interp, am) {
+                return Err(DdlError::TypeNotFound(format!(
+                    "access method \"{am}\" does not exist"
+                )));
+            }
+            let (schema, name) = match rest {
+                [schema, name] => (Some(schema.as_str()), name.as_str()),
+                [name] => (None, name.as_str()),
+                _ => return Ok(()),
+            };
+            let (found, what) = if objtype == ObjectType::ObjectOpclass {
+                (
+                    super::opclass::find_opclass(interp, schema, name, am).is_some(),
+                    "operator class",
+                )
+            } else {
+                (
+                    super::opclass::find_opfamily(interp, schema, name, am).is_some(),
+                    "operator family",
+                )
+            };
+            if !found {
+                return Err(DdlError::TypeNotFound(format!(
+                    "{what} \"{}\" does not exist for access method \"{am}\"",
+                    rest.join(".")
+                )));
+            }
+        }
+        ObjectType::ObjectAccessMethod => {
+            if let node::Node::String(s) = object
+                && !super::opclass::am_exists(interp, &s.sval)
+            {
+                return Err(DdlError::TypeNotFound(format!(
+                    "access method \"{}\" does not exist",
+                    s.sval
+                )));
+            }
+        }
+        ObjectType::ObjectTablespace => {
+            if let node::Node::String(s) = object
+                && !super::cluster::tablespace_exists(interp, &s.sval)
+            {
+                return Err(DdlError::TypeNotFound(format!(
+                    "tablespace \"{}\" does not exist",
+                    s.sval
+                )));
+            }
+        }
+        ObjectType::ObjectFdw => {
+            if let node::Node::String(s) = object {
+                super::fdw::check_fdw(interp, &s.sval)?;
+            }
+        }
+        ObjectType::ObjectLargeobject => {
+            let oid = match object {
+                node::Node::Integer(i) => u32::try_from(i.ival).ok(),
+                node::Node::Float(f) => f.fval.parse().ok(),
+                _ => None,
+            };
+            if let Some(oid) = oid
+                && !super::cluster::large_object_exists(interp, oid)
+            {
+                return Err(DdlError::TypeNotFound(format!(
+                    "large object {oid} does not exist"
+                )));
+            }
+        }
+        ObjectType::ObjectTransform => {
+            let wrapped = typedpg_pg_query::protobuf::Node {
+                node: Some(object.clone()),
+            };
+            super::languages::find_transform(interp, &wrapped)?;
+        }
+        ObjectType::ObjectConversion => {
+            let parts = names(object);
+            let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
+            if !super::conversions::conversion_exists(interp, &parts) {
+                return Err(DdlError::TypeNotFound(format!(
+                    "conversion \"{}\" does not exist",
+                    parts.join(".")
+                )));
+            }
+        }
+        ObjectType::ObjectEventTrigger => {
+            if let node::Node::String(s) = object
+                && !interp.event_triggers.iter().any(|(t, _)| *t == s.sval)
+            {
+                return Err(DdlError::TypeNotFound(format!(
+                    "event trigger \"{}\" does not exist",
+                    s.sval
+                )));
+            }
+        }
+        ObjectType::ObjectSubscription => {
+            if let node::Node::String(s) = object {
+                super::cluster::alter_subscription(interp, &s.sval)?;
+            }
+        }
+        ObjectType::ObjectPublication => {
+            if let node::Node::String(s) = object
+                && !super::publications::publication_exists(interp, &s.sval)
+            {
+                return Err(DdlError::TypeNotFound(format!(
+                    "publication \"{}\" does not exist",
+                    s.sval
+                )));
+            }
+        }
+        ObjectType::ObjectLanguage => {
+            if let node::Node::String(s) = object {
+                super::languages::check(interp, &s.sval)?;
             }
         }
         _ => {}

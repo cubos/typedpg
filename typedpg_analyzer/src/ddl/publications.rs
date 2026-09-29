@@ -382,7 +382,10 @@ fn check_schemas_to_add(interp: &PgCatalog, objects: &[Object<'_>]) -> Result<()
 
 /// CheckAlterPublication: a FOR ALL TABLES publication gains or loses no
 /// tables or schemas.
-fn check_alter_all_tables(publication: &Publication, objects: &[Object<'_>]) -> Result<(), DdlError> {
+fn check_alter_all_tables(
+    publication: &Publication,
+    objects: &[Object<'_>],
+) -> Result<(), DdlError> {
     if !publication.all_tables {
         return Ok(());
     }
@@ -806,6 +809,11 @@ pub(crate) fn rename_publication(
     };
     p.name = stmt.newname.clone();
     Ok(())
+}
+
+/// Whether publication `name` exists.
+pub(crate) fn publication_exists(interp: &PgCatalog, name: &str) -> bool {
+    interp.publications.iter().any(|p| p.name == name)
 }
 
 impl Publication {

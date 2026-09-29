@@ -353,6 +353,238 @@ fn grant_targets_must_exist() {
 }
 
 #[test]
+fn grant_privileges_must_suit_their_objects() {
+    // PG 18 ExecuteGrantStmt (the privileges each object type has),
+    // objectNamesToOids, ExecGrant_Relation / _Type_check / _Language_check,
+    // merge_acl_with_grant and ExecAlterDefaultPrivilegesStmt.
+    let setup = "CREATE TABLE t (a int);
+                 CREATE SEQUENCE s;
+                 CREATE TYPE mood AS ENUM ('a');
+                 CREATE FUNCTION f(int) RETURNS int LANGUAGE sql AS 'select 1';";
+    for (stmt, msg) in [
+        (
+            "GRANT EXECUTE ON t TO PUBLIC;",
+            "invalid privilege type EXECUTE for relation",
+        ),
+        (
+            "GRANT TRUNCATE (a) ON t TO PUBLIC;",
+            "invalid privilege type TRUNCATE for column",
+        ),
+        (
+            "GRANT USAGE ON t TO PUBLIC;",
+            "invalid privilege type USAGE for table",
+        ),
+        (
+            "GRANT CONNECT ON SCHEMA public TO PUBLIC;",
+            "invalid privilege type CONNECT for schema",
+        ),
+        (
+            "GRANT USAGE ON FUNCTION f(int) TO PUBLIC;",
+            "invalid privilege type USAGE for function",
+        ),
+        (
+            "GRANT SELECT ON TYPE mood TO PUBLIC;",
+            "invalid privilege type SELECT for type",
+        ),
+        (
+            "GRANT SELECT (a) ON SEQUENCE s TO PUBLIC;",
+            "column privileges are only valid for relations",
+        ),
+        (
+            "GRANT USAGE ON TYPE _mood TO PUBLIC;",
+            "cannot set privileges of array types",
+        ),
+        (
+            "GRANT USAGE ON DOMAIN mood TO PUBLIC;",
+            "\"mood\" is not a domain",
+        ),
+        (
+            "GRANT SELECT ON t TO PUBLIC WITH GRANT OPTION;",
+            "grant options can only be granted to roles",
+        ),
+        (
+            "GRANT SELECT ON s TO pg_nosuch;",
+            "role \"pg_nosuch\" does not exist",
+        ),
+        (
+            "ALTER DEFAULT PRIVILEGES GRANT USAGE ON TABLES TO PUBLIC;",
+            "invalid privilege type USAGE for relation",
+        ),
+        (
+            "ALTER DEFAULT PRIVILEGES GRANT SELECT (a) ON TABLES TO PUBLIC;",
+            "default privileges cannot be set for columns",
+        ),
+        (
+            "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT CREATE ON SCHEMAS TO PUBLIC;",
+            "cannot use IN SCHEMA clause when using GRANT/REVOKE ON SCHEMAS",
+        ),
+        (
+            "ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO PUBLIC WITH GRANT OPTION;",
+            "grant options can only be granted to roles",
+        ),
+        (
+            "GRANT USAGE ON LANGUAGE nosuch TO PUBLIC;",
+            "language \"nosuch\" does not exist",
+        ),
+        (
+            "GRANT USAGE ON LANGUAGE c TO PUBLIC;",
+            "language \"c\" is not trusted",
+        ),
+        (
+            "GRANT USAGE ON FOREIGN DATA WRAPPER nosuch TO PUBLIC;",
+            "foreign-data wrapper \"nosuch\" does not exist",
+        ),
+        (
+            "GRANT USAGE ON FOREIGN SERVER nosuch TO PUBLIC;",
+            "server \"nosuch\" does not exist",
+        ),
+        (
+            "GRANT CREATE ON TABLESPACE nosuch TO PUBLIC;",
+            "tablespace \"nosuch\" does not exist",
+        ),
+        (
+            "GRANT SET ON PARAMETER nosuch_param TO PUBLIC;",
+            "unrecognized configuration parameter \"nosuch_param\"",
+        ),
+        (
+            "GRANT SELECT ON LARGE OBJECT 12345 TO PUBLIC;",
+            "large object 12345 does not exist",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "GRANT SELECT (ctid, a), UPDATE (a) ON t TO PUBLIC;
+             GRANT ALL ON t, s TO PUBLIC;
+             GRANT USAGE, SELECT ON SEQUENCE s TO PUBLIC;
+             GRANT USAGE ON s TO PUBLIC;
+             GRANT USAGE ON TYPE mood TO PUBLIC;
+             GRANT USAGE ON LANGUAGE plpgsql TO PUBLIC;
+             GRANT CREATE ON TABLESPACE pg_default TO PUBLIC;
+             GRANT SET ON PARAMETER work_mem TO PUBLIC;
+             GRANT SET ON PARAMETER myapp.flag TO PUBLIC;
+             REVOKE SET ON PARAMETER nosuch_param FROM PUBLIC;
+             GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO PUBLIC;
+             SELECT lo_create(12345);
+             GRANT SELECT ON LARGE OBJECT 12345 TO PUBLIC;
+             ALTER DEFAULT PRIVILEGES GRANT CREATE ON SCHEMAS TO PUBLIC;
+             ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO PUBLIC;",
+        ),
+    ]);
+}
+
+#[test]
+fn comment_on_checks_existence_and_relation_kinds() {
+    // PG 18 CommentObject and get_object_address for the object kinds
+    // besides relations, types and routines.
+    let setup = "CREATE TABLE t (a int);
+                 CREATE SEQUENCE s;
+                 CREATE TYPE mood AS ENUM ('a');
+                 CREATE PUBLICATION pb;
+                 CREATE FUNCTION ef() RETURNS event_trigger LANGUAGE plpgsql AS 'begin end';
+                 CREATE EVENT TRIGGER et ON ddl_command_start EXECUTE FUNCTION ef();";
+    for (stmt, msg) in [
+        (
+            "COMMENT ON COLUMN s.last_value IS 'x';",
+            "cannot set comment on relation \"s\"",
+        ),
+        (
+            "COMMENT ON COLUMN t IS 'x';",
+            "column name must be qualified",
+        ),
+        (
+            "COMMENT ON CAST (mood AS text) IS 'x';",
+            "cast from type mood to type text does not exist",
+        ),
+        (
+            "COMMENT ON CAST (nosuch AS text) IS 'x';",
+            "type \"nosuch\" does not exist",
+        ),
+        (
+            "COMMENT ON OPERATOR CLASS int4_ops USING gist IS 'x';",
+            "operator class \"int4_ops\" does not exist for access method \"gist\"",
+        ),
+        (
+            "COMMENT ON OPERATOR FAMILY nosuch USING btree IS 'x';",
+            "operator family \"nosuch\" does not exist for access method \"btree\"",
+        ),
+        (
+            "COMMENT ON OPERATOR CLASS int4_ops USING nosuch IS 'x';",
+            "access method \"nosuch\" does not exist",
+        ),
+        (
+            "COMMENT ON ACCESS METHOD nosuch IS 'x';",
+            "access method \"nosuch\" does not exist",
+        ),
+        (
+            "COMMENT ON TABLESPACE nosuch IS 'x';",
+            "tablespace \"nosuch\" does not exist",
+        ),
+        (
+            "COMMENT ON FOREIGN DATA WRAPPER nosuch IS 'x';",
+            "foreign-data wrapper \"nosuch\" does not exist",
+        ),
+        (
+            "COMMENT ON LARGE OBJECT 1234 IS 'x';",
+            "large object 1234 does not exist",
+        ),
+        (
+            "COMMENT ON TRANSFORM FOR int LANGUAGE sql IS 'x';",
+            "transform for type integer language \"sql\" does not exist",
+        ),
+        (
+            "COMMENT ON CONVERSION nosuch IS 'x';",
+            "conversion \"nosuch\" does not exist",
+        ),
+        (
+            "COMMENT ON EVENT TRIGGER nosuch IS 'x';",
+            "event trigger \"nosuch\" does not exist",
+        ),
+        (
+            "COMMENT ON SUBSCRIPTION nosuch IS 'x';",
+            "subscription \"nosuch\" does not exist",
+        ),
+        (
+            "COMMENT ON PUBLICATION nope IS 'x';",
+            "publication \"nope\" does not exist",
+        ),
+        (
+            "COMMENT ON LANGUAGE nosuch IS 'x';",
+            "language \"nosuch\" does not exist",
+        ),
+        (
+            "DROP TRANSFORM FOR int LANGUAGE sql;",
+            "transform for type integer language \"sql\" does not exist",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "COMMENT ON COLUMN t.ctid IS 'x';
+             COMMENT ON COLUMN t.a IS 'x';
+             COMMENT ON CAST (int AS bigint) IS 'x';
+             COMMENT ON OPERATOR CLASS int4_ops USING btree IS 'x';
+             COMMENT ON OPERATOR FAMILY integer_ops USING btree IS 'x';
+             COMMENT ON ACCESS METHOD btree IS 'x';
+             COMMENT ON TABLESPACE pg_default IS 'x';
+             COMMENT ON CONVERSION utf8_to_iso_8859_1 IS 'x';
+             COMMENT ON EVENT TRIGGER et IS 'x';
+             COMMENT ON PUBLICATION pb IS 'x';
+             COMMENT ON LANGUAGE plpgsql IS 'x';
+             DROP TRANSFORM IF EXISTS FOR int LANGUAGE sql;",
+        ),
+    ]);
+}
+
+#[test]
 fn policies_are_validated_and_tracked() {
     // PG 18 CreatePolicy / AlterPolicy / rename_policy / DROP POLICY.
     let setup = "CREATE TABLE t (a int);

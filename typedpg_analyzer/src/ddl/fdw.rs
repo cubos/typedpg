@@ -42,7 +42,7 @@ pub(crate) fn check_server(interp: &PgCatalog, name: &str) -> Result<(), DdlErro
     }
 }
 
-fn check_fdw(interp: &PgCatalog, name: &str) -> Result<(), DdlError> {
+pub(crate) fn check_fdw(interp: &PgCatalog, name: &str) -> Result<(), DdlError> {
     if interp.foreign_data.wrappers.iter().any(|w| w == name) {
         Ok(())
     } else {

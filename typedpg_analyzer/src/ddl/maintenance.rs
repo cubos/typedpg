@@ -242,32 +242,6 @@ pub fn security_label(stmt: &SecLabelStmt) -> Result<(), DdlError> {
     )))
 }
 
-/// ALTER DEFAULT PRIVILEGES IN SCHEMA s ... : the schemas must exist.
-pub fn alter_default_privileges(
-    interp: &PgCatalog,
-    stmt: &typedpg_pg_query::protobuf::AlterDefaultPrivilegesStmt,
-) -> Result<(), DdlError> {
-    for opt in &stmt.options {
-        let Some(node::Node::DefElem(de)) = opt.node.as_ref() else {
-            continue;
-        };
-        if de.defname != "schemas" {
-            continue;
-        }
-        let Some(node::Node::List(list)) = de.arg.as_deref().and_then(|a| a.node.as_ref()) else {
-            continue;
-        };
-        for schema in list.items.iter().filter_map(super::util::node_string) {
-            if interp.namespace_oid(schema).is_none() {
-                return Err(DdlError::TableNotFound(format!(
-                    "schema \"{schema}\" does not exist"
-                )));
-            }
-        }
-    }
-    Ok(())
-}
-
 /// COPY (DoCopy / ProcessCopyOptions / BeginCopyTo / BeginCopyFrom): the
 /// options must be known, the relation must suit the direction and the
 /// column list name its columns once; COPY (query) TO analyzes the query.
