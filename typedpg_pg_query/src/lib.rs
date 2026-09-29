@@ -234,6 +234,17 @@ impl protobuf::ParseResult {
     }
 }
 
+impl<'a> NodeRef<'a> {
+    /// The node's direct children, in field order — the building block for
+    /// walkers that, like PostgreSQL's `raw_expression_tree_walker`
+    /// callers, need to decide per node whether and how to descend.
+    pub fn children(self) -> Vec<NodeRef<'a>> {
+        let mut out = Vec::new();
+        node::children(self, &mut |c| out.push(c));
+        out
+    }
+}
+
 impl NodeEnum {
     /// This node and every node below it, breadth-first, with its depth
     /// (this node at 0).

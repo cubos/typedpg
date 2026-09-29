@@ -41,19 +41,31 @@ pub(crate) fn process_from_item(
 
             // Check CTEs first.
             if rv.schemaname.is_empty()
-                && let Some(cte_cols) = cte_scopes.get(&rv.relname)
+                && let Some((cte_cols, search_cycle, expand)) =
+                    cte_reference_columns(cte_scopes, &rv.relname)
             {
                 check_cte_reference(cte_scopes, &rv.relname)?;
-                let cols: Vec<ScopeColumn> = cte_cols
-                    .iter()
-                    .cloned()
-                    .map(|mut c| {
-                        c.table_alias = alias.to_owned();
-                        c
-                    })
-                    .collect();
-                scope.add_derived(alias, cols, crate::scope::SourceKind::Cte)?;
+                let realias = |cols: Vec<ScopeColumn>| -> Vec<ScopeColumn> {
+                    cols.into_iter()
+                        .map(|mut c| {
+                            c.table_alias = alias.to_owned();
+                            c
+                        })
+                        .collect()
+                };
+                scope.add_derived(alias, realias(cte_cols), crate::scope::SourceKind::Cte)?;
+                // An alias list renames only the CTE's own columns.
                 apply_alias_column_names(scope, rv.alias.as_ref())?;
+                // addRangeTableEntryForCTE appends the SEARCH / CYCLE
+                // columns; below the WITH's own level they are left out of
+                // `*` (but stay referencable by name).
+                if let Some(src) = scope.sources.last_mut() {
+                    if expand {
+                        src.columns.extend(realias(search_cycle));
+                    } else {
+                        src.system_columns.extend(realias(search_cycle));
+                    }
+                }
                 return Ok(());
             }
 

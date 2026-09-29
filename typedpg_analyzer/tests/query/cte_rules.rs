@@ -348,3 +348,236 @@ fn recursive_query_structure_rules() {
         db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
 }
+
+/// transformWithClause: in WITH RECURSIVE every item sees every other, so
+/// the items are analyzed in dependency order (TopologicalSort); a cycle
+/// between items is 0A000.
+#[test]
+fn recursive_with_items_see_later_siblings() {
+    let db = setup();
+    let s = db
+        .analyze("WITH RECURSIVE x AS (SELECT * FROM y), y AS (SELECT 1 a) SELECT * FROM x")
+        .unwrap();
+    assert_cols(&s, vec![c("a", int4())]);
+    db.analyze(
+        "WITH RECURSIVE x AS (SELECT * FROM y), y(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM y \
+         WHERE n < 3), z AS (SELECT * FROM x) SELECT * FROM z",
+    )
+    .unwrap();
+    // An inner WITH redefining the name captures the reference.
+    db.analyze(
+        "WITH RECURSIVE x AS (WITH y AS (SELECT 2 a) SELECT * FROM y), y AS (SELECT * FROM x) \
+         SELECT * FROM y",
+    )
+    .unwrap();
+    let err = db
+        .analyze(
+            "WITH RECURSIVE x(a) AS (SELECT * FROM y), y(a) AS (SELECT 1 UNION ALL SELECT a FROM x) \
+             SELECT * FROM x",
+        )
+        .unwrap_err();
+    assert!(matches!(err, AnalyzeError::FeatureNotSupported(_)), "{err:?}");
+    assert!(
+        err.to_string()
+            .starts_with("mutual recursion between WITH items is not implemented"),
+        "{err}"
+    );
+    // Without RECURSIVE a later item stays invisible.
+    let err = db
+        .analyze("WITH x AS (SELECT * FROM y), y AS (SELECT 1 a) SELECT * FROM x")
+        .unwrap_err();
+    assert!(
+        err.to_string().starts_with("relation \"y\" does not exist"),
+        "{err}"
+    );
+}
+
+/// checkWellFormedSelectStmt: only INTERSECT ALL is unsafe for the
+/// recursive reference; EXCEPT is unsafe on its right side, and on its left
+/// side with ALL.
+#[test]
+fn recursive_reference_under_intersect_and_except() {
+    let db = setup();
+    for sql in [
+        "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL (SELECT n FROM r INTERSECT SELECT 2)) \
+         SELECT * FROM r",
+        "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL (SELECT 2 INTERSECT SELECT n FROM r)) \
+         SELECT * FROM r",
+        "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL (SELECT n FROM r EXCEPT SELECT 2)) \
+         SELECT * FROM r",
+    ] {
+        let s = db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        assert_eq!(s.columns.len(), 1, "{sql}");
+    }
+    for (sql, msg) in [
+        (
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL (SELECT n FROM r INTERSECT ALL SELECT 2)) \
+             SELECT * FROM r",
+            "recursive reference to query \"r\" must not appear within INTERSECT",
+        ),
+        (
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL (SELECT n FROM r EXCEPT ALL SELECT 2)) \
+             SELECT * FROM r",
+            "recursive reference to query \"r\" must not appear within EXCEPT",
+        ),
+        (
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL (SELECT 2 EXCEPT SELECT n FROM r)) \
+             SELECT * FROM r",
+            "recursive reference to query \"r\" must not appear within EXCEPT",
+        ),
+    ] {
+        let err = db.analyze(sql).unwrap_err();
+        assert!(matches!(err, AnalyzeError::InvalidRecursion(_)), "{sql}: {err:?}");
+        assert!(err.to_string().starts_with(msg), "{sql}: {err}");
+    }
+}
+
+/// checkWellFormedRecursion walks a WITH attached to the recursive query's
+/// UNION as a subquery context; a WITH there that doesn't reference the
+/// CTE is visible to both terms.
+#[test]
+fn with_on_a_recursive_query_body() {
+    let db = setup();
+    let err = db
+        .analyze(
+            "WITH RECURSIVE r(n) AS (WITH x AS (SELECT * FROM r) SELECT 1 UNION ALL \
+             SELECT n FROM x) SELECT * FROM r",
+        )
+        .unwrap_err();
+    assert!(matches!(err, AnalyzeError::InvalidRecursion(_)), "{err:?}");
+    assert!(
+        err.to_string()
+            .starts_with("recursive reference to query \"r\" must not appear within a subquery"),
+        "{err}"
+    );
+    let s = db
+        .analyze(
+            "WITH RECURSIVE r(n) AS (WITH x AS (SELECT 1 AS k) SELECT k FROM x UNION ALL \
+             SELECT n + k FROM r, x WHERE n < 3) SELECT * FROM r",
+        )
+        .unwrap();
+    assert_cols(&s, vec![c("n", int4())]);
+}
+
+/// analyzeCTETargetList exposes a recursive CTE's `unknown` column (an
+/// untyped parameter or literal in the non-recursive term) as text before
+/// the recursive term is analyzed. (With `WHERE n < 5` the query has a
+/// second error, which PG and the analyzer may report in either order.)
+#[test]
+fn unknown_non_recursive_term_column_is_text() {
+    let db = setup();
+    let err = db
+        .analyze(
+            "WITH RECURSIVE r(n) AS (SELECT $a UNION ALL SELECT n + 1 FROM r WHERE length(n) < 5) \
+             SELECT * FROM r",
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("operator does not exist: text + integer"),
+        "{err}"
+    );
+    let s = db
+        .analyze(
+            "WITH RECURSIVE r(n) AS (SELECT $a UNION ALL SELECT n || 'x' FROM r WHERE length(n) < 5) \
+             SELECT * FROM r",
+        )
+        .unwrap();
+    assert_eq!(s.columns[0].pg_type, text());
+    assert_eq!(s.params[0].pg_type, text());
+}
+
+/// analyzeCTETargetList applies a CTE's column alias list to a
+/// data-modifying body's RETURNING columns too.
+#[test]
+fn data_modifying_cte_column_aliases() {
+    let db = setup();
+    let s = db
+        .analyze("WITH d(x) AS (DELETE FROM t RETURNING id, a) SELECT x, a FROM d")
+        .unwrap();
+    assert_cols(&s, vec![c("x", int4()), c("a", int4())]);
+    let err = db
+        .analyze("WITH d(x, y, z) AS (DELETE FROM t RETURNING id, a) SELECT 1 FROM d")
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("WITH query \"d\" has 2 columns available but 3 columns specified"),
+        "{err}"
+    );
+}
+
+/// analyzeCTE's SEARCH / CYCLE name checks, and the columns those clauses
+/// add to every reference — including the recursive term's self-reference,
+/// where a clashing name makes the column reference ambiguous.
+#[test]
+fn search_cycle_column_names() {
+    let db = setup();
+    const R: &str = "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5)";
+    let cases: &[(&str, &str)] = &[
+        (
+            "SEARCH DEPTH FIRST BY n, n SET o",
+            "search column \"n\" specified more than once",
+        ),
+        (
+            "CYCLE n, n SET c USING p",
+            "cycle column \"n\" specified more than once",
+        ),
+        (
+            "SEARCH DEPTH FIRST BY n SET o CYCLE n SET o USING p",
+            "search sequence column name and cycle mark column name are the same",
+        ),
+        (
+            "SEARCH DEPTH FIRST BY n SET o CYCLE n SET c USING o",
+            "search sequence column name and cycle path column name are the same",
+        ),
+        (
+            "SEARCH DEPTH FIRST BY n SET n",
+            "column reference \"n\" is ambiguous",
+        ),
+        ("CYCLE n SET n USING p", "column reference \"n\" is ambiguous"),
+        ("CYCLE n SET c USING n", "column reference \"n\" is ambiguous"),
+    ];
+    for (clause, msg) in cases {
+        let sql = format!("{R} {clause} SELECT * FROM r");
+        let err = db.analyze(&sql).unwrap_err();
+        assert!(err.to_string().starts_with(msg), "{sql}: {err}");
+    }
+    // Without a reference to clash with, the name check itself fires.
+    let err = db
+        .analyze(
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT 2 FROM r WHERE false) \
+             SEARCH DEPTH FIRST BY n SET n SELECT * FROM r",
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string().starts_with(
+            "search sequence column name \"n\" already used in WITH query column list"
+        ),
+        "{err}"
+    );
+    // The recursive term sees the added columns but `*` there leaves them
+    // out; so does every reference below the WITH's own level.
+    db.analyze(&format!(
+        "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE o IS NOT NULL \
+         AND n < 5) SEARCH DEPTH FIRST BY n SET o SELECT * FROM r"
+    ))
+    .unwrap();
+    for (sql, width) in [
+        (format!("{R} SEARCH DEPTH FIRST BY n SET o SELECT * FROM r"), 2),
+        (
+            format!("{R} SEARCH DEPTH FIRST BY n SET o, s AS (SELECT * FROM r) SELECT * FROM s"),
+            1,
+        ),
+        (
+            format!("{R} SEARCH DEPTH FIRST BY n SET o SELECT * FROM r UNION ALL SELECT * FROM r"),
+            1,
+        ),
+        (
+            format!("{R} CYCLE n SET c USING p SELECT * FROM (SELECT * FROM r) q"),
+            1,
+        ),
+    ] {
+        let s = db.analyze(&sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        assert_eq!(s.columns.len(), width, "{sql}");
+    }
+}
