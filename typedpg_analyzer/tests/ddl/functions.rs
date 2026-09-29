@@ -571,6 +571,62 @@ fn sql_function_parameter_names_resolve_after_columns() {
 }
 
 #[test]
+fn sql_function_result_rows_are_checked_like_check_sql_fn_retval() {
+    let setup = "CREATE TABLE t (id int PRIMARY KEY, name text NOT NULL);
+                 CREATE TYPE pair AS (a int, b text);";
+    // Accepted by PG 18: assignment coercions per column, a lone column of
+    // the composite type, a table's row, a bare record.
+    build_db(&[(
+        "0001.sql",
+        &format!(
+            "{setup}
+             CREATE FUNCTION r2() RETURNS pair LANGUAGE sql AS $$ SELECT 1, 'x'::text $$;
+             CREATE FUNCTION r6() RETURNS pair LANGUAGE sql AS $$ SELECT ROW(1,'x')::pair $$;
+             CREATE FUNCTION r7(OUT a int, OUT b text) LANGUAGE sql AS $$ SELECT 1, 2 $$;
+             CREATE FUNCTION r9() RETURNS t LANGUAGE sql AS $$ SELECT * FROM t $$;
+             CREATE FUNCTION r11() RETURNS TABLE (a int, b text) LANGUAGE sql AS $$ SELECT 1, 'x' $$;
+             CREATE FUNCTION r13() RETURNS record LANGUAGE sql AS $$ SELECT 1, 2 $$;
+             CREATE FUNCTION r14() RETURNS pair LANGUAGE sql AS $$ SELECT 1::int8, 'x' $$;
+             CREATE FUNCTION r15() RETURNS pair LANGUAGE sql AS $$ SELECT 1.5, 'x' $$;"
+        ),
+    )]);
+    for (function, msg) in [
+        (
+            "CREATE FUNCTION r1() RETURNS SETOF int LANGUAGE sql AS $$ SELECT name FROM t $$;",
+            "return type mismatch in function declared to return integer (Actual return type is text.)",
+        ),
+        (
+            "CREATE FUNCTION r3() RETURNS pair LANGUAGE sql AS $$ SELECT 1 $$;",
+            "return type mismatch in function declared to return pair (Final statement returns too few columns.)",
+        ),
+        (
+            "CREATE FUNCTION r4() RETURNS pair LANGUAGE sql AS $$ SELECT 1, 2, 3 $$;",
+            "return type mismatch in function declared to return pair (Final statement returns too many columns.)",
+        ),
+        (
+            "CREATE FUNCTION r5() RETURNS pair LANGUAGE sql AS $$ SELECT 'x'::text, 1 $$;",
+            "return type mismatch in function declared to return pair (Final statement returns text instead of integer at column 1.)",
+        ),
+        (
+            "CREATE FUNCTION r8(OUT a int, OUT b text) LANGUAGE sql AS $$ SELECT 1 $$;",
+            "return type mismatch in function declared to return record (Final statement returns too few columns.)",
+        ),
+        (
+            "CREATE FUNCTION r10() RETURNS SETOF t LANGUAGE sql AS $$ SELECT id FROM t $$;",
+            "return type mismatch in function declared to return t (Final statement returns too few columns.)",
+        ),
+        (
+            "CREATE FUNCTION r12() RETURNS TABLE (a int, b int) LANGUAGE sql AS $$ SELECT 1, 'x'::text $$;",
+            "return type mismatch in function declared to return record (Final statement returns text instead of integer at column 2.)",
+        ),
+    ] {
+        let sql = format!("{setup}\n{function}");
+        let err = try_apply(&[("0001.sql", &sql)]).expect_err(function);
+        assert!(err.to_string().starts_with(msg), "{function}\n  got: {err}");
+    }
+}
+
+#[test]
 fn sql_function_bodies_report_every_analysis_error() {
     for (sql, msg) in [
         (

@@ -98,8 +98,12 @@ struct LastStatement {
     column_types: Option<Vec<PgTypeOid>>,
 }
 
-/// `check_sql_fn_retval` for scalar and void returns (composite, record and
-/// set-returning functions are not checked).
+/// `check_sql_fn_retval`: the final statement must return rows, and its
+/// columns must fit the declared result under assignment coercion — one
+/// column for a scalar (also per row of a `SETOF`), the attributes of a
+/// named composite, or the OUT / TABLE parameters, in order. A lone column of
+/// the composite type itself is accepted too; a bare `record` result is not
+/// checked.
 fn check_return_type(
     interp: &PgCatalog,
     proc: &PgProc,
@@ -110,52 +114,101 @@ fn check_return_type(
         .pg_type
         .get(&rettype)
         .is_some_and(|t| t.typname == "void" && t.typtype == TypType::Pseudo);
-    if is_void || rettype == oid::UNKNOWN || proc.proretset {
+    if is_void || rettype == oid::UNKNOWN {
         return Ok(());
     }
     let Some(t) = interp.pg_type.get(&interp.unwrap_domain(rettype)) else {
         return Ok(());
     };
-    if matches!(t.typtype, TypType::Composite | TypType::Pseudo) {
-        return Ok(());
-    }
-    let mismatch = || {
-        format!(
-            "return type mismatch in function declared to return {}",
-            super::util::format_type_for_message(interp, rettype)
+    // The row the function returns, when it returns one.
+    let row: Option<Vec<PgTypeOid>> = if t.typtype == TypType::Composite {
+        let relid = t.typrelid;
+        Some(
+            relid
+                .map(|r| {
+                    interp
+                        .attributes_of(r)
+                        .iter()
+                        .filter(|a| a.attnum > 0)
+                        .map(|a| a.atttypid)
+                        .collect()
+                })
+                .unwrap_or_default(),
         )
+    } else if rettype == oid::RECORD {
+        let out: Vec<PgTypeOid> = proc
+            .proargmodes
+            .iter()
+            .zip(&proc.proallargtypes)
+            .filter(|(m, _)| matches!(m, ArgMode::Out | ArgMode::InOut | ArgMode::Table))
+            .map(|(_, &t)| t)
+            .collect();
+        if out.is_empty() {
+            return Ok(());
+        }
+        Some(out)
+    } else if t.typtype == TypType::Pseudo {
+        return Ok(());
+    } else {
+        None
+    };
+    let mismatch = |detail: String| {
+        DdlError::Parse(format!(
+            "return type mismatch in function declared to return {} ({detail})",
+            super::util::format_type_for_message(interp, rettype)
+        ))
     };
     let Some(last) = last else {
         return Ok(());
     };
     if !last.returns_rows {
-        return Err(DdlError::Parse(format!(
-            "{} (Function's final statement must be SELECT or \
-             INSERT/UPDATE/DELETE/MERGE RETURNING.)",
-            mismatch()
-        )));
+        return Err(mismatch(
+            "Function's final statement must be SELECT or INSERT/UPDATE/DELETE/MERGE RETURNING."
+                .into(),
+        ));
     }
     let Some(column_types) = last.column_types.as_deref() else {
         return Ok(());
     };
-    match column_types {
-        [single] => {
-            if *single != oid::UNKNOWN
-                && !can_coerce(*single, rettype, CoercionContext::Assignment, interp)
-            {
-                return Err(DdlError::Parse(format!(
-                    "{} (Actual return type is {}.)",
-                    mismatch(),
-                    super::util::format_type_for_message(interp, *single)
-                )));
-            }
-            Ok(())
-        }
-        _ => Err(DdlError::Parse(format!(
-            "{} (Final statement must return exactly one column.)",
-            mismatch()
-        ))),
+    let fits = |actual: PgTypeOid, declared: PgTypeOid| {
+        actual == oid::UNKNOWN || can_coerce(actual, declared, CoercionContext::Assignment, interp)
+    };
+    let name = |t: PgTypeOid| super::util::format_type_for_message(interp, t);
+    let Some(row) = row else {
+        return match column_types {
+            [single] if fits(*single, rettype) => Ok(()),
+            [single] => Err(mismatch(format!(
+                "Actual return type is {}.",
+                name(*single)
+            ))),
+            _ => Err(mismatch(
+                "Final statement must return exactly one column.".into(),
+            )),
+        };
+    };
+    if let [single] = column_types
+        && fits(*single, rettype)
+        && interp.unwrap_domain(*single) == interp.unwrap_domain(rettype)
+    {
+        return Ok(());
     }
+    for (i, &actual) in column_types.iter().enumerate() {
+        let Some(&declared) = row.get(i) else {
+            return Err(mismatch("Final statement returns too many columns.".into()));
+        };
+        if !fits(actual, declared) {
+            return Err(mismatch(format!(
+                "Final statement returns {} instead of {} at column {}.",
+                name(actual),
+                name(declared),
+                i + 1
+            )));
+        }
+    }
+    if column_types.len() < row.len() {
+        return Err(mismatch("Final statement returns too few columns.".into()));
+    }
+    Ok(())
 }
 
 fn language_is_sql(stmt: &CreateFunctionStmt) -> bool {
