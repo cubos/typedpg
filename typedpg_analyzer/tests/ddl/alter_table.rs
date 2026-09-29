@@ -952,3 +952,72 @@ fn attach_partition_keeps_persistence_consistent() {
         ),
     ]);
 }
+
+#[test]
+fn detach_concurrently_and_finalize() {
+    // ATExecDetachPartition refuses a concurrent detach while a default
+    // partition exists; a concurrent detach always completes in a
+    // migration, so FINALIZE finds nothing pending; the detached partition
+    // keeps its partition constraint as a CHECK (none for a hash one).
+    let setup = "CREATE TABLE p (a int) PARTITION BY RANGE (a);
+                 CREATE TABLE c PARTITION OF p DEFAULT;
+                 CREATE TABLE c2 PARTITION OF p FOR VALUES FROM (1) TO (2);
+                 CREATE TABLE x (a int);";
+    for (stmt, msg) in [
+        (
+            "-- no-transaction\nALTER TABLE p DETACH PARTITION c CONCURRENTLY",
+            "cannot detach partitions concurrently when a default partition exists",
+        ),
+        (
+            "-- no-transaction\nALTER TABLE p DETACH PARTITION c2 CONCURRENTLY",
+            "cannot detach partitions concurrently when a default partition exists",
+        ),
+        (
+            "ALTER TABLE p DETACH PARTITION c2 FINALIZE;",
+            "cannot complete detaching partition \"c2\"",
+        ),
+        (
+            "ALTER TABLE p DETACH PARTITION x FINALIZE;",
+            "relation \"x\" is not a partition of relation \"p\"",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        (
+            "0001.sql",
+            "CREATE TABLE q (a int, b text) PARTITION BY RANGE (a);
+             CREATE TABLE q1 PARTITION OF q FOR VALUES FROM (1) TO (2);
+             CREATE TABLE r (a int, b int) PARTITION BY RANGE (a, b);
+             CREATE TABLE r1 PARTITION OF r FOR VALUES FROM (1, MINVALUE) TO (2, 5);
+             CREATE TABLE l (a int) PARTITION BY LIST (a);
+             CREATE TABLE l1 PARTITION OF l FOR VALUES IN (NULL);
+             CREATE TABLE h (a int) PARTITION BY HASH (a);
+             CREATE TABLE h1 PARTITION OF h FOR VALUES WITH (MODULUS 2, REMAINDER 0);",
+        ),
+        (
+            "0002.sql",
+            "-- no-transaction\nALTER TABLE q DETACH PARTITION q1 CONCURRENTLY",
+        ),
+        (
+            "0003.sql",
+            "-- no-transaction\nALTER TABLE r DETACH PARTITION r1 CONCURRENTLY",
+        ),
+        (
+            "0004.sql",
+            "-- no-transaction\nALTER TABLE l DETACH PARTITION l1 CONCURRENTLY",
+        ),
+        (
+            "0005.sql",
+            "-- no-transaction\nALTER TABLE h DETACH PARTITION h1 CONCURRENTLY",
+        ),
+        (
+            "0006.sql",
+            "ALTER TABLE q1 DROP CONSTRAINT q1_a_check;
+             ALTER TABLE r1 DROP CONSTRAINT r1_check;
+             ALTER TABLE l1 DROP CONSTRAINT l1_a_check;
+             ALTER TABLE h1 ADD CONSTRAINT h1_a_check CHECK (a > 0);",
+        ),
+    ]);
+}

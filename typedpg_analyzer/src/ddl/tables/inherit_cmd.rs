@@ -446,12 +446,127 @@ pub(super) fn detach_partition(
     let Some(rv) = pc.name.as_ref() else {
         return Ok(());
     };
+    // ATExecDetachPartition: the default partition's constraint would
+    // change under a concurrent detach.
+    if pc.concurrent
+        && inherit::children_of(interp, parent)
+            .iter()
+            .any(|c| matches!(interp.partition_bounds.get(c), Some(super::partbound::Bound::Default)))
+    {
+        return Err(DdlError::Parse(
+            "cannot detach partitions concurrently when a default partition exists".into(),
+        ));
+    }
     let part = super::super::util::lookup_relation(interp, rv)?.1;
+    // DetachAddConstraintIfNeeded: a partition detached concurrently keeps
+    // its partition constraint as a CHECK constraint.
+    let partition_check = if pc.concurrent
+        && interp
+            .pg_inherits
+            .iter()
+            .any(|i| i.inhrelid == part && i.inhparent == parent)
+    {
+        super::partbound::partition_constraint_check(interp, parent, part)
+    } else {
+        None
+    };
     super::foreign_keys::detach_fks(interp, parent, part);
     remove_inheritance(interp, part, parent, "partition")?;
     super::partidx::detach_partition_indexes(interp, part);
     interp.partition_bounds.remove(&part);
+    if let Some((expr, vars)) = partition_check {
+        add_detached_partition_check(interp, part, expr, &vars)?;
+    }
     Ok(())
+}
+
+/// DetachAddConstraintIfNeeded: the partition constraint becomes a CHECK
+/// constraint (named as AddRelationNewConstraints names one: after its one
+/// column, if it reads one), unless the partition already has it.
+fn add_detached_partition_check(
+    interp: &mut PgCatalog,
+    part: PgClassOid,
+    expr: typedpg_pg_query::protobuf::Node,
+    vars: &[String],
+) -> Result<(), DdlError> {
+    let stored = super::check_inherit::StoredExpr::written(&expr);
+    if interp.pg_constraint.values().any(|c| {
+        c.conrelid == part
+            && c.contype == ConType::Check
+            && interp.check_defs.get(&c.oid).is_some_and(|d| d.expr == stored)
+    }) {
+        return Ok(());
+    }
+    let addition = match vars {
+        [one] => one.clone(),
+        _ => String::new(),
+    };
+    let name = inherit::choose_constraint_name(interp, part, &addition, "check");
+    let mut conkey: Vec<i16> = vars
+        .iter()
+        .filter_map(|v| interp.attribute_by_name(part, v).map(|a| a.attnum))
+        .collect();
+    conkey.sort_unstable();
+    let oid = PgConstraintOid::from_nonzero(interp.alloc_oid()?);
+    interp.insert_pg_constraint(PgConstraint {
+        oid,
+        conname: name,
+        conrelid: part,
+        contype: ConType::Check,
+        conkey,
+        confrelid: None,
+        confkey: Vec::new(),
+        conislocal: true,
+        coninhcount: 0,
+        conenforced: true,
+        convalidated: true,
+        connoinherit: false,
+        conperiod: false,
+    });
+    interp.check_defs.insert(
+        oid,
+        super::check_inherit::CheckDef {
+            expr: stored,
+            no_inherit: false,
+        },
+    );
+    Ok(())
+}
+
+/// `ALTER TABLE parent DETACH PARTITION part FINALIZE`
+/// (ATExecDetachPartitionFinalize): completes a concurrent detach that was
+/// interrupted. A migration's concurrent detach always completes, so none
+/// is ever pending: DeleteInheritsTuple reports a partition as having no
+/// pending detach, RemoveInheritance any other relation as not a
+/// partition.
+pub(super) fn detach_partition_finalize(
+    interp: &PgCatalog,
+    parent: PgClassOid,
+    cmd: &AlterTableCmd,
+) -> Result<(), DdlError> {
+    let Some(node::Node::PartitionCmd(pc)) = cmd.def.as_deref().and_then(|d| d.node.as_ref())
+    else {
+        return Ok(());
+    };
+    let Some(rv) = pc.name.as_ref() else {
+        return Ok(());
+    };
+    let part = super::super::util::lookup_relation(interp, rv)?.1;
+    let part_name = relname_of(interp, part);
+    if interp
+        .pg_inherits
+        .iter()
+        .any(|i| i.inhrelid == part && i.inhparent == parent)
+    {
+        return Err(DdlError::Parse(format!(
+            "cannot complete detaching partition \"{part_name}\" (There's no pending \
+             concurrent detach.)"
+        )));
+    }
+    Err(DdlError::TableNotFound(format!(
+        "relation \"{part_name}\" is not a partition of relation \"{}\"",
+        relname_of(interp, parent)
+    )))
 }
 
 /// RemoveInheritance: drop the `pg_inherits` row and give back the

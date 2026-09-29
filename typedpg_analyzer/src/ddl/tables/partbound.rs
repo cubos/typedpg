@@ -657,6 +657,106 @@ fn check_new_bound(
     Ok(())
 }
 
+/// The partition constraint of `part` (get_qual_from_partbound) as a CHECK
+/// expression over its columns, and the columns it reads — what
+/// DetachAddConstraintIfNeeded gives a partition detached CONCURRENTLY.
+/// The bound values are rendered as NULLs of the key types: the analyzer
+/// reads a CHECK's shape, columns and types, not its values. A key
+/// expression isn't kept, so its columns stand in for it. `None` for a
+/// default or hash partition.
+pub(crate) fn partition_constraint_check(
+    interp: &PgCatalog,
+    parent: PgClassOid,
+    part: PgClassOid,
+) -> Option<(typedpg_pg_query::protobuf::Node, Vec<String>)> {
+    let spec = interp.partition_specs.get(&parent)?;
+    let bound = interp.partition_bounds.get(&part)?;
+    let quote = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+    let typed_null = |t: PgTypeOid| {
+        let typ = interp.pg_type.get(&t);
+        let schema = typ
+            .and_then(|t| interp.namespace_name(t.typnamespace))
+            .unwrap_or("pg_catalog");
+        let name = typ.map_or("unknown", |t| t.typname.as_str());
+        format!("NULL::{}.{}", quote(schema), quote(name))
+    };
+    let mut vars: Vec<String> = Vec::new();
+    let mut keys: Vec<(String, &PartKey)> = Vec::new();
+    for key in &spec.keys {
+        match &key.name {
+            Some(name) => {
+                if !vars.contains(name) {
+                    vars.push(name.clone());
+                }
+                keys.push((quote(name), key));
+            }
+            None => {
+                let read: Vec<String> = interp
+                    .partition_key_attrs
+                    .get(&parent)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|&an| {
+                        interp
+                            .attributes_of(parent)
+                            .iter()
+                            .find(|a| a.attnum == an)
+                            .map(|a| a.attname.clone())
+                    })
+                    .collect();
+                for name in &read {
+                    if !vars.contains(name) {
+                        vars.push(name.clone());
+                    }
+                }
+                let cols: Vec<String> = read.iter().map(|n| quote(n)).collect();
+                keys.push((format!("ROW({})", cols.join(", ")), key));
+            }
+        }
+    }
+    let mut conjuncts: Vec<String> = Vec::new();
+    match bound {
+        // A hash partition's constraint (satisfies_hash_partition over the
+        // parent's OID) isn't carried over: PG 18 adds no CHECK for one.
+        Bound::Default | Bound::Hash { .. } => return None,
+        Bound::List(values) => {
+            let (k, key) = keys.first()?;
+            let non_null = values.iter().filter(|v| v.is_some()).count();
+            let has_null = values.iter().any(Option::is_none);
+            let any = (non_null > 0).then(|| {
+                let elems = vec![typed_null(key.type_oid); non_null];
+                format!("{k} = ANY (ARRAY[{}])", elems.join(", "))
+            });
+            conjuncts.push(match (any, has_null) {
+                (Some(any), false) => format!("{k} IS NOT NULL AND {any}"),
+                (Some(any), true) => format!("({k} IS NULL OR {any})"),
+                (None, _) => format!("{k} IS NULL"),
+            });
+        }
+        Bound::Range { lower, upper } => {
+            for (i, (k, key)) in keys.iter().enumerate() {
+                conjuncts.push(format!("{k} IS NOT NULL"));
+                if matches!(lower.get(i), Some(RangeDatum::Value(_))) {
+                    conjuncts.push(format!("{k} >= {}", typed_null(key.type_oid)));
+                }
+                if matches!(upper.get(i), Some(RangeDatum::Value(_))) {
+                    conjuncts.push(format!("{k} < {}", typed_null(key.type_oid)));
+                }
+            }
+        }
+    }
+    let sql = format!("SELECT {}", conjuncts.join(" AND "));
+    let parsed = typedpg_pg_query::parse(&sql).ok()?;
+    let stmt = parsed.protobuf.stmts.into_iter().next()?.stmt?;
+    let node::Node::SelectStmt(sel) = stmt.node? else {
+        return None;
+    };
+    let node::Node::ResTarget(rt) = sel.target_list.into_iter().next()?.node? else {
+        return None;
+    };
+    Some((*rt.val?, vars))
+}
+
 /// The partitions of `parent` in PartitionDesc order (partition_bounds_create):
 /// range partitions by lower bound, list partitions by their smallest
 /// non-NULL value (a NULL-only one after those), hash partitions by

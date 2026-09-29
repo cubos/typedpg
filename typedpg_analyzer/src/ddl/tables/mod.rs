@@ -1130,6 +1130,9 @@ fn apply_alter_subtype(
         }
         AlterTableType::AtAttachPartition => inherit_cmd::attach_partition(interp, relid, cmd),
         AlterTableType::AtDetachPartition => inherit_cmd::detach_partition(interp, relid, cmd),
+        AlterTableType::AtDetachPartitionFinalize => {
+            inherit_cmd::detach_partition_finalize(interp, relid, cmd)
+        }
         AlterTableType::AtDropOf => typed::drop_of(interp, relid),
         AlterTableType::AtReplicaIdentity => object_refs::replica_identity(interp, relid, cmd),
         AlterTableType::AtAlterConstraint => object_refs::alter_constraint(interp, relid, cmd, rec),
@@ -1360,6 +1363,10 @@ fn check_alter_target(
             "ATTACH PARTITION",
         ),
         At::AtDetachPartition => (class.relkind == RelKind::Partitioned, "DETACH PARTITION"),
+        At::AtDetachPartitionFinalize => (
+            class.relkind == RelKind::Partitioned,
+            "DETACH PARTITION ... FINALIZE",
+        ),
         At::AtDropInherit => (table_like, "NO INHERIT"),
         At::AtDropOf => (class.relkind == RelKind::Table, "NOT OF"),
         At::AtDropConstraint => (table_like, "DROP CONSTRAINT"),
