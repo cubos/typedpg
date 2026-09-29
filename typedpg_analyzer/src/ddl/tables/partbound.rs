@@ -62,6 +62,25 @@ pub(crate) fn partition_key_collations(
         .unwrap_or_default()
 }
 
+/// The partition key's column types, and the access method of its
+/// operator classes (`hash` for HASH partitioning, else `btree`).
+pub(crate) fn partition_key_types(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+) -> (Vec<PgTypeOid>, &'static str) {
+    match interp.partition_specs.get(&relid) {
+        Some(s) => (
+            s.keys.iter().map(|k| k.type_oid).collect(),
+            if s.strategy == Strategy::Hash {
+                "hash"
+            } else {
+                "btree"
+            },
+        ),
+        None => (Vec::new(), "btree"),
+    }
+}
+
 /// The collations whose order is the strings' code point order: C / POSIX
 /// (byte order, which for UTF-8 is code point order), `ucs_basic`, and the
 /// builtin provider's `pg_c_utf8` / `pg_unicode_fast`.

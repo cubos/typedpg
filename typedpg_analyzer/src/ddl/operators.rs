@@ -29,6 +29,7 @@ pub fn define_operator(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), 
     let mut left_type: Option<PgTypeOid> = None;
     let mut right_type: Option<PgTypeOid> = None;
     let mut procedure: Option<(Option<String>, String)> = None;
+    let mut commutator: Option<(Option<String>, String)> = None;
 
     for opt in &stmt.definition {
         let Some(node::Node::DefElem(de)) = opt.node.as_ref() else {
@@ -50,6 +51,9 @@ pub fn define_operator(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), 
             }
             "procedure" | "function" => {
                 procedure = parse_func_name(arg);
+            }
+            "commutator" => {
+                commutator = parse_func_name(arg);
             }
             _ => {}
         }
@@ -89,8 +93,59 @@ pub fn define_operator(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), 
         oprright: right_oid,
         oprresult: Some(result_oid),
         oprcode: Some(proc_oid),
+        oprcom: None,
     });
+    if let Some((com_schema, com_name)) = commutator {
+        link_commutator(interp, oid, com_schema.as_deref(), &com_name)?;
+    }
 
+    Ok(())
+}
+
+/// OperatorCreate's COMMUTATOR (get_other_operator / OperatorUpd): the
+/// operator with the reversed operand types, whose own `oprcom` is pointed
+/// back at the new one — or the new operator itself when it names itself.
+/// A commutator not defined yet (PG makes it a shell) links up when it is
+/// created naming this one.
+fn link_commutator(
+    interp: &mut PgCatalog,
+    oid: PgOperatorOid,
+    schema: Option<&str>,
+    name: &str,
+) -> Result<(), DdlError> {
+    let Some(op) = interp.pg_operator.get(&oid).cloned() else {
+        return Ok(());
+    };
+    let namespaces = match schema {
+        Some(s) => vec![super::util::existing_namespace(interp, s)?],
+        None => vec![op.oprnamespace],
+    };
+    let self_link = name == op.oprname
+        && namespaces.contains(&op.oprnamespace)
+        && op.oprleft == Some(op.oprright);
+    let other = if self_link {
+        Some(oid)
+    } else {
+        interp
+            .pg_operator
+            .values()
+            .find(|o| {
+                o.oprname == name
+                    && namespaces.contains(&o.oprnamespace)
+                    && o.oprleft == Some(op.oprright)
+                    && op.oprleft == Some(o.oprright)
+            })
+            .map(|o| o.oid)
+    };
+    let Some(other) = other else {
+        return Ok(());
+    };
+    if let Some(row) = interp.pg_operator.get_mut(&oid) {
+        row.oprcom = Some(other);
+    }
+    if let Some(row) = interp.pg_operator.get_mut(&other) {
+        row.oprcom = Some(oid);
+    }
     Ok(())
 }
 

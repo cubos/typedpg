@@ -384,6 +384,7 @@ pub(super) fn add_foreign_key(
         Vec::new(),
         with_period,
         false,
+        None,
     )?;
     if let Some(row) = interp.pg_constraint.get_mut(&oid) {
         row.conenforced = c.is_enforced;

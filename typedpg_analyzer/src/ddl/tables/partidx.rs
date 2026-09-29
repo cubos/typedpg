@@ -170,6 +170,9 @@ fn create_clone(
     if let Some(am) = am {
         interp.index_access_methods.insert(index, am);
     }
+    if let Some(keys) = interp.index_keys.get(&pi.indexrelid).cloned() {
+        interp.index_keys.insert(index, keys);
+    }
     if let Some(con) = parent_con {
         let oid = PgConstraintOid::from_nonzero(interp.alloc_oid()?);
         interp.insert_pg_constraint(PgConstraint {

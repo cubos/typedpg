@@ -3,12 +3,14 @@
 //! resolution of index columns (ResolveOpClass / GetDefaultOpClass,
 //! indexcmds.c).
 
-use typedpg_pg_query::protobuf::{CreateAmStmt, CreateOpClassStmt, CreateOpFamilyStmt, node};
+use typedpg_pg_query::protobuf::{
+    AlterOpFamilyStmt, CreateAmStmt, CreateOpClassItem, CreateOpClassStmt, CreateOpFamilyStmt, node,
+};
 
 use super::DdlError;
 use super::util::node_string;
-use crate::oid::{PgNamespaceOid, PgTypeOid};
-use crate::pg_catalog::{PgAm, PgCatalog, PgOpclass, PgOpfamily, TypCategory, TypType};
+use crate::oid::{PgNamespaceOid, PgOperatorOid, PgTypeOid};
+use crate::pg_catalog::{PgAm, PgAmop, PgCatalog, PgOpclass, PgOpfamily, TypCategory, TypType};
 
 /// What an index access method supports (the `IndexAmRoutine` flags of
 /// the built-in AMs). Unknown AMs (from extensions) are not checked.
@@ -17,24 +19,129 @@ pub(crate) struct AmCaps {
     pub(crate) can_multicol: bool,
     pub(crate) can_include: bool,
     pub(crate) can_order: bool,
+    /// `amclusterable`.
+    pub(crate) can_cluster: bool,
+    /// `amgettuple != NULL`: what an exclusion constraint checks through.
+    pub(crate) has_gettuple: bool,
 }
 
 pub(crate) fn am_caps(amname: &str) -> Option<AmCaps> {
-    let caps = |can_unique, can_multicol, can_include, can_order| AmCaps {
-        can_unique,
-        can_multicol,
-        can_include,
-        can_order,
-    };
+    let caps =
+        |can_unique, can_multicol, can_include, can_order, can_cluster, has_gettuple| AmCaps {
+            can_unique,
+            can_multicol,
+            can_include,
+            can_order,
+            can_cluster,
+            has_gettuple,
+        };
     Some(match amname {
-        "btree" => caps(true, true, true, true),
-        "hash" => caps(false, false, false, false),
-        "gist" => caps(false, true, true, false),
-        "gin" => caps(false, true, false, false),
-        "brin" => caps(false, true, false, false),
-        "spgist" => caps(false, false, true, false),
+        "btree" => caps(true, true, true, true, true, true),
+        "hash" => caps(false, false, false, false, false, true),
+        "gist" => caps(false, true, true, false, true, true),
+        "gin" => caps(false, true, false, false, false, false),
+        "brin" => caps(false, true, false, false, false, false),
+        "spgist" => caps(false, false, true, false, false, true),
         _ => return None,
     })
+}
+
+/// An operator class's identity: `(opcnamespace, opcname, opcmethod)`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OpclassId {
+    pub(crate) namespace: PgNamespaceOid,
+    pub(crate) name: String,
+    pub(crate) method: String,
+}
+
+impl OpclassId {
+    fn of(c: &PgOpclass) -> Self {
+        OpclassId {
+            namespace: c.opcnamespace,
+            name: c.opcname.clone(),
+            method: c.opcmethod.clone(),
+        }
+    }
+
+    pub(crate) fn get<'a>(&self, interp: &'a PgCatalog) -> Option<&'a PgOpclass> {
+        interp.pg_opclass.iter().find(|c| {
+            c.opcnamespace == self.namespace && c.opcname == self.name && c.opcmethod == self.method
+        })
+    }
+}
+
+/// get_op_opfamily_strategy: whether `opr` is a search operator of
+/// `opclass`'s operator family.
+pub(crate) fn opfamily_has_operator(
+    interp: &PgCatalog,
+    opclass: &PgOpclass,
+    opr: PgOperatorOid,
+) -> bool {
+    interp.pg_amop.iter().any(|o| {
+        o.amopopr == opr
+            && o.amopfamily == opclass.opcfamily
+            && o.amopfamilynamespace == opclass.opcfamilynamespace
+            && o.amopmethod == opclass.opcmethod
+    })
+}
+
+/// get_opfamily_member: the operator of `opclass`'s family with strategy
+/// `strategy` over (`opcintype`, `opcintype`).
+pub(crate) fn opfamily_member(
+    interp: &PgCatalog,
+    opclass: &PgOpclass,
+    strategy: i16,
+) -> Option<PgOperatorOid> {
+    interp
+        .pg_amop
+        .iter()
+        .find(|o| {
+            o.amopfamily == opclass.opcfamily
+                && o.amopfamilynamespace == opclass.opcfamilynamespace
+                && o.amopmethod == opclass.opcmethod
+                && o.amopstrategy == strategy
+                && o.amoplefttype == opclass.opcintype
+                && o.amoprighttype == opclass.opcintype
+        })
+        .map(|o| o.amopopr)
+}
+
+/// format_operator: `name(left,right)`, the name schema-qualified when its
+/// schema isn't on the search path.
+pub(crate) fn format_operator(interp: &PgCatalog, opr: PgOperatorOid) -> String {
+    let Some(op) = interp.pg_operator.get(&opr) else {
+        return opr.to_string();
+    };
+    let name = if interp.schemas_for_lookup(None).contains(&op.oprnamespace) {
+        op.oprname.clone()
+    } else {
+        // quote_identifier(nspname) — QualifiedName's quoting of the schema
+        // part; the operator name itself is never quoted.
+        let schema = interp.namespace_name(op.oprnamespace).unwrap_or_default();
+        let quoted = crate::qualified_name::QualifiedName::new(schema, "x").to_string();
+        format!("{}.{}", &quoted[..quoted.len() - 2], op.oprname)
+    };
+    let left = op.oprleft.map_or_else(
+        || "NONE".to_owned(),
+        |t| super::util::format_type_for_message(interp, t),
+    );
+    let right = super::util::format_type_for_message(interp, op.oprright);
+    format!("{name}({left},{right})")
+}
+
+/// format_opfamily: an operator family's name, schema-qualified when its
+/// schema isn't on the search path.
+pub(crate) fn format_opfamily(interp: &PgCatalog, opclass: &PgOpclass) -> String {
+    if interp
+        .schemas_for_lookup(None)
+        .contains(&opclass.opcfamilynamespace)
+    {
+        return opclass.opcfamily.clone();
+    }
+    let schema = interp
+        .namespace_name(opclass.opcfamilynamespace)
+        .unwrap_or_default();
+    crate::qualified_name::QualifiedName::new(schema, &opclass.opcfamily).to_string()
 }
 
 pub(crate) fn am_exists(interp: &PgCatalog, amname: &str) -> bool {
@@ -125,8 +232,8 @@ pub fn create_am(interp: &mut PgCatalog, stmt: &CreateAmStmt) -> Result<(), DdlE
         .find_functions(schema.as_deref(), &handler)
         .into_iter()
         .find(|p| p.proargtypes == [internal])
-        .map(|p| p.prorettype);
-    let Some(rettype) = found else {
+        .map(|p| (p.oid, p.prorettype));
+    let Some((handler_oid, rettype)) = found else {
         return Err(DdlError::TypeNotFound(format!(
             "function {handler}(internal) does not exist"
         )));
@@ -144,6 +251,7 @@ pub fn create_am(interp: &mut PgCatalog, stmt: &CreateAmStmt) -> Result<(), DdlE
     interp.pg_am.push(PgAm {
         amname: stmt.amname.clone(),
         amtype: stmt.amtype.clone(),
+        amhandler: Some(handler_oid),
     });
     Ok(())
 }
@@ -182,17 +290,24 @@ pub fn create_opclass(interp: &mut PgCatalog, stmt: &CreateOpClassStmt) -> Resul
     };
     let (schema, name) = split_name(&stmt.opclassname);
     let nsoid = object_namespace(interp, schema.as_deref())?;
-    if !stmt.opfamilyname.is_empty() {
+    let family = if !stmt.opfamilyname.is_empty() {
         let (fschema, fname) = split_name(&stmt.opfamilyname);
-        if find_opfamily(interp, fschema.as_deref(), &fname, &am).is_none() {
-            return Err(DdlError::TypeNotFound(format!(
-                "operator family \"{fname}\" does not exist for access method \"{am}\""
-            )));
+        match find_opfamily(interp, fschema.as_deref(), &fname, &am) {
+            Some(f) => (f.opfname.clone(), f.opfnamespace),
+            None => {
+                return Err(DdlError::TypeNotFound(format!(
+                    "operator family \"{fname}\" does not exist for access method \"{am}\""
+                )));
+            }
         }
-    } else if !interp
-        .pg_opfamily
-        .iter()
-        .any(|f| f.opfnamespace == nsoid && f.opfname == name && f.opfmethod == am)
+    } else {
+        (name.clone(), nsoid)
+    };
+    if stmt.opfamilyname.is_empty()
+        && !interp
+            .pg_opfamily
+            .iter()
+            .any(|f| f.opfnamespace == nsoid && f.opfname == name && f.opfmethod == am)
     {
         interp.pg_opfamily.push(PgOpfamily {
             opfname: name.clone(),
@@ -222,13 +337,131 @@ pub fn create_opclass(interp: &mut PgCatalog, stmt: &CreateOpClassStmt) -> Resul
             existing.opcname
         )));
     }
+    let (family_name, family_ns) = family;
+    for item in &stmt.items {
+        if let Some(node::Node::CreateOpClassItem(item)) = item.node.as_ref() {
+            add_family_operator(interp, &family_name, family_ns, &am, item, Some(intype))?;
+        }
+    }
     interp.pg_opclass.push(PgOpclass {
         opcname: name,
         opcnamespace: nsoid,
         opcmethod: am,
         opcintype: intype,
         opcdefault: stmt.is_default,
+        opcfamily: family_name,
+        opcfamilynamespace: family_ns,
     });
+    Ok(())
+}
+
+/// DefineOpClass / AlterOpFamilyAdd: an `OPERATOR n name [(left, right)]`
+/// item becomes a search member (`pg_amop`) of the family — its operand
+/// types default to the opclass's input type. `FOR ORDER BY` operators and
+/// FUNCTION / STORAGE items are not recorded; an operator that doesn't
+/// resolve is skipped.
+fn add_family_operator(
+    interp: &mut PgCatalog,
+    family: &str,
+    family_ns: PgNamespaceOid,
+    am: &str,
+    item: &CreateOpClassItem,
+    intype: Option<PgTypeOid>,
+) -> Result<(), DdlError> {
+    // OPCLASS_ITEM_OPERATOR, not FOR ORDER BY.
+    if item.itemtype != 1 || !item.order_family.is_empty() {
+        return Ok(());
+    }
+    let Some(owa) = item.name.as_ref() else {
+        return Ok(());
+    };
+    let (left, right) = match owa.objargs.as_slice() {
+        [l, r] => {
+            let resolve = |n: &typedpg_pg_query::protobuf::Node| match n.node.as_ref() {
+                Some(node::Node::TypeName(tn)) => super::util::resolve_type_name(tn, interp),
+                _ => None,
+            };
+            (resolve(l), resolve(r))
+        }
+        [] => (intype, intype),
+        _ => return Ok(()),
+    };
+    let (Some(left), Some(right)) = (left, right) else {
+        return Ok(());
+    };
+    let (schema, name) = split_name(&owa.objname);
+    let Some(opr) = interp
+        .schemas_for_lookup(schema.as_deref())
+        .into_iter()
+        .find_map(|ns| {
+            interp.pg_operator.values().find(|o| {
+                o.oprnamespace == ns
+                    && o.oprname == name
+                    && o.oprleft == Some(left)
+                    && o.oprright == right
+            })
+        })
+        .map(|o| o.oid)
+    else {
+        return Ok(());
+    };
+    interp.pg_amop.push(PgAmop {
+        amopfamily: family.to_owned(),
+        amopfamilynamespace: family_ns,
+        amopmethod: am.to_owned(),
+        amoplefttype: left,
+        amoprighttype: right,
+        amopstrategy: i16::try_from(item.number).unwrap_or_default(),
+        amopopr: opr,
+    });
+    Ok(())
+}
+
+/// ALTER OPERATOR FAMILY name USING am ADD | DROP ... (AlterOpFamily): the
+/// family's search operators follow the OPERATOR items.
+pub fn alter_opfamily(interp: &mut PgCatalog, stmt: &AlterOpFamilyStmt) -> Result<(), DdlError> {
+    am_must_exist(interp, &stmt.amname)?;
+    let (schema, name) = split_name(&stmt.opfamilyname);
+    let Some((family, family_ns)) = find_opfamily(interp, schema.as_deref(), &name, &stmt.amname)
+        .map(|f| (f.opfname.clone(), f.opfnamespace))
+    else {
+        return Err(DdlError::TypeNotFound(format!(
+            "operator family \"{name}\" does not exist for access method \"{}\"",
+            stmt.amname
+        )));
+    };
+    for item in &stmt.items {
+        let Some(node::Node::CreateOpClassItem(item)) = item.node.as_ref() else {
+            continue;
+        };
+        if !stmt.is_drop {
+            add_family_operator(interp, &family, family_ns, &stmt.amname, item, None)?;
+            continue;
+        }
+        // AlterOpFamilyDrop: `OPERATOR n (left, right)`.
+        if item.itemtype != 1 {
+            continue;
+        }
+        let types: Vec<Option<PgTypeOid>> = item
+            .class_args
+            .iter()
+            .map(|n| match n.node.as_ref() {
+                Some(node::Node::TypeName(tn)) => super::util::resolve_type_name(tn, interp),
+                _ => None,
+            })
+            .collect();
+        if let [Some(left), Some(right)] = types.as_slice() {
+            let strategy = i16::try_from(item.number).unwrap_or_default();
+            interp.pg_amop.retain(|o| {
+                !(o.amopfamily == family
+                    && o.amopfamilynamespace == family_ns
+                    && o.amopmethod == stmt.amname
+                    && o.amopstrategy == strategy
+                    && o.amoplefttype == *left
+                    && o.amoprighttype == *right)
+            });
+        }
+    }
     Ok(())
 }
 
@@ -288,6 +521,9 @@ pub(crate) fn drop_am_object(
                     interp
                         .pg_opfamily
                         .retain(|f| !(f.opfnamespace == ns && f.opfname == n && f.opfmethod == am));
+                    interp.pg_amop.retain(|o| {
+                        !(o.amopfamilynamespace == ns && o.amopfamily == n && o.amopmethod == am)
+                    });
                 }
                 None if missing_ok => {}
                 None => {
@@ -377,27 +613,29 @@ fn default_opclass<'a>(
     )
 }
 
-/// ResolveOpClass for one index column of type `typ`.
+/// ResolveOpClass for one index column of type `typ`: the operator class
+/// named (which must accept the type), else the type's default one. `None`
+/// for an unknown-typed column.
 pub(crate) fn resolve_index_opclass(
     interp: &PgCatalog,
     opclass: &[typedpg_pg_query::protobuf::Node],
     typ: PgTypeOid,
     am: &str,
-) -> Result<(), DdlError> {
+) -> Result<Option<OpclassId>, DdlError> {
     if typ == crate::pg_catalog::oid::UNKNOWN {
-        return Ok(());
+        return Ok(None);
     }
     let typname = || super::util::format_type_for_message(interp, typ);
     if opclass.is_empty() {
-        if default_opclass(interp, typ, am)?.is_none() {
+        let Some(found) = default_opclass(interp, typ, am)? else {
             return Err(DdlError::TypeNotFound(format!(
                 "data type {} has no default operator class for access method \"{am}\" (You \
                  must specify an operator class for the index or define a default operator \
                  class for the data type.)",
                 typname()
             )));
-        }
-        return Ok(());
+        };
+        return Ok(Some(OpclassId::of(found)));
     }
     let (schema, name) = split_name(opclass);
     let Some(found) = find_opclass(interp, schema.as_deref(), &name, am) else {
@@ -405,15 +643,40 @@ pub(crate) fn resolve_index_opclass(
             "operator class \"{name}\" does not exist for access method \"{am}\""
         )));
     };
-    if !binary_coercible(interp, interp.unwrap_domain(typ), found.opcintype)
-        && !binary_coercible(interp, typ, found.opcintype)
+    check_opclass_accepts(interp, found, typ)?;
+    Ok(Some(OpclassId::of(found)))
+}
+
+/// ResolveOpClass: an explicitly named operator class must accept the
+/// column's type (binary-coercibly).
+pub(crate) fn check_opclass_accepts(
+    interp: &PgCatalog,
+    opclass: &PgOpclass,
+    typ: PgTypeOid,
+) -> Result<(), DdlError> {
+    if !binary_coercible(interp, interp.unwrap_domain(typ), opclass.opcintype)
+        && !binary_coercible(interp, typ, opclass.opcintype)
     {
         return Err(DdlError::Parse(format!(
-            "operator class \"{name}\" does not accept data type {}",
-            typname()
+            "operator class \"{}\" does not accept data type {}",
+            opclass.opcname,
+            super::util::format_type_for_message(interp, typ)
         )));
     }
     Ok(())
+}
+
+/// GetDefaultOpClass as an identity: the default operator class of `am`
+/// for `typ`, if exactly one.
+pub(crate) fn default_opclass_id(
+    interp: &PgCatalog,
+    typ: PgTypeOid,
+    am: &str,
+) -> Option<OpclassId> {
+    default_opclass(interp, typ, am)
+        .ok()
+        .flatten()
+        .map(OpclassId::of)
 }
 
 /// The declared input type (`opcintype`) of `typ`'s default operator class

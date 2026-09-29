@@ -610,6 +610,9 @@ pub struct PgTsObject {
 pub struct PgAm {
     pub amname: String,
     pub amtype: String,
+    /// FK `pg_proc.oid` of the handler function. `None` when unknown.
+    #[serde(with = "crate::oid::oid_or_zero")]
+    pub amhandler: Option<PgProcOid>,
 }
 
 /// `pg_opfamily`: an operator family of an access method.
@@ -634,6 +637,30 @@ pub struct PgOpclass {
     /// FK `pg_type.oid`: the input type.
     pub opcintype: PgTypeOid,
     pub opcdefault: bool,
+    /// `opcfamily`: the operator family's `opfname` (of access method
+    /// `opcmethod`) ...
+    pub opcfamily: String,
+    /// ... and its `opfnamespace`.
+    pub opcfamilynamespace: PgNamespaceOid,
+}
+
+/// `pg_amop`: a search operator (`amoppurpose = 's'`) of an operator
+/// family, whose identity is `(amopfamily, amopfamilynamespace,
+/// amopmethod)` like [`PgOpfamily`]'s.
+#[derive(Debug, Clone, Serialize_tuple, Deserialize_tuple)]
+pub struct PgAmop {
+    pub amopfamily: String,
+    /// FK `pg_namespace.oid` of the family.
+    pub amopfamilynamespace: PgNamespaceOid,
+    /// The access method's `amname`.
+    pub amopmethod: String,
+    /// FK `pg_type.oid`.
+    pub amoplefttype: PgTypeOid,
+    /// FK `pg_type.oid`.
+    pub amoprighttype: PgTypeOid,
+    pub amopstrategy: i16,
+    /// FK `pg_operator.oid`.
+    pub amopopr: PgOperatorOid,
 }
 
 /// `pg_class`: a relation (table, view, matview, partitioned table, composite
@@ -867,6 +894,10 @@ pub struct PgOperator {
     /// operators (PG: `0`).
     #[serde(with = "crate::oid::oid_or_zero")]
     pub oprcode: Option<PgProcOid>,
+    /// FK `pg_operator.oid` of the commutator. `None` when it has none
+    /// (PG: `0`).
+    #[serde(with = "crate::oid::oid_or_zero")]
+    pub oprcom: Option<PgOperatorOid>,
 }
 
 /// `pg_cast`: a cast rule between two types.

@@ -760,3 +760,238 @@ fn attaching_indexes_of_constraints() {
         .unwrap();
     assert!(con.conislocal && con.coninhcount == 0);
 }
+
+/// Apply `setup` then each statement, expecting PG's error `message` (a
+/// prefix of the analyzer's) for every one.
+fn assert_rejected(setup: &str, cases: &[(&str, &str)]) {
+    for (sql, message) in cases {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", sql)]).expect_err(sql);
+        assert!(
+            err.to_string().starts_with(message),
+            "{sql}\n  expected: {message}\n       got: {err}"
+        );
+    }
+}
+
+/// Apply `setup` then each statement, expecting all to succeed.
+fn assert_accepted(setup: &str, statements: &[&str]) {
+    for sql in statements {
+        if let Err(err) = try_apply(&[("0001.sql", setup), ("0002.sql", sql)]) {
+            panic!("{sql}\n  rejected: {err}");
+        }
+    }
+}
+
+#[test]
+fn constraint_indexes_resolve_operator_classes() {
+    // DefineIndex runs ResolveOpClass for a PRIMARY KEY / UNIQUE / EXCLUDE
+    // constraint's index as for CREATE INDEX.
+    assert_rejected(
+        "CREATE TABLE s (a point, j json);",
+        &[
+            (
+                "CREATE TABLE t (a point UNIQUE);",
+                "data type point has no default operator class for access method \"btree\"",
+            ),
+            (
+                "CREATE TABLE t (a json PRIMARY KEY);",
+                "data type json has no default operator class for access method \"btree\"",
+            ),
+            (
+                "CREATE TABLE t (a int, EXCLUDE USING gist (a WITH =));",
+                "data type integer has no default operator class for access method \"gist\"",
+            ),
+            (
+                "ALTER TABLE s ADD UNIQUE (a);",
+                "data type point has no default operator class for access method \"btree\"",
+            ),
+            (
+                "CREATE TABLE t (a int, EXCLUDE USING btree (a text_ops WITH =));",
+                "operator class \"text_ops\" does not accept data type integer",
+            ),
+        ],
+    );
+    assert_accepted(
+        "",
+        &[
+            "CREATE TABLE t (a int UNIQUE, b text PRIMARY KEY, \
+             c int4range, EXCLUDE USING gist (c WITH &&));",
+            "CREATE EXTENSION btree_gist; \
+             CREATE TABLE t (a int, r int4range, EXCLUDE USING gist (a WITH =, r WITH &&));",
+        ],
+    );
+}
+
+#[test]
+fn constraint_index_options_are_validated() {
+    // DefineIndex: index_reloptions over the constraint's WITH (...).
+    assert_rejected(
+        "CREATE TABLE s (a int);",
+        &[
+            (
+                "CREATE TABLE t (a int, UNIQUE (a) WITH (foo=50));",
+                "unrecognized parameter \"foo\"",
+            ),
+            (
+                "CREATE TABLE t (a int PRIMARY KEY WITH (fillfactor=5));",
+                "value 5 out of bounds for option \"fillfactor\"",
+            ),
+            (
+                "CREATE TABLE t (a int, EXCLUDE USING btree (a WITH =) WITH (foo=1));",
+                "unrecognized parameter \"foo\"",
+            ),
+            (
+                "ALTER TABLE s ADD UNIQUE (a) WITH (foo=1);",
+                "unrecognized parameter \"foo\"",
+            ),
+        ],
+    );
+    assert_accepted(
+        "",
+        &["CREATE TABLE t (a int PRIMARY KEY WITH (fillfactor=50));"],
+    );
+}
+
+#[test]
+fn exclusion_operators_are_checked() {
+    // ComputeIndexAttrs: the operator must exist for the column type, be
+    // its own commutator and belong to the operator class's family.
+    assert_rejected(
+        "",
+        &[
+            (
+                "CREATE TABLE t (r int4range, EXCLUDE USING gist (r WITH <<));",
+                "operator <<(anyrange,anyrange) is not commutative",
+            ),
+            (
+                "CREATE TABLE t (r int4range, EXCLUDE USING gist (r WITH <));",
+                "operator <(anyrange,anyrange) is not commutative",
+            ),
+            (
+                "CREATE TABLE t (a int, EXCLUDE USING btree (a WITH <>));",
+                "operator <>(integer,integer) is not a member of operator family \"integer_ops\"",
+            ),
+            (
+                "CREATE TABLE t (a int, EXCLUDE USING btree (a WITH ===));",
+                "operator does not exist: integer === integer",
+            ),
+            (
+                "CREATE TABLE t (a text, EXCLUDE USING btree (a text_pattern_ops WITH ~=~));",
+                "operator does not exist: text ~=~ text",
+            ),
+        ],
+    );
+    assert_accepted(
+        "",
+        &[
+            "CREATE TABLE t (a int, EXCLUDE USING btree (a WITH =));",
+            "CREATE TABLE t (a int, EXCLUDE USING hash (a WITH =));",
+            "CREATE TABLE t (a text, EXCLUDE USING btree (a WITH OPERATOR(pg_catalog.=)));",
+            "CREATE EXTENSION btree_gist; CREATE TABLE t (a int, EXCLUDE USING gist (a WITH <>));",
+        ],
+    );
+}
+
+#[test]
+fn exclusion_needs_an_access_method_with_gettuple() {
+    assert_rejected(
+        "",
+        &[
+            (
+                "CREATE TABLE t (a int, EXCLUDE USING brin (a WITH =));",
+                "access method \"brin\" does not support exclusion constraints",
+            ),
+            (
+                "CREATE TABLE t (a int[], EXCLUDE USING gin (a WITH &&));",
+                "access method \"gin\" does not support exclusion constraints",
+            ),
+            (
+                "CREATE TABLE t (a int, EXCLUDE USING nosuch (a WITH =));",
+                "access method \"nosuch\" does not exist",
+            ),
+        ],
+    );
+}
+
+#[test]
+fn exclusion_on_a_partitioned_table_compares_the_partition_key_with_equality() {
+    assert_rejected(
+        "",
+        &[
+            (
+                "CREATE TABLE t (a int, b int, EXCLUDE USING btree (b WITH =)) \
+                 PARTITION BY RANGE (a);",
+                "unique constraint on partitioned table must include all partitioning columns",
+            ),
+            (
+                "CREATE TABLE t (a int4range, EXCLUDE USING gist (a WITH &&)) \
+                 PARTITION BY RANGE (a);",
+                "cannot match partition key to index on column \"a\" using non-equal operator \
+                 \"&&\"",
+            ),
+        ],
+    );
+    assert_accepted(
+        "",
+        &[
+            "CREATE TABLE t (a int, EXCLUDE USING btree (a WITH =)) PARTITION BY RANGE (a);",
+            "CREATE TABLE t (a int, EXCLUDE USING hash (a WITH =)) PARTITION BY RANGE (a);",
+            "CREATE TABLE t (a int, EXCLUDE USING btree (a WITH =)) PARTITION BY HASH (a);",
+        ],
+    );
+}
+
+#[test]
+fn index_column_collations_are_validated() {
+    // ComputeIndexAttrs: the COLLATE clause names an existing collation,
+    // of a collatable type.
+    let setup = "CREATE TABLE t (a int, b text);";
+    assert_rejected(
+        setup,
+        &[
+            (
+                "CREATE INDEX ON t (a COLLATE \"C\");",
+                "collations are not supported by type integer",
+            ),
+            (
+                "CREATE INDEX ON t ((a + 1) COLLATE \"C\");",
+                "collations are not supported by type integer",
+            ),
+            (
+                "CREATE INDEX ON t (b COLLATE nosuch);",
+                "collation \"nosuch\" for encoding \"UTF8\" does not exist",
+            ),
+            (
+                "CREATE TABLE x (a text, EXCLUDE USING btree (a COLLATE nosuch WITH =));",
+                "collation \"nosuch\" for encoding \"UTF8\" does not exist",
+            ),
+        ],
+    );
+    assert_accepted(
+        setup,
+        &[
+            "CREATE INDEX ON t (b COLLATE \"C\");",
+            "CREATE INDEX ON t ((b || 'x') COLLATE \"C\");",
+        ],
+    );
+}
+
+#[test]
+fn an_index_cannot_use_a_table_access_method() {
+    // GetIndexAmRoutine: heap_tableam_handler (oid 3) returns no
+    // IndexAmRoutine.
+    assert_rejected(
+        "CREATE TABLE t (a int); \
+         CREATE ACCESS METHOD myheap TYPE TABLE HANDLER heap_tableam_handler;",
+        &[
+            (
+                "CREATE INDEX ON t USING heap (a);",
+                "index access method handler function 3 did not return an IndexAmRoutine struct",
+            ),
+            (
+                "CREATE INDEX ON t USING myheap (a);",
+                "index access method handler function 3 did not return an IndexAmRoutine struct",
+            ),
+        ],
+    );
+}

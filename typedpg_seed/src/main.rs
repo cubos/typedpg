@@ -17,7 +17,7 @@ use testcontainers::runners::SyncRunner;
 use testcontainers_modules::postgres::Postgres;
 use typedpg_analyzer::{
     AggKind, ArgMode, AttGenerated, AttIdentity, CastContext, CastMethod, ConType, DepType,
-    PgAggregate, PgAm, PgAttribute, PgCast, PgCastOid, PgCatalog, PgCatalogSeed, PgClass,
+    PgAggregate, PgAm, PgAmop, PgAttribute, PgCast, PgCastOid, PgCatalog, PgCatalogSeed, PgClass,
     PgClassOid, PgCollation, PgCollationOid, PgConstraint, PgConstraintOid, PgDepend, PgEnum,
     PgEnumOid, PgExtension, PgExtensionOid, PgGenericOid, PgIndex, PgInherits, PgNamespace,
     PgNamespaceOid, PgOpclass, PgOperator, PgOperatorOid, PgOpfamily, PgProc, PgProcOid, PgRange,
@@ -113,7 +113,7 @@ fn export_catalog(client: &mut postgres::Client) -> Result<PgCatalogSeed, postgr
     let pg_collation = export_collations(client)?;
     let search_path = export_search_path(client)?;
     let sql_function_defs = export_sql_function_defs(client)?;
-    let (pg_am, pg_opfamily, pg_opclass) = export_access_methods(client)?;
+    let (pg_am, pg_opfamily, pg_opclass, pg_amop) = export_access_methods(client)?;
     let pg_settings = export_settings(client)?;
     let pg_ts_objects = export_ts_objects(client)?;
 
@@ -148,6 +148,7 @@ fn export_catalog(client: &mut postgres::Client) -> Result<PgCatalogSeed, postgr
         pg_am,
         pg_opfamily,
         pg_opclass,
+        pg_amop,
         pg_settings,
         pg_ts_objects,
     };
@@ -475,7 +476,7 @@ fn export_operators(client: &mut postgres::Client) -> Result<Vec<PgOperator>, po
     // No filter — shell operators (oprresult = 0) round-trip too. Operator
     // resolution skips them at lookup time.
     let rows = client.query(
-        "SELECT oid, oprname, oprnamespace, oprleft, oprright, oprresult, oprcode::oid \
+        "SELECT oid, oprname, oprnamespace, oprleft, oprright, oprresult, oprcode::oid, oprcom \
          FROM pg_catalog.pg_operator \
          ORDER BY oid",
         &[],
@@ -489,6 +490,7 @@ fn export_operators(client: &mut postgres::Client) -> Result<Vec<PgOperator>, po
             let oprright: u32 = r.get(4);
             let oprresult: u32 = r.get(5);
             let oprcode: u32 = r.get(6);
+            let oprcom: u32 = r.get(7);
             PgOperator {
                 oid: PgOperatorOid::new(oid).expect("pg_operator.oid is non-zero"),
                 oprname: r.get(1),
@@ -497,6 +499,7 @@ fn export_operators(client: &mut postgres::Client) -> Result<Vec<PgOperator>, po
                 oprright: PgTypeOid::new(oprright).expect("oprright is non-zero"),
                 oprresult: PgTypeOid::new(oprresult),
                 oprcode: PgProcOid::new(oprcode),
+                oprcom: PgOperatorOid::new(oprcom),
             }
         })
         .collect())
@@ -846,8 +849,8 @@ fn export_settings(client: &mut postgres::Client) -> Result<Vec<PgSetting>, post
         .collect())
 }
 
-/// `pg_am`, `pg_opfamily` and `pg_opclass` rows.
-type AccessMethodRows = (Vec<PgAm>, Vec<PgOpfamily>, Vec<PgOpclass>);
+/// `pg_am`, `pg_opfamily`, `pg_opclass` and (search) `pg_amop` rows.
+type AccessMethodRows = (Vec<PgAm>, Vec<PgOpfamily>, Vec<PgOpclass>, Vec<PgAmop>);
 
 /// Access methods, operator families and operator classes (by access
 /// method name).
@@ -856,13 +859,14 @@ fn export_access_methods(
 ) -> Result<AccessMethodRows, postgres::Error> {
     let am = client
         .query(
-            "SELECT amname::text, amtype::text FROM pg_catalog.pg_am ORDER BY oid",
+            "SELECT amname::text, amtype::text, amhandler::oid FROM pg_catalog.pg_am ORDER BY oid",
             &[],
         )?
         .iter()
         .map(|r| PgAm {
             amname: r.get(0),
             amtype: r.get(1),
+            amhandler: PgProcOid::new(r.get::<_, u32>(2)),
         })
         .collect();
     let opfamily = client
@@ -883,8 +887,10 @@ fn export_access_methods(
         .collect();
     let opclass = client
         .query(
-            "SELECT c.opcname::text, c.opcnamespace, a.amname::text, c.opcintype, c.opcdefault \
+            "SELECT c.opcname::text, c.opcnamespace, a.amname::text, c.opcintype, c.opcdefault, \
+                    f.opfname::text, f.opfnamespace \
              FROM pg_catalog.pg_opclass c JOIN pg_catalog.pg_am a ON a.oid = c.opcmethod \
+             JOIN pg_catalog.pg_opfamily f ON f.oid = c.opcfamily \
              ORDER BY c.oid",
             &[],
         )?
@@ -896,10 +902,36 @@ fn export_access_methods(
                 opcmethod: r.get(2),
                 opcintype: PgTypeOid::new(r.get::<_, u32>(3))?,
                 opcdefault: r.get(4),
+                opcfamily: r.get(5),
+                opcfamilynamespace: PgNamespaceOid::new(r.get::<_, u32>(6))?,
             })
         })
         .collect();
-    Ok((am, opfamily, opclass))
+    let amop = client
+        .query(
+            "SELECT f.opfname::text, f.opfnamespace, a.amname::text, o.amoplefttype, \
+                    o.amoprighttype, o.amopstrategy, o.amopopr \
+             FROM pg_catalog.pg_amop o \
+             JOIN pg_catalog.pg_opfamily f ON f.oid = o.amopfamily \
+             JOIN pg_catalog.pg_am a ON a.oid = o.amopmethod \
+             WHERE o.amoppurpose = 's' \
+             ORDER BY o.oid",
+            &[],
+        )?
+        .iter()
+        .filter_map(|r| {
+            Some(PgAmop {
+                amopfamily: r.get(0),
+                amopfamilynamespace: PgNamespaceOid::new(r.get::<_, u32>(1))?,
+                amopmethod: r.get(2),
+                amoplefttype: PgTypeOid::new(r.get::<_, u32>(3))?,
+                amoprighttype: PgTypeOid::new(r.get::<_, u32>(4))?,
+                amopstrategy: r.get(5),
+                amopopr: PgOperatorOid::new(r.get::<_, u32>(6))?,
+            })
+        })
+        .collect();
+    Ok((am, opfamily, opclass, amop))
 }
 
 /// `pg_get_functiondef` of each non-set-returning `LANGUAGE sql` function;

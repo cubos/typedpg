@@ -148,6 +148,8 @@ pub struct PgCatalogSeed {
     #[serde(default)]
     pub pg_opclass: Vec<PgOpclass>,
     #[serde(default)]
+    pub pg_amop: Vec<PgAmop>,
+    #[serde(default)]
     pub pg_settings: Vec<PgSetting>,
     #[serde(default)]
     pub pg_ts_objects: Vec<PgTsObject>,
@@ -190,6 +192,7 @@ pub struct PgCatalog {
     pub(crate) pg_am: Vec<PgAm>,
     pub(crate) pg_opfamily: Vec<PgOpfamily>,
     pub(crate) pg_opclass: Vec<PgOpclass>,
+    pub(crate) pg_amop: Vec<PgAmop>,
     pub(crate) pg_settings: Vec<PgSetting>,
     pub(crate) pg_ts_objects: Vec<PgTsObject>,
 
@@ -282,6 +285,10 @@ pub struct PgCatalog {
     /// created ON ONLY a table with partitions, until every partition has
     /// one attached.
     pub(crate) invalid_indexes: std::collections::HashSet<PgClassOid>,
+    /// What `pg_index` keeps per key column beyond `indkey` (`indclass`,
+    /// `indcollation`, `indoption`, `indnullsnotdistinct`) and an exclusion
+    /// constraint's operators, for the indexes DDL creates.
+    pub(crate) index_keys: HashMap<PgClassOid, crate::ddl::indexes::IndexKeys>,
     /// `pg_sequence` rows of the sequences migrations create.
     pub(crate) sequence_params: HashMap<PgClassOid, crate::ddl::seqparams::SeqParams>,
     /// Foreign-data wrappers, servers, user mappings, foreign tables'
@@ -531,6 +538,7 @@ impl PgCatalog {
         cat.pg_am = seed.pg_am;
         cat.pg_opfamily = seed.pg_opfamily;
         cat.pg_opclass = seed.pg_opclass;
+        cat.pg_amop = seed.pg_amop;
         cat.pg_settings = seed.pg_settings;
         cat.pg_ts_objects = seed.pg_ts_objects;
         for (oid, definition) in seed.sql_function_defs {
@@ -566,6 +574,7 @@ impl PgCatalog {
             pg_am: Vec::new(),
             pg_opfamily: Vec::new(),
             pg_opclass: Vec::new(),
+            pg_amop: Vec::new(),
             pg_settings: Vec::new(),
             pg_ts_objects: Vec::new(),
             namespace_by_name: HashMap::new(),
@@ -598,6 +607,7 @@ impl PgCatalog {
             index_parents: HashMap::new(),
             nonimmediate_indexes: std::collections::HashSet::new(),
             invalid_indexes: std::collections::HashSet::new(),
+            index_keys: HashMap::new(),
             sequence_params: HashMap::new(),
             foreign_data: Default::default(),
             installing_extension: None,
@@ -720,6 +730,7 @@ impl PgCatalog {
             pg_am: self.pg_am.clone(),
             pg_opfamily: self.pg_opfamily.clone(),
             pg_opclass: self.pg_opclass.clone(),
+            pg_amop: self.pg_amop.clone(),
             pg_settings: self.pg_settings.clone(),
             pg_ts_objects: self.pg_ts_objects.clone(),
             sql_function_defs: {
@@ -1283,6 +1294,7 @@ impl PgCatalog {
         self.index_parents.remove(&oid);
         self.nonimmediate_indexes.remove(&oid);
         self.invalid_indexes.remove(&oid);
+        self.index_keys.remove(&oid);
         self.sequence_params.remove(&oid);
         self.foreign_data.table_servers.remove(&oid);
         self.relpersistence.remove(&oid);

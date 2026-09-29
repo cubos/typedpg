@@ -49,18 +49,20 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
         }
     }
 
-    // DefineIndex: the access method and what it supports.
+    // DefineIndex: the access method, what it supports, and its options.
     let am = if stmt.access_method.is_empty() {
         "btree"
     } else {
         stmt.access_method.as_str()
     };
-    if !super::opclass::am_exists(db, am) {
-        return Err(DdlError::TypeNotFound(format!(
-            "access method \"{am}\" does not exist"
-        )));
-    }
-    let caps = super::opclass::am_caps(am);
+    let caps = check_index_am(
+        db,
+        am,
+        stmt.unique,
+        !stmt.index_including_params.is_empty(),
+        stmt.index_params.len(),
+        false,
+    )?;
     if let Some(index_am) = super::reloptions::IndexAm::from_name(am) {
         super::reloptions::check_reloptions(
             &stmt.options,
@@ -68,23 +70,6 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
             false,
             false,
         )?;
-    }
-    if let Some(caps) = caps.as_ref() {
-        if stmt.unique && !caps.can_unique {
-            return Err(DdlError::UnsupportedDdl(format!(
-                "access method \"{am}\" does not support unique indexes"
-            )));
-        }
-        if !stmt.index_including_params.is_empty() && !caps.can_include {
-            return Err(DdlError::UnsupportedDdl(format!(
-                "access method \"{am}\" does not support included columns"
-            )));
-        }
-        if stmt.index_params.len() > 1 && !caps.can_multicol {
-            return Err(DdlError::UnsupportedDdl(format!(
-                "access method \"{am}\" does not support multicolumn indexes"
-            )));
-        }
     }
 
     if let Some(pred) = stmt.where_clause.as_deref() {
@@ -140,8 +125,7 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
         .map(|a| (a.attname.clone(), a.attnum))
         .collect();
     let mut indkey: Vec<i16> = Vec::with_capacity(stmt.index_params.len());
-    // indcollation: the COLLATE clause, else the column's.
-    let mut indcollation = Vec::with_capacity(stmt.index_params.len());
+    let mut key_columns: Vec<IndexKeyColumn> = Vec::with_capacity(stmt.index_params.len());
     let mut indexprs: Vec<SerializedAst> = Vec::new();
     for param in &stmt.index_params {
         let Some(node::Node::IndexElem(elem)) = param.node.as_ref() else {
@@ -159,43 +143,31 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
                 })?;
             indkey.push(an);
             let attr = db.attribute_by_name(indrelid, &elem.name);
-            indcollation.push(if elem.collation.is_empty() {
-                attr.and_then(|a| a.attcollation)
-            } else {
-                super::tables::partbound::collation_clause(db, &elem.collation)
-            });
-            attr.map(|a| a.atttypid)
+            attr.map(|a| (a.atttypid, a.attcollation))
         } else if let Some(expr) = elem.expr.as_deref() {
             indkey.push(0);
-            indcollation.push(None);
             indexprs.push(serialize_node(expr));
             match super::volatile::infer_over_relation(db, indrelid, expr, None) {
-                Some(Ok(t)) => Some(t.type_oid),
+                Some(Ok(t)) => Some((t.type_oid, None)),
                 _ => None,
             }
         } else {
             None
         };
-        // ResolveOpClass, then the ordering options (amcanorder).
-        if let Some(typ) = column_type {
-            super::opclass::resolve_index_opclass(db, &elem.opclass, typ, am)?;
-        }
-        if let Some(caps) = caps.as_ref()
-            && !caps.can_order
-        {
-            use typedpg_pg_query::protobuf::{SortByDir, SortByNulls};
-            if elem.ordering != SortByDir::SortbyDefault as i32 {
-                return Err(DdlError::UnsupportedDdl(format!(
-                    "access method \"{am}\" does not support ASC/DESC options"
-                )));
-            }
-            if elem.nulls_ordering != SortByNulls::SortbyNullsDefault as i32 {
-                return Err(DdlError::UnsupportedDdl(format!(
-                    "access method \"{am}\" does not support NULLS FIRST/LAST options"
-                )));
-            }
-        }
+        // ComputeIndexAttrs: the collation, ResolveOpClass, then the
+        // ordering options (amcanorder).
+        let (column, _) = compute_key_column(
+            db,
+            am,
+            caps.as_ref(),
+            Some(elem),
+            column_type.map(|(t, _)| t),
+            column_type.and_then(|(_, c)| c),
+            None,
+        )?;
+        key_columns.push(column);
     }
+    let indcollation: Vec<_> = key_columns.iter().map(|c| c.collation).collect();
     // ComputeIndexAttrs: the INCLUDE columns follow the key columns in
     // indkey; they must be plain columns.
     let indnkeyatts = indkey.len() as i16;
@@ -302,6 +274,13 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
         reltype: None,
     });
 
+    db.index_keys.insert(
+        indexrelid,
+        IndexKeys {
+            columns: key_columns,
+            nulls_not_distinct: stmt.nulls_not_distinct,
+        },
+    );
     let indnatts = indkey.len() as i16;
     db.insert_pg_index(PgIndex {
         indexrelid,
@@ -326,6 +305,446 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
         db.invalid_indexes.insert(indexrelid);
     }
 
+    Ok(())
+}
+
+/// What `pg_index` keeps of one key column beyond `indkey`.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct IndexKeyColumn {
+    /// The key's type, which `opclass` was resolved for (`opckeytype`
+    /// aside).
+    pub(crate) typ: Option<crate::oid::PgTypeOid>,
+    /// `indclass`: the operator class. `None` when the column's type is
+    /// unknown to the analyzer.
+    pub(crate) opclass: Option<super::opclass::OpclassId>,
+    /// `indcollation`.
+    pub(crate) collation: Option<crate::oid::PgCollationOid>,
+    /// `indoption == 0`: ASC NULLS LAST.
+    pub(crate) default_order: bool,
+    /// The exclusion constraint's operator for this column (`conexclop`),
+    /// as written.
+    pub(crate) exclusion_op: Option<Vec<String>>,
+}
+
+/// The key columns of an index as [`IndexKeyColumn`]s, and
+/// `indnullsnotdistinct`.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct IndexKeys {
+    pub(crate) columns: Vec<IndexKeyColumn>,
+    pub(crate) nulls_not_distinct: bool,
+}
+
+/// DefineIndex: the access method must exist and be an index one (a table
+/// AM's handler returns no IndexAmRoutine), and support what the index
+/// asks of it. Returns the built-in AM's capabilities.
+fn check_index_am(
+    db: &PgCatalog,
+    am: &str,
+    unique: bool,
+    include: bool,
+    nkeys: usize,
+    exclusion: bool,
+) -> Result<Option<super::opclass::AmCaps>, DdlError> {
+    let Some(row) = db.pg_am.iter().find(|a| a.amname == am) else {
+        return Err(DdlError::TypeNotFound(format!(
+            "access method \"{am}\" does not exist"
+        )));
+    };
+    if row.amtype == "t" {
+        // GetIndexAmRoutine (amapi.c), an elog.
+        return Err(DdlError::UnsupportedDdl(format!(
+            "index access method handler function {} did not return an IndexAmRoutine struct",
+            row.amhandler.map_or(0, |h| h.get())
+        )));
+    }
+    let caps = super::opclass::am_caps(am);
+    if let Some(caps) = caps.as_ref() {
+        if unique && !caps.can_unique {
+            return Err(DdlError::UnsupportedDdl(format!(
+                "access method \"{am}\" does not support unique indexes"
+            )));
+        }
+        if include && !caps.can_include {
+            return Err(DdlError::UnsupportedDdl(format!(
+                "access method \"{am}\" does not support included columns"
+            )));
+        }
+        if nkeys > 1 && !caps.can_multicol {
+            return Err(DdlError::UnsupportedDdl(format!(
+                "access method \"{am}\" does not support multicolumn indexes"
+            )));
+        }
+        if exclusion && !caps.has_gettuple {
+            return Err(DdlError::UnsupportedDdl(format!(
+                "access method \"{am}\" does not support exclusion constraints"
+            )));
+        }
+    }
+    Ok(caps)
+}
+
+/// ComputeIndexAttrs (indexcmds.c) for one key column of type `typ`
+/// (`None` when unknown): its collation — the COLLATE clause, which must
+/// name an existing collation of a collatable type, else `column_collation`
+/// —, its operator class (ResolveOpClass), its exclusion operator and its
+/// ordering options.
+#[allow(clippy::too_many_arguments)]
+fn compute_key_column(
+    db: &PgCatalog,
+    am: &str,
+    caps: Option<&super::opclass::AmCaps>,
+    elem: Option<&typedpg_pg_query::protobuf::IndexElem>,
+    typ: Option<crate::oid::PgTypeOid>,
+    column_collation: Option<crate::oid::PgCollationOid>,
+    exclusion_op: Option<&[typedpg_pg_query::protobuf::Node]>,
+) -> Result<(IndexKeyColumn, Option<crate::oid::PgOperatorOid>), DdlError> {
+    use typedpg_pg_query::protobuf::{SortByDir, SortByNulls};
+    let mut collation = column_collation;
+    if let Some(names) = elem
+        .map(|e| e.collation.as_slice())
+        .filter(|n| !n.is_empty())
+    {
+        // get_collation_oid(attribute->collation, false).
+        collation = Some(
+            super::tables::partbound::collation_clause(db, names).ok_or_else(|| {
+                let written: Vec<&str> =
+                    names.iter().filter_map(super::util::node_string).collect();
+                DdlError::TypeNotFound(format!(
+                    "collation \"{}\" for encoding \"UTF8\" does not exist",
+                    written.join(".")
+                ))
+            })?,
+        );
+        let collatable = |t: crate::oid::PgTypeOid| {
+            db.pg_type
+                .get(&db.unwrap_domain(t))
+                .is_some_and(|t| t.typcollation.is_some())
+        };
+        if let Some(t) = typ
+            && t != crate::pg_catalog::oid::UNKNOWN
+            && !collatable(t)
+        {
+            return Err(DdlError::Parse(format!(
+                "collations are not supported by type {}",
+                super::util::format_type_for_message(db, t)
+            )));
+        }
+    }
+    let opclass = match typ {
+        Some(t) => super::opclass::resolve_index_opclass(
+            db,
+            elem.map_or(&[][..], |e| e.opclass.as_slice()),
+            t,
+            am,
+        )?,
+        None => None,
+    };
+    let exclusion_op: Option<Vec<String>> = exclusion_op.map(|names| {
+        names
+            .iter()
+            .filter_map(super::util::node_string)
+            .map(str::to_owned)
+            .collect()
+    });
+    let exclusion_opr = match (exclusion_op.as_deref(), typ) {
+        (Some(names), Some(t)) => check_exclusion_operator(db, names, t, opclass.as_ref())?,
+        _ => None,
+    };
+    let (ordering, nulls) = elem.map_or(
+        (
+            SortByDir::SortbyDefault as i32,
+            SortByNulls::SortbyNullsDefault as i32,
+        ),
+        |e| (e.ordering, e.nulls_ordering),
+    );
+    if let Some(caps) = caps
+        && !caps.can_order
+    {
+        if ordering != SortByDir::SortbyDefault as i32 {
+            return Err(DdlError::UnsupportedDdl(format!(
+                "access method \"{am}\" does not support ASC/DESC options"
+            )));
+        }
+        if nulls != SortByNulls::SortbyNullsDefault as i32 {
+            return Err(DdlError::UnsupportedDdl(format!(
+                "access method \"{am}\" does not support NULLS FIRST/LAST options"
+            )));
+        }
+    }
+    // indoption: DESC, and NULLS FIRST (the default under DESC).
+    let desc = ordering == SortByDir::SortbyDesc as i32;
+    let nulls_first = if nulls == SortByNulls::SortbyNullsDefault as i32 {
+        desc
+    } else {
+        nulls == SortByNulls::SortbyNullsFirst as i32
+    };
+    let column = IndexKeyColumn {
+        typ,
+        opclass,
+        collation,
+        default_order: !desc && !nulls_first,
+        exclusion_op,
+    };
+    Ok((column, exclusion_opr))
+}
+
+/// ComputeIndexAttrs: an exclusion constraint's operator must take the
+/// column's type on both sides without run-time coercion
+/// (compatible_oper_opid), be its own commutator, and belong to the column
+/// operator class's family. Returns the operator.
+fn check_exclusion_operator(
+    db: &PgCatalog,
+    names: &[String],
+    typ: crate::oid::PgTypeOid,
+    opclass: Option<&super::opclass::OpclassId>,
+) -> Result<Option<crate::oid::PgOperatorOid>, DdlError> {
+    use crate::lookup::OperatorMatch;
+    let name = names.join(".");
+    let opname = names.last().map(String::as_str).unwrap_or_default();
+    let typname = || super::util::format_type_for_message(db, typ);
+    let found = match db.find_operator_detailed(&name, Some(typ), typ) {
+        OperatorMatch::Found(op) => op,
+        OperatorMatch::NotFound => {
+            return Err(DdlError::TypeNotFound(format!(
+                "operator does not exist: {} {opname} {} (No operator matches the given name \
+                 and argument types. You might need to add explicit type casts.)",
+                typname(),
+                typname()
+            )));
+        }
+        OperatorMatch::Ambiguous => {
+            return Err(DdlError::UnsupportedDdl(format!(
+                "operator is not unique: {} {opname} {}",
+                typname(),
+                typname()
+            )));
+        }
+        OperatorMatch::Error(e) => return Err(DdlError::UnsupportedDdl(e.to_string())),
+    };
+    let opr = found.oid;
+    let declared_ok = |declared: Option<crate::oid::PgTypeOid>| {
+        declared.is_none_or(|d| {
+            d == typ
+                || db.is_binary_coercible(typ, d)
+                || db.is_binary_coercible(db.unwrap_domain(typ), d)
+                || db
+                    .pg_type
+                    .get(&d)
+                    .is_some_and(|t| t.typtype == crate::pg_catalog::TypType::Pseudo)
+        })
+    };
+    // compatible_oper: the operand types must be binary-compatible.
+    let op_row = db.pg_operator.get(&opr);
+    if !declared_ok(op_row.and_then(|o| o.oprleft)) || !declared_ok(op_row.map(|o| o.oprright)) {
+        return Err(DdlError::UnsupportedDdl(format!(
+            "operator requires run-time type coercion: {}",
+            super::opclass::format_operator(db, opr)
+        )));
+    }
+    if op_row.and_then(|o| o.oprcom) != Some(opr) {
+        return Err(DdlError::UnsupportedDdl(format!(
+            "operator {} is not commutative (Only commutative operators can be used in \
+             exclusion constraints.)",
+            super::opclass::format_operator(db, opr)
+        )));
+    }
+    // get_op_opfamily_strategy — skipped for a family none of whose
+    // operators the analyzer could record.
+    if let Some(class) = opclass.and_then(|c| c.get(db))
+        && db.pg_amop.iter().any(|o| {
+            o.amopfamily == class.opcfamily
+                && o.amopfamilynamespace == class.opcfamilynamespace
+                && o.amopmethod == class.opcmethod
+        })
+        && !super::opclass::opfamily_has_operator(db, class, opr)
+    {
+        return Err(DdlError::UnsupportedDdl(format!(
+            "operator {} is not a member of operator family \"{}\" (The exclusion operator \
+             must be related to the index operator class for the constraint.)",
+            super::opclass::format_operator(db, opr),
+            super::opclass::format_opfamily(db, class)
+        )));
+    }
+    Ok(Some(opr))
+}
+
+/// DefineIndex (and transformIndexConstraint's IndexStmt) for the index of
+/// a PRIMARY KEY, UNIQUE or EXCLUDE constraint `c` with key columns
+/// `conkey` (`0` for an EXCLUDE expression) and INCLUDE columns `include`:
+/// the column limit, the access method (btree; GiST for WITHOUT OVERLAPS;
+/// the EXCLUDE's `USING`), its WITH options, then each key column's
+/// collation, operator class, exclusion operator and ordering — and, on a
+/// partitioned table, that an EXCLUDE constraint compares every partition
+/// key column with its equality operator.
+pub(crate) fn define_constraint_index(
+    db: &PgCatalog,
+    relid: PgClassOid,
+    c: &typedpg_pg_query::protobuf::Constraint,
+    conkey: &[i16],
+    include: &[i16],
+    period: bool,
+) -> Result<(String, IndexKeys), DdlError> {
+    use typedpg_pg_query::protobuf::ConstrType;
+    let exclusion = c.contype == ConstrType::ConstrExclusion as i32;
+    let am = if exclusion && !c.access_method.is_empty() {
+        c.access_method.clone()
+    } else if period {
+        "gist".to_owned()
+    } else {
+        "btree".to_owned()
+    };
+    let caps = check_index_am(
+        db,
+        &am,
+        !exclusion && !period,
+        !include.is_empty(),
+        conkey.len(),
+        exclusion,
+    )?;
+    if let Some(index_am) = super::reloptions::IndexAm::from_name(&am) {
+        super::reloptions::check_reloptions(
+            &c.options,
+            super::reloptions::RelOptKind::Index(index_am),
+            false,
+            false,
+        )?;
+    }
+    let attrs = db.attributes_of(relid);
+    let mut columns = Vec::with_capacity(conkey.len());
+    let mut exclusion_oprs = Vec::with_capacity(conkey.len());
+    for (i, &attnum) in conkey.iter().enumerate() {
+        let attr = attrs.iter().find(|a| attnum > 0 && a.attnum == attnum);
+        let (elem, opnames) = if exclusion {
+            match c.exclusions.get(i).and_then(|p| p.node.as_ref()) {
+                Some(node::Node::List(l)) => {
+                    let elem = match l.items.first().and_then(|n| n.node.as_ref()) {
+                        Some(node::Node::IndexElem(e)) => Some(&**e),
+                        _ => None,
+                    };
+                    let ops = match l.items.get(1).and_then(|n| n.node.as_ref()) {
+                        Some(node::Node::List(ops)) => Some(ops.items.as_slice()),
+                        _ => None,
+                    };
+                    (elem, ops)
+                }
+                _ => (None, None),
+            }
+        } else {
+            (None, None)
+        };
+        let typ = match (attr, elem.and_then(|e| e.expr.as_deref())) {
+            (Some(a), _) => Some(a.atttypid),
+            (None, Some(expr)) => {
+                super::expr_kind::check_expr_kind(
+                    db,
+                    expr,
+                    super::expr_kind::ExprKind::IndexExpression,
+                )?;
+                match super::volatile::infer_over_relation(db, relid, expr, None) {
+                    Some(Err(e)) => return Err(DdlError::UnsupportedDdl(e.to_string())),
+                    Some(Ok(t)) => Some(t.type_oid),
+                    None => None,
+                }
+            }
+            (None, None) => None,
+        };
+        let (column, opr) = compute_key_column(
+            db,
+            &am,
+            caps.as_ref(),
+            elem,
+            typ,
+            attr.and_then(|a| a.attcollation),
+            opnames,
+        )?;
+        columns.push(column);
+        exclusion_oprs.push(opr);
+    }
+    if exclusion {
+        check_exclusion_covers_partition_key(db, relid, conkey, &columns, &exclusion_oprs)?;
+    }
+    Ok((
+        am,
+        IndexKeys {
+            columns,
+            nulls_not_distinct: c.nulls_not_distinct,
+        },
+    ))
+}
+
+/// DefineIndex on a partitioned table, for an exclusion constraint: every
+/// partition key column must be a key column, under the key's collation,
+/// compared with the partition key's equality operator.
+fn check_exclusion_covers_partition_key(
+    db: &PgCatalog,
+    relid: PgClassOid,
+    conkey: &[i16],
+    columns: &[IndexKeyColumn],
+    oprs: &[Option<crate::oid::PgOperatorOid>],
+) -> Result<(), DdlError> {
+    let Some(part_key) = db.partition_keys.get(&relid) else {
+        return Ok(());
+    };
+    if part_key.contains(&0) {
+        return Err(DdlError::Parse(
+            "unsupported EXCLUDE constraint with partition key definition".into(),
+        ));
+    }
+    let collations = super::tables::partbound::partition_key_collations(db, relid);
+    let (key_types, key_am) = super::tables::partbound::partition_key_types(db, relid);
+    // BTEqualStrategyNumber / HTEqualStrategyNumber.
+    let eq_strategy = if key_am == "hash" { 1 } else { 3 };
+    let attname = |attnum: i16| {
+        db.attributes_of(relid)
+            .iter()
+            .find(|a| a.attnum == attnum)
+            .map(|a| a.attname.clone())
+            .unwrap_or_default()
+    };
+    for (i, pk) in part_key.iter().enumerate() {
+        let ptkey_eqop = key_types.get(i).and_then(|&t| {
+            let class = super::opclass::default_opclass_id(db, t, key_am)?;
+            super::opclass::opfamily_member(db, class.get(db)?, eq_strategy)
+        });
+        let mut found = false;
+        for (j, k) in conkey.iter().enumerate() {
+            if k != pk || columns[j].collation != collations.get(i).copied().flatten() {
+                continue;
+            }
+            let (Some(opr), Some(eq)) = (oprs[j], ptkey_eqop) else {
+                // Types or operators the analyzer doesn't know: assume it
+                // matches.
+                found = true;
+                break;
+            };
+            if opr == eq {
+                found = true;
+                break;
+            }
+            let opname = db
+                .pg_operator
+                .get(&opr)
+                .map(|o| o.oprname.clone())
+                .unwrap_or_default();
+            return Err(DdlError::UnsupportedDdl(format!(
+                "cannot match partition key to index on column \"{}\" using non-equal operator \
+                 \"{opname}\"",
+                attname(*pk)
+            )));
+        }
+        if !found {
+            return Err(DdlError::UnsupportedDdl(format!(
+                "unique constraint on partitioned table must include all partitioning columns \
+                 (EXCLUDE constraint on table \"{}\" lacks column \"{}\" which is part of the \
+                 partition key.)",
+                db.pg_class
+                    .get(&relid)
+                    .map(|c| c.relname.as_str())
+                    .unwrap_or_default(),
+                attname(*pk)
+            )));
+        }
+    }
     Ok(())
 }
 

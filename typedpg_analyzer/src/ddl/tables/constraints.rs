@@ -23,6 +23,9 @@ pub(crate) fn emit_constraints(
     let attnum_of = |name: &str| attinfo_by_name.get(name).map(|(an, _)| *an);
 
     let mut to_emit: Vec<PendingConstraint> = Vec::new();
+    // The parse node of each `to_emit` entry, for DefineIndex's checks of
+    // the index-backed ones.
+    let mut specs: Vec<&typedpg_pg_query::protobuf::Constraint> = Vec::new();
     // FOREIGN KEYs are resolved only after this table's own PRIMARY KEY /
     // UNIQUE constraints exist, so a self-reference finds them — PG likewise
     // adds FKs after creating the table and its indexes
@@ -66,6 +69,7 @@ pub(crate) fn emit_constraints(
                         include_attnums(interp, relid, c)?.0,
                         false,
                     ));
+                    specs.push(c);
                 }
                 Ok(ConstrType::ConstrUnique) => {
                     to_emit.push((
@@ -85,6 +89,7 @@ pub(crate) fn emit_constraints(
                         include_attnums(interp, relid, c)?.0,
                         false,
                     ));
+                    specs.push(c);
                 }
                 Ok(ConstrType::ConstrCheck) => {
                     to_emit.push((
@@ -112,6 +117,7 @@ pub(crate) fn emit_constraints(
                         include_attnums(interp, relid, c)?.0,
                         false,
                     ));
+                    specs.push(c);
                 }
                 Ok(ConstrType::ConstrForeign) => {
                     pending_fks.push((
@@ -162,6 +168,7 @@ pub(crate) fn emit_constraints(
                     include_attnums(interp, relid, c)?.0,
                     c.without_overlaps,
                 ));
+                specs.push(c);
             }
             Ok(ConstrType::ConstrUnique) if !columns.is_empty() => {
                 check_key_column_list(interp, relid, c, &column_names)?;
@@ -188,6 +195,7 @@ pub(crate) fn emit_constraints(
                     include_attnums(interp, relid, c)?.0,
                     c.without_overlaps,
                 ));
+                specs.push(c);
             }
             Ok(ConstrType::ConstrCheck) => {
                 to_emit.push((
@@ -215,6 +223,7 @@ pub(crate) fn emit_constraints(
                     include_attnums(interp, relid, c)?.0,
                     false,
                 ));
+                specs.push(c);
             }
             Ok(ConstrType::ConstrExclusion) => {
                 let (keys, names) = exclusion_keys(interp, relid, c)?;
@@ -237,6 +246,7 @@ pub(crate) fn emit_constraints(
                     include_attnums(interp, relid, c)?.0,
                     false,
                 ));
+                specs.push(c);
             }
             Ok(ConstrType::ConstrForeign) => {
                 // Table-level FK uses `fk_attrs` for the local columns;
@@ -262,10 +272,10 @@ pub(crate) fn emit_constraints(
     // transformIndexConstraints drops a PRIMARY KEY / UNIQUE spec that
     // repeats an earlier one's key (an unnamed duplicate; a PRIMARY KEY wins
     // over a UNIQUE).
-    let mut kept: Vec<PendingConstraint> = Vec::new();
-    for pending in to_emit {
+    let mut kept: Vec<(PendingConstraint, &typedpg_pg_query::protobuf::Constraint)> = Vec::new();
+    for (pending, spec) in to_emit.into_iter().zip(specs) {
         let index_backed = |t: ConType| matches!(t, ConType::PrimaryKey | ConType::Unique);
-        let dup = kept.iter().position(|k| {
+        let dup = kept.iter().position(|(k, _)| {
             index_backed(k.1)
                 && index_backed(pending.1)
                 && k.2 == pending.2
@@ -273,22 +283,25 @@ pub(crate) fn emit_constraints(
                 && k.8 == pending.8
         });
         match dup {
-            Some(i) if !pending.0.is_explicit() || !kept[i].0.is_explicit() => {
-                if pending.1 == ConType::PrimaryKey && kept[i].1 == ConType::Unique {
-                    kept[i] = pending;
+            Some(i) if !pending.0.is_explicit() || !kept[i].0.0.is_explicit() => {
+                if pending.1 == ConType::PrimaryKey && kept[i].0.1 == ConType::Unique {
+                    kept[i] = (pending, spec);
                 }
             }
-            _ => kept.push(pending),
+            _ => kept.push((pending, spec)),
         }
     }
-    let (checks, indexed): (Vec<_>, Vec<_>) = kept.into_iter().partition(|k| k.1 == ConType::Check);
+    let (checks, indexed): (Vec<_>, Vec<_>) =
+        kept.into_iter().partition(|(k, _)| k.1 == ConType::Check);
     let mut kept = checks;
     let n_checks = kept.len();
     kept.extend(indexed);
     let n_all = kept.len();
     let mut check_names: Vec<String> = Vec::new();
-    for (i, (conname, contype, conkey, confrelid, confkey, check, deferrable, include, period)) in
-        kept.into_iter().enumerate()
+    for (
+        i,
+        ((conname, contype, conkey, confrelid, confkey, check, deferrable, include, period), spec),
+    ) in kept.into_iter().enumerate()
     {
         if i == n_checks {
             record_not_nulls(interp)?;
@@ -308,8 +321,18 @@ pub(crate) fn emit_constraints(
             }
         }
         let oid = emit_constraint_with_backing_index(
-            interp, relid, conname, contype, conkey, confrelid, confkey, deferrable, include,
-            period, false,
+            interp,
+            relid,
+            conname,
+            contype,
+            conkey,
+            confrelid,
+            confkey,
+            deferrable,
+            include,
+            period,
+            false,
+            Some(spec),
         )?;
         if let Some((def, enforced)) = check {
             // CREATE TABLE's constraints are valid unless NOT ENFORCED.
@@ -567,6 +590,10 @@ pub(super) fn fold_constraint_attrs(
 /// both a constraint and an index, sharing one name. Mirror that so DROP
 /// COLUMN / DROP TABLE cascade through `pg_index` and `ON CONFLICT ON
 /// CONSTRAINT name` finds the index by its conname.
+///
+/// `spec` is the constraint as written, whose index DefineIndex checks
+/// ([`crate::ddl::indexes::define_constraint_index`]); `None` for a copy of
+/// an existing constraint (LIKE), whose caller records the index's keys.
 #[allow(clippy::too_many_arguments)] // one field per pg_constraint column
 pub(super) fn emit_constraint_with_backing_index(
     interp: &mut PgCatalog,
@@ -580,7 +607,18 @@ pub(super) fn emit_constraint_with_backing_index(
     include: Vec<i16>,
     period: bool,
     index_only: bool,
+    spec: Option<&typedpg_pg_query::protobuf::Constraint>,
 ) -> Result<PgConstraintOid, DdlError> {
+    let index_backed = matches!(
+        contype,
+        ConType::PrimaryKey | ConType::Unique | ConType::Exclusion
+    );
+    let index_def = match spec {
+        Some(c) if index_backed => Some(crate::ddl::indexes::define_constraint_index(
+            interp, relid, c, &conkey, &include, period,
+        )?),
+        _ => None,
+    };
     if period && contype != ConType::ForeignKey {
         check_without_overlaps_index(interp, relid, &conkey)?;
     }
@@ -703,6 +741,12 @@ pub(super) fn emit_constraint_with_backing_index(
         // clones copy it).
         if deferrable {
             interp.nonimmediate_indexes.insert(indexrelid);
+        }
+        if let Some((am, keys)) = index_def {
+            if am != "btree" {
+                interp.index_access_methods.insert(indexrelid, am);
+            }
+            interp.index_keys.insert(indexrelid, keys);
         }
         if !index_only {
             super::partidx::propagate_new_index(interp, relid, indexrelid)?;
@@ -1307,6 +1351,7 @@ fn add_constraint_node(
             include.clone(),
             false,
             index_only,
+            Some(c),
         )?;
     }
 
@@ -1359,6 +1404,7 @@ fn add_constraint_node(
                 include.clone(),
                 c.without_overlaps,
                 index_only,
+                Some(c),
             )?;
         }
     }
@@ -1414,6 +1460,7 @@ fn add_constraint_node(
                 include.clone(),
                 c.without_overlaps,
                 index_only,
+                Some(c),
             )?;
         }
     }
@@ -1544,15 +1591,15 @@ fn add_index_constraint(
             c.indexname
         )));
     }
+    let unusable = "Cannot create a primary key or unique constraint using such an index.";
     if !index.indisunique {
         return Err(DdlError::Parse(format!(
-            "\"{}\" is not a unique index",
+            "\"{}\" is not a unique index ({unusable})",
             c.indexname
         )));
     }
     let is_primary = c.contype == ConstrType::ConstrPrimary as i32;
     if is_primary {
-        check_no_primary_key(interp, relid)?;
     }
     let conname = if c.conname.is_empty() {
         c.indexname.clone()
@@ -1811,7 +1858,7 @@ pub(crate) fn copy_like_constraints(
                         ),
                     };
                     let nkey = key_columns(&idx).len();
-                    emit_constraint_with_backing_index(
+                    let oid = emit_constraint_with_backing_index(
                         interp,
                         relid,
                         name,
@@ -1825,7 +1872,10 @@ pub(crate) fn copy_like_constraints(
                         indkey[nkey..].to_vec(),
                         period,
                         false,
+                        None,
                     )?;
+                    let conname = interp.pg_constraint.get(&oid).map(|c| c.conname.clone());
+                    copy_index_details(interp, idx.indexrelid, relid, conname.as_deref());
                 }
                 None => {
                     let name = choose_relation_name(interp, nsoid, relname, &addition, "idx");
@@ -1838,15 +1888,49 @@ pub(crate) fn copy_like_constraints(
                         relkind,
                         reltype: None,
                     });
+                    let source = idx.indexrelid;
                     interp.insert_pg_index(PgIndex {
                         indexrelid,
                         indrelid: relid,
                         indkey,
                         ..idx
                     });
+                    copy_index_details_to(interp, source, indexrelid);
                 }
             }
         }
     }
     Ok(())
+}
+
+/// generateClonedIndexStmt: a LIKE copy of an index keeps its access
+/// method and its key columns' operator classes, collations and options.
+fn copy_index_details_to(interp: &mut PgCatalog, source: PgClassOid, index: PgClassOid) {
+    if let Some(am) = interp.index_access_methods.get(&source).cloned() {
+        interp.index_access_methods.insert(index, am);
+    }
+    if let Some(keys) = interp.index_keys.get(&source).cloned() {
+        interp.index_keys.insert(index, keys);
+    }
+}
+
+/// [`copy_index_details_to`] for the index of the constraint `conname` of
+/// `relid`.
+fn copy_index_details(
+    interp: &mut PgCatalog,
+    source: PgClassOid,
+    relid: PgClassOid,
+    conname: Option<&str>,
+) {
+    let Some(conname) = conname else {
+        return;
+    };
+    let index = interp
+        .pg_index
+        .values()
+        .find(|i| i.indrelid == relid && relname_of(interp, i.indexrelid) == conname)
+        .map(|i| i.indexrelid);
+    if let Some(index) = index {
+        copy_index_details_to(interp, source, index);
+    }
 }
