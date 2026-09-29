@@ -1028,3 +1028,33 @@ fn database_qualified_relations_are_cross_database_references() {
         );
     }
 }
+
+/// A VALUES list sees the LATERAL / correlated outer levels, and its star
+/// items are expanded like any expression list (transformExpressionList).
+#[test]
+fn values_rows_see_outer_levels_and_expand_stars() {
+    let db = setup();
+    let s = db
+        .analyze("SELECT * FROM (VALUES (1, 'a')) v(a, b), LATERAL (VALUES (v.*)) w")
+        .unwrap();
+    let names: Vec<&str> = s.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["a", "b", "column1", "column2"]);
+    assert_eq!(s.columns[2].pg_type, int4());
+    assert_eq!(s.columns[3].pg_type, text());
+    let s = db
+        .analyze("SELECT w.x FROM users u, LATERAL (VALUES (u.id), (u.age)) w(x)")
+        .unwrap();
+    assert_cols(&s, vec![cn("x", int8())]);
+    let s = db
+        .analyze(
+            "SELECT id FROM users u WHERE u.age IN (SELECT * FROM (VALUES (1)) q(x)) \
+                  AND u.id IN (VALUES (u.id))",
+        )
+        .unwrap();
+    assert_cols(&s, vec![c("id", int8())]);
+    assert_err_prefix!(
+        db.analyze("SELECT * FROM users u, (VALUES (u.id)) w"),
+        AnalyzeError::UndefinedTable(_),
+        "invalid reference to FROM-clause entry for table \"u\""
+    );
+}

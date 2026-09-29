@@ -137,9 +137,24 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
     // the first row; names default to `column1`/`column2`/… (PG convention)
     // and are typically overridden by a `AS alias(col1, col2)` column list
     // at the RangeSubselect that wraps the VALUES.
+    // The rows see the LATERAL and correlated outer levels like any
+    // expression of this level (`LATERAL (VALUES (v.a))`).
     if !sel.values_lists.is_empty() {
+        let mut values_scope = Scope {
+            ctes: cte_scopes.clone(),
+            ..Scope::default()
+        };
+        values_scope
+            .lateral_sources
+            .extend(lateral_sources.iter().cloned());
+        values_scope
+            .outer_sources
+            .extend(correlated_sources.iter().cloned());
+        values_scope
+            .shadowed_sources
+            .extend(shadowed_sources.iter().cloned());
         return Ok((
-            analyze_values_lists(&sel.values_lists, snapshot, params, &cte_scopes)?,
+            analyze_values_lists(&sel.values_lists, snapshot, params, &values_scope)?,
             None,
         ));
     }

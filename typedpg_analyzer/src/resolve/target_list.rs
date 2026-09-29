@@ -261,50 +261,41 @@ pub(crate) fn analyze_values_lists(
     values_lists: &[protobuf::Node],
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
-    ctes: &HashMap<String, Vec<ScopeColumn>>,
+    scope: &Scope,
 ) -> Result<Vec<RawColumn>, AnalyzeError> {
-    // Each entry in `values_lists` is a `List` of per-column expressions for
-    // one row. An empty VALUES list would be a grammar error in PG, but we
-    // guard anyway for robustness.
-    let first = values_lists
+    let null_ctx = NullabilityContext::default();
+    let ctx = || expr::Ctx::new(scope, &null_ctx, snapshot);
+    // transformValuesClause: each row goes through transformExpressionList,
+    // which expands `rel.*` / `(expr).*` items into one item per column
+    // (`VALUES (v.*)` in a LATERAL subquery).
+    let rows: Vec<Vec<protobuf::Node>> = values_lists
         .iter()
-        .find_map(|n| match n.node.as_ref()? {
-            node::Node::List(l) => Some(l),
+        .filter_map(|n| match n.node.as_ref()? {
+            node::Node::List(l) => {
+                Some(expr::expand_row_args(&l.items, ctx(), params).into_owned())
+            }
             _ => None,
         })
+        .collect();
+    // An empty VALUES list would be a grammar error in PG, but we guard
+    // anyway for robustness.
+    let first = rows
+        .first()
         .ok_or_else(|| AnalyzeError::Unsupported("empty VALUES list".into()))?;
 
-    let arity = first.items.len();
-    let empty_scope = Scope {
-        ctes: ctes.clone(),
-        ..Scope::default()
-    };
-    let empty_null = NullabilityContext::default();
+    let arity = first.len();
 
     let mut column_types: Vec<Vec<PgTypeOid>> = vec![Vec::new(); arity];
     let mut column_typmods: Vec<Vec<Option<i32>>> = vec![Vec::new(); arity];
     let mut column_nullable: Vec<bool> = vec![false; arity];
 
-    for row_node in values_lists {
-        let Some(node::Node::List(row)) = row_node.node.as_ref() else {
-            continue;
-        };
+    for row in &rows {
         // PG (SQLSTATE 42601): every row must have the first row's arity.
-        if row.items.len() != arity {
-            return Err(
-                crate::pgmsg::values_lists_length(arity, row.items.len()).finalize_implicit()
-            );
+        if row.len() != arity {
+            return Err(crate::pgmsg::values_lists_length(arity, row.len()).finalize_implicit());
         }
-        for (i, item) in row.items.iter().enumerate() {
-            if i >= arity {
-                break;
-            }
-            let t = expr::infer_expr(
-                item,
-                expr::Ctx::new(&empty_scope, &empty_null, snapshot),
-                params,
-                TypeGoal::NONE,
-            )?;
+        for (i, item) in row.iter().enumerate() {
+            let t = expr::infer_expr(item, ctx(), params, TypeGoal::NONE)?;
             check_no_srf_in_clause(item, snapshot, "VALUES")?;
             column_types[i].push(t.type_oid);
             column_typmods[i].push(t.typmod);
@@ -323,25 +314,15 @@ pub(crate) fn analyze_values_lists(
     // param to int4 (matching PG's Describe) and string-literal contents
     // get validated. Speculative-walk rules apply: only literal-content
     // rejections propagate.
-    let mut row_idx = 0usize;
-    for row_node in values_lists {
-        let Some(node::Node::List(row)) = row_node.node.as_ref() else {
-            continue;
-        };
-        for (i, item) in row.items.iter().enumerate() {
-            if i >= arity || common[i] == oid::UNKNOWN {
+    for (row_idx, row) in rows.iter().enumerate() {
+        for (i, item) in row.iter().enumerate() {
+            if common[i] == oid::UNKNOWN {
                 continue;
             }
             if column_types[i].get(row_idx) == Some(&oid::UNKNOWN) {
-                expr::coerce_unknown_to(
-                    item,
-                    expr::Ctx::new(&empty_scope, &empty_null, snapshot),
-                    params,
-                    common[i],
-                )?;
+                expr::coerce_unknown_to(item, ctx(), params, common[i])?;
             }
         }
-        row_idx += 1;
     }
 
     let columns = (0..arity)
