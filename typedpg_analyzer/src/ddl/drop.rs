@@ -198,6 +198,12 @@ fn drop_relation(
             "\"{name}\" is not a {requested_kind}"
         )));
     }
+    // RangeVarCallbackForDropRelation.
+    if interp.is_system_class(class_oid) {
+        return Err(DdlError::Parse(format!(
+            "permission denied: \"{name}\" is a system catalog"
+        )));
+    }
     drop_relation_oid(interp, class_oid, &name, kind, cascade, named_relations)
 }
 

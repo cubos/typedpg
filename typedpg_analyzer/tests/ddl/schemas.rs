@@ -245,6 +245,90 @@ fn create_schema_elements_run_grouped_by_kind() {
 }
 
 #[test]
+fn system_schemas_and_catalogs_are_protected() {
+    // PG 18 CreateSchemaCommand / RenameSchema (IsReservedName),
+    // heap_create (no relations in pg_catalog or pg_toast) and the
+    // IsSystemClass checks of ALTER / DROP / TRUNCATE / RENAME.
+    for (stmt, msg) in [
+        (
+            "CREATE SCHEMA pg_foo;",
+            "unacceptable schema name \"pg_foo\"",
+        ),
+        (
+            "CREATE SCHEMA IF NOT EXISTS pg_catalog;",
+            "unacceptable schema name \"pg_catalog\"",
+        ),
+        (
+            "CREATE SCHEMA s; ALTER SCHEMA s RENAME TO pg_x;",
+            "unacceptable schema name \"pg_x\"",
+        ),
+        (
+            "CREATE SCHEMA s; CREATE SCHEMA s2; ALTER SCHEMA s RENAME TO s2;",
+            "schema \"s2\" already exists",
+        ),
+        (
+            "CREATE TABLE pg_catalog.x (a int);",
+            "permission denied to create \"pg_catalog.x\"",
+        ),
+        (
+            "CREATE VIEW pg_catalog.xv AS SELECT 1 AS a;",
+            "permission denied to create \"pg_catalog.xv\"",
+        ),
+        (
+            "CREATE SEQUENCE pg_catalog.xs;",
+            "permission denied to create \"pg_catalog.xs\"",
+        ),
+        (
+            "CREATE TYPE pg_catalog.ct AS (a int);",
+            "permission denied to create \"pg_catalog.ct\"",
+        ),
+        (
+            "CREATE TABLE pg_toast.x (a int);",
+            "permission denied to create \"pg_toast.x\"",
+        ),
+        (
+            "BEGIN; SET LOCAL search_path = pg_catalog; CREATE TABLE t (a int); COMMIT;",
+            "permission denied to create \"pg_catalog.t\"",
+        ),
+        (
+            "SELECT set_config('search_path', 'pg_catalog', false); CREATE TABLE t (a int);",
+            "permission denied to create \"pg_catalog.t\"",
+        ),
+        (
+            "CREATE TABLE pg_catalog.pg_class (a int);",
+            "relation \"pg_class\" already exists",
+        ),
+        (
+            "ALTER TABLE pg_catalog.pg_class ADD COLUMN x int;",
+            "permission denied: \"pg_class\" is a system catalog",
+        ),
+        (
+            "ALTER TABLE pg_catalog.pg_class RENAME TO x;",
+            "permission denied: \"pg_class\" is a system catalog",
+        ),
+        (
+            "DROP TABLE pg_catalog.pg_class;",
+            "permission denied: \"pg_class\" is a system catalog",
+        ),
+        (
+            "TRUNCATE pg_catalog.pg_class;",
+            "permission denied: \"pg_class\" is a system catalog",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int);
+         ALTER TABLE t SET SCHEMA pg_catalog;
+         CREATE TYPE pg_catalog.e AS ENUM ('a');
+         CREATE FUNCTION pg_catalog.zz() RETURNS int LANGUAGE sql AS 'select 1';
+         COMMENT ON TABLE pg_catalog.pg_class IS 'x';",
+    )]);
+}
+
+#[test]
 fn create_schema_errors() {
     // PG 18: 42P06 schema "s" already exists; 42P15 for a mismatched element.
     assert_ddl_err!(

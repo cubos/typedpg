@@ -81,6 +81,14 @@ impl PgCatalog {
             })
     }
 
+    /// IsCatalogNamespace / IsToastNamespace (catalog.c): relations may not
+    /// be created in `pg_catalog` or a TOAST schema (heap_create).
+    pub(crate) fn is_system_namespace(&self, nsoid: PgNamespaceOid) -> bool {
+        self.namespace_name(nsoid).is_some_and(|n| {
+            n == PG_CATALOG_SCHEMA || n == "pg_toast" || n.starts_with("pg_toast_temp_")
+        })
+    }
+
     /// OID of the `pg_catalog` schema (looked up once per call). Returns
     /// `None` only on an empty catalog.
     pub(crate) fn pg_catalog_oid(&self) -> Option<PgNamespaceOid> {

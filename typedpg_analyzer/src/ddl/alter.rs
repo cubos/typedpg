@@ -130,7 +130,7 @@ fn rename_constraint(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), Dd
     // An index-backed constraint renames its index first
     // (RenameRelationInternal), then RenameConstraintById.
     if is_index_backed {
-        crate::ddl::util::check_relation_name_free(interp, nsoid, &stmt.newname)?;
+        crate::ddl::util::check_relation_name_unused(interp, nsoid, &stmt.newname)?;
     }
     check_constraint_name_free(interp, class_oid, &stmt.newname, &relname)?;
     if interp.pg_constraint.get(&target_oid).map(|c| c.contype)
@@ -226,6 +226,13 @@ fn rename_relation(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlE
         Err(_) if stmt.missing_ok => return Ok(()),
         Err(e) => return Err(e),
     };
+    // RangeVarCallbackForAlterRelation.
+    if interp.is_system_class(class_oid) {
+        return Err(DdlError::Parse(format!(
+            "permission denied: \"{}\" is a system catalog",
+            rv.relname
+        )));
+    }
     check_alter_relation_kind(
         interp,
         class_oid,
@@ -237,7 +244,7 @@ fn rename_relation(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlE
     let new_name = stmt.newname.clone();
     // RenameRelationInternal: the new name must be free for the relation
     // and for its row type.
-    crate::ddl::util::check_relation_name_free(interp, nsoid, &new_name)?;
+    crate::ddl::util::check_relation_name_unused(interp, nsoid, &new_name)?;
 
     let class = interp.pg_class.get(&class_oid).cloned();
     interp.rename_pg_class(class_oid, new_name.clone(), nsoid);
@@ -483,6 +490,13 @@ fn rename_schema(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlErr
             "schema \"{old}\" does not exist"
         )));
     };
+    // RenameSchema.
+    if interp.namespace_oid(new).is_some() {
+        return Err(DdlError::DuplicateObject(format!(
+            "schema \"{new}\" already exists"
+        )));
+    }
+    crate::ddl::schema_stmt::check_schema_name(new)?;
 
     interp.rename_pg_namespace(nsoid, new.clone());
     views::rewrite_views_on_schema_rename(interp, old, new);

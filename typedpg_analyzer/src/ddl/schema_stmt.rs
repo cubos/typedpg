@@ -6,6 +6,18 @@ use super::DdlError;
 use super::util::ensure_namespace;
 use crate::pg_catalog::PgCatalog;
 
+/// CreateSchemaCommand / RenameSchema: the `pg_` prefix is reserved for
+/// system schemas (IsReservedName), even for a superuser.
+pub(crate) fn check_schema_name(name: &str) -> Result<(), DdlError> {
+    if name.starts_with("pg_") {
+        return Err(DdlError::Parse(format!(
+            "unacceptable schema name \"{name}\" (The prefix \"pg_\" is reserved for system \
+             schemas.)"
+        )));
+    }
+    Ok(())
+}
+
 /// `CREATE SCHEMA [IF NOT EXISTS] name [AUTHORIZATION role] [elements]`
 /// (`CreateSchemaCommand`, schemacmds.c).
 pub fn create_schema(interp: &mut PgCatalog, stmt: &CreateSchemaStmt) -> Result<(), DdlError> {
@@ -47,6 +59,7 @@ pub fn create_schema(interp: &mut PgCatalog, stmt: &CreateSchemaStmt) -> Result<
     } else {
         stmt.schemaname.clone()
     };
+    check_schema_name(&name)?;
     if interp.namespace_oid(&name).is_some() {
         if stmt.if_not_exists {
             return Ok(());

@@ -559,12 +559,33 @@ pub fn index_name_addition(colnames: &[String]) -> String {
     out
 }
 
-/// `heap_create_with_catalog`'s name checks for a new relation: no relation
-/// of that name may exist in the schema, and neither may a type (every
-/// relation with a row type claims the name in `pg_type` too). An
-/// auto-generated array type is not a conflict — PG renames it out of the
-/// way.
+/// `heap_create_with_catalog`'s checks for a new relation: its name must be
+/// free ([`check_relation_name_unused`]), and the schema not a system one
+/// (heap_create).
 pub fn check_relation_name_free(
+    snapshot: &PgCatalog,
+    nsoid: PgNamespaceOid,
+    name: &str,
+) -> Result<(), DdlError> {
+    check_relation_name_unused(snapshot, nsoid, name)?;
+    // PG prints the name as `"%s.%s"` — unquoted parts, not a quoted
+    // qualified name — so it is rendered the same way here.
+    if snapshot.is_system_namespace(nsoid) {
+        let schema = snapshot.namespace_name(nsoid).unwrap_or_default();
+        return Err(DdlError::Parse(format!(
+            "permission denied to create \"{schema}.{name}\" (System catalog modifications are \
+             currently disallowed.)"
+        )));
+    }
+    Ok(())
+}
+
+/// The name checks for a relation taking `name` in schema `nsoid` (created,
+/// renamed or moved there): no relation of that name may exist in the
+/// schema, and neither may a type (every relation with a row type claims
+/// the name in `pg_type` too). An auto-generated array type is not a
+/// conflict — PG renames it out of the way.
+pub fn check_relation_name_unused(
     snapshot: &PgCatalog,
     nsoid: PgNamespaceOid,
     name: &str,
