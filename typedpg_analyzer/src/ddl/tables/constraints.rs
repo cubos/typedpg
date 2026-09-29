@@ -831,7 +831,7 @@ pub(crate) fn check_unique_covers_partition_key(
         )));
     }
     let part_collations = super::partbound::partition_key_collations(interp, relid);
-    let eq_ops = crate::ddl::indexes::partition_key_eq_operators(interp, relid);
+    let eq_ops = super::partbound::partition_key_eqops(interp, relid);
     let covered = |(i, pk): (usize, &i16)| {
         let collation = part_collations.get(i).copied().flatten();
         let ptkey_eqop = eq_ops.get(i).copied().flatten();

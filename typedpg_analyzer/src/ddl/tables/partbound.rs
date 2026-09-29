@@ -31,6 +31,10 @@ struct PartKey {
     /// The key's collation orders strings by code point, so string values
     /// order without a server.
     code_point_order: bool,
+    /// `partclass`: the operator class (its family's equality operator is
+    /// the key's notion of equality). `None` when the key's type is
+    /// unknown to the analyzer.
+    opclass: Option<crate::oid::PgOpclassOid>,
 }
 
 /// The collation a `COLLATE` clause names.
@@ -62,23 +66,34 @@ pub(crate) fn partition_key_collations(
         .unwrap_or_default()
 }
 
-/// The partition key's column types, and the access method of its
-/// operator classes (`hash` for HASH partitioning, else `btree`).
-pub(crate) fn partition_key_types(
+/// The equality operator of each partition key column (DefineIndex's
+/// `ptkey_eqop`): the COMPARE_EQ member of its operator class's
+/// (`partclass`) family. `None` where the analyzer can't tell.
+pub(crate) fn partition_key_eqops(
     interp: &PgCatalog,
     relid: PgClassOid,
-) -> (Vec<PgTypeOid>, &'static str) {
-    match interp.partition_specs.get(&relid) {
-        Some(s) => (
-            s.keys.iter().map(|k| k.type_oid).collect(),
-            if s.strategy == Strategy::Hash {
-                "hash"
-            } else {
-                "btree"
-            },
-        ),
-        None => (Vec::new(), "btree"),
-    }
+) -> Vec<Option<crate::oid::PgOperatorOid>> {
+    let Some(spec) = interp.partition_specs.get(&relid) else {
+        return Vec::new();
+    };
+    spec.keys
+        .iter()
+        .map(|k| crate::ddl::indexes::index_eq_operator(interp, k.opclass?))
+        .collect()
+}
+
+/// `text_pattern_ops` / `varchar_pattern_ops` compare strings byte by byte
+/// (bttext_pattern_cmp), whatever the collation: code point order for
+/// UTF-8. (`bpchar_pattern_ops` also ignores trailing blanks, which the
+/// string comparison here doesn't model.)
+fn compares_bytes(interp: &PgCatalog, opclass: Option<crate::oid::PgOpclassOid>) -> bool {
+    opclass
+        .and_then(|oid| crate::ddl::opclass::opclass_by_oid(interp, oid))
+        .is_some_and(|c| {
+            c.opcmethod == "btree"
+                && matches!(c.opcname.as_str(), "text_pattern_ops" | "varchar_pattern_ops")
+                && interp.namespace_name(c.opcnamespace) == Some("pg_catalog")
+        })
 }
 
 /// The collations whose order is the strings' code point order: C / POSIX
@@ -151,6 +166,18 @@ pub(super) fn record_partition_spec(
         Ok(Ps::Hash) => Strategy::Hash,
         _ => Strategy::Range,
     };
+    let am = if strategy == Strategy::Hash {
+        "hash"
+    } else {
+        "btree"
+    };
+    // ComputePartitionAttrs: the key's operator class, as written or the
+    // type's default (its errors were reported when the key was checked).
+    let opclass_of = |typ: PgTypeOid, pe: &typedpg_pg_query::protobuf::PartitionElem| {
+        crate::ddl::opclass::resolve_index_opclass(interp, &pe.opclass, typ, am)
+            .ok()
+            .flatten()
+    };
     let mut keys = Vec::new();
     for elem in &spec.part_params {
         let Some(node::Node::PartitionElem(pe)) = elem.node.as_ref() else {
@@ -161,24 +188,31 @@ pub(super) fn record_partition_spec(
         if !pe.name.is_empty() {
             let attr = interp.attribute_by_name(relid, &pe.name);
             let collation = explicit.unwrap_or_else(|| attr.and_then(|a| a.attcollation));
+            let type_oid = attr.map_or(crate::pg_catalog::oid::UNKNOWN, |a| a.atttypid);
+            let opclass = opclass_of(type_oid, pe);
             keys.push(PartKey {
-                type_oid: attr.map_or(crate::pg_catalog::oid::UNKNOWN, |a| a.atttypid),
+                type_oid,
                 name: Some(pe.name.clone()),
                 collation,
-                code_point_order: collation.is_some_and(|c| orders_by_code_point(interp, c)),
+                code_point_order: collation.is_some_and(|c| orders_by_code_point(interp, c))
+                    || compares_bytes(interp, opclass),
+                opclass,
             });
         } else if let Some(expr) = pe.expr.as_deref() {
             let typ = match crate::ddl::volatile::infer_over_relation(interp, relid, expr, None) {
                 Some(Ok(t)) => t.type_oid,
                 _ => crate::pg_catalog::oid::UNKNOWN,
             };
+            let opclass = opclass_of(typ, pe);
             keys.push(PartKey {
                 type_oid: typ,
                 name: None,
                 collation: explicit.flatten(),
                 code_point_order: explicit
                     .flatten()
-                    .is_some_and(|c| orders_by_code_point(interp, c)),
+                    .is_some_and(|c| orders_by_code_point(interp, c))
+                    || compares_bytes(interp, opclass),
+                opclass,
             });
         }
     }
@@ -258,6 +292,7 @@ fn transform_bound(
                 name: None,
                 collation: None,
                 code_point_order: false,
+                opclass: None,
             });
             let mut values: Vec<Option<Datum>> = Vec::new();
             for v in &spec.listdatums {

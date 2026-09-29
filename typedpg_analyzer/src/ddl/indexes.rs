@@ -763,7 +763,7 @@ fn check_exclusion_covers_partition_key(
         ));
     }
     let collations = super::tables::partbound::partition_key_collations(db, relid);
-    let eq_ops = partition_key_eq_operators(db, relid);
+    let eq_ops = super::tables::partbound::partition_key_eqops(db, relid);
     let attname = |attnum: i16| {
         db.attributes_of(relid)
             .iter()
@@ -813,22 +813,6 @@ fn check_exclusion_covers_partition_key(
         }
     }
     Ok(())
-}
-
-/// DefineIndex: each partition key column's equality operator — the
-/// `=` of its (default) btree or hash operator class's family.
-pub(crate) fn partition_key_eq_operators(
-    db: &PgCatalog,
-    relid: PgClassOid,
-) -> Vec<Option<crate::oid::PgOperatorOid>> {
-    let (key_types, key_am) = super::tables::partbound::partition_key_types(db, relid);
-    key_types
-        .iter()
-        .map(|&t| {
-            let class = super::opclass::default_opclass_id(db, t, key_am)?;
-            index_eq_operator(db, class)
-        })
-        .collect()
 }
 
 /// get_opfamily_member_for_cmptype(COMPARE_EQ): the equality operator of

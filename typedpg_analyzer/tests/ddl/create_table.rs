@@ -1440,3 +1440,52 @@ fn partition_bound_values_are_coerced_to_the_key_type() {
         ),
     ]);
 }
+
+#[test]
+fn a_partition_keys_operator_class_is_its_notion_of_equality_and_order() {
+    // ComputePartitionAttrs records the key's operator class (partclass):
+    // DefineIndex requires a unique / primary key / exclusion index on a
+    // partitioned table to use its family's equality operator, and bounds
+    // compare with its comparison (text_pattern_ops: bytes).
+    let setup = "CREATE TYPE c AS (x int);
+                 CREATE TABLE p (a c) PARTITION BY RANGE (a record_image_ops);
+                 CREATE TABLE q (a c) PARTITION BY RANGE (a);
+                 CREATE TABLE r (t text) PARTITION BY RANGE (t text_pattern_ops);
+                 CREATE TABLE r1 PARTITION OF r FOR VALUES FROM ('a') TO ('c');";
+    let uncovered = "unique constraint on partitioned table must include all partitioning columns";
+    for (stmt, msg) in [
+        ("CREATE UNIQUE INDEX ON p (a);", uncovered),
+        ("ALTER TABLE p ADD PRIMARY KEY (a);", uncovered),
+        ("CREATE UNIQUE INDEX ON q (a record_image_ops);", uncovered),
+        (
+            "CREATE TABLE p2 (a c, UNIQUE (a)) PARTITION BY RANGE (a record_image_ops);",
+            uncovered,
+        ),
+        (
+            "ALTER TABLE p ADD CONSTRAINT e EXCLUDE USING btree (a WITH =);",
+            "cannot match partition key to index on column \"a\" using non-equal operator \"=\"",
+        ),
+        (
+            "CREATE TABLE r2 PARTITION OF r FOR VALUES FROM ('b') TO ('d');",
+            "partition \"r2\" would overlap partition \"r1\"",
+        ),
+        (
+            "CREATE TABLE r3 PARTITION OF r FOR VALUES FROM ('e') TO ('d');",
+            "empty range bound specified for partition \"r3\"",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "CREATE UNIQUE INDEX ON p (a record_image_ops);
+             CREATE UNIQUE INDEX ON q (a);
+             CREATE TABLE h (t text) PARTITION BY HASH (t text_pattern_ops);
+             CREATE UNIQUE INDEX ON h (t);
+             CREATE TABLE r4 PARTITION OF r FOR VALUES FROM ('c') TO ('d');",
+        ),
+    ]);
+}
