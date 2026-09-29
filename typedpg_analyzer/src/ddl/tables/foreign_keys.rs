@@ -200,6 +200,19 @@ pub(super) fn add_foreign_key(
     recurse: bool,
 ) -> Result<(), DdlError> {
     let relname = relname_of(interp, relid);
+    // ATExecAddConstraint: an explicit name must be free on the table —
+    // CREATE TABLE's foreign keys are added after its other constraints.
+    if !c.conname.is_empty()
+        && interp
+            .pg_constraint
+            .values()
+            .any(|x| x.conrelid == relid && x.conname == c.conname)
+    {
+        return Err(DdlError::DuplicateObject(format!(
+            "constraint \"{}\" for relation \"{relname}\" already exists",
+            c.conname
+        )));
+    }
     let conname = ConName::from_explicit(&c.conname, default_name).resolve(interp, relid);
 
     // The referenced table.

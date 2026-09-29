@@ -1329,3 +1329,46 @@ fn no_inherit_check_is_rejected_on_partitioned_tables() {
          ALTER TABLE t ADD CHECK (a < 10) NO INHERIT;",
     )]);
 }
+
+#[test]
+fn a_foreign_keys_explicit_name_must_be_free() {
+    // ATExecAddConstraint: CREATE TABLE's foreign keys are added after its
+    // other constraints, and an explicit name must be free on the table —
+    // a CHECK's, a NOT NULL's, a UNIQUE's or another foreign key's.
+    let setup = "CREATE TABLE p (a int PRIMARY KEY);
+                 CREATE TABLE c (a int, CONSTRAINT fk CHECK (a > 0));";
+    for (stmt, table, name) in [
+        (
+            "CREATE TABLE c1 (a int, CONSTRAINT fk FOREIGN KEY (a) REFERENCES p,
+                              CONSTRAINT fk CHECK (a > 0));",
+            "c1",
+            "fk",
+        ),
+        (
+            "CREATE TABLE c2 (a int, CONSTRAINT fk FOREIGN KEY (a) REFERENCES p,
+                              CONSTRAINT fk FOREIGN KEY (a) REFERENCES p);",
+            "c2",
+            "fk",
+        ),
+        (
+            "CREATE TABLE c3 (a int CONSTRAINT nn NOT NULL,
+                              CONSTRAINT nn FOREIGN KEY (a) REFERENCES p);",
+            "c3",
+            "nn",
+        ),
+        (
+            "CREATE TABLE c4 (a int CONSTRAINT u UNIQUE, CONSTRAINT u FOREIGN KEY (a) REFERENCES p);",
+            "c4",
+            "u",
+        ),
+        (
+            "ALTER TABLE c ADD CONSTRAINT fk FOREIGN KEY (a) REFERENCES p;",
+            "c",
+            "fk",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        let msg = format!("constraint \"{name}\" for relation \"{table}\" already exists");
+        assert!(err.to_string().starts_with(&msg), "{stmt}\n  got: {err}");
+    }
+}
