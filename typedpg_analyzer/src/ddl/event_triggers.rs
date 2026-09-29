@@ -1,7 +1,7 @@
 //! Event triggers (event_trigger.c): the event must be known, the
 //! function must exist and return `event_trigger`, and names are unique.
 
-use pg_query::protobuf::{AlterEventTrigStmt, CreateEventTrigStmt};
+use typedpg_pg_query::protobuf::{AlterEventTrigStmt, CreateEventTrigStmt};
 
 use super::DdlError;
 use super::util::node_string;
@@ -82,7 +82,7 @@ pub fn alter_event_trigger(interp: &PgCatalog, stmt: &AlterEventTrigStmt) -> Res
 /// DROP EVENT TRIGGER [IF EXISTS] name.
 pub(crate) fn drop_event_trigger(
     interp: &mut PgCatalog,
-    obj_node: &pg_query::protobuf::Node,
+    obj_node: &typedpg_pg_query::protobuf::Node,
     missing_ok: bool,
 ) -> Result<(), DdlError> {
     let Some(name) = node_string(obj_node).map(str::to_owned) else {
@@ -99,7 +99,7 @@ pub(crate) fn drop_event_trigger(
 /// ALTER EVENT TRIGGER name RENAME TO new.
 pub(crate) fn rename_event_trigger(
     interp: &mut PgCatalog,
-    stmt: &pg_query::protobuf::RenameStmt,
+    stmt: &typedpg_pg_query::protobuf::RenameStmt,
 ) -> Result<(), DdlError> {
     let Some(old) = stmt
         .object

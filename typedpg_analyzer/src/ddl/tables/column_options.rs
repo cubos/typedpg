@@ -185,7 +185,7 @@ fn check_index_statistics_column(
 
 /// `attribute_reloptions`: the only per-column options are the float
 /// `n_distinct` and `n_distinct_inherited`, each at least -1.
-fn check_attribute_options(def: Option<&pg_query::protobuf::Node>) -> Result<(), DdlError> {
+fn check_attribute_options(def: Option<&typedpg_pg_query::protobuf::Node>) -> Result<(), DdlError> {
     let Some(node::Node::List(list)) = def.and_then(|d| d.node.as_ref()) else {
         return Ok(());
     };

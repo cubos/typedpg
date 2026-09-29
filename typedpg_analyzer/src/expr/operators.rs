@@ -232,7 +232,7 @@ fn handle_between(
     Ok(Some(ExprType::scalar(oid::BOOL, nullable)))
 }
 
-/// `a IN (x, y, …)` / `a NOT IN (…)` (pg_query tags NOT IN with op `<>`) —
+/// `a IN (x, y, …)` / `a NOT IN (…)` (typedpg_pg_query tags NOT IN with op `<>`) —
 /// PG's `transformAExprIn`. When more than one list item is free of Vars of
 /// the current query level, PG tries to fold those into one
 /// `a op ANY(ARRAY[…])`: it selects the common type of `a` and those items

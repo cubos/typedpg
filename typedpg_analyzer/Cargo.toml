@@ -20,8 +20,7 @@ pg_sanity = ["dep:postgres", "dep:bytes"]
 
 [dependencies]
 typedpg_core = { path = "../typedpg_core", version = "0.1.0" }
-# Our libpg_query binding, under the name the code has always used.
-pg_query = { package = "typedpg_pg_query", path = "../typedpg_pg_query", version = "0.1.0" }
+typedpg_pg_query = { path = "../typedpg_pg_query", version = "0.1.0" }
 prost = "0.14"
 base64 = "0.23"
 serde = { version = "1", features = ["derive"] }

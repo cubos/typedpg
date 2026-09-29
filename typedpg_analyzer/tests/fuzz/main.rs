@@ -20,7 +20,7 @@
 //!      DISTINCT [ON], …), set operations, CTEs, and DML
 //!      (INSERT/UPDATE/DELETE with RETURNING) — mistypes deliberately allowed,
 //!      and `$pN` parameters threaded through typed contexts;
-//!   2. an **AST mutator** that parses a seed with `pg_query`, tweaks leaf
+//!   2. an **AST mutator** that parses a seed with `typedpg_pg_query`, tweaks leaf
 //!      nodes in the protobuf tree (constants, column refs, operators,
 //!      function names, cast targets), and deparses back to SQL — which keeps
 //!      the output syntactically plausible while perturbing types; and
@@ -65,14 +65,14 @@
 
 use std::collections::BTreeMap;
 
-use pg_query::NodeEnum;
-use pg_query::protobuf::{self, a_const};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use typedpg_analyzer::{
     AnalyzedQuery, Divergence, DivergenceKind, PgCatalog, PgTypeOid, ProKind, QualifiedName,
     TypType, Type,
 };
+use typedpg_pg_query::NodeEnum;
+use typedpg_pg_query::protobuf::{self, a_const};
 
 mod generators;
 mod minimize;
@@ -212,7 +212,7 @@ fn fuzz_analyze_against_pg() {
         );
     }
     // Reusable pool of parseable queries to seed the AST mutator (the static
-    // seeds plus generated ones that round-tripped through pg_query).
+    // seeds plus generated ones that round-tripped through typedpg_pg_query).
     let mut live_seeds: Vec<String> = SEEDS.iter().map(|s| s.to_string()).collect();
     // Pool of queries known to analyze cleanly (Ok, no divergence). The
     // single-fault mode mutates these with exactly one edit, so any resulting
@@ -225,7 +225,7 @@ fn fuzz_analyze_against_pg() {
             let (r, d) = db.analyze_checked(s);
             r.is_ok() && d.is_none()
         })
-        // Pools hold the positional (`$N`) form pg_query can parse.
+        // Pools hold the positional (`$N`) form typedpg_pg_query can parse.
         .map(|s| named_to_positional(s))
         .collect();
 
@@ -253,11 +253,11 @@ fn fuzz_analyze_against_pg() {
             }
         } else if roll < 32 {
             // Template generator (SELECT / set-op / CTE / VALUES / DML).
-            // Pool the *positional* form (`$N`) — pg_query can parse it, so
+            // Pool the *positional* form (`$N`) — typedpg_pg_query can parse it, so
             // parametrized statements feed the mutation pipeline too.
             let q = gen_statement(&mut rng);
             let positional = named_to_positional(&q);
-            if pg_query::parse(&positional).is_ok() && live_seeds.len() < 400 {
+            if typedpg_pg_query::parse(&positional).is_ok() && live_seeds.len() < 400 {
                 live_seeds.push(positional);
             }
             q
@@ -290,12 +290,12 @@ fn fuzz_analyze_against_pg() {
         if let (Ok(q), None) = (&result, &divergence) {
             // Grow the valid-base pool with cleanly-analyzing queries we
             // generate, so single-fault has fresh material beyond the static
-            // seeds. Pool the *positional* (`$N`) form: pg_query parses it,
+            // seeds. Pool the *positional* (`$N`) form: typedpg_pg_query parses it,
             // so parametrized queries join the mutation pipeline — mutating
             // *around* a bare param is exactly the single-fault shape that
             // stresses parameter-type inference.
             let positional = named_to_positional(&sql);
-            if valid_seeds.len() < 400 && pg_query::parse(&positional).is_ok() {
+            if valid_seeds.len() < 400 && typedpg_pg_query::parse(&positional).is_ok() {
                 valid_seeds.push(positional);
             }
             // Metamorphic self-consistency (Strategy 4): a pass-through wrap

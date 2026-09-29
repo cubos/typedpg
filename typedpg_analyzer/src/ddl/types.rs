@@ -1,6 +1,6 @@
 //! CREATE TYPE / CREATE DOMAIN / ALTER TYPE DDL handlers.
 
-use pg_query::protobuf::{
+use typedpg_pg_query::protobuf::{
     AlterEnumStmt, CoercionContext, CompositeTypeStmt, ConstrType, CreateCastStmt,
     CreateDomainStmt, CreateEnumStmt, CreateRangeStmt, DefineStmt, ObjectType, node,
 };
@@ -144,7 +144,7 @@ fn add_domain_constraint(
     interp: &PgCatalog,
     domain: &str,
     base_type: PgTypeOid,
-    c: &pg_query::protobuf::Constraint,
+    c: &typedpg_pg_query::protobuf::Constraint,
     existing: &mut Vec<DomainConstraint>,
 ) -> Result<(), DdlError> {
     let kind = match ConstrType::try_from(c.contype) {
@@ -201,7 +201,7 @@ fn add_domain_constraint(
 fn check_domain_check_expression(
     interp: &PgCatalog,
     base_type: PgTypeOid,
-    expr: &pg_query::protobuf::Node,
+    expr: &typedpg_pg_query::protobuf::Node,
 ) -> Result<(), DdlError> {
     use crate::expr::{TypeGoal, infer_expr};
     use crate::nullability::NullabilityContext;
@@ -258,7 +258,7 @@ fn check_domain_check_expression(
 /// `pg_type.typnotnull`, which every column of the domain reads.
 pub fn alter_domain(
     interp: &mut PgCatalog,
-    stmt: &pg_query::protobuf::AlterDomainStmt,
+    stmt: &typedpg_pg_query::protobuf::AlterDomainStmt,
 ) -> Result<(), DdlError> {
     let parts: Vec<&str> = stmt.type_name.iter().filter_map(node_string).collect();
     let (schema, name) = match parts.as_slice() {
@@ -292,7 +292,7 @@ pub fn alter_domain(
     match stmt.subtype.as_str() {
         // SET NOT NULL / DROP NOT NULL
         "O" => {
-            let nn = pg_query::protobuf::Constraint {
+            let nn = typedpg_pg_query::protobuf::Constraint {
                 contype: ConstrType::ConstrNotnull as i32,
                 ..Default::default()
             };
@@ -835,7 +835,7 @@ pub fn define_type(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), DdlE
 fn record_type_options(
     interp: &mut PgCatalog,
     oid: PgTypeOid,
-    options: &[pg_query::protobuf::Node],
+    options: &[typedpg_pg_query::protobuf::Node],
 ) {
     for opt in options {
         let Some(node::Node::DefElem(de)) = opt.node.as_ref() else {
@@ -889,7 +889,7 @@ fn record_type_options(
 /// (SUBSCRIPT) change anything.
 pub fn alter_type(
     interp: &mut PgCatalog,
-    stmt: &pg_query::protobuf::AlterTypeStmt,
+    stmt: &typedpg_pg_query::protobuf::AlterTypeStmt,
 ) -> Result<(), DdlError> {
     let parts: Vec<&str> = stmt
         .type_name
@@ -957,7 +957,7 @@ pub fn create_cast(interp: &mut PgCatalog, stmt: &CreateCastStmt) -> Result<(), 
     }
     let castfunc = match stmt.func.as_ref() {
         Some(func) => {
-            let object = Some(Box::new(pg_query::protobuf::Node {
+            let object = Some(Box::new(typedpg_pg_query::protobuf::Node {
                 node: Some(node::Node::ObjectWithArgs(func.clone())),
             }));
             let Some((schema, name, arg_oids)) = super::alter::extract_func_target(&object, interp)

@@ -7,7 +7,7 @@
 //! are checked for the relations they name and analyzed with each NEW /
 //! OLD column reference standing in as a typed NULL.
 
-use pg_query::protobuf::{CmdType, RuleStmt, node};
+use typedpg_pg_query::protobuf::{CmdType, RuleStmt, node};
 
 use super::DdlError;
 use crate::oid::PgClassOid;
@@ -64,35 +64,36 @@ pub fn create_rule(interp: &mut PgCatalog, stmt: &RuleStmt) -> Result<(), DdlErr
     };
     // In the WHERE condition the missing one is an invisible range entry
     // (errorMissingRTE); in an action, transformRuleStmt names the event.
-    let pseudo_refs = |n: &pg_query::protobuf::Node, in_qual: bool| -> Result<(), DdlError> {
-        let Some(inner) = n.node.as_ref() else {
-            return Ok(());
-        };
-        for (node, ..) in inner.nodes() {
-            let pg_query::NodeRef::ColumnRef(cr) = node else {
-                continue;
+    let pseudo_refs =
+        |n: &typedpg_pg_query::protobuf::Node, in_qual: bool| -> Result<(), DdlError> {
+            let Some(inner) = n.node.as_ref() else {
+                return Ok(());
             };
-            if cr.fields.len() < 2 {
-                continue;
-            }
-            let missing = match cr.fields.first().and_then(super::util::node_string) {
-                Some("old") if !has_old => ("old", "ON INSERT rule cannot use OLD"),
-                Some("new") if !has_new => ("new", "ON DELETE rule cannot use NEW"),
-                _ => continue,
-            };
-            return Err(DdlError::Parse(if in_qual {
-                format!(
-                    "invalid reference to FROM-clause entry for table \"{}\" (There is an \
+            for (node, ..) in inner.nodes() {
+                let typedpg_pg_query::NodeRef::ColumnRef(cr) = node else {
+                    continue;
+                };
+                if cr.fields.len() < 2 {
+                    continue;
+                }
+                let missing = match cr.fields.first().and_then(super::util::node_string) {
+                    Some("old") if !has_old => ("old", "ON INSERT rule cannot use OLD"),
+                    Some("new") if !has_new => ("new", "ON DELETE rule cannot use NEW"),
+                    _ => continue,
+                };
+                return Err(DdlError::Parse(if in_qual {
+                    format!(
+                        "invalid reference to FROM-clause entry for table \"{}\" (There is an \
                      entry for table \"{}\", but it cannot be referenced from this part of \
                      the query.)",
-                    missing.0, missing.0
-                )
-            } else {
-                missing.1.to_owned()
-            }));
-        }
-        Ok(())
-    };
+                        missing.0, missing.0
+                    )
+                } else {
+                    missing.1.to_owned()
+                }));
+            }
+            Ok(())
+        };
     if let Some(qual) = stmt.where_clause.as_deref() {
         pseudo_refs(qual, true)?;
         check_rule_qual(interp, relid, qual, has_old, has_new)?;
@@ -122,7 +123,7 @@ pub fn create_rule(interp: &mut PgCatalog, stmt: &RuleStmt) -> Result<(), DdlErr
 fn check_rule_qual(
     interp: &PgCatalog,
     relid: PgClassOid,
-    qual: &pg_query::protobuf::Node,
+    qual: &typedpg_pg_query::protobuf::Node,
     has_old: bool,
     has_new: bool,
 ) -> Result<(), DdlError> {
@@ -169,7 +170,7 @@ fn check_rule_qual(
 /// defined by the action don't count.
 fn check_action_relations(
     interp: &PgCatalog,
-    action: &pg_query::protobuf::Node,
+    action: &typedpg_pg_query::protobuf::Node,
 ) -> Result<(), DdlError> {
     let Some(inner) = action.node.as_ref() else {
         return Ok(());
@@ -178,12 +179,12 @@ fn check_action_relations(
     let ctes: Vec<&str> = nodes
         .iter()
         .filter_map(|(n, ..)| match n {
-            pg_query::NodeRef::CommonTableExpr(c) => Some(c.ctename.as_str()),
+            typedpg_pg_query::NodeRef::CommonTableExpr(c) => Some(c.ctename.as_str()),
             _ => None,
         })
         .collect();
     for (n, ..) in &nodes {
-        let pg_query::NodeRef::RangeVar(rv) = n else {
+        let typedpg_pg_query::NodeRef::RangeVar(rv) = n else {
             continue;
         };
         if rv.schemaname.is_empty() && ctes.contains(&rv.relname.as_str()) {
@@ -200,7 +201,7 @@ fn check_action_relations(
 fn check_action_query(
     interp: &PgCatalog,
     relid: PgClassOid,
-    action: &pg_query::protobuf::Node,
+    action: &typedpg_pg_query::protobuf::Node,
     has_old: bool,
     has_new: bool,
 ) -> Result<(), DdlError> {
@@ -237,7 +238,7 @@ fn check_action_query(
 /// `DROP RULE [IF EXISTS] name ON table`.
 pub(crate) fn drop_rule(
     interp: &mut PgCatalog,
-    obj_node: &pg_query::protobuf::Node,
+    obj_node: &typedpg_pg_query::protobuf::Node,
     missing_ok: bool,
 ) -> Result<(), DdlError> {
     let Some(node::Node::List(list)) = obj_node.node.as_ref() else {
@@ -252,7 +253,7 @@ pub(crate) fn drop_rule(
     let Some((name, rel)) = parts.split_last() else {
         return Ok(());
     };
-    let rv = pg_query::protobuf::RangeVar {
+    let rv = typedpg_pg_query::protobuf::RangeVar {
         schemaname: if rel.len() == 2 {
             rel[0].clone()
         } else {
@@ -282,7 +283,7 @@ pub(crate) fn drop_rule(
 /// `ALTER RULE name ON table RENAME TO new` (RenameRewriteRule).
 pub(crate) fn rename_rule(
     interp: &mut PgCatalog,
-    stmt: &pg_query::protobuf::RenameStmt,
+    stmt: &typedpg_pg_query::protobuf::RenameStmt,
 ) -> Result<(), DdlError> {
     let Some(rv) = stmt.relation.as_ref() else {
         return Ok(());

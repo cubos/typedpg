@@ -3,7 +3,7 @@
 //! IMPORT FOREIGN SCHEMA name a server that must exist, and PG keeps the
 //! names unique and the dependencies between them.
 
-use pg_query::protobuf::{
+use typedpg_pg_query::protobuf::{
     CreateFdwStmt, CreateForeignServerStmt, CreateUserMappingStmt, DropUserMappingStmt,
     ImportForeignSchemaStmt, RoleSpec, RoleSpecType, node,
 };
@@ -54,7 +54,7 @@ fn check_fdw(interp: &PgCatalog, name: &str) -> Result<(), DdlError> {
 /// lookup_fdw_validator_func).
 fn check_functions(
     interp: &PgCatalog,
-    options: &[pg_query::protobuf::Node],
+    options: &[typedpg_pg_query::protobuf::Node],
 ) -> Result<(), DdlError> {
     for opt in options {
         let Some(node::Node::DefElem(de)) = opt.node.as_ref() else {
@@ -120,7 +120,7 @@ pub fn create_fdw(interp: &mut PgCatalog, stmt: &CreateFdwStmt) -> Result<(), Dd
 
 pub fn alter_fdw(
     interp: &PgCatalog,
-    stmt: &pg_query::protobuf::AlterFdwStmt,
+    stmt: &typedpg_pg_query::protobuf::AlterFdwStmt,
 ) -> Result<(), DdlError> {
     check_fdw(interp, &stmt.fdwname)?;
     check_functions(interp, &stmt.func_options)
@@ -154,7 +154,7 @@ pub fn create_server(
 
 pub fn alter_server(
     interp: &PgCatalog,
-    stmt: &pg_query::protobuf::AlterForeignServerStmt,
+    stmt: &typedpg_pg_query::protobuf::AlterForeignServerStmt,
 ) -> Result<(), DdlError> {
     check_server(interp, &stmt.servername)
 }
@@ -192,7 +192,7 @@ pub fn create_user_mapping(
 
 pub fn alter_user_mapping(
     interp: &PgCatalog,
-    stmt: &pg_query::protobuf::AlterUserMappingStmt,
+    stmt: &typedpg_pg_query::protobuf::AlterUserMappingStmt,
 ) -> Result<(), DdlError> {
     check_server(interp, &stmt.servername)?;
     let user = role_name(stmt.user.as_ref());
@@ -253,7 +253,7 @@ pub fn import_foreign_schema(
 pub(crate) fn drop_foreign_object(
     interp: &mut PgCatalog,
     wrapper: bool,
-    obj_node: &pg_query::protobuf::Node,
+    obj_node: &typedpg_pg_query::protobuf::Node,
     missing_ok: bool,
     cascade: bool,
 ) -> Result<(), DdlError> {
@@ -324,7 +324,7 @@ pub(crate) fn drop_foreign_object(
 pub(crate) fn rename_foreign_object(
     interp: &mut PgCatalog,
     wrapper: bool,
-    stmt: &pg_query::protobuf::RenameStmt,
+    stmt: &typedpg_pg_query::protobuf::RenameStmt,
 ) -> Result<(), DdlError> {
     let Some(old) = stmt
         .object

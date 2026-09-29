@@ -199,7 +199,7 @@ fn set_operation_sort_and_limit(
             continue;
         };
         if let Some(node::Node::AConst(ac)) = inner.node.as_ref()
-            && let Some(pg_query::protobuf::a_const::Val::Ival(i)) = &ac.val
+            && let Some(typedpg_pg_query::protobuf::a_const::Val::Ival(i)) = &ac.val
         {
             let ord = i.ival as i64;
             if ord < 1 || ord as usize > columns.len() {
@@ -264,7 +264,7 @@ fn arm_unknown_literal(arm: &protobuf::SelectStmt, i: usize) -> Option<&str> {
     };
     match rt.val.as_deref()?.node.as_ref()? {
         node::Node::AConst(ac) if !ac.isnull => match &ac.val {
-            Some(pg_query::protobuf::a_const::Val::Sval(sv)) => Some(sv.sval.as_str()),
+            Some(typedpg_pg_query::protobuf::a_const::Val::Sval(sv)) => Some(sv.sval.as_str()),
             _ => None,
         },
         _ => None,

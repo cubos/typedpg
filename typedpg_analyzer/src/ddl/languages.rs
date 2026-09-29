@@ -2,7 +2,7 @@
 //! transforms name one that must exist; CREATE LANGUAGE ... HANDLER adds
 //! one, and the built-in ones can't be dropped.
 
-use pg_query::protobuf::{CreatePLangStmt, CreateTransformStmt};
+use typedpg_pg_query::protobuf::{CreatePLangStmt, CreateTransformStmt};
 
 use super::DdlError;
 use crate::pg_catalog::PgCatalog;
@@ -61,7 +61,7 @@ pub fn create_language(interp: &mut PgCatalog, stmt: &CreatePLangStmt) -> Result
 /// DROP LANGUAGE [IF EXISTS] name.
 pub(crate) fn drop_language(
     interp: &mut PgCatalog,
-    obj_node: &pg_query::protobuf::Node,
+    obj_node: &typedpg_pg_query::protobuf::Node,
     missing_ok: bool,
 ) -> Result<(), DdlError> {
     let Some(name) = super::util::node_string(obj_node).map(str::to_owned) else {
@@ -98,7 +98,7 @@ pub(crate) fn drop_language(
 /// ALTER LANGUAGE name RENAME TO new.
 pub(crate) fn rename_language(
     interp: &mut PgCatalog,
-    stmt: &pg_query::protobuf::RenameStmt,
+    stmt: &typedpg_pg_query::protobuf::RenameStmt,
 ) -> Result<(), DdlError> {
     let Some(old) = stmt
         .object

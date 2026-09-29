@@ -18,7 +18,7 @@ pub(crate) fn analyze_cte(
         .ok_or_else(|| AnalyzeError::Unsupported("CTE without query".into()))?;
 
     // `WITH RECURSIVE` — the recursive branch references the CTE by name, so
-    // we have to seed the scope before analyzing it. pg_query's AST doesn't
+    // we have to seed the scope before analyzing it. typedpg_pg_query's AST doesn't
     // set `cterecursive` on individual CTEs without full parse analysis, so
     // we rely on the enclosing `WithClause.recursive` flag (true when the
     // user wrote `WITH RECURSIVE`) plus the UNION shape of the inner query.

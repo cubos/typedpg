@@ -1,7 +1,7 @@
 //! DDL interpreter: applies DDL statements to a [`PgCatalog`](crate::PgCatalog)
 //! in memory.
 //!
-//! This module parses SQL migration files using `pg_query` and mutates the
+//! This module parses SQL migration files using `typedpg_pg_query` and mutates the
 //! snapshot as if the DDL had been executed against a real PostgreSQL instance.
 
 mod acl;
@@ -47,7 +47,7 @@ pub(crate) mod volatile;
 #[cfg(any(test, feature = "internal"))]
 pub(crate) use views::serialize_subnode;
 
-use pg_query::protobuf::node;
+use typedpg_pg_query::protobuf::node;
 
 use crate::pg_catalog::PgCatalog;
 
@@ -133,7 +133,7 @@ pub(crate) fn apply_sql_to(db: &mut PgCatalog, sql: &str) -> Result<(), DdlError
 }
 
 fn apply_sql_statements(db: &mut PgCatalog, sql: &str) -> Result<(), DdlError> {
-    let parsed = pg_query::parse(sql).map_err(|e| DdlError::Parse(e.to_string()))?;
+    let parsed = typedpg_pg_query::parse(sql).map_err(|e| DdlError::Parse(e.to_string()))?;
     let tx = txblock::TxContext::of(sql, &parsed.protobuf.stmts);
 
     for raw_stmt in &parsed.protobuf.stmts {
@@ -188,7 +188,7 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
 
         // ── Type definitions (CREATE TYPE name (...)) and casts ─────
         node::Node::DefineStmt(s) => {
-            use pg_query::protobuf::ObjectType;
+            use typedpg_pg_query::protobuf::ObjectType;
             match ObjectType::try_from(s.kind).unwrap_or(ObjectType::Undefined) {
                 ObjectType::ObjectType => types::define_type(db, s),
                 ObjectType::ObjectOperator => operators::define_operator(db, s),

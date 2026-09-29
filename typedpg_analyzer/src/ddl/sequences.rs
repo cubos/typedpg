@@ -7,7 +7,7 @@
 //! relation-drop path with tables and views). RENAME / SET SCHEMA flow
 //! through `ddl/alter.rs`.
 
-use pg_query::protobuf::{AlterSeqStmt, CreateSeqStmt, node};
+use typedpg_pg_query::protobuf::{AlterSeqStmt, CreateSeqStmt, node};
 
 use super::DdlError;
 use super::util::{choose_relation_name, ensure_range_var, node_string, range_var_names};
@@ -89,7 +89,7 @@ pub(crate) fn create_owned_sequence(
     relid: PgClassOid,
     attnum: i16,
     deptype: DepType,
-    options: &[pg_query::protobuf::Node],
+    options: &[typedpg_pg_query::protobuf::Node],
 ) -> Result<(), DdlError> {
     let Some(class) = interp.pg_class.get(&relid).cloned() else {
         return Err(DdlError::Internal(format!("relation oid {relid} missing")));
@@ -124,7 +124,7 @@ pub(crate) fn create_owned_sequence(
         .iter()
         .find(|a| a.attnum == attnum)
         .map_or(oid::INT8, |a| a.atttypid);
-    let sequence_options: Vec<pg_query::protobuf::Node> = options
+    let sequence_options: Vec<typedpg_pg_query::protobuf::Node> = options
         .iter()
         .filter(|o| {
             !matches!(o.node.as_ref(), Some(node::Node::DefElem(de))
@@ -233,7 +233,7 @@ fn owned_sequences_by(
 fn apply_owned_by(
     interp: &mut PgCatalog,
     seq_oid: PgClassOid,
-    opt: &pg_query::protobuf::Node,
+    opt: &typedpg_pg_query::protobuf::Node,
 ) -> Result<(), DdlError> {
     let Some(node::Node::DefElem(de)) = opt.node.as_ref() else {
         return Ok(());

@@ -6,7 +6,7 @@
 //! Grantee roles are not checked: roles live in the cluster, outside what
 //! the migrations build, and are usually created elsewhere.
 
-use pg_query::protobuf::{GrantStmt, GrantTargetType, ObjectType, node};
+use typedpg_pg_query::protobuf::{GrantStmt, GrantTargetType, ObjectType, node};
 
 use super::DdlError;
 use super::util::node_string;
@@ -41,8 +41,8 @@ pub fn grant(interp: &PgCatalog, stmt: &GrantStmt) -> Result<(), DdlError> {
 fn check_object(
     interp: &PgCatalog,
     objtype: ObjectType,
-    obj: &pg_query::protobuf::Node,
-    privileges: &[pg_query::protobuf::Node],
+    obj: &typedpg_pg_query::protobuf::Node,
+    privileges: &[typedpg_pg_query::protobuf::Node],
 ) -> Result<(), DdlError> {
     match (objtype, obj.node.as_ref()) {
         (ObjectType::ObjectTable | ObjectType::ObjectSequence, Some(node::Node::RangeVar(rv))) => {
@@ -82,7 +82,7 @@ fn check_object(
             }
         }
         (ObjectType::ObjectType | ObjectType::ObjectDomain, Some(node::Node::List(l))) => {
-            let tn = pg_query::protobuf::TypeName {
+            let tn = typedpg_pg_query::protobuf::TypeName {
                 names: l.items.clone(),
                 ..Default::default()
             };

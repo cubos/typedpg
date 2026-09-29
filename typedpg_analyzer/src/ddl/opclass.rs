@@ -3,7 +3,7 @@
 //! resolution of index columns (ResolveOpClass / GetDefaultOpClass,
 //! indexcmds.c).
 
-use pg_query::protobuf::{CreateAmStmt, CreateOpClassStmt, CreateOpFamilyStmt, node};
+use typedpg_pg_query::protobuf::{CreateAmStmt, CreateOpClassStmt, CreateOpFamilyStmt, node};
 
 use super::DdlError;
 use super::util::node_string;
@@ -51,7 +51,7 @@ fn am_must_exist(interp: &PgCatalog, amname: &str) -> Result<(), DdlError> {
 }
 
 /// `(schema, name)` of a possibly qualified name list.
-fn split_name(names: &[pg_query::protobuf::Node]) -> (Option<String>, String) {
+fn split_name(names: &[typedpg_pg_query::protobuf::Node]) -> (Option<String>, String) {
     let parts: Vec<&str> = names.iter().filter_map(node_string).collect();
     match parts.as_slice() {
         [schema, name] => (Some((*schema).to_owned()), (*name).to_owned()),
@@ -235,11 +235,11 @@ pub fn create_opclass(interp: &mut PgCatalog, stmt: &CreateOpClassStmt) -> Resul
 /// DROP ACCESS METHOD / OPERATOR CLASS / OPERATOR FAMILY.
 pub(crate) fn drop_am_object(
     interp: &mut PgCatalog,
-    objtype: pg_query::protobuf::ObjectType,
-    obj_node: &pg_query::protobuf::Node,
+    objtype: typedpg_pg_query::protobuf::ObjectType,
+    obj_node: &typedpg_pg_query::protobuf::Node,
     missing_ok: bool,
 ) -> Result<(), DdlError> {
-    use pg_query::protobuf::ObjectType;
+    use typedpg_pg_query::protobuf::ObjectType;
     match objtype {
         ObjectType::ObjectAccessMethod => {
             let Some(name) = node_string(obj_node).map(str::to_owned) else {
@@ -380,7 +380,7 @@ fn default_opclass<'a>(
 /// ResolveOpClass for one index column of type `typ`.
 pub(crate) fn resolve_index_opclass(
     interp: &PgCatalog,
-    opclass: &[pg_query::protobuf::Node],
+    opclass: &[typedpg_pg_query::protobuf::Node],
     typ: PgTypeOid,
     am: &str,
 ) -> Result<(), DdlError> {

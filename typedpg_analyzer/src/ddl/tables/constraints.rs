@@ -26,7 +26,7 @@ pub(crate) fn emit_constraints(
     // (transformFKConstraints queues them as ALTER TABLE ADD CONSTRAINT).
     // `(constraint, local columns, their types, their attnums, default name)`.
     type PendingFk<'a> = (
-        &'a pg_query::protobuf::Constraint,
+        &'a typedpg_pg_query::protobuf::Constraint,
         Vec<String>,
         Vec<PgTypeOid>,
         Vec<i16>,
@@ -35,7 +35,7 @@ pub(crate) fn emit_constraints(
     let mut pending_fks: Vec<PendingFk> = Vec::new();
 
     // Column-level constraints.
-    let column_constraints: Vec<(&pg_query::protobuf::ColumnDef, Vec<_>)> = stmt
+    let column_constraints: Vec<(&typedpg_pg_query::protobuf::ColumnDef, Vec<_>)> = stmt
         .table_elts
         .iter()
         .filter_map(|elt| match elt.node.as_ref() {
@@ -312,7 +312,7 @@ pub(crate) fn emit_constraints(
 fn include_attnums(
     interp: &PgCatalog,
     relid: PgClassOid,
-    c: &pg_query::protobuf::Constraint,
+    c: &typedpg_pg_query::protobuf::Constraint,
 ) -> Result<(Vec<i16>, Vec<String>), DdlError> {
     let mut attnums = Vec::new();
     let mut names = Vec::new();
@@ -334,9 +334,9 @@ fn include_attnums(
 /// separate attribute nodes that apply to the constraint before them; a
 /// lone INITIALLY DEFERRED implies DEFERRABLE.
 pub(super) fn fold_constraint_attrs(
-    constraints: &[pg_query::protobuf::Node],
-) -> Vec<pg_query::protobuf::Constraint> {
-    let mut out: Vec<pg_query::protobuf::Constraint> = Vec::new();
+    constraints: &[typedpg_pg_query::protobuf::Node],
+) -> Vec<typedpg_pg_query::protobuf::Constraint> {
+    let mut out: Vec<typedpg_pg_query::protobuf::Constraint> = Vec::new();
     let mut saw_deferrability = false;
     for n in constraints {
         let Some(node::Node::Constraint(c)) = n.node.as_ref() else {
@@ -518,7 +518,7 @@ pub(crate) fn check_unique_covers_partition_key(
 fn exclusion_keys(
     interp: &PgCatalog,
     relid: PgClassOid,
-    c: &pg_query::protobuf::Constraint,
+    c: &typedpg_pg_query::protobuf::Constraint,
 ) -> Result<(Vec<i16>, Vec<String>), DdlError> {
     let mut attnums = Vec::new();
     let mut names = Vec::new();
@@ -561,7 +561,7 @@ pub(crate) fn persistence(interp: &PgCatalog, relid: PgClassOid) -> char {
 fn check_fk_persistence(
     interp: &PgCatalog,
     relid: PgClassOid,
-    c: &pg_query::protobuf::Constraint,
+    c: &typedpg_pg_query::protobuf::Constraint,
 ) -> Result<(), DdlError> {
     // The referenced table (its errors are resolve_fk_target's to report).
     let Some(target) = c
@@ -598,7 +598,7 @@ fn check_fk_persistence(
 /// - Local and target column types match (after domain unwrapping).
 fn resolve_fk_target(
     interp: &PgCatalog,
-    c: &pg_query::protobuf::Constraint,
+    c: &typedpg_pg_query::protobuf::Constraint,
     relname: &str,
     local_col_names: &[String],
     local_types: &[PgTypeOid],
@@ -874,7 +874,7 @@ pub(crate) fn validate_constraint_expressions(
                         // may not read another generated column.
                         if let Some(inner) = expr.node.as_ref() {
                             for (n, ..) in inner.nodes() {
-                                let pg_query::NodeRef::ColumnRef(cr) = n else {
+                                let typedpg_pg_query::NodeRef::ColumnRef(cr) = n else {
                                     continue;
                                 };
                                 let Some(colname) =
@@ -1128,10 +1128,10 @@ pub(crate) fn add_constraint(
 pub(crate) fn add_column_constraints(
     interp: &mut PgCatalog,
     relid: PgClassOid,
-    cd: &pg_query::protobuf::ColumnDef,
+    cd: &typedpg_pg_query::protobuf::ColumnDef,
 ) -> Result<(), DdlError> {
-    let colname_node = pg_query::protobuf::Node {
-        node: Some(node::Node::String(pg_query::protobuf::String {
+    let colname_node = typedpg_pg_query::protobuf::Node {
+        node: Some(node::Node::String(typedpg_pg_query::protobuf::String {
             sval: cd.colname.clone(),
         })),
     };
@@ -1165,7 +1165,7 @@ pub(crate) fn add_column_constraints(
 fn add_constraint_node(
     interp: &mut PgCatalog,
     relid: PgClassOid,
-    c: &pg_query::protobuf::Constraint,
+    c: &typedpg_pg_query::protobuf::Constraint,
     cmd_name: &str,
     rec: super::inherit::Recursion,
 ) -> Result<(), DdlError> {
@@ -1407,7 +1407,7 @@ fn add_constraint_node(
 fn add_index_constraint(
     interp: &mut PgCatalog,
     relid: PgClassOid,
-    c: &pg_query::protobuf::Constraint,
+    c: &typedpg_pg_query::protobuf::Constraint,
 ) -> Result<(), DdlError> {
     let nsoid = interp
         .pg_class
@@ -1504,7 +1504,7 @@ fn add_index_constraint(
 fn validate_check_expression_for_table(
     interp: &PgCatalog,
     relid: PgClassOid,
-    expr: &pg_query::protobuf::Node,
+    expr: &typedpg_pg_query::protobuf::Node,
 ) -> Result<(), DdlError> {
     use crate::expr::{TypeGoal, infer_expr};
     use crate::nullability::NullabilityContext;

@@ -3,7 +3,7 @@
 //! the relation kind's option table (reloptions.c) and rejects unknown
 //! names, malformed values and out-of-range numbers.
 
-use pg_query::protobuf::node;
+use typedpg_pg_query::protobuf::node;
 
 use super::DdlError;
 
@@ -119,7 +119,7 @@ fn option_type(kind: RelOptKind, namespace: Option<&str>, name: &str) -> Option<
 }
 
 /// defGetString of an option's value; a bare name means "true".
-fn value_string(de: &pg_query::protobuf::DefElem) -> Option<String> {
+fn value_string(de: &typedpg_pg_query::protobuf::DefElem) -> Option<String> {
     Some(match de.arg.as_deref().and_then(|a| a.node.as_ref()) {
         None => "true".to_owned(),
         Some(node::Node::Integer(i)) => i.ival.to_string(),
@@ -225,7 +225,7 @@ fn check_value(name: &str, typ: OptType, value: &str) -> Result<(), DdlError> {
 /// transformRelOptions + the kind's `*_reloptions`: validate a `WITH` /
 /// `SET` list, or the names of a `RESET` list.
 pub(crate) fn check_reloptions(
-    options: &[pg_query::protobuf::Node],
+    options: &[typedpg_pg_query::protobuf::Node],
     kind: RelOptKind,
     reset: bool,
     accept_oids_off: bool,

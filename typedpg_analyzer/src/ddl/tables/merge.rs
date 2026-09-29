@@ -149,7 +149,7 @@ pub(crate) fn assemble_columns(
 /// options can merge into them.
 fn of_type_columns(
     interp: &PgCatalog,
-    tn: &pg_query::protobuf::TypeName,
+    tn: &typedpg_pg_query::protobuf::TypeName,
     entries: &mut Vec<Entry>,
 ) -> Result<(), DdlError> {
     let type_oid = lookup_type_name(tn, interp)?;
@@ -188,7 +188,7 @@ fn of_type_columns(
 /// catalog, so nothing is copied from those.
 fn expand_like(
     interp: &PgCatalog,
-    lc: &pg_query::protobuf::TableLikeClause,
+    lc: &typedpg_pg_query::protobuf::TableLikeClause,
     entries: &mut Vec<Entry>,
     likes: &mut Vec<LikeCopy>,
 ) -> Result<(), DdlError> {
@@ -258,7 +258,7 @@ fn expand_like(
 /// `relation "x" does not exist` when it doesn't.
 fn lookup_relation(
     interp: &PgCatalog,
-    rv: &pg_query::protobuf::RangeVar,
+    rv: &typedpg_pg_query::protobuf::RangeVar,
 ) -> Result<PgClassOid, DdlError> {
     let (schema, name) = range_var_names(rv, interp);
     interp

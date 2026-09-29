@@ -27,8 +27,8 @@ impl CallNotation {
     /// Read `fc`'s notation, enforcing PG's parse-time rules on named
     /// arguments (`ParseFuncOrColumn`): a name may be used only once, and no
     /// positional argument may follow a named one.
-    pub(crate) fn of(fc: &pg_query::protobuf::FuncCall) -> Result<Self, AnalyzeError> {
-        use pg_query::protobuf::node::Node;
+    pub(crate) fn of(fc: &typedpg_pg_query::protobuf::FuncCall) -> Result<Self, AnalyzeError> {
+        use typedpg_pg_query::protobuf::node::Node;
         let mut names: Vec<String> = Vec::new();
         for arg in &fc.args {
             let span = || {
@@ -62,9 +62,13 @@ impl CallNotation {
 
 /// The value expression of a call argument — the `x` of a named argument
 /// `a => x`, the node itself otherwise.
-pub(crate) fn call_arg_value(arg: &pg_query::protobuf::Node) -> &pg_query::protobuf::Node {
+pub(crate) fn call_arg_value(
+    arg: &typedpg_pg_query::protobuf::Node,
+) -> &typedpg_pg_query::protobuf::Node {
     match arg.node.as_ref() {
-        Some(pg_query::protobuf::node::Node::NamedArgExpr(na)) => na.arg.as_deref().unwrap_or(arg),
+        Some(typedpg_pg_query::protobuf::node::Node::NamedArgExpr(na)) => {
+            na.arg.as_deref().unwrap_or(arg)
+        }
         _ => arg,
     }
 }

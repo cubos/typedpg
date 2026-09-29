@@ -314,7 +314,7 @@ pub(crate) struct SourceSpan {
 ///
 /// `sql_original` is the SQL exactly as the user wrote it (what shows up in
 /// the snippet); `lex_output` maps post-lex byte offsets (what
-/// `pg_query`/AST `location` fields refer to) back to the original.
+/// `typedpg_pg_query`/AST `location` fields refer to) back to the original.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DiagContext<'a> {
     pub sql_original: &'a str,
@@ -445,7 +445,7 @@ impl SourceSpan {
         Self::new(start, start + 1)
     }
 
-    /// Convert a `pg_query` AST `location` (i32; -1 means absent) into a
+    /// Convert a `typedpg_pg_query` AST `location` (i32; -1 means absent) into a
     /// caret-only span. Returns `None` when the location is unset.
     pub(crate) fn from_location(location: i32) -> Option<Self> {
         if location < 0 {
@@ -494,9 +494,9 @@ impl SourceSpan {
 
 /// Extract the `location` byte offset (post-lex SQL) from any AST node
 /// variant that carries one. Returns `None` for nodes without location
-/// info (e.g. `BoolExpr` — `pg_query` doesn't track its position).
-pub(crate) fn node_location(node: &pg_query::protobuf::Node) -> Option<i32> {
-    use pg_query::protobuf::node::Node;
+/// info (e.g. `BoolExpr` — `typedpg_pg_query` doesn't track its position).
+pub(crate) fn node_location(node: &typedpg_pg_query::protobuf::Node) -> Option<i32> {
+    use typedpg_pg_query::protobuf::node::Node;
     let inner = node.node.as_ref()?;
     let loc = match inner {
         Node::ColumnRef(n) => n.location,
@@ -854,7 +854,7 @@ impl RawError {
         }
     }
 
-    /// Build a `Parse` raw error (from `pg_query`).
+    /// Build a `Parse` raw error (from `typedpg_pg_query`).
     #[allow(dead_code)] // infra reserved for variants not yet migrated
     pub(crate) fn parse(message: String, span: Option<SourceSpan>) -> Self {
         let primary = span.map(|s| DiagnosticLabel::new(s, ""));

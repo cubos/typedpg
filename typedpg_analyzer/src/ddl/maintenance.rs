@@ -3,7 +3,7 @@
 //! SECURITY LABEL, ALTER DEFAULT PRIVILEGES — but that PG runs against
 //! named objects which must exist and suit the command.
 
-use pg_query::protobuf::{
+use typedpg_pg_query::protobuf::{
     ClusterStmt, DropBehavior, LockStmt, ReindexObjectType, ReindexStmt, SecLabelStmt,
     TruncateStmt, VacuumStmt, node,
 };
@@ -80,7 +80,7 @@ pub fn truncate(interp: &PgCatalog, stmt: &TruncateStmt) -> Result<(), DdlError>
 /// RangeVarCallbackMaintainsTable: tables and materialized views.
 fn maintained_table(
     interp: &PgCatalog,
-    rv: &pg_query::protobuf::RangeVar,
+    rv: &typedpg_pg_query::protobuf::RangeVar,
 ) -> Result<PgClassOid, DdlError> {
     let (_, relid) = super::util::lookup_relation(interp, rv)?;
     if !matches!(
@@ -226,7 +226,7 @@ pub fn security_label(stmt: &SecLabelStmt) -> Result<(), DdlError> {
 /// ALTER DEFAULT PRIVILEGES IN SCHEMA s ... : the schemas must exist.
 pub fn alter_default_privileges(
     interp: &PgCatalog,
-    stmt: &pg_query::protobuf::AlterDefaultPrivilegesStmt,
+    stmt: &typedpg_pg_query::protobuf::AlterDefaultPrivilegesStmt,
 ) -> Result<(), DdlError> {
     for opt in &stmt.options {
         let Some(node::Node::DefElem(de)) = opt.node.as_ref() else {
@@ -253,7 +253,10 @@ pub fn alter_default_privileges(
 /// options must be known, the relation must suit the direction and the
 /// column list name its columns once; COPY (query) TO analyzes the query.
 /// The data itself (files, STDIN) isn't modeled.
-pub fn copy(interp: &PgCatalog, stmt: &pg_query::protobuf::CopyStmt) -> Result<(), DdlError> {
+pub fn copy(
+    interp: &PgCatalog,
+    stmt: &typedpg_pg_query::protobuf::CopyStmt,
+) -> Result<(), DdlError> {
     const OPTIONS: &[&str] = &[
         "format",
         "freeze",

@@ -1,6 +1,6 @@
 //! DROP statement handler.
 
-use pg_query::protobuf::{DropBehavior, DropStmt, ObjectType, node};
+use typedpg_pg_query::protobuf::{DropBehavior, DropStmt, ObjectType, node};
 
 use super::DdlError;
 use super::util::{extract_names, format_type_for_message, node_string, resolve_type_name};
@@ -105,7 +105,7 @@ pub fn drop_objects(interp: &mut PgCatalog, stmt: &DropStmt) -> Result<(), DdlEr
 
 fn drop_relation(
     interp: &mut PgCatalog,
-    obj_node: &pg_query::protobuf::Node,
+    obj_node: &typedpg_pg_query::protobuf::Node,
     missing_ok: bool,
     cascade: bool,
     requested: ObjectType,
@@ -401,7 +401,7 @@ pub(crate) fn drop_relation_by_oid(interp: &mut PgCatalog, class_oid: PgClassOid
 /// `CREATE UNIQUE INDEX` may have synthesized for ON CONFLICT matching.
 fn drop_index(
     interp: &mut PgCatalog,
-    obj_node: &pg_query::protobuf::Node,
+    obj_node: &typedpg_pg_query::protobuf::Node,
     missing_ok: bool,
 ) -> Result<(), DdlError> {
     let names = match obj_node.node.as_ref() {
@@ -498,11 +498,11 @@ fn drop_index(
 
 fn drop_type(
     interp: &mut PgCatalog,
-    obj_node: &pg_query::protobuf::Node,
+    obj_node: &typedpg_pg_query::protobuf::Node,
     missing_ok: bool,
     cascade: bool,
 ) -> Result<(), DdlError> {
-    let names: &[pg_query::protobuf::Node] = match obj_node.node.as_ref() {
+    let names: &[typedpg_pg_query::protobuf::Node] = match obj_node.node.as_ref() {
         Some(node::Node::TypeName(tn)) => &tn.names,
         Some(node::Node::List(list)) => &list.items,
         _ => return Ok(()),
@@ -638,7 +638,7 @@ fn drop_type(
 
 fn drop_extension(
     interp: &mut PgCatalog,
-    obj_node: &pg_query::protobuf::Node,
+    obj_node: &typedpg_pg_query::protobuf::Node,
     missing_ok: bool,
     _cascade: bool,
 ) -> Result<(), DdlError> {
@@ -707,7 +707,7 @@ fn drop_extension(
 /// `DROP FUNCTION` / `DROP PROCEDURE`.
 fn drop_function(
     interp: &mut PgCatalog,
-    obj_node: &pg_query::protobuf::Node,
+    obj_node: &typedpg_pg_query::protobuf::Node,
     missing_ok: bool,
     cascade: bool,
     expected_kind: ObjectType,
@@ -910,7 +910,7 @@ fn find_proc(
 /// DROP AGGREGATE.
 fn drop_aggregate(
     interp: &mut PgCatalog,
-    obj_node: &pg_query::protobuf::Node,
+    obj_node: &typedpg_pg_query::protobuf::Node,
     missing_ok: bool,
     cascade: bool,
 ) -> Result<(), DdlError> {
@@ -979,7 +979,7 @@ fn drop_aggregate(
 /// DROP OPERATOR name(lefttype, righttype).
 fn drop_operator(
     interp: &mut PgCatalog,
-    obj_node: &pg_query::protobuf::Node,
+    obj_node: &typedpg_pg_query::protobuf::Node,
     missing_ok: bool,
 ) -> Result<(), DdlError> {
     let Some(node::Node::ObjectWithArgs(owa)) = obj_node.node.as_ref() else {
@@ -1062,10 +1062,10 @@ pub(crate) fn find_operator(
 /// `DROP OPERATOR`. A `TypeName` with an empty `names` list stands for
 /// `NONE`, indicating a prefix operator (no left operand).
 fn parse_operator_arg_types(
-    objargs: &[pg_query::protobuf::Node],
+    objargs: &[typedpg_pg_query::protobuf::Node],
     snapshot: &PgCatalog,
 ) -> (Option<PgTypeOid>, Option<PgTypeOid>) {
-    let resolve = |n: &pg_query::protobuf::Node| -> Option<PgTypeOid> {
+    let resolve = |n: &typedpg_pg_query::protobuf::Node| -> Option<PgTypeOid> {
         if let Some(node::Node::TypeName(tn)) = n.node.as_ref() {
             if tn.names.is_empty() {
                 return None;
@@ -1085,7 +1085,7 @@ fn parse_operator_arg_types(
 /// DROP CAST (source AS target).
 fn drop_cast(
     interp: &mut PgCatalog,
-    obj_node: &pg_query::protobuf::Node,
+    obj_node: &typedpg_pg_query::protobuf::Node,
     missing_ok: bool,
 ) -> Result<(), DdlError> {
     let items = match obj_node.node.as_ref() {
@@ -1143,7 +1143,7 @@ fn format_arg_oids(oids: &[PgTypeOid], snapshot: &PgCatalog) -> String {
 /// DROP SCHEMA name [CASCADE | RESTRICT].
 fn drop_schema(
     interp: &mut PgCatalog,
-    obj_node: &pg_query::protobuf::Node,
+    obj_node: &typedpg_pg_query::protobuf::Node,
     missing_ok: bool,
     cascade: bool,
 ) -> Result<(), DdlError> {

@@ -7,8 +7,8 @@ use super::*;
 /// Candidate reductions of `sql` produced by structural edits to the parsed
 /// SELECT (drop a projection, drop a clause, unwrap a binary expr).
 pub(crate) fn reductions(sql: &str) -> Vec<String> {
-    // `sql` is in the analyzer's named form; pg_query needs positional.
-    let Ok(parsed) = pg_query::parse(&named_to_positional(sql)) else {
+    // `sql` is in the analyzer's named form; typedpg_pg_query needs positional.
+    let Ok(parsed) = typedpg_pg_query::parse(&named_to_positional(sql)) else {
         return Vec::new();
     };
     // The wrapper `ParseResult` isn't `Clone`, but the inner protobuf message
@@ -27,7 +27,7 @@ pub(crate) fn reductions(sql: &str) -> Vec<String> {
             } else {
                 return None;
             }
-            pg_query::deparse(&clone)
+            typedpg_pg_query::deparse(&clone)
                 .ok()
                 .map(|s| positional_to_named(&s))
         };

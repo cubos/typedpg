@@ -6,7 +6,7 @@
 //! STYPE (state type), mirroring how PostgreSQL resolves aggregate result
 //! types.
 
-use pg_query::protobuf::{DefineStmt, FunctionParameterMode, node};
+use typedpg_pg_query::protobuf::{DefineStmt, FunctionParameterMode, node};
 
 use crate::oid::{PgProcOid, PgTypeOid};
 use crate::pg_catalog::{AggKind, PgAggregate, PgProc, ProKind};
@@ -26,7 +26,7 @@ pub fn define_aggregate(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(),
     // Parallel to `arg_types`; `""` for an unnamed argument.
     let mut arg_names: Vec<String> = Vec::new();
     let mut variadic_oid: Option<PgTypeOid> = None;
-    let arg_nodes: Vec<&pg_query::protobuf::Node> = if stmt.args.len() == 2
+    let arg_nodes: Vec<&typedpg_pg_query::protobuf::Node> = if stmt.args.len() == 2
         && let Some(node::Node::List(list)) = stmt.args[0].node.as_ref()
     {
         list.items.iter().collect()
@@ -178,7 +178,7 @@ pub fn define_aggregate(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(),
 }
 
 /// Parse a function name from a DefElem argument.
-fn parse_func_name(arg: &pg_query::protobuf::Node) -> Option<(Option<String>, String)> {
+fn parse_func_name(arg: &typedpg_pg_query::protobuf::Node) -> Option<(Option<String>, String)> {
     let parts: Vec<&str> = match arg.node.as_ref()? {
         node::Node::TypeName(tn) => tn
             .names

@@ -10,7 +10,7 @@
 //! overlap as far as the analyzer can tell.
 
 use super::*;
-use pg_query::protobuf::PartitionBoundSpec;
+use typedpg_pg_query::protobuf::PartitionBoundSpec;
 
 /// A partitioned table's strategy and key (`pg_partitioned_table`).
 #[derive(Clone, Debug)]
@@ -68,9 +68,9 @@ pub(crate) enum Bound {
 pub(super) fn record_partition_spec(
     interp: &mut PgCatalog,
     relid: PgClassOid,
-    spec: &pg_query::protobuf::PartitionSpec,
+    spec: &typedpg_pg_query::protobuf::PartitionSpec,
 ) {
-    use pg_query::protobuf::PartitionStrategy as Ps;
+    use typedpg_pg_query::protobuf::PartitionStrategy as Ps;
     let strategy = match Ps::try_from(spec.strategy) {
         Ok(Ps::List) => Strategy::List,
         Ok(Ps::Hash) => Strategy::Hash,
@@ -204,7 +204,7 @@ fn transform_bound(
 /// transformPartitionRangeBounds + validateInfiniteBounds.
 fn range_datums(
     interp: &PgCatalog,
-    values: &[pg_query::protobuf::Node],
+    values: &[typedpg_pg_query::protobuf::Node],
     keys: &[(PgTypeOid, Option<String>)],
 ) -> Result<Vec<RangeDatum>, DdlError> {
     let mut out = Vec::new();
@@ -259,7 +259,7 @@ fn range_datums(
 /// type. `None` is NULL.
 fn bound_value(
     interp: &PgCatalog,
-    v: &pg_query::protobuf::Node,
+    v: &typedpg_pg_query::protobuf::Node,
     (key_type, key_name): &(PgTypeOid, Option<String>),
 ) -> Result<Option<Datum>, DdlError> {
     use crate::coerce::{CoercionContext, coercion_pathway};
@@ -271,7 +271,7 @@ fn bound_value(
             || inner
                 .nodes()
                 .into_iter()
-                .any(|(n, ..)| matches!(n, pg_query::NodeRef::ColumnRef(_))))
+                .any(|(n, ..)| matches!(n, typedpg_pg_query::NodeRef::ColumnRef(_))))
     {
         return Err(DdlError::Parse(
             "cannot use column reference in partition bound expression".into(),
@@ -318,7 +318,11 @@ fn bound_value(
 }
 
 /// The comparable form of a bound constant.
-fn normalize(interp: &PgCatalog, v: &pg_query::protobuf::Node, key_type: PgTypeOid) -> Datum {
+fn normalize(
+    interp: &PgCatalog,
+    v: &typedpg_pg_query::protobuf::Node,
+    key_type: PgTypeOid,
+) -> Datum {
     use crate::pg_catalog::oid;
     let key = interp.unwrap_domain(key_type);
     let integer_key = [oid::INT2, oid::INT4, oid::INT8].contains(&key);
@@ -338,7 +342,7 @@ fn normalize(interp: &PgCatalog, v: &pg_query::protobuf::Node, key_type: PgTypeO
     if integer_key && let Some(i) = fold_integer(v) {
         return Datum::Int(i);
     }
-    use pg_query::protobuf::a_const::Val;
+    use typedpg_pg_query::protobuf::a_const::Val;
     match literal {
         Some(Val::Ival(i)) if integer_key => Datum::Int(i128::from(i.ival)),
         Some(Val::Sval(s)) if integer_key => s
@@ -359,15 +363,15 @@ fn normalize(interp: &PgCatalog, v: &pg_query::protobuf::Node, key_type: PgTypeO
 
 /// Evaluate an integer constant expression of `+`, `-`, `*` over integer
 /// literals (evaluate_expr for the common case).
-fn fold_integer(v: &pg_query::protobuf::Node) -> Option<i128> {
-    use pg_query::protobuf::a_const::Val;
+fn fold_integer(v: &typedpg_pg_query::protobuf::Node) -> Option<i128> {
+    use typedpg_pg_query::protobuf::a_const::Val;
     match v.node.as_ref()? {
         node::Node::AConst(c) => match c.val.as_ref()? {
             Val::Ival(i) => Some(i128::from(i.ival)),
             Val::Fval(f) if !f.fval.contains(['.', 'e', 'E']) => f.fval.parse().ok(),
             _ => None,
         },
-        node::Node::AExpr(e) if e.kind == pg_query::protobuf::AExprKind::AexprOp as i32 => {
+        node::Node::AExpr(e) if e.kind == typedpg_pg_query::protobuf::AExprKind::AexprOp as i32 => {
             let op = e.name.first().and_then(super::super::util::node_string)?;
             let r = fold_integer(e.rexpr.as_deref()?)?;
             match e.lexpr.as_deref() {

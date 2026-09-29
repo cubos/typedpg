@@ -16,7 +16,7 @@ fn is_partition(interp: &PgCatalog, relid: PgClassOid) -> bool {
     })
 }
 
-fn parent_rangevar(cmd: &AlterTableCmd) -> Option<&pg_query::protobuf::RangeVar> {
+fn parent_rangevar(cmd: &AlterTableCmd) -> Option<&typedpg_pg_query::protobuf::RangeVar> {
     match cmd.def.as_deref().and_then(|d| d.node.as_ref()) {
         Some(node::Node::RangeVar(rv)) => Some(rv),
         _ => None,

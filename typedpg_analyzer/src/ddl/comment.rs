@@ -3,7 +3,7 @@
 //! (`get_object_address`), so a migration naming something that doesn't
 //! exist fails.
 
-use pg_query::protobuf::{CommentStmt, ObjectType, node};
+use typedpg_pg_query::protobuf::{CommentStmt, ObjectType, node};
 
 use super::DdlError;
 use super::util::node_string;
@@ -22,7 +22,7 @@ pub fn comment_on(interp: &PgCatalog, stmt: &CommentStmt) -> Result<(), DdlError
 /// build.
 pub fn alter_owner(
     interp: &PgCatalog,
-    stmt: &pg_query::protobuf::AlterOwnerStmt,
+    stmt: &typedpg_pg_query::protobuf::AlterOwnerStmt,
 ) -> Result<(), DdlError> {
     let objtype = ObjectType::try_from(stmt.object_type).unwrap_or(ObjectType::Undefined);
     if let Some(rv) = stmt.relation.as_ref() {
@@ -36,7 +36,7 @@ pub fn alter_owner(
     if let (ObjectType::ObjectType | ObjectType::ObjectDomain, node::Node::List(l)) =
         (objtype, object)
     {
-        let tn = pg_query::protobuf::TypeName {
+        let tn = typedpg_pg_query::protobuf::TypeName {
             names: l.items.clone(),
             ..Default::default()
         };
@@ -168,7 +168,7 @@ pub(crate) fn resolve_object(
         | ObjectType::ObjectRoutine
         | ObjectType::ObjectAggregate => {
             let unspecified = matches!(object, node::Node::ObjectWithArgs(o) if o.args_unspecified);
-            let object = Some(Box::new(pg_query::protobuf::Node {
+            let object = Some(Box::new(typedpg_pg_query::protobuf::Node {
                 node: Some(object.clone()),
             }));
             let Some((schema, name, arg_oids)) = super::alter::extract_func_target(&object, interp)

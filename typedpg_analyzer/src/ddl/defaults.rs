@@ -5,7 +5,7 @@
 //! subqueries, aggregates and window functions, and must then be coercible
 //! to the column's type under assignment rules.
 
-use pg_query::protobuf::{self, node};
+use typedpg_pg_query::protobuf::{self, node};
 
 use super::DdlError;
 use crate::coerce::{CoercionContext, can_coerce};
@@ -320,7 +320,7 @@ fn collect_sequence_refs(
 fn regclass_literal(node: &protobuf::Node) -> Option<&str> {
     match node.node.as_ref()? {
         node::Node::AConst(c) => match c.val.as_ref()? {
-            pg_query::protobuf::a_const::Val::Sval(s) => Some(s.sval.as_str()),
+            typedpg_pg_query::protobuf::a_const::Val::Sval(s) => Some(s.sval.as_str()),
             _ => None,
         },
         node::Node::TypeCast(tc) => regclass_literal(tc.arg.as_deref()?),

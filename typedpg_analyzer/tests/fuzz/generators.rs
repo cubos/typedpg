@@ -228,7 +228,7 @@ pub(crate) fn lit_or_param(ty: Ty, rng: &mut StdRng, np: &mut u32) -> String {
 }
 
 /// Convert the fuzzer's named placeholders (`$pN`, the form the analyzer
-/// accepts) into PG-native positional ones (`$N`) so `pg_query` can parse
+/// accepts) into PG-native positional ones (`$N`) so `typedpg_pg_query` can parse
 /// the statement — the mutation/minimization pipeline operates on the
 /// positional form. Quote-aware enough for fuzzer-generated SQL.
 pub(crate) fn named_to_positional(sql: &str) -> String {

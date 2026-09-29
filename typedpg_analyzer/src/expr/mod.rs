@@ -1,6 +1,6 @@
 //! Expression type inference.
 //!
-//! Walks pg_query AST expression nodes and infers their type (OID) and
+//! Walks typedpg_pg_query AST expression nodes and infers their type (OID) and
 //! nullability based on the schema snapshot and current scope.
 //!
 //! Every expression evaluation receives a [`TypeGoal`] describing the type
@@ -11,7 +11,7 @@
 //! compatibility check verifies that the result type can be coerced to the
 //! goal under the allowed coercion context.
 
-use pg_query::protobuf::{self, a_const, node};
+use typedpg_pg_query::protobuf::{self, a_const, node};
 
 use crate::coerce::{self, CoercionContext, can_coerce};
 use crate::error::AnalyzeError;
@@ -689,7 +689,7 @@ pub(crate) fn infer_expr(
         }
         node::Node::MinMaxExpr(mm) => {
             // `GREATEST`/`LEAST` are non-strict: they skip NULL args and
-            // return NULL only when every arg is NULL. pg_query's AST
+            // return NULL only when every arg is NULL. typedpg_pg_query's AST
             // doesn't fill in `minmaxtype` without full parse analysis —
             // we resolve the common type from the args and track per-arg
             // nullability.
@@ -929,7 +929,7 @@ pub(crate) fn infer_expr(
         }
         node::Node::SqlvalueFunction(svf) => {
             // SQL value functions: `CURRENT_DATE`, `CURRENT_TIMESTAMP`,
-            // `CURRENT_USER`, `CURRENT_SCHEMA`, `LOCALTIME`, … pg_query leaves
+            // `CURRENT_USER`, `CURRENT_SCHEMA`, `LOCALTIME`, … typedpg_pg_query leaves
             // the result OID at 0 in the raw tree, so map the op ourselves
             // (PG's gram.y assigns these). All but CURRENT_SCHEMA are never NULL.
             use protobuf::SqlValueFunctionOp as Op;

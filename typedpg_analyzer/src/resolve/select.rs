@@ -490,7 +490,7 @@ fn check_window_refs(
 fn ordinal_of(node: &protobuf::Node) -> Option<i64> {
     if let Some(node::Node::AConst(ac)) = node.node.as_ref()
         && !ac.isnull
-        && let Some(pg_query::protobuf::a_const::Val::Ival(i)) = &ac.val
+        && let Some(typedpg_pg_query::protobuf::a_const::Val::Ival(i)) = &ac.val
     {
         return Some(i.ival as i64);
     }
@@ -665,9 +665,9 @@ fn is_select_alias_reference(
 /// PG's `LCS_asString`: the clause's spelling in messages.
 pub(crate) fn lock_strength_name(lc: &protobuf::LockingClause) -> &'static str {
     match lc.strength() {
-        pg_query::protobuf::LockClauseStrength::LcsForkeyshare => "FOR KEY SHARE",
-        pg_query::protobuf::LockClauseStrength::LcsForshare => "FOR SHARE",
-        pg_query::protobuf::LockClauseStrength::LcsFornokeyupdate => "FOR NO KEY UPDATE",
+        typedpg_pg_query::protobuf::LockClauseStrength::LcsForkeyshare => "FOR KEY SHARE",
+        typedpg_pg_query::protobuf::LockClauseStrength::LcsForshare => "FOR SHARE",
+        typedpg_pg_query::protobuf::LockClauseStrength::LcsFornokeyupdate => "FOR NO KEY UPDATE",
         _ => "FOR UPDATE",
     }
 }

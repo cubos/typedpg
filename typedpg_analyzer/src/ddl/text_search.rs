@@ -3,7 +3,7 @@
 //! others it's built from. Also the lookups behind `regconfig` /
 //! `regdictionary` input.
 
-use pg_query::protobuf::{AlterTsConfigurationStmt, DefineStmt, ObjectType, node};
+use typedpg_pg_query::protobuf::{AlterTsConfigurationStmt, DefineStmt, ObjectType, node};
 
 use super::DdlError;
 use super::util::node_string;
@@ -57,13 +57,13 @@ pub(crate) fn find(interp: &PgCatalog, kind: &str, names: &[&str]) -> Result<(),
     )))
 }
 
-fn names_of(nodes: &[pg_query::protobuf::Node]) -> Vec<&str> {
+fn names_of(nodes: &[typedpg_pg_query::protobuf::Node]) -> Vec<&str> {
     nodes.iter().filter_map(node_string).collect()
 }
 
 /// A definition option naming another text search object
 /// (`PARSER = p`, `COPY = c`, `TEMPLATE = t`).
-fn option_names(de: &pg_query::protobuf::DefElem) -> Vec<String> {
+fn option_names(de: &typedpg_pg_query::protobuf::DefElem) -> Vec<String> {
     match de.arg.as_deref().and_then(|a| a.node.as_ref()) {
         Some(node::Node::TypeName(tn)) => tn
             .names
@@ -144,7 +144,7 @@ pub fn alter_configuration(
 /// ALTER TEXT SEARCH DICTIONARY name (...).
 pub fn alter_dictionary(
     interp: &PgCatalog,
-    stmt: &pg_query::protobuf::AlterTsDictionaryStmt,
+    stmt: &typedpg_pg_query::protobuf::AlterTsDictionaryStmt,
 ) -> Result<(), DdlError> {
     find(interp, "d", &names_of(&stmt.dictname))
 }
@@ -153,7 +153,7 @@ pub fn alter_dictionary(
 pub(crate) fn drop(
     interp: &mut PgCatalog,
     objtype: ObjectType,
-    obj_node: &pg_query::protobuf::Node,
+    obj_node: &typedpg_pg_query::protobuf::Node,
     missing_ok: bool,
 ) -> Result<(), DdlError> {
     let kind = match objtype {

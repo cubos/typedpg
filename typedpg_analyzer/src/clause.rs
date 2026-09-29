@@ -18,7 +18,7 @@
 //! HAVING/JOIN ON, LIMIT/OFFSET, FILTER, CASE/WHEN, NOT/AND/OR, IS TRUE…) —
 //! each a chance to diverge on ordering or wording.
 
-use pg_query::protobuf;
+use typedpg_pg_query::protobuf;
 
 use crate::error::AnalyzeError;
 use crate::expr::{self, Ctx, TypeGoal};

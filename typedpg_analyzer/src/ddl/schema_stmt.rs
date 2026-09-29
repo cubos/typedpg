@@ -1,6 +1,6 @@
 //! CREATE SCHEMA handler.
 
-use pg_query::protobuf::{CreateSchemaStmt, node};
+use typedpg_pg_query::protobuf::{CreateSchemaStmt, node};
 
 use super::DdlError;
 use super::util::ensure_namespace;

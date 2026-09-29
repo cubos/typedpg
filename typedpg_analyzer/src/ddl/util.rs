@@ -1,6 +1,6 @@
 //! Shared utilities for DDL interpretation.
 
-use pg_query::protobuf::{Node, RangeVar, TypeName, node};
+use typedpg_pg_query::protobuf::{Node, RangeVar, TypeName, node};
 
 use crate::ddl::DdlError;
 use crate::oid::{PgCastOid, PgNamespaceOid, PgTypeOid};
@@ -333,7 +333,7 @@ pub fn type_name_to_string(tn: &TypeName) -> String {
 /// Normalize PostgreSQL type name aliases to their canonical form, the way
 /// the SQL grammar would for a bare keyword. Only meaningful for type names
 /// that went through no grammar at all (e.g. the text of a `regtype`
-/// literal); `TypeName` nodes from `pg_query` are already canonical.
+/// literal); `TypeName` nodes from `typedpg_pg_query` are already canonical.
 pub(crate) fn normalize_type_name(name: &str) -> &str {
     match name {
         "integer" | "int" => "int4",

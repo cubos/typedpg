@@ -3,7 +3,7 @@
 //! it (`parse_analyze`), so a data migration naming a missing table or
 //! column, or mistyping a value, fails.
 
-use pg_query::protobuf::node;
+use typedpg_pg_query::protobuf::node;
 
 use super::DdlError;
 use crate::error::AnalyzeError;

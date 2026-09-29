@@ -1,6 +1,6 @@
 //! CREATE FUNCTION handler (signature registration only).
 
-use pg_query::protobuf::{CreateFunctionStmt, FunctionParameterMode, node};
+use typedpg_pg_query::protobuf::{CreateFunctionStmt, FunctionParameterMode, node};
 
 use crate::oid::{PgProcOid, PgTypeOid};
 use crate::pg_catalog::{ArgMode, PgProc, ProKind, oid as builtin_oid};
@@ -321,12 +321,12 @@ fn function_language(stmt: &CreateFunctionStmt) -> Option<String> {
 /// affect static analysis.
 pub fn alter_function(
     interp: &mut PgCatalog,
-    stmt: &pg_query::protobuf::AlterFunctionStmt,
+    stmt: &typedpg_pg_query::protobuf::AlterFunctionStmt,
 ) -> Result<(), DdlError> {
     let Some(func) = stmt.func.as_ref() else {
         return Ok(());
     };
-    let object = Some(Box::new(pg_query::protobuf::Node {
+    let object = Some(Box::new(typedpg_pg_query::protobuf::Node {
         node: Some(node::Node::ObjectWithArgs(func.clone())),
     }));
     let Some((schema, name, arg_oids)) = super::alter::extract_func_target(&object, interp) else {

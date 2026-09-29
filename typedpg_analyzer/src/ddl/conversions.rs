@@ -2,7 +2,7 @@
 //! existing encodings and a conversion function with the fixed signature,
 //! conversion names are unique per schema.
 
-use pg_query::protobuf::CreateConversionStmt;
+use typedpg_pg_query::protobuf::CreateConversionStmt;
 
 use super::DdlError;
 use super::util::node_string;
@@ -241,10 +241,10 @@ fn find(interp: &PgCatalog, names: &[&str]) -> Option<(String, PgNamespaceOid)> 
 /// DROP CONVERSION [IF EXISTS] name.
 pub(crate) fn drop_conversion(
     interp: &mut PgCatalog,
-    obj_node: &pg_query::protobuf::Node,
+    obj_node: &typedpg_pg_query::protobuf::Node,
     missing_ok: bool,
 ) -> Result<(), DdlError> {
-    let Some(pg_query::protobuf::node::Node::List(l)) = obj_node.node.as_ref() else {
+    let Some(typedpg_pg_query::protobuf::node::Node::List(l)) = obj_node.node.as_ref() else {
         return Ok(());
     };
     let names: Vec<&str> = l.items.iter().filter_map(node_string).collect();
@@ -264,9 +264,9 @@ pub(crate) fn drop_conversion(
 /// ALTER CONVERSION name RENAME TO new.
 pub(crate) fn rename_conversion(
     interp: &mut PgCatalog,
-    stmt: &pg_query::protobuf::RenameStmt,
+    stmt: &typedpg_pg_query::protobuf::RenameStmt,
 ) -> Result<(), DdlError> {
-    let Some(pg_query::protobuf::node::Node::List(l)) =
+    let Some(typedpg_pg_query::protobuf::node::Node::List(l)) =
         stmt.object.as_deref().and_then(|o| o.node.as_ref())
     else {
         return Ok(());

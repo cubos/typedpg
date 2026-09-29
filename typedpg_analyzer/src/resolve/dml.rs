@@ -474,7 +474,7 @@ fn analyze_insert_select(
                 && let Some(val) = &rt.val
                 && let Some(node::Node::AConst(ac)) = val.node.as_ref()
                 && !ac.isnull
-                && let Some(pg_query::protobuf::a_const::Val::Sval(sv)) = &ac.val
+                && let Some(typedpg_pg_query::protobuf::a_const::Val::Sval(sv)) = &ac.val
             {
                 Some(sv.sval.as_str())
             } else {

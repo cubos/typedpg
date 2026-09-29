@@ -14,7 +14,7 @@
 //! view_oid`, `refobjid = table_oid`, and `refobjsubid = attnum` (or 0 when
 //! the view depends on the whole relation).
 
-use pg_query::protobuf::{self, CreateTableAsStmt, ObjectType, ViewStmt, node};
+use typedpg_pg_query::protobuf::{self, CreateTableAsStmt, ObjectType, ViewStmt, node};
 
 use crate::oid::{PgClassOid, PgGenericOid, PgNamespaceOid, PgProcOid, PgRewriteOid, PgTypeOid};
 use crate::pg_catalog::{
@@ -640,7 +640,7 @@ pub(crate) fn serialize_subnode(
     sql: &str,
     pick: impl Fn(&protobuf::Node) -> Option<&protobuf::Node>,
 ) -> Result<crate::pg_catalog::SerializedAst, super::DdlError> {
-    let parsed = pg_query::parse(sql)
+    let parsed = typedpg_pg_query::parse(sql)
         .map_err(|e| super::DdlError::Parse(format!("failed to parse `{sql}`: {e}")))?;
     let proto = parsed.protobuf;
     let stmt = proto
@@ -1590,7 +1590,7 @@ fn returns_set(interp: &PgCatalog, node: &protobuf::Node) -> bool {
                 || fc.args.iter().any(|a| returns_set(interp, a))
         }
         other => other.nodes().into_iter().skip(1).any(|(n, ..)| match n {
-            pg_query::NodeRef::FuncCall(fc) => returns_set(
+            typedpg_pg_query::NodeRef::FuncCall(fc) => returns_set(
                 interp,
                 &protobuf::Node {
                     node: Some(node::Node::FuncCall(Box::new(fc.clone()))),

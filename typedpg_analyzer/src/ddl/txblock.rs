@@ -7,7 +7,7 @@
 //! a lone `-- no-transaction` statement never is, and a lone statement
 //! otherwise depends on the runner's setting — left unchecked.
 
-use pg_query::protobuf::{DiscardMode, ReindexObjectType, TransactionStmtKind, node};
+use typedpg_pg_query::protobuf::{DiscardMode, ReindexObjectType, TransactionStmtKind, node};
 
 use super::DdlError;
 
@@ -22,7 +22,7 @@ pub(crate) struct TxContext {
 }
 
 impl TxContext {
-    pub(crate) fn of(sql: &str, statements: &[pg_query::protobuf::RawStmt]) -> TxContext {
+    pub(crate) fn of(sql: &str, statements: &[typedpg_pg_query::protobuf::RawStmt]) -> TxContext {
         // MigrationSource: the first line, trimmed.
         let no_transaction = sql
             .lines()
@@ -86,7 +86,7 @@ impl TxContext {
 
 /// PreventInTransactionBlock callers.
 fn forbidden_in_block(stmt: &node::Node) -> Option<&'static str> {
-    let concurrently = |params: &[pg_query::protobuf::Node]| {
+    let concurrently = |params: &[typedpg_pg_query::protobuf::Node]| {
         params.iter().any(|p| {
             matches!(p.node.as_ref(), Some(node::Node::DefElem(de))
                 if de.defname == "concurrently"

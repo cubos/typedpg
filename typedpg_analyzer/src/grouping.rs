@@ -14,7 +14,7 @@
 
 use std::collections::HashSet;
 
-use pg_query::protobuf::{self, GroupingSetKind, node};
+use typedpg_pg_query::protobuf::{self, GroupingSetKind, node};
 
 use crate::error::AnalyzeError;
 use crate::expr;

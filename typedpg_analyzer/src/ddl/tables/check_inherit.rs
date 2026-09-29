@@ -18,11 +18,11 @@ pub(crate) struct CheckDef {
 }
 
 /// The canonical text of a CHECK expression.
-pub(crate) fn check_expr_text(expr: &pg_query::protobuf::Node) -> String {
-    let select = pg_query::protobuf::SelectStmt {
-        target_list: vec![pg_query::protobuf::Node {
+pub(crate) fn check_expr_text(expr: &typedpg_pg_query::protobuf::Node) -> String {
+    let select = typedpg_pg_query::protobuf::SelectStmt {
+        target_list: vec![typedpg_pg_query::protobuf::Node {
             node: Some(node::Node::ResTarget(Box::new(
-                pg_query::protobuf::ResTarget {
+                typedpg_pg_query::protobuf::ResTarget {
                     val: Some(Box::new(expr.clone())),
                     ..Default::default()
                 },
@@ -190,7 +190,7 @@ pub(super) fn add_check(
     interp: &mut PgCatalog,
     relid: PgClassOid,
     name: &str,
-    expr: &pg_query::protobuf::Node,
+    expr: &typedpg_pg_query::protobuf::Node,
     no_inherit: bool,
     rec: super::inherit::Recursion,
     conkey: Vec<i16>,

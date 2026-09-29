@@ -232,7 +232,7 @@ pub struct PgCatalog {
     /// (`SELECT expr` / `RETURN expr`, as `inline_function` requires),
     /// which PG substitutes for the call before checking an index or
     /// generation expression's mutability.
-    pub(crate) inline_sql_bodies: HashMap<PgProcOid, pg_query::protobuf::Node>,
+    pub(crate) inline_sql_bodies: HashMap<PgProcOid, typedpg_pg_query::protobuf::Node>,
     /// Seeded `pg_get_functiondef` sources behind `inline_sql_bodies`,
     /// kept so `to_seed` round-trips them.
     sql_function_defs: HashMap<PgProcOid, String>,
@@ -700,9 +700,9 @@ impl PgCatalog {
     /// Record a seeded SQL function's definition and, when PG would inline
     /// it, the expression it stands for.
     fn add_sql_function_def(&mut self, oid: PgProcOid, definition: String) {
-        let stmt = pg_query::parse(&definition).ok().and_then(|p| {
+        let stmt = typedpg_pg_query::parse(&definition).ok().and_then(|p| {
             match p.protobuf.stmts.first()?.stmt.as_ref()?.node.as_ref()? {
-                pg_query::protobuf::node::Node::CreateFunctionStmt(s) => Some(s.clone()),
+                typedpg_pg_query::protobuf::node::Node::CreateFunctionStmt(s) => Some(s.clone()),
                 _ => None,
             }
         });
@@ -1011,12 +1011,12 @@ impl PgCatalog {
 /// Quick check: does `sql` contain any `CREATE/ALTER/DROP EXTENSION`
 /// statement? Used to skip the PG sanity mirror when the analyzer's embedded
 /// extension support diverges from what PG sanity ships natively. We parse via
-/// `pg_query` (cheap — `apply_sql_to` parses anyway) and inspect the AST so
+/// `typedpg_pg_query` (cheap — `apply_sql_to` parses anyway) and inspect the AST so
 /// a column or identifier named `extension` doesn't cause a false skip.
 #[cfg(feature = "pg_sanity")]
 fn sql_touches_extension(sql: &str) -> bool {
-    use pg_query::protobuf::node;
-    let Ok(parsed) = pg_query::parse(sql) else {
+    use typedpg_pg_query::protobuf::node;
+    let Ok(parsed) = typedpg_pg_query::parse(sql) else {
         return false;
     };
     parsed.protobuf.stmts.iter().any(|raw| {
@@ -1026,7 +1026,7 @@ fn sql_touches_extension(sql: &str) -> bool {
         match stmt {
             node::Node::CreateExtensionStmt(_) | node::Node::AlterExtensionStmt(_) => true,
             node::Node::DropStmt(d) => {
-                d.remove_type == pg_query::protobuf::ObjectType::ObjectExtension as i32
+                d.remove_type == typedpg_pg_query::protobuf::ObjectType::ObjectExtension as i32
             }
             _ => false,
         }

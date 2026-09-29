@@ -725,7 +725,7 @@ fn merge_using_columns(
 /// available but M columns specified`).
 fn apply_alias_column_names(
     scope: &mut Scope,
-    alias_node: Option<&pg_query::protobuf::Alias>,
+    alias_node: Option<&typedpg_pg_query::protobuf::Alias>,
 ) -> Result<(), AnalyzeError> {
     let Some(a) = alias_node else {
         return Ok(());

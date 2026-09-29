@@ -13,7 +13,7 @@
 //! session, `SET LOCAL` until the end of the transaction (`COMMIT` /
 //! `ROLLBACK` or the end of the `apply_sql` call).
 
-use pg_query::protobuf::{
+use typedpg_pg_query::protobuf::{
     FuncCall, SelectStmt, TransactionStmt, TransactionStmtKind, VariableSetKind, VariableSetStmt,
     a_const, node,
 };
@@ -228,7 +228,7 @@ pub(crate) fn select_side_effects(
 }
 
 /// A constant `SET` argument as the string GUC code parses.
-fn const_arg_string(arg: &pg_query::protobuf::Node) -> Option<String> {
+fn const_arg_string(arg: &typedpg_pg_query::protobuf::Node) -> Option<String> {
     match arg.node.as_ref() {
         Some(node::Node::AConst(c)) => match c.val.as_ref()? {
             a_const::Val::Ival(i) => Some(i.ival.to_string()),
@@ -257,7 +257,7 @@ fn constant_set_config(fc: &FuncCall) -> Option<(String, String)> {
     let [setting, value, _] = fc.args.as_slice() else {
         return None;
     };
-    let as_str = |n: &pg_query::protobuf::Node| match n.node.as_ref() {
+    let as_str = |n: &typedpg_pg_query::protobuf::Node| match n.node.as_ref() {
         Some(node::Node::AConst(c)) => match c.val.as_ref() {
             Some(a_const::Val::Sval(s)) => Some(s.sval.clone()),
             _ => None,
@@ -282,7 +282,7 @@ fn constant_search_path_set_config(fc: &FuncCall) -> Option<(String, bool)> {
     let [setting, value, is_local] = fc.args.as_slice() else {
         return None;
     };
-    let as_const = |n: &pg_query::protobuf::Node| match n.node.as_ref() {
+    let as_const = |n: &typedpg_pg_query::protobuf::Node| match n.node.as_ref() {
         Some(node::Node::AConst(c)) => c.val.clone(),
         _ => None,
     };

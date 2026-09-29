@@ -15,8 +15,8 @@
 //!    pg_class entries; dropping the underlying table tears down the
 //!    indexes via `pg_index.indrelid`.
 
-use pg_query::protobuf::{IndexStmt, node};
 use prost::Message;
+use typedpg_pg_query::protobuf::{IndexStmt, node};
 
 use super::DdlError;
 use super::volatile::{ExprLocation, check_no_volatile};
@@ -169,7 +169,7 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
         if let Some(caps) = caps.as_ref()
             && !caps.can_order
         {
-            use pg_query::protobuf::{SortByDir, SortByNulls};
+            use typedpg_pg_query::protobuf::{SortByDir, SortByNulls};
             if elem.ordering != SortByDir::SortbyDefault as i32 {
                 return Err(DdlError::UnsupportedDdl(format!(
                     "access method \"{am}\" does not support ASC/DESC options"
@@ -289,7 +289,7 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
 
 /// `FigureIndexColname`: a function call is named after the function, a
 /// column reference after the column (through casts), anything else `expr`.
-fn figure_index_colname(expr: Option<&pg_query::protobuf::Node>) -> String {
+fn figure_index_colname(expr: Option<&typedpg_pg_query::protobuf::Node>) -> String {
     match expr.and_then(|e| e.node.as_ref()) {
         Some(node::Node::FuncCall(fc)) => fc
             .funcname
@@ -308,10 +308,10 @@ fn figure_index_colname(expr: Option<&pg_query::protobuf::Node>) -> String {
     }
 }
 
-/// Encode a `pg_query::Node` as a `SerializedAst` (protobuf bytes + an
+/// Encode a `typedpg_pg_query::Node` as a `SerializedAst` (protobuf bytes + an
 /// empty bindings stream — index expressions don't yet flow through the
 /// view-binding walker; that's a separate piece of work).
-fn serialize_node(node: &pg_query::protobuf::Node) -> SerializedAst {
+fn serialize_node(node: &typedpg_pg_query::protobuf::Node) -> SerializedAst {
     let mut buf = Vec::with_capacity(64);
     node.encode(&mut buf).ok();
     SerializedAst {

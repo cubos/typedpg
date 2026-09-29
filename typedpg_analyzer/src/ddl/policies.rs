@@ -3,7 +3,7 @@
 //! and type-checks the USING / WITH CHECK expressions over the table's row
 //! (`CreatePolicy`, policy.c), so the catalog keeps the names.
 
-use pg_query::protobuf::{AlterPolicyStmt, CreatePolicyStmt, RangeVar, node};
+use typedpg_pg_query::protobuf::{AlterPolicyStmt, CreatePolicyStmt, RangeVar, node};
 
 use super::DdlError;
 use crate::oid::PgClassOid;
@@ -78,7 +78,7 @@ pub fn alter_policy(interp: &PgCatalog, stmt: &AlterPolicyStmt) -> Result<(), Dd
 /// `DROP POLICY [IF EXISTS] name ON table`.
 pub(crate) fn drop_policy(
     interp: &mut PgCatalog,
-    obj_node: &pg_query::protobuf::Node,
+    obj_node: &typedpg_pg_query::protobuf::Node,
     missing_ok: bool,
 ) -> Result<(), DdlError> {
     let Some(node::Node::List(list)) = obj_node.node.as_ref() else {
@@ -124,7 +124,7 @@ pub(crate) fn drop_policy(
 /// `ALTER POLICY name ON table RENAME TO new` (rename_policy).
 pub(crate) fn rename_policy(
     interp: &mut PgCatalog,
-    stmt: &pg_query::protobuf::RenameStmt,
+    stmt: &typedpg_pg_query::protobuf::RenameStmt,
 ) -> Result<(), DdlError> {
     let Some(rv) = stmt.relation.as_ref() else {
         return Ok(());
@@ -155,7 +155,7 @@ pub(crate) fn rename_policy(
 fn check_policy_expression(
     interp: &PgCatalog,
     relid: PgClassOid,
-    expr: &pg_query::protobuf::Node,
+    expr: &typedpg_pg_query::protobuf::Node,
 ) -> Result<(), DdlError> {
     use crate::expr::{TypeGoal, infer_expr};
     use crate::nullability::NullabilityContext;

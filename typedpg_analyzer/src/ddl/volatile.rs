@@ -11,7 +11,7 @@
 //! overloads that can take the call's argument count and rejects the call
 //! when none of them is IMMUTABLE.
 
-use pg_query::protobuf::{self, node};
+use typedpg_pg_query::protobuf::{self, node};
 
 use super::DdlError;
 use crate::pg_catalog::{PgCatalog, ProVolatile};

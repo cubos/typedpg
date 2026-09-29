@@ -1,6 +1,6 @@
 //! CREATE TABLE and ALTER TABLE DDL handlers.
 
-use pg_query::protobuf::{
+use typedpg_pg_query::protobuf::{
     AlterTableCmd, AlterTableStmt, AlterTableType, ConstrType, CreateStmt, DropBehavior, node,
 };
 
@@ -91,12 +91,12 @@ impl ConName {
 fn check_conkey(
     interp: &PgCatalog,
     relid: PgClassOid,
-    expr: Option<&pg_query::protobuf::Node>,
+    expr: Option<&typedpg_pg_query::protobuf::Node>,
 ) -> Vec<i16> {
     let mut attnums: Vec<i16> = Vec::new();
     if let Some(inner) = expr.and_then(|e| e.node.as_ref()) {
         for (n, ..) in inner.nodes() {
-            if let pg_query::NodeRef::ColumnRef(cr) = n
+            if let typedpg_pg_query::NodeRef::ColumnRef(cr) = n
                 && let Some(name) = cr.fields.last().and_then(super::util::node_string)
                 && let Some(attr) = interp.attribute_by_name(relid, name)
                 && !attnums.contains(&attr.attnum)
@@ -115,12 +115,12 @@ fn check_conkey(
 fn check_name_addition(
     interp: &PgCatalog,
     relid: PgClassOid,
-    expr: Option<&pg_query::protobuf::Node>,
+    expr: Option<&typedpg_pg_query::protobuf::Node>,
 ) -> String {
     let mut columns: Vec<String> = Vec::new();
     if let Some(inner) = expr.and_then(|e| e.node.as_ref()) {
         for (n, ..) in inner.nodes() {
-            if let pg_query::NodeRef::ColumnRef(cr) = n
+            if let typedpg_pg_query::NodeRef::ColumnRef(cr) = n
                 && let Some(name) = cr.fields.last().and_then(super::util::node_string)
                 && interp.attribute_by_name(relid, name).is_some()
                 && !columns.iter().any(|c| c == name)
@@ -313,7 +313,7 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
         interp.relpersistence.insert(class_oid, 'u');
     }
     // ON COMMIT applies to temporary tables only (transformCreateStmt).
-    use pg_query::protobuf::OnCommitAction;
+    use typedpg_pg_query::protobuf::OnCommitAction;
     match OnCommitAction::try_from(stmt.oncommit) {
         Ok(OnCommitAction::OncommitNoop | OnCommitAction::Undefined) | Err(_) => {}
         Ok(action) => {
@@ -452,7 +452,7 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
     // transformPartitionSpec / ComputePartitionAttrs: the key columns and
     // expressions, and their operator classes.
     if let Some(spec) = stmt.partspec.as_ref() {
-        use pg_query::protobuf::PartitionStrategy;
+        use typedpg_pg_query::protobuf::PartitionStrategy;
         let strategy = PartitionStrategy::try_from(spec.strategy).ok();
         if strategy == Some(PartitionStrategy::List) && spec.part_params.len() > 1 {
             return Err(DdlError::Parse(
@@ -490,7 +490,7 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
                     inner
                         .nodes()
                         .into_iter()
-                        .any(|(n, ..)| matches!(n, pg_query::NodeRef::ColumnRef(_)))
+                        .any(|(n, ..)| matches!(n, typedpg_pg_query::NodeRef::ColumnRef(_)))
                 });
                 if !reads_columns {
                     return Err(DdlError::Parse(
@@ -589,7 +589,7 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
 /// elsewhere; the server and options don't affect typing.
 pub fn create_foreign_table(
     interp: &mut PgCatalog,
-    stmt: &pg_query::protobuf::CreateForeignTableStmt,
+    stmt: &typedpg_pg_query::protobuf::CreateForeignTableStmt,
 ) -> Result<(), DdlError> {
     let Some(base) = stmt.base_stmt.as_ref() else {
         return Ok(());
@@ -638,7 +638,7 @@ struct ParsedColumn {
     /// `Internal` for identity columns.
     owned_sequence: Option<crate::pg_catalog::DepType>,
     /// The identity's sequence options (`GENERATED ... AS IDENTITY (...)`).
-    identity_options: Vec<pg_query::protobuf::Node>,
+    identity_options: Vec<typedpg_pg_query::protobuf::Node>,
     /// The column has a local NOT NULL (explicit, PRIMARY KEY, serial,
     /// identity) — PG 18 records it as a local not-null constraint.
     nn_local: bool,
@@ -670,8 +670,8 @@ pub fn alter_table(interp: &mut PgCatalog, stmt: &AlterTableStmt) -> Result<(), 
     // RangeVarCallbackForAlterRelation: ALTER TABLE doesn't reach a
     // composite type, and ALTER TYPE only reaches one.
     let relkind = interp.pg_class.get(&class_oid).map(|c| c.relkind);
-    let via_alter_type = pg_query::protobuf::ObjectType::try_from(stmt.objtype)
-        == Ok(pg_query::protobuf::ObjectType::ObjectType);
+    let via_alter_type = typedpg_pg_query::protobuf::ObjectType::try_from(stmt.objtype)
+        == Ok(typedpg_pg_query::protobuf::ObjectType::ObjectType);
     if !via_alter_type && relkind == Some(RelKind::CompositeType) {
         return Err(DdlError::Parse(format!(
             "\"{}\" is a composite type",

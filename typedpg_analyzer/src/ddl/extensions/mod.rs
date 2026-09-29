@@ -10,7 +10,7 @@
 //! 2. Add an `ExtensionDef` entry to the `REGISTRY` array below
 //! 3. Run `./update_extensions.sh` to fetch from PG upstream
 
-use pg_query::protobuf::{AlterExtensionStmt, CreateExtensionStmt};
+use typedpg_pg_query::protobuf::{AlterExtensionStmt, CreateExtensionStmt};
 
 use super::DdlError;
 use super::util::ensure_namespace;
@@ -91,7 +91,7 @@ pub fn create_extension(
     // get_required_extension: required extensions must be installed, or
     // are installed first with CASCADE.
     let cascade = stmt.options.iter().any(|o| {
-        matches!(o.node.as_ref(), Some(pg_query::protobuf::node::Node::DefElem(de))
+        matches!(o.node.as_ref(), Some(typedpg_pg_query::protobuf::node::Node::DefElem(de))
             if de.defname == "cascade")
     });
     for required in requires(name) {
@@ -108,7 +108,7 @@ pub fn create_extension(
         sub.extname = (*required).to_owned();
         sub.if_not_exists = true;
         sub.options.retain(|o| {
-            !matches!(o.node.as_ref(), Some(pg_query::protobuf::node::Node::DefElem(de))
+            !matches!(o.node.as_ref(), Some(typedpg_pg_query::protobuf::node::Node::DefElem(de))
                 if de.defname == "new_version")
         });
         create_extension(interp, &sub)?;
@@ -410,12 +410,12 @@ fn substitute_extschema(interp: &PgCatalog, schema: &str, sql: &str) -> String {
 }
 
 /// Extract a string option from CREATE/ALTER EXTENSION options.
-fn extract_option(options: &[pg_query::protobuf::Node], name: &str) -> Option<String> {
+fn extract_option(options: &[typedpg_pg_query::protobuf::Node], name: &str) -> Option<String> {
     for opt in options {
-        if let Some(pg_query::protobuf::node::Node::DefElem(de)) = opt.node.as_ref()
+        if let Some(typedpg_pg_query::protobuf::node::Node::DefElem(de)) = opt.node.as_ref()
             && de.defname == name
             && let Some(arg) = de.arg.as_deref()
-            && let Some(pg_query::protobuf::node::Node::String(s)) = arg.node.as_ref()
+            && let Some(typedpg_pg_query::protobuf::node::Node::String(s)) = arg.node.as_ref()
         {
             return Some(s.sval.clone());
         }
@@ -437,11 +437,11 @@ fn extension_oid(interp: &PgCatalog, name: &str) -> Result<PgExtensionOid, DdlEr
 /// with PG's description of it (getObjectDescription).
 fn member_object(
     interp: &PgCatalog,
-    objtype: pg_query::protobuf::ObjectType,
-    object: &pg_query::protobuf::node::Node,
+    objtype: typedpg_pg_query::protobuf::ObjectType,
+    object: &typedpg_pg_query::protobuf::node::Node,
 ) -> Result<Option<(PgClassOid, PgGenericOid, String)>, DdlError> {
-    use pg_query::protobuf::ObjectType;
-    use pg_query::protobuf::node::Node;
+    use typedpg_pg_query::protobuf::ObjectType;
+    use typedpg_pg_query::protobuf::node::Node;
     super::comment::resolve_object(interp, objtype, object)?;
     let names = |n: &Node| -> Vec<String> {
         match n {
@@ -495,7 +495,7 @@ fn member_object(
             ))
         }
         ObjectType::ObjectFunction | ObjectType::ObjectProcedure | ObjectType::ObjectRoutine => {
-            let boxed = Some(Box::new(pg_query::protobuf::Node {
+            let boxed = Some(Box::new(typedpg_pg_query::protobuf::Node {
                 node: Some(object.clone()),
             }));
             let Some((schema, name, args)) = super::alter::extract_func_target(&boxed, interp)
@@ -526,7 +526,7 @@ fn member_object(
 /// (ExecAlterExtensionContentsRecurse).
 pub fn alter_extension_contents(
     interp: &mut PgCatalog,
-    stmt: &pg_query::protobuf::AlterExtensionContentsStmt,
+    stmt: &typedpg_pg_query::protobuf::AlterExtensionContentsStmt,
 ) -> Result<(), DdlError> {
     // The extension's own scripts add and drop members while its
     // membership is still being recorded.
@@ -537,8 +537,8 @@ pub fn alter_extension_contents(
     let Some(object) = stmt.object.as_deref().and_then(|o| o.node.as_ref()) else {
         return Ok(());
     };
-    let objtype = pg_query::protobuf::ObjectType::try_from(stmt.objtype)
-        .unwrap_or(pg_query::protobuf::ObjectType::Undefined);
+    let objtype = typedpg_pg_query::protobuf::ObjectType::try_from(stmt.objtype)
+        .unwrap_or(typedpg_pg_query::protobuf::ObjectType::Undefined);
     let Some((classid, objid, description)) = member_object(interp, objtype, object)? else {
         return Ok(());
     };

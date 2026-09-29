@@ -3,7 +3,7 @@
 //! and keeps their names unique per schema, and a statistics object goes
 //! away with its table or any column it reads.
 
-use pg_query::protobuf::{AlterStatsStmt, CreateStatsStmt, node};
+use typedpg_pg_query::protobuf::{AlterStatsStmt, CreateStatsStmt, node};
 
 use super::DdlError;
 use super::util::node_string;
@@ -23,7 +23,7 @@ pub(crate) struct StatisticsObject {
 /// STATS_MAX_DIMENSIONS.
 const MAX_DIMENSIONS: usize = 8;
 
-fn split(names: &[pg_query::protobuf::Node]) -> (Option<String>, String) {
+fn split(names: &[typedpg_pg_query::protobuf::Node]) -> (Option<String>, String) {
     let parts: Vec<&str> = names.iter().filter_map(node_string).collect();
     match parts.as_slice() {
         [schema, name] => (Some((*schema).to_owned()), (*name).to_owned()),
@@ -34,7 +34,7 @@ fn split(names: &[pg_query::protobuf::Node]) -> (Option<String>, String) {
 
 /// get_statistics_object_oid: an unqualified name is looked up along the
 /// search path.
-fn find(interp: &PgCatalog, names: &[pg_query::protobuf::Node]) -> Option<usize> {
+fn find(interp: &PgCatalog, names: &[typedpg_pg_query::protobuf::Node]) -> Option<usize> {
     let (schema, name) = split(names);
     interp
         .schemas_for_lookup(schema.as_deref())
@@ -47,7 +47,7 @@ fn find(interp: &PgCatalog, names: &[pg_query::protobuf::Node]) -> Option<usize>
         })
 }
 
-fn not_found(names: &[pg_query::protobuf::Node]) -> DdlError {
+fn not_found(names: &[typedpg_pg_query::protobuf::Node]) -> DdlError {
     let parts: Vec<&str> = names.iter().filter_map(node_string).collect();
     DdlError::TypeNotFound(format!(
         "statistics object \"{}\" does not exist",
@@ -156,7 +156,7 @@ pub fn create_statistics(interp: &mut PgCatalog, stmt: &CreateStatsStmt) -> Resu
             }
             if let Some(inner) = expr.node.as_ref() {
                 for (n, ..) in inner.nodes() {
-                    if let pg_query::NodeRef::ColumnRef(cr) = n
+                    if let typedpg_pg_query::NodeRef::ColumnRef(cr) = n
                         && let Some(col) = cr.fields.last().and_then(node_string)
                         && let Some(a) = interp.attribute_by_name(relid, col)
                     {
@@ -270,7 +270,7 @@ pub fn alter_statistics(interp: &PgCatalog, stmt: &AlterStatsStmt) -> Result<(),
 /// `DROP STATISTICS [IF EXISTS] name`.
 pub(crate) fn drop_statistics(
     interp: &mut PgCatalog,
-    obj_node: &pg_query::protobuf::Node,
+    obj_node: &typedpg_pg_query::protobuf::Node,
     missing_ok: bool,
 ) -> Result<(), DdlError> {
     let Some(node::Node::List(l)) = obj_node.node.as_ref() else {
@@ -289,7 +289,7 @@ pub(crate) fn drop_statistics(
 /// `ALTER STATISTICS name RENAME TO new` (AlterObjectRename_internal).
 pub(crate) fn rename_statistics(
     interp: &mut PgCatalog,
-    stmt: &pg_query::protobuf::RenameStmt,
+    stmt: &typedpg_pg_query::protobuf::RenameStmt,
 ) -> Result<(), DdlError> {
     let Some(node::Node::List(l)) = stmt.object.as_deref().and_then(|o| o.node.as_ref()) else {
         return Ok(());
@@ -317,7 +317,10 @@ pub(crate) fn rename_statistics(
 }
 
 /// Whether a statistics object `names` exists (get_object_address).
-pub(crate) fn statistics_exist(interp: &PgCatalog, names: &[pg_query::protobuf::Node]) -> bool {
+pub(crate) fn statistics_exist(
+    interp: &PgCatalog,
+    names: &[typedpg_pg_query::protobuf::Node],
+) -> bool {
     find(interp, names).is_some()
 }
 

@@ -266,7 +266,7 @@ fn recursive_cycle_clause_with_explicit_mark_values() {
         )
         .unwrap();
     // The mark column is NOT NULL; we don't pin the exact type because
-    // pg_query reports the inferred type via cycle_mark_type, which
+    // typedpg_pg_query reports the inferred type via cycle_mark_type, which
     // depends on the literals — the important assertions are name+nullability.
     let mark = s.columns.iter().find(|c| c.name == "mark").unwrap();
     assert!(!mark.nullable);

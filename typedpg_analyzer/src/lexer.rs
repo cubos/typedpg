@@ -774,7 +774,7 @@ mod tests {
     // and block comments (`/* ... */`), and — unlike standard SQL — block
     // comments *nest*. The lexer must (a) ignore `$name`/`$..` inside any
     // comment, (b) preserve the comment text verbatim in the output SQL (so
-    // `pg_query` sees an equivalent statement), and (c) not treat comment
+    // `typedpg_pg_query` sees an equivalent statement), and (c) not treat comment
     // markers as comments when they appear inside strings, dollar-quotes, or
     // quoted identifiers (and vice-versa).
 

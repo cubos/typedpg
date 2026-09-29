@@ -1,6 +1,6 @@
 //! CREATE OPERATOR handler.
 
-use pg_query::protobuf::{DefineStmt, node};
+use typedpg_pg_query::protobuf::{DefineStmt, node};
 
 use crate::oid::{PgOperatorOid, PgTypeOid};
 use crate::pg_catalog::PgOperator;
@@ -95,7 +95,7 @@ pub fn define_operator(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), 
 }
 
 /// Parse a function name from a DefElem argument.
-fn parse_func_name(arg: &pg_query::protobuf::Node) -> Option<(Option<String>, String)> {
+fn parse_func_name(arg: &typedpg_pg_query::protobuf::Node) -> Option<(Option<String>, String)> {
     let parts: Vec<&str> = match arg.node.as_ref()? {
         node::Node::TypeName(tn) => tn
             .names

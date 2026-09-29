@@ -2,7 +2,7 @@
 //! validates them when they are created (`CreateTriggerFiringOn`) and a
 //! trigger depends on its function, so the catalog keeps a minimal record.
 
-use pg_query::protobuf::{CreateTrigStmt, node};
+use typedpg_pg_query::protobuf::{CreateTrigStmt, node};
 
 use super::DdlError;
 use crate::oid::{PgClassOid, PgProcOid};
@@ -102,7 +102,7 @@ pub fn create_trigger(interp: &mut PgCatalog, stmt: &CreateTrigStmt) -> Result<(
 /// `DROP TRIGGER [IF EXISTS] name ON table`.
 pub(crate) fn drop_trigger(
     interp: &mut PgCatalog,
-    obj_node: &pg_query::protobuf::Node,
+    obj_node: &typedpg_pg_query::protobuf::Node,
     missing_ok: bool,
 ) -> Result<(), DdlError> {
     let Some(node::Node::List(list)) = obj_node.node.as_ref() else {
@@ -117,7 +117,7 @@ pub(crate) fn drop_trigger(
     let Some((trigname, rel)) = parts.split_last() else {
         return Ok(());
     };
-    let rv = pg_query::protobuf::RangeVar {
+    let rv = typedpg_pg_query::protobuf::RangeVar {
         schemaname: if rel.len() == 2 {
             rel[0].clone()
         } else {
@@ -159,7 +159,7 @@ pub(crate) fn triggers_using_function(
 /// `ALTER TRIGGER name ON table RENAME TO new` (renametrig).
 pub(crate) fn rename_trigger(
     interp: &mut PgCatalog,
-    stmt: &pg_query::protobuf::RenameStmt,
+    stmt: &typedpg_pg_query::protobuf::RenameStmt,
 ) -> Result<(), DdlError> {
     let Some(rv) = stmt.relation.as_ref() else {
         return Ok(());

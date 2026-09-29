@@ -588,7 +588,7 @@ pub struct PgRewrite {
     pub(crate) ev_action: SerializedAst,
 }
 
-/// Bundle of a protobuf-encoded `pg_query::Node` plus the per-name-slot
+/// Bundle of a protobuf-encoded `typedpg_pg_query::Node` plus the per-name-slot
 /// binding side-table that resolves every `RangeVar` / `ColumnRef` /
 /// `FuncCall` / `TypeName` in the AST to a catalog OID.
 ///
@@ -602,7 +602,7 @@ pub struct PgRewrite {
 /// remain valid and the deparser looks up *current* names.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize_tuple, Deserialize_tuple)]
 pub struct SerializedAst {
-    /// Protobuf-encoded `pg_query::Node`. Base64 in JSON.
+    /// Protobuf-encoded `typedpg_pg_query::Node`. Base64 in JSON.
     #[serde(with = "serde_base64")]
     pub ast: Vec<u8>,
     /// One entry per name slot, walked in lockstep with the AST.

@@ -634,7 +634,7 @@ fn stress_annotation_on_left_join_star() {
 
 #[test]
 fn syntax_error_message_matches_pg_verbatim() {
-    // `pg_query::Error::Parse`'s Display prepends "Invalid statement: " to the
+    // `typedpg_pg_query::Error::Parse`'s Display prepends "Invalid statement: " to the
     // server-side wording. The error-message contract requires our message to
     // *start with* PG's verbatim text, so the analyzer must strip that wrapper.
     // PG: `syntax error at or near "true"` — `EXTRACT(<expr> FROM …)` only
@@ -673,7 +673,7 @@ fn extract_unresolved_reports_pg_catalog_qualified_name() {
 
 #[test]
 fn sql_value_functions_infer_types() {
-    // pg_query emits these as `SQLValueFunction` (with a 0 result OID in the raw
+    // typedpg_pg_query emits these as `SQLValueFunction` (with a 0 result OID in the raw
     // tree); the analyzer used to reject every one with "expression node type
     // not supported". Each maps to a concrete, NOT-NULL type — except
     // CURRENT_SCHEMA, NULL when no search-path schema exists.

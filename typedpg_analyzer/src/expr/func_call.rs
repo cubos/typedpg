@@ -73,7 +73,7 @@ pub(crate) fn infer_func_call(
             // Same literal-content validation an explicit cast performs.
             if let Some(node::Node::AConst(ac)) = func.args[0].node.as_ref()
                 && !ac.isnull
-                && let Some(pg_query::protobuf::a_const::Val::Sval(sv)) = &ac.val
+                && let Some(typedpg_pg_query::protobuf::a_const::Val::Sval(sv)) = &ac.val
                 && let Err(msg) = crate::literal_input::validate(&sv.sval, target, snapshot)
             {
                 let span = crate::error::node_location(&func.args[0])
@@ -634,7 +634,7 @@ fn extract_unit_is_infinite_safe(
         && matches!(
             func.args.first().and_then(|a| a.node.as_ref()),
             Some(node::Node::AConst(protobuf::AConst {
-                val: Some(pg_query::protobuf::a_const::Val::Sval(sv)),
+                val: Some(typedpg_pg_query::protobuf::a_const::Val::Sval(sv)),
                 ..
             })) if INFINITE_FIELDS.contains(&sv.sval.to_lowercase().as_str())
         )

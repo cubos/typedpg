@@ -11,7 +11,7 @@
 //! Either way the analyzer just needs a valid `pg_collation` row so
 //! subsequent `COLLATE "name"` references resolve.
 
-use pg_query::protobuf::{DefineStmt, node};
+use typedpg_pg_query::protobuf::{DefineStmt, node};
 
 use super::DdlError;
 use super::util::ensure_qualified_name;

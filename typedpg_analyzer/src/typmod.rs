@@ -28,7 +28,7 @@
 //! `Ok(None)` so custom types with their own typmodin function don't break
 //! the migration — we just don't track typmod for those.
 
-use pg_query::protobuf::{Node, node};
+use typedpg_pg_query::protobuf::{Node, node};
 
 use crate::ddl::DdlError;
 use crate::error::AnalyzeError;
@@ -320,7 +320,7 @@ fn encode_vector(raw: &[i32]) -> Result<i32, DdlError> {
 fn extract_int(node: &Node) -> Result<i32, DdlError> {
     match node.node.as_ref() {
         Some(node::Node::AConst(c)) => match c.val.as_ref() {
-            Some(pg_query::protobuf::a_const::Val::Ival(i)) => Ok(i.ival),
+            Some(typedpg_pg_query::protobuf::a_const::Val::Ival(i)) => Ok(i.ival),
             _ => Err(DdlError::UnsupportedDdl(
                 "non-integer typmod argument".into(),
             )),
@@ -411,7 +411,7 @@ pub fn check_literal_assignment(
 fn string_literal(node: &Node) -> Option<&str> {
     match node.node.as_ref()? {
         node::Node::AConst(c) => match c.val.as_ref()? {
-            pg_query::protobuf::a_const::Val::Sval(s) => Some(s.sval.as_str()),
+            typedpg_pg_query::protobuf::a_const::Val::Sval(s) => Some(s.sval.as_str()),
             _ => None,
         },
         // Allow `'abc'::varchar(N)` — drill through the cast so the literal
@@ -424,9 +424,9 @@ fn string_literal(node: &Node) -> Option<&str> {
 fn numeric_literal_string(node: &Node) -> Option<String> {
     match node.node.as_ref()? {
         node::Node::AConst(c) => match c.val.as_ref()? {
-            pg_query::protobuf::a_const::Val::Ival(i) => Some(i.ival.to_string()),
-            pg_query::protobuf::a_const::Val::Fval(f) => Some(f.fval.clone()),
-            pg_query::protobuf::a_const::Val::Sval(s) => Some(s.sval.clone()),
+            typedpg_pg_query::protobuf::a_const::Val::Ival(i) => Some(i.ival.to_string()),
+            typedpg_pg_query::protobuf::a_const::Val::Fval(f) => Some(f.fval.clone()),
+            typedpg_pg_query::protobuf::a_const::Val::Sval(s) => Some(s.sval.clone()),
             _ => None,
         },
         node::Node::TypeCast(tc) => tc.arg.as_deref().and_then(numeric_literal_string),

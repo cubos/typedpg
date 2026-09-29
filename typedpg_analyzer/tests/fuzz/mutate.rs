@@ -1,14 +1,14 @@
-//! Strategy 2 — AST mutation: parse a seed with pg_query, tweak leaf
+//! Strategy 2 — AST mutation: parse a seed with typedpg_pg_query, tweak leaf
 //! nodes, deparse back to SQL.
 
 use super::*;
 
 // ──────────────────────────────────────────────────────────────────────────
-// Strategy 2 — AST mutation via pg_query parse → tweak → deparse.
+// Strategy 2 — AST mutation via typedpg_pg_query parse → tweak → deparse.
 // ──────────────────────────────────────────────────────────────────────────
 
 /// Seed queries for the AST mutator. Named `$pN` params are welcome: the
-/// pools store the positional (`$N`) form pg_query understands, and the
+/// pools store the positional (`$N`) form typedpg_pg_query understands, and the
 /// mutation boundary converts back — mutating *around* a bare param is the
 /// canonical single-fault probe of parameter-type inference.
 pub(crate) const SEEDS: &[&str] = &[
@@ -89,14 +89,14 @@ pub(crate) fn str_node(s: &str) -> protobuf::Node {
 /// multi-fault queries produce (PG and the analyzer picking different "first"
 /// errors).
 pub(crate) fn mutate(seed: &str, rng: &mut StdRng, n_edits: u32) -> Option<String> {
-    let mut parsed = pg_query::parse(seed).ok()?;
+    let mut parsed = typedpg_pg_query::parse(seed).ok()?;
 
     // SAFETY: `nodes_mut` hands back raw pointers into `parsed`'s owned
     // protobuf tree. They stay valid because `parsed` outlives this block and
     // we don't move it; we mutate through them and then deparse. The pointers
     // carry no lifetime, so the `&mut parsed` borrow ends here and `deparse`
     // (an immutable borrow) is free to read the mutated tree afterwards.
-    let nodes: Vec<pg_query::NodeMut> = unsafe { parsed.protobuf.nodes_mut() }
+    let nodes: Vec<typedpg_pg_query::NodeMut> = unsafe { parsed.protobuf.nodes_mut() }
         .into_iter()
         .map(|(n, _)| n)
         .collect();
@@ -113,8 +113,8 @@ pub(crate) fn mutate(seed: &str, rng: &mut StdRng, n_edits: u32) -> Option<Strin
 }
 
 /// One mutation on a single node, dispatched on its kind.
-pub(crate) fn apply_mutation(node: pg_query::NodeMut, rng: &mut StdRng) {
-    use pg_query::NodeMut;
+pub(crate) fn apply_mutation(node: typedpg_pg_query::NodeMut, rng: &mut StdRng) {
+    use typedpg_pg_query::NodeMut;
     unsafe {
         match node {
             NodeMut::AConst(p) if !p.is_null() => {

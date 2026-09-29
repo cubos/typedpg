@@ -2,7 +2,7 @@
 //! affect typing, but PG resolves the tables, columns, row filters and
 //! schemas they name, validates their options and keeps membership.
 
-use pg_query::protobuf::{
+use typedpg_pg_query::protobuf::{
     AlterPublicationAction, AlterPublicationStmt, CreatePublicationStmt, PublicationObjSpecType,
     PublicationTable, node,
 };
@@ -87,7 +87,7 @@ fn def_get_string(arg: Option<&node::Node>) -> Option<String> {
 }
 
 /// parse_publication_options.
-fn check_options(options: &[pg_query::protobuf::Node]) -> Result<Options, DdlError> {
+fn check_options(options: &[typedpg_pg_query::protobuf::Node]) -> Result<Options, DdlError> {
     let mut out = Options::default();
     let mut seen: Vec<&str> = Vec::new();
     for opt in options {
@@ -148,7 +148,7 @@ fn check_options(options: &[pg_query::protobuf::Node]) -> Result<Options, DdlErr
 /// either mention has a row filter or a column list.
 fn resolve_objects<'a>(
     interp: &PgCatalog,
-    objects: &'a [pg_query::protobuf::Node],
+    objects: &'a [typedpg_pg_query::protobuf::Node],
 ) -> Result<Vec<Object<'a>>, DdlError> {
     let mut out: Vec<Object<'a>> = Vec::new();
     let mut kind = PublicationObjSpecType::PublicationobjTable;
@@ -334,7 +334,7 @@ const FIRST_NORMAL_OBJECT_ID: u32 = 16384;
 fn check_row_filter(
     interp: &PgCatalog,
     relid: PgClassOid,
-    filter: &pg_query::protobuf::Node,
+    filter: &typedpg_pg_query::protobuf::Node,
 ) -> Result<(), DdlError> {
     let unsupported = |e: crate::error::AnalyzeError| DdlError::UnsupportedDdl(e.to_string());
     let used = std::cell::RefCell::new(Vec::new());
@@ -386,24 +386,26 @@ fn invalid_row_filter(detail: &str) -> DdlError {
 fn check_simple_rowfilter_expr(
     interp: &PgCatalog,
     relid: PgClassOid,
-    node: &pg_query::protobuf::Node,
+    node: &typedpg_pg_query::protobuf::Node,
 ) -> Result<(), DdlError> {
     const ONLY_SIMPLE: &str = "Only columns, constants, built-in operators, built-in data types, \
                                built-in collations, and immutable built-in functions are allowed.";
     let Some(inner) = node.node.as_ref() else {
         return Ok(());
     };
-    let type_of = |n: &pg_query::protobuf::Node| {
+    let type_of = |n: &typedpg_pg_query::protobuf::Node| {
         super::volatile::infer_over_relation(interp, relid, n, None)
             .and_then(Result::ok)
             .map(|t| t.type_oid)
     };
     let user_type =
         |t: Option<crate::oid::PgTypeOid>| t.is_some_and(|t| t.get() >= FIRST_NORMAL_OBJECT_ID);
-    fn opt(n: &Option<Box<pg_query::protobuf::Node>>) -> Vec<&pg_query::protobuf::Node> {
+    fn opt(
+        n: &Option<Box<typedpg_pg_query::protobuf::Node>>,
+    ) -> Vec<&typedpg_pg_query::protobuf::Node> {
         n.as_deref().into_iter().collect()
     }
-    let children: Vec<&pg_query::protobuf::Node> = match inner {
+    let children: Vec<&typedpg_pg_query::protobuf::Node> = match inner {
         node::Node::ColumnRef(cr) => {
             let Some(name) = cr.fields.last().and_then(super::util::node_string) else {
                 return Err(invalid_row_filter(ONLY_SIMPLE));
@@ -685,7 +687,7 @@ pub fn alter_publication(
 /// DROP PUBLICATION [IF EXISTS] name.
 pub(crate) fn drop_publication(
     interp: &mut PgCatalog,
-    obj_node: &pg_query::protobuf::Node,
+    obj_node: &typedpg_pg_query::protobuf::Node,
     missing_ok: bool,
 ) -> Result<(), DdlError> {
     let Some(name) = super::util::node_string(obj_node).map(str::to_owned) else {
@@ -702,7 +704,7 @@ pub(crate) fn drop_publication(
 /// ALTER PUBLICATION name RENAME TO new.
 pub(crate) fn rename_publication(
     interp: &mut PgCatalog,
-    stmt: &pg_query::protobuf::RenameStmt,
+    stmt: &typedpg_pg_query::protobuf::RenameStmt,
 ) -> Result<(), DdlError> {
     let Some(old) = stmt.object.as_deref().and_then(super::util::node_string) else {
         return Ok(());

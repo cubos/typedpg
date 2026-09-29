@@ -14,7 +14,7 @@
 //! ([`crate::expr::with_sql_function_params`]), after columns and relations,
 //! as PG's `sql_fn_post_column_ref` does.
 
-use pg_query::protobuf::{self, CreateFunctionStmt, Token, node};
+use typedpg_pg_query::protobuf::{self, CreateFunctionStmt, Token, node};
 
 use super::DdlError;
 use crate::coerce::{CoercionContext, can_coerce};
@@ -57,7 +57,8 @@ pub(crate) fn validate_sql_function(
     let mut last: Option<LastStatement> = None;
     for sql in &statements {
         let rewritten = substitute_params(interp, sql, &params)?;
-        let parsed = pg_query::parse(&rewritten).map_err(|e| DdlError::Parse(e.to_string()))?;
+        let parsed =
+            typedpg_pg_query::parse(&rewritten).map_err(|e| DdlError::Parse(e.to_string()))?;
         for raw in &parsed.protobuf.stmts {
             let Some(inner) = raw.stmt.as_ref().and_then(|n| n.node.as_ref()) else {
                 continue;
@@ -355,7 +356,7 @@ fn substitute_params(
     sql: &str,
     params: &[(String, PgTypeOid)],
 ) -> Result<String, DdlError> {
-    let scan = pg_query::scan(sql).map_err(|e| DdlError::Parse(e.to_string()))?;
+    let scan = typedpg_pg_query::scan(sql).map_err(|e| DdlError::Parse(e.to_string()))?;
     let tokens = &scan.tokens;
     let text = |t: &protobuf::ScanToken| &sql[t.start as usize..t.end as usize];
     let typed = |n: usize| -> Option<String> {
@@ -428,7 +429,7 @@ pub(crate) fn inlinable_body(stmt: &CreateFunctionStmt, proc: &PgProc) -> Option
     let [source] = statements.as_slice() else {
         return None;
     };
-    let parsed = pg_query::parse(source).ok()?;
+    let parsed = typedpg_pg_query::parse(source).ok()?;
     let [raw] = parsed.protobuf.stmts.as_slice() else {
         return None;
     };
@@ -483,7 +484,7 @@ pub(crate) fn validate_plpgsql_function(
 /// types) before it runs. What the block does when it runs isn't modeled.
 pub(crate) fn do_block(
     interp: &PgCatalog,
-    stmt: &pg_query::protobuf::DoStmt,
+    stmt: &typedpg_pg_query::protobuf::DoStmt,
 ) -> Result<(), DdlError> {
     let mut code = None;
     let mut language = "plpgsql".to_owned();
@@ -532,8 +533,8 @@ pub(crate) fn do_block(
 /// applies make_return_stmt's rules — and resolve its declared variables'
 /// types.
 fn compile_plpgsql(interp: &PgCatalog, sql: &str) -> Result<(), DdlError> {
-    let parsed = pg_query::parse_plpgsql(sql).map_err(|e| match e {
-        pg_query::Error::Parse(msg) => DdlError::Parse(msg),
+    let parsed = typedpg_pg_query::parse_plpgsql(sql).map_err(|e| match e {
+        typedpg_pg_query::Error::Parse(msg) => DdlError::Parse(msg),
         other => DdlError::Parse(other.to_string()),
     })?;
     let datums = parsed
@@ -561,12 +562,12 @@ fn compile_plpgsql(interp: &PgCatalog, sql: &str) -> Result<(), DdlError> {
         // couldn't resolve (any user-defined one) is compiled as a record
         // and only its written name tells what it was.
         if let Some(names) = ty.get("origtypname").and_then(|n| n.as_array()) {
-            let tn = pg_query::protobuf::TypeName {
+            let tn = typedpg_pg_query::protobuf::TypeName {
                 names: names
                     .iter()
                     .filter_map(|n| n.as_str())
-                    .map(|n| pg_query::protobuf::Node {
-                        node: Some(node::Node::String(pg_query::protobuf::String {
+                    .map(|n| typedpg_pg_query::protobuf::Node {
+                        node: Some(node::Node::String(typedpg_pg_query::protobuf::String {
                             sval: n.to_owned(),
                         })),
                     })
@@ -575,8 +576,8 @@ fn compile_plpgsql(interp: &PgCatalog, sql: &str) -> Result<(), DdlError> {
                     .get("origtypname_array_bounds")
                     .and_then(|b| b.as_u64())
                     .unwrap_or(0))
-                    .map(|_| pg_query::protobuf::Node {
-                        node: Some(node::Node::Integer(pg_query::protobuf::Integer {
+                    .map(|_| typedpg_pg_query::protobuf::Node {
+                        node: Some(node::Node::Integer(typedpg_pg_query::protobuf::Integer {
                             ival: -1,
                         })),
                     })
@@ -624,11 +625,13 @@ fn check_declared_type(interp: &PgCatalog, typname: &str) -> Result<(), DdlError
         if names.len() < 2 {
             return Ok(());
         }
-        let tn = pg_query::protobuf::TypeName {
+        let tn = typedpg_pg_query::protobuf::TypeName {
             names: names
                 .into_iter()
-                .map(|n| pg_query::protobuf::Node {
-                    node: Some(node::Node::String(pg_query::protobuf::String { sval: n })),
+                .map(|n| typedpg_pg_query::protobuf::Node {
+                    node: Some(node::Node::String(typedpg_pg_query::protobuf::String {
+                        sval: n,
+                    })),
                 })
                 .collect(),
             pct_type: true,
@@ -637,7 +640,7 @@ fn check_declared_type(interp: &PgCatalog, typname: &str) -> Result<(), DdlError
         super::util::lookup_type_name(&tn, interp)?;
         return Ok(());
     }
-    let Ok(parsed) = pg_query::parse(&format!("SELECT NULL::{trimmed}")) else {
+    let Ok(parsed) = typedpg_pg_query::parse(&format!("SELECT NULL::{trimmed}")) else {
         return Ok(());
     };
     let tn = parsed
@@ -645,7 +648,7 @@ fn check_declared_type(interp: &PgCatalog, typname: &str) -> Result<(), DdlError
         .nodes()
         .into_iter()
         .find_map(|(n, ..)| match n {
-            pg_query::NodeRef::TypeCast(tc) => tc.type_name.clone(),
+            typedpg_pg_query::NodeRef::TypeCast(tc) => tc.type_name.clone(),
             _ => None,
         });
     if let Some(tn) = tn {

@@ -4,8 +4,8 @@
 //! window functions (`transformWindowFuncCall`) and — except in policies —
 //! sub-selects (`transformSubLink`).
 
-use pg_query::NodeRef;
-use pg_query::protobuf;
+use typedpg_pg_query::NodeRef;
+use typedpg_pg_query::protobuf;
 
 use super::DdlError;
 use crate::pg_catalog::PgCatalog;

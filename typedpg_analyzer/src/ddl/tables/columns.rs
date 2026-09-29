@@ -4,7 +4,7 @@ use super::*;
 /// type, or `None` for any other type name. Mirrors the check at the top of
 /// `transformColumnDefinition` (`parse_utilcmd.c`): the name must be
 /// unqualified or `pg_catalog`-qualified, with no array bounds.
-pub(crate) fn serial_base_type(tn: &pg_query::protobuf::TypeName) -> Option<PgTypeOid> {
+pub(crate) fn serial_base_type(tn: &typedpg_pg_query::protobuf::TypeName) -> Option<PgTypeOid> {
     use crate::pg_catalog::oid;
     if !tn.array_bounds.is_empty() || tn.pct_type {
         return None;
@@ -27,7 +27,7 @@ pub(crate) fn serial_base_type(tn: &pg_query::protobuf::TypeName) -> Option<PgTy
 }
 
 /// Whether the column definition carries a constraint of kind `kind`.
-fn has_constraint(cd: &pg_query::protobuf::ColumnDef, kind: ConstrType) -> bool {
+fn has_constraint(cd: &typedpg_pg_query::protobuf::ColumnDef, kind: ConstrType) -> bool {
     cd.constraints.iter().any(
         |n| matches!(n.node.as_ref(), Some(node::Node::Constraint(c)) if c.contype == kind as i32),
     )
@@ -35,8 +35,8 @@ fn has_constraint(cd: &pg_query::protobuf::ColumnDef, kind: ConstrType) -> bool 
 
 /// The DEFAULT expression written on a column definition, if any.
 pub(crate) fn column_default_expr(
-    cd: &pg_query::protobuf::ColumnDef,
-) -> Option<&pg_query::protobuf::Node> {
+    cd: &typedpg_pg_query::protobuf::ColumnDef,
+) -> Option<&typedpg_pg_query::protobuf::Node> {
     cd.raw_default.as_deref().or_else(|| {
         cd.constraints.iter().find_map(|n| match n.node.as_ref()? {
             node::Node::Constraint(c) if c.contype == ConstrType::ConstrDefault as i32 => {
@@ -52,10 +52,10 @@ pub(crate) fn column_default_expr(
 pub(crate) fn parse_column_def(
     interp: &PgCatalog,
     relname: &str,
-    cd: &pg_query::protobuf::ColumnDef,
+    cd: &typedpg_pg_query::protobuf::ColumnDef,
     pk_columns: &[String],
 ) -> Result<ParsedColumn, DdlError> {
-    // Detect SERIAL/BIGSERIAL/SMALLSERIAL from type name — pg_query keeps the
+    // Detect SERIAL/BIGSERIAL/SMALLSERIAL from type name — typedpg_pg_query keeps the
     // original name and does NOT rewrite to int4 + nextval(...).
     let serial_type = cd.type_name.as_ref().and_then(serial_base_type);
     let is_serial = serial_type.is_some();
@@ -326,7 +326,7 @@ pub(crate) fn set_identity(
     // ATExecSetIdentity: the other options alter the identity sequence
     // (AlterSequence's init_params).
     if let Some(node::Node::List(list)) = def.node.as_ref() {
-        let options: Vec<pg_query::protobuf::Node> = list
+        let options: Vec<typedpg_pg_query::protobuf::Node> = list
             .items
             .iter()
             .filter(|o| {
@@ -999,7 +999,7 @@ fn check_using_expression(
     interp: &PgCatalog,
     relid: PgClassOid,
     attr: &PgAttribute,
-    expr: &pg_query::protobuf::Node,
+    expr: &typedpg_pg_query::protobuf::Node,
     new_type: PgTypeOid,
 ) -> Result<(), DdlError> {
     use crate::expr::{TypeGoal, infer_expr};
@@ -1071,7 +1071,7 @@ pub(crate) fn type_collation(
 /// type's default.
 pub(crate) fn column_collation(
     interp: &PgCatalog,
-    cd: &pg_query::protobuf::ColumnDef,
+    cd: &typedpg_pg_query::protobuf::ColumnDef,
     type_oid: PgTypeOid,
 ) -> Result<Option<crate::oid::PgCollationOid>, DdlError> {
     let Some(coll) = cd.coll_clause.as_deref() else {
@@ -1214,7 +1214,7 @@ fn check_generation_expression(
     interp: &PgCatalog,
     relid: PgClassOid,
     attr: &PgAttribute,
-    expr: &pg_query::protobuf::Node,
+    expr: &typedpg_pg_query::protobuf::Node,
 ) -> Result<(), DdlError> {
     use crate::expr::{TypeGoal, infer_expr};
     use crate::nullability::NullabilityContext;

@@ -360,7 +360,7 @@ pub(crate) fn recursive_query_column_type(
     )
 }
 
-/// A parse error from `pg_query`, which carries PG's message but not its
+/// A parse error from `typedpg_pg_query`, which carries PG's message but not its
 /// SQLSTATE. Most grammar errors are `syntax_error` (42601), but gram.y
 /// raises a few with another code; those messages (from PG 18's gram.y,
 /// the query-level ones) get the variant carrying that code — the frame

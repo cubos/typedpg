@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use pg_query::protobuf::{self, CmdType, JoinType, SetOperation, node};
+use typedpg_pg_query::protobuf::{self, CmdType, JoinType, SetOperation, node};
 
 use crate::error::AnalyzeError;
 use crate::expr::{self, Ctx, TypeGoal};
@@ -201,22 +201,22 @@ pub(crate) fn fuse(
 // Internal static analyzer
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Parse `sql` with `pg_query`, walk the AST, and produce the resolved output
+/// Parse `sql` with `typedpg_pg_query`, walk the AST, and produce the resolved output
 /// columns, parameter type information, and the subquery-wrap eligibility
 /// flag.
 ///
 /// `param_nullability` seeds explicit `$foo?`/`$foo!` annotations indexed by
 /// 1-based positional parameter index minus one.
-/// Extract the PG-verbatim message from a `pg_query` parse failure.
+/// Extract the PG-verbatim message from a `typedpg_pg_query` parse failure.
 ///
-/// `pg_query::Error::Parse`'s `Display` prepends `"Invalid statement: "` to the
+/// `typedpg_pg_query::Error::Parse`'s `Display` prepends `"Invalid statement: "` to the
 /// server-side wording (`syntax error at or near "x"`). The error-message
 /// contract requires our message to *start with* PG's verbatim text, so for the
 /// `Parse` variant we return the inner string unwrapped; other variants keep
 /// their full `Display`.
-fn parse_error_message(e: &pg_query::Error) -> String {
+fn parse_error_message(e: &typedpg_pg_query::Error) -> String {
     match e {
-        pg_query::Error::Parse(msg) => msg.clone(),
+        typedpg_pg_query::Error::Parse(msg) => msg.clone(),
         other => other.to_string(),
     }
 }
@@ -226,8 +226,8 @@ pub(crate) fn analyze_static(
     sql: &str,
     param_nullability: &[Option<bool>],
 ) -> Result<(Vec<AnalyzedColumn>, Vec<ParamInfo>, bool), AnalyzeError> {
-    let parsed =
-        pg_query::parse(sql).map_err(|e| crate::pgmsg::grammar_error(parse_error_message(&e)))?;
+    let parsed = typedpg_pg_query::parse(sql)
+        .map_err(|e| crate::pgmsg::grammar_error(parse_error_message(&e)))?;
 
     let stmt = parsed
         .protobuf

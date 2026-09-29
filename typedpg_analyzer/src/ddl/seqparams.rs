@@ -2,7 +2,7 @@
 //! are checked against each other and the sequence's data type like
 //! `init_params` (sequence.c) does.
 
-use pg_query::protobuf::node;
+use typedpg_pg_query::protobuf::node;
 
 use super::DdlError;
 use crate::oid::PgTypeOid;
@@ -47,8 +47,8 @@ impl SeqParams {
 impl SeqParams {
     /// sequence_options (sequence.c): these parameters as the option list
     /// that recreates them.
-    pub(crate) fn as_options(&self) -> Vec<pg_query::protobuf::Node> {
-        use pg_query::protobuf::{DefElem, Float, Integer, Node};
+    pub(crate) fn as_options(&self) -> Vec<typedpg_pg_query::protobuf::Node> {
+        use typedpg_pg_query::protobuf::{DefElem, Float, Integer, Node};
         let def = |name: &str, value: i128| {
             let arg = match i32::try_from(value) {
                 Ok(ival) => node::Node::Integer(Integer { ival }),
@@ -74,7 +74,7 @@ impl SeqParams {
     }
 }
 
-fn numeric_arg(de: &pg_query::protobuf::DefElem) -> Option<i128> {
+fn numeric_arg(de: &typedpg_pg_query::protobuf::DefElem) -> Option<i128> {
     match de.arg.as_deref().and_then(|a| a.node.as_ref())? {
         node::Node::Integer(i) => Some(i128::from(i.ival)),
         node::Node::Float(f) => f.fval.parse().ok(),
@@ -86,7 +86,7 @@ fn numeric_arg(de: &pg_query::protobuf::DefElem) -> Option<i128> {
 /// init_params: apply `options` to `current` (a new sequence when `None`).
 pub(crate) fn init_params(
     interp: &PgCatalog,
-    options: &[pg_query::protobuf::Node],
+    options: &[typedpg_pg_query::protobuf::Node],
     current: Option<SeqParams>,
 ) -> Result<SeqParams, DdlError> {
     match current {
@@ -100,7 +100,7 @@ pub(crate) fn init_params(
 /// sequence parameters.
 pub(crate) fn init_column_params(
     interp: &PgCatalog,
-    options: &[pg_query::protobuf::Node],
+    options: &[typedpg_pg_query::protobuf::Node],
     typ: PgTypeOid,
 ) -> Result<SeqParams, DdlError> {
     apply(interp, options, SeqParams::defaults(typ), true)
@@ -108,7 +108,7 @@ pub(crate) fn init_column_params(
 
 fn apply(
     interp: &PgCatalog,
-    options: &[pg_query::protobuf::Node],
+    options: &[typedpg_pg_query::protobuf::Node],
     old: SeqParams,
     is_init: bool,
 ) -> Result<SeqParams, DdlError> {

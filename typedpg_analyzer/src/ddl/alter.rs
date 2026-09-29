@@ -5,7 +5,7 @@
 //! of an object — every other attribute (STRICT, VOLATILE, owner, tablespace,
 //! …) is irrelevant for static type analysis and remains a no-op.
 
-use pg_query::protobuf::{AlterObjectSchemaStmt, ObjectType, RenameStmt, node};
+use typedpg_pg_query::protobuf::{AlterObjectSchemaStmt, ObjectType, RenameStmt, node};
 
 use super::DdlError;
 use super::util::{node_string, resolve_type_name};
@@ -172,7 +172,7 @@ fn rename_domain_constraint(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result
     let Some(node::Node::List(l)) = stmt.object.as_deref().and_then(|o| o.node.as_ref()) else {
         return Ok(());
     };
-    let tn = pg_query::protobuf::TypeName {
+    let tn = typedpg_pg_query::protobuf::TypeName {
         names: l.items.clone(),
         ..Default::default()
     };
@@ -272,7 +272,7 @@ fn rename_column(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlErr
             "cannot rename column of typed table".into(),
         ));
     }
-    let cascade = stmt.behavior == pg_query::protobuf::DropBehavior::DropCascade as i32;
+    let cascade = stmt.behavior == typedpg_pg_query::protobuf::DropBehavior::DropCascade as i32;
     let typed = crate::ddl::tables::typed::typed_table_dependents(interp, relid, cascade)?;
     rename_column_in(interp, relid, &stmt.subname, &stmt.newname, rv.inh, false)?;
     for table in typed {
@@ -612,7 +612,7 @@ fn set_type_schema(
 
 /// Extract `(schema_opt, name, arg_oids)` from an `ObjectWithArgs` target.
 pub(crate) fn extract_func_target(
-    object: &Option<Box<pg_query::protobuf::Node>>,
+    object: &Option<Box<typedpg_pg_query::protobuf::Node>>,
     interp: &PgCatalog,
 ) -> Option<(Option<String>, String, Vec<PgTypeOid>)> {
     let node = object.as_deref()?;
