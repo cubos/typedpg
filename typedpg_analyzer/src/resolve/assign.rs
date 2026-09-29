@@ -334,7 +334,6 @@ pub(crate) fn analyze_set_clause(
             })?;
         let target = assignment_target(tc, &rt.indirection, ctx, params)?;
         assigned.push((tc.attname.as_str(), target.indirected));
-        let is_default = matches!(&value, SetValue::Expr(v) if is_set_to_default(v));
         match value {
             SetValue::Expr(val) => {
                 // Catch `UPDATE … SET not_null_col = NULL` statically — PG
@@ -358,7 +357,6 @@ pub(crate) fn analyze_set_clause(
                 {
                     return Err(err);
                 }
-                check_update_generated(tc, is_default)?;
                 let goal = TypeGoal::assignment(target.type_oid).with_source_column(&tc.attname);
                 // Attach the target column's reference span so a
                 // TypeMismatch surfaces a secondary label at the `col =`
@@ -378,7 +376,6 @@ pub(crate) fn analyze_set_clause(
                 }
             }
             SetValue::SubqueryColumn(col) => {
-                check_update_generated(tc, false)?;
                 if col.type_oid != target.type_oid
                     && !crate::coerce::can_coerce(
                         col.type_oid,
@@ -408,25 +405,6 @@ pub(crate) fn analyze_set_clause(
             )
             .finalize_implicit());
         }
-    }
-    Ok(())
-}
-
-/// Generated and `GENERATED ALWAYS` identity columns can only be updated to
-/// `DEFAULT`.
-fn check_update_generated(
-    tc: &crate::pg_catalog::PgAttribute,
-    is_default: bool,
-) -> Result<(), AnalyzeError> {
-    if tc.attgenerated.is_some() && !is_default {
-        return Err(
-            crate::pgmsg::update_generated_to_non_default(&tc.attname, false).finalize_implicit(),
-        );
-    }
-    if tc.attidentity == Some(AttIdentity::Always) && !is_default {
-        return Err(
-            crate::pgmsg::update_generated_to_non_default(&tc.attname, true).finalize_implicit(),
-        );
     }
     Ok(())
 }

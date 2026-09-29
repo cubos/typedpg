@@ -230,6 +230,18 @@ pub(crate) fn merge_view_partial_instead_triggers(view: &str) -> RawError {
     )
 }
 
+/// RewriteQuery: `infinite recursion detected in rules for relation "r"` —
+/// SQLSTATE 42P17.
+pub(crate) fn infinite_rule_recursion(relation: &str) -> RawError {
+    RawError::new(
+        AnalyzeError::InvalidObjectDefinition(format!(
+            "infinite recursion detected in rules for relation \"{relation}\""
+        )),
+        None,
+        None,
+    )
+}
+
 /// matchLocks: `cannot execute MERGE on relation "r"` — SQLSTATE 0A000.
 pub(crate) fn merge_on_relation_with_rules(relation: &str) -> RawError {
     RawError::new(
@@ -1124,6 +1136,7 @@ mod tests {
             (no_on_conflict_arbiter("t").kind, "42P10"),
             (insert_non_default_into_generated("g", false).kind, "428C9"),
             (update_generated_to_non_default("g", true).kind, "428C9"),
+            (infinite_rule_recursion("t").kind, "42P17"),
             (
                 view_not_updatable(crate::resolve::DmlEvent::Insert, "v", "x", false).kind,
                 "55000",

@@ -117,6 +117,12 @@ pub enum AnalyzeError {
     #[error("{0}")]
     ObjectNotInPrerequisiteState(String),
 
+    /// A definition that can't be used as it stands (rules that fire each
+    /// other forever). Equivalent to PG `invalid_object_definition`
+    /// (SQLSTATE 42P17).
+    #[error("{0}")]
+    InvalidObjectDefinition(String),
+
     /// Semantic-analysis errors PostgreSQL classifies as `syntax_error`
     /// (SQLSTATE 42601) even though they aren't grammar failures: VALUES
     /// list arity, set-operation column counts.
@@ -285,6 +291,7 @@ impl AnalyzeError {
             WindowingError(_) => Some("42P20"),
             GeneratedAlways(_) => Some("428C9"),
             ObjectNotInPrerequisiteState(_) => Some("55000"),
+            InvalidObjectDefinition(_) => Some("42P17"),
             TypeMismatch { .. }
             | Invalid(_)
             | InvalidLiteral(_)
@@ -971,6 +978,7 @@ fn replace_message(e: AnalyzeError, rendered: String) -> AnalyzeError {
         AnalyzeError::ObjectNotInPrerequisiteState(_) => {
             AnalyzeError::ObjectNotInPrerequisiteState(rendered)
         }
+        AnalyzeError::InvalidObjectDefinition(_) => AnalyzeError::InvalidObjectDefinition(rendered),
         AnalyzeError::SyntaxError(_) => AnalyzeError::SyntaxError(rendered),
         AnalyzeError::UndefinedSchema(_) => AnalyzeError::UndefinedSchema(rendered),
         AnalyzeError::FeatureNotSupported(_) => AnalyzeError::FeatureNotSupported(rendered),

@@ -381,18 +381,6 @@ fn merge_when_insert(
             ) {
                 return Err(err);
             }
-            if tc.attgenerated.is_some() && !is_set_to_default(val) {
-                return Err(
-                    crate::pgmsg::insert_non_default_into_generated(&tc.attname, false)
-                        .finalize_implicit(),
-                );
-            }
-            if tc.attidentity == Some(AttIdentity::Always) && !is_set_to_default(val) {
-                return Err(
-                    crate::pgmsg::insert_non_default_into_generated(&tc.attname, true)
-                        .finalize_implicit(),
-                );
-            }
         }
         let goal = target_col
             .map(|tc| TypeGoal::assignment(tc.atttypid))

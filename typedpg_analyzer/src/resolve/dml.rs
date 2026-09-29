@@ -389,25 +389,6 @@ fn analyze_insert_values(
             {
                 return Err(err);
             }
-            if let Some(tc) = target_col
-                && tc.attgenerated.is_some()
-                && !is_set_to_default(val)
-            {
-                return Err(
-                    crate::pgmsg::insert_non_default_into_generated(&tc.attname, false)
-                        .finalize_implicit(),
-                );
-            }
-            if let Some(tc) = target_col
-                && tc.attidentity == Some(AttIdentity::Always)
-                && !is_set_to_default(val)
-                && !tgt.overriding
-            {
-                return Err(
-                    crate::pgmsg::insert_non_default_into_generated(&tc.attname, true)
-                        .finalize_implicit(),
-                );
-            }
             let goal = match (target_col, &target) {
                 (Some(tc), Some(t)) => {
                     TypeGoal::assignment(t.type_oid).with_source_column(&tc.attname)
@@ -488,27 +469,6 @@ fn analyze_insert_select(
     } else {
         &[]
     };
-    // INSERT ... SELECT cannot supply `DEFAULT`, so any target column that is
-    // `GENERATED ALWAYS AS IDENTITY` is rejected unless the user requested
-    // OVERRIDING SYSTEM VALUE, and a generated column (stored or virtual)
-    // always is — PG's `rewriteTargetListIU` checks both per column.
-    for i in 0..sel_cols.len() {
-        let Some(tc) = target_col_at(tgt, i) else {
-            continue;
-        };
-        if tc.attidentity == Some(AttIdentity::Always) && !tgt.overriding {
-            return Err(
-                crate::pgmsg::insert_non_default_into_generated(&tc.attname, true)
-                    .finalize_implicit(),
-            );
-        }
-        if tc.attgenerated.is_some() {
-            return Err(
-                crate::pgmsg::insert_non_default_into_generated(&tc.attname, false)
-                    .finalize_implicit(),
-            );
-        }
-    }
     // Each SELECT output column must be assignment-coercible to its target
     // column — PG rejects `INSERT INTO t (int8_col) SELECT jsonb_col …` at
     // parse time with `column "X" is of type Y but expression is of type Z`.

@@ -5,7 +5,8 @@
 //!
 //! The rule's WHERE condition is type-checked over NEW / OLD; its actions
 //! are checked for the relations they name and analyzed with each NEW /
-//! OLD column reference standing in as a typed NULL.
+//! OLD column reference standing in as a typed NULL. The rewriter's checks
+//! on an action run when a statement fires the rule, as in PG.
 
 use typedpg_pg_query::protobuf::{CmdType, RuleStmt, node};
 
@@ -31,6 +32,11 @@ pub(crate) struct Rule {
     /// Fires in the default (origin) session replication role:
     /// `ev_enabled` is `O` or `A`.
     pub(crate) enabled: bool,
+    /// Has actions (not `DO NOTHING`): firing produces product queries.
+    pub(crate) has_actions: bool,
+    /// The INSERT / UPDATE / DELETE actions, as the rewriter rewrites them
+    /// when the rule fires.
+    pub(crate) actions: Vec<crate::resolve::rewrite::RuleAction>,
 }
 
 pub fn create_rule(interp: &mut PgCatalog, stmt: &RuleStmt) -> Result<(), DdlError> {
@@ -118,10 +124,15 @@ pub fn create_rule(interp: &mut PgCatalog, stmt: &RuleStmt) -> Result<(), DdlErr
         pseudo_refs(qual, true)?;
         check_rule_qual(interp, relid, qual, has_old, has_new)?;
     }
+    let mut actions = Vec::new();
     for action in &stmt.actions {
         pseudo_refs(action, false)?;
         check_action_relations(interp, action)?;
-        check_action_query(interp, relid, action, has_old, has_new)?;
+        let (checked, rewrites) = crate::resolve::rewrite::collect_rule_actions(|| {
+            check_action_query(interp, relid, action, has_old, has_new)
+        });
+        checked?;
+        actions.extend(rewrites);
     }
 
     let relname = rv.relname.clone();
@@ -147,6 +158,8 @@ pub fn create_rule(interp: &mut PgCatalog, stmt: &RuleStmt) -> Result<(), DdlErr
         conditional: stmt.where_clause.is_some(),
         returning,
         enabled: true,
+        has_actions: !stmt.actions.is_empty(),
+        actions,
     };
     let rules = interp.rules.entry(relid).or_default();
     if let Some(existing) = rules.iter_mut().find(|r| r.name == stmt.rulename) {

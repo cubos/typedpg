@@ -411,3 +411,69 @@ fn base_relation_constraints_through_views() {
         "constraint \"c_pkey\" for table \"vc\" does not exist",
     );
 }
+
+#[test]
+fn rule_actions_are_rewritten_when_the_rule_fires() {
+    // transformRuleStmt leaves the rewriter's checks to the statements that
+    // fire the rule: these rules are created, and firing them fails.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE g (a int, b int GENERATED ALWAYS AS (a * 2) STORED);
+         CREATE TABLE s (a int);
+         CREATE RULE r2 AS ON INSERT TO s DO ALSO INSERT INTO g VALUES (new.a, new.a);
+         CREATE TABLE u (a int);
+         CREATE VIEW vg AS SELECT a, count(*) AS n FROM u GROUP BY a;
+         CREATE TABLE w (a int);
+         CREATE RULE r3 AS ON UPDATE TO w DO ALSO DELETE FROM vg;
+         CREATE TABLE ok (a int);
+         CREATE TABLE log (a int);
+         CREATE RULE r4 AS ON INSERT TO ok DO ALSO INSERT INTO log VALUES (new.a);
+         CREATE TABLE quiet (a int PRIMARY KEY);
+         CREATE RULE r5 AS ON INSERT TO quiet DO INSTEAD NOTHING;",
+    )
+    .unwrap();
+    assert_prefix(
+        &db,
+        "INSERT INTO s VALUES (1)",
+        "cannot insert a non-DEFAULT value into column \"b\"",
+    );
+    assert_prefix(&db, "UPDATE w SET a = 1", "cannot delete from view \"vg\"");
+    assert_ok(&db, "INSERT INTO ok VALUES (1)");
+    assert_ok(&db, "DELETE FROM w");
+    // DO INSTEAD NOTHING yields no product query.
+    assert_ok(&db, "INSERT INTO quiet VALUES (1) ON CONFLICT DO NOTHING");
+}
+
+#[test]
+fn rules_that_fire_themselves_are_infinite_recursion() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE t (a int);
+         CREATE RULE r1 AS ON INSERT TO t DO ALSO INSERT INTO t VALUES (new.a);
+         CREATE TABLE p (a int);
+         CREATE TABLE q (a int);
+         CREATE RULE rp AS ON DELETE TO p DO ALSO DELETE FROM q;
+         CREATE RULE rq AS ON DELETE TO q DO ALSO DELETE FROM p;
+         CREATE TABLE base (a int);
+         CREATE VIEW vbase AS SELECT a FROM base;
+         CREATE RULE rb AS ON UPDATE TO base DO ALSO UPDATE vbase SET a = new.a;",
+    )
+    .unwrap();
+    for (sql, relation) in [
+        ("INSERT INTO t VALUES (1)", "t"),
+        ("DELETE FROM p", "p"),
+        ("DELETE FROM q", "q"),
+        ("UPDATE base SET a = 1", "base"),
+        ("UPDATE vbase SET a = 1", "vbase"),
+    ] {
+        let err = assert_prefix(
+            &db,
+            sql,
+            &format!("infinite recursion detected in rules for relation \"{relation}\""),
+        );
+        assert!(
+            matches!(err, AnalyzeError::InvalidObjectDefinition(_)),
+            "{sql}"
+        );
+    }
+}

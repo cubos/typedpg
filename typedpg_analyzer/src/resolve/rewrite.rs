@@ -140,20 +140,58 @@ pub(crate) fn check_rewrite(
     relid: crate::oid::PgClassOid,
     rw: &Rewrite,
 ) -> Result<(), AnalyzeError> {
+    let collected = RULE_ACTIONS.with(|c| match c.borrow_mut().as_mut() {
+        Some(actions) => {
+            actions.push((relid, rw.clone()));
+            true
+        }
+        None => false,
+    });
+    if collected {
+        return Ok(());
+    }
     let mut execution_error = None;
-    rewrite_level(snapshot, relid, rw, 0, &mut execution_error)?;
+    rewrite_level(
+        snapshot,
+        relid,
+        rw,
+        0,
+        &mut execution_error,
+        &mut Vec::new(),
+    )?;
     execution_error.map_or(Ok(()), Err)
+}
+
+/// A rule action's result relation and what the rewriter sees of it.
+pub(crate) type RuleAction = (crate::oid::PgClassOid, Rewrite);
+
+thread_local! {
+    /// Set while a rule's actions are analyzed ([`collect_rule_actions`]).
+    static RULE_ACTIONS: std::cell::RefCell<Option<Vec<RuleAction>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` (transformRuleStmt's analysis of a rule's actions) without the
+/// rewriter: PG rewrites an action only when a statement fires the rule.
+/// What the rewriter would have been handed is returned alongside.
+pub(crate) fn collect_rule_actions<R>(f: impl FnOnce() -> R) -> (R, Vec<RuleAction>) {
+    let prev = RULE_ACTIONS.with(|c| c.replace(Some(Vec::new())));
+    let out = f();
+    let actions = RULE_ACTIONS.with(|c| c.replace(prev)).unwrap_or_default();
+    (out, actions)
 }
 
 /// One `RewriteQuery` level. `execution_error` collects the NOT NULL
 /// violation a bare `NULL` written through a view to the base relation
-/// raises at execution — after every rewriter error.
+/// raises at execution — after every rewriter error; `rewrite_events` holds
+/// the (relation, event) pairs whose product queries are being rewritten.
 fn rewrite_level(
     snapshot: &PgCatalog,
     relid: crate::oid::PgClassOid,
     rw: &Rewrite,
     depth: usize,
     execution_error: &mut Option<AnalyzeError>,
+    rewrite_events: &mut Vec<(crate::oid::PgClassOid, Option<DmlEvent>)>,
 ) -> Result<(), AnalyzeError> {
     let Some(class) = snapshot.pg_class.get(&relid) else {
         return Ok(());
@@ -162,20 +200,13 @@ fn rewrite_level(
     let is_view = class.relkind == RelKind::View;
     let attrs = snapshot.attributes_of(relid);
 
-    // rewriteTargetListIU. The result relation named by the statement
-    // itself had its generated / identity columns checked during analysis;
-    // one reached through a view is checked here.
+    // rewriteTargetListIU.
     let mut actions = Vec::with_capacity(rw.actions.len());
     for action in &rw.actions {
         let assigns = match action.event {
-            Some(event @ (DmlEvent::Insert | DmlEvent::Update)) => target_list_iu(
-                attrs,
-                event,
-                &action.assigns,
-                action.overriding,
-                is_view,
-                depth > 0,
-            )?,
+            Some(event @ (DmlEvent::Insert | DmlEvent::Update)) => {
+                target_list_iu(attrs, event, &action.assigns, action.overriding, is_view)?
+            }
             _ => Vec::new(),
         };
         actions.push(Action {
@@ -190,7 +221,6 @@ fn rewrite_level(
             set,
             false,
             is_view,
-            depth > 0,
         )?)),
         other => other.clone(),
     };
@@ -223,7 +253,7 @@ fn rewrite_level(
     let rule_returning = matching
         .iter()
         .any(|r| r.instead && !r.conditional && r.returning);
-    let product_queries = !matching.is_empty();
+    let product_queries = matching.iter().any(|r| r.has_actions);
 
     if depth > 0 && !is_view && execution_error.is_none() {
         let written = actions
@@ -257,6 +287,7 @@ fn rewrite_level(
     }
 
     let mut updatable_view = false;
+    let mut view_product = None;
     if !instead && is_view && !view_has_instead_trigger(snapshot, relid, event, &actions) {
         if qual_product && let Some(event) = event {
             return Err(crate::pgmsg::view_not_updatable(
@@ -272,16 +303,43 @@ fn rewrite_level(
             on_conflict,
             ..rw.clone()
         };
-        rewrite_target_view(
-            snapshot,
-            relid,
-            relname,
-            rw,
-            &rewritten,
-            depth,
-            execution_error,
-        )?;
+        view_product = rewrite_target_view(snapshot, relid, relname, rw, &rewritten)?;
         updatable_view = true;
+    }
+
+    // The product queries — the fired rules' actions and the statement
+    // rewritten against a view's base relation (after the actions for
+    // INSERT, before them otherwise) — are rewritten in turn; a relation
+    // and event already being rewritten means the rules recurse.
+    let mut products: Vec<(&RuleAction, usize)> = matching
+        .iter()
+        .flat_map(|r| r.actions.iter())
+        .map(|p| (p, 0))
+        .collect();
+    if let Some(view) = &view_product {
+        let at = if event == Some(DmlEvent::Insert) {
+            products.len()
+        } else {
+            0
+        };
+        products.insert(at, (view, depth + 1));
+    }
+    if product_queries || view_product.is_some() {
+        if rewrite_events.contains(&(relid, event)) {
+            return Err(crate::pgmsg::infinite_rule_recursion(relname).finalize_implicit());
+        }
+        rewrite_events.push((relid, event));
+        for ((target, product), depth) in products {
+            rewrite_level(
+                snapshot,
+                *target,
+                product,
+                depth,
+                execution_error,
+                rewrite_events,
+            )?;
+        }
+        rewrite_events.pop();
     }
 
     if let Some(event) = event
@@ -302,7 +360,7 @@ fn rewrite_level(
 }
 
 /// rewriteTargetListIU over one target list of relation `attrs`: the
-/// GENERATED ALWAYS / generated-column checks (when `check`), and the
+/// GENERATED ALWAYS / generated-column checks, and the
 /// resulting target list — a view column's default replaces a DEFAULT (or,
 /// for INSERT, a missing value); without one, INSERT drops the DEFAULT and
 /// UPDATE sets NULL; generated columns never stay in it.
@@ -312,7 +370,6 @@ fn target_list_iu(
     assigns: &[Assign],
     overriding: bool,
     is_view: bool,
-    check: bool,
 ) -> Result<Vec<Assign>, AnalyzeError> {
     let mut out = Vec::new();
     for att in attrs {
@@ -328,7 +385,7 @@ fn target_list_iu(
             }
             continue;
         };
-        if check && !assigned.default {
+        if !assigned.default {
             let identity_always = att.attidentity == Some(AttIdentity::Always);
             match event {
                 DmlEvent::Insert if identity_always && !overriding => {
@@ -391,23 +448,21 @@ fn view_has_instead_trigger(
     }
 }
 
-/// rewriteTargetView: the view must be automatically updatable, every
-/// column the statement modifies must be one of its base relation's, and
-/// the statement continues against the base relation.
+/// rewriteTargetView: the view must be automatically updatable and every
+/// column the statement modifies must be one of its base relation's; the
+/// statement continues against the base relation, which is returned.
 fn rewrite_target_view(
     snapshot: &PgCatalog,
     relid: crate::oid::PgClassOid,
     relname: &str,
     rw: &Rewrite,
     rewritten: &Rewrite,
-    depth: usize,
-    execution_error: &mut Option<AnalyzeError>,
-) -> Result<(), AnalyzeError> {
+) -> Result<Option<(crate::oid::PgClassOid, Rewrite)>, AnalyzeError> {
     let (actions, on_conflict) = (&rewritten.actions, &rewritten.on_conflict);
     // Views not defined through DDL here (seeded system views) carry no
     // stored query analysis; leave them alone.
     let Some(upd) = snapshot.view_updatability.get(&relid) else {
-        return Ok(());
+        return Ok(None);
     };
     let insert_or_update = rw
         .actions
@@ -428,7 +483,7 @@ fn rewrite_target_view(
                 crate::pgmsg::view_not_updatable(event, relname, reason, rw.merge)
                     .finalize_implicit(),
             ),
-            None => Ok(()),
+            None => Ok(None),
         };
     }
     let view_attrs = snapshot.attributes_of(relid);
@@ -476,7 +531,7 @@ fn rewrite_target_view(
     // Continue against the base relation, with the view's columns renamed
     // to the base columns they are.
     let Some(base) = upd.base else {
-        return Ok(());
+        return Ok(None);
     };
     let base_attrs = snapshot.attributes_of(base);
     let base_name = |column: &str| -> Option<String> {
@@ -511,5 +566,5 @@ fn rewrite_target_view(
         returning: rw.returning,
         listed: rw.listed.iter().filter_map(|c| base_name(c)).collect(),
     };
-    rewrite_level(snapshot, base, &base_rw, depth + 1, execution_error)
+    Ok(Some((base, base_rw)))
 }

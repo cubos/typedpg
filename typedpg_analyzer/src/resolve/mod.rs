@@ -792,7 +792,7 @@ mod dml;
 mod from;
 mod merge;
 mod returning;
-mod rewrite;
+pub(crate) mod rewrite;
 mod select;
 mod set_ops;
 mod target_list;
