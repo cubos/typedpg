@@ -21,6 +21,8 @@ pub(crate) struct Publication {
     schemas: Vec<PgNamespaceOid>,
     /// `pubviaroot`.
     via_root: bool,
+    /// `puballtables`: FOR ALL TABLES.
+    all_tables: bool,
 }
 
 /// A `pg_publication_rel` row: whether it has a row filter (`prqual`) and
@@ -298,6 +300,22 @@ fn check_tables_to_add(
                  supported for {kinds}.)"
             )));
         }
+        // Not a system table (IsCatalogRelation), nor a temporary or
+        // unlogged one.
+        let detail = if relid.get() < FIRST_UNPINNED_OBJECT_ID {
+            Some("This operation is not supported for system tables.")
+        } else {
+            match interp.relpersistence.get(&relid) {
+                Some('t') => Some("This operation is not supported for temporary tables."),
+                Some('u') => Some("This operation is not supported for unlogged tables."),
+                _ => None,
+            }
+        };
+        if let Some(detail) = detail {
+            return Err(DdlError::UnsupportedDdl(format!(
+                "cannot add relation \"{relname}\" to publication ({detail})"
+            )));
+        }
         // pub_collist_validate.
         let mut seen: Vec<&str> = Vec::new();
         for col in pt.columns.iter().filter_map(super::util::node_string) {
@@ -336,6 +354,50 @@ fn check_tables_to_add(
 
 /// First OID of objects not created by initdb (`FirstNormalObjectId`).
 const FIRST_NORMAL_OBJECT_ID: u32 = 16384;
+
+/// `FirstUnpinnedObjectId`: below it, the system catalogs
+/// (IsCatalogRelationOid).
+const FIRST_UNPINNED_OBJECT_ID: u32 = 12000;
+
+/// check_publication_add_schema: not a system schema nor a temporary one.
+fn check_schemas_to_add(interp: &PgCatalog, objects: &[Object<'_>]) -> Result<(), DdlError> {
+    for object in objects {
+        let Object::Schema(ns) = object else {
+            continue;
+        };
+        let detail = if interp.is_system_namespace(*ns) {
+            "This operation is not supported for system schemas."
+        } else if interp.temp_namespace == Some(*ns) {
+            "Temporary schemas cannot be replicated."
+        } else {
+            continue;
+        };
+        return Err(DdlError::UnsupportedDdl(format!(
+            "cannot add schema \"{}\" to publication ({detail})",
+            interp.namespace_name(*ns).unwrap_or_default()
+        )));
+    }
+    Ok(())
+}
+
+/// CheckAlterPublication: a FOR ALL TABLES publication gains or loses no
+/// tables or schemas.
+fn check_alter_all_tables(publication: &Publication, objects: &[Object<'_>]) -> Result<(), DdlError> {
+    if !publication.all_tables {
+        return Ok(());
+    }
+    let detail = if objects.iter().any(|o| matches!(o, Object::Schema(_))) {
+        "Schemas cannot be added to or dropped from FOR ALL TABLES publications."
+    } else if objects.iter().any(|o| matches!(o, Object::Table(..))) {
+        "Tables cannot be added to or dropped from FOR ALL TABLES publications."
+    } else {
+        return Ok(());
+    };
+    Err(DdlError::Parse(format!(
+        "publication \"{}\" is defined as FOR ALL TABLES ({detail})",
+        publication.name
+    )))
+}
 
 /// TransformPubWhereClauses: the row filter is transformed as a WHERE
 /// clause (`transformWhereClause` with EXPR_KIND_WHERE, coerced to
@@ -535,11 +597,13 @@ pub fn create_publication(
     let objects = resolve_objects(interp, &stmt.pubobjects)?;
     let with_schemas = objects.iter().any(|o| matches!(o, Object::Schema(_)));
     check_tables_to_add(interp, &stmt.pubname, &objects, via_root, with_schemas)?;
+    check_schemas_to_add(interp, &objects)?;
     let mut publication = Publication {
         name: stmt.pubname.clone(),
         tables: Vec::new(),
         schemas: Vec::new(),
         via_root,
+        all_tables: stmt.for_all_tables,
     };
     for object in objects {
         match object {
@@ -595,6 +659,7 @@ pub fn alter_publication(
     let objects = resolve_objects(interp, &stmt.pubobjects)?;
     let adds_schemas = objects.iter().any(|o| matches!(o, Object::Schema(_)));
     let publication = &interp.publications[index];
+    check_alter_all_tables(publication, &objects)?;
     match action {
         AlterPublicationAction::ApAddObjects => {
             let with_schemas = adds_schemas || !publication.schemas.is_empty();
@@ -605,6 +670,7 @@ pub fn alter_publication(
                 publication.via_root,
                 with_schemas,
             )?;
+            check_schemas_to_add(interp, &objects)?;
         }
         AlterPublicationAction::ApSetObjects => {
             check_tables_to_add(
@@ -614,6 +680,7 @@ pub fn alter_publication(
                 publication.via_root,
                 adds_schemas,
             )?;
+            check_schemas_to_add(interp, &objects)?;
         }
         _ => {}
     }

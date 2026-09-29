@@ -4728,6 +4728,66 @@ fn publication_row_filters_are_validated() {
 }
 
 #[test]
+fn publications_take_only_publishable_tables_and_schemas() {
+    // PG 18 check_publication_add_relation / check_publication_add_schema
+    // and CheckAlterPublication.
+    let setup = "CREATE TABLE t (a int PRIMARY KEY, b text);
+                 CREATE UNLOGGED TABLE tu (a int);
+                 CREATE PUBLICATION pall FOR ALL TABLES;
+                 CREATE PUBLICATION p;";
+    for (stmt, msg) in [
+        (
+            "ALTER PUBLICATION pall ADD TABLE t;",
+            "publication \"pall\" is defined as FOR ALL TABLES",
+        ),
+        (
+            "ALTER PUBLICATION pall DROP TABLE t;",
+            "publication \"pall\" is defined as FOR ALL TABLES",
+        ),
+        (
+            "ALTER PUBLICATION pall SET TABLES IN SCHEMA public;",
+            "publication \"pall\" is defined as FOR ALL TABLES",
+        ),
+        (
+            "CREATE TEMP TABLE tt (a int); CREATE PUBLICATION q FOR TABLE tt;",
+            "cannot add relation \"tt\" to publication",
+        ),
+        (
+            "CREATE PUBLICATION q FOR TABLE tu;",
+            "cannot add relation \"tu\" to publication",
+        ),
+        (
+            "CREATE PUBLICATION q FOR TABLE pg_catalog.pg_class;",
+            "cannot add relation \"pg_class\" to publication",
+        ),
+        (
+            "ALTER PUBLICATION p ADD TABLE pg_catalog.pg_class;",
+            "cannot add relation \"pg_class\" to publication",
+        ),
+        (
+            "CREATE PUBLICATION q FOR TABLES IN SCHEMA pg_catalog;",
+            "cannot add schema \"pg_catalog\" to publication",
+        ),
+        (
+            "ALTER PUBLICATION p ADD TABLES IN SCHEMA pg_toast;",
+            "cannot add schema \"pg_toast\" to publication",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "ALTER PUBLICATION pall SET (publish = 'insert');
+             ALTER PUBLICATION p ADD TABLE t;
+             ALTER PUBLICATION p ADD TABLES IN SCHEMA public;",
+        ),
+    ]);
+}
+
+#[test]
 fn publication_membership_rules() {
     // PG 18 parse_publication_options / OpenTableList /
     // TransformPubWhereClauses / CheckPubRelationColumnList /
