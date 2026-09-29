@@ -441,10 +441,18 @@ pub(crate) fn analyze_with_clause(
     let mut cte_scopes = outer_ctes.clone();
     for cte in ctes {
         let returning = match cte.ctequery.as_deref().and_then(|q| q.node.as_ref()) {
-            Some(node::Node::InsertStmt(s)) => Some(!s.returning_list.is_empty()),
-            Some(node::Node::UpdateStmt(s)) => Some(!s.returning_list.is_empty()),
-            Some(node::Node::DeleteStmt(s)) => Some(!s.returning_list.is_empty()),
-            Some(node::Node::MergeStmt(s)) => Some(!s.returning_list.is_empty()),
+            Some(node::Node::InsertStmt(s)) => {
+                Some(!crate::resolve::returning_exprs(&s.returning_clause).is_empty())
+            }
+            Some(node::Node::UpdateStmt(s)) => {
+                Some(!crate::resolve::returning_exprs(&s.returning_clause).is_empty())
+            }
+            Some(node::Node::DeleteStmt(s)) => {
+                Some(!crate::resolve::returning_exprs(&s.returning_clause).is_empty())
+            }
+            Some(node::Node::MergeStmt(s)) => {
+                Some(!crate::resolve::returning_exprs(&s.returning_clause).is_empty())
+            }
             _ => None,
         };
         if returning.is_some() && !top_level {

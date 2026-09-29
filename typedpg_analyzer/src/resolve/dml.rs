@@ -60,7 +60,7 @@ pub(crate) fn analyze_insert_with_outer_ctes(
     );
 
     let columns = resolve_target_list(
-        &ins.returning_list,
+        returning_exprs(&ins.returning_clause),
         expr::Ctx::new(&ret_scope, &ret_null_ctx, snapshot),
         params,
     )?;
@@ -693,7 +693,7 @@ pub(crate) fn analyze_update_with_outer_ctes(
     }
 
     let columns = resolve_target_list(
-        &upd.returning_list,
+        returning_exprs(&upd.returning_clause),
         expr::Ctx::new(&scope, &null_ctx, snapshot),
         params,
     )?;
@@ -798,7 +798,7 @@ pub(crate) fn analyze_delete_with_outer_ctes(
     }
 
     let columns = resolve_target_list(
-        &del.returning_list,
+        returning_exprs(&del.returning_clause),
         expr::Ctx::new(&scope, &null_ctx, snapshot),
         params,
     )?;

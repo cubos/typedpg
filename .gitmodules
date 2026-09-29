@@ -1,0 +1,3 @@
+[submodule "typedpg_pg_query/libpg_query"]
+	path = typedpg_pg_query/libpg_query
+	url = https://github.com/pganalyze/libpg_query.git

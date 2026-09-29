@@ -52,7 +52,16 @@ typedpg_cli (binary: `cargo typedpg migrate up/down/status/create`)
             └── typedpg_macros (proc macro: sql!)
                     ├── typedpg_core
                     └── typedpg_analyzer (compile-time only: lexer, param types, query_info, type_map, static SQL analyzer)
+                            └── typedpg_pg_query (PostgreSQL parser: our libpg_query binding)
 ```
+
+`typedpg_pg_query` compiles libpg_query from a git submodule pinned to a
+release tag (`git submodule update --init` after cloning). Its AST types and
+walkers are generated from libpg_query's `pg_query.proto` by
+`typedpg_pg_query_codegen` (`cargo run -p typedpg_pg_query_codegen`), and a
+few fixes to libpg_query's sources are applied at build time from
+`typedpg_pg_query/patches.rs`. See `typedpg_pg_query/README.md` for moving to
+a new PostgreSQL release.
 
 ### Compile-time pipeline (`sql!` macro)
 
@@ -60,7 +69,7 @@ typedpg_cli (binary: `cargo typedpg migrate up/down/status/create`)
 2. Lex SQL via `typedpg_analyzer::lexer::lex()` — rewrites `$name` → `$1`, extracts `$..spread`
 3. Load config from `[package.metadata.typedpg]` in consumer's `Cargo.toml`
 4. Build schema snapshot from seed + migrations via DDL interpreter (in-memory, no Docker)
-5. Static analysis: parse SQL with `pg_query`, resolve types and nullability against snapshot
+5. Static analysis: parse SQL with `typedpg_pg_query` (libpg_query), resolve types and nullability against snapshot
 6. `codegen::generate()` — emit anonymous output struct, typed query builder, `.fetch_all()/.fetch_one()/.fetch_optional()/.execute()` methods
 
 ### Runtime

@@ -1,0 +1,41 @@
+[package]
+name = "typedpg_pg_query"
+version.workspace = true
+edition.workspace = true
+# Our code is MIT OR Apache-2.0; the bundled libpg_query is BSD-3-Clause and
+# the PostgreSQL sources it embeds are under the PostgreSQL License.
+license = "(MIT OR Apache-2.0) AND BSD-3-Clause AND PostgreSQL"
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "PostgreSQL parser bindings for typedpg, built on libpg_query"
+keywords = ["postgres", "postgresql", "sql", "parser"]
+categories = ["database", "parser-implementations"]
+links = "pg_query"
+build = "build.rs"
+# Only what the build compiles (the submodule also carries tests, fixtures
+# and generated C++ we don't use).
+include = [
+    "/Cargo.toml",
+    "/build.rs",
+    "/patches.rs",
+    "/README.md",
+    "/src/**/*.rs",
+    "/tests/**/*.rs",
+    "/libpg_query/LICENSE",
+    "/libpg_query/pg_query.h",
+    "/libpg_query/postgres_deparse.h",
+    "/libpg_query/src/**/*",
+    "/libpg_query/vendor/**/*",
+    "/libpg_query/protobuf/pg_query.pb-c.c",
+    "/libpg_query/protobuf/pg_query.pb-c.h",
+    "/libpg_query/protobuf/pg_query.proto",
+]
+
+[dependencies]
+prost = "0.14"
+serde_json = "1"
+thiserror = "2"
+
+[build-dependencies]
+cc = "1"

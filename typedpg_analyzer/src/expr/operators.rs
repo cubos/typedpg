@@ -314,6 +314,9 @@ pub(crate) fn infer_synthetic_op(
         }],
         lexpr: Some(Box::new(l.clone())),
         rexpr: Some(Box::new(r.clone())),
+        // No IN list: `makeSimpleA_Expr` leaves the list bounds unset.
+        rexpr_list_start: -1,
+        rexpr_list_end: -1,
         location,
     };
     infer_a_expr(&e, ctx, params)
@@ -338,6 +341,9 @@ fn infer_plain_op(
         }],
         lexpr: Some(Box::new(l.clone())),
         rexpr: Some(Box::new(r.clone())),
+        // No IN list: `makeSimpleA_Expr` leaves the list bounds unset.
+        rexpr_list_start: -1,
+        rexpr_list_end: -1,
         location,
     };
     infer_generic_binary_op(&e, op, ctx, params)

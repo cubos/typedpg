@@ -131,22 +131,38 @@ fn table_constraint<'a>(
         })
 }
 
-/// `ALTER TABLE ... ALTER CONSTRAINT name [NOT] DEFERRABLE ...`
-/// (ATExecAlterConstraint): only foreign keys change deferrability.
+/// `ALTER TABLE ... ALTER CONSTRAINT name [NOT] DEFERRABLE ... | [NOT]
+/// ENFORCED | [NO] INHERIT` (ATExecAlterConstraint): deferrability and
+/// enforceability change only on a foreign key, inheritability only on a
+/// not-null constraint.
 pub(super) fn alter_constraint(
     interp: &PgCatalog,
     relid: PgClassOid,
     cmd: &AlterTableCmd,
 ) -> Result<(), DdlError> {
-    let Some(node::Node::Constraint(c)) = cmd.def.as_deref().and_then(|d| d.node.as_ref()) else {
+    let Some(node::Node::AtalterConstraint(alter)) =
+        cmd.def.as_deref().and_then(|d| d.node.as_ref())
+    else {
         return Ok(());
     };
-    let con = table_constraint(interp, relid, &c.conname)?;
-    if con.contype != ConType::ForeignKey {
+    let con = table_constraint(interp, relid, &alter.conname)?;
+    let relname = relname_of(interp, relid);
+    if alter.alter_deferrability && con.contype != ConType::ForeignKey {
         return Err(DdlError::Parse(format!(
-            "constraint \"{}\" of relation \"{}\" is not a foreign key constraint",
-            c.conname,
-            relname_of(interp, relid)
+            "constraint \"{}\" of relation \"{relname}\" is not a foreign key constraint",
+            alter.conname
+        )));
+    }
+    if alter.alter_enforceability && con.contype != ConType::ForeignKey {
+        return Err(DdlError::Parse(format!(
+            "cannot alter enforceability of constraint \"{}\" of relation \"{relname}\"",
+            alter.conname
+        )));
+    }
+    if alter.alter_inheritability && con.contype != ConType::NotNull {
+        return Err(DdlError::Parse(format!(
+            "constraint \"{}\" of relation \"{relname}\" is not a not-null constraint",
+            alter.conname
         )));
     }
     Ok(())

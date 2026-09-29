@@ -181,7 +181,7 @@ pub(crate) fn analyze_merge_with_outer_ctes(
     }
     MERGE_RETURNING_DEPTH.with(|d| d.set(d.get() + 1));
     let columns = resolve_target_list(
-        &merge.returning_list,
+        returning_exprs(&merge.returning_clause),
         expr::Ctx::new(&both, &ret_null_ctx, snapshot),
         params,
     );

@@ -98,7 +98,7 @@ pub(crate) fn mutate(seed: &str, rng: &mut StdRng, n_edits: u32) -> Option<Strin
     // (an immutable borrow) is free to read the mutated tree afterwards.
     let nodes: Vec<pg_query::NodeMut> = unsafe { parsed.protobuf.nodes_mut() }
         .into_iter()
-        .map(|(n, _, _)| n)
+        .map(|(n, _)| n)
         .collect();
     if nodes.is_empty() {
         return None;

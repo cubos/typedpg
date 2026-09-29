@@ -1,0 +1,13 @@
+[package]
+name = "typedpg_pg_query_codegen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Generates typedpg_pg_query's protobuf types and AST walkers from libpg_query's pg_query.proto"
+
+[dependencies]
+heck = "0.5"
+prost-build = "0.14"
+prost-types = "0.14"
+protox = "0.9"

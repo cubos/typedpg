@@ -303,6 +303,11 @@ fn can_run_as_subquery(stmt: &node::Node) -> bool {
 /// before they are merged with lexer-side info.
 pub(crate) type RawParam = (i32, PgTypeOid, bool);
 
+/// The expressions of a `RETURNING` clause (none when there is no clause).
+pub(crate) fn returning_exprs(clause: &Option<protobuf::ReturningClause>) -> &[protobuf::Node] {
+    clause.as_ref().map_or(&[], |c| c.exprs.as_slice())
+}
+
 /// Lower-level analyzer entry point: walks a pre-parsed AST node and returns
 /// the raw columns (keyed by OID) and sorted param list without converting to
 /// [`Type`]. Used by [`analyze_static`] (after parsing) and by the DDL view

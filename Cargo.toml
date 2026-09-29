@@ -9,6 +9,8 @@ members = [
     "typedpg_example",
     "typedpg_e2e",
     "typedpg_seed",
+    "typedpg_pg_query",
+    "typedpg_pg_query_codegen",
 ]
 
 # Shared metadata inherited by the publishable crates via `<field>.workspace = true`.
