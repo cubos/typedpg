@@ -753,3 +753,24 @@ fn cross_domain_same_base_coerces_like_pg() {
     let s = db.analyze("SELECT a = b AS eq FROM t2").unwrap();
     assert_cols(&s, vec![cn("eq", bool_ty())]);
 }
+
+/// An array of a domain is not itself a domain: PG's row description keeps
+/// it as the domain's array type (only a domain column collapses to its
+/// base), while `ARRAY[domain_value]` is built over the base type.
+#[test]
+fn arrays_of_domains_keep_the_domain_array_type() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE DOMAIN nn2 AS int NOT NULL;
+         CREATE TABLE dt (d nn2, ds nn2[]);",
+    )
+    .unwrap();
+    for sql in [
+        "SELECT '{1}'::nn2[] AS v",
+        "SELECT ds AS v FROM dt",
+        "SELECT ARRAY[d] AS v FROM dt",
+        "SELECT d AS v FROM dt",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}

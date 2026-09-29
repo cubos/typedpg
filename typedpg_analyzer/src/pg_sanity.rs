@@ -703,18 +703,19 @@ fn check_error_prefix(
 /// compared as plain strings.
 ///
 /// Domains are unwrapped to their base type for comparison purposes — PG's
-/// wire-level Describe collapses domain columns to their base OID. The
+/// wire-level Describe collapses domain columns to their base OID
+/// (`getBaseTypeAndTypmod` in printtup's SendRowDescriptionCols). The
 /// analyzer's `Type::Domain` shape is asserted in dedicated tests; this
-/// comparison only validates the underlying physical type.
+/// comparison only validates the underlying physical type. Only the column
+/// type itself is collapsed: an array *of* a domain is not a domain, so PG
+/// reports it as the domain's array type (`nn[]`).
 fn qualified_type_name_for_compare(ty: &Type) -> String {
     match ty {
         Type::Domain { base, .. } => qualified_type_name_for_compare(base),
-        Type::Basic { schema, name, .. }
-        | Type::Enum { schema, name, .. }
-        | Type::Range { schema, name, .. }
-        | Type::Composite { schema, name, .. } => QualifiedName::new(schema, name).to_string(),
-        Type::Array { element } => format!("{}[]", qualified_type_name_for_compare(element)),
-        Type::AnonymousRecord { .. } => "pg_catalog.record".to_string(),
+        Type::Array { element } => {
+            format!("{}[]", qualified_param_type_name_for_compare(element))
+        }
+        other => qualified_param_type_name_for_compare(other),
     }
 }
 
