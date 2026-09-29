@@ -76,6 +76,13 @@ fn validate_sql_body(
     let mut last: Option<LastStatement> = None;
     for inner in &statements {
         if !is_analyzable(inner) {
+            // interpret_AS_clause: an inline body holds queries only.
+            if stmt.sql_body.is_some() {
+                return Err(DdlError::UnsupportedDdl(format!(
+                    "{} is not yet supported in unquoted SQL function body",
+                    command_tag(inner)
+                )));
+            }
             // A utility statement: parse analysis has nothing to check in
             // it — it runs only at call time, so the statements after it
             // don't see what it would create.
@@ -352,6 +359,78 @@ fn is_polymorphic(interp: &PgCatalog, t: PgTypeOid) -> bool {
                     | "anycompatiblemultirange"
             )
         })
+}
+
+/// `CreateCommandTag` (utility.c) for the utility statements a body may
+/// hold.
+fn command_tag(stmt: &node::Node) -> String {
+    use typedpg_pg_query::protobuf::ObjectType as O;
+    let object = |t: i32| -> &'static str {
+        match O::try_from(t).unwrap_or(O::Undefined) {
+            O::ObjectTable => "TABLE",
+            O::ObjectSequence => "SEQUENCE",
+            O::ObjectView => "VIEW",
+            O::ObjectMatview => "MATERIALIZED VIEW",
+            O::ObjectIndex => "INDEX",
+            O::ObjectType => "TYPE",
+            O::ObjectDomain => "DOMAIN",
+            O::ObjectSchema => "SCHEMA",
+            O::ObjectFunction => "FUNCTION",
+            O::ObjectProcedure => "PROCEDURE",
+            O::ObjectRoutine => "ROUTINE",
+            O::ObjectAggregate => "AGGREGATE",
+            O::ObjectOperator => "OPERATOR",
+            O::ObjectExtension => "EXTENSION",
+            O::ObjectTrigger => "TRIGGER",
+            O::ObjectRule => "RULE",
+            O::ObjectPolicy => "POLICY",
+            O::ObjectForeignTable => "FOREIGN TABLE",
+            _ => "OBJECT",
+        }
+    };
+    match stmt {
+        node::Node::CreateStmt(_) => "CREATE TABLE".into(),
+        node::Node::DropStmt(d) => format!("DROP {}", object(d.remove_type)),
+        node::Node::AlterTableStmt(a) => format!("ALTER {}", object(a.objtype)),
+        node::Node::IndexStmt(_) => "CREATE INDEX".into(),
+        node::Node::ViewStmt(_) => "CREATE VIEW".into(),
+        node::Node::CreateFunctionStmt(f) if f.is_procedure => "CREATE PROCEDURE".into(),
+        node::Node::CreateFunctionStmt(_) => "CREATE FUNCTION".into(),
+        node::Node::CreateSeqStmt(_) => "CREATE SEQUENCE".into(),
+        node::Node::AlterSeqStmt(_) => "ALTER SEQUENCE".into(),
+        node::Node::CreateSchemaStmt(_) => "CREATE SCHEMA".into(),
+        node::Node::CreateDomainStmt(_) => "CREATE DOMAIN".into(),
+        node::Node::CompositeTypeStmt(_)
+        | node::Node::CreateEnumStmt(_)
+        | node::Node::CreateRangeStmt(_) => "CREATE TYPE".into(),
+        node::Node::CreateTableAsStmt(c) if c.is_select_into => "SELECT INTO".into(),
+        node::Node::CreateTableAsStmt(c) if c.objtype == O::ObjectMatview as i32 => {
+            "CREATE MATERIALIZED VIEW".into()
+        }
+        node::Node::CreateTableAsStmt(_) => "CREATE TABLE AS".into(),
+        node::Node::TruncateStmt(_) => "TRUNCATE TABLE".into(),
+        node::Node::CommentStmt(_) => "COMMENT".into(),
+        node::Node::NotifyStmt(_) => "NOTIFY".into(),
+        node::Node::CallStmt(_) => "CALL".into(),
+        node::Node::DoStmt(_) => "DO".into(),
+        node::Node::ExplainStmt(_) => "EXPLAIN".into(),
+        node::Node::LockStmt(_) => "LOCK TABLE".into(),
+        node::Node::VacuumStmt(v) if v.is_vacuumcmd => "VACUUM".into(),
+        node::Node::VacuumStmt(_) => "ANALYZE".into(),
+        node::Node::VariableSetStmt(v)
+            if matches!(
+                typedpg_pg_query::protobuf::VariableSetKind::try_from(v.kind),
+                Ok(typedpg_pg_query::protobuf::VariableSetKind::VarReset
+                    | typedpg_pg_query::protobuf::VariableSetKind::VarResetAll)
+            ) =>
+        {
+            "RESET".into()
+        }
+        node::Node::VariableSetStmt(_) => "SET".into(),
+        node::Node::GrantStmt(g) if g.is_grant => "GRANT".into(),
+        node::Node::GrantStmt(_) => "REVOKE".into(),
+        _ => "utility statement".into(),
+    }
 }
 
 fn is_analyzable(stmt: &node::Node) -> bool {

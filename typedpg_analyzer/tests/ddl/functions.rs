@@ -1339,3 +1339,54 @@ fn create_aggregate_validates_its_definition() {
         ),
     ]);
 }
+
+#[test]
+fn a_failed_migration_leaves_no_trace() {
+    // The migration runs in one transaction: the CREATE FUNCTION before the
+    // failing CREATE OR REPLACE is undone too.
+    let mut db = PgCatalog::new().unwrap();
+    let err = db
+        .apply_sql(
+            "CREATE FUNCTION f(a int) RETURNS int LANGUAGE sql AS 'select 1';
+             CREATE OR REPLACE FUNCTION f(int) RETURNS int LANGUAGE sql AS 'select 1';",
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("cannot change name of input parameter \"a\""),
+        "{err}"
+    );
+    assert_err_prefix!(
+        db.analyze("SELECT f(a => 1) AS x"),
+        AnalyzeError::UndefinedFunction(_),
+        "function f(a => integer) does not exist"
+    );
+}
+
+#[test]
+fn inline_bodies_hold_queries_and_transforms_can_be_dropped() {
+    assert_ddl_rejections(&[
+        (
+            "",
+            "CREATE FUNCTION f() RETURNS void LANGUAGE sql BEGIN ATOMIC CREATE TABLE x(a int); END;",
+            "CREATE TABLE is not yet supported in unquoted SQL function body",
+        ),
+        (
+            "CREATE TRANSFORM FOR int LANGUAGE sql (FROM SQL WITH FUNCTION prsd_lextype(internal));
+             DROP TRANSFORM FOR int LANGUAGE sql;",
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql TRANSFORM FOR TYPE int AS 'select 1';",
+            "transform for type integer language \"sql\" does not exist",
+        ),
+        (
+            "",
+            "DROP TRANSFORM FOR int LANGUAGE sql;",
+            "transform for type integer language \"sql\" does not exist",
+        ),
+    ]);
+    build(&[(
+        "0001.sql",
+        "CREATE TRANSFORM FOR int LANGUAGE sql (FROM SQL WITH FUNCTION prsd_lextype(internal));
+         CREATE FUNCTION f() RETURNS int LANGUAGE sql TRANSFORM FOR TYPE int AS 'select 1';
+         DROP TRANSFORM IF EXISTS FOR text LANGUAGE sql;",
+    )]);
+}
