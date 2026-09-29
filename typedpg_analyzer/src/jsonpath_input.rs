@@ -17,12 +17,12 @@
 //!   quote;
 //! - `@ is not allowed in root expressions`, `LAST is allowed only in array
 //!   subscripts`, the `like_regex` flag checks and `.decimal()`'s argument
-//!   count.
+//!   count;
+//! - the `like_regex` pattern, compiled like `makeItemLikeRegex` does
+//!   (`invalid regular expression: …`, see [`crate::regex_input`]).
 //!
-//! Conservative like the rest of [`crate::literal_input`]: the regular
-//! expression of a `like_regex` predicate is not compiled (PG's regex
-//! engine errors are not modeled), and numeric literal magnitudes are not
-//! range-checked.
+//! Conservative like the rest of [`crate::literal_input`]: numeric literal
+//! magnitudes are not range-checked.
 
 /// Validate `content` as `jsonpath` input. `Err` carries PG's message.
 pub(crate) fn validate(content: &str) -> Result<(), String> {
@@ -47,6 +47,48 @@ pub(crate) fn validate(content: &str) -> Result<(), String> {
         Some(msg) => Err(msg),
         None => Ok(()),
     }
+}
+
+/// `makeItemLikeRegex` (jsonpath_gram.y): check the flag characters, map
+/// them to `pg_regcomp` flags (`jspConvertRegexFlags`, jsonpath_gram.y) and
+/// compile the pattern.
+fn like_regex(pattern: &[u8], flags: &[u8]) -> Result<(), String> {
+    use crate::regex_input::{REG_ADVANCED, REG_ICASE, REG_NLANCH, REG_NLSTOP, REG_QUOTE};
+    let (mut icase, mut dotall, mut mline, mut wspace, mut quote) =
+        (false, false, false, false, false);
+    for &f in flags {
+        match f {
+            b'i' => icase = true,
+            b's' => dotall = true,
+            b'm' => mline = true,
+            b'x' => wspace = true,
+            b'q' => quote = true,
+            _ => return Err("invalid input syntax for type jsonpath".to_string()),
+        }
+    }
+    // XQuery is very nearly Spencer's AREs; `q` (a literal pattern)
+    // overrides `x`.
+    let mut cflags = REG_ADVANCED;
+    if icase {
+        cflags |= REG_ICASE;
+    }
+    if quote {
+        cflags &= !REG_ADVANCED;
+        cflags |= REG_QUOTE;
+    } else {
+        if !dotall {
+            cflags |= REG_NLSTOP;
+        }
+        if mline {
+            cflags |= REG_NLANCH;
+        }
+        if wspace {
+            return Err(
+                "XQuery \"x\" flag (expanded regular expressions) is not implemented".to_string(),
+            );
+        }
+    }
+    crate::regex_input::check(&String::from_utf8_lossy(pattern), cflags)
 }
 
 fn yyerror(msg: &str, yytext: &str) -> String {
@@ -820,24 +862,21 @@ impl Parser {
             }
             K::Kw(Kw::LikeRegex) => {
                 self.bump();
-                self.expect(K::Str)?;
-                if self.kind() == K::Kw(Kw::Flag) {
+                let pattern = self.expect(K::Str)?;
+                let flags = if self.kind() == K::Kw(Kw::Flag) {
                     self.bump();
-                    let flags = self.expect(K::Str)?;
-                    // makeItemLikeRegex: only i, s, m, x, q are flags, and
-                    // x (expanded regexes) is not implemented.
-                    for &f in &flags.val {
-                        match f {
-                            b'i' | b's' | b'm' | b'q' => {}
-                            b'x' => {
-                                return Err("XQuery \"x\" flag (expanded regular \
-                                            expressions) is not implemented"
-                                    .to_string());
-                            }
-                            _ => return Err("invalid input syntax for type jsonpath".to_string()),
-                        }
+                    self.expect(K::Str)?.val
+                } else {
+                    // The rule without FLAG is reduced only once bison has
+                    // its lookahead token, so a scanner error there wins.
+                    if self.kind() == K::LexError {
+                        return self.error();
                     }
-                }
+                    Vec::new()
+                };
+                // makeItemLikeRegex runs in the grammar action, so its
+                // errors come before any later syntax error.
+                like_regex(&pattern.val, &flags)?;
                 Ok(Kind::Pred)
             }
             _ => Ok(Kind::Expr),
@@ -1109,6 +1148,8 @@ mod tests {
             "$.decimal(4, 2)",
             "$ ? (@ starts with $x)",
             "$ like_regex \"a\" flag \"iq\"",
+            "$ like_regex \"(\" flag \"xq\"",
+            "$ like_regex \"^(a|b)+\\\\d{2}$\" flag \"sm\"",
             "$.a`b",
             "$.\"a b\"",
             "true.a",
@@ -1159,6 +1200,18 @@ mod tests {
                 "syntax error at or near \" \" of jsonpath input",
             ),
             ("", "invalid input syntax for type jsonpath: \"\""),
+            (
+                "$ like_regex \"(\"",
+                "invalid regular expression: parentheses () not balanced",
+            ),
+            (
+                "$ like_regex \"a\" flag \"xz\"",
+                "invalid input syntax for type jsonpath",
+            ),
+            (
+                "$ like_regex \"(\" flag \"x\"",
+                "XQuery \"x\" flag (expanded regular expressions) is not implemented",
+            ),
         ] {
             assert_eq!(validate(p), Err(msg.to_string()), "{p}");
         }

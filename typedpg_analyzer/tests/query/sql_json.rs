@@ -363,3 +363,35 @@ fn sql_json_returning_format_and_wrapper_rules() {
     db.analyze("SELECT JSON_VALUE(b FORMAT JSON ENCODING UTF8, '$') AS r FROM t")
         .unwrap();
 }
+
+#[test]
+fn jsonpath_like_regex_pattern_is_compiled_at_input() {
+    // makeItemLikeRegex compiles the pattern while jsonpath_in parses the
+    // literal, so a malformed regex fails prepare — in a cast, in a SQL/JSON
+    // path argument and in a jsonpath operator's operand alike.
+    let db = setup();
+    for sql in [
+        r#"SELECT '$.a ? (@ like_regex "(")'::jsonpath"#,
+        r#"SELECT JSON_VALUE(j, $$$.a ? (@ like_regex "(")$$) FROM t"#,
+        r#"SELECT j @? '$.a ? (@ like_regex "(" flag "i")' FROM t"#,
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::InvalidLiteral(_),
+            "invalid regular expression: parentheses () not balanced"
+        );
+    }
+    assert_err_prefix!(
+        db.analyze(r#"SELECT JSON_EXISTS(j, '$ ? (@ like_regex "a{2,1}")') FROM t"#),
+        AnalyzeError::InvalidLiteral(_),
+        "invalid regular expression: invalid repetition count(s)"
+    );
+    for sql in [
+        // `q` makes the pattern a literal string, and overrides `x`.
+        r#"SELECT '$.a ? (@ like_regex "(" flag "q")'::jsonpath AS p"#,
+        r#"SELECT '$.a ? (@ like_regex "(" flag "xq")'::jsonpath AS p"#,
+        r#"SELECT JSON_VALUE(j, '$.a ? (@ like_regex "^(a|b)+\\d{2}$" flag "is")') AS v FROM t"#,
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
