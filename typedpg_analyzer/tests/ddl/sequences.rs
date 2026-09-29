@@ -325,3 +325,73 @@ fn sequence_columns_are_visible() {
         ],
     );
 }
+
+#[test]
+fn sequence_ownership_and_options_follow_postgres_checks() {
+    let setup = "CREATE TABLE t (a int);
+                 CREATE SCHEMA x;
+                 CREATE TABLE ti (a int GENERATED ALWAYS AS IDENTITY);
+                 CREATE SEQUENCE s;
+                 CREATE SEQUENCE s2 MAXVALUE 100000;
+                 CREATE SEQUENCE s5 OWNED BY t.a;
+                 CREATE TEMP TABLE tt (a int);";
+    assert_ddl_rejections(&[
+        (
+            setup,
+            "CREATE SEQUENCE x.s9 OWNED BY t.a;",
+            "sequence must be in same schema as table it is linked to",
+        ),
+        (
+            setup,
+            "CREATE SEQUENCE s3 OWNED BY tt.a;",
+            "sequence must be in same schema as table it is linked to",
+        ),
+        (
+            setup,
+            "CREATE SEQUENCE s4 OWNED BY s.last_value;",
+            "sequence cannot be owned by relation \"s\"",
+        ),
+        (
+            setup,
+            "ALTER SEQUENCE ti_a_seq OWNED BY NONE;",
+            "cannot change ownership of identity sequence",
+        ),
+        (
+            setup,
+            "ALTER SEQUENCE s5 SET SCHEMA x;",
+            "cannot move an owned sequence into another schema",
+        ),
+        (
+            setup,
+            "ALTER SEQUENCE s2 AS smallint;",
+            "MAXVALUE (100000) is out of range for sequence data type smallint",
+        ),
+        (
+            "",
+            "CREATE SEQUENCE s SEQUENCE NAME x;",
+            "invalid sequence option SEQUENCE NAME",
+        ),
+        (
+            "",
+            "CREATE SEQUENCE s LOGGED;",
+            "option \"logged\" not recognized",
+        ),
+        (
+            "",
+            "CREATE SEQUENCE s MAXVALUE 9223372036854775808;",
+            "value \"9223372036854775808\" is out of range for type bigint",
+        ),
+        (
+            "",
+            "CREATE SEQUENCE s OWNED BY foo;",
+            "invalid OWNED BY option",
+        ),
+    ]);
+    // A bound that was the old type's own follows the new type.
+    build(&[(
+        "0001.sql",
+        "CREATE SEQUENCE s;
+         ALTER SEQUENCE s AS smallint;
+         CREATE TABLE ti2 (a int GENERATED ALWAYS AS IDENTITY (SEQUENCE NAME ti2_seq));",
+    )]);
+}

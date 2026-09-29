@@ -74,12 +74,22 @@ impl SeqParams {
     }
 }
 
-fn numeric_arg(de: &typedpg_pg_query::protobuf::DefElem) -> Option<i128> {
-    match de.arg.as_deref().and_then(|a| a.node.as_ref())? {
-        node::Node::Integer(i) => Some(i128::from(i.ival)),
-        node::Node::Float(f) => f.fval.parse().ok(),
-        node::Node::String(s) => s.sval.parse().ok(),
-        _ => None,
+/// `defGetInt64`: an integer, or a numeric literal `int8in` accepts.
+fn numeric_arg(de: &typedpg_pg_query::protobuf::DefElem) -> Result<Option<i128>, DdlError> {
+    let text = match de.arg.as_deref().and_then(|a| a.node.as_ref()) {
+        Some(node::Node::Integer(i)) => return Ok(Some(i128::from(i.ival))),
+        Some(node::Node::Float(f)) => f.fval.as_str(),
+        Some(node::Node::String(s)) => s.sval.as_str(),
+        _ => return Ok(None),
+    };
+    match crate::literal_input::parse_pg_integer(text) {
+        Some(v) if i64::try_from(v).is_ok() => Ok(Some(v)),
+        Some(_) => Err(DdlError::UnsupportedDdl(format!(
+            "value \"{text}\" is out of range for type bigint"
+        ))),
+        None => Err(DdlError::UnsupportedDdl(
+            crate::pgmsg::invalid_input_syntax_for_type("bigint", text),
+        )),
     }
 }
 
@@ -125,29 +135,41 @@ fn apply(
             continue;
         };
         let name = de.defname.as_str();
-        if matches!(
-            name,
-            "as" | "increment" | "maxvalue" | "minvalue" | "start" | "restart" | "cache" | "cycle"
-        ) {
-            if seen.contains(&name) {
-                return Err(DdlError::Parse("conflicting or redundant options".into()));
+        match name {
+            "as" | "increment" | "maxvalue" | "minvalue" | "start" | "restart" | "cache"
+            | "cycle" | "owned_by" => {
+                if seen.contains(&name) {
+                    return Err(DdlError::Parse("conflicting or redundant options".into()));
+                }
+                seen.push(name);
             }
-            seen.push(name);
+            // The grammar takes it for identity columns only, where it is
+            // filtered out before.
+            "sequence_name" => {
+                return Err(DdlError::Parse(
+                    "invalid sequence option SEQUENCE NAME".into(),
+                ));
+            }
+            other => {
+                return Err(DdlError::UnsupportedDdl(format!(
+                    "option \"{other}\" not recognized"
+                )));
+            }
         }
         match name {
             "as" => {
                 if let Some(node::Node::TypeName(tn)) =
                     de.arg.as_deref().and_then(|a| a.node.as_ref())
                 {
-                    as_type = Some(super::util::lookup_type_name(tn, interp)?);
+                    as_type = Some(super::functions::typename_type_id(interp, tn)?);
                 }
             }
-            "increment" => increment = numeric_arg(de),
-            "maxvalue" => max = Some(numeric_arg(de)),
-            "minvalue" => min = Some(numeric_arg(de)),
-            "start" => start = numeric_arg(de),
-            "restart" => restart = Some(numeric_arg(de)),
-            "cache" => cache = numeric_arg(de),
+            "increment" => increment = numeric_arg(de)?,
+            "maxvalue" => max = Some(numeric_arg(de)?),
+            "minvalue" => min = Some(numeric_arg(de)?),
+            "start" => start = numeric_arg(de)?,
+            "restart" => restart = Some(numeric_arg(de)?),
+            "cache" => cache = numeric_arg(de)?,
             _ => {}
         }
     }
@@ -171,17 +193,23 @@ fn apply(
     }
     let (type_min, type_max) = type_range(p.typ);
     let (old_min, old_max) = type_range(old.typ);
-    let type_changed = as_type.is_some_and(|t| t != old.typ);
+    // AS on an existing sequence resets the bounds that were the old
+    // type's own (explicit ones stay, and must fit the new type).
+    let reset_max = !is_init && as_type.is_some() && old.max == old_max;
+    let reset_min = !is_init && as_type.is_some() && old.min == old_min;
     let typname = || super::util::format_type_for_message(interp, p.typ);
 
-    // MAXVALUE: explicit, NO MAXVALUE / new sequence => default, or reset
-    // to the new type's bound when the type changed and it was the old
-    // type's (an explicit value is left alone, even out of range).
+    // MAXVALUE: explicit, else NO MAXVALUE / a new sequence / a reset gets
+    // the default (the type's maximum ascending, -1 descending).
+    let default_max = if p.increment > 0 || reset_max {
+        type_max
+    } else {
+        -1
+    };
     match max {
         Some(Some(v)) => p.max = v,
-        Some(None) => p.max = if p.increment > 0 { type_max } else { -1 },
-        None if is_init => p.max = if p.increment > 0 { type_max } else { -1 },
-        None if type_changed && old.max == old_max => p.max = type_max,
+        Some(None) => p.max = default_max,
+        None if is_init || reset_max => p.max = default_max,
         None => {}
     }
     if p.max < type_min || p.max > type_max {
@@ -191,11 +219,15 @@ fn apply(
             typname()
         )));
     }
+    let default_min = if p.increment < 0 || reset_min {
+        type_min
+    } else {
+        1
+    };
     match min {
         Some(Some(v)) => p.min = v,
-        Some(None) => p.min = if p.increment > 0 { 1 } else { type_min },
-        None if is_init => p.min = if p.increment > 0 { 1 } else { type_min },
-        None if type_changed && old.min == old_min => p.min = type_min,
+        Some(None) => p.min = default_min,
+        None if is_init || reset_min => p.min = default_min,
         None => {}
     }
     if p.min < type_min || p.min > type_max {

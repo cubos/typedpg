@@ -128,7 +128,7 @@ pub(crate) fn create_owned_sequence(
         .iter()
         .filter(|o| {
             !matches!(o.node.as_ref(), Some(node::Node::DefElem(de))
-                if matches!(de.defname.as_str(), "sequence_name" | "generated"))
+                if matches!(de.defname.as_str(), "sequence_name" | "generated" | "logged" | "unlogged"))
         })
         .cloned()
         .collect();
@@ -251,35 +251,109 @@ fn apply_owned_by(
         _ => return Ok(()),
     };
     let seq_obj = PgGenericOid::from_nonzero(seq_oid.into_nonzero());
-    if parts.len() == 1 && parts[0].eq_ignore_ascii_case("none") {
-        interp.pg_depend.retain(|d| {
-            !(d.classid == PG_CLASS_RELID && d.objid == seq_obj && d.deptype == DepType::Auto)
-        });
-        return Ok(());
-    }
-    // `process_owned_by` (sequence.c): the last name is the column, the
-    // rest the (optionally qualified) table.
-    let Some((col, rel)) = parts.split_last() else {
-        return Ok(());
-    };
-    let (schema, relname) = match rel {
-        [relname] => (None, relname.as_str()),
-        [schema, relname] => (Some(schema.as_str()), relname.as_str()),
-        _ => {
-            return Err(DdlError::Parse("invalid OWNED BY option".to_owned()));
+    let owner = if parts.len() == 1 {
+        if !parts[0].eq_ignore_ascii_case("none") {
+            return Err(DdlError::Parse(
+                "invalid OWNED BY option (Specify OWNED BY table.column or OWNED BY NONE.)".into(),
+            ));
         }
+        None
+    } else {
+        // `process_owned_by` (sequence.c): the last name is the column, the
+        // rest the (optionally qualified) table.
+        let Some((col, rel)) = parts.split_last() else {
+            return Ok(());
+        };
+        let (schema, relname) = match rel {
+            [relname] => (None, relname.as_str()),
+            [schema, relname] => (Some(schema.as_str()), relname.as_str()),
+            _ => {
+                return Err(DdlError::Parse("invalid OWNED BY option".to_owned()));
+            }
+        };
+        let Some(table) = interp.resolve_table(schema, relname).cloned() else {
+            return Err(DdlError::TableNotFound(format!(
+                "relation \"{relname}\" does not exist"
+            )));
+        };
+        // A sequence belongs to a table, foreign table or view, in its own
+        // schema.
+        if !matches!(
+            table.relkind,
+            RelKind::Table | RelKind::ForeignTable | RelKind::View | RelKind::Partitioned
+        ) {
+            return Err(DdlError::UnsupportedDdl(format!(
+                "sequence cannot be owned by relation \"{}\" (This operation is not supported \
+                 for {}.)",
+                table.relname,
+                table.relkind.plural()
+            )));
+        }
+        if interp.pg_class.get(&seq_oid).map(|c| c.relnamespace) != Some(table.relnamespace) {
+            return Err(DdlError::UnsupportedDdl(
+                "sequence must be in same schema as table it is linked to".into(),
+            ));
+        }
+        let Some(attnum) = interp.attribute_by_name(table.oid, col).map(|a| a.attnum) else {
+            return Err(DdlError::Parse(format!(
+                "column \"{col}\" of relation \"{relname}\" does not exist"
+            )));
+        };
+        Some((table.oid, attnum))
     };
-    let Some(table) = interp.resolve_table(schema, relname).map(|c| c.oid) else {
-        return Err(DdlError::TableNotFound(format!(
-            "relation \"{relname}\" does not exist"
+    // An identity column's sequence keeps its owner.
+    check_not_identity_sequence(interp, seq_oid)?;
+    match owner {
+        Some((table, attnum)) => record_ownership(interp, seq_oid, table, attnum, DepType::Auto),
+        None => interp.pg_depend.retain(|d| {
+            !(d.classid == PG_CLASS_RELID && d.objid == seq_obj && d.deptype == DepType::Auto)
+        }),
+    }
+    Ok(())
+}
+
+/// The table a sequence belongs to (`sequenceIsOwned` with AUTO or
+/// INTERNAL): `(table, deptype)`.
+pub(crate) fn sequence_owner(
+    interp: &PgCatalog,
+    seq_oid: PgClassOid,
+) -> Option<(PgClassOid, DepType)> {
+    let seq_obj = PgGenericOid::from_nonzero(seq_oid.into_nonzero());
+    interp
+        .iter_pg_depend()
+        .find(|d| {
+            d.classid == PG_CLASS_RELID
+                && d.objid == seq_obj
+                && d.refclassid == PG_CLASS_RELID
+                && matches!(d.deptype, DepType::Auto | DepType::Internal)
+        })
+        .and_then(|d| Some((PgClassOid::new(d.refobjid.get())?, d.deptype)))
+}
+
+/// `Sequence "s" is linked to table "t".`
+fn linked_detail(interp: &PgCatalog, seq_oid: PgClassOid, table: PgClassOid) -> String {
+    let name = |oid: PgClassOid| {
+        interp
+            .pg_class
+            .get(&oid)
+            .map(|c| c.relname.clone())
+            .unwrap_or_default()
+    };
+    format!(
+        "Sequence \"{}\" is linked to table \"{}\".",
+        name(seq_oid),
+        name(table)
+    )
+}
+
+/// process_owned_by: `cannot change ownership of identity sequence`.
+fn check_not_identity_sequence(interp: &PgCatalog, seq_oid: PgClassOid) -> Result<(), DdlError> {
+    if let Some((table, DepType::Internal)) = sequence_owner(interp, seq_oid) {
+        return Err(DdlError::UnsupportedDdl(format!(
+            "cannot change ownership of identity sequence ({})",
+            linked_detail(interp, seq_oid, table)
         )));
-    };
-    let Some(attnum) = interp.attribute_by_name(table, col).map(|a| a.attnum) else {
-        return Err(DdlError::Parse(format!(
-            "column \"{col}\" of relation \"{relname}\" does not exist"
-        )));
-    };
-    record_ownership(interp, seq_oid, table, attnum, DepType::Auto);
+    }
     Ok(())
 }
 
