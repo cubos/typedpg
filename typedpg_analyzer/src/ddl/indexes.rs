@@ -47,6 +47,12 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
                 class.relname
             )));
         }
+        if stmt.concurrent && class.relkind == RelKind::Partitioned {
+            return Err(DdlError::UnsupportedDdl(format!(
+                "cannot create index on partitioned table \"{}\" concurrently",
+                class.relname
+            )));
+        }
     }
     check_index_max_keys(stmt.index_params.len() + stmt.index_including_params.len())?;
 
@@ -873,6 +879,46 @@ pub(crate) fn rebuild_indexes_for_column_type(
         if changed {
             db.index_keys.insert(index.indexrelid, keys);
         }
+    }
+    Ok(())
+}
+
+/// RemoveRelations (tablecmds.c): DROP INDEX CONCURRENTLY drops a single
+/// index, without CASCADE — and not a partitioned one, unless it is
+/// temporary (a temporary relation is never dropped concurrently).
+pub(crate) fn check_drop_concurrently(
+    db: &PgCatalog,
+    stmt: &typedpg_pg_query::protobuf::DropStmt,
+) -> Result<(), DdlError> {
+    use typedpg_pg_query::protobuf::DropBehavior;
+    if stmt.objects.len() != 1 {
+        return Err(DdlError::UnsupportedDdl(
+            "DROP INDEX CONCURRENTLY does not support dropping multiple objects".into(),
+        ));
+    }
+    if stmt.behavior == DropBehavior::DropCascade as i32 {
+        return Err(DdlError::UnsupportedDdl(
+            "DROP INDEX CONCURRENTLY does not support CASCADE".into(),
+        ));
+    }
+    let Some(node::Node::List(list)) = stmt.objects[0].node.as_ref() else {
+        return Ok(());
+    };
+    let (schema, name) = super::util::extract_names(&list.items, db);
+    let index = db
+        .namespace_oid(&schema)
+        .and_then(|ns| db.class_by_qname.get(&(ns, name.clone())).copied());
+    if let Some(index) = index
+        && db.pg_class.get(&index).map(|c| c.relkind) == Some(RelKind::PartitionedIndex)
+        && db
+            .pg_index
+            .get(&index)
+            .and_then(|i| db.relpersistence.get(&i.indrelid))
+            != Some(&'t')
+    {
+        return Err(DdlError::UnsupportedDdl(format!(
+            "cannot drop partitioned index \"{name}\" concurrently"
+        )));
     }
     Ok(())
 }

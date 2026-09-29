@@ -1020,6 +1020,46 @@ fn index_max_keys_limits_indexes_partition_keys_and_foreign_keys() {
 }
 
 #[test]
+fn concurrent_index_builds_and_drops_follow_pg_restrictions() {
+    let setup = "CREATE TABLE t (a int, b int); CREATE INDEX i1 ON t (a); \
+                 CREATE INDEX i2 ON t (b); \
+                 CREATE TABLE p (a int) PARTITION BY RANGE (a); CREATE INDEX pi ON p (a);";
+    assert_rejected(
+        setup,
+        &[
+            (
+                "DROP INDEX CONCURRENTLY i1, i2;",
+                "DROP INDEX CONCURRENTLY does not support dropping multiple objects",
+            ),
+            (
+                "DROP INDEX CONCURRENTLY i1 CASCADE;",
+                "DROP INDEX CONCURRENTLY does not support CASCADE",
+            ),
+            (
+                "DROP INDEX CONCURRENTLY pi;",
+                "cannot drop partitioned index \"pi\" concurrently",
+            ),
+            (
+                "CREATE INDEX CONCURRENTLY ON p (a);",
+                "cannot create index on partitioned table \"p\" concurrently",
+            ),
+            (
+                "CREATE INDEX CONCURRENTLY ON p USING nosuch (a);",
+                "cannot create index on partitioned table \"p\" concurrently",
+            ),
+        ],
+    );
+    assert_accepted(
+        setup,
+        &[
+            "DROP INDEX CONCURRENTLY i1;",
+            "DROP INDEX CONCURRENTLY IF EXISTS nosuch;",
+            "CREATE INDEX CONCURRENTLY ON t (a, b);",
+        ],
+    );
+}
+
+#[test]
 fn an_index_cannot_use_a_table_access_method() {
     // GetIndexAmRoutine: heap_tableam_handler (oid 3) returns no
     // IndexAmRoutine.

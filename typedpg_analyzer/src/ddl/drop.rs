@@ -18,6 +18,9 @@ pub fn drop_objects(interp: &mut PgCatalog, stmt: &DropStmt) -> Result<(), DdlEr
         DropBehavior::try_from(stmt.behavior),
         Ok(DropBehavior::DropCascade)
     );
+    if stmt.concurrent {
+        super::indexes::check_drop_concurrently(interp, stmt)?;
+    }
 
     // The relations one DROP names go together (performMultipleDeletions):
     // dependencies among them need no CASCADE.
