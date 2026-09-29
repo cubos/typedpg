@@ -1249,3 +1249,39 @@ fn drop_column_only_refuses_a_partitioned_table_with_partitions() {
     db.analyze("SELECT * FROM c").unwrap();
     db.analyze("SELECT b FROM rc").unwrap();
 }
+
+#[test]
+fn alter_table_subcommands_run_pass_by_pass() {
+    // ATController runs the subcommands by pass: DROPs, then ALTER TYPE,
+    // then ADD COLUMN, then constraints and defaults. A column's type
+    // changes at most once per statement.
+    let setup = "CREATE TABLE t (a int, b int);";
+    for (stmt, msg) in [
+        (
+            "ALTER TABLE t ALTER COLUMN a TYPE text, ALTER COLUMN a TYPE bigint;",
+            "cannot alter type of column \"a\" twice",
+        ),
+        (
+            "ALTER TABLE t ALTER COLUMN a TYPE text, DROP COLUMN a;",
+            "column \"a\" of relation \"t\" does not exist",
+        ),
+        (
+            "ALTER TABLE t ADD COLUMN c int, ALTER COLUMN c TYPE text;",
+            "column \"c\" of relation \"t\" does not exist",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "ALTER TABLE t ALTER COLUMN a TYPE int, ALTER COLUMN a TYPE bigint;
+             ALTER TABLE t ALTER COLUMN b SET DEFAULT 'x', ALTER COLUMN b TYPE text;
+             ALTER TABLE t DROP COLUMN b, ADD COLUMN b text;
+             ALTER TABLE t ADD COLUMN d int, ADD CONSTRAINT dc CHECK (d > 0),
+                 ALTER COLUMN d SET NOT NULL;",
+        ),
+    ]);
+}

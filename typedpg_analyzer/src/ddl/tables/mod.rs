@@ -1064,18 +1064,100 @@ pub fn alter_table(interp: &mut PgCatalog, stmt: &AlterTableStmt) -> Result<(), 
     // The TOAST tables the earlier statements made: SET (toast.*) reads
     // them, and a column this statement drops or retypes keeps one.
     toast::note_toast_tables(interp);
-    for cmd_node in &stmt.cmds {
-        let Some(node::Node::AlterTableCmd(cmd)) = cmd_node.node.as_ref() else {
-            continue;
-        };
+    // ATController: the subcommands run pass by pass (AlterTablePass), in
+    // statement order within a pass — DROPs before ALTER TYPE before ADD
+    // COLUMN before the constraints.
+    let mut cmds: Vec<&AlterTableCmd> = stmt
+        .cmds
+        .iter()
+        .filter_map(|n| match n.node.as_ref() {
+            Some(node::Node::AlterTableCmd(cmd)) => Some(&**cmd),
+            _ => None,
+        })
+        .collect();
+    cmds.sort_by_key(|cmd| alter_table_pass(cmd));
+    // ATExecAlterColumnType: a column's type changes once per statement.
+    let mut retyped: Vec<String> = Vec::new();
+    for cmd in cmds {
         let rec = inherit::Recursion {
             recurse,
             recursing: false,
         };
+        let retype = cmd.subtype == AlterTableType::AtAlterColumnType as i32;
+        let before = interp
+            .attribute_by_name(class_oid, &cmd.name)
+            .map(|a| (a.atttypid, a.atttypmod));
+        if retype && retyped.contains(&cmd.name) {
+            return Err(DdlError::UnsupportedDdl(format!(
+                "cannot alter type of column \"{}\" twice",
+                cmd.name
+            )));
+        }
         apply_alter_cmd(interp, class_oid, cmd, rec)?;
+        if retype
+            && interp
+                .attribute_by_name(class_oid, &cmd.name)
+                .map(|a| (a.atttypid, a.atttypmod))
+                != before
+        {
+            retyped.push(cmd.name.clone());
+        }
     }
 
     Ok(())
+}
+
+/// ATPrepCmd's `pass` for a subcommand (AlterTablePass, tablecmds.c).
+/// transformAlterTableStmt turns an index-backed ADD CONSTRAINT into an
+/// ADD INDEX.
+fn alter_table_pass(cmd: &AlterTableCmd) -> u8 {
+    use AlterTableType as At;
+    const DROP: u8 = 0;
+    const ALTER_TYPE: u8 = 1;
+    const ADD_COL: u8 = 2;
+    const SET_EXPRESSION: u8 = 3;
+    const ADD_CONSTR: u8 = 6;
+    const COL_ATTRS: u8 = 7;
+    const ADD_INDEXCONSTR: u8 = 8;
+    const ADD_INDEX: u8 = 9;
+    const ADD_OTHERCONSTR: u8 = 10;
+    const MISC: u8 = 11;
+    match AlterTableType::try_from(cmd.subtype).unwrap_or(At::Undefined) {
+        At::AtDropColumn
+        | At::AtDropNotNull
+        | At::AtDropExpression
+        | At::AtDropIdentity
+        | At::AtDropConstraint => DROP,
+        At::AtColumnDefault if cmd.def.is_none() => DROP,
+        At::AtAlterColumnType => ALTER_TYPE,
+        At::AtAddColumn | At::AtAddColumnToView => ADD_COL,
+        At::AtSetExpression => SET_EXPRESSION,
+        At::AtAddConstraint => match cmd.def.as_deref().and_then(|d| d.node.as_ref()) {
+            Some(node::Node::Constraint(c))
+                if !c.indexname.is_empty()
+                    && matches!(
+                        ConstrType::try_from(c.contype),
+                        Ok(ConstrType::ConstrPrimary | ConstrType::ConstrUnique)
+                    ) =>
+            {
+                ADD_INDEXCONSTR
+            }
+            Some(node::Node::Constraint(c))
+                if matches!(
+                    ConstrType::try_from(c.contype),
+                    Ok(ConstrType::ConstrPrimary
+                        | ConstrType::ConstrUnique
+                        | ConstrType::ConstrExclusion)
+                ) =>
+            {
+                ADD_INDEX
+            }
+            _ => ADD_CONSTR,
+        },
+        At::AtSetNotNull => COL_ATTRS,
+        At::AtColumnDefault | At::AtAddIdentity => ADD_OTHERCONSTR,
+        _ => MISC,
+    }
 }
 
 fn apply_alter_cmd(
