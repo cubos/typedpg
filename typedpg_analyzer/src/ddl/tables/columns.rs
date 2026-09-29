@@ -454,14 +454,68 @@ pub(crate) fn parse_column_def(
     })
 }
 
+/// ATExecAddIdentity / ATExecSetIdentity / ATExecDropIdentity: a
+/// partitioned table's identity is its partitions' too, so it changes only
+/// through the whole tree — neither under ONLY nor on a partition directly.
+fn check_identity_recursion(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+    rec: inherit::Recursion,
+    only_msg: &str,
+    partition_msg: &str,
+) -> Result<(), DdlError> {
+    let partitioned = interp.pg_class.get(&relid).map(|c| c.relkind) == Some(RelKind::Partitioned);
+    if partitioned && !rec.recurse {
+        return Err(DdlError::Parse(format!(
+            "{only_msg} (Do not specify the ONLY keyword.)"
+        )));
+    }
+    if !rec.recursing && super::inherit_cmd::is_partition(interp, relid) {
+        return Err(DdlError::Parse(partition_msg.to_owned()));
+    }
+    Ok(())
+}
+
+/// The partitions an identity change of `relid` reaches (not a regular
+/// inheritance child's: identity isn't inherited there).
+fn identity_partitions(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+    rec: inherit::Recursion,
+) -> Vec<PgClassOid> {
+    if rec.recurse && interp.pg_class.get(&relid).map(|c| c.relkind) == Some(RelKind::Partitioned) {
+        inherit::children_of(interp, relid)
+    } else {
+        Vec::new()
+    }
+}
+
 pub(crate) fn set_identity(
     interp: &mut PgCatalog,
     relid: PgClassOid,
     cmd: &AlterTableCmd,
+    rec: inherit::Recursion,
 ) -> Result<(), DdlError> {
     let Some(def) = cmd.def.as_deref() else {
         return Ok(());
     };
+    if matches!(def.node.as_ref(), Some(node::Node::Constraint(_))) {
+        check_identity_recursion(
+            interp,
+            relid,
+            rec,
+            "cannot add identity to a column of only the partitioned table",
+            "cannot add identity to a column of a partition",
+        )?;
+    } else {
+        check_identity_recursion(
+            interp,
+            relid,
+            rec,
+            "cannot change identity column of only the partitioned table",
+            "cannot change identity column of a partition",
+        )?;
+    }
 
     // `ALTER COLUMN x ADD GENERATED <kind> AS IDENTITY` parses with
     // `def = Constraint{contype=Identity, generated_when=…}`. The
@@ -591,7 +645,7 @@ pub(crate) fn set_identity(
             interp.sequence_params.insert(seq, params);
         }
     }
-    if is_add {
+    if is_add && !rec.recursing {
         let options = match def.node.as_ref() {
             Some(node::Node::Constraint(c)) => c.options.clone(),
             _ => Vec::new(),
@@ -604,6 +658,9 @@ pub(crate) fn set_identity(
             &options,
         )?;
     }
+    for child in identity_partitions(interp, relid, rec) {
+        set_identity(interp, child, cmd, rec.child())?;
+    }
     Ok(())
 }
 
@@ -611,7 +668,15 @@ pub(crate) fn drop_identity(
     interp: &mut PgCatalog,
     relid: PgClassOid,
     cmd: &AlterTableCmd,
+    rec: inherit::Recursion,
 ) -> Result<(), DdlError> {
+    check_identity_recursion(
+        interp,
+        relid,
+        rec,
+        "cannot drop identity from a column of only the partitioned table",
+        "cannot drop identity from a column of a partition",
+    )?;
     super::check_not_system_column(interp, relid, &cmd.name)?;
     let rel = relname_of(interp, relid);
     let Some(attrs) = interp.pg_attribute.get_mut(&relid) else {
@@ -642,6 +707,9 @@ pub(crate) fn drop_identity(
     // The identity sequence is internal to the column and goes with it.
     for seq in crate::ddl::sequences::identity_sequences(interp, relid, attnum) {
         crate::ddl::drop::drop_relation_by_oid(interp, seq);
+    }
+    for child in identity_partitions(interp, relid, rec) {
+        drop_identity(interp, child, cmd, rec.child())?;
     }
     Ok(())
 }

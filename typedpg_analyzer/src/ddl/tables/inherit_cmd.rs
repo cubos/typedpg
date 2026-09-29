@@ -428,6 +428,21 @@ pub(super) fn attach_partition(
         super::partbound::add_partition_bound(interp, parent, attach, bound)?;
     }
     create_inheritance(interp, attach, parent, &attach_name, true)?;
+    // MergeAttributesIntoExisting: a partition's column shares its
+    // parent's identity.
+    let identities: Vec<(String, AttIdentity)> = interp
+        .attributes_of(parent)
+        .iter()
+        .filter_map(|a| a.attidentity.map(|i| (a.attname.clone(), i)))
+        .collect();
+    if let Some(attrs) = interp.pg_attribute.get_mut(&attach) {
+        for (name, identity) in identities {
+            if let Some(a) = attrs.iter_mut().find(|a| a.attname == name) {
+                a.attidentity = Some(identity);
+                a.atthasdef = true;
+            }
+        }
+    }
     super::foreign_keys::clone_parent_fks(interp, parent, attach)?;
     // AttachPartitionEnsureIndexes.
     super::partidx::clone_parent_indexes(interp, parent, attach)
@@ -474,6 +489,13 @@ pub(super) fn detach_partition(
     remove_inheritance(interp, part, parent, "partition")?;
     super::partidx::detach_partition_indexes(interp, part);
     interp.partition_bounds.remove(&part);
+    // DetachPartitionFinalize: the identity was the parent's.
+    if let Some(attrs) = interp.pg_attribute.get_mut(&part) {
+        for a in attrs.iter_mut().filter(|a| a.attidentity.is_some()) {
+            a.attidentity = None;
+            a.atthasdef = false;
+        }
+    }
     if let Some((expr, vars)) = partition_check {
         add_detached_partition_check(interp, part, expr, &vars)?;
     }

@@ -1158,9 +1158,9 @@ fn apply_alter_subtype(
             add_constraint(interp, relid, cmd, rec)
         }
         AlterTableType::AtDropConstraint => drop_constraint(interp, relid, cmd, rec),
-        AlterTableType::AtAddIdentity => set_identity(interp, relid, cmd),
-        AlterTableType::AtSetIdentity => set_identity(interp, relid, cmd),
-        AlterTableType::AtDropIdentity => drop_identity(interp, relid, cmd),
+        AlterTableType::AtAddIdentity => set_identity(interp, relid, cmd, rec),
+        AlterTableType::AtSetIdentity => set_identity(interp, relid, cmd, rec),
+        AlterTableType::AtDropIdentity => drop_identity(interp, relid, cmd, rec),
         AlterTableType::AtDropExpression => drop_expression(interp, relid, cmd, rec),
         AlterTableType::AtSetExpression => set_expression(interp, relid, cmd, rec),
         AlterTableType::AtSetStatistics
