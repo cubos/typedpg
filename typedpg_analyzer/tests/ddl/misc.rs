@@ -4393,3 +4393,36 @@ fn rule_actions_are_analyzed_over_new_and_old() {
         ),
     ]);
 }
+
+#[test]
+fn rule_actions_see_whole_row_and_star_new_old() {
+    // PG 18: `new.*`, a whole-row `new` / `old` and references from a
+    // subquery are analyzed too, not skipped.
+    let setup = "CREATE TABLE src (id int PRIMARY KEY, name text NOT NULL, amount int);
+                 CREATE TABLE log1 (id int, name text, amount int);
+                 CREATE TABLE log2 (r src);
+                 CREATE TABLE log3 (id int, info text);";
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "CREATE RULE r1 AS ON INSERT TO src DO ALSO INSERT INTO log1 SELECT new.*;
+             CREATE RULE r2 AS ON INSERT TO src DO ALSO INSERT INTO log2 VALUES (new);
+             CREATE RULE r3 AS ON UPDATE TO src DO ALSO INSERT INTO log3 SELECT old.id, (SELECT new.name);
+             CREATE RULE r8 AS ON DELETE TO src DO ALSO INSERT INTO log2 SELECT old;",
+        ),
+    ]);
+    for (stmt, msg) in [
+        (
+            "CREATE RULE r6 AS ON INSERT TO src DO ALSO INSERT INTO log3 VALUES (new.id, new.amount + 'a'::text);",
+            "operator does not exist: integer + text",
+        ),
+        (
+            "CREATE RULE r7 AS ON INSERT TO src DO ALSO INSERT INTO log3 SELECT new.*;",
+            "INSERT has more expressions than target columns",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+}

@@ -100,7 +100,7 @@ pub fn create_rule(interp: &mut PgCatalog, stmt: &RuleStmt) -> Result<(), DdlErr
     for action in &stmt.actions {
         pseudo_refs(action, false)?;
         check_action_relations(interp, action)?;
-        check_action_query(interp, relid, action)?;
+        check_action_query(interp, relid, action, has_old, has_new)?;
     }
 
     let relname = rv.relname.clone();
@@ -194,18 +194,16 @@ fn check_action_relations(
     Ok(())
 }
 
-/// transformRuleStmt analyzes each action with NEW / OLD in its range
-/// table, reachable only by qualified references (relation namespace).
-/// The analyzer has no such scope entry, so each `new.col` / `old.col` is
-/// replaced by `(NULL::<column type>)` — keeping any `.field` after it —
-/// and the rewritten statement is analyzed. Actions using NEW / OLD any
-/// other way (`new.*`, a whole-row `new`) are left unchecked.
+/// transformRuleStmt analyzes each action with OLD / NEW in its range table,
+/// reachable only through the relation namespace (`old.col`, `new.*`, a
+/// whole-row `new`) — see [`crate::scope::with_rule_pseudo_relations`].
 fn check_action_query(
     interp: &PgCatalog,
     relid: PgClassOid,
     action: &pg_query::protobuf::Node,
+    has_old: bool,
+    has_new: bool,
 ) -> Result<(), DdlError> {
-    use pg_query::protobuf::{KeywordKind, Token};
     let Some(inner) = action.node.as_ref() else {
         return Ok(());
     };
@@ -218,83 +216,22 @@ fn check_action_query(
     ) {
         return Ok(());
     }
-    let Ok(sql) = inner.deparse() else {
+    let Some(class) = interp.pg_class.get(&relid) else {
         return Ok(());
     };
-    let Ok(scan) = pg_query::scan(&sql) else {
-        return Ok(());
-    };
-    let tokens = &scan.tokens;
-    let text = |i: usize| {
-        tokens
-            .get(i)
-            .map_or("", |t| &sql[t.start as usize..t.end as usize])
-    };
-    let mut out = String::with_capacity(sql.len());
-    let mut pos = 0usize;
-    let mut i = 0usize;
-    while i < tokens.len() {
-        let tok = &tokens[i];
-        // NEW / OLD scan as unreserved keywords.
-        let word = Token::try_from(tok.token) == Ok(Token::Ident)
-            || KeywordKind::try_from(tok.keyword_kind) == Ok(KeywordKind::UnreservedKeyword);
-        let pseudo =
-            word && matches!(
-                super::function_body::identifier_value(text(i)).as_str(),
-                "new" | "old"
-            ) && (i == 0 || text(i - 1) != ".");
-        if !pseudo {
-            i += 1;
-            continue;
-        }
-        if text(i + 1) != "." || text(i + 2) == "*" || i + 2 >= tokens.len() {
-            return Ok(());
-        }
-        let rel = super::function_body::identifier_value(text(i));
-        let column = super::function_body::identifier_value(text(i + 2));
-        let typ = interp
-            .attribute_by_name(relid, &column)
-            .map(|a| a.atttypid)
-            .or_else(|| {
-                crate::pg_catalog::SYSTEM_COLUMNS
-                    .iter()
-                    .find(|(n, ..)| *n == column)
-                    .map(|(_, t, _)| *t)
-            });
-        let Some(typ) = typ else {
-            return Err(DdlError::Parse(format!(
-                "column {} does not exist",
-                crate::qualified_name::QualifiedName::new(rel, column)
-            )));
-        };
-        let Some(ty) = interp.pg_type.get(&typ) else {
-            return Ok(());
-        };
-        let Some(schema) = interp.namespace_name(ty.typnamespace) else {
-            return Ok(());
-        };
-        out.push_str(&sql[pos..tok.start as usize]);
-        out.push_str(&format!(
-            "(NULL::{})",
-            crate::qualified_name::QualifiedName::new(schema, &ty.typname)
-        ));
-        pos = tokens[i + 2].end as usize;
-        i += 3;
-    }
-    out.push_str(&sql[pos..]);
-    let Ok(parsed) = pg_query::parse(&out) else {
-        return Ok(());
-    };
-    let Some(stmt) = parsed
-        .protobuf
-        .stmts
-        .first()
-        .and_then(|s| s.stmt.as_ref())
-        .and_then(|n| n.node.as_ref())
-    else {
-        return Ok(());
-    };
-    super::dml::check_statement(interp, stmt)
+    let nspname = interp
+        .namespace_name(class.relnamespace)
+        .unwrap_or("public")
+        .to_owned();
+    let relation = crate::qualified_name::QualifiedName::new(nspname, class.relname.clone());
+    let attrs = interp.attributes_of(relid).to_vec();
+    let names: Vec<&str> = [has_old.then_some("old"), has_new.then_some("new")]
+        .into_iter()
+        .flatten()
+        .collect();
+    crate::scope::with_rule_pseudo_relations(interp, relation, &attrs, &names, || {
+        super::dml::check_statement(interp, inner)
+    })
 }
 
 /// `DROP RULE [IF EXISTS] name ON table`.

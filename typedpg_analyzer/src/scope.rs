@@ -165,7 +165,7 @@ fn ambiguous_column_error(
     .finalize_implicit()
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub(crate) struct Scope {
     pub sources: Vec<TableSource>,
     /// Same-level FROM items made visible by `LATERAL`. PG resolves them
@@ -190,6 +190,56 @@ pub(crate) struct Scope {
     /// ones). Sublinks and nested subqueries inherit them — PG resolves a
     /// CTE name by walking up the parse-state chain (`scanNameSpaceForCTE`).
     pub ctes: std::collections::HashMap<String, Vec<ScopeColumn>>,
+}
+
+thread_local! {
+    /// Relations every scope sees as outer references while a rule action
+    /// is analyzed — see [`with_rule_pseudo_relations`].
+    static RULE_PSEUDO_RELATIONS: std::cell::RefCell<Vec<TableSource>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Run `f` with the rule's OLD / NEW pseudo-relations in the range table of
+/// whatever it analyzes, as `transformRuleStmt` adds them: in the relation
+/// namespace only (`addToRelNameSpace`, not `addToVarNameSpace`), so
+/// `new.col`, `new.*` and a whole-row `new` resolve, while an unqualified
+/// column name never reaches them. Subqueries see them as outer references.
+pub(crate) fn with_rule_pseudo_relations<R>(
+    snapshot: &PgCatalog,
+    relation: QualifiedName,
+    columns: &[PgAttribute],
+    names: &[&str],
+    f: impl FnOnce() -> R,
+) -> R {
+    let mut holder = Scope::default();
+    for name in names {
+        holder.add_dml_target(snapshot, name, relation.clone(), columns);
+    }
+    let sources = holder
+        .sources
+        .into_iter()
+        .map(|mut s| {
+            s.join_hidden = s.columns.iter().map(|c| c.name.clone()).collect();
+            s
+        })
+        .collect();
+    let prev = RULE_PSEUDO_RELATIONS.with(|r| r.replace(sources));
+    let out = f();
+    RULE_PSEUDO_RELATIONS.with(|r| *r.borrow_mut() = prev);
+    out
+}
+
+impl Default for Scope {
+    fn default() -> Self {
+        Scope {
+            sources: Vec::new(),
+            lateral_sources: Vec::new(),
+            outer_sources: RULE_PSEUDO_RELATIONS.with(|r| r.borrow().clone()),
+            shadowed_sources: Vec::new(),
+            lateral_blocked_aliases: Default::default(),
+            ctes: Default::default(),
+        }
+    }
 }
 
 /// Build the public-facing `UndefinedTable` error for a missing relation,
