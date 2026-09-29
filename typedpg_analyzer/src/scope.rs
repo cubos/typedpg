@@ -455,6 +455,14 @@ impl Scope {
         let relname = table.relname.clone();
         // A view has no system attributes.
         let is_view = table.relkind == crate::pg_catalog::RelKind::View;
+        // A NOT NULL domain only guarantees values that were stored and
+        // checked; a view's or materialized view's column is what its query
+        // yields — NULL from an outer join too — and already carries the
+        // nullability inferred for that query.
+        let stores_checked_values = !matches!(
+            table.relkind,
+            crate::pg_catalog::RelKind::View | crate::pg_catalog::RelKind::MaterializedView
+        );
 
         let columns: Vec<ScopeColumn> = snapshot
             .attributes_of(table_oid)
@@ -463,7 +471,7 @@ impl Scope {
                 name: c.attname.clone(),
                 type_oid: c.atttypid,
                 base_not_null: snapshot.attr_proven_not_null(c)
-                    || snapshot.type_is_not_null(c.atttypid),
+                    || (stores_checked_values && snapshot.type_is_not_null(c.atttypid)),
                 typmod: snapshot.effective_typmod(c.atttypid, c.atttypmod),
                 collation: c.attcollation,
                 table_alias: alias.to_owned(),
