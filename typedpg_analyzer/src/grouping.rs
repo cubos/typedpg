@@ -782,6 +782,8 @@ pub(crate) struct LevelInfo {
     /// Per output column, whether its collation is explicit (a plain
     /// SELECT's; a set operation's columns carry implicit ones).
     pub explicit_collations: Vec<bool>,
+    /// A plain SELECT's output column names (PG's resnames).
+    pub output_names: Vec<String>,
 }
 
 thread_local! {
@@ -834,6 +836,7 @@ pub(crate) fn register_level(
                 ns,
                 has_aggs: false,
                 explicit_collations: Vec::new(),
+                output_names: Vec::new(),
             },
         )
     });
@@ -844,10 +847,16 @@ pub(crate) fn level_info(sel: &protobuf::SelectStmt) -> Option<LevelInfo> {
     LEVELS.with(|l| l.borrow().get(&level_key(sel)).cloned())
 }
 
-/// Record which output columns of SELECT `sel` have an explicit collation.
-pub(crate) fn set_explicit_collations(sel: &protobuf::SelectStmt, explicit: Vec<bool>) {
+/// Record SELECT `sel`'s output column names and which of its columns
+/// have an explicit collation.
+pub(crate) fn set_output_columns(
+    sel: &protobuf::SelectStmt,
+    names: Vec<String>,
+    explicit: Vec<bool>,
+) {
     LEVELS.with(|l| {
         if let Some(info) = l.borrow_mut().get_mut(&level_key(sel)) {
+            info.output_names = names;
             info.explicit_collations = explicit;
         }
     });

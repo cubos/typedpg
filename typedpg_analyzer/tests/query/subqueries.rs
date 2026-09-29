@@ -707,3 +707,21 @@ fn sublink_reaches_every_enclosing_level() {
         );
     }
 }
+
+/// PG names a scalar subquery after its transformed first target entry —
+/// a `*`'s column, a set operation's left arm's — at strength 2, so a cast
+/// around it keeps that name.
+#[test]
+fn scalar_subquery_named_after_its_first_output_column() {
+    let db = setup();
+    let s = db
+        .analyze(
+            "SELECT (SELECT * FROM (SELECT 1 AS a) q), \
+             (SELECT * FROM (SELECT 1 AS b) q UNION SELECT 2), \
+             (SELECT 1)::int, (SELECT count(*) FROM users)::int, \
+             (SELECT * FROM (VALUES (1)) v)",
+        )
+        .unwrap();
+    let names: Vec<&str> = s.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["a", "b", "?column?", "count", "column1"]);
+}

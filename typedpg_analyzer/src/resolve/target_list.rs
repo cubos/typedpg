@@ -617,6 +617,13 @@ fn sublink_target_colname(sl: &protobuf::SubLink) -> (i32, Option<String>) {
     if !sel.values_lists.is_empty() {
         return (2, Some("column1".to_string()));
     }
+    // PG names it after the transformed subquery's first target entry — its
+    // resname, whatever the target (a `*` included), strength 2.
+    if let Some(name) =
+        crate::grouping::level_info(sel).and_then(|l| l.output_names.first().cloned())
+    {
+        return (2, Some(name));
+    }
     let Some(node::Node::ResTarget(rt)) = sel.target_list.first().and_then(|t| t.node.as_ref())
     else {
         return (0, None);

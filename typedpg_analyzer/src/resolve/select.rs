@@ -442,7 +442,11 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
         expr::Ctx::new(&scope, &null_ctx, snapshot),
         params,
     )?;
-    grouping::set_explicit_collations(sel, explicit_collations);
+    grouping::set_output_columns(
+        sel,
+        columns.iter().map(|c| c.name.clone()).collect(),
+        explicit_collations,
+    );
 
     // CASE / COALESCE / aggregate and window arguments may not contain
     // set-returning functions anywhere in this level.
