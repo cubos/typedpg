@@ -774,3 +774,21 @@ fn arrays_of_domains_keep_the_domain_array_type() {
         db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
 }
+
+#[test]
+fn an_array_of_a_domain_is_typed_as_the_domains_array() {
+    // The analyzer's type for an array of a domain is the domain's own
+    // array type (`d[]`), the one Describe reports.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE DOMAIN d AS int; CREATE TABLE t (c d[]);")
+        .unwrap();
+    let expected = array_of(domain("public", "d", int4()));
+    for sql in [
+        "SELECT c AS a FROM t",
+        "SELECT ARRAY[1::d] AS a",
+        "SELECT '{1}'::d[] AS a",
+    ] {
+        let q = db.analyze(sql).unwrap();
+        assert_eq!(q.columns[0].pg_type, expected, "{sql}");
+    }
+}
