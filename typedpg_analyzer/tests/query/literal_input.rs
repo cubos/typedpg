@@ -1183,3 +1183,37 @@ fn interval_cast_literal_uses_the_written_field_restriction() {
     db.analyze("SELECT '1:30'::interval minute to second AS v")
         .unwrap();
 }
+
+/// An assigned literal is read by interval_in with the target column's
+/// typmod, so the column's field restriction decides the decoding.
+#[test]
+fn interval_assignment_literal_uses_the_column_field_restriction() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE iv (id INT PRIMARY KEY, h INTERVAL HOUR, dh INTERVAL DAY TO HOUR,
+                          plain INTERVAL);",
+    )
+    .unwrap();
+    for sql in [
+        "INSERT INTO iv (id, h) VALUES (1, '[1,2)')",
+        "INSERT INTO iv (id, dh) VALUES (1, '1 1')",
+        "UPDATE iv SET dh = '1 1'",
+        "INSERT INTO iv (id, dh) SELECT 1, '1 1'",
+        "MERGE INTO iv USING (SELECT 1 AS id) s ON iv.id = s.id \
+         WHEN MATCHED THEN UPDATE SET dh = '1 1'",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    for sql in [
+        "INSERT INTO iv (id, plain) VALUES (1, '1 1')",
+        "UPDATE iv SET plain = '1 1'",
+        "INSERT INTO iv (id, plain) SELECT 1, '1 1'",
+        "MERGE INTO iv USING (SELECT 1 AS id) s ON iv.id = s.id \
+         WHEN MATCHED THEN UPDATE SET plain = '1 1'",
+    ] {
+        assert_first_line!(
+            db.analyze(sql),
+            "invalid input syntax for type interval: \"1 1\""
+        );
+    }
+}

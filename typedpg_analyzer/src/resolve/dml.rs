@@ -550,7 +550,16 @@ fn analyze_insert_select(
             }
         });
         if let Some(text) = literal {
-            if let Err(msg) = crate::literal_input::validate(text, target_oid, snapshot) {
+            // Read with the column's typmod, as coerce_type does.
+            let typmod = (tc.atttypid == target_oid)
+                .then(|| snapshot.effective_typmod(tc.atttypid, tc.atttypmod))
+                .flatten();
+            let checked = if tc.atttypid == target_oid {
+                crate::literal_input::validate_with_typmod(text, target_oid, typmod, snapshot)
+            } else {
+                crate::literal_input::validate(text, target_oid, snapshot)
+            };
+            if let Err(msg) = checked {
                 return Err(crate::error::RawError::invalid_literal(msg, None).finalize_implicit());
             }
             continue;
