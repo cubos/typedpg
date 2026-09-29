@@ -638,7 +638,10 @@ fn set_relation_schema(
     let Some(new_nsoid) = new_nsoid else {
         return Ok(());
     };
-    let old_schema = interp.namespace_name(old_nsoid).unwrap_or_default().to_owned();
+    let old_schema = interp
+        .namespace_name(old_nsoid)
+        .unwrap_or_default()
+        .to_owned();
     if new_schema == "pg_toast" || old_schema == "pg_toast" {
         return Err(DdlError::Parse(
             "cannot move objects into or out of TOAST schema".into(),

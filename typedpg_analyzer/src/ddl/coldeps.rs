@@ -257,7 +257,9 @@ fn returning_vals(clause: &Option<protobuf::ReturningClause>) -> Vec<&Node> {
 }
 
 fn relation_of(interp: &PgCatalog, rv: &protobuf::RangeVar) -> Option<PgClassOid> {
-    super::util::lookup_relation(interp, rv).ok().map(|(_, oid)| oid)
+    super::util::lookup_relation(interp, rv)
+        .ok()
+        .map(|(_, oid)| oid)
 }
 
 fn names_of(interp: &PgCatalog, relid: PgClassOid, names: &[Node]) -> Vec<(PgClassOid, i16)> {
@@ -276,11 +278,7 @@ fn names_of(interp: &PgCatalog, relid: PgClassOid, names: &[Node]) -> Vec<(PgCla
 /// The relations (attnum 0) and columns a statement reads or writes —
 /// SELECT, INSERT, UPDATE, DELETE — with `extra_from` in scope (a rule's
 /// NEW and OLD).
-fn statement_refs(
-    interp: &PgCatalog,
-    stmt: &Node,
-    extra_from: &[Node],
-) -> Vec<(PgClassOid, i16)> {
+fn statement_refs(interp: &PgCatalog, stmt: &Node, extra_from: &[Node]) -> Vec<(PgClassOid, i16)> {
     let mut refs: Vec<(PgClassOid, i16)> = Vec::new();
     let walk = |select: &Node, refs: &mut Vec<(PgClassOid, i16)>| {
         let (relations, columns) = super::views::statement_references(interp, select);
@@ -288,7 +286,9 @@ fn statement_refs(
         refs.extend(columns);
     };
     match stmt.node.as_ref() {
-        Some(node::Node::SelectStmt(sel)) if !extra_from.is_empty() && sel.values_lists.is_empty() => {
+        Some(node::Node::SelectStmt(sel))
+            if !extra_from.is_empty() && sel.values_lists.is_empty() =>
+        {
             let mut sel = sel.clone();
             sel.from_clause.extend(extra_from.iter().cloned());
             walk(
@@ -380,7 +380,11 @@ fn policy_refs(
     if exprs.is_empty() {
         return Vec::new();
     }
-    statement_refs(interp, &select_of(&exprs, vec![range_var_node(table, None)]), &[])
+    statement_refs(
+        interp,
+        &select_of(&exprs, vec![range_var_node(table, None)]),
+        &[],
+    )
 }
 
 /// CREATE POLICY: the columns its USING / WITH CHECK read.
@@ -462,7 +466,10 @@ pub(crate) fn record_trigger(
     };
     let mut refs = names_of(interp, relid, &stmt.columns);
     if let Some(when) = stmt.when_clause.as_deref() {
-        let from = vec![range_var_node(rv, Some("new")), range_var_node(rv, Some("old"))];
+        let from = vec![
+            range_var_node(rv, Some("new")),
+            range_var_node(rv, Some("old")),
+        ];
         refs.extend(
             statement_refs(interp, &select_of(&[when], from), &[])
                 .into_iter()
@@ -482,17 +489,27 @@ pub(crate) fn record_trigger(
 
 /// CREATE RULE: what its WHERE condition and actions read, NEW and OLD
 /// standing for the rule's relation.
-pub(crate) fn record_rule(interp: &mut PgCatalog, stmt: &protobuf::RuleStmt) -> Result<(), DdlError> {
+pub(crate) fn record_rule(
+    interp: &mut PgCatalog,
+    stmt: &protobuf::RuleStmt,
+) -> Result<(), DdlError> {
     let Some(rv) = stmt.relation.as_ref() else {
         return Ok(());
     };
     let Some(relid) = relation_of(interp, rv) else {
         return Ok(());
     };
-    let new_old = vec![range_var_node(rv, Some("new")), range_var_node(rv, Some("old"))];
+    let new_old = vec![
+        range_var_node(rv, Some("new")),
+        range_var_node(rv, Some("old")),
+    ];
     let mut refs: Vec<(PgClassOid, i16)> = Vec::new();
     if let Some(qual) = stmt.where_clause.as_deref() {
-        refs.extend(statement_refs(interp, &select_of(&[qual], new_old.clone()), &[]));
+        refs.extend(statement_refs(
+            interp,
+            &select_of(&[qual], new_old.clone()),
+            &[],
+        ));
     }
     for action in &stmt.actions {
         refs.extend(statement_refs(interp, action, &new_old));

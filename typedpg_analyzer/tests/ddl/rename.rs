@@ -167,7 +167,10 @@ fn rename_checks_the_relation_kind() {
                  CREATE INDEX bi ON b (x);
                  CREATE TYPE ct AS (x int);";
     for (stmt, msg) in [
-        ("ALTER TABLE ct RENAME TO ct2;", "\"ct\" is a composite type"),
+        (
+            "ALTER TABLE ct RENAME TO ct2;",
+            "\"ct\" is a composite type",
+        ),
         ("ALTER VIEW b RENAME TO c;", "\"b\" is not a view"),
         ("ALTER SEQUENCE b RENAME TO c;", "\"b\" is not a sequence"),
     ] {

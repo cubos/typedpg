@@ -748,7 +748,8 @@ fn a_partition_gets_no_column_of_its_own() {
     let stmt = "ALTER TABLE c ADD COLUMN b int;";
     let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
     assert!(
-        err.to_string().starts_with("cannot add column to a partition"),
+        err.to_string()
+            .starts_with("cannot add column to a partition"),
         "got: {err}"
     );
     build_db(&[
@@ -825,13 +826,19 @@ fn user_relations_stay_out_of_pg_global() {
     for (stmt, msg) in [
         ("ALTER TABLE a SET TABLESPACE pg_global;", placed),
         ("ALTER INDEX i SET TABLESPACE pg_global;", placed),
-        ("ALTER MATERIALIZED VIEW m SET TABLESPACE pg_global;", placed),
+        (
+            "ALTER MATERIALIZED VIEW m SET TABLESPACE pg_global;",
+            placed,
+        ),
         ("CREATE TABLE b (x int) TABLESPACE pg_global;", placed),
         (
             "CREATE TABLE p (x int) PARTITION BY RANGE (x) TABLESPACE pg_global;",
             placed,
         ),
-        ("CREATE TABLE c TABLESPACE pg_global AS SELECT 1 AS x;", placed),
+        (
+            "CREATE TABLE c TABLESPACE pg_global AS SELECT 1 AS x;",
+            placed,
+        ),
         ("CREATE INDEX j ON a (x) TABLESPACE pg_global;", placed),
         (
             "CREATE TABLE u (x int, UNIQUE (x) USING INDEX TABLESPACE pg_global);",
@@ -1034,7 +1041,10 @@ fn system_columns_can_be_neither_dropped_nor_altered() {
                  CREATE TYPE ct AS (x int);
                  CREATE VIEW v AS SELECT 1 AS a;";
     for (stmt, msg) in [
-        ("ALTER TABLE t DROP COLUMN ctid;", "cannot drop system column \"ctid\""),
+        (
+            "ALTER TABLE t DROP COLUMN ctid;",
+            "cannot drop system column \"ctid\"",
+        ),
         (
             "ALTER TABLE t DROP COLUMN IF EXISTS xmin;",
             "cannot drop system column \"xmin\"",
@@ -1233,8 +1243,9 @@ fn drop_column_only_refuses_a_partitioned_table_with_partitions() {
     let stmt = "ALTER TABLE ONLY p DROP COLUMN b;";
     let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
     assert!(
-        err.to_string()
-            .starts_with("cannot drop column from only the partitioned table when partitions exist"),
+        err.to_string().starts_with(
+            "cannot drop column from only the partitioned table when partitions exist"
+        ),
         "got: {err}"
     );
     let db = build_db(&[
@@ -1410,7 +1421,10 @@ fn policies_triggers_rules_and_sql_bodies_depend_on_what_they_read() {
         let base = format!("CREATE TABLE t (a int, b int); CREATE TABLE u (x int); {trigger_fn}");
         let err = try_apply(&[("0001.sql", &base), ("0002.sql", setup), ("0003.sql", stmt)])
             .expect_err(stmt);
-        assert!(err.to_string().contains(msg), "{setup} / {stmt}\n  got: {err}");
+        assert!(
+            err.to_string().contains(msg),
+            "{setup} / {stmt}\n  got: {err}"
+        );
     }
     // CASCADE drops the dependents; an ALTER POLICY that stops reading a
     // column releases it.

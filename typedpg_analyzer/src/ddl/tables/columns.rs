@@ -1008,8 +1008,7 @@ pub(crate) fn drop_column(
 
     // Policies, triggers, rules and SQL-standard function bodies reading the
     // column depend on it: CASCADE drops them.
-    let object_dependents =
-        crate::ddl::coldeps::dependents_on_column(interp, relid, target.attnum);
+    let object_dependents = crate::ddl::coldeps::dependents_on_column(interp, relid, target.attnum);
     if let Some(first) = object_dependents.first()
         && !cascade
     {
@@ -1348,9 +1347,7 @@ pub(crate) fn alter_column_type(
             let params = crate::ddl::seqparams::init_params(
                 interp,
                 std::slice::from_ref(&as_type),
-                Some(current.unwrap_or(crate::ddl::seqparams::SeqParams::defaults(
-                    attr.atttypid,
-                ))),
+                Some(current.unwrap_or(crate::ddl::seqparams::SeqParams::defaults(attr.atttypid))),
             )?;
             interp.sequence_params.insert(seq, params);
         }

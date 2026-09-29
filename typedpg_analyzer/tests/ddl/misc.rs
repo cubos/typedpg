@@ -4652,7 +4652,10 @@ fn truncate_only_refuses_a_partitioned_table() {
             "{stmt}\n  got: {err}"
         );
     }
-    build_db(&[("0001.sql", setup), ("0002.sql", "TRUNCATE p; TRUNCATE ONLY c;")]);
+    build_db(&[
+        ("0001.sql", setup),
+        ("0002.sql", "TRUNCATE p; TRUNCATE ONLY c;"),
+    ]);
 }
 
 #[test]

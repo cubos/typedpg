@@ -464,9 +464,12 @@ pub(super) fn detach_partition(
     // ATExecDetachPartition: the default partition's constraint would
     // change under a concurrent detach.
     if pc.concurrent
-        && inherit::children_of(interp, parent)
-            .iter()
-            .any(|c| matches!(interp.partition_bounds.get(c), Some(super::partbound::Bound::Default)))
+        && inherit::children_of(interp, parent).iter().any(|c| {
+            matches!(
+                interp.partition_bounds.get(c),
+                Some(super::partbound::Bound::Default)
+            )
+        })
     {
         return Err(DdlError::Parse(
             "cannot detach partitions concurrently when a default partition exists".into(),
@@ -515,7 +518,10 @@ fn add_detached_partition_check(
     if interp.pg_constraint.values().any(|c| {
         c.conrelid == part
             && c.contype == ConType::Check
-            && interp.check_defs.get(&c.oid).is_some_and(|d| d.expr == stored)
+            && interp
+                .check_defs
+                .get(&c.oid)
+                .is_some_and(|d| d.expr == stored)
     }) {
         return Ok(());
     }

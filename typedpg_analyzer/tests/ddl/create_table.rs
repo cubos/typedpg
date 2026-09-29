@@ -1194,14 +1194,26 @@ fn set_returning_functions_are_rejected_in_defaults() {
 fn columns_may_not_have_a_pseudo_type() {
     // CheckAttributeType: CREATE TABLE, CREATE TABLE AS and views alike.
     for (sql, msg) in [
-        ("CREATE TABLE b (c record);", "column \"c\" has pseudo-type record"),
+        (
+            "CREATE TABLE b (c record);",
+            "column \"c\" has pseudo-type record",
+        ),
         (
             "CREATE TABLE b (c anyelement);",
             "column \"c\" has pseudo-type anyelement",
         ),
-        ("CREATE TABLE b (c cstring);", "column \"c\" has pseudo-type cstring"),
-        ("CREATE TABLE b (c unknown);", "column \"c\" has pseudo-type unknown"),
-        ("CREATE TABLE b (c void);", "column \"c\" has pseudo-type void"),
+        (
+            "CREATE TABLE b (c cstring);",
+            "column \"c\" has pseudo-type cstring",
+        ),
+        (
+            "CREATE TABLE b (c unknown);",
+            "column \"c\" has pseudo-type unknown",
+        ),
+        (
+            "CREATE TABLE b (c void);",
+            "column \"c\" has pseudo-type void",
+        ),
         (
             "CREATE TABLE b AS SELECT row(1, 2) AS c;",
             "column \"c\" has pseudo-type record",
@@ -1318,8 +1330,14 @@ fn create_table_as_execute_runs_a_prepared_statement() {
                  CREATE TABLE t (x int);
                  PREPARE i AS INSERT INTO t VALUES (1);";
     for (stmt, msg) in [
-        ("PREPARE s AS SELECT 2;", "prepared statement \"s\" already exists"),
-        ("PREPARE bad AS SELECT nope;", "column \"nope\" does not exist"),
+        (
+            "PREPARE s AS SELECT 2;",
+            "prepared statement \"s\" already exists",
+        ),
+        (
+            "PREPARE bad AS SELECT nope;",
+            "column \"nope\" does not exist",
+        ),
         (
             "CREATE TABLE b AS EXECUTE p2(1, 'x');",
             "wrong number of parameters for prepared statement \"p2\"",
@@ -1337,9 +1355,18 @@ fn create_table_as_execute_runs_a_prepared_statement() {
             "CREATE TABLE b AS EXECUTE nope;",
             "prepared statement \"nope\" does not exist",
         ),
-        ("EXECUTE nope;", "prepared statement \"nope\" does not exist"),
-        ("DEALLOCATE nope;", "prepared statement \"nope\" does not exist"),
-        ("DEALLOCATE s; EXECUTE s;", "prepared statement \"s\" does not exist"),
+        (
+            "EXECUTE nope;",
+            "prepared statement \"nope\" does not exist",
+        ),
+        (
+            "DEALLOCATE nope;",
+            "prepared statement \"nope\" does not exist",
+        ),
+        (
+            "DEALLOCATE s; EXECUTE s;",
+            "prepared statement \"s\" does not exist",
+        ),
         (
             "CREATE TABLE b AS EXECUTE i;",
             "prepared statement is not a SELECT",
@@ -1364,12 +1391,18 @@ fn create_table_as_execute_runs_a_prepared_statement() {
              PREPARE s AS SELECT 2;",
         ),
     ]);
-    assert_cols(&db.analyze("SELECT c FROM b").unwrap(), vec![cn("c", int4())]);
+    assert_cols(
+        &db.analyze("SELECT c FROM b").unwrap(),
+        vec![cn("c", int4())],
+    );
     assert_cols(
         &db.analyze("SELECT * FROM b2").unwrap(),
         vec![cn("a", int4()), cn("b", text()), cn("c", bool_ty())],
     );
-    assert_cols(&db.analyze("SELECT y FROM b3").unwrap(), vec![cn("y", int4())]);
+    assert_cols(
+        &db.analyze("SELECT y FROM b3").unwrap(),
+        vec![cn("y", int4())],
+    );
 }
 
 #[test]

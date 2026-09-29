@@ -83,7 +83,13 @@ fn check_attribute_type_rec(
         }
         TypType::Range => {
             if let Some(range) = interp.pg_range.get(&typid) {
-                check_attribute_type_rec(interp, attname, range.rngsubtype, containing, is_virtual)?;
+                check_attribute_type_rec(
+                    interp,
+                    attname,
+                    range.rngsubtype,
+                    containing,
+                    is_virtual,
+                )?;
             }
         }
         TypType::Multirange => {

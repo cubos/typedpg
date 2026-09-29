@@ -206,9 +206,7 @@ fn create_relation_as(
         }) => {
             let prepared = super::prepared::lookup_execute(interp, estmt)?;
             if !prepared.is_select() {
-                return Err(DdlError::Parse(
-                    "prepared statement is not a SELECT".into(),
-                ));
+                return Err(DdlError::Parse("prepared statement is not a SELECT".into()));
             }
             resolve_view_with_params(interp, &prepared.query, &aliases, &prepared.param_types)
                 .map_err(|e| match e {

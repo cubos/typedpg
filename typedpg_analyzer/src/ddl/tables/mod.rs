@@ -888,8 +888,7 @@ pub(crate) fn check_not_system_column(
     relid: PgClassOid,
     name: &str,
 ) -> Result<(), DdlError> {
-    if interp.attribute_by_name(relid, name).is_none() && is_system_column_of(interp, relid, name)
-    {
+    if interp.attribute_by_name(relid, name).is_none() && is_system_column_of(interp, relid, name) {
         return Err(DdlError::UnsupportedDdl(format!(
             "cannot alter system column \"{name}\""
         )));
@@ -1212,7 +1211,8 @@ fn apply_alter_subtype(
         AlterTableType::AtAlterColumnType => alter_column_type(interp, relid, cmd, rec),
         AlterTableType::AtAddConstraint => {
             // DefineIndex, for a constraint's USING INDEX TABLESPACE.
-            if let Some(node::Node::Constraint(c)) = cmd.def.as_deref().and_then(|d| d.node.as_ref())
+            if let Some(node::Node::Constraint(c)) =
+                cmd.def.as_deref().and_then(|d| d.node.as_ref())
             {
                 check_tablespace_placement(&c.indexspace)?;
                 // transformIndexConstraint takes a system column as found:
