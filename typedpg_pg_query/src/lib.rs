@@ -14,6 +14,7 @@
 //! generated modules are produced by `typedpg_pg_query_codegen`; see the
 //! crate README for moving to a new release.
 
+mod catalog;
 mod ffi;
 mod node;
 #[allow(clippy::all, missing_docs)]
@@ -25,6 +26,7 @@ use std::os::raw::c_char;
 
 use prost::Message;
 
+pub use catalog::{Catalog, CatalogAttribute, CatalogType};
 pub use node::{NodeMut, NodeRef};
 /// The `oneof` of every node kind — what [`protobuf::Node::node`] holds.
 pub use protobuf::node::Node as NodeEnum;
@@ -141,8 +143,11 @@ pub fn deparse(tree: &protobuf::ParseResult) -> Result<String> {
     sql
 }
 
-/// Parse a `CREATE FUNCTION … LANGUAGE plpgsql` statement's body with
-/// PL/pgSQL's grammar, returning libpg_query's JSON rendering of it.
+/// Parse a `CREATE FUNCTION … LANGUAGE plpgsql` statement (or a `DO`
+/// block) with PL/pgSQL's compiler, returning libpg_query's JSON rendering
+/// of it. Without a catalog, the compiler only knows the built-in types:
+/// any other type name is assumed to be a row type (see
+/// [`parse_plpgsql_with_catalog`]).
 pub fn parse_plpgsql(sql: &str) -> Result<serde_json::Value> {
     let input = CString::new(sql)?;
     let result = unsafe { ffi::pg_query_parse_plpgsql(input.as_ptr()) };
@@ -154,6 +159,16 @@ pub fn parse_plpgsql(sql: &str) -> Result<serde_json::Value> {
     };
     unsafe { ffi::pg_query_free_plpgsql_parse_result(result) };
     parsed
+}
+
+/// [`parse_plpgsql`], with the compiler resolving types, schemas, relations
+/// and columns (`%TYPE`, `%ROWTYPE`) against `catalog` — so it reports what
+/// PostgreSQL would for that catalog (`type "x" does not exist`, `relation
+/// "t" does not exist`, …).
+///
+/// `catalog` must not call back into this crate.
+pub fn parse_plpgsql_with_catalog(sql: &str, catalog: &dyn Catalog) -> Result<serde_json::Value> {
+    catalog::with_catalog(catalog, || parse_plpgsql(sql))
 }
 
 /// Every node reachable from `roots`, breadth-first, each with its depth

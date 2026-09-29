@@ -19,6 +19,7 @@ include = [
     "/Cargo.toml",
     "/build.rs",
     "/patches.rs",
+    "/csrc/**/*",
     "/README.md",
     "/src/**/*.rs",
     "/tests/**/*.rs",

@@ -24,6 +24,7 @@ fn main() {
 
     // Sources with a patch (patches.rs) are compiled from a patched copy.
     println!("cargo:rerun-if-changed=patches.rs");
+    println!("cargo:rerun-if-changed=csrc");
     let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
     let mut patched: std::collections::BTreeMap<&str, String> = std::collections::BTreeMap::new();
     for patch in PATCHES {
@@ -57,6 +58,9 @@ fn main() {
         .file(lib.join("vendor/protobuf-c/protobuf-c.c"))
         .file(lib.join("vendor/xxhash/xxhash.c"))
         .file(lib.join("protobuf/pg_query.pb-c.c"))
+        // The catalog hooks (patched lookups call into them).
+        .file("csrc/catalog.c")
+        .include("csrc")
         .include(lib)
         // A patched copy's `#include "…"` of its upstream neighbours.
         .include(lib.join("src"))

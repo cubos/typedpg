@@ -164,4 +164,678 @@ const PATCHES: &[Patch] = &[
 		typ->origtypname = origtypname;
 "#,
     },
+    Patch {
+        file: "src/postgres/src_backend_utils_cache_syscache.c",
+        why: "The catalog hooks' declarations.",
+        find: r#"#include "postgres.h"
+"#,
+        replace: r#"#include "postgres.h"
+#include "typedpg_catalog_internal.h"
+"#,
+    },
+    Patch {
+        file: "src/postgres/src_backend_utils_cache_syscache.c",
+        why: "Route pg_type lookups by OID to the installed catalog.",
+        find: r#"    if (cacheId != TYPEOID)
+        elog(ERROR, "Not implemented (SearchSysCache1 only supports TYPEOID cache (%d), got cache %d)", TYPEOID, cacheId);
+"#,
+        replace: r#"    if (typedpg_catalog_active() && cacheId == TYPEOID)
+        return typedpg_search_type(DatumGetObjectId(key1));
+
+    if (cacheId != TYPEOID)
+        elog(ERROR, "Not implemented (SearchSysCache1 only supports TYPEOID cache (%d), got cache %d)", TYPEOID, cacheId);
+"#,
+    },
+    Patch {
+        file: "src/postgres/src_backend_utils_cache_syscache.c",
+        why: "Route pg_type lookups by name and schema to the installed catalog.",
+        find: r#"	if (cacheId != TYPENAMENSP)
+        elog(ERROR, "Not implemented (GetSysCacheOid only supports TYPENAMENSP cache (%d), got cache %d)", TYPENAMENSP, cacheId);
+"#,
+        replace: r#"    if (typedpg_catalog_active() && cacheId == TYPENAMENSP)
+        return typedpg_type_by_name(DatumGetObjectId(key2), DatumGetPointer(key1));
+
+	if (cacheId != TYPENAMENSP)
+        elog(ERROR, "Not implemented (GetSysCacheOid only supports TYPENAMENSP cache (%d), got cache %d)", TYPENAMENSP, cacheId);
+"#,
+    },
+    Patch {
+        file: "src/postgres/src_backend_catalog_namespace.c",
+        why: "The catalog hooks' declarations.",
+        find: r#"#include "postgres.h"
+"#,
+        replace: r#"#include "postgres.h"
+#include "typedpg_catalog_internal.h"
+"#,
+    },
+    Patch {
+        file: "src/postgres/src_backend_catalog_namespace.c",
+        why: "Resolve schemas with the installed catalog (PG's missing-schema error).",
+        find: r#"	// CHANGED: Only support pg_catalog and public namespace
+"#,
+        replace: r#"	if (typedpg_catalog_active())
+		return typedpg_lookup_namespace(nspname, missing_ok);
+
+	// CHANGED: Only support pg_catalog and public namespace
+"#,
+    },
+    Patch {
+        file: "src/postgres/src_backend_catalog_namespace.c",
+        why: "Take the search path from the installed catalog.",
+        find: r#"activeSearchPath = list_make2_oid(PG_CATALOG_NAMESPACE, PG_PUBLIC_NAMESPACE);}"#,
+        replace: r#"if (typedpg_catalog_active())
+	activeSearchPath = typedpg_search_path();
+else
+	activeSearchPath = list_make2_oid(PG_CATALOG_NAMESPACE, PG_PUBLIC_NAMESPACE);}"#,
+    },
+    Patch {
+        file: "src/postgres/src_backend_catalog_namespace.c",
+        why: "TypeIsVisible (it decides whether messages schema-qualify a type) from the installed catalog.",
+        find: r#"TypeIsVisible(Oid typid)
+{
+return true;}"#,
+        replace: r#"TypeIsVisible(Oid typid)
+{
+if (typedpg_catalog_active())
+	return typedpg_type_is_visible(typid);
+return true;}"#,
+    },
+    Patch {
+        file: "src/postgres/src_backend_utils_cache_lsyscache.c",
+        why: "The catalog hooks' declarations.",
+        find: r#"#include "postgres.h"
+"#,
+        replace: r#"#include "postgres.h"
+#include "typedpg_catalog_internal.h"
+"#,
+    },
+    Patch {
+        file: "src/postgres/src_backend_utils_cache_lsyscache.c",
+        why: "Schema names from the installed catalog (the NAMESPACEOID cache isn't mocked).",
+        find: r#"get_namespace_name(Oid nspid)
+{
+	HeapTuple	tp;
+"#,
+        replace: r#"get_namespace_name(Oid nspid)
+{
+	HeapTuple	tp;
+
+	if (typedpg_catalog_active())
+		return typedpg_namespace_name(nspid);
+"#,
+    },
+    Patch {
+        file: "src/postgres/src_backend_parser_parse_type.c",
+        why: "The catalog hooks' declarations.",
+        find: r#"#include "postgres.h"
+"#,
+        replace: r#"#include "postgres.h"
+#include "typedpg_catalog_internal.h"
+"#,
+    },
+    Patch {
+        file: "src/postgres/src_backend_parser_parse_type.c",
+        why: "Restore PostgreSQL 18.4's %TYPE lookup (table.column%TYPE in a function signature) over the installed catalog; the mock only has Not implemented.",
+        find: r#"	else if (typeName->pct_type)
+	{
+        // CHANGED: Not currently implemented, requires us to get type mappings from caller
+        elog(ERROR, "Not implemented");
+		/* Handle %TYPE reference to type of an existing field */
+		//RangeVar   *rel = makeRangeVar(NULL, NULL, typeName->location);
+		//char	   *field = NULL;
+		//Oid			relid;
+		//AttrNumber	attnum;
+
+		/* deconstruct the name list */
+		//switch (list_length(typeName->names))
+		//{
+		//	case 1:
+		//		ereport(ERROR,
+		//				(errcode(ERRCODE_SYNTAX_ERROR),
+		//				 errmsg("improper %%TYPE reference (too few dotted names): %s",
+		//						NameListToString(typeName->names)),
+		//				 parser_errposition(pstate, typeName->location)));
+		//		break;
+		//	case 2:
+		//		rel->relname = strVal(linitial(typeName->names));
+		//		field = strVal(lsecond(typeName->names));
+		//		break;
+		//	case 3:
+		//		rel->schemaname = strVal(linitial(typeName->names));
+		//		rel->relname = strVal(lsecond(typeName->names));
+		//		field = strVal(lthird(typeName->names));
+		//		break;
+		//	case 4:
+		//		rel->catalogname = strVal(linitial(typeName->names));
+		//		rel->schemaname = strVal(lsecond(typeName->names));
+		//		rel->relname = strVal(lthird(typeName->names));
+		//		field = strVal(lfourth(typeName->names));
+		//		break;
+		//	default:
+		//		ereport(ERROR,
+		//				(errcode(ERRCODE_SYNTAX_ERROR),
+		//				 errmsg("improper %%TYPE reference (too many dotted names): %s",
+		//						NameListToString(typeName->names)),
+		//				 parser_errposition(pstate, typeName->location)));
+		//		break;
+		//}
+
+		/*
+		 * Look up the field.
+		 *
+		 * XXX: As no lock is taken here, this might fail in the presence of
+		 * concurrent DDL.  But taking a lock would carry a performance
+		 * penalty and would also require a permissions check.
+		 */
+		//relid = RangeVarGetRelid(rel, NoLock, missing_ok);
+		//attnum = get_attnum(relid, field);
+		//if (attnum == InvalidAttrNumber)
+		//{
+		//	if (missing_ok)
+		//		typoid = InvalidOid;
+		//	else
+		//		ereport(ERROR,
+		//				(errcode(ERRCODE_UNDEFINED_COLUMN),
+		//				 errmsg("column \"%s\" of relation \"%s\" does not exist",
+		//						field, rel->relname),
+		//				 parser_errposition(pstate, typeName->location)));
+		//}
+		//else
+		//{
+		//	typoid = get_atttype(relid, attnum);
+        //
+		//	/* this construct should never have an array indicator */
+		//	Assert(typeName->arrayBounds == NIL);
+        //
+		//	/* emit nuisance notice (intentionally not errposition'd) */
+		//	ereport(NOTICE,
+		//			(errmsg("type reference %s converted to %s",
+		//					TypeNameToString(typeName),
+		//					format_type_be(typoid))));
+		//}
+	}
+"#,
+        replace: r#"	else if (typeName->pct_type && typedpg_catalog_active())
+	{
+		/* Handle %TYPE reference to type of an existing field */
+		RangeVar   *rel = makeRangeVar(NULL, NULL, typeName->location);
+		char	   *field = NULL;
+		Oid			relid;
+		AttrNumber	attnum;
+
+		/* deconstruct the name list */
+		switch (list_length(typeName->names))
+		{
+			case 1:
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("improper %%TYPE reference (too few dotted names): %s",
+								NameListToString(typeName->names)),
+						 parser_errposition(pstate, typeName->location)));
+				break;
+			case 2:
+				rel->relname = strVal(linitial(typeName->names));
+				field = strVal(lsecond(typeName->names));
+				break;
+			case 3:
+				rel->schemaname = strVal(linitial(typeName->names));
+				rel->relname = strVal(lsecond(typeName->names));
+				field = strVal(lthird(typeName->names));
+				break;
+			case 4:
+				rel->catalogname = strVal(linitial(typeName->names));
+				rel->schemaname = strVal(lsecond(typeName->names));
+				rel->relname = strVal(lthird(typeName->names));
+				field = strVal(lfourth(typeName->names));
+				break;
+			default:
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("improper %%TYPE reference (too many dotted names): %s",
+								NameListToString(typeName->names)),
+						 parser_errposition(pstate, typeName->location)));
+				break;
+		}
+
+		/*
+		 * Look up the field.
+		 *
+		 * XXX: As no lock is taken here, this might fail in the presence of
+		 * concurrent DDL.  But taking a lock would carry a performance
+		 * penalty and would also require a permissions check.
+		 */
+		relid = RangeVarGetRelid(rel, NoLock, missing_ok);
+		attnum = get_attnum(relid, field);
+		if (attnum == InvalidAttrNumber)
+		{
+			if (missing_ok)
+				typoid = InvalidOid;
+			else
+				ereport(ERROR,
+						(errcode(ERRCODE_UNDEFINED_COLUMN),
+						 errmsg("column \"%s\" of relation \"%s\" does not exist",
+								field, rel->relname),
+						 parser_errposition(pstate, typeName->location)));
+		}
+		else
+		{
+			typoid = get_atttype(relid, attnum);
+
+			/* this construct should never have an array indicator */
+			Assert(typeName->arrayBounds == NIL);
+
+			/* emit nuisance notice (intentionally not errposition'd) */
+			ereport(NOTICE,
+					(errmsg("type reference %s converted to %s",
+							TypeNameToString(typeName),
+							format_type_be(typoid))));
+		}
+	}
+	else if (typeName->pct_type)
+	{
+        // CHANGED: Not currently implemented, requires us to get type mappings from caller
+        elog(ERROR, "Not implemented");
+		/* Handle %TYPE reference to type of an existing field */
+		//RangeVar   *rel = makeRangeVar(NULL, NULL, typeName->location);
+		//char	   *field = NULL;
+		//Oid			relid;
+		//AttrNumber	attnum;
+
+		/* deconstruct the name list */
+		//switch (list_length(typeName->names))
+		//{
+		//	case 1:
+		//		ereport(ERROR,
+		//				(errcode(ERRCODE_SYNTAX_ERROR),
+		//				 errmsg("improper %%TYPE reference (too few dotted names): %s",
+		//						NameListToString(typeName->names)),
+		//				 parser_errposition(pstate, typeName->location)));
+		//		break;
+		//	case 2:
+		//		rel->relname = strVal(linitial(typeName->names));
+		//		field = strVal(lsecond(typeName->names));
+		//		break;
+		//	case 3:
+		//		rel->schemaname = strVal(linitial(typeName->names));
+		//		rel->relname = strVal(lsecond(typeName->names));
+		//		field = strVal(lthird(typeName->names));
+		//		break;
+		//	case 4:
+		//		rel->catalogname = strVal(linitial(typeName->names));
+		//		rel->schemaname = strVal(lsecond(typeName->names));
+		//		rel->relname = strVal(lthird(typeName->names));
+		//		field = strVal(lfourth(typeName->names));
+		//		break;
+		//	default:
+		//		ereport(ERROR,
+		//				(errcode(ERRCODE_SYNTAX_ERROR),
+		//				 errmsg("improper %%TYPE reference (too many dotted names): %s",
+		//						NameListToString(typeName->names)),
+		//				 parser_errposition(pstate, typeName->location)));
+		//		break;
+		//}
+
+		/*
+		 * Look up the field.
+		 *
+		 * XXX: As no lock is taken here, this might fail in the presence of
+		 * concurrent DDL.  But taking a lock would carry a performance
+		 * penalty and would also require a permissions check.
+		 */
+		//relid = RangeVarGetRelid(rel, NoLock, missing_ok);
+		//attnum = get_attnum(relid, field);
+		//if (attnum == InvalidAttrNumber)
+		//{
+		//	if (missing_ok)
+		//		typoid = InvalidOid;
+		//	else
+		//		ereport(ERROR,
+		//				(errcode(ERRCODE_UNDEFINED_COLUMN),
+		//				 errmsg("column \"%s\" of relation \"%s\" does not exist",
+		//						field, rel->relname),
+		//				 parser_errposition(pstate, typeName->location)));
+		//}
+		//else
+		//{
+		//	typoid = get_atttype(relid, attnum);
+        //
+		//	/* this construct should never have an array indicator */
+		//	Assert(typeName->arrayBounds == NIL);
+        //
+		//	/* emit nuisance notice (intentionally not errposition'd) */
+		//	ereport(NOTICE,
+		//			(errmsg("type reference %s converted to %s",
+		//					TypeNameToString(typeName),
+		//					format_type_be(typoid))));
+		//}
+	}
+"#,
+    },
+    Patch {
+        file: "src/postgres/src_pl_plpgsql_src_pl_comp.c",
+        why: "The catalog hooks' declarations.",
+        find: r#"#include "postgres.h"
+"#,
+        replace: r#"#include "postgres.h"
+#include "typedpg_catalog_internal.h"
+"#,
+    },
+    Patch {
+        file: "src/postgres/src_pl_plpgsql_src_pl_comp.c",
+        why: "Restore PostgreSQL 18.4's plpgsql_parse_wordtype (variable, table and column lookups for %TYPE / %ROWTYPE) over the installed catalog; the mock only echoes the text.",
+        find: r#"PLpgSQL_type *
+plpgsql_parse_wordtype(char *ident)
+{
+	PLpgSQL_type *typ;
+
+	typ = (PLpgSQL_type *) palloc0(sizeof(PLpgSQL_type));
+	typ->typname = psprintf("%s%%TYPE", ident);
+	typ->ttype = PLPGSQL_TTYPE_SCALAR;
+	return typ;
+}
+"#,
+        replace: r#"static PLpgSQL_type *
+typedpg_pg18_plpgsql_parse_wordtype(char *ident)
+{
+	PLpgSQL_nsitem *nse;
+
+	/*
+	 * Do a lookup in the current namespace stack
+	 */
+	nse = plpgsql_ns_lookup(plpgsql_ns_top(), false,
+							ident, NULL, NULL,
+							NULL);
+
+	if (nse != NULL)
+	{
+		switch (nse->itemtype)
+		{
+			case PLPGSQL_NSTYPE_VAR:
+				return ((PLpgSQL_var *) (plpgsql_Datums[nse->itemno]))->datatype;
+			case PLPGSQL_NSTYPE_REC:
+				return ((PLpgSQL_rec *) (plpgsql_Datums[nse->itemno]))->datatype;
+			default:
+				break;
+		}
+	}
+
+	/* No match, complain */
+	ereport(ERROR,
+			(errcode(ERRCODE_UNDEFINED_OBJECT),
+			 errmsg("variable \"%s\" does not exist", ident)));
+	return NULL;				/* keep compiler quiet */
+}
+
+PLpgSQL_type *
+plpgsql_parse_wordtype(char *ident)
+{
+	if (typedpg_catalog_active())
+		return typedpg_pg18_plpgsql_parse_wordtype(ident);
+	PLpgSQL_type *typ;
+
+	typ = (PLpgSQL_type *) palloc0(sizeof(PLpgSQL_type));
+	typ->typname = psprintf("%s%%TYPE", ident);
+	typ->ttype = PLPGSQL_TTYPE_SCALAR;
+	return typ;
+}
+"#,
+    },
+    Patch {
+        file: "src/postgres/src_pl_plpgsql_src_pl_comp.c",
+        why: "Restore PostgreSQL 18.4's plpgsql_parse_cwordtype (variable, table and column lookups for %TYPE / %ROWTYPE) over the installed catalog; the mock only echoes the text.",
+        find: r#"PLpgSQL_type *
+plpgsql_parse_cwordtype(List *idents)
+{
+	PLpgSQL_type *typ;
+
+	typ = (PLpgSQL_type *) palloc0(sizeof(PLpgSQL_type));
+	typ->typname = psprintf("%s%%TYPE", NameListToString(idents));
+	typ->ttype = PLPGSQL_TTYPE_SCALAR;
+	return typ;
+}
+"#,
+        replace: r#"static PLpgSQL_type *
+typedpg_pg18_plpgsql_parse_cwordtype(List *idents)
+{
+	PLpgSQL_type *dtype = NULL;
+	PLpgSQL_nsitem *nse;
+	int			nnames;
+	RangeVar   *relvar = NULL;
+	const char *fldname = NULL;
+	Oid			classOid;
+	HeapTuple	attrtup = NULL;
+	HeapTuple	typetup = NULL;
+	Form_pg_attribute attrStruct;
+	MemoryContext oldCxt;
+
+	/* Avoid memory leaks in the long-term function context */
+	oldCxt = MemoryContextSwitchTo(plpgsql_compile_tmp_cxt);
+
+	if (list_length(idents) == 2)
+	{
+		/*
+		 * Do a lookup in the current namespace stack
+		 */
+		nse = plpgsql_ns_lookup(plpgsql_ns_top(), false,
+								strVal(linitial(idents)),
+								strVal(lsecond(idents)),
+								NULL,
+								&nnames);
+
+		if (nse != NULL && nse->itemtype == PLPGSQL_NSTYPE_VAR)
+		{
+			/* Block-qualified reference to scalar variable. */
+			dtype = ((PLpgSQL_var *) (plpgsql_Datums[nse->itemno]))->datatype;
+			goto done;
+		}
+		else if (nse != NULL && nse->itemtype == PLPGSQL_NSTYPE_REC &&
+				 nnames == 2)
+		{
+			/* Block-qualified reference to record variable. */
+			dtype = ((PLpgSQL_rec *) (plpgsql_Datums[nse->itemno]))->datatype;
+			goto done;
+		}
+
+		/*
+		 * First word could also be a table name
+		 */
+		relvar = makeRangeVar(NULL,
+							  strVal(linitial(idents)),
+							  -1);
+		fldname = strVal(lsecond(idents));
+	}
+	else
+	{
+		/*
+		 * We could check for a block-qualified reference to a field of a
+		 * record variable, but %TYPE is documented as applying to variables,
+		 * not fields of variables.  Things would get rather ambiguous if we
+		 * allowed either interpretation.
+		 */
+		List	   *rvnames;
+
+		Assert(list_length(idents) > 2);
+		rvnames = list_delete_last(list_copy(idents));
+		relvar = makeRangeVarFromNameList(rvnames);
+		fldname = strVal(llast(idents));
+	}
+
+	/* Look up relation name.  Can't lock it - we might not have privileges. */
+	classOid = RangeVarGetRelid(relvar, NoLock, false);
+
+	/*
+	 * Fetch the named table field and its type
+	 */
+	attrtup = SearchSysCacheAttName(classOid, fldname);
+	if (!HeapTupleIsValid(attrtup))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_COLUMN),
+				 errmsg("column \"%s\" of relation \"%s\" does not exist",
+						fldname, relvar->relname)));
+	attrStruct = (Form_pg_attribute) GETSTRUCT(attrtup);
+
+	typetup = SearchSysCache1(TYPEOID,
+							  ObjectIdGetDatum(attrStruct->atttypid));
+	if (!HeapTupleIsValid(typetup))
+		elog(ERROR, "cache lookup failed for type %u", attrStruct->atttypid);
+
+	/*
+	 * Found that - build a compiler type struct in the caller's cxt and
+	 * return it.  Note that we treat the type as being found-by-OID; no
+	 * attempt to re-look-up the type name will happen during invalidations.
+	 */
+	MemoryContextSwitchTo(oldCxt);
+	dtype = build_datatype(typetup,
+						   attrStruct->atttypmod,
+						   attrStruct->attcollation,
+						   NULL);
+	MemoryContextSwitchTo(plpgsql_compile_tmp_cxt);
+
+done:
+	if (HeapTupleIsValid(attrtup))
+		ReleaseSysCache(attrtup);
+	if (HeapTupleIsValid(typetup))
+		ReleaseSysCache(typetup);
+
+	MemoryContextSwitchTo(oldCxt);
+	return dtype;
+}
+
+PLpgSQL_type *
+plpgsql_parse_cwordtype(List *idents)
+{
+	if (typedpg_catalog_active())
+		return typedpg_pg18_plpgsql_parse_cwordtype(idents);
+	PLpgSQL_type *typ;
+
+	typ = (PLpgSQL_type *) palloc0(sizeof(PLpgSQL_type));
+	typ->typname = psprintf("%s%%TYPE", NameListToString(idents));
+	typ->ttype = PLPGSQL_TTYPE_SCALAR;
+	return typ;
+}
+"#,
+    },
+    Patch {
+        file: "src/postgres/src_pl_plpgsql_src_pl_comp.c",
+        why: "Restore PostgreSQL 18.4's plpgsql_parse_wordrowtype (variable, table and column lookups for %TYPE / %ROWTYPE) over the installed catalog; the mock only echoes the text.",
+        find: r#"PLpgSQL_type *
+plpgsql_parse_wordrowtype(char *ident)
+{
+	PLpgSQL_type *typ;
+
+	typ = (PLpgSQL_type *) palloc0(sizeof(PLpgSQL_type));
+	typ->typname = psprintf("%s%%rowtype", ident);
+	typ->ttype = PLPGSQL_TTYPE_SCALAR;
+	return typ;
+}
+"#,
+        replace: r#"static PLpgSQL_type *
+typedpg_pg18_plpgsql_parse_wordrowtype(char *ident)
+{
+	Oid			classOid;
+	Oid			typOid;
+
+	/*
+	 * Look up the relation.  Note that because relation rowtypes have the
+	 * same names as their relations, this could be handled as a type lookup
+	 * equally well; we use the relation lookup code path only because the
+	 * errors thrown here have traditionally referred to relations not types.
+	 * But we'll make a TypeName in case we have to do re-look-up of the type.
+	 */
+	classOid = RelnameGetRelid(ident);
+	if (!OidIsValid(classOid))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_TABLE),
+				 errmsg("relation \"%s\" does not exist", ident)));
+
+	/* Some relkinds lack type OIDs */
+	typOid = get_rel_type_id(classOid);
+	if (!OidIsValid(typOid))
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("relation \"%s\" does not have a composite type",
+						ident)));
+
+	/* Build and return the row type struct */
+	return plpgsql_build_datatype(typOid, -1, InvalidOid,
+								  makeTypeName(ident));
+}
+
+PLpgSQL_type *
+plpgsql_parse_wordrowtype(char *ident)
+{
+	if (typedpg_catalog_active())
+		return typedpg_pg18_plpgsql_parse_wordrowtype(ident);
+	PLpgSQL_type *typ;
+
+	typ = (PLpgSQL_type *) palloc0(sizeof(PLpgSQL_type));
+	typ->typname = psprintf("%s%%rowtype", ident);
+	typ->ttype = PLPGSQL_TTYPE_SCALAR;
+	return typ;
+}
+"#,
+    },
+    Patch {
+        file: "src/postgres/src_pl_plpgsql_src_pl_comp.c",
+        why: "Restore PostgreSQL 18.4's plpgsql_parse_cwordrowtype (variable, table and column lookups for %TYPE / %ROWTYPE) over the installed catalog; the mock only echoes the text.",
+        find: r#"PLpgSQL_type *
+plpgsql_parse_cwordrowtype(List *idents)
+{
+	PLpgSQL_type *typ;
+
+	typ = (PLpgSQL_type *) palloc0(sizeof(PLpgSQL_type));
+	typ->typname = psprintf("%s%%rowtype", NameListToString(idents));
+	typ->ttype = PLPGSQL_TTYPE_SCALAR;
+	return typ;
+}
+"#,
+        replace: r#"static PLpgSQL_type *
+typedpg_pg18_plpgsql_parse_cwordrowtype(List *idents)
+{
+	Oid			classOid;
+	Oid			typOid;
+	RangeVar   *relvar;
+	MemoryContext oldCxt;
+
+	/*
+	 * As above, this is a relation lookup but could be a type lookup if we
+	 * weren't being backwards-compatible about error wording.
+	 */
+
+	/* Avoid memory leaks in long-term function context */
+	oldCxt = MemoryContextSwitchTo(plpgsql_compile_tmp_cxt);
+
+	/* Look up relation name.  Can't lock it - we might not have privileges. */
+	relvar = makeRangeVarFromNameList(idents);
+	classOid = RangeVarGetRelid(relvar, NoLock, false);
+
+	/* Some relkinds lack type OIDs */
+	typOid = get_rel_type_id(classOid);
+	if (!OidIsValid(typOid))
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("relation \"%s\" does not have a composite type",
+						relvar->relname)));
+
+	MemoryContextSwitchTo(oldCxt);
+
+	/* Build and return the row type struct */
+	return plpgsql_build_datatype(typOid, -1, InvalidOid,
+								  makeTypeNameFromNameList(idents));
+}
+
+PLpgSQL_type *
+plpgsql_parse_cwordrowtype(List *idents)
+{
+	if (typedpg_catalog_active())
+		return typedpg_pg18_plpgsql_parse_cwordrowtype(idents);
+	PLpgSQL_type *typ;
+
+	typ = (PLpgSQL_type *) palloc0(sizeof(PLpgSQL_type));
+	typ->typname = psprintf("%s%%rowtype", NameListToString(idents));
+	typ->ttype = PLPGSQL_TTYPE_SCALAR;
+	return typ;
+}
+"#,
+    },
 ];
