@@ -61,8 +61,10 @@ pub fn truncate(interp: &PgCatalog, stmt: &TruncateStmt) -> Result<(), DdlError>
         return Ok(());
     }
     for &target in &targets {
+        // heap_truncate_find_FKs: NOT ENFORCED foreign keys don't count.
         if let Some(fk) = interp.pg_constraint.values().find(|c| {
             c.contype == ConType::ForeignKey
+                && c.conenforced
                 && c.confrelid == Some(target)
                 && !targets.contains(&c.conrelid)
         }) {

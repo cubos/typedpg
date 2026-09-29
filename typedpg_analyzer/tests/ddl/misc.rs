@@ -4614,3 +4614,26 @@ fn unsupported_relation_kinds_are_named_like_pg() {
         ),
     ]);
 }
+
+#[test]
+fn truncate_ignores_not_enforced_foreign_keys() {
+    // heap_truncate_find_FKs skips a NOT ENFORCED foreign key; a NOT VALID
+    // one still counts.
+    let setup = "CREATE TABLE a (x int PRIMARY KEY);
+                 CREATE TABLE b (y int REFERENCES a NOT ENFORCED);
+                 CREATE TABLE a2 (x int PRIMARY KEY);
+                 CREATE TABLE b2 (y int);
+                 ALTER TABLE b2 ADD CONSTRAINT fk FOREIGN KEY (y) REFERENCES a2 NOT VALID;";
+    for stmt in [
+        "TRUNCATE a2;",
+        "ALTER TABLE b ALTER CONSTRAINT b_y_fkey ENFORCED; TRUNCATE a;",
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(
+            err.to_string()
+                .starts_with("cannot truncate a table referenced in a foreign key constraint"),
+            "{stmt}\n  got: {err}"
+        );
+    }
+    build_db(&[("0001.sql", setup), ("0002.sql", "TRUNCATE a;")]);
+}
