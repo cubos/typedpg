@@ -78,6 +78,11 @@ pub(crate) struct TableSource {
     /// The whole row may be absent (NULL): RETURNING's `old` for an INSERT,
     /// `new` for a DELETE. Its columns are then nullable too.
     pub null_row: bool,
+    /// The target relation of an UPDATE / DELETE / INSERT … ON CONFLICT
+    /// (PG's `p_target_nsitem`): when it is [`Self::lateral_blocked`], PG
+    /// hints that the entry can't be referenced from this part of the
+    /// query instead of blaming the join type.
+    pub dml_target: bool,
 }
 
 /// The RTE kind behind a [`TableSource`].
@@ -132,6 +137,7 @@ impl TableSource {
             kind: SourceKind::Other,
             table_only: false,
             null_row: false,
+            dml_target: false,
         }
     }
 
@@ -173,15 +179,24 @@ impl TableSource {
     }
 }
 
-/// PG (42P10): a reference to a RIGHT / FULL join's left side from its
-/// LATERAL right side.
-fn lateral_blocked_error(alias: &str, span: Option<SourceSpan>) -> AnalyzeError {
+/// PG's `check_lateral_ref_ok` (42P10): a reference to a RIGHT / FULL
+/// join's left side from its LATERAL right side, or to an UPDATE / DELETE
+/// target from its FROM / USING list.
+fn lateral_blocked_error(source: &TableSource, span: Option<SourceSpan>) -> AnalyzeError {
+    let alias = &source.alias;
     RawError::new(
         AnalyzeError::InvalidColumnReference(format!(
             "invalid reference to FROM-clause entry for table \"{alias}\""
         )),
         span,
-        Some("The combining JOIN type must be INNER or LEFT for a LATERAL reference.".into()),
+        Some(if source.dml_target {
+            format!(
+                "There is an entry for table \"{alias}\", but it cannot be referenced from this \
+                 part of the query."
+            )
+        } else {
+            "The combining JOIN type must be INNER or LEFT for a LATERAL reference.".into()
+        }),
     )
     .finalize_implicit()
 }
@@ -475,6 +490,7 @@ impl Scope {
             system_columns: system_columns_for(alias),
             source_qn: Some(qn),
             kind: SourceKind::Relation,
+            dml_target: true,
             ..TableSource::derived(alias, cols)
         });
     }
@@ -535,7 +551,7 @@ impl Scope {
                 // PG checks the entry's LATERAL visibility before looking
                 // the column up (`check_lateral_ref_ok`).
                 if source.lateral_blocked {
-                    return Err(lateral_blocked_error(t, span));
+                    return Err(lateral_blocked_error(source, span));
                 }
                 // A name the entry exposes twice (an aliased join over two
                 // `id`s, a subquery `SELECT 1 a, 2 a`) is ambiguous even
@@ -632,7 +648,7 @@ impl Scope {
             }
             if let Some((source, col)) = matches.first() {
                 if source.lateral_blocked {
-                    return Err(lateral_blocked_error(&source.alias, span));
+                    return Err(lateral_blocked_error(source, span));
                 }
                 return Ok(col);
             }

@@ -39,7 +39,9 @@ pub(crate) fn analyze_correlated_select(
         &outer_scope.ctes,
         &[],
         &outer,
-        &[],
+        // Unreferencable entries stay so inside the sublink (errorMissingRTE
+        // searches every enclosing range table).
+        &outer_scope.shadowed_sources,
     )?;
     resolve_unknown_outputs(sel, &mut cols, params);
     Ok((cols, p))

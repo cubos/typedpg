@@ -115,11 +115,15 @@ pub(crate) fn process_from_item(
                 // inside another one still sees the outermost lateral refs,
                 // so pass the enclosing scope's own lateral tier along too.
                 let visible = scope.lateral_visible();
-                let (lateral_sources, shadowed_sources): (Vec<_>, Vec<_>) = if sub.lateral {
+                let (lateral_sources, mut shadowed_sources): (Vec<_>, Vec<_>) = if sub.lateral {
                     (visible, Vec::new())
                 } else {
                     (Vec::new(), visible)
                 };
+                // Entries this level already can't reference stay
+                // unreferencable below it: PG's errorMissingRTE finds them
+                // in any enclosing range table.
+                shadowed_sources.extend(scope.shadowed_sources.iter().cloned());
                 let (mut cols, _) = analyze_select_with_ctes_and_outer(
                     sel,
                     snapshot,
@@ -446,12 +450,25 @@ fn process_join_expr(
     // `ON` are never registered with the collector and `into_sorted`
     // reports a spurious "parameter gap".
     if let Some(quals) = &join.quals {
+        // transformJoinOnClause: the ON clause sees just the join's two
+        // sides (plus outer levels); the FROM items beside the join are in
+        // the range table but not referencable from it.
+        let mut on_scope = scope.clone();
+        let side_sources: Vec<crate::scope::TableSource> =
+            left.to(right).sources(scope).to_vec();
+        on_scope.shadowed_sources.extend(
+            scope.sources[..left.start]
+                .iter()
+                .chain(&scope.sources[right.end..])
+                .cloned(),
+        );
+        on_scope.sources = side_sources;
         // Shares WHERE's machinery: resolution errors first, then
         // the no-aggregates placement rule, then PG's clause wording
         // (`argument of JOIN/ON must be type boolean, not type X`).
         crate::clause::coerce_clause_expr(
             quals,
-            expr::Ctx::new(scope, null_ctx, snapshot),
+            expr::Ctx::new(&on_scope, null_ctx, snapshot),
             params,
             crate::clause::ClauseKind::JoinOn,
         )?;
@@ -768,6 +785,7 @@ fn srf_arg_scope(scope: &Scope) -> Scope {
         .lateral_sources
         .extend(scope.lateral_sources.clone());
     arg_scope.outer_sources.extend(scope.outer_sources.clone());
+    arg_scope.shadowed_sources = scope.shadowed_sources.clone();
     arg_scope.ctes = scope.ctes.clone();
     arg_scope
 }
@@ -1096,6 +1114,9 @@ fn process_tablesample(
         ..Scope::default()
     };
     arg_scope.shadowed_sources = scope.sources.clone();
+    arg_scope
+        .shadowed_sources
+        .extend(scope.shadowed_sources.iter().cloned());
     let null_ctx = NullabilityContext::default();
     let ctx = expr::Ctx::new(&arg_scope, &null_ctx, snapshot);
     let coerce = |arg: &protobuf::Node,

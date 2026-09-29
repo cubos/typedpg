@@ -715,9 +715,12 @@ pub(crate) fn analyze_update_with_outer_ctes(
         &table_attrs,
     );
 
-    // Process FROM clause (UPDATE ... FROM ... WHERE ...).
-    process_from_clause(
+    // Process FROM clause (UPDATE ... FROM ... WHERE ...). transformUpdateStmt
+    // marks the target `p_lateral_only` without `p_lateral_ok` meanwhile:
+    // a LATERAL item there sees it but may not reference it.
+    process_from_clause_beside_target(
         &upd.from_clause,
+        alias,
         &mut scope,
         &mut null_ctx,
         snapshot,
@@ -838,8 +841,9 @@ pub(crate) fn analyze_delete_with_outer_ctes(
 
     // `DELETE … USING t1, t2 …` is UPDATE's FROM: extra joinable sources
     // visible to WHERE and RETURNING.
-    process_from_clause(
+    process_from_clause_beside_target(
         &del.using_clause,
+        alias,
         &mut scope,
         &mut null_ctx,
         snapshot,
@@ -873,4 +877,27 @@ pub(crate) fn analyze_delete_with_outer_ctes(
     rw.returning = has_returning(&del.returning_clause);
     check_rewrite(snapshot, table_oid, &rw)?;
     Ok((columns, None))
+}
+
+/// UPDATE's FROM / DELETE's USING list, processed while the target entry
+/// `target_alias` is LATERAL-only and not LATERAL-ok (transformUpdateStmt /
+/// transformDeleteStmt): a LATERAL subquery or a FROM function referencing
+/// it is `invalid reference to FROM-clause entry` (42P10).
+fn process_from_clause_beside_target(
+    from_clause: &[protobuf::Node],
+    target_alias: &str,
+    scope: &mut Scope,
+    null_ctx: &mut NullabilityContext,
+    snapshot: &PgCatalog,
+    cte_scopes: &HashMap<String, Vec<ScopeColumn>>,
+    params: &mut ParamCollector,
+) -> Result<(), AnalyzeError> {
+    let newly_blocked = scope
+        .lateral_blocked_aliases
+        .insert(target_alias.to_owned());
+    let out = process_from_clause(from_clause, scope, null_ctx, snapshot, cte_scopes, params);
+    if newly_blocked {
+        scope.lateral_blocked_aliases.remove(target_alias);
+    }
+    out
 }

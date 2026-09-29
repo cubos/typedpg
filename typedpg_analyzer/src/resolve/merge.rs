@@ -127,6 +127,11 @@ pub(crate) fn analyze_merge_with_outer_ctes(
         ..Scope::default()
     };
     let mut null_ctx = NullabilityContext::default();
+    // The target is in the range table (setTargetTable) but not yet in the
+    // namespace while the source is transformed: a reference to it from
+    // inside the source is `invalid reference to FROM-clause entry`.
+    source_scope.shadowed_sources = target_scope.sources.clone();
+    let target_entries = source_scope.shadowed_sources.len();
     if let Some(source_relation) = &merge.source_relation {
         process_from_item(
             source_relation,
@@ -142,6 +147,7 @@ pub(crate) fn analyze_merge_with_outer_ctes(
             return Err(crate::pgmsg::merge_name_specified_twice(&target_alias).finalize_implicit());
         }
     }
+    source_scope.shadowed_sources.drain(..target_entries);
 
     // Both relations: the ON condition and WHEN MATCHED arms.
     let mut both = source_scope.clone();

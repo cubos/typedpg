@@ -126,6 +126,59 @@ fn insert_multiple_rows() {
     assert_params(&s, vec![p(text()), p(text()), p(text()), p(text())]);
 }
 
+/// transformUpdateStmt / transformDeleteStmt keep the target LATERAL-only
+/// and not LATERAL-ok while the FROM / USING list is transformed: a
+/// LATERAL item or FROM function reaching it is 42P10, a plain subquery or
+/// a JOIN's ON clause the generic `invalid reference` (42P01). MERGE's
+/// target is not in the namespace at all while the source is transformed.
+#[test]
+fn from_list_cannot_reference_the_dml_target() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE t (id int PRIMARY KEY, v int NOT NULL, w text);
+         CREATE TABLE s (id int PRIMARY KEY, v int NOT NULL, x text);",
+    )
+    .unwrap();
+    for sql in [
+        "UPDATE t SET v = q.v FROM LATERAL (SELECT t.v) q",
+        "UPDATE t SET v = s.v FROM s JOIN LATERAL (SELECT t.v) q ON true",
+        "UPDATE t SET v = 1 FROM LATERAL (SELECT w) q",
+        "UPDATE t SET v = 1 FROM generate_series(1, t.v) g",
+        "DELETE FROM t USING LATERAL (SELECT t.v) q",
+        "DELETE FROM t USING s, LATERAL (SELECT t.v) q",
+        "DELETE FROM t USING generate_series(1, v) g",
+    ] {
+        let err = db.analyze(sql).unwrap_err();
+        assert!(
+            matches!(err, AnalyzeError::InvalidColumnReference(_)),
+            "{sql}: {err:?}"
+        );
+        assert!(
+            err.to_string()
+                .starts_with("invalid reference to FROM-clause entry for table \"t\""),
+            "{sql}: {err}"
+        );
+    }
+    for sql in [
+        "UPDATE t SET v = 1 FROM (SELECT t.v) q",
+        "UPDATE t SET v = 1 FROM s JOIN s s2 ON t.id = s2.id",
+        "MERGE INTO t USING (s JOIN LATERAL (SELECT t.v) q ON true) ON t.id = s.id \
+         WHEN MATCHED THEN DELETE",
+        "MERGE INTO t USING generate_series(1, t.v) g ON true WHEN MATCHED THEN DELETE",
+    ] {
+        let err = db.analyze(sql).unwrap_err();
+        assert!(matches!(err, AnalyzeError::UndefinedTable(_)), "{sql}: {err:?}");
+        assert!(
+            err.to_string()
+                .starts_with("invalid reference to FROM-clause entry for table \"t\""),
+            "{sql}: {err}"
+        );
+    }
+    // WHERE and SET see the target normally.
+    db.analyze("UPDATE t SET v = q.v FROM LATERAL (SELECT s.v FROM s) q WHERE t.id = q.v")
+        .unwrap();
+}
+
 /// transformInsertStmt checks each later VALUES row against the first
 /// row's length before the per-row arity rule, so a short second row is a
 /// VALUES error, not an INSERT arity one.

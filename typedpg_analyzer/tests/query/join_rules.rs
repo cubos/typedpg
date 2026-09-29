@@ -187,6 +187,43 @@ fn lateral_reference_under_right_or_full_join_is_rejected() {
         .unwrap();
 }
 
+/// transformJoinOnClause: an ON clause sees only its join's two sides (and
+/// outer levels), not the FROM items beside the join.
+#[test]
+fn join_on_clause_sees_only_its_own_sides() {
+    let db = setup();
+    for sql in [
+        "SELECT * FROM t, u JOIN nn ON t.id = nn.id",
+        "SELECT * FROM t, u JOIN nn ON nn.q = (SELECT t.a)",
+    ] {
+        let err = db.analyze(sql).unwrap_err();
+        assert!(matches!(err, AnalyzeError::UndefinedTable(_)), "{sql}: {err:?}");
+        assert!(
+            err.to_string()
+                .starts_with("invalid reference to FROM-clause entry for table \"t\""),
+            "{sql}: {err}"
+        );
+    }
+    let err = db
+        .analyze("SELECT * FROM t, u JOIN nn ON a = nn.id")
+        .unwrap_err();
+    assert!(matches!(err, AnalyzeError::UndefinedColumn(_)), "{err:?}");
+    // A FROM item to the right is not in the range table yet.
+    assert_err_starts_with(
+        &db,
+        "SELECT * FROM u JOIN nn ON t.id = nn.id, t",
+        "missing FROM-clause entry for table \"t\"",
+    );
+    // Nested joins, LATERAL outer references and correlated outer levels
+    // are all still visible.
+    db.analyze("SELECT * FROM t JOIN u ON t.id = u.t_id JOIN nn ON t.id = nn.id")
+        .unwrap();
+    db.analyze("SELECT * FROM t, LATERAL (SELECT * FROM u JOIN nn ON u.y = t.a) q")
+        .unwrap();
+    db.analyze("SELECT (SELECT 1 FROM u JOIN nn ON u.y = t.a LIMIT 1) FROM t")
+        .unwrap();
+}
+
 #[test]
 fn join_error_wordings_match_pg() {
     let db = setup();
