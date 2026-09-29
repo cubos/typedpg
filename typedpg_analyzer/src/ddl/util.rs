@@ -43,15 +43,6 @@ pub fn range_var_names(rv: &RangeVar, snapshot: &PgCatalog) -> (String, String) 
     (schema, rv.relname.clone())
 }
 
-/// Schema of the type an unqualified `name` resolves to along the search
-/// path, or the creation namespace when no such type exists.
-pub fn type_lookup_schema(snapshot: &PgCatalog, name: &str) -> String {
-    snapshot
-        .resolve_type_by_name(None, name)
-        .and_then(|t| snapshot.namespace_name(t.typnamespace).map(str::to_owned))
-        .unwrap_or_else(|| fallback_schema(snapshot))
-}
-
 /// Resolve an existing relation named by a `RangeVar` to `(namespace,
 /// relation)`, with PG's errors (`RangeVarGetRelidExtended`): `schema "s"
 /// does not exist` for a missing qualifier, `relation "x" does not exist`

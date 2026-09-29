@@ -1256,15 +1256,15 @@ fn define_base_type(
             Some(n) => n.parse().unwrap_or(-1),
         };
     }
-    if let Some(de) = get("element") {
-        if let Some(node::Node::TypeName(tn)) = de.arg.as_deref().and_then(|a| a.node.as_ref()) {
-            let elem = super::functions::typename_type_id(interp, tn)?;
-            if interp.pg_type.get(&elem).map(|t| t.typtype) == Some(TypType::Pseudo) {
-                return Err(DdlError::Parse(format!(
-                    "array element type cannot be {}",
-                    super::util::format_type_for_message(interp, elem)
-                )));
-            }
+    if let Some(de) = get("element")
+        && let Some(node::Node::TypeName(tn)) = de.arg.as_deref().and_then(|a| a.node.as_ref())
+    {
+        let elem = super::functions::typename_type_id(interp, tn)?;
+        if interp.pg_type.get(&elem).map(|t| t.typtype) == Some(TypType::Pseudo) {
+            return Err(DdlError::Parse(format!(
+                "array element type cannot be {}",
+                super::util::format_type_for_message(interp, elem)
+            )));
         }
     }
     if get("passedbyvalue").is_some() {
