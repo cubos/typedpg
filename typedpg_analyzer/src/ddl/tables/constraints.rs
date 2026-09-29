@@ -264,6 +264,7 @@ pub(crate) fn emit_constraints(
     for (c, local_names, local_types, conkey, default_name) in pending_fks {
         let (target_oid, target_attnums) =
             resolve_fk_target(interp, c, relname, &local_names, &local_types)?;
+        check_fk_persistence(interp, relid, target_oid)?;
         let conname = ConName::from_explicit(&c.conname, default_name).resolve(interp, relid);
         emit_constraint_with_backing_index(
             interp,
@@ -414,6 +415,34 @@ fn exclusion_keys(
         }
     }
     Ok((attnums, names))
+}
+
+/// The relation's persistence: `p` (permanent), `u` (unlogged) or `t` (temporary).
+pub(crate) fn persistence(interp: &PgCatalog, relid: PgClassOid) -> char {
+    interp.relpersistence.get(&relid).copied().unwrap_or('p')
+}
+
+/// ATAddForeignKeyConstraint: a permanent table references only
+/// permanent tables, an unlogged one permanent or unlogged ones, a
+/// temporary one only temporary ones.
+fn check_fk_persistence(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+    target: PgClassOid,
+) -> Result<(), DdlError> {
+    let msg = match (persistence(interp, relid), persistence(interp, target)) {
+        ('p', t) if t != 'p' => {
+            "constraints on permanent tables may reference only permanent tables"
+        }
+        ('u', 't') => {
+            "constraints on unlogged tables may reference only permanent or unlogged tables"
+        }
+        ('t', t) if t != 't' => {
+            "constraints on temporary tables may reference only temporary tables"
+        }
+        _ => return Ok(()),
+    };
+    Err(DdlError::UnsupportedDdl(msg.into()))
 }
 
 /// Resolve a `FOREIGN KEY` target: returns `(target_class_oid, target_attnums)`.
@@ -1196,6 +1225,7 @@ fn add_constraint_node(
             .unwrap_or_default();
         let (target_oid, target_attnums) =
             resolve_fk_target(interp, c, &relname_owned, &column_names, &local_types)?;
+        check_fk_persistence(interp, relid, target_oid)?;
         let conname = ConName::from_explicit(
             &c.conname,
             ConName::Constraint {

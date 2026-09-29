@@ -169,6 +169,11 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
         return Ok(());
     }
     // transformCreateStmt.
+    if stmt.partspec.is_some() && rv.relpersistence == "u" {
+        return Err(DdlError::UnsupportedDdl(
+            "partitioned tables cannot be unlogged".into(),
+        ));
+    }
     if stmt.partspec.is_some() && !stmt.inh_relations.is_empty() && stmt.partbound.is_none() {
         return Err(DdlError::Parse(
             "cannot create partitioned table as inheritance child".into(),
@@ -284,6 +289,9 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
     if let Some(tn) = stmt.of_typename.as_ref() {
         let of_type = lookup_type_name(tn, interp)?;
         typed::set_of_type(interp, class_oid, of_type);
+    }
+    if let Some(p @ ('u' | 't')) = rv.relpersistence.chars().next() {
+        interp.relpersistence.insert(class_oid, p);
     }
     for (i, col) in columns.iter().enumerate() {
         interp.insert_pg_attribute(PgAttribute {
@@ -714,6 +722,9 @@ fn apply_alter_subtype(
             column_options::alter_column_setting(interp, relid, cmd, subtype)
         }
         AlterTableType::AtClusterOn => object_refs::cluster_on(interp, relid, cmd),
+        AlterTableType::AtSetLogged | AlterTableType::AtSetUnLogged => {
+            set_persistence(interp, relid, subtype == AlterTableType::AtSetLogged)
+        }
         AlterTableType::AtSetAccessMethod if !cmd.name.is_empty() => {
             crate::ddl::opclass::check_table_am(interp, &cmd.name)
         }
@@ -748,6 +759,51 @@ fn apply_alter_subtype(
         // Other subtypes are no-ops for schema analysis.
         _ => Ok(()),
     }
+}
+
+/// `ALTER TABLE ... SET LOGGED / UNLOGGED` (ATPrepChangePersistence): a
+/// logged table may not reference an unlogged one, and a table referenced
+/// by a logged one can't become unlogged.
+fn set_persistence(
+    interp: &mut PgCatalog,
+    relid: PgClassOid,
+    to_logged: bool,
+) -> Result<(), DdlError> {
+    let relname = relname_of(interp, relid);
+    for con in interp.pg_constraint.values() {
+        if con.contype != ConType::ForeignKey {
+            continue;
+        }
+        let other = if to_logged {
+            (con.conrelid == relid).then_some(con.confrelid).flatten()
+        } else {
+            (con.confrelid == Some(relid)).then_some(con.conrelid)
+        };
+        let Some(other) = other.filter(|o| *o != relid) else {
+            continue;
+        };
+        let other_permanent = constraints::persistence(interp, other) == 'p';
+        if to_logged && !other_permanent {
+            return Err(DdlError::UnsupportedDdl(format!(
+                "could not change table \"{relname}\" to logged because it references unlogged \
+                 table \"{}\"",
+                relname_of(interp, other)
+            )));
+        }
+        if !to_logged && other_permanent {
+            return Err(DdlError::UnsupportedDdl(format!(
+                "could not change table \"{relname}\" to unlogged because it references logged \
+                 table \"{}\"",
+                relname_of(interp, other)
+            )));
+        }
+    }
+    if to_logged {
+        interp.relpersistence.remove(&relid);
+    } else {
+        interp.relpersistence.insert(relid, 'u');
+    }
+    Ok(())
 }
 
 /// `ALTER ... SET / RESET (storage parameters)` (ATExecSetRelOptions): the

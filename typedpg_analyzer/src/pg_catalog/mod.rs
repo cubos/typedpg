@@ -264,6 +264,9 @@ pub struct PgCatalog {
     pub(crate) installing_extension: Option<String>,
     /// Logical-replication publications.
     pub(crate) publications: Vec<crate::ddl::publications::Publication>,
+    /// `relpersistence` of unlogged (`u`) and temporary (`t`) relations;
+    /// absent means permanent.
+    pub(crate) relpersistence: HashMap<PgClassOid, char>,
     /// Event triggers and the function each executes.
     pub(crate) event_triggers: Vec<(String, crate::oid::PgProcOid)>,
     /// Enum labels added in the current transaction to a type created
@@ -543,6 +546,7 @@ impl PgCatalog {
             installing_extension: None,
             publications: Vec::new(),
             event_triggers: Vec::new(),
+            relpersistence: HashMap::new(),
             uncommitted_enum_labels: Default::default(),
             enums_created_in_transaction: Default::default(),
             partition_specs: HashMap::new(),
@@ -1170,6 +1174,7 @@ impl PgCatalog {
         self.index_parents.remove(&oid);
         self.sequence_params.remove(&oid);
         self.foreign_data.table_servers.remove(&oid);
+        self.relpersistence.remove(&oid);
         for p in &mut self.publications {
             p.forget_relation(oid);
         }

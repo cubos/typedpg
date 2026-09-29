@@ -33,6 +33,12 @@ pub fn create_view(interp: &mut PgCatalog, stmt: &ViewStmt) -> Result<(), DdlErr
         .as_ref()
         .ok_or_else(|| DdlError::Parse("CREATE VIEW without name".into()))?;
 
+    // DefineView.
+    if rv.relpersistence == "u" {
+        return Err(DdlError::Parse(
+            "views cannot be unlogged because they do not have storage".into(),
+        ));
+    }
     let (nsoid, name) = ensure_range_var(interp, rv)?;
     let qn_label = crate::qualified_name::QualifiedName::new(
         interp.namespace_name(nsoid).unwrap_or("?"),
@@ -201,7 +207,12 @@ fn create_relation_as(
         }
     }
 
-    install_relation(interp, nsoid, name, kind, resolved)?;
+    install_relation(interp, nsoid, name.clone(), kind, resolved)?;
+    if let Some(p @ ('u' | 't')) = rv.relpersistence.chars().next()
+        && let Some(&oid) = interp.class_by_qname.get(&(nsoid, name))
+    {
+        interp.relpersistence.insert(oid, p);
+    }
     Ok(())
 }
 

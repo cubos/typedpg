@@ -3415,3 +3415,58 @@ fn event_triggers_are_validated_and_tracked() {
         ),
     ]);
 }
+
+#[test]
+fn unlogged_tables_follow_persistence_rules() {
+    // PG 18 ATAddForeignKeyConstraint / ATPrepChangePersistence /
+    // transformCreateStmt / DefineView.
+    let setup = "CREATE TABLE p (id int PRIMARY KEY);
+                 CREATE UNLOGGED TABLE u (id int PRIMARY KEY);
+                 CREATE UNLOGGED TABLE f3 (x int REFERENCES u);
+                 CREATE TABLE f4 (x int REFERENCES p);";
+    for (stmt, msg) in [
+        (
+            "CREATE TABLE f1 (x int REFERENCES u);",
+            "constraints on permanent tables may reference only permanent tables",
+        ),
+        (
+            "CREATE TABLE f1 (x int); ALTER TABLE f1 ADD FOREIGN KEY (x) REFERENCES u;",
+            "constraints on permanent tables may reference only permanent tables",
+        ),
+        (
+            "ALTER TABLE f3 SET LOGGED;",
+            "could not change table \"f3\" to logged because it references unlogged table \"u\"",
+        ),
+        (
+            "ALTER TABLE p SET UNLOGGED;",
+            "could not change table \"p\" to unlogged because it references logged table \"f4\"",
+        ),
+        (
+            "CREATE UNLOGGED TABLE pu (a int) PARTITION BY LIST (a);",
+            "partitioned tables cannot be unlogged",
+        ),
+        (
+            "CREATE UNLOGGED VIEW v AS SELECT 1;",
+            "views cannot be unlogged because they do not have storage",
+        ),
+        (
+            "CREATE UNLOGGED TABLE c AS SELECT 1 AS id; CREATE TABLE f5 (x int REFERENCES u);",
+            "constraints on permanent tables may reference only permanent tables",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "CREATE UNLOGGED TABLE f2 (x int REFERENCES p);
+             ALTER TABLE u SET LOGGED;
+             ALTER TABLE f3 SET LOGGED;
+             CREATE UNLOGGED SEQUENCE s;
+             ALTER TABLE f4 SET UNLOGGED;
+             ALTER TABLE p SET UNLOGGED;",
+        ),
+    ]);
+}
