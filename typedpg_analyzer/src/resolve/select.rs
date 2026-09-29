@@ -161,7 +161,7 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
         .collect();
     if sel.op != SetOperation::SetopNone as i32 {
         grouping::register_level(sel, &[], &[]);
-        return analyze_set_operation(sel, snapshot, params, &cte_scopes, &outer);
+        return analyze_set_operation(sel, snapshot, params, &cte_scopes, &outer, shadowed_sources);
     }
 
     // Handle `VALUES (…), (…), …` — a `SelectStmt` without a FROM/target

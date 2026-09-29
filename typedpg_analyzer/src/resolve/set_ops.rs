@@ -10,6 +10,7 @@ pub(crate) fn analyze_set_operation(
     params: &mut ParamCollector,
     cte_scopes: &HashMap<String, Vec<ScopeColumn>>,
     outer: &[crate::scope::TableSource],
+    shadowed: &[crate::scope::TableSource],
 ) -> AnalyzeResult {
     let left = sel
         .larg
@@ -21,13 +22,29 @@ pub(crate) fn analyze_set_operation(
         .ok_or_else(|| AnalyzeError::Unsupported("UNION without right side".into()))?;
 
     // The arms are subqueries of the set operation: outer references reach
-    // them as correlated ones.
+    // them as correlated ones, and the FROM entries a non-LATERAL subquery
+    // can't see stay unreachable (PG's `invalid reference to FROM-clause
+    // entry`).
     check_set_op_member_locking(left)?;
-    let (left_cols, _) =
-        analyze_select_with_ctes_and_outer(left, snapshot, params, cte_scopes, &[], outer, &[])?;
+    let (left_cols, _) = analyze_select_with_ctes_and_outer(
+        left,
+        snapshot,
+        params,
+        cte_scopes,
+        &[],
+        outer,
+        shadowed,
+    )?;
     check_set_op_member_locking(right)?;
-    let (right_cols, _) =
-        analyze_select_with_ctes_and_outer(right, snapshot, params, cte_scopes, &[], outer, &[])?;
+    let (right_cols, _) = analyze_select_with_ctes_and_outer(
+        right,
+        snapshot,
+        params,
+        cte_scopes,
+        &[],
+        outer,
+        shadowed,
+    )?;
 
     // PG names the operation in both error messages below.
     let op_label = match protobuf::SetOperation::try_from(sel.op) {

@@ -690,4 +690,20 @@ fn sublink_reaches_every_enclosing_level() {
         &s,
         vec![cn("id", int4()), cn("sum", int8()), c("column1", int4())],
     );
+    let s = db
+        .analyze("SELECT * FROM t, LATERAL (SELECT t.v UNION SELECT 1) q")
+        .unwrap();
+    assert_eq!(s.columns.len(), 3);
+    // A non-LATERAL subquery can't see its sibling FROM entries — nor can
+    // its set operation arms or VALUES rows.
+    for sql in [
+        "SELECT * FROM t, (SELECT t.v UNION SELECT 1) q",
+        "SELECT * FROM t, (VALUES (t.v)) q",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::UndefinedTable(_),
+            "invalid reference to FROM-clause entry for table \"t\""
+        );
+    }
 }
