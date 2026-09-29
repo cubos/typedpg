@@ -342,6 +342,7 @@ pub(crate) fn emit_constraints(
                 row.convalidated = enforced;
             }
             interp.check_defs.insert(oid, def);
+            crate::ddl::depend::record_check_constraint(interp, oid);
         }
     }
     if n_all == n_checks {

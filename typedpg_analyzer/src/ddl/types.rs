@@ -188,6 +188,7 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
 
     register_array_type(interp, nsoid, &name, oid)?;
     interp.domain_constraints.insert(oid, constraints);
+    record_domain_constraint_dependencies(interp, oid)?;
     Ok(())
 }
 
@@ -196,6 +197,9 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
 pub(crate) struct DomainConstraint {
     pub(crate) name: String,
     pub(crate) kind: DomainConstraintKind,
+    /// What a CHECK's expression refers to, until the constraint's
+    /// dependencies are recorded.
+    pub(crate) refs: Vec<super::depend::Reference>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -216,11 +220,12 @@ fn add_domain_constraint(
     c: &typedpg_pg_query::protobuf::Constraint,
     existing: &mut Vec<DomainConstraint>,
 ) -> Result<(), DdlError> {
+    let mut refs = Vec::new();
     let kind = match ConstrType::try_from(c.contype) {
         Ok(ConstrType::ConstrNotnull) => DomainConstraintKind::NotNull,
         Ok(ConstrType::ConstrCheck) => {
             if let Some(expr) = c.raw_expr.as_deref() {
-                check_domain_check_expression(interp, base_type, expr)?;
+                refs = check_domain_check_expression(interp, base_type, expr)?;
             }
             DomainConstraintKind::Check
         }
@@ -261,7 +266,31 @@ fn add_domain_constraint(
         }
         c.conname.clone()
     };
-    existing.push(DomainConstraint { name, kind });
+    existing.push(DomainConstraint { name, kind, refs });
+    Ok(())
+}
+
+/// domainAddCheckConstraint: a domain's new CHECK constraints depend on
+/// what their expressions refer to.
+fn record_domain_constraint_dependencies(
+    interp: &mut PgCatalog,
+    typid: PgTypeOid,
+) -> Result<(), DdlError> {
+    let pending: Vec<(String, Vec<super::depend::Reference>)> = interp
+        .domain_constraints
+        .get_mut(&typid)
+        .into_iter()
+        .flatten()
+        .filter(|c| !c.refs.is_empty())
+        .map(|c| (c.name.clone(), std::mem::take(&mut c.refs)))
+        .collect();
+    for (name, refs) in pending {
+        super::depend::record_named(
+            interp,
+            super::depend::NamedObject::DomainConstraint { typid, name },
+            &refs,
+        )?;
+    }
     Ok(())
 }
 
@@ -271,7 +300,7 @@ fn check_domain_check_expression(
     interp: &PgCatalog,
     base_type: PgTypeOid,
     expr: &typedpg_pg_query::protobuf::Node,
-) -> Result<(), DdlError> {
+) -> Result<Vec<super::depend::Reference>, DdlError> {
     use crate::expr::{TypeGoal, infer_expr};
     use crate::nullability::NullabilityContext;
     use crate::param_collector::ParamCollector;
@@ -314,20 +343,23 @@ fn check_domain_check_expression(
     {
         return Err(DdlError::Parse(format!("there is no parameter ${number}")));
     }
-    let result = infer_expr(
-        expr,
-        crate::expr::Ctx::new(&scope, &null_ctx, interp),
-        &mut params,
-        TypeGoal::NONE,
-    )
-    .map_err(|e| DdlError::UnsupportedDdl(format!("{e} (in domain CHECK constraint)")))?;
+    let (result, refs) = super::depend::collect(|| {
+        infer_expr(
+            expr,
+            crate::expr::Ctx::new(&scope, &null_ctx, interp),
+            &mut params,
+            TypeGoal::NONE,
+        )
+    });
+    let result = result
+        .map_err(|e| DdlError::UnsupportedDdl(format!("{e} (in domain CHECK constraint)")))?;
     if result.type_oid != oid::BOOL && result.type_oid != oid::UNKNOWN {
         return Err(DdlError::UnsupportedDdl(format!(
             "argument of CHECK must be type boolean, not type {}",
             super::util::format_type_for_message(interp, result.type_oid)
         )));
     }
-    Ok(())
+    Ok(refs)
 }
 
 // ─── ALTER DOMAIN ───────────────────────────────────────────────────────────
@@ -425,6 +457,7 @@ pub fn alter_domain(
         t.typnotnull = typnotnull;
     }
     interp.domain_constraints.insert(type_oid, constraints);
+    record_domain_constraint_dependencies(interp, type_oid)?;
     if changed {
         // Views over columns of the domain see the change too.
         let relations: Vec<PgClassOid> = interp

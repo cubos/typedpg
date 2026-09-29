@@ -286,6 +286,7 @@ pub(super) fn resolve_composite_field(
             };
             AnalyzeError::UndefinedColumn(msg)
         })?;
+    crate::ddl::depend::note_column(relid, field_name);
 
     Ok(ExprType::scalar_with_typmod(
         field.atttypid,

@@ -235,6 +235,16 @@ pub(crate) fn record_default_dependencies(
     for seq in sequences {
         record_default_sequence(interp, relid, attnum, seq);
     }
+    // Functions, operators, types, ... the expression refers to.
+    if let Some(expr) = expr {
+        let refs = super::depend::expression_references(interp, expr, Some(relid));
+        super::depend::record_references(
+            interp,
+            super::depend::ObjectAddress::column(relid, attnum),
+            &refs,
+            crate::pg_catalog::DepType::Normal,
+        );
+    }
 }
 
 /// The default of `relid.attnum` depends on sequence `seq` (serial's
@@ -270,7 +280,6 @@ pub(crate) fn forget_default_dependencies(
         !(d.classid == PG_CLASS_RELID
             && d.objid == rel_obj
             && d.objsubid == attnum
-            && d.refclassid == PG_CLASS_RELID
             && d.deptype == DepType::Normal)
     });
 }

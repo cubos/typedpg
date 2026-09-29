@@ -138,6 +138,7 @@ impl CookedGeneration {
             .insert((relid, attnum), self.expr_type);
         interp.attr_default_exprs.insert((relid, attnum), self.text);
         interp.generated_refs.insert((relid, attnum), self.refs);
+        crate::ddl::depend::record_column_expression(interp, relid, attnum);
     }
 }
 

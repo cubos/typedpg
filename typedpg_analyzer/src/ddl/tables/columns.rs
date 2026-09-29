@@ -993,15 +993,15 @@ pub(crate) fn drop_column(
                 Some(QualifiedName::new(nsname, &c.relname).to_string())
             })
             .collect();
-        let relname = interp
-            .pg_class
-            .get(&relid)
-            .map(|c| c.relname.clone())
-            .unwrap_or_default();
+        // getObjectDescription: "column b of composite type comp" for an
+        // attribute of a composite type.
+        let column = crate::ddl::depend::describe(
+            interp,
+            crate::ddl::depend::ObjectAddress::column(relid, target.attnum),
+        );
         return Err(DdlError::DependencyError(format!(
-            "cannot drop column {} of table {relname} because other objects depend on it \
+            "cannot drop {column} because other objects depend on it \
              (view(s) {} depend on this column)",
-            cmd.name,
             view_names.join(", "),
         )));
     }
@@ -1064,6 +1064,7 @@ pub(crate) fn drop_column(
         drop_column(interp, relid, &drop_dependent, rec)?;
     }
     interp.generated_refs.remove(&(relid, target.attnum));
+    crate::ddl::depend::drop_column_dependents(interp, relid, target.attnum, cascade)?;
 
     // Resolve the column's attnum *before* we touch anything — both the
     // FK protection and the children-cascade need it.

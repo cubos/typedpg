@@ -533,7 +533,7 @@ fn config_uses_default_parser(interp: &PgCatalog, at: usize) -> bool {
 /// (MakeConfigurationMapping / DropConfigurationMapping): the token types
 /// must be the parser's (getTokenTypes), the dictionaries must exist.
 pub fn alter_configuration(
-    interp: &PgCatalog,
+    interp: &mut PgCatalog,
     stmt: &AlterTsConfigurationStmt,
 ) -> Result<(), DdlError> {
     let at = position(interp, "c", &names_of(&stmt.cfgname))?;
@@ -551,7 +551,8 @@ pub fn alter_configuration(
             find(interp, "d", &names_of(&l.items))?;
         }
     }
-    Ok(())
+    // The configuration depends on the dictionaries it maps to.
+    crate::ddl::depend::record_ts_mapping(interp, &names_of(&stmt.cfgname), &stmt.dicts)
 }
 
 /// ALTER TEXT SEARCH DICTIONARY name (...) (AlterTSDictionary): the options
@@ -596,6 +597,7 @@ pub(crate) fn drop(
     objtype: ObjectType,
     obj_node: &typedpg_pg_query::protobuf::Node,
     missing_ok: bool,
+    cascade: bool,
 ) -> Result<(), DdlError> {
     let kind = match objtype {
         ObjectType::ObjectTsconfiguration => "c",
@@ -620,6 +622,7 @@ pub(crate) fn drop(
             .iter()
             .any(|o| o.kind == kind && o.name == name && o.namespace == *ns)
     }) {
+        crate::ddl::depend::drop_ts_object(interp, kind, &name, ns, cascade)?;
         interp
             .pg_ts_objects
             .retain(|o| !(o.kind == kind && o.name == name && o.namespace == ns));

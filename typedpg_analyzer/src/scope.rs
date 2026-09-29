@@ -67,6 +67,9 @@ pub(crate) struct TableSource {
     /// side: PG keeps it in the namespace but rejects any reference to it
     /// (`check_lateral_ref_ok`, 42P10).
     pub lateral_blocked: bool,
+    /// The relation behind a FROM item that names one (dependencies on its
+    /// columns are noted as they are resolved).
+    pub relid: Option<crate::oid::PgClassOid>,
     /// What kind of range-table entry PG would build for this FROM item —
     /// drives the locking-clause rules (`transformLockingClause`).
     pub kind: SourceKind,
@@ -165,6 +168,7 @@ impl TableSource {
             columns,
             system_columns: Vec::new(),
             source_qn: None,
+            relid: None,
             join_hidden: Default::default(),
             lateral_blocked: false,
             kind: SourceKind::Other,
@@ -173,6 +177,20 @@ impl TableSource {
             dml_target: false,
             whole_row: WholeRow::Record,
             lock_error: None,
+        }
+    }
+
+    /// A reference resolved to column `name` of this FROM item.
+    pub(crate) fn note_column(&self, name: &str) {
+        if let Some(relid) = self.relid {
+            crate::ddl::depend::note_column(relid, name);
+        }
+    }
+
+    /// A `*` over this FROM item refers to each of its columns.
+    pub(crate) fn note_star_columns(&self) {
+        for c in &self.columns {
+            self.note_column(&c.name);
         }
     }
 
@@ -448,6 +466,7 @@ impl Scope {
             .ok_or_else(|| undefined_table_error(snapshot, schema, name, span))?;
         check_relation_opens(table)?;
         let table_oid = table.oid;
+        crate::ddl::depend::note(crate::ddl::depend::ObjectAddress::relation(table_oid));
         let nspname = snapshot
             .namespace_name(table.relnamespace)
             .map(str::to_owned)
@@ -486,6 +505,7 @@ impl Scope {
                 system_columns_for(alias)
             },
             source_qn: Some(QualifiedName::new(nspname, relname)),
+            relid: Some(table_oid),
             kind: SourceKind::Relation,
             ..TableSource::derived(alias, columns)
         });
@@ -529,9 +549,14 @@ impl Scope {
                 record_fields: None,
             })
             .collect();
+        let relid = columns.first().map(|c| c.attrelid);
+        if let Some(relid) = relid {
+            crate::ddl::depend::note(crate::ddl::depend::ObjectAddress::relation(relid));
+        }
         self.sources.push(TableSource {
             system_columns: system_columns_for(alias),
             source_qn: Some(qn),
+            relid,
             kind: SourceKind::Relation,
             dml_target: true,
             ..TableSource::derived(alias, cols)
@@ -618,6 +643,7 @@ impl Scope {
                         let qn = QualifiedName::new(t, column).to_string();
                         return Err(ambiguous_column_error(column, &[qn.clone(), qn], span));
                     }
+                    source.note_column(column);
                     return Ok(col);
                 }
             }
@@ -702,6 +728,7 @@ impl Scope {
                 if source.lateral_blocked {
                     return Err(lateral_blocked_error(source, span));
                 }
+                source.note_column(column);
                 return Ok(col);
             }
         }
@@ -725,7 +752,10 @@ impl Scope {
     pub fn star_columns(&self) -> Vec<&ScopeColumn> {
         self.sources
             .iter()
-            .flat_map(|s| s.visible_columns())
+            .flat_map(|s| {
+                s.note_star_columns();
+                s.visible_columns()
+            })
             .collect()
     }
 }

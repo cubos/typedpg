@@ -10,7 +10,7 @@
 //! 2. Add an `ExtensionDef` entry to the `REGISTRY` array below
 //! 3. Run `./update_extensions.sh` to fetch from PG upstream
 
-use typedpg_pg_query::protobuf::{AlterExtensionStmt, CreateExtensionStmt};
+use typedpg_pg_query::protobuf::{AlterExtensionStmt, CreateExtensionStmt, node};
 
 use super::DdlError;
 use super::util::ensure_namespace;
@@ -62,6 +62,20 @@ pub fn create_extension(
         )));
     }
 
+    // plpgsql comes with the server: re-creating it after a DROP EXTENSION
+    // brings the language back.
+    if name == "plpgsql" && !REGISTRY.iter().any(|e| e.name == "plpgsql") {
+        let nsoid = super::util::existing_namespace(interp, "pg_catalog")?;
+        let ext_oid = PgExtensionOid::from_nonzero(interp.alloc_oid()?);
+        interp.insert_pg_extension(PgExtension {
+            oid: ext_oid,
+            extname: name.clone(),
+            extnamespace: nsoid,
+            extversion: "1.0".to_owned(),
+        });
+        interp.dropped_languages.retain(|l| l != "plpgsql");
+        return Ok(());
+    }
     let ext = REGISTRY
         .iter()
         .find(|e| e.name == name.as_str())
@@ -132,6 +146,7 @@ pub fn create_extension(
         interp.pg_proc.keys().copied().collect();
     let casts_before: std::collections::HashSet<PgCastOid> =
         interp.pg_cast.keys().copied().collect();
+    let others_before = OtherMembers::snapshot(interp);
 
     let installing = interp.installing_extension.replace(name.clone());
     let applied = apply_with_schema(interp, &target_schema, &path);
@@ -139,6 +154,7 @@ pub fn create_extension(
     applied?;
 
     record_extension_membership(interp, ext_oid, &types_before, &procs_before, &casts_before);
+    others_before.record(interp, ext_oid);
 
     Ok(())
 }
@@ -184,6 +200,7 @@ pub fn alter_extension(interp: &mut PgCatalog, stmt: &AlterExtensionStmt) -> Res
         interp.pg_proc.keys().copied().collect();
     let casts_before: std::collections::HashSet<PgCastOid> =
         interp.pg_cast.keys().copied().collect();
+    let others_before = OtherMembers::snapshot(interp);
 
     let installing = interp.installing_extension.replace(name.clone());
     let applied = apply_with_schema(interp, &installed_nsname, &path);
@@ -191,6 +208,7 @@ pub fn alter_extension(interp: &mut PgCatalog, stmt: &AlterExtensionStmt) -> Res
     applied?;
 
     record_extension_membership(interp, ext_oid, &types_before, &procs_before, &casts_before);
+    others_before.record(interp, ext_oid);
 
     if let Some(entry) = interp.pg_extension.get_mut(&ext_oid) {
         entry.extversion = target_version;
@@ -249,6 +267,74 @@ fn record_extension_membership(
     for cast_oid in new_casts {
         let g = PgGenericOid::from_nonzero(cast_oid.into_nonzero());
         interp.add_dependency(ext_dep(PG_CAST_RELID, g));
+    }
+}
+
+/// What an extension's scripts may create besides types, functions and
+/// casts, as it was before they ran: its operators, relations, operator
+/// classes and text search objects become members too
+/// (recordDependencyOnCurrentExtension).
+struct OtherMembers {
+    operators: std::collections::HashSet<crate::oid::PgOperatorOid>,
+    relations: std::collections::HashSet<PgClassOid>,
+    opclasses: usize,
+    ts_objects: usize,
+}
+
+impl OtherMembers {
+    fn snapshot(interp: &PgCatalog) -> Self {
+        Self {
+            operators: interp.pg_operator.keys().copied().collect(),
+            relations: interp.pg_class.keys().copied().collect(),
+            opclasses: interp.pg_opclass.len(),
+            ts_objects: interp.pg_ts_objects.len(),
+        }
+    }
+
+    fn record(self, interp: &mut PgCatalog, ext_oid: PgExtensionOid) {
+        use crate::ddl::depend::ObjectAddress;
+        let mut members: Vec<ObjectAddress> = interp
+            .pg_operator
+            .keys()
+            .filter(|k| !self.operators.contains(k))
+            .map(|&o| ObjectAddress::operator(o))
+            .collect();
+        // A relation's indexes and row type are its own, not members.
+        members.extend(
+            interp
+                .pg_class
+                .iter()
+                .filter(|(k, c)| {
+                    !self.relations.contains(k)
+                        && !matches!(
+                            c.relkind,
+                            crate::pg_catalog::RelKind::Index
+                                | crate::pg_catalog::RelKind::PartitionedIndex
+                        )
+                })
+                .map(|(&k, _)| ObjectAddress::relation(k)),
+        );
+        members.extend(crate::ddl::depend::extension_named_members(
+            interp,
+            self.opclasses,
+            self.ts_objects,
+        ));
+        let ext = ObjectAddress {
+            classid: PG_EXTENSION_RELID,
+            objid: PgGenericOid::from_nonzero(ext_oid.into_nonzero()),
+            objsubid: 0,
+        };
+        for member in members {
+            interp.add_dependency(PgDepend {
+                classid: member.classid,
+                objid: member.objid,
+                objsubid: 0,
+                refclassid: ext.classid,
+                refobjid: ext.objid,
+                refobjsubid: 0,
+                deptype: DepType::Extension,
+            });
+        }
     }
 }
 
@@ -625,6 +711,102 @@ pub(crate) fn set_extension_schema(
     }
     if let Some(row) = interp.pg_extension.get_mut(&ext) {
         row.extnamespace = new_nsoid;
+    }
+    Ok(())
+}
+
+/// The operator classes that take options (an `options` support function,
+/// `amoptsprocnum`) and their one integer option: `(method, opclass,
+/// option, min, max, multiple-of)`. From PostgreSQL 18.6's
+/// `add_local_int_reloption` calls: tsgistidx.c, brin_minmax_multi.c and
+/// the pg_trgm / hstore / intarray / ltree GiST support
+/// (`GISTMaxIndexKeySize` is 2024).
+const OPCLASS_OPTIONS: &[(&str, &str, &str, i64, i64, i64)] = &[
+    ("gist", "tsvector_ops", "siglen", 1, 2024, 1),
+    ("gist", "gist_trgm_ops", "siglen", 1, 2024, 1),
+    ("gist", "gist_hstore_ops", "siglen", 1, 2024, 1),
+    ("gist", "gist__int_ops", "numranges", 1, 252, 1),
+    ("gist", "gist__intbig_ops", "siglen", 1, 2024, 1),
+    ("gist", "gist_ltree_ops", "siglen", 4, 2024, 4),
+    ("gist", "gist__ltree_ops", "siglen", 1, 2024, 1),
+];
+
+/// `index_opclass_options` (indexam.c): options written after an index
+/// column's operator class must be the class's own, in range.
+pub(crate) fn check_opclass_options(
+    interp: &PgCatalog,
+    opclass: &[typedpg_pg_query::protobuf::Node],
+    options: &[typedpg_pg_query::protobuf::Node],
+    am: &str,
+) -> Result<(), DdlError> {
+    if options.is_empty() {
+        return Ok(());
+    }
+    let parts: Vec<&str> = opclass
+        .iter()
+        .filter_map(super::util::node_string)
+        .collect();
+    let (schema, name) = match parts.as_slice() {
+        [s, n] => (Some(*s), *n),
+        [n] => (None, *n),
+        _ => return Ok(()),
+    };
+    let Some(found) = super::opclass::find_opclass(interp, schema, name, am) else {
+        return Ok(());
+    };
+    let spec = OPCLASS_OPTIONS
+        .iter()
+        .find(|(m, c, ..)| *m == am && *c == found.opcname)
+        .copied()
+        .or_else(|| {
+            (am == "brin" && found.opcname.ends_with("_minmax_multi_ops")).then_some((
+                "brin",
+                "",
+                "values_per_range",
+                8,
+                256,
+                1,
+            ))
+        });
+    let Some((_, _, option, min, max, multiple)) = spec else {
+        return Err(DdlError::UnsupportedDdl(format!(
+            "operator class {} has no options",
+            found.opcname
+        )));
+    };
+    for opt in options {
+        let Some(node::Node::DefElem(de)) = opt.node.as_ref() else {
+            continue;
+        };
+        if de.defname != option {
+            return Err(DdlError::UnsupportedDdl(format!(
+                "unrecognized parameter \"{}\"",
+                de.defname
+            )));
+        }
+        let text = match de.arg.as_deref().and_then(|a| a.node.as_ref()) {
+            Some(node::Node::Integer(i)) => i.ival.to_string(),
+            Some(node::Node::String(s)) => s.sval.clone(),
+            Some(node::Node::Float(f)) => f.fval.clone(),
+            Some(node::Node::TypeName(tn)) => super::util::type_name_to_string(tn),
+            _ => String::new(),
+        };
+        let Ok(value) = text.trim().parse::<i64>() else {
+            return Err(DdlError::UnsupportedDdl(format!(
+                "invalid value for integer option \"{option}\": {text}"
+            )));
+        };
+        if value < min || value > max {
+            return Err(DdlError::UnsupportedDdl(format!(
+                "value {value} out of bounds for option \"{option}\" (Valid values are between \
+                 \"{min}\" and \"{max}\".)"
+            )));
+        }
+        if value % multiple != 0 {
+            return Err(DdlError::UnsupportedDdl(format!(
+                "siglen value must be a multiple of {multiple}"
+            )));
+        }
     }
     Ok(())
 }

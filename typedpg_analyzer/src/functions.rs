@@ -353,6 +353,7 @@ pub(crate) fn func_get_detail(
             ..field
         })
         .collect();
+    crate::ddl::depend::note(crate::ddl::depend::ObjectAddress::proc(f.oid));
     Ok(FuncDetail::Routine(ResolvedFunction {
         oid: f.oid,
         aggregate: snapshot

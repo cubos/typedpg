@@ -233,6 +233,32 @@ fn resolve_insert_target(
         }
     }
     check_insert_target_duplicates(&ins.cols)?;
+    // The columns the INSERT writes (the leading ones, without a column
+    // list) — what a stored query depends on.
+    crate::ddl::depend::note(crate::ddl::depend::ObjectAddress::relation(table_oid));
+    let written: Vec<&str> = if col_names.is_empty() {
+        let arity = match ins.select_stmt.as_deref().and_then(|s| s.node.as_ref()) {
+            Some(node::Node::SelectStmt(sel)) => match sel.values_lists.first() {
+                Some(row) => match row.node.as_ref() {
+                    Some(node::Node::List(l)) => l.items.len(),
+                    _ => 0,
+                },
+                None => sel.target_list.len(),
+            },
+            _ => 0,
+        };
+        table_attrs
+            .iter()
+            .filter(|a| a.attnum > 0)
+            .take(arity)
+            .map(|a| a.attname.as_str())
+            .collect()
+    } else {
+        col_names.iter().map(String::as_str).collect()
+    };
+    for name in written {
+        crate::ddl::depend::note_column(table_oid, name);
+    }
     let col_indirection = ins
         .cols
         .iter()
@@ -924,6 +950,12 @@ pub(crate) fn analyze_update_with_outer_ctes(
         .map(str::to_owned)
         .unwrap_or_default();
     let table_attrs = snapshot.attributes_of(table_oid).to_vec();
+    // The columns the UPDATE writes.
+    for target in &upd.target_list {
+        if let Some(node::Node::ResTarget(rt)) = target.node.as_ref() {
+            crate::ddl::depend::note_column(table_oid, &rt.name);
+        }
+    }
 
     // Walk `UPDATE … WITH (cte) …` so parameters inside the CTE are seen by
     // the collector and the CTE alias is visible to the FROM clause. Same

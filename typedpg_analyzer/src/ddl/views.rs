@@ -741,6 +741,12 @@ fn record_view_dependencies(interp: &mut PgCatalog, class_oid: PgClassOid, deps:
             0,
         ));
     }
+    super::depend::record_references(
+        interp,
+        super::depend::ObjectAddress::relation(class_oid),
+        &deps.references,
+        DepType::Normal,
+    );
 }
 
 #[derive(Clone)]
@@ -764,6 +770,10 @@ struct ViewDeps {
     function_refs: Vec<PgProcOid>,
     /// `pg_type.oid` values — types named explicitly (e.g. as CAST targets).
     type_refs: Vec<PgTypeOid>,
+    /// What the analyzed query refers to: the operators it resolved, the
+    /// sequences its regclass literals name, the composite fields it
+    /// selects, ... (`recordDependencyOnExpr` over the view's query).
+    references: Vec<super::depend::Reference>,
 }
 
 /// Resolve view columns at creation time, walk the AST to emit a binding
@@ -789,13 +799,13 @@ fn resolve_view_with_params(
         .node
         .as_ref()
         .ok_or_else(|| DdlError::Parse("CREATE VIEW with empty query node".into()))?;
-    let (raw_columns, _) =
-        crate::resolve::analyze_raw_node_with_param_types(snapshot, inner, param_types).map_err(
-            |source| DdlError::ViewAnalysis {
-                view: String::new(),
-                source: Box::new(source),
-            },
-        )?;
+    let (analyzed, references) = super::depend::collect(|| {
+        crate::resolve::analyze_raw_node_with_param_types(snapshot, inner, param_types)
+    });
+    let (raw_columns, _) = analyzed.map_err(|source| DdlError::ViewAnalysis {
+        view: String::new(),
+        source: Box::new(source),
+    })?;
 
     let columns: Vec<ResolvedColumn> = raw_columns
         .iter()
@@ -825,7 +835,8 @@ fn resolve_view_with_params(
         })
         .collect();
 
-    let (bindings, deps) = collect_view_bindings_and_deps(query_node, snapshot);
+    let (bindings, mut deps) = collect_view_bindings_and_deps(query_node, snapshot);
+    deps.references = references;
     let ast = encode_ast(query_node);
 
     Ok(ResolvedView {
@@ -997,6 +1008,7 @@ fn derive_deps_from_bindings(bindings: &[AstBinding]) -> ViewDeps {
         relation_refs,
         function_refs,
         type_refs,
+        references: Vec::new(),
     }
 }
 

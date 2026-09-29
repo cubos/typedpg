@@ -348,3 +348,72 @@ fn create_extension_hstore_ltree_cube_isn() {
         ]
     );
 }
+
+#[test]
+fn extension_members_only_go_with_their_extension() {
+    for (sql, message) in [
+        (
+            "CREATE EXTENSION pgcrypto; DROP FUNCTION gen_salt(text);",
+            "cannot drop function gen_salt(text) because extension pgcrypto requires it",
+        ),
+        (
+            "CREATE EXTENSION hstore; DROP TYPE hstore CASCADE;",
+            "cannot drop type hstore because extension hstore requires it",
+        ),
+        (
+            "CREATE EXTENSION hstore; CREATE TABLE th (a hstore, b int); DROP EXTENSION hstore;",
+            "cannot drop extension hstore because other objects depend on it",
+        ),
+        (
+            "CREATE EXTENSION pg_trgm;
+             CREATE TABLE tt (d text);
+             CREATE INDEX ON tt USING gin (d gin_trgm_ops);
+             DROP EXTENSION pg_trgm;",
+            "cannot drop extension pg_trgm because other objects depend on it",
+        ),
+        (
+            "DROP EXTENSION plpgsql;
+             CREATE FUNCTION pf() RETURNS int LANGUAGE plpgsql AS 'begin return 1; end';",
+            "language \"plpgsql\" does not exist",
+        ),
+        (
+            "CREATE EXTENSION pg_trgm;
+             CREATE TABLE tt (d text);
+             CREATE INDEX ON tt USING gist (d gist_trgm_ops(siglen = 99999));",
+            "value 99999 out of bounds for option \"siglen\"",
+        ),
+        (
+            "CREATE TABLE tt (d text); CREATE INDEX ON tt (d text_ops(x = 1));",
+            "operator class text_ops has no options",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", sql)]).expect_err(sql);
+        assert!(err.to_string().starts_with(message), "{sql}\n  got: {err}");
+    }
+}
+
+#[test]
+fn drop_extension_or_schema_cascade_drops_columns_of_their_types() {
+    let db = build(&[(
+        "0001.sql",
+        "CREATE EXTENSION hstore;
+         CREATE TABLE th (a hstore, b int);
+         DROP EXTENSION hstore CASCADE;
+         CREATE SCHEMA s;
+         CREATE TYPE s.mood AS ENUM ('a');
+         CREATE DOMAIN s.dd AS int;
+         CREATE TABLE t (m s.mood, d s.dd, b int);
+         DROP SCHEMA s CASCADE;
+         DROP EXTENSION plpgsql;
+         CREATE EXTENSION plpgsql;
+         CREATE FUNCTION pf() RETURNS int LANGUAGE plpgsql AS 'begin return 1; end';
+         CREATE EXTENSION pg_trgm;
+         CREATE TABLE tt (d text);
+         CREATE INDEX ON tt USING gist (d gist_trgm_ops(siglen = 12));",
+    )]);
+    for table in ["th", "t"] {
+        let q = db.analyze(&format!("SELECT * FROM {table}")).unwrap();
+        let names: Vec<&str> = q.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["b"], "{table}");
+    }
+}

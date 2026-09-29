@@ -498,14 +498,17 @@ impl PgCatalog {
             result,
             self,
         ) {
-            Ok((result_type_oid, _)) => OperatorMatch::Found(ResolvedOperator {
-                left_type_oid: chosen.oprleft.map(|_| declared[0]),
-                declared_left_type_oid: chosen.oprleft,
-                right_type_oid: *declared.last().unwrap_or(&chosen.oprright),
-                result_type_oid,
-                code: chosen.oprcode,
-                oid: chosen.oid,
-            }),
+            Ok((result_type_oid, _)) => {
+                crate::ddl::depend::note(crate::ddl::depend::ObjectAddress::operator(chosen.oid));
+                OperatorMatch::Found(ResolvedOperator {
+                    left_type_oid: chosen.oprleft.map(|_| declared[0]),
+                    declared_left_type_oid: chosen.oprleft,
+                    right_type_oid: *declared.last().unwrap_or(&chosen.oprright),
+                    result_type_oid,
+                    code: chosen.oprcode,
+                    oid: chosen.oid,
+                })
+            }
             Err(e) => OperatorMatch::Error(e),
         }
     }

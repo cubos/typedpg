@@ -445,3 +445,187 @@ fn drop_errors_for_a_missing_schema_and_several_blocked_targets() {
     ]);
     build(&[("0001.sql", "DROP FUNCTION IF EXISTS nosuchschema.f();")]);
 }
+
+#[test]
+fn objects_built_on_a_function_block_its_drop() {
+    let f = "CREATE FUNCTION f() RETURNS int LANGUAGE sql IMMUTABLE AS 'select 1';";
+    let blocked = "cannot drop function f() because other objects depend on it";
+    let with = |sql: &str| format!("{f} {sql}");
+    let cases = [
+        with("CREATE TABLE t (a int CHECK (a > f()));"),
+        with("CREATE TABLE t (a int); CREATE INDEX ON t ((a + f()));"),
+        with("CREATE TABLE t (a int DEFAULT f());"),
+        with("CREATE TABLE t (a int, g int GENERATED ALWAYS AS (a + f()) STORED);"),
+        with("CREATE DOMAIN d AS int CHECK (VALUE > f());"),
+        with("CREATE FUNCTION g(x int DEFAULT f()) RETURNS int LANGUAGE sql AS 'select 1';"),
+        with("CREATE TABLE t (a int); CREATE POLICY p ON t USING (a = f());"),
+        with("CREATE FUNCTION g() RETURNS int LANGUAGE sql RETURN f() + 1;"),
+    ];
+    let cases: Vec<(&str, &str, &str)> = cases
+        .iter()
+        .map(|setup| (setup.as_str(), "DROP FUNCTION f();", blocked))
+        .collect();
+    assert_ddl_rejections(&cases);
+    assert_ddl_rejections(&[
+        (
+            "CREATE FUNCTION myf(int, int) RETURNS int LANGUAGE sql AS 'select $1';
+             CREATE OPERATOR === (leftarg = int, rightarg = int, function = myf);",
+            "DROP FUNCTION myf(int, int);",
+            "cannot drop function myf(integer,integer) because other objects depend on it",
+        ),
+        (
+            "CREATE TYPE mood AS ENUM ('a');
+             CREATE FUNCTION m2t(mood) RETURNS text LANGUAGE sql IMMUTABLE AS 'select $1::text';
+             CREATE CAST (mood AS text) WITH FUNCTION m2t(mood);",
+            "DROP FUNCTION m2t(mood);",
+            "cannot drop function m2t(mood) because other objects depend on it",
+        ),
+        (
+            "CREATE FUNCTION sf(int, int) RETURNS int LANGUAGE sql AS 'select $1 + $2';
+             CREATE AGGREGATE ag(int) (sfunc = sf, stype = int);",
+            "DROP FUNCTION sf(int, int);",
+            "cannot drop function sf(integer,integer) because other objects depend on it",
+        ),
+        (
+            "CREATE TYPE base2;
+             CREATE FUNCTION base2_in(cstring) RETURNS base2 LANGUAGE internal IMMUTABLE STRICT
+                 AS 'int4in';
+             CREATE FUNCTION base2_out(base2) RETURNS cstring LANGUAGE internal IMMUTABLE STRICT
+                 AS 'int4out';
+             CREATE TYPE base2 (INPUT = base2_in, OUTPUT = base2_out, INTERNALLENGTH = 4,
+                 PASSEDBYVALUE);",
+            "DROP FUNCTION base2_in(cstring);",
+            "cannot drop function base2_in(cstring) because other objects depend on it",
+        ),
+    ]);
+}
+
+#[test]
+fn drop_function_cascade_takes_what_is_built_on_it() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE FUNCTION myf(int, int) RETURNS int LANGUAGE sql AS 'select $1';
+         CREATE OPERATOR === (leftarg = int, rightarg = int, function = myf);
+         CREATE FUNCTION f() RETURNS int LANGUAGE sql IMMUTABLE AS 'select 1';
+         CREATE TABLE tg (a int, g int GENERATED ALWAYS AS (a + f()) STORED);
+         CREATE FUNCTION g(x int DEFAULT f()) RETURNS int LANGUAGE sql AS 'select 1';",
+    )
+    .unwrap();
+    db.apply_sql("DROP FUNCTION myf(int, int) CASCADE; DROP FUNCTION f() CASCADE;")
+        .unwrap();
+    assert_err_prefix!(
+        db.analyze("SELECT 1 === 2 AS x"),
+        AnalyzeError::UndefinedOperator(_),
+        "operator does not exist: integer === integer"
+    );
+    assert!(db.find_functions(None, "g").is_empty());
+    // The generated column went with f(); the table stays.
+    let q = db.analyze("SELECT * FROM tg").unwrap();
+    assert_eq!(q.columns.len(), 1);
+}
+
+#[test]
+fn an_inline_sql_body_depends_on_what_it_reads() {
+    let setup = "CREATE TABLE t (a int);
+                 CREATE FUNCTION f() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT a FROM t; END;";
+    assert_ddl_rejections(&[
+        (
+            setup,
+            "DROP TABLE t;",
+            "cannot drop table t because other objects depend on it",
+        ),
+        (
+            setup,
+            "ALTER TABLE t DROP COLUMN a;",
+            "cannot drop column a of table t because other objects depend on it",
+        ),
+    ]);
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(setup).unwrap();
+    db.apply_sql("DROP TABLE t CASCADE;").unwrap();
+    assert_err_prefix!(
+        db.analyze("SELECT f() AS x"),
+        AnalyzeError::UndefinedFunction(_),
+        "function f() does not exist"
+    );
+    // A string body is not parsed into dependencies.
+    build(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int);
+         CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT a FROM t';
+         DROP TABLE t;",
+    )]);
+}
+
+#[test]
+fn rules_policies_triggers_and_views_hold_on_to_what_they_use() {
+    assert_ddl_rejections(&[
+        (
+            "CREATE SEQUENCE s;
+             CREATE VIEW vs AS SELECT nextval('s') AS n;",
+            "DROP SEQUENCE s;",
+            "cannot drop sequence s because other objects depend on it",
+        ),
+        (
+            "CREATE TYPE comp AS (a int, b int);
+             CREATE VIEW vc AS SELECT (NULL::comp).b;",
+            "ALTER TYPE comp DROP ATTRIBUTE b;",
+            "cannot drop column b of composite type comp because other objects depend on it",
+        ),
+        (
+            "CREATE TABLE ta (a int, b int);
+             CREATE TABLE tr (a int);
+             CREATE RULE r AS ON INSERT TO tr DO ALSO INSERT INTO ta VALUES (NEW.a);",
+            "DROP TABLE ta;",
+            "cannot drop table ta because other objects depend on it",
+        ),
+        (
+            "CREATE TABLE ta (a int, b int);
+             CREATE TABLE tr (a int);
+             CREATE RULE r AS ON INSERT TO tr DO ALSO INSERT INTO ta VALUES (NEW.a);",
+            "ALTER TABLE ta DROP COLUMN a;",
+            "cannot drop column a of table ta because other objects depend on it",
+        ),
+        (
+            "CREATE TABLE ta (a int, b int);
+             CREATE TABLE tp (a int);
+             CREATE POLICY p ON tp USING (a IN (SELECT b FROM ta));",
+            "ALTER TABLE ta DROP COLUMN b;",
+            "cannot drop column b of table ta because other objects depend on it",
+        ),
+        (
+            "CREATE TABLE ta (a int, b int);
+             CREATE FUNCTION trf() RETURNS trigger LANGUAGE plpgsql AS 'begin return new; end';
+             CREATE TRIGGER tt BEFORE UPDATE OF b ON ta FOR EACH ROW EXECUTE FUNCTION trf();",
+            "ALTER TABLE ta DROP COLUMN b;",
+            "cannot drop column b of table ta because other objects depend on it",
+        ),
+        (
+            "CREATE TABLE tid (a int GENERATED ALWAYS AS IDENTITY);",
+            "DROP SEQUENCE tid_a_seq;",
+            "cannot drop sequence tid_a_seq because column a of table tid requires it",
+        ),
+        (
+            "CREATE TEXT SEARCH DICTIONARY mydict (TEMPLATE = simple);
+             CREATE TEXT SEARCH CONFIGURATION mycfg (COPY = simple);
+             ALTER TEXT SEARCH CONFIGURATION mycfg ALTER MAPPING FOR word WITH mydict;",
+            "DROP TEXT SEARCH DICTIONARY mydict;",
+            "cannot drop text search dictionary mydict because other objects depend on it",
+        ),
+        (
+            "CREATE TEXT SEARCH CONFIGURATION mycfg (COPY = simple);
+             CREATE TABLE tts (d text);
+             CREATE INDEX ON tts (to_tsvector('mycfg', d));",
+            "DROP TEXT SEARCH CONFIGURATION mycfg;",
+            "cannot drop text search configuration mycfg because other objects depend on it",
+        ),
+    ]);
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE SEQUENCE s;
+         CREATE VIEW vs AS SELECT nextval('s') AS n;
+         DROP SEQUENCE s CASCADE;",
+    )
+    .unwrap();
+    assert!(db.resolve_table(None, "vs").is_none());
+}

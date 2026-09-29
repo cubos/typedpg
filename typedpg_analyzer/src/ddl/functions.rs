@@ -13,7 +13,7 @@ use typedpg_pg_query::protobuf::{
 };
 
 use crate::oid::{PgNamespaceOid, PgProcOid, PgTypeOid};
-use crate::pg_catalog::{ArgMode, PgProc, ProKind, ProVolatile, oid as builtin_oid};
+use crate::pg_catalog::{ArgMode, DepType, PgProc, ProKind, ProVolatile, oid as builtin_oid};
 
 use super::DdlError;
 use super::util::{
@@ -325,6 +325,8 @@ pub(crate) struct ParameterList {
     pub variadic: Option<PgTypeOid>,
     /// The result type the OUT parameters imply (`requiredResultType`).
     pub required_result: Option<PgTypeOid>,
+    /// What the DEFAULT expressions refer to.
+    pub default_refs: Vec<super::depend::Reference>,
     /// Whether any parameter has an OUT or VARIADIC mode (PG then stores
     /// `proallargtypes` / `proargmodes`).
     pub has_modes: bool,
@@ -346,6 +348,7 @@ pub(crate) fn interpret_function_parameter_list(
         default_types: Vec::new(),
         variadic: None,
         required_result: None,
+        default_refs: Vec::new(),
         has_modes: false,
     };
     let mut out_count = 0;
@@ -455,13 +458,11 @@ pub(crate) fn interpret_function_parameter_list(
             }
             Some(expr) => {
                 let polymorphic = crate::polymorphic::is_polymorphic(toid);
-                list.default_types
-                    .push(super::defaults::check_function_default(
-                        interp,
-                        expr,
-                        toid,
-                        polymorphic,
-                    )?);
+                let (default_type, refs) = super::depend::collect(|| {
+                    super::defaults::check_function_default(interp, expr, toid, polymorphic)
+                });
+                list.default_types.push(default_type?);
+                list.default_refs.extend(refs);
                 have_defaults = true;
             }
             None => {
@@ -615,10 +616,14 @@ pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Res
     if language == "internal" {
         fmgr_internal_validator(attrs.as_clause, &proc)?;
     }
-    super::function_body::validate_sql_function(interp, stmt, &proc)?;
+    let body_refs = super::function_body::validate_sql_function(interp, stmt, &proc)?;
     super::function_body::validate_plpgsql_function(interp, stmt)?;
     // ProcedureCreate: a SQL-standard body depends on what it reads.
     super::coldeps::record_function_body(interp, proc.oid, stmt);
+    // What the inline body and the parameter defaults refer to.
+    let addr = super::depend::ObjectAddress::proc(proc.oid);
+    super::depend::record_references(interp, addr, &body_refs, DepType::Normal);
+    super::depend::record_references(interp, addr, &params.default_refs, DepType::Normal);
 
     Ok(())
 }

@@ -7,37 +7,47 @@ use crate::common::*;
 
 #[test]
 fn drop_operator_removes_only_matching_signature() {
-    // pgvector registers multiple `<=>` overloads (vector/halfvec/sparsevec).
-    // Dropping the (vector, vector) overload must leave the others alone.
+    // Dropping the (int, int) overload must leave the (text, text) one.
     let snap = build(&[(
         "0001.sql",
-        "CREATE EXTENSION vector;
-         DROP OPERATOR <=> (vector, vector);",
+        "CREATE FUNCTION ieq(int, int) RETURNS bool LANGUAGE sql AS 'select $1 = $2';
+         CREATE FUNCTION teq(text, text) RETURNS bool LANGUAGE sql AS 'select $1 = $2';
+         CREATE OPERATOR <==> (leftarg = int, rightarg = int, function = ieq);
+         CREATE OPERATOR <==> (leftarg = text, rightarg = text, function = teq);
+         DROP OPERATOR <==> (int, int);",
     )]);
-
-    let vector_oid = snap.resolve_type_by_name(None, "vector").unwrap().oid;
-    let halfvec_oid = snap.resolve_type_by_name(None, "halfvec").unwrap().oid;
-
     let public_oid = snap.namespace_oid("public").unwrap();
     let ops: Vec<&PgOperator> = snap
         .pg_operator()
         .values()
-        .filter(|o| o.oprnamespace == public_oid && o.oprname == "<=>")
+        .filter(|o| o.oprnamespace == public_oid && o.oprname == "<==>")
         .collect();
-    assert!(
-        !ops.is_empty(),
-        "other overloads should still be registered"
-    );
-
+    let int4_oid = snap.resolve_type_by_name(None, "int4").unwrap().oid;
+    let text_oid = snap.resolve_type_by_name(None, "text").unwrap().oid;
     assert!(
         !ops.iter()
-            .any(|o| o.oprleft == Some(vector_oid) && o.oprright == vector_oid),
-        "(vector, vector) overload should have been dropped"
+            .any(|o| o.oprleft == Some(int4_oid) && o.oprright == int4_oid),
+        "(int, int) overload should have been dropped"
     );
     assert!(
         ops.iter()
-            .any(|o| o.oprleft == Some(halfvec_oid) && o.oprright == halfvec_oid),
-        "(halfvec, halfvec) overload should still be registered"
+            .any(|o| o.oprleft == Some(text_oid) && o.oprright == text_oid),
+        "(text, text) overload should still be registered"
+    );
+}
+
+#[test]
+fn an_extension_operator_only_goes_with_its_extension() {
+    let result = try_apply(&[(
+        "0001.sql",
+        "CREATE EXTENSION vector;
+         DROP OPERATOR <=> (vector, vector);",
+    )]);
+    assert_ddl_err!(
+        result,
+        DdlError::DependencyError(_),
+        "cannot drop operator <=>(vector,vector) because extension vector requires it (You can \
+         drop extension vector instead.)"
     );
 }
 

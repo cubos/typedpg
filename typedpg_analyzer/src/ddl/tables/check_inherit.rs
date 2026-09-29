@@ -149,6 +149,7 @@ fn insert_check(
     });
     if let Some(def) = def {
         interp.check_defs.insert(oid, def);
+        crate::ddl::depend::record_check_constraint(interp, oid);
     }
     Ok(())
 }

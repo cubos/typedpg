@@ -1524,6 +1524,7 @@ fn resolve_type_name(
         .finalize_implicit()
     })?;
 
+    crate::ddl::depend::note(crate::ddl::depend::ObjectAddress::type_(type_entry.oid));
     // typenameType: a shell type can't be used.
     if !type_entry.typisdefined {
         return Err(AnalyzeError::UndefinedType(format!(

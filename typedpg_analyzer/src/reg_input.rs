@@ -163,8 +163,11 @@ fn lookup_by_names(typname: &str, names: &[String], snapshot: &PgCatalog) -> Res
                     ));
                 }
             };
-            if snapshot.resolve_table(schema, rel).is_some()
-                || schema.is_some_and(is_system_schema)
+            if let Some(class) = snapshot.resolve_table(schema, rel) {
+                crate::ddl::depend::note(crate::ddl::depend::ObjectAddress::relation(class.oid));
+                return Ok(());
+            }
+            if schema.is_some_and(is_system_schema)
                 || (schema.is_none() && rel.starts_with("pg_"))
             {
                 return Ok(());
@@ -235,7 +238,10 @@ fn lookup_by_names(typname: &str, names: &[String], snapshot: &PgCatalog) -> Res
             }
             let parts: Vec<&str> = names.iter().map(String::as_str).collect();
             let kind = if typname == "regconfig" { "c" } else { "d" };
-            crate::ddl::text_search::find(snapshot, kind, &parts).map_err(|e| e.to_string())
+            crate::ddl::text_search::find(snapshot, kind, &parts).map_err(|e| e.to_string())?;
+            let (schema, name) = deconstruct(names)?;
+            crate::ddl::depend::note_ts_object(snapshot, kind, schema, name);
+            Ok(())
         }
         _ => Ok(()),
     }

@@ -52,7 +52,10 @@ pub(crate) fn expanded_target_entries<'a>(
                 let cols: Vec<&ScopeColumn> = match table_filter {
                     Some(tbl) => scope
                         .find_source(tbl)
-                        .map(|s| s.columns.iter().collect())
+                        .map(|s| {
+                            s.note_star_columns();
+                            s.columns.iter().collect()
+                        })
                         .unwrap_or_default(),
                     None => scope.star_columns(),
                 };
@@ -139,7 +142,10 @@ pub(crate) fn resolve_target_list_explicit(
                 // one, or an outer query's (PG's `ExpandColumnRefStar`
                 // resolves the name like any qualifier).
                 match scope.find_source(tbl) {
-                    Some(src) => src.columns.iter().collect(),
+                    Some(src) => {
+                        src.note_star_columns();
+                        src.columns.iter().collect()
+                    }
                     None => {
                         // No such entry: the qualified lookup reports PG's
                         // `missing FROM-clause entry` / `invalid reference`.

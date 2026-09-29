@@ -152,6 +152,7 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
         key_columns.push(key.column);
         indclass.push(key.opclass);
         indcollation.push(key.collation);
+        super::extensions::check_opclass_options(db, &elem.opclass, &elem.opclassopts, am)?;
     }
     // ComputeIndexAttrs: the INCLUDE columns follow the key columns in
     // indkey; they must be plain columns.
@@ -282,6 +283,8 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
         indcollation,
         indclass,
     });
+    crate::ddl::depend::record_index_expressions(db, indexrelid);
+    crate::ddl::depend::record_index_opclasses(db, indexrelid, &stmt.index_params, am);
     // DefineIndex on a partitioned table recurses — not under ONLY, where
     // the index stays invalid while the table has partitions without one
     // attached (ALTER INDEX ... ATTACH PARTITION validates it).

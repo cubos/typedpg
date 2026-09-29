@@ -608,13 +608,20 @@ pub fn create_publication(
         via_root,
         all_tables: stmt.for_all_tables,
     };
+    let mut tables = Vec::new();
     for object in objects {
         match object {
-            Object::Table(rel, _) => publication.tables.push(rel),
+            Object::Table(rel, pt) => {
+                publication.tables.push(rel);
+                tables.push((rel.relid, pt));
+            }
             Object::Schema(ns) => publication.schemas.push(ns),
         }
     }
     interp.publications.push(publication);
+    for (relid, pt) in tables {
+        crate::ddl::depend::record_publication_rel(interp, &stmt.pubname, relid, pt)?;
+    }
     Ok(())
 }
 
@@ -820,5 +827,10 @@ impl Publication {
     /// A dropped relation leaves the publication.
     pub(crate) fn forget_relation(&mut self, relid: PgClassOid) {
         self.tables.retain(|t| t.relid != relid);
+    }
+
+    /// Whether the publication lists table `relid`.
+    pub(crate) fn has_relation(&self, relid: PgClassOid) -> bool {
+        self.tables.iter().any(|t| t.relid == relid)
     }
 }

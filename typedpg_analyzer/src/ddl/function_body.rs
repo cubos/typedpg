@@ -23,7 +23,25 @@ use crate::oid::PgTypeOid;
 use crate::pg_catalog::{ArgMode, PgCatalog, PgProc, TypCategory, TypType, oid};
 
 /// Validate the body of `proc` as created by `stmt`.
+///
+/// Returns what an inline (`BEGIN ATOMIC` / `RETURN`) body refers to: PG
+/// stores it parsed, and the routine depends on those objects
+/// (ProcedureCreate → recordDependencyOnExpr).
 pub(crate) fn validate_sql_function(
+    interp: &PgCatalog,
+    stmt: &CreateFunctionStmt,
+    proc: &PgProc,
+) -> Result<Vec<super::depend::Reference>, DdlError> {
+    let (result, refs) = super::depend::collect(|| validate_sql_body(interp, stmt, proc));
+    result?;
+    Ok(if stmt.sql_body.is_some() {
+        refs
+    } else {
+        Vec::new()
+    })
+}
+
+fn validate_sql_body(
     interp: &PgCatalog,
     stmt: &CreateFunctionStmt,
     proc: &PgProc,
