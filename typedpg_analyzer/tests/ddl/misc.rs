@@ -4172,3 +4172,71 @@ fn index_columns_are_named_for_set_statistics() {
         ),
     ]);
 }
+
+#[test]
+fn index_include_columns_are_modeled() {
+    // PG 18 ComputeIndexAttrs / transformIndexConstraint: INCLUDE columns
+    // are non-key index columns — part of the generated index name, of the
+    // index's dependencies, but not of the constraint key.
+    let setup = "CREATE TABLE t (a int, b int);
+                 CREATE INDEX ON t (a) INCLUDE (b);
+                 CREATE UNIQUE INDEX u ON t (a) INCLUDE (b);
+                 CREATE TABLE s (a int, b int, UNIQUE (a) INCLUDE (b),
+                     EXCLUDE USING btree (b WITH =) INCLUDE (a));
+                 CREATE TABLE k (a int, b int, CONSTRAINT kp PRIMARY KEY (a) INCLUDE (b));
+                 CREATE TABLE k2 (a int, b int, PRIMARY KEY (a) INCLUDE (b));";
+    for (stmt, msg) in [
+        (
+            "CREATE INDEX x ON t (a) INCLUDE ((b + 1));",
+            "expressions are not supported in included columns",
+        ),
+        (
+            "CREATE TABLE s2 (a int, UNIQUE (a) INCLUDE (nosuch));",
+            "column \"nosuch\" named in key does not exist",
+        ),
+        (
+            "ALTER TABLE t ADD UNIQUE (a) INCLUDE (nosuch);",
+            "column \"nosuch\" named in key does not exist",
+        ),
+        (
+            "ALTER INDEX u ALTER COLUMN 2 SET STATISTICS 100;",
+            "cannot alter statistics on included column \"b\" of index \"u\"",
+        ),
+        (
+            "ALTER INDEX kp ALTER COLUMN b SET STATISTICS 100;",
+            "cannot alter statistics on included column \"b\" of index \"kp\"",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    let db = build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "DROP INDEX t_a_b_idx;
+             ALTER INDEX s_a_b_key RENAME TO s1;
+             ALTER INDEX s_b_a_excl RENAME TO s2;
+             ALTER TABLE t ADD UNIQUE (b) INCLUDE (a);
+             ALTER INDEX t_b_a_key RENAME TO t1;
+             CREATE TABLE l (LIKE s INCLUDING INDEXES);
+             ALTER INDEX l_a_b_key RENAME TO l1;
+             ALTER TABLE k DROP COLUMN b;
+             ALTER TABLE k ADD CONSTRAINT kp PRIMARY KEY (a);",
+        ),
+    ]);
+    // The PRIMARY KEY's INCLUDE column isn't made NOT NULL.
+    let seed = db.to_seed();
+    let k = seed
+        .pg_class
+        .iter()
+        .find(|c| c.relname == "k2")
+        .unwrap()
+        .oid;
+    let b = seed
+        .pg_attribute
+        .iter()
+        .find(|a| a.attrelid == k && a.attname == "b")
+        .unwrap();
+    assert!(!b.attnotnull);
+}

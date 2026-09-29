@@ -679,10 +679,23 @@ pub(crate) fn drop_column(
         // PK/UNIQUE/CHECK constraints, FK source side, and indexes —
         // regardless of CASCADE. PG treats these as part of the column.
         // External FKs (in other tables) only fall away under CASCADE.
+        // A constraint whose index goes (through an INCLUDE column) goes
+        // too.
+        let index_names: Vec<String> = dependent_indexes
+            .iter()
+            .filter_map(|i| interp.pg_class.get(i).map(|c| c.relname.clone()))
+            .collect();
         let always_drop: Vec<_> = interp
             .pg_constraint
             .values()
-            .filter(|c| c.conrelid == relid && c.conkey.contains(&an))
+            .filter(|c| {
+                c.conrelid == relid
+                    && (c.conkey.contains(&an)
+                        || (matches!(
+                            c.contype,
+                            ConType::PrimaryKey | ConType::Unique | ConType::Exclusion
+                        ) && index_names.contains(&c.conname)))
+            })
             .map(|c| c.oid)
             .collect();
         for oid in always_drop {

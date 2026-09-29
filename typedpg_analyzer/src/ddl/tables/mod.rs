@@ -22,8 +22,8 @@ use crate::qualified_name::QualifiedName;
 /// Pending `pg_constraint` row built up while walking a `CreateStmt`:
 /// `(conname, contype, conkey, confrelid, confkey)`. Materialized into
 /// real catalog rows after all FK targets have been validated.
-/// CHECK constraints also carry their definition; the last field is
-/// DEFERRABLE.
+/// CHECK constraints also carry their definition; then come DEFERRABLE
+/// and the INCLUDE columns.
 type PendingConstraint = (
     ConName,
     ConType,
@@ -32,6 +32,7 @@ type PendingConstraint = (
     Vec<i16>,
     Option<check_inherit::CheckDef>,
     bool,
+    Vec<i16>,
 );
 
 /// A constraint's name: the explicit one, or PG's generated
@@ -267,6 +268,20 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
             }
             if is_not_null && !c.conname.is_empty() {
                 col.nn_name = Some(c.conname.clone());
+            }
+        }
+    }
+
+    // transformIndexConstraint: so must their INCLUDE columns.
+    for elt in stmt.constraints.iter().chain(stmt.table_elts.iter()) {
+        let Some(node::Node::Constraint(c)) = elt.node.as_ref() else {
+            continue;
+        };
+        for key in c.including.iter().filter_map(super::util::node_string) {
+            if !columns.iter().any(|col| col.name == key) {
+                return Err(DdlError::Parse(format!(
+                    "column \"{key}\" named in key does not exist"
+                )));
             }
         }
     }

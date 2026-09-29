@@ -182,17 +182,22 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
             }
         }
     }
-    // INCLUDE columns must exist.
+    // ComputeIndexAttrs: the INCLUDE columns follow the key columns in
+    // indkey; they must be plain columns.
+    let indnkeyatts = indkey.len() as i16;
     for param in &stmt.index_including_params {
-        if let Some(node::Node::IndexElem(elem)) = param.node.as_ref()
-            && !elem.name.is_empty()
-            && !attnum_by_name.contains_key(&elem.name)
-        {
-            return Err(DdlError::Parse(format!(
-                "column \"{}\" does not exist",
-                elem.name
-            )));
+        let Some(node::Node::IndexElem(elem)) = param.node.as_ref() else {
+            continue;
+        };
+        if elem.name.is_empty() {
+            return Err(DdlError::UnsupportedDdl(
+                "expressions are not supported in included columns".into(),
+            ));
         }
+        let an = *attnum_by_name
+            .get(&elem.name)
+            .ok_or_else(|| DdlError::Parse(format!("column \"{}\" does not exist", elem.name)))?;
+        indkey.push(an);
     }
     let indpred = stmt.where_clause.as_deref().map(serialize_node);
     if stmt.unique || stmt.primary {
@@ -201,7 +206,12 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
         } else {
             "UNIQUE"
         };
-        super::tables::check_unique_covers_partition_key(db, indrelid, &indkey, label)?;
+        super::tables::check_unique_covers_partition_key(
+            db,
+            indrelid,
+            &indkey[..indnkeyatts as usize],
+            label,
+        )?;
     }
 
     // ── Pick a name for the index ──
@@ -210,9 +220,12 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
     // constraint's is `<table>_<columns>_idx` — unique or not — numbered
     // when taken; expression columns are named like FigureIndexColname.
     let conname = if stmt.idxname.is_empty() {
+        // ChooseIndexColumnNames over all the index's columns, INCLUDE ones
+        // too.
         let colnames: Vec<String> = stmt
             .index_params
             .iter()
+            .chain(&stmt.index_including_params)
             .filter_map(|param| match param.node.as_ref()? {
                 node::Node::IndexElem(elem) if !elem.name.is_empty() => Some(elem.name.clone()),
                 node::Node::IndexElem(elem) => Some(figure_index_colname(elem.expr.as_deref())),
@@ -259,9 +272,7 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
         indexrelid,
         indrelid,
         indnatts,
-        // PG distinguishes key cols from `INCLUDE (cols)`. We don't model
-        // INCLUDE today — every column counts as a key column.
-        indnkeyatts: indnatts,
+        indnkeyatts,
         indisunique: stmt.unique,
         indisprimary: stmt.primary,
         indkey,
