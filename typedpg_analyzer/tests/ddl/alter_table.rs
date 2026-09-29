@@ -921,3 +921,34 @@ fn persistence_changes_follow_at_prep_change_persistence() {
         ),
     ]);
 }
+
+#[test]
+fn attach_partition_keeps_persistence_consistent() {
+    // ATExecAttachPartition: a permanent table's partitions are permanent,
+    // a temporary one's temporary.
+    let setup = "CREATE TABLE p (a int) PARTITION BY RANGE (a);
+                 CREATE TEMP TABLE c (a int);
+                 CREATE TEMP TABLE tp (a int) PARTITION BY RANGE (a);
+                 CREATE TABLE d (a int);";
+    for (stmt, msg) in [
+        (
+            "ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (1) TO (2);",
+            "cannot attach a temporary relation as partition of permanent relation \"p\"",
+        ),
+        (
+            "ALTER TABLE tp ATTACH PARTITION d FOR VALUES FROM (1) TO (2);",
+            "cannot attach a permanent relation as partition of temporary relation \"tp\"",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "ALTER TABLE p ATTACH PARTITION d FOR VALUES FROM (1) TO (2);
+             ALTER TABLE tp ATTACH PARTITION c FOR VALUES FROM (1) TO (2);",
+        ),
+    ]);
+}

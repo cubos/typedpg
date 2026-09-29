@@ -389,6 +389,22 @@ pub(super) fn attach_partition(
              \"{attach_name}\".)"
         )));
     }
+    // ATExecAttachPartition: a permanent table's partitions are permanent,
+    // a temporary one's temporary.
+    let parent_temp = super::super::util::is_temp_relation(interp, parent);
+    let attach_temp = super::super::util::is_temp_relation(interp, attach);
+    if !parent_temp && attach_temp {
+        return Err(DdlError::Parse(format!(
+            "cannot attach a temporary relation as partition of permanent relation \
+             \"{parent_name}\""
+        )));
+    }
+    if parent_temp && !attach_temp {
+        return Err(DdlError::Parse(format!(
+            "cannot attach a permanent relation as partition of temporary relation \
+             \"{parent_name}\""
+        )));
+    }
     // The partition may have neither an identity column nor columns the
     // parent lacks.
     for a in interp.attributes_of(attach) {
