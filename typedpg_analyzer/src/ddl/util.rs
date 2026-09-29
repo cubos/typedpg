@@ -70,14 +70,16 @@ pub fn lookup_relation(
     };
     match snapshot.class_by_qname.get(&(nsoid, name.clone())) {
         Some(&oid) => Ok((nsoid, oid)),
-        None => Err(DdlError::TableNotFound(format!(
-            "relation \"{}\" does not exist",
-            if rv.schemaname.is_empty() {
-                name
-            } else {
-                format!("{schema}.{name}")
-            }
-        ))),
+        // Deliberately not a QualifiedName: RangeVarGetRelidExtended's
+        // message is `errmsg("relation \"%s.%s\" does not exist",
+        // schemaname, relname)`, the raw names joined by a dot with no
+        // quoting — `relation "My Schema.a"b" does not exist` — and the
+        // wording must match PG's verbatim.
+        None => Err(DdlError::TableNotFound(if rv.schemaname.is_empty() {
+            format!("relation \"{name}\" does not exist")
+        } else {
+            format!("relation \"{}.{name}\" does not exist", rv.schemaname)
+        })),
     }
 }
 

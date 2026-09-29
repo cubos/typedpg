@@ -560,3 +560,40 @@ fn set_schema_moves_a_relation_with_its_indexes_and_sequences() {
     ]);
     db.analyze("SELECT x FROM s.c").unwrap();
 }
+
+#[test]
+fn a_missing_qualified_relation_is_named_as_pg_names_it() {
+    // RangeVarGetRelidExtended: `relation "%s.%s" does not exist` joins the
+    // schema and relation names as written, without quoting them — even
+    // when they would need quotes as identifiers.
+    let setup = "CREATE SCHEMA \"My Schema\";";
+    for (stmt, msg) in [
+        (
+            "ALTER TABLE \"My Schema\".\"No Pe\" ADD COLUMN x int;",
+            "relation \"My Schema.No Pe\" does not exist",
+        ),
+        (
+            "TRUNCATE \"My Schema\".\"a\"\"b\";",
+            "relation \"My Schema.a\"b\" does not exist",
+        ),
+        (
+            "ALTER TABLE \"My Schema\".\"select\" ADD COLUMN x int;",
+            "relation \"My Schema.select\" does not exist",
+        ),
+        (
+            "ALTER TABLE public.nope ADD COLUMN x int;",
+            "relation \"public.nope\" does not exist",
+        ),
+        (
+            "ALTER TABLE \"No Pe\" ADD COLUMN x int;",
+            "relation \"No Pe\" does not exist",
+        ),
+        (
+            "ALTER TABLE nosch.nope ADD COLUMN x int;",
+            "schema \"nosch\" does not exist",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+}
