@@ -976,3 +976,74 @@ fn float_literal_underflow_rejected_but_subnormals_accepted() {
         db.analyze(q).unwrap_or_else(|e| panic!("{q}: {e}"));
     }
 }
+
+// ── range / multirange literals (range_in, multirange_in) ───────────────────
+
+#[test]
+fn range_literal_lower_above_upper_rejected() {
+    let db = setup();
+    for q in [
+        "SELECT '[1,0]'::int4range",
+        "SELECT '[1.5,1.4]'::numrange",
+        "SELECT '[NaN,1]'::numrange",
+        "SELECT '[2024-01-02,2024-01-01]'::daterange",
+        "SELECT '[2024-01-01 10:00,2024-01-01 09:00]'::tsrange",
+    ] {
+        assert_first_line!(
+            db.analyze(q),
+            "range lower bound must be less than or equal to range upper bound"
+        );
+    }
+    // Equal bounds make an empty (or single-point) range; unbounded sides
+    // never conflict.
+    for q in [
+        "SELECT '[1,1)'::int4range AS v",
+        "SELECT '[1,1]'::int4range AS v",
+        "SELECT '(,)'::int4range AS v",
+        "SELECT '[1.5,1.50]'::numrange AS v",
+    ] {
+        db.analyze(q).unwrap_or_else(|e| panic!("{q}: {e}"));
+    }
+}
+
+#[test]
+fn range_literal_bounds_validated_with_subtype() {
+    let db = setup();
+    assert_first_line!(
+        db.analyze("SELECT '[a,2)'::int4range"),
+        "invalid input syntax for type integer: \"a\""
+    );
+    assert_first_line!(
+        db.analyze("SELECT '[1,2,3)'::int4range"),
+        "malformed range literal: \"[1,2,3)\""
+    );
+    // int4range_canonical can't shift an inclusive upper bound past MAX.
+    assert_first_line!(
+        db.analyze("SELECT '[1,2147483647]'::int4range"),
+        "integer out of range"
+    );
+}
+
+#[test]
+fn multirange_literal_structure_and_members_validated() {
+    let db = setup();
+    assert_first_line!(
+        db.analyze("SELECT '{[1,2)'::int4multirange"),
+        "malformed multirange literal: \"{[1,2)\""
+    );
+    assert_first_line!(
+        db.analyze("SELECT '{[1,2),}'::int4multirange"),
+        "malformed multirange literal: \"{[1,2),}\""
+    );
+    // Member ranges report with their own text.
+    assert_first_line!(
+        db.analyze("SELECT '{[1,2),[4,3)}'::int4multirange"),
+        "range lower bound must be less than or equal to range upper bound"
+    );
+    assert_first_line!(
+        db.analyze("SELECT '{[1,\"2)\"]}'::int4multirange"),
+        "invalid input syntax for type integer: \"2)\""
+    );
+    db.analyze("SELECT '{empty, [1,2), (3,4]}'::int4multirange AS v")
+        .unwrap();
+}

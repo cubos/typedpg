@@ -80,24 +80,16 @@ pub(crate) fn validate(
         ));
     }
 
-    // Ranges: must be `empty` (case-insensitive, surrounding whitespace
-    // allowed) or start with `(` / `[`. Bound contents are not validated.
+    // Ranges and multiranges: `range_in` / `multirange_in` (see
+    // `crate::range_input`), bounds validated with the subtype.
     if t.typtype == TypType::Range {
-        let trimmed = content.trim_matches(|c: char| c.is_ascii_whitespace());
-        if trimmed.eq_ignore_ascii_case("empty") || trimmed.starts_with(['(', '[']) {
-            return Ok(());
-        }
-        return Err(format!("malformed range literal: \"{content}\""));
+        return crate::range_input::validate_range(content, target, snapshot);
     }
-
-    // Multiranges: the value must open with `{` after optional whitespace
-    // (`'{}'` is the valid empty multirange). Member ranges aren't validated.
     if t.typtype == TypType::Multirange {
-        let trimmed = content.trim_start_matches(|c: char| c.is_ascii_whitespace());
-        if trimmed.starts_with('{') {
+        let Some(range) = snapshot.range_of_multirange(target) else {
             return Ok(());
-        }
-        return Err(format!("malformed multirange literal: \"{content}\""));
+        };
+        return crate::range_input::validate_multirange(content, range, snapshot);
     }
 
     // True arrays: `array_in`'s grammar (see `crate::array_input`), each

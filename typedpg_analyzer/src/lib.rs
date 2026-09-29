@@ -57,6 +57,7 @@ mod pgmsg;
 mod polymorphic;
 #[cfg(feature = "pg_sanity")]
 pub use pg_sanity::{Divergence, DivergenceKind};
+mod range_input;
 mod regex_input;
 mod resolve;
 mod scope;
