@@ -249,6 +249,10 @@ pub enum AnalyzeError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// SQLSTATE 2201W (`invalid_row_count_in_limit_clause`).
+    #[error("{0}")]
+    InvalidRowCountInLimitClause(String),
+
     /// SQLSTATE 54011 (`too_many_columns`).
     #[error("{0}")]
     TooManyColumns(String),
@@ -304,6 +308,7 @@ impl AnalyzeError {
             GeneratedAlways(_) => Some("428C9"),
             ObjectNotInPrerequisiteState(_) => Some("55000"),
             InvalidObjectDefinition(_) => Some("42P17"),
+            InvalidRowCountInLimitClause(_) => Some("2201W"),
             TooManyColumns(_) => Some("54011"),
             StatementTooComplex(_) => Some("54001"),
             TooManyArguments(_) => Some("54023"),
@@ -1000,6 +1005,9 @@ fn replace_message(e: AnalyzeError, rendered: String) -> AnalyzeError {
         AnalyzeError::DuplicateColumn(_) => AnalyzeError::DuplicateColumn(rendered),
         AnalyzeError::InvalidRecursion(_) => AnalyzeError::InvalidRecursion(rendered),
         AnalyzeError::PgInternalError(_) => AnalyzeError::PgInternalError(rendered),
+        AnalyzeError::InvalidRowCountInLimitClause(_) => {
+            AnalyzeError::InvalidRowCountInLimitClause(rendered)
+        }
         AnalyzeError::TooManyColumns(_) => AnalyzeError::TooManyColumns(rendered),
         AnalyzeError::StatementTooComplex(_) => AnalyzeError::StatementTooComplex(rendered),
         AnalyzeError::TooManyArguments(_) => AnalyzeError::TooManyArguments(rendered),

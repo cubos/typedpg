@@ -186,10 +186,9 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
         values_scope
             .shadowed_sources
             .extend(shadowed_sources.iter().cloned());
-        return Ok((
-            analyze_values_lists(&sel.values_lists, snapshot, params, &values_scope)?,
-            None,
-        ));
+        let columns = analyze_values_lists(&sel.values_lists, snapshot, params, &values_scope)?;
+        values_sort_and_limit(sel, &columns, snapshot, params, &cte_scopes, &outer)?;
+        return Ok((columns, None));
     }
 
     let mut scope = Scope {
@@ -729,6 +728,66 @@ fn check_sort_group_keys(
         }
     }
     Ok(())
+}
+
+/// ORDER BY / LIMIT / OFFSET of a bare `VALUES` list (PG's
+/// transformValuesClause): they see its columns (`column1`, …) the way a
+/// query sees a FROM item, and select-list positions count its columns.
+fn values_sort_and_limit(
+    sel: &protobuf::SelectStmt,
+    columns: &[RawColumn],
+    snapshot: &PgCatalog,
+    params: &mut ParamCollector,
+    cte_scopes: &HashMap<String, Vec<ScopeColumn>>,
+    outer: &[crate::scope::TableSource],
+) -> Result<(), AnalyzeError> {
+    let alias = crate::scope::hidden_alias("values");
+    let cols: Vec<ScopeColumn> = columns
+        .iter()
+        .map(|c| ScopeColumn {
+            name: c.name.clone(),
+            type_oid: c.type_oid,
+            base_not_null: !c.nullable,
+            typmod: c.typmod,
+            collation: c.collation,
+            table_alias: alias.clone(),
+            record_fields: c.record_fields.clone(),
+        })
+        .collect();
+    let mut scope = Scope {
+        ctes: cte_scopes.clone(),
+        ..Scope::default()
+    };
+    scope.outer_sources.extend(outer.iter().cloned());
+    scope.add_derived(&alias, cols, crate::scope::SourceKind::Other)?;
+    let null_ctx = NullabilityContext::default();
+    for sort_node in &sel.sort_clause {
+        let Some(node::Node::SortBy(sb)) = sort_node.node.as_ref() else {
+            continue;
+        };
+        let Some(inner) = sb.node.as_deref() else {
+            continue;
+        };
+        if let Some(ord) = sql92_position(inner, "ORDER BY")? {
+            if ord < 1 || ord as usize > columns.len() {
+                return Err(crate::pgmsg::position_not_in_select_list(
+                    "ORDER BY",
+                    ord,
+                    crate::error::node_location(inner)
+                        .and_then(crate::error::SourceSpan::from_node_token),
+                )
+                .finalize_implicit());
+            }
+            continue;
+        }
+        expr::infer_expr(
+            inner,
+            expr::Ctx::new(&scope, &null_ctx, snapshot),
+            params,
+            TypeGoal::NONE,
+        )?;
+    }
+    analyze_limit_offset(sel, expr::Ctx::new(&scope, &null_ctx, snapshot), params)
 }
 
 /// Recursively find window-function calls and verify that any *named*
@@ -1314,6 +1373,18 @@ pub(crate) fn analyze_limit_offset(
             )
             .finalize_implicit());
         }
+    }
+    // transformLimitClause: WITH TIES needs a row count, so a NULL constant
+    // there is rejected (a NULL at run time only fails when evaluated).
+    if sel.limit_option == protobuf::LimitOption::WithTies as i32
+        && let Some(node::Node::AConst(ac)) =
+            sel.limit_count.as_deref().and_then(|n| n.node.as_ref())
+        && ac.isnull
+    {
+        return Err(crate::pgmsg::with_ties_null_row_count(
+            crate::error::SourceSpan::from_node_token(ac.location),
+        )
+        .finalize_implicit());
     }
     Ok(())
 }

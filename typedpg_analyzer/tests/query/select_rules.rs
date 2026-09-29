@@ -601,7 +601,7 @@ fn ordinals_count_star_expanded_targets() {
 
 /// findTargetlistEntrySQL92: a constant ORDER BY / GROUP BY / DISTINCT ON
 /// item is a position, so it must be an integer (42601) — inside grouping
-/// sets and implicit rows too, and for set operations.
+/// sets and implicit rows too, and for set operations and VALUES.
 #[test]
 fn non_integer_constant_in_sort_and_group_clauses() {
     let db = setup();
@@ -646,6 +646,10 @@ fn non_integer_constant_in_sort_and_group_clauses() {
             "SELECT 1 UNION SELECT 2 ORDER BY 'x'",
             "non-integer constant in ORDER BY",
         ),
+        (
+            "VALUES (1) ORDER BY 'x'",
+            "non-integer constant in ORDER BY",
+        ),
     ] {
         let err = assert_err_prefix(&db, sql, msg);
         assert!(matches!(err, AnalyzeError::SyntaxError(_)), "{err:?}");
@@ -660,6 +664,25 @@ fn non_integer_constant_in_sort_and_group_clauses() {
         matches!(err, AnalyzeError::InvalidColumnReference(_)),
         "{err:?}"
     );
+}
+
+/// A bare VALUES list takes ORDER BY / LIMIT over its own columns.
+#[test]
+fn values_list_order_by_and_limit() {
+    let db = setup();
+    let err = assert_err_prefix(
+        &db,
+        "VALUES (1) ORDER BY 2",
+        "ORDER BY position 2 is not in select list",
+    );
+    assert!(
+        matches!(err, AnalyzeError::InvalidColumnReference(_)),
+        "{err:?}"
+    );
+    let s = db
+        .analyze("VALUES (1), (2) ORDER BY column1 + 1 LIMIT 1")
+        .unwrap();
+    assert_cols(&s, vec![c("column1", int4())]);
 }
 
 /// A bare name matching several output columns with different expressions
@@ -702,6 +725,31 @@ fn ambiguous_output_column_name_in_sort_and_group_clauses() {
         "column \"t.id\" must appear in the GROUP BY clause",
     );
     assert!(matches!(err, AnalyzeError::GroupingError(_)), "{err:?}");
+}
+
+/// transformLimitClause: WITH TIES needs a row count — a NULL constant is
+/// 2201W.
+#[test]
+fn fetch_with_ties_rejects_null_row_count() {
+    let db = setup();
+    for sql in [
+        "SELECT id FROM t ORDER BY id FETCH FIRST NULL ROW WITH TIES",
+        "SELECT * FROM t ORDER BY a FETCH FIRST (NULL) ROWS WITH TIES",
+        "SELECT 1 UNION SELECT 2 ORDER BY 1 FETCH FIRST NULL ROWS WITH TIES",
+        "VALUES (1) ORDER BY 1 FETCH FIRST NULL ROWS WITH TIES",
+    ] {
+        let err = assert_err_prefix(
+            &db,
+            sql,
+            "row count cannot be null in FETCH FIRST ... WITH TIES clause",
+        );
+        assert!(
+            matches!(err, AnalyzeError::InvalidRowCountInLimitClause(_)),
+            "{err:?}"
+        );
+    }
+    db.analyze("SELECT id FROM t ORDER BY id FETCH FIRST 1 ROW WITH TIES")
+        .unwrap();
 }
 
 /// get_sort_group_operators: a sort key needs its type's ordering operator

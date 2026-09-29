@@ -1298,6 +1298,18 @@ pub(crate) fn clause_name_ambiguous(
     )
 }
 
+/// `row count cannot be null in FETCH FIRST ... WITH TIES clause` —
+/// SQLSTATE 2201W (transformLimitClause).
+pub(crate) fn with_ties_null_row_count(span: Option<SourceSpan>) -> RawError {
+    RawError::new(
+        AnalyzeError::InvalidRowCountInLimitClause(
+            "row count cannot be null in FETCH FIRST ... WITH TIES clause".to_string(),
+        ),
+        span,
+        None,
+    )
+}
+
 /// `could not identify an ordering operator for type T` — SQLSTATE 42883:
 /// a sort key whose type has no default btree opclass
 /// (get_sort_group_operators). `hint` adds PG's errhint for sort clauses.
