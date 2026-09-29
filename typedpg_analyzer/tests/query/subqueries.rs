@@ -598,3 +598,23 @@ fn qualified_reference_stops_at_nearest_entry_of_that_name() {
         "column u.v does not exist"
     );
 }
+
+/// A FROM subquery can't see its own level's FROM items (without LATERAL),
+/// but it still sees the enclosing query levels as outer references.
+#[test]
+fn from_subquery_sees_enclosing_levels() {
+    let db = setup();
+    let s = db
+        .analyze("SELECT (SELECT x FROM (SELECT u.age AS x) q) FROM users u")
+        .unwrap();
+    assert_cols(&s, vec![cn("x", int4())]);
+    db.analyze(
+        "SELECT * FROM users u WHERE EXISTS \
+         (SELECT 1 FROM (SELECT p.id FROM posts p WHERE p.user_id = u.id) q)",
+    )
+    .unwrap();
+    db.analyze(
+        "SELECT * FROM users u, LATERAL (SELECT * FROM (SELECT u.name) i) q",
+    )
+    .unwrap();
+}

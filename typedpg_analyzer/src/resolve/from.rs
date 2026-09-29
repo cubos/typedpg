@@ -114,23 +114,30 @@ pub(crate) fn process_from_item(
                 // Lateral visibility is transitive: a LATERAL subquery nested
                 // inside another one still sees the outermost lateral refs,
                 // so pass the enclosing scope's own lateral tier along too.
-                let visible = scope.lateral_visible();
+                // The lateral tier this level received belongs to the
+                // enclosing level: a non-LATERAL subquery still reaches it
+                // as an outer reference, only this level's own items are
+                // off limits.
+                let mut enclosing = scope.enclosing_sources();
                 let (lateral_sources, mut shadowed_sources): (Vec<_>, Vec<_>) = if sub.lateral {
-                    (visible, Vec::new())
+                    (scope.lateral_visible(), Vec::new())
                 } else {
-                    (Vec::new(), visible)
+                    enclosing.splice(0..0, scope.lateral_sources.iter().cloned());
+                    (Vec::new(), scope.sources.clone())
                 };
                 // Entries this level already can't reference stay
                 // unreferencable below it: PG's errorMissingRTE finds them
                 // in any enclosing range table.
                 shadowed_sources.extend(scope.shadowed_sources.iter().cloned());
+                // Every FROM subquery still sees the enclosing query levels
+                // as outer references.
                 let (mut cols, _) = analyze_select_with_ctes_and_outer(
                     sel,
                     snapshot,
                     params,
                     cte_scopes,
                     &lateral_sources,
-                    &[],
+                    &enclosing,
                     &shadowed_sources,
                 )?;
                 resolve_unknown_outputs(sel, &mut cols, params);

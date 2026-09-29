@@ -541,6 +541,15 @@ impl Scope {
             .collect()
     }
 
+    /// The enclosing query levels' entries this level reaches as outer
+    /// references, minus the rule OLD / NEW pseudo-relations every
+    /// [`Scope::default`] already starts with — what a nested subquery
+    /// hands down as its correlated tier.
+    pub fn enclosing_sources(&self) -> Vec<TableSource> {
+        let pseudo = RULE_PSEUDO_RELATIONS.with(|r| r.borrow().len());
+        self.outer_sources.iter().skip(pseudo).cloned().collect()
+    }
+
     pub fn find_source(&self, alias: &str) -> Option<&TableSource> {
         self.sources
             .iter()
