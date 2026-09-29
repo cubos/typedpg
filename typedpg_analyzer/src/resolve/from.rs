@@ -208,6 +208,36 @@ pub(crate) fn process_from_item(
                 AnalyzeError::Unsupported("RangeTableSample without relation".into())
             })?;
             process_from_item(relation, scope, null_ctx, snapshot, cte_scopes, params)?;
+            // transformFromClauseItem: only a plain table, partitioned
+            // table or materialized view can be sampled (not a view,
+            // sequence, foreign table or WITH query).
+            let sampleable = match relation.node.as_ref() {
+                Some(node::Node::RangeVar(rv))
+                    if !(rv.schemaname.is_empty() && cte_scopes.contains_key(&rv.relname)) =>
+                {
+                    let schema = (!rv.schemaname.is_empty()).then_some(rv.schemaname.as_str());
+                    snapshot.resolve_table(schema, &rv.relname).is_some_and(|c| {
+                        matches!(
+                            c.relkind,
+                            crate::pg_catalog::RelKind::Table
+                                | crate::pg_catalog::RelKind::MaterializedView
+                                | crate::pg_catalog::RelKind::Partitioned
+                        )
+                    })
+                }
+                _ => false,
+            };
+            if !sampleable {
+                return Err(crate::error::RawError::new(
+                    AnalyzeError::FeatureNotSupported(
+                        "TABLESAMPLE clause can only be applied to tables and materialized views"
+                            .into(),
+                    ),
+                    None,
+                    None,
+                )
+                .finalize_implicit());
+            }
             process_tablesample(ts, scope, snapshot, params)?;
         }
         node::Node::JsonTable(jt) => {
@@ -1193,11 +1223,15 @@ fn process_tablesample(
             other => other.map(|_| ()),
         }
     };
+    // The arguments are EXPR_KIND_FROM_FUNCTION expressions: no aggregates
+    // or window functions.
     for (arg, &target) in ts.args.iter().zip(param_types) {
         coerce(arg, target, "TABLESAMPLE", params)?;
+        crate::clause::check_no_aggregates_or_windows(arg, snapshot, "functions in FROM")?;
     }
     if let Some(seed) = ts.repeatable.as_deref() {
         coerce(seed, oid::FLOAT8, "REPEATABLE", params)?;
+        crate::clause::check_no_aggregates_or_windows(seed, snapshot, "functions in FROM")?;
     }
     Ok(())
 }

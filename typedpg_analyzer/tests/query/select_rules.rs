@@ -509,6 +509,48 @@ fn tablesample_arguments_are_analyzed() {
     }
 }
 
+/// transformFromClauseItem samples only plain / partitioned tables and
+/// materialized views; the arguments are FROM-function expressions, where
+/// aggregates are refused.
+#[test]
+fn tablesample_targets_and_argument_kinds() {
+    let mut db = setup();
+    db.apply_sql(
+        "CREATE VIEW vt AS SELECT * FROM t;
+         CREATE SEQUENCE sq;
+         CREATE MATERIALIZED VIEW mv AS SELECT * FROM t;
+         CREATE TABLE pt (k int) PARTITION BY RANGE (k);",
+    )
+    .unwrap();
+    for sql in [
+        "SELECT * FROM vt TABLESAMPLE SYSTEM (1)",
+        "SELECT * FROM sq TABLESAMPLE SYSTEM (1)",
+        "WITH c AS (SELECT * FROM t) SELECT * FROM c TABLESAMPLE SYSTEM (1)",
+    ] {
+        let err = assert_err_prefix(
+            &db,
+            sql,
+            "TABLESAMPLE clause can only be applied to tables and materialized views",
+        );
+        assert!(
+            matches!(err, AnalyzeError::FeatureNotSupported(_)),
+            "{sql}: {err:?}"
+        );
+    }
+    for sql in [
+        "SELECT * FROM mv TABLESAMPLE SYSTEM (1)",
+        "SELECT * FROM pt TABLESAMPLE BERNOULLI (50)",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    let err = assert_err_prefix(
+        &db,
+        "SELECT * FROM t TABLESAMPLE SYSTEM (sum(1))",
+        "aggregate functions are not allowed in functions in FROM",
+    );
+    assert!(matches!(err, AnalyzeError::GroupingError(_)), "{err:?}");
+}
+
 // ── Ordinals over a star-expanded select list ────────────────────────────────
 
 /// `findTargetlistEntrySQL92` counts the *expanded* target list: every
