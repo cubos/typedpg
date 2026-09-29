@@ -584,3 +584,152 @@ fn rewrite_target_view(
     };
     Ok(Some((base, base_rw)))
 }
+
+/// A product query's `querySource`, as `fireRules` stamps it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QuerySource {
+    Original,
+    InsteadRule,
+    QualInsteadRule,
+    NonInsteadRule,
+}
+
+/// What `RewriteQuery` turns a statement of `event` on `relid` into: its
+/// queries' commands and sources — the fired rules' actions (each
+/// rewritten in turn), the statement rewritten onto an automatically
+/// updatable view's base relation, and the statement itself unless an
+/// unconditional INSTEAD rule replaced it (first for INSERT, last
+/// otherwise).
+fn rewritten_queries(
+    snapshot: &PgCatalog,
+    relid: crate::oid::PgClassOid,
+    cmd: CmdType,
+    source: QuerySource,
+    events: &mut Vec<(crate::oid::PgClassOid, CmdType)>,
+) -> Vec<(CmdType, QuerySource)> {
+    let event = match cmd {
+        CmdType::CmdInsert => Some(DmlEvent::Insert),
+        CmdType::CmdUpdate => Some(DmlEvent::Update),
+        CmdType::CmdDelete => Some(DmlEvent::Delete),
+        _ => None,
+    };
+    let Some(event) = event else {
+        return vec![(cmd, source)];
+    };
+    // A recursion the real rewrite reports as an error of its own.
+    if events.contains(&(relid, cmd)) {
+        return vec![(cmd, source)];
+    }
+    events.push((relid, cmd));
+    // matchLocks, in the relation's rule order (by name).
+    let mut matching: Vec<&crate::ddl::rules::Rule> = snapshot
+        .rules
+        .get(&relid)
+        .map(|rs| {
+            rs.iter()
+                .filter(|r| r.enabled && r.event == cmd)
+                .collect()
+        })
+        .unwrap_or_default();
+    matching.sort_by(|a, b| a.name.cmp(&b.name));
+    let instead = matching.iter().any(|r| r.instead && !r.conditional);
+    let qual_product = matching.iter().any(|r| r.instead && r.conditional);
+
+    let mut out: Vec<(CmdType, QuerySource)> = Vec::new();
+    for rule in &matching {
+        let qsrc = match (rule.instead, rule.conditional) {
+            (true, true) => QuerySource::QualInsteadRule,
+            (true, false) => QuerySource::InsteadRule,
+            (false, _) => QuerySource::NonInsteadRule,
+        };
+        let mut dml = rule.actions.iter();
+        for &action_cmd in &rule.action_cmds {
+            match action_cmd {
+                CmdType::CmdInsert | CmdType::CmdUpdate | CmdType::CmdDelete => {
+                    match dml.next() {
+                        Some((target, _)) => out.extend(rewritten_queries(
+                            snapshot, *target, action_cmd, qsrc, events,
+                        )),
+                        None => out.push((action_cmd, qsrc)),
+                    }
+                }
+                other => out.push((other, qsrc)),
+            }
+        }
+    }
+    let mut replaced = instead;
+    let is_view = snapshot
+        .pg_class
+        .get(&relid)
+        .is_some_and(|c| c.relkind == RelKind::View);
+    if !instead
+        && !qual_product
+        && is_view
+        && !view_has_instead_trigger(snapshot, relid, Some(event), &[])
+        && let Some(base) = snapshot
+            .view_updatability
+            .get(&relid)
+            .and_then(|u| u.base)
+    {
+        let base_queries = rewritten_queries(snapshot, base, cmd, source, events);
+        if event == DmlEvent::Insert {
+            out.extend(base_queries);
+        } else {
+            out.splice(0..0, base_queries);
+        }
+        replaced = true;
+    }
+    if !replaced {
+        if event == DmlEvent::Insert {
+            out.insert(0, (cmd, source));
+        } else {
+            out.push((cmd, source));
+        }
+    }
+    events.pop();
+    out
+}
+
+/// `RewriteQuery`'s treatment of a data-modifying WITH query: it must come
+/// out of the rewriter as exactly one query, so only unconditional,
+/// single-statement DO INSTEAD rules (or none) are supported on its target
+/// (0A000 otherwise).
+pub(crate) fn check_with_query_rules(
+    snapshot: &PgCatalog,
+    relid: crate::oid::PgClassOid,
+    cmd: CmdType,
+) -> Result<(), AnalyzeError> {
+    let queries = rewritten_queries(snapshot, relid, cmd, QuerySource::Original, &mut Vec::new());
+    let unsupported = |what: &str| {
+        crate::error::RawError::new(
+            AnalyzeError::FeatureNotSupported(format!(
+                "{what} rules are not supported for data-modifying statements in WITH"
+            )),
+            None,
+            None,
+        )
+        .finalize_implicit()
+    };
+    match queries.as_slice() {
+        [(q, _)]
+            if matches!(
+                q,
+                CmdType::CmdSelect | CmdType::CmdInsert | CmdType::CmdUpdate | CmdType::CmdDelete
+            ) =>
+        {
+            Ok(())
+        }
+        [_] => Err(unsupported("DO INSTEAD NOTIFY")),
+        [] => Err(unsupported("DO INSTEAD NOTHING")),
+        many => {
+            for (_, src) in many {
+                match src {
+                    QuerySource::QualInsteadRule => return Err(unsupported("conditional DO INSTEAD")),
+                    QuerySource::NonInsteadRule => return Err(unsupported("DO ALSO")),
+                    _ => {}
+                }
+            }
+            Err(unsupported("multi-statement DO INSTEAD"))
+        }
+    }
+}

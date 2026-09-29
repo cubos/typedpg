@@ -37,6 +37,9 @@ pub(crate) struct Rule {
     /// The INSERT / UPDATE / DELETE actions, as the rewriter rewrites them
     /// when the rule fires.
     pub(crate) actions: Vec<crate::resolve::rewrite::RuleAction>,
+    /// The command of every action, in order (`CmdUtility` for NOTIFY):
+    /// the product queries firing the rule adds.
+    pub(crate) action_cmds: Vec<CmdType>,
 }
 
 pub fn create_rule(interp: &mut PgCatalog, stmt: &RuleStmt) -> Result<(), DdlError> {
@@ -155,6 +158,17 @@ pub fn create_rule(interp: &mut PgCatalog, stmt: &RuleStmt) -> Result<(), DdlErr
         enabled: true,
         has_actions: !stmt.actions.is_empty(),
         actions,
+        action_cmds: stmt
+            .actions
+            .iter()
+            .map(|a| match a.node.as_ref() {
+                Some(node::Node::SelectStmt(_)) => CmdType::CmdSelect,
+                Some(node::Node::InsertStmt(_)) => CmdType::CmdInsert,
+                Some(node::Node::UpdateStmt(_)) => CmdType::CmdUpdate,
+                Some(node::Node::DeleteStmt(_)) => CmdType::CmdDelete,
+                _ => CmdType::CmdUtility,
+            })
+            .collect(),
     };
     let rules = interp.rules.entry(relid).or_default();
     if let Some(existing) = rules.iter_mut().find(|r| r.name == stmt.rulename) {

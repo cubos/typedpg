@@ -181,6 +181,22 @@ pub(crate) fn analyze_cte(
                 }
                 _ => unreachable!("matched above"),
             };
+            // RewriteQuery first rewrites a data-modifying WITH query, which
+            // must come out as a single query.
+            let target = match cte_query {
+                node::Node::InsertStmt(s) => s.relation.as_ref().map(|r| (r, CmdType::CmdInsert)),
+                node::Node::UpdateStmt(s) => s.relation.as_ref().map(|r| (r, CmdType::CmdUpdate)),
+                node::Node::DeleteStmt(s) => s.relation.as_ref().map(|r| (r, CmdType::CmdDelete)),
+                _ => None,
+            };
+            if let Some((rv, cmd)) = target
+                && let Some(class) = snapshot.resolve_table(
+                    (!rv.schemaname.is_empty()).then_some(rv.schemaname.as_str()),
+                    &rv.relname,
+                )
+            {
+                check_with_query_rules(snapshot, class.oid, cmd)?;
+            }
             // analyzeCTETargetList names a data-modifying CTE's RETURNING
             // columns through the alias list too.
             let cols = apply_cte_column_aliases(&cte.ctename, cols, &cte.aliascolnames)?;

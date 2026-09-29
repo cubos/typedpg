@@ -549,3 +549,72 @@ fn statements_the_executor_always_refuses_are_rejected() {
         );
     }
 }
+
+/// RewriteQuery rewrites a data-modifying WITH query first and needs
+/// exactly one query back: DO ALSO, DO INSTEAD NOTHING, conditional and
+/// multi-statement DO INSTEAD rules are refused there (0A000), while an
+/// unconditional single-action DO INSTEAD rule or a plain table is fine.
+#[test]
+fn data_modifying_with_on_relations_with_rules() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE t (id int PRIMARY KEY, v int NOT NULL);
+         CREATE TABLE s (id int PRIMARY KEY, v int NOT NULL);
+         CREATE TABLE tr (id int, v int);
+         CREATE RULE tr_also AS ON INSERT TO tr DO ALSO INSERT INTO s VALUES (NEW.id, NEW.v);
+         CREATE TABLE tr2 (id int, v int);
+         CREATE RULE tr2_inst AS ON UPDATE TO tr2 DO INSTEAD NOTHING;
+         CREATE TABLE trc (id int, v int);
+         CREATE RULE trc_c AS ON INSERT TO trc WHERE NEW.v > 0 DO INSTEAD INSERT INTO s VALUES (NEW.id, NEW.v);
+         CREATE TABLE tm (id int, v int);
+         CREATE RULE tm_m AS ON DELETE TO tm DO INSTEAD (DELETE FROM s WHERE s.id = OLD.id; DELETE FROM t WHERE t.id = OLD.id);
+         CREATE TABLE ti (id int, v int);
+         CREATE RULE ti_i AS ON INSERT TO ti DO INSTEAD INSERT INTO s VALUES (NEW.id, NEW.v) RETURNING s.*;
+         CREATE TABLE tn (id int, v int);
+         CREATE RULE tn_n AS ON INSERT TO tn DO INSTEAD NOTIFY chan;
+         CREATE TABLE tc (id int, v int);
+         CREATE RULE tc_c AS ON INSERT TO tc DO INSTEAD INSERT INTO tr VALUES (NEW.id, NEW.v);",
+    )
+    .unwrap();
+    for (sql, msg) in [
+        (
+            "WITH q AS (INSERT INTO tr VALUES (1, 1) RETURNING *) SELECT * FROM q",
+            "DO ALSO rules are not supported for data-modifying statements in WITH",
+        ),
+        (
+            "WITH q AS (UPDATE tr2 SET v = 1) SELECT 1",
+            "DO INSTEAD NOTHING rules are not supported for data-modifying statements in WITH",
+        ),
+        (
+            "WITH q AS (INSERT INTO trc VALUES (1, 1)) SELECT 1",
+            "conditional DO INSTEAD rules are not supported for data-modifying statements in WITH",
+        ),
+        (
+            "WITH q AS (DELETE FROM tm) SELECT 1",
+            "multi-statement DO INSTEAD rules are not supported for data-modifying statements \
+             in WITH",
+        ),
+        (
+            "WITH q AS (INSERT INTO tn VALUES (1, 1)) SELECT 1",
+            "DO INSTEAD NOTIFY rules are not supported for data-modifying statements in WITH",
+        ),
+        // The single INSTEAD action lands on a table with a DO ALSO rule.
+        (
+            "WITH q AS (INSERT INTO tc VALUES (1, 1)) SELECT 1",
+            "DO ALSO rules are not supported for data-modifying statements in WITH",
+        ),
+    ] {
+        let err = assert_prefix(&db, sql, msg);
+        assert!(
+            matches!(err, AnalyzeError::FeatureNotSupported(_)),
+            "{sql}: {err:?}"
+        );
+    }
+    assert_ok(
+        &db,
+        "WITH q AS (INSERT INTO ti VALUES (1, 1) RETURNING *) SELECT * FROM q",
+    );
+    assert_ok(&db, "WITH q AS (DELETE FROM tr RETURNING id) SELECT * FROM q");
+    // The statement itself (not in WITH) may fire them.
+    assert_ok(&db, "INSERT INTO tr VALUES (1, 1)");
+}
