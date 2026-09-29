@@ -238,7 +238,9 @@ pub(crate) fn analyze_static(
         .ok_or_else(|| AnalyzeError::Parse("empty statement".into()))?;
 
     let can_run_as_subquery = can_run_as_subquery(stmt);
-    let (raw_columns, raw_params) = analyze_raw_node(snapshot, stmt, param_nullability)?;
+    let (raw_columns, raw_params) = expr::with_plan_time_checks(|| {
+        analyze_raw_node(snapshot, stmt, param_nullability)
+    })?;
 
     let columns = raw_columns
         .into_iter()

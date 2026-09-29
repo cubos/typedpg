@@ -1156,6 +1156,27 @@ pub(crate) fn inconsistent_param_error(
     .finalize_implicit()
 }
 
+thread_local! {
+    static PLAN_TIME_CHECKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` analyzing a statement that will be *planned and executed* (an
+/// application query), as opposed to DDL that only stores an expression
+/// (a view, a default, a function body): the checks for errors the
+/// planner raises on every execution — constant folding, selectivity
+/// estimation — apply only here.
+pub(crate) fn with_plan_time_checks<R>(f: impl FnOnce() -> R) -> R {
+    let prev = PLAN_TIME_CHECKS.with(|c| c.replace(true));
+    let out = f();
+    PLAN_TIME_CHECKS.with(|c| c.set(prev));
+    out
+}
+
+/// Whether [`with_plan_time_checks`] is in effect.
+pub(crate) fn plan_time_checks() -> bool {
+    PLAN_TIME_CHECKS.with(std::cell::Cell::get)
+}
+
 /// PG's `transformExpressionList` for a `ROW(...)` constructor's arguments:
 /// a `rel.*` column reference expands to one reference per column of `rel`
 /// (`ExpandColumnRefStar`) and a `(expr).*` indirection to one field
@@ -1396,6 +1417,7 @@ use indirection::*;
 pub(crate) use indirection::{expand_indirection_star, transform_container_subscripts};
 use json::*;
 use literals::*;
+pub(crate) use operators::check_regex_restrictions;
 use operators::*;
 use sublink::*;
 use xml::*;

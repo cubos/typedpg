@@ -540,3 +540,48 @@ fn aggregate_in_limit_and_offset_rejected() {
         "got: {err}"
     );
 }
+
+/// PostgreSQL compiles a constant regex pattern while *planning*: a match of
+/// two constants is folded (eval_const_expressions) and a WHERE / JOIN ON
+/// qual `expr ~ 'pattern'` over one relation has its selectivity estimated
+/// from the pattern (patternsel). An invalid pattern there fails every
+/// execution, while elsewhere it only fails per evaluated row, and DDL
+/// that merely stores the expression is accepted.
+#[test]
+fn constant_regex_patterns_compiled_by_the_planner_are_validated() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE rt (id INT PRIMARY KEY, s TEXT NOT NULL, n NAME);
+         CREATE TABLE rt2 (id INT PRIMARY KEY, s TEXT);
+         CREATE VIEW rv AS SELECT id FROM rt WHERE s ~ '(';",
+    )
+    .unwrap();
+    for sql in [
+        "SELECT 'a' ~ '(' AS m",
+        "SELECT 'a' ~* ('(' || '') AS m",
+        "SELECT 'a' SIMILAR TO '(' AS m",
+        "SELECT id FROM rt WHERE s ~ '('",
+        "SELECT id FROM rt WHERE NOT (s !~ '[z-a]') OR id = 1",
+        "SELECT id FROM rt WHERE lower(s) ~* '('",
+        "SELECT id FROM rt WHERE n ~ '('",
+        "SELECT id FROM rt WHERE s SIMILAR TO '('",
+        "SELECT rt.id FROM rt JOIN rt2 ON rt2.s ~ '(' AND rt2.id = rt.id",
+        "DELETE FROM rt WHERE s ~ '('",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::Invalid(_),
+            "invalid regular expression:"
+        );
+    }
+    for sql in [
+        "SELECT s ~ '(' AS m FROM rt",
+        "SELECT id FROM rt WHERE '(' ~ s",
+        "SELECT rt.id FROM rt JOIN rt2 ON rt.s || rt2.s ~ '('",
+        "SELECT id FROM rt WHERE s ~ '(?q)('",
+        "SELECT id FROM rt WHERE s SIMILAR TO '\\('",
+        "SELECT id FROM rv",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}

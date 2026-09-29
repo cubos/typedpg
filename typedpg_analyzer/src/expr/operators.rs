@@ -795,6 +795,17 @@ fn infer_generic_binary_op(
                 op.result_type_oid,
                 snapshot,
             )?;
+            // A regex match of two constants is folded by the planner
+            // (eval_const_expressions), compiling the pattern on every
+            // execution.
+            if plan_time_checks()
+                && let Some(icase) = regex_operator_icase(snapshot, op.code)
+                && let (Some(l), Some(r)) = (expr.lexpr.as_deref(), expr.rexpr.as_deref())
+                && const_string(l, snapshot).is_some()
+                && let Some(pattern) = const_regex_pattern(r, snapshot)
+            {
+                check_regex_pattern(pattern, icase)?;
+            }
             // The operator is a call of its function: `box # box`
             // (box_intersect) is NULL for disjoint boxes, `jsonb @? jsonpath`
             // (jsonb_path_exists_opr) when the path evaluation fails.
@@ -844,4 +855,286 @@ fn infer_generic_binary_op(
         None => crate::pgmsg::prefix_operator_does_not_exist(op_name, &right_pg, span),
     };
     Err(err.finalize_implicit())
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Regex patterns the planner compiles
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// `Some(icase)` when `code` is one of the POSIX regex match functions
+/// behind `~`, `~*`, `!~`, `!~*` (and SIMILAR TO): `textregexeq`,
+/// `nameicregexne`, …
+fn regex_operator_icase(snapshot: &PgCatalog, code: Option<crate::oid::PgProcOid>) -> Option<bool> {
+    let f = code.and_then(|c| snapshot.pg_proc.get(&c))?;
+    if Some(f.pronamespace) != snapshot.pg_catalog_oid() {
+        return None;
+    }
+    let base = ["text", "bpchar", "name"]
+        .iter()
+        .find_map(|p| f.proname.strip_prefix(p))?;
+    match base {
+        "regexeq" | "regexne" => Some(false),
+        "icregexeq" | "icregexne" => Some(true),
+        _ => None,
+    }
+}
+
+/// The value of a string constant as the planner folds it: an untyped or
+/// string-typed literal, possibly cast between string types or
+/// concatenated with `||`. `None` for anything else.
+fn const_string(node: &protobuf::Node, snapshot: &PgCatalog) -> Option<String> {
+    match node.node.as_ref()? {
+        node::Node::AConst(ac) if !ac.isnull => match &ac.val {
+            Some(a_const::Val::Sval(sv)) => Some(sv.sval.clone()),
+            _ => None,
+        },
+        node::Node::TypeCast(c) => {
+            let tn = c.type_name.as_ref()?;
+            if !tn.typmods.is_empty() || !tn.array_bounds.is_empty() {
+                return None;
+            }
+            let names = extract_string_fields(&tn.names);
+            let name = names.last()?;
+            let t = snapshot.resolve_type_by_name(
+                (names.len() == 2).then(|| names[0].as_str()),
+                name,
+            )?;
+            (t.typcategory == TypCategory::String).then_some(())?;
+            const_string(c.arg.as_deref()?, snapshot)
+        }
+        node::Node::AExpr(e)
+            if protobuf::AExprKind::try_from(e.kind) == Ok(protobuf::AExprKind::AexprOp)
+                && extract_string_fields(&e.name) == ["||"] =>
+        {
+            let l = const_string(e.lexpr.as_deref()?, snapshot)?;
+            let r = const_string(e.rexpr.as_deref()?, snapshot)?;
+            Some(l + &r)
+        }
+        _ => None,
+    }
+}
+
+/// The regex a constant pattern operand folds to: a constant string, or
+/// SIMILAR TO's `similar_to_escape(pattern [, escape])` over constants
+/// (its own errors are plan-time errors too, hence the inner `Result`).
+fn const_regex_pattern(
+    node: &protobuf::Node,
+    snapshot: &PgCatalog,
+) -> Option<Result<String, AnalyzeError>> {
+    if let Some(node::Node::FuncCall(fc)) = node.node.as_ref()
+        && extract_string_fields(&fc.funcname).last().map(String::as_str)
+            == Some("similar_to_escape")
+    {
+        let pattern = const_string(fc.args.first()?, snapshot)?;
+        let escape = match fc.args.get(1) {
+            Some(e) => Some(const_string(e, snapshot)?),
+            None => None,
+        };
+        return Some(similar_escape(&pattern, escape.as_deref()));
+    }
+    const_string(node, snapshot).map(Ok)
+}
+
+fn check_regex_pattern(
+    pattern: Result<String, AnalyzeError>,
+    icase: bool,
+) -> Result<(), AnalyzeError> {
+    use crate::regex_input::{REG_ADVANCED, REG_ICASE};
+    let cflags = if icase { REG_ADVANCED | REG_ICASE } else { REG_ADVANCED };
+    crate::regex_input::check(&pattern?, cflags).map_err(|msg| {
+        crate::error::RawError::invalid(msg, None, None).finalize_implicit()
+    })
+}
+
+/// PG's `similar_escape_internal` (regexp.c): the POSIX regex a SIMILAR TO
+/// pattern is matched as. `escape` is `None` for the default backslash,
+/// `Some("")` for no escape character.
+fn similar_escape(pattern: &str, escape: Option<&str>) -> Result<String, AnalyzeError> {
+    let e: Option<char> = match escape {
+        None => Some('\\'),
+        Some("") => None,
+        Some(esc) => {
+            let mut chars = esc.chars();
+            let c = chars.next();
+            if chars.next().is_some() {
+                return Err(crate::error::RawError::invalid(
+                    "invalid escape string".to_owned(),
+                    None,
+                    Some("Escape string must be empty or one character.".to_owned()),
+                )
+                .finalize_implicit());
+            }
+            c
+        }
+    };
+    let mut r = String::from("^(?:");
+    let mut afterescape = false;
+    let mut nquotes = 0;
+    let mut bracket_depth = 0;
+    let mut charclass_pos = 0;
+    for pchar in pattern.chars() {
+        if afterescape {
+            if pchar == '"' && bracket_depth < 1 {
+                match nquotes {
+                    0 => r.push_str("){1,1}?("),
+                    1 => r.push_str("){1,1}(?:"),
+                    _ => {
+                        return Err(crate::error::RawError::invalid(
+                            "SQL regular expression may not contain more than two \
+                             escape-double-quote separators"
+                                .to_owned(),
+                            None,
+                            None,
+                        )
+                        .finalize_implicit());
+                    }
+                }
+                nquotes += 1;
+            } else {
+                r.push('\\');
+                r.push(pchar);
+                charclass_pos = 3;
+            }
+            afterescape = false;
+        } else if e == Some(pchar) {
+            afterescape = true;
+        } else if bracket_depth > 0 {
+            if pchar == '\\' {
+                r.push('\\');
+            }
+            r.push(pchar);
+            if pchar == ']' && charclass_pos > 2 {
+                bracket_depth -= 1;
+            } else if pchar == '[' {
+                bracket_depth += 1;
+                charclass_pos = 3;
+            } else if pchar == '^' {
+                charclass_pos += 1;
+            } else {
+                charclass_pos = 3;
+            }
+        } else if pchar == '[' {
+            r.push(pchar);
+            bracket_depth = 1;
+            charclass_pos = 1;
+        } else if pchar == '%' {
+            r.push_str(".*");
+        } else if pchar == '_' {
+            r.push('.');
+        } else if pchar == '(' {
+            r.push_str("(?:");
+        } else if matches!(pchar, '\\' | '.' | '^' | '$') {
+            r.push('\\');
+            r.push(pchar);
+        } else {
+            r.push(pchar);
+        }
+    }
+    r.push_str(")$");
+    Ok(r)
+}
+
+/// The planner's selectivity estimate for a WHERE / JOIN ON qual
+/// `expr ~ 'pattern'` (`patternsel` → `regex_fixed_prefix`) compiles the
+/// constant pattern whenever the other side is a restriction variable — an
+/// expression over one relation's columns — so an invalid pattern fails
+/// every execution, however many rows the relation has. Walks the qual's
+/// AND / OR / NOT tree, the part `clauselist_selectivity` estimates.
+pub(crate) fn check_regex_restrictions(
+    node: &protobuf::Node,
+    ctx: Ctx<'_>,
+) -> Result<(), AnalyzeError> {
+    if !plan_time_checks() {
+        return Ok(());
+    }
+    match node.node.as_ref() {
+        Some(node::Node::BoolExpr(b)) => {
+            for a in &b.args {
+                check_regex_restrictions(a, ctx)?;
+            }
+            Ok(())
+        }
+        Some(node::Node::AExpr(e)) => {
+            let kind = protobuf::AExprKind::try_from(e.kind);
+            let op = extract_string_fields(&e.name);
+            let icase = match (kind, op.as_slice()) {
+                (Ok(protobuf::AExprKind::AexprOp), [o]) if o == "~" || o == "!~" => false,
+                (Ok(protobuf::AExprKind::AexprOp), [o]) if o == "~*" || o == "!~*" => true,
+                (Ok(protobuf::AExprKind::AexprSimilar), _) => false,
+                _ => return Ok(()),
+            };
+            let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) else {
+                return Ok(());
+            };
+            let Some(pattern) = const_regex_pattern(r, ctx.snapshot) else {
+                return Ok(());
+            };
+            if !is_restriction_variable(l, ctx) {
+                return Ok(());
+            }
+            // Only the string types' regex operators (not, e.g., ltree's `~`).
+            let mut scratch = ParamCollector::default();
+            let Ok(t) = infer_expr(l, ctx, &mut scratch, TypeGoal::NONE) else {
+                return Ok(());
+            };
+            let base = ctx.snapshot.unwrap_domain(t.type_oid);
+            if !(base == oid::NAME
+                || coerce::type_category(base, ctx.snapshot) == Some(TypCategory::String))
+            {
+                return Ok(());
+            }
+            check_regex_pattern(pattern, icase)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// `get_restriction_variable`'s test: the expression references columns
+/// of exactly one relation of this query level (and nothing we can't
+/// classify).
+fn is_restriction_variable(node: &protobuf::Node, ctx: Ctx<'_>) -> bool {
+    fn walk(n: &protobuf::Node, ctx: Ctx<'_>, rel: &mut Option<String>) -> bool {
+        match n.node.as_ref() {
+            Some(node::Node::ColumnRef(cr)) => {
+                let parts = extract_string_fields(&cr.fields);
+                let (table, column) = match parts.as_slice() {
+                    [c] if parts.len() == cr.fields.len() => (None, c.as_str()),
+                    [t, c] if parts.len() == cr.fields.len() => (Some(t.as_str()), c.as_str()),
+                    _ => return false,
+                };
+                let Ok(col) = ctx.scope.resolve_column(table, column, None) else {
+                    return false;
+                };
+                if !ctx.scope.sources.iter().any(|s| s.alias == col.table_alias) {
+                    return false;
+                }
+                match rel {
+                    Some(r) if *r != col.table_alias => false,
+                    _ => {
+                        *rel = Some(col.table_alias.clone());
+                        true
+                    }
+                }
+            }
+            Some(node::Node::AConst(_)) => true,
+            Some(node::Node::TypeCast(c)) => c.arg.as_deref().is_some_and(|a| walk(a, ctx, rel)),
+            Some(node::Node::CollateClause(c)) => {
+                c.arg.as_deref().is_some_and(|a| walk(a, ctx, rel))
+            }
+            Some(node::Node::FuncCall(f)) => {
+                f.agg_order.is_empty()
+                    && f.agg_filter.is_none()
+                    && f.over.is_none()
+                    && f.args.iter().all(|a| walk(a, ctx, rel))
+            }
+            Some(node::Node::AExpr(e)) => {
+                protobuf::AExprKind::try_from(e.kind) == Ok(protobuf::AExprKind::AexprOp)
+                    && e.lexpr.as_deref().is_none_or(|a| walk(a, ctx, rel))
+                    && e.rexpr.as_deref().is_none_or(|a| walk(a, ctx, rel))
+            }
+            _ => false,
+        }
+    }
+    let mut rel = None;
+    walk(node, ctx, &mut rel) && rel.is_some()
 }

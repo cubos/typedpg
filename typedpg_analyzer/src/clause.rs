@@ -114,6 +114,9 @@ pub(crate) fn coerce_clause_expr(
             if let Some(c) = kind.aggregate_context() {
                 check_no_aggregates_or_windows(node, ctx.snapshot, c)?;
             }
+            if matches!(kind, ClauseKind::Where | ClauseKind::JoinOn) {
+                expr::check_regex_restrictions(node, ctx)?;
+            }
             return Ok(t);
         }
         Err(e) => e,
