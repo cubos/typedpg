@@ -108,6 +108,32 @@ fn parses_plpgsql_bodies() {
 }
 
 #[test]
+fn plpgsql_functions_without_a_string_body_are_errors_not_aborts() {
+    // Each of these used to fail a C assert in libpg_query and abort.
+    for (sql, message) in [
+        (
+            "CREATE FUNCTION f(a int) RETURNS int LANGUAGE plpgsql RETURN a + 1",
+            "inline SQL function body only valid for language SQL",
+        ),
+        (
+            "CREATE PROCEDURE p() LANGUAGE plpgsql BEGIN ATOMIC SELECT 1; END",
+            "inline SQL function body only valid for language SQL",
+        ),
+        (
+            "CREATE FUNCTION f() RETURNS int LANGUAGE plpgsql",
+            "no function body specified",
+        ),
+    ] {
+        match typedpg_pg_query::parse_plpgsql(sql) {
+            Err(typedpg_pg_query::Error::Parse(msg)) => assert_eq!(msg, message, "{sql}"),
+            other => panic!("{sql}: {other:?}"),
+        }
+    }
+    // Without LANGUAGE an inline body is SQL: nothing to compile.
+    assert!(typedpg_pg_query::parse_plpgsql("CREATE FUNCTION f() RETURNS int RETURN 1").is_ok());
+}
+
+#[test]
 fn plpgsql_trigger_functions_dump_valid_json() {
     // TG_* variables are promise datums; `RETURN NEW` is a retvarno.
     let json = typedpg_pg_query::parse_plpgsql(
