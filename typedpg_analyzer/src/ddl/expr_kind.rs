@@ -26,6 +26,8 @@ pub(crate) enum ExprKind {
     PartitionBound,
     /// EXPR_KIND_PARTITION_EXPRESSION.
     PartitionExpression,
+    /// EXPR_KIND_TRIGGER_WHEN.
+    TriggerWhen,
 }
 
 impl ExprKind {
@@ -40,6 +42,7 @@ impl ExprKind {
             ExprKind::Policy => "policy expressions",
             ExprKind::PartitionBound => "partition bound",
             ExprKind::PartitionExpression => "partition key expressions",
+            ExprKind::TriggerWhen => "trigger WHEN conditions",
         }
     }
 
@@ -54,6 +57,7 @@ impl ExprKind {
             ExprKind::Policy => None,
             ExprKind::PartitionBound => Some("partition bound"),
             ExprKind::PartitionExpression => Some("partition key expression"),
+            ExprKind::TriggerWhen => Some("trigger WHEN condition"),
         }
     }
 }

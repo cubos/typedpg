@@ -95,3 +95,84 @@ fn alter_trigger_rename_is_tracked() {
         assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
     }
 }
+
+#[test]
+fn trigger_when_conditions_reference_only_the_available_row_values() {
+    // CreateTriggerFiringOn (PG 18): the WHEN condition is a boolean over
+    // OLD / NEW, restricted by the trigger's level, events and timing.
+    let setup = "CREATE TABLE g (a int, b int GENERATED ALWAYS AS (a) VIRTUAL,
+                   c int GENERATED ALWAYS AS (a) STORED);
+                 CREATE TABLE p (a int, b int);
+                 CREATE FUNCTION tf() RETURNS trigger LANGUAGE plpgsql AS 'begin return new; end';";
+    let generated = "BEFORE trigger's WHEN condition cannot reference NEW generated columns";
+    for (stmt, msg) in [
+        (
+            "BEFORE INSERT ON g FOR EACH ROW WHEN (new.b > 0)",
+            generated,
+        ),
+        (
+            "BEFORE INSERT ON g FOR EACH ROW WHEN (new.c > 0)",
+            generated,
+        ),
+        (
+            "BEFORE INSERT ON g FOR EACH ROW WHEN (new.* IS NOT NULL)",
+            generated,
+        ),
+        (
+            "BEFORE INSERT ON g FOR EACH ROW WHEN (new IS NOT NULL)",
+            generated,
+        ),
+        (
+            "BEFORE INSERT ON p FOR EACH ROW WHEN (old.a > 0)",
+            "INSERT trigger's WHEN condition cannot reference OLD values",
+        ),
+        (
+            "BEFORE DELETE ON p FOR EACH ROW WHEN (new.a > 0)",
+            "DELETE trigger's WHEN condition cannot reference NEW values",
+        ),
+        (
+            "BEFORE INSERT ON p FOR EACH STATEMENT WHEN (new.a > 0)",
+            "statement trigger's WHEN condition cannot reference column values",
+        ),
+        (
+            "BEFORE INSERT ON p FOR EACH ROW WHEN (new.xmin::text = '1')",
+            "BEFORE trigger's WHEN condition cannot reference NEW system columns",
+        ),
+        (
+            "BEFORE INSERT ON p FOR EACH ROW WHEN (a > 0)",
+            "column reference \"a\" is ambiguous",
+        ),
+        (
+            "BEFORE INSERT ON p FOR EACH ROW WHEN (new.a)",
+            "argument of WHEN must be type boolean, not type integer",
+        ),
+        (
+            "BEFORE INSERT ON p FOR EACH ROW WHEN ((SELECT true))",
+            "cannot use subquery in trigger WHEN condition",
+        ),
+        (
+            "BEFORE INSERT ON p FOR EACH ROW WHEN (count(*) > 0)",
+            "aggregate functions are not allowed in trigger WHEN conditions",
+        ),
+        (
+            "BEFORE INSERT ON p FOR EACH ROW WHEN (generate_series(1, 2) > 0)",
+            "set-returning functions are not allowed in trigger WHEN conditions",
+        ),
+    ] {
+        let stmt = format!("CREATE TRIGGER tr {stmt} EXECUTE FUNCTION tf();");
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", &stmt)]).expect_err(&stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "CREATE TRIGGER t1 AFTER INSERT ON g FOR EACH ROW WHEN (new.b > 0) EXECUTE FUNCTION tf();
+             CREATE TRIGGER t2 BEFORE UPDATE ON g FOR EACH ROW WHEN (old.b > 0) EXECUTE FUNCTION tf();
+             CREATE TRIGGER t3 AFTER INSERT ON p FOR EACH ROW WHEN (new.xmin::text = '1') EXECUTE FUNCTION tf();
+             CREATE TRIGGER t4 BEFORE UPDATE ON p FOR EACH ROW WHEN (old.a IS DISTINCT FROM new.a) EXECUTE FUNCTION tf();
+             CREATE TRIGGER t5 BEFORE INSERT ON p FOR EACH ROW WHEN (new IS NOT NULL) EXECUTE FUNCTION tf();
+             CREATE TRIGGER t6 AFTER UPDATE ON p FOR EACH STATEMENT WHEN (true) EXECUTE FUNCTION tf();",
+        ),
+    ]);
+}

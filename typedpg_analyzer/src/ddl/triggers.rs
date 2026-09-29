@@ -15,8 +15,147 @@ pub(crate) struct Trigger {
     pub(crate) function: PgProcOid,
 }
 
-/// `TRIGGER_TYPE_INSTEAD` (trigger.h).
+/// `TRIGGER_TYPE_*` bits (trigger.h).
+const TRIGGER_TYPE_BEFORE: i32 = 1 << 1;
+const TRIGGER_TYPE_INSERT: i32 = 1 << 2;
+const TRIGGER_TYPE_DELETE: i32 = 1 << 3;
 const TRIGGER_TYPE_INSTEAD: i32 = 1 << 6;
+
+/// CreateTriggerFiringOn: the WHEN condition is transformed as a boolean
+/// WHERE clause (EXPR_KIND_TRIGGER_WHEN) over the relation as `old` and
+/// `new`, and may only reference the row values the trigger has — none
+/// for a statement trigger, no OLD for INSERT, no NEW for DELETE, and for a
+/// BEFORE trigger no NEW system column nor generated column (their values
+/// don't exist yet).
+fn check_when_clause(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+    stmt: &CreateTrigStmt,
+    when: &typedpg_pg_query::protobuf::Node,
+) -> Result<(), DdlError> {
+    use crate::expr::{TypeGoal, infer_expr};
+    use crate::nullability::NullabilityContext;
+    use crate::param_collector::ParamCollector;
+    use crate::qualified_name::QualifiedName;
+    use crate::scope::Scope;
+
+    let unsupported = |e: crate::error::AnalyzeError| DdlError::UnsupportedDdl(e.to_string());
+    super::expr_kind::check_expr_kind(interp, when, super::expr_kind::ExprKind::TriggerWhen)?;
+    crate::resolve::check_no_srf_in_clause(when, interp, "trigger WHEN conditions")
+        .map_err(unsupported)?;
+    let Some(class) = interp.pg_class.get(&relid) else {
+        return Ok(());
+    };
+    let nspname = interp
+        .namespace_name(class.relnamespace)
+        .unwrap_or("public")
+        .to_owned();
+    let attrs = interp.attributes_of(relid).to_vec();
+    let mut scope = Scope::default();
+    for alias in ["old", "new"] {
+        scope.add_dml_target(
+            interp,
+            alias,
+            QualifiedName::new(nspname.clone(), class.relname.clone()),
+            &attrs,
+        );
+    }
+    let null_ctx = NullabilityContext::default();
+    let mut params = ParamCollector::default();
+    let result = infer_expr(
+        when,
+        crate::expr::Ctx::new(&scope, &null_ctx, interp),
+        &mut params,
+        TypeGoal::NONE,
+    )
+    .map_err(unsupported)?;
+    // transformWhereClause: coerce_to_boolean.
+    if result.type_oid != crate::pg_catalog::oid::BOOL
+        && result.type_oid != crate::pg_catalog::oid::UNKNOWN
+    {
+        return Err(DdlError::UnsupportedDdl(format!(
+            "argument of WHEN must be type boolean, not type {}",
+            super::util::format_type_for_message(interp, result.type_oid)
+        )));
+    }
+
+    let before = stmt.timing & TRIGGER_TYPE_BEFORE != 0;
+    let has_generated = attrs.iter().any(|a| a.attgenerated.is_some());
+    let Some(inner) = when.node.as_ref() else {
+        return Ok(());
+    };
+    for (n, ..) in inner.nodes() {
+        let typedpg_pg_query::NodeRef::ColumnRef(cr) = n else {
+            continue;
+        };
+        let fields: Vec<Option<&str>> = cr.fields.iter().map(super::util::node_string).collect();
+        let (varno, column) = match fields.as_slice() {
+            // `old` / `new` as a whole row, `old.*`, `old.col`.
+            [Some(rel)]
+                if (*rel == "old" || *rel == "new") && !attrs.iter().any(|a| a.attname == *rel) =>
+            {
+                (*rel, None)
+            }
+            [Some(rel), rest] if *rel == "old" || *rel == "new" => (*rel, *rest),
+            // An unqualified column is ambiguous between OLD and NEW; the
+            // analysis above reported it.
+            _ => continue,
+        };
+        if !stmt.row {
+            return Err(DdlError::Parse(
+                "statement trigger's WHEN condition cannot reference column values".into(),
+            ));
+        }
+        if varno == "old" {
+            if stmt.events & TRIGGER_TYPE_INSERT != 0 {
+                return Err(DdlError::Parse(
+                    "INSERT trigger's WHEN condition cannot reference OLD values".into(),
+                ));
+            }
+            continue;
+        }
+        if stmt.events & TRIGGER_TYPE_DELETE != 0 {
+            return Err(DdlError::Parse(
+                "DELETE trigger's WHEN condition cannot reference NEW values".into(),
+            ));
+        }
+        if !before {
+            continue;
+        }
+        match column {
+            None => {
+                if has_generated {
+                    return Err(DdlError::Parse(
+                        "BEFORE trigger's WHEN condition cannot reference NEW generated columns \
+                         (A whole-row reference is used and the table contains generated \
+                         columns.)"
+                            .into(),
+                    ));
+                }
+            }
+            Some(col) => match attrs.iter().find(|a| a.attname == col) {
+                Some(attr) if attr.attgenerated.is_some() => {
+                    return Err(DdlError::Parse(format!(
+                        "BEFORE trigger's WHEN condition cannot reference NEW generated columns \
+                         (Column \"{col}\" is a generated column.)"
+                    )));
+                }
+                Some(_) => {}
+                None if crate::pg_catalog::SYSTEM_COLUMNS
+                    .iter()
+                    .any(|(n, ..)| *n == col) =>
+                {
+                    return Err(DdlError::UnsupportedDdl(
+                        "BEFORE trigger's WHEN condition cannot reference NEW system columns"
+                            .into(),
+                    ));
+                }
+                None => {}
+            },
+        }
+    }
+    Ok(())
+}
 
 pub fn create_trigger(interp: &mut PgCatalog, stmt: &CreateTrigStmt) -> Result<(), DdlError> {
     let Some(rv) = stmt.relation.as_ref() else {
@@ -48,6 +187,10 @@ pub fn create_trigger(interp: &mut PgCatalog, stmt: &CreateTrigStmt) -> Result<(
                 class.relname
             )));
         }
+    }
+
+    if let Some(when) = stmt.when_clause.as_deref() {
+        check_when_clause(interp, relid, stmt, when)?;
     }
 
     // The function takes no declared arguments (the trigger's arguments go
