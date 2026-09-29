@@ -25,6 +25,7 @@ pub fn create_event_trigger(
             stmt.eventname
         )));
     }
+    check_filters(stmt)?;
     if interp
         .event_triggers
         .iter()
@@ -64,6 +65,71 @@ pub fn create_event_trigger(
     interp
         .event_triggers
         .push((stmt.trigname.clone(), function));
+    Ok(())
+}
+
+/// CreateEventTrigger's filter validation: `tag` is the only filter
+/// variable, given once; its values must be command tags the event fires
+/// for (validate_ddl_tags / validate_table_rewrite_tags), and login
+/// triggers take none.
+fn check_filters(stmt: &CreateEventTrigStmt) -> Result<(), DdlError> {
+    use typedpg_pg_query::protobuf::node;
+    let mut tags: Option<Vec<&str>> = None;
+    for filter in &stmt.whenclause {
+        let Some(node::Node::DefElem(def)) = filter.node.as_ref() else {
+            continue;
+        };
+        if def.defname != "tag" {
+            return Err(DdlError::Parse(format!(
+                "unrecognized filter variable \"{}\"",
+                def.defname
+            )));
+        }
+        if tags.is_some() {
+            return Err(DdlError::Parse(format!(
+                "filter variable \"{}\" specified more than once",
+                def.defname
+            )));
+        }
+        tags = Some(match def.arg.as_deref().and_then(|a| a.node.as_ref()) {
+            Some(node::Node::List(list)) => list.items.iter().filter_map(node_string).collect(),
+            _ => Vec::new(),
+        });
+    }
+    let Some(tags) = tags else {
+        return Ok(());
+    };
+    let not_supported =
+        |tag: &str| DdlError::UnsupportedDdl(format!("event triggers are not supported for {tag}"));
+    match stmt.eventname.as_str() {
+        "ddl_command_start" | "ddl_command_end" | "sql_drop" => {
+            for tag in tags {
+                match super::cmdtag::lookup(tag) {
+                    None => {
+                        return Err(DdlError::Parse(format!(
+                            "filter value \"{tag}\" not recognized for filter variable \"tag\""
+                        )));
+                    }
+                    Some((false, _)) => return Err(not_supported(tag)),
+                    Some((true, _)) => {}
+                }
+            }
+        }
+        "table_rewrite" => {
+            if let Some(tag) = tags
+                .into_iter()
+                .find(|tag| !super::cmdtag::lookup(tag).is_some_and(|(_, rewrite_ok)| rewrite_ok))
+            {
+                return Err(not_supported(tag));
+            }
+        }
+        "login" => {
+            return Err(DdlError::UnsupportedDdl(
+                "tag filtering is not supported for login event triggers".into(),
+            ));
+        }
+        _ => {}
+    }
     Ok(())
 }
 

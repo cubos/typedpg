@@ -3614,6 +3614,79 @@ fn event_triggers_are_validated_and_tracked() {
 }
 
 #[test]
+fn event_trigger_tag_filters_are_validated() {
+    // PG 18 CreateEventTrigger: validate_ddl_tags / validate_table_rewrite_tags
+    // against cmdtaglist.h.
+    let setup = "CREATE FUNCTION ef() RETURNS event_trigger LANGUAGE plpgsql AS 'begin end';";
+    for (stmt, msg) in [
+        (
+            "CREATE EVENT TRIGGER et ON ddl_command_start WHEN tag IN ('CREATE TABLE', 'bogus')
+             EXECUTE FUNCTION ef();",
+            "filter value \"bogus\" not recognized for filter variable \"tag\"",
+        ),
+        (
+            "CREATE EVENT TRIGGER et ON ddl_command_end WHEN tag IN ('CREATE EVENT TRIGGER')
+             EXECUTE FUNCTION ef();",
+            "event triggers are not supported for CREATE EVENT TRIGGER",
+        ),
+        (
+            "CREATE EVENT TRIGGER et ON sql_drop WHEN tag IN ('create database')
+             EXECUTE FUNCTION ef();",
+            "event triggers are not supported for create database",
+        ),
+        (
+            "CREATE EVENT TRIGGER et ON ddl_command_start WHEN tag IN ('CREATE ROLE')
+             EXECUTE FUNCTION ef();",
+            "event triggers are not supported for CREATE ROLE",
+        ),
+        (
+            "CREATE EVENT TRIGGER et ON table_rewrite WHEN tag IN ('CREATE TABLE')
+             EXECUTE FUNCTION ef();",
+            "event triggers are not supported for CREATE TABLE",
+        ),
+        (
+            "CREATE EVENT TRIGGER et ON table_rewrite WHEN tag IN ('ALTER DOMAIN')
+             EXECUTE FUNCTION ef();",
+            "event triggers are not supported for ALTER DOMAIN",
+        ),
+        (
+            "CREATE EVENT TRIGGER et ON table_rewrite WHEN tag IN ('bogus')
+             EXECUTE FUNCTION ef();",
+            "event triggers are not supported for bogus",
+        ),
+        (
+            "CREATE EVENT TRIGGER et ON ddl_command_start WHEN bogus IN ('CREATE TABLE')
+             EXECUTE FUNCTION ef();",
+            "unrecognized filter variable \"bogus\"",
+        ),
+        (
+            "CREATE EVENT TRIGGER et ON ddl_command_start
+             WHEN tag IN ('CREATE TABLE') AND tag IN ('DROP TABLE') EXECUTE FUNCTION ef();",
+            "filter variable \"tag\" specified more than once",
+        ),
+        (
+            "CREATE EVENT TRIGGER et ON login WHEN tag IN ('LOGIN') EXECUTE FUNCTION ef();",
+            "tag filtering is not supported for login event triggers",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "CREATE EVENT TRIGGER e1 ON ddl_command_start
+                 WHEN tag IN ('create table', 'DROP TABLE', 'COMMENT') EXECUTE FUNCTION ef();
+             CREATE EVENT TRIGGER e2 ON table_rewrite
+                 WHEN tag IN ('ALTER TABLE', 'ALTER TYPE', 'alter materialized view')
+                 EXECUTE FUNCTION ef();
+             CREATE EVENT TRIGGER e3 ON sql_drop WHEN tag IN ('DROP INDEX') EXECUTE FUNCTION ef();",
+        ),
+    ]);
+}
+
+#[test]
 fn unlogged_tables_follow_persistence_rules() {
     // PG 18 ATAddForeignKeyConstraint / ATPrepChangePersistence /
     // transformCreateStmt / DefineView.
