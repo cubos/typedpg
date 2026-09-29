@@ -133,8 +133,15 @@ impl ToSql for NullParam {
 }
 
 pub(crate) struct PgSanityServer {
-    /// Connected to the per-instance scratch database.
+    /// The migrations' session, on the per-instance scratch database.
     client: Client,
+    /// A second session on it, where queries are prepared: the
+    /// application's queries run outside the migrations' session, so its
+    /// temporary relations are not theirs.
+    query_client: Client,
+    /// The `search_path` last copied from the migrations' session to
+    /// [`Self::query_client`].
+    query_search_path: Option<String>,
     /// Admin connection string (kept verbatim from `POSTGRES_URL`) so the
     /// `Drop` impl can connect back to a different database to run
     /// `DROP DATABASE` against the scratch one.
@@ -176,11 +183,22 @@ impl PgSanityServer {
 
         // Reconnect with the same parameters but pointing at the scratch DB.
         let scratch_conn_str = with_dbname(&admin_conn_str, &db_name)?;
-        let client = Client::connect(&scratch_conn_str, NoTls)
-            .map_err(|e| format!("pg_sanity: connect to scratch DB \"{db_name}\" failed: {e}"))?;
+        let connect = || {
+            Client::connect(&scratch_conn_str, NoTls)
+                .map_err(|e| format!("pg_sanity: connect to scratch DB \"{db_name}\" failed: {e}"))
+        };
+        let client = connect()?;
+        let mut query_client = connect()?;
+        // A query waiting on a lock the migrations' session holds (an open
+        // transaction) is a harness problem, not a hang.
+        query_client
+            .batch_execute("SET lock_timeout = '10s'")
+            .map_err(|e| format!("pg_sanity: SET lock_timeout failed: {e}"))?;
 
         Ok(Self {
             client,
+            query_client,
+            query_search_path: None,
             admin_conn_str,
             db_name,
             type_name_cache: HashMap::new(),
@@ -275,7 +293,8 @@ impl PgSanityServer {
         analysis_sql: &str,
         our_result: &Result<AnalyzedQuery, AnalyzeError>,
     ) -> Option<Divergence> {
-        let pg_result = self.client.prepare(analysis_sql);
+        self.sync_query_session();
+        let pg_result = self.query_client.prepare(analysis_sql);
 
         match (our_result, &pg_result) {
             (Ok(ours), Ok(stmt)) => {
@@ -458,7 +477,7 @@ impl PgSanityServer {
                 let null_param_refs: Vec<&(dyn ToSql + Sync)> =
                     null_params.iter().map(|p| p as _).collect();
 
-                let exec_result = match self.client.transaction() {
+                let exec_result = match self.query_client.transaction() {
                     Ok(mut tx) => {
                         let r = tx.execute(stmt, &null_param_refs);
                         // `tx` drops here → automatic rollback so the
@@ -507,11 +526,34 @@ impl PgSanityServer {
     /// so they line up with [`Type::Array`]. Inlines the OID as a literal
     /// (non-injectable: it's a u32 from PG itself) to dodge `to_sql` for
     /// the `oid` type.
+    /// Give the query session the migrations' `search_path`, which the
+    /// analyzer resolves queries with.
+    fn sync_query_session(&mut self) {
+        // In a failed transaction the setting can't be read; keep the last.
+        let Ok(row) = self
+            .client
+            .query_one("SELECT current_setting('search_path')", &[])
+        else {
+            return;
+        };
+        let search_path: String = row.get(0);
+        if self.query_search_path.as_ref() == Some(&search_path) {
+            return;
+        }
+        self.query_client
+            .query_one(
+                "SELECT pg_catalog.set_config('search_path', $1, false)",
+                &[&search_path],
+            )
+            .expect("pg_sanity: copying search_path to the query session failed");
+        self.query_search_path = Some(search_path);
+    }
+
     fn qualified_type_name(&mut self, oid: u32) -> Result<String, postgres::Error> {
         if let Some(name) = self.type_name_cache.get(&oid) {
             return Ok(name.clone());
         }
-        let row = self.client.query_one(
+        let row = self.query_client.query_one(
             &format!(
                 "SELECT n.nspname, t.typname, t.typcategory::text, t.typelem::int8 \
                  FROM pg_catalog.pg_type t \
@@ -558,6 +600,12 @@ impl Drop for PgSanityServer {
                 .expect("pg_sanity: drop: admin reconnect failed"),
         );
         drop(scratch);
+        let query = std::mem::replace(
+            &mut self.query_client,
+            Client::connect(&self.admin_conn_str, NoTls)
+                .expect("pg_sanity: drop: admin reconnect failed"),
+        );
+        drop(query);
 
         // The placeholder client we just created is connected to the admin
         // DB — perfect for issuing the DROP. Errors during drop are
