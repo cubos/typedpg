@@ -83,6 +83,24 @@ pub(crate) struct TableSource {
     /// hints that the entry can't be referenced from this part of the
     /// query instead of blaming the join type.
     pub dml_target: bool,
+    /// What a whole-row reference to this entry (`f`, `f.*` in an
+    /// expression) yields when it has no backing relation — PG's
+    /// `makeWholeRowVar` for a function RTE.
+    pub whole_row: WholeRow,
+}
+
+/// The value of a whole-row reference to a FROM item without a backing
+/// relation (`makeWholeRowVar`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum WholeRow {
+    /// An anonymous `record` of the entry's columns (subqueries, CTEs,
+    /// VALUES, joins, several functions, `WITH ORDINALITY`, …).
+    #[default]
+    Record,
+    /// A single function returning a named composite type: that type.
+    Composite(PgTypeOid),
+    /// A single function returning a scalar: the function's value itself.
+    Scalar,
 }
 
 /// The RTE kind behind a [`TableSource`].
@@ -138,6 +156,7 @@ impl TableSource {
             table_only: false,
             null_row: false,
             dml_target: false,
+            whole_row: WholeRow::Record,
         }
     }
 

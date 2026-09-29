@@ -433,6 +433,63 @@ fn bare_alias_field_nullability_preserved() {
     assert_cols(&s, vec![cn("a", int4())]);
 }
 
+/// makeWholeRowVar for FROM items without a backing relation: a single
+/// function keeps its named composite (or scalar) result, everything else
+/// — subqueries, CTEs, joins, record functions — is an anonymous record.
+#[test]
+fn bare_alias_of_non_table_from_items() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE t (id int PRIMARY KEY, v int NOT NULL, w text);
+         CREATE TABLE s (id int PRIMARY KEY, v int NOT NULL, x text);
+         CREATE TYPE comp AS (a int, b text);
+         CREATE FUNCTION fc1() RETURNS comp LANGUAGE sql AS 'SELECT 1, ''a''';",
+    )
+    .unwrap();
+    let s = db.analyze("SELECT f FROM fc1() f").unwrap();
+    assert!(
+        matches!(&s.columns[0].pg_type, Type::Composite { name, .. } if name == "comp"),
+        "{:?}",
+        s.columns[0].pg_type
+    );
+    let s = db.analyze("SELECT (f).a FROM fc1() f").unwrap();
+    assert_cols(&s, vec![cn("a", int4())]);
+    let s = db.analyze("SELECT f FROM upper('x') AS f(c)").unwrap();
+    assert_cols(&s, vec![c("f", text())]);
+    for sql in [
+        "SELECT x FROM jsonb_to_record('{}') AS x(a int)",
+        "SELECT q FROM t LEFT JOIN (SELECT 1 a) q ON true",
+        "SELECT j FROM (t LEFT JOIN s USING (id)) j",
+        "SELECT o FROM fc1() WITH ORDINALITY o",
+        "WITH c AS (SELECT 1 AS a) SELECT c FROM c",
+    ] {
+        let s = db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        assert_eq!(s.columns.len(), 1, "{sql}");
+        assert!(
+            matches!(s.columns[0].pg_type, Type::AnonymousRecord { .. }),
+            "{sql}: {:?}",
+            s.columns[0].pg_type
+        );
+    }
+    // The subquery is on the nullable side of the LEFT JOIN.
+    let s = db
+        .analyze("SELECT q FROM t LEFT JOIN (SELECT 1 a) q ON true")
+        .unwrap();
+    assert!(s.columns[0].nullable);
+    let s = db
+        .analyze(
+            "MERGE INTO t USING (SELECT * FROM s) q ON t.id = q.id \
+             WHEN NOT MATCHED BY SOURCE THEN UPDATE SET v = 0 RETURNING q.v, q",
+        )
+        .unwrap();
+    assert_eq!(s.columns.len(), 2);
+    // A column of the same name still wins over the whole row.
+    let s = db
+        .analyze("SELECT q FROM (SELECT 1 AS q) q")
+        .unwrap();
+    assert_cols(&s, vec![c("q", int4())]);
+}
+
 // ── SRFs with OUT / TABLE args ───────────────────────────────────────────────
 
 #[test]

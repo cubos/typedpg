@@ -69,16 +69,13 @@ pub(crate) fn infer_column_ref(
             // or `(u).name`). Only kick in when the column lookup failed AND
             // the identifier matches a table alias in scope — otherwise we'd
             // shadow legitimate UndefinedColumn errors.
+            // PG only tries the whole-row reading when no column matched
+            // (an ambiguous or otherwise invalid column is an error).
             if table.is_none()
+                && matches!(e, AnalyzeError::UndefinedColumn(_))
                 && let Some(src) = scope.find_source(column)
-                && let Some(qn) = src.source_qn.as_ref()
-                && let Some(nsoid) = snapshot.namespace_oid(&qn.schema)
-                && let Some(&composite_oid) = snapshot.type_by_qname.get(&(nsoid, qn.name.clone()))
             {
-                return Ok(ExprType::scalar(
-                    composite_oid,
-                    whole_row_nullable(src, null_ctx),
-                ));
+                return whole_row_ref(src, null_ctx, snapshot);
             }
             // Inside a SQL function body, a name no column or relation
             // claims may name one of the function's parameters.
@@ -175,7 +172,16 @@ fn infer_star_ref(
     let source = scope.find_source(alias).ok_or_else(|| {
         AnalyzeError::UndefinedTable(format!("missing FROM-clause entry for table \"{alias}\""))
     })?;
+    whole_row_ref(source, null_ctx, snapshot)
+}
 
+/// PG's `transformWholeRowRef` / `makeWholeRowVar`: a whole-row reference
+/// to a FROM entry (`t` or `t.*` in an expression).
+fn whole_row_ref(
+    source: &crate::scope::TableSource,
+    null_ctx: &NullabilityContext,
+    snapshot: &PgCatalog,
+) -> Result<ExprType, AnalyzeError> {
     // Real tables / views resolve to their backing composite type so calls
     // like `row_to_json(t.*)` see the registered row OID. CTE and subquery
     // sources have no `source_qn` — PG composes an anonymous row type at
@@ -201,6 +207,27 @@ fn infer_star_ref(
             composite_oid,
             whole_row_nullable(source, null_ctx),
         ));
+    }
+
+    match source.whole_row {
+        // A single function returning a named composite keeps its type.
+        crate::scope::WholeRow::Composite(t) => {
+            return Ok(ExprType::scalar(t, whole_row_nullable(source, null_ctx)));
+        }
+        // A single scalar function: the reference is the function's value.
+        crate::scope::WholeRow::Scalar => {
+            if let Some(c) = source.columns.first() {
+                return Ok(ExprType {
+                    type_oid: c.type_oid,
+                    nullable: null_ctx.is_nullable(&c.table_alias, &c.name, c.base_not_null),
+                    typmod: c.typmod,
+                    collation: c.collation,
+                    explicit_collation: false,
+                    record_fields: c.record_fields.clone(),
+                });
+            }
+        }
+        crate::scope::WholeRow::Record => {}
     }
 
     let fields: Vec<RecordField> = source

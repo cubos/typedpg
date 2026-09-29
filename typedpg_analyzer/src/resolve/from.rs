@@ -294,8 +294,21 @@ fn process_range_function(
     let arg_ctx = expr::Ctx::new(&arg_scope, null_ctx, snapshot);
     let nfuncs = funcs.len();
     let mut cols: Vec<ScopeColumn> = Vec::new();
+    let mut whole_row = crate::scope::WholeRow::Record;
     for f in &funcs {
-        cols.extend(function_rte_columns(f, alias, nfuncs, arg_ctx, params)?);
+        cols.extend(function_rte_columns(
+            f,
+            alias,
+            nfuncs,
+            arg_ctx,
+            params,
+            &mut whole_row,
+        )?);
+    }
+    // makeWholeRowVar: several functions or WITH ORDINALITY always make an
+    // anonymous record.
+    if nfuncs != 1 || rf.ordinality {
+        whole_row = crate::scope::WholeRow::Record;
     }
     if nfuncs > 1 {
         // nodeFunctionscan.c pads every function that runs out of rows
@@ -338,6 +351,9 @@ fn process_range_function(
     }
 
     scope.add_derived(alias, cols, crate::scope::SourceKind::Function)?;
+    if let Some(src) = scope.sources.last_mut() {
+        src.whole_row = whole_row;
+    }
     Ok(())
 }
 
@@ -877,12 +893,16 @@ pub(crate) fn srf_elements_nullable(
 /// definition list is redundant there), `record` requires one, and a
 /// scalar result is a single column (a column definition list is not
 /// allowed).
+///
+/// `whole_row` receives what a whole-row reference to a single-function RTE
+/// yields: its named composite type, or the scalar value itself.
 fn function_rte_columns(
     f: &RteFunction<'_>,
     alias: &str,
     nfuncs: usize,
     arg_ctx: Ctx<'_>,
     params: &mut ParamCollector,
+    whole_row: &mut crate::scope::WholeRow,
 ) -> Result<Vec<ScopeColumn>, AnalyzeError> {
     let snapshot = arg_ctx.snapshot;
     let func_call: &protobuf::FuncCall = &f.call;
@@ -959,6 +979,7 @@ fn function_rte_columns(
         if has_coldeflist {
             return Err(crate::pgmsg::coldeflist_redundant_composite().finalize_implicit());
         }
+        *whole_row = crate::scope::WholeRow::Composite(resolved.return_type_oid);
         return Ok(snapshot
             .attributes_of(typrelid)
             .iter()
@@ -1007,6 +1028,7 @@ fn function_rte_columns(
     // after the RTE alias (`FROM generate_series(1, 3) AS g` exposes `g`);
     // with several functions each column keeps its function's name.
     let col_name = if nfuncs == 1 { alias } else { name };
+    *whole_row = crate::scope::WholeRow::Scalar;
     Ok(vec![ScopeColumn {
         name: col_name.to_owned(),
         type_oid: resolved.return_type_oid,
