@@ -5,11 +5,15 @@ use super::*;
 /// are validated (existence, column existence, type compatibility, and
 /// uniqueness coverage on the referenced columns) and recorded with
 /// `confrelid`/`confkey` so the dependency graph is traversable.
+///
+/// DefineRelation's order: the CHECK constraints, then the not-null ones
+/// (`record_not_nulls`), then the index-backed ones, then the foreign keys.
 pub(crate) fn emit_constraints(
     interp: &mut PgCatalog,
     relid: PgClassOid,
     relname: &str,
     stmt: &CreateStmt,
+    record_not_nulls: &dyn Fn(&mut PgCatalog) -> Result<(), DdlError>,
 ) -> Result<(), DdlError> {
     let attinfo_by_name: std::collections::HashMap<String, (i16, PgTypeOid)> = interp
         .attributes_of(relid)
@@ -277,8 +281,29 @@ pub(crate) fn emit_constraints(
             _ => kept.push(pending),
         }
     }
-    for (conname, contype, conkey, confrelid, confkey, check, deferrable, include, period) in kept {
+    let (checks, indexed): (Vec<_>, Vec<_>) = kept.into_iter().partition(|k| k.1 == ConType::Check);
+    let mut kept = checks;
+    let n_checks = kept.len();
+    kept.extend(indexed);
+    let n_all = kept.len();
+    let mut check_names: Vec<String> = Vec::new();
+    for (i, (conname, contype, conkey, confrelid, confkey, check, deferrable, include, period)) in
+        kept.into_iter().enumerate()
+    {
+        if i == n_checks {
+            record_not_nulls(interp)?;
+        }
         let conname = conname.resolve(interp, relid);
+        // AddRelationNewConstraints: two CHECK constraints of one command
+        // can't share a name.
+        if contype == ConType::Check {
+            if check_names.contains(&conname) {
+                return Err(DdlError::DuplicateObject(format!(
+                    "check constraint \"{conname}\" already exists"
+                )));
+            }
+            check_names.push(conname.clone());
+        }
         let oid = emit_constraint_with_backing_index(
             interp, relid, conname, contype, conkey, confrelid, confkey, deferrable, include,
             period, false,
@@ -292,6 +317,9 @@ pub(crate) fn emit_constraints(
             }
             interp.check_defs.insert(oid, def);
         }
+    }
+    if n_all == n_checks {
+        record_not_nulls(interp)?;
     }
     for (c, local_names, default_name) in pending_fks {
         super::foreign_keys::add_foreign_key(
@@ -576,6 +604,31 @@ pub(super) fn emit_constraint_with_backing_index(
         };
         let columns: Vec<i16> = conkey.iter().chain(&include).copied().collect();
         check_index_columns(interp, relid, &columns, &[], usage)?;
+    }
+    if matches!(
+        contype,
+        ConType::PrimaryKey | ConType::Unique | ConType::Exclusion
+    ) {
+        // index_create: the index is a relation of the schema, and the
+        // constraint's name must be free on the table.
+        let nsoid = interp.pg_class.get(&relid).map(|c| c.relnamespace);
+        if let Some(ns) = nsoid
+            && interp.class_by_qname.contains_key(&(ns, conname.clone()))
+        {
+            return Err(DdlError::DuplicateObject(format!(
+                "relation \"{conname}\" already exists"
+            )));
+        }
+        if interp
+            .pg_constraint
+            .values()
+            .any(|c| c.conrelid == relid && c.conname == conname)
+        {
+            return Err(DdlError::DuplicateObject(format!(
+                "constraint \"{conname}\" for relation \"{}\" already exists",
+                relname_of(interp, relid)
+            )));
+        }
     }
     let oid = PgConstraintOid::from_nonzero(interp.alloc_oid()?);
     interp.insert_pg_constraint(PgConstraint {
@@ -1728,10 +1781,12 @@ pub(crate) fn copy_like_constraints(
             match backing {
                 Some((contype, period)) => {
                     let name = match contype {
-                        ConType::PrimaryKey => {
-                            choose_relation_name(interp, nsoid, relname, "", "pkey")
-                        }
-                        _ => choose_relation_name(interp, nsoid, relname, &addition, "key"),
+                        ConType::PrimaryKey => crate::ddl::util::choose_constraint_index_name(
+                            interp, nsoid, relname, "", "pkey",
+                        ),
+                        _ => crate::ddl::util::choose_constraint_index_name(
+                            interp, nsoid, relname, &addition, "key",
+                        ),
                     };
                     let nkey = key_columns(&idx).len();
                     emit_constraint_with_backing_index(

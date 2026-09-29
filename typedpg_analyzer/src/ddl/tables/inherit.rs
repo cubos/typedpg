@@ -97,13 +97,36 @@ pub(crate) fn choose_constraint_name(
     }
 }
 
-/// Record the not-null constraint of a freshly-created column
-/// (AddRelationNotNullConstraints): local when the column declares one
-/// (named explicitly or `<table>_<column>_not_null`), otherwise inherited
-/// under the first parent's constraint name. It is valid — the table is
-/// empty — and NO INHERIT only as declared, which an inherited not-null
-/// constraint can't be.
-pub(super) fn record_not_null(
+/// Record the not-null constraints of a freshly-created table
+/// (AddRelationNotNullConstraints), after its CHECK constraints: first the
+/// declared ones, in column order — named as given, or
+/// `<table>_<column>_not_null` made unique — then the purely inherited
+/// ones, under the first parent's name unless the table already uses it.
+/// A given name is only checked against other given ones, so one a CHECK
+/// constraint took fails on pg_constraint's unique index. The constraints
+/// are valid — the table is empty — and NO INHERIT only as declared, which
+/// an inherited not-null constraint can't be.
+pub(super) fn record_not_nulls(
+    interp: &mut PgCatalog,
+    relid: PgClassOid,
+    columns: &[ParsedColumn],
+) -> Result<(), DdlError> {
+    let local = |col: &ParsedColumn| col.nn_local || col.nn_inhcount == 0;
+    let declared = columns
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.not_null && local(c));
+    let inherited = columns
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.not_null && !local(c));
+    for (i, col) in declared.chain(inherited) {
+        record_not_null(interp, relid, (i + 1) as i16, col)?;
+    }
+    Ok(())
+}
+
+fn record_not_null(
     interp: &mut PgCatalog,
     relid: PgClassOid,
     attnum: i16,
@@ -117,13 +140,28 @@ pub(super) fn record_not_null(
             col.name
         )));
     }
+    let used = |interp: &PgCatalog, name: &str| {
+        interp
+            .pg_constraint
+            .values()
+            .any(|c| c.conrelid == relid && c.conname == name)
+    };
     let name = match (&col.nn_name, local) {
-        (Some(name), _) => name.clone(),
+        (Some(name), _) => {
+            if used(interp, name) {
+                return Err(DdlError::DuplicateObject(format!(
+                    "duplicate key value violates unique constraint \
+                     \"pg_constraint_conrelid_contypid_conname_index\" (Key (conrelid, contypid, \
+                     conname)=({relid}, 0, {name}) already exists.)"
+                )));
+            }
+            name.clone()
+        }
         (None, true) => choose_constraint_name(interp, relid, &col.name, "not_null"),
-        (None, false) => col
-            .nn_inh_name
-            .clone()
-            .unwrap_or_else(|| choose_constraint_name(interp, relid, &col.name, "not_null")),
+        (None, false) => match &col.nn_inh_name {
+            Some(name) if !used(interp, name) => name.clone(),
+            _ => choose_constraint_name(interp, relid, &col.name, "not_null"),
+        },
     };
     insert_not_null(
         interp,

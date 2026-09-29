@@ -498,6 +498,38 @@ pub fn choose_relation_name(
     }
 }
 
+/// PG's `ChooseRelationName` with `isconstraint`: the name of a
+/// constraint's index must be free as a relation name and as a constraint
+/// name in the schema.
+pub fn choose_constraint_index_name(
+    snapshot: &PgCatalog,
+    nsoid: PgNamespaceOid,
+    name1: &str,
+    name2: &str,
+    label: &str,
+) -> String {
+    let constraint_taken = |name: &str| {
+        snapshot.pg_constraint.values().any(|c| {
+            c.conname == name
+                && snapshot.pg_class.get(&c.conrelid).map(|r| r.relnamespace) == Some(nsoid)
+        })
+    };
+    let mut pass = 0;
+    loop {
+        let modlabel = if pass == 0 {
+            label.to_owned()
+        } else {
+            format!("{label}{pass}")
+        };
+        let name = make_object_name(name1, name2, &modlabel);
+        if !snapshot.class_by_qname.contains_key(&(nsoid, name.clone())) && !constraint_taken(&name)
+        {
+            return name;
+        }
+        pass += 1;
+    }
+}
+
 /// PG's `ChooseIndexColumnNames` + `ChooseIndexNameAddition`: the index
 /// columns' names (`expr` for expressions, deduplicated with a counter),
 /// joined with `_`.

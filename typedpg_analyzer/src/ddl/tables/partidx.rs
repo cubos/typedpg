@@ -130,13 +130,23 @@ fn create_clone(
         Some(ConType::Exclusion) => (super::super::util::index_name_addition(&colnames), "excl"),
         _ => (super::super::util::index_name_addition(&colnames), "idx"),
     };
-    let name = super::super::util::choose_relation_name(
-        interp,
-        class.relnamespace,
-        &class.relname,
-        &addition,
-        label,
-    );
+    let name = if parent_con.is_some() {
+        super::super::util::choose_constraint_index_name(
+            interp,
+            class.relnamespace,
+            &class.relname,
+            &addition,
+            label,
+        )
+    } else {
+        super::super::util::choose_relation_name(
+            interp,
+            class.relnamespace,
+            &class.relname,
+            &addition,
+            label,
+        )
+    };
     let index = PgClassOid::from_nonzero(interp.alloc_oid()?);
     interp.insert_pg_class(PgClass {
         oid: index,

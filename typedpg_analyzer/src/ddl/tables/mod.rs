@@ -74,9 +74,9 @@ impl ConName {
                 let nsoid = interp.pg_class.get(&relid).map(|c| c.relnamespace);
                 let relname = relname_of(interp, relid);
                 match nsoid {
-                    Some(ns) => {
-                        super::util::choose_relation_name(interp, ns, &relname, addition, label)
-                    }
+                    Some(ns) => super::util::choose_constraint_index_name(
+                        interp, ns, &relname, addition, label,
+                    ),
                     None => super::util::make_object_name(&relname, addition, label),
                 }
             }
@@ -441,11 +441,6 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
         typisdefined: true,
     });
 
-    for (i, col) in columns.iter().enumerate() {
-        if col.not_null {
-            inherit::record_not_null(interp, class_oid, (i + 1) as i16, col)?;
-        }
-    }
     // Default expressions carried over from parents / LIKE sources (a
     // local DEFAULT, recorded while validating below, overrides them), and
     // serial's `nextval(...)`, a bigint.
@@ -723,7 +718,9 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
     }
     // Emit pg_constraint rows so ON CONFLICT, DROP CASCADE, and FK
     // dependency checks can consult them later. FK validation runs here.
-    emit_constraints(interp, class_oid, &name, stmt)?;
+    emit_constraints(interp, class_oid, &name, stmt, &|interp| {
+        inherit::record_not_nulls(interp, class_oid, &columns)
+    })?;
     check_inherit::inherit_parent_checks(interp, class_oid)?;
     if stmt.partbound.is_some()
         && let Some(parent) = interp

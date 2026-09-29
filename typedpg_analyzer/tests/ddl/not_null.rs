@@ -498,3 +498,96 @@ fn partitioned_tables_take_no_no_inherit_not_null() {
         msg,
     );
 }
+
+#[test]
+fn constraint_names_collide_in_create_table_like_pg() {
+    // DefineRelation (PG 18) creates the CHECK constraints first, then the
+    // not-null ones, then the index-backed ones. An auto-generated not-null
+    // name skips the names taken; a given one isn't checked against the
+    // CHECK constraints, so a clash fails on pg_constraint's unique index.
+    let dup_key = "duplicate key value violates unique constraint \"pg_constraint_conrelid_contypid_conname_index\"";
+    for (stmt, msg) in [
+        (
+            "CREATE TABLE z3 (a int check (a > 0), constraint z3_a_check not null a);",
+            dup_key,
+        ),
+        (
+            "CREATE TABLE z7 (a int constraint c7 not null, constraint c7 check (a > 0));",
+            dup_key,
+        ),
+        (
+            "CREATE TABLE z12 (a int not null, constraint z12_a_not_null check (a > 0), \
+             b int constraint z12_a_not_null1 not null);",
+            dup_key,
+        ),
+        (
+            "CREATE TABLE z14 (a int constraint z14_a_check not null check (a > 0));",
+            dup_key,
+        ),
+        (
+            "CREATE TABLE z6 (a int, constraint c1 check (a > 0), constraint c1 unique (a));",
+            "constraint \"c1\" for relation \"z6\" already exists",
+        ),
+        (
+            "CREATE TABLE z16 (a int, constraint c1 unique (a), constraint c1 check (a > 0));",
+            "constraint \"c1\" for relation \"z16\" already exists",
+        ),
+        (
+            "CREATE TABLE z15 (a int, b int check (b > 0), constraint z15_b_check unique (a));",
+            "constraint \"z15_b_check\" for relation \"z15\" already exists",
+        ),
+        (
+            "CREATE TABLE z8 (a int, constraint z8_a_check check (a > 0), \
+             constraint z8_a_check check (a > 1));",
+            "check constraint \"z8_a_check\" already exists",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE z4 (a int constraint z4_a_not_null check (a > 0) not null);
+         CREATE TABLE z5 (a int not null, constraint z5_a_not_null check (a > 0));
+         CREATE TABLE z13 (a int check (a > 0) not null, b int, \
+                           constraint z13_a_not_null check (b > 0));
+         CREATE TABLE z17 (a int primary key constraint z17_pkey check (a > 0));",
+    )]);
+    let names = |table: &str| -> Vec<(String, ConType)> {
+        db.constraints_of_table(table)
+            .into_iter()
+            .map(|c| (c.conname, c.contype))
+            .collect()
+    };
+    assert_eq!(
+        names("z4"),
+        vec![
+            ("z4_a_not_null".to_owned(), ConType::Check),
+            ("z4_a_not_null1".to_owned(), ConType::NotNull)
+        ]
+    );
+    assert_eq!(
+        names("z5"),
+        vec![
+            ("z5_a_not_null".to_owned(), ConType::Check),
+            ("z5_a_not_null1".to_owned(), ConType::NotNull)
+        ]
+    );
+    assert_eq!(
+        names("z13"),
+        vec![
+            ("z13_a_check".to_owned(), ConType::Check),
+            ("z13_a_not_null".to_owned(), ConType::Check),
+            ("z13_a_not_null1".to_owned(), ConType::NotNull)
+        ]
+    );
+    // The primary key's generated name skips the CHECK constraint's too.
+    assert_eq!(
+        names("z17"),
+        vec![
+            ("z17_pkey".to_owned(), ConType::Check),
+            ("z17_a_not_null".to_owned(), ConType::NotNull),
+            ("z17_pkey1".to_owned(), ConType::PrimaryKey)
+        ]
+    );
+}
