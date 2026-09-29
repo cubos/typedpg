@@ -15,6 +15,7 @@
 //! crate README for moving to a new release.
 
 mod catalog;
+mod equal;
 mod ffi;
 mod node;
 #[allow(clippy::all, missing_docs)]
@@ -27,6 +28,7 @@ use std::os::raw::c_char;
 use prost::Message;
 
 pub use catalog::{Catalog, CatalogAttribute, CatalogType};
+pub use equal::Equal;
 pub use node::{NodeMut, NodeRef};
 /// The `oneof` of every node kind — what [`protobuf::Node::node`] holds.
 pub use protobuf::node::Node as NodeEnum;

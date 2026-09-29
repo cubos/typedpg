@@ -125,3 +125,31 @@ fn plpgsql_trigger_functions_dump_valid_json() {
     .unwrap();
     assert!(json.to_string().contains("\"retvarno\":2"), "{json}");
 }
+
+#[test]
+fn equal_compares_trees_like_postgres_equal() {
+    use typedpg_pg_query::Equal;
+    let expr = |sql: &str| {
+        let parsed = typedpg_pg_query::parse(&format!("SELECT {sql}")).unwrap();
+        let NodeEnum::SelectStmt(sel) = parsed.protobuf.stmts[0]
+            .stmt
+            .as_ref()
+            .unwrap()
+            .node
+            .clone()
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        sel.target_list[0].clone()
+    };
+    // Layout and case of keywords don't matter: locations aren't compared.
+    assert!(expr("a + 1 > 0").equal(&expr("a+1>0")));
+    assert!(expr("x IN (1, 2)").equal(&expr("x in (1,2)")));
+    assert!(expr("CASE WHEN a THEN 1 END").equal(&expr("case  when a then 1 end")));
+    // Anything else does.
+    assert!(!expr("a + 1 > 0").equal(&expr("a + 2 > 0")));
+    assert!(!expr("a > 0").equal(&expr("b > 0")));
+    assert!(!expr("(a > 0)::int").equal(&expr("(a > 0)::bigint")));
+    assert!(!expr("x IN (1, 2)").equal(&expr("x IN (2, 1)")));
+}

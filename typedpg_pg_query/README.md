@@ -12,6 +12,9 @@ to a release tag) and exposes:
 - `protobuf`, the AST types, generated from libpg_query's `pg_query.proto`;
 - `NodeRef` / `NodeMut`, a view of a node by kind, and `nodes()` /
   `nodes_mut()`, every node of a tree (breadth-first, with its depth);
+- `Equal`, PostgreSQL's `equal()` over the AST: every field compared except
+  source locations and `equal_ignore` fields, both read from the PostgreSQL
+  headers libpg_query vendors;
 - `parse_plpgsql_with_catalog`, which compiles a PL/pgSQL function against a
   caller-supplied `Catalog` (see below).
 
@@ -38,7 +41,7 @@ from; they are read from the vendored `pg_query.h` at build time.
 1. Check out the new tag in the submodule:
    `git -C typedpg_pg_query/libpg_query checkout <tag>`.
 2. Regenerate the Rust sources: `cargo run -p typedpg_pg_query_codegen`
-   (writes `src/protobuf.rs` and `src/node.rs`; the
+   (writes `src/protobuf.rs`, `src/node.rs` and `src/equal.rs`; the
    `generated_sources_are_up_to_date` test fails while they are stale).
 3. Build. A patch in `patches.rs` whose spot changed upstream fails the build
    with the patch's description: re-derive it, or drop it if upstream fixed
