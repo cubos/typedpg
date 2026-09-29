@@ -323,3 +323,31 @@ fn drop_table_takes_inheritance_children_only_with_cascade() {
     assert!(db.resolve_table(None, "m2").is_none());
     assert!(db.resolve_table(None, "m3").is_none());
 }
+
+#[test]
+fn drop_type_of_a_range_takes_its_multirange_and_constructors() {
+    // The multirange type and the constructor functions are internal to the
+    // range type; only what uses them needs CASCADE.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TYPE textrange2 AS RANGE (subtype = text, collation = \"C\");
+         DROP TYPE textrange2;
+         CREATE TYPE textrange2 AS RANGE (subtype = text);
+         CREATE FUNCTION f(textrange2) RETURNS int LANGUAGE sql AS 'SELECT 1';
+         DROP TYPE textrange2 CASCADE;
+         CREATE TYPE textrange2 AS RANGE (subtype = text);",
+    )]);
+    assert!(db.resolve_type_by_name(None, "textmultirange2").is_some());
+    let err = try_apply(&[(
+        "0001.sql",
+        "CREATE TYPE textrange2 AS RANGE (subtype = text);
+         CREATE TABLE t (a textmultirange2);
+         DROP TYPE textrange2;",
+    )])
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("cannot drop type textrange2 because other objects depend on it"),
+        "{err}"
+    );
+}

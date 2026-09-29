@@ -611,6 +611,32 @@ fn drop_type(
         )));
     };
     let array_oid = interp.array_type_of(type_oid);
+    // A range type's multirange type and the constructor functions of both
+    // are internal to it (DEPENDENCY_INTERNAL): they go along, and only
+    // what depends on them in turn needs CASCADE.
+    let multirange = interp.pg_range.get(&type_oid).and_then(|r| r.rngmultitypid);
+    let own_types: Vec<crate::oid::PgTypeOid> = [Some(type_oid), array_oid]
+        .into_iter()
+        .chain(
+            multirange
+                .into_iter()
+                .flat_map(|mr| [Some(mr), interp.array_type_of(mr)]),
+        )
+        .flatten()
+        .collect();
+    let constructors: Vec<crate::oid::PgProcOid> = interp
+        .pg_proc
+        .values()
+        .filter(|p| {
+            (p.prorettype == type_oid || Some(p.prorettype) == multirange)
+                && multirange.is_some()
+                && interp
+                    .pg_type
+                    .get(&p.prorettype)
+                    .is_some_and(|t| t.typname == p.proname && t.typnamespace == p.pronamespace)
+        })
+        .map(|p| p.oid)
+        .collect();
 
     // Find tables/composites with columns of this type (or its array form).
     let dependent_relations: Vec<PgClassOid> = interp
@@ -619,7 +645,7 @@ fn drop_type(
         .filter_map(|(&relid, attrs)| {
             attrs
                 .iter()
-                .any(|a| a.atttypid == type_oid || array_oid.is_some_and(|arr| a.atttypid == arr))
+                .any(|a| own_types.contains(&a.atttypid))
                 .then_some(relid)
         })
         .collect();
@@ -670,13 +696,10 @@ fn drop_type(
     }
 
     // Functions taking or returning the type depend on it too.
-    let dependent_functions = functions_using_types(
-        interp,
-        &[Some(type_oid), array_oid]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>(),
-    );
+    let dependent_functions: Vec<crate::oid::PgProcOid> = functions_using_types(interp, &own_types)
+        .into_iter()
+        .filter(|f| !constructors.contains(f))
+        .collect();
     if !dependent_functions.is_empty() && !cascade {
         return Err(DdlError::DependencyError(format!(
             "cannot drop type {name} because other objects depend on it \
@@ -691,9 +714,7 @@ fn drop_type(
         }
         for relid in &dependent_relations {
             if let Some(attrs) = interp.pg_attribute.get_mut(relid) {
-                attrs.retain(|a| {
-                    a.atttypid != type_oid && array_oid.is_none_or(|arr| a.atttypid != arr)
-                });
+                attrs.retain(|a| !own_types.contains(&a.atttypid));
             }
         }
         if !dependent_views.is_empty() {
@@ -702,6 +723,16 @@ fn drop_type(
         drop_functions_cascade(interp, &dependent_functions);
     }
 
+    for proc in constructors {
+        interp.remove_pg_proc(proc);
+    }
+    for mr_type in own_types
+        .iter()
+        .copied()
+        .filter(|t| *t != type_oid && Some(*t) != array_oid)
+    {
+        interp.remove_pg_type(mr_type);
+    }
     if let Some(arr_oid) = array_oid {
         interp.remove_pg_type(arr_oid);
         let arr_obj = crate::oid::PgGenericOid::from_nonzero(arr_oid.into_nonzero());
