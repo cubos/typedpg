@@ -11,6 +11,10 @@ use crate::pg_catalog::PgCatalog;
 
 pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Result<(), DdlError> {
     let (nsoid, name) = ensure_qualified_name(interp, &stmt.funcname)?;
+    // CreateFunction: the language must exist.
+    if let Some(language) = function_language(stmt) {
+        super::languages::check(interp, &language)?;
+    }
 
     // Walk parameters once, splitting IN/INOUT/VARIADIC into the call
     // signature and OUT/TABLE/INOUT into the named output columns.

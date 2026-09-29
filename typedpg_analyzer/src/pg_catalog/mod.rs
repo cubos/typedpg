@@ -279,6 +279,10 @@ pub struct PgCatalog {
     pub(crate) in_migration: bool,
     /// `ON COMMIT DROP` temporary tables of the current transaction.
     pub(crate) on_commit_drop: Vec<PgClassOid>,
+    /// Languages added by CREATE LANGUAGE, and built-in ones dropped or
+    /// renamed away.
+    pub(crate) languages: Vec<String>,
+    pub(crate) dropped_languages: Vec<String>,
     /// Event triggers and the function each executes.
     pub(crate) event_triggers: Vec<(String, crate::oid::PgProcOid)>,
     /// Enum labels added in the current transaction to a type created
@@ -564,6 +568,8 @@ impl PgCatalog {
             temp_namespace: None,
             in_migration: false,
             on_commit_drop: Vec::new(),
+            languages: Vec::new(),
+            dropped_languages: Vec::new(),
             uncommitted_enum_labels: Default::default(),
             enums_created_in_transaction: Default::default(),
             partition_specs: HashMap::new(),

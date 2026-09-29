@@ -3619,3 +3619,52 @@ fn text_search_objects_are_tracked() {
         ),
     ]);
 }
+
+#[test]
+fn languages_must_exist() {
+    // PG 18 get_language_oid / DropProceduralLanguage / CreateTransform.
+    let setup = "CREATE TABLE t (a text);";
+    for (stmt, msg) in [
+        (
+            "CREATE FUNCTION f() RETURNS int LANGUAGE nosuch AS 'x';",
+            "language \"nosuch\" does not exist",
+        ),
+        (
+            "DROP LANGUAGE nosuch;",
+            "language \"nosuch\" does not exist",
+        ),
+        (
+            "DROP LANGUAGE plpgsql;",
+            "cannot drop language plpgsql because extension plpgsql requires it",
+        ),
+        (
+            "DROP LANGUAGE sql;",
+            "cannot drop language sql because it is required by the database system",
+        ),
+        (
+            "ALTER LANGUAGE nosuch RENAME TO x;",
+            "language \"nosuch\" does not exist",
+        ),
+        (
+            "CREATE TRANSFORM FOR int LANGUAGE nosuch (FROM SQL WITH FUNCTION f(internal));",
+            "language \"nosuch\" does not exist",
+        ),
+        (
+            "DO $$ BEGIN END $$ LANGUAGE nosuch;",
+            "language \"nosuch\" does not exist",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'select 1';
+             CREATE FUNCTION g() RETURNS int LANGUAGE plpgsql AS 'begin return 1; end';
+             DROP LANGUAGE IF EXISTS nosuch;
+             CREATE OR REPLACE LANGUAGE plpgsql;",
+        ),
+    ]);
+}

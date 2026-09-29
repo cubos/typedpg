@@ -502,6 +502,7 @@ pub(crate) fn do_block(
             _ => {}
         }
     }
+    super::languages::check(interp, &language)?;
     match language.as_str() {
         "plpgsql" => {}
         "sql" | "c" | "internal" => {
@@ -509,11 +510,9 @@ pub(crate) fn do_block(
                 "language \"{language}\" does not support inline code execution"
             )));
         }
-        _ => {
-            return Err(DdlError::TypeNotFound(format!(
-                "language \"{language}\" does not exist"
-            )));
-        }
+        // A language created by CREATE LANGUAGE: its inline handler isn't
+        // modeled.
+        _ => return Ok(()),
     }
     let Some(code) = code else {
         return Ok(());

@@ -20,6 +20,7 @@ pub(crate) mod function_body;
 pub mod functions;
 mod guc;
 pub mod indexes;
+pub(crate) mod languages;
 mod maintenance;
 pub(crate) mod opclass;
 pub mod operators;
@@ -235,6 +236,8 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         node::Node::AlterPolicyStmt(s) => policies::alter_policy(db, s),
         node::Node::RuleStmt(s) => rules::create_rule(db, s),
         node::Node::CreateAmStmt(s) => opclass::create_am(db, s),
+        node::Node::CreatePlangStmt(s) => languages::create_language(db, s),
+        node::Node::CreateTransformStmt(s) => languages::create_transform(db, s),
         node::Node::AlterTsconfigurationStmt(s) => text_search::alter_configuration(db, s),
         node::Node::AlterTsdictionaryStmt(s) => text_search::alter_dictionary(db, s),
         node::Node::CreateEventTrigStmt(s) => event_triggers::create_event_trigger(db, s),
@@ -306,8 +309,6 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         | node::Node::DropTableSpaceStmt(_)
         | node::Node::AlterTableSpaceOptionsStmt(_)
         | node::Node::CreateConversionStmt(_)
-        | node::Node::CreatePlangStmt(_)
-        | node::Node::CreateTransformStmt(_)
         | node::Node::AlterCollationStmt(_)
         | node::Node::AlterObjectDependsStmt(_) => Ok(()),
         node::Node::AlterTypeStmt(s) => types::alter_type(db, s),
