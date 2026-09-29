@@ -57,6 +57,7 @@ pub(crate) fn analyze_merge_with_outer_ctes(
         .relation
         .as_ref()
         .ok_or_else(|| AnalyzeError::Unsupported("MERGE without relation".into()))?;
+    super::from::check_rangevar_catalog(relation)?;
 
     // Process the optional `WITH` clause first (CTEs visible to source +
     // ON + every WHEN branch) — transformMergeStmt does it before anything

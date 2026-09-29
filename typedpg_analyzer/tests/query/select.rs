@@ -1007,3 +1007,24 @@ fn database_qualified_names_are_cross_database_references() {
         "improper qualified name (too many dotted names): a.b.c.d.e"
     );
 }
+
+/// A database-qualified relation (`db.schema.rel`) in FROM or as a DML
+/// target is a cross-database reference like any other catalog qualifier.
+#[test]
+fn database_qualified_relations_are_cross_database_references() {
+    let db = setup();
+    for sql in [
+        "SELECT * FROM x.public.users",
+        "SELECT u.id FROM posts JOIN x.public.users u ON u.id = posts.user_id",
+        "INSERT INTO x.public.users (id) VALUES (1)",
+        "UPDATE x.public.users SET age = 1",
+        "DELETE FROM x.public.users",
+        "MERGE INTO x.public.users u USING posts p ON u.id = p.user_id WHEN MATCHED THEN DELETE",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::FeatureNotSupported(_),
+            "cross-database references are not implemented: \"x.public.users\""
+        );
+    }
+}

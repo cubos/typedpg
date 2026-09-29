@@ -33,6 +33,7 @@ pub(crate) fn process_from_item(
 
     match inner {
         node::Node::RangeVar(rv) => {
+            check_rangevar_catalog(rv)?;
             let alias = rv
                 .alias
                 .as_ref()
@@ -842,6 +843,23 @@ fn apply_alias_column_names(
         }
     }
     Ok(())
+}
+
+/// RangeVarGetRelidExtended's catalog check: a relation qualified by a
+/// database name (`db.schema.rel`) must be in the current database, which
+/// the analyzer cannot know — every catalog qualifier is taken as another
+/// database (`crate::pgmsg::cross_database_reference`). PG quotes the
+/// whole name here.
+pub(crate) fn check_rangevar_catalog(rv: &protobuf::RangeVar) -> Result<(), AnalyzeError> {
+    if rv.catalogname.is_empty() {
+        return Ok(());
+    }
+    let name = format!("\"{}.{}.{}\"", rv.catalogname, rv.schemaname, rv.relname);
+    Err(crate::pgmsg::cross_database_reference(
+        &name,
+        crate::error::SourceSpan::from_node_qname(rv.location),
+    )
+    .finalize_implicit())
 }
 
 /// The scope a FROM function's arguments are resolved in: every FROM item

@@ -180,6 +180,7 @@ fn resolve_insert_target(
     relation: &protobuf::RangeVar,
     snapshot: &PgCatalog,
 ) -> Result<InsertTarget, AnalyzeError> {
+    super::from::check_rangevar_catalog(relation)?;
     let schema = (!relation.schemaname.is_empty()).then_some(relation.schemaname.as_str());
     let table = snapshot
         .resolve_table(schema, &relation.relname)
@@ -882,6 +883,7 @@ pub(crate) fn analyze_update_with_outer_ctes(
         .relation
         .as_ref()
         .ok_or_else(|| AnalyzeError::Unsupported("UPDATE without relation".into()))?;
+    super::from::check_rangevar_catalog(relation)?;
 
     let table = snapshot
         .resolve_table(
@@ -1009,6 +1011,7 @@ pub(crate) fn analyze_delete_with_outer_ctes(
         .relation
         .as_ref()
         .ok_or_else(|| AnalyzeError::Unsupported("DELETE without relation".into()))?;
+    super::from::check_rangevar_catalog(relation)?;
 
     let table = snapshot
         .resolve_table(
