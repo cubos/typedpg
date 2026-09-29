@@ -85,6 +85,7 @@ pub const PG_OPERATOR_RELID: PgClassOid = PgClassOid::from_raw(2617);
 pub const PG_CAST_RELID: PgClassOid = PgClassOid::from_raw(2605);
 pub const PG_EXTENSION_RELID: PgClassOid = PgClassOid::from_raw(3079);
 
+mod pg_query_catalog;
 mod rows;
 pub use rows::*;
 
@@ -290,6 +291,10 @@ pub struct PgCatalog {
     /// Whether migrations are being applied. Temporary objects belong to
     /// the migration runner's session: queries analyzed afterwards (in an
     /// application session) don't see them.
+    /// The source text of the statement being applied (from its RawStmt
+    /// location), for the checks that hand a statement back to libpg_query
+    /// (PL/pgSQL compilation). `None` outside `apply_sql`.
+    pub(crate) statement_sql: Option<String>,
     pub(crate) in_migration: bool,
     /// `ON COMMIT DROP` temporary tables of the current transaction.
     pub(crate) on_commit_drop: Vec<PgClassOid>,
@@ -592,6 +597,7 @@ impl PgCatalog {
             relpersistence: HashMap::new(),
             temp_namespace: None,
             in_migration: false,
+            statement_sql: None,
             on_commit_drop: Vec::new(),
             languages: Vec::new(),
             dropped_languages: Vec::new(),

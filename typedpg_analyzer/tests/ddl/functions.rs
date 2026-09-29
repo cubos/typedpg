@@ -931,3 +931,58 @@ fn plpgsql_function_bodies_are_compiled() {
          CREATE FUNCTION ok2() RETURNS int LANGUAGE plpgsql AS 'begin retrun 1; end';",
     )]);
 }
+
+#[test]
+fn plpgsql_bodies_compile_against_the_migration_catalog() {
+    // PL/pgSQL's compiler resolves types, schemas, %TYPE and %ROWTYPE
+    // against the catalog the migrations built. Expectations from PG 18.
+    let setup = "CREATE SCHEMA app;
+                 CREATE TYPE app.mood AS ENUM ('a');
+                 CREATE TABLE users (id int4 PRIMARY KEY, name text NOT NULL);
+                 CREATE TYPE shelly;";
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "CREATE FUNCTION p1(m app.mood, VARIADIC xs int4[]) RETURNS app.mood LANGUAGE plpgsql
+                 AS $$ DECLARE ms app.mood[]; r users%ROWTYPE; n users.name%TYPE; BEGIN RETURN m; END $$;
+             CREATE FUNCTION p7(x users.id%TYPE) RETURNS int LANGUAGE plpgsql
+                 AS $$ BEGIN RETURN x; END $$;
+             CREATE FUNCTION p8() RETURNS trigger LANGUAGE plpgsql
+                 AS $$ BEGIN NEW.name := upper(NEW.name); RETURN NEW; END $$;
+             DO $$ DECLARE m app.mood; BEGIN NULL; END $$;",
+        ),
+    ]);
+    for (function, message) in [
+        (
+            "CREATE FUNCTION p2() RETURNS int LANGUAGE plpgsql AS $$ DECLARE x shelly; BEGIN RETURN 1; END $$;",
+            "type \"shelly\" is only a shell",
+        ),
+        (
+            "CREATE FUNCTION p3() RETURNS int LANGUAGE plpgsql AS $$ DECLARE x app.nosuch; BEGIN RETURN 1; END $$;",
+            "type \"app.nosuch\" does not exist",
+        ),
+        (
+            "CREATE FUNCTION p4() RETURNS int LANGUAGE plpgsql AS $$ DECLARE x nope.t; BEGIN RETURN 1; END $$;",
+            "schema \"nope\" does not exist",
+        ),
+        (
+            "CREATE FUNCTION p5() RETURNS int LANGUAGE plpgsql AS $$ DECLARE r app.users%ROWTYPE; BEGIN RETURN 1; END $$;",
+            "relation \"app.users\" does not exist",
+        ),
+        (
+            "CREATE FUNCTION p6() RETURNS int LANGUAGE plpgsql AS $$ DECLARE n users.nope%TYPE; BEGIN RETURN 1; END $$;",
+            "column \"nope\" of relation \"users\" does not exist",
+        ),
+        (
+            "CREATE FUNCTION p9() RETURNS int LANGUAGE plpgsql AS $$ DECLARE r record[]; BEGIN RETURN 1; END $$;",
+            "variable \"r\" has pseudo-type record[]",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", function)]).expect_err(function);
+        assert!(
+            err.to_string().starts_with(message),
+            "{function}\n  got: {err}"
+        );
+    }
+}

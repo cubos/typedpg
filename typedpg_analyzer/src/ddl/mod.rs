@@ -147,7 +147,19 @@ fn apply_sql_statements(db: &mut PgCatalog, sql: &str) -> Result<(), DdlError> {
             continue;
         };
         tx.check(stmt)?;
-        apply_statement(db, stmt)?;
+        // stmt_len 0 means "to the end of the input".
+        let start = usize::try_from(raw_stmt.stmt_location).unwrap_or(0);
+        let end = match usize::try_from(raw_stmt.stmt_len) {
+            Ok(0) | Err(_) => sql.len(),
+            Ok(len) => start + len,
+        };
+        let text = sql.get(start..end).map(str::to_owned);
+        // Statements may apply nested SQL (extension scripts): restore the
+        // outer statement's text afterwards.
+        let outer = std::mem::replace(&mut db.statement_sql, text);
+        let result = apply_statement(db, stmt);
+        db.statement_sql = outer;
+        result?;
     }
 
     Ok(())

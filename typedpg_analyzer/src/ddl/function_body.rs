@@ -475,8 +475,12 @@ pub(crate) fn validate_plpgsql_function(
     if !is_plpgsql || !interp.check_function_bodies {
         return Ok(());
     }
-    let sql = deparse(node::Node::CreateFunctionStmt(Box::new(stmt.clone())))?;
-    compile_plpgsql(interp, &sql)
+    // The statement as written: libpg_query's PL/pgSQL entry point takes SQL
+    // text, and the migration's own text is exactly what PG compiles.
+    let Some(sql) = interp.statement_sql.as_deref() else {
+        return Ok(());
+    };
+    compile_plpgsql(interp, sql)
 }
 
 /// `DO [LANGUAGE lang] 'code'` (ExecuteDoStmt): the language must exist and
@@ -528,165 +532,18 @@ pub(crate) fn do_block(
     compile_plpgsql(interp, &sql)
 }
 
-/// Compile a `CREATE FUNCTION ... LANGUAGE plpgsql` statement with the
-/// PL/pgSQL grammar — which, compiling against the declared signature, also
-/// applies make_return_stmt's rules — and resolve its declared variables'
-/// types.
+/// Compile a `CREATE FUNCTION ... LANGUAGE plpgsql` statement (or a `DO`
+/// block wrapped as one) with PL/pgSQL's compiler, against this catalog: the
+/// compiler resolves the signature's and the declared variables' types,
+/// `%TYPE` / `%ROWTYPE`, and applies make_return_stmt's rules itself, with
+/// PostgreSQL's errors.
 fn compile_plpgsql(interp: &PgCatalog, sql: &str) -> Result<(), DdlError> {
-    let parsed = typedpg_pg_query::parse_plpgsql(sql).map_err(|e| match e {
-        typedpg_pg_query::Error::Parse(msg) => DdlError::Parse(msg),
-        other => DdlError::Parse(other.to_string()),
-    })?;
-    let datums = parsed
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|f| f.get("PLpgSQL_function")?.get("datums")?.as_array())
-        .flatten();
-    for datum in datums {
-        let Some(var) = datum
-            .get("PLpgSQL_var")
-            .or_else(|| datum.get("PLpgSQL_rec"))
-        else {
-            continue;
-        };
-        // Parameters and implicit variables (FOUND, TG_*) have no line
-        // number; only DECLAREd variables are checked.
-        if var.get("lineno").is_none() {
-            continue;
-        }
-        let Some(ty) = var.get("datatype").and_then(|d| d.get("PLpgSQL_type")) else {
-            continue;
-        };
-        // The name as written: libpg_query has no catalog, so a type it
-        // couldn't resolve (any user-defined one) is compiled as a record
-        // and only its written name tells what it was.
-        if let Some(names) = ty.get("origtypname").and_then(|n| n.as_array()) {
-            let tn = typedpg_pg_query::protobuf::TypeName {
-                names: names
-                    .iter()
-                    .filter_map(|n| n.as_str())
-                    .map(|n| typedpg_pg_query::protobuf::Node {
-                        node: Some(node::Node::String(typedpg_pg_query::protobuf::String {
-                            sval: n.to_owned(),
-                        })),
-                    })
-                    .collect(),
-                array_bounds: (0..ty
-                    .get("origtypname_array_bounds")
-                    .and_then(|b| b.as_u64())
-                    .unwrap_or(0))
-                    .map(|_| typedpg_pg_query::protobuf::Node {
-                        node: Some(node::Node::Integer(typedpg_pg_query::protobuf::Integer {
-                            ival: -1,
-                        })),
-                    })
-                    .collect(),
-                typemod: -1,
-                ..Default::default()
-            };
-            super::util::lookup_type_name(&tn, interp)?;
-            continue;
-        }
-        if let Some(typname) = ty.get("typname").and_then(|t| t.as_str()) {
-            check_declared_type(interp, typname)?;
-        }
-    }
-    Ok(())
-}
-
-/// Resolve a PL/pgSQL variable's declared type: `x%TYPE` names a column,
-/// `r%ROWTYPE` a relation, anything else is an ordinary type name.
-fn check_declared_type(interp: &PgCatalog, typname: &str) -> Result<(), DdlError> {
-    let trimmed = typname.trim();
-    let lower = trimmed.to_ascii_lowercase();
-    if let Some(prefix) = lower
-        .strip_suffix("%rowtype")
-        .map(|_| &trimmed[..trimmed.len() - "%rowtype".len()])
-    {
-        let names = split_dotted(prefix);
-        let (schema, name) = match names.as_slice() {
-            [name] => (None, name.as_str()),
-            [schema, name] => (Some(schema.as_str()), name.as_str()),
-            _ => return Ok(()),
-        };
-        if interp.resolve_table(schema, name).is_none() {
-            return Err(DdlError::TableNotFound(format!(
-                "relation \"{}\" does not exist",
-                names.join(".")
-            )));
-        }
-        return Ok(());
-    }
-    if lower.ends_with("%type") {
-        // A variable's own %TYPE (`x other_var%TYPE`) can't be told apart
-        // from a column reference here; only check `rel.col%TYPE`.
-        let names = split_dotted(&trimmed[..trimmed.len() - "%type".len()]);
-        if names.len() < 2 {
-            return Ok(());
-        }
-        let tn = typedpg_pg_query::protobuf::TypeName {
-            names: names
-                .into_iter()
-                .map(|n| typedpg_pg_query::protobuf::Node {
-                    node: Some(node::Node::String(typedpg_pg_query::protobuf::String {
-                        sval: n,
-                    })),
-                })
-                .collect(),
-            pct_type: true,
-            ..Default::default()
-        };
-        super::util::lookup_type_name(&tn, interp)?;
-        return Ok(());
-    }
-    let Ok(parsed) = typedpg_pg_query::parse(&format!("SELECT NULL::{trimmed}")) else {
-        return Ok(());
-    };
-    let tn = parsed
-        .protobuf
-        .nodes()
-        .into_iter()
-        .find_map(|(n, ..)| match n {
-            typedpg_pg_query::NodeRef::TypeCast(tc) => tc.type_name.clone(),
-            _ => None,
-        });
-    if let Some(tn) = tn {
-        super::util::lookup_type_name(&tn, interp)?;
-    }
-    Ok(())
-}
-
-/// Split `a.b."C"` into identifiers (quoted ones as written, bare ones
-/// downcased).
-fn split_dotted(text: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut chars = text.trim().chars().peekable();
-    loop {
-        let mut part = String::new();
-        if chars.next_if_eq(&'"').is_some() {
-            while let Some(c) = chars.next() {
-                if c == '"' {
-                    if chars.next_if_eq(&'"').is_some() {
-                        part.push('"');
-                    } else {
-                        break;
-                    }
-                } else {
-                    part.push(c);
-                }
-            }
-        } else {
-            while let Some(c) = chars.next_if(|&c| c != '.') {
-                part.push(c.to_ascii_lowercase());
-            }
-        }
-        out.push(part.trim().to_owned());
-        if chars.next_if_eq(&'.').is_none() {
-            break;
-        }
-    }
-    out
+    typedpg_pg_query::parse_plpgsql_with_catalog(sql, interp)
+        .map(|_| ())
+        .map_err(|e| match e {
+            typedpg_pg_query::Error::Parse(msg) => DdlError::Parse(msg),
+            other => DdlError::Parse(other.to_string()),
+        })
 }
 
 /// The pseudo-types a function may take and return: ProcedureCreate's
