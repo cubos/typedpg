@@ -87,6 +87,21 @@ pub(crate) struct TableSource {
     /// expression) yields when it has no backing relation — PG's
     /// `makeWholeRowVar` for a function RTE.
     pub whole_row: WholeRow,
+    /// For a view or FROM subquery: what a locking clause pushed into it
+    /// hits in the levels below it (a view's own query, an outer join's
+    /// nullable side there) — the rewriter / planner errors PG raises when
+    /// the statement is planned.
+    pub lock_error: Option<LockBlock>,
+}
+
+/// Why a locking clause can't be pushed into a view or subquery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LockBlock {
+    /// `CheckSelectLocking`: `FOR UPDATE is not allowed with <construct>`.
+    NotAllowedWith(&'static str),
+    /// `make_outerjoininfo`: a marked relation on an outer join's nullable
+    /// side.
+    NullableSide,
 }
 
 /// The value of a whole-row reference to a FROM item without a backing
@@ -157,6 +172,7 @@ impl TableSource {
             null_row: false,
             dml_target: false,
             whole_row: WholeRow::Record,
+            lock_error: None,
         }
     }
 

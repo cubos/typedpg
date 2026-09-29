@@ -19,7 +19,9 @@ pub(crate) fn analyze_set_operation(
         .as_ref()
         .ok_or_else(|| AnalyzeError::Unsupported("UNION without right side".into()))?;
 
+    check_set_op_member_locking(left)?;
     let (left_cols, _) = analyze_select_with_ctes(left, snapshot, params, cte_scopes)?;
+    check_set_op_member_locking(right)?;
     let (right_cols, _) = analyze_select_with_ctes(right, snapshot, params, cte_scopes)?;
 
     // PG names the operation in both error messages below.
@@ -268,5 +270,22 @@ fn arm_unknown_literal(arm: &protobuf::SelectStmt, i: usize) -> Option<&str> {
             _ => None,
         },
         _ => None,
+    }
+}
+
+/// transformSetOperationTree: no member of a set-operation tree may carry
+/// a locking clause (0A000), checked as each member is reached.
+pub(crate) fn check_set_op_member_locking(arm: &protobuf::SelectStmt) -> Result<(), AnalyzeError> {
+    match arm.locking_clause.first().and_then(|n| n.node.as_ref()) {
+        Some(node::Node::LockingClause(lc)) => Err(crate::error::RawError::new(
+            AnalyzeError::FeatureNotSupported(format!(
+                "{} is not allowed with UNION/INTERSECT/EXCEPT",
+                lock_strength_name(lc)
+            )),
+            None,
+            None,
+        )
+        .finalize_implicit()),
+        _ => Ok(()),
     }
 }

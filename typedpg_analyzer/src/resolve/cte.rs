@@ -71,6 +71,7 @@ pub(crate) fn analyze_cte(
             if let Some(with) = &sel.with_clause {
                 body_ctes = analyze_with_clause(with, snapshot, params, &body_ctes, outer_sources)?;
             }
+            check_set_op_member_locking(larg)?;
             let (mut seed_cols, _) = analyze_body(larg, params, &body_ctes)?;
             // analyzeCTETargetList: a recursive CTE exposes an `unknown`
             // column (an untyped literal or parameter) as text before the
@@ -90,6 +91,7 @@ pub(crate) fn analyze_cte(
                 owner_depth,
             );
 
+            check_set_op_member_locking(rarg)?;
             let (rec_cols, _) = analyze_body(rarg, params, &scopes_with_self)?;
             check_no_aggregates_in_recursive_term(rarg, snapshot)?;
             if seed_cols.len() != rec_cols.len() {

@@ -825,6 +825,16 @@ fn check_locking_clause(
             let Some(node::Node::RangeVar(rv)) = rel.node.as_ref() else {
                 continue;
             };
+            if !rv.schemaname.is_empty() || !rv.catalogname.is_empty() {
+                return Err(crate::error::RawError::new(
+                    AnalyzeError::SyntaxError(format!(
+                        "{clause} must specify unqualified relation names"
+                    )),
+                    crate::error::SourceSpan::from_node_qname(rv.location),
+                    None,
+                )
+                .finalize_implicit());
+            }
             let Some(source) = scope.sources.iter().find(|s| s.alias == rv.relname) else {
                 return Err(crate::error::RawError::new(
                     AnalyzeError::UndefinedTable(format!(
@@ -858,12 +868,31 @@ fn check_locking_clause(
             }
         }
         for source in &locked {
-            if matches!(source.kind, SourceKind::Relation)
-                && null_ctx.is_nullable(&source.alias, "", true)
+            if matches!(
+                source.kind,
+                SourceKind::Relation | SourceKind::Subquery { .. }
+            ) && null_ctx.is_nullable(&source.alias, "", true)
             {
                 return Err(unsupported(format!(
                     "{clause} cannot be applied to the nullable side of an outer join"
                 )));
+            }
+        }
+        // Below a locked view or subquery: its own query's blockers and
+        // nullable sides (the rewriter / planner's errors).
+        for source in &locked {
+            match source.lock_error {
+                Some(crate::scope::LockBlock::NotAllowedWith(blocker)) => {
+                    return Err(unsupported(format!(
+                        "{clause} is not allowed with {blocker}"
+                    )));
+                }
+                Some(crate::scope::LockBlock::NullableSide) => {
+                    return Err(unsupported(format!(
+                        "{clause} cannot be applied to the nullable side of an outer join"
+                    )));
+                }
+                None => {}
             }
         }
     }

@@ -81,6 +81,11 @@ pub(crate) fn process_from_item(
                 alias,
                 crate::error::SourceSpan::from_node_qname(rv.location),
             )?;
+            if let Some(class) = snapshot.resolve_table(schema, &rv.relname)
+                && let Some(src) = scope.sources.last_mut()
+            {
+                src.lock_error = view_lock_error(class, snapshot);
+            }
             apply_alias_column_names(scope, rv.alias.as_ref())?;
         }
         node::Node::JoinExpr(join) => {
@@ -186,6 +191,9 @@ pub(crate) fn process_from_item(
                         lock_blocker: subquery_lock_blocker(sel, snapshot),
                     },
                 )?;
+                if let Some(src) = scope.sources.last_mut() {
+                    src.lock_error = pushed_lock_error(sel, snapshot);
+                }
             }
         }
         node::Node::RangeFunction(rf) => {
@@ -1413,4 +1421,96 @@ fn json_table_columns(
         });
     }
     Ok(())
+}
+
+/// What a locking clause pushed into query `sel` — a FROM subquery or a
+/// view's definition — runs into below the level that names it:
+/// `CheckSelectLocking` on it and its nested subqueries (the parser's
+/// `transformLockingClause` for subqueries, `grouping_planner` for views,
+/// whose queries only appear after the rewriter's `markQueryForLocking`),
+/// the same for the views it reads, and `make_outerjoininfo`'s refusal of
+/// a marked relation or subquery on an outer join's nullable side.
+pub(crate) fn pushed_lock_error(
+    sel: &protobuf::SelectStmt,
+    snapshot: &PgCatalog,
+) -> Option<crate::scope::LockBlock> {
+    use crate::scope::LockBlock;
+    if let Some(b) = subquery_lock_blocker(sel, snapshot) {
+        return Some(LockBlock::NotAllowedWith(b));
+    }
+    let ctes: Vec<String> = sel
+        .with_clause
+        .as_ref()
+        .map(|w| {
+            w.ctes
+                .iter()
+                .filter_map(|c| match c.node.as_ref()? {
+                    node::Node::CommonTableExpr(c) => Some(c.ctename.clone()),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    fn item(
+        n: &protobuf::Node,
+        nullable: bool,
+        ctes: &[String],
+        snapshot: &PgCatalog,
+    ) -> Option<crate::scope::LockBlock> {
+        use crate::scope::LockBlock;
+        match n.node.as_ref()? {
+            node::Node::RangeVar(rv) => {
+                if rv.schemaname.is_empty() && ctes.contains(&rv.relname) {
+                    return None;
+                }
+                let schema = (!rv.schemaname.is_empty()).then_some(rv.schemaname.as_str());
+                let class = snapshot.resolve_table(schema, &rv.relname)?;
+                if nullable {
+                    return Some(LockBlock::NullableSide);
+                }
+                view_lock_error(class, snapshot)
+            }
+            node::Node::RangeSubselect(rs) => {
+                if nullable {
+                    return Some(LockBlock::NullableSide);
+                }
+                match rs.subquery.as_deref()?.node.as_ref()? {
+                    node::Node::SelectStmt(s) => pushed_lock_error(s, snapshot),
+                    _ => None,
+                }
+            }
+            node::Node::RangeTableSample(ts) => item(ts.relation.as_deref()?, nullable, ctes, snapshot),
+            node::Node::JoinExpr(j) => {
+                let (l, r) = match JoinType::try_from(j.jointype) {
+                    Ok(JoinType::JoinLeft) => (nullable, true),
+                    Ok(JoinType::JoinRight) => (true, nullable),
+                    Ok(JoinType::JoinFull) => (true, true),
+                    _ => (nullable, nullable),
+                };
+                j.larg
+                    .as_deref()
+                    .and_then(|n| item(n, l, ctes, snapshot))
+                    .or_else(|| j.rarg.as_deref().and_then(|n| item(n, r, ctes, snapshot)))
+            }
+            // Functions, VALUES, JSON_TABLE… are unaffected by FOR UPDATE.
+            _ => None,
+        }
+    }
+    sel.from_clause
+        .iter()
+        .find_map(|n| item(n, false, &ctes, snapshot))
+}
+
+/// [`pushed_lock_error`] for a view's stored query (`None` for a table).
+pub(crate) fn view_lock_error(
+    class: &crate::pg_catalog::PgClass,
+    snapshot: &PgCatalog,
+) -> Option<crate::scope::LockBlock> {
+    if class.relkind != crate::pg_catalog::RelKind::View {
+        return None;
+    }
+    match crate::ddl::views::view_query(snapshot, class.oid)?.node? {
+        node::Node::SelectStmt(s) => pushed_lock_error(&s, snapshot),
+        _ => None,
+    }
 }

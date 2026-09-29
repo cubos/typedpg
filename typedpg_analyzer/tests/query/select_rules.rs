@@ -135,6 +135,96 @@ fn locking_clause_targets() {
     }
 }
 
+/// transformSetOperationTree refuses a locking clause on any member of a
+/// set operation, parenthesized or not, recursive-CTE terms included.
+#[test]
+fn locking_clause_on_a_set_operation_member() {
+    let db = setup();
+    for sql in [
+        "(SELECT id FROM t FOR UPDATE) UNION SELECT id FROM u",
+        "SELECT id FROM t UNION (SELECT id FROM u FOR SHARE)",
+        "SELECT id FROM t UNION (SELECT id FROM u UNION (SELECT id FROM t FOR UPDATE))",
+        "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL (SELECT n + 1 FROM r WHERE n < 3 FOR UPDATE)) \
+         SELECT * FROM r",
+    ] {
+        let err = assert_err_prefix(&db, sql, "FOR ");
+        assert!(
+            err.to_string()
+                .contains("is not allowed with UNION/INTERSECT/EXCEPT"),
+            "{sql}: {err}"
+        );
+    }
+}
+
+/// transformLockingClause: `FOR UPDATE OF` names FROM entries, never
+/// schema-qualified relations (42601).
+#[test]
+fn locking_clause_names_are_unqualified() {
+    let db = setup();
+    let err = assert_err_prefix(
+        &db,
+        "SELECT * FROM t FOR UPDATE OF public.t",
+        "FOR UPDATE must specify unqualified relation names",
+    );
+    assert!(matches!(err, AnalyzeError::SyntaxError(_)), "{err:?}");
+}
+
+/// A locking clause pushed into a view (rewriter) or subquery reaches its
+/// query: grouping there fails in the planner's CheckSelectLocking, a
+/// relation on an outer join's nullable side in make_outerjoininfo — every
+/// execution fails, so the analyzer rejects them.
+#[test]
+fn locking_clause_through_views_and_subqueries() {
+    let mut db = setup();
+    db.apply_sql(
+        "CREATE VIEW va AS SELECT count(*) AS c FROM t;
+         CREATE VIEW vl AS SELECT t.id, u.x FROM t LEFT JOIN u ON u.t_id = t.id;
+         CREATE VIEW vv AS SELECT * FROM vl;
+         CREATE VIEW vp AS SELECT id, a FROM t;",
+    )
+    .unwrap();
+    for (sql, msg) in [
+        (
+            "SELECT * FROM va FOR UPDATE",
+            "FOR UPDATE is not allowed with aggregate functions",
+        ),
+        (
+            "SELECT * FROM (SELECT * FROM va) q FOR SHARE",
+            "FOR SHARE is not allowed with aggregate functions",
+        ),
+        (
+            "SELECT * FROM vl FOR UPDATE",
+            "FOR UPDATE cannot be applied to the nullable side of an outer join",
+        ),
+        (
+            "SELECT * FROM vv FOR UPDATE",
+            "FOR UPDATE cannot be applied to the nullable side of an outer join",
+        ),
+        (
+            "SELECT * FROM (SELECT t.id FROM t LEFT JOIN u ON u.t_id = t.id) q FOR UPDATE",
+            "FOR UPDATE cannot be applied to the nullable side of an outer join",
+        ),
+        (
+            "SELECT * FROM t LEFT JOIN (SELECT * FROM u) q ON q.t_id = t.id FOR UPDATE",
+            "FOR UPDATE cannot be applied to the nullable side of an outer join",
+        ),
+    ] {
+        let err = assert_err_prefix(&db, sql, msg);
+        assert!(
+            matches!(err, AnalyzeError::FeatureNotSupported(_)),
+            "{sql}: {err:?}"
+        );
+    }
+    for sql in [
+        "SELECT * FROM vp FOR UPDATE",
+        "SELECT * FROM va, t FOR UPDATE OF t",
+        "SELECT * FROM (SELECT * FROM vp) q FOR UPDATE",
+        "SELECT * FROM t LEFT JOIN (SELECT * FROM u) q ON q.t_id = t.id FOR UPDATE OF t",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
+
 // ── Set-operation ORDER BY / LIMIT ───────────────────────────────────────────
 
 fn setup_wide() -> PgCatalog {
