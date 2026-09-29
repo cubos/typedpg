@@ -1219,3 +1219,33 @@ fn a_partitioned_tables_identity_changes_through_the_whole_tree() {
         ),
     ]);
 }
+
+#[test]
+fn drop_column_only_refuses_a_partitioned_table_with_partitions() {
+    // ATExecDropColumn: a partition's columns are its parent's, so ONLY is
+    // refused while partitions exist (a regular parent's children keep the
+    // column as their own).
+    let setup = "CREATE TABLE p (a int, b int) PARTITION BY RANGE (a);
+                 CREATE TABLE c PARTITION OF p FOR VALUES FROM (1) TO (2);
+                 CREATE TABLE e (a int, b int) PARTITION BY RANGE (a);
+                 CREATE TABLE r (a int, b int);
+                 CREATE TABLE rc () INHERITS (r);";
+    let stmt = "ALTER TABLE ONLY p DROP COLUMN b;";
+    let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+    assert!(
+        err.to_string()
+            .starts_with("cannot drop column from only the partitioned table when partitions exist"),
+        "got: {err}"
+    );
+    let db = build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "ALTER TABLE p DROP COLUMN b;
+             ALTER TABLE ONLY e DROP COLUMN b;
+             ALTER TABLE ONLY r DROP COLUMN b;",
+        ),
+    ]);
+    db.analyze("SELECT * FROM c").unwrap();
+    db.analyze("SELECT b FROM rc").unwrap();
+}

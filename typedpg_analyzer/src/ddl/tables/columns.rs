@@ -965,6 +965,18 @@ pub(crate) fn drop_column(
         )));
     }
 
+    // ATExecDropColumn: a partition's columns are its parent's.
+    if !rec.recurse
+        && interp.pg_class.get(&relid).map(|c| c.relkind) == Some(RelKind::Partitioned)
+        && !inherit::children_of(interp, relid).is_empty()
+    {
+        return Err(DdlError::Parse(
+            "cannot drop column from only the partitioned table when partitions exist (Do not \
+             specify the ONLY keyword.)"
+                .into(),
+        ));
+    }
+
     let cascade = matches!(
         DropBehavior::try_from(cmd.behavior),
         Ok(DropBehavior::DropCascade)
