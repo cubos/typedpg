@@ -648,5 +648,8 @@ fn a_publication_holds_on_to_its_column_list_and_row_filter() {
             "cannot drop column b of table tq because other objects depend on it",
         ),
     ]);
-    build(&[("0001.sql", &format!("{setup} ALTER TABLE tp DROP COLUMN c;"))]);
+    build(&[(
+        "0001.sql",
+        &format!("{setup} ALTER TABLE tp DROP COLUMN c;"),
+    )]);
 }
