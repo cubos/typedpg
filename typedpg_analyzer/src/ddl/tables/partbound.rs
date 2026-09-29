@@ -404,7 +404,25 @@ fn bound_value(
         infer_expr(v, ctx(), &mut params, TypeGoal::assignment(*key_type))
             .map_err(|e| DdlError::Parse(e.to_string()))?;
     }
-    Ok(Some(normalize(interp, v, key)))
+    let datum = normalize(interp, v, key);
+    // evaluate_expr: the value coerced to an integer key must fit it (the
+    // cast's "smallint out of range").
+    let base = interp.unwrap_domain(*key_type);
+    let range = match base {
+        oid::INT2 => Some((i128::from(i16::MIN), i128::from(i16::MAX))),
+        oid::INT4 => Some((i128::from(i32::MIN), i128::from(i32::MAX))),
+        oid::INT8 => Some((i128::from(i64::MIN), i128::from(i64::MAX))),
+        _ => None,
+    };
+    if let (Some((lo, hi)), Datum::Int(value)) = (range, &datum)
+        && !(lo..=hi).contains(value)
+    {
+        return Err(DdlError::Parse(format!(
+            "{} out of range",
+            format_type_for_message(interp, base)
+        )));
+    }
+    Ok(Some(datum))
 }
 
 /// The comparable form of a bound constant.
@@ -421,6 +439,7 @@ fn normalize(
         interp.pg_type.get(&key).map(|t| t.typcategory),
         Some(crate::pg_catalog::TypCategory::String)
     );
+    let bool_key = key == oid::BOOL;
     let literal = match v.node.as_ref() {
         Some(node::Node::AConst(c)) => c.val.as_ref(),
         Some(node::Node::TypeCast(tc)) => match tc.arg.as_deref().and_then(|a| a.node.as_ref()) {
@@ -435,14 +454,15 @@ fn normalize(
     use typedpg_pg_query::protobuf::a_const::Val;
     match literal {
         Some(Val::Ival(i)) if integer_key => Datum::Int(i128::from(i.ival)),
-        Some(Val::Sval(s)) if integer_key => s
-            .sval
-            .trim()
-            .parse::<i128>()
+        // int2in / int4in / int8in.
+        Some(Val::Sval(s)) if integer_key => crate::literal_input::parse_pg_integer(&s.sval)
             .map_or(Datum::Opaque, Datum::Int),
-        Some(Val::Fval(f)) if integer_key && !f.fval.contains(['.', 'e', 'E']) => {
-            f.fval.parse::<i128>().map_or(Datum::Opaque, Datum::Int)
-        }
+        // A numeric constant cast to an integer rounds half away from zero.
+        Some(Val::Fval(f)) if integer_key => round_numeric(&f.fval).map_or(Datum::Opaque, Datum::Int),
+        // boolin: the values of one truth are one bound value.
+        Some(Val::Boolval(b)) if bool_key => Datum::Int(i128::from(b.boolval)),
+        Some(Val::Sval(s)) if bool_key => crate::ddl::reloptions::parse_bool(&s.sval)
+            .map_or(Datum::Opaque, |b| Datum::Int(i128::from(b))),
         Some(Val::Sval(s)) if datetime_key => {
             iso_datetime(&s.sval).map_or(Datum::Opaque, Datum::Stamp)
         }
@@ -452,6 +472,37 @@ fn normalize(
         Some(Val::Sval(s)) if text_key => Datum::Text(s.sval.clone()),
         _ => Datum::Opaque,
     }
+}
+
+/// A numeric constant (`1.5`, `-2.49`, `12e3`) rounded to an integer, half
+/// away from zero, as numeric_int4 does.
+fn round_numeric(text: &str) -> Option<i128> {
+    let (mantissa, exponent) = match text.split_once(['e', 'E']) {
+        Some((m, e)) => (m, e.parse::<i32>().ok()?),
+        None => (text, 0),
+    };
+    let negative = mantissa.starts_with('-');
+    let mantissa = mantissa.trim_start_matches(['-', '+']);
+    let (int_part, frac_part) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let mut digits: String = format!("{int_part}{frac_part}");
+    // The position of the decimal point within `digits`.
+    let point = i64::try_from(int_part.len()).ok()? + i64::from(exponent);
+    if point > 38 {
+        return None;
+    }
+    if point < 0 {
+        return Some(0);
+    }
+    let point = usize::try_from(point).ok()?;
+    while digits.len() < point {
+        digits.push('0');
+    }
+    let (whole, rest) = digits.split_at(point);
+    let mut value: i128 = if whole.is_empty() { 0 } else { whole.parse().ok()? };
+    if rest.as_bytes().first().is_some_and(|d| *d >= b'5') {
+        value += 1;
+    }
+    Some(if negative { -value } else { value })
 }
 
 /// Evaluate an integer constant expression of `+`, `-`, `*` over integer

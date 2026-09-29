@@ -1371,3 +1371,72 @@ fn create_table_as_execute_runs_a_prepared_statement() {
     );
     assert_cols(&db.analyze("SELECT y FROM b3").unwrap(), vec![cn("y", int4())]);
 }
+
+#[test]
+fn partition_bound_values_are_coerced_to_the_key_type() {
+    // transformPartitionBoundValue coerces a bound to the key type and
+    // evaluates it: an integer overflowing the key's type fails, a numeric
+    // rounds, and values equal once coerced ('t' and true, '1' and 1.2 for
+    // an integer) are one value.
+    let setup = "CREATE TABLE p (a smallint) PARTITION BY RANGE (a);
+                 CREATE TABLE c3 PARTITION OF p FOR VALUES FROM (1.4) TO (3.5);
+                 CREATE TABLE q (a bool) PARTITION BY LIST (a);
+                 CREATE TABLE q1 PARTITION OF q FOR VALUES IN (true);
+                 CREATE TABLE q4 PARTITION OF q FOR VALUES IN ('off');
+                 CREATE TABLE r (a int) PARTITION BY LIST (a);
+                 CREATE TABLE r1 PARTITION OF r FOR VALUES IN (1);
+                 CREATE TABLE r4 PARTITION OF r FOR VALUES IN (' 2 ', 2);";
+    for (stmt, msg) in [
+        (
+            "CREATE TABLE c1 PARTITION OF p FOR VALUES FROM (10) TO (100000);",
+            "smallint out of range",
+        ),
+        (
+            "CREATE TABLE c7 PARTITION OF p FOR VALUES FROM (32767.6) TO (MAXVALUE);",
+            "smallint out of range",
+        ),
+        (
+            "CREATE TABLE r6 PARTITION OF r FOR VALUES IN (3000000000);",
+            "integer out of range",
+        ),
+        (
+            "CREATE TABLE c4 PARTITION OF p FOR VALUES FROM (1) TO (2);",
+            "partition \"c4\" would overlap partition \"c3\"",
+        ),
+        (
+            "CREATE TABLE q2 PARTITION OF q FOR VALUES IN ('t');",
+            "partition \"q2\" would overlap partition \"q1\"",
+        ),
+        (
+            "CREATE TABLE q3 PARTITION OF q FOR VALUES IN ('yes');",
+            "partition \"q3\" would overlap partition \"q1\"",
+        ),
+        (
+            "CREATE TABLE q5 PARTITION OF q FOR VALUES IN (false);",
+            "partition \"q5\" would overlap partition \"q4\"",
+        ),
+        (
+            "CREATE TABLE r2 PARTITION OF r FOR VALUES IN ('1');",
+            "partition \"r2\" would overlap partition \"r1\"",
+        ),
+        (
+            "CREATE TABLE r3 PARTITION OF r FOR VALUES IN (1.2);",
+            "partition \"r3\" would overlap partition \"r1\"",
+        ),
+        (
+            "CREATE TABLE r5 PARTITION OF r FOR VALUES IN (2);",
+            "partition \"r5\" would overlap partition \"r4\"",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "CREATE TABLE c6 PARTITION OF p FOR VALUES FROM (4.4) TO (6);
+             CREATE TABLE r7 PARTITION OF r FOR VALUES IN (2.5e0);",
+        ),
+    ]);
+}
