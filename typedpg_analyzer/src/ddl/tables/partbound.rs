@@ -91,7 +91,10 @@ fn compares_bytes(interp: &PgCatalog, opclass: Option<crate::oid::PgOpclassOid>)
         .and_then(|oid| crate::ddl::opclass::opclass_by_oid(interp, oid))
         .is_some_and(|c| {
             c.opcmethod == "btree"
-                && matches!(c.opcname.as_str(), "text_pattern_ops" | "varchar_pattern_ops")
+                && matches!(
+                    c.opcname.as_str(),
+                    "text_pattern_ops" | "varchar_pattern_ops"
+                )
                 && interp.namespace_name(c.opcnamespace) == Some("pg_catalog")
         })
 }
@@ -490,10 +493,13 @@ fn normalize(
     match literal {
         Some(Val::Ival(i)) if integer_key => Datum::Int(i128::from(i.ival)),
         // int2in / int4in / int8in.
-        Some(Val::Sval(s)) if integer_key => crate::literal_input::parse_pg_integer(&s.sval)
-            .map_or(Datum::Opaque, Datum::Int),
+        Some(Val::Sval(s)) if integer_key => {
+            crate::literal_input::parse_pg_integer(&s.sval).map_or(Datum::Opaque, Datum::Int)
+        }
         // A numeric constant cast to an integer rounds half away from zero.
-        Some(Val::Fval(f)) if integer_key => round_numeric(&f.fval).map_or(Datum::Opaque, Datum::Int),
+        Some(Val::Fval(f)) if integer_key => {
+            round_numeric(&f.fval).map_or(Datum::Opaque, Datum::Int)
+        }
         // boolin: the values of one truth are one bound value.
         Some(Val::Boolval(b)) if bool_key => Datum::Int(i128::from(b.boolval)),
         Some(Val::Sval(s)) if bool_key => crate::ddl::reloptions::parse_bool(&s.sval)
@@ -533,7 +539,11 @@ fn round_numeric(text: &str) -> Option<i128> {
         digits.push('0');
     }
     let (whole, rest) = digits.split_at(point);
-    let mut value: i128 = if whole.is_empty() { 0 } else { whole.parse().ok()? };
+    let mut value: i128 = if whole.is_empty() {
+        0
+    } else {
+        whole.parse().ok()?
+    };
     if rest.as_bytes().first().is_some_and(|d| *d >= b'5') {
         value += 1;
     }
