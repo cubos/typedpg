@@ -20,7 +20,7 @@ use typedpg_pg_query::protobuf::{IndexStmt, node};
 
 use super::DdlError;
 use super::volatile::{ExprLocation, check_no_volatile};
-use crate::oid::PgClassOid;
+use crate::oid::{PgClassOid, PgCollationOid, PgOpclassOid};
 use crate::pg_catalog::{AstBinding, PgCatalog, PgClass, PgIndex, RelKind, SerializedAst};
 
 pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError> {
@@ -106,6 +106,8 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
         .collect();
     let mut indkey: Vec<i16> = Vec::with_capacity(stmt.index_params.len());
     let mut key_columns: Vec<IndexKeyColumn> = Vec::with_capacity(stmt.index_params.len());
+    let mut indclass = Vec::with_capacity(stmt.index_params.len());
+    let mut indcollation = Vec::with_capacity(stmt.index_params.len());
     let mut indexprs: Vec<SerializedAst> = Vec::new();
     for param in &stmt.index_params {
         let Some(node::Node::IndexElem(elem)) = param.node.as_ref() else {
@@ -136,7 +138,7 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
         };
         // ComputeIndexAttrs: the collation, ResolveOpClass, then the
         // ordering options (amcanorder).
-        let (column, _) = compute_key_column(
+        let key = compute_key_column(
             db,
             am,
             caps.as_ref(),
@@ -145,9 +147,10 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
             column_type.and_then(|(_, c)| c),
             None,
         )?;
-        key_columns.push(column);
+        key_columns.push(key.column);
+        indclass.push(key.opclass);
+        indcollation.push(key.collation);
     }
-    let indcollation: Vec<_> = key_columns.iter().map(|c| c.collation).collect();
     // ComputeIndexAttrs: the INCLUDE columns follow the key columns in
     // indkey; they must be plain columns.
     let indnkeyatts = indkey.len() as i16;
@@ -273,6 +276,8 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
         indkey,
         indexprs,
         indpred,
+        indcollation,
+        indclass,
     });
     // DefineIndex on a partitioned table recurses — not under ONLY, where
     // the index stays invalid while the table has partitions without one
@@ -336,17 +341,13 @@ fn check_index_expression(
 /// and INCLUDE ones — a partition key or a foreign key may have.
 pub(crate) const INDEX_MAX_KEYS: usize = 32;
 
-/// What `pg_index` keeps of one key column beyond `indkey`.
+/// What the analyzer keeps of one key column beyond `pg_index`'s
+/// `indkey` / `indclass` / `indcollation`.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct IndexKeyColumn {
-    /// The key's type, which `opclass` was resolved for (`opckeytype`
+    /// The key's type, which `indclass` was resolved for (`opckeytype`
     /// aside).
     pub(crate) typ: Option<crate::oid::PgTypeOid>,
-    /// `indclass`: the operator class. `None` when the column's type is
-    /// unknown to the analyzer.
-    pub(crate) opclass: Option<super::opclass::OpclassId>,
-    /// `indcollation`.
-    pub(crate) collation: Option<crate::oid::PgCollationOid>,
     /// `indoption == 0`: ASC NULLS LAST.
     pub(crate) default_order: bool,
     /// The exclusion constraint's operator for this column (`conexclop`),
@@ -360,6 +361,25 @@ pub(crate) struct IndexKeyColumn {
 pub(crate) struct IndexKeys {
     pub(crate) columns: Vec<IndexKeyColumn>,
     pub(crate) nulls_not_distinct: bool,
+}
+
+/// One key column as ComputeIndexAttrs resolves it.
+struct ComputedKey {
+    column: IndexKeyColumn,
+    /// `indclass`.
+    opclass: Option<PgOpclassOid>,
+    /// `indcollation`.
+    collation: Option<PgCollationOid>,
+    /// The exclusion operator (`indexInfo->ii_ExclusionOps`).
+    exclusion_opr: Option<crate::oid::PgOperatorOid>,
+}
+
+/// An index-backed constraint's index as DefineIndex resolves it.
+pub(crate) struct ConstraintIndex {
+    pub(crate) am: String,
+    pub(crate) keys: IndexKeys,
+    pub(crate) indclass: Vec<Option<PgOpclassOid>>,
+    pub(crate) indcollation: Vec<Option<PgCollationOid>>,
 }
 
 /// DefineIndex: an index has at most INDEX_MAX_KEYS columns, key and
@@ -436,7 +456,7 @@ fn compute_key_column(
     typ: Option<crate::oid::PgTypeOid>,
     column_collation: Option<crate::oid::PgCollationOid>,
     exclusion_op: Option<&[typedpg_pg_query::protobuf::Node]>,
-) -> Result<(IndexKeyColumn, Option<crate::oid::PgOperatorOid>), DdlError> {
+) -> Result<ComputedKey, DdlError> {
     use typedpg_pg_query::protobuf::{SortByDir, SortByNulls};
     let mut collation = column_collation;
     if let Some(names) = elem
@@ -486,7 +506,7 @@ fn compute_key_column(
             .collect()
     });
     let exclusion_opr = match (exclusion_op.as_deref(), typ) {
-        (Some(names), Some(t)) => check_exclusion_operator(db, names, t, opclass.as_ref())?,
+        (Some(names), Some(t)) => check_exclusion_operator(db, names, t, opclass)?,
         _ => None,
     };
     let (ordering, nulls) = elem.map_or(
@@ -517,14 +537,16 @@ fn compute_key_column(
     } else {
         nulls == SortByNulls::SortbyNullsFirst as i32
     };
-    let column = IndexKeyColumn {
-        typ,
+    Ok(ComputedKey {
+        column: IndexKeyColumn {
+            typ,
+            default_order: !desc && !nulls_first,
+            exclusion_op,
+        },
         opclass,
         collation,
-        default_order: !desc && !nulls_first,
-        exclusion_op,
-    };
-    Ok((column, exclusion_opr))
+        exclusion_opr,
+    })
 }
 
 /// ComputeIndexAttrs: an exclusion constraint's operator must take the
@@ -535,7 +557,7 @@ fn check_exclusion_operator(
     db: &PgCatalog,
     names: &[String],
     typ: crate::oid::PgTypeOid,
-    opclass: Option<&super::opclass::OpclassId>,
+    opclass: Option<PgOpclassOid>,
 ) -> Result<Option<crate::oid::PgOperatorOid>, DdlError> {
     use crate::lookup::OperatorMatch;
     let name = names.join(".");
@@ -589,7 +611,7 @@ fn check_exclusion_operator(
     }
     // get_op_opfamily_strategy — skipped for a family none of whose
     // operators the analyzer could record.
-    if let Some(class) = opclass.and_then(|c| c.get(db))
+    if let Some(class) = opclass.and_then(|c| super::opclass::opclass_by_oid(db, c))
         && db.pg_amop.iter().any(|o| {
             o.amopfamily == class.opcfamily
                 && o.amopfamilynamespace == class.opcfamilynamespace
@@ -622,7 +644,7 @@ pub(crate) fn define_constraint_index(
     conkey: &[i16],
     include: &[i16],
     period: bool,
-) -> Result<(String, IndexKeys), DdlError> {
+) -> Result<ConstraintIndex, DdlError> {
     use typedpg_pg_query::protobuf::ConstrType;
     let exclusion = c.contype == ConstrType::ConstrExclusion as i32;
     check_index_max_keys(conkey.len() + include.len())?;
@@ -656,6 +678,8 @@ pub(crate) fn define_constraint_index(
     }
     let attrs = db.attributes_of(relid);
     let mut columns = Vec::with_capacity(conkey.len());
+    let mut indclass = Vec::with_capacity(conkey.len());
+    let mut indcollation = Vec::with_capacity(conkey.len());
     let mut exclusion_oprs = Vec::with_capacity(conkey.len());
     for (i, &attnum) in conkey.iter().enumerate() {
         let attr = attrs.iter().find(|a| attnum > 0 && a.attnum == attnum);
@@ -689,7 +713,7 @@ pub(crate) fn define_constraint_index(
             }
             (None, None) => None,
         };
-        let (column, opr) = compute_key_column(
+        let key = compute_key_column(
             db,
             &am,
             caps.as_ref(),
@@ -698,19 +722,23 @@ pub(crate) fn define_constraint_index(
             attr.and_then(|a| a.attcollation),
             opnames,
         )?;
-        columns.push(column);
-        exclusion_oprs.push(opr);
+        columns.push(key.column);
+        indclass.push(key.opclass);
+        indcollation.push(key.collation);
+        exclusion_oprs.push(key.exclusion_opr);
     }
     if exclusion {
-        check_exclusion_covers_partition_key(db, relid, conkey, &columns, &exclusion_oprs)?;
+        check_exclusion_covers_partition_key(db, relid, conkey, &indcollation, &exclusion_oprs)?;
     }
-    Ok((
+    Ok(ConstraintIndex {
         am,
-        IndexKeys {
+        keys: IndexKeys {
             columns,
             nulls_not_distinct: c.nulls_not_distinct,
         },
-    ))
+        indclass,
+        indcollation,
+    })
 }
 
 /// DefineIndex on a partitioned table, for an exclusion constraint: every
@@ -720,7 +748,7 @@ fn check_exclusion_covers_partition_key(
     db: &PgCatalog,
     relid: PgClassOid,
     conkey: &[i16],
-    columns: &[IndexKeyColumn],
+    key_collations: &[Option<PgCollationOid>],
     oprs: &[Option<crate::oid::PgOperatorOid>],
 ) -> Result<(), DdlError> {
     let Some(part_key) = db.partition_keys.get(&relid) else {
@@ -745,11 +773,15 @@ fn check_exclusion_covers_partition_key(
     for (i, pk) in part_key.iter().enumerate() {
         let ptkey_eqop = key_types.get(i).and_then(|&t| {
             let class = super::opclass::default_opclass_id(db, t, key_am)?;
-            super::opclass::opfamily_member(db, class.get(db)?, eq_strategy)
+            super::opclass::opfamily_member(
+                db,
+                super::opclass::opclass_by_oid(db, class)?,
+                eq_strategy,
+            )
         });
         let mut found = false;
         for (j, k) in conkey.iter().enumerate() {
-            if k != pk || columns[j].collation != collations.get(i).copied().flatten() {
+            if k != pk || key_collations[j] != collations.get(i).copied().flatten() {
                 continue;
             }
             let (Some(opr), Some(eq)) = (oprs[j], ptkey_eqop) else {
@@ -818,7 +850,7 @@ pub(crate) fn rebuild_indexes_for_column_type(
         .cloned()
         .collect();
     indexes.sort_by_key(|i| i.indexrelid);
-    for index in indexes {
+    for mut index in indexes {
         let Some(mut keys) = db.index_keys.get(&index.indexrelid).cloned() else {
             continue;
         };
@@ -863,7 +895,8 @@ pub(crate) fn rebuild_indexes_for_column_type(
             // pg_get_indexdef's COLLATE: an explicit one must suit the new
             // type.
             let column_collation = if k == attnum { old_collation } else { None };
-            if key.collation.is_some() && key.collation != column_collation {
+            let collation = index.indcollation.get(i).copied().flatten();
+            if collation.is_some() && collation != column_collation {
                 let collatable = db
                     .pg_type
                     .get(&db.unwrap_domain(new_type))
@@ -874,13 +907,15 @@ pub(crate) fn rebuild_indexes_for_column_type(
                         super::util::format_type_for_message(db, new_type)
                     )));
                 }
-            } else if k == attnum {
-                key.collation = attr.attcollation;
+            } else if k == attnum
+                && let Some(slot) = index.indcollation.get_mut(i)
+            {
+                *slot = attr.attcollation;
             }
-            let explicit = key.opclass.clone().filter(|class| {
-                super::opclass::default_opclass_id(db, prior_type, &am).as_ref() != Some(class)
+            let explicit = index.indclass.get(i).copied().flatten().filter(|&class| {
+                super::opclass::default_opclass_id(db, prior_type, &am) != Some(class)
             });
-            let opclass = match explicit.as_ref().and_then(|c| c.get(db)) {
+            let opclass = match explicit.and_then(|c| super::opclass::opclass_by_oid(db, c)) {
                 Some(class) => {
                     super::opclass::check_opclass_accepts(db, class, new_type)?;
                     explicit
@@ -888,14 +923,20 @@ pub(crate) fn rebuild_indexes_for_column_type(
                 None => super::opclass::resolve_index_opclass(db, &[], new_type, &am)?,
             };
             if let Some(names) = key.exclusion_op.as_deref() {
-                check_exclusion_operator(db, names, new_type, opclass.as_ref())?;
+                check_exclusion_operator(db, names, new_type, opclass)?;
             }
             key.typ = Some(new_type);
-            key.opclass = opclass;
+            if let Some(slot) = index.indclass.get_mut(i) {
+                *slot = opclass;
+            }
             changed = true;
         }
         if changed {
             db.index_keys.insert(index.indexrelid, keys);
+            if let Some(row) = db.pg_index.get_mut(&index.indexrelid) {
+                row.indclass = index.indclass;
+                row.indcollation = index.indcollation;
+            }
         }
     }
     Ok(())

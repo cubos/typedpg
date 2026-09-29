@@ -1317,3 +1317,93 @@ fn add_constraint_using_index_checks_the_index() {
         ],
     );
 }
+
+/// `(indclass as opclass names, indcollation as collation names)` of the
+/// index named `name`.
+fn index_classes(db: &PgCatalog, name: &str) -> (Vec<Option<String>>, Vec<Option<String>>) {
+    let seed = db.to_seed();
+    let index = db
+        .pg_index_values()
+        .find(|i| {
+            db.pg_class()
+                .get(&i.indexrelid)
+                .is_some_and(|c| c.relname == name)
+        })
+        .unwrap_or_else(|| panic!("no index {name}"));
+    let classes = index
+        .indclass
+        .iter()
+        .map(|c| {
+            c.and_then(|c| seed.pg_opclass.iter().find(|o| o.oid == c))
+                .map(|o| o.opcname.clone())
+        })
+        .collect();
+    let collations = index
+        .indcollation
+        .iter()
+        .map(|c| {
+            c.and_then(|c| seed.pg_collation.iter().find(|o| o.oid == c))
+                .map(|o| o.collname.clone())
+        })
+        .collect();
+    (classes, collations)
+}
+
+#[test]
+fn indexes_record_their_operator_classes_and_collations() {
+    // pg_index.indclass / indcollation, per key column, for every way an
+    // index comes to be.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int, b text, c text COLLATE \"C\", d varchar);
+         CREATE INDEX i ON t (a, b COLLATE \"C\" text_pattern_ops, c, (a + 1), d) INCLUDE (b);
+         ALTER TABLE t ADD CONSTRAINT u UNIQUE (b, c);
+         CREATE TABLE e (r int4range, EXCLUDE USING gist (r WITH &&));
+         CREATE TABLE l (LIKE t INCLUDING INDEXES);
+         CREATE TABLE p (a int, b text) PARTITION BY RANGE (a);
+         CREATE INDEX pi ON p (b COLLATE \"POSIX\" varchar_pattern_ops);
+         CREATE TABLE p1 PARTITION OF p FOR VALUES FROM (0) TO (10);",
+    )]);
+    let some = |v: &[&str]| -> Vec<Option<String>> {
+        v.iter()
+            .map(|s| (!s.is_empty()).then(|| (*s).to_owned()))
+            .collect()
+    };
+    let i = (
+        some(&[
+            "int4_ops",
+            "text_pattern_ops",
+            "text_ops",
+            "int4_ops",
+            "text_ops",
+        ]),
+        some(&["", "C", "C", "", "default"]),
+    );
+    assert_eq!(index_classes(&db, "i"), i);
+    assert_eq!(index_classes(&db, "l_a_b_c_expr_d_b1_idx"), i);
+    let u = (some(&["text_ops", "text_ops"]), some(&["default", "C"]));
+    assert_eq!(index_classes(&db, "u"), u);
+    assert_eq!(index_classes(&db, "l_b_c_key"), u);
+    assert_eq!(
+        index_classes(&db, "e_r_excl"),
+        (some(&["range_ops"]), some(&[""]))
+    );
+    let pi = (some(&["varchar_pattern_ops"]), some(&["POSIX"]));
+    assert_eq!(index_classes(&db, "pi"), pi);
+    assert_eq!(index_classes(&db, "p1_b_idx"), pi);
+    // ALTER COLUMN TYPE re-resolves them: a default operator class and
+    // collation follow the new type, an explicit one stays.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int, b text);
+         CREATE INDEX i ON t (a, b text_pattern_ops);
+         ALTER TABLE t ALTER a TYPE text, ALTER b TYPE varchar;",
+    )]);
+    assert_eq!(
+        index_classes(&db, "i"),
+        (
+            some(&["text_ops", "text_pattern_ops"]),
+            some(&["default", "default"])
+        )
+    );
+}

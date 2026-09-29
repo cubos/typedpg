@@ -166,6 +166,8 @@ fn create_clone(
         indkey: indkey.clone(),
         indexprs: pi.indexprs.clone(),
         indpred: pi.indpred.clone(),
+        indcollation: pi.indcollation.clone(),
+        indclass: pi.indclass.clone(),
     });
     if let Some(am) = am {
         interp.index_access_methods.insert(index, am);

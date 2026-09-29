@@ -20,9 +20,9 @@ use typedpg_analyzer::{
     PgAggregate, PgAm, PgAmop, PgAttribute, PgCast, PgCastOid, PgCatalog, PgCatalogSeed, PgClass,
     PgClassOid, PgCollation, PgCollationOid, PgConstraint, PgConstraintOid, PgDepend, PgEnum,
     PgEnumOid, PgExtension, PgExtensionOid, PgGenericOid, PgIndex, PgInherits, PgNamespace,
-    PgNamespaceOid, PgOpclass, PgOperator, PgOperatorOid, PgOpfamily, PgProc, PgProcOid, PgRange,
-    PgSetting, PgTsObject, PgType, PgTypeOid, ProKind, ProVolatile, QualifiedName, RelKind,
-    TypAlign, TypCategory, TypStorage, TypType,
+    PgNamespaceOid, PgOpclass, PgOpclassOid, PgOperator, PgOperatorOid, PgOpfamily, PgProc,
+    PgProcOid, PgRange, PgSetting, PgTsObject, PgType, PgTypeOid, ProKind, ProVolatile,
+    QualifiedName, RelKind, TypAlign, TypCategory, TypStorage, TypType,
 };
 
 fn main() {
@@ -624,6 +624,7 @@ fn export_indexes(
         "SELECT i.indexrelid, i.indrelid, i.indnatts, i.indnkeyatts, \
                 i.indisunique, i.indisprimary, i.indisexclusion, \
                 i.indkey::int2[]::int4[] AS indkey, \
+                i.indcollation::oid[] AS indcollation, i.indclass::oid[] AS indclass, \
                 i.indexprs IS NOT NULL AS has_exprs, \
                 CASE WHEN i.indpred IS NOT NULL \
                      THEN pg_get_expr(i.indpred, i.indrelid) \
@@ -643,8 +644,10 @@ fn export_indexes(
         let indisprimary: bool = r.get(5);
         let indisexclusion: bool = r.get(6);
         let indkey_raw: Vec<i32> = r.get(7);
-        let has_exprs: bool = r.get(8);
-        let pred_sql: Option<String> = r.get(9);
+        let indcollation: Vec<u32> = r.get(8);
+        let indclass: Vec<u32> = r.get(9);
+        let has_exprs: bool = r.get(10);
+        let pred_sql: Option<String> = r.get(11);
         let indkey: Vec<i16> = indkey_raw.into_iter().map(|n| n as i16).collect();
 
         // Pull each expression slot's SQL via pg_get_indexdef(idx, slot, false).
@@ -712,6 +715,8 @@ fn export_indexes(
             indkey,
             indexprs,
             indpred,
+            indcollation: indcollation.into_iter().map(PgCollationOid::new).collect(),
+            indclass: indclass.into_iter().map(PgOpclassOid::new).collect(),
         });
     }
     if !skipped.is_empty() {
@@ -887,7 +892,8 @@ fn export_access_methods(
         .collect();
     let opclass = client
         .query(
-            "SELECT c.opcname::text, c.opcnamespace, a.amname::text, c.opcintype, c.opcdefault, \
+            "SELECT c.oid, c.opcname::text, c.opcnamespace, a.amname::text, c.opcintype, \
+                    c.opcdefault, \
                     f.opfname::text, f.opfnamespace \
              FROM pg_catalog.pg_opclass c JOIN pg_catalog.pg_am a ON a.oid = c.opcmethod \
              JOIN pg_catalog.pg_opfamily f ON f.oid = c.opcfamily \
@@ -897,13 +903,14 @@ fn export_access_methods(
         .iter()
         .filter_map(|r| {
             Some(PgOpclass {
-                opcname: r.get(0),
-                opcnamespace: PgNamespaceOid::new(r.get::<_, u32>(1))?,
-                opcmethod: r.get(2),
-                opcintype: PgTypeOid::new(r.get::<_, u32>(3))?,
-                opcdefault: r.get(4),
-                opcfamily: r.get(5),
-                opcfamilynamespace: PgNamespaceOid::new(r.get::<_, u32>(6))?,
+                oid: PgOpclassOid::new(r.get::<_, u32>(0))?,
+                opcname: r.get(1),
+                opcnamespace: PgNamespaceOid::new(r.get::<_, u32>(2))?,
+                opcmethod: r.get(3),
+                opcintype: PgTypeOid::new(r.get::<_, u32>(4))?,
+                opcdefault: r.get(5),
+                opcfamily: r.get(6),
+                opcfamilynamespace: PgNamespaceOid::new(r.get::<_, u32>(7))?,
             })
         })
         .collect();

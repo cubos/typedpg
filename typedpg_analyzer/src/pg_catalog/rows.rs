@@ -10,7 +10,7 @@ use serde_tuple::{Deserialize_tuple, Serialize_tuple};
 
 use crate::oid::{
     PgCastOid, PgClassOid, PgCollationOid, PgConstraintOid, PgEnumOid, PgExtensionOid,
-    PgGenericOid, PgNamespaceOid, PgOperatorOid, PgProcOid, PgRewriteOid, PgTypeOid,
+    PgGenericOid, PgNamespaceOid, PgOpclassOid, PgOperatorOid, PgProcOid, PgRewriteOid, PgTypeOid,
 };
 
 // ─── Enums ─────────────────────────────────────────────────────────────────
@@ -539,6 +539,14 @@ pub struct PgIndex {
     pub indexprs: Vec<SerializedAst>,
     /// Partial-index predicate. `None` for non-partial indexes.
     pub indpred: Option<SerializedAst>,
+    /// `indcollation`: each key column's collation (`None` — PG's `0` — for
+    /// a non-collatable one).
+    #[serde(with = "crate::oid::vec_oid_or_zero")]
+    pub indcollation: Vec<Option<PgCollationOid>>,
+    /// `indclass`: each key column's operator class. `None` where the
+    /// analyzer couldn't resolve it (an expression of unknown type).
+    #[serde(with = "crate::oid::vec_oid_or_zero")]
+    pub indclass: Vec<Option<PgOpclassOid>>,
 }
 
 /// `pg_inherits`: one row per (child, parent) edge in the inheritance graph.
@@ -629,6 +637,7 @@ pub struct PgOpfamily {
 /// access method; `opcdefault` ones are used when an index names none.
 #[derive(Debug, Clone, Serialize_tuple, Deserialize_tuple)]
 pub struct PgOpclass {
+    pub oid: PgOpclassOid,
     pub opcname: String,
     /// FK `pg_namespace.oid`.
     pub opcnamespace: PgNamespaceOid,

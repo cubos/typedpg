@@ -179,6 +179,10 @@ define_oid!(
     PgRewriteOid
 );
 define_oid!(
+    /// `pg_opclass.oid` — one per operator class.
+    PgOpclassOid
+);
+define_oid!(
     /// `pg_collation.oid` — one per registered collation
     /// (`"C"`, `"POSIX"`, `"en_US.UTF-8"`, …).
     PgCollationOid
@@ -241,6 +245,30 @@ pub mod vec_oid {
                 O::new(r).ok_or_else(|| serde::de::Error::custom("oid in vector must be non-zero"))
             })
             .collect()
+    }
+}
+
+/// Serde adapter for `Vec<Option<XxxOid>>` columns — an `oidvector` whose
+/// entries may be `0` for "none" (`pg_index.indcollation` of a
+/// non-collatable column). Stored as a JSON array of integers.
+#[allow(dead_code)]
+pub mod vec_oid_or_zero {
+    use super::OidLike;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<O: OidLike, S: Serializer>(
+        value: &[Option<O>],
+        ser: S,
+    ) -> Result<S::Ok, S::Error> {
+        let raws: Vec<u32> = value.iter().map(|o| o.map_or(0, |o| o.get())).collect();
+        raws.serialize(ser)
+    }
+
+    pub fn deserialize<'de, O: OidLike, D: Deserializer<'de>>(
+        de: D,
+    ) -> Result<Vec<Option<O>>, D::Error> {
+        let raws: Vec<u32> = Vec::deserialize(de)?;
+        Ok(raws.into_iter().map(O::new).collect())
     }
 }
 

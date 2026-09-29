@@ -9,7 +9,7 @@ use typedpg_pg_query::protobuf::{
 
 use super::DdlError;
 use super::util::node_string;
-use crate::oid::{PgNamespaceOid, PgOperatorOid, PgTypeOid};
+use crate::oid::{PgNamespaceOid, PgOpclassOid, PgOperatorOid, PgTypeOid};
 use crate::pg_catalog::{PgAm, PgAmop, PgCatalog, PgOpclass, PgOpfamily, TypCategory, TypType};
 
 /// What an index access method supports (the `IndexAmRoutine` flags of
@@ -46,28 +46,9 @@ pub(crate) fn am_caps(amname: &str) -> Option<AmCaps> {
     })
 }
 
-/// An operator class's identity: `(opcnamespace, opcname, opcmethod)`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct OpclassId {
-    pub(crate) namespace: PgNamespaceOid,
-    pub(crate) name: String,
-    pub(crate) method: String,
-}
-
-impl OpclassId {
-    fn of(c: &PgOpclass) -> Self {
-        OpclassId {
-            namespace: c.opcnamespace,
-            name: c.opcname.clone(),
-            method: c.opcmethod.clone(),
-        }
-    }
-
-    pub(crate) fn get<'a>(&self, interp: &'a PgCatalog) -> Option<&'a PgOpclass> {
-        interp.pg_opclass.iter().find(|c| {
-            c.opcnamespace == self.namespace && c.opcname == self.name && c.opcmethod == self.method
-        })
-    }
+/// The `pg_opclass` row of `oid`.
+pub(crate) fn opclass_by_oid(interp: &PgCatalog, oid: PgOpclassOid) -> Option<&PgOpclass> {
+    interp.pg_opclass.iter().find(|c| c.oid == oid)
 }
 
 /// get_op_opfamily_strategy: whether `opr` is a search operator of
@@ -343,7 +324,9 @@ pub fn create_opclass(interp: &mut PgCatalog, stmt: &CreateOpClassStmt) -> Resul
             add_family_operator(interp, &family_name, family_ns, &am, item, Some(intype))?;
         }
     }
+    let oid = PgOpclassOid::from_nonzero(interp.alloc_oid()?);
     interp.pg_opclass.push(PgOpclass {
+        oid,
         opcname: name,
         opcnamespace: nsoid,
         opcmethod: am,
@@ -621,7 +604,7 @@ pub(crate) fn resolve_index_opclass(
     opclass: &[typedpg_pg_query::protobuf::Node],
     typ: PgTypeOid,
     am: &str,
-) -> Result<Option<OpclassId>, DdlError> {
+) -> Result<Option<PgOpclassOid>, DdlError> {
     if typ == crate::pg_catalog::oid::UNKNOWN {
         return Ok(None);
     }
@@ -635,7 +618,7 @@ pub(crate) fn resolve_index_opclass(
                 typname()
             )));
         };
-        return Ok(Some(OpclassId::of(found)));
+        return Ok(Some(found.oid));
     }
     let (schema, name) = split_name(opclass);
     let Some(found) = find_opclass(interp, schema.as_deref(), &name, am) else {
@@ -644,7 +627,7 @@ pub(crate) fn resolve_index_opclass(
         )));
     };
     check_opclass_accepts(interp, found, typ)?;
-    Ok(Some(OpclassId::of(found)))
+    Ok(Some(found.oid))
 }
 
 /// ResolveOpClass: an explicitly named operator class must accept the
@@ -672,11 +655,11 @@ pub(crate) fn default_opclass_id(
     interp: &PgCatalog,
     typ: PgTypeOid,
     am: &str,
-) -> Option<OpclassId> {
+) -> Option<PgOpclassOid> {
     default_opclass(interp, typ, am)
         .ok()
         .flatten()
-        .map(OpclassId::of)
+        .map(|c| c.oid)
 }
 
 /// The declared input type (`opcintype`) of `typ`'s default operator class

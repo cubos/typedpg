@@ -71,7 +71,7 @@ pub(crate) mod qualified_name {
 
 pub use oid::{
     PgCastOid, PgClassOid, PgCollationOid, PgConstraintOid, PgEnumOid, PgExtensionOid,
-    PgGenericOid, PgNamespaceOid, PgOperatorOid, PgProcOid, PgRewriteOid, PgTypeOid,
+    PgGenericOid, PgNamespaceOid, PgOpclassOid, PgOperatorOid, PgProcOid, PgRewriteOid, PgTypeOid,
 };
 #[cfg(any(test, feature = "internal"))]
 pub use pg_catalog::{

@@ -722,6 +722,29 @@ pub(super) fn emit_constraint_with_backing_index(
         // The INCLUDE columns follow the key columns.
         let indnkeyatts = conkey.len() as i16;
         let indkey: Vec<i16> = conkey.iter().chain(&include).copied().collect();
+        // Without a written definition (a LIKE copy, whose caller copies the
+        // source's), each column's own collation and default operator class.
+        let (indclass, indcollation) = match index_def.as_ref() {
+            Some(def) => (def.indclass.clone(), def.indcollation.clone()),
+            None => {
+                let am = if period { "gist" } else { "btree" };
+                conkey
+                    .iter()
+                    .map(|&a| {
+                        let attr = interp
+                            .attributes_of(relid)
+                            .iter()
+                            .find(|att| att.attnum == a);
+                        (
+                            attr.and_then(|att| {
+                                crate::ddl::opclass::default_opclass_id(interp, att.atttypid, am)
+                            }),
+                            attr.and_then(|att| att.attcollation),
+                        )
+                    })
+                    .unzip()
+            }
+        };
         interp.insert_pg_index(PgIndex {
             indexrelid,
             indrelid: relid,
@@ -736,17 +759,19 @@ pub(super) fn emit_constraint_with_backing_index(
             indkey,
             indexprs: Vec::new(),
             indpred: None,
+            indcollation,
+            indclass,
         });
         // index_create: indimmediate = !deferrable (before the partition
         // clones copy it).
         if deferrable {
             interp.nonimmediate_indexes.insert(indexrelid);
         }
-        if let Some((am, keys)) = index_def {
-            if am != "btree" {
-                interp.index_access_methods.insert(indexrelid, am);
+        if let Some(def) = index_def {
+            if def.am != "btree" {
+                interp.index_access_methods.insert(indexrelid, def.am);
             }
-            interp.index_keys.insert(indexrelid, keys);
+            interp.index_keys.insert(indexrelid, def.keys);
         }
         if !index_only {
             super::partidx::propagate_new_index(interp, relid, indexrelid)?;
@@ -1654,8 +1679,9 @@ fn add_index_constraint(
             };
             let default_class =
                 crate::ddl::opclass::default_opclass_id(interp, attr.atttypid, "btree");
-            if (key.opclass.is_some() && key.opclass != default_class)
-                || key.collation != attr.attcollation
+            let opclass = index.indclass.get(i).copied().flatten();
+            if (opclass.is_some() && opclass != default_class)
+                || index.indcollation.get(i).copied().flatten() != attr.attcollation
                 || !key.default_order
             {
                 return Err(DdlError::Parse(format!(
@@ -1998,17 +2024,16 @@ pub(crate) fn copy_like_constraints(
 }
 
 /// generateClonedIndexStmt: a LIKE copy of an index keeps its access
-/// method, its key columns' operator classes, collations and options, and
-/// its expressions and predicate.
+/// method, its key columns' operator classes (`indclass`), collations
+/// (`indcollation`) and options, and its expressions and predicate.
 fn copy_index_details_to(interp: &mut PgCatalog, source: PgClassOid, index: PgClassOid) {
-    if let Some((exprs, pred)) = interp
-        .pg_index
-        .get(&source)
-        .map(|i| (i.indexprs.clone(), i.indpred.clone()))
+    if let Some(src) = interp.pg_index.get(&source).cloned()
         && let Some(copy) = interp.pg_index.get_mut(&index)
     {
-        copy.indexprs = exprs;
-        copy.indpred = pred;
+        copy.indexprs = src.indexprs;
+        copy.indpred = src.indpred;
+        copy.indclass = src.indclass;
+        copy.indcollation = src.indcollation;
     }
     if let Some(am) = interp.index_access_methods.get(&source).cloned() {
         interp.index_access_methods.insert(index, am);
