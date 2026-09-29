@@ -333,6 +333,8 @@ pub struct PgCatalog {
     /// renamed away.
     pub(crate) languages: Vec<String>,
     pub(crate) dropped_languages: Vec<String>,
+    /// Materialized views created or refreshed WITH NO DATA.
+    pub(crate) unpopulated_matviews: std::collections::HashSet<PgClassOid>,
     /// Encoding conversions created by migrations.
     pub(crate) conversions: Vec<(String, PgNamespaceOid)>,
     /// Event triggers and the function each executes.
@@ -650,6 +652,7 @@ impl PgCatalog {
             on_commit_drop: Vec::new(),
             languages: Vec::new(),
             dropped_languages: Vec::new(),
+            unpopulated_matviews: std::collections::HashSet::new(),
             conversions: Vec::new(),
             uncommitted_enum_labels: Default::default(),
             enums_created_in_transaction: Default::default(),

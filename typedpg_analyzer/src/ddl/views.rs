@@ -48,6 +48,9 @@ pub fn create_view(interp: &mut PgCatalog, stmt: &ViewStmt) -> Result<(), DdlErr
 
     let aliases = string_list(&stmt.aliases);
 
+    if let Some(query) = stmt.query.as_deref() {
+        check_no_parameters(query)?;
+    }
     let resolved = match stmt.query.as_deref() {
         Some(query_node) => {
             resolve_view_now(interp, query_node, &aliases).map_err(|e| match e {
@@ -60,6 +63,20 @@ pub fn create_view(interp: &mut PgCatalog, stmt: &ViewStmt) -> Result<(), DdlErr
         }
         None => ResolvedView::default(),
     };
+    // DefineView: parse analysis allows these; a view can't have them.
+    if let Some(query) = stmt.query.as_deref() {
+        if matches!(query.node.as_ref(), Some(node::Node::SelectStmt(sel)) if sel.into_clause.is_some())
+        {
+            return Err(DdlError::UnsupportedDdl(
+                "views must not contain SELECT INTO".into(),
+            ));
+        }
+        if has_modifying_cte(query) {
+            return Err(DdlError::UnsupportedDdl(
+                "views must not contain data-modifying statements in WITH".into(),
+            ));
+        }
+    }
     // DefineView (view.c): the alias list may not outnumber the columns.
     if aliases.len() > resolved.columns.len() {
         return Err(DdlError::Parse(
@@ -198,6 +215,9 @@ fn create_relation_as(
     )
     .to_string();
     let aliases = string_list(&into.col_names);
+    if let Some(query) = query {
+        check_no_parameters(query)?;
+    }
     let mut resolved = match query {
         // CREATE TABLE ... AS EXECUTE (ExecuteQuery): the prepared SELECT's
         // columns, its arguments checked.
@@ -228,6 +248,26 @@ fn create_relation_as(
         }
         None => ResolvedView::default(),
     };
+    // transformCreateTableAsStmt: a materialized view outlives the session
+    // and is refreshed from its query.
+    if kind == RelKind::MaterializedView {
+        if query.is_some_and(has_modifying_cte) {
+            return Err(DdlError::UnsupportedDdl(
+                "materialized views must not use data-modifying statements in WITH".into(),
+            ));
+        }
+        let reads_temp = resolved
+            .deps
+            .relation_refs
+            .iter()
+            .chain(resolved.deps.column_refs.iter().map(|(r, _)| r))
+            .any(|&r| super::util::is_temp_relation(interp, r));
+        if reads_temp {
+            return Err(DdlError::UnsupportedDdl(
+                "materialized views must not use temporary tables or views".into(),
+            ));
+        }
+    }
     if aliases.len() > resolved.columns.len() {
         return Err(DdlError::Parse(
             "too many column names were specified".into(),
@@ -256,10 +296,18 @@ fn create_relation_as(
     }
 
     install_relation(interp, nsoid, name.clone(), kind, resolved)?;
+    let oid = interp.class_by_qname.get(&(nsoid, name)).copied();
     if let Some(p @ ('u' | 't')) = rv.relpersistence.chars().next()
-        && let Some(&oid) = interp.class_by_qname.get(&(nsoid, name))
+        && let Some(oid) = oid
     {
         interp.relpersistence.insert(oid, p);
+    }
+    // WITH NO DATA leaves a materialized view unpopulated.
+    if kind == RelKind::MaterializedView
+        && into.skip_data
+        && let Some(oid) = oid
+    {
+        interp.unpopulated_matviews.insert(oid);
     }
     Ok(())
 }
@@ -329,8 +377,54 @@ fn check_view_columns(
                 super::util::format_type_with_typmod(interp, new_col.type_oid, new_col.typmod),
             )));
         }
+        if old_col.attcollation != new_col.collation {
+            let name = |c: Option<crate::oid::PgCollationOid>| {
+                c.and_then(|c| interp.pg_collation.get(&c))
+                    .map(|c| c.collname.clone())
+                    .unwrap_or_default()
+            };
+            return Err(DdlError::Parse(format!(
+                "cannot change collation of view column \"{}\" from \"{}\" to \"{}\"",
+                old_col.attname,
+                name(old_col.attcollation),
+                name(new_col.collation)
+            )));
+        }
     }
     Ok(())
+}
+
+/// The query of a view or CREATE TABLE AS has no parameters: a `$n` is an
+/// error (transformParamRef without a parameter hook).
+fn check_no_parameters(query: &protobuf::Node) -> Result<(), DdlError> {
+    let number = query
+        .node
+        .iter()
+        .flat_map(|n| n.nodes())
+        .find_map(|(n, _)| match n {
+            typedpg_pg_query::NodeRef::ParamRef(p) => Some(p.number),
+            _ => None,
+        });
+    match number {
+        Some(n) => Err(DdlError::Parse(format!("there is no parameter ${n}"))),
+        None => Ok(()),
+    }
+}
+
+/// Whether a CTE of the query's WITH is an INSERT / UPDATE / DELETE /
+/// MERGE (`hasModifyingCTE`).
+fn has_modifying_cte(query: &protobuf::Node) -> bool {
+    let Some(node::Node::SelectStmt(sel)) = query.node.as_ref() else {
+        return false;
+    };
+    sel.with_clause.as_ref().is_some_and(|w| {
+        w.ctes.iter().any(|cte| {
+            matches!(cte.node.as_ref(), Some(node::Node::CommonTableExpr(c))
+                if matches!(c.ctequery.as_deref().and_then(|q| q.node.as_ref()),
+                    Some(node::Node::InsertStmt(_) | node::Node::UpdateStmt(_)
+                        | node::Node::DeleteStmt(_) | node::Node::MergeStmt(_))))
+        })
+    })
 }
 
 /// Redefine an existing view in place: same OID and row type, the column
@@ -416,7 +510,48 @@ pub fn refresh_materialized_view(
             "\"{}\" is not a materialized view",
             c.relname
         ))),
-        Some(_) => Ok(()),
+        Some(c) => {
+            let oid = c.oid;
+            if stmt.concurrent {
+                if interp.unpopulated_matviews.contains(&oid) {
+                    return Err(DdlError::UnsupportedDdl(
+                        "CONCURRENTLY cannot be used when the materialized view is not populated"
+                            .into(),
+                    ));
+                }
+                if stmt.skip_data {
+                    return Err(DdlError::Parse(
+                        "CONCURRENTLY and WITH NO DATA options cannot be used together".into(),
+                    ));
+                }
+                // is_usable_unique_index: unique, immediate, valid, not
+                // partial, over plain columns only.
+                let usable = interp.pg_index.values().any(|i| {
+                    i.indrelid == oid
+                        && i.indisunique
+                        && i.indpred.is_none()
+                        && !i.indkey.is_empty()
+                        && i.indkey.iter().all(|&k| k > 0)
+                        && !interp.nonimmediate_indexes.contains(&i.indexrelid)
+                        && !interp.invalid_indexes.contains(&i.indexrelid)
+                });
+                if !usable {
+                    let schema = interp.namespace_name(c.relnamespace).unwrap_or_default();
+                    return Err(DdlError::UnsupportedDdl(format!(
+                        "cannot refresh materialized view \"{}\" concurrently (Create a unique \
+                         index with no WHERE clause on one or more columns of the materialized \
+                         view.)",
+                        crate::qualified_name::QualifiedName::new(schema, &c.relname)
+                    )));
+                }
+            }
+            if stmt.skip_data {
+                interp.unpopulated_matviews.insert(oid);
+            } else {
+                interp.unpopulated_matviews.remove(&oid);
+            }
+            Ok(())
+        }
     }
 }
 

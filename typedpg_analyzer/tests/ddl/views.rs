@@ -1283,3 +1283,86 @@ fn star_views_depend_on_every_expanded_column() {
         "{err}"
     );
 }
+
+#[test]
+fn not_null_domain_column_of_a_view_is_nullable_through_an_outer_join() {
+    // The domain's NOT NULL holds for u.b as stored; the view's LEFT JOIN
+    // still produces NULLs, for a view and a materialized view alike.
+    let db = build(&[(
+        "0001.sql",
+        "CREATE DOMAIN d AS int NOT NULL;
+         CREATE TABLE t (a int NOT NULL);
+         CREATE TABLE u (a int NOT NULL, b d);
+         CREATE VIEW v AS SELECT u.b FROM t LEFT JOIN u ON t.a = u.a;
+         CREATE MATERIALIZED VIEW mv AS SELECT u.b FROM t LEFT JOIN u ON t.a = u.a;
+         CREATE VIEW inner_v AS SELECT u.b FROM u;",
+    )]);
+    for relation in ["v", "mv"] {
+        let q = db.analyze(&format!("SELECT b FROM {relation}")).unwrap();
+        assert!(q.columns[0].nullable, "{relation}");
+    }
+    let q = db.analyze("SELECT b FROM inner_v").unwrap();
+    assert!(!q.columns[0].nullable);
+}
+
+#[test]
+fn view_and_materialized_view_ddl_follows_postgres_checks() {
+    let t = "CREATE TABLE t (a int, b text);";
+    assert_ddl_rejections(&[
+        (
+            "CREATE TABLE t (a int, b text);
+             CREATE VIEW v AS SELECT b FROM t;",
+            "CREATE OR REPLACE VIEW v AS SELECT b COLLATE \"C\" AS b FROM t;",
+            "cannot change collation of view column \"b\" from \"default\" to \"C\"",
+        ),
+        (
+            t,
+            "CREATE VIEW v AS SELECT a INTO t2 FROM t;",
+            "views must not contain SELECT INTO",
+        ),
+        (
+            t,
+            "CREATE VIEW v AS WITH x AS (INSERT INTO t VALUES (1) RETURNING a) SELECT a FROM x;",
+            "views must not contain data-modifying statements in WITH",
+        ),
+        (
+            "CREATE TEMP TABLE tt (a int);",
+            "CREATE MATERIALIZED VIEW mv AS SELECT a FROM tt;",
+            "materialized views must not use temporary tables or views",
+        ),
+        (
+            "",
+            "CREATE MATERIALIZED VIEW mv AS SELECT $1::int AS x;",
+            "there is no parameter $1",
+        ),
+        (
+            "CREATE MATERIALIZED VIEW mv AS SELECT 1 AS x;",
+            "REFRESH MATERIALIZED VIEW CONCURRENTLY mv;",
+            "cannot refresh materialized view \"public.mv\" concurrently",
+        ),
+        (
+            "CREATE MATERIALIZED VIEW mv AS SELECT 1 AS x WITH NO DATA;
+             CREATE UNIQUE INDEX ON mv (x);",
+            "REFRESH MATERIALIZED VIEW CONCURRENTLY mv;",
+            "CONCURRENTLY cannot be used when the materialized view is not populated",
+        ),
+        (t, "ALTER VIEW t RENAME TO t9;", "\"t\" is not a view"),
+        (
+            t,
+            "ALTER SEQUENCE t RENAME TO t9;",
+            "\"t\" is not a sequence",
+        ),
+        (
+            t,
+            "ALTER MATERIALIZED VIEW t RENAME TO t9;",
+            "\"t\" is not a materialized view",
+        ),
+    ]);
+    build(&[(
+        "0001.sql",
+        "CREATE MATERIALIZED VIEW mv AS SELECT 1 AS x WITH NO DATA;
+         CREATE UNIQUE INDEX ON mv (x);
+         REFRESH MATERIALIZED VIEW mv;
+         REFRESH MATERIALIZED VIEW CONCURRENTLY mv;",
+    )]);
+}

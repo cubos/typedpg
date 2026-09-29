@@ -260,7 +260,8 @@ fn rename_relation(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlE
     if let Some(type_oid) = class.as_ref().and_then(|c| c.reltype) {
         interp.rename_pg_type(type_oid, new_name.clone(), nsoid);
         if let Some(arr_oid) = interp.array_type_of(type_oid) {
-            interp.rename_pg_type(arr_oid, format!("_{new_name}"), nsoid);
+            let array_name = crate::ddl::types::make_array_type_name(interp, nsoid, &new_name);
+            interp.rename_pg_type(arr_oid, array_name, nsoid);
         }
     }
     // Renaming a constraint's index renames the constraint too
