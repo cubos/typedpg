@@ -996,6 +996,29 @@ pub fn alter_table(interp: &mut PgCatalog, stmt: &AlterTableStmt) -> Result<(), 
             "cannot have multiple SET TABLESPACE subcommands".into(),
         ));
     }
+    // ATPrepCmd: the persistence changes once per statement (a SET LOGGED
+    // / UNLOGGED to the current persistence changes nothing).
+    let mut persistence = current_persistence(interp, class_oid);
+    let mut persistence_changed = false;
+    for cmd_node in &stmt.cmds {
+        let Some(node::Node::AlterTableCmd(cmd)) = cmd_node.node.as_ref() else {
+            continue;
+        };
+        let target = match AlterTableType::try_from(cmd.subtype) {
+            Ok(AlterTableType::AtSetLogged) => 'p',
+            Ok(AlterTableType::AtSetUnLogged) => 'u',
+            _ => continue,
+        };
+        if persistence_changed {
+            return Err(DdlError::Parse(
+                "cannot change persistence setting twice".into(),
+            ));
+        }
+        if persistence != 't' && persistence != target {
+            persistence_changed = true;
+            persistence = target;
+        }
+    }
     // The TOAST tables the earlier statements made: SET (toast.*) reads
     // them, and a column this statement drops or retypes keeps one.
     toast::note_toast_tables(interp);
@@ -1128,7 +1151,18 @@ fn apply_alter_subtype(
     }
 }
 
+/// `relpersistence`: a relation of the temporary schema is temporary.
+fn current_persistence(interp: &PgCatalog, relid: PgClassOid) -> char {
+    if super::util::is_temp_relation(interp, relid) {
+        't'
+    } else {
+        constraints::persistence(interp, relid)
+    }
+}
+
 /// `ALTER TABLE ... SET LOGGED / UNLOGGED` (ATPrepChangePersistence): a
+/// temporary relation's persistence can't change, setting the current one
+/// is a no-op, a table listed in a publication can't become unlogged, a
 /// logged table may not reference an unlogged one, and a table referenced
 /// by a logged one can't become unlogged.
 fn set_persistence(
@@ -1137,6 +1171,22 @@ fn set_persistence(
     to_logged: bool,
 ) -> Result<(), DdlError> {
     let relname = relname_of(interp, relid);
+    match current_persistence(interp, relid) {
+        't' => {
+            return Err(DdlError::Parse(format!(
+                "cannot change logged status of table \"{relname}\" because it is temporary"
+            )));
+        }
+        'p' if to_logged => return Ok(()),
+        'u' if !to_logged => return Ok(()),
+        _ => {}
+    }
+    if !to_logged && crate::ddl::publications::relation_in_publication(interp, relid) {
+        return Err(DdlError::Parse(format!(
+            "cannot change table \"{relname}\" to unlogged because it is part of a publication \
+             (Unlogged relations cannot be replicated.)"
+        )));
+    }
     for con in interp.pg_constraint.values() {
         if con.contype != ConType::ForeignKey {
             continue;

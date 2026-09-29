@@ -875,3 +875,49 @@ fn user_relations_stay_out_of_pg_global() {
         ),
     ]);
 }
+
+#[test]
+fn persistence_changes_follow_at_prep_change_persistence() {
+    // A temporary relation's persistence can't change; the current one is
+    // a no-op; it changes once per statement; a table listed in a
+    // publication can't become unlogged.
+    let setup = "CREATE TEMP TABLE a (x int);
+                 CREATE TEMP SEQUENCE s;
+                 CREATE UNLOGGED TABLE u (x int);
+                 CREATE TABLE p (x int);
+                 CREATE PUBLICATION pub FOR TABLE p;";
+    for (stmt, msg) in [
+        (
+            "ALTER TABLE a SET UNLOGGED;",
+            "cannot change logged status of table \"a\" because it is temporary",
+        ),
+        (
+            "ALTER TABLE a SET LOGGED;",
+            "cannot change logged status of table \"a\" because it is temporary",
+        ),
+        (
+            "ALTER SEQUENCE s SET LOGGED;",
+            "cannot change logged status of table \"s\" because it is temporary",
+        ),
+        (
+            "ALTER TABLE u SET LOGGED, SET LOGGED;",
+            "cannot change persistence setting twice",
+        ),
+        (
+            "ALTER TABLE p SET UNLOGGED;",
+            "cannot change table \"p\" to unlogged because it is part of a publication",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "ALTER TABLE p SET LOGGED;
+             CREATE TABLE q (x int);
+             ALTER TABLE q SET LOGGED, SET UNLOGGED;",
+        ),
+    ]);
+}
