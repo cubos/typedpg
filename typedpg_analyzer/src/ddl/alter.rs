@@ -405,49 +405,7 @@ fn rename_function_like(
 }
 
 fn rename_type_obj(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlError> {
-    let Some(object) = stmt.object.as_deref() else {
-        return Ok(());
-    };
-    let parts: Vec<&str> = match object.node.as_ref() {
-        Some(node::Node::TypeName(tn)) => tn.names.iter().filter_map(node_string).collect(),
-        Some(node::Node::List(list)) => list.items.iter().filter_map(node_string).collect(),
-        _ => return Ok(()),
-    };
-
-    let (schema_name, old_name) = match parts.as_slice() {
-        [s, n] => ((*s).to_owned(), (*n).to_owned()),
-        [n] => (
-            crate::ddl::util::type_lookup_schema(interp, n),
-            (*n).to_owned(),
-        ),
-        _ => return Ok(()),
-    };
-
-    let Some(nsoid) = interp.namespace_oid(&schema_name) else {
-        if stmt.missing_ok {
-            return Ok(());
-        }
-        return Err(DdlError::TypeNotFound(
-            QualifiedName::new(&schema_name, &old_name).to_string(),
-        ));
-    };
-    let Some(&type_oid) = interp.type_by_qname.get(&(nsoid, old_name.clone())) else {
-        if stmt.missing_ok {
-            return Ok(());
-        }
-        return Err(DdlError::TypeNotFound(
-            QualifiedName::new(&schema_name, &old_name).to_string(),
-        ));
-    };
-
-    let new_name = stmt.newname.clone();
-    interp.rename_pg_type(type_oid, new_name.clone(), nsoid);
-
-    let arr_old = format!("_{old_name}");
-    if let Some(&arr_oid) = interp.type_by_qname.get(&(nsoid, arr_old)) {
-        interp.rename_pg_type(arr_oid, format!("_{new_name}"), nsoid);
-    }
-    Ok(())
+    crate::ddl::types::rename_type(interp, stmt)
 }
 
 fn rename_schema(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlError> {
@@ -724,48 +682,7 @@ fn set_type_schema(
     stmt: &AlterObjectSchemaStmt,
     new_nsoid: PgNamespaceOid,
 ) -> Result<(), DdlError> {
-    let Some(object) = stmt.object.as_deref() else {
-        return Ok(());
-    };
-    let parts: Vec<&str> = match object.node.as_ref() {
-        Some(node::Node::TypeName(tn)) => tn.names.iter().filter_map(node_string).collect(),
-        Some(node::Node::List(list)) => list.items.iter().filter_map(node_string).collect(),
-        _ => return Ok(()),
-    };
-    let (old_schema, name) = match parts.as_slice() {
-        [s, n] => ((*s).to_owned(), (*n).to_owned()),
-        [n] => (
-            crate::ddl::util::type_lookup_schema(interp, n),
-            (*n).to_owned(),
-        ),
-        _ => return Ok(()),
-    };
-
-    let Some(old_nsoid) = interp.namespace_oid(&old_schema) else {
-        if stmt.missing_ok {
-            return Ok(());
-        }
-        return Err(DdlError::TypeNotFound(
-            QualifiedName::new(&old_schema, &name).to_string(),
-        ));
-    };
-    let Some(&type_oid) = interp.type_by_qname.get(&(old_nsoid, name.clone())) else {
-        if stmt.missing_ok {
-            return Ok(());
-        }
-        return Err(DdlError::TypeNotFound(
-            QualifiedName::new(&old_schema, &name).to_string(),
-        ));
-    };
-
-    interp.rename_pg_type(type_oid, name.clone(), new_nsoid);
-
-    let arr_key = format!("_{name}");
-    if let Some(&arr_oid) = interp.type_by_qname.get(&(old_nsoid, arr_key.clone())) {
-        interp.rename_pg_type(arr_oid, arr_key, new_nsoid);
-    }
-
-    Ok(())
+    crate::ddl::types::set_type_schema(interp, stmt, new_nsoid)
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────

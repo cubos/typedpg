@@ -1524,14 +1524,18 @@ fn resolve_type_name(
         .finalize_implicit()
     })?;
 
-    if is_array {
-        let array_name = format!("_{name}");
-        if let Some(arr) = snapshot.resolve_type_by_name(schema, &array_name) {
-            return Ok(arr.oid);
-        }
-        if let Some(arr_oid) = snapshot.array_type_of(type_entry.oid) {
-            return Ok(arr_oid);
-        }
+    // typenameType: a shell type can't be used.
+    if !type_entry.typisdefined {
+        return Err(AnalyzeError::UndefinedType(format!(
+            "type \"{}\" is only a shell",
+            parts.join(".")
+        )));
+    }
+
+    // The array type is the element's `typarray`, whatever its name
+    // (makeArrayTypeName can't always use `_name`).
+    if is_array && let Some(arr_oid) = snapshot.array_type_of(type_entry.oid) {
+        return Ok(arr_oid);
     }
 
     Ok(type_entry.oid)

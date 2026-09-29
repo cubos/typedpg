@@ -210,7 +210,7 @@ pub(crate) fn parse_column_def(
 
     let type_oid = match (serial_type, cd.type_name.as_ref()) {
         (Some(oid), _) => oid,
-        (None, Some(tn)) => lookup_type_name(tn, interp)?,
+        (None, Some(tn)) => crate::ddl::functions::typename_type_id(interp, tn)?,
         (None, None) => oid::UNKNOWN,
     };
 
@@ -1394,7 +1394,7 @@ pub(crate) fn alter_column_type(
         )));
     }
     let new_type_oid = match cd.type_name.as_ref() {
-        Some(tn) => lookup_type_name(tn, interp)?,
+        Some(tn) => crate::ddl::functions::typename_type_id(interp, tn)?,
         None => return Ok(()),
     };
 

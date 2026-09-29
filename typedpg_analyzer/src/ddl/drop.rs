@@ -82,6 +82,11 @@ fn drop_each(
                 )?;
             }
             ObjectType::ObjectType | ObjectType::ObjectDomain => {
+                if obj_type == ObjectType::ObjectDomain
+                    && let Some(node::Node::TypeName(tn)) = obj_node.node.as_ref()
+                {
+                    super::types::check_is_domain(interp, &tn.names)?;
+                }
                 drop_type(interp, obj_node, stmt.missing_ok, cascade)?;
             }
             ObjectType::ObjectFunction | ObjectType::ObjectProcedure => {

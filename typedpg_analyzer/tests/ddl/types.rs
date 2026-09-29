@@ -715,3 +715,204 @@ fn subscript_handlers_are_resolved_like_define_type() {
         )
     );
 }
+
+#[test]
+fn composite_and_range_type_ddl_follows_postgres_checks() {
+    assert_ddl_rejections(&[
+        (
+            "",
+            "CREATE TYPE comp AS (a int, a text);",
+            "column \"a\" specified more than once",
+        ),
+        (
+            "CREATE TYPE comp AS (a int, b text);",
+            "ALTER TYPE comp ADD ATTRIBUTE c comp;",
+            "composite type comp cannot be made a member of itself",
+        ),
+        (
+            "CREATE TYPE comp AS (a int, b text);",
+            "ALTER TYPE comp ADD ATTRIBUTE c comp[];",
+            "composite type comp cannot be made a member of itself",
+        ),
+        (
+            "CREATE TYPE comp AS (a int, b text);
+             CREATE TYPE comp2 AS (x comp);",
+            "ALTER TYPE comp ADD ATTRIBUTE c comp2;",
+            "composite type comp cannot be made a member of itself",
+        ),
+        (
+            "CREATE TABLE t (a int);",
+            "ALTER TABLE t ADD COLUMN c t;",
+            "composite type t cannot be made a member of itself",
+        ),
+        (
+            "",
+            "CREATE TYPE r AS RANGE (subtype = int4, subtype_diff = int4mi);",
+            "range subtype diff function int4mi(integer, integer) must return type double precision",
+        ),
+        (
+            "",
+            "CREATE TYPE r AS RANGE (subtype = int4, subtype_diff = float8mi);",
+            "function float8mi(integer, integer) does not exist",
+        ),
+        (
+            "",
+            "CREATE TYPE r AS RANGE (subtype = int4, bogus = 1);",
+            "type attribute \"bogus\" not recognized",
+        ),
+        (
+            "",
+            "CREATE TYPE r AS RANGE (subtype = int4, collation = \"C\");",
+            "range collation specified but subtype does not support collation",
+        ),
+        (
+            "",
+            "CREATE TYPE r AS RANGE (subtype = text, subtype = int4);",
+            "conflicting or redundant options",
+        ),
+        (
+            "",
+            "CREATE TYPE r AS RANGE (subtype = int4, canonical = int4range_canonical);",
+            "cannot specify a canonical function without a pre-created shell type",
+        ),
+        (
+            "CREATE TYPE mood AS ENUM ('a');
+             CREATE SCHEMA s;
+             CREATE TYPE s.mood AS ENUM ('b');",
+            "ALTER TYPE mood SET SCHEMA s;",
+            "type \"mood\" already exists in schema \"s\"",
+        ),
+        (
+            "CREATE TABLE t (a int);",
+            "ALTER TYPE t RENAME TO t2;",
+            "t is a table's row type",
+        ),
+        (
+            "CREATE TYPE mood AS ENUM ('a');",
+            "ALTER TYPE _mood RENAME TO foo;",
+            "cannot alter array type mood[]",
+        ),
+    ]);
+}
+
+#[test]
+fn create_type_named_like_an_array_type_moves_the_array_aside() {
+    // moveArrayTypeName: `_mood` becomes `__mood`, still mood's array.
+    let db = build(&[(
+        "0001.sql",
+        "CREATE TYPE mood AS ENUM ('a');
+         CREATE TYPE _mood AS ENUM ('b');",
+    )]);
+    let q = db
+        .analyze("SELECT '{a}'::mood[] AS m, 'b'::_mood AS u")
+        .unwrap();
+    assert_eq!(
+        q.columns[0].pg_type,
+        array_of(enum_ty("public", "mood", &["a"]))
+    );
+    assert_eq!(q.columns[1].pg_type, enum_ty("public", "_mood", &["b"]));
+    assert!(db.resolve_type_by_name(None, "__mood").is_some());
+}
+
+#[test]
+fn shell_and_base_type_rules() {
+    let io = "CREATE TYPE base2;
+              CREATE FUNCTION base2_in(cstring) RETURNS base2 LANGUAGE internal IMMUTABLE STRICT
+                  AS 'int4in';
+              CREATE FUNCTION base2_out(base2) RETURNS cstring LANGUAGE internal IMMUTABLE STRICT
+                  AS 'int4out';";
+    let defined = format!(
+        "{io} CREATE TYPE base2 (INPUT = base2_in, OUTPUT = base2_out, INTERNALLENGTH = 4, \
+         PASSEDBYVALUE);"
+    );
+    assert_ddl_rejections(&[
+        (
+            "CREATE TYPE shell;",
+            "CREATE TABLE t (a shell);",
+            "type \"shell\" is only a shell",
+        ),
+        (
+            "CREATE TYPE shell;",
+            "CREATE FUNCTION f(shell) RETURNS int LANGUAGE sql AS 'select 1';",
+            "SQL function cannot accept shell type shell",
+        ),
+        (
+            "",
+            "CREATE TYPE base1 (INPUT = int4in, OUTPUT = int4out);",
+            "type \"base1\" does not exist",
+        ),
+        (
+            io,
+            "CREATE TYPE base2 (INPUT = base2_in);",
+            "type output function must be specified",
+        ),
+        (
+            io,
+            "CREATE TYPE base2 (INPUT = int4in, OUTPUT = base2_out);",
+            "type input function int4in must return type base2",
+        ),
+        (
+            &defined,
+            "ALTER TYPE base2 SET (STORAGE = extended);",
+            "fixed-size types must have storage PLAIN",
+        ),
+        (
+            "CREATE TYPE mood AS ENUM ('a');",
+            "ALTER TYPE mood SET (storage = plain);",
+            "mood is not a base type",
+        ),
+    ]);
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TYPE shell;").unwrap();
+    assert_err_prefix!(
+        db.analyze("SELECT NULL::shell AS x"),
+        AnalyzeError::UndefinedType(_),
+        "type \"shell\" is only a shell"
+    );
+}
+
+#[test]
+fn enum_labels_and_domain_commands_are_checked() {
+    let long = "a".repeat(64);
+    let create = format!("CREATE TYPE big AS ENUM ('{long}');");
+    let add = format!("ALTER TYPE mood ADD VALUE '{long}';");
+    let rename = format!("ALTER TYPE mood RENAME VALUE 'a' TO '{long}';");
+    let invalid = format!("invalid enum label \"{long}\"");
+    let mood = "CREATE TYPE mood AS ENUM ('a');";
+    assert_ddl_rejections(&[
+        ("", &create, &invalid),
+        (mood, &add, &invalid),
+        (mood, &rename, &invalid),
+        (mood, "DROP DOMAIN mood;", "\"mood\" is not a domain"),
+        (
+            mood,
+            "COMMENT ON DOMAIN mood IS 'x';",
+            "\"mood\" is not a domain",
+        ),
+        (
+            mood,
+            "GRANT USAGE ON DOMAIN mood TO public;",
+            "\"mood\" is not a domain",
+        ),
+        (
+            "",
+            "CREATE DOMAIN d AS int COLLATE \"C\";",
+            "collations are not supported by type integer",
+        ),
+        (
+            "CREATE DOMAIN d AS int;",
+            "ALTER DOMAIN d SET DEFAULT 'abc';",
+            "invalid input syntax for type integer: \"abc\"",
+        ),
+        (
+            "",
+            "CREATE DOMAIN d AS int CHECK (VALUE > $1);",
+            "there is no parameter $1",
+        ),
+    ]);
+    // 63 bytes is fine.
+    build(&[(
+        "0001.sql",
+        &format!("CREATE TYPE ok AS ENUM ('{}');", "a".repeat(63)),
+    )]);
+}

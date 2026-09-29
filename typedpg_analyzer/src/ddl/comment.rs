@@ -189,6 +189,9 @@ pub(crate) fn resolve_object(
         ObjectType::ObjectType | ObjectType::ObjectDomain => {
             if let node::Node::TypeName(tn) = object {
                 super::util::lookup_type_name(tn, interp)?;
+                if objtype == ObjectType::ObjectDomain {
+                    super::types::check_is_domain(interp, &tn.names)?;
+                }
             }
         }
         ObjectType::ObjectSchema => {
