@@ -643,7 +643,13 @@ pub(crate) fn transform_container_subscripts(
 
     // hstore_subscript_transform (hstore_subs.c): one text subscript, no
     // slices; the result is text.
-    if snapshot.type_subscript.get(&base).map(String::as_str) == Some("hstore_subscript_handler") {
+    if snapshot
+        .pg_type
+        .get(&base)
+        .and_then(|t| t.typsubscript)
+        .and_then(|h| snapshot.pg_proc.get(&h))
+        .is_some_and(|h| h.proname == "hstore_subscript_handler")
+    {
         if is_slice || subscripts.len() != 1 {
             return Err(AnalyzeError::FeatureNotSupported(
                 "hstore allows only one subscript".into(),

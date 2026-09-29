@@ -79,7 +79,7 @@ pub use pg_catalog::{
     DepType, EvEnabled, EvType, PgAggregate, PgAm, PgAttribute, PgCast, PgCatalogSeed, PgClass,
     PgCollation, PgConstraint, PgDepend, PgEnum, PgExtension, PgIndex, PgInherits, PgNamespace,
     PgOpclass, PgOperator, PgOpfamily, PgProc, PgRange, PgRewrite, PgSetting, PgTsObject, PgType,
-    ProKind, ProVolatile, RelKind, SerializedAst, TypCategory, TypStorage, TypType,
+    ProKind, ProVolatile, RelKind, SerializedAst, TypAlign, TypCategory, TypStorage, TypType,
 };
 
 pub use ddl::DdlError;

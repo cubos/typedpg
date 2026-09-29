@@ -560,3 +560,158 @@ fn enum_label_changes_follow_pg() {
         assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
     }
 }
+
+// ── Physical layout (typlen, typbyval, typalign, typstorage, typsubscript) ──
+
+/// `(typtype, typlen, typbyval, typalign, typstorage, subscript handler)`.
+fn layout(
+    snap: &PgCatalog,
+    name: &str,
+) -> (TypType, i16, bool, TypAlign, TypStorage, Option<String>) {
+    let t = snap
+        .resolve_type_by_name(None, name)
+        .unwrap_or_else(|| panic!("type {name}"));
+    let handler = t
+        .typsubscript
+        .and_then(|h| snap.pg_proc().get(&h))
+        .map(|p| p.proname.clone());
+    (
+        t.typtype,
+        t.typlen,
+        t.typbyval,
+        t.typalign,
+        t.typstorage,
+        handler,
+    )
+}
+
+#[test]
+fn created_types_get_postgres_physical_layout() {
+    use TypAlign::*;
+    use TypStorage::*;
+    // Values read from pg_type on PostgreSQL 18 after the same DDL.
+    let snap = build(&[(
+        "0001.sql",
+        "CREATE TYPE e AS ENUM ('a');
+         CREATE TYPE c AS (a int, b float8);
+         CREATE DOMAIN d AS int4[];
+         CREATE DOMAIN dt AS text;
+         CREATE TYPE r AS RANGE (subtype = float8);
+         CREATE TYPE ri AS RANGE (subtype = int2);
+         CREATE TABLE t (a int);
+         CREATE VIEW v AS SELECT 1 AS x;",
+    )]);
+    let array = Some("array_subscript_handler".to_owned());
+    for (name, expected) in [
+        ("e", (TypType::Enum, 4, true, Int, Plain, None)),
+        (
+            "_e",
+            (TypType::Base, -1, false, Int, Extended, array.clone()),
+        ),
+        ("c", (TypType::Composite, -1, false, Double, Extended, None)),
+        (
+            "_c",
+            (TypType::Base, -1, false, Double, Extended, array.clone()),
+        ),
+        // A domain stores like its base, but isn't subscripted by itself.
+        ("d", (TypType::Domain, -1, false, Int, Extended, None)),
+        ("dt", (TypType::Domain, -1, false, Int, Extended, None)),
+        ("r", (TypType::Range, -1, false, Double, Extended, None)),
+        (
+            "r_multirange",
+            (TypType::Multirange, -1, false, Double, Extended, None),
+        ),
+        (
+            "_r",
+            (TypType::Base, -1, false, Double, Extended, array.clone()),
+        ),
+        ("ri", (TypType::Range, -1, false, Int, Extended, None)),
+        (
+            "ri_multirange",
+            (TypType::Multirange, -1, false, Int, Extended, None),
+        ),
+        ("t", (TypType::Composite, -1, false, Double, Extended, None)),
+        ("v", (TypType::Composite, -1, false, Double, Extended, None)),
+    ] {
+        assert_eq!(layout(&snap, name), expected, "{name}");
+    }
+}
+
+#[test]
+fn shell_types_are_undefined_pseudo_types_until_fully_created() {
+    let snap = build(&[(
+        "0001.sql",
+        "CREATE TYPE sh;
+         CREATE TYPE f1;
+         CREATE FUNCTION f1_in(cstring) RETURNS f1 LANGUAGE internal IMMUTABLE STRICT AS 'int4in';
+         CREATE FUNCTION f1_out(f1) RETURNS cstring LANGUAGE internal IMMUTABLE STRICT AS 'int4out';
+         CREATE TYPE f1 (INPUT = f1_in, OUTPUT = f1_out);
+         CREATE TYPE f2;
+         CREATE FUNCTION f2_in(cstring) RETURNS f2 LANGUAGE internal IMMUTABLE STRICT AS 'int4in';
+         CREATE FUNCTION f2_out(f2) RETURNS cstring LANGUAGE internal IMMUTABLE STRICT AS 'int4out';
+         CREATE TYPE f2 (INPUT = f2_in, OUTPUT = f2_out, INTERNALLENGTH = 4, PASSEDBYVALUE, ALIGNMENT = int4);
+         CREATE TYPE f3;
+         CREATE FUNCTION f3_in(cstring) RETURNS f3 LANGUAGE internal IMMUTABLE STRICT AS 'float8in';
+         CREATE FUNCTION f3_out(f3) RETURNS cstring LANGUAGE internal IMMUTABLE STRICT AS 'float8out';
+         CREATE TYPE f3 (INPUT = f3_in, OUTPUT = f3_out, INTERNALLENGTH = 8, PASSEDBYVALUE, ALIGNMENT = double);
+         CREATE TYPE f4;
+         CREATE FUNCTION f4_in(cstring) RETURNS f4 LANGUAGE internal IMMUTABLE STRICT AS 'int8in';
+         CREATE FUNCTION f4_out(f4) RETURNS cstring LANGUAGE internal IMMUTABLE STRICT AS 'int8out';
+         CREATE TYPE f4 (INPUT = f4_in, OUTPUT = f4_out, LIKE = int8);",
+    )]);
+    use TypAlign::*;
+    use TypStorage::*;
+    let sh = snap.resolve_type_by_name(None, "sh").unwrap();
+    assert!(!sh.typisdefined);
+    assert_eq!(
+        layout(&snap, "sh"),
+        (TypType::Pseudo, 4, true, Int, Plain, None)
+    );
+    assert!(
+        snap.resolve_type_by_name(None, "_sh").is_none(),
+        "a shell has no array"
+    );
+    for (name, expected) in [
+        ("f1", (TypType::Base, -1, false, Int, Plain, None)),
+        ("f2", (TypType::Base, 4, true, Int, Plain, None)),
+        ("f3", (TypType::Base, 8, true, Double, Plain, None)),
+        ("f4", (TypType::Base, 8, true, Double, Plain, None)),
+    ] {
+        assert_eq!(layout(&snap, name), expected, "{name}");
+        assert!(snap.resolve_type_by_name(None, name).unwrap().typisdefined);
+    }
+    assert_eq!(layout(&snap, "_f1").3, Int);
+    assert_eq!(layout(&snap, "_f3").3, Double);
+}
+
+#[test]
+fn subscript_handlers_are_resolved_like_define_type() {
+    let shell = "CREATE TYPE f5;
+         CREATE FUNCTION f5_in(cstring) RETURNS f5 LANGUAGE internal IMMUTABLE STRICT AS 'textin';
+         CREATE FUNCTION f5_out(f5) RETURNS cstring LANGUAGE internal IMMUTABLE STRICT AS 'textout';";
+    for (definition, message) in [
+        (
+            "CREATE TYPE f5 (INPUT = f5_in, OUTPUT = f5_out, SUBSCRIPT = nosuch_handler);",
+            "function nosuch_handler(internal) does not exist",
+        ),
+        (
+            "CREATE TYPE f5 (INPUT = f5_in, OUTPUT = f5_out, SUBSCRIPT = array_subscript_handler);",
+            "user-defined types cannot use subscripting function array_subscript_handler",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", shell), ("0002.sql", definition)]).unwrap_err();
+        assert!(err.to_string().starts_with(message), "{definition}: {err}");
+    }
+    let snap = build(&[("0001.sql", "CREATE EXTENSION hstore;")]);
+    assert_eq!(
+        layout(&snap, "hstore"),
+        (
+            TypType::Base,
+            -1,
+            false,
+            TypAlign::Int,
+            TypStorage::Extended,
+            Some("hstore_subscript_handler".to_owned())
+        )
+    );
+}

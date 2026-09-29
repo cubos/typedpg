@@ -393,6 +393,7 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
             attinhcount: col.inhcount,
         });
     }
+    let phys = crate::ddl::types::TypePhysical::COMPOSITE;
     interp.insert_pg_type(PgType {
         oid: composite_oid,
         typname: name.clone(),
@@ -408,10 +409,16 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
         typtypmod: None,
         typcollation: None,
         typstorage: TypStorage::Extended,
+        typlen: phys.typlen,
+        typbyval: phys.typbyval,
+        typalign: phys.typalign,
+        typsubscript: phys.typsubscript,
+        typisdefined: true,
     });
     register_composite_to_record_cast(interp, composite_oid)?;
 
     // Array type for the composite (`_<name>` in the same schema).
+    let phys = crate::ddl::types::TypePhysical::array(interp, composite_oid);
     interp.insert_pg_type(PgType {
         oid: array_oid,
         typname: format!("_{name}"),
@@ -427,6 +434,11 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
         typtypmod: None,
         typcollation: None,
         typstorage: TypStorage::Extended,
+        typlen: phys.typlen,
+        typbyval: phys.typbyval,
+        typalign: phys.typalign,
+        typsubscript: phys.typsubscript,
+        typisdefined: true,
     });
 
     for (i, col) in columns.iter().enumerate() {

@@ -5,10 +5,10 @@ use typedpg_pg_query::protobuf::{
     CreateDomainStmt, CreateEnumStmt, CreateRangeStmt, DefineStmt, ObjectType, node,
 };
 
-use crate::oid::{PgCastOid, PgClassOid, PgEnumOid, PgNamespaceOid, PgTypeOid};
+use crate::oid::{PgCastOid, PgClassOid, PgEnumOid, PgNamespaceOid, PgProcOid, PgTypeOid};
 use crate::pg_catalog::{
     CastContext, CastMethod, PgAttribute, PgCast, PgClass, PgEnum, PgRange, PgType, RelKind,
-    TypCategory, TypStorage, TypType,
+    TypAlign, TypCategory, TypStorage, TypType,
 };
 
 use super::DdlError;
@@ -164,6 +164,7 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
         .map_or(TypStorage::Plain, |t| t.typstorage);
 
     let oid = PgTypeOid::from_nonzero(interp.alloc_oid()?);
+    let phys = TypePhysical::of(interp, base_type_oid);
     interp.insert_pg_type(PgType {
         oid,
         typname: name.clone(),
@@ -179,6 +180,11 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
         typtypmod,
         typcollation: domain_collation,
         typstorage: domain_storage,
+        typlen: phys.typlen,
+        typbyval: phys.typbyval,
+        typalign: phys.typalign,
+        typsubscript: phys.typsubscript,
+        typisdefined: true,
     });
 
     register_array_type(interp, nsoid, &name, oid)?;
@@ -446,6 +452,7 @@ pub fn create_enum(interp: &mut PgCatalog, stmt: &CreateEnumStmt) -> Result<(), 
 
     let oid = PgTypeOid::from_nonzero(interp.alloc_oid()?);
     interp.enums_created_in_transaction.insert(oid);
+    let phys = TypePhysical::ENUM;
     interp.insert_pg_type(PgType {
         oid,
         typname: name.clone(),
@@ -461,6 +468,11 @@ pub fn create_enum(interp: &mut PgCatalog, stmt: &CreateEnumStmt) -> Result<(), 
         typtypmod: None,
         typcollation: None,
         typstorage: TypStorage::Plain,
+        typlen: phys.typlen,
+        typbyval: phys.typbyval,
+        typalign: phys.typalign,
+        typsubscript: phys.typsubscript,
+        typisdefined: true,
     });
     for (i, label) in labels.into_iter().enumerate() {
         let enum_oid = PgEnumOid::from_nonzero(interp.alloc_oid()?);
@@ -551,6 +563,7 @@ pub fn create_composite(interp: &mut PgCatalog, stmt: &CompositeTypeStmt) -> Res
             attinhcount: 0,
         });
     }
+    let phys = TypePhysical::COMPOSITE;
     interp.insert_pg_type(PgType {
         oid: type_oid,
         typname: name.clone(),
@@ -566,6 +579,11 @@ pub fn create_composite(interp: &mut PgCatalog, stmt: &CompositeTypeStmt) -> Res
         typtypmod: None,
         typcollation: None,
         typstorage: TypStorage::Extended,
+        typlen: phys.typlen,
+        typbyval: phys.typbyval,
+        typalign: phys.typalign,
+        typsubscript: phys.typsubscript,
+        typisdefined: true,
     });
 
     register_array_type(interp, nsoid, &name, type_oid)?;
@@ -639,6 +657,7 @@ pub fn create_range(interp: &mut PgCatalog, stmt: &CreateRangeStmt) -> Result<()
     }
 
     let oid = PgTypeOid::from_nonzero(interp.alloc_oid()?);
+    let phys = TypePhysical::range(interp, subtype_oid);
     interp.insert_pg_type(PgType {
         oid,
         typname: name.clone(),
@@ -654,10 +673,16 @@ pub fn create_range(interp: &mut PgCatalog, stmt: &CreateRangeStmt) -> Result<()
         typtypmod: None,
         typcollation: None,
         typstorage: TypStorage::Extended,
+        typlen: phys.typlen,
+        typbyval: phys.typbyval,
+        typalign: phys.typalign,
+        typsubscript: phys.typsubscript,
+        typisdefined: true,
     });
     let range_array = register_array_type(interp, nsoid, &name, oid)?;
 
     let mr_oid = PgTypeOid::from_nonzero(interp.alloc_oid()?);
+    let phys = TypePhysical::range(interp, subtype_oid);
     interp.insert_pg_type(PgType {
         oid: mr_oid,
         typname: mr_name.clone(),
@@ -673,6 +698,11 @@ pub fn create_range(interp: &mut PgCatalog, stmt: &CreateRangeStmt) -> Result<()
         typtypmod: None,
         typcollation: None,
         typstorage: TypStorage::Extended,
+        typlen: phys.typlen,
+        typbyval: phys.typbyval,
+        typalign: phys.typalign,
+        typsubscript: phys.typsubscript,
+        typisdefined: true,
     });
     register_array_type(interp, mr_nsoid, &mr_name, mr_oid)?;
     interp.insert_pg_range(PgRange {
@@ -890,63 +920,202 @@ pub fn define_type(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), DdlE
         Some(&oid) => oid,
         None => create_base_type(interp, nsoid, &name)?,
     };
-    record_type_options(interp, oid, &stmt.definition);
+    if !stmt.definition.is_empty() {
+        define_base_type(interp, nsoid, &name, oid, &stmt.definition)?;
+    }
     Ok(())
 }
 
-/// Record the type options the analyzer uses (`SUBSCRIPT = handler`) from a
-/// `CREATE TYPE (...)` / `ALTER TYPE ... SET (...)` option list.
+/// The value of a `CREATE TYPE` option, as DefineType's `defGetString` reads
+/// it (a name's last component, a string or a number), lowercased.
+fn option_word(de: &typedpg_pg_query::protobuf::DefElem) -> Option<String> {
+    match de.arg.as_deref().and_then(|a| a.node.as_ref())? {
+        node::Node::TypeName(tn) => tn
+            .names
+            .last()
+            .and_then(super::util::node_string)
+            .map(str::to_ascii_lowercase),
+        node::Node::String(s) => Some(s.sval.to_ascii_lowercase()),
+        node::Node::Integer(i) => Some(i.ival.to_string()),
+        _ => None,
+    }
+}
+
+/// The full `CREATE TYPE name (...)` of a base type (DefineType): the shell
+/// becomes a defined base type with the physical layout its options give —
+/// `LIKE` first, then INTERNALLENGTH, PASSEDBYVALUE, ALIGNMENT and STORAGE
+/// over it — and gets its array type.
+fn define_base_type(
+    interp: &mut PgCatalog,
+    nsoid: PgNamespaceOid,
+    name: &str,
+    oid: PgTypeOid,
+    options: &[typedpg_pg_query::protobuf::Node],
+) -> Result<(), DdlError> {
+    let defs: Vec<&typedpg_pg_query::protobuf::DefElem> = options
+        .iter()
+        .filter_map(|o| match o.node.as_ref() {
+            Some(node::Node::DefElem(de)) => Some(de.as_ref()),
+            _ => None,
+        })
+        .collect();
+    let mut phys = TypePhysical::VARIABLE_BASE;
+    let mut storage = TypStorage::Plain;
+    if let Some(like) = defs.iter().find(|d| d.defname.eq_ignore_ascii_case("like"))
+        && let Some(node::Node::TypeName(tn)) = like.arg.as_deref().and_then(|a| a.node.as_ref())
+    {
+        let like_oid = super::util::lookup_type_name(tn, interp)?;
+        if let Some(t) = interp.pg_type.get(&like_oid) {
+            phys = TypePhysical {
+                typlen: t.typlen,
+                typbyval: t.typbyval,
+                typalign: t.typalign,
+                typsubscript: None,
+            };
+            storage = t.typstorage;
+        }
+    }
+    for de in &defs {
+        match de.defname.to_ascii_lowercase().as_str() {
+            "internallength" => {
+                phys.typlen = match option_word(de).as_deref() {
+                    Some("variable") | None => -1,
+                    Some(n) => n.parse().unwrap_or(-1),
+                };
+            }
+            "passedbyvalue" => phys.typbyval = true,
+            "alignment" => {
+                phys.typalign = match option_word(de).as_deref() {
+                    Some("double" | "float8") => TypAlign::Double,
+                    Some("int4" | "integer") => TypAlign::Int,
+                    Some("int2" | "smallint") => TypAlign::Short,
+                    Some("char" | "bpchar") => TypAlign::Char,
+                    other => {
+                        return Err(DdlError::Parse(format!(
+                            "alignment \"{}\" not recognized",
+                            other.unwrap_or_default()
+                        )));
+                    }
+                };
+            }
+            "storage" => {
+                if let Some(s) = parse_storage(de) {
+                    storage = s;
+                }
+            }
+            _ => {}
+        }
+    }
+    let subscript = match defs
+        .iter()
+        .find(|d| d.defname.eq_ignore_ascii_case("subscript"))
+    {
+        Some(de) => subscript_handler(interp, de)?,
+        None => None,
+    };
+    if let Some(t) = interp.pg_type.get_mut(&oid) {
+        t.typtype = TypType::Base;
+        t.typcategory = TypCategory::UserDefined;
+        t.typisdefined = true;
+        t.typlen = phys.typlen;
+        t.typbyval = phys.typbyval;
+        t.typalign = phys.typalign;
+        t.typstorage = storage;
+        t.typsubscript = subscript;
+    }
+    let has_array = interp
+        .pg_type
+        .get(&oid)
+        .is_some_and(|t| t.typarray.is_some());
+    if !has_array {
+        register_array_type(interp, nsoid, name, oid)?;
+    }
+    Ok(())
+}
+
+/// DefineType's `STORAGE = plain | external | extended | main`.
+fn parse_storage(de: &typedpg_pg_query::protobuf::DefElem) -> Option<TypStorage> {
+    Some(match option_word(de)?.as_str() {
+        "external" => TypStorage::External,
+        "extended" => TypStorage::Extended,
+        "main" => TypStorage::Main,
+        _ => TypStorage::Plain,
+    })
+}
+
+/// findTypeSubscriptingFunction: `SUBSCRIPT = handler` names a function
+/// taking `internal`; `none` clears it; the built-in array handlers are
+/// reserved for true arrays.
+fn subscript_handler(
+    interp: &PgCatalog,
+    de: &typedpg_pg_query::protobuf::DefElem,
+) -> Result<Option<PgProcOid>, DdlError> {
+    let names: Vec<&str> = match de.arg.as_deref().and_then(|a| a.node.as_ref()) {
+        Some(node::Node::TypeName(tn)) => tn
+            .names
+            .iter()
+            .filter_map(super::util::node_string)
+            .collect(),
+        Some(node::Node::String(s)) => vec![s.sval.as_str()],
+        _ => return Ok(None),
+    };
+    let (schema, name) = match names.as_slice() {
+        [n] => (None, *n),
+        [s, n] => (Some(*s), *n),
+        _ => return Ok(None),
+    };
+    if schema.is_none() && name.eq_ignore_ascii_case("none") {
+        return Ok(None);
+    }
+    const INTERNAL: PgTypeOid = PgTypeOid::from_raw(2281);
+    let Some(proc) = interp
+        .find_functions(schema, name)
+        .into_iter()
+        .find(|p| p.proargtypes == [INTERNAL])
+    else {
+        return Err(DdlError::TypeNotFound(format!(
+            "function {}(internal) does not exist",
+            names.join(".")
+        )));
+    };
+    if matches!(
+        proc.proname.as_str(),
+        "array_subscript_handler" | "raw_array_subscript_handler"
+    ) && interp.namespace_name(proc.pronamespace) == Some("pg_catalog")
+    {
+        return Err(DdlError::Parse(format!(
+            "user-defined types cannot use subscripting function {}",
+            proc.proname
+        )));
+    }
+    Ok(Some(proc.oid))
+}
+
+/// `ALTER TYPE ... SET (...)` (AlterType): STORAGE and SUBSCRIPT change the
+/// type's row.
 fn record_type_options(
     interp: &mut PgCatalog,
     oid: PgTypeOid,
     options: &[typedpg_pg_query::protobuf::Node],
-) {
+) -> Result<(), DdlError> {
     for opt in options {
         let Some(node::Node::DefElem(de)) = opt.node.as_ref() else {
             continue;
         };
         if de.defname.eq_ignore_ascii_case("storage") {
-            // DefineType: `STORAGE = plain | external | extended | main`.
-            let storage = match de.arg.as_deref().and_then(|a| a.node.as_ref()) {
-                Some(node::Node::TypeName(tn)) => {
-                    tn.names.last().and_then(super::util::node_string)
-                }
-                Some(node::Node::String(s)) => Some(s.sval.as_str()),
-                _ => None,
-            };
-            let storage = match storage.map(str::to_ascii_lowercase).as_deref() {
-                Some("external") => TypStorage::External,
-                Some("extended") => TypStorage::Extended,
-                Some("main") => TypStorage::Main,
-                _ => TypStorage::Plain,
-            };
-            if let Some(t) = interp.pg_type.get_mut(&oid) {
+            if let Some(storage) = parse_storage(de)
+                && let Some(t) = interp.pg_type.get_mut(&oid)
+            {
                 t.typstorage = storage;
             }
-            continue;
-        }
-        if !de.defname.eq_ignore_ascii_case("subscript") {
-            continue;
-        }
-        let handler = match de.arg.as_deref().and_then(|a| a.node.as_ref()) {
-            Some(node::Node::TypeName(tn)) => {
-                tn.names.iter().rev().find_map(|n| match n.node.as_ref() {
-                    Some(node::Node::String(s)) => Some(s.sval.clone()),
-                    _ => None,
-                })
-            }
-            Some(node::Node::String(s)) => Some(s.sval.clone()),
-            _ => None,
-        };
-        match handler {
-            Some(h) if !h.eq_ignore_ascii_case("none") => {
-                interp.type_subscript.insert(oid, h);
-            }
-            _ => {
-                interp.type_subscript.remove(&oid);
+        } else if de.defname.eq_ignore_ascii_case("subscript") {
+            let handler = subscript_handler(interp, de)?;
+            if let Some(t) = interp.pg_type.get_mut(&oid) {
+                t.typsubscript = handler;
             }
         }
     }
+    Ok(())
 }
 
 /// `ALTER TYPE name SET (...)`: only the options the analyzer models
@@ -970,24 +1139,28 @@ pub fn alter_type(
     };
     if let Some(t) = interp.resolve_type_by_name(schema, name) {
         let oid = t.oid;
-        record_type_options(interp, oid, &stmt.options);
+        record_type_options(interp, oid, &stmt.options)?;
     }
     Ok(())
 }
 
-/// Register a user-defined base type (shell or full) with its array type.
+/// Register a shell type (`CREATE TYPE name;`, or the not-yet-defined result
+/// type of a C function).
 pub(crate) fn create_base_type(
     interp: &mut PgCatalog,
     nsoid: PgNamespaceOid,
     name: &str,
 ) -> Result<PgTypeOid, DdlError> {
+    // TypeShellMake: a pseudo-type placeholder, not yet defined and without
+    // an array type (the full CREATE TYPE adds it).
     let oid = PgTypeOid::from_nonzero(interp.alloc_oid()?);
+    let phys = TypePhysical::SHELL;
     interp.insert_pg_type(PgType {
         oid,
         typname: name.to_owned(),
         typnamespace: nsoid,
-        typtype: TypType::Base,
-        typcategory: TypCategory::UserDefined,
+        typtype: TypType::Pseudo,
+        typcategory: TypCategory::Pseudo,
         typispreferred: false,
         typrelid: None,
         typelem: None,
@@ -997,8 +1170,12 @@ pub(crate) fn create_base_type(
         typtypmod: None,
         typcollation: None,
         typstorage: TypStorage::Plain,
+        typlen: phys.typlen,
+        typbyval: phys.typbyval,
+        typalign: phys.typalign,
+        typsubscript: phys.typsubscript,
+        typisdefined: false,
     });
-    register_array_type(interp, nsoid, name, oid)?;
     Ok(oid)
 }
 
@@ -1102,6 +1279,83 @@ pub fn create_cast(interp: &mut PgCatalog, stmt: &CreateCastStmt) -> Result<(), 
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
+/// `pg_type`'s physical columns, as PostgreSQL assigns them to each kind of
+/// type it creates.
+pub(crate) struct TypePhysical {
+    pub typlen: i16,
+    pub typbyval: bool,
+    pub typalign: TypAlign,
+    pub typsubscript: Option<PgProcOid>,
+}
+
+impl TypePhysical {
+    /// DefineEnum: a 4-byte OID, passed by value.
+    pub(crate) const ENUM: Self = Self {
+        typlen: 4,
+        typbyval: true,
+        typalign: TypAlign::Int,
+        typsubscript: None,
+    };
+    /// A row type (CREATE TYPE AS, a table's or view's): a varlena record.
+    pub(crate) const COMPOSITE: Self = Self {
+        typlen: -1,
+        typbyval: false,
+        typalign: TypAlign::Double,
+        typsubscript: None,
+    };
+    /// TypeShellMake: a placeholder until the full CREATE TYPE.
+    pub(crate) const SHELL: Self = Self {
+        typlen: 4,
+        typbyval: true,
+        typalign: TypAlign::Int,
+        typsubscript: None,
+    };
+    /// DefineType's defaults for a full base type: INTERNALLENGTH =
+    /// VARIABLE, not PASSEDBYVALUE, ALIGNMENT = int4.
+    pub(crate) const VARIABLE_BASE: Self = Self {
+        typlen: -1,
+        typbyval: false,
+        typalign: TypAlign::Int,
+        typsubscript: None,
+    };
+
+    /// A domain stores its values like its base type (DefineDomain), but has
+    /// no subscripting handler of its own: subscripting a domain goes through
+    /// its base type.
+    pub(crate) fn of(interp: &PgCatalog, base: PgTypeOid) -> Self {
+        interp
+            .pg_type
+            .get(&base)
+            .map_or(Self::VARIABLE_BASE, |t| Self {
+                typlen: t.typlen,
+                typbyval: t.typbyval,
+                typalign: t.typalign,
+                typsubscript: None,
+            })
+    }
+
+    /// A range or multirange over `subtype` (DefineRange).
+    pub(crate) fn range(interp: &PgCatalog, subtype: PgTypeOid) -> Self {
+        Self {
+            typalign: Self::of(interp, subtype).typalign.of_container(),
+            ..Self::VARIABLE_BASE
+        }
+    }
+
+    /// The array type of `element`: a varlena whose alignment follows the
+    /// element's, subscripted by `array_subscript_handler`.
+    pub(crate) fn array(interp: &PgCatalog, element: PgTypeOid) -> Self {
+        Self {
+            typalign: Self::of(interp, element).typalign.of_container(),
+            typsubscript: interp
+                .find_functions(Some("pg_catalog"), "array_subscript_handler")
+                .first()
+                .map(|p| p.oid),
+            ..Self::VARIABLE_BASE
+        }
+    }
+}
+
 /// Suppress the auto array name when needed; we always use `_<name>`.
 fn array_name(base_name: &str) -> String {
     format!("_{base_name}")
@@ -1116,6 +1370,7 @@ fn register_array_type(
     element_oid: PgTypeOid,
 ) -> Result<PgTypeOid, DdlError> {
     let array_oid = PgTypeOid::from_nonzero(interp.alloc_oid()?);
+    let phys = TypePhysical::array(interp, element_oid);
     interp.insert_pg_type(PgType {
         oid: array_oid,
         typname: array_name(base_name),
@@ -1131,6 +1386,11 @@ fn register_array_type(
         typtypmod: None,
         typcollation: None,
         typstorage: TypStorage::Extended,
+        typlen: phys.typlen,
+        typbyval: phys.typbyval,
+        typalign: phys.typalign,
+        typsubscript: phys.typsubscript,
+        typisdefined: true,
     });
     if let Some(elem) = interp.pg_type.get_mut(&element_oid) {
         elem.typarray = Some(array_oid);

@@ -7,7 +7,7 @@ pub use typedpg_analyzer::{
     PgAggregate, PgAttribute, PgCast, PgCastOid, PgCatalog, PgCatalogSeed, PgClass, PgClassOid,
     PgDepend, PgEnum, PgEnumOid, PgExtension, PgExtensionOid, PgGenericOid, PgIndex, PgNamespace,
     PgNamespaceOid, PgOperator, PgOperatorOid, PgProc, PgProcOid, PgRange, PgType, PgTypeOid,
-    ProKind, QualifiedName, RecordField, RelKind, TypCategory, TypType, Type,
+    ProKind, QualifiedName, RecordField, RelKind, TypAlign, TypCategory, TypStorage, TypType, Type,
 };
 
 /// Terse helper for building a [`QualifiedName`] in tests.

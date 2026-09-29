@@ -22,7 +22,7 @@ use typedpg_analyzer::{
     PgEnumOid, PgExtension, PgExtensionOid, PgGenericOid, PgIndex, PgInherits, PgNamespace,
     PgNamespaceOid, PgOpclass, PgOperator, PgOperatorOid, PgOpfamily, PgProc, PgProcOid, PgRange,
     PgSetting, PgTsObject, PgType, PgTypeOid, ProKind, ProVolatile, QualifiedName, RelKind,
-    TypCategory, TypStorage, TypType,
+    TypAlign, TypCategory, TypStorage, TypType,
 };
 
 fn main() {
@@ -205,7 +205,7 @@ fn export_types(client: &mut postgres::Client) -> Result<Vec<PgType>, postgres::
     let rows = client.query(
         "SELECT oid, typname, typnamespace, typtype, typcategory, typispreferred, \
                 typrelid, typelem, typarray, typbasetype, typnotnull, typtypmod, typcollation, \
-                typstorage \
+                typstorage, typlen, typbyval, typalign, typsubscript::oid, typisdefined \
          FROM pg_catalog.pg_type ORDER BY oid",
         &[],
     )?;
@@ -242,6 +242,16 @@ fn export_types(client: &mut postgres::Client) -> Result<Vec<PgType>, postgres::
                     b'x' => TypStorage::Extended,
                     _ => TypStorage::Plain,
                 },
+                typlen: r.get(14),
+                typbyval: r.get(15),
+                typalign: match r.get::<_, i8>(16) as u8 {
+                    b'c' => TypAlign::Char,
+                    b's' => TypAlign::Short,
+                    b'd' => TypAlign::Double,
+                    _ => TypAlign::Int,
+                },
+                typsubscript: PgProcOid::new(r.get(17)),
+                typisdefined: r.get(18),
             }
         })
         .collect())

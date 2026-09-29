@@ -460,6 +460,7 @@ fn install_relation(
             attinhcount: 0,
         });
     }
+    let phys = super::types::TypePhysical::COMPOSITE;
     interp.insert_pg_type(PgType {
         oid: composite_oid,
         typname: name.clone(),
@@ -475,7 +476,13 @@ fn install_relation(
         typtypmod: None,
         typcollation: None,
         typstorage: TypStorage::Extended,
+        typlen: phys.typlen,
+        typbyval: phys.typbyval,
+        typalign: phys.typalign,
+        typsubscript: phys.typsubscript,
+        typisdefined: true,
     });
+    let phys = super::types::TypePhysical::array(interp, composite_oid);
     interp.insert_pg_type(PgType {
         oid: array_oid,
         typname: format!("_{name}"),
@@ -491,6 +498,11 @@ fn install_relation(
         typtypmod: None,
         typcollation: None,
         typstorage: TypStorage::Extended,
+        typlen: phys.typlen,
+        typbyval: phys.typbyval,
+        typalign: phys.typalign,
+        typsubscript: phys.typsubscript,
+        typisdefined: true,
     });
 
     record_view_dependencies(interp, class_oid, &deps);

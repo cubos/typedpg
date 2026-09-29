@@ -50,6 +50,42 @@ pub enum TypStorage {
     Extended,
 }
 
+/// `pg_type.typalign`: the alignment a value of the type needs when stored.
+/// Serialized as the bare PG char.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TypAlign {
+    #[serde(rename = "c")]
+    Char,
+    #[serde(rename = "s")]
+    Short,
+    #[serde(rename = "i")]
+    Int,
+    #[serde(rename = "d")]
+    Double,
+}
+
+impl TypAlign {
+    /// The PG char (`c`, `s`, `i`, `d`).
+    pub fn as_char(self) -> u8 {
+        match self {
+            TypAlign::Char => b'c',
+            TypAlign::Short => b's',
+            TypAlign::Int => b'i',
+            TypAlign::Double => b'd',
+        }
+    }
+
+    /// The alignment of an array, range or multirange over a type with
+    /// alignment `self`: `d` stays `d`, everything else is `i` (DefineType's
+    /// array, DefineRange).
+    pub fn of_container(self) -> TypAlign {
+        match self {
+            TypAlign::Double => TypAlign::Double,
+            _ => TypAlign::Int,
+        }
+    }
+}
+
 /// `pg_type.typcategory`. PG chars: A array, B boolean, C composite, D
 /// date/time, E enum, G geometric, I network, N numeric, P pseudo, R range, S
 /// string, T timespan, U user-defined, V bit-string, X unknown, Z internal.
@@ -322,6 +358,22 @@ pub struct PgType {
     pub typcollation: Option<PgCollationOid>,
     /// `pg_type.typstorage`.
     pub typstorage: TypStorage,
+    /// `pg_type.typlen`: the fixed size of a value, `-1` for a varlena type,
+    /// `-2` for a C string.
+    pub typlen: i16,
+    /// `pg_type.typbyval`: values are passed by value (fixed size ≤ 8).
+    pub typbyval: bool,
+    /// `pg_type.typalign`.
+    pub typalign: TypAlign,
+    /// FK `pg_proc.oid` of the subscripting handler (`array_subscript_handler`
+    /// for true arrays, `jsonb_subscript_handler`, an extension's own…).
+    /// `None` (PG's `0`) for types that can't be subscripted.
+    #[serde(with = "crate::oid::oid_or_zero")]
+    pub typsubscript: Option<PgProcOid>,
+    /// `pg_type.typisdefined`: `false` for a shell type, which `CREATE TYPE
+    /// name;` (or a C function returning a not-yet-defined type) creates
+    /// until the full `CREATE TYPE` defines it.
+    pub typisdefined: bool,
 }
 
 /// `pg_enum`: one row per enum label.
