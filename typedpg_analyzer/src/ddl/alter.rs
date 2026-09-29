@@ -70,6 +70,12 @@ pub fn rename(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlError>
         ObjectType::ObjectForeignServer => {
             crate::ddl::fdw::rename_foreign_object(interp, false, stmt)
         }
+        ObjectType::ObjectTsconfiguration
+        | ObjectType::ObjectTsdictionary
+        | ObjectType::ObjectTsparser
+        | ObjectType::ObjectTstemplate => {
+            crate::ddl::text_search::rename(interp, rename_type, stmt)
+        }
         _ => Ok(()),
     }
 }
@@ -535,6 +541,12 @@ pub fn set_schema(interp: &mut PgCatalog, stmt: &AlterObjectSchemaStmt) -> Resul
             }
             None => Ok(()),
         },
+        ObjectType::ObjectTsconfiguration
+        | ObjectType::ObjectTsdictionary
+        | ObjectType::ObjectTsparser
+        | ObjectType::ObjectTstemplate => {
+            crate::ddl::text_search::set_schema(interp, object_type, stmt, new_nsoid)
+        }
         _ => Ok(()),
     }
 }

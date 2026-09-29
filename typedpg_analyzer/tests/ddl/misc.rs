@@ -4174,6 +4174,160 @@ fn text_search_objects_are_tracked() {
 }
 
 #[test]
+fn text_search_renames_and_moves_are_seen_by_regconfig() {
+    // PG 18 AlterObjectRename_internal / AlterObjectNamespace_internal on
+    // text search objects, and the regconfig / regdictionary lookups.
+    let setup = "CREATE SCHEMA s;
+                 CREATE TEXT SEARCH CONFIGURATION myc (COPY = english);
+                 CREATE TEXT SEARCH CONFIGURATION other (COPY = english);
+                 CREATE TEXT SEARCH DICTIONARY myd (TEMPLATE = simple);
+                 ALTER TEXT SEARCH CONFIGURATION myc RENAME TO myc2;";
+    for (stmt, msg) in [
+        (
+            "SELECT to_tsvector('myc', 'x');",
+            "text search configuration \"myc\" does not exist",
+        ),
+        (
+            "ALTER TEXT SEARCH CONFIGURATION myc2 RENAME TO other;",
+            "text search configuration \"other\" already exists in schema \"public\"",
+        ),
+        (
+            "ALTER TEXT SEARCH CONFIGURATION nosuch RENAME TO x;",
+            "text search configuration \"nosuch\" does not exist",
+        ),
+        (
+            "ALTER TEXT SEARCH CONFIGURATION myc2 SET SCHEMA s; SELECT 'myc2'::regconfig;",
+            "text search configuration \"myc2\" does not exist",
+        ),
+        (
+            "ALTER TEXT SEARCH DICTIONARY myd RENAME TO myd2; SELECT 'myd'::regdictionary;",
+            "text search dictionary \"myd\" does not exist",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    let db = build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "SELECT to_tsvector('myc2', 'x'), 'myc2'::regconfig;
+             ALTER TEXT SEARCH CONFIGURATION myc2 SET SCHEMA s;
+             ALTER TEXT SEARCH DICTIONARY myd RENAME TO myd2;
+             SELECT 's.myc2'::regconfig, 'myd2'::regdictionary;",
+        ),
+    ]);
+    db.analyze("SELECT to_tsvector('s.myc2', 'x') AS x")
+        .unwrap();
+}
+
+#[test]
+fn text_search_options_are_validated() {
+    // PG 18 DefineTSConfiguration / DefineTSDictionary / getTokenTypes /
+    // verify_dictoptions with the built-in templates' init methods
+    // (dsimple_init, dsnowball_init, dispell_init, dsynonym_init,
+    // thesaurus_init) and the stock tsearch_data files.
+    let setup = "CREATE TEXT SEARCH CONFIGURATION myc (PARSER = default);
+                 CREATE TEXT SEARCH DICTIONARY d (TEMPLATE = simple);";
+    for (stmt, msg) in [
+        (
+            "ALTER TEXT SEARCH CONFIGURATION myc ADD MAPPING FOR bogus WITH simple;",
+            "token type \"bogus\" does not exist",
+        ),
+        (
+            "ALTER TEXT SEARCH CONFIGURATION english DROP MAPPING FOR asciiword, bogus;",
+            "token type \"bogus\" does not exist",
+        ),
+        (
+            "CREATE TEXT SEARCH CONFIGURATION c2 (PARSER = default, COPY = english);",
+            "cannot specify both PARSER and COPY options",
+        ),
+        (
+            "CREATE TEXT SEARCH CONFIGURATION c2 (BOGUS = x);",
+            "text search configuration parameter \"bogus\" not recognized",
+        ),
+        (
+            "CREATE TEXT SEARCH DICTIONARY d2 (BOGUS = x);",
+            "text search template is required",
+        ),
+        (
+            "CREATE TEXT SEARCH DICTIONARY d2 (TEMPLATE = simple, BOGUS = x);",
+            "unrecognized simple dictionary parameter: \"bogus\"",
+        ),
+        (
+            "CREATE TEXT SEARCH DICTIONARY d2 (TEMPLATE = simple, STOPWORDS = nosuchfile);",
+            "could not open stop-word file \"/usr/share/postgresql/18/tsearch_data/nosuchfile.stop\"",
+        ),
+        (
+            "CREATE TEXT SEARCH DICTIONARY d2 (TEMPLATE = simple, STOPWORDS = 'English');",
+            "invalid text search configuration file name \"English\"",
+        ),
+        (
+            "CREATE TEXT SEARCH DICTIONARY d2 (TEMPLATE = simple, STOPWORDS = english, STOPWORDS = english);",
+            "multiple StopWords parameters",
+        ),
+        (
+            "CREATE TEXT SEARCH DICTIONARY d2 (TEMPLATE = simple, ACCEPT = maybe);",
+            "accept requires a Boolean value",
+        ),
+        (
+            "CREATE TEXT SEARCH DICTIONARY d2 (TEMPLATE = snowball);",
+            "missing Language parameter",
+        ),
+        (
+            "CREATE TEXT SEARCH DICTIONARY d2 (TEMPLATE = snowball, LANGUAGE = klingon);",
+            "no Snowball stemmer available for language \"klingon\" and encoding \"UTF8\"",
+        ),
+        (
+            "CREATE TEXT SEARCH DICTIONARY d2 (TEMPLATE = ispell, DICTFILE = ispell_sample);",
+            "missing AffFile parameter",
+        ),
+        (
+            "CREATE TEXT SEARCH DICTIONARY d2 (TEMPLATE = ispell, DICTFILE = nosuch, AFFFILE = ispell_sample);",
+            "could not open dictionary file \"/usr/share/postgresql/18/tsearch_data/nosuch.dict\"",
+        ),
+        (
+            "CREATE TEXT SEARCH DICTIONARY d2 (TEMPLATE = synonym);",
+            "missing Synonyms parameter",
+        ),
+        (
+            "CREATE TEXT SEARCH DICTIONARY d2 (TEMPLATE = synonym, SYNONYMS = nosuch);",
+            "could not open synonym file \"/usr/share/postgresql/18/tsearch_data/nosuch.syn\"",
+        ),
+        (
+            "CREATE TEXT SEARCH DICTIONARY d2 (TEMPLATE = thesaurus, DICTFILE = thesaurus_sample);",
+            "missing Dictionary parameter",
+        ),
+        (
+            "CREATE TEXT SEARCH DICTIONARY d2 (TEMPLATE = thesaurus, DICTFILE = thesaurus_sample,
+             DICTIONARY = nosuch);",
+            "text search dictionary \"nosuch\" does not exist",
+        ),
+        (
+            "ALTER TEXT SEARCH DICTIONARY d (BOGUS = 1);",
+            "unrecognized simple dictionary parameter: \"bogus\"",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "ALTER TEXT SEARCH CONFIGURATION myc ADD MAPPING FOR asciiword, word WITH simple;
+             CREATE TEXT SEARCH DICTIONARY d2 (TEMPLATE = simple, STOPWORDS = english, ACCEPT = false);
+             CREATE TEXT SEARCH DICTIONARY d3 (TEMPLATE = snowball, LANGUAGE = 'French');
+             CREATE TEXT SEARCH DICTIONARY d4 (TEMPLATE = ispell, DICTFILE = ispell_sample,
+                 AFFFILE = ispell_sample, STOPWORDS = english);
+             CREATE TEXT SEARCH DICTIONARY d5 (TEMPLATE = synonym, SYNONYMS = synonym_sample);
+             ALTER TEXT SEARCH DICTIONARY d2 (STOPWORDS);
+             ALTER TEXT SEARCH DICTIONARY d (STOPWORDS = german);",
+        ),
+    ]);
+}
+
+#[test]
 fn languages_must_exist() {
     // PG 18 get_language_oid / DropProceduralLanguage / CreateTransform.
     let setup = "CREATE TABLE t (a text);";

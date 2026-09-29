@@ -195,6 +195,9 @@ pub struct PgCatalog {
     pub(crate) pg_amop: Vec<PgAmop>,
     pub(crate) pg_settings: Vec<PgSetting>,
     pub(crate) pg_ts_objects: Vec<PgTsObject>,
+    /// Parsers, templates and options of the text search objects migrations
+    /// create.
+    pub(crate) ts_definitions: crate::ddl::text_search::TsDefinitions,
 
     // ── Name-keyed indexes (built by `from_seed`, maintained by DDL) ──
     pub(crate) namespace_by_name: HashMap<String, PgNamespaceOid>,
@@ -594,6 +597,7 @@ impl PgCatalog {
             pg_amop: Vec::new(),
             pg_settings: Vec::new(),
             pg_ts_objects: Vec::new(),
+            ts_definitions: Default::default(),
             namespace_by_name: HashMap::new(),
             type_by_qname: HashMap::new(),
             class_by_qname: HashMap::new(),
