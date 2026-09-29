@@ -232,7 +232,8 @@ pub struct PgCatalog {
     /// Canonical text of each column DEFAULT / generation expression —
     /// what MergeAttributes compares when several parents give a column a
     /// default (PG compares the cooked `pg_attrdef` trees).
-    pub(crate) attr_default_exprs: HashMap<(PgClassOid, i16), String>,
+    pub(crate) attr_default_exprs:
+        HashMap<(PgClassOid, i16), crate::ddl::tables::check_inherit::StoredExpr>,
     /// The columns each generation expression reads, by the generated
     /// column (PG records them as `pg_depend` rows of the column's
     /// `pg_attrdef` entry): DROP COLUMN of such a column needs CASCADE and

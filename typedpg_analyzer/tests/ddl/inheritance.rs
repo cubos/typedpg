@@ -572,3 +572,40 @@ fn a_column_inherited_from_outside_the_tree_keeps_its_type() {
          ALTER TABLE top ALTER COLUMN f1 TYPE bigint;",
     )]);
 }
+
+#[test]
+fn inherited_expressions_compare_as_parse_trees() {
+    // Two spellings of one parse tree are the same CHECK / DEFAULT; a
+    // different tree is not.
+    build(&[(
+        "0001.sql",
+        "CREATE TABLE p1 (a int DEFAULT (1 + 2), CONSTRAINT c CHECK (a > 0));
+         CREATE TABLE p2 (a int DEFAULT 1+2, CONSTRAINT c CHECK ((a)>0));
+         CREATE TABLE child () INHERITS (p1, p2);
+         INSERT INTO child DEFAULT VALUES;
+         CREATE TABLE local (a int, CONSTRAINT c CHECK ( a  >  0 )) INHERITS (p1);",
+    )]);
+    let base = "CREATE TABLE p1 (a int DEFAULT 1, CONSTRAINT c CHECK (a > 0));
+                CREATE TABLE p2 (a int DEFAULT 1, CONSTRAINT c CHECK (a >= 0));";
+    for (sql, message) in [
+        (
+            "CREATE TABLE child (a int, CONSTRAINT c CHECK (a >= 0)) INHERITS (p1);",
+            "constraint \"c\" for relation \"child\" already exists",
+        ),
+        (
+            "CREATE TABLE child () INHERITS (p1, p2);",
+            "check constraint name \"c\" appears multiple times but with different expressions",
+        ),
+        (
+            "CREATE TABLE child (a int) INHERITS (p1, p2);",
+            "check constraint name \"c\" appears multiple times but with different expressions",
+        ),
+        (
+            "CREATE STATISTICS s ON (a+1), ((a) + 1) FROM p1;",
+            "duplicate expression in statistics definition",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", base), ("0002.sql", sql)]).expect_err(sql);
+        assert!(err.to_string().starts_with(message), "{sql}\n  got: {err}");
+    }
+}

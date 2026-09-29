@@ -95,8 +95,8 @@ pub(crate) struct CookedGeneration {
     /// Its type before the coercion to the column's type (what ALTER
     /// COLUMN TYPE re-coerces).
     pub(crate) expr_type: PgTypeOid,
-    /// Its canonical text.
-    pub(crate) text: String,
+    /// The expression as written.
+    pub(crate) text: super::check_inherit::StoredExpr,
 }
 
 impl CookedGeneration {
@@ -179,7 +179,7 @@ pub(crate) fn cook_generation_expr(
             return Ok(CookedGeneration {
                 refs: Vec::new(),
                 expr_type: atttypid,
-                text: super::check_inherit::check_expr_text(expr),
+                text: super::check_inherit::StoredExpr::written(expr),
             });
         }
     };
@@ -266,7 +266,7 @@ pub(crate) fn cook_generation_expr(
         return Ok(CookedGeneration {
             refs,
             expr_type: atttypid,
-            text: super::check_inherit::check_expr_text(expr),
+            text: super::check_inherit::StoredExpr::written(expr),
         });
     }
     if !crate::coerce::can_coerce(
@@ -285,7 +285,7 @@ pub(crate) fn cook_generation_expr(
     Ok(CookedGeneration {
         refs,
         expr_type: result.type_oid,
-        text: super::check_inherit::check_expr_text(expr),
+        text: super::check_inherit::StoredExpr::written(expr),
     })
 }
 

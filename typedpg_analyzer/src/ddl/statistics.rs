@@ -125,7 +125,7 @@ pub fn create_statistics(interp: &mut PgCatalog, stmt: &CreateStatsStmt) -> Resu
         )
     };
     let mut columns: Vec<i16> = Vec::new();
-    let mut exprs: Vec<String> = Vec::new();
+    let mut exprs: Vec<super::tables::check_inherit::StoredExpr> = Vec::new();
     let mut attnums: Vec<i16> = Vec::new();
     let mut name_parts: Vec<String> = Vec::new();
     for elem in &stmt.exprs {
@@ -176,7 +176,7 @@ pub fn create_statistics(interp: &mut PgCatalog, stmt: &CreateStatsStmt) -> Resu
                     }
                 }
             }
-            exprs.push(super::tables::check_inherit::check_expr_text(expr));
+            exprs.push(super::tables::check_inherit::StoredExpr::written(expr));
             name_parts.push("expr".into());
         }
     }
@@ -213,9 +213,11 @@ pub fn create_statistics(interp: &mut PgCatalog, stmt: &CreateStatsStmt) -> Resu
             "duplicate column name in statistics definition".into(),
         ));
     }
-    let mut sorted_exprs = exprs.clone();
-    sorted_exprs.sort();
-    if sorted_exprs.windows(2).any(|w| w[0] == w[1]) {
+    if exprs
+        .iter()
+        .enumerate()
+        .any(|(i, e)| exprs[..i].contains(e))
+    {
         return Err(DdlError::DuplicateObject(
             "duplicate expression in statistics definition".into(),
         ));

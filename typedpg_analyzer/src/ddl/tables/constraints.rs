@@ -101,7 +101,7 @@ pub(crate) fn emit_constraints(
                         Vec::new(),
                         Some((
                             check_inherit::CheckDef {
-                                expr: check_inherit::check_expr_text(
+                                expr: check_inherit::StoredExpr::written(
                                     &c.raw_expr.clone().map(|b| *b).unwrap_or_default(),
                                 ),
                                 no_inherit: c.is_no_inherit,
@@ -204,7 +204,7 @@ pub(crate) fn emit_constraints(
                     Vec::new(),
                     Some((
                         check_inherit::CheckDef {
-                            expr: check_inherit::check_expr_text(
+                            expr: check_inherit::StoredExpr::written(
                                 &c.raw_expr.clone().map(|b| *b).unwrap_or_default(),
                             ),
                             no_inherit: c.is_no_inherit,
@@ -947,7 +947,7 @@ pub(crate) fn validate_constraint_expressions(
                 .insert((class_oid, attr.attnum), default_type);
             interp.attr_default_exprs.insert(
                 (class_oid, attr.attnum),
-                super::check_inherit::check_expr_text(expr),
+                super::check_inherit::StoredExpr::written(expr),
             );
             crate::ddl::defaults::record_default_dependencies(
                 interp,

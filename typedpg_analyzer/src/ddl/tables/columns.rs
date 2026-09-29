@@ -154,12 +154,6 @@ fn in_partition_key(interp: &PgCatalog, relid: PgClassOid, attnum: i16) -> bool 
         .is_some_and(|attrs| attrs.contains(&attnum))
 }
 
-/// The canonical text of a serial column's `nextval(...)` default: it
-/// names the column's own sequence, so it matches no other default.
-pub(crate) fn serial_default_text(relid: PgClassOid, attnum: i16) -> String {
-    format!("nextval(<sequence of {relid}.{attnum}>)")
-}
-
 /// The DEFAULT expression written on a column definition, if any.
 pub(crate) fn column_default_expr(
     cd: &typedpg_pg_query::protobuf::ColumnDef,
@@ -757,8 +751,8 @@ fn add_column_to(
         interp.attr_default_exprs.insert(
             (relid, next_attnum),
             match column_default_expr(cd) {
-                Some(expr) => super::check_inherit::check_expr_text(expr),
-                None => serial_default_text(relid, next_attnum),
+                Some(expr) => super::check_inherit::StoredExpr::written(expr),
+                None => super::check_inherit::StoredExpr::Serial(relid, next_attnum),
             },
         );
     }
@@ -1118,7 +1112,7 @@ pub(crate) fn set_default(
                     .insert((relid, attr.attnum), default_type);
                 interp.attr_default_exprs.insert(
                     (relid, attr.attnum),
-                    super::check_inherit::check_expr_text(expr),
+                    super::check_inherit::StoredExpr::written(expr),
                 );
             }
             None => {

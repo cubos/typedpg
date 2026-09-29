@@ -452,7 +452,7 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
                 .insert((class_oid, attnum), crate::pg_catalog::oid::INT8);
             interp.attr_default_exprs.insert(
                 (class_oid, attnum),
-                columns::serial_default_text(class_oid, attnum),
+                check_inherit::StoredExpr::Serial(class_oid, attnum),
             );
             continue;
         }
@@ -814,7 +814,7 @@ struct ParsedColumn {
     /// The canonical text of the default / generation expression inherited
     /// from the parents, and whether two parents disagree on it
     /// (MergeAttributes' `bogus_marker`).
-    inherited_default: Option<String>,
+    inherited_default: Option<check_inherit::StoredExpr>,
     bogus_default: bool,
 }
 

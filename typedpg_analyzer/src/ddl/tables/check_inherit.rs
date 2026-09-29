@@ -8,12 +8,10 @@
 use super::*;
 
 /// The parts of a CHECK constraint's `pg_constraint` row the analyzer
-/// needs beyond [`PgConstraint`]: the expression (deparsed, so two
-/// spellings of the same parse tree compare equal — PG compares the cooked
-/// trees) and `connoinherit`.
+/// needs beyond [`PgConstraint`]: the expression and `connoinherit`.
 #[derive(Clone, Debug)]
 pub(crate) struct CheckDef {
-    pub(crate) expr: String,
+    pub(crate) expr: StoredExpr,
     pub(crate) no_inherit: bool,
 }
 
@@ -35,23 +33,32 @@ impl CheckFlags {
     }
 }
 
-/// The canonical text of a CHECK expression.
-pub(crate) fn check_expr_text(expr: &typedpg_pg_query::protobuf::Node) -> String {
-    let select = typedpg_pg_query::protobuf::SelectStmt {
-        target_list: vec![typedpg_pg_query::protobuf::Node {
-            node: Some(node::Node::ResTarget(Box::new(
-                typedpg_pg_query::protobuf::ResTarget {
-                    val: Some(Box::new(expr.clone())),
-                    ..Default::default()
-                },
-            ))),
-        }],
-        ..Default::default()
-    };
-    node::Node::SelectStmt(Box::new(select))
-        .deparse()
-        .map(|s| s.trim_start_matches("SELECT ").to_owned())
-        .unwrap_or_default()
+/// An expression kept from the DDL that wrote it: a CHECK constraint, a
+/// column default or generation expression, a statistics expression. Two
+/// compare equal when PG's `equal()` says their parse trees are (source
+/// locations aside), so different spellings of one tree match.
+#[derive(Clone, Debug)]
+pub(crate) enum StoredExpr {
+    Written(Box<typedpg_pg_query::protobuf::Node>),
+    /// A serial column's `nextval()` of its own sequence.
+    Serial(PgClassOid, i16),
+}
+
+impl StoredExpr {
+    pub(crate) fn written(expr: &typedpg_pg_query::protobuf::Node) -> Self {
+        StoredExpr::Written(Box::new(expr.clone()))
+    }
+}
+
+impl PartialEq for StoredExpr {
+    fn eq(&self, other: &Self) -> bool {
+        use typedpg_pg_query::Equal;
+        match (self, other) {
+            (StoredExpr::Written(a), StoredExpr::Written(b)) => a.equal(b),
+            (StoredExpr::Serial(r1, a1), StoredExpr::Serial(r2, a2)) => r1 == r2 && a1 == a2,
+            _ => false,
+        }
+    }
 }
 
 fn same_expr(a: Option<&CheckDef>, b: Option<&CheckDef>) -> bool {
@@ -245,7 +252,7 @@ pub(super) fn add_check(
     flags: CheckFlags,
 ) -> Result<(), DdlError> {
     let def = CheckDef {
-        expr: check_expr_text(expr),
+        expr: StoredExpr::written(expr),
         no_inherit,
     };
     let relname = relname_of(interp, relid);
