@@ -67,6 +67,20 @@ impl PgCatalog {
         self.pg_namespace.get(&oid).map(|n| n.nspname.as_str())
     }
 
+    /// IsSystemClass (catalog.c): a relation with a pinned OID — below
+    /// FirstUnpinnedObjectId (12000): the system catalogs, their indexes and
+    /// TOAST tables — or one in a TOAST schema. Even a superuser may not
+    /// alter or drop these (without allow_system_table_mods).
+    pub(crate) fn is_system_class(&self, relid: PgClassOid) -> bool {
+        /// FirstUnpinnedObjectId (transam.h).
+        const FIRST_UNPINNED_OBJECT_ID: u32 = 12000;
+        relid.get() < FIRST_UNPINNED_OBJECT_ID
+            || self.pg_class.get(&relid).is_some_and(|c| {
+                self.namespace_name(c.relnamespace)
+                    .is_some_and(|n| n == "pg_toast" || n.starts_with("pg_toast_temp_"))
+            })
+    }
+
     /// OID of the `pg_catalog` schema (looked up once per call). Returns
     /// `None` only on an empty catalog.
     pub(crate) fn pg_catalog_oid(&self) -> Option<PgNamespaceOid> {

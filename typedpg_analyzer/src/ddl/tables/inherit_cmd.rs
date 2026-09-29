@@ -445,7 +445,8 @@ pub(super) fn attach_partition(
     }
     super::foreign_keys::clone_parent_fks(interp, parent, attach)?;
     // AttachPartitionEnsureIndexes.
-    super::partidx::clone_parent_indexes(interp, parent, attach)
+    super::partidx::clone_parent_indexes(interp, parent, attach)?;
+    crate::ddl::triggers::clone_row_triggers_to_partition(interp, parent, attach)
 }
 
 /// `ALTER TABLE parent DETACH PARTITION name` (ATExecDetachPartition).
@@ -491,6 +492,7 @@ pub(super) fn detach_partition(
     super::foreign_keys::detach_fks(interp, parent, part);
     remove_inheritance(interp, part, parent, "partition")?;
     super::partidx::detach_partition_indexes(interp, part);
+    crate::ddl::triggers::drop_cloned_triggers(interp, part);
     interp.partition_bounds.remove(&part);
     // DetachPartitionFinalize: the identity was the parent's.
     if let Some(attrs) = interp.pg_attribute.get_mut(&part) {

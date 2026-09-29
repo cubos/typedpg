@@ -798,6 +798,7 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
             .map(|i| i.inhparent)
     {
         partidx::clone_parent_indexes(interp, parent, class_oid)?;
+        crate::ddl::triggers::clone_row_triggers_to_partition(interp, parent, class_oid)?;
     }
     for like in &likes {
         copy_like_constraints(interp, class_oid, &name, like)?;
