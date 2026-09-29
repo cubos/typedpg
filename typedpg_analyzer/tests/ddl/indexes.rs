@@ -1060,3 +1060,74 @@ fn alter_column_type_resolves_index_operator_classes_again() {
         ],
     );
 }
+
+#[test]
+fn add_constraint_using_index_checks_the_index() {
+    // transformIndexConstraint / ATExecAddIndexConstraint /
+    // index_check_primary_key.
+    let setup = "CREATE TABLE t (a int, b text);
+                 CREATE UNIQUE INDEX i1 ON t (a) WHERE a > 0;
+                 CREATE UNIQUE INDEX i2 ON t ((a + 1));
+                 CREATE UNIQUE INDEX i3 ON t (a DESC);
+                 CREATE UNIQUE INDEX i4 ON t (b text_pattern_ops);
+                 CREATE UNIQUE INDEX i5 ON t (a) NULLS NOT DISTINCT;
+                 CREATE UNIQUE INDEX i6 ON t (b COLLATE \"C\");
+                 CREATE UNIQUE INDEX i7 ON t (a NULLS FIRST);
+                 CREATE UNIQUE INDEX i9 ON t (b COLLATE \"default\");
+                 CREATE UNIQUE INDEX i10 ON t (a int4_ops);
+                 CREATE UNIQUE INDEX i11 ON t (a) INCLUDE (b);
+                 CREATE INDEX nu ON t (a);
+                 CREATE TABLE t2 (a int UNIQUE);
+                 CREATE TABLE pp (a int) PARTITION BY RANGE (a);
+                 CREATE UNIQUE INDEX pi ON pp (a);";
+    let sorting =
+        |i: &str| format!("index \"{i}\" column number 1 does not have default sorting behavior");
+    let (s3, s4, s6, s7) = (sorting("i3"), sorting("i4"), sorting("i6"), sorting("i7"));
+    assert_rejected(
+        setup,
+        &[
+            (
+                "ALTER TABLE t ADD CONSTRAINT u UNIQUE USING INDEX i1;",
+                "\"i1\" is a partial index",
+            ),
+            (
+                "ALTER TABLE t ADD CONSTRAINT u UNIQUE USING INDEX i2;",
+                "index \"i2\" contains expressions",
+            ),
+            ("ALTER TABLE t ADD CONSTRAINT u UNIQUE USING INDEX i3;", &s3),
+            ("ALTER TABLE t ADD CONSTRAINT u UNIQUE USING INDEX i4;", &s4),
+            ("ALTER TABLE t ADD CONSTRAINT u UNIQUE USING INDEX i6;", &s6),
+            ("ALTER TABLE t ADD CONSTRAINT u UNIQUE USING INDEX i7;", &s7),
+            (
+                "ALTER TABLE t ADD CONSTRAINT u UNIQUE USING INDEX nu;",
+                "\"nu\" is not a unique index",
+            ),
+            (
+                "ALTER TABLE t2 ADD CONSTRAINT u UNIQUE USING INDEX t2_a_key;",
+                "index \"t2_a_key\" is already associated with a constraint",
+            ),
+            (
+                "ALTER TABLE t ADD CONSTRAINT u UNIQUE USING INDEX t2_a_key;",
+                "index \"t2_a_key\" is already associated with a constraint",
+            ),
+            (
+                "ALTER TABLE pp ADD CONSTRAINT u UNIQUE USING INDEX pi;",
+                "ALTER TABLE / ADD CONSTRAINT USING INDEX is not supported on partitioned tables",
+            ),
+            (
+                "ALTER TABLE t ADD CONSTRAINT u PRIMARY KEY USING INDEX i5;",
+                "primary keys cannot use NULLS NOT DISTINCT indexes",
+            ),
+        ],
+    );
+    assert_accepted(
+        setup,
+        &[
+            "ALTER TABLE t ADD CONSTRAINT u UNIQUE USING INDEX i9;",
+            "ALTER TABLE t ADD CONSTRAINT u UNIQUE USING INDEX i10;",
+            "ALTER TABLE t ADD CONSTRAINT u UNIQUE USING INDEX i11;",
+            "ALTER TABLE t ADD CONSTRAINT u UNIQUE USING INDEX i5;",
+            "ALTER TABLE t ADD CONSTRAINT u PRIMARY KEY USING INDEX i10;",
+        ],
+    );
+}

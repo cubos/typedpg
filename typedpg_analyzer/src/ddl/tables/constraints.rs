@@ -1578,6 +1578,20 @@ fn add_index_constraint(
     let Some(index) = interp.pg_index.get(&index_oid).cloned() else {
         return Ok(());
     };
+    // transformIndexConstraint: the index may not back a constraint yet.
+    if interp.pg_constraint.values().any(|con| {
+        con.conrelid == index.indrelid
+            && con.conname == c.indexname
+            && matches!(
+                con.contype,
+                ConType::PrimaryKey | ConType::Unique | ConType::Exclusion
+            )
+    }) {
+        return Err(DdlError::UnsupportedDdl(format!(
+            "index \"{}\" is already associated with a constraint",
+            c.indexname
+        )));
+    }
     if index.indrelid != relid {
         return Err(DdlError::Parse(format!(
             "index \"{}\" does not belong to table \"{}\"",
@@ -1598,8 +1612,81 @@ fn add_index_constraint(
             c.indexname
         )));
     }
+    if !index.indexprs.is_empty() {
+        return Err(DdlError::Parse(format!(
+            "index \"{}\" contains expressions ({unusable})",
+            c.indexname
+        )));
+    }
+    if index.indpred.is_some() {
+        return Err(DdlError::Parse(format!(
+            "\"{}\" is a partial index ({unusable})",
+            c.indexname
+        )));
+    }
+    if interp.nonimmediate_indexes.contains(&index_oid) && !c.deferrable {
+        return Err(DdlError::UnsupportedDdl(format!(
+            "\"{}\" is a deferrable index (Cannot create a non-deferrable constraint using a \
+             deferrable index.)",
+            c.indexname
+        )));
+    }
+    if interp
+        .index_access_methods
+        .get(&index_oid)
+        .is_some_and(|am| am != "btree")
+    {
+        return Err(DdlError::Parse(format!(
+            "index \"{}\" is not a btree ({unusable})",
+            c.indexname
+        )));
+    }
+    // Each key column must have the default operator class, collation and
+    // sort options.
+    if let Some(keys) = interp.index_keys.get(&index_oid) {
+        for (i, (&attnum, key)) in key_columns(&index).iter().zip(&keys.columns).enumerate() {
+            let Some(attr) = interp
+                .attributes_of(relid)
+                .iter()
+                .find(|a| a.attnum == attnum)
+            else {
+                continue;
+            };
+            let default_class =
+                crate::ddl::opclass::default_opclass_id(interp, attr.atttypid, "btree");
+            if (key.opclass.is_some() && key.opclass != default_class)
+                || key.collation != attr.attcollation
+                || !key.default_order
+            {
+                return Err(DdlError::Parse(format!(
+                    "index \"{}\" column number {} does not have default sorting behavior \
+                     ({unusable})",
+                    c.indexname,
+                    i + 1
+                )));
+            }
+        }
+    }
+    // ATExecAddIndexConstraint.
+    if interp.pg_class.get(&relid).map(|r| r.relkind) == Some(RelKind::Partitioned) {
+        return Err(DdlError::UnsupportedDdl(
+            "ALTER TABLE / ADD CONSTRAINT USING INDEX is not supported on partitioned tables"
+                .into(),
+        ));
+    }
     let is_primary = c.contype == ConstrType::ConstrPrimary as i32;
     if is_primary {
+        // index_check_primary_key.
+        check_no_primary_key(interp, relid)?;
+        if interp
+            .index_keys
+            .get(&index_oid)
+            .is_some_and(|k| k.nulls_not_distinct)
+        {
+            return Err(DdlError::Parse(
+                "primary keys cannot use NULLS NOT DISTINCT indexes".into(),
+            ));
+        }
     }
     let conname = if c.conname.is_empty() {
         c.indexname.clone()
