@@ -1456,3 +1456,27 @@ fn partition_indexes_match_on_collation_and_operator_family() {
     );
     assert_accepted(setup, &["ALTER INDEX qj ATTACH PARTITION q1_bp;"]);
 }
+
+#[test]
+fn unique_index_covers_the_partition_key_only_with_its_equality() {
+    // DefineIndex: the index column's operator family must have the
+    // partition key's equality operator (record_image_ops' is *=, not =).
+    let setup = "CREATE TYPE pr AS (x int);
+                 CREATE TABLE t (a pr, b text) PARTITION BY LIST (a);
+                 CREATE TABLE h (a int) PARTITION BY HASH (a);";
+    assert_rejected(
+        setup,
+        &[(
+            "CREATE UNIQUE INDEX ON t (a record_image_ops);",
+            "unique constraint on partitioned table must include all partitioning columns",
+        )],
+    );
+    assert_accepted(
+        setup,
+        &[
+            "CREATE UNIQUE INDEX ON t (a);",
+            "CREATE UNIQUE INDEX ON t (a record_ops, b text_pattern_ops);",
+            "CREATE UNIQUE INDEX ON h (a);",
+        ],
+    );
+}

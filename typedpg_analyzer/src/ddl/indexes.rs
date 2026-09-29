@@ -198,6 +198,7 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
             indrelid,
             &indkey[..indnkeyatts as usize],
             &indcollation,
+            &indclass,
             label,
         )?;
     }
@@ -760,9 +761,7 @@ fn check_exclusion_covers_partition_key(
         ));
     }
     let collations = super::tables::partbound::partition_key_collations(db, relid);
-    let (key_types, key_am) = super::tables::partbound::partition_key_types(db, relid);
-    // BTEqualStrategyNumber / HTEqualStrategyNumber.
-    let eq_strategy = if key_am == "hash" { 1 } else { 3 };
+    let eq_ops = partition_key_eq_operators(db, relid);
     let attname = |attnum: i16| {
         db.attributes_of(relid)
             .iter()
@@ -771,14 +770,7 @@ fn check_exclusion_covers_partition_key(
             .unwrap_or_default()
     };
     for (i, pk) in part_key.iter().enumerate() {
-        let ptkey_eqop = key_types.get(i).and_then(|&t| {
-            let class = super::opclass::default_opclass_id(db, t, key_am)?;
-            super::opclass::opfamily_member(
-                db,
-                super::opclass::opclass_by_oid(db, class)?,
-                eq_strategy,
-            )
-        });
+        let ptkey_eqop = eq_ops.get(i).copied().flatten();
         let mut found = false;
         for (j, k) in conkey.iter().enumerate() {
             if k != pk || key_collations[j] != collations.get(i).copied().flatten() {
@@ -819,6 +811,39 @@ fn check_exclusion_covers_partition_key(
         }
     }
     Ok(())
+}
+
+/// DefineIndex: each partition key column's equality operator — the
+/// `=` of its (default) btree or hash operator class's family.
+pub(crate) fn partition_key_eq_operators(
+    db: &PgCatalog,
+    relid: PgClassOid,
+) -> Vec<Option<crate::oid::PgOperatorOid>> {
+    let (key_types, key_am) = super::tables::partbound::partition_key_types(db, relid);
+    key_types
+        .iter()
+        .map(|&t| {
+            let class = super::opclass::default_opclass_id(db, t, key_am)?;
+            index_eq_operator(db, class)
+        })
+        .collect()
+}
+
+/// get_opfamily_member_for_cmptype(COMPARE_EQ): the equality operator of
+/// a btree or hash operator class's family over its input type; `None`
+/// for other access methods or an unknown class.
+pub(crate) fn index_eq_operator(
+    db: &PgCatalog,
+    class: PgOpclassOid,
+) -> Option<crate::oid::PgOperatorOid> {
+    let class = super::opclass::opclass_by_oid(db, class)?;
+    // BTEqualStrategyNumber / HTEqualStrategyNumber.
+    let strategy = match class.opcmethod.as_str() {
+        "btree" => 3,
+        "hash" => 1,
+        _ => return None,
+    };
+    super::opclass::opfamily_member(db, class, strategy)
 }
 
 /// ATPostAlterTypeCleanup (tablecmds.c): after ALTER COLUMN TYPE, every

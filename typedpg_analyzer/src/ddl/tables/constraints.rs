@@ -641,7 +641,11 @@ pub(super) fn emit_constraint_with_backing_index(
                     .and_then(|att| att.attcollation)
             })
             .collect();
-        check_unique_covers_partition_key(interp, relid, &conkey, &collations, label)?;
+        let classes = index_def
+            .as_ref()
+            .map(|d| d.indclass.clone())
+            .unwrap_or_default();
+        check_unique_covers_partition_key(interp, relid, &conkey, &collations, &classes, label)?;
     }
     if matches!(
         contype,
@@ -807,12 +811,15 @@ pub(super) fn key_columns(index: &PgIndex) -> &[i16] {
 
 /// DefineIndex (indexcmds.c): a unique index on a partitioned table must
 /// contain every partition key column, under the key's collation, and the
-/// key may not be an expression. `collations` are the index columns'.
+/// key may not be an expression. `collations` / `classes` are the index
+/// columns' (a column is covered only under the key's collation, by an
+/// operator class whose equality is the key's; an unknown class matches).
 pub(crate) fn check_unique_covers_partition_key(
     interp: &PgCatalog,
     relid: PgClassOid,
     key: &[i16],
     collations: &[Option<crate::oid::PgCollationOid>],
+    classes: &[Option<crate::oid::PgOpclassOid>],
     label: &str,
 ) -> Result<(), DdlError> {
     let Some(part_key) = interp.partition_keys.get(&relid) else {
@@ -824,11 +831,23 @@ pub(crate) fn check_unique_covers_partition_key(
         )));
     }
     let part_collations = super::partbound::partition_key_collations(interp, relid);
+    let eq_ops = crate::ddl::indexes::partition_key_eq_operators(interp, relid);
     let covered = |(i, pk): (usize, &i16)| {
         let collation = part_collations.get(i).copied().flatten();
-        key.iter()
-            .zip(collations)
-            .any(|(k, c)| k == pk && *c == collation)
+        let ptkey_eqop = eq_ops.get(i).copied().flatten();
+        key.iter().zip(collations).enumerate().any(|(j, (k, c))| {
+            let idx_eqop = classes
+                .get(j)
+                .copied()
+                .flatten()
+                .and_then(|class| crate::ddl::indexes::index_eq_operator(interp, class));
+            k == pk
+                && *c == collation
+                && match (ptkey_eqop, idx_eqop) {
+                    (Some(p), Some(x)) => p == x,
+                    _ => true,
+                }
+        })
     };
     if !part_key.iter().enumerate().all(covered) {
         return Err(DdlError::Parse(
