@@ -91,6 +91,29 @@ impl ClauseKind {
         }
     }
 
+    /// `Some(context)` when PG forbids window calls in this position but
+    /// allows aggregates (`window functions are not allowed in HAVING`).
+    fn window_only_context(self) -> Option<&'static str> {
+        match self {
+            ClauseKind::Having => Some("HAVING"),
+            _ => None,
+        }
+    }
+
+    /// Whether this is a clause of its query level (as opposed to an
+    /// expression inside one): an aggregate belonging to the level that a
+    /// sublink in the clause holds is checked against it.
+    fn is_level_clause(self) -> bool {
+        matches!(
+            self,
+            ClauseKind::Where
+                | ClauseKind::Having
+                | ClauseKind::JoinOn
+                | ClauseKind::Limit
+                | ClauseKind::Offset
+        )
+    }
+
     /// Whether the diagnostic carries a caret label under the offending
     /// expression. (LIMIT/OFFSET historically render bare; the boolean
     /// clauses annotate.)
@@ -108,12 +131,27 @@ pub(crate) fn coerce_clause_expr(
     kind: ClauseKind,
 ) -> Result<expr::ExprType, AnalyzeError> {
     let (goal_oid, goal_name) = kind.expected();
-    let inferred = expr::infer_expr(node, ctx, params, TypeGoal::assignment(goal_oid));
+    // Sublinks analyzed inside a clause of the level hand the aggregates
+    // they hold for the level to the clause's placement rule.
+    let inferred = if kind.is_level_clause() {
+        crate::grouping::with_clause(kind.aggregate_context(), || {
+            expr::infer_expr(node, ctx, params, TypeGoal::assignment(goal_oid))
+        })
+    } else {
+        expr::infer_expr(node, ctx, params, TypeGoal::assignment(goal_oid))
+    };
+    let placement = || -> Result<(), AnalyzeError> {
+        if let Some(c) = kind.aggregate_context() {
+            check_level_calls(node, ctx, c, true)?;
+        }
+        if let Some(c) = kind.window_only_context() {
+            check_level_calls(node, ctx, c, false)?;
+        }
+        Ok(())
+    };
     let e = match inferred {
         Ok(t) => {
-            if let Some(c) = kind.aggregate_context() {
-                check_no_aggregates_or_windows(node, ctx.snapshot, c)?;
-            }
+            placement()?;
             if matches!(kind, ClauseKind::Where | ClauseKind::JoinOn) {
                 expr::check_regex_restrictions(node, ctx)?;
             }
@@ -127,9 +165,7 @@ pub(crate) fn coerce_clause_expr(
     // The expression resolved but isn't the expected type — placement still
     // outranks the coercion complaint (`WHERE min(id)` is "aggregate
     // functions are not allowed in WHERE", not "argument of WHERE…").
-    if let Some(c) = kind.aggregate_context() {
-        check_no_aggregates_or_windows(node, ctx.snapshot, c)?;
-    }
+    placement()?;
     // Re-infer with no goal (on a scratch collector) to learn the actual
     // type for the message.
     let mut params2 = params.clone();
@@ -155,10 +191,75 @@ pub(crate) fn coerce_clause_expr(
     Err(raw.finalize_implicit())
 }
 
+/// PG's placement rules (check_agglevels_and_constraints,
+/// transformWindowFuncCall) for the calls of the current level in `node`:
+/// with `aggregates`, aggregate and GROUPING calls are rejected as well as
+/// window calls, else only window calls. An aggregate belonging to an outer
+/// level (its arguments only reference that level) is that level's
+/// business.
+pub(crate) fn check_level_calls(
+    node: &protobuf::Node,
+    ctx: Ctx<'_>,
+    context: &str,
+    aggregates: bool,
+) -> Result<(), AnalyzeError> {
+    let calls = crate::grouping::level_calls(node, ctx.scope, ctx.snapshot);
+    if aggregates {
+        if let Some(loc) = calls.aggregate {
+            return Err(aggregate_not_allowed(context, Some(loc)));
+        }
+        if let Some(loc) = calls.grouping {
+            return Err(grouping_not_allowed(context, Some(loc)));
+        }
+    }
+    if let Some(loc) = calls.window {
+        return Err(window_not_allowed(context, Some(loc)));
+    }
+    Ok(())
+}
+
+/// `aggregate functions are not allowed in {context}` (42803).
+pub(crate) fn aggregate_not_allowed(context: &str, location: Option<i32>) -> AnalyzeError {
+    // The classic fix for an aggregate in WHERE is a HAVING clause; for the
+    // other clauses there's no single rewrite, so just point at the call.
+    let hint = (context == "WHERE")
+        .then(|| "to filter on an aggregate, use a HAVING clause instead of WHERE".to_string());
+    crate::error::RawError::new(
+        AnalyzeError::GroupingError(format!("aggregate functions are not allowed in {context}")),
+        location.and_then(crate::error::SourceSpan::from_node_qname),
+        hint,
+    )
+    .with_primary_label("aggregate not allowed here")
+    .finalize_implicit()
+}
+
+/// `grouping operations are not allowed in {context}` (42803).
+pub(crate) fn grouping_not_allowed(context: &str, location: Option<i32>) -> AnalyzeError {
+    crate::error::RawError::new(
+        AnalyzeError::GroupingError(format!("grouping operations are not allowed in {context}")),
+        location.and_then(crate::error::SourceSpan::from_node_qname),
+        None,
+    )
+    .with_primary_label("GROUPING not allowed here")
+    .finalize_implicit()
+}
+
+/// `window functions are not allowed in {context}` (42P20).
+fn window_not_allowed(context: &str, location: Option<i32>) -> AnalyzeError {
+    crate::error::RawError::new(
+        AnalyzeError::WindowingError(format!("window functions are not allowed in {context}")),
+        location.and_then(crate::error::SourceSpan::from_node_qname),
+        None,
+    )
+    .with_primary_label("window function not allowed here")
+    .finalize_implicit()
+}
+
 /// Reject aggregate / window function calls in a context where PG forbids
 /// them. Matches PG's `aggregate functions are not allowed in WHERE` /
 /// `window functions are not allowed in WHERE` errors. `context` goes into
-/// the error message (e.g. `"WHERE"`, `"GROUP BY"`, `"JOIN/ON"`).
+/// the error message (e.g. `"WHERE"`, `"GROUP BY"`, `"JOIN/ON"`). Blind to
+/// query levels — [`check_level_calls`] is the level-aware form.
 pub(crate) fn check_no_aggregates_or_windows(
     node: &protobuf::Node,
     snapshot: &PgCatalog,
@@ -166,48 +267,13 @@ pub(crate) fn check_no_aggregates_or_windows(
 ) -> Result<(), AnalyzeError> {
     let kinds = expr::detect_func_kinds(node, snapshot);
     if kinds.has_aggregate {
-        let span = kinds
-            .agg_location
-            .and_then(crate::error::SourceSpan::from_node_qname);
-        // The classic fix for an aggregate in WHERE is a HAVING clause; for the
-        // other clauses there's no single rewrite, so just point at the call.
-        let hint = (context == "WHERE")
-            .then(|| "to filter on an aggregate, use a HAVING clause instead of WHERE".to_string());
-        return Err(crate::error::RawError::new(
-            AnalyzeError::GroupingError(format!(
-                "aggregate functions are not allowed in {context}"
-            )),
-            span,
-            hint,
-        )
-        .with_primary_label("aggregate not allowed here")
-        .finalize_implicit());
+        return Err(aggregate_not_allowed(context, kinds.agg_location));
     }
     if kinds.has_grouping {
-        let span = kinds
-            .grouping_location
-            .and_then(crate::error::SourceSpan::from_node_qname);
-        return Err(crate::error::RawError::new(
-            AnalyzeError::GroupingError(format!(
-                "grouping operations are not allowed in {context}"
-            )),
-            span,
-            None,
-        )
-        .with_primary_label("GROUPING not allowed here")
-        .finalize_implicit());
+        return Err(grouping_not_allowed(context, kinds.grouping_location));
     }
     if kinds.has_window {
-        let span = kinds
-            .window_location
-            .and_then(crate::error::SourceSpan::from_node_qname);
-        return Err(crate::error::RawError::new(
-            AnalyzeError::WindowingError(format!("window functions are not allowed in {context}")),
-            span,
-            None,
-        )
-        .with_primary_label("window function not allowed here")
-        .finalize_implicit());
+        return Err(window_not_allowed(context, kinds.window_location));
     }
     Ok(())
 }

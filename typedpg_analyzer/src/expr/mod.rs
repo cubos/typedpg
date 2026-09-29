@@ -1430,23 +1430,6 @@ use xml::*;
 // Helpers
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Check if any target in a SELECT's target list contains an aggregate call.
-///
-/// Aggregate detection goes through [`detect_func_kinds`], which resolves
-/// each call against `pg_proc` (`prokind == 'a'`) — so extension-provided or
-/// user-defined aggregates are recognized too, not just a hardcoded builtin
-/// list.
-fn has_aggregate_target(target_list: &[protobuf::Node], snapshot: &PgCatalog) -> bool {
-    target_list.iter().any(|node| {
-        if let Some(node::Node::ResTarget(res)) = node.node.as_ref()
-            && let Some(val) = &res.val
-        {
-            return detect_func_kinds(val, snapshot).has_aggregate;
-        }
-        false
-    })
-}
-
 /// Extract string values from a list of nodes.
 pub(crate) fn extract_string_fields(nodes: &[protobuf::Node]) -> Vec<String> {
     nodes

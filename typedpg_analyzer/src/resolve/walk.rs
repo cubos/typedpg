@@ -70,9 +70,69 @@ pub(crate) fn expr_children(node: &protobuf::Node) -> Vec<&protobuf::Node> {
             out.extend(x.args.iter());
         }
         node::Node::MultiAssignRef(m) => push(&mut out, &m.source),
+        node::Node::XmlSerialize(x) => push(&mut out, &x.expr),
+        // SQL/JSON constructors: a `JsonValueExpr` wraps its raw expression.
+        node::Node::JsonValueExpr(v) => push(&mut out, &v.raw_expr),
+        node::Node::JsonKeyValue(kv) => {
+            push(&mut out, &kv.key);
+            push_json_value(&mut out, &kv.value);
+        }
+        node::Node::JsonObjectConstructor(c) => out.extend(c.exprs.iter()),
+        node::Node::JsonArrayConstructor(c) => out.extend(c.exprs.iter()),
+        node::Node::JsonScalarExpr(s) => push(&mut out, &s.expr),
+        node::Node::JsonSerializeExpr(s) => push_json_value(&mut out, &s.expr),
+        node::Node::JsonParseExpr(p) => push_json_value(&mut out, &p.expr),
+        node::Node::JsonIsPredicate(p) => push(&mut out, &p.expr),
+        node::Node::JsonFuncExpr(f) => {
+            push_json_value(&mut out, &f.context_item);
+            push(&mut out, &f.pathspec);
+            for p in &f.passing {
+                if let Some(node::Node::JsonArgument(a)) = p.node.as_ref() {
+                    push_json_value(&mut out, &a.val);
+                }
+            }
+            for b in [&f.on_empty, &f.on_error].into_iter().flatten() {
+                push(&mut out, &b.expr);
+            }
+        }
+        node::Node::JsonObjectAgg(a) => {
+            if let Some(kv) = a.arg.as_deref() {
+                push(&mut out, &kv.key);
+                push_json_value(&mut out, &kv.value);
+            }
+            push_json_agg(&mut out, &a.constructor);
+        }
+        node::Node::JsonArrayAgg(a) => {
+            push_json_value(&mut out, &a.arg);
+            push_json_agg(&mut out, &a.constructor);
+        }
         _ => {}
     }
     out
+}
+
+/// The raw expression of a `JsonValueExpr` field.
+fn push_json_value<'a>(
+    out: &mut Vec<&'a protobuf::Node>,
+    v: &'a Option<Box<protobuf::JsonValueExpr>>,
+) {
+    if let Some(e) = v.as_deref().and_then(|v| v.raw_expr.as_deref()) {
+        out.push(e);
+    }
+}
+
+/// A JSON aggregate's ORDER BY and FILTER (its window, like a `FuncCall`'s
+/// `OVER`, is not an argument).
+fn push_json_agg<'a>(
+    out: &mut Vec<&'a protobuf::Node>,
+    c: &'a Option<Box<protobuf::JsonAggConstructor>>,
+) {
+    if let Some(c) = c.as_deref() {
+        out.extend(c.agg_order.iter());
+        if let Some(f) = c.agg_filter.as_deref() {
+            out.push(f);
+        }
+    }
 }
 
 /// Pre-order visit of `node` and every same-level sub-expression.
@@ -228,7 +288,7 @@ pub(crate) fn check_srf_nesting(
 }
 
 /// True when `fc` names an aggregate (by name, like `detect_func_kinds`).
-fn is_aggregate_call(fc: &protobuf::FuncCall, snapshot: &PgCatalog) -> bool {
+pub(crate) fn is_aggregate_call(fc: &protobuf::FuncCall, snapshot: &PgCatalog) -> bool {
     let parts = expr::extract_string_fields(&fc.funcname);
     let (schema, name) = match parts.as_slice() {
         [n] => (None, n.as_str()),

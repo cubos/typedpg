@@ -556,10 +556,19 @@ fn figure_colname(node: &protobuf::Node) -> (i32, Option<String>) {
 /// `2` when the target has a name, `(0, None)` otherwise (the subquery is then
 /// `?column?`, exactly as a bare expression would be).
 fn sublink_target_colname(sl: &protobuf::SubLink) -> (i32, Option<String>) {
-    let Some(node::Node::SelectStmt(sel)) = sl.subselect.as_deref().and_then(|n| n.node.as_ref())
+    let Some(node::Node::SelectStmt(top)) = sl.subselect.as_deref().and_then(|n| n.node.as_ref())
     else {
         return (0, None);
     };
+    let mut sel: &protobuf::SelectStmt = top;
+    // A set operation's columns are named by its leftmost arm; a VALUES
+    // list's first column is `column1`.
+    while let Some(larg) = sel.larg.as_deref() {
+        sel = larg;
+    }
+    if !sel.values_lists.is_empty() {
+        return (2, Some("column1".to_string()));
+    }
     let Some(node::Node::ResTarget(rt)) = sel.target_list.first().and_then(|t| t.node.as_ref())
     else {
         return (0, None);

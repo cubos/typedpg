@@ -99,11 +99,13 @@ pub(crate) fn resolve_returning(
         }
     }
 
-    let columns = resolve_target_list(
-        &clause.exprs,
-        expr::Ctx::new(&scope, ctx.null_ctx, ctx.snapshot),
-        params,
-    )?;
+    let columns = crate::grouping::with_clause(Some("RETURNING"), || {
+        resolve_target_list(
+            &clause.exprs,
+            expr::Ctx::new(&scope, ctx.null_ctx, ctx.snapshot),
+            params,
+        )
+    })?;
     // A nonempty list that expanded to nothing (stars over a zero-column
     // table) would read as "no RETURNING".
     if columns.is_empty()

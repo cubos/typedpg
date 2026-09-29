@@ -355,16 +355,25 @@ fn process_range_function(
     let nfuncs = funcs.len();
     let mut cols: Vec<ScopeColumn> = Vec::new();
     let mut whole_row = crate::scope::WholeRow::Record;
-    for f in &funcs {
-        cols.extend(function_rte_columns(
-            f,
-            alias,
-            nfuncs,
-            arg_ctx,
-            params,
-            &mut whole_row,
-        )?);
-    }
+    // EXPR_KIND_FROM_FUNCTION: no aggregate or window call of this level,
+    // in the call itself or in a sublink of its arguments.
+    crate::grouping::with_clause(Some("functions in FROM"), || {
+        for f in &funcs {
+            cols.extend(function_rte_columns(
+                f,
+                alias,
+                nfuncs,
+                arg_ctx,
+                params,
+                &mut whole_row,
+            )?);
+            let call = protobuf::Node {
+                node: Some(node::Node::FuncCall(Box::new(f.call.clone().into_owned()))),
+            };
+            crate::clause::check_level_calls(&call, arg_ctx, "functions in FROM", true)?;
+        }
+        Ok::<(), AnalyzeError>(())
+    })?;
     // makeWholeRowVar: several functions or WITH ORDINALITY always make an
     // anonymous record.
     if nfuncs != 1 || rf.ordinality {

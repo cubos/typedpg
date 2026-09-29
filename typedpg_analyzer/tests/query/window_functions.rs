@@ -158,6 +158,16 @@ fn first_value_is_nullable() {
 }
 
 #[test]
+fn window_function_in_having_rejected() {
+    let db = setup();
+    assert_err_prefix!(
+        db.analyze("SELECT count(*) FROM posts HAVING row_number() OVER () > 1"),
+        AnalyzeError::WindowingError(_),
+        "window functions are not allowed in HAVING"
+    );
+}
+
+#[test]
 fn nth_value_is_nullable() {
     let db = setup();
     let s = db

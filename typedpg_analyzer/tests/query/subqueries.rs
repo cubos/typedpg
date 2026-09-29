@@ -544,7 +544,8 @@ fn array_sublink_over_array_and_unknown_columns() {
             c("b", array_of(text())),
             c("c", array_of(text())),
             cn("d", text()),
-            cn("e", text()),
+            // A subquery without FROM yields exactly one row.
+            c("e", text()),
         ],
     );
     // The unknown target of a subquery is text, so comparing it to an int
@@ -615,4 +616,78 @@ fn from_subquery_sees_enclosing_levels() {
     .unwrap();
     db.analyze("SELECT * FROM users u, LATERAL (SELECT * FROM (SELECT u.name) i) q")
         .unwrap();
+}
+
+/// A scalar subquery is NOT NULL only when it yields exactly one row with
+/// a NOT NULL value: an aggregate query of its own level (not over an
+/// outer query's columns) without GROUP BY / HAVING, or a query without
+/// FROM / WHERE — and no LIMIT / OFFSET that can drop the row.
+#[test]
+fn scalar_subquery_is_not_null_only_when_it_yields_exactly_one_row() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE t (id int PRIMARY KEY, name text NOT NULL);
+         CREATE TABLE u (id int PRIMARY KEY, tid int NOT NULL, x text);",
+    )
+    .unwrap();
+    let s = db
+        .analyze(
+            "SELECT (SELECT count(*) FROM u) a, (SELECT count(*) FROM u LIMIT 1) b, \
+             (SELECT count(*) FROM u OFFSET 0) c, (SELECT 1) d, (SELECT t.name) e, \
+             (SELECT count(*) FROM u HAVING false) f, (SELECT count(*) FROM u LIMIT 0) g, \
+             (SELECT count(*) FROM u OFFSET 1) h, \
+             (SELECT count(*) FROM u FETCH FIRST 0 ROWS ONLY) i, \
+             (SELECT count(*) FROM u LIMIT $l) j, \
+             (SELECT 1 WHERE false) l, (SELECT generate_series(1, count(*)::int) FROM u) m \
+             FROM t",
+        )
+        .unwrap();
+    let not_null: Vec<&str> = s
+        .columns
+        .iter()
+        .filter(|c| !c.nullable)
+        .map(|c| c.name.as_str())
+        .collect();
+    assert_eq!(not_null, ["a", "b", "c", "d", "e"]);
+    // `count(t.id)` is the outer query's aggregate: the subquery is a plain
+    // one over `u`, empty when `u` is.
+    let s = db
+        .analyze("SELECT (SELECT count(t.id) FROM u) AS k FROM t GROUP BY t.id")
+        .unwrap();
+    assert_cols(&s, vec![cn("k", int8())]);
+}
+
+/// A sublink reaches every enclosing level, not only the nearest one; set
+/// operation arms and VALUES rows are subqueries too.
+#[test]
+fn sublink_reaches_every_enclosing_level() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE t (id int PRIMARY KEY, v int NOT NULL);
+         CREATE TABLE s (id int PRIMARY KEY, w int);",
+    )
+    .unwrap();
+    let s = db
+        .analyze(
+            "SELECT (SELECT (SELECT t.id)) AS a, (SELECT (SELECT v FROM s LIMIT 1)) AS b FROM t",
+        )
+        .unwrap();
+    assert_cols(&s, vec![c("a", int4()), cn("b", int4())]);
+    // The nearest level's column hides an outer one of the same name.
+    let s = db
+        .analyze("SELECT (SELECT (SELECT id) FROM s LIMIT 1) AS a FROM t")
+        .unwrap();
+    assert_cols(&s, vec![cn("a", int4())]);
+    // Set operation arms and VALUES rows see outer columns, and name the
+    // sublink after their first column.
+    let s = db
+        .analyze(
+            "SELECT (SELECT t.id UNION SELECT 1 LIMIT 1), (SELECT sum(t.v) UNION SELECT 1 LIMIT 1), \
+             (VALUES (t.id)) FROM t GROUP BY t.id",
+        )
+        .unwrap();
+    assert_cols(
+        &s,
+        vec![cn("id", int4()), cn("sum", int8()), c("column1", int4())],
+    );
 }

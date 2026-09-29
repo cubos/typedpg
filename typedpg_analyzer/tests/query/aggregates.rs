@@ -635,3 +635,317 @@ fn max_over_composite_column_accepted() {
     let r = db.analyze("SELECT max(p) FROM shapes");
     assert!(r.is_ok(), "expected max(composite) to resolve, got: {r:?}");
 }
+
+// ── parseCheckAggregates over expressions, sublinks and levels ───────────────
+
+fn grouping_rules_db() -> PgCatalog {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE t (id int PRIMARY KEY, v int NOT NULL, w text, n int);
+         CREATE TABLE s (id int PRIMARY KEY, v int NOT NULL, x text);
+         CREATE TABLE a (id int PRIMARY KEY, x int);
+         CREATE TABLE b (id int PRIMARY KEY, y int);",
+    )
+    .unwrap();
+    db
+}
+
+#[track_caller]
+fn assert_ungrouped(db: &PgCatalog, sql: &str, col: &str) {
+    assert_err_prefix!(
+        db.analyze(sql),
+        AnalyzeError::GroupingError(_),
+        &format!(
+            "column \"{col}\" must appear in the GROUP BY clause or be used in an aggregate \
+             function"
+        )
+    );
+}
+
+/// A GROUP BY expression groups the expressions equal to it — nothing
+/// else: the columns inside it stay ungrouped (PG compares transformed
+/// expressions with `equal()`, not the columns they mention).
+#[test]
+fn expression_grouping_checks_every_other_column() {
+    let db = grouping_rules_db();
+    for (sql, col) in [
+        ("SELECT id FROM t GROUP BY lower(w)", "t.id"),
+        ("SELECT id FROM t GROUP BY 1 + 1", "t.id"),
+        ("SELECT id FROM t GROUP BY now()", "t.id"),
+        ("SELECT id FROM t GROUP BY n + 1", "t.id"),
+        ("SELECT id FROM t GROUP BY $a", "t.id"),
+        ("SELECT w FROM t GROUP BY id + 0", "t.w"),
+        ("SELECT v * 2 FROM t GROUP BY v + 1", "t.v"),
+        ("SELECT id FROM t GROUP BY 1 + 0", "t.id"),
+        ("SELECT w FROM t GROUP BY v, lower(w)", "t.w"),
+        ("SELECT w || 'x' FROM t GROUP BY w || 'y'", "t.w"),
+        ("SELECT v FROM t GROUP BY ROLLUP (v + 1)", "t.v"),
+        (
+            "SELECT t.w FROM t GROUP BY GROUPING SETS ((v), (v + 1))",
+            "t.w",
+        ),
+    ] {
+        assert_ungrouped(&db, sql, col);
+    }
+    for sql in [
+        "SELECT t.v * 2 FROM t GROUP BY v * 2",
+        "SELECT lower(w), count(*) FROM t GROUP BY lower(t.w)",
+        "SELECT v + 1 AS q FROM t GROUP BY q",
+        "SELECT v + 1 FROM t GROUP BY 1",
+        "SELECT w FROM t GROUP BY 1",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
+
+/// Every expression kind is walked for ungrouped columns — GREATEST, ROW,
+/// COLLATE, an IN's left side, SQL/JSON and XML constructors — as are
+/// DISTINCT ON and the direct arguments of an ordered-set aggregate.
+#[test]
+fn ungrouped_columns_found_in_every_expression_kind() {
+    let db = grouping_rules_db();
+    for (sql, col) in [
+        ("SELECT GREATEST(w, 'a') FROM t GROUP BY v", "t.w"),
+        ("SELECT ROW(w) FROM t GROUP BY v", "t.w"),
+        ("SELECT w COLLATE \"C\" FROM t GROUP BY v", "t.w"),
+        ("SELECT id IN (SELECT id FROM s) FROM t GROUP BY v", "t.id"),
+        ("SELECT JSON_OBJECT('a': w) FROM t GROUP BY v", "t.w"),
+        ("SELECT xmlelement(name a, w) FROM t GROUP BY v", "t.w"),
+        ("SELECT DISTINCT ON (w) v FROM t GROUP BY v", "t.w"),
+        (
+            "SELECT percentile_cont(n::float8) WITHIN GROUP (ORDER BY id) FROM t GROUP BY w",
+            "t.n",
+        ),
+    ] {
+        assert_ungrouped(&db, sql, col);
+    }
+}
+
+/// An aggregate anywhere in the level — ORDER BY, DISTINCT ON, a window's
+/// PARTITION BY / ORDER BY — makes the query grouped.
+#[test]
+fn aggregate_outside_the_select_list_groups_the_query() {
+    let db = grouping_rules_db();
+    for (sql, col) in [
+        ("SELECT id FROM t ORDER BY sum(v)", "t.id"),
+        ("SELECT 1 FROM t ORDER BY v, count(*)", "t.v"),
+        ("SELECT id FROM t WINDOW w AS (ORDER BY count(*))", "t.id"),
+        ("SELECT DISTINCT ON (id) count(*) FROM t", "t.id"),
+        ("SELECT sum(id) OVER (ORDER BY sum(id)) FROM t", "t.id"),
+    ] {
+        assert_ungrouped(&db, sql, col);
+    }
+}
+
+/// An aggregate whose arguments only reference an outer query belongs to
+/// that query: it makes it grouped, obeys its clause's placement rule, and
+/// is allowed where the subquery's own clause would forbid it.
+#[test]
+fn outer_level_aggregate_belongs_to_the_outer_query() {
+    let db = grouping_rules_db();
+    assert_ungrouped(&db, "SELECT id, (SELECT sum(t.id) FROM s) FROM t", "t.id");
+    assert_ungrouped(
+        &db,
+        "SELECT (SELECT count(t.v) FROM s LIMIT 1), id FROM t",
+        "t.id",
+    );
+    for (sql, msg) in [
+        (
+            "SELECT id FROM t WHERE v IN (SELECT count(t.v) FROM s)",
+            "aggregate functions are not allowed in WHERE",
+        ),
+        (
+            "SELECT * FROM a JOIN b ON (SELECT sum(a.x)) > 0",
+            "aggregate functions are not allowed in JOIN conditions",
+        ),
+        (
+            "SELECT * FROM a, LATERAL (SELECT sum(a.x)) s",
+            "aggregate functions are not allowed in FROM clause of their own query level",
+        ),
+        (
+            "SELECT * FROM a, generate_series(1, (SELECT sum(a.x))) s",
+            "aggregate functions are not allowed in functions in FROM",
+        ),
+    ] {
+        assert_err_prefix!(db.analyze(sql), AnalyzeError::GroupingError(_), msg);
+    }
+    // An UPDATE's or RETURNING's sublink can't hold the statement's
+    // aggregate either.
+    for (sql, msg) in [
+        (
+            "UPDATE t SET v = (SELECT count(t.v) FROM s)",
+            "aggregate functions are not allowed in UPDATE",
+        ),
+        (
+            "UPDATE t SET (v, w) = (SELECT count(t.v), 'x' FROM s)",
+            "aggregate functions are not allowed in UPDATE",
+        ),
+        (
+            "DELETE FROM t RETURNING (SELECT count(t.v) FROM s)",
+            "aggregate functions are not allowed in RETURNING",
+        ),
+    ] {
+        assert_err_prefix!(db.analyze(sql), AnalyzeError::GroupingError(_), msg);
+    }
+    // In the subquery's WHERE, the outer aggregate is just a value.
+    db.analyze("SELECT (SELECT 1 FROM b WHERE count(a.x) > 0) FROM a")
+        .unwrap();
+    db.analyze("SELECT (SELECT sum(t.v)) FROM t GROUP BY w")
+        .unwrap();
+}
+
+/// A grouped query's sublinks may only use its grouped columns
+/// (`subquery uses ungrouped column … from outer query`).
+#[test]
+fn sublink_in_grouped_query_uses_only_grouped_outer_columns() {
+    let db = grouping_rules_db();
+    for (sql, col) in [
+        ("SELECT (SELECT t.w) FROM t GROUP BY v", "t.w"),
+        (
+            "SELECT EXISTS (SELECT 1 FROM s WHERE s.id = t.id) FROM t GROUP BY v",
+            "t.id",
+        ),
+        (
+            "SELECT v FROM t GROUP BY v HAVING (SELECT t.w) IS NULL",
+            "t.w",
+        ),
+        ("SELECT count(*) FROM t HAVING (SELECT t.v) > 0", "t.v"),
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::GroupingError(_),
+            &format!("subquery uses ungrouped column \"{col}\" from outer query")
+        );
+    }
+    for sql in [
+        "SELECT (SELECT t.w) FROM t GROUP BY w",
+        "SELECT (SELECT count(*) FROM a WHERE a.x = t.v) FROM t GROUP BY t.v",
+        "SELECT (SELECT max(a.x) FROM a GROUP BY a.id HAVING a.id = t.v LIMIT 1) FROM t \
+         GROUP BY t.v",
+        "SELECT (SELECT t.w) FROM t GROUP BY id",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
+
+/// GROUPING() arguments must equal grouping expressions of the level the
+/// call belongs to — a sublink's GROUPING over outer columns is the outer
+/// query's — and there may be at most 31.
+#[test]
+fn grouping_function_arguments_and_level() {
+    let db = grouping_rules_db();
+    assert_err_prefix!(
+        db.analyze("SELECT GROUPING(v + 1) FROM t GROUP BY v"),
+        AnalyzeError::GroupingError(_),
+        "arguments to GROUPING must be grouping expressions of the associated query level"
+    );
+    let s = db
+        .analyze("SELECT (SELECT GROUPING(t.v) FROM s LIMIT 1) AS g FROM t GROUP BY t.v")
+        .unwrap();
+    assert_cols(&s, vec![cn("g", int4())]);
+    db.analyze("SELECT GROUPING(v + 1) FROM t GROUP BY v + 1")
+        .unwrap();
+    let many = ["v"; 32].join(", ");
+    assert_err_prefix!(
+        db.analyze(&format!("SELECT GROUPING({many}) FROM t GROUP BY v")),
+        AnalyzeError::TooManyArguments(_),
+        "GROUPING must have fewer than 32 arguments"
+    );
+}
+
+/// PG's limits on grouping sets: 12 CUBE elements, 4096 sets.
+#[test]
+fn grouping_set_limits() {
+    let db = grouping_rules_db();
+    let v13 = ["v"; 13].join(", ");
+    assert_err_prefix!(
+        db.analyze(&format!("SELECT 1 FROM t GROUP BY CUBE({v13})")),
+        AnalyzeError::TooManyColumns(_),
+        "CUBE is limited to 12 elements"
+    );
+    let v12 = ["v"; 12].join(", ");
+    assert_err_prefix!(
+        db.analyze(&format!("SELECT 1 FROM t GROUP BY CUBE({v12}), CUBE(v)")),
+        AnalyzeError::StatementTooComplex(_),
+        "too many grouping sets present (maximum 4096)"
+    );
+    db.analyze(&format!("SELECT 1 FROM t GROUP BY CUBE({v12})"))
+        .unwrap();
+}
+
+/// A JOIN USING column stands for the left input's column (the right's
+/// for RIGHT JOIN, COALESCE of both for FULL JOIN) when grouping, as PG's
+/// flatten_join_alias_vars makes it.
+#[test]
+fn join_using_column_groups_as_the_column_it_stands_for() {
+    let db = grouping_rules_db();
+    for sql in [
+        "SELECT a.id FROM a JOIN b USING (id) GROUP BY id",
+        "SELECT id FROM a JOIN b USING (id) GROUP BY a.id",
+        "SELECT id, a.x FROM a JOIN b USING (id) GROUP BY id",
+        "SELECT id FROM a FULL JOIN b USING (id) GROUP BY id",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    for (sql, col) in [
+        ("SELECT id, x FROM a JOIN b USING (id) GROUP BY x", "a.id"),
+        ("SELECT b.id FROM a JOIN b USING (id) GROUP BY id", "b.id"),
+        (
+            "SELECT id FROM a FULL JOIN b USING (id) GROUP BY a.id",
+            "b.id",
+        ),
+    ] {
+        assert_ungrouped(&db, sql, col);
+    }
+    // An aliased join's columns stand for its inputs' too — a grouped
+    // primary key reached through it determines its table's columns.
+    for sql in [
+        "SELECT j.w FROM (t JOIN s USING (id)) j GROUP BY j.id",
+        "SELECT j.w FROM (t LEFT JOIN s USING (id)) j GROUP BY id",
+        "SELECT j.c FROM (t JOIN s ON t.id = s.id) j(a, b, c, d, e, f) GROUP BY j.a",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    for (sql, col) in [
+        (
+            "SELECT j.x FROM (t JOIN s USING (id)) j GROUP BY j.id",
+            "s.x",
+        ),
+        (
+            "SELECT j.w FROM (t FULL JOIN s USING (id)) j GROUP BY id",
+            "t.w",
+        ),
+    ] {
+        assert_ungrouped(&db, sql, col);
+    }
+    // An INNER join's USING column is the side that needs no coercion.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE a (id int PRIMARY KEY, x int);
+         CREATE TABLE b (id bigint PRIMARY KEY, y int);",
+    )
+    .unwrap();
+    db.analyze("SELECT b.y FROM a JOIN b USING (id) GROUP BY id")
+        .unwrap();
+    assert_ungrouped(
+        &db,
+        "SELECT id FROM a JOIN b USING (id) GROUP BY a.id",
+        "b.id",
+    );
+    assert_ungrouped(
+        &db,
+        "SELECT a.x FROM a LEFT JOIN b USING (id) GROUP BY id",
+        "a.x",
+    );
+}
+
+/// An aggregate is no function to call in FROM.
+#[test]
+fn aggregate_rejected_as_from_function() {
+    let db = grouping_rules_db();
+    assert_err_prefix!(
+        db.analyze("SELECT * FROM count(*)"),
+        AnalyzeError::GroupingError(_),
+        "aggregate functions are not allowed in functions in FROM"
+    );
+}

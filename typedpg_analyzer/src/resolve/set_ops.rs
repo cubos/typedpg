@@ -9,6 +9,7 @@ pub(crate) fn analyze_set_operation(
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
     cte_scopes: &HashMap<String, Vec<ScopeColumn>>,
+    outer: &[crate::scope::TableSource],
 ) -> AnalyzeResult {
     let left = sel
         .larg
@@ -19,10 +20,14 @@ pub(crate) fn analyze_set_operation(
         .as_ref()
         .ok_or_else(|| AnalyzeError::Unsupported("UNION without right side".into()))?;
 
+    // The arms are subqueries of the set operation: outer references reach
+    // them as correlated ones.
     check_set_op_member_locking(left)?;
-    let (left_cols, _) = analyze_select_with_ctes(left, snapshot, params, cte_scopes)?;
+    let (left_cols, _) =
+        analyze_select_with_ctes_and_outer(left, snapshot, params, cte_scopes, &[], outer, &[])?;
     check_set_op_member_locking(right)?;
-    let (right_cols, _) = analyze_select_with_ctes(right, snapshot, params, cte_scopes)?;
+    let (right_cols, _) =
+        analyze_select_with_ctes_and_outer(right, snapshot, params, cte_scopes, &[], outer, &[])?;
 
     // PG names the operation in both error messages below.
     let op_label = match protobuf::SetOperation::try_from(sel.op) {

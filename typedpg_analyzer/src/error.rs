@@ -248,6 +248,18 @@ pub enum AnalyzeError {
     /// IO error (reading/writing snapshot files).
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// SQLSTATE 54011 (`too_many_columns`).
+    #[error("{0}")]
+    TooManyColumns(String),
+
+    /// SQLSTATE 54001 (`statement_too_complex`).
+    #[error("{0}")]
+    StatementTooComplex(String),
+
+    /// SQLSTATE 54023 (`too_many_arguments`).
+    #[error("{0}")]
+    TooManyArguments(String),
 }
 
 impl AnalyzeError {
@@ -292,6 +304,9 @@ impl AnalyzeError {
             GeneratedAlways(_) => Some("428C9"),
             ObjectNotInPrerequisiteState(_) => Some("55000"),
             InvalidObjectDefinition(_) => Some("42P17"),
+            TooManyColumns(_) => Some("54011"),
+            StatementTooComplex(_) => Some("54001"),
+            TooManyArguments(_) => Some("54023"),
             TypeMismatch { .. }
             | Invalid(_)
             | InvalidLiteral(_)
@@ -985,6 +1000,9 @@ fn replace_message(e: AnalyzeError, rendered: String) -> AnalyzeError {
         AnalyzeError::DuplicateColumn(_) => AnalyzeError::DuplicateColumn(rendered),
         AnalyzeError::InvalidRecursion(_) => AnalyzeError::InvalidRecursion(rendered),
         AnalyzeError::PgInternalError(_) => AnalyzeError::PgInternalError(rendered),
+        AnalyzeError::TooManyColumns(_) => AnalyzeError::TooManyColumns(rendered),
+        AnalyzeError::StatementTooComplex(_) => AnalyzeError::StatementTooComplex(rendered),
+        AnalyzeError::TooManyArguments(_) => AnalyzeError::TooManyArguments(rendered),
         AnalyzeError::TypeMismatch {
             actual, expected, ..
         } => AnalyzeError::TypeMismatch {

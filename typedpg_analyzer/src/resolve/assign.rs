@@ -264,8 +264,9 @@ fn expand_set_items<'a>(
                     else {
                         unreachable!("guarded above");
                     };
-                    let (cols, _) =
-                        analyze_correlated_select(sel, ctx.snapshot, params, ctx.scope)?;
+                    let (cols, _) = crate::grouping::with_clause(Some("UPDATE"), || {
+                        analyze_correlated_select(sel, ctx.snapshot, params, ctx.scope)
+                    })?;
                     if cols.len() != ncolumns {
                         return Err(count_mismatch());
                     }
@@ -378,8 +379,12 @@ pub(crate) fn analyze_set_clause(
                     Some(s) => goal.with_source(s),
                     None => goal,
                 };
-                target.infer_value(val, goal, ctx, params)?;
-                // EXPR_KIND_UPDATE_SOURCE (also ON CONFLICT and MERGE SET).
+                // EXPR_KIND_UPDATE_SOURCE (also ON CONFLICT and MERGE SET);
+                // an aggregate of this level in a sublink of the value is
+                // placed here too.
+                crate::grouping::with_clause(Some("UPDATE"), || {
+                    target.infer_value(val, goal, ctx, params)
+                })?;
                 crate::clause::check_no_aggregates_or_windows(val, snapshot, "UPDATE")?;
                 check_no_srf_in_clause(val, snapshot, "UPDATE")?;
                 if let Some(node::Node::ParamRef(p)) = val.node.as_ref()

@@ -467,6 +467,7 @@ pub(crate) struct QueryLevel;
 impl QueryLevel {
     pub(crate) fn enter() -> Self {
         QUERY_DEPTH.with(|d| d.set(d.get() + 1));
+        crate::grouping::enter_query_level();
         QueryLevel
     }
 }
@@ -474,6 +475,7 @@ impl QueryLevel {
 impl Drop for QueryLevel {
     fn drop(&mut self) {
         QUERY_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+        crate::grouping::leave_query_level();
     }
 }
 

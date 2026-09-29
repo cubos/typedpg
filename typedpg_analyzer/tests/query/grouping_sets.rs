@@ -258,3 +258,21 @@ fn grouping_by_ordinal_over_expanded_targets() {
         );
     }
 }
+
+/// flatten_grouping_sets: an implicit row `(a, b)` in a grouping set is a
+/// set of its members — the empty set beside it still nulls them out.
+#[test]
+fn implicit_row_in_grouping_set_groups_its_members() {
+    let db = setup();
+    for sql in [
+        "SELECT region, product FROM sales GROUP BY GROUPING SETS ((region, product), ())",
+        "SELECT region, product FROM sales GROUP BY ROLLUP((region, product))",
+    ] {
+        let s = db.analyze(sql).unwrap();
+        assert_cols(&s, vec![cn("region", text()), cn("product", text())]);
+    }
+    let s = db
+        .analyze("SELECT region, product FROM sales GROUP BY (region, product)")
+        .unwrap();
+    assert_cols(&s, vec![c("region", text()), c("product", text())]);
+}

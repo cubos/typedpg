@@ -98,7 +98,9 @@ fn sublink_sees_merged_using_column() {
     let s = db
         .analyze("SELECT (SELECT id) AS v FROM t JOIN u USING (id)")
         .unwrap();
-    assert_cols(&s, vec![cn("v", int4())]);
+    // A subquery without FROM yields exactly one row: it is NULL only when
+    // the merged column is.
+    assert_cols(&s, vec![c("v", int4())]);
 }
 
 // ── USING (…) AS alias (PG 14) ───────────────────────────────────────────────

@@ -34,8 +34,7 @@ pub(crate) fn infer_sublink(
                 && let Some(node::Node::SelectStmt(sel)) = subselect.node.as_ref()
             {
                 let first = single_sublink_column(sub, sel, ctx, params)?;
-                let guaranteed_one_row =
-                    sel.group_clause.is_empty() && has_aggregate_target(&sel.target_list, snapshot);
+                let guaranteed_one_row = yields_exactly_one_row(sel, snapshot);
                 let nullable = if guaranteed_one_row {
                     first.nullable
                 } else {
@@ -175,6 +174,45 @@ pub(crate) fn infer_sublink(
             sub_type
         ))),
     }
+}
+
+/// Whether the (already analyzed) scalar subquery `sel` always yields
+/// exactly one row, so that its value is NULL only when its column is — an
+/// empty result makes the sublink NULL. That holds for an aggregate query
+/// of its own level without GROUP BY / HAVING (`count(t.id)` over an outer
+/// `t` is the outer query's aggregate, not one of the subquery's), and for
+/// a query without FROM or WHERE; in both only when neither LIMIT / OFFSET
+/// nor a set-returning select list can drop the row.
+fn yields_exactly_one_row(sel: &protobuf::SelectStmt, snapshot: &PgCatalog) -> bool {
+    if sel.op != protobuf::SetOperation::SetopNone as i32 {
+        return false;
+    }
+    let const_of = |n: &Option<Box<protobuf::Node>>| match n.as_deref().map(|n| n.node.as_ref()) {
+        None => Some(None),
+        Some(Some(node::Node::AConst(ac))) if ac.isnull => Some(None),
+        Some(Some(node::Node::AConst(protobuf::AConst {
+            val: Some(a_const::Val::Ival(i)),
+            ..
+        }))) => Some(Some(i.ival)),
+        _ => None,
+    };
+    // LIMIT ALL / NULL / n ≥ 1, and OFFSET NULL / 0.
+    let limit_keeps = matches!(const_of(&sel.limit_count), Some(None) | Some(Some(1..)));
+    let offset_keeps = matches!(const_of(&sel.limit_offset), Some(None) | Some(Some(0)));
+    if !limit_keeps
+        || !offset_keeps
+        || !sel.group_clause.is_empty()
+        || sel.having_clause.is_some()
+        || crate::resolve::count_srf_calls(&sel.target_list, snapshot) > 0
+    {
+        return false;
+    }
+    if !sel.values_lists.is_empty() {
+        // A VALUES list of one row.
+        return sel.values_lists.len() == 1;
+    }
+    let has_aggs = crate::grouping::level_info(sel).is_some_and(|l| l.has_aggs);
+    has_aggs || (sel.from_clause.is_empty() && sel.where_clause.is_none())
 }
 
 /// The single output column of an EXPR / ARRAY sublink's subquery, as PG's

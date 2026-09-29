@@ -154,15 +154,15 @@ fn merge_action_in_returning() {
             cn("w", text()),
         ],
     );
-    // A sublink inside RETURNING may use it too (a scalar sublink is
-    // nullable).
+    // A sublink inside RETURNING may use it too (a subquery without FROM
+    // yields exactly one row, so it is as NOT NULL as merge_action()).
     let s = db
         .analyze(
             "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE \
              RETURNING (SELECT merge_action())",
         )
         .unwrap();
-    assert_cols(&s, vec![cn("merge_action", text())]);
+    assert_cols(&s, vec![c("merge_action", text())]);
 }
 
 #[test]

@@ -1272,6 +1272,54 @@ pub(crate) fn array_subscript_must_be_integer(span: Option<SourceSpan>) -> RawEr
     )
 }
 
+/// `subquery uses ungrouped column "t.c" from outer query` — SQLSTATE
+/// 42803 (check_ungrouped_columns_walker inside a sublink).
+pub(crate) fn subquery_uses_ungrouped_column(
+    alias: &str,
+    column: &str,
+    span: Option<SourceSpan>,
+) -> RawError {
+    RawError::new(
+        AnalyzeError::GroupingError(format!(
+            "subquery uses ungrouped column \"{alias}.{column}\" from outer query"
+        )),
+        span,
+        None,
+    )
+}
+
+/// `GROUPING must have fewer than 32 arguments` — SQLSTATE 54023
+/// (transformGroupingFunc).
+pub(crate) fn grouping_too_many_arguments(span: Option<SourceSpan>) -> RawError {
+    RawError::new(
+        AnalyzeError::TooManyArguments("GROUPING must have fewer than 32 arguments".to_string()),
+        span,
+        None,
+    )
+}
+
+/// `CUBE is limited to 12 elements` — SQLSTATE 54011 (the grammar's
+/// limit, enforced by transformGroupClause).
+pub(crate) fn cube_too_many_elements(span: Option<SourceSpan>) -> RawError {
+    RawError::new(
+        AnalyzeError::TooManyColumns("CUBE is limited to 12 elements".to_string()),
+        span,
+        None,
+    )
+}
+
+/// `too many grouping sets present (maximum 4096)` — SQLSTATE 54001
+/// (parseCheckAggregates).
+pub(crate) fn too_many_grouping_sets() -> RawError {
+    RawError::new(
+        AnalyzeError::StatementTooComplex(
+            "too many grouping sets present (maximum 4096)".to_string(),
+        ),
+        None,
+        None,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

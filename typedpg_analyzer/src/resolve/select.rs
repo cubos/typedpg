@@ -25,13 +25,36 @@ pub(crate) fn analyze_correlated_select(
 ) -> AnalyzeResult {
     // Everything the enclosing level can see — its own FROM plus any
     // lateral refs it received — is reachable from the sublink as a
-    // correlated (fallback-only) reference.
-    let outer: Vec<_> = outer_scope
+    // correlated (fallback-only) reference; and so is what *it* reaches
+    // that way, the levels further out (PG searches the whole ParseState
+    // chain). Those come behind the enclosing level's entries: an entry of
+    // the same name there hides them, and so does a column of the same name
+    // for unqualified references.
+    let mut outer: Vec<crate::scope::TableSource> = outer_scope
         .sources
         .iter()
         .chain(outer_scope.lateral_sources.iter())
         .cloned()
         .collect();
+    let near_aliases: std::collections::HashSet<String> =
+        outer.iter().map(|s| s.alias.clone()).collect();
+    let near_columns: std::collections::HashSet<String> = outer
+        .iter()
+        .flat_map(|s| s.visible_columns().map(|c| c.name.clone()))
+        .collect();
+    let rule_pseudo = crate::scope::Scope::default().outer_sources;
+    for far in &outer_scope.outer_sources {
+        if near_aliases.contains(&far.alias) || rule_pseudo.iter().any(|p| p.alias == far.alias) {
+            continue;
+        }
+        let mut far = far.clone();
+        for c in &far.columns {
+            if near_columns.contains(&c.name) {
+                far.join_hidden.insert(c.name.clone());
+            }
+        }
+        outer.push(far);
+    }
     let (mut cols, p) = analyze_select_with_ctes_and_outer(
         sel,
         snapshot,
@@ -127,9 +150,18 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
         cte_scopes = analyze_with_clause(with, snapshot, params, &cte_scopes, &outer)?;
     }
 
-    // Handle UNION/INTERSECT/EXCEPT.
+    // Handle UNION/INTERSECT/EXCEPT. The set operation is a query level of
+    // its own, without a FROM clause; its arms are the levels below.
+    // Outer references reach the arms and the VALUES rows below like any
+    // subquery's.
+    let outer: Vec<crate::scope::TableSource> = lateral_sources
+        .iter()
+        .chain(correlated_sources)
+        .cloned()
+        .collect();
     if sel.op != SetOperation::SetopNone as i32 {
-        return analyze_set_operation(sel, snapshot, params, &cte_scopes);
+        grouping::register_level(sel, &[], &[]);
+        return analyze_set_operation(sel, snapshot, params, &cte_scopes, &outer);
     }
 
     // Handle `VALUES (…), (…), …` — a `SelectStmt` without a FROM/target
@@ -140,6 +172,7 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
     // The rows see the LATERAL and correlated outer levels like any
     // expression of this level (`LATERAL (VALUES (v.a))`).
     if !sel.values_lists.is_empty() {
+        grouping::register_level(sel, &[], &[]);
         let mut values_scope = Scope {
             ctes: cte_scopes.clone(),
             ..Scope::default()
@@ -183,15 +216,20 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
     null_ctx.has_group_by = !sel.group_clause.is_empty();
     null_ctx.srfs_in_lockstep = count_srf_calls(&sel.target_list, snapshot) > 1;
 
-    // Process FROM clause.
-    process_from_clause(
-        &sel.from_clause,
-        &mut scope,
-        &mut null_ctx,
-        snapshot,
-        &cte_scopes,
-        params,
-    )?;
+    // Process FROM clause. An aggregate of this level inside it (in a
+    // LATERAL subquery) is PG's EXPR_KIND_FROM_SUBSELECT error; JOIN
+    // conditions and function arguments name their own clause.
+    grouping::with_clause(Some("FROM clause of their own query level"), || {
+        process_from_clause(
+            &sel.from_clause,
+            &mut scope,
+            &mut null_ctx,
+            snapshot,
+            &cte_scopes,
+            params,
+        )
+    })?;
+    grouping::register_level(sel, &scope.sources, &scope.shadowed_sources);
 
     // PG transforms the target list right after FROM; note which bare `$N`
     // outputs it sees untyped before WHERE & co. can type them.
@@ -253,15 +291,18 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
     // `ROLLUP` / `CUBE`) are not real expressions; recurse into their
     // `content` to reach the underlying column references and
     // aggregate-rejection checks.
-    for group_node in &sel.group_clause {
-        walk_group_clause_node(
-            group_node,
-            expr::Ctx::new(&scope, &null_ctx, snapshot),
-            params,
-            &select_aliases,
-            &targets,
-        )?;
-    }
+    grouping::with_clause(Some("GROUP BY"), || {
+        for group_node in &sel.group_clause {
+            walk_group_clause_node(
+                group_node,
+                expr::Ctx::new(&scope, &null_ctx, snapshot),
+                params,
+                &select_aliases,
+                &targets,
+            )?;
+        }
+        Ok::<(), AnalyzeError>(())
+    })?;
 
     // Process HAVING clause — same boolean goal as WHERE, but aggregates
     // are of course allowed there.
@@ -395,9 +436,6 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
         params,
     )?;
 
-    // In a grouped query, every projected/HAVING/ORDER BY column must be
-    // grouped or aggregated (PG SQLSTATE 42803). Checked after the target list
-    // so undefined-column errors surface first, matching PG's order.
     // CASE / COALESCE / aggregate and window arguments may not contain
     // set-returning functions anywhere in this level.
     for n in sel
@@ -411,8 +449,6 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
         check_srf_nesting(n, snapshot)?;
     }
 
-    crate::grouping::check_grouping(sel, &scope, &targets, snapshot)?;
-
     check_order_by_using(
         &sel.sort_clause,
         &sel.target_list,
@@ -425,6 +461,10 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
     // `FOR UPDATE [OF …]` (and FOR SHARE / NO KEY UPDATE / KEY SHARE) —
     // PG checks it last in transformSelectStmt.
     check_locking_clause(sel, &scope, &null_ctx, snapshot)?;
+
+    // Aggregate ownership and parseCheckAggregates — which PG runs after
+    // everything above.
+    grouping::finish_select_level(sel, &scope, &targets, snapshot)?;
 
     Ok((columns, None))
 }
@@ -616,8 +656,15 @@ fn walk_group_clause_node(
         ..
     } = ctx;
     let n_targets = targets.len();
-    if let Some(node::Node::GroupingSet(gs)) = group_node.node.as_ref() {
-        for inner in &gs.content {
+    // A grouping set's members — and the members of an implicit row
+    // `(a, b)`, which flatten_grouping_sets turns into a list of grouping
+    // expressions — are grouping expressions of their own.
+    let members = match group_node.node.as_ref() {
+        Some(node::Node::GroupingSet(gs)) => Some(&gs.content),
+        _ => grouping::implicit_row_items(group_node),
+    };
+    if let Some(members) = members {
+        for inner in members {
             walk_group_clause_node(
                 inner,
                 expr::Ctx::new(scope, null_ctx, snapshot),
@@ -625,6 +672,16 @@ fn walk_group_clause_node(
                 select_aliases,
                 targets,
             )?;
+        }
+        // transformGroupingSet: a CUBE over more than 12 elements.
+        if let Some(node::Node::GroupingSet(gs)) = group_node.node.as_ref()
+            && gs.kind == protobuf::GroupingSetKind::GroupingSetCube as i32
+            && gs.content.len() > 12
+        {
+            return Err(crate::pgmsg::cube_too_many_elements(
+                crate::error::SourceSpan::from_node_qname(gs.location),
+            )
+            .finalize_implicit());
         }
         return Ok(());
     }
@@ -668,7 +725,12 @@ fn walk_group_clause_node(
         });
         return check_group_target_has_no_aggregates(target, snapshot);
     }
-    crate::clause::check_no_aggregates_or_windows(group_node, snapshot, "GROUP BY")?;
+    crate::clause::check_level_calls(
+        group_node,
+        expr::Ctx::new(scope, null_ctx, snapshot),
+        "GROUP BY",
+        true,
+    )?;
     Ok(())
 }
 
