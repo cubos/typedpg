@@ -1208,6 +1208,7 @@ mod sublink;
 mod xml;
 
 use column_refs::*;
+pub(crate) use column_refs::{SqlFunctionParams, with_sql_function_params};
 use conditional::*;
 pub(crate) use func_call::check_window_clause;
 use func_call::*;

@@ -8,14 +8,13 @@
 //! polymorphic arguments are only parsed, as in PG.
 //!
 //! Parameters are referenced as `$n` or by name. The body is analyzed by the
-//! regular query analyzer after rewriting each such reference to
-//! `($n::type)`, so the analyzer sees the declared parameter types. A name
-//! that also matches a column of a relation the statement reads is left
-//! alone and the statement not validated (PG resolves the column first; the
-//! rewrite can't tell them apart), which keeps the check free of false
-//! rejections.
+//! regular query analyzer after rewriting each `$n` to `($n::type)`, so the
+//! analyzer sees the declared parameter types; names are resolved by the
+//! analyzer's column lookup through the SQL-function parameter namespace
+//! ([`crate::expr::with_sql_function_params`]), after columns and relations,
+//! as PG's `sql_fn_post_column_ref` does.
 
-use pg_query::protobuf::{self, CreateFunctionStmt, KeywordKind, Token, node};
+use pg_query::protobuf::{self, CreateFunctionStmt, Token, node};
 
 use super::DdlError;
 use crate::coerce::{CoercionContext, can_coerce};
@@ -51,12 +50,13 @@ pub(crate) fn validate_sql_function(
         return Ok(());
     }
 
+    let namespace = || crate::expr::SqlFunctionParams {
+        name: proc.proname.clone(),
+        params: params.clone(),
+    };
     let mut last: Option<LastStatement> = None;
     for sql in &statements {
-        let Some(rewritten) = substitute_params(interp, sql, &params)? else {
-            // A parameter name doubles as a column name: can't validate.
-            return Ok(());
-        };
+        let rewritten = substitute_params(interp, sql, &params)?;
         let parsed = pg_query::parse(&rewritten).map_err(|e| DdlError::Parse(e.to_string()))?;
         for raw in &parsed.protobuf.stmts {
             let Some(inner) = raw.stmt.as_ref().and_then(|n| n.node.as_ref()) else {
@@ -67,18 +67,20 @@ pub(crate) fn validate_sql_function(
                 // statements after it may depend on what it creates.
                 return Ok(());
             }
-            let columns = match crate::resolve::analyze_raw_node(interp, inner, &[]) {
+            let analyzed = crate::expr::with_sql_function_params(namespace(), || {
+                crate::resolve::analyze_raw_node(interp, inner, &[])
+            });
+            let columns = match analyzed {
                 Ok((columns, _)) => Some(columns),
-                // Report what PG's parse analysis certainly reports too — a
-                // missing relation / schema / column; any other analyzer
-                // complaint leaves the body unvalidated rather than risk
-                // rejecting a function PG accepts.
+                // A construct the analyzer doesn't model says nothing about
+                // the body; every other error is one PG's parse analysis
+                // raises too.
                 Err(
-                    e @ (AnalyzeError::UndefinedTable(_)
-                    | AnalyzeError::UndefinedSchema(_)
-                    | AnalyzeError::UndefinedColumn(_)),
-                ) => return Err(DdlError::UnsupportedDdl(format!("{e}"))),
-                Err(_) => None,
+                    AnalyzeError::Unsupported(_)
+                    | AnalyzeError::UnsupportedJoinType(_)
+                    | AnalyzeError::Internal(_),
+                ) => None,
+                Err(e) => return Err(DdlError::UnsupportedDdl(format!("{e}"))),
             };
             last = Some(LastStatement {
                 returns_rows: returns_rows(inner),
@@ -286,14 +288,12 @@ fn returns_rows(stmt: &node::Node) -> bool {
     }
 }
 
-/// Rewrite every parameter reference (`$n`, or a parameter's name used as a
-/// bare identifier) to `($n::type)`. Returns `None` when a parameter name is
-/// also a column of a relation the SQL reads.
+/// Rewrite every positional parameter reference `$n` to `($n::type)`.
 fn substitute_params(
     interp: &PgCatalog,
     sql: &str,
     params: &[(String, PgTypeOid)],
-) -> Result<Option<String>, DdlError> {
+) -> Result<String, DdlError> {
     let scan = pg_query::scan(sql).map_err(|e| DdlError::Parse(e.to_string()))?;
     let tokens = &scan.tokens;
     let text = |t: &protobuf::ScanToken| &sql[t.start as usize..t.end as usize];
@@ -306,16 +306,6 @@ fn substitute_params(
             crate::qualified_name::QualifiedName::new(schema, &ty.typname)
         ))
     };
-
-    let named: Vec<(String, usize)> = params
-        .iter()
-        .enumerate()
-        .filter(|(_, (name, _))| !name.is_empty())
-        .map(|(i, (name, _))| (name.clone(), i + 1))
-        .collect();
-    if !named.is_empty() && names_collide_with_columns(interp, sql, &named) {
-        return Ok(None);
-    }
 
     // The analyzer numbers query parameters densely, so the referenced
     // parameters are renumbered in order of first use; the cast carries the
@@ -334,26 +324,14 @@ fn substitute_params(
     };
     let mut out = String::with_capacity(sql.len() + 16);
     let mut pos = 0usize;
-    for (i, tok) in tokens.iter().enumerate() {
+    for tok in tokens {
         let kind = Token::try_from(tok.token).unwrap_or(Token::Nul);
-        let keyword = KeywordKind::try_from(tok.keyword_kind).unwrap_or(KeywordKind::NoKeyword);
         let replacement = if kind == Token::Param {
             text(tok)
                 .trim_start_matches('$')
                 .parse::<usize>()
                 .ok()
                 .and_then(&mut typed)
-        } else if kind == Token::Ident
-            || (keyword != KeywordKind::NoKeyword && keyword != KeywordKind::ReservedKeyword)
-        {
-            let prev_dot = i > 0 && text(&tokens[i - 1]) == ".";
-            let next = tokens.get(i + 1).map(text);
-            let qualified_or_call = matches!(next, Some("." | "("));
-            let ident = identifier_value(text(tok));
-            match named.iter().find(|(n, _)| *n == ident) {
-                Some((_, n)) if !prev_dot && !qualified_or_call => typed(*n),
-                _ => None,
-            }
         } else {
             None
         };
@@ -364,7 +342,7 @@ fn substitute_params(
         }
     }
     out.push_str(&sql[pos..]);
-    Ok(Some(out))
+    Ok(out)
 }
 
 /// The identifier a token spells: `"Quoted"` as written, bare ones
@@ -374,38 +352,6 @@ pub(crate) fn identifier_value(raw: &str) -> String {
         Some(inner) => inner.replace("\"\"", "\""),
         None => raw.to_ascii_lowercase(),
     }
-}
-
-/// Whether one of the parameter names is also a column of a relation the
-/// SQL refers to (PG resolves such a name to the column).
-fn names_collide_with_columns(interp: &PgCatalog, sql: &str, named: &[(String, usize)]) -> bool {
-    let Ok(parsed) = pg_query::parse(sql) else {
-        return false;
-    };
-    parsed.protobuf.nodes().iter().any(|(n, ..)| {
-        // Columns of subqueries, CTEs and FROM functions can shadow a
-        // parameter too; don't try to tell those apart.
-        if matches!(
-            n,
-            pg_query::NodeRef::RangeSubselect(_)
-                | pg_query::NodeRef::CommonTableExpr(_)
-                | pg_query::NodeRef::RangeFunction(_)
-        ) {
-            return true;
-        }
-        let pg_query::NodeRef::RangeVar(rv) = n else {
-            return false;
-        };
-        let schema = (!rv.schemaname.is_empty()).then_some(rv.schemaname.as_str());
-        interp
-            .resolve_table(schema, &rv.relname)
-            .is_some_and(|class| {
-                interp
-                    .attributes_of(class.oid)
-                    .iter()
-                    .any(|a| named.iter().any(|(name, _)| *name == a.attname))
-            })
-    })
 }
 
 /// The expression an inlinable `LANGUAGE sql` function stands for

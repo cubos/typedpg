@@ -537,6 +537,61 @@ fn valid_sql_function_bodies_are_accepted() {
     assert_cols(&db.analyze("SELECT f2(1)").unwrap(), vec![cn("f2", int4())]);
 }
 
+#[test]
+fn sql_function_parameter_names_resolve_after_columns() {
+    // PG's sql_fn_post_column_ref: a column wins over a same-named
+    // parameter, `fname.param` names the parameter, and a body whose
+    // parameters shadow columns is still validated.
+    build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (id int PRIMARY KEY, name text NOT NULL);
+         CREATE TYPE pair AS (a int, b text);
+         CREATE FUNCTION c1(id int) RETURNS text LANGUAGE sql AS $$ SELECT name FROM t WHERE id = id $$;
+         CREATE FUNCTION c2(id text) RETURNS int LANGUAGE sql AS $$ SELECT id FROM t $$;
+         CREATE FUNCTION c4(name int) RETURNS int LANGUAGE sql AS $$ SELECT c4.name + 1 FROM t $$;
+         CREATE FUNCTION c6(p pair) RETURNS text LANGUAGE sql AS $$ SELECT p.b $$;
+         CREATE FUNCTION c7(p pair) RETURNS text LANGUAGE sql AS $$ SELECT c7.p.b $$;",
+    )]);
+    for (sql, msg) in [
+        (
+            "CREATE TABLE t (id int PRIMARY KEY, name text NOT NULL);
+             CREATE FUNCTION c5(x int) RETURNS int LANGUAGE sql AS $$ SELECT x FROM t WHERE nope = x $$;",
+            "column \"nope\" does not exist",
+        ),
+        // `id` is t's integer column, not the text parameter.
+        (
+            "CREATE TABLE t (id int PRIMARY KEY, name text NOT NULL);
+             CREATE FUNCTION c8(id text) RETURNS int LANGUAGE sql AS $$ SELECT 1 FROM t WHERE id = 'a' || 'b'::text $$;",
+            "operator does not exist: integer = text",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", sql)]).expect_err(sql);
+        assert!(err.to_string().starts_with(msg), "{sql}\n  got: {err}");
+    }
+}
+
+#[test]
+fn sql_function_bodies_report_every_analysis_error() {
+    for (sql, msg) in [
+        (
+            "CREATE FUNCTION e1(x int) RETURNS int LANGUAGE sql AS $$ SELECT nofunc(x) $$;",
+            "function nofunc(integer) does not exist",
+        ),
+        (
+            "CREATE FUNCTION e2(x int) RETURNS int LANGUAGE sql AS $$ SELECT x + 'a'::text $$;",
+            "operator does not exist: integer + text",
+        ),
+        (
+            "CREATE TABLE t (id int);
+             CREATE FUNCTION e3() RETURNS int LANGUAGE sql AS $$ SELECT count(*) FROM t WHERE count(*) > 1 $$;",
+            "aggregate functions are not allowed in WHERE",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", sql)]).expect_err(sql);
+        assert!(err.to_string().starts_with(msg), "{sql}\n  got: {err}");
+    }
+}
+
 // ── ALTER FUNCTION, SQL-function inlining in index expressions ──────────────
 
 #[test]

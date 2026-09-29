@@ -214,7 +214,7 @@ fn resolve_funccall_out_args(
 /// composite-column accesses (`(c.col).field`, `((c).x).field`), pass
 /// `None` and the wording switches to PG's `column "f" not found in data
 /// type T`.
-fn resolve_composite_field(
+pub(super) fn resolve_composite_field(
     current: &ExprType,
     field_name: &str,
     snapshot: &PgCatalog,
