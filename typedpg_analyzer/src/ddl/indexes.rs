@@ -80,24 +80,7 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
     }
 
     if let Some(pred) = stmt.where_clause.as_deref() {
-        super::expr_kind::check_expr_kind(db, pred, super::expr_kind::ExprKind::IndexPredicate)?;
-        // transformWhereClause: a boolean over the table's row.
-        match super::volatile::infer_over_relation(db, indrelid, pred, None) {
-            Some(Err(e)) => return Err(DdlError::UnsupportedDdl(e.to_string())),
-            Some(Ok(t))
-                if t.type_oid != crate::pg_catalog::oid::BOOL
-                    && t.type_oid != crate::pg_catalog::oid::UNKNOWN =>
-            {
-                return Err(DdlError::UnsupportedDdl(format!(
-                    "argument of WHERE must be type boolean, not type {}",
-                    super::util::format_type_for_message(db, t.type_oid)
-                )));
-            }
-            _ => {}
-        }
-        // CheckPredicate: every function must be IMMUTABLE.
-        check_no_volatile(pred, ExprLocation::IndexPredicate, db)?;
-        super::volatile::check_mutability(db, indrelid, pred, ExprLocation::IndexPredicate)?;
+        check_index_predicate(db, indrelid, pred)?;
     }
 
     // ── Mutability check on expression indexes (ComputeIndexAttrs) ──
@@ -106,17 +89,7 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
             continue;
         };
         if let Some(expr) = elem.expr.as_deref() {
-            super::expr_kind::check_expr_kind(
-                db,
-                expr,
-                super::expr_kind::ExprKind::IndexExpression,
-            )?;
-            // transformIndexStmt: the expression is analyzed over the row.
-            if let Some(Err(e)) = super::volatile::infer_over_relation(db, indrelid, expr, None) {
-                return Err(DdlError::UnsupportedDdl(e.to_string()));
-            }
-            check_no_volatile(expr, ExprLocation::Index, db)?;
-            super::volatile::check_mutability(db, indrelid, expr, ExprLocation::Index)?;
+            check_index_expression(db, indrelid, expr)?;
         }
     }
 
@@ -313,6 +286,50 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
     }
 
     Ok(())
+}
+
+/// transformIndexStmt / CheckPredicate: an index's WHERE is a boolean over
+/// the table's row, of IMMUTABLE functions, in EXPR_KIND_INDEX_PREDICATE.
+fn check_index_predicate(
+    db: &PgCatalog,
+    relid: PgClassOid,
+    pred: &typedpg_pg_query::protobuf::Node,
+) -> Result<(), DdlError> {
+    super::expr_kind::check_expr_kind(db, pred, super::expr_kind::ExprKind::IndexPredicate)?;
+    // transformWhereClause: a boolean over the table's row.
+    match super::volatile::infer_over_relation(db, relid, pred, None) {
+        Some(Err(e)) => return Err(DdlError::UnsupportedDdl(e.to_string())),
+        Some(Ok(t))
+            if t.type_oid != crate::pg_catalog::oid::BOOL
+                && t.type_oid != crate::pg_catalog::oid::UNKNOWN =>
+        {
+            return Err(DdlError::UnsupportedDdl(format!(
+                "argument of WHERE must be type boolean, not type {}",
+                super::util::format_type_for_message(db, t.type_oid)
+            )));
+        }
+        _ => {}
+    }
+    // CheckPredicate: every function must be IMMUTABLE.
+    check_no_volatile(pred, ExprLocation::IndexPredicate, db)?;
+    super::volatile::check_mutability(db, relid, pred, ExprLocation::IndexPredicate)
+}
+
+/// transformIndexStmt / ComputeIndexAttrs: an index expression is analyzed
+/// over the table's row in EXPR_KIND_INDEX_EXPRESSION, and may call only
+/// IMMUTABLE functions.
+fn check_index_expression(
+    db: &PgCatalog,
+    relid: PgClassOid,
+    expr: &typedpg_pg_query::protobuf::Node,
+) -> Result<(), DdlError> {
+    super::expr_kind::check_expr_kind(db, expr, super::expr_kind::ExprKind::IndexExpression)?;
+    // transformIndexStmt: the expression is analyzed over the row.
+    if let Some(Err(e)) = super::volatile::infer_over_relation(db, relid, expr, None) {
+        return Err(DdlError::UnsupportedDdl(e.to_string()));
+    }
+    check_no_volatile(expr, ExprLocation::Index, db)?;
+    super::volatile::check_mutability(db, relid, expr, ExprLocation::Index)
 }
 
 /// INDEX_MAX_KEYS (pg_config_manual.h): the most columns an index — key
@@ -632,6 +649,11 @@ pub(crate) fn define_constraint_index(
             false,
         )?;
     }
+    // transformIndexConstraint: an EXCLUDE constraint's WHERE is the
+    // index's predicate.
+    if let Some(pred) = c.where_clause.as_deref() {
+        check_index_predicate(db, relid, pred)?;
+    }
     let attrs = db.attributes_of(relid);
     let mut columns = Vec::with_capacity(conkey.len());
     let mut exclusion_oprs = Vec::with_capacity(conkey.len());
@@ -658,11 +680,7 @@ pub(crate) fn define_constraint_index(
         let typ = match (attr, elem.and_then(|e| e.expr.as_deref())) {
             (Some(a), _) => Some(a.atttypid),
             (None, Some(expr)) => {
-                super::expr_kind::check_expr_kind(
-                    db,
-                    expr,
-                    super::expr_kind::ExprKind::IndexExpression,
-                )?;
+                check_index_expression(db, relid, expr)?;
                 match super::volatile::infer_over_relation(db, relid, expr, None) {
                     Some(Err(e)) => return Err(DdlError::UnsupportedDdl(e.to_string())),
                     Some(Ok(t)) => Some(t.type_oid),

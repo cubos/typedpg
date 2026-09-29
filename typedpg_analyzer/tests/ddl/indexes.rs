@@ -893,6 +893,46 @@ fn exclusion_operators_are_checked() {
 }
 
 #[test]
+fn exclusion_expressions_and_predicates_are_checked_like_an_index() {
+    // transformIndexConstraint makes them the index's expressions and
+    // predicate: EXPR_KIND_INDEX_EXPRESSION / _PREDICATE, IMMUTABLE only,
+    // a boolean WHERE.
+    assert_rejected(
+        "",
+        &[
+            (
+                "CREATE TABLE t (a int, EXCLUDE (a WITH =) WHERE (generate_series(1, a) > 0));",
+                "set-returning functions are not allowed in index predicates",
+            ),
+            (
+                "CREATE TABLE t (a int, EXCLUDE (a WITH =) WHERE (random() > 0.5));",
+                "functions in index predicate must be marked IMMUTABLE",
+            ),
+            (
+                "CREATE TABLE t (a int, EXCLUDE ((random()::int) WITH =));",
+                "functions in index expression must be marked IMMUTABLE",
+            ),
+            (
+                "CREATE TABLE t (a int, EXCLUDE (a WITH =) WHERE (a));",
+                "argument of WHERE must be type boolean, not type integer",
+            ),
+            (
+                "CREATE TABLE t (a int, EXCLUDE ((sum(a)) WITH =));",
+                "aggregate functions are not allowed in index expressions",
+            ),
+            (
+                "CREATE TABLE t (a int, EXCLUDE (a WITH =) WHERE (nosuch > 0));",
+                "column \"nosuch\" does not exist",
+            ),
+        ],
+    );
+    assert_accepted(
+        "",
+        &["CREATE TABLE t (a int, EXCLUDE ((a + 1) WITH =) WHERE (a > 0));"],
+    );
+}
+
+#[test]
 fn exclusion_needs_an_access_method_with_gettuple() {
     assert_rejected(
         "",
