@@ -22,15 +22,15 @@ use crate::qualified_name::QualifiedName;
 /// Pending `pg_constraint` row built up while walking a `CreateStmt`:
 /// `(conname, contype, conkey, confrelid, confkey)`. Materialized into
 /// real catalog rows after all FK targets have been validated.
-/// CHECK constraints also carry their definition; then come DEFERRABLE
-/// and the INCLUDE columns.
+/// CHECK constraints also carry their definition and whether they are
+/// ENFORCED; then come DEFERRABLE and the INCLUDE columns.
 type PendingConstraint = (
     ConName,
     ConType,
     Vec<i16>,
     Option<PgClassOid>,
     Vec<i16>,
-    Option<check_inherit::CheckDef>,
+    Option<(check_inherit::CheckDef, bool)>,
     bool,
     Vec<i16>,
 );

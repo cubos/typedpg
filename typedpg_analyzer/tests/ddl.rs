@@ -22,6 +22,8 @@ mod constraints;
 mod create_table;
 #[path = "ddl/drop.rs"]
 mod drop_objects;
+#[path = "ddl/enforced.rs"]
+mod enforced;
 #[path = "ddl/extensions.rs"]
 mod extensions;
 #[path = "ddl/functions.rs"]

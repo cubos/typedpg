@@ -17,6 +17,24 @@ pub(crate) struct CheckDef {
     pub(crate) no_inherit: bool,
 }
 
+/// A CHECK constraint's `conenforced` / `convalidated` as it is added.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CheckFlags {
+    pub(crate) enforced: bool,
+    pub(crate) valid: bool,
+}
+
+impl CheckFlags {
+    /// The flags of a constraint written in CREATE TABLE: valid (the table
+    /// is empty) unless NOT ENFORCED.
+    pub(crate) fn created(enforced: bool) -> Self {
+        CheckFlags {
+            enforced,
+            valid: enforced,
+        }
+    }
+}
+
 /// The canonical text of a CHECK expression.
 pub(crate) fn check_expr_text(expr: &typedpg_pg_query::protobuf::Node) -> String {
     let select = typedpg_pg_query::protobuf::SelectStmt {
@@ -78,6 +96,7 @@ fn map_conkey(interp: &PgCatalog, from: PgClassOid, to: PgClassOid, conkey: &[i1
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)] // one per pg_constraint column
 fn insert_check(
     interp: &mut PgCatalog,
     relid: PgClassOid,
@@ -86,6 +105,7 @@ fn insert_check(
     def: Option<CheckDef>,
     conislocal: bool,
     coninhcount: i16,
+    flags: CheckFlags,
 ) -> Result<(), DdlError> {
     let oid = PgConstraintOid::from_nonzero(interp.alloc_oid()?);
     interp.insert_pg_constraint(PgConstraint {
@@ -98,8 +118,8 @@ fn insert_check(
         confkey: Vec::new(),
         conislocal,
         coninhcount,
-        conenforced: true,
-        convalidated: true,
+        conenforced: flags.enforced,
+        convalidated: flags.valid,
         connoinherit: def.as_ref().is_some_and(|d| d.no_inherit),
         conperiod: false,
     });
@@ -124,8 +144,9 @@ pub(super) fn inherit_parent_checks(
     parents.sort_by_key(|i| i.inhseqno);
     let parents: Vec<PgClassOid> = parents.iter().map(|i| i.inhparent).collect();
 
-    // (name, conkey on relid, definition, how many parents contribute it)
-    let mut inherited: Vec<(String, Vec<i16>, Option<CheckDef>, i16)> = Vec::new();
+    // (name, conkey on relid, definition, how many parents contribute it,
+    // enforced by any of them)
+    let mut inherited: Vec<(String, Vec<i16>, Option<CheckDef>, i16, bool)> = Vec::new();
     for parent in parents {
         let mut checks: Vec<PgConstraint> = interp
             .pg_constraint
@@ -149,10 +170,12 @@ pub(super) fn inherit_parent_checks(
                         )));
                     }
                     e.3 += 1;
+                    // One ENFORCED parent makes the merged one ENFORCED.
+                    e.4 |= con.conenforced;
                 }
                 None => {
                     let conkey = map_conkey(interp, parent, relid, &con.conkey);
-                    inherited.push((con.conname.clone(), conkey, def, 1));
+                    inherited.push((con.conname.clone(), conkey, def, 1, con.conenforced));
                 }
             }
         }
@@ -160,9 +183,18 @@ pub(super) fn inherit_parent_checks(
 
     let relname = relname_of(interp, relid);
     let partition = is_partition(interp, relid);
-    for (name, conkey, def, count) in inherited {
+    for (name, conkey, def, count, enforced) in inherited {
         let Some(local) = constraint_named(interp, relid, &name) else {
-            insert_check(interp, relid, &name, conkey, def, false, count)?;
+            insert_check(
+                interp,
+                relid,
+                &name,
+                conkey,
+                def,
+                false,
+                count,
+                CheckFlags::created(enforced),
+            )?;
             continue;
         };
         let local_def = interp.check_defs.get(&local.oid);
@@ -174,6 +206,14 @@ pub(super) fn inherit_parent_checks(
         if local_def.is_some_and(|d| d.no_inherit) {
             return Err(DdlError::UnsupportedDdl(format!(
                 "constraint \"{name}\" conflicts with inherited constraint on relation \
+                 \"{relname}\""
+            )));
+        }
+        // The local definition merging into an ENFORCED inherited one may
+        // not be NOT ENFORCED.
+        if !local.conenforced && enforced {
+            return Err(DdlError::UnsupportedDdl(format!(
+                "constraint \"{name}\" conflicts with NOT ENFORCED constraint on relation \
                  \"{relname}\""
             )));
         }
@@ -190,6 +230,7 @@ pub(super) fn inherit_parent_checks(
 
 /// `ALTER TABLE ... ADD [CONSTRAINT name] CHECK (...)` on `relid`
 /// (ATAddCheckNNConstraint), recursing to the children unless NO INHERIT.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn add_check(
     interp: &mut PgCatalog,
     relid: PgClassOid,
@@ -198,6 +239,7 @@ pub(super) fn add_check(
     no_inherit: bool,
     rec: super::inherit::Recursion,
     conkey: Vec<i16>,
+    flags: CheckFlags,
 ) -> Result<(), DdlError> {
     let def = CheckDef {
         expr: check_expr_text(expr),
@@ -220,8 +262,13 @@ pub(super) fn add_check(
                  \"{relname}\""
             )));
         }
+        check_merge_flags(&existing, flags, true, &relname)?;
         if let Some(row) = interp.pg_constraint.get_mut(&existing.oid) {
             row.conislocal = true;
+            if flags.enforced && !row.conenforced {
+                row.conenforced = true;
+                row.convalidated = true;
+            }
         }
         // Merged: the children already have it.
         return Ok(());
@@ -234,6 +281,7 @@ pub(super) fn add_check(
         Some(def.clone()),
         true,
         0,
+        flags,
     )?;
     if no_inherit {
         return Ok(());
@@ -246,7 +294,34 @@ pub(super) fn add_check(
     }
     for child in children {
         let child_key = map_conkey(interp, relid, child, &conkey);
-        add_inherited_check(interp, child, name, &def, child_key)?;
+        add_inherited_check(interp, child, name, &def, child_key, flags)?;
+    }
+    Ok(())
+}
+
+/// MergeWithExistingConstraint's validity and enforcement rules: a NOT
+/// VALID existing constraint can't stand for a valid one, and an ENFORCED
+/// inherited definition can't merge into a NOT ENFORCED one (nor a local
+/// NOT ENFORCED one into an ENFORCED one).
+fn check_merge_flags(
+    existing: &PgConstraint,
+    flags: CheckFlags,
+    is_local: bool,
+    relname: &str,
+) -> Result<(), DdlError> {
+    let name = &existing.conname;
+    if flags.valid && existing.conenforced && !existing.convalidated {
+        return Err(DdlError::UnsupportedDdl(format!(
+            "constraint \"{name}\" conflicts with NOT VALID constraint on relation \"{relname}\""
+        )));
+    }
+    if (!is_local && flags.enforced && !existing.conenforced)
+        || (is_local && !flags.enforced && existing.conenforced)
+    {
+        return Err(DdlError::UnsupportedDdl(format!(
+            "constraint \"{name}\" conflicts with NOT ENFORCED constraint on relation \
+             \"{relname}\""
+        )));
     }
     Ok(())
 }
@@ -259,6 +334,7 @@ fn add_inherited_check(
     name: &str,
     def: &CheckDef,
     conkey: Vec<i16>,
+    flags: CheckFlags,
 ) -> Result<(), DdlError> {
     let relname = relname_of(interp, relid);
     if let Some(existing) = constraint_named(interp, relid, name) {
@@ -274,6 +350,7 @@ fn add_inherited_check(
                  \"{relname}\""
             )));
         }
+        check_merge_flags(&existing, flags, false, &relname)?;
         if let Some(row) = interp.pg_constraint.get_mut(&existing.oid) {
             row.coninhcount += 1;
         }
@@ -287,10 +364,11 @@ fn add_inherited_check(
         Some(def.clone()),
         false,
         1,
+        flags,
     )?;
     for child in super::inherit::children_of(interp, relid) {
         let child_key = map_conkey(interp, relid, child, &conkey);
-        add_inherited_check(interp, child, name, def, child_key)?;
+        add_inherited_check(interp, child, name, def, child_key, flags)?;
     }
     Ok(())
 }

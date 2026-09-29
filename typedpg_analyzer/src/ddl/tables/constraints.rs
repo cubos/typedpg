@@ -99,12 +99,15 @@ pub(crate) fn emit_constraints(
                         check_conkey(interp, relid, c.raw_expr.as_deref()),
                         None,
                         Vec::new(),
-                        Some(check_inherit::CheckDef {
-                            expr: check_inherit::check_expr_text(
-                                &c.raw_expr.clone().map(|b| *b).unwrap_or_default(),
-                            ),
-                            no_inherit: c.is_no_inherit,
-                        }),
+                        Some((
+                            check_inherit::CheckDef {
+                                expr: check_inherit::check_expr_text(
+                                    &c.raw_expr.clone().map(|b| *b).unwrap_or_default(),
+                                ),
+                                no_inherit: c.is_no_inherit,
+                            },
+                            c.is_enforced,
+                        )),
                         c.deferrable,
                         include_attnums(interp, relid, c)?.0,
                     ));
@@ -196,12 +199,15 @@ pub(crate) fn emit_constraints(
                     check_conkey(interp, relid, c.raw_expr.as_deref()),
                     None,
                     Vec::new(),
-                    Some(check_inherit::CheckDef {
-                        expr: check_inherit::check_expr_text(
-                            &c.raw_expr.clone().map(|b| *b).unwrap_or_default(),
-                        ),
-                        no_inherit: c.is_no_inherit,
-                    }),
+                    Some((
+                        check_inherit::CheckDef {
+                            expr: check_inherit::check_expr_text(
+                                &c.raw_expr.clone().map(|b| *b).unwrap_or_default(),
+                            ),
+                            no_inherit: c.is_no_inherit,
+                        },
+                        c.is_enforced,
+                    )),
                     c.deferrable,
                     include_attnums(interp, relid, c)?.0,
                 ));
@@ -279,9 +285,12 @@ pub(crate) fn emit_constraints(
         let oid = emit_constraint_with_backing_index(
             interp, relid, conname, contype, conkey, confrelid, confkey, deferrable, include,
         )?;
-        if let Some(def) = check {
+        if let Some((def, enforced)) = check {
+            // CREATE TABLE's constraints are valid unless NOT ENFORCED.
             if let Some(row) = interp.pg_constraint.get_mut(&oid) {
                 row.connoinherit = def.no_inherit;
+                row.conenforced = enforced;
+                row.convalidated = enforced;
             }
             interp.check_defs.insert(oid, def);
         }
@@ -292,7 +301,7 @@ pub(crate) fn emit_constraints(
             resolve_fk_target(interp, c, relname, &local_names, &local_types)?;
         check_fk_generated_columns(interp, relid, c, &conkey)?;
         let conname = ConName::from_explicit(&c.conname, default_name).resolve(interp, relid);
-        emit_constraint_with_backing_index(
+        let oid = emit_constraint_with_backing_index(
             interp,
             relid,
             conname,
@@ -303,6 +312,12 @@ pub(crate) fn emit_constraints(
             false,
             Vec::new(),
         )?;
+        // transformFKConstraints: CREATE TABLE's foreign keys are valid
+        // unless NOT ENFORCED.
+        if let Some(row) = interp.pg_constraint.get_mut(&oid) {
+            row.conenforced = c.is_enforced;
+            row.convalidated = c.is_enforced;
+        }
     }
     Ok(())
 }
@@ -1443,6 +1458,10 @@ fn add_constraint_node(
             c.is_no_inherit,
             rec,
             check_conkey(interp, relid, Some(expr)),
+            super::check_inherit::CheckFlags {
+                enforced: c.is_enforced,
+                valid: c.initially_valid,
+            },
         )?;
     }
 
@@ -1488,7 +1507,7 @@ fn add_constraint_node(
             },
         )
         .resolve(interp, relid);
-        emit_constraint_with_backing_index(
+        let oid = emit_constraint_with_backing_index(
             interp,
             relid,
             conname,
@@ -1499,6 +1518,10 @@ fn add_constraint_node(
             false,
             Vec::new(),
         )?;
+        if let Some(row) = interp.pg_constraint.get_mut(&oid) {
+            row.conenforced = c.is_enforced;
+            row.convalidated = c.initially_valid;
+        }
     }
 
     Ok(())

@@ -47,10 +47,74 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
     // `Constraint { contype = CONSTR_NOTNULL }`. PG also forbids null defaults
     // on a NOT NULL domain, but the analyzer doesn't model defaults yet.
     let mut constraints: Vec<DomainConstraint> = Vec::new();
+    let mut saw_default = false;
+    let mut null_defined = false;
+    let mut typ_not_null = false;
     for n in &stmt.constraints {
         let Some(node::Node::Constraint(c)) = n.node.as_ref() else {
             continue;
         };
+        // DefineDomain: which clauses a domain takes, and how often.
+        let fail = |msg: &str| Err(DdlError::Parse(msg.to_owned()));
+        match ConstrType::try_from(c.contype) {
+            Ok(ConstrType::ConstrDefault) => {
+                if saw_default {
+                    return fail("multiple default expressions");
+                }
+                saw_default = true;
+            }
+            Ok(ConstrType::ConstrNotnull) => {
+                if null_defined {
+                    return fail(if typ_not_null {
+                        "redundant NOT NULL constraint definition"
+                    } else {
+                        "conflicting NULL/NOT NULL constraints"
+                    });
+                }
+                if c.is_no_inherit {
+                    return fail("not-null constraints for domains cannot be marked NO INHERIT");
+                }
+                typ_not_null = true;
+                null_defined = true;
+            }
+            Ok(ConstrType::ConstrNull) => {
+                if null_defined && typ_not_null {
+                    return fail("conflicting NULL/NOT NULL constraints");
+                }
+                typ_not_null = false;
+                null_defined = true;
+            }
+            Ok(ConstrType::ConstrCheck) if c.is_no_inherit => {
+                return fail("check constraints for domains cannot be marked NO INHERIT");
+            }
+            Ok(ConstrType::ConstrUnique) => {
+                return fail("unique constraints not possible for domains");
+            }
+            Ok(ConstrType::ConstrPrimary) => {
+                return fail("primary key constraints not possible for domains");
+            }
+            Ok(ConstrType::ConstrExclusion) => {
+                return fail("exclusion constraints not possible for domains");
+            }
+            Ok(ConstrType::ConstrForeign) => {
+                return fail("foreign key constraints not possible for domains");
+            }
+            Ok(
+                ConstrType::ConstrAttrDeferrable
+                | ConstrType::ConstrAttrNotDeferrable
+                | ConstrType::ConstrAttrDeferred
+                | ConstrType::ConstrAttrImmediate,
+            ) => {
+                return fail("specifying constraint deferrability not supported for domains");
+            }
+            Ok(ConstrType::ConstrGenerated | ConstrType::ConstrIdentity) => {
+                return fail("specifying GENERATED not supported for domains");
+            }
+            Ok(ConstrType::ConstrAttrEnforced | ConstrType::ConstrAttrNotEnforced) => {
+                return fail("specifying constraint enforceability not supported for domains");
+            }
+            _ => {}
+        }
         // domainAddDefault: cooked like a column default named after the
         // domain, against the base type.
         if c.contype == ConstrType::ConstrDefault as i32
