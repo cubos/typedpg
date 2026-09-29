@@ -111,8 +111,11 @@ impl PgCatalog {
             return self.namespace_oid(name).into_iter().collect();
         }
         let mut out = Vec::with_capacity(self.search_path.len() + 2);
-        // The temporary schema is searched first (recomputeNamespacePath).
-        if let Some(temp) = self.temp_namespace.filter(|_| self.in_migration) {
+        // The temporary schema is searched first (recomputeNamespacePath),
+        // unless the path lists `pg_temp` somewhere.
+        if let Some(temp) = self.temp_namespace.filter(|_| self.in_migration)
+            && !self.search_path.contains(&temp)
+        {
             out.push(temp);
         }
         if !self.search_path_includes_pg_catalog()

@@ -245,6 +245,38 @@ fn create_schema_elements_run_grouped_by_kind() {
 }
 
 #[test]
+fn an_explicit_pg_temp_in_the_search_path_is_honored() {
+    // PG 18 recomputeNamespacePath: `pg_temp` listed first is the creation
+    // schema (activeTempCreationPending) — new relations are temporary —
+    // and listed later it is searched where it stands.
+    let db = build_db(&[
+        (
+            "0001.sql",
+            "SET search_path = pg_temp, public;
+             CREATE TABLE t (a int);
+             INSERT INTO t VALUES (1);",
+        ),
+        (
+            "0002.sql",
+            "SET search_path = public, pg_temp;
+             CREATE TEMP TABLE u (a int);
+             CREATE TABLE u (b text);
+             INSERT INTO u (b) VALUES ('x');
+             SELECT b FROM u;",
+        ),
+    ]);
+    let err = db
+        .analyze("SELECT a FROM public.t")
+        .expect_err("t is temporary");
+    assert!(
+        err.to_string()
+            .starts_with("relation \"public.t\" does not exist"),
+        "got: {err}"
+    );
+    db.analyze("SELECT b FROM u").unwrap();
+}
+
+#[test]
 fn system_schemas_and_catalogs_are_protected() {
     // PG 18 CreateSchemaCommand / RenameSchema (IsReservedName),
     // heap_create (no relations in pg_catalog or pg_toast) and the

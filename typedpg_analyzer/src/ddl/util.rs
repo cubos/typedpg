@@ -141,8 +141,14 @@ pub fn temp_namespace(interp: &mut PgCatalog) -> Result<PgNamespaceOid, DdlError
     if let Some(oid) = interp.temp_namespace {
         return Ok(oid);
     }
-    let oid = ensure_namespace(interp, "pg_temp_1")?;
+    // Known as the temporary schema before the search path is re-derived,
+    // so a `pg_temp` entry finds it.
+    let oid = PgNamespaceOid::from_nonzero(interp.alloc_oid()?);
     interp.temp_namespace = Some(oid);
+    interp.insert_pg_namespace(PgNamespace {
+        oid,
+        nspname: "pg_temp_1".to_owned(),
+    });
     Ok(oid)
 }
 

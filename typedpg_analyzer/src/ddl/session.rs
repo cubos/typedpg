@@ -171,11 +171,23 @@ impl PgCatalog {
         } else {
             self.search_path_guc.new_session()
         };
+        // recomputeNamespacePath: an explicit `pg_temp` is the session's
+        // temporary schema, searched where it's listed; listed first, it's
+        // where new objects go even before it exists (activeTempCreationPending
+        // — the analyzer creates it right away).
+        let mut temp_first = false;
         for name in setting {
             // `$user` is the schema named after current_user — known only
             // in the migrations' session, and once they name the role.
             let name = match name.as_str() {
-                "pg_temp" => continue,
+                "pg_temp" => {
+                    match self.temp_namespace.filter(|_| self.in_migration) {
+                        Some(temp) if !resolved.contains(&temp) => resolved.push(temp),
+                        Some(_) => {}
+                        None => temp_first |= resolved.is_empty() && self.in_migration,
+                    }
+                    continue;
+                }
                 "$user" => match self.session_identity.current_user() {
                     Some(user) if self.in_migration => user,
                     _ => continue,
@@ -187,6 +199,9 @@ impl PgCatalog {
             {
                 resolved.push(oid);
             }
+        }
+        if temp_first && let Ok(temp) = super::util::temp_namespace(self) {
+            resolved.insert(0, temp);
         }
         self.search_path = resolved;
     }
