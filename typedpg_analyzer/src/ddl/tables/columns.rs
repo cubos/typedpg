@@ -1216,6 +1216,45 @@ pub(crate) fn alter_column_type(
         return Ok(());
     };
     super::check_not_system_column(interp, relid, &cmd.name)?;
+    // transformAlterTableStmt: an identity column's sequence gets an ALTER
+    // SEQUENCE ... AS <new type> that runs first (not for a partition,
+    // whose identity sequence is its parent's).
+    if !rec.recursing
+        && !super::inherit_cmd::is_partition(interp, relid)
+        && let Some(attr) = interp.attribute_by_name(relid, &cmd.name).cloned()
+        && attr.attidentity.is_some()
+        && let Some(tn) = cd.type_name.as_ref()
+    {
+        let new_type = lookup_type_name(tn, interp)?;
+        use crate::pg_catalog::oid;
+        if !matches!(new_type, oid::INT2 | oid::INT4 | oid::INT8) {
+            return Err(DdlError::UnsupportedDdl(
+                "identity column type must be smallint, integer, or bigint".into(),
+            ));
+        }
+        let as_type = typedpg_pg_query::protobuf::Node {
+            node: Some(node::Node::DefElem(Box::new(
+                typedpg_pg_query::protobuf::DefElem {
+                    defname: "as".into(),
+                    arg: Some(Box::new(typedpg_pg_query::protobuf::Node {
+                        node: Some(node::Node::TypeName(tn.clone())),
+                    })),
+                    ..Default::default()
+                },
+            ))),
+        };
+        for seq in crate::ddl::sequences::identity_sequences(interp, relid, attr.attnum) {
+            let current = interp.sequence_params.get(&seq).copied();
+            let params = crate::ddl::seqparams::init_params(
+                interp,
+                std::slice::from_ref(&as_type),
+                Some(current.unwrap_or(crate::ddl::seqparams::SeqParams::defaults(
+                    attr.atttypid,
+                ))),
+            )?;
+            interp.sequence_params.insert(seq, params);
+        }
+    }
     // ATPrepAlterColumnType: USING would contradict the generation
     // expression.
     if let Some(attr) = interp.attribute_by_name(relid, &cmd.name)

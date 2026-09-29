@@ -175,14 +175,13 @@ fn apply(
     let typname = || super::util::format_type_for_message(interp, p.typ);
 
     // MAXVALUE: explicit, NO MAXVALUE / new sequence => default, or reset
-    // when the type changed and it was the old type's bound.
+    // to the new type's bound when the type changed and it was the old
+    // type's (an explicit value is left alone, even out of range).
     match max {
         Some(Some(v)) => p.max = v,
         Some(None) => p.max = if p.increment > 0 { type_max } else { -1 },
         None if is_init => p.max = if p.increment > 0 { type_max } else { -1 },
-        None if type_changed && (old.max == old_max || old.max > type_max) => {
-            p.max = if p.increment > 0 { type_max } else { -1 };
-        }
+        None if type_changed && old.max == old_max => p.max = type_max,
         None => {}
     }
     if p.max < type_min || p.max > type_max {
@@ -196,9 +195,7 @@ fn apply(
         Some(Some(v)) => p.min = v,
         Some(None) => p.min = if p.increment > 0 { 1 } else { type_min },
         None if is_init => p.min = if p.increment > 0 { 1 } else { type_min },
-        None if type_changed && (old.min == old_min || old.min < type_min) => {
-            p.min = if p.increment > 0 { 1 } else { type_min };
-        }
+        None if type_changed && old.min == old_min => p.min = type_min,
         None => {}
     }
     if p.min < type_min || p.min > type_max {

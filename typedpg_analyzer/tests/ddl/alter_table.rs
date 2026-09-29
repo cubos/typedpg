@@ -1100,3 +1100,50 @@ fn system_columns_can_be_neither_dropped_nor_altered() {
         assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
     }
 }
+
+#[test]
+fn alter_column_type_of_an_identity_column_retypes_its_sequence() {
+    // transformAlterTableStmt runs ALTER SEQUENCE ... AS <new type> on the
+    // identity sequence first: the type must be an integer one, and the
+    // sequence's bounds follow (not for a partition, whose sequence is its
+    // parent's).
+    let setup = "CREATE TABLE t (a int GENERATED ALWAYS AS IDENTITY);
+                 CREATE TABLE u (a bigint GENERATED ALWAYS AS IDENTITY (MAXVALUE 100000));
+                 CREATE TABLE p (a int GENERATED ALWAYS AS IDENTITY, b int)
+                     PARTITION BY RANGE (b);
+                 CREATE TABLE c PARTITION OF p FOR VALUES FROM (1) TO (2);";
+    for (stmt, msg) in [
+        (
+            "ALTER TABLE t ALTER COLUMN a TYPE text;",
+            "identity column type must be smallint, integer, or bigint",
+        ),
+        (
+            "ALTER TABLE t ALTER COLUMN a TYPE numeric;",
+            "identity column type must be smallint, integer, or bigint",
+        ),
+        (
+            "ALTER TABLE p ALTER COLUMN a TYPE text;",
+            "identity column type must be smallint, integer, or bigint",
+        ),
+        (
+            "ALTER TABLE u ALTER COLUMN a TYPE smallint;",
+            "MAXVALUE (100000) is out of range for sequence data type smallint",
+        ),
+        (
+            "ALTER TABLE t ALTER COLUMN a TYPE smallint;
+             ALTER TABLE t ALTER COLUMN a RESTART WITH 40000;",
+            "RESTART value (40000) cannot be greater than MAXVALUE (32767)",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "ALTER TABLE t ALTER COLUMN a TYPE bigint;
+             ALTER TABLE p ALTER COLUMN a TYPE bigint;",
+        ),
+    ]);
+}
