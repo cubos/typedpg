@@ -295,6 +295,8 @@ impl Scope {
             .map(str::to_owned)
             .unwrap_or_else(|| "public".to_owned());
         let relname = table.relname.clone();
+        // A view has no system attributes.
+        let is_view = table.relkind == crate::pg_catalog::RelKind::View;
 
         let columns: Vec<ScopeColumn> = snapshot
             .attributes_of(table_oid)
@@ -311,7 +313,11 @@ impl Scope {
             .collect();
 
         self.sources.push(TableSource {
-            system_columns: system_columns_for(alias),
+            system_columns: if is_view {
+                Vec::new()
+            } else {
+                system_columns_for(alias)
+            },
             source_qn: Some(QualifiedName::new(nspname, relname)),
             kind: SourceKind::Relation,
             ..TableSource::derived(alias, columns)
@@ -485,7 +491,12 @@ impl Scope {
                 // for unqualified references.
                 // Every match counts: one entry exposing the name twice is
                 // as ambiguous as two entries exposing it once.
-                for col in source.visible_columns().filter(|c| c.name == column) {
+                // scanRTEForColumn also finds the relation's system columns.
+                for col in source
+                    .visible_columns()
+                    .chain(source.system_columns.iter())
+                    .filter(|c| c.name == column)
+                {
                     matches.push((source, col));
                 }
             }

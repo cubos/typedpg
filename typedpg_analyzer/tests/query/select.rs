@@ -912,3 +912,39 @@ unterminated /* comment at or near \"/* unterminated\"
 ",
     );
 }
+
+#[test]
+fn unqualified_system_columns_resolve_on_tables_only() {
+    // PG 18 colNameToVar / scanRTEForColumn: a bare system column name
+    // resolves against every relation RTE (ambiguous across two); views
+    // have no system attributes, and neither do subqueries.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE t (a int);
+         CREATE TABLE u (b int);
+         CREATE VIEW v AS SELECT * FROM t;",
+    )
+    .unwrap();
+    for sql in [
+        "SELECT ctid FROM t",
+        "SELECT a FROM t WHERE xmin = '1'",
+        "SELECT u.tableoid, t.cmin FROM t JOIN u ON b = a",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    for (sql, msg) in [
+        (
+            "SELECT ctid FROM t, u",
+            "column reference \"ctid\" is ambiguous",
+        ),
+        ("SELECT v.ctid FROM v", "column v.ctid does not exist"),
+        ("SELECT ctid FROM v", "column \"ctid\" does not exist"),
+        (
+            "SELECT tableoid FROM (SELECT * FROM t) s",
+            "column \"tableoid\" does not exist",
+        ),
+    ] {
+        let err = db.analyze(sql).expect_err(sql);
+        assert!(err.to_string().starts_with(msg), "{sql}\n  got: {err}");
+    }
+}
