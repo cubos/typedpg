@@ -412,7 +412,13 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
     }
     for (i, col) in columns.iter().enumerate() {
         if let Some(deptype) = col.owned_sequence {
-            super::sequences::create_owned_sequence(interp, class_oid, (i + 1) as i16, deptype)?;
+            super::sequences::create_owned_sequence(
+                interp,
+                class_oid,
+                (i + 1) as i16,
+                deptype,
+                &col.identity_options,
+            )?;
         }
     }
     for (i, &parent) in parents.iter().enumerate() {
@@ -614,6 +620,8 @@ struct ParsedColumn {
     /// Implicit sequence the column owns: `Auto` for serial columns,
     /// `Internal` for identity columns.
     owned_sequence: Option<crate::pg_catalog::DepType>,
+    /// The identity's sequence options (`GENERATED ... AS IDENTITY (...)`).
+    identity_options: Vec<pg_query::protobuf::Node>,
     /// The column has a local NOT NULL (explicit, PRIMARY KEY, serial,
     /// identity) — PG 18 records it as a local not-null constraint.
     nn_local: bool,

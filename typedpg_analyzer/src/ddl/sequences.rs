@@ -89,6 +89,7 @@ pub(crate) fn create_owned_sequence(
     relid: PgClassOid,
     attnum: i16,
     deptype: DepType,
+    options: &[pg_query::protobuf::Node],
 ) -> Result<(), DdlError> {
     let Some(class) = interp.pg_class.get(&relid).cloned() else {
         return Err(DdlError::Internal(format!("relation oid {relid} missing")));
@@ -99,17 +100,55 @@ pub(crate) fn create_owned_sequence(
         .find(|a| a.attnum == attnum)
         .map(|a| a.attname.clone())
         .unwrap_or_default();
-    let name = choose_relation_name(interp, class.relnamespace, &class.relname, &colname, "seq");
-    let seq_oid = insert_sequence_relation(interp, class.relnamespace, name)?;
-    // A serial / identity sequence has its column's integer type.
+    // An identity's `SEQUENCE NAME` option names the sequence.
+    let explicit_name = options.iter().find_map(|o| match o.node.as_ref() {
+        Some(node::Node::DefElem(de)) if de.defname == "sequence_name" => {
+            match de.arg.as_deref().and_then(|a| a.node.as_ref()) {
+                Some(node::Node::List(l)) => {
+                    let parts: Vec<&str> = l.items.iter().filter_map(node_string).collect();
+                    match parts.as_slice() {
+                        [schema, name] => Some((Some((*schema).to_owned()), (*name).to_owned())),
+                        [.., name] => Some((None, (*name).to_owned())),
+                        [] => None,
+                    }
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    });
+    // A serial / identity sequence has its column's integer type; its
+    // options are checked like CREATE SEQUENCE's.
     let column_type = interp
         .attributes_of(relid)
         .iter()
         .find(|a| a.attnum == attnum)
         .map_or(oid::INT8, |a| a.atttypid);
-    interp
-        .sequence_params
-        .insert(seq_oid, super::seqparams::SeqParams::defaults(column_type));
+    let sequence_options: Vec<pg_query::protobuf::Node> = options
+        .iter()
+        .filter(|o| {
+            !matches!(o.node.as_ref(), Some(node::Node::DefElem(de))
+                if matches!(de.defname.as_str(), "sequence_name" | "generated"))
+        })
+        .cloned()
+        .collect();
+    let params = super::seqparams::init_column_params(interp, &sequence_options, column_type)?;
+    let (nsoid, name) = match explicit_name {
+        Some((schema, name)) => {
+            let nsoid = match schema {
+                Some(s) => super::util::existing_namespace(interp, &s)?,
+                None => class.relnamespace,
+            };
+            super::util::check_relation_name_free(interp, nsoid, &name)?;
+            (nsoid, name)
+        }
+        None => (
+            class.relnamespace,
+            choose_relation_name(interp, class.relnamespace, &class.relname, &colname, "seq"),
+        ),
+    };
+    let seq_oid = insert_sequence_relation(interp, nsoid, name)?;
+    interp.sequence_params.insert(seq_oid, params);
     record_ownership(interp, seq_oid, relid, attnum, deptype);
     if deptype == DepType::Auto {
         // serial's `DEFAULT nextval('<seq>')` depends on the sequence.

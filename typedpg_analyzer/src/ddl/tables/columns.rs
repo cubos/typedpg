@@ -103,6 +103,7 @@ pub(crate) fn parse_column_def(
     let mut nn_name: Option<String> = None;
     let mut saw_null = false;
     let mut saw_not_null = cd.is_not_null;
+    let mut identity_options = Vec::new();
     for c_node in &cd.constraints {
         if let Some(node::Node::Constraint(c)) = c_node.node.as_ref() {
             match ConstrType::try_from(c.contype) {
@@ -123,6 +124,7 @@ pub(crate) fn parse_column_def(
                 Ok(ConstrType::ConstrIdentity) => {
                     has_default = true;
                     not_null = true;
+                    identity_options.clone_from(&c.options);
                     if identity.is_none() {
                         identity = match c.generated_when.as_str() {
                             // PG `ATTRIBUTE_IDENTITY_ALWAYS` is `'a'`,
@@ -225,6 +227,7 @@ pub(crate) fn parse_column_def(
         } else {
             None
         },
+        identity_options,
         nn_local: not_null,
         nn_name,
         nn_inhcount: 0,
@@ -320,12 +323,42 @@ pub(crate) fn set_identity(
         col.attidentity = Some(new_identity);
         col.atthasdef = true;
     }
+    // ATExecSetIdentity: the other options alter the identity sequence
+    // (AlterSequence's init_params).
+    if let Some(node::Node::List(list)) = def.node.as_ref() {
+        let options: Vec<pg_query::protobuf::Node> = list
+            .items
+            .iter()
+            .filter(|o| {
+                !matches!(o.node.as_ref(), Some(node::Node::DefElem(de)) if de.defname == "generated")
+            })
+            .cloned()
+            .collect();
+        for seq in crate::ddl::sequences::identity_sequences(interp, relid, attnum) {
+            let current = interp.sequence_params.get(&seq).copied();
+            let params = crate::ddl::seqparams::init_params(
+                interp,
+                &options,
+                Some(
+                    current.unwrap_or(crate::ddl::seqparams::SeqParams::defaults(
+                        crate::pg_catalog::oid::INT8,
+                    )),
+                ),
+            )?;
+            interp.sequence_params.insert(seq, params);
+        }
+    }
     if is_add {
+        let options = match def.node.as_ref() {
+            Some(node::Node::Constraint(c)) => c.options.clone(),
+            _ => Vec::new(),
+        };
         crate::ddl::sequences::create_owned_sequence(
             interp,
             relid,
             attnum,
             crate::pg_catalog::DepType::Internal,
+            &options,
         )?;
     }
     Ok(())
@@ -497,7 +530,13 @@ fn add_column_to(
     if !rec.recursing
         && let Some(deptype) = col.owned_sequence
     {
-        crate::ddl::sequences::create_owned_sequence(interp, relid, next_attnum, deptype)?;
+        crate::ddl::sequences::create_owned_sequence(
+            interp,
+            relid,
+            next_attnum,
+            deptype,
+            &col.identity_options,
+        )?;
     }
     if !rec.recursing {
         // The generation expression, now that the column exists.

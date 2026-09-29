@@ -59,7 +59,29 @@ pub(crate) fn init_params(
     options: &[pg_query::protobuf::Node],
     current: Option<SeqParams>,
 ) -> Result<SeqParams, DdlError> {
-    let is_init = current.is_none();
+    match current {
+        Some(current) => apply(interp, options, current, false),
+        None => apply(interp, options, SeqParams::defaults(oid::INT8), true),
+    }
+}
+
+/// init_params for the new sequence of a serial / identity column of type
+/// `typ`; the identity's `SEQUENCE NAME` / `GENERATED` options aren't
+/// sequence parameters.
+pub(crate) fn init_column_params(
+    interp: &PgCatalog,
+    options: &[pg_query::protobuf::Node],
+    typ: PgTypeOid,
+) -> Result<SeqParams, DdlError> {
+    apply(interp, options, SeqParams::defaults(typ), true)
+}
+
+fn apply(
+    interp: &PgCatalog,
+    options: &[pg_query::protobuf::Node],
+    old: SeqParams,
+    is_init: bool,
+) -> Result<SeqParams, DdlError> {
     let mut seen: Vec<&str> = Vec::new();
     let mut as_type = None;
     let mut increment = None;
@@ -100,7 +122,6 @@ pub(crate) fn init_params(
         }
     }
 
-    let old = current.unwrap_or(SeqParams::defaults(oid::INT8));
     let mut p = old;
     if let Some(typ) = as_type {
         if typ != oid::INT2 && typ != oid::INT4 && typ != oid::INT8 {
