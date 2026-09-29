@@ -59,6 +59,18 @@ pub(crate) fn validate(
     // Enums: exact label match (no whitespace trimming, case-sensitive).
     if t.typtype == TypType::Enum {
         if snapshot.enum_labels_of(target).contains(&content) {
+            // check_safe_enum_use (enum.c): a label added by ALTER TYPE ...
+            // ADD VALUE is unusable until its transaction commits.
+            if snapshot
+                .uncommitted_enum_labels
+                .contains(&(target, content.to_owned()))
+            {
+                let name = crate::ddl::util::format_type_for_message(snapshot, target);
+                return Err(format!(
+                    "unsafe use of new value \"{content}\" of enum type {name} (New enum values \
+                     must be committed before they can be used.)"
+                ));
+            }
             return Ok(());
         }
         // PG renders the enum's name search-path aware (`st`, `s2.en2`).

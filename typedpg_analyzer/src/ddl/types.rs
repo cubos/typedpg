@@ -381,6 +381,7 @@ pub fn create_enum(interp: &mut PgCatalog, stmt: &CreateEnumStmt) -> Result<(), 
     }
 
     let oid = PgTypeOid::from_nonzero(interp.alloc_oid()?);
+    interp.enums_created_in_transaction.insert(oid);
     interp.insert_pg_type(PgType {
         oid,
         typname: name.clone(),
@@ -730,6 +731,14 @@ pub fn alter_enum(interp: &mut PgCatalog, stmt: &AlterEnumStmt) -> Result<(), Dd
             return Err(not_a_label(&stmt.old_val));
         };
         label.enumlabel = stmt.new_val.clone();
+        if interp
+            .uncommitted_enum_labels
+            .remove(&(oid, stmt.old_val.clone()))
+        {
+            interp
+                .uncommitted_enum_labels
+                .insert((oid, stmt.new_val.clone()));
+        }
         return Ok(());
     }
 
@@ -782,6 +791,13 @@ pub fn alter_enum(interp: &mut PgCatalog, stmt: &AlterEnumStmt) -> Result<(), Dd
         return Err(not_a_label(&stmt.new_val_neighbor));
     };
 
+    // check_safe_enum_use: until the transaction commits, the new label
+    // is unusable unless the type is new too.
+    if !interp.enums_created_in_transaction.contains(&oid) {
+        interp
+            .uncommitted_enum_labels
+            .insert((oid, stmt.new_val.clone()));
+    }
     let enum_oid = PgEnumOid::from_nonzero(interp.alloc_oid()?);
     interp.insert_pg_enum(PgEnum {
         oid: enum_oid,

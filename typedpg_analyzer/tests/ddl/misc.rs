@@ -3168,3 +3168,39 @@ fn copy_resolves_its_relation_and_options() {
         ),
     ]);
 }
+
+#[test]
+fn new_enum_labels_are_unusable_until_committed() {
+    // PG 18 check_safe_enum_use: a label added by ALTER TYPE ... ADD VALUE
+    // can't be used in the same transaction, unless the type is new too.
+    let setup = "CREATE TYPE mood AS ENUM ('a');";
+    for (stmt, msg) in [
+        (
+            "ALTER TYPE mood ADD VALUE 'b'; SELECT 'b'::mood;",
+            "unsafe use of new value \"b\" of enum type mood",
+        ),
+        (
+            "ALTER TYPE mood ADD VALUE 'b'; CREATE TABLE u (m mood DEFAULT 'b');",
+            "unsafe use of new value \"b\" of enum type mood",
+        ),
+        (
+            "ALTER TYPE mood ADD VALUE 'b'; ALTER TYPE mood RENAME VALUE 'b' TO 'c'; SELECT 'c'::mood;",
+            "unsafe use of new value \"c\" of enum type mood",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "ALTER TYPE mood ADD VALUE 'b'; SELECT 'a'::mood;",
+        ),
+        ("0003.sql", "SELECT 'b'::mood;"),
+        (
+            "0004.sql",
+            "CREATE TYPE mood2 AS ENUM ('x'); ALTER TYPE mood2 ADD VALUE 'y'; SELECT 'y'::mood2;",
+        ),
+    ]);
+}

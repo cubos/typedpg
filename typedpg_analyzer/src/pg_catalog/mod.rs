@@ -262,6 +262,12 @@ pub struct PgCatalog {
     pub(crate) foreign_data: crate::ddl::fdw::ForeignData,
     /// The extension whose scripts are running.
     pub(crate) installing_extension: Option<String>,
+    /// Enum labels added in the current transaction to a type created
+    /// before it: unusable until committed (check_safe_enum_use).
+    pub(crate) uncommitted_enum_labels: std::collections::HashSet<(PgTypeOid, String)>,
+    /// Enum types created in the current transaction (their new labels
+    /// are safe).
+    pub(crate) enums_created_in_transaction: std::collections::HashSet<PgTypeOid>,
     /// `pg_partitioned_table`: strategy and key types.
     pub(crate) partition_specs: HashMap<PgClassOid, crate::ddl::tables::partbound::PartSpec>,
     /// `relpartbound` of each partition.
@@ -531,6 +537,8 @@ impl PgCatalog {
             sequence_params: HashMap::new(),
             foreign_data: Default::default(),
             installing_extension: None,
+            uncommitted_enum_labels: Default::default(),
+            enums_created_in_transaction: Default::default(),
             partition_specs: HashMap::new(),
             partition_bounds: HashMap::new(),
             check_defs: HashMap::new(),

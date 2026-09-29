@@ -73,6 +73,9 @@ impl PgCatalog {
         if self.search_path_guc.local.take().is_some() {
             self.refresh_search_path();
         }
+        // New enum labels are committed.
+        self.uncommitted_enum_labels.clear();
+        self.enums_created_in_transaction.clear();
     }
 
     /// Extension-script / CREATE SCHEMA element scope: `schema` goes in front of the
