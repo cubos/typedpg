@@ -13,8 +13,17 @@ use crate::pg_catalog::PgCatalog;
 /// what PG's parse analysis rejects. Analyzer limitations
 /// (`Unsupported`, internal errors) leave the statement unchecked.
 pub(crate) fn check_statement(interp: &PgCatalog, stmt: &node::Node) -> Result<(), DdlError> {
+    analyze_statement(interp, stmt).map(drop)
+}
+
+/// [`check_statement`], returning the statement's result columns when the
+/// analysis could tell them.
+pub(crate) fn analyze_statement(
+    interp: &PgCatalog,
+    stmt: &node::Node,
+) -> Result<Option<Vec<crate::resolve::RawColumn>>, DdlError> {
     match crate::resolve::analyze_raw_node(interp, stmt, &[]) {
-        Ok(_) => Ok(()),
+        Ok((columns, _)) => Ok(Some(columns)),
         Err(
             AnalyzeError::Unsupported(_)
             | AnalyzeError::UnsupportedJoinType(_)
@@ -22,7 +31,7 @@ pub(crate) fn check_statement(interp: &PgCatalog, stmt: &node::Node) -> Result<(
             | AnalyzeError::Lex(_)
             | AnalyzeError::Serde(_)
             | AnalyzeError::Io(_),
-        ) => Ok(()),
+        ) => Ok(None),
         Err(e) => Err(DdlError::UnsupportedDdl(e.to_string())),
     }
 }

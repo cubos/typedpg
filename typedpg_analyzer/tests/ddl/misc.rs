@@ -1720,6 +1720,93 @@ fn rules_are_validated_and_tracked() {
 }
 
 #[test]
+fn rule_returning_lists_and_the_return_rule_are_validated() {
+    // PG 18 DefineQueryRewrite / checkRuleResultList / RenameRewriteRule,
+    // and a view's `_RETURN` rule.
+    let setup = "CREATE TABLE t (a int);
+                 CREATE TABLE u (a int);
+                 CREATE VIEW v AS SELECT a FROM t;
+                 CREATE RULE r AS ON INSERT TO t DO INSTEAD NOTHING;";
+    for (stmt, msg) in [
+        (
+            "CREATE RULE x AS ON INSERT TO t DO ALSO INSERT INTO u VALUES (new.a) RETURNING a;",
+            "RETURNING lists are not supported in non-INSTEAD rules",
+        ),
+        (
+            "CREATE RULE x AS ON INSERT TO v WHERE new.a > 0
+             DO INSTEAD INSERT INTO t VALUES (new.a) RETURNING a;",
+            "RETURNING lists are not supported in conditional rules",
+        ),
+        (
+            "CREATE RULE x AS ON INSERT TO v DO INSTEAD (
+                 INSERT INTO t VALUES (new.a) RETURNING a;
+                 INSERT INTO u VALUES (new.a) RETURNING a);",
+            "cannot have multiple RETURNING lists in a rule",
+        ),
+        (
+            "CREATE RULE x AS ON INSERT TO v DO INSTEAD INSERT INTO t VALUES (new.a) RETURNING a::text;",
+            "RETURNING list's entry 1 has different type from column \"a\"",
+        ),
+        (
+            "CREATE RULE x AS ON INSERT TO v DO INSTEAD INSERT INTO t VALUES (new.a) RETURNING a, a;",
+            "RETURNING list has too many entries",
+        ),
+        (
+            "CREATE RULE \"_RETURN\" AS ON INSERT TO t DO INSTEAD NOTHING;",
+            "non-view rule for \"t\" must not be named \"_RETURN\"",
+        ),
+        (
+            "CREATE RULE \"_RETURN\" AS ON SELECT TO v DO INSTEAD SELECT a FROM t;",
+            "\"v\" is already a view",
+        ),
+        (
+            "CREATE OR REPLACE RULE \"_RETURN\" AS ON SELECT TO v DO INSTEAD SELECT a::bigint AS a FROM u;",
+            "SELECT rule's target entry 1 has different type from column \"a\"",
+        ),
+        (
+            "CREATE OR REPLACE RULE \"_RETURN\" AS ON SELECT TO v DO INSTEAD SELECT a AS b FROM u;",
+            "SELECT rule's target entry 1 has different column name from column \"a\"",
+        ),
+        (
+            "CREATE OR REPLACE RULE x AS ON SELECT TO v DO INSTEAD SELECT a FROM u;",
+            "view rule for \"v\" must be named \"_RETURN\"",
+        ),
+        (
+            "CREATE OR REPLACE RULE \"_RETURN\" AS ON SELECT TO v DO INSTEAD SELECT a FROM u;
+             DROP TABLE u;",
+            "cannot drop table u because other objects depend on it",
+        ),
+        (
+            "ALTER RULE \"_RETURN\" ON v RENAME TO x;",
+            "renaming an ON SELECT rule is not allowed",
+        ),
+        (
+            "ALTER RULE r ON t RENAME TO \"_RETURN\";",
+            "non-view rule for \"t\" must not be named \"_RETURN\"",
+        ),
+        (
+            "DROP RULE \"_RETURN\" ON v;",
+            "cannot drop rule _RETURN on view v because view v requires it",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "CREATE RULE x AS ON INSERT TO v DO INSTEAD INSERT INTO t VALUES (new.a) RETURNING *;
+             CREATE RULE y AS ON UPDATE TO v DO INSTEAD
+                 (UPDATE t SET a = new.a; UPDATE u SET a = new.a RETURNING a);
+             COMMENT ON RULE \"_RETURN\" ON v IS 'x';
+             CREATE OR REPLACE RULE \"_RETURN\" AS ON SELECT TO v DO INSTEAD SELECT a FROM u;
+             DROP TABLE t CASCADE;",
+        ),
+    ]);
+}
+
+#[test]
 fn alter_owner_and_comment_resolve_their_target() {
     // PG 18 get_object_address / LookupFuncWithArgs / AlterTypeOwner /
     // get_collation_oid / get_trigger_oid / get_relation_policy_oid /

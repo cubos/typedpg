@@ -303,14 +303,7 @@ pub(crate) fn resolve_object(
                     "policy",
                     "table",
                 ),
-                _ => (
-                    interp
-                        .rules
-                        .get(&oid)
-                        .is_some_and(|rs| rs.iter().any(|r| &r.name == sub)),
-                    "rule",
-                    "relation",
-                ),
+                _ => (super::rules::has_rule(interp, oid, sub), "rule", "relation"),
             };
             if !exists {
                 return Err(DdlError::TypeNotFound(format!(
