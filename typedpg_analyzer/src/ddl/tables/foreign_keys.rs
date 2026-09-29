@@ -374,7 +374,7 @@ pub(super) fn add_foreign_key(
     let oid = emit_constraint_with_backing_index(
         interp,
         relid,
-        conname,
+        conname.clone(),
         ConType::ForeignKey,
         fk_attnums,
         Some(target),
@@ -394,7 +394,131 @@ pub(super) fn add_foreign_key(
         };
     }
     interp.fk_details.insert(oid, FkDetails::of(c));
+    // ATAddForeignKeyConstraint: the referenced side first, then the
+    // referencing one.
+    recurse_referenced(interp, oid, &conname)?;
     recurse_referencing(interp, relid, oid)
+}
+
+/// addFkRecurseReferenced: a foreign key referencing a partitioned table
+/// gets one more `pg_constraint` row per referenced partition (and theirs,
+/// recursively) — on the referencing relation, pointing at the partition,
+/// derived from the row pointing at its parent. `base` is the name the
+/// rows are named after.
+fn recurse_referenced(
+    interp: &mut PgCatalog,
+    con: PgConstraintOid,
+    base: &str,
+) -> Result<(), DdlError> {
+    let Some(pkrel) = interp.pg_constraint.get(&con).and_then(|c| c.confrelid) else {
+        return Ok(());
+    };
+    if interp.pg_class.get(&pkrel).map(|c| c.relkind) != Some(RelKind::Partitioned) {
+        return Ok(());
+    }
+    for part in super::partbound::partition_desc_order(interp, pkrel) {
+        add_referenced_partition_row(interp, con, part, base)?;
+    }
+    Ok(())
+}
+
+/// addFkConstraint (referenced side) for partition `part` of the table
+/// `parent_con` references, then its partitions.
+fn add_referenced_partition_row(
+    interp: &mut PgCatalog,
+    parent_con: PgConstraintOid,
+    part: PgClassOid,
+    base: &str,
+) -> Result<(), DdlError> {
+    let Some(parent) = interp.pg_constraint.get(&parent_con).cloned() else {
+        return Ok(());
+    };
+    let Some(pkrel) = parent.confrelid else {
+        return Ok(());
+    };
+    // The referenced columns, by name in the partition.
+    let pk_attrs = interp.attributes_of(pkrel).to_vec();
+    let confkey: Vec<i16> = parent
+        .confkey
+        .iter()
+        .filter_map(|an| pk_attrs.iter().find(|a| a.attnum == *an))
+        .filter_map(|a| interp.attribute_by_name(part, &a.attname).map(|p| p.attnum))
+        .collect();
+    let name = derived_fk_name(interp, parent.conrelid, base);
+    let oid = PgConstraintOid::from_nonzero(interp.alloc_oid()?);
+    interp.insert_pg_constraint(PgConstraint {
+        oid,
+        conname: name,
+        conrelid: parent.conrelid,
+        contype: ConType::ForeignKey,
+        conkey: parent.conkey.clone(),
+        confrelid: Some(part),
+        confkey,
+        conislocal: false,
+        coninhcount: 1,
+        conenforced: parent.conenforced,
+        convalidated: parent.convalidated,
+        connoinherit: false,
+        conperiod: parent.conperiod,
+    });
+    if let Some(mut details) = interp.fk_details.get(&parent_con).cloned() {
+        details.parent = Some(parent_con);
+        interp.fk_details.insert(oid, details);
+    }
+    recurse_referenced(interp, oid, base)
+}
+
+/// addFkConstraint's name for a derived row: `base` unless the relation
+/// already has a constraint so named, else ChooseConstraintName(base, NULL,
+/// "") — `base_1`, `base_2`, … the first no constraint in the namespace
+/// has.
+fn derived_fk_name(interp: &PgCatalog, relid: PgClassOid, base: &str) -> String {
+    let on_rel = interp
+        .pg_constraint
+        .values()
+        .any(|c| c.conrelid == relid && c.conname == base);
+    if !on_rel {
+        return base.to_owned();
+    }
+    let nsoid = interp.pg_class.get(&relid).map(|c| c.relnamespace);
+    let taken = |name: &str| {
+        interp.pg_constraint.values().any(|c| {
+            c.conname == name && interp.pg_class.get(&c.conrelid).map(|r| r.relnamespace) == nsoid
+        })
+    };
+    (1..)
+        .map(|pass| crate::ddl::util::make_object_name(base, "", &pass.to_string()))
+        .find(|name| !taken(name))
+        .unwrap_or_else(|| base.to_owned())
+}
+
+/// CloneFkReferenced: a new partition of a referenced partitioned table
+/// gets a derived row for every foreign key referencing that table (not
+/// for one whose parent row does too — it arrives through the parent).
+fn clone_referenced_fks(
+    interp: &mut PgCatalog,
+    parent: PgClassOid,
+    part: PgClassOid,
+) -> Result<(), DdlError> {
+    let mut fks: Vec<PgConstraint> = interp
+        .pg_constraint
+        .values()
+        .filter(|c| c.contype == ConType::ForeignKey && c.confrelid == Some(parent))
+        .cloned()
+        .collect();
+    fks.sort_by_key(|c| c.oid);
+    let oids: Vec<PgConstraintOid> = fks.iter().map(|c| c.oid).collect();
+    for fk in fks {
+        let parent_cloned = interp
+            .fk_details
+            .get(&fk.oid)
+            .and_then(|d| d.parent)
+            .is_some_and(|p| oids.contains(&p));
+        if !parent_cloned {
+            add_referenced_partition_row(interp, fk.oid, part, &fk.conname)?;
+        }
+    }
+    Ok(())
 }
 
 /// What `pg_constraint` keeps of a foreign key beyond [`PgConstraint`]:
@@ -457,6 +581,16 @@ pub(crate) fn fk_clones(interp: &PgCatalog, con: PgConstraintOid) -> Vec<PgConst
 pub(crate) fn fk_parent(interp: &PgCatalog, con: PgConstraintOid) -> Option<PgConstraint> {
     let parent = interp.fk_details.get(&con)?.parent?;
     interp.pg_constraint.get(&parent).cloned()
+}
+
+/// The topmost constraint `con` derives from (following `conparentid`),
+/// if it derives from any.
+pub(crate) fn fk_root(interp: &PgCatalog, con: PgConstraintOid) -> Option<PgConstraint> {
+    let mut root = fk_parent(interp, con)?;
+    while let Some(parent) = fk_parent(interp, root.oid) {
+        root = parent;
+    }
+    Some(root)
 }
 
 /// addFkRecurseReferencing: a foreign key of a partitioned table reaches
@@ -604,6 +738,7 @@ pub(super) fn clone_parent_fks(
         .cloned()
         .collect();
     fks.sort_by_key(|c| c.oid);
+    let oids: Vec<PgConstraintOid> = fks.iter().map(|c| c.oid).collect();
     for fk in &fks {
         if fk.confrelid == Some(part) {
             return Err(DdlError::UnsupportedDdl(format!(
@@ -614,15 +749,37 @@ pub(super) fn clone_parent_fks(
             )));
         }
     }
+    // CloneFkReferencing: not a constraint whose parent is cloned too (the
+    // rows derived for referenced partitions).
     for fk in fks {
-        attach_or_clone(interp, part, fk.oid)?;
+        let parent_cloned = interp
+            .fk_details
+            .get(&fk.oid)
+            .and_then(|d| d.parent)
+            .is_some_and(|p| oids.contains(&p));
+        if !parent_cloned {
+            attach_or_clone(interp, part, fk.oid)?;
+        }
     }
-    Ok(())
+    clone_referenced_fks(interp, parent, part)
 }
 
 /// DetachPartitionFinalize: the partition's inherited foreign keys become
-/// its own.
+/// its own, and the rows derived for it as a referenced partition go (with
+/// those derived from them).
 pub(super) fn detach_fks(interp: &mut PgCatalog, parent: PgClassOid, part: PgClassOid) {
+    let referenced: Vec<PgConstraintOid> = interp
+        .pg_constraint
+        .values()
+        .filter(|c| c.contype == ConType::ForeignKey && c.confrelid == Some(part))
+        .filter(|c| fk_parent(interp, c.oid).is_some_and(|p| p.confrelid == Some(parent)))
+        .map(|c| c.oid)
+        .collect();
+    for oid in referenced {
+        drop_fk_clones(interp, oid);
+        interp.pg_constraint.remove(&oid);
+        interp.fk_details.remove(&oid);
+    }
     let inherited: Vec<PgConstraintOid> = interp
         .pg_constraint
         .values()

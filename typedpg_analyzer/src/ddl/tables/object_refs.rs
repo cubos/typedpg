@@ -194,9 +194,10 @@ pub(super) fn alter_constraint(
             alter.conname
         )));
     }
-    // A partition's clone of a partitioned table's foreign key is altered
-    // through the parent.
-    if let Some(parent) = foreign_keys::fk_parent(interp, con.oid) {
+    // A partition's clone of a partitioned table's foreign key, or a row
+    // derived for a referenced partition, is altered through the topmost
+    // constraint it derives from.
+    if let Some(parent) = foreign_keys::fk_root(interp, con.oid) {
         return Err(DdlError::Parse(format!(
             "cannot alter constraint \"{}\" on relation \"{relname}\" (Constraint \"{}\" is \
              derived from constraint \"{}\" of relation \"{}\". You may alter the constraint it \

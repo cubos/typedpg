@@ -1003,3 +1003,145 @@ fn foreign_keys_of_partitioned_tables_reach_their_partitions() {
         "{err}"
     );
 }
+
+#[test]
+fn foreign_keys_referencing_partitioned_tables_derive_one_row_per_partition() {
+    // addFkRecurseReferenced / CloneFkReferenced (PG 18): the referencing
+    // table holds one more foreign key row per referenced partition, named
+    // by ChooseConstraintName(<fk>, NULL, "") — the first `<fk>_N` free in
+    // the schema — derived from the row for the partition's parent.
+    use typedpg_analyzer::ConType;
+    let fks = |db: &PgCatalog, table: &str| -> Vec<(String, String)> {
+        db.constraints_of_table(table)
+            .into_iter()
+            .filter(|c| c.contype == ConType::ForeignKey)
+            .map(|c| {
+                let target = c.confrelid.and_then(|r| db.pg_class().get(&r).cloned());
+                (c.conname, target.map(|t| t.relname).unwrap_or_default())
+            })
+            .collect()
+    };
+    let owned = |v: &[(&str, &str)]| -> Vec<(String, String)> {
+        v.iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect()
+    };
+    let setup = "CREATE TABLE p (id int PRIMARY KEY) PARTITION BY RANGE (id);
+                 CREATE TABLE p2 PARTITION OF p FOR VALUES FROM (10) TO (20) PARTITION BY RANGE (id);
+                 CREATE TABLE p1 PARTITION OF p FOR VALUES FROM (0) TO (10);
+                 CREATE TABLE p21 PARTITION OF p2 FOR VALUES FROM (10) TO (15);
+                 CREATE TABLE other (x int CONSTRAINT r_pid_fkey_1 CHECK (x > 0));
+                 CREATE TABLE r (pid int REFERENCES p);";
+    let mut db = build_db(&[("0001.sql", setup)]);
+    assert_eq!(
+        fks(&db, "r"),
+        owned(&[
+            ("r_pid_fkey", "p"),
+            ("r_pid_fkey_2", "p1"),
+            ("r_pid_fkey_3", "p2"),
+            ("r_pid_fkey_4", "p21"),
+        ])
+    );
+    for (stmt, msg) in [
+        (
+            "ALTER TABLE r ALTER CONSTRAINT r_pid_fkey_2 NOT DEFERRABLE;",
+            "cannot alter constraint \"r_pid_fkey_2\" on relation \"r\" (Constraint \"r_pid_fkey_2\" is derived from constraint \"r_pid_fkey\" of relation \"r\".",
+        ),
+        (
+            "ALTER TABLE r ALTER CONSTRAINT r_pid_fkey_4 ENFORCED;",
+            "cannot alter constraint \"r_pid_fkey_4\" on relation \"r\" (Constraint \"r_pid_fkey_4\" is derived from constraint \"r_pid_fkey\" of relation \"r\".",
+        ),
+        (
+            "ALTER TABLE r DROP CONSTRAINT r_pid_fkey_2;",
+            "cannot drop inherited constraint \"r_pid_fkey_2\" of relation \"r\"",
+        ),
+        (
+            "ALTER TABLE r DROP CONSTRAINT IF EXISTS r_pid_fkey_2;",
+            "cannot drop inherited constraint \"r_pid_fkey_2\" of relation \"r\"",
+        ),
+        (
+            "TRUNCATE p1;",
+            "cannot truncate a table referenced in a foreign key constraint",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    db.apply_sql(
+        "ALTER TABLE r VALIDATE CONSTRAINT r_pid_fkey_2;
+         ALTER TABLE r RENAME CONSTRAINT r_pid_fkey_3 TO renamed;
+         COMMENT ON CONSTRAINT r_pid_fkey_2 ON r IS 'x';
+         ALTER TABLE p DETACH PARTITION p1;",
+    )
+    .unwrap();
+    assert_eq!(
+        fks(&db, "r"),
+        owned(&[
+            ("r_pid_fkey", "p"),
+            ("renamed", "p2"),
+            ("r_pid_fkey_4", "p21")
+        ])
+    );
+    // CloneFkReferenced names a new partition's row after the row for its
+    // parent; referencing partitions get no rows of their own.
+    db.apply_sql(
+        "ALTER TABLE p ATTACH PARTITION p1 FOR VALUES FROM (0) TO (10);
+         CREATE TABLE p22 (id int PRIMARY KEY);
+         ALTER TABLE p2 ATTACH PARTITION p22 FOR VALUES FROM (15) TO (20);
+         CREATE TABLE rr (pid int REFERENCES p) PARTITION BY RANGE (pid);
+         CREATE TABLE rr1 PARTITION OF rr FOR VALUES FROM (0) TO (10);",
+    )
+    .unwrap();
+    assert_eq!(
+        fks(&db, "r"),
+        owned(&[
+            ("r_pid_fkey", "p"),
+            ("renamed", "p2"),
+            ("r_pid_fkey_4", "p21"),
+            ("r_pid_fkey_2", "p1"),
+            ("renamed_1", "p22"),
+        ])
+    );
+    assert_eq!(
+        fks(&db, "rr"),
+        owned(&[
+            ("rr_pid_fkey", "p"),
+            ("rr_pid_fkey_1", "p1"),
+            ("rr_pid_fkey_2", "p2"),
+            ("rr_pid_fkey_3", "p21"),
+            ("rr_pid_fkey_4", "p22"),
+        ])
+    );
+    assert_eq!(fks(&db, "rr1"), owned(&[("rr_pid_fkey", "p")]));
+    db.apply_sql(
+        "ALTER TABLE p DETACH PARTITION p2;
+         ALTER TABLE r ALTER CONSTRAINT r_pid_fkey DEFERRABLE;",
+    )
+    .unwrap();
+    assert_eq!(
+        fks(&db, "r"),
+        owned(&[("r_pid_fkey", "p"), ("r_pid_fkey_2", "p1")])
+    );
+    db.apply_sql("ALTER TABLE r DROP CONSTRAINT r_pid_fkey;")
+        .unwrap();
+    assert_eq!(fks(&db, "r"), owned(&[]));
+
+    // ATExecAlterConstraint names the topmost ancestor, on the referencing
+    // side too.
+    let err = try_apply(&[(
+        "0001.sql",
+        "CREATE TABLE rp (a int PRIMARY KEY);
+         CREATE TABLE fp (a int REFERENCES rp) PARTITION BY LIST (a);
+         CREATE TABLE fp1 PARTITION OF fp FOR VALUES IN (1, 2) PARTITION BY LIST (a);
+         CREATE TABLE fp11 PARTITION OF fp1 FOR VALUES IN (1);
+         ALTER TABLE fp11 ALTER CONSTRAINT fp_a_fkey NOT ENFORCED;",
+    )])
+    .unwrap_err();
+    assert!(
+        err.to_string().starts_with(
+            "cannot alter constraint \"fp_a_fkey\" on relation \"fp11\" (Constraint \
+             \"fp_a_fkey\" is derived from constraint \"fp_a_fkey\" of relation \"fp\"."
+        ),
+        "{err}"
+    );
+}

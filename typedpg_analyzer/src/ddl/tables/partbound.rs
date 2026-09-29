@@ -563,3 +563,52 @@ fn check_new_bound(
     }
     Ok(())
 }
+
+/// The partitions of `parent` in PartitionDesc order (partition_bounds_create):
+/// range partitions by lower bound, list partitions by their smallest
+/// non-NULL value (a NULL-only one after those), hash partitions by
+/// (modulus, remainder), the default partition last. Bounds the analyzer
+/// can't order (text values, whose order is the collation's) come after
+/// the ordered ones, in creation order.
+pub(crate) fn partition_desc_order(interp: &PgCatalog, parent: PgClassOid) -> Vec<PgClassOid> {
+    // A total order: (group, orderable key, creation order).
+    let key = |p: &PgClassOid| -> (u8, Option<Vec<(u8, Datum)>>, PgClassOid) {
+        let orderable = |d: &Datum| matches!(d, Datum::Int(_) | Datum::Stamp(_));
+        match interp.partition_bounds.get(p) {
+            Some(Bound::Default) => (3, None, *p),
+            Some(Bound::List(values)) if values.iter().all(Option::is_none) => (2, None, *p),
+            Some(Bound::List(values)) => {
+                let min = values.iter().flatten().filter(|d| orderable(d)).min();
+                let all = values.iter().flatten().all(orderable);
+                (0, min.filter(|_| all).map(|d| vec![(1, d.clone())]), *p)
+            }
+            Some(Bound::Range { lower, .. }) => {
+                let parts: Option<Vec<(u8, Datum)>> = lower
+                    .iter()
+                    .map(|d| match d {
+                        RangeDatum::MinValue => Some((0, Datum::Opaque)),
+                        RangeDatum::Value(v) if orderable(v) => Some((1, v.clone())),
+                        RangeDatum::Value(_) => None,
+                        RangeDatum::MaxValue => Some((2, Datum::Opaque)),
+                    })
+                    .collect();
+                (0, parts, *p)
+            }
+            Some(Bound::Hash { modulus, remainder }) => (
+                0,
+                Some(vec![
+                    (1, Datum::Int(i128::from(*modulus))),
+                    (1, Datum::Int(i128::from(*remainder))),
+                ]),
+                *p,
+            ),
+            None => (1, None, *p),
+        }
+    };
+    let mut parts = inherit::children_of(interp, parent);
+    parts.sort_by_key(|p| {
+        let (group, k, oid) = key(p);
+        (group, k.is_none(), k, oid)
+    });
+    parts
+}
