@@ -393,23 +393,20 @@ fn analyze_insert_values(
                 && tc.attgenerated.is_some()
                 && !is_set_to_default(val)
             {
-                return Err(AnalyzeError::Invalid(format!(
-                    "cannot insert a non-DEFAULT value into column \"{}\" \
-                     (generated column on `{}`)",
-                    tc.attname, tgt.relname,
-                )));
+                return Err(
+                    crate::pgmsg::insert_non_default_into_generated(&tc.attname, false)
+                        .finalize_implicit(),
+                );
             }
             if let Some(tc) = target_col
                 && tc.attidentity == Some(AttIdentity::Always)
                 && !is_set_to_default(val)
                 && !tgt.overriding
             {
-                return Err(AnalyzeError::Invalid(format!(
-                    "cannot insert a non-DEFAULT value into column \"{}\" \
-                     (identity column on `{}` defined as GENERATED ALWAYS \
-                     — hint: use OVERRIDING SYSTEM VALUE to override)",
-                    tc.attname, tgt.relname,
-                )));
+                return Err(
+                    crate::pgmsg::insert_non_default_into_generated(&tc.attname, true)
+                        .finalize_implicit(),
+                );
             }
             let goal = match (target_col, &target) {
                 (Some(tc), Some(t)) => {
@@ -500,19 +497,16 @@ fn analyze_insert_select(
             continue;
         };
         if tc.attidentity == Some(AttIdentity::Always) && !tgt.overriding {
-            return Err(AnalyzeError::Invalid(format!(
-                "cannot insert a non-DEFAULT value into column \"{}\" \
-                 (identity column on `{}` defined as GENERATED ALWAYS \
-                 — hint: use OVERRIDING SYSTEM VALUE to override)",
-                tc.attname, tgt.relname,
-            )));
+            return Err(
+                crate::pgmsg::insert_non_default_into_generated(&tc.attname, true)
+                    .finalize_implicit(),
+            );
         }
         if tc.attgenerated.is_some() {
-            return Err(AnalyzeError::Invalid(format!(
-                "cannot insert a non-DEFAULT value into column \"{}\" \
-                 (generated column on `{}`)",
-                tc.attname, tgt.relname,
-            )));
+            return Err(
+                crate::pgmsg::insert_non_default_into_generated(&tc.attname, false)
+                    .finalize_implicit(),
+            );
         }
     }
     // Each SELECT output column must be assignment-coercible to its target

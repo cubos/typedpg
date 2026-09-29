@@ -382,18 +382,16 @@ fn merge_when_insert(
                 return Err(err);
             }
             if tc.attgenerated.is_some() && !is_set_to_default(val) {
-                return Err(AnalyzeError::Invalid(format!(
-                    "cannot insert a non-DEFAULT value into column \"{}\" \
-                     (generated column on `{}`)",
-                    tc.attname, table_relname,
-                )));
+                return Err(
+                    crate::pgmsg::insert_non_default_into_generated(&tc.attname, false)
+                        .finalize_implicit(),
+                );
             }
             if tc.attidentity == Some(AttIdentity::Always) && !is_set_to_default(val) {
-                return Err(AnalyzeError::Invalid(format!(
-                    "cannot insert a non-DEFAULT value into column \"{}\" \
-                     (identity column on `{}` defined as GENERATED ALWAYS)",
-                    tc.attname, table_relname,
-                )));
+                return Err(
+                    crate::pgmsg::insert_non_default_into_generated(&tc.attname, true)
+                        .finalize_implicit(),
+                );
             }
         }
         let goal = target_col

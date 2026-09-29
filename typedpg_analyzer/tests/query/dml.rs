@@ -782,8 +782,8 @@ fn insert_into_generated_always_as_identity_should_error() {
     let db = setup();
     assert_analyze_err!(
         db.analyze("INSERT INTO users (id, name, email) VALUES ($p1, $p2, $p3)"),
-        AnalyzeError::Invalid(_),
-        "cannot insert a non-DEFAULT value into column \"id\" (identity column on `users` defined as GENERATED ALWAYS — hint: use OVERRIDING SYSTEM VALUE to override)",
+        AnalyzeError::GeneratedAlways(_),
+        "cannot insert a non-DEFAULT value into column \"id\" (Column \"id\" is an identity column defined as GENERATED ALWAYS.)\n  help: Use OVERRIDING SYSTEM VALUE to override.\n",
     );
 }
 
@@ -873,8 +873,8 @@ fn insert_select_into_generated_always_is_rejected() {
     .unwrap();
     assert_analyze_err!(
         db.analyze("INSERT INTO dst (id, name) SELECT n, 'x' FROM src"),
-        AnalyzeError::Invalid(_),
-        "cannot insert a non-DEFAULT value into column \"id\" (identity column on `dst` defined as GENERATED ALWAYS — hint: use OVERRIDING SYSTEM VALUE to override)",
+        AnalyzeError::GeneratedAlways(_),
+        "cannot insert a non-DEFAULT value into column \"id\" (Column \"id\" is an identity column defined as GENERATED ALWAYS.)\n  help: Use OVERRIDING SYSTEM VALUE to override.\n",
     );
 }
 
@@ -903,8 +903,8 @@ fn update_set_generated_always_to_literal_is_rejected() {
     let db = setup();
     assert_analyze_err!(
         db.analyze("UPDATE users SET id = $p1 WHERE id = $p2"),
-        AnalyzeError::Invalid(_),
-        "column \"id\" can only be updated to DEFAULT (identity column on `users` defined as GENERATED ALWAYS)",
+        AnalyzeError::GeneratedAlways(_),
+        "column \"id\" can only be updated to DEFAULT (Column \"id\" is an identity column defined as GENERATED ALWAYS.)",
     );
 }
 
@@ -951,8 +951,8 @@ fn alter_table_add_identity_then_insert_is_rejected() {
     .unwrap();
     assert_analyze_err!(
         db.analyze("INSERT INTO t (id, name) VALUES ($p1, $p2)"),
-        AnalyzeError::Invalid(_),
-        "cannot insert a non-DEFAULT value into column \"id\" (identity column on `t` defined as GENERATED ALWAYS — hint: use OVERRIDING SYSTEM VALUE to override)",
+        AnalyzeError::GeneratedAlways(_),
+        "cannot insert a non-DEFAULT value into column \"id\" (Column \"id\" is an identity column defined as GENERATED ALWAYS.)\n  help: Use OVERRIDING SYSTEM VALUE to override.\n",
     );
 }
 
@@ -991,8 +991,8 @@ fn alter_table_set_identity_changes_kind() {
     .unwrap();
     assert_analyze_err!(
         db.analyze("INSERT INTO t (id, name) VALUES ($p1, $p2)"),
-        AnalyzeError::Invalid(_),
-        "cannot insert a non-DEFAULT value into column \"id\" (identity column on `t` defined as GENERATED ALWAYS — hint: use OVERRIDING SYSTEM VALUE to override)",
+        AnalyzeError::GeneratedAlways(_),
+        "cannot insert a non-DEFAULT value into column \"id\" (Column \"id\" is an identity column defined as GENERATED ALWAYS.)\n  help: Use OVERRIDING SYSTEM VALUE to override.\n",
     );
 }
 
@@ -1014,8 +1014,8 @@ fn merge_insert_into_generated_always_is_rejected() {
             "MERGE INTO dst d USING src s ON d.id = s.n \
              WHEN NOT MATCHED THEN INSERT (id, name) VALUES (s.n, s.label)"
         ),
-        AnalyzeError::Invalid(_),
-        "cannot insert a non-DEFAULT value into column \"id\" (identity column on `dst` defined as GENERATED ALWAYS)",
+        AnalyzeError::GeneratedAlways(_),
+        "cannot insert a non-DEFAULT value into column \"id\" (Column \"id\" is an identity column defined as GENERATED ALWAYS.)\n  help: Use OVERRIDING SYSTEM VALUE to override.\n",
     );
 }
 
@@ -1038,8 +1038,8 @@ fn merge_update_generated_always_is_rejected() {
             "MERGE INTO dst d USING src s ON d.id = s.n \
              WHEN MATCHED THEN UPDATE SET id = s.n"
         ),
-        AnalyzeError::Invalid(_),
-        "column \"id\" can only be updated to DEFAULT (identity column on `dst` defined as GENERATED ALWAYS)",
+        AnalyzeError::GeneratedAlways(_),
+        "column \"id\" can only be updated to DEFAULT (Column \"id\" is an identity column defined as GENERATED ALWAYS.)",
     );
 }
 
@@ -1053,8 +1053,8 @@ fn on_conflict_do_update_set_generated_always_is_rejected() {
             "INSERT INTO users (name, email) VALUES ($p1, $p2) \
              ON CONFLICT (email) DO UPDATE SET id = 99"
         ),
-        AnalyzeError::Invalid(_),
-        "column \"id\" can only be updated to DEFAULT (identity column on `users` defined as GENERATED ALWAYS)",
+        AnalyzeError::GeneratedAlways(_),
+        "column \"id\" can only be updated to DEFAULT (Column \"id\" is an identity column defined as GENERATED ALWAYS.)",
     );
 }
 

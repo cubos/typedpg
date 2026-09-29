@@ -358,7 +358,7 @@ pub(crate) fn analyze_set_clause(
                 {
                     return Err(err);
                 }
-                check_update_generated(tc, is_default, table_relname)?;
+                check_update_generated(tc, is_default)?;
                 let goal = TypeGoal::assignment(target.type_oid).with_source_column(&tc.attname);
                 // Attach the target column's reference span so a
                 // TypeMismatch surfaces a secondary label at the `col =`
@@ -378,7 +378,7 @@ pub(crate) fn analyze_set_clause(
                 }
             }
             SetValue::SubqueryColumn(col) => {
-                check_update_generated(tc, false, table_relname)?;
+                check_update_generated(tc, false)?;
                 if col.type_oid != target.type_oid
                     && !crate::coerce::can_coerce(
                         col.type_oid,
@@ -417,21 +417,16 @@ pub(crate) fn analyze_set_clause(
 fn check_update_generated(
     tc: &crate::pg_catalog::PgAttribute,
     is_default: bool,
-    table_relname: &str,
 ) -> Result<(), AnalyzeError> {
     if tc.attgenerated.is_some() && !is_default {
-        return Err(AnalyzeError::Invalid(format!(
-            "column \"{}\" can only be updated to DEFAULT \
-             (generated column on `{}`)",
-            tc.attname, table_relname,
-        )));
+        return Err(
+            crate::pgmsg::update_generated_to_non_default(&tc.attname, false).finalize_implicit(),
+        );
     }
     if tc.attidentity == Some(AttIdentity::Always) && !is_default {
-        return Err(AnalyzeError::Invalid(format!(
-            "column \"{}\" can only be updated to DEFAULT \
-             (identity column on `{}` defined as GENERATED ALWAYS)",
-            tc.attname, table_relname,
-        )));
+        return Err(
+            crate::pgmsg::update_generated_to_non_default(&tc.attname, true).finalize_implicit(),
+        );
     }
     Ok(())
 }

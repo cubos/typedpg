@@ -492,8 +492,8 @@ fn insert_into_generated_column_rejected() {
             "INSERT INTO invoices (id, net, tax_rate, gross) \
              VALUES ($p1, $p2, $p3, $p4)",
         ),
-        AnalyzeError::Invalid(_),
-        "cannot insert a non-DEFAULT value into column \"gross\" (generated column on `invoices`)",
+        AnalyzeError::GeneratedAlways(_),
+        "cannot insert a non-DEFAULT value into column \"gross\" (Column \"gross\" is a generated column.)",
     );
 }
 
@@ -503,8 +503,8 @@ fn update_generated_column_rejected() {
     // PG: `column "gross" can only be updated to DEFAULT`.
     assert_analyze_err!(
         db.analyze("UPDATE invoices SET gross = $p1 WHERE id = $p2"),
-        AnalyzeError::Invalid(_),
-        "column \"gross\" can only be updated to DEFAULT (generated column on `invoices`)",
+        AnalyzeError::GeneratedAlways(_),
+        "column \"gross\" can only be updated to DEFAULT (Column \"gross\" is a generated column.)",
     );
 }
 
@@ -517,8 +517,8 @@ fn insert_into_generated_column_with_literal_rejected() {
             "INSERT INTO invoices (id, net, tax_rate, gross) \
              VALUES ($p1, $p2, $p3, 42.0)",
         ),
-        AnalyzeError::Invalid(_),
-        "cannot insert a non-DEFAULT value into column \"gross\" (generated column on `invoices`)",
+        AnalyzeError::GeneratedAlways(_),
+        "cannot insert a non-DEFAULT value into column \"gross\" (Column \"gross\" is a generated column.)",
     );
 }
 
