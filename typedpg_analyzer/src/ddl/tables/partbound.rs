@@ -5,9 +5,10 @@
 //! moduli dividing each other).
 //!
 //! Values are compared only when their order is known without a PG
-//! runtime: integer keys, and date / timestamp keys written in ISO form
-//! (for LIST also any string key, by equality). Other values never
-//! overlap as far as the analyzer can tell.
+//! runtime: integer keys, date / timestamp keys written in ISO form, and
+//! string keys under a collation that orders by code point (for LIST also
+//! any string key, by equality). Other values never overlap as far as the
+//! analyzer can tell.
 
 use super::*;
 use typedpg_pg_query::protobuf::PartitionBoundSpec;
@@ -16,8 +17,61 @@ use typedpg_pg_query::protobuf::PartitionBoundSpec;
 #[derive(Clone, Debug)]
 pub(crate) struct PartSpec {
     strategy: Strategy,
-    /// Type and name (column name, or `None` for an expression) of each key.
-    keys: Vec<(PgTypeOid, Option<String>)>,
+    keys: Vec<PartKey>,
+}
+
+/// One partition key column or expression.
+#[derive(Clone, Debug)]
+struct PartKey {
+    type_oid: PgTypeOid,
+    /// The column name, or `None` for an expression.
+    name: Option<String>,
+    /// `partcollation`.
+    collation: Option<crate::oid::PgCollationOid>,
+    /// The key's collation orders strings by code point, so string values
+    /// order without a server.
+    code_point_order: bool,
+}
+
+/// The collation a `COLLATE` clause names.
+pub(crate) fn collation_clause(
+    interp: &PgCatalog,
+    names: &[typedpg_pg_query::protobuf::Node],
+) -> Option<crate::oid::PgCollationOid> {
+    let names: Vec<&str> = names
+        .iter()
+        .filter_map(super::super::util::node_string)
+        .collect();
+    match names.as_slice() {
+        [schema, name] => interp.resolve_collation(Some(schema), name),
+        [name] => interp.resolve_collation(None, name),
+        _ => None,
+    }
+    .map(|c| c.oid)
+}
+
+/// The partition key's collations (`partcollation`), in key order.
+pub(crate) fn partition_key_collations(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+) -> Vec<Option<crate::oid::PgCollationOid>> {
+    interp
+        .partition_specs
+        .get(&relid)
+        .map(|s| s.keys.iter().map(|k| k.collation).collect())
+        .unwrap_or_default()
+}
+
+/// The collations whose order is the strings' code point order: C / POSIX
+/// (byte order, which for UTF-8 is code point order), `ucs_basic`, and the
+/// builtin provider's `pg_c_utf8` / `pg_unicode_fast`.
+fn orders_by_code_point(interp: &PgCatalog, collation: crate::oid::PgCollationOid) -> bool {
+    interp.pg_collation.get(&collation).is_some_and(|c| {
+        matches!(
+            c.collname.as_str(),
+            "C" | "POSIX" | "ucs_basic" | "pg_c_utf8" | "pg_unicode_fast"
+        ) && interp.namespace_name(c.collnamespace) == Some("pg_catalog")
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,6 +87,8 @@ pub(crate) enum Datum {
     Int(i128),
     /// A normalized ISO date / timestamp: its text order is its time order.
     Stamp(String),
+    /// A string key value under a collation that orders by code point.
+    CodePoints(String),
     /// A string key value, compared by equality only (its order depends
     /// on the collation).
     Text(String),
@@ -81,17 +137,30 @@ pub(super) fn record_partition_spec(
         let Some(node::Node::PartitionElem(pe)) = elem.node.as_ref() else {
             continue;
         };
+        // The key's collation: its COLLATE clause, else the column's.
+        let explicit = (!pe.collation.is_empty()).then(|| collation_clause(interp, &pe.collation));
         if !pe.name.is_empty() {
-            let typ = interp
-                .attribute_by_name(relid, &pe.name)
-                .map_or(crate::pg_catalog::oid::UNKNOWN, |a| a.atttypid);
-            keys.push((typ, Some(pe.name.clone())));
+            let attr = interp.attribute_by_name(relid, &pe.name);
+            let collation = explicit.unwrap_or_else(|| attr.and_then(|a| a.attcollation));
+            keys.push(PartKey {
+                type_oid: attr.map_or(crate::pg_catalog::oid::UNKNOWN, |a| a.atttypid),
+                name: Some(pe.name.clone()),
+                collation,
+                code_point_order: collation.is_some_and(|c| orders_by_code_point(interp, c)),
+            });
         } else if let Some(expr) = pe.expr.as_deref() {
             let typ = match crate::ddl::volatile::infer_over_relation(interp, relid, expr, None) {
                 Some(Ok(t)) => t.type_oid,
                 _ => crate::pg_catalog::oid::UNKNOWN,
             };
-            keys.push((typ, None));
+            keys.push(PartKey {
+                type_oid: typ,
+                name: None,
+                collation: explicit.flatten(),
+                code_point_order: explicit
+                    .flatten()
+                    .is_some_and(|c| orders_by_code_point(interp, c)),
+            });
         }
     }
     interp
@@ -165,11 +234,12 @@ fn transform_bound(
             if spec.strategy != "l" {
                 return Err(invalid("list"));
             }
-            let key = pspec
-                .keys
-                .first()
-                .cloned()
-                .unwrap_or((crate::pg_catalog::oid::UNKNOWN, None));
+            let key = pspec.keys.first().cloned().unwrap_or(PartKey {
+                type_oid: crate::pg_catalog::oid::UNKNOWN,
+                name: None,
+                collation: None,
+                code_point_order: false,
+            });
             let mut values: Vec<Option<Datum>> = Vec::new();
             for v in &spec.listdatums {
                 let d = bound_value(interp, v, &key)?;
@@ -205,7 +275,7 @@ fn transform_bound(
 fn range_datums(
     interp: &PgCatalog,
     values: &[typedpg_pg_query::protobuf::Node],
-    keys: &[(PgTypeOid, Option<String>)],
+    keys: &[PartKey],
 ) -> Result<Vec<RangeDatum>, DdlError> {
     let mut out = Vec::new();
     for (v, key) in values.iter().zip(keys) {
@@ -260,8 +330,9 @@ fn range_datums(
 fn bound_value(
     interp: &PgCatalog,
     v: &typedpg_pg_query::protobuf::Node,
-    (key_type, key_name): &(PgTypeOid, Option<String>),
+    key: &PartKey,
 ) -> Result<Option<Datum>, DdlError> {
+    let (key_type, key_name) = (&key.type_oid, &key.name);
     use crate::coerce::{CoercionContext, coercion_pathway};
     use crate::expr::{TypeGoal, infer_expr};
     use crate::pg_catalog::oid;
@@ -314,17 +385,17 @@ fn bound_value(
         infer_expr(v, ctx(), &mut params, TypeGoal::assignment(*key_type))
             .map_err(|e| DdlError::Parse(e.to_string()))?;
     }
-    Ok(Some(normalize(interp, v, *key_type)))
+    Ok(Some(normalize(interp, v, key)))
 }
 
 /// The comparable form of a bound constant.
 fn normalize(
     interp: &PgCatalog,
     v: &typedpg_pg_query::protobuf::Node,
-    key_type: PgTypeOid,
+    part_key: &PartKey,
 ) -> Datum {
     use crate::pg_catalog::oid;
-    let key = interp.unwrap_domain(key_type);
+    let key = interp.unwrap_domain(part_key.type_oid);
     let integer_key = [oid::INT2, oid::INT4, oid::INT8].contains(&key);
     let datetime_key = [oid::DATE, oid::TIMESTAMP, oid::TIMESTAMPTZ].contains(&key);
     let text_key = matches!(
@@ -355,6 +426,9 @@ fn normalize(
         }
         Some(Val::Sval(s)) if datetime_key => {
             iso_datetime(&s.sval).map_or(Datum::Opaque, Datum::Stamp)
+        }
+        Some(Val::Sval(s)) if text_key && part_key.code_point_order => {
+            Datum::CodePoints(s.sval.clone())
         }
         Some(Val::Sval(s)) if text_key => Datum::Text(s.sval.clone()),
         _ => Datum::Opaque,
@@ -438,12 +512,12 @@ fn cmp_range(a: &[RangeDatum], b: &[RangeDatum]) -> Option<std::cmp::Ordering> {
                 return None;
             }
             (RangeDatum::Value(p), RangeDatum::Value(q)) => match (p, q) {
-                (Datum::Int(_), Datum::Int(_)) | (Datum::Stamp(_), Datum::Stamp(_)) => {
-                    match p.cmp(q) {
-                        Ordering::Equal => continue,
-                        o => return Some(o),
-                    }
-                }
+                (Datum::Int(_), Datum::Int(_))
+                | (Datum::Stamp(_), Datum::Stamp(_))
+                | (Datum::CodePoints(_), Datum::CodePoints(_)) => match p.cmp(q) {
+                    Ordering::Equal => continue,
+                    o => return Some(o),
+                },
                 _ => return None,
             },
             _ => match rank(x).cmp(&rank(y)) {
@@ -568,12 +642,13 @@ fn check_new_bound(
 /// range partitions by lower bound, list partitions by their smallest
 /// non-NULL value (a NULL-only one after those), hash partitions by
 /// (modulus, remainder), the default partition last. Bounds the analyzer
-/// can't order (text values, whose order is the collation's) come after
-/// the ordered ones, in creation order.
+/// can't order (text values under a collation other than code point
+/// order) come after the ordered ones, in creation order.
 pub(crate) fn partition_desc_order(interp: &PgCatalog, parent: PgClassOid) -> Vec<PgClassOid> {
     // A total order: (group, orderable key, creation order).
     let key = |p: &PgClassOid| -> (u8, Option<Vec<(u8, Datum)>>, PgClassOid) {
-        let orderable = |d: &Datum| matches!(d, Datum::Int(_) | Datum::Stamp(_));
+        let orderable =
+            |d: &Datum| matches!(d, Datum::Int(_) | Datum::Stamp(_) | Datum::CodePoints(_));
         match interp.partition_bounds.get(p) {
             Some(Bound::Default) => (3, None, *p),
             Some(Bound::List(values)) if values.iter().all(Option::is_none) => (2, None, *p),

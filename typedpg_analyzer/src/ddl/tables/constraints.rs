@@ -590,7 +590,17 @@ pub(super) fn emit_constraint_with_backing_index(
         } else {
             "UNIQUE"
         };
-        check_unique_covers_partition_key(interp, relid, &conkey, label)?;
+        let collations: Vec<_> = conkey
+            .iter()
+            .map(|&a| {
+                interp
+                    .attributes_of(relid)
+                    .iter()
+                    .find(|att| att.attnum == a)
+                    .and_then(|att| att.attcollation)
+            })
+            .collect();
+        check_unique_covers_partition_key(interp, relid, &conkey, &collations, label)?;
     }
     if matches!(
         contype,
@@ -723,12 +733,13 @@ pub(super) fn key_columns(index: &PgIndex) -> &[i16] {
 }
 
 /// DefineIndex (indexcmds.c): a unique index on a partitioned table must
-/// contain every partition key column, and the key may not be an
-/// expression.
+/// contain every partition key column, under the key's collation, and the
+/// key may not be an expression. `collations` are the index columns'.
 pub(crate) fn check_unique_covers_partition_key(
     interp: &PgCatalog,
     relid: PgClassOid,
     key: &[i16],
+    collations: &[Option<crate::oid::PgCollationOid>],
     label: &str,
 ) -> Result<(), DdlError> {
     let Some(part_key) = interp.partition_keys.get(&relid) else {
@@ -739,7 +750,14 @@ pub(crate) fn check_unique_covers_partition_key(
             "unsupported {label} constraint with partition key definition"
         )));
     }
-    if part_key.iter().any(|pk| !key.contains(pk)) {
+    let part_collations = super::partbound::partition_key_collations(interp, relid);
+    let covered = |(i, pk): (usize, &i16)| {
+        let collation = part_collations.get(i).copied().flatten();
+        key.iter()
+            .zip(collations)
+            .any(|(k, c)| k == pk && *c == collation)
+    };
+    if !part_key.iter().enumerate().all(covered) {
         return Err(DdlError::Parse(
             "unique constraint on partitioned table must include all partitioning columns".into(),
         ));

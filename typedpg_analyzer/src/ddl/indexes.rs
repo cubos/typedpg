@@ -139,6 +139,8 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
         .map(|a| (a.attname.clone(), a.attnum))
         .collect();
     let mut indkey: Vec<i16> = Vec::with_capacity(stmt.index_params.len());
+    // indcollation: the COLLATE clause, else the column's.
+    let mut indcollation = Vec::with_capacity(stmt.index_params.len());
     let mut indexprs: Vec<SerializedAst> = Vec::new();
     for param in &stmt.index_params {
         let Some(node::Node::IndexElem(elem)) = param.node.as_ref() else {
@@ -155,10 +157,16 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
                     DdlError::Parse(format!("column \"{}\" does not exist", elem.name))
                 })?;
             indkey.push(an);
-            db.attribute_by_name(indrelid, &elem.name)
-                .map(|a| a.atttypid)
+            let attr = db.attribute_by_name(indrelid, &elem.name);
+            indcollation.push(if elem.collation.is_empty() {
+                attr.and_then(|a| a.attcollation)
+            } else {
+                super::tables::partbound::collation_clause(db, &elem.collation)
+            });
+            attr.map(|a| a.atttypid)
         } else if let Some(expr) = elem.expr.as_deref() {
             indkey.push(0);
+            indcollation.push(None);
             indexprs.push(serialize_node(expr));
             match super::volatile::infer_over_relation(db, indrelid, expr, None) {
                 Some(Ok(t)) => Some(t.type_oid),
@@ -233,6 +241,7 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
             db,
             indrelid,
             &indkey[..indnkeyatts as usize],
+            &indcollation,
             label,
         )?;
     }

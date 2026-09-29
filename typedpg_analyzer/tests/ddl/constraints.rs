@@ -1145,3 +1145,98 @@ fn foreign_keys_referencing_partitioned_tables_derive_one_row_per_partition() {
         "{err}"
     );
 }
+
+#[test]
+fn string_partition_bounds_order_under_code_point_collations() {
+    // Under C (and the other code point collations) string bounds order
+    // without a server: PartitionDesc order names the derived foreign keys,
+    // and range bounds overlap or are empty as in PG. 'Z' < 'a' in C.
+    use typedpg_analyzer::ConType;
+    let fks = |db: &PgCatalog| -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = db
+            .constraints_of_table("r")
+            .into_iter()
+            .filter(|c| c.contype == ConType::ForeignKey)
+            .map(|c| {
+                let target = c.confrelid.and_then(|r| db.pg_class().get(&r).cloned());
+                (c.conname, target.map(|t| t.relname).unwrap_or_default())
+            })
+            .collect();
+        out.sort();
+        out
+    };
+    for key in [
+        "(k text COLLATE \"C\" PRIMARY KEY) PARTITION BY LIST (k)",
+        "(k text COLLATE \"C\" PRIMARY KEY) PARTITION BY LIST (k COLLATE \"C\")",
+    ] {
+        let setup = format!(
+            "CREATE TABLE p {key};
+             CREATE TABLE pz PARTITION OF p FOR VALUES IN ('z');
+             CREATE TABLE pa PARTITION OF p FOR VALUES IN ('a');
+             CREATE TABLE pu PARTITION OF p FOR VALUES IN ('Z');
+             CREATE TABLE r (k text REFERENCES p);"
+        );
+        let db = build_db(&[("0001.sql", &setup)]);
+        assert_eq!(
+            fks(&db),
+            [
+                ("r_k_fkey", "p"),
+                ("r_k_fkey_1", "pu"),
+                ("r_k_fkey_2", "pa"),
+                ("r_k_fkey_3", "pz"),
+            ]
+            .map(|(a, b)| (a.to_owned(), b.to_owned())),
+            "{key}"
+        );
+        let err = try_apply(&[
+            ("0001.sql", &setup),
+            (
+                "0002.sql",
+                "ALTER TABLE p DETACH PARTITION pz;
+                 ALTER TABLE r ALTER CONSTRAINT r_k_fkey_1 DEFERRABLE;",
+            ),
+        ])
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("cannot alter constraint \"r_k_fkey_1\" on relation \"r\""),
+            "{key}: {err}"
+        );
+    }
+
+    // A unique index covers a key column only under the key's collation.
+    let keyed = "CREATE TABLE u (k text) PARTITION BY LIST (k COLLATE \"C\");
+                 CREATE UNIQUE INDEX ON u (k COLLATE \"C\");";
+    build_db(&[("0001.sql", keyed)]);
+    for sql in [
+        "ALTER TABLE u ADD PRIMARY KEY (k);",
+        "CREATE UNIQUE INDEX ON u (k);",
+        "CREATE TABLE u2 (k text PRIMARY KEY) PARTITION BY LIST (k COLLATE \"C\");",
+    ] {
+        let err = try_apply(&[("0001.sql", keyed), ("0002.sql", sql)]).expect_err(sql);
+        assert!(
+            err.to_string().starts_with(
+                "unique constraint on partitioned table must include all partitioning columns"
+            ),
+            "{sql}\n  got: {err}"
+        );
+    }
+
+    let range = "CREATE TABLE t (k text COLLATE \"C\") PARTITION BY RANGE (k);
+                 CREATE TABLE t1 PARTITION OF t FOR VALUES FROM ('a') TO ('m');
+                 CREATE TABLE t2 PARTITION OF t FOR VALUES FROM ('Z') TO ('a');";
+    build_db(&[("0001.sql", range)]);
+    for (sql, message) in [
+        (
+            "CREATE TABLE t3 PARTITION OF t FOR VALUES FROM ('c') TO ('z');",
+            "partition \"t3\" would overlap partition \"t1\"",
+        ),
+        (
+            "CREATE TABLE t3 PARTITION OF t FOR VALUES FROM ('b') TO ('B');",
+            "empty range bound specified for partition \"t3\"",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", range), ("0002.sql", sql)]).expect_err(sql);
+        assert!(err.to_string().starts_with(message), "{sql}\n  got: {err}");
+    }
+}
