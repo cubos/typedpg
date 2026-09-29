@@ -736,3 +736,26 @@ fn a_column_may_not_hold_its_own_tables_row_type() {
         "got: {err}"
     );
 }
+
+#[test]
+fn a_partition_gets_no_column_of_its_own() {
+    // ATExecAddColumn: a partition's columns are its parent's; a plain
+    // inheritance child may add some.
+    let setup = "CREATE TABLE p (a int) PARTITION BY RANGE (a);
+                 CREATE TABLE c PARTITION OF p FOR VALUES FROM (1) TO (2);
+                 CREATE TABLE q (a int);
+                 CREATE TABLE qc () INHERITS (q);";
+    let stmt = "ALTER TABLE c ADD COLUMN b int;";
+    let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+    assert!(
+        err.to_string().starts_with("cannot add column to a partition"),
+        "got: {err}"
+    );
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "ALTER TABLE qc ADD COLUMN b int; ALTER TABLE p ADD COLUMN b int;",
+        ),
+    ]);
+}

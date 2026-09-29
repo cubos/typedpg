@@ -6,7 +6,8 @@
 
 use super::*;
 
-fn is_partition(interp: &PgCatalog, relid: PgClassOid) -> bool {
+/// `relispartition`: the relation is a partition of a partitioned table.
+pub(super) fn is_partition(interp: &PgCatalog, relid: PgClassOid) -> bool {
     interp.pg_inherits.iter().any(|i| {
         i.inhrelid == relid
             && interp

@@ -657,6 +657,10 @@ fn add_column_to(
     let Some(node::Node::ColumnDef(cd)) = def.node.as_ref() else {
         return Ok(());
     };
+    // ATExecAddColumn: a partition's columns are its parent's.
+    if !rec.recursing && super::inherit_cmd::is_partition(interp, relid) {
+        return Err(DdlError::Parse("cannot add column to a partition".into()));
+    }
     let children = inherit::children_of(interp, relid);
     if !rec.recurse && !children.is_empty() {
         return Err(DdlError::Parse(
