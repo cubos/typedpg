@@ -1294,3 +1294,38 @@ fn set_returning_functions_are_rejected_in_ddl_expression_kinds() {
         ),
     ]);
 }
+
+#[test]
+fn no_inherit_check_is_rejected_on_partitioned_tables() {
+    // StoreRelCheck: a partitioned table holds no rows, so a NO INHERIT
+    // CHECK constraint on it makes no sense (42P16).
+    let setup = "CREATE TABLE p (a int) PARTITION BY LIST (a);";
+    for (sql, table) in [
+        (
+            "CREATE TABLE p2 (a int, CHECK (a > 0) NO INHERIT) PARTITION BY LIST (a);",
+            "p2",
+        ),
+        (
+            "CREATE TABLE p2 (a int CHECK (a > 0) NO INHERIT) PARTITION BY LIST (a);",
+            "p2",
+        ),
+        (
+            "ALTER TABLE p ADD CONSTRAINT c CHECK (a > 0) NO INHERIT;",
+            "p",
+        ),
+        ("ALTER TABLE p ADD CHECK (a > 0) NO INHERIT NOT VALID;", "p"),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", sql)]).expect_err(sql);
+        assert_eq!(
+            err.to_string(),
+            format!("cannot add NO INHERIT constraint to partitioned table \"{table}\""),
+            "{sql}"
+        );
+    }
+    // A plain table may have one.
+    build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int, CHECK (a > 0) NO INHERIT);
+         ALTER TABLE t ADD CHECK (a < 10) NO INHERIT;",
+    )]);
+}

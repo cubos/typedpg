@@ -103,6 +103,22 @@ fn map_conkey(interp: &PgCatalog, from: PgClassOid, to: PgClassOid, conkey: &[i1
         .collect()
 }
 
+/// StoreRelCheck (heap.c): a partitioned table holds no rows of its own,
+/// so a NO INHERIT CHECK constraint on it makes no sense.
+pub(crate) fn check_no_inherit_allowed(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+    no_inherit: bool,
+) -> Result<(), DdlError> {
+    if no_inherit && interp.pg_class.get(&relid).map(|c| c.relkind) == Some(RelKind::Partitioned) {
+        return Err(DdlError::Parse(format!(
+            "cannot add NO INHERIT constraint to partitioned table \"{}\"",
+            relname_of(interp, relid)
+        )));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)] // one per pg_constraint column
 fn insert_check(
     interp: &mut PgCatalog,
@@ -114,6 +130,7 @@ fn insert_check(
     coninhcount: i16,
     flags: CheckFlags,
 ) -> Result<(), DdlError> {
+    check_no_inherit_allowed(interp, relid, def.as_ref().is_some_and(|d| d.no_inherit))?;
     let oid = PgConstraintOid::from_nonzero(interp.alloc_oid()?);
     interp.insert_pg_constraint(PgConstraint {
         oid,

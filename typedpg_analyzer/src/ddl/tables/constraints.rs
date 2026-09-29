@@ -303,6 +303,9 @@ pub(crate) fn emit_constraints(
                 )));
             }
             check_names.push(conname.clone());
+            if let Some((def, _)) = check.as_ref() {
+                check_inherit::check_no_inherit_allowed(interp, relid, def.no_inherit)?;
+            }
         }
         let oid = emit_constraint_with_backing_index(
             interp, relid, conname, contype, conkey, confrelid, confkey, deferrable, include,
