@@ -13,8 +13,7 @@ use crate::pg_catalog::{
 
 use super::DdlError;
 use super::util::{
-    ensure_qualified_name, lookup_type_name, names_key, node_string,
-    register_composite_to_record_cast,
+    ensure_qualified_name, names_key, node_string, register_composite_to_record_cast,
 };
 use crate::pg_catalog::PgCatalog;
 
@@ -1639,55 +1638,33 @@ pub(crate) fn create_base_type(
 
 // ─── CREATE CAST ────────────────────────────────────────────────────────────
 
+/// `CREATE CAST (source AS target) ...` (CreateCast, functioncmds.c, and
+/// CastCreate): no pseudo-types; a cast function takes the source (or
+/// something it is binary-coercible to), an optional int4 typmod and bool
+/// explicit flag, and returns the target (or something binary-coercible to
+/// it) — a plain, non-set function; WITHOUT FUNCTION needs physically
+/// identical, binary-compatible types.
 pub fn create_cast(interp: &mut PgCatalog, stmt: &CreateCastStmt) -> Result<(), DdlError> {
-    // CreateCast: both types must exist, the pair must not have a cast yet,
-    // and WITH FUNCTION names an existing function.
     let (Some(source), Some(target)) = (stmt.sourcetype.as_ref(), stmt.targettype.as_ref()) else {
         return Ok(());
     };
-    let src = lookup_type_name(source, interp)?;
-    let tgt = lookup_type_name(target, interp)?;
-    if interp.cast_by_pair.contains_key(&(src, tgt)) {
-        return Err(DdlError::DuplicateObject(format!(
-            "cast from type {} to type {} already exists",
-            super::util::format_type_for_message(interp, src),
-            super::util::format_type_for_message(interp, tgt)
+    let src = super::functions::typename_type_id(interp, source)?;
+    let tgt = super::functions::typename_type_id(interp, target)?;
+    let typtype = |oid: PgTypeOid| interp.pg_type.get(&oid).map(|t| t.typtype);
+    let shown = |oid: PgTypeOid| super::util::format_type_for_message(interp, oid);
+    let invalid = |msg: &str| Err(DdlError::Parse(msg.to_owned()));
+    if typtype(src) == Some(TypType::Pseudo) {
+        return Err(DdlError::Parse(format!(
+            "source data type {} is a pseudo-type",
+            shown(src)
         )));
     }
-    let castfunc = match stmt.func.as_ref() {
-        Some(func) => {
-            let object = Some(Box::new(typedpg_pg_query::protobuf::Node {
-                node: Some(node::Node::ObjectWithArgs(func.clone())),
-            }));
-            let Some((schema, name, arg_oids)) = super::alter::extract_func_target(&object, interp)
-            else {
-                return Ok(());
-            };
-            let wanted = arg_oids.clone();
-            let Some((_, oid)) =
-                super::alter::find_proc(interp, schema.as_deref(), &name, &move |p| {
-                    p.proargtypes == wanted
-                })
-            else {
-                let args = arg_oids
-                    .iter()
-                    .map(|&t| super::util::format_type_for_message(interp, t))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                return Err(DdlError::TypeNotFound(format!(
-                    "function {name}({args}) does not exist"
-                )));
-            };
-            Some(oid)
-        }
-        None => None,
-    };
-
-    let castcontext = match CoercionContext::try_from(stmt.context) {
-        Ok(CoercionContext::CoercionImplicit) => CastContext::Implicit,
-        Ok(CoercionContext::CoercionAssignment) => CastContext::Assignment,
-        _ => CastContext::Explicit,
-    };
+    if typtype(tgt) == Some(TypType::Pseudo) {
+        return Err(DdlError::Parse(format!(
+            "target data type {} is a pseudo-type",
+            shown(tgt)
+        )));
+    }
 
     // Map `CREATE CAST` syntax to pg_cast.castmethod:
     // - WITH FUNCTION f(...)  → 'f' (Function)
@@ -1700,29 +1677,99 @@ pub fn create_cast(interp: &mut PgCatalog, stmt: &CreateCastStmt) -> Result<(), 
     } else {
         CastMethod::Binary
     };
-
-    // PG rejects WITHOUT FUNCTION (binary-compatible) casts that touch a
-    // domain or enum on either side. Domains carry CHECK constraints that
-    // must run at cast time, and enums have an internal ordering that's not
-    // safe to bit-cast through. Only WITH FUNCTION supports either case.
-    // The two errors come out with different wording on PG's side
-    // (SQLSTATE 42P17), so we match each precisely.
-    if matches!(castmethod, CastMethod::Binary) {
-        let typtype = |oid: PgTypeOid| interp.pg_type.get(&oid).map(|t| t.typtype);
-        let src_kind = typtype(src);
-        let tgt_kind = typtype(tgt);
-        if src_kind == Some(TypType::Domain) || tgt_kind == Some(TypType::Domain) {
-            return Err(DdlError::Parse(
-                "domain data types must not be marked binary-compatible".into(),
-            ));
+    let mut nargs = 0;
+    let mut castfunc = None;
+    if let Some(func) = stmt.func.as_ref() {
+        let Some(oid) = super::functions::lookup_func_with_args(
+            interp,
+            ObjectType::ObjectFunction,
+            func,
+            false,
+        )?
+        else {
+            return Ok(());
+        };
+        let Some(proc) = interp.pg_proc.get(&oid) else {
+            return Ok(());
+        };
+        nargs = proc.proargtypes.len();
+        if !(1..=3).contains(&nargs) {
+            return invalid("cast function must take one to three arguments");
         }
-        if src_kind == Some(TypType::Enum) || tgt_kind == Some(TypType::Enum) {
-            return Err(DdlError::Parse(
-                "enum data types are not binary-compatible".into(),
-            ));
+        if !super::functions::is_binary_coercible(interp, src, proc.proargtypes[0]) {
+            return invalid(
+                "argument of cast function must match or be binary-coercible from source data \
+                 type",
+            );
+        }
+        if nargs > 1 && proc.proargtypes[1] != crate::pg_catalog::oid::INT4 {
+            return invalid("second argument of cast function must be type integer");
+        }
+        if nargs > 2 && proc.proargtypes[2] != crate::pg_catalog::oid::BOOL {
+            return invalid("third argument of cast function must be type boolean");
+        }
+        if !super::functions::is_binary_coercible(interp, proc.prorettype, tgt) {
+            return invalid(
+                "return data type of cast function must match or be binary-coercible to target \
+                 data type",
+            );
+        }
+        if proc.prokind != crate::pg_catalog::ProKind::Function {
+            return invalid("cast function must be a normal function");
+        }
+        if proc.proretset {
+            return invalid("cast function must not return a set");
+        }
+        castfunc = Some(oid);
+    }
+    if matches!(castmethod, CastMethod::Binary) {
+        let physical = |oid: PgTypeOid| {
+            interp
+                .pg_type
+                .get(&oid)
+                .map(|t| (t.typlen, t.typbyval, t.typalign))
+        };
+        if physical(src) != physical(tgt) {
+            return invalid("source and target data types are not physically compatible");
+        }
+        let kinds = [typtype(src), typtype(tgt)];
+        if kinds.contains(&Some(TypType::Composite)) {
+            return invalid("composite data types are not binary-compatible");
+        }
+        if crate::coerce::element_type(src, interp).is_some()
+            || crate::coerce::element_type(tgt, interp).is_some()
+        {
+            return invalid("array data types are not binary-compatible");
+        }
+        if kinds.contains(&Some(TypType::Range)) || kinds.contains(&Some(TypType::Multirange)) {
+            return invalid("range data types are not binary-compatible");
+        }
+        if kinds.contains(&Some(TypType::Enum)) {
+            return invalid("enum data types are not binary-compatible");
+        }
+        if kinds.contains(&Some(TypType::Domain)) {
+            return invalid("domain data types must not be marked binary-compatible");
         }
     }
+    // Only a length coercion function (more than one argument) may cast a
+    // type to itself.
+    if src == tgt && nargs < 2 {
+        return invalid("source data type and target data type are the same");
+    }
 
+    let castcontext = match CoercionContext::try_from(stmt.context) {
+        Ok(CoercionContext::CoercionImplicit) => CastContext::Implicit,
+        Ok(CoercionContext::CoercionAssignment) => CastContext::Assignment,
+        _ => CastContext::Explicit,
+    };
+    // CastCreate.
+    if interp.cast_by_pair.contains_key(&(src, tgt)) {
+        return Err(DdlError::DuplicateObject(format!(
+            "cast from type {} to type {} already exists",
+            shown(src),
+            shown(tgt)
+        )));
+    }
     let cast_oid = PgCastOid::from_nonzero(interp.alloc_oid()?);
     interp.insert_pg_cast(PgCast {
         oid: cast_oid,
@@ -1732,6 +1779,19 @@ pub fn create_cast(interp: &mut PgCatalog, stmt: &CreateCastStmt) -> Result<(), 
         castmethod,
         castfunc,
     });
+    // The cast depends on its function and both types.
+    super::depend::record(
+        interp,
+        super::depend::ObjectAddress::cast(cast_oid),
+        castfunc
+            .map(super::depend::ObjectAddress::proc)
+            .into_iter()
+            .chain([
+                super::depend::ObjectAddress::type_(src),
+                super::depend::ObjectAddress::type_(tgt),
+            ]),
+        crate::pg_catalog::DepType::Normal,
+    );
     Ok(())
 }
 

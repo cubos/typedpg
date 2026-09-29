@@ -146,3 +146,50 @@ fn user_cast_backed_by_a_non_strict_function_is_nullable() {
         vec![c("m", int4())],
     );
 }
+
+#[test]
+fn create_cast_checks_its_function_and_types() {
+    let mood = "CREATE TYPE mood AS ENUM ('a');";
+    let fns = "CREATE TYPE mood AS ENUM ('a');
+               CREATE FUNCTION m2t(mood) RETURNS text LANGUAGE sql AS 'select $1::text';
+               CREATE FUNCTION m2i(mood, text) RETURNS int LANGUAGE sql AS 'select 1';
+               CREATE FUNCTION m2s(mood) RETURNS SETOF int LANGUAGE sql AS 'select 1';";
+    assert_ddl_rejections(&[
+        (
+            fns,
+            "CREATE CAST (mood AS int) WITH FUNCTION m2t(mood);",
+            "return data type of cast function must match or be binary-coercible to target data \
+             type",
+        ),
+        (
+            fns,
+            "CREATE CAST (mood AS int) WITH FUNCTION m2i(mood, text);",
+            "second argument of cast function must be type integer",
+        ),
+        (
+            fns,
+            "CREATE CAST (mood AS int) WITH FUNCTION m2s(mood);",
+            "cast function must not return a set",
+        ),
+        (
+            mood,
+            "CREATE CAST (mood AS int) WITHOUT FUNCTION;",
+            "enum data types are not binary-compatible",
+        ),
+        (
+            mood,
+            "CREATE CAST (mood AS text) WITHOUT FUNCTION;",
+            "source and target data types are not physically compatible",
+        ),
+        (
+            "",
+            "CREATE CAST (int AS int) WITH FUNCTION int4abs(int);",
+            "source data type and target data type are the same",
+        ),
+        (
+            "",
+            "CREATE CAST (int AS anyelement) WITH INOUT;",
+            "target data type anyelement is a pseudo-type",
+        ),
+    ]);
+}
