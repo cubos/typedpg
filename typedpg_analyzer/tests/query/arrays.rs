@@ -140,7 +140,8 @@ fn any_all_nullable_through_null_elements() {
                     id = ANY('{1,NULL}'::int8[]) AS c, id = ANY(ARRAY[1, NULL]) AS d, \
                     id = ANY($arr) AS e, \
                     id = ANY(ARRAY[1, 2]) AS f, id <> ALL(ARRAY[[1], [2]]::int8[]) AS g, \
-                    id = ANY(ARRAY[nums[1]]) AS h \
+                    id = ANY(ARRAY[nums[1]]) AS h, id = ANY('{1,2}') AS i, \
+                    'x' <> ALL('{3, \"NULL\"}'::text[]) AS j, id = ANY('{1,null}') AS k \
              FROM users",
         )
         .unwrap();
@@ -155,6 +156,9 @@ fn any_all_nullable_through_null_elements() {
             c("f", bool_ty()),
             c("g", bool_ty()),
             cn("h", bool_ty()),
+            c("i", bool_ty()),
+            c("j", bool_ty()),
+            cn("k", bool_ty()),
         ],
     );
 }

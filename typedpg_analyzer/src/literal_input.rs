@@ -1358,7 +1358,6 @@ fn check_domain_accepts_null(ty: PgTypeOid, snapshot: &PgCatalog) -> Result<(), 
 /// with no NULL element (an unquoted `NULL`, in any case, is a NULL
 /// element; `"NULL"` is a string). Malformed literals report `true`.
 /// Exposed for the nullability of `x = ANY('{…}')`.
-#[allow(dead_code)]
 pub(crate) fn array_literal_may_contain_null(content: &str) -> bool {
     crate::array_input::may_contain_null(content)
 }

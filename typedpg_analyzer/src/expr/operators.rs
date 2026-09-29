@@ -580,6 +580,13 @@ pub(crate) fn array_elements_may_be_null(
             .arg
             .as_deref()
             .is_none_or(|a| array_elements_may_be_null(a, ctx, params)),
+        // An untyped literal (`'{1,2}'`, cast or coerced to the array type).
+        Some(node::Node::AConst(ac)) => match &ac.val {
+            Some(a_const::Val::Sval(sv)) if !ac.isnull => {
+                crate::literal_input::array_literal_may_contain_null(&sv.sval)
+            }
+            _ => true,
+        },
         _ => true,
     }
 }

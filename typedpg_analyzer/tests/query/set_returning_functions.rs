@@ -448,5 +448,11 @@ fn from_function_untyped_args_take_the_resolved_types() {
         db.analyze("SELECT * FROM generate_series(1, 'a') g"),
         AnalyzeError::InvalidLiteral(_),
         "invalid input syntax for type integer: \"a\""
+    );    assert_err_prefix!(
+        db.analyze(
+            "SELECT * FROM generate_series('2020-01-01'::timestamptz, '2020-02-01', '1 xday') g"
+        ),
+        AnalyzeError::InvalidLiteral(_),
+        "invalid input syntax for type interval: \"1 xday\""
     );
 }
