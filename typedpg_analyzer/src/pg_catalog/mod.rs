@@ -254,7 +254,11 @@ pub struct PgCatalog {
     /// `pg_policy`: each relation's row-security policy names.
     pub(crate) policies: HashMap<PgClassOid, Vec<String>>,
     /// `pg_rewrite` rule names added by CREATE RULE, per relation.
-    pub(crate) rules: HashMap<PgClassOid, Vec<String>>,
+    pub(crate) rules: HashMap<PgClassOid, Vec<crate::ddl::rules::Rule>>,
+    /// What the rewriter needs to auto-update each view created by DDL
+    /// (view_query_is_auto_updatable / view_col_is_auto_updatable over its
+    /// stored query).
+    pub(crate) view_updatability: HashMap<PgClassOid, crate::ddl::views::ViewUpdatability>,
     /// `pg_class.reloftype` of typed tables (`CREATE TABLE ... OF type`).
     pub(crate) typed_tables: HashMap<PgClassOid, PgTypeOid>,
     /// The `indisclustered` index of each table (CLUSTER ... USING,
@@ -580,6 +584,7 @@ impl PgCatalog {
             sql_function_defs: HashMap::new(),
             partition_keys: HashMap::new(),
             triggers: HashMap::new(),
+            view_updatability: HashMap::new(),
             policies: HashMap::new(),
             rules: HashMap::new(),
             typed_tables: HashMap::new(),
@@ -1264,6 +1269,7 @@ impl PgCatalog {
         self.triggers.remove(&oid);
         self.policies.remove(&oid);
         self.rules.remove(&oid);
+        self.view_updatability.remove(&oid);
         self.typed_tables.remove(&oid);
         self.clustered_indexes.remove(&oid);
         self.clustered_indexes.retain(|_, index| *index != oid);

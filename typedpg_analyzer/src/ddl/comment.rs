@@ -301,7 +301,10 @@ pub(crate) fn resolve_object(
                     "table",
                 ),
                 _ => (
-                    interp.rules.get(&oid).is_some_and(|rs| rs.contains(sub)),
+                    interp
+                        .rules
+                        .get(&oid)
+                        .is_some_and(|rs| rs.iter().any(|r| &r.name == sub)),
                     "rule",
                     "relation",
                 ),

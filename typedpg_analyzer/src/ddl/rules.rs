@@ -13,6 +13,26 @@ use super::DdlError;
 use crate::oid::PgClassOid;
 use crate::pg_catalog::{PgCatalog, RelKind};
 
+/// A rewrite rule (`pg_rewrite`) as far as the rewriter's treatment of the
+/// statements it fires on is concerned (RewriteQuery / matchLocks /
+/// fireRules).
+#[derive(Clone, Debug)]
+pub(crate) struct Rule {
+    pub(crate) name: String,
+    /// `ev_type`.
+    pub(crate) event: CmdType,
+    /// `is_instead`.
+    pub(crate) instead: bool,
+    /// Has a WHERE condition (`ev_qual`).
+    pub(crate) conditional: bool,
+    /// Some action has a RETURNING list (only allowed in an unconditional
+    /// INSTEAD rule).
+    pub(crate) returning: bool,
+    /// Fires in the default (origin) session replication role:
+    /// `ev_enabled` is `O` or `A`.
+    pub(crate) enabled: bool,
+}
+
 pub fn create_rule(interp: &mut PgCatalog, stmt: &RuleStmt) -> Result<(), DdlError> {
     let Some(rv) = stmt.relation.as_ref() else {
         return Ok(());
@@ -105,9 +125,37 @@ pub fn create_rule(interp: &mut PgCatalog, stmt: &RuleStmt) -> Result<(), DdlErr
     }
 
     let relname = rv.relname.clone();
+    let returning = stmt.actions.iter().any(|a| match a.node.as_ref() {
+        Some(node::Node::InsertStmt(s)) => s
+            .returning_clause
+            .as_ref()
+            .is_some_and(|r| !r.exprs.is_empty()),
+        Some(node::Node::UpdateStmt(s)) => s
+            .returning_clause
+            .as_ref()
+            .is_some_and(|r| !r.exprs.is_empty()),
+        Some(node::Node::DeleteStmt(s)) => s
+            .returning_clause
+            .as_ref()
+            .is_some_and(|r| !r.exprs.is_empty()),
+        _ => false,
+    });
+    let rule = Rule {
+        name: stmt.rulename.clone(),
+        event,
+        instead: stmt.instead,
+        conditional: stmt.where_clause.is_some(),
+        returning,
+        enabled: true,
+    };
     let rules = interp.rules.entry(relid).or_default();
-    if rules.contains(&stmt.rulename) {
+    if let Some(existing) = rules.iter_mut().find(|r| r.name == stmt.rulename) {
         if stmt.replace {
+            // DefineQueryRewrite replaces the definition; ev_enabled stays.
+            *existing = Rule {
+                enabled: existing.enabled,
+                ..rule
+            };
             return Ok(());
         }
         return Err(DdlError::DuplicateObject(format!(
@@ -115,7 +163,7 @@ pub fn create_rule(interp: &mut PgCatalog, stmt: &RuleStmt) -> Result<(), DdlErr
             stmt.rulename
         )));
     }
-    rules.push(stmt.rulename.clone());
+    rules.push(rule);
     Ok(())
 }
 
@@ -270,7 +318,7 @@ pub(crate) fn drop_rule(
     };
     let rules = interp.rules.entry(relid).or_default();
     let before = rules.len();
-    rules.retain(|r| r != name);
+    rules.retain(|r| &r.name != name);
     if rules.len() == before && !missing_ok {
         return Err(DdlError::TypeNotFound(format!(
             "rule \"{name}\" for relation \"{}\" does not exist",
@@ -290,34 +338,37 @@ pub(crate) fn rename_rule(
     };
     let (_, relid) = super::util::lookup_relation(interp, rv)?;
     let rules = interp.rules.entry(relid).or_default();
-    let Some(pos) = rules.iter().position(|r| *r == stmt.subname) else {
+    let Some(pos) = rules.iter().position(|r| r.name == stmt.subname) else {
         return Err(DdlError::TypeNotFound(format!(
             "rule \"{}\" for relation \"{}\" does not exist",
             stmt.subname, rv.relname
         )));
     };
-    if rules.contains(&stmt.newname) {
+    if rules.iter().any(|r| r.name == stmt.newname) {
         return Err(DdlError::DuplicateObject(format!(
             "rule \"{}\" for relation \"{}\" already exists",
             stmt.newname, rv.relname
         )));
     }
-    rules[pos] = stmt.newname.clone();
+    rules[pos].name = stmt.newname.clone();
     Ok(())
 }
 
 /// `ALTER TABLE ... ENABLE / DISABLE [ALWAYS | REPLICA] RULE name`
-/// (EnableDisableRule).
-pub(crate) fn check_rule_exists(
-    interp: &PgCatalog,
+/// (EnableDisableRule): `fires` is whether the new `ev_enabled` fires in
+/// the origin replication role (`O` / `A`).
+pub(crate) fn set_rule_enabled(
+    interp: &mut PgCatalog,
     relid: PgClassOid,
     name: &str,
+    fires: bool,
 ) -> Result<(), DdlError> {
-    if interp
+    if let Some(rule) = interp
         .rules
-        .get(&relid)
-        .is_some_and(|rs| rs.iter().any(|r| r == name))
+        .get_mut(&relid)
+        .and_then(|rs| rs.iter_mut().find(|r| r.name == name))
     {
+        rule.enabled = fires;
         return Ok(());
     }
     let relname = interp

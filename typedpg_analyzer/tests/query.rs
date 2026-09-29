@@ -66,6 +66,8 @@ mod typmod;
 mod user_types;
 #[path = "query/utility_stmts.rs"]
 mod utility_stmts;
+#[path = "query/view_dml.rs"]
+mod view_dml;
 #[path = "query/where_clause.rs"]
 mod where_clause;
 #[path = "query/xml.rs"]

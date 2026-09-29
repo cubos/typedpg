@@ -29,7 +29,7 @@ pub mod operators;
 mod policies;
 pub(crate) mod publications;
 pub(crate) mod reloptions;
-mod rules;
+pub(crate) mod rules;
 pub mod schema_stmt;
 pub(crate) mod seqparams;
 pub mod sequences;

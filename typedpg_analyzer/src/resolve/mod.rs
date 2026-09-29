@@ -553,16 +553,67 @@ fn validate_on_conflict_target(
             target_exprs.push(node_fingerprint(e));
         }
     }
+    let mut where_clause = on_conflict
+        .infer
+        .as_deref()
+        .and_then(|i| i.where_clause.as_deref())
+        .cloned();
+
+    // Through an automatically updatable view, the planner infers the
+    // arbiter on the base relation (rewriteTargetView rewrites the
+    // inference elements onto its columns). A view that isn't updatable
+    // fails in the rewriter first.
+    let mut table_oid = table_oid;
+    let mut target_expr_nodes: Vec<protobuf::Node> = infer
+        .index_elems
+        .iter()
+        .filter_map(|elem| match elem.node.as_ref() {
+            Some(node::Node::IndexElem(ie)) if ie.name.is_empty() => ie.expr.as_deref().cloned(),
+            _ => None,
+        })
+        .collect();
+    while let Some(upd) = snapshot.view_updatability.get(&table_oid) {
+        let Some(base) = upd.base else {
+            return Ok(());
+        };
+        let view_attrs = snapshot.attributes_of(table_oid);
+        let base_attrs = snapshot.attributes_of(base);
+        let base_attnum = |attnum: i16| -> Option<i16> {
+            let pos = view_attrs.iter().position(|a| a.attnum == attnum)?;
+            upd.columns.get(pos)?.as_ref().ok().copied()
+        };
+        let base_name = |name: &str| -> Option<String> {
+            let attnum = view_attrs.iter().find(|a| a.attname == name)?.attnum;
+            let b = base_attnum(attnum)?;
+            base_attrs
+                .iter()
+                .find(|a| a.attnum == b)
+                .map(|a| a.attname.clone())
+        };
+        // A view column that isn't a base column can't match any index key.
+        target_cols = target_cols
+            .iter()
+            .map(|&a| base_attnum(a).unwrap_or(i16::MIN))
+            .collect();
+        for e in &mut target_expr_nodes {
+            *e = rename_column_refs(e, &base_name);
+        }
+        if let Some(w) = &mut where_clause {
+            *w = rename_column_refs(w, &base_name);
+        }
+        table_oid = base;
+    }
+    if !target_expr_nodes.is_empty() {
+        target_exprs = target_expr_nodes.iter().map(node_fingerprint).collect();
+    }
     target_exprs.sort();
 
     let decode = |ast: &crate::pg_catalog::SerializedAst| -> Option<protobuf::Node> {
         use prost::Message;
         protobuf::Node::decode(ast.ast.as_slice()).ok()
     };
-    let where_conjuncts: Vec<String> = on_conflict
-        .infer
-        .as_deref()
-        .and_then(|i| i.where_clause.as_deref())
+    let where_conjuncts: Vec<String> = where_clause
+        .as_ref()
         .map(conjunct_fingerprints)
         .unwrap_or_default();
 
@@ -614,6 +665,42 @@ fn validate_on_conflict_target(
     Ok(())
 }
 
+/// `node` with every column reference's column name mapped through
+/// `rename` (names it doesn't map keep theirs) — rewriteTargetView's
+/// re-pointing of view columns at the base relation's.
+fn rename_column_refs(
+    node: &protobuf::Node,
+    rename: &dyn Fn(&str) -> Option<String>,
+) -> protobuf::Node {
+    let mut tree = protobuf::ParseResult {
+        version: 0,
+        stmts: vec![protobuf::RawStmt {
+            stmt: Some(Box::new(node.clone())),
+            stmt_location: 0,
+            stmt_len: 0,
+        }],
+    };
+    // SAFETY: the tree is neither moved nor dropped while the pointers are
+    // used, and only the `String` leaves of column references are written —
+    // no subtree any other pointer refers into is replaced.
+    unsafe {
+        for (n, _) in tree.nodes_mut() {
+            if let typedpg_pg_query::NodeMut::ColumnRef(cr) = n
+                && let Some(last) = (*cr).fields.last_mut()
+                && let Some(node::Node::String(s)) = last.node.as_mut()
+                && let Some(new) = rename(&s.sval)
+            {
+                s.sval = new;
+            }
+        }
+    }
+    tree.stmts
+        .pop()
+        .and_then(|s| s.stmt)
+        .map(|b| *b)
+        .unwrap_or_default()
+}
+
 /// The location-free fingerprints of `node`'s top-level AND conjuncts.
 fn conjunct_fingerprints(node: &protobuf::Node) -> Vec<String> {
     match node.node.as_ref() {
@@ -644,7 +731,14 @@ fn null_assignment_error(
             "domain {domain} does not allow null values"
         )));
     }
-    if tc.attnotnull {
+    // A view's columns carry no NOT NULL of their own (their inferred
+    // non-nullability is not a constraint); the base relation's is checked
+    // when the rewriter reaches it.
+    let on_view = snapshot
+        .pg_class
+        .get(&tc.attrelid)
+        .is_some_and(|c| c.relkind == crate::pg_catalog::RelKind::View);
+    if tc.attnotnull && !on_view {
         let verb = match op {
             "insert" => "insert NULL into",
             _ => "assign NULL to",
@@ -693,6 +787,7 @@ mod dml;
 mod from;
 mod merge;
 mod returning;
+mod rewrite;
 mod select;
 mod set_ops;
 mod target_list;
@@ -710,6 +805,7 @@ pub(crate) use dml::*;
 pub(crate) use from::*;
 pub(crate) use merge::*;
 pub(crate) use returning::*;
+pub(crate) use rewrite::*;
 pub(crate) use select::*;
 pub(crate) use set_ops::*;
 pub(crate) use target_list::*;

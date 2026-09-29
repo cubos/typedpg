@@ -119,6 +119,166 @@ pub(crate) fn positional_argument_after_named(span: Option<SourceSpan>) -> RawEr
     )
 }
 
+/// rewriteTargetListIU (INSERT): `cannot insert a non-DEFAULT value into
+/// column "c"` — SQLSTATE 428C9. `identity` selects the GENERATED ALWAYS
+/// identity detail (and PG's OVERRIDING hint) over the generated-column one.
+pub(crate) fn insert_non_default_into_generated(column: &str, identity: bool) -> RawError {
+    let detail = if identity {
+        format!("Column \"{column}\" is an identity column defined as GENERATED ALWAYS.")
+    } else {
+        format!("Column \"{column}\" is a generated column.")
+    };
+    RawError::new(
+        AnalyzeError::GeneratedAlways(format!(
+            "cannot insert a non-DEFAULT value into column \"{column}\" ({detail})"
+        )),
+        None,
+        identity.then(|| "Use OVERRIDING SYSTEM VALUE to override.".to_owned()),
+    )
+}
+
+/// rewriteTargetListIU (UPDATE): `column "c" can only be updated to
+/// DEFAULT` — SQLSTATE 428C9.
+pub(crate) fn update_generated_to_non_default(column: &str, identity: bool) -> RawError {
+    let detail = if identity {
+        format!("Column \"{column}\" is an identity column defined as GENERATED ALWAYS.")
+    } else {
+        format!("Column \"{column}\" is a generated column.")
+    };
+    RawError::new(
+        AnalyzeError::GeneratedAlways(format!(
+            "column \"{column}\" can only be updated to DEFAULT ({detail})"
+        )),
+        None,
+        None,
+    )
+}
+
+/// error_view_not_updatable: `cannot insert into view "v"` / `cannot update
+/// view "v"` / `cannot delete from view "v"` — SQLSTATE 55000, with the
+/// reason as detail and PG's hint (`merge` picks MERGE's trigger-only hint).
+pub(crate) fn view_not_updatable(
+    command: crate::resolve::DmlEvent,
+    view: &str,
+    detail: &str,
+    merge: bool,
+) -> RawError {
+    use crate::resolve::DmlEvent;
+    let (message, verb, event) = match command {
+        DmlEvent::Insert => (
+            format!("cannot insert into view \"{view}\""),
+            "inserting into",
+            "INSERT",
+        ),
+        DmlEvent::Update => (
+            format!("cannot update view \"{view}\""),
+            "updating",
+            "UPDATE",
+        ),
+        DmlEvent::Delete => (
+            format!("cannot delete from view \"{view}\""),
+            "deleting from",
+            "DELETE",
+        ),
+    };
+    let hint = if merge {
+        format!("To enable {verb} the view using MERGE, provide an INSTEAD OF {event} trigger.")
+    } else {
+        format!(
+            "To enable {verb} the view, provide an INSTEAD OF {event} trigger or an unconditional \
+             ON {event} DO INSTEAD rule."
+        )
+    };
+    RawError::new(
+        AnalyzeError::ObjectNotInPrerequisiteState(format!("{message} ({detail})")),
+        None,
+        Some(hint),
+    )
+}
+
+/// rewriteTargetView: `cannot insert into column "c" of view "v"` (`update`,
+/// `merge into`) — SQLSTATE 0A000, with view_col_is_auto_updatable's reason.
+pub(crate) fn view_column_not_updatable(
+    verb: &str,
+    column: &str,
+    view: &str,
+    detail: &str,
+) -> RawError {
+    RawError::new(
+        AnalyzeError::FeatureNotSupported(format!(
+            "cannot {verb} column \"{column}\" of view \"{view}\" ({detail})"
+        )),
+        None,
+        None,
+    )
+}
+
+/// rewriteTargetView: `cannot merge into view "v"` when only some MERGE
+/// actions have INSTEAD OF triggers — SQLSTATE 0A000.
+pub(crate) fn merge_view_partial_instead_triggers(view: &str) -> RawError {
+    RawError::new(
+        AnalyzeError::FeatureNotSupported(format!(
+            "cannot merge into view \"{view}\" (MERGE is not supported for views with INSTEAD OF \
+             triggers for some actions but not all.)"
+        )),
+        None,
+        Some(
+            "To enable merging into the view, either provide a full set of INSTEAD OF triggers \
+             or drop the existing INSTEAD OF triggers."
+                .to_owned(),
+        ),
+    )
+}
+
+/// matchLocks: `cannot execute MERGE on relation "r"` — SQLSTATE 0A000.
+pub(crate) fn merge_on_relation_with_rules(relation: &str) -> RawError {
+    RawError::new(
+        AnalyzeError::FeatureNotSupported(format!(
+            "cannot execute MERGE on relation \"{relation}\" (MERGE is not supported for \
+             relations with rules.)"
+        )),
+        None,
+        None,
+    )
+}
+
+/// RewriteQuery: `INSERT with ON CONFLICT clause cannot be used with table
+/// that has INSERT or UPDATE rules` — SQLSTATE 0A000.
+pub(crate) fn on_conflict_with_rules() -> RawError {
+    RawError::new(
+        AnalyzeError::FeatureNotSupported(
+            "INSERT with ON CONFLICT clause cannot be used with table that has INSERT or UPDATE \
+             rules"
+                .into(),
+        ),
+        None,
+        None,
+    )
+}
+
+/// RewriteQuery: `cannot perform INSERT RETURNING on relation "r"` (UPDATE,
+/// DELETE) when an INSTEAD rule without RETURNING replaces the statement —
+/// SQLSTATE 0A000.
+pub(crate) fn returning_without_instead_rule_returning(
+    command: crate::resolve::DmlEvent,
+    relation: &str,
+) -> RawError {
+    let event = match command {
+        crate::resolve::DmlEvent::Insert => "INSERT",
+        crate::resolve::DmlEvent::Update => "UPDATE",
+        crate::resolve::DmlEvent::Delete => "DELETE",
+    };
+    RawError::new(
+        AnalyzeError::FeatureNotSupported(format!(
+            "cannot perform {event} RETURNING on relation \"{relation}\""
+        )),
+        None,
+        Some(format!(
+            "You need an unconditional ON {event} DO INSTEAD rule with a RETURNING clause."
+        )),
+    )
+}
+
 /// `GROUP BY position N is not in select list` / `ORDER BY position N is
 /// not in select list` — SQLSTATE 42P10 (`invalid_column_reference`).
 pub(crate) fn position_not_in_select_list(
@@ -962,6 +1122,24 @@ mod tests {
             (values_lists_length(2, 1).kind, "42601"),
             (unknown_field_not_coercible("text", None).kind, "XX000"),
             (no_on_conflict_arbiter("t").kind, "42P10"),
+            (insert_non_default_into_generated("g", false).kind, "428C9"),
+            (update_generated_to_non_default("g", true).kind, "428C9"),
+            (
+                view_not_updatable(crate::resolve::DmlEvent::Insert, "v", "x", false).kind,
+                "55000",
+            ),
+            (
+                view_column_not_updatable("update", "c", "v", "x").kind,
+                "0A000",
+            ),
+            (merge_view_partial_instead_triggers("v").kind, "0A000"),
+            (merge_on_relation_with_rules("t").kind, "0A000"),
+            (on_conflict_with_rules().kind, "0A000"),
+            (
+                returning_without_instead_rule_returning(crate::resolve::DmlEvent::Delete, "t")
+                    .kind,
+                "0A000",
+            ),
             (window_does_not_exist("w").kind, "42704"),
             (using_column_missing("id", "left").kind, "42703"),
             (join_using_types_mismatch("integer", "point").kind, "42804"),

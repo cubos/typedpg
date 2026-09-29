@@ -8,17 +8,32 @@ use super::DdlError;
 use crate::oid::{PgClassOid, PgProcOid};
 use crate::pg_catalog::{PgCatalog, RelKind};
 
-/// A trigger (`pg_trigger`): its name and function.
+/// A trigger (`pg_trigger`): its name, function and firing kind.
 #[derive(Clone, Debug)]
 pub(crate) struct Trigger {
     pub(crate) name: String,
     pub(crate) function: PgProcOid,
+    /// The `TRIGGER_TYPE_INSERT | _DELETE | _UPDATE | _TRUNCATE` bits of
+    /// an `INSTEAD OF ... FOR EACH ROW` trigger, else 0 — what the
+    /// relcache's `trig_*_instead_row` flags are made of.
+    pub(crate) instead_row_events: i32,
 }
+
+impl Trigger {
+    /// The relation has an INSTEAD OF row trigger for this event
+    /// (`TRIGGER_TYPE_INSERT` / `_UPDATE` / `_DELETE` bits).
+    pub(crate) fn is_instead_row_for(&self, event_bit: i32) -> bool {
+        self.instead_row_events & event_bit != 0
+    }
+}
+
+/// `TRIGGER_TYPE_UPDATE` (trigger.h).
+pub(crate) const TRIGGER_TYPE_UPDATE: i32 = 1 << 4;
 
 /// `TRIGGER_TYPE_*` bits (trigger.h).
 const TRIGGER_TYPE_BEFORE: i32 = 1 << 1;
-const TRIGGER_TYPE_INSERT: i32 = 1 << 2;
-const TRIGGER_TYPE_DELETE: i32 = 1 << 3;
+pub(crate) const TRIGGER_TYPE_INSERT: i32 = 1 << 2;
+pub(crate) const TRIGGER_TYPE_DELETE: i32 = 1 << 3;
 const TRIGGER_TYPE_INSTEAD: i32 = 1 << 6;
 
 /// CreateTriggerFiringOn: the WHEN condition is transformed as a boolean
@@ -224,6 +239,7 @@ pub fn create_trigger(interp: &mut PgCatalog, stmt: &CreateTrigStmt) -> Result<(
         )));
     }
 
+    let instead_row_events = if instead && stmt.row { stmt.events } else { 0 };
     let triggers = interp.triggers.entry(relid).or_default();
     if let Some(existing) = triggers.iter_mut().find(|t| t.name == stmt.trigname) {
         if !stmt.replace {
@@ -233,11 +249,13 @@ pub fn create_trigger(interp: &mut PgCatalog, stmt: &CreateTrigStmt) -> Result<(
             )));
         }
         existing.function = function;
+        existing.instead_row_events = instead_row_events;
         return Ok(());
     }
     triggers.push(Trigger {
         name: stmt.trigname.clone(),
         function,
+        instead_row_events,
     });
     Ok(())
 }

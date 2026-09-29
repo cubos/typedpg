@@ -67,6 +67,7 @@ pub fn create_view(interp: &mut PgCatalog, stmt: &ViewStmt) -> Result<(), DdlErr
         ));
     }
     check_duplicate_columns(&resolved.columns)?;
+    let updatability = stmt.query.as_deref().map(|q| view_updatability(interp, q));
     // DefineView: WITH CHECK OPTION needs an automatically updatable view
     // (checked before the options are parsed).
     let check_option = stmt.with_check_option > protobuf::ViewCheckOption::NoCheckOption as i32
@@ -97,6 +98,9 @@ pub fn create_view(interp: &mut PgCatalog, stmt: &ViewStmt) -> Result<(), DdlErr
         }
         check_view_columns(interp, existing_oid, &resolved.columns)?;
         replace_view(interp, existing_oid, resolved)?;
+        if let Some(updatability) = updatability {
+            interp.view_updatability.insert(existing_oid, updatability);
+        }
         return Ok(());
     }
 
@@ -119,10 +123,13 @@ pub fn create_view(interp: &mut PgCatalog, stmt: &ViewStmt) -> Result<(), DdlErr
     };
     super::util::check_relation_name_free(interp, nsoid, &name)?;
     install_relation(interp, nsoid, name.clone(), RelKind::View, resolved)?;
-    if Some(nsoid) == interp.temp_namespace
-        && let Some(&oid) = interp.class_by_qname.get(&(nsoid, name))
-    {
-        interp.relpersistence.insert(oid, 't');
+    if let Some(&oid) = interp.class_by_qname.get(&(nsoid, name)) {
+        if Some(nsoid) == interp.temp_namespace {
+            interp.relpersistence.insert(oid, 't');
+        }
+        if let Some(updatability) = updatability {
+            interp.view_updatability.insert(oid, updatability);
+        }
     }
     Ok(())
 }
@@ -1493,32 +1500,67 @@ fn interp_type_collation(
     snapshot.pg_type.get(&type_oid).and_then(|t| t.typcollation)
 }
 
-/// view_query_is_auto_updatable (view.c / rewriteHandler.c) with
-/// `check_cols`: why `query` isn't automatically updatable, if it isn't.
-fn not_auto_updatable_reason(interp: &PgCatalog, query: &protobuf::Node) -> Option<&'static str> {
+/// What the rewriter (rewriteTargetView) needs from a view's stored query
+/// to update it automatically. Computed when the view is (re)defined: the
+/// stored query never changes afterwards.
+#[derive(Clone, Debug)]
+pub(crate) struct ViewUpdatability {
+    /// `view_query_is_auto_updatable(query, check_cols = false)`: why the
+    /// view can't be updated automatically, if it can't.
+    pub(crate) not_updatable: Option<&'static str>,
+    /// The single base relation (when auto-updatable).
+    pub(crate) base: Option<PgClassOid>,
+    /// Per view column, in attnum order: the base column's attnum, or why
+    /// the column isn't updatable (`view_col_is_auto_updatable`).
+    pub(crate) columns: Vec<Result<i16, &'static str>>,
+}
+
+impl ViewUpdatability {
+    /// `view_query_is_auto_updatable` with `check_cols`: at least one
+    /// column must be updatable (INSERT / UPDATE need one).
+    pub(crate) fn reason(&self, check_cols: bool) -> Option<&'static str> {
+        self.not_updatable.or_else(|| {
+            (check_cols && !self.columns.iter().any(Result::is_ok))
+                .then_some("Views that have no updatable columns are not automatically updatable.")
+        })
+    }
+}
+
+/// view_query_is_auto_updatable / view_col_is_auto_updatable
+/// (rewriteHandler.c) over a view's defining SELECT.
+pub(crate) fn view_updatability(interp: &PgCatalog, query: &protobuf::Node) -> ViewUpdatability {
+    let not = |reason: &'static str| ViewUpdatability {
+        not_updatable: Some(reason),
+        base: None,
+        columns: Vec::new(),
+    };
     let Some(node::Node::SelectStmt(sel)) = query.node.as_ref() else {
-        return None;
+        return not(
+            "Views that do not select from a single table or view are not automatically updatable.",
+        );
     };
     if sel.op != protobuf::SetOperation::SetopNone as i32 {
-        return Some(
+        return not(
             "Views containing UNION, INTERSECT, or EXCEPT are not automatically updatable.",
         );
     }
     if !sel.distinct_clause.is_empty() {
-        return Some("Views containing DISTINCT are not automatically updatable.");
+        return not("Views containing DISTINCT are not automatically updatable.");
     }
     if !sel.group_clause.is_empty() {
-        return Some("Views containing GROUP BY are not automatically updatable.");
+        return not("Views containing GROUP BY are not automatically updatable.");
     }
     if sel.having_clause.is_some() {
-        return Some("Views containing HAVING are not automatically updatable.");
+        return not("Views containing HAVING are not automatically updatable.");
     }
     if sel.with_clause.is_some() {
-        return Some("Views containing WITH are not automatically updatable.");
+        return not("Views containing WITH are not automatically updatable.");
     }
     if sel.limit_count.is_some() || sel.limit_offset.is_some() {
-        return Some("Views containing LIMIT or OFFSET are not automatically updatable.");
+        return not("Views containing LIMIT or OFFSET are not automatically updatable.");
     }
+    // hasAggs / hasWindowFuncs cover the whole query level (an ORDER BY
+    // aggregate makes it one), hasTargetSRFs only the target list.
     let mut kinds = crate::expr::FuncKindPresence::default();
     let mut srf = false;
     for target in &sel.target_list {
@@ -1533,50 +1575,106 @@ fn not_auto_updatable_reason(interp: &PgCatalog, query: &protobuf::Node) -> Opti
         kinds.has_window |= found.has_window;
         srf |= returns_set(interp, val);
     }
+    for sort in &sel.sort_clause {
+        let found = crate::expr::detect_func_kinds(sort, interp);
+        kinds.has_aggregate |= found.has_aggregate;
+        kinds.has_window |= found.has_window;
+    }
     if kinds.has_aggregate {
-        return Some("Views that return aggregate functions are not automatically updatable.");
+        return not("Views that return aggregate functions are not automatically updatable.");
     }
     if kinds.has_window {
-        return Some("Views that return window functions are not automatically updatable.");
+        return not("Views that return window functions are not automatically updatable.");
     }
     if srf {
-        return Some("Views that return set-returning functions are not automatically updatable.");
+        return not("Views that return set-returning functions are not automatically updatable.");
     }
     let single_table =
         "Views that do not select from a single table or view are not automatically updatable.";
     let [from] = sel.from_clause.as_slice() else {
-        return Some(single_table);
+        return not(single_table);
     };
-    let Some(node::Node::RangeVar(rv)) = from.node.as_ref() else {
-        return Some(single_table);
+    let (rv, tablesample) = match from.node.as_ref() {
+        Some(node::Node::RangeVar(rv)) => (rv, false),
+        Some(node::Node::RangeTableSample(ts)) => {
+            match ts.relation.as_deref().and_then(|r| r.node.as_ref()) {
+                Some(node::Node::RangeVar(rv)) => (rv, true),
+                _ => return not(single_table),
+            }
+        }
+        _ => return not(single_table),
     };
-    let base = super::util::lookup_relation(interp, rv).ok()?.1;
+    let Ok((_, base)) = super::util::lookup_relation(interp, rv) else {
+        return not(single_table);
+    };
     if !matches!(
         interp.pg_class.get(&base).map(|c| c.relkind),
         Some(RelKind::Table | RelKind::Partitioned | RelKind::View | RelKind::ForeignTable)
     ) {
-        return Some(single_table);
+        return not(single_table);
     }
-    // check_cols: some output column must be a plain column of the base
-    // relation.
-    let updatable = sel.target_list.iter().any(|target| {
+    if tablesample {
+        return not("Views containing TABLESAMPLE are not automatically updatable.");
+    }
+    let alias = rv
+        .alias
+        .as_ref()
+        .map_or(rv.relname.as_str(), |a| a.aliasname.as_str());
+    let base_attrs = interp.attributes_of(base);
+    let not_a_column =
+        "View columns that are not columns of their base relation are not updatable.";
+    // The column a name denotes: a base column, a system column, or the
+    // whole row (a bare relation name).
+    let column = |name: &str, qualified: bool| -> Result<i16, &'static str> {
+        if let Some(a) = base_attrs.iter().find(|a| a.attname == name) {
+            return Ok(a.attnum);
+        }
+        if crate::pg_catalog::SYSTEM_COLUMNS
+            .iter()
+            .any(|(n, ..)| *n == name)
+        {
+            return Err("View columns that refer to system columns are not updatable.");
+        }
+        if !qualified && name == alias {
+            return Err("View columns that return whole-row references are not updatable.");
+        }
+        Err(not_a_column)
+    };
+    let mut columns = Vec::new();
+    for target in &sel.target_list {
         let Some(node::Node::ResTarget(rt)) = target.node.as_ref() else {
-            return false;
+            continue;
         };
         let Some(node::Node::ColumnRef(cr)) = rt.val.as_deref().and_then(|v| v.node.as_ref())
         else {
-            return false;
+            columns.push(Err(not_a_column));
+            continue;
         };
-        match cr.fields.last().and_then(|f| f.node.as_ref()) {
-            Some(node::Node::AStar(_)) => true,
-            Some(node::Node::String(s)) => interp.attribute_by_name(base, &s.sval).is_some(),
-            _ => false,
+        let parts: Vec<&str> = cr
+            .fields
+            .iter()
+            .filter_map(super::util::node_string)
+            .collect();
+        let star = matches!(
+            cr.fields.last().and_then(|f| f.node.as_ref()),
+            Some(node::Node::AStar(_))
+        );
+        if star {
+            // `*` / `alias.*`: every column of the base relation.
+            columns.extend(base_attrs.iter().map(|a| Ok(a.attnum)));
+            continue;
         }
-    });
-    if !updatable {
-        return Some("Views that have no updatable columns are not automatically updatable.");
+        columns.push(match parts.as_slice() {
+            [name] => column(name, false),
+            [_, name] | [_, _, name] => column(name, true),
+            _ => Err(not_a_column),
+        });
     }
-    None
+    ViewUpdatability {
+        not_updatable: None,
+        base: Some(base),
+        columns,
+    }
 }
 
 /// Whether `node` calls a set-returning function outside a sub-select.
@@ -1619,7 +1717,7 @@ pub(crate) fn check_option_allowed(
     interp: &PgCatalog,
     query: &protobuf::Node,
 ) -> Result<(), DdlError> {
-    match not_auto_updatable_reason(interp, query) {
+    match view_updatability(interp, query).reason(true) {
         Some(reason) => Err(DdlError::UnsupportedDdl(format!(
             "WITH CHECK OPTION is supported only on automatically updatable views ({reason})"
         ))),

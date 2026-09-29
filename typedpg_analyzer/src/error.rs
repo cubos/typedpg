@@ -105,6 +105,18 @@ pub enum AnalyzeError {
     #[error("{0}")]
     WindowingError(String),
 
+    /// A non-DEFAULT value written to a generated or `GENERATED ALWAYS`
+    /// identity column. Equivalent to PG `generated_always` (SQLSTATE
+    /// 428C9).
+    #[error("{0}")]
+    GeneratedAlways(String),
+
+    /// The statement needs something the object doesn't have (a view that
+    /// isn't automatically updatable). Equivalent to PG
+    /// `object_not_in_prerequisite_state` (SQLSTATE 55000).
+    #[error("{0}")]
+    ObjectNotInPrerequisiteState(String),
+
     /// Semantic-analysis errors PostgreSQL classifies as `syntax_error`
     /// (SQLSTATE 42601) even though they aren't grammar failures: VALUES
     /// list arity, set-operation column counts.
@@ -271,6 +283,8 @@ impl AnalyzeError {
             DatatypeMismatch(_) => Some("42804"),
             GroupingError(_) => Some("42803"),
             WindowingError(_) => Some("42P20"),
+            GeneratedAlways(_) => Some("428C9"),
+            ObjectNotInPrerequisiteState(_) => Some("55000"),
             TypeMismatch { .. }
             | Invalid(_)
             | InvalidLiteral(_)
@@ -953,6 +967,10 @@ fn replace_message(e: AnalyzeError, rendered: String) -> AnalyzeError {
         AnalyzeError::DatatypeMismatch(_) => AnalyzeError::DatatypeMismatch(rendered),
         AnalyzeError::GroupingError(_) => AnalyzeError::GroupingError(rendered),
         AnalyzeError::WindowingError(_) => AnalyzeError::WindowingError(rendered),
+        AnalyzeError::GeneratedAlways(_) => AnalyzeError::GeneratedAlways(rendered),
+        AnalyzeError::ObjectNotInPrerequisiteState(_) => {
+            AnalyzeError::ObjectNotInPrerequisiteState(rendered)
+        }
         AnalyzeError::SyntaxError(_) => AnalyzeError::SyntaxError(rendered),
         AnalyzeError::UndefinedSchema(_) => AnalyzeError::UndefinedSchema(rendered),
         AnalyzeError::FeatureNotSupported(_) => AnalyzeError::FeatureNotSupported(rendered),

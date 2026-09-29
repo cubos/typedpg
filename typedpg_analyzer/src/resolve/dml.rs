@@ -32,13 +32,45 @@ pub(crate) fn analyze_insert_with_outer_ctes(
     let cte_scopes = build_insert_cte_scopes(ins, snapshot, params, outer_ctes)?;
 
     // Match $N params in VALUES to column types, or analyze INSERT...SELECT.
+    // The rewriter later sees one target list entry per supplied column.
+    let mut assigns: Vec<Assign> = Vec::new();
     if let Some(select_node) = &ins.select_stmt
         && let Some(node::Node::SelectStmt(val_sel)) = select_node.node.as_ref()
     {
         if !val_sel.values_lists.is_empty() {
             analyze_insert_values(ins, val_sel, &tgt, snapshot, params, &cte_scopes)?;
+            let rows: Vec<&[protobuf::Node]> = val_sel
+                .values_lists
+                .iter()
+                .filter_map(|l| match l.node.as_ref() {
+                    Some(node::Node::List(list)) => Some(list.items.as_slice()),
+                    _ => None,
+                })
+                .collect();
+            let width = rows.first().map_or(0, |r| r.len());
+            assigns = (0..width)
+                .filter_map(|i| {
+                    Some(Assign {
+                        column: target_col_at(&tgt, i)?.attname.clone(),
+                        default: rows.iter().all(|r| r.get(i).is_some_and(is_set_to_default)),
+                        null: tgt.col_indirection.get(i).is_none_or(Vec::is_empty)
+                            && rows
+                                .iter()
+                                .any(|r| r.get(i).is_some_and(is_sql_null_literal)),
+                    })
+                })
+                .collect();
         } else {
-            analyze_insert_select(val_sel, &tgt, snapshot, params, &cte_scopes)?;
+            let width = analyze_insert_select(val_sel, &tgt, snapshot, params, &cte_scopes)?;
+            assigns = (0..width)
+                .filter_map(|i| {
+                    Some(Assign {
+                        column: target_col_at(&tgt, i)?.attname.clone(),
+                        default: false,
+                        null: false,
+                    })
+                })
+                .collect();
         }
     }
 
@@ -85,6 +117,21 @@ pub(crate) fn analyze_insert_with_outer_ctes(
         expr::Ctx::new(&ret_scope, &ret_null_ctx, snapshot),
         params,
     )?;
+
+    let mut rw = Rewrite::single(DmlEvent::Insert, assigns, tgt.overriding);
+    rw.returning = has_returning(&ins.returning_clause);
+    rw.on_conflict = ins.on_conflict_clause.as_ref().and_then(|oc| {
+        match protobuf::OnConflictAction::try_from(oc.action) {
+            Ok(protobuf::OnConflictAction::OnconflictUpdate) => {
+                let set = set_list_assigns(&oc.target_list);
+                rw.listed.extend(set.iter().map(|a| a.column.clone()));
+                Some(Some(set))
+            }
+            Ok(protobuf::OnConflictAction::OnconflictNothing) => Some(None),
+            _ => None,
+        }
+    });
+    check_rewrite(snapshot, tgt.oid, &rw)?;
 
     Ok((columns, None))
 }
@@ -410,7 +457,7 @@ fn analyze_insert_select(
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
     cte_scopes: &HashMap<String, Vec<ScopeColumn>>,
-) -> Result<(), AnalyzeError> {
+) -> Result<usize, AnalyzeError> {
     // Walk the SELECT side of `INSERT … SELECT` so its params are registered
     // and any undefined-column / typo errors inside the SELECT propagate
     // cleanly. PG (transformInsertStmt) analyzes the SELECT first and only
@@ -558,7 +605,7 @@ fn analyze_insert_select(
             }
         }
     }
-    Ok(())
+    Ok(sel_cols.len())
 }
 
 /// `ON CONFLICT (…) DO UPDATE SET …` / `DO NOTHING`.
@@ -731,6 +778,9 @@ pub(crate) fn analyze_update_with_outer_ctes(
         expr::Ctx::new(&scope, &null_ctx, snapshot),
         params,
     )?;
+    let mut rw = Rewrite::single(DmlEvent::Update, set_list_assigns(&upd.target_list), false);
+    rw.returning = has_returning(&upd.returning_clause);
+    check_rewrite(snapshot, table_oid, &rw)?;
     Ok((columns, None))
 }
 
@@ -778,6 +828,7 @@ pub(crate) fn analyze_delete_with_outer_ctes(
             )
         })?;
 
+    let table_oid = table.oid;
     let table_relname = table.relname.clone();
     let table_nsname = snapshot
         .namespace_name(table.relnamespace)
@@ -842,5 +893,8 @@ pub(crate) fn analyze_delete_with_outer_ctes(
         expr::Ctx::new(&scope, &null_ctx, snapshot),
         params,
     )?;
+    let mut rw = Rewrite::single(DmlEvent::Delete, Vec::new(), false);
+    rw.returning = has_returning(&del.returning_clause);
+    check_rewrite(snapshot, table_oid, &rw)?;
     Ok((columns, None))
 }

@@ -200,7 +200,77 @@ pub(crate) fn analyze_merge_with_outer_ctes(
         params,
     );
     MERGE_RETURNING_DEPTH.with(|d| d.set(d.get() - 1));
-    Ok((columns?, None))
+    let columns = columns?;
+
+    let mut actions = Vec::new();
+    for when_node in &merge.merge_when_clauses {
+        let Some(node::Node::MergeWhenClause(when)) = when_node.node.as_ref() else {
+            continue;
+        };
+        actions.push(match CmdType::try_from(when.command_type) {
+            Ok(CmdType::CmdInsert) => {
+                // `INSERT (cols) VALUES (…)`, or the leading columns.
+                let names: Vec<String> = if when.target_list.is_empty() {
+                    table_attrs
+                        .iter()
+                        .take(when.values.len())
+                        .map(|a| a.attname.clone())
+                        .collect()
+                } else {
+                    when.target_list
+                        .iter()
+                        .filter_map(|t| match t.node.as_ref() {
+                            Some(node::Node::ResTarget(rt)) => Some(rt.name.clone()),
+                            _ => None,
+                        })
+                        .collect()
+                };
+                Action {
+                    event: Some(DmlEvent::Insert),
+                    assigns: names
+                        .into_iter()
+                        .zip(&when.values)
+                        .map(|(column, v)| Assign {
+                            column,
+                            default: is_set_to_default(v),
+                            null: is_sql_null_literal(v),
+                        })
+                        .collect(),
+                    overriding: when.r#override
+                        == protobuf::OverridingKind::OverridingUserValue as i32
+                        || when.r#override
+                            == protobuf::OverridingKind::OverridingSystemValue as i32,
+                }
+            }
+            Ok(CmdType::CmdUpdate) => Action {
+                event: Some(DmlEvent::Update),
+                assigns: set_list_assigns(&when.target_list),
+                overriding: false,
+            },
+            Ok(CmdType::CmdDelete) => Action {
+                event: Some(DmlEvent::Delete),
+                assigns: Vec::new(),
+                overriding: false,
+            },
+            _ => Action {
+                event: None,
+                assigns: Vec::new(),
+                overriding: false,
+            },
+        });
+    }
+    let rw = Rewrite {
+        merge: true,
+        listed: actions
+            .iter()
+            .flat_map(|a| a.assigns.iter().map(|x| x.column.clone()))
+            .collect(),
+        actions,
+        on_conflict: None,
+        returning: has_returning(&merge.returning_clause),
+    };
+    check_rewrite(snapshot, table_oid, &rw)?;
+    Ok((columns, None))
 }
 
 fn walk_merge_when_clause(
