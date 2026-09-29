@@ -2959,3 +2959,43 @@ fn foreign_data_wrappers_servers_and_user_mappings() {
         ),
     ]);
 }
+
+#[test]
+fn new_objects_need_an_existing_schema() {
+    // PG 18 RangeVarGetCreationNamespace / QualifiedNameGetCreationNamespace:
+    // an object created in a named schema needs that schema.
+    let setup = "CREATE TABLE t (a int);";
+    for stmt in [
+        "CREATE TABLE nosuch.t2 (a int);",
+        "CREATE VIEW nosuch.v AS SELECT 1;",
+        "CREATE SEQUENCE nosuch.s;",
+        "CREATE FUNCTION nosuch.f() RETURNS int LANGUAGE sql AS 'select 1';",
+        "CREATE TYPE nosuch.e AS ENUM ('a');",
+        "CREATE DOMAIN nosuch.d AS int;",
+        "CREATE AGGREGATE nosuch.a (int) (sfunc = int4pl, stype = int);",
+        "CREATE COLLATION nosuch.c FROM \"C\";",
+        "CREATE OPERATOR nosuch.### (leftarg = int, rightarg = int, function = int4pl);",
+        "ALTER TABLE t SET SCHEMA nosuch;",
+        "CREATE TYPE nosuch.r AS RANGE (subtype = int4);",
+        "CREATE TYPE nosuch.c AS (a int);",
+        "CREATE MATERIALIZED VIEW nosuch.mv AS SELECT 1;",
+        "CREATE TABLE nosuch.ct AS SELECT 1;",
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(
+            err.to_string()
+                .starts_with("schema \"nosuch\" does not exist"),
+            "{stmt}\n  got: {err}"
+        );
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "CREATE SCHEMA s;
+             CREATE TABLE s.t2 (a int);
+             CREATE FUNCTION s.f() RETURNS int LANGUAGE sql AS 'select 1';
+             ALTER TABLE t SET SCHEMA s;",
+        ),
+    ]);
+}

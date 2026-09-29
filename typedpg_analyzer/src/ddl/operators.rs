@@ -6,7 +6,7 @@ use crate::oid::{PgOperatorOid, PgTypeOid};
 use crate::pg_catalog::PgOperator;
 
 use super::DdlError;
-use super::util::{ensure_namespace, resolve_type_name};
+use super::util::resolve_type_name;
 use crate::pg_catalog::PgCatalog;
 
 pub fn define_operator(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), DdlError> {
@@ -24,7 +24,7 @@ pub fn define_operator(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), 
         [schema, name] => (schema.clone(), name.clone()),
         _ => return Ok(()),
     };
-    let nsoid = ensure_namespace(interp, &schema)?;
+    let nsoid = super::util::existing_namespace(interp, &schema)?;
 
     let mut left_type: Option<PgTypeOid> = None;
     let mut right_type: Option<PgTypeOid> = None;

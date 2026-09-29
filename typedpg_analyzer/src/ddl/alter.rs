@@ -8,7 +8,7 @@
 use pg_query::protobuf::{AlterObjectSchemaStmt, ObjectType, RenameStmt, node};
 
 use super::DdlError;
-use super::util::{ensure_namespace, node_string, resolve_type_name};
+use super::util::{node_string, resolve_type_name};
 use super::views;
 use crate::oid::{PgNamespaceOid, PgProcOid, PgTypeOid};
 use crate::pg_catalog::{PgCatalog, PgProc, ProKind};
@@ -439,7 +439,7 @@ fn rename_schema(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlErr
 pub fn set_schema(interp: &mut PgCatalog, stmt: &AlterObjectSchemaStmt) -> Result<(), DdlError> {
     let object_type = ObjectType::try_from(stmt.object_type).unwrap_or(ObjectType::Undefined);
     let new_schema = stmt.newschema.clone();
-    let new_nsoid = ensure_namespace(interp, &new_schema)?;
+    let new_nsoid = crate::ddl::util::existing_namespace(interp, &new_schema)?;
 
     match object_type {
         ObjectType::ObjectTable

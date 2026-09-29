@@ -133,9 +133,16 @@ pub fn ensure_namespace(interp: &mut PgCatalog, name: &str) -> Result<PgNamespac
     Ok(oid)
 }
 
-/// Extract a `(nspoid, name)` pair, creating the namespace if it doesn't
-/// exist yet. Convenience wrapper around `extract_names` + `ensure_namespace`
-/// for DDL handlers that are about to insert a row.
+/// LookupCreationNamespace: the schema a new object goes in must exist.
+pub fn existing_namespace(interp: &PgCatalog, name: &str) -> Result<PgNamespaceOid, DdlError> {
+    interp
+        .namespace_oid(name)
+        .ok_or_else(|| DdlError::TableNotFound(format!("schema \"{name}\" does not exist")))
+}
+
+/// The `(nspoid, name)` a new object is created as
+/// (QualifiedNameGetCreationNamespace): the named schema, which must exist,
+/// or the creation schema.
 pub fn ensure_qualified_name(
     interp: &mut PgCatalog,
     names: &[Node],
@@ -146,10 +153,11 @@ pub fn ensure_qualified_name(
         [name] => (creation_schema(interp)?, (*name).to_owned()),
         _ => ("public".to_owned(), String::new()),
     };
-    Ok((ensure_namespace(interp, &schema)?, name))
+    Ok((existing_namespace(interp, &schema)?, name))
 }
 
-/// Same as `ensure_qualified_name` but for `RangeVar` inputs.
+/// Same as `ensure_qualified_name` but for `RangeVar` inputs
+/// (RangeVarGetCreationNamespace).
 pub fn ensure_range_var(
     interp: &mut PgCatalog,
     rv: &RangeVar,
@@ -159,7 +167,7 @@ pub fn ensure_range_var(
     } else {
         rv.schemaname.clone()
     };
-    Ok((ensure_namespace(interp, &schema)?, rv.relname.clone()))
+    Ok((existing_namespace(interp, &schema)?, rv.relname.clone()))
 }
 
 /// Resolve a `TypeName` AST node to a type OID in the snapshot.

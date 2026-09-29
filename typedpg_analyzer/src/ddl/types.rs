@@ -560,7 +560,7 @@ pub fn create_range(interp: &mut PgCatalog, stmt: &CreateRangeStmt) -> Result<()
         ));
     };
     let (mr_nsoid, mr_name) = match multirange_names.as_deref() {
-        Some([schema, mr]) => (super::util::ensure_namespace(interp, schema)?, mr.clone()),
+        Some([schema, mr]) => (super::util::existing_namespace(interp, schema)?, mr.clone()),
         Some([mr]) => (nsoid, mr.clone()),
         _ => (nsoid, make_multirange_type_name(&name)),
     };
