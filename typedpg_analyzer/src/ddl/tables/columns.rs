@@ -730,7 +730,7 @@ fn add_column_to(
         find_composite_type_dependencies(interp, row_type, relid)?;
     }
     // ATExecAddColumn: BuildDescForRelation's STORAGE and COMPRESSION.
-    super::column_options::check_column_def_options(interp, cd, col.type_oid)?;
+    let storage = super::column_options::check_column_def_options(interp, cd, col.type_oid)?;
     // ATExecAddColumn: CheckAttributeType, within the relation's row type.
     super::generated::check_attribute_type(
         interp,
@@ -761,6 +761,9 @@ fn add_column_to(
         attislocal: !rec.recursing,
         attinhcount: i16::from(rec.recursing),
     });
+    if let Some(storage) = storage {
+        super::column_options::record_attr_storage(interp, relid, next_attnum, storage);
+    }
     if let Some(default_type) = default_type {
         interp
             .attr_default_types
@@ -1052,6 +1055,7 @@ pub(crate) fn drop_column(
 
     interp.attr_default_types.remove(&(relid, target.attnum));
     interp.attr_default_exprs.remove(&(relid, target.attnum));
+    interp.attr_storage.remove(&(relid, target.attnum));
     crate::ddl::statistics::drop_column_statistics(interp, relid, target.attnum);
     crate::ddl::defaults::forget_default_dependencies(interp, relid, target.attnum);
     if let Some(attrs) = interp.pg_attribute.get_mut(&relid) {
@@ -1384,6 +1388,8 @@ pub(crate) fn alter_column_type(
         col.atttypmod = new_typmod;
         col.attcollation = new_collation;
     }
+    // ATExecAlterColumnType: attstorage becomes the new type's.
+    interp.attr_storage.remove(&(relid, attr.attnum));
     crate::ddl::indexes::rebuild_indexes_for_column_type(
         interp,
         relid,

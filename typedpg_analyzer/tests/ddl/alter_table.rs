@@ -759,3 +759,56 @@ fn a_partition_gets_no_column_of_its_own() {
         ),
     ]);
 }
+
+#[test]
+fn toast_storage_parameters_are_checked_only_with_a_toast_table() {
+    // ATExecSetRelOptions validates `toast.` options against the TOAST
+    // table, which exists once a CREATE / ALTER left the relation with a
+    // column needing one (needs_toast_table) and survives the column;
+    // CREATE TABLE ... WITH always validates them.
+    build_db(&[(
+        "0001.sql",
+        "CREATE TABLE a (x int);
+         ALTER TABLE a SET (toast.fillfactor = 50);
+         ALTER TABLE a SET (toast.fillfactor = 5, toast.toast_tuple_target = 200);
+         CREATE TABLE c (x int);
+         ALTER TABLE c ADD COLUMN t text, SET (toast.fillfactor = 50);
+         CREATE TABLE d (v varchar(500));
+         ALTER TABLE d SET (toast.fillfactor = 50);
+         CREATE TABLE h (n numeric(1000, 0));
+         ALTER TABLE h SET (toast.fillfactor = 50);
+         CREATE TABLE f (t text STORAGE plain);
+         ALTER TABLE f SET (toast.fillfactor = 50);
+         CREATE TABLE fc () INHERITS (f);
+         ALTER TABLE fc SET (toast.fillfactor = 50);
+         CREATE MATERIALIZED VIEW m AS SELECT 1 AS x;
+         ALTER MATERIALIZED VIEW m SET (toast.fillfactor = 50);",
+    )]);
+    let setup = "CREATE TABLE a (x int, t text);
+                 CREATE TABLE b (x int, t text);
+                 ALTER TABLE b DROP COLUMN t;
+                 CREATE TABLE c (x int);
+                 ALTER TABLE c ADD COLUMN t text;
+                 CREATE TABLE e (v varchar(600));
+                 CREATE TABLE k (v varchar(500), n numeric(1000, 0));
+                 CREATE TABLE g (t text);
+                 ALTER TABLE g ALTER COLUMN t SET STORAGE plain;
+                 CREATE MATERIALIZED VIEW m AS SELECT 'x'::text AS x;";
+    for stmt in [
+        "ALTER TABLE a SET (toast.fillfactor = 50);",
+        "ALTER TABLE b SET (toast.fillfactor = 50);",
+        "ALTER TABLE c SET (toast.fillfactor = 50);",
+        "ALTER TABLE e SET (toast.fillfactor = 50);",
+        "ALTER TABLE k SET (toast.fillfactor = 50);",
+        "ALTER TABLE g SET (toast.fillfactor = 50);",
+        "ALTER MATERIALIZED VIEW m SET (toast.fillfactor = 50);",
+        "CREATE TABLE n (x int) WITH (toast.fillfactor = 50);",
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(
+            err.to_string()
+                .starts_with("unrecognized parameter \"fillfactor\""),
+            "{stmt}\n  got: {err}"
+        );
+    }
+}

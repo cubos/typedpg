@@ -21,6 +21,7 @@ pub(crate) const LIKE_DEFAULTS: u32 = 1 << 3;
 pub(crate) const LIKE_GENERATED: u32 = 1 << 4;
 pub(crate) const LIKE_IDENTITY: u32 = 1 << 5;
 pub(crate) const LIKE_INDEXES: u32 = 1 << 6;
+pub(crate) const LIKE_STORAGE: u32 = 1 << 8;
 
 /// A `LIKE source INCLUDING ...` clause whose constraints / indexes are
 /// copied once the new relation exists.

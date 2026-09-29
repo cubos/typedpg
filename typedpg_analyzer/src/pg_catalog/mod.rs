@@ -343,6 +343,13 @@ pub struct PgCatalog {
     pub(crate) partition_bounds: HashMap<PgClassOid, crate::ddl::tables::partbound::Bound>,
     /// CHECK constraints' expressions and `connoinherit`.
     pub(crate) check_defs: HashMap<PgConstraintOid, crate::ddl::tables::check_inherit::CheckDef>,
+    /// Tables and materialized views with a TOAST table (`reltoastrelid`):
+    /// the CREATE or ALTER that first left them with a column needing one
+    /// (needs_toast_table) made it, and it stays.
+    pub(crate) toast_tables: std::collections::HashSet<PgClassOid>,
+    /// `attstorage` of the columns whose storage isn't their type's
+    /// `typstorage` (a STORAGE clause, ALTER COLUMN SET STORAGE).
+    pub(crate) attr_storage: HashMap<(PgClassOid, i16), TypStorage>,
     /// `pg_type.typsubscript` of user base types, as the handler function's
     /// name (`hstore_subscript_handler`), set by `CREATE TYPE (SUBSCRIPT =
     /// …)` / `ALTER TYPE … SET (SUBSCRIPT = …)`. Built-in types aren't
@@ -629,6 +636,8 @@ impl PgCatalog {
             fk_details: HashMap::new(),
             partition_bounds: HashMap::new(),
             check_defs: HashMap::new(),
+            toast_tables: std::collections::HashSet::new(),
+            attr_storage: HashMap::new(),
             next_oid: USER_OID_START_NZ,
             #[cfg(feature = "pg_sanity")]
             pg_sanity: None,
@@ -1298,6 +1307,8 @@ impl PgCatalog {
         self.sequence_params.remove(&oid);
         self.foreign_data.table_servers.remove(&oid);
         self.relpersistence.remove(&oid);
+        self.toast_tables.remove(&oid);
+        self.attr_storage.retain(|(relid, _), _| *relid != oid);
         for p in &mut self.publications {
             p.forget_relation(oid);
         }

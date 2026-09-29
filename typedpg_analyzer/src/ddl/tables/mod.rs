@@ -373,11 +373,14 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
     }
     // BuildDescForRelation: each column definition's STORAGE and
     // COMPRESSION, for the column's final type.
+    let mut storage_clauses: Vec<(String, TypStorage)> = Vec::new();
     for elt in &stmt.table_elts {
         if let Some(node::Node::ColumnDef(cd)) = elt.node.as_ref()
             && let Some(col) = columns.iter().find(|c| c.name == cd.colname)
+            && let Some(storage) =
+                column_options::check_column_def_options(interp, cd, col.type_oid)?
         {
-            column_options::check_column_def_options(interp, cd, col.type_oid)?;
+            storage_clauses.push((cd.colname.clone(), storage));
         }
     }
     // CheckAttributeNamesTypes (heap_create_with_catalog): no column may
@@ -398,6 +401,28 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
             attislocal: col.is_local,
             attinhcount: col.inhcount,
         });
+    }
+    // attstorage: the STORAGE clause, else an inherited column's parent's
+    // (MergeAttributes), else a LIKE ... INCLUDING STORAGE source's.
+    for (i, col) in columns.iter().enumerate() {
+        let from_source = |src: PgClassOid| {
+            let attnum = interp.attribute_by_name(src, &col.name)?.attnum;
+            interp.attr_storage.get(&(src, attnum)).copied()
+        };
+        let storage = storage_clauses
+            .iter()
+            .find(|(n, _)| *n == col.name)
+            .map(|(_, s)| *s)
+            .or_else(|| parents.iter().find_map(|&p| from_source(p)))
+            .or_else(|| {
+                likes
+                    .iter()
+                    .filter(|l| l.options & merge::LIKE_STORAGE != 0)
+                    .find_map(|l| from_source(l.source))
+            });
+        if let Some(storage) = storage {
+            column_options::record_attr_storage(interp, class_oid, (i + 1) as i16, storage);
+        }
     }
     let phys = crate::ddl::types::TypePhysical::COMPOSITE;
     interp.insert_pg_type(PgType {
@@ -900,6 +925,9 @@ pub fn alter_table(interp: &mut PgCatalog, stmt: &AlterTableStmt) -> Result<(), 
         )));
     }
 
+    // The TOAST tables the earlier statements made: SET (toast.*) reads
+    // them, and a column this statement drops or retypes keeps one.
+    toast::note_toast_tables(interp);
     for cmd_node in &stmt.cmds {
         let Some(node::Node::AlterTableCmd(cmd)) = cmd_node.node.as_ref() else {
             continue;
@@ -1094,8 +1122,23 @@ fn set_reloptions(
         }
         _ => return Ok(()),
     };
+    // ATExecSetRelOptions validates the `toast.` options only for a
+    // relation that has a TOAST table.
+    let items: Vec<typedpg_pg_query::protobuf::Node> = if kind == RelOptKind::Heap
+        && !interp.toast_tables.contains(&relid)
+    {
+        list.items
+            .iter()
+            .filter(|o| {
+                !matches!(o.node.as_ref(), Some(node::Node::DefElem(de)) if de.defnamespace == "toast")
+            })
+            .cloned()
+            .collect()
+    } else {
+        list.items.clone()
+    };
     crate::ddl::reloptions::check_reloptions(
-        &list.items,
+        &items,
         kind,
         subtype == AlterTableType::AtResetRelOptions,
         false,
@@ -1234,6 +1277,7 @@ pub(crate) mod inherit;
 mod inherit_cmd;
 mod merge;
 mod object_refs;
+pub(crate) mod toast;
 pub(crate) use object_refs::check_clusterable_index;
 pub(crate) mod partbound;
 pub(crate) mod partidx;

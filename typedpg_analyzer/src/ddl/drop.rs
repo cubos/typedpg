@@ -13,6 +13,9 @@ use crate::pg_catalog::{
 use crate::qualified_name::QualifiedName;
 
 pub fn drop_objects(interp: &mut PgCatalog, stmt: &DropStmt) -> Result<(), DdlError> {
+    // A TOAST table outlives the columns that needed it, which a CASCADE
+    // can drop.
+    super::tables::toast::note_toast_tables(interp);
     let obj_type = ObjectType::try_from(stmt.remove_type).unwrap_or(ObjectType::Undefined);
     let cascade = matches!(
         DropBehavior::try_from(stmt.behavior),

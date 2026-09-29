@@ -10,7 +10,7 @@ use crate::pg_catalog::{SYSTEM_COLUMNS, TypStorage};
 const MIN_STATISTICS_TARGET: i32 = -1;
 
 pub(super) fn alter_column_setting(
-    interp: &PgCatalog,
+    interp: &mut PgCatalog,
     relid: PgClassOid,
     cmd: &AlterTableCmd,
     subtype: AlterTableType,
@@ -69,7 +69,9 @@ pub(super) fn alter_column_setting(
 
     match subtype {
         AlterTableType::AtSetStorage => {
-            get_attribute_storage(interp, attr.atttypid, &def_name().unwrap_or_default())?;
+            let storage =
+                get_attribute_storage(interp, attr.atttypid, &def_name().unwrap_or_default())?;
+            record_attr_storage(interp, relid, attr.attnum, storage);
         }
         AlterTableType::AtSetCompression => {
             let method = def_name().unwrap_or_default();
@@ -144,19 +146,41 @@ pub(crate) fn get_attribute_compression(
 }
 
 /// BuildDescForRelation: a column definition's STORAGE and COMPRESSION
-/// clauses, for its type.
+/// clauses, for its type. Returns the STORAGE clause's mode.
 pub(crate) fn check_column_def_options(
     interp: &PgCatalog,
     cd: &typedpg_pg_query::protobuf::ColumnDef,
     typid: PgTypeOid,
-) -> Result<(), DdlError> {
-    if !cd.storage_name.is_empty() {
-        get_attribute_storage(interp, typid, &cd.storage_name)?;
-    }
+) -> Result<Option<TypStorage>, DdlError> {
+    let storage = if cd.storage_name.is_empty() {
+        None
+    } else {
+        Some(get_attribute_storage(interp, typid, &cd.storage_name)?)
+    };
     if !cd.compression.is_empty() {
         get_attribute_compression(interp, typid, &cd.compression)?;
     }
-    Ok(())
+    Ok(storage)
+}
+
+/// Remember column `relid.attnum`'s `attstorage` when it isn't its type's.
+pub(crate) fn record_attr_storage(
+    interp: &mut PgCatalog,
+    relid: PgClassOid,
+    attnum: i16,
+    storage: TypStorage,
+) {
+    let typstorage = interp
+        .attributes_of(relid)
+        .iter()
+        .find(|a| a.attnum == attnum)
+        .and_then(|a| interp.pg_type.get(&a.atttypid))
+        .map(|t| t.typstorage);
+    if typstorage == Some(storage) {
+        interp.attr_storage.remove(&(relid, attnum));
+    } else {
+        interp.attr_storage.insert((relid, attnum), storage);
+    }
 }
 
 /// ChooseIndexColumnNames (indexcmds.c): an index column is named after
