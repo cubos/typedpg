@@ -257,6 +257,9 @@ pub struct PgCatalog {
     pub(crate) index_parents: HashMap<PgClassOid, PgClassOid>,
     /// `pg_sequence` rows of the sequences migrations create.
     pub(crate) sequence_params: HashMap<PgClassOid, crate::ddl::seqparams::SeqParams>,
+    /// Foreign-data wrappers, servers, user mappings, foreign tables'
+    /// servers.
+    pub(crate) foreign_data: crate::ddl::fdw::ForeignData,
     /// `pg_partitioned_table`: strategy and key types.
     pub(crate) partition_specs: HashMap<PgClassOid, crate::ddl::tables::partbound::PartSpec>,
     /// `relpartbound` of each partition.
@@ -524,6 +527,7 @@ impl PgCatalog {
             index_access_methods: HashMap::new(),
             index_parents: HashMap::new(),
             sequence_params: HashMap::new(),
+            foreign_data: Default::default(),
             partition_specs: HashMap::new(),
             partition_bounds: HashMap::new(),
             check_defs: HashMap::new(),
@@ -1148,6 +1152,7 @@ impl PgCatalog {
         self.index_access_methods.remove(&oid);
         self.index_parents.remove(&oid);
         self.sequence_params.remove(&oid);
+        self.foreign_data.table_servers.remove(&oid);
         self.index_parents.retain(|_, parent| *parent != oid);
         self.partition_specs.remove(&oid);
         self.partition_bounds.remove(&oid);

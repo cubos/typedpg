@@ -236,6 +236,11 @@ pub(crate) fn resolve_object(
                 _ => {}
             }
         }
+        ObjectType::ObjectForeignServer => {
+            if let node::Node::String(s) = object {
+                super::fdw::check_server(interp, &s.sval)?;
+            }
+        }
         ObjectType::ObjectStatisticExt => {
             if let node::Node::List(l) = object
                 && !super::statistics::statistics_exist(interp, &l.items)

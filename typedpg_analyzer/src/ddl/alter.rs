@@ -40,6 +40,10 @@ pub fn rename(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlError>
         ObjectType::ObjectPolicy => crate::ddl::policies::rename_policy(interp, stmt),
         ObjectType::ObjectRule => crate::ddl::rules::rename_rule(interp, stmt),
         ObjectType::ObjectStatisticExt => crate::ddl::statistics::rename_statistics(interp, stmt),
+        ObjectType::ObjectFdw => crate::ddl::fdw::rename_foreign_object(interp, true, stmt),
+        ObjectType::ObjectForeignServer => {
+            crate::ddl::fdw::rename_foreign_object(interp, false, stmt)
+        }
         _ => Ok(()),
     }
 }

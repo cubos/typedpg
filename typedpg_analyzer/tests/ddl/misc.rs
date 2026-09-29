@@ -2853,3 +2853,109 @@ fn sequence_parameters_are_validated() {
         ),
     ]);
 }
+
+#[test]
+fn foreign_data_wrappers_servers_and_user_mappings() {
+    // PG 18 foreigncmds.c / get_foreign_server_oid.
+    let setup = "CREATE FOREIGN DATA WRAPPER w;
+                 CREATE SERVER s FOREIGN DATA WRAPPER w;
+                 CREATE USER MAPPING FOR public SERVER s;
+                 CREATE FOREIGN TABLE ft (a int) SERVER s;";
+    for (stmt, msg) in [
+        (
+            "CREATE FOREIGN DATA WRAPPER w;",
+            "foreign-data wrapper \"w\" already exists",
+        ),
+        (
+            "CREATE FOREIGN DATA WRAPPER w2 HANDLER nosuch;",
+            "function nosuch() does not exist",
+        ),
+        (
+            "CREATE FOREIGN DATA WRAPPER w3 VALIDATOR nosuch;",
+            "function nosuch(text[], oid) does not exist",
+        ),
+        (
+            "CREATE SERVER s2 FOREIGN DATA WRAPPER nosuch;",
+            "foreign-data wrapper \"nosuch\" does not exist",
+        ),
+        (
+            "CREATE SERVER s FOREIGN DATA WRAPPER w;",
+            "server \"s\" already exists",
+        ),
+        (
+            "CREATE USER MAPPING FOR public SERVER nosuch;",
+            "server \"nosuch\" does not exist",
+        ),
+        (
+            "CREATE USER MAPPING FOR public SERVER s;",
+            "user mapping for \"public\" already exists for server \"s\"",
+        ),
+        (
+            "CREATE FOREIGN TABLE ft2 (a int) SERVER nosuch;",
+            "server \"nosuch\" does not exist",
+        ),
+        ("DROP SERVER nosuch;", "server \"nosuch\" does not exist"),
+        (
+            "DROP SERVER s;",
+            "cannot drop server s because other objects depend on it",
+        ),
+        (
+            "DROP FOREIGN DATA WRAPPER nosuch;",
+            "foreign-data wrapper \"nosuch\" does not exist",
+        ),
+        (
+            "DROP FOREIGN DATA WRAPPER w;",
+            "cannot drop foreign-data wrapper w because other objects depend on it",
+        ),
+        (
+            "ALTER SERVER nosuch OPTIONS (a 'b');",
+            "server \"nosuch\" does not exist",
+        ),
+        (
+            "ALTER FOREIGN DATA WRAPPER nosuch OPTIONS (a 'b');",
+            "foreign-data wrapper \"nosuch\" does not exist",
+        ),
+        (
+            "DROP USER MAPPING FOR public SERVER nosuch;",
+            "server \"nosuch\" does not exist",
+        ),
+        (
+            "DROP USER MAPPING FOR public SERVER s; DROP USER MAPPING FOR public SERVER s;",
+            "user mapping for \"public\" does not exist for server \"s\"",
+        ),
+        (
+            "IMPORT FOREIGN SCHEMA x FROM SERVER s INTO nosuch;",
+            "schema \"nosuch\" does not exist",
+        ),
+        (
+            "IMPORT FOREIGN SCHEMA x FROM SERVER nosuch INTO public;",
+            "server \"nosuch\" does not exist",
+        ),
+        (
+            "ALTER SERVER nosuch RENAME TO s3;",
+            "server \"nosuch\" does not exist",
+        ),
+        (
+            "DROP SERVER s CASCADE; SELECT * FROM ft;",
+            "relation \"ft\" does not exist",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "CREATE SERVER IF NOT EXISTS s FOREIGN DATA WRAPPER w;
+             ALTER SERVER s RENAME TO s2;
+             CREATE FOREIGN TABLE ft3 (a int) SERVER s2;
+             ALTER SERVER s2 OPTIONS (ADD host 'x');
+             DROP USER MAPPING IF EXISTS FOR public SERVER nosuch;
+             DROP USER MAPPING FOR public SERVER s2;
+             DROP SERVER IF EXISTS nosuch;
+             DROP FOREIGN DATA WRAPPER w CASCADE;
+             CREATE FOREIGN DATA WRAPPER w;",
+        ),
+    ]);
+}

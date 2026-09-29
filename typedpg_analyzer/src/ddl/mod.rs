@@ -14,6 +14,7 @@ mod dml;
 pub mod drop;
 mod expr_kind;
 pub mod extensions;
+pub(crate) mod fdw;
 pub(crate) mod function_body;
 pub mod functions;
 mod guc;
@@ -220,6 +221,14 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         node::Node::AlterPolicyStmt(s) => policies::alter_policy(db, s),
         node::Node::RuleStmt(s) => rules::create_rule(db, s),
         node::Node::CreateAmStmt(s) => opclass::create_am(db, s),
+        node::Node::CreateFdwStmt(s) => fdw::create_fdw(db, s),
+        node::Node::AlterFdwStmt(s) => fdw::alter_fdw(db, s),
+        node::Node::CreateForeignServerStmt(s) => fdw::create_server(db, s),
+        node::Node::AlterForeignServerStmt(s) => fdw::alter_server(db, s),
+        node::Node::CreateUserMappingStmt(s) => fdw::create_user_mapping(db, s),
+        node::Node::AlterUserMappingStmt(s) => fdw::alter_user_mapping(db, s),
+        node::Node::DropUserMappingStmt(s) => fdw::drop_user_mapping(db, s),
+        node::Node::ImportForeignSchemaStmt(s) => fdw::import_foreign_schema(db, s),
         node::Node::CreateStatsStmt(s) => statistics::create_statistics(db, s),
         node::Node::AlterStatsStmt(s) => statistics::alter_statistics(db, s),
         node::Node::CreateOpClassStmt(s) => opclass::create_opclass(db, s),
@@ -279,14 +288,6 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         | node::Node::DropSubscriptionStmt(_)
         | node::Node::AlterTsconfigurationStmt(_)
         | node::Node::AlterTsdictionaryStmt(_)
-        | node::Node::CreateFdwStmt(_)
-        | node::Node::AlterFdwStmt(_)
-        | node::Node::CreateForeignServerStmt(_)
-        | node::Node::AlterForeignServerStmt(_)
-        | node::Node::CreateUserMappingStmt(_)
-        | node::Node::AlterUserMappingStmt(_)
-        | node::Node::DropUserMappingStmt(_)
-        | node::Node::ImportForeignSchemaStmt(_)
         | node::Node::CreateTableSpaceStmt(_)
         | node::Node::DropTableSpaceStmt(_)
         | node::Node::AlterTableSpaceOptionsStmt(_)

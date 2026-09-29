@@ -556,6 +556,8 @@ pub fn create_foreign_table(
     if existed.is_some() {
         return Ok(());
     }
+    // CreateForeignTable: GetForeignServerByName.
+    crate::ddl::fdw::check_server(interp, &stmt.servername)?;
     if let Some(rv) = base.relation.as_ref() {
         let (schema, name) = range_var_names(rv, interp);
         if let Some(oid) = interp
@@ -564,6 +566,10 @@ pub fn create_foreign_table(
             && let Some(class) = interp.pg_class.get_mut(&oid)
         {
             class.relkind = RelKind::ForeignTable;
+            interp
+                .foreign_data
+                .table_servers
+                .insert(oid, stmt.servername.clone());
         }
     }
     Ok(())
