@@ -29,6 +29,7 @@ fn ty(oid: u32, name: &str, namespace: u32, len: i16, typtype: u8, category: u8)
         typmod: -1,
         not_null: false,
         collation: 0,
+        is_defined: true,
     }
 }
 

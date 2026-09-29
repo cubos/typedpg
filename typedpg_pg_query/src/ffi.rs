@@ -75,6 +75,7 @@ pub(crate) struct TypedpgType {
     pub typtypmod: i32,
     pub typnotnull: bool,
     pub typcollation: u32,
+    pub typisdefined: bool,
 }
 
 /// `TypedpgAttribute` in csrc/catalog.h.

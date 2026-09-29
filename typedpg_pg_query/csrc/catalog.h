@@ -39,6 +39,7 @@ typedef struct TypedpgType
 	int32_t		typtypmod;
 	bool		typnotnull;
 	uint32_t	typcollation;
+	bool		typisdefined;
 } TypedpgType;
 
 /* The pg_attribute columns %TYPE reads. */

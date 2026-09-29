@@ -78,7 +78,7 @@ typedpg_search_type(Oid typid)
 	t->typtype = row.typtype;
 	t->typcategory = row.typcategory;
 	t->typispreferred = row.typispreferred;
-	t->typisdefined = true;
+	t->typisdefined = row.typisdefined;
 	t->typdelim = ',';
 	t->typrelid = row.typrelid;
 	t->typsubscript = row.typsubscript;

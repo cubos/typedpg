@@ -39,6 +39,8 @@ pub struct CatalogType {
     pub typmod: i32,
     pub not_null: bool,
     pub collation: u32,
+    /// `typisdefined`: `false` for a shell type.
+    pub is_defined: bool,
 }
 
 /// A `pg_attribute` row, with the columns `%TYPE` reads.
@@ -131,6 +133,7 @@ extern "C" fn type_by_oid(ctx: *mut c_void, oid: u32, out: *mut ffi::TypedpgType
             typtypmod: t.typmod,
             typnotnull: t.not_null,
             typcollation: t.collation,
+            typisdefined: t.is_defined,
         };
         // SAFETY: C passes a writable TypedpgType.
         unsafe { out.write(row) };
