@@ -11,7 +11,24 @@ to a release tag) and exposes:
 - `parse`, `scan`, `deparse` and `parse_plpgsql`;
 - `protobuf`, the AST types, generated from libpg_query's `pg_query.proto`;
 - `NodeRef` / `NodeMut`, a view of a node by kind, and `nodes()` /
-  `nodes_mut()`, every node of a tree (breadth-first, with its depth).
+  `nodes_mut()`, every node of a tree (breadth-first, with its depth);
+- `parse_plpgsql_with_catalog`, which compiles a PL/pgSQL function against a
+  caller-supplied `Catalog` (see below).
+
+## PL/pgSQL and the catalog
+
+SQL parsing is pure grammar, but PL/pgSQL's compiler looks things up: the
+types of the arguments, the result and declared variables, schemas, and — for
+`%TYPE` / `%ROWTYPE` — relations and columns. Outside a server, libpg_query
+answers those lookups from mocks that only know the built-in types.
+
+`parse_plpgsql_with_catalog` installs a `Catalog` for the duration of the
+call, and the lookups read it instead (`csrc/catalog.c` plus the redirecting
+patches in `patches.rs`): user-defined types resolve with their real kind,
+and missing objects get PostgreSQL's own errors (`type "x" does not exist`,
+`relation "t" does not exist`, `column "c" of relation "t" does not exist`).
+PostgreSQL 18.4's `%TYPE` / `%ROWTYPE` code, which libpg_query replaces with a
+text-only stand-in, is restored while a catalog is installed.
 
 `PG_VERSION` / `PG_VERSION_NUM` name the PostgreSQL release the grammar comes
 from; they are read from the vendored `pg_query.h` at build time.
@@ -35,19 +52,19 @@ from; they are read from the vendored `pg_query.h` at build time.
 
 `patches.rs` lists exact-text replacements applied to libpg_query's sources
 at build time: the build copies each patched file into `OUT_DIR` and compiles
-the copy. They fix gaps in libpg_query 18.0.0's PL/pgSQL support, which
-compiles function bodies against a mock, catalog-less syscache:
+the copy. They fall in three groups:
 
-- the PL/pgSQL JSON dump wrote a trigger function's `TG_*` promise datums as
-  empty objects (invalid JSON), and left out `retvarno`, a record variable's
-  declared type and the type name as written;
-- the mock `pg_type` rows had no `typelem` / `typsubscript`, so no array was a
-  true array and every `VARIADIC` function was rejected;
-- a type qualified by a schema other than `pg_catalog` / `public` failed with
-  "Not implemented", and an array of a user-defined type became the
-  pseudo-type `record[]`;
-- `build_datatype` never kept the written type name, so a user-defined type
-  (compiled as a record by the mocks) could not be identified.
+- **Catalog hooks** — route the mocked catalog lookups to an installed
+  `Catalog`, and restore PostgreSQL's `%TYPE` / `%ROWTYPE` code while one is.
+- **PL/pgSQL JSON dump fixes** — libpg_query 18.0.0 wrote a trigger
+  function's `TG_*` promise datums as empty objects (invalid JSON), and left
+  out `retvarno`, a record variable's declared type and the type name as
+  written.
+- **Mock fixes**, for compiling without a catalog: the mock `pg_type` rows
+  had no `typelem` / `typsubscript` (every `VARIADIC` function was rejected),
+  schemas other than `pg_catalog` / `public` failed with "Not implemented",
+  an array of a user-defined type became the pseudo-type `record[]`, and the
+  written type name was never kept.
 
 ## License
 
