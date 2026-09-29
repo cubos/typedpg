@@ -727,3 +727,84 @@ fn split_dotted(text: &str) -> Vec<String> {
     }
     out
 }
+
+/// The pseudo-types a function may take and return: ProcedureCreate's
+/// `internal` rule for every language, then fmgr_sql_validator's and
+/// plpgsql_validator's (checked whatever check_function_bodies says).
+pub(crate) fn check_pseudo_types(
+    interp: &PgCatalog,
+    language: Option<&str>,
+    proc: &PgProc,
+) -> Result<(), DdlError> {
+    let typname = |t: PgTypeOid| interp.pg_type.get(&t).map(|ty| ty.typname.clone());
+    let is_pseudo = |t: PgTypeOid| {
+        interp
+            .pg_type
+            .get(&t)
+            .is_some_and(|ty| ty.typtype == TypType::Pseudo)
+    };
+    let internal = |t: PgTypeOid| typname(t).as_deref() == Some("internal");
+    let inputs = input_params(proc);
+    // A procedure's result is void or its OUT parameters' record.
+    let is_procedure = proc.prokind == crate::pg_catalog::ProKind::Procedure;
+    if internal(proc.prorettype) && !inputs.iter().any(|(_, t)| internal(*t)) {
+        return Err(DdlError::Parse(
+            "unsafe use of pseudo-type \"internal\" (A function returning \"internal\" must \
+             have at least one \"internal\" argument.)"
+                .into(),
+        ));
+    }
+    let shown = |t: PgTypeOid| super::util::format_type_for_message(interp, t);
+    match language {
+        Some("sql") => {
+            let rettype = proc.prorettype;
+            if !is_procedure
+                && is_pseudo(rettype)
+                && !matches!(typname(rettype).as_deref(), Some("void" | "record"))
+                && !is_polymorphic(interp, rettype)
+            {
+                return Err(DdlError::Parse(format!(
+                    "SQL functions cannot return type {}",
+                    shown(rettype)
+                )));
+            }
+            for (_, t) in &inputs {
+                if is_pseudo(*t) && !is_polymorphic(interp, *t) {
+                    return Err(DdlError::Parse(format!(
+                        "SQL functions cannot have arguments of type {}",
+                        shown(*t)
+                    )));
+                }
+            }
+        }
+        Some("plpgsql") => {
+            let rettype = proc.prorettype;
+            if !is_procedure
+                && is_pseudo(rettype)
+                && !matches!(
+                    typname(rettype).as_deref(),
+                    Some("void" | "record" | "trigger" | "event_trigger")
+                )
+                && !is_polymorphic(interp, rettype)
+            {
+                return Err(DdlError::UnsupportedDdl(format!(
+                    "PL/pgSQL functions cannot return type {}",
+                    shown(rettype)
+                )));
+            }
+            for (_, t) in &inputs {
+                if is_pseudo(*t)
+                    && typname(*t).as_deref() != Some("record")
+                    && !is_polymorphic(interp, *t)
+                {
+                    return Err(DdlError::UnsupportedDdl(format!(
+                        "PL/pgSQL functions cannot accept type {}",
+                        shown(*t)
+                    )));
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}

@@ -274,6 +274,7 @@ pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Res
         provolatile,
         proargdefaulttypes,
     };
+    super::function_body::check_pseudo_types(interp, function_language(stmt).as_deref(), &proc)?;
     interp.insert_pg_proc(proc.clone());
     if let Some(body) = super::function_body::inlinable_body(stmt, &proc) {
         interp.inline_sql_bodies.insert(oid, body);

@@ -3781,3 +3781,62 @@ fn identity_sequence_options_are_validated() {
         ),
     ]);
 }
+
+#[test]
+fn functions_follow_pseudo_type_rules() {
+    // PG 18 ProcedureCreate / fmgr_sql_validator / plpgsql_validator.
+    let setup = "CREATE TABLE t (a text);";
+    for (stmt, msg) in [
+        (
+            "CREATE FUNCTION f1(cstring) RETURNS int LANGUAGE sql AS 'select 1';",
+            "SQL functions cannot have arguments of type cstring",
+        ),
+        (
+            "CREATE FUNCTION f2(internal) RETURNS int LANGUAGE sql AS 'select 1';",
+            "SQL functions cannot have arguments of type internal",
+        ),
+        (
+            "CREATE FUNCTION f4() RETURNS cstring LANGUAGE sql AS 'select 1';",
+            "SQL functions cannot return type cstring",
+        ),
+        (
+            "CREATE FUNCTION f5() RETURNS internal LANGUAGE sql AS 'select 1';",
+            "unsafe use of pseudo-type \"internal\"",
+        ),
+        (
+            "CREATE FUNCTION f6() RETURNS trigger LANGUAGE sql AS 'select 1';",
+            "SQL functions cannot return type trigger",
+        ),
+        (
+            "CREATE FUNCTION f8(trigger) RETURNS int LANGUAGE sql AS 'select 1';",
+            "SQL functions cannot have arguments of type trigger",
+        ),
+        (
+            "CREATE FUNCTION f10(cstring) RETURNS int LANGUAGE plpgsql AS 'begin return 1; end';",
+            "PL/pgSQL functions cannot accept type cstring",
+        ),
+        (
+            "CREATE FUNCTION f11() RETURNS cstring LANGUAGE plpgsql AS 'begin return 1; end';",
+            "PL/pgSQL functions cannot return type cstring",
+        ),
+        (
+            "CREATE FUNCTION f12() RETURNS internal LANGUAGE c AS 'x', 'y';",
+            "unsafe use of pseudo-type \"internal\"",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "CREATE FUNCTION f3(anyelement) RETURNS int LANGUAGE sql AS 'select 1';
+             CREATE FUNCTION f9() RETURNS trigger LANGUAGE plpgsql AS 'begin return null; end';
+             CREATE FUNCTION f13() RETURNS void LANGUAGE sql AS 'select';
+             CREATE FUNCTION f14() RETURNS record LANGUAGE sql AS 'select 1, 2';
+             CREATE FUNCTION f15(record) RETURNS int LANGUAGE plpgsql AS 'begin return 1; end';
+             CREATE PROCEDURE p1() LANGUAGE sql AS 'select 1';",
+        ),
+    ]);
+}
