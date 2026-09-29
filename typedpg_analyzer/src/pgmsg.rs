@@ -157,6 +157,27 @@ pub(crate) fn duplicate_table_alias(alias: &str) -> RawError {
     )
 }
 
+/// `OLD cannot be specified multiple times` (or `NEW …`) — SQLSTATE 42601:
+/// a `RETURNING WITH (…)` list naming the same row twice
+/// (`transformReturningClause`).
+pub(crate) fn returning_option_repeated(kind: &str, span: Option<SourceSpan>) -> RawError {
+    RawError::new(
+        AnalyzeError::SyntaxError(format!("{kind} cannot be specified multiple times")),
+        span,
+        None,
+    )
+}
+
+/// `RETURNING must have at least one column` — SQLSTATE 42601: a nonempty
+/// RETURNING list whose stars expanded to nothing (a zero-column table).
+pub(crate) fn returning_without_columns(span: Option<SourceSpan>) -> RawError {
+    RawError::new(
+        AnalyzeError::SyntaxError("RETURNING must have at least one column".into()),
+        span,
+        None,
+    )
+}
+
 /// `table "t" has N columns available but M columns specified` — SQLSTATE
 /// 42P10: a FROM column-alias list longer than the relation's width.
 pub(crate) fn too_many_column_aliases(alias: &str, available: usize, specified: usize) -> RawError {

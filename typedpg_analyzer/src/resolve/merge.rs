@@ -149,8 +149,16 @@ pub(crate) fn analyze_merge_with_outer_ctes(
     }
 
     let mut source_may_be_null = false;
+    let mut rows = ReturningRows::default();
     for when_node in &merge.merge_when_clauses {
         if let Some(node::Node::MergeWhenClause(when)) = when_node.node.as_ref() {
+            // An INSERT action returns a row with no old version, a DELETE
+            // action one with no new version.
+            match CmdType::try_from(when.command_type) {
+                Ok(CmdType::CmdInsert) => rows.old_may_be_null = true,
+                Ok(CmdType::CmdDelete) => rows.new_may_be_null = true,
+                _ => {}
+            }
             let when_scope = match protobuf::MergeMatchKind::try_from(when.match_kind) {
                 Ok(protobuf::MergeMatchKind::MergeWhenNotMatchedBySource) => {
                     // Rows of the target without a source match: the source
@@ -172,16 +180,19 @@ pub(crate) fn analyze_merge_with_outer_ctes(
         }
     }
 
-    // RETURNING sees the source and the target. The target columns are the
-    // inserted / updated / deleted row, so they keep their base
-    // nullability; the source is NULL for NOT MATCHED BY SOURCE actions.
+    // RETURNING sees the source and the target (plus the OLD / NEW rows).
+    // The target columns are the inserted / updated / deleted row, so they
+    // keep their base nullability; the source is NULL for NOT MATCHED BY
+    // SOURCE actions.
     let mut ret_null_ctx = null_ctx.clone();
     if source_may_be_null {
         ret_null_ctx.mark_all_nullable(&nullability::collect_aliases(&source_scope.sources));
     }
     MERGE_RETURNING_DEPTH.with(|d| d.set(d.get() + 1));
-    let columns = resolve_target_list(
-        returning_exprs(&merge.returning_clause),
+    let columns = resolve_returning(
+        &merge.returning_clause,
+        &target_alias,
+        rows,
         expr::Ctx::new(&both, &ret_null_ctx, snapshot),
         params,
     );

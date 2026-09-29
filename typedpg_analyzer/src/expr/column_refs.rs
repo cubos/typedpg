@@ -145,9 +145,9 @@ fn sql_function_param(parts: &[String], snapshot: &PgCatalog) -> Option<ExprType
 /// `create_table` registers alongside the table — same OID that a call site
 /// like `row_to_json(alias.*)` would see at runtime.
 /// A whole-row reference is NULL when its entry is on the nullable side of
-/// an outer join.
+/// an outer join, or is a RETURNING OLD / NEW row that may not exist.
 fn whole_row_nullable(src: &crate::scope::TableSource, null_ctx: &NullabilityContext) -> bool {
-    null_ctx.alias_is_nullable(&src.alias)
+    src.null_row || null_ctx.alias_is_nullable(&src.alias)
 }
 
 fn infer_star_ref(

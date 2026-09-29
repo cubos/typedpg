@@ -70,6 +70,14 @@ pub(crate) struct TableSource {
     /// What kind of range-table entry PG would build for this FROM item —
     /// drives the locking-clause rules (`transformLockingClause`).
     pub kind: SourceKind,
+    /// A table-only namespace item (`addNSItemToQuery` with
+    /// `addToVarNameSpace = false`): reachable by its name (`new.col`,
+    /// `new.*`, a whole-row `new`) but never by an unqualified column name
+    /// or the bare `*`. Rule OLD / NEW and RETURNING's OLD / NEW rows.
+    pub table_only: bool,
+    /// The whole row may be absent (NULL): RETURNING's `old` for an INSERT,
+    /// `new` for a DELETE. Its columns are then nullable too.
+    pub null_row: bool,
 }
 
 /// The RTE kind behind a [`TableSource`].
@@ -122,6 +130,8 @@ impl TableSource {
             join_hidden: Default::default(),
             lateral_blocked: false,
             kind: SourceKind::Other,
+            table_only: false,
+            null_row: false,
         }
     }
 
@@ -129,7 +139,37 @@ impl TableSource {
     pub(crate) fn visible_columns(&self) -> impl Iterator<Item = &ScopeColumn> {
         self.columns
             .iter()
-            .filter(|c| !self.join_hidden.contains(&c.name))
+            .filter(|c| !self.table_only && !self.join_hidden.contains(&c.name))
+    }
+
+    /// The system columns an unqualified reference can see.
+    fn visible_system_columns(&self) -> impl Iterator<Item = &ScopeColumn> {
+        self.system_columns.iter().filter(|_| !self.table_only)
+    }
+
+    /// This entry under another name, as a table-only namespace item —
+    /// PG's `addNSItemForReturning` copy of the target relation. With
+    /// `null_row`, the row (and so every column) may be NULL.
+    pub(crate) fn table_only_copy(&self, alias: &str, null_row: bool) -> Self {
+        let rename = |cols: &[ScopeColumn]| -> Vec<ScopeColumn> {
+            cols.iter()
+                .map(|c| ScopeColumn {
+                    table_alias: alias.to_owned(),
+                    base_not_null: c.base_not_null && !null_row,
+                    ..c.clone()
+                })
+                .collect()
+        };
+        TableSource {
+            alias: alias.to_owned(),
+            columns: rename(&self.columns),
+            system_columns: rename(&self.system_columns),
+            join_hidden: Default::default(),
+            lateral_blocked: false,
+            table_only: true,
+            null_row,
+            ..self.clone()
+        }
     }
 }
 
@@ -219,7 +259,7 @@ pub(crate) fn with_rule_pseudo_relations<R>(
         .sources
         .into_iter()
         .map(|mut s| {
-            s.join_hidden = s.columns.iter().map(|c| c.name.clone()).collect();
+            s.table_only = true;
             s
         })
         .collect();
@@ -551,7 +591,7 @@ impl Scope {
                 // scanRTEForColumn also finds the relation's system columns.
                 for col in source
                     .visible_columns()
-                    .chain(source.system_columns.iter())
+                    .chain(source.visible_system_columns())
                     .filter(|c| c.name == column)
                 {
                     matches.push((source, col));

@@ -52,15 +52,36 @@ pub(crate) fn analyze_insert_with_outer_ctes(
         ..Scope::default()
     };
     let ret_null_ctx = NullabilityContext::default();
+    let target_qn = crate::qualified_name::QualifiedName::new(&tgt.nsname, &tgt.relname);
     ret_scope.add_dml_target(
         snapshot,
         insert_target_alias(relation),
-        crate::qualified_name::QualifiedName::new(&tgt.nsname, &tgt.relname),
+        target_qn.clone(),
         &tgt.attrs,
     );
+    // ON CONFLICT DO UPDATE's EXCLUDED is in the range table but not the
+    // namespace RETURNING sees: referencing it is PG's `invalid reference
+    // to FROM-clause entry`, and it does not mask a RETURNING OLD / NEW
+    // alias.
+    if ins
+        .on_conflict_clause
+        .as_ref()
+        .is_some_and(|oc| oc.action == protobuf::OnConflictAction::OnconflictUpdate as i32)
+    {
+        let mut holder = Scope::default();
+        holder.add_dml_target(snapshot, "excluded", target_qn, &tgt.attrs);
+        ret_scope.shadowed_sources.extend(holder.sources);
+    }
 
-    let columns = resolve_target_list(
-        returning_exprs(&ins.returning_clause),
+    // No returned row of an INSERT has an old version, except the ones
+    // ON CONFLICT DO UPDATE updated.
+    let columns = resolve_returning(
+        &ins.returning_clause,
+        insert_target_alias(relation),
+        ReturningRows {
+            old_may_be_null: true,
+            new_may_be_null: false,
+        },
         expr::Ctx::new(&ret_scope, &ret_null_ctx, snapshot),
         params,
     )?;
@@ -692,8 +713,10 @@ pub(crate) fn analyze_update_with_outer_ctes(
         check_no_srf_in_clause(where_clause, snapshot, "WHERE")?;
     }
 
-    let columns = resolve_target_list(
-        returning_exprs(&upd.returning_clause),
+    let columns = resolve_returning(
+        &upd.returning_clause,
+        alias,
+        ReturningRows::default(),
         expr::Ctx::new(&scope, &null_ctx, snapshot),
         params,
     )?;
@@ -797,8 +820,14 @@ pub(crate) fn analyze_delete_with_outer_ctes(
         check_no_srf_in_clause(where_clause, snapshot, "WHERE")?;
     }
 
-    let columns = resolve_target_list(
-        returning_exprs(&del.returning_clause),
+    // A deleted row has no new version.
+    let columns = resolve_returning(
+        &del.returning_clause,
+        alias,
+        ReturningRows {
+            old_may_be_null: false,
+            new_may_be_null: true,
+        },
         expr::Ctx::new(&scope, &null_ctx, snapshot),
         params,
     )?;
