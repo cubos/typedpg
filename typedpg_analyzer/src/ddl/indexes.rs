@@ -402,7 +402,7 @@ pub(crate) fn check_index_columns(
 
 /// `FigureIndexColname`: a function call is named after the function, a
 /// column reference after the column (through casts), anything else `expr`.
-fn figure_index_colname(expr: Option<&typedpg_pg_query::protobuf::Node>) -> String {
+pub(crate) fn figure_index_colname(expr: Option<&typedpg_pg_query::protobuf::Node>) -> String {
     match expr.and_then(|e| e.node.as_ref()) {
         Some(node::Node::FuncCall(fc)) => fc
             .funcname

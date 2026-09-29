@@ -699,7 +699,10 @@ fn exclusion_keys(
         };
         if elem.name.is_empty() {
             attnums.push(0);
-            names.push("expr".to_owned());
+            // ChooseIndexColumnNames → FigureIndexColname.
+            names.push(crate::ddl::indexes::figure_index_colname(
+                elem.expr.as_deref(),
+            ));
         } else {
             let attnum = interp
                 .attribute_by_name(relid, &elem.name)

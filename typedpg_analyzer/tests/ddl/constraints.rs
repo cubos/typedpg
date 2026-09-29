@@ -887,3 +887,27 @@ fn foreign_key_columns_pair_through_the_referenced_opclass() {
         assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
     }
 }
+
+#[test]
+fn exclusion_constraint_names_follow_figure_index_colname() {
+    // ChooseIndexColumnNames: an expression element is named like
+    // FigureIndexColname — after the column under a cast, after the
+    // function called.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE circles (c1 circle, c2 text,
+            EXCLUDE USING gist (c1 WITH &&, (c2::circle) WITH &&)
+            WHERE (circle_center(c1) <> '(0,0)'));
+         CREATE TABLE e2 (a int, b int, EXCLUDE USING btree (abs(a) WITH =, (b + 1) WITH =));
+         REINDEX INDEX circles_c1_c2_excl;",
+    )]);
+    let names = db.pg_constraint_names_for_table("public", "circles");
+    assert!(names.iter().any(|n| n == "circles_c1_c2_excl"), "{names:?}");
+    let names = db.pg_constraint_names_for_table("public", "e2");
+    assert!(names.iter().any(|n| n == "e2_abs_expr_excl"), "{names:?}");
+    db.analyze(
+        "INSERT INTO circles VALUES ('<(20,20), 10>', '<(0,0), 4>')
+         ON CONFLICT ON CONSTRAINT circles_c1_c2_excl DO NOTHING",
+    )
+    .unwrap();
+}
