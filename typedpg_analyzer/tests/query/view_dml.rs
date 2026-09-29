@@ -614,7 +614,10 @@ fn data_modifying_with_on_relations_with_rules() {
         &db,
         "WITH q AS (INSERT INTO ti VALUES (1, 1) RETURNING *) SELECT * FROM q",
     );
-    assert_ok(&db, "WITH q AS (DELETE FROM tr RETURNING id) SELECT * FROM q");
+    assert_ok(
+        &db,
+        "WITH q AS (DELETE FROM tr RETURNING id) SELECT * FROM q",
+    );
     // The statement itself (not in WITH) may fire them.
     assert_ok(&db, "INSERT INTO tr VALUES (1, 1)");
 }

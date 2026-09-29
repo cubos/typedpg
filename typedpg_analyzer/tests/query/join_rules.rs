@@ -197,7 +197,10 @@ fn join_on_clause_sees_only_its_own_sides() {
         "SELECT * FROM t, u JOIN nn ON nn.q = (SELECT t.a)",
     ] {
         let err = db.analyze(sql).unwrap_err();
-        assert!(matches!(err, AnalyzeError::UndefinedTable(_)), "{sql}: {err:?}");
+        assert!(
+            matches!(err, AnalyzeError::UndefinedTable(_)),
+            "{sql}: {err:?}"
+        );
         assert!(
             err.to_string()
                 .starts_with("invalid reference to FROM-clause entry for table \"t\""),

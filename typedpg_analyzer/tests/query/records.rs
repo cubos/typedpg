@@ -484,9 +484,7 @@ fn bare_alias_of_non_table_from_items() {
         .unwrap();
     assert_eq!(s.columns.len(), 2);
     // A column of the same name still wins over the whole row.
-    let s = db
-        .analyze("SELECT q FROM (SELECT 1 AS q) q")
-        .unwrap();
+    let s = db.analyze("SELECT q FROM (SELECT 1 AS q) q").unwrap();
     assert_cols(&s, vec![c("q", int4())]);
 }
 

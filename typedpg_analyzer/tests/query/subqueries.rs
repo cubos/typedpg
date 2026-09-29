@@ -613,8 +613,6 @@ fn from_subquery_sees_enclosing_levels() {
          (SELECT 1 FROM (SELECT p.id FROM posts p WHERE p.user_id = u.id) q)",
     )
     .unwrap();
-    db.analyze(
-        "SELECT * FROM users u, LATERAL (SELECT * FROM (SELECT u.name) i) q",
-    )
-    .unwrap();
+    db.analyze("SELECT * FROM users u, LATERAL (SELECT * FROM (SELECT u.name) i) q")
+        .unwrap();
 }

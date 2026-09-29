@@ -353,7 +353,7 @@ fn analyze_insert_values(
             None => first_len = Some(list.items.len()),
             Some(n) if n != list.items.len() => {
                 return Err(
-                    crate::pgmsg::values_lists_length(n, list.items.len()).finalize_implicit(),
+                    crate::pgmsg::values_lists_length(n, list.items.len()).finalize_implicit()
                 );
             }
             Some(_) => {}
@@ -702,12 +702,8 @@ fn transform_on_conflict_arbiter(
         where_clause: None,
     };
     let invalid = |msg: &str| {
-        crate::error::RawError::new(
-            AnalyzeError::InvalidColumnReference(msg.into()),
-            None,
-            None,
-        )
-        .finalize_implicit()
+        crate::error::RawError::new(AnalyzeError::InvalidColumnReference(msg.into()), None, None)
+            .finalize_implicit()
     };
     for elem in &infer.index_elems {
         let Some(node::Node::IndexElem(ie)) = elem.node.as_ref() else {
@@ -723,7 +719,9 @@ fn transform_on_conflict_arbiter(
             ie.nulls_ordering(),
             protobuf::SortByNulls::SortbyNullsDefault | protobuf::SortByNulls::Undefined
         ) {
-            return Err(invalid("NULLS FIRST/LAST is not allowed in ON CONFLICT clause"));
+            return Err(invalid(
+                "NULLS FIRST/LAST is not allowed in ON CONFLICT clause",
+            ));
         }
         if !ie.name.is_empty() {
             // A plain column becomes a ColumnRef transformed like any
@@ -817,9 +815,7 @@ fn check_index_expr_kind(
     });
     if has_sublink {
         return Err(crate::error::RawError::new(
-            AnalyzeError::FeatureNotSupported(format!(
-                "cannot use subquery in {subquery_context}"
-            )),
+            AnalyzeError::FeatureNotSupported(format!("cannot use subquery in {subquery_context}")),
             None,
             None,
         )

@@ -267,7 +267,10 @@ fn unqualify(node: &protobuf::Node) -> protobuf::Node {
         for cr in column_refs {
             let fields = &mut (*cr).fields;
             if fields.len() > 1
-                && matches!(fields.last().and_then(|f| f.node.as_ref()), Some(node::Node::String(_)))
+                && matches!(
+                    fields.last().and_then(|f| f.node.as_ref()),
+                    Some(node::Node::String(_))
+                )
             {
                 let last = fields.pop();
                 fields.clear();

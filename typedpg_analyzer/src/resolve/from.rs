@@ -216,14 +216,16 @@ pub(crate) fn process_from_item(
                     if !(rv.schemaname.is_empty() && cte_scopes.contains_key(&rv.relname)) =>
                 {
                     let schema = (!rv.schemaname.is_empty()).then_some(rv.schemaname.as_str());
-                    snapshot.resolve_table(schema, &rv.relname).is_some_and(|c| {
-                        matches!(
-                            c.relkind,
-                            crate::pg_catalog::RelKind::Table
-                                | crate::pg_catalog::RelKind::MaterializedView
-                                | crate::pg_catalog::RelKind::Partitioned
-                        )
-                    })
+                    snapshot
+                        .resolve_table(schema, &rv.relname)
+                        .is_some_and(|c| {
+                            matches!(
+                                c.relkind,
+                                crate::pg_catalog::RelKind::Table
+                                    | crate::pg_catalog::RelKind::MaterializedView
+                                    | crate::pg_catalog::RelKind::Partitioned
+                            )
+                        })
                 }
                 _ => false,
             };
@@ -527,8 +529,7 @@ fn process_join_expr(
         // sides (plus outer levels); the FROM items beside the join are in
         // the range table but not referencable from it.
         let mut on_scope = scope.clone();
-        let side_sources: Vec<crate::scope::TableSource> =
-            left.to(right).sources(scope).to_vec();
+        let side_sources: Vec<crate::scope::TableSource> = left.to(right).sources(scope).to_vec();
         on_scope.shadowed_sources.extend(
             scope.sources[..left.start]
                 .iter()
@@ -1513,7 +1514,9 @@ pub(crate) fn pushed_lock_error(
                     _ => None,
                 }
             }
-            node::Node::RangeTableSample(ts) => item(ts.relation.as_deref()?, nullable, ctes, snapshot),
+            node::Node::RangeTableSample(ts) => {
+                item(ts.relation.as_deref()?, nullable, ctes, snapshot)
+            }
             node::Node::JoinExpr(j) => {
                 let (l, r) = match JoinType::try_from(j.jointype) {
                     Ok(JoinType::JoinLeft) => (nullable, true),

@@ -625,11 +625,7 @@ fn rewritten_queries(
     let mut matching: Vec<&crate::ddl::rules::Rule> = snapshot
         .rules
         .get(&relid)
-        .map(|rs| {
-            rs.iter()
-                .filter(|r| r.enabled && r.event == cmd)
-                .collect()
-        })
+        .map(|rs| rs.iter().filter(|r| r.enabled && r.event == cmd).collect())
         .unwrap_or_default();
     matching.sort_by(|a, b| a.name.cmp(&b.name));
     let instead = matching.iter().any(|r| r.instead && !r.conditional);
@@ -645,14 +641,12 @@ fn rewritten_queries(
         let mut dml = rule.actions.iter();
         for &action_cmd in &rule.action_cmds {
             match action_cmd {
-                CmdType::CmdInsert | CmdType::CmdUpdate | CmdType::CmdDelete => {
-                    match dml.next() {
-                        Some((target, _)) => out.extend(rewritten_queries(
-                            snapshot, *target, action_cmd, qsrc, events,
-                        )),
-                        None => out.push((action_cmd, qsrc)),
-                    }
-                }
+                CmdType::CmdInsert | CmdType::CmdUpdate | CmdType::CmdDelete => match dml.next() {
+                    Some((target, _)) => out.extend(rewritten_queries(
+                        snapshot, *target, action_cmd, qsrc, events,
+                    )),
+                    None => out.push((action_cmd, qsrc)),
+                },
                 other => out.push((other, qsrc)),
             }
         }
@@ -666,10 +660,7 @@ fn rewritten_queries(
         && !qual_product
         && is_view
         && !view_has_instead_trigger(snapshot, relid, Some(event), &[])
-        && let Some(base) = snapshot
-            .view_updatability
-            .get(&relid)
-            .and_then(|u| u.base)
+        && let Some(base) = snapshot.view_updatability.get(&relid).and_then(|u| u.base)
     {
         let base_queries = rewritten_queries(snapshot, base, cmd, source, events);
         if event == DmlEvent::Insert {
@@ -724,7 +715,9 @@ pub(crate) fn check_with_query_rules(
         many => {
             for (_, src) in many {
                 match src {
-                    QuerySource::QualInsteadRule => return Err(unsupported("conditional DO INSTEAD")),
+                    QuerySource::QualInsteadRule => {
+                        return Err(unsupported("conditional DO INSTEAD"));
+                    }
                     QuerySource::NonInsteadRule => return Err(unsupported("DO ALSO")),
                     _ => {}
                 }

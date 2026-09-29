@@ -376,7 +376,10 @@ fn recursive_with_items_see_later_siblings() {
              SELECT * FROM x",
         )
         .unwrap_err();
-    assert!(matches!(err, AnalyzeError::FeatureNotSupported(_)), "{err:?}");
+    assert!(
+        matches!(err, AnalyzeError::FeatureNotSupported(_)),
+        "{err:?}"
+    );
     assert!(
         err.to_string()
             .starts_with("mutual recursion between WITH items is not implemented"),
@@ -427,7 +430,10 @@ fn recursive_reference_under_intersect_and_except() {
         ),
     ] {
         let err = db.analyze(sql).unwrap_err();
-        assert!(matches!(err, AnalyzeError::InvalidRecursion(_)), "{sql}: {err:?}");
+        assert!(
+            matches!(err, AnalyzeError::InvalidRecursion(_)),
+            "{sql}: {err:?}"
+        );
         assert!(err.to_string().starts_with(msg), "{sql}: {err}");
     }
 }
@@ -534,8 +540,14 @@ fn search_cycle_column_names() {
             "SEARCH DEPTH FIRST BY n SET n",
             "column reference \"n\" is ambiguous",
         ),
-        ("CYCLE n SET n USING p", "column reference \"n\" is ambiguous"),
-        ("CYCLE n SET c USING n", "column reference \"n\" is ambiguous"),
+        (
+            "CYCLE n SET n USING p",
+            "column reference \"n\" is ambiguous",
+        ),
+        (
+            "CYCLE n SET c USING n",
+            "column reference \"n\" is ambiguous",
+        ),
     ];
     for (clause, msg) in cases {
         let sql = format!("{R} {clause} SELECT * FROM r");
@@ -563,7 +575,10 @@ fn search_cycle_column_names() {
     ))
     .unwrap();
     for (sql, width) in [
-        (format!("{R} SEARCH DEPTH FIRST BY n SET o SELECT * FROM r"), 2),
+        (
+            format!("{R} SEARCH DEPTH FIRST BY n SET o SELECT * FROM r"),
+            2,
+        ),
         (
             format!("{R} SEARCH DEPTH FIRST BY n SET o, s AS (SELECT * FROM r) SELECT * FROM s"),
             1,

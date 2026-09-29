@@ -167,7 +167,10 @@ fn from_list_cannot_reference_the_dml_target() {
         "MERGE INTO t USING generate_series(1, t.v) g ON true WHEN MATCHED THEN DELETE",
     ] {
         let err = db.analyze(sql).unwrap_err();
-        assert!(matches!(err, AnalyzeError::UndefinedTable(_)), "{sql}: {err:?}");
+        assert!(
+            matches!(err, AnalyzeError::UndefinedTable(_)),
+            "{sql}: {err:?}"
+        );
         assert!(
             err.to_string()
                 .starts_with("invalid reference to FROM-clause entry for table \"t\""),

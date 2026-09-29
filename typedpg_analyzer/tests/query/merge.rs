@@ -206,7 +206,9 @@ fn merge_returning_as_cte_body() {
 fn merge_insert_values_must_match_the_target_columns() {
     let db = setup();
     let err = db
-        .analyze("MERGE INTO t USING s ON t.id = s.id WHEN NOT MATCHED THEN INSERT (id, v) VALUES (1)")
+        .analyze(
+            "MERGE INTO t USING s ON t.id = s.id WHEN NOT MATCHED THEN INSERT (id, v) VALUES (1)",
+        )
         .unwrap_err();
     assert!(matches!(err, AnalyzeError::SyntaxError(_)), "{err:?}");
     assert!(
@@ -243,11 +245,13 @@ fn merge_rejects_unreachable_when_clauses() {
          WHEN NOT MATCHED BY SOURCE AND t.v > 0 THEN DO NOTHING",
     ] {
         let err = db.analyze(sql).unwrap_err();
-        assert!(matches!(err, AnalyzeError::SyntaxError(_)), "{sql}: {err:?}");
         assert!(
-            err.to_string().starts_with(
-                "unreachable WHEN clause specified after unconditional WHEN clause"
-            ),
+            matches!(err, AnalyzeError::SyntaxError(_)),
+            "{sql}: {err:?}"
+        );
+        assert!(
+            err.to_string()
+                .starts_with("unreachable WHEN clause specified after unconditional WHEN clause"),
             "{sql}: {err}"
         );
     }
@@ -269,7 +273,10 @@ fn merge_target_and_source_need_distinct_names() {
         "MERGE INTO t AS x USING (SELECT 1 AS id) x ON true WHEN MATCHED THEN DELETE",
     ] {
         let err = db.analyze(sql).unwrap_err();
-        assert!(matches!(err, AnalyzeError::DuplicateAlias(_)), "{sql}: {err:?}");
+        assert!(
+            matches!(err, AnalyzeError::DuplicateAlias(_)),
+            "{sql}: {err:?}"
+        );
         assert!(
             err.to_string().starts_with("name \"")
                 && err.to_string().contains("\" specified more than once"),

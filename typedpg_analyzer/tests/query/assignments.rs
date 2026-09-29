@@ -302,14 +302,18 @@ fn on_conflict_inference_where_is_analyzed() {
             "WHERE generate_series(1, 2) > 0",
             "set-returning functions are not allowed in index predicates",
         ),
-        ("WHERE (SELECT true)", "cannot use subquery in index predicate"),
+        (
+            "WHERE (SELECT true)",
+            "cannot use subquery in index predicate",
+        ),
         (
             "WHERE excluded.v > 0",
             "missing FROM-clause entry for table \"excluded\"",
         ),
     ];
     for (clause, msg) in cases {
-        let sql = format!("INSERT INTO t (id, v) VALUES (1, 1) ON CONFLICT (id) {clause} DO NOTHING");
+        let sql =
+            format!("INSERT INTO t (id, v) VALUES (1, 1) ON CONFLICT (id) {clause} DO NOTHING");
         let err = db.analyze(&sql).unwrap_err();
         assert!(err.to_string().starts_with(msg), "{sql}: {err}");
     }
@@ -341,11 +345,19 @@ fn on_conflict_partial_index_predicate_is_implied() {
         "WHERE t.v > 0 AND w IS NOT NULL",
         "WHERE (v > 3 OR v = 1)",
     ] {
-        let sql = format!("INSERT INTO t (id, v) VALUES (1, 1) ON CONFLICT (w) {clause} DO NOTHING");
+        let sql =
+            format!("INSERT INTO t (id, v) VALUES (1, 1) ON CONFLICT (w) {clause} DO NOTHING");
         db.analyze(&sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
-    for clause in ["", "WHERE v >= 0", "WHERE v < 5", "WHERE v <> 0", "WHERE v > 0 OR id > 0"] {
-        let sql = format!("INSERT INTO t (id, v) VALUES (1, 1) ON CONFLICT (w) {clause} DO NOTHING");
+    for clause in [
+        "",
+        "WHERE v >= 0",
+        "WHERE v < 5",
+        "WHERE v <> 0",
+        "WHERE v > 0 OR id > 0",
+    ] {
+        let sql =
+            format!("INSERT INTO t (id, v) VALUES (1, 1) ON CONFLICT (w) {clause} DO NOTHING");
         let err = db.analyze(&sql).unwrap_err();
         assert!(
             matches!(err, AnalyzeError::InvalidColumnReference(_)),
@@ -371,7 +383,10 @@ fn on_conflict_inference_elements() {
             "operator class \"nope_ops\" does not exist for access method \"btree\"",
         ),
         ("((nope + 1))", "column \"nope\" does not exist"),
-        ("((id + 'x'))", "invalid input syntax for type integer: \"x\""),
+        (
+            "((id + 'x'))",
+            "invalid input syntax for type integer: \"x\"",
+        ),
         (
             "(ctid)",
             "there is no unique or exclusion constraint matching the ON CONFLICT specification",
@@ -439,7 +454,8 @@ fn assigning_to_a_system_column_is_refused() {
             "{sql}: {err:?}"
         );
         assert!(
-            err.to_string().starts_with("cannot assign to system column"),
+            err.to_string()
+                .starts_with("cannot assign to system column"),
             "{sql}: {err}"
         );
     }
