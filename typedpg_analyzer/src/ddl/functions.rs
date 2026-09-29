@@ -295,6 +295,8 @@ pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Res
     // the catalog, so a recursive SQL function resolves.
     super::function_body::validate_sql_function(interp, stmt, &proc)?;
     super::function_body::validate_plpgsql_function(interp, stmt)?;
+    // ProcedureCreate: a SQL-standard body depends on what it reads.
+    super::coldeps::record_function_body(interp, oid, stmt);
 
     Ok(())
 }

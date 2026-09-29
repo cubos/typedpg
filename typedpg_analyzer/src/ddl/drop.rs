@@ -388,6 +388,28 @@ fn drop_relation_oid(
             )));
         }
     }
+    // SQL-standard function bodies, and other tables' policies, triggers and
+    // rules, reading the relation (its own go with it).
+    let object_dependents: Vec<super::coldeps::Dependent> =
+        super::coldeps::dependents_on_relation(interp, class_oid)
+            .into_iter()
+            .filter(|d| {
+                !matches!(d,
+                    super::coldeps::Dependent::Policy { relid, .. }
+                    | super::coldeps::Dependent::Trigger { relid, .. }
+                    | super::coldeps::Dependent::Rule { relid, .. }
+                        if named_relations.contains(relid))
+            })
+            .collect();
+    if let Some(first) = object_dependents.first()
+        && !cascade
+    {
+        return Err(DdlError::DependencyError(format!(
+            "cannot drop {kind} {name} because other objects depend on it ({} depends on \
+             {kind} {name})",
+            super::coldeps::describe(interp, first),
+        )));
+    }
     // Column defaults using the sequence (`nextval('s')`).
     let dependent_defaults = defaults_using_sequence(interp, class_oid);
     if let Some(&(relid, attnum)) = dependent_defaults.first()
@@ -414,6 +436,9 @@ fn drop_relation_oid(
         views::drop_views(interp, &dependent_views);
     }
     drop_functions_cascade(interp, &dependent_functions);
+    for dependent in &object_dependents {
+        super::coldeps::drop_dependent(interp, dependent);
+    }
     // CASCADE drops those columns (not their relations) and types.
     for (relid, column) in dependent_columns {
         if let Some(attrs) = interp.pg_attribute.get_mut(&relid) {

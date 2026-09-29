@@ -36,9 +36,29 @@ pub fn rename(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlError>
         ObjectType::ObjectColumn | ObjectType::ObjectAttribute => rename_column(interp, stmt),
         ObjectType::ObjectTabconstraint => rename_constraint(interp, stmt),
         ObjectType::ObjectDomconstraint => rename_domain_constraint(interp, stmt),
-        ObjectType::ObjectTrigger => crate::ddl::triggers::rename_trigger(interp, stmt),
-        ObjectType::ObjectPolicy => crate::ddl::policies::rename_policy(interp, stmt),
-        ObjectType::ObjectRule => crate::ddl::rules::rename_rule(interp, stmt),
+        ObjectType::ObjectTrigger | ObjectType::ObjectPolicy | ObjectType::ObjectRule => {
+            let relid = stmt
+                .relation
+                .as_ref()
+                .and_then(|rv| crate::ddl::util::lookup_relation(interp, rv).ok())
+                .map(|(_, oid)| oid);
+            match rename_type {
+                ObjectType::ObjectTrigger => crate::ddl::triggers::rename_trigger(interp, stmt)?,
+                ObjectType::ObjectPolicy => crate::ddl::policies::rename_policy(interp, stmt)?,
+                _ => crate::ddl::rules::rename_rule(interp, stmt)?,
+            }
+            if let Some(relid) = relid {
+                use crate::ddl::coldeps::Dependent;
+                let name = stmt.subname.clone();
+                let old = match rename_type {
+                    ObjectType::ObjectTrigger => Dependent::Trigger { relid, name },
+                    ObjectType::ObjectPolicy => Dependent::Policy { relid, name },
+                    _ => Dependent::Rule { relid, name },
+                };
+                crate::ddl::coldeps::rename(interp, &old, &stmt.newname);
+            }
+            Ok(())
+        }
         ObjectType::ObjectStatisticExt => crate::ddl::statistics::rename_statistics(interp, stmt),
         ObjectType::ObjectFdw => crate::ddl::fdw::rename_foreign_object(interp, true, stmt),
         ObjectType::ObjectPublication => crate::ddl::publications::rename_publication(interp, stmt),

@@ -33,6 +33,7 @@ pub(crate) mod rules;
 pub mod schema_stmt;
 pub(crate) mod seqparams;
 pub mod sequences;
+pub(crate) mod coldeps;
 pub(crate) mod prepared;
 pub(crate) mod session;
 pub(crate) mod statistics;
@@ -255,11 +256,17 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         // ── No-ops (irrelevant for type analysis) ───────────────────
         node::Node::CommentStmt(s) => comment::comment_on(db, s),
         node::Node::AlterOwnerStmt(s) => comment::alter_owner(db, s),
-        node::Node::CreateTrigStmt(s) => triggers::create_trigger(db, s),
+        node::Node::CreateTrigStmt(s) => {
+            triggers::create_trigger(db, s).and_then(|()| coldeps::record_trigger(db, s))
+        }
         node::Node::GrantStmt(s) => acl::grant(db, s),
-        node::Node::CreatePolicyStmt(s) => policies::create_policy(db, s),
-        node::Node::AlterPolicyStmt(s) => policies::alter_policy(db, s),
-        node::Node::RuleStmt(s) => rules::create_rule(db, s),
+        node::Node::CreatePolicyStmt(s) => {
+            policies::create_policy(db, s).and_then(|()| coldeps::record_policy(db, s))
+        }
+        node::Node::AlterPolicyStmt(s) => {
+            policies::alter_policy(db, s).and_then(|()| coldeps::record_policy_alter(db, s))
+        }
+        node::Node::RuleStmt(s) => rules::create_rule(db, s).and_then(|()| coldeps::record_rule(db, s)),
         node::Node::CreateAmStmt(s) => opclass::create_am(db, s),
         node::Node::CreateConversionStmt(s) => conversions::create_conversion(db, s),
         node::Node::CreatePlangStmt(s) => languages::create_language(db, s),

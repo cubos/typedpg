@@ -1006,6 +1006,26 @@ pub(crate) fn drop_column(
         )));
     }
 
+    // Policies, triggers, rules and SQL-standard function bodies reading the
+    // column depend on it: CASCADE drops them.
+    let object_dependents =
+        crate::ddl::coldeps::dependents_on_column(interp, relid, target.attnum);
+    if let Some(first) = object_dependents.first()
+        && !cascade
+    {
+        let relname = relname_of(interp, relid);
+        return Err(DdlError::DependencyError(format!(
+            "cannot drop column {} of table {relname} because other objects depend on it \
+             ({} depends on column {} of table {relname})",
+            cmd.name,
+            crate::ddl::coldeps::describe(interp, first),
+            cmd.name,
+        )));
+    }
+    for dependent in &object_dependents {
+        crate::ddl::coldeps::drop_dependent(interp, dependent);
+    }
+
     // A generated column reading this one depends on it (through its
     // pg_attrdef entry): it needs CASCADE, and goes with it.
     let generated_dependents: Vec<String> = {
@@ -1501,6 +1521,24 @@ pub(crate) fn alter_column_type(
     }
     let old_type_oid = attr.atttypid;
 
+    // RememberAllDependentForRebuilding: a policy, trigger, rule or
+    // SQL-standard function body reading the column isn't rebuilt.
+    if let Some(dependent) =
+        crate::ddl::coldeps::dependents_on_column(interp, relid, attr.attnum).first()
+    {
+        use crate::ddl::coldeps::Dependent;
+        let what = match dependent {
+            Dependent::Policy { .. } => "used in a policy definition",
+            Dependent::Trigger { .. } => "used in a trigger definition",
+            Dependent::Rule { .. } => "used by a view or rule",
+            Dependent::Function(_) => "used by a function or procedure",
+        };
+        return Err(DdlError::UnsupportedDdl(format!(
+            "cannot alter type of a column {what} ({} depends on column \"{}\")",
+            crate::ddl::coldeps::describe(interp, dependent),
+            cmd.name
+        )));
+    }
     let dependent_views = views::find_views_depending_on_column(interp, relid, &cmd.name);
     if !dependent_views.is_empty() {
         // Match PG (SQLSTATE 0A000): any dependent view blocks `ALTER COLUMN

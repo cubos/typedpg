@@ -1336,3 +1336,99 @@ fn alter_column_type_rebuilds_what_reads_the_column() {
         ),
     ]);
 }
+
+#[test]
+fn policies_triggers_rules_and_sql_bodies_depend_on_what_they_read() {
+    // CreatePolicy / CreateTrigger / InsertRule / ProcedureCreate record
+    // pg_depend edges on the columns (and relations) they read: DROP
+    // COLUMN / DROP TABLE of those needs CASCADE (which drops them), and
+    // ALTER COLUMN TYPE is refused (RememberAllDependentForRebuilding).
+    let trigger_fn = "CREATE FUNCTION tf() RETURNS trigger LANGUAGE plpgsql AS \
+                      'BEGIN RETURN NEW; END';";
+    let depends = "because other objects depend on it";
+    for (setup, stmt, msg) in [
+        (
+            "CREATE POLICY p ON t USING (a > 0);",
+            "ALTER TABLE t ALTER COLUMN a TYPE text;",
+            "cannot alter type of a column used in a policy definition",
+        ),
+        (
+            "CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW WHEN (new.a > 0)
+                 EXECUTE FUNCTION tf();",
+            "ALTER TABLE t ALTER COLUMN a TYPE text;",
+            "cannot alter type of a column used in a trigger definition",
+        ),
+        (
+            "CREATE RULE r AS ON INSERT TO t DO ALSO INSERT INTO u VALUES (new.a);",
+            "ALTER TABLE t ALTER COLUMN a TYPE bigint;",
+            "cannot alter type of a column used by a view or rule",
+        ),
+        (
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT a FROM t; END;",
+            "ALTER TABLE t ALTER COLUMN a TYPE bigint;",
+            "cannot alter type of a column used by a function or procedure",
+        ),
+        (
+            "CREATE POLICY p ON t USING (a > 0);",
+            "ALTER TABLE t DROP COLUMN a;",
+            depends,
+        ),
+        (
+            "CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW WHEN (new.a > 0)
+                 EXECUTE FUNCTION tf();",
+            "ALTER TABLE t DROP COLUMN a;",
+            depends,
+        ),
+        (
+            "CREATE TRIGGER tr BEFORE UPDATE OF a ON t FOR EACH ROW EXECUTE FUNCTION tf();",
+            "ALTER TABLE t DROP COLUMN a;",
+            depends,
+        ),
+        (
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT a FROM t; END;",
+            "ALTER TABLE t DROP COLUMN a;",
+            depends,
+        ),
+        (
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT a FROM t; END;",
+            "DROP TABLE t;",
+            depends,
+        ),
+        (
+            "CREATE POLICY p ON t USING (a IN (SELECT x FROM u));",
+            "DROP TABLE u;",
+            depends,
+        ),
+        (
+            "CREATE POLICY p ON t USING (a > 0);
+             ALTER POLICY p ON t USING (b > 0);
+             ALTER POLICY p ON t RENAME TO q;",
+            "ALTER TABLE t DROP COLUMN b;",
+            "cannot drop column b of table t because other objects depend on it (policy q",
+        ),
+    ] {
+        let base = format!("CREATE TABLE t (a int, b int); CREATE TABLE u (x int); {trigger_fn}");
+        let err = try_apply(&[("0001.sql", &base), ("0002.sql", setup), ("0003.sql", stmt)])
+            .expect_err(stmt);
+        assert!(err.to_string().contains(msg), "{setup} / {stmt}\n  got: {err}");
+    }
+    // CASCADE drops the dependents; an ALTER POLICY that stops reading a
+    // column releases it.
+    build_db(&[(
+        "0001.sql",
+        &format!(
+            "CREATE TABLE t (a int, b int, c int); {trigger_fn}
+             CREATE POLICY p ON t USING (a > 0);
+             CREATE TRIGGER tr BEFORE UPDATE OF a ON t FOR EACH ROW EXECUTE FUNCTION tf();
+             ALTER TABLE t DROP COLUMN a CASCADE;
+             CREATE POLICY p ON t USING (b > 0);
+             CREATE TRIGGER tr BEFORE UPDATE OF b ON t FOR EACH ROW EXECUTE FUNCTION tf();
+             ALTER POLICY p ON t USING (true);
+             DROP TRIGGER tr ON t;
+             ALTER TABLE t DROP COLUMN b;
+             CREATE FUNCTION f() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT c FROM t; END;
+             DROP TABLE t CASCADE;
+             CREATE FUNCTION f() RETURNS int LANGUAGE sql RETURN 1;"
+        ),
+    )]);
+}

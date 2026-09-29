@@ -796,6 +796,16 @@ impl BindingWalker {
     }
 }
 
+/// The relations and `(relation, attnum)` columns a SELECT reads, as the
+/// binding walker resolves them (what a view would record in pg_depend).
+pub(crate) fn statement_references(
+    snapshot: &PgCatalog,
+    query_node: &protobuf::Node,
+) -> (Vec<PgClassOid>, Vec<(PgClassOid, i16)>) {
+    let (_, deps) = collect_view_bindings_and_deps(query_node, snapshot);
+    (deps.relation_refs, deps.column_refs)
+}
+
 fn collect_view_bindings_and_deps(
     query_node: &protobuf::Node,
     snapshot: &PgCatalog,
