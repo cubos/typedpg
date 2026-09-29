@@ -629,3 +629,24 @@ fn rules_policies_triggers_and_views_hold_on_to_what_they_use() {
     .unwrap();
     assert!(db.resolve_table(None, "vs").is_none());
 }
+
+#[test]
+fn a_publication_holds_on_to_its_column_list_and_row_filter() {
+    let setup = "CREATE TABLE tp (a int, b int, c int);
+                 CREATE PUBLICATION pb FOR TABLE tp (a, b);
+                 CREATE TABLE tq (a int, b int);
+                 CREATE PUBLICATION pq FOR TABLE tq WHERE (b > 0);";
+    assert_ddl_rejections(&[
+        (
+            setup,
+            "ALTER TABLE tp DROP COLUMN b;",
+            "cannot drop column b of table tp because other objects depend on it",
+        ),
+        (
+            setup,
+            "ALTER TABLE tq DROP COLUMN b;",
+            "cannot drop column b of table tq because other objects depend on it",
+        ),
+    ]);
+    build(&[("0001.sql", &format!("{setup} ALTER TABLE tp DROP COLUMN c;"))]);
+}
