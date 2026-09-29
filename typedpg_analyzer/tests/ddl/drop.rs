@@ -399,3 +399,49 @@ fn drop_table_needs_cascade_for_what_uses_its_row_type() {
     }
     assert!(db.resolve_type_by_name(None, "d").is_none());
 }
+
+#[test]
+fn drop_procedure_signature_may_list_out_arguments() {
+    let db = build(&[(
+        "0001.sql",
+        "CREATE PROCEDURE p(a int, OUT b int) LANGUAGE sql AS 'select a';
+         DROP PROCEDURE p(int, int);",
+    )]);
+    assert!(db.find_functions(None, "p").is_empty());
+}
+
+#[test]
+fn drop_naming_one_object_twice_drops_it_once() {
+    let db = build(&[(
+        "0001.sql",
+        "CREATE FUNCTION f(int) RETURNS int LANGUAGE sql AS 'select 1';
+         DROP FUNCTION f(int), f(integer);
+         CREATE TABLE t (a int);
+         CREATE VIEW v AS SELECT * FROM t;
+         DROP VIEW v, v;
+         CREATE FUNCTION myeq(int, int) RETURNS bool LANGUAGE sql AS 'select true';
+         CREATE OPERATOR === (leftarg = int, rightarg = int, function = myeq);
+         DROP OPERATOR ===(int, int), ===(int, int);",
+    )]);
+    assert!(db.find_functions(None, "f").is_empty());
+    assert!(db.resolve_table(None, "v").is_none());
+}
+
+#[test]
+fn drop_errors_for_a_missing_schema_and_several_blocked_targets() {
+    assert_ddl_rejections(&[
+        (
+            "",
+            "DROP FUNCTION nosuchschema.f();",
+            "schema \"nosuchschema\" does not exist",
+        ),
+        (
+            "CREATE TABLE t (a int);
+             CREATE TABLE u (b int);
+             CREATE VIEW w AS SELECT * FROM t, u;",
+            "DROP TABLE t, u;",
+            "cannot drop desired object(s) because other objects depend on them",
+        ),
+    ]);
+    build(&[("0001.sql", "DROP FUNCTION IF EXISTS nosuchschema.f();")]);
+}

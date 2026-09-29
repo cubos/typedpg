@@ -15,6 +15,7 @@ mod comment;
 mod conversion_procs;
 pub(crate) mod conversions;
 mod defaults;
+pub(crate) mod depend;
 mod dml;
 mod do_block;
 pub mod drop;

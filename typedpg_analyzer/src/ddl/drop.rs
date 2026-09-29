@@ -8,7 +8,7 @@ use super::views;
 use crate::oid::{PgCastOid, PgClassOid, PgNamespaceOid, PgOperatorOid, PgProcOid, PgTypeOid};
 use crate::pg_catalog::{
     PG_CAST_RELID, PG_CLASS_RELID, PG_EXTENSION_RELID, PG_NAMESPACE_RELID, PG_OPERATOR_RELID,
-    PG_PROC_RELID, PG_TYPE_RELID, PgCatalog, PgOperator, PgProc, ProKind, RelKind,
+    PG_PROC_RELID, PG_TYPE_RELID, PgCatalog, PgOperator, RelKind,
 };
 use crate::qualified_name::QualifiedName;
 
@@ -39,7 +39,33 @@ pub fn drop_objects(interp: &mut PgCatalog, stmt: &DropStmt) -> Result<(), DdlEr
             _ => None,
         })
         .collect();
-    for obj_node in &stmt.objects {
+    // Every name is looked up before anything is deleted: a name repeated
+    // (or two names of one object) is one target, and when several objects
+    // are named a dependency blocks them together.
+    let targets: Vec<Option<(i32, u32)>> = stmt
+        .objects
+        .iter()
+        .map(|o| super::depend::drop_target_identity(interp, obj_type, o))
+        .collect();
+    let result = drop_each(interp, stmt, obj_type, cascade, &named_relations, &targets);
+    if targets.iter().flatten().count() > 1 {
+        return result.map_err(super::depend::multiple_targets_message);
+    }
+    result
+}
+
+fn drop_each(
+    interp: &mut PgCatalog,
+    stmt: &DropStmt,
+    obj_type: ObjectType,
+    cascade: bool,
+    named_relations: &[PgClassOid],
+    targets: &[Option<(i32, u32)>],
+) -> Result<(), DdlError> {
+    for (i, obj_node) in stmt.objects.iter().enumerate() {
+        if targets[i].is_some() && targets[..i].contains(&targets[i]) {
+            continue;
+        }
         match obj_type {
             ObjectType::ObjectTable
             | ObjectType::ObjectView
@@ -52,7 +78,7 @@ pub fn drop_objects(interp: &mut PgCatalog, stmt: &DropStmt) -> Result<(), DdlEr
                     stmt.missing_ok,
                     cascade,
                     obj_type,
-                    &named_relations,
+                    named_relations,
                 )?;
             }
             ObjectType::ObjectType | ObjectType::ObjectDomain => {
@@ -986,82 +1012,28 @@ fn drop_function(
         .map(|s| s.to_owned())
         .collect();
 
-    let (schema_opt, name) = match parts.as_slice() {
-        [name] => (None, name.clone()),
-        [schema, name] => (Some(schema.clone()), name.clone()),
-        _ => return Ok(()),
-    };
-
+    let name = parts.last().cloned().unwrap_or_default();
     // LookupFuncWithArgs (parse_func.c): the argument types must resolve,
-    // then the name + types pick exactly one routine of any kind, whose
-    // kind must match the command.
-    let mut arg_oids: Vec<PgTypeOid> = Vec::new();
-    for n in &owa.objargs {
-        if let Some(node::Node::TypeName(tn)) = n.node.as_ref() {
-            match super::util::lookup_type_name(tn, interp) {
-                Ok(oid) => arg_oids.push(oid),
-                Err(_) if missing_ok => return Ok(()),
-                Err(e) => return Err(e),
-            }
-        }
-    }
+    // then the name + types pick exactly one routine, whose kind must match
+    // the command.
+    let Some(target) =
+        super::functions::lookup_func_with_args(interp, expected_kind, owa, missing_ok)?
+    else {
+        return Ok(());
+    };
+    let arg_oids: Vec<PgTypeOid> = interp
+        .pg_proc
+        .get(&target)
+        .map(|p| p.proargtypes.clone())
+        .unwrap_or_default();
     let want_procedure = expected_kind == ObjectType::ObjectProcedure;
     let kind_word = if want_procedure {
         "procedure"
     } else {
         "function"
     };
-    let signature = format!("{name}({})", format_arg_oids(&arg_oids, interp));
-
-    let target = if owa.args_unspecified {
-        let all: Vec<PgProcOid> = interp
-            .find_functions(schema_opt.as_deref(), &name)
-            .iter()
-            .map(|p| p.oid)
-            .collect();
-        match all.as_slice() {
-            [] => None,
-            [one] => Some(*one),
-            _ => {
-                return Err(DdlError::DependencyError(format!(
-                    "{kind_word} name \"{name}\" is not unique"
-                )));
-            }
-        }
-    } else {
-        let wanted = arg_oids.clone();
-        find_proc(interp, schema_opt.as_deref(), &name, &move |p: &PgProc| {
-            p.proargtypes == wanted
-        })
-    };
-
-    let Some(target) = target else {
-        if missing_ok {
-            return Ok(());
-        }
-        return Err(DdlError::DependencyError(if owa.args_unspecified {
-            format!("could not find a {kind_word} named \"{name}\"")
-        } else {
-            format!("{kind_word} {signature} does not exist")
-        }));
-    };
-    let found_kind = interp.pg_proc.get(&target).map(|p| p.prokind);
-    match (found_kind, expected_kind) {
-        (Some(ProKind::Procedure), ObjectType::ObjectFunction) => {
-            return Err(DdlError::DependencyError(format!(
-                "{signature} is not a function"
-            )));
-        }
-        (
-            Some(ProKind::Function | ProKind::Window | ProKind::Aggregate),
-            ObjectType::ObjectProcedure,
-        ) => {
-            return Err(DdlError::DependencyError(format!(
-                "{signature} is not a procedure"
-            )));
-        }
-        _ => {}
-    }
+    // getObjectDescription's `name(type,type)`.
+    let signature = format!("{name}({})", format_arg_oids(&arg_oids, interp).replace(", ", ","));
     let target = Some(target);
 
     if let Some(oid) = target {
@@ -1149,41 +1121,6 @@ fn format_view_list(snapshot: &PgCatalog, view_oids: &[PgClassOid]) -> String {
         .join(", ")
 }
 
-/// Find the first `pg_proc` OID matching the predicate, walking the search
-/// path when `schema` is `None`. Mirrors PG's overload resolution for
-/// schema-less DROP.
-fn find_proc(
-    snapshot: &PgCatalog,
-    schema: Option<&str>,
-    name: &str,
-    matches: &dyn Fn(&PgProc) -> bool,
-) -> Option<PgProcOid> {
-    let candidate_schemas: Vec<PgNamespaceOid> = if let Some(s) = schema {
-        snapshot.namespace_oid(s).into_iter().collect()
-    } else {
-        let mut v = Vec::new();
-        if let Some(pg_oid) = snapshot.namespace_oid("pg_catalog")
-            && !snapshot.search_path.contains(&pg_oid)
-        {
-            v.push(pg_oid);
-        }
-        v.extend(snapshot.search_path.iter().copied());
-        v
-    };
-    for nsoid in candidate_schemas {
-        if let Some(oids) = snapshot.proc_by_qname.get(&(nsoid, name.to_owned())) {
-            for &oid in oids {
-                if let Some(p) = snapshot.pg_proc.get(&oid)
-                    && matches(p)
-                {
-                    return Some(oid);
-                }
-            }
-        }
-    }
-    None
-}
-
 /// DROP AGGREGATE.
 fn drop_aggregate(
     interp: &mut PgCatalog,
@@ -1195,39 +1132,18 @@ fn drop_aggregate(
         return Ok(());
     };
 
-    let parts: Vec<String> = owa
+    let name = owa
         .objname
-        .iter()
-        .filter_map(node_string)
-        .map(|s| s.to_owned())
-        .collect();
-    let (schema_opt, name) = match parts.as_slice() {
-        [name] => (None, name.clone()),
-        [schema, name] => (Some(schema.clone()), name.clone()),
-        _ => return Ok(()),
-    };
-
-    let arg_oids: Vec<PgTypeOid> = owa
-        .objargs
-        .iter()
-        .filter_map(|n| {
-            if let Some(node::Node::TypeName(tn)) = n.node.as_ref() {
-                resolve_type_name(tn, interp)
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    let matches = |p: &PgProc| matches!(p.prokind, ProKind::Aggregate) && p.proargtypes == arg_oids;
-    let target = find_proc(interp, schema_opt.as_deref(), &name, &matches);
-
-    if target.is_none() && !missing_ok {
-        return Err(DdlError::DependencyError(format!(
-            "aggregate {name}({}) does not exist",
-            format_arg_oids(&arg_oids, interp),
-        )));
-    }
+        .last()
+        .and_then(node_string)
+        .unwrap_or_default()
+        .to_owned();
+    let target =
+        super::functions::lookup_func_with_args(interp, ObjectType::ObjectAggregate, owa, missing_ok)?;
+    let arg_oids: Vec<PgTypeOid> = target
+        .and_then(|oid| interp.pg_proc.get(&oid))
+        .map(|p| p.proargtypes.clone())
+        .unwrap_or_default();
 
     if let Some(oid) = target {
         let dependent_views = views::find_views_depending_on_function(interp, oid);
@@ -1301,6 +1217,27 @@ fn drop_operator(
         interp.remove_dependencies_on(PG_OPERATOR_RELID, obj);
     }
     Ok(())
+}
+
+/// The operator a `DROP OPERATOR name(left, right)` names, if it exists.
+pub(crate) fn operator_target(
+    interp: &PgCatalog,
+    obj_node: &typedpg_pg_query::protobuf::Node,
+) -> Option<PgOperatorOid> {
+    let Some(node::Node::ObjectWithArgs(owa)) = obj_node.node.as_ref() else {
+        return None;
+    };
+    let parts: Vec<&str> = owa.objname.iter().filter_map(node_string).collect();
+    let (schema, name) = match parts.as_slice() {
+        [name] => (None, *name),
+        [schema, name] => (Some(*schema), *name),
+        _ => return None,
+    };
+    let (left, right) = parse_operator_arg_types(&owa.objargs, interp);
+    let right = right?;
+    find_operator(interp, schema, name, &|o: &PgOperator| {
+        o.oprleft == left && o.oprright == right
+    })
 }
 
 pub(crate) fn find_operator(
