@@ -369,7 +369,7 @@ fn substitute_params(
 
 /// The identifier a token spells: `"Quoted"` as written, bare ones
 /// downcased.
-fn identifier_value(raw: &str) -> String {
+pub(crate) fn identifier_value(raw: &str) -> String {
     match raw.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
         Some(inner) => inner.replace("\"\"", "\""),
         None => raw.to_ascii_lowercase(),

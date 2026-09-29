@@ -4345,3 +4345,51 @@ fn conversion_encodings_must_exist() {
          CREATE CONVERSION c3 FOR 'Windows1252' TO 'UTF8' FROM win_to_utf8;",
     )]);
 }
+
+#[test]
+fn rule_actions_are_analyzed_over_new_and_old() {
+    // PG 18 transformRuleStmt: each action is analyzed with NEW / OLD as
+    // relation-only range entries (qualified references only).
+    let setup = "CREATE TYPE pair AS (x int, y int);
+                 CREATE TABLE t (a int, name text, p pair);
+                 CREATE TABLE log (id int, msg text);";
+    for (stmt, msg) in [
+        (
+            "CREATE RULE r AS ON INSERT TO t DO ALSO INSERT INTO log VALUES (new.nosuch);",
+            "column new.nosuch does not exist",
+        ),
+        (
+            "CREATE RULE r AS ON INSERT TO t DO ALSO INSERT INTO log (id) VALUES (new.name);",
+            "column \"id\" is of type integer but expression is of type text",
+        ),
+        (
+            "CREATE RULE r AS ON UPDATE TO t DO ALSO UPDATE log SET msg = new.name WHERE nosuch = 1;",
+            "column \"nosuch\" does not exist",
+        ),
+        (
+            "CREATE RULE r AS ON INSERT TO t DO ALSO INSERT INTO log VALUES (new.a, a);",
+            "column \"a\" does not exist",
+        ),
+        (
+            "CREATE RULE r AS ON DELETE TO t DO ALSO INSERT INTO log VALUES (old.a || 'x', 'y');",
+            "column \"id\" is of type integer but expression is of type text",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "CREATE RULE r4 AS ON UPDATE TO t DO ALSO (
+                 INSERT INTO log VALUES (old.a, new.name);
+                 DELETE FROM log WHERE log.id = old.a;
+                 NOTIFY ch;
+                 SELECT (new.p).x, new.a + 1
+             );
+             CREATE RULE r7 AS ON INSERT TO t DO ALSO INSERT INTO log VALUES (new.a, new.ctid::text);
+             CREATE RULE r8 AS ON INSERT TO t DO INSTEAD NOTHING;",
+        ),
+    ]);
+}
