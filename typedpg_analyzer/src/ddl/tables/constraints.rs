@@ -1402,6 +1402,14 @@ fn add_constraint_node(
                 }
             })
             .unwrap_or_else(|| cmd_name.to_owned());
+        // transformTableConstraint.
+        if c.is_no_inherit
+            && interp.pg_class.get(&relid).map(|r| r.relkind) == Some(RelKind::Partitioned)
+        {
+            return Err(DdlError::UnsupportedDdl(
+                "not-null constraints on partitioned tables cannot be NO INHERIT".into(),
+            ));
+        }
         let spec = super::inherit::NotNullSpec {
             name: (!c.conname.is_empty()).then_some(c.conname.as_str()),
             no_inherit: c.is_no_inherit,

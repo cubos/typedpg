@@ -251,6 +251,12 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
         };
         let is_primary = c.contype == ConstrType::ConstrPrimary as i32;
         let is_not_null = c.contype == ConstrType::ConstrNotnull as i32;
+        // transformTableConstraint.
+        if is_not_null && c.is_no_inherit && stmt.partspec.is_some() {
+            return Err(DdlError::UnsupportedDdl(
+                "not-null constraints on partitioned tables cannot be NO INHERIT".into(),
+            ));
+        }
         if !is_primary && !is_not_null && c.contype != ConstrType::ConstrUnique as i32 {
             continue;
         }

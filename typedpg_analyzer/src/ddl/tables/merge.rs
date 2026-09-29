@@ -238,6 +238,9 @@ fn expand_like(
     for attr in interp.attributes_of(source) {
         let generated = attr.attgenerated.filter(|_| opts & LIKE_GENERATED != 0);
         let identity = attr.attidentity.filter(|_| opts & LIKE_IDENTITY != 0);
+        let source_nn = copy_not_null
+            .then(|| super::inherit::not_null_constraint(interp, source, attr.attnum).cloned())
+            .flatten();
         let plain_default = attr.atthasdef
             && attr.attgenerated.is_none()
             && attr.attidentity.is_none()
@@ -263,8 +266,10 @@ fn expand_like(
                     })
                     .unwrap_or_default(),
                 nn_local: copy_not_null && attr.attnotnull,
-                nn_name: None,
-                nn_no_inherit: false,
+                // RelationGetNotNullConstraints(include_noinh = true): the
+                // source's constraint, with its name and NO INHERIT flag.
+                nn_name: source_nn.as_ref().map(|c| c.conname.clone()),
+                nn_no_inherit: source_nn.as_ref().is_some_and(|c| c.connoinherit),
                 nn_inhcount: 0,
                 nn_inh_name: None,
                 is_local: true,

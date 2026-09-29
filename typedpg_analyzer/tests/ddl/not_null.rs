@@ -459,3 +459,42 @@ fn alter_inherit_matches_not_null_constraints() {
          ALTER TABLE ic3 INHERIT ip3;",
     )]);
 }
+
+#[test]
+fn like_copies_not_null_constraints_with_their_names() {
+    // transformTableLikeClause copies the source's not-null constraints,
+    // names and NO INHERIT flags included.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE s (a int NOT NULL, b int CONSTRAINT bnn NOT NULL NO INHERIT);
+         CREATE TABLE t (LIKE s);
+         ALTER TABLE t RENAME CONSTRAINT s_a_not_null TO a_nn;",
+    )]);
+    assert_eq!(
+        not_nulls(&db, "t"),
+        vec![
+            nn("a_nn", true, false, true, 0),
+            nn("bnn", true, true, true, 0)
+        ]
+    );
+    assert_err(
+        "CREATE TABLE s (a int CONSTRAINT foo NOT NULL);",
+        "CREATE TABLE t (LIKE s, CONSTRAINT foo2 NOT NULL a);",
+        "conflicting not-null constraint names \"foo\" and \"foo2\"",
+    );
+}
+
+#[test]
+fn partitioned_tables_take_no_no_inherit_not_null() {
+    let msg = "not-null constraints on partitioned tables cannot be NO INHERIT";
+    assert_err(
+        "",
+        "CREATE TABLE p (a int, NOT NULL a NO INHERIT) PARTITION BY LIST (a);",
+        msg,
+    );
+    assert_err(
+        "CREATE TABLE p (a int) PARTITION BY LIST (a);",
+        "ALTER TABLE p ADD CONSTRAINT nn NOT NULL a NO INHERIT;",
+        msg,
+    );
+}
