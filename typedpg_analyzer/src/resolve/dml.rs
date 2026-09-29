@@ -334,10 +334,23 @@ fn analyze_insert_values(
     let null_ctx = NullabilityContext::default();
     let expected_len = insert_arity(tgt);
 
+    let mut first_len: Option<usize> = None;
     for val_list in &val_sel.values_lists {
         let Some(node::Node::List(list)) = val_list.node.as_ref() else {
             continue;
         };
+        // transformInsertStmt: every row of a multi-row VALUES must be as
+        // long as the first one, which already passed transformInsertRow's
+        // arity check.
+        match first_len {
+            None => first_len = Some(list.items.len()),
+            Some(n) if n != list.items.len() => {
+                return Err(
+                    crate::pgmsg::values_lists_length(n, list.items.len()).finalize_implicit(),
+                );
+            }
+            Some(_) => {}
+        }
         // Arity check: the VALUES row must match the declared column list
         // (or, when no column list is given, the full table width).
         if arity_mismatch(tgt, list.items.len(), expected_len) {

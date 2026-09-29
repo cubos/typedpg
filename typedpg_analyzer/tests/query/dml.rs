@@ -126,6 +126,32 @@ fn insert_multiple_rows() {
     assert_params(&s, vec![p(text()), p(text()), p(text()), p(text())]);
 }
 
+/// transformInsertStmt checks each later VALUES row against the first
+/// row's length before the per-row arity rule, so a short second row is a
+/// VALUES error, not an INSERT arity one.
+#[test]
+fn insert_values_rows_must_share_a_length() {
+    let db = setup();
+    let err = db
+        .analyze("INSERT INTO users (name, email) VALUES ('a', 'b'), ('c')")
+        .unwrap_err();
+    assert!(matches!(err, AnalyzeError::SyntaxError(_)), "{err:?}");
+    assert!(
+        err.to_string()
+            .starts_with("VALUES lists must all be the same length"),
+        "{err}"
+    );
+    // A short first row still trips the arity rule.
+    let err = db
+        .analyze("INSERT INTO users (name, email) VALUES ('a'), ('c', 'd')")
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("INSERT has more target columns than expressions"),
+        "{err}"
+    );
+}
+
 #[test]
 fn insert_into_posts() {
     let db = setup();
