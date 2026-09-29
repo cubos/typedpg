@@ -377,3 +377,24 @@ fn the_seed_keeps_the_server_search_path_setting() {
     let info = restored.analyze("SELECT a FROM t").unwrap();
     assert_eq!(info.columns.len(), 1);
 }
+
+#[test]
+fn a_migration_session_search_path_does_not_reach_the_queries() {
+    // SET search_path lasts for the migration runner's session — the
+    // following migrations too — but the application's queries run in
+    // sessions of their own, with the server's setting.
+    let db = build_db(&[
+        (
+            "0001.sql",
+            "CREATE SCHEMA app; SET search_path = app; CREATE TABLE t (a int);",
+        ),
+        ("0002.sql", "CREATE TABLE t2 (b int);"),
+    ]);
+    assert!(db.analyze("SELECT a FROM app.t").is_ok());
+    assert!(db.analyze("SELECT b FROM app.t2").is_ok());
+    let err = db.analyze("SELECT a FROM t").unwrap_err();
+    assert!(
+        err.to_string().starts_with("relation \"t\" does not exist"),
+        "{err}"
+    );
+}

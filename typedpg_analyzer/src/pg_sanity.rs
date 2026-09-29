@@ -137,11 +137,8 @@ pub(crate) struct PgSanityServer {
     client: Client,
     /// A second session on it, where queries are prepared: the
     /// application's queries run outside the migrations' session, so its
-    /// temporary relations are not theirs.
+    /// temporary relations and session settings are not theirs.
     query_client: Client,
-    /// The `search_path` last copied from the migrations' session to
-    /// [`Self::query_client`].
-    query_search_path: Option<String>,
     /// Admin connection string (kept verbatim from `POSTGRES_URL`) so the
     /// `Drop` impl can connect back to a different database to run
     /// `DROP DATABASE` against the scratch one.
@@ -198,7 +195,6 @@ impl PgSanityServer {
         Ok(Self {
             client,
             query_client,
-            query_search_path: None,
             admin_conn_str,
             db_name,
             type_name_cache: HashMap::new(),
@@ -293,7 +289,6 @@ impl PgSanityServer {
         analysis_sql: &str,
         our_result: &Result<AnalyzedQuery, AnalyzeError>,
     ) -> Option<Divergence> {
-        self.sync_query_session();
         let pg_result = self.query_client.prepare(analysis_sql);
 
         match (our_result, &pg_result) {
@@ -526,29 +521,6 @@ impl PgSanityServer {
     /// so they line up with [`Type::Array`]. Inlines the OID as a literal
     /// (non-injectable: it's a u32 from PG itself) to dodge `to_sql` for
     /// the `oid` type.
-    /// Give the query session the migrations' `search_path`, which the
-    /// analyzer resolves queries with.
-    fn sync_query_session(&mut self) {
-        // In a failed transaction the setting can't be read; keep the last.
-        let Ok(row) = self
-            .client
-            .query_one("SELECT current_setting('search_path')", &[])
-        else {
-            return;
-        };
-        let search_path: String = row.get(0);
-        if self.query_search_path.as_ref() == Some(&search_path) {
-            return;
-        }
-        self.query_client
-            .query_one(
-                "SELECT pg_catalog.set_config('search_path', $1, false)",
-                &[&search_path],
-            )
-            .expect("pg_sanity: copying search_path to the query session failed");
-        self.query_search_path = Some(search_path);
-    }
-
     fn qualified_type_name(&mut self, oid: u32) -> Result<String, postgres::Error> {
         if let Some(name) = self.type_name_cache.get(&oid) {
             return Ok(name.clone());

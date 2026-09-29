@@ -142,9 +142,18 @@ impl PgCatalog {
     /// Re-derive [`PgCatalog::search_path`] from the textual setting: every
     /// entry naming an existing schema, in order, without duplicates.
     /// `$user` and `pg_temp` never name a schema the analyzer models.
+    ///
+    /// Outside the migrations the setting is the server's: the
+    /// application's queries run in sessions of their own, which a
+    /// migration's `SET search_path` doesn't reach.
     pub(crate) fn refresh_search_path(&mut self) {
         let mut resolved = Vec::new();
-        for name in self.search_path_guc.effective() {
+        let setting = if self.in_migration {
+            self.search_path_guc.effective()
+        } else {
+            &self.search_path_guc.default
+        };
+        for name in setting {
             // `$user` is the schema named after current_user — known only
             // in the migrations' session, and once they name the role.
             let name = match name.as_str() {
