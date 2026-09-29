@@ -404,3 +404,49 @@ fn srf_placement_rules() {
         db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
 }
+
+/// A FROM-clause function is resolved through the same `ParseFuncOrColumn`
+/// as a call in the select list, so its untyped arguments are coerced to
+/// the chosen signature: parameters take the declared types and literal
+/// contents are validated by the argument type's input function.
+#[test]
+fn from_function_untyped_args_take_the_resolved_types() {
+    let mut db = setup();
+    db.apply_sql(
+        "CREATE FUNCTION f_def(a int, b text DEFAULT 'x', c int DEFAULT 3) RETURNS text
+         LANGUAGE sql AS $$ SELECT b $$;",
+    )
+    .unwrap();
+    for (sql, expected) in [
+        ("SELECT * FROM generate_series(1, $a) g", vec![p(int4())]),
+        ("SELECT * FROM generate_series($a, 10) g", vec![p(int4())]),
+        ("SELECT * FROM abs($a) g", vec![p(float8())]),
+        ("SELECT * FROM int4pl($a, 1) g", vec![p(int4())]),
+        ("SELECT * FROM f_def($a) g", vec![p(int4())]),
+        ("SELECT * FROM f_def(1, c => $x) g", vec![p(int4())]),
+        (
+            "SELECT * FROM ROWS FROM (generate_series(1, $a), generate_series($b, 2)) g",
+            vec![p(int4()), p(int4())],
+        ),
+        (
+            "SELECT g FROM t JOIN LATERAL generate_series(1, $a) g ON true",
+            vec![p(int4())],
+        ),
+        (
+            "SELECT * FROM n, generate_series($a, n.id) g",
+            vec![p(int4())],
+        ),
+        (
+            "SELECT * FROM generate_series($a::timestamptz, $b, $c) g",
+            vec![p(timestamptz()), p(timestamptz()), p(interval())],
+        ),
+    ] {
+        let s = db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        assert_params(&s, expected);
+    }
+    assert_err_prefix!(
+        db.analyze("SELECT * FROM generate_series(1, 'a') g"),
+        AnalyzeError::InvalidLiteral(_),
+        "invalid input syntax for type integer: \"a\""
+    );
+}

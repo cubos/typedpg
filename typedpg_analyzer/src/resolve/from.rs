@@ -1001,6 +1001,9 @@ fn function_rte_columns(
         false,
         crate::error::SourceSpan::from_node_qname(func_call.location),
     )?;
+    // Coerce untyped arguments to the chosen signature (pins `$N`,
+    // validates literal contents), as for a call anywhere else.
+    expr::backfill_call_args(func_call, &arg_types, &resolved, arg_ctx, params)?;
     let has_coldeflist = !f.coldeflist.is_empty();
 
     // A strict catalog SRF with a single OUT column (`jsonb_array_elements`

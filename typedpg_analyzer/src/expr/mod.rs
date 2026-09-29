@@ -1303,7 +1303,7 @@ mod xml;
 use column_refs::*;
 pub(crate) use column_refs::{SqlFunctionParams, with_sql_function_params};
 use conditional::*;
-pub(crate) use func_call::check_window_clause;
+pub(crate) use func_call::{backfill_call_args, check_window_clause};
 use func_call::*;
 use indirection::*;
 pub(crate) use indirection::{expand_indirection_star, transform_container_subscripts};

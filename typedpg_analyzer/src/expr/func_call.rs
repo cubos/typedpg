@@ -506,6 +506,28 @@ fn check_no_nested_aggregates(
     Ok(())
 }
 
+/// [`backfill_func_args`] for a call analyzed outside [`infer_func_call`] —
+/// a function in FROM (`transformRangeFunction` transforms it through the
+/// same `ParseFuncOrColumn`, so `FROM generate_series(1, $1)` types `$1`
+/// and validates `FROM generate_series(1, 'a')` exactly like the SELECT
+/// list does). `arg_types` are the bottom-up types of `func.args`.
+pub(crate) fn backfill_call_args(
+    func: &protobuf::FuncCall,
+    arg_types: &[PgTypeOid],
+    resolved: &functions::ResolvedFunction,
+    ctx: Ctx<'_>,
+    params: &mut ParamCollector,
+) -> Result<(), AnalyzeError> {
+    let args = FuncArgs {
+        types: arg_types.to_vec(),
+        nullable: vec![false; arg_types.len()],
+        any_nullable: false,
+        exprs: Vec::new(),
+        direct_count: arg_types.len(),
+    };
+    backfill_func_args(func, &args, resolved, ctx, params)
+}
+
 /// Pass 2: back-fill UNKNOWN direct args with the expected types from the
 /// resolved signature (equivalent to PG's `coerce_func_args`). Only the direct
 /// args correspond to `func.args`; ordered args (`agg_within_group`) come from
