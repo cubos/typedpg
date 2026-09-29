@@ -827,11 +827,14 @@ pub(crate) fn operator_result_nullable(
         return any_nullable;
     };
     if Some(f.pronamespace) != snapshot.pg_catalog_oid() {
-        return any_nullable
-            || !f.proisstrict
-            || matches!(op_name, "->" | "->>" | "#>" | "#>>");
+        return any_nullable || !f.proisstrict || matches!(op_name, "->" | "->>" | "#>" | "#>>");
     }
-    builtin_signature_nullable(&proc_signature(f, snapshot), f.proisstrict, args_nullable, false)
+    builtin_signature_nullable(
+        &proc_signature(f, snapshot),
+        f.proisstrict,
+        args_nullable,
+        false,
+    )
 }
 
 /// Whether a `pg_catalog` routine's result can be NULL, given which of the

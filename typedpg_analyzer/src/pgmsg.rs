@@ -692,7 +692,10 @@ pub(crate) fn grammar_error(message: String) -> AnalyzeError {
         AnalyzeError::WindowingError(message)
     } else if FEATURE_NOT_SUPPORTED.iter().any(|m| message.starts_with(m)) {
         AnalyzeError::FeatureNotSupported(message)
-    } else if INVALID_PARAMETER_VALUE.iter().any(|m| message.starts_with(m)) {
+    } else if INVALID_PARAMETER_VALUE
+        .iter()
+        .any(|m| message.starts_with(m))
+    {
         AnalyzeError::Invalid(message)
     } else {
         AnalyzeError::Parse(message)
@@ -1293,10 +1296,7 @@ mod tests {
                 function_is_not_unique("mod", "unknown, unknown", None).kind,
                 "42725",
             ),
-            (
-                procedure_is_not_unique("p", "unknown", None).kind,
-                "42725",
-            ),
+            (procedure_is_not_unique("p", "unknown", None).kind, "42725"),
             (cross_database_reference("x.s.t", None).kind, "0A000"),
             (improper_qualified_name("a.b.c.d", None).kind, "42601"),
             (

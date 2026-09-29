@@ -1177,7 +1177,8 @@ fn interval_cast_literal_uses_the_written_field_restriction() {
         db.analyze("SELECT '[1,2)'::interval"),
         "invalid input syntax for type interval: \"[1,2)\""
     );
-    db.analyze("SELECT '1 1'::interval day to hour AS v").unwrap();
+    db.analyze("SELECT '1 1'::interval day to hour AS v")
+        .unwrap();
     db.analyze("SELECT '[1,2)'::interval hour AS v").unwrap();
     db.analyze("SELECT '1:30'::interval minute to second AS v")
         .unwrap();

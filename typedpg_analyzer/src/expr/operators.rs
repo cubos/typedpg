@@ -320,7 +320,11 @@ fn handle_in_list(
             && let Err(prev) = params.coerce_untyped(p.number, deduced)
         {
             return Err(inconsistent_param_error(
-                p.number, prev, deduced, p.location, ctx.snapshot,
+                p.number,
+                prev,
+                deduced,
+                p.location,
+                ctx.snapshot,
             ));
         }
     }
@@ -530,8 +534,10 @@ fn handle_any_all(
                 None => {
                     let l = crate::ddl::util::format_type_for_message(snapshot, left_oid);
                     let r = crate::ddl::util::format_type_for_message(snapshot, elem_oid);
-                    return Err(crate::pgmsg::operator_does_not_exist(&l, &op_name, &r, None)
-                        .finalize_implicit());
+                    return Err(
+                        crate::pgmsg::operator_does_not_exist(&l, &op_name, &r, None)
+                            .finalize_implicit(),
+                    );
                 }
             }
         }
@@ -763,7 +769,11 @@ fn infer_generic_binary_op(
     let left_oid_resolved = left_oid;
     let right_oid_resolved = right_oid;
 
-    let args_nullable: Vec<bool> = left.iter().chain(right.iter()).map(|t| t.nullable).collect();
+    let args_nullable: Vec<bool> = left
+        .iter()
+        .chain(right.iter())
+        .map(|t| t.nullable)
+        .collect();
 
     // Operator lookup with the bottom-up types — UNKNOWN sides are resolved
     // by `find_operator`'s own rules (homogeneous probe, category and text
@@ -895,10 +905,8 @@ fn const_string(node: &protobuf::Node, snapshot: &PgCatalog) -> Option<String> {
             }
             let names = extract_string_fields(&tn.names);
             let name = names.last()?;
-            let t = snapshot.resolve_type_by_name(
-                (names.len() == 2).then(|| names[0].as_str()),
-                name,
-            )?;
+            let t = snapshot
+                .resolve_type_by_name((names.len() == 2).then(|| names[0].as_str()), name)?;
             (t.typcategory == TypCategory::String).then_some(())?;
             const_string(c.arg.as_deref()?, snapshot)
         }
@@ -922,7 +930,9 @@ fn const_regex_pattern(
     snapshot: &PgCatalog,
 ) -> Option<Result<String, AnalyzeError>> {
     if let Some(node::Node::FuncCall(fc)) = node.node.as_ref()
-        && extract_string_fields(&fc.funcname).last().map(String::as_str)
+        && extract_string_fields(&fc.funcname)
+            .last()
+            .map(String::as_str)
             == Some("similar_to_escape")
     {
         let pattern = const_string(fc.args.first()?, snapshot)?;
@@ -940,10 +950,13 @@ fn check_regex_pattern(
     icase: bool,
 ) -> Result<(), AnalyzeError> {
     use crate::regex_input::{REG_ADVANCED, REG_ICASE};
-    let cflags = if icase { REG_ADVANCED | REG_ICASE } else { REG_ADVANCED };
-    crate::regex_input::check(&pattern?, cflags).map_err(|msg| {
-        crate::error::RawError::invalid(msg, None, None).finalize_implicit()
-    })
+    let cflags = if icase {
+        REG_ADVANCED | REG_ICASE
+    } else {
+        REG_ADVANCED
+    };
+    crate::regex_input::check(&pattern?, cflags)
+        .map_err(|msg| crate::error::RawError::invalid(msg, None, None).finalize_implicit())
 }
 
 /// PG's `similar_escape_internal` (regexp.c): the POSIX regex a SIMILAR TO

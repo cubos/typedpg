@@ -103,8 +103,12 @@ pub(crate) fn infer_type_cast(
     if let Some(node::Node::AConst(ac)) = inner.node.as_ref()
         && !ac.isnull
         && let Some(a_const::Val::Sval(sv)) = &ac.val
-        && let Err(msg) =
-            crate::literal_input::validate_with_typmod(&sv.sval, target_oid, written_typmod, snapshot)
+        && let Err(msg) = crate::literal_input::validate_with_typmod(
+            &sv.sval,
+            target_oid,
+            written_typmod,
+            snapshot,
+        )
     {
         let span =
             crate::error::node_location(inner).and_then(crate::error::SourceSpan::from_node_token);
@@ -137,8 +141,8 @@ pub(crate) fn infer_type_cast(
     let target_base = snapshot.unwrap_domain(target_oid);
     let array_target = match inner.node.as_ref() {
         // (`get_element_type`: also `record[]`, a pseudo-type array.)
-        Some(node::Node::AArrayExpr(arr)) => array_element_type(snapshot, target_base)
-            .map(|element_type| {
+        Some(node::Node::AArrayExpr(arr)) => {
+            array_element_type(snapshot, target_base).map(|element_type| {
                 (
                     arr,
                     ArrayTarget {
@@ -151,7 +155,8 @@ pub(crate) fn infer_type_cast(
                         },
                     },
                 )
-            }),
+            })
+        }
         _ => None,
     };
     let built_for_target = array_target.is_some();

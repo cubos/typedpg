@@ -607,7 +607,8 @@ fn arrays_coerce_element_wise() {
     assert_cols(&s, vec![c("a", array_of(int8()))]);
     db.analyze("INSERT INTO ta (id, arr) VALUES (1, ARRAY[1.5])")
         .unwrap();
-    db.analyze("UPDATE ta SET arr = ARRAY[1.5]::numeric[]").unwrap();
+    db.analyze("UPDATE ta SET arr = ARRAY[1.5]::numeric[]")
+        .unwrap();
 }
 
 /// gram.y rejects an out-of-range `float(p)` precision itself, with

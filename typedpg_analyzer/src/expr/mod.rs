@@ -1231,17 +1231,19 @@ pub(crate) fn expand_row_args<'a>(
                 match expand_indirection_star(ind, ctx, &mut scratch) {
                     Ok(Some(fields)) => {
                         let prefix = &ind.indirection[..ind.indirection.len() - 1];
-                        out.extend(fields.iter().map(|(name, _)| protobuf::Node {
-                            node: Some(node::Node::AIndirection(Box::new(
-                                protobuf::AIndirection {
-                                    arg: ind.arg.clone(),
-                                    indirection: prefix
-                                        .iter()
-                                        .cloned()
-                                        .chain(std::iter::once(string(name)))
-                                        .collect(),
-                                },
-                            ))),
+                        out.extend(fields.iter().map(|(name, _)| {
+                            protobuf::Node {
+                                node: Some(node::Node::AIndirection(Box::new(
+                                    protobuf::AIndirection {
+                                        arg: ind.arg.clone(),
+                                        indirection: prefix
+                                            .iter()
+                                            .cloned()
+                                            .chain(std::iter::once(string(name)))
+                                            .collect(),
+                                    },
+                                ))),
+                            }
                         }));
                     }
                     _ => out.push(arg.clone()),
@@ -1409,10 +1411,12 @@ mod sublink;
 mod xml;
 
 use column_refs::*;
-pub(crate) use column_refs::{SqlFunctionParams, check_column_ref_length, with_sql_function_params};
+pub(crate) use column_refs::{
+    SqlFunctionParams, check_column_ref_length, with_sql_function_params,
+};
 use conditional::*;
-pub(crate) use func_call::{backfill_call_args, check_window_clause};
 use func_call::*;
+pub(crate) use func_call::{backfill_call_args, check_window_clause};
 use indirection::*;
 pub(crate) use indirection::{expand_indirection_star, transform_container_subscripts};
 use json::*;

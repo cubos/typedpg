@@ -2527,7 +2527,9 @@ fn row_constructor_expands_star_arguments() {
     assert_cols(&s, vec![c("x", text())]);
     let s = db.analyze("SELECT (ROW(t.*, 1)).f8 AS x FROM t").unwrap();
     assert_cols(&s, vec![c("x", int4())]);
-    let s = db.analyze("SELECT (ROW(public.t.*)).f1 AS x FROM t").unwrap();
+    let s = db
+        .analyze("SELECT (ROW(public.t.*)).f1 AS x FROM t")
+        .unwrap();
     assert_cols(&s, vec![c("x", int4())]);
     let s = db.analyze("SELECT ROW(t.*)::t AS x FROM t").unwrap();
     assert!(matches!(&s.columns[0].pg_type, Type::Composite { name, .. } if name == "t"));
@@ -2538,7 +2540,9 @@ fn row_constructor_expands_star_arguments() {
         )
         .unwrap();
     assert_cols(&s, vec![cn("x", bool_ty())]);
-    let s = db.analyze("SELECT (ROW((tc.c).*)).f2 AS x FROM tc").unwrap();
+    let s = db
+        .analyze("SELECT (ROW((tc.c).*)).f2 AS x FROM tc")
+        .unwrap();
     assert_cols(&s, vec![cn("x", text())]);
     assert_err_prefix!(
         db.analyze("SELECT ROW(nosuch.*) FROM t"),
@@ -2572,7 +2576,9 @@ fn composite_casts_between_unrelated_types_are_rejected() {
         AnalyzeError::Invalid(_),
         "cannot cast type comp to t"
     );
-    let s = db.analyze("SELECT (child.*)::parent AS p FROM child").unwrap();
+    let s = db
+        .analyze("SELECT (child.*)::parent AS p FROM child")
+        .unwrap();
     assert!(matches!(&s.columns[0].pg_type, Type::Composite { name, .. } if name == "parent"));
     db.analyze("SELECT (t.*)::text, 'x'::text::comp FROM t")
         .unwrap();
@@ -2606,10 +2612,8 @@ fn composite_cast_to_record_keeps_its_type() {
 #[test]
 fn field_of_opaque_record_function_is_unidentified_column() {
     let mut db = PgCatalog::new().unwrap();
-    db.apply_sql(
-        "CREATE FUNCTION f_rec() RETURNS record LANGUAGE sql AS $$ SELECT 1, 'a' $$;",
-    )
-    .unwrap();
+    db.apply_sql("CREATE FUNCTION f_rec() RETURNS record LANGUAGE sql AS $$ SELECT 1, 'a' $$;")
+        .unwrap();
     assert_err_prefix!(
         db.analyze("SELECT (f_rec()).a"),
         AnalyzeError::UndefinedColumn(_),
