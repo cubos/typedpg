@@ -916,3 +916,19 @@ fn enum_labels_and_domain_commands_are_checked() {
         &format!("CREATE TYPE ok AS ENUM ('{}');", "a".repeat(63)),
     )]);
 }
+
+#[test]
+fn a_relation_named_like_an_array_type_moves_the_array_aside() {
+    let db = build(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int);
+         CREATE TABLE _t (b int);
+         CREATE VIEW v AS SELECT 1 AS x;
+         CREATE VIEW _v AS SELECT 2 AS y;",
+    )]);
+    for (array, element) in [("__t", "t"), ("__v", "v")] {
+        let arr = db.resolve_type_by_name(None, array).expect(array);
+        let elem = db.resolve_type_by_name(None, element).unwrap();
+        assert_eq!(arr.typelem, Some(elem.oid), "{array}");
+    }
+}
