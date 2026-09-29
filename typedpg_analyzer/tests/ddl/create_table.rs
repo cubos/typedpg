@@ -1189,3 +1189,87 @@ fn set_returning_functions_are_rejected_in_defaults() {
         );
     }
 }
+
+#[test]
+fn columns_may_not_have_a_pseudo_type() {
+    // CheckAttributeType: CREATE TABLE, CREATE TABLE AS and views alike.
+    for (sql, msg) in [
+        ("CREATE TABLE b (c record);", "column \"c\" has pseudo-type record"),
+        (
+            "CREATE TABLE b (c anyelement);",
+            "column \"c\" has pseudo-type anyelement",
+        ),
+        ("CREATE TABLE b (c cstring);", "column \"c\" has pseudo-type cstring"),
+        ("CREATE TABLE b (c unknown);", "column \"c\" has pseudo-type unknown"),
+        ("CREATE TABLE b (c void);", "column \"c\" has pseudo-type void"),
+        (
+            "CREATE TABLE b AS SELECT row(1, 2) AS c;",
+            "column \"c\" has pseudo-type record",
+        ),
+        (
+            "CREATE TABLE b AS SELECT pg_sleep(0) AS c;",
+            "column \"c\" has pseudo-type void",
+        ),
+        (
+            "CREATE VIEW b AS SELECT row(1, 2) AS c;",
+            "column \"c\" has pseudo-type record",
+        ),
+        (
+            "CREATE VIEW v AS SELECT 1 AS a;
+             CREATE OR REPLACE VIEW v AS SELECT 1 AS a, row(1, 2) AS c;",
+            "column \"c\" has pseudo-type record",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", sql)]).expect_err(sql);
+        assert!(err.to_string().starts_with(msg), "{sql}\n  got: {err}");
+    }
+    // An output column still untyped is stored as text
+    // (resolveTargetListUnknowns), not as the pseudo-type unknown.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE b AS SELECT 'x' AS c, NULL AS d;
+         CREATE VIEW v AS SELECT NULL AS d;",
+    )]);
+    for sql in ["SELECT c, d FROM b", "SELECT d FROM v"] {
+        let q = db.analyze(sql).unwrap();
+        assert!(q.columns.iter().all(|c| c.pg_type == text()), "{sql}");
+    }
+}
+
+#[test]
+fn columns_may_not_take_a_system_column_name() {
+    // CheckAttributeNamesTypes / check_for_column_name_collision (even
+    // under IF NOT EXISTS); views and composite types have no system
+    // columns.
+    for (sql, msg) in [
+        (
+            "CREATE TABLE t2 (oid int, xmin int);",
+            "column name \"xmin\" conflicts with a system column name",
+        ),
+        (
+            "CREATE TABLE t (a int); ALTER TABLE t ADD COLUMN xmin int;",
+            "column name \"xmin\" conflicts with a system column name",
+        ),
+        (
+            "CREATE TABLE t (a int); ALTER TABLE t ADD COLUMN IF NOT EXISTS ctid int;",
+            "column name \"ctid\" conflicts with a system column name",
+        ),
+        (
+            "CREATE TABLE t3 AS SELECT 1 AS xmin;",
+            "column name \"xmin\" conflicts with a system column name",
+        ),
+        (
+            "CREATE MATERIALIZED VIEW m AS SELECT 1 AS cmax;",
+            "column name \"cmax\" conflicts with a system column name",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", sql)]).expect_err(sql);
+        assert!(err.to_string().starts_with(msg), "{sql}\n  got: {err}");
+    }
+    build_db(&[(
+        "0001.sql",
+        "CREATE VIEW v AS SELECT 1 AS xmin;
+         CREATE TYPE ct AS (xmin int);
+         ALTER TYPE ct ADD ATTRIBUTE ctid int;",
+    )]);
+}

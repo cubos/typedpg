@@ -13,44 +13,69 @@ fn is_user_defined(oid: u32) -> bool {
     oid >= FIRST_UNPINNED_OBJECT_ID
 }
 
-/// `CheckAttributeType(..., CHKATYPE_IS_VIRTUAL)` (heap.c), the parts that
-/// concern a virtual generated column: its type may not be (or contain,
+/// `CheckAttributeType` (heap.c): a column's type may not be (or contain,
 /// through a composite's attributes, a range's subtype, a multirange's range
-/// or an array's element) a domain, nor be user-defined.
-pub(crate) fn check_virtual_column_type(
+/// or an array's element) a pseudo-type, nor a composite type that contains
+/// it — `containing` starts with the row type the column is added to (ALTER
+/// TABLE's `list_make1_oid(rel->rd_rel->reltype)`), empty for a new
+/// relation. A virtual generated column (`CHKATYPE_IS_VIRTUAL`) may not
+/// have a domain nor a user-defined type either. (The "no collation was
+/// derived" check is not modeled: the analyzer's derived collations are not
+/// precise enough to reject on.)
+pub(crate) fn check_attribute_type(
     interp: &PgCatalog,
     attname: &str,
     typid: PgTypeOid,
+    containing: Option<PgTypeOid>,
+    is_virtual: bool,
 ) -> Result<(), DdlError> {
-    check_virtual_column_type_rec(interp, attname, typid, &mut Vec::new())
+    let mut containing: Vec<PgTypeOid> = containing.into_iter().collect();
+    check_attribute_type_rec(interp, attname, typid, &mut containing, is_virtual)
 }
 
-fn check_virtual_column_type_rec(
+fn check_attribute_type_rec(
     interp: &PgCatalog,
     attname: &str,
     typid: PgTypeOid,
     containing: &mut Vec<PgTypeOid>,
+    is_virtual: bool,
 ) -> Result<(), DdlError> {
     let Some(typ) = interp.pg_type.get(&typid) else {
         return Ok(());
     };
     match typ.typtype {
-        TypType::Domain => {
-            return Err(DdlError::UnsupportedDdl(format!(
-                "virtual generated column \"{attname}\" cannot have a domain type"
+        TypType::Pseudo => {
+            return Err(DdlError::Parse(format!(
+                "column \"{attname}\" has pseudo-type {}",
+                super::super::util::format_type_for_message(interp, typid)
             )));
         }
+        TypType::Domain => {
+            if is_virtual {
+                return Err(DdlError::UnsupportedDdl(format!(
+                    "virtual generated column \"{attname}\" cannot have a domain type"
+                )));
+            }
+            if let Some(base) = typ.typbasetype {
+                check_attribute_type_rec(interp, attname, base, containing, is_virtual)?;
+            }
+        }
         TypType::Composite => {
-            if !containing.contains(&typid)
-                && let Some(relid) = typ.typrelid
-            {
+            if containing.contains(&typid) {
+                return Err(DdlError::Parse(format!(
+                    "composite type {} cannot be made a member of itself",
+                    super::super::util::format_type_for_message(interp, typid)
+                )));
+            }
+            if let Some(relid) = typ.typrelid {
                 containing.push(typid);
                 for attr in interp.attributes_of(relid).to_vec() {
-                    check_virtual_column_type_rec(
+                    check_attribute_type_rec(
                         interp,
                         &attr.attname,
                         attr.atttypid,
                         containing,
+                        is_virtual,
                     )?;
                 }
                 containing.pop();
@@ -58,7 +83,7 @@ fn check_virtual_column_type_rec(
         }
         TypType::Range => {
             if let Some(range) = interp.pg_range.get(&typid) {
-                check_virtual_column_type_rec(interp, attname, range.rngsubtype, containing)?;
+                check_attribute_type_rec(interp, attname, range.rngsubtype, containing, is_virtual)?;
             }
         }
         TypType::Multirange => {
@@ -67,19 +92,19 @@ fn check_virtual_column_type_rec(
                 .values()
                 .find(|r| r.rngmultitypid == Some(typid))
             {
-                check_virtual_column_type_rec(interp, attname, range.rngtypid, containing)?;
+                check_attribute_type_rec(interp, attname, range.rngtypid, containing, is_virtual)?;
             }
         }
         _ => {
             if typ.typcategory == TypCategory::Array
                 && let Some(elem) = typ.typelem
             {
-                check_virtual_column_type_rec(interp, attname, elem, containing)?;
+                check_attribute_type_rec(interp, attname, elem, containing, is_virtual)?;
             }
         }
     }
     // For consistency with check_virtual_generated_security().
-    if is_user_defined(typid.get()) {
+    if is_virtual && is_user_defined(typid.get()) {
         return Err(DdlError::UnsupportedDdl(format!(
             "virtual generated column \"{attname}\" cannot have a user-defined type (Virtual \
              generated columns that make use of user-defined types are not yet supported.)"

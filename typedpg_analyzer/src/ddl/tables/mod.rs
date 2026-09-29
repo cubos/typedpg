@@ -371,12 +371,9 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
             }
         }
     }
-    // CheckAttributeNamesTypes (heap_create_with_catalog).
-    for col in &columns {
-        if col.generated == Some(AttGenerated::Virtual) {
-            generated::check_virtual_column_type(interp, &col.name, col.type_oid)?;
-        }
-    }
+    // CheckAttributeNamesTypes (heap_create_with_catalog): no column may
+    // take a system column's name, then each column's type is checked.
+    check_attribute_names_types(interp, &columns)?;
     for (i, col) in columns.iter().enumerate() {
         interp.insert_pg_attribute(PgAttribute {
             attrelid: class_oid,
@@ -742,6 +739,42 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
         copy_like_constraints(interp, class_oid, &name, like)?;
     }
 
+    Ok(())
+}
+
+/// CheckAttributeNamesTypes (heap.c) for a relation with storage: a column
+/// may not take a system column's name, and its type must pass
+/// CheckAttributeType.
+fn check_attribute_names_types(
+    interp: &PgCatalog,
+    columns: &[ParsedColumn],
+) -> Result<(), DdlError> {
+    for col in columns {
+        check_system_column_name(&col.name)?;
+    }
+    for col in columns {
+        generated::check_attribute_type(
+            interp,
+            &col.name,
+            col.type_oid,
+            None,
+            col.generated == Some(AttGenerated::Virtual),
+        )?;
+    }
+    Ok(())
+}
+
+/// The system column name check of CheckAttributeNamesTypes and
+/// check_for_column_name_collision (tablecmds.c).
+pub(crate) fn check_system_column_name(name: &str) -> Result<(), DdlError> {
+    if crate::pg_catalog::SYSTEM_COLUMNS
+        .iter()
+        .any(|(n, ..)| *n == name)
+    {
+        return Err(DdlError::DuplicateObject(format!(
+            "column name \"{name}\" conflicts with a system column name"
+        )));
+    }
     Ok(())
 }
 
@@ -1187,6 +1220,7 @@ mod columns;
 mod constraints;
 pub(crate) mod foreign_keys;
 mod generated;
+pub(crate) use generated::check_attribute_type;
 pub(crate) mod inherit;
 mod inherit_cmd;
 mod merge;

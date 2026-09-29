@@ -328,6 +328,8 @@ fn replace_view(
         ast,
         deps,
     } = resolved;
+    // DefineVirtualRelation adds the new columns with ATExecAddColumn.
+    check_relation_columns(interp, RelKind::View, &columns)?;
     let attrs: Vec<PgAttribute> = columns
         .iter()
         .enumerate()
@@ -410,6 +412,25 @@ struct ResolvedView {
     deps: ViewDeps,
 }
 
+/// CheckAttributeNamesTypes (heap_create_with_catalog): a table or
+/// materialized view's column may not take a system column's name (a view
+/// has none), and no column may have a pseudo-type.
+fn check_relation_columns(
+    interp: &PgCatalog,
+    relkind: RelKind,
+    columns: &[ResolvedColumn],
+) -> Result<(), DdlError> {
+    if relkind != RelKind::View {
+        for col in columns {
+            super::tables::check_system_column_name(&col.name)?;
+        }
+    }
+    for col in columns {
+        super::tables::check_attribute_type(interp, &col.name, col.type_oid, None, false)?;
+    }
+    Ok(())
+}
+
 /// Build a `pg_class` row + the matching `pg_attribute` rows + composite type
 /// + array type, and write the `pg_depend` rows for the view's dependencies.
 fn install_relation(
@@ -425,6 +446,7 @@ fn install_relation(
         ast,
         deps,
     } = resolved;
+    check_relation_columns(interp, relkind, &columns)?;
     let class_oid = PgClassOid::from_nonzero(interp.alloc_oid()?);
     let composite_oid = PgTypeOid::from_nonzero(interp.alloc_oid()?);
     let array_oid = PgTypeOid::from_nonzero(interp.alloc_oid()?);
@@ -616,14 +638,21 @@ fn resolve_view_now(
             } else {
                 col.name.clone()
             };
+            // transformSelectStmt's resolveTargetListUnknowns: an output
+            // column still of type unknown is stored as text.
+            let type_oid = if col.type_oid == crate::pg_catalog::oid::UNKNOWN {
+                crate::pg_catalog::oid::TEXT
+            } else {
+                col.type_oid
+            };
             ResolvedColumn {
                 name,
-                type_oid: col.type_oid,
+                type_oid,
                 typmod: col.typmod,
                 not_null: !col.nullable,
                 collation: col
                     .collation
-                    .or_else(|| interp_type_collation(snapshot, col.type_oid)),
+                    .or_else(|| interp_type_collation(snapshot, type_oid)),
             }
         })
         .collect();

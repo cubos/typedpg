@@ -710,6 +710,13 @@ fn add_column_to(
         )));
     }
 
+    // check_for_column_name_collision: a system column's name is taken even
+    // under IF NOT EXISTS (a composite type has no system columns).
+    let relkind = interp.pg_class.get(&relid).map(|c| c.relkind);
+    if relkind != Some(RelKind::CompositeType) {
+        super::check_system_column_name(&cd.colname)?;
+    }
+
     // ATExecAddColumn: a column with a default — or a constrained domain
     // type, whose NULL default is checked — rewrites a table's rows.
     if interp.pg_class.get(&relid).map(|c| c.relkind) == Some(RelKind::Table)
@@ -718,10 +725,14 @@ fn add_column_to(
     {
         find_composite_type_dependencies(interp, row_type, relid)?;
     }
-    // ATExecAddColumn: CheckAttributeType.
-    if col.generated == Some(AttGenerated::Virtual) {
-        super::generated::check_virtual_column_type(interp, &col.name, col.type_oid)?;
-    }
+    // ATExecAddColumn: CheckAttributeType, within the relation's row type.
+    super::generated::check_attribute_type(
+        interp,
+        &col.name,
+        col.type_oid,
+        interp.pg_class.get(&relid).and_then(|c| c.reltype),
+        col.generated == Some(AttGenerated::Virtual),
+    )?;
     let next_attnum = interp
         .attributes_of(relid)
         .iter()
@@ -1225,10 +1236,15 @@ pub(crate) fn alter_column_type(
     let new_collation = column_collation(interp, cd, new_type_oid)?
         .or_else(|| type_collation(interp, new_type_oid));
 
-    // CheckAttributeType(..., CHKATYPE_IS_VIRTUAL).
-    if attr.attgenerated == Some(AttGenerated::Virtual) {
-        super::generated::check_virtual_column_type(interp, &cmd.name, new_type_oid)?;
-    }
+    // ATPrepAlterColumnType: CheckAttributeType, within the relation's row
+    // type.
+    super::generated::check_attribute_type(
+        interp,
+        &cmd.name,
+        new_type_oid,
+        interp.pg_class.get(&relid).and_then(|c| c.reltype),
+        attr.attgenerated == Some(AttGenerated::Virtual),
+    )?;
     // ATPrepAlterColumnType: the old value (or the USING expression) must
     // be assignment-coercible to the new type — a virtual column stores
     // none.

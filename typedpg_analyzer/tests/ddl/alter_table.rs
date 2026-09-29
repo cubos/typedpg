@@ -707,3 +707,32 @@ fn alter_column_type_using_rejects_what_transform_expressions_forbid() {
         assert!(err.to_string().starts_with(message), "{sql}\n  got: {err}");
     }
 }
+
+#[test]
+fn a_column_may_not_hold_its_own_tables_row_type() {
+    // CheckAttributeType within the relation's row type: directly, through
+    // an array or through another composite that contains it.
+    let setup = "CREATE TABLE a (x int, w int);
+                 CREATE TABLE b (y a);
+                 CREATE TYPE ct AS (x int);";
+    for stmt in [
+        "ALTER TABLE a ADD COLUMN y a;",
+        "ALTER TABLE a ADD COLUMN y a[];",
+        "ALTER TABLE a ADD COLUMN z b;",
+        "ALTER TABLE a ALTER COLUMN w TYPE b USING NULL;",
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(
+            err.to_string()
+                .starts_with("composite type a cannot be made a member of itself"),
+            "{stmt}\n  got: {err}"
+        );
+    }
+    let stmt = "ALTER TYPE ct ADD ATTRIBUTE s ct;";
+    let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+    assert!(
+        err.to_string()
+            .starts_with("composite type ct cannot be made a member of itself"),
+        "got: {err}"
+    );
+}
