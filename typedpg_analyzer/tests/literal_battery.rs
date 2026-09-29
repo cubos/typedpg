@@ -106,9 +106,9 @@ const BATTERY: &[&str] = &[
     "SELECT '12:30:00'::time",
     "SELECT '{}'::timetz",
     "SELECT '1 day'::interval",
-    // (Not `'[1,2)'`: under an `interval hour` typmod that decodes as
-    // 1 day 2 hours, and the validator can't see the typmod.)
     "SELECT '[1,x)'::interval",
+    "SELECT '[1,2)'::interval",
+    "SELECT '[1,2)'::interval hour",
     "SELECT '2024-01-01 12:00 America/New_York'::timestamptz",
     "SELECT 'now()'::timestamptz",
     // ── jsonpath like_regex: patterns compiled by pg_regcomp ─────────────

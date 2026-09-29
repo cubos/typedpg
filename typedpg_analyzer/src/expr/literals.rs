@@ -103,7 +103,8 @@ pub(crate) fn infer_type_cast(
     if let Some(node::Node::AConst(ac)) = inner.node.as_ref()
         && !ac.isnull
         && let Some(a_const::Val::Sval(sv)) = &ac.val
-        && let Err(msg) = crate::literal_input::validate(&sv.sval, target_oid, snapshot)
+        && let Err(msg) =
+            crate::literal_input::validate_with_typmod(&sv.sval, target_oid, written_typmod, snapshot)
     {
         let span =
             crate::error::node_location(inner).and_then(crate::error::SourceSpan::from_node_token);

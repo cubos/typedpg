@@ -68,7 +68,9 @@ pub(crate) fn infer_func_call(
             if let Some(node::Node::AConst(ac)) = func.args[0].node.as_ref()
                 && !ac.isnull
                 && let Some(typedpg_pg_query::protobuf::a_const::Val::Sval(sv)) = &ac.val
-                && let Err(msg) = crate::literal_input::validate(&sv.sval, target, snapshot)
+                // A function-style cast carries no typmod.
+                && let Err(msg) =
+                    crate::literal_input::validate_with_typmod(&sv.sval, target, None, snapshot)
             {
                 let span = crate::error::node_location(&func.args[0])
                     .and_then(crate::error::SourceSpan::from_node_token);

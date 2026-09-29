@@ -1161,3 +1161,24 @@ fn cidr_literal_host_bits_rejected() {
         db.analyze(q).unwrap_or_else(|e| panic!("{q}: {e}"));
     }
 }
+
+/// An explicit cast hands its typmod to `interval_in`, whose field
+/// restriction decides how bare numbers and `mm:ss` fields decode — so a
+/// cast's interval literal is decided exactly, not only when every
+/// restriction agrees.
+#[test]
+fn interval_cast_literal_uses_the_written_field_restriction() {
+    let db = setup();
+    assert_first_line!(
+        db.analyze("SELECT '1 1'::interval"),
+        "invalid input syntax for type interval: \"1 1\""
+    );
+    assert_first_line!(
+        db.analyze("SELECT '[1,2)'::interval"),
+        "invalid input syntax for type interval: \"[1,2)\""
+    );
+    db.analyze("SELECT '1 1'::interval day to hour AS v").unwrap();
+    db.analyze("SELECT '[1,2)'::interval hour AS v").unwrap();
+    db.analyze("SELECT '1:30'::interval minute to second AS v")
+        .unwrap();
+}

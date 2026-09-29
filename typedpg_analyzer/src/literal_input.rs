@@ -25,6 +25,27 @@
 use crate::oid::PgTypeOid;
 use crate::pg_catalog::{PgCatalog, TypCategory, TypType, oid};
 
+/// [`validate`] when the typmod the input function receives is known
+/// exactly (`None` meaning `-1`) — an explicit cast, whose written typmod
+/// reaches the input function (`coerce_type` → `stringTypeDatum`). Only
+/// interval input depends on it: its field restriction changes the
+/// decoding, so `'1 1'::interval` is decided although `'1 1'` into an
+/// `interval day to hour` column is valid. A domain target keeps the
+/// conservative [`validate`] (the input function gets the domain's base
+/// typmod).
+pub(crate) fn validate_with_typmod(
+    content: &str,
+    target: PgTypeOid,
+    typmod: Option<i32>,
+    snapshot: &PgCatalog,
+) -> Result<(), String> {
+    const INTERVAL: PgTypeOid = PgTypeOid::from_raw(1186);
+    if target == INTERVAL {
+        return crate::datetime_input::validate_interval(content, typmod.unwrap_or(-1));
+    }
+    validate(content, target, snapshot)
+}
+
 /// Outcome of validating literal `content` against `target`: `Ok(())` when PG
 /// would accept it (or we can't tell), `Err(message)` with PG's verbatim
 /// parse-time error when it provably wouldn't.

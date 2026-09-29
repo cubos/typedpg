@@ -25,10 +25,11 @@
 //!   within a day of the timestamp range limits;
 //! - hexadecimal or subnormal numbers in ISO 8601 intervals (strtod
 //!   corner cases);
-//! - the interval typmod: PG passes an interval column's / cast's field
-//!   restriction to `interval_in` (it changes how bare numbers and `mm:ss`
-//!   decode), which the caller does not tell us — an interval literal is
-//!   only rejected when every field restriction rejects it the same way.
+//! - the interval typmod, where the caller doesn't know it: PG passes an
+//!   interval column's / cast's field restriction to `interval_in` (it
+//!   changes how bare numbers and `mm:ss` decode) — without it an interval
+//!   literal is only rejected when every field restriction rejects it the
+//!   same way; a cast's known typmod goes through [`validate_interval`].
 
 use crate::pgmsg;
 
@@ -104,6 +105,22 @@ pub(crate) fn validate(content: &str, ty: DatetimeType) -> Result<(), String> {
     match outcome {
         Ok(()) | Err(Dterr::Unsure) => Ok(()),
         Err(e) => Err(message(&e, content, ty)),
+    }
+}
+
+/// `interval_in` with a known typmod (`-1` for none): the field restriction
+/// the typmod carries (`INTERVAL_RANGE`) decides how bare numbers and
+/// `mm:ss` fields decode, so with it known the literal is decided exactly
+/// instead of only when every restriction agrees ([`validate`]).
+pub(crate) fn validate_interval(content: &str, typmod: i32) -> Result<(), String> {
+    let range = if typmod < 0 {
+        INTERVAL_FULL_RANGE
+    } else {
+        (typmod >> 16) & INTERVAL_FULL_RANGE
+    };
+    match interval_in_range(content, range) {
+        Ok(()) | Err(Dterr::Unsure) => Ok(()),
+        Err(e) => Err(message(&e, content, DatetimeType::Interval)),
     }
 }
 
