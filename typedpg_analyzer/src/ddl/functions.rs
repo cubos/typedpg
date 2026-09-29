@@ -425,9 +425,8 @@ pub(crate) fn interpret_function_parameter_list(
         if mode == ArgMode::Variadic {
             var_count += 1;
             list.variadic = Some(
-                crate::polymorphic::variadic_element_type(toid, interp).ok_or_else(|| {
-                    DdlError::Parse("VARIADIC parameter must be an array".into())
-                })?,
+                crate::polymorphic::variadic_element_type(toid, interp)
+                    .ok_or_else(|| DdlError::Parse("VARIADIC parameter must be an array".into()))?,
             );
         }
         // Two input or two output parameters can't share a name.
@@ -507,15 +506,16 @@ pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Res
     // TRANSFORM FOR TYPE t: a transform for t (or its element type) and
     // the language must exist.
     if let Some(transform) = attrs.transform
-        && let Some(node::Node::List(types)) = transform.arg.as_deref().and_then(|a| a.node.as_ref())
+        && let Some(node::Node::List(types)) =
+            transform.arg.as_deref().and_then(|a| a.node.as_ref())
     {
         for item in &types.items {
             let Some(node::Node::TypeName(tn)) = item.node.as_ref() else {
                 continue;
             };
             let typeid = typename_type_id(interp, tn)?;
-            let typeid = crate::coerce::element_type(interp.unwrap_domain(typeid), interp)
-                .unwrap_or(typeid);
+            let typeid =
+                crate::coerce::element_type(interp.unwrap_domain(typeid), interp).unwrap_or(typeid);
             if !super::languages::transform_exists(interp, typeid, &language) {
                 return Err(DdlError::TypeNotFound(format!(
                     "transform for type {} language \"{language}\" does not exist",
@@ -686,7 +686,10 @@ fn interpret_as_clause(
         if language != "sql" {
             return invalid("inline SQL function body only valid for language SQL");
         }
-        if in_types.iter().any(|&t| crate::polymorphic::is_polymorphic(t)) {
+        if in_types
+            .iter()
+            .any(|&t| crate::polymorphic::is_polymorphic(t))
+        {
             return invalid(
                 "SQL function with unquoted function body cannot have polymorphic arguments",
             );
@@ -759,6 +762,10 @@ pub(crate) fn procedure_create(
             }
             check_replacement(&existing, &proc)?;
             interp.remove_pg_proc(existing.oid);
+            super::depend::forget_dependencies_of(
+                interp,
+                super::depend::ObjectAddress::proc(existing.oid),
+            );
             existing.oid
         }
         None => PgProcOid::from_nonzero(interp.alloc_oid()?),
@@ -1273,7 +1280,8 @@ pub(crate) fn rename_routine(
     stmt: &typedpg_pg_query::protobuf::RenameStmt,
     objtype: ObjectType,
 ) -> Result<(), DdlError> {
-    let Some(node::Node::ObjectWithArgs(owa)) = stmt.object.as_deref().and_then(|o| o.node.as_ref())
+    let Some(node::Node::ObjectWithArgs(owa)) =
+        stmt.object.as_deref().and_then(|o| o.node.as_ref())
     else {
         return Ok(());
     };
@@ -1296,7 +1304,8 @@ pub(crate) fn set_routine_schema(
     new_nsoid: PgNamespaceOid,
     objtype: ObjectType,
 ) -> Result<(), DdlError> {
-    let Some(node::Node::ObjectWithArgs(owa)) = stmt.object.as_deref().and_then(|o| o.node.as_ref())
+    let Some(node::Node::ObjectWithArgs(owa)) =
+        stmt.object.as_deref().and_then(|o| o.node.as_ref())
     else {
         return Ok(());
     };
@@ -1311,4 +1320,42 @@ pub(crate) fn set_routine_schema(
     }
     interp.rename_pg_proc(oid, proc.proname.clone(), new_nsoid);
     Ok(())
+}
+
+/// `IsBinaryCoercible` (parse_coerce.c): `src` is `target`, a domain over
+/// it, fits a polymorphic target (any, anyelement, an array for anyarray,
+/// ...), a composite for record, or has an implicit binary-method cast.
+pub(crate) fn is_binary_coercible(interp: &PgCatalog, src: PgTypeOid, target: PgTypeOid) -> bool {
+    use crate::pg_catalog::{CastContext, CastMethod, TypType};
+    let raw = |oid: u32| PgTypeOid::from_raw(oid);
+    if src == target || [raw(2276), raw(2283), raw(5077)].contains(&target) {
+        return true;
+    }
+    let src = interp.unwrap_domain(src);
+    if src == target {
+        return true;
+    }
+    let typtype = interp.pg_type.get(&src).map(|t| t.typtype);
+    let is_array = crate::coerce::element_type(src, interp).is_some();
+    let fits = match target.get() {
+        2277 | 5078 => is_array,                // anyarray, anycompatiblearray
+        2776 | 5079 => !is_array,               // anynonarray, anycompatiblenonarray
+        3500 => typtype == Some(TypType::Enum), // anyenum
+        3831 | 5080 => typtype == Some(TypType::Range), // anyrange, anycompatiblerange
+        4537 | 4538 => typtype == Some(TypType::Multirange),
+        2249 => crate::coerce::is_complex(src, interp), // record
+        2287 => crate::coerce::element_type(src, interp)
+            .is_some_and(|e| crate::coerce::is_complex(e, interp)),
+        _ => false,
+    };
+    if fits {
+        return true;
+    }
+    interp
+        .cast_by_pair
+        .get(&(src, target))
+        .and_then(|oid| interp.pg_cast.get(oid))
+        .is_some_and(|c| {
+            c.castmethod == CastMethod::Binary && c.castcontext == CastContext::Implicit
+        })
 }

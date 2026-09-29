@@ -1033,7 +1033,10 @@ fn drop_function(
         "function"
     };
     // getObjectDescription's `name(type,type)`.
-    let signature = format!("{name}({})", format_arg_oids(&arg_oids, interp).replace(", ", ","));
+    let signature = format!(
+        "{name}({})",
+        format_arg_oids(&arg_oids, interp).replace(", ", ",")
+    );
     let target = Some(target);
 
     if let Some(oid) = target {
@@ -1138,8 +1141,12 @@ fn drop_aggregate(
         .and_then(node_string)
         .unwrap_or_default()
         .to_owned();
-    let target =
-        super::functions::lookup_func_with_args(interp, ObjectType::ObjectAggregate, owa, missing_ok)?;
+    let target = super::functions::lookup_func_with_args(
+        interp,
+        ObjectType::ObjectAggregate,
+        owa,
+        missing_ok,
+    )?;
     let arg_oids: Vec<PgTypeOid> = target
         .and_then(|oid| interp.pg_proc.get(&oid))
         .map(|p| p.proargtypes.clone())

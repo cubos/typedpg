@@ -323,7 +323,9 @@ pub(crate) fn func_get_detail(
             .iter()
             .map(|&pp| default_arg_type(f, call_param_types(f, notation), pp)),
     );
-    let rettype = aggregate_final_return(f, snapshot).unwrap_or(f.prorettype);
+    // An aggregate's `prorettype` is already its final function's result,
+    // resolved at CREATE AGGREGATE (AggregateCreate).
+    let rettype = f.prorettype;
     let (return_type_oid, poly) = crate::polymorphic::enforce_generic_type_consistency(
         &actuals,
         &mut declared,
@@ -797,16 +799,6 @@ fn build_out_args(p: &PgProc) -> Vec<OutArg> {
         });
     }
     out
-}
-
-/// Effective return type for an aggregate: when `pg_aggregate.aggfinalfn`
-/// points at a real proc, use *that* proc's `prorettype`; otherwise the
-/// caller falls back to the aggregate's own `prorettype`. PG derives this
-/// the same way at lookup time — we don't cache the type on `pg_aggregate`.
-fn aggregate_final_return(f: &PgProc, snapshot: &PgCatalog) -> Option<PgTypeOid> {
-    let agg = snapshot.pg_aggregate.get(&f.oid)?;
-    let final_oid = agg.aggfinalfn?;
-    snapshot.pg_proc.get(&final_oid).map(|p| p.prorettype)
 }
 
 /// Whether an operator's result can be NULL, given which operands can be:

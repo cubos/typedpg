@@ -1233,3 +1233,109 @@ fn alter_function_without_arguments_needs_a_unique_name() {
         "function name \"f\" is not unique",
     )]);
 }
+
+#[test]
+fn create_aggregate_resolves_its_final_function_like_a_call() {
+    // FINALFUNC is looked up with the state type as argument, and a
+    // polymorphic final function's result is resolved from it.
+    let db = build(&[(
+        "0001.sql",
+        "CREATE FUNCTION ff(bigint) RETURNS int LANGUAGE sql AS 'select 1';
+         CREATE FUNCTION ff(int) RETURNS text LANGUAGE sql AS 'select ''x''';
+         CREATE AGGREGATE a1(int) (sfunc = int4pl, stype = int, finalfunc = ff);
+         CREATE FUNCTION fp(anyelement) RETURNS anyelement LANGUAGE sql AS 'select $1';
+         CREATE AGGREGATE a2(int) (sfunc = int4pl, stype = int, finalfunc = fp);
+         CREATE AGGREGATE mysum(int) (sfunc = int4pl, stype = int);
+         CREATE OR REPLACE AGGREGATE mysum(int) (sfunc = int4larger, stype = int);
+         CREATE AGGREGATE a3 (basetype = int, sfunc = int4pl, stype = int);",
+    )]);
+    let q = db
+        .analyze("SELECT a1(1) AS x, a2(1) AS y, mysum(1) AS z, a3(1) AS w")
+        .unwrap();
+    assert_eq!(q.columns[0].pg_type, text());
+    assert_eq!(q.columns[1].pg_type, int4());
+    assert_eq!(q.columns[2].pg_type, int4());
+    assert_eq!(q.columns[3].pg_type, int4());
+}
+
+#[test]
+fn create_aggregate_validates_its_definition() {
+    let agg = |def: &str| format!("CREATE AGGREGATE a(int) ({def});");
+    let cases: Vec<(String, &str)> = vec![
+        (
+            "CREATE AGGREGATE a(nosuchtype) (sfunc = int4pl, stype = int);".into(),
+            "type nosuchtype does not exist",
+        ),
+        (
+            agg("sfunc = nosuchfn, stype = int"),
+            "function nosuchfn(integer, integer) does not exist",
+        ),
+        (
+            agg("sfunc = int4pl, stype = bigint"),
+            "function int4pl(bigint, integer) does not exist",
+        ),
+        (agg("sfunc = int4pl"), "aggregate stype must be specified"),
+        (
+            agg("sfunc = int4pl, stype = int, initcond = 'x'"),
+            "invalid input syntax for type integer: \"x\"",
+        ),
+        (
+            agg("sfunc = int4pl, stype = int, finalfunc = float8abs"),
+            "function float8abs(double precision) requires run-time type coercion",
+        ),
+        (
+            agg("sfunc = int4pl, stype = int, combinefunc = int8pl"),
+            "function int8pl(bigint, bigint) requires run-time type coercion",
+        ),
+        (
+            agg("sfunc = int4pl, stype = int, msfunc = int4pl, mstype = int"),
+            "aggregate minvfunc must be specified when mstype is specified",
+        ),
+        (
+            agg("sfunc = int4pl, stype = int, mstype = int"),
+            "aggregate msfunc must be specified when mstype is specified",
+        ),
+        (
+            agg("sfunc = int4pl, stype = int, serialfunc = int4send"),
+            "must specify both or neither of serialization and deserialization functions",
+        ),
+        (
+            agg("sfunc = int4pl, stype = int, hypothetical"),
+            "only ordered-set aggregates can be hypothetical",
+        ),
+        (
+            agg("sfunc = int4pl, stype = int, finalfunc_modify = bogus"),
+            "parameter \"finalfunc_modify\" must be READ_ONLY, SHAREABLE, or READ_WRITE",
+        ),
+        (
+            agg("sfunc = int4pl, stype = int, parallel = bogus"),
+            "parameter \"parallel\" must be SAFE, RESTRICTED, or UNSAFE",
+        ),
+        (
+            "CREATE AGGREGATE a(*) (sfunc = int4pl, stype = int);".into(),
+            "function int4pl(integer) does not exist",
+        ),
+        (
+            agg("sfunc = int4pl, stype = nosuchtype"),
+            "type \"nosuchtype\" does not exist",
+        ),
+        (
+            agg("sfunc = int4pl, stype = int, finalfunc = nosuchfn"),
+            "function nosuchfn(integer) does not exist",
+        ),
+    ];
+    let cases: Vec<(&str, &str, &str)> = cases.iter().map(|(s, m)| ("", s.as_str(), *m)).collect();
+    assert_ddl_rejections(&cases);
+    assert_ddl_rejections(&[
+        (
+            "CREATE FUNCTION fs(int) RETURNS SETOF int LANGUAGE sql AS 'select 1';",
+            "CREATE AGGREGATE a(int) (sfunc = int4pl, stype = int, finalfunc = fs);",
+            "function fs(integer) returns a set",
+        ),
+        (
+            "CREATE FUNCTION mysum(int) RETURNS int LANGUAGE sql AS 'select 1';",
+            "CREATE OR REPLACE AGGREGATE mysum(int) (sfunc = int4pl, stype = int);",
+            "cannot change routine kind",
+        ),
+    ]);
+}
