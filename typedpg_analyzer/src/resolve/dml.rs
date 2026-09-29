@@ -700,6 +700,7 @@ fn transform_on_conflict_arbiter(
         exprs: Vec::new(),
         whole_row: false,
         where_clause: None,
+        qualified: Vec::new(),
     };
     let invalid = |msg: &str| {
         crate::error::RawError::new(AnalyzeError::InvalidColumnReference(msg.into()), None, None)
@@ -723,17 +724,20 @@ fn transform_on_conflict_arbiter(
                 "NULLS FIRST/LAST is not allowed in ON CONFLICT clause",
             ));
         }
+        let mut elem_attnum = None;
         if !ie.name.is_empty() {
             // A plain column becomes a ColumnRef transformed like any
             // other: a user or system column, else a whole-row reference to
             // the target, else an unknown column.
             if let Some(a) = tgt.attrs.iter().find(|a| a.attname == ie.name) {
                 arbiter.cols.insert(a.attnum);
+                elem_attnum = Some(a.attnum);
             } else if let Some(&(_, _, attnum)) = crate::pg_catalog::SYSTEM_COLUMNS
                 .iter()
                 .find(|(n, ..)| *n == ie.name)
             {
                 arbiter.cols.insert(attnum);
+                elem_attnum = Some(attnum);
             } else if ie.name == target_alias {
                 arbiter.whole_row = true;
             } else {
@@ -745,6 +749,8 @@ fn transform_on_conflict_arbiter(
             check_index_expr_kind(e, snapshot, "index expressions", "index expression")?;
             arbiter.exprs.push(e.clone());
         }
+        let mut collation = None;
+        let mut opclass = None;
         if !ie.collation.is_empty() {
             let parts = expr::extract_string_fields(&ie.collation);
             let (schema, name) = match parts.as_slice() {
@@ -752,8 +758,9 @@ fn transform_on_conflict_arbiter(
                 [s, n] => (Some(s.as_str()), n.as_str()),
                 _ => (None, ""),
             };
-            if snapshot.resolve_collation(schema, name).is_none() {
-                return Err(crate::pgmsg::collation_does_not_exist(&parts.join(".")));
+            match snapshot.resolve_collation(schema, name) {
+                Some(c) => collation = Some(c.oid),
+                None => return Err(crate::pgmsg::collation_does_not_exist(&parts.join("."))),
             }
         }
         if !ie.opclass.is_empty() {
@@ -763,16 +770,30 @@ fn transform_on_conflict_arbiter(
                 [s, n] => (Some(s.as_str()), n.as_str()),
                 _ => (None, ""),
             };
-            if crate::ddl::opclass::find_opclass(snapshot, schema, name, "btree").is_none() {
-                return Err(crate::error::RawError::new(
-                    AnalyzeError::UndefinedObject(format!(
-                        "operator class \"{name}\" does not exist for access method \"btree\""
-                    )),
-                    None,
-                    None,
-                )
-                .finalize_implicit());
+            match crate::ddl::opclass::find_opclass(snapshot, schema, name, "btree") {
+                Some(c) => opclass = Some(c.oid),
+                None => {
+                    return Err(crate::error::RawError::new(
+                        AnalyzeError::UndefinedObject(format!(
+                            "operator class \"{name}\" does not exist for access method \
+                             \"btree\""
+                        )),
+                        None,
+                        None,
+                    )
+                    .finalize_implicit());
+                }
             }
+        }
+        // infer_arbiter_indexes matches these against the index's
+        // indcollation / indclass.
+        if collation.is_some() || opclass.is_some() {
+            arbiter.qualified.push(crate::resolve::ArbiterElem {
+                attnum: elem_attnum,
+                expr: ie.expr.as_deref().cloned(),
+                collation,
+                opclass,
+            });
         }
     }
     if let Some(w) = infer.where_clause.as_deref() {

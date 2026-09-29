@@ -464,6 +464,72 @@ pub(crate) struct Arbiter {
     pub whole_row: bool,
     /// The inference WHERE clause.
     pub where_clause: Option<protobuf::Node>,
+    /// The elements that name a collation or operator class
+    /// (`InferenceElem.infercollid` / `inferopclass`).
+    pub qualified: Vec<ArbiterElem>,
+}
+
+/// An inference element with an explicit COLLATE or operator class.
+#[derive(Clone, Debug)]
+pub(crate) struct ArbiterElem {
+    /// The column it names, or `None` for an expression.
+    pub attnum: Option<i16>,
+    /// The expression it names.
+    pub expr: Option<protobuf::Node>,
+    pub collation: Option<crate::oid::PgCollationOid>,
+    pub opclass: Option<crate::oid::PgOpclassOid>,
+}
+
+/// infer_collation_opclass_match (plancat.c): some key column of `idx`
+/// that is `elem`'s column or expression has its collation and an
+/// operator class of the same family and input type as its operator
+/// class. A key column whose class the analyzer couldn't resolve counts as
+/// a match.
+fn infer_collation_opclass_match(
+    snapshot: &PgCatalog,
+    elem: &ArbiterElem,
+    idx: &crate::pg_catalog::PgIndex,
+    idx_exprs: &[protobuf::Node],
+) -> bool {
+    let class_of = |c: crate::oid::PgOpclassOid| crate::ddl::opclass::opclass_by_oid(snapshot, c);
+    let infer = elem.opclass.and_then(class_of);
+    let nkey = usize::try_from(idx.indnkeyatts)
+        .unwrap_or(0)
+        .min(idx.indkey.len());
+    let mut nplain = 0;
+    for natt in 0..nkey {
+        let attno = idx.indkey[natt];
+        if attno != 0 {
+            nplain += 1;
+        }
+        if let Some(infer) = infer
+            && let Some(class) = idx.indclass.get(natt).copied().flatten().and_then(class_of)
+            && (infer.opcfamily != class.opcfamily
+                || infer.opcfamilynamespace != class.opcfamilynamespace
+                || infer.opcmethod != class.opcmethod
+                || infer.opcintype != class.opcintype)
+        {
+            continue;
+        }
+        if elem.collation.is_some()
+            && elem.collation != idx.indcollation.get(natt).copied().flatten()
+        {
+            continue;
+        }
+        match (elem.attnum, &elem.expr) {
+            (Some(a), _) if a == attno => return true,
+            (None, Some(e))
+                if attno == 0
+                    && idx_exprs
+                        .get(natt - nplain)
+                        .is_some_and(|x| node_fingerprint(x) == node_fingerprint(e)) =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// The planner's side of an `ON CONFLICT` target (`infer_arbiter_indexes`,
@@ -526,6 +592,7 @@ fn validate_on_conflict_target(
     let mut target_cols = arbiter.cols.clone();
     let mut target_expr_nodes = arbiter.exprs.clone();
     let mut where_clause = arbiter.where_clause.clone();
+    let mut qualified = arbiter.qualified.clone();
 
     // Through an automatically updatable view, the planner infers the
     // arbiter on the base relation (rewriteTargetView rewrites the
@@ -561,6 +628,12 @@ fn validate_on_conflict_target(
         if let Some(w) = &mut where_clause {
             *w = rename_column_refs(w, &base_name);
         }
+        for q in &mut qualified {
+            q.attnum = q.attnum.map(|a| base_attnum(a).unwrap_or(i16::MIN));
+            if let Some(e) = &mut q.expr {
+                *e = rename_column_refs(e, &base_name);
+            }
+        }
         table_oid = base;
     }
     let mut target_exprs: Vec<String> = target_expr_nodes.iter().map(node_fingerprint).collect();
@@ -587,22 +660,26 @@ fn validate_on_conflict_target(
             .min(idx.indkey.len())];
         let cols: std::collections::BTreeSet<i16> =
             key.iter().copied().filter(|&a| a != 0).collect();
-        let mut exprs: Vec<String> = idx
-            .indexprs
-            .iter()
-            .filter_map(|a| decode(a).map(|n| node_fingerprint(&n)))
-            .collect();
+        let idx_exprs: Vec<protobuf::Node> = idx.indexprs.iter().filter_map(decode).collect();
+        let mut exprs: Vec<String> = idx_exprs.iter().map(node_fingerprint).collect();
         exprs.sort();
         exprs.dedup();
         if cols != target_cols || exprs != target_exprs {
+            return false;
+        }
+        if !qualified
+            .iter()
+            .all(|q| infer_collation_opclass_match(snapshot, q, idx, &idx_exprs))
+        {
             return false;
         }
         let pred = idx.indpred.as_ref().and_then(decode);
         predtest::predicate_implied_by(pred.as_ref(), where_clause.as_ref())
     });
     // Constraint-backed keys, for catalogs whose constraints carry no
-    // pg_index row.
+    // pg_index row (and so no collations or operator classes to match).
     let constraint_matches = target_exprs.is_empty()
+        && qualified.is_empty()
         && snapshot.pg_constraint_values().any(|c| {
             c.conrelid == table_oid
                 && matches!(c.contype, ConType::PrimaryKey | ConType::Unique)

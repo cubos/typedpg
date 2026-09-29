@@ -702,10 +702,9 @@ pub(crate) fn check_with_query_rules(
         .finalize_implicit()
     };
     match queries.as_slice() {
-        [(
-            CmdType::CmdSelect | CmdType::CmdInsert | CmdType::CmdUpdate | CmdType::CmdDelete,
-            _,
-        )] => Ok(()),
+        [
+            (CmdType::CmdSelect | CmdType::CmdInsert | CmdType::CmdUpdate | CmdType::CmdDelete, _),
+        ] => Ok(()),
         [_] => Err(unsupported("DO INSTEAD NOTIFY")),
         [] => Err(unsupported("DO INSTEAD NOTHING")),
         many => {

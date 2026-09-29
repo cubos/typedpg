@@ -271,6 +271,65 @@ fn on_conflict_infers_partial_and_expression_indexes() {
     }
 }
 
+/// infer_collation_opclass_match: an element's explicit COLLATE must be
+/// the index column's collation, and its operator class must share the
+/// index column's operator family and input type (text_pattern_ops matches
+/// a varchar_pattern_ops index, varchar_ops a varchar one only through
+/// text_ops).
+#[test]
+fn on_conflict_matches_explicit_collations_and_operator_classes() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE t (a int, b text, c varchar, d text);
+         CREATE UNIQUE INDEX ON t (b);
+         CREATE UNIQUE INDEX ON t (c varchar_pattern_ops);
+         CREATE UNIQUE INDEX ON t ((a + 1));
+         CREATE UNIQUE INDEX ON t (d COLLATE \"C\");
+         CREATE VIEW v AS SELECT b AS vb FROM t;",
+    )
+    .unwrap();
+    for target in [
+        "(b COLLATE \"default\")",
+        "(b text_ops)",
+        "(c text_pattern_ops)",
+        "(c varchar_pattern_ops)",
+        "(c)",
+        "((a + 1) int4_ops)",
+        "(d)",
+        "(d COLLATE \"C\")",
+        "(d COLLATE \"C\" text_ops)",
+    ] {
+        let sql =
+            format!("INSERT INTO t VALUES (1, 'x', 'y', 'z') ON CONFLICT {target} DO NOTHING");
+        db.analyze(&sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    db.analyze("INSERT INTO v VALUES ('x') ON CONFLICT (vb text_ops) DO NOTHING")
+        .unwrap();
+    let mut rejected: Vec<String> = [
+        "(b COLLATE \"C\")",
+        "(b text_pattern_ops)",
+        "(c varchar_ops)",
+        "((a + 1) int8_ops)",
+        "((a + 1) COLLATE \"C\")",
+        "(d COLLATE \"POSIX\")",
+    ]
+    .iter()
+    .map(|target| {
+        format!("INSERT INTO t VALUES (1, 'x', 'y', 'z') ON CONFLICT {target} DO NOTHING")
+    })
+    .collect();
+    rejected.push("INSERT INTO v VALUES ('x') ON CONFLICT (vb COLLATE \"C\") DO NOTHING".into());
+    for sql in &rejected {
+        let err = db.analyze(sql).unwrap_err();
+        assert!(
+            err.to_string().starts_with(
+                "there is no unique or exclusion constraint matching the ON CONFLICT specification"
+            ),
+            "{sql}: {err}"
+        );
+    }
+}
+
 fn setup_inference() -> PgCatalog {
     let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
