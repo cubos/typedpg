@@ -260,6 +260,8 @@ pub struct PgCatalog {
     /// Foreign-data wrappers, servers, user mappings, foreign tables'
     /// servers.
     pub(crate) foreign_data: crate::ddl::fdw::ForeignData,
+    /// The extension whose scripts are running.
+    pub(crate) installing_extension: Option<String>,
     /// `pg_partitioned_table`: strategy and key types.
     pub(crate) partition_specs: HashMap<PgClassOid, crate::ddl::tables::partbound::PartSpec>,
     /// `relpartbound` of each partition.
@@ -528,6 +530,7 @@ impl PgCatalog {
             index_parents: HashMap::new(),
             sequence_params: HashMap::new(),
             foreign_data: Default::default(),
+            installing_extension: None,
             partition_specs: HashMap::new(),
             partition_bounds: HashMap::new(),
             check_defs: HashMap::new(),

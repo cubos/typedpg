@@ -77,15 +77,45 @@ pub fn create_extension(
 
     let target_version = extract_option(&stmt.options, "new_version")
         .unwrap_or_else(|| ext.default_version.to_owned());
-    let target_schema =
-        extract_option(&stmt.options, "schema").unwrap_or_else(|| "public".to_owned());
+    // CreateExtensionInternal: the SCHEMA given, which must exist, or the
+    // creation schema.
+    let target_schema = match extract_option(&stmt.options, "schema") {
+        Some(schema) => schema,
+        None => super::util::creation_schema(interp)?,
+    };
+    let target_nsoid = super::util::existing_namespace(interp, &target_schema)?;
 
     // Find the install path: base version, then upgrades to target.
     let path = find_install_path(ext, &target_version)?;
 
+    // get_required_extension: required extensions must be installed, or
+    // are installed first with CASCADE.
+    let cascade = stmt.options.iter().any(|o| {
+        matches!(o.node.as_ref(), Some(pg_query::protobuf::node::Node::DefElem(de))
+            if de.defname == "cascade")
+    });
+    for required in requires(name) {
+        if interp.extension_by_name.contains_key(*required) {
+            continue;
+        }
+        if !cascade {
+            return Err(DdlError::TypeNotFound(format!(
+                "required extension \"{required}\" is not installed (Use CREATE EXTENSION ... \
+                 CASCADE to install required extensions too.)"
+            )));
+        }
+        let mut sub = stmt.clone();
+        sub.extname = (*required).to_owned();
+        sub.if_not_exists = true;
+        sub.options.retain(|o| {
+            !matches!(o.node.as_ref(), Some(pg_query::protobuf::node::Node::DefElem(de))
+                if de.defname == "new_version")
+        });
+        create_extension(interp, &sub)?;
+    }
+
     // Allocate the pg_extension row up front so we can reference its OID
     // when tagging objects created during installation.
-    let target_nsoid = ensure_namespace(interp, &target_schema)?;
     let ext_oid = PgExtensionOid::from_nonzero(interp.alloc_oid()?);
     interp.insert_pg_extension(PgExtension {
         oid: ext_oid,
@@ -103,7 +133,10 @@ pub fn create_extension(
     let casts_before: std::collections::HashSet<PgCastOid> =
         interp.pg_cast.keys().copied().collect();
 
-    apply_with_schema(interp, &target_schema, &path)?;
+    let installing = interp.installing_extension.replace(name.clone());
+    let applied = apply_with_schema(interp, &target_schema, &path);
+    interp.installing_extension = installing;
+    applied?;
 
     record_extension_membership(interp, ext_oid, &types_before, &procs_before, &casts_before);
 
@@ -118,7 +151,7 @@ pub fn alter_extension(interp: &mut PgCatalog, stmt: &AlterExtensionStmt) -> Res
     let ext_oid = *interp
         .extension_by_name
         .get(name.as_str())
-        .ok_or_else(|| DdlError::ExtensionError(format!("extension '{name}' is not installed")))?;
+        .ok_or_else(|| DdlError::TypeNotFound(format!("extension \"{name}\" does not exist")))?;
     let installed_version = interp
         .pg_extension
         .get(&ext_oid)
@@ -152,7 +185,10 @@ pub fn alter_extension(interp: &mut PgCatalog, stmt: &AlterExtensionStmt) -> Res
     let casts_before: std::collections::HashSet<PgCastOid> =
         interp.pg_cast.keys().copied().collect();
 
-    apply_with_schema(interp, &installed_nsname, &path)?;
+    let installing = interp.installing_extension.replace(name.clone());
+    let applied = apply_with_schema(interp, &installed_nsname, &path);
+    interp.installing_extension = installing;
+    applied?;
 
     record_extension_membership(interp, ext_oid, &types_before, &procs_before, &casts_before);
 
@@ -216,6 +252,21 @@ fn record_extension_membership(
     }
 }
 
+/// The control files' `requires`: extensions that must be installed first.
+fn requires(name: &str) -> &'static [&'static str] {
+    match name {
+        "earthdistance" => &["cube"],
+        "hstore_plperl" => &["hstore", "plperl"],
+        "hstore_plperlu" => &["hstore", "plperlu"],
+        "bool_plperl" | "jsonb_plperl" => &["plperl"],
+        "bool_plperlu" | "jsonb_plperlu" => &["plperlu"],
+        "hstore_plpython3u" => &["hstore", "plpython3u"],
+        "jsonb_plpython3u" => &["plpython3u"],
+        "ltree_plpython3u" => &["ltree", "plpython3u"],
+        _ => &[],
+    }
+}
+
 // ─── Path resolution ────────────────────────────────────────────────────────
 
 /// Find the script chain to install an extension at a target version.
@@ -254,7 +305,7 @@ fn find_install_path<'a>(ext: &'a ExtensionDef, target: &str) -> Result<Vec<&'a 
     }
 
     Err(DdlError::ExtensionError(format!(
-        "no install path for extension '{}' to version '{target}' (reached '{current}')",
+        "extension \"{}\" has no installation script nor update path for version \"{target}\"",
         ext.name,
     )))
 }
@@ -281,7 +332,7 @@ fn find_upgrade_path<'a>(
     }
 
     Err(DdlError::ExtensionError(format!(
-        "no upgrade path for extension '{}' from '{from}' to '{target}' (reached '{current}')",
+        "extension \"{}\" has no update path from version \"{from}\" to version \"{target}\"",
         ext.name,
     )))
 }
@@ -370,4 +421,210 @@ fn extract_option(options: &[pg_query::protobuf::Node], name: &str) -> Option<St
         }
     }
     None
+}
+
+// ─── ALTER EXTENSION ADD / DROP, SET SCHEMA ─────────────────────────────────
+
+fn extension_oid(interp: &PgCatalog, name: &str) -> Result<PgExtensionOid, DdlError> {
+    interp
+        .extension_by_name
+        .get(name)
+        .copied()
+        .ok_or_else(|| DdlError::TypeNotFound(format!("extension \"{name}\" does not exist")))
+}
+
+/// The catalog and oid of the object an ALTER EXTENSION ADD / DROP names,
+/// with PG's description of it (getObjectDescription).
+fn member_object(
+    interp: &PgCatalog,
+    objtype: pg_query::protobuf::ObjectType,
+    object: &pg_query::protobuf::node::Node,
+) -> Result<Option<(PgClassOid, PgGenericOid, String)>, DdlError> {
+    use pg_query::protobuf::ObjectType;
+    use pg_query::protobuf::node::Node;
+    super::comment::resolve_object(interp, objtype, object)?;
+    let names = |n: &Node| -> Vec<String> {
+        match n {
+            Node::List(l) => l
+                .items
+                .iter()
+                .filter_map(super::util::node_string)
+                .map(str::to_owned)
+                .collect(),
+            Node::String(s) => vec![s.sval.clone()],
+            _ => Vec::new(),
+        }
+    };
+    Ok(match objtype {
+        ObjectType::ObjectTable
+        | ObjectType::ObjectView
+        | ObjectType::ObjectMatview
+        | ObjectType::ObjectSequence
+        | ObjectType::ObjectForeignTable => {
+            let parts = names(object);
+            let (schema, name) = match parts.as_slice() {
+                [name] => (None, name.as_str()),
+                [schema, name] => (Some(schema.as_str()), name.as_str()),
+                _ => return Ok(None),
+            };
+            let Some(class) = interp.resolve_table(schema, name) else {
+                return Ok(None);
+            };
+            let kind = match class.relkind {
+                crate::pg_catalog::RelKind::View => "view",
+                crate::pg_catalog::RelKind::MaterializedView => "materialized view",
+                crate::pg_catalog::RelKind::Sequence => "sequence",
+                crate::pg_catalog::RelKind::ForeignTable => "foreign table",
+                _ => "table",
+            };
+            Some((
+                crate::pg_catalog::PG_CLASS_RELID,
+                PgGenericOid::from_nonzero(class.oid.into_nonzero()),
+                format!("{kind} {}", class.relname),
+            ))
+        }
+        ObjectType::ObjectType | ObjectType::ObjectDomain => {
+            let Node::TypeName(tn) = object else {
+                return Ok(None);
+            };
+            let typ = super::util::lookup_type_name(tn, interp)?;
+            Some((
+                PG_TYPE_RELID,
+                PgGenericOid::from_nonzero(typ.into_nonzero()),
+                format!("type {}", super::util::format_type_for_message(interp, typ)),
+            ))
+        }
+        ObjectType::ObjectFunction | ObjectType::ObjectProcedure | ObjectType::ObjectRoutine => {
+            let boxed = Some(Box::new(pg_query::protobuf::Node {
+                node: Some(object.clone()),
+            }));
+            let Some((schema, name, args)) = super::alter::extract_func_target(&boxed, interp)
+            else {
+                return Ok(None);
+            };
+            let Some((_, oid)) = super::alter::find_proc(interp, schema.as_deref(), &name, &|p| {
+                p.proargtypes == args
+            }) else {
+                return Ok(None);
+            };
+            let shown = args
+                .iter()
+                .map(|&t| super::util::format_type_for_message(interp, t))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Some((
+                PG_PROC_RELID,
+                PgGenericOid::from_nonzero(oid.into_nonzero()),
+                format!("function {name}({shown})"),
+            ))
+        }
+        _ => None,
+    })
+}
+
+/// `ALTER EXTENSION name ADD | DROP object`
+/// (ExecAlterExtensionContentsRecurse).
+pub fn alter_extension_contents(
+    interp: &mut PgCatalog,
+    stmt: &pg_query::protobuf::AlterExtensionContentsStmt,
+) -> Result<(), DdlError> {
+    // The extension's own scripts add and drop members while its
+    // membership is still being recorded.
+    if interp.installing_extension.as_deref() == Some(stmt.extname.as_str()) {
+        return Ok(());
+    }
+    let ext = extension_oid(interp, &stmt.extname)?;
+    let Some(object) = stmt.object.as_deref().and_then(|o| o.node.as_ref()) else {
+        return Ok(());
+    };
+    let objtype = pg_query::protobuf::ObjectType::try_from(stmt.objtype)
+        .unwrap_or(pg_query::protobuf::ObjectType::Undefined);
+    let Some((classid, objid, description)) = member_object(interp, objtype, object)? else {
+        return Ok(());
+    };
+    let membership = interp
+        .iter_pg_depend()
+        .find(|d| {
+            d.classid == classid
+                && d.objid == objid
+                && d.deptype == DepType::Extension
+                && d.refclassid == PG_EXTENSION_RELID
+        })
+        .map(|d| d.refobjid);
+    let ext_generic = PgGenericOid::from_nonzero(ext.into_nonzero());
+    let ext_name = |oid: PgGenericOid| {
+        interp
+            .pg_extension
+            .values()
+            .find(|e| PgGenericOid::from_nonzero(e.oid.into_nonzero()) == oid)
+            .map(|e| e.extname.clone())
+            .unwrap_or_default()
+    };
+    if stmt.action > 0 {
+        if let Some(owner) = membership {
+            return Err(DdlError::UnsupportedDdl(format!(
+                "{description} is already a member of extension \"{}\"",
+                ext_name(owner)
+            )));
+        }
+        interp.add_dependency(PgDepend {
+            classid,
+            objid,
+            objsubid: 0,
+            refclassid: PG_EXTENSION_RELID,
+            refobjid: ext_generic,
+            refobjsubid: 0,
+            deptype: DepType::Extension,
+        });
+    } else {
+        if membership != Some(ext_generic) {
+            return Err(DdlError::UnsupportedDdl(format!(
+                "{description} is not a member of extension \"{}\"",
+                stmt.extname
+            )));
+        }
+        interp.pg_depend.retain(|d| {
+            !(d.classid == classid
+                && d.objid == objid
+                && d.deptype == DepType::Extension
+                && d.refobjid == ext_generic)
+        });
+    }
+    Ok(())
+}
+
+/// `ALTER EXTENSION name SET SCHEMA s` (AlterExtensionNamespace): the
+/// extension's types (with their array types) and functions move.
+pub(crate) fn set_extension_schema(
+    interp: &mut PgCatalog,
+    name: &str,
+    new_nsoid: crate::oid::PgNamespaceOid,
+) -> Result<(), DdlError> {
+    let ext = extension_oid(interp, name)?;
+    let ext_generic = PgGenericOid::from_nonzero(ext.into_nonzero());
+    let members: Vec<(PgClassOid, PgGenericOid)> = interp
+        .iter_pg_depend()
+        .filter(|d| d.refobjid == ext_generic && d.deptype == DepType::Extension)
+        .map(|d| (d.classid, d.objid))
+        .collect();
+    for (classid, objid) in members {
+        if classid == PG_TYPE_RELID {
+            let typ = PgTypeOid::from_nonzero(objid.into_nonzero());
+            let array = interp.array_type_of(typ);
+            for t in std::iter::once(typ).chain(array) {
+                if let Some(name) = interp.pg_type.get(&t).map(|r| r.typname.clone()) {
+                    interp.rename_pg_type(t, name, new_nsoid);
+                }
+            }
+        } else if classid == PG_PROC_RELID {
+            let proc = PgProcOid::from_nonzero(objid.into_nonzero());
+            if let Some(name) = interp.pg_proc.get(&proc).map(|p| p.proname.clone()) {
+                interp.rename_pg_proc(proc, name, new_nsoid);
+            }
+        }
+    }
+    if let Some(row) = interp.pg_extension.get_mut(&ext) {
+        row.extnamespace = new_nsoid;
+    }
+    Ok(())
 }

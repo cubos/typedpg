@@ -221,6 +221,7 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         node::Node::AlterPolicyStmt(s) => policies::alter_policy(db, s),
         node::Node::RuleStmt(s) => rules::create_rule(db, s),
         node::Node::CreateAmStmt(s) => opclass::create_am(db, s),
+        node::Node::AlterExtensionContentsStmt(s) => extensions::alter_extension_contents(db, s),
         node::Node::CreateFdwStmt(s) => fdw::create_fdw(db, s),
         node::Node::AlterFdwStmt(s) => fdw::alter_fdw(db, s),
         node::Node::CreateForeignServerStmt(s) => fdw::create_server(db, s),
@@ -254,7 +255,6 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         | node::Node::NotifyStmt(_)
         | node::Node::ListenStmt(_)
         | node::Node::UnlistenStmt(_)
-        | node::Node::AlterExtensionContentsStmt(_)
         // Statements PG accepts in a migration that don't change anything the
         // static analysis reads: DML and procedure calls (like the SELECT /
         // INSERT above), prepared statements and cursors, statistics,

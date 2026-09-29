@@ -2999,3 +2999,78 @@ fn new_objects_need_an_existing_schema() {
         ),
     ]);
 }
+
+#[test]
+fn extensions_follow_create_extension_rules() {
+    // PG 18 CreateExtensionInternal / get_required_extension /
+    // ExecAlterExtensionStmt / ExecAlterExtensionContentsRecurse /
+    // AlterExtensionNamespace.
+    let setup = "CREATE TABLE t (a int); CREATE SCHEMA x;";
+    for (stmt, msg) in [
+        (
+            "CREATE EXTENSION citext SCHEMA nosuch;",
+            "schema \"nosuch\" does not exist",
+        ),
+        (
+            "CREATE EXTENSION citext VERSION '9.9';",
+            "extension \"citext\" has no installation script nor update path for version \"9.9\"",
+        ),
+        (
+            "CREATE EXTENSION citext; ALTER EXTENSION citext UPDATE TO '9.9';",
+            "extension \"citext\" has no update path from version \"1.8\" to version \"9.9\"",
+        ),
+        (
+            "ALTER EXTENSION nosuch UPDATE;",
+            "extension \"nosuch\" does not exist",
+        ),
+        (
+            "ALTER EXTENSION nosuch ADD TABLE t;",
+            "extension \"nosuch\" does not exist",
+        ),
+        (
+            "CREATE EXTENSION citext; ALTER EXTENSION citext ADD TABLE nosuch;",
+            "relation \"nosuch\" does not exist",
+        ),
+        (
+            "CREATE EXTENSION citext; ALTER EXTENSION citext ADD TABLE t; ALTER EXTENSION citext ADD TABLE t;",
+            "table t is already a member of extension \"citext\"",
+        ),
+        (
+            "CREATE EXTENSION citext; ALTER EXTENSION citext DROP TABLE t;",
+            "table t is not a member of extension \"citext\"",
+        ),
+        (
+            "CREATE EXTENSION citext; ALTER EXTENSION citext SET SCHEMA nosuch;",
+            "schema \"nosuch\" does not exist",
+        ),
+        (
+            "CREATE EXTENSION earthdistance;",
+            "required extension \"cube\" is not installed",
+        ),
+        (
+            "CREATE SCHEMA s; SET search_path = s; CREATE EXTENSION citext; SELECT 'x'::public.citext;",
+            "type \"public.citext\" does not exist",
+        ),
+        (
+            "CREATE EXTENSION cube; ALTER EXTENSION cube SET SCHEMA x; SELECT '(1)'::public.cube;",
+            "type \"public.cube\" does not exist",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "CREATE EXTENSION earthdistance CASCADE;
+             CREATE EXTENSION citext SCHEMA x;
+             SELECT 'a'::x.citext;
+             ALTER EXTENSION citext ADD TABLE t;
+             ALTER EXTENSION citext DROP TABLE t;
+             ALTER EXTENSION cube SET SCHEMA x;
+             SELECT '(1)'::x.cube;
+             CREATE EXTENSION IF NOT EXISTS citext;",
+        ),
+    ]);
+}

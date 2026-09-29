@@ -453,6 +453,13 @@ pub fn set_schema(interp: &mut PgCatalog, stmt: &AlterObjectSchemaStmt) -> Resul
         ObjectType::ObjectType | ObjectType::ObjectDomain => {
             set_type_schema(interp, stmt, new_nsoid)
         }
+        ObjectType::ObjectExtension => match stmt.object.as_deref().and_then(node_string) {
+            Some(name) => {
+                let name = name.to_owned();
+                crate::ddl::extensions::set_extension_schema(interp, &name, new_nsoid)
+            }
+            None => Ok(()),
+        },
         _ => Ok(()),
     }
 }
