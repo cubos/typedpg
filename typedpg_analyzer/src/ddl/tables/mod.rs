@@ -1119,6 +1119,14 @@ fn check_alter_target(
         At::AtDropInherit => (table_like, "NO INHERIT"),
         At::AtDropOf => (class.relkind == RelKind::Table, "NOT OF"),
         At::AtDropConstraint => (table_like, "DROP CONSTRAINT"),
+        At::AtSetLogged => (
+            matches!(class.relkind, RelKind::Table | RelKind::Sequence),
+            "SET LOGGED",
+        ),
+        At::AtSetUnLogged => (
+            matches!(class.relkind, RelKind::Table | RelKind::Sequence),
+            "SET UNLOGGED",
+        ),
         _ => (true, ""),
     };
     if allowed {
@@ -1130,7 +1138,9 @@ fn check_alter_target(
         RelKind::View => "views",
         RelKind::MaterializedView => "materialized views",
         RelKind::Sequence => "sequences",
-        RelKind::Index | RelKind::PartitionedIndex => "indexes",
+        RelKind::Index => "indexes",
+        RelKind::PartitionedIndex => "partitioned indexes",
+        RelKind::Partitioned => "partitioned tables",
         RelKind::CompositeType => "composite types",
         _ => "this relation",
     };

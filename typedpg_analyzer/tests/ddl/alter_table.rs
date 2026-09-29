@@ -645,3 +645,37 @@ fn a_row_type_stored_elsewhere_pins_the_table() {
         ),
     ]);
 }
+
+#[test]
+fn set_logged_applies_to_tables_and_sequences_only() {
+    // ATSimplePermissions(ATT_TABLE | ATT_SEQUENCE): PG 18 refuses it on a
+    // partitioned table.
+    let setup = "CREATE TABLE p (a int) PARTITION BY LIST (a);
+                 CREATE VIEW v AS SELECT 1 AS a;
+                 CREATE SEQUENCE s;";
+    for (stmt, msg) in [
+        (
+            "ALTER TABLE p SET UNLOGGED;",
+            "ALTER action SET UNLOGGED cannot be performed on relation \"p\" (This operation is \
+             not supported for partitioned tables.)",
+        ),
+        (
+            "ALTER TABLE p SET LOGGED;",
+            "ALTER action SET LOGGED cannot be performed on relation \"p\"",
+        ),
+        (
+            "ALTER TABLE v SET LOGGED;",
+            "ALTER action SET LOGGED cannot be performed on relation \"v\"",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "ALTER TABLE s SET UNLOGGED; ALTER TABLE s SET LOGGED;",
+        ),
+    ]);
+}
