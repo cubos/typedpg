@@ -46,6 +46,9 @@ pub(crate) enum ClauseKind {
     /// `IS [NOT] TRUE/FALSE/UNKNOWN` — the payload is PG's spelling of the
     /// test (`"IS TRUE"`, …).
     BoolTest(&'static str),
+    /// A ROWS / GROUPS window frame offset (the payload names the frame
+    /// mode) — transformFrameOffset coerces it to bigint like LIMIT.
+    FrameOffset(&'static str),
 }
 
 impl ClauseKind {
@@ -64,6 +67,7 @@ impl ClauseKind {
             ClauseKind::And => "AND",
             ClauseKind::Or => "OR",
             ClauseKind::BoolTest(label) => label,
+            ClauseKind::FrameOffset(mode) => mode,
         }
     }
 
@@ -71,7 +75,9 @@ impl ClauseKind {
     /// in the message.
     fn expected(self) -> (PgTypeOid, &'static str) {
         match self {
-            ClauseKind::Limit | ClauseKind::Offset => (oid::INT8, "bigint"),
+            ClauseKind::Limit | ClauseKind::Offset | ClauseKind::FrameOffset(_) => {
+                (oid::INT8, "bigint")
+            }
             _ => (oid::BOOL, "boolean"),
         }
     }
@@ -87,6 +93,8 @@ impl ClauseKind {
             ClauseKind::JoinOn => Some("JOIN conditions"),
             ClauseKind::Limit => Some("LIMIT"),
             ClauseKind::Offset => Some("OFFSET"),
+            ClauseKind::FrameOffset("ROWS") => Some("window ROWS"),
+            ClauseKind::FrameOffset(_) => Some("window GROUPS"),
             _ => None,
         }
     }
@@ -111,6 +119,7 @@ impl ClauseKind {
                 | ClauseKind::JoinOn
                 | ClauseKind::Limit
                 | ClauseKind::Offset
+                | ClauseKind::FrameOffset(_)
         )
     }
 
@@ -118,7 +127,10 @@ impl ClauseKind {
     /// expression. (LIMIT/OFFSET historically render bare; the boolean
     /// clauses annotate.)
     fn caret_label(self) -> bool {
-        !matches!(self, ClauseKind::Limit | ClauseKind::Offset)
+        !matches!(
+            self,
+            ClauseKind::Limit | ClauseKind::Offset | ClauseKind::FrameOffset(_)
+        )
     }
 }
 

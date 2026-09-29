@@ -157,6 +157,53 @@ fn first_value_is_nullable() {
     assert_cols(&s, vec![cn("first", text())]);
 }
 
+/// transformFrameOffset: a ROWS / GROUPS offset is coerced to bigint by
+/// assignment (numeric works, text is `argument of ROWS must be type
+/// bigint`), and no offset may hold an aggregate.
+#[test]
+fn window_frame_offsets() {
+    let db = setup();
+    for sql in [
+        "SELECT sum(views) OVER (ORDER BY id ROWS 1.5 PRECEDING) AS a FROM posts",
+        "SELECT sum(views) OVER (ORDER BY id GROUPS 1.5 PRECEDING) AS a FROM posts",
+        "SELECT sum(views) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 2.5 FOLLOWING) AS a \
+         FROM posts",
+    ] {
+        let s = db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        // Every frame holds the current row.
+        assert_cols(&s, vec![c("a", int8())]);
+    }
+    for (sql, msg) in [
+        (
+            "SELECT sum(views) OVER (ORDER BY id ROWS '1'::text PRECEDING) FROM posts",
+            "argument of ROWS must be type bigint, not type text",
+        ),
+        (
+            "SELECT sum(views) OVER (ORDER BY id GROUPS '1'::text PRECEDING) FROM posts",
+            "argument of GROUPS must be type bigint, not type text",
+        ),
+    ] {
+        assert_err_prefix!(db.analyze(sql), AnalyzeError::DatatypeMismatch(_), msg);
+    }
+    for (sql, msg) in [
+        (
+            "SELECT sum(views) OVER (ORDER BY id ROWS BETWEEN sum(1) PRECEDING AND CURRENT ROW) \
+             FROM posts",
+            "aggregate functions are not allowed in window ROWS",
+        ),
+        (
+            "SELECT sum(views) OVER (ORDER BY id GROUPS sum(1) PRECEDING) FROM posts",
+            "aggregate functions are not allowed in window GROUPS",
+        ),
+        (
+            "SELECT sum(views) OVER (ORDER BY views RANGE sum(1) PRECEDING) FROM posts",
+            "aggregate functions are not allowed in window RANGE",
+        ),
+    ] {
+        assert_err_prefix!(db.analyze(sql), AnalyzeError::GroupingError(_), msg);
+    }
+}
+
 #[test]
 fn window_function_in_having_rejected() {
     let db = setup();

@@ -820,13 +820,26 @@ fn transform_window_def(
         match range_key {
             Some(key) if construct == "RANGE" => {
                 let actual = infer_expr(offset, ctx, params, TypeGoal::NONE)?.type_oid;
+                crate::clause::check_level_calls(offset, ctx, "window RANGE", true)?;
                 let target = in_range_offset_type(key, actual, offset, ctx)?;
                 if actual == oid::UNKNOWN {
                     coerce_unknown_to(offset, ctx, params, target)?;
                 }
             }
+            // ROWS / GROUPS: coerce_to_specific_type(…, INT8OID, …), an
+            // assignment coercion with the construct's wording.
             _ => {
-                infer_expr(offset, ctx, params, TypeGoal::implicit(oid::INT8))?;
+                let mode = if construct == "ROWS" {
+                    "ROWS"
+                } else {
+                    "GROUPS"
+                };
+                crate::clause::coerce_clause_expr(
+                    offset,
+                    ctx,
+                    params,
+                    crate::clause::ClauseKind::FrameOffset(mode),
+                )?;
             }
         }
         if contains_column_ref(offset) {
