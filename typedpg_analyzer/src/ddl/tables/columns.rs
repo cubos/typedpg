@@ -1546,6 +1546,145 @@ pub(crate) fn alter_column_type(
         old_type_oid,
         attr.attcollation,
     )?;
+    recheck_dependents_of_retyped_column(interp, relid, &attr)?;
+    Ok(())
+}
+
+/// ATPostAlterTypeCleanup: what reads a retyped column is rebuilt from its
+/// definition over the new type — partial indexes' predicates, then CHECK
+/// constraints and foreign keys (both the referencing and the referenced
+/// side) — and fails where the definition no longer fits (`operator does
+/// not exist: text > integer`, a foreign key that "cannot be implemented").
+/// `attr` is the column as it was.
+fn recheck_dependents_of_retyped_column(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+    attr: &PgAttribute,
+) -> Result<(), DdlError> {
+    use crate::expr::{TypeGoal, infer_expr};
+    use crate::pg_catalog::oid;
+    use prost::Message;
+    let reads_column = |expr: &typedpg_pg_query::protobuf::Node| {
+        expr.node.as_ref().is_some_and(|inner| {
+            inner.nodes().into_iter().any(|(n, ..)| {
+                matches!(n, typedpg_pg_query::NodeRef::ColumnRef(cr)
+                    if cr.fields.last().and_then(super::super::util::node_string)
+                        == Some(attr.attname.as_str()))
+            })
+        })
+    };
+    let relname = relname_of(interp, relid);
+    let nspname = interp
+        .pg_class
+        .get(&relid)
+        .and_then(|c| interp.namespace_name(c.relnamespace))
+        .unwrap_or("public")
+        .to_owned();
+    let attrs = interp.attributes_of(relid).to_vec();
+    let mut scope = crate::scope::Scope::default();
+    scope.add_dml_target(
+        interp,
+        &relname,
+        QualifiedName::new(nspname, relname.clone()),
+        &attrs,
+    );
+    let null_ctx = crate::nullability::NullabilityContext::default();
+    let infer_bool = |expr: &typedpg_pg_query::protobuf::Node, clause: &str| {
+        let mut params = crate::param_collector::ParamCollector::default();
+        let found = infer_expr(
+            expr,
+            crate::expr::Ctx::new(&scope, &null_ctx, interp),
+            &mut params,
+            TypeGoal::NONE,
+        )
+        .map_err(|e| DdlError::UnsupportedDdl(e.to_string()))?;
+        if found.type_oid != oid::BOOL && found.type_oid != oid::UNKNOWN {
+            return Err(DdlError::UnsupportedDdl(format!(
+                "argument of {clause} must be type boolean, not type {}",
+                format_type_for_message(interp, found.type_oid)
+            )));
+        }
+        Ok(())
+    };
+
+    // AT_PASS_OLD_INDEX: the partial indexes' predicates.
+    let mut indexes: Vec<&PgIndex> = interp
+        .pg_index
+        .values()
+        .filter(|i| i.indrelid == relid)
+        .collect();
+    indexes.sort_by_key(|i| i.indexrelid);
+    for index in indexes {
+        if let Some(pred) = index.indpred.as_ref()
+            && let Ok(expr) = typedpg_pg_query::protobuf::Node::decode(pred.ast.as_slice())
+            && reads_column(&expr)
+        {
+            infer_bool(&expr, "WHERE")?;
+        }
+    }
+
+    // AT_PASS_OLD_CONSTR: CHECK constraints reading the column, and the
+    // foreign keys over it.
+    let mut constraints: Vec<&PgConstraint> = interp
+        .pg_constraint
+        .values()
+        .filter(|c| {
+            (c.conrelid == relid && c.conkey.contains(&attr.attnum))
+                || (c.contype == ConType::ForeignKey
+                    && c.confrelid == Some(relid)
+                    && c.confkey.contains(&attr.attnum))
+        })
+        .collect();
+    constraints.sort_by_key(|c| c.oid);
+    for con in constraints {
+        match con.contype {
+            ConType::Check => {
+                if let Some(super::check_inherit::CheckDef {
+                    expr: super::check_inherit::StoredExpr::Written(expr),
+                    ..
+                }) = interp.check_defs.get(&con.oid)
+                {
+                    infer_bool(expr, "CHECK")?;
+                }
+            }
+            ConType::ForeignKey => {
+                let Some(target) = con.confrelid else {
+                    continue;
+                };
+                let column = |rel: PgClassOid, attnum: i16| {
+                    interp
+                        .attributes_of(rel)
+                        .iter()
+                        .find(|a| a.attnum == attnum)
+                        .cloned()
+                };
+                for (&fk, &pk) in con.conkey.iter().zip(&con.confkey) {
+                    let (Some(fk), Some(pk)) = (column(con.conrelid, fk), column(target, pk))
+                    else {
+                        continue;
+                    };
+                    if !super::foreign_keys::fk_types_compatible(
+                        interp,
+                        pk.atttypid,
+                        fk.atttypid,
+                        con.conperiod,
+                    ) {
+                        return Err(DdlError::DependencyError(format!(
+                            "foreign key constraint \"{}\" cannot be implemented (Key columns \
+                             \"{}\" of the referencing table and \"{}\" of the referenced table \
+                             are of incompatible types: {} and {}.)",
+                            con.conname,
+                            fk.attname,
+                            pk.attname,
+                            format_type_for_message(interp, fk.atttypid),
+                            format_type_for_message(interp, pk.atttypid)
+                        )));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
     Ok(())
 }
 

@@ -1285,3 +1285,54 @@ fn alter_table_subcommands_run_pass_by_pass() {
         ),
     ]);
 }
+
+#[test]
+fn alter_column_type_rebuilds_what_reads_the_column() {
+    // ATPostAlterTypeCleanup re-adds a partial index's predicate, the CHECK
+    // constraints and the foreign keys over a retyped column from their
+    // definitions: they must fit the new type.
+    for (setup, stmt, msg) in [
+        (
+            "CREATE TABLE t (a int CHECK (a > 0));",
+            "ALTER TABLE t ALTER COLUMN a TYPE text;",
+            "operator does not exist: text > integer",
+        ),
+        (
+            "CREATE TABLE t (a int); CREATE INDEX ON t ((a + 1));",
+            "ALTER TABLE t ALTER COLUMN a TYPE text;",
+            "operator does not exist: text + integer",
+        ),
+        (
+            "CREATE TABLE t (a int); CREATE INDEX ON t (a) WHERE a > 0;",
+            "ALTER TABLE t ALTER COLUMN a TYPE text;",
+            "operator does not exist: text > integer",
+        ),
+        (
+            "CREATE TABLE p (a int PRIMARY KEY); CREATE TABLE c (x int REFERENCES p);",
+            "ALTER TABLE c ALTER COLUMN x TYPE text;",
+            "foreign key constraint \"c_x_fkey\" cannot be implemented",
+        ),
+        (
+            "CREATE TABLE p (a int PRIMARY KEY); CREATE TABLE c (x int REFERENCES p);",
+            "ALTER TABLE p ALTER COLUMN a TYPE text;",
+            "foreign key constraint \"c_x_fkey\" cannot be implemented",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        (
+            "0001.sql",
+            "CREATE TABLE p (a int PRIMARY KEY);
+             CREATE TABLE c (x int REFERENCES p, y int CHECK (y > 0));
+             CREATE INDEX ON c (y) WHERE y > 0;",
+        ),
+        (
+            "0002.sql",
+            "ALTER TABLE p ALTER COLUMN a TYPE bigint;
+             ALTER TABLE c ALTER COLUMN x TYPE smallint;
+             ALTER TABLE c ALTER COLUMN y TYPE bigint;",
+        ),
+    ]);
+}

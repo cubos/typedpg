@@ -151,7 +151,7 @@ fn check_referenced_attrs(
 /// must resolve the polymorphic input alike); for a concrete btree opclass,
 /// a cross-type member of its family or implicit casts of both types to
 /// the opclass type.
-fn fk_types_compatible(
+pub(super) fn fk_types_compatible(
     interp: &PgCatalog,
     pktype: PgTypeOid,
     fktype: PgTypeOid,
