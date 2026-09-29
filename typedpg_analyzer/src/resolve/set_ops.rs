@@ -153,15 +153,49 @@ pub(crate) fn analyze_set_operation(
             (None, false) => target,
         };
         let typmod = if l.typmod == r.typmod { l.typmod } else { None };
-        // UNION arms only carry collation forward when both sides agree
-        // — same shape as the typmod merge above. Mirrors PG's collation
-        // derivation rule that conflicting branches produce an
-        // indeterminate (None) collation.
-        let collation = if l.collation == r.collation {
-            l.collation
-        } else {
-            None
+        // transformSetOperationTree: every set operation but UNION ALL
+        // compares the rows, so the column type needs an equality operator.
+        let union_all = op_label == "UNION" && sel.all;
+        if !union_all {
+            crate::clause::check_key_operators(
+                snapshot,
+                type_oid,
+                crate::clause::KeyUse::Group,
+                None,
+            )?;
+        }
+        // select_common_collation over the two arms' columns: an explicit
+        // collation (a COLLATE in a plain arm's select list) wins, two
+        // different explicit ones are an error, and two different implicit
+        // ones leave the column without a collation — an error too unless
+        // it is UNION ALL, which never compares.
+        let arm_state = |arm: &protobuf::SelectStmt, c: &RawColumn| {
+            let explicit = arm.op == SetOperation::SetopNone as i32
+                && crate::grouping::level_info(arm)
+                    .is_some_and(|l| l.explicit_collations.get(i).copied().unwrap_or(false));
+            crate::clause::CollationState::column(snapshot, type_oid, c.collation, explicit)
         };
+        let (ls, rs) = (arm_state(left, &l), arm_state(right, &r));
+        if let (Some(a), Some(b)) = (ls.explicit(), rs.explicit())
+            && a != b
+        {
+            let name = |c| {
+                snapshot
+                    .pg_collation
+                    .get(&c)
+                    .map(|c| c.collname.clone())
+                    .unwrap_or_default()
+            };
+            return Err(crate::pgmsg::collation_mismatch_explicit(
+                &name(a),
+                &name(b),
+            ));
+        }
+        let merged = ls.merged(rs);
+        if !union_all {
+            merged.check_determinate(snapshot, None)?;
+        }
+        let collation = merged.collation();
         columns.push(RawColumn {
             name: l.name,
             type_oid,
@@ -214,10 +248,8 @@ fn set_operation_sort_and_limit(
         let Some(inner) = sb.node.as_deref() else {
             continue;
         };
-        if let Some(node::Node::AConst(ac)) = inner.node.as_ref()
-            && let Some(typedpg_pg_query::protobuf::a_const::Val::Ival(i)) = &ac.val
-        {
-            let ord = i.ival as i64;
+        let sorts = sb.sortby_dir() != protobuf::SortByDir::SortbyUsing;
+        if let Some(ord) = sql92_position(inner, "ORDER BY")? {
             if ord < 1 || ord as usize > columns.len() {
                 return Err(crate::pgmsg::position_not_in_select_list(
                     "ORDER BY",
@@ -227,7 +259,41 @@ fn set_operation_sort_and_limit(
                 )
                 .finalize_implicit());
             }
+            if sorts {
+                crate::clause::check_key_operators(
+                    snapshot,
+                    columns[ord as usize - 1].type_oid,
+                    crate::clause::KeyUse::Sort,
+                    crate::error::node_location(inner),
+                )?;
+            }
             continue;
+        }
+        // findTargetlistEntrySQL92: a name matches the result columns;
+        // several of that name (distinct columns) are ambiguous.
+        if let Some(node::Node::ColumnRef(cr)) = inner.node.as_ref()
+            && let [name] = expr::extract_string_fields(&cr.fields).as_slice()
+            && cr.fields.len() == 1
+        {
+            let mut named = columns.iter().filter(|c| &c.name == name);
+            if let Some(col) = named.next() {
+                if named.next().is_some() {
+                    return Err(crate::pgmsg::clause_name_ambiguous(
+                        "ORDER BY",
+                        name,
+                        crate::error::SourceSpan::from_node_qname(cr.location),
+                    )
+                    .finalize_implicit());
+                }
+                if sorts {
+                    crate::clause::check_key_operators(
+                        snapshot,
+                        col.type_oid,
+                        crate::clause::KeyUse::Sort,
+                        Some(cr.location),
+                    )?;
+                }
+            }
         }
         expr::infer_expr(
             inner,

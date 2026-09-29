@@ -779,6 +779,9 @@ pub(crate) struct LevelInfo {
     /// PG's `hasAggs`: an aggregate or `GROUPING(…)` of this level exists,
     /// in its own clauses or in a sublink.
     pub has_aggs: bool,
+    /// Per output column, whether its collation is explicit (a plain
+    /// SELECT's; a set operation's columns carry implicit ones).
+    pub explicit_collations: Vec<bool>,
 }
 
 thread_local! {
@@ -830,6 +833,7 @@ pub(crate) fn register_level(
             LevelInfo {
                 ns,
                 has_aggs: false,
+                explicit_collations: Vec::new(),
             },
         )
     });
@@ -838,6 +842,15 @@ pub(crate) fn register_level(
 /// What the analysis of SELECT `sel` recorded, if it was analyzed.
 pub(crate) fn level_info(sel: &protobuf::SelectStmt) -> Option<LevelInfo> {
     LEVELS.with(|l| l.borrow().get(&level_key(sel)).cloned())
+}
+
+/// Record which output columns of SELECT `sel` have an explicit collation.
+pub(crate) fn set_explicit_collations(sel: &protobuf::SelectStmt, explicit: Vec<bool>) {
+    LEVELS.with(|l| {
+        if let Some(info) = l.borrow_mut().get_mut(&level_key(sel)) {
+            info.explicit_collations = explicit;
+        }
+    });
 }
 
 /// Run `f` with the current level analyzing a clause that forbids
@@ -1229,6 +1242,17 @@ fn string_node(s: &str) -> protobuf::Node {
     protobuf::Node {
         node: Some(node::Node::String(protobuf::String { sval: s.to_owned() })),
     }
+}
+
+/// Whether two expressions of the current level are PG-`equal()` (up to
+/// how their column references are spelled).
+pub(crate) fn same_level_exprs_equal(
+    a: &protobuf::Node,
+    b: &protobuf::Node,
+    scope: &Scope,
+) -> bool {
+    let chain = Chain(vec![Some(Rc::new(Namespace::of(&scope.sources)))]);
+    canonical(a, &chain, 0).equal(&canonical(b, &chain, 0))
 }
 
 /// The locations of the first aggregate, `GROUPING(…)` and window call in

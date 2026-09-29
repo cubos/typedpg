@@ -88,6 +88,17 @@ pub(crate) fn resolve_target_list(
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<Vec<RawColumn>, AnalyzeError> {
+    resolve_target_list_explicit(target_list, ctx, params).map(|(columns, _)| columns)
+}
+
+/// [`resolve_target_list`], also telling for each output column whether
+/// its collation is explicit (derived from a `COLLATE` clause) — what a set
+/// operation merging the column with another arm's needs.
+pub(crate) fn resolve_target_list_explicit(
+    target_list: &[protobuf::Node],
+    ctx: Ctx<'_>,
+    params: &mut ParamCollector,
+) -> Result<(Vec<RawColumn>, Vec<bool>), AnalyzeError> {
     let Ctx {
         scope,
         null_ctx,
@@ -95,6 +106,7 @@ pub(crate) fn resolve_target_list(
         ..
     } = ctx;
     let mut columns = Vec::new();
+    let mut explicit = Vec::new();
 
     for (i, target) in target_list.iter().enumerate() {
         let rt = match target.node.as_ref() {
@@ -145,6 +157,7 @@ pub(crate) fn resolve_target_list(
 
             for col in star_cols {
                 let nullable = null_ctx.is_nullable(&col.table_alias, &col.name, col.base_not_null);
+                explicit.push(false);
                 columns.push(RawColumn {
                     name: col.name.clone(),
                     type_oid: col.type_oid,
@@ -167,6 +180,7 @@ pub(crate) fn resolve_target_list(
         {
             for (name, t) in fields {
                 unknown_field_output_check(val, t.type_oid)?;
+                explicit.push(t.explicit_collation);
                 columns.push(RawColumn {
                     name,
                     type_oid: t.type_oid,
@@ -223,6 +237,7 @@ pub(crate) fn resolve_target_list(
             unknown_field_output_check(val, type_oid)?;
         }
 
+        explicit.push(expr_type.explicit_collation);
         columns.push(RawColumn {
             name,
             type_oid,
@@ -233,7 +248,7 @@ pub(crate) fn resolve_target_list(
         });
     }
 
-    Ok(columns)
+    Ok((columns, explicit))
 }
 
 /// PG resolves an `unknown` output column to `text` (`resolveTargetListUnknowns`,

@@ -1272,6 +1272,92 @@ pub(crate) fn array_subscript_must_be_integer(span: Option<SourceSpan>) -> RawEr
     )
 }
 
+/// `non-integer constant in ORDER BY` (GROUP BY, DISTINCT ON) — SQLSTATE
+/// 42601: findTargetlistEntrySQL92 takes a bare constant as a select-list
+/// position, and only an integer can be one.
+pub(crate) fn non_integer_constant(clause: &str, span: Option<SourceSpan>) -> RawError {
+    RawError::new(
+        AnalyzeError::SyntaxError(format!("non-integer constant in {clause}")),
+        span,
+        None,
+    )
+}
+
+/// `ORDER BY "a" is ambiguous` (GROUP BY, DISTINCT ON) — SQLSTATE 42702: a
+/// bare name matching several differing output columns
+/// (findTargetlistEntrySQL92).
+pub(crate) fn clause_name_ambiguous(
+    clause: &str,
+    name: &str,
+    span: Option<SourceSpan>,
+) -> RawError {
+    RawError::new(
+        AnalyzeError::AmbiguousColumn(format!("{clause} \"{name}\" is ambiguous")),
+        span,
+        None,
+    )
+}
+
+/// `could not identify an ordering operator for type T` — SQLSTATE 42883:
+/// a sort key whose type has no default btree opclass
+/// (get_sort_group_operators). `hint` adds PG's errhint for sort clauses.
+pub(crate) fn no_ordering_operator(
+    type_name: &str,
+    hint: bool,
+    span: Option<SourceSpan>,
+) -> RawError {
+    RawError::new(
+        AnalyzeError::UndefinedFunction(format!(
+            "could not identify an ordering operator for type {type_name}"
+        )),
+        span,
+        hint.then(|| "Use an explicit ordering operator or modify the query.".to_string()),
+    )
+}
+
+/// `could not identify an equality operator for type T` — SQLSTATE 42883:
+/// a grouping / DISTINCT / set-operation key whose type has neither a
+/// btree nor a hash default opclass (get_sort_group_operators).
+pub(crate) fn no_equality_operator(type_name: &str, span: Option<SourceSpan>) -> RawError {
+    RawError::new(
+        AnalyzeError::UndefinedFunction(format!(
+            "could not identify an equality operator for type {type_name}"
+        )),
+        span,
+        None,
+    )
+}
+
+/// `could not identify a comparison function for type T` — SQLSTATE
+/// 42883: GREATEST / LEAST over a type without a btree comparison
+/// function (ExecInitExprRec, at executor start).
+pub(crate) fn no_comparison_function(type_name: &str) -> RawError {
+    RawError::new(
+        AnalyzeError::UndefinedFunction(format!(
+            "could not identify a comparison function for type {type_name}"
+        )),
+        None,
+        None,
+    )
+}
+
+/// `collation mismatch between implicit collations "A" and "B"` —
+/// SQLSTATE 42P21: a sort / group key (or a set operation's column) whose
+/// collation is indeterminate.
+pub(crate) fn collation_mismatch_implicit(a: &str, b: &str, span: Option<SourceSpan>) -> RawError {
+    RawError::new(
+        AnalyzeError::CollationMismatch(format!(
+            "collation mismatch between implicit collations \"{a}\" and \"{b}\""
+        )),
+        span,
+        Some(
+            "You can choose the collation by applying the COLLATE clause to one or both \
+             expressions."
+                .to_string(),
+        ),
+    )
+}
+
 /// `subquery uses ungrouped column "t.c" from outer query` — SQLSTATE
 /// 42803 (check_ungrouped_columns_walker inside a sublink).
 pub(crate) fn subquery_uses_ungrouped_column(

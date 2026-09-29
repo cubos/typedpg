@@ -293,6 +293,13 @@ fn search_cycle_columns(
         for v in values {
             expr::coerce_unknown_to(v, ctx, params, mark_type)?;
         }
+        // analyzeCTE compares cycle marks with the type's equality operator.
+        crate::clause::check_key_operators(
+            snapshot,
+            mark_type,
+            crate::clause::KeyUse::Group,
+            None,
+        )?;
         added.push(synthetic(&cycle.cycle_mark_column, mark_type));
         added.push(synthetic(&cycle.cycle_path_column, record_array));
     }

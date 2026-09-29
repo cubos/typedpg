@@ -368,3 +368,68 @@ fn collation_flows_through_functions_operators_and_constructs() {
         ]
     );
 }
+
+/// assign_collations: a sort / group key whose collation is indeterminate
+/// (two different implicit collations meet) is 42P21 — ORDER BY, GROUP BY,
+/// DISTINCT, an aggregate's ORDER BY, and a set operation's columns
+/// (except UNION ALL's, which are never compared).
+#[test]
+fn indeterminate_collation_rejected_for_sort_and_group_keys() {
+    let db = collation_db();
+    for sql in [
+        "SELECT sc FROM tc ORDER BY sc || sp",
+        "SELECT DISTINCT sc || sp FROM tc",
+        "SELECT sc || sp FROM tc GROUP BY sc || sp",
+        "SELECT sc || sp AS x FROM tc GROUP BY 1",
+        "SELECT array_agg(sc ORDER BY sc || sp) FROM tc",
+        "SELECT sc FROM tc UNION SELECT sp FROM tc",
+        "SELECT sc FROM tc INTERSECT SELECT sp FROM tc",
+        // A sublink carries its column's collation.
+        "SELECT (SELECT sc) || sp FROM tc ORDER BY 1",
+        "SELECT ARRAY(SELECT sc FROM tc) || ARRAY[sp] FROM tc ORDER BY 1",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::CollationMismatch(_),
+            "collation mismatch between implicit collations \"C\" and \"POSIX\""
+        );
+    }
+    for sql in [
+        "SELECT sc || sp FROM tc",
+        "SELECT sc FROM tc ORDER BY length(sc || sp)",
+        "SELECT sc FROM tc ORDER BY (sc || sp) COLLATE \"C\"",
+        "SELECT sc FROM tc ORDER BY sc || s",
+        "SELECT sc FROM tc UNION ALL SELECT sp FROM tc",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    let s = db
+        .analyze("SELECT sc AS x FROM tc UNION ALL SELECT sp FROM tc")
+        .unwrap();
+    assert_cols(&s, vec![cn("x", text())]);
+}
+
+/// select_common_collation: a COLLATE in one arm's select list decides
+/// the set operation's column collation; two different ones are 42P21
+/// even for UNION ALL.
+#[test]
+fn set_operation_explicit_collations() {
+    let db = collation_db();
+    for sql in [
+        "SELECT s COLLATE \"C\" FROM tc UNION SELECT sn COLLATE \"POSIX\" FROM tc",
+        "SELECT s COLLATE \"C\" FROM tc UNION ALL SELECT sn COLLATE \"POSIX\" FROM tc",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::CollationMismatch(_),
+            "collation mismatch between explicit collations \"C\" and \"POSIX\""
+        );
+    }
+    let s = db
+        .analyze("SELECT sp COLLATE \"C\" AS x FROM tc UNION SELECT sp FROM tc")
+        .unwrap();
+    assert_cols(
+        &s,
+        vec![cn("x", basic_with_collation("pg_catalog", "text", "C"))],
+    );
+}

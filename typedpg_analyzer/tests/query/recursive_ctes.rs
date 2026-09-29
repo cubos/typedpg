@@ -272,6 +272,21 @@ fn recursive_cycle_clause_with_explicit_mark_values() {
     assert!(!mark.nullable);
 }
 
+/// analyzeCTE compares cycle marks with the mark type's equality operator.
+#[test]
+fn cycle_mark_type_needs_an_equality_operator() {
+    let db = setup();
+    assert_err_prefix!(
+        db.analyze(
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3) \
+             CYCLE n SET is_cycle TO point '(1,1)' DEFAULT point '(0,0)' USING path \
+             SELECT * FROM r",
+        ),
+        AnalyzeError::UndefinedFunction(_),
+        "could not identify an equality operator for type point"
+    );
+}
+
 #[test]
 fn recursive_search_breadth_first_with_other_columns_intact() {
     let db = setup();

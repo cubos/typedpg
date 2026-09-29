@@ -706,6 +706,14 @@ pub(crate) fn infer_expr(
                 Some(t) if t != oid::UNKNOWN => t,
                 _ => select_common_type(label, &types, snapshot)?,
             };
+            // ExecInitExprRec looks up the type's btree comparison function
+            // when the executor starts — every execution fails without one.
+            if !crate::clause::has_ordering_operator(snapshot, resolved_type) {
+                return Err(crate::pgmsg::no_comparison_function(
+                    &crate::ddl::util::format_type_for_message(snapshot, resolved_type),
+                )
+                .finalize_implicit());
+            }
             // Back-fill UNKNOWN args with the resolved common type so
             // embedded params get pinned and string-literal contents are
             // validated (PG rejects `GREATEST(1, 'x')` at parse time).

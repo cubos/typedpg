@@ -40,11 +40,11 @@ pub(crate) fn infer_sublink(
                 } else {
                     true
                 };
-                return Ok(ExprType::scalar_with_typmod(
-                    first.type_oid,
-                    nullable,
-                    first.typmod,
-                ));
+                // The sublink carries its column's collation, implicitly.
+                return Ok(
+                    ExprType::scalar_with_typmod(first.type_oid, nullable, first.typmod)
+                        .with_collation((first.collation, false)),
+                );
             }
             Ok(ExprType::scalar(oid::UNKNOWN, true))
         }
@@ -146,13 +146,16 @@ pub(crate) fn infer_sublink(
             // (a multi-dimensional array), otherwise its array type.
             let mut array_oid = oid::UNKNOWN;
             let mut typmod = None;
+            let mut collation = (None, false);
             if let Some(subselect) = &sub.subselect
                 && let Some(node::Node::SelectStmt(sel)) = subselect.node.as_ref()
             {
                 let first = single_sublink_column(sub, sel, ctx, params)?;
                 // The array carries the column's typmod (exprTypmod of an
-                // ARRAY sublink is its subquery column's).
+                // ARRAY sublink is its subquery column's) and, implicitly,
+                // its collation.
                 typmod = first.typmod;
+                collation = (first.collation, false);
                 let elem = first.type_oid;
                 let elem_is_array = snapshot
                     .get_type(elem)
@@ -167,7 +170,7 @@ pub(crate) fn infer_sublink(
                     })?
                 };
             }
-            Ok(ExprType::scalar_with_typmod(array_oid, false, typmod))
+            Ok(ExprType::scalar_with_typmod(array_oid, false, typmod).with_collation(collation))
         }
         _ => Err(AnalyzeError::Unsupported(format!(
             "sublink type: {:?}",

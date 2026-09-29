@@ -277,3 +277,254 @@ pub(crate) fn check_no_aggregates_or_windows(
     }
     Ok(())
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Sort / group keys
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Whether `t` has an ordering operator: PG's typcache `TYPECACHE_LT_OPR`,
+/// the `<` of its default btree operator class — which an array or a
+/// composite only has when its element / every field has one too.
+pub(crate) fn has_ordering_operator(snapshot: &PgCatalog, t: PgTypeOid) -> bool {
+    type_has_operators(snapshot, t, false, 0)
+}
+
+/// Whether `t` has an equality operator: PG's typcache `TYPECACHE_EQ_OPR`,
+/// from its default btree operator class or else its default hash one
+/// (element- / field-wise for arrays and composites).
+pub(crate) fn has_equality_operator(snapshot: &PgCatalog, t: PgTypeOid) -> bool {
+    type_has_operators(snapshot, t, true, 0)
+}
+
+fn type_has_operators(snapshot: &PgCatalog, t: PgTypeOid, equality: bool, depth: u32) -> bool {
+    let t = snapshot.unwrap_domain(t);
+    // An unknown literal becomes text; an anonymous record is only
+    // checked field by field at run time.
+    if depth > 32 || t == oid::UNKNOWN || t == oid::RECORD {
+        return true;
+    }
+    let Some(ty) = snapshot.get_type(t) else {
+        return true;
+    };
+    if ty.typcategory == crate::pg_catalog::TypCategory::Array
+        && let Some(elem) = ty.typelem
+    {
+        return type_has_operators(snapshot, elem, equality, depth + 1);
+    }
+    if ty.typtype == crate::pg_catalog::TypType::Composite
+        && let Some(relid) = ty.typrelid
+    {
+        return snapshot
+            .attributes_of(relid)
+            .iter()
+            .filter(|a| a.attnum > 0)
+            .all(|a| type_has_operators(snapshot, a.atttypid, equality, depth + 1));
+    }
+    let has = |am| crate::ddl::opclass::default_opclass_intype(snapshot, t, am).is_some();
+    has("btree") || (equality && has("hash"))
+}
+
+/// How a sort / group key is used, which decides the operators
+/// get_sort_group_operators requires of its type.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeyUse {
+    /// ORDER BY (the query's, a window's or an aggregate's): `<`.
+    Sort,
+    /// GROUP BY, DISTINCT [ON], PARTITION BY, set operations: `=`.
+    Group,
+    /// An aggregate's DISTINCT argument: `=`, and `<` to sort its input.
+    AggDistinct,
+}
+
+/// get_sort_group_operators for a key of type `t`.
+pub(crate) fn check_key_operators(
+    snapshot: &PgCatalog,
+    t: PgTypeOid,
+    usage: KeyUse,
+    location: Option<i32>,
+) -> Result<(), AnalyzeError> {
+    let span = location.and_then(crate::error::SourceSpan::from_node_qname);
+    let name = || crate::ddl::util::format_type_for_message(snapshot, t);
+    if matches!(usage, KeyUse::Group | KeyUse::AggDistinct) && !has_equality_operator(snapshot, t) {
+        return Err(crate::pgmsg::no_equality_operator(&name(), span).finalize_implicit());
+    }
+    if matches!(usage, KeyUse::Sort | KeyUse::AggDistinct) && !has_ordering_operator(snapshot, t) {
+        return Err(
+            crate::pgmsg::no_ordering_operator(&name(), usage == KeyUse::Sort, span)
+                .finalize_implicit(),
+        );
+    }
+    Ok(())
+}
+
+/// PG's collation strengths (parse_collate.c), weakest first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Strength {
+    None,
+    Implicit,
+    Conflict,
+    Explicit,
+}
+
+/// An expression's collation state: its collation and strength, and for a
+/// conflict the second collation.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CollationState {
+    strength: Strength,
+    collation: Option<crate::oid::PgCollationOid>,
+    other: Option<crate::oid::PgCollationOid>,
+}
+
+impl CollationState {
+    const NONE: CollationState = CollationState {
+        strength: Strength::None,
+        collation: None,
+        other: None,
+    };
+
+    /// The state of a value of type `t` carrying `collation` (its type's
+    /// when `None`), explicitly (`COLLATE`) or not.
+    fn of_value(
+        snapshot: &PgCatalog,
+        t: PgTypeOid,
+        collation: Option<crate::oid::PgCollationOid>,
+        explicit: bool,
+    ) -> Self {
+        let Some(type_collation) = snapshot.get_type(t).and_then(|ty| ty.typcollation) else {
+            return Self::NONE;
+        };
+        CollationState {
+            strength: if explicit {
+                Strength::Explicit
+            } else {
+                Strength::Implicit
+            },
+            collation: Some(collation.unwrap_or(type_collation)),
+            other: None,
+        }
+    }
+
+    /// PG's merge_collation_state: fold a sibling's state into this one.
+    fn merge(&mut self, s: CollationState) {
+        if s.strength > self.strength {
+            *self = s;
+        } else if s.strength == self.strength
+            && s.strength == Strength::Implicit
+            && s.collation != self.collation
+        {
+            if self.collation == Some(DEFAULT_COLLATION) {
+                *self = s;
+            } else if s.collation != Some(DEFAULT_COLLATION) {
+                self.strength = Strength::Conflict;
+                self.other = s.collation;
+            }
+        }
+    }
+
+    /// The state PG's select_common_collation merges for two values: a
+    /// set operation's column from its two arms.
+    pub(crate) fn merged(mut self, other: CollationState) -> CollationState {
+        self.merge(other);
+        self
+    }
+
+    /// A column value of type `t` with collation `collation` (implicit
+    /// unless `explicit`).
+    pub(crate) fn column(
+        snapshot: &PgCatalog,
+        t: PgTypeOid,
+        collation: Option<crate::oid::PgCollationOid>,
+        explicit: bool,
+    ) -> Self {
+        Self::of_value(snapshot, t, collation, explicit)
+    }
+
+    /// The collation, when explicit.
+    pub(crate) fn explicit(self) -> Option<crate::oid::PgCollationOid> {
+        (self.strength == Strength::Explicit)
+            .then_some(self.collation)
+            .flatten()
+    }
+
+    /// The resolved collation, `None` for a conflict or no collation.
+    pub(crate) fn collation(self) -> Option<crate::oid::PgCollationOid> {
+        match self.strength {
+            Strength::Implicit | Strength::Explicit => self.collation,
+            _ => None,
+        }
+    }
+
+    /// `collation mismatch between implicit collations …` when the state
+    /// is a conflict.
+    pub(crate) fn check_determinate(
+        self,
+        snapshot: &PgCatalog,
+        location: Option<i32>,
+    ) -> Result<(), AnalyzeError> {
+        if self.strength != Strength::Conflict {
+            return Ok(());
+        }
+        let name = |c: Option<crate::oid::PgCollationOid>| {
+            c.and_then(|c| snapshot.pg_collation.get(&c))
+                .map(|c| c.collname.clone())
+                .unwrap_or_default()
+        };
+        Err(crate::pgmsg::collation_mismatch_implicit(
+            &name(self.collation),
+            &name(self.other),
+            location.and_then(crate::error::SourceSpan::from_node_qname),
+        )
+        .finalize_implicit())
+    }
+}
+
+/// PG's `DEFAULT_COLLATION_OID`.
+const DEFAULT_COLLATION: crate::oid::PgCollationOid = crate::oid::PgCollationOid::from_raw(100);
+
+/// PG's assign_collations_walker for one expression of the current level:
+/// explicit (`COLLATE`) beats implicit, a non-default implicit collation
+/// beats the default, and two different non-default implicit ones are a
+/// conflict that bubbles up through every node whose result is
+/// collatable. Types come from inference on scratch parameters.
+pub(crate) fn collation_state(
+    node: &protobuf::Node,
+    ctx: Ctx<'_>,
+    params: &ParamCollector,
+) -> CollationState {
+    let infer = |n: &protobuf::Node| {
+        let mut scratch = params.clone();
+        expr::infer_expr(n, ctx, &mut scratch, TypeGoal::NONE).ok()
+    };
+    if let Some(protobuf::node::Node::CollateClause(_)) = node.node.as_ref() {
+        return infer(node).map_or(CollationState::NONE, |t| {
+            CollationState::of_value(ctx.snapshot, t.type_oid, t.collation, true)
+        });
+    }
+    let children = crate::resolve::expr_children(node);
+    if children.is_empty() {
+        return infer(node).map_or(CollationState::NONE, |t| {
+            CollationState::of_value(ctx.snapshot, t.type_oid, t.collation, t.explicit_collation)
+        });
+    }
+    let mut merged = CollationState::NONE;
+    for c in children {
+        merged.merge(collation_state(c, ctx, params));
+    }
+    match infer(node) {
+        // A node whose result isn't collatable absorbs its inputs' state.
+        Some(t) => match ctx
+            .snapshot
+            .get_type(t.type_oid)
+            .and_then(|ty| ty.typcollation)
+        {
+            None => CollationState::NONE,
+            Some(_) if merged.strength > Strength::None => merged,
+            Some(tc) => CollationState {
+                strength: Strength::Implicit,
+                collation: Some(tc),
+                other: None,
+            },
+        },
+        None => merged,
+    }
+}

@@ -336,7 +336,7 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
         let Some(inner) = sb.node.as_deref() else {
             continue;
         };
-        if let Some(ord) = ordinal_of(inner) {
+        if let Some(ord) = sql92_position(inner, "ORDER BY")? {
             if ord < 1 || ord as usize > n_targets {
                 return Err(crate::pgmsg::position_not_in_select_list(
                     "ORDER BY",
@@ -372,7 +372,7 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
     // referenced only inside DISTINCT ON was never registered with the
     // collector and analysis died on the param-count invariant.
     for distinct_node in &sel.distinct_clause {
-        if let Some(ord) = ordinal_of(distinct_node) {
+        if let Some(ord) = sql92_position(distinct_node, "DISTINCT ON")? {
             if ord < 1 || ord as usize > n_targets {
                 return Err(crate::pgmsg::position_not_in_select_list(
                     "DISTINCT ON",
@@ -430,11 +430,12 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
     analyze_limit_offset(sel, expr::Ctx::new(&scope, &null_ctx, snapshot), params)?;
 
     // Resolve target list (SELECT expressions) — no type expectation.
-    let columns = resolve_target_list(
+    let (columns, explicit_collations) = resolve_target_list_explicit(
         &sel.target_list,
         expr::Ctx::new(&scope, &null_ctx, snapshot),
         params,
     )?;
+    grouping::set_explicit_collations(sel, explicit_collations);
 
     // CASE / COALESCE / aggregate and window arguments may not contain
     // set-returning functions anywhere in this level.
@@ -457,6 +458,13 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
         params,
     )?;
     check_distinct_on_matches_order_by(sel, &columns)?;
+    check_sort_group_keys(
+        sel,
+        &targets,
+        &columns,
+        expr::Ctx::new(&scope, &null_ctx, snapshot),
+        params,
+    )?;
 
     // `FOR UPDATE [OF …]` (and FOR SHARE / NO KEY UPDATE / KEY SHARE) —
     // PG checks it last in transformSelectStmt.
@@ -467,6 +475,260 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
     grouping::finish_select_level(sel, &scope, &targets, snapshot)?;
 
     Ok((columns, None))
+}
+
+/// What an ORDER BY / GROUP BY / DISTINCT ON item denotes.
+enum KeyRef<'a> {
+    /// A select-list entry (expanded-target index).
+    Target(usize),
+    /// An expression of its own.
+    Expr(&'a protobuf::Node),
+}
+
+/// The expression of expanded select-list entry `i`, a column reference for
+/// a `*` column.
+fn target_expr(targets: &[ExpandedTarget<'_>], i: usize) -> Option<protobuf::Node> {
+    match targets.get(i)? {
+        ExpandedTarget::Expr(rt) => rt.val.as_deref().cloned(),
+        ExpandedTarget::StarColumn {
+            column: Some((alias, col)),
+            ..
+        } => Some(protobuf::Node {
+            node: Some(node::Node::ColumnRef(protobuf::ColumnRef {
+                fields: [*alias, *col]
+                    .into_iter()
+                    .map(|s| protobuf::Node {
+                        node: Some(node::Node::String(protobuf::String { sval: s.into() })),
+                    })
+                    .collect(),
+                location: -1,
+            })),
+        }),
+        ExpandedTarget::StarColumn { column: None, .. } => None,
+    }
+}
+
+/// PG's findTargetlistEntrySQL92 for an ORDER BY / GROUP BY / DISTINCT ON
+/// item: an integer constant is a select-list position; a bare name is the
+/// output column of that name (in GROUP BY only when no input column has
+/// it) — `{clause} "a" is ambiguous` (42702) when several output columns
+/// of that name have differing expressions; anything else is an expression.
+fn sql92_key<'a>(
+    node: &'a protobuf::Node,
+    clause: &str,
+    targets: &[ExpandedTarget<'_>],
+    columns: &[RawColumn],
+    scope: &Scope,
+) -> Result<KeyRef<'a>, AnalyzeError> {
+    if let Some(ord) = ordinal_of(node) {
+        return Ok(match usize::try_from(ord - 1) {
+            Ok(i) if i < columns.len() => KeyRef::Target(i),
+            _ => KeyRef::Expr(node),
+        });
+    }
+    let Some(node::Node::ColumnRef(cr)) = node.node.as_ref() else {
+        return Ok(KeyRef::Expr(node));
+    };
+    let parts = expr::extract_string_fields(&cr.fields);
+    let [name] = parts.as_slice() else {
+        return Ok(KeyRef::Expr(node));
+    };
+    if cr.fields.len() != 1
+        || (clause == "GROUP BY" && scope.resolve_column(None, name, None).is_ok())
+    {
+        return Ok(KeyRef::Expr(node));
+    }
+    let matches: Vec<usize> = columns
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| &c.name == name)
+        .map(|(i, _)| i)
+        .collect();
+    let Some(&first) = matches.first() else {
+        return Ok(KeyRef::Expr(node));
+    };
+    let first_expr = target_expr(targets, first);
+    for &other in &matches[1..] {
+        let same = match (&first_expr, target_expr(targets, other)) {
+            (Some(a), Some(b)) => grouping::same_level_exprs_equal(a, &b, scope),
+            _ => false,
+        };
+        if !same {
+            return Err(crate::pgmsg::clause_name_ambiguous(
+                clause,
+                name,
+                crate::error::SourceSpan::from_node_qname(cr.location),
+            )
+            .finalize_implicit());
+        }
+    }
+    Ok(KeyRef::Target(first))
+}
+
+/// The operator and collation requirements on the sort / group keys of a
+/// SELECT level: get_sort_group_operators for each ORDER BY / GROUP BY /
+/// DISTINCT [ON] key, each window's PARTITION BY / ORDER BY, and each
+/// aggregate's DISTINCT arguments and ORDER BY (42883 when the type has no
+/// such operator), then assign_collations' rule that a sort / group key's
+/// collation must be determinate (42P21).
+fn check_sort_group_keys(
+    sel: &protobuf::SelectStmt,
+    targets: &[ExpandedTarget<'_>],
+    columns: &[RawColumn],
+    ctx: Ctx<'_>,
+    params: &ParamCollector,
+) -> Result<(), AnalyzeError> {
+    use crate::clause::KeyUse;
+    let scope = ctx.scope;
+    // `(key, operators needed — None for ORDER BY … USING, location)`.
+    let mut keys: Vec<(KeyRef<'_>, Option<KeyUse>, i32)> = Vec::new();
+    let loc = |n: &protobuf::Node| crate::error::node_location(n).unwrap_or(-1);
+    fn sort_items(order: &[protobuf::Node]) -> Vec<(&protobuf::Node, bool)> {
+        order
+            .iter()
+            .filter_map(|o| match o.node.as_ref()? {
+                node::Node::SortBy(sb) => Some((
+                    sb.node.as_deref()?,
+                    sb.sortby_dir() == protobuf::SortByDir::SortbyUsing,
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+    for (inner, using) in sort_items(&sel.sort_clause) {
+        let key = sql92_key(inner, "ORDER BY", targets, columns, scope)?;
+        keys.push((key, (!using).then_some(KeyUse::Sort), loc(inner)));
+    }
+    let mut stack: Vec<&protobuf::Node> = sel.group_clause.iter().rev().collect();
+    while let Some(g) = stack.pop() {
+        if let Some(node::Node::GroupingSet(gs)) = g.node.as_ref() {
+            stack.extend(gs.content.iter().rev());
+        } else if let Some(items) = grouping::implicit_row_items(g) {
+            stack.extend(items.iter().rev());
+        } else {
+            let key = sql92_key(g, "GROUP BY", targets, columns, scope)?;
+            keys.push((key, Some(KeyUse::Group), loc(g)));
+        }
+    }
+    let plain_distinct =
+        !sel.distinct_clause.is_empty() && sel.distinct_clause.iter().all(|n| n.node.is_none());
+    if plain_distinct {
+        for (i, t) in targets.iter().enumerate() {
+            let location = match t {
+                ExpandedTarget::Expr(rt) => rt.location,
+                ExpandedTarget::StarColumn { location, .. } => *location,
+            };
+            keys.push((KeyRef::Target(i), Some(KeyUse::Group), location));
+        }
+    } else {
+        for d in sel.distinct_clause.iter().filter(|n| n.node.is_some()) {
+            let key = sql92_key(d, "DISTINCT ON", targets, columns, scope)?;
+            keys.push((key, Some(KeyUse::Group), loc(d)));
+        }
+    }
+    // Windows and aggregates of this level.
+    let mut windows: Vec<&protobuf::WindowDef> = sel
+        .window_clause
+        .iter()
+        .filter_map(|w| match w.node.as_ref()? {
+            node::Node::WindowDef(wd) => Some(&**wd),
+            _ => None,
+        })
+        .collect();
+    let mut level_exprs: Vec<&protobuf::Node> = sel
+        .target_list
+        .iter()
+        .filter_map(|t| match t.node.as_ref()? {
+            node::Node::ResTarget(rt) => rt.val.as_deref(),
+            _ => None,
+        })
+        .collect();
+    level_exprs.extend(sel.having_clause.as_deref());
+    level_exprs.extend(sort_items(&sel.sort_clause).into_iter().map(|(n, _)| n));
+    let mut agg_keys: Vec<(&protobuf::Node, KeyUse)> = Vec::new();
+    for e in level_exprs {
+        visit_same_level(e, &mut |n| {
+            // SQL/JSON aggregates: their ORDER BY and window.
+            let json_agg = match n.node.as_ref() {
+                Some(node::Node::JsonObjectAgg(a)) => a.constructor.as_deref(),
+                Some(node::Node::JsonArrayAgg(a)) => a.constructor.as_deref(),
+                _ => None,
+            };
+            if let Some(ctor) = json_agg {
+                windows.extend(ctor.over.as_deref());
+                agg_keys.extend(
+                    sort_items(&ctor.agg_order)
+                        .into_iter()
+                        .map(|(n, _)| (n, KeyUse::Sort)),
+                );
+            }
+            let Some(node::Node::FuncCall(fc)) = n.node.as_ref() else {
+                return;
+            };
+            if let Some(over) = fc.over.as_deref() {
+                windows.push(over);
+            }
+            if fc.agg_distinct {
+                agg_keys.extend(fc.args.iter().map(|a| (a, KeyUse::AggDistinct)));
+            }
+            agg_keys.extend(
+                sort_items(&fc.agg_order)
+                    .into_iter()
+                    .map(|(n, _)| (n, KeyUse::Sort)),
+            );
+        });
+    }
+    for wd in windows {
+        keys.extend(
+            wd.partition_clause
+                .iter()
+                .map(|p| (KeyRef::Expr(p), Some(KeyUse::Group), loc(p))),
+        );
+        keys.extend(
+            sort_items(&wd.order_clause)
+                .into_iter()
+                .map(|(o, using)| (KeyRef::Expr(o), (!using).then_some(KeyUse::Sort), loc(o))),
+        );
+    }
+    keys.extend(
+        agg_keys
+            .into_iter()
+            .map(|(n, u)| (KeyRef::Expr(n), Some(u), loc(n))),
+    );
+
+    let key_type = |key: &KeyRef<'_>| match key {
+        KeyRef::Target(i) => columns.get(*i).map(|c| c.type_oid),
+        KeyRef::Expr(n) => {
+            let mut scratch = params.clone();
+            expr::infer_expr(n, ctx, &mut scratch, TypeGoal::NONE)
+                .ok()
+                .map(|t| t.type_oid)
+        }
+    };
+    for (key, usage, location) in &keys {
+        if let Some(usage) = usage
+            && let Some(t) = key_type(key)
+        {
+            crate::clause::check_key_operators(ctx.snapshot, t, *usage, Some(*location))?;
+        }
+    }
+    for (key, _, location) in &keys {
+        let collatable = key_type(key)
+            .and_then(|t| ctx.snapshot.get_type(t))
+            .is_some_and(|t| t.typcollation.is_some());
+        if !collatable {
+            continue;
+        }
+        let expr = match key {
+            KeyRef::Target(i) => target_expr(targets, *i),
+            KeyRef::Expr(n) => Some((*n).clone()),
+        };
+        if let Some(e) = expr {
+            crate::clause::collation_state(&e, ctx, params)
+                .check_determinate(ctx.snapshot, Some(*location))?;
+        }
+    }
+    Ok(())
 }
 
 /// Recursively find window-function calls and verify that any *named*
@@ -578,6 +840,30 @@ fn check_window_refs(
     Ok(())
 }
 
+/// findTargetlistEntrySQL92's constant rule for an ORDER BY / GROUP BY /
+/// DISTINCT ON item: an integer constant is a 1-based select-list position
+/// (`Some`), any other constant — string, float, boolean, NULL — is
+/// `non-integer constant in {clause}` (42601), and anything else is an
+/// expression (`None`).
+pub(crate) fn sql92_position(
+    node: &protobuf::Node,
+    clause: &str,
+) -> Result<Option<i64>, AnalyzeError> {
+    let Some(node::Node::AConst(ac)) = node.node.as_ref() else {
+        return Ok(None);
+    };
+    match &ac.val {
+        Some(typedpg_pg_query::protobuf::a_const::Val::Ival(i)) if !ac.isnull => {
+            Ok(Some(i.ival as i64))
+        }
+        _ => Err(crate::pgmsg::non_integer_constant(
+            clause,
+            crate::error::SourceSpan::from_node_token(ac.location),
+        )
+        .finalize_implicit()),
+    }
+}
+
 /// If `node` is a bare integer literal, return its value — GROUP BY / ORDER
 /// BY treat those as 1-based projection ordinals.
 fn ordinal_of(node: &protobuf::Node) -> Option<i64> {
@@ -687,7 +973,7 @@ fn walk_group_clause_node(
     }
     // Integer literals are 1-based projection ordinals (42P10 when out of
     // range); a valid one needs no further walking.
-    if let Some(ord) = ordinal_of(group_node) {
+    if let Some(ord) = sql92_position(group_node, "GROUP BY")? {
         if ord < 1 || ord as usize > n_targets {
             return Err(crate::pgmsg::position_not_in_select_list(
                 "GROUP BY",

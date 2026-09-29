@@ -598,3 +598,215 @@ fn ordinals_count_star_expanded_targets() {
     );
     assert!(matches!(err, AnalyzeError::GroupingError(_)), "{err:?}");
 }
+
+/// findTargetlistEntrySQL92: a constant ORDER BY / GROUP BY / DISTINCT ON
+/// item is a position, so it must be an integer (42601) — inside grouping
+/// sets and implicit rows too, and for set operations.
+#[test]
+fn non_integer_constant_in_sort_and_group_clauses() {
+    let db = setup();
+    for (sql, msg) in [
+        (
+            "SELECT id FROM t ORDER BY 'x'",
+            "non-integer constant in ORDER BY",
+        ),
+        (
+            "SELECT id FROM t ORDER BY 1.5",
+            "non-integer constant in ORDER BY",
+        ),
+        (
+            "SELECT id FROM t ORDER BY NULL",
+            "non-integer constant in ORDER BY",
+        ),
+        (
+            "SELECT id FROM t ORDER BY true",
+            "non-integer constant in ORDER BY",
+        ),
+        (
+            "SELECT id FROM t GROUP BY 'x'",
+            "non-integer constant in GROUP BY",
+        ),
+        (
+            "SELECT id FROM t GROUP BY 1.5",
+            "non-integer constant in GROUP BY",
+        ),
+        (
+            "SELECT id FROM t GROUP BY ROLLUP('x')",
+            "non-integer constant in GROUP BY",
+        ),
+        (
+            "SELECT id FROM t GROUP BY (id, 'x')",
+            "non-integer constant in GROUP BY",
+        ),
+        (
+            "SELECT DISTINCT ON ('x') id FROM t",
+            "non-integer constant in DISTINCT ON",
+        ),
+        (
+            "SELECT 1 UNION SELECT 2 ORDER BY 'x'",
+            "non-integer constant in ORDER BY",
+        ),
+    ] {
+        let err = assert_err_prefix(&db, sql, msg);
+        assert!(matches!(err, AnalyzeError::SyntaxError(_)), "{err:?}");
+    }
+    // An implicit row's members are grouping items of their own.
+    let err = assert_err_prefix(
+        &db,
+        "SELECT id FROM t GROUP BY (1, 2)",
+        "GROUP BY position 2 is not in select list",
+    );
+    assert!(
+        matches!(err, AnalyzeError::InvalidColumnReference(_)),
+        "{err:?}"
+    );
+}
+
+/// A bare name matching several output columns with different expressions
+/// is ambiguous (42702) — in GROUP BY only when no input column has it.
+#[test]
+fn ambiguous_output_column_name_in_sort_and_group_clauses() {
+    let db = setup();
+    for (sql, msg) in [
+        (
+            "SELECT id AS x, a AS x FROM t ORDER BY x",
+            "ORDER BY \"x\" is ambiguous",
+        ),
+        (
+            "SELECT DISTINCT ON (x) id AS x, a AS x FROM t",
+            "DISTINCT ON \"x\" is ambiguous",
+        ),
+        (
+            "SELECT id AS x, a AS x FROM t GROUP BY x",
+            "GROUP BY \"x\" is ambiguous",
+        ),
+        (
+            "SELECT 1 x, 2 x UNION SELECT 1, 2 ORDER BY x",
+            "ORDER BY \"x\" is ambiguous",
+        ),
+    ] {
+        let err = assert_err_prefix(&db, sql, msg);
+        assert!(matches!(err, AnalyzeError::AmbiguousColumn(_)), "{err:?}");
+    }
+    for sql in [
+        "SELECT id AS x, id AS x FROM t ORDER BY x",
+        "SELECT id AS x, t.id AS x FROM t ORDER BY x",
+        "SELECT *, id FROM t ORDER BY id",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    // GROUP BY prefers the input column `a` over the output alias.
+    let err = assert_err_prefix(
+        &db,
+        "SELECT id AS a, a FROM t GROUP BY a",
+        "column \"t.id\" must appear in the GROUP BY clause",
+    );
+    assert!(matches!(err, AnalyzeError::GroupingError(_)), "{err:?}");
+}
+
+/// get_sort_group_operators: a sort key needs its type's ordering operator
+/// and a grouping / DISTINCT / set-operation / PARTITION BY key its
+/// equality operator (42883) — json, xml and point have none; GREATEST /
+/// LEAST need a comparison function.
+#[test]
+fn sort_and_group_keys_need_ordering_and_equality_operators() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE tj (id int PRIMARY KEY, js json NOT NULL, p point NOT NULL, x xid);
+         CREATE TYPE pj AS (a int, j json);
+         CREATE TABLE tc (id int PRIMARY KEY, c pj, arr json[]);",
+    )
+    .unwrap();
+    for (sql, msg) in [
+        (
+            "SELECT id FROM tj ORDER BY js",
+            "could not identify an ordering operator for type json",
+        ),
+        (
+            "SELECT id FROM tj ORDER BY p",
+            "could not identify an ordering operator for type point",
+        ),
+        (
+            "SELECT id FROM tj ORDER BY x",
+            "could not identify an ordering operator for type xid",
+        ),
+        (
+            "SELECT id FROM tc ORDER BY c",
+            "could not identify an ordering operator for type pj",
+        ),
+        (
+            "SELECT id FROM tc ORDER BY arr",
+            "could not identify an ordering operator for type json[]",
+        ),
+        (
+            "SELECT DISTINCT js FROM tj",
+            "could not identify an equality operator for type json",
+        ),
+        (
+            "SELECT js FROM tj UNION SELECT js FROM tj",
+            "could not identify an equality operator for type json",
+        ),
+        (
+            "SELECT js FROM tj GROUP BY js",
+            "could not identify an equality operator for type json",
+        ),
+        (
+            "SELECT count(DISTINCT js) FROM tj",
+            "could not identify an equality operator for type json",
+        ),
+        (
+            "SELECT id FROM tj GROUP BY id, point '(1,1)'",
+            "could not identify an equality operator for type point",
+        ),
+        (
+            "SELECT point '(1,1)' UNION SELECT point '(1,1)'",
+            "could not identify an equality operator for type point",
+        ),
+        (
+            "SELECT json_build_object() INTERSECT SELECT json_build_object()",
+            "could not identify an equality operator for type json",
+        ),
+        (
+            "SELECT xmlelement(name a) UNION SELECT xmlelement(name b)",
+            "could not identify an equality operator for type xml",
+        ),
+        (
+            "SELECT DISTINCT ON (point '(1,1)') id FROM tj",
+            "could not identify an equality operator for type point",
+        ),
+        (
+            "SELECT id FROM tj GROUP BY ROLLUP (point '(1,1)')",
+            "could not identify an equality operator for type point",
+        ),
+        (
+            "SELECT row_number() OVER (PARTITION BY p) FROM tj",
+            "could not identify an equality operator for type point",
+        ),
+        (
+            "SELECT row_number() OVER (ORDER BY p) FROM tj",
+            "could not identify an ordering operator for type point",
+        ),
+        (
+            "SELECT array_agg(id ORDER BY p) FROM tj",
+            "could not identify an ordering operator for type point",
+        ),
+        (
+            "SELECT p FROM tj UNION ALL SELECT p FROM tj ORDER BY 1",
+            "could not identify an ordering operator for type point",
+        ),
+        (
+            "SELECT greatest(p, p) FROM tj",
+            "could not identify a comparison function for type point",
+        ),
+    ] {
+        assert_err_prefix!(db.analyze(sql), AnalyzeError::UndefinedFunction(_), msg);
+    }
+    for sql in [
+        "SELECT p FROM tj UNION ALL SELECT p FROM tj",
+        "SELECT DISTINCT x FROM tj",
+        "SELECT id FROM tj ORDER BY p <-> point '(0,0)'",
+        "SELECT DISTINCT ROW(id, p) FROM tj",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
