@@ -1306,3 +1306,68 @@ fn columns_may_not_take_a_system_column_name() {
          ALTER TYPE ct ADD ATTRIBUTE ctid int;",
     )]);
 }
+
+#[test]
+fn create_table_as_execute_runs_a_prepared_statement() {
+    // prepare.c: PREPARE analyzes and keeps the query, EXECUTE (also as
+    // CREATE TABLE AS EXECUTE) checks its arguments against the parameter
+    // types, DEALLOCATE forgets it.
+    let setup = "PREPARE s AS SELECT 1 AS c;
+                 PREPARE p2(int, text) AS SELECT $1 AS a, $2 AS b, $3::bool AS c;
+                 PREPARE u(int) AS SELECT $1 + 1 AS x;
+                 CREATE TABLE t (x int);
+                 PREPARE i AS INSERT INTO t VALUES (1);";
+    for (stmt, msg) in [
+        ("PREPARE s AS SELECT 2;", "prepared statement \"s\" already exists"),
+        ("PREPARE bad AS SELECT nope;", "column \"nope\" does not exist"),
+        (
+            "CREATE TABLE b AS EXECUTE p2(1, 'x');",
+            "wrong number of parameters for prepared statement \"p2\"",
+        ),
+        (
+            "CREATE TABLE b AS EXECUTE p2('z', 'x', true);",
+            "invalid input syntax for type integer: \"z\"",
+        ),
+        (
+            "CREATE TABLE b AS EXECUTE u(now());",
+            "parameter $1 of type timestamp with time zone cannot be coerced to the expected \
+             type integer",
+        ),
+        (
+            "CREATE TABLE b AS EXECUTE nope;",
+            "prepared statement \"nope\" does not exist",
+        ),
+        ("EXECUTE nope;", "prepared statement \"nope\" does not exist"),
+        ("DEALLOCATE nope;", "prepared statement \"nope\" does not exist"),
+        ("DEALLOCATE s; EXECUTE s;", "prepared statement \"s\" does not exist"),
+        (
+            "CREATE TABLE b AS EXECUTE i;",
+            "prepared statement is not a SELECT",
+        ),
+        (
+            "PREPARE r AS SELECT row(1, 2) AS c; CREATE TABLE b AS EXECUTE r;",
+            "column \"c\" has pseudo-type record",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    let db = build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "CREATE TABLE b AS EXECUTE s;
+             CREATE TABLE b2 AS EXECUTE p2(1.5, 'x', true);
+             CREATE TABLE b3 (y) AS EXECUTE u(1);
+             EXECUTE i;
+             DEALLOCATE ALL;
+             PREPARE s AS SELECT 2;",
+        ),
+    ]);
+    assert_cols(&db.analyze("SELECT c FROM b").unwrap(), vec![cn("c", int4())]);
+    assert_cols(
+        &db.analyze("SELECT * FROM b2").unwrap(),
+        vec![cn("a", int4()), cn("b", text()), cn("c", bool_ty())],
+    );
+    assert_cols(&db.analyze("SELECT y FROM b3").unwrap(), vec![cn("y", int4())]);
+}

@@ -199,6 +199,26 @@ fn create_relation_as(
     .to_string();
     let aliases = string_list(&into.col_names);
     let mut resolved = match query {
+        // CREATE TABLE ... AS EXECUTE (ExecuteQuery): the prepared SELECT's
+        // columns, its arguments checked.
+        Some(protobuf::Node {
+            node: Some(node::Node::ExecuteStmt(estmt)),
+        }) => {
+            let prepared = super::prepared::lookup_execute(interp, estmt)?;
+            if !prepared.is_select() {
+                return Err(DdlError::Parse(
+                    "prepared statement is not a SELECT".into(),
+                ));
+            }
+            resolve_view_with_params(interp, &prepared.query, &aliases, &prepared.param_types)
+                .map_err(|e| match e {
+                    DdlError::ViewAnalysis { source, .. } => DdlError::ViewAnalysis {
+                        view: qn_label.clone(),
+                        source,
+                    },
+                    other => other,
+                })?
+        }
         Some(query_node) => {
             resolve_view_now(interp, query_node, &aliases).map_err(|e| match e {
                 DdlError::ViewAnalysis { source, .. } => DdlError::ViewAnalysis {
@@ -618,17 +638,28 @@ fn resolve_view_now(
     query_node: &protobuf::Node,
     aliases: &[String],
 ) -> Result<ResolvedView, DdlError> {
+    resolve_view_with_params(snapshot, query_node, aliases, &[])
+}
+
+/// [`resolve_view_now`] for a query whose `$n` have types (a prepared
+/// statement's).
+fn resolve_view_with_params(
+    snapshot: &PgCatalog,
+    query_node: &protobuf::Node,
+    aliases: &[String],
+    param_types: &[PgTypeOid],
+) -> Result<ResolvedView, DdlError> {
     let inner = query_node
         .node
         .as_ref()
         .ok_or_else(|| DdlError::Parse("CREATE VIEW with empty query node".into()))?;
     let (raw_columns, _) =
-        crate::resolve::analyze_raw_node(snapshot, inner, &[]).map_err(|source| {
-            DdlError::ViewAnalysis {
+        crate::resolve::analyze_raw_node_with_param_types(snapshot, inner, param_types).map_err(
+            |source| DdlError::ViewAnalysis {
                 view: String::new(),
                 source: Box::new(source),
-            }
-        })?;
+            },
+        )?;
 
     let columns: Vec<ResolvedColumn> = raw_columns
         .iter()

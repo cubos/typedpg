@@ -33,6 +33,7 @@ pub(crate) mod rules;
 pub mod schema_stmt;
 pub(crate) mod seqparams;
 pub mod sequences;
+pub(crate) mod prepared;
 pub(crate) mod session;
 pub(crate) mod statistics;
 pub mod tables;
@@ -298,7 +299,6 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         | node::Node::AlterRoleStmt(_)
         | node::Node::AlterOperatorStmt(_)
         | node::Node::VariableShowStmt(_)
-        | node::Node::DiscardStmt(_)
         | node::Node::ExplainStmt(_)
         | node::Node::NotifyStmt(_)
         | node::Node::ListenStmt(_)
@@ -311,9 +311,6 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         // configuration, foreign-data wrappers / servers / user mappings,
         // tablespaces, conversions, languages, transforms, security labels,
         // and type property changes (`ALTER TYPE t SET (...)`).
-        | node::Node::PrepareStmt(_)
-        | node::Node::ExecuteStmt(_)
-        | node::Node::DeallocateStmt(_)
         | node::Node::DeclareCursorStmt(_)
         | node::Node::FetchStmt(_)
         | node::Node::ClosePortalStmt(_)
@@ -336,6 +333,10 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         | node::Node::AlterObjectDependsStmt(_) => Ok(()),
         node::Node::AlterTypeStmt(s) => types::alter_type(db, s),
         node::Node::AlterTableMoveAllStmt(s) => tables::alter_table_move_all(db, s),
+        node::Node::PrepareStmt(s) => prepared::prepare(db, s),
+        node::Node::ExecuteStmt(s) => prepared::execute(db, s),
+        node::Node::DeallocateStmt(s) => prepared::deallocate(db, s),
+        node::Node::DiscardStmt(s) => prepared::discard(db, s),
 
         // ── Unknown DDL — surface as an error ───────────────────────
         other => Err(DdlError::UnsupportedDdl(format!("{other:?}"))),

@@ -350,6 +350,8 @@ pub struct PgCatalog {
     /// `attstorage` of the columns whose storage isn't their type's
     /// `typstorage` (a STORAGE clause, ALTER COLUMN SET STORAGE).
     pub(crate) attr_storage: HashMap<(PgClassOid, i16), TypStorage>,
+    /// The migration session's prepared statements (PREPARE), by name.
+    pub(crate) prepared_statements: HashMap<String, crate::ddl::prepared::PreparedStatement>,
     /// `pg_type.typsubscript` of user base types, as the handler function's
     /// name (`hstore_subscript_handler`), set by `CREATE TYPE (SUBSCRIPT =
     /// …)` / `ALTER TYPE … SET (SUBSCRIPT = …)`. Built-in types aren't
@@ -638,6 +640,7 @@ impl PgCatalog {
             check_defs: HashMap::new(),
             toast_tables: std::collections::HashSet::new(),
             attr_storage: HashMap::new(),
+            prepared_statements: HashMap::new(),
             next_oid: USER_OID_START_NZ,
             #[cfg(feature = "pg_sanity")]
             pg_sanity: None,
