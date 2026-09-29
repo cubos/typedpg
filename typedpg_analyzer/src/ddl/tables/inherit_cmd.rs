@@ -416,6 +416,7 @@ pub(super) fn attach_partition(
         super::partbound::add_partition_bound(interp, parent, attach, bound)?;
     }
     create_inheritance(interp, attach, parent, &attach_name, true)?;
+    super::foreign_keys::clone_parent_fks(interp, parent, attach)?;
     // AttachPartitionEnsureIndexes.
     super::partidx::clone_parent_indexes(interp, parent, attach)
 }
@@ -434,6 +435,7 @@ pub(super) fn detach_partition(
         return Ok(());
     };
     let part = super::super::util::lookup_relation(interp, rv)?.1;
+    super::foreign_keys::detach_fks(interp, parent, part);
     remove_inheritance(interp, part, parent, "partition")?;
     super::partidx::detach_partition_indexes(interp, part);
     interp.partition_bounds.remove(&part);

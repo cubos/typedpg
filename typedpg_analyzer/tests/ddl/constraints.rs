@@ -911,3 +911,95 @@ fn exclusion_constraint_names_follow_figure_index_colname() {
     )
     .unwrap();
 }
+
+#[test]
+fn foreign_keys_of_partitioned_tables_reach_their_partitions() {
+    // addFkRecurseReferencing / CloneFkReferencing (PG 18): each partition
+    // holds a clone that only the parent's constraint can alter or drop.
+    let setup = "CREATE TABLE rp (a int PRIMARY KEY);
+                 CREATE TABLE fp (a int) PARTITION BY LIST (a);
+                 CREATE TABLE fp1 PARTITION OF fp FOR VALUES IN (1);
+                 ALTER TABLE fp ADD CONSTRAINT myfk FOREIGN KEY (a) REFERENCES rp;";
+    use typedpg_analyzer::ConType;
+    let clone = |db: &PgCatalog, table: &str| {
+        db.constraints_of_table(table)
+            .into_iter()
+            .find(|c| c.contype == ConType::ForeignKey)
+    };
+    let db = build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "CREATE TABLE fp2 PARTITION OF fp FOR VALUES IN (2);",
+        ),
+    ]);
+    for part in ["fp1", "fp2"] {
+        let c = clone(&db, part).unwrap();
+        assert_eq!(
+            (c.conname.as_str(), c.conislocal, c.coninhcount),
+            ("myfk", false, 1)
+        );
+    }
+    for (stmt, msg) in [
+        (
+            "ALTER TABLE ONLY fp ADD FOREIGN KEY (a) REFERENCES rp;",
+            "cannot use ONLY for foreign key on partitioned table \"fp\" referencing relation \"rp\"",
+        ),
+        (
+            "ALTER TABLE fp1 DROP CONSTRAINT myfk;",
+            "cannot drop inherited constraint \"myfk\" of relation \"fp1\"",
+        ),
+        (
+            "ALTER TABLE fp1 ALTER CONSTRAINT myfk NOT ENFORCED;",
+            "cannot alter constraint \"myfk\" on relation \"fp1\"",
+        ),
+        (
+            "CREATE TABLE fp3 (a int);
+             ALTER TABLE fp3 ADD CONSTRAINT myfk FOREIGN KEY (a) REFERENCES rp NOT ENFORCED;
+             ALTER TABLE fp ATTACH PARTITION fp3 FOR VALUES IN (3);",
+            "constraint \"myfk\" enforceability conflicts with constraint \"myfk\" on relation \"fp3\"",
+        ),
+        (
+            "CREATE TABLE self (a int PRIMARY KEY) PARTITION BY LIST (a);
+             CREATE TABLE selfp (a int PRIMARY KEY);
+             ALTER TABLE self ADD FOREIGN KEY (a) REFERENCES selfp;
+             ALTER TABLE self ATTACH PARTITION selfp FOR VALUES IN (1);",
+            "cannot attach table \"selfp\" as a partition because it is referenced by foreign key \"self_a_fkey\"",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    let mut db = build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "ALTER TABLE fp ALTER CONSTRAINT myfk NOT ENFORCED;
+             ALTER TABLE fp DETACH PARTITION fp1;",
+        ),
+    ]);
+    let c = clone(&db, "fp1").unwrap();
+    assert!(!c.conenforced && c.conislocal && c.coninhcount == 0);
+    // An equivalent foreign key of an attached table is adopted.
+    db.apply_sql(
+        "ALTER TABLE fp ATTACH PARTITION fp1 FOR VALUES IN (1);
+         ALTER TABLE fp DROP CONSTRAINT myfk;",
+    )
+    .unwrap();
+    assert!(clone(&db, "fp1").is_none());
+
+    // A partition of a referenced partitioned table is needed by the key.
+    let err = try_apply(&[(
+        "0001.sql",
+        "CREATE TABLE droppk (a int PRIMARY KEY) PARTITION BY RANGE (a);
+         CREATE TABLE droppk1 PARTITION OF droppk FOR VALUES FROM (0) TO (1000);
+         CREATE TABLE dropfk (a int REFERENCES droppk);
+         DROP TABLE droppk1;",
+    )])
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("cannot drop table droppk1 because other objects depend on it"),
+        "{err}"
+    );
+}

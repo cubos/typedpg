@@ -227,24 +227,6 @@ fn drop_relation_oid(
              {child_name} depends on {kind} {name})"
         )));
     }
-    for child in children {
-        if named_relations.contains(&child) || !interp.pg_class.contains_key(&child) {
-            continue;
-        }
-        let child_name = interp
-            .pg_class
-            .get(&child)
-            .map(|c| c.relname.clone())
-            .unwrap_or_default();
-        drop_relation_oid(
-            interp,
-            child,
-            &child_name,
-            "table",
-            cascade,
-            named_relations,
-        )?;
-    }
 
     let dependent_views = views::find_dependent_views(interp, class_oid);
     if !dependent_views.is_empty() && !cascade {
@@ -266,15 +248,33 @@ fn drop_relation_oid(
     // PG also blocks DROP TABLE when an FK on another table targets us
     // (without CASCADE). Walk pg_constraint for FK rows whose
     // `confrelid` is this relation.
+    // The partitioned tables above this partition that aren't going too.
+    let mut referenced_ancestors: Vec<PgClassOid> = Vec::new();
+    let mut current = class_oid;
+    while let Some(parent) = interp
+        .pg_inherits
+        .iter()
+        .find(|i| i.inhrelid == current)
+        .map(|i| i.inhparent)
+        .filter(|p| interp.pg_class.get(p).map(|c| c.relkind) == Some(RelKind::Partitioned))
+    {
+        if !named_relations.contains(&parent) {
+            referenced_ancestors.push(parent);
+        }
+        current = parent;
+    }
     let dependent_fks: Vec<(crate::pg_catalog::PgConstraint, String)> = interp
         .pg_constraint
         .values()
         .filter(|c| {
             matches!(c.contype, crate::pg_catalog::ConType::ForeignKey)
-                && c.confrelid == Some(class_oid)
+                && (c.confrelid == Some(class_oid)
+                    || c.confrelid.is_some_and(|r| referenced_ancestors.contains(&r)))
                 // Its own foreign keys go with it.
                 && c.conrelid != class_oid
                 && !named_relations.contains(&c.conrelid)
+                // A clone goes with its parent.
+                && crate::ddl::tables::foreign_keys::fk_parent(interp, c.oid).is_none()
         })
         .filter_map(|c| {
             let owner = interp.pg_class.get(&c.conrelid)?;
@@ -354,7 +354,22 @@ fn drop_relation_oid(
         let fk_oids: Vec<_> = dependent_fks.iter().map(|(c, _)| c.oid).collect();
         for oid in fk_oids {
             interp.pg_constraint.remove(&oid);
+            crate::ddl::tables::foreign_keys::drop_fk_clones(interp, oid);
         }
+    }
+
+    let mut going: Vec<PgClassOid> = named_relations.to_vec();
+    going.push(class_oid);
+    for child in children {
+        if named_relations.contains(&child) || !interp.pg_class.contains_key(&child) {
+            continue;
+        }
+        let child_name = interp
+            .pg_class
+            .get(&child)
+            .map(|c| c.relname.clone())
+            .unwrap_or_default();
+        drop_relation_oid(interp, child, &child_name, "table", cascade, &going)?;
     }
 
     drop_relation_by_oid(interp, class_oid);

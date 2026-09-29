@@ -188,6 +188,7 @@ pub(super) fn add_foreign_key(
     fk_names: &[String],
     default_name: ConName,
     created: bool,
+    recurse: bool,
 ) -> Result<(), DdlError> {
     let relname = relname_of(interp, relid);
     let conname = ConName::from_explicit(&c.conname, default_name).resolve(interp, relid);
@@ -217,6 +218,12 @@ pub(super) fn add_foreign_key(
                  \"{conname}\")"
             ))
         })?;
+    if !recurse && interp.pg_class.get(&relid).map(|c| c.relkind) == Some(RelKind::Partitioned) {
+        return Err(DdlError::Parse(format!(
+            "cannot use ONLY for foreign key on partitioned table \"{relname}\" referencing \
+             relation \"{target_name}\""
+        )));
+    }
     if !matches!(
         interp.pg_class.get(&target).map(|c| c.relkind),
         Some(RelKind::Table | RelKind::Partitioned)
@@ -386,5 +393,274 @@ pub(super) fn add_foreign_key(
             c.initially_valid
         };
     }
+    interp.fk_details.insert(oid, FkDetails::of(c));
+    recurse_referencing(interp, relid, oid)
+}
+
+/// What `pg_constraint` keeps of a foreign key beyond [`PgConstraint`]:
+/// its actions, match type and deferrability (`confupdtype`,
+/// `confdeltype`, `confmatchtype`, `condeferrable`, `condeferred`) and the
+/// constraint of the partitioned table it was cloned from (`conparentid`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FkDetails {
+    upd_action: String,
+    del_action: String,
+    match_type: String,
+    deferrable: bool,
+    initdeferred: bool,
+    pub(crate) parent: Option<PgConstraintOid>,
+}
+
+impl FkDetails {
+    fn of(c: &typedpg_pg_query::protobuf::Constraint) -> Self {
+        let or = |s: &str, default: &str| {
+            if s.is_empty() {
+                default.to_owned()
+            } else {
+                s.to_owned()
+            }
+        };
+        FkDetails {
+            upd_action: or(&c.fk_upd_action, "a"),
+            del_action: or(&c.fk_del_action, "a"),
+            match_type: or(&c.fk_matchtype, "s"),
+            deferrable: c.deferrable,
+            initdeferred: c.initdeferred,
+            parent: None,
+        }
+    }
+
+    /// The same definition, the parent link aside.
+    fn same_as(&self, other: &FkDetails) -> bool {
+        self.upd_action == other.upd_action
+            && self.del_action == other.del_action
+            && self.match_type == other.match_type
+            && self.deferrable == other.deferrable
+            && self.initdeferred == other.initdeferred
+    }
+}
+
+/// The foreign keys cloned from `con` into partitions (`conparentid`).
+pub(crate) fn fk_clones(interp: &PgCatalog, con: PgConstraintOid) -> Vec<PgConstraintOid> {
+    let mut clones: Vec<PgConstraintOid> = interp
+        .fk_details
+        .iter()
+        .filter(|(_, d)| d.parent == Some(con))
+        .map(|(oid, _)| *oid)
+        .filter(|oid| interp.pg_constraint.contains_key(oid))
+        .collect();
+    clones.sort();
+    clones
+}
+
+/// The constraint `con` was cloned from, if any.
+pub(crate) fn fk_parent(interp: &PgCatalog, con: PgConstraintOid) -> Option<PgConstraint> {
+    let parent = interp.fk_details.get(&con)?.parent?;
+    interp.pg_constraint.get(&parent).cloned()
+}
+
+/// addFkRecurseReferencing: a foreign key of a partitioned table reaches
+/// every partition — attached to an equivalent foreign key the partition
+/// has, or cloned.
+fn recurse_referencing(
+    interp: &mut PgCatalog,
+    relid: PgClassOid,
+    con: PgConstraintOid,
+) -> Result<(), DdlError> {
+    if interp.pg_class.get(&relid).map(|c| c.relkind) != Some(RelKind::Partitioned) {
+        return Ok(());
+    }
+    for part in super::inherit::children_of(interp, relid) {
+        attach_or_clone(interp, part, con)?;
+    }
     Ok(())
+}
+
+/// tryAttachPartitionForeignKey / CloneFkReferencing for one partition.
+fn attach_or_clone(
+    interp: &mut PgCatalog,
+    part: PgClassOid,
+    parent_con: PgConstraintOid,
+) -> Result<(), DdlError> {
+    let Some(parent) = interp.pg_constraint.get(&parent_con).cloned() else {
+        return Ok(());
+    };
+    let parent_details = interp.fk_details.get(&parent_con).cloned();
+    // The key columns, by name in the partition.
+    let parent_attrs = interp.attributes_of(parent.conrelid).to_vec();
+    let names: Vec<String> = parent
+        .conkey
+        .iter()
+        .filter_map(|an| {
+            parent_attrs
+                .iter()
+                .find(|a| a.attnum == *an)
+                .map(|a| a.attname.clone())
+        })
+        .collect();
+    let mapped: Vec<i16> = names
+        .iter()
+        .filter_map(|n| interp.attribute_by_name(part, n).map(|a| a.attnum))
+        .collect();
+    let part_name = relname_of(interp, part);
+    let mut candidates: Vec<PgConstraint> = interp
+        .pg_constraint
+        .values()
+        .filter(|c| {
+            c.conrelid == part
+                && c.contype == ConType::ForeignKey
+                && c.confrelid == parent.confrelid
+                && c.conkey == mapped
+                && c.confkey == parent.confkey
+        })
+        .cloned()
+        .collect();
+    candidates.sort_by_key(|c| c.oid);
+    for candidate in candidates {
+        if candidate.conenforced != parent.conenforced {
+            return Err(DdlError::Parse(format!(
+                "constraint \"{}\" enforceability conflicts with constraint \"{}\" on relation \
+                 \"{part_name}\"",
+                parent.conname, candidate.conname
+            )));
+        }
+        let details = interp.fk_details.get(&candidate.oid).cloned();
+        let attachable = details.as_ref().is_none_or(|d| d.parent.is_none())
+            && match (&details, &parent_details) {
+                (Some(d), Some(p)) => d.same_as(p),
+                _ => true,
+            };
+        if !attachable {
+            continue;
+        }
+        // AttachPartitionForeignKey.
+        if let Some(row) = interp.pg_constraint.get_mut(&candidate.oid) {
+            row.conislocal = false;
+            row.coninhcount = 1;
+        }
+        let mut details = details.or(parent_details.clone()).unwrap_or(FkDetails {
+            upd_action: "a".into(),
+            del_action: "a".into(),
+            match_type: "s".into(),
+            deferrable: false,
+            initdeferred: false,
+            parent: None,
+        });
+        details.parent = Some(parent_con);
+        interp.fk_details.insert(candidate.oid, details);
+        return Ok(());
+    }
+    // No luck finding a good constraint to reuse; create our own, under the
+    // parent's name unless the partition uses it.
+    let name = if interp
+        .pg_constraint
+        .values()
+        .any(|c| c.conrelid == part && c.conname == parent.conname)
+    {
+        super::inherit::choose_constraint_name(
+            interp,
+            part,
+            &crate::ddl::util::index_name_addition(&names),
+            "fkey",
+        )
+    } else {
+        parent.conname.clone()
+    };
+    let oid = PgConstraintOid::from_nonzero(interp.alloc_oid()?);
+    interp.insert_pg_constraint(PgConstraint {
+        oid,
+        conname: name,
+        conrelid: part,
+        contype: ConType::ForeignKey,
+        conkey: mapped,
+        confrelid: parent.confrelid,
+        confkey: parent.confkey.clone(),
+        conislocal: false,
+        coninhcount: 1,
+        conenforced: parent.conenforced,
+        convalidated: parent.convalidated,
+        connoinherit: false,
+        conperiod: parent.conperiod,
+    });
+    if let Some(mut details) = parent_details {
+        details.parent = Some(parent_con);
+        interp.fk_details.insert(oid, details);
+    }
+    recurse_referencing(interp, part, oid)
+}
+
+/// CloneForeignKeyConstraints (CREATE TABLE ... PARTITION OF, ATTACH
+/// PARTITION): the new partition gets the partitioned table's foreign keys
+/// — it can't be the table one of them references.
+pub(super) fn clone_parent_fks(
+    interp: &mut PgCatalog,
+    parent: PgClassOid,
+    part: PgClassOid,
+) -> Result<(), DdlError> {
+    let mut fks: Vec<PgConstraint> = interp
+        .pg_constraint
+        .values()
+        .filter(|c| c.conrelid == parent && c.contype == ConType::ForeignKey)
+        .cloned()
+        .collect();
+    fks.sort_by_key(|c| c.oid);
+    for fk in &fks {
+        if fk.confrelid == Some(part) {
+            return Err(DdlError::UnsupportedDdl(format!(
+                "cannot attach table \"{}\" as a partition because it is referenced by foreign \
+                 key \"{}\"",
+                relname_of(interp, part),
+                fk.conname
+            )));
+        }
+    }
+    for fk in fks {
+        attach_or_clone(interp, part, fk.oid)?;
+    }
+    Ok(())
+}
+
+/// DetachPartitionFinalize: the partition's inherited foreign keys become
+/// its own.
+pub(super) fn detach_fks(interp: &mut PgCatalog, parent: PgClassOid, part: PgClassOid) {
+    let inherited: Vec<PgConstraintOid> = interp
+        .pg_constraint
+        .values()
+        .filter(|c| c.conrelid == part && c.contype == ConType::ForeignKey)
+        .filter(|c| fk_parent(interp, c.oid).is_some_and(|p| p.conrelid == parent))
+        .map(|c| c.oid)
+        .collect();
+    for oid in inherited {
+        if let Some(row) = interp.pg_constraint.get_mut(&oid) {
+            row.conislocal = true;
+            row.coninhcount = 0;
+        }
+        if let Some(d) = interp.fk_details.get_mut(&oid) {
+            d.parent = None;
+        }
+    }
+}
+
+/// A partitioned table's foreign key goes with the clones in its
+/// partitions (their DEPENDENCY_INTERNAL on it).
+pub(crate) fn drop_fk_clones(interp: &mut PgCatalog, con: PgConstraintOid) {
+    for clone in fk_clones(interp, con) {
+        drop_fk_clones(interp, clone);
+        interp.pg_constraint.remove(&clone);
+        interp.fk_details.remove(&clone);
+    }
+}
+
+/// Apply `f` to the clones of `con`, recursively.
+pub(super) fn for_each_fk_clone(
+    interp: &mut PgCatalog,
+    con: PgConstraintOid,
+    f: &dyn Fn(&mut PgConstraint),
+) {
+    for clone in fk_clones(interp, con) {
+        if let Some(row) = interp.pg_constraint.get_mut(&clone) {
+            f(row);
+        }
+        for_each_fk_clone(interp, clone, f);
+    }
 }

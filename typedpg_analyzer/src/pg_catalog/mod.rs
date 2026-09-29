@@ -312,6 +312,9 @@ pub struct PgCatalog {
     /// Every column a partitioned table's key reads — as a key column or
     /// inside a key expression (`has_partition_attrs`).
     pub(crate) partition_key_attrs: HashMap<PgClassOid, Vec<i16>>,
+    /// Foreign keys' actions, match type, deferrability and parent
+    /// (`confupdtype`, ..., `conparentid`).
+    pub(crate) fk_details: HashMap<PgConstraintOid, crate::ddl::tables::foreign_keys::FkDetails>,
     /// `relpartbound` of each partition.
     pub(crate) partition_bounds: HashMap<PgClassOid, crate::ddl::tables::partbound::Bound>,
     /// CHECK constraints' expressions and `connoinherit`.
@@ -598,6 +601,7 @@ impl PgCatalog {
             enums_created_in_transaction: Default::default(),
             partition_specs: HashMap::new(),
             partition_key_attrs: HashMap::new(),
+            fk_details: HashMap::new(),
             partition_bounds: HashMap::new(),
             check_defs: HashMap::new(),
             type_subscript: HashMap::new(),

@@ -294,7 +294,15 @@ pub(crate) fn emit_constraints(
         }
     }
     for (c, local_names, default_name) in pending_fks {
-        super::foreign_keys::add_foreign_key(interp, relid, c, &local_names, default_name, true)?;
+        super::foreign_keys::add_foreign_key(
+            interp,
+            relid,
+            c,
+            &local_names,
+            default_name,
+            true,
+            true,
+        )?;
     }
     let _ = relname;
     Ok(())
@@ -1116,6 +1124,7 @@ pub(crate) fn drop_constraint(
     }
 
     interp.pg_constraint.remove(&oid);
+    super::foreign_keys::drop_fk_clones(interp, oid);
     Ok(())
 }
 
@@ -1394,7 +1403,15 @@ fn add_constraint_node(
             addition: crate::ddl::util::index_name_addition(&column_names),
             label: "fkey",
         };
-        super::foreign_keys::add_foreign_key(interp, relid, c, &column_names, default_name, false)?;
+        super::foreign_keys::add_foreign_key(
+            interp,
+            relid,
+            c,
+            &column_names,
+            default_name,
+            false,
+            rec.recurse,
+        )?;
     }
 
     Ok(())

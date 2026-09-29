@@ -194,6 +194,19 @@ pub(super) fn alter_constraint(
             alter.conname
         )));
     }
+    // A partition's clone of a partitioned table's foreign key is altered
+    // through the parent.
+    if let Some(parent) = foreign_keys::fk_parent(interp, con.oid) {
+        return Err(DdlError::Parse(format!(
+            "cannot alter constraint \"{}\" on relation \"{relname}\" (Constraint \"{}\" is \
+             derived from constraint \"{}\" of relation \"{}\". You may alter the constraint it \
+             derives from instead.)",
+            alter.conname,
+            alter.conname,
+            parent.conname,
+            relname_of(interp, parent.conrelid)
+        )));
+    }
     if alter.alter_inheritability && alter.noinherit && con.coninhcount > 0 {
         return Err(DdlError::Parse(format!(
             "cannot alter inherited constraint \"{}\" on relation \"{relname}\"",
@@ -202,11 +215,16 @@ pub(super) fn alter_constraint(
     }
     // AlterConstrUpdateConstraintEntry: a constraint made ENFORCED is
     // validated; a NOT ENFORCED one is not valid.
-    if alter.alter_enforceability
-        && let Some(c) = interp.pg_constraint.get_mut(&con.oid)
-    {
-        c.conenforced = alter.is_enforced;
-        c.convalidated = alter.is_enforced;
+    if alter.alter_enforceability {
+        let enforced = alter.is_enforced;
+        if let Some(c) = interp.pg_constraint.get_mut(&con.oid) {
+            c.conenforced = enforced;
+            c.convalidated = enforced;
+        }
+        foreign_keys::for_each_fk_clone(interp, con.oid, &|c| {
+            c.conenforced = enforced;
+            c.convalidated = enforced;
+        });
     }
     if alter.alter_inheritability {
         inherit::alter_not_null_inheritability(interp, &con, alter.noinherit)?;
@@ -278,9 +296,11 @@ pub(super) fn validate_constraint(
             Ok(())
         }
         _ => {
+            // QueueFKConstraintValidation: the partitions' clones too.
             if let Some(c) = interp.pg_constraint.get_mut(&con.oid) {
                 c.convalidated = true;
             }
+            foreign_keys::for_each_fk_clone(interp, con.oid, &|c| c.convalidated = true);
             Ok(())
         }
     }

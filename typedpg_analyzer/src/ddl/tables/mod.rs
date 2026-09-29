@@ -702,6 +702,13 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
     // expression must be assignable to the column's declared type.
     validate_constraint_expressions(interp, class_oid, &name, stmt)?;
 
+    // CloneForeignKeyConstraints: a partition gets its parent's foreign
+    // keys before its own constraints are added.
+    if stmt.partbound.is_some()
+        && let Some(&parent) = parents.first()
+    {
+        foreign_keys::clone_parent_fks(interp, parent, class_oid)?;
+    }
     // Emit pg_constraint rows so ON CONFLICT, DROP CASCADE, and FK
     // dependency checks can consult them later. FK validation runs here.
     emit_constraints(interp, class_oid, &name, stmt)?;
@@ -1155,7 +1162,7 @@ pub(crate) mod check_inherit;
 mod column_options;
 mod columns;
 mod constraints;
-mod foreign_keys;
+pub(crate) mod foreign_keys;
 mod generated;
 pub(crate) mod inherit;
 mod inherit_cmd;
