@@ -26,6 +26,8 @@ mod drop_objects;
 mod extensions;
 #[path = "ddl/functions.rs"]
 mod functions;
+#[path = "ddl/generated.rs"]
+mod generated;
 #[path = "ddl/misc.rs"]
 mod misc;
 #[path = "ddl/operators.rs"]

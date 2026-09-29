@@ -226,6 +226,11 @@ pub struct PgCatalog {
     /// column type that `cookDefault` adds) — what ALTER COLUMN TYPE
     /// re-coerces (PG keeps the expression in `pg_attrdef`).
     pub(crate) attr_default_types: HashMap<(PgClassOid, i16), PgTypeOid>,
+    /// The columns each generation expression reads, by the generated
+    /// column (PG records them as `pg_depend` rows of the column's
+    /// `pg_attrdef` entry): DROP COLUMN of such a column needs CASCADE and
+    /// takes the generated column along; ALTER COLUMN TYPE of it is refused.
+    pub(crate) generated_refs: HashMap<(PgClassOid, i16), Vec<i16>>,
     /// The `check_function_bodies` GUC (pg_dump output turns it off).
     pub(crate) check_function_bodies: bool,
     /// The single expression of each inlinable `LANGUAGE sql` function
@@ -551,6 +556,7 @@ impl PgCatalog {
             search_path_guc: Default::default(),
             domain_constraints: HashMap::new(),
             attr_default_types: HashMap::new(),
+            generated_refs: HashMap::new(),
             check_function_bodies: true,
             inline_sql_bodies: HashMap::new(),
             sql_function_defs: HashMap::new(),
@@ -1192,6 +1198,7 @@ impl PgCatalog {
     pub(crate) fn remove_pg_class(&mut self, oid: PgClassOid) -> Option<PgClass> {
         self.attr_default_types
             .retain(|(relid, _), _| *relid != oid);
+        self.generated_refs.retain(|(relid, _), _| *relid != oid);
         self.partition_keys.remove(&oid);
         self.triggers.remove(&oid);
         self.policies.remove(&oid);

@@ -26,13 +26,6 @@ pub(crate) fn serial_base_type(tn: &typedpg_pg_query::protobuf::TypeName) -> Opt
     }
 }
 
-/// Whether the column definition carries a constraint of kind `kind`.
-fn has_constraint(cd: &typedpg_pg_query::protobuf::ColumnDef, kind: ConstrType) -> bool {
-    cd.constraints.iter().any(
-        |n| matches!(n.node.as_ref(), Some(node::Node::Constraint(c)) if c.contype == kind as i32),
-    )
-}
-
 /// The DEFAULT expression written on a column definition, if any.
 pub(crate) fn column_default_expr(
     cd: &typedpg_pg_query::protobuf::ColumnDef,
@@ -47,23 +40,50 @@ pub(crate) fn column_default_expr(
     })
 }
 
+/// Where a column definition is being transformed
+/// (`CreateStmtContext`): a typed table (`OF type`), a partition, a
+/// partitioned table.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ColumnContext {
+    pub(crate) of_type: bool,
+    pub(crate) partbound: bool,
+    pub(crate) partitioned: bool,
+}
+
 /// Parse a `ColumnDef` AST node into a `ParsedColumn` (shared between
-/// CREATE TABLE and ALTER TABLE ADD COLUMN paths).
+/// CREATE TABLE and ALTER TABLE ADD COLUMN paths). Ports
+/// `transformColumnDefinition` (parse_utilcmd.c): the column's constraint
+/// clauses are processed in order, and each conflicting combination is
+/// reported where PG reports it.
 pub(crate) fn parse_column_def(
     interp: &PgCatalog,
     relname: &str,
     cd: &typedpg_pg_query::protobuf::ColumnDef,
     pk_columns: &[String],
+    cx: ColumnContext,
 ) -> Result<ParsedColumn, DdlError> {
+    use crate::pg_catalog::oid;
     // Detect SERIAL/BIGSERIAL/SMALLSERIAL from type name — typedpg_pg_query keeps the
     // original name and does NOT rewrite to int4 + nextval(...).
     let serial_type = cd.type_name.as_ref().and_then(serial_base_type);
     let is_serial = serial_type.is_some();
+    if let Some(tn) = cd.type_name.as_ref()
+        && !tn.array_bounds.is_empty()
+        && serial_base_type(&typedpg_pg_query::protobuf::TypeName {
+            array_bounds: Vec::new(),
+            ..tn.clone()
+        })
+        .is_some()
+    {
+        return Err(DdlError::UnsupportedDdl(
+            "array of serial is not implemented".into(),
+        ));
+    }
 
     let type_oid = match (serial_type, cd.type_name.as_ref()) {
         (Some(oid), _) => oid,
         (None, Some(tn)) => lookup_type_name(tn, interp)?,
-        (None, None) => crate::pg_catalog::oid::UNKNOWN,
+        (None, None) => oid::UNKNOWN,
     };
 
     // Encode any `(n)` / `(p,s)` modifier sitting next to the type name.
@@ -73,138 +93,203 @@ pub(crate) fn parse_column_def(
         None => None,
     };
 
-    let mut not_null = cd.is_not_null;
-    let mut has_default = cd.raw_default.is_some() || cd.cooked_default.is_some();
-    let mut is_generated = false;
-
-    // `transformColumnDefinition`: a serial column is its integer type
-    // with `DEFAULT nextval(...)` from an owned sequence and NOT NULL.
+    // transformConstraintAttrs, then the constraints; a serial column gets
+    // a trailing `DEFAULT nextval(...)` so a conflicting DEFAULT /
+    // GENERATED clause is detected.
+    let mut constraints = fold_constraint_attrs(&cd.constraints)?;
+    let mut need_notnull = false;
+    let mut disallow_noinherit_notnull = false;
     if is_serial {
-        has_default = true;
-        not_null = true;
+        constraints.push(typedpg_pg_query::protobuf::Constraint {
+            contype: ConstrType::ConstrDefault as i32,
+            ..Default::default()
+        });
+        need_notnull = true;
+        disallow_noinherit_notnull = true;
+    }
+    if constraints.iter().any(|c| {
+        matches!(
+            ConstrType::try_from(c.contype),
+            Ok(ConstrType::ConstrIdentity | ConstrType::ConstrPrimary)
+        )
+    }) {
+        disallow_noinherit_notnull = true;
     }
 
-    let mut identity: Option<AttIdentity> = None;
-    if !cd.identity.is_empty() {
-        has_default = true;
-        not_null = true;
-        identity = match cd.identity.as_str() {
-            "a" => Some(AttIdentity::Always),
-            "d" => Some(AttIdentity::ByDefault),
-            _ => None,
-        };
-    }
-
-    if !cd.generated.is_empty() {
-        has_default = true;
-        is_generated = true;
-    }
-
-    let mut nn_name: Option<String> = None;
-    let mut saw_null = false;
-    let mut saw_not_null = cd.is_not_null;
-    let mut identity_options = Vec::new();
-    for c_node in &cd.constraints {
-        if let Some(node::Node::Constraint(c)) = c_node.node.as_ref() {
-            match ConstrType::try_from(c.contype) {
-                Ok(ConstrType::ConstrNotnull) => {
-                    not_null = true;
-                    saw_not_null = true;
-                    if !c.conname.is_empty() {
-                        nn_name = Some(c.conname.clone());
-                    }
-                }
-                Ok(ConstrType::ConstrNull) => saw_null = true,
-                Ok(ConstrType::ConstrPrimary) => {
-                    not_null = true;
-                }
-                Ok(ConstrType::ConstrDefault) => {
-                    has_default = true;
-                }
-                Ok(ConstrType::ConstrIdentity) => {
-                    has_default = true;
-                    not_null = true;
-                    identity_options.clone_from(&c.options);
-                    if identity.is_none() {
-                        identity = match c.generated_when.as_str() {
-                            // PG `ATTRIBUTE_IDENTITY_ALWAYS` is `'a'`,
-                            // `ATTRIBUTE_IDENTITY_BY_DEFAULT` is `'d'`.
-                            "a" => Some(AttIdentity::Always),
-                            "d" => Some(AttIdentity::ByDefault),
-                            // Default to BY DEFAULT when unspecified, matching
-                            // `GENERATED AS IDENTITY` shorthand semantics in
-                            // some grammars; PG itself always emits one of the
-                            // two so this is just a defensive fallback.
-                            _ => Some(AttIdentity::ByDefault),
-                        };
-                    }
-                }
-                Ok(ConstrType::ConstrGenerated) => {
-                    has_default = true;
-                    is_generated = true;
-                    if let Some(expr) = c.raw_expr.as_deref() {
-                        crate::ddl::volatile::check_no_volatile(
-                            expr,
-                            crate::ddl::volatile::ExprLocation::Generated,
-                            interp,
-                        )?;
-                    }
-                }
-                // No CHECK volatility check here — PG accepts the DDL even
-                // when the predicate calls a VOLATILE function (it only
-                // complains at runtime).
-                _ => {}
-            }
-        }
-    }
-
-    // transformColumnDefinition: at most one of DEFAULT / GENERATED ... AS
-    // (expr) / GENERATED ... AS IDENTITY, and an identity column's type must
-    // suit a sequence (init_params).
-    let saw_default = cd.raw_default.is_some()
-        || cd.cooked_default.is_some()
-        || has_constraint(cd, ConstrType::ConstrDefault);
-    let saw_generated = !cd.generated.is_empty() || has_constraint(cd, ConstrType::ConstrGenerated);
-    let saw_identity = !cd.identity.is_empty() || has_constraint(cd, ConstrType::ConstrIdentity);
-    let both = |what: &str| {
+    let colname = &cd.colname;
+    let conflicting_null = || {
         DdlError::Parse(format!(
-            "both {what} specified for column \"{}\" of table \"{relname}\"",
-            cd.colname
+            "conflicting NULL/NOT NULL declarations for column \"{colname}\" of table \"{relname}\""
         ))
     };
-    if saw_default && saw_identity {
-        return Err(both("default and identity"));
+    let conflicting_no_inherit = || {
+        DdlError::Parse(format!(
+            "conflicting NO INHERIT declarations for not-null constraints on column \"{colname}\""
+        ))
+    };
+    let both = |what: &str| {
+        DdlError::Parse(format!(
+            "both {what} specified for column \"{colname}\" of table \"{relname}\""
+        ))
+    };
+
+    let mut is_not_null = false;
+    let mut saw_nullable = false;
+    let mut saw_default = false;
+    let mut saw_identity = false;
+    let mut saw_generated = false;
+    // The column's not-null constraint: (name, NO INHERIT).
+    let mut notnull: Option<(Option<String>, bool)> = None;
+    let mut identity: Option<AttIdentity> = None;
+    let mut generated: Option<AttGenerated> = None;
+    let mut identity_options = Vec::new();
+    for c in &constraints {
+        match ConstrType::try_from(c.contype) {
+            Ok(ConstrType::ConstrNull) => {
+                if (saw_nullable && is_not_null) || need_notnull {
+                    return Err(conflicting_null());
+                }
+                is_not_null = false;
+                saw_nullable = true;
+            }
+            Ok(ConstrType::ConstrNotnull) => {
+                if cx.partitioned && c.is_no_inherit {
+                    return Err(DdlError::UnsupportedDdl(
+                        "not-null constraints on partitioned tables cannot be NO INHERIT".into(),
+                    ));
+                }
+                if saw_nullable && !is_not_null {
+                    return Err(conflicting_null());
+                }
+                if disallow_noinherit_notnull && c.is_no_inherit {
+                    return Err(conflicting_no_inherit());
+                }
+                let name = (!c.conname.is_empty()).then(|| c.conname.clone());
+                match notnull.as_mut() {
+                    None => {
+                        is_not_null = true;
+                        saw_nullable = true;
+                        need_notnull = false;
+                        notnull = Some((name, c.is_no_inherit));
+                    }
+                    Some((existing, no_inherit)) => {
+                        if let (Some(a), Some(b)) = (existing.as_ref(), name.as_ref())
+                            && a != b
+                        {
+                            return Err(DdlError::Parse(format!(
+                                "conflicting not-null constraint names \"{a}\" and \"{b}\""
+                            )));
+                        }
+                        if *no_inherit != c.is_no_inherit {
+                            return Err(conflicting_no_inherit());
+                        }
+                        if existing.is_none() {
+                            *existing = name;
+                        }
+                    }
+                }
+            }
+            Ok(ConstrType::ConstrDefault) => {
+                if saw_default {
+                    return Err(DdlError::Parse(format!(
+                        "multiple default values specified for column \"{colname}\" of table \"{relname}\""
+                    )));
+                }
+                saw_default = true;
+            }
+            Ok(ConstrType::ConstrIdentity) => {
+                if cx.of_type {
+                    return Err(DdlError::UnsupportedDdl(
+                        "identity columns are not supported on typed tables".into(),
+                    ));
+                }
+                if cx.partbound {
+                    return Err(DdlError::UnsupportedDdl(
+                        "identity columns are not supported on partitions".into(),
+                    ));
+                }
+                if saw_identity {
+                    return Err(DdlError::Parse(format!(
+                        "multiple identity specifications for column \"{colname}\" of table \"{relname}\""
+                    )));
+                }
+                // generateSerialExtraStmts → init_params: the sequence's type.
+                if !matches!(type_oid, oid::INT2 | oid::INT4 | oid::INT8) {
+                    return Err(DdlError::Parse(
+                        "identity column type must be smallint, integer, or bigint".into(),
+                    ));
+                }
+                identity_options.clone_from(&c.options);
+                // PG `ATTRIBUTE_IDENTITY_ALWAYS` is `'a'`,
+                // `ATTRIBUTE_IDENTITY_BY_DEFAULT` is `'d'`.
+                identity = Some(match c.generated_when.as_str() {
+                    "a" => AttIdentity::Always,
+                    _ => AttIdentity::ByDefault,
+                });
+                saw_identity = true;
+                if !saw_nullable {
+                    need_notnull = true;
+                } else if !is_not_null {
+                    return Err(conflicting_null());
+                }
+            }
+            Ok(ConstrType::ConstrGenerated) => {
+                if cx.of_type {
+                    return Err(DdlError::UnsupportedDdl(
+                        "generated columns are not supported on typed tables".into(),
+                    ));
+                }
+                if saw_generated {
+                    return Err(DdlError::Parse(format!(
+                        "multiple generation clauses specified for column \"{colname}\" of table \"{relname}\""
+                    )));
+                }
+                // gram.y's opt_virtual_or_stored: VIRTUAL unless STORED.
+                generated = Some(if c.generated_kind == "s" {
+                    AttGenerated::Stored
+                } else {
+                    AttGenerated::Virtual
+                });
+                if let Some(expr) = c.raw_expr.as_deref() {
+                    crate::ddl::volatile::check_no_volatile(
+                        expr,
+                        crate::ddl::volatile::ExprLocation::Generated,
+                        interp,
+                    )?;
+                }
+                saw_generated = true;
+            }
+            Ok(ConstrType::ConstrPrimary) => {
+                if saw_nullable && !is_not_null {
+                    return Err(conflicting_null());
+                }
+                need_notnull = true;
+            }
+            // CHECK, UNIQUE and FOREIGN KEY are processed with the table's
+            // constraints.
+            _ => {}
+        }
+        if saw_default && saw_identity {
+            return Err(both("default and identity"));
+        }
+        if saw_default && saw_generated {
+            return Err(both("default and generation expression"));
+        }
+        if saw_identity && saw_generated {
+            return Err(both("identity and generation expression"));
+        }
     }
-    if saw_default && saw_generated {
-        return Err(both("default and generation expression"));
-    }
-    if saw_identity && saw_generated {
-        return Err(both("identity and generation expression"));
-    }
-    if saw_identity
-        && !matches!(
-            type_oid,
-            crate::pg_catalog::oid::INT2
-                | crate::pg_catalog::oid::INT4
-                | crate::pg_catalog::oid::INT8
-        )
-    {
-        return Err(DdlError::Parse(
-            "identity column type must be smallint, integer, or bigint".into(),
-        ));
+    // A not-null constraint for PRIMARY KEY, SERIAL or IDENTITY.
+    if need_notnull && !(saw_nullable && is_not_null) {
+        is_not_null = true;
+        notnull = Some((None, false));
     }
 
-    // transformColumnDefinition rejects `NULL` together with `NOT NULL`.
-    if saw_null && saw_not_null {
-        return Err(DdlError::Parse(format!(
-            "conflicting NULL/NOT NULL declarations for column \"{}\" of table \"{relname}\"",
-            cd.colname
-        )));
-    }
-
-    if pk_columns.iter().any(|pk| pk == &cd.colname) {
+    let mut not_null = is_not_null;
+    if pk_columns.iter().any(|pk| pk == colname) {
         not_null = true;
     }
+    let (nn_name, nn_no_inherit) = notnull.unwrap_or((None, false));
 
     // `COLLATE "name"` decoration on the column: PG rejects unknown names
     // and non-collatable types. The collation oid lands on pg_attribute.
@@ -216,8 +301,8 @@ pub(crate) fn parse_column_def(
         type_oid,
         typmod,
         not_null,
-        has_default,
-        is_generated,
+        has_default: saw_default || saw_identity || saw_generated,
+        generated,
         identity,
         collation,
         owned_sequence: if identity.is_some() {
@@ -230,6 +315,7 @@ pub(crate) fn parse_column_def(
         identity_options,
         nn_local: not_null,
         nn_name,
+        nn_no_inherit,
         nn_inhcount: 0,
         nn_inh_name: None,
         is_local: true,
@@ -437,7 +523,11 @@ fn add_column_to(
         ));
     }
 
-    let col = parse_column_def(interp, &relname_of(interp, relid), cd, &[])?;
+    let cx = ColumnContext {
+        partitioned: interp.pg_class.get(&relid).map(|c| c.relkind) == Some(RelKind::Partitioned),
+        ..ColumnContext::default()
+    };
+    let col = parse_column_def(interp, &relname_of(interp, relid), cd, &[], cx)?;
     let default_type = match column_default_expr(cd) {
         Some(expr) => Some(crate::ddl::defaults::check_default(
             interp,
@@ -482,6 +572,10 @@ fn add_column_to(
         )));
     }
 
+    // ATExecAddColumn: CheckAttributeType.
+    if col.generated == Some(AttGenerated::Virtual) {
+        super::generated::check_virtual_column_type(interp, &col.name, col.type_oid)?;
+    }
     let next_attnum = interp
         .attributes_of(relid)
         .iter()
@@ -496,7 +590,7 @@ fn add_column_to(
         attnum: next_attnum,
         attnotnull: false,
         atthasdef: col.has_default,
-        attgenerated: col.is_generated.then_some(AttGenerated::Stored),
+        attgenerated: col.generated,
         atttypmod: col.typmod,
         // Identity is not inherited by regular children.
         attidentity: col.identity.filter(|_| !rec.recursing),
@@ -538,25 +632,22 @@ fn add_column_to(
             &col.identity_options,
         )?;
     }
-    if !rec.recursing {
-        // The generation expression, now that the column exists.
-        for c_node in &cd.constraints {
-            if let Some(node::Node::Constraint(c)) = c_node.node.as_ref()
-                && c.contype == ConstrType::ConstrGenerated as i32
-                && let Some(expr) = c.raw_expr.as_deref()
-            {
-                crate::ddl::expr_kind::check_expr_kind(
-                    interp,
-                    expr,
-                    crate::ddl::expr_kind::ExprKind::GeneratedColumn,
-                )?;
-                crate::ddl::volatile::check_mutability(
-                    interp,
-                    relid,
-                    expr,
-                    crate::ddl::volatile::ExprLocation::Generated,
-                )?;
-            }
+    // The generation expression, now that the column exists.
+    for c_node in &cd.constraints {
+        if let Some(node::Node::Constraint(c)) = c_node.node.as_ref()
+            && c.contype == ConstrType::ConstrGenerated as i32
+            && let Some(expr) = c.raw_expr.as_deref()
+            && let Some(kind) = col.generated
+        {
+            let cooked = super::generated::cook_generation_expr(
+                interp,
+                relid,
+                &col.name,
+                col.type_oid,
+                kind,
+                expr,
+            )?;
+            cooked.record(interp, relid, next_attnum);
         }
     }
     for child in children {
@@ -623,6 +714,46 @@ pub(crate) fn drop_column(
             view_names.join(", "),
         )));
     }
+
+    // A generated column reading this one depends on it (through its
+    // pg_attrdef entry): it needs CASCADE, and goes with it.
+    let generated_dependents: Vec<String> = {
+        let mut deps: Vec<(i16, String)> = interp
+            .generated_refs
+            .iter()
+            .filter(|((rel, attnum), refs)| {
+                *rel == relid && *attnum != target.attnum && refs.contains(&target.attnum)
+            })
+            .filter_map(|((_, attnum), _)| {
+                interp
+                    .attributes_of(relid)
+                    .iter()
+                    .find(|a| a.attnum == *attnum)
+                    .map(|a| (a.attnum, a.attname.clone()))
+            })
+            .collect();
+        deps.sort();
+        deps.into_iter().map(|(_, name)| name).collect()
+    };
+    if let Some(first) = generated_dependents.first()
+        && !cascade
+    {
+        let relname = relname_of(interp, relid);
+        return Err(DdlError::DependencyError(format!(
+            "cannot drop column {} of table {relname} because other objects depend on it \
+             (column {first} of table {relname} depends on column {} of table {relname})",
+            cmd.name, cmd.name,
+        )));
+    }
+    for dependent in &generated_dependents {
+        let drop_dependent = AlterTableCmd {
+            name: dependent.clone(),
+            missing_ok: true,
+            ..cmd.clone()
+        };
+        drop_column(interp, relid, &drop_dependent, rec)?;
+    }
+    interp.generated_refs.remove(&(relid, target.attnum));
 
     // Resolve the column's attnum *before* we touch anything — both the
     // FK protection and the children-cascade need it.
@@ -778,6 +909,35 @@ pub(crate) fn set_default(
     rec: inherit::Recursion,
 ) -> Result<(), DdlError> {
     let attr = interp.attribute_by_name(relid, &cmd.name).cloned();
+    // ATExecColumnDefault: an identity or generated column's default is
+    // its identity / generation expression.
+    if let Some(attr) = &attr {
+        let relname = relname_of(interp, relid);
+        if attr.attidentity.is_some() {
+            let hint = if cmd.def.is_none() {
+                " (Use ALTER TABLE ... ALTER COLUMN ... DROP IDENTITY instead.)"
+            } else {
+                ""
+            };
+            return Err(DdlError::Parse(format!(
+                "column \"{}\" of relation \"{relname}\" is an identity column{hint}",
+                cmd.name
+            )));
+        }
+        if let Some(kind) = attr.attgenerated {
+            let hint = match (cmd.def.is_some(), kind) {
+                (true, _) => " (Use ALTER TABLE ... ALTER COLUMN ... SET EXPRESSION instead.)",
+                (false, AttGenerated::Stored) => {
+                    " (Use ALTER TABLE ... ALTER COLUMN ... DROP EXPRESSION instead.)"
+                }
+                (false, AttGenerated::Virtual) => "",
+            };
+            return Err(DdlError::Parse(format!(
+                "column \"{}\" of relation \"{relname}\" is a generated column{hint}",
+                cmd.name
+            )));
+        }
+    }
     if let Some(attr) = &attr {
         match cmd.def.as_deref() {
             Some(expr) => {
@@ -836,6 +996,18 @@ pub(crate) fn alter_column_type(
     let Some(node::Node::ColumnDef(cd)) = def.node.as_ref() else {
         return Ok(());
     };
+    // ATPrepAlterColumnType: USING would contradict the generation
+    // expression.
+    if let Some(attr) = interp.attribute_by_name(relid, &cmd.name)
+        && attr.attgenerated.is_some()
+        && cd.raw_default.is_some()
+    {
+        return Err(DdlError::Parse(format!(
+            "cannot specify USING when altering type of generated column (Column \"{}\" is a \
+             generated column.)",
+            cmd.name
+        )));
+    }
     if let Some(attr) = interp.attribute_by_name(relid, &cmd.name)
         && !rec.recursing
         && attr.attinhcount > 0
@@ -909,9 +1081,14 @@ pub(crate) fn alter_column_type(
     let new_collation = column_collation(interp, cd, new_type_oid)?
         .or_else(|| type_collation(interp, new_type_oid));
 
+    // CheckAttributeType(..., CHKATYPE_IS_VIRTUAL).
+    if attr.attgenerated == Some(AttGenerated::Virtual) {
+        super::generated::check_virtual_column_type(interp, &cmd.name, new_type_oid)?;
+    }
     // ATPrepAlterColumnType: the old value (or the USING expression) must
-    // be assignment-coercible to the new type.
-    if !rec.recursing {
+    // be assignment-coercible to the new type — a virtual column stores
+    // none.
+    if !rec.recursing && attr.attgenerated != Some(AttGenerated::Virtual) {
         match cd.raw_default.as_deref() {
             Some(using) => check_using_expression(interp, relid, &attr, using, new_type_oid)?,
             None => {
@@ -939,10 +1116,37 @@ pub(crate) fn alter_column_type(
             interp,
         )
     {
+        let what = if attr.attgenerated.is_some() {
+            "generation expression"
+        } else {
+            "default"
+        };
         return Err(DdlError::Parse(format!(
-            "default for column \"{}\" cannot be cast automatically to type {}",
+            "{what} for column \"{}\" cannot be cast automatically to type {}",
             cmd.name,
             format_type_for_message(interp, new_type_oid)
+        )));
+    }
+    // RememberAllDependentForRebuilding: a generated column reading this
+    // one pins its type.
+    if let Some(((_, generated), _)) = interp
+        .generated_refs
+        .iter()
+        .filter(|((rel, gen_attnum), refs)| {
+            *rel == relid && *gen_attnum != attr.attnum && refs.contains(&attr.attnum)
+        })
+        .min_by_key(|((_, gen_attnum), _)| *gen_attnum)
+    {
+        let generated_name = interp
+            .attributes_of(relid)
+            .iter()
+            .find(|a| a.attnum == *generated)
+            .map(|a| a.attname.clone())
+            .unwrap_or_default();
+        return Err(DdlError::UnsupportedDdl(format!(
+            "cannot alter type of a column used by a generated column (Column \"{}\" is used \
+             by generated column \"{generated_name}\".)",
+            cmd.name
         )));
     }
 
@@ -1111,19 +1315,26 @@ pub(crate) fn column_collation(
     Ok(Some(resolved.oid))
 }
 
-/// The generated column `name` of `relid`, or PG's `column "x" of relation
-/// "t" is not a generated column` (`ATExecDropExpression` /
-/// `ATExecSetExpression`).
-fn generated_column(
+/// The column `name` of `relid` for an ALTER COLUMN subcommand: PG's
+/// `column "x" of relation "t" does not exist`, or `cannot alter system
+/// column` for a system column.
+fn alter_target_column(
     interp: &PgCatalog,
     relid: PgClassOid,
     name: &str,
-) -> Result<Option<PgAttribute>, DdlError> {
-    let attr = interp
-        .attribute_by_name(relid, name)
-        .cloned()
-        .ok_or_else(|| DdlError::Parse(column_not_found_msg(interp, relid, name)))?;
-    Ok(attr.attgenerated.is_some().then_some(attr))
+) -> Result<PgAttribute, DdlError> {
+    if let Some(attr) = interp.attribute_by_name(relid, name) {
+        return Ok(attr.clone());
+    }
+    if crate::pg_catalog::SYSTEM_COLUMNS
+        .iter()
+        .any(|(n, ..)| *n == name)
+    {
+        return Err(DdlError::UnsupportedDdl(format!(
+            "cannot alter system column \"{name}\""
+        )));
+    }
+    Err(DdlError::Parse(column_not_found_msg(interp, relid, name)))
 }
 
 fn not_generated_msg(interp: &PgCatalog, relid: PgClassOid, name: &str) -> String {
@@ -1133,30 +1344,59 @@ fn not_generated_msg(interp: &PgCatalog, relid: PgClassOid, name: &str) -> Strin
     )
 }
 
-/// `ALTER COLUMN c DROP EXPRESSION [IF EXISTS]`: the column keeps its
-/// current values and becomes an ordinary column without a default; the
-/// change reaches the children too.
+/// `ALTER COLUMN c DROP EXPRESSION [IF EXISTS]` (`ATPrepDropExpression` /
+/// `ATExecDropExpression`): the column keeps its current values and becomes
+/// an ordinary column without a default; the change reaches the children
+/// too, and `ONLY` is refused while there are any. An inherited column
+/// keeps its parent's expression, and a virtual column has no values to
+/// keep.
 pub(crate) fn drop_expression(
     interp: &mut PgCatalog,
     relid: PgClassOid,
     cmd: &AlterTableCmd,
     rec: inherit::Recursion,
 ) -> Result<(), DdlError> {
-    let Some(attr) = generated_column(interp, relid, &cmd.name)? else {
-        if cmd.missing_ok {
-            return Ok(());
-        }
-        return Err(DdlError::Parse(not_generated_msg(interp, relid, &cmd.name)));
-    };
-    if let Some(attrs) = interp.pg_attribute.get_mut(&relid)
-        && let Some(a) = attrs.iter_mut().find(|a| a.attnum == attr.attnum)
-    {
-        a.attgenerated = None;
-        a.atthasdef = false;
+    let children = inherit::children_of(interp, relid);
+    if !rec.recurse && !rec.recursing && !children.is_empty() {
+        return Err(DdlError::UnsupportedDdl(
+            "ALTER TABLE / DROP EXPRESSION must be applied to child tables too".into(),
+        ));
     }
-    interp.attr_default_types.remove(&(relid, attr.attnum));
+    if !rec.recursing {
+        let attr = interp
+            .attribute_by_name(relid, &cmd.name)
+            .ok_or_else(|| DdlError::Parse(column_not_found_msg(interp, relid, &cmd.name)))?;
+        if attr.attinhcount > 0 {
+            return Err(DdlError::Parse(
+                "cannot drop generation expression from inherited column".into(),
+            ));
+        }
+    }
+    let attr = alter_target_column(interp, relid, &cmd.name)?;
+    let relname = relname_of(interp, relid);
+    match attr.attgenerated {
+        Some(AttGenerated::Virtual) => {
+            return Err(DdlError::UnsupportedDdl(format!(
+                "ALTER TABLE / DROP EXPRESSION is not supported for virtual generated columns \
+                 (Column \"{}\" of relation \"{relname}\" is a virtual generated column.)",
+                cmd.name
+            )));
+        }
+        None if cmd.missing_ok => {}
+        None => return Err(DdlError::Parse(not_generated_msg(interp, relid, &cmd.name))),
+        Some(AttGenerated::Stored) => {
+            if let Some(attrs) = interp.pg_attribute.get_mut(&relid)
+                && let Some(a) = attrs.iter_mut().find(|a| a.attnum == attr.attnum)
+            {
+                a.attgenerated = None;
+                a.atthasdef = false;
+            }
+            interp.attr_default_types.remove(&(relid, attr.attnum));
+            interp.generated_refs.remove(&(relid, attr.attnum));
+        }
+    }
     if rec.recurse {
-        for child in inherit::children_of(interp, relid) {
+        for child in children {
             if interp.attribute_by_name(child, &cmd.name).is_some() {
                 drop_expression(interp, child, cmd, rec.child())?;
             }
@@ -1165,37 +1405,59 @@ pub(crate) fn drop_expression(
     Ok(())
 }
 
-/// `ALTER COLUMN c SET EXPRESSION AS (expr)`: only for a generated column;
-/// the new expression, evaluated over the row, must suit the column type.
+/// `ALTER COLUMN c SET EXPRESSION AS (expr)` (`ATExecSetExpression`): only
+/// for a generated column, and — until PG rechecks the constraints and row
+/// filters over the new values — not for a virtual one of a table with CHECK
+/// constraints or in a publication. The new expression is cooked like the
+/// original one (`cookDefault`); the change reaches the children.
 pub(crate) fn set_expression(
     interp: &mut PgCatalog,
     relid: PgClassOid,
     cmd: &AlterTableCmd,
     rec: inherit::Recursion,
 ) -> Result<(), DdlError> {
-    let Some(attr) = generated_column(interp, relid, &cmd.name)? else {
+    let attr = alter_target_column(interp, relid, &cmd.name)?;
+    let Some(kind) = attr.attgenerated else {
         return Err(DdlError::Parse(not_generated_msg(interp, relid, &cmd.name)));
     };
-    if !rec.recursing
-        && let Some(expr) = cmd.def.as_deref()
+    let relname = relname_of(interp, relid);
+    let virtual_detail = || {
+        format!(
+            "(Column \"{}\" of relation \"{relname}\" is a virtual generated column.)",
+            cmd.name
+        )
+    };
+    if kind == AttGenerated::Virtual
+        && interp
+            .pg_constraint
+            .values()
+            .any(|c| c.conrelid == relid && c.contype == ConType::Check)
     {
-        crate::ddl::expr_kind::check_expr_kind(
-            interp,
-            expr,
-            crate::ddl::expr_kind::ExprKind::GeneratedColumn,
-        )?;
-        crate::ddl::volatile::check_no_volatile(
-            expr,
-            crate::ddl::volatile::ExprLocation::Generated,
-            interp,
-        )?;
-        check_generation_expression(interp, relid, &attr, expr)?;
-        crate::ddl::volatile::check_mutability(
+        return Err(DdlError::UnsupportedDdl(format!(
+            "ALTER TABLE / SET EXPRESSION is not supported for virtual generated columns in \
+             tables with check constraints {}",
+            virtual_detail()
+        )));
+    }
+    if kind == AttGenerated::Virtual
+        && crate::ddl::publications::relation_in_publication(interp, relid)
+    {
+        return Err(DdlError::UnsupportedDdl(format!(
+            "ALTER TABLE / SET EXPRESSION is not supported for virtual generated columns in \
+             tables that are part of a publication {}",
+            virtual_detail()
+        )));
+    }
+    if let Some(expr) = cmd.def.as_deref() {
+        let cooked = super::generated::cook_generation_expr(
             interp,
             relid,
+            &attr.attname,
+            attr.atttypid,
+            kind,
             expr,
-            crate::ddl::volatile::ExprLocation::Generated,
         )?;
+        cooked.record(interp, relid, attr.attnum);
     }
     if rec.recurse {
         for child in inherit::children_of(interp, relid) {
@@ -1203,71 +1465,6 @@ pub(crate) fn set_expression(
                 set_expression(interp, child, cmd, rec.child())?;
             }
         }
-    }
-    Ok(())
-}
-
-/// A generation expression over the table's row must yield the column's
-/// type (`cookDefault` for generated columns): an untyped literal goes
-/// through the type's input, anything else must be assignment-coercible.
-fn check_generation_expression(
-    interp: &PgCatalog,
-    relid: PgClassOid,
-    attr: &PgAttribute,
-    expr: &typedpg_pg_query::protobuf::Node,
-) -> Result<(), DdlError> {
-    use crate::expr::{TypeGoal, infer_expr};
-    use crate::nullability::NullabilityContext;
-    use crate::param_collector::ParamCollector;
-    use crate::scope::Scope;
-
-    let relname = relname_of(interp, relid);
-    let nspname = interp
-        .pg_class
-        .get(&relid)
-        .and_then(|c| interp.namespace_name(c.relnamespace))
-        .unwrap_or("public")
-        .to_owned();
-    let attrs = interp.attributes_of(relid).to_vec();
-    let mut scope = Scope::default();
-    scope.add_dml_target(
-        interp,
-        &relname,
-        QualifiedName::new(nspname, relname.clone()),
-        &attrs,
-    );
-    let null_ctx = NullabilityContext::default();
-    let mut params = ParamCollector::default();
-    let wrap = |e: crate::error::AnalyzeError| DdlError::UnsupportedDdl(format!("{e}"));
-    let result = infer_expr(
-        expr,
-        crate::expr::Ctx::new(&scope, &null_ctx, interp),
-        &mut params,
-        TypeGoal::NONE,
-    )
-    .map_err(wrap)?;
-    if result.type_oid == crate::pg_catalog::oid::UNKNOWN {
-        infer_expr(
-            expr,
-            crate::expr::Ctx::new(&scope, &null_ctx, interp),
-            &mut params,
-            TypeGoal::assignment(attr.atttypid),
-        )
-        .map_err(wrap)?;
-        return Ok(());
-    }
-    if !crate::coerce::can_coerce(
-        result.type_oid,
-        attr.atttypid,
-        crate::coerce::CoercionContext::Assignment,
-        interp,
-    ) {
-        return Err(DdlError::UnsupportedDdl(format!(
-            "column \"{}\" is of type {} but default expression is of type {}",
-            attr.attname,
-            format_type_for_message(interp, attr.atttypid),
-            format_type_for_message(interp, result.type_oid)
-        )));
     }
     Ok(())
 }

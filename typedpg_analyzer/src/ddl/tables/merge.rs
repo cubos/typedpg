@@ -54,6 +54,11 @@ pub(crate) fn assemble_columns(
 ) -> Result<AssembledColumns, DdlError> {
     let is_partition = stmt.partbound.is_some();
     let relname = stmt.relation.as_ref().map_or("", |rv| rv.relname.as_str());
+    let cx = ColumnContext {
+        of_type: stmt.of_typename.is_some(),
+        partbound: is_partition,
+        partitioned: stmt.partspec.is_some(),
+    };
     let mut entries: Vec<Entry> = Vec::new();
     let mut likes: Vec<LikeCopy> = Vec::new();
 
@@ -64,7 +69,7 @@ pub(crate) fn assemble_columns(
     for elt in &stmt.table_elts {
         match elt.node.as_ref() {
             Some(node::Node::ColumnDef(cd)) => entries.push(Entry {
-                col: parse_column_def(interp, relname, cd, pk_columns)?,
+                col: parse_column_def(interp, relname, cd, pk_columns, cx)?,
                 has_type: cd.type_name.is_some(),
                 is_from_type: false,
             }),
@@ -101,11 +106,12 @@ pub(crate) fn assemble_columns(
             let target = &mut entries[i];
             target.col.not_null = opt.not_null;
             target.col.has_default = opt.has_default;
-            target.col.is_generated = opt.is_generated;
+            target.col.generated = opt.generated;
             target.col.identity = opt.identity;
             target.col.owned_sequence = opt.owned_sequence;
             target.col.nn_local = opt.nn_local;
             target.col.nn_name = opt.nn_name;
+            target.col.nn_no_inherit = opt.nn_no_inherit;
             target.is_from_type = false;
         }
         i += 1;
@@ -162,13 +168,14 @@ fn of_type_columns(
                 typmod: attr.atttypmod,
                 not_null: false,
                 has_default: false,
-                is_generated: false,
+                generated: None,
                 identity: None,
                 collation: attr.attcollation,
                 owned_sequence: None,
                 identity_options: Vec::new(),
                 nn_local: false,
                 nn_name: None,
+                nn_no_inherit: false,
                 nn_inhcount: 0,
                 nn_inh_name: None,
                 is_local: true,
@@ -210,7 +217,7 @@ fn expand_like(
     };
     let opts = lc.options;
     for attr in interp.attributes_of(source) {
-        let generated = attr.attgenerated.is_some() && opts & LIKE_GENERATED != 0;
+        let generated = attr.attgenerated.filter(|_| opts & LIKE_GENERATED != 0);
         let identity = attr.attidentity.filter(|_| opts & LIKE_IDENTITY != 0);
         let plain_default = attr.atthasdef
             && attr.attgenerated.is_none()
@@ -222,8 +229,8 @@ fn expand_like(
                 type_oid: attr.atttypid,
                 typmod: attr.atttypmod,
                 not_null: copy_not_null && attr.attnotnull,
-                has_default: plain_default || generated || identity.is_some(),
-                is_generated: generated,
+                has_default: plain_default || generated.is_some() || identity.is_some(),
+                generated,
                 identity,
                 collation: attr.attcollation,
                 owned_sequence: identity.map(|_| crate::pg_catalog::DepType::Internal),
@@ -238,6 +245,7 @@ fn expand_like(
                     .unwrap_or_default(),
                 nn_local: copy_not_null && attr.attnotnull,
                 nn_name: None,
+                nn_no_inherit: false,
                 nn_inhcount: 0,
                 nn_inh_name: None,
                 is_local: true,
@@ -343,7 +351,7 @@ fn inherited_columns(
                 }
                 existing.not_null |= attr.attnotnull;
                 existing.has_default |= has_default;
-                existing.is_generated |= attr.attgenerated.is_some();
+                existing.generated = existing.generated.or(attr.attgenerated);
                 existing.inhcount += 1;
                 if let Some(nn) = parent_nn {
                     existing.nn_inhcount += 1;
@@ -357,13 +365,14 @@ fn inherited_columns(
                 typmod: attr.atttypmod,
                 not_null: attr.attnotnull,
                 has_default,
-                is_generated: attr.attgenerated.is_some(),
+                generated: attr.attgenerated,
                 identity,
                 collation: attr.attcollation,
                 owned_sequence: None,
                 identity_options: Vec::new(),
                 nn_local: false,
                 nn_name: None,
+                nn_no_inherit: false,
                 nn_inhcount: i16::from(parent_nn.is_some()),
                 nn_inh_name: parent_nn,
                 is_local: false,

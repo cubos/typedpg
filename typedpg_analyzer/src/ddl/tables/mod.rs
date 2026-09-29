@@ -327,6 +327,12 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
             }
         }
     }
+    // CheckAttributeNamesTypes (heap_create_with_catalog).
+    for col in &columns {
+        if col.generated == Some(AttGenerated::Virtual) {
+            generated::check_virtual_column_type(interp, &col.name, col.type_oid)?;
+        }
+    }
     for (i, col) in columns.iter().enumerate() {
         interp.insert_pg_attribute(PgAttribute {
             attrelid: class_oid,
@@ -335,7 +341,7 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
             attnum: (i + 1) as i16,
             attnotnull: col.not_null,
             atthasdef: col.has_default,
-            attgenerated: col.is_generated.then_some(AttGenerated::Stored),
+            attgenerated: col.generated,
             atttypmod: col.typmod,
             attidentity: col.identity,
             attcollation: col.collation,
@@ -395,7 +401,7 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
                 .insert((class_oid, attnum), crate::pg_catalog::oid::INT8);
             continue;
         }
-        if !col.has_default || col.is_generated {
+        if !col.has_default || col.generated.is_some() {
             continue;
         }
         let inherited = parents
@@ -486,6 +492,62 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
                     Some(Ok(t)) => Some(t.type_oid),
                     None => None,
                 };
+                // ComputePartitionAttrs: the columns the expression reads —
+                // all of them through a whole-row reference — may be neither
+                // system nor generated columns.
+                let mut read: Vec<i16> = Vec::new();
+                if let Some(inner) = expr.node.as_ref() {
+                    for (n, ..) in inner.nodes() {
+                        let typedpg_pg_query::NodeRef::ColumnRef(cr) = n else {
+                            continue;
+                        };
+                        let whole_row = match cr.fields.as_slice() {
+                            [.., last]
+                                if matches!(last.node.as_ref(), Some(node::Node::AStar(_))) =>
+                            {
+                                true
+                            }
+                            [only] => super::util::node_string(only).is_some_and(|f| {
+                                f == name && interp.attribute_by_name(class_oid, f).is_none()
+                            }),
+                            _ => false,
+                        };
+                        if whole_row {
+                            read.extend(interp.attributes_of(class_oid).iter().map(|a| a.attnum));
+                            continue;
+                        }
+                        let Some(col) = cr.fields.last().and_then(super::util::node_string) else {
+                            continue;
+                        };
+                        match interp.attribute_by_name(class_oid, col) {
+                            Some(attr) => read.push(attr.attnum),
+                            None if crate::pg_catalog::SYSTEM_COLUMNS
+                                .iter()
+                                .any(|(n, ..)| *n == col) =>
+                            {
+                                return Err(DdlError::Parse(
+                                    "partition key expressions cannot contain system column \
+                                     references"
+                                        .into(),
+                                ));
+                            }
+                            None => {}
+                        }
+                    }
+                }
+                read.sort_unstable();
+                if let Some(generated) = read.iter().find_map(|&attnum| {
+                    interp
+                        .attributes_of(class_oid)
+                        .iter()
+                        .find(|a| a.attnum == attnum && a.attgenerated.is_some())
+                }) {
+                    return Err(DdlError::Parse(format!(
+                        "cannot use generated column in partition key (Column \"{}\" is a \
+                         generated column.)",
+                        generated.attname
+                    )));
+                }
                 let reads_columns = expr.node.as_ref().is_some_and(|inner| {
                     inner
                         .nodes()
@@ -631,7 +693,8 @@ struct ParsedColumn {
     typmod: Option<i32>,
     not_null: bool,
     has_default: bool,
-    is_generated: bool,
+    /// `GENERATED ALWAYS AS (expr) {STORED | VIRTUAL}` (`attgenerated`).
+    generated: Option<AttGenerated>,
     identity: Option<AttIdentity>,
     collation: Option<crate::oid::PgCollationOid>,
     /// Implicit sequence the column owns: `Auto` for serial columns,
@@ -644,6 +707,8 @@ struct ParsedColumn {
     nn_local: bool,
     /// Explicit name of that local constraint (`CONSTRAINT x NOT NULL`).
     nn_name: Option<String>,
+    /// That local constraint is `NO INHERIT` (`connoinherit`).
+    nn_no_inherit: bool,
     /// Parents contributing a not-null constraint, and the first one's name
     /// (the name an inherited-only constraint keeps).
     nn_inhcount: i16,
@@ -996,6 +1061,7 @@ pub(crate) mod check_inherit;
 mod column_options;
 mod columns;
 mod constraints;
+mod generated;
 pub(crate) mod inherit;
 mod inherit_cmd;
 mod merge;

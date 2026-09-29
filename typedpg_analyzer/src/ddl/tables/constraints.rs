@@ -35,16 +35,12 @@ pub(crate) fn emit_constraints(
     let mut pending_fks: Vec<PendingFk> = Vec::new();
 
     // Column-level constraints.
-    let column_constraints: Vec<(&typedpg_pg_query::protobuf::ColumnDef, Vec<_>)> = stmt
-        .table_elts
-        .iter()
-        .filter_map(|elt| match elt.node.as_ref() {
-            Some(node::Node::ColumnDef(cd)) => {
-                Some((&**cd, fold_constraint_attrs(&cd.constraints)))
-            }
-            _ => None,
-        })
-        .collect();
+    let mut column_constraints: Vec<(&typedpg_pg_query::protobuf::ColumnDef, Vec<_>)> = Vec::new();
+    for elt in &stmt.table_elts {
+        if let Some(node::Node::ColumnDef(cd)) = elt.node.as_ref() {
+            column_constraints.push((&**cd, fold_constraint_attrs(&cd.constraints)?));
+        }
+    }
     for (cd, constraints) in &column_constraints {
         let Some(an) = attnum_of(&cd.colname) else {
             continue;
@@ -291,6 +287,7 @@ pub(crate) fn emit_constraints(
         check_fk_persistence(interp, relid, c)?;
         let (target_oid, target_attnums) =
             resolve_fk_target(interp, c, relname, &local_names, &local_types)?;
+        check_fk_generated_columns(interp, relid, c, &conkey)?;
         let conname = ConName::from_explicit(&c.conname, default_name).resolve(interp, relid);
         emit_constraint_with_backing_index(
             interp,
@@ -330,52 +327,126 @@ fn include_attnums(
 }
 
 /// transformConstraintAttrs (parse_utilcmd.c): a column's `[NOT]
-/// DEFERRABLE` / `INITIALLY {DEFERRED | IMMEDIATE}` clauses arrive as
-/// separate attribute nodes that apply to the constraint before them; a
-/// lone INITIALLY DEFERRED implies DEFERRABLE.
+/// DEFERRABLE` / `INITIALLY {DEFERRED | IMMEDIATE}` / `[NOT] ENFORCED`
+/// clauses arrive as separate attribute nodes that apply to the constraint
+/// before them; a lone INITIALLY DEFERRED implies DEFERRABLE, and a NOT
+/// ENFORCED constraint is also NOT VALID. Deferrability only suits a key or
+/// foreign-key constraint, enforceability a CHECK or foreign key.
 pub(super) fn fold_constraint_attrs(
     constraints: &[typedpg_pg_query::protobuf::Node],
-) -> Vec<typedpg_pg_query::protobuf::Constraint> {
+) -> Result<Vec<typedpg_pg_query::protobuf::Constraint>, DdlError> {
+    use ConstrType as C;
     let mut out: Vec<typedpg_pg_query::protobuf::Constraint> = Vec::new();
     let mut saw_deferrability = false;
+    let mut saw_initially = false;
+    let mut saw_enforced = false;
+    let syntax = |msg: &str| DdlError::Parse(msg.to_owned());
     for n in constraints {
         let Some(node::Node::Constraint(c)) = n.node.as_ref() else {
             continue;
         };
-        let attr = ConstrType::try_from(c.contype);
+        let attr = ConstrType::try_from(c.contype).unwrap_or(C::Undefined);
         let is_attr = matches!(
             attr,
-            Ok(ConstrType::ConstrAttrDeferrable
-                | ConstrType::ConstrAttrNotDeferrable
-                | ConstrType::ConstrAttrDeferred
-                | ConstrType::ConstrAttrImmediate)
+            C::ConstrAttrDeferrable
+                | C::ConstrAttrNotDeferrable
+                | C::ConstrAttrDeferred
+                | C::ConstrAttrImmediate
+                | C::ConstrAttrEnforced
+                | C::ConstrAttrNotEnforced
         );
-        let Some(last) = out.last_mut().filter(|_| is_attr) else {
-            if !is_attr {
-                saw_deferrability = false;
-                out.push((**c).clone());
-            }
+        if !is_attr {
+            saw_deferrability = false;
+            saw_initially = false;
+            saw_enforced = false;
+            out.push((**c).clone());
             continue;
-        };
+        }
+        let last = out.last_mut();
+        let last_type = last
+            .as_ref()
+            .and_then(|l| ConstrType::try_from(l.contype).ok());
+        // SUPPORTS_ATTRS.
+        let supports_deferrability = matches!(
+            last_type,
+            Some(C::ConstrPrimary | C::ConstrUnique | C::ConstrExclusion | C::ConstrForeign)
+        );
+        let supports_enforced = matches!(last_type, Some(C::ConstrCheck | C::ConstrForeign));
         match attr {
-            Ok(ConstrType::ConstrAttrDeferrable) => {
-                last.deferrable = true;
+            C::ConstrAttrDeferrable | C::ConstrAttrNotDeferrable => {
+                let deferrable = attr == C::ConstrAttrDeferrable;
+                if !supports_deferrability {
+                    return Err(syntax(if deferrable {
+                        "misplaced DEFERRABLE clause"
+                    } else {
+                        "misplaced NOT DEFERRABLE clause"
+                    }));
+                }
+                if saw_deferrability {
+                    return Err(syntax(
+                        "multiple DEFERRABLE/NOT DEFERRABLE clauses not allowed",
+                    ));
+                }
                 saw_deferrability = true;
-            }
-            Ok(ConstrType::ConstrAttrNotDeferrable) => {
-                last.deferrable = false;
-                saw_deferrability = true;
-            }
-            Ok(ConstrType::ConstrAttrDeferred) => {
-                last.initdeferred = true;
-                if !saw_deferrability {
-                    last.deferrable = true;
+                let last = last.expect("supports_deferrability implies a constraint");
+                last.deferrable = deferrable;
+                if !deferrable && saw_initially && last.initdeferred {
+                    return Err(syntax(
+                        "constraint declared INITIALLY DEFERRED must be DEFERRABLE",
+                    ));
                 }
             }
-            _ => last.initdeferred = false,
+            C::ConstrAttrDeferred | C::ConstrAttrImmediate => {
+                let deferred = attr == C::ConstrAttrDeferred;
+                if !supports_deferrability {
+                    return Err(syntax(if deferred {
+                        "misplaced INITIALLY DEFERRED clause"
+                    } else {
+                        "misplaced INITIALLY IMMEDIATE clause"
+                    }));
+                }
+                if saw_initially {
+                    return Err(syntax(
+                        "multiple INITIALLY IMMEDIATE/DEFERRED clauses not allowed",
+                    ));
+                }
+                saw_initially = true;
+                let last = last.expect("supports_deferrability implies a constraint");
+                last.initdeferred = deferred;
+                if deferred {
+                    if !saw_deferrability {
+                        last.deferrable = true;
+                    } else if !last.deferrable {
+                        return Err(syntax(
+                            "constraint declared INITIALLY DEFERRED must be DEFERRABLE",
+                        ));
+                    }
+                }
+            }
+            _ => {
+                let enforced = attr == C::ConstrAttrEnforced;
+                if !supports_enforced {
+                    return Err(syntax(if enforced {
+                        "misplaced ENFORCED clause"
+                    } else {
+                        "misplaced NOT ENFORCED clause"
+                    }));
+                }
+                if saw_enforced {
+                    return Err(syntax("multiple ENFORCED/NOT ENFORCED clauses not allowed"));
+                }
+                saw_enforced = true;
+                let last = last.expect("supports_enforced implies a constraint");
+                last.is_enforced = enforced;
+                if !enforced {
+                    // A NOT ENFORCED constraint must be marked as invalid.
+                    last.skip_validation = true;
+                    last.initially_valid = false;
+                }
+            }
         }
     }
-    out
+    Ok(out)
 }
 
 /// Insert a `pg_constraint` row and, for PK/UNIQUE, the backing
@@ -407,6 +478,19 @@ fn emit_constraint_with_backing_index(
             "UNIQUE"
         };
         check_unique_covers_partition_key(interp, relid, &conkey, label)?;
+    }
+    if matches!(
+        contype,
+        ConType::PrimaryKey | ConType::Unique | ConType::Exclusion
+    ) {
+        use crate::ddl::indexes::{IndexUse, check_index_columns};
+        let usage = if contype == ConType::PrimaryKey {
+            IndexUse::Primary
+        } else {
+            IndexUse::Constraint
+        };
+        let columns: Vec<i16> = conkey.iter().chain(&include).copied().collect();
+        check_index_columns(interp, relid, &columns, &[], usage)?;
     }
     let oid = PgConstraintOid::from_nonzero(interp.alloc_oid()?);
     interp.insert_pg_constraint(PgConstraint {
@@ -547,6 +631,27 @@ fn exclusion_keys(
             names.push(elem.name.clone());
         }
     }
+    // DefineIndex: nor may its expressions or predicate read a virtual
+    // generated column.
+    let exprs: Vec<&typedpg_pg_query::protobuf::Node> = c
+        .exclusions
+        .iter()
+        .filter_map(|pair| match pair.node.as_ref()? {
+            node::Node::List(l) => match l.items.first()?.node.as_ref()? {
+                node::Node::IndexElem(elem) => elem.expr.as_deref(),
+                _ => None,
+            },
+            _ => None,
+        })
+        .chain(c.where_clause.as_deref())
+        .collect();
+    crate::ddl::indexes::check_index_columns(
+        interp,
+        relid,
+        &[],
+        &exprs,
+        crate::ddl::indexes::IndexUse::Constraint,
+    )?;
     Ok((attnums, names))
 }
 
@@ -585,6 +690,46 @@ fn check_fk_persistence(
         _ => return Ok(()),
     };
     Err(DdlError::UnsupportedDdl(msg.into()))
+}
+
+/// ATAddForeignKeyConstraint: what a foreign key may do over generated
+/// columns — no action that writes the referencing column (per the SQL
+/// standard), and no virtual column at all.
+fn check_fk_generated_columns(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+    c: &typedpg_pg_query::protobuf::Constraint,
+    fk_attnums: &[i16],
+) -> Result<(), DdlError> {
+    for &attnum in fk_attnums {
+        let generated = interp
+            .attributes_of(relid)
+            .iter()
+            .find(|a| a.attnum == attnum)
+            .and_then(|a| a.attgenerated);
+        if generated.is_some() {
+            if matches!(c.fk_upd_action.as_str(), "n" | "d" | "c") {
+                return Err(DdlError::Parse(
+                    "invalid ON UPDATE action for foreign key constraint containing generated \
+                     column"
+                        .into(),
+                ));
+            }
+            if matches!(c.fk_del_action.as_str(), "n" | "d") {
+                return Err(DdlError::Parse(
+                    "invalid ON DELETE action for foreign key constraint containing generated \
+                     column"
+                        .into(),
+                ));
+            }
+        }
+        if generated == Some(crate::pg_catalog::AttGenerated::Virtual) {
+            return Err(DdlError::UnsupportedDdl(
+                "foreign key constraints on virtual generated columns are not supported".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Resolve a `FOREIGN KEY` target: returns `(target_class_oid, target_attnums)`.
@@ -858,81 +1003,19 @@ pub(crate) fn validate_constraint_expressions(
                     }
                 }
                 Ok(ConstrType::ConstrGenerated) => {
-                    if let Some(expr) = c.raw_expr.as_deref() {
-                        crate::ddl::expr_kind::check_expr_kind(
-                            interp,
-                            expr,
-                            crate::ddl::expr_kind::ExprKind::GeneratedColumn,
-                        )?;
-                        crate::ddl::volatile::check_mutability(
+                    if let Some(expr) = c.raw_expr.as_deref()
+                        && let Some(attr) = table_attrs.iter().find(|a| a.attname == cd.colname)
+                    {
+                        let cooked = super::generated::cook_generation_expr(
                             interp,
                             class_oid,
+                            &cd.colname,
+                            attr.atttypid,
+                            attr.attgenerated
+                                .unwrap_or(crate::pg_catalog::AttGenerated::Stored),
                             expr,
-                            crate::ddl::volatile::ExprLocation::Generated,
                         )?;
-                        // check_nested_generated: a generation expression
-                        // may not read another generated column.
-                        if let Some(inner) = expr.node.as_ref() {
-                            for (n, ..) in inner.nodes() {
-                                let typedpg_pg_query::NodeRef::ColumnRef(cr) = n else {
-                                    continue;
-                                };
-                                let Some(colname) =
-                                    cr.fields.last().and_then(crate::ddl::util::node_string)
-                                else {
-                                    continue;
-                                };
-                                if table_attrs
-                                    .iter()
-                                    .any(|a| a.attname == colname && a.attgenerated.is_some())
-                                {
-                                    return Err(DdlError::Parse(format!(
-                                        "cannot use generated column \"{colname}\" in column \
-                                         generation expression"
-                                    )));
-                                }
-                            }
-                        }
-                        let col_type = table_attrs
-                            .iter()
-                            .find(|a| a.attname == cd.colname)
-                            .map(|a| a.atttypid)
-                            .ok_or_else(|| {
-                                DdlError::Parse(format!(
-                                    "generated column \"{}\" of \"{relname}\" not found \
-                                     in pg_attribute",
-                                    cd.colname
-                                ))
-                            })?;
-                        // Use a no-goal pass so we can compare the expression's
-                        // type to the column's type ourselves and emit PG's
-                        // exact wording on mismatch (`column "X" is of type T
-                        // but default expression is of type U`).
-                        let result = infer_expr(
-                            expr,
-                            crate::expr::Ctx::new(&scope, &null_ctx, interp),
-                            &mut params,
-                            TypeGoal::NONE,
-                        )
-                        .map_err(|e| {
-                            DdlError::UnsupportedDdl(format!(
-                                "{e} (in GENERATED expression on {})",
-                                QualifiedName::new(relname, &cd.colname),
-                            ))
-                        })?;
-                        if interp.unwrap_domain(result.type_oid) != interp.unwrap_domain(col_type)
-                            && result.type_oid != oid::UNKNOWN
-                            && !interp.has_implicit_cast(result.type_oid, col_type)
-                        {
-                            let col_typname = format_type_for_message(interp, col_type);
-                            let expr_typname = format_type_for_message(interp, result.type_oid);
-                            return Err(DdlError::UnsupportedDdl(format!(
-                                "column \"{}\" is of type {col_typname} but default expression \
-                                 is of type {expr_typname} (in GENERATED expression on \
-                                 \"{relname}\")",
-                                cd.colname
-                            )));
-                        }
+                        cooked.record(interp, class_oid, attr.attnum);
                     }
                 }
                 _ => {}
@@ -1139,7 +1222,7 @@ pub(crate) fn add_column_constraints(
         recurse: false,
         recursing: false,
     };
-    for mut c in fold_constraint_attrs(&cd.constraints) {
+    for mut c in fold_constraint_attrs(&cd.constraints)? {
         match ConstrType::try_from(c.contype) {
             Ok(ConstrType::ConstrPrimary | ConstrType::ConstrUnique) => {
                 c.keys = vec![colname_node.clone()];
@@ -1375,6 +1458,7 @@ fn add_constraint_node(
         check_fk_persistence(interp, relid, c)?;
         let (target_oid, target_attnums) =
             resolve_fk_target(interp, c, &relname_owned, &column_names, &local_types)?;
+        check_fk_generated_columns(interp, relid, c, &attnums)?;
         let conname = ConName::from_explicit(
             &c.conname,
             ConName::Constraint {

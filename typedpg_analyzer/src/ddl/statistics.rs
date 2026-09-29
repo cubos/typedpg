@@ -119,6 +119,11 @@ pub fn create_statistics(interp: &mut PgCatalog, stmt: &CreateStatsStmt) -> Resu
     }
 
     // The columns and expressions.
+    let virtual_column = || {
+        DdlError::UnsupportedDdl(
+            "statistics creation on virtual generated columns is not supported".into(),
+        )
+    };
     let mut columns: Vec<i16> = Vec::new();
     let mut exprs: Vec<String> = Vec::new();
     let mut attnums: Vec<i16> = Vec::new();
@@ -139,6 +144,9 @@ pub fn create_statistics(interp: &mut PgCatalog, stmt: &CreateStatsStmt) -> Resu
                     se.name
                 )));
             };
+            if attr.attgenerated == Some(crate::pg_catalog::AttGenerated::Virtual) {
+                return Err(virtual_column());
+            }
             if !super::opclass::has_default_btree_opclass(interp, attr.atttypid) {
                 return Err(DdlError::UnsupportedDdl(format!(
                     "column \"{}\" cannot be used in statistics because its type {} has no \
@@ -160,6 +168,10 @@ pub fn create_statistics(interp: &mut PgCatalog, stmt: &CreateStatsStmt) -> Resu
                         && let Some(col) = cr.fields.last().and_then(node_string)
                         && let Some(a) = interp.attribute_by_name(relid, col)
                     {
+                        // pull_varattnos: no virtual generated column.
+                        if a.attgenerated == Some(crate::pg_catalog::AttGenerated::Virtual) {
+                            return Err(virtual_column());
+                        }
                         attnums.push(a.attnum);
                     }
                 }

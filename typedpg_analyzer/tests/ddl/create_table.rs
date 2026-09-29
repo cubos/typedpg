@@ -640,7 +640,8 @@ fn generated_column_with_mismatched_type_is_rejected() {
             );",
         )]),
         DdlError::UnsupportedDdl(_),
-        "column \"bad\" is of type integer but default expression is of type text (in GENERATED expression on \"t\")",
+        "column \"bad\" is of type integer but default expression is of type text (You will need \
+         to rewrite or cast the expression.)",
     );
 }
 

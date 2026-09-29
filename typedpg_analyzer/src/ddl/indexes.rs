@@ -145,10 +145,15 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
             continue;
         };
         let column_type = if !elem.name.is_empty() {
-            // ComputeIndexAttrs: `column "x" does not exist`.
-            let an = *attnum_by_name.get(&elem.name).ok_or_else(|| {
-                DdlError::Parse(format!("column \"{}\" does not exist", elem.name))
-            })?;
+            // ComputeIndexAttrs: `column "x" does not exist`; a system
+            // column resolves (and DefineIndex refuses it).
+            let an = attnum_by_name
+                .get(&elem.name)
+                .copied()
+                .or_else(|| system_attnum(&elem.name))
+                .ok_or_else(|| {
+                    DdlError::Parse(format!("column \"{}\" does not exist", elem.name))
+                })?;
             indkey.push(an);
             db.attribute_by_name(indrelid, &elem.name)
                 .map(|a| a.atttypid)
@@ -194,12 +199,30 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
                 "expressions are not supported in included columns".into(),
             ));
         }
-        let an = *attnum_by_name
+        let an = attnum_by_name
             .get(&elem.name)
+            .copied()
+            .or_else(|| system_attnum(&elem.name))
             .ok_or_else(|| DdlError::Parse(format!("column \"{}\" does not exist", elem.name)))?;
         indkey.push(an);
     }
     let indpred = stmt.where_clause.as_deref().map(serialize_node);
+    let usage = if stmt.primary {
+        IndexUse::Primary
+    } else if stmt.isconstraint {
+        IndexUse::Constraint
+    } else {
+        IndexUse::Index
+    };
+    let key_exprs: Vec<&typedpg_pg_query::protobuf::Node> = stmt
+        .index_params
+        .iter()
+        .filter_map(|p| match p.node.as_ref()? {
+            node::Node::IndexElem(elem) => elem.expr.as_deref(),
+            _ => None,
+        })
+        .chain(stmt.where_clause.as_deref())
+        .collect();
     if stmt.unique || stmt.primary {
         let label = if stmt.primary {
             "PRIMARY KEY"
@@ -213,6 +236,7 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
             label,
         )?;
     }
+    check_index_columns(db, indrelid, &indkey, &key_exprs, usage)?;
 
     // ── Pick a name for the index ──
     //
@@ -284,6 +308,94 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
         super::tables::partidx::propagate_new_index(db, indrelid, indexrelid)?;
     }
 
+    Ok(())
+}
+
+/// The (negative) attnum of system column `name`.
+fn system_attnum(name: &str) -> Option<i16> {
+    crate::pg_catalog::SYSTEM_COLUMNS
+        .iter()
+        .find(|(n, ..)| *n == name)
+        .map(|(.., attnum)| *attnum)
+}
+
+/// What an index is built for, as DefineIndex words its column errors.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IndexUse {
+    Index,
+    /// A UNIQUE or EXCLUDE constraint's index.
+    Constraint,
+    Primary,
+}
+
+/// DefineIndex (indexcmds.c): no index on a system column, nor on a virtual
+/// generated column — as a key or INCLUDE column (`attnums`, `0` for an
+/// expression slot) or read by a key expression or the predicate (`exprs`).
+pub(crate) fn check_index_columns(
+    db: &PgCatalog,
+    relid: PgClassOid,
+    attnums: &[i16],
+    exprs: &[&typedpg_pg_query::protobuf::Node],
+    usage: IndexUse,
+) -> Result<(), DdlError> {
+    use crate::pg_catalog::AttGenerated;
+    let is_virtual = |attnum: i16| {
+        db.attributes_of(relid)
+            .iter()
+            .any(|a| a.attnum == attnum && a.attgenerated == Some(AttGenerated::Virtual))
+    };
+    let system =
+        || DdlError::UnsupportedDdl("index creation on system columns is not supported".into());
+    let constraint_msg = |usage: IndexUse| match usage {
+        IndexUse::Constraint | IndexUse::Primary => {
+            "unique constraints on virtual generated columns are not supported"
+        }
+        IndexUse::Index => "indexes on virtual generated columns are not supported",
+    };
+    for &attnum in attnums {
+        if attnum < 0 {
+            return Err(system());
+        }
+        if attnum > 0 && is_virtual(attnum) {
+            return Err(DdlError::UnsupportedDdl(
+                match usage {
+                    IndexUse::Primary => {
+                        "primary keys on virtual generated columns are not supported"
+                    }
+                    other => constraint_msg(other),
+                }
+                .into(),
+            ));
+        }
+    }
+    let mut read: Vec<i16> = Vec::new();
+    for expr in exprs {
+        let Some(inner) = expr.node.as_ref() else {
+            continue;
+        };
+        for (n, ..) in inner.nodes() {
+            let typedpg_pg_query::NodeRef::ColumnRef(cr) = n else {
+                continue;
+            };
+            let Some(name) = cr.fields.last().and_then(super::util::node_string) else {
+                continue;
+            };
+            match db.attribute_by_name(relid, name) {
+                Some(attr) => read.push(attr.attnum),
+                None if crate::pg_catalog::SYSTEM_COLUMNS
+                    .iter()
+                    .any(|(n, ..)| *n == name) =>
+                {
+                    return Err(system());
+                }
+                None => {}
+            }
+        }
+    }
+    read.sort_unstable();
+    if read.into_iter().any(is_virtual) {
+        return Err(DdlError::UnsupportedDdl(constraint_msg(usage).into()));
+    }
     Ok(())
 }
 

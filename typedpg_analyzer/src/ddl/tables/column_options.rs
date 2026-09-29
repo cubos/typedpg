@@ -53,6 +53,15 @@ pub(super) fn alter_column_setting(
             interp, relid, &cmd.name,
         )));
     };
+    // ATExecSetStatistics: ANALYZE skips virtual generated columns.
+    if subtype == AlterTableType::AtSetStatistics
+        && attr.attgenerated == Some(crate::pg_catalog::AttGenerated::Virtual)
+    {
+        return Err(DdlError::UnsupportedDdl(format!(
+            "cannot alter statistics on virtual generated column \"{}\"",
+            cmd.name
+        )));
+    }
     let typstorage = interp
         .pg_type
         .get(&attr.atttypid)

@@ -314,6 +314,15 @@ fn check_tables_to_add(
                     "column \"{col}\" of relation \"{relname}\" does not exist"
                 )));
             }
+            if interp
+                .attribute_by_name(relid, col)
+                .and_then(|a| a.attgenerated)
+                == Some(crate::pg_catalog::AttGenerated::Virtual)
+            {
+                return Err(DdlError::Parse(format!(
+                    "cannot use virtual generated column \"{col}\" in publication column list"
+                )));
+            }
             if seen.contains(&col) {
                 return Err(DdlError::DuplicateObject(format!(
                     "duplicate column \"{col}\" in publication column list"
@@ -685,6 +694,15 @@ pub fn alter_publication(
 }
 
 /// DROP PUBLICATION [IF EXISTS] name.
+/// GetRelationPublications (pg_publication.c): whether a publication lists
+/// the table itself (`pg_publication_rel`).
+pub(crate) fn relation_in_publication(interp: &PgCatalog, relid: PgClassOid) -> bool {
+    interp
+        .publications
+        .iter()
+        .any(|p| p.tables.iter().any(|t| t.relid == relid))
+}
+
 pub(crate) fn drop_publication(
     interp: &mut PgCatalog,
     obj_node: &typedpg_pg_query::protobuf::Node,
