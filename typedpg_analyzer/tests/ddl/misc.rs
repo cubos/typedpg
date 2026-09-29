@@ -3361,3 +3361,57 @@ fn publications_are_validated_and_tracked() {
         ),
     ]);
 }
+
+#[test]
+fn event_triggers_are_validated_and_tracked() {
+    // PG 18 CreateEventTrigger / AlterEventTrigger / dependency on the
+    // function.
+    let setup = "CREATE FUNCTION ef() RETURNS event_trigger LANGUAGE plpgsql AS 'begin end';
+                 CREATE FUNCTION nf() RETURNS int LANGUAGE sql AS 'select 1';
+                 CREATE EVENT TRIGGER e ON ddl_command_start EXECUTE FUNCTION ef();";
+    for (stmt, msg) in [
+        (
+            "CREATE EVENT TRIGGER x ON ddl_command_start EXECUTE FUNCTION nosuch();",
+            "function nosuch() does not exist",
+        ),
+        (
+            "CREATE EVENT TRIGGER x ON nosuch_event EXECUTE FUNCTION ef();",
+            "unrecognized event name \"nosuch_event\"",
+        ),
+        (
+            "CREATE EVENT TRIGGER x ON ddl_command_start EXECUTE FUNCTION nf();",
+            "function nf must return type event_trigger",
+        ),
+        (
+            "CREATE EVENT TRIGGER e ON ddl_command_end EXECUTE FUNCTION ef();",
+            "event trigger \"e\" already exists",
+        ),
+        (
+            "ALTER EVENT TRIGGER nosuch DISABLE;",
+            "event trigger \"nosuch\" does not exist",
+        ),
+        (
+            "DROP EVENT TRIGGER nosuch;",
+            "event trigger \"nosuch\" does not exist",
+        ),
+        (
+            "DROP FUNCTION ef();",
+            "cannot drop function ef() because other objects depend on it",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "ALTER EVENT TRIGGER e DISABLE;
+             ALTER EVENT TRIGGER e RENAME TO e2;
+             DROP EVENT TRIGGER IF EXISTS nosuch;
+             CREATE EVENT TRIGGER e3 ON sql_drop EXECUTE FUNCTION ef();
+             DROP EVENT TRIGGER e2;
+             DROP FUNCTION ef() CASCADE;",
+        ),
+    ]);
+}

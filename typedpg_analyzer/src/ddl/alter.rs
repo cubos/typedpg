@@ -42,6 +42,9 @@ pub fn rename(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlError>
         ObjectType::ObjectStatisticExt => crate::ddl::statistics::rename_statistics(interp, stmt),
         ObjectType::ObjectFdw => crate::ddl::fdw::rename_foreign_object(interp, true, stmt),
         ObjectType::ObjectPublication => crate::ddl::publications::rename_publication(interp, stmt),
+        ObjectType::ObjectEventTrigger => {
+            crate::ddl::event_triggers::rename_event_trigger(interp, stmt)
+        }
         ObjectType::ObjectForeignServer => {
             crate::ddl::fdw::rename_foreign_object(interp, false, stmt)
         }

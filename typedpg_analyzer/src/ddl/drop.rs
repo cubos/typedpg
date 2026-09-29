@@ -72,6 +72,9 @@ pub fn drop_objects(interp: &mut PgCatalog, stmt: &DropStmt) -> Result<(), DdlEr
                     cascade,
                 )?;
             }
+            ObjectType::ObjectEventTrigger => {
+                super::event_triggers::drop_event_trigger(interp, obj_node, stmt.missing_ok)?;
+            }
             ObjectType::ObjectPublication => {
                 super::publications::drop_publication(interp, obj_node, stmt.missing_ok)?;
             }
@@ -807,6 +810,17 @@ fn drop_function(
                 ts.retain(|t| t.name != trigger);
             }
         }
+        // So does an event trigger.
+        let event_triggers = super::event_triggers::event_triggers_using(interp, oid);
+        if let Some(trigger) = event_triggers.first()
+            && !cascade
+        {
+            return Err(DdlError::DependencyError(format!(
+                "cannot drop {kind_word} {signature} because other objects depend on it \
+                 (event trigger {trigger} depends on {kind_word} {signature})"
+            )));
+        }
+        interp.event_triggers.retain(|(_, f)| *f != oid);
         let dependent_views = views::find_views_depending_on_function(interp, oid);
         if !dependent_views.is_empty() && !cascade {
             let view_names = format_view_list(interp, &dependent_views);

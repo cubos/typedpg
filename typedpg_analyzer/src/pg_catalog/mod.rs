@@ -264,6 +264,8 @@ pub struct PgCatalog {
     pub(crate) installing_extension: Option<String>,
     /// Logical-replication publications.
     pub(crate) publications: Vec<crate::ddl::publications::Publication>,
+    /// Event triggers and the function each executes.
+    pub(crate) event_triggers: Vec<(String, crate::oid::PgProcOid)>,
     /// Enum labels added in the current transaction to a type created
     /// before it: unusable until committed (check_safe_enum_use).
     pub(crate) uncommitted_enum_labels: std::collections::HashSet<(PgTypeOid, String)>,
@@ -540,6 +542,7 @@ impl PgCatalog {
             foreign_data: Default::default(),
             installing_extension: None,
             publications: Vec::new(),
+            event_triggers: Vec::new(),
             uncommitted_enum_labels: Default::default(),
             enums_created_in_transaction: Default::default(),
             partition_specs: HashMap::new(),

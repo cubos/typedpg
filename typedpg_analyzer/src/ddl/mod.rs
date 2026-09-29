@@ -12,6 +12,7 @@ mod comment;
 mod defaults;
 mod dml;
 pub mod drop;
+pub(crate) mod event_triggers;
 mod expr_kind;
 pub mod extensions;
 pub(crate) mod fdw;
@@ -222,6 +223,8 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         node::Node::AlterPolicyStmt(s) => policies::alter_policy(db, s),
         node::Node::RuleStmt(s) => rules::create_rule(db, s),
         node::Node::CreateAmStmt(s) => opclass::create_am(db, s),
+        node::Node::CreateEventTrigStmt(s) => event_triggers::create_event_trigger(db, s),
+        node::Node::AlterEventTrigStmt(s) => event_triggers::alter_event_trigger(db, s),
         node::Node::CreatePublicationStmt(s) => publications::create_publication(db, s),
         node::Node::AlterPublicationStmt(s) => publications::alter_publication(db, s),
         node::Node::DoStmt(s) => function_body::do_block(db, s),
@@ -282,8 +285,6 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         | node::Node::DropRoleStmt(_)
         | node::Node::ReassignOwnedStmt(_)
         | node::Node::DropOwnedStmt(_)
-        | node::Node::CreateEventTrigStmt(_)
-        | node::Node::AlterEventTrigStmt(_)
         | node::Node::CreateSubscriptionStmt(_)
         | node::Node::AlterSubscriptionStmt(_)
         | node::Node::DropSubscriptionStmt(_)
