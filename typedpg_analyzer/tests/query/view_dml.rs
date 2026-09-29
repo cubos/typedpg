@@ -618,3 +618,26 @@ fn data_modifying_with_on_relations_with_rules() {
     // The statement itself (not in WITH) may fire them.
     assert_ok(&db, "INSERT INTO tr VALUES (1, 1)");
 }
+
+/// transformUpdateStmt / transformDeleteStmt: WHERE CURRENT OF can't target
+/// a view.
+#[test]
+fn where_current_of_on_a_view() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE t (id int PRIMARY KEY, v int NOT NULL, w text);
+         CREATE VIEW vt AS SELECT id, v, w FROM t WHERE v > 0;",
+    )
+    .unwrap();
+    for sql in [
+        "DELETE FROM vt WHERE CURRENT OF c",
+        "UPDATE vt SET v = 1 WHERE CURRENT OF c",
+    ] {
+        let err = assert_prefix(&db, sql, "WHERE CURRENT OF on a view is not implemented");
+        assert!(
+            matches!(err, AnalyzeError::FeatureNotSupported(_)),
+            "{sql}: {err:?}"
+        );
+    }
+    assert_ok(&db, "DELETE FROM t WHERE CURRENT OF c");
+}

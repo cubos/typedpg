@@ -889,6 +889,7 @@ pub(crate) fn analyze_update_with_outer_ctes(
     if let Some(with) = &upd.with_clause {
         cte_scopes = analyze_with_clause(with, snapshot, params, &cte_scopes, &[])?;
     }
+    check_current_of_on_view(upd.where_clause.as_deref(), snapshot, table_oid)?;
 
     // Build scope with target table + FROM clause tables.
     let mut scope = Scope {
@@ -1014,6 +1015,7 @@ pub(crate) fn analyze_delete_with_outer_ctes(
     if let Some(with) = &del.with_clause {
         cte_scopes = analyze_with_clause(with, snapshot, params, &cte_scopes, &[])?;
     }
+    check_current_of_on_view(del.where_clause.as_deref(), snapshot, table_oid)?;
 
     let mut scope = Scope {
         ctes: cte_scopes.clone(),
@@ -1093,4 +1095,31 @@ fn process_from_clause_beside_target(
         scope.lateral_blocked_aliases.remove(target_alias);
     }
     out
+}
+
+/// transformUpdateStmt / transformDeleteStmt: `WHERE CURRENT OF` can't
+/// target a view (0A000).
+fn check_current_of_on_view(
+    where_clause: Option<&protobuf::Node>,
+    snapshot: &PgCatalog,
+    table_oid: crate::oid::PgClassOid,
+) -> Result<(), AnalyzeError> {
+    if matches!(
+        where_clause.and_then(|w| w.node.as_ref()),
+        Some(node::Node::CurrentOfExpr(_))
+    ) && snapshot
+        .pg_class
+        .get(&table_oid)
+        .is_some_and(|c| c.relkind == crate::pg_catalog::RelKind::View)
+    {
+        return Err(crate::error::RawError::new(
+            AnalyzeError::FeatureNotSupported(
+                "WHERE CURRENT OF on a view is not implemented".into(),
+            ),
+            None,
+            None,
+        )
+        .finalize_implicit());
+    }
+    Ok(())
 }
