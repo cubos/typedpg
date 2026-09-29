@@ -595,6 +595,12 @@ fn analyze_insert_on_conflict(
         &tgt.attrs,
     );
     conflict_scope.add_dml_target(snapshot, "excluded", target_qn, &tgt.attrs);
+    // transformOnConflictClause marks the EXCLUDED RTE as
+    // RELKIND_COMPOSITE_TYPE, so scanNSItemForColumn offers it no system
+    // columns: `excluded.ctid` does not exist.
+    if let Some(excluded) = conflict_scope.sources.last_mut() {
+        excluded.system_columns.clear();
+    }
     let conflict_null_ctx = NullabilityContext::default();
     analyze_set_clause(
         &on_conflict.target_list,

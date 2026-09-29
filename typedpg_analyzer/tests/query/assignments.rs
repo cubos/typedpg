@@ -323,3 +323,27 @@ fn assigning_to_a_system_column_is_refused() {
         );
     }
 }
+
+/// The EXCLUDED pseudo-relation is a composite-type RTE: it has no system
+/// columns, while the target's stay reachable.
+#[test]
+fn excluded_has_no_system_columns() {
+    let db = setup();
+    db.analyze(
+        "INSERT INTO t (id, a) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET a = excluded.a \
+         WHERE t.ctid IS NOT NULL",
+    )
+    .unwrap();
+    let err = db
+        .analyze(
+            "INSERT INTO t (id, a) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET a = excluded.a \
+             WHERE excluded.ctid IS NULL",
+        )
+        .unwrap_err();
+    assert!(matches!(err, AnalyzeError::UndefinedColumn(_)), "{err:?}");
+    assert!(
+        err.to_string()
+            .starts_with("column excluded.ctid does not exist"),
+        "{err}"
+    );
+}
