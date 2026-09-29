@@ -457,70 +457,234 @@ fn validate_oid(content: &str) -> Result<(), String> {
 
 // ─── floats ─────────────────────────────────────────────────────────────────
 
-/// Mirrors `float8in` / `float4in`, which delegate to `strtod`: optional
-/// whitespace and sign, then `inf`/`infinity`/`nan` (case-insensitive), a
-/// decimal float (`1`, `.5`, `5.`, `1e3`, `5.e-3`), or a C99 hex float
-/// (`0x1F`, `0x1.8p3`). No underscores, no range check (kept conservative).
-fn validate_float(content: &str, type_name: &str) -> Result<(), String> {
-    let err = || crate::pgmsg::invalid_input_syntax_for_type(type_name, content);
-    let mut s = content.trim_matches(|c: char| c.is_ascii_whitespace());
-    if let Some(rest) = s.strip_prefix(['+', '-']) {
-        s = rest;
+/// C `isspace` in the C locale (float input skips it on both sides).
+fn c_isspace(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r')
+}
+
+/// The shape of the longest prefix glibc's `strtod`/`strtof` accepts.
+enum FloatPrefix {
+    /// `inf`, `infinity`, `nan`, `nan(chars)` — never out of range.
+    Special,
+    /// A decimal float (`1`, `.5`, `5.`, `1e3`); the prefix text parses
+    /// with Rust's correctly-rounded `str::parse`, like glibc.
+    Decimal { nonzero_digit: bool },
+    /// A C99 hex float `0x H* [. H*] [p [sign] D+]`: the hex digits (int
+    /// and fraction concatenated), the fraction digit count and the binary
+    /// exponent (saturated).
+    Hex {
+        digits: Vec<u8>,
+        frac_len: i64,
+        exp: i64,
+    },
+}
+
+/// Length and shape of the longest `strtod` prefix of `s` (which starts at
+/// the number: leading whitespace already skipped), or `None` when no
+/// conversion is possible (`endptr == num`).
+fn strtod_prefix(s: &[u8]) -> Option<(usize, FloatPrefix)> {
+    let at = |i: usize| s.get(i).copied().unwrap_or(0);
+    let mut p = 0;
+    if matches!(at(0), b'+' | b'-') {
+        p = 1;
     }
-    let lower = s.to_ascii_lowercase();
-    if lower == "inf" || lower == "infinity" || lower == "nan" {
-        return Ok(());
+    let starts_ci = |i: usize, word: &[u8]| {
+        s.len() >= i + word.len() && s[i..i + word.len()].eq_ignore_ascii_case(word)
+    };
+    if starts_ci(p, b"infinity") {
+        return Some((p + 8, FloatPrefix::Special));
     }
-    // C99 hex float: 0x H* [. H*] [p [sign] D+] — at least one hex digit
-    // overall.
-    if let Some(hex) = lower.strip_prefix("0x") {
-        let (mantissa, exp) = match hex.split_once('p') {
-            Some((m, e)) => (m, Some(e)),
-            None => (hex, None),
-        };
-        let (int_part, frac_part) = match mantissa.split_once('.') {
-            Some((i, f)) => (i, f),
-            None => (mantissa, ""),
-        };
-        if int_part.is_empty() && frac_part.is_empty() {
-            return Err(err());
-        }
-        if !int_part.chars().all(|c| c.is_ascii_hexdigit())
-            || !frac_part.chars().all(|c| c.is_ascii_hexdigit())
-        {
-            return Err(err());
-        }
-        if let Some(e) = exp {
-            let e = e.strip_prefix(['+', '-']).unwrap_or(e);
-            if e.is_empty() || !e.chars().all(|c| c.is_ascii_digit()) {
-                return Err(err());
+    if starts_ci(p, b"inf") {
+        return Some((p + 3, FloatPrefix::Special));
+    }
+    if starts_ci(p, b"nan") {
+        let mut q = p + 3;
+        // `nan(n-char-sequence)` — only consumed when the paren closes.
+        if at(q) == b'(' {
+            let mut r = q + 1;
+            while at(r).is_ascii_alphanumeric() || at(r) == b'_' {
+                r += 1;
+            }
+            if at(r) == b')' {
+                q = r + 1;
             }
         }
-        return Ok(());
+        return Some((q, FloatPrefix::Special));
     }
-    // Decimal float: D* [. D*] [e [sign] D+] — at least one digit in the
-    // mantissa.
-    let (mantissa, exp) = match lower.split_once('e') {
-        Some((m, e)) => (m, Some(e)),
-        None => (lower.as_str(), None),
-    };
-    let (int_part, frac_part) = match mantissa.split_once('.') {
-        Some((i, f)) => (i, f),
-        None => (mantissa, ""),
-    };
-    if int_part.is_empty() && frac_part.is_empty() {
-        return Err(err());
-    }
-    if !int_part.chars().all(|c| c.is_ascii_digit())
-        || !frac_part.chars().all(|c| c.is_ascii_digit())
+    // Hex float: `0x` must be followed by a hex digit, or `.` and one.
+    if at(p) == b'0'
+        && matches!(at(p + 1), b'x' | b'X')
+        && (at(p + 2).is_ascii_hexdigit() || (at(p + 2) == b'.' && at(p + 3).is_ascii_hexdigit()))
     {
+        let mut q = p + 2;
+        let mut digits = Vec::new();
+        let mut frac_len = 0i64;
+        while at(q).is_ascii_hexdigit() {
+            digits.push(at(q));
+            q += 1;
+        }
+        if at(q) == b'.' {
+            q += 1;
+            while at(q).is_ascii_hexdigit() {
+                digits.push(at(q));
+                frac_len += 1;
+                q += 1;
+            }
+        }
+        let mut exp = 0i64;
+        if matches!(at(q), b'p' | b'P') {
+            let mut r = q + 1;
+            let negative = at(r) == b'-';
+            if matches!(at(r), b'+' | b'-') {
+                r += 1;
+            }
+            if at(r).is_ascii_digit() {
+                while at(r).is_ascii_digit() {
+                    exp = (exp * 10 + i64::from(at(r) - b'0')).min(1 << 40);
+                    r += 1;
+                }
+                if negative {
+                    exp = -exp;
+                }
+                q = r;
+            }
+        }
+        return Some((
+            q,
+            FloatPrefix::Hex {
+                digits,
+                frac_len,
+                exp,
+            },
+        ));
+    }
+    // Decimal: digits with an optional point, at least one digit, then an
+    // exponent that is only consumed when digits follow it.
+    let mut q = p;
+    let mut any_digit = false;
+    let mut nonzero_digit = false;
+    while at(q).is_ascii_digit() {
+        any_digit = true;
+        nonzero_digit |= at(q) != b'0';
+        q += 1;
+    }
+    if at(q) == b'.' {
+        q += 1;
+        while at(q).is_ascii_digit() {
+            any_digit = true;
+            nonzero_digit |= at(q) != b'0';
+            q += 1;
+        }
+    }
+    if !any_digit {
+        return None;
+    }
+    if matches!(at(q), b'e' | b'E') {
+        let mut r = q + 1;
+        if matches!(at(r), b'+' | b'-') {
+            r += 1;
+        }
+        if at(r).is_ascii_digit() {
+            while at(r).is_ascii_digit() {
+                r += 1;
+            }
+            q = r;
+        }
+    }
+    Some((q, FloatPrefix::Decimal { nonzero_digit }))
+}
+
+/// Whether the nonzero hex float `digits × 2^(exp − 4·frac_len)` rounds
+/// (to nearest, ties to even) to zero or to infinity in a binary format
+/// with `precision` significand bits, maximum exponent `emax` and minimum
+/// subnormal exponent `emin_sub` — i.e. whether `strtod` reports ERANGE
+/// with a zero/huge result.
+fn hex_float_out_of_range(
+    digits: &[u8],
+    frac_len: i64,
+    exp: i64,
+    precision: usize,
+    emax: i64,
+    emin_sub: i64,
+) -> bool {
+    let mut bits = Vec::with_capacity(digits.len() * 4);
+    for d in digits {
+        let v = (*d as char).to_digit(16).unwrap_or(0);
+        for shift in (0..4).rev() {
+            bits.push((v >> shift) & 1 == 1);
+        }
+    }
+    let Some(lead) = bits.iter().position(|&b| b) else {
+        return false; // an exact zero is not a range error
+    };
+    let bits = &bits[lead..];
+    // Exponent of the leading one bit.
+    let top = (bits.len() as i64 - 1) + exp - 4 * frac_len;
+    if top > emax {
+        return true;
+    }
+    if top == emax {
+        // Rounds up to 2^(emax+1) only when the kept bits are all ones and
+        // the first dropped bit is set.
+        return bits.len() > precision
+            && bits[..precision].iter().all(|&b| b)
+            && bits[precision];
+    }
+    if top < emin_sub - 1 {
+        return true; // below half the smallest subnormal
+    }
+    // Exactly half the smallest subnormal ties to even (zero).
+    top == emin_sub - 1 && bits[1..].iter().all(|&b| !b)
+}
+
+/// Mirrors `float8in_internal` / `float4in_internal` (float.c): leading
+/// whitespace, then the longest prefix glibc's `strtod`/`strtof` accepts
+/// (decimal or C99 hex floats, `inf`/`infinity`/`nan`/`nan(…)` in any
+/// case, optionally signed), then only trailing whitespace. A value that
+/// overflows to infinity or underflows to zero from a nonzero mantissa is
+/// out of range — reported with just the number's text, and before the
+/// trailing-garbage check (`'1e400x'` is out of range); subnormal results
+/// are accepted.
+fn validate_float(content: &str, type_name: &str) -> Result<(), String> {
+    let err = || crate::pgmsg::invalid_input_syntax_for_type(type_name, content);
+    let is_real = type_name == "real";
+    let bytes = content.as_bytes();
+    let start = bytes.iter().position(|&b| !c_isspace(b)).unwrap_or(bytes.len());
+    let num = &bytes[start..];
+    if num.is_empty() {
         return Err(err());
     }
-    if let Some(e) = exp {
-        let e = e.strip_prefix(['+', '-']).unwrap_or(e);
-        if e.is_empty() || !e.chars().all(|c| c.is_ascii_digit()) {
-            return Err(err());
+    let (len, shape) = strtod_prefix(num).ok_or_else(err)?;
+    let text = &content[start..start + len];
+    let out_of_range = match shape {
+        FloatPrefix::Special => false,
+        FloatPrefix::Decimal { nonzero_digit } => {
+            let (is_inf, is_zero) = if is_real {
+                let v: f32 = text.parse().unwrap_or(0.0);
+                (v.is_infinite(), v == 0.0)
+            } else {
+                let v: f64 = text.parse().unwrap_or(0.0);
+                (v.is_infinite(), v == 0.0)
+            };
+            is_inf || (is_zero && nonzero_digit)
         }
+        FloatPrefix::Hex {
+            digits,
+            frac_len,
+            exp,
+        } => {
+            if is_real {
+                hex_float_out_of_range(&digits, frac_len, exp, 24, 127, -149)
+            } else {
+                hex_float_out_of_range(&digits, frac_len, exp, 53, 1023, -1074)
+            }
+        }
+    };
+    if out_of_range {
+        return Err(format!("\"{text}\" is out of range for type {type_name}"));
+    }
+    if num[len..].iter().any(|&b| !c_isspace(b)) {
+        return Err(err());
     }
     Ok(())
 }
@@ -1298,6 +1462,61 @@ mod tests {
         }
         for bad in ["", "1e", "1_000", "x", "1.2.3", "0x", "1e+"] {
             assert!(v(bad).is_err(), "{bad:?} should be invalid");
+        }
+    }
+
+    #[test]
+    fn float_range() {
+        let f8 = |s| validate_float(s, "double precision");
+        let f4 = |s| validate_float(s, "real");
+        // Accepted: subnormals, values rounding to the extremes, exact
+        // zeros, glibc's nan(...) form, `\v` padding.
+        for ok in [
+            "1e-310",
+            "3e-324",
+            "0e-400",
+            "1.7976931348623158e308",
+            "0x1p-1074",
+            "0x1.8p-1075",
+            "0x1.fffffffffffffp1023",
+            "0x.8",
+            "nan(123)",
+            "nan()",
+            "5.",
+            "\x0b1\x0b",
+        ] {
+            assert!(f8(ok).is_ok(), "{ok:?} should be valid float8");
+        }
+        for ok in ["1e-40", "1.4e-45", "8e-46", "3.4028235e38", "+inf"] {
+            assert!(f4(ok).is_ok(), "{ok:?} should be valid float4");
+        }
+        for (bad, num) in [
+            ("1e400", "1e400"),
+            ("1e-400", "1e-400"),
+            ("2e-324", "2e-324"),
+            (" -1e400 ", "-1e400"),
+            (" 1e400x", "1e400"),
+            ("1.7976931348623159e308", "1.7976931348623159e308"),
+            ("0x1p5000", "0x1p5000"),
+            ("0x1p-1075", "0x1p-1075"),
+            ("0x1.fffffffffffff8p1023", "0x1.fffffffffffff8p1023"),
+        ] {
+            assert_eq!(
+                f8(bad).unwrap_err(),
+                format!("\"{num}\" is out of range for type double precision"),
+            );
+        }
+        for bad in ["1e40", "1e-50", "7e-46", "3.4028236e38", "1e400"] {
+            assert_eq!(
+                f4(bad).unwrap_err(),
+                format!("\"{bad}\" is out of range for type real"),
+            );
+        }
+        for bad in ["infinit", "infinityx", "0x1p", "."] {
+            assert_eq!(
+                f8(bad).unwrap_err(),
+                format!("invalid input syntax for type double precision: \"{bad}\""),
+            );
         }
     }
 

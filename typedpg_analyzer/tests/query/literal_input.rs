@@ -930,3 +930,49 @@ fn array_literal_null_element_of_not_null_domain_rejected() {
     );
     db.analyze("SELECT cardinality('{1}'::nn2[]) AS v").unwrap();
 }
+
+// ── float range (float8in_internal / float4in_internal) ─────────────────────
+
+#[test]
+fn float_literal_overflow_rejected() {
+    let db = setup();
+    assert_first_line!(
+        db.analyze("SELECT '1e400'::float8"),
+        "\"1e400\" is out of range for type double precision"
+    );
+    assert_first_line!(
+        db.analyze("SELECT '1e40'::float4"),
+        "\"1e40\" is out of range for type real"
+    );
+    // The range error names just the number and wins over trailing junk.
+    assert_first_line!(
+        db.analyze("SELECT ' 1e400x'::float8"),
+        "\"1e400\" is out of range for type double precision"
+    );
+    // Assignment coercion runs the same input function.
+    assert_first_line!(
+        db.analyze("UPDATE t SET f = '-1e400'"),
+        "\"-1e400\" is out of range for type double precision"
+    );
+}
+
+#[test]
+fn float_literal_underflow_rejected_but_subnormals_accepted() {
+    let db = setup();
+    assert_first_line!(
+        db.analyze("SELECT '1e-400'::float8"),
+        "\"1e-400\" is out of range for type double precision"
+    );
+    assert_first_line!(
+        db.analyze("SELECT '1e-50'::float4"),
+        "\"1e-50\" is out of range for type real"
+    );
+    for q in [
+        "SELECT '1e-310'::float8 AS v",
+        "SELECT '1e-40'::float4 AS v",
+        "SELECT '0e-400'::float8 AS v",
+        "SELECT 'nan(1)'::float8 AS v",
+    ] {
+        db.analyze(q).unwrap_or_else(|e| panic!("{q}: {e}"));
+    }
+}
