@@ -2431,3 +2431,26 @@ fn unknown_field_of_an_anonymous_record_is_not_coercible() {
         db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
 }
+
+#[test]
+fn whole_row_of_null_extended_side_is_nullable() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE t (id int PRIMARY KEY);
+         CREATE TABLE u (id int NOT NULL, x text);",
+    )
+    .unwrap();
+    let s = db
+        .analyze("SELECT u, row_to_json(u.*) AS j FROM t LEFT JOIN u ON false")
+        .unwrap();
+    assert_cols(
+        &s,
+        vec![
+            cn(
+                "u",
+                composite("public", "u", vec![rf("id", int4()), rfn("x", text())]),
+            ),
+            cn("j", json_ty()),
+        ],
+    );
+}

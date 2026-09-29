@@ -23,7 +23,7 @@ pub(crate) fn infer_column_ref(
         .iter()
         .any(|f| matches!(f.node.as_ref(), Some(node::Node::AStar(_))));
     if has_star {
-        return infer_star_ref(col_ref, scope, snapshot);
+        return infer_star_ref(col_ref, scope, null_ctx, snapshot);
     }
 
     let parts = extract_string_fields(&col_ref.fields);
@@ -75,7 +75,10 @@ pub(crate) fn infer_column_ref(
                 && let Some(nsoid) = snapshot.namespace_oid(&qn.schema)
                 && let Some(&composite_oid) = snapshot.type_by_qname.get(&(nsoid, qn.name.clone()))
             {
-                return Ok(ExprType::scalar(composite_oid, false));
+                return Ok(ExprType::scalar(
+                    composite_oid,
+                    whole_row_nullable(src, null_ctx),
+                ));
             }
             // Inside a SQL function body, a name no column or relation
             // claims may name one of the function's parameters.
@@ -141,9 +144,16 @@ fn sql_function_param(parts: &[String], snapshot: &PgCatalog) -> Option<ExprType
 /// underlying relation. The composite is the per-table `TypeEntry` that
 /// `create_table` registers alongside the table — same OID that a call site
 /// like `row_to_json(alias.*)` would see at runtime.
+/// A whole-row reference is NULL when its entry is on the nullable side of
+/// an outer join.
+fn whole_row_nullable(src: &crate::scope::TableSource, null_ctx: &NullabilityContext) -> bool {
+    null_ctx.alias_is_nullable(&src.alias)
+}
+
 fn infer_star_ref(
     col_ref: &protobuf::ColumnRef,
     scope: &Scope,
+    null_ctx: &NullabilityContext,
     snapshot: &PgCatalog,
 ) -> Result<ExprType, AnalyzeError> {
     // The alias/relname qualifying the star is the last String field before
@@ -187,7 +197,10 @@ fn infer_star_ref(
                     "internal: no composite type registered for relation {qn}"
                 ))
             })?;
-        return Ok(ExprType::scalar(composite_oid, false));
+        return Ok(ExprType::scalar(
+            composite_oid,
+            whole_row_nullable(source, null_ctx),
+        ));
     }
 
     let fields: Vec<RecordField> = source
@@ -207,7 +220,7 @@ fn infer_star_ref(
         .collect();
     Ok(ExprType {
         type_oid: oid::RECORD,
-        nullable: false,
+        nullable: whole_row_nullable(source, null_ctx),
         typmod: None,
         collation: None,
         explicit_collation: false,

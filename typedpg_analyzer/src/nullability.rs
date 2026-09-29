@@ -39,6 +39,13 @@ impl NullabilityContext {
         }
     }
 
+    /// Whether the source `table_alias` is on the nullable side of an outer
+    /// join — a whole-row reference to it (`SELECT u FROM a LEFT JOIN u …`)
+    /// is then NULL for the null-extended rows.
+    pub fn alias_is_nullable(&self, table_alias: &str) -> bool {
+        self.nullable_aliases.contains(table_alias)
+    }
+
     /// Check if a column is nullable, considering the column's base
     /// definition, whether its source table is on a nullable JOIN side, and
     /// whether some grouping set in `GROUPING SETS`/`ROLLUP`/`CUBE` omits it.
