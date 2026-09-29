@@ -3503,6 +3503,98 @@ fn do_blocks_are_compiled() {
 }
 
 #[test]
+fn do_blocks_run_their_straight_line_statements() {
+    // PG 18 plpgsql_inline_handler runs the block: its SQL statements,
+    // EXECUTE of a string, RAISE, assignments (exec_stmt_block,
+    // exec_stmt_execsql, exec_stmt_dynexecute, exec_stmt_raise,
+    // exec_stmt_assign), nested blocks and their exception handlers.
+    let setup = "CREATE TABLE t (a int);";
+    for (stmt, msg) in [
+        ("DO $$ BEGIN RAISE EXCEPTION 'boom'; END $$;", "boom"),
+        (
+            "DO $$ BEGIN RAISE 'boom % and %', 1, 'two'; END $$;",
+            "boom 1 and two",
+        ),
+        (
+            "DO $$ DECLARE n int := 7; BEGIN RAISE EXCEPTION 'n is %, 100%%', n; END $$;",
+            "n is 7, 100%",
+        ),
+        (
+            "DO $$ BEGIN RAISE EXCEPTION USING MESSAGE = 'via using'; END $$;",
+            "via using",
+        ),
+        (
+            "DO $$ BEGIN RAISE division_by_zero; END $$;",
+            "division_by_zero",
+        ),
+        (
+            "DO $$ DECLARE x int; BEGIN x := 'abc'; END $$;",
+            "invalid input syntax for type integer: \"abc\"",
+        ),
+        (
+            "DO $$ DECLARE x int := 'abc'; BEGIN NULL; END $$;",
+            "invalid input syntax for type integer: \"abc\"",
+        ),
+        (
+            "DO $$ BEGIN CREATE TABLE t (a int); END $$;",
+            "relation \"t\" already exists",
+        ),
+        (
+            "DO $$ BEGIN INSERT INTO nosuch VALUES (1); END $$;",
+            "relation \"nosuch\" does not exist",
+        ),
+        (
+            "DO $$ BEGIN CREATE TABLE u (a int); END $$; SELECT b FROM u;",
+            "column \"b\" does not exist",
+        ),
+        (
+            "DO $$ BEGIN EXECUTE 'CREATE TABLE u (a int)'; END $$; CREATE TABLE u (a int);",
+            "relation \"u\" already exists",
+        ),
+        (
+            "DO $$ BEGIN
+               BEGIN CREATE TABLE t (a int); EXCEPTION WHEN others THEN NULL; END;
+               CREATE TABLE u (a int);
+               RAISE EXCEPTION 'after';
+             END $$;",
+            "after",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    let db = build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "DO $$ BEGIN CREATE TABLE u (a int); END $$;
+             DO $$ BEGIN EXECUTE 'CREATE TABLE w (b text)'; END $$;
+             DO $$ DECLARE n int := 1; BEGIN
+               n := 2;
+               RAISE NOTICE 'n = %', n;
+               CREATE VIEW v AS SELECT a FROM u;
+             END $$;
+             DO $$ BEGIN
+               BEGIN CREATE TABLE x (a int); CREATE TABLE t (a int);
+               EXCEPTION WHEN others THEN CREATE TABLE y (c int);
+               END;
+             END $$;
+             DO $$ BEGIN RETURN; RAISE EXCEPTION 'unreached'; END $$;",
+        ),
+    ]);
+    for sql in [
+        "SELECT a FROM u",
+        "SELECT b FROM w",
+        "SELECT a FROM v",
+        "SELECT c FROM y",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    // The failing block's subtransaction rolled x back.
+    assert!(db.resolve_table(None, "x").is_none());
+}
+
+#[test]
 fn copy_resolves_its_relation_and_options() {
     // PG 18 DoCopy / ProcessCopyOptions / BeginCopyTo / BeginCopyFrom.
     let setup = "CREATE TABLE t (a int, b int);

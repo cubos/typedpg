@@ -15,6 +15,7 @@ mod conversion_procs;
 pub(crate) mod conversions;
 mod defaults;
 mod dml;
+mod do_block;
 pub mod drop;
 pub(crate) mod event_triggers;
 mod expr_kind;
@@ -328,7 +329,11 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         node::Node::AlterEventTrigStmt(s) => event_triggers::alter_event_trigger(db, s),
         node::Node::CreatePublicationStmt(s) => publications::create_publication(db, s),
         node::Node::AlterPublicationStmt(s) => publications::alter_publication(db, s),
-        node::Node::DoStmt(s) => function_body::do_block(db, s),
+        // Compiled first (plpgsql_compile_inline), then run.
+        node::Node::DoStmt(s) => {
+            function_body::do_block(db, s)?;
+            do_block::execute(db, s)
+        }
         node::Node::AlterExtensionContentsStmt(s) => extensions::alter_extension_contents(db, s),
         node::Node::CreateFdwStmt(s) => fdw::create_fdw(db, s),
         node::Node::AlterFdwStmt(s) => fdw::alter_fdw(db, s),

@@ -15,6 +15,28 @@ struct Patch {
 const PATCHES: &[Patch] = &[
     Patch {
         file: "src/pg_query_json_plpgsql.c",
+        why: "A block's DECLAREd variables (initvarnos: the datums exec_stmt_block initializes on entry) were not dumped, so a reader couldn't tell which block declares which variable.",
+        find: r#"	WRITE_NODE_TYPE("PLpgSQL_stmt_block");
+
+	WRITE_INT_FIELD(lineno, lineno, lineno);
+	WRITE_STRING_FIELD(label, label, label);
+"#,
+        replace: r#"	WRITE_NODE_TYPE("PLpgSQL_stmt_block");
+
+	WRITE_INT_FIELD(lineno, lineno, lineno);
+	WRITE_STRING_FIELD(label, label, label);
+	if (node->n_initvars > 0)
+	{
+		appendStringInfoString(out, "\"initvarnos\":[");
+		for (int i = 0; i < node->n_initvars; i++)
+			appendStringInfo(out, "%d,", node->initvarnos[i]);
+		removeTrailingDelimiter(out);
+		appendStringInfoString(out, "],");
+	}
+"#,
+    },
+    Patch {
+        file: "src/pg_query_json_plpgsql.c",
         why: "A trigger function's TG_* variables are promise datums (a PLpgSQL_var filled in at call time); the dump wrote them as empty objects, making the whole output invalid JSON.",
         find: r#"			case PLPGSQL_DTYPE_RECFIELD:
 				dump_record_field(out, (PLpgSQL_recfield *) d);
