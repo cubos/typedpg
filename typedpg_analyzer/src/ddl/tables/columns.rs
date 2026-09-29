@@ -26,6 +26,15 @@ pub(crate) fn serial_base_type(tn: &typedpg_pg_query::protobuf::TypeName) -> Opt
     }
 }
 
+/// has_partition_attrs: whether the table's partition key reads column
+/// `attnum` (as a key column or in a key expression).
+fn in_partition_key(interp: &PgCatalog, relid: PgClassOid, attnum: i16) -> bool {
+    interp
+        .partition_key_attrs
+        .get(&relid)
+        .is_some_and(|attrs| attrs.contains(&attnum))
+}
+
 /// The canonical text of a serial column's `nextval(...)` default: it
 /// names the column's own sequence, so it matches no other default.
 pub(crate) fn serial_default_text(relid: PgClassOid, attnum: i16) -> String {
@@ -710,6 +719,14 @@ pub(crate) fn drop_column(
             cmd.name
         )));
     }
+    if in_partition_key(interp, relid, target.attnum) {
+        return Err(DdlError::Parse(format!(
+            "cannot drop column \"{}\" because it is part of the partition key of relation \
+             \"{}\"",
+            cmd.name,
+            relname_of(interp, relid)
+        )));
+    }
 
     let cascade = matches!(
         DropBehavior::try_from(cmd.behavior),
@@ -1046,6 +1063,16 @@ pub(crate) fn alter_column_type(
         return Err(DdlError::Parse(format!(
             "cannot alter inherited column \"{}\"",
             cmd.name
+        )));
+    }
+    if let Some(attr) = interp.attribute_by_name(relid, &cmd.name)
+        && in_partition_key(interp, relid, attr.attnum)
+    {
+        return Err(DdlError::Parse(format!(
+            "cannot alter column \"{}\" because it is part of the partition key of relation \
+             \"{}\"",
+            cmd.name,
+            relname_of(interp, relid)
         )));
     }
     let children: Vec<PgClassOid> = inherit::children_of(interp, relid)

@@ -540,6 +540,8 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
             "btree"
         };
         let mut key = Vec::new();
+        // Every column the key reads (has_partition_attrs).
+        let mut key_attrs: Vec<i16> = Vec::new();
         for elem in &spec.part_params {
             let Some(node::Node::PartitionElem(pe)) = elem.node.as_ref() else {
                 continue;
@@ -605,6 +607,7 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
                     }
                 }
                 read.sort_unstable();
+                key_attrs.extend(read.iter().copied());
                 if let Some(generated) = read.iter().find_map(|&attnum| {
                     interp
                         .attributes_of(class_oid)
@@ -664,6 +667,7 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
                     )));
                 }
                 key.push(attr.attnum);
+                key_attrs.push(attr.attnum);
                 Some(attr.atttypid)
             };
             if let Some(typ) = key_type {
@@ -671,6 +675,9 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
             }
         }
         interp.partition_keys.insert(class_oid, key);
+        key_attrs.sort_unstable();
+        key_attrs.dedup();
+        interp.partition_key_attrs.insert(class_oid, key_attrs);
         partbound::record_partition_spec(interp, class_oid, spec);
     }
 

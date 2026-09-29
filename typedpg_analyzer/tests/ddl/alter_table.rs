@@ -556,3 +556,36 @@ fn alter_table_actions_are_limited_to_their_relation_kinds() {
         ),
     ]);
 }
+
+#[test]
+fn partition_key_columns_can_be_neither_dropped_nor_retyped() {
+    // has_partition_attrs covers key columns and columns read by a key
+    // expression (PG 18 wording).
+    for (setup, stmt, msg) in [
+        (
+            "CREATE TABLE pp (a int, b int) PARTITION BY LIST (a);",
+            "ALTER TABLE pp DROP COLUMN a;",
+            "cannot drop column \"a\" because it is part of the partition key of relation \"pp\"",
+        ),
+        (
+            "CREATE TABLE pe (a int, b int) PARTITION BY LIST ((a + b));",
+            "ALTER TABLE pe DROP COLUMN b;",
+            "cannot drop column \"b\" because it is part of the partition key of relation \"pe\"",
+        ),
+        (
+            "CREATE TABLE pe (a int, b int) PARTITION BY LIST ((a + b));",
+            "ALTER TABLE pe ALTER COLUMN b TYPE bigint;",
+            "cannot alter column \"b\" because it is part of the partition key of relation \"pe\"",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[(
+        "0001.sql",
+        "CREATE TABLE pp (a int, b int) PARTITION BY LIST (a);
+         ALTER TABLE pp DROP COLUMN b;
+         ALTER TABLE pp ADD COLUMN c int;
+         ALTER TABLE pp ALTER COLUMN c TYPE bigint;",
+    )]);
+}

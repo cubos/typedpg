@@ -309,6 +309,9 @@ pub struct PgCatalog {
     pub(crate) enums_created_in_transaction: std::collections::HashSet<PgTypeOid>,
     /// `pg_partitioned_table`: strategy and key types.
     pub(crate) partition_specs: HashMap<PgClassOid, crate::ddl::tables::partbound::PartSpec>,
+    /// Every column a partitioned table's key reads — as a key column or
+    /// inside a key expression (`has_partition_attrs`).
+    pub(crate) partition_key_attrs: HashMap<PgClassOid, Vec<i16>>,
     /// `relpartbound` of each partition.
     pub(crate) partition_bounds: HashMap<PgClassOid, crate::ddl::tables::partbound::Bound>,
     /// CHECK constraints' expressions and `connoinherit`.
@@ -594,6 +597,7 @@ impl PgCatalog {
             uncommitted_enum_labels: Default::default(),
             enums_created_in_transaction: Default::default(),
             partition_specs: HashMap::new(),
+            partition_key_attrs: HashMap::new(),
             partition_bounds: HashMap::new(),
             check_defs: HashMap::new(),
             type_subscript: HashMap::new(),
@@ -1267,6 +1271,7 @@ impl PgCatalog {
         }
         self.index_parents.retain(|_, parent| *parent != oid);
         self.partition_specs.remove(&oid);
+        self.partition_key_attrs.remove(&oid);
         self.partition_bounds.remove(&oid);
         let row = self.pg_class.remove(&oid)?;
         self.class_by_qname
