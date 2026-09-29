@@ -40,8 +40,11 @@ pub(crate) struct TypedCat {
     /// result types that have at least one producer (for goal selection).
     pub(crate) producible: Vec<PgTypeOid>,
     /// user relations: `(relname, [(col, type, not_null)])`.
-    pub(crate) relations: Vec<(String, Vec<(String, PgTypeOid, bool)>)>,
+    pub(crate) relations: Vec<(String, Vec<RelationColumn>)>,
 }
+
+/// One column of a user relation: `(name, type, not_null)`.
+pub(crate) type RelationColumn = (String, PgTypeOid, bool);
 
 /// Build the type-directed generation index from the live catalog.
 pub(crate) fn build_typed_cat(db: &PgCatalog) -> TypedCat {
@@ -122,26 +125,26 @@ pub(crate) fn gen_typed(
     rng: &mut StdRng,
     np: &mut u32,
 ) -> String {
-    if depth > 0 && !rng.random_bool(0.4) {
-        if let Some(prods) = cat.by_result.get(&goal) {
-            if !prods.is_empty() {
-                return match &prods[rng.random_range(0..prods.len())] {
-                    Producer::Func { call, args } => {
-                        let a: Vec<String> = args
-                            .iter()
-                            .map(|&at| gen_typed(cat, cols, at, depth - 1, rng, np))
-                            .collect();
-                        format!("{call}({})", a.join(", "))
-                    }
-                    Producer::Op { name, left, right } => format!(
-                        "({} {} {})",
-                        gen_typed(cat, cols, *left, depth - 1, rng, np),
-                        name,
-                        gen_typed(cat, cols, *right, depth - 1, rng, np),
-                    ),
-                };
+    if depth > 0
+        && !rng.random_bool(0.4)
+        && let Some(prods) = cat.by_result.get(&goal)
+        && !prods.is_empty()
+    {
+        return match &prods[rng.random_range(0..prods.len())] {
+            Producer::Func { call, args } => {
+                let a: Vec<String> = args
+                    .iter()
+                    .map(|&at| gen_typed(cat, cols, at, depth - 1, rng, np))
+                    .collect();
+                format!("{call}({})", a.join(", "))
             }
-        }
+            Producer::Op { name, left, right } => format!(
+                "({} {} {})",
+                gen_typed(cat, cols, *left, depth - 1, rng, np),
+                name,
+                gen_typed(cat, cols, *right, depth - 1, rng, np),
+            ),
+        };
     }
     gen_typed_leaf(cat, cols, goal, rng, np)
 }
