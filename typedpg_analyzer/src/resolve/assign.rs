@@ -368,6 +368,8 @@ pub(crate) fn analyze_set_clause(
                     None => goal,
                 };
                 target.infer_value(val, goal, ctx, params)?;
+                // EXPR_KIND_UPDATE_SOURCE (also ON CONFLICT and MERGE SET).
+                crate::clause::check_no_aggregates_or_windows(val, snapshot, "UPDATE")?;
                 check_no_srf_in_clause(val, snapshot, "UPDATE")?;
                 if let Some(node::Node::ParamRef(p)) = val.node.as_ref()
                     && (!tc.attnotnull || target.indirected)

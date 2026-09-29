@@ -89,6 +89,16 @@ pub(crate) fn resolve_returning(
         }
     }
 
+    // EXPR_KIND_RETURNING / EXPR_KIND_MERGE_RETURNING.
+    for target in &clause.exprs {
+        if let Some(node::Node::ResTarget(rt)) = target.node.as_ref()
+            && let Some(val) = &rt.val
+        {
+            crate::clause::check_no_aggregates_or_windows(val, ctx.snapshot, "RETURNING")?;
+            check_no_srf_in_clause(val, ctx.snapshot, "RETURNING")?;
+        }
+    }
+
     let columns = resolve_target_list(
         &clause.exprs,
         expr::Ctx::new(&scope, ctx.null_ctx, ctx.snapshot),

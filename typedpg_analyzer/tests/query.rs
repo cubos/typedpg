@@ -26,6 +26,8 @@ mod cte_rules;
 mod ctes;
 #[path = "query/dml.rs"]
 mod dml;
+#[path = "query/dml_clause_kinds.rs"]
+mod dml_clause_kinds;
 #[path = "query/expressions.rs"]
 mod expressions;
 #[path = "query/join_rules.rs"]

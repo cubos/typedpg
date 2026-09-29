@@ -381,6 +381,8 @@ fn analyze_insert_values(
             if val_sel.values_lists.len() > 1 {
                 check_no_srf_in_clause(val, snapshot, "VALUES")?;
             }
+            // EXPR_KIND_VALUES / EXPR_KIND_VALUES_SINGLE.
+            crate::clause::check_no_aggregates_or_windows(val, snapshot, "VALUES")?;
             match &target {
                 Some(t) => t.infer_value(val, goal, ctx, params)?,
                 None if is_set_to_default(val) => expr::ExprType::scalar(oid::UNKNOWN, false),
@@ -607,6 +609,8 @@ fn analyze_insert_on_conflict(
             params,
             TypeGoal::implicit(oid::BOOL),
         )?;
+        crate::clause::check_no_aggregates_or_windows(where_clause, snapshot, "WHERE")?;
+        check_no_srf_in_clause(where_clause, snapshot, "WHERE")?;
     }
     Ok(())
 }

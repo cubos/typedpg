@@ -146,6 +146,9 @@ pub(crate) fn analyze_merge_with_outer_ctes(
             params,
             TypeGoal::assignment(oid::BOOL),
         )?;
+        // transformMergeStmt analyzes it as EXPR_KIND_JOIN_ON.
+        crate::clause::check_no_aggregates_or_windows(join_condition, snapshot, "JOIN conditions")?;
+        check_no_srf_in_clause(join_condition, snapshot, "JOIN conditions")?;
     }
 
     let mut source_may_be_null = false;
@@ -209,6 +212,12 @@ fn walk_merge_when_clause(
 ) -> Result<(), AnalyzeError> {
     if let Some(condition) = &when.condition {
         expr::infer_expr(condition, ctx, params, TypeGoal::assignment(oid::BOOL))?;
+        crate::clause::check_no_aggregates_or_windows(
+            condition,
+            ctx.snapshot,
+            "MERGE WHEN conditions",
+        )?;
+        check_no_srf_in_clause(condition, ctx.snapshot, "MERGE WHEN conditions")?;
     }
 
     let cmd = CmdType::try_from(when.command_type).unwrap_or(CmdType::Undefined);
@@ -322,6 +331,8 @@ fn merge_when_insert(
             .unwrap_or(TypeGoal::NONE);
         if !is_set_to_default(val) {
             expr::infer_expr(val, ctx, params, goal)?;
+            // EXPR_KIND_VALUES_SINGLE.
+            crate::clause::check_no_aggregates_or_windows(val, snapshot, "VALUES")?;
         }
         if let Some(node::Node::ParamRef(p)) = val.node.as_ref()
             && let Some(tc) = target_col
