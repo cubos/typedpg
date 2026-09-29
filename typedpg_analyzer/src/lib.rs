@@ -46,6 +46,7 @@ mod jsonpath_input;
 mod lexer;
 mod literal_input;
 mod lookup;
+mod network_input;
 mod nullability;
 mod oid;
 mod param;
@@ -63,8 +64,10 @@ mod resolve;
 mod scope;
 mod seed;
 mod suggest;
+mod tsearch_input;
 mod types;
 mod typmod;
+mod xml_input;
 
 /// Re-exports of types defined in `typedpg_core` but used pervasively by
 /// the analyzer. Kept here so downstream crates (and tests) can depend only

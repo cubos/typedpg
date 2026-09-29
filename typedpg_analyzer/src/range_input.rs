@@ -151,9 +151,9 @@ pub(crate) fn validate_range(
         return Ok(());
     };
     match lo.cmp(&hi) {
-        Ordering::Greater => Err(
-            "range lower bound must be less than or equal to range upper bound".to_string(),
-        ),
+        Ordering::Greater => {
+            Err("range lower bound must be less than or equal to range upper bound".to_string())
+        }
         // Equal bounds that are not both inclusive make an empty range,
         // which is never canonicalized.
         Ordering::Equal if !(parts.lower_inc && parts.upper_inc) => Ok(()),
@@ -165,7 +165,11 @@ pub(crate) fn validate_range(
 /// inclusive upper bound at the type's maximum can't be shifted by one.
 /// (`daterange_canonical` can only overflow past year 5874897 — out of the
 /// shapes [`BoundKey`] parses.)
-fn check_canonical(parts: &RangeParts, range_oid: PgTypeOid, snapshot: &PgCatalog) -> Result<(), String> {
+fn check_canonical(
+    parts: &RangeParts,
+    range_oid: PgTypeOid,
+    snapshot: &PgCatalog,
+) -> Result<(), String> {
     let (max, msg) = match builtin_range_kind(range_oid, snapshot) {
         Some(Kind::Int4) => (i128::from(i32::MAX), "integer out of range"),
         Some(Kind::Int8) => (i128::from(i64::MAX), "bigint out of range"),
@@ -261,38 +265,44 @@ fn parse_numeric_key(s: &str) -> Option<BoundKey> {
         return (!t.starts_with(['+', '-'])).then_some(BoundKey::NaN);
     }
     if lower == "inf" || lower == "infinity" {
-        return Some(if neg { BoundKey::NegInf } else { BoundKey::PosInf });
+        return Some(if neg {
+            BoundKey::NegInf
+        } else {
+            BoundKey::PosInf
+        });
     }
     let bytes = body.as_bytes();
-    let (digits, exp): (Vec<u8>, i64) = if bytes.len() >= 2
-        && bytes[0] == b'0'
-        && matches!(bytes[1] | 0x20, b'x' | b'o' | b'b')
-    {
-        let radix = match bytes[1] | 0x20 {
-            b'x' => 16,
-            b'o' => 8,
-            _ => 2,
+    let (digits, exp): (Vec<u8>, i64) =
+        if bytes.len() >= 2 && bytes[0] == b'0' && matches!(bytes[1] | 0x20, b'x' | b'o' | b'b') {
+            let radix = match bytes[1] | 0x20 {
+                b'x' => 16,
+                b'o' => 8,
+                _ => 2,
+            };
+            let v = u128::from_str_radix(&body[2..].replace('_', ""), radix).ok()?;
+            let d = v.to_string().into_bytes();
+            let e = d.len() as i64;
+            (d, e)
+        } else {
+            let clean = body.replace('_', "");
+            let (mantissa, exponent) = match clean.find(['e', 'E']) {
+                Some(i) => (&clean[..i], clean[i + 1..].parse::<i64>().ok()?),
+                None => (clean.as_str(), 0),
+            };
+            if exponent.abs() > 1000 {
+                return None;
+            }
+            let (int_part, frac_part) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+            if !int_part
+                .bytes()
+                .chain(frac_part.bytes())
+                .all(|c| c.is_ascii_digit())
+            {
+                return None;
+            }
+            let d: Vec<u8> = int_part.bytes().chain(frac_part.bytes()).collect();
+            (d, int_part.len() as i64 + exponent)
         };
-        let v = u128::from_str_radix(&body[2..].replace('_', ""), radix).ok()?;
-        let d = v.to_string().into_bytes();
-        let e = d.len() as i64;
-        (d, e)
-    } else {
-        let clean = body.replace('_', "");
-        let (mantissa, exponent) = match clean.find(['e', 'E']) {
-            Some(i) => (&clean[..i], clean[i + 1..].parse::<i64>().ok()?),
-            None => (clean.as_str(), 0),
-        };
-        if exponent.abs() > 1000 {
-            return None;
-        }
-        let (int_part, frac_part) = mantissa.split_once('.').unwrap_or((mantissa, ""));
-        if !int_part.bytes().chain(frac_part.bytes()).all(|c| c.is_ascii_digit()) {
-            return None;
-        }
-        let d: Vec<u8> = int_part.bytes().chain(frac_part.bytes()).collect();
-        (d, int_part.len() as i64 + exponent)
-    };
     let lead = digits.iter().position(|&c| c != b'0');
     let Some(lead) = lead else {
         return Some(BoundKey::Dec(Decimal::Zero));
@@ -373,7 +383,9 @@ fn parse_datetime_key(s: &str, kind: Kind) -> Option<BoundKey> {
     // HH:MM[:SS[.frac]]
     let two = |r: &[u8], i: usize| -> Option<i64> {
         let p = r.get(i..i + 2)?;
-        p.iter().all(u8::is_ascii_digit).then(|| i64::from(p[0] - b'0') * 10 + i64::from(p[1] - b'0'))
+        p.iter()
+            .all(u8::is_ascii_digit)
+            .then(|| i64::from(p[0] - b'0') * 10 + i64::from(p[1] - b'0'))
     };
     let hh = two(rest, 0)?;
     if rest.get(2) != Some(&b':') {
@@ -543,10 +555,20 @@ mod tests {
 
     #[test]
     fn range_structure() {
-        for ok in [" empty ", "EMPTY", "(,)", "[1,2)", "[ 1 , 2 )", "[\"1\",\"2\")", "[\\1,2)"] {
+        for ok in [
+            " empty ",
+            "EMPTY",
+            "(,)",
+            "[1,2)",
+            "[ 1 , 2 )",
+            "[\"1\",\"2\")",
+            "[\\1,2)",
+        ] {
             assert!(parse_range(ok).is_ok(), "{ok:?}");
         }
-        for bad in ["", "emptyx", "[1,2)x", "[1,2,3)", "[1", "[a,b", "[1\\", "1,2"] {
+        for bad in [
+            "", "emptyx", "[1,2)x", "[1,2,3)", "[1", "[a,b", "[1\\", "1,2",
+        ] {
             assert_eq!(
                 parse_range(bad).err().unwrap(),
                 format!("malformed range literal: \"{bad}\""),
@@ -578,9 +600,12 @@ mod tests {
         let k = |s, kind| parse_datetime_key(s, kind);
         assert!(k("2024-01-02", Kind::Date) > k("2024-01-01", Kind::Date));
         assert!(k("infinity", Kind::Date) > k("9999-12-31", Kind::Date));
-        assert!(k("2024-01-01 24:00", Kind::Timestamp) == k("2024-01-02 00:00:00", Kind::Timestamp));
         assert!(
-            k("2024-01-01 10:00+02", Kind::Timestamptz) < k("2024-01-01 09:00+00", Kind::Timestamptz)
+            k("2024-01-01 24:00", Kind::Timestamp) == k("2024-01-02 00:00:00", Kind::Timestamp)
+        );
+        assert!(
+            k("2024-01-01 10:00+02", Kind::Timestamptz)
+                < k("2024-01-01 09:00+00", Kind::Timestamptz)
         );
         assert!(k("2024-01-01 10:00", Kind::Timestamptz).is_none());
         assert!(k("2024-02-30", Kind::Date).is_none());

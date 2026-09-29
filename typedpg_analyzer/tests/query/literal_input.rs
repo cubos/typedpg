@@ -871,7 +871,14 @@ fn array_literal_element_validated_against_element_type() {
 #[test]
 fn array_literal_structure_rejected() {
     let db = setup();
-    for lit in ["{1,2", "{{1},{2,3}}", "{1,}", "{\"a\"b}", "[1:3]={1,2}", "{1} x"] {
+    for lit in [
+        "{1,2",
+        "{{1},{2,3}}",
+        "{1,}",
+        "{\"a\"b}",
+        "[1:3]={1,2}",
+        "{1} x",
+    ] {
         assert_first_line!(
             db.analyze(&format!("SELECT '{lit}'::int[]")),
             &format!("malformed array literal: \"{lit}\"")
@@ -1046,4 +1053,111 @@ fn multirange_literal_structure_and_members_validated() {
     );
     db.analyze("SELECT '{empty, [1,2), (3,4]}'::int4multirange AS v")
         .unwrap();
+}
+
+// ── bytea / tsquery / tsvector / xml / cidr ─────────────────────────────────
+
+#[test]
+fn bytea_literal_hex_and_escape_formats_validated() {
+    let db = setup();
+    assert_first_line!(
+        db.analyze("SELECT '\\xZZ'::bytea"),
+        "invalid hexadecimal digit: \"Z\""
+    );
+    assert_first_line!(
+        db.analyze("SELECT E'\\\\x4'::bytea"),
+        "invalid hexadecimal data: odd number of digits"
+    );
+    assert_first_line!(
+        db.analyze("SELECT 'ab\\401c'::bytea"),
+        "invalid input syntax for type bytea"
+    );
+    for q in [
+        "SELECT '\\x 41 42'::bytea AS v",
+        "SELECT 'ab\\\\c\\101'::bytea AS v",
+    ] {
+        db.analyze(q).unwrap_or_else(|e| panic!("{q}: {e}"));
+    }
+}
+
+#[test]
+fn tsquery_literal_parsed_like_tsqueryin() {
+    let db = setup();
+    assert_first_line!(
+        db.analyze("SELECT 'a &'::tsquery"),
+        "no operand in tsquery: \"a &\""
+    );
+    assert_first_line!(
+        db.analyze("SELECT 'a b'::tsquery"),
+        "syntax error in tsquery: \"a b\""
+    );
+    assert_first_line!(
+        db.analyze("SELECT 'a <16385> b'::tsquery"),
+        "distance in phrase operator must be an integer value between zero and 16384 inclusive"
+    );
+    // No dictionary is involved: stop words and the empty query are fine.
+    for q in [
+        "SELECT ''::tsquery AS v",
+        "SELECT 'the & a'::tsquery AS v",
+        "SELECT '(a | b) & !c <-> d:AB*'::tsquery AS v",
+    ] {
+        db.analyze(q).unwrap_or_else(|e| panic!("{q}: {e}"));
+    }
+}
+
+#[test]
+fn tsvector_literal_parsed_like_tsvectorin() {
+    let db = setup();
+    assert_first_line!(
+        db.analyze("SELECT '''a b'::tsvector"),
+        "syntax error in tsvector: \"'a b\""
+    );
+    assert_first_line!(
+        db.analyze("SELECT 'a:0'::tsvector"),
+        "wrong position info in tsvector: \"a:0\""
+    );
+    db.analyze("SELECT 'a:1A,2b ''c d'' &'::tsvector AS v")
+        .unwrap();
+}
+
+#[test]
+fn xml_literal_must_be_well_formed_content() {
+    let db = setup();
+    for lit in ["<a>", "<a></b>", "<a x=1/>", "a & b", "<!-- a -- b -->"] {
+        assert_first_line!(
+            db.analyze(&format!("SELECT '{lit}'::xml")),
+            "invalid XML content"
+        );
+    }
+    assert_first_line!(
+        db.analyze("SELECT '<?xml version=1.0?><a/>'::xml"),
+        "invalid XML content: invalid XML declaration"
+    );
+    for q in [
+        "SELECT 'plain text'::xml AS v",
+        "SELECT '<a x=\"1\">t<b/><!-- c --></a><c/>'::xml AS v",
+        "SELECT '<?xml version=\"1.0\"?><a>&amp;&#65;</a>'::xml AS v",
+    ] {
+        db.analyze(q).unwrap_or_else(|e| panic!("{q}: {e}"));
+    }
+}
+
+#[test]
+fn cidr_literal_host_bits_rejected() {
+    let db = setup();
+    for lit in ["1.2.3.4/24", "10.1/8", "fe80::1/64"] {
+        assert_first_line!(
+            db.analyze(&format!("SELECT '{lit}'::cidr")),
+            &format!("invalid cidr value: \"{lit}\"")
+        );
+    }
+    for q in [
+        "SELECT '1.2.3.0/24'::cidr AS v",
+        "SELECT '10'::cidr AS v",
+        "SELECT 'fe80::/64'::cidr AS v",
+        // inet takes an abbreviated address when the mask covers it.
+        "SELECT '192.168/16'::inet AS v",
+    ] {
+        db.analyze(q).unwrap_or_else(|e| panic!("{q}: {e}"));
+    }
 }

@@ -10,15 +10,17 @@
 //!
 //! The contract is **conservative**: [`validate`] must never reject a string
 //! PostgreSQL's input function would accept. Types whose grammar we don't
-//! model (geometric coordinates, inet, …) are accepted
-//! wholesale — except for the empty string, which a fixed list of them is
-//! known to reject (see [`EMPTY_INVALID`]). When in doubt, accept.
+//! model fully (geometric coordinates, …) are only checked
+//! for the slices we can decide exactly. When in doubt, accept.
 //!
 //! Each rejection carries PG's message verbatim (the analyzer's error-message
 //! contract): `invalid input syntax for type %s: "%s"`, `value "%s" is out of
 //! range for type %s`, `malformed array literal: "%s"`, `malformed range
-//! literal: "%s"`, `invalid input value for enum %s: "%s"`, or `invalid name
-//! syntax` — all verified against PostgreSQL 18.
+//! literal: "%s"`, `invalid input value for enum %s: "%s"`, `invalid name
+//! syntax`, … — all verified against PostgreSQL 18. Arrays, ranges,
+//! multiranges, inet/cidr, tsvector/tsquery and xml have their own modules
+//! (`array_input`, `range_input`, `network_input`, `tsearch_input`,
+//! `xml_input`).
 
 use crate::oid::PgTypeOid;
 use crate::pg_catalog::{PgCatalog, TypCategory, TypType, oid};
@@ -240,6 +242,10 @@ pub(crate) fn validate(
         }
         "bit" | "varbit" => validate_bit(content),
         "money" => validate_money(content),
+        "bytea" => validate_bytea(content),
+        "tsquery" => crate::tsearch_input::validate_tsquery(content),
+        "tsvector" => crate::tsearch_input::validate_tsvector(content),
+        "xml" => crate::xml_input::validate(content),
         "inet" => validate_inet(content, false),
         "cidr" => validate_inet(content, true),
         "macaddr" => validate_macaddr(content, false),
@@ -618,9 +624,7 @@ fn hex_float_out_of_range(
     if top == emax {
         // Rounds up to 2^(emax+1) only when the kept bits are all ones and
         // the first dropped bit is set.
-        return bits.len() > precision
-            && bits[..precision].iter().all(|&b| b)
-            && bits[precision];
+        return bits.len() > precision && bits[..precision].iter().all(|&b| b) && bits[precision];
     }
     if top < emin_sub - 1 {
         return true; // below half the smallest subnormal
@@ -641,7 +645,10 @@ fn validate_float(content: &str, type_name: &str) -> Result<(), String> {
     let err = || crate::pgmsg::invalid_input_syntax_for_type(type_name, content);
     let is_real = type_name == "real";
     let bytes = content.as_bytes();
-    let start = bytes.iter().position(|&b| !c_isspace(b)).unwrap_or(bytes.len());
+    let start = bytes
+        .iter()
+        .position(|&b| !c_isspace(b))
+        .unwrap_or(bytes.len());
     let num = &bytes[start..];
     if num.is_empty() {
         return Err(err());
@@ -1076,94 +1083,10 @@ fn validate_money(content: &str) -> Result<(), String> {
 
 // ─── network types ──────────────────────────────────────────────────────────
 
-/// One IPv4 dotted-quad. `exact` requires all 4 octets (inet); cidr accepts
-/// the abbreviated 1–3 octet forms (`'10/8'::cidr`).
-fn valid_ipv4(s: &str, exact: bool) -> bool {
-    let parts: Vec<&str> = s.split('.').collect();
-    if parts.len() > 4 || (exact && parts.len() != 4) || parts.is_empty() {
-        return false;
-    }
-    parts.iter().all(|p| {
-        !p.is_empty()
-            && p.len() <= 3
-            && p.chars().all(|c| c.is_ascii_digit())
-            && p.parse::<u16>().is_ok_and(|v| v <= 255)
-    })
-}
-
-/// IPv6 textual form: up to 8 hex groups of 1–4 digits, at most one `::`
-/// elision, optional dotted-quad in the last position.
-fn valid_ipv6(addr: &str) -> bool {
-    let (head, tail, elided) = match addr.find("::") {
-        Some(i) => (&addr[..i], &addr[i + 2..], true),
-        None => (addr, "", false),
-    };
-    // A second `::` is malformed.
-    if tail.contains("::") {
-        return false;
-    }
-    let side_groups = |s: &str, v4_allowed: bool| -> Option<u32> {
-        if s.is_empty() {
-            return Some(0);
-        }
-        let parts: Vec<&str> = s.split(':').collect();
-        let mut groups = 0u32;
-        for (i, p) in parts.iter().enumerate() {
-            if p.is_empty() {
-                return None;
-            }
-            if p.contains('.') {
-                if !v4_allowed || i != parts.len() - 1 || !valid_ipv4(p, true) {
-                    return None;
-                }
-                groups += 2;
-            } else if p.len() <= 4 && p.chars().all(|c| c.is_ascii_hexdigit()) {
-                groups += 1;
-            } else {
-                return None;
-            }
-        }
-        Some(groups)
-    };
-    let Some(head_groups) = side_groups(head, !elided) else {
-        return false;
-    };
-    let Some(tail_groups) = side_groups(tail, true) else {
-        return false;
-    };
-    let total = head_groups + tail_groups;
-    if elided { total <= 7 } else { total == 8 }
-}
-
-/// Mirrors `inet_in` / `cidr_in` (network.c): an IPv4 dotted-quad or an
-/// IPv6 address, with an optional `/bits` netmask (≤ 32 / ≤ 128). cidr also
-/// accepts the abbreviated IPv4 forms; the cidr "host bits set" check is a
-/// different error and not modeled (accepted).
+/// Mirrors `inet_in` / `cidr_in` (network.c) exactly — see
+/// [`crate::network_input`].
 fn validate_inet(content: &str, is_cidr: bool) -> Result<(), String> {
-    let name = if is_cidr { "cidr" } else { "inet" };
-    let err = || format!("invalid input syntax for type {name}: \"{content}\"");
-    let s = content.trim_matches(|c: char| c.is_ascii_whitespace());
-    let (addr, mask) = match s.split_once('/') {
-        Some((a, m)) => (a, Some(m)),
-        None => (s, None),
-    };
-    let is_v6 = addr.contains(':');
-    if let Some(m) = mask {
-        let limit = if is_v6 { 128 } else { 32 };
-        if m.is_empty()
-            || !m.chars().all(|c| c.is_ascii_digit())
-            || m.parse::<u32>().is_ok_and(|v| v > limit)
-            || m.len() > 3
-        {
-            return Err(err());
-        }
-    }
-    let ok = if is_v6 {
-        valid_ipv6(addr)
-    } else {
-        valid_ipv4(addr, !is_cidr)
-    };
-    if ok { Ok(()) } else { Err(err()) }
+    crate::network_input::validate(content, is_cidr)
 }
 
 /// Mirrors `macaddr_in` / `macaddr8_in` (mac.c / mac8.c) loosely: hex digits
@@ -1329,6 +1252,59 @@ fn validate_xid(content: &str, name: &str) -> Result<(), String> {
         return Err(format!(
             "invalid input syntax for type {name}: \"{content}\""
         ));
+    }
+    Ok(())
+}
+
+// ─── bytea ──────────────────────────────────────────────────────────────────
+
+/// Mirrors `byteain` (varlena.c): `\x` selects hex format
+/// (`hex_decode_safe`: pairs of hex digits, whitespace allowed between
+/// pairs only); anything else is escape format, where a backslash must be
+/// doubled or start a `\[0-3][0-7][0-7]` octal escape.
+fn validate_bytea(content: &str) -> Result<(), String> {
+    let b = content.as_bytes();
+    if let Some(hex) = b.strip_prefix(b"\\x") {
+        let digit_err = |i: usize| {
+            // The offending character, whole (it may be multibyte).
+            let at = content.len() - hex.len() + i;
+            let c = content[at..].chars().next().unwrap_or_default();
+            format!("invalid hexadecimal digit: \"{c}\"")
+        };
+        let mut i = 0;
+        while i < hex.len() {
+            if matches!(hex[i], b' ' | b'\n' | b'\t' | b'\r') {
+                i += 1;
+                continue;
+            }
+            if !hex[i].is_ascii_hexdigit() {
+                return Err(digit_err(i));
+            }
+            i += 1;
+            if i >= hex.len() {
+                return Err("invalid hexadecimal data: odd number of digits".to_string());
+            }
+            if !hex[i].is_ascii_hexdigit() {
+                return Err(digit_err(i));
+            }
+            i += 1;
+        }
+        return Ok(());
+    }
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'\\' {
+            i += 1;
+        } else if matches!(b.get(i + 1), Some(b'0'..=b'3'))
+            && matches!(b.get(i + 2), Some(b'0'..=b'7'))
+            && matches!(b.get(i + 3), Some(b'0'..=b'7'))
+        {
+            i += 4;
+        } else if b.get(i + 1) == Some(&b'\\') {
+            i += 2;
+        } else {
+            return Err("invalid input syntax for type bytea".to_string());
+        }
     }
     Ok(())
 }
@@ -1616,41 +1592,6 @@ mod tests {
             validate_money("9999999999999999999999").unwrap_err(),
             "value \"9999999999999999999999\" is out of range for type money"
         );
-    }
-
-    #[test]
-    fn inet_inputs() {
-        for ok in [
-            "192.168.0.1",
-            "192.168.0.1/24",
-            "::1",
-            "fe80::1/64",
-            "::ffff:192.168.0.1",
-            "1:2:3:4:5:6:7:8",
-        ] {
-            assert!(validate_inet(ok, false).is_ok(), "{ok:?} should be valid");
-        }
-        for bad in [
-            "42",
-            "192.168",
-            "256.1.1.1",
-            "192.168.0.1/33",
-            "hello",
-            "1:2:3:4:5:6:7:8:9",
-            "1::2::3",
-        ] {
-            assert!(
-                validate_inet(bad, false).is_err(),
-                "{bad:?} should be invalid"
-            );
-        }
-        for ok in ["10/8", "10.1/16", "192.168.0.0/24"] {
-            assert!(
-                validate_inet(ok, true).is_ok(),
-                "{ok:?} should be valid cidr"
-            );
-        }
-        assert!(validate_inet("x/8", true).is_err());
     }
 
     #[test]
