@@ -729,6 +729,8 @@ fn add_column_to(
     {
         find_composite_type_dependencies(interp, row_type, relid)?;
     }
+    // ATExecAddColumn: BuildDescForRelation's STORAGE and COMPRESSION.
+    super::column_options::check_column_def_options(interp, cd, col.type_oid)?;
     // ATExecAddColumn: CheckAttributeType, within the relation's row type.
     super::generated::check_attribute_type(
         interp,

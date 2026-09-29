@@ -371,6 +371,15 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
             }
         }
     }
+    // BuildDescForRelation: each column definition's STORAGE and
+    // COMPRESSION, for the column's final type.
+    for elt in &stmt.table_elts {
+        if let Some(node::Node::ColumnDef(cd)) = elt.node.as_ref()
+            && let Some(col) = columns.iter().find(|c| c.name == cd.colname)
+        {
+            column_options::check_column_def_options(interp, cd, col.type_oid)?;
+        }
+    }
     // CheckAttributeNamesTypes (heap_create_with_catalog): no column may
     // take a system column's name, then each column's type is checked.
     check_attribute_names_types(interp, &columns)?;

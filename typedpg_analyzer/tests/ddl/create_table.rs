@@ -1237,6 +1237,39 @@ fn columns_may_not_have_a_pseudo_type() {
 }
 
 #[test]
+fn column_storage_and_compression_must_suit_the_type() {
+    // BuildDescForRelation (GetAttributeStorage / GetAttributeCompression)
+    // in CREATE TABLE and ADD COLUMN, as ALTER COLUMN SET does.
+    for (sql, msg) in [
+        (
+            "CREATE TABLE t (a int COMPRESSION pglz);",
+            "column data type integer does not support compression",
+        ),
+        (
+            "CREATE TABLE t (a text STORAGE EXTERNAL, b int STORAGE MAIN);",
+            "column data type integer can only have storage PLAIN",
+        ),
+        (
+            "CREATE TABLE t (a int); ALTER TABLE t ADD COLUMN d int COMPRESSION pglz;",
+            "column data type integer does not support compression",
+        ),
+        (
+            "CREATE TABLE t (a int); ALTER TABLE t ADD COLUMN d text COMPRESSION zz;",
+            "invalid compression method \"zz\"",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", sql)]).expect_err(sql);
+        assert!(err.to_string().starts_with(msg), "{sql}\n  got: {err}");
+    }
+    build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int COMPRESSION default, b int STORAGE plain,
+                         c text STORAGE main COMPRESSION lz4);
+         ALTER TABLE t ADD COLUMN d text STORAGE external COMPRESSION pglz;",
+    )]);
+}
+
+#[test]
 fn columns_may_not_take_a_system_column_name() {
     // CheckAttributeNamesTypes / check_for_column_name_collision (even
     // under IF NOT EXISTS); views and composite types have no system

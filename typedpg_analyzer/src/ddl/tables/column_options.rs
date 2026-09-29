@@ -62,11 +62,6 @@ pub(super) fn alter_column_setting(
             cmd.name
         )));
     }
-    let typstorage = interp
-        .pg_type
-        .get(&attr.atttypid)
-        .map_or(TypStorage::Plain, |t| t.typstorage);
-    let typname = || format_type_for_message(interp, attr.atttypid);
     let def_name = || match cmd.def.as_deref().and_then(|d| d.node.as_ref()) {
         Some(node::Node::String(s)) => Some(s.sval.clone()),
         _ => None,
@@ -74,46 +69,92 @@ pub(super) fn alter_column_setting(
 
     match subtype {
         AlterTableType::AtSetStorage => {
-            // GetAttributeStorage.
-            let mode = def_name().unwrap_or_default();
-            let storage = match mode.to_ascii_lowercase().as_str() {
-                "plain" => TypStorage::Plain,
-                "external" => TypStorage::External,
-                "extended" => TypStorage::Extended,
-                "main" => TypStorage::Main,
-                "default" => typstorage,
-                _ => {
-                    return Err(DdlError::UnsupportedDdl(format!(
-                        "invalid storage type \"{mode}\""
-                    )));
-                }
-            };
-            if storage != TypStorage::Plain && typstorage == TypStorage::Plain {
-                return Err(DdlError::UnsupportedDdl(format!(
-                    "column data type {} can only have storage PLAIN",
-                    typname()
-                )));
-            }
+            get_attribute_storage(interp, attr.atttypid, &def_name().unwrap_or_default())?;
         }
         AlterTableType::AtSetCompression => {
-            // GetAttributeCompression.
             let method = def_name().unwrap_or_default();
-            if !method.is_empty() && method != "default" {
-                if typstorage == TypStorage::Plain {
-                    return Err(DdlError::UnsupportedDdl(format!(
-                        "column data type {} does not support compression",
-                        typname()
-                    )));
-                }
-                if method != "pglz" && method != "lz4" {
-                    return Err(DdlError::UnsupportedDdl(format!(
-                        "invalid compression method \"{method}\""
-                    )));
-                }
+            if !method.is_empty() {
+                get_attribute_compression(interp, attr.atttypid, &method)?;
             }
         }
         AlterTableType::AtSetOptions => check_attribute_options(cmd.def.as_deref())?,
         _ => {}
+    }
+    Ok(())
+}
+
+/// GetAttributeStorage (tablecmds.c): the storage mode `mode` for a column
+/// of type `typid` — only PLAIN for a type that can't be toasted.
+pub(crate) fn get_attribute_storage(
+    interp: &PgCatalog,
+    typid: PgTypeOid,
+    mode: &str,
+) -> Result<TypStorage, DdlError> {
+    let typstorage = interp
+        .pg_type
+        .get(&typid)
+        .map_or(TypStorage::Plain, |t| t.typstorage);
+    let storage = match mode.to_ascii_lowercase().as_str() {
+        "plain" => TypStorage::Plain,
+        "external" => TypStorage::External,
+        "extended" => TypStorage::Extended,
+        "main" => TypStorage::Main,
+        "default" => typstorage,
+        _ => {
+            return Err(DdlError::UnsupportedDdl(format!(
+                "invalid storage type \"{mode}\""
+            )));
+        }
+    };
+    if storage != TypStorage::Plain && typstorage == TypStorage::Plain {
+        return Err(DdlError::UnsupportedDdl(format!(
+            "column data type {} can only have storage PLAIN",
+            format_type_for_message(interp, typid)
+        )));
+    }
+    Ok(storage)
+}
+
+/// GetAttributeCompression (tablecmds.c): the compression method `method`
+/// for a column of type `typid` — none for a type that can't be toasted.
+pub(crate) fn get_attribute_compression(
+    interp: &PgCatalog,
+    typid: PgTypeOid,
+    method: &str,
+) -> Result<(), DdlError> {
+    let typstorage = interp
+        .pg_type
+        .get(&typid)
+        .map_or(TypStorage::Plain, |t| t.typstorage);
+    if typstorage == TypStorage::Plain {
+        if method == "default" {
+            return Ok(());
+        }
+        return Err(DdlError::UnsupportedDdl(format!(
+            "column data type {} does not support compression",
+            format_type_for_message(interp, typid)
+        )));
+    }
+    if !matches!(method, "default" | "pglz" | "lz4") {
+        return Err(DdlError::UnsupportedDdl(format!(
+            "invalid compression method \"{method}\""
+        )));
+    }
+    Ok(())
+}
+
+/// BuildDescForRelation: a column definition's STORAGE and COMPRESSION
+/// clauses, for its type.
+pub(crate) fn check_column_def_options(
+    interp: &PgCatalog,
+    cd: &typedpg_pg_query::protobuf::ColumnDef,
+    typid: PgTypeOid,
+) -> Result<(), DdlError> {
+    if !cd.storage_name.is_empty() {
+        get_attribute_storage(interp, typid, &cd.storage_name)?;
+    }
+    if !cd.compression.is_empty() {
+        get_attribute_compression(interp, typid, &cd.compression)?;
     }
     Ok(())
 }
