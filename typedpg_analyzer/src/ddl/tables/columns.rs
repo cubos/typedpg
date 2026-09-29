@@ -1305,6 +1305,28 @@ pub(crate) fn alter_column_type(
     if let Some(row_type) = interp.pg_class.get(&relid).and_then(|c| c.reltype) {
         find_composite_type_dependencies(interp, row_type, relid)?;
     }
+    // ATPrepAlterColumnType's recursion: a descendant's column may not
+    // also come from a parent outside the altered tree.
+    if rec.recurse && !rec.recursing {
+        let tree = inherit::all_inheritors(interp, relid);
+        for &descendant in &tree[1..] {
+            let numparents = interp
+                .pg_inherits
+                .iter()
+                .filter(|h| h.inhrelid == descendant && tree.contains(&h.inhparent))
+                .count() as i16;
+            if interp
+                .attribute_by_name(descendant, &cmd.name)
+                .is_some_and(|a| a.attinhcount > numparents)
+            {
+                return Err(DdlError::Parse(format!(
+                    "cannot alter inherited column \"{}\" of relation \"{}\"",
+                    cmd.name,
+                    relname_of(interp, descendant)
+                )));
+            }
+        }
+    }
     for child in children {
         alter_column_type(interp, child, cmd, rec.child())?;
     }

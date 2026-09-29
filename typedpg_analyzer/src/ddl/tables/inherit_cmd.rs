@@ -74,6 +74,15 @@ pub(super) fn add_inherit(
     if is_partition(interp, parent) {
         return Err(DdlError::Parse("cannot inherit from a partition".into()));
     }
+    // ATExecAddInherit: permanent tables can't inherit from temporary ones.
+    if super::constraints::persistence(interp, parent) == 't'
+        && super::constraints::persistence(interp, relid) != 't'
+    {
+        return Err(DdlError::Parse(format!(
+            "cannot inherit from temporary relation \"{}\"",
+            rv.relname
+        )));
+    }
     let child_name = relname_of(interp, relid);
     let parent_name = relname_of(interp, parent);
     if all_inheritors(interp, relid).contains(&parent) {

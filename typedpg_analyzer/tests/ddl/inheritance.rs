@@ -498,3 +498,77 @@ fn add_column_not_null_is_inherited_under_the_parent_name() {
         vec!["c2_b_not_null"]
     );
 }
+
+#[test]
+fn inheritance_respects_temporariness_and_partitions() {
+    // MergeAttributes / ATExecAddInherit (PG 18).
+    let setup = "CREATE TEMP TABLE tp (a int);
+                 CREATE TABLE pp (a int);
+                 CREATE TABLE ptab (a int) PARTITION BY LIST (a);
+                 CREATE TABLE pt1 PARTITION OF ptab FOR VALUES IN (2);
+                 CREATE TEMP TABLE ttab (a int) PARTITION BY LIST (a);
+                 CREATE TABLE p1 (a int);";
+    for (stmt, msg) in [
+        (
+            "CREATE TABLE pc () INHERITS (tp);",
+            "cannot inherit from temporary relation \"tp\"",
+        ),
+        (
+            "CREATE TEMP TABLE ptemp PARTITION OF ptab FOR VALUES IN (1);",
+            "cannot create a temporary relation as partition of permanent relation \"ptab\"",
+        ),
+        (
+            "CREATE TABLE tperm PARTITION OF ttab FOR VALUES IN (1);",
+            "cannot create a permanent relation as partition of temporary relation \"ttab\"",
+        ),
+        (
+            "CREATE TABLE ipt () INHERITS (pt1);",
+            "cannot inherit from partition \"pt1\"",
+        ),
+        (
+            "ALTER TABLE p1 INHERIT tp;",
+            "cannot inherit from temporary relation \"tp\"",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "CREATE TEMP TABLE tc () INHERITS (tp);
+             CREATE TEMP TABLE tc2 () INHERITS (pp);
+             CREATE TABLE pg_temp.tx () INHERITS (tp);
+             CREATE TEMP TABLE t2 (a int);
+             ALTER TABLE t2 INHERIT tp;",
+        ),
+    ]);
+}
+
+#[test]
+fn a_column_inherited_from_outside_the_tree_keeps_its_type() {
+    // ATPrepAlterColumnType: find_all_inheritors counts each descendant's
+    // parents inside the altered tree.
+    let err = try_apply(&[(
+        "0001.sql",
+        "CREATE TABLE parent1 (f1 int);
+         CREATE TABLE parent2 (f1 int);
+         CREATE TABLE childtab () INHERITS (parent1, parent2);
+         ALTER TABLE parent1 ALTER COLUMN f1 TYPE bigint;",
+    )])
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("cannot alter inherited column \"f1\" of relation \"childtab\""),
+        "{err}"
+    );
+    build_db(&[(
+        "0001.sql",
+        "CREATE TABLE top (f1 int);
+         CREATE TABLE mid1 () INHERITS (top);
+         CREATE TABLE mid2 () INHERITS (top);
+         CREATE TABLE bottom () INHERITS (mid1, mid2);
+         ALTER TABLE top ALTER COLUMN f1 TYPE bigint;",
+    )]);
+}

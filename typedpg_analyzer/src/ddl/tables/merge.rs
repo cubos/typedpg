@@ -319,6 +319,14 @@ fn inherited_columns(
 ) -> Result<(Vec<ParsedColumn>, Vec<PgClassOid>), DdlError> {
     let mut columns: Vec<ParsedColumn> = Vec::new();
     let mut parents: Vec<PgClassOid> = Vec::new();
+    // The new relation is temporary (CREATE TEMP TABLE, or created in
+    // pg_temp).
+    let new_temp = stmt.relation.as_ref().is_some_and(|rv| {
+        rv.relpersistence == "t"
+            || interp.temp_namespace.is_some_and(|temp| {
+                interp.namespace_oid(&range_var_names(rv, interp).0) == Some(temp)
+            })
+    });
     for parent_node in &stmt.inh_relations {
         let Some(node::Node::RangeVar(rv)) = parent_node.node.as_ref() else {
             continue;
@@ -348,6 +356,38 @@ fn inherited_columns(
                     )));
                 }
             }
+        }
+        // MergeAttributes: a partition takes no regular children, and a
+        // temporary relation none but temporary ones — and a partition
+        // shares its parent's temporariness.
+        if !is_partition
+            && interp.pg_inherits.iter().any(|i| {
+                i.inhrelid == parent
+                    && interp.pg_class.get(&i.inhparent).map(|c| c.relkind)
+                        == Some(RelKind::Partitioned)
+            })
+        {
+            return Err(DdlError::Parse(format!(
+                "cannot inherit from partition \"{}\"",
+                rv.relname
+            )));
+        }
+        let parent_temp = super::constraints::persistence(interp, parent) == 't';
+        if is_partition && !parent_temp && new_temp {
+            return Err(DdlError::Parse(format!(
+                "cannot create a temporary relation as partition of permanent relation \"{}\"",
+                rv.relname
+            )));
+        }
+        if parent_temp && !new_temp {
+            return Err(DdlError::Parse(if is_partition {
+                format!(
+                    "cannot create a permanent relation as partition of temporary relation \"{}\"",
+                    rv.relname
+                )
+            } else {
+                format!("cannot inherit from temporary relation \"{}\"", rv.relname)
+            }));
         }
         if parents.contains(&parent) {
             return Err(DdlError::DuplicateObject(format!(
