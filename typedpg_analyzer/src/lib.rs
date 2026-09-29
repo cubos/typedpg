@@ -31,6 +31,7 @@
 //! // result.params[0].rust_type  == "i64"
 //! ```
 
+mod array_input;
 mod builtin_nullability;
 mod clause;
 mod coerce;

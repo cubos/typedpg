@@ -833,3 +833,100 @@ fn datetime_multi_field_values_decoded() {
         "interval out of range"
     );
 }
+// ── array literal contents (array_in) ───────────────────────────────────────
+
+#[test]
+fn array_literal_element_validated_against_element_type() {
+    let db = setup();
+    assert_first_line!(
+        db.analyze("SELECT '{a}'::int[]"),
+        "invalid input syntax for type integer: \"a\""
+    );
+    assert_first_line!(
+        db.analyze("SELECT '{1,2147483648}'::int[]"),
+        "value \"2147483648\" is out of range for type integer"
+    );
+    // The element error wins over a structural error further right, as
+    // array_in calls the element input function token by token.
+    assert_first_line!(
+        db.analyze("SELECT '{a,'::int[]"),
+        "invalid input syntax for type integer: \"a\""
+    );
+    // Quoted / escaped / padded elements are de-quoted before validation.
+    for q in [
+        "SELECT '{\"1\", 2 ,\\3}'::int[] AS v",
+        "SELECT '{1\\ }'::int[] AS v",
+        "SELECT '{NULL,null}'::int[] AS v",
+        "SELECT '[0:1]={1,2}'::int[] AS v",
+    ] {
+        db.analyze(q).unwrap_or_else(|e| panic!("{q}: {e}"));
+    }
+    // A quoted "NULL" is the string, not a NULL element.
+    assert_first_line!(
+        db.analyze("SELECT '{\"NULL\"}'::int[]"),
+        "invalid input syntax for type integer: \"NULL\""
+    );
+}
+
+#[test]
+fn array_literal_structure_rejected() {
+    let db = setup();
+    for lit in ["{1,2", "{{1},{2,3}}", "{1,}", "{\"a\"b}", "[1:3]={1,2}", "{1} x"] {
+        assert_first_line!(
+            db.analyze(&format!("SELECT '{lit}'::int[]")),
+            &format!("malformed array literal: \"{lit}\"")
+        );
+    }
+    assert_first_line!(
+        db.analyze("SELECT '[2:1]={1}'::int[]"),
+        "upper bound cannot be less than lower bound"
+    );
+    assert_first_line!(
+        db.analyze("SELECT '{{{{{{{1}}}}}}}'::int[]"),
+        "number of array dimensions exceeds the maximum allowed (6)"
+    );
+    assert_first_line!(
+        db.analyze("SELECT '[1:99999999999]={1}'::int[]"),
+        "array bound is out of integer range"
+    );
+}
+
+#[test]
+fn array_literal_insert_assignment_validates_elements() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE t (id INT PRIMARY KEY, name TEXT, arr INT[]);")
+        .unwrap();
+    assert_first_line!(
+        db.analyze("INSERT INTO t (id, name, arr) VALUES (1, 'a', '{a}')"),
+        "invalid input syntax for type integer: \"a\""
+    );
+    db.analyze("INSERT INTO t (id, name, arr) VALUES (1, 'a', '{1,NULL}')")
+        .unwrap();
+}
+
+#[test]
+fn array_literal_box_elements_use_semicolon_delimiter() {
+    let db = setup();
+    db.analyze("SELECT '{(1,2),(3,4);(5,6),(7,8)}'::box[] AS v")
+        .unwrap();
+    assert_first_line!(
+        db.analyze("SELECT '{(1,2),(3,4),(5,6),(7,8)}'::box[]"),
+        "invalid input syntax for type box: \"(1,2),(3,4),(5,6),(7,8)\""
+    );
+}
+
+#[test]
+fn array_literal_null_element_of_not_null_domain_rejected() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE DOMAIN nn AS int NOT NULL; CREATE DOMAIN nn2 AS nn;")
+        .unwrap();
+    assert_first_line!(
+        db.analyze("SELECT '{NULL}'::nn[]"),
+        "domain nn does not allow null values"
+    );
+    assert_first_line!(
+        db.analyze("SELECT '{1,NULL}'::nn2[]"),
+        "domain nn2 does not allow null values"
+    );
+    db.analyze("SELECT cardinality('{1}'::nn2[]) AS v").unwrap();
+}

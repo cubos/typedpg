@@ -100,26 +100,16 @@ pub(crate) fn validate(
         return Err(format!("malformed multirange literal: \"{content}\""));
     }
 
-    // True arrays: after optional leading whitespace the value must open with
-    // `{` (or `[` for the explicit-dimensions form `[1:2]={…}`). Element
-    // contents are not validated. `oidvector`/`int2vector` share the Array
-    // category but use their own space-separated input format — skip them
-    // (they're exactly the types whose element doesn't point back via
-    // `typarray`).
+    // True arrays: `array_in`'s grammar (see `crate::array_input`), each
+    // element validated with the element type's own input rules.
+    // `oidvector`/`int2vector` share the Array category but use their own
+    // space-separated input format — skip them (they're exactly the types
+    // whose element doesn't point back via `typarray`).
     if t.typcategory == TypCategory::Array
-        && t.typelem
-            .is_some_and(|e| snapshot.array_type_of(e) == Some(target))
+        && let Some(elem) = t.typelem
+        && snapshot.array_type_of(elem) == Some(target)
     {
-        let trimmed = content.trim_start_matches(|c: char| c.is_ascii_whitespace());
-        if trimmed.starts_with('{') {
-            return Ok(());
-        }
-        // The explicit-dimensions form is `[lo:hi]…={…}` — a `[` opener
-        // without the `={` separator (e.g. `'[1,]'`) is malformed.
-        if trimmed.starts_with('[') && trimmed.contains("={") {
-            return Ok(());
-        }
-        return Err(format!("malformed array literal: \"{content}\""));
+        return validate_array(content, elem, snapshot);
     }
 
     // Name-resolving and fixed-syntax pg_catalog builtins, keyed by name.
@@ -1185,6 +1175,60 @@ fn validate_xid(content: &str, name: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+// ─── arrays ─────────────────────────────────────────────────────────────────
+
+/// Mirrors `array_in` (arrayfuncs.c): the structural grammar is walked by
+/// [`crate::array_input::parse_array`], and every element is validated in
+/// input order exactly as `array_in` calls the element's input function —
+/// recursively through [`validate`] for non-NULL elements, and through the
+/// domain's NOT NULL constraint for NULL ones (`domain_in` is not strict).
+///
+/// The element delimiter is the element type's `typdelim`: `;` for `box`,
+/// `,` for every other built-in. A base type defined outside `pg_catalog`
+/// (an extension's, with a `DELIMITER` we don't record) only gets the
+/// opening-shape check.
+fn validate_array(content: &str, elem: PgTypeOid, snapshot: &PgCatalog) -> Result<(), String> {
+    let base = snapshot.unwrap_domain(elem);
+    let Some(base_type) = snapshot.get_type(base) else {
+        return Ok(());
+    };
+    let in_pg_catalog = snapshot.namespace_name(base_type.typnamespace) == Some("pg_catalog");
+    let delim = if in_pg_catalog && base_type.typname == "box" {
+        b';'
+    } else if base_type.typtype == TypType::Base && !in_pg_catalog {
+        let trimmed = content.trim_start_matches(|c: char| c.is_ascii_whitespace());
+        if trimmed.starts_with('{') || (trimmed.starts_with('[') && trimmed.contains("={")) {
+            return Ok(());
+        }
+        return Err(format!("malformed array literal: \"{content}\""));
+    } else {
+        b','
+    };
+    crate::array_input::parse_array(content, delim, &mut |e| match e {
+        Some(value) => validate(value, elem, snapshot),
+        None => check_domain_accepts_null(elem, snapshot),
+    })
+}
+
+/// `domain_check_input` on a NULL value: any NOT NULL constraint along the
+/// domain chain rejects it, naming the outermost domain.
+fn check_domain_accepts_null(ty: PgTypeOid, snapshot: &PgCatalog) -> Result<(), String> {
+    if snapshot.domain_not_null_name(ty).is_some() {
+        let name = crate::ddl::util::format_type_for_message(snapshot, ty);
+        return Err(format!("domain {name} does not allow null values"));
+    }
+    Ok(())
+}
+
+/// True unless the array literal `content` provably parses to an array
+/// with no NULL element (an unquoted `NULL`, in any case, is a NULL
+/// element; `"NULL"` is a string). Malformed literals report `true`.
+/// Exposed for the nullability of `x = ANY('{…}')`.
+#[allow(dead_code)]
+pub(crate) fn array_literal_may_contain_null(content: &str) -> bool {
+    crate::array_input::may_contain_null(content)
 }
 
 #[cfg(test)]
