@@ -589,3 +589,59 @@ fn partition_key_columns_can_be_neither_dropped_nor_retyped() {
          ALTER TABLE pp ALTER COLUMN c TYPE bigint;",
     )]);
 }
+
+#[test]
+fn a_row_type_stored_elsewhere_pins_the_table() {
+    // find_composite_type_dependencies (PG 18): rewriting a table — ALTER
+    // COLUMN TYPE, or ADD COLUMN with a default — or retyping a virtual or
+    // partitioned table's column is refused while a stored column holds its
+    // row type, directly or through an array / domain.
+    let setup = "CREATE TABLE t1 (a int, v text GENERATED ALWAYS AS ('hello') VIRTUAL);
+                 CREATE TABLE t2 (x t1);
+                 CREATE TABLE t3 (a int);
+                 CREATE TABLE t4 (x t3[]);
+                 CREATE TABLE p (a int, b int) PARTITION BY LIST (a);
+                 CREATE TABLE pu (x p);
+                 CREATE TYPE ct AS (x int);
+                 CREATE TABLE ut (c ct);";
+    for (stmt, msg) in [
+        (
+            "ALTER TABLE t1 ALTER COLUMN v TYPE varchar;",
+            "cannot alter table \"t1\" because column \"t2.x\" uses its row type",
+        ),
+        (
+            "ALTER TABLE t1 ADD COLUMN c int DEFAULT 1;",
+            "cannot alter table \"t1\" because column \"t2.x\" uses its row type",
+        ),
+        (
+            "ALTER TABLE t1 ADD COLUMN c serial;",
+            "cannot alter table \"t1\" because column \"t2.x\" uses its row type",
+        ),
+        (
+            "ALTER TABLE t3 ALTER COLUMN a TYPE bigint;",
+            "cannot alter table \"t3\" because column \"t4.x\" uses its row type",
+        ),
+        (
+            "ALTER TABLE p ALTER COLUMN b TYPE bigint;",
+            "cannot alter table \"p\" because column \"pu.x\" uses its row type",
+        ),
+        (
+            "ALTER TYPE ct ALTER ATTRIBUTE x TYPE bigint;",
+            "cannot alter type \"ct\" because column \"ut.c\" uses it",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "ALTER TABLE t1 ADD COLUMN c int;
+             ALTER TABLE t1 ALTER COLUMN c SET NOT NULL;
+             ALTER TABLE p ADD COLUMN d int DEFAULT 1;
+             ALTER TYPE ct ADD ATTRIBUTE y int;
+             ALTER TYPE ct DROP ATTRIBUTE y;",
+        ),
+    ]);
+}

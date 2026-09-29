@@ -26,6 +26,125 @@ pub(crate) fn serial_base_type(tn: &typedpg_pg_query::protobuf::TypeName) -> Opt
     }
 }
 
+/// find_composite_type_dependencies (tablecmds.c): the relation `orig`'s
+/// row type (or an attribute type of composite type `orig`) can't change
+/// while a stored column holds values of it — directly, or through an
+/// array, domain, range or multirange over it, or a view's or composite
+/// type's row type that contains it. A column of a relation with storage
+/// or partitions blocks; other relations only pass the question on.
+pub(crate) fn find_composite_type_dependencies(
+    interp: &PgCatalog,
+    type_oid: PgTypeOid,
+    orig: PgClassOid,
+) -> Result<(), DdlError> {
+    let mut visited = Vec::new();
+    composite_dependencies_of(interp, type_oid, orig, &mut visited)
+}
+
+fn composite_dependencies_of(
+    interp: &PgCatalog,
+    type_oid: PgTypeOid,
+    orig: PgClassOid,
+    visited: &mut Vec<PgTypeOid>,
+) -> Result<(), DdlError> {
+    if visited.contains(&type_oid) {
+        return Ok(());
+    }
+    visited.push(type_oid);
+    // Types containing it.
+    let mut containers: Vec<PgTypeOid> = interp
+        .pg_type
+        .values()
+        .filter(|t| {
+            (t.typcategory == TypCategory::Array && t.typelem == Some(type_oid))
+                || t.typbasetype == Some(type_oid)
+        })
+        .map(|t| t.oid)
+        .collect();
+    containers.extend(
+        interp
+            .pg_range
+            .values()
+            .filter(|r| r.rngsubtype == type_oid)
+            .map(|r| r.rngtypid),
+    );
+    containers.extend(interp.pg_range.get(&type_oid).and_then(|r| r.rngmultitypid));
+    containers.sort();
+    for container in containers {
+        composite_dependencies_of(interp, container, orig, visited)?;
+    }
+    // Relations with a column of it.
+    let mut users: Vec<(PgClassOid, String)> = interp
+        .pg_attribute
+        .iter()
+        .filter_map(|(rel, attrs)| {
+            attrs
+                .iter()
+                .find(|a| a.atttypid == type_oid)
+                .map(|a| (*rel, a.attname.clone()))
+        })
+        .collect();
+    users.sort();
+    for (rel, column) in users {
+        let Some(class) = interp.pg_class.get(&rel) else {
+            continue;
+        };
+        if matches!(
+            class.relkind,
+            RelKind::Table | RelKind::MaterializedView | RelKind::Partitioned
+        ) {
+            let orig_class = interp.pg_class.get(&orig);
+            let orig_name = relname_of(interp, orig);
+            let user = format!("{}.{column}", class.relname);
+            return Err(DdlError::UnsupportedDdl(
+                match orig_class.map(|c| c.relkind) {
+                    Some(RelKind::CompositeType) => {
+                        format!(
+                            "cannot alter type \"{orig_name}\" because column \"{user}\" uses it"
+                        )
+                    }
+                    Some(RelKind::ForeignTable) => format!(
+                        "cannot alter foreign table \"{orig_name}\" because column \"{user}\" uses \
+                         its row type"
+                    ),
+                    _ => format!(
+                        "cannot alter table \"{orig_name}\" because column \"{user}\" uses its row \
+                         type"
+                    ),
+                },
+            ));
+        }
+        if let Some(row_type) = class.reltype {
+            composite_dependencies_of(interp, row_type, orig, visited)?;
+        }
+    }
+    Ok(())
+}
+
+/// DomainHasConstraints: a domain in `typ`'s chain carries a CHECK or NOT
+/// NULL constraint.
+fn domain_has_constraints(interp: &PgCatalog, typ: PgTypeOid) -> bool {
+    let mut current = typ;
+    while let Some(t) = interp.pg_type.get(&current) {
+        if t.typtype != TypType::Domain {
+            return false;
+        }
+        if t.typnotnull
+            || interp
+                .domain_constraints
+                .get(&current)
+                .is_some_and(|c| !c.is_empty())
+        {
+            return true;
+        }
+        match t.typbasetype {
+            Some(base) => current = base,
+            None => return false,
+        }
+    }
+    false
+}
+
 /// has_partition_attrs: whether the table's partition key reads column
 /// `attnum` (as a key column or in a key expression).
 fn in_partition_key(interp: &PgCatalog, relid: PgClassOid, attnum: i16) -> bool {
@@ -597,6 +716,14 @@ fn add_column_to(
         )));
     }
 
+    // ATExecAddColumn: a column with a default — or a constrained domain
+    // type, whose NULL default is checked — rewrites a table's rows.
+    if interp.pg_class.get(&relid).map(|c| c.relkind) == Some(RelKind::Table)
+        && (col.has_default || domain_has_constraints(interp, col.type_oid))
+        && let Some(row_type) = interp.pg_class.get(&relid).and_then(|c| c.reltype)
+    {
+        find_composite_type_dependencies(interp, row_type, relid)?;
+    }
     // ATExecAddColumn: CheckAttributeType.
     if col.generated == Some(AttGenerated::Virtual) {
         super::generated::check_virtual_column_type(interp, &col.name, col.type_oid)?;
@@ -1099,41 +1226,6 @@ pub(crate) fn alter_column_type(
         .attribute_by_name(relid, &cmd.name)
         .cloned()
         .ok_or_else(|| DdlError::Parse(column_not_found_msg(interp, relid, &cmd.name)))?;
-    // find_composite_type_dependencies: a composite type's attribute can't
-    // change type while a table column stores values of the type.
-    if let Some(class) = interp.pg_class.get(&relid)
-        && class.relkind == RelKind::CompositeType
-        && let Some(row_type) = class.reltype
-    {
-        let array = interp.array_type_of(row_type);
-        let user = interp
-            .pg_attribute
-            .iter()
-            .filter(|(user_rel, _)| {
-                interp.pg_class.get(user_rel).is_some_and(|c| {
-                    matches!(
-                        c.relkind,
-                        RelKind::Table
-                            | RelKind::Partitioned
-                            | RelKind::ForeignTable
-                            | RelKind::MaterializedView
-                    )
-                })
-            })
-            .find_map(|(user_rel, attrs)| {
-                attrs
-                    .iter()
-                    .find(|a| a.atttypid == row_type || Some(a.atttypid) == array)
-                    .map(|a| (*user_rel, a.attname.clone()))
-            });
-        if let Some((user_rel, column)) = user {
-            return Err(DdlError::Parse(format!(
-                "cannot alter type \"{}\" because column \"{}.{column}\" uses it",
-                class.relname,
-                relname_of(interp, user_rel)
-            )));
-        }
-    }
     // GetColumnDefCollation: an explicit COLLATE, else the new type's
     // default — the old column's collation does not carry over.
     let new_collation = column_collation(interp, cd, new_type_oid)?
@@ -1208,6 +1300,11 @@ pub(crate) fn alter_column_type(
         )));
     }
 
+    // The table's rewrite (or, without storage, this check now): no stored
+    // column may hold its row type.
+    if let Some(row_type) = interp.pg_class.get(&relid).and_then(|c| c.reltype) {
+        find_composite_type_dependencies(interp, row_type, relid)?;
+    }
     for child in children {
         alter_column_type(interp, child, cmd, rec.child())?;
     }
@@ -1506,6 +1603,12 @@ pub(crate) fn set_expression(
              tables that are part of a publication {}",
             virtual_detail()
         )));
+    }
+    if kind == AttGenerated::Stored
+        && interp.pg_class.get(&relid).map(|c| c.relkind) == Some(RelKind::Table)
+        && let Some(row_type) = interp.pg_class.get(&relid).and_then(|c| c.reltype)
+    {
+        find_composite_type_dependencies(interp, row_type, relid)?;
     }
     if let Some(expr) = cmd.def.as_deref() {
         let cooked = super::generated::cook_generation_expr(
