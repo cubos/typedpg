@@ -984,6 +984,7 @@ pub(crate) fn validate_constraint_expressions(
                             expr,
                             crate::ddl::expr_kind::ExprKind::CheckConstraint,
                         )?;
+                        check_system_column_refs(interp, class_oid, expr)?;
                         // Infer with no type goal so a non-bool result
                         // doesn't surface as a TypeMismatch — we want PG's
                         // exact wording (`argument of CHECK must be type
@@ -1047,6 +1048,7 @@ pub(crate) fn validate_constraint_expressions(
                 expr,
                 crate::ddl::expr_kind::ExprKind::CheckConstraint,
             )?;
+            check_system_column_refs(interp, class_oid, expr)?;
             let result = infer_expr(
                 expr,
                 crate::expr::Ctx::new(&scope, &null_ctx, interp),
@@ -1602,6 +1604,37 @@ fn add_index_constraint(
     Ok(())
 }
 
+/// scanNSItemForColumn under EXPR_KIND_CHECK_CONSTRAINT: a CHECK
+/// constraint may read no system column but `tableoid`.
+fn check_system_column_refs(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+    expr: &typedpg_pg_query::protobuf::Node,
+) -> Result<(), DdlError> {
+    let Some(inner) = expr.node.as_ref() else {
+        return Ok(());
+    };
+    for (n, ..) in inner.nodes() {
+        let typedpg_pg_query::NodeRef::ColumnRef(cr) = n else {
+            continue;
+        };
+        let Some(name) = cr.fields.last().and_then(crate::ddl::util::node_string) else {
+            continue;
+        };
+        if name != "tableoid"
+            && interp.attribute_by_name(relid, name).is_none()
+            && crate::pg_catalog::SYSTEM_COLUMNS
+                .iter()
+                .any(|(n, ..)| *n == name)
+        {
+            return Err(DdlError::Parse(format!(
+                "system column \"{name}\" reference in check constraint is invalid"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Run a CHECK expression through the analyzer in the scope of `relid`
 /// and verify its result type is boolean. Used by ALTER TABLE ADD
 /// CONSTRAINT (the CREATE TABLE path uses [`validate_constraint_expressions`]
@@ -1644,6 +1677,7 @@ fn validate_check_expression_for_table(
         expr,
         crate::ddl::expr_kind::ExprKind::CheckConstraint,
     )?;
+    check_system_column_refs(interp, relid, expr)?;
     let result = infer_expr(
         expr,
         crate::expr::Ctx::new(&scope, &null_ctx, interp),

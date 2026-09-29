@@ -797,3 +797,25 @@ fn on_conflict_on_constraint_needs_an_index_backed_constraint() {
     db.analyze("INSERT INTO t VALUES (1) ON CONFLICT ON CONSTRAINT t_c_key DO NOTHING")
         .unwrap();
 }
+
+#[test]
+fn check_constraints_read_no_system_column_but_tableoid() {
+    // scanNSItemForColumn (EXPR_KIND_CHECK_CONSTRAINT), PG 18 wording.
+    for stmt in [
+        "CREATE TABLE t (a text, CHECK (ctid::text = 'x'));",
+        "CREATE TABLE t (a text CHECK (xmin::text <> ''));",
+        "CREATE TABLE t (a text); ALTER TABLE t ADD CHECK (cmax::text <> '');",
+    ] {
+        let err = try_apply(&[("0001.sql", stmt)]).expect_err(stmt);
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("system column \"")
+                && msg.contains("reference in check constraint is invalid"),
+            "{stmt}\n  got: {msg}"
+        );
+    }
+    build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a text, CHECK (tableoid::regclass::text = 't'));",
+    )]);
+}
