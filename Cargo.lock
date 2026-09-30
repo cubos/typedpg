@@ -3234,7 +3234,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "typedpg"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bb8",
  "bb8-postgres",
@@ -3259,7 +3259,7 @@ dependencies = [
 
 [[package]]
 name = "typedpg_analyzer"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -3278,7 +3278,7 @@ dependencies = [
 
 [[package]]
 name = "typedpg_cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "clap",
@@ -3293,7 +3293,7 @@ dependencies = [
 
 [[package]]
 name = "typedpg_core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3336,7 +3336,7 @@ dependencies = [
 
 [[package]]
 name = "typedpg_macros"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3351,7 +3351,7 @@ dependencies = [
 
 [[package]]
 name = "typedpg_pg_query"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cc",
  "prost",
@@ -3362,7 +3362,7 @@ dependencies = [
 
 [[package]]
 name = "typedpg_pg_query_codegen"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "heck",
  "prost-build",
