@@ -167,8 +167,7 @@ fn lookup_by_names(typname: &str, names: &[String], snapshot: &PgCatalog) -> Res
                 crate::ddl::depend::note(crate::ddl::depend::ObjectAddress::relation(class.oid));
                 return Ok(());
             }
-            if schema.is_some_and(is_system_schema)
-                || (schema.is_none() && rel.starts_with("pg_"))
+            if schema.is_some_and(is_system_schema) || (schema.is_none() && rel.starts_with("pg_"))
             {
                 return Ok(());
             }
