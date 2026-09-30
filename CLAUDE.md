@@ -132,6 +132,13 @@ is rejected at compile time with the error the execution raises. That is
 stricter than PREPARE, and correct: the oracle's execute fallback runs such
 a query and compares against the runtime error.
 
+One deliberate exception goes further: writing a literal `NULL` into a NOT
+NULL column (or NOT NULL domain) is rejected at compile time in UPDATE and
+MERGE too, although PG fails only the executions that touch a row (an UPDATE
+or MERGE matching nothing succeeds). Such a statement is a bug whenever it
+does anything, so typedpg reports it; those tests call `skip_pg_sanity`,
+since the oracle's execute fallback runs against empty tables.
+
 When a query has **multiple simultaneous errors**, we deliberately do **not**
 require the analyzer to pick the *same* error PG reports first. PG's
 error-reporting order follows its own parse/transform sequence (it resolves an
@@ -159,4 +166,11 @@ collide on a plain `format!`.
 Always use `typedpg_core::QualifiedName::new(schema, name).to_string()`
 (or pass the `QualifiedName` directly to `format!("{}", qn)`). The
 `Display` impl handles the quoting and is the canonical way to render
-these names — including in error messages that must match PG verbatim.
+these names — including in error messages, whenever PG quotes them.
+
+The exception is an error message PG itself builds from the raw names: the
+verbatim contract wins, so render exactly what PG's `errmsg` does. E.g.
+`RangeVarGetRelidExtended` reports `relation "%s.%s" does not exist` with
+neither quoting nor escaping (`"My Schema"."a""b"` → `relation "My
+Schema.a"b" does not exist`). Cite the PG `errmsg` in a comment where you
+do this.
