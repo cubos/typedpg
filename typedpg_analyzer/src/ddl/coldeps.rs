@@ -347,6 +347,26 @@ fn statement_refs(interp: &PgCatalog, stmt: &Node, extra_from: &[Node]) -> Vec<(
             {
                 refs.push((relid, 0));
                 refs.extend(names_of(interp, relid, &ins.cols));
+                // Without a column list the values go to the leading
+                // columns (transformInsertStmt's implicit target list).
+                if ins.cols.is_empty() {
+                    let given = match ins.select_stmt.as_deref().and_then(|s| s.node.as_ref()) {
+                        Some(node::Node::SelectStmt(sel)) => match sel.values_lists.first() {
+                            Some(row) => match row.node.as_ref() {
+                                Some(node::Node::List(l)) => Some(l.items.len()),
+                                _ => None,
+                            },
+                            None => Some(sel.target_list.len()),
+                        },
+                        _ => None,
+                    };
+                    let columns = interp.attributes_of(relid).iter().filter(|a| a.attnum > 0);
+                    refs.extend(
+                        columns
+                            .take(given.unwrap_or(usize::MAX))
+                            .map(|a| (relid, a.attnum)),
+                    );
+                }
             }
             if let Some(source) = ins.select_stmt.as_deref() {
                 refs.extend(statement_refs(interp, source, extra_from));
@@ -398,6 +418,77 @@ fn statement_refs(interp: &PgCatalog, stmt: &Node, extra_from: &[Node]) -> Vec<(
         _ => {}
     }
     refs
+}
+
+/// The functions a statement calls — SELECT, INSERT, UPDATE, DELETE —
+/// with `extra_from` in scope, as [`statement_refs`] walks it.
+fn statement_functions(interp: &PgCatalog, stmt: &Node, extra_from: &[Node]) -> Vec<PgProcOid> {
+    let walk = |select: &Node| super::views::statement_functions(interp, select);
+    let with_target = |rv: &protobuf::RangeVar, more: &[Node]| {
+        let mut from = vec![range_var_node(rv, None)];
+        from.extend(more.iter().cloned());
+        from.extend(extra_from.iter().cloned());
+        from
+    };
+    match stmt.node.as_ref() {
+        Some(node::Node::SelectStmt(sel)) if !sel.values_lists.is_empty() => {
+            let exprs: Vec<&Node> = sel
+                .values_lists
+                .iter()
+                .flat_map(|row| match row.node.as_ref() {
+                    Some(node::Node::List(l)) => l.items.iter().collect::<Vec<_>>(),
+                    _ => Vec::new(),
+                })
+                .collect();
+            walk(&select_of(&exprs, extra_from.to_vec()))
+        }
+        Some(node::Node::SelectStmt(sel)) => {
+            let mut sel = sel.clone();
+            sel.from_clause.extend(extra_from.iter().cloned());
+            walk(&Node {
+                node: Some(node::Node::SelectStmt(sel)),
+            })
+        }
+        Some(node::Node::InsertStmt(ins)) => {
+            let mut out = ins
+                .select_stmt
+                .as_deref()
+                .map(|s| statement_functions(interp, s, extra_from))
+                .unwrap_or_default();
+            let returning = returning_vals(&ins.returning_clause);
+            if let Some(rv) = ins.relation.as_ref()
+                && !returning.is_empty()
+            {
+                out.extend(walk(&select_of(&returning, with_target(rv, &[]))));
+            }
+            out
+        }
+        Some(node::Node::UpdateStmt(upd)) => {
+            let Some(rv) = upd.relation.as_ref() else {
+                return Vec::new();
+            };
+            let mut exprs: Vec<&Node> = upd
+                .target_list
+                .iter()
+                .filter_map(|t| match t.node.as_ref()? {
+                    node::Node::ResTarget(rt) => rt.val.as_deref(),
+                    _ => None,
+                })
+                .collect();
+            exprs.extend(upd.where_clause.as_deref());
+            exprs.extend(returning_vals(&upd.returning_clause));
+            walk(&select_of(&exprs, with_target(rv, &upd.from_clause)))
+        }
+        Some(node::Node::DeleteStmt(del)) => {
+            let Some(rv) = del.relation.as_ref() else {
+                return Vec::new();
+            };
+            let mut exprs: Vec<&Node> = del.where_clause.as_deref().into_iter().collect();
+            exprs.extend(returning_vals(&del.returning_clause));
+            walk(&select_of(&exprs, with_target(rv, &del.using_clause)))
+        }
+        _ => Vec::new(),
+    }
 }
 
 // ─── Recording ──────────────────────────────────────────────────────────
@@ -565,14 +656,23 @@ pub(crate) fn record_rule(
     // The rule's own relation, through NEW / OLD, is its owner, not a
     // dependency of its own (its columns are).
     refs.retain(|&(r, attnum)| r != relid || attnum != 0);
-    set(
-        interp,
-        Dependent::Rule {
-            relid,
-            name: stmt.rulename.clone(),
-        },
-        refs,
-    );
+    // The functions its qualification and actions call.
+    let mut functions: Vec<PgProcOid> = Vec::new();
+    if let Some(qual) = stmt.where_clause.as_deref() {
+        functions.extend(super::views::statement_functions(
+            interp,
+            &select_of(&[qual], new_old.clone()),
+        ));
+    }
+    for action in &stmt.actions {
+        functions.extend(statement_functions(interp, action, &new_old));
+    }
+    let dep = Dependent::Rule {
+        relid,
+        name: stmt.rulename.clone(),
+    };
+    set(interp, dep.clone(), refs);
+    set_functions(interp, dep, functions);
     Ok(())
 }
 

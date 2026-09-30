@@ -2039,6 +2039,55 @@ fn rule_returning_lists_and_the_return_rule_are_validated() {
 }
 
 #[test]
+fn rules_depend_on_the_relations_their_actions_name() {
+    // PG 18 InsertRule records the rule's dependencies on what its actions
+    // and qualification read (recordDependencyOnExpr): dropping one needs
+    // CASCADE, which drops the rule.
+    let setup = "CREATE TABLE t (a int);
+                 CREATE TABLE u (a int);
+                 CREATE VIEW v AS SELECT a FROM t;
+                 CREATE RULE r AS ON INSERT TO v DO INSTEAD INSERT INTO u VALUES (new.a);
+                 CREATE TABLE w (b int, c int);
+                 CREATE FUNCTION f(int) RETURNS int LANGUAGE sql AS 'select $1';
+                 CREATE RULE q AS ON UPDATE TO v DO INSTEAD UPDATE w SET b = f(new.a) WHERE c > 0;";
+    for (stmt, msg) in [
+        (
+            "DROP TABLE u;",
+            "cannot drop table u because other objects depend on it",
+        ),
+        (
+            "ALTER TABLE u ALTER COLUMN a TYPE bigint;",
+            "cannot alter type of a column used by a view or rule",
+        ),
+        (
+            "ALTER TABLE w DROP COLUMN c;",
+            "cannot drop column c of table w because other objects depend on it",
+        ),
+        (
+            "DROP FUNCTION f(int);",
+            "cannot drop function f(integer) because other objects depend on it",
+        ),
+        (
+            "ALTER TABLE u DROP COLUMN a;",
+            "cannot drop column a of table u because other objects depend on it",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "DROP TABLE u CASCADE;
+             INSERT INTO v VALUES (1);
+             DROP FUNCTION f(int) CASCADE;
+             ALTER TABLE w DROP COLUMN c;",
+        ),
+    ]);
+}
+
+#[test]
 fn alter_owner_and_comment_resolve_their_target() {
     // PG 18 get_object_address / LookupFuncWithArgs / AlterTypeOwner /
     // get_collation_oid / get_trigger_oid / get_relation_policy_oid /
