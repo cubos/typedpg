@@ -608,6 +608,8 @@ pub struct PgSetting {
 /// (`pg_ts_template`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize_tuple, Deserialize_tuple)]
 pub struct PgTsObject {
+    /// The object's OID in its catalog: the identity `pg_depend` rows name.
+    pub oid: PgGenericOid,
     pub kind: String,
     pub name: String,
     /// FK `pg_namespace.oid`.

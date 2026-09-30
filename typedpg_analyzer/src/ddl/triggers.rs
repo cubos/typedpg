@@ -13,6 +13,8 @@ use crate::pg_catalog::{PgCatalog, RelKind};
 /// A trigger (`pg_trigger`): its name, function and firing kind.
 #[derive(Clone, Debug)]
 pub(crate) struct Trigger {
+    /// `pg_trigger.oid`: the identity `pg_depend` rows name.
+    pub(crate) oid: crate::oid::PgGenericOid,
     pub(crate) name: String,
     pub(crate) function: PgProcOid,
     /// The `TRIGGER_TYPE_INSERT | _DELETE | _UPDATE | _TRUNCATE` bits of
@@ -253,6 +255,7 @@ pub fn create_trigger(interp: &mut PgCatalog, stmt: &CreateTrigStmt) -> Result<(
         .map(str::to_owned)
         .collect();
     let trigger = Trigger {
+        oid: crate::ddl::depend::PENDING_OID,
         name: stmt.trigname.clone(),
         function,
         instead_row_events: if stmt.timing & TRIGGER_TYPE_INSTEAD != 0 && stmt.row {
@@ -523,6 +526,13 @@ fn install(
     let clone_to_partitions =
         trigger.row && interp.pg_class.get(&relid).map(|c| c.relkind) == Some(RelKind::Partitioned);
     let clone = trigger.clone();
+    // A replaced trigger keeps its identity; a new one (a partition's clone
+    // too) gets its own.
+    let oid = match existing {
+        Some(at) => interp.triggers[&relid][at].oid,
+        None => crate::oid::PgGenericOid::from_nonzero(interp.alloc_oid()?),
+    };
+    let trigger = Trigger { oid, ..trigger };
     let triggers = interp.triggers.entry(relid).or_default();
     match existing {
         Some(at) => triggers[at] = trigger,
@@ -608,7 +618,11 @@ pub(crate) fn drop_cloned_triggers(interp: &mut PgCatalog, part: PgClassOid) {
 /// Remove trigger `name` of `relid` and, recursively, its clones.
 fn remove_with_clones(interp: &mut PgCatalog, relid: PgClassOid, name: &str) {
     if let Some(triggers) = interp.triggers.get_mut(&relid) {
+        let dropped = triggers.iter().find(|t| t.name == name).map(|t| t.oid);
         triggers.retain(|t| t.name != name);
+        if let Some(oid) = dropped {
+            interp.remove_dependencies_of(super::depend::PG_TRIGGER_RELID, oid);
+        }
     }
     for part in partitions_of(interp, relid) {
         if interp

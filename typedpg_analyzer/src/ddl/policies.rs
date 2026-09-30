@@ -14,6 +14,8 @@ use crate::pg_catalog::{PgCatalog, RelKind};
 /// in [`super::coldeps`].
 #[derive(Clone, Debug)]
 pub(crate) struct Policy {
+    /// `pg_policy.oid`: the identity `pg_depend` rows name.
+    pub(crate) oid: crate::oid::PgGenericOid,
     pub(crate) name: String,
     /// `polcmd`: `*` (ALL), `r` (SELECT), `a` (INSERT), `w` (UPDATE) or `d`
     /// (DELETE).
@@ -80,7 +82,9 @@ pub fn create_policy(interp: &mut PgCatalog, stmt: &CreatePolicyStmt) -> Result<
             stmt.policy_name, rv.relname
         )));
     }
+    let oid = crate::oid::PgGenericOid::from_nonzero(interp.alloc_oid()?);
     interp.policies.entry(relid).or_default().push(Policy {
+        oid,
         name: stmt.policy_name.clone(),
         cmd,
     });
@@ -158,9 +162,12 @@ pub(crate) fn drop_policy(
         Err(e) => return Err(e),
     };
     let policies = interp.policies.entry(relid).or_default();
-    let before = policies.len();
+    let dropped = policies.iter().find(|p| p.name == *name).map(|p| p.oid);
     policies.retain(|p| p.name != *name);
-    if policies.len() == before && !missing_ok {
+    if let Some(oid) = dropped {
+        interp.remove_dependencies_of(super::depend::PG_POLICY_RELID, oid);
+    }
+    if dropped.is_none() && !missing_ok {
         return Err(DdlError::TypeNotFound(format!(
             "policy \"{name}\" for table \"{}\" does not exist",
             rv.relname

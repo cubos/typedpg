@@ -195,6 +195,8 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
 /// A named domain constraint (`pg_constraint` row with `contypid` set).
 #[derive(Clone, Debug)]
 pub(crate) struct DomainConstraint {
+    /// `pg_constraint.oid`: the identity `pg_depend` rows name.
+    pub(crate) oid: crate::oid::PgGenericOid,
     pub(crate) name: String,
     pub(crate) kind: DomainConstraintKind,
     /// What a CHECK's expression refers to, until the constraint's
@@ -214,7 +216,7 @@ pub(crate) enum DomainConstraintKind {
 /// collision, `ChooseConstraintName`). Other constraint kinds (DEFAULT,
 /// NULL) carry no name.
 fn add_domain_constraint(
-    interp: &PgCatalog,
+    interp: &mut PgCatalog,
     domain: &str,
     base_type: PgTypeOid,
     c: &typedpg_pg_query::protobuf::Constraint,
@@ -266,7 +268,13 @@ fn add_domain_constraint(
         }
         c.conname.clone()
     };
-    existing.push(DomainConstraint { name, kind, refs });
+    let oid = crate::oid::PgGenericOid::from_nonzero(interp.alloc_oid()?);
+    existing.push(DomainConstraint {
+        oid,
+        name,
+        kind,
+        refs,
+    });
     Ok(())
 }
 
@@ -455,6 +463,18 @@ pub fn alter_domain(
     if let Some(t) = interp.pg_type.get_mut(&type_oid) {
         changed = t.typnotnull != typnotnull;
         t.typnotnull = typnotnull;
+    }
+    // A dropped constraint's dependencies go with it.
+    let dropped: Vec<crate::oid::PgGenericOid> = interp
+        .domain_constraints
+        .get(&type_oid)
+        .into_iter()
+        .flatten()
+        .filter(|old| constraints.iter().all(|c| c.oid != old.oid))
+        .map(|old| old.oid)
+        .collect();
+    for oid in dropped {
+        interp.remove_dependencies_of(super::depend::PG_CONSTRAINT_RELID, oid);
     }
     interp.domain_constraints.insert(type_oid, constraints);
     record_domain_constraint_dependencies(interp, type_oid)?;

@@ -270,7 +270,7 @@ pub(crate) fn record_references(
                     .attribute_by_name(*relid, name)
                     .map(|a| ObjectAddress::column(*relid, a.attnum)),
             ),
-            Reference::Named(object) => addrs.extend(named_address(interp, object.clone())),
+            Reference::Named(object) => addrs.extend(named_address_of(interp, object)),
         }
     }
     record(interp, depender, addrs, deptype);
@@ -295,8 +295,14 @@ pub(crate) const PG_TS_CONFIG_RELID: PgClassOid = PgClassOid::from_raw(3602);
 /// `pg_ts_dict`.
 pub(crate) const PG_TS_DICT_RELID: PgClassOid = PgClassOid::from_raw(3600);
 
-/// A catalog object the analyzer keeps by name rather than by OID. It gets
-/// an OID here so `pg_depend` rows can name it.
+/// The OID of an object its creation hasn't stored yet (the creation
+/// assigns a fresh one, or keeps the replaced object's).
+pub(crate) const PENDING_OID: PgGenericOid = PgGenericOid::from_raw(u32::MAX);
+
+/// A catalog object the analyzer keeps in a collection of its own rather
+/// than a `pg_class` / `pg_proc` / ... row, as named now: the key its
+/// identity — the OID it got at creation, which no rename changes, as in PG
+/// — is looked up by. `pg_depend` rows name the OID.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum NamedObject {
     Policy {
@@ -347,37 +353,49 @@ impl NamedObject {
         }
     }
 
-    /// Whether the object still exists (its own DROP / RENAME may have
-    /// removed it without telling `pg_depend`).
-    fn exists(&self, interp: &PgCatalog) -> bool {
+    /// The object's OID, when it exists.
+    fn oid(&self, interp: &PgCatalog) -> Option<PgGenericOid> {
         match self {
             NamedObject::Policy { relid, name } => interp
                 .policies
-                .get(relid)
-                .is_some_and(|p| p.iter().any(|p| &p.name == name)),
+                .get(relid)?
+                .iter()
+                .find(|p| &p.name == name)
+                .map(|p| p.oid),
             NamedObject::Rule { relid, name } => interp
                 .rules
-                .get(relid)
-                .is_some_and(|r| r.iter().any(|r| &r.name == name)),
+                .get(relid)?
+                .iter()
+                .find(|r| &r.name == name)
+                .map(|r| r.oid),
             NamedObject::Trigger { relid, name } => interp
                 .triggers
-                .get(relid)
-                .is_some_and(|t| t.iter().any(|t| &t.name == name)),
+                .get(relid)?
+                .iter()
+                .find(|t| &t.name == name)
+                .map(|t| t.oid),
             NamedObject::DomainConstraint { typid, name } => interp
                 .domain_constraints
-                .get(typid)
-                .is_some_and(|c| c.iter().any(|c| &c.name == name)),
+                .get(typid)?
+                .iter()
+                .find(|c| &c.name == name)
+                .map(|c| c.oid),
             NamedObject::PublicationRel { publication, relid } => interp
                 .publications
                 .iter()
-                .any(|p| &p.name == publication && p.has_relation(*relid)),
+                .find(|p| &p.name == publication)?
+                .relation_oid(*relid),
             NamedObject::Opclass {
                 name,
                 namespace,
                 method,
-            } => interp.pg_opclass.iter().any(|c| {
-                &c.opcname == name && c.opcnamespace == *namespace && &c.opcmethod == method
-            }),
+            } => interp
+                .pg_opclass
+                .iter()
+                .find(|c| {
+                    &c.opcname == name && c.opcnamespace == *namespace && &c.opcmethod == method
+                })
+                .map(|c| PgGenericOid::from_nonzero(c.oid.into_nonzero())),
             NamedObject::TsObject {
                 kind,
                 name,
@@ -385,70 +403,88 @@ impl NamedObject {
             } => interp
                 .pg_ts_objects
                 .iter()
-                .any(|o| &o.kind == kind && &o.name == name && o.namespace == *namespace),
+                .find(|o| &o.kind == kind && &o.name == name && o.namespace == *namespace)
+                .map(|o| o.oid),
         }
     }
 }
 
-/// The address of `object`, registering it (with a fresh OID) the first
-/// time. `None` for a built-in object (in `pg_catalog`), which nothing
+/// The object whose identity is `addr`, as named now.
+pub(crate) fn named_object_at(interp: &PgCatalog, addr: ObjectAddress) -> Option<NamedObject> {
+    let oid = addr.objid;
+    match addr.classid {
+        c if c == PG_POLICY_RELID => interp.policies.iter().find_map(|(relid, ps)| {
+            ps.iter()
+                .find(|p| p.oid == oid)
+                .map(|p| NamedObject::Policy {
+                    relid: *relid,
+                    name: p.name.clone(),
+                })
+        }),
+        c if c == PG_REWRITE_RELID => interp.rules.iter().find_map(|(relid, rs)| {
+            rs.iter().find(|r| r.oid == oid).map(|r| NamedObject::Rule {
+                relid: *relid,
+                name: r.name.clone(),
+            })
+        }),
+        c if c == PG_TRIGGER_RELID => interp.triggers.iter().find_map(|(relid, ts)| {
+            ts.iter()
+                .find(|t| t.oid == oid)
+                .map(|t| NamedObject::Trigger {
+                    relid: *relid,
+                    name: t.name.clone(),
+                })
+        }),
+        c if c == PG_CONSTRAINT_RELID => {
+            interp.domain_constraints.iter().find_map(|(typid, cs)| {
+                cs.iter()
+                    .find(|c| c.oid == oid)
+                    .map(|c| NamedObject::DomainConstraint {
+                        typid: *typid,
+                        name: c.name.clone(),
+                    })
+            })
+        }
+        c if c == PG_PUBLICATION_REL_RELID => interp.publications.iter().find_map(|p| {
+            p.relation_with_oid(oid)
+                .map(|relid| NamedObject::PublicationRel {
+                    publication: p.name.clone(),
+                    relid,
+                })
+        }),
+        c if c == PG_OPCLASS_RELID => interp
+            .pg_opclass
+            .iter()
+            .find(|c| c.oid.get() == oid.get())
+            .map(|c| NamedObject::Opclass {
+                name: c.opcname.clone(),
+                namespace: c.opcnamespace,
+                method: c.opcmethod.clone(),
+            }),
+        c if c == PG_TS_CONFIG_RELID || c == PG_TS_DICT_RELID => interp
+            .pg_ts_objects
+            .iter()
+            .find(|o| o.oid == oid)
+            .map(|o| NamedObject::TsObject {
+                kind: o.kind.clone(),
+                name: o.name.clone(),
+                namespace: o.namespace,
+            }),
+        _ => None,
+    }
+}
+
+/// The identity of `object`, if it exists. `None` too for a built-in text
+/// search object or operator class (pinned in `pg_catalog`), which nothing
 /// records dependencies on.
-fn named_address(interp: &mut PgCatalog, object: NamedObject) -> Option<ObjectAddress> {
-    if let NamedObject::TsObject { namespace, .. } | NamedObject::Opclass { namespace, .. } =
-        &object
+pub(crate) fn named_address_of(interp: &PgCatalog, object: &NamedObject) -> Option<ObjectAddress> {
+    if let NamedObject::TsObject { namespace, .. } | NamedObject::Opclass { namespace, .. } = object
         && interp.namespace_name(*namespace) == Some("pg_catalog")
     {
         return None;
     }
-    let existing = interp
-        .named_objects
-        .iter()
-        .find(|(_, o)| **o == object)
-        .map(|(oid, _)| *oid);
-    let classid = object.classid();
-    let oid = match existing {
-        Some(oid) => oid,
-        None => {
-            let oid = interp.alloc_oid().ok()?;
-            interp.named_objects.insert(oid, object);
-            oid
-        }
-    };
-    Some(ObjectAddress::new(classid, oid, 0))
-}
-
-/// The address `object` was registered under, if it was.
-pub(crate) fn named_address_of(interp: &PgCatalog, object: &NamedObject) -> Option<ObjectAddress> {
-    interp
-        .named_objects
-        .iter()
-        .find(|(_, o)| *o == object)
-        .map(|(oid, o)| ObjectAddress::new(o.classid(), *oid, 0))
-}
-
-/// The object the analyzer keeps by name at `addr`.
-pub(crate) fn named_object_at(interp: &PgCatalog, addr: ObjectAddress) -> Option<NamedObject> {
-    interp
-        .named_objects
-        .get(&addr.objid.into_nonzero())
-        .filter(|o| o.classid() == addr.classid)
-        .cloned()
-}
-
-/// ALTER POLICY / TRIGGER / RULE ... RENAME TO: the object keeps its
-/// address (and dependencies) under its new name.
-pub(crate) fn rename_named(interp: &mut PgCatalog, old: &NamedObject, new_name: &str) {
-    for object in interp.named_objects.values_mut() {
-        if object != old {
-            continue;
-        }
-        match object {
-            NamedObject::Policy { name, .. }
-            | NamedObject::Rule { name, .. }
-            | NamedObject::Trigger { name, .. } => *name = new_name.to_owned(),
-            _ => {}
-        }
-    }
+    let oid = object.oid(interp)?;
+    Some(ObjectAddress::new(object.classid(), oid.into_nonzero(), 0))
 }
 
 /// Whether the object at `addr` still exists.
@@ -456,15 +492,16 @@ pub(crate) fn object_exists(interp: &PgCatalog, addr: ObjectAddress) -> bool {
     exists(interp, addr)
 }
 
-/// The address of `object` as the depender of new dependencies: a
-/// re-created object of the same name starts over — what the old one
-/// depended on is forgotten.
+/// The identity of `object` as the depender of new dependencies: what it
+/// depended on before (an earlier definition, CREATE OR REPLACE) is
+/// forgotten.
 pub(crate) fn named_object(
     interp: &mut PgCatalog,
     object: NamedObject,
 ) -> Result<ObjectAddress, super::DdlError> {
-    let addr = named_address(interp, object)
-        .ok_or_else(|| super::DdlError::Internal("no address for a built-in object".into()))?;
+    let addr = named_address_of(interp, &object).ok_or_else(|| {
+        super::DdlError::Internal(format!("{object:?} has no identity to depend from"))
+    })?;
     forget_dependencies_of(interp, addr);
     Ok(addr)
 }
@@ -483,18 +520,11 @@ pub(crate) fn drop_ts_object(
         name: name.to_owned(),
         namespace,
     };
-    let Some(oid) = interp
-        .named_objects
-        .iter()
-        .find(|(_, o)| **o == object)
-        .map(|(oid, _)| *oid)
-    else {
+    let Some(addr) = named_address_of(interp, &object) else {
         return Ok(());
     };
-    let addr = ObjectAddress::new(object.classid(), oid, 0);
     let desc = describe(interp, addr);
     drop_dependents(interp, addr, &desc, cascade)?;
-    interp.named_objects.remove(&oid);
     interp.remove_dependencies_of(addr.classid, addr.objid);
     Ok(())
 }
@@ -531,15 +561,9 @@ fn exists(interp: &PgCatalog, addr: ObjectAddress) -> bool {
         c if c == PG_CONSTRAINT_RELID => {
             crate::oid::PgConstraintOid::new(oid)
                 .is_some_and(|o| interp.pg_constraint.contains_key(&o))
-                || interp
-                    .named_objects
-                    .get(&addr.objid.into_nonzero())
-                    .is_some_and(|o| o.exists(interp))
+                || named_object_at(interp, addr).is_some()
         }
-        _ => interp
-            .named_objects
-            .get(&addr.objid.into_nonzero())
-            .is_some_and(|o| o.exists(interp)),
+        _ => named_object_at(interp, addr).is_some(),
     }
 }
 
@@ -624,32 +648,28 @@ pub(crate) fn describe(interp: &PgCatalog, addr: ObjectAddress) -> String {
                 let (_, table) = relation(con.conrelid);
                 return format!("constraint {} on table {table}", con.conname);
             }
-            match interp.named_objects.get(&addr.objid.into_nonzero()) {
+            match named_object_at(interp, addr) {
                 Some(NamedObject::DomainConstraint { name, .. }) => format!("constraint {name}"),
                 _ => "constraint".into(),
             }
         }
-        _ => match interp.named_objects.get(&addr.objid.into_nonzero()) {
+        _ => match named_object_at(interp, addr) {
             Some(NamedObject::Policy { relid, name }) => {
-                format!("policy {name} on table {}", relation(*relid).1)
+                format!("policy {name} on table {}", relation(relid).1)
             }
             Some(NamedObject::Rule { relid, name }) => {
-                format!(
-                    "rule {name} on {} {}",
-                    relation(*relid).0,
-                    relation(*relid).1
-                )
+                format!("rule {name} on {} {}", relation(relid).0, relation(relid).1)
             }
             Some(NamedObject::Trigger { relid, name }) => {
                 format!(
                     "trigger {name} on {} {}",
-                    relation(*relid).0,
-                    relation(*relid).1
+                    relation(relid).0,
+                    relation(relid).1
                 )
             }
             Some(NamedObject::PublicationRel { publication, relid }) => format!(
                 "publication of table {} in publication {publication}",
-                relation(*relid).1
+                relation(relid).1
             ),
             Some(NamedObject::Opclass { name, method, .. }) => {
                 format!("operator class {name} for access method {method}")
@@ -962,7 +982,7 @@ fn delete_object_now(interp: &mut PgCatalog, addr: ObjectAddress) -> Result<(), 
             }
         }
         _ => {
-            if let Some(object) = interp.named_objects.remove(&addr.objid.into_nonzero()) {
+            if let Some(object) = named_object_at(interp, addr) {
                 delete_named(interp, &object);
             }
         }
@@ -1052,7 +1072,9 @@ pub(crate) fn delete_member(interp: &mut PgCatalog, classid: PgClassOid, objid: 
         super::languages::delete_language(interp, language);
         return;
     }
-    if let Some(object) = interp.named_objects.remove(&objid.into_nonzero()) {
+    if let Some(object) =
+        named_object_at(interp, ObjectAddress::new(classid, objid.into_nonzero(), 0))
+    {
         delete_named(interp, &object);
     }
     interp.remove_dependencies_of(classid, objid);
@@ -1087,7 +1109,7 @@ pub(crate) fn extension_named_members(
     );
     objects
         .into_iter()
-        .filter_map(|o| named_address(interp, o))
+        .filter_map(|o| named_address_of(interp, &o))
         .collect()
 }
 
@@ -1331,7 +1353,7 @@ pub(crate) fn record_ts_mapping(
     let Some(config) = find(interp, "c", config) else {
         return Ok(());
     };
-    let Some(depender) = named_address(interp, config) else {
+    let Some(depender) = named_address_of(interp, &config) else {
         return Ok(());
     };
     let refs: Vec<Reference> = dicts

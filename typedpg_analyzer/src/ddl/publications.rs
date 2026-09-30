@@ -29,6 +29,9 @@ pub(crate) struct Publication {
 /// a column list (`prattrs`).
 #[derive(Clone, Copy, Debug)]
 struct PubRel {
+    /// `pg_publication_rel.oid`, once the table is added: the identity
+    /// `pg_depend` rows name.
+    pub(crate) oid: Option<crate::oid::PgGenericOid>,
     relid: PgClassOid,
     has_filter: bool,
     has_columns: bool,
@@ -173,6 +176,7 @@ fn resolve_objects<'a>(
                 };
                 let (_, relid) = super::util::lookup_relation(interp, rv)?;
                 let rel = PubRel {
+                    oid: None,
                     relid,
                     has_filter: pt.where_clause.is_some(),
                     has_columns: !pt.columns.is_empty(),
@@ -619,8 +623,28 @@ pub fn create_publication(
         }
     }
     interp.publications.push(publication);
-    for (relid, pt) in tables {
-        crate::ddl::depend::record_publication_rel(interp, &stmt.pubname, relid, pt)?;
+    register_tables(interp, &stmt.pubname, &tables)
+}
+
+/// publication_add_relation: each added table gets its
+/// `pg_publication_rel` identity, which depends on the columns of its
+/// column list and on what its row filter refers to.
+fn register_tables(
+    interp: &mut PgCatalog,
+    pubname: &str,
+    tables: &[(PgClassOid, &PublicationTable)],
+) -> Result<(), DdlError> {
+    for &(relid, pt) in tables {
+        let oid = crate::oid::PgGenericOid::from_nonzero(interp.alloc_oid()?);
+        if let Some(rel) = interp
+            .publications
+            .iter_mut()
+            .find(|p| p.name == pubname)
+            .and_then(|p| p.tables.iter_mut().find(|t| t.relid == relid))
+        {
+            rel.oid = Some(oid);
+        }
+        crate::ddl::depend::record_publication_rel(interp, pubname, relid, pt)?;
     }
     Ok(())
 }
@@ -694,6 +718,18 @@ pub fn alter_publication(
         }
         _ => {}
     }
+    // The tables this command adds, registered once the publication has
+    // them.
+    let added: Vec<(PgClassOid, &PublicationTable)> = match action {
+        AlterPublicationAction::ApAddObjects | AlterPublicationAction::ApSetObjects => objects
+            .iter()
+            .filter_map(|o| match o {
+                Object::Table(rel, pt) => Some((rel.relid, *pt)),
+                Object::Schema(_) => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
     let publication = &mut interp.publications[index];
     match action {
         AlterPublicationAction::ApAddObjects => {
@@ -767,7 +803,7 @@ pub fn alter_publication(
         }
         AlterPublicationAction::Undefined => {}
     }
-    Ok(())
+    register_tables(interp, &stmt.pubname, &added)
 }
 
 /// DROP PUBLICATION [IF EXISTS] name.
@@ -789,7 +825,16 @@ pub(crate) fn drop_publication(
         return Ok(());
     };
     let before = interp.publications.len();
+    let rels: Vec<crate::oid::PgGenericOid> = interp
+        .publications
+        .iter()
+        .filter(|p| p.name == name)
+        .flat_map(|p| p.tables.iter().filter_map(|t| t.oid))
+        .collect();
     interp.publications.retain(|p| p.name != name);
+    for oid in rels {
+        interp.remove_dependencies_of(super::depend::PG_PUBLICATION_REL_RELID, oid);
+    }
     if interp.publications.len() == before && !missing_ok {
         return Err(missing(&name));
     }
@@ -830,7 +875,16 @@ impl Publication {
     }
 
     /// Whether the publication lists table `relid`.
-    pub(crate) fn has_relation(&self, relid: PgClassOid) -> bool {
-        self.tables.iter().any(|t| t.relid == relid)
+    /// The `pg_publication_rel` identity of table `relid`, if listed.
+    pub(crate) fn relation_oid(&self, relid: PgClassOid) -> Option<crate::oid::PgGenericOid> {
+        self.tables.iter().find(|t| t.relid == relid)?.oid
+    }
+
+    /// The table whose `pg_publication_rel` identity is `oid`, if listed.
+    pub(crate) fn relation_with_oid(&self, oid: crate::oid::PgGenericOid) -> Option<PgClassOid> {
+        self.tables
+            .iter()
+            .find(|t| t.oid == Some(oid))
+            .map(|t| t.relid)
     }
 }

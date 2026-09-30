@@ -185,3 +185,128 @@ fn rename_checks_the_relation_kind() {
         ),
     ]);
 }
+
+#[test]
+fn dependencies_survive_renames() {
+    // PG keeps pg_depend rows by OID, so renaming either side of a
+    // dependency — the dependent (a policy, trigger, rule, domain
+    // constraint, publication, text search object) or what it refers to
+    // (a table, column, function, language) — keeps it: the DROP is still
+    // refused, and CASCADE still takes the dependent along.
+    for (setup, drop, refused, cascade, gone, gone_msg) in [
+        (
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql IMMUTABLE AS 'select 1';
+             CREATE TABLE tq (a int);
+             CREATE POLICY p ON tq USING (a = f());
+             ALTER POLICY p ON tq RENAME TO p2;
+             ALTER TABLE tq RENAME TO tq2;",
+            "DROP FUNCTION f();",
+            "cannot drop function f() because other objects depend on it",
+            "DROP FUNCTION f() CASCADE;",
+            "ALTER POLICY p2 ON tq2 RENAME TO p3;",
+            "policy \"p2\" for table \"tq2\" does not exist",
+        ),
+        (
+            "CREATE FUNCTION trf() RETURNS trigger LANGUAGE plpgsql
+                 AS 'begin return new; end';
+             CREATE TABLE tt (a int, b int);
+             CREATE TRIGGER t1 BEFORE UPDATE OF b ON tt
+                 FOR EACH ROW EXECUTE FUNCTION trf();
+             ALTER TRIGGER t1 ON tt RENAME TO t2;
+             ALTER TABLE tt RENAME COLUMN b TO b2;
+             ALTER TABLE tt RENAME TO tt2;",
+            "ALTER TABLE tt2 DROP COLUMN b2;",
+            "cannot drop column b2 of table tt2 because other objects depend on it \
+             (trigger t2 on table tt2 depends on column b2 of table tt2)",
+            "ALTER TABLE tt2 DROP COLUMN b2 CASCADE;",
+            "DROP TRIGGER t2 ON tt2;",
+            "trigger \"t2\" for table \"tt2\" does not exist",
+        ),
+        (
+            "CREATE TABLE tr (a int);
+             CREATE TABLE ta (a int, b int);
+             CREATE RULE r AS ON INSERT TO tr DO ALSO INSERT INTO ta VALUES (NEW.a);
+             ALTER RULE r ON tr RENAME TO r2;
+             ALTER TABLE ta RENAME TO ta2;
+             ALTER TABLE ta2 RENAME COLUMN a TO a2;",
+            "ALTER TABLE ta2 DROP COLUMN a2;",
+            "cannot drop column a2 of table ta2 because other objects depend on it \
+             (rule r2 on table tr depends on column a2 of table ta2)",
+            "ALTER TABLE ta2 DROP COLUMN a2 CASCADE;",
+            "DROP RULE r2 ON tr;",
+            "rule \"r2\" for relation \"tr\" does not exist",
+        ),
+        (
+            "CREATE FUNCTION h() RETURNS int LANGUAGE sql IMMUTABLE AS 'select 1';
+             CREATE DOMAIN dm AS int CONSTRAINT c1 CHECK (VALUE > h());
+             ALTER DOMAIN dm RENAME CONSTRAINT c1 TO c2;
+             ALTER FUNCTION h() RENAME TO h2;",
+            "DROP FUNCTION h2();",
+            "cannot drop function h2() because other objects depend on it \
+             (constraint c2 depends on function h2())",
+            "DROP FUNCTION h2() CASCADE;",
+            "ALTER DOMAIN dm DROP CONSTRAINT c2;",
+            "constraint \"c2\" of domain \"dm\" does not exist",
+        ),
+        (
+            "CREATE TABLE tp (a int, b int, c int);
+             CREATE PUBLICATION pb FOR TABLE tp (a, b);
+             ALTER PUBLICATION pb RENAME TO pb2;
+             ALTER TABLE tp RENAME COLUMN b TO bb;",
+            "ALTER TABLE tp DROP COLUMN bb;",
+            "cannot drop column bb of table tp because other objects depend on it \
+             (publication of table tp in publication pb2 depends on column bb of table tp)",
+            "ALTER TABLE tp DROP COLUMN bb CASCADE;",
+            "ALTER PUBLICATION pb2 DROP TABLE tp;",
+            "relation \"tp\" is not part of the publication",
+        ),
+        (
+            "CREATE TEXT SEARCH DICTIONARY mydict (TEMPLATE = simple);
+             CREATE TEXT SEARCH CONFIGURATION mycfg (COPY = simple);
+             ALTER TEXT SEARCH CONFIGURATION mycfg ALTER MAPPING FOR word WITH mydict;
+             ALTER TEXT SEARCH DICTIONARY mydict RENAME TO mydict2;
+             ALTER TEXT SEARCH CONFIGURATION mycfg RENAME TO mycfg2;",
+            "DROP TEXT SEARCH DICTIONARY mydict2;",
+            "cannot drop text search dictionary mydict2 because other objects depend on it \
+             (text search configuration mycfg2 depends on text search dictionary mydict2)",
+            "DROP TEXT SEARCH DICTIONARY mydict2 CASCADE;",
+            "DROP TEXT SEARCH CONFIGURATION mycfg2;",
+            "text search configuration \"mycfg2\" does not exist",
+        ),
+        (
+            "CREATE TEXT SEARCH CONFIGURATION cfg (COPY = simple);
+             CREATE TABLE tts (d text);
+             CREATE INDEX tts_idx ON tts (to_tsvector('cfg', d));
+             ALTER TEXT SEARCH CONFIGURATION cfg RENAME TO cfg2;",
+            "DROP TEXT SEARCH CONFIGURATION cfg2;",
+            "cannot drop text search configuration cfg2 because other objects depend on it \
+             (index tts_idx depends on text search configuration cfg2)",
+            "DROP TEXT SEARCH CONFIGURATION cfg2 CASCADE;",
+            "DROP INDEX tts_idx;",
+            "index \"tts_idx\" does not exist",
+        ),
+        (
+            "CREATE FUNCTION pf() RETURNS int LANGUAGE plpgsql AS 'begin return 1; end';
+             ALTER LANGUAGE plpgsql RENAME TO plx;",
+            "DROP EXTENSION plpgsql;",
+            "cannot drop extension plpgsql because other objects depend on it \
+             (function pf() depends on language plx)",
+            "DROP EXTENSION plpgsql CASCADE;",
+            "DROP FUNCTION pf();",
+            "function pf() does not exist",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", drop)]).expect_err(drop);
+        assert!(err.to_string().starts_with(refused), "{drop}\n  got: {err}");
+        let err = try_apply(&[
+            ("0001.sql", setup),
+            ("0002.sql", cascade),
+            ("0003.sql", gone),
+        ])
+        .expect_err(gone);
+        assert!(
+            err.to_string().starts_with(gone_msg),
+            "{gone}\n  got: {err}"
+        );
+    }
+}

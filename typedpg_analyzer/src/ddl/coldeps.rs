@@ -148,13 +148,9 @@ pub(crate) fn describe(interp: &PgCatalog, dep: &Dependent) -> String {
     super::depend::describe(interp, addr)
 }
 
-/// ALTER POLICY / TRIGGER / RULE ... RENAME TO: the dependencies follow the
-/// name.
+/// ALTER POLICY / TRIGGER / RULE ... RENAME TO: the object keeps its OID —
+/// its `pg_depend` rows — and a policy its analyzed quals.
 pub(crate) fn rename(interp: &mut PgCatalog, old: &Dependent, new_name: &str) {
-    let Some(named) = old.named() else {
-        return;
-    };
-    super::depend::rename_named(interp, &named, new_name);
     if let Dependent::Policy { relid, name } = old
         && let Some(quals) = interp
             .column_deps
@@ -566,6 +562,15 @@ pub(crate) fn record_rule(
     let Some(relid) = relation_of(interp, rv) else {
         return Ok(());
     };
+    // A view's `_RETURN` rule is its query, whose dependencies the view
+    // records (create_view).
+    if !interp
+        .rules
+        .get(&relid)
+        .is_some_and(|rules| rules.iter().any(|r| r.name == stmt.rulename))
+    {
+        return Ok(());
+    }
     let new_old = vec![
         range_var_node(rv, Some("new")),
         range_var_node(rv, Some("old")),

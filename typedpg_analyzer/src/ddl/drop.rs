@@ -1147,7 +1147,11 @@ fn drop_function(
         }
         for (relid, trigger) in dependent_triggers {
             if let Some(ts) = interp.triggers.get_mut(&relid) {
+                let dropped = ts.iter().find(|t| t.name == trigger).map(|t| t.oid);
                 ts.retain(|t| t.name != trigger);
+                if let Some(oid) = dropped {
+                    interp.remove_dependencies_of(super::depend::PG_TRIGGER_RELID, oid);
+                }
             }
         }
         // So does an event trigger.

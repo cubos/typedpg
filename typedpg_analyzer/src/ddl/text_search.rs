@@ -479,11 +479,16 @@ pub fn define(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), DdlError>
         verify_dict_options(interp, template, &dict_options)?;
     }
     let object = PgTsObject {
+        oid: crate::oid::PgGenericOid::from_nonzero(interp.alloc_oid()?),
         kind: kind.to_owned(),
         name: name.clone(),
         namespace: nsoid,
     };
-    if interp.pg_ts_objects.contains(&object) {
+    if interp
+        .pg_ts_objects
+        .iter()
+        .any(|o| o.kind == object.kind && o.name == object.name && o.namespace == nsoid)
+    {
         // The catalog's unique index reports it.
         let index = match kind {
             "c" => "pg_ts_config_cfgname_index",

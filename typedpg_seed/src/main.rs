@@ -842,16 +842,18 @@ fn export_depends(client: &mut postgres::Client) -> Result<Vec<PgDepend>, postgr
 fn export_ts_objects(client: &mut postgres::Client) -> Result<Vec<PgTsObject>, postgres::Error> {
     Ok(client
         .query(
-            "SELECT 'c', cfgname::text, cfgnamespace FROM pg_catalog.pg_ts_config \
-             UNION ALL SELECT 'd', dictname::text, dictnamespace FROM pg_catalog.pg_ts_dict \
-             UNION ALL SELECT 'p', prsname::text, prsnamespace FROM pg_catalog.pg_ts_parser \
-             UNION ALL SELECT 't', tmplname::text, tmplnamespace FROM pg_catalog.pg_ts_template \
+            "SELECT 'c', cfgname::text, cfgnamespace, oid FROM pg_catalog.pg_ts_config \
+             UNION ALL SELECT 'd', dictname::text, dictnamespace, oid FROM pg_catalog.pg_ts_dict \
+             UNION ALL SELECT 'p', prsname::text, prsnamespace, oid FROM pg_catalog.pg_ts_parser \
+             UNION ALL SELECT 't', tmplname::text, tmplnamespace, oid \
+                 FROM pg_catalog.pg_ts_template \
              ORDER BY 1, 2",
             &[],
         )?
         .iter()
         .filter_map(|r| {
             Some(PgTsObject {
+                oid: PgGenericOid::new(r.get::<_, u32>(3))?,
                 kind: r.get(0),
                 name: r.get(1),
                 namespace: PgNamespaceOid::new(r.get::<_, u32>(2))?,

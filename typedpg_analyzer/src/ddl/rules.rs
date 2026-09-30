@@ -19,6 +19,8 @@ use crate::pg_catalog::{PgCatalog, RelKind};
 /// fireRules).
 #[derive(Clone, Debug)]
 pub(crate) struct Rule {
+    /// `pg_rewrite.oid`: the identity `pg_depend` rows name.
+    pub(crate) oid: crate::oid::PgGenericOid,
     pub(crate) name: String,
     /// `ev_type`.
     pub(crate) event: CmdType,
@@ -178,6 +180,7 @@ pub fn create_rule(interp: &mut PgCatalog, stmt: &RuleStmt) -> Result<(), DdlErr
         _ => false,
     });
     let rule = Rule {
+        oid: crate::ddl::depend::PENDING_OID,
         name: stmt.rulename.clone(),
         event,
         instead: stmt.instead,
@@ -203,6 +206,7 @@ pub fn create_rule(interp: &mut PgCatalog, stmt: &RuleStmt) -> Result<(), DdlErr
         if stmt.replace {
             // DefineQueryRewrite replaces the definition; ev_enabled stays.
             *existing = Rule {
+                oid: existing.oid,
                 enabled: existing.enabled,
                 ..rule
             };
@@ -213,7 +217,12 @@ pub fn create_rule(interp: &mut PgCatalog, stmt: &RuleStmt) -> Result<(), DdlErr
             stmt.rulename
         )));
     }
-    rules.push(rule);
+    let oid = crate::oid::PgGenericOid::from_nonzero(interp.alloc_oid()?);
+    interp
+        .rules
+        .entry(relid)
+        .or_default()
+        .push(Rule { oid, ..rule });
     Ok(())
 }
 
