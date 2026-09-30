@@ -2620,3 +2620,20 @@ fn field_of_opaque_record_function_is_unidentified_column() {
         "could not identify column \"a\" in record data type"
     );
 }
+
+/// A field of a record-typed scalar subquery has no known row shape at
+/// parse time: `could not identify column … in record data type`.
+#[test]
+fn field_of_record_subquery_is_unidentified_column() {
+    let db = PgCatalog::new().unwrap();
+    for sql in [
+        "SELECT (SELECT (1, 2)).f1",
+        "SELECT (SELECT ROW(1, 'a')).f2",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::UndefinedColumn(_),
+            "could not identify column"
+        );
+    }
+}

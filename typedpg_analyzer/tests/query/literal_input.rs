@@ -1254,3 +1254,28 @@ fn reg_type_literals_are_parsed_and_looked_up() {
         db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
 }
+
+/// Every coercion of an untyped literal runs the target's input function —
+/// in COALESCE, a comparison, an INSERT value or an array comparison as in
+/// an explicit cast.
+#[test]
+fn malformed_literals_rejected_in_implicit_coercions() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE posts (id INT PRIMARY KEY, published_at TIMESTAMPTZ, tags TEXT[]);",
+    )
+    .unwrap();
+    for sql in [
+        "SELECT COALESCE(published_at, 'a0-01-01') FROM posts",
+        "SELECT id FROM posts WHERE published_at = 'a0-01-01'",
+        "INSERT INTO posts (id, published_at) VALUES (1, 'a0-01-01')",
+        "SELECT '2024-01-01'::timetz",
+    ] {
+        let err = db.analyze(sql).expect_err(sql).to_string();
+        assert!(err.starts_with("invalid input syntax for type"), "{sql}: {err}");
+    }
+    assert_first_line!(
+        db.analyze("SELECT id FROM posts WHERE tags = '{\"a\": 1}'"),
+        "malformed array literal: \"{\"a\": 1}\""
+    );
+}
