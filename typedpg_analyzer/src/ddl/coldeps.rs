@@ -1,20 +1,21 @@
-//! The `pg_depend` edges of objects that aren't relations and that the
-//! catalog doesn't otherwise keep: a policy's USING / WITH CHECK
-//! (CreatePolicy → recordDependencyOnExpr), a trigger's WHEN condition and
-//! UPDATE OF columns (CreateTrigger), a rule's qualification and actions
-//! (InsertRule), and a SQL-standard function body (ProcedureCreate's
-//! `prosqlbody` dependencies). Each is a DEPENDENCY_NORMAL on a column
-//! (or, attnum 0, a relation): DROP COLUMN / DROP TABLE of what they read
-//! needs CASCADE, and ALTER COLUMN TYPE of a column they read is refused
-//! (RememberAllDependentForRebuilding).
+//! What policies, triggers and rules refer to: a policy's USING / WITH
+//! CHECK (CreatePolicy → recordDependencyOnExpr), a trigger's WHEN
+//! condition and UPDATE OF columns (CreateTrigger), a rule's qualification
+//! and actions (InsertRule). The references are extracted here and stored
+//! as `pg_depend` rows by [`super::depend`] — the one dependency store DROP
+//! consults: DEPENDENCY_NORMAL on each column (or relation) and function
+//! read, and DEPENDENCY_AUTO on the object's own relation, which it goes
+//! with. ALTER COLUMN TYPE of a column such an object — or a SQL-standard
+//! function body — reads is refused (RememberAllDependentForRebuilding).
 
 use std::collections::HashMap;
 
 use typedpg_pg_query::protobuf::{self, Node, node};
 
 use super::DdlError;
+use super::depend::{NamedObject, ObjectAddress};
 use crate::oid::{PgClassOid, PgProcOid};
-use crate::pg_catalog::PgCatalog;
+use crate::pg_catalog::{DepType, PG_CLASS_RELID, PG_PROC_RELID, PgCatalog};
 
 /// An object depending on columns.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -25,104 +26,108 @@ pub(crate) enum Dependent {
     Function(PgProcOid),
 }
 
-/// The recorded edges.
+/// State ALTER POLICY needs beyond `pg_depend`.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ColumnDeps {
-    /// `(dependent, referenced relation, attnum)`; attnum 0 is the
-    /// relation itself.
-    edges: Vec<(Dependent, PgClassOid, i16)>,
-    /// `(dependent, function)`: the functions a policy's or rule's
-    /// expressions call.
-    function_edges: Vec<(Dependent, PgProcOid)>,
     /// Each policy's USING and WITH CHECK expressions: ALTER POLICY
     /// replaces them one at a time.
-    policy_quals: HashMap<(PgClassOid, String), (Option<Node>, Option<Node>)>,
+    pub(crate) policy_quals: HashMap<(PgClassOid, String), (Option<Node>, Option<Node>)>,
 }
 
-/// The object still exists (the edges of a dropped one stay behind until
-/// the name is reused; they are ignored).
-fn exists(interp: &PgCatalog, dep: &Dependent) -> bool {
-    match dep {
-        Dependent::Policy { relid, name } => interp
-            .policies
-            .get(relid)
-            .is_some_and(|ps| ps.iter().any(|p| p.name == *name)),
-        Dependent::Trigger { relid, name } => interp
-            .triggers
-            .get(relid)
-            .is_some_and(|ts| ts.iter().any(|t| t.name == *name)),
-        Dependent::Rule { relid, name } => interp
-            .rules
-            .get(relid)
-            .is_some_and(|rs| rs.iter().any(|r| r.name == *name)),
-        Dependent::Function(oid) => interp.pg_proc.contains_key(oid),
+impl Dependent {
+    fn named(&self) -> Option<NamedObject> {
+        Some(match self {
+            Dependent::Policy { relid, name } => NamedObject::Policy {
+                relid: *relid,
+                name: name.clone(),
+            },
+            Dependent::Trigger { relid, name } => NamedObject::Trigger {
+                relid: *relid,
+                name: name.clone(),
+            },
+            Dependent::Rule { relid, name } => NamedObject::Rule {
+                relid: *relid,
+                name: name.clone(),
+            },
+            Dependent::Function(_) => return None,
+        })
     }
-}
 
-fn set(interp: &mut PgCatalog, dep: Dependent, refs: Vec<(PgClassOid, i16)>) {
-    let deps = &mut interp.column_deps;
-    deps.edges.retain(|(d, ..)| *d != dep);
-    for (relid, attnum) in refs {
-        if !deps
-            .edges
-            .iter()
-            .any(|(d, r, a)| *d == dep && *r == relid && *a == attnum)
-        {
-            deps.edges.push((dep.clone(), relid, attnum));
+    fn of(interp: &PgCatalog, addr: ObjectAddress) -> Option<Self> {
+        if addr.classid == PG_PROC_RELID {
+            return PgProcOid::new(addr.objid.get()).map(Dependent::Function);
+        }
+        match super::depend::named_object_at(interp, addr)? {
+            NamedObject::Policy { relid, name } => Some(Dependent::Policy { relid, name }),
+            NamedObject::Trigger { relid, name } => Some(Dependent::Trigger { relid, name }),
+            NamedObject::Rule { relid, name } => Some(Dependent::Rule { relid, name }),
+            _ => None,
         }
     }
 }
 
-fn set_functions(interp: &mut PgCatalog, dep: Dependent, functions: Vec<PgProcOid>) {
-    let edges = &mut interp.column_deps.function_edges;
-    edges.retain(|(d, _)| *d != dep);
-    for f in functions {
-        if !edges.iter().any(|(d, g)| *d == dep && *g == f) {
-            edges.push((dep.clone(), f));
-        }
-    }
+/// Record `dep`'s references (replacing earlier ones): normal
+/// dependencies on the columns and relations in `refs` and the functions
+/// in `functions`; its own relation it depends on automatically.
+fn store(
+    interp: &mut PgCatalog,
+    dep: &Dependent,
+    refs: Vec<(PgClassOid, i16)>,
+    functions: Vec<PgProcOid>,
+) -> Result<(), DdlError> {
+    let Some(named) = dep.named() else {
+        return Ok(());
+    };
+    let owner = match dep {
+        Dependent::Policy { relid, .. }
+        | Dependent::Trigger { relid, .. }
+        | Dependent::Rule { relid, .. } => *relid,
+        Dependent::Function(_) => return Ok(()),
+    };
+    let addr = super::depend::named_object(interp, named)?;
+    let referenced = refs
+        .into_iter()
+        .filter(|&(r, a)| !(r == owner && a == 0))
+        .map(|(r, a)| ObjectAddress::column(r, a))
+        .chain(functions.into_iter().map(ObjectAddress::proc));
+    super::depend::record(interp, addr, referenced, DepType::Normal);
+    super::depend::record(
+        interp,
+        addr,
+        [ObjectAddress::relation(owner)],
+        DepType::Auto,
+    );
+    Ok(())
 }
 
-/// The existing objects whose expressions call `function`, in creation
-/// order.
-pub(crate) fn dependents_calling(interp: &PgCatalog, function: PgProcOid) -> Vec<Dependent> {
-    let mut out: Vec<Dependent> = Vec::new();
-    for (dep, f) in &interp.column_deps.function_edges {
-        if *f == function && exists(interp, dep) && !out.contains(dep) {
-            out.push(dep.clone());
-        }
-    }
-    out
-}
-
-/// The existing objects depending on column `relid.attnum`, in creation
-/// order.
+/// The existing policies, triggers, rules and SQL-standard function bodies
+/// depending on column `relid.attnum`, in creation order.
 pub(crate) fn dependents_on_column(
     interp: &PgCatalog,
     relid: PgClassOid,
     attnum: i16,
 ) -> Vec<Dependent> {
     let mut out: Vec<Dependent> = Vec::new();
-    for (dep, r, a) in &interp.column_deps.edges {
-        if *r == relid && *a == attnum && exists(interp, dep) && !out.contains(dep) {
-            out.push(dep.clone());
+    for d in interp.iter_pg_depend() {
+        if d.refclassid != PG_CLASS_RELID
+            || d.refobjid.get() != relid.get()
+            || d.refobjsubid != attnum
+            || d.deptype != DepType::Normal
+        {
+            continue;
         }
-    }
-    out
-}
-
-/// The existing objects depending on relation `relid` or one of its
-/// columns, other than those that belong to it (its policies, triggers
-/// and rules go with it).
-pub(crate) fn dependents_on_relation(interp: &PgCatalog, relid: PgClassOid) -> Vec<Dependent> {
-    let mut out: Vec<Dependent> = Vec::new();
-    for (dep, r, _) in &interp.column_deps.edges {
-        let owned = matches!(dep,
-            Dependent::Policy { relid: o, .. }
-            | Dependent::Trigger { relid: o, .. }
-            | Dependent::Rule { relid: o, .. } if *o == relid);
-        if *r == relid && !owned && exists(interp, dep) && !out.contains(dep) {
-            out.push(dep.clone());
+        let addr = ObjectAddress {
+            classid: d.classid,
+            objid: d.objid,
+            objsubid: d.objsubid,
+        };
+        if !super::depend::object_exists(interp, addr) {
+            continue;
+        }
+        if let Some(dep) = Dependent::of(interp, addr)
+            && !out.contains(&dep)
+        {
+            out.push(dep);
         }
     }
     out
@@ -130,101 +135,26 @@ pub(crate) fn dependents_on_relation(interp: &PgCatalog, relid: PgClassOid) -> V
 
 /// getObjectDescription.
 pub(crate) fn describe(interp: &PgCatalog, dep: &Dependent) -> String {
-    let rel = |relid: &PgClassOid| {
-        interp
-            .pg_class
-            .get(relid)
-            .map(|c| c.relname.clone())
-            .unwrap_or_default()
+    let addr = match dep {
+        Dependent::Function(oid) => ObjectAddress::proc(*oid),
+        other => match other
+            .named()
+            .and_then(|n| super::depend::named_address_of(interp, &n))
+        {
+            Some(addr) => addr,
+            None => return String::new(),
+        },
     };
-    match dep {
-        Dependent::Policy { relid, name } => format!("policy {name} on table {}", rel(relid)),
-        Dependent::Trigger { relid, name } => format!("trigger {name} on table {}", rel(relid)),
-        Dependent::Rule { relid, name } => format!("rule {name} on table {}", rel(relid)),
-        Dependent::Function(oid) => {
-            let Some(p) = interp.pg_proc.get(oid) else {
-                return String::new();
-            };
-            let args: Vec<String> = p
-                .proargtypes
-                .iter()
-                .map(|&t| super::util::format_type_for_message(interp, t))
-                .collect();
-            let kind = if p.prokind == crate::pg_catalog::ProKind::Procedure {
-                "procedure"
-            } else {
-                "function"
-            };
-            format!("{kind} {}({})", p.proname, args.join(","))
-        }
-    }
+    super::depend::describe(interp, addr)
 }
 
-/// DROP ... CASCADE: the dependent goes (a function takes the views
-/// calling it along).
-pub(crate) fn drop_dependent(interp: &mut PgCatalog, dep: &Dependent) {
-    match dep {
-        Dependent::Policy { relid, name } => {
-            if let Some(ps) = interp.policies.get_mut(relid) {
-                ps.retain(|p| p.name != *name);
-            }
-            interp
-                .column_deps
-                .policy_quals
-                .remove(&(*relid, name.clone()));
-        }
-        Dependent::Trigger { relid, name } => {
-            if let Some(ts) = interp.triggers.get_mut(relid) {
-                ts.retain(|t| t.name != *name);
-            }
-        }
-        Dependent::Rule { relid, name } => {
-            if let Some(rs) = interp.rules.get_mut(relid) {
-                rs.retain(|r| r.name != *name);
-            }
-        }
-        Dependent::Function(oid) => {
-            let views_on = super::views::find_views_depending_on_function(interp, *oid);
-            if !views_on.is_empty() {
-                super::views::drop_views(interp, &views_on);
-            }
-            interp.remove_pg_proc(*oid);
-            let obj = crate::oid::PgGenericOid::from_nonzero(oid.into_nonzero());
-            interp.remove_dependencies_of(crate::pg_catalog::PG_PROC_RELID, obj);
-            interp.remove_dependencies_on(crate::pg_catalog::PG_PROC_RELID, obj);
-        }
-    }
-    interp.column_deps.edges.retain(|(d, ..)| d != dep);
-    interp.column_deps.function_edges.retain(|(d, _)| d != dep);
-}
-
-/// ALTER POLICY / TRIGGER / RULE ... RENAME TO: the edges follow the name.
+/// ALTER POLICY / TRIGGER / RULE ... RENAME TO: the dependencies follow the
+/// name.
 pub(crate) fn rename(interp: &mut PgCatalog, old: &Dependent, new_name: &str) {
-    let renamed = match old {
-        Dependent::Policy { relid, .. } => Dependent::Policy {
-            relid: *relid,
-            name: new_name.to_owned(),
-        },
-        Dependent::Trigger { relid, .. } => Dependent::Trigger {
-            relid: *relid,
-            name: new_name.to_owned(),
-        },
-        Dependent::Rule { relid, .. } => Dependent::Rule {
-            relid: *relid,
-            name: new_name.to_owned(),
-        },
-        Dependent::Function(_) => return,
+    let Some(named) = old.named() else {
+        return;
     };
-    for (d, ..) in &mut interp.column_deps.edges {
-        if d == old {
-            *d = renamed.clone();
-        }
-    }
-    for (d, _) in &mut interp.column_deps.function_edges {
-        if d == old {
-            *d = renamed.clone();
-        }
-    }
+    super::depend::rename_named(interp, &named, new_name);
     if let Dependent::Policy { relid, name } = old
         && let Some(quals) = interp
             .column_deps
@@ -546,8 +476,7 @@ pub(crate) fn record_policy(
         relid,
         name: stmt.policy_name.clone(),
     };
-    set(interp, dep.clone(), refs);
-    set_functions(interp, dep, functions);
+    store(interp, &dep, refs, functions)?;
     interp
         .column_deps
         .policy_quals
@@ -585,8 +514,7 @@ pub(crate) fn record_policy_alter(
         relid,
         name: stmt.policy_name.clone(),
     };
-    set(interp, dep.clone(), refs);
-    set_functions(interp, dep, functions);
+    store(interp, &dep, refs, functions)?;
     interp.column_deps.policy_quals.insert(key, quals);
     Ok(())
 }
@@ -615,15 +543,15 @@ pub(crate) fn record_trigger(
                 .filter(|&(_, attnum)| attnum != 0),
         );
     }
-    set(
+    store(
         interp,
-        Dependent::Trigger {
+        &Dependent::Trigger {
             relid,
             name: stmt.trigname.clone(),
         },
         refs,
-    );
-    Ok(())
+        Vec::new(),
+    )
 }
 
 /// CREATE RULE: what its WHERE condition and actions read, NEW and OLD
@@ -671,43 +599,5 @@ pub(crate) fn record_rule(
         relid,
         name: stmt.rulename.clone(),
     };
-    set(interp, dep.clone(), refs);
-    set_functions(interp, dep, functions);
-    Ok(())
-}
-
-/// A SQL-standard function body (`BEGIN ATOMIC ... END` / `RETURN expr`):
-/// everything its statements read. A string body records nothing.
-pub(crate) fn record_function_body(
-    interp: &mut PgCatalog,
-    proc: PgProcOid,
-    stmt: &protobuf::CreateFunctionStmt,
-) {
-    let Some(body) = stmt.sql_body.as_deref() else {
-        return;
-    };
-    let mut statements: Vec<Node> = Vec::new();
-    collect_body(body, &mut statements);
-    let mut refs: Vec<(PgClassOid, i16)> = Vec::new();
-    for s in &statements {
-        refs.extend(statement_refs(interp, s, &[]));
-    }
-    set(interp, Dependent::Function(proc), refs);
-}
-
-fn collect_body(node: &Node, out: &mut Vec<Node>) {
-    match node.node.as_ref() {
-        Some(node::Node::List(l)) => {
-            for item in &l.items {
-                collect_body(item, out);
-            }
-        }
-        Some(node::Node::ReturnStmt(r)) => {
-            if let Some(val) = r.returnval.as_deref() {
-                out.push(select_of(&[val], Vec::new()));
-            }
-        }
-        Some(_) => out.push(node.clone()),
-        None => {}
-    }
+    store(interp, &dep, refs, functions)
 }

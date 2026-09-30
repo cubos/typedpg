@@ -575,7 +575,7 @@ pub fn create_composite(interp: &mut PgCatalog, stmt: &CompositeTypeStmt) -> Res
                 )));
             }
             let type_oid = super::functions::typename_type_id(interp, tn)?;
-            check_attribute_type(interp, &cd.colname, type_oid, &mut Vec::new())?;
+            super::tables::check_attribute_type(interp, &cd.colname, type_oid, None, false)?;
             let typmod = crate::typmod::encode(interp, type_oid, &tn.typmods)?;
             let collation = super::tables::column_collation(interp, cd, type_oid)?
                 .or_else(|| super::tables::type_collation(interp, type_oid));
@@ -2029,63 +2029,6 @@ fn new_type_oid(interp: &mut PgCatalog, shell: Option<PgTypeOid>) -> Result<PgTy
         Some(oid) => Ok(oid),
         None => Ok(PgTypeOid::from_nonzero(interp.alloc_oid()?)),
     }
-}
-
-/// `CheckAttributeType` (heap.c) for a column / attribute `attname` of type
-/// `atttypid` in a relation whose row type is in `containing` (the row
-/// types enclosing it): no pseudo-type (a table's `record` / `anyarray`
-/// exceptions aside), and no composite type that contains itself — through
-/// a domain, a range, an array or another composite.
-pub(crate) fn check_attribute_type(
-    interp: &PgCatalog,
-    attname: &str,
-    atttypid: PgTypeOid,
-    containing: &mut Vec<PgTypeOid>,
-) -> Result<(), DdlError> {
-    let Some(t) = interp.pg_type.get(&atttypid) else {
-        return Ok(());
-    };
-    match t.typtype {
-        TypType::Pseudo => {
-            if t.typisdefined {
-                return Err(DdlError::Parse(format!(
-                    "column \"{attname}\" has pseudo-type {}",
-                    super::util::format_type_for_message(interp, atttypid)
-                )));
-            }
-        }
-        TypType::Domain => {
-            if let Some(base) = t.typbasetype {
-                check_attribute_type(interp, attname, base, containing)?;
-            }
-        }
-        TypType::Composite => {
-            if containing.contains(&atttypid) {
-                return Err(DdlError::Parse(format!(
-                    "composite type {} cannot be made a member of itself",
-                    super::util::format_type_for_message(interp, atttypid)
-                )));
-            }
-            containing.push(atttypid);
-            if let Some(relid) = t.typrelid {
-                for attr in interp.attributes_of(relid).iter().filter(|a| a.attnum > 0) {
-                    check_attribute_type(interp, &attr.attname, attr.atttypid, containing)?;
-                }
-            }
-            containing.pop();
-        }
-        TypType::Range => {
-            if let Some(r) = interp.pg_range.get(&atttypid) {
-                check_attribute_type(interp, attname, r.rngsubtype, containing)?;
-            }
-        }
-        _ => {
-            if let Some(elem) = crate::coerce::element_type(atttypid, interp) {
-                check_attribute_type(interp, attname, elem, containing)?;
-            }
-        }
-    }
-    Ok(())
 }
 
 /// The `"x" is not a domain` check of the commands that name a DOMAIN

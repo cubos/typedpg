@@ -435,28 +435,6 @@ fn drop_relation_oid(
             )));
         }
     }
-    // SQL-standard function bodies, and other tables' policies, triggers and
-    // rules, reading the relation (its own go with it).
-    let object_dependents: Vec<super::coldeps::Dependent> =
-        super::coldeps::dependents_on_relation(interp, class_oid)
-            .into_iter()
-            .filter(|d| {
-                !matches!(d,
-                    super::coldeps::Dependent::Policy { relid, .. }
-                    | super::coldeps::Dependent::Trigger { relid, .. }
-                    | super::coldeps::Dependent::Rule { relid, .. }
-                        if named_relations.contains(relid))
-            })
-            .collect();
-    if let Some(first) = object_dependents.first()
-        && !cascade
-    {
-        return Err(DdlError::DependencyError(format!(
-            "cannot drop {kind} {name} because other objects depend on it ({} depends on \
-             {kind} {name})",
-            super::coldeps::describe(interp, first),
-        )));
-    }
     // Column defaults using the sequence (`nextval('s')`).
     let dependent_defaults = defaults_using_sequence(interp, class_oid);
     if let Some(&(relid, attnum)) = dependent_defaults.first()
@@ -490,9 +468,6 @@ fn drop_relation_oid(
         views::drop_views(interp, &dependent_views);
     }
     drop_functions_cascade(interp, &dependent_functions);
-    for dependent in &object_dependents {
-        super::coldeps::drop_dependent(interp, dependent);
-    }
     // CASCADE drops those columns (not their relations) and types.
     for (relid, column) in dependent_columns {
         if let Some(attrs) = interp.pg_attribute.get_mut(&relid) {
@@ -1190,20 +1165,6 @@ fn drop_function(
             )));
         }
         interp.event_triggers.retain(|(_, f)| *f != oid);
-        // And a policy or rule calling it.
-        let dependent_objects = super::coldeps::dependents_calling(interp, oid);
-        if let Some(dependent) = dependent_objects.first()
-            && !cascade
-        {
-            return Err(DdlError::DependencyError(format!(
-                "cannot drop {kind_word} {signature} because other objects depend on it \
-                 ({} depends on {kind_word} {signature})",
-                super::coldeps::describe(interp, dependent)
-            )));
-        }
-        for dependent in &dependent_objects {
-            super::coldeps::drop_dependent(interp, dependent);
-        }
         let dependent_views = views::find_views_depending_on_function(interp, oid);
         if !dependent_views.is_empty() && !cascade {
             let view_names = format_view_list(interp, &dependent_views);

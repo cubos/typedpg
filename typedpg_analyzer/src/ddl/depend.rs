@@ -348,9 +348,10 @@ impl NamedObject {
     /// removed it without telling `pg_depend`).
     fn exists(&self, interp: &PgCatalog) -> bool {
         match self {
-            NamedObject::Policy { relid, name } => {
-                interp.policies.get(relid).is_some_and(|p| p.iter().any(|p| &p.name == name))
-            }
+            NamedObject::Policy { relid, name } => interp
+                .policies
+                .get(relid)
+                .is_some_and(|p| p.iter().any(|p| &p.name == name)),
             NamedObject::Rule { relid, name } => interp
                 .rules
                 .get(relid)
@@ -411,6 +412,45 @@ fn named_address(interp: &mut PgCatalog, object: NamedObject) -> Option<ObjectAd
         }
     };
     Some(ObjectAddress::new(classid, oid, 0))
+}
+
+/// The address `object` was registered under, if it was.
+pub(crate) fn named_address_of(interp: &PgCatalog, object: &NamedObject) -> Option<ObjectAddress> {
+    interp
+        .named_objects
+        .iter()
+        .find(|(_, o)| *o == object)
+        .map(|(oid, o)| ObjectAddress::new(o.classid(), *oid, 0))
+}
+
+/// The object the analyzer keeps by name at `addr`.
+pub(crate) fn named_object_at(interp: &PgCatalog, addr: ObjectAddress) -> Option<NamedObject> {
+    interp
+        .named_objects
+        .get(&addr.objid.into_nonzero())
+        .filter(|o| o.classid() == addr.classid)
+        .cloned()
+}
+
+/// ALTER POLICY / TRIGGER / RULE ... RENAME TO: the object keeps its
+/// address (and dependencies) under its new name.
+pub(crate) fn rename_named(interp: &mut PgCatalog, old: &NamedObject, new_name: &str) {
+    for object in interp.named_objects.values_mut() {
+        if object != old {
+            continue;
+        }
+        match object {
+            NamedObject::Policy { name, .. }
+            | NamedObject::Rule { name, .. }
+            | NamedObject::Trigger { name, .. } => *name = new_name.to_owned(),
+            _ => {}
+        }
+    }
+}
+
+/// Whether the object at `addr` still exists.
+pub(crate) fn object_exists(interp: &PgCatalog, addr: ObjectAddress) -> bool {
+    exists(interp, addr)
 }
 
 /// The address of `object` as the depender of new dependencies: a
@@ -523,7 +563,12 @@ pub(crate) fn describe(interp: &PgCatalog, addr: ObjectAddress) -> String {
                 return "function".into();
             };
             let args: Vec<String> = p.proargtypes.iter().map(|&t| type_name(t)).collect();
-            format!("function {}({})", p.proname, args.join(","))
+            let kind = if p.prokind == crate::pg_catalog::ProKind::Procedure {
+                "procedure"
+            } else {
+                "function"
+            };
+            format!("{kind} {}({})", p.proname, args.join(","))
         }
         c if c == PG_OPERATOR_RELID => {
             let Some(o) = PgOperatorOid::new(oid).and_then(|o| interp.pg_operator.get(&o)) else {
@@ -735,10 +780,24 @@ pub(crate) fn drop_dependents(
         .into_iter()
         .filter(|(d, _)| !in_progress(*d))
         .collect();
+    // An object that belongs to the target (automatically or internally —
+    // a table's policies, triggers and rules) goes with it, whatever else
+    // of the target it depends on normally.
+    let owned = |d: &ObjectAddress| {
+        target.objsubid == 0
+            && interp.pg_depend.iter().any(|row| {
+                row.classid == d.classid
+                    && row.objid == d.objid
+                    && row.refclassid == target.classid
+                    && row.refobjid == target.objid
+                    && row.refobjsubid == 0
+                    && matches!(row.deptype, DepType::Auto | DepType::Internal)
+            })
+    };
     if !cascade
         && let Some((blocker, _)) = dependents
             .iter()
-            .find(|(d, t)| *t == DepType::Normal && !is_drop_target(*d))
+            .find(|(d, t)| *t == DepType::Normal && !is_drop_target(*d) && !owned(d))
     {
         return Err(super::DdlError::DependencyError(format!(
             "cannot drop {target_desc} because other objects depend on it ({} depends on \
@@ -898,6 +957,10 @@ fn drop_column_dependent(interp: &mut PgCatalog, relid: PgClassOid, attnum: i16)
 fn delete_named(interp: &mut PgCatalog, object: &NamedObject) {
     match object {
         NamedObject::Policy { relid, name } => {
+            interp
+                .column_deps
+                .policy_quals
+                .remove(&(*relid, name.clone()));
             if let Some(p) = interp.policies.get_mut(relid) {
                 p.retain(|n| &n.name != name);
             }
@@ -1152,26 +1215,6 @@ pub(crate) fn record_index_expressions(interp: &mut PgCatalog, index: PgClassOid
         .collect();
     let refs: Vec<&typedpg_pg_query::protobuf::Node> = exprs.iter().collect();
     record_expressions(interp, ObjectAddress::relation(index), &refs, Some(relid));
-}
-
-/// A policy depends on what its USING / WITH CHECK expressions refer to
-/// (CreatePolicy).
-pub(crate) fn record_policy(
-    interp: &mut PgCatalog,
-    relid: PgClassOid,
-    name: &str,
-    exprs: &[Option<&typedpg_pg_query::protobuf::Node>],
-) -> Result<(), super::DdlError> {
-    let addr = named_object(
-        interp,
-        NamedObject::Policy {
-            relid,
-            name: name.to_owned(),
-        },
-    )?;
-    let exprs: Vec<&typedpg_pg_query::protobuf::Node> = exprs.iter().flatten().copied().collect();
-    record_expressions(interp, addr, &exprs, Some(relid));
-    Ok(())
 }
 
 /// A named object (a rule, a trigger, ...) depends on `refs`.

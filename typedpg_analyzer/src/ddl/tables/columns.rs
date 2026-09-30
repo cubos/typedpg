@@ -1006,25 +1006,6 @@ pub(crate) fn drop_column(
         )));
     }
 
-    // Policies, triggers, rules and SQL-standard function bodies reading the
-    // column depend on it: CASCADE drops them.
-    let object_dependents = crate::ddl::coldeps::dependents_on_column(interp, relid, target.attnum);
-    if let Some(first) = object_dependents.first()
-        && !cascade
-    {
-        let relname = relname_of(interp, relid);
-        return Err(DdlError::DependencyError(format!(
-            "cannot drop column {} of table {relname} because other objects depend on it \
-             ({} depends on column {} of table {relname})",
-            cmd.name,
-            crate::ddl::coldeps::describe(interp, first),
-            cmd.name,
-        )));
-    }
-    for dependent in &object_dependents {
-        crate::ddl::coldeps::drop_dependent(interp, dependent);
-    }
-
     // A generated column reading this one depends on it (through its
     // pg_attrdef entry): it needs CASCADE, and goes with it.
     let generated_dependents: Vec<String> = {
