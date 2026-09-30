@@ -442,7 +442,12 @@ fn replace_view(
         deps,
     } = resolved;
     // DefineVirtualRelation adds the new columns with ATExecAddColumn.
-    check_relation_columns(interp, RelKind::View, &columns)?;
+    let system = interp
+        .pg_class
+        .get(&view_oid)
+        .and_then(|c| interp.namespace_name(c.relnamespace))
+        == Some("pg_catalog");
+    check_relation_columns(interp, RelKind::View, &columns, system)?;
     let attrs: Vec<PgAttribute> = columns
         .iter()
         .enumerate()
@@ -569,17 +574,26 @@ struct ResolvedView {
 /// CheckAttributeNamesTypes (heap_create_with_catalog): a table or
 /// materialized view's column may not take a system column's name (a view
 /// has none), and no column may have a pseudo-type.
+///
+/// A relation of `pg_catalog` is created by initdb, under
+/// `allow_system_table_mods`: its columns may be `anyarray`
+/// (`CHKATYPE_ANYARRAY`, as `pg_stats` has). The seed replays those views.
 fn check_relation_columns(
     interp: &PgCatalog,
     relkind: RelKind,
     columns: &[ResolvedColumn],
+    system: bool,
 ) -> Result<(), DdlError> {
+    const ANYARRAY: PgTypeOid = PgTypeOid::from_raw(2277);
     if relkind != RelKind::View {
         for col in columns {
             super::tables::check_system_column_name(&col.name)?;
         }
     }
     for col in columns {
+        if system && col.type_oid == ANYARRAY {
+            continue;
+        }
         super::tables::check_attribute_type(interp, &col.name, col.type_oid, None, false)?;
     }
     Ok(())
@@ -600,7 +614,8 @@ fn install_relation(
         ast,
         deps,
     } = resolved;
-    check_relation_columns(interp, relkind, &columns)?;
+    let system = interp.namespace_name(nsoid) == Some("pg_catalog");
+    check_relation_columns(interp, relkind, &columns, system)?;
     let class_oid = PgClassOid::from_nonzero(interp.alloc_oid()?);
     let composite_oid = PgTypeOid::from_nonzero(interp.alloc_oid()?);
     let array_oid = PgTypeOid::from_nonzero(interp.alloc_oid()?);
