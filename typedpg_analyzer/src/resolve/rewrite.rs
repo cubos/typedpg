@@ -271,9 +271,7 @@ fn rewrite_level(
         .any(|r| r.instead && !r.conditional && r.returning);
     let product_queries = matching.iter().any(|r| r.has_actions);
 
-    // A MERGE action runs only for the rows it matches, so a NULL it
-    // writes fails only some executions: not an execution error to report.
-    if depth > 0 && !is_view && !rw.merge && execution_error.is_none() {
+    if depth > 0 && !is_view && execution_error.is_none() {
         let written = actions
             .iter()
             .filter_map(|a| Some((a.event?, &a.assigns)))
