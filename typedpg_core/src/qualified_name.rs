@@ -123,6 +123,18 @@ pub enum ParseQualifiedNameError {
 // Ident rendering
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// A single identifier rendered the way [`QualifiedName`]'s [`Display`]
+/// renders each part: quoted only when necessary (PG's `quote_identifier`).
+pub fn quote_identifier(s: &str) -> String {
+    struct Ident<'a>(&'a str);
+    impl fmt::Display for Ident<'_> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write_ident(f, self.0)
+        }
+    }
+    Ident(s).to_string()
+}
+
 fn write_ident(f: &mut fmt::Formatter<'_>, s: &str) -> fmt::Result {
     if needs_quoting(s) {
         f.write_str("\"")?;

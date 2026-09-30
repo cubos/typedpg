@@ -245,10 +245,10 @@ fn drop_relation(
             "permission denied: \"{name}\" is a system catalog"
         )));
     }
-    drop_relation_oid(interp, class_oid, &name, kind, cascade, named_relations)
+    drop_relation_oid(interp, class_oid, kind, cascade, named_relations)
 }
 
-/// Drop relation `class_oid` (named `name`, a `kind`) and what depends on
+/// Drop relation `class_oid` (a `kind`) and what depends on
 /// it: its inheritance children need CASCADE (a partition goes with its
 /// parent regardless), and so do views, foreign keys in other tables,
 /// functions over its row type and defaults using it as a sequence —
@@ -256,11 +256,13 @@ fn drop_relation(
 fn drop_relation_oid(
     interp: &mut PgCatalog,
     class_oid: PgClassOid,
-    name: &str,
     kind: &str,
     cascade: bool,
     named_relations: &[PgClassOid],
 ) -> Result<(), DdlError> {
+    // The messages name it as getObjectDescription does (qualified unless
+    // visible), not as written.
+    let name = &super::depend::relation_display_name(interp, class_oid);
     // Inheritance children depend on their parent (DEPENDENCY_NORMAL); a
     // partition is part of it (DEPENDENCY_AUTO).
     let partitioned =
@@ -522,12 +524,7 @@ fn drop_relation_oid(
         if named_relations.contains(&child) || !interp.pg_class.contains_key(&child) {
             continue;
         }
-        let child_name = interp
-            .pg_class
-            .get(&child)
-            .map(|c| c.relname.clone())
-            .unwrap_or_default();
-        drop_relation_oid(interp, child, &child_name, "table", cascade, &going)?;
+        drop_relation_oid(interp, child, "table", cascade, &going)?;
     }
 
     drop_relation_by_oid(interp, class_oid);
@@ -784,6 +781,9 @@ fn drop_type(
         )));
     };
     let deps = TypeDependents::of(interp, type_oid);
+    // The messages name it as format_type_be does (qualified unless
+    // visible), not as written.
+    let name = format_type_for_message(interp, type_oid);
 
     // Typed tables (`reloftype`) depend on their type.
     if let Some(&table) = deps.typed_tables.first()
@@ -1095,14 +1095,6 @@ fn drop_function(
         return Ok(());
     };
 
-    let parts: Vec<String> = owa
-        .objname
-        .iter()
-        .filter_map(node_string)
-        .map(|s| s.to_owned())
-        .collect();
-
-    let name = parts.last().cloned().unwrap_or_default();
     // LookupFuncWithArgs (parse_func.c): the argument types must resolve,
     // then the name + types pick exactly one routine, whose kind must match
     // the command.
@@ -1111,11 +1103,6 @@ fn drop_function(
     else {
         return Ok(());
     };
-    let arg_oids: Vec<PgTypeOid> = interp
-        .pg_proc
-        .get(&target)
-        .map(|p| p.proargtypes.clone())
-        .unwrap_or_default();
     let want_procedure = expected_kind == ObjectType::ObjectProcedure;
     let kind_word = if want_procedure {
         "procedure"
@@ -1123,10 +1110,7 @@ fn drop_function(
         "function"
     };
     // getObjectDescription's `name(type,type)`.
-    let signature = format!(
-        "{name}({})",
-        format_arg_oids(&arg_oids, interp).replace(", ", ",")
-    );
+    let signature = super::depend::function_signature(interp, target);
     let target = Some(target);
 
     if let Some(oid) = target {
@@ -1174,9 +1158,8 @@ fn drop_function(
                 "function"
             };
             return Err(DdlError::DependencyError(format!(
-                "cannot drop {kind} {name}({}) because other objects depend on it \
+                "cannot drop {kind} {signature} because other objects depend on it \
                  (view(s) {view_names} depend on this {kind})",
-                format_arg_oids(&arg_oids, interp),
             )));
         }
         // What else depends on it (operators, casts, aggregates, types,

@@ -400,7 +400,7 @@ pub fn format_type_for_message(snapshot: &PgCatalog, oid: PgTypeOid) -> String {
     if !visible && let Some(ns) = snapshot.namespace_name(t.typnamespace) {
         return QualifiedName::new(ns, &t.typname).to_string();
     }
-    t.typname.clone()
+    typedpg_core::quote_identifier(&t.typname)
 }
 
 /// PG's `NAMEDATALEN - 1`: the longest identifier, in bytes.

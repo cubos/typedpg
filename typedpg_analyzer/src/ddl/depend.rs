@@ -567,6 +567,64 @@ fn exists(interp: &PgCatalog, addr: ObjectAddress) -> bool {
     }
 }
 
+/// `name` in namespace `namespace`, qualified — as getObjectDescription
+/// renders it — unless `visible` (the first object of its name along the
+/// search path).
+fn qualify_unless_visible(
+    interp: &PgCatalog,
+    namespace: crate::oid::PgNamespaceOid,
+    name: &str,
+    visible: bool,
+) -> String {
+    match interp.namespace_name(namespace) {
+        Some(ns) if !visible => typedpg_core::QualifiedName::new(ns, name).to_string(),
+        _ => typedpg_core::quote_identifier(name),
+    }
+}
+
+/// Relation `relid`'s name as getRelationDescription renders it: qualified
+/// unless it is visible (RelationIsVisible).
+pub(crate) fn relation_display_name(interp: &PgCatalog, relid: PgClassOid) -> String {
+    let Some(c) = interp.pg_class.get(&relid) else {
+        return String::new();
+    };
+    let visible = interp
+        .schemas_for_lookup(None)
+        .into_iter()
+        .find_map(|ns| interp.class_by_qname.get(&(ns, c.relname.clone())))
+        == Some(&relid);
+    qualify_unless_visible(interp, c.relnamespace, &c.relname, visible)
+}
+
+/// Routine `oid` as format_procedure renders it — `name(type,type)`, the
+/// name qualified unless the routine is visible (FunctionIsVisible: no
+/// routine of its name and argument types comes earlier on the search
+/// path).
+pub(crate) fn function_signature(interp: &PgCatalog, oid: PgProcOid) -> String {
+    let Some(p) = interp.pg_proc.get(&oid) else {
+        return String::new();
+    };
+    let visible = interp.schemas_for_lookup(None).into_iter().find_map(|ns| {
+        interp
+            .pg_proc
+            .values()
+            .find(|q| {
+                q.pronamespace == ns && q.proname == p.proname && q.proargtypes == p.proargtypes
+            })
+            .map(|q| q.oid)
+    }) == Some(oid);
+    let args: Vec<String> = p
+        .proargtypes
+        .iter()
+        .map(|&t| super::util::format_type_for_message(interp, t))
+        .collect();
+    format!(
+        "{}({})",
+        qualify_unless_visible(interp, p.pronamespace, &p.proname, visible),
+        args.join(",")
+    )
+}
+
 /// `getObjectDescription` (objectaddress.c), for the objects dependencies
 /// connect.
 pub(crate) fn describe(interp: &PgCatalog, addr: ObjectAddress) -> String {
@@ -585,20 +643,19 @@ pub(crate) fn describe(interp: &PgCatalog, addr: ObjectAddress) -> String {
             RelKind::ForeignTable => "foreign table",
             _ => "table",
         };
-        (kind.into(), c.relname.clone())
+        (kind.into(), relation_display_name(interp, relid))
     };
     match addr.classid {
         c if c == PG_PROC_RELID => {
             let Some(p) = PgProcOid::new(oid).and_then(|o| interp.pg_proc.get(&o)) else {
                 return "function".into();
             };
-            let args: Vec<String> = p.proargtypes.iter().map(|&t| type_name(t)).collect();
             let kind = if p.prokind == crate::pg_catalog::ProKind::Procedure {
                 "procedure"
             } else {
                 "function"
             };
-            format!("{kind} {}({})", p.proname, args.join(","))
+            format!("{kind} {}", function_signature(interp, p.oid))
         }
         c if c == PG_OPERATOR_RELID => {
             let Some(o) = PgOperatorOid::new(oid).and_then(|o| interp.pg_operator.get(&o)) else {
@@ -671,17 +728,44 @@ pub(crate) fn describe(interp: &PgCatalog, addr: ObjectAddress) -> String {
                 "publication of table {} in publication {publication}",
                 relation(relid).1
             ),
-            Some(NamedObject::Opclass { name, method, .. }) => {
-                format!("operator class {name} for access method {method}")
+            Some(NamedObject::Opclass {
+                name,
+                namespace,
+                method,
+            }) => {
+                // OpclassIsVisible: the first of its name for the method.
+                let visible = interp.schemas_for_lookup(None).into_iter().find(|ns| {
+                    interp.pg_opclass.iter().any(|c| {
+                        c.opcname == name && c.opcnamespace == *ns && c.opcmethod == method
+                    })
+                }) == Some(namespace);
+                format!(
+                    "operator class {} for access method {method}",
+                    qualify_unless_visible(interp, namespace, &name, visible)
+                )
             }
-            Some(NamedObject::TsObject { kind, name, .. }) => format!(
-                "text search {} {name}",
-                if kind == "c" {
-                    "configuration"
-                } else {
-                    "dictionary"
-                }
-            ),
+            Some(NamedObject::TsObject {
+                kind,
+                name,
+                namespace,
+            }) => {
+                // TSDictionaryIsVisible / TSConfigIsVisible.
+                let visible = interp.schemas_for_lookup(None).into_iter().find(|ns| {
+                    interp
+                        .pg_ts_objects
+                        .iter()
+                        .any(|o| o.kind == kind && o.name == name && o.namespace == *ns)
+                }) == Some(namespace);
+                format!(
+                    "text search {} {}",
+                    if kind == "c" {
+                        "configuration"
+                    } else {
+                        "dictionary"
+                    },
+                    qualify_unless_visible(interp, namespace, &name, visible)
+                )
+            }
             _ => "object".into(),
         },
     }

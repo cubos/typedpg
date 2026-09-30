@@ -653,3 +653,83 @@ fn a_publication_holds_on_to_its_column_list_and_row_filter() {
         &format!("{setup} ALTER TABLE tp DROP COLUMN c;"),
     )]);
 }
+
+#[test]
+fn dependency_errors_qualify_names_off_the_search_path() {
+    // getObjectDescription qualifies a relation, routine, type or text
+    // search object that isn't visible — as after SET SCHEMA into a schema
+    // off the search path — and quotes its name when needed.
+    let setup = "CREATE FUNCTION trf() RETURNS trigger LANGUAGE plpgsql
+                     AS 'begin return new; end';
+                 CREATE SCHEMA s2;
+                 CREATE TABLE tc (a int, b int);
+                 CREATE TRIGGER tc1 BEFORE UPDATE OF b ON tc
+                     FOR EACH ROW EXECUTE FUNCTION trf();
+                 ALTER TABLE tc SET SCHEMA s2;
+                 CREATE FUNCTION k() RETURNS int LANGUAGE sql IMMUTABLE AS 'select 1';
+                 CREATE TABLE tk (a int);
+                 CREATE POLICY pk ON tk USING (a = k());
+                 ALTER FUNCTION k() SET SCHEMA s2;
+                 CREATE TABLE x (a int);
+                 CREATE VIEW vx AS SELECT a FROM x;
+                 ALTER TABLE x SET SCHEMA s2;
+                 CREATE DOMAIN dd AS int CHECK (VALUE > 0);
+                 CREATE TABLE ud (v dd);
+                 ALTER DOMAIN dd SET SCHEMA s2;
+                 CREATE TEXT SEARCH DICTIONARY mydict (TEMPLATE = simple);
+                 CREATE TEXT SEARCH CONFIGURATION mycfg (COPY = simple);
+                 ALTER TEXT SEARCH CONFIGURATION mycfg ALTER MAPPING FOR word WITH mydict;
+                 ALTER TEXT SEARCH DICTIONARY mydict SET SCHEMA s2;
+                 ALTER TEXT SEARCH CONFIGURATION mycfg SET SCHEMA s2;
+                 CREATE TABLE \"My T\" (a int);
+                 CREATE VIEW vm AS SELECT a FROM \"My T\";
+                 CREATE FUNCTION \"Fx\"() RETURNS int LANGUAGE sql IMMUTABLE AS 'select 1';
+                 CREATE POLICY pf ON tk USING (a = \"Fx\"());
+                 CREATE TYPE \"Ty\" AS ENUM ('a');
+                 CREATE TABLE ut (x \"Ty\");";
+    for (stmt, msg) in [
+        (
+            "ALTER TABLE s2.tc DROP COLUMN b;",
+            "cannot drop column b of table s2.tc because other objects depend on it \
+             (trigger tc1 on table s2.tc depends on column b of table s2.tc)",
+        ),
+        (
+            "DROP FUNCTION s2.k();",
+            "cannot drop function s2.k() because other objects depend on it \
+             (policy pk on table tk depends on function s2.k())",
+        ),
+        (
+            "ALTER TABLE s2.x DROP COLUMN a;",
+            "cannot drop column a of table s2.x because other objects depend on it",
+        ),
+        (
+            "DROP TABLE s2.x;",
+            "cannot drop table s2.x because other objects depend on it",
+        ),
+        (
+            "DROP DOMAIN s2.dd;",
+            "cannot drop type s2.dd because other objects depend on it",
+        ),
+        (
+            "DROP TEXT SEARCH DICTIONARY s2.mydict;",
+            "cannot drop text search dictionary s2.mydict because other objects depend on it \
+             (text search configuration s2.mycfg depends on text search dictionary s2.mydict)",
+        ),
+        (
+            "DROP TABLE \"My T\";",
+            "cannot drop table \"My T\" because other objects depend on it",
+        ),
+        (
+            "DROP FUNCTION \"Fx\"();",
+            "cannot drop function \"Fx\"() because other objects depend on it \
+             (policy pf on table tk depends on function \"Fx\"())",
+        ),
+        (
+            "DROP TYPE \"Ty\";",
+            "cannot drop type \"Ty\" because other objects depend on it",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+}
