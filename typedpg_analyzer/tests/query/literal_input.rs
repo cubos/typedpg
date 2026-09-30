@@ -1217,3 +1217,40 @@ fn interval_assignment_literal_uses_the_column_field_restriction() {
         );
     }
 }
+
+/// The reg* input functions parse a (qualified) name with PG's identifier
+/// rules — or, for regtype, a whole type name with the grammar — and look
+/// it up at parse time.
+#[test]
+fn reg_type_literals_are_parsed_and_looked_up() {
+    let db = setup();
+    for (sql, msg) in [
+        ("SELECT '1.5e3'::regclass", "relation \"1.5e3\" does not exist"),
+        ("SELECT '{1,2}'::regclass", "relation \"{1,2}\" does not exist"),
+        ("SELECT 'x y'::regclass", "invalid name syntax"),
+        (
+            "SELECT 'a.b.c.d'::regclass",
+            "improper relation name (too many dotted names): a.b.c.d",
+        ),
+        ("SELECT '{1,2}'::regtype", "syntax error at or near \"{\""),
+        ("SELECT '1.5e3'::regtype", "syntax error at or near \"1.5e3\""),
+        ("SELECT 'nosuch[]'::regtype", "type \"nosuch[]\" does not exist"),
+        ("SELECT 'setof int'::regtype", "invalid type name \"setof int\""),
+        ("SELECT '1.5e3'::regproc", "function \"1.5e3\" does not exist"),
+        ("SELECT '1.5e3'::regnamespace", "invalid name syntax"),
+        ("SELECT '1.5e3'::regoper", "operator does not exist: 1.5e3"),
+        ("SELECT '1.5e3'::regprocedure", "expected a left parenthesis"),
+    ] {
+        assert_first_line!(db.analyze(sql), msg);
+    }
+    for sql in [
+        "SELECT ' T '::regclass AS v",
+        "SELECT 'public.t'::regclass AS v",
+        "SELECT 'int[]'::regtype AS v, 'numeric(10,2)'::regtype AS w",
+        "SELECT 'character varying'::regtype AS v",
+        "SELECT '-'::regclass AS v",
+        "SELECT 'lower(text)'::regprocedure AS v",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}

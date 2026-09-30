@@ -45,7 +45,10 @@ pub(crate) struct PgQueryPlpgsqlParseResult {
 }
 
 unsafe extern "C" {
-    pub(crate) fn pg_query_parse_protobuf(input: *const c_char) -> PgQueryProtobufParseResult;
+    pub(crate) fn pg_query_parse_protobuf_opts(
+        input: *const c_char,
+        parser_options: std::ffi::c_int,
+    ) -> PgQueryProtobufParseResult;
     pub(crate) fn pg_query_free_protobuf_parse_result(result: PgQueryProtobufParseResult);
     pub(crate) fn pg_query_scan(input: *const c_char) -> PgQueryScanResult;
     pub(crate) fn pg_query_free_scan_result(result: PgQueryScanResult);

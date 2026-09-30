@@ -748,9 +748,3 @@ pub(crate) fn set_schema(
         .rekey(kind, (old_ns, name.clone()), (new_ns, name));
     Ok(())
 }
-
-/// `regconfig` / `regdictionary` input of a bare name: an existing
-/// configuration / dictionary.
-pub(crate) fn check_reg_input(interp: &PgCatalog, kind: &str, name: &str) -> Result<(), String> {
-    find(interp, kind, &[name]).map_err(|e| e.to_string())
-}

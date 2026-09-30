@@ -87,8 +87,23 @@ unsafe fn error_message(error: *const ffi::PgQueryError) -> String {
 
 /// Parse `sql` with PostgreSQL's grammar.
 pub fn parse(sql: &str) -> Result<ParseResult> {
+    parse_with_options(sql, 0)
+}
+
+/// libpg_query's `PG_QUERY_PARSE_TYPE_NAME` mode.
+const PARSE_TYPE_NAME: std::ffi::c_int = 1;
+
+/// Parse `text` as a lone type name — PG's `raw_parser` in
+/// `RAW_PARSE_TYPE_NAME` mode, what `parseTypeString` (`'…'::regtype`,
+/// `to_regtype`) uses. The result holds one statement whose node is a
+/// `TypeName`.
+pub fn parse_type_name(text: &str) -> Result<ParseResult> {
+    parse_with_options(text, PARSE_TYPE_NAME)
+}
+
+fn parse_with_options(sql: &str, options: std::ffi::c_int) -> Result<ParseResult> {
     let input = CString::new(sql)?;
-    let result = unsafe { ffi::pg_query_parse_protobuf(input.as_ptr()) };
+    let result = unsafe { ffi::pg_query_parse_protobuf_opts(input.as_ptr(), options) };
     let parsed = if result.error.is_null() {
         let data = unsafe {
             std::slice::from_raw_parts(result.parse_tree.data as *const u8, result.parse_tree.len)

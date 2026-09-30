@@ -135,106 +135,11 @@ pub(crate) fn validate(
         "uuid" => validate_uuid(content),
         "json" | "jsonb" => validate_json(content),
         "jsonpath" => crate::jsonpath_input::validate(content),
-        // The object-resolving reg* family parses the value as a (possibly
-        // qualified) SQL identifier and resolves it at parse time. An
-        // empty/whitespace-only string is never a valid name; for the two
-        // members whose target catalog we fully model (relations and
-        // functions) a *simple* unquoted name is also resolved here. The
-        // rest (regtype's full type-name grammar, roles/collations/text
-        // search objects we don't track) are accepted unchecked.
+        // The object-resolving reg* family: an OID, or a name looked up at
+        // parse time — see `reg_input`.
         name @ ("regproc" | "regprocedure" | "regoper" | "regoperator" | "regclass" | "regtype"
         | "regcollation" | "regconfig" | "regdictionary" | "regnamespace" | "regrole") => {
-            let trimmed = content.trim_matches(|c: char| c.is_ascii_whitespace());
-            if trimmed.is_empty() {
-                return Err("invalid name syntax".to_string());
-            }
-            // All-digits is an OID literal — subject to oid's range check
-            // (`'99…9'::regproc` → `value "…" is out of range for type oid`).
-            // The check is on the *raw* content: reg* input functions only
-            // take the OID path when the whole string is digits.
-            if content.chars().all(|c| c.is_ascii_digit()) {
-                if content.parse::<u64>().is_ok_and(|v| v <= u32::MAX as u64) {
-                    return Ok(());
-                }
-                return Err(format!("value \"{content}\" is out of range for type oid"));
-            }
-            // Surrounding whitespace interacts with each reg* type's own
-            // trimming rules (`' 42 '::regproc` is rejected, `' users '` is
-            // not necessarily) — accept rather than model them.
-            if trimmed != content {
-                return Ok(());
-            }
-            if !matches!(
-                name,
-                "regclass"
-                    | "regproc"
-                    | "regtype"
-                    | "regconfig"
-                    | "regdictionary"
-                    | "regnamespace"
-                    | "regcollation"
-            ) {
-                return Ok(());
-            }
-            // Quoted / qualified forms need real identifier parsing — skip.
-            if trimmed.contains(['"', '.']) {
-                return Ok(());
-            }
-            // `regtype` parses its value with the full type-name grammar
-            // (`'character varying'`, `'int[]'`, `'numeric(10,2)'`, …); only
-            // a single bare identifier is simple enough to resolve here.
-            if name == "regtype"
-                && !trimmed
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
-            {
-                return Ok(());
-            }
-            // An unquoted name containing whitespace fails PG's identifier
-            // splitting up front (`'1 day'::regclass` → invalid name syntax).
-            if name != "regtype" && trimmed.chars().any(|c| c.is_ascii_whitespace()) {
-                return Err("invalid name syntax".to_string());
-            }
-            // Unquoted identifiers fold to lowercase before lookup. System
-            // objects (`pg_*`, information_schema) may be absent from the
-            // snapshot — accept those rather than risk a false rejection.
-            let folded = trimmed.to_ascii_lowercase();
-            if folded.starts_with("pg_") || folded.starts_with("information_schema") {
-                return Ok(());
-            }
-            match name {
-                "regclass" if snapshot.resolve_table(None, &folded).is_none() => {
-                    Err(format!("relation \"{folded}\" does not exist"))
-                }
-                // `regproc` (unlike `regprocedure`) requires the bare name to
-                // resolve to exactly one function.
-                "regproc" => match snapshot.find_functions(None, &folded).len() {
-                    0 => Err(format!("function \"{folded}\" does not exist")),
-                    1 => Ok(()),
-                    _ => Err(format!("more than one function named \"{folded}\"")),
-                },
-                // A bare identifier for `regtype`: try the SQL-standard
-                // aliases (`integer` → `int4`) then the catalog.
-                "regtype" => {
-                    let normalized = crate::ddl::util::normalize_type_name(&folded);
-                    if snapshot.resolve_type_by_name(None, normalized).is_some()
-                        || snapshot.resolve_type_by_name(None, &folded).is_some()
-                    {
-                        Ok(())
-                    } else {
-                        Err(format!("type \"{folded}\" does not exist"))
-                    }
-                }
-                "regconfig" => crate::ddl::text_search::check_reg_input(snapshot, "c", &folded),
-                "regdictionary" => crate::ddl::text_search::check_reg_input(snapshot, "d", &folded),
-                "regnamespace" if snapshot.namespace_oid(&folded).is_none() => {
-                    Err(format!("schema \"{folded}\" does not exist"))
-                }
-                "regcollation" if snapshot.resolve_collation(None, &folded).is_none() => Err(
-                    format!("collation \"{folded}\" for encoding \"UTF8\" does not exist"),
-                ),
-                _ => Ok(()),
-            }
+            crate::reg_input::validate(name, content, snapshot)
         }
         // Datetime family: a port of PG's datetime input decoder — see
         // `datetime_input`.

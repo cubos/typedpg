@@ -338,28 +338,6 @@ pub fn type_name_to_string(tn: &TypeName) -> String {
     out
 }
 
-/// Normalize PostgreSQL type name aliases to their canonical form, the way
-/// the SQL grammar would for a bare keyword. Only meaningful for type names
-/// that went through no grammar at all (e.g. the text of a `regtype`
-/// literal); `TypeName` nodes from `typedpg_pg_query` are already canonical.
-pub(crate) fn normalize_type_name(name: &str) -> &str {
-    match name {
-        "integer" | "int" => "int4",
-        "smallint" => "int2",
-        "bigint" => "int8",
-        "real" => "float4",
-        "double precision" | "double" => "float8",
-        "boolean" => "bool",
-        "character varying" | "varchar" => "varchar",
-        "character" | "char" => "bpchar",
-        "decimal" | "numeric" => "numeric",
-        "serial" => "int4",
-        "bigserial" => "int8",
-        "smallserial" => "int2",
-        other => other,
-    }
-}
-
 /// Render a type OID into PG's user-facing name for diagnostic messages.
 ///
 /// Mirrors `format_type_extended` in `src/backend/utils/adt/format_type.c`
