@@ -474,7 +474,9 @@ fn routines_depend_on_their_language() {
 
 #[test]
 fn a_created_language_depends_on_its_handler_and_holds_its_routines() {
-    let setup = "CREATE FUNCTION myh() RETURNS language_handler LANGUAGE c AS 'mylib';
+    // A handler the server can load, so the oracle runs the setup too.
+    let setup = "CREATE FUNCTION myh() RETURNS language_handler LANGUAGE c
+                     AS '$libdir/plpgsql', 'plpgsql_call_handler';
                  CREATE LANGUAGE mylang HANDLER myh;
                  CREATE FUNCTION mf() RETURNS int LANGUAGE mylang AS 'x';";
     for (stmt, message) in [
