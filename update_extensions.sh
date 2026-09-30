@@ -356,6 +356,14 @@ download_ext "xml2" \
     "xml2--1.1.sql" \
     "xml2--1.1--1.2.sql"
 
+echo -e "\n--- plpgsql (1.0, src/pl/plpgsql) ---"
+echo "  plpgsql--1.0.sql..."
+if curl -sfL "${BASE_URL}/src/pl/plpgsql/src/plpgsql--1.0.sql" -o /tmp/ext_tmp.sql; then
+    grep -v '^\\\(echo\|quit\)' /tmp/ext_tmp.sql > "${OUT_DIR}/plpgsql--1.0.sql" || true
+else
+    echo "    WARNING: Failed to download plpgsql"
+fi
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Third-party extensions
 # ═══════════════════════════════════════════════════════════════════════════

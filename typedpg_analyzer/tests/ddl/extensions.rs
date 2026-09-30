@@ -417,3 +417,87 @@ fn drop_extension_or_schema_cascade_drops_columns_of_their_types() {
         assert_eq!(names, ["b"], "{table}");
     }
 }
+
+#[test]
+fn routines_depend_on_their_language() {
+    // PG 18: a plpgsql routine depends on language plpgsql, a member of the
+    // plpgsql extension; the pinned built-in languages record nothing.
+    let setup = "CREATE FUNCTION pf() RETURNS int LANGUAGE plpgsql AS 'begin return 1; end';
+                 CREATE PROCEDURE pp() LANGUAGE plpgsql AS 'begin end';
+                 CREATE FUNCTION sf() RETURNS int LANGUAGE sql AS 'select 1';";
+    for (stmt, message) in [
+        (
+            "DROP EXTENSION plpgsql;",
+            "cannot drop extension plpgsql because other objects depend on it (function pf() \
+             depends on language plpgsql)",
+        ),
+        (
+            "DROP LANGUAGE plpgsql;",
+            "cannot drop language plpgsql because extension plpgsql requires it (You can drop \
+             extension plpgsql instead.)",
+        ),
+        (
+            "DROP LANGUAGE sql;",
+            "cannot drop language sql because it is required by the database system",
+        ),
+        (
+            "DROP FUNCTION plpgsql_call_handler();",
+            "cannot drop function plpgsql_call_handler() because extension plpgsql requires it",
+        ),
+        (
+            "DROP EXTENSION plpgsql CASCADE; DO 'begin end';",
+            "language \"plpgsql\" does not exist",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(message), "{stmt}\n  got: {err}");
+    }
+    // CASCADE takes the plpgsql routines only; CREATE EXTENSION brings the
+    // language back, and its routines depend on it again.
+    let mut db = build_db(&[("0001.sql", setup)]);
+    db.apply_sql("DROP EXTENSION plpgsql CASCADE;").unwrap();
+    assert!(db.find_functions(None, "pf").is_empty());
+    assert!(db.find_functions(None, "pp").is_empty());
+    assert_eq!(db.find_functions(None, "sf").len(), 1);
+    db.apply_sql(
+        "CREATE EXTENSION plpgsql;
+         CREATE FUNCTION pf3() RETURNS int LANGUAGE plpgsql AS 'begin return 1; end';",
+    )
+    .unwrap();
+    let err = db.apply_sql("DROP EXTENSION plpgsql;").unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("cannot drop extension plpgsql because other objects depend on it"),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_created_language_depends_on_its_handler_and_holds_its_routines() {
+    let setup = "CREATE FUNCTION myh() RETURNS language_handler LANGUAGE c AS 'mylib';
+                 CREATE LANGUAGE mylang HANDLER myh;
+                 CREATE FUNCTION mf() RETURNS int LANGUAGE mylang AS 'x';";
+    for (stmt, message) in [
+        (
+            "DROP FUNCTION myh();",
+            "cannot drop function myh() because other objects depend on it (language mylang \
+             depends on function myh())",
+        ),
+        (
+            "DROP LANGUAGE mylang;",
+            "cannot drop language mylang because other objects depend on it (function mf() \
+             depends on language mylang)",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(message), "{stmt}\n  got: {err}");
+    }
+    let db = build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "ALTER LANGUAGE mylang RENAME TO otherlang; DROP FUNCTION myh() CASCADE;",
+        ),
+    ]);
+    assert!(db.find_functions(None, "mf").is_empty());
+}

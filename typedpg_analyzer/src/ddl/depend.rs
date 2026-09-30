@@ -110,6 +110,9 @@ impl ObjectAddress {
     pub(crate) fn cast(oid: PgCastOid) -> Self {
         Self::new(PG_CAST_RELID, oid.into_nonzero(), 0)
     }
+    pub(crate) fn language(oid: crate::oid::PgLanguageOid) -> Self {
+        Self::new(crate::pg_catalog::PG_LANGUAGE_RELID, oid.into_nonzero(), 0)
+    }
 
     /// The address of what [`drop_target_identity`] found for `obj_type`.
     pub(crate) fn of_drop_target(obj_type: ObjectType, oid: u32) -> Option<Self> {
@@ -133,10 +136,10 @@ impl ObjectAddress {
     }
 }
 
-/// `FirstNormalObjectId`: objects below it come with the server (the
-/// seed); PG never records dependencies on pinned objects, and none of
-/// these can be dropped by a migration anyway.
-const FIRST_NORMAL_OBJECT_ID: u32 = 16384;
+/// `FirstUnpinnedObjectId`: objects below it are pinned (the core of the
+/// system, created by genbki); PG never records dependencies on them.
+/// initdb's later objects (plpgsql, information_schema) are not pinned.
+const FIRST_UNPINNED_OBJECT_ID: u32 = 12000;
 
 /// `recordDependencyOn` for each of `referenced` (deduplicated, like
 /// `record_object_address_dependencies`), skipping built-in objects and
@@ -149,7 +152,7 @@ pub(crate) fn record(
 ) {
     let mut refs: Vec<ObjectAddress> = referenced
         .into_iter()
-        .filter(|r| r.objid.get() >= FIRST_NORMAL_OBJECT_ID)
+        .filter(|r| r.objid.get() >= FIRST_UNPINNED_OBJECT_ID)
         .filter(|r| (r.classid, r.objid) != (depender.classid, depender.objid))
         .collect();
     refs.sort();
@@ -511,6 +514,9 @@ fn exists(interp: &PgCatalog, addr: ObjectAddress) -> bool {
         c if c == PG_CAST_RELID => {
             PgCastOid::new(oid).is_some_and(|o| interp.pg_cast.contains_key(&o))
         }
+        c if c == crate::pg_catalog::PG_LANGUAGE_RELID => {
+            crate::oid::PgLanguageOid::new(oid).is_some_and(|o| interp.pg_language.contains_key(&o))
+        }
         c if c == PG_TYPE_RELID => {
             PgTypeOid::new(oid).is_some_and(|o| interp.pg_type.contains_key(&o))
         }
@@ -576,6 +582,12 @@ pub(crate) fn describe(interp: &PgCatalog, addr: ObjectAddress) -> String {
             };
             let left = o.oprleft.map_or_else(|| "NONE".to_owned(), type_name);
             format!("operator {}({left},{})", o.oprname, type_name(o.oprright))
+        }
+        c if c == crate::pg_catalog::PG_LANGUAGE_RELID => {
+            match crate::oid::PgLanguageOid::new(oid).and_then(|o| interp.pg_language.get(&o)) {
+                Some(l) => format!("language {}", l.lanname),
+                None => "language".into(),
+            }
         }
         c if c == PG_CAST_RELID => match PgCastOid::new(oid).and_then(|o| interp.pg_cast.get(&o)) {
             Some(cast) => format!(
@@ -776,6 +788,29 @@ pub(crate) fn drop_dependents(
     target_desc: &str,
     cascade: bool,
 ) -> Result<(), super::DdlError> {
+    drop_dependents_reporting(interp, target, target_desc, target_desc, cascade)
+}
+
+/// [`drop_dependents`] of `target`, a member of the object a DROP names
+/// (`dropped_desc`, e.g. its extension): the error names that object, its
+/// detail the member the dependent depends on.
+pub(crate) fn drop_member_dependents(
+    interp: &mut PgCatalog,
+    member: ObjectAddress,
+    dropped_desc: &str,
+    cascade: bool,
+) -> Result<(), super::DdlError> {
+    let member_desc = describe(interp, member);
+    drop_dependents_reporting(interp, member, dropped_desc, &member_desc, cascade)
+}
+
+fn drop_dependents_reporting(
+    interp: &mut PgCatalog,
+    target: ObjectAddress,
+    target_desc: &str,
+    detail_desc: &str,
+    cascade: bool,
+) -> Result<(), super::DdlError> {
     let dependents: Vec<(ObjectAddress, DepType)> = dependents_of(interp, target)
         .into_iter()
         .filter(|(d, _)| !in_progress(*d))
@@ -801,7 +836,7 @@ pub(crate) fn drop_dependents(
     {
         return Err(super::DdlError::DependencyError(format!(
             "cannot drop {target_desc} because other objects depend on it ({} depends on \
-             {target_desc})",
+             {detail_desc})",
             describe_dependent(interp, *blocker)
         )));
     }
@@ -880,6 +915,11 @@ fn delete_object_now(interp: &mut PgCatalog, addr: ObjectAddress) -> Result<(), 
         c if c == PG_CAST_RELID => {
             if let Some(cast) = PgCastOid::new(oid) {
                 interp.remove_pg_cast(cast);
+            }
+        }
+        c if c == crate::pg_catalog::PG_LANGUAGE_RELID => {
+            if let Some(language) = crate::oid::PgLanguageOid::new(oid) {
+                super::languages::delete_language(interp, language);
             }
         }
         c if c == PG_TYPE_RELID => {
@@ -1006,6 +1046,12 @@ fn delete_named(interp: &mut PgCatalog, object: &NamedObject) {
 
 /// DROP EXTENSION: remove a member the analyzer keeps by name.
 pub(crate) fn delete_member(interp: &mut PgCatalog, classid: PgClassOid, objid: PgGenericOid) {
+    if classid == crate::pg_catalog::PG_LANGUAGE_RELID
+        && let Some(language) = crate::oid::PgLanguageOid::new(objid.get())
+    {
+        super::languages::delete_language(interp, language);
+        return;
+    }
     if let Some(object) = interp.named_objects.remove(&objid.into_nonzero()) {
         delete_named(interp, &object);
     }

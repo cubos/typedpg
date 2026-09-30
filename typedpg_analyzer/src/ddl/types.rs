@@ -902,6 +902,7 @@ pub fn create_range(interp: &mut PgCatalog, stmt: &CreateRangeStmt) -> Result<()
             proargnames: Vec::new(),
             provolatile: crate::pg_catalog::ProVolatile::Immutable,
             proargdefaulttypes: Vec::new(),
+            prolang: crate::pg_catalog::INTERNAL_LANGUAGE,
         });
     }
     super::depend::record(

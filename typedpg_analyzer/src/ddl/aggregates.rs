@@ -548,6 +548,7 @@ pub fn define_aggregate(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(),
         },
         provolatile: ProVolatile::Immutable,
         proargdefaulttypes: Vec::new(),
+        prolang: crate::pg_catalog::INTERNAL_LANGUAGE,
     };
     let proc = super::functions::procedure_create(interp, proc, stmt.replace)?;
     // AggregateCreate's own replacement rules.

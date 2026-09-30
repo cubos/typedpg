@@ -62,20 +62,6 @@ pub fn create_extension(
         )));
     }
 
-    // plpgsql comes with the server: re-creating it after a DROP EXTENSION
-    // brings the language back.
-    if name == "plpgsql" && !REGISTRY.iter().any(|e| e.name == "plpgsql") {
-        let nsoid = super::util::existing_namespace(interp, "pg_catalog")?;
-        let ext_oid = PgExtensionOid::from_nonzero(interp.alloc_oid()?);
-        interp.insert_pg_extension(PgExtension {
-            oid: ext_oid,
-            extname: name.clone(),
-            extnamespace: nsoid,
-            extversion: "1.0".to_owned(),
-        });
-        interp.dropped_languages.retain(|l| l != "plpgsql");
-        return Ok(());
-    }
     let ext = REGISTRY
         .iter()
         .find(|e| e.name == name.as_str())
@@ -275,6 +261,7 @@ fn record_extension_membership(
 /// classes and text search objects become members too
 /// (recordDependencyOnCurrentExtension).
 struct OtherMembers {
+    languages: std::collections::HashSet<crate::oid::PgLanguageOid>,
     operators: std::collections::HashSet<crate::oid::PgOperatorOid>,
     relations: std::collections::HashSet<PgClassOid>,
     opclasses: usize,
@@ -284,6 +271,7 @@ struct OtherMembers {
 impl OtherMembers {
     fn snapshot(interp: &PgCatalog) -> Self {
         Self {
+            languages: interp.pg_language.keys().copied().collect(),
             operators: interp.pg_operator.keys().copied().collect(),
             relations: interp.pg_class.keys().copied().collect(),
             opclasses: interp.pg_opclass.len(),
@@ -299,6 +287,13 @@ impl OtherMembers {
             .filter(|k| !self.operators.contains(k))
             .map(|&o| ObjectAddress::operator(o))
             .collect();
+        members.extend(
+            interp
+                .pg_language
+                .keys()
+                .filter(|k| !self.languages.contains(k))
+                .map(|&l| ObjectAddress::language(l)),
+        );
         // A relation's indexes and row type are its own, not members.
         members.extend(
             interp
@@ -473,7 +468,10 @@ fn substitute_extschema(interp: &PgCatalog, schema: &str, sql: &str) -> String {
             format!("\"{}\"", s.replace('"', "\"\""))
         }
     };
-    let mut out = sql.replace("@extschema@", &quote(schema));
+    // The owner: the migrations' role (ownership isn't modeled).
+    let mut out = sql
+        .replace("@extschema@", &quote(schema))
+        .replace("@extowner@", "CURRENT_USER");
     while let Some(start) = out.find("@extschema:") {
         let rest = &out[start + "@extschema:".len()..];
         let Some(end) = rest.find('@') else {

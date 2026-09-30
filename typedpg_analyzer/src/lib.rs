@@ -79,16 +79,17 @@ pub(crate) mod qualified_name {
 
 pub use oid::{
     PgCastOid, PgClassOid, PgCollationOid, PgConstraintOid, PgEnumOid, PgExtensionOid,
-    PgGenericOid, PgNamespaceOid, PgOpclassOid, PgOperatorOid, PgProcOid, PgRewriteOid, PgTypeOid,
+    PgGenericOid, PgLanguageOid, PgNamespaceOid, PgOpclassOid, PgOperatorOid, PgProcOid,
+    PgRewriteOid, PgTypeOid,
 };
 #[cfg(any(test, feature = "internal"))]
 pub use pg_catalog::{
     AggKind, ArgMode, AstBinding, AttGenerated, AttIdentity, CastContext, CastMethod, ConType,
     DepType, EvEnabled, EvType, PgAggregate, PgAm, PgAmop, PgAttribute, PgCast, PgCatalogSeed,
     PgClass, PgCollation, PgConstraint, PgDepend, PgEnum, PgExtension, PgIndex, PgInherits,
-    PgNamespace, PgOpclass, PgOperator, PgOpfamily, PgProc, PgRange, PgRewrite, PgSetting,
-    PgTsObject, PgType, ProKind, ProVolatile, RelKind, SerializedAst, TypAlign, TypCategory,
-    TypStorage, TypType,
+    PgLanguage, PgNamespace, PgOpclass, PgOperator, PgOpfamily, PgProc, PgRange, PgRewrite,
+    PgSetting, PgTsObject, PgType, ProKind, ProVolatile, RelKind, SerializedAst, TypAlign,
+    TypCategory, TypStorage, TypType,
 };
 
 pub use ddl::DdlError;

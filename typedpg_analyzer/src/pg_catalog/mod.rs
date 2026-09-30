@@ -21,7 +21,7 @@ use crate::error::AnalyzeError;
 use crate::lexer::lex;
 use crate::oid::{
     PgCastOid, PgClassOid, PgCollationOid, PgConstraintOid, PgExtensionOid, PgGenericOid,
-    PgNamespaceOid, PgOperatorOid, PgProcOid, PgRewriteOid, PgTypeOid,
+    PgLanguageOid, PgNamespaceOid, PgOperatorOid, PgProcOid, PgRewriteOid, PgTypeOid,
 };
 use crate::resolve::{AnalyzedQuery, analyze_static, build_spread_sample_sql, fuse};
 use crate::seed::load_seed;
@@ -84,6 +84,12 @@ pub const PG_PROC_RELID: PgClassOid = PgClassOid::from_raw(1255);
 pub const PG_OPERATOR_RELID: PgClassOid = PgClassOid::from_raw(2617);
 pub const PG_CAST_RELID: PgClassOid = PgClassOid::from_raw(2605);
 pub const PG_EXTENSION_RELID: PgClassOid = PgClassOid::from_raw(3079);
+pub const PG_LANGUAGE_RELID: PgClassOid = PgClassOid::from_raw(2612);
+
+/// The OIDs initdb gives the built-in languages (pg_language.dat).
+pub const INTERNAL_LANGUAGE: PgLanguageOid = PgLanguageOid::from_raw(12);
+pub const C_LANGUAGE: PgLanguageOid = PgLanguageOid::from_raw(13);
+pub const SQL_LANGUAGE: PgLanguageOid = PgLanguageOid::from_raw(14);
 
 mod pg_query_catalog;
 mod rows;
@@ -153,6 +159,8 @@ pub struct PgCatalogSeed {
     pub pg_settings: Vec<PgSetting>,
     #[serde(default)]
     pub pg_ts_objects: Vec<PgTsObject>,
+    #[serde(default)]
+    pub pg_language: Vec<PgLanguage>,
 }
 
 // ─── In-memory catalog ─────────────────────────────────────────────────────
@@ -195,6 +203,7 @@ pub struct PgCatalog {
     pub(crate) pg_amop: Vec<PgAmop>,
     pub(crate) pg_settings: Vec<PgSetting>,
     pub(crate) pg_ts_objects: Vec<PgTsObject>,
+    pub(crate) pg_language: HashMap<PgLanguageOid, PgLanguage>,
     /// Parsers, templates and options of the text search objects migrations
     /// create.
     pub(crate) ts_definitions: crate::ddl::text_search::TsDefinitions,
@@ -329,10 +338,6 @@ pub struct PgCatalog {
     pub(crate) migrations_use_transaction: bool,
     /// `ON COMMIT DROP` temporary tables of the current transaction.
     pub(crate) on_commit_drop: Vec<PgClassOid>,
-    /// Languages added by CREATE LANGUAGE, and built-in ones dropped or
-    /// renamed away.
-    pub(crate) languages: Vec<String>,
-    pub(crate) dropped_languages: Vec<String>,
     /// Materialized views created or refreshed WITH NO DATA.
     pub(crate) unpopulated_matviews: std::collections::HashSet<PgClassOid>,
     /// Objects the analyzer keeps by name (policies, rules, triggers, ...),
@@ -481,6 +486,9 @@ impl PgCatalog {
         for e in &seed.pg_extension {
             bump(e.oid.get(), &mut max_oid);
         }
+        for l in &seed.pg_language {
+            bump(l.oid.get(), &mut max_oid);
+        }
         for e in &seed.pg_enum {
             bump(e.oid.get(), &mut max_oid);
         }
@@ -570,6 +578,10 @@ impl PgCatalog {
         cat.pg_amop = seed.pg_amop;
         cat.pg_settings = seed.pg_settings;
         cat.pg_ts_objects = seed.pg_ts_objects;
+        cat.pg_language = seed.pg_language.into_iter().map(|l| (l.oid, l)).collect();
+        if cat.pg_language.is_empty() {
+            cat.pg_language = default_languages();
+        }
         for (oid, definition) in seed.sql_function_defs {
             cat.add_sql_function_def(oid, definition);
         }
@@ -606,6 +618,7 @@ impl PgCatalog {
             pg_amop: Vec::new(),
             pg_settings: Vec::new(),
             pg_ts_objects: Vec::new(),
+            pg_language: HashMap::new(),
             ts_definitions: Default::default(),
             cluster_objects: Default::default(),
             transforms: Vec::new(),
@@ -653,8 +666,6 @@ impl PgCatalog {
             migrations_use_transaction: false,
             statement_sql: None,
             on_commit_drop: Vec::new(),
-            languages: Vec::new(),
-            dropped_languages: Vec::new(),
             unpopulated_matviews: std::collections::HashSet::new(),
             named_objects: HashMap::new(),
             conversions: Vec::new(),
@@ -731,6 +742,19 @@ impl PgCatalog {
 
         let mut pg_depend = self.pg_depend.clone();
         pg_depend.sort_by_key(|d| (d.classid, d.objid, d.objsubid, d.refclassid, d.refobjid));
+        // The seed replays its views, which record rows PG exported already.
+        let mut seen = std::collections::HashSet::new();
+        pg_depend.retain(|d| {
+            seen.insert((
+                d.classid,
+                d.objid,
+                d.objsubid,
+                d.refclassid,
+                d.refobjid,
+                d.refobjsubid,
+                d.deptype as u8,
+            ))
+        });
 
         let mut pg_inherits = self.pg_inherits.clone();
         pg_inherits.sort_by_key(|i| (i.inhrelid, i.inhseqno));
@@ -772,6 +796,11 @@ impl PgCatalog {
             pg_amop: self.pg_amop.clone(),
             pg_settings: self.pg_settings.clone(),
             pg_ts_objects: self.pg_ts_objects.clone(),
+            pg_language: {
+                let mut rows: Vec<_> = self.pg_language.values().cloned().collect();
+                rows.sort_by_key(|l| l.oid);
+                rows
+            },
             sql_function_defs: {
                 let mut defs: Vec<_> = self
                     .sql_function_defs
@@ -1637,6 +1666,29 @@ impl PgCatalog {
         self.pg_depend
             .retain(|d| !(d.refclassid == refclassid && d.refobjid == refobjid));
     }
+}
+
+/// The built-in languages, for a seed that predates `pg_language`.
+fn default_languages() -> HashMap<PgLanguageOid, PgLanguage> {
+    [
+        (INTERNAL_LANGUAGE, "internal", false),
+        (C_LANGUAGE, "c", false),
+        (SQL_LANGUAGE, "sql", true),
+    ]
+    .into_iter()
+    .map(|(oid, name, trusted)| {
+        (
+            oid,
+            PgLanguage {
+                oid,
+                lanname: name.to_owned(),
+                lanispl: false,
+                lanpltrusted: trusted,
+                lanplcallfoid: None,
+            },
+        )
+    })
+    .collect()
 }
 
 /// PostgreSQL's boot value of `search_path`, for a seed that predates the

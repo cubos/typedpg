@@ -502,7 +502,7 @@ pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Res
         None if stmt.sql_body.is_some() => "sql".to_owned(),
         None => return Err(DdlError::Parse("no language specified".into())),
     };
-    super::languages::check(interp, &language)?;
+    let prolang = super::languages::check(interp, &language)?;
 
     // TRANSFORM FOR TYPE t: a transform for t (or its element type) and
     // the language must exist.
@@ -604,8 +604,17 @@ pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Res
         },
         provolatile: attrs.common.volatility().unwrap_or(ProVolatile::Volatile),
         proargdefaulttypes: params.default_types.clone(),
+        prolang,
     };
     let proc = procedure_create(interp, proc, stmt.replace)?;
+    // ProcedureCreate: the routine depends on its language (the pinned
+    // built-in ones record nothing).
+    super::depend::record(
+        interp,
+        super::depend::ObjectAddress::proc(proc.oid),
+        [super::depend::ObjectAddress::language(prolang)],
+        DepType::Normal,
+    );
 
     super::function_body::check_pseudo_types(interp, Some(&language), &proc)?;
     if let Some(body) = super::function_body::inlinable_body(stmt, &proc) {

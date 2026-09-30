@@ -1,99 +1,148 @@
 //! Procedural languages (`pg_language`): functions, DO blocks and
 //! transforms name one that must exist; CREATE LANGUAGE ... HANDLER adds
-//! one, and the built-in ones can't be dropped.
+//! one (depending on its handler functions), a routine depends on its
+//! language, and DROP LANGUAGE goes through the dependency engine — the
+//! built-in languages are pinned, plpgsql belongs to its extension.
 
 use typedpg_pg_query::protobuf::{CreatePLangStmt, CreateTransformStmt};
 
 use super::DdlError;
-use crate::oid::PgTypeOid;
-use crate::pg_catalog::PgCatalog;
+use crate::oid::{PgLanguageOid, PgProcOid, PgTypeOid};
+use crate::pg_catalog::{PgCatalog, PgLanguage};
 
-/// The languages of a stock database.
-pub(crate) const BUILTIN: &[&str] = &["internal", "c", "sql", "plpgsql"];
+/// `FirstUnpinnedObjectId`: the built-in languages below it (internal, c,
+/// sql) are pinned — required by the database system.
+const FIRST_UNPINNED_OBJECT_ID: u32 = 12000;
+
+/// get_language_oid(missing_ok = true).
+pub(crate) fn find(interp: &PgCatalog, name: &str) -> Option<PgLanguageOid> {
+    interp
+        .pg_language
+        .values()
+        .find(|l| l.lanname == name)
+        .map(|l| l.oid)
+}
 
 pub(crate) fn exists(interp: &PgCatalog, name: &str) -> bool {
-    BUILTIN.contains(&name) && !interp.dropped_languages.iter().any(|l| l == name)
-        || interp.languages.iter().any(|l| l == name)
+    find(interp, name).is_some()
+}
+
+fn not_found(name: &str) -> DdlError {
+    DdlError::TypeNotFound(format!(
+        "language \"{name}\" does not exist (Use CREATE EXTENSION to load the language into the \
+         database.)"
+    ))
 }
 
 /// get_language_oid.
-pub(crate) fn check(interp: &PgCatalog, name: &str) -> Result<(), DdlError> {
-    if exists(interp, name) {
-        return Ok(());
-    }
-    Err(DdlError::TypeNotFound(format!(
-        "language \"{name}\" does not exist (Use CREATE EXTENSION to load the language into the \
-         database.)"
-    )))
+pub(crate) fn check(interp: &PgCatalog, name: &str) -> Result<PgLanguageOid, DdlError> {
+    find(interp, name).ok_or_else(|| not_found(name))
 }
 
-/// CREATE [OR REPLACE] LANGUAGE name HANDLER ... (CreateProceduralLanguage).
+/// The `name(args)` function of a CREATE LANGUAGE clause, if written.
+fn clause_function(
+    interp: &PgCatalog,
+    names: &[typedpg_pg_query::protobuf::Node],
+    args: &[PgTypeOid],
+) -> Result<Option<PgProcOid>, DdlError> {
+    let parts: Vec<String> = names
+        .iter()
+        .filter_map(super::util::node_string)
+        .map(str::to_owned)
+        .collect();
+    if parts.is_empty() {
+        return Ok(None);
+    }
+    match super::functions::lookup_func_name(interp, &parts, Some(args))? {
+        Some(oid) => Ok(Some(oid)),
+        None => Err(DdlError::TypeNotFound(format!(
+            "function {} does not exist",
+            super::functions::func_signature_string(interp, &parts, args)
+        ))),
+    }
+}
+
+/// CREATE [OR REPLACE] [TRUSTED] LANGUAGE name HANDLER h [INLINE i]
+/// [VALIDATOR v] (CreateProceduralLanguage): the language depends on its
+/// handler, inline and validator functions.
 pub fn create_language(interp: &mut PgCatalog, stmt: &CreatePLangStmt) -> Result<(), DdlError> {
-    if exists(interp, &stmt.plname) {
-        if stmt.replace {
-            return Ok(());
-        }
+    let existing = find(interp, &stmt.plname);
+    if existing.is_some() && !stmt.replace {
         return Err(DdlError::DuplicateObject(format!(
             "language \"{}\" already exists",
             stmt.plname
         )));
     }
-    let parts: Vec<&str> = stmt
-        .plhandler
-        .iter()
-        .filter_map(super::util::node_string)
-        .collect();
-    if let [.., handler] = parts.as_slice() {
-        let schema = (parts.len() == 2).then(|| parts[0]);
-        let found = interp
-            .find_functions(schema, handler)
+    const INTERNAL: PgTypeOid = PgTypeOid::from_raw(2281);
+    const OID: PgTypeOid = PgTypeOid::from_raw(26);
+    let handler = clause_function(interp, &stmt.plhandler, &[])?;
+    let inline = clause_function(interp, &stmt.plinline, &[INTERNAL])?;
+    let validator = clause_function(interp, &stmt.plvalidator, &[OID])?;
+    let oid = match existing {
+        Some(oid) => oid,
+        None => PgLanguageOid::from_nonzero(interp.alloc_oid()?),
+    };
+    interp.pg_language.insert(
+        oid,
+        PgLanguage {
+            oid,
+            lanname: stmt.plname.clone(),
+            lanispl: true,
+            lanpltrusted: stmt.pltrusted,
+            lanplcallfoid: handler,
+        },
+    );
+    let addr = super::depend::ObjectAddress::language(oid);
+    super::depend::forget_dependencies_of(interp, addr);
+    super::depend::record(
+        interp,
+        addr,
+        [handler, inline, validator]
             .into_iter()
-            .any(|p| p.proargtypes.is_empty());
-        if !found {
-            return Err(DdlError::TypeNotFound(format!(
-                "function {handler}() does not exist"
-            )));
-        }
-    }
-    interp.languages.push(stmt.plname.clone());
+            .flatten()
+            .map(super::depend::ObjectAddress::proc),
+        crate::pg_catalog::DepType::Normal,
+    );
     Ok(())
 }
 
-/// DROP LANGUAGE [IF EXISTS] name.
+/// DROP LANGUAGE [IF EXISTS] name [CASCADE]: the built-in languages are
+/// pinned, an extension's language goes with its extension, and the
+/// routines written in it need CASCADE.
 pub(crate) fn drop_language(
     interp: &mut PgCatalog,
     obj_node: &typedpg_pg_query::protobuf::Node,
     missing_ok: bool,
+    cascade: bool,
 ) -> Result<(), DdlError> {
     let Some(name) = super::util::node_string(obj_node).map(str::to_owned) else {
         return Ok(());
     };
-    if !exists(interp, &name) {
+    let Some(oid) = find(interp, &name) else {
         if missing_ok {
             return Ok(());
         }
-        return Err(check(interp, &name).unwrap_err());
+        return Err(not_found(&name));
+    };
+    if oid.get() < FIRST_UNPINNED_OBJECT_ID {
+        return Err(DdlError::DependencyError(format!(
+            "cannot drop language {name} because it is required by the database system"
+        )));
     }
-    match name.as_str() {
-        "internal" | "c" | "sql" => {
-            return Err(DdlError::DependencyError(format!(
-                "cannot drop language {name} because it is required by the database system"
-            )));
-        }
-        "plpgsql" => {
-            return Err(DdlError::DependencyError(
-                "cannot drop language plpgsql because extension plpgsql requires it (You can \
-                 drop extension plpgsql instead.)"
-                    .into(),
-            ));
-        }
-        _ => {}
-    }
-    interp.languages.retain(|l| *l != name);
-    if BUILTIN.contains(&name.as_str()) {
-        interp.dropped_languages.push(name);
-    }
+    let addr = super::depend::ObjectAddress::language(oid);
+    let desc = format!("language {name}");
+    super::depend::check_not_owned(interp, addr, &desc)?;
+    super::depend::drop_dependents(interp, addr, &desc, cascade)?;
+    delete_language(interp, oid);
     Ok(())
+}
+
+/// Remove language `oid` and its dependency rows.
+pub(crate) fn delete_language(interp: &mut PgCatalog, oid: PgLanguageOid) {
+    interp.pg_language.remove(&oid);
+    let addr = super::depend::ObjectAddress::language(oid);
+    interp.remove_dependencies_of(addr.classid, addr.objid);
+    interp.remove_dependencies_on(addr.classid, addr.objid);
 }
 
 /// ALTER LANGUAGE name RENAME TO new.
@@ -109,18 +158,15 @@ pub(crate) fn rename_language(
     else {
         return Ok(());
     };
-    check(interp, &old)?;
+    let oid = check(interp, &old)?;
     if exists(interp, &stmt.newname) {
         return Err(DdlError::DuplicateObject(format!(
             "language \"{}\" already exists",
             stmt.newname
         )));
     }
-    if let Some(l) = interp.languages.iter_mut().find(|l| **l == old) {
-        l.clone_from(&stmt.newname);
-    } else {
-        interp.dropped_languages.push(old);
-        interp.languages.push(stmt.newname.clone());
+    if let Some(l) = interp.pg_language.get_mut(&oid) {
+        l.lanname.clone_from(&stmt.newname);
     }
     Ok(())
 }

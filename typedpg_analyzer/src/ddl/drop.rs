@@ -150,7 +150,7 @@ fn drop_each(
                 super::conversions::drop_conversion(interp, obj_node, stmt.missing_ok)?;
             }
             ObjectType::ObjectLanguage => {
-                super::languages::drop_language(interp, obj_node, stmt.missing_ok)?;
+                super::languages::drop_language(interp, obj_node, stmt.missing_ok, cascade)?;
             }
             ObjectType::ObjectPublication => {
                 super::publications::drop_publication(interp, obj_node, stmt.missing_ok)?;
@@ -1033,7 +1033,7 @@ fn drop_extension(
     }
     super::depend::with_drop_targets(members.clone(), || {
         for member in &members {
-            super::depend::drop_dependents(interp, *member, &desc, cascade)?;
+            super::depend::drop_member_dependents(interp, *member, &desc, cascade)?;
         }
         Ok::<(), DdlError>(())
     })?;
@@ -1076,10 +1076,6 @@ fn drop_extension(
         }
     }
 
-    // The procedural language plpgsql belongs to its extension.
-    if name == "plpgsql" {
-        interp.dropped_languages.push(name.clone());
-    }
     interp.remove_pg_extension(ext_oid);
     let ext_obj = crate::oid::PgGenericOid::from_nonzero(ext_oid.into_nonzero());
     interp.remove_dependencies_of(PG_EXTENSION_RELID, ext_obj);

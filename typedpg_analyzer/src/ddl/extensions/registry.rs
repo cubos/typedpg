@@ -806,6 +806,16 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
             },
         ],
     },
+    // ── plpgsql (src/pl/plpgsql, installed by initdb) ─────────────────
+    ExtensionDef {
+        name: "plpgsql",
+        default_version: "1.0",
+        versions: &[ExtensionVersion {
+            version: "1.0",
+            from: None,
+            sql: include_str!("../../extensions/plpgsql--1.0.sql"),
+        }],
+    },
     // ── postgres_fdw ───────────────────────────────────────────────────
     ExtensionDef {
         name: "postgres_fdw",

@@ -10,7 +10,8 @@ use serde_tuple::{Deserialize_tuple, Serialize_tuple};
 
 use crate::oid::{
     PgCastOid, PgClassOid, PgCollationOid, PgConstraintOid, PgEnumOid, PgExtensionOid,
-    PgGenericOid, PgNamespaceOid, PgOpclassOid, PgOperatorOid, PgProcOid, PgRewriteOid, PgTypeOid,
+    PgGenericOid, PgLanguageOid, PgNamespaceOid, PgOpclassOid, PgOperatorOid, PgProcOid,
+    PgRewriteOid, PgTypeOid,
 };
 
 // ─── Enums ─────────────────────────────────────────────────────────────────
@@ -845,6 +846,8 @@ pub struct PgProc {
     /// parameter's default can differ — and its type takes part in
     /// resolving the call's polymorphic types (`ParseFuncOrColumn`).
     pub proargdefaulttypes: Vec<PgTypeOid>,
+    /// FK `pg_language.oid`.
+    pub prolang: PgLanguageOid,
 }
 
 /// `pg_aggregate`: extra metadata for aggregate `pg_proc` rows.
@@ -923,6 +926,20 @@ pub struct PgCast {
     /// for binary / I/O casts (PG: `0`).
     #[serde(with = "crate::oid::oid_or_zero")]
     pub castfunc: Option<PgProcOid>,
+}
+
+/// `pg_language`: a procedural language.
+#[derive(Debug, Clone, Serialize_tuple, Deserialize_tuple)]
+pub struct PgLanguage {
+    pub oid: PgLanguageOid,
+    pub lanname: String,
+    /// `lanispl`: a procedural language (not internal / c / sql).
+    pub lanispl: bool,
+    pub lanpltrusted: bool,
+    /// FK `pg_proc.oid` of the call handler; `None` (PG: `0`) for the
+    /// built-in languages.
+    #[serde(with = "crate::oid::oid_or_zero")]
+    pub lanplcallfoid: Option<PgProcOid>,
 }
 
 /// `pg_extension`: an installed extension.

@@ -183,6 +183,10 @@ define_oid!(
     PgOpclassOid
 );
 define_oid!(
+    /// `pg_language.oid` — one per procedural language.
+    PgLanguageOid
+);
+define_oid!(
     /// `pg_collation.oid` — one per registered collation
     /// (`"C"`, `"POSIX"`, `"en_US.UTF-8"`, …).
     PgCollationOid

@@ -19,10 +19,10 @@ use typedpg_analyzer::{
     AggKind, ArgMode, AttGenerated, AttIdentity, CastContext, CastMethod, ConType, DepType,
     PgAggregate, PgAm, PgAmop, PgAttribute, PgCast, PgCastOid, PgCatalog, PgCatalogSeed, PgClass,
     PgClassOid, PgCollation, PgCollationOid, PgConstraint, PgConstraintOid, PgDepend, PgEnum,
-    PgEnumOid, PgExtension, PgExtensionOid, PgGenericOid, PgIndex, PgInherits, PgNamespace,
-    PgNamespaceOid, PgOpclass, PgOpclassOid, PgOperator, PgOperatorOid, PgOpfamily, PgProc,
-    PgProcOid, PgRange, PgSetting, PgTsObject, PgType, PgTypeOid, ProKind, ProVolatile,
-    QualifiedName, RelKind, TypAlign, TypCategory, TypStorage, TypType,
+    PgEnumOid, PgExtension, PgExtensionOid, PgGenericOid, PgIndex, PgInherits, PgLanguage,
+    PgLanguageOid, PgNamespace, PgNamespaceOid, PgOpclass, PgOpclassOid, PgOperator, PgOperatorOid,
+    PgOpfamily, PgProc, PgProcOid, PgRange, PgSetting, PgTsObject, PgType, PgTypeOid, ProKind,
+    ProVolatile, QualifiedName, RelKind, TypAlign, TypCategory, TypStorage, TypType,
 };
 
 fn main() {
@@ -81,6 +81,7 @@ fn main() {
     eprintln!("  pg_operator:  {}", snapshot.pg_operator.len());
     eprintln!("  pg_cast:      {}", snapshot.pg_cast.len());
     eprintln!("  pg_extension: {}", snapshot.pg_extension.len());
+    eprintln!("  pg_language:  {}", snapshot.pg_language.len());
     eprintln!("  pg_depend:    {}", snapshot.pg_depend.len());
     eprintln!("  pg_inherits:  {}", snapshot.pg_inherits.len());
     eprintln!("  pg_constraint:{}", snapshot.pg_constraint.len());
@@ -107,6 +108,7 @@ fn export_catalog(client: &mut postgres::Client) -> Result<PgCatalogSeed, postgr
     let pg_operator = export_operators(client)?;
     let pg_cast = export_casts(client)?;
     let pg_extension = export_extensions(client)?;
+    let pg_language = export_languages(client)?;
     let pg_depend = export_depends(client)?;
     let pg_inherits = export_inherits(client)?;
     let pg_constraint = export_constraints(client)?;
@@ -151,6 +153,7 @@ fn export_catalog(client: &mut postgres::Client) -> Result<PgCatalogSeed, postgr
         pg_amop,
         pg_settings,
         pg_ts_objects,
+        pg_language,
     };
     let scratch = PgCatalog::from_seed(seed.clone());
     seed.pg_index = export_indexes(client, &scratch)?;
@@ -352,7 +355,7 @@ fn export_procs(client: &mut postgres::Client) -> Result<Vec<PgProc>, postgres::
                 p.proargtypes::int4[]::int4[], p.prorettype, \
                 p.proretset, p.provariadic, p.proisstrict, p.pronargdefaults, \
                 p.proallargtypes::int4[], p.proargmodes, p.proargnames, \
-                p.provolatile, \
+                p.provolatile, p.prolang, \
                 (SELECT coalesce(array_agg(t.typtype = 'p' AND t.typname LIKE 'any%' \
                                            ORDER BY u.ord), '{}') \
                    FROM unnest(p.proargtypes::oid[]) WITH ORDINALITY u(o, ord) \
@@ -393,7 +396,8 @@ fn export_procs(client: &mut postgres::Client) -> Result<Vec<PgProc>, postgres::
             let prorettype: u32 = r.get(5);
             let provariadic: u32 = r.get(7);
             let pronargdefaults: i16 = r.get(9);
-            let polymorphic_args: Vec<bool> = r.get(14);
+            let prolang: u32 = r.get(14);
+            let polymorphic_args: Vec<bool> = r.get(15);
             // The builtin defaults' types: a default of a non-polymorphic
             // parameter was coerced to the parameter's type when the
             // function was created, so its type is the declared one. A
@@ -424,6 +428,7 @@ fn export_procs(client: &mut postgres::Client) -> Result<Vec<PgProc>, postgres::
                 proargnames: arg_names.unwrap_or_default(),
                 provolatile: char_to_provolatile(provolatile as u8 as char),
                 proargdefaulttypes,
+                prolang: PgLanguageOid::new(prolang).expect("prolang is non-zero"),
             }
         })
         .collect())
@@ -528,6 +533,29 @@ fn export_casts(client: &mut postgres::Client) -> Result<Vec<PgCast>, postgres::
                 castcontext: char_to_castcontext(ctx as u8 as char),
                 castmethod: char_to_castmethod(method as u8 as char),
                 castfunc: PgProcOid::new(castfunc),
+            }
+        })
+        .collect())
+}
+
+fn export_languages(client: &mut postgres::Client) -> Result<Vec<PgLanguage>, postgres::Error> {
+    let rows = client.query(
+        "SELECT oid, lanname, lanispl, lanpltrusted, lanplcallfoid \
+         FROM pg_catalog.pg_language \
+         ORDER BY oid",
+        &[],
+    )?;
+    Ok(rows
+        .iter()
+        .map(|r| {
+            let oid: u32 = r.get(0);
+            let handler: u32 = r.get(4);
+            PgLanguage {
+                oid: PgLanguageOid::new(oid).expect("pg_language.oid is non-zero"),
+                lanname: r.get(1),
+                lanispl: r.get(2),
+                lanpltrusted: r.get(3),
+                lanplcallfoid: PgProcOid::new(handler),
             }
         })
         .collect())
