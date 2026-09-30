@@ -733,3 +733,39 @@ fn dependency_errors_qualify_names_off_the_search_path() {
         assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
     }
 }
+
+#[test]
+fn a_partition_dependent_blocks_the_drop_of_its_parent() {
+    // reportDependentObjects names what the DROP names, not the partition
+    // that goes along with it.
+    let setup = "CREATE TABLE p (a int) PARTITION BY RANGE (a);
+                 CREATE TABLE p1 PARTITION OF p FOR VALUES FROM (1) TO (10)
+                     PARTITION BY RANGE (a);
+                 CREATE TABLE p11 PARTITION OF p1 FOR VALUES FROM (1) TO (5);
+                 CREATE VIEW vp AS SELECT a FROM p11;
+                 CREATE TABLE q (a int) PARTITION BY LIST (a);
+                 CREATE TABLE q1 PARTITION OF q FOR VALUES IN (1);
+                 CREATE FUNCTION qf() RETURNS SETOF q1 LANGUAGE sql
+                     BEGIN ATOMIC SELECT * FROM q1; END;";
+    for (stmt, msg) in [
+        (
+            "DROP TABLE p;",
+            "cannot drop table p because other objects depend on it",
+        ),
+        (
+            "DROP TABLE p1;",
+            "cannot drop table p1 because other objects depend on it",
+        ),
+        (
+            "DROP TABLE q;",
+            "cannot drop table q because other objects depend on it",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        ("0002.sql", "DROP TABLE p CASCADE; DROP TABLE q CASCADE;"),
+    ]);
+}

@@ -251,10 +251,11 @@ fn drop_relation(
             "permission denied: \"{name}\" is a system catalog"
         )));
     }
-    drop_relation_oid(interp, class_oid, kind, cascade, named_relations)
+    drop_relation_oid(interp, class_oid, kind, cascade, named_relations, None)
 }
 
-/// Drop relation `class_oid` (a `kind`) and what depends on
+/// Drop relation `class_oid` (a `kind`; part of what `dropped` describes,
+/// when the DROP names another relation) and what depends on
 /// it: its inheritance children need CASCADE (a partition goes with its
 /// parent regardless), and so do views, foreign keys in other tables,
 /// functions over its row type and defaults using it as a sequence —
@@ -265,10 +266,14 @@ fn drop_relation_oid(
     kind: &str,
     cascade: bool,
     named_relations: &[PgClassOid],
+    dropped: Option<&str>,
 ) -> Result<(), DdlError> {
     // The messages name it as getObjectDescription does (qualified unless
     // visible), not as written.
     let name = &super::depend::relation_display_name(interp, class_oid);
+    // A partition going with its parent: the errors name what the DROP
+    // names (reportDependentObjects).
+    let target = dropped.map_or_else(|| format!("{kind} {name}"), str::to_owned);
     // Inheritance children depend on their parent (DEPENDENCY_NORMAL); a
     // partition is part of it (DEPENDENCY_AUTO).
     let partitioned =
@@ -284,7 +289,7 @@ fn drop_relation_oid(
             .map(|c| c.relname.clone())
             .unwrap_or_default();
         return Err(DdlError::DependencyError(format!(
-            "cannot drop {kind} {name} because other objects depend on it (table \
+            "cannot drop {target} because other objects depend on it (table \
              {child_name} depends on {kind} {name})"
         )));
     }
@@ -311,7 +316,7 @@ fn drop_relation_oid(
             })
             .collect();
         return Err(DdlError::DependencyError(format!(
-            "cannot drop {kind} {name} because other objects depend on it \
+            "cannot drop {target} because other objects depend on it \
              (view(s) {} depend on this)",
             view_names.join(", "),
         )));
@@ -363,7 +368,7 @@ fn drop_relation_oid(
             .map(|(c, owner)| format!("{} on {}", c.conname, owner))
             .collect();
         return Err(DdlError::DependencyError(format!(
-            "cannot drop {kind} {name} because other objects depend on it \
+            "cannot drop {target} because other objects depend on it \
              (foreign key constraint(s) {} depend on this)",
             labels.join(", "),
         )));
@@ -380,7 +385,7 @@ fn drop_relation_oid(
     let dependent_functions = functions_using_types(interp, &row_types);
     if !dependent_functions.is_empty() && !cascade {
         return Err(DdlError::DependencyError(format!(
-            "cannot drop {kind} {name} because other objects depend on it \
+            "cannot drop {target} because other objects depend on it \
              (function {} depends on type {name})",
             describe_function(interp, dependent_functions[0]),
         )));
@@ -430,14 +435,14 @@ fn drop_relation_oid(
                 _ => "table",
             };
             return Err(DdlError::DependencyError(format!(
-                "cannot drop {kind} {name} because other objects depend on it (column {column} \
+                "cannot drop {target} because other objects depend on it (column {column} \
                  of {owner_kind} {} depends on type {name})",
                 owner.map(|c| c.relname.as_str()).unwrap_or("?"),
             )));
         }
         if let Some(t) = dependent_types.first() {
             return Err(DdlError::DependencyError(format!(
-                "cannot drop {kind} {name} because other objects depend on it (type {} depends \
+                "cannot drop {target} because other objects depend on it (type {} depends \
                  on type {name})",
                 format_type_for_message(interp, *t),
             )));
@@ -460,7 +465,7 @@ fn drop_relation_oid(
             .map(|a| a.attname.clone())
             .unwrap_or_default();
         return Err(DdlError::DependencyError(format!(
-            "cannot drop {kind} {name} because other objects depend on it \
+            "cannot drop {target} because other objects depend on it \
              (default value for column {column} of table {table} depends on {kind} {name})"
         )));
     }
@@ -471,7 +476,7 @@ fn drop_relation_oid(
     let addr = super::depend::ObjectAddress::relation(class_oid);
     let desc = format!("{kind} {name}");
     super::depend::check_not_owned(interp, addr, &desc)?;
-    super::depend::drop_dependents(interp, addr, &desc, cascade)?;
+    super::depend::drop_member_dependents(interp, addr, &target, cascade)?;
     if !dependent_views.is_empty() {
         views::drop_views(interp, &dependent_views);
     }
@@ -530,7 +535,7 @@ fn drop_relation_oid(
         if named_relations.contains(&child) || !interp.pg_class.contains_key(&child) {
             continue;
         }
-        drop_relation_oid(interp, child, "table", cascade, &going)?;
+        drop_relation_oid(interp, child, "table", cascade, &going, Some(&target))?;
     }
 
     drop_relation_by_oid(interp, class_oid);
