@@ -122,6 +122,10 @@ pub(crate) struct TypeGoal {
     /// UPDATE SET), the column's name. Used to produce PG's exact wording:
     /// `column "X" is of type Y but expression is of type Z`.
     pub source_col_name: Option<String>,
+    /// The type modifier the coercion hands the target's input function
+    /// (`None` is PG's `-1`): an assigned column's typmod. Every other
+    /// coercion of an untyped literal passes `-1`.
+    pub typmod: Option<i32>,
 }
 
 impl TypeGoal {
@@ -131,6 +135,7 @@ impl TypeGoal {
         coercion: CoercionContext::Implicit,
         source_span: None,
         source_col_name: None,
+        typmod: None,
     };
 
     /// Expression context — only implicit casts allowed
@@ -141,6 +146,7 @@ impl TypeGoal {
             coercion: CoercionContext::Implicit,
             source_span: None,
             source_col_name: None,
+            typmod: None,
         }
     }
 
@@ -152,6 +158,7 @@ impl TypeGoal {
             coercion: CoercionContext::Assignment,
             source_span: None,
             source_col_name: None,
+            typmod: None,
         }
     }
 
@@ -160,6 +167,12 @@ impl TypeGoal {
     /// secondary label in type-mismatch diagnostics.
     pub fn with_source(mut self, span: crate::error::SourceSpan) -> Self {
         self.source_span = Some(span);
+        self
+    }
+
+    /// Attach the target's type modifier (see [`Self::typmod`]).
+    pub fn with_typmod(mut self, typmod: Option<i32>) -> Self {
+        self.typmod = typmod;
         self
     }
 
@@ -1017,7 +1030,12 @@ pub(crate) fn infer_expr(
         && let Some(node::Node::AConst(ac)) = node.node.as_ref()
         && !ac.isnull
         && let Some(a_const::Val::Sval(sv)) = &ac.val
-        && let Err(msg) = crate::literal_input::validate(&sv.sval, goal.type_oid, snapshot)
+        && let Err(msg) = crate::literal_input::validate_with_typmod(
+            &sv.sval,
+            goal.type_oid,
+            goal.typmod,
+            snapshot,
+        )
     {
         let span =
             crate::error::node_location(node).and_then(crate::error::SourceSpan::from_node_token);

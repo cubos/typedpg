@@ -353,20 +353,6 @@ pub fn check_literal_assignment(
     typmod: Option<i32>,
     value: &Node,
 ) -> Option<AnalyzeError> {
-    // An untyped literal assigned to an interval column is read by
-    // interval_in with the column's typmod (coerce_type passes it to
-    // stringTypeDatum), whose field restriction decides how bare numbers
-    // and `mm:ss` fields decode: `'1 1'` fits `interval day to hour` but
-    // not `interval`.
-    const INTERVAL: PgTypeOid = PgTypeOid::from_raw(1186);
-    if type_oid == INTERVAL
-        && let Some(node::Node::AConst(c)) = value.node.as_ref()
-        && let Some(typedpg_pg_query::protobuf::a_const::Val::Sval(sv)) = c.val.as_ref()
-    {
-        return crate::datetime_input::validate_interval(&sv.sval, typmod.unwrap_or(-1))
-            .err()
-            .map(AnalyzeError::InvalidLiteral);
-    }
     let decoded = decode(snapshot, type_oid, typmod);
     match decoded {
         DecodedTypmod::Length(n)

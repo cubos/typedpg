@@ -1000,6 +1000,15 @@ const BATTERY: &[&str] = &[
     "SELECT age(now(), 'a0-01-01')",
     "SELECT make_interval(0) + '1 xday'",
     "SELECT '2024-01-01'::date + '1 fortnight'",
+    // interval_in with typmod -1 wherever no column / cast gives one
+    "SELECT now() - '10: 0'",
+    "SELECT now() - '.10:00'",
+    "SELECT make_interval(0) + '2024-01-01 1000:00+02'",
+    "SELECT COALESCE(make_interval(0), '1 1')",
+    "SELECT make_interval(0) = '1 1'",
+    "SELECT '1 1'::interval day to hour",
+    "SELECT '{\"1 1\"}'::interval day to hour[]",
+    "SELECT '{\"1 1\"}'::interval[]",
 ];
 
 #[test]

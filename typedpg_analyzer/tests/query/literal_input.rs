@@ -1225,21 +1225,42 @@ fn interval_assignment_literal_uses_the_column_field_restriction() {
 fn reg_type_literals_are_parsed_and_looked_up() {
     let db = setup();
     for (sql, msg) in [
-        ("SELECT '1.5e3'::regclass", "relation \"1.5e3\" does not exist"),
-        ("SELECT '{1,2}'::regclass", "relation \"{1,2}\" does not exist"),
+        (
+            "SELECT '1.5e3'::regclass",
+            "relation \"1.5e3\" does not exist",
+        ),
+        (
+            "SELECT '{1,2}'::regclass",
+            "relation \"{1,2}\" does not exist",
+        ),
         ("SELECT 'x y'::regclass", "invalid name syntax"),
         (
             "SELECT 'a.b.c.d'::regclass",
             "improper relation name (too many dotted names): a.b.c.d",
         ),
         ("SELECT '{1,2}'::regtype", "syntax error at or near \"{\""),
-        ("SELECT '1.5e3'::regtype", "syntax error at or near \"1.5e3\""),
-        ("SELECT 'nosuch[]'::regtype", "type \"nosuch[]\" does not exist"),
-        ("SELECT 'setof int'::regtype", "invalid type name \"setof int\""),
-        ("SELECT '1.5e3'::regproc", "function \"1.5e3\" does not exist"),
+        (
+            "SELECT '1.5e3'::regtype",
+            "syntax error at or near \"1.5e3\"",
+        ),
+        (
+            "SELECT 'nosuch[]'::regtype",
+            "type \"nosuch[]\" does not exist",
+        ),
+        (
+            "SELECT 'setof int'::regtype",
+            "invalid type name \"setof int\"",
+        ),
+        (
+            "SELECT '1.5e3'::regproc",
+            "function \"1.5e3\" does not exist",
+        ),
         ("SELECT '1.5e3'::regnamespace", "invalid name syntax"),
         ("SELECT '1.5e3'::regoper", "operator does not exist: 1.5e3"),
-        ("SELECT '1.5e3'::regprocedure", "expected a left parenthesis"),
+        (
+            "SELECT '1.5e3'::regprocedure",
+            "expected a left parenthesis",
+        ),
     ] {
         assert_first_line!(db.analyze(sql), msg);
     }
@@ -1261,10 +1282,8 @@ fn reg_type_literals_are_parsed_and_looked_up() {
 #[test]
 fn malformed_literals_rejected_in_implicit_coercions() {
     let mut db = PgCatalog::new().unwrap();
-    db.apply_sql(
-        "CREATE TABLE posts (id INT PRIMARY KEY, published_at TIMESTAMPTZ, tags TEXT[]);",
-    )
-    .unwrap();
+    db.apply_sql("CREATE TABLE posts (id INT PRIMARY KEY, published_at TIMESTAMPTZ, tags TEXT[]);")
+        .unwrap();
     for sql in [
         "SELECT COALESCE(published_at, 'a0-01-01') FROM posts",
         "SELECT id FROM posts WHERE published_at = 'a0-01-01'",
@@ -1272,10 +1291,43 @@ fn malformed_literals_rejected_in_implicit_coercions() {
         "SELECT '2024-01-01'::timetz",
     ] {
         let err = db.analyze(sql).expect_err(sql).to_string();
-        assert!(err.starts_with("invalid input syntax for type"), "{sql}: {err}");
+        assert!(
+            err.starts_with("invalid input syntax for type"),
+            "{sql}: {err}"
+        );
     }
     assert_first_line!(
         db.analyze("SELECT id FROM posts WHERE tags = '{\"a\": 1}'"),
         "malformed array literal: \"{\"a\": 1}\""
     );
+}
+
+/// coerce_type hands interval_in the target's typmod: `-1` for operator
+/// and function arguments and common types, the domain's for a domain, a
+/// subscripted assignment's container typmod — but `array_in` gets `-1`,
+/// so array elements decode unrestricted. An interval literal is decided
+/// exactly everywhere.
+#[test]
+fn interval_literals_decode_with_the_coercion_typmod() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE DOMAIN dh AS INTERVAL DAY TO HOUR;
+         CREATE TABLE ivs (id INT PRIMARY KEY, d dh, a INTERVAL DAY TO HOUR[], p INTERVAL);",
+    )
+    .unwrap();
+    for sql in [
+        "SELECT p FROM ivs WHERE p = '10: 0'",
+        "SELECT p FROM ivs WHERE p = '1 1'",
+        "SELECT COALESCE(p, '1 1') FROM ivs",
+        "INSERT INTO ivs (id, a) VALUES (1, '{\"1 1\"}')",
+    ] {
+        assert_first_line!(db.analyze(sql), "invalid input syntax for type interval");
+    }
+    for sql in [
+        "SELECT '1 1'::dh AS v",
+        "INSERT INTO ivs (id, d) VALUES (1, '1 1')",
+        "UPDATE ivs SET a[1] = '1 1'",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
 }

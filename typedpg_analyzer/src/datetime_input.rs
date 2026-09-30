@@ -25,11 +25,10 @@
 //!   within a day of the timestamp range limits;
 //! - hexadecimal or subnormal numbers in ISO 8601 intervals (strtod
 //!   corner cases);
-//! - the interval typmod, where the caller doesn't know it: PG passes an
-//!   interval column's / cast's field restriction to `interval_in` (it
-//!   changes how bare numbers and `mm:ss` decode) — without it an interval
-//!   literal is only rejected when every field restriction rejects it the
-//!   same way; a cast's known typmod goes through [`validate_interval`].
+//! - (the interval typmod is not a gap: PG passes an interval column's /
+//!   cast's field restriction to `interval_in`, where it changes how bare
+//!   numbers and `mm:ss` decode, and every caller hands it over — see
+//!   [`validate_interval`]).
 
 use crate::pgmsg;
 
@@ -96,7 +95,7 @@ type DtResult<T> = Result<T, Dterr>;
 /// accepts it (or we can't tell), `Err(message)` with PG's verbatim error.
 pub(crate) fn validate(content: &str, ty: DatetimeType) -> Result<(), String> {
     let outcome = match ty {
-        DatetimeType::Interval => interval_in(content),
+        DatetimeType::Interval => interval_in_range(content, INTERVAL_FULL_RANGE),
         DatetimeType::Date => date_in(content),
         DatetimeType::Time | DatetimeType::TimeTz => time_in(content),
         DatetimeType::Timestamp => timestamp_in(content, false),
@@ -1898,31 +1897,6 @@ fn timestamp_in(content: &str, with_tz: bool) -> DtResult<()> {
         }
         None => Err(Dterr::Unsure),
     }
-}
-
-/// `interval_in` (timestamp.c). The typmod's field restriction changes the
-/// decoding; not knowing it, reject only when every restriction rejects
-/// with the same error.
-fn interval_in(content: &str) -> DtResult<()> {
-    const RANGES: [i32; 7] = [
-        INTERVAL_FULL_RANGE,
-        interval_mask(YEAR),
-        interval_mask(MONTH),
-        interval_mask(DAY),
-        interval_mask(HOUR),
-        interval_mask(MINUTE),
-        MINUTE_TO_SECOND,
-    ];
-    let first = interval_in_range(content, INTERVAL_FULL_RANGE);
-    let Err(err) = first else {
-        return Ok(());
-    };
-    for range in &RANGES[1..] {
-        if interval_in_range(content, *range).as_ref() != Err(&err) {
-            return Err(Dterr::Unsure);
-        }
-    }
-    Err(err)
 }
 
 fn interval_in_range(content: &str, range: i32) -> DtResult<()> {

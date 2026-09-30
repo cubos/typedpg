@@ -9,6 +9,8 @@ use super::*;
 pub(crate) struct AssignTarget {
     /// The type the assigned value is coerced to.
     pub type_oid: PgTypeOid,
+    /// The type modifier that coercion passes on (see `TypeGoal::typmod`).
+    pub typmod: Option<i32>,
     /// The target carries indirection: the value lands inside the column,
     /// so the column-level NOT NULL / typmod checks don't apply.
     pub indirected: bool,
@@ -35,6 +37,9 @@ pub(crate) fn assignment_target(
 ) -> Result<AssignTarget, AnalyzeError> {
     let snapshot = ctx.snapshot;
     let mut ty = tc.atttypid;
+    // The typmod the value's coercion passes on: the column's, which an
+    // array's elements share; a field's own.
+    let mut typmod = snapshot.effective_typmod(tc.atttypid, tc.atttypmod);
     let mut target_name = tc.attname.clone();
     let mut last_step = None;
     let mut i = 0;
@@ -93,6 +98,7 @@ pub(crate) fn assignment_target(
                     .finalize_implicit());
                 };
                 ty = attr.atttypid;
+                typmod = snapshot.effective_typmod(attr.atttypid, attr.atttypmod);
                 target_name = field.clone();
                 last_step = Some((false, target_name.clone()));
                 i += 1;
@@ -102,6 +108,7 @@ pub(crate) fn assignment_target(
     }
     Ok(AssignTarget {
         type_oid: ty,
+        typmod,
         indirected: !indirection.is_empty(),
         last_step,
         first_step_is_subscript: indirection
@@ -139,9 +146,10 @@ impl AssignTarget {
             return Ok(expr::ExprType::scalar(self.type_oid, false));
         }
         let Some((subscript, name)) = &self.last_step else {
-            return expr::infer_expr(val, ctx, params, goal);
+            return expr::infer_expr(val, ctx, params, goal.with_typmod(self.typmod));
         };
-        match expr::infer_expr(val, ctx, params, TypeGoal::assignment(self.type_oid)) {
+        let goal = TypeGoal::assignment(self.type_oid).with_typmod(self.typmod);
+        match expr::infer_expr(val, ctx, params, goal) {
             Err(AnalyzeError::TypeMismatch { .. }) => {
                 let mut scratch = params.clone();
                 let actual = expr::infer_expr(val, ctx, &mut scratch, TypeGoal::NONE)

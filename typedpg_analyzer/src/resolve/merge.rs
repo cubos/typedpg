@@ -412,7 +412,11 @@ fn merge_when_insert(
         // transformInsertRow → transformAssignedExpr: a failed coercion
         // names the target column, exactly like a plain INSERT.
         let goal = target_col
-            .map(|tc| TypeGoal::assignment(tc.atttypid).with_source_column(&tc.attname))
+            .map(|tc| {
+                TypeGoal::assignment(tc.atttypid)
+                    .with_source_column(&tc.attname)
+                    .with_typmod(snapshot.effective_typmod(tc.atttypid, tc.atttypmod))
+            })
             .unwrap_or(TypeGoal::NONE);
         if !is_set_to_default(val) {
             expr::infer_expr(val, ctx, params, goal)?;

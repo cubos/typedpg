@@ -25,27 +25,6 @@
 use crate::oid::PgTypeOid;
 use crate::pg_catalog::{PgCatalog, TypCategory, TypType, oid};
 
-/// [`validate`] when the typmod the input function receives is known
-/// exactly (`None` meaning `-1`) — an explicit cast, whose written typmod
-/// reaches the input function (`coerce_type` → `stringTypeDatum`). Only
-/// interval input depends on it: its field restriction changes the
-/// decoding, so `'1 1'::interval` is decided although `'1 1'` into an
-/// `interval day to hour` column is valid. A domain target keeps the
-/// conservative [`validate`] (the input function gets the domain's base
-/// typmod).
-pub(crate) fn validate_with_typmod(
-    content: &str,
-    target: PgTypeOid,
-    typmod: Option<i32>,
-    snapshot: &PgCatalog,
-) -> Result<(), String> {
-    const INTERVAL: PgTypeOid = PgTypeOid::from_raw(1186);
-    if target == INTERVAL {
-        return crate::datetime_input::validate_interval(content, typmod.unwrap_or(-1));
-    }
-    validate(content, target, snapshot)
-}
-
 /// Outcome of validating literal `content` against `target`: `Ok(())` when PG
 /// would accept it (or we can't tell), `Err(message)` with PG's verbatim
 /// parse-time error when it provably wouldn't.
@@ -54,9 +33,34 @@ pub(crate) fn validate(
     target: PgTypeOid,
     snapshot: &PgCatalog,
 ) -> Result<(), String> {
+    validate_with_typmod(content, target, None, snapshot)
+}
+
+/// [`validate`] with the type modifier of the coercion's target (`None` is
+/// PG's `-1`): an explicit cast's written typmod, an assigned column's
+/// typmod — every other coercion (operator and function arguments,
+/// CASE/COALESCE/UNION common types) has `-1`. `coerce_type` hands it to
+/// the input function only for interval ("we *must* pass the typmod or it
+/// won't be able to obey the bizarre SQL-spec input rules"): the field
+/// restriction decides how bare numbers and `mm:ss` fields decode (`'1 1'`
+/// is valid as `interval day to hour`, not as `interval`). Every other
+/// input function, `array_in` included, gets `-1`.
+pub(crate) fn validate_with_typmod(
+    content: &str,
+    target: PgTypeOid,
+    typmod: Option<i32>,
+    snapshot: &PgCatalog,
+) -> Result<(), String> {
     // Domain values are validated by the *base* type's input function, and
     // PG's message names the base type (`'x'::posint` → `… for type integer`).
-    let target = snapshot.unwrap_domain(target);
+    // coerce_type hands it the domain's base typmod instead of the target's.
+    let base = snapshot.unwrap_domain(target);
+    let typmod = if base == target {
+        typmod
+    } else {
+        snapshot.effective_typmod(target, None)
+    };
+    let target = base;
 
     match target {
         oid::BOOL => return validate_bool(content),
@@ -145,6 +149,9 @@ pub(crate) fn validate(
         // `datetime_input`.
         name @ ("date" | "time" | "timetz" | "timestamp" | "timestamptz" | "interval") => {
             match crate::datetime_input::DatetimeType::from_typname(name) {
+                Some(crate::datetime_input::DatetimeType::Interval) => {
+                    crate::datetime_input::validate_interval(content, typmod.unwrap_or(-1))
+                }
                 Some(ty) => crate::datetime_input::validate(content, ty),
                 None => Ok(()),
             }
