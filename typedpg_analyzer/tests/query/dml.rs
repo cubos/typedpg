@@ -1379,41 +1379,27 @@ fn merge_update_unknown_column_errors() {
     );
 }
 
+/// A MERGE action runs only for the rows it matches, so writing NULL to a
+/// NOT NULL column (or a NOT NULL domain) fails only some executions — PG
+/// prepares it and runs it fine when nothing matches. The analyzer rejects
+/// only what every execution rejects, so these are accepted.
 #[test]
-fn merge_insert_null_into_not_null_column_errors() {
-    // MERGE that ends up doing an INSERT — pg_sanity's execute fallback
-    // hits the row-level NOT NULL check and PG's wording matches ours.
-    let db = setup();
-    assert_analyze_err!(
-        db.analyze(
-            "MERGE INTO users u \
-             USING (SELECT $p1::text AS email) src \
-             ON u.email = src.email \
-             WHEN NOT MATCHED THEN INSERT (name, email) VALUES (NULL, src.email)"
-        ),
-        AnalyzeError::Invalid(_),
-        "null value in column \"name\" of relation \"users\" violates not-null constraint (cannot insert NULL into NOT NULL column `users.name`)",
-    );
-}
-
-#[test]
-fn merge_update_set_not_null_to_null_literal_errors() {
-    // MERGE that ends up doing an UPDATE — the execute fallback runs with
-    // NULL params against an empty scratch table, so the WHEN MATCHED arm
-    // never fires and the row-level NOT NULL check stays out of reach.
-    // Keep the skip and rely on the analyzer's compile-time guard.
+fn merge_null_into_not_null_column_is_accepted() {
     let mut db = setup();
-    db.skip_pg_sanity();
-    assert_analyze_err!(
-        db.analyze(
-            "MERGE INTO users u \
-             USING (SELECT $p1::bigint AS id) src \
-             ON u.id = src.id \
-             WHEN MATCHED THEN UPDATE SET name = NULL"
-        ),
-        AnalyzeError::Invalid(_),
-        "null value in column \"name\" of relation \"users\" violates not-null constraint (cannot assign NULL to NOT NULL column `users.name`)",
-    );
+    db.apply_sql("CREATE DOMAIN dnn AS int NOT NULL; ALTER TABLE users ADD COLUMN d dnn;")
+        .unwrap();
+    for sql in [
+        "MERGE INTO users u USING (SELECT $p1::bigint AS id) src ON u.id = src.id \
+         WHEN MATCHED THEN UPDATE SET name = NULL",
+        "MERGE INTO users u USING posts p ON p.user_id = u.id WHEN MATCHED THEN UPDATE SET d = NULL",
+        "MERGE INTO users u USING posts p ON p.user_id = u.id \
+         WHEN NOT MATCHED THEN INSERT (name, email, d) VALUES (NULL, p.title, 1)",
+        // One source row, but it inserts only when no user has that email.
+        "MERGE INTO users u USING (SELECT $p1::text AS email) src ON u.email = src.email \
+         WHEN NOT MATCHED THEN INSERT (name, email) VALUES (NULL, src.email)",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
 }
 
 #[test]

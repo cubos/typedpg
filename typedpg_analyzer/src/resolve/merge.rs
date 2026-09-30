@@ -341,13 +341,16 @@ fn merge_when_update(
     table_attrs: &[crate::pg_catalog::PgAttribute],
     table_relname: &str,
 ) -> Result<(), AnalyzeError> {
+    // No static NULL-into-NOT-NULL check: the action only runs for a
+    // matched row, so the constraint fails at execution for some data
+    // only, and the analyzer rejects just what every execution rejects.
     analyze_set_clause(
         &when.target_list,
         table_attrs,
         table_relname,
         ctx,
         params,
-        true,
+        false,
     )
 }
 
@@ -393,20 +396,18 @@ fn merge_when_insert(
     };
     for (i, val) in when.values.iter().enumerate() {
         let target_col = target_attrs.get(i).copied();
-        if let Some(tc) = target_col {
-            if is_sql_null_literal(val)
-                && let Some(err) = null_assignment_error(tc, snapshot, table_relname, "insert")
-            {
-                return Err(err);
-            }
-            if let Some(err) = crate::typmod::check_literal_assignment(
+        // A NULL into a NOT NULL column (or domain) is not rejected here:
+        // the action only runs for an unmatched source row, so only some
+        // executions fail (see merge_when_update).
+        if let Some(tc) = target_col
+            && let Some(err) = crate::typmod::check_literal_assignment(
                 snapshot,
                 tc.atttypid,
                 snapshot.effective_typmod(tc.atttypid, tc.atttypmod),
                 val,
-            ) {
-                return Err(err);
-            }
+            )
+        {
+            return Err(err);
         }
         // transformInsertRow → transformAssignedExpr: a failed coercion
         // names the target column, exactly like a plain INSERT.
