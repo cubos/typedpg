@@ -138,7 +138,8 @@ fn joined(names: &[String]) -> String {
 
 /// Schemas whose relations the snapshot doesn't carry.
 fn is_system_schema(schema: &str) -> bool {
-    matches!(schema, "pg_catalog" | "information_schema" | "pg_toast") || schema.starts_with("pg_temp")
+    matches!(schema, "pg_catalog" | "information_schema" | "pg_toast")
+        || schema.starts_with("pg_temp")
 }
 
 fn lookup_by_names(typname: &str, names: &[String], snapshot: &PgCatalog) -> Result<(), String> {
