@@ -313,3 +313,64 @@ fn operator_classes_and_families_rename_move_and_drop_with_their_dependents() {
         ),
     ]);
 }
+
+#[test]
+fn operator_family_members_are_unique_per_strategy_and_types() {
+    // PG 18: addFamilyMember refuses a strategy number given twice for the
+    // same operand types; ALTER OPERATOR FAMILY ADD refuses one the family
+    // has and DROP one it hasn't; CREATE OPERATOR CLASS doesn't check, so
+    // pg_amop's unique index does.
+    let setup = "CREATE OPERATOR FAMILY f USING btree;
+                 ALTER OPERATOR FAMILY f USING btree ADD OPERATOR 1 < (int4, int4);
+                 CREATE SCHEMA s;";
+    for (stmt, msg) in [
+        (
+            "ALTER OPERATOR FAMILY f USING btree ADD OPERATOR 1 < (int4, int4);",
+            "operator 1(integer,integer) already exists in operator family \"f\"",
+        ),
+        (
+            "ALTER OPERATOR FAMILY public.f USING btree ADD OPERATOR 1 < (int4, int4);",
+            "operator 1(integer,integer) already exists in operator family \"public.f\"",
+        ),
+        (
+            "ALTER OPERATOR FAMILY f USING btree
+                 ADD OPERATOR 2 <= (int4, int4), OPERATOR 2 <= (int4, int4);",
+            "operator number 2 for (integer,integer) appears more than once",
+        ),
+        (
+            "CREATE OPERATOR CLASS c FOR TYPE int4 USING btree FAMILY f AS OPERATOR 1 <;",
+            "duplicate key value violates unique constraint \"pg_amop_fam_strat_index\"",
+        ),
+        (
+            "CREATE OPERATOR CLASS c FOR TYPE int4 USING btree FAMILY f
+                 AS OPERATOR 2 <=, OPERATOR 2 <=;",
+            "operator number 2 for (integer,integer) appears more than once",
+        ),
+        (
+            "ALTER OPERATOR FAMILY s.nope USING btree ADD OPERATOR 1 < (int4, int4);",
+            "operator family \"s.nope\" does not exist for access method \"btree\"",
+        ),
+        (
+            "ALTER OPERATOR FAMILY f USING btree DROP OPERATOR 3 (int4, int4);",
+            "operator 3(integer,integer) does not exist in operator family \"f\"",
+        ),
+        (
+            "ALTER OPERATOR FAMILY f USING btree
+                 DROP OPERATOR 1 (int4, int4), OPERATOR 1 (int4, int4);",
+            "operator number 1 for (integer,integer) appears more than once",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "ALTER OPERATOR FAMILY f USING btree ADD OPERATOR 2 <= (int4, int4);
+             ALTER OPERATOR FAMILY f USING btree DROP OPERATOR 1 (int4, int4);
+             ALTER OPERATOR FAMILY f USING btree ADD OPERATOR 1 < (int4, int4);
+             CREATE OPERATOR CLASS c FOR TYPE int4 USING btree FAMILY f AS OPERATOR 3 =;",
+        ),
+    ]);
+}

@@ -278,15 +278,9 @@ pub fn create_opclass(interp: &mut PgCatalog, stmt: &CreateOpClassStmt) -> Resul
         match find_opfamily(interp, fschema.as_deref(), &fname, &am) {
             Some(f) => (f.opfname.clone(), f.opfnamespace),
             None => {
-                // The name as written (NameListToString).
-                let written = stmt
-                    .opfamilyname
-                    .iter()
-                    .filter_map(node_string)
-                    .collect::<Vec<_>>()
-                    .join(".");
                 return Err(DdlError::TypeNotFound(format!(
-                    "operator family \"{written}\" does not exist for access method \"{am}\""
+                    "operator family \"{}\" does not exist for access method \"{am}\"",
+                    written(&stmt.opfamilyname)
                 )));
             }
         }
@@ -330,10 +324,22 @@ pub fn create_opclass(interp: &mut PgCatalog, stmt: &CreateOpClassStmt) -> Resul
         )));
     }
     let (family_name, family_ns) = family;
-    for item in &stmt.items {
-        if let Some(node::Node::CreateOpClassItem(item)) = item.node.as_ref() {
-            add_family_operator(interp, &family_name, family_ns, &am, item, Some(intype))?;
+    // storeOperators without the ADD check: an operator the family already
+    // has trips pg_amop's unique index.
+    for op in family_operators(
+        interp,
+        &family_name,
+        family_ns,
+        &am,
+        &stmt.items,
+        Some(intype),
+    )? {
+        if interp.pg_amop.iter().any(|o| same_member(o, &op)) {
+            return Err(DdlError::DuplicateObject(
+                "duplicate key value violates unique constraint \"pg_amop_fam_strat_index\"".into(),
+            ));
         }
+        interp.pg_amop.push(op);
     }
     let oid = PgOpclassOid::from_nonzero(interp.alloc_oid()?);
     // The class depends on its family, and goes with it (DEPENDENCY_AUTO).
@@ -369,21 +375,19 @@ pub fn create_opclass(interp: &mut PgCatalog, stmt: &CreateOpClassStmt) -> Resul
 /// types default to the opclass's input type. `FOR ORDER BY` operators and
 /// FUNCTION / STORAGE items are not recorded; an operator that doesn't
 /// resolve is skipped.
-fn add_family_operator(
-    interp: &mut PgCatalog,
+fn family_operator(
+    interp: &PgCatalog,
     family: &str,
     family_ns: PgNamespaceOid,
     am: &str,
     item: &CreateOpClassItem,
     intype: Option<PgTypeOid>,
-) -> Result<(), DdlError> {
+) -> Option<PgAmop> {
     // OPCLASS_ITEM_OPERATOR, not FOR ORDER BY.
     if item.itemtype != 1 || !item.order_family.is_empty() {
-        return Ok(());
+        return None;
     }
-    let Some(owa) = item.name.as_ref() else {
-        return Ok(());
-    };
+    let owa = item.name.as_ref()?;
     let (left, right) = match owa.objargs.as_slice() {
         [l, r] => {
             let resolve = |n: &typedpg_pg_query::protobuf::Node| match n.node.as_ref() {
@@ -393,13 +397,13 @@ fn add_family_operator(
             (resolve(l), resolve(r))
         }
         [] => (intype, intype),
-        _ => return Ok(()),
+        _ => return None,
     };
     let (Some(left), Some(right)) = (left, right) else {
-        return Ok(());
+        return None;
     };
     let (schema, name) = split_name(&owa.objname);
-    let Some(opr) = interp
+    let opr = interp
         .schemas_for_lookup(schema.as_deref())
         .into_iter()
         .find_map(|ns| {
@@ -410,11 +414,8 @@ fn add_family_operator(
                     && o.oprright == right
             })
         })
-        .map(|o| o.oid)
-    else {
-        return Ok(());
-    };
-    interp.pg_amop.push(PgAmop {
+        .map(|o| o.oid)?;
+    Some(PgAmop {
         amopfamily: family.to_owned(),
         amopfamilynamespace: family_ns,
         amopmethod: am.to_owned(),
@@ -422,8 +423,59 @@ fn add_family_operator(
         amoprighttype: right,
         amopstrategy: i16::try_from(item.number).unwrap_or_default(),
         amopopr: opr,
-    });
-    Ok(())
+    })
+}
+
+/// Whether `a` and `b` are the same member of a family: strategy number
+/// and operand types (pg_amop_fam_strat_index).
+fn same_member(a: &PgAmop, b: &PgAmop) -> bool {
+    a.amopfamily == b.amopfamily
+        && a.amopfamilynamespace == b.amopfamilynamespace
+        && a.amopmethod == b.amopmethod
+        && a.amopstrategy == b.amopstrategy
+        && a.amoplefttype == b.amoplefttype
+        && a.amoprighttype == b.amoprighttype
+}
+
+/// The OPERATOR items of a CREATE OPERATOR CLASS / ALTER OPERATOR FAMILY
+/// ADD, resolved (addFamilyMember: a strategy number is given once per
+/// operand types).
+fn family_operators(
+    interp: &PgCatalog,
+    family: &str,
+    family_ns: PgNamespaceOid,
+    am: &str,
+    items: &[typedpg_pg_query::protobuf::Node],
+    intype: Option<PgTypeOid>,
+) -> Result<Vec<PgAmop>, DdlError> {
+    let mut ops: Vec<PgAmop> = Vec::new();
+    for item in items {
+        let Some(node::Node::CreateOpClassItem(item)) = item.node.as_ref() else {
+            continue;
+        };
+        let Some(op) = family_operator(interp, family, family_ns, am, item, intype) else {
+            continue;
+        };
+        if ops.iter().any(|o| same_member(o, &op)) {
+            return Err(DdlError::Parse(format!(
+                "operator number {} for ({},{}) appears more than once",
+                op.amopstrategy,
+                super::util::format_type_for_message(interp, op.amoplefttype),
+                super::util::format_type_for_message(interp, op.amoprighttype),
+            )));
+        }
+        ops.push(op);
+    }
+    Ok(ops)
+}
+
+/// The name list as written (NameListToString).
+fn written(names: &[typedpg_pg_query::protobuf::Node]) -> String {
+    names
+        .iter()
+        .filter_map(node_string)
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 /// ALTER OPERATOR FAMILY name USING am ADD | DROP ... (AlterOpFamily): the
@@ -435,19 +487,34 @@ pub fn alter_opfamily(interp: &mut PgCatalog, stmt: &AlterOpFamilyStmt) -> Resul
         .map(|f| (f.opfname.clone(), f.opfnamespace))
     else {
         return Err(DdlError::TypeNotFound(format!(
-            "operator family \"{name}\" does not exist for access method \"{}\"",
+            "operator family \"{}\" does not exist for access method \"{}\"",
+            written(&stmt.opfamilyname),
             stmt.amname
         )));
     };
+    if !stmt.is_drop {
+        // AlterOpFamilyAdd → storeOperators(isAdd).
+        let ops = family_operators(interp, &family, family_ns, &stmt.amname, &stmt.items, None)?;
+        for op in &ops {
+            if interp.pg_amop.iter().any(|o| same_member(o, op)) {
+                return Err(DdlError::DuplicateObject(format!(
+                    "operator {}({},{}) already exists in operator family \"{}\"",
+                    op.amopstrategy,
+                    super::util::format_type_for_message(interp, op.amoplefttype),
+                    super::util::format_type_for_message(interp, op.amoprighttype),
+                    written(&stmt.opfamilyname),
+                )));
+            }
+        }
+        interp.pg_amop.extend(ops);
+        return Ok(());
+    }
+    // AlterOpFamilyDrop: `OPERATOR n (left, right)` items.
+    let mut dropped: Vec<(i16, PgTypeOid, PgTypeOid)> = Vec::new();
     for item in &stmt.items {
         let Some(node::Node::CreateOpClassItem(item)) = item.node.as_ref() else {
             continue;
         };
-        if !stmt.is_drop {
-            add_family_operator(interp, &family, family_ns, &stmt.amname, item, None)?;
-            continue;
-        }
-        // AlterOpFamilyDrop: `OPERATOR n (left, right)`.
         if item.itemtype != 1 {
             continue;
         }
@@ -461,14 +528,34 @@ pub fn alter_opfamily(interp: &mut PgCatalog, stmt: &AlterOpFamilyStmt) -> Resul
             .collect();
         if let [Some(left), Some(right)] = types.as_slice() {
             let strategy = i16::try_from(item.number).unwrap_or_default();
-            interp.pg_amop.retain(|o| {
-                !(o.amopfamily == family
-                    && o.amopfamilynamespace == family_ns
-                    && o.amopmethod == stmt.amname
-                    && o.amopstrategy == strategy
-                    && o.amoplefttype == *left
-                    && o.amoprighttype == *right)
-            });
+            if dropped.contains(&(strategy, *left, *right)) {
+                return Err(DdlError::Parse(format!(
+                    "operator number {strategy} for ({},{}) appears more than once",
+                    super::util::format_type_for_message(interp, *left),
+                    super::util::format_type_for_message(interp, *right),
+                )));
+            }
+            dropped.push((strategy, *left, *right));
+        }
+    }
+    // dropOperators.
+    for (strategy, left, right) in dropped {
+        let before = interp.pg_amop.len();
+        interp.pg_amop.retain(|o| {
+            !(o.amopfamily == family
+                && o.amopfamilynamespace == family_ns
+                && o.amopmethod == stmt.amname
+                && o.amopstrategy == strategy
+                && o.amoplefttype == left
+                && o.amoprighttype == right)
+        });
+        if interp.pg_amop.len() == before {
+            return Err(DdlError::TypeNotFound(format!(
+                "operator {strategy}({},{}) does not exist in operator family \"{}\"",
+                super::util::format_type_for_message(interp, left),
+                super::util::format_type_for_message(interp, right),
+                written(&stmt.opfamilyname),
+            )));
         }
     }
     Ok(())
@@ -552,12 +639,7 @@ fn resolve_am_object(
         })
     };
     if found.is_none() && !missing_ok {
-        // The name as written (NameListToString).
-        let written = names
-            .iter()
-            .filter_map(node_string)
-            .collect::<Vec<_>>()
-            .join(".");
+        let written = written(names);
         let what = if is_class {
             "operator class"
         } else {
