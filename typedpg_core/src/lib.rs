@@ -15,6 +15,7 @@
 
 pub mod build;
 pub mod config;
+mod keywords;
 mod qualified_name;
 
 pub use qualified_name::{ParseQualifiedNameError, QualifiedName, quote_identifier};

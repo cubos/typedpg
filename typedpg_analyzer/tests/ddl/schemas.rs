@@ -739,3 +739,22 @@ fn a_missing_qualified_relation_is_named_as_pg_names_it() {
         assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
     }
 }
+
+#[test]
+fn reserved_keyword_names_are_quoted_in_messages_like_pg() {
+    // quote_identifier quotes a keyword that isn't unreserved.
+    let setup = "CREATE SCHEMA \"select\";
+                 CREATE TABLE \"select\".\"order\" (a int);
+                 CREATE VIEW v AS SELECT a FROM \"select\".\"order\";";
+    let err = try_apply(&[
+        ("0001.sql", setup),
+        ("0002.sql", "DROP TABLE \"select\".\"order\";"),
+    ])
+    .unwrap_err();
+    assert!(
+        err.to_string().starts_with(
+            "cannot drop table \"select\".\"order\" because other objects depend on it"
+        ),
+        "{err}"
+    );
+}

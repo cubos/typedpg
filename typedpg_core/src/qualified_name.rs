@@ -151,29 +151,17 @@ fn write_ident(f: &mut fmt::Formatter<'_>, s: &str) -> fmt::Result {
     }
 }
 
-/// An unquoted PG identifier must start with a letter or underscore and
-/// contain only letters, digits, underscores, or `$`. We also quote strings
-/// that are empty or match a SQL reserved keyword the parser would choke on.
+/// PG's `quote_identifier` (ruleutils.c): an identifier stays bare only
+/// when it is a lowercase ASCII letter or `_` followed by lowercase ASCII
+/// letters, digits and `_` (so uppercase, `$`, non-ASCII and the empty
+/// string are quoted), and isn't a keyword that isn't unreserved.
 fn needs_quoting(s: &str) -> bool {
-    if s.is_empty() {
-        return true;
-    }
     let mut chars = s.chars();
-    let first = chars.next().unwrap();
-    if !(first.is_ascii_alphabetic() || first == '_') {
-        return true;
-    }
-    for ch in chars {
-        if !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '$') {
-            return true;
-        }
-    }
-    // Any uppercase letter forces quoting: PG folds unquoted idents to
-    // lowercase, so `Foo` written bare would parse as `foo`.
-    if s.chars().any(|c| c.is_ascii_uppercase()) {
-        return true;
-    }
-    false
+    let safe = chars
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    !safe || crate::keywords::is_quoted_keyword(s)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -267,6 +255,29 @@ impl<'a> Parser<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quoting_follows_pg_quote_identifier() {
+        for (ident, rendered) in [
+            ("user_id", "user_id"),
+            ("_x1", "_x1"),
+            ("abort", "abort"),     // unreserved keyword
+            ("order", "\"order\""), // reserved
+            ("int", "\"int\""),     // column-name keyword
+            ("left", "\"left\""),   // type/function-name keyword
+            ("a$b", "\"a$b\""),
+            ("Users", "\"Users\""),
+            ("1a", "\"1a\""),
+            ("é", "\"é\""),
+            ("", "\"\""),
+            ("a\"b", "\"a\"\"b\""),
+        ] {
+            assert_eq!(quote_identifier(ident), rendered, "{ident:?}");
+        }
+        let q = QualifiedName::new("select", "order");
+        assert_eq!(q.to_string(), "\"select\".\"order\"");
+        assert_eq!(q.to_string().parse::<QualifiedName>().unwrap(), q);
+    }
 
     #[test]
     fn parse_simple() {

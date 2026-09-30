@@ -3357,6 +3357,7 @@ dependencies = [
  "prost",
  "serde_json",
  "thiserror",
+ "typedpg_core",
 ]
 
 [[package]]
