@@ -286,3 +286,33 @@ fn merge_target_and_source_need_distinct_names() {
     db.analyze("MERGE INTO t AS x USING t ON x.id = t.id WHEN MATCHED THEN DELETE")
         .unwrap();
 }
+
+/// transformInsertRow coerces a WHEN NOT MATCHED INSERT value like a plain
+/// INSERT's (same error variant): a value that can't be assigned is
+/// `column "x" is of type … but expression is of type …` (42804).
+#[test]
+fn merge_insert_value_of_the_wrong_type() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TYPE status AS ENUM ('a', 'b');
+         CREATE TABLE t (id int PRIMARY KEY, views bigint NOT NULL);
+         CREATE TABLE u (id int, st status);",
+    )
+    .unwrap();
+    for sql in [
+        "MERGE INTO t USING u ON t.id = u.id WHEN NOT MATCHED THEN INSERT VALUES (u.id, u.st)",
+        "MERGE INTO t USING u ON t.id = u.id WHEN NOT MATCHED THEN INSERT (views, id) \
+         VALUES (u.st, u.id)",
+    ] {
+        let err = db.analyze(sql).unwrap_err();
+        assert!(
+            matches!(err, AnalyzeError::TypeMismatch { .. }),
+            "{sql}: {err:?}"
+        );
+        assert!(
+            err.to_string()
+                .starts_with("column \"views\" is of type bigint but expression is of type status"),
+            "{sql}: {err}"
+        );
+    }
+}
