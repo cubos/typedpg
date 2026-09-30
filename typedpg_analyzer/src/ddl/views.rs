@@ -804,6 +804,15 @@ pub(crate) fn statement_references(
     (deps.relation_refs, deps.column_refs)
 }
 
+/// The functions a statement calls (the view machinery's binding walker).
+pub(crate) fn statement_functions(
+    snapshot: &PgCatalog,
+    query_node: &protobuf::Node,
+) -> Vec<PgProcOid> {
+    let (_, deps) = collect_view_bindings_and_deps(query_node, snapshot);
+    deps.function_refs
+}
+
 fn collect_view_bindings_and_deps(
     query_node: &protobuf::Node,
     snapshot: &PgCatalog,

@@ -7,8 +7,8 @@
 mod acl;
 pub mod aggregates;
 pub mod alter;
-pub(crate) mod coldeps;
 pub(crate) mod cmdtag;
+pub(crate) mod coldeps;
 pub mod collations;
 mod comment;
 mod conversion_procs;
@@ -28,7 +28,7 @@ pub(crate) mod languages;
 mod maintenance;
 pub(crate) mod opclass;
 pub mod operators;
-mod policies;
+pub(crate) mod policies;
 pub(crate) mod prepared;
 pub(crate) mod publications;
 pub(crate) mod reloptions;

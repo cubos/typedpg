@@ -1535,6 +1535,23 @@ fn check_alter_target(
             matches!(class.relkind, RelKind::Table | RelKind::Sequence),
             "SET UNLOGGED",
         ),
+        // Row security is a table's (ATT_TABLE | ATT_PARTITIONED_TABLE).
+        At::AtEnableRowSecurity => (
+            matches!(class.relkind, RelKind::Table | RelKind::Partitioned),
+            "ENABLE ROW SECURITY",
+        ),
+        At::AtDisableRowSecurity => (
+            matches!(class.relkind, RelKind::Table | RelKind::Partitioned),
+            "DISABLE ROW SECURITY",
+        ),
+        At::AtForceRowSecurity => (
+            matches!(class.relkind, RelKind::Table | RelKind::Partitioned),
+            "FORCE ROW SECURITY",
+        ),
+        At::AtNoForceRowSecurity => (
+            matches!(class.relkind, RelKind::Table | RelKind::Partitioned),
+            "NO FORCE ROW SECURITY",
+        ),
         _ => (true, ""),
     };
     if allowed {

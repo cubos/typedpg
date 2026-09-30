@@ -440,6 +440,110 @@ fn policies_are_validated_and_tracked() {
 }
 
 #[test]
+fn policies_check_their_command_and_depend_on_their_columns() {
+    // PG 18 CreatePolicy / AlterPolicy (the expressions each command
+    // takes), the policy's dependencies on the columns it reads
+    // (ATExecDropColumn, ATExecAlterColumnType), and ATSimplePermissions
+    // for the row-security actions.
+    let setup = "CREATE TABLE t (a int, b int, c int);
+                 CREATE TABLE o (x int);
+                 CREATE POLICY pi ON t FOR INSERT WITH CHECK (a > 0);
+                 CREATE POLICY ps ON t FOR SELECT USING (b > 0);
+                 CREATE POLICY pu ON t FOR UPDATE USING (true)
+                     WITH CHECK (EXISTS (SELECT 1 FROM o WHERE o.x = t.c));
+                 CREATE FUNCTION f(int) RETURNS bool LANGUAGE sql AS 'select true';
+                 CREATE POLICY pf ON t USING (f(c));
+                 CREATE VIEW v AS SELECT 1 AS one;";
+    for (stmt, msg) in [
+        (
+            "CREATE POLICY p ON t FOR INSERT USING (a > 0);",
+            "only WITH CHECK expression allowed for INSERT",
+        ),
+        (
+            "CREATE POLICY p ON t FOR SELECT WITH CHECK (a > 0);",
+            "WITH CHECK cannot be applied to SELECT or DELETE",
+        ),
+        (
+            "CREATE POLICY p ON t FOR DELETE USING (true) WITH CHECK (a > 0);",
+            "WITH CHECK cannot be applied to SELECT or DELETE",
+        ),
+        (
+            "CREATE POLICY p ON nosuch FOR INSERT USING (true);",
+            "only WITH CHECK expression allowed for INSERT",
+        ),
+        (
+            "ALTER POLICY pi ON t USING (true);",
+            "only WITH CHECK expression allowed for INSERT",
+        ),
+        (
+            "ALTER POLICY ps ON t WITH CHECK (true);",
+            "only USING expression allowed for SELECT, DELETE",
+        ),
+        (
+            "ALTER POLICY nosuch ON t USING (nosuchcol);",
+            "column \"nosuchcol\" does not exist",
+        ),
+        (
+            "ALTER TABLE t DROP COLUMN a;",
+            "cannot drop column a of table t because other objects depend on it",
+        ),
+        (
+            "ALTER TABLE o DROP COLUMN x;",
+            "cannot drop column x of table o because other objects depend on it",
+        ),
+        (
+            "ALTER TABLE t ALTER COLUMN b TYPE bigint;",
+            "cannot alter type of a column used in a policy definition",
+        ),
+        (
+            "ALTER POLICY pu ON t USING (a > 0); ALTER TABLE t DROP COLUMN c;",
+            "cannot drop column c of table t because other objects depend on it",
+        ),
+        (
+            "DROP TABLE o;",
+            "cannot drop table o because other objects depend on it",
+        ),
+        (
+            "DROP FUNCTION f(int);",
+            "cannot drop function f(integer) because other objects depend on it",
+        ),
+        (
+            "DROP TABLE o CASCADE; DROP FUNCTION f(int) CASCADE; ALTER POLICY pu ON t USING (true);",
+            "policy \"pu\" for table \"t\" does not exist",
+        ),
+        (
+            "ALTER TABLE v ENABLE ROW LEVEL SECURITY;",
+            "ALTER action ENABLE ROW SECURITY cannot be performed on relation \"v\"",
+        ),
+        (
+            "ALTER TABLE v FORCE ROW LEVEL SECURITY;",
+            "ALTER action FORCE ROW SECURITY cannot be performed on relation \"v\"",
+        ),
+        (
+            "CREATE POLICY p ON pg_catalog.pg_class USING (true);",
+            "permission denied: \"pg_class\" is a system catalog",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    let db = build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "ALTER TABLE t ENABLE ROW LEVEL SECURITY;
+             ALTER TABLE t FORCE ROW LEVEL SECURITY;
+             ALTER POLICY pi ON t WITH CHECK (c > 0);
+             ALTER TABLE t ALTER COLUMN a TYPE bigint;
+             ALTER POLICY pu ON t USING (b > 0) WITH CHECK (true);
+             ALTER TABLE o DROP COLUMN x;
+             ALTER TABLE t DROP COLUMN b CASCADE;",
+        ),
+    ]);
+    db.analyze("SELECT a, c FROM t").unwrap();
+}
+
+#[test]
 fn ddl_expression_kinds_reject_aggregates_windows_and_subqueries() {
     // PG 18 transformExpr with EXPR_KIND_CHECK_CONSTRAINT / DOMAIN_CHECK /
     // INDEX_EXPRESSION / INDEX_PREDICATE / GENERATED_COLUMN: aggregates and

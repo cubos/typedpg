@@ -1,7 +1,8 @@
 //! CREATE / ALTER / DROP POLICY. Row-level security doesn't change query
-//! types, but PG resolves the table, keeps policy names unique per table
-//! and type-checks the USING / WITH CHECK expressions over the table's row
-//! (`CreatePolicy`, policy.c), so the catalog keeps the names.
+//! types, but PG resolves the table, keeps policy names unique per table,
+//! checks which expressions the policy's command takes, type-checks the
+//! USING / WITH CHECK expressions over the table's row (`CreatePolicy`,
+//! policy.c) and records their dependencies on the columns they read.
 
 use typedpg_pg_query::protobuf::{AlterPolicyStmt, CreatePolicyStmt, RangeVar, node};
 
@@ -9,9 +10,37 @@ use super::DdlError;
 use crate::oid::PgClassOid;
 use crate::pg_catalog::{PgCatalog, RelKind};
 
-/// RangeVarCallbackForPolicy: policies live on plain and partitioned tables.
+/// A row-security policy (`pg_policy`); what its expressions depend on is
+/// in [`super::coldeps`].
+#[derive(Clone, Debug)]
+pub(crate) struct Policy {
+    pub(crate) name: String,
+    /// `polcmd`: `*` (ALL), `r` (SELECT), `a` (INSERT), `w` (UPDATE) or `d`
+    /// (DELETE).
+    cmd: char,
+}
+
+/// parse_policy_command.
+fn policy_command(cmd_name: &str) -> char {
+    match cmd_name {
+        "select" => 'r',
+        "insert" => 'a',
+        "update" => 'w',
+        "delete" => 'd',
+        _ => '*',
+    }
+}
+
+/// RangeVarCallbackForPolicy: policies live on plain and partitioned
+/// tables, and not on system catalogs.
 fn policy_table(interp: &PgCatalog, rv: &RangeVar) -> Result<PgClassOid, DdlError> {
     let (_, relid) = super::util::lookup_relation(interp, rv)?;
+    if interp.is_system_class(relid) {
+        return Err(DdlError::Parse(format!(
+            "permission denied: \"{}\" is a system catalog",
+            rv.relname
+        )));
+    }
     let relkind = interp.pg_class.get(&relid).map(|c| c.relkind);
     if !matches!(relkind, Some(RelKind::Table | RelKind::Partitioned)) {
         return Err(DdlError::UnsupportedDdl(format!(
@@ -26,51 +55,70 @@ pub fn create_policy(interp: &mut PgCatalog, stmt: &CreatePolicyStmt) -> Result<
     let Some(rv) = stmt.table.as_ref() else {
         return Ok(());
     };
+    // CreatePolicy checks the expressions against the command first.
+    let cmd = policy_command(&stmt.cmd_name);
+    if matches!(cmd, 'r' | 'd') && stmt.with_check.is_some() {
+        return Err(DdlError::Parse(
+            "WITH CHECK cannot be applied to SELECT or DELETE".into(),
+        ));
+    }
+    if cmd == 'a' && stmt.qual.is_some() {
+        return Err(DdlError::Parse(
+            "only WITH CHECK expression allowed for INSERT".into(),
+        ));
+    }
     let relid = policy_table(interp, rv)?;
+    check_policy_expression(interp, relid, stmt.qual.as_deref())?;
+    check_policy_expression(interp, relid, stmt.with_check.as_deref())?;
     if interp
         .policies
         .get(&relid)
-        .is_some_and(|ps| ps.contains(&stmt.policy_name))
+        .is_some_and(|ps| ps.iter().any(|p| p.name == stmt.policy_name))
     {
         return Err(DdlError::DuplicateObject(format!(
             "policy \"{}\" for table \"{}\" already exists",
             stmt.policy_name, rv.relname
         )));
     }
-    for expr in [stmt.qual.as_deref(), stmt.with_check.as_deref()]
-        .into_iter()
-        .flatten()
-    {
-        check_policy_expression(interp, relid, expr)?;
-    }
-    interp
-        .policies
-        .entry(relid)
-        .or_default()
-        .push(stmt.policy_name.clone());
+    interp.policies.entry(relid).or_default().push(Policy {
+        name: stmt.policy_name.clone(),
+        cmd,
+    });
     Ok(())
 }
 
-pub fn alter_policy(interp: &PgCatalog, stmt: &AlterPolicyStmt) -> Result<(), DdlError> {
+pub fn alter_policy(interp: &mut PgCatalog, stmt: &AlterPolicyStmt) -> Result<(), DdlError> {
     let Some(rv) = stmt.table.as_ref() else {
         return Ok(());
     };
     let relid = policy_table(interp, rv)?;
-    if !interp
-        .policies
+    // AlterPolicy transforms the new expressions, then finds the policy.
+    check_policy_expression(interp, relid, stmt.qual.as_deref())?;
+    check_policy_expression(interp, relid, stmt.with_check.as_deref())?;
+    let relname = interp
+        .pg_class
         .get(&relid)
-        .is_some_and(|ps| ps.contains(&stmt.policy_name))
-    {
+        .map(|c| c.relname.clone())
+        .unwrap_or_default();
+    let Some(policy) = interp
+        .policies
+        .get_mut(&relid)
+        .and_then(|ps| ps.iter_mut().find(|p| p.name == stmt.policy_name))
+    else {
         return Err(DdlError::TypeNotFound(format!(
-            "policy \"{}\" for table \"{}\" does not exist",
-            stmt.policy_name, rv.relname
+            "policy \"{}\" for table \"{relname}\" does not exist",
+            stmt.policy_name
         )));
+    };
+    if matches!(policy.cmd, 'r' | 'd') && stmt.with_check.is_some() {
+        return Err(DdlError::Parse(
+            "only USING expression allowed for SELECT, DELETE".into(),
+        ));
     }
-    for expr in [stmt.qual.as_deref(), stmt.with_check.as_deref()]
-        .into_iter()
-        .flatten()
-    {
-        check_policy_expression(interp, relid, expr)?;
+    if policy.cmd == 'a' && stmt.qual.is_some() {
+        return Err(DdlError::Parse(
+            "only WITH CHECK expression allowed for INSERT".into(),
+        ));
     }
     Ok(())
 }
@@ -111,7 +159,7 @@ pub(crate) fn drop_policy(
     };
     let policies = interp.policies.entry(relid).or_default();
     let before = policies.len();
-    policies.retain(|p| p != name);
+    policies.retain(|p| p.name != *name);
     if policies.len() == before && !missing_ok {
         return Err(DdlError::TypeNotFound(format!(
             "policy \"{name}\" for table \"{}\" does not exist",
@@ -135,19 +183,19 @@ pub(crate) fn rename_policy(
         Err(e) => return Err(e),
     };
     let policies = interp.policies.entry(relid).or_default();
-    if policies.contains(&stmt.newname) {
+    if policies.iter().any(|p| p.name == stmt.newname) {
         return Err(DdlError::DuplicateObject(format!(
             "policy \"{}\" for table \"{}\" already exists",
             stmt.newname, rv.relname
         )));
     }
-    let Some(p) = policies.iter_mut().find(|p| **p == stmt.subname) else {
+    let Some(p) = policies.iter_mut().find(|p| p.name == stmt.subname) else {
         return Err(DdlError::TypeNotFound(format!(
             "policy \"{}\" for table \"{}\" does not exist",
             stmt.subname, rv.relname
         )));
     };
-    *p = stmt.newname.clone();
+    p.name = stmt.newname.clone();
     Ok(())
 }
 
@@ -155,8 +203,11 @@ pub(crate) fn rename_policy(
 fn check_policy_expression(
     interp: &PgCatalog,
     relid: PgClassOid,
-    expr: &typedpg_pg_query::protobuf::Node,
+    expr: Option<&typedpg_pg_query::protobuf::Node>,
 ) -> Result<(), DdlError> {
+    let Some(expr) = expr else {
+        return Ok(());
+    };
     use crate::expr::{TypeGoal, infer_expr};
     use crate::nullability::NullabilityContext;
     use crate::param_collector::ParamCollector;

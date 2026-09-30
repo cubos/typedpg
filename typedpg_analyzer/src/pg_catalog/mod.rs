@@ -259,7 +259,7 @@ pub struct PgCatalog {
     /// `pg_trigger`: each relation's triggers (name and function).
     pub(crate) triggers: HashMap<PgClassOid, Vec<crate::ddl::triggers::Trigger>>,
     /// `pg_policy`: each relation's row-security policy names.
-    pub(crate) policies: HashMap<PgClassOid, Vec<String>>,
+    pub(crate) policies: HashMap<PgClassOid, Vec<crate::ddl::policies::Policy>>,
     /// `pg_rewrite` rule names added by CREATE RULE, per relation.
     pub(crate) rules: HashMap<PgClassOid, Vec<crate::ddl::rules::Rule>>,
     /// What the rewriter needs to auto-update each view created by DDL

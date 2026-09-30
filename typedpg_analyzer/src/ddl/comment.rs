@@ -296,7 +296,10 @@ pub(crate) fn resolve_object(
                     "table",
                 ),
                 ObjectType::ObjectPolicy => (
-                    interp.policies.get(&oid).is_some_and(|ps| ps.contains(sub)),
+                    interp
+                        .policies
+                        .get(&oid)
+                        .is_some_and(|ps| ps.iter().any(|p| &p.name == sub)),
                     "policy",
                     "table",
                 ),

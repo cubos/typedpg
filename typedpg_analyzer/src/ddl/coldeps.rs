@@ -31,6 +31,9 @@ pub(crate) struct ColumnDeps {
     /// `(dependent, referenced relation, attnum)`; attnum 0 is the
     /// relation itself.
     edges: Vec<(Dependent, PgClassOid, i16)>,
+    /// `(dependent, function)`: the functions a policy's or rule's
+    /// expressions call.
+    function_edges: Vec<(Dependent, PgProcOid)>,
     /// Each policy's USING and WITH CHECK expressions: ALTER POLICY
     /// replaces them one at a time.
     policy_quals: HashMap<(PgClassOid, String), (Option<Node>, Option<Node>)>,
@@ -43,7 +46,7 @@ fn exists(interp: &PgCatalog, dep: &Dependent) -> bool {
         Dependent::Policy { relid, name } => interp
             .policies
             .get(relid)
-            .is_some_and(|ps| ps.contains(name)),
+            .is_some_and(|ps| ps.iter().any(|p| p.name == *name)),
         Dependent::Trigger { relid, name } => interp
             .triggers
             .get(relid)
@@ -68,6 +71,28 @@ fn set(interp: &mut PgCatalog, dep: Dependent, refs: Vec<(PgClassOid, i16)>) {
             deps.edges.push((dep.clone(), relid, attnum));
         }
     }
+}
+
+fn set_functions(interp: &mut PgCatalog, dep: Dependent, functions: Vec<PgProcOid>) {
+    let edges = &mut interp.column_deps.function_edges;
+    edges.retain(|(d, _)| *d != dep);
+    for f in functions {
+        if !edges.iter().any(|(d, g)| *d == dep && *g == f) {
+            edges.push((dep.clone(), f));
+        }
+    }
+}
+
+/// The existing objects whose expressions call `function`, in creation
+/// order.
+pub(crate) fn dependents_calling(interp: &PgCatalog, function: PgProcOid) -> Vec<Dependent> {
+    let mut out: Vec<Dependent> = Vec::new();
+    for (dep, f) in &interp.column_deps.function_edges {
+        if *f == function && exists(interp, dep) && !out.contains(dep) {
+            out.push(dep.clone());
+        }
+    }
+    out
 }
 
 /// The existing objects depending on column `relid.attnum`, in creation
@@ -141,7 +166,7 @@ pub(crate) fn drop_dependent(interp: &mut PgCatalog, dep: &Dependent) {
     match dep {
         Dependent::Policy { relid, name } => {
             if let Some(ps) = interp.policies.get_mut(relid) {
-                ps.retain(|p| p != name);
+                ps.retain(|p| p.name != *name);
             }
             interp
                 .column_deps
@@ -170,6 +195,7 @@ pub(crate) fn drop_dependent(interp: &mut PgCatalog, dep: &Dependent) {
         }
     }
     interp.column_deps.edges.retain(|(d, ..)| d != dep);
+    interp.column_deps.function_edges.retain(|(d, _)| d != dep);
 }
 
 /// ALTER POLICY / TRIGGER / RULE ... RENAME TO: the edges follow the name.
@@ -190,6 +216,11 @@ pub(crate) fn rename(interp: &mut PgCatalog, old: &Dependent, new_name: &str) {
         Dependent::Function(_) => return,
     };
     for (d, ..) in &mut interp.column_deps.edges {
+        if d == old {
+            *d = renamed.clone();
+        }
+    }
+    for (d, _) in &mut interp.column_deps.function_edges {
         if d == old {
             *d = renamed.clone();
         }
@@ -371,6 +402,22 @@ fn statement_refs(interp: &PgCatalog, stmt: &Node, extra_from: &[Node]) -> Vec<(
 
 // ─── Recording ──────────────────────────────────────────────────────────
 
+/// The functions a policy's USING / WITH CHECK call.
+fn policy_functions(
+    interp: &PgCatalog,
+    table: &protobuf::RangeVar,
+    quals: &(Option<Node>, Option<Node>),
+) -> Vec<PgProcOid> {
+    let exprs: Vec<&Node> = quals.0.iter().chain(quals.1.iter()).collect();
+    if exprs.is_empty() {
+        return Vec::new();
+    }
+    super::views::statement_functions(
+        interp,
+        &select_of(&exprs, vec![range_var_node(table, None)]),
+    )
+}
+
 fn policy_refs(
     interp: &PgCatalog,
     table: &protobuf::RangeVar,
@@ -403,11 +450,13 @@ pub(crate) fn record_policy(
         stmt.with_check.as_deref().cloned(),
     );
     let refs = policy_refs(interp, table, &quals);
+    let functions = policy_functions(interp, table, &quals);
     let dep = Dependent::Policy {
         relid,
         name: stmt.policy_name.clone(),
     };
-    set(interp, dep, refs);
+    set(interp, dep.clone(), refs);
+    set_functions(interp, dep, functions);
     interp
         .column_deps
         .policy_quals
@@ -440,14 +489,13 @@ pub(crate) fn record_policy_alter(
         quals.1 = Some(c.clone());
     }
     let refs = policy_refs(interp, table, &quals);
-    set(
-        interp,
-        Dependent::Policy {
-            relid,
-            name: stmt.policy_name.clone(),
-        },
-        refs,
-    );
+    let functions = policy_functions(interp, table, &quals);
+    let dep = Dependent::Policy {
+        relid,
+        name: stmt.policy_name.clone(),
+    };
+    set(interp, dep.clone(), refs);
+    set_functions(interp, dep, functions);
     interp.column_deps.policy_quals.insert(key, quals);
     Ok(())
 }

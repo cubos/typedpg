@@ -1087,6 +1087,20 @@ fn drop_function(
             )));
         }
         interp.event_triggers.retain(|(_, f)| *f != oid);
+        // And a policy or rule calling it.
+        let dependent_objects = super::coldeps::dependents_calling(interp, oid);
+        if let Some(dependent) = dependent_objects.first()
+            && !cascade
+        {
+            return Err(DdlError::DependencyError(format!(
+                "cannot drop {kind_word} {signature} because other objects depend on it \
+                 ({} depends on {kind_word} {signature})",
+                super::coldeps::describe(interp, dependent)
+            )));
+        }
+        for dependent in &dependent_objects {
+            super::coldeps::drop_dependent(interp, dependent);
+        }
         let dependent_views = views::find_views_depending_on_function(interp, oid);
         if !dependent_views.is_empty() && !cascade {
             let view_names = format_view_list(interp, &dependent_views);
