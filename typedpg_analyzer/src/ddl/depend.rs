@@ -85,7 +85,7 @@ pub(crate) struct ObjectAddress {
 }
 
 impl ObjectAddress {
-    fn new(classid: PgClassOid, oid: std::num::NonZeroU32, objsubid: i16) -> Self {
+    pub(crate) fn new(classid: PgClassOid, oid: std::num::NonZeroU32, objsubid: i16) -> Self {
         Self {
             classid,
             objid: PgGenericOid::from_nonzero(oid),
@@ -290,6 +290,8 @@ pub(crate) const PG_TRIGGER_RELID: PgClassOid = PgClassOid::from_raw(2620);
 pub(crate) const PG_PUBLICATION_REL_RELID: PgClassOid = PgClassOid::from_raw(6106);
 /// `pg_opclass`.
 pub(crate) const PG_OPCLASS_RELID: PgClassOid = PgClassOid::from_raw(2616);
+/// `pg_opfamily`.
+pub(crate) const PG_OPFAMILY_RELID: PgClassOid = PgClassOid::from_raw(2753);
 /// `pg_ts_config`.
 pub(crate) const PG_TS_CONFIG_RELID: PgClassOid = PgClassOid::from_raw(3602);
 /// `pg_ts_dict`.
@@ -331,6 +333,12 @@ pub(crate) enum NamedObject {
         namespace: crate::oid::PgNamespaceOid,
         method: String,
     },
+    /// An operator family.
+    Opfamily {
+        name: String,
+        namespace: crate::oid::PgNamespaceOid,
+        method: String,
+    },
     /// A text search configuration (`c`) or dictionary (`d`).
     TsObject {
         kind: String,
@@ -348,6 +356,7 @@ impl NamedObject {
             NamedObject::DomainConstraint { .. } => PG_CONSTRAINT_RELID,
             NamedObject::PublicationRel { .. } => PG_PUBLICATION_REL_RELID,
             NamedObject::Opclass { .. } => PG_OPCLASS_RELID,
+            NamedObject::Opfamily { .. } => PG_OPFAMILY_RELID,
             NamedObject::TsObject { kind, .. } if kind == "c" => PG_TS_CONFIG_RELID,
             NamedObject::TsObject { .. } => PG_TS_DICT_RELID,
         }
@@ -396,6 +405,17 @@ impl NamedObject {
                     &c.opcname == name && c.opcnamespace == *namespace && &c.opcmethod == method
                 })
                 .map(|c| PgGenericOid::from_nonzero(c.oid.into_nonzero())),
+            NamedObject::Opfamily {
+                name,
+                namespace,
+                method,
+            } => interp
+                .pg_opfamily
+                .iter()
+                .find(|f| {
+                    &f.opfname == name && f.opfnamespace == *namespace && &f.opfmethod == method
+                })
+                .map(|f| f.oid),
             NamedObject::TsObject {
                 kind,
                 name,
@@ -461,6 +481,17 @@ pub(crate) fn named_object_at(interp: &PgCatalog, addr: ObjectAddress) -> Option
                 namespace: c.opcnamespace,
                 method: c.opcmethod.clone(),
             }),
+        c if c == PG_OPFAMILY_RELID => {
+            interp
+                .pg_opfamily
+                .iter()
+                .find(|f| f.oid == oid)
+                .map(|f| NamedObject::Opfamily {
+                    name: f.opfname.clone(),
+                    namespace: f.opfnamespace,
+                    method: f.opfmethod.clone(),
+                })
+        }
         c if c == PG_TS_CONFIG_RELID || c == PG_TS_DICT_RELID => interp
             .pg_ts_objects
             .iter()
@@ -475,10 +506,12 @@ pub(crate) fn named_object_at(interp: &PgCatalog, addr: ObjectAddress) -> Option
 }
 
 /// The identity of `object`, if it exists. `None` too for a built-in text
-/// search object or operator class (pinned in `pg_catalog`), which nothing
-/// records dependencies on.
+/// search object, operator class or family (pinned in `pg_catalog`), which
+/// nothing records dependencies on.
 pub(crate) fn named_address_of(interp: &PgCatalog, object: &NamedObject) -> Option<ObjectAddress> {
-    if let NamedObject::TsObject { namespace, .. } | NamedObject::Opclass { namespace, .. } = object
+    if let NamedObject::TsObject { namespace, .. }
+    | NamedObject::Opclass { namespace, .. }
+    | NamedObject::Opfamily { namespace, .. } = object
         && interp.namespace_name(*namespace) == Some("pg_catalog")
     {
         return None;
@@ -504,6 +537,31 @@ pub(crate) fn named_object(
     })?;
     forget_dependencies_of(interp, addr);
     Ok(addr)
+}
+
+/// DROP of an object kept in a collection of its own (an operator class
+/// or family): what depends on it needs CASCADE; a built-in one is
+/// required by the database system.
+pub(crate) fn drop_named(
+    interp: &mut PgCatalog,
+    object: NamedObject,
+    cascade: bool,
+) -> Result<(), super::DdlError> {
+    let Some(oid) = object.oid(interp) else {
+        return Ok(());
+    };
+    let addr = ObjectAddress::new(object.classid(), oid.into_nonzero(), 0);
+    let desc = describe(interp, addr);
+    if named_address_of(interp, &object).is_none() {
+        return Err(super::DdlError::DependencyError(format!(
+            "cannot drop {desc} because it is required by the database system"
+        )));
+    }
+    check_not_owned(interp, addr, &desc)?;
+    drop_dependents(interp, addr, &desc, cascade)?;
+    delete_named(interp, &object);
+    interp.remove_dependencies_of(addr.classid, addr.objid);
+    Ok(())
 }
 
 /// DROP TEXT SEARCH CONFIGURATION / DICTIONARY: what depends on it (a
@@ -744,6 +802,22 @@ pub(crate) fn describe(interp: &PgCatalog, addr: ObjectAddress) -> String {
                     qualify_unless_visible(interp, namespace, &name, visible)
                 )
             }
+            Some(NamedObject::Opfamily {
+                name,
+                namespace,
+                method,
+            }) => {
+                // OpfamilyIsVisible: the first of its name for the method.
+                let visible = interp.schemas_for_lookup(None).into_iter().find(|ns| {
+                    interp.pg_opfamily.iter().any(|f| {
+                        f.opfname == name && f.opfnamespace == *ns && f.opfmethod == method
+                    })
+                }) == Some(namespace);
+                format!(
+                    "operator family {} for access method {method}",
+                    qualify_unless_visible(interp, namespace, &name, visible)
+                )
+            }
             Some(NamedObject::TsObject {
                 kind,
                 name,
@@ -919,29 +993,16 @@ fn drop_dependents_reporting(
         .into_iter()
         .filter(|(d, _)| !in_progress(*d))
         .collect();
-    // An object that belongs to the target (automatically or internally —
-    // a table's policies, triggers and rules) goes with it, whatever else
-    // of the target it depends on normally.
-    let owned = |d: &ObjectAddress| {
-        target.objsubid == 0
-            && interp.pg_depend.iter().any(|row| {
-                row.classid == d.classid
-                    && row.objid == d.objid
-                    && row.refclassid == target.classid
-                    && row.refobjid == target.objid
-                    && row.refobjsubid == 0
-                    && matches!(row.deptype, DepType::Auto | DepType::Internal)
-            })
-    };
-    if !cascade
-        && let Some((blocker, _)) = dependents
-            .iter()
-            .find(|(d, t)| *t == DepType::Normal && !is_drop_target(*d) && !owned(d))
-    {
+    if !cascade && let Some((blocker, via)) = find_blocker(interp, target) {
+        let via_desc = if via == target {
+            detail_desc.to_owned()
+        } else {
+            describe(interp, via)
+        };
         return Err(super::DdlError::DependencyError(format!(
             "cannot drop {target_desc} because other objects depend on it ({} depends on \
-             {detail_desc})",
-            describe_dependent(interp, *blocker)
+             {via_desc})",
+            describe_dependent(interp, blocker)
         )));
     }
     while_deleting(target, || {
@@ -953,6 +1014,57 @@ fn drop_dependents_reporting(
         }
         Ok(())
     })
+}
+
+/// findDependentObjects / reportDependentObjects without CASCADE: an
+/// object the DROP of `target` would take along — its dependents,
+/// recursively (a family's operator class's index) — that depends
+/// normally on one of them, and isn't reached automatically or internally
+/// too (a column's default on the column's owned sequence) nor dropped by
+/// the same command; with the object it depends on.
+fn find_blocker(
+    interp: &mut PgCatalog,
+    target: ObjectAddress,
+) -> Option<(ObjectAddress, ObjectAddress)> {
+    // Every object reached, whether some path reaches it automatically or
+    // internally, and the first object it depends on normally.
+    let mut reached: Vec<(ObjectAddress, bool, Option<ObjectAddress>)> = vec![(target, true, None)];
+    let mut at = 0;
+    while at < reached.len() {
+        let from = reached[at].0;
+        at += 1;
+        let dependents: Vec<(ObjectAddress, DepType)> = dependents_of(interp, from)
+            .into_iter()
+            .filter(|(d, _)| !in_progress(*d) && !is_drop_target(*d))
+            .collect();
+        for (d, deptype) in dependents {
+            // An object that belongs to what is dropped (automatically or
+            // internally — a table's policies, triggers and rules) goes
+            // with it, whatever else of it it depends on normally.
+            let owned = deptype != DepType::Normal
+                || (from.objsubid == 0
+                    && interp.pg_depend.iter().any(|row| {
+                        row.classid == d.classid
+                            && row.objid == d.objid
+                            && row.refclassid == from.classid
+                            && row.refobjid == from.objid
+                            && row.refobjsubid == 0
+                            && matches!(row.deptype, DepType::Auto | DepType::Internal)
+                    }));
+            match reached.iter_mut().find(|(r, ..)| *r == d) {
+                Some((_, silent, via)) => {
+                    *silent |= owned;
+                    if !owned && via.is_none() {
+                        *via = Some(from);
+                    }
+                }
+                None => reached.push((d, owned, (!owned).then_some(from))),
+            }
+        }
+    }
+    reached
+        .into_iter()
+        .find_map(|(d, silent, via)| via.filter(|_| !silent).map(|via| (d, via)))
 }
 
 /// `findDependentObjects`' owner check for a DROP of `target`: an object
@@ -1138,6 +1250,21 @@ fn delete_named(interp: &mut PgCatalog, object: &NamedObject) {
         } => interp.pg_opclass.retain(|c| {
             !(&c.opcname == name && c.opcnamespace == *namespace && &c.opcmethod == method)
         }),
+        // Its operators go with it.
+        NamedObject::Opfamily {
+            name,
+            namespace,
+            method,
+        } => {
+            interp.pg_opfamily.retain(|f| {
+                !(&f.opfname == name && f.opfnamespace == *namespace && &f.opfmethod == method)
+            });
+            interp.pg_amop.retain(|o| {
+                !(&o.amopfamily == name
+                    && o.amopfamilynamespace == *namespace
+                    && &o.amopmethod == method)
+            });
+        }
         NamedObject::TsObject {
             kind,
             name,
@@ -1165,22 +1292,33 @@ pub(crate) fn delete_member(interp: &mut PgCatalog, classid: PgClassOid, objid: 
     interp.remove_dependencies_on(classid, objid);
 }
 
-/// An extension's new objects the analyzer keeps by name (operator
-/// classes, text search objects), as addresses for its membership rows.
+/// An extension's new objects the analyzer keeps in collections of their
+/// own (operator families and classes, text search objects), as addresses
+/// for its membership rows.
 pub(crate) fn extension_named_members(
     interp: &mut PgCatalog,
+    opfamilies_before: usize,
     opclasses_before: usize,
     ts_before: usize,
 ) -> Vec<ObjectAddress> {
-    let mut objects: Vec<NamedObject> = interp.pg_opclass
-        [opclasses_before.min(interp.pg_opclass.len())..]
+    let mut objects: Vec<NamedObject> = interp.pg_opfamily
+        [opfamilies_before.min(interp.pg_opfamily.len())..]
         .iter()
-        .map(|c| NamedObject::Opclass {
-            name: c.opcname.clone(),
-            namespace: c.opcnamespace,
-            method: c.opcmethod.clone(),
+        .map(|f| NamedObject::Opfamily {
+            name: f.opfname.clone(),
+            namespace: f.opfnamespace,
+            method: f.opfmethod.clone(),
         })
         .collect();
+    objects.extend(
+        interp.pg_opclass[opclasses_before.min(interp.pg_opclass.len())..]
+            .iter()
+            .map(|c| NamedObject::Opclass {
+                name: c.opcname.clone(),
+                namespace: c.opcnamespace,
+                method: c.opcmethod.clone(),
+            }),
+    );
     objects.extend(
         interp.pg_ts_objects[ts_before.min(interp.pg_ts_objects.len())..]
             .iter()

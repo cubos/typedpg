@@ -906,7 +906,7 @@ fn export_access_methods(
         .collect();
     let opfamily = client
         .query(
-            "SELECT f.opfname::text, f.opfnamespace, a.amname::text \
+            "SELECT f.opfname::text, f.opfnamespace, a.amname::text, f.oid \
              FROM pg_catalog.pg_opfamily f JOIN pg_catalog.pg_am a ON a.oid = f.opfmethod \
              ORDER BY f.oid",
             &[],
@@ -914,6 +914,7 @@ fn export_access_methods(
         .iter()
         .filter_map(|r| {
             Some(PgOpfamily {
+                oid: PgGenericOid::new(r.get::<_, u32>(3))?,
                 opfname: r.get(0),
                 opfnamespace: PgNamespaceOid::new(r.get::<_, u32>(1))?,
                 opfmethod: r.get(2),

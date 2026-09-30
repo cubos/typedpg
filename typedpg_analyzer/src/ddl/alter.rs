@@ -77,6 +77,16 @@ pub fn rename(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlError>
         | ObjectType::ObjectTstemplate => {
             crate::ddl::text_search::rename(interp, rename_type, stmt)
         }
+        ObjectType::ObjectOpclass | ObjectType::ObjectOpfamily => match stmt.object.as_deref() {
+            Some(object) => crate::ddl::opclass::rename_or_move_am_object(
+                interp,
+                rename_type == ObjectType::ObjectOpclass,
+                object,
+                Some(&stmt.newname),
+                None,
+            ),
+            None => Ok(()),
+        },
         _ => Ok(()),
     }
 }
@@ -475,6 +485,16 @@ pub fn set_schema(interp: &mut PgCatalog, stmt: &AlterObjectSchemaStmt) -> Resul
         | ObjectType::ObjectTstemplate => {
             crate::ddl::text_search::set_schema(interp, object_type, stmt, new_nsoid)
         }
+        ObjectType::ObjectOpclass | ObjectType::ObjectOpfamily => match stmt.object.as_deref() {
+            Some(object) => crate::ddl::opclass::rename_or_move_am_object(
+                interp,
+                object_type == ObjectType::ObjectOpclass,
+                object,
+                None,
+                Some(new_nsoid),
+            ),
+            None => Ok(()),
+        },
         _ => Ok(()),
     }
 }

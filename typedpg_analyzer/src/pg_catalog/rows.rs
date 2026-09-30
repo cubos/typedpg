@@ -629,6 +629,8 @@ pub struct PgAm {
 /// `pg_opfamily`: an operator family of an access method.
 #[derive(Debug, Clone, Serialize_tuple, Deserialize_tuple)]
 pub struct PgOpfamily {
+    /// The family's OID: the identity `pg_depend` rows name.
+    pub oid: PgGenericOid,
     pub opfname: String,
     /// FK `pg_namespace.oid`.
     pub opfnamespace: PgNamespaceOid,

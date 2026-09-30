@@ -258,12 +258,13 @@ fn record_extension_membership(
 
 /// What an extension's scripts may create besides types, functions and
 /// casts, as it was before they ran: its operators, relations, operator
-/// classes and text search objects become members too
+/// families and classes and text search objects become members too
 /// (recordDependencyOnCurrentExtension).
 struct OtherMembers {
     languages: std::collections::HashSet<crate::oid::PgLanguageOid>,
     operators: std::collections::HashSet<crate::oid::PgOperatorOid>,
     relations: std::collections::HashSet<PgClassOid>,
+    opfamilies: usize,
     opclasses: usize,
     ts_objects: usize,
 }
@@ -274,6 +275,7 @@ impl OtherMembers {
             languages: interp.pg_language.keys().copied().collect(),
             operators: interp.pg_operator.keys().copied().collect(),
             relations: interp.pg_class.keys().copied().collect(),
+            opfamilies: interp.pg_opfamily.len(),
             opclasses: interp.pg_opclass.len(),
             ts_objects: interp.pg_ts_objects.len(),
         }
@@ -311,6 +313,7 @@ impl OtherMembers {
         );
         members.extend(crate::ddl::depend::extension_named_members(
             interp,
+            self.opfamilies,
             self.opclasses,
             self.ts_objects,
         ));

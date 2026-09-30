@@ -252,7 +252,9 @@ pub fn create_opfamily(interp: &mut PgCatalog, stmt: &CreateOpFamilyStmt) -> Res
             stmt.amname
         )));
     }
+    let oid = crate::oid::PgGenericOid::from_nonzero(interp.alloc_oid()?);
     interp.pg_opfamily.push(PgOpfamily {
+        oid,
         opfname: name,
         opfnamespace: nsoid,
         opfmethod: stmt.amname.clone(),
@@ -276,8 +278,15 @@ pub fn create_opclass(interp: &mut PgCatalog, stmt: &CreateOpClassStmt) -> Resul
         match find_opfamily(interp, fschema.as_deref(), &fname, &am) {
             Some(f) => (f.opfname.clone(), f.opfnamespace),
             None => {
+                // The name as written (NameListToString).
+                let written = stmt
+                    .opfamilyname
+                    .iter()
+                    .filter_map(node_string)
+                    .collect::<Vec<_>>()
+                    .join(".");
                 return Err(DdlError::TypeNotFound(format!(
-                    "operator family \"{fname}\" does not exist for access method \"{am}\""
+                    "operator family \"{written}\" does not exist for access method \"{am}\""
                 )));
             }
         }
@@ -290,7 +299,9 @@ pub fn create_opclass(interp: &mut PgCatalog, stmt: &CreateOpClassStmt) -> Resul
             .iter()
             .any(|f| f.opfnamespace == nsoid && f.opfname == name && f.opfmethod == am)
     {
+        let oid = crate::oid::PgGenericOid::from_nonzero(interp.alloc_oid()?);
         interp.pg_opfamily.push(PgOpfamily {
+            oid,
             opfname: name.clone(),
             opfnamespace: nsoid,
             opfmethod: am.clone(),
@@ -325,6 +336,15 @@ pub fn create_opclass(interp: &mut PgCatalog, stmt: &CreateOpClassStmt) -> Resul
         }
     }
     let oid = PgOpclassOid::from_nonzero(interp.alloc_oid()?);
+    // The class depends on its family, and goes with it (DEPENDENCY_AUTO).
+    let family = super::depend::named_address_of(
+        interp,
+        &super::depend::NamedObject::Opfamily {
+            name: family_name.clone(),
+            namespace: family_ns,
+            method: am.clone(),
+        },
+    );
     interp.pg_opclass.push(PgOpclass {
         oid,
         opcname: name,
@@ -335,6 +355,12 @@ pub fn create_opclass(interp: &mut PgCatalog, stmt: &CreateOpClassStmt) -> Resul
         opcfamily: family_name,
         opcfamilynamespace: family_ns,
     });
+    super::depend::record(
+        interp,
+        super::depend::ObjectAddress::new(super::depend::PG_OPCLASS_RELID, oid.into_nonzero(), 0),
+        family,
+        crate::pg_catalog::DepType::Auto,
+    );
     Ok(())
 }
 
@@ -454,6 +480,7 @@ pub(crate) fn drop_am_object(
     objtype: typedpg_pg_query::protobuf::ObjectType,
     obj_node: &typedpg_pg_query::protobuf::Node,
     missing_ok: bool,
+    cascade: bool,
 ) -> Result<(), DdlError> {
     use typedpg_pg_query::protobuf::ObjectType;
     match objtype {
@@ -470,53 +497,163 @@ pub(crate) fn drop_am_object(
             }
         }
         ObjectType::ObjectOpclass | ObjectType::ObjectOpfamily => {
-            // [am, name...]
-            let Some(node::Node::List(l)) = obj_node.node.as_ref() else {
-                return Ok(());
-            };
-            let Some((am, names)) = l.items.split_first() else {
-                return Ok(());
-            };
-            let am = node_string(am).unwrap_or_default().to_owned();
-            if !am_exists(interp, &am) {
-                return Err(DdlError::TypeNotFound(format!(
-                    "access method \"{am}\" does not exist"
-                )));
-            }
-            let (schema, name) = split_name(names);
-            let what = if objtype == ObjectType::ObjectOpclass {
-                "operator class"
-            } else {
-                "operator family"
-            };
-            let found = if objtype == ObjectType::ObjectOpclass {
-                find_opclass(interp, schema.as_deref(), &name, &am)
-                    .map(|c| (c.opcnamespace, c.opcname.clone()))
-            } else {
-                find_opfamily(interp, schema.as_deref(), &name, &am)
-                    .map(|f| (f.opfnamespace, f.opfname.clone()))
-            };
-            match found {
-                Some((ns, n)) if objtype == ObjectType::ObjectOpclass => interp
-                    .pg_opclass
-                    .retain(|c| !(c.opcnamespace == ns && c.opcname == n && c.opcmethod == am)),
-                Some((ns, n)) => {
-                    interp
-                        .pg_opfamily
-                        .retain(|f| !(f.opfnamespace == ns && f.opfname == n && f.opfmethod == am));
-                    interp.pg_amop.retain(|o| {
-                        !(o.amopfamilynamespace == ns && o.amopfamily == n && o.amopmethod == am)
-                    });
-                }
-                None if missing_ok => {}
-                None => {
-                    return Err(DdlError::TypeNotFound(format!(
-                        "{what} \"{name}\" does not exist for access method \"{am}\""
-                    )));
-                }
+            let is_class = objtype == ObjectType::ObjectOpclass;
+            if let Some(object) = resolve_am_object(interp, is_class, obj_node, missing_ok)? {
+                // What depends on it (an index on the class, the classes of
+                // the family and their indexes) needs CASCADE.
+                super::depend::drop_named(interp, object, cascade)?;
             }
         }
         _ => {}
+    }
+    Ok(())
+}
+
+/// The operator class or family `[am, name...]` names, resolved along the
+/// search path. `Ok(None)` when it (or its schema, with `missing_ok`)
+/// doesn't exist.
+fn resolve_am_object(
+    interp: &PgCatalog,
+    is_class: bool,
+    obj_node: &typedpg_pg_query::protobuf::Node,
+    missing_ok: bool,
+) -> Result<Option<super::depend::NamedObject>, DdlError> {
+    use super::depend::NamedObject;
+    let Some(node::Node::List(l)) = obj_node.node.as_ref() else {
+        return Ok(None);
+    };
+    let Some((am, names)) = l.items.split_first() else {
+        return Ok(None);
+    };
+    let am = node_string(am).unwrap_or_default().to_owned();
+    am_must_exist(interp, &am)?;
+    let (schema, name) = split_name(names);
+    if let Some(schema) = schema.as_deref()
+        && interp.namespace_oid(schema).is_none()
+    {
+        if missing_ok {
+            return Ok(None);
+        }
+        return Err(DdlError::TypeNotFound(format!(
+            "schema \"{schema}\" does not exist"
+        )));
+    }
+    let found = if is_class {
+        find_opclass(interp, schema.as_deref(), &name, &am).map(|c| NamedObject::Opclass {
+            name: c.opcname.clone(),
+            namespace: c.opcnamespace,
+            method: am.clone(),
+        })
+    } else {
+        find_opfamily(interp, schema.as_deref(), &name, &am).map(|f| NamedObject::Opfamily {
+            name: f.opfname.clone(),
+            namespace: f.opfnamespace,
+            method: am.clone(),
+        })
+    };
+    if found.is_none() && !missing_ok {
+        // The name as written (NameListToString).
+        let written = names
+            .iter()
+            .filter_map(node_string)
+            .collect::<Vec<_>>()
+            .join(".");
+        let what = if is_class {
+            "operator class"
+        } else {
+            "operator family"
+        };
+        return Err(DdlError::TypeNotFound(format!(
+            "{what} \"{written}\" does not exist for access method \"{am}\""
+        )));
+    }
+    Ok(found)
+}
+
+/// ALTER OPERATOR CLASS / FAMILY ... RENAME TO / SET SCHEMA
+/// (AlterObjectRename_internal / AlterObjectNamespace_internal): the
+/// object keeps its OID — and its dependencies — under its new name. A
+/// family's operators and classes, which name it, follow it.
+pub(crate) fn rename_or_move_am_object(
+    interp: &mut PgCatalog,
+    is_class: bool,
+    obj_node: &typedpg_pg_query::protobuf::Node,
+    new_name: Option<&str>,
+    new_namespace: Option<PgNamespaceOid>,
+) -> Result<(), DdlError> {
+    use super::depend::NamedObject;
+    let (NamedObject::Opclass {
+        name,
+        namespace,
+        method,
+    }
+    | NamedObject::Opfamily {
+        name,
+        namespace,
+        method,
+    }) = (match resolve_am_object(interp, is_class, obj_node, false)? {
+        Some(object) => object,
+        None => return Ok(()),
+    })
+    else {
+        return Ok(());
+    };
+    let to_name = new_name.map_or_else(|| name.clone(), str::to_owned);
+    let to_ns = new_namespace.unwrap_or(namespace);
+    if to_name == name && to_ns == namespace {
+        return Ok(());
+    }
+    // report_namespace_conflict.
+    let taken = if is_class {
+        interp
+            .pg_opclass
+            .iter()
+            .any(|c| c.opcname == to_name && c.opcnamespace == to_ns && c.opcmethod == method)
+    } else {
+        interp
+            .pg_opfamily
+            .iter()
+            .any(|f| f.opfname == to_name && f.opfnamespace == to_ns && f.opfmethod == method)
+    };
+    if taken {
+        let what = if is_class {
+            "operator class"
+        } else {
+            "operator family"
+        };
+        return Err(DdlError::DuplicateObject(format!(
+            "{what} \"{to_name}\" for access method \"{method}\" already exists in schema \"{}\"",
+            interp.namespace_name(to_ns).unwrap_or_default()
+        )));
+    }
+    if is_class {
+        if let Some(c) = interp
+            .pg_opclass
+            .iter_mut()
+            .find(|c| c.opcname == name && c.opcnamespace == namespace && c.opcmethod == method)
+        {
+            c.opcname = to_name;
+            c.opcnamespace = to_ns;
+        }
+        return Ok(());
+    }
+    for f in &mut interp.pg_opfamily {
+        if f.opfname == name && f.opfnamespace == namespace && f.opfmethod == method {
+            f.opfname.clone_from(&to_name);
+            f.opfnamespace = to_ns;
+        }
+    }
+    for o in &mut interp.pg_amop {
+        if o.amopfamily == name && o.amopfamilynamespace == namespace && o.amopmethod == method {
+            o.amopfamily.clone_from(&to_name);
+            o.amopfamilynamespace = to_ns;
+        }
+    }
+    for c in &mut interp.pg_opclass {
+        if c.opcfamily == name && c.opcfamilynamespace == namespace && c.opcmethod == method {
+            c.opcfamily.clone_from(&to_name);
+            c.opcfamilynamespace = to_ns;
+        }
     }
     Ok(())
 }

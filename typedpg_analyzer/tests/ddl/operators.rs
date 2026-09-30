@@ -197,3 +197,119 @@ fn a_commutator_reference_makes_a_shell_operator() {
         "operator is only a shell: text <==> integer"
     );
 }
+
+#[test]
+fn operator_classes_and_families_rename_move_and_drop_with_their_dependents() {
+    // PG 18: ALTER OPERATOR CLASS / FAMILY ... RENAME TO / SET SCHEMA keep
+    // the object's OID, so an index on the class still blocks DROP — of
+    // the class, or of its family, which takes the class along
+    // (DEPENDENCY_AUTO) — until CASCADE drops the index too. A built-in
+    // one is required by the database system.
+    let setup = "CREATE OPERATOR CLASS myops FOR TYPE int4 USING btree AS
+                     OPERATOR 1 <, OPERATOR 2 <=, OPERATOR 3 =, OPERATOR 4 >=, OPERATOR 5 >,
+                     FUNCTION 1 btint4cmp(int4, int4);
+                 CREATE OPERATOR CLASS other FOR TYPE int4 USING btree AS
+                     OPERATOR 1 <, OPERATOR 2 <=, OPERATOR 3 =, OPERATOR 4 >=, OPERATOR 5 >,
+                     FUNCTION 1 btint4cmp(int4, int4);
+                 CREATE TABLE to1 (a int);
+                 CREATE INDEX to1_idx ON to1 (a myops);
+                 CREATE SCHEMA s;";
+    let moved = "ALTER OPERATOR CLASS myops USING btree RENAME TO myops2;
+                 ALTER OPERATOR CLASS myops2 USING btree SET SCHEMA s;
+                 ALTER OPERATOR FAMILY myops USING btree RENAME TO fam2;
+                 ALTER OPERATOR FAMILY fam2 USING btree SET SCHEMA s;";
+    for (stmt, msg) in [
+        (
+            "ALTER OPERATOR CLASS nope USING btree RENAME TO x;",
+            "operator class \"nope\" does not exist for access method \"btree\"",
+        ),
+        (
+            "ALTER OPERATOR CLASS myops USING nope RENAME TO x;",
+            "access method \"nope\" does not exist",
+        ),
+        (
+            "ALTER OPERATOR CLASS myops USING btree RENAME TO other;",
+            "operator class \"other\" for access method \"btree\" already exists in schema \
+             \"public\"",
+        ),
+        (
+            "ALTER OPERATOR FAMILY nope USING btree RENAME TO x;",
+            "operator family \"nope\" does not exist for access method \"btree\"",
+        ),
+        (
+            "ALTER OPERATOR FAMILY myops USING btree RENAME TO other;",
+            "operator family \"other\" for access method \"btree\" already exists in schema \
+             \"public\"",
+        ),
+        (
+            "ALTER OPERATOR CLASS other USING btree SET SCHEMA s;
+             ALTER OPERATOR CLASS s.other USING btree RENAME TO myops;
+             ALTER OPERATOR CLASS myops USING btree SET SCHEMA s;",
+            "operator class \"myops\" for access method \"btree\" already exists in schema \"s\"",
+        ),
+        (
+            &format!("{moved} DROP OPERATOR CLASS s.myops2 USING btree;"),
+            "cannot drop operator class s.myops2 for access method btree because other objects \
+             depend on it (index to1_idx depends on operator class s.myops2 for access method \
+             btree)",
+        ),
+        (
+            &format!("{moved} DROP OPERATOR FAMILY s.fam2 USING btree;"),
+            "cannot drop operator family s.fam2 for access method btree because other objects \
+             depend on it (index to1_idx depends on operator class s.myops2 for access method \
+             btree)",
+        ),
+        (
+            &format!(
+                "{moved} DROP OPERATOR FAMILY s.fam2 USING btree CASCADE; DROP INDEX to1_idx;"
+            ),
+            "index \"to1_idx\" does not exist",
+        ),
+        (
+            &format!(
+                "{moved} DROP OPERATOR CLASS s.myops2 USING btree CASCADE; DROP INDEX to1_idx;"
+            ),
+            "index \"to1_idx\" does not exist",
+        ),
+        (
+            "DROP OPERATOR CLASS s.nope USING btree;",
+            "operator class \"s.nope\" does not exist for access method \"btree\"",
+        ),
+        (
+            "DROP OPERATOR CLASS nos.nope USING btree;",
+            "schema \"nos\" does not exist",
+        ),
+        (
+            "CREATE OPERATOR CLASS s.c2 FOR TYPE int4 USING btree FAMILY s.nofam AS OPERATOR 1 <;",
+            "operator family \"s.nofam\" does not exist for access method \"btree\"",
+        ),
+        (
+            "DROP OPERATOR CLASS int4_ops USING btree;",
+            "cannot drop operator class int4_ops for access method btree because it is required \
+             by the database system",
+        ),
+        (
+            "DROP OPERATOR FAMILY integer_ops USING btree;",
+            "cannot drop operator family integer_ops for access method btree because it is \
+             required by the database system",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            &format!(
+                "{moved}
+                 CREATE INDEX to1_idx2 ON to1 (a s.myops2);
+                 DROP OPERATOR CLASS IF EXISTS nope USING btree;
+                 DROP OPERATOR CLASS IF EXISTS nos.nope USING btree;
+                 DROP OPERATOR FAMILY s.fam2 USING btree CASCADE;
+                 CREATE OPERATOR FAMILY fam2 USING btree;
+                 DROP OPERATOR CLASS other USING btree;"
+            ),
+        ),
+    ]);
+}
