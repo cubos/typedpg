@@ -358,6 +358,7 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         node::Node::SecLabelStmt(s) => maintenance::security_label(s),
         node::Node::AlterDefaultPrivilegesStmt(s) => acl::alter_default_privileges(db, s),
         node::Node::ConstraintsSetStmt(s) => session::set_constraints(db, s),
+        node::Node::ExplainStmt(s) => session::explain(db, s),
         node::Node::CreateTableSpaceStmt(s) => cluster::create_tablespace(db, s),
         node::Node::DropTableSpaceStmt(s) => cluster::drop_tablespace(db, s),
         node::Node::CreateSubscriptionStmt(s) => cluster::create_subscription(db, s),
@@ -368,7 +369,6 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         | node::Node::AlterRoleStmt(_)
         | node::Node::AlterOperatorStmt(_)
         | node::Node::VariableShowStmt(_)
-        | node::Node::ExplainStmt(_)
         | node::Node::NotifyStmt(_)
         | node::Node::ListenStmt(_)
         | node::Node::UnlistenStmt(_)

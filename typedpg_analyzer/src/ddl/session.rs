@@ -626,6 +626,145 @@ fn split_identifier_string(value: &str) -> Vec<String> {
     out
 }
 
+/// `EXPLAIN [(options)] statement` (ExplainQuery): the options are
+/// validated (ParseExplainOptionList), then the statement is analyzed —
+/// and with ANALYZE, run.
+pub(crate) fn explain(
+    interp: &mut PgCatalog,
+    stmt: &typedpg_pg_query::protobuf::ExplainStmt,
+) -> Result<(), DdlError> {
+    let analyze = check_explain_options(&stmt.options)?;
+    let Some(query) = stmt.query.as_deref().and_then(|q| q.node.as_ref()) else {
+        return Ok(());
+    };
+    if analyze {
+        return super::apply_statement(interp, query);
+    }
+    match query {
+        node::Node::ExecuteStmt(e) => super::prepared::execute(interp, e),
+        node::Node::CreateTableAsStmt(ctas) => {
+            match ctas.query.as_deref().and_then(|q| q.node.as_ref()) {
+                Some(node::Node::ExecuteStmt(e)) => {
+                    super::prepared::lookup_execute(interp, e).map(drop)
+                }
+                Some(q) => super::dml::check_statement(interp, q),
+                None => Ok(()),
+            }
+        }
+        node::Node::DeclareCursorStmt(d) => d
+            .query
+            .as_deref()
+            .and_then(|q| q.node.as_ref())
+            .map_or(Ok(()), |q| super::dml::check_statement(interp, q)),
+        _ => super::dml::check_statement(interp, query),
+    }
+}
+
+/// ParseExplainOptionList; returns ANALYZE.
+fn check_explain_options(options: &[typedpg_pg_query::protobuf::Node]) -> Result<bool, DdlError> {
+    let boolean = |de: &typedpg_pg_query::protobuf::DefElem| -> Result<bool, DdlError> {
+        let value = match de.arg.as_deref().and_then(|a| a.node.as_ref()) {
+            None => return Ok(true),
+            Some(node::Node::Integer(i)) => match i.ival {
+                0 => Some(false),
+                1 => Some(true),
+                _ => None,
+            },
+            Some(node::Node::Boolean(b)) => Some(b.boolval),
+            Some(other) => match string_arg(other).map(|s| s.to_ascii_lowercase()) {
+                Some(s) if s == "true" || s == "on" => Some(true),
+                Some(s) if s == "false" || s == "off" => Some(false),
+                _ => None,
+            },
+        };
+        value.ok_or_else(|| DdlError::Parse(format!("{} requires a Boolean value", de.defname)))
+    };
+    let (mut analyze, mut wal, mut generic) = (false, false, false);
+    let (mut timing, mut serialize) = (None, false);
+    for opt in options {
+        let Some(node::Node::DefElem(de)) = opt.node.as_ref() else {
+            continue;
+        };
+        let text = || {
+            de.arg
+                .as_deref()
+                .and_then(|a| a.node.as_ref())
+                .and_then(string_arg)
+        };
+        match de.defname.as_str() {
+            "analyze" => analyze = boolean(de)?,
+            "verbose" | "costs" | "buffers" | "settings" | "summary" | "memory" => {
+                boolean(de)?;
+            }
+            "wal" => wal = boolean(de)?,
+            "generic_plan" => generic = boolean(de)?,
+            "timing" => timing = Some(boolean(de)?),
+            "serialize" => {
+                serialize = match text() {
+                    None => true,
+                    Some(v) if v == "off" || v == "none" => false,
+                    Some(v) if v == "text" || v == "binary" => true,
+                    Some(v) => {
+                        return Err(DdlError::Parse(format!(
+                            "unrecognized value for EXPLAIN option \"serialize\": \"{v}\""
+                        )));
+                    }
+                };
+            }
+            "format" => {
+                let v = text().unwrap_or_default();
+                if !matches!(v.as_str(), "text" | "xml" | "json" | "yaml") {
+                    return Err(DdlError::Parse(format!(
+                        "unrecognized value for EXPLAIN option \"format\": \"{v}\""
+                    )));
+                }
+            }
+            other => {
+                return Err(DdlError::Parse(format!(
+                    "unrecognized EXPLAIN option \"{other}\""
+                )));
+            }
+        }
+    }
+    let requires_analyze = |option: &str| {
+        Err(DdlError::Parse(format!(
+            "EXPLAIN option {option} requires ANALYZE"
+        )))
+    };
+    if wal && !analyze {
+        return requires_analyze("WAL");
+    }
+    if timing.unwrap_or(analyze) && !analyze {
+        return requires_analyze("TIMING");
+    }
+    if serialize && !analyze {
+        return requires_analyze("SERIALIZE");
+    }
+    if generic && analyze {
+        return Err(DdlError::Parse(
+            "EXPLAIN options ANALYZE and GENERIC_PLAN cannot be used together".into(),
+        ));
+    }
+    Ok(analyze)
+}
+
+/// defGetString of an option value.
+fn string_arg(n: &node::Node) -> Option<String> {
+    match n {
+        node::Node::String(s) => Some(s.sval.clone()),
+        node::Node::Integer(i) => Some(i.ival.to_string()),
+        node::Node::Float(f) => Some(f.fval.clone()),
+        node::Node::TypeName(tn) => Some(
+            tn.names
+                .iter()
+                .filter_map(super::util::node_string)
+                .collect::<Vec<_>>()
+                .join("."),
+        ),
+        _ => None,
+    }
+}
+
 /// `SET CONSTRAINTS { ALL | name [, ...] } { DEFERRED | IMMEDIATE }`
 /// (AfterTriggerSetState): each name must match a constraint in its schema
 /// — or, unqualified, in the first schema of the search path that has one

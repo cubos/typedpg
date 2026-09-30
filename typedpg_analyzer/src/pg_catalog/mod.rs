@@ -604,6 +604,7 @@ impl PgCatalog {
             ts_definitions: Default::default(),
             cluster_objects: Default::default(),
             transforms: Vec::new(),
+            prepared_statements: HashMap::new(),
             namespace_by_name: HashMap::new(),
             type_by_qname: HashMap::new(),
             class_by_qname: HashMap::new(),
@@ -660,7 +661,6 @@ impl PgCatalog {
             toast_tables: std::collections::HashSet::new(),
             attr_storage: HashMap::new(),
             column_deps: Default::default(),
-            prepared_statements: HashMap::new(),
             next_oid: USER_OID_START_NZ,
             #[cfg(feature = "pg_sanity")]
             pg_sanity: None,
@@ -1138,10 +1138,12 @@ impl PgCatalog {
 
     /// Roll the catalog back to `snapshot` (ROLLBACK, ROLLBACK TO
     /// SAVEPOINT, a failed statement). What isn't transactional stays: the
-    /// OID counter (PG never hands an OID out twice), and the state of the
-    /// statement being applied and of the sanity mirror.
+    /// OID counter (PG never hands an OID out twice), the session's
+    /// prepared statements, and the state of the statement being applied
+    /// and of the sanity mirror.
     pub(crate) fn roll_back_to(&mut self, snapshot: &PgCatalog) {
         let next_oid = self.next_oid;
+        let prepared_statements = std::mem::take(&mut self.prepared_statements);
         let statement_sql = self.statement_sql.take();
         let in_migration = self.in_migration;
         let installing_extension = self.installing_extension.take();
@@ -1149,6 +1151,7 @@ impl PgCatalog {
         let (tainted, skip) = (self.pg_sanity_tainted, self.pg_sanity_skip);
         *self = snapshot.clone();
         self.next_oid = next_oid.max(self.next_oid);
+        self.prepared_statements = prepared_statements;
         self.statement_sql = statement_sql;
         self.in_migration = in_migration;
         self.installing_extension = installing_extension;

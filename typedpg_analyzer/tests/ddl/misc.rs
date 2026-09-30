@@ -2435,6 +2435,68 @@ fn transaction_block_rules_follow_the_migration_runner() {
 }
 
 #[test]
+fn explain_checks_its_options_and_statement() {
+    // PG 18 ExplainQuery / ParseExplainOptionList: the options, then the
+    // statement is analyzed (run, with ANALYZE). Prepared statements are
+    // the session's: a ROLLBACK keeps them.
+    let setup = "CREATE TABLE t (a int);";
+    for (stmt, msg) in [
+        (
+            "EXPLAIN SELECT nope FROM t;",
+            "column \"nope\" does not exist",
+        ),
+        (
+            "EXPLAIN INSERT INTO t VALUES ('x');",
+            "invalid input syntax for type integer: \"x\"",
+        ),
+        (
+            "EXPLAIN (bogus) SELECT 1;",
+            "unrecognized EXPLAIN option \"bogus\"",
+        ),
+        (
+            "EXPLAIN (FORMAT csv) SELECT 1;",
+            "unrecognized value for EXPLAIN option \"format\": \"csv\"",
+        ),
+        (
+            "EXPLAIN (TIMING) SELECT 1;",
+            "EXPLAIN option TIMING requires ANALYZE",
+        ),
+        (
+            "EXPLAIN (ANALYZE, GENERIC_PLAN) SELECT 1;",
+            "EXPLAIN options ANALYZE and GENERIC_PLAN cannot be used together",
+        ),
+        (
+            "EXPLAIN CREATE TABLE x AS SELECT 1 AS a; SELECT a FROM x;",
+            "relation \"x\" does not exist",
+        ),
+        (
+            "EXPLAIN EXECUTE nosuch;",
+            "prepared statement \"nosuch\" does not exist",
+        ),
+        (
+            "EXPLAIN CREATE TABLE z AS EXECUTE nosuch;",
+            "prepared statement \"nosuch\" does not exist",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    let db = build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "EXPLAIN SELECT a FROM t;
+             EXPLAIN (ANALYZE, BUFFERS off, FORMAT json) INSERT INTO t VALUES (1);
+             EXPLAIN ANALYZE CREATE TABLE x AS SELECT 1 AS a;
+             PREPARE q AS SELECT a FROM t;",
+        ),
+        ("0003.sql", "BEGIN; PREPARE r AS SELECT 1; ROLLBACK;"),
+        ("0004.sql", "EXECUTE r; DEALLOCATE r; EXPLAIN EXECUTE q;"),
+    ]);
+    db.analyze("SELECT a FROM x").unwrap();
+}
+
+#[test]
 fn transaction_control_follows_the_transaction_block() {
     // PG 18 xact.c (DefineSavepoint, ReleaseSavepoint, RollbackToSavepoint,
     // EndTransactionBlock, PrepareTransactionBlock), PreventCommandIfReadOnly
