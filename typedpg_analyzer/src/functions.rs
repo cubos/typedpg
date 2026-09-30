@@ -190,11 +190,11 @@ pub(crate) fn func_get_detail(
     let nargs = arg_types.len();
     let candidates = func_candidates(snapshot, schema, name, nargs, notation);
 
-    // PG's wording keeps the user's schema qualifier — match it so the
-    // sanity-check prefix passes. `QualifiedName::Display` handles
-    // identifier quoting (and round-trips through PG's rules).
+    // PG's wording keeps the user's schema qualifier, joined raw:
+    // func_signature_string renders the name with NameListToString, which
+    // neither quotes nor escapes (`function pg_catalog.extract(...)`).
     let qualified = match schema {
-        Some(s) => crate::qualified_name::QualifiedName::new(s, name).to_string(),
+        Some(s) => format!("{s}.{name}"),
         None => name.to_string(),
     };
     // Render the call's actual arg types in PG-style names (int4 → integer,

@@ -669,6 +669,21 @@ fn extract_unresolved_reports_pg_catalog_qualified_name() {
     );
 }
 
+#[test]
+fn undefined_function_names_are_joined_raw_like_pg() {
+    // func_signature_string uses NameListToString: no quoting, no escaping,
+    // even for names quote_identifier would quote.
+    let db = setup();
+    let err = db
+        .analyze("SELECT public.\"Order\"(1), 1 FROM users")
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("function public.Order(integer) does not exist"),
+        "{err}"
+    );
+}
+
 // ── SQL value functions (CURRENT_DATE / CURRENT_USER / …) ────────────────────
 
 #[test]
