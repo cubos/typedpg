@@ -126,8 +126,12 @@ pub(crate) fn infer_indirection(
             }
             _ => {
                 return Err(AnalyzeError::Unsupported(format!(
-                    "unsupported indirection step: {:?}",
-                    steps[i].node.as_ref().map(std::mem::discriminant)
+                    "typedpg does not support {} in an indirection (`expr.field`, \
+                     `expr[i]`) yet",
+                    steps[i]
+                        .node
+                        .as_ref()
+                        .map_or_else(|| "an empty step".to_owned(), crate::error::node_kind)
                 )));
             }
         }

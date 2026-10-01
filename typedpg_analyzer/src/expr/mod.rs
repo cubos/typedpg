@@ -1072,10 +1072,15 @@ fn infer_expr_unlocated(
         node::Node::JsonIsPredicate(p) => infer_json_is_predicate(p, ctx, params),
         node::Node::XmlExpr(x) => infer_xml_expr(x, ctx, params),
         node::Node::XmlSerialize(xs) => infer_xml_serialize(xs, ctx, params),
-        _ => Err(AnalyzeError::Unsupported(format!(
-            "expression node type not supported: {:?}",
-            std::mem::discriminant(inner)
-        ))),
+        _ => Err(crate::error::RawError::unsupported(
+            format!(
+                "typedpg does not support {} expressions yet",
+                crate::error::node_kind(inner)
+            ),
+            crate::error::expr_span(node),
+            None,
+        )
+        .finalize_implicit()),
     }?;
 
     // PG runs the target type's input function on untyped string-literal

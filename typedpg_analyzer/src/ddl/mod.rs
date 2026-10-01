@@ -578,6 +578,10 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         node::Node::DiscardStmt(s) => prepared::discard(db, s),
 
         // ── Unknown DDL — surface as an error ───────────────────────
-        other => Err(DdlError::UnsupportedDdl(format!("{other:?}"))),
+        // Name the statement, never dump its tree.
+        other => Err(DdlError::UnsupportedDdl(format!(
+            "typedpg's migration interpreter does not support {} yet",
+            crate::error::statement_name(other)
+        ))),
     }
 }

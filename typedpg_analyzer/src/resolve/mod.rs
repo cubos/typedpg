@@ -441,10 +441,15 @@ fn analyze_raw_node_with(
                 node::Node::DeleteStmt(del) => analyze_delete(del, snapshot, &mut params)?,
                 node::Node::MergeStmt(merge) => analyze_merge(merge, snapshot, &mut params)?,
                 _ => {
-                    return Err(AnalyzeError::Unsupported(format!(
-                        "EXPLAIN with statement type: {:?}",
-                        std::mem::discriminant(inner)
-                    )));
+                    return Err(crate::error::RawError::unsupported(
+                        format!(
+                            "typedpg does not support EXPLAIN of {} yet",
+                            crate::error::statement_name(inner)
+                        ),
+                        crate::error::statement_span(),
+                        None,
+                    )
+                    .finalize_implicit());
                 }
             };
             (
@@ -469,10 +474,19 @@ fn analyze_raw_node_with(
             (Vec::new(), None)
         }
         _ => {
-            return Err(AnalyzeError::Unsupported(format!(
-                "statement type: {:?}",
-                std::mem::discriminant(stmt)
-            )));
+            return Err(crate::error::RawError::unsupported(
+                format!(
+                    "typedpg does not support {} statements in queries yet",
+                    crate::error::statement_name(stmt)
+                ),
+                crate::error::statement_span(),
+                Some(
+                    "a query can be SELECT, VALUES, INSERT, UPDATE, DELETE, MERGE, CALL, \
+                     EXPLAIN, NOTIFY, LISTEN or UNLISTEN; schema changes belong in migrations"
+                        .into(),
+                ),
+            )
+            .finalize_implicit());
         }
     };
 

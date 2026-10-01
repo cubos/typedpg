@@ -247,10 +247,15 @@ pub(crate) fn process_from_item(
             process_json_table(jt, scope, null_ctx, snapshot, params)?;
         }
         _ => {
-            return Err(AnalyzeError::Unsupported(format!(
-                "FROM item type: {:?}",
-                std::mem::discriminant(inner)
-            )));
+            return Err(crate::error::RawError::unsupported(
+                format!(
+                    "typedpg does not support {} in FROM yet",
+                    crate::error::node_kind(inner)
+                ),
+                crate::error::expr_span(node),
+                None,
+            )
+            .finalize_implicit());
         }
     }
     Ok(())
