@@ -11,6 +11,16 @@ use super::*;
 /// literal contents collapse to one. Twenty probes of `'<garbage>'::date`
 /// are one missing validator, not twenty findings.
 pub(crate) fn signature(div: &Divergence) -> String {
+    // A nullability report goes on with the scenario, parameters and
+    // seeding behind it: per-query detail, not part of the root cause.
+    let message = match div.message.find("\nscenario: ") {
+        Some(end) if div.kind == DivergenceKind::Nullability => &div.message[..end],
+        _ => div.message.as_str(),
+    };
+    let div = &Divergence {
+        kind: div.kind,
+        message: message.to_owned(),
+    };
     let stripped = match (div.message.find("SQL:\n---\n"), div.message.find("\n---\n")) {
         (Some(start), _) => {
             // Remove from "SQL:" up to and including the closing "---" line.
@@ -66,6 +76,15 @@ pub(crate) struct Finding {
     pub(crate) single_fault: bool,
 }
 
+impl Finding {
+    /// A finding that is a bug whatever the query's fault count: a single
+    /// fault's divergence, or unsound nullability (a valid query's rows
+    /// can't be "error-ordering noise").
+    pub(crate) fn high_signal(&self) -> bool {
+        self.single_fault || self.kind == DivergenceKind::Nullability
+    }
+}
+
 pub(crate) fn write_findings(out_dir: &str, findings: &BTreeMap<String, Finding>) {
     if findings.is_empty() {
         return;
@@ -75,16 +94,18 @@ pub(crate) fn write_findings(out_dir: &str, findings: &BTreeMap<String, Finding>
         return;
     }
     for (n, f) in findings.values().enumerate() {
-        // High-signal single-fault findings get a `single-` prefix so they
-        // sort first and are easy to triage; ordering-prone multi-fault ones
-        // get `multi-`.
-        let tier = if f.single_fault { "single" } else { "multi" };
+        // High-signal findings (single-fault, or unsound nullability) get a
+        // `high-` prefix so they sort first and are easy to triage;
+        // ordering-prone multi-fault ones get `multi-`.
+        let tier = if f.high_signal() { "high" } else { "multi" };
         let path = format!("{out_dir}/{tier}-{:?}-{n:03}.sql", f.kind);
         let body = format!(
             "-- divergence kind: {:?}{}\n-- {}\n--\n-- full report:\n{}\n\n{};\n",
             f.kind,
             if f.single_fault {
                 " (single-fault, high signal)"
+            } else if f.high_signal() {
+                " (high signal)"
             } else {
                 " (multi-fault — may be error-ordering, not a bug)"
             },
@@ -122,13 +143,13 @@ pub(crate) fn print_summary(iters: u32, findings: &BTreeMap<String, Finding>) {
         *by_kind.entry(format!("{:?}", f.kind)).or_default() += 1;
         *by_family.entry(family(f)).or_default() += 1;
     }
-    let single = findings.values().filter(|f| f.single_fault).count();
+    let high = findings.values().filter(|f| f.high_signal()).count();
     eprintln!("\n──── fuzz summary ────");
     eprintln!("iterations:        {iters}");
     eprintln!("unique divergences: {}", findings.len());
     eprintln!(
-        "  single-fault (high signal): {single}   multi-fault (may be ordering): {}",
-        findings.len() - single
+        "  high signal (single-fault or nullability): {high}   multi-fault (may be ordering): {}",
+        findings.len() - high
     );
     for (kind, count) in &by_kind {
         eprintln!("  {kind:<24} {count}");
