@@ -90,15 +90,14 @@
 //! use_transaction = true                  # optional, wrap each migration in a tx
 //! fail_on_drift = true                    # optional, abort if applied migration changed
 //!
-//! [package.metadata.typedpg.domains]
-//! user_preferences = "crate::UserPrefs"   # optional, JSONB domain mappings
-//!
-//! [package.metadata.typedpg.enums]
-//! user_role = "crate::UserRole"           # optional, PG enum mappings
-//!
-//! [package.metadata.typedpg.types]
-//! "extensions.ltree" = "String"           # optional, custom PG → Rust type mappings
+//! [package.metadata.typedpg.types]          # optional, PG type → Rust type
+//! user_preferences = "crate::UserPrefs"   # a JSONB domain (serde)
+//! user_role = "crate::UserRole"           # an enum (Display + FromStr)
+//! "public.address" = "crate::Address"     # a composite (rebuilt field by field)
+//! "extensions.ltree" = "String"           # any other type (ToSql + FromSql)
 //! ```
+//!
+//! A key typedpg does not know is a compile error, not silently ignored.
 //!
 //! Crates that talk to more than one database declare each additional one
 //! under `[package.metadata.typedpg.databases.<name>]` (same shape: `database`,
@@ -212,7 +211,7 @@
 //! in `Cargo.toml`:
 //!
 //! ```toml
-//! [package.metadata.typedpg.domains]
+//! [package.metadata.typedpg.types]
 //! user_preferences = "crate::domains::UserPreferences"
 //! ```
 //!
