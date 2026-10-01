@@ -1200,7 +1200,9 @@ fn untyped_param_in_list_with_mixed_types_is_inconsistent() {
 /// not an internal analyzer error.
 #[test]
 fn spread_without_field_list_is_a_user_error() {
-    let db = setup();
+    let mut db = setup();
+    // `$..spread` is typedpg syntax: PG has no counterpart error to match.
+    db.skip_pg_sanity();
     assert_err_prefix!(
         db.analyze("INSERT INTO users (id, name, email) VALUES $..items"),
         AnalyzeError::Invalid(_),
