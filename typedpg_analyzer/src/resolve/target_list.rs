@@ -229,7 +229,7 @@ pub(crate) fn resolve_target_list_explicit(
         // SRF-as-target-list case where the expression itself is the call.
         let record_fields = expr_type.record_fields.or_else(|| {
             if let Some(node::Node::FuncCall(fc)) = val.node.as_ref() {
-                resolve_funccall_record_fields(fc, snapshot, params)
+                resolve_funccall_record_fields(fc, snapshot, params).map(Into::into)
             } else {
                 None
             }

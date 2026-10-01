@@ -920,19 +920,42 @@ fn cast_to_text_drops_shape() {
 }
 
 #[test]
-fn union_drops_shape_conservatively() {
+fn union_keeps_a_shape_both_arms_agree_on() {
     let db = setup();
-    // Both branches produce a record with the same arity, but the analyzer
-    // takes the conservative path: shape is dropped at set-op boundaries
-    // (matches PG's typmod-collapse to -1 for records that flow through a
-    // set operation).
+    // Both arms produce the same row shape: the column keeps it, a field
+    // NULL where either arm's is.
     let s = db
         .analyze(
             "SELECT ROW(1::int4, 'x'::text) AS r \
-             UNION ALL SELECT ROW(2::int4, 'y'::text) AS r",
+             UNION ALL SELECT ROW(2::int4, NULL::text) AS r",
         )
         .unwrap();
-    // OID is `record` pseudo-type, not `AnonymousRecord` — shape lost.
+    assert_eq!(
+        col(&s, "r").pg_type,
+        anon_record(vec![rf("f1", int4()), rfn("f2", text())])
+    );
+    // PG reads the shape off the left arm (`expandRecordVariable`), so a
+    // field of the column resolves through the set operation.
+    let s = db
+        .analyze(
+            "SELECT (u.r).f2 AS f2 FROM (SELECT ROW(1::int4, 'x'::text) AS r \
+             UNION ALL SELECT ROW(2::int4, 'y'::text)) u",
+        )
+        .unwrap();
+    assert_cols(&s, vec![c("f2", text())]);
+}
+
+#[test]
+fn union_drops_a_shape_the_arms_disagree_on() {
+    let db = setup();
+    // `record` unifies with `record` whatever the fields: rows of either
+    // shape come out, so the column has no static shape.
+    let s = db
+        .analyze(
+            "SELECT ROW(1::int4, 'x'::text) AS r \
+             UNION ALL SELECT ROW(2::int4) AS r",
+        )
+        .unwrap();
     assert_eq!(col(&s, "r").pg_type, basic("pg_catalog", "record"));
 }
 
@@ -1149,18 +1172,59 @@ fn row_param_against_composite_column() {
 // ── Indirection — chains and edge cases ──────────────────────────────────────
 
 #[test]
-fn deep_nested_row_indirection() {
-    // Triple-nested ROW with field access through every level. Real PG
-    // rejects deep indirection past the first ROW level (intermediate
-    // ROWs lose their column-name typmod after the first `.fN` step), but
-    // the analyzer threads `record_fields` through every step and
-    // resolves it cleanly. Useful intentionally — opt out of the mirror.
-    let mut db = setup();
-    db.skip_pg_sanity();
+fn deep_nested_row_indirection_is_rejected() {
+    // A field selected out of a ROW is a FieldSelect PG types as plain
+    // `record`, with no tuple descriptor: selecting from it again fails at
+    // the second step, as in PG.
+    let db = setup();
+    assert_err_prefix!(
+        db.analyze(
+            "SELECT ((ROW(1::int4, ROW('a'::text, ROW(true, NULL::int8)))).f2.f2).f1 AS deep"
+        ),
+        AnalyzeError::UndefinedColumn(_),
+        "could not identify column \"f2\" in record data type"
+    );
+    // The selected record itself comes back with its fields.
     let s = db
-        .analyze("SELECT ((ROW(1::int4, ROW('a'::text, ROW(true, NULL::int8)))).f2.f2).f1 AS deep")
+        .analyze("SELECT (ROW(1::int4, ROW('a'::text, 2::int4))).f2 AS r")
         .unwrap();
-    assert_eq!(col(&s, "deep").pg_type, bool_ty());
+    assert_eq!(
+        col(&s, "r").pg_type,
+        anon_record(vec![rf("f1", text()), rf("f2", int4())])
+    );
+}
+
+#[test]
+fn record_selected_from_a_record_has_no_shape_for_pg() {
+    let db = setup();
+    // Through a subquery's column PG's expandRecordVariable fails before
+    // looking at the field; `.*` and a projection call fail the same way.
+    for sql in [
+        "SELECT (s.x).f1 FROM (SELECT (ROW(1, ROW(2, 3))).f2 AS x) s",
+        "WITH c AS (SELECT (ROW(1, ROW(2, 3))).f2 AS x) SELECT (x).f1 FROM c",
+        "SELECT (s.x).* FROM (SELECT (ROW(1, ROW(2, 3))).f2 AS x) s",
+        "SELECT ((ROW(1, ROW(2, 3))).f2).*",
+        "SELECT f1(s.x) FROM (SELECT (ROW(1, ROW(2, 3))).f2 AS x) s",
+        // A VALUES cell has no shape for PG either.
+        "SELECT (s.x).f1 FROM (VALUES (ROW(1, 2))) s(x)",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::WrongObjectType(_),
+            "record type has not been registered"
+        );
+    }
+    // Called as a function on the expression, no function matches.
+    assert_err_prefix!(
+        db.analyze("SELECT f1((ROW(1, ROW(2, 3))).f2)"),
+        AnalyzeError::UndefinedFunction(_),
+        "function f1(record) does not exist"
+    );
+    // A function taking any record still accepts it.
+    let s = db
+        .analyze("SELECT row_to_json(s.x) AS j FROM (SELECT (ROW(1, ROW(2, 3))).f2 AS x) s")
+        .unwrap();
+    assert_cols(&s, vec![c("j", json_ty())]);
 }
 
 #[test]
@@ -1485,22 +1549,27 @@ fn row_constructor_with_named_aliases_in_subquery() {
 }
 
 #[test]
-fn nested_anonymous_records_via_subquery_pipeline() {
+fn nested_anonymous_records_via_subquery_pipeline_is_rejected() {
     // Pipeline: build a ROW with a nested ROW inside, push it through a
-    // subquery, then drill into the nested field at the outer level.
-    // Same analyzer-extension as `deep_nested_row_indirection` — PG's
-    // record typmod stops working past one indirection step, but the
-    // analyzer threads the inline record shape through the subquery
-    // boundary. Opt out of the mirror.
-    let mut db = setup();
-    db.skip_pg_sanity();
-    let s = db
-        .analyze(
+    // subquery, then drill into the nested field at the outer level. The
+    // first step resolves (PG follows `t.r` to the ROW); the second
+    // selects from a FieldSelect of type `record`, which PG can't.
+    let db = setup();
+    assert_err_prefix!(
+        db.analyze(
             "SELECT ((t.r).f2).f1 AS x \
              FROM (SELECT ROW(1::int4, ROW('a'::text, 2::int4)) AS r) t",
-        )
+        ),
+        AnalyzeError::UndefinedColumn(_),
+        "could not identify column \"f1\" in record data type"
+    );
+    let s = db
+        .analyze("SELECT (t.r).f2 AS x FROM (SELECT ROW(1::int4, ROW('a'::text, 2::int4)) AS r) t")
         .unwrap();
-    assert_eq!(col(&s, "x").pg_type, text());
+    assert_eq!(
+        col(&s, "x").pg_type,
+        anon_record(vec![rf("f1", text()), rf("f2", int4())])
+    );
 }
 
 #[test]

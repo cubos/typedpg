@@ -223,10 +223,95 @@ pub(crate) struct ExprType {
     /// column. Explicit collations win over implicit ones, and two
     /// different explicit ones meeting in one expression are an error.
     pub explicit_collation: bool,
-    pub record_fields: Option<Vec<RecordField>>,
+    pub record_fields: Option<RecordShape>,
     /// For an array value, whether its elements can be NULL, where known
     /// (see [`crate::types::Type::Array`]); `None` otherwise.
     pub elem_nullable: Option<bool>,
+}
+
+/// The row shape of a record value: its fields, and whether PostgreSQL
+/// sees them too while parsing.
+///
+/// The analyzer keeps a shape PG loses: a field selected out of a record
+/// that is itself a record (`(ROW(1, ROW(2, 3))).f2`) is a `FieldSelect`
+/// whose result PG types as plain `record` (typmod -1), with no tuple
+/// descriptor `get_expr_result_tupdesc` could find. The value still comes
+/// back with its fields (the shape describes it to the macro), but PG
+/// rejects selecting from it again: `could not identify column … in record
+/// data type` on the expression, `record type has not been registered`
+/// through a subquery's column (`expandRecordVariable`) or for `.*`.
+#[derive(Debug, Clone)]
+pub(crate) struct RecordShape {
+    pub fields: Vec<RecordField>,
+    /// PG has no tuple descriptor for this shape.
+    pub hidden: bool,
+}
+
+impl RecordShape {
+    /// The shape PG can't see, of a value selected out of another record
+    /// or read from a VALUES list.
+    pub fn hidden(fields: Vec<RecordField>) -> Self {
+        Self {
+            fields,
+            hidden: true,
+        }
+    }
+}
+
+/// The row shape of a set operation's record column from its arms'. PG
+/// takes the left arm's (what `expandRecordVariable` follows), so whether
+/// it is hidden is the left's; the analyzer keeps a shape only when both
+/// arms agree on it field for field, a field NULL where a row that can
+/// come out (either arm's for UNION, the left one's otherwise) has it NULL.
+pub(crate) fn merge_set_op_shapes(
+    left: Option<&RecordShape>,
+    right: Option<&RecordShape>,
+    union: bool,
+) -> Option<RecordShape> {
+    let (left, right) = (left?, right?);
+    if left.len() != right.len() {
+        return None;
+    }
+    let mut fields = Vec::with_capacity(left.len());
+    for (l, r) in left.iter().zip(right.iter()) {
+        if l.ty.type_oid != r.ty.type_oid {
+            return None;
+        }
+        let mut ty = l.ty.clone();
+        if union {
+            ty.nullable |= r.ty.nullable;
+            ty.elem_nullable = merge_elem_nullable([l.ty.elem_nullable, r.ty.elem_nullable]);
+            ty.record_fields = match (&l.ty.record_fields, &r.ty.record_fields) {
+                (None, None) => None,
+                (l, r) => merge_set_op_shapes(l.as_ref(), r.as_ref(), true),
+            };
+        }
+        fields.push(RecordField {
+            name: l.name.clone(),
+            ty,
+        });
+    }
+    Some(RecordShape {
+        fields,
+        hidden: left.hidden,
+    })
+}
+
+impl From<Vec<RecordField>> for RecordShape {
+    fn from(fields: Vec<RecordField>) -> Self {
+        Self {
+            fields,
+            hidden: false,
+        }
+    }
+}
+
+impl std::ops::Deref for RecordShape {
+    type Target = [RecordField];
+
+    fn deref(&self) -> &[RecordField] {
+        &self.fields
+    }
 }
 
 /// One element of an anonymous record's static shape, as it flows through
@@ -905,7 +990,7 @@ fn infer_expr_unlocated(
                 typmod: None,
                 collation: None,
                 explicit_collation: false,
-                record_fields: Some(fields),
+                record_fields: Some(fields.into()),
                 elem_nullable: None,
             })
         }

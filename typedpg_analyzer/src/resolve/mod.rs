@@ -898,7 +898,7 @@ pub(crate) struct RawColumn {
     /// SRF out_args, ROW constructors, or propagated through subqueries.
     /// Used both to surface `Type::AnonymousRecord` in the final output and
     /// to feed downstream `(x).field` resolution via the scope.
-    pub record_fields: Option<Vec<crate::expr::RecordField>>,
+    pub record_fields: Option<crate::expr::RecordShape>,
     /// For an array column, whether its elements can be NULL, where known
     /// (see [`crate::types::Type::Array`]).
     pub elem_nullable: Option<bool>,

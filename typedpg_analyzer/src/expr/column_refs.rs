@@ -250,7 +250,7 @@ fn whole_row_ref(
             }
         }
         return Ok(ExprType {
-            record_fields: Some(shape),
+            record_fields: Some(shape.into()),
             ..ExprType::scalar(composite_oid, whole_row_nullable(source, null_ctx))
         });
     }
@@ -283,7 +283,7 @@ fn whole_row_ref(
         typmod: None,
         collation: None,
         explicit_collation: false,
-        record_fields: Some(shape_of_columns(&source.columns)),
+        record_fields: Some(shape_of_columns(&source.columns).into()),
         elem_nullable: None,
     })
 }
