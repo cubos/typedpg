@@ -1106,9 +1106,14 @@ fn check_group_target_has_no_aggregates(
     {
         let kinds = expr::detect_func_kinds(val, snapshot);
         if kinds.has_aggregate || kinds.has_grouping {
-            return Err(AnalyzeError::GroupingError(
-                "aggregate functions are not allowed in GROUP BY".into(),
-            ));
+            return Err(crate::error::RawError::new(
+                AnalyzeError::GroupingError(
+                    "aggregate functions are not allowed in GROUP BY".into(),
+                ),
+                kinds.aggregate_span(),
+                None,
+            )
+            .finalize_implicit());
         }
     }
     Ok(())

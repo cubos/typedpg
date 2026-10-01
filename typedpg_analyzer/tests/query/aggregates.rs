@@ -342,7 +342,55 @@ fn nested_aggregate_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT SUM(COUNT(*)) FROM posts GROUP BY user_id"),
         AnalyzeError::GroupingError(_),
-        "aggregate function calls cannot be nested",
+        concat!(
+            "aggregate function calls cannot be nested\n",
+            "  ╭────\n",
+            "1 │ SELECT SUM(COUNT(*)) FROM posts GROUP BY user_id\n",
+            "  ·            ─────\n",
+            "  ╰────\n",
+            "  help: compute the inner aggregate in a subquery, e.g. `SELECT max(n) FROM (SELECT count(*) AS n FROM t GROUP BY g) s`\n",
+        ),
+    );
+}
+
+#[test]
+fn aggregate_placement_errors_point_at_the_call() {
+    let db = setup();
+    // A GROUP BY ordinal naming an aggregate output: PG points at the call.
+    assert_analyze_err!(
+        db.analyze("SELECT count(*) FROM posts GROUP BY 1"),
+        AnalyzeError::GroupingError(_),
+        "\
+aggregate functions are not allowed in GROUP BY
+  ╭────
+1 │ SELECT count(*) FROM posts GROUP BY 1
+  ·        ─────
+  ╰────
+",
+    );
+    assert_analyze_err!(
+        db.analyze("SELECT json_agg(json_agg(id)) FROM posts"),
+        AnalyzeError::GroupingError(_),
+        "\
+aggregate function calls cannot be nested
+  ╭────
+1 │ SELECT json_agg(json_agg(id)) FROM posts
+  ·                 ────────
+  ╰────
+  help: compute the inner aggregate in a subquery, e.g. `SELECT max(n) FROM (SELECT count(*) AS n FROM t GROUP BY g) s`
+",
+    );
+    assert_analyze_err!(
+        db.analyze("SELECT JSON_ARRAYAGG(count(*)) FROM posts"),
+        AnalyzeError::GroupingError(_),
+        "\
+aggregate function calls cannot be nested
+  ╭────
+1 │ SELECT JSON_ARRAYAGG(count(*)) FROM posts
+  ·                      ─────
+  ╰────
+  help: compute the inner aggregate in a subquery, e.g. `SELECT max(n) FROM (SELECT count(*) AS n FROM t GROUP BY g) s`
+",
     );
 }
 
@@ -355,7 +403,13 @@ fn window_function_in_aggregate_argument_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT SUM(ROW_NUMBER() OVER ()) FROM posts"),
         AnalyzeError::GroupingError(_),
-        "aggregate function calls cannot contain window function calls",
+        concat!(
+            "aggregate function calls cannot contain window function calls\n",
+            "  ╭────\n",
+            "1 │ SELECT SUM(ROW_NUMBER() OVER ()) FROM posts\n",
+            "  ·            ──────────\n",
+            "  ╰────\n",
+        ),
     );
 }
 
