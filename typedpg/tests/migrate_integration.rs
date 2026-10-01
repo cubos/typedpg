@@ -401,6 +401,37 @@ async fn drift_is_a_warning_without_fail_on_drift() {
     assert!(statuses[1].applied && !statuses[1].drifted);
 }
 
+/// Drift compares the migration text as applied, whatever the database
+/// encoding: hashing it server-side (`md5(sql_source)`) would hash LATIN1
+/// bytes and see drift in every migration with a non-ASCII character.
+#[tokio::test]
+async fn no_false_drift_on_a_non_utf8_database() {
+    let server = typedpg_test_support::server();
+    let admin = server.connect("postgres").await;
+    let db = format!("migrate_latin1_{}", std::process::id());
+    admin
+        .batch_execute(&format!(
+            "CREATE DATABASE {db} ENCODING 'LATIN1' LC_COLLATE 'C' LC_CTYPE 'C' \
+             TEMPLATE template0"
+        ))
+        .await
+        .unwrap();
+    let mut client = server.connect(&db).await;
+    let source = MigrationSource::from_embedded([(
+        "0001_cafe",
+        "CREATE TABLE cafe (name TEXT DEFAULT 'café');",
+        None,
+    )])
+    .unwrap();
+    let config = MigrationsConfig::default();
+
+    migrate::run(&mut client, &source, &config).await.unwrap();
+    let again = migrate::run(&mut client, &source, &config).await.unwrap();
+    assert!(again.is_empty());
+    let statuses = migrate::status(&client, &source, &config).await.unwrap();
+    assert!(statuses[0].applied && !statuses[0].drifted);
+}
+
 /// Two runners racing on a fresh database (two replicas booting at once):
 /// both succeed and every migration applies exactly once. The tracking
 /// table must be created under the advisory lock — two concurrent
