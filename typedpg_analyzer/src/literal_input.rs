@@ -351,9 +351,27 @@ fn parse_radix_digits(s: &mut &str) -> Option<(u32, String)> {
     }
 }
 
+/// The radix and digits `strtoul(s, &end, 0)` reads from an unsigned
+/// digit run that must be consumed whole: `0x` hex, `0b` binary (glibc
+/// 2.38+ under `_GNU_SOURCE`, as PG builds), a leading `0` octal, decimal
+/// otherwise — no underscores, no `0o`. `None` when `s` isn't such a run.
+fn strtoul_base0(s: &str) -> Option<(u32, &str)> {
+    let (radix, digits) = if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X"))
+    {
+        (16, rest)
+    } else if let Some(rest) = s.strip_prefix("0b").or_else(|| s.strip_prefix("0B")) {
+        (2, rest)
+    } else if s.starts_with('0') {
+        (8, s)
+    } else {
+        (10, s)
+    };
+    (!digits.is_empty() && digits.chars().all(|c| c.is_digit(radix))).then_some((radix, digits))
+}
+
 /// Mirrors `uint32in_subr` (numutils.c): `strtoul` semantics — optional
-/// whitespace and sign, decimal or `0x`-prefixed digits, **no** underscores
-/// or `0o`/`0b`. The range check follows strtoul's wrap-around acceptance:
+/// whitespace and sign, then a digit run read with base 0 (see
+/// [`strtoul_base0`]). The range check follows strtoul's wrap-around acceptance:
 /// a value is in range when it fits `uint32`, or when it's negative and its
 /// magnitude fits `int32` (so `'-1'::oid` is 4294967295 but
 /// `'-4294967295'::oid` is out of range) — verified against PG 18.
@@ -368,13 +386,9 @@ fn validate_oid(content: &str) -> Result<(), String> {
         }
         None => false,
     };
-    let (radix, digits) = match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        Some(rest) => (16, rest),
-        None => (10, s),
-    };
-    if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
+    let Some((radix, digits)) = strtoul_base0(s) else {
         return Err(syntax_err());
-    }
+    };
     let in_range = match u64::from_str_radix(digits, radix) {
         Ok(v) if negative => v <= i32::MAX as u64 + 1,
         Ok(v) => v <= u32::MAX as u64,
@@ -1167,21 +1181,13 @@ fn validate_pg_lsn(content: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// `xid` / `xid8` / `cid` parse via strtoul-style rules on PG 18: decimal
-/// digits or a `0x` hex prefix (bare hex like `ff` is rejected), optional
-/// sign (the parse wraps like strtoul). No range check.
+/// `xid` / `xid8` / `cid` parse via strtoul-style rules on PG 18: an
+/// optional sign, then a base-0 digit run (see [`strtoul_base0`]; bare hex
+/// like `ff` is rejected). The parse wraps like strtoul: no range check.
 fn validate_xid(content: &str, name: &str) -> Result<(), String> {
     let s = content.trim_matches(|c: char| c.is_ascii_whitespace());
-    let mut digits = s.strip_prefix(['+', '-']).unwrap_or(s);
-    let mut radix = 10;
-    if let Some(rest) = digits
-        .strip_prefix("0x")
-        .or_else(|| digits.strip_prefix("0X"))
-    {
-        digits = rest;
-        radix = 16;
-    }
-    if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
+    let digits = s.strip_prefix(['+', '-']).unwrap_or(s);
+    if strtoul_base0(digits).is_none() {
         return Err(format!(
             "invalid input syntax for type {name}: \"{content}\""
         ));
@@ -1600,11 +1606,22 @@ mod tests {
 
     #[test]
     fn oid_inputs() {
-        for ok in [" 42 ", "-1", "0x10", "+7"] {
+        // strtoul base 0: hex, octal (leading 0) and, on glibc 2.38+,
+        // binary — '0b101' is 5, '017' is 15 on PG 18.
+        for ok in [" 42 ", "-1", "0x10", "+7", "017", "0", "0b101", "0B1"] {
             assert!(validate_oid(ok).is_ok(), "{ok:?} should be valid");
         }
-        for bad in ["", "1_0", "42x", "0x", "hello"] {
+        for bad in ["", "1_0", "42x", "0x", "hello", "08", "0b", "0b2", "0o17"] {
             assert!(validate_oid(bad).is_err(), "{bad:?} should be invalid");
+        }
+        for ok in ["017", "0b101", "-0x1F"] {
+            assert!(validate_xid(ok, "xid8").is_ok(), "{ok:?} should be valid");
+        }
+        for bad in ["09", "0b", "0o1"] {
+            assert!(
+                validate_xid(bad, "xid").is_err(),
+                "{bad:?} should be invalid"
+            );
         }
     }
 }
