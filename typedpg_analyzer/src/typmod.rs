@@ -355,34 +355,11 @@ pub fn check_literal_assignment(
 ) -> Option<AnalyzeError> {
     let decoded = decode(snapshot, type_oid, typmod);
     match decoded {
-        DecodedTypmod::Length(n)
-            if matches!(
-                (
-                    type_oid,
-                    snapshot.get_type(type_oid).map(|t| t.typname.as_str())
-                ),
-                (builtin_oid::VARCHAR | builtin_oid::BPCHAR, _)
-            ) =>
+        DecodedTypmod::Length(_)
+            if matches!(type_oid, builtin_oid::VARCHAR | builtin_oid::BPCHAR) =>
         {
             let s = string_literal(value)?;
-            if s.chars().count() as i32 > n {
-                // Match PG's wording: SQL-standard names instead of the
-                // catalog `typname` so error messages line up across
-                // tooling (e.g. `\d+` output / sqlstate-driven UIs).
-                let typ_label = match type_oid {
-                    builtin_oid::VARCHAR => "character varying".to_string(),
-                    builtin_oid::BPCHAR => "character".to_string(),
-                    _ => snapshot
-                        .get_type(type_oid)
-                        .map(|t| t.typname.clone())
-                        .unwrap_or_else(|| "character varying".into()),
-                };
-                Some(AnalyzeError::Invalid(format!(
-                    "value too long for type {typ_label}({n})"
-                )))
-            } else {
-                None
-            }
+            char_length_violation(snapshot, type_oid, typmod, s).map(AnalyzeError::Invalid)
         }
         DecodedTypmod::Numeric { precision, scale } => {
             let raw = numeric_literal_string(value)?;
@@ -406,6 +383,34 @@ pub fn check_literal_assignment(
         }
         _ => None,
     }
+}
+
+/// `varchar_input` / `bpchar_input`: a `varchar(n)` / `char(n)` value
+/// longer than `n` characters is an error unless every character past the
+/// `n`th is a space (those are dropped). `None` for other types or a value
+/// that fits.
+pub(crate) fn char_length_violation(
+    snapshot: &PgCatalog,
+    type_oid: PgTypeOid,
+    typmod: Option<i32>,
+    s: &str,
+) -> Option<String> {
+    let DecodedTypmod::Length(n) = decode(snapshot, type_oid, typmod) else {
+        return None;
+    };
+    // Match PG's wording: SQL-standard names instead of the catalog
+    // `typname` so error messages line up across tooling (e.g. `\d+`
+    // output / sqlstate-driven UIs).
+    let typ_label = match type_oid {
+        builtin_oid::VARCHAR => "character varying",
+        builtin_oid::BPCHAR => "character",
+        _ => return None,
+    };
+    let excess_not_blank = s
+        .chars()
+        .skip(usize::try_from(n).unwrap_or(0))
+        .any(|c| c != ' ');
+    excess_not_blank.then(|| format!("value too long for type {typ_label}({n})"))
 }
 
 fn string_literal(node: &Node) -> Option<&str> {
