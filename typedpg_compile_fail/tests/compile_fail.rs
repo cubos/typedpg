@@ -6,6 +6,10 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
 
+/// The toolchain the snapshots are taken with (see the comment where it
+/// runs).
+const TOOLCHAIN: &str = "1.99.0";
+
 fn bless() -> bool {
     ["BLESS", "TYPEDPG_BLESS"]
         .iter()
@@ -32,8 +36,11 @@ fn compile_fail_snapshots() {
     assert!(!cases.is_empty(), "no cases under fixture/src/bin");
 
     let target_dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("compile-fail");
-    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let output = Command::new(cargo)
+    // rustc's own help and note lines change between releases, so the
+    // snapshots are checked with one pinned toolchain, whatever runs the
+    // tests: bump TOOLCHAIN (and CI's install step) and re-bless together.
+    let output = Command::new("rustup")
+        .args(["run", TOOLCHAIN, "cargo"])
         .args(["check", "--bins", "--keep-going", "--message-format=json"])
         .arg("--manifest-path")
         .arg(fixture.join("Cargo.toml"))
@@ -46,8 +53,21 @@ fn compile_fail_snapshots() {
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
         .env_remove("CARGO_TARGET_DIR")
         .env_remove("CARGO_BUILD_TARGET_DIR")
+        .env_remove("RUSTUP_TOOLCHAIN")
+        .env_remove("RUSTC")
+        .env_remove("RUSTC_WRAPPER")
         .output()
-        .expect("run cargo check on the fixture");
+        .unwrap_or_else(|e| {
+            panic!(
+                "run `rustup run {TOOLCHAIN} cargo check` on the fixture ({e}); install the \
+                 pinned toolchain with `rustup toolchain install {TOOLCHAIN} --profile minimal`"
+            )
+        });
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("is not installed"),
+        "the pinned toolchain {TOOLCHAIN} is not installed: run `rustup toolchain install \
+         {TOOLCHAIN} --profile minimal`"
+    );
 
     let mut errors: BTreeMap<String, String> = BTreeMap::new();
     let mut foreign = String::new();

@@ -2,7 +2,10 @@ error[E0277]: `$id` expects a value for SQL type bigint NOT NULL, not `Option<i6
  --> src/bin/sql_option_for_non_null_param.rs:5:5
   |
 5 |     typedpg::sql!(db, "SELECT name FROM users WHERE id = $id")
-  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected a value for bigint
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |     |
+  |     `Option<i64>` doesn't satisfy the trait bound
+  |     expected a value for bigint
   |
   = help: the trait `__TypedpgBind0` is not implemented for `Option<i64>`
   = note: `$id` takes `i64`, or any value with `Into<i64>`

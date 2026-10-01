@@ -18,7 +18,8 @@ note: required for `Id` to implement `FromQueryRow<__sql_columns>`
    |        ^^
  6 |     id: i32,
    |     -- unsatisfied trait bound
-   = help: consider manually implementing `FromQueryRow<__sql_columns>` to avoid undesired bounds
+   = help: consider manually implementing `FromQueryRow<__sql_columns>` to avoid undesired bounds caused by "imperfect derives"
+   = note: to learn more, visit <https://github.com/rust-lang/rust/issues/26925>
 note: required by a bound in `__typedpg_query::<__E>::fetch_optional_as`
   --> src/bin/from_row_wrong_field_type.rs:10:25
    |

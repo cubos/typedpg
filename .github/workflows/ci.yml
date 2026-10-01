@@ -28,6 +28,9 @@ jobs:
           components: rustfmt, clippy
       - uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
+      # The compile-fail snapshots are taken with one pinned toolchain
+      # (TOOLCHAIN in typedpg_compile_fail/tests/compile_fail.rs).
+      - run: rustup toolchain install 1.99.0 --profile minimal
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo clippy -p typedpg_analyzer --all-targets --features pg_sanity -- -D warnings
