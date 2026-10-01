@@ -435,7 +435,11 @@ async fn revert_inner(
                 let tx = client.transaction().await?;
 
                 tx.batch_execute(down_sql).await.map_err(|e| {
-                    crate::Error::Migration(format!("failed to revert migration {}: {}", name, e))
+                    crate::Error::Migration(format!(
+                        "failed to revert migration {}: {}",
+                        name,
+                        format_pg_error(&e)
+                    ))
                 })?;
 
                 tx.execute(
@@ -447,7 +451,11 @@ async fn revert_inner(
                 tx.commit().await?;
             } else {
                 client.batch_execute(down_sql).await.map_err(|e| {
-                    crate::Error::Migration(format!("failed to revert migration {}: {}", name, e))
+                    crate::Error::Migration(format!(
+                        "failed to revert migration {}: {}",
+                        name,
+                        format_pg_error(&e)
+                    ))
                 })?;
 
                 client

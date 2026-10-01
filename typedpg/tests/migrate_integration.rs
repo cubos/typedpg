@@ -228,6 +228,40 @@ async fn revert_not_applied_errors() {
     assert!(err.contains("not applied"), "unexpected error: {err}");
 }
 
+/// A down migration that fails reports the server's error and leaves the
+/// migration applied, its effects untouched.
+#[tokio::test]
+async fn failing_down_migration_reports_the_server_error() {
+    let (mut client, _db) = fresh_db().await;
+    let dir = tempfile::tempdir().unwrap();
+    create_test_migrations(dir.path());
+    write(
+        dir.path(),
+        "20260319120000_create_orders.down.sql",
+        "DROP TABLE orders; DROP TABLE no_such_table;",
+    );
+    let source = MigrationSource::from_dir(dir.path()).unwrap();
+    let config = MigrationsConfig::default();
+    migrate::run(&mut client, &source, &config).await.unwrap();
+
+    let err = migrate::revert(&mut client, &source, ORDERS, false, &config)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains(&format!("failed to revert migration {ORDERS}"))
+            && err.contains("table \"no_such_table\" does not exist"),
+        "unexpected error: {err}"
+    );
+
+    assert!(
+        table_exists(&client, "orders").await,
+        "the down SQL rolled back"
+    );
+    let statuses = migrate::status(&client, &source, &config).await.unwrap();
+    assert!(statuses[1].applied, "still recorded as applied");
+}
+
 /// Every statement of a failing transactional migration rolls back, not
 /// only the failing one, and the migration is not recorded.
 #[tokio::test]
