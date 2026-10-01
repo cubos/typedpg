@@ -5,7 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
-typedpg = { path = "../typedpg" }
+typedpg = { path = "../typedpg", features = ["bb8"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
@@ -19,6 +19,8 @@ tokio = { version = "1", features = ["full"] }
 tokio-postgres = { version = "0.7", features = ["with-serde_json-1", "with-chrono-0_4", "with-uuid-1"] }
 deadpool-postgres = "0.14"
 typedpg_test_support = { path = "../typedpg_test_support" }
+bb8 = "0.9"
+bb8-postgres = "0.9"
 
 [package.metadata.typedpg.database]
 migrations = "./migrations"
