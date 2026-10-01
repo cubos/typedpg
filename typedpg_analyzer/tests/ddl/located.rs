@@ -62,17 +62,33 @@ syntax error at or near \",\"
 }
 
 #[test]
-fn error_without_position_points_at_the_statement() {
-    // The interpreter raises this one with no span: the caret goes to the
-    // statement's first token, past the comments leading into it.
+fn error_without_position_points_at_the_name_it_is_about() {
+    // The interpreter raises this one with no span: the name PG quotes is
+    // found among the statement's tokens (past the comments leading in).
     let sql = "CREATE TABLE a (id int);\n\n/* again */ -- oops\nCREATE TABLE a (id int);\n";
     assert_eq!(
         located_error(POSTS, "0004.sql", sql),
         "\
 relation \"a\" already exists
-  --> 0004.sql:4:1
+  --> 0004.sql:4:14
   ╭────
 4 │ CREATE TABLE a (id int);
+  ·              ─
+  ╰────"
+    );
+}
+
+#[test]
+fn error_without_a_name_points_at_the_statement() {
+    // Nothing to find: the statement's first token, past the comments.
+    let sql = "SELECT 1;\n/* again */ -- oops\nCREATE TABLE b (id int, id int);\n";
+    assert_eq!(
+        located_error(POSTS, "0006.sql", sql),
+        "\
+column \"id\" specified more than once
+  --> 0006.sql:3:1
+  ╭────
+3 │ CREATE TABLE b (id int, id int);
   · ───┬──
   ·    ╰─ in this statement
   ╰────"

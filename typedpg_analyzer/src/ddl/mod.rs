@@ -228,23 +228,67 @@ fn locate_in_statement(
             c
         }
         captured => {
-            // The error has no usable position: point at the statement.
-            let first = first_token_offset(sql, start);
-            let span = crate::error::SourceSpan::at_token(sql, first)
-                .unwrap_or_else(|| crate::error::SourceSpan::one_char_at(first));
+            // The error has no usable position: point at the name it is
+            // about when the statement spells it once, else at the
+            // statement.
+            let (span, label) = match named_token(sql, start, end, &message) {
+                Some(span) => (span, ""),
+                None => {
+                    let first = first_token_offset(sql, start);
+                    let span = crate::error::SourceSpan::at_token(sql, first)
+                        .unwrap_or_else(|| crate::error::SourceSpan::one_char_at(first));
+                    (span, "in this statement")
+                }
+            };
             let (hint, notes) = captured.map(|c| (c.hint, c.notes)).unwrap_or_default();
             crate::error::CapturedDiagnostic {
                 pg_message: message,
-                primary: Some(crate::error::DiagnosticLabel::new(
-                    span,
-                    "in this statement",
-                )),
+                primary: Some(crate::error::DiagnosticLabel::new(span, label)),
                 secondaries: Vec::new(),
                 hint,
                 notes,
             }
         }
     }
+}
+
+/// The one token of `sql[start..end]` naming what `message` is about: the
+/// name PG quotes in a `… "name" does not exist` / `… already exists` /
+/// `… is not …` message (its last dotted part), when exactly one
+/// identifier of the statement spells it — case-folded unless quoted, as
+/// PG reads identifiers. `None` when the statement has none or several.
+fn named_token(
+    sql: &str,
+    start: usize,
+    end: usize,
+    message: &str,
+) -> Option<crate::error::SourceSpan> {
+    let first_line = message.lines().next()?;
+    let (_, rest) = first_line.split_once('"')?;
+    let (quoted, after) = rest.split_once('"')?;
+    if !(after.starts_with(" does not exist")
+        || after.starts_with(" already exists")
+        || after.starts_with(" is not "))
+    {
+        return None;
+    }
+    let name = quoted.rsplit('.').next()?;
+    if name.is_empty() {
+        return None;
+    }
+    let text = sql.get(start..end)?;
+    let scanned = typedpg_pg_query::scan(text).ok()?;
+    let mut found = scanned.tokens.iter().filter_map(|t| {
+        let (s, e) = (usize::try_from(t.start).ok()?, usize::try_from(t.end).ok()?);
+        let token = text.get(s..e)?;
+        let spelled = match token.strip_prefix('"').and_then(|t| t.strip_suffix('"')) {
+            Some(inner) => inner.replace("\"\"", "\""),
+            None => token.to_lowercase(),
+        };
+        (spelled == name).then(|| crate::error::SourceSpan::new(start + s, start + e))
+    });
+    let span = found.next()?;
+    found.next().is_none().then_some(span)
 }
 
 /// The byte range of `raw_stmt` in `sql` (`stmt_len` 0 means "to the end").
