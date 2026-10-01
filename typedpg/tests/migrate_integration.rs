@@ -2,9 +2,9 @@ use std::fs;
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use testcontainers::core::Mount;
+use testcontainers::core::WaitFor;
 use testcontainers::runners::AsyncRunner;
-use testcontainers::{ContainerAsync, ImageExt};
-use testcontainers_modules::postgres::Postgres;
+use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use tokio_postgres::NoTls;
 use typedpg::migrate::MigrationSource;
 use typedpg_core::config::MigrationsConfig;
@@ -56,9 +56,25 @@ fn track_container(id: String) {
 /// PGDATA is mounted as tmpfs so Postgres runs entirely in RAM: no anonymous
 /// volume is created, so nothing is left behind on OrbStack/Docker after
 /// teardown. Also speeds up the test cycle (initdb + fsync go through memory).
-async fn start_postgres() -> ContainerAsync<Postgres> {
-    let container = Postgres::default()
-        .with_tag("latest")
+/// The official `postgres` image, as testcontainers-modules' `Postgres`
+/// configured it: user / password / database `postgres`, fsync off, ready
+/// once the server logs that it accepts connections.
+fn postgres_image(name: &str, tag: &str) -> GenericImage {
+    GenericImage::new(name, tag)
+        .with_wait_for(WaitFor::message_on_stderr(
+            "database system is ready to accept connections",
+        ))
+        .with_wait_for(WaitFor::message_on_stdout(
+            "database system is ready to accept connections",
+        ))
+}
+
+async fn start_postgres() -> ContainerAsync<GenericImage> {
+    let container = postgres_image("postgres", "latest")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_cmd(["-c", "fsync=off"])
         .with_mount(Mount::tmpfs_mount("/var/lib/postgresql"))
         .with_host_config_modifier(|cfg| cfg.auto_remove = Some(true))
         .start()
@@ -69,7 +85,7 @@ async fn start_postgres() -> ContainerAsync<Postgres> {
 }
 
 async fn connect_to_container(
-    container: &testcontainers::ContainerAsync<Postgres>,
+    container: &testcontainers::ContainerAsync<GenericImage>,
 ) -> tokio_postgres::Client {
     let host = container.get_host().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();

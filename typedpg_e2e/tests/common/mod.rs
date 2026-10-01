@@ -16,9 +16,9 @@ use std::sync::{Mutex, OnceLock};
 
 use deadpool_postgres::{Config, Pool, Runtime};
 use testcontainers::core::Mount;
+use testcontainers::core::WaitFor;
 use testcontainers::runners::AsyncRunner;
-use testcontainers::{ContainerAsync, ImageExt};
-use testcontainers_modules::postgres::Postgres;
+use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use tokio::sync::OnceCell;
 use tokio_postgres::NoTls;
 use typedpg::migrate::MigrationSource;
@@ -68,7 +68,20 @@ pub struct TestEnv {
     port: u16,
     // Kept alive for the duration of the test binary — dropping this would
     // tear down the Docker container.
-    _container: ContainerAsync<Postgres>,
+    _container: ContainerAsync<GenericImage>,
+}
+
+/// The official `postgres` image, as testcontainers-modules' `Postgres`
+/// configured it: user / password / database `postgres`, fsync off, ready
+/// once the server logs that it accepts connections.
+fn postgres_image(name: &str, tag: &str) -> GenericImage {
+    GenericImage::new(name, tag)
+        .with_wait_for(WaitFor::message_on_stderr(
+            "database system is ready to accept connections",
+        ))
+        .with_wait_for(WaitFor::message_on_stdout(
+            "database system is ready to accept connections",
+        ))
 }
 
 static ENV: OnceCell<TestEnv> = OnceCell::const_new();
@@ -90,9 +103,11 @@ pub async fn setup() -> Pool {
             // no anonymous volume gets created, so nothing is left behind on
             // OrbStack/Docker after the container is removed. Also speeds up
             // the test cycle (initdb + fsync go through memory).
-            let container = Postgres::default()
-                .with_name("pgvector/pgvector")
-                .with_tag("pg18")
+            let container = postgres_image("pgvector/pgvector", "pg18")
+                .with_env_var("POSTGRES_USER", "postgres")
+                .with_env_var("POSTGRES_PASSWORD", "postgres")
+                .with_env_var("POSTGRES_DB", "postgres")
+                .with_cmd(["-c", "fsync=off"])
                 .with_mount(Mount::tmpfs_mount("/var/lib/postgresql"))
                 .with_host_config_modifier(|cfg| cfg.auto_remove = Some(true))
                 .start()

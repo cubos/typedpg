@@ -11,10 +11,11 @@
 
 use std::collections::HashMap;
 
+use testcontainers::GenericImage;
 use testcontainers::ImageExt;
 use testcontainers::core::Mount;
+use testcontainers::core::WaitFor;
 use testcontainers::runners::SyncRunner;
-use testcontainers_modules::postgres::Postgres;
 use typedpg_analyzer::{
     AggKind, ArgMode, AttGenerated, AttIdentity, CastContext, CastMethod, ConType, DepType,
     PgAggregate, PgAm, PgAmop, PgAttribute, PgCast, PgCastOid, PgCatalog, PgCatalogSeed, PgClass,
@@ -27,8 +28,20 @@ use typedpg_analyzer::{
 
 fn main() {
     eprintln!("Pulling postgres:latest from registry...");
-    let request = Postgres::default()
-        .with_tag("latest")
+    // The official image, as testcontainers-modules' `Postgres` configured
+    // it: user / password / database `postgres`, fsync off, ready once the
+    // server logs that it accepts connections.
+    let request = GenericImage::new("postgres", "latest")
+        .with_wait_for(WaitFor::message_on_stderr(
+            "database system is ready to accept connections",
+        ))
+        .with_wait_for(WaitFor::message_on_stdout(
+            "database system is ready to accept connections",
+        ))
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_cmd(["-c", "fsync=off"])
         .with_mount(Mount::tmpfs_mount("/var/lib/postgresql"))
         .pull_image()
         .expect("failed to pull postgres:latest");
