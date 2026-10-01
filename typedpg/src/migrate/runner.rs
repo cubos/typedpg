@@ -112,10 +112,16 @@ pub async fn run(
     source: &MigrationSource,
     config: &MigrationsConfig,
 ) -> Result<Vec<String>, crate::Error> {
-    ensure_table(client, config).await?;
+    validate(config)?;
     acquire_lock(client, config).await?;
 
-    let result = run_inner(client, source, config).await;
+    // The tracking table is created under the lock: two runners racing on
+    // a fresh database would otherwise both find it missing, and one
+    // `CREATE TABLE IF NOT EXISTS` fails on the other's catalog rows.
+    let result = match ensure_table(client, config).await {
+        Ok(()) => run_inner(client, source, config).await,
+        Err(e) => Err(e),
+    };
 
     // Always release lock, even if run_inner failed.
     let release = release_lock(client, config).await;
@@ -344,10 +350,14 @@ pub async fn revert(
     force: bool,
     config: &MigrationsConfig,
 ) -> Result<(), crate::Error> {
-    ensure_table(client, config).await?;
+    validate(config)?;
     acquire_lock(client, config).await?;
 
-    let result = revert_inner(client, source, name, force, config).await;
+    // Under the lock, as in `run`.
+    let result = match ensure_table(client, config).await {
+        Ok(()) => revert_inner(client, source, name, force, config).await,
+        Err(e) => Err(e),
+    };
 
     let release = release_lock(client, config).await;
     match (&result, release) {
@@ -432,10 +442,16 @@ async fn revert_inner(
     Ok(())
 }
 
-async fn ensure_table(client: &Client, config: &MigrationsConfig) -> Result<(), crate::Error> {
+/// Reject a tracking table name that is not a plain qualified identifier:
+/// it is interpolated into every query.
+fn validate(config: &MigrationsConfig) -> Result<(), crate::Error> {
     config
         .validate()
-        .map_err(|e| crate::Error::Migration(e.to_string()))?;
+        .map_err(|e| crate::Error::Migration(e.to_string()))
+}
+
+async fn ensure_table(client: &Client, config: &MigrationsConfig) -> Result<(), crate::Error> {
+    validate(config)?;
     let sql = format!(
         "CREATE TABLE IF NOT EXISTS {} (
             name       TEXT PRIMARY KEY,

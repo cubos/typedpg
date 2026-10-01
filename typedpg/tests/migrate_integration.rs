@@ -341,6 +341,31 @@ async fn drift_is_a_warning_without_fail_on_drift() {
     assert!(statuses[1].applied && !statuses[1].drifted);
 }
 
+/// Two runners racing on a fresh database (two replicas booting at once):
+/// both succeed and every migration applies exactly once. The tracking
+/// table must be created under the advisory lock — two concurrent
+/// `CREATE TABLE IF NOT EXISTS` can both miss the table and collide.
+#[tokio::test]
+async fn concurrent_runs_on_a_fresh_database() {
+    let dir = tempfile::tempdir().unwrap();
+    create_test_migrations(dir.path());
+    let source = MigrationSource::from_dir(dir.path()).unwrap();
+    let config = MigrationsConfig::default();
+
+    for _ in 0..10 {
+        let (mut a, db) = fresh_db().await;
+        let mut b = second_session(&db).await;
+        let (ra, rb) = tokio::join!(
+            migrate::run(&mut a, &source, &config),
+            migrate::run(&mut b, &source, &config),
+        );
+        let (ra, rb) = (ra.expect("runner a"), rb.expect("runner b"));
+        let mut all: Vec<_> = ra.into_iter().chain(rb).collect();
+        all.sort();
+        assert_eq!(all, [USERS, ORDERS], "each migration applied once");
+    }
+}
+
 /// A source baked in with `embed_migrations!` runs like one read from disk.
 #[tokio::test]
 async fn embedded_source_runs() {
