@@ -752,6 +752,23 @@ pub fn generate_copy_in(
     }})
 }
 
+/// The `__TYPEDPG_QUERY` constant the `NoRows` / `TooManyRows` errors carry:
+/// the query's SQL and the location of the `sql!` invocation (`file!()` and
+/// friends, expanded with the call site's span, report where the macro was
+/// invoked).
+fn query_context(analyzed: &AnalyzedQuery) -> TokenStream {
+    let sql = &analyzed.sql;
+    quote! {
+        #[allow(dead_code)]
+        const __TYPEDPG_QUERY: typedpg::error::QueryContext = typedpg::error::QueryContext::new(
+            #sql,
+            ::core::file!(),
+            ::core::line!(),
+            ::core::column!(),
+        );
+    }
+}
+
 /// Generate code for a regular query (no spreads).
 fn generate_regular(
     analyzed: &AnalyzedQuery,
@@ -772,9 +789,13 @@ fn generate_regular(
         wrap_with_limit(&sql_str, analyzed.can_run_as_subquery).unwrap_or_else(|| sql_str.clone());
 
     let fetch_value_method = build_fetch_value_method(&analyzed.columns, config, &registry)?;
+    let query_context = query_context(analyzed);
 
     let ts = quote! {
         {
+            // ----- the query, for the errors about it -----
+            #query_context
+
             // ----- synthesized composite / record structs -----
             #record_defs
 
@@ -817,9 +838,9 @@ fn generate_regular(
                     ).await?;
                     let mut __iter = __rows.into_iter();
                     let __row = __iter.next()
-                        .ok_or_else(|| typedpg::Error::NoRows)?;
+                        .ok_or_else(|| typedpg::Error::no_rows(__TYPEDPG_QUERY))?;
                     if __iter.next().is_some() {
-                        return ::std::result::Result::Err(typedpg::Error::TooManyRows);
+                        return ::std::result::Result::Err(typedpg::Error::too_many_rows(__TYPEDPG_QUERY));
                     }
                     ::std::result::Result::Ok(__sql_output {
                         #row_mapping
@@ -837,7 +858,7 @@ fn generate_regular(
                     match __iter.next() {
                         Some(__row) => {
                             if __iter.next().is_some() {
-                                return ::std::result::Result::Err(typedpg::Error::TooManyRows);
+                                return ::std::result::Result::Err(typedpg::Error::too_many_rows(__TYPEDPG_QUERY));
                             }
                             ::std::result::Result::Ok(Some(__sql_output {
                                 #row_mapping
@@ -904,9 +925,9 @@ fn generate_regular(
                     ).await?;
                     let mut __iter = __rows.into_iter();
                     let __row = __iter.next()
-                        .ok_or_else(|| typedpg::Error::NoRows)?;
+                        .ok_or_else(|| typedpg::Error::no_rows(__TYPEDPG_QUERY))?;
                     if __iter.next().is_some() {
-                        return ::std::result::Result::Err(typedpg::Error::TooManyRows);
+                        return ::std::result::Result::Err(typedpg::Error::too_many_rows(__TYPEDPG_QUERY));
                     }
                     __T::from_row(&__row)
                 }
@@ -922,7 +943,7 @@ fn generate_regular(
                     match __iter.next() {
                         Some(__row) => {
                             if __iter.next().is_some() {
-                                return ::std::result::Result::Err(typedpg::Error::TooManyRows);
+                                return ::std::result::Result::Err(typedpg::Error::too_many_rows(__TYPEDPG_QUERY));
                             }
                             ::std::result::Result::Ok(Some(__T::from_row(&__row)?))
                         },
@@ -1121,9 +1142,13 @@ fn generate_spread(
     };
 
     let fetch_value_method = build_fetch_value_method(&analyzed.columns, config, &registry)?;
+    let query_context = query_context(analyzed);
 
     let ts = quote! {
         {
+            // ----- the query, for the errors about it -----
+            #query_context
+
             // ----- synthesized composite / record structs -----
             #record_defs
 
@@ -1165,13 +1190,13 @@ fn generate_spread(
                 async fn fetch_one(self) -> ::std::result::Result<__sql_output, typedpg::Error> {
                     #query_preamble
                     if __any_empty {
-                        return ::std::result::Result::Err(typedpg::Error::NoRows);
+                        return ::std::result::Result::Err(typedpg::Error::no_rows(__TYPEDPG_QUERY));
                     }
                     let __rows = typedpg::Executor::query(&self.__executor, &__sql, &__params_ref).await?;
                     let mut __iter = __rows.into_iter();
-                    let __row = __iter.next().ok_or_else(|| typedpg::Error::NoRows)?;
+                    let __row = __iter.next().ok_or_else(|| typedpg::Error::no_rows(__TYPEDPG_QUERY))?;
                     if __iter.next().is_some() {
-                        return ::std::result::Result::Err(typedpg::Error::TooManyRows);
+                        return ::std::result::Result::Err(typedpg::Error::too_many_rows(__TYPEDPG_QUERY));
                     }
                     ::std::result::Result::Ok(__sql_output { #row_mapping })
                 }
@@ -1186,7 +1211,7 @@ fn generate_spread(
                     match __iter.next() {
                         Some(__row) => {
                             if __iter.next().is_some() {
-                                return ::std::result::Result::Err(typedpg::Error::TooManyRows);
+                                return ::std::result::Result::Err(typedpg::Error::too_many_rows(__TYPEDPG_QUERY));
                             }
                             ::std::result::Result::Ok(Some(__sql_output { #row_mapping }))
                         },
@@ -1238,13 +1263,13 @@ fn generate_spread(
                 async fn fetch_one_as<__T: typedpg::FromRow>(self) -> ::std::result::Result<__T, typedpg::Error> {
                     #query_preamble
                     if __any_empty {
-                        return ::std::result::Result::Err(typedpg::Error::NoRows);
+                        return ::std::result::Result::Err(typedpg::Error::no_rows(__TYPEDPG_QUERY));
                     }
                     let __rows = typedpg::Executor::query(&self.__executor, &__sql, &__params_ref).await?;
                     let mut __iter = __rows.into_iter();
-                    let __row = __iter.next().ok_or_else(|| typedpg::Error::NoRows)?;
+                    let __row = __iter.next().ok_or_else(|| typedpg::Error::no_rows(__TYPEDPG_QUERY))?;
                     if __iter.next().is_some() {
-                        return ::std::result::Result::Err(typedpg::Error::TooManyRows);
+                        return ::std::result::Result::Err(typedpg::Error::too_many_rows(__TYPEDPG_QUERY));
                     }
                     __T::from_row(&__row)
                 }
@@ -1259,7 +1284,7 @@ fn generate_spread(
                     match __iter.next() {
                         Some(__row) => {
                             if __iter.next().is_some() {
-                                return ::std::result::Result::Err(typedpg::Error::TooManyRows);
+                                return ::std::result::Result::Err(typedpg::Error::too_many_rows(__TYPEDPG_QUERY));
                             }
                             ::std::result::Result::Ok(Some(__T::from_row(&__row)?))
                         },
