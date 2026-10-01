@@ -488,11 +488,9 @@ impl Config {
 #[derive(Debug, Clone)]
 pub struct ResolvedConfig<'a> {
     database: &'a DatabaseConfig,
-    /// Per-database migration runner settings. Resolved and carried here for
-    /// completeness, but no consumer reads it yet: the migration runner is
-    /// driven by the CLI off the top-level [`Config::migrations`], which has
-    /// no `db = name` selector.
-    #[allow(dead_code)]
+    /// Per-database migration runner settings: the `sql!` macro reads
+    /// `use_transaction` to interpret the migrations as the runner applies
+    /// them.
     migrations: &'a MigrationsConfig,
     /// Unified type map keyed by qualified PG type name. The `sql!` macro
     /// infers the (de)serialization strategy from each type's kind.
@@ -525,6 +523,13 @@ fn qualify_keys(
 }
 
 impl ResolvedConfig<'_> {
+    /// Whether this database's migrations run each in a transaction
+    /// (`[package.metadata.typedpg.databases.<name>.migrations]`, or the
+    /// top-level section for the default database).
+    pub fn migrations_use_transaction(&self) -> bool {
+        self.migrations.use_transaction
+    }
+
     /// Resolve the migrations path relative to a base directory.
     pub fn migrations_dir(&self, base: &Path) -> PathBuf {
         self.database.migrations_dir(base)
@@ -889,6 +894,30 @@ migrations = "./migrations/analytics"
         assert_eq!(
             resolved.database.migrations,
             PathBuf::from("./migrations/analytics")
+        );
+    }
+
+    #[test]
+    fn resolve_named_db_carries_its_runner_settings() {
+        let toml = r#"
+[package]
+name = "my-app"
+version = "0.1.0"
+edition = "2021"
+
+[package.metadata.typedpg.migrations]
+use_transaction = true
+
+[package.metadata.typedpg.databases.analytics.migrations]
+use_transaction = false
+"#;
+        let config = Config::from_str(toml).unwrap();
+        assert!(config.resolve(None).unwrap().migrations_use_transaction());
+        assert!(
+            !config
+                .resolve(Some("analytics"))
+                .unwrap()
+                .migrations_use_transaction()
         );
     }
 

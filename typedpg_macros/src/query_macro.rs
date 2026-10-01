@@ -375,10 +375,11 @@ pub(crate) fn catalog_for<'c>(
         syn::Error::new(Span::call_site(), format!("failed to hash migrations: {e}"))
     })?;
 
+    // The selected database's runner setting, not the top-level one.
     let catalog = get_or_build_pg_catalog(
         &all_dirs,
         &migration_hash,
-        config.migrations.use_transaction,
+        resolved.migrations_use_transaction(),
     )?;
     let missing: Vec<String> = all_dirs
         .iter()
