@@ -1547,6 +1547,7 @@ fn resolve_type_name(
             kind: AnalyzeError::UndefinedType(format!("type \"{qualified}\" does not exist")),
             primary: span.map(|s| crate::error::DiagnosticLabel::new(s, "type does not exist")),
             secondaries: Vec::new(),
+            notes: Vec::new(),
             hint,
         }
         .finalize_implicit()

@@ -2010,13 +2010,16 @@ fn select_star_qualifier_without_relation_errors() {
         db.analyze("SELECT row_to_json(*) FROM users u"),
         AnalyzeError::UndefinedFunction(_),
         concat!(
-            "function row_to_json() does not exist (found 2 candidate(s))\n",
+            "function row_to_json() does not exist\n",
             "  ╭────\n",
             "1 │ SELECT row_to_json(*) FROM users u\n",
             "  ·        ─────┬─────\n",
             "  ·             ╰─ function does not exist\n",
             "  ╰────\n",
-            "  help: did you mean \"row_to_json\"?\n",
+            "  help: No function matches the given name and argument types. You might need to add explicit type casts.\n",
+            "  note: candidates are:\n",
+            "          row_to_json(record)\n",
+            "          row_to_json(record, boolean)\n",
         ),
     );
 }
@@ -2042,13 +2045,16 @@ fn row_to_json_with_no_args_errors() {
         db.analyze("SELECT row_to_json()"),
         AnalyzeError::UndefinedFunction(_),
         concat!(
-            "function row_to_json() does not exist (found 2 candidate(s))\n",
+            "function row_to_json() does not exist\n",
             "  ╭────\n",
             "1 │ SELECT row_to_json()\n",
             "  ·        ─────┬─────\n",
             "  ·             ╰─ function does not exist\n",
             "  ╰────\n",
-            "  help: did you mean \"row_to_json\"?\n",
+            "  help: No function matches the given name and argument types. You might need to add explicit type casts.\n",
+            "  note: candidates are:\n",
+            "          row_to_json(record)\n",
+            "          row_to_json(record, boolean)\n",
         ),
     );
 }
