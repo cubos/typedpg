@@ -59,7 +59,7 @@ fn create_writes_timestamped_up_and_down_files() {
     let dir = project(&[]);
     fs::remove_dir(dir.path().join("db")).unwrap();
 
-    ok(&cli(dir.path(), None, &["migrate", "create", "add_users"]));
+    let stdout = ok(&cli(dir.path(), None, &["migrate", "create", "add_users"]));
 
     let mut files: Vec<String> = fs::read_dir(dir.path().join("db"))
         .expect("create makes the configured directory")
@@ -80,6 +80,11 @@ fn create_writes_timestamped_up_and_down_files() {
             ""
         );
     }
+    assert_eq!(
+        stdout,
+        format!("Created ./db/{up}\nCreated ./db/{down}\n"),
+        "stdout"
+    );
     // The new migration parses as a valid source.
     typedpg::migrate::MigrationSource::from_dir(&dir.path().join("db")).unwrap();
 }
