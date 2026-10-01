@@ -197,6 +197,8 @@ pub(crate) fn validate_with_typmod(
         "pg_lsn" => validate_pg_lsn(content),
         "pg_snapshot" | "txid_snapshot" => validate_pg_snapshot(content),
         name @ ("xid" | "xid8" | "cid") => validate_xid(content, name),
+        "oidvector" => validate_oidvector(content),
+        "int2vector" => validate_int2vector(content),
         _ => Ok(()),
     }
 }
@@ -1667,6 +1669,122 @@ fn validate_record(
     Ok(())
 }
 
+// ─── oidvector / int2vector ─────────────────────────────────────────────────
+
+/// The longest prefix `strtoul(s, &end, 0)` converts, after leading
+/// whitespace and a sign: its radix, digits and end offset (`None` when
+/// nothing converts, `endptr == s`). Unlike [`strtoul_base0`] the run
+/// needn't end the input: `"08"` converts `0` (octal) and stops at the 8.
+fn strtoul_prefix(s: &[u8]) -> Option<(u32, &str, usize, bool)> {
+    let mut p = 0;
+    while p < s.len() && c_isspace(s[p]) {
+        p += 1;
+    }
+    let negative = s.get(p) == Some(&b'-');
+    if matches!(s.get(p), Some(b'+' | b'-')) {
+        p += 1;
+    }
+    let is = |i: usize, f: fn(&u8) -> bool| s.get(i).is_some_and(f);
+    let (radix, start) = if s.get(p) == Some(&b'0')
+        && matches!(s.get(p + 1), Some(b'x' | b'X'))
+        && is(p + 2, u8::is_ascii_hexdigit)
+    {
+        (16, p + 2)
+    } else if s.get(p) == Some(&b'0')
+        && matches!(s.get(p + 1), Some(b'b' | b'B'))
+        && is(p + 2, |c| matches!(c, b'0' | b'1'))
+    {
+        (2, p + 2)
+    } else if s.get(p) == Some(&b'0') {
+        (8, p)
+    } else {
+        (10, p)
+    };
+    let mut end = start;
+    while s.get(end).is_some_and(|&c| (c as char).is_digit(radix)) {
+        end += 1;
+    }
+    if end == start {
+        return None;
+    }
+    let digits = std::str::from_utf8(&s[start..end]).unwrap_or("0");
+    Some((radix, digits, end, negative))
+}
+
+/// Mirrors `oidvectorin` (oid.c): whitespace-separated OIDs (as many as
+/// given: PG 16 dropped the `FUNC_MAX_ARGS` limit), each read by `uint32in_subr` with an end
+/// pointer — so an element's error names the rest of the input from it
+/// (`'1,2'` fails on `",2"`).
+fn validate_oidvector(content: &str) -> Result<(), String> {
+    let b = content.as_bytes();
+    let mut p = 0;
+    loop {
+        while p < b.len() && c_isspace(b[p]) {
+            p += 1;
+        }
+        if p == b.len() {
+            return Ok(());
+        }
+        let rest = &content[p..];
+        let Some((radix, digits, end, negative)) = strtoul_prefix(&b[p..]) else {
+            return Err(crate::pgmsg::invalid_input_syntax_for_type("oid", rest));
+        };
+        // uint32in_subr's range: what fits uint32, or a negative whose
+        // magnitude fits int32 (see validate_oid).
+        let in_range = match u64::from_str_radix(digits, radix) {
+            Ok(v) if negative => v <= i32::MAX as u64 + 1,
+            Ok(v) => v <= u32::MAX as u64,
+            Err(_) => false,
+        };
+        if !in_range {
+            return Err(format!("value \"{rest}\" is out of range for type oid"));
+        }
+        p += end;
+    }
+}
+
+/// Mirrors `int2vectorin` (int.c): whitespace-separated (unlimited, as for
+/// `oidvector`) `strtol(…, 10)` smallints, each followed by a
+/// space or the end; an element's error names the rest of the input from
+/// it.
+fn validate_int2vector(content: &str) -> Result<(), String> {
+    let b = content.as_bytes();
+    let mut p = 0;
+    loop {
+        while p < b.len() && c_isspace(b[p]) {
+            p += 1;
+        }
+        if p == b.len() {
+            return Ok(());
+        }
+        let rest = &content[p..];
+        let syntax = || crate::pgmsg::invalid_input_syntax_for_type("smallint", rest);
+        let mut q = p;
+        let negative = b.get(q) == Some(&b'-');
+        if matches!(b.get(q), Some(b'+' | b'-')) {
+            q += 1;
+        }
+        let digits = q;
+        while q < b.len() && b[q].is_ascii_digit() {
+            q += 1;
+        }
+        if q == digits {
+            return Err(syntax());
+        }
+        let magnitude: i128 = content[digits..q].parse().unwrap_or(i128::MAX);
+        let value = if negative { -magnitude } else { magnitude };
+        if !(i16::MIN as i128..=i16::MAX as i128).contains(&value) {
+            return Err(format!(
+                "value \"{rest}\" is out of range for type smallint"
+            ));
+        }
+        if q < b.len() && b[q] != b' ' {
+            return Err(syntax());
+        }
+        p = q;
+    }
+}
+
 // ─── system identifier types ────────────────────────────────────────────────
 
 /// Mirrors `tidin` (tid.c): `(block,offset)` with two unsigned decimal
@@ -2205,6 +2323,40 @@ mod tests {
         assert!(validate_xid("42", "xid").is_ok());
         assert!(validate_xid("0x10", "xid").is_ok());
         assert!(validate_xid("ff", "xid").is_err());
+    }
+
+    #[test]
+    fn vector_inputs() {
+        // oidvector: strtoul base 0 per element, stopping where it stops
+        // ('08' is 0 then 8); errors name the rest of the input.
+        for ok in ["1 2  3", " 1 ", "", "0x1F 017 0b1", "08", "-1", "\t1\t2"] {
+            assert!(validate_oidvector(ok).is_ok(), "{ok:?} should be valid");
+        }
+        for (bad, msg) in [
+            ("1_", "invalid input syntax for type oid: \"_\""),
+            ("1,2", "invalid input syntax for type oid: \",2\""),
+            ("1 2 x", "invalid input syntax for type oid: \"x\""),
+            (
+                "4294967296",
+                "value \"4294967296\" is out of range for type oid",
+            ),
+        ] {
+            assert_eq!(validate_oidvector(bad).unwrap_err(), msg);
+        }
+        // int2vector: strtol base 10, a space or the end after each.
+        for ok in ["1 2 3", "", " 1  2 ", "+1 -2"] {
+            assert!(validate_int2vector(ok).is_ok(), "{ok:?} should be valid");
+        }
+        for (bad, msg) in [
+            ("0x1F", "invalid input syntax for type smallint: \"0x1F\""),
+            ("1\t2", "invalid input syntax for type smallint: \"1\t2\""),
+            (
+                "40000 1",
+                "value \"40000 1\" is out of range for type smallint",
+            ),
+        ] {
+            assert_eq!(validate_int2vector(bad).unwrap_err(), msg);
+        }
     }
 
     #[test]
