@@ -2000,21 +2000,20 @@ fn insert_composite_column_with_wrong_arity_errors() {
 #[test]
 fn update_composite_with_wrong_field_types_errors() {
     // `point2d.x` is FLOAT8 and there is no bool→float8 cast, so the
-    // record→composite coercion fails. (PG's exact wording here is
-    // `cannot cast type record to point2d`; the analyzer surfaces the offending
-    // per-field coercion instead — both reject, so skip the mirror.)
-    let mut db = setup();
-    db.skip_pg_sanity();
+    // record→composite coercion fails as a whole, with PG's
+    // coerce_record_to_complex wording (and its detail as the help).
+    let db = setup();
     assert_analyze_err!(
         db.analyze("UPDATE points SET p = ROW(true, 1.0) WHERE id = 1"),
-        AnalyzeError::TypeMismatch { .. },
+        AnalyzeError::Invalid(_),
         concat!(
-            "cannot coerce boolean to double precision\n",
+            "cannot cast type record to point2d\n",
             "  ╭────\n",
             "1 │ UPDATE points SET p = ROW(true, 1.0) WHERE id = 1\n",
-            "  ·                           ──┬─\n",
-            "  ·                             ╰─ expected double precision, found boolean\n",
+            "  ·                       ─┬─\n",
+            "  ·                        ╰─ record value\n",
             "  ╰────\n",
+            "  help: Cannot cast type boolean to double precision in column 1.\n",
         ),
     );
 }
