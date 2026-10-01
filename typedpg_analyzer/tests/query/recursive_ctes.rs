@@ -142,6 +142,57 @@ fn recursive_one_arm_nullable_propagates() {
     assert_cols(&s, vec![c("id", int8()), cn("label", text())]);
 }
 
+#[test]
+fn recursive_term_null_reaches_other_columns_in_later_iterations() {
+    let db = setup();
+    // The recursive term reads its own output: `b` turns NULL on the
+    // first step, and `a`, copied from `b`, on the next one — and `a`
+    // from `b` from `c` two steps later. Both arms are NOT NULL as written
+    // against the seed's rows.
+    let s = db
+        .analyze(
+            "WITH RECURSIVE r(a, b, c, k) AS ( \
+                SELECT 1, 1, 1, 1 \
+                UNION ALL \
+                SELECT b, c, NULL::int, k + 1 FROM r WHERE k < 4 \
+             ) SELECT a, b, c, k FROM r",
+        )
+        .unwrap();
+    assert_cols(
+        &s,
+        vec![
+            cn("a", int4()),
+            cn("b", int4()),
+            cn("c", int4()),
+            c("k", int4()),
+        ],
+    );
+}
+
+#[test]
+fn recursive_term_null_reaches_elements_and_fields() {
+    let db = setup();
+    // The same through an array's elements and a record's fields.
+    let s = db
+        .analyze(
+            "WITH RECURSIVE r(a, b, x, k) AS ( \
+                SELECT ARRAY[1], ARRAY[1], ROW(1), 1 \
+                UNION ALL \
+                SELECT b, ARRAY[NULL::int], ROW(NULL::int), k + 1 FROM r WHERE k < 3 \
+             ) SELECT a, x FROM r",
+        )
+        .unwrap();
+    assert_cols(
+        &s,
+        vec![
+            c("a", array_of(int4())),
+            c("x", anon_record(vec![rfn("f1", int4())])),
+        ],
+    );
+    // (assert_cols leaves element nullability out.)
+    assert_eq!(col(&s, "a").pg_type, array_with_elems(int4(), true));
+}
+
 // ── Non-recursive WITH still picks up aliascolnames ──────────────────────────
 
 #[test]

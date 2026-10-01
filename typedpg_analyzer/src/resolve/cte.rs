@@ -19,6 +19,25 @@ pub(crate) struct AnalyzedCte {
 /// entries of the enclosing query levels: a CTE body is a sub-level of the
 /// query owning the WITH (whose own FROM isn't transformed yet), so it may
 /// reference them as outer references.
+/// Every nullability flag of `columns` (their own, their array elements',
+/// their record fields'), to tell when a recursive CTE's have settled.
+fn nullability_signature(columns: &[ScopeColumn]) -> Vec<Option<bool>> {
+    fn shape(out: &mut Vec<Option<bool>>, s: Option<&crate::expr::RecordShape>) {
+        for f in s.into_iter().flat_map(|s| s.iter()) {
+            out.push(Some(f.ty.nullable));
+            out.push(f.ty.elem_nullable);
+            shape(out, f.ty.record_fields.as_ref());
+        }
+    }
+    let mut out = Vec::new();
+    for c in columns {
+        out.push(Some(c.base_not_null));
+        out.push(c.elem_nullable);
+        shape(&mut out, c.record_fields.as_ref());
+    }
+    out
+}
+
 pub(crate) fn analyze_cte(
     cte: &protobuf::CommonTableExpr,
     recursive: bool,
@@ -129,38 +148,80 @@ pub(crate) fn analyze_cte(
                 }
             }
 
-            seed_cols
-                .into_iter()
-                .zip(rec_cols)
-                .map(|(s, r)| {
-                    let type_oid =
-                        crate::coerce::find_common_type(&[s.type_oid, r.type_oid], snapshot)
-                            .unwrap_or(s.type_oid);
-                    let typmod = if s.typmod == r.typmod { s.typmod } else { None };
-                    // Recursive CTE arms only keep the collation when both
-                    // arms agree — otherwise PG drops it (same shape as the
-                    // typmod merge above).
-                    let collation = if s.collation == r.collation {
-                        s.collation
-                    } else {
-                        None
-                    };
-                    ScopeColumn {
-                        name: s.name,
-                        type_oid,
-                        // Either arm producing NULL makes the column nullable.
-                        base_not_null: !(s.nullable || r.nullable),
-                        typmod,
-                        collation,
-                        table_alias: cte.ctename.clone(),
-                        record_fields: s.record_fields,
-                        elem_nullable: crate::expr::merge_elem_nullable([
-                            s.elem_nullable,
-                            r.elem_nullable,
-                        ]),
-                    }
-                })
-                .collect()
+            let merge = |rec_cols: &[RawColumn]| -> Vec<ScopeColumn> {
+                seed_cols
+                    .iter()
+                    .zip(rec_cols)
+                    .map(|(s, r)| {
+                        let type_oid =
+                            crate::coerce::find_common_type(&[s.type_oid, r.type_oid], snapshot)
+                                .unwrap_or(s.type_oid);
+                        let typmod = if s.typmod == r.typmod { s.typmod } else { None };
+                        // Recursive CTE arms only keep the collation when
+                        // both arms agree — otherwise PG drops it (same
+                        // shape as the typmod merge above).
+                        let collation = if s.collation == r.collation {
+                            s.collation
+                        } else {
+                            None
+                        };
+                        ScopeColumn {
+                            name: s.name.clone(),
+                            type_oid,
+                            // Either arm producing NULL makes the column
+                            // nullable.
+                            base_not_null: !(s.nullable || r.nullable),
+                            typmod,
+                            collation,
+                            table_alias: cte.ctename.clone(),
+                            record_fields: crate::expr::merge_set_op_shapes(
+                                s.record_fields.as_ref(),
+                                r.record_fields.as_ref(),
+                                true,
+                            ),
+                            elem_nullable: crate::expr::merge_elem_nullable([
+                                s.elem_nullable,
+                                r.elem_nullable,
+                            ]),
+                        }
+                    })
+                    .collect()
+            };
+
+            // The recursive term above read the CTE as the seed's rows, but
+            // it also reads its own output: a NULL it makes in one column
+            // flows into the next iteration (`SELECT b, NULL FROM r` turns
+            // `a` NULL on the second step). Analyze it again over the
+            // columns as they stand until their nullability settles — it
+            // only turns on, so this ends; the bound is a safety net, past
+            // which nothing is assumed NOT NULL.
+            let mut columns = merge(&rec_cols);
+            let mut settled = false;
+            for _ in 0..32 {
+                let mut scopes = body_ctes.clone();
+                register_cte(
+                    &mut scopes,
+                    &cte.ctename,
+                    columns.clone(),
+                    search_cycle.clone(),
+                    owner_depth,
+                );
+                let (rec_cols, _) = analyze_body(rarg, params, &scopes)?;
+                let next = merge(&rec_cols);
+                if nullability_signature(&next) == nullability_signature(&columns) {
+                    settled = true;
+                    break;
+                }
+                columns = next;
+            }
+            if !settled {
+                for c in &mut columns {
+                    c.base_not_null = false;
+                    c.elem_nullable = Some(true);
+                    c.record_fields = None;
+                }
+            }
+            columns
         }
         node::Node::SelectStmt(sel) => {
             let (mut cols, _) = analyze_body(sel, params, existing_ctes)?;
