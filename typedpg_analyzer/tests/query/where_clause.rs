@@ -375,6 +375,43 @@ fn text_eq_int_rejected() {
             "  ·                                 ┬\n",
             "  ·                                 ╰─ operator does not exist\n",
             "  ╰────\n",
+            "  help: No operator matches the given name and argument types. You might need to add explicit type casts.\n",
+            "  note: `text = text` exists: cast the right operand to text (`expr::text`)\n",
+        ),
+    );
+}
+
+#[test]
+fn any_operator_mismatch_points_at_the_operator() {
+    // PG positions it at the operator, like a plain comparison.
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("SELECT id FROM users WHERE name = ANY(ARRAY[1, 2])"),
+        AnalyzeError::UndefinedOperator(_),
+        concat!(
+            "operator does not exist: text = integer\n",
+            "  ╭────\n",
+            "1 │ SELECT id FROM users WHERE name = ANY(ARRAY[1, 2])\n",
+            "  ·                                 ┬\n",
+            "  ·                                 ╰─ operator does not exist\n",
+            "  ╰────\n",
+            "  help: No operator matches the given name and argument types. You might need to add explicit type casts.\n",
+            "  note: `text = text` exists: cast the right operand to text (`expr::text`)\n",
+        ),
+    );
+}
+
+#[test]
+fn join_using_operator_mismatch_gets_the_hint() {
+    // PG gives this one no position; the hint and the cast still help.
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("SELECT 1 FROM (SELECT id FROM users) a JOIN (SELECT name AS id FROM users) b USING (id)"),
+        AnalyzeError::UndefinedOperator(_),
+        concat!(
+            "operator does not exist: bigint = text\n",
+            "  help: No operator matches the given name and argument types. You might need to add explicit type casts.\n",
+            "  note: `bigint = bigint` exists: cast the right operand to bigint (`expr::bigint`)\n",
         ),
     );
 }
@@ -392,6 +429,8 @@ fn text_eq_int_literal_rejected() {
             "  ·                                 ┬\n",
             "  ·                                 ╰─ operator does not exist\n",
             "  ╰────\n",
+            "  help: No operator matches the given name and argument types. You might need to add explicit type casts.\n",
+            "  note: `text = text` exists: cast the right operand to text (`expr::text`)\n",
         ),
     );
 }
@@ -409,6 +448,7 @@ fn timestamptz_lt_int_rejected() {
             "  ·                                       ┬\n",
             "  ·                                       ╰─ operator does not exist\n",
             "  ╰────\n",
+            "  help: No operator matches the given name and argument types. You might need to add explicit type casts.\n",
         ),
     );
 }
@@ -428,6 +468,7 @@ fn int_like_text_rejected() {
             "  ·                               ─┬\n",
             "  ·                                ╰─ operator does not exist\n",
             "  ╰────\n",
+            "  help: No operator matches the given name and argument types. You might need to add explicit type casts.\n",
         ),
     );
 }
@@ -448,6 +489,8 @@ fn same_param_with_conflicting_types_rejected() {
             "  ·                                               ┬\n",
             "  ·                                               ╰─ operator does not exist\n",
             "  ╰────\n",
+            "  help: No operator matches the given name and argument types. You might need to add explicit type casts.\n",
+            "  note: `text = text` exists: cast the right operand to text (`expr::text`)\n",
         ),
     );
 }

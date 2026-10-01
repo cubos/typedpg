@@ -1950,6 +1950,7 @@ fn row_constructor_in_arithmetic_errors() {
             "  ·                  ┬\n",
             "  ·                  ╰─ operator does not exist\n",
             "  ╰────\n",
+            "  help: No operator matches the given name and argument types. You might need to add explicit type casts.\n",
         ),
     );
 }
@@ -1968,6 +1969,7 @@ fn record_in_jsonb_minus_op_errors() {
             "  ·                    ┬\n",
             "  ·                    ╰─ operator does not exist\n",
             "  ╰────\n",
+            "  help: No operator matches the given name and argument types. You might need to add explicit type casts.\n",
         ),
     );
 }
@@ -1986,6 +1988,7 @@ fn record_compared_to_scalar_errors() {
             "  ·                                          ┬\n",
             "  ·                                          ╰─ operator does not exist\n",
             "  ╰────\n",
+            "  help: No operator matches the given name and argument types. You might need to add explicit type casts.\n",
         ),
     );
 }
