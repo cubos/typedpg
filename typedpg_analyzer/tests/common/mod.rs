@@ -134,9 +134,18 @@ pub fn basic_with_collation(schema: &str, name: &str, collation: &str) -> Type {
     }
 }
 
+/// An array of `element` whose elements' nullability is known.
+pub fn array_with_elems(element: Type, element_nullable: bool) -> Type {
+    Type::Array {
+        element: Box::new(element),
+        element_nullable: Some(element_nullable),
+    }
+}
+
 pub fn array_of(element: Type) -> Type {
     Type::Array {
         element: Box::new(element),
+        element_nullable: None,
     }
 }
 
@@ -342,7 +351,15 @@ pub fn assert_cols(analyzed: &AnalyzedQuery, expected: Vec<ColSpec>) {
         .iter()
         .map(|c| ColSpec {
             name: c.name.clone(),
-            ty: c.pg_type.clone(),
+            // What is known of an array's element nullability is checked by
+            // query/array_element_nullability.rs; these tests check types.
+            ty: match c.pg_type.clone() {
+                Type::Array { element, .. } => Type::Array {
+                    element,
+                    element_nullable: None,
+                },
+                other => other,
+            },
             nullable: c.nullable,
         })
         .collect();

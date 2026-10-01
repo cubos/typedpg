@@ -823,7 +823,34 @@ fn infer_generic_binary_op(
             // (jsonb_path_exists_opr) when the path evaluation fails.
             let nullable =
                 functions::operator_result_nullable(snapshot, op_name, op.code, &args_nullable);
-            return Ok(ExprType::scalar(op.result_type_oid, nullable).with_collation(state));
+            // `||` on arrays appends, prepends or concatenates: the result's
+            // elements are both sides' elements / values.
+            let side = |t: &Option<ExprType>, array: bool| {
+                t.as_ref().and_then(|t| {
+                    if array {
+                        t.elem_nullable
+                    } else {
+                        Some(t.nullable)
+                    }
+                })
+            };
+            let elem_nullable = match op
+                .code
+                .and_then(|c| snapshot.pg_proc.get(&c))
+                .map(|p| p.proname.as_str())
+            {
+                Some("array_cat") => merge_elem_nullable([side(&left, true), side(&right, true)]),
+                Some("array_append") => {
+                    merge_elem_nullable([side(&left, true), side(&right, false)])
+                }
+                Some("array_prepend") => {
+                    merge_elem_nullable([side(&left, false), side(&right, true)])
+                }
+                _ => None,
+            };
+            return Ok(ExprType::scalar(op.result_type_oid, nullable)
+                .with_collation(state)
+                .with_elem_nullable(elem_nullable));
         }
         crate::lookup::OperatorMatch::Ambiguous => {
             // PG (SQLSTATE 42725): `operator is not unique: <left> <op>

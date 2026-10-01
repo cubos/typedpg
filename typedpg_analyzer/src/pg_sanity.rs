@@ -712,7 +712,7 @@ fn check_error_prefix(
 fn qualified_type_name_for_compare(ty: &Type) -> String {
     match ty {
         Type::Domain { base, .. } => qualified_type_name_for_compare(base),
-        Type::Array { element } => {
+        Type::Array { element, .. } => {
             format!("{}[]", qualified_param_type_name_for_compare(element))
         }
         other => qualified_param_type_name_for_compare(other),
@@ -732,7 +732,7 @@ fn qualified_param_type_name_for_compare(ty: &Type) -> String {
         | Type::Range { schema, name, .. }
         | Type::Composite { schema, name, .. }
         | Type::Domain { schema, name, .. } => QualifiedName::new(schema, name).to_string(),
-        Type::Array { element } => {
+        Type::Array { element, .. } => {
             format!("{}[]", qualified_param_type_name_for_compare(element))
         }
         Type::AnonymousRecord { .. } => "pg_catalog.record".to_string(),

@@ -171,6 +171,7 @@ pub(crate) fn resolve_target_list_explicit(
                     typmod: col.typmod,
                     collation: col.collation,
                     record_fields: col.record_fields.clone(),
+                    elem_nullable: None,
                 });
             }
             continue;
@@ -193,6 +194,7 @@ pub(crate) fn resolve_target_list_explicit(
                     nullable: t.nullable,
                     typmod: t.typmod,
                     collation: t.collation,
+                    elem_nullable: t.elem_nullable,
                     record_fields: t.record_fields,
                 });
             }
@@ -251,6 +253,7 @@ pub(crate) fn resolve_target_list_explicit(
             typmod: expr_type.typmod,
             collation: expr_type.collation,
             record_fields,
+            elem_nullable: expr_type.elem_nullable,
         });
     }
 
@@ -398,6 +401,7 @@ pub(crate) fn analyze_values_lists(
             // table (cols)` re-attach the target column's attcollation.
             collation: None,
             record_fields: None,
+            elem_nullable: None,
         })
         .collect();
 

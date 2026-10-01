@@ -227,6 +227,10 @@ pub(crate) fn analyze_set_operation(
             typmod,
             collation,
             record_fields: None,
+            elem_nullable: match op_label {
+                "EXCEPT" | "INTERSECT" => l.elem_nullable,
+                _ => crate::expr::merge_elem_nullable([l.elem_nullable, r.elem_nullable]),
+            },
         });
     }
 

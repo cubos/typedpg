@@ -405,6 +405,7 @@ fn analyze_raw_node_with(
                     typmod: None,
                     collation: None,
                     record_fields: None,
+                    elem_nullable: None,
                 }],
                 None,
             )
@@ -804,6 +805,9 @@ pub(crate) struct RawColumn {
     /// Used both to surface `Type::AnonymousRecord` in the final output and
     /// to feed downstream `(x).field` resolution via the scope.
     pub record_fields: Option<Vec<crate::expr::RecordField>>,
+    /// For an array column, whether its elements can be NULL, where known
+    /// (see [`crate::types::Type::Array`]).
+    pub elem_nullable: Option<bool>,
 }
 
 /// Return type for analyze_* functions: columns + optional pre-sorted params.

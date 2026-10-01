@@ -583,7 +583,6 @@ fn arrays_coerce_element_wise() {
     let mut db = setup();
     db.apply_sql("CREATE TABLE ta (id INT PRIMARY KEY, arr INT[]);")
         .unwrap();
-    let numeric_arr = array_of(numeric());
     for sql in [
         "SELECT COALESCE(ARRAY[1], ARRAY[2.5]) AS a",
         "SELECT CASE WHEN true THEN ARRAY[1] ELSE ARRAY[2.5] END AS a",
@@ -591,7 +590,13 @@ fn arrays_coerce_element_wise() {
         "SELECT GREATEST(ARRAY[1], ARRAY[2.5]) AS a",
     ] {
         let s = db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
-        assert_eq!(s.columns[0].pg_type, numeric_arr, "{sql}");
+        // (Only the UNION's arms carry their elements' nullability.)
+        let element_nullable = sql.contains("UNION").then_some(false);
+        let expected = Type::Array {
+            element: Box::new(numeric()),
+            element_nullable,
+        };
+        assert_eq!(s.columns[0].pg_type, expected, "{sql}");
     }
     for sql in [
         "SELECT ARRAY[ARRAY[1], ARRAY[2.5]] AS a",
@@ -599,7 +604,7 @@ fn arrays_coerce_element_wise() {
         "SELECT ARRAY[arr, ARRAY[1.5]] AS a FROM ta",
     ] {
         let s = db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
-        assert_eq!(s.columns[0].pg_type, numeric_arr, "{sql}");
+        assert_eq!(s.columns[0].pg_type, array_of(numeric()), "{sql}");
     }
     let s = db
         .analyze("SELECT ARRAY[ARRAY[1]::int[], ARRAY[2]::bigint[]] AS a")
