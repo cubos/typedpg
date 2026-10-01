@@ -1,0 +1,6 @@
+error: spread `$..users` needs a field list naming the item fields to bind, e.g. `$..users { field1, field2 }`
+  --> src/bin/sql_spread_without_fields.rs:14:23
+   |
+14 |     typedpg::sql!(db, "INSERT INTO users (name, email) VALUES $..users")
+   |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+

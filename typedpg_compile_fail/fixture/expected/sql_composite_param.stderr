@@ -1,0 +1,8 @@
+error: composite / record-typed query parameters are not supported — pass the fields individually using a ROW(...) constructor in SQL
+ --> src/bin/sql_composite_param.rs:5:5
+  |
+5 |     typedpg::sql!(db, "UPDATE users SET addr = $addr WHERE id = 1")
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the macro `typedpg::sql` (in Nightly builds, run with -Z macro-backtrace for more info)
+

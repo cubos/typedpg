@@ -1,0 +1,6 @@
+error: 1 field(s) for 2 column(s): each row supplies, in order, name, email
+ --> src/bin/copy_in_field_count.rs:9:56
+  |
+9 |     typedpg::copy_in!(db, "users (name, email)", users { name }).await?;
+  |                                                        ^^^^^^^^
+

@@ -1,0 +1,6 @@
+error: field `name` listed more than once
+ --> src/bin/copy_in_duplicate_field.rs:9:64
+  |
+9 |     typedpg::copy_in!(db, "users (name, email)", users { name, name }).await?;
+  |                                                                ^^^^
+

@@ -1,0 +1,6 @@
+error: unknown parameter `idd` — not found in SQL. Available parameters: $id
+ --> src/bin/sql_unknown_parameter.rs:4:23
+  |
+4 |     typedpg::sql!(db, "SELECT name FROM users WHERE id = $id", id = 1, idd = 2)
+  |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+

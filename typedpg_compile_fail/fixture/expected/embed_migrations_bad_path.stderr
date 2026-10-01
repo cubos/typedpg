@@ -1,0 +1,6 @@
+error: embed_migrations! path is not a directory: ./no_such_dir (resolved to ./no_such_dir)
+ --> src/bin/embed_migrations_bad_path.rs:4:40
+  |
+4 |     let _ = typedpg::embed_migrations!("./no_such_dir");
+  |                                        ^^^^^^^^^^^^^^^
+

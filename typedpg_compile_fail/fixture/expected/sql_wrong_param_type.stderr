@@ -1,0 +1,11 @@
+error[E0277]: the trait bound `i64: From<&str>` is not satisfied
+ --> src/bin/sql_wrong_param_type.rs:4:69
+  |
+4 |     typedpg::sql!(db, "SELECT name FROM users WHERE id = $id", id = "one")
+  |     ----------------------------------------------------------------^^^^^-
+  |     |                                                               |
+  |     |                                                               the trait `From<&str>` is not implemented for `i64`
+  |     required by a bound introduced by this call
+  |
+  = note: required for `&str` to implement `Into<i64>`
+

@@ -1,0 +1,12 @@
+error: FromRow can only be derived for structs
+ --> src/bin/from_row_not_a_struct.rs:4:6
+  |
+4 | enum Kind {
+  |      ^^^^
+
+error: FromRow can only be derived for structs with named fields
+ --> src/bin/from_row_not_a_struct.rs:9:8
+  |
+9 | struct Pair(i64, String);
+  |        ^^^^
+

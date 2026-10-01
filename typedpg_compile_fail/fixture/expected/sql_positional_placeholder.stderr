@@ -1,0 +1,6 @@
+error: positional placeholder `$1` is not supported in sql!: name the parameter (e.g. `$id`) so it can be bound
+ --> src/bin/sql_positional_placeholder.rs:4:23
+  |
+4 |     typedpg::sql!(db, "SELECT name FROM users WHERE id = $1")
+  |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+

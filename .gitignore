@@ -2,3 +2,4 @@ target/
 .worktrees
 .devcontainer
 .vscode
+/typedpg_compile_fail/fixture/Cargo.lock

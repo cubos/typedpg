@@ -1,0 +1,6 @@
+error: migration file does not have a numeric prefix (NNNN_...): ./bad_migrations/create_things.sql
+ --> src/bin/embed_migrations_bad_file_name.rs:5:40
+  |
+5 |     let _ = typedpg::embed_migrations!("./bad_migrations");
+  |                                        ^^^^^^^^^^^^^^^^^^
+

@@ -1,0 +1,9 @@
+error[E0277]: the trait bound `i64: From<Option<i64>>` is not satisfied
+ --> src/bin/sql_option_for_non_null_param.rs:5:5
+  |
+5 |     typedpg::sql!(db, "SELECT name FROM users WHERE id = $id")
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `From<Option<i64>>` is not implemented for `i64`
+  |
+  = note: required for `Option<i64>` to implement `Into<i64>`
+  = note: this error originates in the macro `typedpg::sql` (in Nightly builds, run with -Z macro-backtrace for more info)
+

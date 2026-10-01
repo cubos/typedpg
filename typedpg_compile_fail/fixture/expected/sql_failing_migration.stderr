@@ -1,0 +1,8 @@
+error: DDL interpretation failed in '0001_broken.sql': type "no_such_type" does not exist
+ --> src/bin/sql_failing_migration.rs:4:5
+  |
+4 |     typedpg::sql!(db = broken, db, "SELECT id FROM things")
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the macro `typedpg::sql` (in Nightly builds, run with -Z macro-backtrace for more info)
+

@@ -1,0 +1,29 @@
+# The crate the compile-fail harness builds: every binary under `src/bin/`
+# is one case, checked against `expected/<case>.stderr`. It is its own
+# workspace (the empty `[workspace]` below) so the main workspace's
+# `cargo build/clippy --all-targets` never sees the deliberately failing
+# binaries; `tests/compile_fail.rs` checks it with its own target dir.
+[package]
+name = "typedpg_compile_fail_fixture"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+typedpg = { path = "../../typedpg" }
+serde = { version = "1", features = ["derive"] }
+# The code `sql!` generates for a jsonb domain names `::serde_json`.
+serde_json = "1"
+tokio-postgres = "0.7"
+
+[package.metadata.typedpg.database]
+migrations = "./migrations"
+
+[package.metadata.typedpg.types]
+mood = "::typedpg_compile_fail_fixture::Mood"
+prefs = "::typedpg_compile_fail_fixture::Prefs"
+
+[package.metadata.typedpg.databases.broken.database]
+migrations = "./migrations_broken"
