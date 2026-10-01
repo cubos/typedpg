@@ -45,10 +45,11 @@
 //! `Vec<RustType>`.
 //!
 //! All fields have sensible defaults. The `[package.metadata.typedpg]` section
-//! itself is required, but every field within it is optional.
+//! itself is required, but every field within it is optional. A key no field
+//! reads (a typo, or the retired `domains` / `enums` sections) is an error.
 
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use crate::qualified_name::{ParseQualifiedNameError, QualifiedName};
@@ -75,6 +76,9 @@ pub struct Config {
     /// Used with `sql!(db = name, ...)` syntax.
     #[serde(default)]
     pub(crate) databases: HashMap<String, DatabaseEntry>,
+    /// Keys no field claims, rejected by [`Config::check_unknown_keys`].
+    #[serde(flatten)]
+    unknown: BTreeMap<String, toml::Value>,
 }
 
 /// A named database entry for multi-database support.
@@ -92,6 +96,8 @@ pub struct DatabaseEntry {
     /// Unified type mappings.
     #[serde(default)]
     types: HashMap<String, String>,
+    #[serde(flatten)]
+    unknown: BTreeMap<String, toml::Value>,
 }
 
 /// Database-related configuration.
@@ -110,6 +116,8 @@ pub struct DatabaseConfig {
     /// Paths are relative to the project root or absolute.
     #[serde(default)]
     extra_migrations: Vec<PathBuf>,
+    #[serde(flatten)]
+    unknown: BTreeMap<String, toml::Value>,
 }
 
 impl Default for DatabaseConfig {
@@ -117,6 +125,7 @@ impl Default for DatabaseConfig {
         Self {
             migrations: Self::default_migrations(),
             extra_migrations: Vec::new(),
+            unknown: BTreeMap::new(),
         }
     }
 }
@@ -156,6 +165,7 @@ fn resolve_against(path: &Path, base: &Path) -> PathBuf {
 /// Controls how migrations are tracked and executed. All fields have defaults,
 /// so this entire section can be omitted from `Cargo.toml`.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MigrationsConfig {
     /// Fully qualified table name for tracking applied migrations.
     /// Default: "public._migrations"
@@ -338,6 +348,12 @@ pub enum ConfigError {
     InvalidTable { table: String, reason: String },
     #[error("unknown database '{0}' — not found in [package.metadata.typedpg.databases]")]
     UnknownDatabase(String),
+    #[error("unknown key `{key}` in [{section}]: {hint}")]
+    UnknownKey {
+        section: String,
+        key: String,
+        hint: String,
+    },
     #[error("invalid qualified name in [{section}] key '{key}': {source}")]
     InvalidQualifiedName {
         section: &'static str,
@@ -353,12 +369,77 @@ impl std::str::FromStr for Config {
     fn from_str(content: &str) -> Result<Self, Self::Err> {
         let cargo: CargoToml = toml::from_str(content)?;
         let config = cargo.package.metadata.typedpg;
+        config.check_unknown_keys()?;
         config.migrations.validate()?;
         Ok(config)
     }
 }
 
+/// Keys older releases read and this one ignores: accepted so old manifests
+/// keep building, since they never changed what the macros generate.
+const LEGACY_TOP_LEVEL_KEYS: &[&str] = &["analysis_mode"];
+const LEGACY_DATABASE_KEYS: &[&str] = &["docker_image"];
+
+/// Reject the keys of `unknown` that are not `legacy`. A misspelt or
+/// retired key used to be dropped silently — `[…typedpg.domains]` mappings,
+/// say, were just never applied.
+fn reject_unknown(
+    unknown: &BTreeMap<String, toml::Value>,
+    legacy: &[&str],
+    section: &str,
+    expected: &str,
+) -> Result<(), ConfigError> {
+    let Some(key) = unknown.keys().find(|k| !legacy.contains(&k.as_str())) else {
+        return Ok(());
+    };
+    let hint = match key.as_str() {
+        "domains" | "enums" => format!(
+            "the [{section}.{key}] section was replaced by [{section}.types], which maps \
+             domains, enums, composites and scalars alike"
+        ),
+        _ => format!("expected one of {expected}"),
+    };
+    Err(ConfigError::UnknownKey {
+        section: section.to_owned(),
+        key: key.clone(),
+        hint,
+    })
+}
+
 impl Config {
+    /// Reject keys no field reads, at every level of the configuration.
+    fn check_unknown_keys(&self) -> Result<(), ConfigError> {
+        const TOP: &str = "package.metadata.typedpg";
+        const TOP_KEYS: &str = "`database`, `migrations`, `types`, `databases`";
+        const DATABASE_KEYS: &str = "`migrations`, `extra_migrations`";
+        reject_unknown(&self.unknown, LEGACY_TOP_LEVEL_KEYS, TOP, TOP_KEYS)?;
+        reject_unknown(
+            &self.database.unknown,
+            LEGACY_DATABASE_KEYS,
+            &format!("{TOP}.database"),
+            DATABASE_KEYS,
+        )?;
+        let mut names: Vec<_> = self.databases.keys().collect();
+        names.sort();
+        for name in names {
+            let entry = &self.databases[name];
+            let section = format!("{TOP}.databases.{name}");
+            reject_unknown(
+                &entry.unknown,
+                &[],
+                &section,
+                "`database`, `migrations`, `types`",
+            )?;
+            reject_unknown(
+                &entry.database.unknown,
+                LEGACY_DATABASE_KEYS,
+                &format!("{section}.database"),
+                DATABASE_KEYS,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Load config from a `Cargo.toml` file.
     pub fn from_cargo_toml(path: &Path) -> Result<Self, ConfigError> {
         let content = std::fs::read_to_string(path).map_err(|e| ConfigError::Io {
@@ -585,6 +666,60 @@ docker_image = "postgres:16"
 migrations = "./migrations"
 "#;
         Config::from_str(toml).unwrap();
+    }
+
+    fn parse_err(metadata: &str) -> String {
+        let toml = format!("[package]\nname = \"my-app\"\nversion = \"0.1.0\"\n\n{metadata}");
+        Config::from_str(&toml).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn retired_domains_and_enums_sections_are_rejected() {
+        // Both were folded into [types]; ignoring them silently left the
+        // user's mappings unapplied.
+        for section in ["domains", "enums"] {
+            let err = parse_err(&format!(
+                "[package.metadata.typedpg.{section}]\nuser_preferences = \"crate::Prefs\"\n"
+            ));
+            assert_eq!(
+                err,
+                format!(
+                    "unknown key `{section}` in [package.metadata.typedpg]: the \
+                     [package.metadata.typedpg.{section}] section was replaced by \
+                     [package.metadata.typedpg.types], which maps domains, enums, \
+                     composites and scalars alike"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_keys_are_rejected_at_every_level() {
+        assert_eq!(
+            parse_err("[package.metadata.typedpg.type]\nfoo = \"crate::Foo\"\n"),
+            "unknown key `type` in [package.metadata.typedpg]: expected one of \
+             `database`, `migrations`, `types`, `databases`"
+        );
+        assert_eq!(
+            parse_err("[package.metadata.typedpg.database]\nmigration = \"./m\"\n"),
+            "unknown key `migration` in [package.metadata.typedpg.database]: expected one \
+             of `migrations`, `extra_migrations`"
+        );
+        assert_eq!(
+            parse_err("[package.metadata.typedpg.databases.analytics]\ntype = {}\n"),
+            "unknown key `type` in [package.metadata.typedpg.databases.analytics]: expected \
+             one of `database`, `migrations`, `types`"
+        );
+        assert_eq!(
+            parse_err("[package.metadata.typedpg.databases.analytics.database]\npath = \"x\"\n"),
+            "unknown key `path` in [package.metadata.typedpg.databases.analytics.database]: \
+             expected one of `migrations`, `extra_migrations`"
+        );
+        let err = parse_err("[package.metadata.typedpg.migrations]\ntabel = \"x\"\n");
+        assert!(
+            err.contains("unknown field `tabel`, expected one of `table`"),
+            "{err}"
+        );
     }
 
     #[test]
