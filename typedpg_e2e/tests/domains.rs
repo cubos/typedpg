@@ -103,20 +103,25 @@ async fn domain_jsonb_update_replaces_value() {
 #[tokio::test]
 async fn arrays_of_domains_are_read_as_arrays_of_their_base_type() {
     let pool = common::setup().await;
+    let (id1, id2) = (
+        common::unique_id(&pool).await,
+        common::unique_id(&pool).await,
+    );
     let client = pool.get().await.expect("client");
     client
-        .batch_execute(
+        .execute(
             "INSERT INTO domain_arrays (id, nums, prefs) VALUES \
-             (1, '{1,2,3}', ARRAY['{\"theme\": \"dark\", \"newsletter\": false, \
+             ($1, '{1,2,3}', ARRAY['{\"theme\": \"dark\", \"newsletter\": false, \
              \"daily_digest_limit\": 2}'::user_preferences]), \
-             (2, '{}', NULL)",
+             ($2, '{}', NULL)",
+            &[&id1, &id2],
         )
         .await
         .expect("insert");
 
     let rows = sql!(
         &pool,
-        "SELECT id, nums, prefs FROM domain_arrays ORDER BY id"
+        "SELECT id, nums, prefs FROM domain_arrays WHERE id IN ($id1, $id2) ORDER BY id"
     )
     .fetch_all()
     .await

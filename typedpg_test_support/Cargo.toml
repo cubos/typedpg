@@ -1,0 +1,12 @@
+[package]
+name = "typedpg_test_support"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "One PostgreSQL container shared by every test process of a test run"
+
+[dependencies]
+libc = "0.2"
+tokio = { version = "1", features = ["rt", "macros"] }
+tokio-postgres = "0.7"

@@ -13,10 +13,11 @@ struct NewUser {
 #[tokio::test]
 async fn copy_in_loads_rows_and_counts_them() {
     let pool = common::setup().await;
+    let tag = common::unique("copy");
     let users: Vec<NewUser> = (0..1000)
         .map(|i| NewUser {
             name: format!("copy-{i}"),
-            email: format!("copy-{i}@example.com"),
+            email: format!("{tag}-{i}@example.com"),
             age: (i % 2 == 0).then_some(i),
         })
         .collect();
@@ -30,7 +31,7 @@ async fn copy_in_loads_rows_and_counts_them() {
     .expect("copy");
     assert_eq!(copied, 1000);
 
-    let prefix = "copy-%@example.com";
+    let prefix = format!("{tag}-%@example.com");
     let stats = sql!(
         &pool,
         "SELECT count(*) AS n, count(age) AS with_age FROM users WHERE email LIKE $prefix"
@@ -73,9 +74,13 @@ async fn enums_domains_and_their_arrays_round_trip() {
         newsletter: true,
         daily_digest_limit: 3,
     };
+    let (id1, id2) = (
+        common::unique_id(&pool).await,
+        common::unique_id(&pool).await,
+    );
     let rows = vec![
         Target {
-            id: 1,
+            id: id1,
             status: Some(PostStatus::Published),
             statuses: vec![PostStatus::Draft, PostStatus::Archived],
             pref: Some(pref("dark")),
@@ -84,7 +89,7 @@ async fn enums_domains_and_their_arrays_round_trip() {
             amount: Some(Decimal::new(1234, 2)),
         },
         Target {
-            id: 2,
+            id: id2,
             status: None,
             statuses: vec![],
             pref: None,
@@ -113,7 +118,7 @@ async fn enums_domains_and_their_arrays_round_trip() {
     let back = sql!(
         &pool,
         "SELECT id, status, statuses, pref, prefs, tags, amount, doubled \
-         FROM copy_targets ORDER BY id"
+         FROM copy_targets WHERE id IN ($id1, $id2) ORDER BY id"
     )
     .fetch_all()
     .await
@@ -126,7 +131,11 @@ async fn enums_domains_and_their_arrays_round_trip() {
     assert_eq!(first.prefs, Some(vec![pref("a"), pref("b")]));
     assert_eq!(first.tags, ["x", "y"]);
     assert_eq!(first.amount, Some(Decimal::new(1234, 2)));
-    assert_eq!(first.doubled, Some(2), "generated columns are computed");
+    assert_eq!(
+        first.doubled,
+        Some(id1 * 2),
+        "generated columns are computed"
+    );
     let second = &back[1];
     assert_eq!(
         (second.status, second.pref.clone(), second.prefs.clone()),

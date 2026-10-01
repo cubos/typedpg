@@ -37,6 +37,5 @@ futures-core = "0.3"
 futures-util = "0.3"
 
 [dev-dependencies]
-testcontainers = "0.28"
 tempfile = "3"
-libc = "0.2"
+typedpg_test_support = { path = "../typedpg_test_support" }

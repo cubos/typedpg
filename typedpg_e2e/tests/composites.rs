@@ -23,14 +23,15 @@ use typedpg_e2e::{GeoPoint, PostStatus};
 /// Ids of the rows seeded into each table for a single test.
 struct Ids {
     office: i64,
+    warehouse: i64,
     landmark: i64,
     tagged: i64,
     domained: i64,
 }
 
 /// Seed every composite table with raw SQL so the tests can focus on the
-/// *read* path. nextest runs each test in its own process — and `common`
-/// gives each process a fresh container — so the inserts never accumulate.
+/// *read* path. Every test of the run shares the database, so the inserts
+/// accumulate: tests look their rows up by the ids returned here.
 async fn seed(pool: &deadpool_postgres::Pool) -> Ids {
     let client = pool.get().await.expect("get client");
 
@@ -47,14 +48,16 @@ async fn seed(pool: &deadpool_postgres::Pool) -> Ids {
         .expect("seed office")
         .get(0);
 
-    client
-        .execute(
+    let warehouse: i64 = client
+        .query_one(
             "INSERT INTO offices (label, addr, org) VALUES
-                 ('warehouse', ROW('3 Blvd', 'Nice', '06000'), NULL)",
+                 ('warehouse', ROW('3 Blvd', 'Nice', '06000'), NULL)
+             RETURNING id",
             &[],
         )
         .await
-        .expect("seed warehouse");
+        .expect("seed warehouse")
+        .get(0);
 
     let landmark: i64 = client
         .query_one(
@@ -94,6 +97,7 @@ async fn seed(pool: &deadpool_postgres::Pool) -> Ids {
 
     Ids {
         office,
+        warehouse,
         landmark,
         tagged,
         domained,
@@ -146,9 +150,10 @@ async fn select_composite_nested_in_composite() {
 #[tokio::test]
 async fn nullable_composite_column_is_none() {
     let pool = common::setup().await;
-    let _ = seed(&pool).await;
+    let ids = seed(&pool).await;
 
-    let row = sql!(&pool, "SELECT org FROM offices WHERE label = 'warehouse'")
+    let warehouse_id = ids.warehouse;
+    let row = sql!(&pool, "SELECT org FROM offices WHERE id = $warehouse_id")
         .fetch_one()
         .await
         .expect("select null composite");
@@ -224,7 +229,8 @@ async fn insert_with_row_constructor_then_read_back() {
     let pool = common::setup().await;
     let _ = seed(&pool).await;
 
-    let label = "annex";
+    let unique_label = common::unique("annex");
+    let label = unique_label.as_str();
     let street = "9 Lane";
     let city = "Tours";
     let zip = "37000";
