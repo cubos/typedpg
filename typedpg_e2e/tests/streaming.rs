@@ -83,6 +83,10 @@ async fn an_error_while_reading_comes_through_the_stream() {
         Some(&tokio_postgres::error::SqlState::DIVISION_BY_ZERO),
         "{err:?}"
     );
+    assert_eq!(
+        err.to_string(),
+        "database error: division by zero (SQLSTATE 22012)"
+    );
 }
 
 #[tokio::test]

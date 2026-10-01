@@ -204,3 +204,28 @@ async fn fetch_all_returns_multiple_rows() {
     assert!(names.contains(&"Carol"));
     assert!(names.contains(&"Dave"));
 }
+
+#[tokio::test]
+async fn database_errors_display_the_server_message() {
+    let pool = common::setup().await;
+    let email = "dup-display@example.com";
+    sql!(
+        &pool,
+        "INSERT INTO users (name, email) VALUES ('A', $email)"
+    )
+    .execute()
+    .await
+    .expect("first insert");
+    let err = sql!(
+        &pool,
+        "INSERT INTO users (name, email) VALUES ('B', $email)"
+    )
+    .execute()
+    .await
+    .expect_err("duplicate email");
+    assert_eq!(
+        err.to_string(),
+        "database error: duplicate key value violates unique constraint \"users_email_key\" \
+         (SQLSTATE 23505) DETAIL: Key (email)=(dup-display@example.com) already exists."
+    );
+}

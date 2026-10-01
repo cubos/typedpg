@@ -10,7 +10,11 @@
 #[non_exhaustive]
 pub enum Error {
     /// A PostgreSQL protocol or query execution error.
-    #[error("database error: {0}")]
+    ///
+    /// Displayed with the server's message and SQLSTATE (plus its DETAIL and
+    /// HINT), or for a client-side failure with the chain of causes —
+    /// `tokio_postgres::Error`'s own `Display` says only "db error".
+    #[error("database error: {}", DatabaseErrorDisplay(.0))]
     Database(#[from] tokio_postgres::Error),
 
     /// A migration-specific error.
@@ -53,5 +57,31 @@ impl From<deadpool_postgres::PoolError> for Error {
 impl From<bb8::RunError<tokio_postgres::Error>> for Error {
     fn from(e: bb8::RunError<tokio_postgres::Error>) -> Self {
         Error::Pool(e.to_string())
+    }
+}
+
+/// Renders a `tokio_postgres::Error` with what its own `Display` leaves to
+/// `source()`: the server's message, or the underlying causes.
+struct DatabaseErrorDisplay<'a>(&'a tokio_postgres::Error);
+
+impl std::fmt::Display for DatabaseErrorDisplay<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(db) = self.0.as_db_error() {
+            write!(f, "{} (SQLSTATE {})", db.message(), db.code().code())?;
+            if let Some(detail) = db.detail() {
+                write!(f, " DETAIL: {detail}")?;
+            }
+            if let Some(hint) = db.hint() {
+                write!(f, " HINT: {hint}")?;
+            }
+            return Ok(());
+        }
+        write!(f, "{}", self.0)?;
+        let mut source = std::error::Error::source(self.0);
+        while let Some(cause) = source {
+            write!(f, ": {cause}")?;
+            source = cause.source();
+        }
+        Ok(())
     }
 }
