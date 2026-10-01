@@ -62,7 +62,18 @@ fn resolve_type_with_shape(
         }
         return Ok(Type::AnonymousRecord { fields: out });
     }
-    resolve_type(type_oid, typmod, collation, snapshot)
+    let mut ty = resolve_type(type_oid, typmod, collation, snapshot)?;
+    // A composite carrying a shape is a row read from a relation: its
+    // fields are NULL only where the relation's columns may be.
+    if let (Type::Composite { fields, .. }, Some(shape)) = (&mut ty, shape) {
+        for field in fields {
+            field.nullable = shape
+                .iter()
+                .find(|f| f.name == field.name)
+                .is_none_or(|f| f.ty.nullable);
+        }
+    }
+    Ok(ty)
 }
 
 /// The [`Type`] of a table column: its type with the column's typmod and
@@ -226,7 +237,11 @@ fn resolve_type(
                     out.push(crate::types::RecordField {
                         name: f.attname.clone(),
                         ty: resolve_type(f.atttypid, f.atttypmod, f.attcollation, snapshot)?,
-                        nullable: !f.attnotnull,
+                        // A composite type's fields have no NOT NULL of
+                        // their own, not even a table's row type's
+                        // (`ROW(NULL)::t`); `resolve_type_with_shape`
+                        // narrows a row read from the relation.
+                        nullable: true,
                     });
                 }
                 return Ok(Type::Composite {

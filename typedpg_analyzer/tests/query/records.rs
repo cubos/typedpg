@@ -2674,3 +2674,72 @@ fn field_of_record_subquery_is_unidentified_column() {
         );
     }
 }
+
+// ── Field nullability of a table's row type ──────────────────────────────────
+
+/// A table whose row type is used as a value: `holder.r` holds `rt` values,
+/// which PostgreSQL accepts with any field NULL (`ROW(NULL, NULL)::rt`) —
+/// a composite type's fields carry no NOT NULL of their own.
+fn row_type_setup() -> PgCatalog {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE rt (a INT NOT NULL, b TEXT);
+         CREATE TABLE holder (id INT PRIMARY KEY, r rt NOT NULL);",
+    )
+    .unwrap();
+    db
+}
+
+#[test]
+fn field_of_a_row_type_value_is_nullable() {
+    let db = row_type_setup();
+    // `rt.a` is NOT NULL in the table, not in a value of type `rt`.
+    let s = db.analyze("SELECT (r).a AS a FROM holder").unwrap();
+    assert_cols(&s, vec![cn("a", int4())]);
+    let s = db.analyze("SELECT (ROW(NULL, 'x')::rt).a AS a").unwrap();
+    assert_cols(&s, vec![cn("a", int4())]);
+    // Expanding the value, or returning it whole, is no different.
+    let s = db.analyze("SELECT (h.r).* FROM holder h").unwrap();
+    assert_cols(&s, vec![cn("a", int4()), cn("b", text())]);
+    let s = db.analyze("SELECT r FROM holder").unwrap();
+    assert_cols(
+        &s,
+        vec![c(
+            "r",
+            composite("public", "rt", vec![rfn("a", int4()), rfn("b", text())]),
+        )],
+    );
+}
+
+#[test]
+fn field_of_a_row_read_from_its_table_keeps_not_null() {
+    let db = row_type_setup();
+    // A whole-row reference reads stored rows, whose `a` can't be NULL —
+    // also once passed through a subquery.
+    let s = db.analyze("SELECT (t).a AS a FROM rt t").unwrap();
+    assert_cols(&s, vec![c("a", int4())]);
+    let s = db
+        .analyze("SELECT (s.rec).a AS a FROM (SELECT t AS rec FROM rt t) s")
+        .unwrap();
+    assert_cols(&s, vec![c("a", int4())]);
+    let s = db.analyze("SELECT t FROM rt t").unwrap();
+    assert_cols(
+        &s,
+        vec![c(
+            "t",
+            composite("public", "rt", vec![rf("a", int4()), rfn("b", text())]),
+        )],
+    );
+    // The row of an outer join's nullable side is NULL as a whole; its
+    // fields still follow the table.
+    let s = db
+        .analyze("SELECT t FROM holder h LEFT JOIN rt t ON false")
+        .unwrap();
+    assert_cols(
+        &s,
+        vec![cn(
+            "t",
+            composite("public", "rt", vec![rf("a", int4()), rfn("b", text())]),
+        )],
+    );
+}

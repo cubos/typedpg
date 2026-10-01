@@ -153,6 +153,11 @@ fn column_ref_record_fields(cr: &protobuf::ColumnRef, scope: &Scope) -> Option<V
         _ => return None,
     };
     let col = scope.resolve_column(table, column, None).ok()?;
+    // A composite's shape only says which fields are NULL; its fields are
+    // looked up in the catalog (see `composite_field_nullable`).
+    if col.type_oid != oid::RECORD {
+        return None;
+    }
     col.record_fields.clone()
 }
 
@@ -224,7 +229,11 @@ pub(super) fn resolve_composite_field(
     snapshot: &PgCatalog,
     relation_alias: Option<&str>,
 ) -> Result<ExprType, AnalyzeError> {
-    if let Some(shape) = current.record_fields.as_deref() {
+    // Domain-over-composite needs unwrapping to see the composite fields.
+    let base_oid = snapshot.unwrap_domain(current.type_oid);
+    if base_oid == oid::RECORD
+        && let Some(shape) = current.record_fields.as_deref()
+    {
         let field = shape.iter().find(|f| f.name == field_name).ok_or_else(|| {
             AnalyzeError::UndefinedColumn(format!(
                 "could not identify column \"{field_name}\" in record data type"
@@ -243,8 +252,6 @@ pub(super) fn resolve_composite_field(
         });
     }
 
-    // Domain-over-composite needs unwrapping to see the composite fields.
-    let base_oid = snapshot.unwrap_domain(current.type_oid);
     // A `record` whose row shape is unknown here (a `RETURNS record`
     // function without a column definition list): ParseFuncOrColumn finds
     // no field and reports the column, not the type (42703).
@@ -295,9 +302,22 @@ pub(super) fn resolve_composite_field(
 
     Ok(ExprType::scalar_with_typmod(
         field.atttypid,
-        current.nullable || !field.attnotnull,
+        current.nullable || composite_field_nullable(current, field_name),
         field.atttypmod,
     ))
+}
+
+/// Whether field `name` of a non-NULL composite value `value` may be NULL.
+/// A composite type's fields have no NOT NULL of their own: even a table's
+/// row type takes `ROW(NULL)::t`, and a column of type `t` holds whatever
+/// was stored. Only a row read from a relation (whose whole-row reference
+/// carries the relation's columns as its shape) keeps their NOT NULL.
+pub(crate) fn composite_field_nullable(value: &ExprType, name: &str) -> bool {
+    value
+        .record_fields
+        .as_deref()
+        .and_then(|shape| shape.iter().find(|f| f.name == name))
+        .is_none_or(|f| f.ty.nullable)
 }
 
 /// `ARRAY[expr1, expr2, …]` with no target type (see [`transform_array_expr`]).
@@ -517,7 +537,10 @@ pub(crate) fn expand_indirection_star(
         infer_indirection(&inner, ctx, params)?
     };
 
-    if let Some(fields) = &container.record_fields {
+    let base = snapshot.unwrap_domain(container.type_oid);
+    if base == oid::RECORD
+        && let Some(fields) = &container.record_fields
+    {
         return Ok(Some(
             fields
                 .iter()
@@ -529,7 +552,6 @@ pub(crate) fn expand_indirection_star(
                 .collect(),
         ));
     }
-    let base = snapshot.unwrap_domain(container.type_oid);
     let relid = snapshot
         .get_type(base)
         .filter(|t| t.typtype == TypType::Composite)
@@ -602,8 +624,8 @@ pub(crate) fn try_column_projection(
         return Ok(None);
     }
     let has_field = match &t.record_fields {
-        Some(fields) => fields.iter().any(|f| f.name == name.sval),
-        None => snapshot
+        Some(fields) if base == oid::RECORD => fields.iter().any(|f| f.name == name.sval),
+        _ => snapshot
             .get_type(base)
             .and_then(|e| e.typrelid)
             .is_some_and(|relid| {
