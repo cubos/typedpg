@@ -216,7 +216,7 @@ impl PgCatalog {
         self.uncommitted_enum_labels.clear();
         self.enums_created_in_transaction.clear();
         // ON COMMIT DROP temporary tables go.
-        for table in std::mem::take(&mut self.on_commit_drop) {
+        for table in std::mem::take(&mut self.on_commit_drop).into_inner() {
             crate::ddl::drop::drop_relation_by_oid(self, table);
         }
     }

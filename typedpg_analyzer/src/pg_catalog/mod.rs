@@ -91,6 +91,8 @@ pub const INTERNAL_LANGUAGE: PgLanguageOid = PgLanguageOid::from_raw(12);
 pub const C_LANGUAGE: PgLanguageOid = PgLanguageOid::from_raw(13);
 pub const SQL_LANGUAGE: PgLanguageOid = PgLanguageOid::from_raw(14);
 
+mod shared;
+pub use shared::Shared;
 mod pg_query_catalog;
 mod rows;
 pub use rows::*;
@@ -176,58 +178,58 @@ pub struct PgCatalogSeed {
 #[derive(Clone)]
 pub struct PgCatalog {
     // ── Catalog tables ──
-    pub(crate) pg_namespace: HashMap<PgNamespaceOid, PgNamespace>,
-    pub(crate) pg_type: HashMap<PgTypeOid, PgType>,
-    pub(crate) pg_class: HashMap<PgClassOid, PgClass>,
-    pub(crate) pg_proc: HashMap<PgProcOid, PgProc>,
-    pub(crate) pg_aggregate: HashMap<PgProcOid, PgAggregate>,
-    pub(crate) pg_operator: HashMap<PgOperatorOid, PgOperator>,
-    pub(crate) pg_cast: HashMap<PgCastOid, PgCast>,
-    pub(crate) pg_extension: HashMap<PgExtensionOid, PgExtension>,
+    pub(crate) pg_namespace: Shared<HashMap<PgNamespaceOid, PgNamespace>>,
+    pub(crate) pg_type: Shared<HashMap<PgTypeOid, PgType>>,
+    pub(crate) pg_class: Shared<HashMap<PgClassOid, PgClass>>,
+    pub(crate) pg_proc: Shared<HashMap<PgProcOid, PgProc>>,
+    pub(crate) pg_aggregate: Shared<HashMap<PgProcOid, PgAggregate>>,
+    pub(crate) pg_operator: Shared<HashMap<PgOperatorOid, PgOperator>>,
+    pub(crate) pg_cast: Shared<HashMap<PgCastOid, PgCast>>,
+    pub(crate) pg_extension: Shared<HashMap<PgExtensionOid, PgExtension>>,
     /// Keyed by `attrelid`; vec ordered by `attnum`.
-    pub(crate) pg_attribute: HashMap<PgClassOid, Vec<PgAttribute>>,
+    pub(crate) pg_attribute: Shared<HashMap<PgClassOid, Vec<PgAttribute>>>,
     /// Keyed by `enumtypid`; vec ordered by `enumsortorder`.
-    pub(crate) pg_enum: HashMap<PgTypeOid, Vec<PgEnum>>,
+    pub(crate) pg_enum: Shared<HashMap<PgTypeOid, Vec<PgEnum>>>,
     /// Keyed by `rngtypid`.
-    pub(crate) pg_range: HashMap<PgTypeOid, PgRange>,
-    pub(crate) pg_depend: Vec<PgDepend>,
-    pub(crate) pg_inherits: Vec<PgInherits>,
-    pub(crate) pg_constraint: HashMap<PgConstraintOid, PgConstraint>,
+    pub(crate) pg_range: Shared<HashMap<PgTypeOid, PgRange>>,
+    pub(crate) pg_depend: Shared<Vec<PgDepend>>,
+    pub(crate) pg_inherits: Shared<Vec<PgInherits>>,
+    pub(crate) pg_constraint: Shared<HashMap<PgConstraintOid, PgConstraint>>,
     /// Keyed by `indexrelid` (the index's `pg_class.oid`).
-    pub(crate) pg_index: HashMap<PgClassOid, PgIndex>,
+    pub(crate) pg_index: Shared<HashMap<PgClassOid, PgIndex>>,
     pg_rewrite: HashMap<PgRewriteOid, PgRewrite>,
-    pub(crate) pg_collation: HashMap<PgCollationOid, PgCollation>,
-    pub(crate) pg_am: Vec<PgAm>,
-    pub(crate) pg_opfamily: Vec<PgOpfamily>,
-    pub(crate) pg_opclass: Vec<PgOpclass>,
-    pub(crate) pg_amop: Vec<PgAmop>,
-    pub(crate) pg_settings: Vec<PgSetting>,
-    pub(crate) pg_ts_objects: Vec<PgTsObject>,
-    pub(crate) pg_language: HashMap<PgLanguageOid, PgLanguage>,
+    pub(crate) pg_collation: Shared<HashMap<PgCollationOid, PgCollation>>,
+    pub(crate) pg_am: Shared<Vec<PgAm>>,
+    pub(crate) pg_opfamily: Shared<Vec<PgOpfamily>>,
+    pub(crate) pg_opclass: Shared<Vec<PgOpclass>>,
+    pub(crate) pg_amop: Shared<Vec<PgAmop>>,
+    pub(crate) pg_settings: Shared<Vec<PgSetting>>,
+    pub(crate) pg_ts_objects: Shared<Vec<PgTsObject>>,
+    pub(crate) pg_language: Shared<HashMap<PgLanguageOid, PgLanguage>>,
     /// Parsers, templates and options of the text search objects migrations
     /// create.
     pub(crate) ts_definitions: crate::ddl::text_search::TsDefinitions,
     /// Tablespaces, subscriptions and large objects migrations create.
     pub(crate) cluster_objects: crate::ddl::cluster::ClusterObjects,
     /// Transforms (`pg_transform`) migrations create: `(type, language)`.
-    pub(crate) transforms: Vec<(PgTypeOid, String)>,
+    pub(crate) transforms: Shared<Vec<(PgTypeOid, String)>>,
 
     // ── Name-keyed indexes (built by `from_seed`, maintained by DDL) ──
-    pub(crate) namespace_by_name: HashMap<String, PgNamespaceOid>,
+    pub(crate) namespace_by_name: Shared<HashMap<String, PgNamespaceOid>>,
     /// `(typnamespace, typname) -> typoid`.
-    pub(crate) type_by_qname: HashMap<(PgNamespaceOid, String), PgTypeOid>,
+    pub(crate) type_by_qname: Shared<HashMap<(PgNamespaceOid, String), PgTypeOid>>,
     /// `(relnamespace, relname) -> classoid`.
-    pub(crate) class_by_qname: HashMap<(PgNamespaceOid, String), PgClassOid>,
+    pub(crate) class_by_qname: Shared<HashMap<(PgNamespaceOid, String), PgClassOid>>,
     /// `(pronamespace, proname) -> [procoid]` (overloads).
-    pub(crate) proc_by_qname: HashMap<(PgNamespaceOid, String), Vec<PgProcOid>>,
+    pub(crate) proc_by_qname: Shared<HashMap<(PgNamespaceOid, String), Vec<PgProcOid>>>,
     /// `(oprnamespace, oprname) -> [opoid]` (overloads).
-    pub(crate) operator_by_qname: HashMap<(PgNamespaceOid, String), Vec<PgOperatorOid>>,
+    pub(crate) operator_by_qname: Shared<HashMap<(PgNamespaceOid, String), Vec<PgOperatorOid>>>,
     /// `(castsource, casttarget) -> castoid`.
-    pub(crate) cast_by_pair: HashMap<(PgTypeOid, PgTypeOid), PgCastOid>,
-    pub(crate) extension_by_name: HashMap<String, PgExtensionOid>,
+    pub(crate) cast_by_pair: Shared<HashMap<(PgTypeOid, PgTypeOid), PgCastOid>>,
+    pub(crate) extension_by_name: Shared<HashMap<String, PgExtensionOid>>,
     /// `(collnamespace, collname) -> collation_oid`. Walked by analyzer
     /// when validating `COLLATE "x"` decorations.
-    pub(crate) collation_by_qname: HashMap<(PgNamespaceOid, String), PgCollationOid>,
+    pub(crate) collation_by_qname: Shared<HashMap<(PgNamespaceOid, String), PgCollationOid>>,
 
     // ── Session state (non-PG) ──
     /// Namespace OIDs in search order (analog of PG's `search_path` GUC).
@@ -243,12 +245,13 @@ pub struct PgCatalog {
     /// with `contypid` set): what `ALTER DOMAIN ... DROP CONSTRAINT name`
     /// resolves against. The domain's effective NOT NULL lives in
     /// `pg_type.typnotnull`.
-    pub(crate) domain_constraints: HashMap<PgTypeOid, Vec<crate::ddl::types::DomainConstraint>>,
+    pub(crate) domain_constraints:
+        Shared<HashMap<PgTypeOid, Vec<crate::ddl::types::DomainConstraint>>>,
     /// Type of each column DEFAULT expression as `strip_implicit_coercions`
     /// sees it (the expression's own type, before the coercion to the
     /// column type that `cookDefault` adds) — what ALTER COLUMN TYPE
     /// re-coerces (PG keeps the expression in `pg_attrdef`).
-    pub(crate) attr_default_types: HashMap<(PgClassOid, i16), PgTypeOid>,
+    pub(crate) attr_default_types: Shared<HashMap<(PgClassOid, i16), PgTypeOid>>,
     /// Canonical text of each column DEFAULT / generation expression —
     /// what MergeAttributes compares when several parents give a column a
     /// default (PG compares the cooked `pg_attrdef` trees).
@@ -258,55 +261,55 @@ pub struct PgCatalog {
     /// column (PG records them as `pg_depend` rows of the column's
     /// `pg_attrdef` entry): DROP COLUMN of such a column needs CASCADE and
     /// takes the generated column along; ALTER COLUMN TYPE of it is refused.
-    pub(crate) generated_refs: HashMap<(PgClassOid, i16), Vec<i16>>,
+    pub(crate) generated_refs: Shared<HashMap<(PgClassOid, i16), Vec<i16>>>,
     /// The `check_function_bodies` GUC (pg_dump output turns it off).
     pub(crate) check_function_bodies: bool,
     /// The single expression of each inlinable `LANGUAGE sql` function
     /// (`SELECT expr` / `RETURN expr`, as `inline_function` requires),
     /// which PG substitutes for the call before checking an index or
     /// generation expression's mutability.
-    pub(crate) inline_sql_bodies: HashMap<PgProcOid, typedpg_pg_query::protobuf::Node>,
+    pub(crate) inline_sql_bodies: Shared<HashMap<PgProcOid, typedpg_pg_query::protobuf::Node>>,
     /// Seeded `pg_get_functiondef` sources behind `inline_sql_bodies`,
     /// kept so `to_seed` round-trips them.
     sql_function_defs: HashMap<PgProcOid, String>,
     /// `pg_partitioned_table.partattrs` of each partitioned table: the
     /// partition key's attnums, `0` for an expression.
-    pub(crate) partition_keys: HashMap<PgClassOid, Vec<i16>>,
+    pub(crate) partition_keys: Shared<HashMap<PgClassOid, Vec<i16>>>,
     /// `pg_trigger`: each relation's triggers (name and function).
-    pub(crate) triggers: HashMap<PgClassOid, Vec<crate::ddl::triggers::Trigger>>,
+    pub(crate) triggers: Shared<HashMap<PgClassOid, Vec<crate::ddl::triggers::Trigger>>>,
     /// `pg_policy`: each relation's row-security policy names.
-    pub(crate) policies: HashMap<PgClassOid, Vec<crate::ddl::policies::Policy>>,
+    pub(crate) policies: Shared<HashMap<PgClassOid, Vec<crate::ddl::policies::Policy>>>,
     /// `pg_rewrite` rule names added by CREATE RULE, per relation.
-    pub(crate) rules: HashMap<PgClassOid, Vec<crate::ddl::rules::Rule>>,
+    pub(crate) rules: Shared<HashMap<PgClassOid, Vec<crate::ddl::rules::Rule>>>,
     /// What the rewriter needs to auto-update each view created by DDL
     /// (view_query_is_auto_updatable / view_col_is_auto_updatable over its
     /// stored query).
-    pub(crate) view_updatability: HashMap<PgClassOid, crate::ddl::views::ViewUpdatability>,
+    pub(crate) view_updatability: Shared<HashMap<PgClassOid, crate::ddl::views::ViewUpdatability>>,
     /// `pg_class.reloftype` of typed tables (`CREATE TABLE ... OF type`).
-    pub(crate) typed_tables: HashMap<PgClassOid, PgTypeOid>,
+    pub(crate) typed_tables: Shared<HashMap<PgClassOid, PgTypeOid>>,
     /// The `indisclustered` index of each table (CLUSTER ... USING,
     /// ALTER TABLE ... CLUSTER ON).
-    pub(crate) clustered_indexes: HashMap<PgClassOid, PgClassOid>,
+    pub(crate) clustered_indexes: Shared<HashMap<PgClassOid, PgClassOid>>,
     /// `pg_statistic_ext`: extended statistics objects.
-    pub(crate) statistics: Vec<crate::ddl::statistics::StatisticsObject>,
+    pub(crate) statistics: Shared<Vec<crate::ddl::statistics::StatisticsObject>>,
     /// `relam` of indexes created with a non-default access method
     /// (btree when absent).
-    pub(crate) index_access_methods: HashMap<PgClassOid, String>,
+    pub(crate) index_access_methods: Shared<HashMap<PgClassOid, String>>,
     /// Partition index -> the partitioned index it belongs to (PG keeps
     /// these in `pg_inherits`).
-    pub(crate) index_parents: HashMap<PgClassOid, PgClassOid>,
+    pub(crate) index_parents: Shared<HashMap<PgClassOid, PgClassOid>>,
     /// Indexes of DEFERRABLE constraints (`pg_index.indimmediate = false`).
-    pub(crate) nonimmediate_indexes: std::collections::HashSet<PgClassOid>,
+    pub(crate) nonimmediate_indexes: Shared<std::collections::HashSet<PgClassOid>>,
     /// Indexes with `pg_index.indisvalid = false`: a partitioned index
     /// created ON ONLY a table with partitions, until every partition has
     /// one attached.
-    pub(crate) invalid_indexes: std::collections::HashSet<PgClassOid>,
+    pub(crate) invalid_indexes: Shared<std::collections::HashSet<PgClassOid>>,
     /// What `pg_index` keeps per key column beyond `indkey` (`indclass`,
     /// `indcollation`, `indoption`, `indnullsnotdistinct`) and an exclusion
     /// constraint's operators, for the indexes DDL creates.
-    pub(crate) index_keys: HashMap<PgClassOid, crate::ddl::indexes::IndexKeys>,
+    pub(crate) index_keys: Shared<HashMap<PgClassOid, crate::ddl::indexes::IndexKeys>>,
     /// `pg_sequence` rows of the sequences migrations create.
-    pub(crate) sequence_params: HashMap<PgClassOid, crate::ddl::seqparams::SeqParams>,
+    pub(crate) sequence_params: Shared<HashMap<PgClassOid, crate::ddl::seqparams::SeqParams>>,
     /// Foreign-data wrappers, servers, user mappings, foreign tables'
     /// servers.
     pub(crate) foreign_data: crate::ddl::fdw::ForeignData,
@@ -314,12 +317,12 @@ pub struct PgCatalog {
     pub(crate) installing_extension: Option<String>,
     /// The index of each table's `REPLICA IDENTITY USING INDEX`
     /// (`relreplident = 'i'`).
-    pub(crate) replica_identity_indexes: HashMap<PgClassOid, PgClassOid>,
+    pub(crate) replica_identity_indexes: Shared<HashMap<PgClassOid, PgClassOid>>,
     /// Logical-replication publications.
-    pub(crate) publications: Vec<crate::ddl::publications::Publication>,
+    pub(crate) publications: Shared<Vec<crate::ddl::publications::Publication>>,
     /// `relpersistence` of unlogged (`u`) and temporary (`t`) relations;
     /// absent means permanent.
-    pub(crate) relpersistence: HashMap<PgClassOid, char>,
+    pub(crate) relpersistence: Shared<HashMap<PgClassOid, char>>,
     /// The migration session's temporary schema (`pg_temp`), once a
     /// temporary relation was created.
     pub(crate) temp_namespace: Option<PgNamespaceOid>,
@@ -337,43 +340,47 @@ pub struct PgCatalog {
     /// a bare simple query, as `batch_execute` alone does.
     pub(crate) migrations_use_transaction: bool,
     /// `ON COMMIT DROP` temporary tables of the current transaction.
-    pub(crate) on_commit_drop: Vec<PgClassOid>,
+    pub(crate) on_commit_drop: Shared<Vec<PgClassOid>>,
     /// Materialized views created or refreshed WITH NO DATA.
-    pub(crate) unpopulated_matviews: std::collections::HashSet<PgClassOid>,
+    pub(crate) unpopulated_matviews: Shared<std::collections::HashSet<PgClassOid>>,
     /// Encoding conversions created by migrations.
-    pub(crate) conversions: Vec<(String, PgNamespaceOid)>,
+    pub(crate) conversions: Shared<Vec<(String, PgNamespaceOid)>>,
     /// Event triggers and the function each executes.
-    pub(crate) event_triggers: Vec<(String, crate::oid::PgProcOid)>,
+    pub(crate) event_triggers: Shared<Vec<(String, crate::oid::PgProcOid)>>,
     /// Enum labels added in the current transaction to a type created
     /// before it: unusable until committed (check_safe_enum_use).
-    pub(crate) uncommitted_enum_labels: std::collections::HashSet<(PgTypeOid, String)>,
+    pub(crate) uncommitted_enum_labels: Shared<std::collections::HashSet<(PgTypeOid, String)>>,
     /// Enum types created in the current transaction (their new labels
     /// are safe).
-    pub(crate) enums_created_in_transaction: std::collections::HashSet<PgTypeOid>,
+    pub(crate) enums_created_in_transaction: Shared<std::collections::HashSet<PgTypeOid>>,
     /// `pg_partitioned_table`: strategy and key types.
-    pub(crate) partition_specs: HashMap<PgClassOid, crate::ddl::tables::partbound::PartSpec>,
+    pub(crate) partition_specs:
+        Shared<HashMap<PgClassOid, crate::ddl::tables::partbound::PartSpec>>,
     /// Every column a partitioned table's key reads — as a key column or
     /// inside a key expression (`has_partition_attrs`).
-    pub(crate) partition_key_attrs: HashMap<PgClassOid, Vec<i16>>,
+    pub(crate) partition_key_attrs: Shared<HashMap<PgClassOid, Vec<i16>>>,
     /// Foreign keys' actions, match type, deferrability and parent
     /// (`confupdtype`, ..., `conparentid`).
-    pub(crate) fk_details: HashMap<PgConstraintOid, crate::ddl::tables::foreign_keys::FkDetails>,
+    pub(crate) fk_details:
+        Shared<HashMap<PgConstraintOid, crate::ddl::tables::foreign_keys::FkDetails>>,
     /// `relpartbound` of each partition.
-    pub(crate) partition_bounds: HashMap<PgClassOid, crate::ddl::tables::partbound::Bound>,
+    pub(crate) partition_bounds: Shared<HashMap<PgClassOid, crate::ddl::tables::partbound::Bound>>,
     /// CHECK constraints' expressions and `connoinherit`.
-    pub(crate) check_defs: HashMap<PgConstraintOid, crate::ddl::tables::check_inherit::CheckDef>,
+    pub(crate) check_defs:
+        Shared<HashMap<PgConstraintOid, crate::ddl::tables::check_inherit::CheckDef>>,
     /// Tables and materialized views with a TOAST table (`reltoastrelid`):
     /// the CREATE or ALTER that first left them with a column needing one
     /// (needs_toast_table) made it, and it stays.
-    pub(crate) toast_tables: std::collections::HashSet<PgClassOid>,
+    pub(crate) toast_tables: Shared<std::collections::HashSet<PgClassOid>>,
     /// `attstorage` of the columns whose storage isn't their type's
     /// `typstorage` (a STORAGE clause, ALTER COLUMN SET STORAGE).
-    pub(crate) attr_storage: HashMap<(PgClassOid, i16), TypStorage>,
+    pub(crate) attr_storage: Shared<HashMap<(PgClassOid, i16), TypStorage>>,
     /// The column / relation dependencies of policies, triggers, rules and
     /// SQL-standard function bodies.
     pub(crate) column_deps: crate::ddl::coldeps::ColumnDeps,
     /// The migration session's prepared statements (PREPARE), by name.
-    pub(crate) prepared_statements: HashMap<String, crate::ddl::prepared::PreparedStatement>,
+    pub(crate) prepared_statements:
+        Shared<HashMap<String, crate::ddl::prepared::PreparedStatement>>,
     /// `pg_type.typsubscript` of user base types, as the handler function's
     /// name (`hstore_subscript_handler`), set by `CREATE TYPE (SUBSCRIPT =
     /// …)` / `ALTER TYPE … SET (SUBSCRIPT = …)`. Built-in types aren't
@@ -553,8 +560,8 @@ impl PgCatalog {
             cat.extension_by_name.insert(e.extname.clone(), e.oid);
             cat.pg_extension.insert(e.oid, e);
         }
-        cat.pg_depend = seed.pg_depend;
-        cat.pg_inherits = seed.pg_inherits;
+        cat.pg_depend = seed.pg_depend.into();
+        cat.pg_inherits = seed.pg_inherits.into();
         for c in seed.pg_constraint {
             cat.pg_constraint.insert(c.oid, c);
         }
@@ -569,15 +576,20 @@ impl PgCatalog {
                 .insert((c.collnamespace, c.collname.clone()), c.oid);
             cat.pg_collation.insert(c.oid, c);
         }
-        cat.pg_am = seed.pg_am;
-        cat.pg_opfamily = seed.pg_opfamily;
-        cat.pg_opclass = seed.pg_opclass;
-        cat.pg_amop = seed.pg_amop;
-        cat.pg_settings = seed.pg_settings;
-        cat.pg_ts_objects = seed.pg_ts_objects;
-        cat.pg_language = seed.pg_language.into_iter().map(|l| (l.oid, l)).collect();
+        cat.pg_am = seed.pg_am.into();
+        cat.pg_opfamily = seed.pg_opfamily.into();
+        cat.pg_opclass = seed.pg_opclass.into();
+        cat.pg_amop = seed.pg_amop.into();
+        cat.pg_settings = seed.pg_settings.into();
+        cat.pg_ts_objects = seed.pg_ts_objects.into();
+        cat.pg_language = seed
+            .pg_language
+            .into_iter()
+            .map(|l| (l.oid, l))
+            .collect::<HashMap<_, _>>()
+            .into();
         if cat.pg_language.is_empty() {
-            cat.pg_language = default_languages();
+            cat.pg_language = default_languages().into();
         }
         for (oid, definition) in seed.sql_function_defs {
             cat.add_sql_function_def(oid, definition);
@@ -592,88 +604,88 @@ impl PgCatalog {
     /// subselects whose RangeVars are already fully qualified.
     fn empty() -> Self {
         Self {
-            pg_namespace: HashMap::new(),
-            pg_type: HashMap::new(),
-            pg_class: HashMap::new(),
-            pg_proc: HashMap::new(),
-            pg_aggregate: HashMap::new(),
-            pg_operator: HashMap::new(),
-            pg_cast: HashMap::new(),
-            pg_extension: HashMap::new(),
-            pg_attribute: HashMap::new(),
-            pg_enum: HashMap::new(),
-            pg_range: HashMap::new(),
-            pg_depend: Vec::new(),
-            pg_inherits: Vec::new(),
-            pg_constraint: HashMap::new(),
-            pg_index: HashMap::new(),
+            pg_namespace: Shared::default(),
+            pg_type: Shared::default(),
+            pg_class: Shared::default(),
+            pg_proc: Shared::default(),
+            pg_aggregate: Shared::default(),
+            pg_operator: Shared::default(),
+            pg_cast: Shared::default(),
+            pg_extension: Shared::default(),
+            pg_attribute: Shared::default(),
+            pg_enum: Shared::default(),
+            pg_range: Shared::default(),
+            pg_depend: Shared::default(),
+            pg_inherits: Shared::default(),
+            pg_constraint: Shared::default(),
+            pg_index: Shared::default(),
             pg_rewrite: HashMap::new(),
-            pg_collation: HashMap::new(),
-            pg_am: Vec::new(),
-            pg_opfamily: Vec::new(),
-            pg_opclass: Vec::new(),
-            pg_amop: Vec::new(),
-            pg_settings: Vec::new(),
-            pg_ts_objects: Vec::new(),
-            pg_language: HashMap::new(),
+            pg_collation: Shared::default(),
+            pg_am: Shared::default(),
+            pg_opfamily: Shared::default(),
+            pg_opclass: Shared::default(),
+            pg_amop: Shared::default(),
+            pg_settings: Shared::default(),
+            pg_ts_objects: Shared::default(),
+            pg_language: Shared::default(),
             ts_definitions: Default::default(),
             cluster_objects: Default::default(),
-            transforms: Vec::new(),
-            prepared_statements: HashMap::new(),
-            namespace_by_name: HashMap::new(),
-            type_by_qname: HashMap::new(),
-            class_by_qname: HashMap::new(),
-            proc_by_qname: HashMap::new(),
-            operator_by_qname: HashMap::new(),
-            cast_by_pair: HashMap::new(),
-            extension_by_name: HashMap::new(),
-            collation_by_qname: HashMap::new(),
+            transforms: Shared::default(),
+            prepared_statements: Shared::default(),
+            namespace_by_name: Shared::default(),
+            type_by_qname: Shared::default(),
+            class_by_qname: Shared::default(),
+            proc_by_qname: Shared::default(),
+            operator_by_qname: Shared::default(),
+            cast_by_pair: Shared::default(),
+            extension_by_name: Shared::default(),
+            collation_by_qname: Shared::default(),
             search_path: Vec::new(),
             search_path_guc: Default::default(),
             session_identity: Default::default(),
-            domain_constraints: HashMap::new(),
-            attr_default_types: HashMap::new(),
+            domain_constraints: Shared::default(),
+            attr_default_types: Shared::default(),
             attr_default_exprs: HashMap::new(),
-            generated_refs: HashMap::new(),
+            generated_refs: Shared::default(),
             check_function_bodies: true,
-            inline_sql_bodies: HashMap::new(),
+            inline_sql_bodies: Shared::default(),
             sql_function_defs: HashMap::new(),
-            partition_keys: HashMap::new(),
-            triggers: HashMap::new(),
-            view_updatability: HashMap::new(),
-            policies: HashMap::new(),
-            rules: HashMap::new(),
-            typed_tables: HashMap::new(),
-            clustered_indexes: HashMap::new(),
-            statistics: Vec::new(),
-            index_access_methods: HashMap::new(),
-            index_parents: HashMap::new(),
-            nonimmediate_indexes: std::collections::HashSet::new(),
-            invalid_indexes: std::collections::HashSet::new(),
-            index_keys: HashMap::new(),
-            sequence_params: HashMap::new(),
+            partition_keys: Shared::default(),
+            triggers: Shared::default(),
+            view_updatability: Shared::default(),
+            policies: Shared::default(),
+            rules: Shared::default(),
+            typed_tables: Shared::default(),
+            clustered_indexes: Shared::default(),
+            statistics: Shared::default(),
+            index_access_methods: Shared::default(),
+            index_parents: Shared::default(),
+            nonimmediate_indexes: Shared::default(),
+            invalid_indexes: Shared::default(),
+            index_keys: Shared::default(),
+            sequence_params: Shared::default(),
             foreign_data: Default::default(),
             installing_extension: None,
-            replica_identity_indexes: HashMap::new(),
-            publications: Vec::new(),
-            event_triggers: Vec::new(),
-            relpersistence: HashMap::new(),
+            replica_identity_indexes: Shared::default(),
+            publications: Shared::default(),
+            event_triggers: Shared::default(),
+            relpersistence: Shared::default(),
             temp_namespace: None,
             in_migration: false,
             migrations_use_transaction: false,
             statement_sql: None,
-            on_commit_drop: Vec::new(),
-            unpopulated_matviews: std::collections::HashSet::new(),
-            conversions: Vec::new(),
-            uncommitted_enum_labels: Default::default(),
-            enums_created_in_transaction: Default::default(),
-            partition_specs: HashMap::new(),
-            partition_key_attrs: HashMap::new(),
-            fk_details: HashMap::new(),
-            partition_bounds: HashMap::new(),
-            check_defs: HashMap::new(),
-            toast_tables: std::collections::HashSet::new(),
-            attr_storage: HashMap::new(),
+            on_commit_drop: Shared::default(),
+            unpopulated_matviews: Shared::default(),
+            conversions: Shared::default(),
+            uncommitted_enum_labels: Shared::default(),
+            enums_created_in_transaction: Shared::default(),
+            partition_specs: Shared::default(),
+            partition_key_attrs: Shared::default(),
+            fk_details: Shared::default(),
+            partition_bounds: Shared::default(),
+            check_defs: Shared::default(),
+            toast_tables: Shared::default(),
+            attr_storage: Shared::default(),
             column_deps: Default::default(),
             next_oid: USER_OID_START_NZ,
             #[cfg(feature = "pg_sanity")]
@@ -736,7 +748,7 @@ impl PgCatalog {
         let mut pg_extension: Vec<_> = self.pg_extension.values().cloned().collect();
         pg_extension.sort_by_key(|e| e.oid);
 
-        let mut pg_depend = self.pg_depend.clone();
+        let mut pg_depend = Vec::clone(&self.pg_depend);
         pg_depend.sort_by_key(|d| (d.classid, d.objid, d.objsubid, d.refclassid, d.refobjid));
         // The seed replays its views, which record rows PG exported already.
         let mut seen = std::collections::HashSet::new();
@@ -752,7 +764,7 @@ impl PgCatalog {
             ))
         });
 
-        let mut pg_inherits = self.pg_inherits.clone();
+        let mut pg_inherits = Vec::clone(&self.pg_inherits);
         pg_inherits.sort_by_key(|i| (i.inhrelid, i.inhseqno));
 
         let mut pg_constraint: Vec<_> = self.pg_constraint.values().cloned().collect();
@@ -786,12 +798,12 @@ impl PgCatalog {
             pg_rewrite,
             pg_collation,
             search_path: self.search_path_guc.new_session_setting(),
-            pg_am: self.pg_am.clone(),
-            pg_opfamily: self.pg_opfamily.clone(),
-            pg_opclass: self.pg_opclass.clone(),
-            pg_amop: self.pg_amop.clone(),
-            pg_settings: self.pg_settings.clone(),
-            pg_ts_objects: self.pg_ts_objects.clone(),
+            pg_am: Vec::clone(&self.pg_am),
+            pg_opfamily: Vec::clone(&self.pg_opfamily),
+            pg_opclass: Vec::clone(&self.pg_opclass),
+            pg_amop: Vec::clone(&self.pg_amop),
+            pg_settings: Vec::clone(&self.pg_settings),
+            pg_ts_objects: Vec::clone(&self.pg_ts_objects),
             pg_language: {
                 let mut rows: Vec<_> = self.pg_language.values().cloned().collect();
                 rows.sort_by_key(|l| l.oid);
