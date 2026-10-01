@@ -113,6 +113,17 @@ pub(crate) struct LexOutput {
 }
 
 impl LexOutput {
+    /// The output of lexing `sql` with nothing to rewrite: offsets map to
+    /// themselves. For SQL that isn't a `sql!` template (a migration).
+    pub(crate) fn identity(sql: &str) -> Self {
+        Self {
+            sql: sql.to_owned(),
+            params: Vec::new(),
+            spreads: Vec::new(),
+            rewrites: Vec::new(),
+        }
+    }
+
     /// Translate a byte offset from the post-lex SQL back into the original
     /// SQL. If `post_lex` falls inside a removed/rewritten token, returns the
     /// start of that token in the original SQL.

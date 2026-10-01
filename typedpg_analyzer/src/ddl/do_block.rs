@@ -59,6 +59,8 @@ pub(crate) fn execute(
     interp: &mut PgCatalog,
     stmt: &typedpg_pg_query::protobuf::DoStmt,
 ) -> Result<(), DdlError> {
+    // The block's statements are parsed from its code, not the migration.
+    let _barrier = crate::error::DiagContextGuard::barrier();
     let mut code = None;
     let mut language = "plpgsql".to_owned();
     for arg in &stmt.args {

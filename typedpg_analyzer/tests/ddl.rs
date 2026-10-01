@@ -30,6 +30,8 @@ mod extensions;
 mod functions;
 #[path = "ddl/generated.rs"]
 mod generated;
+#[path = "ddl/located.rs"]
+mod located;
 #[path = "ddl/misc.rs"]
 mod misc;
 #[path = "ddl/not_null.rs"]

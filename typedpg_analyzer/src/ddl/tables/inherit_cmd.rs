@@ -502,6 +502,8 @@ pub(super) fn detach_partition(
         }
     }
     if let Some((expr, vars)) = partition_check {
+        // The constraint is parsed from SQL built for it.
+        let _barrier = crate::error::DiagContextGuard::barrier();
         add_detached_partition_check(interp, part, expr, &vars)?;
     }
     Ok(())
