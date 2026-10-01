@@ -233,6 +233,29 @@ fn update_varchar_too_long_rejected() {
 }
 
 #[test]
+fn char_length_ignores_excess_spaces() {
+    // varchar_input / bpchar_input drop the characters past the length
+    // when they are all spaces: PG stores 'abc' for 'abc   '.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE t (slug VARCHAR(3) NOT NULL, code CHAR(2));")
+        .unwrap();
+    db.analyze("INSERT INTO t VALUES ('abc   ', 'xy  ')")
+        .unwrap();
+    db.analyze("UPDATE t SET slug = 'abc ', code = 'x '")
+        .unwrap();
+    assert_analyze_err!(
+        db.analyze("UPDATE t SET slug = 'ab c'"),
+        AnalyzeError::Invalid(_),
+        "value too long for type character varying(3)",
+    );
+    assert_analyze_err!(
+        db.analyze("INSERT INTO t VALUES ('abc', 'xy z')"),
+        AnalyzeError::Invalid(_),
+        "value too long for type character(2)",
+    );
+}
+
+#[test]
 fn update_numeric_overflow_rejected() {
     // Compile-time guard: PG only catches numeric overflow at execution
     // time, so pglite's `prepare` doesn't see it. Opt out of the mirror.
