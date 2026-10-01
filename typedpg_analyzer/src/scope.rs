@@ -412,24 +412,43 @@ pub(crate) fn undefined_dml_column_error(
 /// Build the public-facing `UndefinedColumn` error.
 ///
 /// `message` is the PG-verbatim first line — callers pick the wording
-/// matching PG's behavior (bare column, qualified column, ambiguous, or
-/// "invalid reference to FROM-clause entry"). `column` is the bare column
-/// name used for the "did you mean" suggestion; `scope` is searched for
-/// candidate column names.
+/// matching PG's behavior (bare or qualified column). `qualifier` is the
+/// table the user named, if any; the hint is [`Scope::column_hint`]'s.
 fn undefined_column_error(
     scope: &Scope,
+    qualifier: Option<&str>,
     column: &str,
     message: String,
     span: Option<SourceSpan>,
 ) -> AnalyzeError {
-    let candidates: Vec<&str> = scope
-        .all_columns()
-        .iter()
-        .map(|c| c.name.as_str())
-        .collect();
-    let hint = suggest_similar(column, candidates.iter().copied())
-        .map(|c| format!("did you mean \"{c}\"?"));
+    let hint = scope.column_hint(qualifier, column);
     RawError::undefined_column(message, span, hint).finalize_implicit()
+}
+
+/// PG's hint naming a column (errorMissingColumn): `Perhaps you meant to
+/// reference the column "t.c".`, or `… "a.c" or the column "b.c".` for
+/// two equally good matches. PG builds it from the raw names
+/// (`"%s.%s"`), unquoted — so do we.
+fn perhaps_column_hint(matches: &[(&str, &str)]) -> Option<String> {
+    let name = |(alias, column): &(&str, &str)| {
+        if is_hidden_alias(alias) {
+            (*column).to_owned()
+        } else {
+            format!("{alias}.{column}")
+        }
+    };
+    match matches {
+        [one] => Some(format!(
+            "Perhaps you meant to reference the column \"{}\".",
+            name(one)
+        )),
+        [a, b] => Some(format!(
+            "Perhaps you meant to reference the column \"{}\" or the column \"{}\".",
+            name(a),
+            name(b)
+        )),
+        _ => None,
+    }
 }
 
 impl Scope {
@@ -659,6 +678,7 @@ impl Scope {
             if alias_exists {
                 return Err(undefined_column_error(
                     self,
+                    Some(t),
                     column,
                     format!("column {} does not exist", QualifiedName::new(t, column)),
                     span,
@@ -671,20 +691,44 @@ impl Scope {
             // The same wording covers qualifying by a table's *real* name
             // when the FROM entry gave it an alias (`SELECT users.id FROM
             // users u` — PG hints at the alias).
-            let aliased_away = self
+            let aliased_as = self
                 .all_tiers()
-                .any(|s| s.alias != t && s.source_qn.as_ref().is_some_and(|qn| qn.name == t));
-            if aliased_away || self.shadowed_sources.iter().any(|s| s.alias == t) {
+                .chain(self.shadowed_sources.iter())
+                .find(|s| s.alias != t && s.source_qn.as_ref().is_some_and(|qn| qn.name == t))
+                .map(|s| s.alias.clone());
+            let shadowed = self.shadowed_sources.iter().any(|s| s.alias == t);
+            if aliased_as.is_some() || shadowed {
                 // PG classifies this as undefined_table (42P01): the entry
-                // exists but is not referencable from here.
-                return Err(crate::error::RawError::new(
+                // exists but is not referencable from here. Its hint
+                // (errorMissingRTE) names the alias a relation was given;
+                // otherwise its detail says why the entry is out of reach.
+                let (hint, note) = match aliased_as.filter(|a| !is_hidden_alias(a)) {
+                    Some(alias) => (
+                        Some(format!(
+                            "Perhaps you meant to reference the table alias \"{alias}\"."
+                        )),
+                        None,
+                    ),
+                    None => (
+                        None,
+                        Some(format!(
+                            "There is an entry for table \"{t}\", but it cannot be referenced \
+                             from this part of the query."
+                        )),
+                    ),
+                };
+                let mut err = crate::error::RawError::new(
                     AnalyzeError::UndefinedTable(format!(
                         "invalid reference to FROM-clause entry for table \"{t}\""
                     )),
                     span,
-                    None,
+                    hint,
                 )
-                .finalize_implicit());
+                .with_primary_label("not referencable here");
+                if let Some(note) = note {
+                    err = err.with_note(note);
+                }
+                return Err(err.finalize_implicit());
             }
             // The alias matches nothing in scope at all — PG reports the
             // missing FROM entry (42P01), not a missing column.
@@ -693,8 +737,9 @@ impl Scope {
                     "missing FROM-clause entry for table \"{t}\""
                 )),
                 span,
-                None,
+                self.missing_entry_hint(t),
             )
+            .with_primary_label("no FROM-clause entry by this name")
             .finalize_implicit());
         }
 
@@ -738,14 +783,70 @@ impl Scope {
         }
         Err(undefined_column_error(
             self,
+            None,
             column,
             format!("column \"{column}\" does not exist"),
             span,
         ))
     }
 
-    pub fn all_columns(&self) -> Vec<&ScopeColumn> {
-        self.sources.iter().flat_map(|s| s.columns.iter()).collect()
+    /// The hint for a column reference nothing in scope resolved, like
+    /// PG's errorMissingColumn: for `t.col`, a close name among `t`'s
+    /// columns, else the other entries that have `col` exactly; for a bare
+    /// `col`, the close names across every entry, qualified by the entry
+    /// (when one or two entries have the best one).
+    fn column_hint(&self, qualifier: Option<&str>, column: &str) -> Option<String> {
+        let entries: Vec<&TableSource> = self.all_tiers().filter(|s| !s.table_only).collect();
+        fn columns_of<'a>(s: &&'a TableSource) -> Vec<(&'a str, &'a str)> {
+            s.visible_columns()
+                .map(|c| (s.alias.as_str(), c.name.as_str()))
+                .collect()
+        }
+        if let Some(t) = qualifier {
+            let named: Vec<(&str, &str)> = entries
+                .iter()
+                .filter(|s| s.alias == t)
+                .flat_map(columns_of)
+                .collect();
+            if let Some(best) = crate::suggest::suggest_similar(column, named.iter().map(|c| c.1)) {
+                return perhaps_column_hint(&[(t, best)]);
+            }
+            let elsewhere: Vec<(&str, &str)> = entries
+                .iter()
+                .filter(|s| s.alias != t)
+                .flat_map(columns_of)
+                .filter(|c| c.1 == column)
+                .collect();
+            return perhaps_column_hint(&elsewhere);
+        }
+        let all: Vec<(&str, &str)> = entries.iter().flat_map(columns_of).collect();
+        let best = crate::suggest::suggest_similar(column, all.iter().map(|c| c.1))?;
+        let mut holders: Vec<(&str, &str)> = all.into_iter().filter(|c| c.1 == best).collect();
+        holders.dedup();
+        perhaps_column_hint(&holders).or_else(|| Some(format!("did you mean \"{best}\"?")))
+    }
+
+    /// The hint for `missing FROM-clause entry for table "t"`: a similar
+    /// entry name, else the entries this level has.
+    fn missing_entry_hint(&self, t: &str) -> Option<String> {
+        let names: Vec<&str> = self
+            .all_tiers()
+            .map(|s| s.alias.as_str())
+            .filter(|a| !is_hidden_alias(a) && !a.is_empty())
+            .collect();
+        if let Some(best) = crate::suggest::suggest_similar(t, names.iter().copied()) {
+            return Some(format!("did you mean \"{best}\"?"));
+        }
+        let here: Vec<String> = self
+            .sources
+            .iter()
+            .filter(|s| !is_hidden_alias(&s.alias) && !s.alias.is_empty())
+            .map(|s| match &s.source_qn {
+                Some(qn) if qn.name != s.alias => format!("\"{}\" ({})", s.alias, qn.name),
+                _ => format!("\"{}\"", s.alias),
+            })
+            .collect();
+        (!here.is_empty()).then(|| format!("the FROM clause has {}", here.join(", ")))
     }
 
     /// Columns the bare `*` expands to: everything visible, minus the

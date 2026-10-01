@@ -746,7 +746,7 @@ column \"nme\" does not exist
   ·        ─┬─
   ·         ╰─ column does not exist
   ╰────
-  help: did you mean \"name\"?
+  help: Perhaps you meant to reference the column \"users.name\".
 ",
     );
 }
@@ -765,7 +765,7 @@ column u.nme does not exist
   ·        ──┬──
   ·          ╰─ column does not exist
   ╰────
-  help: did you mean \"name\"?
+  help: Perhaps you meant to reference the column \"u.name\".
 ",
     );
 }
@@ -783,7 +783,7 @@ column \"ema\" does not exist
   ·                            ─┬─
   ·                             ╰─ column does not exist
   ╰────
-  help: did you mean \"email\"?
+  help: Perhaps you meant to reference the column \"users.email\".
 ",
     );
 }
@@ -1208,6 +1208,84 @@ INSERT has more target columns than expressions
   ·                                      ╰─ no value for this column
   ╰────
   help: 3 target column(s) for 2 value(s): supply a value for every listed column
+",
+        ),
+    ];
+    for (sql, expected) in cases {
+        let err = db.analyze(sql).unwrap_err();
+        assert_eq!(err.to_string(), *expected, "{sql}");
+    }
+}
+
+// ── Hints on unresolved references (PG's errorMissingRTE / errorMissingColumn) ─
+
+#[test]
+fn unresolved_reference_hints_follow_pg() {
+    let db = setup();
+    let cases: &[(&str, &str)] = &[
+        // The table's name where the FROM entry gave it an alias.
+        (
+            "SELECT users.id FROM users u",
+            "\
+invalid reference to FROM-clause entry for table \"users\"
+  ╭────
+1 │ SELECT users.id FROM users u
+  ·        ────┬───
+  ·            ╰─ not referencable here
+  ╰────
+  help: Perhaps you meant to reference the table alias \"u\".
+",
+        ),
+        // A qualifier naming nothing: a similar entry name.
+        (
+            "SELECT usr.id FROM users usrs",
+            "\
+missing FROM-clause entry for table \"usr\"
+  ╭────
+1 │ SELECT usr.id FROM users usrs
+  ·        ───┬──
+  ·           ╰─ no FROM-clause entry by this name
+  ╰────
+  help: did you mean \"usrs\"?
+",
+        ),
+        // … or, with none, the entries there are.
+        (
+            "SELECT x.id FROM users u, posts p",
+            "\
+missing FROM-clause entry for table \"x\"
+  ╭────
+1 │ SELECT x.id FROM users u, posts p
+  ·        ──┬─
+  ·          ╰─ no FROM-clause entry by this name
+  ╰────
+  help: the FROM clause has \"u\" (users), \"p\" (posts)
+",
+        ),
+        // A qualified column the named entry lacks but another has.
+        (
+            "SELECT u.title FROM users u, posts p",
+            "\
+column u.title does not exist
+  ╭────
+1 │ SELECT u.title FROM users u, posts p
+  ·        ───┬───
+  ·           ╰─ column does not exist
+  ╰────
+  help: Perhaps you meant to reference the column \"p.title\".
+",
+        ),
+        // A typo matching two entries equally well.
+        (
+            "SELECT idd FROM users u, posts p",
+            "\
+column \"idd\" does not exist
+  ╭────
+1 │ SELECT idd FROM users u, posts p
+  ·        ─┬─
+  ·         ╰─ column does not exist
+  ╰────
+  help: Perhaps you meant to reference the column \"u.id\" or the column \"p.id\".
 ",
         ),
     ];
