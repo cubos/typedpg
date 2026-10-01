@@ -301,6 +301,24 @@ fn cast_regclass_and_regproc_resolved_against_catalog() {
         "invalid name syntax"
     );
     assert_first_line!(db.analyze("SELECT ''::regproc"), "invalid name syntax");
+    // A failed function / operator lookup names the input as written, not
+    // the identifier it split into (downcased, trimmed).
+    assert_first_line!(
+        db.analyze("SELECT ' EMPTY '::regproc"),
+        "function \" EMPTY \" does not exist"
+    );
+    assert_first_line!(
+        db.analyze("SELECT 'NaN'::regproc"),
+        "function \"NaN\" does not exist"
+    );
+    assert_first_line!(
+        db.analyze("SELECT ' 42 '::regproc"),
+        "function \" 42 \" does not exist"
+    );
+    assert_first_line!(
+        db.analyze("SELECT 'No_Such_Op'::regoper"),
+        "operator does not exist: No_Such_Op"
+    );
 }
 
 // ── Coercion contexts beyond the explicit cast ──────────────────────────────
@@ -505,6 +523,13 @@ fn regtype_bare_identifier_resolved_against_catalog() {
         db.analyze("SELECT 'NaN'::regtype"),
         "type \"nan\" does not exist"
     );
+    // An empty or blank value fails before the type-name grammar runs.
+    for blank in ["", "   "] {
+        assert_first_line!(
+            db.analyze(&format!("SELECT '{blank}'::regtype")),
+            &format!("invalid type name \"{blank}\"")
+        );
+    }
     // Anything beyond a bare identifier uses the full type grammar — skip.
     db.analyze("SELECT 'character varying'::regtype AS v")
         .unwrap();
