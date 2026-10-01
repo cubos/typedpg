@@ -1087,30 +1087,27 @@ impl PgCatalog {
 
         // When the query has spreads, run analysis on a sample SQL where each
         // spread is materialized as a single row of placeholders, so the
-        // analyzer can infer the field types from surrounding context.
-        let analysis_sql = if lex_output.spreads.is_empty() {
-            lex_output.sql.clone()
+        // analyzer can infer the field types from surrounding context. Its
+        // offset map leads back to the original SQL like the lexer's does.
+        let sample_lex;
+        let analysis_lex = if lex_output.spreads.is_empty() {
+            &lex_output
         } else {
             match build_spread_sample_sql(&lex_output) {
-                Ok(s) => s,
+                Ok(l) => {
+                    sample_lex = l;
+                    &sample_lex
+                }
                 Err(e) => return (lex_output.sql.clone(), Err(e)),
             }
         };
+        let analysis_sql = analysis_lex.sql.clone();
 
         // Install the diagnostic context so that error sites deep in the
         // analyzer can render snippet + caret + hint against the original
-        // SQL. When the query has spreads, `analysis_sql` differs from
-        // `lex_output.sql` (the lexer-rewritten form the post-lex offsets
-        // refer to) — falling back to no context yields flat error messages
-        // for those queries, which is acceptable until we extend the offset
-        // map across spread expansion.
-        let (columns, mut info_params, can_run_as_subquery) = if lex_output.spreads.is_empty() {
-            let _guard = crate::error::DiagContextGuard::install(sql, &lex_output);
-            match analyze_static(self, &analysis_sql, &param_nullability) {
-                Ok(p) => p,
-                Err(e) => return (analysis_sql, Err(e)),
-            }
-        } else {
+        // SQL.
+        let (columns, mut info_params, can_run_as_subquery) = {
+            let _guard = crate::error::DiagContextGuard::install(sql, analysis_lex);
             match analyze_static(self, &analysis_sql, &param_nullability) {
                 Ok(p) => p,
                 Err(e) => return (analysis_sql, Err(e)),

@@ -1210,3 +1210,39 @@ fn spread_without_field_list_is_a_user_error() {
          e.g. `$..items { field1, field2 }`"
     );
 }
+
+// ── Diagnostics in `$..spread` queries ──────────────────────────────────────
+
+#[test]
+fn spread_query_errors_render_against_the_original_sql() {
+    // The analyzer sees each spread expanded to a placeholder row; errors
+    // after (and inside) it still point at what the user wrote.
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("INSERT INTO users (id, name, email) VALUES $..rows { id, name, email } RETURNING nme"),
+        AnalyzeError::UndefinedColumn(_),
+        "\
+column \"nme\" does not exist
+  ╭────
+1 │ INSERT INTO users (id, name, email) VALUES $..rows { id, name, email } RETURNING nme
+  ·                                                                                  ─┬─
+  ·                                                                                   ╰─ column does not exist
+  ╰────
+  help: Perhaps you meant to reference the column \"users.name\".
+",
+    );
+    // A row of the wrong width: the caret lands on the spread token.
+    assert_analyze_err!(
+        db.analyze("INSERT INTO users (id, name) VALUES $..rows { id, name, email }"),
+        AnalyzeError::SyntaxError(_),
+        "\
+INSERT has more expressions than target columns
+  ╭────
+1 │ INSERT INTO users (id, name) VALUES $..rows { id, name, email }
+  ·                                     ┬
+  ·                                     ╰─ no target column for this value
+  ╰────
+  help: 3 values for 2 target column(s): add the missing columns to the column list, or drop the extra values
+",
+    );
+}

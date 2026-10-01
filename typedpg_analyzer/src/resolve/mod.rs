@@ -100,7 +100,53 @@ pub struct AnalyzedQuery {
 /// Returns [`AnalyzeError::Invalid`] for a spread written without a field
 /// list (`$..items` rather than `$..items { a, b }`): the lexer accepts the
 /// bare form, but nothing then says which item fields fill which columns.
-pub(crate) fn build_spread_sample_sql(lex_output: &LexOutput) -> Result<String, AnalyzeError> {
+///
+/// Returned as a [`LexOutput`] over the sample SQL whose rewrites map its
+/// offsets back to the original SQL — each spread's placeholder row maps
+/// onto the `$..name` token — so diagnostics render against what the user
+/// wrote.
+pub(crate) fn build_spread_sample_sql(lex_output: &LexOutput) -> Result<LexOutput, AnalyzeError> {
+    let sql = spread_sample_sql(lex_output)?;
+    // The lexer records a zero-length rewrite for each spread, in the
+    // spreads' order; the sample replaces it with the placeholder row.
+    let mut rows = lex_output
+        .spreads
+        .iter()
+        .map(|s| s.fields.as_ref().map_or(0, Vec::len));
+    let mut shift = 0usize;
+    let mut counter = lex_output.params.len();
+    let mut rewrites = Vec::with_capacity(lex_output.rewrites.len());
+    for rw in &lex_output.rewrites {
+        let mut out = rw.clone();
+        out.post_lex_at += shift;
+        if rw.post_lex_len == 0
+            && let Some(n) = rows.next()
+        {
+            // `(` + n placeholders `$k` joined by `, ` + `)`, as
+            // `spread_sample_sql` writes them.
+            let row_len = 2
+                + (0..n)
+                    .map(|i| {
+                        counter += 1;
+                        1 + counter.to_string().len() + if i > 0 { 2 } else { 0 }
+                    })
+                    .sum::<usize>();
+            out.post_lex_len = row_len;
+            shift += row_len;
+        }
+        rewrites.push(out);
+    }
+    debug_assert_eq!(lex_output.sql.len() + shift, sql.len());
+    Ok(LexOutput {
+        sql,
+        params: lex_output.params.clone(),
+        spreads: lex_output.spreads.clone(),
+        rewrites,
+    })
+}
+
+/// The text of [`build_spread_sample_sql`].
+fn spread_sample_sql(lex_output: &LexOutput) -> Result<String, AnalyzeError> {
     let base_sql = &lex_output.sql;
     let num_regular_params = lex_output.params.len();
     let mut result = String::with_capacity(base_sql.len() + 64);
