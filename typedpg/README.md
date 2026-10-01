@@ -605,6 +605,20 @@ Everything runs in-process during `cargo build`. No external dependencies, fast 
 
 Extensions are supported via built-in SQL definitions that the DDL interpreter processes automatically when it sees `CREATE EXTENSION`.
 
+### Faster dev builds
+
+Cargo compiles proc macros and their dependencies **unoptimized** in dev builds, so the analyzer behind `sql!` runs at debug speed — several times slower than it needs to. Opting it into optimization in your `Cargo.toml` makes each `sql!` and each migration replay much cheaper; the analyzer is then compiled optimized once and cached:
+
+```toml
+[profile.dev.package.typedpg_analyzer]
+opt-level = 3
+
+[profile.dev.package.typedpg_pg_query]
+opt-level = 3
+```
+
+Measured on a schema of ~300 tables: replaying the migrations goes from ~0.5 s to ~0.2 s per crate build, and analyzing a query from ~0.3 ms to ~0.04 ms.
+
 ## Requirements
 
 - Rust 1.85+
