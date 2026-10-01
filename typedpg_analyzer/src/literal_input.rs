@@ -188,6 +188,7 @@ pub(crate) fn validate_with_typmod(
         }
         "tid" => validate_tid(content),
         "pg_lsn" => validate_pg_lsn(content),
+        "pg_snapshot" | "txid_snapshot" => validate_pg_snapshot(content),
         name @ ("xid" | "xid8" | "cid") => validate_xid(content, name),
         _ => Ok(()),
     }
@@ -1374,6 +1375,87 @@ fn validate_line(content: &str, g: &mut GeoInput<'_>) -> Result<(), String> {
     Ok(())
 }
 
+// ─── snapshots ──────────────────────────────────────────────────────────────
+
+/// `strtou64(s, &end, 10)` (glibc `strtoull`): leading whitespace, an
+/// optional sign, decimal digits. Returns the value (saturated on
+/// overflow, negated modulo 2⁶⁴ for `-`) and the end offset — `0`, the
+/// start, when no digit follows.
+fn strtou64(s: &[u8]) -> (u64, usize) {
+    let mut p = 0;
+    while p < s.len() && c_isspace(s[p]) {
+        p += 1;
+    }
+    let negative = s.get(p) == Some(&b'-');
+    if matches!(s.get(p), Some(b'+' | b'-')) {
+        p += 1;
+    }
+    let digits = p;
+    let mut value: u64 = 0;
+    let mut overflow = false;
+    while p < s.len() && s[p].is_ascii_digit() {
+        match value
+            .checked_mul(10)
+            .and_then(|v| v.checked_add(u64::from(s[p] - b'0')))
+        {
+            Some(v) => value = v,
+            None => overflow = true,
+        }
+        p += 1;
+    }
+    if p == digits {
+        return (0, 0);
+    }
+    if overflow {
+        return (u64::MAX, p);
+    }
+    (
+        if negative {
+            value.wrapping_neg()
+        } else {
+            value
+        },
+        p,
+    )
+}
+
+/// Mirrors `parse_snapshot` (xid8funcs.c), the input of `pg_snapshot` and
+/// `txid_snapshot`: `xmin:xmax:` then a comma-separated, ascending list of
+/// in-progress xids, with `0 < xmin <= xmax` and every xid in
+/// `[xmin, xmax)`. Its error names `pg_snapshot` for both types.
+fn validate_pg_snapshot(content: &str) -> Result<(), String> {
+    let bad = || format!("invalid input syntax for type pg_snapshot: \"{content}\"");
+    let b = content.as_bytes();
+    let (xmin, end) = strtou64(b);
+    if b.get(end) != Some(&b':') {
+        return Err(bad());
+    }
+    let mut p = end + 1;
+    let (xmax, end) = strtou64(&b[p..]);
+    if b.get(p + end) != Some(&b':') {
+        return Err(bad());
+    }
+    p += end + 1;
+    if xmin == 0 || xmax == 0 || xmax < xmin {
+        return Err(bad());
+    }
+    let mut last = 0u64;
+    while p < b.len() {
+        let (val, end) = strtou64(&b[p..]);
+        p += end;
+        if val < xmin || val >= xmax || val < last {
+            return Err(bad());
+        }
+        last = val;
+        match b.get(p) {
+            Some(b',') => p += 1,
+            None => {}
+            Some(_) => return Err(bad()),
+        }
+    }
+    Ok(())
+}
+
 // ─── system identifier types ────────────────────────────────────────────────
 
 /// Mirrors `tidin` (tid.c): `(block,offset)` with two unsigned decimal
@@ -1870,6 +1952,43 @@ mod tests {
         assert!(validate_xid("42", "xid").is_ok());
         assert!(validate_xid("0x10", "xid").is_ok());
         assert!(validate_xid("ff", "xid").is_err());
+    }
+
+    #[test]
+    fn snapshot_inputs() {
+        // parse_snapshot: xmin:xmax:xip,… with 0 < xmin <= xmax and the
+        // xips ascending in [xmin, xmax); duplicates and a trailing comma
+        // pass. Verified against PG 18.
+        for ok in [
+            "1:2:",
+            "1:2:1",
+            "1:2:1,",
+            "1:3:1,1,2",
+            "1:1:",
+            " 1: 2: 1",
+            "-1:-1:",
+        ] {
+            assert!(validate_pg_snapshot(ok).is_ok(), "{ok:?} should be valid");
+        }
+        for bad in [
+            "",
+            "1:2",
+            "2:1:",
+            "0:1:",
+            ":2:",
+            "1:2:2",
+            "1:3:2,1",
+            "1:2:x",
+            "1:2:1 ",
+            "1:2:1,,",
+            "-Infinity",
+            "{1,2}",
+        ] {
+            assert_eq!(
+                validate_pg_snapshot(bad).unwrap_err(),
+                format!("invalid input syntax for type pg_snapshot: \"{bad}\""),
+            );
+        }
     }
 
     #[test]
