@@ -238,6 +238,11 @@ pub(crate) fn analyze_set_operation(
             merged.check_determinate(snapshot, None)?;
         }
         let collation = merged.collation();
+        let record_fields = crate::expr::merge_set_op_shapes(
+            l.record_fields.as_ref(),
+            r.record_fields.as_ref(),
+            op_label == "UNION",
+        );
         columns.push(RawColumn {
             name: l.name,
             type_oid,
@@ -251,7 +256,7 @@ pub(crate) fn analyze_set_operation(
             },
             typmod,
             collation,
-            record_fields: None,
+            record_fields,
             elem_nullable: match op_label {
                 "EXCEPT" | "INTERSECT" => l.elem_nullable,
                 _ => crate::expr::merge_elem_nullable([l.elem_nullable, r.elem_nullable]),

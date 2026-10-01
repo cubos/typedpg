@@ -40,7 +40,7 @@ pub(crate) struct ScopeColumn {
     /// Named-field structure when the column holds a record value: SRF /
     /// OUT-arg functions populate this from `out_args`, ROW constructors fill
     /// it from the inferred shape, subqueries propagate it through.
-    pub record_fields: Option<Vec<crate::expr::RecordField>>,
+    pub record_fields: Option<crate::expr::RecordShape>,
 }
 
 /// A table-like source in the FROM clause.

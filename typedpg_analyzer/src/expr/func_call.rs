@@ -52,7 +52,7 @@ pub(crate) fn infer_func_call(
             func.args.first().and_then(|a| a.node.as_ref()),
             Some(node::Node::AConst(_))
         );
-    let resolved = match functions::func_get_detail(
+    let detail = functions::func_get_detail(
         snapshot,
         schema,
         name,
@@ -60,7 +60,14 @@ pub(crate) fn infer_func_call(
         &notation,
         Some(unknown_const),
         crate::error::SourceSpan::from_node_qname(func.location),
-    )? {
+    );
+    let detail = match detail {
+        Err(e) if e.sqlstate() == Some("42883") => {
+            return Err(unmatched_projection_error(func, ctx, params).unwrap_or(e));
+        }
+        other => other?,
+    };
+    let resolved = match detail {
         functions::FuncDetail::Routine(r) => r,
         functions::FuncDetail::Coercion(target) => {
             check_call_shape(func, None, &args, &notation, ctx)?;
@@ -145,7 +152,7 @@ pub(crate) fn infer_func_call(
     let record_fields = if resolved.out_args.is_empty() {
         None
     } else {
-        Some(RecordField::from_out_args(&resolved.out_args))
+        Some(RecordField::from_out_args(&resolved.out_args).into())
     };
     // The result's collation derives from the arguments' (assign_collations).
     let (collation, explicit_collation) =

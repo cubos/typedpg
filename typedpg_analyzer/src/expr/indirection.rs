@@ -22,60 +22,14 @@ pub(crate) fn infer_indirection(
         .as_deref()
         .ok_or_else(|| AnalyzeError::Unsupported("indirection without arg".into()))?;
 
-    // Two shortcut paths for `record`-typed args whose fields aren't stored
-    // in a composite `TypeEntry`:
-    //
-    // 1. `(func(...)).field` — direct FuncCall with `out_args` (TABLE/OUT).
-    // 2. `(alias.col).field` — ColumnRef whose scope entry carries
-    //    `record_fields` (populated when the subquery's target expr was a
-    //    FuncCall with out_args).
-    //
-    // Consume leading String steps against those named fields; fall through
-    // to the generic walker for any remaining steps (e.g. nested composite
-    // unwrap, subscript on a scalar out_arg).
-    let from_direct_funccall = if let Some(node::Node::FuncCall(fc)) = arg.node.as_ref() {
-        resolve_funccall_out_args(fc, ctx, params)?
-    } else {
-        None
-    };
-    let from_column_record = if from_direct_funccall.is_none() {
-        if let Some(node::Node::ColumnRef(cr)) = arg.node.as_ref() {
-            column_ref_record_fields(cr, scope)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    let leading_fields = from_direct_funccall
-        .as_ref()
-        .or(from_column_record.as_ref());
-    let (start_step, mut current) = if let Some(fields) = leading_fields {
-        let mut idx = 0usize;
-        let mut current = None;
-        while idx < ind.indirection.len() {
-            let Some(node::Node::String(s)) = ind.indirection[idx].node.as_ref() else {
-                break;
-            };
-            let field = fields.iter().find(|f| f.name == s.sval).ok_or_else(|| {
-                AnalyzeError::UndefinedColumn(format!(
-                    "could not identify column \"{}\" in record data type",
-                    s.sval
-                ))
-            })?;
-            current = Some(field.ty.clone());
-            idx += 1;
-        }
-        (idx, current)
-    } else {
-        (0, None)
-    };
-
-    let mut current = match current.take() {
-        Some(c) => c,
-        None => infer_expr(arg, ctx, params, TypeGoal::NONE)?,
-    };
+    // A `record` arg's fields come with its inferred type: a function's OUT
+    // / TABLE args, a ROW constructor's, a column's (carried from the
+    // subquery or CTE that produced it).
+    let mut current = infer_expr(arg, ctx, params, TypeGoal::NONE)?;
+    let arg_is_column = matches!(
+        arg.node.as_ref(),
+        Some(node::Node::ColumnRef(cr)) if column_ref_is_column(cr, scope)
+    );
 
     // Detect the `(alias).field` shape: arg is a single-identifier ColumnRef
     // whose identifier is a relation alias in scope (not a column). PG emits
@@ -99,11 +53,14 @@ pub(crate) fn infer_indirection(
         None
     };
 
-    let steps = &ind.indirection[start_step..];
+    let steps = &ind.indirection[..];
     let mut i = 0;
     while i < steps.len() {
         match steps[i].node.as_ref() {
             Some(node::Node::String(s)) => {
+                if i == 0 && arg_is_column {
+                    record_var_shape_visible(&current, snapshot)?;
+                }
                 let alias_hint = if i == 0 { arg_is_bare_alias } else { None };
                 current = resolve_composite_field(&current, &s.sval, snapshot, alias_hint)?;
                 i += 1;
@@ -140,71 +97,39 @@ pub(crate) fn infer_indirection(
     Ok(current)
 }
 
-/// Look up `record_fields` for a `ColumnRef` that resolves to a scope column
-/// carrying named output columns (set when its producing expression was a
-/// FuncCall with `out_args`). Returns `None` if the ref doesn't resolve or
-/// the column isn't a record.
-fn column_ref_record_fields(cr: &protobuf::ColumnRef, scope: &Scope) -> Option<Vec<RecordField>> {
+/// Whether `cr` names a column (a Var in PG) rather than a FROM entry's
+/// whole row.
+pub(crate) fn column_ref_is_column(cr: &protobuf::ColumnRef, scope: &Scope) -> bool {
     let parts = extract_string_fields(&cr.fields);
+    if parts.len() != cr.fields.len() {
+        return false; // `t.*`
+    }
     let (table, column) = match parts.as_slice() {
         [col] => (None, col.as_str()),
         [tbl, col] => (Some(tbl.as_str()), col.as_str()),
         [_schema, tbl, col] => (Some(tbl.as_str()), col.as_str()),
-        _ => return None,
+        _ => return false,
     };
-    let col = scope.resolve_column(table, column, None).ok()?;
-    // A composite's shape only says which fields are NULL; its fields are
-    // looked up in the catalog (see `composite_field_nullable`).
-    if col.type_oid != oid::RECORD {
-        return None;
-    }
-    col.record_fields.clone()
+    scope.resolve_column(table, column, None).is_ok()
 }
 
-/// If `fc` names a function with declared `out_args` (TABLE/OUT args),
-/// return them so indirection steps can match against named output columns.
-/// Returns `Ok(None)` when the function has no out_args — the caller should
-/// fall back to generic composite/record handling.
-fn resolve_funccall_out_args(
-    fc: &protobuf::FuncCall,
-    ctx: Ctx<'_>,
-    params: &mut ParamCollector,
-) -> Result<Option<Vec<RecordField>>, AnalyzeError> {
-    let Ctx { snapshot, .. } = ctx;
-    let parts = extract_string_fields(&fc.funcname);
-    let (schema, name) = match parts.as_slice() {
-        [n] => (None, n.as_str()),
-        [s, n] => (Some(s.as_str()), n.as_str()),
-        _ => return Ok(None),
-    };
-
-    // Infer arg types against the caller's scope so column refs in the
-    // arguments resolve to concrete types — needed for polymorphic
-    // substitution (`anyelement` → element-of-array etc.) when the function
-    // has polymorphic out args like `_pg_expandarray(anyarray) RETURNS
-    // (x anyelement, n int)`.
-    let mut arg_types = Vec::with_capacity(fc.args.len());
-    for arg in &fc.args {
-        let t = infer_expr(arg, ctx, params, TypeGoal::NONE)
-            .map(|e| e.type_oid)
-            .unwrap_or(oid::UNKNOWN);
-        arg_types.push(t);
+/// PG's `expandRecordVariable`: the row shape of a `record` column (of a
+/// subquery, CTE, VALUES list or function) is the shape of the expression
+/// behind it, and when PG has none (`(ROW(1, ROW(2, 3))).f2`, a CASE, a
+/// VALUES cell) it fails outright with `record type has not been
+/// registered` (42809) — before looking at any field name.
+pub(crate) fn record_var_shape_visible(
+    value: &ExprType,
+    snapshot: &PgCatalog,
+) -> Result<(), AnalyzeError> {
+    if snapshot.unwrap_domain(value.type_oid) == oid::RECORD
+        && value.record_fields.as_ref().is_none_or(|s| s.hidden)
+    {
+        return Err(AnalyzeError::WrongObjectType(
+            "record type has not been registered".into(),
+        ));
     }
-
-    let Ok(notation) = crate::functions::CallNotation::of(fc) else {
-        return Ok(None);
-    };
-    let resolved = match crate::functions::resolve_function(
-        snapshot, schema, name, &arg_types, &notation, false, None,
-    ) {
-        Ok(r) => r,
-        Err(_) => return Ok(None),
-    };
-    if resolved.out_args.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(RecordField::from_out_args(&resolved.out_args)))
-    }
+    Ok(())
 }
 
 /// Look up `field_name` inside a composite type's field list. The resulting
@@ -231,8 +156,9 @@ pub(super) fn resolve_composite_field(
 ) -> Result<ExprType, AnalyzeError> {
     // Domain-over-composite needs unwrapping to see the composite fields.
     let base_oid = snapshot.unwrap_domain(current.type_oid);
+    // A shape PG can't see (see `RecordShape`) has no field PG could find.
     if base_oid == oid::RECORD
-        && let Some(shape) = current.record_fields.as_deref()
+        && let Some(shape) = current.record_fields.as_ref().filter(|s| !s.hidden)
     {
         let field = shape.iter().find(|f| f.name == field_name).ok_or_else(|| {
             AnalyzeError::UndefinedColumn(format!(
@@ -240,14 +166,23 @@ pub(super) fn resolve_composite_field(
             ))
         })?;
         // Field's full ExprType (including any nested record shape) is
-        // already on `field.ty`; just OR the enclosing nullability in.
+        // already on `field.ty`; just OR the enclosing nullability in. A
+        // record selected out of a record is a FieldSelect PG types as
+        // plain `record`: its shape is hidden from PG from here on.
+        let record_fields = field.ty.record_fields.clone().map(|s| {
+            if field.ty.type_oid == oid::RECORD {
+                RecordShape::hidden(s.fields)
+            } else {
+                s
+            }
+        });
         return Ok(ExprType {
             type_oid: field.ty.type_oid,
             nullable: current.nullable || field.ty.nullable,
             typmod: field.ty.typmod,
             collation: field.ty.collation,
             explicit_collation: false,
-            record_fields: field.ty.record_fields.clone(),
+            record_fields,
             elem_nullable: field.ty.elem_nullable,
         });
     }
@@ -538,8 +473,10 @@ pub(crate) fn expand_indirection_star(
     };
 
     let base = snapshot.unwrap_domain(container.type_oid);
+    // A shape hidden from PG fails below like an unknown one (see
+    // `RecordShape`).
     if base == oid::RECORD
-        && let Some(fields) = &container.record_fields
+        && let Some(fields) = container.record_fields.as_ref().filter(|s| !s.hidden)
     {
         return Ok(Some(
             fields
@@ -547,6 +484,11 @@ pub(crate) fn expand_indirection_star(
                 .map(|f| {
                     let mut ty = f.ty.clone();
                     ty.nullable |= container.nullable;
+                    // Each column is a FieldSelect: a record one hides
+                    // its shape from PG.
+                    if ty.type_oid == oid::RECORD {
+                        ty.record_fields = ty.record_fields.map(|s| RecordShape::hidden(s.fields));
+                    }
                     (f.name.clone(), ty)
                 })
                 .collect(),
@@ -582,6 +524,53 @@ pub(crate) fn expand_indirection_star(
     Ok(Some(out))
 }
 
+/// The argument and name of a call PG may read as a column projection:
+/// one argument, an unqualified name, no aggregate / window / VARIADIC
+/// decoration and no argument name.
+fn projection_candidate(func: &protobuf::FuncCall) -> Option<(&protobuf::Node, &protobuf::String)> {
+    let [arg] = func.args.as_slice() else {
+        return None;
+    };
+    let [name] = func.funcname.as_slice() else {
+        return None;
+    };
+    let Some(node::Node::String(name)) = name.node.as_ref() else {
+        return None;
+    };
+    if !func.agg_order.is_empty()
+        || func.agg_filter.is_some()
+        || func.agg_star
+        || func.agg_distinct
+        || func.agg_within_group
+        || func.over.is_some()
+        || func.func_variadic
+        || matches!(arg.node.as_ref(), Some(node::Node::NamedArgExpr(_)))
+    {
+        return None;
+    }
+    Some((arg, name))
+}
+
+/// For a call no function matched: PG's last try reads it as a column
+/// projection, and on a `record` column whose shape it can't see that
+/// fails in `expandRecordVariable` (see [`record_var_shape_visible`])
+/// rather than as a missing function. `None` when that doesn't apply.
+pub(crate) fn unmatched_projection_error(
+    func: &protobuf::FuncCall,
+    ctx: Ctx<'_>,
+    params: &mut ParamCollector,
+) -> Option<AnalyzeError> {
+    let (arg, _) = projection_candidate(func)?;
+    let Some(node::Node::ColumnRef(cr)) = arg.node.as_ref() else {
+        return None;
+    };
+    if !column_ref_is_column(cr, ctx.scope) {
+        return None;
+    }
+    let t = infer_expr(arg, ctx, params, TypeGoal::NONE).ok()?;
+    record_var_shape_visible(&t, ctx.snapshot).err()
+}
+
 /// PG's column-projection reading of a one-argument call
 /// (`ParseFuncOrColumn` → `ParseComplexProjection`): `x(t)` with an
 /// unqualified name, no decoration and a composite / record argument is
@@ -594,26 +583,9 @@ pub(crate) fn try_column_projection(
     params: &mut ParamCollector,
 ) -> Result<Option<ExprType>, AnalyzeError> {
     let snapshot = ctx.snapshot;
-    let [arg] = func.args.as_slice() else {
+    let Some((arg, name)) = projection_candidate(func) else {
         return Ok(None);
     };
-    let [name] = func.funcname.as_slice() else {
-        return Ok(None);
-    };
-    let Some(node::Node::String(name)) = name.node.as_ref() else {
-        return Ok(None);
-    };
-    if !func.agg_order.is_empty()
-        || func.agg_filter.is_some()
-        || func.agg_star
-        || func.agg_distinct
-        || func.agg_within_group
-        || func.over.is_some()
-        || func.func_variadic
-        || matches!(arg.node.as_ref(), Some(node::Node::NamedArgExpr(_)))
-    {
-        return Ok(None);
-    }
     let t = infer_expr(arg, ctx, params, TypeGoal::NONE)?;
     let base = snapshot.unwrap_domain(t.type_oid);
     let complex = base == oid::RECORD
@@ -624,7 +596,10 @@ pub(crate) fn try_column_projection(
         return Ok(None);
     }
     let has_field = match &t.record_fields {
-        Some(fields) if base == oid::RECORD => fields.iter().any(|f| f.name == name.sval),
+        // A hidden shape has no field PG could find.
+        Some(fields) if base == oid::RECORD => {
+            !fields.hidden && fields.iter().any(|f| f.name == name.sval)
+        }
         _ => snapshot
             .get_type(base)
             .and_then(|e| e.typrelid)
