@@ -646,7 +646,8 @@ pub mod __private {
         }
 
         fn accepts(ty: &Type) -> bool {
-            matches!(ty.kind(), Kind::Enum(_))
+            // (`copy_in!` encodes an enum as `text`, its label's format.)
+            matches!(ty.kind(), Kind::Enum(_)) || *ty == Type::TEXT
         }
 
         to_sql_checked!();
