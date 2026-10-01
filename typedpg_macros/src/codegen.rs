@@ -655,6 +655,7 @@ fn emit_one_record(
                 None => quote! { __reader.read_field::<#raw>()? },
             },
             DecodeCtx::RecordField,
+            &format!("field \"{}\"", field.name),
         )?;
         let tmp = format_ident!("__field_{}", i);
         from_sql_reads.extend(quote! { let #tmp: #field_ty = #decode; });
@@ -1761,8 +1762,12 @@ enum DecodeCtx {
 }
 
 impl DecodeCtx {
-    /// Wrap a `String` message expression into this context's error type.
-    fn wrap_err(self, msg: TokenStream) -> TokenStream {
+    /// The error, of this context's type, for a failure `e` to turn a value
+    /// into `target`, prefixed with `label` (`column "x" (int4)`,
+    /// `field "x"`): `column "x" (jsonb): failed to deserialize T: …`.
+    fn wrap_err(self, label: &str, what: &str, target: &syn::Type) -> TokenStream {
+        let prefix = format!("{label}: {what} {}", type_text(target));
+        let msg = quote! { format!("{}: {e}", #prefix) };
         match self {
             DecodeCtx::Column => quote! { typedpg::Error::Deserialize(#msg) },
             DecodeCtx::RecordField => quote! {
@@ -1778,7 +1783,7 @@ impl DecodeCtx {
 /// wire value, applying the [`DeserStrategy`]'s bridge.
 ///
 /// `read(raw, hint)` turns a raw Rust type into an expression that reads a
-/// value of that type from the underlying source — `__row.get::<_, T>(idx)`
+/// value of that type from the underlying source — `read_column::<T>(…)?`
 /// for an output column, `__reader.read_field*::<T>()?` for a synthesized
 /// record field. `hint`, when set, is a PG `Type` expression the reader must
 /// decode the value *as*: a record field carries only its inline OID, which
@@ -1793,6 +1798,7 @@ fn decode_value(
     registry: &RecordRegistry,
     read: &dyn Fn(TokenStream, Option<TokenStream>) -> TokenStream,
     ctx: DecodeCtx,
+    label: &str,
 ) -> Result<TokenStream, syn::Error> {
     // PG `Type` a JSONB-strategy value must be decoded as — `json` vs `jsonb`
     // differ by a leading version byte.
@@ -1806,8 +1812,7 @@ fn decode_value(
     };
     match &mapping.strategy {
         DeserStrategy::JsonbDomain { target } => {
-            let err = ctx
-                .wrap_err(quote! { format!("failed to deserialize {}: {e}", stringify!(#target)) });
+            let err = ctx.wrap_err(label, "failed to deserialize", target);
             let hint = Some(json_hint());
             if nullable {
                 let rd = read(quote! { ::std::option::Option<::serde_json::Value> }, hint);
@@ -1826,8 +1831,7 @@ fn decode_value(
             }
         }
         DeserStrategy::EnumAsString { target } => {
-            let err = ctx
-                .wrap_err(quote! { format!("failed to parse enum {}: {e}", stringify!(#target)) });
+            let err = ctx.wrap_err(label, "failed to parse enum", target);
             if nullable {
                 let rd = read(
                     quote! { ::std::option::Option<::typedpg::__private::EnumString> },
@@ -1848,8 +1852,7 @@ fn decode_value(
             }
         }
         DeserStrategy::VecOfJsonbDomain { inner } => {
-            let err = ctx
-                .wrap_err(quote! { format!("failed to deserialize {}: {e}", stringify!(#inner)) });
+            let err = ctx.wrap_err(label, "failed to deserialize", inner);
             let hint = Some(quote! {
                 &::typedpg::__private::tokio_postgres::types::Type::JSONB_ARRAY
             });
@@ -1875,8 +1878,7 @@ fn decode_value(
             }
         }
         DeserStrategy::VecOfEnumAsString { inner } => {
-            let err = ctx
-                .wrap_err(quote! { format!("failed to parse enum {}: {e}", stringify!(#inner)) });
+            let err = ctx.wrap_err(label, "failed to parse enum", inner);
             let map = quote! {
                 __vs.into_iter()
                     .map(|__v| __v.0.parse::<#inner>().map_err(|e| #err))
@@ -1937,13 +1939,44 @@ fn column_get_expr(
 ) -> Result<TokenStream, syn::Error> {
     let idx_lit = proc_macro2::Literal::usize_unsuffixed(idx);
     let mapping = resolve_type_mapping(&col.pg_type, config, registry)?;
+    let name = &col.name;
+    let pg_type = pg_type_label(&col.pg_type);
+    let label = format!("column \"{name}\" ({pg_type})");
     decode_value(
         &mapping,
         &col.pg_type,
         col.nullable,
         config,
         registry,
-        &|raw, _hint| quote! { __row.get::<_, ::typedpg::__private::BaseTyped<#raw>>(#idx_lit).0 },
+        &|raw, _hint| {
+            quote! { ::typedpg::__private::read_column::<#raw>(&__row, #idx_lit, #name, #pg_type)? }
+        },
         DecodeCtx::Column,
+        &label,
     )
+}
+
+/// A Rust type as source text, for messages: `::crate::T`, `Vec<i32>`.
+fn type_text(ty: &syn::Type) -> String {
+    quote!(#ty).to_string().replace(' ', "")
+}
+
+/// How an error message names a PG type: its name, schema-qualified (and
+/// quoted where needed) outside `pg_catalog`, `[]`-suffixed for an array.
+fn pg_type_label(ty: &Type) -> String {
+    match ty {
+        Type::Basic { schema, name, .. }
+        | Type::Domain { schema, name, .. }
+        | Type::Enum { schema, name, .. }
+        | Type::Range { schema, name, .. }
+        | Type::Composite { schema, name, .. } => {
+            if schema == "pg_catalog" {
+                name.clone()
+            } else {
+                QualifiedName::new(schema.clone(), name.clone()).to_string()
+            }
+        }
+        Type::Array { element } => format!("{}[]", pg_type_label(element)),
+        Type::AnonymousRecord { .. } => "record".to_string(),
+    }
 }

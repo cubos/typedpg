@@ -420,6 +420,7 @@
 //! Nullable columns (no `NOT NULL` constraint) are wrapped in `Option<T>`.
 
 mod copy;
+mod decode;
 pub mod error;
 pub mod executor;
 pub mod from_row;
@@ -461,6 +462,7 @@ pub use rust_decimal;
 #[doc(hidden)]
 pub mod __private {
     pub use crate::copy::CopyRow;
+    pub use crate::decode::{read_column, read_named_column};
     pub use bytes;
     pub use tokio_postgres;
 

@@ -1,5 +1,6 @@
 use proc_macro2::TokenStream;
 use quote::quote;
+use syn::ext::IdentExt;
 use syn::{Data, DeriveInput, Fields};
 
 pub fn expand(input: DeriveInput) -> Result<TokenStream, syn::Error> {
@@ -29,9 +30,9 @@ pub fn expand(input: DeriveInput) -> Result<TokenStream, syn::Error> {
         .iter()
         .map(|f| {
             let field_name = f.ident.as_ref().unwrap();
-            let col_name = field_name.to_string();
+            let col_name = field_name.unraw().to_string();
             quote! {
-                #field_name: __row.try_get(#col_name)?
+                #field_name: ::typedpg::__private::read_named_column(__row, #col_name)?
             }
         })
         .collect();
