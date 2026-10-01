@@ -462,6 +462,68 @@ pub mod __private {
     use bytes::{Buf, BytesMut};
     use tokio_postgres::types::{FromSql, IsNull, Kind, ToSql, Type, to_sql_checked};
 
+    /// Reads a column as `T`, with an array of a domain read as an array of
+    /// the domain's base type.
+    ///
+    /// PostgreSQL describes a domain-typed column by its base type, but an
+    /// array of a domain has its own array type, whose element is the
+    /// domain — and `FromSql` impls (`Vec<i32>`, `Vec<serde_json::Value>`)
+    /// accept only their base element types. The binary format is the
+    /// base type's either way.
+    #[doc(hidden)]
+    pub struct BaseTyped<T>(pub T);
+
+    /// `ty` with its array element's domains replaced by their base type,
+    /// if it is such an array.
+    fn base_typed(ty: &Type) -> Option<Type> {
+        let Kind::Array(member) = ty.kind() else {
+            return None;
+        };
+        let mut base = member;
+        while let Kind::Domain(inner) = base.kind() {
+            base = inner;
+        }
+        if std::ptr::eq(base, member) {
+            return None;
+        }
+        Some(Type::new(
+            ty.name().to_owned(),
+            ty.oid(),
+            Kind::Array(base.clone()),
+            ty.schema().to_owned(),
+        ))
+    }
+
+    impl<'a, T: FromSql<'a>> FromSql<'a> for BaseTyped<T> {
+        fn from_sql(
+            ty: &Type,
+            raw: &'a [u8],
+        ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+            Self::from_sql_nullable(ty, Some(raw))
+        }
+
+        fn from_sql_null(ty: &Type) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+            Self::from_sql_nullable(ty, None)
+        }
+
+        fn from_sql_nullable(
+            ty: &Type,
+            raw: Option<&'a [u8]>,
+        ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+            match base_typed(ty) {
+                Some(base) => T::from_sql_nullable(&base, raw).map(BaseTyped),
+                None => T::from_sql_nullable(ty, raw).map(BaseTyped),
+            }
+        }
+
+        fn accepts(ty: &Type) -> bool {
+            match base_typed(ty) {
+                Some(base) => T::accepts(&base),
+                None => T::accepts(ty),
+            }
+        }
+    }
+
     /// Bridge type for PostgreSQL enums.
     ///
     /// `tokio_postgres` will not decode/encode a PG enum as `String` directly:

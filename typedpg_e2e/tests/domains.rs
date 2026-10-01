@@ -99,3 +99,37 @@ async fn domain_jsonb_update_replaces_value() {
     assert_eq!(got.theme, "solarized");
     assert_eq!(got.daily_digest_limit, 20);
 }
+
+#[tokio::test]
+async fn arrays_of_domains_are_read_as_arrays_of_their_base_type() {
+    let pool = common::setup().await;
+    let client = pool.get().await.expect("client");
+    client
+        .batch_execute(
+            "INSERT INTO domain_arrays (id, nums, prefs) VALUES \
+             (1, '{1,2,3}', ARRAY['{\"theme\": \"dark\", \"newsletter\": false, \
+             \"daily_digest_limit\": 2}'::user_preferences]), \
+             (2, '{}', NULL)",
+        )
+        .await
+        .expect("insert");
+
+    let rows = sql!(
+        &pool,
+        "SELECT id, nums, prefs FROM domain_arrays ORDER BY id"
+    )
+    .fetch_all()
+    .await
+    .expect("select");
+    assert_eq!(rows[0].nums, [1, 2, 3]);
+    assert_eq!(
+        rows[0].prefs,
+        Some(vec![UserPreferences {
+            theme: "dark".into(),
+            newsletter: false,
+            daily_digest_limit: 2,
+        }])
+    );
+    assert!(rows[1].nums.is_empty());
+    assert_eq!(rows[1].prefs, None);
+}
