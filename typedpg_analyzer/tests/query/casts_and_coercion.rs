@@ -460,7 +460,13 @@ fn cast_date_to_bool_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT '2020-01-01'::date::bool"),
         AnalyzeError::Invalid(_),
-        "cannot cast type date to boolean",
+        concat!(
+            "cannot cast type date to boolean\n",
+            "  ╭────\n",
+            "1 │ SELECT '2020-01-01'::date::bool\n",
+            "  ·        ────────────\n",
+            "  ╰────\n",
+        ),
     );
 }
 
