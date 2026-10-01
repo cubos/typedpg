@@ -9,7 +9,8 @@
 //! [`crate::AnalyzedColumn`] / [`crate::AnalyzedParam`]. Inside an
 //! `AnonymousRecord` the fields *do* carry per-element nullability because
 //! every field is its own column-like site (`ROW(NOT_NULL_col, NULL_col)`
-//! has one nullable element and one not).
+//! has one nullable element and one not). An `Array` carries what the
+//! analysis knows about its elements' nullability the same way.
 
 use typedpg_core::QualifiedName;
 
@@ -79,6 +80,14 @@ pub enum Type {
     },
     Array {
         element: Box<Type>,
+        /// Whether the array's elements can be NULL, where the analysis
+        /// knows: `Some(true)` for `array_agg(nullable_col)` or
+        /// `ARRAY[a, NULL]`, `Some(false)` for `array_agg(not_null_col)` or
+        /// `string_to_array(s, ',')`. `None` when nothing is known — always
+        /// the case for a table's array column (PostgreSQL has no NOT NULL
+        /// for elements), a parameter, or an array that came through a
+        /// subquery, CTE, view or most expressions.
+        element_nullable: Option<bool>,
     },
     Enum {
         schema: String,
@@ -131,7 +140,7 @@ impl Type {
                 Some(QualifiedName::new(schema.clone(), name.clone()).to_string())
             }
             Type::Domain { base, .. } => base.cast_name(),
-            Type::Array { element } => element.cast_name().map(|n| format!("{n}[]")),
+            Type::Array { element, .. } => element.cast_name().map(|n| format!("{n}[]")),
             Type::AnonymousRecord { .. } => None,
         }
     }

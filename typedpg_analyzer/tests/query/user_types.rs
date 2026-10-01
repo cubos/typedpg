@@ -782,11 +782,14 @@ fn an_array_of_a_domain_is_typed_as_the_domains_array() {
     let mut db = PgCatalog::new().unwrap();
     db.apply_sql("CREATE DOMAIN d AS int; CREATE TABLE t (c d[]);")
         .unwrap();
-    let expected = array_of(domain("public", "d", int4()));
-    for sql in [
-        "SELECT c AS a FROM t",
-        "SELECT ARRAY[1::d] AS a",
-        "SELECT '{1}'::d[] AS a",
+    let element = domain("public", "d", int4());
+    for (sql, expected) in [
+        ("SELECT c AS a FROM t", array_of(element.clone())),
+        (
+            "SELECT ARRAY[1::d] AS a",
+            array_with_elems(element.clone(), false),
+        ),
+        ("SELECT '{1}'::d[] AS a", array_of(element.clone())),
     ] {
         let q = db.analyze(sql).unwrap();
         assert_eq!(q.columns[0].pg_type, expected, "{sql}");

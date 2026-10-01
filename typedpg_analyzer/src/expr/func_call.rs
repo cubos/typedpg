@@ -160,7 +160,70 @@ pub(crate) fn infer_func_call(
         collation,
         explicit_collation,
         record_fields,
+        elem_nullable: builtin_array_elem_nullable(func, &resolved, &args),
     })
+}
+
+/// Whether the elements of the array a `pg_catalog` routine returns can be
+/// NULL, for the routines whose result says (`None` for the rest): an
+/// aggregate or constructor of values has NULL elements exactly when a
+/// value is NULL, an array transformed element-wise keeps its input's.
+fn builtin_array_elem_nullable(
+    func: &protobuf::FuncCall,
+    resolved: &functions::ResolvedFunction,
+    args: &FuncArgs,
+) -> Option<bool> {
+    if resolved.schema != "pg_catalog" {
+        return None;
+    }
+    let value = |i: usize| args.nullable.get(i).copied();
+    let elems = |i: usize| args.exprs.get(i).and_then(|e| e.elem_nullable);
+    let is_null_const = |i: usize| {
+        matches!(
+            func.args.get(i).and_then(|a| a.node.as_ref()),
+            Some(node::Node::AConst(c)) if c.isnull
+        )
+    };
+    match resolved.signature.as_str() {
+        // (`array_agg(anyarray)` builds a multidimensional array.)
+        "array_agg(anynonarray)"
+        | "array_fill(anyelement,_int4)"
+        | "array_fill(anyelement,_int4,_int4)" => value(0),
+        "array_append(anycompatiblearray,anycompatible)" => {
+            merge_elem_nullable([elems(0), value(1)])
+        }
+        "array_prepend(anycompatible,anycompatiblearray)" => {
+            merge_elem_nullable([value(0), elems(1)])
+        }
+        "array_cat(anycompatiblearray,anycompatiblearray)" => {
+            merge_elem_nullable([elems(0), elems(1)])
+        }
+        "array_replace(anycompatiblearray,anycompatible,anycompatible)" => {
+            merge_elem_nullable([elems(0), value(2)])
+        }
+        // Removing NULL removes every NULL element.
+        "array_remove(anycompatiblearray,anycompatible)" if is_null_const(1) => Some(false),
+        "array_remove(anycompatiblearray,anycompatible)"
+        | "array_reverse(anyarray)"
+        | "array_shuffle(anyarray)"
+        | "array_sample(anyarray,int4)"
+        | "array_sort(anyarray)"
+        | "array_sort(anyarray,bool)"
+        | "array_sort(anyarray,bool,bool)"
+        | "trim_array(anyarray,int4)" => elems(0),
+        // The fields equal to the null string become NULL.
+        "string_to_array(text,text,text)" => Some(!is_null_const(2)),
+        "string_to_array(text,text)"
+        | "regexp_split_to_array(text,text)"
+        | "regexp_split_to_array(text,text,text)"
+        | "array_positions(anycompatiblearray,anycompatible)" => Some(false),
+        // A capture group that doesn't take part in the match is NULL.
+        "regexp_match(text,text)"
+        | "regexp_match(text,text,text)"
+        | "regexp_matches(text,text)"
+        | "regexp_matches(text,text,text)" => Some(true),
+        _ => None,
+    }
 }
 
 /// PG's checks in `ParseFuncOrColumn` / `transformAggregateCall` that the

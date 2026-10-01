@@ -168,7 +168,7 @@ impl RecordRegistry {
     fn register(&mut self, ty: &Type, config: &ResolvedConfig) {
         match ty {
             Type::Domain { base, .. } => self.register(base, config),
-            Type::Array { element } => self.register(element, config),
+            Type::Array { element, .. } => self.register(element, config),
             Type::Range { subtype, .. } => self.register(subtype, config),
             Type::Composite { fields, .. } => {
                 // Always synthesize a struct, even when a `[types]` override
@@ -240,10 +240,17 @@ enum DeserStrategy {
     /// Enum represented as its label string. Value is stringified via
     /// `ToString` on the way in and parsed via `FromStr` on the way out.
     EnumAsString { target: syn::Type },
-    /// Homogeneous collection of JSONB-backed domain values.
-    VecOfJsonbDomain { inner: syn::Type },
-    /// Homogeneous collection of enum values.
-    VecOfEnumAsString { inner: syn::Type },
+    /// Homogeneous collection of JSONB-backed domain values; `nullable_elems`
+    /// when its elements are known to be NULL-able (`Vec<Option<T>>`).
+    VecOfJsonbDomain {
+        inner: syn::Type,
+        nullable_elems: bool,
+    },
+    /// Homogeneous collection of enum values (`nullable_elems` as above).
+    VecOfEnumAsString {
+        inner: syn::Type,
+        nullable_elems: bool,
+    },
     /// Composite type or anonymous `ROW(...)` / subquery record. Decoded
     /// through a synthesized record struct (see [`RecordRegistry`]); when the
     /// composite has a `[types]` override the decoded value is rebuilt
@@ -308,15 +315,19 @@ fn resolve_type_mapping(
     config: &ResolvedConfig,
     registry: &RecordRegistry,
 ) -> Result<RustMapping, syn::Error> {
-    if let Type::Array { element } = ty {
-        return resolve_array_mapping(element, config, registry);
+    if let Type::Array {
+        element,
+        element_nullable,
+    } = ty
+    {
+        return resolve_array_mapping(element, *element_nullable == Some(true), config, registry);
     }
 
     let ovr = override_path(ty, config);
 
     match innermost_type(ty) {
         // A domain over an array behaves like the array itself.
-        Type::Array { element } => resolve_array_mapping(element, config, registry),
+        Type::Array { element, .. } => resolve_array_mapping(element, false, config, registry),
         Type::Composite { .. } | Type::AnonymousRecord { .. } => Ok(RustMapping {
             rust_type: record_site_type(ty, config, registry)?,
             strategy: DeserStrategy::Record,
@@ -447,15 +458,21 @@ fn resolve_type_mapping(
     }
 }
 
-/// Resolve the mapping for a PG array, given its element type.
+/// Resolve the mapping for a PG array, given its element type and whether
+/// its elements are known to be NULL-able (then `Vec<Option<T>>`).
 fn resolve_array_mapping(
     element: &Type,
+    nullable_elems: bool,
     config: &ResolvedConfig,
     registry: &RecordRegistry,
 ) -> Result<RustMapping, syn::Error> {
     let inner = resolve_type_mapping(element, config, registry)?;
     let rt = &inner.rust_type;
-    let vec_type: syn::Type = parse_str(&format!("Vec<{}>", quote! { #rt }))?;
+    let vec_type: syn::Type = if nullable_elems {
+        parse_str(&format!("Vec<Option<{}>>", quote! { #rt }))?
+    } else {
+        parse_str(&format!("Vec<{}>", quote! { #rt }))?
+    };
     match inner.strategy {
         DeserStrategy::Plain { .. } => Ok(RustMapping {
             rust_type: vec_type,
@@ -466,12 +483,18 @@ fn resolve_array_mapping(
         }),
         DeserStrategy::JsonbDomain { target } => Ok(RustMapping {
             rust_type: vec_type,
-            strategy: DeserStrategy::VecOfJsonbDomain { inner: target },
+            strategy: DeserStrategy::VecOfJsonbDomain {
+                inner: target,
+                nullable_elems,
+            },
             accepts_iter: false,
         }),
         DeserStrategy::EnumAsString { target } => Ok(RustMapping {
             rust_type: vec_type,
-            strategy: DeserStrategy::VecOfEnumAsString { inner: target },
+            strategy: DeserStrategy::VecOfEnumAsString {
+                inner: target,
+                nullable_elems,
+            },
             accepts_iter: false,
         }),
         DeserStrategy::Record => Ok(RustMapping {
@@ -486,6 +509,27 @@ fn resolve_array_mapping(
             "nested arrays of domain/enum/composite types are not supported",
         )),
     }
+}
+
+/// True for an array whose elements are known to be NULL-able.
+fn has_nullable_elems(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Array {
+            element_nullable: Some(true),
+            ..
+        }
+    )
+}
+
+/// `Vec<inner>`, or `Vec<Option<inner>>` for an array `ty` with NULL-able
+/// elements.
+fn vec_of(inner: &syn::Type, ty: &Type) -> Result<syn::Type, syn::Error> {
+    Ok(if has_nullable_elems(ty) {
+        parse_str(&format!("Vec<Option<{}>>", quote! { #inner }))?
+    } else {
+        parse_str(&format!("Vec<{}>", quote! { #inner }))?
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -516,10 +560,7 @@ fn record_raw_type(ty: &Type, registry: &RecordRegistry) -> Result<syn::Type, sy
     match ty {
         Type::Composite { .. } | Type::AnonymousRecord { .. } => record_struct_path(ty, registry),
         Type::Domain { base, .. } => record_raw_type(base, registry),
-        Type::Array { element } => {
-            let inner = record_raw_type(element, registry)?;
-            Ok(parse_str(&format!("Vec<{}>", quote! { #inner }))?)
-        }
+        Type::Array { element, .. } => vec_of(&record_raw_type(element, registry)?, ty),
         // Reached only for a `Record`-strategy type, which always bottoms out
         // at a composite / anonymous record — never a scalar.
         _ => Err(syn::Error::new(
@@ -544,9 +585,8 @@ fn record_site_type(
         inner @ (Type::Composite { .. } | Type::AnonymousRecord { .. }) => {
             record_struct_path(inner, registry)
         }
-        Type::Array { element } => {
-            let inner = record_site_type(element, config, registry)?;
-            Ok(parse_str(&format!("Vec<{}>", quote! { #inner }))?)
+        array @ Type::Array { element, .. } => {
+            vec_of(&record_site_type(element, config, registry)?, array)
         }
         _ => record_raw_type(ty, registry),
     }
@@ -558,7 +598,7 @@ fn record_site_type(
 /// already holds every field in its site-typed form.
 fn record_needs_conversion(ty: &Type, config: &ResolvedConfig) -> bool {
     match ty {
-        Type::Array { element } => record_needs_conversion(element, config),
+        Type::Array { element, .. } => record_needs_conversion(element, config),
         _ => override_path(ty, config).is_some(),
     }
 }
@@ -579,8 +619,9 @@ fn convert_record_to_site(
     if !record_needs_conversion(ty, config) {
         return Ok(value);
     }
-    if let Type::Array { element } = ty {
-        let elem = convert_record_to_site(quote! { __elem }, element, false, config)?;
+    if let Type::Array { element, .. } = ty {
+        let elem =
+            convert_record_to_site(quote! { __elem }, element, has_nullable_elems(ty), config)?;
         let map_vec = quote! {
             __vec.into_iter().map(|__elem| #elem).collect::<::std::vec::Vec<_>>()
         };
@@ -1920,57 +1961,40 @@ fn decode_value(
                 })
             }
         }
-        DeserStrategy::VecOfJsonbDomain { inner } => {
+        DeserStrategy::VecOfJsonbDomain {
+            inner,
+            nullable_elems,
+        } => {
             let err = ctx.wrap_err("failed to deserialize", inner);
             let hint = Some(quote! {
                 &::typedpg::__private::tokio_postgres::types::Type::JSONB_ARRAY
             });
-            let map = quote! {
-                __vs.into_iter()
-                    .map(|__v| ::serde_json::from_value::<#inner>(__v).map_err(|e| #err))
-                    .collect::<::std::result::Result<::std::vec::Vec<#inner>, _>>()?
-            };
-            if nullable {
-                let rd = read(
-                    quote! { ::std::option::Option<::std::vec::Vec<::serde_json::Value>> },
-                    hint,
-                );
-                Ok(quote! {
-                    match #rd {
-                        ::std::option::Option::Some(__vs) => ::std::option::Option::Some(#map),
-                        ::std::option::Option::None => ::std::option::Option::None,
-                    }
-                })
-            } else {
-                let rd = read(quote! { ::std::vec::Vec<::serde_json::Value> }, hint);
-                Ok(quote! { { let __vs = #rd; #map } })
-            }
+            let convert = quote! { ::serde_json::from_value::<#inner>(__v).map_err(|e| #err) };
+            Ok(decode_vec(
+                read,
+                hint,
+                nullable,
+                *nullable_elems,
+                quote! { ::serde_json::Value },
+                inner,
+                convert,
+            ))
         }
-        DeserStrategy::VecOfEnumAsString { inner } => {
+        DeserStrategy::VecOfEnumAsString {
+            inner,
+            nullable_elems,
+        } => {
             let err = ctx.wrap_err("failed to parse enum", inner);
-            let map = quote! {
-                __vs.into_iter()
-                    .map(|__v| __v.0.parse::<#inner>().map_err(|e| #err))
-                    .collect::<::std::result::Result<::std::vec::Vec<#inner>, _>>()?
-            };
-            if nullable {
-                let rd = read(
-                    quote! { ::std::option::Option<::std::vec::Vec<::typedpg::__private::EnumString>> },
-                    None,
-                );
-                Ok(quote! {
-                    match #rd {
-                        ::std::option::Option::Some(__vs) => ::std::option::Option::Some(#map),
-                        ::std::option::Option::None => ::std::option::Option::None,
-                    }
-                })
-            } else {
-                let rd = read(
-                    quote! { ::std::vec::Vec<::typedpg::__private::EnumString> },
-                    None,
-                );
-                Ok(quote! { { let __vs = #rd; #map } })
-            }
+            let convert = quote! { __v.0.parse::<#inner>().map_err(|e| #err) };
+            Ok(decode_vec(
+                read,
+                None,
+                nullable,
+                *nullable_elems,
+                quote! { ::typedpg::__private::EnumString },
+                inner,
+                convert,
+            ))
         }
         DeserStrategy::Record | DeserStrategy::VecOfRecord => {
             // Decode through the synthesized record struct, then (when the
@@ -2009,6 +2033,49 @@ fn decode_value(
                 Ok(read(quote! { #base }, None))
             }
         }
+    }
+}
+
+/// Decode an array whose elements bridge through `wire` into `site`, with
+/// `convert` turning `__v: wire` into a `Result<site, _>`. `nullable` is the
+/// array's own NULL-ability, `nullable_elems` its elements'.
+fn decode_vec(
+    read: &dyn Fn(TokenStream, Option<TokenStream>) -> TokenStream,
+    hint: Option<TokenStream>,
+    nullable: bool,
+    nullable_elems: bool,
+    wire: TokenStream,
+    site: &syn::Type,
+    convert: TokenStream,
+) -> TokenStream {
+    let (wire_elem, site_elem, convert) = if nullable_elems {
+        (
+            quote! { ::std::option::Option<#wire> },
+            quote! { ::std::option::Option<#site> },
+            quote! { __v.map(|__v| #convert).transpose() },
+        )
+    } else {
+        (wire, quote! { #site }, convert)
+    };
+    let map = quote! {
+        __vs.into_iter()
+            .map(|__v| #convert)
+            .collect::<::std::result::Result<::std::vec::Vec<#site_elem>, _>>()?
+    };
+    if nullable {
+        let rd = read(
+            quote! { ::std::option::Option<::std::vec::Vec<#wire_elem>> },
+            hint,
+        );
+        quote! {
+            match #rd {
+                ::std::option::Option::Some(__vs) => ::std::option::Option::Some(#map),
+                ::std::option::Option::None => ::std::option::Option::None,
+            }
+        }
+    } else {
+        let rd = read(quote! { ::std::vec::Vec<#wire_elem> }, hint);
+        quote! { { let __vs = #rd; #map } }
     }
 }
 
@@ -2056,7 +2123,7 @@ fn pg_type_label(ty: &Type) -> String {
                 QualifiedName::new(schema.clone(), name.clone()).to_string()
             }
         }
-        Type::Array { element } => format!("{}[]", pg_type_label(element)),
+        Type::Array { element, .. } => format!("{}[]", pg_type_label(element)),
         Type::AnonymousRecord { .. } => "record".to_string(),
     }
 }

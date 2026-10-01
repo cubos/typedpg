@@ -1268,7 +1268,7 @@ fn array_agg_of_composite_column_returns_array_of_composite() {
         .unwrap();
     let works = &col(&s, "works").pg_type;
     match works {
-        Type::Array { element } => {
+        Type::Array { element, .. } => {
             assert_eq!(
                 **element,
                 composite(
@@ -2114,7 +2114,7 @@ fn composite_array_column_is_array_of_composite() {
     let s = db.analyze("SELECT addrs FROM locations").unwrap();
     let addrs = &col(&s, "addrs").pg_type;
     match addrs {
-        Type::Array { element } => assert_eq!(
+        Type::Array { element, .. } => assert_eq!(
             **element,
             composite(
                 "public",
@@ -2603,7 +2603,7 @@ fn composite_cast_to_record_keeps_its_type() {
         .analyze("SELECT cs::record[] AS b, ARRAY['(1,a)'::comp]::record[] AS c FROM ct")
         .unwrap();
     assert!(matches!(&s.columns[0].pg_type,
-        Type::Array { element } if matches!(&**element, Type::Composite { name, .. } if name == "comp")));
+        Type::Array { element, .. } if matches!(&**element, Type::Composite { name, .. } if name == "comp")));
 }
 
 /// Selecting a field of a `record` whose shape is unknown (a `RETURNS

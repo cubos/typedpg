@@ -146,6 +146,7 @@ pub(crate) fn infer_sublink(
             let mut array_oid = oid::UNKNOWN;
             let mut typmod = None;
             let mut collation = (None, false);
+            let mut elem_nullable = None;
             if let Some(subselect) = &sub.subselect
                 && let Some(node::Node::SelectStmt(sel)) = subselect.node.as_ref()
             {
@@ -159,6 +160,9 @@ pub(crate) fn infer_sublink(
                 let elem_is_array = snapshot
                     .get_type(elem)
                     .is_some_and(|t| t.typcategory == TypCategory::Array && t.typelem.is_some());
+                // The elements are the column's values (or, for an array
+                // column, the multidimensional result's sub-arrays').
+                elem_nullable = (!elem_is_array).then_some(first.nullable);
                 array_oid = if elem_is_array {
                     elem
                 } else {
@@ -169,7 +173,9 @@ pub(crate) fn infer_sublink(
                     })?
                 };
             }
-            Ok(ExprType::scalar_with_typmod(array_oid, false, typmod).with_collation(collation))
+            Ok(ExprType::scalar_with_typmod(array_oid, false, typmod)
+                .with_collation(collation)
+                .with_elem_nullable(elem_nullable))
         }
         _ => Err(AnalyzeError::Unsupported(format!(
             "sublink type: {:?}",

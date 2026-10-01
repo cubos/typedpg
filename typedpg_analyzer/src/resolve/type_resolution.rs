@@ -8,13 +8,19 @@ pub(crate) fn build_column(
     rc: RawColumn,
     snapshot: &PgCatalog,
 ) -> Result<AnalyzedColumn, AnalyzeError> {
-    let pg_type = resolve_type_with_shape(
+    let mut pg_type = resolve_type_with_shape(
         rc.type_oid,
         rc.typmod,
         rc.collation,
         rc.record_fields.as_deref(),
         snapshot,
     )?;
+    if let Type::Array {
+        element_nullable, ..
+    } = &mut pg_type
+    {
+        *element_nullable = rc.elem_nullable;
+    }
 
     // Handle nullability annotations (! and ?).
     let (name, nullable) = parse_nullability_annotation(&rc.name, rc.nullable);
@@ -141,6 +147,7 @@ fn resolve_type(
             let element = resolve_type(elem, typmod, collation, snapshot)?;
             return Ok(Type::Array {
                 element: Box::new(element),
+                element_nullable: None,
             });
         }
 

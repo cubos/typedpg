@@ -87,6 +87,7 @@ pub(crate) fn infer_column_ref(
                 // `(col).field` indirection and ROW-vs-shape coercion can
                 // see through to the field types.
                 record_fields: col.record_fields.clone(),
+                elem_nullable: None,
             })
         }
         Err(e) => {
@@ -250,6 +251,7 @@ fn whole_row_ref(
                     collation: c.collation,
                     explicit_collation: false,
                     record_fields: c.record_fields.clone(),
+                    elem_nullable: None,
                 });
             }
         }
@@ -268,6 +270,7 @@ fn whole_row_ref(
                 collation: c.collation,
                 explicit_collation: false,
                 record_fields: c.record_fields.clone(),
+                elem_nullable: None,
             },
         })
         .collect();
@@ -278,5 +281,6 @@ fn whole_row_ref(
         collation: None,
         explicit_collation: false,
         record_fields: Some(fields),
+        elem_nullable: None,
     })
 }

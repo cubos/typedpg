@@ -224,6 +224,9 @@ pub(crate) struct ExprType {
     /// different explicit ones meeting in one expression are an error.
     pub explicit_collation: bool,
     pub record_fields: Option<Vec<RecordField>>,
+    /// For an array value, whether its elements can be NULL, where known
+    /// (see [`crate::types::Type::Array`]); `None` otherwise.
+    pub elem_nullable: Option<bool>,
 }
 
 /// One element of an anonymous record's static shape, as it flows through
@@ -266,6 +269,7 @@ impl ExprType {
             collation: None,
             explicit_collation: false,
             record_fields: None,
+            elem_nullable: None,
         }
     }
 
@@ -280,6 +284,7 @@ impl ExprType {
             collation: None,
             explicit_collation: false,
             record_fields: None,
+            elem_nullable: None,
         }
     }
 
@@ -300,7 +305,14 @@ impl ExprType {
             collation,
             explicit_collation: false,
             record_fields: None,
+            elem_nullable: None,
         }
+    }
+
+    /// The same value, with its array elements' nullability.
+    pub fn with_elem_nullable(mut self, elem_nullable: Option<bool>) -> Self {
+        self.elem_nullable = elem_nullable;
+        self
     }
 
     /// The same value with the collation state PG's `assign_collations`
@@ -309,6 +321,21 @@ impl ExprType {
         (self.collation, self.explicit_collation) = state;
         self
     }
+}
+
+/// The element nullability of an array built from parts whose element (or
+/// value) nullability is `parts`: NULL-able if any part's is, known
+/// non-NULL only if every part's is.
+pub(crate) fn merge_elem_nullable(parts: impl IntoIterator<Item = Option<bool>>) -> Option<bool> {
+    let mut all_known = true;
+    for part in parts {
+        match part {
+            Some(true) => return Some(true),
+            Some(false) => {}
+            None => all_known = false,
+        }
+    }
+    all_known.then_some(false)
 }
 
 /// PG's `DEFAULT_COLLATION_OID`.
@@ -848,6 +875,7 @@ pub(crate) fn infer_expr(
                 collation: None,
                 explicit_collation: false,
                 record_fields: Some(fields),
+                elem_nullable: None,
             })
         }
         node::Node::SetToDefault(d) => {

@@ -179,7 +179,7 @@ fn array_sublink_of_text_returns_text_array() {
     let db = setup();
     let sql = "SELECT ARRAY(SELECT name FROM users) AS names";
     let info = db.analyze(sql).unwrap();
-    assert_eq!(col(&info, "names").pg_type, array_of(text()));
+    assert_eq!(col(&info, "names").pg_type, array_with_elems(text(), false));
     // ARRAY() always returns a non-null array (empty if no rows).
     assert!(!col(&info, "names").nullable);
 }
@@ -189,7 +189,8 @@ fn array_sublink_of_int4_returns_int4_array() {
     let db = setup();
     let sql = "SELECT ARRAY(SELECT age FROM users WHERE age IS NOT NULL) AS ages";
     let info = db.analyze(sql).unwrap();
-    assert_eq!(col(&info, "ages").pg_type, array_of(int4()));
+    // The WHERE does not narrow the column: its elements stay NULL-able.
+    assert_eq!(col(&info, "ages").pg_type, array_with_elems(int4(), true));
     assert!(!col(&info, "ages").nullable);
 }
 

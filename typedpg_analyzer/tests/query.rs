@@ -14,6 +14,8 @@ mod common;
 // ── Feature files ────────────────────────────────────────────────────────────
 #[path = "query/aggregates.rs"]
 mod aggregates;
+#[path = "query/array_element_nullability.rs"]
+mod array_element_nullability;
 #[path = "query/assignments.rs"]
 mod assignments;
 #[path = "query/call.rs"]
