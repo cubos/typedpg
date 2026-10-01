@@ -22,7 +22,7 @@ cargo nextest run --release --test migrate_integration  # integration tests (req
 cargo nextest run --release test_name                # run a single test by name
 ```
 
-All compile-time tests run without Docker. Integration tests for the runtime migration runner use `testcontainers-modules` and require a running Docker daemon.
+All compile-time tests run without Docker. Integration tests for the runtime migration runner use `testcontainers` and require a running Docker daemon.
 
 Note: doctests are not supported by nextest — for those, fall back to `cargo test --doc`.
 
