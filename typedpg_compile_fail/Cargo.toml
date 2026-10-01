@@ -1,0 +1,10 @@
+[package]
+name = "typedpg_compile_fail"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Compile-fail snapshot tests for the typedpg macros"
+
+[dev-dependencies]
+serde_json = "1"

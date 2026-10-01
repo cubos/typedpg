@@ -3121,6 +3121,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "typedpg_compile_fail"
+version = "0.0.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "typedpg_core"
 version = "0.3.0"
 dependencies = [

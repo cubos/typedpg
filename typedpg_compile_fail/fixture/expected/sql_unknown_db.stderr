@@ -1,0 +1,6 @@
+error: unknown database 'nosuch' — not found in [package.metadata.typedpg.databases]
+ --> src/bin/sql_unknown_db.rs:4:24
+  |
+4 |     typedpg::sql!(db = nosuch, db, "SELECT 1 AS one")
+  |                        ^^^^^^
+

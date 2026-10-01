@@ -26,6 +26,19 @@ All compile-time tests run without Docker. Integration tests for the runtime mig
 
 Note: doctests are not supported by nextest — for those, fall back to `cargo test --doc`.
 
+### Compile-fail snapshots
+
+Every compile-time error the macros report is pinned by
+`typedpg_compile_fail`: each binary under `typedpg_compile_fail/fixture/src/bin/`
+is one case, and its rendered errors must equal
+`fixture/expected/<case>.stderr` (`pass_*` cases must compile). After a
+deliberate wording change, re-bless and review the diff:
+
+```bash
+cargo nextest run --release -p typedpg_compile_fail           # check
+BLESS=1 cargo nextest run --release -p typedpg_compile_fail   # rewrite snapshots
+```
+
 ## Regenerating `seed.json`
 
 Never hand-migrate `typedpg_analyzer/src/seed.json` (e.g. with a Python

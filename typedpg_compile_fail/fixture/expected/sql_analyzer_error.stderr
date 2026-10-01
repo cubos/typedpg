@@ -1,0 +1,13 @@
+error: column "nmae" does not exist
+         ╭────
+       1 │ SELECT id, nmae FROM users WHERE age > 3
+         ·            ──┬─
+         ·              ╰─ column does not exist
+         ╰────
+         help: did you mean "name"?
+       
+ --> src/bin/sql_analyzer_error.rs:4:23
+  |
+4 |     typedpg::sql!(db, "SELECT id, nmae FROM users WHERE age > 3")
+  |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+

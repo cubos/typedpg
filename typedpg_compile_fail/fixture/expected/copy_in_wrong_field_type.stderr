@@ -1,0 +1,8 @@
+error[E0277]: the trait bound `Option<i32>: From<String>` is not satisfied
+  --> src/bin/copy_in_wrong_field_type.rs:13:5
+   |
+13 |     typedpg::copy_in!(db, "users (name, age)", users { name, age }).await?;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `From<String>` is not implemented for `Option<i32>`
+   |
+   = note: this error originates in the macro `typedpg::copy_in` (in Nightly builds, run with -Z macro-backtrace for more info)
+

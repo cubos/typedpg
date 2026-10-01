@@ -1,0 +1,20 @@
+error: unexpected end of input, expected the rows and their fields: `source { field, ... }`
+  --> src/bin/copy_in_malformed_source.rs:11:5
+   |
+11 |     typedpg::copy_in!(db, "users (name)", users).await?;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this error originates in the macro `typedpg::copy_in` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: expected the fields in braces: `source { field, ... }`
+  --> src/bin/copy_in_malformed_source.rs:17:48
+   |
+17 |     typedpg::copy_in!(db, "users (name)", users(name)).await?;
+   |                                                ^^^^^^
+
+error: expected the rows before their fields: `source { field, ... }`
+  --> src/bin/copy_in_malformed_source.rs:22:43
+   |
+22 |     typedpg::copy_in!(db, "users (name)", { name }).await?;
+   |                                           ^^^^^^^^
+

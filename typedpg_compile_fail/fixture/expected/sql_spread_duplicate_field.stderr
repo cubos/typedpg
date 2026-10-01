@@ -1,0 +1,6 @@
+error: duplicate field 'name' in $..users spread
+  --> src/bin/sql_spread_duplicate_field.rs:11:9
+   |
+11 |         "INSERT INTO users (name, email) VALUES $..users { name, name }"
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
