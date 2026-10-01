@@ -180,10 +180,16 @@ fn resolve_type(
                 });
             }
             TypType::Range | TypType::Multirange => {
-                let subtype_oid = snapshot
-                    .pg_range
-                    .get(&type_oid)
-                    .map(|r| r.rngsubtype)
+                let multirange = te.typtype == TypType::Multirange;
+                // `pg_range` is keyed by the range; a multirange's subtype
+                // is its range's.
+                let range_oid = if multirange {
+                    snapshot.range_of_multirange(type_oid)
+                } else {
+                    Some(type_oid)
+                };
+                let subtype_oid = range_oid
+                    .and_then(|r| snapshot.range_subtype(r))
                     .unwrap_or(oid::UNKNOWN);
                 let subtype = resolve_type(subtype_oid, None, None, snapshot)?;
                 return Ok(Type::Range {
@@ -192,6 +198,7 @@ fn resolve_type(
                     subtype: Box::new(subtype),
                     extension,
                     typmod,
+                    multirange,
                 });
             }
             TypType::Composite => {

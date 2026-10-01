@@ -384,26 +384,27 @@
 //! | `float4` / `real` | `f32` |
 //! | `float8` / `double precision` | `f64` |
 //! | `numeric` / `decimal` | `rust_decimal::Decimal` |
-//! | `text` | `String` |
-//! | `varchar` / `char(n)` | `String` |
+//! | `text` / `varchar` / `char(n)` / `name` | `String` |
+//! | `"char"` | `i8` |
 //! | `bytea` | `Vec<u8>` |
 //! | `uuid` | `uuid::Uuid` |
 //! | `date` | `chrono::NaiveDate` |
 //! | `time` | `chrono::NaiveTime` |
 //! | `timestamp` | `chrono::NaiveDateTime` |
 //! | `timestamptz` | `chrono::DateTime<chrono::Utc>` |
-//! | `json` | `serde_json::Value` |
-//! | `jsonb` | `serde_json::Value` |
-//! | `oid` | `u32` |
-//! | `bool[]` | `Vec<bool>` |
-//! | `int2[]` | `Vec<i16>` |
-//! | `int4[]` | `Vec<i32>` |
-//! | `int8[]` | `Vec<i64>` |
-//! | `float4[]` | `Vec<f32>` |
-//! | `float8[]` | `Vec<f64>` |
-//! | `text[]` | `Vec<String>` |
-//! | `uuid[]` | `Vec<uuid::Uuid>` |
-//! | `jsonb[]` | `Vec<serde_json::Value>` |
+//! | `timetz` | [`types::TimeTz`] |
+//! | `interval` | [`types::Interval`] |
+//! | `json` / `jsonb` | `serde_json::Value` |
+//! | `inet` | `cidr::IpInet` (crate `cidr` 0.3) |
+//! | `cidr` | `cidr::IpCidr` |
+//! | `macaddr` | `eui48::MacAddress` (crate `eui48` 1) |
+//! | `oid`, `xid`, `cid`, `regclass` and the other `reg*` types | `u32` |
+//! | `xid8` | [`types::Xid8`] |
+//! | `pg_lsn` | [`types::PgLsn`] |
+//! | ranges (`int4range`, `tstzrange`, …) | [`types::Range<T>`] |
+//! | built-in multiranges (`int4multirange`, …) | [`types::MultiRange<T>`] |
+//! | `void` | `()` |
+//! | `T[]` | `Vec<T>` |
 //!
 //! Types declared in your own schema — JSONB domains, enums, and types from
 //! extensions like `pgvector` — are mapped through the
@@ -427,6 +428,7 @@ pub mod from_row;
 pub mod migrate;
 mod pool; // Executor impls for pool types (deadpool, bb8)
 pub mod stream;
+pub mod types;
 
 pub use error::Error;
 pub use executor::Executor;
@@ -469,20 +471,50 @@ pub mod __private {
     use bytes::{Buf, BytesMut};
     use tokio_postgres::types::{FromSql, IsNull, Kind, ToSql, Type, to_sql_checked};
 
-    /// Reads a column as `T`, with an array of a domain read as an array of
-    /// the domain's base type.
+    /// Reads (and binds) a value as `T` through the type its binary format
+    /// is that of, where `T`'s `FromSql` / `ToSql` impl would refuse the
+    /// value's own type:
     ///
-    /// PostgreSQL describes a domain-typed column by its base type, but an
-    /// array of a domain has its own array type, whose element is the
-    /// domain — and `FromSql` impls (`Vec<i32>`, `Vec<serde_json::Value>`)
-    /// accept only their base element types. The binary format is the
-    /// base type's either way.
+    /// - an array of a domain is an array of the domain's base type.
+    ///   PostgreSQL describes a domain-typed column by its base type, but an
+    ///   array of a domain has its own array type, whose element is the
+    ///   domain — and `FromSql` impls (`Vec<i32>`, `Vec<serde_json::Value>`)
+    ///   accept only their base element types;
+    /// - the `reg*` OID alias types (`regclass`, `regtype`, …), `xid` and
+    ///   `cid` are `oid`s: an unsigned 4-byte integer, read as `u32`.
+    ///
+    /// Arrays of either are bound with their own element type OID in the
+    /// array header, which `array_recv` checks.
     #[doc(hidden)]
+    #[derive(Debug)]
     pub struct BaseTyped<T>(pub T);
 
-    /// `ty` with its array element's domains replaced by their base type,
-    /// if it is such an array.
-    fn base_typed(ty: &Type) -> Option<Type> {
+    /// The 4-byte unsigned types `u32`'s impls (which accept only `oid`)
+    /// read and write.
+    fn is_oid_like(ty: &Type) -> bool {
+        matches!(
+            *ty,
+            Type::REGPROC
+                | Type::REGPROCEDURE
+                | Type::REGOPER
+                | Type::REGOPERATOR
+                | Type::REGCLASS
+                | Type::REGTYPE
+                | Type::REGNAMESPACE
+                | Type::REGROLE
+                | Type::REGCOLLATION
+                | Type::REGCONFIG
+                | Type::REGDICTIONARY
+                | Type::XID
+                | Type::CID
+        )
+    }
+
+    /// The type a value of `ty` is (de)serialized as, if not `ty` itself.
+    fn wire_type(ty: &Type) -> Option<Type> {
+        if is_oid_like(ty) {
+            return Some(Type::OID);
+        }
         let Kind::Array(member) = ty.kind() else {
             return None;
         };
@@ -490,13 +522,17 @@ pub mod __private {
         while let Kind::Domain(inner) = base.kind() {
             base = inner;
         }
-        if std::ptr::eq(base, member) {
+        let base = if is_oid_like(base) {
+            Type::OID
+        } else if std::ptr::eq(base, member) {
             return None;
-        }
+        } else {
+            base.clone()
+        };
         Some(Type::new(
             ty.name().to_owned(),
             ty.oid(),
-            Kind::Array(base.clone()),
+            Kind::Array(base),
             ty.schema().to_owned(),
         ))
     }
@@ -517,17 +553,63 @@ pub mod __private {
             ty: &Type,
             raw: Option<&'a [u8]>,
         ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
-            match base_typed(ty) {
-                Some(base) => T::from_sql_nullable(&base, raw).map(BaseTyped),
+            match wire_type(ty) {
+                Some(wire) => T::from_sql_nullable(&wire, raw).map(BaseTyped),
                 None => T::from_sql_nullable(ty, raw).map(BaseTyped),
             }
         }
 
         fn accepts(ty: &Type) -> bool {
-            match base_typed(ty) {
-                Some(base) => T::accepts(&base),
+            match wire_type(ty) {
+                Some(wire) => T::accepts(&wire),
                 None => T::accepts(ty),
             }
+        }
+    }
+
+    impl<T: ToSql> ToSql for BaseTyped<T> {
+        fn to_sql(
+            &self,
+            ty: &Type,
+            out: &mut BytesMut,
+        ) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
+            let Some(wire) = wire_type(ty) else {
+                return self.0.to_sql(ty, out);
+            };
+            let start = out.len();
+            let is_null = self.0.to_sql(&wire, out)?;
+            // The element type OID: bytes 8..12 of the binary array format.
+            if let (IsNull::No, Kind::Array(member)) = (&is_null, ty.kind()) {
+                out[start + 8..start + 12].copy_from_slice(&member.oid().to_be_bytes());
+            }
+            Ok(is_null)
+        }
+
+        fn accepts(ty: &Type) -> bool {
+            match wire_type(ty) {
+                Some(wire) => T::accepts(&wire),
+                None => T::accepts(ty),
+            }
+        }
+
+        to_sql_checked!();
+    }
+
+    /// A `void` value, which has no bytes (`void_send` sends none): the
+    /// `sql!` macro reads a `void` column as `()` through it.
+    #[derive(Debug)]
+    pub struct Void;
+
+    impl<'a> FromSql<'a> for Void {
+        fn from_sql(
+            _ty: &Type,
+            _raw: &'a [u8],
+        ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+            Ok(Void)
+        }
+
+        fn accepts(ty: &Type) -> bool {
+            *ty == Type::VOID
         }
     }
 
@@ -726,7 +808,7 @@ pub mod __private {
                 Some(head)
             };
             self.consumed += 1;
-            T::from_sql_nullable(&field_ty, body)
+            BaseTyped::<T>::from_sql_nullable(&field_ty, body).map(|v| v.0)
         }
 
         /// Assert the record carried exactly `expected` fields. Generated
