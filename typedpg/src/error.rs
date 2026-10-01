@@ -17,6 +17,11 @@ pub enum Error {
     #[error("database error: {}", DatabaseErrorDisplay(.0))]
     Database(#[from] tokio_postgres::Error),
 
+    /// The executor can't do what was asked (e.g. `copy_in!` on an executor
+    /// without a COPY implementation).
+    #[error("unsupported: {0}")]
+    Unsupported(String),
+
     /// A migration-specific error.
     #[error("migration error: {0}")]
     Migration(String),

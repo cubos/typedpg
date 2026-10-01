@@ -96,7 +96,8 @@ pub use ddl::DdlError;
 pub use error::AnalyzeError;
 pub use pg_catalog::PgCatalog;
 pub use resolve::{
-    AnalyzedColumn, AnalyzedParam, AnalyzedQuery, AnalyzedSpread, AnalyzedSpreadField,
+    AnalyzedColumn, AnalyzedCopyIn, AnalyzedParam, AnalyzedQuery, AnalyzedSpread,
+    AnalyzedSpreadField,
 };
 pub use typedpg_core::{ParseQualifiedNameError, QualifiedName};
 pub use types::{RecordField, Type};

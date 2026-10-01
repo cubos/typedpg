@@ -59,6 +59,17 @@ fn resolve_type_with_shape(
     resolve_type(type_oid, typmod, collation, snapshot)
 }
 
+/// The [`Type`] of a table column: its type with the column's typmod and
+/// collation.
+pub(crate) fn column_type(
+    type_oid: PgTypeOid,
+    typmod: Option<i32>,
+    collation: Option<crate::oid::PgCollationOid>,
+    snapshot: &PgCatalog,
+) -> Result<Type, AnalyzeError> {
+    resolve_type(type_oid, typmod, collation, snapshot)
+}
+
 pub(crate) fn build_param_info(
     type_oid: PgTypeOid,
     nullable: bool,

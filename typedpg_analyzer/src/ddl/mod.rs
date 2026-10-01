@@ -28,7 +28,7 @@ pub mod functions;
 mod guc;
 pub mod indexes;
 pub(crate) mod languages;
-mod maintenance;
+pub(crate) mod maintenance;
 pub(crate) mod opclass;
 pub mod operators;
 pub(crate) mod policies;

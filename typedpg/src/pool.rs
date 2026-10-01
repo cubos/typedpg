@@ -7,6 +7,8 @@ use tokio_postgres::Row;
 use tokio_postgres::types::ToSql;
 
 #[cfg(any(feature = "deadpool", feature = "bb8"))]
+use crate::copy::{CopyRow, column_types, write_rows};
+#[cfg(any(feature = "deadpool", feature = "bb8"))]
 use crate::executor::{Executor, slice_iter};
 #[cfg(any(feature = "deadpool", feature = "bb8"))]
 use crate::stream::RowStream;
@@ -52,6 +54,21 @@ impl Executor for deadpool_postgres::Pool {
         let rows = client.deref().query_raw(sql, slice_iter(params)).await?;
         Ok(RowStream::with_connection(rows, client))
     }
+
+    async fn copy_in<'a, I>(
+        &'a self,
+        describe_sql: &'a str,
+        copy_sql: &'a str,
+        rows: I,
+    ) -> Result<u64, crate::Error>
+    where
+        I: Iterator<Item = Result<CopyRow, crate::Error>> + Send + 'a,
+    {
+        let client = self.get().await?;
+        let types = column_types(&client.deref().prepare(describe_sql).await?);
+        let sink = client.deref().copy_in(copy_sql).await?;
+        write_rows(sink, &types, rows).await
+    }
 }
 
 /// [`Executor`] implementation for `deadpool_postgres::Object` (the pooled connection).
@@ -84,6 +101,20 @@ impl Executor for deadpool_postgres::Object {
     ) -> Result<RowStream, crate::Error> {
         let rows = self.deref().query_raw(sql, slice_iter(params)).await?;
         Ok(RowStream::new(rows))
+    }
+
+    async fn copy_in<'a, I>(
+        &'a self,
+        describe_sql: &'a str,
+        copy_sql: &'a str,
+        rows: I,
+    ) -> Result<u64, crate::Error>
+    where
+        I: Iterator<Item = Result<CopyRow, crate::Error>> + Send + 'a,
+    {
+        let types = column_types(&self.deref().prepare(describe_sql).await?);
+        let sink = self.deref().copy_in(copy_sql).await?;
+        write_rows(sink, &types, rows).await
     }
 }
 
@@ -124,6 +155,20 @@ impl Executor for deadpool_postgres::Transaction<'_> {
     ) -> Result<RowStream, crate::Error> {
         let rows = self.deref().query_raw(sql, slice_iter(params)).await?;
         Ok(RowStream::new(rows))
+    }
+
+    async fn copy_in<'a, I>(
+        &'a self,
+        describe_sql: &'a str,
+        copy_sql: &'a str,
+        rows: I,
+    ) -> Result<u64, crate::Error>
+    where
+        I: Iterator<Item = Result<CopyRow, crate::Error>> + Send + 'a,
+    {
+        let types = column_types(&self.deref().prepare(describe_sql).await?);
+        let sink = self.deref().copy_in(copy_sql).await?;
+        write_rows(sink, &types, rows).await
     }
 }
 
@@ -170,5 +215,20 @@ where
         let client = self.get_owned().await?;
         let rows = client.query_raw(sql, slice_iter(params)).await?;
         Ok(RowStream::with_connection(rows, client))
+    }
+
+    async fn copy_in<'a, I>(
+        &'a self,
+        describe_sql: &'a str,
+        copy_sql: &'a str,
+        rows: I,
+    ) -> Result<u64, crate::Error>
+    where
+        I: Iterator<Item = Result<CopyRow, crate::Error>> + Send + 'a,
+    {
+        let client = self.get().await?;
+        let types = column_types(&client.prepare(describe_sql).await?);
+        let sink = client.copy_in(copy_sql).await?;
+        write_rows(sink, &types, rows).await
     }
 }

@@ -1,6 +1,7 @@
 use tokio_postgres::Row;
 use tokio_postgres::types::ToSql;
 
+use crate::copy::{CopyRow, column_types, write_rows};
 use crate::stream::RowStream;
 
 /// Abstraction over types that can execute SQL queries against PostgreSQL.
@@ -92,6 +93,37 @@ pub trait Executor: Sync {
     ) -> impl std::future::Future<Output = Result<RowStream, crate::Error>> + Send + 'a {
         async move { Ok(RowStream::from_rows(self.query(sql, params).await?)) }
     }
+
+    /// Runs `copy_sql` (a binary `COPY ... FROM STDIN`) feeding it `rows`,
+    /// and returns the number of rows copied. `describe_sql` is prepared
+    /// only for the target columns' types.
+    ///
+    /// Used internally by `copy_in!`. The default implementation returns
+    /// [`Error::Unsupported`](crate::Error::Unsupported); every executor in
+    /// this crate implements it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Database`](crate::Error::Database) if the server refuses the
+    /// COPY or a row, the error a row's conversion raised, or
+    /// [`Error::Pool`](crate::Error::Pool) if no connection can be acquired.
+    /// On error the COPY is aborted: no row is kept.
+    fn copy_in<'a, I>(
+        &'a self,
+        describe_sql: &'a str,
+        copy_sql: &'a str,
+        rows: I,
+    ) -> impl std::future::Future<Output = Result<u64, crate::Error>> + Send + 'a
+    where
+        I: Iterator<Item = Result<CopyRow, crate::Error>> + Send + 'a,
+    {
+        let _ = (describe_sql, copy_sql, rows);
+        async move {
+            Err(crate::Error::Unsupported(
+                "this executor does not implement COPY".into(),
+            ))
+        }
+    }
 }
 
 impl<T: Executor + Sync> Executor for &T {
@@ -117,6 +149,21 @@ impl<T: Executor + Sync> Executor for &T {
         params: &'a [&'a (dyn ToSql + Sync)],
     ) -> Result<RowStream, crate::Error> {
         (**self).query_stream(sql, params).await
+    }
+
+    // Not an `async fn`: forwarding the inner future sidesteps Rust 1.88
+    // (the MSRV) rejecting the generic's lifetime bound in one
+    // (rust#100013).
+    fn copy_in<'a, I>(
+        &'a self,
+        describe_sql: &'a str,
+        copy_sql: &'a str,
+        rows: I,
+    ) -> impl std::future::Future<Output = Result<u64, crate::Error>> + Send + 'a
+    where
+        I: Iterator<Item = Result<CopyRow, crate::Error>> + Send + 'a,
+    {
+        (**self).copy_in(describe_sql, copy_sql, rows)
     }
 }
 
@@ -145,6 +192,20 @@ impl Executor for tokio_postgres::Client {
         let rows = tokio_postgres::Client::query_raw(self, sql, slice_iter(params)).await?;
         Ok(RowStream::new(rows))
     }
+
+    async fn copy_in<'a, I>(
+        &'a self,
+        describe_sql: &'a str,
+        copy_sql: &'a str,
+        rows: I,
+    ) -> Result<u64, crate::Error>
+    where
+        I: Iterator<Item = Result<CopyRow, crate::Error>> + Send + 'a,
+    {
+        let types = column_types(&tokio_postgres::Client::prepare(self, describe_sql).await?);
+        let sink = tokio_postgres::Client::copy_in(self, copy_sql).await?;
+        write_rows(sink, &types, rows).await
+    }
 }
 
 impl Executor for tokio_postgres::Transaction<'_> {
@@ -171,6 +232,20 @@ impl Executor for tokio_postgres::Transaction<'_> {
     ) -> Result<RowStream, crate::Error> {
         let rows = tokio_postgres::Transaction::query_raw(self, sql, slice_iter(params)).await?;
         Ok(RowStream::new(rows))
+    }
+
+    async fn copy_in<'a, I>(
+        &'a self,
+        describe_sql: &'a str,
+        copy_sql: &'a str,
+        rows: I,
+    ) -> Result<u64, crate::Error>
+    where
+        I: Iterator<Item = Result<CopyRow, crate::Error>> + Send + 'a,
+    {
+        let types = column_types(&tokio_postgres::Transaction::prepare(self, describe_sql).await?);
+        let sink = tokio_postgres::Transaction::copy_in(self, copy_sql).await?;
+        write_rows(sink, &types, rows).await
     }
 }
 
