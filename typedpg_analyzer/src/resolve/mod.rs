@@ -395,11 +395,40 @@ pub(crate) fn analyze_raw_node_with_param_types(
     analyze_raw_node_with(snapshot, stmt, params)
 }
 
+/// Analyze `stmt` until its params' nullability is settled. A walk can
+/// read a `$N` as non-NULL (`COALESCE(col, $1)` taking its nullability
+/// from it) before a later site infers it nullable (the same `COALESCE`,
+/// or `$1` assigned to a nullable column): the statement is then analyzed
+/// again with those params nullable from the start, so no inference rests
+/// on a value the caller may pass as NULL. Nullability only ever turns
+/// on, so this ends after at most one pass per param.
 fn analyze_raw_node_with(
     snapshot: &PgCatalog,
     stmt: &node::Node,
-    mut params: ParamCollector,
+    params: ParamCollector,
 ) -> Result<(Vec<RawColumn>, Vec<RawParam>), AnalyzeError> {
+    let mut seeded = params;
+    loop {
+        let (analysis, stale) = analyze_raw_node_once(snapshot, stmt, seeded.clone())?;
+        if stale.is_empty() {
+            return Ok(analysis);
+        }
+        for n in stale {
+            seeded.infer_nullable(n, true);
+        }
+    }
+}
+
+/// A statement's output columns and parameters.
+type RawAnalysis = (Vec<RawColumn>, Vec<RawParam>);
+
+/// One pass of [`analyze_raw_node_with`], also returning the params read
+/// as non-NULL that ended up nullable.
+fn analyze_raw_node_once(
+    snapshot: &PgCatalog,
+    stmt: &node::Node,
+    mut params: ParamCollector,
+) -> Result<(RawAnalysis, Vec<i32>), AnalyzeError> {
     let (raw_columns, raw_params) = match stmt {
         // `SELECT … INTO t` is CREATE TABLE AS (transformSelectStmt turns it
         // into a CreateTableAsStmt): it returns no rows.
@@ -490,12 +519,13 @@ fn analyze_raw_node_with(
         }
     };
 
+    let stale = params.stale_non_null_reads();
     let raw_params = match raw_params {
         Some(p) => p,
         None => params.into_sorted()?,
     };
 
-    Ok((raw_columns, raw_params))
+    Ok(((raw_columns, raw_params), stale))
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
