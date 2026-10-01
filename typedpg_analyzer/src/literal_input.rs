@@ -10,8 +10,8 @@
 //!
 //! The contract is **conservative**: [`validate`] must never reject a string
 //! PostgreSQL's input function would accept. Types whose grammar we don't
-//! model fully (geometric coordinates, …) are only checked
-//! for the slices we can decide exactly. When in doubt, accept.
+//! model fully are only checked for the slices we can decide exactly. When
+//! in doubt, accept.
 //!
 //! Each rejection carries PG's message verbatim (the analyzer's error-message
 //! contract): `invalid input syntax for type %s: "%s"`, `value "%s" is out of
@@ -580,6 +580,36 @@ fn hex_float_out_of_range(
     top == emin_sub - 1 && bits[1..].iter().all(|&b| !b)
 }
 
+/// Whether the `strtod` (`strtof` when `is_real`) prefix `text` of shape
+/// `shape` overflows to infinity or underflows to zero from a nonzero
+/// mantissa — what `float8in_internal` reports as out of range.
+fn strtod_out_of_range(text: &str, shape: &FloatPrefix, is_real: bool) -> bool {
+    match shape {
+        FloatPrefix::Special => false,
+        FloatPrefix::Decimal { nonzero_digit } => {
+            let (is_inf, is_zero) = if is_real {
+                let v: f32 = text.parse().unwrap_or(0.0);
+                (v.is_infinite(), v == 0.0)
+            } else {
+                let v: f64 = text.parse().unwrap_or(0.0);
+                (v.is_infinite(), v == 0.0)
+            };
+            is_inf || (is_zero && *nonzero_digit)
+        }
+        FloatPrefix::Hex {
+            digits,
+            frac_len,
+            exp,
+        } => {
+            if is_real {
+                hex_float_out_of_range(digits, *frac_len, *exp, 24, 127, -149)
+            } else {
+                hex_float_out_of_range(digits, *frac_len, *exp, 53, 1023, -1074)
+            }
+        }
+    }
+}
+
 /// Mirrors `float8in_internal` / `float4in_internal` (float.c): leading
 /// whitespace, then the longest prefix glibc's `strtod`/`strtof` accepts
 /// (decimal or C99 hex floats, `inf`/`infinity`/`nan`/`nan(…)` in any
@@ -602,31 +632,7 @@ fn validate_float(content: &str, type_name: &str) -> Result<(), String> {
     }
     let (len, shape) = strtod_prefix(num).ok_or_else(err)?;
     let text = &content[start..start + len];
-    let out_of_range = match shape {
-        FloatPrefix::Special => false,
-        FloatPrefix::Decimal { nonzero_digit } => {
-            let (is_inf, is_zero) = if is_real {
-                let v: f32 = text.parse().unwrap_or(0.0);
-                (v.is_infinite(), v == 0.0)
-            } else {
-                let v: f64 = text.parse().unwrap_or(0.0);
-                (v.is_infinite(), v == 0.0)
-            };
-            is_inf || (is_zero && nonzero_digit)
-        }
-        FloatPrefix::Hex {
-            digits,
-            frac_len,
-            exp,
-        } => {
-            if is_real {
-                hex_float_out_of_range(&digits, frac_len, exp, 24, 127, -149)
-            } else {
-                hex_float_out_of_range(&digits, frac_len, exp, 53, 1023, -1074)
-            }
-        }
-    };
-    if out_of_range {
+    if strtod_out_of_range(text, &shape, is_real) {
         return Err(format!("\"{text}\" is out of range for type {type_name}"));
     }
     if num[len..].iter().any(|&b| !c_isspace(b)) {
@@ -1058,93 +1064,314 @@ fn validate_macaddr(content: &str, is_mac8: bool) -> Result<(), String> {
 
 // ─── geometric types ────────────────────────────────────────────────────────
 
-/// Mirrors the geo_ops.c input functions loosely: tokenize the value into
-/// float coordinates (sign / digits / `.` / exponent; `nan` and
-/// `inf`/`infinity` are valid coordinates) amid the delimiter set
-/// `, ( ) [ ] < > { }` and whitespace, then check the coordinate *count*
-/// each shape requires. Delimiter placement is not modeled (accept-leaning):
-/// `'(1,2]'::point` passes here even though PG rejects it.
-fn validate_geometric(content: &str, name: &str) -> Result<(), String> {
-    let err = || format!("invalid input syntax for type {name}: \"{content}\"");
-    let mut nums = 0usize;
-    let bytes = content.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let c = bytes[i] as char;
-        if c.is_ascii_whitespace()
-            || matches!(c, ',' | '(' | ')' | '[' | ']' | '<' | '>' | '{' | '}')
-        {
-            i += 1;
-            continue;
-        }
-        // A coordinate: optional sign, then nan/inf[inity] or a decimal
-        // float with optional exponent.
-        let start = i;
-        if matches!(bytes[i], b'+' | b'-') {
-            i += 1;
-        }
-        let rest = &content[i..];
-        let lower = rest
-            .get(..8.min(rest.len()))
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        if lower.starts_with("infinity") {
-            i += 8;
-            nums += 1;
-            continue;
-        }
-        if lower.starts_with("inf") {
-            i += 3;
-            nums += 1;
-            continue;
-        }
-        if lower.starts_with("nan") {
-            i += 3;
-            nums += 1;
-            continue;
-        }
-        let mut any = false;
-        while i < bytes.len() && bytes[i].is_ascii_digit() {
-            i += 1;
-            any = true;
-        }
-        if i < bytes.len() && bytes[i] == b'.' {
-            i += 1;
-            while i < bytes.len() && bytes[i].is_ascii_digit() {
-                i += 1;
-                any = true;
-            }
-        }
-        if any && i < bytes.len() && matches!(bytes[i], b'e' | b'E') {
-            let mut j = i + 1;
-            if j < bytes.len() && matches!(bytes[j], b'+' | b'-') {
-                j += 1;
-            }
-            let mut exp_digit = false;
-            while j < bytes.len() && bytes[j].is_ascii_digit() {
-                j += 1;
-                exp_digit = true;
-            }
-            if exp_digit {
-                i = j;
-            }
-        }
-        if !any || i == start {
-            return Err(err());
-        }
-        nums += 1;
+/// A failed geometric parse: PG's syntax error (on the whole input) or a
+/// coordinate out of float8 range (on the coordinate's text).
+enum GeoError {
+    Syntax,
+    OutOfRange(String),
+}
+
+/// A port of geo_ops.c's input decoders over `s` (`single_decode`,
+/// `pair_decode`, `path_decode`): `pos` is the C code's `str` pointer.
+struct GeoInput<'a> {
+    s: &'a [u8],
+    pos: usize,
+}
+
+impl GeoInput<'_> {
+    fn at(&self, i: usize) -> u8 {
+        self.s.get(i).copied().unwrap_or(0)
     }
-    let count_ok = match name {
-        "point" => nums == 2,
-        "lseg" | "box" => nums == 4,
-        "circle" => nums == 3,
-        // `{A,B,C}` (3) or two points (4).
-        "line" => nums == 3 || nums == 4,
-        // One or more points.
-        "path" | "polygon" => nums >= 2 && nums.is_multiple_of(2),
-        _ => true,
+
+    fn cur(&self) -> u8 {
+        self.at(self.pos)
+    }
+
+    fn skip_space(&mut self) {
+        while c_isspace(self.cur()) {
+            self.pos += 1;
+        }
+    }
+
+    /// `single_decode` → `float8in_internal` with an end pointer: leading
+    /// whitespace, the longest `strtod` prefix, trailing whitespace. The
+    /// value is approximate for a hex float (only the sign / ε-zero checks
+    /// below use it).
+    fn single(&mut self) -> Result<f64, GeoError> {
+        self.skip_space();
+        let num = &self.s[self.pos..];
+        if num.is_empty() {
+            return Err(GeoError::Syntax);
+        }
+        let (len, shape) = strtod_prefix(num).ok_or(GeoError::Syntax)?;
+        let text = std::str::from_utf8(&num[..len]).unwrap_or("");
+        if strtod_out_of_range(text, &shape, false) {
+            return Err(GeoError::OutOfRange(text.to_owned()));
+        }
+        let value = match &shape {
+            FloatPrefix::Special => {
+                let lower = text.trim_start_matches(['+', '-']).to_ascii_lowercase();
+                let sign = if text.starts_with('-') { -1.0 } else { 1.0 };
+                if lower.starts_with("nan") {
+                    f64::NAN
+                } else {
+                    sign * f64::INFINITY
+                }
+            }
+            FloatPrefix::Decimal { .. } => text.parse().unwrap_or(0.0),
+            FloatPrefix::Hex {
+                digits,
+                frac_len,
+                exp,
+            } => {
+                let mantissa = digits.iter().fold(0.0f64, |acc, d| {
+                    acc * 16.0 + f64::from((*d as char).to_digit(16).unwrap_or(0))
+                });
+                let sign = if text.starts_with('-') { -1.0 } else { 1.0 };
+                let shift = (*exp - 4 * *frac_len).clamp(-2000, 2000) as i32;
+                sign * mantissa * 2f64.powi(shift)
+            }
+        };
+        self.pos += len;
+        self.skip_space();
+        Ok(value)
+    }
+
+    /// `pair_decode`: `x,y` or `(x,y)`; without an end pointer the pair
+    /// must end the input.
+    fn pair(&mut self, endptr: bool) -> Result<(f64, f64), GeoError> {
+        self.skip_space();
+        let has_delim = self.cur() == b'(';
+        if has_delim {
+            self.pos += 1;
+        }
+        let x = self.single()?;
+        if self.cur() != b',' {
+            return Err(GeoError::Syntax);
+        }
+        self.pos += 1;
+        let y = self.single()?;
+        if has_delim {
+            if self.cur() != b')' {
+                return Err(GeoError::Syntax);
+            }
+            self.pos += 1;
+            self.skip_space();
+        }
+        if !endptr && self.pos != self.s.len() {
+            return Err(GeoError::Syntax);
+        }
+        Ok((x, y))
+    }
+
+    /// `path_decode`: `npts` pairs, optionally wrapped in `[ ]` (when
+    /// `opentype`) or `( )`. Returns the points and whether it was `[ ]`.
+    fn path(
+        &mut self,
+        opentype: bool,
+        npts: usize,
+        endptr: bool,
+    ) -> Result<(Vec<(f64, f64)>, bool), GeoError> {
+        let mut depth = 0;
+        self.skip_space();
+        let isopen = self.cur() == b'[';
+        if isopen {
+            if !opentype {
+                return Err(GeoError::Syntax);
+            }
+            depth += 1;
+            self.pos += 1;
+        } else if self.cur() == b'(' {
+            let mut cp = self.pos + 1;
+            while c_isspace(self.at(cp)) {
+                cp += 1;
+            }
+            // A second `(` opens the path; a lone one (the last `(` in the
+            // input) does too.
+            if self.at(cp) == b'(' || self.s[self.pos..].iter().rposition(|&b| b == b'(') == Some(0)
+            {
+                depth += 1;
+                self.pos = cp;
+            }
+        }
+        let mut points = Vec::with_capacity(npts);
+        for _ in 0..npts {
+            points.push(self.pair(true)?);
+            if self.cur() == b',' {
+                self.pos += 1;
+            }
+        }
+        while depth > 0 {
+            if self.cur() == b')' || (self.cur() == b']' && isopen && depth == 1) {
+                depth -= 1;
+                self.pos += 1;
+                self.skip_space();
+            } else {
+                return Err(GeoError::Syntax);
+            }
+        }
+        if !endptr && self.pos != self.s.len() {
+            return Err(GeoError::Syntax);
+        }
+        Ok((points, isopen))
+    }
+}
+
+/// `pair_count`: the points a path / polygon input holds, from its comma
+/// count (odd, else `None`).
+fn pair_count(s: &[u8]) -> Option<usize> {
+    let commas = s.iter().filter(|&&b| b == b',').count();
+    (commas % 2 == 1).then_some(commas.div_ceil(2))
+}
+
+/// geo_ops.c's `FPzero` / `FPeq`, with its `EPSILON`.
+fn fp_zero(a: f64) -> bool {
+    a.abs() <= 1.0e-6
+}
+
+fn fp_eq(a: f64, b: f64) -> bool {
+    a == b || (a - b).abs() <= 1.0e-6
+}
+
+/// `point_eq_point`: ε-equal coordinates, or exactly equal ones (NaN
+/// equal to NaN) when a NaN is involved.
+fn point_eq(p: (f64, f64), q: (f64, f64)) -> bool {
+    if p.0.is_nan() || p.1.is_nan() || q.0.is_nan() || q.1.is_nan() {
+        let eq = |a: f64, b: f64| a == b || (a.is_nan() && b.is_nan());
+        return eq(p.0, q.0) && eq(p.1, q.1);
+    }
+    fp_eq(p.0, q.0) && fp_eq(p.1, q.1)
+}
+
+/// Mirrors the geo_ops.c input functions (`point_in`, `lseg_in`, `box_in`,
+/// `path_in`, `poly_in`, `circle_in`, `line_in`) on top of the decoders
+/// above: their delimiters, the float8 coordinates (`float8in_internal`,
+/// whose out-of-range error names just the coordinate), and the value
+/// checks a line or circle makes.
+fn validate_geometric(content: &str, name: &str) -> Result<(), String> {
+    let syntax = || format!("invalid input syntax for type {name}: \"{content}\"");
+    let s = content.as_bytes();
+    let mut g = GeoInput { s, pos: 0 };
+    if name == "line" {
+        return validate_line(content, &mut g);
+    }
+    let result: Result<(), GeoError> = (|| {
+        match name {
+            "point" => g.pair(false).map(|_| ()),
+            "lseg" => g.path(true, 2, false).map(|_| ()),
+            "box" => g.path(false, 2, false).map(|_| ()),
+            "polygon" => {
+                let npts = pair_count(s).ok_or(GeoError::Syntax)?;
+                g.path(false, npts, false).map(|_| ())
+            }
+            "path" => {
+                let npts = pair_count(s).ok_or(GeoError::Syntax)?;
+                g.skip_space();
+                // A single leading paren is the path's own (closed) one.
+                let mut depth = 0;
+                if g.cur() == b'(' && s[g.pos..].iter().rposition(|&b| b == b'(') == Some(0) {
+                    g.pos += 1;
+                    depth = 1;
+                }
+                g.path(true, npts, true)?;
+                if depth == 1 {
+                    if g.cur() != b')' {
+                        return Err(GeoError::Syntax);
+                    }
+                    g.pos += 1;
+                    g.skip_space();
+                }
+                if g.pos != s.len() {
+                    return Err(GeoError::Syntax);
+                }
+                Ok(())
+            }
+            "circle" => {
+                let mut depth = 0;
+                g.skip_space();
+                if g.cur() == b'<' {
+                    depth += 1;
+                    g.pos += 1;
+                } else if g.cur() == b'(' {
+                    let mut cp = g.pos + 1;
+                    while c_isspace(g.at(cp)) {
+                        cp += 1;
+                    }
+                    if g.at(cp) == b'(' {
+                        depth += 1;
+                        g.pos = cp;
+                    }
+                }
+                g.pair(true)?;
+                if g.cur() == b',' {
+                    g.pos += 1;
+                }
+                let radius = g.single()?;
+                if radius < 0.0 {
+                    return Err(GeoError::Syntax);
+                }
+                while depth > 0 {
+                    if g.cur() == b')' || (g.cur() == b'>' && depth == 1) {
+                        depth -= 1;
+                        g.pos += 1;
+                        g.skip_space();
+                    } else {
+                        return Err(GeoError::Syntax);
+                    }
+                }
+                if g.pos != s.len() {
+                    return Err(GeoError::Syntax);
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    })();
+    match result {
+        Ok(()) => Ok(()),
+        Err(GeoError::Syntax) => Err(syntax()),
+        Err(GeoError::OutOfRange(text)) => Err(format!(
+            "\"{text}\" is out of range for type double precision"
+        )),
+    }
+}
+
+/// `line_in`: `{A,B,C}` (A and B not both zero) or two distinct points in
+/// `lseg` syntax.
+fn validate_line(content: &str, g: &mut GeoInput<'_>) -> Result<(), String> {
+    let syntax = || format!("invalid input syntax for type line: \"{content}\"");
+    let to_msg = |e: GeoError| match e {
+        GeoError::Syntax => syntax(),
+        GeoError::OutOfRange(text) => {
+            format!("\"{text}\" is out of range for type double precision")
+        }
     };
-    if count_ok { Ok(()) } else { Err(err()) }
+    g.skip_space();
+    if g.cur() == b'{' {
+        g.pos += 1;
+        let mut coef = [0.0; 3];
+        for (i, c) in coef.iter_mut().enumerate() {
+            *c = g.single().map_err(to_msg)?;
+            let delim = if i < 2 { b',' } else { b'}' };
+            if g.cur() != delim {
+                return Err(syntax());
+            }
+            g.pos += 1;
+        }
+        g.skip_space();
+        if g.pos != g.s.len() {
+            return Err(syntax());
+        }
+        if fp_zero(coef[0]) && fp_zero(coef[1]) {
+            return Err("invalid line specification: A and B cannot both be zero".into());
+        }
+        return Ok(());
+    }
+    let (points, _) = g.path(true, 2, false).map_err(to_msg)?;
+    if point_eq(points[0], points[1]) {
+        return Err("invalid line specification: must be two distinct points".into());
+    }
+    Ok(())
 }
 
 // ─── system identifier types ────────────────────────────────────────────────
@@ -1582,12 +1809,53 @@ mod tests {
             ("(1,2)", "circle"),
             ("{1,2}", "line"),
             ("(1,2,3)", "path"),
+            // Delimiters must match (point_in / path_decode).
+            ("[1,2]", "point"),
+            ("(1,2]", "point"),
+            ("((1,2))", "point"),
+            ("[(0,0),(1,1)]", "box"),
+            ("((1,2),(3,4)]", "lseg"),
+            ("<(1,2),3", "circle"),
+            ("(1,2) x", "point"),
         ] {
             assert!(
                 validate_geometric(bad, ty).is_err(),
                 "{bad:?}::{ty} should be invalid"
             );
         }
+        // More shapes PG 18 accepts.
+        for (ok, ty) in [
+            (" ( 1 , 2 ) ", "point"),
+            ("[(1,2),(3,4)]", "path"),
+            ("(1,2),(3,4)", "box"),
+            ("((1,2),3)", "circle"),
+            ("1,2,3", "circle"),
+            ("[(1,2),(3,4))", "lseg"),
+            ("(0x10,inf)", "point"),
+        ] {
+            assert!(
+                validate_geometric(ok, ty).is_ok(),
+                "{ok:?}::{ty} should be valid"
+            );
+        }
+        // Value checks, and a coordinate out of float8 range.
+        let msg = |c, ty| validate_geometric(c, ty).unwrap_err();
+        assert_eq!(
+            msg("{0,0,1}", "line"),
+            "invalid line specification: A and B cannot both be zero"
+        );
+        assert_eq!(
+            msg("[(1,1),(1,1)]", "line"),
+            "invalid line specification: must be two distinct points"
+        );
+        assert_eq!(
+            msg("<(1,2),-3>", "circle"),
+            "invalid input syntax for type circle: \"<(1,2),-3>\""
+        );
+        assert_eq!(
+            msg("(1e400,2)", "point"),
+            "\"1e400\" is out of range for type double precision"
+        );
     }
 
     #[test]
