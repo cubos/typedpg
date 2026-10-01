@@ -369,11 +369,20 @@ fn analyze_insert_values(
     let null_ctx = NullabilityContext::default();
     let expected_len = insert_arity(tgt);
 
+    // A literal NULL into a NOT NULL column fails every execution, but at
+    // execution: PG reports it only once the whole statement has parsed,
+    // for the first failing row, and in that row for the first column in
+    // attnum order (ExecConstraints) — omitted columns with no default
+    // included — after any NOT NULL domain (checked while the row is
+    // built).
+    let mut violation: Option<NullViolation> = None;
     let mut first_len: Option<usize> = None;
     for val_list in &val_sel.values_lists {
         let Some(node::Node::List(list)) = val_list.node.as_ref() else {
             continue;
         };
+        let mut row_violations: Vec<NullViolation> = Vec::new();
+        let mut default_nulls: Vec<NullViolation> = Vec::new();
         // transformInsertStmt: every row of a multi-row VALUES must be as
         // long as the first one, which already passed transformInsertRow's
         // arity check.
@@ -422,7 +431,16 @@ fn analyze_insert_values(
                 && is_sql_null_literal(val)
                 && let Some(err) = null_assignment_error(tc, snapshot, &tgt.relname, "insert")
             {
-                return Err(err);
+                row_violations.push(NullViolation::of(tc, snapshot, err));
+            }
+            // An explicit DEFAULT that is NULL competes like an omitted
+            // column.
+            if let Some(tc) = target_col
+                && !indirected
+                && is_set_to_default(val)
+                && let Some(v) = null_default_violation(tc, tgt, snapshot)
+            {
+                default_nulls.push(v);
             }
             if let Some(tc) = target_col
                 && !indirected
@@ -467,8 +485,75 @@ fn analyze_insert_values(
                 params.infer_nullable(p.number, true);
             }
         }
+        if violation.is_none() && !row_violations.is_empty() {
+            row_violations.extend(omitted_not_null_columns(tgt, list.items.len(), snapshot));
+            row_violations.extend(default_nulls);
+            violation = row_violations.into_iter().min_by_key(|v| v.order);
+        }
     }
-    Ok(())
+    match violation {
+        Some(v) => Err(v.error),
+        None => Ok(()),
+    }
+}
+
+/// A NULL a row of an INSERT would store into a NOT NULL column or domain.
+struct NullViolation {
+    /// When PG reports it: NOT NULL domains while the row is built, then
+    /// the columns' NOT NULL in attnum order.
+    order: (bool, i16),
+    error: AnalyzeError,
+}
+
+impl NullViolation {
+    fn of(tc: &crate::pg_catalog::PgAttribute, snapshot: &PgCatalog, error: AnalyzeError) -> Self {
+        let domain = snapshot.domain_not_null_name(tc.atttypid).is_some();
+        Self {
+            order: (!domain, tc.attnum),
+            error,
+        }
+    }
+}
+
+/// Whether column `c`'s default is NULL: no DEFAULT, identity or
+/// generation expression. A domain-typed column is taken as having one
+/// (its type may carry a default the snapshot doesn't model).
+fn null_default(c: &crate::pg_catalog::PgAttribute, snapshot: &PgCatalog) -> bool {
+    !c.atthasdef
+        && c.attidentity.is_none()
+        && c.attgenerated.is_none()
+        && snapshot.unwrap_domain(c.atttypid) == c.atttypid
+}
+
+/// NOT NULL column `c` storing its default, when that is NULL (see
+/// [`null_default`]).
+fn null_default_violation(
+    c: &crate::pg_catalog::PgAttribute,
+    tgt: &InsertTarget,
+    snapshot: &PgCatalog,
+) -> Option<NullViolation> {
+    if !(c.attnum > 0 && c.attnotnull && null_default(c, snapshot)) {
+        return None;
+    }
+    null_assignment_error(c, snapshot, &tgt.relname, "insert")
+        .map(|e| NullViolation::of(c, snapshot, e))
+}
+
+/// The NOT NULL columns an INSERT row giving `given` values leaves to a
+/// NULL default.
+fn omitted_not_null_columns(
+    tgt: &InsertTarget,
+    given: usize,
+    snapshot: &PgCatalog,
+) -> Vec<NullViolation> {
+    let provided: Vec<&str> = (0..given)
+        .filter_map(|i| target_col_at(tgt, i).map(|c| c.attname.as_str()))
+        .collect();
+    tgt.attrs
+        .iter()
+        .filter(|c| !provided.contains(&c.attname.as_str()))
+        .filter_map(|c| null_default_violation(c, tgt, snapshot))
+        .collect()
 }
 
 /// transformInsertRow's arity error for `expressions` values against

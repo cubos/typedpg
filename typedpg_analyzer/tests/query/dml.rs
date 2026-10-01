@@ -438,6 +438,43 @@ fn insert_null_into_not_null_column_rejected() {
 }
 
 #[test]
+fn insert_null_reports_the_first_null_column_in_table_order() {
+    // PG checks a row's NOT NULL columns in attnum order once the row is
+    // built: an omitted column with no default (posts.user_id) comes
+    // before the literal NULL (posts.title), and the column list's order
+    // doesn't matter.
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("INSERT INTO posts (title) VALUES (NULL)"),
+        AnalyzeError::Invalid(_),
+        "null value in column \"user_id\" of relation \"posts\" violates not-null constraint (cannot insert NULL into NOT NULL column `posts.user_id`)",
+    );
+    assert_analyze_err!(
+        db.analyze("INSERT INTO users (email, name) VALUES (NULL, NULL)"),
+        AnalyzeError::Invalid(_),
+        "null value in column \"name\" of relation \"users\" violates not-null constraint (cannot insert NULL into NOT NULL column `users.name`)",
+    );
+    // An explicit DEFAULT that is NULL counts like an omitted column.
+    assert_analyze_err!(
+        db.analyze("INSERT INTO posts (title, user_id) VALUES (NULL, DEFAULT)"),
+        AnalyzeError::Invalid(_),
+        "null value in column \"user_id\" of relation \"posts\" violates not-null constraint (cannot insert NULL into NOT NULL column `posts.user_id`)",
+    );
+    // The first failing row is the one reported.
+    assert_analyze_err!(
+        db.analyze("INSERT INTO users (name, email) VALUES ('a', 'b'), ('c', NULL), (NULL, 'd')"),
+        AnalyzeError::Invalid(_),
+        "null value in column \"email\" of relation \"users\" violates not-null constraint (cannot insert NULL into NOT NULL column `users.email`)",
+    );
+    // An error PG raises while parsing comes first, wherever it is.
+    assert_err_prefix!(
+        db.analyze("INSERT INTO users (name, email, age) VALUES (NULL, 'b', 'x')"),
+        AnalyzeError::InvalidLiteral(_),
+        "invalid input syntax for type integer: \"x\""
+    );
+}
+
+#[test]
 fn insert_values_row_wrong_arity_rejected() {
     let db = setup();
     // Explicit column list (name, email) expects 2 values per row; we
