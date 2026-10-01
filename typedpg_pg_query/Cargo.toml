@@ -2,6 +2,7 @@
 name = "typedpg_pg_query"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 # Our code is MIT OR Apache-2.0; the bundled libpg_query is BSD-3-Clause and
 # the PostgreSQL sources it embeds are under the PostgreSQL License.
 license = "(MIT OR Apache-2.0) AND BSD-3-Clause AND PostgreSQL"

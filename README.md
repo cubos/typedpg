@@ -607,7 +607,7 @@ Extensions are supported via built-in SQL definitions that the DDL interpreter p
 
 ## Requirements
 
-- Rust 1.85+
+- Rust 1.88+
 
 ## License
 

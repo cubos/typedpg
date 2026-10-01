@@ -2,6 +2,7 @@
 name = "typedpg_pg_query_codegen"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 publish = false
 description = "Generates typedpg_pg_query's protobuf types and AST walkers from libpg_query's pg_query.proto"
