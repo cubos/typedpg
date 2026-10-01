@@ -176,7 +176,10 @@ impl ParamCollector {
                 // deductions conflict — `$1 IS NULL, $1 = 1`) PG reports
                 // `ambiguous_parameter` (42P08); with no competing
                 // deduction at all it's `indeterminate_datatype` (42P18).
-                let message = format!("could not determine data type of parameter ${num}");
+                let message = crate::error::naming_param(
+                    format!("could not determine data type of parameter ${num}"),
+                    num,
+                );
                 let kind = if self.indeterminate_locked.contains(&num)
                     && self.constraints.contains_key(&num)
                 {
@@ -184,12 +187,17 @@ impl ParamCollector {
                 } else {
                     AnalyzeError::IndeterminateType(message)
                 };
+                let written = crate::error::param_written_as(num)
+                    .map_or_else(|| format!("${num}"), |w| w.trim_matches('`').to_owned());
+                let hint = if written.starts_with('$') {
+                    format!("add an explicit cast to the parameter, e.g. `{written}::int4`")
+                } else {
+                    "add an explicit cast where the field is used".to_owned()
+                };
                 return Err(crate::error::RawError::new(
                     kind,
-                    None,
-                    Some(format!(
-                        "add an explicit cast to the parameter, e.g. `${num}::int4`"
-                    )),
+                    crate::error::param_span(num),
+                    Some(hint),
                 )
                 .with_primary_label("type cannot be determined")
                 .finalize_implicit());
@@ -214,10 +222,18 @@ impl ParamCollector {
         // (42P18).
         for (i, (num, _, _)) in params.iter().enumerate() {
             if *num != (i as i32 + 1) {
-                return Err(AnalyzeError::IndeterminateType(format!(
-                    "could not determine data type of parameter ${}",
-                    i + 1
-                )));
+                return Err(crate::error::RawError::new(
+                    AnalyzeError::IndeterminateType(format!(
+                        "could not determine data type of parameter ${}",
+                        i + 1
+                    )),
+                    crate::error::param_span(*num),
+                    Some(format!(
+                        "parameters are numbered from $1 without gaps; ${} is never used",
+                        i + 1
+                    )),
+                )
+                .finalize_implicit());
             }
         }
 
