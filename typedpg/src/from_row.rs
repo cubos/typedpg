@@ -23,8 +23,70 @@ use tokio_postgres::Row;
 ///     .await?;
 /// ```
 ///
-/// Field names must match column names exactly (or their sanitized form).
-/// `Option<T>` fields handle nullable columns automatically.
+/// Field names must match column names (a `"title!"` / `"age?"` column
+/// matches field `title` / `age`). `Option<T>` fields handle nullable
+/// columns. With `sql!`'s `fetch_*_as`, the fields are checked against the
+/// query at compile time (see [`FromQueryRow`]); `from_row` itself, for a
+/// raw row, reads each field with its type's `FromSql` impl and is only
+/// implemented when every field has one.
 pub trait FromRow: Sized {
     fn from_row(row: &Row) -> Result<Self, crate::Error>;
+}
+
+/// A type the `fetch_*_as::<T>()` methods of query `Q` can build — checked
+/// at compile time: each of its fields has a column of the same name in
+/// the query, whose Rust type it can hold.
+///
+/// `#[derive(FromRow)]` implements it for every query whose columns match
+/// the struct's fields; the row is decoded exactly as `sql!` decodes its
+/// own output struct (enums, JSONB domains, composites included), by
+/// column position. A hand-written `FromRow` impl doesn't provide it:
+/// derive it instead to use `fetch_*_as`.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` can't be built from this query's rows",
+    label = "not built from this query's rows",
+    note = "`fetch_*_as::<T>()` needs `T` to `#[derive(typedpg::FromRow)]`, with a field per query \
+            column it reads"
+)]
+pub trait FromQueryRow<Q>: Sized {
+    fn from_query_row(row: &Row) -> Result<Self, crate::Error>;
+}
+
+/// The column of query `Self` named by key `K` (a hash of the column's
+/// field name): its Rust type and how to read it. Implemented by the
+/// `sql!` macro for each query; required by `#[derive(FromRow)]` for each
+/// field.
+#[doc(hidden)]
+#[diagnostic::on_unimplemented(
+    message = "the query has no column for a field of this `FromRow` type",
+    label = "the query has no column of this field's name",
+    note = "a `#[derive(FromRow)]` field reads the query column of the same name (with any \
+            \"col!\" / \"col?\" annotation dropped): rename the field or alias the column"
+)]
+pub trait Column<const K: u128> {
+    type Type;
+    fn decode(row: &Row) -> Result<Self::Type, crate::Error>;
+}
+
+/// A `FromRow` field type that can hold a query column of Rust type `C`:
+/// `C` itself, or `Option<C>`.
+#[diagnostic::on_unimplemented(
+    message = "a `FromRow` field of type `{Self}` can't hold its query column, of type `{C}`",
+    label = "this field's type doesn't match its column",
+    note = "a field takes its column's Rust type `{C}`, or `Option<{C}>`"
+)]
+pub trait FromColumn<C>: Sized {
+    fn from_column(value: C) -> Self;
+}
+
+impl<T> FromColumn<T> for T {
+    fn from_column(value: T) -> Self {
+        value
+    }
+}
+
+impl<T> FromColumn<T> for Option<T> {
+    fn from_column(value: T) -> Self {
+        Some(value)
+    }
 }

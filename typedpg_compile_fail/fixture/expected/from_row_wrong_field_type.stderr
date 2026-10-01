@@ -1,0 +1,28 @@
+error[E0277]: a `FromRow` field of type `i32` can't hold its query column, of type `i64`
+  --> src/bin/from_row_wrong_field_type.rs:11:10
+   |
+11 |         .fetch_optional_as()
+   |          ^^^^^^^^^^^^^^^^^ this field's type doesn't match its column
+   |
+   = help: the trait `FromColumn<i64>` is not implemented for `i32`
+   = note: a field takes its column's Rust type `i64`, or `Option<i64>`
+help: the trait `FromColumn<T>` is implemented for `Option<T>`
+  --> $WORKSPACE/typedpg/src/from_row.rs:LL:CC
+   |
+88 | impl<T> FromColumn<T> for Option<T> {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+note: required for `Id` to implement `FromQueryRow<__sql_columns>`
+  --> src/bin/from_row_wrong_field_type.rs:5:8
+   |
+ 5 | struct Id {
+   |        ^^
+ 6 |     id: i32,
+   |     -- unsatisfied trait bound
+   = help: consider manually implementing `FromQueryRow<__sql_columns>` to avoid undesired bounds
+note: required by a bound in `__typedpg_query::<__E>::fetch_optional_as`
+  --> src/bin/from_row_wrong_field_type.rs:10:25
+   |
+10 |     let _: Option<Id> = typedpg::sql!(db, "SELECT id FROM users LIMIT 1")
+   |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `__typedpg_query::<__E>::fetch_optional_as`
+   = note: this error originates in the macro `typedpg::sql` (in Nightly builds, run with -Z macro-backtrace for more info)
+
