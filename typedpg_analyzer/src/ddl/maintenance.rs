@@ -301,7 +301,19 @@ pub fn copy(
     let kind = relkind(interp, relid);
     let refused = if stmt.is_from {
         match kind {
-            Some(RelKind::View) => Some(("cannot copy to view", "")),
+            // CopyFrom: a view takes rows through an INSTEAD OF INSERT
+            // trigger.
+            Some(RelKind::View)
+                if !interp.triggers.get(&relid).is_some_and(|ts| {
+                    ts.iter()
+                        .any(|t| t.is_instead_row_for(crate::ddl::triggers::TRIGGER_TYPE_INSERT))
+                }) =>
+            {
+                Some((
+                    "cannot copy to view",
+                    " (To enable copying to a view, provide an INSTEAD OF INSERT trigger.)",
+                ))
+            }
             Some(RelKind::MaterializedView) => Some(("cannot copy to materialized view", "")),
             Some(RelKind::Sequence) => Some(("cannot copy to sequence", "")),
             _ => None,
@@ -333,6 +345,16 @@ pub fn copy(
             return Err(DdlError::Parse(format!(
                 "column \"{col}\" of relation \"{}\" does not exist",
                 rv.relname
+            )));
+        }
+        // CopyGetAttnums: generated columns take no input.
+        if interp
+            .attribute_by_name(relid, col)
+            .is_some_and(|a| a.attgenerated.is_some())
+        {
+            return Err(DdlError::Parse(format!(
+                "column \"{col}\" is a generated column (Generated columns cannot be used in \
+                 COPY.)"
             )));
         }
         if seen.contains(&col) {
