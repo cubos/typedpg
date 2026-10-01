@@ -78,7 +78,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
 async fn handle_migrate(action: MigrateAction) -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_cargo_toml(Path::new("./Cargo.toml"))?;
-    let migrations_dir = config.migrations_dir(Path::new("."));
+    // Relative to the current directory: an empty base keeps the configured
+    // path as written ("./db", not "././db") in what the CLI prints.
+    let migrations_dir = config.migrations_dir(Path::new(""));
 
     // Handle actions that don't require a database connection
     if let MigrateAction::Create { name } = &action {
