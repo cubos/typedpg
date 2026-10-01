@@ -99,6 +99,7 @@ pub(crate) fn analyze_cte(
                     "UNION",
                     seed_cols.len(),
                     rec_cols.len(),
+                    super::set_ops::branch_column_span(rarg, 0),
                 )
                 .finalize_implicit());
             }
@@ -285,7 +286,8 @@ fn search_cycle_columns(
                     snapshot,
                     *concrete.last().unwrap_or(&concrete[0]),
                 );
-                crate::pgmsg::types_cannot_be_matched("CYCLE", &a, &b, "", None).finalize_implicit()
+                crate::pgmsg::types_cannot_be_matched("CYCLE", &a, &b, "", None, None)
+                    .finalize_implicit()
             })?
         };
         // Coercing the values to the mark type validates literal content

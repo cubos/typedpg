@@ -629,7 +629,7 @@ fn process_join_expr(
             })
             .collect();
         if scope.sources.iter().any(|s| s.alias == alias) {
-            return Err(crate::pgmsg::duplicate_table_alias(&alias).finalize_implicit());
+            return Err(crate::pgmsg::duplicate_table_alias(&alias, None).finalize_implicit());
         }
         scope.sources.insert(
             left.start,
@@ -684,7 +684,7 @@ fn alias_join(
         c.name = name;
     }
     if scope.sources.iter().any(|s| s.alias == alias.aliasname) {
-        return Err(crate::pgmsg::duplicate_table_alias(&alias.aliasname).finalize_implicit());
+        return Err(crate::pgmsg::duplicate_table_alias(&alias.aliasname, None).finalize_implicit());
     }
     scope.shadowed_sources.extend(
         inner

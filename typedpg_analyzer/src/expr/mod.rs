@@ -744,7 +744,10 @@ pub(crate) fn infer_expr(
             let types: Vec<PgTypeOid> = args.iter().map(|t| t.type_oid).collect();
             let resolved_type = match PgTypeOid::new(mm.minmaxtype) {
                 Some(t) if t != oid::UNKNOWN => t,
-                _ => select_common_type(label, &types, snapshot)?,
+                _ => {
+                    let nodes: Vec<&protobuf::Node> = mm.args.iter().collect();
+                    select_common_type(label, &types, &nodes, snapshot)?
+                }
             };
             // ExecInitExprRec looks up the type's btree comparison function
             // when the executor starts — every execution fails without one.
@@ -1476,6 +1479,7 @@ use column_refs::*;
 pub(crate) use column_refs::{
     SqlFunctionParams, check_column_ref_length, with_sql_function_params,
 };
+pub(crate) use conditional::failing_input_span;
 use conditional::*;
 use func_call::*;
 pub(crate) use func_call::{backfill_call_args, check_window_clause};

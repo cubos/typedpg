@@ -436,9 +436,13 @@ impl Scope {
     /// PG (SQLSTATE 42712): every FROM item of one query level needs a
     /// distinct alias — `FROM users u, posts u` is rejected. The synthetic
     /// empty-alias sources produced by JOIN USING merging are exempt.
-    fn check_duplicate_alias(&self, alias: &str) -> Result<(), AnalyzeError> {
+    fn check_duplicate_alias(
+        &self,
+        alias: &str,
+        span: Option<SourceSpan>,
+    ) -> Result<(), AnalyzeError> {
         if self.sources.iter().any(|s| s.alias == alias) {
-            return Err(crate::pgmsg::duplicate_table_alias(alias).finalize_implicit());
+            return Err(crate::pgmsg::duplicate_table_alias(alias, span).finalize_implicit());
         }
         Ok(())
     }
@@ -460,7 +464,7 @@ impl Scope {
         alias: &str,
         span: Option<SourceSpan>,
     ) -> Result<(), AnalyzeError> {
-        self.check_duplicate_alias(alias)?;
+        self.check_duplicate_alias(alias, span)?;
         let table = snapshot
             .resolve_table(schema, name)
             .ok_or_else(|| undefined_table_error(snapshot, schema, name, span))?;
@@ -520,7 +524,7 @@ impl Scope {
         columns: Vec<ScopeColumn>,
         kind: SourceKind,
     ) -> Result<(), AnalyzeError> {
-        self.check_duplicate_alias(alias)?;
+        self.check_duplicate_alias(alias, None)?;
         self.sources.push(TableSource {
             kind,
             ..TableSource::derived(alias, columns)

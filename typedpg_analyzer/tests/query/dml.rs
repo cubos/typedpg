@@ -444,8 +444,16 @@ fn insert_values_row_wrong_arity_rejected() {
     // pass 3. PG: `INSERT has more expressions than target columns`.
     assert_analyze_err!(
         db.analyze("INSERT INTO users (name, email) VALUES ($p1, $p2, $p3)"),
-        AnalyzeError::Invalid(_),
-        "INSERT has more expressions than target columns (table `users` expects 2, got 3)",
+        AnalyzeError::SyntaxError(_),
+        concat!(
+            "INSERT has more expressions than target columns\n",
+            "  ╭────\n",
+            "1 │ INSERT INTO users (name, email) VALUES ($p1, $p2, $p3)\n",
+            "  ·                                                   ┬\n",
+            "  ·                                                   ╰─ no target column for this value\n",
+            "  ╰────\n",
+            "  help: 3 values for 2 target column(s): add the missing columns to the column list, or drop the extra values\n",
+        ),
     );
 }
 
@@ -455,8 +463,16 @@ fn insert_select_column_count_mismatch_rejected() {
     // Target has 2 columns, SELECT has 1.
     assert_analyze_err!(
         db.analyze("INSERT INTO users (name, email) SELECT name FROM users"),
-        AnalyzeError::Invalid(_),
-        "INSERT has more target columns than expressions (table `users` expects 2, SELECT produces 1)",
+        AnalyzeError::SyntaxError(_),
+        concat!(
+            "INSERT has more target columns than expressions\n",
+            "  ╭────\n",
+            "1 │ INSERT INTO users (name, email) SELECT name FROM users\n",
+            "  ·                          ──┬──\n",
+            "  ·                            ╰─ no value for this column\n",
+            "  ╰────\n",
+            "  help: 2 target column(s) for 1 value(s): supply a value for every listed column\n",
+        ),
     );
 }
 

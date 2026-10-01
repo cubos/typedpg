@@ -1147,3 +1147,72 @@ fn values_rows_see_outer_levels_and_expand_stars() {
         "invalid reference to FROM-clause entry for table \"u\""
     );
 }
+
+// ── Positions of construct-level errors (where PG reports them) ────────────
+
+#[test]
+fn construct_errors_point_where_pg_does() {
+    let db = setup();
+    let cases: &[(&str, &str)] = &[
+        (
+            "SELECT * FROM (VALUES (1, 2), (3)) v",
+            "\
+VALUES lists must all be the same length
+  ╭────
+1 │ SELECT * FROM (VALUES (1, 2), (3)) v
+  ·                                ─
+  ╰────
+  help: the first row has 2 column(s), a later row has 1
+",
+        ),
+        (
+            "SELECT 1, 2 UNION SELECT 3",
+            "\
+each UNION query must have the same number of columns
+  ╭────
+1 │ SELECT 1, 2 UNION SELECT 3
+  ·                          ─
+  ╰────
+  help: the left side produces 2 column(s), the right side 1
+",
+        ),
+        (
+            "SELECT sum(age) OVER w FROM users",
+            "\
+window \"w\" does not exist
+  ╭────
+1 │ SELECT sum(age) OVER w FROM users
+  ·                      ─
+  ╰────
+  help: define it in a WINDOW clause, e.g. `WINDOW w AS (ORDER BY …)`
+",
+        ),
+        (
+            "SELECT 1 FROM users u, posts u",
+            "\
+table name \"u\" specified more than once
+  ╭────
+1 │ SELECT 1 FROM users u, posts u
+  ·                        ─────
+  ╰────
+  help: give one of them another alias
+",
+        ),
+        (
+            "INSERT INTO posts (user_id, title, body) VALUES (1, 'x')",
+            "\
+INSERT has more target columns than expressions
+  ╭────
+1 │ INSERT INTO posts (user_id, title, body) VALUES (1, 'x')
+  ·                                    ──┬─
+  ·                                      ╰─ no value for this column
+  ╰────
+  help: 3 target column(s) for 2 value(s): supply a value for every listed column
+",
+        ),
+    ];
+    for (sql, expected) in cases {
+        let err = db.analyze(sql).unwrap_err();
+        assert_eq!(err.to_string(), *expected, "{sql}");
+    }
+}

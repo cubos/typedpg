@@ -316,7 +316,11 @@ pub(crate) fn analyze_values_lists(
     for row in &rows {
         // PG (SQLSTATE 42601): every row must have the first row's arity.
         if row.len() != arity {
-            return Err(crate::pgmsg::values_lists_length(arity, row.len()).finalize_implicit());
+            // PG positions it at the row's first value.
+            let span = row.first().and_then(crate::error::expr_span);
+            return Err(
+                crate::pgmsg::values_lists_length(arity, row.len(), span).finalize_implicit()
+            );
         }
         for (i, item) in row.iter().enumerate() {
             let t = expr::infer_expr(item, ctx(), params, TypeGoal::NONE)?;
@@ -330,7 +334,7 @@ pub(crate) fn analyze_values_lists(
     // transformValuesClause: select_common_type("VALUES") per column — rows
     // whose types have none are `VALUES types X and Y cannot be matched`.
     let mut common: Vec<PgTypeOid> = Vec::with_capacity(arity);
-    for types in &column_types {
+    for (column, types) in column_types.iter().enumerate() {
         if let Some(t) = crate::coerce::find_common_type(types, snapshot) {
             common.push(t);
             continue;
@@ -345,6 +349,9 @@ pub(crate) fn analyze_values_lists(
             continue;
         }
         let name = |t| crate::ddl::util::format_type_for_message(snapshot, t);
+        // The column's cells, parallel to `types`, to point at the failing one.
+        let cells: Vec<&protobuf::Node> = rows.iter().filter_map(|r| r.get(column)).collect();
+        let span = |failing| crate::expr::failing_input_span(types, &cells, failing, snapshot);
         match crate::coerce::select_common_type(&concrete, snapshot) {
             Ok(t) => common.push(t),
             Err(crate::coerce::CommonTypeError::Mismatch(a, b)) => {
@@ -354,14 +361,18 @@ pub(crate) fn analyze_values_lists(
                     &name(b),
                     "",
                     None,
+                    span(b),
                 )
                 .finalize_implicit());
             }
             Err(crate::coerce::CommonTypeError::CannotConvert { from, to }) => {
-                return Err(
-                    crate::pgmsg::could_not_convert_type("VALUES", &name(from), &name(to))
-                        .finalize_implicit(),
-                );
+                return Err(crate::pgmsg::could_not_convert_type(
+                    "VALUES",
+                    &name(from),
+                    &name(to),
+                    span(from),
+                )
+                .finalize_implicit());
             }
         }
     }

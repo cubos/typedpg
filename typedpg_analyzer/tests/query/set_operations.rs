@@ -13,6 +13,11 @@ fn union_with_incompatible_concrete_types_rejected() {
         AnalyzeError::DatatypeMismatch(_),
         concat!(
             "UNION types bigint and text cannot be matched (column `id`)\n",
+            "  ╭────\n",
+            "1 │ SELECT id FROM t UNION SELECT s FROM t\n",
+            "  ·                               ┬\n",
+            "  ·                               ╰─ this is text\n",
+            "  ╰────\n",
             "  help: cast both sides to a common type, e.g. `id::bigint`\n",
         ),
     );
