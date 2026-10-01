@@ -1,4 +1,4 @@
-error: nested arrays of domain/enum/composite types are not supported
+error: nested arrays of domain/enum/composite types are not supported (output column `mood_history`)
  --> src/bin/sql_nested_enum_array.rs:5:5
   |
 5 |     typedpg::sql!(db, "SELECT mood_history FROM users")

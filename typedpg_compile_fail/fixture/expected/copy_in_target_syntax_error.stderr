@@ -1,0 +1,12 @@
+error: syntax error at or near "email"
+         ╭────
+       1 │ users (name email)
+         ·             ─────
+         ╰────
+         help: a copy_in! target is a table and an optional column list: `table (column, ...)`
+       
+  --> src/bin/copy_in_target_syntax_error.rs:10:27
+   |
+10 |     typedpg::copy_in!(db, "users (name email)", users { name }).await?;
+   |                           ^^^^^^^^^^^^^^^^^^^^
+

@@ -1,0 +1,12 @@
+error: relation "users" does not exist
+         ╭────
+       1 │ SELECT id FROM users
+         ·                ──┬──
+         ·                  ╰─ relation does not exist
+         ╰────
+         note: no migrations were loaded from 'no_such_migrations': the directory does not exist (see [package.metadata.typedpg.databases.missing.database] in Cargo.toml)
+ --> src/bin/sql_missing_migrations_dir.rs:6:37
+  |
+6 |     typedpg::sql!(db = missing, db, "SELECT id FROM users")
+  |                                     ^^^^^^^^^^^^^^^^^^^^^^
+

@@ -1,4 +1,9 @@
-error: DDL interpretation failed in '0001_broken.sql': type "no_such_type" does not exist
+error: type "no_such_type" does not exist
+         --> migrations_broken/0001_broken.sql:2:36
+         ╭────
+       2 │ ALTER TABLE things ADD COLUMN name no_such_type;
+         ·                                    ────────────
+         ╰────
  --> src/bin/sql_failing_migration.rs:4:5
   |
 4 |     typedpg::sql!(db = broken, db, "SELECT id FROM things")
