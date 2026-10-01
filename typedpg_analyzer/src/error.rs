@@ -684,6 +684,60 @@ impl SourceSpan {
     }
 }
 
+/// How the user wrote positional parameter `$num`: `` `$email` `` for a
+/// named parameter, `` `email` of `$..rows` `` for a spread field. `None`
+/// when no `sql!` template is being analyzed or the parameter was written
+/// positionally.
+pub(crate) fn param_written_as(num: i32) -> Option<String> {
+    let index = usize::try_from(num).ok()?.checked_sub(1)?;
+    with_diag_ctx(|ctx| {
+        let lex = ctx?.lex_output;
+        if let Some(p) = lex.params.get(index) {
+            return (!p.name.starts_with(|c: char| c.is_ascii_digit()))
+                .then(|| format!("`${}`", p.name));
+        }
+        let mut rest = index - lex.params.len();
+        for spread in &lex.spreads {
+            let fields = spread.fields.as_deref().unwrap_or_default();
+            if let Some(f) = fields.get(rest) {
+                return Some(format!("`{}` of `$..{}`", f.name, spread.name));
+            }
+            rest -= fields.len();
+        }
+        None
+    })
+}
+
+/// The span of the first occurrence of positional parameter `$num` in the
+/// SQL being analyzed — the placeholder the lexer wrote for a named one,
+/// which renders as the user's `$name` (or the spread it expands).
+pub(crate) fn param_span(num: i32) -> Option<SourceSpan> {
+    let token = format!("${num}");
+    with_diag_ctx(|ctx| {
+        let sql = &ctx?.lex_output.sql;
+        let bytes = sql.as_bytes();
+        let mut from = 0;
+        while let Some(found) = sql[from..].find(&token) {
+            let at = from + found;
+            let end = at + token.len();
+            if !bytes.get(end).is_some_and(u8::is_ascii_digit) {
+                return Some(SourceSpan::new(at, end));
+            }
+            from = end;
+        }
+        None
+    })
+}
+
+/// `message` (PG's, naming `$num`) with how the user wrote the parameter
+/// appended: `could not determine data type of parameter $2 (`$email`)`.
+pub(crate) fn naming_param(message: String, num: i32) -> String {
+    match param_written_as(num) {
+        Some(written) => format!("{message} ({written})"),
+        None => message,
+    }
+}
+
 /// Extract the `location` byte offset (post-lex SQL) from any AST node
 /// variant that carries one. Returns `None` for nodes without location
 /// info (e.g. `BoolExpr` — `typedpg_pg_query` doesn't track its position).
@@ -741,6 +795,14 @@ fn scan_value_token(bytes: &[u8], start: usize) -> Option<usize> {
         return None;
     }
     let b = bytes[start];
+    // A positional parameter: `$` and its number.
+    if b == b'$' && bytes.get(start + 1).is_some_and(u8::is_ascii_digit) {
+        let digits = bytes[start + 1..]
+            .iter()
+            .take_while(|c| c.is_ascii_digit())
+            .count();
+        return Some(start + 1 + digits);
+    }
     // Single-quoted string literal, with `''` escape.
     if b == b'\'' {
         let mut i = start + 1;

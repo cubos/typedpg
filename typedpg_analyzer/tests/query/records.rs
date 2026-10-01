@@ -1738,8 +1738,13 @@ fn param_inside_row_unconsumed_is_indeterminate() {
         db.analyze("SELECT (ROW($p1, 1::int4)).f2 + 1 AS n"),
         AnalyzeError::IndeterminateType(_),
         concat!(
-            "could not determine data type of parameter $1\n",
-            "  help: add an explicit cast to the parameter, e.g. `$1::int4`\n",
+            "could not determine data type of parameter $1 (`$p1`)\n",
+            "  ╭────\n",
+            "1 │ SELECT (ROW($p1, 1::int4)).f2 + 1 AS n\n",
+            "  ·             ─┬─\n",
+            "  ·              ╰─ type cannot be determined\n",
+            "  ╰────\n",
+            "  help: add an explicit cast to the parameter, e.g. `$p1::int4`\n",
         ),
     );
 }
@@ -1775,8 +1780,13 @@ fn param_in_nested_row_compared_inferred_per_field() {
         ),
         AnalyzeError::IndeterminateType(_),
         concat!(
-            "could not determine data type of parameter $2\n",
-            "  help: add an explicit cast to the parameter, e.g. `$2::int4`\n",
+            "could not determine data type of parameter $2 (`$p2`)\n",
+            "  ╭────\n",
+            "1 │ SELECT u.id FROM users u WHERE ROW(u.id, ROW(u.name, u.age)) = ROW($p1, ROW($p2, $p3))\n",
+            "  ·                                                                             ─┬─\n",
+            "  ·                                                                              ╰─ type cannot be determined\n",
+            "  ╰────\n",
+            "  help: add an explicit cast to the parameter, e.g. `$p2::int4`\n",
         ),
     );
 }

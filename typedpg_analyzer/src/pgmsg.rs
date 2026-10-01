@@ -1364,12 +1364,14 @@ pub(crate) fn inconsistent_parameter_types(
     span: Option<SourceSpan>,
 ) -> RawError {
     RawError::new(
-        AnalyzeError::AmbiguousParameter(format!(
-            "inconsistent types deduced for parameter ${num}"
+        AnalyzeError::AmbiguousParameter(crate::error::naming_param(
+            format!("inconsistent types deduced for parameter ${num}"),
+            num,
         )),
         span,
         Some(format!("{deduced} versus {target}")),
     )
+    .with_primary_label(format!("used here as {target}"))
 }
 
 /// `array subscript must have type integer` — SQLSTATE 42804.

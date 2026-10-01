@@ -1246,3 +1246,36 @@ INSERT has more expressions than target columns
 ",
     );
 }
+
+#[test]
+fn parameter_errors_name_the_parameter_as_written() {
+    // PG's message names the positional `$N` the analyzer sees; the user
+    // wrote `$email`: both are shown, and the caret is on the placeholder.
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("SELECT $email AS e FROM users WHERE id = $email"),
+        AnalyzeError::AmbiguousParameter(_),
+        "\
+inconsistent types deduced for parameter $1 (`$email`)
+  ╭────
+1 │ SELECT $email AS e FROM users WHERE id = $email
+  ·        ───┬──
+  ·           ╰─ used here as text
+  ╰────
+  help: bigint versus text
+",
+    );
+    assert_analyze_err!(
+        db.analyze("SELECT id FROM users WHERE $flag IS NULL AND $other IS NULL"),
+        AnalyzeError::IndeterminateType(_),
+        "\
+could not determine data type of parameter $1 (`$flag`)
+  ╭────
+1 │ SELECT id FROM users WHERE $flag IS NULL AND $other IS NULL
+  ·                            ──┬──
+  ·                              ╰─ type cannot be determined
+  ╰────
+  help: add an explicit cast to the parameter, e.g. `$flag::int4`
+",
+    );
+}
