@@ -18,7 +18,10 @@ use crate::codegen::{self, ParamAssignment};
 // ---------------------------------------------------------------------------
 
 struct CachedPgCatalog {
-    catalog: PgCatalog,
+    /// The catalog, or how building it failed: a broken migration is
+    /// reported in full by the first `sql!` that builds the catalog, and
+    /// in one line by the others (see [`get_or_build_pg_catalog`]).
+    catalog: Result<PgCatalog, CatalogFailure>,
     /// Cache key: migration hash.
     migration_hash: String,
     /// Cache key: the runner's `use_transaction` setting.
@@ -29,9 +32,26 @@ thread_local! {
     static CACHED_PG_CATALOG: RefCell<Option<CachedPgCatalog>> = const { RefCell::new(None) };
 }
 
+/// A migration the catalog could not be built past.
+#[derive(Clone)]
+struct CatalogFailure {
+    /// The full diagnostic: the statement's message, `--> file:line:col`,
+    /// the snippet.
+    full: String,
+    /// The message's first line, for the one-line repeat.
+    summary: String,
+    /// The migration's path, as shown in the diagnostic.
+    filename: String,
+}
+
 /// Build (or retrieve from cache) a [`PgCatalog`] from migration files.
 /// `use_transaction` is the migration runner's setting: whether it wraps
 /// each migration in a transaction.
+///
+/// A migration that fails fails every `sql!` of the crate. The first one
+/// to build the catalog reports the full diagnostic; the cached failure
+/// makes the others report a one-line summary — the same snippet at every
+/// query of the crate would bury everything else.
 fn get_or_build_pg_catalog(
     migrations_dirs: &[&Path],
     migration_hash: &str,
@@ -43,7 +63,17 @@ fn get_or_build_pg_catalog(
             && cached.migration_hash == migration_hash
             && cached.use_transaction == use_transaction
         {
-            return Ok(cached.catalog.clone());
+            return match &cached.catalog {
+                Ok(catalog) => Ok(catalog.clone()),
+                Err(failure) => Err(syn::Error::new(
+                    Span::call_site(),
+                    format!(
+                        "migration {} failed: {} (reported in full at the first sql! of this \
+                         crate)",
+                        failure.filename, failure.summary
+                    ),
+                )),
+            };
         }
         drop(borrow);
 
@@ -55,28 +85,35 @@ fn get_or_build_pg_catalog(
             )
         })?;
         catalog.set_migrations_use_transaction(use_transaction);
+        let mut result = Ok(());
         for (filename, sql) in &migrations {
-            catalog.apply_sql(sql).map_err(|e| {
-                syn::Error::new(
-                    Span::call_site(),
-                    format!("DDL interpretation failed in '{filename}': {e}"),
-                )
-            })?;
+            if let Err(e) = catalog.apply_migration(filename, sql) {
+                let full = e.to_string();
+                let summary = full.lines().next().unwrap_or_default().to_owned();
+                result = Err(CatalogFailure {
+                    full,
+                    summary,
+                    filename: filename.clone(),
+                });
+                break;
+            }
         }
+        let built = result.map(|()| catalog);
 
         cell.borrow_mut().replace(CachedPgCatalog {
-            catalog: catalog.clone(),
+            catalog: built.clone(),
             migration_hash: migration_hash.to_string(),
             use_transaction,
         });
 
-        Ok(catalog)
+        built.map_err(|failure| syn::Error::new(Span::call_site(), failure.full))
     })
 }
 
 /// Collect all migration SQL files from the given directories.
 ///
-/// Returns `(filename, content)` pairs sorted by filename.
+/// Returns `(path, content)` pairs sorted by file name (whatever the
+/// directory), `path` in the form diagnostics show.
 fn collect_migration_files(dirs: &[&Path]) -> Result<Vec<(String, String)>, syn::Error> {
     let mut files = Vec::new();
 
@@ -94,20 +131,38 @@ fn collect_migration_files(dirs: &[&Path]) -> Result<Vec<(String, String)>, syn:
             let path = entry.path();
             let name = path.to_string_lossy().to_string();
             if name.ends_with(".sql") && !name.ends_with(".down.sql") {
-                let filename = entry.file_name().to_string_lossy().to_string();
+                // Shown in diagnostics (`--> migrations/0002_more.sql:9:12`):
+                // the path from the crate root when it is under it, as
+                // rustc's own paths are.
+                let filename = display_path(&path);
                 let content = std::fs::read_to_string(&path).map_err(|e| {
                     syn::Error::new(
                         Span::call_site(),
                         format!("failed to read migration '{}': {e}", path.display()),
                     )
                 })?;
-                files.push((filename, content));
+                files.push((entry.file_name(), filename, content));
             }
         }
     }
 
     files.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(files)
+    Ok(files
+        .into_iter()
+        .map(|(_, path, sql)| (path, sql))
+        .collect())
+}
+
+/// `path` relative to the crate being compiled when it is under it — the
+/// form rustc prints its own source paths in — else as configured.
+fn display_path(path: &Path) -> String {
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
+    let shown = path
+        .strip_prefix(&manifest_dir)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .into_owned();
+    shown.strip_prefix("./").map(str::to_owned).unwrap_or(shown)
 }
 
 // ---------------------------------------------------------------------------
@@ -273,12 +328,33 @@ pub(crate) fn load_config() -> Result<typedpg_core::config::Config, syn::Error> 
         .map_err(|e| syn::Error::new(Span::call_site(), format!("failed to load config: {e}")))
 }
 
+/// The catalog a database's migrations build, and what to tell the user
+/// about how it was built.
+pub(crate) struct BuiltCatalog<'c> {
+    pub catalog: PgCatalog,
+    pub resolved: typedpg_core::config::ResolvedConfig<'c>,
+    /// Set when a configured migrations directory does not exist — a
+    /// missing directory counts as no migrations, so a typo in the path
+    /// shows up as every table being missing. Appended to analysis errors.
+    pub missing_dirs_note: Option<String>,
+}
+
+impl BuiltCatalog<'_> {
+    /// `error` with the [`Self::missing_dirs_note`], if any.
+    pub(crate) fn annotate(&self, error: String) -> String {
+        match &self.missing_dirs_note {
+            Some(note) => format!("{}\n  note: {note}", error.trim_end()),
+            None => error,
+        }
+    }
+}
+
 /// The database `db_name` names (the default one without it) and the
 /// catalog its migrations build.
 pub(crate) fn catalog_for<'c>(
     config: &'c typedpg_core::config::Config,
     db_name: Option<&Ident>,
-) -> Result<(PgCatalog, typedpg_core::config::ResolvedConfig<'c>), syn::Error> {
+) -> Result<BuiltCatalog<'c>, syn::Error> {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
     let manifest_path = Path::new(&manifest_dir);
     let db_name_str = db_name.map(|i| i.to_string());
@@ -304,18 +380,36 @@ pub(crate) fn catalog_for<'c>(
         &migration_hash,
         config.migrations.use_transaction,
     )?;
-    Ok((catalog, resolved))
+    let missing: Vec<String> = all_dirs
+        .iter()
+        .filter(|d| !d.is_dir())
+        .map(|d| format!("'{}'", display_path(d)))
+        .collect();
+    let missing_dirs_note = (!missing.is_empty()).then(|| {
+        format!(
+            "no migrations were loaded from {}: the directory does not exist (see \
+             [package.metadata.typedpg.database] in Cargo.toml)",
+            missing.join(", ")
+        )
+    });
+    Ok(BuiltCatalog {
+        catalog,
+        resolved,
+        missing_dirs_note,
+    })
 }
 
 pub fn expand(input: QueryInput) -> Result<proc_macro2::TokenStream, syn::Error> {
     let sql_str = parse_sql_literal_preserving_linebreaks(&input.sql);
     let config = load_config()?;
-    let (catalog, resolved) = catalog_for(&config, input.db_name.as_ref())?;
+    let built = catalog_for(&config, input.db_name.as_ref())?;
 
     // 3. Analyze the SQL (lex + type inference in one pass).
-    let analyzed = catalog
+    let analyzed = built
+        .catalog
         .analyze(&sql_str)
-        .map_err(|e| syn::Error::new(input.sql.span(), e.to_string()))?;
+        .map_err(|e| syn::Error::new(input.sql.span(), built.annotate(e.to_string())))?;
+    let resolved = &built.resolved;
 
     // A native `$1` placeholder is a valid PG parameter, but it has no name
     // an argument could bind to.
@@ -377,7 +471,58 @@ pub fn expand(input: QueryInput) -> Result<proc_macro2::TokenStream, syn::Error>
     }
 
     // 6. Generate typed Rust code.
-    codegen::generate(&analyzed, &resolved, &input.executor, &input.assignments)
+    codegen::generate(&analyzed, resolved, &input.executor, &input.assignments)
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    use super::get_or_build_pg_catalog;
+
+    #[test]
+    fn a_failing_migration_is_reported_in_full_once() {
+        let dir = std::env::temp_dir().join(format!(
+            "typedpg-macros-failing-migration-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("0001_init.sql"), "CREATE TABLE t (id int);\n").unwrap();
+        std::fs::write(
+            dir.join("0002_view.sql"),
+            "CREATE VIEW v AS\n    SELECT idd FROM t;\n",
+        )
+        .unwrap();
+        let first = get_or_build_pg_catalog(&[dir.as_path()], "failing", true)
+            .err()
+            .expect("the migration fails")
+            .to_string();
+        let second = get_or_build_pg_catalog(&[dir.as_path()], "failing", true)
+            .err()
+            .expect("the failure is cached")
+            .to_string();
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let path = dir.join("0002_view.sql").display().to_string();
+        assert_eq!(
+            first,
+            format!(
+                "column \"idd\" does not exist (while analyzing view 'public.v')
+  --> {path}:2:12
+  ╭────
+2 │     SELECT idd FROM t;
+  ·            ─┬─
+  ·             ╰─ column does not exist
+  ╰────
+  help: did you mean \"id\"?"
+            )
+        );
+        assert_eq!(
+            second,
+            format!(
+                "migration {path} failed: column \"idd\" does not exist (while analyzing view \
+                 'public.v') (reported in full at the first sql! of this crate)"
+            )
+        );
+    }
 }
 
 #[cfg(test)]

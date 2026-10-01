@@ -78,10 +78,11 @@ impl Parse for CopyInInput {
 
 pub fn expand(input: CopyInInput) -> Result<TokenStream, syn::Error> {
     let config = load_config()?;
-    let (catalog, resolved) = catalog_for(&config, input.db_name.as_ref())?;
+    let built = catalog_for(&config, input.db_name.as_ref())?;
+    let (catalog, resolved) = (&built.catalog, &built.resolved);
     let target = catalog
         .analyze_copy_in(&input.target.value())
-        .map_err(|e| syn::Error::new(input.target.span(), e.to_string()))?;
+        .map_err(|e| syn::Error::new(input.target.span(), built.annotate(e.to_string())))?;
 
     if input.fields.len() != target.columns.len() {
         let columns: Vec<&str> = target.columns.iter().map(|c| c.name.as_str()).collect();
@@ -107,7 +108,7 @@ pub fn expand(input: CopyInInput) -> Result<TokenStream, syn::Error> {
 
     codegen::generate_copy_in(
         &target,
-        &resolved,
+        resolved,
         &input.executor,
         &input.source,
         &input.fields,
