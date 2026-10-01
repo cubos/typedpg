@@ -1788,6 +1788,8 @@ column \"flag\" is of type boolean but expression is of type integer
   ·                                   │                      ╰─ expected boolean, found integer
   ·                                   ╰─ expected boolean here
   ╰────
+  help: You will need to rewrite or cast the expression.
+  note: an explicit cast from integer to boolean exists: `expr::boolean`
 ",
     );
 }
@@ -1807,6 +1809,7 @@ column \"user_id\" is of type bigint but expression is of type boolean
   ·                       │                      ╰─ expected bigint, found boolean
   ·                       ╰─ expected bigint here
   ╰────
+  help: You will need to rewrite or cast the expression.
 ",
     );
 }
@@ -1935,6 +1938,8 @@ fn update_text_into_int_column_rejected() {
             "  ·                   │      ╰─ expected integer, found text\n",
             "  ·                   ╰─ expected integer here\n",
             "  ╰────\n",
+            "  help: You will need to rewrite or cast the expression.\n",
+            "  note: an explicit cast from text to integer exists: `expr::integer`\n",
         ),
     );
 }

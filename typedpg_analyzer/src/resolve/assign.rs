@@ -155,32 +155,41 @@ impl AssignTarget {
                 let actual = expr::infer_expr(val, ctx, &mut scratch, TypeGoal::NONE)
                     .map(|e| e.type_oid)
                     .unwrap_or(oid::UNKNOWN);
-                Err(self.mismatch(*subscript, name, actual, ctx.snapshot))
+                // PG positions it at the value.
+                let span = crate::error::node_location(val).and_then(|loc| {
+                    crate::error::SourceSpan::from_node_token(loc)
+                        .or_else(|| crate::error::SourceSpan::from_location(loc))
+                });
+                Err(self.mismatch(*subscript, name, actual, ctx.snapshot, span))
             }
             other => other,
         }
     }
 
-    /// The coercion-failure error for a value of type `actual`.
+    /// The coercion-failure error for a value of type `actual`, `span`
+    /// marking where it comes from.
     pub(crate) fn mismatch_error(
         &self,
         column: &str,
         actual: PgTypeOid,
         snapshot: &PgCatalog,
+        span: Option<crate::error::SourceSpan>,
     ) -> AnalyzeError {
         match &self.last_step {
-            Some((subscript, name)) => self.mismatch(*subscript, name, actual, snapshot),
+            Some((subscript, name)) => self.mismatch(*subscript, name, actual, snapshot, span),
             None => {
                 let expected = crate::ddl::util::format_type_for_message(snapshot, self.type_oid);
-                let actual = crate::ddl::util::format_type_for_message(snapshot, actual);
-                crate::error::RawError::new(
+                let actual_pg = crate::ddl::util::format_type_for_message(snapshot, actual);
+                let err = crate::error::RawError::new(
                     AnalyzeError::DatatypeMismatch(format!(
-                        "column \"{column}\" is of type {expected} but expression is of type {actual}"
+                        "column \"{column}\" is of type {expected} but expression is of type {actual_pg}"
                     )),
-                    None,
-                    Some("You will need to rewrite or cast the expression.".into()),
+                    span,
+                    Some(crate::pgmsg::REWRITE_OR_CAST_HINT.into()),
                 )
-                .finalize_implicit()
+                .with_primary_label(format!("expected {expected}, found {actual_pg}"));
+                crate::pgmsg::with_explicit_cast_note(err, snapshot, actual, self.type_oid)
+                    .finalize_implicit()
             }
         }
     }
@@ -189,11 +198,12 @@ impl AssignTarget {
         &self,
         subscript: bool,
         name: &str,
-        actual: PgTypeOid,
+        actual_oid: PgTypeOid,
         snapshot: &PgCatalog,
+        span: Option<crate::error::SourceSpan>,
     ) -> AnalyzeError {
         let expected = crate::ddl::util::format_type_for_message(snapshot, self.type_oid);
-        let actual = crate::ddl::util::format_type_for_message(snapshot, actual);
+        let actual = crate::ddl::util::format_type_for_message(snapshot, actual_oid);
         let msg = if subscript {
             format!(
                 "subscripted assignment to \"{name}\" requires type {expected} but expression is of type {actual}"
@@ -201,12 +211,14 @@ impl AssignTarget {
         } else {
             format!("subfield \"{name}\" is of type {expected} but expression is of type {actual}")
         };
-        crate::error::RawError::new(
+        let err = crate::error::RawError::new(
             AnalyzeError::DatatypeMismatch(msg),
-            None,
-            Some("You will need to rewrite or cast the expression.".into()),
+            span,
+            Some(crate::pgmsg::REWRITE_OR_CAST_HINT.into()),
         )
-        .finalize_implicit()
+        .with_primary_label(format!("expected {expected}, found {actual}"));
+        crate::pgmsg::with_explicit_cast_note(err, snapshot, actual_oid, self.type_oid)
+            .finalize_implicit()
     }
 }
 
@@ -410,7 +422,14 @@ pub(crate) fn analyze_set_clause(
                         snapshot,
                     )
                 {
-                    return Err(target.mismatch_error(&tc.attname, col.type_oid, snapshot));
+                    // The subquery's column has no node of its own: mark
+                    // the column it is assigned to.
+                    return Err(target.mismatch_error(
+                        &tc.attname,
+                        col.type_oid,
+                        snapshot,
+                        crate::error::SourceSpan::from_node_qname(rt.location),
+                    ));
                 }
             }
         }

@@ -141,6 +141,41 @@ fn subscripted_assignment_errors() {
     );
 }
 
+#[test]
+fn assignment_mismatch_points_at_the_value_with_pg_hint() {
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("UPDATE j SET arr[1] = 'x'::text"),
+        AnalyzeError::DatatypeMismatch(_),
+        "\
+subscripted assignment to \"arr\" requires type integer but expression is of type text
+  ╭────
+1 │ UPDATE j SET arr[1] = 'x'::text
+  ·                          ┬
+  ·                          ╰─ expected integer, found text
+  ╰────
+  help: You will need to rewrite or cast the expression.
+  note: an explicit cast from text to integer exists: `expr::integer`
+"
+    );
+    // A subquery's column has no node of its own: the target column is
+    // marked.
+    assert_analyze_err!(
+        db.analyze("UPDATE j SET (n, arr) = (SELECT 1, 'x'::text)"),
+        AnalyzeError::DatatypeMismatch(_),
+        "\
+column \"arr\" is of type integer[] but expression is of type text
+  ╭────
+1 │ UPDATE j SET (n, arr) = (SELECT 1, 'x'::text)
+  ·                  ─┬─
+  ·                   ╰─ expected integer[], found text
+  ╰────
+  help: You will need to rewrite or cast the expression.
+  note: an explicit cast from text to integer[] exists: `expr::integer[]`
+"
+    );
+}
+
 // ── Duplicate targets ────────────────────────────────────────────────────────
 
 #[test]

@@ -1397,7 +1397,12 @@ fn check_goal_compatibility(
         .source_span
         .map(|s| crate::error::DiagnosticLabel::new(s, format!("expected {expected_pg} here")));
 
-    Err(crate::error::RawError::type_mismatch(
+    // transformAssignedExpr's hint, for the column wording.
+    let hint = goal
+        .source_col_name
+        .as_ref()
+        .map(|_| crate::pgmsg::REWRITE_OR_CAST_HINT.to_owned());
+    let err = crate::error::RawError::type_mismatch(
         actual,
         expected,
         &actual_pg,
@@ -1405,9 +1410,12 @@ fn check_goal_compatibility(
         context,
         primary_span,
         secondary,
-        None,
+        hint,
+    );
+    Err(
+        crate::pgmsg::with_explicit_cast_note(err, snapshot, result.type_oid, goal.type_oid)
+            .finalize_implicit(),
     )
-    .finalize_implicit())
 }
 
 fn type_display_name(oid: PgTypeOid, snapshot: &PgCatalog) -> String {
