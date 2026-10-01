@@ -97,9 +97,9 @@ pub struct AnalyzedQuery {
 /// placeholders numbered after the last regular parameter. Field mapping is
 /// mandatory for spreads, so `fields.len()` gives the column count.
 ///
-/// Returns [`AnalyzeError::Internal`] if any spread reaches this point without
-/// the field list the lexer is supposed to attach — that would indicate a
-/// lexer/macro contract bug rather than user input.
+/// Returns [`AnalyzeError::Invalid`] for a spread written without a field
+/// list (`$..items` rather than `$..items { a, b }`): the lexer accepts the
+/// bare form, but nothing then says which item fields fill which columns.
 pub(crate) fn build_spread_sample_sql(lex_output: &LexOutput) -> Result<String, AnalyzeError> {
     let base_sql = &lex_output.sql;
     let num_regular_params = lex_output.params.len();
@@ -110,8 +110,9 @@ pub(crate) fn build_spread_sample_sql(lex_output: &LexOutput) -> Result<String, 
     for spread in &lex_output.spreads {
         result.push_str(&base_sql[last_offset..spread.offset]);
         let fields = spread.fields.as_ref().ok_or_else(|| {
-            AnalyzeError::Internal(format!(
-                "spread '${}' reached the analyzer without a field list",
+            AnalyzeError::Invalid(format!(
+                "spread `$..{0}` needs a field list naming the item fields to bind, \
+                 e.g. `$..{0} {{ field1, field2 }}`",
                 spread.name
             ))
         })?;
