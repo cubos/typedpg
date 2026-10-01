@@ -17,6 +17,7 @@ fn system_columns_for(alias: &str) -> Vec<ScopeColumn> {
             collation: None,
             table_alias: alias.to_owned(),
             record_fields: None,
+            elem_nullable: None,
         })
         .collect()
 }
@@ -41,6 +42,9 @@ pub(crate) struct ScopeColumn {
     /// OUT-arg functions populate this from `out_args`, ROW constructors fill
     /// it from the inferred shape, subqueries propagate it through.
     pub record_fields: Option<crate::expr::RecordShape>,
+    /// For an array column, whether its elements can be NULL, where the
+    /// query producing it knows (see [`crate::types::Type::Array`]).
+    pub elem_nullable: Option<bool>,
 }
 
 /// A table-like source in the FROM clause.
@@ -518,6 +522,7 @@ impl Scope {
                 collation: c.attcollation,
                 table_alias: alias.to_owned(),
                 record_fields: None,
+                elem_nullable: None,
             })
             .collect();
 
@@ -570,6 +575,7 @@ impl Scope {
                 collation: c.attcollation,
                 table_alias: alias.to_owned(),
                 record_fields: None,
+                elem_nullable: None,
             })
             .collect();
         let relid = columns.first().map(|c| c.attrelid);

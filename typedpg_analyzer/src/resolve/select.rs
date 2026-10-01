@@ -764,6 +764,7 @@ fn values_sort_and_limit(
             collation: c.collation,
             table_alias: alias.clone(),
             record_fields: c.record_fields.clone(),
+            elem_nullable: c.elem_nullable,
         })
         .collect();
     let mut scope = Scope {
