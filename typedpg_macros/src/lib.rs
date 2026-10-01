@@ -247,19 +247,23 @@ mod query_macro;
 /// The macro produces clear compile-time errors when something is wrong:
 ///
 /// ```text
-/// // Invalid column name
+/// // Invalid column name (PG's wording, plus a snippet pointing at the SQL)
 /// sql!(pool, "SELECT nonexistent FROM users").fetch_all().await?;
-/// // error: column "nonexistent" does not exist in table "users"
+/// // error: column "nonexistent" does not exist
 ///
-/// // Type mismatch
+/// // Type mismatch: `age` is an INT column, so `$age` binds an `i32`
 /// let age: &str = "not a number";
 /// sql!(pool, "SELECT id FROM users WHERE age > $age").fetch_all().await?;
-/// // error: expected INT, got &str
+/// // error[E0277]: the trait bound `i32: From<&str>` is not satisfied
 ///
 /// // Missing field mapping on spread
 /// sql!(pool, "INSERT INTO users (name, email) VALUES $..items");
-/// // error: $..items requires explicit field mapping: $..items { field1, field2 }
+/// // error: spread `$..items` needs a field list naming the item fields to bind,
+/// //        e.g. `$..items { field1, field2 }`
 /// ```
+///
+/// The `typedpg_compile_fail` crate in the repository pins the exact output
+/// of every error the macros report.
 #[proc_macro]
 pub fn sql(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input = syn::parse_macro_input!(input as query_macro::QueryInput);
