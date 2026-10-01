@@ -3,20 +3,15 @@
 //! scope before analyzing the recursive arm, then unifies the two arms'
 //! types (mirrors PG's common-type resolution over `UNION ALL`).
 //!
-//! Not exercised yet (still unsupported): `SEARCH BREADTH/DEPTH FIRST BY
-//! …` and `CYCLE … SET … USING …` clauses, which carry their own
-//! inference logic around the recursion bookkeeping columns.
+//! `SEARCH BREADTH/DEPTH FIRST BY … SET …` and `CYCLE … SET … USING …`
+//! add bookkeeping columns (the search order, the cycle mark and path);
+//! their types and nullability are checked like any other column, against
+//! the pg_sanity mirror too.
 
 use crate::common::*;
 
 fn setup() -> PgCatalog {
     let mut db = PgCatalog::new().unwrap();
-    // Recursive CTE SEARCH / CYCLE clauses synthesize columns whose types
-    // PG resolves at planning time (`record[]` for path, inferred from
-    // literals for mark, etc.). The analyzer makes a heuristic choice that
-    // doesn't always line up with PG's wire-protocol Describe — so opt
-    // out of the pglite mirror for the whole suite.
-    db.skip_pg_sanity();
     db.apply_sql(
         "CREATE TABLE categories (
             id        BIGINT PRIMARY KEY,
@@ -165,12 +160,9 @@ fn non_recursive_cte_with_column_aliases() {
 
 // ── SEARCH BREADTH/DEPTH FIRST BY … SET … ───────────────────────────────────
 //
-// Adds a synthetic ordering column populated by PG. Result type:
-// BREADTH FIRST → record(int8, array_of_keys) packed into the SET column.
-// DEPTH FIRST   → similar, with a different shape.
-// PG materializes the SET column with type `text` for label-only callers.
-// These tests pin behavior against PG; they're ignored until the analyzer
-// learns to register the SET column.
+// Adds a synthetic ordering column populated by PG: a record of the
+// depth and the keys for BREADTH FIRST, an array of the key records for
+// DEPTH FIRST — never NULL.
 
 #[test]
 fn recursive_search_breadth_first_registers_path_column() {
@@ -222,8 +214,8 @@ fn recursive_search_depth_first_registers_path_column() {
 
 // ── CYCLE … SET … USING … ───────────────────────────────────────────────────
 //
-// Adds two synthetic columns: an `is_cycle` bool and a `path` array.
-// Without analyzer support these references will fail.
+// Adds two synthetic columns: the cycle mark (`boolean`, or the type of
+// the TO / DEFAULT values) and the `path` array of key records.
 
 #[test]
 fn recursive_cycle_clause_registers_columns() {
