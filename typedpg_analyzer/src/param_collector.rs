@@ -37,6 +37,11 @@ pub(crate) struct ParamCollector {
     /// [`Self::mark_untyped_output`]). PG's `resolveTargetListUnknowns`
     /// later coerces exactly those occurrences to `text`.
     untyped_outputs: HashSet<i32>,
+    /// Param numbers some expression read as non-NULL ([`Self::read_nullable`]).
+    /// A param inferred nullable only later in the walk (inside a
+    /// `COALESCE`, or as the value of a nullable column) makes those reads
+    /// stale: see [`Self::stale_non_null_reads`].
+    read_non_null: HashSet<i32>,
 }
 
 impl ParamCollector {
@@ -72,6 +77,31 @@ impl ParamCollector {
     /// Get the nullable annotation for a parameter. Defaults to false (non-nullable).
     pub fn is_nullable(&self, param_num: i32) -> bool {
         self.nullable.get(&param_num).copied().unwrap_or(false)
+    }
+
+    /// [`Self::is_nullable`] for an expression that builds on the answer
+    /// (a `$N` occurrence's own nullability), remembering a non-NULL one.
+    pub fn read_nullable(&mut self, param_num: i32) -> bool {
+        let nullable = self.is_nullable(param_num);
+        if !nullable {
+            self.read_non_null.insert(param_num);
+        }
+        nullable
+    }
+
+    /// The params an expression read as non-NULL that ended up nullable:
+    /// the expression's nullability rests on a value the caller may pass
+    /// as NULL, so the statement must be analyzed again with them nullable
+    /// from the start.
+    pub fn stale_non_null_reads(&self) -> Vec<i32> {
+        let mut stale: Vec<i32> = self
+            .read_non_null
+            .iter()
+            .copied()
+            .filter(|&n| self.is_nullable(n))
+            .collect();
+        stale.sort_unstable();
+        stale
     }
 
     /// Get the inferred type for a parameter. Returns UNKNOWN if not yet constrained.

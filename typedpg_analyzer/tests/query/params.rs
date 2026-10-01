@@ -76,11 +76,45 @@ fn untyped_params_in_comparison_default_to_text() {
 #[test]
 fn param_not_null_by_default() {
     let db = setup();
-    // $p1 has no nullable annotation → NOT NULL.
-    // COALESCE(nullable_age, not_null_param) → NOT NULL.
-    let sql = "SELECT COALESCE(age, $p1) as val FROM users";
+    // $p1 has no nullable annotation and no site infers it nullable → NOT
+    // NULL, and so is `id + $p1`.
+    let sql = "SELECT id + $p1 as val FROM users";
     let info = db.analyze(sql).unwrap();
+    assert!(!info.params[0].nullable);
     assert!(!col(&info, "val").nullable);
+}
+
+#[test]
+fn param_in_coalesce_is_nullable_and_so_is_the_result() {
+    let db = setup();
+    // A bare `$p1` in COALESCE is inferred nullable (that's what the
+    // COALESCE is for), so `COALESCE(nullable_age, $p1)` is nullable too:
+    // the caller may pass NULL for both.
+    let info = db
+        .analyze("SELECT COALESCE(age, $p1) as val FROM users")
+        .unwrap();
+    assert!(info.params[0].nullable);
+    assert!(col(&info, "val").nullable);
+    // `$p1!` keeps it NOT NULL, and with it the COALESCE.
+    let info = db
+        .analyze("SELECT COALESCE(age, $p1!) as val FROM users")
+        .unwrap();
+    assert!(!info.params[0].nullable);
+    assert!(!col(&info, "val").nullable);
+}
+
+#[test]
+fn param_read_before_a_later_site_infers_it_nullable() {
+    let db = setup();
+    // `$p + 1` is walked while `$p` still looks NOT NULL; the COALESCE
+    // after it makes `$p` nullable. The statement is analyzed again, so
+    // `a` doesn't rest on a value the caller may pass as NULL.
+    let info = db
+        .analyze("SELECT $p + 1 AS a, COALESCE($p, 0) AS b")
+        .unwrap();
+    assert!(info.params[0].nullable);
+    assert!(col(&info, "a").nullable);
+    assert!(!col(&info, "b").nullable);
 }
 
 #[test]
@@ -801,8 +835,8 @@ fn torture_param_in_coalesce() {
     let db = setup();
     let sql = "SELECT COALESCE(age, $p1) as val FROM users";
     let info = db.analyze(sql).unwrap();
-    // $p1 is NOT NULL by default → COALESCE has a NOT NULL arg → NOT NULL.
-    assert!(!col(&info, "val").nullable);
+    // The COALESCE infers $p1 nullable, so no arg is NOT NULL → nullable.
+    assert!(col(&info, "val").nullable);
 }
 
 #[test]

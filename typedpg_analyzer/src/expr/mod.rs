@@ -753,7 +753,7 @@ fn infer_expr_unlocated(
                 params.record(p.number, goal.type_oid);
             }
             let type_oid = params.get(p.number);
-            Ok(ExprType::scalar(type_oid, params.is_nullable(p.number)))
+            Ok(ExprType::scalar(type_oid, params.read_nullable(p.number)))
         }
         node::Node::MinMaxExpr(mm) => {
             // `GREATEST`/`LEAST` are non-strict: they skip NULL args and
