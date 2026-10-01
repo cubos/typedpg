@@ -57,7 +57,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
-      - run: scripts/run-pg-sanity.sh --no-fail-fast
+      # The suite (with the nullability soundness oracle) plus a short pass
+      # of the #[ignore]d differential fuzzer, which fails only on
+      # high-signal findings: single-fault divergences and unsound
+      # nullability.
+      - run: scripts/run-pg-sanity.sh --no-fail-fast --run-ignored all
+        env:
+          FUZZ_ITERS: 300
+          FUZZ_STRICT: single
 
   msrv:
     name: minimum Rust version (1.88)

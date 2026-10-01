@@ -12,7 +12,11 @@
 //!     parameter type (or count, or name) differs, and
 //!   * **invalid queries with a divergent error** — `Err`/`Err` where our
 //!     message doesn't start with PG's, plus the `Ok`/`Err` and `Err`/`Ok`
-//!     asymmetries.
+//!     asymmetries, and
+//!   * **unsound nullability** — the oracle executes every accepted query
+//!     over adversarial rows (NULL in every nullable column, empty tables,
+//!     unmatched outer joins; see `pg_sanity/soundness.rs`) and reports a
+//!     value the analyzer inferred NOT NULL that comes back NULL.
 //!
 //! Query generation uses four strategies:
 //!   1. a schema-driven **template generator** (`gen_statement`) that emits
@@ -31,8 +35,8 @@
 //!      *types* across the whole builtin surface (see `build_typed_cat`); and
 //!   4. a **metamorphic** check (`metamorphic_check`) that wraps a valid query
 //!      in a pass-through subquery/CTE and asserts the analyzer reports the same
-//!      column type/nullability shape — the only way to test nullability
-//!      propagation, since PG's wire protocol doesn't expose it; and
+//!      column type/nullability shape — a self-consistency check that also
+//!      catches inference lost (not just made unsound) across the wrap; and
 //!   5. a **literal-content probe** (`gen_literal_probe`) that pushes a pool of
 //!      valid/invalid literal strings (`'0x1F'`, `'1_'`, `'NaN'`, `'[1,]'`, …)
 //!      through every coercion context (cast, operator, COALESCE, INSERT)
@@ -57,7 +61,9 @@
 //!
 //! Knobs (env vars): `FUZZ_ITERS` (default 2000), `FUZZ_SEED` (default
 //! 0xC0FFEE), `FUZZ_OUT` (output dir), `FUZZ_STRICT` (panic at the end if any
-//! finding was discovered), `FUZZ_DUMP=N` (print N generated statements and a
+//! finding was discovered; `FUZZ_STRICT=single` only for the high-signal ones —
+//! single-fault findings and unsound nullability, what CI runs),
+//! `FUZZ_DUMP=N` (print N generated statements and a
 //! shape histogram, then exit — no DB needed; for inspecting what the template
 //! generator produces) and `FUZZ_TYPED_DUMP=N` (print N type-directed samples
 //! and the valid-by-construction rate, then exit — needs the DB).
@@ -305,7 +311,7 @@ fn fuzz_analyze_against_pg() {
                 metamorphic_check(&db, &sql, q, &mut rng, &mut findings, i);
             }
         }
-        if let Some(div) = divergence {
+        if let Some(div) = divergence.filter(|d| !deliberate_divergence(d)) {
             let sig = signature(&div);
             // Only the first query per signature is minimized + recorded
             // (minimize is expensive — gate it behind the vacant slot).
@@ -331,12 +337,40 @@ fn fuzz_analyze_against_pg() {
     write_findings(&out_dir, &findings);
     print_summary(iters, &findings);
 
-    if std::env::var("FUZZ_STRICT").is_ok() && !findings.is_empty() {
-        panic!(
+    match std::env::var("FUZZ_STRICT").as_deref() {
+        Ok("single") => {
+            let high: Vec<&Finding> = findings.values().filter(|f| f.high_signal()).collect();
+            if !high.is_empty() {
+                panic!(
+                    "fuzz: {} high-signal divergence(s) found (FUZZ_STRICT=single):\n{}\nSee {out_dir}/",
+                    high.len(),
+                    high.iter()
+                        .map(|f| format!("  {:?}: {}", f.kind, f.example_sql))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                );
+            }
+        }
+        Ok(_) if !findings.is_empty() => panic!(
             "fuzz: {} unique divergence(s) found (FUZZ_STRICT). See {out_dir}/",
             findings.len()
-        );
+        ),
+        _ => {}
     }
+}
+
+/// An `Err`/`Ok` divergence that is the analyzer's documented choice, not a
+/// bug: a literal NULL written into a NOT NULL column (or domain) is
+/// rejected in UPDATE and MERGE too, although PG fails only the executions
+/// that touch a row — and the execute fallback runs against empty tables
+/// (see CLAUDE.md, "Errors that every execution raises").
+fn deliberate_divergence(div: &Divergence) -> bool {
+    div.kind == DivergenceKind::AnalyzeAcceptedExecuted
+        && div.message.lines().any(|l| {
+            l.starts_with("analyzer error: null value in column ")
+                || l.starts_with("analyzer error: domain ")
+                    && l.contains("does not allow null values")
+        })
 }
 
 // ──────────────────────────────────────────────────────────────────────────
