@@ -198,6 +198,7 @@ pub(crate) fn validate_with_typmod(
         "pg_snapshot" | "txid_snapshot" => validate_pg_snapshot(content),
         name @ ("xid" | "xid8" | "cid") => validate_xid(content, name),
         "oidvector" => validate_oidvector(content),
+        "aclitem" => validate_aclitem(content),
         "int2vector" => validate_int2vector(content),
         _ => Ok(()),
     }
@@ -1785,6 +1786,99 @@ fn validate_int2vector(content: &str) -> Result<(), String> {
     }
 }
 
+// ─── aclitem ────────────────────────────────────────────────────────────────
+
+/// acl.c's `getid`: skip whitespace, read an identifier (ASCII letters,
+/// digits, `_`, non-ASCII bytes, or `"…"` with `""` for a quote), skip
+/// whitespace. Returns the name and the position after it.
+fn acl_getid(b: &[u8], mut p: usize) -> Result<(Vec<u8>, usize), String> {
+    while p < b.len() && c_isspace(b[p]) {
+        p += 1;
+    }
+    let mut name = Vec::new();
+    let mut in_quotes = false;
+    while p < b.len() {
+        let c = b[p];
+        if !(c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80 || c == b'"' || in_quotes) {
+            break;
+        }
+        if c == b'"' {
+            if !in_quotes {
+                in_quotes = true;
+                p += 1;
+                continue;
+            }
+            if b.get(p + 1) != Some(&b'"') {
+                in_quotes = false;
+                p += 1;
+                continue;
+            }
+            p += 1; // an escaped quote: keep the second one
+        }
+        // NAMEDATALEN - 1.
+        if name.len() >= 63 {
+            return Err("identifier too long".to_string());
+        }
+        name.push(b[p]);
+        p += 1;
+    }
+    while p < b.len() && c_isspace(b[p]) {
+        p += 1;
+    }
+    Ok((name, p))
+}
+
+/// Mirrors `aclitemin` / `aclparse` (acl.c): `[group|user] grantee=privs
+/// [/grantor]` (an empty grantee is PUBLIC), privilege letters from
+/// `ACL_ALL_RIGHTS_STR`, each optionally followed by `*`, then only
+/// whitespace. Role names aren't checked: the analyzer doesn't model
+/// roles.
+fn validate_aclitem(content: &str) -> Result<(), String> {
+    const ACL_ALL_RIGHTS_STR: &str = "arwdDxtXUCTcsAm";
+    let b = content.as_bytes();
+    let (mut name, mut p) = acl_getid(b, 0)?;
+    if b.get(p) != Some(&b'=') {
+        if name != b"group" && name != b"user" {
+            return Err(format!(
+                "unrecognized key word: \"{}\" (ACL key word must be \"group\" or \"user\".)",
+                String::from_utf8_lossy(&name)
+            ));
+        }
+        (name, p) = acl_getid(b, p)?;
+        if name.is_empty() {
+            return Err(
+                "missing name (A name must follow the \"group\" or \"user\" key word.)".to_string(),
+            );
+        }
+    }
+    if b.get(p) != Some(&b'=') {
+        return Err("missing \"=\" sign".to_string());
+    }
+    p += 1;
+    while p < b.len() && (b[p].is_ascii_alphabetic() || b[p] == b'*') {
+        if b[p] != b'*' && !ACL_ALL_RIGHTS_STR.as_bytes().contains(&b[p]) {
+            return Err(format!(
+                "invalid mode character: must be one of \"{ACL_ALL_RIGHTS_STR}\""
+            ));
+        }
+        p += 1;
+    }
+    if b.get(p) == Some(&b'/') {
+        let (grantor, q) = acl_getid(b, p + 1)?;
+        if grantor.is_empty() {
+            return Err("a name must follow the \"/\" sign".to_string());
+        }
+        p = q;
+    }
+    while p < b.len() && c_isspace(b[p]) {
+        p += 1;
+    }
+    if p != b.len() {
+        return Err("extra garbage at the end of the ACL specification".to_string());
+    }
+    Ok(())
+}
+
 // ─── system identifier types ────────────────────────────────────────────────
 
 /// Mirrors `tidin` (tid.c): `(block,offset)` with two unsigned decimal
@@ -2323,6 +2417,45 @@ mod tests {
         assert!(validate_xid("42", "xid").is_ok());
         assert!(validate_xid("0x10", "xid").is_ok());
         assert!(validate_xid("ff", "xid").is_err());
+    }
+
+    #[test]
+    fn aclitem_inputs() {
+        for ok in [
+            "=r/postgres",
+            "postgres=r*w/postgres",
+            "group postgres=r/postgres",
+            " postgres =r/ postgres ",
+            "\"postgres\"=r/postgres",
+            "=r",
+        ] {
+            assert!(validate_aclitem(ok).is_ok(), "{ok:?} should be valid");
+        }
+        for (bad, msg) in [
+            (
+                "5.",
+                "unrecognized key word: \"5\" (ACL key word must be \"group\" or \"user\".)",
+            ),
+            ("postgres:r", "unrecognized key word: \"postgres\""),
+            ("group postgres r", "missing \"=\" sign"),
+            (
+                "postgres=q",
+                "invalid mode character: must be one of \"arwdDxtXUCTcsAm\"",
+            ),
+            ("postgres=r/", "a name must follow the \"/\" sign"),
+            (
+                "postgres=r/postgres x",
+                "extra garbage at the end of the ACL specification",
+            ),
+            // No whitespace between `=` and the privileges.
+            (
+                "postgres= r/postgres",
+                "extra garbage at the end of the ACL specification",
+            ),
+        ] {
+            let err = validate_aclitem(bad).unwrap_err();
+            assert!(err.starts_with(msg), "{bad:?}: {err}");
+        }
     }
 
     #[test]
