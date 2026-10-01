@@ -99,5 +99,8 @@ pub use resolve::{
     AnalyzedColumn, AnalyzedCopyIn, AnalyzedParam, AnalyzedQuery, AnalyzedSpread,
     AnalyzedSpreadField,
 };
+/// The "did you mean" matcher behind the analyzer's suggestions, for the
+/// macros' own errors (an unknown `sql!` argument name).
+pub use suggest::suggest_similar;
 pub use typedpg_core::{ParseQualifiedNameError, QualifiedName};
 pub use types::{RecordField, Type};
