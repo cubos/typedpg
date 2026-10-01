@@ -907,7 +907,6 @@ fn generate_spread(
     }
 
     // ── Per-spread: generics, fields, inits, push exprs, SQL pieces ────
-    let mut spread_generic_types = Vec::new();
     let mut spread_struct_fields = TokenStream::new();
     let mut spread_struct_inits = TokenStream::new();
     let mut spread_empty_checks = TokenStream::new();
@@ -922,20 +921,23 @@ fn generate_spread(
 
     for (si, spread) in analyzed.spreads.iter().enumerate() {
         let col_count = spread.fields.len();
-        let type_ident = format_ident!("__S{}", si);
         let field_ident = format_ident!("__spread_{}", si);
         let size_ident = format_ident!("__size_{}", si);
-
-        spread_generic_types.push(type_ident.clone());
 
         // SQL piece before this spread
         sql_pieces.push(&analyzed.sql[last_offset..spread.offset]);
         last_offset = spread.offset;
         fields_per_row_lits.push(proc_macro2::Literal::usize_unsuffixed(col_count));
 
-        // Struct field + init (all spreads share the '__s lifetime)
+        // The spread's rows and parameters, extracted where `sql!` is
+        // invoked — the one place the element type is concrete, so the
+        // fields can be read (a method generic over the element type
+        // can't access them).
         spread_struct_fields.extend(quote! {
-            #field_ident: &'__s [#type_ident],
+            #field_ident: ::std::result::Result<
+                (usize, ::std::vec::Vec<__SpreadParam>),
+                typedpg::Error,
+            >,
         });
 
         let spread_value_expr: TokenStream = {
@@ -948,17 +950,6 @@ fn generate_spread(
                 }
             }
         };
-        spread_struct_inits.extend(quote! {
-            #field_ident: &(#spread_value_expr)[..],
-        });
-
-        spread_empty_checks.extend(quote! {
-            if self.#field_ident.is_empty() { __any_empty = true; }
-        });
-
-        spread_size_args.extend(quote! { self.#field_ident.len(), });
-        spread_size_params.extend(quote! { #size_ident: usize, });
-
         // Param push expressions: iterate spread items and push field values
         let mut item_pushes = TokenStream::new();
         for field in &spread.fields {
@@ -967,10 +958,30 @@ fn generate_spread(
             item_pushes.extend(push_param(field, config, &registry, &accessor)?);
         }
 
+        spread_struct_inits.extend(quote! {
+            #field_ident: (|| {
+                let __items = &(#spread_value_expr)[..];
+                let mut __params: ::std::vec::Vec<__SpreadParam> =
+                    ::std::vec::Vec::with_capacity(__items.len() * #col_count);
+                for __item in __items.iter() {
+                    #item_pushes
+                }
+                ::std::result::Result::Ok((__items.len(), __params))
+            })(),
+        });
+
+        let len_ident = format_ident!("__len_{}", si);
+        let params_ident = format_ident!("__spread_params_{}", si);
+        spread_empty_checks.extend(quote! {
+            let (#len_ident, #params_ident) = self.#field_ident?;
+            if #len_ident == 0 { __any_empty = true; }
+        });
+
+        spread_size_args.extend(quote! { #len_ident, });
+        spread_size_params.extend(quote! { #size_ident: usize, });
+
         spread_param_pushes.extend(quote! {
-            for __item in self.#field_ident.iter() {
-                #item_pushes
-            }
+            __params.extend(#params_ident);
         });
     }
 
@@ -1013,20 +1024,22 @@ fn generate_spread(
     // ── Capacity estimate ───────────────────────────────────────────────
     let mut capacity_expr = quote! { #num_regular_lit };
     for (si, fpr) in fields_per_row_lits.iter().enumerate() {
-        let field_ident = format_ident!("__spread_{}", si);
-        capacity_expr.extend(quote! { + self.#field_ident.len() * #fpr });
+        let len_ident = format_ident!("__len_{}", si);
+        capacity_expr.extend(quote! { + #len_ident * #fpr });
     }
 
     let query_preamble = quote! {
         let mut __any_empty = false;
         #spread_empty_checks
         let __sql = __build_spread_sql(#spread_size_args);
-        let mut __params: Vec<Box<dyn ::typedpg::__private::tokio_postgres::types::ToSql + Sync>>
-            = Vec::with_capacity(#capacity_expr);
+        let mut __params: Vec<__SpreadParam> = Vec::with_capacity(#capacity_expr);
         #regular_param_pushes
         #spread_param_pushes
         let __params_ref: Vec<&(dyn ::typedpg::__private::tokio_postgres::types::ToSql + Sync)>
-            = __params.iter().map(|p| p.as_ref()).collect();
+            = __params
+                .iter()
+                .map(|p| p.as_ref() as &(dyn ::typedpg::__private::tokio_postgres::types::ToSql + Sync))
+                .collect();
     };
 
     let fetch_value_method = build_fetch_value_method(&analyzed.columns, config, &registry)?;
@@ -1043,7 +1056,13 @@ fn generate_spread(
             }
 
             #[allow(non_camel_case_types)]
-            struct __typedpg_query<'__s, __E: typedpg::Executor, #(#spread_generic_types,)*> {
+            // A parameter value, owned: `Send` so the query's future is.
+            #[allow(non_camel_case_types)]
+            type __SpreadParam =
+                ::std::boxed::Box<dyn ::typedpg::__private::tokio_postgres::types::ToSql + Sync + Send>;
+
+            #[allow(non_camel_case_types)]
+            struct __typedpg_query<__E: typedpg::Executor> {
                 __executor: __E,
                 #spread_struct_fields
                 #regular_param_fields
@@ -1053,9 +1072,7 @@ fn generate_spread(
                 #sql_builder_body
             }
 
-            impl<'__s, __E: typedpg::Executor, #(#spread_generic_types,)*>
-                __typedpg_query<'__s, __E, #(#spread_generic_types,)*>
-            {
+            impl<__E: typedpg::Executor> __typedpg_query<__E> {
                 async fn fetch_all(self) -> ::std::result::Result<::std::vec::Vec<__sql_output>, typedpg::Error> {
                     #query_preamble
                     if __any_empty {
@@ -1329,7 +1346,7 @@ fn push_param<P: TypedParam>(
     reject_record_param(&mapping.strategy)?;
     let is_nullable = param.nullable();
     let to_sql_ty = quote! {
-        Box<dyn ::typedpg::__private::tokio_postgres::types::ToSql + Sync>
+        Box<dyn ::typedpg::__private::tokio_postgres::types::ToSql + Sync + Send>
     };
 
     let ts = match mapping.strategy {
