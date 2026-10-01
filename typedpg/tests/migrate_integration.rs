@@ -49,7 +49,7 @@ fn track_container(id: String) {
     }
 }
 
-/// Start a throwaway Postgres container on the latest tag with Docker's
+/// Start a throwaway PostgreSQL 18 container with Docker's
 /// `--rm` flag set, so the container is deleted as soon as it exits — even
 /// when the Ryuk reaper is unavailable or a test panics before Drop runs.
 ///
@@ -70,7 +70,7 @@ fn postgres_image(name: &str, tag: &str) -> GenericImage {
 }
 
 async fn start_postgres() -> ContainerAsync<GenericImage> {
-    let container = postgres_image("postgres", "latest")
+    let container = postgres_image("postgres", "18")
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
         .with_env_var("POSTGRES_DB", "postgres")
