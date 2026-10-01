@@ -341,6 +341,76 @@ async fn no_transaction_migration() {
     assert!(table_exists(&client, "idx_users_name").await);
 }
 
+/// A `-- no-transaction` migration may hold several statements that refuse
+/// to run in a transaction block. Sent as one multi-statement query they
+/// would all run in PG's implicit transaction block and fail.
+#[tokio::test]
+async fn no_transaction_migration_with_several_statements() {
+    let (mut client, _db) = fresh_db().await;
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "0001_create_users.sql",
+        "CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT NOT NULL, email TEXT);",
+    );
+    write(
+        dir.path(),
+        "0002_add_indexes.sql",
+        "-- no-transaction\n\
+         CREATE INDEX CONCURRENTLY idx_users_name ON users(name);\n\
+         -- a comment; with a semicolon\n\
+         CREATE INDEX CONCURRENTLY \"idx;email\" ON users(email);\n",
+    );
+    let source = MigrationSource::from_dir(dir.path()).unwrap();
+
+    let applied = migrate::run(&mut client, &source, &MigrationsConfig::default())
+        .await
+        .unwrap();
+    assert_eq!(applied.len(), 2);
+    assert!(table_exists(&client, "idx_users_name").await);
+    assert!(table_exists(&client, "\"idx;email\"").await);
+}
+
+/// With `use_transaction = false` every migration runs outside a
+/// transaction: statements PG refuses in a transaction block work, and a
+/// failure keeps what the statements before it did.
+#[tokio::test]
+async fn global_use_transaction_false() {
+    let (mut client, _db) = fresh_db().await;
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "0001_create_users.sql",
+        "CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT NOT NULL);\n\
+         CREATE INDEX CONCURRENTLY idx_users_name ON users(name);",
+    );
+    write(
+        dir.path(),
+        "0002_partial.sql",
+        "CREATE TABLE kept (); SELECT 1/0;",
+    );
+    let source = MigrationSource::from_dir(dir.path()).unwrap();
+    let config = MigrationsConfig {
+        use_transaction: false,
+        ..Default::default()
+    };
+
+    let err = migrate::run(&mut client, &source, &config)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("division by zero"), "unexpected error: {err}");
+    assert!(table_exists(&client, "idx_users_name").await);
+    assert!(
+        table_exists(&client, "kept").await,
+        "no transaction: the statement before the failure stays applied"
+    );
+    assert_eq!(
+        recorded(&client, "public._migrations").await,
+        ["0001_create_users"]
+    );
+}
+
 #[tokio::test]
 async fn custom_table_name() {
     let (mut client, _db) = fresh_db().await;

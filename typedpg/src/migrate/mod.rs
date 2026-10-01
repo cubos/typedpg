@@ -25,6 +25,10 @@
 //! or per-migration by adding `-- no-transaction` as the first line of the SQL file
 //! (useful for `CREATE INDEX CONCURRENTLY` and similar statements).
 //!
+//! Outside a transaction the statements of a migration run one at a time,
+//! each committing on its own: a failure leaves the statements before it
+//! applied (and the migration unrecorded).
+//!
 //! # Concurrency safety
 //!
 //! The [`run`] and [`revert`] functions acquire a PostgreSQL advisory lock
@@ -58,6 +62,7 @@
 
 mod runner;
 mod source;
+mod split;
 
 pub use runner::{MigrationStatus, revert, run, status};
 pub use source::{Migration, MigrationSource};

@@ -2,6 +2,7 @@ use tokio_postgres::Client;
 
 use super::MigrationsConfig;
 use super::source::MigrationSource;
+use super::split::split_statements;
 
 /// Computes the MD5 hex digest of a migration's SQL content.
 ///
@@ -201,13 +202,15 @@ async fn run_inner(
 
             tx.commit().await?;
         } else {
-            client.batch_execute(&migration.sql).await.map_err(|e| {
-                crate::Error::Migration(format!(
-                    "failed to apply migration {}: {}",
-                    migration.name,
-                    format_pg_error(&e)
-                ))
-            })?;
+            execute_each(client, &migration.sql)
+                .await
+                .map_err(|(n, e)| {
+                    crate::Error::Migration(format!(
+                        "failed to apply migration {} (statement {n}): {}",
+                        migration.name,
+                        format_pg_error(&e)
+                    ))
+                })?;
 
             client
                 .execute(
@@ -450,9 +453,9 @@ async fn revert_inner(
 
                 tx.commit().await?;
             } else {
-                client.batch_execute(down_sql).await.map_err(|e| {
+                execute_each(client, down_sql).await.map_err(|(n, e)| {
                     crate::Error::Migration(format!(
-                        "failed to revert migration {}: {}",
+                        "failed to revert migration {} (statement {n}): {}",
                         name,
                         format_pg_error(&e)
                     ))
@@ -483,6 +486,20 @@ async fn revert_inner(
         }
     }
 
+    Ok(())
+}
+
+/// Run `sql` outside a transaction, one statement at a time: sent whole,
+/// PG would run its statements in one implicit transaction block (see
+/// [`split_statements`]). Fails with the 1-based number of the failing
+/// statement; the statements before it stay applied.
+async fn execute_each(client: &Client, sql: &str) -> Result<(), (usize, tokio_postgres::Error)> {
+    for (i, statement) in split_statements(sql).into_iter().enumerate() {
+        client
+            .batch_execute(statement)
+            .await
+            .map_err(|e| (i + 1, e))?;
+    }
     Ok(())
 }
 
