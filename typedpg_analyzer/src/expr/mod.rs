@@ -427,6 +427,22 @@ pub(crate) struct FuncKindPresence {
 /// without resolving anything against the schema. Used up-front by clauses
 /// that forbid those constructs (WHERE, GROUP BY, JOIN ON, HAVING for the
 /// nested-agg case).
+impl FuncKindPresence {
+    /// Where the first aggregate (or `GROUPING`) call found is — PG
+    /// positions placement errors at the offending call's name.
+    pub(crate) fn aggregate_span(&self) -> Option<crate::error::SourceSpan> {
+        self.agg_location
+            .or(self.grouping_location)
+            .and_then(crate::error::SourceSpan::from_node_qname)
+    }
+
+    /// Where the first window-function call found is.
+    pub(crate) fn window_span(&self) -> Option<crate::error::SourceSpan> {
+        self.window_location
+            .and_then(crate::error::SourceSpan::from_node_qname)
+    }
+}
+
 pub(crate) fn detect_func_kinds(node: &protobuf::Node, snapshot: &PgCatalog) -> FuncKindPresence {
     let mut out = FuncKindPresence::default();
     walk(node, snapshot, &mut out);

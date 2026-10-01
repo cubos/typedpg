@@ -360,9 +360,7 @@ fn json_agg_modifiers(
 fn check_not_nested(n: &protobuf::Node, snapshot: &PgCatalog) -> Result<(), AnalyzeError> {
     let kinds = detect_func_kinds(n, snapshot);
     if kinds.has_aggregate || kinds.has_grouping {
-        return Err(AnalyzeError::GroupingError(
-            "aggregate function calls cannot be nested".into(),
-        ));
+        return Err(crate::pgmsg::nested_aggregate(kinds.aggregate_span()).finalize_implicit());
     }
     Ok(())
 }

@@ -467,6 +467,32 @@ pub(crate) fn merge_unreachable_when_clause() -> RawError {
     )
 }
 
+/// `aggregate function calls cannot be nested` — SQLSTATE 42803
+/// (`check_agglevels_and_constraints`), at the inner aggregate.
+pub(crate) fn nested_aggregate(span: Option<SourceSpan>) -> RawError {
+    RawError::new(
+        AnalyzeError::GroupingError("aggregate function calls cannot be nested".into()),
+        span,
+        Some(
+            "compute the inner aggregate in a subquery, e.g. `SELECT max(n) FROM (SELECT count(*) \
+             AS n FROM t GROUP BY g) s`"
+                .into(),
+        ),
+    )
+}
+
+/// `aggregate function calls cannot contain window function calls` —
+/// SQLSTATE 42803, at the window function.
+pub(crate) fn window_in_aggregate(span: Option<SourceSpan>) -> RawError {
+    RawError::new(
+        AnalyzeError::GroupingError(
+            "aggregate function calls cannot contain window function calls".into(),
+        ),
+        span,
+        None,
+    )
+}
+
 /// `INSERT has more expressions than target columns` — SQLSTATE 42601
 /// (`transformInsertRow`). PG positions it at the first extra expression;
 /// `targets` / `expressions` are the counts, for the hint.
