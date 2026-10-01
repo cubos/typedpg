@@ -1930,7 +1930,8 @@ fn build_params_slice(
     for idx in 0..analyzed.params.len() {
         let field_name = format_ident!("p{}", idx);
         let pi = &analyzed.params[idx];
-        let mapping = resolve_type_mapping(&pi.pg_type, config, registry)?;
+        let mapping = resolve_type_mapping(&pi.pg_type, config, registry)
+            .map_err(|e| naming_subject(e, &format!("parameter `${}`", pi.name)))?;
         reject_record_param(&mapping.strategy)?;
         let nullable = pi.nullable;
 
@@ -2045,12 +2046,25 @@ fn build_row_mapping(
 // Type helpers
 // ---------------------------------------------------------------------------
 
+/// `error` (about a type) saying what has the type — `no Rust mapping for
+/// PostgreSQL type T (output column `v`) — add it …` — so a query with
+/// several columns says which one needs a mapping.
+fn naming_subject(error: syn::Error, subject: &str) -> syn::Error {
+    let message = error.to_string();
+    let message = match message.split_once(" — ") {
+        Some((what, fix)) => format!("{what} ({subject}) — {fix}"),
+        None => format!("{message} ({subject})"),
+    };
+    syn::Error::new(error.span(), message)
+}
+
 fn column_rust_type(
     col: &AnalyzedColumn,
     config: &ResolvedConfig,
     registry: &RecordRegistry,
 ) -> Result<syn::Type, syn::Error> {
-    let mapping = resolve_type_mapping(&col.pg_type, config, registry)?;
+    let mapping = resolve_type_mapping(&col.pg_type, config, registry)
+        .map_err(|e| naming_subject(e, &format!("output column `{}`", col.name)))?;
     let inner = mapping.rust_type;
     if col.nullable {
         Ok(parse_str(&format!(
