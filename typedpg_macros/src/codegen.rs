@@ -800,7 +800,14 @@ pub fn generate_copy_in(
     let mut pushes = TokenStream::new();
     for (column, field) in target.columns.iter().zip(fields) {
         pushes.extend(
-            push_item_field(column, config, &registry, field).map_err(|e| {
+            push_item_field(
+                &format!("field `{field}` (column \"{}\")", column.name),
+                column,
+                config,
+                &registry,
+                field,
+            )
+            .map_err(|e| {
                 syn::Error::new(field.span(), format!("column \"{}\": {}", column.name, e))
             })?,
         );
@@ -1064,6 +1071,7 @@ fn generate_spread(
     for (idx, param) in analyzed.params.iter().enumerate() {
         let field_name = format_ident!("p{}", idx);
         let (field_type, value_expr) = build_field_type_and_value(
+            &format!("`${}`", param.name),
             param,
             config,
             &registry,
@@ -1146,7 +1154,14 @@ fn generate_spread(
         let mut item_pushes = TokenStream::new();
         for field in &spread.fields {
             let accessor_ident = format_ident!("{}", field.name);
-            item_pushes.extend(push_item_field(field, config, &registry, &accessor_ident)?);
+            let subject = format!("field `{}` of `$..{}`", field.name, spread.name);
+            item_pushes.extend(push_item_field(
+                &subject,
+                field,
+                config,
+                &registry,
+                &accessor_ident,
+            )?);
         }
 
         spread_struct_inits.extend(quote! {
@@ -1489,8 +1504,13 @@ fn build_param_fields(
     for (idx, param) in analyzed.params.iter().enumerate() {
         let field_name = format_ident!("p{}", idx);
         let value_expr = resolve_param_value(&param.name, assignments)?;
-        let (field_type, value_expr) =
-            build_field_type_and_value(param, config, registry, &value_expr)?;
+        let (field_type, value_expr) = build_field_type_and_value(
+            &format!("`${}`", param.name),
+            param,
+            config,
+            registry,
+            &value_expr,
+        )?;
 
         defs.extend(quote! {
             #field_name: #field_type,
@@ -1510,13 +1530,14 @@ fn build_param_fields(
 /// conversions a query parameter accepts — so a field of the wrong type is
 /// a compile error at the field, not a failure when the query runs.
 fn push_item_field<P: TypedParam>(
+    subject: &str,
     param: &P,
     config: &ResolvedConfig,
     registry: &RecordRegistry,
     field: &syn::Ident,
 ) -> Result<TokenStream, syn::Error> {
     let raw = quote::quote_spanned! {field.span()=> ::std::clone::Clone::clone(&__item.#field) };
-    let (ty, value) = build_field_type_and_value(param, config, registry, &raw)?;
+    let (ty, value) = build_field_type_and_value(subject, param, config, registry, &raw)?;
     let local = format_ident!("__field_{}", field);
     let push = push_param(param, config, registry, &quote! { #local })?;
     // The clone carries the field's span (so a type error points at the
@@ -1531,6 +1552,7 @@ fn push_item_field<P: TypedParam>(
 /// Compute the Rust field type and (optionally wrapped) value expression for a
 /// query parameter.
 fn build_field_type_and_value<P: TypedParam>(
+    subject: &str,
     param: &P,
     config: &ResolvedConfig,
     registry: &RecordRegistry,
@@ -1562,24 +1584,139 @@ fn build_field_type_and_value<P: TypedParam>(
         DeserStrategy::EnumAsString { .. } => override_path(param.pg_type(), config).is_none(),
         _ => false,
     };
-    let value_expr = match (accepts_into_string, mapping.accepts_iter, is_nullable) {
-        (true, _, true) => {
-            quote! {
-                ::typedpg::__private::IntoOptionString::into_option_string(#value_expr)
-            }
-        }
-        (true, _, false) => quote! { Into::<String>::into(#value_expr) },
+    let rt_text = type_text(inner_rt);
+    // (bound on `__V`, conversion of `self: __V`, what the note says it takes)
+    let (bound, convert, takes) = match (accepts_into_string, mapping.accepts_iter, is_nullable) {
+        (true, _, true) => (
+            quote! { __V: ::typedpg::__private::IntoOptionString },
+            quote! { ::typedpg::__private::IntoOptionString::into_option_string(self) },
+            "`&str`, `String` or `&String`, or an `Option` of one (`None` for NULL)".to_string(),
+        ),
+        (true, _, false) => (
+            quote! { __V: ::std::convert::Into<::std::string::String> },
+            quote! { ::std::convert::Into::<::std::string::String>::into(self) },
+            "`String`, or any value with `Into<String>` (`&str`, `&String`, …)".to_string(),
+        ),
         (_, true, false) => {
             // Vec<T> with a plain element — accept any IntoIterator<Item: Into<T>>.
-            quote! { ::typedpg::__private::into_flex_vec(#value_expr) }
+            let elem = vec_element(inner_rt).ok_or_else(|| {
+                syn::Error::new(
+                    proc_macro2::Span::call_site(),
+                    "internal error: an iterable parameter's type is not a Vec",
+                )
+            })?;
+            (
+                quote! {
+                    __V: ::std::iter::IntoIterator,
+                    <__V as ::std::iter::IntoIterator>::Item: ::std::convert::Into<#elem>
+                },
+                quote! { ::typedpg::__private::into_flex_vec(self) },
+                format!(
+                    "`{rt_text}`, or any iterable (array, slice iterator, …) of values with \
+                     `Into<{}>`",
+                    type_text(&elem)
+                ),
+            )
         }
-        (false, _, true) => {
-            quote! { ::std::option::Option::<#inner_rt>::from(#value_expr) }
-        }
-        (false, false, false) => quote! { Into::<#inner_rt>::into(#value_expr) },
+        (false, _, true) => (
+            quote! { ::std::option::Option<#inner_rt>: ::std::convert::From<__V> },
+            quote! { ::std::option::Option::<#inner_rt>::from(self) },
+            format!("`{rt_text}`, or `Option<{rt_text}>` (`None` for NULL)"),
+        ),
+        (false, false, false) => (
+            quote! { __V: ::std::convert::Into<#inner_rt> },
+            quote! { ::std::convert::Into::<#inner_rt>::into(self) },
+            format!("`{rt_text}`, or any value with `Into<{rt_text}>`"),
+        ),
     };
 
+    // The conversion goes through a trait of its own, whose blanket impl
+    // `do_not_recommend` hides: a value it can't take is then reported as
+    // that trait not being implemented, with a message naming the
+    // parameter and its SQL type instead of rustc's `i64: From<&str>`.
+    let sql_type = sql_type_name(param.pg_type());
+    let nullable_note = if is_nullable { "" } else { " NOT NULL" };
+    let message = escape_braces(&format!(
+        "{subject} expects a value for SQL type {sql_type}{nullable_note}, not `"
+    )) + "{Self}`";
+    let label = escape_braces(&format!("expected a value for {sql_type}"));
+    let note = escape_braces(&format!("{subject} takes {takes}"));
+    // A name of its own, so rustc doesn't point at the binding traits of
+    // other parameters as "similarly named".
+    static BIND_TRAITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let bind_trait = format_ident!(
+        "__TypedpgBind{}",
+        BIND_TRAITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let value_expr = quote! {{
+        #[diagnostic::on_unimplemented(message = #message, label = #label, note = #note)]
+        trait #bind_trait {
+            fn __typedpg_bind(self) -> #field_type;
+        }
+        #[diagnostic::do_not_recommend]
+        impl<__V> #bind_trait for __V where #bound {
+            #[inline]
+            fn __typedpg_bind(self) -> #field_type {
+                #convert
+            }
+        }
+        #bind_trait::__typedpg_bind(#value_expr)
+    }};
+
     Ok((field_type, value_expr))
+}
+
+/// `s` with `{` / `}` doubled, for a `#[diagnostic::on_unimplemented]`
+/// format string.
+fn escape_braces(s: &str) -> String {
+    s.replace('{', "{{").replace('}', "}}")
+}
+
+/// The element type of a `Vec<T>` (written by this module, any path).
+fn vec_element(ty: &syn::Type) -> Option<syn::Type> {
+    let syn::Type::Path(p) = ty else {
+        return None;
+    };
+    let last = p.path.segments.last()?;
+    if last.ident != "Vec" {
+        return None;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &last.arguments else {
+        return None;
+    };
+    match args.args.first()? {
+        syn::GenericArgument::Type(t) => Some(t.clone()),
+        _ => None,
+    }
+}
+
+/// How a compile-time message names a PG type, the way PostgreSQL's
+/// `format_type` does for the built-ins (`bigint`, `text[]`,
+/// `timestamp with time zone`); a user type by its qualified name.
+fn sql_type_name(ty: &Type) -> String {
+    match ty {
+        Type::Basic { schema, name, .. } if schema == "pg_catalog" => {
+            let sql = match name.as_str() {
+                "bool" => "boolean",
+                "int2" => "smallint",
+                "int4" => "integer",
+                "int8" => "bigint",
+                "float4" => "real",
+                "float8" => "double precision",
+                "varchar" => "character varying",
+                "bpchar" => "character",
+                "timestamp" => "timestamp without time zone",
+                "timestamptz" => "timestamp with time zone",
+                "time" => "time without time zone",
+                "timetz" => "time with time zone",
+                "char" => "\"char\"",
+                other => other,
+            };
+            sql.to_string()
+        }
+        Type::Array { element, .. } => format!("{}[]", sql_type_name(element)),
+        other => pg_type_label(other),
+    }
 }
 
 /// Build the `push` statement for a param/field in the spread execution path.
