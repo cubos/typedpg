@@ -1294,3 +1294,23 @@ column \"idd\" does not exist
         assert_eq!(err.to_string(), *expected, "{sql}");
     }
 }
+
+#[test]
+fn unsupported_statement_is_named_not_dumped() {
+    let mut db = setup();
+    // typedpg's own limitation: PG has nothing to compare.
+    db.skip_pg_sanity();
+    assert_analyze_err!(
+        db.analyze("  CREATE INDEX ON users (name)"),
+        AnalyzeError::Unsupported(_),
+        "\
+typedpg does not support CREATE INDEX statements in queries yet
+  ╭────
+1 │   CREATE INDEX ON users (name)
+  ·   ───┬──
+  ·      ╰─ unsupported construct
+  ╰────
+  help: a query can be SELECT, VALUES, INSERT, UPDATE, DELETE, MERGE, CALL, EXPLAIN, NOTIFY, LISTEN or UNLISTEN; schema changes belong in migrations
+",
+    );
+}

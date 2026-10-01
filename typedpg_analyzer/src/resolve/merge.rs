@@ -326,8 +326,8 @@ fn walk_merge_when_clause(
             Ok(())
         }
         _ => Err(AnalyzeError::Unsupported(format!(
-            "MERGE WHEN command type {:?} is not supported",
-            cmd
+            "typedpg does not support the MERGE action {} yet",
+            cmd.as_str_name()
         ))),
     }
 }

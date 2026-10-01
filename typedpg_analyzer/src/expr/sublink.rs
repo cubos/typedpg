@@ -185,10 +185,15 @@ pub(crate) fn infer_sublink(
                 .with_collation(collation)
                 .with_elem_nullable(elem_nullable))
         }
-        _ => Err(AnalyzeError::Unsupported(format!(
-            "sublink type: {:?}",
-            sub_type
-        ))),
+        _ => Err(crate::error::RawError::unsupported(
+            format!(
+                "typedpg does not support {} subqueries yet",
+                sub_type.as_str_name()
+            ),
+            crate::error::SourceSpan::from_location(sub.location),
+            None,
+        )
+        .finalize_implicit()),
     }
 }
 

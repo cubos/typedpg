@@ -684,6 +684,38 @@ impl SourceSpan {
     }
 }
 
+/// The kind of a parse-tree node, as the parser names it (`RangeTableFunc`,
+/// `XmlSerialize`): for "typedpg does not support … yet" messages, which
+/// must not dump the node.
+pub(crate) fn node_kind(node: &typedpg_pg_query::protobuf::node::Node) -> String {
+    // The `Debug` rendering starts with the variant's name.
+    let debug = format!("{node:?}");
+    debug
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .next()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// A statement's name for messages: its command tag (`CREATE
+/// TABLESPACE`), or its node kind when the tag table has none.
+pub(crate) fn statement_name(stmt: &typedpg_pg_query::protobuf::node::Node) -> String {
+    match crate::ddl::cmdtag::command_tag(stmt) {
+        "???" => node_kind(stmt),
+        tag => tag.to_owned(),
+    }
+}
+
+/// The span of a statement's first token, for errors about the whole
+/// statement.
+pub(crate) fn statement_span() -> Option<SourceSpan> {
+    with_diag_ctx(|ctx| {
+        let sql = &ctx?.lex_output.sql;
+        let start = sql.len() - sql.trim_start().len();
+        SourceSpan::at_token(sql, start)
+    })
+}
+
 /// How the user wrote positional parameter `$num`: `` `$email` `` for a
 /// named parameter, `` `email` of `$..rows` `` for a spread field. `None`
 /// when no `sql!` template is being analyzed or the parameter was written
@@ -1111,7 +1143,6 @@ impl RawError {
     }
 
     /// Build an `Unsupported` raw error.
-    #[allow(dead_code)] // infra reserved for variants not yet migrated
     pub(crate) fn unsupported(
         message: String,
         span: Option<SourceSpan>,
@@ -1133,19 +1164,6 @@ impl RawError {
         let primary = span.map(|s| DiagnosticLabel::new(s, ""));
         Self {
             kind: AnalyzeError::Lex(message),
-            primary,
-            secondaries: Vec::new(),
-            notes: Vec::new(),
-            hint: None,
-        }
-    }
-
-    /// Build a `Parse` raw error (from `typedpg_pg_query`).
-    #[allow(dead_code)] // infra reserved for variants not yet migrated
-    pub(crate) fn parse(message: String, span: Option<SourceSpan>) -> Self {
-        let primary = span.map(|s| DiagnosticLabel::new(s, ""));
-        Self {
-            kind: AnalyzeError::Parse(message),
             primary,
             secondaries: Vec::new(),
             notes: Vec::new(),
@@ -1324,6 +1342,29 @@ impl std::error::Error for RawError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn first_stmt(sql: &str) -> typedpg_pg_query::protobuf::node::Node {
+        typedpg_pg_query::parse(sql).unwrap().protobuf.stmts[0]
+            .stmt
+            .as_ref()
+            .unwrap()
+            .node
+            .clone()
+            .unwrap()
+    }
+
+    #[test]
+    fn statements_and_nodes_are_named_not_dumped() {
+        assert_eq!(
+            statement_name(&first_stmt("CREATE TABLESPACE t LOCATION '/x'")),
+            "CREATE TABLESPACE"
+        );
+        assert_eq!(
+            statement_name(&first_stmt("CREATE DATABASE d")),
+            "CREATE DATABASE"
+        );
+        assert_eq!(node_kind(&first_stmt("SELECT 1")), "SelectStmt");
+    }
 
     #[test]
     fn fallback_span_locates_an_unlocated_error_keeping_its_hint() {
