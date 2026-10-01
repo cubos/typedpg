@@ -1092,7 +1092,8 @@ fn generate_spread(
     let mut spread_size_params = TokenStream::new();
 
     // SQL pieces: the text between spread offsets
-    let mut sql_pieces: Vec<&str> = Vec::new();
+    let mut sql_pieces: Vec<String> = Vec::new();
+    let mut spread_casts: Vec<Vec<String>> = Vec::new();
     let mut fields_per_row_lits = Vec::new();
     let mut last_offset = 0;
 
@@ -1102,8 +1103,22 @@ fn generate_spread(
         let size_ident = format_ident!("__size_{}", si);
 
         // SQL piece before this spread
-        sql_pieces.push(&analyzed.sql[last_offset..spread.offset]);
+        sql_pieces.push(cast_range(analyzed, last_offset, spread.offset));
         last_offset = spread.offset;
+        // Each field's placeholder is cast to its type, like a regular
+        // parameter's.
+        spread_casts.push(
+            spread
+                .fields
+                .iter()
+                .map(|f| {
+                    f.pg_type
+                        .cast_name()
+                        .map(|n| format!("::{n}"))
+                        .unwrap_or_default()
+                })
+                .collect(),
+        );
         fields_per_row_lits.push(proc_macro2::Literal::usize_unsuffixed(col_count));
 
         // The spread's rows and parameters, extracted where `sql!` is
@@ -1162,7 +1177,7 @@ fn generate_spread(
     }
 
     // Final SQL piece (after last spread)
-    sql_pieces.push(&analyzed.sql[last_offset..]);
+    sql_pieces.push(cast_range(analyzed, last_offset, analyzed.sql.len()));
 
     // ── Generate the __build_spread_sql function body ────────────────────
     let num_regular_lit = proc_macro2::Literal::usize_unsuffixed(num_regular_params);
@@ -1173,11 +1188,13 @@ fn generate_spread(
     });
 
     for si in 0..num_spreads {
-        let piece = sql_pieces[si];
+        let piece = &sql_pieces[si];
         let fpr = &fields_per_row_lits[si];
         let size_ident = format_ident!("__size_{}", si);
+        let casts = &spread_casts[si];
         sql_builder_body.extend(quote! {
             __sql.push_str(#piece);
+            let __casts: [&str; #fpr] = [#(#casts),*];
             for __r in 0..#size_ident {
                 if __r > 0 { __sql.push_str(", "); }
                 __sql.push('(');
@@ -1185,13 +1202,14 @@ fn generate_spread(
                     if __c > 0 { __sql.push_str(", "); }
                     __sql.push('$');
                     __sql.push_str(&__p.to_string());
+                    __sql.push_str(__casts[__c]);
                     __p += 1;
                 }
                 __sql.push(')');
             }
         });
     }
-    let final_piece = sql_pieces[num_spreads];
+    let final_piece = &sql_pieces[num_spreads];
     sql_builder_body.extend(quote! {
         __sql.push_str(#final_piece);
         __sql
@@ -1601,12 +1619,12 @@ fn push_param<P: TypedParam>(
         DeserStrategy::EnumAsString { .. } => {
             if is_nullable {
                 quote! {
-                    __params.push(Box::new(#accessor.as_ref().map(|__v| __v.to_string()))
+                    __params.push(Box::new(#accessor.as_ref().map(|__v| ::typedpg::__private::EnumString(__v.to_string())))
                         as #to_sql_ty);
                 }
             } else {
                 quote! {
-                    __params.push(Box::new(#accessor.to_string()) as #to_sql_ty);
+                    __params.push(Box::new(::typedpg::__private::EnumString(#accessor.to_string())) as #to_sql_ty);
                 }
             }
         }
@@ -1637,13 +1655,13 @@ fn push_param<P: TypedParam>(
             if is_nullable {
                 quote! {
                     __params.push(Box::new(#accessor.as_ref().map(|__vec|
-                        __vec.iter().map(|__v| __v.to_string()).collect::<Vec<String>>()))
+                        __vec.iter().map(|__v| ::typedpg::__private::EnumString(__v.to_string())).collect::<Vec<_>>()))
                         as #to_sql_ty);
                 }
             } else {
                 quote! {
                     __params.push(Box::new(
-                        #accessor.iter().map(|__v| __v.to_string()).collect::<Vec<String>>())
+                        #accessor.iter().map(|__v| ::typedpg::__private::EnumString(__v.to_string())).collect::<Vec<_>>())
                         as #to_sql_ty);
                 }
             }
@@ -1680,33 +1698,36 @@ fn resolve_param_value(
 // ---------------------------------------------------------------------------
 
 fn cast_params(analyzed: &AnalyzedQuery) -> String {
-    let mut insertions: Vec<(usize, String)> = Vec::new();
+    cast_range(analyzed, 0, analyzed.sql.len())
+}
 
+/// `analyzed.sql[start..end]`, with each regular parameter placeholder in
+/// it followed by a cast to its type (`$1::pg_catalog.int4`): the type the
+/// bound value is encoded as — a domain's base type, an enum itself (so a
+/// label bound as `EnumString` is accepted).
+fn cast_range(analyzed: &AnalyzedQuery, start: usize, end: usize) -> String {
+    let mut insertions: Vec<(usize, String)> = Vec::new();
     for param in &analyzed.params {
         if let Some(pg_type) = param.pg_type.cast_name() {
-            let cast_str = format!("::{pg_type}");
             for &offset in &param.sql_offsets {
-                insertions.push((offset, cast_str.clone()));
+                // An offset is just past its `$N`, so never at a range start.
+                if offset > start && offset <= end {
+                    insertions.push((offset, format!("::{pg_type}")));
+                }
             }
         }
     }
-
-    if insertions.is_empty() {
-        return analyzed.sql.clone();
-    }
-
     insertions.sort_by_key(|(off, _)| *off);
 
     let sql = &analyzed.sql;
-    let mut result = String::with_capacity(sql.len() + insertions.len() * 8);
-    let mut last = 0;
+    let mut result = String::with_capacity(end - start + insertions.len() * 8);
+    let mut last = start;
     for (offset, cast_str) in &insertions {
         result.push_str(&sql[last..*offset]);
         result.push_str(cast_str);
         last = *offset;
     }
-    result.push_str(&sql[last..]);
-
+    result.push_str(&sql[last..end]);
     result
 }
 
@@ -1792,13 +1813,13 @@ fn build_params_slice(
                 if nullable {
                     quote! {
                         &self.#field_name.as_ref().map(|__vec|
-                            __vec.iter().map(|__v| __v.to_string()).collect::<Vec<String>>())
+                            __vec.iter().map(|__v| ::typedpg::__private::EnumString(__v.to_string())).collect::<Vec<_>>())
                             as #to_sql,
                     }
                 } else {
                     quote! {
                         &self.#field_name.iter()
-                            .map(|__v| __v.to_string()).collect::<Vec<String>>()
+                            .map(|__v| ::typedpg::__private::EnumString(__v.to_string())).collect::<Vec<_>>()
                             as #to_sql,
                     }
                 }
