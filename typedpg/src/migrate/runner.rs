@@ -5,11 +5,16 @@ use super::source::MigrationSource;
 
 /// Computes the MD5 hex digest of a migration's SQL content.
 ///
-/// Must match PostgreSQL's `md5()` function so we can compare hashes computed
-/// locally with hashes computed on the server via `md5(sql_source)`.
+/// Must match the hash the server computes for the stored text,
+/// [`STORED_SQL_HASH`], so the two can be compared.
 fn sql_hash(sql: &str) -> String {
     format!("{:x}", md5::compute(sql.as_bytes()))
 }
+
+/// The MD5 of a stored migration's UTF-8 bytes. `md5(text)` would hash
+/// the text in the *database* encoding: on a LATIN1 database every
+/// migration with a non-ASCII character would look drifted.
+const STORED_SQL_HASH: &str = "md5(convert_to(sql_source, 'UTF8'))";
 
 /// Formats a `tokio_postgres::Error` including the underlying Postgres
 /// `DbError` details (severity, message, detail, hint, position), which are
@@ -278,7 +283,7 @@ pub async fn status(
         Vec::new()
     } else {
         let source_column = if has_sql_source {
-            "md5(sql_source)"
+            STORED_SQL_HASH
         } else {
             "NULL::text"
         };
@@ -517,7 +522,7 @@ async fn get_applied(
 ) -> Result<std::collections::HashMap<String, Option<String>>, crate::Error> {
     let rows = client
         .query(
-            &format!("SELECT name, md5(sql_source) FROM {}", config.table),
+            &format!("SELECT name, {STORED_SQL_HASH} FROM {}", config.table),
             &[],
         )
         .await?;
