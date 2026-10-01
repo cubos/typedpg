@@ -144,26 +144,31 @@ async fn run_inner(
     let applied = get_applied(client, config).await?;
     let mut newly_applied = Vec::new();
 
+    // Drift is checked over every applied migration before anything new
+    // runs: a pending migration can sort before an applied one (merged out
+    // of order), and must not run when the run is going to abort.
     for migration in source.migrations() {
-        if let Some(stored_hash) = applied.get(&migration.name) {
-            // Already applied — check for drift.
-            if let Some(h) = stored_hash {
-                let current = sql_hash(&migration.sql);
-                if *h != current {
-                    if config.fail_on_drift {
-                        return Err(crate::Error::Migration(format!(
-                            "migration '{}' has been modified since it was applied; \
-                             set [package.metadata.typedpg.migrations] fail_on_drift = false \
-                             to downgrade to a warning",
-                            migration.name
-                        )));
-                    }
-                    eprintln!(
-                        "warning: migration '{}' has been modified since it was applied",
-                        migration.name
-                    );
-                }
+        let Some(Some(h)) = applied.get(&migration.name) else {
+            continue;
+        };
+        if *h != sql_hash(&migration.sql) {
+            if config.fail_on_drift {
+                return Err(crate::Error::Migration(format!(
+                    "migration '{}' has been modified since it was applied; \
+                     set [package.metadata.typedpg.migrations] fail_on_drift = false \
+                     to downgrade to a warning",
+                    migration.name
+                )));
             }
+            eprintln!(
+                "warning: migration '{}' has been modified since it was applied",
+                migration.name
+            );
+        }
+    }
+
+    for migration in source.migrations() {
+        if applied.contains_key(&migration.name) {
             continue;
         }
 

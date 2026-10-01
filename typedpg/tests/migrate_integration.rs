@@ -331,6 +331,50 @@ async fn custom_table_name() {
     assert!(!table_exists(&client, "public._migrations").await);
 }
 
+/// Editing an applied migration is drift. With `fail_on_drift` (the
+/// default) the run aborts before applying anything — including a pending
+/// migration that sorts *before* the drifted one (merged out of order).
+#[tokio::test]
+async fn drift_aborts_the_run_before_applying_anything() {
+    let (mut client, _db) = fresh_db().await;
+    let config = MigrationsConfig::default();
+    let first = MigrationSource::from_embedded([
+        ("0001_a", "CREATE TABLE a (id INT);", None),
+        ("0003_c", "CREATE TABLE c (id INT);", None),
+    ])
+    .unwrap();
+    migrate::run(&mut client, &first, &config).await.unwrap();
+
+    let edited = MigrationSource::from_embedded([
+        ("0001_a", "CREATE TABLE a (id INT);", None),
+        ("0002_b", "CREATE TABLE b (id INT);", None),
+        ("0003_c", "CREATE TABLE c (id BIGINT);", None),
+    ])
+    .unwrap();
+    let err = migrate::run(&mut client, &edited, &config)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("migration '0003_c' has been modified since it was applied"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        !table_exists(&client, "b").await,
+        "0002_b ran despite the drift"
+    );
+
+    let statuses = migrate::status(&client, &edited, &config).await.unwrap();
+    let drifted: Vec<_> = statuses
+        .iter()
+        .map(|s| (s.name.as_str(), s.drifted))
+        .collect();
+    assert_eq!(
+        drifted,
+        [("0001_a", false), ("0002_b", false), ("0003_c", true)]
+    );
+}
+
 /// With `fail_on_drift = false` drift is only a warning: pending
 /// migrations still apply, and `status` still flags the edited one.
 #[tokio::test]
