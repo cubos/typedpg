@@ -318,6 +318,35 @@ fn aggregate_in_where_rejected() {
 }
 
 #[test]
+fn call_no_aggregate_matches_is_a_missing_function_not_a_misplaced_aggregate() {
+    let db = setup();
+    // `max()` names aggregates, but none takes no argument: PG resolves the
+    // call first and fails it as a missing function, before any placement
+    // rule could apply.
+    for sql in [
+        "INSERT INTO users (id, name) VALUES (max(), 'n')",
+        "SELECT id FROM users WHERE max() > 0",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::UndefinedFunction(_),
+            "function max() does not exist"
+        );
+    }
+    // count(*) and an ordered-set aggregate still count as aggregates.
+    for sql in [
+        "SELECT id FROM users WHERE count(*) > 0",
+        "SELECT id FROM users WHERE percentile_cont(0.5) WITHIN GROUP (ORDER BY age) > 0",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::GroupingError(_),
+            "aggregate functions are not allowed in WHERE"
+        );
+    }
+}
+
+#[test]
 fn aggregate_in_group_by_rejected() {
     let db = setup();
     // PG: `aggregate functions are not allowed in GROUP BY`.
