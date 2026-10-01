@@ -1050,24 +1050,137 @@ fn validate_inet(content: &str, is_cidr: bool) -> Result<(), String> {
     crate::network_input::validate(content, is_cidr)
 }
 
-/// Mirrors `macaddr_in` / `macaddr8_in` (mac.c / mac8.c) loosely: hex digits
-/// in groups separated by `:`, `-` or `.`; 12 digits total for macaddr, 12
-/// or 16 for macaddr8 (6-byte MACs expand via FF:FE). Separator *placement*
-/// is not modeled (PG's fixed sscanf formats are stricter) — accept-leaning.
+/// One `%x` / `%2x` conversion of glibc's `sscanf` at `*pos`: leading
+/// whitespace (not counted in the width), then — within `width` characters
+/// — an optional sign, an optional `0x` prefix (when a hex digit follows)
+/// and at least one hex digit. Returns the value (negative for `-`,
+/// saturated far out of the octet range on overflow).
+fn scanf_hex(b: &[u8], pos: &mut usize, width: Option<usize>) -> Option<i64> {
+    let mut p = *pos;
+    while p < b.len() && c_isspace(b[p]) {
+        p += 1;
+    }
+    let limit = width.map_or(b.len(), |w| (p + w).min(b.len()));
+    let negative = b.get(p) == Some(&b'-');
+    if p < limit && matches!(b[p], b'+' | b'-') {
+        p += 1;
+    }
+    if p + 2 < limit
+        && b[p] == b'0'
+        && matches!(b[p + 1], b'x' | b'X')
+        && b[p + 2].is_ascii_hexdigit()
+    {
+        p += 2;
+    }
+    let digits = p;
+    let mut value: i64 = 0;
+    while p < limit && b[p].is_ascii_hexdigit() {
+        value = (value * 16 + i64::from((b[p] as char).to_digit(16).unwrap_or(0))).min(1 << 40);
+        p += 1;
+    }
+    if p == digits {
+        return None;
+    }
+    *pos = p;
+    Some(if negative { -value } else { value })
+}
+
+/// Run one of `macaddr_in`'s `sscanf` formats — six `%x` (or `%2x`) octets
+/// with the separators in `seps` (`0` for none) after the given octets —
+/// and its `%1s` junk check. The octets when all six convert and nothing
+/// but whitespace follows.
+fn scanf_mac(b: &[u8], width: Option<usize>, seps: [u8; 5]) -> Option<[i64; 6]> {
+    let mut pos = 0;
+    let mut octets = [0i64; 6];
+    for (i, octet) in octets.iter_mut().enumerate() {
+        if i > 0 && seps[i - 1] != 0 {
+            if b.get(pos) != Some(&seps[i - 1]) {
+                return None;
+            }
+            pos += 1;
+        }
+        *octet = scanf_hex(b, &mut pos, width)?;
+    }
+    b[pos..].iter().all(|&c| c_isspace(c)).then_some(octets)
+}
+
+/// Mirrors `macaddr_in` (mac.c): the first of its seven `sscanf` formats
+/// that converts all six octets with no trailing junk — `%x` with `:` or
+/// `-` between every octet, then `%2x` grouped as `xxxxxx:xxxxxx`,
+/// `xxxxxx-xxxxxx`, `xxxx.xxxx.xxxx`, `xxxx-xxxx-xxxx`, `xxxxxxxxxxxx` —
+/// with `sscanf`'s leniency (whitespace and a sign before each number, so
+/// `'2024-01-01'` reads as 20:24:00:01:00:01); then every octet in 0..=255.
+/// `macaddr8` is `macaddr8_in`'s hand-written parser.
 fn validate_macaddr(content: &str, is_mac8: bool) -> Result<(), String> {
-    let name = if is_mac8 { "macaddr8" } else { "macaddr" };
-    let err = || format!("invalid input syntax for type {name}: \"{content}\"");
-    let s = content.trim_matches(|c: char| c.is_ascii_whitespace());
-    let mut ndigits = 0usize;
-    for c in s.chars() {
-        if c.is_ascii_hexdigit() {
-            ndigits += 1;
-        } else if !matches!(c, ':' | '-' | '.') {
+    if is_mac8 {
+        return validate_macaddr8(content);
+    }
+    let b = content.as_bytes();
+    let formats: [(Option<usize>, [u8; 5]); 7] = [
+        (None, [b':'; 5]),
+        (None, [b'-'; 5]),
+        (Some(2), [0, 0, b':', 0, 0]),
+        (Some(2), [0, 0, b'-', 0, 0]),
+        (Some(2), [0, b'.', 0, b'.', 0]),
+        (Some(2), [0, b'-', 0, b'-', 0]),
+        (Some(2), [0; 5]),
+    ];
+    let Some(octets) = formats
+        .iter()
+        .find_map(|&(width, seps)| scanf_mac(b, width, seps))
+    else {
+        return Err(format!(
+            "invalid input syntax for type macaddr: \"{content}\""
+        ));
+    };
+    if octets.iter().any(|o| !(0..=255).contains(o)) {
+        return Err(format!(
+            "invalid octet value in \"macaddr\" value: \"{content}\""
+        ));
+    }
+    Ok(())
+}
+
+/// Mirrors `macaddr8_in` (mac8.c): leading whitespace, then bytes of two
+/// hex digits, each optionally followed by a separator (`:`, `-` or `.`,
+/// the same one throughout), until fewer than two characters remain —
+/// whitespace allowed only right after the 6th or 8th byte, and then only
+/// whitespace; 6 or 8 bytes in all.
+fn validate_macaddr8(content: &str) -> Result<(), String> {
+    let err = || format!("invalid input syntax for type macaddr8: \"{content}\"");
+    let b = content.as_bytes();
+    let mut p = 0;
+    while p < b.len() && c_isspace(b[p]) {
+        p += 1;
+    }
+    let mut count = 0;
+    let mut spacer = 0u8;
+    while p + 1 < b.len() {
+        count += 1;
+        if count > 8 || !b[p].is_ascii_hexdigit() || !b[p + 1].is_ascii_hexdigit() {
             return Err(err());
         }
+        p += 2;
+        if let Some(&sep @ (b':' | b'-' | b'.')) = b.get(p) {
+            if spacer == 0 {
+                spacer = sep;
+            } else if spacer != sep {
+                return Err(err());
+            }
+            p += 1;
+        }
+        if (count == 6 || count == 8) && b.get(p).is_some_and(|&c| c_isspace(c)) {
+            if b[p..].iter().any(|&c| !c_isspace(c)) {
+                return Err(err());
+            }
+            p = b.len();
+        }
     }
-    let ok = ndigits == 12 || (is_mac8 && ndigits == 16);
-    if ok { Ok(()) } else { Err(err()) }
+    if count == 6 || count == 8 {
+        Ok(())
+    } else {
+        Err(err())
+    }
 }
 
 // ─── geometric types ────────────────────────────────────────────────────────
@@ -1960,6 +2073,48 @@ mod tests {
         }
         assert!(validate_macaddr("aa:bb:cc:dd:ee:ff:00:11", true).is_ok());
         assert!(validate_macaddr("aa:bb:cc:dd:ee:ff", true).is_ok());
+        // sscanf's `%x` takes whitespace and a sign before each number:
+        // PG 18 reads '2024-01-01' as 20:24:00:01:00:01 (`%2x` six times).
+        for ok in [
+            "2024-01-01",
+            "8:0:2b:1:2:3",
+            "8: 0:2b:1:2:3",
+            "8:0:2b:1:2:-0",
+        ] {
+            assert!(
+                validate_macaddr(ok, false).is_ok(),
+                "{ok:?} should be valid"
+            );
+        }
+        for bad in ["08:00-2b:01:02:03", "0800:2b01:0203", "08:00:2b:01:02:03 x"] {
+            assert!(
+                validate_macaddr(bad, false).is_err(),
+                "{bad:?} should be invalid"
+            );
+        }
+        assert_eq!(
+            validate_macaddr("8:0:2b:1:2:100", false).unwrap_err(),
+            "invalid octet value in \"macaddr\" value: \"8:0:2b:1:2:100\""
+        );
+        // macaddr8_in: pairs of hex digits, one separator kind throughout.
+        for ok in [
+            "08002b0102030405",
+            "08:00:2b:01:02:03:04:05",
+            "08002b0102031",
+        ] {
+            assert!(validate_macaddr(ok, true).is_ok(), "{ok:?} should be valid");
+        }
+        for bad in [
+            "08:00-2b:01:02:03",
+            "08002b 010203",
+            "8:0:2b:1:2:3",
+            "08002b01020",
+        ] {
+            assert!(
+                validate_macaddr(bad, true).is_err(),
+                "{bad:?} should be invalid"
+            );
+        }
     }
 
     #[test]
