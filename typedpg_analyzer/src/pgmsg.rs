@@ -30,9 +30,14 @@ pub(crate) fn invalid_input_syntax_for_type(type_msg_name: &str, content: &str) 
     format!("invalid input syntax for type {type_msg_name}: \"{content}\"")
 }
 
+/// PG's hint on `operator does not exist` (`op_error`).
+pub(crate) const NO_OPERATOR_MATCHES_HINT: &str = "No operator matches the given name and \
+                                                   argument types. You might need to add \
+                                                   explicit type casts.";
+
 /// `operator does not exist: <left> <op> <right>` — SQLSTATE 42883
-/// (`undefined_function`). `left`/`right` are PG-rendered type names
-/// (`format_type_for_message`).
+/// (`undefined_function`), with PG's hint. `left`/`right` are PG-rendered
+/// type names (`format_type_for_message`).
 pub(crate) fn operator_does_not_exist(
     left: &str,
     op: &str,
@@ -42,7 +47,7 @@ pub(crate) fn operator_does_not_exist(
     RawError::undefined_operator(
         format!("operator does not exist: {left} {op} {right}"),
         span,
-        None,
+        Some(NO_OPERATOR_MATCHES_HINT.to_owned()),
     )
 }
 
@@ -80,7 +85,11 @@ pub(crate) fn prefix_operator_does_not_exist(
     right: &str,
     span: Option<SourceSpan>,
 ) -> RawError {
-    RawError::undefined_operator(format!("operator does not exist: {op} {right}"), span, None)
+    RawError::undefined_operator(
+        format!("operator does not exist: {op} {right}"),
+        span,
+        Some(NO_OPERATOR_MATCHES_HINT.to_owned()),
+    )
 }
 
 /// `operator is not unique: <op> <right>` — SQLSTATE 42725, prefix form.

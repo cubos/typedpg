@@ -128,9 +128,17 @@ pub(crate) fn infer_sublink(
                     {
                         let left_pg = crate::ddl::util::format_type_for_message(snapshot, l_oid);
                         let right_pg = crate::ddl::util::format_type_for_message(snapshot, r_oid);
-                        return Err(AnalyzeError::UndefinedOperator(format!(
-                            "operator does not exist: {left_pg} {op_name} {right_pg}"
-                        )));
+                        // PG positions it at the sublink's operator (`IN`,
+                        // `= ANY`, the row comparison's `=`).
+                        let span = crate::error::SourceSpan::from_node_token(sub.location)
+                            .or_else(|| crate::error::SourceSpan::from_location(sub.location));
+                        let err = crate::pgmsg::operator_does_not_exist(
+                            &left_pg, &op_name, &right_pg, span,
+                        );
+                        return Err(crate::expr::operators::with_cast_note(
+                            err, snapshot, &op_name, l_oid, r_oid,
+                        )
+                        .finalize_implicit());
                     }
                 }
             }

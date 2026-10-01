@@ -1460,7 +1460,7 @@ mod func_call;
 mod indirection;
 mod json;
 mod literals;
-mod operators;
+pub(crate) mod operators;
 mod sublink;
 mod xml;
 

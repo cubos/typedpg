@@ -534,10 +534,13 @@ fn handle_any_all(
                 None => {
                     let l = crate::ddl::util::format_type_for_message(snapshot, left_oid);
                     let r = crate::ddl::util::format_type_for_message(snapshot, elem_oid);
-                    return Err(
-                        crate::pgmsg::operator_does_not_exist(&l, &op_name, &r, None)
-                            .finalize_implicit(),
-                    );
+                    // PG positions it at the operator, as for a plain one.
+                    let span = (expr.location >= 0).then(|| {
+                        crate::error::SourceSpan::at_length(expr.location as usize, op_name.len())
+                    });
+                    let err = crate::pgmsg::operator_does_not_exist(&l, &op_name, &r, span);
+                    return Err(with_cast_note(err, snapshot, &op_name, left_oid, elem_oid)
+                        .finalize_implicit());
                 }
             }
         }
@@ -885,15 +888,57 @@ fn infer_generic_binary_op(
     let span = (expr.location >= 0)
         .then(|| crate::error::SourceSpan::at_length(expr.location as usize, op_name.len()));
     let err = match left_oid_resolved {
-        Some(l) => crate::pgmsg::operator_does_not_exist(
-            &crate::ddl::util::format_type_for_message(snapshot, l),
+        Some(l) => with_cast_note(
+            crate::pgmsg::operator_does_not_exist(
+                &crate::ddl::util::format_type_for_message(snapshot, l),
+                op_name,
+                &right_pg,
+                span,
+            ),
+            snapshot,
             op_name,
-            &right_pg,
-            span,
+            l,
+            right_oid_resolved,
         ),
         None => crate::pgmsg::prefix_operator_does_not_exist(op_name, &right_pg, span),
     };
     Err(err.finalize_implicit())
+}
+
+/// Add to an `operator does not exist: L op R` error the cast that makes
+/// it resolve, when there is one: an `op` taking two `L`s, the right
+/// operand castable to `L` (or the mirror image) — `name = 1::bigint` gets
+/// "`text = text` exists: cast the right operand to text (`expr::text`)".
+/// A cast either side is offered only when its operator exists, so the
+/// note never sends the user to another `operator does not exist`.
+pub(crate) fn with_cast_note(
+    err: crate::error::RawError,
+    snapshot: &PgCatalog,
+    op_name: &str,
+    left: crate::oid::PgTypeOid,
+    right: crate::oid::PgTypeOid,
+) -> crate::error::RawError {
+    use crate::coerce::{CoercionContext, coercion_pathway};
+    if left == oid::UNKNOWN || right == oid::UNKNOWN {
+        return err;
+    }
+    let castable = |target, source| {
+        coercion_pathway(target, source, CoercionContext::Explicit, snapshot).is_some()
+            && snapshot
+                .find_operator(op_name, Some(target), target)
+                .is_some()
+    };
+    let (side, target) = if castable(left, right) {
+        ("right", left)
+    } else if castable(right, left) {
+        ("left", right)
+    } else {
+        return err;
+    };
+    let t = crate::ddl::util::format_type_for_message(snapshot, target);
+    err.with_note(format!(
+        "`{t} {op_name} {t}` exists: cast the {side} operand to {t} (`expr::{t}`)"
+    ))
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

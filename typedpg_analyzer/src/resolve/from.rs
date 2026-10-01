@@ -778,9 +778,12 @@ fn merge_using_columns(
                 .find_operator("=", Some(l.type_oid), r.type_oid)
                 .is_none()
         {
-            return Err(
-                crate::pgmsg::operator_does_not_exist(&lt, "=", &rt, None).finalize_implicit()
-            );
+            // PG gives this one no position.
+            let err = crate::pgmsg::operator_does_not_exist(&lt, "=", &rt, None);
+            return Err(crate::expr::operators::with_cast_note(
+                err, snapshot, "=", l.type_oid, r.type_oid,
+            )
+            .finalize_implicit());
         }
         let type_oid = if l.type_oid == r.type_oid {
             l.type_oid

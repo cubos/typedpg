@@ -438,7 +438,16 @@ fn in_subquery_with_incompatible_types_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT id FROM posts WHERE user_id IN (SELECT title FROM posts)"),
         AnalyzeError::UndefinedOperator(_),
-        "operator does not exist: bigint = text",
+        concat!(
+            "operator does not exist: bigint = text\n",
+            "  ╭────\n",
+            "1 │ SELECT id FROM posts WHERE user_id IN (SELECT title FROM posts)\n",
+            "  ·                                    ─┬\n",
+            "  ·                                     ╰─ operator does not exist\n",
+            "  ╰────\n",
+            "  help: No operator matches the given name and argument types. You might need to add explicit type casts.\n",
+            "  note: `bigint = bigint` exists: cast the right operand to bigint (`expr::bigint`)\n",
+        ),
     );
 }
 
