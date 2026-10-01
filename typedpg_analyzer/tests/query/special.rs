@@ -640,11 +640,48 @@ fn syntax_error_message_matches_pg_verbatim() {
     // *start with* PG's verbatim text, so the analyzer must strip that wrapper.
     // PG: `syntax error at or near "true"` — `EXTRACT(<expr> FROM …)` only
     // accepts an identifier/string field, so a boolean literal is a syntax error.
+    // The caret underlines the token PG names, at the position it reports.
     let db = setup();
     assert_analyze_err!(
         db.analyze("SELECT extract(true FROM age) FROM users"),
         AnalyzeError::Parse(_),
-        "syntax error at or near \"true\"",
+        "\
+syntax error at or near \"true\"
+  ╭────
+1 │ SELECT extract(true FROM age) FROM users
+  ·                ────
+  ╰────
+",
+    );
+}
+
+#[test]
+fn syntax_error_points_at_its_position() {
+    // The position is mapped back through the lexer's `$name` rewrite, onto
+    // the line the user wrote it on.
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("SELECT id, name\nFROM users\nWHERE id = $id AND = 1"),
+        AnalyzeError::Parse(_),
+        "\
+syntax error at or near \"=\"
+  ╭────
+3 │ WHERE id = $id AND = 1
+  ·                    ─
+  ╰────
+",
+    );
+    // `at end of input` points just past the last character.
+    assert_analyze_err!(
+        db.analyze("SELECT id FROM users WHERE"),
+        AnalyzeError::Parse(_),
+        "\
+syntax error at end of input
+  ╭────
+1 │ SELECT id FROM users WHERE
+  ·                           ─
+  ╰────
+",
     );
 }
 

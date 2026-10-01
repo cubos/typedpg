@@ -246,7 +246,9 @@ fn span_to_position(span: SourceSpan, sql: &str) -> Option<Position> {
         .position(|&b| b == b'\n')
         .map(|p| line_start + p)
         .unwrap_or(bytes.len());
-    let end_on_line = end.min(line_end);
+    // At least one column wide: a span at the end of a line (`syntax error
+    // at end of input`) still gets its marker, just past the last character.
+    let end_on_line = end.min(line_end).max(start + 1);
 
     Some(Position {
         line,

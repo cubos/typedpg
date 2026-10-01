@@ -208,17 +208,21 @@ pub(crate) fn fuse(
 ///
 /// `param_nullability` seeds explicit `$foo?`/`$foo!` annotations indexed by
 /// 1-based positional parameter index minus one.
-/// Extract the PG-verbatim message from a `typedpg_pg_query` parse failure.
+/// Turn a `typedpg_pg_query` parse failure into the analyzer's error.
 ///
 /// `typedpg_pg_query::Error::Parse`'s `Display` prepends `"Invalid statement: "` to the
 /// server-side wording (`syntax error at or near "x"`). The error-message
 /// contract requires our message to *start with* PG's verbatim text, so for the
-/// `Parse` variant we return the inner string unwrapped; other variants keep
-/// their full `Display`.
-fn parse_error_message(e: &typedpg_pg_query::Error) -> String {
+/// `Parse` variant we take the inner message unwrapped — with its position,
+/// for the caret — while other variants keep their full `Display`.
+pub(crate) fn parse_failure(e: typedpg_pg_query::Error, sql: &str) -> crate::error::RawError {
     match e {
-        typedpg_pg_query::Error::Parse(msg) => msg.clone(),
-        other => other.to_string(),
+        typedpg_pg_query::Error::Parse { message, position } => {
+            let span =
+                position.map(|p| crate::error::SourceSpan::syntax_error_at(sql, p, &message));
+            crate::pgmsg::grammar_error(message, span)
+        }
+        other => crate::pgmsg::grammar_error(other.to_string(), None),
     }
 }
 
@@ -227,8 +231,8 @@ pub(crate) fn analyze_static(
     sql: &str,
     param_nullability: &[Option<bool>],
 ) -> Result<(Vec<AnalyzedColumn>, Vec<ParamInfo>, bool), AnalyzeError> {
-    let parsed = typedpg_pg_query::parse(sql)
-        .map_err(|e| crate::pgmsg::grammar_error(parse_error_message(&e)))?;
+    let parsed =
+        typedpg_pg_query::parse(sql).map_err(|e| parse_failure(e, sql).finalize_implicit())?;
 
     let stmt = parsed
         .protobuf

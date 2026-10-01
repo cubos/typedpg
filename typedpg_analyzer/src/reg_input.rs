@@ -279,7 +279,7 @@ fn regtype_in(content: &str, snapshot: &PgCatalog) -> Result<(), String> {
     // The grammar's type-name mode decides whether the text is a lone type
     // name (and words its syntax errors) ...
     typedpg_pg_query::parse_type_name(content).map_err(|e| match e {
-        typedpg_pg_query::Error::Parse(msg) => msg,
+        typedpg_pg_query::Error::Parse { message, .. } => message,
         other => other.to_string(),
     })?;
     // ... but libpg_query's tree output for that mode drops the TypeName's

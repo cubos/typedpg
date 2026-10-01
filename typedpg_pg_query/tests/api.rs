@@ -21,7 +21,30 @@ fn parse_errors_carry_the_server_message() {
     let err = typedpg_pg_query::parse("SELECT FROM WHERE").unwrap_err();
     assert_eq!(
         err,
-        typedpg_pg_query::Error::Parse("syntax error at or near \"WHERE\"".into())
+        typedpg_pg_query::Error::Parse {
+            message: "syntax error at or near \"WHERE\"".into(),
+            position: Some(12),
+        }
+    );
+    // The position is a byte offset, though PG counts characters.
+    let err = typedpg_pg_query::parse("SELECT 'é' FROM WHERE").unwrap_err();
+    assert!(
+        matches!(
+            err,
+            typedpg_pg_query::Error::Parse {
+                position: Some(17),
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    let err = typedpg_pg_query::parse("SELECT 1 +").unwrap_err();
+    assert_eq!(
+        err,
+        typedpg_pg_query::Error::Parse {
+            message: "syntax error at end of input".into(),
+            position: Some(10),
+        }
     );
     assert!(matches!(
         typedpg_pg_query::parse("SELECT '\0'"),
@@ -125,7 +148,9 @@ fn plpgsql_functions_without_a_string_body_are_errors_not_aborts() {
         ),
     ] {
         match typedpg_pg_query::parse_plpgsql(sql) {
-            Err(typedpg_pg_query::Error::Parse(msg)) => assert_eq!(msg, message, "{sql}"),
+            Err(typedpg_pg_query::Error::Parse { message: msg, .. }) => {
+                assert_eq!(msg, message, "{sql}")
+            }
             other => panic!("{sql}: {other:?}"),
         }
     }
