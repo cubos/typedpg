@@ -39,7 +39,7 @@ pub(crate) fn validate(typname: &str, content: &str, snapshot: &PgCatalog) -> Re
         "regprocedure" | "regoperator" => name_and_arg_types(content).map(|_| ()),
         _ => {
             let names = qualified_name_list(content)?;
-            lookup_by_names(typname, &names, snapshot)
+            lookup_by_names(typname, content, &names, snapshot)
         }
     }
 }
@@ -142,7 +142,13 @@ fn is_system_schema(schema: &str) -> bool {
         || schema.starts_with("pg_temp")
 }
 
-fn lookup_by_names(typname: &str, names: &[String], snapshot: &PgCatalog) -> Result<(), String> {
+/// Look `names` (split from the input `content`) up as a `typname` value.
+fn lookup_by_names(
+    typname: &str,
+    content: &str,
+    names: &[String],
+    snapshot: &PgCatalog,
+) -> Result<(), String> {
     match typname {
         "regclass" => {
             // makeRangeVarFromNameList + RangeVarGetRelid(missing_ok).
@@ -178,7 +184,7 @@ fn lookup_by_names(typname: &str, names: &[String], snapshot: &PgCatalog) -> Res
             // OpernameGetCandidates with a missing schema allowed.
             let (schema, name) = deconstruct(names)?;
             if schema.is_some_and(|s| snapshot.namespace_oid(s).is_none()) {
-                return Err(not_found(typname, names));
+                return Err(not_found(typname, content));
             }
             let count = if typname == "regproc" {
                 snapshot.find_functions(schema, name).len()
@@ -191,13 +197,12 @@ fn lookup_by_names(typname: &str, names: &[String], snapshot: &PgCatalog) -> Res
                     .count()
             };
             match count {
-                0 => Err(not_found(typname, names)),
+                0 => Err(not_found(typname, content)),
                 1 => Ok(()),
-                _ if typname == "regproc" => Err(format!(
-                    "more than one function named \"{}\"",
-                    joined(names)
-                )),
-                _ => Err(format!("more than one operator named {}", joined(names))),
+                _ if typname == "regproc" => {
+                    Err(format!("more than one function named \"{content}\""))
+                }
+                _ => Err(format!("more than one operator named {content}")),
             }
         }
         "regnamespace" | "regrole" => {
@@ -246,11 +251,13 @@ fn lookup_by_names(typname: &str, names: &[String], snapshot: &PgCatalog) -> Res
     }
 }
 
-fn not_found(typname: &str, names: &[String]) -> String {
+/// regprocin's / regoperin's lookup failure, which names the input as
+/// written (`' EMPTY '`), not the identifier it split into.
+fn not_found(typname: &str, content: &str) -> String {
     if typname == "regproc" {
-        format!("function \"{}\" does not exist", joined(names))
+        format!("function \"{content}\" does not exist")
     } else {
-        format!("operator does not exist: {}", joined(names))
+        format!("operator does not exist: {content}")
     }
 }
 
@@ -276,6 +283,14 @@ fn deconstruct(names: &[String]) -> Result<(Option<&str>, &str), String> {
 /// existing type with a valid modifier.
 fn regtype_in(content: &str, snapshot: &PgCatalog) -> Result<(), String> {
     use typedpg_pg_query::protobuf::node;
+    // typeStringToTypeName fails an empty / all-whitespace value before
+    // the grammar sees it.
+    if content
+        .chars()
+        .all(|c| matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0c' | '\x0b'))
+    {
+        return Err(format!("invalid type name \"{content}\""));
+    }
     // The grammar's type-name mode decides whether the text is a lone type
     // name (and words its syntax errors) ...
     typedpg_pg_query::parse_type_name(content).map_err(|e| match e {
