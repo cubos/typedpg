@@ -135,6 +135,22 @@ async fn status_shows_applied_and_pending() {
     assert!(statuses[1].applied_at.is_none());
 }
 
+/// `status` is read-only: on a database that never ran a migration it
+/// reports everything pending without creating the tracking table.
+#[tokio::test]
+async fn status_does_not_create_the_tracking_table() {
+    let (client, _db) = fresh_db().await;
+    let dir = tempfile::tempdir().unwrap();
+    create_test_migrations(dir.path());
+    let source = MigrationSource::from_dir(dir.path()).unwrap();
+
+    let statuses = migrate::status(&client, &source, &MigrationsConfig::default())
+        .await
+        .unwrap();
+    assert!(statuses.iter().all(|s| !s.applied));
+    assert!(!table_exists(&client, "public._migrations").await);
+}
+
 #[tokio::test]
 async fn revert_with_down_sql() {
     let (mut client, _db) = fresh_db().await;
