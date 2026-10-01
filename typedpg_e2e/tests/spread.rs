@@ -11,15 +11,16 @@ struct NewUser {
 #[tokio::test]
 async fn spread_inserts_every_row_with_its_fields() {
     let pool = common::setup().await;
+    let tag = common::unique("spread");
     let users = [
         NewUser {
             name: "Ann".into(),
-            email: "spread-ann@example.com".into(),
+            email: format!("{tag}-ann@example.com"),
             age: Some(31),
         },
         NewUser {
             name: "Ben".into(),
-            email: "spread-ben@example.com".into(),
+            email: format!("{tag}-ben@example.com"),
             age: None,
         },
     ];
@@ -32,7 +33,7 @@ async fn spread_inserts_every_row_with_its_fields() {
     .expect("insert");
     assert_eq!(inserted, 2);
 
-    let prefix = "spread-%";
+    let prefix = format!("{tag}-%");
     let rows = sql!(
         &pool,
         "SELECT name, age FROM users WHERE email LIKE $prefix ORDER BY name"
@@ -49,7 +50,7 @@ async fn spread_with_regular_params_and_returning() {
     let pool = common::setup().await;
     let users = [NewUser {
         name: "Cid".into(),
-        email: "spread-cid@example.com".into(),
+        email: format!("{}@example.com", common::unique("spread-cid")),
         age: None,
     }];
     let age = 40;

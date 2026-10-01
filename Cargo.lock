@@ -3071,18 +3071,17 @@ dependencies = [
  "deadpool-postgres",
  "futures-core",
  "futures-util",
- "libc",
  "md5",
  "rust_decimal",
  "serde",
  "serde_json",
  "tempfile",
- "testcontainers",
  "thiserror",
  "tokio",
  "tokio-postgres",
  "typedpg_core",
  "typedpg_macros",
+ "typedpg_test_support",
  "uuid",
 ]
 
@@ -3145,16 +3144,15 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "deadpool-postgres",
- "libc",
  "pgvector",
  "rust_decimal",
  "serde",
  "serde_json",
- "testcontainers",
  "tokio",
  "tokio-postgres",
  "typedpg",
  "typedpg_core",
+ "typedpg_test_support",
  "uuid",
 ]
 
@@ -3214,6 +3212,15 @@ dependencies = [
  "serde_json",
  "testcontainers",
  "typedpg_analyzer",
+]
+
+[[package]]
+name = "typedpg_test_support"
+version = "0.0.0"
+dependencies = [
+ "libc",
+ "tokio",
+ "tokio-postgres",
 ]
 
 [[package]]
