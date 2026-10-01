@@ -39,6 +39,8 @@ pub(crate) enum ClauseKind {
     Offset,
     /// A searched CASE's WHEN condition.
     CaseWhen,
+    /// A MERGE `WHEN [NOT] MATCHED AND condition` (EXPR_KIND_MERGE_WHEN).
+    MergeWhen,
     /// One operand of NOT / AND / OR (PG names the operator in the message).
     Not,
     And,
@@ -63,6 +65,7 @@ impl ClauseKind {
             ClauseKind::Limit => "LIMIT",
             ClauseKind::Offset => "OFFSET",
             ClauseKind::CaseWhen => "CASE/WHEN",
+            ClauseKind::MergeWhen => "WHEN",
             ClauseKind::Not => "NOT",
             ClauseKind::And => "AND",
             ClauseKind::Or => "OR",
@@ -91,6 +94,7 @@ impl ClauseKind {
             ClauseKind::Where => Some("WHERE"),
             // PG's ParseExprKindName for EXPR_KIND_JOIN_ON.
             ClauseKind::JoinOn => Some("JOIN conditions"),
+            ClauseKind::MergeWhen => Some("MERGE WHEN conditions"),
             ClauseKind::Limit => Some("LIMIT"),
             ClauseKind::Offset => Some("OFFSET"),
             ClauseKind::FrameOffset("ROWS") => Some("window ROWS"),
@@ -117,6 +121,7 @@ impl ClauseKind {
             ClauseKind::Where
                 | ClauseKind::Having
                 | ClauseKind::JoinOn
+                | ClauseKind::MergeWhen
                 | ClauseKind::Limit
                 | ClauseKind::Offset
                 | ClauseKind::FrameOffset(_)

@@ -13,6 +13,26 @@ fn setup() -> PgCatalog {
     db
 }
 
+// ── Conditions ───────────────────────────────────────────────────────────────
+
+#[test]
+fn conditions_name_their_clause_when_not_boolean() {
+    // transformMergeStmt coerces each `WHEN … AND condition` as WHEN.
+    let db = setup();
+    assert_err_prefix!(
+        db.analyze("MERGE INTO t USING s ON t.id = s.id WHEN MATCHED AND 93 THEN DO NOTHING"),
+        AnalyzeError::DatatypeMismatch(_),
+        "argument of WHEN must be type boolean, not type integer"
+    );
+    assert_err_prefix!(
+        db.analyze(
+            "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED AND count(*) > 0 THEN DO NOTHING"
+        ),
+        AnalyzeError::GroupingError(_),
+        "aggregate functions are not allowed in MERGE WHEN conditions"
+    );
+}
+
 // ── WHEN-clause visibility (PG's setNamespaceForMergeWhen) ───────────────────
 
 #[test]

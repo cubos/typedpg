@@ -307,11 +307,13 @@ fn walk_merge_when_clause(
     table_relname: &str,
 ) -> Result<(), AnalyzeError> {
     if let Some(condition) = &when.condition {
-        expr::infer_expr(condition, ctx, params, TypeGoal::assignment(oid::BOOL))?;
-        crate::clause::check_no_aggregates_or_windows(
+        // transformMergeStmt: transformWhereClause(…, EXPR_KIND_MERGE_WHEN,
+        // "WHEN").
+        crate::clause::coerce_clause_expr(
             condition,
-            ctx.snapshot,
-            "MERGE WHEN conditions",
+            ctx,
+            params,
+            crate::clause::ClauseKind::MergeWhen,
         )?;
         check_no_srf_in_clause(condition, ctx.snapshot, "MERGE WHEN conditions")?;
     }
