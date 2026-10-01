@@ -16,6 +16,11 @@ async fn fresh_db() -> (Client, String) {
     (server.connect(&db).await, db)
 }
 
+/// Another session on the same database.
+async fn second_session(db: &str) -> Client {
+    typedpg_test_support::server().connect(db).await
+}
+
 async fn table_exists(client: &Client, name: &str) -> bool {
     client
         .query_one("SELECT to_regclass($1) IS NOT NULL", &[&name])
@@ -240,6 +245,29 @@ async fn failed_migration_rolls_back_every_statement() {
     assert_eq!(recorded(&client, "public._migrations").await, [USERS]);
 }
 
+/// The advisory lock is released when a run fails, so the next runner
+/// (or another session) can take it.
+#[tokio::test]
+async fn lock_is_released_after_a_failed_run() {
+    let (mut client, db) = fresh_db().await;
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "0001_bad.sql", "THIS IS NOT VALID SQL;");
+    let source = MigrationSource::from_dir(dir.path()).unwrap();
+    let config = MigrationsConfig::default();
+
+    migrate::run(&mut client, &source, &config)
+        .await
+        .unwrap_err();
+
+    let other = second_session(&db).await;
+    let got: bool = other
+        .query_one("SELECT pg_try_advisory_lock($1)", &[&config.lock_id])
+        .await
+        .unwrap()
+        .get(0);
+    assert!(got, "the failed run kept the advisory lock");
+}
+
 #[tokio::test]
 async fn no_transaction_migration() {
     let (mut client, _db) = fresh_db().await;
@@ -285,4 +313,92 @@ async fn custom_table_name() {
         [USERS]
     );
     assert!(!table_exists(&client, "public._migrations").await);
+}
+
+/// With `fail_on_drift = false` drift is only a warning: pending
+/// migrations still apply, and `status` still flags the edited one.
+#[tokio::test]
+async fn drift_is_a_warning_without_fail_on_drift() {
+    let (mut client, _db) = fresh_db().await;
+    let config = MigrationsConfig {
+        fail_on_drift: false,
+        ..Default::default()
+    };
+    let first =
+        MigrationSource::from_embedded([("0001_a", "CREATE TABLE a (id INT);", None)]).unwrap();
+    migrate::run(&mut client, &first, &config).await.unwrap();
+
+    let edited = MigrationSource::from_embedded([
+        ("0001_a", "CREATE TABLE a (id INT); -- edited", None),
+        ("0002_b", "CREATE TABLE b (id INT);", None),
+    ])
+    .unwrap();
+    let applied = migrate::run(&mut client, &edited, &config).await.unwrap();
+    assert_eq!(applied, ["0002_b"]);
+
+    let statuses = migrate::status(&client, &edited, &config).await.unwrap();
+    assert!(statuses[0].applied && statuses[0].drifted);
+    assert!(statuses[1].applied && !statuses[1].drifted);
+}
+
+/// A source baked in with `embed_migrations!` runs like one read from disk.
+#[tokio::test]
+async fn embedded_source_runs() {
+    let (mut client, _db) = fresh_db().await;
+    let source = typedpg::embed_migrations!("tests/embedded_migrations");
+    let names: Vec<_> = source
+        .migrations()
+        .iter()
+        .map(|m| m.name.as_str())
+        .collect();
+    assert_eq!(names, ["0001_create_users", "0002_create_orders"]);
+
+    let applied = migrate::run(&mut client, &source, &MigrationsConfig::default())
+        .await
+        .unwrap();
+    assert_eq!(applied, names);
+    assert!(table_exists(&client, "orders").await);
+}
+
+/// A tracking table from before `sql_source` existed: its rows have no
+/// stored text, so they can never drift, and the column is added on the
+/// next run.
+#[tokio::test]
+async fn legacy_tracking_table_without_sql_source() {
+    let (mut client, _db) = fresh_db().await;
+    client
+        .batch_execute(
+            "CREATE TABLE public._migrations (
+                 name       TEXT PRIMARY KEY,
+                 applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+             );
+             CREATE TABLE a (id INT);
+             INSERT INTO public._migrations (name) VALUES ('0001_a');",
+        )
+        .await
+        .unwrap();
+    let source = MigrationSource::from_embedded([
+        ("0001_a", "CREATE TABLE a (id INT); -- not what ran", None),
+        ("0002_b", "CREATE TABLE b (id INT);", None),
+    ])
+    .unwrap();
+    let config = MigrationsConfig::default();
+
+    let statuses = migrate::status(&client, &source, &config).await.unwrap();
+    assert!(statuses[0].applied && !statuses[0].drifted);
+    assert!(!statuses[1].applied);
+
+    let applied = migrate::run(&mut client, &source, &config).await.unwrap();
+    assert_eq!(applied, ["0002_b"]);
+    let stored: Vec<Option<String>> = client
+        .query(
+            "SELECT sql_source FROM public._migrations ORDER BY name",
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(stored, [None, Some("CREATE TABLE b (id INT);".into())]);
 }
