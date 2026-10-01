@@ -102,31 +102,61 @@ async fn handle_migrate(action: MigrateAction) -> Result<(), Box<dyn std::error:
 
     let source = MigrationSource::from_dir(&migrations_dir)?;
 
-    let use_tls = database_url.contains("sslmode=require")
-        || database_url.contains("sslmode=prefer")
-        || database_url.contains("sslmode=verify");
+    let mut client = connect(&database_url).await?;
+    run_migrate_action(action, &mut client, &source, &config).await
+}
 
-    if use_tls {
-        let tls_connector = native_tls::TlsConnector::builder().build()?;
-        let tls = postgres_native_tls::MakeTlsConnector::new(tls_connector);
-        let (mut client, connection) = tokio_postgres::connect(&database_url, tls).await?;
-        tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                eprintln!("Database connection error: {e}");
+/// Connect honoring the URL's `sslmode` as libpq does: `disable` is plain,
+/// `require` is TLS or nothing, and `prefer` (the default) tries TLS and
+/// falls back to a plain connection when that attempt fails — for instance
+/// on a server with a self-signed certificate, which the TLS connector
+/// (verifying against the system roots) rejects.
+async fn connect(database_url: &str) -> Result<tokio_postgres::Client, Box<dyn std::error::Error>> {
+    use tokio_postgres::config::SslMode;
+
+    let config: tokio_postgres::Config = database_url
+        .parse()
+        .map_err(|e| format!("invalid DATABASE_URL: {e}"))?;
+    match config.get_ssl_mode() {
+        SslMode::Disable => connect_plain(&config).await,
+        SslMode::Require => connect_tls(&config).await,
+        _ => match connect_tls(&config).await {
+            Ok(client) => Ok(client),
+            Err(tls_err) => {
+                let mut plain = config.clone();
+                plain.ssl_mode(SslMode::Disable);
+                connect_plain(&plain)
+                    .await
+                    .map_err(|e| format!("{e} (after a TLS attempt failed: {tls_err})").into())
             }
-        });
-        return run_migrate_action(action, &mut client, &source, &config).await;
+        },
     }
+}
 
-    let (mut client, connection) =
-        tokio_postgres::connect(&database_url, tokio_postgres::NoTls).await?;
+async fn connect_tls(
+    config: &tokio_postgres::Config,
+) -> Result<tokio_postgres::Client, Box<dyn std::error::Error>> {
+    let tls_connector = native_tls::TlsConnector::builder().build()?;
+    let tls = postgres_native_tls::MakeTlsConnector::new(tls_connector);
+    let (client, connection) = config.connect(tls).await?;
     tokio::spawn(async move {
         if let Err(e) = connection.await {
             eprintln!("Database connection error: {e}");
         }
     });
+    Ok(client)
+}
 
-    run_migrate_action(action, &mut client, &source, &config).await
+async fn connect_plain(
+    config: &tokio_postgres::Config,
+) -> Result<tokio_postgres::Client, Box<dyn std::error::Error>> {
+    let (client, connection) = config.connect(tokio_postgres::NoTls).await?;
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("Database connection error: {e}");
+        }
+    });
+    Ok(client)
 }
 
 async fn run_migrate_action(

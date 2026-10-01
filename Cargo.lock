@@ -3113,10 +3113,12 @@ dependencies = [
  "dotenvy",
  "native-tls",
  "postgres-native-tls",
+ "tempfile",
  "tokio",
  "tokio-postgres",
  "typedpg",
  "typedpg_core",
+ "typedpg_test_support",
 ]
 
 [[package]]

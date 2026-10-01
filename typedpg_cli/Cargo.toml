@@ -26,3 +26,7 @@ postgres-native-tls = "0.5"
 native-tls = "0.2"
 chrono = "0.4"
 dotenvy = "0.15"
+
+[dev-dependencies]
+tempfile = "3"
+typedpg_test_support = { path = "../typedpg_test_support" }
