@@ -813,7 +813,13 @@ fn row_compare_mismatched_arity_is_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT ROW(1) = ROW(1, 2) AS e"),
         AnalyzeError::SyntaxError(_),
-        "unequal number of entries in row expressions",
+        concat!(
+            "unequal number of entries in row expressions\n",
+            "  ╭────\n",
+            "1 │ SELECT ROW(1) = ROW(1, 2) AS e\n",
+            "  ·               ─\n",
+            "  ╰────\n",
+        ),
     );
 }
 
@@ -995,7 +1001,13 @@ fn row_inside_subquery_in_where_arity_check() {
              WHERE ROW(u.id, u.name) = (SELECT ROW(u2.id, u2.name) FROM users u2 WHERE u2.id = u.id)",
         ),
         AnalyzeError::Invalid(_),
-        "subquery has too few columns (subquery has 1, lhs has 2)",
+        concat!(
+        "subquery has too few columns (subquery has 1, lhs has 2)\n",
+        "  ╭────\n",
+        "1 │ SELECT u.id FROM users u WHERE ROW(u.id, u.name) = (SELECT ROW(u2.id, u2.name) FROM users u2 WHERE u2.id = u.id)\n",
+        "  ·                                                  ─\n",
+        "  ╰────\n",
+    ),
     );
 }
 
@@ -1863,7 +1875,13 @@ fn star_on_unknown_alias_errors() {
     assert_analyze_err!(
         db.analyze("SELECT row_to_json(nope.*) FROM users u"),
         AnalyzeError::UndefinedTable(_),
-        "missing FROM-clause entry for table \"nope\"",
+        concat!(
+            "missing FROM-clause entry for table \"nope\"\n",
+            "  ╭────\n",
+            "1 │ SELECT row_to_json(nope.*) FROM users u\n",
+            "  ·                    ────\n",
+            "  ╰────\n",
+        ),
     );
 }
 

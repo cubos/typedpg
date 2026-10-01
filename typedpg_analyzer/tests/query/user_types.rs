@@ -90,7 +90,13 @@ fn star_expr_on_unknown_alias_fails() {
     assert_analyze_err!(
         db.analyze(sql),
         AnalyzeError::UndefinedTable(_),
-        "missing FROM-clause entry for table \"nope\"",
+        concat!(
+            "missing FROM-clause entry for table \"nope\"\n",
+            "  ╭────\n",
+            "1 │ SELECT row_to_json(nope.*) FROM users u\n",
+            "  ·                    ────\n",
+            "  ╰────\n",
+        ),
     );
 }
 

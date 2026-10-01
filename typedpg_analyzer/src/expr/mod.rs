@@ -661,6 +661,18 @@ pub(crate) fn infer_expr(
     params: &mut ParamCollector,
     goal: TypeGoal,
 ) -> Result<ExprType, AnalyzeError> {
+    // An error raised with no location points at the innermost expression
+    // being inferred when it was.
+    infer_expr_unlocated(node, ctx, params, goal)
+        .map_err(|e| crate::error::with_fallback_span(e, || crate::error::expr_span(node)))
+}
+
+fn infer_expr_unlocated(
+    node: &protobuf::Node,
+    ctx: Ctx<'_>,
+    params: &mut ParamCollector,
+    goal: TypeGoal,
+) -> Result<ExprType, AnalyzeError> {
     let Ctx { snapshot, .. } = ctx;
     let inner = node
         .node

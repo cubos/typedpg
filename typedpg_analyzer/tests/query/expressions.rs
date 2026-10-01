@@ -198,7 +198,13 @@ fn nullif_incompatible_concrete_types_rejected() {
     assert_analyze_err!(
         db.analyze("SELECT NULLIF(age, 'x'::text) FROM users"),
         AnalyzeError::UndefinedOperator(_),
-        "operator does not exist: integer = text (NULLIF types integer and text cannot be matched)",
+        concat!(
+            "operator does not exist: integer = text (NULLIF types integer and text cannot be matched)\n",
+            "  ╭────\n",
+            "1 │ SELECT NULLIF(age, 'x'::text) FROM users\n",
+            "  ·               ───\n",
+            "  ╰────\n",
+        ),
     );
 }
 

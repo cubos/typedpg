@@ -398,6 +398,85 @@ thread_local! {
     /// The diagnostic of the last error finalized under a capture-mode
     /// context.
     static CAPTURED: RefCell<Option<CapturedDiagnostic>> = const { RefCell::new(None) };
+    /// The last error rendered without a location: its diagnostic and the
+    /// text it rendered to, so [`with_fallback_span`] can recognize it and
+    /// render it again with one.
+    static LAST_UNLOCATED: RefCell<Option<(String, CapturedDiagnostic)>> =
+        const { RefCell::new(None) };
+}
+
+/// Give `err` the location `span()` when it has none.
+///
+/// Errors are rendered where they are raised, and many sites can't tell
+/// where in the SQL they are (a catalog rule checked deep in resolution).
+/// An outer caller that knows which expression it was analyzing — PG's
+/// errors mostly point at one — wraps the result: an error that came out
+/// with no location (one finalized without a span, or a variant built
+/// directly) is rendered again pointing at the expression; one that has a
+/// location is left alone, so the innermost caller's span wins.
+pub(crate) fn with_fallback_span(
+    err: AnalyzeError,
+    span: impl FnOnce() -> Option<SourceSpan>,
+) -> AnalyzeError {
+    with_diag_ctx(|ctx| {
+        let Some(ctx) = ctx else {
+            return err;
+        };
+        let rendered = err.to_string();
+        if ctx.capture {
+            // Locate the captured diagnostic, if it is this error's and
+            // has no location yet; an error built directly gets one.
+            CAPTURED.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                match slot.as_mut() {
+                    Some(c) if c.pg_message == rendered => {
+                        if c.primary.is_none() {
+                            c.primary = span().map(|s| DiagnosticLabel::new(s, ""));
+                        }
+                    }
+                    _ => {
+                        *slot = Some(CapturedDiagnostic {
+                            pg_message: rendered,
+                            primary: span().map(|s| DiagnosticLabel::new(s, "")),
+                            secondaries: Vec::new(),
+                            hint: None,
+                            notes: Vec::new(),
+                        });
+                    }
+                }
+            });
+            return err;
+        }
+        let stored = LAST_UNLOCATED.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .filter(|(text, _)| *text == rendered)
+                .map(|(_, diag)| diag.clone())
+        });
+        let diag = match stored {
+            Some(diag) => diag,
+            // Built directly, never rendered: a bare message.
+            None if !rendered.contains('\n') => CapturedDiagnostic {
+                pg_message: rendered,
+                primary: None,
+                secondaries: Vec::new(),
+                hint: None,
+                notes: Vec::new(),
+            },
+            None => return err,
+        };
+        let Some(span) = span() else {
+            return err;
+        };
+        let raw = RawError {
+            kind: replace_message(err, diag.pg_message.clone()),
+            primary: Some(DiagnosticLabel::new(span, "")),
+            secondaries: diag.secondaries,
+            hint: diag.hint,
+            notes: diag.notes,
+        };
+        ctx.render(raw)
+    })
 }
 
 /// What an error finalized in capture mode had besides its message: its
@@ -1056,6 +1135,20 @@ impl RawError {
                 CAPTURED.with(|slot| *slot.borrow_mut() = Some(captured));
                 self.kind
             }
+            Some(c) if self.primary.is_none() && self.secondaries.is_empty() => {
+                // Rendered without a location: remember it, for an outer
+                // caller to locate (`with_fallback_span`).
+                let diag = CapturedDiagnostic {
+                    pg_message: self.pg_message(),
+                    primary: None,
+                    secondaries: Vec::new(),
+                    hint: self.hint.clone(),
+                    notes: self.notes.clone(),
+                };
+                let rendered = c.render(self);
+                LAST_UNLOCATED.with(|slot| *slot.borrow_mut() = Some((rendered.to_string(), diag)));
+                rendered
+            }
             Some(c) => c.render(self),
             None => self.kind,
         }
@@ -1165,3 +1258,39 @@ impl std::fmt::Display for RawError {
 }
 
 impl std::error::Error for RawError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fallback_span_locates_an_unlocated_error_keeping_its_hint() {
+        let sql = "SELECT f(x)";
+        let lex = crate::param::LexOutput::identity(sql);
+        let _guard = DiagContextGuard::install(sql, &lex);
+        let err = RawError::new(
+            AnalyzeError::GroupingError("boom".into()),
+            None,
+            Some("try this".into()),
+        )
+        .finalize_implicit();
+        assert_eq!(err.to_string(), "boom\n  help: try this\n");
+        let located = with_fallback_span(err, || Some(SourceSpan::new(9, 10)));
+        assert!(matches!(located, AnalyzeError::GroupingError(_)));
+        assert_eq!(
+            located.to_string(),
+            "boom\n  ╭────\n1 │ SELECT f(x)\n  ·          ─\n  ╰────\n  help: try this\n"
+        );
+        // A located error keeps its location.
+        let again = with_fallback_span(located, || Some(SourceSpan::new(7, 8)));
+        assert!(again.to_string().contains("·          ─"), "{again}");
+        // A variant built directly gets one too.
+        let direct = with_fallback_span(AnalyzeError::Unsupported("nope".into()), || {
+            Some(SourceSpan::new(7, 8))
+        });
+        assert_eq!(
+            direct.to_string(),
+            "nope\n  ╭────\n1 │ SELECT f(x)\n  ·        ─\n  ╰────\n"
+        );
+    }
+}
