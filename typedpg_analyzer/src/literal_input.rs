@@ -107,6 +107,13 @@ pub(crate) fn validate_with_typmod(
         ));
     }
 
+    // Composites: `record_in`, each field validated with its own type.
+    if t.typtype == TypType::Composite
+        && let Some(relid) = t.typrelid
+    {
+        return validate_record(content, relid, snapshot);
+    }
+
     // Ranges and multiranges: `range_in` / `multirange_in` (see
     // `crate::range_input`), bounds validated with the subtype.
     if t.typtype == TypType::Range {
@@ -1452,6 +1459,97 @@ fn validate_pg_snapshot(content: &str) -> Result<(), String> {
             None => {}
             Some(_) => return Err(bad()),
         }
+    }
+    Ok(())
+}
+
+// ─── composites ─────────────────────────────────────────────────────────────
+
+/// Mirrors `record_in` (rowtypes.c) for the row type of relation `relid`:
+/// optional whitespace, `(`, one field per column — empty for NULL,
+/// otherwise text where `"…"` quotes (with `""` for a quote) and `\`
+/// escapes the next character — separated by commas, `)`, then only
+/// whitespace. Each non-NULL field goes through its column type's input
+/// (with the column's typmod), whose error is the one reported.
+fn validate_record(
+    content: &str,
+    relid: crate::oid::PgClassOid,
+    snapshot: &PgCatalog,
+) -> Result<(), String> {
+    let malformed = |detail: &str| format!("malformed record literal: \"{content}\" ({detail})");
+    let b = content.as_bytes();
+    let mut p = 0;
+    while p < b.len() && c_isspace(b[p]) {
+        p += 1;
+    }
+    if b.get(p) != Some(&b'(') {
+        return Err(malformed("Missing left parenthesis."));
+    }
+    p += 1;
+    let columns: Vec<(PgTypeOid, Option<i32>)> = snapshot
+        .attributes_of(relid)
+        .iter()
+        .filter(|a| a.attnum > 0)
+        .map(|a| {
+            (
+                a.atttypid,
+                snapshot.effective_typmod(a.atttypid, a.atttypmod),
+            )
+        })
+        .collect();
+    for (i, (column_type, typmod)) in columns.iter().enumerate() {
+        if i > 0 {
+            if b.get(p) == Some(&b',') {
+                p += 1;
+            } else {
+                return Err(malformed("Too few columns."));
+            }
+        }
+        if matches!(b.get(p), Some(b',' | b')')) {
+            continue; // NULL
+        }
+        let mut field: Vec<u8> = Vec::new();
+        let mut inquote = false;
+        while inquote || !matches!(b.get(p), Some(b',' | b')')) {
+            let Some(&ch) = b.get(p) else {
+                return Err(malformed("Unexpected end of input."));
+            };
+            p += 1;
+            match ch {
+                b'\\' => {
+                    let Some(&next) = b.get(p) else {
+                        return Err(malformed("Unexpected end of input."));
+                    };
+                    field.push(next);
+                    p += 1;
+                }
+                b'"' if !inquote => inquote = true,
+                b'"' if b.get(p) == Some(&b'"') => {
+                    field.push(b'"');
+                    p += 1;
+                }
+                b'"' => inquote = false,
+                _ => field.push(ch),
+            }
+        }
+        let field = String::from_utf8_lossy(&field);
+        validate_with_typmod(&field, *column_type, *typmod, snapshot)?;
+        // The column's input function gets its typmod: a `varchar(n)`
+        // field is length-checked.
+        let base = snapshot.unwrap_domain(*column_type);
+        if let Some(msg) = crate::typmod::char_length_violation(snapshot, base, *typmod, &field) {
+            return Err(msg);
+        }
+    }
+    if b.get(p) != Some(&b')') {
+        return Err(malformed("Too many columns."));
+    }
+    p += 1;
+    while p < b.len() && c_isspace(b[p]) {
+        p += 1;
+    }
+    if p != b.len() {
+        return Err(malformed("Junk after right parenthesis."));
     }
     Ok(())
 }

@@ -2811,3 +2811,53 @@ fn field_of_a_row_read_from_its_table_keeps_not_null() {
         )],
     );
 }
+
+// ── Composite literals ───────────────────────────────────────────────────────
+
+#[test]
+fn composite_literal_is_parsed_like_record_in() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TYPE trio AS (a int, b text, c varchar(2));")
+        .unwrap();
+    // Empty fields are NULL; quotes, doubled quotes and backslashes; the
+    // varchar field's excess spaces are dropped.
+    for ok in [
+        "(1,a,b)",
+        "(,,)",
+        " ( 1 ,a,b) ",
+        r#"("1","a,b","c")"#,
+        r#"(1,"a""b",c)"#,
+        r"(1,a\,b,c)",
+        r#"(1,a,"bc   ")"#,
+    ] {
+        db.analyze(&format!("SELECT '{ok}'::trio AS v")).unwrap();
+    }
+    for (bad, msg) in [
+        (
+            "1.5e3",
+            r#"malformed record literal: "1.5e3" (Missing left parenthesis.)"#,
+        ),
+        ("()", r#"malformed record literal: "()" (Too few columns.)"#),
+        (
+            "(1,a,b,c)",
+            r#"malformed record literal: "(1,a,b,c)" (Too many columns.)"#,
+        ),
+        (
+            "(1,a,b) x",
+            r#"malformed record literal: "(1,a,b) x" (Junk after right parenthesis.)"#,
+        ),
+        (
+            "(1,a,b",
+            r#"malformed record literal: "(1,a,b" (Unexpected end of input.)"#,
+        ),
+        // A field is its column type's input.
+        ("(x,a,b)", r#"invalid input syntax for type integer: "x""#),
+        ("(1,a,bcd)", "value too long for type character varying(2)"),
+    ] {
+        assert_err_prefix!(
+            db.analyze(&format!("SELECT '{bad}'::trio AS v")),
+            AnalyzeError::InvalidLiteral(_),
+            msg
+        );
+    }
+}
