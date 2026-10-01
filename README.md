@@ -136,6 +136,22 @@ let max_age = sql!(pool, "SELECT max(age) FROM users")
 
 `fetch_value` is only generated when the query returns exactly one column. Multi-column queries use `fetch_one`/`fetch_all` with struct access.
 
+### `fetch_stream` -- rows as they arrive
+
+For large results, `fetch_stream` yields the typed rows as the server sends them instead of collecting a `Vec` first (`fetch_stream_as::<T>()` maps them to your own `FromRow` type):
+
+```rust
+use typedpg::stream::TryStreamExt;
+
+let mut users = sql!(pool, "SELECT id, name FROM users")
+    .fetch_stream().await?;
+while let Some(user) = users.try_next().await? {
+    println!("{} {}", user.id, user.name);
+}
+```
+
+The stream is a nameable `typedpg::QueryStream<T>` (`Send` and `Unpin`). Run on a pool, it holds its connection until it is dropped; an error raised while the server produces rows (say, a division by zero in row 3) comes through the stream.
+
 ## Named parameters
 
 Parameters use `$name` syntax. Values can be explicitly assigned or captured from scope:

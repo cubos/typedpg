@@ -7,7 +7,9 @@ use tokio_postgres::Row;
 use tokio_postgres::types::ToSql;
 
 #[cfg(any(feature = "deadpool", feature = "bb8"))]
-use crate::executor::Executor;
+use crate::executor::{Executor, slice_iter};
+#[cfg(any(feature = "deadpool", feature = "bb8"))]
+use crate::stream::RowStream;
 
 // ── deadpool-postgres ────────────────────────────────────────────────────────
 
@@ -39,6 +41,17 @@ impl Executor for deadpool_postgres::Pool {
         let client = self.get().await?;
         Ok(client.deref().execute(sql, params).await?)
     }
+
+    async fn query_stream<'a>(
+        &'a self,
+        sql: &'a str,
+        params: &'a [&'a (dyn ToSql + Sync)],
+    ) -> Result<RowStream, crate::Error> {
+        // The stream keeps the connection until it is dropped.
+        let client = self.get().await?;
+        let rows = client.deref().query_raw(sql, slice_iter(params)).await?;
+        Ok(RowStream::with_connection(rows, client))
+    }
 }
 
 /// [`Executor`] implementation for `deadpool_postgres::Object` (the pooled connection).
@@ -62,6 +75,15 @@ impl Executor for deadpool_postgres::Object {
         params: &'a [&'a (dyn ToSql + Sync)],
     ) -> Result<u64, crate::Error> {
         Ok(self.deref().execute(sql, params).await?)
+    }
+
+    async fn query_stream<'a>(
+        &'a self,
+        sql: &'a str,
+        params: &'a [&'a (dyn ToSql + Sync)],
+    ) -> Result<RowStream, crate::Error> {
+        let rows = self.deref().query_raw(sql, slice_iter(params)).await?;
+        Ok(RowStream::new(rows))
     }
 }
 
@@ -93,6 +115,15 @@ impl Executor for deadpool_postgres::Transaction<'_> {
         params: &'a [&'a (dyn ToSql + Sync)],
     ) -> Result<u64, crate::Error> {
         Ok(self.deref().execute(sql, params).await?)
+    }
+
+    async fn query_stream<'a>(
+        &'a self,
+        sql: &'a str,
+        params: &'a [&'a (dyn ToSql + Sync)],
+    ) -> Result<RowStream, crate::Error> {
+        let rows = self.deref().query_raw(sql, slice_iter(params)).await?;
+        Ok(RowStream::new(rows))
     }
 }
 
@@ -128,5 +159,16 @@ where
     ) -> Result<u64, crate::Error> {
         let client = self.get().await?;
         Ok(client.execute(sql, params).await?)
+    }
+
+    async fn query_stream<'a>(
+        &'a self,
+        sql: &'a str,
+        params: &'a [&'a (dyn ToSql + Sync)],
+    ) -> Result<RowStream, crate::Error> {
+        // An owned connection, kept by the stream until it is dropped.
+        let client = self.get_owned().await?;
+        let rows = client.query_raw(sql, slice_iter(params)).await?;
+        Ok(RowStream::with_connection(rows, client))
     }
 }
