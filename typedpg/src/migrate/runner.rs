@@ -223,7 +223,8 @@ async fn run_inner(
 /// The result is ordered by migration version.
 ///
 /// Unlike [`run`] and [`revert`], this function does **not** acquire an advisory
-/// lock -- it is a read-only operation.
+/// lock -- it is a read-only operation. It creates nothing either: without a
+/// tracking table every migration is pending.
 ///
 /// # Errors
 ///
@@ -250,17 +251,42 @@ pub async fn status(
     source: &MigrationSource,
     config: &MigrationsConfig,
 ) -> Result<Vec<MigrationStatus>, crate::Error> {
-    ensure_table(client, config).await?;
+    validate(config)?;
 
-    let rows = client
-        .query(
-            &format!(
-                "SELECT name, applied_at, md5(sql_source) FROM {} ORDER BY name",
-                config.table
-            ),
-            &[],
-        )
-        .await?;
+    // Read-only, so neither create the table nor add the column `run`
+    // would: a table from before `sql_source` existed reads with no stored
+    // text, and no table at all as nothing applied.
+    let (exists, has_sql_source): (bool, bool) = {
+        let row = client
+            .query_one(
+                "SELECT c.oid IS NOT NULL,
+                        EXISTS (SELECT 1 FROM pg_catalog.pg_attribute a
+                                WHERE a.attrelid = c.oid AND a.attname = 'sql_source'
+                                  AND NOT a.attisdropped)
+                 FROM (SELECT pg_catalog.to_regclass($1) AS oid) AS c",
+                &[&config.table],
+            )
+            .await?;
+        (row.get(0), row.get(1))
+    };
+    let rows = if !exists {
+        Vec::new()
+    } else {
+        let source_column = if has_sql_source {
+            "md5(sql_source)"
+        } else {
+            "NULL::text"
+        };
+        client
+            .query(
+                &format!(
+                    "SELECT name, applied_at, {source_column} FROM {} ORDER BY name",
+                    config.table
+                ),
+                &[],
+            )
+            .await?
+    };
 
     let mut applied: std::collections::HashMap<
         String,
