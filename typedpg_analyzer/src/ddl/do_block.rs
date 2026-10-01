@@ -486,7 +486,7 @@ impl Run {
                     } else if chars.next_if_eq(&'%').is_some() {
                         out.push('%');
                     } else {
-                        match params.next().and_then(&text) {
+                        match params.next().and_then(text) {
                             Some(value) => out.push_str(&value),
                             // A value only running the block would give.
                             None => return Ok(Flow::Unknown),
@@ -505,7 +505,7 @@ impl Run {
             .flatten()
         {
             let option = option.get("PLpgSQL_raise_option").unwrap_or(&Value::Null);
-            let value = option.get("expr").and_then(&text);
+            let value = option.get("expr").and_then(text);
             match option.get("opt_type").and_then(Value::as_u64).unwrap_or(0) {
                 OPTION_ERRCODE => match value {
                     Some(code) => errcode = Some(code),
