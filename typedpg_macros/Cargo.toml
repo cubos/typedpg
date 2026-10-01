@@ -15,8 +15,8 @@ categories = ["database", "development-tools::procedural-macro-helpers"]
 proc-macro = true
 
 [dependencies]
-typedpg_core = { path = "../typedpg_core", version = "0.2.0" }
-typedpg_analyzer = { path = "../typedpg_analyzer", version = "0.2.0" }
+typedpg_core = { path = "../typedpg_core", version = "0.3.0" }
+typedpg_analyzer = { path = "../typedpg_analyzer", version = "0.3.0" }
 proc-macro2 = "1"
 quote = "1"
 syn = { version = "3", features = ["full", "extra-traits"] }
