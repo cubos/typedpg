@@ -359,18 +359,31 @@ fn fuzz_analyze_against_pg() {
     }
 }
 
-/// An `Err`/`Ok` divergence that is the analyzer's documented choice, not a
-/// bug: a literal NULL written into a NOT NULL column (or domain) is
-/// rejected in UPDATE and MERGE too, although PG fails only the executions
-/// that touch a row — and the execute fallback runs against empty tables
-/// (see CLAUDE.md, "Errors that every execution raises").
+/// A divergence that is the analyzer's documented choice, not a bug:
+///
+/// - a literal NULL written into a NOT NULL column (or domain) is rejected
+///   in UPDATE and MERGE too, although PG fails only the executions that
+///   touch a row — and the execute fallback runs against empty tables (see
+///   CLAUDE.md, "Errors that every execution raises");
+/// - a role name (`'x'::regrole`, an `aclitem` grantee) is accepted: roles
+///   live in the cluster, not in the migrations (see `reg_input`), so the
+///   scratch database's `role "x" does not exist` says nothing about the
+///   one the application runs against.
 fn deliberate_divergence(div: &Divergence) -> bool {
-    div.kind == DivergenceKind::AnalyzeAcceptedExecuted
-        && div.message.lines().any(|l| {
-            l.starts_with("analyzer error: null value in column ")
-                || l.starts_with("analyzer error: domain ")
-                    && l.contains("does not allow null values")
-        })
+    let line = |prefix: &str| {
+        div.message
+            .lines()
+            .find_map(|l| l.strip_prefix(prefix).map(str::to_owned))
+    };
+    match div.kind {
+        DivergenceKind::AnalyzeAcceptedExecuted => line("analyzer error: ").is_some_and(|e| {
+            e.starts_with("null value in column ")
+                || (e.starts_with("domain ") && e.contains("does not allow null values"))
+        }),
+        DivergenceKind::AnalyzePgRejected => line("PG error: ")
+            .is_some_and(|e| e.starts_with("role \"") && e.contains("\" does not exist")),
+        _ => false,
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────
