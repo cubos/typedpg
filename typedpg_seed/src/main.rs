@@ -3,7 +3,7 @@
 //! Usage:
 //!   cargo run -p typedpg_seed
 //!
-//! Spins up a disposable `postgres:latest` container via the Docker daemon
+//! Spins up a disposable `postgres:18` container via the Docker daemon
 //! (using `testcontainers`), waits for it to accept connections, exports each
 //! `pg_catalog` table almost 1:1 into the analyzer's `PgCatalogSeed`, then
 //! stops + removes the container (via `Drop`). The output is written to
@@ -27,11 +27,13 @@ use typedpg_analyzer::{
 };
 
 fn main() {
-    eprintln!("Pulling postgres:latest from registry...");
+    // The PostgreSQL release whose grammar typedpg_pg_query vendors: the
+    // seed must describe the same server the parser speaks for.
+    eprintln!("Pulling postgres:18 from registry...");
     // The official image, as testcontainers-modules' `Postgres` configured
     // it: user / password / database `postgres`, fsync off, ready once the
     // server logs that it accepts connections.
-    let request = GenericImage::new("postgres", "latest")
+    let request = GenericImage::new("postgres", "18")
         .with_wait_for(WaitFor::message_on_stderr(
             "database system is ready to accept connections",
         ))
@@ -44,9 +46,9 @@ fn main() {
         .with_cmd(["-c", "fsync=off"])
         .with_mount(Mount::tmpfs_mount("/var/lib/postgresql"))
         .pull_image()
-        .expect("failed to pull postgres:latest");
+        .expect("failed to pull postgres:18");
 
-    eprintln!("Starting postgres:latest container...");
+    eprintln!("Starting postgres:18 container...");
     let container = request.start().expect("failed to start postgres container");
 
     let host = container.get_host().expect("failed to get container host");
