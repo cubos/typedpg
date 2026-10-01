@@ -91,3 +91,35 @@ fn targets_are_checked_like_pg() {
         );
     }
 }
+
+#[test]
+fn target_syntax_errors_point_into_the_target() {
+    // The analyzer parses `COPY <target> FROM STDIN`: the error is about the
+    // target as written, not that statement.
+    let db = db();
+    let err = db.analyze_copy_in("plain (a b)").unwrap_err();
+    assert!(matches!(err, AnalyzeError::Parse(_)), "{err:?}");
+    assert_eq!(
+        err.to_string(),
+        "\
+syntax error at or near \"b\"
+  ╭────
+1 │ plain (a b)
+  ·          ─
+  ╰────
+  help: a copy_in! target is a table and an optional column list: `table (column, ...)`
+"
+    );
+    // Cut short: the error would land on the `FROM` typedpg appended.
+    assert_eq!(
+        db.analyze_copy_in("plain (a,").unwrap_err().to_string(),
+        "\
+syntax error at end of input
+  ╭────
+1 │ plain (a,
+  ·          ─
+  ╰────
+  help: a copy_in! target is a table and an optional column list: `table (column, ...)`
+"
+    );
+}
