@@ -125,6 +125,61 @@ pub(crate) fn push_trailer(out: &mut String, raw: &RawError) {
     }
 }
 
+/// Render an error located in a file — a migration — as
+///
+/// ```text
+/// column t.lable does not exist
+///   --> 0002_more.sql:9:12
+///   ╭────
+/// 9 │            t.lable AS tag
+///   ·            ───┬───
+///   ·               ╰─ column does not exist
+///   ╰────
+///   help: did you mean "label"?
+/// ```
+///
+/// `message` stays the first line verbatim; `diag`'s spans are byte
+/// offsets into `sql`, the file's contents. The `-->` line gives the
+/// 1-based line and column (in characters) of the primary span, the
+/// convention editors and terminals turn into a link.
+pub(crate) fn render_in_file(
+    message: &str,
+    filename: &str,
+    sql: &str,
+    diag: &crate::error::CapturedDiagnostic,
+) -> String {
+    let raw = RawError {
+        kind: crate::error::AnalyzeError::Invalid(message.to_owned()),
+        primary: diag.primary.clone(),
+        secondaries: diag.secondaries.clone(),
+        hint: diag.hint.clone(),
+        notes: diag.notes.clone(),
+    };
+    let rendered = render(message, &raw, sql, &LexOutput::identity(sql));
+    let location = match diag.primary.as_ref() {
+        Some(p) if p.span.start <= sql.len() => {
+            let before = &sql[..floor_char_boundary(sql, p.span.start)];
+            let line = before.matches('\n').count() + 1;
+            let col = before.rsplit('\n').next().unwrap_or("").chars().count() + 1;
+            format!("  --> {filename}:{line}:{col}\n")
+        }
+        _ => format!("  --> {filename}\n"),
+    };
+    // After the message's first line.
+    match rendered.split_once('\n') {
+        Some((first, rest)) => format!("{first}\n{location}{rest}"),
+        None => format!("{rendered}\n{location}"),
+    }
+}
+
+/// The largest char boundary of `s` at or before `i`.
+fn floor_char_boundary(s: &str, mut i: usize) -> usize {
+    while !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
 /// One marker on a source line — a position plus an optional label and a
 /// primary/secondary flag (kept around for future styling differences).
 #[derive(Clone)]

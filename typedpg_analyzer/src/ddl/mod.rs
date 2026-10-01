@@ -62,9 +62,15 @@ use crate::pg_catalog::PgCatalog;
 #[derive(Debug)]
 pub enum DdlError {
     Parse(String),
+    /// An error in a migration file, located: what
+    /// [`PgCatalog::apply_migration`](crate::PgCatalog::apply_migration)
+    /// returns. `source` is the statement's error; `diagnostic` the
+    /// rendered location in `filename` — `-->` line, snippet with a caret,
+    /// help — that follows its message.
     Migration {
         filename: String,
         source: Box<DdlError>,
+        diagnostic: String,
     },
     UnsupportedDdl(String),
     TypeNotFound(String),
@@ -101,9 +107,9 @@ impl std::fmt::Display for DdlError {
             | DdlError::ExtensionError(msg)
             | DdlError::DependencyError(msg) => write!(f, "{msg}"),
             DdlError::Internal(msg) => write!(f, "internal DDL interpreter error: {msg}"),
-            DdlError::Migration { filename, source } => {
-                write!(f, "in migration '{filename}': {source}")
-            }
+            // The statement's message comes first, verbatim; the
+            // diagnostic carries the file name.
+            DdlError::Migration { diagnostic, .. } => write!(f, "{}", diagnostic.trim_end()),
             DdlError::ViewAnalysis { view, source } => {
                 // Lead with the inner analyzer message so it stays
                 // verbatim-aligned with PG's wording (the `pglite_sanity`
@@ -132,14 +138,42 @@ impl std::error::Error for DdlError {
 
 /// Apply one migration: its statements, in the transactions the migration
 /// runner gives them ([`txblock::Transaction`]).
-pub(crate) fn apply_migration(db: &mut PgCatalog, sql: &str) -> Result<(), DdlError> {
-    in_migration(db, |db| {
-        let parsed = parse(sql)?;
+///
+/// On failure, also returns where in `sql` the error is (see
+/// [`MigrationFailure`]).
+pub(crate) fn apply_migration(db: &mut PgCatalog, sql: &str) -> Result<(), MigrationFailure> {
+    // Errors the analyzer raises while the statements are applied keep their
+    // plain messages (that is what `DdlError` reports), but their spans —
+    // AST locations, offsets into `sql` — and hints are captured to locate
+    // the failure in the file.
+    let lex = crate::param::LexOutput::identity(sql);
+    let _capture = crate::error::DiagContextGuard::capture(sql, &lex);
+    let mut located = None;
+    let result = in_migration(db, |db| {
+        let parsed = typedpg_pg_query::parse(sql).map_err(|e| {
+            let (message, position) = match e {
+                typedpg_pg_query::Error::Parse { message, position } => (message, position),
+                other => (other.to_string(), None),
+            };
+            located = position.map(|p| crate::error::CapturedDiagnostic {
+                pg_message: message.clone(),
+                primary: Some(crate::error::DiagnosticLabel::new(
+                    crate::error::SourceSpan::syntax_error_at(sql, p, &message),
+                    "",
+                )),
+                secondaries: Vec::new(),
+                hint: None,
+                notes: Vec::new(),
+            });
+            // A grammar error carries PG's message verbatim.
+            DdlError::Parse(message)
+        })?;
         let mut tx = txblock::Transaction::start(db, sql, &parsed.protobuf.stmts);
         for raw_stmt in &parsed.protobuf.stmts {
             let Some(stmt) = raw_stmt.stmt.as_ref().and_then(|n| n.node.as_ref()) else {
                 continue;
             };
+            crate::error::take_captured();
             let result = tx
                 .check(db, stmt)
                 .and_then(|()| tx.check_setting(stmt))
@@ -150,6 +184,7 @@ pub(crate) fn apply_migration(db: &mut PgCatalog, sql: &str) -> Result<(), DdlEr
                     })
                 });
             if let Err(e) = result {
+                located = Some(locate_in_statement(sql, raw_stmt, &e));
                 tx.abort(db);
                 return Err(e);
             }
@@ -157,12 +192,112 @@ pub(crate) fn apply_migration(db: &mut PgCatalog, sql: &str) -> Result<(), DdlEr
         }
         tx.finish(db);
         Ok(())
+    });
+    result.map_err(|error| MigrationFailure {
+        error,
+        location: located.map(Box::new),
     })
+}
+
+/// A migration that failed: the error, and — when known — where in the
+/// migration's SQL it is, as a diagnostic whose spans are byte offsets
+/// into it.
+pub(crate) struct MigrationFailure {
+    pub error: DdlError,
+    pub location: Option<Box<crate::error::CapturedDiagnostic>>,
+}
+
+/// Where `error`, raised by the statement `raw_stmt` of `sql`, is: the
+/// diagnostic the analyzer captured for it when that is this error's and
+/// points into the statement — the offending token, with its label and
+/// hint — else the statement's first token.
+fn locate_in_statement(
+    sql: &str,
+    raw_stmt: &typedpg_pg_query::protobuf::RawStmt,
+    error: &DdlError,
+) -> crate::error::CapturedDiagnostic {
+    let (start, end) = statement_range(sql, raw_stmt);
+    let message = error.to_string();
+    let captured = crate::error::take_captured().filter(|c| message.starts_with(&c.pg_message));
+    let in_statement = |label: &crate::error::DiagnosticLabel| {
+        label.span.start >= start && label.span.start < end.max(start + 1)
+    };
+    match captured {
+        Some(mut c) if c.primary.as_ref().is_some_and(in_statement) => {
+            c.secondaries.retain(in_statement);
+            c
+        }
+        captured => {
+            // The error has no usable position: point at the statement.
+            let first = first_token_offset(sql, start);
+            let span = crate::error::SourceSpan::at_token(sql, first)
+                .unwrap_or_else(|| crate::error::SourceSpan::one_char_at(first));
+            let (hint, notes) = captured.map(|c| (c.hint, c.notes)).unwrap_or_default();
+            crate::error::CapturedDiagnostic {
+                pg_message: message,
+                primary: Some(crate::error::DiagnosticLabel::new(
+                    span,
+                    "in this statement",
+                )),
+                secondaries: Vec::new(),
+                hint,
+                notes,
+            }
+        }
+    }
+}
+
+/// The byte range of `raw_stmt` in `sql` (`stmt_len` 0 means "to the end").
+fn statement_range(sql: &str, raw_stmt: &typedpg_pg_query::protobuf::RawStmt) -> (usize, usize) {
+    let start = usize::try_from(raw_stmt.stmt_location)
+        .unwrap_or(0)
+        .min(sql.len());
+    let end = match usize::try_from(raw_stmt.stmt_len) {
+        Ok(0) | Err(_) => sql.len(),
+        Ok(len) => (start + len).min(sql.len()),
+    };
+    (start, end)
+}
+
+/// The offset of the first token at or after `at`: a statement's location
+/// is where the previous one ended, before the whitespace and comments
+/// that lead into it.
+fn first_token_offset(sql: &str, mut at: usize) -> usize {
+    let bytes = sql.as_bytes();
+    loop {
+        while at < bytes.len() && bytes[at].is_ascii_whitespace() {
+            at += 1;
+        }
+        if bytes[at..].starts_with(b"--") {
+            at = sql[at..].find('\n').map_or(sql.len(), |n| at + n + 1);
+        } else if bytes[at..].starts_with(b"/*") {
+            // Block comments nest.
+            let mut depth = 0usize;
+            while at < bytes.len() {
+                if bytes[at..].starts_with(b"/*") {
+                    depth += 1;
+                    at += 2;
+                } else if bytes[at..].starts_with(b"*/") {
+                    depth -= 1;
+                    at += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    at += 1;
+                }
+            }
+        } else {
+            return at;
+        }
+    }
 }
 
 /// Parse and apply all DDL statements in a SQL string that runs inside
 /// another statement (an extension's scripts).
 pub(crate) fn apply_sql_to(db: &mut PgCatalog, sql: &str) -> Result<(), DdlError> {
+    // The statements' locations are offsets into `sql`, not the migration.
+    let _barrier = crate::error::DiagContextGuard::barrier();
     in_migration(db, |db| {
         let parsed = parse(sql)?;
         for raw_stmt in &parsed.protobuf.stmts {
@@ -206,12 +341,7 @@ fn with_statement_sql(
     raw_stmt: &typedpg_pg_query::protobuf::RawStmt,
     f: impl FnOnce(&mut PgCatalog) -> Result<(), DdlError>,
 ) -> Result<(), DdlError> {
-    // stmt_len 0 means "to the end of the input".
-    let start = usize::try_from(raw_stmt.stmt_location).unwrap_or(0);
-    let end = match usize::try_from(raw_stmt.stmt_len) {
-        Ok(0) | Err(_) => sql.len(),
-        Ok(len) => start + len,
-    };
+    let (start, end) = statement_range(sql, raw_stmt);
     let text = sql.get(start..end).map(str::to_owned);
     // Statements may apply nested SQL (extension scripts): restore the
     // outer statement's text afterwards.

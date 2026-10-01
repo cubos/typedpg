@@ -843,7 +843,41 @@ impl PgCatalog {
     /// runner's would, and a migration that fails leaves the catalog as its
     /// last transaction found it.
     pub fn apply_sql(&mut self, sql: &str) -> Result<(), DdlError> {
-        let result = crate::ddl::apply_migration(self, sql);
+        self.apply_sql_located(sql).map_err(|failure| failure.error)
+    }
+
+    /// [`Self::apply_sql`] for the migration file `filename`: an error comes
+    /// back as [`DdlError::Migration`], which renders the statement's
+    /// message followed by where in the file it is — `--> file:line:col`
+    /// and the offending line with a caret — and any hint.
+    pub fn apply_migration(&mut self, filename: &str, sql: &str) -> Result<(), DdlError> {
+        self.apply_sql_located(sql).map_err(|failure| {
+            let message = failure.error.to_string();
+            let location =
+                failure
+                    .location
+                    .map(|l| *l)
+                    .unwrap_or_else(|| crate::error::CapturedDiagnostic {
+                        pg_message: message.clone(),
+                        primary: None,
+                        secondaries: Vec::new(),
+                        hint: None,
+                        notes: Vec::new(),
+                    });
+            let diagnostic = crate::diagnostic::render_in_file(&message, filename, sql, &location);
+            DdlError::Migration {
+                filename: filename.to_owned(),
+                source: Box::new(failure.error),
+                diagnostic,
+            }
+        })
+    }
+
+    fn apply_sql_located(&mut self, sql: &str) -> Result<(), crate::ddl::MigrationFailure> {
+        let (result, location) = match crate::ddl::apply_migration(self, sql) {
+            Ok(()) => (Ok(()), None),
+            Err(failure) => (Err(failure.error), failure.location),
+        };
         #[cfg(feature = "pg_sanity")]
         {
             if sql_touches_extension(sql) {
@@ -858,7 +892,7 @@ impl PgCatalog {
                 self.run_pg_sanity_apply_check(sql, &result);
             }
         }
-        result
+        result.map_err(|error| crate::ddl::MigrationFailure { error, location })
     }
 
     /// Parse `expr_sql` as a SELECT-list expression (`SELECT <expr>`),
@@ -1306,7 +1340,7 @@ impl PgCatalog {
         &mut self,
         sql: &str,
     ) -> (Result<(), DdlError>, Option<crate::pg_sanity::Divergence>) {
-        let result = crate::ddl::apply_migration(self, sql);
+        let result = crate::ddl::apply_migration(self, sql).map_err(|failure| failure.error);
         if sql_touches_extension(sql) {
             self.pg_sanity_tainted = true;
             return (result, None);

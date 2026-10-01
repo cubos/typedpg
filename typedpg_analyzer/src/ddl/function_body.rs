@@ -57,6 +57,9 @@ fn validate_sql_body(
     if !always_check && !interp.check_function_bodies {
         return Ok(());
     }
+    // A string body was parsed on its own: its locations are offsets into
+    // the body, not the migration.
+    let _barrier = (!always_check).then(crate::error::DiagContextGuard::barrier);
 
     let params = input_params(proc);
     let polymorphic = params

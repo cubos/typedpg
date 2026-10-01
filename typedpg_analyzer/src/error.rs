@@ -360,6 +360,9 @@ pub(crate) struct SourceSpan {
 pub(crate) struct DiagContext<'a> {
     pub sql_original: &'a str,
     pub lex_output: &'a crate::param::LexOutput,
+    /// Capture mode (see [`DiagContextGuard::capture`]): errors keep their
+    /// plain message and their diagnostic is recorded for the caller.
+    pub capture: bool,
 }
 
 impl<'a> DiagContext<'a> {
@@ -385,12 +388,35 @@ impl<'a> DiagContext<'a> {
 use std::cell::RefCell;
 
 struct DiagSlot {
-    sql_ptr: *const str,
-    lex_ptr: *const crate::param::LexOutput,
+    /// `None` for a barrier: the analysis below it works on another text.
+    ptrs: Option<(*const str, *const crate::param::LexOutput)>,
+    capture: bool,
 }
 
 thread_local! {
     static DIAG_TLS: RefCell<Vec<DiagSlot>> = const { RefCell::new(Vec::new()) };
+    /// The diagnostic of the last error finalized under a capture-mode
+    /// context.
+    static CAPTURED: RefCell<Option<CapturedDiagnostic>> = const { RefCell::new(None) };
+}
+
+/// What an error finalized in capture mode had besides its message: its
+/// labels (spans in the coordinates of the capturing context's SQL), hint
+/// and notes.
+#[derive(Debug, Clone)]
+pub(crate) struct CapturedDiagnostic {
+    /// The PG-verbatim message the error carries.
+    pub pg_message: String,
+    pub primary: Option<DiagnosticLabel>,
+    pub secondaries: Vec<DiagnosticLabel>,
+    pub hint: Option<String>,
+    pub notes: Vec<String>,
+}
+
+/// Take the diagnostic recorded by the last error finalized in capture
+/// mode, clearing it.
+pub(crate) fn take_captured() -> Option<CapturedDiagnostic> {
+    CAPTURED.with(|c| c.borrow_mut().take())
 }
 
 /// RAII guard that installs a [`DiagContext`] into thread-local storage and
@@ -403,12 +429,37 @@ pub(crate) struct DiagContextGuard<'a> {
 
 impl<'a> DiagContextGuard<'a> {
     pub(crate) fn install(sql: &'a str, lex_output: &'a crate::param::LexOutput) -> Self {
-        DIAG_TLS.with(|tls| {
-            tls.borrow_mut().push(DiagSlot {
-                sql_ptr: sql as *const str,
-                lex_ptr: lex_output as *const crate::param::LexOutput,
-            });
-        });
+        Self::push(DiagSlot {
+            ptrs: Some((sql as *const str, lex_output as *const _)),
+            capture: false,
+        })
+    }
+
+    /// Install a context in capture mode: errors finalized under it keep
+    /// their plain PG message (as with no context), and their spans, hint
+    /// and notes are recorded for [`take_captured`] instead of rendered.
+    /// The DDL interpreter uses it to locate an error in a migration file
+    /// without changing the messages its statements produce.
+    pub(crate) fn capture(sql: &'a str, lex_output: &'a crate::param::LexOutput) -> Self {
+        Self::push(DiagSlot {
+            ptrs: Some((sql as *const str, lex_output as *const _)),
+            capture: true,
+        })
+    }
+
+    /// Hide the installed context from the analysis run under this guard:
+    /// it works on a tree parsed from some other text (a function body
+    /// given as a string, an extension script), whose locations the
+    /// context's SQL can't resolve.
+    pub(crate) fn barrier() -> Self {
+        Self::push(DiagSlot {
+            ptrs: None,
+            capture: false,
+        })
+    }
+
+    fn push(slot: DiagSlot) -> Self {
+        DIAG_TLS.with(|tls| tls.borrow_mut().push(slot));
         Self {
             _marker: std::marker::PhantomData,
         }
@@ -429,20 +480,24 @@ fn with_diag_ctx<R>(f: impl FnOnce(Option<DiagContext>) -> R) -> R {
     DIAG_TLS.with(|tls| {
         let slots = tls.borrow();
         match slots.last() {
-            Some(slot) => {
+            Some(DiagSlot {
+                ptrs: Some((sql_ptr, lex_ptr)),
+                capture,
+            }) => {
                 // SAFETY: the pointers are valid for the lifetime of the
                 // `DiagContextGuard` that installed them; the guard is on a
                 // stack frame strictly outer to this call (the analyzer is
                 // synchronous), so the borrow here is sound.
                 let ctx = unsafe {
                     DiagContext {
-                        sql_original: &*slot.sql_ptr,
-                        lex_output: &*slot.lex_ptr,
+                        sql_original: &**sql_ptr,
+                        lex_output: &**lex_ptr,
+                        capture: *capture,
                     }
                 };
                 f(Some(ctx))
             }
-            None => f(None),
+            _ => f(None),
         }
     })
 }
@@ -972,6 +1027,17 @@ impl RawError {
     /// hint is rendered and the variant is returned as-is.
     fn finalize(self, ctx: Option<DiagContext>) -> AnalyzeError {
         match ctx {
+            Some(c) if c.capture => {
+                let captured = CapturedDiagnostic {
+                    pg_message: self.pg_message(),
+                    primary: self.primary,
+                    secondaries: self.secondaries,
+                    hint: self.hint,
+                    notes: self.notes,
+                };
+                CAPTURED.with(|slot| *slot.borrow_mut() = Some(captured));
+                self.kind
+            }
             Some(c) => c.render(self),
             None => self.kind,
         }
