@@ -1,7 +1,7 @@
 //! Shared types for the typedpg end-to-end tests.
 //!
-//! These are referenced from `[package.metadata.typedpg.domains]` and
-//! `[package.metadata.typedpg.enums]` in this crate's Cargo.toml. The
+//! These are referenced from `[package.metadata.typedpg.types]` in this
+//! crate's Cargo.toml. The
 //! `sql!` macro emits the paths declared there literally into generated
 //! code, so they must be reachable via `::typedpg_e2e::…` from both the
 //! crate itself and from `tests/*.rs` integration binaries.

@@ -179,7 +179,7 @@ mod query_macro;
 /// your `Cargo.toml`:
 ///
 /// ```text
-/// [package.metadata.typedpg.domains]
+/// [package.metadata.typedpg.types]
 /// user_preferences = "crate::domains::UserPreferences"
 /// order_metadata = "crate::domains::OrderMetadata"
 /// ```

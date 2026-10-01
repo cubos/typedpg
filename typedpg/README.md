@@ -332,7 +332,7 @@ sql!(pool, "UPDATE users SET role = $role WHERE id = $id", role = "editor", id =
 To get type-safe enum values instead of raw strings, map them in `Cargo.toml`:
 
 ```toml
-[package.metadata.typedpg.enums]
+[package.metadata.typedpg.types]
 user_role = "crate::UserRole"
 ```
 
@@ -362,7 +362,7 @@ let profile = sql!(pool, "SELECT user_id, preferences FROM profiles WHERE user_i
 With configuration, the macro automatically serializes/deserializes through your Rust type:
 
 ```toml
-[package.metadata.typedpg.domains]
+[package.metadata.typedpg.types]
 user_preferences = "crate::domains::UserPreferences"
 ```
 
@@ -600,12 +600,13 @@ use_transaction = true             # optional — wrap each migration in a tx
 fail_on_drift = true               # optional — abort if an already-applied
                                    # migration file has been edited since
 
-[package.metadata.typedpg.domains]
-user_preferences = "crate::UserPrefs"  # optional — JSONB domain → Rust struct
-
-[package.metadata.typedpg.enums]
-user_role = "crate::UserRole"          # optional — PG enum → Rust enum
+[package.metadata.typedpg.types]       # optional — PG type → Rust type
+user_preferences = "crate::UserPrefs"  # JSONB domain → Rust struct (serde)
+user_role = "crate::UserRole"          # PG enum → Rust enum (Display + FromStr)
 ```
+
+A key typedpg does not recognize is a compile error rather than silently
+ignored.
 
 For projects with more than one database see the [Multiple databases](#multiple-databases) section above.
 
