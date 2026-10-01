@@ -1868,7 +1868,7 @@ fn column_get_expr(
         col.nullable,
         config,
         registry,
-        &|raw, _hint| quote! { __row.get::<_, #raw>(#idx_lit) },
+        &|raw, _hint| quote! { __row.get::<_, ::typedpg::__private::BaseTyped<#raw>>(#idx_lit).0 },
         DecodeCtx::Column,
     )
 }
