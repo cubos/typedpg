@@ -5,7 +5,10 @@ error[E0277]: field `age` of `$..users` expects a value for SQL type integer, no
 12 | |         db,
 13 | |         "INSERT INTO users (name, email, age) VALUES $..users { name, email, age }"
 14 | |     )
-   | |_____^ expected a value for integer
+   | |     ^
+   | |     |
+   | |_____`String` doesn't satisfy the trait bound
+   |       expected a value for integer
    |
    = help: the trait `__TypedpgBind2` is not implemented for `String`
    = note: field `age` of `$..users` takes `i32`, or `Option<i32>` (`None` for NULL)

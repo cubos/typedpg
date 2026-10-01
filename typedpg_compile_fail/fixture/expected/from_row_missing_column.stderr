@@ -19,7 +19,8 @@ note: required for `Named` to implement `FromQueryRow<__sql_columns>`
  6 |     name: String,
  7 |     nickname: String,
    |     -------- unsatisfied trait bound
-   = help: consider manually implementing `FromQueryRow<__sql_columns>` to avoid undesired bounds
+   = help: consider manually implementing `FromQueryRow<__sql_columns>` to avoid undesired bounds caused by "imperfect derives"
+   = note: to learn more, visit <https://github.com/rust-lang/rust/issues/26925>
 note: required by a bound in `__typedpg_query::<__E>::fetch_one_as`
   --> src/bin/from_row_missing_column.rs:11:20
    |
