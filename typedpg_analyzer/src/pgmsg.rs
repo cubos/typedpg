@@ -35,6 +35,34 @@ pub(crate) const NO_OPERATOR_MATCHES_HINT: &str = "No operator matches the given
                                                    argument types. You might need to add \
                                                    explicit type casts.";
 
+/// PG's hint when an assigned value doesn't coerce to its target
+/// (`transformAssignedExpr`).
+pub(crate) const REWRITE_OR_CAST_HINT: &str = "You will need to rewrite or cast the expression.";
+
+/// Add to a type-mismatch error, when an explicit cast from `actual` to
+/// `expected` exists (assignment coercion failed, so it is explicit-only),
+/// a note saying so — `text` to `integer` gets "an explicit cast from text
+/// to integer exists: `expr::integer`". When there is none, the value has
+/// to be rewritten and the note would mislead.
+pub(crate) fn with_explicit_cast_note(
+    err: RawError,
+    snapshot: &crate::pg_catalog::PgCatalog,
+    actual: crate::oid::PgTypeOid,
+    expected: crate::oid::PgTypeOid,
+) -> RawError {
+    use crate::coerce::{CoercionContext, coercion_pathway};
+    if actual == crate::pg_catalog::oid::UNKNOWN
+        || coercion_pathway(expected, actual, CoercionContext::Explicit, snapshot).is_none()
+    {
+        return err;
+    }
+    let from = crate::ddl::util::format_type_for_message(snapshot, actual);
+    let to = crate::ddl::util::format_type_for_message(snapshot, expected);
+    err.with_note(format!(
+        "an explicit cast from {from} to {to} exists: `expr::{to}`"
+    ))
+}
+
 /// `operator does not exist: <left> <op> <right>` — SQLSTATE 42883
 /// (`undefined_function`), with PG's hint. `left`/`right` are PG-rendered
 /// type names (`format_type_for_message`).
