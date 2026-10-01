@@ -131,3 +131,59 @@ async fn enum_filter_in_where_clause() {
     let titles: Vec<_> = published.iter().map(|r| r.title.as_str()).collect();
     assert_eq!(titles, vec!["b", "c"]);
 }
+
+#[tokio::test]
+async fn unmapped_enum_params_take_what_text_params_do() {
+    let pool = common::setup().await;
+    // `mood` has no [types] mapping: its labels are Strings, and its
+    // parameters take &str / String / Option<_> like a text parameter.
+    let id = common::unique_id(&pool).await;
+    let row = sql!(
+        &pool,
+        "INSERT INTO moods (id, mood, fixed) VALUES ($id, $m, $f) RETURNING mood, fixed",
+        m = "ok",
+        f = "sad"
+    )
+    .fetch_one()
+    .await
+    .expect("&str");
+    assert_eq!(
+        (row.mood.as_deref(), row.fixed.as_str()),
+        (Some("ok"), "sad")
+    );
+
+    let id = common::unique_id(&pool).await;
+    let label = String::from("sad");
+    let row = sql!(
+        &pool,
+        "INSERT INTO moods (id, mood, fixed) VALUES ($id, $m, $f) RETURNING mood",
+        m = label.clone(),
+        f = &label
+    )
+    .fetch_one()
+    .await
+    .expect("String");
+    assert_eq!(row.mood.as_deref(), Some("sad"));
+
+    let id = common::unique_id(&pool).await;
+    let row = sql!(
+        &pool,
+        "INSERT INTO moods (id, mood) VALUES ($id, $m) RETURNING mood",
+        m = None::<&str>
+    )
+    .fetch_one()
+    .await
+    .expect("None");
+    assert_eq!(row.mood, None);
+
+    let id = common::unique_id(&pool).await;
+    let row = sql!(
+        &pool,
+        "INSERT INTO moods (id, mood) VALUES ($id, $m) RETURNING mood",
+        m = Some("ok")
+    )
+    .fetch_one()
+    .await
+    .expect("Some(&str)");
+    assert_eq!(row.mood.as_deref(), Some("ok"));
+}

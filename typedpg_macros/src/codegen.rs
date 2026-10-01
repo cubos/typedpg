@@ -1553,12 +1553,15 @@ fn build_field_type_and_value<P: TypedParam>(
         mapping.rust_type.clone()
     };
 
-    let accepts_into_string = matches!(
-        mapping.strategy,
+    // Text-like values, and the labels of an enum without a `[types]`
+    // mapping (read and bound as a `String`), take what a `String` does.
+    let accepts_into_string = match &mapping.strategy {
         DeserStrategy::Plain {
-            accepts_into_string: true
-        }
-    );
+            accepts_into_string,
+        } => *accepts_into_string,
+        DeserStrategy::EnumAsString { .. } => override_path(param.pg_type(), config).is_none(),
+        _ => false,
+    };
     let value_expr = match (accepts_into_string, mapping.accepts_iter, is_nullable) {
         (true, _, true) => {
             quote! {
