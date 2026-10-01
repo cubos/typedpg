@@ -20,7 +20,12 @@ const STORED_SQL_HASH: &str = "md5(convert_to(sql_source, 'UTF8'))";
 /// Formats a `tokio_postgres::Error` including the underlying Postgres
 /// `DbError` details (severity, message, detail, hint, position), which are
 /// otherwise hidden behind the generic `"db error"` Display impl.
-fn format_pg_error(e: &tokio_postgres::Error) -> String {
+///
+/// `sql` is the migration's text and `base` the byte offset in it of the
+/// statement that was sent (0 when the whole migration was): PG's
+/// position, a character index into what was sent, is reported as the
+/// line and column of the migration file, with the line and a caret.
+fn format_pg_error(e: &tokio_postgres::Error, sql: &str, base: usize) -> String {
     if let Some(db) = e.as_db_error() {
         let mut out = format!("{}: {}", db.severity(), db.message());
         if let Some(detail) = db.detail() {
@@ -34,7 +39,7 @@ fn format_pg_error(e: &tokio_postgres::Error) -> String {
         if let Some(pos) = db.position() {
             use tokio_postgres::error::ErrorPosition;
             match pos {
-                ErrorPosition::Original(p) => out.push_str(&format!("\nPOSITION: {}", p)),
+                ErrorPosition::Original(p) => out.push_str(&locate_position(sql, base, *p)),
                 ErrorPosition::Internal { position, query } => out.push_str(&format!(
                     "\nINTERNAL POSITION: {}\nQUERY: {}",
                     position, query
@@ -45,6 +50,30 @@ fn format_pg_error(e: &tokio_postgres::Error) -> String {
     } else {
         e.to_string()
     }
+}
+
+/// PG's error position `position` — a 1-based character index into
+/// `sql[base..]`, the text that was sent — as psql shows it: `LINE n:` and
+/// the line, then a caret under the column. `n` counts lines of the whole
+/// `sql`.
+fn locate_position(sql: &str, base: usize, position: u32) -> String {
+    let sent = sql.get(base..).unwrap_or_default();
+    let chars = usize::try_from(position).unwrap_or(0).saturating_sub(1);
+    let at = base
+        + sent
+            .char_indices()
+            .nth(chars)
+            .map_or(sent.len(), |(i, _)| i);
+    let line_start = sql[..at].rfind('\n').map_or(0, |i| i + 1);
+    let line_end = sql[at..].find('\n').map_or(sql.len(), |i| at + i);
+    let line_no = sql[..at].matches('\n').count() + 1;
+    let column = sql[line_start..at].chars().count();
+    let prefix = format!("LINE {line_no}: ");
+    format!(
+        "\n{prefix}{}\n{}^",
+        &sql[line_start..line_end],
+        " ".repeat(prefix.len() + column)
+    )
 }
 
 /// Status of a single migration, indicating whether it has been applied.
@@ -187,7 +216,7 @@ async fn run_inner(
                 crate::Error::Migration(format!(
                     "failed to apply migration {}: {}",
                     migration.name,
-                    format_pg_error(&e)
+                    format_pg_error(&e, &migration.sql, 0)
                 ))
             })?;
 
@@ -204,11 +233,11 @@ async fn run_inner(
         } else {
             execute_each(client, &migration.sql)
                 .await
-                .map_err(|(n, e)| {
+                .map_err(|(n, at, e)| {
                     crate::Error::Migration(format!(
                         "failed to apply migration {} (statement {n}): {}",
                         migration.name,
-                        format_pg_error(&e)
+                        format_pg_error(&e, &migration.sql, at)
                     ))
                 })?;
 
@@ -441,7 +470,7 @@ async fn revert_inner(
                     crate::Error::Migration(format!(
                         "failed to revert migration {}: {}",
                         name,
-                        format_pg_error(&e)
+                        format_pg_error(&e, down_sql, 0)
                     ))
                 })?;
 
@@ -453,11 +482,11 @@ async fn revert_inner(
 
                 tx.commit().await?;
             } else {
-                execute_each(client, down_sql).await.map_err(|(n, e)| {
+                execute_each(client, down_sql).await.map_err(|(n, at, e)| {
                     crate::Error::Migration(format!(
                         "failed to revert migration {} (statement {n}): {}",
                         name,
-                        format_pg_error(&e)
+                        format_pg_error(&e, down_sql, at)
                     ))
                 })?;
 
@@ -492,13 +521,19 @@ async fn revert_inner(
 /// Run `sql` outside a transaction, one statement at a time: sent whole,
 /// PG would run its statements in one implicit transaction block (see
 /// [`split_statements`]). Fails with the 1-based number of the failing
-/// statement; the statements before it stay applied.
-async fn execute_each(client: &Client, sql: &str) -> Result<(), (usize, tokio_postgres::Error)> {
+/// statement and its byte offset in `sql`; the statements before it stay
+/// applied.
+async fn execute_each(
+    client: &Client,
+    sql: &str,
+) -> Result<(), (usize, usize, tokio_postgres::Error)> {
     for (i, statement) in split_statements(sql).into_iter().enumerate() {
+        // `split_statements` returns slices of `sql`.
+        let at = statement.as_ptr() as usize - sql.as_ptr() as usize;
         client
             .batch_execute(statement)
             .await
-            .map_err(|e| (i + 1, e))?;
+            .map_err(|e| (i + 1, at, e))?;
     }
     Ok(())
 }
@@ -560,4 +595,31 @@ async fn get_applied(
     }
 
     Ok(map)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::locate_position;
+
+    #[test]
+    fn positions_are_lines_and_columns_of_the_migration() {
+        let sql = "CREATE TABLE a (id int);\nCREATE TABL b (id int);\n";
+        // The whole migration sent: PG's position 33 is `TABL` on line 2.
+        assert_eq!(
+            locate_position(sql, 0, 33),
+            "\nLINE 2: CREATE TABL b (id int);\n               ^"
+        );
+        // One statement sent (non-transactional run): the position is
+        // relative to it, the line still the file's.
+        let second = sql.find("CREATE TABL b").unwrap();
+        assert_eq!(
+            locate_position(sql, second, 8),
+            "\nLINE 2: CREATE TABL b (id int);\n               ^"
+        );
+        // PG counts characters, not bytes.
+        assert_eq!(
+            locate_position("SELECT 'é' x y", 0, 14),
+            "\nLINE 1: SELECT 'é' x y\n                     ^"
+        );
+    }
 }
