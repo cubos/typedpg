@@ -3080,6 +3080,8 @@ dependencies = [
  "bytes",
  "chrono",
  "deadpool-postgres",
+ "futures-core",
+ "futures-util",
  "libc",
  "md5",
  "rust_decimal",

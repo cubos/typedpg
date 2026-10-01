@@ -425,10 +425,12 @@ pub mod executor;
 pub mod from_row;
 pub mod migrate;
 mod pool; // Executor impls for pool types (deadpool, bb8)
+pub mod stream;
 
 pub use error::Error;
 pub use executor::Executor;
 pub use from_row::FromRow;
+pub use stream::{QueryStream, RowStream};
 
 /// Build-script helpers — re-exported from `typedpg_core`.
 ///

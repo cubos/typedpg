@@ -793,6 +793,31 @@ fn generate_regular(
                     }
                 }
 
+                /// Execute the query and stream its rows as the server sends
+                /// them.
+                async fn fetch_stream(self) -> ::std::result::Result<typedpg::QueryStream<__sql_output>, typedpg::Error> {
+                    let __rows = typedpg::Executor::query_stream(
+                        &self.__executor,
+                        #sql_str,
+                        &[#params_slice],
+                    ).await?;
+                    ::std::result::Result::Ok(typedpg::QueryStream::new(__rows, |__row| {
+                        ::std::result::Result::Ok(__sql_output {
+                            #row_mapping
+                        })
+                    }))
+                }
+
+                /// Execute the query and stream its rows, mapped to `T`.
+                async fn fetch_stream_as<__T: typedpg::FromRow>(self) -> ::std::result::Result<typedpg::QueryStream<__T>, typedpg::Error> {
+                    let __rows = typedpg::Executor::query_stream(
+                        &self.__executor,
+                        #sql_str,
+                        &[#params_slice],
+                    ).await?;
+                    ::std::result::Result::Ok(typedpg::QueryStream::new(__rows, __T::from_row))
+                }
+
                 /// Execute the statement and return the number of affected rows.
                 async fn execute(self) -> ::std::result::Result<u64, typedpg::Error> {
                     typedpg::Executor::execute(
@@ -1114,6 +1139,26 @@ fn generate_spread(
                         },
                         None => ::std::result::Result::Ok(None),
                     }
+                }
+
+                async fn fetch_stream(self) -> ::std::result::Result<typedpg::QueryStream<__sql_output>, typedpg::Error> {
+                    #query_preamble
+                    let __decode: fn(&typedpg::__private::tokio_postgres::Row) -> ::std::result::Result<__sql_output, typedpg::Error> =
+                        |__row| ::std::result::Result::Ok(__sql_output { #row_mapping });
+                    if __any_empty {
+                        return ::std::result::Result::Ok(typedpg::QueryStream::new(typedpg::RowStream::empty(), __decode));
+                    }
+                    let __rows = typedpg::Executor::query_stream(&self.__executor, &__sql, &__params_ref).await?;
+                    ::std::result::Result::Ok(typedpg::QueryStream::new(__rows, __decode))
+                }
+
+                async fn fetch_stream_as<__T: typedpg::FromRow>(self) -> ::std::result::Result<typedpg::QueryStream<__T>, typedpg::Error> {
+                    #query_preamble
+                    if __any_empty {
+                        return ::std::result::Result::Ok(typedpg::QueryStream::new(typedpg::RowStream::empty(), __T::from_row));
+                    }
+                    let __rows = typedpg::Executor::query_stream(&self.__executor, &__sql, &__params_ref).await?;
+                    ::std::result::Result::Ok(typedpg::QueryStream::new(__rows, __T::from_row))
                 }
 
                 async fn execute(self) -> ::std::result::Result<u64, typedpg::Error> {
