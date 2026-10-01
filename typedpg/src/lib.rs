@@ -420,6 +420,7 @@
 //!
 //! Nullable columns (no `NOT NULL` constraint) are wrapped in `Option<T>`.
 
+mod copy;
 pub mod error;
 pub mod executor;
 pub mod from_row;
@@ -449,6 +450,10 @@ pub use typedpg_macros::embed_migrations;
 /// configuration details.
 pub use typedpg_macros::sql;
 
+/// Re-export the `copy_in!` macro from `typedpg_macros`: bulk-load rows with
+/// a binary `COPY ... FROM STDIN`. See [`macro@copy_in`].
+pub use typedpg_macros::copy_in;
+
 // Re-export rust_decimal so generated code can reference it.
 pub use rust_decimal;
 
@@ -456,6 +461,7 @@ pub use rust_decimal;
 /// Not part of the public API — do not rely on these directly.
 #[doc(hidden)]
 pub mod __private {
+    pub use crate::copy::CopyRow;
     pub use bytes;
     pub use tokio_postgres;
 

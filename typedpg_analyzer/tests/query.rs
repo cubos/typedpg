@@ -20,6 +20,8 @@ mod assignments;
 mod call;
 #[path = "query/casts_and_coercion.rs"]
 mod casts_and_coercion;
+#[path = "query/copy_in.rs"]
+mod copy_in;
 #[path = "query/cte_rules.rs"]
 mod cte_rules;
 #[path = "query/ctes.rs"]

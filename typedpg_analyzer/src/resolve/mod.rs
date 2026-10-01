@@ -810,6 +810,7 @@ type AnalyzeResult = Result<(Vec<RawColumn>, Option<Vec<(i32, PgTypeOid, bool)>>
 
 mod assign;
 mod call;
+mod copy_in;
 mod cte;
 mod dml;
 mod from;
@@ -829,6 +830,7 @@ mod walk;
 // the former monolith, so these globs never collide.
 pub(crate) use assign::*;
 pub(crate) use call::*;
+pub use copy_in::AnalyzedCopyIn;
 pub(crate) use cte::*;
 pub(crate) use dml::*;
 pub(crate) use from::*;

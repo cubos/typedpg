@@ -8,8 +8,8 @@ use quote::{format_ident, quote};
 use syn::parse_str;
 
 use typedpg_analyzer::{
-    AnalyzedColumn, AnalyzedParam, AnalyzedQuery, AnalyzedSpreadField, QualifiedName, RecordField,
-    Type,
+    AnalyzedColumn, AnalyzedCopyIn, AnalyzedParam, AnalyzedQuery, AnalyzedSpreadField,
+    QualifiedName, RecordField, Type,
 };
 use typedpg_core::config::ResolvedConfig;
 
@@ -89,6 +89,16 @@ trait TypedParam {
 }
 
 impl TypedParam for AnalyzedParam {
+    fn pg_type(&self) -> &Type {
+        &self.pg_type
+    }
+    fn nullable(&self) -> bool {
+        self.nullable
+    }
+}
+
+/// A `copy_in!` target column, as the value a row supplies for it.
+impl TypedParam for AnalyzedColumn {
     fn pg_type(&self) -> &Type {
         &self.pg_type
     }
@@ -696,6 +706,49 @@ pub fn generate(
     } else {
         generate_spread(analyzed, config, executor_expr, assignments)
     }
+}
+
+/// Generate the future a `copy_in!` invocation evaluates to: each item of
+/// `source` becomes a row of `target`'s columns, read from the item's
+/// `fields` in order, streamed through a binary `COPY ... FROM STDIN`.
+pub fn generate_copy_in(
+    target: &AnalyzedCopyIn,
+    config: &ResolvedConfig,
+    executor_expr: &syn::Expr,
+    source: &syn::Expr,
+    fields: &[syn::Ident],
+) -> Result<TokenStream, syn::Error> {
+    let registry = RecordRegistry::default();
+    let mut pushes = TokenStream::new();
+    for (column, field) in target.columns.iter().zip(fields) {
+        pushes.extend(
+            push_item_field(column, config, &registry, field).map_err(|e| {
+                syn::Error::new(field.span(), format!("column \"{}\": {}", column.name, e))
+            })?,
+        );
+    }
+    let width = fields.len();
+    let copy_sql = &target.copy_sql;
+    let describe_sql = &target.describe_sql;
+    Ok(quote! {{
+        // Evaluated here, like sql!'s executor: the future takes the values,
+        // not the variables they borrow from.
+        let __executor = #executor_expr;
+        let __source = #source;
+        async move {
+            // The rows are converted one at a time, as the COPY consumes
+            // them: the source is never collected.
+            let __rows = ::std::iter::IntoIterator::into_iter(__source).map(
+                |__item| -> ::std::result::Result<typedpg::__private::CopyRow, typedpg::Error> {
+                    let mut __params: typedpg::__private::CopyRow =
+                        ::std::vec::Vec::with_capacity(#width);
+                    #pushes
+                    ::std::result::Result::Ok(__params)
+                },
+            );
+            typedpg::Executor::copy_in(&__executor, #describe_sql, #copy_sql, __rows).await
+        }
+    }})
 }
 
 /// Generate code for a regular query (no spreads).

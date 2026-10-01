@@ -8,6 +8,7 @@
 extern crate proc_macro;
 
 mod codegen;
+mod copy_in_macro;
 mod embed_migrations;
 mod from_row;
 mod migrations_hash;
@@ -401,6 +402,45 @@ pub fn embed_migrations(input: proc_macro::TokenStream) -> proc_macro::TokenStre
     match embed_migrations::expand(input) {
         Ok(ts) => ts.into(),
         Err(e) => e.to_compile_error().into(),
+    }
+}
+
+/// Bulk-load rows into a table with a binary `COPY ... FROM STDIN`.
+///
+/// ```rust,ignore
+/// let copied: u64 = copy_in!(pool, "users (name, email)", users { name, email }).await?;
+/// ```
+///
+/// - The target is a table (or a partitioned table, or a view with an
+///   `INSTEAD OF INSERT` trigger) and an optional column list; without one,
+///   every column but the generated ones. It is checked against the schema
+///   your migrations build, with PostgreSQL's errors.
+/// - The rows are any `IntoIterator` (a `Vec`, a slice, an iterator over
+///   anything); each item supplies the listed fields, in the columns'
+///   order, with the types the columns require (`Option<T>` only for a
+///   nullable column). Items are converted one at a time as the COPY
+///   consumes them.
+/// - It evaluates to a future of the number of rows copied. On error the
+///   COPY is aborted and no row is kept.
+///
+/// Accepts the same `db = name,` prefix as [`sql!`].
+#[proc_macro]
+pub fn copy_in(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    let input = syn::parse_macro_input!(input as copy_in_macro::CopyInInput);
+    match copy_in_macro::expand(input) {
+        Ok(ts) => ts.into(),
+        Err(e) => {
+            // The error, plus a future of the right type so `.await?` at the
+            // call site adds no errors of its own.
+            let err = e.to_compile_error();
+            quote::quote! {
+                {
+                    #err;
+                    async { ::std::result::Result::<u64, typedpg::Error>::Ok(::std::unreachable!()) }
+                }
+            }
+            .into()
+        }
     }
 }
 

@@ -286,6 +286,24 @@ sql!(pool, "INSERT INTO users (name, email) VALUES $..new_users { name, email }"
 
 The macro expands `$..new_users { name, email }` into a multi-row `VALUES` clause with proper parameter numbering.
 
+## Bulk loading with `copy_in!`
+
+For large loads, `copy_in!` streams rows through PostgreSQL's binary `COPY ... FROM STDIN` — much faster than `INSERT`, and with no limit on the number of rows:
+
+```rust
+use typedpg::copy_in;
+
+let copied: u64 = copy_in!(pool, "users (name, email)", new_users { name, email })
+    .await?;
+```
+
+- The target is a table and an optional column list (without one: every column but the generated ones), checked at compile time against your migrations — an unknown table or column, a generated column or a view without an `INSTEAD OF INSERT` trigger is a compile error with PostgreSQL's message.
+- The rows are any `IntoIterator` (a `Vec`, `&slice`, or a lazy iterator); each item supplies the listed fields in the columns' order, typed by the columns — `Option<T>` only for nullable ones. Items are converted one at a time as the COPY consumes them.
+- Enums, JSONB domains and arrays of them go through your `[package.metadata.typedpg.types]` mappings, as in `sql!`.
+- If any row fails, the whole COPY is aborted and no row is kept. Inside a transaction, it commits or rolls back with it.
+
+Use `$..spread` when you need `RETURNING` or `ON CONFLICT`; `copy_in!` when you just need the rows in.
+
 ## Enum types
 
 PostgreSQL enums (`CREATE TYPE ... AS ENUM`) are supported out of the box. Without configuration, they map to `String`:

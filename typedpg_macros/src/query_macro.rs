@@ -260,34 +260,36 @@ fn parse_sql_literal_preserving_linebreaks(lit: &LitStr) -> String {
 }
 
 /// Execute the full `sql!` pipeline and return the generated `TokenStream`.
-pub fn expand(input: QueryInput) -> Result<proc_macro2::TokenStream, syn::Error> {
-    let sql_str = parse_sql_literal_preserving_linebreaks(&input.sql);
-
-    // 1. Load project config from Cargo.toml.
+/// The project's `[package.metadata.typedpg]` config.
+pub(crate) fn load_config() -> Result<typedpg_core::config::Config, syn::Error> {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").map_err(|_| {
         syn::Error::new(
             Span::call_site(),
             "CARGO_MANIFEST_DIR not set — are you running inside cargo build?",
         )
     })?;
-    let manifest_path = Path::new(&manifest_dir);
-    let cargo_toml_path = manifest_path.join("Cargo.toml");
-    let config = typedpg_core::config::Config::from_cargo_toml(&cargo_toml_path)
-        .map_err(|e| syn::Error::new(Span::call_site(), format!("failed to load config: {e}")))?;
+    let cargo_toml_path = Path::new(&manifest_dir).join("Cargo.toml");
+    typedpg_core::config::Config::from_cargo_toml(&cargo_toml_path)
+        .map_err(|e| syn::Error::new(Span::call_site(), format!("failed to load config: {e}")))
+}
 
-    let db_name_str = input.db_name.as_ref().map(|i| i.to_string());
+/// The database `db_name` names (the default one without it) and the
+/// catalog its migrations build.
+pub(crate) fn catalog_for<'c>(
+    config: &'c typedpg_core::config::Config,
+    db_name: Option<&Ident>,
+) -> Result<(PgCatalog, typedpg_core::config::ResolvedConfig<'c>), syn::Error> {
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
+    let manifest_path = Path::new(&manifest_dir);
+    let db_name_str = db_name.map(|i| i.to_string());
     let resolved = config.resolve(db_name_str.as_deref()).map_err(|e| {
         syn::Error::new(
-            input
-                .db_name
-                .as_ref()
-                .map(|i| i.span())
-                .unwrap_or(Span::call_site()),
+            db_name.map(|i| i.span()).unwrap_or(Span::call_site()),
             e.to_string(),
         )
     })?;
 
-    // 2. Build (or reuse cached) PgCatalog from migrations.
+    // Build (or reuse cached) PgCatalog from migrations.
     let migrations_dir = resolved.migrations_dir(manifest_path);
     let extra_dirs = resolved.extra_migrations_dirs(manifest_path);
     let mut all_dirs: Vec<&Path> = vec![migrations_dir.as_path()];
@@ -302,6 +304,13 @@ pub fn expand(input: QueryInput) -> Result<proc_macro2::TokenStream, syn::Error>
         &migration_hash,
         config.migrations.use_transaction,
     )?;
+    Ok((catalog, resolved))
+}
+
+pub fn expand(input: QueryInput) -> Result<proc_macro2::TokenStream, syn::Error> {
+    let sql_str = parse_sql_literal_preserving_linebreaks(&input.sql);
+    let config = load_config()?;
+    let (catalog, resolved) = catalog_for(&config, input.db_name.as_ref())?;
 
     // 3. Analyze the SQL (lex + type inference in one pass).
     let analyzed = catalog
