@@ -1194,3 +1194,17 @@ fn untyped_param_in_list_with_mixed_types_is_inconsistent() {
         "operator does not exist: integer = text"
     );
 }
+
+/// The lexer accepts a bare `$..items`, but without a field list nothing
+/// says which item fields fill which columns: a user error naming the fix,
+/// not an internal analyzer error.
+#[test]
+fn spread_without_field_list_is_a_user_error() {
+    let db = setup();
+    assert_err_prefix!(
+        db.analyze("INSERT INTO users (id, name, email) VALUES $..items"),
+        AnalyzeError::Invalid(_),
+        "spread `$..items` needs a field list naming the item fields to bind, \
+         e.g. `$..items { field1, field2 }`"
+    );
+}
