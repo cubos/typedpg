@@ -489,7 +489,7 @@ let maybe: Option<User> = sql!(pool, "SELECT id, name, email FROM users WHERE id
     .await?;
 ```
 
-Field names must match the query's output column names. `Option<T>` fields receive nullable columns. Field types still have to match what the analyzer infers — the macro's compile-time type check runs against the SQL, not against `T`.
+Field names must match the query's output column names (a `"col!"` / `"col?"` alias names the column `col`). Each field's type must be its column's Rust type, or an `Option` of it, and this is checked at compile time: `age: i32` for a nullable `age`, or a field the query doesn't return, is a compile error pointing at the field. Rows are decoded the way `sql!` decodes its own struct, so mapped enum, JSONB-domain and composite fields work too.
 
 ## Multiple databases
 

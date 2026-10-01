@@ -265,9 +265,12 @@
 //!     .await?;
 //! ```
 //!
-//! Field names must match the query's output column names; `Option<T>` fields
-//! receive nullable columns. The compile-time type check still runs against
-//! the SQL itself, not against `T`.
+//! `T` is checked against the query at compile time: each field must have an
+//! output column of the same name (a `"col!"` / `"col?"` alias names the
+//! column `col`), and the field's type must be the column's Rust type, or an
+//! `Option` of it — `age: i32` for a nullable `age` is a compile error. The
+//! row is decoded the way `sql!` decodes its own struct, so fields of mapped
+//! enum, JSONB-domain and composite types work too.
 //!
 //! # Multiple databases
 //!

@@ -1,0 +1,28 @@
+error[E0277]: a `FromRow` field of type `i32` can't hold its query column, of type `Option<i32>`
+  --> src/bin/from_row_nullable_column.rs:11:10
+   |
+11 |         .fetch_all_as()
+   |          ^^^^^^^^^^^^ this field's type doesn't match its column
+   |
+   = help: the trait `FromColumn<Option<i32>>` is not implemented for `i32`
+   = note: a field takes its column's Rust type `Option<i32>`, or `Option<Option<i32>>`
+help: the trait `FromColumn<T>` is implemented for `Option<T>`
+  --> $WORKSPACE/typedpg/src/from_row.rs:LL:CC
+   |
+88 | impl<T> FromColumn<T> for Option<T> {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+note: required for `Age` to implement `FromQueryRow<__sql_columns>`
+  --> src/bin/from_row_nullable_column.rs:5:8
+   |
+ 5 | struct Age {
+   |        ^^^
+ 6 |     age: i32,
+   |     --- unsatisfied trait bound
+   = help: consider manually implementing `FromQueryRow<__sql_columns>` to avoid undesired bounds
+note: required by a bound in `__typedpg_query::<__E>::fetch_all_as`
+  --> src/bin/from_row_nullable_column.rs:10:23
+   |
+10 |     let _: Vec<Age> = typedpg::sql!(db, "SELECT age FROM users")
+   |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `__typedpg_query::<__E>::fetch_all_as`
+   = note: this error originates in the macro `typedpg::sql` (in Nightly builds, run with -Z macro-backtrace for more info)
+

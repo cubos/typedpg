@@ -339,7 +339,7 @@ fn error_placeholder(e: syn::Error) -> proc_macro2::TokenStream {
                 ) -> ::std::result::Result<typedpg::QueryStream<__sql_output>, typedpg::Error> {
                     ::std::unreachable!()
                 }
-                async fn fetch_stream_as<__T: typedpg::FromRow>(
+                async fn fetch_stream_as<__T>(
                     self,
                 ) -> ::std::result::Result<typedpg::QueryStream<__T>, typedpg::Error> {
                     ::std::unreachable!()
@@ -347,17 +347,17 @@ fn error_placeholder(e: syn::Error) -> proc_macro2::TokenStream {
                 async fn fetch_value<__T>(self) -> ::std::result::Result<__T, typedpg::Error> {
                     ::std::unreachable!()
                 }
-                async fn fetch_all_as<__T: typedpg::FromRow>(
+                async fn fetch_all_as<__T>(
                     self,
                 ) -> ::std::result::Result<::std::vec::Vec<__T>, typedpg::Error> {
                     ::std::unreachable!()
                 }
-                async fn fetch_one_as<__T: typedpg::FromRow>(
+                async fn fetch_one_as<__T>(
                     self,
                 ) -> ::std::result::Result<__T, typedpg::Error> {
                     ::std::unreachable!()
                 }
-                async fn fetch_optional_as<__T: typedpg::FromRow>(
+                async fn fetch_optional_as<__T>(
                     self,
                 ) -> ::std::result::Result<::std::option::Option<__T>, typedpg::Error>
                 {

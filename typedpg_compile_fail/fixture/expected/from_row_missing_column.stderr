@@ -1,0 +1,29 @@
+error[E0277]: the query has no column for a field of this `FromRow` type
+  --> src/bin/from_row_missing_column.rs:12:10
+   |
+12 |         .fetch_one_as()
+   |          ^^^^^^^^^^^^ the query has no column of this field's name
+   |
+   = note: a `#[derive(FromRow)]` field reads the query column of the same name (with any "col!" / "col?" annotation dropped): rename the field or alias the column
+help: the trait `Column<227795099659203099934513066942484421973>` is not implemented for `__sql_columns`
+      but trait `Column<139805238982077690295483749954561134894>` is implemented for it
+  --> src/bin/from_row_missing_column.rs:11:20
+   |
+11 |     let _: Named = typedpg::sql!(db, "SELECT name FROM users LIMIT 1")
+   |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+note: required for `Named` to implement `FromQueryRow<__sql_columns>`
+  --> src/bin/from_row_missing_column.rs:5:8
+   |
+ 5 | struct Named {
+   |        ^^^^^
+ 6 |     name: String,
+ 7 |     nickname: String,
+   |     -------- unsatisfied trait bound
+   = help: consider manually implementing `FromQueryRow<__sql_columns>` to avoid undesired bounds
+note: required by a bound in `__typedpg_query::<__E>::fetch_one_as`
+  --> src/bin/from_row_missing_column.rs:11:20
+   |
+11 |     let _: Named = typedpg::sql!(db, "SELECT name FROM users LIMIT 1")
+   |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `__typedpg_query::<__E>::fetch_one_as`
+   = note: this error originates in the macro `typedpg::sql` (in Nightly builds, run with -Z macro-backtrace for more info)
+

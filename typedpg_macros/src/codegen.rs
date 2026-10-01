@@ -863,6 +863,7 @@ fn generate_regular(
     let registry = RecordRegistry::build(analyzed, config);
     let record_defs = emit_records(&registry, config)?;
     let output_struct = build_output_struct(&analyzed.columns, config, &registry)?;
+    let column_impls = build_column_impls(&analyzed.columns, config, &registry)?;
     let (param_field_defs, param_field_inits) =
         build_param_fields(analyzed, config, &registry, assignments)?;
     let params_slice = build_params_slice(analyzed, config, &registry)?;
@@ -889,6 +890,8 @@ fn generate_regular(
             struct __sql_output {
                 #output_struct
             }
+
+            #column_impls
 
             // ----- query builder struct -----
             #[allow(non_camel_case_types)]
@@ -968,13 +971,13 @@ fn generate_regular(
                 }
 
                 /// Execute the query and stream its rows, mapped to `T`.
-                async fn fetch_stream_as<__T: typedpg::FromRow>(self) -> ::std::result::Result<typedpg::QueryStream<__T>, typedpg::Error> {
+                async fn fetch_stream_as<__T: typedpg::from_row::FromQueryRow<__sql_columns>>(self) -> ::std::result::Result<typedpg::QueryStream<__T>, typedpg::Error> {
                     let __rows = typedpg::Executor::query_stream(
                         &self.__executor,
                         #sql_str,
                         &[#params_slice],
                     ).await?;
-                    ::std::result::Result::Ok(typedpg::QueryStream::new(__rows, __T::from_row))
+                    ::std::result::Result::Ok(typedpg::QueryStream::new(__rows, <__T as typedpg::from_row::FromQueryRow<__sql_columns>>::from_query_row))
                 }
 
                 /// Execute the statement and return the number of affected rows.
@@ -989,19 +992,19 @@ fn generate_regular(
                 #fetch_value_method
 
                 /// Execute the query and return all resulting rows mapped to `T`.
-                async fn fetch_all_as<__T: typedpg::FromRow>(self) -> ::std::result::Result<::std::vec::Vec<__T>, typedpg::Error> {
+                async fn fetch_all_as<__T: typedpg::from_row::FromQueryRow<__sql_columns>>(self) -> ::std::result::Result<::std::vec::Vec<__T>, typedpg::Error> {
                     let __rows = typedpg::Executor::query(
                         &self.__executor,
                         #sql_str,
                         &[#params_slice],
                     ).await?;
                     __rows.into_iter().map(|__row| {
-                        __T::from_row(&__row)
+                        <__T as typedpg::from_row::FromQueryRow<__sql_columns>>::from_query_row(&__row)
                     }).collect()
                 }
 
                 /// Execute the query and return exactly one row mapped to `T`.
-                async fn fetch_one_as<__T: typedpg::FromRow>(self) -> ::std::result::Result<__T, typedpg::Error> {
+                async fn fetch_one_as<__T: typedpg::from_row::FromQueryRow<__sql_columns>>(self) -> ::std::result::Result<__T, typedpg::Error> {
                     let __rows = typedpg::Executor::query(
                         &self.__executor,
                         #sql_limited,
@@ -1013,11 +1016,11 @@ fn generate_regular(
                     if __iter.next().is_some() {
                         return ::std::result::Result::Err(typedpg::Error::too_many_rows(__TYPEDPG_QUERY));
                     }
-                    __T::from_row(&__row)
+                    <__T as typedpg::from_row::FromQueryRow<__sql_columns>>::from_query_row(&__row)
                 }
 
                 /// Execute the query and return at most one row mapped to `T`.
-                async fn fetch_optional_as<__T: typedpg::FromRow>(self) -> ::std::result::Result<::std::option::Option<__T>, typedpg::Error> {
+                async fn fetch_optional_as<__T: typedpg::from_row::FromQueryRow<__sql_columns>>(self) -> ::std::result::Result<::std::option::Option<__T>, typedpg::Error> {
                     let __rows = typedpg::Executor::query(
                         &self.__executor,
                         #sql_limited,
@@ -1029,7 +1032,7 @@ fn generate_regular(
                             if __iter.next().is_some() {
                                 return ::std::result::Result::Err(typedpg::Error::too_many_rows(__TYPEDPG_QUERY));
                             }
-                            ::std::result::Result::Ok(Some(__T::from_row(&__row)?))
+                            ::std::result::Result::Ok(Some(<__T as typedpg::from_row::FromQueryRow<__sql_columns>>::from_query_row(&__row)?))
                         },
                         None => ::std::result::Result::Ok(None),
                     }
@@ -1060,6 +1063,7 @@ fn generate_spread(
     let registry = RecordRegistry::build(analyzed, config);
     let record_defs = emit_records(&registry, config)?;
     let output_struct = build_output_struct(&analyzed.columns, config, &registry)?;
+    let column_impls = build_column_impls(&analyzed.columns, config, &registry)?;
     let row_mapping = build_row_mapping(&analyzed.columns, config, &registry)?;
     let num_regular_params = analyzed.params.len();
     let num_spreads = analyzed.spreads.len();
@@ -1268,6 +1272,8 @@ fn generate_spread(
                 #output_struct
             }
 
+            #column_impls
+
             #[allow(non_camel_case_types)]
             // A parameter value, owned: `Send` so the query's future is.
             #[allow(non_camel_case_types)]
@@ -1340,13 +1346,13 @@ fn generate_spread(
                     ::std::result::Result::Ok(typedpg::QueryStream::new(__rows, __decode))
                 }
 
-                async fn fetch_stream_as<__T: typedpg::FromRow>(self) -> ::std::result::Result<typedpg::QueryStream<__T>, typedpg::Error> {
+                async fn fetch_stream_as<__T: typedpg::from_row::FromQueryRow<__sql_columns>>(self) -> ::std::result::Result<typedpg::QueryStream<__T>, typedpg::Error> {
                     #query_preamble
                     if __any_empty {
-                        return ::std::result::Result::Ok(typedpg::QueryStream::new(typedpg::RowStream::empty(), __T::from_row));
+                        return ::std::result::Result::Ok(typedpg::QueryStream::new(typedpg::RowStream::empty(), <__T as typedpg::from_row::FromQueryRow<__sql_columns>>::from_query_row));
                     }
                     let __rows = typedpg::Executor::query_stream(&self.__executor, &__sql, &__params_ref).await?;
-                    ::std::result::Result::Ok(typedpg::QueryStream::new(__rows, __T::from_row))
+                    ::std::result::Result::Ok(typedpg::QueryStream::new(__rows, <__T as typedpg::from_row::FromQueryRow<__sql_columns>>::from_query_row))
                 }
 
                 async fn execute(self) -> ::std::result::Result<u64, typedpg::Error> {
@@ -1359,18 +1365,18 @@ fn generate_spread(
 
                 #fetch_value_method
 
-                async fn fetch_all_as<__T: typedpg::FromRow>(self) -> ::std::result::Result<::std::vec::Vec<__T>, typedpg::Error> {
+                async fn fetch_all_as<__T: typedpg::from_row::FromQueryRow<__sql_columns>>(self) -> ::std::result::Result<::std::vec::Vec<__T>, typedpg::Error> {
                     #query_preamble
                     if __any_empty {
                         return ::std::result::Result::Ok(::std::vec::Vec::new());
                     }
                     let __rows = typedpg::Executor::query(&self.__executor, &__sql, &__params_ref).await?;
                     __rows.into_iter().map(|__row| {
-                        __T::from_row(&__row)
+                        <__T as typedpg::from_row::FromQueryRow<__sql_columns>>::from_query_row(&__row)
                     }).collect()
                 }
 
-                async fn fetch_one_as<__T: typedpg::FromRow>(self) -> ::std::result::Result<__T, typedpg::Error> {
+                async fn fetch_one_as<__T: typedpg::from_row::FromQueryRow<__sql_columns>>(self) -> ::std::result::Result<__T, typedpg::Error> {
                     #query_preamble
                     if __any_empty {
                         return ::std::result::Result::Err(typedpg::Error::no_rows(__TYPEDPG_QUERY));
@@ -1381,10 +1387,10 @@ fn generate_spread(
                     if __iter.next().is_some() {
                         return ::std::result::Result::Err(typedpg::Error::too_many_rows(__TYPEDPG_QUERY));
                     }
-                    __T::from_row(&__row)
+                    <__T as typedpg::from_row::FromQueryRow<__sql_columns>>::from_query_row(&__row)
                 }
 
-                async fn fetch_optional_as<__T: typedpg::FromRow>(self) -> ::std::result::Result<::std::option::Option<__T>, typedpg::Error> {
+                async fn fetch_optional_as<__T: typedpg::from_row::FromQueryRow<__sql_columns>>(self) -> ::std::result::Result<::std::option::Option<__T>, typedpg::Error> {
                     #query_preamble
                     if __any_empty {
                         return ::std::result::Result::Ok(::std::option::Option::None);
@@ -1396,7 +1402,7 @@ fn generate_spread(
                             if __iter.next().is_some() {
                                 return ::std::result::Result::Err(typedpg::Error::too_many_rows(__TYPEDPG_QUERY));
                             }
-                            ::std::result::Result::Ok(Some(__T::from_row(&__row)?))
+                            ::std::result::Result::Ok(Some(<__T as typedpg::from_row::FromQueryRow<__sql_columns>>::from_query_row(&__row)?))
                         },
                         None => ::std::result::Result::Ok(None),
                     }
@@ -1486,6 +1492,42 @@ fn build_output_struct(
     }
 
     Ok(fields)
+}
+
+/// The `__sql_columns` marker type `fetch_*_as::<T>()` builds `T` from: one
+/// `typedpg::from_row::Column<K>` impl per output column, keyed by the
+/// output struct's field name, decoding the column the way the output
+/// struct does. `#[derive(FromRow)]` requires one per field, so a field
+/// without a column, or of a type that can't hold its column, is a compile
+/// error.
+fn build_column_impls(
+    columns: &[AnalyzedColumn],
+    config: &ResolvedConfig,
+    registry: &RecordRegistry,
+) -> Result<TokenStream, syn::Error> {
+    use syn::ext::IdentExt;
+    let mut impls = TokenStream::new();
+    for (idx, col) in columns.iter().enumerate() {
+        let key = crate::from_row::field_key(&make_field_ident(&col.name).unraw().to_string());
+        let ty = column_rust_type(col, config, registry)?;
+        let get_expr = column_get_expr(col, config, registry, idx)?;
+        impls.extend(quote! {
+            impl typedpg::from_row::Column<#key> for __sql_columns {
+                type Type = #ty;
+                #[allow(clippy::needless_question_mark)]
+                fn decode(
+                    __row: &::typedpg::__private::tokio_postgres::Row,
+                ) -> ::std::result::Result<#ty, typedpg::Error> {
+                    ::std::result::Result::Ok(#get_expr)
+                }
+            }
+        });
+    }
+    Ok(quote! {
+        #[allow(non_camel_case_types)]
+        struct __sql_columns;
+        #impls
+    })
 }
 
 // ---------------------------------------------------------------------------
