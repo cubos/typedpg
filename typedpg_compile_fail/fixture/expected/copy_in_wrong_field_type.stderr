@@ -1,8 +1,9 @@
-error[E0277]: the trait bound `Option<i32>: From<String>` is not satisfied
-  --> src/bin/copy_in_wrong_field_type.rs:13:5
+error[E0277]: field `age` (column "age") expects a value for SQL type integer, not `String`
+  --> src/bin/copy_in_wrong_field_type.rs:13:62
    |
 13 |     typedpg::copy_in!(db, "users (name, age)", users { name, age }).await?;
-   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `From<String>` is not implemented for `Option<i32>`
+   |                                                              ^^^ expected a value for integer
    |
-   = note: this error originates in the macro `typedpg::copy_in` (in Nightly builds, run with -Z macro-backtrace for more info)
+   = help: the trait `__TypedpgBind1` is not implemented for `String`
+   = note: field `age` (column "age") takes `i32`, or `Option<i32>` (`None` for NULL)
 

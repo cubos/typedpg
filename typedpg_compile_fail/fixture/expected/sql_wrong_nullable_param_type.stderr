@@ -1,0 +1,9 @@
+error[E0277]: `$age` expects a value for SQL type integer, not `Option<&str>`
+ --> src/bin/sql_wrong_nullable_param_type.rs:7:15
+  |
+7 |         age = Some("forty")
+  |               ^^^^^^^^^^^^^ expected a value for integer
+  |
+  = help: the trait `__TypedpgBind0` is not implemented for `Option<&str>`
+  = note: `$age` takes `i32`, or `Option<i32>` (`None` for NULL)
+

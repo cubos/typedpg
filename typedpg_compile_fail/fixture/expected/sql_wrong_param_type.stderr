@@ -1,11 +1,9 @@
-error[E0277]: the trait bound `i64: From<&str>` is not satisfied
+error[E0277]: `$id` expects a value for SQL type bigint NOT NULL, not `&str`
  --> src/bin/sql_wrong_param_type.rs:4:69
   |
 4 |     typedpg::sql!(db, "SELECT name FROM users WHERE id = $id", id = "one")
-  |     ----------------------------------------------------------------^^^^^-
-  |     |                                                               |
-  |     |                                                               the trait `From<&str>` is not implemented for `i64`
-  |     required by a bound introduced by this call
+  |                                                                     ^^^^^ expected a value for bigint
   |
-  = note: required for `&str` to implement `Into<i64>`
+  = help: the trait `__TypedpgBind0` is not implemented for `&str`
+  = note: `$id` takes `i64`, or any value with `Into<i64>`
 

@@ -1,0 +1,13 @@
+error[E0277]: field `age` of `$..users` expects a value for SQL type integer, not `String`
+  --> src/bin/sql_spread_wrong_field_type.rs:11:5
+   |
+11 | /     typedpg::sql!(
+12 | |         db,
+13 | |         "INSERT INTO users (name, email, age) VALUES $..users { name, email, age }"
+14 | |     )
+   | |_____^ expected a value for integer
+   |
+   = help: the trait `__TypedpgBind2` is not implemented for `String`
+   = note: field `age` of `$..users` takes `i32`, or `Option<i32>` (`None` for NULL)
+   = note: this error originates in the macro `typedpg::sql` (in Nightly builds, run with -Z macro-backtrace for more info)
+
