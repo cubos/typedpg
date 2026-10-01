@@ -979,8 +979,7 @@ fn generate_spread(
         let mut item_pushes = TokenStream::new();
         for field in &spread.fields {
             let accessor_ident = format_ident!("{}", field.name);
-            let accessor: TokenStream = quote! { __item.#accessor_ident };
-            item_pushes.extend(push_param(field, config, &registry, &accessor)?);
+            item_pushes.extend(push_item_field(field, config, &registry, &accessor_ident)?);
         }
 
         spread_struct_inits.extend(quote! {
@@ -1330,6 +1329,29 @@ fn build_param_fields(
     }
 
     Ok((defs, inits))
+}
+
+/// Push the value field `field` of the current row item (`__item`) supplies
+/// for `param`, first bound to the Rust type `param` requires — with the
+/// conversions a query parameter accepts — so a field of the wrong type is
+/// a compile error at the field, not a failure when the query runs.
+fn push_item_field<P: TypedParam>(
+    param: &P,
+    config: &ResolvedConfig,
+    registry: &RecordRegistry,
+    field: &syn::Ident,
+) -> Result<TokenStream, syn::Error> {
+    let raw = quote::quote_spanned! {field.span()=> ::std::clone::Clone::clone(&__item.#field) };
+    let (ty, value) = build_field_type_and_value(param, config, registry, &raw)?;
+    let local = format_ident!("__field_{}", field);
+    let push = push_param(param, config, registry, &quote! { #local })?;
+    // The clone carries the field's span (so a type error points at the
+    // field), which makes clippy treat it as the caller's code.
+    Ok(quote::quote_spanned! {field.span()=>
+        #[allow(clippy::clone_on_copy)]
+        let #local: #ty = #value;
+        #push
+    })
 }
 
 /// Compute the Rust field type and (optionally wrapped) value expression for a
