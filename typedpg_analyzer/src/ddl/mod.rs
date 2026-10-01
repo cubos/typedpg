@@ -193,7 +193,7 @@ fn parse(sql: &str) -> Result<typedpg_pg_query::ParseResult, DdlError> {
     // A grammar error carries PG's message verbatim.
     typedpg_pg_query::parse(sql).map_err(|e| {
         DdlError::Parse(match e {
-            typedpg_pg_query::Error::Parse(msg) => msg,
+            typedpg_pg_query::Error::Parse { message, .. } => message,
             other => other.to_string(),
         })
     })

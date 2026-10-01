@@ -279,7 +279,7 @@ fn body_statements(stmt: &CreateFunctionStmt) -> Result<Option<(Vec<node::Node>,
         return Ok(None);
     };
     let parsed = typedpg_pg_query::parse(source).map_err(|e| match e {
-        typedpg_pg_query::Error::Parse(msg) => DdlError::Parse(msg),
+        typedpg_pg_query::Error::Parse { message, .. } => DdlError::Parse(message),
         other => DdlError::Parse(other.to_string()),
     })?;
     let statements = parsed
@@ -590,7 +590,7 @@ fn compile_plpgsql(interp: &PgCatalog, sql: &str) -> Result<(), DdlError> {
     typedpg_pg_query::parse_plpgsql_with_catalog(sql, interp)
         .map(|_| ())
         .map_err(|e| match e {
-            typedpg_pg_query::Error::Parse(msg) => DdlError::Parse(msg),
+            typedpg_pg_query::Error::Parse { message, .. } => DdlError::Parse(message),
             other => DdlError::Parse(other.to_string()),
         })
 }

@@ -486,6 +486,23 @@ impl SourceSpan {
         Self::new(start, start + 1)
     }
 
+    /// The span of a grammar error PG positioned at byte `position` of
+    /// `sql`: the token its message quotes (`syntax error at or near
+    /// "WHERE"`) when the text there spells it, one character otherwise
+    /// (`at end of input` points just past the last one).
+    pub(crate) fn syntax_error_at(sql: &str, position: usize, message: &str) -> Self {
+        let near = message
+            .split_once(" at or near \"")
+            .and_then(|(_, rest)| rest.strip_suffix('"'))
+            .filter(|token| !token.is_empty());
+        match near {
+            Some(token) if sql.get(position..).is_some_and(|s| s.starts_with(token)) => {
+                Self::at_length(position, token.len())
+            }
+            _ => Self::one_char_at(position),
+        }
+    }
+
     /// Convert a `typedpg_pg_query` AST `location` (i32; -1 means absent) into a
     /// caret-only span. Returns `None` when the location is unset.
     pub(crate) fn from_location(location: i32) -> Option<Self> {

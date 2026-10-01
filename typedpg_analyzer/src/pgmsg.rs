@@ -680,7 +680,7 @@ pub(crate) fn recursive_query_column_type(
 /// the query-level ones) get the variant carrying that code — the frame
 /// bound checks of `opt_frame_clause` are `windowing_error` (42P20), a
 /// non-constant JSON_TABLE path `feature_not_supported` (0A000).
-pub(crate) fn grammar_error(message: String) -> AnalyzeError {
+pub(crate) fn grammar_error(message: String, span: Option<SourceSpan>) -> RawError {
     const WINDOWING: &[&str] = &[
         "frame start cannot be UNBOUNDED FOLLOWING",
         "frame starting from following row cannot end with current row",
@@ -699,7 +699,7 @@ pub(crate) fn grammar_error(message: String) -> AnalyzeError {
         "precision for type float must be less than 54 bits",
         "unrecognized JSON encoding: ",
     ];
-    if WINDOWING.iter().any(|m| message.starts_with(m)) {
+    let kind = if WINDOWING.iter().any(|m| message.starts_with(m)) {
         AnalyzeError::WindowingError(message)
     } else if FEATURE_NOT_SUPPORTED.iter().any(|m| message.starts_with(m)) {
         AnalyzeError::FeatureNotSupported(message)
@@ -710,7 +710,8 @@ pub(crate) fn grammar_error(message: String) -> AnalyzeError {
         AnalyzeError::Invalid(message)
     } else {
         AnalyzeError::Parse(message)
-    }
+    };
+    RawError::new(kind, span, None)
 }
 
 /// `cross-database references are not implemented: a.b.c` — SQLSTATE

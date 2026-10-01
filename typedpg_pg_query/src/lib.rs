@@ -46,8 +46,15 @@ pub enum Error {
     Decode(#[from] prost::DecodeError),
     /// PostgreSQL's parser (or deparser) rejected the input; the message is
     /// the server's.
-    #[error("Invalid statement: {0}")]
-    Parse(String),
+    #[error("Invalid statement: {message}")]
+    Parse {
+        /// The server's error message (`syntax error at or near "x"`).
+        message: String,
+        /// Where the error is, as a byte offset into the input — what PG
+        /// reports as the error's `POSITION` (`cursorpos`). `None` when the
+        /// error has no position.
+        position: Option<usize>,
+    },
     /// The PL/pgSQL parse tree wasn't valid JSON.
     #[error("Error parsing JSON: {0}")]
     InvalidJson(String),
@@ -75,6 +82,16 @@ impl ParseResult {
     }
 }
 
+impl Error {
+    /// A [`Error::Parse`] without a position.
+    fn parse_message(message: impl Into<String>) -> Self {
+        Error::Parse {
+            message: message.into(),
+            position: None,
+        }
+    }
+}
+
 /// The message of a libpg_query error.
 ///
 /// # Safety
@@ -83,6 +100,30 @@ unsafe fn error_message(error: *const ffi::PgQueryError) -> String {
     unsafe { CStr::from_ptr((*error).message) }
         .to_string_lossy()
         .into_owned()
+}
+
+/// A libpg_query error as an [`Error::Parse`], its position converted to a
+/// byte offset into `input`.
+///
+/// libpg_query's `cursorpos` is PG's `errposition`: a 1-based *character*
+/// index (`pg_mbstrlen_with_len(scanbuf, location) + 1` in
+/// `scanner_errposition`), 0 when the error has none.
+///
+/// # Safety
+/// `error` must be a live `PgQueryError`.
+unsafe fn parse_error(error: *const ffi::PgQueryError, input: &str) -> Error {
+    let message = unsafe { error_message(error) };
+    let cursorpos = unsafe { (*error).cursorpos };
+    let position = usize::try_from(cursorpos)
+        .ok()
+        .and_then(|pos| pos.checked_sub(1))
+        .map(|chars| {
+            input
+                .char_indices()
+                .nth(chars)
+                .map_or(input.len(), |(byte, _)| byte)
+        });
+    Error::Parse { message, position }
 }
 
 /// Parse `sql` with PostgreSQL's grammar.
@@ -119,7 +160,7 @@ fn parse_with_options(sql: &str, options: std::ffi::c_int) -> Result<ParseResult
             .map(|protobuf| ParseResult { protobuf, stderr })
             .map_err(Error::Decode)
     } else {
-        Err(Error::Parse(unsafe { error_message(result.error) }))
+        Err(unsafe { parse_error(result.error, sql) })
     };
     unsafe { ffi::pg_query_free_protobuf_parse_result(result) };
     parsed
@@ -154,7 +195,7 @@ pub fn deparse(tree: &protobuf::ParseResult) -> Result<String> {
             .to_string_lossy()
             .into_owned())
     } else {
-        Err(Error::Parse(unsafe { error_message(result.error) }))
+        Err(Error::parse_message(unsafe { error_message(result.error) }))
     };
     unsafe { ffi::pg_query_free_deparse_result(result) };
     sql
@@ -172,7 +213,9 @@ pub fn parse_plpgsql(sql: &str) -> Result<serde_json::Value> {
         let json = unsafe { CStr::from_ptr(result.plpgsql_funcs) }.to_string_lossy();
         serde_json::from_str(&json).map_err(|e| Error::InvalidJson(e.to_string()))
     } else {
-        Err(Error::Parse(unsafe { error_message(result.error) }))
+        // PL/pgSQL's compiler positions its errors in the function body,
+        // not in `sql`: drop the position rather than misplace it.
+        Err(Error::parse_message(unsafe { error_message(result.error) }))
     };
     unsafe { ffi::pg_query_free_plpgsql_parse_result(result) };
     parsed
@@ -287,7 +330,7 @@ impl protobuf::Node {
     pub fn deparse(&self) -> Result<String> {
         match &self.node {
             Some(n) => n.deparse(),
-            None => Err(Error::Parse("empty node".into())),
+            None => Err(Error::parse_message("empty node")),
         }
     }
 }
