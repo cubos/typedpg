@@ -2,7 +2,8 @@
 #
 # Spin up a real PostgreSQL Docker container, export POSTGRES_URL pointing
 # at it, run `cargo nextest run --features pg_sanity` (passing through any
-# extra args), then tear the container down — even on failure.
+# extra args), print the nullability oracle's counters, then tear the
+# container down — even on failure.
 #
 # Each `PgCatalog::new()` in the analyzer's tests will create its own
 # scratch database inside the cluster (and DROP it on Drop). All tests
@@ -78,7 +79,32 @@ export POSTGRES_URL="host=127.0.0.1 port=$PG_PORT user=$PG_USER password=$PG_PAS
 echo "pg_sanity: POSTGRES_URL=$POSTGRES_URL"
 echo "pg_sanity: running tests..."
 
+# The nullability soundness oracle (typedpg_analyzer/src/pg_sanity/
+# soundness.rs) appends each catalog's counters here; summed up below.
+TYPEDPG_SOUNDNESS_STATS="$(mktemp -t typedpg-soundness.XXXXXX)"
+export TYPEDPG_SOUNDNESS_STATS
+
 # Defaults always apply; extra args (filters, --run-ignored, -E …) are
 # appended. Repeating `-p`/`--features` from the command line is harmless —
 # cargo merges duplicates.
-cargo nextest run --release --features pg_sanity -p typedpg_analyzer "$@"
+status=0
+cargo nextest run --release --features pg_sanity -p typedpg_analyzer "$@" || status=$?
+
+echo "pg_sanity: nullability oracle —"
+awk -F'\t' '
+    $1 == "count" { n[$2] += $3 }
+    $1 == "skip"  { skips[$2] = 1 }
+    $1 == "error" { errors[$2] += $3 }
+    END {
+        printf "  queries executed over adversarial data: %d (%d scenario runs, %d failed at runtime)\n",
+            n["checked"], n["executions"], n["exec_errors"]
+        for (c in errors) printf "    SQLSTATE %s: %d\n", c, errors[c]
+        printf "  not executed: %d with no NOT NULL promise, %d not SELECT/DML, %d calling unsafe functions, %d lacking a parameter sample\n",
+            n["no_promise"], n["not_executable"], n["unsafe_calls"], n["no_param_sample"]
+        k = 0
+        for (s in skips) k++
+        printf "  tables the seeder could not fill: %d distinct\n", k
+        for (s in skips) printf "    %s\n", s
+    }' "$TYPEDPG_SOUNDNESS_STATS"
+rm -f "$TYPEDPG_SOUNDNESS_STATS"
+exit "$status"

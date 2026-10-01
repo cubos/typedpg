@@ -27,6 +27,11 @@
 //! analyzer states an expected SQLSTATE for its error
 //! ([`AnalyzeError::sqlstate`]), it must match the code PG
 //! attached; errors with no stated code are compared on wording only.
+//!
+//! Every accepted query is also executed over adversarial data to check
+//! the analyzer's nullability: see [`soundness`].
+
+mod soundness;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -87,6 +92,10 @@ pub enum DivergenceKind {
     /// differs from the one PG attached — the analyzer classified the
     /// error under the wrong variant.
     SqlState,
+    /// Query: executed over adversarial data, a value the analyzer
+    /// inferred NOT NULL (a column, an array element, a record field)
+    /// came back NULL.
+    Nullability,
 }
 
 impl std::fmt::Display for Divergence {
@@ -146,6 +155,7 @@ pub(crate) struct PgSanityServer {
     /// Name of the scratch database; dropped from `admin_conn_str` on Drop.
     db_name: String,
     type_name_cache: HashMap<u32, String>,
+    soundness: soundness::Soundness,
 }
 
 impl PgSanityServer {
@@ -198,6 +208,7 @@ impl PgSanityServer {
             admin_conn_str,
             db_name,
             type_name_cache: HashMap::new(),
+            soundness: soundness::Soundness::new(),
         })
     }
 
@@ -223,6 +234,7 @@ impl PgSanityServer {
         our_result: &Result<(), E>,
     ) -> Option<Divergence> {
         let pg_result = self.client.batch_execute(sql);
+        self.soundness.schema_changed();
         match (our_result, &pg_result) {
             (Ok(()), Ok(())) => None,
             (Err(_), Err(_)) => {
@@ -429,7 +441,8 @@ impl PgSanityServer {
                         });
                     }
                 }
-                None
+                self.soundness
+                    .check(&mut self.query_client, analysis_sql, ours, stmt)
             }
             (Err(e), Err(_)) => {
                 let our_msg = format!("{e}");
@@ -553,6 +566,7 @@ impl PgSanityServer {
 
 impl Drop for PgSanityServer {
     fn drop(&mut self) {
+        self.soundness.write_stats();
         // Tear down the scratch database. We can't run DROP DATABASE while
         // any session is connected to it, so first drop our scratch client
         // (by replacing it via `mem::replace` … actually just close

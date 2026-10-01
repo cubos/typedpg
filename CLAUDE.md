@@ -124,6 +124,15 @@ run via `scripts/run-pg-sanity.sh`). A differential fuzzer
 (`typedpg_analyzer/tests/fuzz.rs`, `#[ignore]`d) generates queries to surface
 new disagreements automatically.
 
+**Nullability soundness.** Describe says nothing about nullability, so the
+mirror also *executes* every accepted query, in a rolled-back transaction,
+over adversarial rows it seeds into every table (NULL in each nullable
+column, a second fully-filled row, foreign keys leaving parents unmatched)
+and fails if a value inferred NOT NULL — a column, a `Some(false)` array
+element, a non-nullable record field — comes back NULL
+(`typedpg_analyzer/src/pg_sanity/soundness.rs`). A divergence there is a
+soundness bug in the analyzer: fix the inference, never the expectation.
+
 **Error-message contract — single-error fidelity only.** When the analyzer
 rejects a query, its message must *start with* PG's server-side message
 verbatim (extra trailing detail / hints are fine). This contract applies to
