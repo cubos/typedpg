@@ -4,6 +4,26 @@ use std::path::Path;
 
 include!("patches.rs");
 
+/// libpg_query's PostgreSQL headers, compiled from a copy (see main).
+const HEADERS: &str = "src/postgres/include";
+
+/// Copy the directory tree `from` to `to`.
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap_or_else(|e| panic!("creating {}: {e}", to.display()));
+    for entry in
+        std::fs::read_dir(from).unwrap_or_else(|e| panic!("reading {}: {e}", from.display()))
+    {
+        let entry = entry.expect("a directory entry");
+        let target = to.join(entry.file_name());
+        if entry.file_type().expect("a file type").is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target)
+                .unwrap_or_else(|e| panic!("copying {}: {e}", entry.path().display()));
+        }
+    }
+}
+
 fn main() {
     let lib = Path::new("libpg_query");
     assert!(
@@ -42,6 +62,15 @@ fn main() {
         );
         *text = text.replacen(patch.find, patch.replace, 1);
     }
+    // A patched header can't just be shadowed through the include path:
+    // its neighbours `#include "…"` it, which looks in their own directory
+    // first. The headers are compiled from a copy of the include tree, with
+    // the patched headers written into it.
+    let includes = out_dir.join("patched").join(HEADERS);
+    if includes.exists() {
+        std::fs::remove_dir_all(&includes).expect("clearing the header copy");
+    }
+    copy_tree(&lib.join(HEADERS), &includes);
     let mut replacements = std::collections::HashMap::new();
     for (file, text) in &patched {
         let copy = out_dir.join("patched").join(file);
@@ -66,15 +95,15 @@ fn main() {
         .include(lib.join("src"))
         .include(lib.join("src/postgres"))
         .include(lib.join("vendor"))
-        .include(lib.join("src/postgres/include"))
+        .include(&includes)
         .include(lib.join("src/include"))
         // libpg_query's own warnings are its maintainers' concern.
         .warnings(false);
     let target = std::env::var("TARGET").unwrap_or_default();
     if target.contains("windows") {
-        build.include(lib.join("src/postgres/include/port/win32"));
+        build.include(includes.join("port/win32"));
         if target.contains("msvc") {
-            build.include(lib.join("src/postgres/include/port/win32_msvc"));
+            build.include(includes.join("port/win32_msvc"));
         }
     }
     build.compile("pg_query");

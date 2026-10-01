@@ -14,6 +14,25 @@ struct Patch {
 
 const PATCHES: &[Patch] = &[
     Patch {
+        file: "src/postgres/include/pg_config.h",
+        why: "pg_config.h declared strlcpy available on every non-Windows target, so PostgreSQL's fallback (src_port_strlcpy.c) was never compiled; glibc only has strlcpy since 2.38, and on an older one (Debian bookworm's 2.36) the symbol stayed undefined, so the sql! proc macro failed to load (`can't find crate for typedpg_macros`). Same version test as libpg_query's own strchrnul block above it.",
+        find: r#"#else
+#define HAVE_DECL_STRCHRNUL 0
+#endif
+"#,
+        replace: r#"#else
+#define HAVE_DECL_STRCHRNUL 0
+#endif
+
+/* glibc has strlcpy only since 2.38: use PostgreSQL's port before that. */
+#if defined(__GLIBC__) && !((__GLIBC__ == 2 && __GLIBC_MINOR__ >= 38) || __GLIBC__ > 2)
+#undef HAVE_DECL_STRLCPY
+#define HAVE_DECL_STRLCPY 0
+#undef HAVE_STRLCPY
+#endif
+"#,
+    },
+    Patch {
         file: "src/pg_query_json_plpgsql.c",
         why: "A block's DECLAREd variables (initvarnos: the datums exec_stmt_block initializes on entry) were not dumped, so a reader couldn't tell which block declares which variable.",
         find: r#"	WRITE_NODE_TYPE("PLpgSQL_stmt_block");
