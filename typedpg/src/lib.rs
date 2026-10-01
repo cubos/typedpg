@@ -131,7 +131,7 @@
 //!     .fetch_all()
 //!     .await?;
 //!
-//! // fetch_one -- returns a single Row. Returns Error::NoRows if empty.
+//! // fetch_one -- returns a single Row. Returns Error::NoRows { .. } if empty.
 //! let user = sql!(pool, "SELECT id, name FROM users WHERE id = $id", id = 1)
 //!     .fetch_one()
 //!     .await?;

@@ -35,12 +35,25 @@ pub enum Error {
     Pool(String),
 
     /// A `fetch_one()` / `fetch_value()` call returned zero rows.
-    #[error("query returned no rows")]
-    NoRows,
+    ///
+    /// Match it with `Error::NoRows { .. }`.
+    #[error("query returned no rows: {query}")]
+    #[non_exhaustive]
+    NoRows {
+        /// The query, and where it was written.
+        query: QueryContext,
+    },
 
-    /// A `fetch_one()` / `fetch_value()` call returned more than one row.
-    #[error("query returned more than one row")]
-    TooManyRows,
+    /// A `fetch_one()` / `fetch_optional()` / `fetch_value()` call returned
+    /// more than one row.
+    ///
+    /// Match it with `Error::TooManyRows { .. }`.
+    #[error("query returned more than one row: {query}")]
+    #[non_exhaustive]
+    TooManyRows {
+        /// The query, and where it was written.
+        query: QueryContext,
+    },
 
     /// Failed to deserialize a domain/enum column value from a query result.
     #[error("deserialization error: {0}")]
@@ -49,6 +62,71 @@ pub enum Error {
     /// Failed to serialize a domain/enum value for a query parameter.
     #[error("serialization error: {0}")]
     Serialize(String),
+}
+
+impl Error {
+    #[doc(hidden)]
+    pub fn no_rows(query: QueryContext) -> Self {
+        Error::NoRows { query }
+    }
+
+    #[doc(hidden)]
+    pub fn too_many_rows(query: QueryContext) -> Self {
+        Error::TooManyRows { query }
+    }
+}
+
+/// Which query an error is about: its SQL, and the `sql!` invocation that
+/// wrote it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryContext {
+    sql: &'static str,
+    file: &'static str,
+    line: u32,
+    column: u32,
+}
+
+impl QueryContext {
+    #[doc(hidden)]
+    pub const fn new(sql: &'static str, file: &'static str, line: u32, column: u32) -> Self {
+        QueryContext {
+            sql,
+            file,
+            line,
+            column,
+        }
+    }
+
+    /// The query's SQL, with its parameters numbered (`$1`, `$2`, …) and,
+    /// for a `$..spread`, before the spread's rows are expanded.
+    pub fn sql(&self) -> &'static str {
+        self.sql
+    }
+
+    /// The source file of the `sql!` invocation.
+    pub fn file(&self) -> &'static str {
+        self.file
+    }
+
+    /// The line of the `sql!` invocation (1-based).
+    pub fn line(&self) -> u32 {
+        self.line
+    }
+
+    /// The column of the `sql!` invocation (1-based).
+    pub fn column(&self) -> u32 {
+        self.column
+    }
+}
+
+impl std::fmt::Display for QueryContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "`{}` (sql! at {}:{}:{})",
+            self.sql, self.file, self.line, self.column
+        )
+    }
 }
 
 #[cfg(feature = "deadpool")]
