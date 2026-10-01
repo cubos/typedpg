@@ -5,7 +5,7 @@
 //! close enough to be a useful suggestion.
 
 /// Find the candidate closest to `query` (see [`rank_similar`]).
-pub(crate) fn suggest_similar<'a, I>(query: &str, candidates: I) -> Option<&'a str>
+pub fn suggest_similar<'a, I>(query: &str, candidates: I) -> Option<&'a str>
 where
     I: IntoIterator<Item = &'a str>,
 {

@@ -175,6 +175,8 @@ pub struct QueryInput {
     pub executor: Expr,
     pub sql: LitStr,
     pub assignments: Vec<ParamAssignment>,
+    /// The span of each assignment's name, parallel to `assignments`.
+    pub assignment_spans: Vec<Span>,
 }
 
 impl Parse for QueryInput {
@@ -202,12 +204,14 @@ impl Parse for QueryInput {
         let sql: LitStr = input.parse()?;
 
         let mut assignments = Vec::new();
+        let mut assignment_spans = Vec::new();
         while input.peek(Token![,]) {
             input.parse::<Token![,]>()?;
             if input.is_empty() {
                 break;
             }
             let name: Ident = input.parse()?;
+            assignment_spans.push(name.span());
             if input.peek(Token![=]) {
                 input.parse::<Token![=]>()?;
                 let expr: Expr = input.parse()?;
@@ -228,6 +232,7 @@ impl Parse for QueryInput {
             executor,
             sql,
             assignments,
+            assignment_spans,
         })
     }
 }
@@ -386,10 +391,14 @@ pub(crate) fn catalog_for<'c>(
         .filter(|d| !d.is_dir())
         .map(|d| format!("'{}'", display_path(d)))
         .collect();
+    let section = match &db_name_str {
+        Some(name) => format!("[package.metadata.typedpg.databases.{name}.database]"),
+        None => "[package.metadata.typedpg.database]".to_owned(),
+    };
     let missing_dirs_note = (!missing.is_empty()).then(|| {
         format!(
-            "no migrations were loaded from {}: the directory does not exist (see \
-             [package.metadata.typedpg.database] in Cargo.toml)",
+            "no migrations were loaded from {}: the directory does not exist (see {section} \
+             in Cargo.toml)",
             missing.join(", ")
         )
     });
@@ -430,7 +439,7 @@ pub fn expand(input: QueryInput) -> Result<proc_macro2::TokenStream, syn::Error>
     }
 
     // 4. Validate that all assignments match SQL params/spreads.
-    for assignment in &input.assignments {
+    for (assignment, span) in input.assignments.iter().zip(&input.assignment_spans) {
         if !analyzed.params.iter().any(|p| p.name == assignment.name)
             && !analyzed.spreads.iter().any(|s| s.name == assignment.name)
         {
@@ -445,11 +454,28 @@ pub fn expand(input: QueryInput) -> Result<proc_macro2::TokenStream, syn::Error>
             } else {
                 available.join(", ")
             };
+            // The names an argument can bind; the closest is suggested.
+            let names = analyzed
+                .params
+                .iter()
+                .map(|p| p.name.as_str())
+                .chain(analyzed.spreads.iter().map(|s| s.name.as_str()));
+            let suggestion = typedpg_analyzer::suggest_similar(&assignment.name, names)
+                .map(|s| {
+                    let sigil = if analyzed.spreads.iter().any(|sp| sp.name == s) {
+                        "$.."
+                    } else {
+                        "$"
+                    };
+                    format!("\n  help: did you mean `{s}`, the SQL's `{sigil}{s}`?")
+                })
+                .unwrap_or_default();
             return Err(syn::Error::new(
-                input.sql.span(),
+                *span,
                 format!(
-                    "unknown parameter `{}` — not found in SQL. Available parameters: {}",
-                    assignment.name, available_str,
+                    "unknown parameter `{}` — not found in SQL. Available parameters: \
+                     {available_str}{suggestion}",
+                    assignment.name,
                 ),
             ));
         }
