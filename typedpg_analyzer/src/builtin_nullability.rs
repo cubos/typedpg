@@ -393,7 +393,6 @@ pub(crate) const NEVER_NULL_NONSTRICT: &[&str] = &[
     "satisfies_hash_partition(oid,int4,int4,any)",
     "set_config(text,text,bool)",
     "string_to_table(text,text)",
-    "string_to_table(text,text,text)",
     "tsrange(timestamp,timestamp)",
     "tsrange(timestamp,timestamp,text)",
     "tstzrange(timestamptz,timestamptz)",

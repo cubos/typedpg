@@ -223,6 +223,31 @@ fn non_strict_builtins_that_return_null() {
 }
 
 #[test]
+fn string_to_table_with_a_null_string_emits_nulls() {
+    let db = setup();
+    // The third argument names the field that becomes NULL:
+    // `string_to_table('a,,b', ',', '')` yields 'a', NULL, 'b'. Without it
+    // every field is a string. (One call per query: two set-returning
+    // calls in a select list run in lockstep, the shorter padded with
+    // NULLs.)
+    assert_nullability(
+        &db,
+        "SELECT string_to_table(s, ',', '') AS a FROM t",
+        &[("a", true)],
+    );
+    assert_nullability(
+        &db,
+        "SELECT string_to_table(s, ',') AS b FROM t",
+        &[("b", false)],
+    );
+    assert_nullability(
+        &db,
+        "SELECT x FROM t, string_to_table(t.s, ',', 'x') AS x",
+        &[("x", true)],
+    );
+}
+
+#[test]
 fn system_user_and_current_schema_can_be_null() {
     let db = setup();
     // SYSTEM_USER is NULL under trust auth; CURRENT_SCHEMA with
