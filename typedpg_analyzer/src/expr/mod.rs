@@ -553,11 +553,26 @@ fn walk(node: &protobuf::Node, snapshot: &PgCatalog, out: &mut FuncKindPresence)
                     _ => (None, ""),
                 };
                 if !name.is_empty() {
+                    // Only an aggregate the call's argument count can
+                    // reach: `max()` is no call to `max(anyarray)` — PG
+                    // fails it with `function max() does not exist`
+                    // before any placement rule.
+                    // (An ordered-set aggregate's WITHIN GROUP columns
+                    // are arguments too.)
+                    let nargs = fc.args.len()
+                        + if fc.agg_within_group {
+                            fc.agg_order.len()
+                        } else {
+                            0
+                        };
                     let candidates = snapshot.find_functions(schema, name);
-                    if candidates
-                        .iter()
-                        .any(|f| matches!(f.prokind, crate::pg_catalog::ProKind::Aggregate))
-                    {
+                    if candidates.iter().any(|f| {
+                        let declared = f.proargtypes.len();
+                        let required = declared.saturating_sub(f.pronargdefaults.max(0) as usize);
+                        matches!(f.prokind, crate::pg_catalog::ProKind::Aggregate)
+                            && ((required..=declared).contains(&nargs)
+                                || (f.provariadic.is_some() && nargs + 1 >= declared))
+                    }) {
                         out.has_aggregate = true;
                         out.agg_location.get_or_insert(fc.location);
                     }
