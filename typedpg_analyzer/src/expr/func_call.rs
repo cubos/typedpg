@@ -342,6 +342,8 @@ fn check_call_shape(
                     ctx.snapshot,
                     None,
                     &w,
+                    &args.types,
+                    notation,
                     format!("function {w}({sig}) does not exist"),
                     span,
                 ));

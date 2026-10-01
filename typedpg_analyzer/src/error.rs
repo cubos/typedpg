@@ -724,8 +724,11 @@ pub(crate) struct RawError {
     /// Additional locations relevant to the diagnostic (e.g. the other side
     /// of a type mismatch).
     pub secondaries: Vec<DiagnosticLabel>,
-    /// One-line hint rendered as `= help: ...`.
+    /// One-line hint rendered as `help: ...`.
     pub hint: Option<String>,
+    /// Further context rendered as `note: ...` after the hint — e.g. the
+    /// overloads a call could have meant. May span several lines.
+    pub notes: Vec<String>,
 }
 
 impl RawError {
@@ -738,6 +741,7 @@ impl RawError {
             kind: e,
             primary: None,
             secondaries: Vec::new(),
+            notes: Vec::new(),
             hint: None,
         }
     }
@@ -752,6 +756,7 @@ impl RawError {
             kind,
             primary,
             secondaries: Vec::new(),
+            notes: Vec::new(),
             hint,
         }
     }
@@ -770,6 +775,7 @@ impl RawError {
             kind: AnalyzeError::UndefinedTable(format!("relation \"{qualified}\" does not exist")),
             primary,
             secondaries: Vec::new(),
+            notes: Vec::new(),
             hint,
         }
     }
@@ -795,6 +801,7 @@ impl RawError {
             kind: AnalyzeError::UndefinedColumn(message),
             primary,
             secondaries: Vec::new(),
+            notes: Vec::new(),
             hint,
         }
     }
@@ -811,6 +818,7 @@ impl RawError {
             kind: AnalyzeError::UndefinedFunction(message),
             primary,
             secondaries: Vec::new(),
+            notes: Vec::new(),
             hint,
         }
     }
@@ -826,6 +834,7 @@ impl RawError {
             kind: AnalyzeError::UndefinedOperator(message),
             primary,
             secondaries: Vec::new(),
+            notes: Vec::new(),
             hint,
         }
     }
@@ -856,6 +865,7 @@ impl RawError {
             },
             primary,
             secondaries,
+            notes: Vec::new(),
             hint,
         }
     }
@@ -868,6 +878,7 @@ impl RawError {
             kind: AnalyzeError::Invalid(message),
             primary,
             secondaries: Vec::new(),
+            notes: Vec::new(),
             hint,
         }
     }
@@ -880,6 +891,7 @@ impl RawError {
             kind: AnalyzeError::InvalidLiteral(message),
             primary,
             secondaries: Vec::new(),
+            notes: Vec::new(),
             hint: None,
         }
     }
@@ -896,6 +908,7 @@ impl RawError {
             kind: AnalyzeError::Unsupported(message),
             primary,
             secondaries: Vec::new(),
+            notes: Vec::new(),
             hint,
         }
     }
@@ -908,6 +921,7 @@ impl RawError {
             kind: AnalyzeError::Lex(message),
             primary,
             secondaries: Vec::new(),
+            notes: Vec::new(),
             hint: None,
         }
     }
@@ -920,6 +934,7 @@ impl RawError {
             kind: AnalyzeError::Parse(message),
             primary,
             secondaries: Vec::new(),
+            notes: Vec::new(),
             hint: None,
         }
     }
@@ -931,6 +946,12 @@ impl RawError {
         if let Some(p) = self.primary.as_mut() {
             p.message = message.into();
         }
+        self
+    }
+
+    /// Append a `note: ...` line. Builder-style.
+    pub(crate) fn with_note(mut self, note: impl Into<String>) -> Self {
+        self.notes.push(note.into());
         self
     }
 
@@ -972,8 +993,10 @@ impl RawError {
         sql_original: &str,
         lex_output: &crate::param::LexOutput,
     ) -> AnalyzeError {
-        let has_context =
-            self.primary.is_some() || !self.secondaries.is_empty() || self.hint.is_some();
+        let has_context = self.primary.is_some()
+            || !self.secondaries.is_empty()
+            || self.hint.is_some()
+            || !self.notes.is_empty();
 
         if !has_context {
             return self.kind;

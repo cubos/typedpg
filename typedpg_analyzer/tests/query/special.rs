@@ -696,13 +696,20 @@ fn extract_unresolved_reports_pg_catalog_qualified_name() {
         db.analyze("SELECT extract('year' FROM age) FROM users"),
         AnalyzeError::UndefinedFunction(_),
         concat!(
-            "function pg_catalog.extract(unknown, integer) does not exist (found 6 candidate(s))\n",
+            "function pg_catalog.extract(unknown, integer) does not exist\n",
             "  ╭────\n",
             "1 │ SELECT extract('year' FROM age) FROM users\n",
             "  ·        ───┬───\n",
             "  ·           ╰─ function does not exist\n",
             "  ╰────\n",
-            "  help: did you mean \"extract\"?\n",
+            "  help: No function matches the given name and argument types. You might need to add explicit type casts.\n",
+            "  note: candidates are:\n",
+            "          \"extract\"(text, date)\n",
+            "          \"extract\"(text, interval)\n",
+            "          \"extract\"(text, time with time zone)\n",
+            "          \"extract\"(text, time without time zone)\n",
+            "          \"extract\"(text, timestamp with time zone)\n",
+            "          \"extract\"(text, timestamp without time zone)\n",
         ),
     );
 }

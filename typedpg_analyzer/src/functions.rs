@@ -272,19 +272,15 @@ pub(crate) fn func_get_detail(
             )
             .finalize_implicit());
         }
-        let functions_named = snapshot.find_functions(schema, name).len();
         // PG's wording: `function name(arg_types_joined) does not exist`.
-        // Match it verbatim so pg_sanity's prefix check passes; append the
-        // candidate count as a suffix for the macro caller's diagnostic.
-        let message = if functions_named == 0 {
-            format!("function {qualified}({arg_list_actual}) does not exist")
-        } else {
-            format!(
-                "function {qualified}({arg_list_actual}) does not exist (found {functions_named} candidate(s))"
-            )
-        };
         return Err(undefined_function_error(
-            snapshot, schema, name, message, span,
+            snapshot,
+            schema,
+            name,
+            arg_types,
+            notation,
+            format!("function {qualified}({arg_list_actual}) does not exist"),
+            span,
         ));
     };
     let cand = &candidates[best];
@@ -420,17 +416,109 @@ fn func_name_as_coercion(
     is_coercion.then_some(target)
 }
 
-/// Build the public-facing `UndefinedFunction` error with snippet + hint.
+/// PG's hint on `function … does not exist` (`ParseFuncOrColumn`).
+const NO_FUNCTION_MATCHES_HINT: &str = "No function matches the given name and argument types. \
+                                        You might need to add explicit type casts.";
+
+/// How many overloads the `candidates:` note lists before eliding.
+const MAX_LISTED_OVERLOADS: usize = 10;
+
+/// Build the public-facing `UndefinedFunction` error with snippet + hint,
+/// for a call of `name` with `arg_types` (in `notation`) that nothing
+/// matched.
+///
+/// When functions named `name` exist, the arguments are what's wrong:
+/// suggesting the same name back is no help, so the error carries PG's
+/// hint and lists the overloads instead. Otherwise the name is the
+/// suspect, and the hint suggests a similar one — preferring, among the
+/// close names, one with an overload the arguments fit.
 pub(crate) fn undefined_function_error(
     snapshot: &PgCatalog,
     schema: Option<&str>,
     name: &str,
+    arg_types: &[PgTypeOid],
+    notation: &CallNotation,
     message: String,
     span: Option<crate::error::SourceSpan>,
 ) -> AnalyzeError {
-    let hint = crate::suggest::suggest_similar(name, snapshot.visible_function_names(schema))
-        .map(|c| format!("did you mean \"{c}\"?"));
-    crate::error::RawError::undefined_function(message, span, hint).finalize_implicit()
+    let overloads = snapshot.find_functions(schema, name);
+    let raw = if overloads.is_empty() {
+        let ranked = crate::suggest::rank_similar(name, snapshot.visible_function_names(schema));
+        let fits = |candidate: &str| {
+            let candidates =
+                func_candidates(snapshot, schema, candidate, arg_types.len(), notation);
+            let arg_lists: Vec<&[PgTypeOid]> = candidates
+                .iter()
+                .map(|c| &c.args[..arg_types.len()])
+                .collect();
+            !func_match_argtypes(arg_types, &arg_lists, snapshot).is_empty()
+        };
+        let hint = match ranked.iter().find(|c| fits(c)).or(ranked.first()) {
+            Some(c) => format!("did you mean \"{c}\"?"),
+            None => NO_FUNCTION_MATCHES_HINT.to_owned(),
+        };
+        crate::error::RawError::undefined_function(message, span, Some(hint))
+    } else {
+        crate::error::RawError::undefined_function(
+            message,
+            span,
+            Some(NO_FUNCTION_MATCHES_HINT.to_owned()),
+        )
+        .with_note(overloads_note(snapshot, &overloads))
+    };
+    raw.finalize_implicit()
+}
+
+/// The `candidates:` note listing `overloads` one signature per line,
+/// shortest first (`length(text)`, `pg_catalog.length(bytea)` …): enough
+/// to see which argument types the function takes.
+fn overloads_note(snapshot: &PgCatalog, overloads: &[&PgProc]) -> String {
+    let mut signatures: Vec<(usize, String)> = overloads
+        .iter()
+        .map(|f| (f.proargtypes.len(), overload_signature(snapshot, f)))
+        .collect();
+    signatures.sort();
+    signatures.dedup();
+    let total = signatures.len();
+    let mut note = String::from(if total == 1 {
+        "the only candidate is:"
+    } else {
+        "candidates are:"
+    });
+    for (_, signature) in signatures.iter().take(MAX_LISTED_OVERLOADS) {
+        note.push_str("\n  ");
+        note.push_str(signature);
+    }
+    if total > MAX_LISTED_OVERLOADS {
+        note.push_str(&format!("\n  … and {} more", total - MAX_LISTED_OVERLOADS));
+    }
+    note
+}
+
+/// `name(type, …)` for an overload, the variadic parameter marked
+/// `VARIADIC` and a schema other than `pg_catalog` spelled out.
+fn overload_signature(snapshot: &PgCatalog, f: &PgProc) -> String {
+    let args = f
+        .proargtypes
+        .iter()
+        .enumerate()
+        .map(|(i, &t)| {
+            let ty = crate::ddl::util::format_type_for_message(snapshot, t);
+            if f.provariadic.is_some() && i + 1 == f.proargtypes.len() {
+                format!("VARIADIC {ty}")
+            } else {
+                ty
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let name = match snapshot.namespace_name(f.pronamespace) {
+        Some("pg_catalog") | None => typedpg_core::quote_identifier(&f.proname),
+        Some(schema) => {
+            crate::qualified_name::QualifiedName::new(schema, f.proname.clone()).to_string()
+        }
+    };
+    format!("{name}({args})")
 }
 
 /// The parameters a call of `f` supplies arguments for: its input

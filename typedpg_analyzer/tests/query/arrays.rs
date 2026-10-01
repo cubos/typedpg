@@ -456,13 +456,17 @@ fn unnest_in_from_multi_arg_non_array_errors() {
         db.analyze("SELECT * FROM unnest(ARRAY[1, 2], 'oops'::text) AS t(a, b)"),
         AnalyzeError::UndefinedFunction(_),
         concat!(
-            "function pg_catalog.unnest(text) does not exist (found 3 candidate(s))\n",
+            "function pg_catalog.unnest(text) does not exist\n",
             "  ╭────\n",
             "1 │ SELECT * FROM unnest(ARRAY[1, 2], 'oops'::text) AS t(a, b)\n",
             "  ·               ───┬──\n",
             "  ·                  ╰─ function does not exist\n",
             "  ╰────\n",
-            "  help: did you mean \"unnest\"?\n",
+            "  help: No function matches the given name and argument types. You might need to add explicit type casts.\n",
+            "  note: candidates are:\n",
+            "          unnest(anyarray)\n",
+            "          unnest(anymultirange)\n",
+            "          unnest(tsvector)\n",
         ),
     );
 }
@@ -478,13 +482,15 @@ fn array_ndims_on_scalar_rejected() {
         db.analyze("SELECT array_ndims(7)"),
         AnalyzeError::UndefinedFunction(_),
         concat!(
-            "function array_ndims(integer) does not exist (found 1 candidate(s))\n",
+            "function array_ndims(integer) does not exist\n",
             "  ╭────\n",
             "1 │ SELECT array_ndims(7)\n",
             "  ·        ─────┬─────\n",
             "  ·             ╰─ function does not exist\n",
             "  ╰────\n",
-            "  help: did you mean \"array_ndims\"?\n",
+            "  help: No function matches the given name and argument types. You might need to add explicit type casts.\n",
+            "  note: the only candidate is:\n",
+            "          array_ndims(anyarray)\n",
         ),
     );
 }

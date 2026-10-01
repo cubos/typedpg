@@ -50,10 +50,9 @@ pub(crate) fn render(
 
     if primary.is_none() && secondaries.is_empty() {
         // No location info at all — keep it flat. Optional hint still surfaces.
-        return match &raw.hint {
-            Some(h) => format!("{pg_message}\n  help: {h}\n"),
-            None => format!("{pg_message}\n"),
-        };
+        let mut out = format!("{pg_message}\n");
+        push_trailer(&mut out, raw);
+        return out;
     }
 
     // The first line carries the message; pg_sanity ignores anything past
@@ -109,12 +108,21 @@ pub(crate) fn render(
     }
 
     out.push_str(&format!("{gutter_pad} ╰────\n"));
+    push_trailer(&mut out, raw);
+    out
+}
 
+/// Append the `help:` and `note:` lines that follow the snippet. A
+/// multi-line note keeps its later lines aligned under its first.
+pub(crate) fn push_trailer(out: &mut String, raw: &RawError) {
     if let Some(hint) = &raw.hint {
         out.push_str(&format!("  help: {hint}\n"));
     }
-
-    out
+    for note in &raw.notes {
+        out.push_str("  note: ");
+        out.push_str(&note.replace('\n', "\n        "));
+        out.push('\n');
+    }
 }
 
 /// One marker on a source line — a position plus an optional label and a
@@ -285,6 +293,32 @@ relation \"userz\" does not exist
   ·        ╰─ relation does not exist
   ╰────
   help: did you mean \"users\"?
+";
+        assert_eq!(rendered, expected);
+    }
+
+    #[test]
+    fn renders_notes_after_the_hint() {
+        let sql = "SELECT f(1)";
+        let lex_output = lex(sql).unwrap();
+        let raw = RawError::undefined_function(
+            "function f(integer) does not exist".into(),
+            Some(SourceSpan::new(7, 8)),
+            Some("No function matches.".into()),
+        )
+        .with_note("candidates are:\n  f(text)\n  f(bytea)");
+        let rendered = render(&raw.pg_message(), &raw, sql, &lex_output);
+        let expected = "\
+function f(integer) does not exist
+  ╭────
+1 │ SELECT f(1)
+  ·        ┬
+  ·        ╰─ function does not exist
+  ╰────
+  help: No function matches.
+  note: candidates are:
+          f(text)
+          f(bytea)
 ";
         assert_eq!(rendered, expected);
     }

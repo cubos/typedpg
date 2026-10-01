@@ -826,6 +826,95 @@ function pg_catalog.nonexisting() does not exist
   ·        ───────────┬──────────
   ·                   ╰─ function does not exist
   ╰────
+  help: No function matches the given name and argument types. You might need to add explicit type casts.
+",
+    );
+}
+
+#[test]
+fn transposed_function_name_suggests_the_intended_one() {
+    // `lenght` is one transposition from `length` but two substitutions
+    // from `height`: plain Levenshtein had them tied (and picked by hash
+    // order), the alignment distance does not.
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("SELECT lenght(name) FROM users"),
+        AnalyzeError::UndefinedFunction(_),
+        "\
+function lenght(text) does not exist
+  ╭────
+1 │ SELECT lenght(name) FROM users
+  ·        ───┬──
+  ·           ╰─ function does not exist
+  ╰────
+  help: did you mean \"length\"?
+",
+    );
+}
+
+#[test]
+fn function_suggestion_prefers_a_name_the_arguments_fit() {
+    // `qqx` is one edit from both `qqy` and `qqz`: the suggestion is the
+    // one with an overload the arguments coerce to.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE FUNCTION qqy(int) RETURNS int LANGUAGE sql AS 'SELECT 1';
+         CREATE FUNCTION qqz(text) RETURNS int LANGUAGE sql AS 'SELECT 1';",
+    )
+    .unwrap();
+    assert_analyze_err!(
+        db.analyze("SELECT qqx('x'::text)"),
+        AnalyzeError::UndefinedFunction(_),
+        "\
+function qqx(text) does not exist
+  ╭────
+1 │ SELECT qqx('x'::text)
+  ·        ─┬─
+  ·         ╰─ function does not exist
+  ╰────
+  help: did you mean \"qqz\"?
+",
+    );
+    assert_analyze_err!(
+        db.analyze("SELECT qqx(1)"),
+        AnalyzeError::UndefinedFunction(_),
+        "\
+function qqx(integer) does not exist
+  ╭────
+1 │ SELECT qqx(1)
+  ·        ─┬─
+  ·         ╰─ function does not exist
+  ╰────
+  help: did you mean \"qqy\"?
+",
+    );
+}
+
+#[test]
+fn no_matching_overload_lists_the_candidates() {
+    // The name exists, so suggesting it back is no help: PG's hint, and
+    // the overloads to pick from.
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("SELECT length(name, 1, 2) FROM users"),
+        AnalyzeError::UndefinedFunction(_),
+        "\
+function length(text, integer, integer) does not exist
+  ╭────
+1 │ SELECT length(name, 1, 2) FROM users
+  ·        ───┬──
+  ·           ╰─ function does not exist
+  ╰────
+  help: No function matches the given name and argument types. You might need to add explicit type casts.
+  note: candidates are:
+          length(bit)
+          length(bytea)
+          length(character)
+          length(lseg)
+          length(path)
+          length(text)
+          length(tsvector)
+          length(bytea, name)
 ",
     );
 }
