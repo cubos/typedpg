@@ -1,0 +1,35 @@
+error: function lenght(text) does not exist
+         ╭────
+       1 │ SELECT lenght(name) AS n FROM users
+         ·        ───┬──
+         ·           ╰─ function does not exist
+         ╰────
+         help: did you mean "length"?
+       
+ --> src/bin/sql_function_suggestion.rs:6:23
+  |
+6 |     typedpg::sql!(db, "SELECT lenght(name) AS n FROM users")
+  |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: function length(text, integer, integer) does not exist
+         ╭────
+       1 │ SELECT length(name, 1, 2) AS n FROM users
+         ·        ───┬──
+         ·           ╰─ function does not exist
+         ╰────
+         help: No function matches the given name and argument types. You might need to add explicit type casts.
+         note: candidates are:
+                 length(bit)
+                 length(bytea)
+                 length(character)
+                 length(lseg)
+                 length(path)
+                 length(text)
+                 length(tsvector)
+                 length(bytea, name)
+       
+  --> src/bin/sql_function_suggestion.rs:13:23
+   |
+13 |     typedpg::sql!(db, "SELECT length(name, 1, 2) AS n FROM users")
+   |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+

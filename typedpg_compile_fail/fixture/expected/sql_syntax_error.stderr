@@ -1,0 +1,13 @@
+error: syntax error at or near "="
+         ╭────
+       3 │           WHERE id = = $id
+         ·                      ─
+         ╰────
+       
+ --> src/bin/sql_syntax_error.rs:7:9
+  |
+7 | /         "SELECT id, name \
+8 | |            FROM users \
+9 | |           WHERE id = = $id",
+  | |___________________________^
+

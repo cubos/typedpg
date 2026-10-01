@@ -1,0 +1,21 @@
+error: type "no_such_type" does not exist
+         --> migrations_broken/0001_broken.sql:2:36
+         ╭────
+       2 │ ALTER TABLE things ADD COLUMN name no_such_type;
+         ·                                    ────────────
+         ╰────
+ --> src/bin/sql_failing_migration_reported_once.rs:5:5
+  |
+5 |     typedpg::sql!(db = broken, db, "SELECT id FROM things")
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the macro `typedpg::sql` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: migration migrations_broken/0001_broken.sql failed: type "no_such_type" does not exist (reported in full at the first sql! of this crate)
+  --> src/bin/sql_failing_migration_reported_once.rs:12:5
+   |
+12 |     typedpg::sql!(db = broken, db, "SELECT name FROM things")
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this error originates in the macro `typedpg::sql` (in Nightly builds, run with -Z macro-backtrace for more info)
+

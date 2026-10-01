@@ -27,3 +27,6 @@ prefs = "::typedpg_compile_fail_fixture::Prefs"
 
 [package.metadata.typedpg.databases.broken.database]
 migrations = "./migrations_broken"
+
+[package.metadata.typedpg.databases.missing.database]
+migrations = "./no_such_migrations"

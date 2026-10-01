@@ -4,7 +4,7 @@ error: column "nmae" does not exist
          ·            ──┬─
          ·              ╰─ column does not exist
          ╰────
-         help: did you mean "name"?
+         help: Perhaps you meant to reference the column "users.name".
        
  --> src/bin/sql_analyzer_error.rs:4:23
   |
