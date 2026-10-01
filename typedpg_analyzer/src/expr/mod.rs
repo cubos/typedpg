@@ -954,7 +954,36 @@ fn infer_expr_unlocated(
 
             if let Some((composite_oid, composite_fields)) = composite_goal {
                 let mut any_nullable = false;
-                for (arg, field) in row.args.iter().zip(composite_fields.iter()) {
+                for (i, (arg, field)) in row.args.iter().zip(composite_fields.iter()).enumerate() {
+                    // coerce_record_to_complex: a field that doesn't
+                    // coerce fails the whole record's cast, worded as
+                    // such (42846), not as the field's own mismatch.
+                    let mut scratch = params.clone();
+                    let own = infer_expr(arg, ctx, &mut scratch, TypeGoal::NONE)?;
+                    if own.type_oid != oid::UNKNOWN
+                        && !crate::coerce::can_coerce(
+                            own.type_oid,
+                            field.atttypid,
+                            CoercionContext::Assignment,
+                            snapshot,
+                        )
+                    {
+                        let typname = snapshot
+                            .get_type(composite_oid)
+                            .map_or_else(String::new, |t| t.typname.clone());
+                        return Err(crate::error::RawError::invalid(
+                            format!("cannot cast type record to {typname}"),
+                            crate::error::SourceSpan::from_node_token(row.location),
+                            Some(format!(
+                                "Cannot cast type {} to {} in column {}.",
+                                crate::ddl::util::format_type_for_message(snapshot, own.type_oid),
+                                crate::ddl::util::format_type_for_message(snapshot, field.atttypid),
+                                i + 1,
+                            )),
+                        )
+                        .with_primary_label("record value")
+                        .finalize_implicit());
+                    }
                     let t = infer_expr(arg, ctx, params, TypeGoal::assignment(field.atttypid))?;
                     any_nullable = any_nullable || t.nullable;
                 }
