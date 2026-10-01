@@ -121,7 +121,7 @@ The `sql!` macro is wired end-to-end with static analysis (no Docker needed at c
 The `pg_sanity` feature mirrors every `apply_sql` / `analyze` onto a real
 PostgreSQL and asserts they agree (see `typedpg_analyzer/src/pg_sanity.rs`,
 run via `scripts/run-pg-sanity.sh`). A differential fuzzer
-(`typedpg_analyzer/tests/fuzz.rs`, `#[ignore]`d) generates queries to surface
+(`typedpg_analyzer/tests/fuzz/main.rs`, `#[ignore]`d) generates queries to surface
 new disagreements automatically.
 
 **Nullability soundness.** Describe says nothing about nullability, so the
