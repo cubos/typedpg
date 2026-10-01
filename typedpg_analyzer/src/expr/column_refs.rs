@@ -230,10 +230,29 @@ fn whole_row_ref(
                     "internal: no composite type registered for relation {qn}"
                 ))
             })?;
-        return Ok(ExprType::scalar(
-            composite_oid,
-            whole_row_nullable(source, null_ctx),
-        ));
+        // A row read from the relation keeps its columns' NOT NULL, which
+        // a value of the row type in general doesn't (`ROW(NULL)::t`, a
+        // column of type `t`): carry the columns as the value's shape, the
+        // only place field nullability is taken from for a composite.
+        let mut shape = shape_of_columns(&source.columns);
+        // A RETURNING OLD / NEW row may be missing (`null_row`), which its
+        // columns fold into their own nullability; a row that is there
+        // has the target's NOT NULL columns.
+        if source.null_row
+            && let Some(relid) = source.relid
+        {
+            let attrs = snapshot.attributes_of(relid);
+            for field in &mut shape {
+                if let Some(a) = attrs.iter().find(|a| a.attname == field.name) {
+                    field.ty.nullable = !(snapshot.attr_proven_not_null(a)
+                        || snapshot.type_is_not_null(a.atttypid));
+                }
+            }
+        }
+        return Ok(ExprType {
+            record_fields: Some(shape),
+            ..ExprType::scalar(composite_oid, whole_row_nullable(source, null_ctx))
+        });
     }
 
     match source.whole_row {
@@ -258,8 +277,21 @@ fn whole_row_ref(
         crate::scope::WholeRow::Record => {}
     }
 
-    let fields: Vec<RecordField> = source
-        .columns
+    Ok(ExprType {
+        type_oid: oid::RECORD,
+        nullable: whole_row_nullable(source, null_ctx),
+        typmod: None,
+        collation: None,
+        explicit_collation: false,
+        record_fields: Some(shape_of_columns(&source.columns)),
+        elem_nullable: None,
+    })
+}
+
+/// The row shape of a FROM entry's columns, each field NULL only where the
+/// column itself may be (outer-join nullability is the whole row's).
+fn shape_of_columns(columns: &[crate::scope::ScopeColumn]) -> Vec<RecordField> {
+    columns
         .iter()
         .map(|c| RecordField {
             name: c.name.clone(),
@@ -273,14 +305,5 @@ fn whole_row_ref(
                 elem_nullable: None,
             },
         })
-        .collect();
-    Ok(ExprType {
-        type_oid: oid::RECORD,
-        nullable: whole_row_nullable(source, null_ctx),
-        typmod: None,
-        collation: None,
-        explicit_collation: false,
-        record_fields: Some(fields),
-        elem_nullable: None,
-    })
+        .collect()
 }
