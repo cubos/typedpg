@@ -31,9 +31,16 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo clippy -p typedpg_analyzer --all-targets --features pg_sanity -- -D warnings
-      # Includes the testcontainers-based integration tests (Docker is
-      # available on the hosted runners).
+      # The runtime's pool backends are optional features: build each set
+      # the workspace's feature unification would otherwise hide.
+      - run: cargo clippy -p typedpg --all-targets --no-default-features --features bb8 -- -D warnings
+      - run: cargo clippy -p typedpg --all-targets --no-default-features -- -D warnings
+      # Includes the Docker-backed tests (one PostgreSQL container shared by
+      # the whole run, see typedpg_test_support; Docker is available on the
+      # hosted runners) and the typedpg_compile_fail snapshots.
       - run: cargo nextest run --release --workspace --no-fail-fast
+      # Named again so a snapshot mismatch is its own red step.
+      - run: cargo nextest run --release -p typedpg_compile_fail
       - run: cargo test --doc --workspace
 
   pg-sanity:
