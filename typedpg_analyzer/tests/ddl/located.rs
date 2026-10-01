@@ -42,7 +42,7 @@ column t.lable does not exist (while analyzing view 'public.post_tags')
   ·            ───┬───
   ·               ╰─ column does not exist
   ╰────
-  help: did you mean \"label\"?"
+  help: Perhaps you meant to reference the column \"t.label\"."
     );
 }
 

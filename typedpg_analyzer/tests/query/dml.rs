@@ -1856,7 +1856,7 @@ column p.user_idz does not exist
   ·                                                                                                                    ─────┬────
   ·                                                                                                                         ╰─ column does not exist
   ╰────
-  help: did you mean \"user_id\"?
+  help: Perhaps you meant to reference the column \"p.user_id\".
 ",
     );
 }
@@ -1880,7 +1880,7 @@ column p.user_idz does not exist
   ·                                                                   ─────┬────
   ·                                                                        ╰─ column does not exist
   ╰────
-  help: did you mean \"user_id\"?
+  help: Perhaps you meant to reference the column \"p.user_id\".
 ",
     );
 }

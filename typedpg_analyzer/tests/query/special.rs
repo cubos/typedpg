@@ -526,8 +526,10 @@ fn non_lateral_subquery_cannot_see_outer_scope() {
             "invalid reference to FROM-clause entry for table \"u\"\n",
             "  ╭────\n",
             "1 │ SELECT u.name, s.double_id FROM users u, (SELECT u.id * 2 AS double_id) s\n",
-            "  ·                                                  ────\n",
+            "  ·                                                  ──┬─\n",
+            "  ·                                                    ╰─ not referencable here\n",
             "  ╰────\n",
+            "  note: There is an entry for table \"u\", but it cannot be referenced from this part of the query.\n",
         ),
     );
 }

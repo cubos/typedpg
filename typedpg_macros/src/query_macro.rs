@@ -512,7 +512,7 @@ mod catalog_tests {
   ·            ─┬─
   ·             ╰─ column does not exist
   ╰────
-  help: did you mean \"id\"?"
+  help: Perhaps you meant to reference the column \"t.id\"."
             )
         );
         assert_eq!(
