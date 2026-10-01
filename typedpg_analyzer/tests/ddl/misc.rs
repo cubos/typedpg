@@ -5788,3 +5788,21 @@ fn truncate_refuses_a_system_catalog() {
     }
     build_db(&[("0001.sql", "TRUNCATE information_schema.sql_features;")]);
 }
+
+#[test]
+fn copy_from_refuses_generated_columns_and_views_without_a_trigger() {
+    // CopyGetAttnums refuses generated columns; CopyFrom takes a view only
+    // through an INSTEAD OF INSERT trigger.
+    let setup = "CREATE TABLE t (a int, g int GENERATED ALWAYS AS (a * 2) STORED);
+                 CREATE VIEW v AS SELECT a FROM t;";
+    for (stmt, msg) in [
+        (
+            "COPY t (a, g) FROM STDIN;",
+            "column \"g\" is a generated column",
+        ),
+        ("COPY v (a) FROM STDIN;", "cannot copy to view \"v\""),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+}
