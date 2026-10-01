@@ -26,13 +26,55 @@ pub struct AnalyzedCopyIn {
     pub columns: Vec<AnalyzedColumn>,
 }
 
+/// A grammar error in the `COPY <target> FROM STDIN` built around a
+/// `copy_in!` target, reported against the target as written: the
+/// `Invalid statement:` wrapper and the statement the user never wrote are
+/// dropped, and the caret goes on the target (`prefix` is the length of
+/// what precedes it). An error past the target's end — in the appended
+/// `FROM STDIN` — is the target ending too early: `syntax error at end of
+/// input`, as PG says when the input ends there.
+fn copy_target_syntax_error(
+    e: typedpg_pg_query::Error,
+    target: &str,
+    prefix: usize,
+) -> AnalyzeError {
+    let typedpg_pg_query::Error::Parse { message, position } = e else {
+        return AnalyzeError::Invalid(e.to_string());
+    };
+    let lex = crate::param::LexOutput::identity(target);
+    let _guard = crate::error::DiagContextGuard::install(target, &lex);
+    let at = position.map(|p| p.saturating_sub(prefix));
+    let (message, span) = match at {
+        Some(at) if at < target.len() => {
+            let span = crate::error::SourceSpan::syntax_error_at(target, at, &message);
+            (message, Some(span))
+        }
+        Some(_) => (
+            "syntax error at end of input".to_owned(),
+            Some(crate::error::SourceSpan::one_char_at(target.len())),
+        ),
+        None => (message, None),
+    };
+    crate::error::RawError::new(
+        AnalyzeError::Parse(message),
+        span,
+        Some(
+            "a copy_in! target is a table and an optional column list: `table (column, ...)`"
+                .into(),
+        ),
+    )
+    .finalize_implicit()
+}
+
 impl PgCatalog {
     /// Check `target` — `table` or `table (column, ...)`, as written after
     /// `COPY` — as the target of a `COPY ... FROM STDIN`.
     pub fn analyze_copy_in(&self, target: &str) -> Result<AnalyzedCopyIn, AnalyzeError> {
         let invalid = |msg: String| AnalyzeError::Invalid(msg);
-        let sql = format!("COPY {target} FROM STDIN");
-        let parsed = typedpg_pg_query::parse(&sql).map_err(|e| invalid(e.to_string()))?;
+        const PREFIX: &str = "COPY ";
+        let sql = format!("{PREFIX}{target} FROM STDIN");
+        let parsed = typedpg_pg_query::parse(&sql)
+            .map_err(|e| copy_target_syntax_error(e, target, PREFIX.len()))?;
         // Exactly the one statement, with nothing but a relation and a
         // column list: the target can't smuggle in options or more SQL.
         let [raw] = parsed.protobuf.stmts.as_slice() else {
