@@ -178,6 +178,7 @@ pub fn range_of(schema: &str, name: &str, subtype: Type) -> Type {
         subtype: Box::new(subtype),
         extension: None,
         typmod: None,
+        multirange: false,
     }
 }
 

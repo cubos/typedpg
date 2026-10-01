@@ -1,4 +1,4 @@
-error: no Rust mapping for PostgreSQL type pg_catalog.tsvector — add it to [package.metadata.typedpg.types] in your Cargo.toml
+error: no Rust mapping for PostgreSQL type pg_catalog.tsvector — cast it in the query to a type that has one (e.g. `::text`), or add it to [package.metadata.typedpg.types] in your Cargo.toml
  --> src/bin/sql_no_rust_mapping.rs:4:5
   |
 4 |     typedpg::sql!(db, "SELECT to_tsvector('simple', name) AS v FROM users")

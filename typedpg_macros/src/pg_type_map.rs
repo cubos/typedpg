@@ -12,15 +12,27 @@
 /// Schema is always `pg_catalog` for true built-ins. Arrays are NOT listed
 /// here — they are resolved generically via [`typedpg_analyzer::Type::Array`]
 /// by recursing into the element type and wrapping the result in `Vec<…>`.
+/// Ranges and multiranges map to `typedpg::types::{Range, MultiRange}` of
+/// their subtype's mapping.
+///
+/// Every Rust type here decodes (and encodes) its PG type's binary format,
+/// the format tokio-postgres reads every column in: either through its own
+/// `FromSql` / `ToSql` impl, or — the `u32` of the `reg*` OID aliases, `xid`
+/// and `cid` — through `typedpg::__private::BaseTyped`, which reads them as
+/// the `oid` they are on the wire. A type with no such Rust type (`money`,
+/// `bit`, `record` without a known shape, `anyarray`…) is left out: the
+/// macro then asks for a cast or a `[types]` mapping instead of generating
+/// code that fails when the query runs.
 ///
 /// The mapped Rust types are emitted literally into generated code, so the
-/// corresponding crates (`chrono`, `uuid`, …) must be added to the
-/// consumer's `Cargo.toml` if they appear in any query.
+/// corresponding crates (`chrono`, `uuid`, `cidr`, `eui48`, …) must be added
+/// to the consumer's `Cargo.toml` if they appear in any query.
 static BUILTIN_MAP: &[(&str, &str, &str)] = &[
     // (schema, pg_name, rust_type)
     ("pg_catalog", "bool", "bool"),
     ("pg_catalog", "bytea", "Vec<u8>"),
-    ("pg_catalog", "char", "String"),
+    // The single-byte `"char"`, as rust-postgres reads it.
+    ("pg_catalog", "char", "i8"),
     ("pg_catalog", "name", "String"),
     ("pg_catalog", "int8", "i64"),
     ("pg_catalog", "int2", "i16"),
@@ -28,14 +40,15 @@ static BUILTIN_MAP: &[(&str, &str, &str)] = &[
     ("pg_catalog", "text", "String"),
     ("pg_catalog", "oid", "u32"),
     ("pg_catalog", "xid", "u32"),
-    ("pg_catalog", "xid8", "u64"),
+    ("pg_catalog", "cid", "u32"),
+    ("pg_catalog", "xid8", "::typedpg::types::Xid8"),
     ("pg_catalog", "json", "::serde_json::Value"),
     ("pg_catalog", "jsonb", "::serde_json::Value"),
-    ("pg_catalog", "cidr", "String"),
+    ("pg_catalog", "cidr", "::cidr::IpCidr"),
     ("pg_catalog", "float4", "f32"),
     ("pg_catalog", "float8", "f64"),
-    ("pg_catalog", "macaddr", "String"),
-    ("pg_catalog", "inet", "String"),
+    ("pg_catalog", "macaddr", "::eui48::MacAddress"),
+    ("pg_catalog", "inet", "::cidr::IpInet"),
     ("pg_catalog", "bpchar", "String"),
     ("pg_catalog", "varchar", "String"),
     ("pg_catalog", "date", "::chrono::NaiveDate"),
@@ -46,8 +59,8 @@ static BUILTIN_MAP: &[(&str, &str, &str)] = &[
         "timestamptz",
         "::chrono::DateTime<::chrono::Utc>",
     ),
-    ("pg_catalog", "interval", "String"),
-    ("pg_catalog", "timetz", "String"),
+    ("pg_catalog", "interval", "::typedpg::types::Interval"),
+    ("pg_catalog", "timetz", "::typedpg::types::TimeTz"),
     ("pg_catalog", "numeric", "::rust_decimal::Decimal"),
     ("pg_catalog", "regproc", "u32"),
     ("pg_catalog", "regprocedure", "u32"),
@@ -60,22 +73,14 @@ static BUILTIN_MAP: &[(&str, &str, &str)] = &[
     ("pg_catalog", "regcollation", "u32"),
     ("pg_catalog", "regconfig", "u32"),
     ("pg_catalog", "regdictionary", "u32"),
-    ("pg_catalog", "anyelement", "String"),
-    ("pg_catalog", "anyarray", "String"),
     ("pg_catalog", "uuid", "::uuid::Uuid"),
-    ("pg_catalog", "pg_lsn", "String"),
-    ("pg_catalog", "pg_ndistinct", "String"),
-    ("pg_catalog", "pg_dependencies", "String"),
-    ("pg_catalog", "pg_mcv_list", "String"),
+    ("pg_catalog", "pg_lsn", "::typedpg::types::PgLsn"),
     // UNKNOWN pseudo type — surfaces for empty VALUES lists and some literals
-    // whose type PG hasn't finalized. Rendered as String so codegen produces
-    // something usable instead of erroring.
+    // whose type PG hasn't finalized. Its values travel as text, which
+    // `String` reads.
     ("pg_catalog", "unknown", "String"),
-    // Record pseudo type without known fields — surfaces when a subquery
-    // returns `record` and we have no column list. Emit as String so the
-    // generated struct compiles; callers typically cast at SQL level if they
-    // need structure.
-    ("pg_catalog", "record", "String"),
+    // `void` carries no value (`void_send` sends zero bytes); the codegen
+    // reads it without decoding anything.
     ("pg_catalog", "void", "()"),
 ];
 
@@ -113,5 +118,5 @@ pub(crate) fn lookup_extension(extension: &str, name: &str) -> Option<&'static s
 /// parameter is typed against one of these, the generated code accepts any
 /// `Into<String>`-like value as convenience (e.g. `&str`, `String`, `Cow`).
 pub(crate) fn is_string_like(schema: &str, name: &str) -> bool {
-    schema == "pg_catalog" && matches!(name, "text" | "varchar" | "bpchar" | "name" | "char")
+    schema == "pg_catalog" && matches!(name, "text" | "varchar" | "bpchar" | "name")
 }

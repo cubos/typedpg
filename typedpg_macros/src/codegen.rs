@@ -287,6 +287,12 @@ fn override_path(ty: &Type, config: &ResolvedConfig) -> Option<String> {
     }
 }
 
+/// True for `void` (behind any domains).
+fn is_void(ty: &Type) -> bool {
+    matches!(innermost_type(ty), Type::Basic { schema, name, .. }
+        if schema == "pg_catalog" && name == "void")
+}
+
 /// True for the `json` / `jsonb` catalog types.
 fn is_jsonb_type(ty: &Type) -> bool {
     matches!(ty, Type::Basic { name, .. } if name == "json" || name == "jsonb")
@@ -377,12 +383,19 @@ fn resolve_type_mapping(
             Err(syn::Error::new(
                 proc_macro2::Span::call_site(),
                 format!(
-                    "no Rust mapping for PostgreSQL type {qn} — add it to \
+                    "no Rust mapping for PostgreSQL type {qn} — cast it in the query to a \
+                     type that has one (e.g. `::text`), or add it to \
                      [package.metadata.typedpg.types] in your Cargo.toml"
                 ),
             ))
         }
-        Type::Range { subtype, .. } => {
+        Type::Range {
+            schema,
+            name,
+            subtype,
+            multirange,
+            ..
+        } => {
             if let Some(path) = &ovr {
                 return Ok(RustMapping {
                     rust_type: parse_str(path)?,
@@ -392,12 +405,36 @@ fn resolve_type_mapping(
                     accepts_iter: false,
                 });
             }
-            // No override: map to postgres_range::Range<T>.
+            let qn = QualifiedName::new(schema.clone(), name.clone());
+            // tokio-postgres knows a user-defined multirange only as a
+            // simple type, without its subtype: nothing can read it.
+            if *multirange && schema != "pg_catalog" {
+                return Err(syn::Error::new(
+                    proc_macro2::Span::call_site(),
+                    format!(
+                        "no Rust mapping for PostgreSQL multirange type {qn} — add it to \
+                         [package.metadata.typedpg.types] in your Cargo.toml"
+                    ),
+                ));
+            }
+            // No override: typedpg's Range<T> / MultiRange<T>, whose impls
+            // read the subtype with T's.
             let inner = resolve_type_mapping(subtype, config, registry)?;
+            if !matches!(inner.strategy, DeserStrategy::Plain { .. }) {
+                return Err(syn::Error::new(
+                    proc_macro2::Span::call_site(),
+                    format!(
+                        "no Rust mapping for PostgreSQL range type {qn}: its subtype is not a \
+                         plain scalar — add it to [package.metadata.typedpg.types] in your \
+                         Cargo.toml"
+                    ),
+                ));
+            }
             let inner_rt = inner.rust_type;
+            let wrapper = if *multirange { "MultiRange" } else { "Range" };
             Ok(RustMapping {
                 rust_type: parse_str(&format!(
-                    "::postgres_range::Range<{}>",
+                    "::typedpg::types::{wrapper}<{}>",
                     quote::quote! { #inner_rt }
                 ))?,
                 strategy: DeserStrategy::Plain {
@@ -654,8 +691,7 @@ fn emit_one_record(
                 Some(ty) => quote! { __reader.read_field_with::<#raw>(#ty)? },
                 None => quote! { __reader.read_field::<#raw>()? },
             },
-            DecodeCtx::RecordField,
-            &format!("field \"{}\"", field.name),
+            DecodeCtx::RecordField(&format!("field \"{}\"", field.name)),
         )?;
         let tmp = format_ident!("__field_{}", i);
         from_sql_reads.extend(quote! { let #tmp: #field_ty = #decode; });
@@ -1443,6 +1479,12 @@ fn build_field_type_and_value<P: TypedParam>(
 ) -> Result<(syn::Type, TokenStream), syn::Error> {
     let mapping = resolve_type_mapping(param.pg_type(), config, registry)?;
     reject_record_param(&mapping.strategy)?;
+    if is_void(param.pg_type()) {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "a query parameter can't be of type void",
+        ));
+    }
     let is_nullable = param.nullable();
 
     let inner_rt = &mapping.rust_type;
@@ -1567,7 +1609,7 @@ fn push_param<P: TypedParam>(
         }
         DeserStrategy::Plain { .. } => {
             quote! {
-                __params.push(Box::new(#accessor.clone()) as #to_sql_ty);
+                __params.push(Box::new(::typedpg::__private::BaseTyped(#accessor.clone())) as #to_sql_ty);
             }
         }
         // `reject_record_param` above already bailed out for these.
@@ -1721,7 +1763,7 @@ fn build_params_slice(
                 }
             }
             DeserStrategy::Plain { .. } => {
-                quote! { &self.#field_name as #to_sql, }
+                quote! { &::typedpg::__private::BaseTyped(&self.#field_name) as #to_sql, }
             }
             // `reject_record_param` above already bailed out for these.
             DeserStrategy::Record | DeserStrategy::VecOfRecord => unreachable!(),
@@ -1776,26 +1818,29 @@ fn column_rust_type(
     }
 }
 
-/// Where a decoded value is being produced. Determines the error type a
-/// failed conversion must yield so that `?` is well-typed.
+/// Where a decoded value is being produced: determines the error type a
+/// failed conversion must yield so that `?` is well-typed, and carries how
+/// errors name the value.
 #[derive(Clone, Copy)]
-enum DecodeCtx {
+enum DecodeCtx<'a> {
     /// Inside the `sql!` row-mapping closure — errors are [`typedpg::Error`].
-    Column,
+    /// Named like `column "x" (int4)`.
+    Column(&'a str),
     /// Inside a synthesized record's `FromSql::from_sql` — errors are boxed.
-    RecordField,
+    /// Named like `field "x"`.
+    RecordField(&'a str),
 }
 
-impl DecodeCtx {
+impl DecodeCtx<'_> {
     /// The error, of this context's type, for a failure `e` to turn a value
-    /// into `target`, prefixed with `label` (`column "x" (int4)`,
-    /// `field "x"`): `column "x" (jsonb): failed to deserialize T: …`.
-    fn wrap_err(self, label: &str, what: &str, target: &syn::Type) -> TokenStream {
+    /// into `target`: `column "x" (jsonb): failed to deserialize T: …`.
+    fn wrap_err(self, what: &str, target: &syn::Type) -> TokenStream {
+        let (DecodeCtx::Column(label) | DecodeCtx::RecordField(label)) = self;
         let prefix = format!("{label}: {what} {}", type_text(target));
         let msg = quote! { format!("{}: {e}", #prefix) };
         match self {
-            DecodeCtx::Column => quote! { typedpg::Error::Deserialize(#msg) },
-            DecodeCtx::RecordField => quote! {
+            DecodeCtx::Column(_) => quote! { typedpg::Error::Deserialize(#msg) },
+            DecodeCtx::RecordField(_) => quote! {
                 <::std::boxed::Box<
                     dyn ::std::error::Error + ::std::marker::Send + ::std::marker::Sync,
                 > as ::std::convert::From<::std::string::String>>::from(#msg)
@@ -1822,8 +1867,7 @@ fn decode_value(
     config: &ResolvedConfig,
     registry: &RecordRegistry,
     read: &dyn Fn(TokenStream, Option<TokenStream>) -> TokenStream,
-    ctx: DecodeCtx,
-    label: &str,
+    ctx: DecodeCtx<'_>,
 ) -> Result<TokenStream, syn::Error> {
     // PG `Type` a JSONB-strategy value must be decoded as — `json` vs `jsonb`
     // differ by a leading version byte.
@@ -1837,7 +1881,7 @@ fn decode_value(
     };
     match &mapping.strategy {
         DeserStrategy::JsonbDomain { target } => {
-            let err = ctx.wrap_err(label, "failed to deserialize", target);
+            let err = ctx.wrap_err("failed to deserialize", target);
             let hint = Some(json_hint());
             if nullable {
                 let rd = read(quote! { ::std::option::Option<::serde_json::Value> }, hint);
@@ -1856,7 +1900,7 @@ fn decode_value(
             }
         }
         DeserStrategy::EnumAsString { target } => {
-            let err = ctx.wrap_err(label, "failed to parse enum", target);
+            let err = ctx.wrap_err("failed to parse enum", target);
             if nullable {
                 let rd = read(
                     quote! { ::std::option::Option<::typedpg::__private::EnumString> },
@@ -1877,7 +1921,7 @@ fn decode_value(
             }
         }
         DeserStrategy::VecOfJsonbDomain { inner } => {
-            let err = ctx.wrap_err(label, "failed to deserialize", inner);
+            let err = ctx.wrap_err("failed to deserialize", inner);
             let hint = Some(quote! {
                 &::typedpg::__private::tokio_postgres::types::Type::JSONB_ARRAY
             });
@@ -1903,7 +1947,7 @@ fn decode_value(
             }
         }
         DeserStrategy::VecOfEnumAsString { inner } => {
-            let err = ctx.wrap_err(label, "failed to parse enum", inner);
+            let err = ctx.wrap_err("failed to parse enum", inner);
             let map = quote! {
                 __vs.into_iter()
                     .map(|__v| __v.0.parse::<#inner>().map_err(|e| #err))
@@ -1945,6 +1989,18 @@ fn decode_value(
                 }
             })
         }
+        DeserStrategy::Plain { .. } if is_void(ty) => {
+            // A `void` value has no bytes to decode; only NULL-ness is read.
+            let rd = read(
+                quote! { ::std::option::Option<::typedpg::__private::Void> },
+                None,
+            );
+            Ok(if nullable {
+                quote! { #rd.map(|_| ()) }
+            } else {
+                quote! { { let _ = #rd; } }
+            })
+        }
         DeserStrategy::Plain { .. } => {
             let base = &mapping.rust_type;
             if nullable {
@@ -1976,8 +2032,7 @@ fn column_get_expr(
         &|raw, _hint| {
             quote! { ::typedpg::__private::read_column::<#raw>(&__row, #idx_lit, #name, #pg_type)? }
         },
-        DecodeCtx::Column,
-        &label,
+        DecodeCtx::Column(&label),
     )
 }
 

@@ -12,6 +12,8 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 rust_decimal = { version = "1", features = ["db-tokio-postgres"] }
 pgvector = { version = "0.4", features = ["postgres"] }
+cidr = "0.3"
+eui48 = { version = "1", default-features = false }
 
 [dev-dependencies]
 typedpg_core = { path = "../typedpg_core" }

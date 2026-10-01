@@ -95,6 +95,9 @@ pub enum Type {
         /// `subtype` — kept for symmetry with `Basic`/`Domain` and forward
         /// compatibility with custom range types.
         typmod: Option<i32>,
+        /// A multirange (`int4multirange`) rather than a range: a set of
+        /// ranges over `subtype`, with its own binary format.
+        multirange: bool,
     },
     Composite {
         schema: String,
