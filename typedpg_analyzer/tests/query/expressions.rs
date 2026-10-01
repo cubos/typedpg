@@ -716,6 +716,11 @@ fn case_with_incompatible_concrete_arms_rejected() {
         AnalyzeError::DatatypeMismatch(_),
         concat!(
             "CASE types text and integer cannot be matched\n",
+            "  ╭────\n",
+            "1 │ SELECT CASE WHEN true THEN 1 ELSE 'x'::text END\n",
+            "  ·                            ┬\n",
+            "  ·                            ╰─ this is integer\n",
+            "  ╰────\n",
             "  help: add an explicit cast so the branches share a type, e.g. `expr::integer`\n",
         ),
     );
@@ -759,6 +764,11 @@ fn coalesce_with_incompatible_concrete_arms_rejected() {
         AnalyzeError::DatatypeMismatch(_),
         concat!(
             "COALESCE types integer and text cannot be matched\n",
+            "  ╭────\n",
+            "1 │ SELECT COALESCE(1, 'x'::text)\n",
+            "  ·                    ─┬─\n",
+            "  ·                     ╰─ this is text\n",
+            "  ╰────\n",
             "  help: add an explicit cast so the branches share a type, e.g. `expr::text`\n",
         ),
     );

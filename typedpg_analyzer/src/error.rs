@@ -630,6 +630,24 @@ pub(crate) fn node_location(node: &typedpg_pg_query::protobuf::Node) -> Option<i
     if loc < 0 { None } else { Some(loc) }
 }
 
+/// The span PG's `exprLocation` would put an error about expression
+/// `node` at: its leftmost token — for `'x'::text` the literal, not the
+/// `::` the cast's own location points at; for `a + b`, `a`. A `ResTarget`
+/// stands for its value. `None` when no part of it has a location.
+pub(crate) fn expr_span(node: &typedpg_pg_query::protobuf::Node) -> Option<SourceSpan> {
+    use typedpg_pg_query::protobuf::node::Node;
+    let leftmost = match node.node.as_ref()? {
+        Node::TypeCast(tc) => tc.arg.as_deref().and_then(expr_span),
+        Node::AExpr(e) => e.lexpr.as_deref().and_then(expr_span),
+        Node::ResTarget(rt) => rt.val.as_deref().and_then(expr_span),
+        _ => None,
+    };
+    leftmost.or_else(|| {
+        let loc = node_location(node)?;
+        SourceSpan::from_node_token(loc).or_else(|| SourceSpan::from_location(loc))
+    })
+}
+
 /// Scan whatever token starts at `start` — qualified identifier, numeric
 /// literal, single-quoted string, or boolean/keyword identifier. Returns
 /// the exclusive end byte offset, or `None` if `start` doesn't begin a

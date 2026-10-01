@@ -34,14 +34,19 @@ pub(crate) fn infer_bool_expr(
 /// wording for both: `CASE types A and B cannot be matched` (the running
 /// candidate and the first input of another category, base types) and
 /// `CASE could not convert type A to B`. All-unknown inputs resolve to text.
+///
+/// `nodes` are the inputs' expressions, parallel to `types`: the error
+/// points at the one whose type failed, as PG does.
 pub(crate) fn select_common_type(
     label: &str,
     types: &[PgTypeOid],
+    nodes: &[&protobuf::Node],
     snapshot: &PgCatalog,
 ) -> Result<PgTypeOid, AnalyzeError> {
     let name = |t: PgTypeOid| crate::ddl::util::format_type_for_message(snapshot, t);
     coerce::select_common_type(types, snapshot).map_err(|e| match e {
         coerce::CommonTypeError::Mismatch(a, b) => {
+            let span = failing_input_span(types, nodes, b, snapshot);
             let (a, b) = (name(a), name(b));
             let what = if matches!(label, "GREATEST" | "LEAST") {
                 "arguments"
@@ -56,13 +61,30 @@ pub(crate) fn select_common_type(
                 Some(format!(
                     "add an explicit cast so the {what} share a type, e.g. `expr::{b}`"
                 )),
+                span,
             )
             .finalize_implicit()
         }
         coerce::CommonTypeError::CannotConvert { from, to } => {
-            crate::pgmsg::could_not_convert_type(label, &name(from), &name(to)).finalize_implicit()
+            let span = failing_input_span(types, nodes, from, snapshot);
+            crate::pgmsg::could_not_convert_type(label, &name(from), &name(to), span)
+                .finalize_implicit()
         }
     })
+}
+
+/// Where a common-type failure on (base) type `failing` is: the first
+/// input of that type — `nodes` parallel to `types`.
+pub(crate) fn failing_input_span(
+    types: &[PgTypeOid],
+    nodes: &[&protobuf::Node],
+    failing: PgTypeOid,
+    snapshot: &PgCatalog,
+) -> Option<crate::error::SourceSpan> {
+    let i = types
+        .iter()
+        .position(|&t| t != oid::UNKNOWN && snapshot.unwrap_domain(t) == failing)?;
+    nodes.get(i).and_then(|n| crate::error::expr_span(n))
 }
 
 /// PG's `exprTypmod` for CASE / COALESCE / GREATEST / ARRAY[]: the typmod
@@ -102,7 +124,8 @@ pub(crate) fn infer_coalesce(
     // all-identical fast path that preserves domains must see a NULL branch
     // — `COALESCE(d, NULL)` is the base type, `COALESCE(d, d)` stays `d`.
     let types: Vec<PgTypeOid> = args.iter().map(|t| t.type_oid).collect();
-    let type_oid = select_common_type("COALESCE", &types, snapshot)?;
+    let nodes: Vec<&protobuf::Node> = expr.args.iter().collect();
+    let type_oid = select_common_type("COALESCE", &types, &nodes, snapshot)?;
 
     // Pass 2: back-fill UNKNOWN args with the resolved common type. Literal
     // content rejections propagate (PG raises them from this coercion).
@@ -212,7 +235,14 @@ pub(crate) fn infer_case(
     inputs.extend(results.iter().map(|(_, t)| t.clone()));
 
     let types: Vec<PgTypeOid> = inputs.iter().map(|t| t.type_oid).collect();
-    let type_oid = select_common_type("CASE", &types, snapshot)?;
+    // Parallel to `types` (the implicit ELSE NULL has no node: an untyped
+    // NULL never fails the match).
+    let null_node = protobuf::Node { node: None };
+    let nodes: Vec<&protobuf::Node> =
+        std::iter::once(default.as_ref().map_or(&null_node, |(n, _)| *n))
+            .chain(results.iter().map(|(n, _)| *n))
+            .collect();
+    let type_oid = select_common_type("CASE", &types, &nodes, snapshot)?;
 
     // Pass 2: back-fill UNKNOWN results with the common type. Literal
     // content rejections propagate (PG raises them from this coercion).

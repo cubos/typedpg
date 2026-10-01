@@ -131,7 +131,10 @@ fn join_using_alias_exposes_the_merged_columns() {
     assert_analyze_err!(
         db.analyze("SELECT * FROM t JOIN u USING (id) AS t"),
         AnalyzeError::DuplicateAlias(_),
-        "table name \"t\" specified more than once"
+        concat!(
+            "table name \"t\" specified more than once\n",
+            "  help: give one of them another alias\n",
+        )
     );
 }
 

@@ -434,10 +434,24 @@ fn merge_when_insert(
     // column list (`INSERT DEFAULT VALUES` has no values at all).
     if !when.values.is_empty() {
         if when.values.len() > target_attrs.len() {
-            return Err(crate::pgmsg::insert_more_expressions_than_targets().finalize_implicit());
+            return Err(crate::pgmsg::insert_more_expressions_than_targets(
+                target_attrs.len(),
+                when.values.len(),
+                when.values
+                    .get(target_attrs.len())
+                    .and_then(crate::error::expr_span),
+            )
+            .finalize_implicit());
         }
         if !res_targets.is_empty() && when.values.len() < target_attrs.len() {
-            return Err(crate::pgmsg::insert_more_targets_than_expressions().finalize_implicit());
+            return Err(crate::pgmsg::insert_more_targets_than_expressions(
+                target_attrs.len(),
+                when.values.len(),
+                res_targets
+                    .get(when.values.len())
+                    .and_then(|rt| crate::error::SourceSpan::from_node_qname(rt.location)),
+            )
+            .finalize_implicit());
         }
     }
     Ok(())

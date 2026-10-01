@@ -61,7 +61,8 @@ pub(crate) fn analyze_insert_with_outer_ctes(
                 })
                 .collect();
         } else {
-            let width = analyze_insert_select(val_sel, &tgt, snapshot, params, &cte_scopes)?;
+            let width =
+                analyze_insert_select(val_sel, &ins.cols, &tgt, snapshot, params, &cte_scopes)?;
             assigns = (0..width)
                 .filter_map(|i| {
                     Some(Assign {
@@ -379,29 +380,26 @@ fn analyze_insert_values(
         match first_len {
             None => first_len = Some(list.items.len()),
             Some(n) if n != list.items.len() => {
-                return Err(
-                    crate::pgmsg::values_lists_length(n, list.items.len()).finalize_implicit()
-                );
+                // PG positions it at the row's first value.
+                let span = list.items.first().and_then(crate::error::expr_span);
+                return Err(crate::pgmsg::values_lists_length(n, list.items.len(), span)
+                    .finalize_implicit());
             }
             Some(_) => {}
         }
         // Arity check: the VALUES row must match the declared column list
         // (or, when no column list is given, the full table width).
         if arity_mismatch(tgt, list.items.len(), expected_len) {
-            // PG (SQLSTATE 42601) emits one of two messages:
-            // `INSERT has more expressions than target columns` or
-            // `INSERT has more target columns than expressions`. Mirror PG's
-            // wording verbatim and tack on our richer detail behind it.
-            let pg_msg = if list.items.len() > expected_len {
-                "INSERT has more expressions than target columns"
-            } else {
-                "INSERT has more target columns than expressions"
-            };
-            return Err(AnalyzeError::Invalid(format!(
-                "{pg_msg} (table `{}` expects {expected_len}, got {})",
-                tgt.relname,
+            // PG (SQLSTATE 42601), positioned at the first value without a
+            // column, or the first column without a value.
+            return Err(insert_arity_error(
+                &ins.cols,
+                expected_len,
                 list.items.len(),
-            )));
+                list.items
+                    .get(expected_len)
+                    .and_then(crate::error::expr_span),
+            ));
         }
         for (i, val) in list.items.iter().enumerate() {
             let target_col = target_col_at(tgt, i);
@@ -473,12 +471,36 @@ fn analyze_insert_values(
     Ok(())
 }
 
+/// transformInsertRow's arity error for `expressions` values against
+/// `targets` target columns (`cols`, the explicit column list, maybe
+/// empty). `extra_value` is the span of the first value past the targets.
+fn insert_arity_error(
+    cols: &[protobuf::Node],
+    targets: usize,
+    expressions: usize,
+    extra_value: Option<crate::error::SourceSpan>,
+) -> AnalyzeError {
+    if expressions > targets {
+        crate::pgmsg::insert_more_expressions_than_targets(targets, expressions, extra_value)
+    } else {
+        let column = cols.get(expressions).and_then(|n| match n.node.as_ref() {
+            Some(node::Node::ResTarget(rt)) => {
+                crate::error::SourceSpan::from_node_qname(rt.location)
+            }
+            _ => None,
+        });
+        crate::pgmsg::insert_more_targets_than_expressions(targets, expressions, column)
+    }
+    .finalize_implicit()
+}
+
 /// `INSERT … SELECT …`: enforce arity, reject GENERATED ALWAYS identity
 /// targets (a SELECT can't supply `DEFAULT`), walk the SELECT so its params
 /// register and typos propagate, then pin column types onto bare `$N`
 /// projections.
 fn analyze_insert_select(
     val_sel: &protobuf::SelectStmt,
+    cols: &[protobuf::Node],
     tgt: &InsertTarget,
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
@@ -492,16 +514,12 @@ fn analyze_insert_select(
     let (sel_cols, _) = analyze_select_with_ctes(val_sel, snapshot, params, cte_scopes)?;
     let expected_len = insert_arity(tgt);
     if arity_mismatch(tgt, sel_cols.len(), expected_len) {
-        let pg_msg = if sel_cols.len() > expected_len {
-            "INSERT has more expressions than target columns"
-        } else {
-            "INSERT has more target columns than expressions"
-        };
-        return Err(AnalyzeError::Invalid(format!(
-            "{pg_msg} (table `{}` expects {expected_len}, SELECT produces {})",
-            tgt.relname,
+        return Err(insert_arity_error(
+            cols,
+            expected_len,
             sel_cols.len(),
-        )));
+            super::set_ops::branch_column_span(val_sel, expected_len),
+        ));
     }
     // The SELECT's target entries line up with its output columns only for
     // a plain SELECT without `*`.

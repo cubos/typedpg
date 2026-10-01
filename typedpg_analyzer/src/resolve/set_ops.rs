@@ -4,6 +4,25 @@ use super::*;
 // UNION / INTERSECT / EXCEPT
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// The span of output column `i` of a set operation's branch `node`, as
+/// PG locates it: the expression of a plain SELECT's target (or VALUES
+/// cell), or of the leftmost query of a nested set operation.
+pub(crate) fn branch_column_span(
+    node: &protobuf::SelectStmt,
+    i: usize,
+) -> Option<crate::error::SourceSpan> {
+    if node.op != protobuf::SetOperation::SetopNone as i32 {
+        return node.larg.as_deref().and_then(|l| branch_column_span(l, i));
+    }
+    if let Some(row) = node.values_lists.first() {
+        return match row.node.as_ref()? {
+            node::Node::List(l) => l.items.get(i).and_then(crate::error::expr_span),
+            _ => None,
+        };
+    }
+    node.target_list.get(i).and_then(crate::error::expr_span)
+}
+
 pub(crate) fn analyze_set_operation(
     sel: &protobuf::SelectStmt,
     snapshot: &PgCatalog,
@@ -69,10 +88,14 @@ pub(crate) fn analyze_set_operation(
     }
 
     if left_cols.len() != right_cols.len() {
-        return Err(
-            crate::pgmsg::set_op_column_count(op_label, left_cols.len(), right_cols.len())
-                .finalize_implicit(),
-        );
+        // PG positions it at the right query's first column.
+        return Err(crate::pgmsg::set_op_column_count(
+            op_label,
+            left_cols.len(),
+            right_cols.len(),
+            branch_column_span(right, 0),
+        )
+        .finalize_implicit());
     }
 
     // A bare `$N` projected by one branch adopts the column's reconciled
@@ -162,6 +185,8 @@ pub(crate) fn analyze_set_operation(
                         "cast both sides to a common type, e.g. `{}::{a}`",
                         l.name
                     )),
+                    // PG positions it at the right query's column.
+                    branch_column_span(right, i),
                 )
                 .finalize_implicit());
             }

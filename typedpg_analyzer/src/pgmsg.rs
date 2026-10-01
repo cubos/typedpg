@@ -423,11 +423,11 @@ pub(crate) fn distinct_order_by_not_in_select_list(span: Option<SourceSpan>) -> 
 
 /// `table name "u" specified more than once` — SQLSTATE 42712
 /// (`duplicate_alias`).
-pub(crate) fn duplicate_table_alias(alias: &str) -> RawError {
+pub(crate) fn duplicate_table_alias(alias: &str, span: Option<SourceSpan>) -> RawError {
     RawError::new(
         AnalyzeError::DuplicateAlias(format!("table name \"{alias}\" specified more than once")),
-        None,
-        None,
+        span,
+        Some("give one of them another alias".into()),
     )
 }
 
@@ -468,23 +468,41 @@ pub(crate) fn merge_unreachable_when_clause() -> RawError {
 }
 
 /// `INSERT has more expressions than target columns` — SQLSTATE 42601
-/// (`transformInsertRow`).
-pub(crate) fn insert_more_expressions_than_targets() -> RawError {
+/// (`transformInsertRow`). PG positions it at the first extra expression;
+/// `targets` / `expressions` are the counts, for the hint.
+pub(crate) fn insert_more_expressions_than_targets(
+    targets: usize,
+    expressions: usize,
+    span: Option<SourceSpan>,
+) -> RawError {
     RawError::new(
         AnalyzeError::SyntaxError("INSERT has more expressions than target columns".into()),
-        None,
-        None,
+        span,
+        Some(format!(
+            "{expressions} values for {targets} target column(s): add the missing columns to the \
+             column list, or drop the extra values"
+        )),
     )
+    .with_primary_label("no target column for this value")
 }
 
 /// `INSERT has more target columns than expressions` — SQLSTATE 42601
-/// (`transformInsertRow`).
-pub(crate) fn insert_more_targets_than_expressions() -> RawError {
+/// (`transformInsertRow`). PG positions it at the first target column
+/// without a value.
+pub(crate) fn insert_more_targets_than_expressions(
+    targets: usize,
+    expressions: usize,
+    span: Option<SourceSpan>,
+) -> RawError {
     RawError::new(
         AnalyzeError::SyntaxError("INSERT has more target columns than expressions".into()),
-        None,
-        None,
+        span,
+        Some(format!(
+            "{targets} target column(s) for {expressions} value(s): supply a value for every \
+             listed column"
+        )),
     )
+    .with_primary_label("no value for this column")
 }
 
 /// `OLD cannot be specified multiple times` (or `NEW …`) — SQLSTATE 42601:
@@ -568,10 +586,14 @@ pub(crate) fn unknown_field_not_coercible(target: &str, span: Option<SourceSpan>
 
 /// `VALUES lists must all be the same length` — SQLSTATE 42601
 /// (`syntax_error`).
-pub(crate) fn values_lists_length(first_arity: usize, row_arity: usize) -> RawError {
+pub(crate) fn values_lists_length(
+    first_arity: usize,
+    row_arity: usize,
+    span: Option<SourceSpan>,
+) -> RawError {
     RawError::new(
         AnalyzeError::SyntaxError("VALUES lists must all be the same length".to_string()),
-        None,
+        span,
         Some(format!(
             "the first row has {first_arity} column(s), a later row has {row_arity}"
         )),
@@ -580,10 +602,10 @@ pub(crate) fn values_lists_length(first_arity: usize, row_arity: usize) -> RawEr
 
 /// `window "w" does not exist` — SQLSTATE 42704 (`undefined_object`): a
 /// named-window reference with no matching WINDOW-clause definition.
-pub(crate) fn window_does_not_exist(name: &str) -> RawError {
+pub(crate) fn window_does_not_exist(name: &str, span: Option<SourceSpan>) -> RawError {
     RawError::new(
         AnalyzeError::UndefinedObject(format!("window \"{name}\" does not exist")),
-        None,
+        span,
         Some("define it in a WINDOW clause, e.g. `WINDOW w AS (ORDER BY …)`".into()),
     )
 }
@@ -657,24 +679,31 @@ pub(crate) fn types_cannot_be_matched(
     second: &str,
     extra: &str,
     hint: Option<String>,
+    span: Option<SourceSpan>,
 ) -> RawError {
     RawError::new(
         AnalyzeError::DatatypeMismatch(format!(
             "{construct} types {first} and {second} cannot be matched{extra}"
         )),
-        None,
+        span,
         hint,
     )
+    .with_primary_label(format!("this is {second}"))
 }
 
 /// `each UNION query must have the same number of columns` (likewise
 /// INTERSECT / EXCEPT) — SQLSTATE 42601.
-pub(crate) fn set_op_column_count(op_label: &str, left: usize, right: usize) -> RawError {
+pub(crate) fn set_op_column_count(
+    op_label: &str,
+    left: usize,
+    right: usize,
+    span: Option<SourceSpan>,
+) -> RawError {
     RawError::new(
         AnalyzeError::SyntaxError(format!(
             "each {op_label} query must have the same number of columns"
         )),
-        None,
+        span,
         Some(format!(
             "the left side produces {left} column(s), the right side {right}"
         )),
@@ -1284,10 +1313,15 @@ pub(crate) fn cannot_determine_type_of_empty_array(span: Option<SourceSpan>) -> 
 /// `<CONTEXT> could not convert type A to B` — SQLSTATE 42846
 /// (`cannot_coerce`, no dedicated variant): PG's coerce_to_common_type
 /// after select_common_type chose B for a construct (ARRAY, CASE, …).
-pub(crate) fn could_not_convert_type(context: &str, from: &str, to: &str) -> RawError {
+pub(crate) fn could_not_convert_type(
+    context: &str,
+    from: &str,
+    to: &str,
+    span: Option<SourceSpan>,
+) -> RawError {
     RawError::new(
         AnalyzeError::Invalid(format!("{context} could not convert type {from} to {to}")),
-        None,
+        span,
         None,
     )
 }
@@ -1503,9 +1537,9 @@ mod tests {
                 "42P10",
             ),
             (distinct_order_by_not_in_select_list(None).kind, "42P10"),
-            (duplicate_table_alias("u").kind, "42712"),
+            (duplicate_table_alias("u", None).kind, "42712"),
             (too_many_column_aliases("t", 1, 2).kind, "42P10"),
-            (values_lists_length(2, 1).kind, "42601"),
+            (values_lists_length(2, 1, None).kind, "42601"),
             (unknown_field_not_coercible("text", None).kind, "XX000"),
             (no_on_conflict_arbiter("t").kind, "42P10"),
             (insert_non_default_into_generated("g", false).kind, "428C9"),
@@ -1528,15 +1562,15 @@ mod tests {
                     .kind,
                 "0A000",
             ),
-            (window_does_not_exist("w").kind, "42704"),
+            (window_does_not_exist("w", None).kind, "42704"),
             (using_column_missing("id", "left").kind, "42703"),
             (join_using_types_mismatch("integer", "point").kind, "42804"),
             (nullif_types_mismatch("integer", "point"), "42883"),
             (
-                types_cannot_be_matched("CASE", "integer", "point", "", None).kind,
+                types_cannot_be_matched("CASE", "integer", "point", "", None, None).kind,
                 "42804",
             ),
-            (set_op_column_count("UNION", 2, 1).kind, "42601"),
+            (set_op_column_count("UNION", 2, 1, None).kind, "42601"),
             (no_array_type_for("integer[]"), "42704"),
             (
                 prefix_operator_does_not_exist("-", "text", None).kind,

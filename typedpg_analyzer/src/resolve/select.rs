@@ -813,17 +813,19 @@ fn check_window_refs(
     let Some(inner) = node.node.as_ref() else {
         return Ok(());
     };
-    let check_name = |name: &str| -> Result<(), AnalyzeError> {
+    let check_name = |name: &str, location: i32| -> Result<(), AnalyzeError> {
         if !name.is_empty() && !defined.contains(name) {
-            return Err(crate::pgmsg::window_does_not_exist(name).finalize_implicit());
+            // PG positions it at the window's name.
+            let span = crate::error::SourceSpan::from_node_qname(location);
+            return Err(crate::pgmsg::window_does_not_exist(name, span).finalize_implicit());
         }
         Ok(())
     };
     match inner {
         node::Node::FuncCall(fc) => {
             if let Some(over) = &fc.over {
-                check_name(&over.name)?;
-                check_name(&over.refname)?;
+                check_name(&over.name, over.location)?;
+                check_name(&over.refname, over.location)?;
             }
             for arg in &fc.args {
                 check_window_refs(arg, defined)?;

@@ -74,7 +74,7 @@ pub(crate) fn resolve_returning(
         }
         *named = true;
         if namespace_has(&scope, &opt.value) {
-            return Err(crate::pgmsg::duplicate_table_alias(&opt.value).finalize_implicit());
+            return Err(crate::pgmsg::duplicate_table_alias(&opt.value, span).finalize_implicit());
         }
         scope
             .sources

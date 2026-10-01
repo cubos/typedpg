@@ -384,6 +384,8 @@ pub(crate) fn transform_array_expr(
             let common = match coerce::select_common_type(&types, snapshot) {
                 Ok(t) => t,
                 Err(coerce::CommonTypeError::Mismatch(a, b)) => {
+                    let nodes: Vec<&protobuf::Node> = arr.elements.iter().collect();
+                    let span = super::conditional::failing_input_span(&types, &nodes, b, snapshot);
                     let (a, b) = (name(a), name(b));
                     return Err(crate::pgmsg::types_cannot_be_matched(
                         "ARRAY",
@@ -393,14 +395,19 @@ pub(crate) fn transform_array_expr(
                         Some(format!(
                             "cast the elements to a common type, e.g. `elem::{a}`"
                         )),
+                        span,
                     )
                     .finalize_implicit());
                 }
                 Err(coerce::CommonTypeError::CannotConvert { from, to }) => {
+                    let nodes: Vec<&protobuf::Node> = arr.elements.iter().collect();
+                    let span =
+                        super::conditional::failing_input_span(&types, &nodes, from, snapshot);
                     return Err(crate::pgmsg::could_not_convert_type(
                         "ARRAY",
                         &name(from),
                         &name(to),
+                        span,
                     )
                     .finalize_implicit());
                 }
@@ -447,6 +454,7 @@ pub(crate) fn transform_array_expr(
                 "ARRAY",
                 &name(t.type_oid),
                 &name(coerce_type),
+                crate::error::expr_span(elem),
             )
             .finalize_implicit());
         }

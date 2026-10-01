@@ -168,6 +168,11 @@ fn coalesce_domain_mismatch_reports_base_type_name() {
         AnalyzeError::DatatypeMismatch(_),
         concat!(
             "COALESCE types integer and boolean cannot be matched\n",
+            "  ╭────\n",
+            "1 │ SELECT COALESCE(balance, true) FROM accounts\n",
+            "  ·                          ──┬─\n",
+            "  ·                            ╰─ this is boolean\n",
+            "  ╰────\n",
             "  help: add an explicit cast so the branches share a type, e.g. `expr::boolean`\n",
         ),
     );
@@ -263,6 +268,11 @@ fn array_literal_incompatible_types_rejected() {
         AnalyzeError::DatatypeMismatch(_),
         concat!(
             "ARRAY types text and integer cannot be matched\n",
+            "  ╭────\n",
+            "1 │ SELECT ARRAY['x'::text, 1]\n",
+            "  ·                         ┬\n",
+            "  ·                         ╰─ this is integer\n",
+            "  ╰────\n",
             "  help: cast the elements to a common type, e.g. `elem::text`\n",
         ),
     );
@@ -276,6 +286,11 @@ fn array_literal_bool_and_int_rejected() {
         AnalyzeError::DatatypeMismatch(_),
         concat!(
             "ARRAY types boolean and integer cannot be matched\n",
+            "  ╭────\n",
+            "1 │ SELECT ARRAY[true, 1]\n",
+            "  ·                    ┬\n",
+            "  ·                    ╰─ this is integer\n",
+            "  ╰────\n",
             "  help: cast the elements to a common type, e.g. `elem::boolean`\n",
         ),
     );

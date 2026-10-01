@@ -454,6 +454,7 @@ fn unify_hypothetical_args(
                 &name(ht),
                 "",
                 None,
+                crate::error::expr_span(harg),
             )
             .finalize_implicit());
         };
@@ -1048,7 +1049,7 @@ pub(crate) fn check_window_clause(
                     .iter()
                     .find(|d| d.name == wd.refname)
                     .ok_or_else(|| {
-                        crate::pgmsg::window_does_not_exist(&wd.refname).finalize_implicit()
+                        crate::pgmsg::window_does_not_exist(&wd.refname, span).finalize_implicit()
                     })?,
             )
         };
