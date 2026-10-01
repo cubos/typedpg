@@ -86,7 +86,8 @@ pub enum Type {
         /// `string_to_array(s, ',')`. `None` when nothing is known — always
         /// the case for a table's array column (PostgreSQL has no NOT NULL
         /// for elements), a parameter, or an array that came through a
-        /// subquery, CTE, view or most expressions.
+        /// view or most expressions (a subquery or CTE keeps what its
+        /// query knows).
         element_nullable: Option<bool>,
     },
     Enum {

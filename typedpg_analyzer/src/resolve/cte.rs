@@ -51,6 +51,7 @@ pub(crate) fn analyze_cte(
         typmod: rc.typmod,
         collation: rc.collation,
         record_fields: rc.record_fields,
+        elem_nullable: rc.elem_nullable,
     };
 
     let columns: Vec<ScopeColumn> = match cte_query {
@@ -153,6 +154,10 @@ pub(crate) fn analyze_cte(
                         collation,
                         table_alias: cte.ctename.clone(),
                         record_fields: s.record_fields,
+                        elem_nullable: crate::expr::merge_elem_nullable([
+                            s.elem_nullable,
+                            r.elem_nullable,
+                        ]),
                     }
                 })
                 .collect()
@@ -241,6 +246,7 @@ fn search_cycle_columns(
         typmod: None,
         collation: None,
         record_fields: None,
+        elem_nullable: None,
     };
     let record_array = snapshot.array_type_of(oid::RECORD).unwrap_or(oid::UNKNOWN);
     let mut added: Vec<ScopeColumn> = Vec::new();

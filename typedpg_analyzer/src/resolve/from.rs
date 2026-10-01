@@ -169,6 +169,7 @@ pub(crate) fn process_from_item(
                         typmod: rc.typmod,
                         collation: rc.collation,
                         record_fields: rc.record_fields,
+                        elem_nullable: rc.elem_nullable,
                     })
                     .collect();
                 // PG rejects more aliases than columns (42P10).
@@ -404,6 +405,7 @@ fn process_range_function(
             typmod: None,
             collation: None,
             record_fields: None,
+            elem_nullable: None,
         });
     }
 
@@ -818,6 +820,7 @@ fn merge_using_columns(
             // Set by the caller once the source's alias is known.
             table_alias: String::new(),
             record_fields: None,
+            elem_nullable: crate::expr::merge_elem_nullable([l.elem_nullable, r.elem_nullable]),
         });
         hide.push((l_idx, name.clone()));
         hide.push((r_idx, name.clone()));
@@ -1059,6 +1062,7 @@ fn function_rte_columns(
                 collation: None,
                 table_alias: alias.to_owned(),
                 record_fields: None,
+                elem_nullable: None,
             })
             .collect());
     }
@@ -1088,6 +1092,7 @@ fn function_rte_columns(
                 collation: f.attcollation,
                 table_alias: alias.to_owned(),
                 record_fields: None,
+                elem_nullable: None,
             })
             .collect());
     }
@@ -1128,6 +1133,7 @@ fn function_rte_columns(
         typmod: None,
         collation: None,
         record_fields: None,
+        elem_nullable: None,
     }])
 }
 
@@ -1164,6 +1170,7 @@ fn coldeflist_columns(
             collation: None,
             table_alias: alias.to_owned(),
             record_fields: None,
+            elem_nullable: None,
         });
     }
     for (i, c) in cols.iter().enumerate() {
@@ -1505,6 +1512,7 @@ fn json_table_columns(
             collation: None,
             table_alias: alias.to_owned(),
             record_fields: None,
+            elem_nullable: None,
         });
     }
     Ok(())

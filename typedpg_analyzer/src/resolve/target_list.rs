@@ -171,7 +171,7 @@ pub(crate) fn resolve_target_list_explicit(
                     typmod: col.typmod,
                     collation: col.collation,
                     record_fields: col.record_fields.clone(),
-                    elem_nullable: None,
+                    elem_nullable: col.elem_nullable,
                 });
             }
             continue;

@@ -97,3 +97,27 @@ fn table_columns_and_union_arms() {
         &[("a", Some(false))],
     );
 }
+
+#[test]
+fn subqueries_and_ctes_keep_what_is_known() {
+    let db = setup();
+    // Passing an array through a subquery, a CTE or `*` doesn't change its
+    // elements: a pass-through wrap reports what the query itself does.
+    for sql in [
+        "SELECT a, b FROM (SELECT array_agg(n) AS a, array_agg(age) AS b FROM t) s",
+        "WITH c AS (SELECT array_agg(n) AS a, array_agg(age) AS b FROM t) SELECT a, b FROM c",
+        "SELECT * FROM (SELECT array_agg(n) AS a, array_agg(age) AS b FROM t) s",
+        // An outer join may make the whole array NULL, not an element.
+        "SELECT s.a, s.b FROM t LEFT JOIN (SELECT array_agg(n) AS a, array_agg(age) AS b \
+         FROM t) s ON false",
+    ] {
+        assert_elements(&db, sql, &[("a", Some(false)), ("b", Some(true))]);
+    }
+    // A recursive CTE's column is either arm's.
+    assert_elements(
+        &db,
+        "WITH RECURSIVE r(a, k) AS (SELECT ARRAY[1], 1 UNION ALL \
+         SELECT ARRAY[NULL::int], k + 1 FROM r WHERE k < 3) SELECT a FROM r",
+        &[("a", Some(true))],
+    );
+}
