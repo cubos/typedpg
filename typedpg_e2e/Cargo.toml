@@ -18,7 +18,7 @@ typedpg_core = { path = "../typedpg_core" }
 tokio = { version = "1", features = ["full"] }
 tokio-postgres = { version = "0.7", features = ["with-serde_json-1", "with-chrono-0_4", "with-uuid-1"] }
 deadpool-postgres = "0.14"
-testcontainers = "0.27"
+testcontainers = "0.28"
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
 libc = "0.2"
 
