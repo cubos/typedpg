@@ -128,8 +128,8 @@ fn create_operator_and_cast_require_their_functions() {
 #[test]
 fn user_operator_backed_by_a_non_strict_function_is_nullable() {
     // The function runs on any operands and may return NULL (a SQL function
-    // is CALLED ON NULL INPUT by default); a STRICT one is NULL only on a
-    // NULL operand.
+    // is CALLED ON NULL INPUT by default). STRICT only skips the call on a
+    // NULL operand: a SQL body may still return NULL.
     let db = build_db(&[(
         "0001.sql",
         "CREATE FUNCTION eq3(int, int) RETURNS bool LANGUAGE sql IMMUTABLE AS 'select null::bool';
@@ -143,7 +143,7 @@ fn user_operator_backed_by_a_non_strict_function_is_nullable() {
     );
     assert_cols(
         &db.analyze("SELECT 1 ==== 2 AS e").unwrap(),
-        vec![c("e", bool_ty())],
+        vec![cn("e", bool_ty())],
     );
 }
 

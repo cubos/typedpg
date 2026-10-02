@@ -908,7 +908,19 @@ pub(crate) fn operator_result_nullable(
         return any_nullable;
     };
     if Some(f.pronamespace) != snapshot.pg_catalog_oid() {
-        return any_nullable || !f.proisstrict || matches!(op_name, "->" | "->>" | "#>" | "#>>");
+        // A strict C function of an extension (pgvector's distances) is
+        // taken to be NULL only on a NULL argument, but for the lookup
+        // operators that return NULL for a missing key. A function in SQL,
+        // PL/pgSQL, … can return NULL for any input — `STRICT` only says a
+        // NULL argument skips the call.
+        let compiled = matches!(
+            f.prolang,
+            crate::pg_catalog::C_LANGUAGE | crate::pg_catalog::INTERNAL_LANGUAGE
+        );
+        return any_nullable
+            || !f.proisstrict
+            || !compiled
+            || matches!(op_name, "->" | "->>" | "#>" | "#>>");
     }
     builtin_signature_nullable(
         &proc_signature(f, snapshot),
