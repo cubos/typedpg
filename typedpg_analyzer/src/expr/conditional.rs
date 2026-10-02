@@ -33,7 +33,8 @@ pub(crate) fn infer_bool_expr(
 /// followed by the `coerce_to_common_type` failure it implies, with PG's
 /// wording for both: `CASE types A and B cannot be matched` (the running
 /// candidate and the first input of another category, base types) and
-/// `CASE could not convert type A to B`. All-unknown inputs resolve to text.
+/// `CASE/WHEN could not convert type A to B` (`CASE/ELSE` for the ELSE
+/// result). All-unknown inputs resolve to text.
 ///
 /// `nodes` are the inputs' expressions, parallel to `types`: the error
 /// points at the one whose type failed, as PG does.
@@ -67,7 +68,14 @@ pub(crate) fn select_common_type(
         }
         coerce::CommonTypeError::CannotConvert { from, to } => {
             let span = failing_input_span(types, nodes, from, snapshot);
-            crate::pgmsg::could_not_convert_type(label, &name(from), &name(to), span)
+            // transformCaseExpr coerces the ELSE result (input 0) as
+            // `CASE/ELSE` and each THEN result as `CASE/WHEN`.
+            let context = match label {
+                "CASE" if failing_input(types, from, snapshot) == Some(0) => "CASE/ELSE",
+                "CASE" => "CASE/WHEN",
+                other => other,
+            };
+            crate::pgmsg::could_not_convert_type(context, &name(from), &name(to), span)
                 .finalize_implicit()
         }
     })
@@ -81,10 +89,15 @@ pub(crate) fn failing_input_span(
     failing: PgTypeOid,
     snapshot: &PgCatalog,
 ) -> Option<crate::error::SourceSpan> {
-    let i = types
-        .iter()
-        .position(|&t| t != oid::UNKNOWN && snapshot.unwrap_domain(t) == failing)?;
+    let i = failing_input(types, failing, snapshot)?;
     nodes.get(i).and_then(|n| crate::error::expr_span(n))
+}
+
+/// The position of the first input of (base) type `failing`.
+fn failing_input(types: &[PgTypeOid], failing: PgTypeOid, snapshot: &PgCatalog) -> Option<usize> {
+    types
+        .iter()
+        .position(|&t| t != oid::UNKNOWN && snapshot.unwrap_domain(t) == failing)
 }
 
 /// PG's `exprTypmod` for CASE / COALESCE / GREATEST / ARRAY[]: the typmod
