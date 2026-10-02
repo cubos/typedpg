@@ -463,6 +463,7 @@ fn having_a_row_makes_aggregates_not_null() {
         "count(*) >= 1",
         "0 < count(id)",
         "count(*) = 2",
+        "max(id) > 0",
     ] {
         assert_nullable(
             &db,
@@ -470,7 +471,7 @@ fn having_a_row_makes_aggregates_not_null() {
             &[("m", false)],
         );
     }
-    for having in ["count(*) >= 0", "count(*) < 5", "max(id) > 0"] {
+    for having in ["count(*) >= 0", "count(*) < 5", "max(id) IS NULL"] {
         assert_nullable(
             &db,
             &format!("SELECT max(id) AS m FROM customers HAVING {having}"),

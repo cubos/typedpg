@@ -361,6 +361,17 @@ fn json_agg_modifiers(
     Ok(())
 }
 
+/// A JSON aggregate is NULL only over no rows: `NULL ON NULL` appends a
+/// JSON null, `ABSENT ON NULL` skips the value but still builds `[]` /
+/// `{}` (`json[b]_agg[_strict]` / `json[b]_object_agg*` underneath).
+fn json_agg_nullable(ac: Option<&protobuf::JsonAggConstructor>, ctx: Ctx<'_>) -> bool {
+    !crate::expr::aggregate_reads_rows(
+        ac.is_some_and(|c| c.agg_filter.is_some()),
+        ac.and_then(|c| c.over.as_deref()),
+        ctx.null_ctx,
+    )
+}
+
 /// An aggregate's argument may not itself contain an aggregate.
 fn check_not_nested(n: &protobuf::Node, snapshot: &PgCatalog) -> Result<(), AnalyzeError> {
     let kinds = detect_func_kinds(n, snapshot);
@@ -405,7 +416,7 @@ pub(crate) fn infer_json_objectagg(
     constructor_result(
         ac.and_then(|c| c.output.as_ref()),
         &args,
-        true,
+        json_agg_nullable(ac, ctx),
         ctx.snapshot,
     )
 }
@@ -438,7 +449,7 @@ pub(crate) fn infer_json_arrayagg(
     constructor_result(
         ac.and_then(|c| c.output.as_ref()),
         &args,
-        true,
+        json_agg_nullable(ac, ctx),
         ctx.snapshot,
     )
 }

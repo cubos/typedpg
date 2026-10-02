@@ -951,6 +951,12 @@ fn builtin_signature_nullable(
         false
     } else if NULL_ONLY_ON_VARIADIC_NULL.contains(&sig) {
         variadic_keyword && any_nullable
+    } else if let Some((_, guards)) = NULL_ONLY_ON_NULL_ARGS_AT.iter().find(|(s, _)| *s == sig) {
+        guards
+            .iter()
+            .any(|&i| args_nullable.get(i).copied().unwrap_or(false))
+    } else if NULL_ONLY_WHEN_ALL_ARGS_NULL.contains(&sig) {
+        !args_nullable.is_empty() && args_nullable.iter().all(|&n| n)
     } else if sig == "concat_ws(text,any)" {
         // A NULL separator makes the result NULL; other NULLs are skipped.
         args_nullable.first() == Some(&true) || (variadic_keyword && any_nullable)

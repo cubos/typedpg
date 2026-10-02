@@ -803,7 +803,7 @@ fn create_type_named_like_an_array_type_moves_the_array_aside() {
         .unwrap();
     assert_eq!(
         q.columns[0].pg_type,
-        array_of(enum_ty("public", "mood", &["a"]))
+        array_with_elems(enum_ty("public", "mood", &["a"]), false)
     );
     assert_eq!(q.columns[1].pg_type, enum_ty("public", "_mood", &["b"]));
     assert!(db.resolve_type_by_name(None, "__mood").is_some());

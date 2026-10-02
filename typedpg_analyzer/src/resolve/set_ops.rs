@@ -140,7 +140,8 @@ pub(crate) fn analyze_set_operation(
         .map(|i| arm_unknown_literal(right, i))
         .collect();
 
-    let mut columns = Vec::with_capacity(left_cols.len());
+    let n_columns = left_cols.len();
+    let mut columns = Vec::with_capacity(n_columns);
     for (i, (mut l, mut r)) in left_cols.into_iter().zip(right_cols).enumerate() {
         if left_lits[i].is_some() {
             l.type_oid = oid::UNKNOWN;
@@ -250,6 +251,10 @@ pub(crate) fn analyze_set_operation(
             // (NULLs not distinct) to a right one — a NULL there needs
             // both sides to have one.
             nullable: match op_label {
+                // EXCEPT (DISTINCT) removes every left row equal — NULLs
+                // not distinct — to a right one: a single-column right arm
+                // that always yields a NULL removes every NULL.
+                "EXCEPT" if !sel.all && n_columns == 1 && always_yields_null(right) => false,
                 "EXCEPT" => l.nullable,
                 "INTERSECT" => l.nullable && r.nullable,
                 _ => l.nullable || r.nullable,
@@ -427,4 +432,41 @@ pub(crate) fn check_set_op_member_locking(arm: &protobuf::SelectStmt) -> Result<
         .finalize_implicit()),
         _ => Ok(()),
     }
+}
+
+/// Whether a set operation's single-column arm yields a NULL row whatever
+/// the data: `SELECT NULL` (cast or not) with no FROM, WHERE, grouping or
+/// LIMIT / OFFSET — exactly one row — or a VALUES list with a `(NULL)` row.
+fn always_yields_null(arm: &protobuf::SelectStmt) -> bool {
+    fn is_null_constant(n: &protobuf::Node) -> bool {
+        match n.node.as_ref() {
+            Some(node::Node::AConst(c)) => c.isnull,
+            Some(node::Node::TypeCast(c)) => c.arg.as_deref().is_some_and(is_null_constant),
+            _ => false,
+        }
+    }
+    if arm.op != SetOperation::SetopNone as i32
+        || arm.limit_count.is_some()
+        || arm.limit_offset.is_some()
+        || arm.where_clause.is_some()
+        || arm.having_clause.is_some()
+        || !arm.group_clause.is_empty()
+        || !arm.from_clause.is_empty()
+        || arm.with_clause.is_some()
+    {
+        return false;
+    }
+    if !arm.values_lists.is_empty() {
+        return arm.values_lists.iter().any(|row| match row.node.as_ref() {
+            Some(node::Node::List(l)) => matches!(l.items.as_slice(), [v] if is_null_constant(v)),
+            _ => false,
+        });
+    }
+    matches!(
+        arm.target_list.as_slice(),
+        [t] if matches!(
+            t.node.as_ref(),
+            Some(node::Node::ResTarget(rt)) if rt.val.as_deref().is_some_and(is_null_constant)
+        )
+    )
 }
