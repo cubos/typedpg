@@ -314,3 +314,18 @@ fn a_comparison_under_another_collation_or_type_proves_no_equality() {
         [false]
     );
 }
+
+#[test]
+fn a_strict_sql_operator_can_still_return_null() {
+    // `STRICT` only skips the call on a NULL argument: the body may return
+    // NULL for any other input.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE t (id int PRIMARY KEY, a int NOT NULL);
+         CREATE FUNCTION half(int, int) RETURNS int LANGUAGE sql STRICT IMMUTABLE
+             AS 'SELECT NULLIF($1, $2)';
+         CREATE OPERATOR %% (LEFTARG = int, RIGHTARG = int, FUNCTION = half);",
+    )
+    .unwrap();
+    assert_eq!(nullable(&db, "SELECT a %% a AS v FROM t"), [true]);
+}
