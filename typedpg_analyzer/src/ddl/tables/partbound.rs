@@ -35,6 +35,9 @@ struct PartKey {
     /// the key's notion of equality). `None` when the key's type is
     /// unknown to the analyzer.
     opclass: Option<crate::oid::PgOpclassOid>,
+    /// The attnums of the columns the key is strict in: the key column
+    /// itself, or those a key expression is NULL for when they are.
+    strict_attnums: Vec<i16>,
 }
 
 /// The collation a `COLLATE` clause names.
@@ -200,6 +203,7 @@ pub(super) fn record_partition_spec(
                 code_point_order: collation.is_some_and(|c| orders_by_code_point(interp, c))
                     || compares_bytes(interp, opclass),
                 opclass,
+                strict_attnums: attr.map(|a| a.attnum).into_iter().collect(),
             });
         } else if let Some(expr) = pe.expr.as_deref() {
             let typ = match crate::ddl::volatile::infer_over_relation(interp, relid, expr, None) {
@@ -207,6 +211,11 @@ pub(super) fn record_partition_spec(
                 _ => crate::pg_catalog::oid::UNKNOWN,
             };
             let opclass = opclass_of(typ, pe);
+            let strict_attnums =
+                crate::ddl::volatile::strict_columns_over_relation(interp, relid, expr)
+                    .iter()
+                    .filter_map(|c| interp.attribute_by_name(relid, c).map(|a| a.attnum))
+                    .collect();
             keys.push(PartKey {
                 type_oid: typ,
                 name: None,
@@ -216,6 +225,7 @@ pub(super) fn record_partition_spec(
                     .is_some_and(|c| orders_by_code_point(interp, c))
                     || compares_bytes(interp, opclass),
                 opclass,
+                strict_attnums,
             });
         }
     }
@@ -296,6 +306,7 @@ fn transform_bound(
                 collation: None,
                 code_point_order: false,
                 opclass: None,
+                strict_attnums: Vec::new(),
             });
             let mut values: Vec<Option<Datum>> = Vec::new();
             for v in &spec.listdatums {
@@ -851,6 +862,96 @@ pub(crate) fn partition_constraint_check(
         return None;
     };
     Some((*rt.val?, vars))
+}
+
+/// What the partition constraint of `part` (get_qual_from_partbound) says
+/// of its rows, by the attnums of `parent`'s columns.
+pub(crate) struct BoundFacts {
+    /// Columns never NULL: every key a range bound is over (`key IS NOT
+    /// NULL` for each, MINVALUE / MAXVALUE ones too), or a list bound's
+    /// key when the list has no NULL — a key expression's strict columns.
+    pub not_null: Vec<i16>,
+    /// A list bound over a plain column: the values a non-NULL key is one
+    /// of — when the key's equality is the column type's own (integers,
+    /// or text / varchar under the column's collation), so a value equal
+    /// to one of them by the key is so by the column's `=` too.
+    pub values: Option<(i16, Vec<crate::nonnull::Literal>)>,
+}
+
+/// [`BoundFacts`] of partition `part` of `parent`. `None` for a default
+/// or hash partition, which may hold any key (a NULL one included).
+pub(crate) fn bound_facts(
+    interp: &PgCatalog,
+    parent: PgClassOid,
+    part: PgClassOid,
+) -> Option<BoundFacts> {
+    use crate::nonnull::{LitKind, Literal};
+    use crate::pg_catalog::oid;
+    let spec = interp.partition_specs.get(&parent)?;
+    match interp.partition_bounds.get(&part)? {
+        Bound::Default | Bound::Hash { .. } => None,
+        Bound::Range { .. } => Some(BoundFacts {
+            not_null: spec
+                .keys
+                .iter()
+                .flat_map(|k| k.strict_attnums.iter().copied())
+                .collect(),
+            values: None,
+        }),
+        Bound::List(values) => {
+            let key = spec.keys.first()?;
+            let has_null = values.iter().any(Option::is_none);
+            let column = key
+                .name
+                .as_ref()
+                .and_then(|_| key.strict_attnums.first().copied());
+            let attr = column.and_then(|n| {
+                interp
+                    .attributes_of(parent)
+                    .iter()
+                    .find(|a| a.attnum == n)
+                    .cloned()
+            });
+            let eqop = partition_key_eqops(interp, parent)
+                .first()
+                .copied()
+                .flatten()
+                .map(|o| o.get());
+            let literals = attr.and_then(|a| {
+                let base = interp.unwrap_domain(key.type_oid);
+                let integer = [oid::INT2, oid::INT4, oid::INT8].contains(&base)
+                    && matches!(eqop, Some(94 | 96 | 410));
+                // texteq, under the column's own collation.
+                let text = [oid::TEXT, oid::VARCHAR].contains(&base)
+                    && eqop == Some(98)
+                    && key.collation == a.attcollation;
+                let lits: Option<Vec<Literal>> = values
+                    .iter()
+                    .flatten()
+                    .map(|d| match d {
+                        Datum::Int(i) if integer => Some(Literal {
+                            text: i.to_string(),
+                            kind: LitKind::Integer,
+                        }),
+                        Datum::Text(s) | Datum::CodePoints(s) if text => Some(Literal {
+                            text: s.clone(),
+                            kind: LitKind::String,
+                        }),
+                        _ => None,
+                    })
+                    .collect();
+                lits.map(|l| (a.attnum, l))
+            });
+            Some(BoundFacts {
+                not_null: if has_null {
+                    Vec::new()
+                } else {
+                    key.strict_attnums.clone()
+                },
+                values: literals,
+            })
+        }
+    }
 }
 
 /// The partitions of `parent` in PartitionDesc order (partition_bounds_create):

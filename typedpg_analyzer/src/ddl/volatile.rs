@@ -120,6 +120,47 @@ pub(crate) fn infer_over_relation(
     Some(infer_expr(expr, ctx, &mut params, TypeGoal::NONE))
 }
 
+/// The columns of `relid` an expression over its row is strict in: when
+/// the expression is non-NULL, so are they (what a partition key
+/// expression's `IS NOT NULL` proves). Empty when it doesn't analyze.
+pub(crate) fn strict_columns_over_relation(
+    interp: &PgCatalog,
+    relid: crate::oid::PgClassOid,
+    expr: &protobuf::Node,
+) -> Vec<String> {
+    use crate::expr::{TypeGoal, infer_expr};
+    let Some(class) = interp.pg_class.get(&relid) else {
+        return Vec::new();
+    };
+    let nspname = interp
+        .namespace_name(class.relnamespace)
+        .unwrap_or("public")
+        .to_owned();
+    let attrs = interp.attributes_of(relid).to_vec();
+    let mut scope = crate::scope::Scope::default();
+    scope.add_dml_target(
+        interp,
+        &class.relname,
+        crate::qualified_name::QualifiedName::new(nspname, class.relname.clone()),
+        &attrs,
+    );
+    let null_ctx = crate::nullability::NullabilityContext::default();
+    let mut params = crate::param_collector::ParamCollector::default();
+    let log = crate::nonnull::StrictLog::default();
+    let ctx = crate::expr::Ctx::new(&scope, &null_ctx, interp).logging_strictness(&log);
+    if infer_expr(expr, ctx, &mut params, TypeGoal::NONE).is_err() {
+        return Vec::new();
+    }
+    let mut cols: Vec<String> = crate::nonnull::nonnullable(expr, false, &scope, &log, interp)
+        .columns
+        .into_iter()
+        .filter(|(a, _)| *a == class.relname)
+        .map(|(_, c)| c)
+        .collect();
+    cols.sort();
+    cols
+}
+
 /// `CheckMutability` over the *typed* expression: analyze `expr` over the
 /// row of `relid`, recording every function it runs — called directly,
 /// through an operator or through an explicit cast — and fail on the first

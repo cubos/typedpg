@@ -297,7 +297,26 @@ let rows = sql!(pool,
 let rows = sql!(pool, "SELECT card_last4, coalesce(card_last4, iban) AS ref FROM payments WHERE kind = 'card'")
     .fetch_all().await?;
 // rows[0].card_last4 : String, rows[0].ref : String
+
+// ...written as an iff, with NOT, IS DISTINCT FROM or CASE, and refuted by
+// `<>`, IN lists, `= ANY (…)` and orderings (`lvl >= 10` against `lvl < 10`)
+// CHECK ((status = 'done') = (done_at IS NOT NULL))
+let rows = sql!(pool, "SELECT done_at FROM tasks WHERE status IN ('done')")
+    .fetch_all().await?;
+// rows[0].done_at : OffsetDateTime
+
+// A CASE without ELSE is NOT NULL when its WHENs cover every value: an
+// enum's labels, a CHECK (kind IN (…)) list, both booleans, IS NULL and
+// IS NOT NULL, `a > 0` and `a <= 0`
+let rows = sql!(pool, "SELECT CASE status WHEN 'open' THEN 1 WHEN 'closed' THEN 2 END AS n FROM tickets")
+    .fetch_all().await?;
+// rows[0].n : i32  (status is a NOT NULL enum ('open', 'closed'))
 ```
+
+A partition's bound counts as a constraint too (a range partition key, or a
+list one with no NULL, is never NULL — in the partitioned table as well, when
+no partition takes a NULL key), and so does a `MATCH FULL` foreign key: one of
+its columns non-NULL makes all of them so.
 
 A referenced table under row-level security doesn't count: its policies may
 hide the row.

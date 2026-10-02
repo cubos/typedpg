@@ -490,6 +490,24 @@ fn handle_any_all(
                 if let Some(rexpr) = &expr.rexpr {
                     coerce_unknown_to(rexpr, ctx, params, arr_oid)?;
                 }
+                // The per-element operator over the left type: strict or
+                // not, as for a typed array (left to PG to reject, should
+                // the lookup differ).
+                let op_name = extract_string_fields(&expr.name).join(".");
+                let elem = snapshot.unwrap_domain(left_oid);
+                if !op_name.is_empty()
+                    && !op_name.contains('.')
+                    && let Some(op) = snapshot.find_operator(&op_name, Some(left_oid), elem)
+                {
+                    ctx.note_strict(
+                        expr.location,
+                        crate::nonnull::StrictNode::Op,
+                        ctx.proc_is_strict(op.code)
+                            && ctx
+                                .coercion_is_strict(left_oid, op.left_type_oid.unwrap_or(left_oid))
+                            && ctx.coercion_is_strict(elem, op.right_type_oid),
+                    );
+                }
             }
             None => {
                 let l = crate::ddl::util::format_type_for_message(snapshot, left_oid);

@@ -315,6 +315,7 @@ pub(crate) fn infer_case(
         };
         let log = crate::nonnull::StrictLog::default();
         let mut taken = crate::nonnull::Facts::default();
+        let mut simple_not_taken = crate::nonnull::Facts::default();
         if let Some(cond) = &when.expr {
             let cond_ctx = ctx.logging_strictness(&log);
             match (test_oid, expr.arg.as_deref()) {
@@ -327,12 +328,23 @@ pub(crate) fn infer_case(
                         cond_ctx,
                         params,
                     )?;
-                    // `test = value` TRUE: both non-NULL, if `=` is strict.
+                    // `test = value` TRUE: both non-NULL, if `=` is strict
+                    // — and a column test equals a constant value. Not
+                    // TRUE, a non-NULL test column isn't that value.
                     if log.is_strict(when.location, crate::nonnull::StrictNode::Op) {
                         taken = crate::nonnull::nonnullable(test, false, ctx.scope, &log, snapshot)
                             .union(crate::nonnull::nonnullable(
                                 cond, false, ctx.scope, &log, snapshot,
                             ));
+                        if !crate::nonnull::disabled()
+                            && let Some((col, t)) = crate::nonnull::plain_column(test, ctx.scope)
+                            && let Some(v) = crate::nonnull::literal_for(cond, t, snapshot)
+                        {
+                            let p = crate::nonnull::ValPred::In(vec![v.clone()]);
+                            taken.equals.insert(col.clone(), v);
+                            taken.preds.push((col.clone(), p.clone()));
+                            simple_not_taken.preds.push((col, p.negated()));
+                        }
                     }
                 }
                 // `argument of CASE/WHEN must be type boolean, not type X` —
@@ -379,7 +391,28 @@ pub(crate) fn infer_case(
                 cond, ctx.scope, &log, snapshot,
             ));
         }
+        not_taken = not_taken.union(simple_not_taken);
     }
+    // No WHEN being TRUE may be impossible: then the ELSE (or the
+    // implicit NULL) is never the result.
+    let else_unreachable = {
+        let facts = not_taken.clone().restricted_to(&own);
+        let narrowed = ctx.null_ctx.with_local_facts(facts);
+        let null_ctx = narrowed.as_ref().unwrap_or(ctx.null_ctx);
+        let column = |c: &crate::nonnull::Col| {
+            let col = ctx
+                .scope
+                .find_source(&c.0)?
+                .columns
+                .iter()
+                .find(|sc| sc.name == c.1)?;
+            Some((
+                col.base_not_null,
+                crate::nonnull::checks::Space::of(col.type_oid, col.collation, snapshot),
+            ))
+        };
+        null_ctx.unreachable(&column)
+    };
     // The ELSE result (or PG's implicit `ELSE NULL`) leads the list.
     let default = match &expr.defresult {
         Some(d) => {
@@ -422,7 +455,11 @@ pub(crate) fn infer_case(
         }
     }
 
-    let nullable = inputs.iter().any(|t| t.nullable);
+    // The ELSE (input 0) counts only when it can be the result.
+    let nullable = inputs
+        .iter()
+        .enumerate()
+        .any(|(i, t)| t.nullable && !(i == 0 && else_unreachable));
     // Collations merge in tree order: THEN results, then ELSE.
     let collation = derive_collation(inputs[1..].iter().chain(&inputs[..1]), type_oid, snapshot)?;
     // (The implicit ELSE NULL is never a non-NULL array.)
