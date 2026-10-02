@@ -325,7 +325,8 @@ pub(crate) fn gen_statement(rng: &mut StdRng) -> String {
     let np = &mut 0u32;
     match rng.random_range(0..100) {
         0..=36 => gen_select(rng, np),
-        37..=46 => gen_narrowing_select(rng),
+        37..=42 => gen_narrowing_select(rng),
+        43..=46 => gen_constraint_select(rng),
         47..=57 => gen_set_op(rng, np),
         58..=66 => gen_cte(rng, np),
         67..=72 => gen_values_select(rng, np),
