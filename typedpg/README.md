@@ -222,6 +222,45 @@ let total = sql!(pool, "SELECT sum(age) FROM users")
 // total: Option<i64>
 ```
 
+### Narrowing by conditions
+
+A condition that must hold for a value to be read narrows it, the way
+PostgreSQL's planner reasons about strict operators (`find_nonnullable_vars`,
+`reduce_outer_joins`): `WHERE`, `HAVING`, an inner join's `ON`, an
+aggregate's `FILTER` and a `CASE` branch's `WHEN`.
+
+```rust
+// A strict WHERE condition proves its column non-NULL
+let rows = sql!(pool, "SELECT age FROM users WHERE age > $min", min = 18)
+    .fetch_all().await?;
+// rows[0].age : i32
+
+// ...and turns a LEFT JOIN that filters on its nullable side into an inner one
+let rows = sql!(pool,
+    "SELECT u.name, p.title FROM users u LEFT JOIN posts p ON p.user_id = u.id
+     WHERE p.published_at IS NOT NULL")
+    .fetch_all().await?;
+// rows[0].title : String
+
+// A CASE branch knows what its WHEN ruled out
+let rows = sql!(pool, "SELECT CASE WHEN age IS NULL THEN 0 ELSE age END AS age FROM users")
+    .fetch_all().await?;
+// rows[0].age : i32
+
+// An aggregate reads only the rows its FILTER passes
+let rows = sql!(pool,
+    "SELECT u.id, array_agg(p.title) FILTER (WHERE p.id IS NOT NULL) AS titles
+     FROM users u LEFT JOIN posts p ON p.user_id = u.id GROUP BY u.id")
+    .fetch_all().await?;
+// rows[0].titles : Option<Vec<String>>  (no NULL element; NULL with no post)
+```
+
+Only strict conditions count: `coalesce(age, 0) > 0`, `age IS DISTINCT FROM 5`
+or an `OR` whose arms test different columns prove nothing. `UPDATE` and
+`DELETE ... RETURNING` keep what their `WHERE` proved for the rows they return,
+except in columns the `UPDATE` sets or that a trigger, a rule or a generated
+column may rewrite.
+
 ### Nullability annotations
 
 Override the inferred nullability when you know better than the analyzer. Use `!` to force non-nullable and `?` to force nullable.
