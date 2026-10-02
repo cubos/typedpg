@@ -242,6 +242,20 @@ fn nullif_int_with_numeric_string_literal_coerced() {
 // ── CASE ─────────────────────────────────────────────────────────────────────
 
 #[test]
+fn case_result_conversion_errors_name_the_branch_as_pg_does() {
+    let db = setup();
+    // Same type category, no implicit cast: the ELSE type wins and the
+    // THEN result fails to convert to it (transformCaseExpr's `CASE/WHEN`).
+    assert_err_prefix!(
+        db.analyze(
+            "SELECT CASE WHEN age IS NULL THEN '\\x00'::bytea ELSE gen_random_uuid() END FROM users"
+        ),
+        AnalyzeError::Invalid(_),
+        "CASE/WHEN could not convert type bytea to uuid"
+    );
+}
+
+#[test]
 fn types_match_case_with_else() {
     let db = setup();
     let s = db
