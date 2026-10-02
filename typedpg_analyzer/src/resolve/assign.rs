@@ -285,7 +285,13 @@ fn expand_set_items<'a>(
                         unreachable!("guarded above");
                     };
                     let (cols, _) = crate::grouping::with_clause(Some("UPDATE"), || {
-                        analyze_correlated_select(sel, ctx.snapshot, params, ctx.scope)
+                        analyze_correlated_select(
+                            sel,
+                            ctx.snapshot,
+                            params,
+                            ctx.scope,
+                            ctx.null_ctx,
+                        )
                     })?;
                     if cols.len() != ncolumns {
                         return Err(count_mismatch());

@@ -524,6 +524,14 @@ fn handle_any_all(
             match snapshot.find_operator(&op_name, Some(left_oid), elem_oid) {
                 // The per-element operator call can itself yield NULL.
                 Some(op) => {
+                    ctx.note_strict(
+                        expr.location,
+                        crate::nonnull::StrictNode::Op,
+                        ctx.proc_is_strict(op.code)
+                            && ctx
+                                .coercion_is_strict(left_oid, op.left_type_oid.unwrap_or(left_oid))
+                            && ctx.coercion_is_strict(elem_oid, op.right_type_oid),
+                    );
                     op_nullable = functions::operator_result_nullable(
                         snapshot,
                         &op_name,
@@ -713,7 +721,8 @@ fn handle_row_subselect(
     for la in largs.iter() {
         let _ = infer_expr(la, ctx, params, TypeGoal::NONE);
     }
-    let (cols, _) = crate::resolve::analyze_correlated_select(sel, snapshot, params, scope)?;
+    let (cols, _) =
+        crate::resolve::analyze_correlated_select(sel, snapshot, params, scope, ctx.null_ctx)?;
     if cols.len() != largs.len() {
         let pg_msg = if cols.len() < largs.len() {
             "subquery has too few columns"
@@ -787,6 +796,15 @@ fn infer_generic_binary_op(
     match snapshot.find_operator_detailed(op_name, left_oid_resolved, right_oid_resolved) {
         crate::lookup::OperatorMatch::Found(op) => {
             ctx.note_proc(op.code);
+            ctx.note_strict(
+                expr.location,
+                crate::nonnull::StrictNode::Op,
+                ctx.proc_is_strict(op.code)
+                    && left_oid_resolved
+                        .zip(op.left_type_oid)
+                        .is_none_or(|(a, d)| ctx.coercion_is_strict(a, d))
+                    && ctx.coercion_is_strict(right_oid_resolved, op.right_type_oid),
+            );
             if let (Some(actual), Some(declared)) = (left_oid_resolved, op.left_type_oid) {
                 ctx.note_coercion(actual, declared);
             }

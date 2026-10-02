@@ -197,45 +197,82 @@ pub(crate) fn infer_case(
         None => None,
     };
 
-    // Pass 1: WHEN conditions, then each THEN result with no goal.
+    // Pass 1: WHEN conditions, then each THEN result with no goal — read
+    // knowing what its WHEN being TRUE, and every earlier WHEN not being
+    // TRUE, proves non-NULL. Facts are kept to this level's FROM entries.
+    let own = crate::nonnull::own_aliases(ctx.scope);
+    let mut not_taken = crate::nonnull::Facts::default();
     let mut results: Vec<(&protobuf::Node, ExprType)> = Vec::new();
     for arg in &expr.args {
         let Some(node::Node::CaseWhen(when)) = arg.node.as_ref() else {
             continue;
         };
+        let log = crate::nonnull::StrictLog::default();
+        let mut taken = crate::nonnull::Facts::default();
         if let Some(cond) = &when.expr {
-            match test_oid {
-                Some(test_oid) => {
+            let cond_ctx = ctx.logging_strictness(&log);
+            match (test_oid, expr.arg.as_deref()) {
+                (Some(test_oid), Some(test)) => {
                     infer_synthetic_op(
                         "=",
                         &typed_null(test_oid),
                         cond,
                         when.location,
-                        ctx,
+                        cond_ctx,
                         params,
                     )?;
+                    // `test = value` TRUE: both non-NULL, if `=` is strict.
+                    if log.is_strict(when.location, crate::nonnull::StrictNode::Op) {
+                        taken = crate::nonnull::nonnullable(test, false, ctx.scope, &log)
+                            .union(crate::nonnull::nonnullable(cond, false, ctx.scope, &log));
+                    }
                 }
                 // `argument of CASE/WHEN must be type boolean, not type X` —
                 // wording and ordering live in the shared clause walker.
-                None => {
+                _ => {
                     crate::clause::coerce_clause_expr(
                         cond,
-                        ctx,
+                        cond_ctx,
                         params,
                         crate::clause::ClauseKind::CaseWhen,
                     )?;
+                    taken = crate::nonnull::nonnullable(cond, true, ctx.scope, &log);
                 }
             }
         }
         // Untyped string literals stay UNKNOWN for branch reconciliation and
         // are validated under the resolved common type in pass 2.
         if let Some(result) = &when.result {
-            results.push((result, infer_expr(result, ctx, params, TypeGoal::NONE)?));
+            let facts = not_taken.clone().union(taken).restricted_to(&own);
+            let narrowed = ctx.null_ctx.with_local_facts(facts);
+            let result_ctx = match &narrowed {
+                Some(n) => ctx.with_null_ctx(n),
+                None => ctx,
+            };
+            results.push((
+                result,
+                infer_expr(result, result_ctx, params, TypeGoal::NONE)?,
+            ));
+        }
+        if let (None, Some(cond)) = (&expr.arg, &when.expr) {
+            not_taken = not_taken.union(crate::nonnull::nonnullable_unless_true(
+                cond, ctx.scope, &log,
+            ));
         }
     }
     // The ELSE result (or PG's implicit `ELSE NULL`) leads the list.
     let default = match &expr.defresult {
-        Some(d) => Some((d.as_ref(), infer_expr(d, ctx, params, TypeGoal::NONE)?)),
+        Some(d) => {
+            let narrowed = ctx.null_ctx.with_local_facts(not_taken.restricted_to(&own));
+            let default_ctx = match &narrowed {
+                Some(n) => ctx.with_null_ctx(n),
+                None => ctx,
+            };
+            Some((
+                d.as_ref(),
+                infer_expr(d, default_ctx, params, TypeGoal::NONE)?,
+            ))
+        }
         None => None,
     };
     let mut inputs: Vec<ExprType> = Vec::with_capacity(results.len() + 1);

@@ -46,6 +46,8 @@ mod literal_input;
 mod merge;
 #[path = "query/named_args.rs"]
 mod named_args;
+#[path = "query/null_narrowing.rs"]
+mod null_narrowing;
 #[path = "query/params.rs"]
 mod params;
 #[path = "query/records.rs"]

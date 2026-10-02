@@ -93,7 +93,7 @@ pub(crate) fn analyze_insert_with_outer_ctes(
         snapshot,
         insert_target_alias(relation),
         target_qn.clone(),
-        &tgt.attrs,
+        &written_row_attrs(snapshot, tgt.oid, &tgt.attrs),
     );
     // ON CONFLICT DO UPDATE's EXCLUDED is in the range table but not the
     // namespace RETURNING sees: referencing it is PG's `invalid reference
@@ -117,6 +117,7 @@ pub(crate) fn analyze_insert_with_outer_ctes(
         ReturningRows {
             old_may_be_null: true,
             new_may_be_null: false,
+            ..ReturningRows::default()
         },
         expr::Ctx::new(&ret_scope, &ret_null_ctx, snapshot),
         params,
@@ -1111,21 +1112,50 @@ pub(crate) fn analyze_update_with_outer_ctes(
     )?;
 
     // WHERE — BOOL goal with assignment coercion.
+    let mut rows = ReturningRows::default();
     if let Some(where_clause) = &upd.where_clause {
+        let log = crate::nonnull::StrictLog::default();
         crate::clause::coerce_clause_expr(
             where_clause,
-            expr::Ctx::new(&scope, &null_ctx, snapshot),
+            expr::Ctx::new(&scope, &null_ctx, snapshot).logging_strictness(&log),
             params,
             crate::clause::ClauseKind::Where,
         )?;
         check_no_srf_in_clause(where_clause, snapshot, "WHERE")?;
+        // The FROM entries keep what WHERE saw. The target's new row keeps
+        // it only in the columns nothing rewrites: not SET, not generated
+        // (recomputed), with no BEFORE ROW trigger, rule or row movement
+        // between WHERE and RETURNING. The old row keeps all of it.
+        let assigned: std::collections::HashSet<String> = set_list_assigns(&upd.target_list)
+            .into_iter()
+            .map(|a| a.column)
+            .collect();
+        let keeps = update_keeps_values(snapshot, table_oid);
+        let old_as_is = rows_returned_as_is(snapshot, table_oid);
+        let facts = where_facts(
+            where_clause,
+            &scope,
+            &log,
+            alias,
+            &mut rows,
+            old_as_is,
+            |col| {
+                keeps
+                    && !assigned.contains(col)
+                    && table_attrs
+                        .iter()
+                        .any(|a| a.attname == col && a.attgenerated.is_none())
+            },
+        );
+        null_ctx.add_where_facts(facts);
     }
 
+    let ret_scope = with_written_target(&scope, alias, snapshot, table_oid, &table_attrs);
     let columns = resolve_returning(
         &upd.returning_clause,
         alias,
-        ReturningRows::default(),
-        expr::Ctx::new(&scope, &null_ctx, snapshot),
+        rows,
+        expr::Ctx::new(&ret_scope, &null_ctx, snapshot),
         params,
     )?;
     let mut rw = Rewrite::single(DmlEvent::Update, set_list_assigns(&upd.target_list), false);
@@ -1225,25 +1255,35 @@ pub(crate) fn analyze_delete_with_outer_ctes(
         params,
     )?;
 
+    // A deleted row has no new version.
+    let mut rows = ReturningRows {
+        old_may_be_null: false,
+        new_may_be_null: true,
+        ..ReturningRows::default()
+    };
     // WHERE — BOOL goal with assignment coercion.
     if let Some(where_clause) = &del.where_clause {
+        let log = crate::nonnull::StrictLog::default();
         crate::clause::coerce_clause_expr(
             where_clause,
-            expr::Ctx::new(&scope, &null_ctx, snapshot),
+            expr::Ctx::new(&scope, &null_ctx, snapshot).logging_strictness(&log),
             params,
             crate::clause::ClauseKind::Where,
         )?;
         check_no_srf_in_clause(where_clause, snapshot, "WHERE")?;
+        // RETURNING reads the deleted row as WHERE saw it, unless a rule
+        // rewrites the statement or the target is a view.
+        let keeps = rows_returned_as_is(snapshot, table_oid);
+        let facts = where_facts(where_clause, &scope, &log, alias, &mut rows, keeps, |_| {
+            keeps
+        });
+        null_ctx.add_where_facts(facts);
     }
 
-    // A deleted row has no new version.
     let columns = resolve_returning(
         &del.returning_clause,
         alias,
-        ReturningRows {
-            old_may_be_null: false,
-            new_may_be_null: true,
-        },
+        rows,
         expr::Ctx::new(&scope, &null_ctx, snapshot),
         params,
     )?;
@@ -1251,6 +1291,153 @@ pub(crate) fn analyze_delete_with_outer_ctes(
     rw.returning = has_returning(&del.returning_clause);
     check_rewrite(snapshot, table_oid, &rw)?;
     Ok((columns, None))
+}
+
+/// The target's attributes as RETURNING reads them in the rows an INSERT,
+/// UPDATE or MERGE writes. A table's are its own. A row written through a
+/// view is not a row of the view: it need not pass the view's WHERE (no
+/// CHECK OPTION is assumed), and an INSTEAD OF trigger or a DO INSTEAD
+/// rule returns what it likes — so a view column is NOT NULL there only
+/// when the view's expressions are over any base row, and never with a
+/// trigger or rule.
+pub(crate) fn written_row_attrs(
+    snapshot: &PgCatalog,
+    relid: crate::oid::PgClassOid,
+    attrs: &[crate::pg_catalog::PgAttribute],
+) -> Vec<crate::pg_catalog::PgAttribute> {
+    let is_view = snapshot
+        .pg_class
+        .get(&relid)
+        .is_some_and(|c| c.relkind == crate::pg_catalog::RelKind::View);
+    if !is_view {
+        return attrs.to_vec();
+    }
+    let rewritten = snapshot.rules.get(&relid).is_some_and(|r| !r.is_empty())
+        || snapshot
+            .triggers
+            .get(&relid)
+            .is_some_and(|ts| ts.iter().any(|t| t.instead_row_events != 0));
+    let not_null: Option<Vec<bool>> = if rewritten {
+        None
+    } else {
+        use prost::Message;
+        snapshot
+            .view_body(relid)
+            .and_then(|body| protobuf::Node::decode(body.ast.as_slice()).ok())
+            .and_then(|node| {
+                let inner = node.node.as_ref()?;
+                crate::nonnull::without_narrowing(|| {
+                    crate::resolve::analyze_raw_node(snapshot, inner, &[]).ok()
+                })
+            })
+            .map(|(cols, _)| cols.iter().map(|c| !c.nullable).collect())
+    };
+    attrs
+        .iter()
+        .enumerate()
+        .map(|(i, a)| crate::pg_catalog::PgAttribute {
+            attnotnull: a.attnotnull
+                && not_null
+                    .as_ref()
+                    .is_some_and(|nn| nn.get(i).copied().unwrap_or(false)),
+            ..a.clone()
+        })
+        .collect()
+}
+
+/// `scope` with the target entry `alias`'s columns as RETURNING reads
+/// them in the rows written through relation `relid`
+/// ([`written_row_attrs`]).
+pub(crate) fn with_written_target(
+    scope: &Scope,
+    alias: &str,
+    snapshot: &PgCatalog,
+    relid: crate::oid::PgClassOid,
+    attrs: &[crate::pg_catalog::PgAttribute],
+) -> Scope {
+    let written = written_row_attrs(snapshot, relid, attrs);
+    let mut scope = scope.clone();
+    if let Some(target) = scope.sources.iter_mut().find(|s| s.alias == alias) {
+        for c in &mut target.columns {
+            if let Some(a) = written.iter().find(|a| a.attname == c.name)
+                && !(snapshot.attr_proven_not_null(a) || snapshot.type_is_not_null(a.atttypid))
+            {
+                c.base_not_null = false;
+            }
+        }
+    }
+    scope
+}
+
+/// What an UPDATE's / DELETE's WHERE proves non-NULL for RETURNING: the
+/// facts about the FROM / USING entries, and those about the target's
+/// columns `target_keeps` says the returned row still holds (and so NEW,
+/// `rows.new_proven`). Every target fact holds for OLD (`rows.old_proven`)
+/// when it is read as is (`old_as_is`).
+fn where_facts(
+    where_clause: &protobuf::Node,
+    scope: &Scope,
+    log: &crate::nonnull::StrictLog,
+    target_alias: &str,
+    rows: &mut ReturningRows,
+    old_as_is: bool,
+    target_keeps: impl Fn(&str) -> bool,
+) -> crate::nonnull::Facts {
+    let mut facts = crate::nonnull::nonnullable(where_clause, true, scope, log)
+        .restricted_to(&crate::nonnull::own_aliases(scope));
+    if old_as_is {
+        rows.old_proven = facts
+            .columns
+            .iter()
+            .filter(|(a, _)| a == target_alias)
+            .map(|(_, c)| c.clone())
+            .collect();
+    }
+    facts
+        .columns
+        .retain(|(a, c)| a != target_alias || target_keeps(c));
+    rows.new_proven = facts
+        .columns
+        .iter()
+        .filter(|(a, _)| a == target_alias)
+        .map(|(_, c)| c.clone())
+        .collect();
+    facts
+}
+
+/// Whether nothing between an UPDATE's WHERE and its RETURNING rewrites
+/// the values of the columns it doesn't SET: the target is a plain table
+/// (no view, no partitions or inheritance children to move rows into),
+/// with no BEFORE ROW UPDATE trigger (which may change NEW) and no rule.
+fn update_keeps_values(snapshot: &PgCatalog, relid: crate::oid::PgClassOid) -> bool {
+    let before_row_update = |t: &crate::ddl::triggers::Trigger| {
+        t.row
+            && t.timing & crate::ddl::triggers::TRIGGER_TYPE_BEFORE != 0
+            && t.events & crate::ddl::triggers::TRIGGER_TYPE_UPDATE != 0
+    };
+    snapshot
+        .pg_class
+        .get(&relid)
+        .is_some_and(|c| c.relkind == crate::pg_catalog::RelKind::Table)
+        && !snapshot.pg_inherits.iter().any(|i| i.inhparent == relid)
+        && !snapshot.rules.get(&relid).is_some_and(|r| !r.is_empty())
+        && !snapshot
+            .triggers
+            .get(&relid)
+            .is_some_and(|ts| ts.iter().any(before_row_update))
+}
+
+/// Whether RETURNING reads the old rows (OLD, a DELETE's deleted ones) as
+/// the WHERE saw them: the target is a table (partitioned or not; a
+/// trigger can't change OLD, a BEFORE DELETE one can only skip a row) and
+/// no rule rewrites the statement.
+fn rows_returned_as_is(snapshot: &PgCatalog, relid: crate::oid::PgClassOid) -> bool {
+    snapshot.pg_class.get(&relid).is_some_and(|c| {
+        matches!(
+            c.relkind,
+            crate::pg_catalog::RelKind::Table | crate::pg_catalog::RelKind::Partitioned
+        )
+    }) && !snapshot.rules.get(&relid).is_some_and(|r| !r.is_empty())
 }
 
 /// UPDATE's FROM / DELETE's USING list, processed while the target entry

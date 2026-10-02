@@ -25,7 +25,13 @@ pub(crate) fn infer_sublink(
             if let Some(subselect) = &sub.subselect
                 && let Some(node::Node::SelectStmt(sel)) = subselect.node.as_ref()
             {
-                let _ = crate::resolve::analyze_correlated_select(sel, snapshot, params, scope)?;
+                let _ = crate::resolve::analyze_correlated_select(
+                    sel,
+                    snapshot,
+                    params,
+                    scope,
+                    ctx.null_ctx,
+                )?;
             }
             Ok(ExprType::scalar(oid::BOOL, false))
         }
@@ -54,8 +60,13 @@ pub(crate) fn infer_sublink(
             if let Some(subselect) = &sub.subselect
                 && let Some(node::Node::SelectStmt(sel)) = subselect.node.as_ref()
             {
-                let (cols, _) =
-                    crate::resolve::analyze_correlated_select(sel, snapshot, params, scope)?;
+                let (cols, _) = crate::resolve::analyze_correlated_select(
+                    sel,
+                    snapshot,
+                    params,
+                    scope,
+                    ctx.null_ctx,
+                )?;
 
                 // Arity check: `lhs IN (SELECT …)` / `lhs = ANY(SELECT …)`
                 // requires the LHS and the subquery to match column counts.
@@ -248,8 +259,13 @@ fn single_sublink_column(
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<crate::resolve::RawColumn, AnalyzeError> {
-    let (cols, _) =
-        crate::resolve::analyze_correlated_select(sel, ctx.snapshot, params, ctx.scope)?;
+    let (cols, _) = crate::resolve::analyze_correlated_select(
+        sel,
+        ctx.snapshot,
+        params,
+        ctx.scope,
+        ctx.null_ctx,
+    )?;
     let span = crate::error::SourceSpan::from_location(sub.location);
     let mut cols = cols.into_iter();
     let Some(mut first) = cols.next() else {

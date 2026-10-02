@@ -41,7 +41,8 @@ fn subquery_in_from() {
              FROM (SELECT name, age FROM users WHERE age IS NOT NULL) sub",
         )
         .unwrap();
-    assert_cols(&s, vec![c("name", text()), cn("age", int4())]);
+    // The subquery's WHERE makes its `age` NOT NULL.
+    assert_cols(&s, vec![c("name", text()), c("age", int4())]);
 }
 
 #[test]

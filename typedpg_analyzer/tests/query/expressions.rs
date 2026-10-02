@@ -270,10 +270,9 @@ fn types_match_case_expression() {
     let s = db
         .analyze("SELECT CASE WHEN age IS NULL THEN 0 ELSE age END AS safe_age FROM users")
         .unwrap();
-    // PG control-flow narrowing would make this NOT NULL (ELSE branch only
-    // reached when age IS NOT NULL), but the analyzer does not currently
-    // infer that — it takes the least-common nullability across branches.
-    assert_cols(&s, vec![cn("safe_age", int4())]);
+    // The ELSE branch is only reached when `age IS NULL` is not TRUE, so
+    // `age` is NOT NULL there.
+    assert_cols(&s, vec![c("safe_age", int4())]);
 }
 
 #[test]

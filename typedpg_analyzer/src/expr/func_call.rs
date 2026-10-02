@@ -89,6 +89,23 @@ pub(crate) fn infer_func_call(
 
     check_call_shape(func, Some(&resolved), &args, &notation, ctx)?;
     ctx.note_proc(Some(resolved.oid));
+    // A plain call of a strict function is NULL for a NULL argument — not
+    // an aggregate or window call, nor a variadic one, whose arguments are
+    // packed into an array the function sees whole.
+    ctx.note_strict(
+        func.location,
+        crate::nonnull::StrictNode::Func,
+        resolved.is_strict
+            && !resolved.is_aggregate
+            && !resolved.is_window
+            && func.over.is_none()
+            && resolved.nvargs == 0
+            && args
+                .types
+                .iter()
+                .zip(&resolved.arg_types)
+                .all(|(&a, &d)| ctx.coercion_is_strict(a, d)),
+    );
     for (&actual, &declared) in args.types.iter().zip(&resolved.arg_types) {
         ctx.note_coercion(actual, declared);
     }
@@ -141,7 +158,12 @@ pub(crate) fn infer_func_call(
 
     // Walk aggregate / window modifiers so embedded params and column refs
     // are inferred and validated.
-    walk_func_modifiers(func, ctx, params)?;
+    let filter_log = crate::nonnull::StrictLog::default();
+    walk_func_modifiers(func, ctx, params, &filter_log)?;
+    let mut args = args;
+    if resolved.is_aggregate {
+        narrow_by_filter(func, &mut args, ctx, params, &filter_log);
+    }
 
     let nullable = resolve_func_nullability(func, name, &resolved, ctx, params, &args);
 
@@ -533,6 +555,54 @@ fn collect_arg_types(
     })
 }
 
+/// An aggregate reads its arguments only over the rows its FILTER passes:
+/// what the FILTER proves non-NULL is so in them (`array_agg(x) FILTER
+/// (WHERE x IS NOT NULL)` has no NULL element). The arguments were typed
+/// before the FILTER, as PG does; their nullability is read again under
+/// its facts, on a scratch copy of the parameters (the types are settled).
+fn narrow_by_filter(
+    func: &protobuf::FuncCall,
+    args: &mut FuncArgs,
+    ctx: Ctx<'_>,
+    params: &ParamCollector,
+    log: &crate::nonnull::StrictLog,
+) {
+    let Some(filter) = func.agg_filter.as_deref() else {
+        return;
+    };
+    let facts = crate::nonnull::nonnullable(filter, true, ctx.scope, log)
+        .restricted_to(&crate::nonnull::own_aliases(ctx.scope));
+    let Some(narrowed) = ctx.null_ctx.with_local_facts(facts) else {
+        return;
+    };
+    let narrowed_ctx = ctx.with_null_ctx(&narrowed);
+    let mut scratch = params.clone();
+    let sort_exprs = func.agg_order.iter().filter_map(|o| match o.node.as_ref() {
+        Some(node::Node::SortBy(sb)) => sb.node.as_deref(),
+        _ => Some(o),
+    });
+    let inputs: Vec<&protobuf::Node> = if func.agg_within_group {
+        func.args.iter().chain(sort_exprs).collect()
+    } else {
+        func.args.iter().collect()
+    };
+    for (i, arg) in inputs.into_iter().enumerate() {
+        let Ok(t) = infer_expr(arg, narrowed_ctx, &mut scratch, TypeGoal::NONE) else {
+            continue;
+        };
+        if let Some(n) = args.nullable.get_mut(i) {
+            *n &= t.nullable;
+        }
+        if let Some(e) = args.exprs.get_mut(i) {
+            e.nullable &= t.nullable;
+            if let (Some(old), Some(new)) = (e.elem_nullable, t.elem_nullable) {
+                e.elem_nullable = Some(old && new);
+            }
+        }
+    }
+    args.any_nullable = args.nullable.iter().any(|&n| n);
+}
+
 /// A window function's arguments may hold aggregates — `sum(sum(x)) OVER
 /// (…)` aggregates the grouped rows first — but not another window
 /// function (PG's `transformWindowFuncCall`, SQLSTATE 42P20).
@@ -638,11 +708,17 @@ fn walk_func_modifiers(
     func: &protobuf::FuncCall,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
+    filter_log: &crate::nonnull::StrictLog,
 ) -> Result<(), AnalyzeError> {
     if let Some(filter) = &func.agg_filter {
         // FILTER is a boolean clause like WHERE — wording and ordering live
         // in the shared clause walker.
-        crate::clause::coerce_clause_expr(filter, ctx, params, crate::clause::ClauseKind::Filter)?;
+        crate::clause::coerce_clause_expr(
+            filter,
+            ctx.logging_strictness(filter_log),
+            params,
+            crate::clause::ClauseKind::Filter,
+        )?;
     }
     // Per-aggregate `ORDER BY` (e.g. `array_agg(x ORDER BY y)`). For
     // ordered-set aggregates (`WITHIN GROUP`) the sort expressions were

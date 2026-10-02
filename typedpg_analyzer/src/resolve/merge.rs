@@ -217,6 +217,9 @@ pub(crate) fn analyze_merge_with_outer_ctes(
     if source_may_be_null {
         ret_null_ctx.mark_all_nullable(&nullability::collect_aliases(&source_scope.sources));
     }
+    // Rows inserted or updated through a view are not the view's rows.
+    let both =
+        super::dml::with_written_target(&both, &target_alias, snapshot, table_oid, &table_attrs);
     MERGE_RETURNING_DEPTH.with(|d| d.set(d.get() + 1));
     let columns = resolve_returning(
         &merge.returning_clause,
