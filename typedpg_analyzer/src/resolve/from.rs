@@ -104,7 +104,7 @@ pub(crate) fn process_from_item(
                             .attributes_of(d)
                             .iter()
                             .find(|a| a.attname == c.name)
-                            .is_some_and(|a| snapshot.attr_proven_not_null(a))
+                            .is_some_and(|a| snapshot.attr_never_null(a))
                     });
                 }
                 // Every row of a table satisfies its CHECK constraints
@@ -119,6 +119,21 @@ pub(crate) fn process_from_item(
                     && let Some(checks) =
                         crate::nonnull::checks::RelationChecks::of(snapshot, class.oid)
                 {
+                    let base: HashMap<String, bool> = src
+                        .columns
+                        .iter()
+                        .map(|c| (c.name.clone(), c.base_not_null))
+                        .collect();
+                    let alias = src.alias.clone();
+                    null_ctx.register_checks(&alias, checks, base);
+                } else if !renamed
+                    && let Some(rows) = super::WriteTarget::view_rows(snapshot, class.oid)
+                    && let Some(checks) =
+                        crate::nonnull::checks::RelationChecks::of(snapshot, rows.base)
+                {
+                    // A view's rows are its base table's, whose CHECK
+                    // constraints hold over the plain columns it exposes.
+                    let checks = checks.renamed(|b| rows.target_column(b).map(str::to_owned));
                     let base: HashMap<String, bool> = src
                         .columns
                         .iter()
@@ -733,7 +748,7 @@ fn process_join_expr(
 }
 
 /// Every table inheriting from `relid`, directly or not (partitions too).
-fn inheritance_descendants(
+pub(crate) fn inheritance_descendants(
     snapshot: &PgCatalog,
     relid: crate::oid::PgClassOid,
 ) -> Vec<crate::oid::PgClassOid> {

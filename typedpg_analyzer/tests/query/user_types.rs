@@ -482,9 +482,10 @@ fn setup_generated() -> PgCatalog {
 #[test]
 fn generated_column_select_uses_declared_type() {
     let db = setup_generated();
-    // The declared type wins over the expression type.
+    // The declared type wins over the expression type; the expression
+    // over NOT NULL columns can't be NULL.
     let s = db.analyze("SELECT gross FROM invoices").unwrap();
-    assert_cols(&s, vec![cn("gross", numeric_ps(12, 2))]);
+    assert_cols(&s, vec![c("gross", numeric_ps(12, 2))]);
 }
 
 #[test]
@@ -535,7 +536,7 @@ fn update_generated_column_to_default_accepted() {
     let s = db
         .analyze("UPDATE invoices SET gross = DEFAULT WHERE id = $p1 RETURNING gross")
         .unwrap();
-    assert_cols(&s, vec![cn("gross", numeric_ps(12, 2))]);
+    assert_cols(&s, vec![c("gross", numeric_ps(12, 2))]);
 }
 
 #[test]
@@ -549,7 +550,7 @@ fn insert_into_generated_column_with_default_keyword_accepted() {
              VALUES ($p1, $p2, $p3, DEFAULT) RETURNING gross",
         )
         .unwrap();
-    assert_cols(&s, vec![cn("gross", numeric_ps(12, 2))]);
+    assert_cols(&s, vec![c("gross", numeric_ps(12, 2))]);
 }
 
 #[test]
@@ -563,7 +564,7 @@ fn insert_skipping_generated_column_accepted() {
              VALUES ($p1, $p2, $p3) RETURNING gross",
         )
         .unwrap();
-    assert_cols(&s, vec![cn("gross", numeric_ps(12, 2))]);
+    assert_cols(&s, vec![c("gross", numeric_ps(12, 2))]);
 }
 
 // ── Domain with NOT NULL — `pg_type.typnotnull` propagates to columns ──────

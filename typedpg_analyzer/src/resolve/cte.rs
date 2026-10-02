@@ -597,6 +597,71 @@ pub(crate) fn check_cte_reference(
     Ok(())
 }
 
+/// The CTE-map key marking `name` as a data-modifying CTE that returns
+/// exactly one row (see [`insert_returns_one_row`]).
+fn one_row_marker(name: &str) -> String {
+    format!("\u{1}one-row:{name}")
+}
+
+/// Whether CTE `name` of `ctes` returns exactly one row.
+pub(crate) fn cte_returns_one_row(ctes: &HashMap<String, Vec<ScopeColumn>>, name: &str) -> bool {
+    ctes.contains_key(&one_row_marker(name))
+}
+
+/// Whether INSERT … RETURNING `ins` returns exactly one row whenever it
+/// succeeds: it inserts one row (one VALUES row, or DEFAULT VALUES) into a
+/// table without rules, and no BEFORE ROW trigger can skip it (return
+/// NULL) — nor ON CONFLICT DO NOTHING, nor a DO UPDATE WHERE. ON CONFLICT
+/// DO UPDATE without WHERE returns the inserted row or the updated one.
+fn insert_returns_one_row(ins: &protobuf::InsertStmt, snapshot: &PgCatalog) -> bool {
+    let one_row = match ins.select_stmt.as_deref().and_then(|s| s.node.as_ref()) {
+        None => true,
+        Some(node::Node::SelectStmt(sel)) => {
+            sel.values_lists.len() == 1
+                && sel.with_clause.is_none()
+                && sel.limit_count.is_none()
+                && sel.limit_offset.is_none()
+        }
+        _ => false,
+    };
+    let (update, ok_conflict) = match &ins.on_conflict_clause {
+        None => (false, true),
+        Some(oc) => (
+            true,
+            oc.action == protobuf::OnConflictAction::OnconflictUpdate as i32
+                && oc.where_clause.is_none(),
+        ),
+    };
+    let Some(relation) = &ins.relation else {
+        return false;
+    };
+    let schema = (!relation.schemaname.is_empty()).then_some(relation.schemaname.as_str());
+    let Some(table) = snapshot.resolve_table(schema, &relation.relname) else {
+        return false;
+    };
+    let Some(wt) = WriteTarget::resolve(snapshot, table.oid) else {
+        return false;
+    };
+    let skips = |events: i32| {
+        std::iter::once(wt.base)
+            .chain(super::from::inheritance_descendants(snapshot, wt.base))
+            .any(|r| {
+                snapshot.triggers.get(&r).is_some_and(|ts| {
+                    ts.iter().any(|t| {
+                        t.row
+                            && t.timing & crate::ddl::triggers::TRIGGER_TYPE_BEFORE != 0
+                            && t.events & events != 0
+                    })
+                })
+            })
+    };
+    let mut events = crate::ddl::triggers::TRIGGER_TYPE_INSERT;
+    if update {
+        events |= crate::ddl::triggers::TRIGGER_TYPE_UPDATE;
+    }
+    one_row && ok_conflict && wt.base == table.oid && !skips(events)
+}
+
 /// The CTE-map key holding the SEARCH / CYCLE columns of CTE `name`.
 fn search_cycle_marker(name: &str) -> String {
     format!("\u{1}search-cycle:{name}")
@@ -763,6 +828,16 @@ pub(crate) fn analyze_with_clause(
             cte_scopes.insert(marker, Vec::new());
         } else {
             cte_scopes.remove(&marker);
+        }
+        let one_row = one_row_marker(&cte.ctename);
+        if returning == Some(true)
+            && let Some(node::Node::InsertStmt(ins)) =
+                cte.ctequery.as_deref().and_then(|q| q.node.as_ref())
+            && insert_returns_one_row(ins, snapshot)
+        {
+            cte_scopes.insert(one_row, Vec::new());
+        } else {
+            cte_scopes.remove(&one_row);
         }
         register_cte(
             &mut cte_scopes,

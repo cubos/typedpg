@@ -78,7 +78,8 @@ fn data_modifying_cte_chain() {
              SELECT * FROM upd",
         )
         .unwrap();
-    assert_cols(&s, vec![cn("y", int4())]);
+    // `SET y = 1`: the updated rows hold 1.
+    assert_cols(&s, vec![c("y", int4())]);
     let s = db
         .analyze(
             "WITH ins AS (INSERT INTO t (id, a, c) VALUES (1, 2, 'x') RETURNING id), \

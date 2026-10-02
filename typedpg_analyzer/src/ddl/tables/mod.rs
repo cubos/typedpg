@@ -1620,7 +1620,7 @@ mod columns;
 mod constraints;
 pub(crate) mod foreign_keys;
 mod generated;
-pub(crate) use generated::check_attribute_type;
+pub(crate) use generated::{check_attribute_type, generation_not_null};
 pub(crate) mod inherit;
 mod inherit_cmd;
 mod merge;

@@ -519,11 +519,12 @@ impl Scope {
             .map(|c| ScopeColumn {
                 name: c.attname.clone(),
                 type_oid: c.atttypid,
-                // Only the column's own NOT NULL: a NOT NULL domain doesn't
+                // Only the column's own NOT NULL (or a generation
+                // expression that can't be NULL): a NOT NULL domain doesn't
                 // keep NULL out of a column (CREATE DOMAIN's notes: a value
                 // already of the domain type — an empty scalar subquery, an
                 // outer join's NULL — is stored unchecked).
-                base_not_null: snapshot.attr_proven_not_null(c),
+                base_not_null: snapshot.attr_never_null(c),
                 typmod: snapshot.effective_typmod(c.atttypid, c.atttypmod),
                 collation: c.attcollation,
                 table_alias: alias.to_owned(),
@@ -589,7 +590,7 @@ impl Scope {
                     .attributes_of(d)
                     .iter()
                     .find(|a| a.attname == c.attname)
-                    .is_some_and(|a| snapshot.attr_proven_not_null(a))
+                    .is_some_and(|a| snapshot.attr_never_null(a))
             })
         };
         let cols = columns
@@ -598,7 +599,7 @@ impl Scope {
                 name: c.attname.clone(),
                 type_oid: c.atttypid,
                 // A NOT NULL domain doesn't keep NULL out (see `add_table`).
-                base_not_null: snapshot.attr_proven_not_null(c) && not_null_everywhere(c),
+                base_not_null: snapshot.attr_never_null(c) && not_null_everywhere(c),
                 typmod: snapshot.effective_typmod(c.atttypid, c.atttypmod),
                 collation: c.attcollation,
                 table_alias: alias.to_owned(),

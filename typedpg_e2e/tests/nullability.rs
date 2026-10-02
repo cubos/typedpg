@@ -407,9 +407,10 @@ async fn generated_columns_follow_their_inputs() {
     let base: Option<i32> = row.base;
     let doubled: Option<i32> = row.doubled;
     let tripled: Option<i32> = row.tripled;
-    let label_length: Option<i32> = row.label_length;
+    // `length(label)` over the NOT NULL `label` can't be NULL.
+    let label_length: i32 = row.label_length;
     assert_eq!((base, doubled, tripled), (None, None, None));
-    assert_eq!(label_length, Some(label.len() as i32));
+    assert_eq!(label_length, label.len() as i32);
 }
 
 #[tokio::test]

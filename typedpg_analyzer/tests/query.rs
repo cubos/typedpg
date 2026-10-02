@@ -34,6 +34,8 @@ mod ctes;
 mod dml;
 #[path = "query/dml_clause_kinds.rs"]
 mod dml_clause_kinds;
+#[path = "query/dml_returning_narrowing.rs"]
+mod dml_returning_narrowing;
 #[path = "query/expressions.rs"]
 mod expressions;
 #[path = "query/join_rules.rs"]

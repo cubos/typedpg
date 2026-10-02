@@ -416,3 +416,85 @@ fn check_virtual_generated_security(
     }
     Ok(())
 }
+
+/// Whether generated column `attr` of relation `relid` is non-NULL in
+/// every row whose other columns `input_not_null` says are non-NULL: its
+/// generation expression can't be NULL over them. A STORED column is
+/// recomputed from the row on every write, after any BEFORE trigger
+/// (`ExecComputeStoredGenerated`), and SET EXPRESSION rewrites the table; a
+/// VIRTUAL one is computed when read (`expand_generated_columns_in_expr`).
+/// So its value is always the expression over the row's own columns.
+pub(crate) fn generation_not_null(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+    attr: &crate::pg_catalog::PgAttribute,
+    input_not_null: &dyn Fn(&str) -> bool,
+) -> bool {
+    use crate::nullability::NullabilityContext;
+    use crate::param_collector::ParamCollector;
+    use crate::scope::{Scope, ScopeColumn, TableSource};
+
+    if attr.attgenerated.is_none() {
+        return false;
+    }
+    let Some(super::check_inherit::StoredExpr::Written(expr)) =
+        interp.attr_default_exprs.get(&(relid, attr.attnum))
+    else {
+        return false;
+    };
+    let relname = relname_of(interp, relid);
+    let columns = interp
+        .attributes_of(relid)
+        .iter()
+        .map(|a| ScopeColumn {
+            name: a.attname.clone(),
+            type_oid: a.atttypid,
+            // A generation expression reads no generated column.
+            base_not_null: a.attgenerated.is_none() && input_not_null(&a.attname),
+            typmod: interp.effective_typmod(a.atttypid, a.atttypmod),
+            collation: a.attcollation,
+            table_alias: relname.clone(),
+            record_fields: None,
+            elem_nullable: None,
+        })
+        .collect();
+    let mut scope = Scope::default();
+    scope.sources.push(TableSource::derived(&relname, columns));
+    let null_ctx = NullabilityContext::default();
+    let mut params = ParamCollector::default();
+    // Analyzed on a level of its own, and without noting what it refers
+    // to as a dependency of the statement being analyzed.
+    let (inferred, _) = crate::ddl::depend::collect(|| {
+        let _level = crate::resolve::QueryLevel::enter();
+        crate::expr::infer_expr(
+            expr,
+            crate::expr::Ctx::new(&scope, &null_ctx, interp),
+            &mut params,
+            crate::expr::TypeGoal::assignment(attr.atttypid)
+                .with_typmod(interp.effective_typmod(attr.atttypid, attr.atttypmod)),
+        )
+    });
+    inferred.is_ok_and(|t| !t.nullable)
+}
+
+impl PgCatalog {
+    /// Whether column `attr` is non-NULL in every row of its relation: its
+    /// own NOT NULL ([`PgCatalog::attr_proven_not_null`]), or a generation
+    /// expression that can't be NULL over the row ([`generation_not_null`]).
+    pub(crate) fn attr_never_null(&self, attr: &crate::pg_catalog::PgAttribute) -> bool {
+        if self.attr_proven_not_null(attr) {
+            return true;
+        }
+        if attr.attgenerated.is_none() {
+            return false;
+        }
+        let relid = attr.attrelid;
+        let attrs = self.attributes_of(relid);
+        generation_not_null(self, relid, attr, &|name| {
+            attrs
+                .iter()
+                .find(|a| a.attname == name)
+                .is_some_and(|a| self.attr_proven_not_null(a))
+        })
+    }
+}

@@ -883,11 +883,12 @@ fn delete_returns_the_rows_its_where_saw() {
          RETURNING p.body",
         &[("body", false)],
     );
-    // A view's DELETE goes through the rewriter.
+    // An automatically updatable view's DELETE deletes the base rows the
+    // WHERE saw.
     assert_nullable(
         &db,
         "DELETE FROM users_v WHERE email IS NOT NULL RETURNING email, old.email AS o",
-        &[("email", true), ("o", true)],
+        &[("email", false), ("o", false)],
     );
     // NEW of a deleted row is NULL.
     assert_nullable(
@@ -941,10 +942,11 @@ fn update_returns_the_where_values_of_the_columns_it_keeps() {
         "UPDATE part_t SET id = 1 WHERE email IS NOT NULL RETURNING email",
         &[("email", true)],
     );
+    // Through an automatically updatable view: the base row's.
     assert_nullable(
         &db,
         "UPDATE users_v SET age = 1 WHERE email IS NOT NULL RETURNING email, old.email AS o",
-        &[("email", true), ("o", true)],
+        &[("email", false), ("o", false)],
     );
     // FROM entries keep what WHERE saw.
     assert_nullable(
