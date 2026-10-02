@@ -1263,7 +1263,8 @@ pub(crate) fn drop_constraint(
     }
 
     // Drop the backing index (`<conname>` shares the relname with the
-    // constraint for PK/UNIQUE) before dropping the constraint itself.
+    // constraint for PK/UNIQUE) before dropping the constraint itself —
+    // with CASCADE, the foreign keys referencing it go too.
     if is_pkey_or_unique {
         let nsoid = interp.pg_class.get(&relid).map(|c| c.relnamespace);
         if let Some(nsoid) = nsoid
@@ -1285,6 +1286,16 @@ pub(crate) fn drop_constraint(
                 });
                 interp.remove_pg_index(child);
                 interp.remove_pg_class(child);
+            }
+            if cascade {
+                let key: std::collections::BTreeSet<i16> = interp
+                    .pg_constraint
+                    .get(&oid)
+                    .map(|c| c.conkey.iter().copied().collect())
+                    .unwrap_or_default();
+                for fk in super::foreign_keys::fks_relying_on(interp, relid, &key, idx_oid) {
+                    super::foreign_keys::drop_fk_cascaded(interp, fk);
+                }
             }
             interp.remove_pg_index(idx_oid);
             interp.remove_pg_class(idx_oid);

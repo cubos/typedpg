@@ -50,6 +50,8 @@ mod merge;
 mod named_args;
 #[path = "query/null_narrowing.rs"]
 mod null_narrowing;
+#[path = "query/nullability_soundness.rs"]
+mod nullability_soundness;
 #[path = "query/params.rs"]
 mod params;
 #[path = "query/records.rs"]

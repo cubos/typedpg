@@ -88,6 +88,25 @@ pub(crate) fn process_from_item(
                 src.lock_error = view_lock_error(class, snapshot);
                 src.partial_scan =
                     !rv.inh && class.relkind == crate::pg_catalog::RelKind::Partitioned;
+                // A scan of an inheritance parent returns its children's
+                // rows too: a column is NOT NULL only if it is in each of
+                // them (a parent's `NOT NULL NO INHERIT` isn't).
+                let descendants = if rv.inh {
+                    inheritance_descendants(snapshot, class.oid)
+                } else {
+                    Vec::new()
+                };
+                src.inherits_rows = !descendants.is_empty()
+                    && class.relkind != crate::pg_catalog::RelKind::Partitioned;
+                for c in src.columns.iter_mut().filter(|c| c.base_not_null) {
+                    c.base_not_null = descendants.iter().all(|&d| {
+                        snapshot
+                            .attributes_of(d)
+                            .iter()
+                            .find(|a| a.attname == c.name)
+                            .is_some_and(|a| snapshot.attr_proven_not_null(a))
+                    });
+                }
                 // Every row of a table satisfies its CHECK constraints
                 // (named by the table's own column names: not with an
                 // alias list renaming them).
@@ -713,6 +732,24 @@ fn process_join_expr(
     Ok(())
 }
 
+/// Every table inheriting from `relid`, directly or not (partitions too).
+fn inheritance_descendants(
+    snapshot: &PgCatalog,
+    relid: crate::oid::PgClassOid,
+) -> Vec<crate::oid::PgClassOid> {
+    let mut out = Vec::new();
+    let mut todo = vec![relid];
+    while let Some(r) = todo.pop() {
+        for i in snapshot.pg_inherits.iter().filter(|i| i.inhparent == r) {
+            if !out.contains(&i.inhrelid) {
+                out.push(i.inhrelid);
+                todo.push(i.inhrelid);
+            }
+        }
+    }
+    out
+}
+
 /// The column pairs an ON clause equates, when it is nothing but an AND
 /// of strict `a.x = b.y` comparisons between plain columns.
 fn on_equalities(
@@ -808,10 +845,15 @@ fn fk_match(
             .sources(scope)
             .iter()
             .find(|s| s.alias == child_alias)?;
-        if !matches!(child.kind, crate::scope::SourceKind::Relation) {
+        if !matches!(child.kind, crate::scope::SourceKind::Relation) || child.inherits_rows {
             return None;
         }
         let child_rel = child.relid?;
+        if snapshot.ri_triggers_disabled.contains(&child_rel)
+            || snapshot.ri_triggers_disabled.contains(&parent_rel)
+        {
+            return None;
+        }
         let attname = |rel, attnum: i16| {
             snapshot
                 .attributes_of(rel)
@@ -829,6 +871,13 @@ fn fk_match(
                 && con.confrelid == Some(parent_rel)
                 && con.conenforced
                 && !con.conperiod
+                // Not a partition's internal clone (`conparentid`): the one
+                // referencing a partitioned table also has clones pointing
+                // at each partition, which a row may be in another of.
+                && snapshot
+                    .fk_details
+                    .get(&con.oid)
+                    .is_none_or(|d| d.parent.is_none())
                 && {
                     let fk: Option<std::collections::BTreeSet<(String, String)>> = con
                         .conkey
@@ -865,7 +914,7 @@ fn fk_match(
             child_present,
         })
     };
-    if equalities.is_empty() {
+    if equalities.is_empty() || crate::nonnull::row_locking() {
         return None;
     }
     try_side(right, left, false).or_else(|| try_side(left, right, true))
@@ -1222,17 +1271,18 @@ pub(crate) fn srf_elements_nullable(
             .get_type(resolved.arg_types.first().copied().unwrap_or(oid::UNKNOWN))
             .is_some_and(|t| t.typname == "anyarray");
     if array_unnest {
-        let elements_not_null = match args
+        // What the argument's type says of its elements: `ARRAY[a, b]` over
+        // NOT NULL values, `ARRAY(SELECT nn_col …)`, … (a multidimensional
+        // array's are unknown: its sub-arrays being there says nothing of
+        // their elements).
+        let elements_not_null = args
             .first()
             .map(functions::call_arg_value)
-            .and_then(|a| a.node.as_ref())
-        {
-            Some(node::Node::AArrayExpr(arr)) => arr.elements.iter().all(|e| {
+            .is_some_and(|a| {
                 let mut scratch = params.clone();
-                expr::infer_expr(e, ctx, &mut scratch, TypeGoal::NONE).is_ok_and(|t| !t.nullable)
-            }),
-            _ => false,
-        };
+                expr::infer_expr(a, ctx, &mut scratch, TypeGoal::NONE)
+                    .is_ok_and(|t| t.elem_nullable == Some(false))
+            });
         return Some(!elements_not_null);
     }
     Some(matches!(
@@ -1308,6 +1358,12 @@ fn function_rte_columns(
     if !resolved.out_args.is_empty() {
         if has_coldeflist {
             return Err(crate::pgmsg::coldeflist_redundant_out_params().finalize_implicit());
+        }
+        // A single OUT parameter makes the function scalar
+        // (TYPEFUNC_SCALAR): a whole-row reference is its value, not a
+        // record of it.
+        if resolved.out_args.len() == 1 {
+            *whole_row = crate::scope::WholeRow::Scalar;
         }
         return Ok(resolved
             .out_args

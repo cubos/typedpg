@@ -262,6 +262,7 @@ fn singleton_set(
     }
     match group_leaf(node, scope, targets) {
         GroupLeaf::Column(key) => HashSet::from([key]),
+        GroupLeaf::Expr(fingerprint) => HashSet::from([(EXPR_KEY.to_owned(), fingerprint)]),
         GroupLeaf::Other | GroupLeaf::Unresolved => HashSet::new(),
     }
 }
@@ -270,6 +271,8 @@ fn singleton_set(
 enum GroupLeaf {
     /// A plain column `(table_alias, column_name)`.
     Column((String, String)),
+    /// An expression, by its [`expr_key`].
+    Expr(String),
     /// Some other expression (or an out-of-range ordinal, reported elsewhere).
     Other,
     /// A column reference that neither resolves nor names an output column.
@@ -281,11 +284,12 @@ enum GroupLeaf {
 /// input column first and an output-column alias otherwise, anything else is
 /// an expression of its own.
 fn group_leaf(node: &protobuf::Node, scope: &Scope, targets: &[ExpandedTarget<'_>]) -> GroupLeaf {
-    let target_column = |rt: &protobuf::ResTarget| {
-        rt.val
-            .as_deref()
-            .and_then(|v| resolve_group_column(v, scope))
-            .map_or(GroupLeaf::Other, GroupLeaf::Column)
+    let target_column = |rt: &protobuf::ResTarget| match rt.val.as_deref() {
+        Some(v) => match resolve_group_column(v, scope) {
+            Some(key) => GroupLeaf::Column(key),
+            None => GroupLeaf::Expr(expr_key(v)),
+        },
+        None => GroupLeaf::Other,
     };
     match node.node.as_ref() {
         Some(node::Node::AConst(ac)) => match &ac.val {
@@ -320,8 +324,20 @@ fn group_leaf(node: &protobuf::Node, scope: &Scope, targets: &[ExpandedTarget<'_
             });
             target.map_or(GroupLeaf::Unresolved, target_column)
         }
-        _ => GroupLeaf::Other,
+        Some(_) => GroupLeaf::Expr(expr_key(node)),
+        None => GroupLeaf::Other,
     }
+}
+
+/// The alias part of a grouping key that is an expression rather than a
+/// column (no FROM entry can be named so).
+pub(crate) const EXPR_KEY: &str = "\u{0}expr";
+
+/// The key of an expression in grouping sets: its parse tree without
+/// locations or column qualifiers (`t.g + 1` and `g + 1` are one key —
+/// erring towards matching, which only makes more values nullable).
+pub(crate) fn expr_key(node: &protobuf::Node) -> String {
+    crate::resolve::node_fingerprint(&crate::resolve::predtest_unqualify(node))
 }
 
 /// Resolve a `GROUP BY` entry as a single column against `scope`. Returns the

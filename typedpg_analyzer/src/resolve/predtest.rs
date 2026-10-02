@@ -242,7 +242,7 @@ fn operator_predicate_proof(clause: &protobuf::Node, pred: &protobuf::Node) -> b
 
 /// `node` with every qualified column reference (`t.v`) reduced to its
 /// column name — both sides refer to the one target relation.
-fn unqualify(node: &protobuf::Node) -> protobuf::Node {
+pub(crate) fn unqualify(node: &protobuf::Node) -> protobuf::Node {
     let mut tree = protobuf::ParseResult {
         version: 0,
         stmts: vec![protobuf::RawStmt {

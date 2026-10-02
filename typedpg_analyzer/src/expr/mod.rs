@@ -817,8 +817,21 @@ pub(crate) fn infer_expr(
 ) -> Result<ExprType, AnalyzeError> {
     // An error raised with no location points at the innermost expression
     // being inferred when it was.
-    infer_expr_unlocated(node, ctx, params, goal)
-        .map_err(|e| crate::error::with_fallback_span(e, || crate::error::expr_span(node)))
+    let mut t = infer_expr_unlocated(node, ctx, params, goal)
+        .map_err(|e| crate::error::with_fallback_span(e, || crate::error::expr_span(node)))?;
+    // A grouped expression some grouping set leaves out is NULL in that
+    // set's rows (`GROUP BY ROLLUP (g + 1)`'s total row).
+    if !t.nullable
+        && !matches!(node.node.as_ref(), Some(node::Node::ColumnRef(_)))
+        && ctx.null_ctx.grouping_omits_exprs()
+        && ctx.null_ctx.grouping_omitted.contains(&(
+            crate::grouping::EXPR_KEY.to_owned(),
+            crate::grouping::expr_key(node),
+        ))
+    {
+        t.nullable = true;
+    }
+    Ok(t)
 }
 
 fn infer_expr_unlocated(

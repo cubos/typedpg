@@ -138,8 +138,13 @@ soundness bug in the analyzer: fix the inference, never the expectation.
 **Declared constraints are trusted.** Nullability inference may rely on
 what the schema states — a foreign key's referenced row exists, a CHECK
 holds for every row — including `NOT VALID` and deferrable constraints;
-only `NOT ENFORCED` ones are ignored. Row security on a referenced table
-(which can hide the row) is the exception.
+only `NOT ENFORCED` ones are ignored. The exceptions are what PG itself
+doesn't enforce or what can hide rows: row security on a referenced table,
+`DISABLE TRIGGER ALL` (which turns foreign-key checks off), foreign keys
+under row locking (EvalPlanQual re-joins a re-fetched row), constraints an
+inheritance child doesn't carry (foreign keys, `NO INHERIT`), and a NOT
+NULL domain on a column without its own NOT NULL (PG stores a NULL already
+of the domain type unchecked).
 
 **Error-message contract — single-error fidelity only.** When the analyzer
 rejects a query, its message must *start with* PG's server-side message

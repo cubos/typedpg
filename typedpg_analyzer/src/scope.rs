@@ -104,6 +104,10 @@ pub(crate) struct TableSource {
     /// all in its partitions). A foreign key referencing it doesn't
     /// guarantee its referenced row shows up.
     pub partial_scan: bool,
+    /// A scan of a table with (non-partition) inheritance children that
+    /// also returns their rows: constraints the table doesn't pass down —
+    /// foreign keys, `NO INHERIT` ones — don't bind those.
+    pub inherits_rows: bool,
 }
 
 /// Why a locking clause can't be pushed into a view or subquery.
@@ -187,6 +191,7 @@ impl TableSource {
             whole_row: WholeRow::Record,
             lock_error: None,
             partial_scan: false,
+            inherits_rows: false,
         }
     }
 
@@ -507,14 +512,6 @@ impl Scope {
         let relname = table.relname.clone();
         // A view has no system attributes.
         let is_view = table.relkind == crate::pg_catalog::RelKind::View;
-        // A NOT NULL domain only guarantees values that were stored and
-        // checked; a view's or materialized view's column is what its query
-        // yields — NULL from an outer join too — and already carries the
-        // nullability inferred for that query.
-        let stores_checked_values = !matches!(
-            table.relkind,
-            crate::pg_catalog::RelKind::View | crate::pg_catalog::RelKind::MaterializedView
-        );
 
         let columns: Vec<ScopeColumn> = snapshot
             .attributes_of(table_oid)
@@ -522,8 +519,11 @@ impl Scope {
             .map(|c| ScopeColumn {
                 name: c.attname.clone(),
                 type_oid: c.atttypid,
-                base_not_null: snapshot.attr_proven_not_null(c)
-                    || (stores_checked_values && snapshot.type_is_not_null(c.atttypid)),
+                // Only the column's own NOT NULL: a NOT NULL domain doesn't
+                // keep NULL out of a column (CREATE DOMAIN's notes: a value
+                // already of the domain type — an empty scalar subquery, an
+                // outer join's NULL — is stored unchecked).
+                base_not_null: snapshot.attr_proven_not_null(c),
                 typmod: snapshot.effective_typmod(c.atttypid, c.atttypmod),
                 collation: c.attcollation,
                 table_alias: alias.to_owned(),
@@ -570,13 +570,35 @@ impl Scope {
         qn: QualifiedName,
         columns: &[PgAttribute],
     ) {
+        // The rows of an inheritance parent's children are the statement's
+        // too: a column is NOT NULL only if it is in each of them.
+        let mut descendants = Vec::new();
+        let mut todo: Vec<crate::oid::PgClassOid> =
+            columns.first().map(|c| c.attrelid).into_iter().collect();
+        while let Some(r) = todo.pop() {
+            for i in snapshot.pg_inherits.iter().filter(|i| i.inhparent == r) {
+                if !descendants.contains(&i.inhrelid) {
+                    descendants.push(i.inhrelid);
+                    todo.push(i.inhrelid);
+                }
+            }
+        }
+        let not_null_everywhere = |c: &PgAttribute| {
+            descendants.iter().all(|&d| {
+                snapshot
+                    .attributes_of(d)
+                    .iter()
+                    .find(|a| a.attname == c.attname)
+                    .is_some_and(|a| snapshot.attr_proven_not_null(a))
+            })
+        };
         let cols = columns
             .iter()
             .map(|c| ScopeColumn {
                 name: c.attname.clone(),
                 type_oid: c.atttypid,
-                base_not_null: snapshot.attr_proven_not_null(c)
-                    || snapshot.type_is_not_null(c.atttypid),
+                // A NOT NULL domain doesn't keep NULL out (see `add_table`).
+                base_not_null: snapshot.attr_proven_not_null(c) && not_null_everywhere(c),
                 typmod: snapshot.effective_typmod(c.atttypid, c.atttypmod),
                 collation: c.attcollation,
                 table_alias: alias.to_owned(),

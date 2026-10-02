@@ -76,6 +76,13 @@ pub(crate) struct Knowledge<'a> {
     pub equals: &'a dyn Fn(&str) -> Option<Literal>,
 }
 
+/// What reading a constraint needs to know of the relation's columns.
+struct Cx<'a> {
+    is_composite: &'a dyn Fn(&str) -> bool,
+    column_type: &'a dyn Fn(&str) -> Option<crate::oid::PgTypeOid>,
+    snapshot: &'a PgCatalog,
+}
+
 /// The arms past which an OR of DNF arms grows too large to keep.
 const MAX_ARMS: usize = 16;
 
@@ -116,8 +123,15 @@ impl RelationChecks {
                     .find(|a| a.attname == name)
                     .is_none_or(|a| crate::coerce::is_complex(a.atttypid, snapshot))
             };
+            let column_type =
+                |name: &str| attrs.iter().find(|a| a.attname == name).map(|a| a.atttypid);
+            let cx = Cx {
+                is_composite: &is_composite,
+                column_type: &column_type,
+                snapshot,
+            };
             for conjunct in conjuncts(expr) {
-                if let Some(arms) = dnf(conjunct, &is_composite)
+                if let Some(arms) = dnf(conjunct, &cx)
                     && arms
                         .iter()
                         .any(|arm| arm.iter().any(|l| !matches!(l, Lit::Other)))
@@ -274,13 +288,13 @@ fn conjuncts(n: &protobuf::Node) -> Vec<&protobuf::Node> {
 }
 
 /// `n` as an OR of AND-arms; `None` past [`MAX_ARMS`].
-fn dnf(n: &protobuf::Node, is_composite: &dyn Fn(&str) -> bool) -> Option<Vec<Vec<Lit>>> {
+fn dnf(n: &protobuf::Node, cx: &Cx<'_>) -> Option<Vec<Vec<Lit>>> {
     match n.node.as_ref() {
         Some(node::Node::BoolExpr(b)) => match protobuf::BoolExprType::try_from(b.boolop) {
             Ok(protobuf::BoolExprType::OrExpr) => {
                 let mut arms = Vec::new();
                 for a in &b.args {
-                    arms.extend(dnf(a, is_composite)?);
+                    arms.extend(dnf(a, cx)?);
                     if arms.len() > MAX_ARMS {
                         return None;
                     }
@@ -290,7 +304,7 @@ fn dnf(n: &protobuf::Node, is_composite: &dyn Fn(&str) -> bool) -> Option<Vec<Ve
             Ok(protobuf::BoolExprType::AndExpr) => {
                 let mut arms: Vec<Vec<Lit>> = vec![Vec::new()];
                 for a in &b.args {
-                    let sub = dnf(a, is_composite)?;
+                    let sub = dnf(a, cx)?;
                     let mut next = Vec::new();
                     for x in &arms {
                         for y in &sub {
@@ -305,12 +319,12 @@ fn dnf(n: &protobuf::Node, is_composite: &dyn Fn(&str) -> bool) -> Option<Vec<Ve
                 Some(arms)
             }
             Ok(protobuf::BoolExprType::NotExpr) => match b.args.as_slice() {
-                [inner] => Some(vec![vec![negated_atom(inner, is_composite)]]),
+                [inner] => Some(vec![vec![negated_atom(inner, cx)]]),
                 _ => Some(vec![vec![Lit::Other]]),
             },
             _ => Some(vec![vec![Lit::Other]]),
         },
-        _ => Some(vec![vec![atom(n, is_composite)]]),
+        _ => Some(vec![vec![atom(n, cx)]]),
     }
 }
 
@@ -330,8 +344,12 @@ fn column_name(n: &protobuf::Node) -> Option<String> {
         .cloned()
 }
 
-fn atom(n: &protobuf::Node, is_composite: &dyn Fn(&str) -> bool) -> Lit {
-    let scalar = |a: Option<&protobuf::Node>| a.and_then(column_name).filter(|c| !is_composite(c));
+fn atom(n: &protobuf::Node, cx: &Cx<'_>) -> Lit {
+    let scalar =
+        |a: Option<&protobuf::Node>| a.and_then(column_name).filter(|c| !(cx.is_composite)(c));
+    let lit = |n: &protobuf::Node, c: &str| {
+        (cx.column_type)(c).and_then(|t| super::literal_for(n, t, cx.snapshot))
+    };
     match n.node.as_ref() {
         // A boolean column used as a condition: `done` is `done = true`.
         Some(node::Node::ColumnRef(_)) => match column_name(n) {
@@ -367,8 +385,8 @@ fn atom(n: &protobuf::Node, is_composite: &dyn Fn(&str) -> bool) -> Lit {
             match K::try_from(e.kind) {
                 Ok(K::AexprOp) => {
                     let pair = match (column_name(l), column_name(r)) {
-                        (Some(c), None) => super::literal(r).map(|v| (c, v)),
-                        (None, Some(c)) => super::literal(l).map(|v| (c, v)),
+                        (Some(c), None) => lit(r, &c).map(|v| (c, v)),
+                        (None, Some(c)) => lit(l, &c).map(|v| (c, v)),
                         _ => None,
                     };
                     match (pair, op.as_str()) {
@@ -382,7 +400,7 @@ fn atom(n: &protobuf::Node, is_composite: &dyn Fn(&str) -> bool) -> Lit {
                     else {
                         return Lit::Other;
                     };
-                    let vs: Option<Vec<Literal>> = list.items.iter().map(super::literal).collect();
+                    let vs: Option<Vec<Literal>> = list.items.iter().map(|i| lit(i, &c)).collect();
                     match (vs, op.as_str()) {
                         (Some(vs), "=") => Lit::In(c, vs),
                         (Some(vs), "<>") => Lit::NotIn(c, vs),
@@ -397,8 +415,8 @@ fn atom(n: &protobuf::Node, is_composite: &dyn Fn(&str) -> bool) -> Lit {
 }
 
 /// `NOT n` as a literal.
-fn negated_atom(n: &protobuf::Node, is_composite: &dyn Fn(&str) -> bool) -> Lit {
-    match atom(n, is_composite) {
+fn negated_atom(n: &protobuf::Node, cx: &Cx<'_>) -> Lit {
+    match atom(n, cx) {
         Lit::NotNull(c) => Lit::IsNull(c),
         Lit::IsNull(c) => Lit::NotNull(c),
         // NOT is strict: `NOT (c = v)` is `c <> v`.
