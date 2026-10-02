@@ -40,7 +40,8 @@ pub(crate) fn infer_sublink(
                 && let Some(node::Node::SelectStmt(sel)) = subselect.node.as_ref()
             {
                 let first = single_sublink_column(sub, sel, ctx, params)?;
-                let guaranteed_one_row = yields_exactly_one_row(sel, snapshot);
+                let guaranteed_one_row = yields_exactly_one_row(sel, snapshot)
+                    || reads_one_row_cte(sel, &scope.ctes, snapshot);
                 let nullable = if guaranteed_one_row {
                     first.nullable
                 } else {
@@ -257,6 +258,32 @@ fn yields_exactly_one_row(sel: &protobuf::SelectStmt, snapshot: &PgCatalog) -> b
     }
     let has_aggs = crate::grouping::level_info(sel).is_some_and(|l| l.has_aggs);
     has_aggs || (sel.from_clause.is_empty() && sel.where_clause.is_none())
+}
+
+/// Whether scalar subquery `sel` reads every row of a data-modifying CTE
+/// that returns exactly one row (`SELECT id FROM ins`), and only them.
+fn reads_one_row_cte(
+    sel: &protobuf::SelectStmt,
+    ctes: &std::collections::HashMap<String, Vec<crate::scope::ScopeColumn>>,
+    snapshot: &PgCatalog,
+) -> bool {
+    let [item] = sel.from_clause.as_slice() else {
+        return false;
+    };
+    let Some(node::Node::RangeVar(rv)) = item.node.as_ref() else {
+        return false;
+    };
+    sel.op == protobuf::SetOperation::SetopNone as i32
+        && sel.with_clause.is_none()
+        && sel.where_clause.is_none()
+        && sel.group_clause.is_empty()
+        && sel.having_clause.is_none()
+        && sel.limit_count.is_none()
+        && sel.limit_offset.is_none()
+        && sel.distinct_clause.is_empty()
+        && rv.schemaname.is_empty()
+        && crate::resolve::cte_returns_one_row(ctes, &rv.relname)
+        && crate::resolve::count_srf_calls(&sel.target_list, snapshot) == 0
 }
 
 /// The single output column of an EXPR / ARRAY sublink's subquery, as PG's

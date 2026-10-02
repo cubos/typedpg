@@ -170,6 +170,38 @@ impl RelationChecks {
     /// What the constraints prove of a row the query knows `k` about:
     /// columns non-NULL or NULL, and sets of columns one of which is
     /// non-NULL — over the columns of FROM entry `alias`.
+    /// The constraints over the columns of a relation exposing column `c`
+    /// as `rename(c)` (a view's plain columns): one it doesn't expose gets
+    /// a name no column has, so nothing is known of it.
+    pub(crate) fn renamed(&self, rename: impl Fn(&str) -> Option<String>) -> RelationChecks {
+        let name = |c: &String| rename(c).unwrap_or_else(|| format!("\u{1}hidden:{c}"));
+        let lit = |l: &Lit| match l {
+            Lit::NotNull(c) => Lit::NotNull(name(c)),
+            Lit::IsNull(c) => Lit::IsNull(name(c)),
+            Lit::Eq(c, v) => Lit::Eq(name(c), v.clone()),
+            Lit::Ne(c, v) => Lit::Ne(name(c), v.clone()),
+            Lit::In(c, vs) => Lit::In(name(c), vs.clone()),
+            Lit::NotIn(c, vs) => Lit::NotIn(name(c), vs.clone()),
+            Lit::SomeNonNull(cs) => Lit::SomeNonNull(cs.iter().map(name).collect()),
+            Lit::AllNonNull(cs) => Lit::AllNonNull(cs.iter().map(name).collect()),
+            Lit::Other => Lit::Other,
+        };
+        RelationChecks {
+            clauses: self
+                .clauses
+                .iter()
+                .map(|cl| Clause {
+                    arms: cl
+                        .arms
+                        .iter()
+                        .map(|arm| arm.iter().map(lit).collect())
+                        .collect(),
+                })
+                .collect(),
+            string_distinct: self.string_distinct.iter().map(name).collect(),
+        }
+    }
+
     pub(crate) fn derive(&self, alias: &str, k: &Knowledge<'_>) -> Facts {
         let col = |c: &str| -> Col { (alias.to_owned(), c.to_owned()) };
         let mut out = Facts::default();

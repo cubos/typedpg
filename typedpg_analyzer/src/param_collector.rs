@@ -104,6 +104,13 @@ impl ParamCollector {
         stale
     }
 
+    /// Keep the non-NULL reads a scratch copy of this collector made (an
+    /// expression analyzed again on it only for its nullability).
+    pub fn absorb_non_null_reads(&mut self, scratch: &ParamCollector) {
+        self.read_non_null
+            .extend(scratch.read_non_null.iter().copied());
+    }
+
     /// Get the inferred type for a parameter. Returns UNKNOWN if not yet constrained.
     pub fn get(&self, param_num: i32) -> PgTypeOid {
         self.constraints

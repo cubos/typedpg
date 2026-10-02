@@ -34,11 +34,14 @@ pub(crate) fn analyze_insert_with_outer_ctes(
     // Match $N params in VALUES to column types, or analyze INSERT...SELECT.
     // The rewriter later sees one target list entry per supplied column.
     let mut assigns: Vec<Assign> = Vec::new();
+    // What each row writes at each target position (`None`: DEFAULT); no
+    // row for DEFAULT VALUES, which writes the defaults.
+    let mut written: Vec<Vec<Option<ValueInfo>>> = vec![Vec::new()];
     if let Some(select_node) = &ins.select_stmt
         && let Some(node::Node::SelectStmt(val_sel)) = select_node.node.as_ref()
     {
         if !val_sel.values_lists.is_empty() {
-            analyze_insert_values(ins, val_sel, &tgt, snapshot, params, &cte_scopes)?;
+            written = analyze_insert_values(ins, val_sel, &tgt, snapshot, params, &cte_scopes)?;
             let rows: Vec<&[protobuf::Node]> = val_sel
                 .values_lists
                 .iter()
@@ -61,8 +64,10 @@ pub(crate) fn analyze_insert_with_outer_ctes(
                 })
                 .collect();
         } else {
-            let width =
+            let selected =
                 analyze_insert_select(val_sel, &ins.cols, &tgt, snapshot, params, &cte_scopes)?;
+            let width = selected.len();
+            written = vec![selected.into_iter().map(Some).collect()];
             assigns = (0..width)
                 .filter_map(|i| {
                     Some(Assign {
@@ -87,7 +92,7 @@ pub(crate) fn analyze_insert_with_outer_ctes(
         ctes: cte_scopes.clone(),
         ..Scope::default()
     };
-    let ret_null_ctx = NullabilityContext::default();
+    let mut ret_null_ctx = NullabilityContext::default();
     let target_qn = crate::qualified_name::QualifiedName::new(&tgt.nsname, &tgt.relname);
     ret_scope.add_dml_target(
         snapshot,
@@ -111,14 +116,45 @@ pub(crate) fn analyze_insert_with_outer_ctes(
 
     // No returned row of an INSERT has an old version, except the ones
     // ON CONFLICT DO UPDATE updated.
+    let mut rows = ReturningRows {
+        old_may_be_null: true,
+        new_may_be_null: false,
+        ..ReturningRows::default()
+    };
+    // A returned row is an inserted one, or — ON CONFLICT DO UPDATE — an
+    // updated one (DO NOTHING returns only the inserted rows).
+    if has_returning(&ins.returning_clause)
+        && let Some(wt) = WriteTarget::resolve(snapshot, tgt.oid)
+    {
+        let insert_arm = if wt.insert_keeps(snapshot) {
+            insert_knowledge(snapshot, &wt, &tgt, &written)
+        } else {
+            RowKnowledge::default()
+        };
+        let mut not_null = wt.row_not_null(snapshot, &insert_arm);
+        if let Some(oc) = &ins.on_conflict_clause
+            && oc.action == protobuf::OnConflictAction::OnconflictUpdate as i32
+        {
+            let update_arm = on_conflict_update_arm(
+                oc,
+                relation,
+                &tgt,
+                &wt,
+                &not_null,
+                arbiter.as_ref(),
+                snapshot,
+                params,
+                &cte_scopes,
+            );
+            not_null.retain(|c| update_arm.contains(c));
+        }
+        prove_columns(&mut ret_null_ctx, insert_target_alias(relation), &not_null);
+        rows.new_proven = not_null;
+    }
     let columns = resolve_returning(
         &ins.returning_clause,
         insert_target_alias(relation),
-        ReturningRows {
-            old_may_be_null: true,
-            new_may_be_null: false,
-            ..ReturningRows::default()
-        },
+        rows,
         expr::Ctx::new(&ret_scope, &ret_null_ctx, snapshot),
         params,
     )?;
@@ -143,6 +179,171 @@ pub(crate) fn analyze_insert_with_outer_ctes(
     }
 
     Ok((columns, None))
+}
+
+/// What every row an INSERT stores holds, by base column: the values
+/// `written` gives at each target position in each row (`None`: DEFAULT),
+/// and the defaults of the columns it gives no value for.
+fn insert_knowledge(
+    snapshot: &PgCatalog,
+    wt: &WriteTarget,
+    tgt: &InsertTarget,
+    written: &[Vec<Option<ValueInfo>>],
+) -> RowKnowledge {
+    let rows: Vec<Vec<(String, Option<ValueInfo>)>> = written
+        .iter()
+        .map(|row| {
+            row.iter()
+                .enumerate()
+                .filter_map(|(i, v)| Some((target_col_at(tgt, i)?.attname.clone(), v.clone())))
+                .collect()
+        })
+        .collect();
+    inserted_rows_knowledge(snapshot, wt, &rows)
+}
+
+/// What every row an INSERT (or MERGE's INSERT action) stores holds, by
+/// base column: each row's values for the target columns it names
+/// (`None`: DEFAULT), and the defaults of the others.
+pub(crate) fn inserted_rows_knowledge(
+    snapshot: &PgCatalog,
+    wt: &WriteTarget,
+    rows: &[Vec<(String, Option<ValueInfo>)>],
+) -> RowKnowledge {
+    let base_attrs: Vec<&crate::pg_catalog::PgAttribute> = snapshot
+        .attributes_of(wt.base)
+        .iter()
+        .filter(|a| a.attnum > 0 && a.attgenerated.is_none())
+        .collect();
+    let mut defaults: HashMap<String, ValueInfo> = HashMap::new();
+    let mut combined: HashMap<String, ValueInfo> = HashMap::new();
+    for row in rows {
+        for b in &base_attrs {
+            let given: Vec<&Option<ValueInfo>> = match wt.target_column(&b.attname) {
+                Some(t) => row.iter().filter(|(c, _)| c == t).map(|(_, v)| v).collect(),
+                None => Vec::new(),
+            };
+            let mut omitted = || {
+                defaults
+                    .entry(b.attname.clone())
+                    .or_insert_with(|| wt.omitted(snapshot, b))
+                    .clone()
+            };
+            let info = match given.as_slice() {
+                [] | [None] => omitted(),
+                [Some(v)] => v.clone(),
+                // Several assignments into the column.
+                _ => ValueInfo::default(),
+            };
+            combined
+                .entry(b.attname.clone())
+                .and_modify(|v| *v = v.either(&info))
+                .or_insert(info);
+        }
+    }
+    let mut k = RowKnowledge::default();
+    for (c, v) in &combined {
+        k.write(c, v);
+    }
+    k
+}
+
+/// The base columns proven non-NULL in the rows ON CONFLICT DO UPDATE
+/// updates (ExecOnConflictUpdate): the conflicting row with the SET values
+/// — evaluated where the DO UPDATE WHERE holds, over an EXCLUDED row whose
+/// columns `insert_not_null` are non-NULL — and its other columns as
+/// stored. Those of the arbiter's key equal the proposed row's (a NULL key
+/// never conflicts, and under NULLS NOT DISTINCT only with a NULL one).
+#[allow(clippy::too_many_arguments)]
+fn on_conflict_update_arm(
+    oc: &protobuf::OnConflictClause,
+    relation: &protobuf::RangeVar,
+    tgt: &InsertTarget,
+    wt: &WriteTarget,
+    insert_not_null: &std::collections::HashSet<String>,
+    arbiter: Option<&Arbiter>,
+    snapshot: &PgCatalog,
+    params: &mut ParamCollector,
+    cte_scopes: &HashMap<String, Vec<ScopeColumn>>,
+) -> std::collections::HashSet<String> {
+    // Through a view, EXCLUDED and the SET list are the view's: only what
+    // holds of any row is used.
+    if wt.relid != wt.base || !wt.update_keeps(snapshot) {
+        return wt.row_not_null(snapshot, &RowKnowledge::default());
+    }
+    let alias = insert_target_alias(relation);
+    let target_qn = crate::qualified_name::QualifiedName::new(&tgt.nsname, &tgt.relname);
+    let mut scope = Scope {
+        ctes: cte_scopes.clone(),
+        ..Scope::default()
+    };
+    scope.add_dml_target(snapshot, alias, target_qn.clone(), &tgt.attrs);
+    let mut holder = Scope::default();
+    holder.add_dml_target(snapshot, "excluded", target_qn, &tgt.attrs);
+    for s in &mut holder.sources {
+        s.system_columns.clear();
+        s.dml_target = false;
+        for c in &mut s.columns {
+            c.base_not_null |= insert_not_null.contains(&c.name);
+        }
+    }
+    scope.sources.extend(holder.sources);
+    let mut null_ctx = NullabilityContext::default();
+    let mut k = RowKnowledge::default();
+    if let Some(w) = &oc.where_clause {
+        let log = crate::nonnull::StrictLog::default();
+        let mut scratch = params.clone();
+        let typed = expr::infer_expr(
+            w,
+            expr::Ctx::new(&scope, &null_ctx, snapshot).logging_strictness(&log),
+            &mut scratch,
+            TypeGoal::implicit(oid::BOOL),
+        );
+        if typed.is_ok() {
+            params.absorb_non_null_reads(&scratch);
+            let facts = crate::nonnull::nonnullable(w, true, &scope, &log, snapshot)
+                .restricted_to(&crate::nonnull::own_aliases(&scope));
+            k = RowKnowledge::from_facts(&facts, alias, |c| Some(c.to_owned()));
+            null_ctx.add_where_facts(facts);
+        }
+    }
+    let mut key: Vec<i16> = arbiter
+        .map(|a| a.cols.iter().copied().filter(|&n| n > 0).collect())
+        .unwrap_or_default();
+    if let Some(infer) = oc.infer.as_deref()
+        && !infer.conname.is_empty()
+        && let Some(con) = snapshot.pg_constraint_values().find(|c| {
+            c.conrelid == tgt.oid
+                && c.conname == infer.conname
+                && matches!(c.contype, ConType::Unique | ConType::PrimaryKey)
+        })
+    {
+        key.extend(con.conkey.iter().copied());
+    }
+    for attnum in key {
+        if let Some(a) = tgt.attrs.iter().find(|a| a.attnum == attnum)
+            && insert_not_null.contains(&a.attname)
+        {
+            k.not_null.insert(a.attname.clone());
+        }
+    }
+    let set = set_values(
+        &oc.target_list,
+        wt,
+        &tgt.attrs,
+        expr::Ctx::new(&scope, &null_ctx, snapshot),
+        params,
+    );
+    for a in set_list_assigns(&oc.target_list) {
+        match set.get(&a.column) {
+            Some(v) => k.write(&a.column, v),
+            None => k.write(&a.column, &ValueInfo::default()),
+        }
+    }
+    for a in tgt.attrs.iter().filter(|a| a.attgenerated.is_some()) {
+        k.write(&a.attname, &ValueInfo::default());
+    }
+    wt.row_not_null(snapshot, &k)
 }
 
 /// The name ON CONFLICT and RETURNING use for the INSERT target:
@@ -360,7 +561,7 @@ fn analyze_insert_values(
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
     cte_scopes: &HashMap<String, Vec<ScopeColumn>>,
-) -> Result<(), AnalyzeError> {
+) -> Result<Vec<Vec<Option<ValueInfo>>>, AnalyzeError> {
     // No table in scope for VALUES, but we need scope for possible
     // subqueries/functions inside an individual value expression.
     let scope = Scope {
@@ -378,10 +579,13 @@ fn analyze_insert_values(
     // built).
     let mut violation: Option<NullViolation> = None;
     let mut first_len: Option<usize> = None;
+    // What each row writes at each position (`None`: DEFAULT).
+    let mut written: Vec<Vec<Option<ValueInfo>>> = Vec::new();
     for val_list in &val_sel.values_lists {
         let Some(node::Node::List(list)) = val_list.node.as_ref() else {
             continue;
         };
+        let mut row_written: Vec<Option<ValueInfo>> = Vec::with_capacity(list.items.len());
         let mut row_violations: Vec<NullViolation> = Vec::new();
         let mut default_nulls: Vec<NullViolation> = Vec::new();
         // transformInsertStmt: every row of a multi-row VALUES must be as
@@ -473,11 +677,18 @@ fn analyze_insert_values(
             }
             // EXPR_KIND_VALUES / EXPR_KIND_VALUES_SINGLE.
             crate::clause::check_no_aggregates_or_windows(val, snapshot, "VALUES")?;
-            match &target {
+            let inferred = match &target {
                 Some(t) => t.infer_value(val, goal, ctx, params)?,
                 None if is_set_to_default(val) => expr::ExprType::scalar(oid::UNKNOWN, false),
                 None => expr::infer_expr(val, ctx, params, goal)?,
             };
+            row_written.push(match target_col {
+                _ if is_set_to_default(val) => None,
+                // A value stored inside the column says nothing of it.
+                Some(_) if indirected => Some(ValueInfo::default()),
+                Some(tc) => Some(ValueInfo::of(val, inferred.nullable, tc.atttypid, snapshot)),
+                None => Some(ValueInfo::default()),
+            });
 
             if let Some(node::Node::ParamRef(p)) = val.node.as_ref()
                 && let Some(tc) = target_col
@@ -491,10 +702,11 @@ fn analyze_insert_values(
             row_violations.extend(default_nulls);
             violation = row_violations.into_iter().min_by_key(|v| v.order);
         }
+        written.push(row_written);
     }
     match violation {
         Some(v) => Err(v.error),
-        None => Ok(()),
+        None => Ok(written),
     }
 }
 
@@ -591,7 +803,7 @@ fn analyze_insert_select(
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
     cte_scopes: &HashMap<String, Vec<ScopeColumn>>,
-) -> Result<usize, AnalyzeError> {
+) -> Result<Vec<ValueInfo>, AnalyzeError> {
     // Walk the SELECT side of `INSERT … SELECT` so its params are registered
     // and any undefined-column / typo errors inside the SELECT propagate
     // cleanly. PG (transformInsertStmt) analyzes the SELECT first and only
@@ -735,7 +947,22 @@ fn analyze_insert_select(
             }
         }
     }
-    Ok(sel_cols.len())
+    // What each output column writes (nothing known of a value stored
+    // inside its column).
+    Ok(sel_cols
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let indirected = tgt
+                .col_indirection
+                .get(i)
+                .is_some_and(|ind| !ind.is_empty());
+            ValueInfo {
+                not_null: !c.nullable && !indirected,
+                ..ValueInfo::default()
+            }
+        })
+        .collect())
 }
 
 /// `ON CONFLICT (…) DO UPDATE SET …` / `DO NOTHING`, following
@@ -1113,6 +1340,7 @@ pub(crate) fn analyze_update_with_outer_ctes(
 
     // WHERE — BOOL goal with assignment coercion.
     let mut rows = ReturningRows::default();
+    let mut old_facts: Option<crate::nonnull::Facts> = None;
     if let Some(where_clause) = &upd.where_clause {
         let log = crate::nonnull::StrictLog::default();
         crate::clause::coerce_clause_expr(
@@ -1132,7 +1360,7 @@ pub(crate) fn analyze_update_with_outer_ctes(
             .collect();
         let keeps = update_keeps_values(snapshot, table_oid);
         let old_as_is = rows_returned_as_is(snapshot, table_oid);
-        let facts = where_facts(
+        let (facts, all) = where_facts(
             expr::Ctx::new(&scope, &null_ctx, snapshot),
             where_clause,
             &log,
@@ -1148,6 +1376,48 @@ pub(crate) fn analyze_update_with_outer_ctes(
             },
         );
         null_ctx.add_where_facts(facts);
+        old_facts = Some(all);
+    }
+
+    // The old row is a stored row past WHERE; the new one, with no BEFORE
+    // ROW trigger or row movement, that row with the SET values (computed
+    // from the old row) and the generated columns recomputed.
+    if has_returning(&upd.returning_clause)
+        && let Some(wt) = WriteTarget::resolve(snapshot, table_oid)
+    {
+        let old_k = old_row_knowledge(&wt, old_facts.as_ref(), alias);
+        let old_nn = wt.row_not_null(snapshot, &old_k);
+        let new_k = if wt.update_keeps(snapshot) {
+            let mut set_ctx = null_ctx.clone();
+            if let Some(all) = &old_facts {
+                set_ctx.add_where_facts(all.clone());
+            }
+            let set = set_values(
+                &upd.target_list,
+                &wt,
+                &table_attrs,
+                expr::Ctx::new(&scope, &set_ctx, snapshot),
+                params,
+            );
+            let mut k = old_k;
+            for a in snapshot.attributes_of(wt.base) {
+                if a.attgenerated.is_some() {
+                    k.write(&a.attname, &ValueInfo::default());
+                }
+            }
+            for a in set_list_assigns(&upd.target_list) {
+                if let Some(b) = wt.to_base.get(&a.column) {
+                    k.write(b, &set.get(&a.column).cloned().unwrap_or_default());
+                }
+            }
+            k
+        } else {
+            RowKnowledge::default()
+        };
+        let new_nn = wt.row_not_null(snapshot, &new_k);
+        prove_columns(&mut null_ctx, alias, &new_nn);
+        rows.old_proven.extend(old_nn);
+        rows.new_proven.extend(new_nn);
     }
 
     let ret_scope = with_written_target(&scope, alias, snapshot, table_oid, &table_attrs);
@@ -1262,6 +1532,7 @@ pub(crate) fn analyze_delete_with_outer_ctes(
         ..ReturningRows::default()
     };
     // WHERE — BOOL goal with assignment coercion.
+    let mut old_facts: Option<crate::nonnull::Facts> = None;
     if let Some(where_clause) = &del.where_clause {
         let log = crate::nonnull::StrictLog::default();
         crate::clause::coerce_clause_expr(
@@ -1274,7 +1545,7 @@ pub(crate) fn analyze_delete_with_outer_ctes(
         // RETURNING reads the deleted row as WHERE saw it, unless a rule
         // rewrites the statement or the target is a view.
         let keeps = rows_returned_as_is(snapshot, table_oid);
-        let facts = where_facts(
+        let (facts, all) = where_facts(
             expr::Ctx::new(&scope, &null_ctx, snapshot),
             where_clause,
             &log,
@@ -1284,6 +1555,16 @@ pub(crate) fn analyze_delete_with_outer_ctes(
             |_| keeps,
         );
         null_ctx.add_where_facts(facts);
+        old_facts = Some(all);
+    }
+    // A deleted row is a stored row past WHERE: its CHECK constraints and
+    // generated columns hold too.
+    if has_returning(&del.returning_clause)
+        && let Some(wt) = WriteTarget::resolve(snapshot, table_oid)
+    {
+        let old_nn = wt.row_not_null(snapshot, &old_row_knowledge(&wt, old_facts.as_ref(), alias));
+        prove_columns(&mut null_ctx, alias, &old_nn);
+        rows.old_proven.extend(old_nn);
     }
 
     let columns = resolve_returning(
@@ -1366,7 +1647,7 @@ pub(crate) fn with_written_target(
     if let Some(target) = scope.sources.iter_mut().find(|s| s.alias == alias) {
         for c in &mut target.columns {
             if let Some(a) = written.iter().find(|a| a.attname == c.name)
-                && !snapshot.attr_proven_not_null(a)
+                && !snapshot.attr_never_null(a)
             {
                 c.base_not_null = false;
             }
@@ -1379,7 +1660,8 @@ pub(crate) fn with_written_target(
 /// facts about the FROM / USING entries, and those about the target's
 /// columns `target_keeps` says the returned row still holds (and so NEW,
 /// `rows.new_proven`). Every target fact holds for OLD (`rows.old_proven`)
-/// when it is read as is (`old_as_is`).
+/// when it is read as is (`old_as_is`). Also returns every fact, as they
+/// hold of the old row.
 fn where_facts(
     ctx: expr::Ctx<'_>,
     where_clause: &protobuf::Node,
@@ -1388,9 +1670,10 @@ fn where_facts(
     rows: &mut ReturningRows,
     old_as_is: bool,
     target_keeps: impl Fn(&str) -> bool,
-) -> crate::nonnull::Facts {
-    let mut facts = crate::nonnull::nonnullable(where_clause, true, ctx.scope, log, ctx.snapshot)
+) -> (crate::nonnull::Facts, crate::nonnull::Facts) {
+    let all = crate::nonnull::nonnullable(where_clause, true, ctx.scope, log, ctx.snapshot)
         .restricted_to(&crate::nonnull::own_aliases(ctx.scope));
+    let mut facts = all.clone();
     if old_as_is {
         rows.old_proven = facts
             .columns
@@ -1399,23 +1682,42 @@ fn where_facts(
             .map(|(_, c)| c.clone())
             .collect();
     }
-    facts
-        .columns
-        .retain(|(a, c)| a != target_alias || target_keeps(c));
+    // Nothing the WHERE says of a column the new row doesn't keep holds
+    // for it: not that it is non-NULL, NULL or some constant, nor that it
+    // is one of several non-NULL ones.
+    let kept = |(a, c): &(String, String)| a != target_alias || target_keeps(c);
+    facts.columns.retain(kept);
+    facts.nulls.retain(kept);
+    facts.equals.retain(|c, _| kept(c));
+    facts.disjunctions.retain(|d| d.iter().all(kept));
     rows.new_proven = facts
         .columns
         .iter()
         .filter(|(a, _)| a == target_alias)
         .map(|(_, c)| c.clone())
         .collect();
-    facts
+    (facts, all)
+}
+
+/// What an UPDATE's or DELETE's RETURNING knows of the old rows of `wt`
+/// past WHERE facts `old` (every fact the WHERE proves, `None` without
+/// WHERE): by base column.
+pub(crate) fn old_row_knowledge(
+    wt: &WriteTarget,
+    old: Option<&crate::nonnull::Facts>,
+    alias: &str,
+) -> RowKnowledge {
+    match old {
+        Some(f) => RowKnowledge::from_facts(f, alias, |c| wt.to_base.get(c).cloned()),
+        None => RowKnowledge::default(),
+    }
 }
 
 /// Whether nothing between an UPDATE's WHERE and its RETURNING rewrites
 /// the values of the columns it doesn't SET: the target is a plain table
 /// (no view, no partitions or inheritance children to move rows into),
 /// with no BEFORE ROW UPDATE trigger (which may change NEW) and no rule.
-fn update_keeps_values(snapshot: &PgCatalog, relid: crate::oid::PgClassOid) -> bool {
+pub(crate) fn update_keeps_values(snapshot: &PgCatalog, relid: crate::oid::PgClassOid) -> bool {
     let before_row_update = |t: &crate::ddl::triggers::Trigger| {
         t.row
             && t.timing & crate::ddl::triggers::TRIGGER_TYPE_BEFORE != 0
@@ -1437,7 +1739,7 @@ fn update_keeps_values(snapshot: &PgCatalog, relid: crate::oid::PgClassOid) -> b
 /// the WHERE saw them: the target is a table (partitioned or not; a
 /// trigger can't change OLD, a BEFORE DELETE one can only skip a row) and
 /// no rule rewrites the statement.
-fn rows_returned_as_is(snapshot: &PgCatalog, relid: crate::oid::PgClassOid) -> bool {
+pub(crate) fn rows_returned_as_is(snapshot: &PgCatalog, relid: crate::oid::PgClassOid) -> bool {
     snapshot.pg_class.get(&relid).is_some_and(|c| {
         matches!(
             c.relkind,

@@ -65,7 +65,8 @@ fn insert_old_row_is_null() {
             cn("w", text()),
             c("id", int4()),
             c("v", int4()),
-            cn("w", text()),
+            // The inserted 'b'.
+            c("w", text()),
         ],
     );
 }
@@ -110,7 +111,15 @@ fn whole_row_old_and_new() {
         &s,
         vec![
             cn("old", t_row()),
-            c("new", t_row()),
+            // The inserted row, 'b' in `w`.
+            c(
+                "new",
+                composite(
+                    "public",
+                    "t",
+                    vec![rf("id", int4()), rf("v", int4()), rf("w", text())],
+                ),
+            ),
             cn("v", int4()),
             c("?column?", bool_ty()),
         ],

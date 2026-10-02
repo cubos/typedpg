@@ -276,10 +276,34 @@ A referenced table under row-level security doesn't count: its policies may
 hide the row.
 
 Only strict conditions count: `coalesce(age, 0) > 0`, `age IS DISTINCT FROM 5`
-or an `OR` whose arms test different columns prove nothing. `UPDATE` and
-`DELETE ... RETURNING` keep what their `WHERE` proved for the rows they return,
-except in columns the `UPDATE` sets or that a trigger, a rule or a generated
-column may rewrite.
+or an `OR` whose arms test different columns prove nothing.
+
+A generated column (STORED or VIRTUAL) is its expression over the row, so
+`GENERATED ALWAYS AS (coalesce(note, ''))` is never NULL. A view that is
+automatically updatable reads its base table's CHECK constraints.
+
+`RETURNING` knows what the statement wrote. An `INSERT` returns its values
+and the column defaults; an `UPDATE` returns its `SET` values and whatever
+its `WHERE` proved about the columns it keeps. `ON CONFLICT DO UPDATE`
+returns the inserted row or the updated one, and `MERGE` one row per action
+it runs, past its `WHEN` condition. Every returned row satisfies the table's
+CHECK constraints. An automatically updatable view writes its base table's
+rows. A BEFORE ROW trigger, a rule or an INSTEAD OF trigger may rewrite the
+row, so the values aren't trusted there (only the constraints are):
+
+```rust
+// DEFAULT 'draft', and a SET of a non-NULL value
+let row = sql!(pool, "INSERT INTO posts (title) VALUES ($t) RETURNING status", t = "Hi")
+    .fetch_one().await?;
+// row.status : String
+let rows = sql!(pool, "UPDATE users SET age = 18 WHERE age IS NULL RETURNING age")
+    .fetch_all().await?;
+// rows[0].age : i32
+```
+
+A data-modifying CTE that inserts one `VALUES` row (without `ON CONFLICT DO
+NOTHING`, a `DO UPDATE ... WHERE` or a BEFORE ROW trigger, which may skip it)
+returns exactly one row, so `(SELECT id FROM ins)` is that row's `id`.
 
 ### Nullability annotations
 

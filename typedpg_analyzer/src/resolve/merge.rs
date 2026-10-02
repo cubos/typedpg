@@ -165,10 +165,11 @@ pub(crate) fn analyze_merge_with_outer_ctes(
         .shadowed_sources
         .extend(target_scope.sources.iter().cloned());
 
+    let on_log = crate::nonnull::StrictLog::default();
     if let Some(join_condition) = &merge.join_condition {
         expr::infer_expr(
             join_condition,
-            expr::Ctx::new(&both, &null_ctx, snapshot),
+            expr::Ctx::new(&both, &null_ctx, snapshot).logging_strictness(&on_log),
             params,
             TypeGoal::assignment(oid::BOOL),
         )?;
@@ -179,6 +180,8 @@ pub(crate) fn analyze_merge_with_outer_ctes(
 
     let mut source_may_be_null = false;
     let mut rows = ReturningRows::default();
+    // What each WHEN clause's condition proves, where its action runs.
+    let mut when_facts: Vec<crate::nonnull::Facts> = Vec::new();
     for when_node in &merge.merge_when_clauses {
         if let Some(node::Node::MergeWhenClause(when)) = when_node.node.as_ref() {
             // An INSERT action returns a row with no old version, a DELETE
@@ -199,13 +202,20 @@ pub(crate) fn analyze_merge_with_outer_ctes(
                 Ok(protobuf::MergeMatchKind::MergeWhenNotMatchedByTarget) => &source_only,
                 _ => &both,
             };
+            let log = crate::nonnull::StrictLog::default();
             walk_merge_when_clause(
                 when,
                 expr::Ctx::new(when_scope, &null_ctx, snapshot),
+                &log,
                 params,
                 &table_attrs,
                 &table_relname,
             )?;
+            when_facts.push(match &when.condition {
+                Some(c) => crate::nonnull::nonnullable(c, true, when_scope, &log, snapshot)
+                    .restricted_to(&crate::nonnull::own_aliases(when_scope)),
+                None => crate::nonnull::Facts::default(),
+            });
         }
     }
 
@@ -216,6 +226,47 @@ pub(crate) fn analyze_merge_with_outer_ctes(
     let mut ret_null_ctx = null_ctx.clone();
     if source_may_be_null {
         ret_null_ctx.mark_all_nullable(&nullability::collect_aliases(&source_scope.sources));
+    }
+    if has_returning(&merge.returning_clause)
+        && let Some(wt) = WriteTarget::resolve(snapshot, table_oid)
+    {
+        let on_facts = merge
+            .join_condition
+            .as_deref()
+            .map(|c| {
+                crate::nonnull::nonnullable(c, true, &both, &on_log, snapshot)
+                    .restricted_to(&crate::nonnull::own_aliases(&both))
+            })
+            .unwrap_or_default();
+        let arms = MergeArms {
+            merge,
+            wt: &wt,
+            target_alias: &target_alias,
+            table_attrs: &table_attrs,
+            both: &both,
+            source_only: &source_only,
+            null_ctx: &null_ctx,
+            on_facts: &on_facts,
+            when_facts: &when_facts,
+            snapshot,
+        };
+        let known = arms.returned(params);
+        prove_columns(&mut ret_null_ctx, &target_alias, &known.target);
+        rows.old_proven.extend(known.old);
+        rows.new_proven.extend(known.new);
+        if !source_may_be_null {
+            let source_aliases = crate::nonnull::own_aliases(&source_scope);
+            let facts = known
+                .source
+                .iter()
+                .filter(|(a, _)| source_aliases.contains(a))
+                .fold(crate::nonnull::Facts::default(), |acc, (a, c)| {
+                    acc.union(crate::nonnull::Facts::column(a, c))
+                });
+            if !facts.is_empty() {
+                ret_null_ctx.add_where_facts(facts);
+            }
+        }
     }
     // Rows inserted or updated through a view are not the view's rows.
     let both =
@@ -305,6 +356,7 @@ pub(crate) fn analyze_merge_with_outer_ctes(
 fn walk_merge_when_clause(
     when: &protobuf::MergeWhenClause,
     ctx: Ctx<'_>,
+    log: &crate::nonnull::StrictLog,
     params: &mut ParamCollector,
     table_attrs: &[crate::pg_catalog::PgAttribute],
     table_relname: &str,
@@ -314,7 +366,7 @@ fn walk_merge_when_clause(
         // "WHEN").
         crate::clause::coerce_clause_expr(
             condition,
-            ctx,
+            ctx.logging_strictness(log),
             params,
             crate::clause::ClauseKind::MergeWhen,
         )?;
@@ -505,5 +557,196 @@ fn from_item_refname(item: &protobuf::Node) -> Option<String> {
         node::Node::JsonTable(jt) => alias(&jt.alias).or_else(|| Some("json_table".into())),
         node::Node::RangeTableSample(ts) => from_item_refname(ts.relation.as_deref()?),
         _ => None,
+    }
+}
+
+/// What MERGE RETURNING knows of the rows its actions return: one row per
+/// executed INSERT / UPDATE / DELETE action (ExecMergeMatched /
+/// ExecMergeNotMatched), each where its WHEN condition — and, for a
+/// MATCHED one, the ON condition — held. What is known of every returned
+/// row is what every action that returns one knows.
+struct MergeArms<'a> {
+    merge: &'a protobuf::MergeStmt,
+    wt: &'a WriteTarget,
+    target_alias: &'a str,
+    table_attrs: &'a [crate::pg_catalog::PgAttribute],
+    both: &'a Scope,
+    source_only: &'a Scope,
+    null_ctx: &'a NullabilityContext,
+    on_facts: &'a crate::nonnull::Facts,
+    when_facts: &'a [crate::nonnull::Facts],
+    snapshot: &'a PgCatalog,
+}
+
+/// What every row a MERGE returns is known to hold.
+#[derive(Default)]
+struct MergeKnown {
+    /// The target columns (the new row, a DELETE's old one) proven
+    /// non-NULL.
+    target: std::collections::HashSet<String>,
+    /// OLD's and NEW's, over the actions that have one.
+    old: std::collections::HashSet<String>,
+    new: std::collections::HashSet<String>,
+    /// The source columns proven non-NULL.
+    source: std::collections::HashSet<(String, String)>,
+}
+
+impl MergeArms<'_> {
+    fn returned(&self, params: &mut ParamCollector) -> MergeKnown {
+        type Set = std::collections::HashSet<String>;
+        let meet = |acc: &mut Option<Set>, s: &Set| match acc {
+            Some(a) => a.retain(|c| s.contains(c)),
+            None => *acc = Some(s.clone()),
+        };
+        let (mut target, mut old, mut new): (Option<Set>, Option<Set>, Option<Set>) =
+            (None, None, None);
+        let mut source: Option<std::collections::HashSet<(String, String)>> = None;
+        let whens = self
+            .merge
+            .merge_when_clauses
+            .iter()
+            .filter_map(|n| match n.node.as_ref() {
+                Some(node::Node::MergeWhenClause(w)) => Some(w.as_ref()),
+                _ => None,
+            });
+        for (when, when_facts) in whens.zip(self.when_facts) {
+            let cmd = CmdType::try_from(when.command_type).unwrap_or(CmdType::Undefined);
+            if !matches!(
+                cmd,
+                CmdType::CmdInsert | CmdType::CmdUpdate | CmdType::CmdDelete
+            ) {
+                continue;
+            }
+            let kind = protobuf::MergeMatchKind::try_from(when.match_kind)
+                .unwrap_or(protobuf::MergeMatchKind::MergeWhenMatched);
+            let facts = match kind {
+                protobuf::MergeMatchKind::MergeWhenMatched => {
+                    self.on_facts.clone().union(when_facts.clone())
+                }
+                _ => when_facts.clone(),
+            };
+            let source_cols: std::collections::HashSet<(String, String)> = match kind {
+                protobuf::MergeMatchKind::MergeWhenNotMatchedBySource => Default::default(),
+                _ => facts
+                    .columns
+                    .iter()
+                    .filter(|(a, _)| a != self.target_alias)
+                    .cloned()
+                    .collect(),
+            };
+            match &mut source {
+                Some(s) => s.retain(|c| source_cols.contains(c)),
+                None => source = Some(source_cols),
+            }
+            if cmd == CmdType::CmdInsert {
+                let k = if self.wt.insert_keeps(self.snapshot) {
+                    self.inserted(when, &facts, params)
+                } else {
+                    RowKnowledge::default()
+                };
+                let nn = self.wt.row_not_null(self.snapshot, &k);
+                meet(&mut target, &nn);
+                meet(&mut new, &nn);
+                continue;
+            }
+            let old_k = old_row_knowledge(self.wt, Some(&facts), self.target_alias);
+            let old_nn = self.wt.row_not_null(self.snapshot, &old_k);
+            meet(&mut old, &old_nn);
+            if cmd == CmdType::CmdDelete {
+                meet(&mut target, &old_nn);
+                continue;
+            }
+            let new_k = if self.wt.update_keeps(self.snapshot) {
+                let mut ctx = self.null_ctx.clone();
+                ctx.add_where_facts(facts.clone());
+                let set = set_values(
+                    &when.target_list,
+                    self.wt,
+                    self.table_attrs,
+                    expr::Ctx::new(self.both, &ctx, self.snapshot),
+                    params,
+                );
+                let mut k = old_k;
+                for a in self.snapshot.attributes_of(self.wt.base) {
+                    if a.attgenerated.is_some() {
+                        k.write(&a.attname, &ValueInfo::default());
+                    }
+                }
+                for a in set_list_assigns(&when.target_list) {
+                    if let Some(b) = self.wt.to_base.get(&a.column) {
+                        k.write(b, &set.get(&a.column).cloned().unwrap_or_default());
+                    }
+                }
+                k
+            } else {
+                RowKnowledge::default()
+            };
+            let new_nn = self.wt.row_not_null(self.snapshot, &new_k);
+            meet(&mut target, &new_nn);
+            meet(&mut new, &new_nn);
+        }
+        MergeKnown {
+            target: target.unwrap_or_default(),
+            old: old.unwrap_or_default(),
+            new: new.unwrap_or_default(),
+            source: source.unwrap_or_default(),
+        }
+    }
+
+    /// What an INSERT action stores: its values, evaluated over the source
+    /// row where `facts` hold, and the defaults.
+    fn inserted(
+        &self,
+        when: &protobuf::MergeWhenClause,
+        facts: &crate::nonnull::Facts,
+        params: &mut ParamCollector,
+    ) -> RowKnowledge {
+        let names: Vec<(String, bool)> = if when.target_list.is_empty() {
+            self.table_attrs
+                .iter()
+                .map(|a| (a.attname.clone(), false))
+                .collect()
+        } else {
+            when.target_list
+                .iter()
+                .filter_map(|t| match t.node.as_ref() {
+                    Some(node::Node::ResTarget(rt)) => {
+                        Some((rt.name.clone(), !rt.indirection.is_empty()))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let mut ctx = self.null_ctx.clone();
+        ctx.add_where_facts(facts.clone());
+        let mut scratch = params.clone();
+        let mut row = Vec::new();
+        for ((name, indirected), val) in names.iter().zip(&when.values) {
+            let Some(attr) = self.table_attrs.iter().find(|a| &a.attname == name) else {
+                continue;
+            };
+            let info = if is_set_to_default(val) {
+                None
+            } else if *indirected {
+                Some(ValueInfo::default())
+            } else {
+                let goal = TypeGoal::assignment(attr.atttypid).with_typmod(
+                    self.snapshot
+                        .effective_typmod(attr.atttypid, attr.atttypmod),
+                );
+                match expr::infer_expr(
+                    val,
+                    expr::Ctx::new(self.source_only, &ctx, self.snapshot),
+                    &mut scratch,
+                    goal,
+                ) {
+                    Ok(t) => Some(ValueInfo::of(val, t.nullable, attr.atttypid, self.snapshot)),
+                    Err(_) => Some(ValueInfo::default()),
+                }
+            };
+            row.push((name.clone(), info));
+        }
+        params.absorb_non_null_reads(&scratch);
+        inserted_rows_knowledge(self.snapshot, self.wt, &[row])
     }
 }

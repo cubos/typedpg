@@ -131,11 +131,7 @@ async fn enums_domains_and_their_arrays_round_trip() {
     assert_eq!(first.prefs, Some(vec![pref("a"), pref("b")]));
     assert_eq!(first.tags, ["x", "y"]);
     assert_eq!(first.amount, Some(Decimal::new(1234, 2)));
-    assert_eq!(
-        first.doubled,
-        Some(id1 * 2),
-        "generated columns are computed"
-    );
+    assert_eq!(first.doubled, id1 * 2, "generated columns are computed");
     let second = &back[1];
     assert_eq!(
         (second.status, second.pref.clone(), second.prefs.clone()),

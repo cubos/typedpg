@@ -1,7 +1,8 @@
 //! PostgreSQL 18's virtual generated columns (`GENERATED ALWAYS AS (expr)
 //! [VIRTUAL]`, the default without STORED) on the query side. Expectations
 //! were observed on a live PostgreSQL 18: a virtual column reads like any
-//! column — its declared type, typmod and NOT NULL — and, like a stored
+//! column — its declared type, typmod and NOT NULL (or its expression
+//! over the row, when that can't be NULL) — and, like a stored
 //! one, can only be written as DEFAULT.
 
 use crate::common::*;
@@ -29,8 +30,8 @@ fn reading_virtual_columns() {
     assert_cols(
         &s,
         vec![
-            cn("b", numeric_ps(6, 2)),
-            cn("e", varchar_n(3)),
+            c("b", numeric_ps(6, 2)),
+            c("e", varchar_n(3)),
             c("n", int4()),
         ],
     );
@@ -45,8 +46,8 @@ fn returning_virtual_columns() {
     assert_cols(
         &s,
         vec![
-            cn("b", numeric_ps(6, 2)),
-            cn("e", varchar_n(3)),
+            c("b", numeric_ps(6, 2)),
+            c("e", varchar_n(3)),
             cn("ob", numeric_ps(6, 2)),
             c("nn", int4()),
         ],
@@ -56,7 +57,7 @@ fn returning_virtual_columns() {
         .unwrap();
     assert_cols(
         &s,
-        vec![cn("ob", numeric_ps(6, 2)), cn("nb", numeric_ps(6, 2))],
+        vec![c("ob", numeric_ps(6, 2)), c("nb", numeric_ps(6, 2))],
     );
 }
 
