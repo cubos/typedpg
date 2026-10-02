@@ -127,11 +127,19 @@ new disagreements automatically.
 **Nullability soundness.** Describe says nothing about nullability, so the
 mirror also *executes* every accepted query, in a rolled-back transaction,
 over adversarial rows it seeds into every table (NULL in each nullable
-column, a second fully-filled row, foreign keys leaving parents unmatched)
+column, a second fully-filled row, foreign keys leaving parents unmatched,
+then rows mixing NULL and filled columns so each side of a CHECK tying
+columns together has one)
 and fails if a value inferred NOT NULL — a column, a `Some(false)` array
 element, a non-nullable record field — comes back NULL
 (`typedpg_analyzer/src/pg_sanity/soundness.rs`). A divergence there is a
 soundness bug in the analyzer: fix the inference, never the expectation.
+
+**Declared constraints are trusted.** Nullability inference may rely on
+what the schema states — a foreign key's referenced row exists, a CHECK
+holds for every row — including `NOT VALID` and deferrable constraints;
+only `NOT ENFORCED` ones are ignored. Row security on a referenced table
+(which can hide the row) is the exception.
 
 **Error-message contract — single-error fidelity only.** When the analyzer
 rejects a query, its message must *start with* PG's server-side message

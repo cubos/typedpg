@@ -22,6 +22,8 @@ mod assignments;
 mod call;
 #[path = "query/casts_and_coercion.rs"]
 mod casts_and_coercion;
+#[path = "query/constraint_narrowing.rs"]
+mod constraint_narrowing;
 #[path = "query/copy_in.rs"]
 mod copy_in;
 #[path = "query/cte_rules.rs"]

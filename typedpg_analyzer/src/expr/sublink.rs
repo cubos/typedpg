@@ -113,10 +113,21 @@ pub(crate) fn infer_sublink(
                         joined
                     }
                 };
+                // `x op ANY (SELECT …)` is NULL or FALSE for a NULL `x` when
+                // every comparison is strict (a row's `=` is an AND of its
+                // fields' comparisons, never TRUE with a NULL field).
+                let mut strict = sub_type == protobuf::SubLinkType::AnySublink
+                    && (lhs_row.is_none() || op_name == "=");
                 for (lhs_node, col) in lhs_nodes.iter().zip(cols.iter()) {
                     let lhs = infer_expr(lhs_node, ctx, params, TypeGoal::NONE)?;
                     let l_oid = lhs.type_oid;
                     let r_oid = col.type_oid;
+                    match snapshot.find_operator(&op_name, Some(l_oid), r_oid) {
+                        Some(op) if l_oid != oid::UNKNOWN && r_oid != oid::UNKNOWN => {
+                            strict &= ctx.proc_is_strict(op.code);
+                        }
+                        _ => strict = false,
+                    }
                     // An UNKNOWN side (bare literal / unpinned param) is coerced
                     // by PG to its peer — pin params and skip the rejection.
                     if l_oid == oid::UNKNOWN {
@@ -152,6 +163,7 @@ pub(crate) fn infer_sublink(
                         .finalize_implicit());
                     }
                 }
+                ctx.note_strict(sub.location, crate::nonnull::StrictNode::Sublink, strict);
             }
             Ok(ExprType::scalar(oid::BOOL, true))
         }

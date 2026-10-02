@@ -113,6 +113,8 @@ fn strict_comparisons_narrow_their_operands() {
         "(age > 0) IS NOT UNKNOWN",
         "NOT (age > 0)",
         "age > 0 OR age < -1",
+        "num_nulls(age) = 0",
+        "num_nonnulls(age) > 0",
         "(age > 0 AND email = 'a') OR age < -1",
     ] {
         assert_nullable(
@@ -147,7 +149,6 @@ fn quals_that_hold_for_null_prove_nothing() {
         // Not strict.
         "coalesce(age, 0) > 0",
         "age IS DISTINCT FROM 5",
-        "num_nulls(age) = 0",
         "is_pos_lax(age)",
         "age === 1",
         "CASE WHEN age > 0 THEN true ELSE true END",
@@ -614,7 +615,7 @@ fn using_joins() {
     assert_nullable(
         &db,
         "SELECT k, ka.k AS ak, kb.k AS bk FROM ka LEFT JOIN kb USING (k) WHERE kb.y > 0",
-        &[("k", true), ("ak", false), ("bk", false)],
+        &[("k", false), ("ak", false), ("bk", false)],
     );
     assert_nullable(
         &db,

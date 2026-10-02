@@ -279,7 +279,7 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
         check_no_srf_in_clause(where_clause, snapshot, "WHERE")?;
         // What the rows past WHERE have non-NULL — read by everything
         // evaluated after it, and reducing outer joins PG would reduce.
-        let facts = crate::nonnull::nonnullable(where_clause, true, &scope, &log)
+        let facts = crate::nonnull::nonnullable(where_clause, true, &scope, &log, snapshot)
             .restricted_to(&crate::nonnull::own_aliases(&scope));
         null_ctx.add_where_facts(facts);
     }
@@ -331,9 +331,10 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
         // A grouped column HAVING proves non-NULL is so in every group
         // left — the groups' rows share it — even one a grouping set
         // omits (those groups are the ones HAVING drops).
-        let facts = crate::nonnull::nonnullable(having, true, &scope, &log)
+        let facts = crate::nonnull::nonnullable(having, true, &scope, &log, snapshot)
             .restricted_to(&crate::nonnull::own_aliases(&scope));
         null_ctx.add_local_facts(facts);
+        null_ctx.input_not_empty = having_requires_rows(having);
     }
 
     // Process ORDER BY expressions. Sort items are wrapped in `SortBy` nodes
@@ -1608,4 +1609,74 @@ fn check_distinct_on_matches_order_by(
         return Err(err());
     }
     Ok(())
+}
+
+/// Whether HAVING is FALSE over an empty input: some conjunct needs a
+/// `count(…)` of at least one (`count(*) > 0`, `count(x) >= 1`, …) —
+/// without GROUP BY, the query then has rows only when its input does.
+fn having_requires_rows(having: &protobuf::Node) -> bool {
+    match having.node.as_ref() {
+        Some(node::Node::BoolExpr(b))
+            if protobuf::BoolExprType::try_from(b.boolop)
+                == Ok(protobuf::BoolExprType::AndExpr) =>
+        {
+            b.args.iter().any(having_requires_rows)
+        }
+        Some(node::Node::AExpr(e))
+            if protobuf::AExprKind::try_from(e.kind) == Ok(protobuf::AExprKind::AexprOp) =>
+        {
+            let is_count = |n: Option<&protobuf::Node>| {
+                matches!(
+                    n.and_then(|n| n.node.as_ref()),
+                    Some(node::Node::FuncCall(fc))
+                        if fc.agg_filter.is_none()
+                            && fc.over.is_none()
+                            && matches!(
+                                expr::extract_string_fields(&fc.funcname)
+                                    .iter()
+                                    .map(String::as_str)
+                                    .collect::<Vec<_>>()
+                                    .as_slice(),
+                                ["count"] | ["pg_catalog", "count"]
+                            )
+                )
+            };
+            let int = |n: Option<&protobuf::Node>| {
+                n.and_then(crate::nonnull::literal)
+                    .filter(|l| l.is_integer())
+                    .and_then(|l| l.text.parse::<i64>().ok())
+            };
+            let op = expr::extract_string_fields(&e.name).join(".");
+            let (l, r) = (e.lexpr.as_deref(), e.rexpr.as_deref());
+            // `count(...) op n`, or flipped.
+            let (op, n) = if is_count(l) {
+                match int(r) {
+                    Some(n) => (op.as_str(), n),
+                    None => return false,
+                }
+            } else if is_count(r) {
+                let flipped = match op.as_str() {
+                    "<" => ">",
+                    ">" => "<",
+                    "<=" => ">=",
+                    ">=" => "<=",
+                    other => other,
+                };
+                match int(l) {
+                    Some(n) => (flipped, n),
+                    None => return false,
+                }
+            } else {
+                return false;
+            };
+            // Over an empty input the count is 0.
+            match op {
+                ">" => n >= 0,
+                ">=" | "=" => n >= 1,
+                "<>" => n == 0,
+                _ => false,
+            }
+        }
+        _ => false,
+    }
 }

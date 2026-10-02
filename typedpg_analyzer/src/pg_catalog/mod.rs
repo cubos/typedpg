@@ -287,6 +287,10 @@ pub struct PgCatalog {
     pub(crate) view_updatability: Shared<HashMap<PgClassOid, crate::ddl::views::ViewUpdatability>>,
     /// `pg_class.reloftype` of typed tables (`CREATE TABLE ... OF type`).
     pub(crate) typed_tables: Shared<HashMap<PgClassOid, PgTypeOid>>,
+    /// Tables with row-level security enabled (`relrowsecurity`): their
+    /// policies may hide rows, so a foreign key into one doesn't promise
+    /// the referenced row is visible.
+    pub(crate) row_security: Shared<std::collections::HashSet<PgClassOid>>,
     /// The `indisclustered` index of each table (CLUSTER ... USING,
     /// ALTER TABLE ... CLUSTER ON).
     pub(crate) clustered_indexes: Shared<HashMap<PgClassOid, PgClassOid>>,
@@ -656,6 +660,7 @@ impl PgCatalog {
             policies: Shared::default(),
             rules: Shared::default(),
             typed_tables: Shared::default(),
+            row_security: Shared::default(),
             clustered_indexes: Shared::default(),
             statistics: Shared::default(),
             index_access_methods: Shared::default(),
@@ -1435,6 +1440,7 @@ impl PgCatalog {
         self.rules.remove(&oid);
         self.view_updatability.remove(&oid);
         self.typed_tables.remove(&oid);
+        self.row_security.remove(&oid);
         self.clustered_indexes.remove(&oid);
         self.clustered_indexes.retain(|_, index| *index != oid);
         self.statistics.retain(|s| s.relid != oid);

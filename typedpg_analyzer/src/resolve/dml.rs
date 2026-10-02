@@ -1133,8 +1133,8 @@ pub(crate) fn analyze_update_with_outer_ctes(
         let keeps = update_keeps_values(snapshot, table_oid);
         let old_as_is = rows_returned_as_is(snapshot, table_oid);
         let facts = where_facts(
+            expr::Ctx::new(&scope, &null_ctx, snapshot),
             where_clause,
-            &scope,
             &log,
             alias,
             &mut rows,
@@ -1274,9 +1274,15 @@ pub(crate) fn analyze_delete_with_outer_ctes(
         // RETURNING reads the deleted row as WHERE saw it, unless a rule
         // rewrites the statement or the target is a view.
         let keeps = rows_returned_as_is(snapshot, table_oid);
-        let facts = where_facts(where_clause, &scope, &log, alias, &mut rows, keeps, |_| {
-            keeps
-        });
+        let facts = where_facts(
+            expr::Ctx::new(&scope, &null_ctx, snapshot),
+            where_clause,
+            &log,
+            alias,
+            &mut rows,
+            keeps,
+            |_| keeps,
+        );
         null_ctx.add_where_facts(facts);
     }
 
@@ -1375,16 +1381,16 @@ pub(crate) fn with_written_target(
 /// `rows.new_proven`). Every target fact holds for OLD (`rows.old_proven`)
 /// when it is read as is (`old_as_is`).
 fn where_facts(
+    ctx: expr::Ctx<'_>,
     where_clause: &protobuf::Node,
-    scope: &Scope,
     log: &crate::nonnull::StrictLog,
     target_alias: &str,
     rows: &mut ReturningRows,
     old_as_is: bool,
     target_keeps: impl Fn(&str) -> bool,
 ) -> crate::nonnull::Facts {
-    let mut facts = crate::nonnull::nonnullable(where_clause, true, scope, log)
-        .restricted_to(&crate::nonnull::own_aliases(scope));
+    let mut facts = crate::nonnull::nonnullable(where_clause, true, ctx.scope, log, ctx.snapshot)
+        .restricted_to(&crate::nonnull::own_aliases(ctx.scope));
     if old_as_is {
         rows.old_proven = facts
             .columns
