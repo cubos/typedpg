@@ -513,6 +513,43 @@ impl NullabilityContext {
         out
     }
 
+    /// Whether some grouping set leaves out a grouped expression (not a
+    /// plain column): see [`crate::grouping::expr_key`].
+    pub fn grouping_omits_exprs(&self) -> bool {
+        !self.grouping_omitted.is_empty()
+            && self
+                .grouping_omitted
+                .iter()
+                .any(|(a, _)| a == crate::grouping::EXPR_KEY)
+    }
+
+    /// Set the columns some grouping set leaves out — with, for each, the
+    /// columns that are the same value: a `JOIN USING` merged column and
+    /// its constituents, an aliased join's column and the one inside.
+    pub fn set_grouping_omitted(&mut self, omitted: HashSet<Col>) {
+        let mut all = omitted.clone();
+        for c in &omitted {
+            if let Some(m) = self.merged.get(c) {
+                all.insert(m.left.0.clone());
+                all.insert(m.right.0.clone());
+            }
+            if let Some((inner, _)) = self.aliased.get(c) {
+                all.insert(inner.clone());
+            }
+        }
+        for (col, m) in &self.merged {
+            if omitted.contains(&m.left.0) || omitted.contains(&m.right.0) {
+                all.insert(col.clone());
+            }
+        }
+        for (col, (inner, _)) in &self.aliased {
+            if omitted.contains(inner) {
+                all.insert(col.clone());
+            }
+        }
+        self.grouping_omitted = all;
+    }
+
     /// Whether at least one of `cols` is known non-NULL where the value is
     /// read: what COALESCE / GREATEST / LEAST over them needs to be.
     pub fn some_non_null(&self, cols: &[Col]) -> bool {

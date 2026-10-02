@@ -115,7 +115,7 @@ fn drop_each(
                 drop_schema(interp, obj_node, stmt.missing_ok, cascade)?;
             }
             ObjectType::ObjectIndex => {
-                drop_index(interp, obj_node, stmt.missing_ok)?;
+                drop_index(interp, obj_node, stmt.missing_ok, cascade)?;
             }
             ObjectType::ObjectTrigger => {
                 super::triggers::drop_trigger(interp, obj_node, stmt.missing_ok)?;
@@ -663,6 +663,7 @@ fn drop_index(
     interp: &mut PgCatalog,
     obj_node: &typedpg_pg_query::protobuf::Node,
     missing_ok: bool,
+    cascade: bool,
 ) -> Result<(), DdlError> {
     let names = match obj_node.node.as_ref() {
         Some(node::Node::List(list)) => &list.items,
@@ -731,6 +732,47 @@ fn drop_index(
             "cannot drop index {name} because constraint {name} on table {table_name} requires \
              it (You can drop constraint {name} on table {table_name} instead.)"
         )));
+    }
+    // A foreign key referencing the index's columns depends on it.
+    if let Some(index) = interp.pg_index.get(&class_oid).cloned()
+        && index.indisunique
+        && index.indpred.is_none()
+        && index.indexprs.is_empty()
+    {
+        let key: std::collections::BTreeSet<i16> = index.indkey
+            [..(index.indnkeyatts.max(0) as usize).min(index.indkey.len())]
+            .iter()
+            .copied()
+            .collect();
+        let fks = crate::ddl::tables::foreign_keys::fks_relying_on(
+            interp,
+            index.indrelid,
+            &key,
+            class_oid,
+        );
+        if let Some(&first) = fks.first() {
+            if !cascade {
+                let fk = interp.pg_constraint.get(&first).cloned();
+                let detail = fk.map(|c| {
+                    format!(
+                        " (constraint {} on table {} depends on index {name})",
+                        c.conname,
+                        interp
+                            .pg_class
+                            .get(&c.conrelid)
+                            .map(|r| r.relname.clone())
+                            .unwrap_or_default()
+                    )
+                });
+                return Err(DdlError::DependencyError(format!(
+                    "cannot drop index {name} because other objects depend on it{}",
+                    detail.unwrap_or_default()
+                )));
+            }
+            for fk in fks {
+                crate::ddl::tables::foreign_keys::drop_fk_cascaded(interp, fk);
+            }
+        }
     }
     for child in crate::ddl::tables::partidx::child_indexes(interp, class_oid) {
         interp.remove_pg_index(child);

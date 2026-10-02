@@ -829,6 +829,68 @@ pub(super) fn detach_fks(interp: &mut PgCatalog, parent: PgClassOid, part: PgCla
 
 /// A partitioned table's foreign key goes with the clones in its
 /// partitions (their DEPENDENCY_INTERNAL on it).
+/// The foreign keys that go with unique index `index` of `relid` over
+/// columns `key` (PG's FK depends on its referenced index): those
+/// referencing exactly `key` — unless another unique index or constraint
+/// of `relid` (non-partial, no expressions) covers the same columns.
+pub(crate) fn fks_relying_on(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+    key: &std::collections::BTreeSet<i16>,
+    index: PgClassOid,
+) -> Vec<PgConstraintOid> {
+    let covers = |i: &crate::pg_catalog::PgIndex| {
+        i.indrelid == relid
+            && i.indisunique
+            && i.indpred.is_none()
+            && i.indexprs.is_empty()
+            && i.indkey[..(i.indnkeyatts.max(0) as usize).min(i.indkey.len())]
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                == *key
+    };
+    if interp
+        .pg_index
+        .values()
+        .any(|i| i.indexrelid != index && covers(i))
+    {
+        return Vec::new();
+    }
+    let mut fks: Vec<PgConstraintOid> = interp
+        .pg_constraint
+        .values()
+        .filter(|c| {
+            c.contype == ConType::ForeignKey
+                && c.confrelid == Some(relid)
+                && c.confkey
+                    .iter()
+                    .copied()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    == *key
+                && interp
+                    .fk_details
+                    .get(&c.oid)
+                    .is_none_or(|d| d.parent.is_none())
+        })
+        .map(|c| c.oid)
+        .collect();
+    fks.sort();
+    fks
+}
+
+/// Drop foreign key `con` (and its clones), as a CASCADE through what it
+/// depends on does; views over its tables have their nullability derived
+/// again.
+pub(crate) fn drop_fk_cascaded(interp: &mut PgCatalog, con: PgConstraintOid) {
+    let Some(row) = interp.pg_constraint.remove(&con) else {
+        return;
+    };
+    interp.fk_details.remove(&con);
+    drop_fk_clones(interp, con);
+    crate::ddl::views::refresh_dependent_view_nullability(interp, row.conrelid, true);
+}
+
 pub(crate) fn drop_fk_clones(interp: &mut PgCatalog, con: PgConstraintOid) {
     for clone in fk_clones(interp, con) {
         drop_fk_clones(interp, clone);

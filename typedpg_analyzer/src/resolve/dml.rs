@@ -1366,7 +1366,7 @@ pub(crate) fn with_written_target(
     if let Some(target) = scope.sources.iter_mut().find(|s| s.alias == alias) {
         for c in &mut target.columns {
             if let Some(a) = written.iter().find(|a| a.attname == c.name)
-                && !(snapshot.attr_proven_not_null(a) || snapshot.type_is_not_null(a.atttypid))
+                && !snapshot.attr_proven_not_null(a)
             {
                 c.base_not_null = false;
             }

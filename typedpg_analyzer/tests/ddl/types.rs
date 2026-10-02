@@ -295,36 +295,40 @@ fn create_domain_with_unknown_base_type_is_rejected() {
 
 // ── ALTER DOMAIN ────────────────────────────────────────────────────────────
 
+/// Whether the analyzer lets `INSERT INTO <table> (a) VALUES (NULL)` through:
+/// a NOT NULL domain rejects it. (A stored column of a NOT NULL domain reads
+/// as nullable either way: PG stores a NULL already of the domain type
+/// unchecked.)
+fn takes_null(db: &mut PgCatalog, table: &str) -> bool {
+    db.skip_pg_sanity();
+    db.analyze(&format!("INSERT INTO {table} (a) VALUES (NULL)"))
+        .is_ok()
+}
+
 #[test]
-fn alter_domain_drop_not_null_makes_columns_nullable() {
+fn alter_domain_drop_not_null_lets_null_in() {
     // PG 18: after DROP NOT NULL the domain's typnotnull is false.
-    let db = build_db(&[(
+    let mut db = build_db(&[(
         "0001.sql",
         "CREATE DOMAIN d AS int NOT NULL;
          CREATE TABLE t (a d);
          ALTER DOMAIN d DROP NOT NULL;",
     )]);
-    assert_cols(
-        &db.analyze("SELECT * FROM t").unwrap(),
-        vec![cn("a", domain("public", "d", int4()))],
-    );
+    assert!(takes_null(&mut db, "t"));
 }
 
 #[test]
 fn alter_domain_set_not_null_and_named_constraints() {
     // PG 18: SET NOT NULL / ADD CONSTRAINT nn NOT NULL set typnotnull;
     // DROP CONSTRAINT d_not_null (the generated name) clears it.
-    let db = build_db(&[(
+    let mut db = build_db(&[(
         "0001.sql",
         "CREATE DOMAIN d AS int;
          CREATE TABLE t (a d);
          ALTER DOMAIN d SET NOT NULL;",
     )]);
-    assert_cols(
-        &db.analyze("SELECT * FROM t").unwrap(),
-        vec![c("a", domain("public", "d", int4()))],
-    );
-    let db = build_db(&[(
+    assert!(!takes_null(&mut db, "t"));
+    let mut db = build_db(&[(
         "0001.sql",
         "CREATE DOMAIN d AS int NOT NULL;
          CREATE TABLE t (a d);
@@ -341,18 +345,9 @@ fn alter_domain_set_not_null_and_named_constraints() {
          ALTER DOMAIN d3 SET DEFAULT 1;
          ALTER DOMAIN d3 DROP DEFAULT;",
     )]);
-    assert_cols(
-        &db.analyze("SELECT a FROM t").unwrap(),
-        vec![cn("a", domain("public", "d", int4()))],
-    );
-    assert_cols(
-        &db.analyze("SELECT a FROM t2").unwrap(),
-        vec![cn("a", domain("public", "d2", int4()))],
-    );
-    assert_cols(
-        &db.analyze("SELECT a FROM t3").unwrap(),
-        vec![c("a", domain("public", "d3", int4()))],
-    );
+    assert!(takes_null(&mut db, "t"));
+    assert!(takes_null(&mut db, "t2"));
+    assert!(!takes_null(&mut db, "t3"));
 }
 
 #[test]

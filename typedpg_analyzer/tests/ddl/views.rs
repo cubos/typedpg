@@ -1285,9 +1285,9 @@ fn star_views_depend_on_every_expanded_column() {
 }
 
 #[test]
-fn not_null_domain_column_of_a_view_is_nullable_through_an_outer_join() {
-    // The domain's NOT NULL holds for u.b as stored; the view's LEFT JOIN
-    // still produces NULLs, for a view and a materialized view alike.
+fn not_null_domain_column_of_a_view_is_nullable() {
+    // The view's LEFT JOIN produces NULLs, for a view and a materialized
+    // view alike.
     let db = build(&[(
         "0001.sql",
         "CREATE DOMAIN d AS int NOT NULL;
@@ -1301,8 +1301,10 @@ fn not_null_domain_column_of_a_view_is_nullable_through_an_outer_join() {
         let q = db.analyze(&format!("SELECT b FROM {relation}")).unwrap();
         assert!(q.columns[0].nullable, "{relation}");
     }
+    // Even straight from the table: PG stores a NULL already of the domain
+    // type (an empty scalar subquery's) without checking it.
     let q = db.analyze("SELECT b FROM inner_v").unwrap();
-    assert!(!q.columns[0].nullable);
+    assert!(q.columns[0].nullable);
 }
 
 #[test]

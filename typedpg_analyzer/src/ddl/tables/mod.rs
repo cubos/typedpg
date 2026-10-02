@@ -1194,6 +1194,18 @@ fn apply_alter_cmd(
         }
     }
     apply_alter_subtype(interp, relid, cmd, rec, subtype)?;
+    // A view's nullability may rest on what this relaxes — a foreign key, a
+    // CHECK, a referenced table's rows all being visible, its triggers
+    // enforcing a foreign key: derive it again.
+    if matches!(
+        subtype,
+        AlterTableType::AtDropConstraint
+            | AlterTableType::AtAlterConstraint
+            | AlterTableType::AtEnableRowSecurity
+            | AlterTableType::AtDisableTrigAll
+    ) {
+        crate::ddl::views::refresh_dependent_view_nullability(interp, relid, true);
+    }
     for table in typed_dependents {
         let rec = inherit::Recursion {
             recurse: true,
@@ -1307,6 +1319,14 @@ fn apply_alter_subtype(
         }
         AlterTableType::AtDisableRowSecurity => {
             interp.row_security.remove(&relid);
+            Ok(())
+        }
+        AlterTableType::AtDisableTrigAll => {
+            interp.ri_triggers_disabled.insert(relid);
+            Ok(())
+        }
+        AlterTableType::AtEnableTrigAll => {
+            interp.ri_triggers_disabled.remove(&relid);
             Ok(())
         }
         AlterTableType::AtEnableTrig

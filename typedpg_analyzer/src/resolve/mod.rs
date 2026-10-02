@@ -407,9 +407,14 @@ fn analyze_raw_node_with(
     stmt: &node::Node,
     params: ParamCollector,
 ) -> Result<(Vec<RawColumn>, Vec<RawParam>), AnalyzeError> {
+    let locks = |n: typedpg_pg_query::NodeRef<'_>| matches!(n, typedpg_pg_query::NodeRef::SelectStmt(s) if !s.locking_clause.is_empty());
+    let locks = matches!(stmt, node::Node::SelectStmt(s) if !s.locking_clause.is_empty())
+        || stmt.nodes().into_iter().any(|(n, ..)| locks(n));
     let mut seeded = params;
     loop {
-        let (analysis, stale) = analyze_raw_node_once(snapshot, stmt, seeded.clone())?;
+        let (analysis, stale) = crate::nonnull::with_row_locking(locks, || {
+            analyze_raw_node_once(snapshot, stmt, seeded.clone())
+        })?;
         if stale.is_empty() {
             return Ok(analysis);
         }
@@ -934,6 +939,7 @@ pub(crate) use cte::*;
 pub(crate) use dml::*;
 pub(crate) use from::*;
 pub(crate) use merge::*;
+pub(crate) use predtest::unqualify as predtest_unqualify;
 pub(crate) use returning::*;
 pub(crate) use rewrite::*;
 pub(crate) use select::*;

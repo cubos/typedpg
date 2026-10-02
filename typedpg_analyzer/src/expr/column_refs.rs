@@ -244,8 +244,7 @@ fn whole_row_ref(
             let attrs = snapshot.attributes_of(relid);
             for field in &mut shape {
                 if let Some(a) = attrs.iter().find(|a| a.attname == field.name) {
-                    field.ty.nullable = !(snapshot.attr_proven_not_null(a)
-                        || snapshot.type_is_not_null(a.atttypid));
+                    field.ty.nullable = !snapshot.attr_proven_not_null(a);
                 }
             }
         }

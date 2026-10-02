@@ -45,6 +45,28 @@ fn disabled() -> bool {
     DISABLED.with(|d| d.get())
 }
 
+thread_local! {
+    /// The statement being analyzed locks rows (`FOR UPDATE` / `SHARE`).
+    static ROW_LOCKING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` noting whether the statement locks rows. Under READ COMMITTED a
+/// locked row that was updated concurrently is re-fetched and re-joined
+/// with the rows already read (EvalPlanQual): its WHERE is checked again,
+/// but a foreign key's cross-row promise isn't — its new key may reference
+/// a parent the statement's snapshot doesn't see.
+pub(crate) fn with_row_locking<R>(locks: bool, f: impl FnOnce() -> R) -> R {
+    let before = ROW_LOCKING.with(|d| d.replace(locks));
+    let out = f();
+    ROW_LOCKING.with(|d| d.set(before));
+    out
+}
+
+/// Whether the statement being analyzed locks rows.
+pub(crate) fn row_locking() -> bool {
+    ROW_LOCKING.with(|d| d.get())
+}
+
 /// Which kind of node a [`StrictLog`] entry is about (entries are keyed by
 /// the node's location; the kind keeps nodes of different kinds apart).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -660,7 +682,7 @@ pub(crate) fn plain_column(
     Some(((col.table_alias.clone(), col.name.clone()), col.type_oid))
 }
 
-/// A constant operand: a literal, possibly cast or collated.
+/// A bare constant operand.
 pub(crate) fn literal(n: &protobuf::Node) -> Option<Literal> {
     use typedpg_pg_query::protobuf::a_const::Val;
     match n.node.as_ref()? {
@@ -676,15 +698,34 @@ pub(crate) fn literal(n: &protobuf::Node) -> Option<Literal> {
             Val::Boolval(b) => Some(Literal::boolean(b.boolval)),
             _ => None,
         },
-        node::Node::TypeCast(tc) => literal(tc.arg.as_deref()?),
-        node::Node::CollateClause(cc) => literal(cc.arg.as_deref()?),
         _ => None,
+    }
+}
+
+/// A constant compared with a column of type `column_type`: a bare
+/// literal, or one cast to exactly the column's type. Not one cast to
+/// another type, nor under a COLLATE: the comparison would then be
+/// another type's or collation's (`'A'::citext`, a nondeterministic
+/// collation make `'A'` equal `'a'`), and its equality says nothing a
+/// CHECK on the column can use.
+pub(crate) fn literal_for(
+    n: &protobuf::Node,
+    column_type: crate::oid::PgTypeOid,
+    snapshot: &PgCatalog,
+) -> Option<Literal> {
+    match n.node.as_ref()? {
+        node::Node::TypeCast(tc) => {
+            let target = crate::ddl::util::resolve_type_name(tc.type_name.as_ref()?, snapshot)?;
+            (target == column_type)
+                .then(|| literal(tc.arg.as_deref()?))
+                .flatten()
+        }
+        _ => literal(n),
     }
 }
 
 /// `col = constant` (either way round), TRUE: the column equals it.
 fn comparison_facts(e: &protobuf::AExpr, scope: &Scope, snapshot: &PgCatalog) -> Facts {
-    let _ = snapshot;
     if crate::expr::extract_string_fields(&e.name).join(".") != "=" {
         return Facts::default();
     }
@@ -692,8 +733,8 @@ fn comparison_facts(e: &protobuf::AExpr, scope: &Scope, snapshot: &PgCatalog) ->
         return Facts::default();
     };
     let pair = match (plain_column(l, scope), plain_column(r, scope)) {
-        (Some((c, _)), None) => literal(r).map(|v| (c, v)),
-        (None, Some((c, _))) => literal(l).map(|v| (c, v)),
+        (Some((c, t)), None) => literal_for(r, t, snapshot).map(|v| (c, v)),
+        (None, Some((c, t))) => literal_for(l, t, snapshot).map(|v| (c, v)),
         _ => None,
     };
     let mut f = Facts::default();

@@ -257,7 +257,7 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
         params,
     );
     let expansion = grouping::expand_grouping_sets(&sel.group_clause, &scope, &targets);
-    null_ctx.grouping_omitted = expansion.omitted;
+    null_ctx.set_grouping_omitted(expansion.omitted);
     null_ctx.has_empty_grouping_set = expansion.has_empty_set;
 
     // Process WHERE clause — PG uses COERCION_ASSIGNMENT + BOOL goal, and
