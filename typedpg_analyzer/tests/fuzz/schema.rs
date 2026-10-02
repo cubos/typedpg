@@ -35,6 +35,18 @@ CREATE TABLE posts (
     rating       FLOAT8,
     published_at TIMESTAMPTZ
 );
+CREATE TABLE payments (
+    id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    user_id     BIGINT NOT NULL REFERENCES users(id),
+    reviewer_id BIGINT REFERENCES users(id),
+    method      TEXT NOT NULL,
+    card_last4  TEXT,
+    iban        TEXT,
+    CHECK ((method = 'a' AND card_last4 IS NOT NULL AND iban IS NULL)
+        OR (method = 'b' AND iban IS NOT NULL AND card_last4 IS NULL)
+        OR method NOT IN ('a', 'b')),
+    CHECK (num_nonnulls(card_last4, iban) <= 1)
+);
 ";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -160,6 +172,38 @@ pub(crate) const TABLES: &[Table] = &[
         ],
     },
 ];
+
+/// A table with foreign keys into `users` and CHECK constraints tying its
+/// columns together — only the narrowing generator queries it.
+pub(crate) const PAYMENTS: Table = Table {
+    name: "payments",
+    cols: &[
+        Col {
+            name: "id",
+            ty: Ty::BigInt,
+        },
+        Col {
+            name: "user_id",
+            ty: Ty::BigInt,
+        },
+        Col {
+            name: "reviewer_id",
+            ty: Ty::BigInt,
+        },
+        Col {
+            name: "method",
+            ty: Ty::Text,
+        },
+        Col {
+            name: "card_last4",
+            ty: Ty::Text,
+        },
+        Col {
+            name: "iban",
+            ty: Ty::Text,
+        },
+    ],
+};
 
 /// Every column name across the schema — used by the AST mutator to swap one
 /// column reference for another (often of a different type).

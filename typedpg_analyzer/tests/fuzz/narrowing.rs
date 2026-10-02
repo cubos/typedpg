@@ -181,3 +181,48 @@ pub(crate) fn gen_narrowing_select(rng: &mut StdRng) -> String {
     }
     sql
 }
+
+/// `payments` joined to `users` along its foreign keys (or not quite),
+/// with quals on its CHECK-constrained columns: what the analyzer proves
+/// from the schema, run over rows that satisfy it.
+pub(crate) fn gen_constraint_select(rng: &mut StdRng) -> String {
+    let users = &TABLES[0];
+    let pm = &PAYMENTS;
+    let fk = ["pm.user_id", "pm.reviewer_id"][rng.random_range(0..2)];
+    let from = match rng.random_range(0..5) {
+        0 => format!("payments pm LEFT JOIN users u ON u.id = {fk}"),
+        1 => format!("users u RIGHT JOIN payments pm ON {fk} = u.id"),
+        2 => format!("payments pm FULL JOIN users u ON u.id = {fk}"),
+        3 => format!("users u LEFT JOIN payments pm ON {fk} = u.id"),
+        _ => format!("payments pm LEFT JOIN users u ON u.id = {fk} AND u.age > 0"),
+    };
+    let cols: Vec<QCol> = (0..3)
+        .flat_map(|_| [pick("pm", pm, rng), pick("u", users, rng)])
+        .collect();
+    let method = || ["'a'", "'b'", "'c'"];
+    let mut projs: Vec<String> = cols
+        .iter()
+        .take(rng.random_range(1..4))
+        .enumerate()
+        .map(|(i, c)| format!("{} AS c{i}", c.sql()))
+        .collect();
+    let m = method()[rng.random_range(0..3)];
+    projs.push(match rng.random_range(0..4) {
+        0 => "coalesce(pm.card_last4, pm.iban) AS k".to_string(),
+        1 => format!("CASE WHEN pm.method = {m} THEN pm.card_last4 ELSE '' END AS k"),
+        2 => "CASE WHEN pm.card_last4 IS NULL THEN pm.iban ELSE pm.card_last4 END AS k".into(),
+        _ => "greatest(pm.card_last4, pm.iban) AS k".into(),
+    });
+    let mut sql = format!("SELECT {} FROM {from}", projs.join(", "));
+    let mut quals: Vec<String> = Vec::new();
+    if rng.random_bool(0.6) {
+        quals.push(format!("pm.method = {}", method()[rng.random_range(0..3)]));
+    }
+    if rng.random_bool(0.4) {
+        quals.push(predicate(&cols, rng));
+    }
+    if !quals.is_empty() {
+        sql.push_str(&format!(" WHERE {}", quals.join(" AND ")));
+    }
+    sql
+}
