@@ -1292,11 +1292,15 @@ pub(crate) fn coerce_unknown_to(
 /// scratch collector at PG's point (the caller runs it right after FROM) and
 /// records each such occurrence ([`ParamCollector::mark_untyped_output`]);
 /// [`resolve_untyped_output_params`] then applies PG's coercion to text.
+///
+/// An entry that fails to resolve there fails in PG before any later
+/// clause is looked at: its error is returned, so a query wrong in both
+/// its select list and its WHERE reports the select list's, as PG does.
 pub(crate) fn note_untyped_output_params(
     target_list: &[protobuf::Node],
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
-) {
+) -> Result<(), AnalyzeError> {
     let mut scratch = params.clone();
     for target in target_list {
         let Some(node::Node::ResTarget(rt)) = target.node.as_ref() else {
@@ -1312,10 +1316,21 @@ pub(crate) fn note_untyped_output_params(
             scratch.see(p.number);
             continue;
         }
-        // Only the types this entry deduces matter; its errors surface when
-        // the target list is analyzed for real.
-        let _ = infer_expr(val, ctx, &mut scratch, TypeGoal::NONE);
+        // `*` / `t.*` / `(expr).*` expand rather than resolve as one
+        // expression; the final pass handles them.
+        let star = |fields: &[protobuf::Node]| {
+            fields
+                .iter()
+                .any(|f| matches!(f.node.as_ref(), Some(node::Node::AStar(_))))
+        };
+        match val.node.as_ref() {
+            Some(node::Node::ColumnRef(c)) if star(&c.fields) => continue,
+            Some(node::Node::AIndirection(i)) if star(&i.indirection) => continue,
+            _ => {}
+        }
+        infer_expr(val, ctx, &mut scratch, TypeGoal::NONE)?;
     }
+    Ok(())
 }
 
 /// PG's `resolveTargetListUnknowns` for the bare-parameter output columns

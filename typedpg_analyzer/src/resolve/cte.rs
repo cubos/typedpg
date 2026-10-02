@@ -133,8 +133,25 @@ pub(crate) fn analyze_cte(
                 if s.type_oid == oid::UNKNOWN || r.type_oid == oid::UNKNOWN {
                     continue;
                 }
-                let common = crate::coerce::find_common_type(&[s.type_oid, r.type_oid], snapshot)
-                    .unwrap_or(s.type_oid);
+                // transformSetOperationTree's select_common_type fails first
+                // when the terms' types don't meet at all.
+                let Some(common) =
+                    crate::coerce::find_common_type(&[s.type_oid, r.type_oid], snapshot)
+                else {
+                    let a = crate::ddl::util::format_type_for_message(snapshot, s.type_oid);
+                    let b = crate::ddl::util::format_type_for_message(snapshot, r.type_oid);
+                    return Err(crate::pgmsg::types_cannot_be_matched(
+                        "UNION",
+                        &a,
+                        &b,
+                        &format!(" (column `{}`)", s.name),
+                        Some(format!(
+                            "cast the recursive term's column to the non-recursive term's type, e.g. `::{a}`"
+                        )),
+                        super::set_ops::branch_column_span(rarg, i),
+                    )
+                    .finalize_implicit());
+                };
                 if common != s.type_oid {
                     let seed_ty = crate::ddl::util::format_type_for_message(snapshot, s.type_oid);
                     let overall = crate::ddl::util::format_type_for_message(snapshot, common);
