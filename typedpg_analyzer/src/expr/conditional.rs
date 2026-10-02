@@ -170,10 +170,103 @@ pub(crate) fn infer_coalesce(
         }
     }
 
+    let branches: Vec<(&protobuf::Node, &ExprType)> = expr.args.iter().zip(&args).collect();
     Ok(
         ExprType::scalar_with_typmod(type_oid, all_nullable, agreed_typmod(&args, type_oid))
-            .with_collation(derive_collation(&args, type_oid, snapshot)?),
+            .with_collation(derive_collation(&args, type_oid, snapshot)?)
+            .with_elem_nullable(branches_elem_nullable(&branches, type_oid, snapshot)),
     )
+}
+
+/// The columns a condition proves part of the current grouping set:
+/// `GROUPING(a, b) = 0` (a conjunct of it) holds exactly on the rows of
+/// the grouping sets holding every argument — PG's `GroupingFunc` sets a
+/// column's bit when the set omits it — where those columns carry the
+/// group's own value, not a NULL standing for "all".
+fn grouping_present_columns(
+    cond: &protobuf::Node,
+    scope: &crate::scope::Scope,
+) -> Vec<crate::nonnull::Col> {
+    let mut out = Vec::new();
+    match cond.node.as_ref() {
+        Some(node::Node::BoolExpr(b))
+            if protobuf::BoolExprType::try_from(b.boolop)
+                == Ok(protobuf::BoolExprType::AndExpr) =>
+        {
+            for a in &b.args {
+                out.extend(grouping_present_columns(a, scope));
+            }
+        }
+        Some(node::Node::AExpr(e))
+            if protobuf::AExprKind::try_from(e.kind) == Ok(protobuf::AExprKind::AexprOp)
+                && extract_string_fields(&e.name).as_slice() == ["="] =>
+        {
+            let zero = |n: &protobuf::Node| {
+                matches!(
+                    n.node.as_ref(),
+                    Some(node::Node::AConst(protobuf::AConst {
+                        val: Some(a_const::Val::Ival(i)),
+                        ..
+                    })) if i.ival == 0
+                )
+            };
+            fn grouping(n: &protobuf::Node) -> Option<&protobuf::GroupingFunc> {
+                match n.node.as_ref() {
+                    Some(node::Node::GroupingFunc(g)) => Some(g),
+                    _ => None,
+                }
+            }
+            let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) else {
+                return out;
+            };
+            let g = match (grouping(l), grouping(r)) {
+                (Some(g), _) if zero(r) => g,
+                (_, Some(g)) if zero(l) => g,
+                _ => return out,
+            };
+            for a in &g.args {
+                if let Some(c) = crate::having::column_of(a, scope) {
+                    out.push(c);
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// The element nullability of a COALESCE / CASE over `branches` (each
+/// one's node and inferred type), whose result has type `common`: what
+/// every branch that can be the (non-NULL) result says of its elements.
+/// A NULL constant is never a non-NULL array, an untyped array literal
+/// (`'{}'`) says by its content, a branch of the result's type by its own
+/// knowledge; a converted one says nothing.
+pub(crate) fn branches_elem_nullable(
+    branches: &[(&protobuf::Node, &ExprType)],
+    common: PgTypeOid,
+    snapshot: &PgCatalog,
+) -> Option<bool> {
+    coerce::element_type(snapshot.unwrap_domain(common), snapshot)?;
+    let mut parts = Vec::with_capacity(branches.len());
+    for (node, t) in branches {
+        match node.node.as_ref() {
+            Some(node::Node::AConst(c)) if c.isnull => continue,
+            Some(node::Node::AConst(c)) if t.type_oid == oid::UNKNOWN => match &c.val {
+                Some(a_const::Val::Sval(sv)) => parts.push(Some(
+                    crate::literal_input::array_literal_may_contain_null(&sv.sval),
+                )),
+                _ => parts.push(None),
+            },
+            _ if snapshot.unwrap_domain(t.type_oid) == snapshot.unwrap_domain(common) => {
+                parts.push(t.elem_nullable)
+            }
+            _ => parts.push(None),
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    merge_elem_nullable(parts)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -259,7 +352,19 @@ pub(crate) fn infer_case(
         // are validated under the resolved common type in pass 2.
         if let Some(result) = &when.result {
             let facts = not_taken.clone().union(taken).restricted_to(&own);
-            let narrowed = ctx.null_ctx.with_local_facts(facts);
+            let mut narrowed = ctx.null_ctx.with_local_facts(facts);
+            // `WHEN grouping(g) = 0`: the row's grouping set holds `g`.
+            let present = match (&expr.arg, &when.expr) {
+                (None, Some(cond)) => grouping_present_columns(cond, ctx.scope),
+                _ => Vec::new(),
+            };
+            if !present.is_empty() {
+                let mut n = narrowed.unwrap_or_else(|| ctx.null_ctx.clone());
+                for c in &present {
+                    n.grouping_omitted.remove(c);
+                }
+                narrowed = Some(n);
+            }
             let result_ctx = match &narrowed {
                 Some(n) => ctx.with_null_ctx(n),
                 None => ctx,
@@ -320,8 +425,15 @@ pub(crate) fn infer_case(
     let nullable = inputs.iter().any(|t| t.nullable);
     // Collations merge in tree order: THEN results, then ELSE.
     let collation = derive_collation(inputs[1..].iter().chain(&inputs[..1]), type_oid, snapshot)?;
+    // (The implicit ELSE NULL is never a non-NULL array.)
+    let branches: Vec<(&protobuf::Node, &ExprType)> = default
+        .iter()
+        .chain(results.iter())
+        .map(|(n, t)| (*n, t))
+        .collect();
     Ok(
         ExprType::scalar_with_typmod(type_oid, nullable, agreed_typmod(&inputs, type_oid))
-            .with_collation(collation),
+            .with_collation(collation)
+            .with_elem_nullable(branches_elem_nullable(&branches, type_oid, snapshot)),
     )
 }

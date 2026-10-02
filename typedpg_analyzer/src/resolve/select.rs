@@ -218,7 +218,7 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
         .window_clause
         .iter()
         .filter_map(|w| match w.node.as_ref()? {
-            node::Node::WindowDef(wd) => Some((wd.name.clone(), wd.frame_options)),
+            node::Node::WindowDef(wd) => Some((wd.name.clone(), expr::effective_frame_options(wd))),
             _ => None,
         })
         .collect();
@@ -237,6 +237,20 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
         )
     })?;
     grouping::register_level(sel, &scope.sources, &scope.shadowed_sources);
+    {
+        let ctx = expr::Ctx::new(&scope, &null_ctx, snapshot);
+        // Select-list SRFs that all yield as many rows are never padded.
+        let lockstep = null_ctx.srfs_in_lockstep
+            && !crate::resolve::srfs_have_equal_static_rows(
+                crate::resolve::target_list_srf_calls(&sel.target_list, snapshot),
+                ctx,
+                params,
+            );
+        // An input that always has rows (VALUES, a constant series, …).
+        let never_empty = crate::resolve::select_input_never_empty(sel, ctx, params);
+        null_ctx.srfs_in_lockstep = lockstep;
+        null_ctx.input_not_empty = never_empty;
+    }
 
     // PG transforms the target list right after FROM; note which bare `$N`
     // outputs it sees untyped before WHERE & co. can type them.
@@ -334,7 +348,10 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
         let facts = crate::nonnull::nonnullable(having, true, &scope, &log, snapshot)
             .restricted_to(&crate::nonnull::own_aliases(&scope));
         null_ctx.add_local_facts(facts);
-        null_ctx.input_not_empty = having_requires_rows(having);
+        // What the groups left must hold: rows, non-NULL aggregated values.
+        let facts = crate::having::having_facts(having, &scope, snapshot);
+        null_ctx.input_not_empty |= facts.input_not_empty;
+        null_ctx.nonnull_agg_inputs = facts.nonnull_inputs;
     }
 
     // Process ORDER BY expressions. Sort items are wrapped in `SortBy` nodes
@@ -1609,74 +1626,4 @@ fn check_distinct_on_matches_order_by(
         return Err(err());
     }
     Ok(())
-}
-
-/// Whether HAVING is FALSE over an empty input: some conjunct needs a
-/// `count(…)` of at least one (`count(*) > 0`, `count(x) >= 1`, …) —
-/// without GROUP BY, the query then has rows only when its input does.
-fn having_requires_rows(having: &protobuf::Node) -> bool {
-    match having.node.as_ref() {
-        Some(node::Node::BoolExpr(b))
-            if protobuf::BoolExprType::try_from(b.boolop)
-                == Ok(protobuf::BoolExprType::AndExpr) =>
-        {
-            b.args.iter().any(having_requires_rows)
-        }
-        Some(node::Node::AExpr(e))
-            if protobuf::AExprKind::try_from(e.kind) == Ok(protobuf::AExprKind::AexprOp) =>
-        {
-            let is_count = |n: Option<&protobuf::Node>| {
-                matches!(
-                    n.and_then(|n| n.node.as_ref()),
-                    Some(node::Node::FuncCall(fc))
-                        if fc.agg_filter.is_none()
-                            && fc.over.is_none()
-                            && matches!(
-                                expr::extract_string_fields(&fc.funcname)
-                                    .iter()
-                                    .map(String::as_str)
-                                    .collect::<Vec<_>>()
-                                    .as_slice(),
-                                ["count"] | ["pg_catalog", "count"]
-                            )
-                )
-            };
-            let int = |n: Option<&protobuf::Node>| {
-                n.and_then(crate::nonnull::literal)
-                    .filter(|l| l.is_integer())
-                    .and_then(|l| l.text.parse::<i64>().ok())
-            };
-            let op = expr::extract_string_fields(&e.name).join(".");
-            let (l, r) = (e.lexpr.as_deref(), e.rexpr.as_deref());
-            // `count(...) op n`, or flipped.
-            let (op, n) = if is_count(l) {
-                match int(r) {
-                    Some(n) => (op.as_str(), n),
-                    None => return false,
-                }
-            } else if is_count(r) {
-                let flipped = match op.as_str() {
-                    "<" => ">",
-                    ">" => "<",
-                    "<=" => ">=",
-                    ">=" => "<=",
-                    other => other,
-                };
-                match int(l) {
-                    Some(n) => (flipped, n),
-                    None => return false,
-                }
-            } else {
-                return false;
-            };
-            // Over an empty input the count is 0.
-            match op {
-                ">" => n >= 0,
-                ">=" | "=" => n >= 1,
-                "<>" => n == 0,
-                _ => false,
-            }
-        }
-        _ => false,
-    }
 }

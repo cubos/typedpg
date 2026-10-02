@@ -174,7 +174,18 @@ pub(crate) fn infer_func_call(
     let record_fields = if resolved.out_args.is_empty() {
         None
     } else {
-        Some(RecordField::from_out_args(&resolved.out_args).into())
+        let mut fields = RecordField::from_out_args(&resolved.out_args);
+        // The rows a strict catalog SRF emits (`jsonb_each(j)`: a key, and
+        // a value never SQL NULL) — a NULL record (lockstep padding) reads
+        // as NULL fields anyway.
+        if let Some(nullable) = crate::resolve::srf_out_columns_nullable(&resolved)
+            && nullable.len() == fields.len()
+        {
+            for (f, &n) in fields.iter_mut().zip(nullable) {
+                f.ty.nullable = n;
+            }
+        }
+        Some(fields.into())
     };
     // The result's collation derives from the arguments' (assign_collations).
     let (collation, explicit_collation) =
@@ -754,12 +765,44 @@ fn walk_func_modifiers(
 /// date is NULL only for an infinite input with a field that has no
 /// infinite value (`month`, `day`, …); the fields PG's
 /// `NonFiniteTimestampTzPart` maps to ±Infinity (`year`, `epoch`, … in any
-/// of `datetime.c`'s spellings) never are. With such a literal field the
-/// call is NULL exactly when an argument is.
+/// of `datetime.c`'s spellings) never are. Over an interval the same holds
+/// with `NonFiniteIntervalPart`'s fields: `epoch`, `hour`, `day`, `year`,
+/// `decade`, `century` and `millennium` are ±Infinity for an infinite
+/// interval, the others (`second`, `minute`, `week`, `month`, …) NULL
+/// (checked spelling by spelling on PostgreSQL 18). With such a literal
+/// field the call is NULL exactly when an argument is.
 fn extract_unit_is_infinite_safe(
     func: &protobuf::FuncCall,
     resolved: &functions::ResolvedFunction,
 ) -> bool {
+    const INTERVAL_INFINITE_FIELDS: &[&str] = &[
+        "epoch",
+        "h",
+        "hour",
+        "hours",
+        "hr",
+        "hrs",
+        "d",
+        "day",
+        "days",
+        "y",
+        "year",
+        "years",
+        "yr",
+        "yrs",
+        "c",
+        "cent",
+        "centuries",
+        "century",
+        "dec",
+        "decade",
+        "decades",
+        "decs",
+        "mil",
+        "millennia",
+        "millennium",
+        "mils",
+    ];
     const INFINITE_FIELDS: &[&str] = &[
         "epoch",
         "isoyear",
@@ -784,23 +827,140 @@ fn extract_unit_is_infinite_safe(
         "millennium",
         "mils",
     ];
-    let over_timestamp = matches!(
-        resolved.signature.as_str(),
+    let fields = match resolved.signature.as_str() {
         "extract(text,timestamp)"
-            | "extract(text,timestamptz)"
-            | "extract(text,date)"
-            | "date_part(text,timestamp)"
-            | "date_part(text,timestamptz)"
-            | "date_part(text,date)"
-    );
-    over_timestamp
-        && matches!(
-            func.args.first().and_then(|a| a.node.as_ref()),
-            Some(node::Node::AConst(protobuf::AConst {
-                val: Some(typedpg_pg_query::protobuf::a_const::Val::Sval(sv)),
-                ..
-            })) if INFINITE_FIELDS.contains(&sv.sval.to_lowercase().as_str())
-        )
+        | "extract(text,timestamptz)"
+        | "extract(text,date)"
+        | "date_part(text,timestamp)"
+        | "date_part(text,timestamptz)"
+        | "date_part(text,date)" => INFINITE_FIELDS,
+        "extract(text,interval)" | "date_part(text,interval)" => INTERVAL_INFINITE_FIELDS,
+        _ => return false,
+    };
+    matches!(
+        func.args.first().and_then(|a| a.node.as_ref()),
+        Some(node::Node::AConst(protobuf::AConst {
+            val: Some(typedpg_pg_query::protobuf::a_const::Val::Sval(sv)),
+            ..
+        })) if fields.contains(&sv.sval.to_lowercase().as_str())
+    )
+}
+
+/// Whether `node` (inferred as `t`) is a non-NULL `array_agg` of
+/// non-array values: then it read rows, and `array_agg_finalfn` built a
+/// one-dimensional array with lower bound 1 holding one element per row —
+/// `[1]` is the first value, `array_length(…, 1)` is defined. (Over
+/// arrays, `array_agg(anyarray)` stacks a dimension: `[1]` is NULL.)
+pub(crate) fn is_nonempty_1d_array_agg(
+    node: &protobuf::Node,
+    t: &ExprType,
+    ctx: Ctx<'_>,
+    params: &ParamCollector,
+) -> bool {
+    let Some(node::Node::FuncCall(fc)) = node.node.as_ref() else {
+        return false;
+    };
+    if t.nullable
+        || crate::having::builtin_aggregate_name(fc, ctx.snapshot) != Some("array_agg")
+        || fc.args.len() != 1
+    {
+        return false;
+    }
+    let mut scratch = params.clone();
+    infer_expr(&fc.args[0], ctx, &mut scratch, TypeGoal::NONE).is_ok_and(|a| {
+        a.type_oid != oid::UNKNOWN
+            && coerce::element_type(ctx.snapshot.unwrap_domain(a.type_oid), ctx.snapshot).is_none()
+    })
+}
+
+/// Whether an aggregate always reads rows: with no FILTER (which may pass
+/// none), a window frame holding the current row, or a group — every
+/// GROUP BY group has rows, the empty grouping set's has them when the
+/// input does (`input_not_empty`: a constant source, or HAVING proving it).
+pub(crate) fn aggregate_reads_rows(
+    has_filter: bool,
+    over: Option<&protobuf::WindowDef>,
+    null_ctx: &NullabilityContext,
+) -> bool {
+    if has_filter {
+        return false;
+    }
+    match over {
+        // `ROWS … 1 PRECEDING`, `… FOLLOWING`-only frames and `EXCLUDE
+        // CURRENT ROW / GROUP` can leave a frame empty.
+        Some(over) => window_frame(over, null_ctx).is_some_and(frame_contains_current_row),
+        None => {
+            null_ctx.input_not_empty || (null_ctx.has_group_by && !null_ctx.has_empty_grouping_set)
+        }
+    }
+}
+
+/// The frame options a window call runs over (see
+/// [`effective_frame_options`]): its own, or — for `OVER w` — those of
+/// the WINDOW clause's `w` (`None` when unknown).
+fn window_frame(over: &protobuf::WindowDef, null_ctx: &NullabilityContext) -> Option<i32> {
+    if over.name.is_empty() {
+        Some(effective_frame_options(over))
+    } else {
+        null_ctx.window_frame_options(over)
+    }
+}
+
+/// A window definition's frame options with a constant zero offset bound
+/// (`0 PRECEDING`, `0 FOLLOWING`, `INTERVAL '0 day' PRECEDING`) read as
+/// CURRENT ROW, which it is in every mode: the current row (ROWS), its
+/// peer group (GROUPS), the rows whose key is the current one's (RANGE).
+pub(crate) fn effective_frame_options(wd: &protobuf::WindowDef) -> i32 {
+    const START_CURRENT_ROW: i32 = 0x200;
+    const END_CURRENT_ROW: i32 = 0x400;
+    const START_OFFSET: i32 = 0x800 | 0x2000;
+    const END_OFFSET: i32 = 0x1000 | 0x4000;
+    let mut options = wd.frame_options;
+    if options & START_OFFSET != 0 && wd.start_offset.as_deref().is_some_and(is_zero_offset) {
+        options = (options & !START_OFFSET) | START_CURRENT_ROW;
+    }
+    if options & END_OFFSET != 0 && wd.end_offset.as_deref().is_some_and(is_zero_offset) {
+        options = (options & !END_OFFSET) | END_CURRENT_ROW;
+    }
+    options
+}
+
+/// The integer literal `0`.
+fn is_zero_constant(n: &protobuf::Node) -> bool {
+    matches!(
+        n.node.as_ref(),
+        Some(node::Node::AConst(protobuf::AConst {
+            val: Some(typedpg_pg_query::protobuf::a_const::Val::Ival(i)),
+            ..
+        })) if i.ival == 0
+    )
+}
+
+/// A frame offset that is the constant zero: `0`, `0.0`, or a literal
+/// such as `'0'` / `'0 day'` cast to the offset type.
+fn is_zero_offset(n: &protobuf::Node) -> bool {
+    use typedpg_pg_query::protobuf::a_const::Val;
+    match n.node.as_ref() {
+        Some(node::Node::AConst(c)) if !c.isnull => match &c.val {
+            Some(Val::Ival(i)) => i.ival == 0,
+            Some(Val::Fval(f)) => f.fval.parse::<f64>().is_ok_and(|x| x == 0.0),
+            Some(Val::Sval(s)) => {
+                // A zero quantity, optionally followed by a unit word.
+                let s = s.sval.trim();
+                let digits_end = s
+                    .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+                    .unwrap_or(s.len());
+                let (num, unit) = s.split_at(digits_end);
+                num.chars().any(|c| c.is_ascii_digit())
+                    && num.chars().all(|c| c == '0' || c == '.')
+                    && num.matches('.').count() <= 1
+                    && unit.trim().chars().all(|c| c.is_ascii_alphabetic())
+            }
+            _ => false,
+        },
+        Some(node::Node::TypeCast(c)) => c.arg.as_deref().is_some_and(is_zero_offset),
+        _ => false,
+    }
 }
 
 /// Whether a window frame always includes the current row (PG's
@@ -1247,66 +1407,135 @@ fn resolve_func_nullability(
     {
         nullable
     } else if is_value_window {
+        let builtin = resolved.schema == "pg_catalog";
+        let frame_has_current_row = || {
+            func.over
+                .as_deref()
+                .and_then(|over| window_frame(over, null_ctx))
+                .is_some_and(frame_contains_current_row)
+        };
         match name {
+            // An offset of 0 is the current row itself, whatever the
+            // default (`WinGetFuncArgInPartition` at relpos 0).
+            "lag" | "lead" if builtin && func.args.get(1).is_some_and(is_zero_constant) => {
+                arg_is_nullable(0)
+            }
             "lag" | "lead" if func.args.len() >= 3 => {
                 arg_is_nullable(0) || arg_is_nullable(1) || arg_is_nullable(2)
             }
             // The first / last row of the frame: one exists whenever the
-            // frame holds the current row.
-            "first_value" | "last_value" => {
-                arg_is_nullable(0)
-                    || !func
-                        .over
-                        .as_deref()
-                        .and_then(|over| null_ctx.window_frame_options(over))
-                        .is_some_and(frame_contains_current_row)
+            // frame holds the current row — and so does `nth_value(x, 1)`.
+            "first_value" | "last_value" => arg_is_nullable(0) || !frame_has_current_row(),
+            "nth_value"
+                if builtin
+                    && func.args.get(1).is_some_and(|n| {
+                        matches!(
+                            n.node.as_ref(),
+                            Some(node::Node::AConst(protobuf::AConst {
+                                val: Some(typedpg_pg_query::protobuf::a_const::Val::Ival(i)),
+                                ..
+                            })) if i.ival == 1
+                        )
+                    }) =>
+            {
+                arg_is_nullable(0) || !frame_has_current_row()
             }
             _ => true,
         }
     } else if resolved.is_aggregate {
         let builtin = resolved.schema == "pg_catalog";
-        // An aggregate over a non-empty set of rows: NULL only on NULL
-        // input, except for the builtins that are NULL for some non-empty
-        // inputs (a single row, zero variance) and user-defined aggregates,
-        // whose final/transition functions may return NULL at will.
-        let over_rows = || {
-            args.any_nullable
-                || !builtin
-                || crate::builtin_nullability::NULLABLE_AGGREGATES_OVER_ROWS.contains(&name)
-        };
-        if builtin && name == "count" {
-            // COUNT is never NULL (returns 0 for empty input, even with FILTER).
-            false
-        } else if func.agg_filter.is_some() {
-            // A FILTER clause can eliminate every row in the group.
-            true
-        } else if let Some(over) = &func.over {
-            // A window aggregate sees its frame: never empty when the frame
-            // contains the current row (every window input row exists), but
-            // `ROWS … 1 PRECEDING`, `… FOLLOWING`-only frames and `EXCLUDE
-            // CURRENT ROW / GROUP` can leave it empty. `OVER w` takes its
-            // frame from the WINDOW clause.
-            !null_ctx
-                .window_frame_options(over)
-                .is_some_and(frame_contains_current_row)
-                || over_rows()
-        } else if null_ctx.has_empty_grouping_set {
-            // GROUPING SETS / ROLLUP / CUBE include an empty grouping set
-            // (or `GROUP BY ()` does explicitly). For that row the aggregate
-            // sees the whole input — and an empty input still produces NULL
-            // for non-COUNT aggregates.
-            true
-        } else if null_ctx.has_group_by {
-            over_rows()
-        } else if null_ctx.input_not_empty {
-            // HAVING proved the input has rows.
-            over_rows()
+        let class = crate::having::aggregate_class(name);
+        // The arguments whose values the aggregate reads: an ordered-set
+        // aggregate's ordering values (its direct arguments are fixed per
+        // group), and `string_agg`'s value (a NULL delimiter appends
+        // nothing).
+        let value_args: Vec<usize> = if func.agg_within_group {
+            (args.direct_count..args.nullable.len()).collect()
+        } else if name == "string_agg" {
+            vec![0]
         } else {
-            // Without GROUP BY, non-COUNT aggregates return NULL for empty tables.
-            true
+            (0..args.nullable.len()).collect()
+        };
+        let direct_nullable = func.agg_within_group && (0..args.direct_count).any(arg_is_nullable);
+        // A column HAVING proves non-NULL in some row of the group, read
+        // by a plain aggregate (no FILTER, no window: all the group's rows).
+        let plain = func.agg_filter.is_none() && func.over.is_none();
+        let proven = |i: usize| {
+            let node = if i < args.direct_count {
+                func.args.get(i).map(functions::call_arg_value)
+            } else {
+                func.agg_order
+                    .get(i - args.direct_count)
+                    .and_then(|o| match o.node.as_ref() {
+                        Some(node::Node::SortBy(sb)) => sb.node.as_deref(),
+                        _ => None,
+                    })
+            };
+            plain
+                && builtin
+                && class == crate::having::AggregateClass::Strict
+                && node
+                    .and_then(|n| crate::having::column_of(n, ctx.scope))
+                    .is_some_and(|c| null_ctx.nonnull_agg_inputs.contains(&c))
+        };
+        // An aggregate over a non-empty set of rows: NULL only when every
+        // value it reads is NULL (for the strict ones), never for those
+        // keeping NULL inputs (`array_agg`, `json_agg`, …) — except for
+        // the builtins that are NULL for some non-empty inputs (a single
+        // row, zero variance) and user-defined aggregates, whose
+        // final/transition functions may return NULL at will.
+        let over_rows = || {
+            !builtin
+                || crate::builtin_nullability::NULLABLE_AGGREGATES_OVER_ROWS.contains(&name)
+                || match class {
+                    crate::having::AggregateClass::Strict => {
+                        direct_nullable
+                            || value_args.iter().any(|&i| arg_is_nullable(i) && !proven(i))
+                    }
+                    _ => false,
+                }
+        };
+        let hypothetical = matches!(
+            resolved.aggregate,
+            Some((crate::pg_catalog::AggKind::Hypothetical, _))
+        );
+        if builtin && (class == crate::having::AggregateClass::Count || hypothetical) {
+            // COUNT / regr_count are 0 over no rows (even with FILTER); a
+            // hypothetical-set aggregate ranks its hypothetical row among
+            // whatever rows there are, a NULL one included.
+            false
+        } else {
+            // A proven-present value is a row.
+            let rows =
+                aggregate_reads_rows(func.agg_filter.is_some(), func.over.as_deref(), null_ctx)
+                    || value_args.iter().any(|&i| proven(i));
+            !rows || over_rows()
         }
     } else if resolved.schema == "pg_catalog" && extract_unit_is_infinite_safe(func, resolved) {
         args.any_nullable
+    } else if resolved.schema == "pg_catalog"
+        && matches!(
+            resolved.signature.as_str(),
+            "array_length(anyarray,int4)"
+                | "array_lower(anyarray,int4)"
+                | "array_upper(anyarray,int4)"
+        )
+        && func.args.get(1).is_some_and(|n| {
+            matches!(
+                n.node.as_ref(),
+                Some(node::Node::AConst(protobuf::AConst {
+                    val: Some(typedpg_pg_query::protobuf::a_const::Val::Ival(i)),
+                    ..
+                })) if i.ival == 1
+            )
+        })
+        && args
+            .exprs
+            .first()
+            .is_some_and(|t| is_nonempty_1d_array_agg(&func.args[0], t, ctx, params))
+    {
+        // The one dimension of a non-empty `array_agg`.
+        false
     } else if resolved.schema == "pg_catalog" {
         functions::builtin_result_nullable(resolved, &args.nullable, func.func_variadic)
     } else {

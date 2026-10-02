@@ -39,10 +39,11 @@ async fn array_agg_of_a_nullable_column_reads_null_elements() {
     assert_eq!(pair, vec![Some(30), None]);
     let sub: Vec<Option<i32>> = row.sub;
     assert_eq!(sub, vec![Some(30), None]);
-    let parts: Option<Vec<Option<String>>> = row.parts;
+    // NULL only for a NULL input string.
+    let parts: Vec<Option<String>> = row.parts;
     assert_eq!(
         parts,
-        Some(vec![Some("a".to_string()), None, Some("b".to_string())])
+        vec![Some("a".to_string()), None, Some("b".to_string())]
     );
     let m: Option<Vec<Option<String>>> = row.m;
     assert_eq!(m, Some(vec![None, Some("b".to_string())]));

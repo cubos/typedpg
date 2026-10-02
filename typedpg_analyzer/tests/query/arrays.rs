@@ -168,9 +168,14 @@ fn any_all_nullable_through_null_elements() {
 #[test]
 fn array_concat_text_arrays() {
     let db = setup();
-    // `tags` is nullable → concat is nullable (|| is strict).
+    // `array_cat` isn't strict: a NULL `tags` gives the other array, and
+    // only two NULLs give NULL.
     let s = db
         .analyze("SELECT tags || ARRAY['z']::text[] AS combined FROM users")
+        .unwrap();
+    assert_cols(&s, vec![c("combined", array_of(text()))]);
+    let s = db
+        .analyze("SELECT tags || tags AS combined FROM users")
         .unwrap();
     assert_cols(&s, vec![cn("combined", array_of(text()))]);
 }
@@ -369,7 +374,11 @@ fn unnest_in_from_two_arrays_aligned() {
     let s = db
         .analyze("SELECT t.a, t.b FROM unnest(ARRAY[1, 2], ARRAY['x'::text, 'y']) AS t(a, b)")
         .unwrap();
-    // PG pads the shorter array with NULL, so both columns are nullable.
+    // PG pads the shorter array with NULL — but these are as long.
+    assert_cols(&s, vec![c("a", int4()), c("b", text())]);
+    let s = db
+        .analyze("SELECT t.a, t.b FROM unnest(ARRAY[1, 2], ARRAY['x'::text]) AS t(a, b)")
+        .unwrap();
     assert_cols(&s, vec![cn("a", int4()), cn("b", text())]);
 }
 
@@ -411,10 +420,8 @@ fn unnest_in_from_three_arrays_aligned() {
              ) AS t(a, b, c)",
         )
         .unwrap();
-    assert_cols(
-        &s,
-        vec![cn("a", int4()), cn("b", text()), cn("c", bool_ty())],
-    );
+    // Arrays of the same, static length: nothing is padded.
+    assert_cols(&s, vec![c("a", int4()), c("b", text()), c("c", bool_ty())]);
 }
 
 #[test]
@@ -428,7 +435,7 @@ fn unnest_in_from_two_arrays_with_ordinality() {
              FROM unnest(ARRAY[1, 2], ARRAY['x'::text, 'y']) WITH ORDINALITY AS t(a, b, ord)",
         )
         .unwrap();
-    assert_cols(&s, vec![cn("a", int4()), cn("b", text()), c("ord", int8())]);
+    assert_cols(&s, vec![c("a", int4()), c("b", text()), c("ord", int8())]);
 }
 
 #[test]

@@ -449,9 +449,9 @@ fn process_range_function(
     if nfuncs != 1 || rf.ordinality {
         whole_row = crate::scope::WholeRow::Record;
     }
-    if nfuncs > 1 {
+    if nfuncs > 1 && !srfs_have_equal_static_rows(funcs.iter().map(|f| &*f.call), arg_ctx, params) {
         // nodeFunctionscan.c pads every function that runs out of rows
-        // first with NULLs.
+        // first with NULLs — unless they all yield as many.
         for c in &mut cols {
             c.base_not_null = false;
         }
@@ -1306,6 +1306,266 @@ pub(crate) fn srf_elements_nullable(
     ))
 }
 
+/// The number of rows a set-returning call yields, when the call alone
+/// fixes it whatever the data: `pg_catalog.unnest` of an `ARRAY[…]`
+/// constructor over non-array values (one row per element, NULL or not)
+/// or of an array literal (one per element, every dimension unrolled),
+/// and `pg_catalog.generate_series` over integer literals. `None` for
+/// anything else.
+pub(crate) fn static_srf_rows(
+    fc: &protobuf::FuncCall,
+    ctx: Ctx<'_>,
+    params: &ParamCollector,
+) -> Option<u64> {
+    if fc.over.is_some()
+        || fc.func_variadic
+        || fc.agg_star
+        || fc.agg_filter.is_some()
+        || !fc.agg_order.is_empty()
+        || fc.args.iter().any(|a| {
+            !matches!(a.node.as_ref(), Some(node::Node::NamedArgExpr(_)))
+                && count_srf_calls(std::slice::from_ref(a), ctx.snapshot) > 0
+        })
+    {
+        return None;
+    }
+    let parts = expr::extract_string_fields(&fc.funcname);
+    let (schema, name) = match parts.as_slice() {
+        [n] => (None, n.as_str()),
+        [s, n] => (Some(s.as_str()), n.as_str()),
+        _ => return None,
+    };
+    let mut scratch = params.clone();
+    let mut types = Vec::with_capacity(fc.args.len());
+    for a in &fc.args {
+        types.push(
+            expr::infer_expr(a, ctx, &mut scratch, TypeGoal::NONE)
+                .ok()?
+                .type_oid,
+        );
+    }
+    let resolved = functions::resolve_function(
+        ctx.snapshot,
+        schema,
+        name,
+        &types,
+        &functions::CallNotation::of(fc).ok()?,
+        false,
+        None,
+    )
+    .ok()?;
+    if resolved.schema != "pg_catalog" || !resolved.is_set_returning {
+        return None;
+    }
+    let args: Vec<&protobuf::Node> = fc.args.iter().map(functions::call_arg_value).collect();
+    match resolved.signature.as_str() {
+        "unnest(anyarray)" => static_array_len(args.first()?, ctx, params),
+        "generate_series(int4,int4)"
+        | "generate_series(int8,int8)"
+        | "generate_series(int4,int4,int4)"
+        | "generate_series(int8,int8,int8)" => {
+            let int = |n: &protobuf::Node| -> Option<i128> {
+                crate::nonnull::literal(n)
+                    .filter(|l| l.is_integer())
+                    .and_then(|l| l.text.parse::<i128>().ok())
+            };
+            let start = int(args.first()?)?;
+            let stop = int(args.get(1)?)?;
+            let step = match args.get(2) {
+                Some(s) => int(s)?,
+                None => 1,
+            };
+            let rows = match step {
+                0 => return None,
+                s if s > 0 && stop >= start => (stop - start) / s + 1,
+                s if s < 0 && start >= stop => (start - stop) / -s + 1,
+                _ => 0,
+            };
+            u64::try_from(rows).ok()
+        }
+        _ => None,
+    }
+}
+
+/// The number of elements of an array expression whose length doesn't
+/// depend on the data (see [`static_srf_rows`]); a cast to an array type
+/// keeps it (an element conversion maps elements one to one).
+fn static_array_len(node: &protobuf::Node, ctx: Ctx<'_>, params: &ParamCollector) -> Option<u64> {
+    match node.node.as_ref()? {
+        node::Node::TypeCast(c) => static_array_len(c.arg.as_deref()?, ctx, params),
+        node::Node::AArrayExpr(a) => {
+            // `ARRAY[x, y]` over arrays builds a multidimensional array.
+            let mut scratch = params.clone();
+            for e in &a.elements {
+                if matches!(e.node.as_ref(), Some(node::Node::AArrayExpr(_))) {
+                    return None;
+                }
+                let t = expr::infer_expr(e, ctx, &mut scratch, TypeGoal::NONE).ok()?;
+                if t.type_oid == oid::UNKNOWN
+                    && !matches!(e.node.as_ref(), Some(node::Node::AConst(_)))
+                {
+                    return None;
+                }
+                if crate::coerce::element_type(ctx.snapshot.unwrap_domain(t.type_oid), ctx.snapshot)
+                    .is_some()
+                {
+                    return None;
+                }
+            }
+            u64::try_from(a.elements.len()).ok()
+        }
+        node::Node::AConst(c) if !c.isnull => match &c.val {
+            // (`box[]` literals are `;`-delimited.)
+            Some(protobuf::a_const::Val::Sval(sv)) if !sv.sval.contains(';') => {
+                let mut n: u64 = 0;
+                crate::array_input::parse_array(&sv.sval, b',', &mut |_| {
+                    n += 1;
+                    Ok(())
+                })
+                .ok()?;
+                Some(n)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Whether set-returning calls run in lockstep never pad: each yields the
+/// same, statically known number of rows ([`static_srf_rows`]).
+pub(crate) fn srfs_have_equal_static_rows<'a>(
+    calls: impl IntoIterator<Item = &'a protobuf::FuncCall>,
+    ctx: Ctx<'_>,
+    params: &ParamCollector,
+) -> bool {
+    let mut rows = None;
+    for fc in calls {
+        let Some(n) = static_srf_rows(fc, ctx, params) else {
+            return false;
+        };
+        if rows.is_some_and(|r| r != n) {
+            return false;
+        }
+        rows = Some(n);
+    }
+    rows.is_some()
+}
+
+/// The set-returning calls of a select list (this level's), for
+/// [`srfs_have_equal_static_rows`].
+pub(crate) fn target_list_srf_calls<'a>(
+    targets: &'a [protobuf::Node],
+    snapshot: &PgCatalog,
+) -> Vec<&'a protobuf::FuncCall> {
+    let mut out = Vec::new();
+    for t in targets {
+        crate::resolve::visit_same_level(t, &mut |e| {
+            if let Some(node::Node::FuncCall(fc)) = e.node.as_ref()
+                && crate::resolve::is_srf_call(fc, snapshot)
+            {
+                out.push(&**fc);
+            }
+        });
+    }
+    out
+}
+
+/// Whether a SELECT's input always has a row, whatever the data: no WHERE,
+/// and a FROM list (none at all is one row) of items that always do —
+/// a VALUES list, a FROM-less SELECT, a function of statically known
+/// non-zero length, or a join keeping such a side. What an aggregate
+/// without GROUP BY then reads is never empty. `ctx` sees the FROM list.
+pub(crate) fn select_input_never_empty(
+    sel: &protobuf::SelectStmt,
+    ctx: Ctx<'_>,
+    params: &ParamCollector,
+) -> bool {
+    sel.where_clause.is_none()
+        && sel
+            .from_clause
+            .iter()
+            .all(|item| from_item_never_empty(item, ctx, params))
+}
+
+fn from_item_never_empty(item: &protobuf::Node, ctx: Ctx<'_>, params: &ParamCollector) -> bool {
+    match item.node.as_ref() {
+        Some(node::Node::RangeFunction(rf)) => rf.functions.iter().any(|f| {
+            let Some(node::Node::List(pair)) = f.node.as_ref() else {
+                return false;
+            };
+            let Some(node::Node::FuncCall(fc)) = pair.items.first().and_then(|n| n.node.as_ref())
+            else {
+                return false;
+            };
+            if is_sql_standard_unnest(fc) {
+                // ROWS FROM (unnest(a), unnest(b), …): as long as the longest.
+                return fc.args.iter().any(|arg| {
+                    let mut single = (**fc).clone();
+                    single.args = vec![arg.clone()];
+                    static_srf_rows(&single, ctx, params).is_some_and(|n| n > 0)
+                });
+            }
+            static_srf_rows(fc, ctx, params).is_some_and(|n| n > 0)
+        }),
+        Some(node::Node::RangeSubselect(rs)) => {
+            match rs.subquery.as_deref().and_then(|s| s.node.as_ref()) {
+                Some(node::Node::SelectStmt(s)) => {
+                    s.op == protobuf::SetOperation::SetopNone as i32
+                        && s.limit_count.is_none()
+                        && s.limit_offset.is_none()
+                        && (!s.values_lists.is_empty()
+                            || (s.from_clause.is_empty()
+                                && s.where_clause.is_none()
+                                && s.having_clause.is_none()
+                                && s.group_clause.is_empty()
+                                && count_srf_calls(&s.target_list, ctx.snapshot) == 0))
+                }
+                _ => false,
+            }
+        }
+        Some(node::Node::JoinExpr(j)) => {
+            let side = |n: &Option<Box<protobuf::Node>>| {
+                n.as_deref()
+                    .is_some_and(|n| from_item_never_empty(n, ctx, params))
+            };
+            match protobuf::JoinType::try_from(j.jointype) {
+                Ok(protobuf::JoinType::JoinInner) => {
+                    j.quals.is_none()
+                        && !j.is_natural
+                        && j.using_clause.is_empty()
+                        && side(&j.larg)
+                        && side(&j.rarg)
+                }
+                Ok(protobuf::JoinType::JoinLeft) => side(&j.larg),
+                Ok(protobuf::JoinType::JoinRight) => side(&j.rarg),
+                Ok(protobuf::JoinType::JoinFull) => side(&j.larg) || side(&j.rarg),
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Which OUT columns of a strict `pg_catalog` set-returning function with
+/// several of them can be NULL in a row it emits, for the functions whose
+/// C implementation says (`None` for the rest): `each_worker[_jsonb]`
+/// fills the key from the object's key string, always, and the value
+/// with the member's JSON value — JSON `null` included, as a json/jsonb
+/// datum — except for the `_text` variants, which map a JSON `null` to
+/// SQL NULL. (A NULL argument yields no row: the functions are strict.)
+pub(crate) fn srf_out_columns_nullable(
+    resolved: &functions::ResolvedFunction,
+) -> Option<&'static [bool]> {
+    if !(resolved.is_set_returning && resolved.is_strict && resolved.schema == "pg_catalog") {
+        return None;
+    }
+    match resolved.signature.as_str() {
+        "jsonb_each(jsonb)" | "json_each(json)" => Some(&[false, false]),
+        "jsonb_each_text(jsonb)" | "json_each_text(json)" => Some(&[false, true]),
+        _ => None,
+    }
+}
+
 /// Columns one function contributes to a function RTE, following
 /// `addRangeTableEntryForFunction`'s `get_expr_result_type` classes: OUT
 /// parameters and named composites expose their own row (a column
@@ -1346,8 +1606,6 @@ fn function_rte_columns(
         )
         .finalize_implicit());
     }
-    let any_arg_nullable = arg_nullable.iter().any(|&n| n);
-
     let resolved = functions::resolve_function(
         snapshot,
         schema,
@@ -1363,12 +1621,15 @@ fn function_rte_columns(
     let has_coldeflist = !f.coldeflist.is_empty();
 
     // A strict catalog SRF with a single OUT column (`jsonb_array_elements`
-    // → `value`) emits exactly its elements; wider OUT rows keep the
-    // conservative per-column default.
+    // → `value`) emits exactly its elements; wider OUT rows are known per
+    // column for some (`jsonb_each`) and keep the conservative default
+    // otherwise.
     let single_out_not_null = (resolved.out_args.len() == 1)
         .then(|| srf_elements_nullable(&resolved, name, &func_call.args, arg_ctx, params))
         .flatten()
         .map(|nullable| !nullable);
+    let out_columns_nullable =
+        srf_out_columns_nullable(&resolved).filter(|n| n.len() == resolved.out_args.len());
 
     if !resolved.out_args.is_empty() {
         if has_coldeflist {
@@ -1383,10 +1644,14 @@ fn function_rte_columns(
         return Ok(resolved
             .out_args
             .iter()
-            .map(|f| ScopeColumn {
+            .enumerate()
+            .map(|(i, f)| ScopeColumn {
                 name: f.name.clone(),
                 type_oid: f.type_oid,
-                base_not_null: single_out_not_null.unwrap_or(f.not_null),
+                base_not_null: match out_columns_nullable {
+                    Some(nullable) => !nullable[i],
+                    None => single_out_not_null.unwrap_or(f.not_null),
+                },
                 typmod: None,
                 collation: None,
                 table_alias: alias.to_owned(),
@@ -1444,7 +1709,7 @@ fn function_rte_columns(
             resolved.schema == "pg_catalog"
                 && !functions::builtin_result_nullable(
                     &resolved,
-                    &[any_arg_nullable],
+                    &arg_nullable,
                     func_call.func_variadic,
                 )
         }

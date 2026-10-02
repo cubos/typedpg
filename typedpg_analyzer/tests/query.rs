@@ -38,6 +38,8 @@ mod dml_clause_kinds;
 mod dml_returning_narrowing;
 #[path = "query/expressions.rs"]
 mod expressions;
+#[path = "query/function_aggregate_narrowing.rs"]
+mod function_aggregate_narrowing;
 #[path = "query/join_rules.rs"]
 mod join_rules;
 #[path = "query/joins.rs"]

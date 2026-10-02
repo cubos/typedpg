@@ -71,8 +71,24 @@ pub(crate) fn infer_indirection(
                 // transformContainerSubscripts, so e.g. a slice anywhere in
                 // `arr[1:2][1]` makes the entire run a slice.
                 let run = subscript_run(&steps[i..]);
+                // `(array_agg(x))[1]` over rows: the first value.
+                let first_aggregated = i == 0
+                    && current.elem_nullable == Some(false)
+                    && matches!(run.as_slice(), [ai] if !ai.is_slice
+                    && ai.lidx.is_none()
+                    && matches!(
+                        ai.uidx.as_deref().and_then(|u| u.node.as_ref()),
+                        Some(node::Node::AConst(protobuf::AConst {
+                            val: Some(a_const::Val::Ival(one)),
+                            ..
+                        })) if one.ival == 1
+                    ))
+                    && super::func_call::is_nonempty_1d_array_agg(arg, &current, ctx, params);
                 i += run.len();
                 current = transform_container_subscripts(&current, &run, ctx, params)?;
+                if first_aggregated {
+                    current.nullable = false;
+                }
             }
             // `(expr).*` only expands in a SELECT list (see
             // `expand_indirection_star`); anywhere else PG refuses it.
@@ -434,8 +450,21 @@ pub(crate) fn transform_array_expr(
     // an empty array.
     let state = derive_collation(&elems, array_type, snapshot)?;
     // Its elements are the listed values (unless it is multidimensional,
-    // where they are the sub-arrays' elements).
-    let elem_nullable = (!multidims).then(|| elems.iter().any(|t| t.nullable));
+    // where they are the sub-arrays' elements), each converted to the
+    // element type — which may map one to NULL (`int4(jsonb)` for a JSON
+    // null, a user's non-strict cast).
+    let elem_nullable = (!multidims).then(|| {
+        elems.iter().any(|t| {
+            t.nullable
+                || (t.type_oid != oid::UNKNOWN
+                    && t.type_oid != coerce_type
+                    && super::literals::cast_function_can_return_null(
+                        t.type_oid,
+                        coerce_type,
+                        snapshot,
+                    ))
+        })
+    });
     Ok(ExprType::scalar_with_typmod(array_type, false, typmod)
         .with_collation(state)
         .with_elem_nullable(elem_nullable))

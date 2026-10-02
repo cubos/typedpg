@@ -120,7 +120,9 @@ fn grouping_sets_with_having() {
              HAVING SUM(amount) > 0",
         )
         .unwrap();
-    assert_cols(&s, vec![cn("region", text()), cn("total", int8())]);
+    // HAVING drops the empty set's row over an empty table (its SUM is
+    // NULL), and every other group has rows.
+    assert_cols(&s, vec![cn("region", text()), c("total", int8())]);
 }
 
 #[test]

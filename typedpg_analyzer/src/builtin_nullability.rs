@@ -403,13 +403,6 @@ pub(crate) const NEVER_NULL_NONSTRICT: &[&str] = &[
 /// argument (`format(NULL)`, `array_cat(NULL, NULL)`): non-NULL arguments
 /// give a non-NULL result.
 pub(crate) const NULL_ONLY_ON_NULL_ARG: &[&str] = &[
-    "array_cat(anycompatiblearray,anycompatiblearray)",
-    "array_positions(anycompatiblearray,anycompatible)",
-    "array_remove(anycompatiblearray,anycompatible)",
-    "array_replace(anycompatiblearray,anycompatible,anycompatible)",
-    "array_to_string(anyarray,text,text)",
-    "format(text)",
-    "format(text,any)",
     "format_type(oid,int4)",
     "int2_sum(int8,int2)",
     "int4_sum(int8,int4)",
@@ -418,6 +411,34 @@ pub(crate) const NULL_ONLY_ON_NULL_ARG: &[&str] = &[
     "similar_escape(text,text)",
     "xmlconcat2(xml,xml)",
 ];
+
+/// Non-strict functions whose NULL returns are guarded by a NULL in one of
+/// the listed arguments only: NULL elsewhere is a value like any other.
+/// `text_format` returns NULL only for a NULL format string (a NULL value
+/// prints as `''`, or `NULL` under `%L`; `VARIADIC NULL` is no values);
+/// `text_to_array` only for a NULL input string (a NULL delimiter splits
+/// into characters); `array_remove` / `array_replace` / `array_positions`
+/// only for a NULL array (NULL is a value they search for);
+/// `array_to_string` only for a NULL array or delimiter (a NULL null
+/// string skips NULL elements). Confirmed on PostgreSQL 18.
+pub(crate) const NULL_ONLY_ON_NULL_ARGS_AT: &[(&str, &[usize])] = &[
+    ("array_positions(anycompatiblearray,anycompatible)", &[0]),
+    ("array_remove(anycompatiblearray,anycompatible)", &[0]),
+    (
+        "array_replace(anycompatiblearray,anycompatible,anycompatible)",
+        &[0],
+    ),
+    ("array_to_string(anyarray,text,text)", &[0, 1]),
+    ("format(text)", &[0]),
+    ("format(text,any)", &[0]),
+    ("string_to_array(text,text)", &[0]),
+    ("string_to_array(text,text,text)", &[0]),
+];
+
+/// Non-strict functions that return NULL only when *every* argument is
+/// NULL: `array_cat` returns the other array when one side is NULL.
+pub(crate) const NULL_ONLY_WHEN_ALL_ARGS_NULL: &[&str] =
+    &["array_cat(anycompatiblearray,anycompatiblearray)"];
 
 /// `VARIADIC "any"` functions that return NULL only for an explicit
 /// `VARIADIC NULL` array (`extract_variadic_args` reports no arguments):

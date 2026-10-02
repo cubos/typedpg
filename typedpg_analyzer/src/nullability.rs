@@ -117,6 +117,10 @@ pub(crate) struct NullabilityContext {
     /// that is FALSE for an empty one (`HAVING count(*) > 0`) — so an
     /// aggregate without GROUP BY sees rows.
     pub input_not_empty: bool,
+    /// Columns HAVING proves some row of each group left has non-NULL
+    /// (`HAVING count(b) > 0`): an aggregate over one, NULL only when no
+    /// input is non-NULL (`max(b)`), isn't NULL there.
+    pub nonnull_agg_inputs: Vec<Col>,
     /// `(table_alias, column_name)` pairs for columns that are present in
     /// some grouping sets but omitted from others (under `GROUPING SETS`,
     /// `ROLLUP`, or `CUBE`). PG fills these with NULL for the rows of any

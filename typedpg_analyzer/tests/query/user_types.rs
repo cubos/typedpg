@@ -811,7 +811,10 @@ fn an_array_of_a_domain_is_typed_as_the_domains_array() {
             "SELECT ARRAY[1::d] AS a",
             array_with_elems(element.clone(), false),
         ),
-        ("SELECT '{1}'::d[] AS a", array_of(element.clone())),
+        (
+            "SELECT '{1}'::d[] AS a",
+            array_with_elems(element.clone(), false),
+        ),
     ] {
         let q = db.analyze(sql).unwrap();
         assert_eq!(q.columns[0].pg_type, expected, "{sql}");

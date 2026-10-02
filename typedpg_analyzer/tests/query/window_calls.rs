@@ -170,7 +170,8 @@ fn hypothetical_arguments_take_the_ordering_column_type() {
     let s = db
         .analyze("SELECT rank($p) WITHIN GROUP (ORDER BY x) AS r FROM t")
         .unwrap();
-    assert_cols(&s, vec![cn("r", int8())]);
+    // The hypothetical row is ranked even among no rows, even when NULL.
+    assert_cols(&s, vec![c("r", int8())]);
     assert_params(&s, vec![p(int4())]);
     assert_err_starts_with(
         &db,

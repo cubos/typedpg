@@ -47,10 +47,13 @@ pub(crate) fn infer_sublink(
                 } else {
                     true
                 };
-                // The sublink carries its column's collation, implicitly.
+                // The sublink carries its column's collation, implicitly,
+                // and its value — an array's elements included (no row is
+                // NULL, not an array with other elements).
                 return Ok(
                     ExprType::scalar_with_typmod(first.type_oid, nullable, first.typmod)
-                        .with_collation((first.collation, false)),
+                        .with_collation((first.collation, false))
+                        .with_elem_nullable(first.elem_nullable),
                 );
             }
             Ok(ExprType::scalar(oid::UNKNOWN, true))

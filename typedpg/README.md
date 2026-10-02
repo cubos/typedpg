@@ -222,6 +222,33 @@ let total = sql!(pool, "SELECT sum(age) FROM users")
 // total: Option<i64>
 ```
 
+### Functions and aggregates
+
+What a builtin does with NULL counts, not just whether it is strict: `format`,
+`array_remove`, `string_to_array` and `||` on arrays are NULL only for the
+arguments that make them so; `jsonb_each` always fills `key` and `value`;
+`EXTRACT(epoch FROM interval)` stays non-NULL for an infinite interval. An
+aggregate keeping NULL inputs (`array_agg`, `json_agg`, `JSON_ARRAYAGG`, …) is
+NULL only over no rows, `rank(…) WITHIN GROUP` and `regr_count` never are, and
+an aggregate has rows in a group, in a window frame holding the current row,
+over a constant source (`VALUES`, `generate_series(1, 10)`) and in a group
+HAVING keeps (`HAVING max(x) > 0`; `HAVING count(x) > 0` also makes `max(x)`
+non-NULL).
+
+```rust
+// array_agg keeps NULLs: never NULL in a group, its elements may be
+let rows = sql!(pool,
+    "SELECT u.id, array_agg(p.title) AS titles
+     FROM users u LEFT JOIN posts p ON p.user_id = u.id GROUP BY u.id")
+    .fetch_all().await?;
+// rows[0].titles : Vec<Option<String>>
+
+// HAVING proves the row's group has a non-NULL age
+let total = sql!(pool, "SELECT sum(age) FROM users HAVING count(age) > 0")
+    .fetch_value_optional().await?;
+// total: Option<i64>  (no row, or the sum — never a NULL sum)
+```
+
 ### Narrowing by conditions
 
 A condition that must hold for a value to be read narrows it, the way

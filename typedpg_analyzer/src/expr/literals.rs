@@ -225,7 +225,30 @@ pub(crate) fn infer_type_cast(
     let state = derive_collation([&inner_type], target_oid, snapshot)?;
     let nullable = inner_type.nullable
         || cast_function_can_return_null(inner_type.type_oid, target_oid, snapshot);
-    Ok(ExprType::scalar_with_typmod(target_oid, nullable, written_typmod).with_collation(state))
+    // The elements of an array cast to an array type: an array literal
+    // says (`'{1,2}'::int[]` has no NULL element), an `ARRAY[…]` built
+    // for the target or an array of the same type keeps its own (a
+    // relabeling or typmod coercion maps no element to NULL); an element
+    // conversion (`jsonb[]` → `int[]`, …) may.
+    let elem_nullable = if array_element_type(snapshot, target_base).is_none() {
+        None
+    } else if let Some(node::Node::AConst(ac)) = inner.node.as_ref() {
+        match &ac.val {
+            Some(a_const::Val::Sval(sv)) if !ac.isnull => Some(
+                crate::literal_input::array_literal_may_contain_null(&sv.sval),
+            ),
+            _ => None,
+        }
+    } else if built_for_target || snapshot.unwrap_domain(inner_type.type_oid) == target_base {
+        inner_type.elem_nullable
+    } else {
+        None
+    };
+    Ok(
+        ExprType::scalar_with_typmod(target_oid, nullable, written_typmod)
+            .with_collation(state)
+            .with_elem_nullable(elem_nullable),
+    )
 }
 
 /// Whether the cast from `source` to `target` runs a cast function that can
@@ -233,7 +256,7 @@ pub(crate) fn infer_type_cast(
 /// scalar casts yield NULL for a JSON null. PG names a built-in cast
 /// function after its target type (`pg_cast.castfunc` isn't in the
 /// snapshot), and its nullability comes from the per-overload table.
-fn cast_function_can_return_null(
+pub(super) fn cast_function_can_return_null(
     source: PgTypeOid,
     target: PgTypeOid,
     snapshot: &PgCatalog,

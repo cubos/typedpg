@@ -1728,7 +1728,9 @@ pub(crate) use column_refs::{
 pub(crate) use conditional::failing_input_span;
 use conditional::*;
 use func_call::*;
-pub(crate) use func_call::{backfill_call_args, check_window_clause};
+pub(crate) use func_call::{
+    aggregate_reads_rows, backfill_call_args, check_window_clause, effective_frame_options,
+};
 use indirection::*;
 pub(crate) use indirection::{expand_indirection_star, transform_container_subscripts};
 use json::*;
