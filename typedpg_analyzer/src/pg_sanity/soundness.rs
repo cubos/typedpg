@@ -8,7 +8,7 @@
 //! what comes back.
 //!
 //! Each check runs in one transaction on the query session, rolled back at
-//! the end, over three cumulative scenarios:
+//! the end, over four cumulative scenarios:
 //!
 //! 1. `as-is` — the tables as the migrations left them (usually empty):
 //!    aggregates over empty sets, scalar subqueries returning no row, outer
@@ -20,6 +20,10 @@
 //!    keys of both rows point at the referenced table's first row, so the
 //!    second parent row has no children: outer joins see matched and
 //!    unmatched rows at once.
+//! 4. `mixed` — plus, in tables with CHECK constraints, up to 8 rows
+//!    mixing NULL and filled nullable columns (one NULL, or one filled,
+//!    under either variant), so rows on each side of a constraint tying
+//!    columns together (`kind <> 'a' OR a_id IS NOT NULL`) exist.
 //!
 //! The rows come from `seed.sql`'s `typedpg_seed`, which introspects the
 //! scratch database and builds INSERTs that respect NOT NULL, defaults,
@@ -92,7 +96,7 @@ const UNSAFE_CALLS: &[&str] = &[
 ];
 
 /// The cumulative scenarios, in order: name and seeding mode (0 = none).
-const SCENARIOS: [(&str, i32); 3] = [("as-is", 0), ("nulls", 1), ("full", 2)];
+const SCENARIOS: [(&str, i32); 4] = [("as-is", 0), ("nulls", 1), ("full", 2), ("mixed", 3)];
 
 /// What `typedpg_seed(mode)` did: the INSERTs that succeeded, in order,
 /// and the tables it skipped (`table: reason`).
@@ -238,7 +242,13 @@ impl Soundness {
                 for skip in &plan.skips {
                     *self.stats.seed_skips.entry(skip.clone()).or_default() += 1;
                 }
+                // Nothing added (no table has mixed rows): the data is the
+                // previous scenario's, already checked.
+                let unchanged = mode == 3 && plan.inserts.is_empty();
                 seeded.push((scenario, plan));
+                if unchanged {
+                    continue;
+                }
             }
             let rows = {
                 let mut sp = tx
