@@ -350,6 +350,44 @@ fn recursive_search_breadth_first_with_other_columns_intact() {
 }
 
 #[test]
+fn select_list_errors_come_before_where_errors() {
+    // transformSelectStmt resolves the select list before WHERE: with both
+    // wrong, PG reports the select list's error.
+    let db = setup();
+    for sql in [
+        "SELECT n + 1 FROM (SELECT true AS n) r WHERE n < 5",
+        "WITH RECURSIVE r AS (SELECT true AS n UNION ALL \
+         SELECT n + 1 FROM r WHERE n < 5) SELECT * FROM r",
+    ] {
+        let err = db.analyze(sql).unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("operator does not exist: boolean + integer"),
+            "{sql}: {err}"
+        );
+    }
+}
+
+#[test]
+fn recursive_terms_without_a_common_type_are_rejected() {
+    // select_common_type over the two terms fails before the "overall"
+    // check can: `UNION types boolean and text cannot be matched` (42804).
+    let db = setup();
+    let err = db
+        .analyze(
+            "WITH RECURSIVE r AS (SELECT true AS s, 1 AS n UNION ALL \
+             SELECT s || 'x', n + 1 FROM r WHERE n < 5) SELECT s FROM r",
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("UNION types boolean and text cannot be matched"),
+        "got: {err}"
+    );
+    assert!(matches!(err, AnalyzeError::DatatypeMismatch(_)), "{err:?}");
+}
+
+#[test]
 fn recursive_term_type_must_match_non_recursive_term() {
     // PG fixes the CTE's column types from the non-recursive term; a
     // recursive term that would widen the type errors (42804).

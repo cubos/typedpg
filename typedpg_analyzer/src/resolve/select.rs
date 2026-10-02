@@ -244,7 +244,7 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
         &sel.target_list,
         expr::Ctx::new(&scope, &null_ctx, snapshot),
         params,
-    );
+    )?;
 
     // Expand `GROUPING SETS` / `ROLLUP` / `CUBE`: promote columns that
     // some grouping set omits to nullable, and remember whether any
