@@ -309,6 +309,24 @@ async fn outer_joins_narrowed_by_where_filter_and_case() {
 }
 
 #[tokio::test]
+async fn a_left_join_along_a_foreign_key_always_matches() {
+    let pool = common::setup().await;
+    let author = user(&pool, "fk").await;
+    let post_id = post(&pool, author).await;
+    // `posts.user_id` is NOT NULL and references `users`: the author is
+    // always there, so `u.name` is `String`.
+    let row = sql!(
+        &pool,
+        "SELECT p.id, u.name FROM posts p LEFT JOIN users u ON u.id = p.user_id WHERE p.id = $post_id"
+    )
+    .fetch_one()
+    .await
+    .expect("fk join");
+    let name: String = row.name;
+    assert!(name.starts_with("fk"), "{name}");
+}
+
+#[tokio::test]
 async fn delete_returning_keeps_what_where_proved() {
     let pool = common::setup().await;
     let id = user(&pool, "gone").await;

@@ -570,7 +570,7 @@ fn narrow_by_filter(
     let Some(filter) = func.agg_filter.as_deref() else {
         return;
     };
-    let facts = crate::nonnull::nonnullable(filter, true, ctx.scope, log)
+    let facts = crate::nonnull::nonnullable(filter, true, ctx.scope, log, ctx.snapshot)
         .restricted_to(&crate::nonnull::own_aliases(ctx.scope));
     let Some(narrowed) = ctx.null_ctx.with_local_facts(facts) else {
         return;
@@ -1297,6 +1297,9 @@ fn resolve_func_nullability(
             // for non-COUNT aggregates.
             true
         } else if null_ctx.has_group_by {
+            over_rows()
+        } else if null_ctx.input_not_empty {
+            // HAVING proved the input has rows.
             over_rows()
         } else {
             // Without GROUP BY, non-COUNT aggregates return NULL for empty tables.

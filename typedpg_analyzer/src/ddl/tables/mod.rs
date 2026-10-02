@@ -1301,6 +1301,14 @@ fn apply_alter_subtype(
         AlterTableType::AtEnableReplicaRule | AlterTableType::AtDisableRule => {
             crate::ddl::rules::set_rule_enabled(interp, relid, &cmd.name, false)
         }
+        AlterTableType::AtEnableRowSecurity => {
+            interp.row_security.insert(relid);
+            Ok(())
+        }
+        AlterTableType::AtDisableRowSecurity => {
+            interp.row_security.remove(&relid);
+            Ok(())
+        }
         AlterTableType::AtEnableTrig
         | AlterTableType::AtEnableAlwaysTrig
         | AlterTableType::AtEnableReplicaTrig

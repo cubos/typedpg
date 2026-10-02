@@ -99,6 +99,11 @@ pub(crate) struct TableSource {
     /// nullable side there) — the rewriter / planner errors PG raises when
     /// the statement is planned.
     pub lock_error: Option<LockBlock>,
+    /// A relation scanned so that some of its rows may be missing:
+    /// `TABLESAMPLE`, or `ONLY` over a partitioned table (whose rows are
+    /// all in its partitions). A foreign key referencing it doesn't
+    /// guarantee its referenced row shows up.
+    pub partial_scan: bool,
 }
 
 /// Why a locking clause can't be pushed into a view or subquery.
@@ -181,6 +186,7 @@ impl TableSource {
             dml_target: false,
             whole_row: WholeRow::Record,
             lock_error: None,
+            partial_scan: false,
         }
     }
 

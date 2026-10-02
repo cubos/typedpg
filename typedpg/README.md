@@ -255,6 +255,26 @@ let rows = sql!(pool,
 // rows[0].titles : Option<Vec<String>>  (no NULL element; NULL with no post)
 ```
 
+The schema counts too, taking its constraints to hold as declared (`NOT VALID`
+included; `NOT ENFORCED` ones say nothing):
+
+```rust
+// A LEFT JOIN along a NOT NULL foreign key always finds its row
+let rows = sql!(pool,
+    "SELECT p.title, u.name FROM posts p LEFT JOIN users u ON u.id = p.user_id")
+    .fetch_all().await?;
+// rows[0].name : String
+
+// CHECK constraints combine with what the query knows
+// CHECK ((kind = 'card' AND card_last4 IS NOT NULL) OR (kind = 'iban' AND iban IS NOT NULL))
+let rows = sql!(pool, "SELECT card_last4, coalesce(card_last4, iban) AS ref FROM payments WHERE kind = 'card'")
+    .fetch_all().await?;
+// rows[0].card_last4 : String, rows[0].ref : String
+```
+
+A referenced table under row-level security doesn't count: its policies may
+hide the row.
+
 Only strict conditions count: `coalesce(age, 0) > 0`, `age IS DISTINCT FROM 5`
 or an `OR` whose arms test different columns prove nothing. `UPDATE` and
 `DELETE ... RETURNING` keep what their `WHERE` proved for the rows they return,

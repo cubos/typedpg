@@ -948,7 +948,9 @@ fn infer_expr_unlocated(
                 }
             }
             // GREATEST/LEAST over ≥1 NOT NULL arg are never NULL.
-            let nullable = args.is_empty() || args.iter().all(|t| t.nullable);
+            let nullable = args.is_empty()
+                || (args.iter().all(|t| t.nullable)
+                    && !conditional::some_column_non_null(&mm.args, ctx));
             Ok(ExprType::scalar_with_typmod(
                 resolved_type,
                 nullable,

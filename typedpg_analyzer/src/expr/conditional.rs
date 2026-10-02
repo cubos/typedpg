@@ -116,6 +116,17 @@ pub(crate) fn agreed_typmod(inputs: &[ExprType], common: PgTypeOid) -> Option<i3
 // COALESCE — two-pass (PG chapter 10.5)
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// Whether at least one of the plain columns among `args` is known
+/// non-NULL where they are read (a disjunction: `a IS NOT NULL OR b IS NOT
+/// NULL`, `CHECK (num_nonnulls(a, b) = 1)`).
+pub(crate) fn some_column_non_null(args: &[protobuf::Node], ctx: Ctx<'_>) -> bool {
+    let cols: Vec<crate::nonnull::Col> = args
+        .iter()
+        .filter_map(|a| crate::nonnull::plain_column(a, ctx.scope).map(|(c, _)| c))
+        .collect();
+    cols.len() > 1 && ctx.null_ctx.some_non_null(&cols)
+}
+
 pub(crate) fn infer_coalesce(
     expr: &protobuf::CoalesceExpr,
     ctx: Ctx<'_>,
@@ -131,7 +142,9 @@ pub(crate) fn infer_coalesce(
     for arg in &expr.args {
         args.push(infer_expr(arg, ctx, params, TypeGoal::NONE)?);
     }
-    let all_nullable = args.iter().all(|t| t.nullable);
+    // NULL only when every argument is — not when the quals or CHECK
+    // constraints say one of its columns isn't.
+    let all_nullable = args.iter().all(|t| t.nullable) && !some_column_non_null(&expr.args, ctx);
 
     // Resolve over the *full* arg list (unknowns included): the
     // all-identical fast path that preserves domains must see a NULL branch
@@ -223,8 +236,10 @@ pub(crate) fn infer_case(
                     )?;
                     // `test = value` TRUE: both non-NULL, if `=` is strict.
                     if log.is_strict(when.location, crate::nonnull::StrictNode::Op) {
-                        taken = crate::nonnull::nonnullable(test, false, ctx.scope, &log)
-                            .union(crate::nonnull::nonnullable(cond, false, ctx.scope, &log));
+                        taken = crate::nonnull::nonnullable(test, false, ctx.scope, &log, snapshot)
+                            .union(crate::nonnull::nonnullable(
+                                cond, false, ctx.scope, &log, snapshot,
+                            ));
                     }
                 }
                 // `argument of CASE/WHEN must be type boolean, not type X` —
@@ -236,7 +251,7 @@ pub(crate) fn infer_case(
                         params,
                         crate::clause::ClauseKind::CaseWhen,
                     )?;
-                    taken = crate::nonnull::nonnullable(cond, true, ctx.scope, &log);
+                    taken = crate::nonnull::nonnullable(cond, true, ctx.scope, &log, snapshot);
                 }
             }
         }
@@ -256,7 +271,7 @@ pub(crate) fn infer_case(
         }
         if let (None, Some(cond)) = (&expr.arg, &when.expr) {
             not_taken = not_taken.union(crate::nonnull::nonnullable_unless_true(
-                cond, ctx.scope, &log,
+                cond, ctx.scope, &log, snapshot,
             ));
         }
     }

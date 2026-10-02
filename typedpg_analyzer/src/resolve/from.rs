@@ -86,6 +86,28 @@ pub(crate) fn process_from_item(
                 && let Some(src) = scope.sources.last_mut()
             {
                 src.lock_error = view_lock_error(class, snapshot);
+                src.partial_scan =
+                    !rv.inh && class.relkind == crate::pg_catalog::RelKind::Partitioned;
+                // Every row of a table satisfies its CHECK constraints
+                // (named by the table's own column names: not with an
+                // alias list renaming them).
+                let renamed = rv.alias.as_ref().is_some_and(|a| !a.colnames.is_empty());
+                if !renamed
+                    && matches!(
+                        class.relkind,
+                        crate::pg_catalog::RelKind::Table | crate::pg_catalog::RelKind::Partitioned
+                    )
+                    && let Some(checks) =
+                        crate::nonnull::checks::RelationChecks::of(snapshot, class.oid)
+                {
+                    let base: HashMap<String, bool> = src
+                        .columns
+                        .iter()
+                        .map(|c| (c.name.clone(), c.base_not_null))
+                        .collect();
+                    let alias = src.alias.clone();
+                    null_ctx.register_checks(&alias, checks, base);
+                }
             }
             apply_alias_column_names(scope, rv.alias.as_ref())?;
         }
@@ -215,6 +237,9 @@ pub(crate) fn process_from_item(
                 AnalyzeError::Unsupported("RangeTableSample without relation".into())
             })?;
             process_from_item(relation, scope, null_ctx, snapshot, cte_scopes, params)?;
+            if let Some(src) = scope.sources.last_mut() {
+                src.partial_scan = true;
+            }
             // transformFromClauseItem: only a plain table, partitioned
             // table or materialized view can be sampled (not a view,
             // sequence, foreign table or WITH query).
@@ -547,6 +572,7 @@ fn process_join_expr(
     // `ON` are never registered with the collector and `into_sorted`
     // reports a spurious "parameter gap".
     let mut on_facts = crate::nonnull::Facts::default();
+    let mut equalities: Option<Vec<(crate::nonnull::Col, crate::nonnull::Col)>> = None;
     if let Some(quals) = &join.quals {
         // transformJoinOnClause: the ON clause sees just the join's two
         // sides (plus outer levels); the FROM items beside the join are in
@@ -571,7 +597,8 @@ fn process_join_expr(
             crate::clause::ClauseKind::JoinOn,
         )?;
         check_no_srf_in_clause(quals, snapshot, "JOIN conditions")?;
-        on_facts = crate::nonnull::nonnullable(quals, true, &on_scope, &log);
+        on_facts = crate::nonnull::nonnullable(quals, true, &on_scope, &log, snapshot);
+        equalities = on_equalities(quals, &on_scope, &log);
     }
 
     // `JOIN … USING (cols)` / `NATURAL JOIN` merge the join columns: the
@@ -599,7 +626,7 @@ fn process_join_expr(
     let merged = if using_names.is_empty() {
         None
     } else {
-        let (merged, facts) = merge_using_columns(
+        let (merged, facts, parts) = merge_using_columns(
             scope,
             null_ctx,
             snapshot,
@@ -609,7 +636,11 @@ fn process_join_expr(
             join_type,
         )?;
         on_facts = std::mem::take(&mut on_facts).union(facts);
-        Some(merged)
+        equalities = parts
+            .iter()
+            .map(|p| p.eq_strict.then(|| (p.left.0.clone(), p.right.0.clone())))
+            .collect();
+        Some((merged, parts))
     };
 
     // Apply JOIN nullability.
@@ -620,15 +651,19 @@ fn process_join_expr(
         JoinType::JoinInner => nullability::JoinKind::Inner,
         other => return Err(AnalyzeError::UnsupportedJoinType(other as i32)),
     };
-    null_ctx.record_join(
+    let fk = equalities
+        .as_deref()
+        .and_then(|eqs| fk_match(eqs, scope, left, right, null_ctx, snapshot));
+    let join_idx = null_ctx.record_join(
         kind,
         &nullability::collect_aliases(left.sources(scope)),
         &nullability::collect_aliases(right.sources(scope)),
         on_facts,
+        fk,
     );
 
     let merged_inserted = merged.is_some();
-    if let Some(merged) = merged {
+    if let Some((merged, parts)) = merged {
         // `USING (…) AS j` (PG 14) names the merged columns; otherwise they
         // live in an unreferencable synthetic source.
         let alias = match join.join_using_alias.as_ref() {
@@ -645,6 +680,23 @@ fn process_join_expr(
         if scope.sources.iter().any(|s| s.alias == alias) {
             return Err(crate::pgmsg::duplicate_table_alias(&alias, None).finalize_implicit());
         }
+        null_ctx.record_merged(
+            parts
+                .into_iter()
+                .map(|p| {
+                    (
+                        (alias.clone(), p.name),
+                        nullability::Merged {
+                            join: join_idx,
+                            left: p.left,
+                            right: p.right,
+                            inside_not_null: p.inside_not_null,
+                            eq_strict: p.eq_strict,
+                        },
+                    )
+                })
+                .collect(),
+        );
         scope.sources.insert(
             left.start,
             crate::scope::TableSource {
@@ -661,6 +713,164 @@ fn process_join_expr(
     Ok(())
 }
 
+/// The column pairs an ON clause equates, when it is nothing but an AND
+/// of strict `a.x = b.y` comparisons between plain columns.
+fn on_equalities(
+    quals: &protobuf::Node,
+    on_scope: &Scope,
+    log: &crate::nonnull::StrictLog,
+) -> Option<Vec<(crate::nonnull::Col, crate::nonnull::Col)>> {
+    fn conjuncts<'a>(n: &'a protobuf::Node, out: &mut Vec<&'a protobuf::Node>) {
+        match n.node.as_ref() {
+            Some(node::Node::BoolExpr(b))
+                if protobuf::BoolExprType::try_from(b.boolop)
+                    == Ok(protobuf::BoolExprType::AndExpr) =>
+            {
+                for a in &b.args {
+                    conjuncts(a, out);
+                }
+            }
+            _ => out.push(n),
+        }
+    }
+    let mut cs = Vec::new();
+    conjuncts(quals, &mut cs);
+    cs.into_iter()
+        .map(|c| {
+            let Some(node::Node::AExpr(e)) = c.node.as_ref() else {
+                return None;
+            };
+            if protobuf::AExprKind::try_from(e.kind) != Ok(protobuf::AExprKind::AexprOp)
+                || expr::extract_string_fields(&e.name).join(".") != "="
+                || !log.is_strict(e.location, crate::nonnull::StrictNode::Op)
+            {
+                return None;
+            }
+            let l = crate::nonnull::plain_column(e.lexpr.as_deref()?, on_scope)?.0;
+            let r = crate::nonnull::plain_column(e.rexpr.as_deref()?, on_scope)?.0;
+            Some((l, r))
+        })
+        .collect()
+}
+
+/// The foreign key a join follows, when its join condition is exactly the
+/// equalities of a foreign key between an entry on one side (the child)
+/// and the other side, which must be the referenced table alone (the
+/// parent, scanned in full and without row security hiding rows). The
+/// constraint is assumed to hold, `NOT VALID` or deferrable as it may be;
+/// a `NOT ENFORCED` one isn't.
+fn fk_match(
+    equalities: &[(crate::nonnull::Col, crate::nonnull::Col)],
+    scope: &Scope,
+    left: SourceSpan,
+    right: SourceSpan,
+    null_ctx: &NullabilityContext,
+    snapshot: &PgCatalog,
+) -> Option<nullability::FkMatch> {
+    let parent_of = |side: SourceSpan| -> Option<&crate::scope::TableSource> {
+        match side.sources(scope) {
+            [p] if matches!(p.kind, crate::scope::SourceKind::Relation) && !p.partial_scan => {
+                Some(p)
+            }
+            _ => None,
+        }
+    };
+    let in_span =
+        |side: SourceSpan, alias: &str| side.sources(scope).iter().any(|s| s.alias == alias);
+    let try_side = |parent_side: SourceSpan, child_side: SourceSpan, parent_is_left: bool| {
+        let parent = parent_of(parent_side)?;
+        let parent_rel = parent.relid?;
+        let parent_class = snapshot.pg_class.get(&parent_rel)?;
+        if !matches!(
+            parent_class.relkind,
+            crate::pg_catalog::RelKind::Table | crate::pg_catalog::RelKind::Partitioned
+        ) || snapshot.row_security.contains(&parent_rel)
+        {
+            return None;
+        }
+        // (child column, parent column) pairs, the child all one entry.
+        let mut pairs: Vec<(crate::nonnull::Col, String)> = Vec::new();
+        for (a, b) in equalities {
+            let (c, p) = if a.0 == parent.alias && in_span(child_side, &b.0) {
+                (b, a)
+            } else if b.0 == parent.alias && in_span(child_side, &a.0) {
+                (a, b)
+            } else {
+                return None;
+            };
+            pairs.push((c.clone(), p.1.clone()));
+        }
+        let child_alias = pairs.first()?.0.0.clone();
+        if pairs.iter().any(|(c, _)| c.0 != child_alias) {
+            return None;
+        }
+        let child = child_side
+            .sources(scope)
+            .iter()
+            .find(|s| s.alias == child_alias)?;
+        if !matches!(child.kind, crate::scope::SourceKind::Relation) {
+            return None;
+        }
+        let child_rel = child.relid?;
+        let attname = |rel, attnum: i16| {
+            snapshot
+                .attributes_of(rel)
+                .iter()
+                .find(|a| a.attnum == attnum)
+                .map(|a| a.attname.clone())
+        };
+        let wanted: std::collections::BTreeSet<(String, String)> = pairs
+            .iter()
+            .map(|(c, p)| (c.1.clone(), p.clone()))
+            .collect();
+        let follows = snapshot.pg_constraint.values().any(|con| {
+            con.contype == crate::pg_catalog::ConType::ForeignKey
+                && con.conrelid == child_rel
+                && con.confrelid == Some(parent_rel)
+                && con.conenforced
+                && !con.conperiod
+                && {
+                    let fk: Option<std::collections::BTreeSet<(String, String)>> = con
+                        .conkey
+                        .iter()
+                        .zip(&con.confkey)
+                        .map(|(&c, &p)| Some((attname(child_rel, c)?, attname(parent_rel, p)?)))
+                        .collect();
+                    fk.is_some_and(|fk| fk == wanted)
+                }
+        });
+        if !follows {
+            return None;
+        }
+        let base = |c: &str| {
+            child
+                .columns
+                .iter()
+                .find(|sc| sc.name == c)
+                .map(|sc| sc.base_not_null)
+        };
+        let child_cols: Vec<(crate::nonnull::Col, bool)> = pairs
+            .into_iter()
+            .map(|(c, _)| {
+                let b = base(&c.1).unwrap_or(false);
+                (c, b)
+            })
+            .collect();
+        let child_present = child_cols
+            .iter()
+            .all(|((a, c), b)| !null_ctx.is_nullable(a, c, *b));
+        Some(nullability::FkMatch {
+            parent_is_left,
+            child_cols,
+            child_present,
+        })
+    };
+    if equalities.is_empty() {
+        return None;
+    }
+    try_side(right, left, false).or_else(|| try_side(left, right, true))
+}
+
 /// `(a JOIN b …) AS j [(c1, …)]`, as PG's `transformFromClauseItem` /
 /// `addRangeTableEntryForJoin`: the join becomes one FROM entry `j` whose
 /// columns are its output — merged USING columns, then the left side's,
@@ -670,12 +880,19 @@ fn process_join_expr(
 /// name repeated across the sides is ambiguous even as `j.id`.
 fn alias_join(
     scope: &mut Scope,
-    null_ctx: &NullabilityContext,
+    null_ctx: &mut NullabilityContext,
     alias: &protobuf::Alias,
     start: usize,
     end: usize,
 ) -> Result<(), AnalyzeError> {
     let inner: Vec<crate::scope::TableSource> = scope.sources.drain(start..end).collect();
+    // What each column is inside the join: its nullability follows that
+    // column's, as later quals narrow it or reduce the join it's in.
+    let inner_cols: Vec<(String, String, bool)> = inner
+        .iter()
+        .flat_map(|s| s.visible_columns())
+        .map(|c| (c.table_alias.clone(), c.name.clone(), c.base_not_null))
+        .collect();
     let mut columns: Vec<ScopeColumn> = inner
         .iter()
         .flat_map(|s| s.visible_columns())
@@ -699,6 +916,13 @@ fn alias_join(
     }
     if scope.sources.iter().any(|s| s.alias == alias.aliasname) {
         return Err(crate::pgmsg::duplicate_table_alias(&alias.aliasname, None).finalize_implicit());
+    }
+    // A name repeated across the sides can't be referenced (it's
+    // ambiguous): only unique names are mapped.
+    for (c, (ia, ic, ibase)) in columns.iter().zip(inner_cols) {
+        if columns.iter().filter(|o| o.name == c.name).count() == 1 {
+            null_ctx.record_aliased((alias.aliasname.clone(), c.name.clone()), (ia, ic), ibase);
+        }
     }
     scope.shadowed_sources.extend(
         inner
@@ -754,7 +978,7 @@ fn merge_using_columns(
     left: SourceSpan,
     right: SourceSpan,
     join_type: JoinType,
-) -> Result<(Vec<ScopeColumn>, crate::nonnull::Facts), AnalyzeError> {
+) -> Result<(Vec<ScopeColumn>, crate::nonnull::Facts, Vec<MergedParts>), AnalyzeError> {
     // `(source index, column)` of the unique visible column named `name`.
     let find_col = |scope: &Scope,
                     span: SourceSpan,
@@ -777,6 +1001,7 @@ fn merge_using_columns(
 
     let mut merged: Vec<ScopeColumn> = Vec::with_capacity(using_names.len());
     let mut facts = crate::nonnull::Facts::default();
+    let mut parts: Vec<MergedParts> = Vec::new();
     let mut hide: Vec<(usize, String)> = Vec::new();
     for (i, name) in using_names.iter().enumerate() {
         if using_names[..i].contains(name) {
@@ -817,6 +1042,13 @@ fn merge_using_columns(
                 .union(crate::nonnull::Facts::column(&l.table_alias, &l.name))
                 .union(crate::nonnull::Facts::column(&r.table_alias, &r.name));
         }
+        parts.push(MergedParts {
+            name: name.clone(),
+            left: ((l.table_alias.clone(), l.name.clone()), l.base_not_null),
+            right: ((r.table_alias.clone(), r.name.clone()), r.base_not_null),
+            inside_not_null: (l_not_null, r_not_null),
+            eq_strict,
+        });
         let base_not_null = match join_type {
             JoinType::JoinLeft => l_not_null,
             JoinType::JoinRight => r_not_null,
@@ -844,7 +1076,17 @@ fn merge_using_columns(
     for (idx, name) in hide {
         scope.sources[idx].join_hidden.insert(name);
     }
-    Ok((merged, facts))
+    Ok((merged, facts, parts))
+}
+
+/// A `JOIN USING` merged column's constituents (with their own NOT NULL)
+/// and whether its `l = r` is strict.
+struct MergedParts {
+    name: String,
+    left: (crate::nonnull::Col, bool),
+    right: (crate::nonnull::Col, bool),
+    inside_not_null: (bool, bool),
+    eq_strict: bool,
 }
 
 /// Apply a FROM item's column-alias list (`users AS t(a, b, c)`) to the
