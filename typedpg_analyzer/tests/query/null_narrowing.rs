@@ -146,13 +146,13 @@ fn strict_comparisons_narrow_their_operands() {
 fn quals_that_hold_for_null_prove_nothing() {
     let db = setup();
     for qual in [
-        // Not strict.
-        "coalesce(age, 0) > 0",
+        // Not strict (and TRUE for a NULL `age`).
+        "coalesce(age, 1) > 0",
         "age IS DISTINCT FROM 5",
         "is_pos_lax(age)",
         "age === 1",
         "CASE WHEN age > 0 THEN true ELSE true END",
-        "concat(age, '') = '1'",
+        "concat(age, '1') = '1'",
         "greatest(age, 1) > 0",
         "nullif(age, 0) IS NULL",
         // Arguments packed into a VARIADIC array: the function gets a
@@ -172,7 +172,7 @@ fn quals_that_hold_for_null_prove_nothing() {
         "(age > 1 AND id > 0) IS NOT TRUE",
         // A parameter or a subquery says nothing about the column.
         "$1::int IS NOT NULL",
-        "EXISTS (SELECT 1 FROM posts WHERE posts.id = users.age)",
+        "EXISTS (SELECT 1 FROM posts WHERE posts.id = users.age OR users.age IS NULL)",
         "id IN (SELECT age FROM users)",
     ] {
         assert_nullable(
@@ -203,11 +203,17 @@ fn row_and_whole_row_tests() {
         "SELECT age FROM users u WHERE u.* IS NOT NULL",
         &[("age", false)],
     );
-    // A composite column IS NOT NULL is itself non-NULL; reading a field
-    // still depends on the field.
+    // A composite column IS NOT NULL is itself non-NULL, and so is every
+    // field of it (a row-wise test); not NULL, it may still be a row of
+    // NULLs.
     assert_nullable(
         &db,
         "SELECT p, (p).a AS a FROM users WHERE p IS NOT NULL",
+        &[("p", false), ("a", false)],
+    );
+    assert_nullable(
+        &db,
+        "SELECT p, (p).a AS a FROM users WHERE NOT (p IS NULL)",
         &[("p", false), ("a", true)],
     );
     // A field of a NULL composite is NULL: a strict test on it proves the

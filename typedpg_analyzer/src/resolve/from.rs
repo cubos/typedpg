@@ -13,9 +13,29 @@ pub(crate) fn process_from_clause(
     params: &mut ParamCollector,
 ) -> Result<(), AnalyzeError> {
     for node in from_clause {
-        process_from_item(node, scope, null_ctx, snapshot, cte_scopes, params)?;
+        with_rows_kept(true, || {
+            process_from_item(node, scope, null_ctx, snapshot, cte_scopes, params)
+        })?;
     }
     Ok(())
+}
+
+thread_local! {
+    /// The FROM item being processed is never null-extended in this
+    /// level's rows: it is a FROM-list item, or a side of joins that
+    /// preserve it all the way up.
+    static ROWS_KEPT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn rows_kept() -> bool {
+    ROWS_KEPT.with(|k| k.get())
+}
+
+fn with_rows_kept<R>(kept: bool, f: impl FnOnce() -> R) -> R {
+    let before = ROWS_KEPT.with(|k| k.replace(kept));
+    let out = f();
+    ROWS_KEPT.with(|k| k.set(before));
+    out
 }
 
 pub(crate) fn process_from_item(
@@ -210,15 +230,27 @@ pub(crate) fn process_from_item(
                 shadowed_sources.extend(scope.shadowed_sources.iter().cloned());
                 // Every FROM subquery still sees the enclosing query levels
                 // as outer references.
-                let (mut cols, _) = analyze_select_with_ctes_and_outer(
-                    sel,
-                    snapshot,
-                    params,
-                    cte_scopes,
-                    &lateral_sources,
-                    &enclosing,
-                    &shadowed_sources,
-                )?;
+                // A LATERAL subquery that is never null-extended: what its
+                // WHERE proves of the entries to its left holds for every
+                // row of this level (see `nonnull::capture_correlation`).
+                let capture = sub.lateral && rows_kept();
+                let (analyzed, correlated) = crate::nonnull::capture_correlation(sel, || {
+                    analyze_select_with_ctes_and_outer(
+                        sel,
+                        snapshot,
+                        params,
+                        cte_scopes,
+                        &lateral_sources,
+                        &enclosing,
+                        &shadowed_sources,
+                    )
+                });
+                let (mut cols, _) = analyzed?;
+                if capture {
+                    null_ctx.add_where_facts(
+                        correlated.restricted_to(&crate::nonnull::own_aliases(scope)),
+                    );
+                }
                 resolve_unknown_outputs(sel, &mut cols, params, snapshot)?;
                 let mut scope_cols: Vec<ScopeColumn> = cols
                     .into_iter()
@@ -576,8 +608,12 @@ fn process_join_expr(
     let join_type = JoinType::try_from(join.jointype)
         .map_err(|_| AnalyzeError::UnsupportedJoinType(join.jointype))?;
 
+    let kept = rows_kept();
     let left = SourceSpan::capture(scope, |scope| match &join.larg {
-        Some(larg) => process_from_item(larg, scope, null_ctx, snapshot, cte_scopes, params),
+        Some(larg) => with_rows_kept(
+            kept && matches!(join_type, JoinType::JoinInner | JoinType::JoinLeft),
+            || process_from_item(larg, scope, null_ctx, snapshot, cte_scopes, params),
+        ),
         None => Ok(()),
     })?;
     // PG exposes the left side to a LATERAL right side, but a reference to
@@ -593,7 +629,10 @@ fn process_join_expr(
         scope.lateral_blocked_aliases.extend(left_aliases);
     }
     let right = SourceSpan::capture(scope, |scope| match &join.rarg {
-        Some(rarg) => process_from_item(rarg, scope, null_ctx, snapshot, cte_scopes, params),
+        Some(rarg) => with_rows_kept(
+            kept && matches!(join_type, JoinType::JoinInner | JoinType::JoinRight),
+            || process_from_item(rarg, scope, null_ctx, snapshot, cte_scopes, params),
+        ),
         None => Ok(()),
     });
     scope.lateral_blocked_aliases = blocked_before;

@@ -244,11 +244,19 @@ pub(crate) fn infer_type_cast(
     } else {
         None
     };
-    Ok(
-        ExprType::scalar_with_typmod(target_oid, nullable, written_typmod)
+    // `ROW(a, b)::pair` is the row built for `pair` (and a cast to the
+    // composite a value already is changes nothing): its fields keep
+    // their nullability.
+    let record_fields = inner_type.record_fields.filter(|_| {
+        coerce::is_complex(target_oid, snapshot)
+            && snapshot.unwrap_domain(inner_type.type_oid) == snapshot.unwrap_domain(target_oid)
+    });
+    Ok(ExprType {
+        record_fields,
+        ..ExprType::scalar_with_typmod(target_oid, nullable, written_typmod)
             .with_collation(state)
-            .with_elem_nullable(elem_nullable),
-    )
+            .with_elem_nullable(elem_nullable)
+    })
 }
 
 /// Whether the cast from `source` to `target` runs a cast function that can
