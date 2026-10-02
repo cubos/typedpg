@@ -141,6 +141,11 @@ pub(crate) struct NullabilityContext {
     /// The frame options (`FRAMEOPTION_*` bits) of each window the SELECT's
     /// WINDOW clause names — what `OVER w` runs over.
     pub window_frames: std::collections::HashMap<String, i32>,
+    /// The query may yield a row no row past WHERE made: an aggregate
+    /// query without GROUP BY (or with an empty grouping set) over an
+    /// empty input. What WHERE proves of an expression then doesn't hold
+    /// for the select list's (uncorrelated) expressions.
+    pub where_exprs_off: bool,
 }
 
 impl NullabilityContext {
@@ -660,6 +665,22 @@ impl NullabilityContext {
             }
         }
         self.grouping_omitted = all;
+    }
+
+    /// Whether a qual proved the expression keyed `key` (see
+    /// [`crate::nonnull::exprs`]) non-NULL where it is read: where a HAVING,
+    /// WHEN or FILTER did, or WHERE — unless grouping sets may null out
+    /// what it is computed from after WHERE.
+    pub fn expr_proven_non_null(&self, key: &str) -> bool {
+        self.local_facts.exprs.contains(key)
+            || (self.grouping_omitted.is_empty()
+                && !self.where_exprs_off
+                && self.where_facts.exprs.contains(key))
+    }
+
+    /// Whether any expression fact holds here (a cheap pre-check).
+    pub fn has_expr_facts(&self) -> bool {
+        !self.local_facts.exprs.is_empty() || !self.where_facts.exprs.is_empty()
     }
 
     /// Whether at least one of `cols` is known non-NULL where the value is

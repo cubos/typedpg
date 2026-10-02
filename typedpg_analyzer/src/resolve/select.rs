@@ -278,6 +278,7 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
     // emits its own wording on mismatch: `argument of WHERE must be type
     // boolean, not type X`. Catch the generic coerce error and rewrite to
     // PG's exact message so `pglite_sanity` matches.
+    let mut correlated: Option<crate::nonnull::Facts> = None;
     if let Some(where_clause) = &sel.where_clause {
         // PG rejects aggregate / window function calls inside WHERE (they
         // reference the post-aggregation row, not the pre-aggregation one) —
@@ -293,9 +294,23 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
         check_no_srf_in_clause(where_clause, snapshot, "WHERE")?;
         // What the rows past WHERE have non-NULL — read by everything
         // evaluated after it, and reducing outer joins PG would reduce.
-        let facts = crate::nonnull::nonnullable(where_clause, true, &scope, &log, snapshot)
-            .restricted_to(&crate::nonnull::own_aliases(&scope));
-        null_ctx.add_where_facts(facts);
+        let facts = crate::nonnull::nonnullable(where_clause, true, &scope, &log, snapshot);
+        let own = crate::nonnull::own_aliases(&scope);
+        // An EXISTS / LATERAL subquery hands what it proves of the levels
+        // around it up (see `nonnull::capture_correlation`).
+        if crate::nonnull::correlation_wanted(sel) {
+            let outer: std::collections::HashSet<String> = scope
+                .outer_sources
+                .iter()
+                .chain(&scope.lateral_sources)
+                .map(|s| s.alias.clone())
+                .filter(|a| !own.contains(a))
+                .collect();
+            correlated = Some(facts.clone().restricted_to(&outer));
+        }
+        null_ctx.add_where_facts(facts.restricted_to(&own));
+        null_ctx.where_exprs_off = (sel.group_clause.is_empty() || null_ctx.has_empty_grouping_set)
+            && may_aggregate(sel, &scope, snapshot);
     }
 
     // Collect select-list aliases so GROUP BY / ORDER BY can fall back to
@@ -516,7 +531,85 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
     // everything above.
     grouping::finish_select_level(sel, &scope, &targets, snapshot)?;
 
+    // Every row comes from one WHERE passed — unless an aggregate query
+    // without GROUP BY (or with an empty grouping set) makes a row of an
+    // empty input.
+    if let Some(facts) = correlated {
+        let rows_from_where = if sel.group_clause.is_empty() {
+            sel.having_clause.is_none() && !grouping::level_info(sel).is_none_or(|l| l.has_aggs)
+        } else {
+            !null_ctx.has_empty_grouping_set
+        };
+        if rows_from_where {
+            crate::nonnull::deposit_correlation(sel, facts);
+        }
+    }
+
     Ok((columns, None))
+}
+
+/// Whether `sel` may be an aggregate query: HAVING, or a call that may be
+/// an aggregate of this level in its select list or ORDER BY — directly,
+/// or in a sublink over a column this level may provide (PG gives an
+/// aggregate the level of its arguments' columns).
+fn may_aggregate(sel: &protobuf::SelectStmt, scope: &Scope, snapshot: &PgCatalog) -> bool {
+    use typedpg_pg_query::NodeRef;
+    let is_aggregate = |f: &protobuf::FuncCall| {
+        let parts = expr::extract_string_fields(&f.funcname);
+        let (schema, name) = match parts.as_slice() {
+            [n] => (None, n.as_str()),
+            [s, n] => (Some(s.as_str()), n.as_str()),
+            _ => return true,
+        };
+        snapshot
+            .find_functions(schema, name)
+            .iter()
+            .any(|p| matches!(p.prokind, crate::pg_catalog::ProKind::Aggregate))
+    };
+    // A column reference below `n` that may resolve to this level.
+    fn mentions_own(n: NodeRef<'_>, scope: &Scope) -> bool {
+        if let NodeRef::ColumnRef(cr) = n {
+            let parts = expr::extract_string_fields(&cr.fields);
+            return match parts.as_slice() {
+                [] => true,
+                [one] => {
+                    scope.find_source(one).is_some()
+                        || scope
+                            .sources
+                            .iter()
+                            .any(|s| s.visible_columns().any(|c| &c.name == one))
+                }
+                [.., table, _] => scope.find_source(table).is_some(),
+            };
+        }
+        n.children().into_iter().any(|c| mentions_own(c, scope))
+    }
+    let mentions_own = |n: NodeRef<'_>| mentions_own(n, scope);
+    fn walk(
+        n: NodeRef<'_>,
+        in_sublink: bool,
+        is_aggregate: &dyn Fn(&protobuf::FuncCall) -> bool,
+        mentions_own: &dyn Fn(NodeRef<'_>) -> bool,
+    ) -> bool {
+        let own = match n {
+            NodeRef::FuncCall(f) if is_aggregate(f) => !in_sublink || mentions_own(n),
+            NodeRef::JsonObjectAgg(_) | NodeRef::JsonArrayAgg(_) | NodeRef::GroupingFunc(_) => {
+                !in_sublink || mentions_own(n)
+            }
+            _ => false,
+        };
+        let below = in_sublink || matches!(n, NodeRef::SubLink(_));
+        own || n
+            .children()
+            .into_iter()
+            .any(|c| walk(c, below, is_aggregate, mentions_own))
+    }
+    sel.having_clause.is_some()
+        || sel.target_list.iter().chain(&sel.sort_clause).any(|n| {
+            n.node
+                .as_ref()
+                .is_some_and(|n| walk(n.to_ref(), false, &is_aggregate, &mentions_own))
+        })
 }
 
 /// What an ORDER BY / GROUP BY / DISTINCT ON item denotes.

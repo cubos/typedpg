@@ -175,6 +175,20 @@ fn handle_distinct_from(
         })?;
     } else {
         infer_synthetic_op("=", lexpr, rexpr, expr.location, ctx, params)?;
+        // Not distinct from a non-NULL side, the other side is non-NULL
+        // too (see `nonnull::distinct_facts`). A peek, on a throwaway
+        // collector.
+        if ctx.strict_log.is_some() {
+            for (side, kind) in [
+                (lexpr, crate::nonnull::StrictNode::DistinctLeftNonNull),
+                (rexpr, crate::nonnull::StrictNode::DistinctRightNonNull),
+            ] {
+                let mut scratch = params.clone();
+                let non_null =
+                    infer_expr(side, ctx, &mut scratch, TypeGoal::NONE).is_ok_and(|t| !t.nullable);
+                ctx.note_strict(expr.location, kind, non_null);
+            }
+        }
     }
     Ok(Some(ExprType::scalar(oid::BOOL, false)))
 }
@@ -580,10 +594,13 @@ fn handle_any_all(
     let any_nullable = op_nullable
         || left.as_ref().is_some_and(|l| l.nullable)
         || right.as_ref().is_some_and(|r| r.nullable)
-        || expr
-            .rexpr
-            .as_deref()
-            .is_none_or(|r| array_elements_may_be_null(r, ctx, params));
+        // Elements known non-NULL from the value's own type (`ARRAY(SELECT
+        // nn_col …)`), or from its constructor / literal.
+        || (right.as_ref().and_then(|r| r.elem_nullable) != Some(false)
+            && expr
+                .rexpr
+                .as_deref()
+                .is_none_or(|r| array_elements_may_be_null(r, ctx, params)));
     Ok(Some(ExprType::scalar(oid::BOOL, any_nullable)))
 }
 
@@ -823,6 +840,9 @@ fn infer_generic_binary_op(
                         .is_none_or(|(a, d)| ctx.coercion_is_strict(a, d))
                     && ctx.coercion_is_strict(right_oid_resolved, op.right_type_oid),
             );
+            if ctx.strict_log.is_some() {
+                note_std_compare(expr.location, op_name, &op, &left, &right, ctx);
+            }
             if let (Some(actual), Some(declared)) = (left_oid_resolved, op.left_type_oid) {
                 ctx.note_coercion(actual, declared);
             }
@@ -1260,4 +1280,61 @@ fn is_restriction_variable(node: &protobuf::Node, ctx: Ctx<'_>) -> bool {
     }
     let mut rel = None;
     walk(node, ctx, &mut rel) && rel.is_some()
+}
+
+/// Record whether the comparison at `location` is one the NULL
+/// substitution of [`crate::nonnull::subst`] may compute over constants:
+/// a built-in `=` `<>` `<` `>` `<=` `>=` between integer, numeric or float
+/// operands (or `=` / `<>` between booleans) — and, separately, a
+/// built-in `text = text` / `text <> text` under a deterministic
+/// collation, whose result is then byte equality.
+fn note_std_compare(
+    location: i32,
+    op_name: &str,
+    op: &crate::lookup::ResolvedOperator,
+    left: &Option<ExprType>,
+    right: &Option<ExprType>,
+    ctx: Ctx<'_>,
+) {
+    let snapshot = ctx.snapshot;
+    let builtin = snapshot.pg_operator.get(&op.oid).is_some_and(|o| {
+        snapshot.namespace_name(o.oprnamespace) == Some("pg_catalog")
+            && o.oprcode
+                .and_then(|f| snapshot.pg_proc.get(&f))
+                .is_some_and(|p| snapshot.namespace_name(p.pronamespace) == Some("pg_catalog"))
+    });
+    let equality = matches!(op_name, "=" | "<>");
+    let ordering = equality || matches!(op_name, "<" | ">" | "<=" | ">=");
+    let numeric = |t: PgTypeOid| {
+        [
+            oid::INT2,
+            oid::INT4,
+            oid::INT8,
+            oid::NUMERIC,
+            oid::FLOAT4,
+            oid::FLOAT8,
+        ]
+        .contains(&t)
+    };
+    let (Some(l), r) = (op.left_type_oid, op.right_type_oid) else {
+        ctx.note_strict(location, crate::nonnull::StrictNode::StdCompare, false);
+        ctx.note_strict(location, crate::nonnull::StrictNode::TextEquality, false);
+        return;
+    };
+    let std = builtin
+        && op.result_type_oid == oid::BOOL
+        && ((ordering && numeric(l) && numeric(r))
+            || (equality && l == oid::BOOL && r == oid::BOOL));
+    ctx.note_strict(location, crate::nonnull::StrictNode::StdCompare, std);
+    // PG's database default (100), "C" (950) and "POSIX" (951) compare
+    // bytes; a nondeterministic collation may equal different strings.
+    let deterministic = derive_collation(left.iter().chain(right.iter()), oid::TEXT, snapshot)
+        .is_ok_and(|(c, _)| c.is_none_or(|c| matches!(c.get(), 100 | 950 | 951)));
+    let text = builtin
+        && equality
+        && op.result_type_oid == oid::BOOL
+        && l == oid::TEXT
+        && r == oid::TEXT
+        && deterministic;
+    ctx.note_strict(location, crate::nonnull::StrictNode::TextEquality, text);
 }

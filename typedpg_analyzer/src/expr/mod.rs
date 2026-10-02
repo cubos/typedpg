@@ -819,6 +819,20 @@ pub(crate) fn infer_expr(
     // being inferred when it was.
     let mut t = infer_expr_unlocated(node, ctx, params, goal)
         .map_err(|e| crate::error::with_fallback_span(e, || crate::error::expr_span(node)))?;
+    // The same expression a qual proved non-NULL for this row (`WHERE
+    // j ->> 'k' IS NOT NULL`, `HAVING max(b) > 0`) — see `nonnull::exprs`.
+    if t.nullable
+        && ctx.null_ctx.has_expr_facts()
+        && !matches!(
+            node.node.as_ref(),
+            Some(node::Node::ColumnRef(_) | node::Node::AConst(_) | node::Node::ParamRef(_))
+        )
+        && ctx
+            .null_ctx
+            .expr_proven_non_null(&crate::nonnull::exprs::key(node))
+    {
+        t.nullable = false;
+    }
     // A grouped expression some grouping set leaves out is NULL in that
     // set's rows (`GROUP BY ROLLUP (g + 1)`'s total row).
     if !t.nullable
@@ -1037,7 +1051,7 @@ fn infer_expr_unlocated(
             };
 
             if let Some((composite_oid, composite_fields)) = composite_goal {
-                let mut any_nullable = false;
+                let mut shape = Vec::with_capacity(row.args.len());
                 for (i, (arg, field)) in row.args.iter().zip(composite_fields.iter()).enumerate() {
                     // coerce_record_to_complex: a field that doesn't
                     // coerce fails the whole record's cast, worded as
@@ -1069,12 +1083,32 @@ fn infer_expr_unlocated(
                         .finalize_implicit());
                     }
                     let t = infer_expr(arg, ctx, params, TypeGoal::assignment(field.atttypid))?;
-                    any_nullable = any_nullable || t.nullable;
+                    // coerce_record_to_complex keeps each value, coerced to
+                    // its field's type: still non-NULL when no cast runs
+                    // (same type) or an untyped literal is read by the
+                    // field type's input function. Any other cast may map a
+                    // value to NULL (`int4(jsonb)` on a JSON null).
+                    let literal = matches!(
+                        arg.node.as_ref(),
+                        Some(node::Node::AConst(c)) if !c.isnull
+                    );
+                    let kept =
+                        own.type_oid == field.atttypid || (own.type_oid == oid::UNKNOWN && literal);
+                    shape.push(RecordField {
+                        name: field.attname.clone(),
+                        ty: ExprType::scalar_with_typmod(
+                            field.atttypid,
+                            t.nullable || !kept,
+                            field.atttypmod,
+                        ),
+                    });
                 }
-                // ROW value is never NULL; element NULLs are tracked
-                // inside the composite, not at the outer site.
-                let _ = any_nullable;
-                return Ok(ExprType::scalar(composite_oid, false));
+                // ROW value is never NULL; its fields' nullability is the
+                // composite's shape (what `(ROW(a, b)::pair).x` reads).
+                return Ok(ExprType {
+                    record_fields: Some(shape.into()),
+                    ..ExprType::scalar(composite_oid, false)
+                });
             }
 
             // PG names anonymous ROW elements `f1`, `f2`, ... by position.

@@ -25,13 +25,21 @@ pub(crate) fn infer_sublink(
             if let Some(subselect) = &sub.subselect
                 && let Some(node::Node::SelectStmt(sel)) = subselect.node.as_ref()
             {
-                let _ = crate::resolve::analyze_correlated_select(
-                    sel,
-                    snapshot,
-                    params,
-                    scope,
-                    ctx.null_ctx,
-                )?;
+                // What the subquery's WHERE proves of this level's columns
+                // holds whenever EXISTS is TRUE (see `capture_correlation`).
+                let (analyzed, facts) = crate::nonnull::capture_correlation(sel, || {
+                    crate::resolve::analyze_correlated_select(
+                        sel,
+                        snapshot,
+                        params,
+                        scope,
+                        ctx.null_ctx,
+                    )
+                });
+                analyzed?;
+                if let Some(log) = ctx.strict_log {
+                    log.note_correlated(sub.location, facts);
+                }
             }
             Ok(ExprType::scalar(oid::BOOL, false))
         }
@@ -122,15 +130,36 @@ pub(crate) fn infer_sublink(
                 // fields' comparisons, never TRUE with a NULL field).
                 let mut strict = sub_type == protobuf::SubLinkType::AnySublink
                     && (lhs_row.is_none() || op_name == "=");
+                // ExecScanSubPlan: ANY / ALL is NULL only when some
+                // comparison is and none decides the result — never when
+                // both sides of every comparison are non-NULL and the
+                // operator can't yield NULL for non-NULL inputs (an empty
+                // subquery gives FALSE / TRUE).
+                let mut result_nullable = false;
                 for (lhs_node, col) in lhs_nodes.iter().zip(cols.iter()) {
                     let lhs = infer_expr(lhs_node, ctx, params, TypeGoal::NONE)?;
                     let l_oid = lhs.type_oid;
                     let r_oid = col.type_oid;
+                    result_nullable |= lhs.nullable || col.nullable;
                     match snapshot.find_operator(&op_name, Some(l_oid), r_oid) {
                         Some(op) if l_oid != oid::UNKNOWN && r_oid != oid::UNKNOWN => {
                             strict &= ctx.proc_is_strict(op.code);
+                            let builtin = op
+                                .code
+                                .and_then(|c| snapshot.pg_proc.get(&c))
+                                .is_some_and(|p| Some(p.pronamespace) == snapshot.pg_catalog_oid());
+                            result_nullable |= !builtin
+                                || functions::operator_result_nullable(
+                                    snapshot,
+                                    &op_name,
+                                    op.code,
+                                    &[false, false],
+                                );
                         }
-                        _ => strict = false,
+                        _ => {
+                            strict = false;
+                            result_nullable = true;
+                        }
                     }
                     // An UNKNOWN side (bare literal / unpinned param) is coerced
                     // by PG to its peer — pin params and skip the rejection.
@@ -168,6 +197,7 @@ pub(crate) fn infer_sublink(
                     }
                 }
                 ctx.note_strict(sub.location, crate::nonnull::StrictNode::Sublink, strict);
+                return Ok(ExprType::scalar(oid::BOOL, result_nullable));
             }
             Ok(ExprType::scalar(oid::BOOL, true))
         }

@@ -17,12 +17,56 @@ pub(crate) fn infer_bool_expr(
         Ok(protobuf::BoolExprType::OrExpr) => crate::clause::ClauseKind::Or,
         _ => crate::clause::ClauseKind::And,
     };
+    // Three-valued logic: `a OR b` is NULL only when neither arm is TRUE
+    // and one is NULL. So each arm is read knowing the arms before it are
+    // not TRUE (for AND: not FALSE) — `b IS NULL OR b > 0` never is NULL —
+    // and a constant `true` arm of an OR (`false` of an AND) decides it.
+    // (If the result were NULL, no arm would decide it, so every arm
+    // would be read under facts that hold, hence be non-NULL: a
+    // contradiction.)
+    let op = protobuf::BoolExprType::try_from(expr.boolop);
+    let or = op == Ok(protobuf::BoolExprType::OrExpr);
+    let and_or = or || op == Ok(protobuf::BoolExprType::AndExpr);
+    let own_log = crate::nonnull::StrictLog::default();
+    let (ctx, log) = match ctx.strict_log {
+        Some(log) => (ctx, log),
+        None => (ctx.logging_strictness(&own_log), &own_log),
+    };
+    let own = crate::nonnull::own_aliases(ctx.scope);
+    let mut before = crate::nonnull::Facts::default();
     let mut any_nullable = false;
+    let mut decided = false;
     for arg in &expr.args {
-        let t = crate::clause::coerce_clause_expr(arg, ctx, params, kind)?;
+        let narrowed = if and_or {
+            ctx.null_ctx
+                .with_local_facts(before.clone().restricted_to(&own))
+        } else {
+            None
+        };
+        let arg_ctx = match &narrowed {
+            Some(n) => ctx.with_null_ctx(n),
+            None => ctx,
+        };
+        let t = crate::clause::coerce_clause_expr(arg, arg_ctx, params, kind)?;
         any_nullable = any_nullable || t.nullable;
+        if and_or {
+            decided |= matches!(
+                arg.node.as_ref(),
+                Some(node::Node::AConst(protobuf::AConst {
+                    isnull: false,
+                    val: Some(a_const::Val::Boolval(b)),
+                    ..
+                })) if b.boolval == or
+            );
+            let facts = if or {
+                crate::nonnull::nonnullable_unless_true(arg, ctx.scope, log, ctx.snapshot)
+            } else {
+                crate::nonnull::nonnullable_unless_false(arg, ctx.scope, log, ctx.snapshot)
+            };
+            before = before.union(facts);
+        }
     }
-    Ok(ExprType::scalar(oid::BOOL, any_nullable))
+    Ok(ExprType::scalar(oid::BOOL, any_nullable && !decided))
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

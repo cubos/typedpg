@@ -269,6 +269,12 @@ let rows = sql!(pool,
     .fetch_all().await?;
 // rows[0].title : String
 
+// The same expression, filtered then selected
+let rows = sql!(pool,
+    "SELECT data ->> 'email' AS email FROM users WHERE data ->> 'email' IS NOT NULL")
+    .fetch_all().await?;
+// rows[0].email : String
+
 // A CASE branch knows what its WHEN ruled out
 let rows = sql!(pool, "SELECT CASE WHEN age IS NULL THEN 0 ELSE age END AS age FROM users")
     .fetch_all().await?;
@@ -321,8 +327,15 @@ its columns non-NULL makes all of them so.
 A referenced table under row-level security doesn't count: its policies may
 hide the row.
 
-Only strict conditions count: `coalesce(age, 0) > 0`, `age IS DISTINCT FROM 5`
-or an `OR` whose arms test different columns prove nothing.
+Besides strict conditions, any condition that can't hold with a column NULL
+counts: `coalesce(age, 0) > 0`, `age IS NOT DISTINCT FROM 5`, `(tenant_id, id)
+= ($1, $2)`, `b IS NULL OR b > 0` (never NULL itself), or an `EXISTS` whose
+subquery's `WHERE` is strict in an outer column. A condition on an expression
+narrows the same expression where it is read again — `WHERE data ->> 'k' IS
+NOT NULL` then `data ->> 'k'`, `HAVING max(x) > 0` then `max(x)` — unless it
+runs a volatile function. Conditions that may hold for a NULL prove nothing:
+`coalesce(age, 1) > 0`, `age IS DISTINCT FROM 5`, or an `OR` whose arms test
+different columns.
 
 A generated column (STORED or VIRTUAL) is its expression over the row, so
 `GENERATED ALWAYS AS (coalesce(note, ''))` is never NULL. A view that is

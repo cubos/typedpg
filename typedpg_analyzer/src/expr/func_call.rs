@@ -963,6 +963,178 @@ fn is_zero_offset(n: &protobuf::Node) -> bool {
     }
 }
 
+/// Built-ins whose only NULL results (beyond NULL arguments) depend on
+/// argument values the call spells out — so that, with those arguments as
+/// written, the call is NULL exactly when an argument is:
+///
+/// - `jsonb_path_exists[_tz]` is NULL for a path error only when `silent`
+///   (jsonpath_exec.c): without it, or with a literal `false`, errors are
+///   raised instead;
+/// - `to_char(timestamp[tz] | interval, fmt)` is NULL for an empty format
+///   or a non-finite value: a non-empty literal format over a source that
+///   is always finite (`now()`, `CURRENT_TIMESTAMP`, a literal interval
+///   other than infinity);
+/// - `extract` / `date_part` over such a finite timestamp or date has no
+///   infinite input to be NULL for;
+/// - `array_length` / `array_lower` / `array_upper` (dimension literal 1),
+///   `array_ndims` and `array_dims` of a non-empty `ARRAY[…]` of scalars,
+///   a one-dimensional array.
+fn value_gated_non_null(
+    func: &protobuf::FuncCall,
+    resolved: &functions::ResolvedFunction,
+    ctx: Ctx<'_>,
+    params: &ParamCollector,
+) -> bool {
+    let proname = resolved.signature.split('(').next().unwrap_or_default();
+    let positional: Vec<&protobuf::Node> = func
+        .args
+        .iter()
+        .take_while(|a| !matches!(a.node.as_ref(), Some(node::Node::NamedArgExpr(_))))
+        .collect();
+    let named = |name: &str| {
+        func.args.iter().find_map(|a| match a.node.as_ref() {
+            Some(node::Node::NamedArgExpr(na)) if na.name == name => na.arg.as_deref(),
+            _ => None,
+        })
+    };
+    let first_type = resolved.arg_types.first().copied();
+    match proname {
+        "jsonb_path_exists" | "jsonb_path_exists_tz" => {
+            let silent = positional.get(3).copied().or_else(|| named("silent"));
+            silent.is_none_or(|s| {
+                matches!(
+                    s.node.as_ref(),
+                    Some(node::Node::AConst(protobuf::AConst {
+                        isnull: false,
+                        val: Some(typedpg_pg_query::protobuf::a_const::Val::Boolval(b)),
+                        ..
+                    })) if !b.boolval
+                )
+            })
+        }
+        "to_char" if func.args.len() == 2 && positional.len() == 2 => {
+            let fmt_non_empty = matches!(
+                positional[1].node.as_ref(),
+                Some(node::Node::AConst(protobuf::AConst {
+                    isnull: false,
+                    val: Some(typedpg_pg_query::protobuf::a_const::Val::Sval(s)),
+                    ..
+                })) if !s.sval.is_empty()
+            );
+            let source_finite = match first_type {
+                Some(t) if t == oid::TIMESTAMP || t == oid::TIMESTAMPTZ => {
+                    finite_time_source(positional[0], ctx)
+                }
+                Some(t) if t == INTERVAL => finite_interval_literal(positional[0], ctx),
+                _ => false,
+            };
+            fmt_non_empty && source_finite
+        }
+        "extract" | "date_part" if func.args.len() == 2 && positional.len() == 2 => {
+            matches!(first_type, Some(t) if t == oid::TEXT)
+                && resolved.arg_types.get(1).is_some_and(|&t| {
+                    t == oid::TIMESTAMP || t == oid::TIMESTAMPTZ || t == oid::DATE
+                })
+                && finite_time_source(positional[1], ctx)
+        }
+        "array_length" | "array_lower" | "array_upper"
+            if func.args.len() == 2 && positional.len() == 2 =>
+        {
+            matches!(
+                positional[1].node.as_ref(),
+                Some(node::Node::AConst(protobuf::AConst {
+                    isnull: false,
+                    val: Some(typedpg_pg_query::protobuf::a_const::Val::Ival(i)),
+                    ..
+                })) if i.ival == 1
+            ) && scalar_array_constructor(positional[0], ctx, params)
+        }
+        "array_ndims" | "array_dims" if func.args.len() == 1 && positional.len() == 1 => {
+            scalar_array_constructor(positional[0], ctx, params)
+        }
+        _ => false,
+    }
+}
+
+/// PG's `interval` type.
+const INTERVAL: PgTypeOid = PgTypeOid::from_raw(1186);
+
+/// A timestamp source that is never infinite: the current time.
+fn finite_time_source(n: &protobuf::Node, ctx: Ctx<'_>) -> bool {
+    use protobuf::SqlValueFunctionOp as Op;
+    match n.node.as_ref() {
+        Some(node::Node::SqlvalueFunction(f)) => matches!(
+            Op::try_from(f.op),
+            Ok(Op::SvfopCurrentDate
+                | Op::SvfopCurrentTimestamp
+                | Op::SvfopCurrentTimestampN
+                | Op::SvfopLocaltimestamp
+                | Op::SvfopLocaltimestampN)
+        ),
+        Some(node::Node::FuncCall(f)) if f.args.is_empty() && f.over.is_none() => {
+            let parts = extract_string_fields(&f.funcname);
+            let (schema, name) = match parts.as_slice() {
+                [n] => (None, n.as_str()),
+                [s, n] if s == "pg_catalog" => (Some("pg_catalog"), n.as_str()),
+                _ => return false,
+            };
+            let candidates = ctx.snapshot.find_functions(schema, name);
+            matches!(
+                name,
+                "now" | "statement_timestamp" | "transaction_timestamp" | "clock_timestamp"
+            ) && !candidates.is_empty()
+                && candidates
+                    .iter()
+                    .all(|p| ctx.snapshot.namespace_name(p.pronamespace) == Some("pg_catalog"))
+        }
+        _ => false,
+    }
+}
+
+/// An interval literal that isn't (minus) infinity.
+fn finite_interval_literal(n: &protobuf::Node, ctx: Ctx<'_>) -> bool {
+    let Some(node::Node::TypeCast(tc)) = n.node.as_ref() else {
+        return false;
+    };
+    let is_interval = tc
+        .type_name
+        .as_ref()
+        .and_then(|t| crate::ddl::util::resolve_type_name(t, ctx.snapshot))
+        == Some(INTERVAL);
+    is_interval
+        && matches!(
+            tc.arg.as_deref().and_then(|a| a.node.as_ref()),
+            Some(node::Node::AConst(protobuf::AConst {
+                isnull: false,
+                val: Some(typedpg_pg_query::protobuf::a_const::Val::Sval(s)),
+                ..
+            })) if !s.sval.to_ascii_lowercase().contains("infinity")
+        )
+}
+
+/// `ARRAY[e1, …, en]` (n ≥ 1, possibly cast to an array type) over
+/// scalar elements: a one-dimensional array of n elements. The elements
+/// are re-inferred on a throwaway collector.
+fn scalar_array_constructor(n: &protobuf::Node, ctx: Ctx<'_>, params: &ParamCollector) -> bool {
+    match n.node.as_ref() {
+        Some(node::Node::TypeCast(tc)) => tc
+            .arg
+            .as_deref()
+            .is_some_and(|a| scalar_array_constructor(a, ctx, params)),
+        Some(node::Node::AArrayExpr(arr)) => {
+            !arr.elements.is_empty()
+                && arr.elements.iter().all(|e| {
+                    !matches!(e.node.as_ref(), Some(node::Node::AArrayExpr(_)))
+                        && infer_expr(e, ctx, &mut params.clone(), TypeGoal::NONE).is_ok_and(|t| {
+                            t.type_oid != oid::UNKNOWN
+                                && array_element_type(ctx.snapshot, t.type_oid).is_none()
+                        })
+                })
+        }
+        _ => false,
+    }
+}
+
 /// Whether a window frame always includes the current row (PG's
 /// `FRAMEOPTION_*` bits, parsenodes.h): it starts at or before it
 /// (UNBOUNDED/offset PRECEDING, CURRENT ROW), ends at or after it (CURRENT
@@ -1511,7 +1683,10 @@ fn resolve_func_nullability(
                     || value_args.iter().any(|&i| proven(i));
             !rows || over_rows()
         }
-    } else if resolved.schema == "pg_catalog" && extract_unit_is_infinite_safe(func, resolved) {
+    } else if resolved.schema == "pg_catalog"
+        && (extract_unit_is_infinite_safe(func, resolved)
+            || value_gated_non_null(func, resolved, ctx, params))
+    {
         args.any_nullable
     } else if resolved.schema == "pg_catalog"
         && matches!(

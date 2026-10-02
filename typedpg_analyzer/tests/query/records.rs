@@ -2180,11 +2180,19 @@ fn cast_row_to_composite_lands_on_named_composite() {
         composite(
             "public",
             "address",
-            vec![
-                rfn("street", text()),
-                rfn("city", text()),
-                rfn("zip", text())
-            ],
+            vec![rf("street", text()), rf("city", text()), rf("zip", text())],
+        ),
+    );
+    // The fields are the row's values: NULL where those are.
+    let s = db
+        .analyze("SELECT ROW('s'::text, NULL, '0'::text)::address AS a")
+        .unwrap();
+    assert_eq!(
+        col(&s, "a").pg_type,
+        composite(
+            "public",
+            "address",
+            vec![rf("street", text()), rfn("city", text()), rf("zip", text())],
         ),
     );
 }
@@ -2476,14 +2484,13 @@ fn composite_star_expands_to_its_fields() {
          CREATE TABLE tc (id int PRIMARY KEY, cc comp NOT NULL, nm text NOT NULL);",
     )
     .unwrap();
-    for sql in [
-        "SELECT (cc).* FROM tc",
-        "SELECT (tc.cc).* FROM tc",
-        "SELECT (ROW(1, 'x')::comp).*",
-    ] {
+    for sql in ["SELECT (cc).* FROM tc", "SELECT (tc.cc).* FROM tc"] {
         let s = db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
         assert_cols(&s, vec![cn("a", int4()), cn("b", varchar_n(3))]);
     }
+    // A row built for the type has its values' nullability.
+    let s = db.analyze("SELECT (ROW(1, 'x')::comp).*").unwrap();
+    assert_cols(&s, vec![c("a", int4()), c("b", varchar_n(3))]);
     // A whole-row reference expands to the table's own columns.
     let s = db.analyze("SELECT (t).* FROM tc t").unwrap();
     let names: Vec<_> = s.columns.iter().map(|c| c.name.as_str()).collect();
@@ -2531,7 +2538,7 @@ fn functional_notation_projects_a_column() {
             c("a", int4()),
             c("b", text()),
             cn("c", int4()),
-            cn("d", int4()),
+            c("d", int4()),
             cn("e", numeric_ps(5, 2)),
             c("f", int4()),
         ],
