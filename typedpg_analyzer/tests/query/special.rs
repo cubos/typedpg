@@ -439,22 +439,17 @@ fn lateral_correlated_aggregate() {
 }
 
 #[test]
-fn left_join_lateral_aggregate_becomes_nullable() {
+fn left_join_lateral_aggregate_on_true_stays_not_null() {
     let db = setup();
-    // Semantically COUNT(*) always produces a row, so `total` should stay
-    // NOT NULL even under LEFT JOIN LATERAL. The analyzer conservatively
-    // treats every LEFT JOIN'd column as nullable because it doesn't
-    // reason about "this subquery is guaranteed non-empty". That matches
-    // PG's own planner output (columns from a LEFT JOIN'd relation are
-    // reported as nullable in ROW descriptions), so we freeze the
-    // conservative behavior here.
+    // COUNT(*) without GROUP BY always produces a row, so `ON true` always
+    // matches: the LEFT JOIN never null-extends `agg`.
     let sql = "SELECT u.id, agg.total \
                FROM users u \
                LEFT JOIN LATERAL ( \
                    SELECT COUNT(*) AS total FROM comments c WHERE c.post_id = u.id \
                ) agg ON true";
     let info = db.analyze(sql).unwrap();
-    assert!(col(&info, "total").nullable);
+    assert!(!col(&info, "total").nullable);
 }
 
 // ── LATERAL on an SRF (RangeFunction) ────────────────────────────────────────

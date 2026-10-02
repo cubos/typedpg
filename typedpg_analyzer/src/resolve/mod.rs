@@ -495,6 +495,7 @@ fn analyze_raw_node_once(
                     collation: None,
                     record_fields: None,
                     elem_nullable: None,
+                    origin: None,
                 }],
                 None,
             )
@@ -907,6 +908,8 @@ pub(crate) struct RawColumn {
     /// For an array column, whether its elements can be NULL, where known
     /// (see [`crate::types::Type::Array`]).
     pub elem_nullable: Option<bool>,
+    /// The base-table column the value is passed through from, if any.
+    pub origin: Option<crate::scope::Origin>,
 }
 
 /// Return type for analyze_* functions: columns + optional pre-sorted params.
@@ -922,6 +925,7 @@ mod merge;
 mod predtest;
 mod returning;
 pub(crate) mod rewrite;
+mod row_guarantees;
 mod select;
 mod set_ops;
 mod target_list;
@@ -943,6 +947,7 @@ pub(crate) use merge::*;
 pub(crate) use predtest::unqualify as predtest_unqualify;
 pub(crate) use returning::*;
 pub(crate) use rewrite::*;
+pub(crate) use row_guarantees::*;
 pub(crate) use select::*;
 pub(crate) use set_ops::*;
 pub(crate) use target_list::*;

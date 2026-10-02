@@ -726,7 +726,9 @@ fn nonnullable_node(
             match K::try_from(e.kind) {
                 // `(a, b) = (1, 2)` is `a = 1 AND b = 2` and `(a, b) <> (1,
                 // 2)` `a <> 1 OR b <> 2` (make_row_comparison_op): at the
-                // top level. Below it a FALSE pair hides a NULL one.
+                // top level. Below it a FALSE pair hides a NULL one. An
+                // ordering comparison is NULL when its first pair is (the
+                // row comparison stops at the first NULL pair).
                 Ok(K::AexprOp) if is_row(&e.lexpr) && is_row(&e.rexpr) => {
                     let (Some(l), Some(r)) = (
                         e.lexpr.as_deref().and_then(plain_row_fields),
@@ -755,6 +757,9 @@ fn nonnullable_node(
                                 });
                             }
                             acc.unwrap_or_default()
+                        }
+                        "<" | "<=" | ">" | ">=" => {
+                            l.iter().zip(r).next().map(pair).unwrap_or_default()
                         }
                         _ => Facts::default(),
                     }

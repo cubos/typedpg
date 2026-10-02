@@ -125,6 +125,12 @@ fn a_left_join_along_a_not_null_foreign_key_always_matches() {
         "SELECT p.name FROM porders o LEFT JOIN pcust p ON p.id = o.pcust_id",
         &[("name", false)],
     );
+    // The parent seen through a view keeping all its rows.
+    assert_nullable(
+        &db,
+        "SELECT c.name FROM orders o LEFT JOIN customers_v c ON c.id = o.customer_id",
+        &[("name", false)],
+    );
     // A FULL join keeps only the child side's null-extension.
     assert_nullable(
         &db,
@@ -207,9 +213,8 @@ fn joins_that_dont_follow_a_foreign_key_stay_outer() {
         "SELECT p.label FROM pair_child c LEFT JOIN pair_parent p ON p.a = c.a",
         // Row security may hide the referenced row.
         "SELECT s.v AS name FROM uses_secret u LEFT JOIN secret s ON s.id = u.secret_id",
-        // The parent seen through a view, a subquery, a sample, or `ONLY`
-        // over a partitioned table.
-        "SELECT c.name FROM orders o LEFT JOIN customers_v c ON c.id = o.customer_id",
+        // The parent seen through a filtering subquery, a sample, or
+        // `ONLY` over a partitioned table.
         "SELECT c.name FROM orders o
              LEFT JOIN (SELECT * FROM customers WHERE email IS NOT NULL) c ON c.id = o.customer_id",
         "SELECT c.name FROM orders o

@@ -325,7 +325,36 @@ no partition takes a NULL key), and so does a `MATCH FULL` foreign key: one of
 its columns non-NULL makes all of them so.
 
 A referenced table under row-level security doesn't count: its policies may
-hide the row.
+hide the row. The foreign key holds just the same through subqueries, CTEs,
+views and join trees that pass the key — or every row of the referenced table —
+through unchanged, and for a scalar subquery that looks the referenced row up:
+
+```rust
+let rows = sql!(pool,
+    "SELECT p.title, (SELECT u.name FROM users u WHERE u.id = p.user_id) AS author
+     FROM posts p")
+    .fetch_all().await?;
+// rows[0].author : String
+```
+
+Some queries always yield a row: an aggregate without `GROUP BY` (or
+`HAVING`), a query without `FROM`, `VALUES`, such a lookup. A scalar subquery
+like that is NULL only when its value is, and an outer join `ON true` to one
+never null-extends it:
+
+```rust
+let rows = sql!(pool,
+    "SELECT u.name, s.posts FROM users u
+     LEFT JOIN LATERAL (SELECT count(*) AS posts FROM posts p WHERE p.user_id = u.id) s ON true")
+    .fetch_all().await?;
+// rows[0].posts : i64
+```
+
+A `FULL JOIN` row has one side or the other, so `coalesce(x.id, y.id)` over a
+NOT NULL column of each is NOT NULL; a strict condition on a column a subquery
+or view passes through narrows the row it came from; and a row of a strict
+set-returning function in `FROM` (`generate_series(1, t.n)`,
+`jsonb_array_elements(t.doc)`) proves its arguments were non-NULL.
 
 Besides strict conditions, any condition that can't hold with a column NULL
 counts: `coalesce(age, 0) > 0`, `age IS NOT DISTINCT FROM 5`, `(tenant_id, id)

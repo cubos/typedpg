@@ -47,14 +47,10 @@ pub(crate) fn infer_sublink(
             if let Some(subselect) = &sub.subselect
                 && let Some(node::Node::SelectStmt(sel)) = subselect.node.as_ref()
             {
-                let first = single_sublink_column(sub, sel, ctx, params)?;
-                let guaranteed_one_row = yields_exactly_one_row(sel, snapshot)
-                    || reads_one_row_cte(sel, &scope.ctes, snapshot);
-                let nullable = if guaranteed_one_row {
-                    first.nullable
-                } else {
-                    true
-                };
+                let (first, min_one_row) = single_sublink_column(sub, sel, ctx, params)?;
+                // A row always comes back (more than one is an error): the
+                // value is NULL only when the column is.
+                let nullable = if min_one_row { first.nullable } else { true };
                 // The sublink carries its column's collation, implicitly,
                 // and its value — an array's elements included (no row is
                 // NULL, not an array with other elements).
@@ -215,7 +211,7 @@ pub(crate) fn infer_sublink(
             if let Some(subselect) = &sub.subselect
                 && let Some(node::Node::SelectStmt(sel)) = subselect.node.as_ref()
             {
-                let first = single_sublink_column(sub, sel, ctx, params)?;
+                let (first, _) = single_sublink_column(sub, sel, ctx, params)?;
                 // The array carries the column's typmod (exprTypmod of an
                 // ARRAY sublink is its subquery column's) and, implicitly,
                 // its collation.
@@ -254,83 +250,20 @@ pub(crate) fn infer_sublink(
     }
 }
 
-/// Whether the (already analyzed) scalar subquery `sel` always yields
-/// exactly one row, so that its value is NULL only when its column is — an
-/// empty result makes the sublink NULL. That holds for an aggregate query
-/// of its own level without GROUP BY / HAVING (`count(t.id)` over an outer
-/// `t` is the outer query's aggregate, not one of the subquery's), and for
-/// a query without FROM or WHERE; in both only when neither LIMIT / OFFSET
-/// nor a set-returning select list can drop the row.
-fn yields_exactly_one_row(sel: &protobuf::SelectStmt, snapshot: &PgCatalog) -> bool {
-    if sel.op != protobuf::SetOperation::SetopNone as i32 {
-        return false;
-    }
-    let const_of = |n: &Option<Box<protobuf::Node>>| match n.as_deref().map(|n| n.node.as_ref()) {
-        None => Some(None),
-        Some(Some(node::Node::AConst(ac))) if ac.isnull => Some(None),
-        Some(Some(node::Node::AConst(protobuf::AConst {
-            val: Some(a_const::Val::Ival(i)),
-            ..
-        }))) => Some(Some(i.ival)),
-        _ => None,
-    };
-    // LIMIT ALL / NULL / n ≥ 1, and OFFSET NULL / 0.
-    let limit_keeps = matches!(const_of(&sel.limit_count), Some(None) | Some(Some(1..)));
-    let offset_keeps = matches!(const_of(&sel.limit_offset), Some(None) | Some(Some(0)));
-    if !limit_keeps
-        || !offset_keeps
-        || !sel.group_clause.is_empty()
-        || sel.having_clause.is_some()
-        || crate::resolve::count_srf_calls(&sel.target_list, snapshot) > 0
-    {
-        return false;
-    }
-    if !sel.values_lists.is_empty() {
-        // A VALUES list of one row.
-        return sel.values_lists.len() == 1;
-    }
-    let has_aggs = crate::grouping::level_info(sel).is_some_and(|l| l.has_aggs);
-    has_aggs || (sel.from_clause.is_empty() && sel.where_clause.is_none())
-}
-
-/// Whether scalar subquery `sel` reads every row of a data-modifying CTE
-/// that returns exactly one row (`SELECT id FROM ins`), and only them.
-fn reads_one_row_cte(
-    sel: &protobuf::SelectStmt,
-    ctes: &std::collections::HashMap<String, Vec<crate::scope::ScopeColumn>>,
-    snapshot: &PgCatalog,
-) -> bool {
-    let [item] = sel.from_clause.as_slice() else {
-        return false;
-    };
-    let Some(node::Node::RangeVar(rv)) = item.node.as_ref() else {
-        return false;
-    };
-    sel.op == protobuf::SetOperation::SetopNone as i32
-        && sel.with_clause.is_none()
-        && sel.where_clause.is_none()
-        && sel.group_clause.is_empty()
-        && sel.having_clause.is_none()
-        && sel.limit_count.is_none()
-        && sel.limit_offset.is_none()
-        && sel.distinct_clause.is_empty()
-        && rv.schemaname.is_empty()
-        && crate::resolve::cte_returns_one_row(ctes, &rv.relname)
-        && crate::resolve::count_srf_calls(&sel.target_list, snapshot) == 0
-}
-
 /// The single output column of an EXPR / ARRAY sublink's subquery, as PG's
 /// `transformSubLink` requires: no column is `subquery must return a column`,
 /// more than one is `subquery must return only one column` (both 42601).
 /// An unknown-typed target (`SELECT NULL`, `SELECT 'x'`, `SELECT $1`) has
 /// already been resolved to text by the subquery's own
 /// `resolveTargetListUnknowns`, so a bare untyped param is pinned to text.
+/// Also tells whether the subquery always yields a row (see
+/// [`crate::resolve::LevelSummary::min_one_row`]).
 fn single_sublink_column(
     sub: &protobuf::SubLink,
     sel: &protobuf::SelectStmt,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
-) -> Result<crate::resolve::RawColumn, AnalyzeError> {
+) -> Result<(crate::resolve::RawColumn, bool), AnalyzeError> {
     let (cols, _) = crate::resolve::analyze_correlated_select(
         sel,
         ctx.snapshot,
@@ -338,6 +271,7 @@ fn single_sublink_column(
         ctx.scope,
         ctx.null_ctx,
     )?;
+    let min_one_row = crate::resolve::take_level_summary().min_one_row;
     let span = crate::error::SourceSpan::from_location(sub.location);
     let mut cols = cols.into_iter();
     let Some(mut first) = cols.next() else {
@@ -361,5 +295,5 @@ fn single_sublink_column(
         }
         first.type_oid = oid::TEXT;
     }
-    Ok(first)
+    Ok((first, min_one_row))
 }

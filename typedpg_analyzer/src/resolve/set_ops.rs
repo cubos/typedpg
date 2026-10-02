@@ -266,6 +266,7 @@ pub(crate) fn analyze_set_operation(
                 "EXCEPT" | "INTERSECT" => l.elem_nullable,
                 _ => crate::expr::merge_elem_nullable([l.elem_nullable, r.elem_nullable]),
             },
+            origin: None,
         });
     }
 
@@ -297,6 +298,7 @@ fn set_operation_sort_and_limit(
             table_alias: alias.clone(),
             record_fields: c.record_fields.clone(),
             elem_nullable: c.elem_nullable,
+            origin: None,
         })
         .collect();
     let mut scope = Scope {

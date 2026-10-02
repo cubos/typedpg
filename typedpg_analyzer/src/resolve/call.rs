@@ -67,6 +67,7 @@ pub(crate) fn analyze_call(
             collation: None,
             record_fields: None,
             elem_nullable: None,
+            origin: None,
         })
         .collect();
     Ok((columns, None))
