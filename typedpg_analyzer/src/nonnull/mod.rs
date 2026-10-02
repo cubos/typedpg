@@ -41,7 +41,7 @@ pub(crate) fn without_narrowing<R>(f: impl FnOnce() -> R) -> R {
     out
 }
 
-fn disabled() -> bool {
+pub(crate) fn disabled() -> bool {
     DISABLED.with(|d| d.get())
 }
 
@@ -142,6 +142,73 @@ impl Literal {
     }
 }
 
+/// An ordering comparison of a column with a constant (`c < v`, …).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum CmpOp {
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+impl CmpOp {
+    fn parse(op: &str) -> Option<CmpOp> {
+        match op {
+            "<" => Some(CmpOp::Lt),
+            "<=" => Some(CmpOp::Le),
+            ">" => Some(CmpOp::Gt),
+            ">=" => Some(CmpOp::Ge),
+            _ => None,
+        }
+    }
+
+    /// `v op c` as `c op' v`.
+    fn flipped(self) -> CmpOp {
+        match self {
+            CmpOp::Lt => CmpOp::Gt,
+            CmpOp::Le => CmpOp::Ge,
+            CmpOp::Gt => CmpOp::Lt,
+            CmpOp::Ge => CmpOp::Le,
+        }
+    }
+
+    /// `NOT (c op v)` for a non-NULL `c`, under a total order.
+    pub fn negated(self) -> CmpOp {
+        match self {
+            CmpOp::Lt => CmpOp::Ge,
+            CmpOp::Le => CmpOp::Gt,
+            CmpOp::Gt => CmpOp::Le,
+            CmpOp::Ge => CmpOp::Lt,
+        }
+    }
+}
+
+/// What holds of a column's value *when it is non-NULL*: what a qual that
+/// is TRUE, or a qual that is not TRUE, says of it (`kind = 'a'` not TRUE:
+/// a non-NULL `kind` isn't `'a'`). As a literal of a CHECK constraint, what
+/// the constraint not being FALSE says (`kind = 'a'` is NULL for a NULL
+/// `kind`). The constants are never NULL.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum ValPred {
+    /// One of these (`c = v`, `c IN (…)`, `c = ANY (…)`).
+    In(Vec<Literal>),
+    /// None of these (`c <> v`, `c NOT IN (…)`, `c <> ALL (…)`).
+    NotIn(Vec<Literal>),
+    /// `c op v`.
+    Cmp(CmpOp, Literal),
+}
+
+impl ValPred {
+    /// What the comparison not being TRUE says of a non-NULL column.
+    pub fn negated(&self) -> ValPred {
+        match self {
+            ValPred::In(vs) => ValPred::NotIn(vs.clone()),
+            ValPred::NotIn(vs) => ValPred::In(vs.clone()),
+            ValPred::Cmp(op, v) => ValPred::Cmp(op.negated(), v.clone()),
+        }
+    }
+}
+
 /// What a condition proves:
 ///
 /// - `columns` / `rels`: columns non-NULL and FROM entries not
@@ -149,9 +216,12 @@ impl Literal {
 /// - `nulls`: columns proven NULL;
 /// - `disjunctions`: sets of columns at least one of which is non-NULL
 ///   (`a IS NOT NULL OR b IS NOT NULL`, `num_nonnulls(a, b) > 0`);
-/// - `equals`: columns proven equal to a constant (`kind = 'a'`).
+/// - `equals`: columns proven equal to a constant (`kind = 'a'`);
+/// - `preds`: what holds of a column's value if it is non-NULL
+///   ([`ValPred`]: `kind <> 'b'`, `kind IN ('a', 'b')`, `lvl >= 10`, or a
+///   CASE branch's `kind = 'a'` not being TRUE).
 ///
-/// The last three feed the reasoning with CHECK constraints and
+/// The last four feed the reasoning with CHECK constraints and
 /// COALESCE / GREATEST / LEAST (see [`checks`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Facts {
@@ -160,6 +230,7 @@ pub(crate) struct Facts {
     pub nulls: HashSet<Col>,
     pub disjunctions: Vec<BTreeSet<Col>>,
     pub equals: HashMap<Col, Literal>,
+    pub preds: Vec<(Col, ValPred)>,
 }
 
 impl Facts {
@@ -169,6 +240,13 @@ impl Facts {
             && self.nulls.is_empty()
             && self.disjunctions.is_empty()
             && self.equals.is_empty()
+            && self.preds.is_empty()
+    }
+
+    fn pred(col: Col, pred: ValPred) -> Facts {
+        let mut f = Facts::default();
+        f.preds.push((col, pred));
+        f
     }
 
     pub fn column(alias: &str, column: &str) -> Facts {
@@ -216,7 +294,23 @@ impl Facts {
         for (c, v) in other.equals {
             self.equals.entry(c).or_insert(v);
         }
+        for p in other.preds {
+            if !self.preds.contains(&p) {
+                self.preds.push(p);
+            }
+        }
         self
+    }
+
+    /// The constants a column is known to be one of (if non-NULL).
+    fn one_of(&self, c: &Col) -> Option<Vec<Literal>> {
+        if let Some(v) = self.equals.get(c) {
+            return Some(vec![v.clone()]);
+        }
+        self.preds.iter().find_map(|(pc, p)| match p {
+            ValPred::In(vs) if pc == c => Some(vs.clone()),
+            _ => None,
+        })
     }
 
     /// One of the two holds: what both prove, plus "at least one of" the
@@ -264,7 +358,35 @@ impl Facts {
                 .filter(|(c, v)| other.equals.get(*c) == Some(*v))
                 .map(|(c, v)| (c.clone(), v.clone()))
                 .collect(),
+            preds: self
+                .preds
+                .iter()
+                .filter(|p| other.preds.contains(p))
+                .cloned()
+                .collect(),
         };
+        // `kind = 'a' OR kind = 'b'`: one of the constants either side
+        // allows.
+        let mut cols: Vec<&Col> = self
+            .equals
+            .keys()
+            .chain(self.preds.iter().map(|(c, _)| c))
+            .collect();
+        cols.sort();
+        cols.dedup();
+        for c in cols {
+            if let (Some(mut a), Some(b)) = (self.one_of(c), other.one_of(c)) {
+                for v in b {
+                    if !a.contains(&v) {
+                        a.push(v);
+                    }
+                }
+                let p = (c.clone(), ValPred::In(a));
+                if !out.preds.contains(&p) {
+                    out.preds.push(p);
+                }
+            }
+        }
         if let Some(d) = either
             && !d.iter().any(|c| out.columns.contains(c))
             && !out.disjunctions.contains(&d)
@@ -283,6 +405,7 @@ impl Facts {
         self.disjunctions
             .retain(|d| d.iter().all(|(a, _)| aliases.contains(a)));
         self.equals.retain(|(a, _), _| aliases.contains(a));
+        self.preds.retain(|((a, _), _)| aliases.contains(a));
         self
     }
 }
@@ -392,6 +515,12 @@ pub(crate) fn nonnullable(
                 // (NOT IN: `<> ALL` over a non-empty array, or an AND of
                 // `x <> item`), BETWEEN an AND / OR of comparisons on `x`:
                 // all strict in `x` at any level.
+                Ok(K::AexprIn) if top_level => {
+                    walk_opt(&e.lexpr, false).union(comparison_facts(e, scope, snapshot))
+                }
+                Ok(K::AexprBetween) if top_level => {
+                    walk_opt(&e.lexpr, false).union(between_facts(e, scope, snapshot))
+                }
                 Ok(
                     K::AexprIn
                     | K::AexprBetween
@@ -402,9 +531,10 @@ pub(crate) fn nonnullable(
                 // `is_strict_saop(expr, falseOK)`: `x op ANY(array)` is NULL
                 // or FALSE when an input is NULL, enough at the top level.
                 // `ALL` over an empty array is TRUE whatever `x` is.
-                Ok(K::AexprOpAny) if top_level => {
-                    walk_opt(&e.lexpr, false).union(walk_opt(&e.rexpr, false))
-                }
+                Ok(K::AexprOpAny) if top_level => walk_opt(&e.lexpr, false)
+                    .union(walk_opt(&e.rexpr, false))
+                    .union(comparison_facts(e, scope, snapshot)),
+                Ok(K::AexprOpAll) if top_level => comparison_facts(e, scope, snapshot),
                 _ => Facts::default(),
             }
         }
@@ -581,11 +711,50 @@ pub(crate) fn nonnullable_unless_true(
                 {
                     nonnullable(e, true, scope, log, snapshot)
                 }
+                // `NOT e` not TRUE: `e` not FALSE, so what `e` says holds
+                // of its column unless that is NULL.
+                [e] => match value_pred(e, scope, log, snapshot) {
+                    Some((col, p)) => Facts::pred(col, p),
+                    None => Facts::default(),
+                },
                 _ => Facts::default(),
             },
             _ => Facts::default(),
         },
+        // A comparison with constants not TRUE: a non-NULL column fails it
+        // (`kind = 'a'` not TRUE, `kind` is NULL or isn't `'a'`).
+        node::Node::ColumnRef(_) | node::Node::AExpr(_) => {
+            match value_pred(node, scope, log, snapshot) {
+                Some((col, p)) => Facts::pred(col, p.negated()),
+                None => Facts::default(),
+            }
+        }
         _ => Facts::default(),
+    }
+}
+
+/// What a comparison of a column with constants ([`column_pred`]), or a
+/// boolean column used as a condition (`done`: `done = true`), says of the
+/// column's value when it is TRUE — and, for a non-NULL column, its
+/// negation when it isn't.
+fn value_pred(
+    n: &protobuf::Node,
+    scope: &Scope,
+    log: &StrictLog,
+    snapshot: &PgCatalog,
+) -> Option<(Col, ValPred)> {
+    match n.node.as_ref()? {
+        node::Node::ColumnRef(_) => {
+            let (col, t) = plain_column(n, scope)?;
+            (snapshot.unwrap_domain(t) == crate::pg_catalog::oid::BOOL)
+                .then(|| (col, ValPred::In(vec![Literal::boolean(true)])))
+        }
+        // The operator resolved (and, being strict, is one of the
+        // comparison operators `column_pred` reads).
+        node::Node::AExpr(e) if log.is_strict(e.location, StrictNode::Op) => {
+            column_pred(e, scope, snapshot)
+        }
+        _ => None,
     }
 }
 
@@ -724,24 +893,222 @@ pub(crate) fn literal_for(
     }
 }
 
-/// `col = constant` (either way round), TRUE: the column equals it.
+/// `col op constant` (either way round), `col IN (…)`, `col = ANY (…)`
+/// and `col <> ALL (…)` over constants, TRUE: what it says of the column
+/// (equal to a constant, one or none of several, ordered against one).
 fn comparison_facts(e: &protobuf::AExpr, scope: &Scope, snapshot: &PgCatalog) -> Facts {
-    if crate::expr::extract_string_fields(&e.name).join(".") != "=" {
+    let Some((c, p)) = column_pred(e, scope, snapshot) else {
         return Facts::default();
+    };
+    let mut f = Facts::default();
+    if let ValPred::In(vs) = &p
+        && let [v] = vs.as_slice()
+    {
+        f.equals.insert(c.clone(), v.clone());
     }
+    f.preds.push((c, p));
+    f
+}
+
+/// `col BETWEEN a AND b` over constants, TRUE: `col >= a AND col <= b`.
+fn between_facts(e: &protobuf::AExpr, scope: &Scope, snapshot: &PgCatalog) -> Facts {
     let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) else {
         return Facts::default();
     };
-    let pair = match (plain_column(l, scope), plain_column(r, scope)) {
-        (Some((c, t)), None) => literal_for(r, t, snapshot).map(|v| (c, v)),
-        (None, Some((c, t))) => literal_for(l, t, snapshot).map(|v| (c, v)),
-        _ => None,
+    let (Some((c, t)), Some(node::Node::List(list))) = (plain_column(l, scope), r.node.as_ref())
+    else {
+        return Facts::default();
     };
-    let mut f = Facts::default();
-    if let Some((c, v)) = pair {
-        f.equals.insert(c, v);
+    let bound = |i: usize| list.items.get(i).and_then(|n| literal_for(n, t, snapshot));
+    let (Some(a), Some(b)) = (bound(0), bound(1)) else {
+        return Facts::default();
+    };
+    Facts::pred(c.clone(), ValPred::Cmp(CmpOp::Ge, a))
+        .union(Facts::pred(c, ValPred::Cmp(CmpOp::Le, b)))
+}
+
+/// What a comparison of a plain column with constants, TRUE, says of the
+/// column's value ([`literal_for`] says which constants qualify): `c = v`,
+/// `c <> v`, `c < v` (and `v > c`), `c IN (…)`, `c NOT IN (…)`,
+/// `c = ANY (…)` and `c <> ALL (…)` over an `ARRAY[…]` of constants or an
+/// array literal (`'{a,b}'`). A NULL in an IN list or an `ANY` array
+/// never makes it TRUE and is dropped; one in a NOT IN list or an `ALL`
+/// array makes it never TRUE, and nothing is said.
+pub(crate) fn column_pred(
+    e: &protobuf::AExpr,
+    scope: &Scope,
+    snapshot: &PgCatalog,
+) -> Option<(Col, ValPred)> {
+    use protobuf::AExprKind as K;
+    let op = crate::expr::extract_string_fields(&e.name).join(".");
+    let (l, r) = (e.lexpr.as_deref()?, e.rexpr.as_deref()?);
+    match K::try_from(e.kind).ok()? {
+        K::AexprOp => {
+            let (c, v, flipped) = match (plain_column(l, scope), plain_column(r, scope)) {
+                (Some((c, t)), None) => (c, literal_for(r, t, snapshot)?, false),
+                (None, Some((c, t))) => (c, literal_for(l, t, snapshot)?, true),
+                _ => return None,
+            };
+            let p = match op.as_str() {
+                "=" => ValPred::In(vec![v]),
+                "<>" => ValPred::NotIn(vec![v]),
+                other => {
+                    let cmp = CmpOp::parse(other)?;
+                    ValPred::Cmp(if flipped { cmp.flipped() } else { cmp }, v)
+                }
+            };
+            Some((c, p))
+        }
+        K::AexprIn => {
+            let (c, t) = plain_column(l, scope)?;
+            let Some(node::Node::List(list)) = r.node.as_ref() else {
+                return None;
+            };
+            let positive = match op.as_str() {
+                "=" => true,
+                "<>" => false,
+                _ => return None,
+            };
+            let vs = constants(list.items.iter(), t, positive, snapshot)?;
+            Some((
+                c,
+                if positive {
+                    ValPred::In(vs)
+                } else {
+                    ValPred::NotIn(vs)
+                },
+            ))
+        }
+        kind @ (K::AexprOpAny | K::AexprOpAll) => {
+            let (c, t) = plain_column(l, scope)?;
+            let positive = match (kind, op.as_str()) {
+                (K::AexprOpAny, "=") => true,
+                (K::AexprOpAll, "<>") => false,
+                _ => return None,
+            };
+            let vs = array_constants(r, t, positive, snapshot)?;
+            Some((
+                c,
+                if positive {
+                    ValPred::In(vs)
+                } else {
+                    ValPred::NotIn(vs)
+                },
+            ))
+        }
+        _ => None,
     }
-    f
+}
+
+/// The constants of an IN list or an array, for a column of type `t`
+/// (NULLs dropped when `drop_nulls`, else refused).
+pub(crate) fn constants<'n>(
+    items: impl Iterator<Item = &'n protobuf::Node>,
+    t: crate::oid::PgTypeOid,
+    drop_nulls: bool,
+    snapshot: &PgCatalog,
+) -> Option<Vec<Literal>> {
+    let mut out = Vec::new();
+    for i in items {
+        if let Some(node::Node::AConst(c)) = i.node.as_ref()
+            && c.isnull
+        {
+            if drop_nulls {
+                continue;
+            }
+            return None;
+        }
+        let v = literal_for(i, t, snapshot)?;
+        if !out.contains(&v) {
+            out.push(v);
+        }
+    }
+    Some(out)
+}
+
+/// The elements of `ARRAY[…]` over constants, or of an array literal
+/// (`'{a,b}'`, bare or cast to the array type of the column's type),
+/// compared with a column of type `t`. An array literal is read only in
+/// its plain form — comma-separated unquoted elements, no nesting or
+/// escapes — and for a column whose type reads it that way (text,
+/// varchar, enums, integers: `array_in` with `,` as the delimiter,
+/// trimming the blanks around an element).
+pub(crate) fn array_constants(
+    n: &protobuf::Node,
+    t: crate::oid::PgTypeOid,
+    drop_nulls: bool,
+    snapshot: &PgCatalog,
+) -> Option<Vec<Literal>> {
+    use typedpg_pg_query::protobuf::a_const::Val;
+    match n.node.as_ref()? {
+        node::Node::AArrayExpr(a) => constants(a.elements.iter(), t, drop_nulls, snapshot),
+        node::Node::TypeCast(tc) => {
+            let target = crate::ddl::util::resolve_type_name(tc.type_name.as_ref()?, snapshot)?;
+            if snapshot.pg_type.get(&t).and_then(|ty| ty.typarray) != Some(target) {
+                return None;
+            }
+            match tc.arg.as_deref()?.node.as_ref()? {
+                node::Node::AConst(_) => {
+                    array_constants(tc.arg.as_deref()?, t, drop_nulls, snapshot)
+                }
+                _ => None,
+            }
+        }
+        node::Node::AConst(c) if !c.isnull => {
+            let Some(Val::Sval(s)) = c.val.as_ref() else {
+                return None;
+            };
+            let base = snapshot.unwrap_domain(t);
+            let plain = matches!(
+                base,
+                crate::pg_catalog::oid::TEXT
+                    | crate::pg_catalog::oid::VARCHAR
+                    | crate::pg_catalog::oid::INT2
+                    | crate::pg_catalog::oid::INT4
+                    | crate::pg_catalog::oid::INT8
+            ) || snapshot
+                .pg_type
+                .get(&base)
+                .is_some_and(|ty| ty.typtype == crate::pg_catalog::TypType::Enum);
+            if !plain {
+                return None;
+            }
+            let blank = |c: char| matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c');
+            let inner = s
+                .sval
+                .trim_matches(blank)
+                .strip_prefix('{')?
+                .strip_suffix('}')?;
+            if inner.contains(['{', '}', '"', '\\']) {
+                return None;
+            }
+            let mut out = Vec::new();
+            if inner.trim_matches(blank).is_empty() {
+                return Some(out);
+            }
+            for item in inner.split(',') {
+                let item = item.trim_matches(blank);
+                if item.is_empty() {
+                    return None;
+                }
+                if item.eq_ignore_ascii_case("null") {
+                    if drop_nulls {
+                        continue;
+                    }
+                    return None;
+                }
+                let v = Literal {
+                    text: item.to_owned(),
+                    kind: LitKind::String,
+                };
+                if !out.contains(&v) {
+                    out.push(v);
+                }
+            }
+            Some(out)
+        }
+        _ => None,
+    }
 }
 
 /// How many of `num_nonnulls(args)` / `num_nulls(args)` a comparison with

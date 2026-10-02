@@ -361,7 +361,8 @@ fn alter_parent_reaches_partitions() {
     )]);
     assert_cols(
         &db.analyze("SELECT * FROM m1").unwrap(),
-        vec![c("id", int4()), cn("d", date()), cn("note", text())],
+        // The range bound keeps the key `d` non-NULL.
+        vec![c("id", int4()), c("d", date()), cn("note", text())],
     );
 }
 

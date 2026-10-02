@@ -3,8 +3,8 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
-use crate::nonnull::checks::{Knowledge, RelationChecks};
-use crate::nonnull::{Col, Facts, Literal};
+use crate::nonnull::checks::{Knowledge, RelationChecks, Space};
+use crate::nonnull::{Col, Facts, Literal, ValPred};
 
 /// The kind of a join, as far as nullability goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -234,6 +234,16 @@ impl NullabilityContext {
             .filter_map(|(c, v)| inner(c).map(|i| (i, v.clone())))
             .collect();
         facts.equals.extend(equals);
+        let preds: Vec<(Col, ValPred)> = facts
+            .preds
+            .iter()
+            .filter_map(|(c, p)| inner(c).map(|i| (i, p.clone())))
+            .collect();
+        for p in preds {
+            if !facts.preds.contains(&p) {
+                facts.preds.push(p);
+            }
+        }
         facts
     }
 
@@ -393,10 +403,12 @@ impl NullabilityContext {
                 };
                 let null = |c: &str| self.null_at(level, &(entry.alias.clone(), c.to_owned()));
                 let equals = |c: &str| self.equals_at(level, &(entry.alias.clone(), c.to_owned()));
+                let preds = |c: &str| self.preds_at(level, &(entry.alias.clone(), c.to_owned()));
                 let k = Knowledge {
                     non_null: &non_null,
                     null: &null,
                     equals: &equals,
+                    preds: &preds,
                 };
                 found = found.union(entry.checks.derive(&entry.alias, &k));
             }
@@ -480,6 +492,102 @@ impl NullabilityContext {
         sources.into_iter().find_map(|f| f.equals.get(c).cloned())
     }
 
+    /// What holds of column `c`'s value at `level`, if it is non-NULL.
+    fn preds_at(&self, level: Level, c: &Col) -> Vec<ValPred> {
+        let mut sources = vec![&self.matched_facts];
+        if level != Level::Matched {
+            sources.push(&self.where_facts);
+        }
+        if level == Level::Local {
+            sources.push(&self.local_facts);
+        }
+        let mut out: Vec<ValPred> = sources
+            .into_iter()
+            .flat_map(|f| {
+                f.preds
+                    .iter()
+                    .filter(|(pc, _)| pc == c)
+                    .map(|(_, p)| p.clone())
+            })
+            .collect();
+        if let Some(v) = self.equals_at(level, c) {
+            out.push(ValPred::In(vec![v]));
+        }
+        out
+    }
+
+    /// The knowledge the CHECK constraints of `entry` are read with where
+    /// a value is read: a column non-NULL as read (outer joins and
+    /// grouping sets included), with what holds there.
+    fn with_local_knowledge<R>(
+        &self,
+        entry: &EntryChecks,
+        f: impl FnOnce(&Knowledge<'_>) -> R,
+    ) -> R {
+        let col = |c: &str| (entry.alias.clone(), c.to_owned());
+        let non_null =
+            |c: &str| !self.is_nullable(&entry.alias, c, entry.base_not_null.get(c) == Some(&true));
+        let null = |c: &str| self.null_at(Level::Local, &col(c));
+        let equals = |c: &str| self.equals_at(Level::Local, &col(c));
+        let preds = |c: &str| self.preds_at(Level::Local, &col(c));
+        f(&Knowledge {
+            non_null: &non_null,
+            null: &null,
+            equals: &equals,
+            preds: &preds,
+        })
+    }
+
+    /// Whether no row can be what holds where a value is read: a CASE's
+    /// ELSE after WHENs that cover every case (`CASE WHEN a IS NULL … WHEN
+    /// a IS NOT NULL …`, every label of an enum, every value a CHECK
+    /// allows). `column` gives a column's own NOT NULL and how its values
+    /// compare (`None` for one it can't tell).
+    pub fn unreachable(&self, column: &dyn Fn(&Col) -> Option<(bool, Space)>) -> bool {
+        if crate::nonnull::disabled() {
+            return false;
+        }
+        let levels = [&self.matched_facts, &self.where_facts, &self.local_facts];
+        let mut cols: Vec<Col> = levels
+            .iter()
+            .flat_map(|f| {
+                f.preds
+                    .iter()
+                    .map(|(c, _)| c.clone())
+                    .chain(f.equals.keys().cloned())
+                    .chain(f.nulls.iter().cloned())
+            })
+            .chain(self.derived_matched.nulls.iter().cloned())
+            .chain(self.derived_where.nulls.iter().cloned())
+            .chain(self.derived_local.nulls.iter().cloned())
+            .collect();
+        cols.sort();
+        cols.dedup();
+        for c in &cols {
+            let Some((base, space)) = column(c) else {
+                continue;
+            };
+            if self.is_nullable(&c.0, &c.1, base) {
+                continue;
+            }
+            if self.null_at(Level::Local, c) || space.contradictory(&self.preds_at(Level::Local, c))
+            {
+                return true;
+            }
+        }
+        // A row of a relation no row of which is that. Not under grouping
+        // sets, which null out some of a row's values and keep others.
+        if !self.grouping_omitted.is_empty() {
+            return false;
+        }
+        self.checks.iter().any(|entry| {
+            if self.alias_is_nullable(&entry.alias) {
+                return false;
+            }
+            self.with_local_knowledge(entry, |k| entry.checks.contradicts(k))
+        })
+    }
+
     /// The disjunctions known at `level`: a row-is-there one only while
     /// its entries are always there; before grouping ones not over a
     /// column a grouping set may null out, when read after it.
@@ -558,9 +666,27 @@ impl NullabilityContext {
     /// read: what COALESCE / GREATEST / LEAST over them needs to be.
     pub fn some_non_null(&self, cols: &[Col]) -> bool {
         let set: HashSet<&Col> = cols.iter().collect();
-        self.disjunctions_at(Level::Local)
+        if self
+            .disjunctions_at(Level::Local)
             .iter()
             .any(|d| d.iter().all(|c| set.contains(c)))
+        {
+            return true;
+        }
+        // The CHECK constraints of their entry, case by case.
+        let Some(alias) = cols.first().map(|c| c.0.clone()) else {
+            return false;
+        };
+        if cols.iter().any(|c| c.0 != alias) || !self.grouping_omitted.is_empty() {
+            return false;
+        }
+        let names: Vec<String> = cols.iter().map(|c| c.1.clone()).collect();
+        self.checks.iter().any(|entry| {
+            if entry.alias != alias || self.alias_is_nullable(&entry.alias) {
+                return false;
+            }
+            self.with_local_knowledge(entry, |k| entry.checks.some_non_null(k, &names))
+        })
     }
 
     /// `sources` (FROM entries of this level, handed down to a nested

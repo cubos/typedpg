@@ -1689,6 +1689,7 @@ fn where_facts(
     facts.columns.retain(kept);
     facts.nulls.retain(kept);
     facts.equals.retain(|c, _| kept(c));
+    facts.preds.retain(|(c, _)| kept(c));
     facts.disjunctions.retain(|d| d.iter().all(kept));
     rows.new_proven = facts
         .columns

@@ -565,6 +565,11 @@ impl FkDetails {
         self.deferrable
     }
 
+    /// `confmatchtype = 'f'`: `MATCH FULL`.
+    pub(crate) fn match_full(&self) -> bool {
+        self.match_type == "f"
+    }
+
     fn of(c: &typedpg_pg_query::protobuf::Constraint) -> Self {
         let or = |s: &str, default: &str| {
             if s.is_empty() {
