@@ -11,6 +11,9 @@ use super::*;
 pub(crate) struct AnalyzedCte {
     pub columns: Vec<ScopeColumn>,
     pub search_cycle: Vec<ScopeColumn>,
+    /// The CTE always yields a row (a SELECT whose level does, or a
+    /// recursive one whose non-recursive term does).
+    pub min_one_row: bool,
 }
 
 /// Analyze one CTE body, following PG's `analyzeCTE`. `recursive` is PG's
@@ -71,8 +74,10 @@ pub(crate) fn analyze_cte(
         collation: rc.collation,
         record_fields: rc.record_fields,
         elem_nullable: rc.elem_nullable,
+        origin: rc.origin,
     };
 
+    let mut min_one_row = false;
     let columns: Vec<ScopeColumn> = match cte_query {
         // A recursive CTE is `non-recursive-term UNION [ALL] recursive-term`
         // (checkWellFormedRecursion made sure). transformSetOperationStmt
@@ -93,6 +98,8 @@ pub(crate) fn analyze_cte(
             }
             check_set_op_member_locking(larg)?;
             let (mut seed_cols, _) = analyze_body(larg, params, &body_ctes)?;
+            // UNION [ALL] keeps a row of the non-recursive term.
+            min_one_row = take_level_summary().min_one_row;
             // analyzeCTETargetList: a recursive CTE exposes an `unknown`
             // column (an untyped literal or parameter) as text before the
             // recursive term is looked at.
@@ -200,6 +207,7 @@ pub(crate) fn analyze_cte(
                                 s.elem_nullable,
                                 r.elem_nullable,
                             ]),
+                            origin: None,
                         }
                     })
                     .collect()
@@ -242,6 +250,7 @@ pub(crate) fn analyze_cte(
         }
         node::Node::SelectStmt(sel) => {
             let (mut cols, _) = analyze_body(sel, params, existing_ctes)?;
+            min_one_row = take_level_summary().min_one_row;
             resolve_unknown_outputs(sel, &mut cols, params, snapshot)?;
             let cols = apply_cte_column_aliases(&cte.ctename, cols, &cte.aliascolnames)?;
             cols.into_iter().map(to_scope).collect()
@@ -284,7 +293,15 @@ pub(crate) fn analyze_cte(
             // analyzeCTETargetList names a data-modifying CTE's RETURNING
             // columns through the alias list too.
             let cols = apply_cte_column_aliases(&cte.ctename, cols, &cte.aliascolnames)?;
-            cols.into_iter().map(to_scope).collect()
+            // The rows a data-modifying statement returns are not the
+            // query's snapshot's: a row it inserts is invisible to the rest
+            // of the statement, and so is a parent row inserted beside it.
+            cols.into_iter()
+                .map(|c| ScopeColumn {
+                    origin: None,
+                    ..to_scope(c)
+                })
+                .collect()
         }
         _ => {
             return Err(AnalyzeError::Unsupported(
@@ -297,6 +314,7 @@ pub(crate) fn analyze_cte(
     Ok(AnalyzedCte {
         columns,
         search_cycle,
+        min_one_row,
     })
 }
 
@@ -325,6 +343,7 @@ fn search_cycle_columns(
         collation: None,
         record_fields: None,
         elem_nullable: None,
+        origin: None,
     };
     let record_array = snapshot.array_type_of(oid::RECORD).unwrap_or(oid::UNKNOWN);
     let mut added: Vec<ScopeColumn> = Vec::new();
@@ -662,6 +681,16 @@ fn insert_returns_one_row(ins: &protobuf::InsertStmt, snapshot: &PgCatalog) -> b
     one_row && ok_conflict && wt.base == table.oid && !skips(events)
 }
 
+/// The CTE-map key marking CTE `name` as always yielding a row.
+fn min_one_row_marker(name: &str) -> String {
+    format!("\u{1}min-one-row:{name}")
+}
+
+/// Whether CTE `name` (as `ctes` resolves it) always yields a row.
+pub(crate) fn cte_min_one_row(ctes: &HashMap<String, Vec<ScopeColumn>>, name: &str) -> bool {
+    ctes.contains_key(&min_one_row_marker(name)) || cte_returns_one_row(ctes, name)
+}
+
 /// The CTE-map key holding the SEARCH / CYCLE columns of CTE `name`.
 fn search_cycle_marker(name: &str) -> String {
     format!("\u{1}search-cycle:{name}")
@@ -688,6 +717,8 @@ fn register_cte(
             .is_some_and(|(_, n)| n == name)
     });
     ctes.remove(&search_cycle_marker(name));
+    ctes.remove(&min_one_row_marker(name));
+    ctes.remove(&one_row_marker(name));
     if !search_cycle.is_empty() {
         ctes.insert(search_cycle_marker(name), search_cycle);
         ctes.insert(level_marker(depth, name), Vec::new());
@@ -829,16 +860,6 @@ pub(crate) fn analyze_with_clause(
         } else {
             cte_scopes.remove(&marker);
         }
-        let one_row = one_row_marker(&cte.ctename);
-        if returning == Some(true)
-            && let Some(node::Node::InsertStmt(ins)) =
-                cte.ctequery.as_deref().and_then(|q| q.node.as_ref())
-            && insert_returns_one_row(ins, snapshot)
-        {
-            cte_scopes.insert(one_row, Vec::new());
-        } else {
-            cte_scopes.remove(&one_row);
-        }
         register_cte(
             &mut cte_scopes,
             &cte.ctename,
@@ -846,6 +867,16 @@ pub(crate) fn analyze_with_clause(
             analyzed.search_cycle,
             depth,
         );
+        if returning == Some(true)
+            && let Some(node::Node::InsertStmt(ins)) =
+                cte.ctequery.as_deref().and_then(|q| q.node.as_ref())
+            && insert_returns_one_row(ins, snapshot)
+        {
+            cte_scopes.insert(one_row_marker(&cte.ctename), Vec::new());
+        }
+        if analyzed.min_one_row {
+            cte_scopes.insert(min_one_row_marker(&cte.ctename), Vec::new());
+        }
     }
     Ok(cte_scopes)
 }

@@ -18,6 +18,7 @@ fn system_columns_for(alias: &str) -> Vec<ScopeColumn> {
             table_alias: alias.to_owned(),
             record_fields: None,
             elem_nullable: None,
+            origin: None,
         })
         .collect()
 }
@@ -45,6 +46,40 @@ pub(crate) struct ScopeColumn {
     /// For an array column, whether its elements can be NULL, where the
     /// query producing it knows (see [`crate::types::Type::Array`]).
     pub elem_nullable: Option<bool>,
+    /// The base-table column this column's value is read from, when it
+    /// is one passed through unchanged (see [`Origin`]).
+    pub origin: Option<Origin>,
+}
+
+/// Where a value comes from: column `column` of base table `relid`, read
+/// from one scan of it (`scan`, unique to the FROM entry that scans it —
+/// every column with the same `scan` holds, in a given row, the values of
+/// one and the same table row, or all NULL when the scan's row is
+/// null-extended). Only a column passed through as is (a plain column
+/// reference, `*`) keeps its origin: no expression, set operation or
+/// grouping set that may NULL it on its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Origin {
+    pub scan: u32,
+    pub relid: crate::oid::PgClassOid,
+    pub column: String,
+    /// The column's own NOT NULL in the table (and in each child a scan
+    /// of an inheritance parent reads).
+    pub base_not_null: bool,
+    /// The scan also returns inheritance children's rows (which the
+    /// table's foreign keys don't bind).
+    pub with_children: bool,
+    /// Every row of the table is there: the scan reads all of them (no
+    /// TABLESAMPLE, no `ONLY` over a partitioned table) and every
+    /// derived relation in between keeps them all (no WHERE, no
+    /// grouping, no LIMIT, ...).
+    pub all_rows: bool,
+}
+
+/// A fresh scan identifier (see [`Origin::scan`]).
+pub(crate) fn fresh_scan_id() -> u32 {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// A table-like source in the FROM clause.
@@ -108,6 +143,10 @@ pub(crate) struct TableSource {
     /// also returns their rows: constraints the table doesn't pass down —
     /// foreign keys, `NO INHERIT` ones — don't bind those.
     pub inherits_rows: bool,
+    /// The entry yields at least one row (for each row of the entries a
+    /// LATERAL one reads): a FROM-less query, an aggregate without GROUP
+    /// BY, a lookup a foreign key guarantees, ...
+    pub min_one_row: bool,
 }
 
 /// Why a locking clause can't be pushed into a view or subquery.
@@ -167,6 +206,13 @@ pub(crate) fn hidden_alias(kind: &str) -> String {
     format!("{HIDDEN_ALIAS_MARK}{kind}{n}")
 }
 
+/// True for the hidden alias of an unaliased `JOIN USING`'s merged columns.
+pub(crate) fn is_hidden_join_alias(alias: &str) -> bool {
+    alias
+        .strip_prefix(HIDDEN_ALIAS_MARK)
+        .is_some_and(|rest| rest.starts_with("join"))
+}
+
 /// True for an alias produced by [`hidden_alias`].
 pub(crate) fn is_hidden_alias(alias: &str) -> bool {
     alias.starts_with(HIDDEN_ALIAS_MARK)
@@ -192,6 +238,7 @@ impl TableSource {
             lock_error: None,
             partial_scan: false,
             inherits_rows: false,
+            min_one_row: false,
         }
     }
 
@@ -530,6 +577,7 @@ impl Scope {
                 table_alias: alias.to_owned(),
                 record_fields: None,
                 elem_nullable: None,
+                origin: None,
             })
             .collect();
 
@@ -605,6 +653,7 @@ impl Scope {
                 table_alias: alias.to_owned(),
                 record_fields: None,
                 elem_nullable: None,
+                origin: None,
             })
             .collect();
         let relid = columns.first().map(|c| c.attrelid);
@@ -655,6 +704,32 @@ impl Scope {
     pub fn enclosing_sources(&self) -> Vec<TableSource> {
         let pseudo = RULE_PSEUDO_RELATIONS.with(|r| r.borrow().len());
         self.outer_sources.iter().skip(pseudo).cloned().collect()
+    }
+
+    /// The column a plain column reference (`c`, `t.c`, `s.t.c`; not `*`)
+    /// resolves to, if it resolves.
+    pub(crate) fn plain_column_ref(
+        &self,
+        n: &typedpg_pg_query::protobuf::Node,
+    ) -> Option<&ScopeColumn> {
+        use typedpg_pg_query::protobuf::node;
+        let Some(node::Node::ColumnRef(c)) = n.node.as_ref() else {
+            return None;
+        };
+        if c.fields
+            .iter()
+            .any(|f| matches!(f.node.as_ref(), Some(node::Node::AStar(_))))
+        {
+            return None;
+        }
+        let parts = crate::expr::extract_string_fields(&c.fields);
+        let (table, column) = match parts.as_slice() {
+            [col] => (None, col.as_str()),
+            [tbl, col] => (Some(tbl.as_str()), col.as_str()),
+            [_schema, tbl, col] => (Some(tbl.as_str()), col.as_str()),
+            _ => return None,
+        };
+        self.resolve_column(table, column, None).ok()
     }
 
     pub fn find_source(&self, alias: &str) -> Option<&TableSource> {

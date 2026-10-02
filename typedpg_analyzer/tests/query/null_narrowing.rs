@@ -225,11 +225,12 @@ fn row_and_whole_row_tests() {
         "SELECT tags FROM users WHERE tags[1] = 'a'",
         &[("tags", false)],
     );
-    // A row comparison can be FALSE with NULL fields: `(1, NULL) < (2, NULL)`.
+    // A row comparison can be FALSE with NULL fields: `(1, NULL) < (2, NULL)`
+    // — but not in the first pair, which decides first.
     assert_nullable(
         &db,
         "SELECT age, email FROM users WHERE (age, email) < (1, 'x')",
-        &[("age", true), ("email", true)],
+        &[("age", false), ("email", true)],
     );
 }
 
@@ -386,7 +387,8 @@ fn outer_and_lateral_references_to_a_null_extended_side() {
     );
     assert_nullable(
         &db,
-        "SELECT s.v FROM users u LEFT JOIN LATERAL (SELECT u.id AS v) s ON true",
+        "SELECT s.v FROM users u LEFT JOIN posts p ON p.author_id = u.id
+             LEFT JOIN LATERAL (SELECT p.id AS v) s ON true",
         &[("v", true)],
     );
     assert_nullable(

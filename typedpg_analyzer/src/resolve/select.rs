@@ -161,7 +161,11 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
         .collect();
     if sel.op != SetOperation::SetopNone as i32 {
         grouping::register_level(sel, &[], &[]);
-        return analyze_set_operation(sel, snapshot, params, &cte_scopes, &outer, shadowed_sources);
+        let result =
+            analyze_set_operation(sel, snapshot, params, &cte_scopes, &outer, shadowed_sources);
+        // The arms' summaries say nothing of the whole.
+        set_level_summary(LevelSummary::default());
+        return result;
     }
 
     // Handle `VALUES (…), (…), …` — a `SelectStmt` without a FROM/target
@@ -188,6 +192,9 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
             .extend(shadowed_sources.iter().cloned());
         let columns = analyze_values_lists(&sel.values_lists, snapshot, params, &values_scope)?;
         values_sort_and_limit(sel, &columns, snapshot, params, &cte_scopes, &outer)?;
+        set_level_summary(LevelSummary {
+            min_one_row: limit_keeps_a_row(sel),
+        });
         return Ok((columns, None));
     }
 
@@ -279,12 +286,12 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
     // boolean, not type X`. Catch the generic coerce error and rewrite to
     // PG's exact message so `pglite_sanity` matches.
     let mut correlated: Option<crate::nonnull::Facts> = None;
+    let log = crate::nonnull::StrictLog::default();
     if let Some(where_clause) = &sel.where_clause {
         // PG rejects aggregate / window function calls inside WHERE (they
         // reference the post-aggregation row, not the pre-aggregation one) —
         // but only after the expression itself resolves; the ordering lives
         // in `coerce_bool_clause`.
-        let log = crate::nonnull::StrictLog::default();
         crate::clause::coerce_clause_expr(
             where_clause,
             expr::Ctx::new(&scope, &null_ctx, snapshot).logging_strictness(&log),
@@ -311,6 +318,12 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
         null_ctx.add_where_facts(facts.restricted_to(&own));
         null_ctx.where_exprs_off = (sel.group_clause.is_empty() || null_ctx.has_empty_grouping_set)
             && may_aggregate(sel, &scope, snapshot);
+    }
+    // FROM and WHERE always leaving a row: an aggregate without GROUP BY
+    // sees rows, and the level yields one.
+    let input_nonempty = input_nonempty(sel, &scope, &log, snapshot);
+    if input_nonempty {
+        null_ctx.input_not_empty = true;
     }
 
     // Collect select-list aliases so GROUP BY / ORDER BY can fall back to
@@ -483,7 +496,7 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
     analyze_limit_offset(sel, expr::Ctx::new(&scope, &null_ctx, snapshot), params)?;
 
     // Resolve target list (SELECT expressions) — no type expectation.
-    let (columns, explicit_collations) = resolve_target_list_explicit(
+    let (mut columns, explicit_collations) = resolve_target_list_explicit(
         &sel.target_list,
         expr::Ctx::new(&scope, &null_ctx, snapshot),
         params,
@@ -545,6 +558,15 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
         }
     }
 
+    let has_aggs = grouping::level_info(sel).is_some_and(|l| l.has_aggs);
+    set_level_summary(finish_level(
+        sel,
+        &scope,
+        has_aggs,
+        input_nonempty,
+        &mut columns,
+        snapshot,
+    ));
     Ok((columns, None))
 }
 
@@ -889,6 +911,7 @@ fn values_sort_and_limit(
             table_alias: alias.clone(),
             record_fields: c.record_fields.clone(),
             elem_nullable: c.elem_nullable,
+            origin: None,
         })
         .collect();
     let mut scope = Scope {

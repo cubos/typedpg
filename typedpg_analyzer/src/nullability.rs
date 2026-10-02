@@ -39,6 +39,22 @@ struct JoinRecord {
     right: HashSet<String>,
     on: Facts,
     fk: Option<FkMatch>,
+    /// Whether the left / right side always has a row matching each row
+    /// of the other (`ON true` to a side that always yields a row): it is
+    /// never null-extended.
+    always_matches: (bool, bool),
+    /// For a FULL join: per side, the columns non-NULL whenever that
+    /// side's row is there. Each row has one side or the other.
+    full_sides: Option<[Vec<Col>; 2]>,
+}
+
+/// Where a column's value comes from, as far as this level's facts go:
+/// one scan's row (see [`crate::scope::Origin`]).
+#[derive(Debug, Clone)]
+struct OriginKey {
+    scan: u32,
+    column: String,
+    base_not_null: bool,
 }
 
 /// A `JOIN USING` merged column: which join, and its two constituents.
@@ -99,6 +115,16 @@ pub(crate) struct NullabilityContext {
     aliased: HashMap<Col, (Col, bool)>,
     /// The CHECK constraints of this level's relations.
     checks: Vec<EntryChecks>,
+    /// The base-table scan behind each column passed through unchanged.
+    origins: HashMap<Col, OriginKey>,
+    /// The entry of this level that scans each scan's table (its home).
+    homes: HashMap<u32, String>,
+    /// What holds wherever an entry's row is there: a strict
+    /// set-returning function's arguments.
+    entry_facts: Vec<(String, Facts)>,
+    /// Derived by [`Self::recompute`]: per join, whether a join above it
+    /// null-extends its rows.
+    extended_above: Vec<bool>,
     /// Derived by [`Self::recompute`]: each join's kind once reduced, the
     /// entries on the nullable side of an outer join, what ON clauses
     /// prove whenever their entry's row is there, and what the CHECK
@@ -160,6 +186,7 @@ impl NullabilityContext {
     /// clause proves (facts about entries outside the join are dropped)
     /// and the foreign key its ON clause follows, if any. Returns the
     /// join's index.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_join(
         &mut self,
         kind: JoinKind,
@@ -167,6 +194,8 @@ impl NullabilityContext {
         right: &[String],
         on: Facts,
         fk: Option<FkMatch>,
+        always_matches: (bool, bool),
+        full_sides: Option<[Vec<Col>; 2]>,
     ) -> usize {
         let left: HashSet<String> = left.iter().cloned().collect();
         let right: HashSet<String> = right.iter().cloned().collect();
@@ -177,6 +206,8 @@ impl NullabilityContext {
             right,
             on: on.restricted_to(&sides),
             fk,
+            always_matches,
+            full_sides,
         });
         self.recompute();
         self.joins.len() - 1
@@ -204,6 +235,85 @@ impl NullabilityContext {
         }
     }
 
+    /// Register where the columns of entry `alias` come from (their
+    /// [`crate::scope::Origin`]s); `home` when the entry is the scan
+    /// itself.
+    pub fn register_origins(
+        &mut self,
+        alias: &str,
+        columns: &[crate::scope::ScopeColumn],
+        home: bool,
+    ) {
+        for c in columns {
+            let Some(o) = &c.origin else {
+                continue;
+            };
+            if home {
+                self.homes.insert(o.scan, alias.to_owned());
+            }
+            self.origins.insert(
+                (alias.to_owned(), c.name.clone()),
+                OriginKey {
+                    scan: o.scan,
+                    column: o.column.clone(),
+                    base_not_null: o.base_not_null,
+                },
+            );
+        }
+    }
+
+    /// Record what holds wherever entry `alias`'s row is there.
+    pub fn add_entry_facts(&mut self, alias: &str, facts: Facts) {
+        if facts.is_empty() {
+            return;
+        }
+        self.entry_facts.push((alias.to_owned(), facts));
+        self.recompute();
+    }
+
+    /// Whether join side `side` (its entries) keeps every row of its entry
+    /// `p`: `p` alone, or `p` on a side of each join in it that keeps that
+    /// side's rows — the preserved side of an outer join, or the child
+    /// side of a join that always finds a match there (a foreign key from
+    /// it, `ON true` to a side always yielding a row), as written.
+    pub fn side_keeps_rows_of(&self, side: &HashSet<String>, p: &str) -> bool {
+        // The merged columns of an inner USING join are no entry of a side.
+        let real = |s: &HashSet<String>| -> HashSet<String> {
+            s.iter()
+                .filter(|a| !crate::scope::is_hidden_join_alias(a))
+                .cloned()
+                .collect()
+        };
+        let side = real(side);
+        if side.len() == 1 && side.contains(p) {
+            return true;
+        }
+        let Some(j) = self
+            .joins
+            .iter()
+            .find(|j| real(&j.left.union(&j.right).cloned().collect()) == side)
+        else {
+            return false;
+        };
+        let fk_from = |parent_is_left: bool| {
+            j.fk.as_ref()
+                .is_some_and(|fk| fk.parent_is_left == parent_is_left && fk.child_present)
+        };
+        if j.left.contains(p) {
+            self.side_keeps_rows_of(&j.left, p)
+                && (matches!(j.kind, JoinKind::Left | JoinKind::Full)
+                    || j.always_matches.1
+                    || fk_from(false))
+        } else if j.right.contains(p) {
+            self.side_keeps_rows_of(&j.right, p)
+                && (matches!(j.kind, JoinKind::Right | JoinKind::Full)
+                    || j.always_matches.0
+                    || fk_from(true))
+        } else {
+            false
+        }
+    }
+
     /// Register the CHECK constraints of relation entry `alias`, with its
     /// columns' own NOT NULL.
     pub fn register_checks(
@@ -220,8 +330,39 @@ impl NullabilityContext {
         self.recompute();
     }
 
+    /// `facts` plus the same facts about the entries inside aliased joins,
+    /// and what a non-NULL column passed through from a scan's row proves:
+    /// that row is there, so the scan's entry of this level (its home) has
+    /// that column non-NULL, and so has every NOT NULL column of the same
+    /// entry passed through from the same row (`s.id` non-NULL for
+    /// `(SELECT a.id, a.v FROM b LEFT JOIN a …) s` makes `s.v` so).
+    fn translated(&self, facts: Facts) -> Facts {
+        let mut facts = self.translated_aliases(facts);
+        if self.origins.is_empty() {
+            return facts;
+        }
+        let cols: Vec<Col> = facts.columns.iter().cloned().collect();
+        for c in cols {
+            let Some(o) = self.origins.get(&c) else {
+                continue;
+            };
+            if let Some(home) = self.homes.get(&o.scan)
+                && home != &c.0
+            {
+                facts.rels.insert(home.clone());
+                facts.columns.insert((home.clone(), o.column.clone()));
+            }
+            for (c2, o2) in &self.origins {
+                if c2.0 == c.0 && o2.scan == o.scan && o2.base_not_null {
+                    facts.columns.insert(c2.clone());
+                }
+            }
+        }
+        facts
+    }
+
     /// `facts` plus the same facts about the entries inside aliased joins.
-    fn translated(&self, mut facts: Facts) -> Facts {
+    fn translated_aliases(&self, mut facts: Facts) -> Facts {
         if self.aliased.is_empty() {
             return facts;
         }
@@ -311,8 +452,30 @@ impl NullabilityContext {
         let mut join_nullable = HashSet::new();
         let mut matched = Facts::default();
         let mut kinds = vec![JoinKind::Inner; self.joins.len()];
+        let mut extended_above = vec![false; self.joins.len()];
         for (idx, j) in self.joins.iter().enumerate().rev() {
+            // The joins above were seen first: whatever they null-extend.
+            extended_above[idx] = j
+                .left
+                .iter()
+                .chain(&j.right)
+                .any(|a| join_nullable.contains(a));
             let mut kind = j.kind;
+            // A side always matching is never null-extended.
+            if j.always_matches.1 {
+                kind = match kind {
+                    JoinKind::Left => JoinKind::Inner,
+                    JoinKind::Full => JoinKind::Right,
+                    k => k,
+                };
+            }
+            if j.always_matches.0 {
+                kind = match kind {
+                    JoinKind::Right => JoinKind::Inner,
+                    JoinKind::Full => JoinKind::Left,
+                    k => k,
+                };
+            }
             if let Some(fk) = &j.fk
                 && self.fk_child_present(fk, &forced)
             {
@@ -361,6 +524,7 @@ impl NullabilityContext {
             matched = matched.union(on);
         }
         self.final_kinds = kinds;
+        self.extended_above = extended_above;
         self.join_nullable = join_nullable;
         self.matched_facts = matched;
     }
@@ -416,6 +580,14 @@ impl NullabilityContext {
                     preds: &preds,
                 };
                 found = found.union(entry.checks.derive(&entry.alias, &k));
+            }
+            // An entry always there brings what holds wherever its row is.
+            if level == Level::Where {
+                for (alias, f) in &self.entry_facts {
+                    if !self.alias_is_nullable(alias) {
+                        found = found.union(self.translated(f.clone()));
+                    }
+                }
             }
             // A disjunction with all but one of its columns NULL proves
             // that one.
@@ -692,6 +864,21 @@ impl NullabilityContext {
             .iter()
             .any(|d| d.iter().all(|c| set.contains(c)))
         {
+            return true;
+        }
+        // A FULL join's row has one side or the other (unless a join above
+        // null-extends both): a column of each side non-NULL whenever its
+        // side is there makes one of them non-NULL.
+        let usable = |c: &Col| set.contains(c) && !self.grouping_omitted.contains(c);
+        let full = self.joins.iter().enumerate().any(|(idx, j)| {
+            j.full_sides.as_ref().is_some_and(|[l, r]| {
+                self.final_kinds.get(idx) == Some(&JoinKind::Full)
+                    && self.extended_above.get(idx) == Some(&false)
+                    && l.iter().any(usable)
+                    && r.iter().any(usable)
+            })
+        });
+        if full {
             return true;
         }
         // The CHECK constraints of their entry, case by case.

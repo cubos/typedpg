@@ -74,7 +74,10 @@ pub(crate) fn process_from_item(
                         })
                         .collect()
                 };
-                scope.add_derived(alias, realias(cte_cols), crate::scope::SourceKind::Cte)?;
+                // Each reference scans the CTE's rows anew.
+                let mut cte_cols = realias(cte_cols);
+                fresh_scans(&mut cte_cols);
+                scope.add_derived(alias, cte_cols, crate::scope::SourceKind::Cte)?;
                 // An alias list renames only the CTE's own columns.
                 apply_alias_column_names(scope, rv.alias.as_ref())?;
                 // addRangeTableEntryForCTE appends the SEARCH / CYCLE
@@ -86,6 +89,8 @@ pub(crate) fn process_from_item(
                     } else {
                         src.system_columns.extend(realias(search_cycle));
                     }
+                    src.min_one_row = cte_min_one_row(cte_scopes, &rv.relname);
+                    null_ctx.register_origins(&src.alias, &src.columns, false);
                 }
                 return Ok(());
             }
@@ -127,6 +132,29 @@ pub(crate) fn process_from_item(
                             .is_some_and(|a| snapshot.attr_never_null(a))
                     });
                 }
+                // Where each column's values come from: this scan of the
+                // table, or what a view reads.
+                if class.relkind == crate::pg_catalog::RelKind::View {
+                    if let Some(origins) = view_origins(snapshot, class) {
+                        for (c, o) in src.columns.iter_mut().zip(origins) {
+                            c.origin = o;
+                        }
+                    }
+                } else {
+                    let scan = crate::scope::fresh_scan_id();
+                    let (with_children, all_rows) = (src.inherits_rows, !src.partial_scan);
+                    for c in src.columns.iter_mut() {
+                        c.origin = Some(crate::scope::Origin {
+                            scan,
+                            relid: class.oid,
+                            column: c.name.clone(),
+                            base_not_null: c.base_not_null,
+                            with_children,
+                            all_rows,
+                        });
+                    }
+                }
+
                 // Every row of a table satisfies its CHECK constraints
                 // (named by the table's own column names: not with an
                 // alias list renaming them).
@@ -164,6 +192,15 @@ pub(crate) fn process_from_item(
                 }
             }
             apply_alias_column_names(scope, rv.alias.as_ref())?;
+            if let Some(src) = scope.sources.last() {
+                // A table entry is its scan's home; a view's columns come
+                // from scans inside it.
+                let home = src
+                    .relid
+                    .and_then(|r| snapshot.pg_class.get(&r))
+                    .is_some_and(|c| c.relkind != crate::pg_catalog::RelKind::View);
+                null_ctx.register_origins(&src.alias, &src.columns, home);
+            }
         }
         node::Node::JoinExpr(join) => {
             process_join_expr(join, scope, null_ctx, snapshot, cte_scopes, params)?;
@@ -246,6 +283,7 @@ pub(crate) fn process_from_item(
                     )
                 });
                 let (mut cols, _) = analyzed?;
+                let summary = take_level_summary();
                 if capture {
                     null_ctx.add_where_facts(
                         correlated.restricted_to(&crate::nonnull::own_aliases(scope)),
@@ -263,6 +301,7 @@ pub(crate) fn process_from_item(
                         collation: rc.collation,
                         record_fields: rc.record_fields,
                         elem_nullable: rc.elem_nullable,
+                        origin: rc.origin,
                     })
                     .collect();
                 // PG rejects more aliases than columns (42P10).
@@ -288,6 +327,8 @@ pub(crate) fn process_from_item(
                 )?;
                 if let Some(src) = scope.sources.last_mut() {
                     src.lock_error = pushed_lock_error(sel, snapshot);
+                    src.min_one_row = summary.min_one_row;
+                    null_ctx.register_origins(&src.alias, &src.columns, false);
                 }
             }
         }
@@ -305,6 +346,9 @@ pub(crate) fn process_from_item(
             process_from_item(relation, scope, null_ctx, snapshot, cte_scopes, params)?;
             if let Some(src) = scope.sources.last_mut() {
                 src.partial_scan = true;
+                for o in src.columns.iter_mut().filter_map(|c| c.origin.as_mut()) {
+                    o.all_rows = false;
+                }
             }
             // transformFromClauseItem: only a plain table, partitioned
             // table or materialized view can be sampled (not a view,
@@ -378,7 +422,7 @@ pub(crate) fn process_from_item(
 fn process_range_function(
     rf: &protobuf::RangeFunction,
     scope: &mut Scope,
-    null_ctx: &NullabilityContext,
+    null_ctx: &mut NullabilityContext,
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
 ) -> Result<(), AnalyzeError> {
@@ -453,10 +497,12 @@ fn process_range_function(
     let alias = alias_owned.as_str();
 
     let arg_scope = srf_arg_scope(scope);
-    let arg_ctx = expr::Ctx::new(&arg_scope, null_ctx, snapshot);
+    let log = crate::nonnull::StrictLog::default();
+    let arg_ctx = expr::Ctx::new(&arg_scope, null_ctx, snapshot).logging_strictness(&log);
     let nfuncs = funcs.len();
     let mut cols: Vec<ScopeColumn> = Vec::new();
     let mut whole_row = crate::scope::WholeRow::Record;
+    let mut rows = RteFunctionRows::default();
     // EXPR_KIND_FROM_FUNCTION: no aggregate or window call of this level,
     // in the call itself or in a sublink of its arguments.
     crate::grouping::with_clause(Some("functions in FROM"), || {
@@ -468,6 +514,7 @@ fn process_range_function(
                 arg_ctx,
                 params,
                 &mut whole_row,
+                &mut rows,
             )?);
             let call = protobuf::Node {
                 node: Some(node::Node::FuncCall(Box::new(f.call.clone().into_owned()))),
@@ -502,6 +549,7 @@ fn process_range_function(
             collation: None,
             record_fields: None,
             elem_nullable: None,
+            origin: None,
         });
     }
 
@@ -522,11 +570,59 @@ fn process_range_function(
         c.name = alias_name;
     }
 
+    // ExecMakeTableFunctionResult calls a strict set-returning function
+    // with a NULL argument not at all: no row. So wherever a row of a lone
+    // one is, its arguments were non-NULL (several functions pad each
+    // other's missing rows with NULLs).
+    if nfuncs == 1 && rows.strict_srf {
+        let own = crate::nonnull::own_aliases(scope);
+        let facts = funcs[0]
+            .call
+            .args
+            .iter()
+            .fold(crate::nonnull::Facts::default(), |acc, a| {
+                acc.union(crate::nonnull::nonnullable(
+                    a, false, &arg_scope, &log, snapshot,
+                ))
+            })
+            .restricted_to(&own);
+        null_ctx.add_entry_facts(alias, facts);
+    }
     scope.add_derived(alias, cols, crate::scope::SourceKind::Function)?;
     if let Some(src) = scope.sources.last_mut() {
         src.whole_row = whole_row;
+        src.min_one_row = rows.min_one_row;
     }
     Ok(())
+}
+
+/// What a function RTE's functions guarantee about its rows.
+#[derive(Default)]
+struct RteFunctionRows {
+    /// One of them yields a row whatever happens (`generate_series` over
+    /// constant bounds that aren't empty).
+    min_one_row: bool,
+    /// The (last) function is a strict set-returning one.
+    strict_srf: bool,
+}
+
+/// `generate_series(start, stop [, step])` over integer constants that
+/// make a non-empty series.
+fn constant_series_is_non_empty(args: &[protobuf::Node]) -> bool {
+    let int = |n: &protobuf::Node| match n.node.as_ref() {
+        Some(node::Node::AConst(protobuf::AConst {
+            val: Some(protobuf::a_const::Val::Ival(i)),
+            isnull: false,
+            ..
+        })) => Some(i64::from(i.ival)),
+        _ => None,
+    };
+    let vals: Option<Vec<i64>> = args.iter().map(int).collect();
+    match vals.as_deref() {
+        Some([start, stop]) => start <= stop,
+        Some([start, stop, step]) => (*step > 0 && start <= stop) || (*step < 0 && start >= stop),
+        _ => false,
+    }
 }
 
 /// One function of a function RTE after `transformRangeFunction`'s
@@ -671,7 +767,7 @@ fn process_join_expr(
         )?;
         check_no_srf_in_clause(quals, snapshot, "JOIN conditions")?;
         on_facts = crate::nonnull::nonnullable(quals, true, &on_scope, &log, snapshot);
-        equalities = on_equalities(quals, &on_scope, &log);
+        equalities = on_equalities(quals, &on_scope, &log, snapshot);
     }
 
     // `JOIN … USING (cols)` / `NATURAL JOIN` merge the join columns: the
@@ -727,12 +823,33 @@ fn process_join_expr(
     let fk = equalities
         .as_deref()
         .and_then(|eqs| fk_match(eqs, scope, left, right, null_ctx, snapshot));
+    // `ON true` to a side that always yields a row (for each row of the
+    // other, when LATERAL): that side always matches.
+    let on_true = join.quals.as_deref().is_some_and(is_true_const);
+    let always = |side: SourceSpan| on_true && matches!(side.sources(scope), [s] if s.min_one_row);
+    let always_matches = (always(left), always(right));
+    // A FULL join's row has one side or the other: what each side has
+    // non-NULL whenever its row is there.
+    let full_sides = (kind == nullability::JoinKind::Full).then(|| {
+        let side_cols = |side: SourceSpan| -> Vec<crate::nonnull::Col> {
+            side.sources(scope)
+                .iter()
+                .filter(|s| !null_ctx.alias_is_nullable(&s.alias))
+                .flat_map(|s| s.columns.iter())
+                .filter(|c| !null_ctx.is_nullable(&c.table_alias, &c.name, c.base_not_null))
+                .map(|c| (c.table_alias.clone(), c.name.clone()))
+                .collect()
+        };
+        [side_cols(left), side_cols(right)]
+    });
     let join_idx = null_ctx.record_join(
         kind,
         &nullability::collect_aliases(left.sources(scope)),
         &nullability::collect_aliases(right.sources(scope)),
         on_facts,
         fk,
+        always_matches,
+        full_sides,
     );
 
     let merged_inserted = merged.is_some();
@@ -805,51 +922,71 @@ pub(crate) fn inheritance_descendants(
 }
 
 /// The column pairs an ON clause equates, when it is nothing but an AND
-/// of strict `a.x = b.y` comparisons between plain columns.
+/// of strict `a.x = b.y` comparisons between plain columns — or `IS NOT
+/// DISTINCT FROM`, the same where the columns are non-NULL (what a
+/// foreign key needs of its child keys anyway), and either side may be
+/// cast to its own type (a no-op).
 fn on_equalities(
     quals: &protobuf::Node,
     on_scope: &Scope,
     log: &crate::nonnull::StrictLog,
+    snapshot: &PgCatalog,
 ) -> Option<Vec<(crate::nonnull::Col, crate::nonnull::Col)>> {
-    fn conjuncts<'a>(n: &'a protobuf::Node, out: &mut Vec<&'a protobuf::Node>) {
-        match n.node.as_ref() {
-            Some(node::Node::BoolExpr(b))
-                if protobuf::BoolExprType::try_from(b.boolop)
-                    == Ok(protobuf::BoolExprType::AndExpr) =>
-            {
-                for a in &b.args {
-                    conjuncts(a, out);
-                }
-            }
-            _ => out.push(n),
-        }
-    }
     let mut cs = Vec::new();
     conjuncts(quals, &mut cs);
+    let column = |n: &protobuf::Node| -> Option<crate::nonnull::Col> {
+        let n = match n.node.as_ref()? {
+            // `col::its_type` (no typmod: a length coercion is no no-op).
+            node::Node::TypeCast(tc) => {
+                let tn = tc.type_name.as_ref()?;
+                let arg = tc.arg.as_deref()?;
+                let (_, t) = crate::nonnull::plain_column(arg, on_scope)?;
+                if !tn.typmods.is_empty()
+                    || crate::ddl::util::resolve_type_name(tn, snapshot) != Some(t)
+                {
+                    return None;
+                }
+                arg
+            }
+            _ => n,
+        };
+        Some(crate::nonnull::plain_column(n, on_scope)?.0)
+    };
     cs.into_iter()
         .map(|c| {
             let Some(node::Node::AExpr(e)) = c.node.as_ref() else {
                 return None;
             };
-            if protobuf::AExprKind::try_from(e.kind) != Ok(protobuf::AExprKind::AexprOp)
-                || expr::extract_string_fields(&e.name).join(".") != "="
+            if !matches!(
+                protobuf::AExprKind::try_from(e.kind),
+                Ok(protobuf::AExprKind::AexprOp | protobuf::AExprKind::AexprNotDistinct)
+            ) || expr::extract_string_fields(&e.name).join(".") != "="
                 || !log.is_strict(e.location, crate::nonnull::StrictNode::Op)
             {
                 return None;
             }
-            let l = crate::nonnull::plain_column(e.lexpr.as_deref()?, on_scope)?.0;
-            let r = crate::nonnull::plain_column(e.rexpr.as_deref()?, on_scope)?.0;
+            let l = column(e.lexpr.as_deref()?)?;
+            let r = column(e.rexpr.as_deref()?)?;
             Some((l, r))
         })
         .collect()
 }
 
 /// The foreign key a join follows, when its join condition is exactly the
-/// equalities of a foreign key between an entry on one side (the child)
-/// and the other side, which must be the referenced table alone (the
-/// parent, scanned in full and without row security hiding rows). The
-/// constraint is assumed to hold, `NOT VALID` or deferrable as it may be;
-/// a `NOT ENFORCED` one isn't.
+/// equalities of a foreign key from the rows of an entry on one side (the
+/// child) into the other side, which must keep every row of the
+/// referenced table (the parent): the table itself scanned in full, a
+/// view, subquery or CTE passing all of its rows through, or a join tree
+/// keeping every row of one of those ([`NullabilityContext::side_keeps_rows_of`]).
+/// The child's key columns may come through a subquery, CTE, view or
+/// aliased join too, as long as they are passed through from one scan of
+/// the child table (see [`crate::scope::Origin`]). The constraint is
+/// assumed to hold, `NOT VALID` or deferrable as it may be; a `NOT
+/// ENFORCED` one isn't, nor one into a table with row security.
+///
+/// A join of a table's rows to the same table on the same columns is
+/// matched just the same: each row finds itself (a btree `=` is
+/// reflexive).
 fn fk_match(
     equalities: &[(crate::nonnull::Col, crate::nonnull::Col)],
     scope: &Scope,
@@ -858,105 +995,96 @@ fn fk_match(
     null_ctx: &NullabilityContext,
     snapshot: &PgCatalog,
 ) -> Option<nullability::FkMatch> {
-    let parent_of = |side: SourceSpan| -> Option<&crate::scope::TableSource> {
-        match side.sources(scope) {
-            [p] if matches!(p.kind, crate::scope::SourceKind::Relation) && !p.partial_scan => {
-                Some(p)
-            }
-            _ => None,
-        }
-    };
     let in_span =
         |side: SourceSpan, alias: &str| side.sources(scope).iter().any(|s| s.alias == alias);
+    let col_of = |side: SourceSpan, c: &crate::nonnull::Col| {
+        side.sources(scope)
+            .iter()
+            .find(|s| s.alias == c.0)?
+            .columns
+            .iter()
+            .find(|sc| sc.name == c.1)
+    };
+    // The origins of `cols` (all in `side`), when all from one scan.
+    let one_scan = |side: SourceSpan, cols: &[&crate::nonnull::Col]| {
+        let origins: Vec<&crate::scope::Origin> = cols
+            .iter()
+            .map(|c| col_of(side, c)?.origin.as_ref())
+            .collect::<Option<_>>()?;
+        let first = *origins.first()?;
+        origins
+            .iter()
+            .all(|o| o.scan == first.scan)
+            .then_some(origins)
+    };
     let try_side = |parent_side: SourceSpan, child_side: SourceSpan, parent_is_left: bool| {
-        let parent = parent_of(parent_side)?;
-        let parent_rel = parent.relid?;
-        let parent_class = snapshot.pg_class.get(&parent_rel)?;
-        if !matches!(
-            parent_class.relkind,
-            crate::pg_catalog::RelKind::Table | crate::pg_catalog::RelKind::Partitioned
-        ) || snapshot.row_security.contains(&parent_rel)
-        {
-            return None;
-        }
-        // (child column, parent column) pairs, the child all one entry.
-        let mut pairs: Vec<(crate::nonnull::Col, String)> = Vec::new();
+        // (child column, parent column) pairs.
+        let mut pairs: Vec<(&crate::nonnull::Col, &crate::nonnull::Col)> = Vec::new();
         for (a, b) in equalities {
-            let (c, p) = if a.0 == parent.alias && in_span(child_side, &b.0) {
-                (b, a)
-            } else if b.0 == parent.alias && in_span(child_side, &a.0) {
-                (a, b)
+            if in_span(parent_side, &a.0) && in_span(child_side, &b.0) {
+                pairs.push((b, a));
+            } else if in_span(parent_side, &b.0) && in_span(child_side, &a.0) {
+                pairs.push((a, b));
             } else {
                 return None;
-            };
-            pairs.push((c.clone(), p.1.clone()));
+            }
         }
-        let child_alias = pairs.first()?.0.0.clone();
-        if pairs.iter().any(|(c, _)| c.0 != child_alias) {
-            return None;
-        }
-        let child = child_side
-            .sources(scope)
+        let parent_alias = &pairs.first()?.1.0;
+        let child_alias = &pairs.first()?.0.0;
+        if pairs
             .iter()
-            .find(|s| s.alias == child_alias)?;
-        if !matches!(child.kind, crate::scope::SourceKind::Relation) || child.inherits_rows {
-            return None;
-        }
-        let child_rel = child.relid?;
-        if snapshot.ri_triggers_disabled.contains(&child_rel)
-            || snapshot.ri_triggers_disabled.contains(&parent_rel)
+            .any(|(c, p)| &c.0 != child_alias || &p.0 != parent_alias)
         {
             return None;
         }
-        let attname = |rel, attnum: i16| {
-            snapshot
-                .attributes_of(rel)
-                .iter()
-                .find(|a| a.attnum == attnum)
-                .map(|a| a.attname.clone())
-        };
-        let wanted: std::collections::BTreeSet<(String, String)> = pairs
-            .iter()
-            .map(|(c, p)| (c.1.clone(), p.clone()))
-            .collect();
-        let follows = snapshot.pg_constraint.values().any(|con| {
-            con.contype == crate::pg_catalog::ConType::ForeignKey
-                && con.conrelid == child_rel
-                && con.confrelid == Some(parent_rel)
-                && con.conenforced
-                && !con.conperiod
-                // Not a partition's internal clone (`conparentid`): the one
-                // referencing a partitioned table also has clones pointing
-                // at each partition, which a row may be in another of.
-                && snapshot
-                    .fk_details
-                    .get(&con.oid)
-                    .is_none_or(|d| d.parent.is_none())
-                && {
-                    let fk: Option<std::collections::BTreeSet<(String, String)>> = con
-                        .conkey
-                        .iter()
-                        .zip(&con.confkey)
-                        .map(|(&c, &p)| Some((attname(child_rel, c)?, attname(parent_rel, p)?)))
-                        .collect();
-                    fk.is_some_and(|fk| fk == wanted)
-                }
-        });
-        if !follows {
+        let parent_origins = one_scan(
+            parent_side,
+            &pairs.iter().map(|(_, p)| *p).collect::<Vec<_>>(),
+        )?;
+        let child_origins = one_scan(
+            child_side,
+            &pairs.iter().map(|(c, _)| *c).collect::<Vec<_>>(),
+        )?;
+        let (parent, child) = (parent_origins[0], child_origins[0]);
+        if !parent.all_rows || !fk_parent_ok(snapshot, parent.relid) {
             return None;
         }
-        let base = |c: &str| {
-            child
-                .columns
-                .iter()
-                .find(|sc| sc.name == c)
-                .map(|sc| sc.base_not_null)
+        // The parent's entry keeps its rows through the side's joins.
+        let side_aliases: std::collections::HashSet<String> = parent_side
+            .sources(scope)
+            .iter()
+            .map(|s| s.alias.clone())
+            .collect();
+        if !null_ctx.side_keeps_rows_of(&side_aliases, parent_alias) {
+            return None;
+        }
+        let wanted: std::collections::BTreeSet<(String, String)> = child_origins
+            .iter()
+            .zip(&parent_origins)
+            .map(|(c, p)| (c.column.clone(), p.column.clone()))
+            .collect();
+        let follows =
+            !child.with_children && fk_follows(snapshot, child.relid, parent.relid, &wanted);
+        // A row joined to its own table on its own columns finds itself.
+        let itself = || {
+            scan_contains(parent, child)
+                && pairs
+                    .iter()
+                    .zip(child_origins.iter().zip(&parent_origins))
+                    .all(|((c, _), (co, po))| {
+                        co.column == po.column
+                            && col_of(child_side, c)
+                                .is_some_and(|sc| reflexive_eq(snapshot, sc.type_oid))
+                    })
         };
+        if !follows && !itself() {
+            return None;
+        }
         let child_cols: Vec<(crate::nonnull::Col, bool)> = pairs
-            .into_iter()
+            .iter()
             .map(|(c, _)| {
-                let b = base(&c.1).unwrap_or(false);
-                (c, b)
+                let b = col_of(child_side, c).is_some_and(|sc| sc.base_not_null);
+                ((*c).clone(), b)
             })
             .collect();
         let child_present = child_cols
@@ -1005,6 +1133,14 @@ fn alias_join(
             ..c.clone()
         })
         .collect();
+    // A table's rows are all in the join only if its joins keep them.
+    let inner_aliases: std::collections::HashSet<String> =
+        inner.iter().map(|s| s.alias.clone()).collect();
+    for (c, (ia, _, _)) in columns.iter_mut().zip(&inner_cols) {
+        if let Some(o) = &mut c.origin {
+            o.all_rows &= null_ctx.side_keeps_rows_of(&inner_aliases, ia);
+        }
+    }
     let colnames = expr::extract_string_fields(&alias.colnames);
     if colnames.len() > columns.len() {
         return Err(crate::pgmsg::too_many_join_column_aliases(
@@ -1032,6 +1168,7 @@ fn alias_join(
             .into_iter()
             .filter(|s| !crate::scope::is_hidden_alias(&s.alias)),
     );
+    null_ctx.register_origins(&alias.aliasname, &columns, false);
     scope.sources.insert(
         start,
         crate::scope::TableSource {
@@ -1172,6 +1309,7 @@ fn merge_using_columns(
             table_alias: String::new(),
             record_fields: None,
             elem_nullable: crate::expr::merge_elem_nullable([l.elem_nullable, r.elem_nullable]),
+            origin: None,
         });
         hide.push((l_idx, name.clone()));
         hide.push((r_idx, name.clone()));
@@ -1621,6 +1759,7 @@ fn function_rte_columns(
     arg_ctx: Ctx<'_>,
     params: &mut ParamCollector,
     whole_row: &mut crate::scope::WholeRow,
+    rows: &mut RteFunctionRows,
 ) -> Result<Vec<ScopeColumn>, AnalyzeError> {
     let snapshot = arg_ctx.snapshot;
     let func_call: &protobuf::FuncCall = &f.call;
@@ -1657,6 +1796,19 @@ fn function_rte_columns(
     // Coerce untyped arguments to the chosen signature (pins `$N`,
     // validates literal contents), as for a call anywhere else.
     expr::backfill_call_args(func_call, &arg_types, &resolved, arg_ctx, params)?;
+    // Strict in the arguments as written: not a variadic call packing them
+    // into an array, nor one coercing them through a non-strict cast.
+    rows.strict_srf = resolved.is_set_returning
+        && resolved.is_strict
+        && resolved.nvargs == 0
+        && arg_types
+            .iter()
+            .zip(&resolved.arg_types)
+            .all(|(&a, &d)| arg_ctx.coercion_is_strict(a, d));
+    rows.min_one_row |= resolved.schema == "pg_catalog"
+        && name == "generate_series"
+        && !func_call.func_variadic
+        && constant_series_is_non_empty(&func_call.args);
     let has_coldeflist = !f.coldeflist.is_empty();
 
     // A strict catalog SRF with a single OUT column (`jsonb_array_elements`
@@ -1696,6 +1848,7 @@ fn function_rte_columns(
                 table_alias: alias.to_owned(),
                 record_fields: None,
                 elem_nullable: None,
+                origin: None,
             })
             .collect());
     }
@@ -1726,6 +1879,7 @@ fn function_rte_columns(
                 table_alias: alias.to_owned(),
                 record_fields: None,
                 elem_nullable: None,
+                origin: None,
             })
             .collect());
     }
@@ -1767,6 +1921,7 @@ fn function_rte_columns(
         collation: None,
         record_fields: None,
         elem_nullable: None,
+        origin: None,
     }])
 }
 
@@ -1804,6 +1959,7 @@ fn coldeflist_columns(
             table_alias: alias.to_owned(),
             record_fields: None,
             elem_nullable: None,
+            origin: None,
         });
     }
     for (i, c) in cols.iter().enumerate() {
@@ -2146,6 +2302,7 @@ fn json_table_columns(
             table_alias: alias.to_owned(),
             record_fields: None,
             elem_nullable: None,
+            origin: None,
         });
     }
     Ok(())

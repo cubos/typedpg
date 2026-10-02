@@ -473,7 +473,7 @@ fn bare_alias_of_non_table_from_items() {
     }
     // The subquery is on the nullable side of the LEFT JOIN.
     let s = db
-        .analyze("SELECT q FROM t LEFT JOIN (SELECT 1 a) q ON true")
+        .analyze("SELECT q FROM t LEFT JOIN (SELECT 1 a) q ON q.a > 1")
         .unwrap();
     assert!(s.columns[0].nullable);
     let s = db
