@@ -5,7 +5,7 @@ use super::*;
 // ──────────────────────────────────────────────────────────────────────────────
 
 /// Which of RETURNING's OLD / NEW rows some returned row may lack.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct ReturningRows {
     /// A returned row may have no old version: a plain INSERT, the insert
     /// arm of ON CONFLICT DO UPDATE, a MERGE with an INSERT action.
@@ -13,6 +13,11 @@ pub(crate) struct ReturningRows {
     /// A returned row may have no new version: DELETE, a MERGE with a
     /// DELETE action.
     pub new_may_be_null: bool,
+    /// The target's columns the statement's WHERE proves non-NULL in the
+    /// old row (an UPDATE's or DELETE's): so are OLD's.
+    pub old_proven: std::collections::HashSet<String>,
+    /// Those an UPDATE's new row keeps: so are NEW's.
+    pub new_proven: std::collections::HashSet<String>,
 }
 
 /// PG's `transformReturningClause` (parser/analyze.c): resolve a RETURNING
@@ -55,12 +60,13 @@ pub(crate) fn resolve_returning(
             continue;
         };
         let span = crate::error::SourceSpan::from_node_qname(opt.location);
-        let (named, kind, null_row) = match protobuf::ReturningOptionKind::try_from(opt.option) {
+        let (named, kind, null_row, old) = match protobuf::ReturningOptionKind::try_from(opt.option)
+        {
             Ok(protobuf::ReturningOptionKind::ReturningOptionOld) => {
-                (&mut old_named, "OLD", rows.old_may_be_null)
+                (&mut old_named, "OLD", rows.old_may_be_null, true)
             }
             Ok(protobuf::ReturningOptionKind::ReturningOptionNew) => {
-                (&mut new_named, "NEW", rows.new_may_be_null)
+                (&mut new_named, "NEW", rows.new_may_be_null, false)
             }
             _ => {
                 return Err(AnalyzeError::Unsupported(format!(
@@ -78,14 +84,16 @@ pub(crate) fn resolve_returning(
         }
         scope
             .sources
-            .push(target.table_only_copy(&opt.value, null_row));
+            .push(row_copy(&target, &opt.value, null_row, old, &rows));
     }
-    for (named, name, null_row) in [
-        (old_named, "old", rows.old_may_be_null),
-        (new_named, "new", rows.new_may_be_null),
+    for (named, name, null_row, old) in [
+        (old_named, "old", rows.old_may_be_null, true),
+        (new_named, "new", rows.new_may_be_null, false),
     ] {
         if !named && !namespace_has(&scope, name) {
-            scope.sources.push(target.table_only_copy(name, null_row));
+            scope
+                .sources
+                .push(row_copy(&target, name, null_row, old, &rows));
         }
     }
 
@@ -116,6 +124,29 @@ pub(crate) fn resolve_returning(
         return Err(crate::pgmsg::returning_without_columns(span).finalize_implicit());
     }
     Ok(columns)
+}
+
+/// RETURNING's OLD / NEW row `alias`, a copy of the target entry knowing
+/// what the WHERE proved of its row.
+fn row_copy(
+    target: &crate::scope::TableSource,
+    alias: &str,
+    null_row: bool,
+    old: bool,
+    rows: &ReturningRows,
+) -> crate::scope::TableSource {
+    let mut copy = target.table_only_copy(alias, null_row);
+    let proven = if old {
+        &rows.old_proven
+    } else {
+        &rows.new_proven
+    };
+    if !null_row {
+        for c in &mut copy.columns {
+            c.base_not_null |= proven.contains(&c.name);
+        }
+    }
+    copy
 }
 
 /// PG's `refnameNamespaceItem(pstate, NULL, name, …)` without walking up:

@@ -85,11 +85,11 @@ fn where_timestamptz_column_not_boolean() {
 #[test]
 fn where_is_not_null() {
     let db = setup();
-    // The analyzer doesn't narrow nullability through WHERE clauses.
+    // The rows past the WHERE have a non-NULL age.
     let s = db
         .analyze("SELECT id, age FROM users WHERE age IS NOT NULL")
         .unwrap();
-    assert_cols(&s, vec![c("id", int8()), cn("age", int4())]);
+    assert_cols(&s, vec![c("id", int8()), c("age", int4())]);
 }
 
 #[test]

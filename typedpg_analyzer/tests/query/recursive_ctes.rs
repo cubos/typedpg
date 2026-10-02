@@ -135,7 +135,7 @@ fn recursive_one_arm_nullable_propagates() {
                 SELECT id, name FROM categories WHERE parent_id IS NULL \
                 UNION ALL \
                 SELECT c.id, c.parent_id::text \
-                FROM categories c JOIN tree t ON c.parent_id = t.id \
+                FROM categories c JOIN tree t ON c.id = t.id \
              ) SELECT id, label FROM tree",
         )
         .unwrap();

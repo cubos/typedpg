@@ -312,8 +312,13 @@ pub(crate) fn infer_json_array_query(
 ) -> Result<ExprType, AnalyzeError> {
     let mut args = Vec::new();
     if let Some(node::Node::SelectStmt(sel)) = c.query.as_deref().and_then(|q| q.node.as_ref()) {
-        let (cols, _) =
-            crate::resolve::analyze_correlated_select(sel, ctx.snapshot, params, ctx.scope)?;
+        let (cols, _) = crate::resolve::analyze_correlated_select(
+            sel,
+            ctx.snapshot,
+            params,
+            ctx.scope,
+            ctx.null_ctx,
+        )?;
         if cols.len() != 1 {
             return Err(crate::pgmsg::subquery_must_return_one_column(
                 crate::error::SourceSpan::from_location(c.location),

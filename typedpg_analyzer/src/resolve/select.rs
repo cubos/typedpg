@@ -22,6 +22,7 @@ pub(crate) fn analyze_correlated_select(
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
     outer_scope: &crate::scope::Scope,
+    outer_null_ctx: &NullabilityContext,
 ) -> AnalyzeResult {
     // Everything the enclosing level can see — its own FROM plus any
     // lateral refs it received — is reachable from the sublink as a
@@ -29,13 +30,12 @@ pub(crate) fn analyze_correlated_select(
     // that way, the levels further out (PG searches the whole ParseState
     // chain). Those come behind the enclosing level's entries: an entry of
     // the same name there hides them, and so does a column of the same name
-    // for unqualified references.
-    let mut outer: Vec<crate::scope::TableSource> = outer_scope
-        .sources
-        .iter()
-        .chain(outer_scope.lateral_sources.iter())
-        .cloned()
-        .collect();
+    // for unqualified references. The enclosing level's own entries carry
+    // its nullability (outer joins, quals proven so far) down; the tiers
+    // it received already carry their levels'.
+    let mut outer: Vec<crate::scope::TableSource> =
+        outer_null_ctx.bake_sources(&outer_scope.sources);
+    outer.extend(outer_scope.lateral_sources.iter().cloned());
     let near_aliases: std::collections::HashSet<String> =
         outer.iter().map(|s| s.alias.clone()).collect();
     let near_columns: std::collections::HashSet<String> = outer
@@ -269,13 +269,19 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
         // reference the post-aggregation row, not the pre-aggregation one) —
         // but only after the expression itself resolves; the ordering lives
         // in `coerce_bool_clause`.
+        let log = crate::nonnull::StrictLog::default();
         crate::clause::coerce_clause_expr(
             where_clause,
-            expr::Ctx::new(&scope, &null_ctx, snapshot),
+            expr::Ctx::new(&scope, &null_ctx, snapshot).logging_strictness(&log),
             params,
             crate::clause::ClauseKind::Where,
         )?;
         check_no_srf_in_clause(where_clause, snapshot, "WHERE")?;
+        // What the rows past WHERE have non-NULL — read by everything
+        // evaluated after it, and reducing outer joins PG would reduce.
+        let facts = crate::nonnull::nonnullable(where_clause, true, &scope, &log)
+            .restricted_to(&crate::nonnull::own_aliases(&scope));
+        null_ctx.add_where_facts(facts);
     }
 
     // Collect select-list aliases so GROUP BY / ORDER BY can fall back to
@@ -314,13 +320,20 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
     // Process HAVING clause — same boolean goal as WHERE, but aggregates
     // are of course allowed there.
     if let Some(having) = &sel.having_clause {
+        let log = crate::nonnull::StrictLog::default();
         crate::clause::coerce_clause_expr(
             having,
-            expr::Ctx::new(&scope, &null_ctx, snapshot),
+            expr::Ctx::new(&scope, &null_ctx, snapshot).logging_strictness(&log),
             params,
             crate::clause::ClauseKind::Having,
         )?;
         check_no_srf_in_clause(having, snapshot, "HAVING")?;
+        // A grouped column HAVING proves non-NULL is so in every group
+        // left — the groups' rows share it — even one a grouping set
+        // omits (those groups are the ones HAVING drops).
+        let facts = crate::nonnull::nonnullable(having, true, &scope, &log)
+            .restricted_to(&crate::nonnull::own_aliases(&scope));
+        null_ctx.add_local_facts(facts);
     }
 
     // Process ORDER BY expressions. Sort items are wrapped in `SortBy` nodes

@@ -47,6 +47,7 @@ mod lexer;
 mod literal_input;
 mod lookup;
 mod network_input;
+mod nonnull;
 mod nullability;
 mod oid;
 mod param;

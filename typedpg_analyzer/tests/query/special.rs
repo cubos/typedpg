@@ -187,11 +187,14 @@ fn array_sublink_of_text_returns_text_array() {
 #[test]
 fn array_sublink_of_int4_returns_int4_array() {
     let db = setup();
-    let sql = "SELECT ARRAY(SELECT age FROM users WHERE age IS NOT NULL) AS ages";
+    let sql = "SELECT ARRAY(SELECT age FROM users) AS ages";
     let info = db.analyze(sql).unwrap();
-    // The WHERE does not narrow the column: its elements stay NULL-able.
     assert_eq!(col(&info, "ages").pg_type, array_with_elems(int4(), true));
     assert!(!col(&info, "ages").nullable);
+    // The subquery's WHERE leaves no NULL element.
+    let sql = "SELECT ARRAY(SELECT age FROM users WHERE age IS NOT NULL) AS ages";
+    let info = db.analyze(sql).unwrap();
+    assert_eq!(col(&info, "ages").pg_type, array_with_elems(int4(), false));
 }
 
 // ── `FROM func(...)` — RangeFunction ─────────────────────────────────────────

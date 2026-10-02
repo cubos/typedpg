@@ -51,7 +51,7 @@ impl Trigger {
 pub(crate) const TRIGGER_TYPE_UPDATE: i32 = 1 << 4;
 
 /// `TRIGGER_TYPE_*` bits (trigger.h).
-const TRIGGER_TYPE_BEFORE: i32 = 1 << 1;
+pub(crate) const TRIGGER_TYPE_BEFORE: i32 = 1 << 1;
 pub(crate) const TRIGGER_TYPE_INSERT: i32 = 1 << 2;
 pub(crate) const TRIGGER_TYPE_DELETE: i32 = 1 << 3;
 const TRIGGER_TYPE_TRUNCATE: i32 = 1 << 5;

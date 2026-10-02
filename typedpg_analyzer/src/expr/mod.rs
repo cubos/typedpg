@@ -47,6 +47,10 @@ pub(crate) struct Ctx<'a> {
     /// DDL needs to check an index / generation expression's mutability
     /// the way PG's CheckMutability does.
     pub used_procs: Option<&'a std::cell::RefCell<Vec<crate::oid::PgProcOid>>>,
+    /// When set, the strictness of the operators, functions and casts the
+    /// expression resolves is recorded — what [`crate::nonnull`] needs to
+    /// tell what a qual proves non-NULL.
+    pub strict_log: Option<&'a crate::nonnull::StrictLog>,
 }
 
 impl<'a> Ctx<'a> {
@@ -61,6 +65,56 @@ impl<'a> Ctx<'a> {
             null_ctx,
             snapshot,
             used_procs: None,
+            strict_log: None,
+        }
+    }
+
+    /// The same context, recording strictness into `log`.
+    pub fn logging_strictness(self, log: &'a crate::nonnull::StrictLog) -> Self {
+        Ctx {
+            strict_log: Some(log),
+            ..self
+        }
+    }
+
+    /// The same context over another nullability context.
+    pub fn with_null_ctx(self, null_ctx: &'a NullabilityContext) -> Self {
+        Ctx { null_ctx, ..self }
+    }
+
+    /// Record the strictness of the node of `kind` at `location`.
+    pub fn note_strict(&self, location: i32, kind: crate::nonnull::StrictNode, strict: bool) {
+        if let Some(log) = self.strict_log {
+            log.note(location, kind, strict);
+        }
+    }
+
+    /// Whether `proc` is strict.
+    pub fn proc_is_strict(&self, proc: Option<crate::oid::PgProcOid>) -> bool {
+        proc.and_then(|p| self.snapshot.pg_proc.get(&p))
+            .is_some_and(|p| p.proisstrict)
+    }
+
+    /// Whether the implicit coercion from `from` to `to` (an argument
+    /// coerced to a declared type) maps NULL to NULL: no cast function, or
+    /// a strict one.
+    pub fn coercion_is_strict(&self, from: PgTypeOid, to: PgTypeOid) -> bool {
+        if from == to || from == oid::UNKNOWN {
+            return true;
+        }
+        let key = (
+            self.snapshot.unwrap_domain(from),
+            self.snapshot.unwrap_domain(to),
+        );
+        match self
+            .snapshot
+            .cast_by_pair
+            .get(&key)
+            .and_then(|oid| self.snapshot.pg_cast.get(oid))
+            .and_then(|c| c.castfunc)
+        {
+            Some(f) => self.proc_is_strict(Some(f)),
+            None => true,
         }
     }
 

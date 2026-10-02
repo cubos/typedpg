@@ -138,7 +138,12 @@ pub(crate) fn process_from_item(
                 // off limits.
                 let mut enclosing = scope.enclosing_sources();
                 let (lateral_sources, mut shadowed_sources): (Vec<_>, Vec<_>) = if sub.lateral {
-                    (scope.lateral_visible(), Vec::new())
+                    // This level's own entries carry its nullability down.
+                    let mut visible = scope.lateral_visible();
+                    let own = scope.sources.len();
+                    let baked = null_ctx.bake_sources(&visible[..own]);
+                    visible.splice(..own, baked);
+                    (visible, Vec::new())
                 } else {
                     enclosing.splice(0..0, scope.lateral_sources.iter().cloned());
                     (Vec::new(), scope.sources.clone())
@@ -541,6 +546,7 @@ fn process_join_expr(
     // afterwards. Without this walk, `$N` parameters used only in
     // `ON` are never registered with the collector and `into_sorted`
     // reports a spurious "parameter gap".
+    let mut on_facts = crate::nonnull::Facts::default();
     if let Some(quals) = &join.quals {
         // transformJoinOnClause: the ON clause sees just the join's two
         // sides (plus outer levels); the FROM items beside the join are in
@@ -557,13 +563,15 @@ fn process_join_expr(
         // Shares WHERE's machinery: resolution errors first, then
         // the no-aggregates placement rule, then PG's clause wording
         // (`argument of JOIN/ON must be type boolean, not type X`).
+        let log = crate::nonnull::StrictLog::default();
         crate::clause::coerce_clause_expr(
             quals,
-            expr::Ctx::new(&on_scope, null_ctx, snapshot),
+            expr::Ctx::new(&on_scope, null_ctx, snapshot).logging_strictness(&log),
             params,
             crate::clause::ClauseKind::JoinOn,
         )?;
         check_no_srf_in_clause(quals, snapshot, "JOIN conditions")?;
+        on_facts = crate::nonnull::nonnullable(quals, true, &on_scope, &log);
     }
 
     // `JOIN … USING (cols)` / `NATURAL JOIN` merge the join columns: the
@@ -591,7 +599,7 @@ fn process_join_expr(
     let merged = if using_names.is_empty() {
         None
     } else {
-        Some(merge_using_columns(
+        let (merged, facts) = merge_using_columns(
             scope,
             null_ctx,
             snapshot,
@@ -599,26 +607,25 @@ fn process_join_expr(
             left,
             right,
             join_type,
-        )?)
+        )?;
+        on_facts = std::mem::take(&mut on_facts).union(facts);
+        Some(merged)
     };
 
     // Apply JOIN nullability.
-    match join_type {
-        JoinType::JoinLeft => {
-            let right_aliases = nullability::collect_aliases(right.sources(scope));
-            null_ctx.mark_all_nullable(&right_aliases);
-        }
-        JoinType::JoinRight => {
-            let left_aliases = nullability::collect_aliases(left.sources(scope));
-            null_ctx.mark_all_nullable(&left_aliases);
-        }
-        JoinType::JoinFull => {
-            let all_aliases = nullability::collect_aliases(left.to(right).sources(scope));
-            null_ctx.mark_all_nullable(&all_aliases);
-        }
-        JoinType::JoinInner => {} // No nullability change.
+    let kind = match join_type {
+        JoinType::JoinLeft => nullability::JoinKind::Left,
+        JoinType::JoinRight => nullability::JoinKind::Right,
+        JoinType::JoinFull => nullability::JoinKind::Full,
+        JoinType::JoinInner => nullability::JoinKind::Inner,
         other => return Err(AnalyzeError::UnsupportedJoinType(other as i32)),
-    }
+    };
+    null_ctx.record_join(
+        kind,
+        &nullability::collect_aliases(left.sources(scope)),
+        &nullability::collect_aliases(right.sources(scope)),
+        on_facts,
+    );
 
     let merged_inserted = merged.is_some();
     if let Some(merged) = merged {
@@ -747,7 +754,7 @@ fn merge_using_columns(
     left: SourceSpan,
     right: SourceSpan,
     join_type: JoinType,
-) -> Result<Vec<ScopeColumn>, AnalyzeError> {
+) -> Result<(Vec<ScopeColumn>, crate::nonnull::Facts), AnalyzeError> {
     // `(source index, column)` of the unique visible column named `name`.
     let find_col = |scope: &Scope,
                     span: SourceSpan,
@@ -769,6 +776,7 @@ fn merge_using_columns(
     };
 
     let mut merged: Vec<ScopeColumn> = Vec::with_capacity(using_names.len());
+    let mut facts = crate::nonnull::Facts::default();
     let mut hide: Vec<(usize, String)> = Vec::new();
     for (i, name) in using_names.iter().enumerate() {
         if using_names[..i].contains(name) {
@@ -779,12 +787,8 @@ fn merge_using_columns(
 
         let lt = crate::ddl::util::format_type_for_message(snapshot, l.type_oid);
         let rt = crate::ddl::util::format_type_for_message(snapshot, r.type_oid);
-        if l.type_oid != oid::UNKNOWN
-            && r.type_oid != oid::UNKNOWN
-            && snapshot
-                .find_operator("=", Some(l.type_oid), r.type_oid)
-                .is_none()
-        {
+        let eq = snapshot.find_operator("=", Some(l.type_oid), r.type_oid);
+        if l.type_oid != oid::UNKNOWN && r.type_oid != oid::UNKNOWN && eq.is_none() {
             // PG gives this one no position.
             let err = crate::pgmsg::operator_does_not_exist(&lt, "=", &rt, None);
             return Err(crate::expr::operators::with_cast_note(
@@ -801,11 +805,23 @@ fn merge_using_columns(
         };
         let l_not_null = !null_ctx.is_nullable(&l.table_alias, &l.name, l.base_not_null);
         let r_not_null = !null_ctx.is_nullable(&r.table_alias, &r.name, r.base_not_null);
+        // The join qual `l = r`: when its operator is strict, a joined
+        // pair has both sides non-NULL.
+        let eq_strict = eq
+            .as_ref()
+            .and_then(|op| op.code)
+            .and_then(|f| snapshot.pg_proc.get(&f))
+            .is_some_and(|f| f.proisstrict);
+        if eq_strict {
+            facts = facts
+                .union(crate::nonnull::Facts::column(&l.table_alias, &l.name))
+                .union(crate::nonnull::Facts::column(&r.table_alias, &r.name));
+        }
         let base_not_null = match join_type {
             JoinType::JoinLeft => l_not_null,
             JoinType::JoinRight => r_not_null,
             JoinType::JoinFull => l_not_null && r_not_null,
-            _ => l_not_null || r_not_null,
+            _ => l_not_null || r_not_null || eq_strict,
         };
         merged.push(ScopeColumn {
             name: name.clone(),
@@ -828,7 +844,7 @@ fn merge_using_columns(
     for (idx, name) in hide {
         scope.sources[idx].join_hidden.insert(name);
     }
-    Ok(merged)
+    Ok((merged, facts))
 }
 
 /// Apply a FROM item's column-alias list (`users AS t(a, b, c)`) to the

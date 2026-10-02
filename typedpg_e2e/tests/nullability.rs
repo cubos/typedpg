@@ -204,7 +204,7 @@ async fn view_over_an_outer_join() {
 }
 
 #[tokio::test]
-async fn where_is_not_null_is_not_narrowed() {
+async fn where_narrows_what_it_proves_non_null() {
     let pool = common::setup().await;
     let with_age = user(&pool, "refine").await;
     let without_age = user(&pool, "refine").await;
@@ -213,8 +213,7 @@ async fn where_is_not_null_is_not_narrowed() {
         .await
         .expect("set age");
     let ids = [with_age, without_age];
-    // The analyzer doesn't narrow a column through WHERE: `age` stays
-    // `Option` (conservative), and only rows with an age come back.
+    // Only rows with an age pass the WHERE: `age` is `i32`.
     let ages = sql!(
         &pool,
         "SELECT age FROM users WHERE id = ANY($ids) AND age IS NOT NULL"
@@ -222,8 +221,8 @@ async fn where_is_not_null_is_not_narrowed() {
     .fetch_all()
     .await
     .expect("filtered");
-    let ages: Vec<Option<i32>> = ages.into_iter().map(|r| r.age).collect();
-    assert_eq!(ages, vec![Some(30)]);
+    let ages: Vec<i32> = ages.into_iter().map(|r| r.age).collect();
+    assert_eq!(ages, vec![30]);
     let mut all = sql!(&pool, "SELECT age FROM users WHERE id = ANY($ids)")
         .fetch_all()
         .await
@@ -231,6 +230,101 @@ async fn where_is_not_null_is_not_narrowed() {
     all.sort_by_key(|r| r.age.is_none());
     let all: Vec<Option<i32>> = all.into_iter().map(|r| r.age).collect();
     assert_eq!(all, vec![Some(30), None]);
+
+    // A CASE branch knows what its WHEN ruled out.
+    let mut aged = sql!(
+        &pool,
+        "SELECT CASE WHEN age IS NULL THEN 0 ELSE age END AS age FROM users WHERE id = ANY($ids)"
+    )
+    .fetch_all()
+    .await
+    .expect("case");
+    aged.sort_by_key(|r| r.age);
+    let aged: Vec<i32> = aged.into_iter().map(|r| r.age).collect();
+    assert_eq!(aged, vec![0, 30]);
+}
+
+#[tokio::test]
+async fn outer_joins_narrowed_by_where_filter_and_case() {
+    let pool = common::setup().await;
+    let author = user(&pool, "narrow").await;
+    let lurker = user(&pool, "narrow").await;
+    let post_id = post(&pool, author).await;
+    let ids = [author, lurker];
+
+    // A strict WHERE qual on the LEFT JOIN's nullable side: an inner join.
+    let rows = sql!(
+        &pool,
+        "SELECT u.id, p.title FROM users u LEFT JOIN posts p ON p.user_id = u.id
+         WHERE u.id = ANY($ids) AND p.id IS NOT NULL"
+    )
+    .fetch_all()
+    .await
+    .expect("reduced join");
+    let titles: Vec<(i64, String)> = rows.into_iter().map(|r| (r.id, r.title)).collect();
+    assert_eq!(titles.len(), 1);
+    assert_eq!(titles[0].0, author);
+
+    // The matched side's titles, aggregated: no NULL element.
+    let mut rows = sql!(
+        &pool,
+        "SELECT u.id, array_agg(p.title) FILTER (WHERE p.id IS NOT NULL) AS titles
+         FROM users u LEFT JOIN posts p ON p.user_id = u.id
+         WHERE u.id = ANY($ids) GROUP BY u.id"
+    )
+    .fetch_all()
+    .await
+    .expect("filtered aggregate");
+    rows.sort_by_key(|r| r.id != author);
+    let titles: Vec<Option<Vec<String>>> = rows.into_iter().map(|r| r.titles).collect();
+    assert_eq!(titles[0].as_ref().map(Vec::len), Some(1));
+    assert_eq!(titles[1], None, "a user without posts aggregates no row");
+
+    // CASE over the match.
+    let mut rows = sql!(
+        &pool,
+        "SELECT u.id, CASE WHEN p.id IS NULL THEN '' ELSE p.title END AS title
+         FROM users u LEFT JOIN posts p ON p.user_id = u.id WHERE u.id = ANY($ids)"
+    )
+    .fetch_all()
+    .await
+    .expect("case over the join");
+    rows.sort_by_key(|r| r.id != author);
+    let titles: Vec<String> = rows.into_iter().map(|r| r.title).collect();
+    assert!(!titles[0].is_empty());
+    assert_eq!(titles[1], "");
+
+    // And a sublink reading the null-extended side stays `Option`.
+    let mut rows = sql!(
+        &pool,
+        "SELECT u.id, (SELECT p.id) AS pid FROM users u LEFT JOIN posts p ON p.user_id = u.id
+         WHERE u.id = ANY($ids)"
+    )
+    .fetch_all()
+    .await
+    .expect("sublink");
+    rows.sort_by_key(|r| r.id != author);
+    let pids: Vec<Option<i64>> = rows.into_iter().map(|r| r.pid).collect();
+    assert_eq!(pids, vec![Some(post_id), None]);
+}
+
+#[tokio::test]
+async fn delete_returning_keeps_what_where_proved() {
+    let pool = common::setup().await;
+    let id = user(&pool, "gone").await;
+    sql!(&pool, "UPDATE users SET age = 41 WHERE id = $id")
+        .execute()
+        .await
+        .expect("set age");
+    let row = sql!(
+        &pool,
+        "DELETE FROM users WHERE id = $id AND age > 0 RETURNING age, old.age AS old_age"
+    )
+    .fetch_one()
+    .await
+    .expect("delete");
+    let (age, old_age): (i32, i32) = (row.age, row.old_age);
+    assert_eq!((age, old_age), (41, 41));
 }
 
 #[tokio::test]
