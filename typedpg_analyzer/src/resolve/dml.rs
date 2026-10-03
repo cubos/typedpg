@@ -1677,20 +1677,13 @@ pub(crate) fn written_row_attrs(
     let not_null: Option<Vec<bool>> = if rewritten {
         None
     } else {
-        use prost::Message;
         let base = snapshot.view_updatability.get(&relid).and_then(|u| u.base);
-        snapshot
-            .view_body(relid)
-            .and_then(|body| protobuf::Node::decode(body.ast.as_slice()).ok())
-            .and_then(|node| {
-                let inner = node.node.as_ref()?;
-                crate::nonnull::without_narrowing(|| {
-                    with_written_relation(base, events, || {
-                        crate::resolve::analyze_raw_node(snapshot, inner, &[]).ok()
-                    })
-                })
+        crate::nonnull::without_narrowing(|| {
+            with_written_relation(base, events, || {
+                crate::ddl::views::reanalyze_view(snapshot, relid)
             })
-            .map(|(cols, _)| cols.iter().map(|c| !c.nullable).collect())
+        })
+        .map(|cols| cols.iter().map(|c| !c.nullable).collect())
     };
     attrs
         .iter()

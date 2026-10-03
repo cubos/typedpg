@@ -178,6 +178,48 @@ pub(crate) fn count_srf_calls(nodes: &[protobuf::Node], snapshot: &PgCatalog) ->
     n
 }
 
+/// The set-returning calls a SELECT level evaluates in its projection: the
+/// select list's, and those of the ORDER BY, GROUP BY and DISTINCT ON
+/// items that aren't select-list expressions. PG adds such an item as a
+/// resjunk target entry (`findTargetlistEntrySQL99`), so its calls run in
+/// the same ProjectSet as the select list's: in lockstep with them (the
+/// shorter ones padded with NULL), and leaving no row when they all yield
+/// none — `SELECT 1 ORDER BY generate_series(1, 0)` is empty.
+pub(crate) fn level_srf_calls<'a>(
+    sel: &'a protobuf::SelectStmt,
+    snapshot: &PgCatalog,
+) -> Vec<&'a protobuf::FuncCall> {
+    let targets: Vec<String> = sel
+        .target_list
+        .iter()
+        .filter_map(|t| match t.node.as_ref()? {
+            node::Node::ResTarget(rt) => rt.val.as_deref().map(node_fingerprint),
+            _ => None,
+        })
+        .collect();
+    let extra = sel
+        .sort_clause
+        .iter()
+        .filter_map(|n| match n.node.as_ref()? {
+            node::Node::SortBy(sb) => sb.node.as_deref(),
+            _ => Some(n),
+        })
+        .chain(&sel.group_clause)
+        .chain(&sel.distinct_clause)
+        .filter(|n| !targets.contains(&node_fingerprint(n)));
+    let mut out = Vec::new();
+    for n in sel.target_list.iter().chain(extra) {
+        visit_same_level(n, &mut |e| {
+            if let Some(node::Node::FuncCall(fc)) = e.node.as_ref()
+                && is_srf_call(fc, snapshot)
+            {
+                out.push(&**fc);
+            }
+        });
+    }
+    out
+}
+
 /// True when `node` contains a set-returning function call at this query
 /// level (itself included).
 fn contains_srf(node: &protobuf::Node, snapshot: &PgCatalog) -> bool {
