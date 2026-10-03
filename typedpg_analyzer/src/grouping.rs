@@ -300,7 +300,7 @@ fn group_leaf(
     snapshot: &PgCatalog,
 ) -> GroupLeaf {
     let target_column = |rt: &protobuf::ResTarget| match rt.val.as_deref() {
-        Some(v) => match resolve_group_column(v, scope) {
+        Some(v) => match resolve_group_column(v, scope, snapshot) {
             Some(key) => GroupLeaf::Column(key),
             None => GroupLeaf::Expr(expr_key(v, snapshot)),
         },
@@ -321,7 +321,7 @@ fn group_leaf(
             _ => GroupLeaf::Other,
         },
         Some(node::Node::ColumnRef(cr)) => {
-            if let Some(key) = resolve_group_column(node, scope) {
+            if let Some(key) = resolve_group_column(node, scope, snapshot) {
                 return GroupLeaf::Column(key);
             }
             let alias = match cr.fields.as_slice() {
@@ -339,7 +339,10 @@ fn group_leaf(
             });
             target.map_or(GroupLeaf::Unresolved, target_column)
         }
-        Some(_) => GroupLeaf::Expr(expr_key(node, snapshot)),
+        Some(_) => match resolve_group_column(node, scope, snapshot) {
+            Some(key) => GroupLeaf::Column(key),
+            None => GroupLeaf::Expr(expr_key(node, snapshot)),
+        },
         None => GroupLeaf::Other,
     }
 }
@@ -406,9 +409,14 @@ pub(crate) fn resolve_type_names(node: &protobuf::Node, snapshot: &PgCatalog) ->
 }
 
 /// Resolve a `GROUP BY` entry as a single column against `scope`. Returns the
-/// `(table_alias, column_name)` for a plain `ColumnRef`, or `None` for any
-/// other shape (expression, grouping set, select-list alias, …).
-fn resolve_group_column(node: &protobuf::Node, scope: &Scope) -> Option<ColKey> {
+/// `(table_alias, column_name)` for a plain `ColumnRef` (or a cast of one
+/// that is no coercion, [`peel_noop_casts`]), or `None` for any other shape (expression, grouping set, select-list alias, …).
+fn resolve_group_column(
+    node: &protobuf::Node,
+    scope: &Scope,
+    snapshot: &PgCatalog,
+) -> Option<ColKey> {
+    let node = peel_noop_casts(node, scope, snapshot);
     let node::Node::ColumnRef(cr) = node.node.as_ref()? else {
         return None;
     };
@@ -425,6 +433,56 @@ fn resolve_group_column(node: &protobuf::Node, scope: &Scope) -> Option<ColKey> 
         .resolve_column(table, column, None)
         .ok()
         .map(|c| (c.table_alias.clone(), c.name.clone()))
+}
+
+/// `node` without the casts over a column of `scope` that leave it as it
+/// is: PG's `coerce_type` returns its input unchanged when the target type
+/// is the input's, and `coerce_type_typmod` when the typmod is too, so
+/// `GROUP BY a::int` on an `int` column groups by the column itself (and
+/// `ROLLUP (a::int)` leaves `a` NULL in the total row). A cast changing
+/// the typmod — `v::varchar` on a `varchar(5)` column — stays a coercion.
+fn peel_noop_casts<'a>(
+    node: &'a protobuf::Node,
+    scope: &Scope,
+    snapshot: &PgCatalog,
+) -> &'a protobuf::Node {
+    let Some(node::Node::TypeCast(tc)) = node.node.as_ref() else {
+        return node;
+    };
+    let (Some(arg), Some(tn)) = (tc.arg.as_deref(), tc.type_name.as_ref()) else {
+        return node;
+    };
+    let inner = peel_noop_casts(arg, scope, snapshot);
+    let Some(node::Node::ColumnRef(cr)) = inner.node.as_ref() else {
+        return node;
+    };
+    let parts = expr::extract_string_fields(&cr.fields);
+    if parts.len() != cr.fields.len() {
+        return node;
+    }
+    let (table, column) = match parts.as_slice() {
+        [col] => (None, col.as_str()),
+        [tbl, col] | [_, tbl, col] => (Some(tbl.as_str()), col.as_str()),
+        _ => return node,
+    };
+    let Ok(col) = scope.resolve_column(table, column, None) else {
+        return node;
+    };
+    let Some(target) = crate::ddl::util::resolve_type_name(tn, snapshot) else {
+        return node;
+    };
+    // A typmod we can't encode (a type whose `typmodin` isn't modeled)
+    // isn't known to match.
+    let typmod = match crate::typmod::encode(snapshot, target, &tn.typmods) {
+        Ok(None) if !tn.typmods.is_empty() => return node,
+        Ok(m) => m,
+        Err(_) => return node,
+    };
+    if target == col.type_oid && typmod == col.typmod {
+        inner
+    } else {
+        node
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1554,10 +1612,10 @@ pub(crate) fn finish_select_level(
         .finalize_implicit()
     };
     for g in own_grouping {
-        if g.args
-            .iter()
-            .any(|a| !group.contains(&canonical(a, &own, 0, snapshot)))
-        {
+        if g.args.iter().any(|a| {
+            let a = peel_noop_casts(a, scope, snapshot);
+            !group.contains(&canonical(a, &own, 0, snapshot))
+        }) {
             return Err(grouping_error(g.location));
         }
     }
@@ -1723,7 +1781,9 @@ impl GroupExprs {
                     }
                     _ => None,
                 },
-                Some(node::Node::ColumnRef(cr)) if resolve_group_column(g, scope).is_none() => {
+                Some(node::Node::ColumnRef(cr))
+                    if resolve_group_column(g, scope, snapshot).is_none() =>
+                {
                     match expr::extract_string_fields(&cr.fields).as_slice() {
                         [name] => targets
                             .iter()
@@ -1749,13 +1809,20 @@ impl GroupExprs {
                 Some(ExpandedTarget::StarColumn { column: None, .. }) => continue,
                 None => g,
             };
-            if let Some(node::Node::ColumnRef(cr)) = expr.node.as_ref()
+            // A cast that is no coercion is the column itself; the cast
+            // stays a grouping expression too, for `GROUPING(a::int)`.
+            let column = peel_noop_casts(expr, scope, snapshot);
+            if let Some(node::Node::ColumnRef(cr)) = column.node.as_ref()
                 && let Some(RefTarget {
                     level: 0,
                     target: Some((alias, Some(col))),
                 }) = own.resolve(cr)
             {
                 out.add_column((alias, col), ns);
+                if !std::ptr::eq(column, expr) {
+                    out.have_non_var = true;
+                    out.exprs.push(canonical(expr, own, 0, snapshot));
+                }
                 continue;
             }
             out.have_non_var = true;
