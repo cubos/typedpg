@@ -473,7 +473,7 @@ fn peel_noop_casts<'a>(
     };
     // A typmod we can't encode (a type whose `typmodin` isn't modeled)
     // isn't known to match.
-    let typmod = match crate::typmod::encode(snapshot, target, &tn.typmods) {
+    let typmod = match crate::typmod::encode(snapshot, target, tn) {
         Ok(None) if !tn.typmods.is_empty() => return node,
         Ok(m) => m,
         Err(_) => return node,

@@ -150,7 +150,7 @@ pub(crate) fn infer_xml_serialize(
     let arg = coerce_to_specific_type(e, XML, "XMLSERIALIZE", ctx, params)?;
     let target = resolve_type_name(xs.type_name.as_ref(), snapshot)?;
     let typmod = match xs.type_name.as_ref() {
-        Some(tn) => crate::typmod::encode(snapshot, target, &tn.typmods)
+        Some(tn) => crate::typmod::encode(snapshot, target, tn)
             .map_err(|e| AnalyzeError::Invalid(e.to_string()))?,
         None => None,
     };

@@ -471,3 +471,71 @@ fn invalid_typmods_rejected_like_typmodin() {
         "type modifier is not allowed for type \"text\""
     );
 }
+
+/// `typenameTypeMod` hands each modifier to `typmodin` as a string — an
+/// integer, a numeric or string literal as written, a bare identifier —
+/// and `ArrayGetIntegerTypmods` parses those with `pg_strtoint32`; a type
+/// without a `typmodin` is named as written.
+#[test]
+fn typmods_are_strings_parsed_like_integers() {
+    let db = PgCatalog::new().unwrap();
+    for sql in [
+        "SELECT '10'::bit('3') AS b",
+        "SELECT '10'::bit(' 3 ') AS b",
+        "SELECT '10'::bit('0x3') AS b",
+        "SELECT '10'::bit(0x3) AS b",
+    ] {
+        let s = db.analyze(sql).unwrap();
+        assert_cols(&s, vec![c("b", basic_with_typmod("pg_catalog", "bit", 3))]);
+    }
+    let s = db.analyze("SELECT '10'::bit('1_0') AS b").unwrap();
+    assert_cols(&s, vec![c("b", basic_with_typmod("pg_catalog", "bit", 10))]);
+    for (sql, msg) in [
+        (
+            "SELECT '10'::bit(3.14)",
+            "invalid input syntax for type integer: \"3.14\"",
+        ),
+        (
+            "SELECT '10'::bit(x)",
+            "invalid input syntax for type integer: \"x\"",
+        ),
+        (
+            "SELECT 1::numeric(5, 2.0)",
+            "invalid input syntax for type integer: \"2.0\"",
+        ),
+        (
+            "SELECT '10'::bit(99999999999)",
+            "value \"99999999999\" is out of range for type integer",
+        ),
+        (
+            "SELECT '10'::bit('99999999999')",
+            "value \"99999999999\" is out of range for type integer",
+        ),
+        (
+            "SELECT '10'::bit(null)",
+            "type modifiers must be simple constants or identifiers",
+        ),
+        (
+            "SELECT '10'::bit(true)",
+            "type modifiers must be simple constants or identifiers",
+        ),
+        (
+            "SELECT '10'::bit(1 + 1)",
+            "type modifiers must be simple constants or identifiers",
+        ),
+        (
+            "SELECT 'x'::text(3.5)",
+            "type modifier is not allowed for type \"text\"",
+        ),
+        (
+            "SELECT 'x'::pg_catalog.text(3)",
+            "type modifier is not allowed for type \"pg_catalog.text\"",
+        ),
+        (
+            "SELECT 'x'::pg_catalog.text(3)[]",
+            "type modifier is not allowed for type \"pg_catalog.text[]\"",
+        ),
+    ] {
+        assert_err_prefix!(db.analyze(sql), AnalyzeError::Invalid(_), msg);
+    }
+}

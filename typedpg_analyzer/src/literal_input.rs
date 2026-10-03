@@ -273,7 +273,12 @@ fn take_digits(s: &mut &str, radix: u32) -> Option<String> {
 /// Mirrors `pg_strtointNN` (numutils.c): optional surrounding whitespace, an
 /// optional sign, then decimal digits or a `0x`/`0o`/`0b` radix prefix —
 /// underscores allowed between digits — followed by a range check.
-fn validate_int(content: &str, min: i128, max: i128, type_name: &str) -> Result<(), String> {
+pub(crate) fn validate_int(
+    content: &str,
+    min: i128,
+    max: i128,
+    type_name: &str,
+) -> Result<(), String> {
     let syntax_err = || crate::pgmsg::invalid_input_syntax_for_type(type_name, content);
     let mut s = content.trim_matches(|c: char| c.is_ascii_whitespace());
 

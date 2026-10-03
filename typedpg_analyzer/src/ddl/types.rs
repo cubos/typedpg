@@ -28,7 +28,7 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
         .as_ref()
         .ok_or_else(|| DdlError::TypeNotFound("domain base type".into()))?;
     let base_type_oid = super::functions::typename_type_id(interp, base_type_name)?;
-    let typtypmod = crate::typmod::encode(interp, base_type_oid, &base_type_name.typmods)?;
+    let typtypmod = crate::typmod::encode(interp, base_type_oid, base_type_name)?;
     // DefineDomain: a domain is over a base, composite, enum, range or
     // multirange type or another domain — never a pseudo-type.
     if interp.pg_type.get(&base_type_oid).map(|t| t.typtype) == Some(TypType::Pseudo) {
@@ -641,7 +641,7 @@ pub fn create_composite(interp: &mut PgCatalog, stmt: &CompositeTypeStmt) -> Res
             }
             let type_oid = super::functions::typename_type_id(interp, tn)?;
             super::tables::check_attribute_type(interp, &cd.colname, type_oid, None, false)?;
-            let typmod = crate::typmod::encode(interp, type_oid, &tn.typmods)?;
+            let typmod = crate::typmod::encode(interp, type_oid, tn)?;
             let collation = super::tables::column_collation(interp, cd, type_oid)?
                 .or_else(|| super::tables::type_collation(interp, type_oid));
             field_defs.push((

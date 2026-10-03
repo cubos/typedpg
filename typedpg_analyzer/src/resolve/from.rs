@@ -1996,7 +1996,7 @@ fn coldeflist_columns(
             crate::ddl::DdlError::TypeNotFound(msg) => AnalyzeError::UndefinedType(msg),
             other => AnalyzeError::Invalid(other.to_string()),
         })?;
-        let typmod = crate::typmod::encode(snapshot, type_oid, &tn.typmods)
+        let typmod = crate::typmod::encode(snapshot, type_oid, tn)
             .map_err(|e| AnalyzeError::Invalid(e.to_string()))?;
         cols.push(ScopeColumn {
             name: cd.colname.clone(),
@@ -2286,7 +2286,7 @@ fn json_table_columns(
                 crate::ddl::DdlError::TypeNotFound(msg) => AnalyzeError::UndefinedType(msg),
                 other => AnalyzeError::Invalid(other.to_string()),
             })?;
-            let m = crate::typmod::encode(snapshot, t, &tn.typmods)
+            let m = crate::typmod::encode(snapshot, t, tn)
                 .map_err(|e| AnalyzeError::Invalid(e.to_string()))?;
             (t, m)
         };
