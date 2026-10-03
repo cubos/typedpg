@@ -12,6 +12,13 @@ use crate::protobuf;
 /// Structural equality of AST values, as PostgreSQL's `equal()`.
 pub trait Equal {
     fn equal(&self, other: &Self) -> bool;
+
+    /// Append the value's key: a string over the fields `equal()` compares,
+    /// the same for two values exactly when they are `equal()` — what to
+    /// hash or store in place of the value. Every key is self-delimiting
+    /// (a scalar ends in `;`, a message is braced, a list bracketed), so a
+    /// sequence of keys reads back one way.
+    fn equal_key(&self, out: &mut String);
 }
 
 impl<T: Equal> Equal for Option<T> {
@@ -22,17 +29,39 @@ impl<T: Equal> Equal for Option<T> {
             _ => false,
         }
     }
+
+    fn equal_key(&self, out: &mut String) {
+        match self {
+            Some(a) => {
+                out.push('?');
+                a.equal_key(out);
+            }
+            None => out.push('~'),
+        }
+    }
 }
 
 impl<T: Equal> Equal for Box<T> {
     fn equal(&self, other: &Self) -> bool {
         (**self).equal(other)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        (**self).equal_key(out)
+    }
 }
 
 impl<T: Equal> Equal for Vec<T> {
     fn equal(&self, other: &Self) -> bool {
         self.len() == other.len() && self.iter().zip(other).all(|(a, b)| a.equal(b))
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('[');
+        for a in self {
+            a.equal_key(out);
+        }
+        out.push(']');
     }
 }
 
@@ -41,6 +70,11 @@ macro_rules! scalar {
         impl Equal for $t {
             fn equal(&self, other: &Self) -> bool {
                 self == other
+            }
+
+            fn equal_key(&self, out: &mut String) {
+                use std::fmt::Write;
+                let _ = write!(out, "{self:?};");
             }
         }
     )*};
@@ -52,17 +86,37 @@ impl Equal for protobuf::ParseResult {
     fn equal(&self, other: &Self) -> bool {
         self.version.equal(&other.version) && self.stmts.equal(&other.stmts)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.version.equal_key(out);
+        self.stmts.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::ScanResult {
     fn equal(&self, other: &Self) -> bool {
         self.version.equal(&other.version) && self.tokens.equal(&other.tokens)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.version.equal_key(out);
+        self.tokens.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::Node {
     fn equal(&self, other: &Self) -> bool {
         self.node.equal(&other.node)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.node.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -352,11 +406,1377 @@ impl Equal for protobuf::node::Node {
             _ => false,
         }
     }
+
+    fn equal_key(&self, out: &mut String) {
+        match self {
+            Self::Alias(a) => {
+                out.push_str("Alias(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::RangeVar(a) => {
+                out.push_str("RangeVar(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::TableFunc(a) => {
+                out.push_str("TableFunc(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::IntoClause(a) => {
+                out.push_str("IntoClause(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::Var(a) => {
+                out.push_str("Var(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::Param(a) => {
+                out.push_str("Param(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::Aggref(a) => {
+                out.push_str("Aggref(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::GroupingFunc(a) => {
+                out.push_str("GroupingFunc(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::WindowFunc(a) => {
+                out.push_str("WindowFunc(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::WindowFuncRunCondition(a) => {
+                out.push_str("WindowFuncRunCondition(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::MergeSupportFunc(a) => {
+                out.push_str("MergeSupportFunc(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::SubscriptingRef(a) => {
+                out.push_str("SubscriptingRef(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::FuncExpr(a) => {
+                out.push_str("FuncExpr(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::NamedArgExpr(a) => {
+                out.push_str("NamedArgExpr(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::OpExpr(a) => {
+                out.push_str("OpExpr(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::DistinctExpr(a) => {
+                out.push_str("DistinctExpr(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::NullIfExpr(a) => {
+                out.push_str("NullIfExpr(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::ScalarArrayOpExpr(a) => {
+                out.push_str("ScalarArrayOpExpr(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::BoolExpr(a) => {
+                out.push_str("BoolExpr(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::SubLink(a) => {
+                out.push_str("SubLink(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::SubPlan(a) => {
+                out.push_str("SubPlan(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::AlternativeSubPlan(a) => {
+                out.push_str("AlternativeSubPlan(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::FieldSelect(a) => {
+                out.push_str("FieldSelect(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::FieldStore(a) => {
+                out.push_str("FieldStore(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::RelabelType(a) => {
+                out.push_str("RelabelType(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::CoerceViaIo(a) => {
+                out.push_str("CoerceViaIo(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::ArrayCoerceExpr(a) => {
+                out.push_str("ArrayCoerceExpr(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::ConvertRowtypeExpr(a) => {
+                out.push_str("ConvertRowtypeExpr(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::CollateExpr(a) => {
+                out.push_str("CollateExpr(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::CaseExpr(a) => {
+                out.push_str("CaseExpr(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::CaseWhen(a) => {
+                out.push_str("CaseWhen(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::CaseTestExpr(a) => {
+                out.push_str("CaseTestExpr(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::ArrayExpr(a) => {
+                out.push_str("ArrayExpr(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::RowExpr(a) => {
+                out.push_str("RowExpr(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::RowCompareExpr(a) => {
+                out.push_str("RowCompareExpr(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::CoalesceExpr(a) => {
+                out.push_str("CoalesceExpr(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::MinMaxExpr(a) => {
+                out.push_str("MinMaxExpr(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::SqlvalueFunction(a) => {
+                out.push_str("SqlvalueFunction(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::XmlExpr(a) => {
+                out.push_str("XmlExpr(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::JsonFormat(a) => {
+                out.push_str("JsonFormat(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::JsonReturning(a) => {
+                out.push_str("JsonReturning(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::JsonValueExpr(a) => {
+                out.push_str("JsonValueExpr(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::JsonConstructorExpr(a) => {
+                out.push_str("JsonConstructorExpr(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::JsonIsPredicate(a) => {
+                out.push_str("JsonIsPredicate(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::JsonBehavior(a) => {
+                out.push_str("JsonBehavior(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::JsonExpr(a) => {
+                out.push_str("JsonExpr(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::JsonTablePath(a) => {
+                out.push_str("JsonTablePath(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::JsonTablePathScan(a) => {
+                out.push_str("JsonTablePathScan(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::JsonTableSiblingJoin(a) => {
+                out.push_str("JsonTableSiblingJoin(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::NullTest(a) => {
+                out.push_str("NullTest(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::BooleanTest(a) => {
+                out.push_str("BooleanTest(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::MergeAction(a) => {
+                out.push_str("MergeAction(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::CoerceToDomain(a) => {
+                out.push_str("CoerceToDomain(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::CoerceToDomainValue(a) => {
+                out.push_str("CoerceToDomainValue(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::SetToDefault(a) => {
+                out.push_str("SetToDefault(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::CurrentOfExpr(a) => {
+                out.push_str("CurrentOfExpr(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::NextValueExpr(a) => {
+                out.push_str("NextValueExpr(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::InferenceElem(a) => {
+                out.push_str("InferenceElem(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::ReturningExpr(a) => {
+                out.push_str("ReturningExpr(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::TargetEntry(a) => {
+                out.push_str("TargetEntry(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::RangeTblRef(a) => {
+                out.push_str("RangeTblRef(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::JoinExpr(a) => {
+                out.push_str("JoinExpr(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::FromExpr(a) => {
+                out.push_str("FromExpr(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::OnConflictExpr(a) => {
+                out.push_str("OnConflictExpr(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::Query(a) => {
+                out.push_str("Query(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::TypeName(a) => {
+                out.push_str("TypeName(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::ColumnRef(a) => {
+                out.push_str("ColumnRef(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::ParamRef(a) => {
+                out.push_str("ParamRef(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::AExpr(a) => {
+                out.push_str("AExpr(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::TypeCast(a) => {
+                out.push_str("TypeCast(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::CollateClause(a) => {
+                out.push_str("CollateClause(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::RoleSpec(a) => {
+                out.push_str("RoleSpec(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::FuncCall(a) => {
+                out.push_str("FuncCall(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::AStar(a) => {
+                out.push_str("AStar(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::AIndices(a) => {
+                out.push_str("AIndices(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::AIndirection(a) => {
+                out.push_str("AIndirection(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::AArrayExpr(a) => {
+                out.push_str("AArrayExpr(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::ResTarget(a) => {
+                out.push_str("ResTarget(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::MultiAssignRef(a) => {
+                out.push_str("MultiAssignRef(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::SortBy(a) => {
+                out.push_str("SortBy(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::WindowDef(a) => {
+                out.push_str("WindowDef(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::RangeSubselect(a) => {
+                out.push_str("RangeSubselect(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::RangeFunction(a) => {
+                out.push_str("RangeFunction(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::RangeTableFunc(a) => {
+                out.push_str("RangeTableFunc(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::RangeTableFuncCol(a) => {
+                out.push_str("RangeTableFuncCol(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::RangeTableSample(a) => {
+                out.push_str("RangeTableSample(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::ColumnDef(a) => {
+                out.push_str("ColumnDef(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::TableLikeClause(a) => {
+                out.push_str("TableLikeClause(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::IndexElem(a) => {
+                out.push_str("IndexElem(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::DefElem(a) => {
+                out.push_str("DefElem(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::LockingClause(a) => {
+                out.push_str("LockingClause(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::XmlSerialize(a) => {
+                out.push_str("XmlSerialize(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::PartitionElem(a) => {
+                out.push_str("PartitionElem(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::PartitionSpec(a) => {
+                out.push_str("PartitionSpec(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::PartitionBoundSpec(a) => {
+                out.push_str("PartitionBoundSpec(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::PartitionRangeDatum(a) => {
+                out.push_str("PartitionRangeDatum(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::PartitionCmd(a) => {
+                out.push_str("PartitionCmd(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::RangeTblEntry(a) => {
+                out.push_str("RangeTblEntry(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::RtepermissionInfo(a) => {
+                out.push_str("RtepermissionInfo(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::RangeTblFunction(a) => {
+                out.push_str("RangeTblFunction(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::TableSampleClause(a) => {
+                out.push_str("TableSampleClause(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::WithCheckOption(a) => {
+                out.push_str("WithCheckOption(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::SortGroupClause(a) => {
+                out.push_str("SortGroupClause(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::GroupingSet(a) => {
+                out.push_str("GroupingSet(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::WindowClause(a) => {
+                out.push_str("WindowClause(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::RowMarkClause(a) => {
+                out.push_str("RowMarkClause(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::WithClause(a) => {
+                out.push_str("WithClause(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::InferClause(a) => {
+                out.push_str("InferClause(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::OnConflictClause(a) => {
+                out.push_str("OnConflictClause(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::CtesearchClause(a) => {
+                out.push_str("CtesearchClause(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::CtecycleClause(a) => {
+                out.push_str("CtecycleClause(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::CommonTableExpr(a) => {
+                out.push_str("CommonTableExpr(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::MergeWhenClause(a) => {
+                out.push_str("MergeWhenClause(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::ReturningOption(a) => {
+                out.push_str("ReturningOption(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::ReturningClause(a) => {
+                out.push_str("ReturningClause(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::TriggerTransition(a) => {
+                out.push_str("TriggerTransition(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::JsonOutput(a) => {
+                out.push_str("JsonOutput(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::JsonArgument(a) => {
+                out.push_str("JsonArgument(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::JsonFuncExpr(a) => {
+                out.push_str("JsonFuncExpr(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::JsonTablePathSpec(a) => {
+                out.push_str("JsonTablePathSpec(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::JsonTable(a) => {
+                out.push_str("JsonTable(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::JsonTableColumn(a) => {
+                out.push_str("JsonTableColumn(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::JsonKeyValue(a) => {
+                out.push_str("JsonKeyValue(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::JsonParseExpr(a) => {
+                out.push_str("JsonParseExpr(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::JsonScalarExpr(a) => {
+                out.push_str("JsonScalarExpr(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::JsonSerializeExpr(a) => {
+                out.push_str("JsonSerializeExpr(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::JsonObjectConstructor(a) => {
+                out.push_str("JsonObjectConstructor(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::JsonArrayConstructor(a) => {
+                out.push_str("JsonArrayConstructor(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::JsonArrayQueryConstructor(a) => {
+                out.push_str("JsonArrayQueryConstructor(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::JsonAggConstructor(a) => {
+                out.push_str("JsonAggConstructor(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::JsonObjectAgg(a) => {
+                out.push_str("JsonObjectAgg(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::JsonArrayAgg(a) => {
+                out.push_str("JsonArrayAgg(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::RawStmt(a) => {
+                out.push_str("RawStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::InsertStmt(a) => {
+                out.push_str("InsertStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::DeleteStmt(a) => {
+                out.push_str("DeleteStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::UpdateStmt(a) => {
+                out.push_str("UpdateStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::MergeStmt(a) => {
+                out.push_str("MergeStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::SelectStmt(a) => {
+                out.push_str("SelectStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::SetOperationStmt(a) => {
+                out.push_str("SetOperationStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::ReturnStmt(a) => {
+                out.push_str("ReturnStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::PlassignStmt(a) => {
+                out.push_str("PlassignStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::CreateSchemaStmt(a) => {
+                out.push_str("CreateSchemaStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::AlterTableStmt(a) => {
+                out.push_str("AlterTableStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::AlterTableCmd(a) => {
+                out.push_str("AlterTableCmd(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::AtalterConstraint(a) => {
+                out.push_str("AtalterConstraint(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::ReplicaIdentityStmt(a) => {
+                out.push_str("ReplicaIdentityStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::AlterCollationStmt(a) => {
+                out.push_str("AlterCollationStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::AlterDomainStmt(a) => {
+                out.push_str("AlterDomainStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::GrantStmt(a) => {
+                out.push_str("GrantStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::ObjectWithArgs(a) => {
+                out.push_str("ObjectWithArgs(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::AccessPriv(a) => {
+                out.push_str("AccessPriv(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::GrantRoleStmt(a) => {
+                out.push_str("GrantRoleStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::AlterDefaultPrivilegesStmt(a) => {
+                out.push_str("AlterDefaultPrivilegesStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::CopyStmt(a) => {
+                out.push_str("CopyStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::VariableSetStmt(a) => {
+                out.push_str("VariableSetStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::VariableShowStmt(a) => {
+                out.push_str("VariableShowStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::CreateStmt(a) => {
+                out.push_str("CreateStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::Constraint(a) => {
+                out.push_str("Constraint(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::CreateTableSpaceStmt(a) => {
+                out.push_str("CreateTableSpaceStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::DropTableSpaceStmt(a) => {
+                out.push_str("DropTableSpaceStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::AlterTableSpaceOptionsStmt(a) => {
+                out.push_str("AlterTableSpaceOptionsStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::AlterTableMoveAllStmt(a) => {
+                out.push_str("AlterTableMoveAllStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::CreateExtensionStmt(a) => {
+                out.push_str("CreateExtensionStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::AlterExtensionStmt(a) => {
+                out.push_str("AlterExtensionStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::AlterExtensionContentsStmt(a) => {
+                out.push_str("AlterExtensionContentsStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::CreateFdwStmt(a) => {
+                out.push_str("CreateFdwStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::AlterFdwStmt(a) => {
+                out.push_str("AlterFdwStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::CreateForeignServerStmt(a) => {
+                out.push_str("CreateForeignServerStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::AlterForeignServerStmt(a) => {
+                out.push_str("AlterForeignServerStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::CreateForeignTableStmt(a) => {
+                out.push_str("CreateForeignTableStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::CreateUserMappingStmt(a) => {
+                out.push_str("CreateUserMappingStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::AlterUserMappingStmt(a) => {
+                out.push_str("AlterUserMappingStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::DropUserMappingStmt(a) => {
+                out.push_str("DropUserMappingStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::ImportForeignSchemaStmt(a) => {
+                out.push_str("ImportForeignSchemaStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::CreatePolicyStmt(a) => {
+                out.push_str("CreatePolicyStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::AlterPolicyStmt(a) => {
+                out.push_str("AlterPolicyStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::CreateAmStmt(a) => {
+                out.push_str("CreateAmStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::CreateTrigStmt(a) => {
+                out.push_str("CreateTrigStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::CreateEventTrigStmt(a) => {
+                out.push_str("CreateEventTrigStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::AlterEventTrigStmt(a) => {
+                out.push_str("AlterEventTrigStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::CreatePlangStmt(a) => {
+                out.push_str("CreatePlangStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::CreateRoleStmt(a) => {
+                out.push_str("CreateRoleStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::AlterRoleStmt(a) => {
+                out.push_str("AlterRoleStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::AlterRoleSetStmt(a) => {
+                out.push_str("AlterRoleSetStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::DropRoleStmt(a) => {
+                out.push_str("DropRoleStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::CreateSeqStmt(a) => {
+                out.push_str("CreateSeqStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::AlterSeqStmt(a) => {
+                out.push_str("AlterSeqStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::DefineStmt(a) => {
+                out.push_str("DefineStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::CreateDomainStmt(a) => {
+                out.push_str("CreateDomainStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::CreateOpClassStmt(a) => {
+                out.push_str("CreateOpClassStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::CreateOpClassItem(a) => {
+                out.push_str("CreateOpClassItem(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::CreateOpFamilyStmt(a) => {
+                out.push_str("CreateOpFamilyStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::AlterOpFamilyStmt(a) => {
+                out.push_str("AlterOpFamilyStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::DropStmt(a) => {
+                out.push_str("DropStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::TruncateStmt(a) => {
+                out.push_str("TruncateStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::CommentStmt(a) => {
+                out.push_str("CommentStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::SecLabelStmt(a) => {
+                out.push_str("SecLabelStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::DeclareCursorStmt(a) => {
+                out.push_str("DeclareCursorStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::ClosePortalStmt(a) => {
+                out.push_str("ClosePortalStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::FetchStmt(a) => {
+                out.push_str("FetchStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::IndexStmt(a) => {
+                out.push_str("IndexStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::CreateStatsStmt(a) => {
+                out.push_str("CreateStatsStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::StatsElem(a) => {
+                out.push_str("StatsElem(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::AlterStatsStmt(a) => {
+                out.push_str("AlterStatsStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::CreateFunctionStmt(a) => {
+                out.push_str("CreateFunctionStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::FunctionParameter(a) => {
+                out.push_str("FunctionParameter(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::AlterFunctionStmt(a) => {
+                out.push_str("AlterFunctionStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::DoStmt(a) => {
+                out.push_str("DoStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::InlineCodeBlock(a) => {
+                out.push_str("InlineCodeBlock(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::CallStmt(a) => {
+                out.push_str("CallStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::CallContext(a) => {
+                out.push_str("CallContext(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::RenameStmt(a) => {
+                out.push_str("RenameStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::AlterObjectDependsStmt(a) => {
+                out.push_str("AlterObjectDependsStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::AlterObjectSchemaStmt(a) => {
+                out.push_str("AlterObjectSchemaStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::AlterOwnerStmt(a) => {
+                out.push_str("AlterOwnerStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::AlterOperatorStmt(a) => {
+                out.push_str("AlterOperatorStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::AlterTypeStmt(a) => {
+                out.push_str("AlterTypeStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::RuleStmt(a) => {
+                out.push_str("RuleStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::NotifyStmt(a) => {
+                out.push_str("NotifyStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::ListenStmt(a) => {
+                out.push_str("ListenStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::UnlistenStmt(a) => {
+                out.push_str("UnlistenStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::TransactionStmt(a) => {
+                out.push_str("TransactionStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::CompositeTypeStmt(a) => {
+                out.push_str("CompositeTypeStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::CreateEnumStmt(a) => {
+                out.push_str("CreateEnumStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::CreateRangeStmt(a) => {
+                out.push_str("CreateRangeStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::AlterEnumStmt(a) => {
+                out.push_str("AlterEnumStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::ViewStmt(a) => {
+                out.push_str("ViewStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::LoadStmt(a) => {
+                out.push_str("LoadStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::CreatedbStmt(a) => {
+                out.push_str("CreatedbStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::AlterDatabaseStmt(a) => {
+                out.push_str("AlterDatabaseStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::AlterDatabaseRefreshCollStmt(a) => {
+                out.push_str("AlterDatabaseRefreshCollStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::AlterDatabaseSetStmt(a) => {
+                out.push_str("AlterDatabaseSetStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::DropdbStmt(a) => {
+                out.push_str("DropdbStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::AlterSystemStmt(a) => {
+                out.push_str("AlterSystemStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::ClusterStmt(a) => {
+                out.push_str("ClusterStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::VacuumStmt(a) => {
+                out.push_str("VacuumStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::VacuumRelation(a) => {
+                out.push_str("VacuumRelation(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::ExplainStmt(a) => {
+                out.push_str("ExplainStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::CreateTableAsStmt(a) => {
+                out.push_str("CreateTableAsStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::RefreshMatViewStmt(a) => {
+                out.push_str("RefreshMatViewStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::CheckPointStmt(a) => {
+                out.push_str("CheckPointStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::DiscardStmt(a) => {
+                out.push_str("DiscardStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::LockStmt(a) => {
+                out.push_str("LockStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::ConstraintsSetStmt(a) => {
+                out.push_str("ConstraintsSetStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::ReindexStmt(a) => {
+                out.push_str("ReindexStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::CreateConversionStmt(a) => {
+                out.push_str("CreateConversionStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::CreateCastStmt(a) => {
+                out.push_str("CreateCastStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::CreateTransformStmt(a) => {
+                out.push_str("CreateTransformStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::PrepareStmt(a) => {
+                out.push_str("PrepareStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::ExecuteStmt(a) => {
+                out.push_str("ExecuteStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::DeallocateStmt(a) => {
+                out.push_str("DeallocateStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::DropOwnedStmt(a) => {
+                out.push_str("DropOwnedStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::ReassignOwnedStmt(a) => {
+                out.push_str("ReassignOwnedStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::AlterTsdictionaryStmt(a) => {
+                out.push_str("AlterTsdictionaryStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::AlterTsconfigurationStmt(a) => {
+                out.push_str("AlterTsconfigurationStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::PublicationTable(a) => {
+                out.push_str("PublicationTable(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::PublicationObjSpec(a) => {
+                out.push_str("PublicationObjSpec(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::CreatePublicationStmt(a) => {
+                out.push_str("CreatePublicationStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::AlterPublicationStmt(a) => {
+                out.push_str("AlterPublicationStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::CreateSubscriptionStmt(a) => {
+                out.push_str("CreateSubscriptionStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::AlterSubscriptionStmt(a) => {
+                out.push_str("AlterSubscriptionStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::DropSubscriptionStmt(a) => {
+                out.push_str("DropSubscriptionStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::Integer(a) => {
+                out.push_str("Integer(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::Float(a) => {
+                out.push_str("Float(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::Boolean(a) => {
+                out.push_str("Boolean(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::String(a) => {
+                out.push_str("String(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::BitString(a) => {
+                out.push_str("BitString(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::List(a) => {
+                out.push_str("List(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::IntList(a) => {
+                out.push_str("IntList(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::OidList(a) => {
+                out.push_str("OidList(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::AConst(a) => {
+                out.push_str("AConst(");
+                a.equal_key(out);
+                out.push(')');
+            }
+        }
+    }
 }
 
 impl Equal for protobuf::Integer {
     fn equal(&self, other: &Self) -> bool {
         self.ival.equal(&other.ival)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.ival.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -364,11 +1784,23 @@ impl Equal for protobuf::Float {
     fn equal(&self, other: &Self) -> bool {
         self.fval.equal(&other.fval)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.fval.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::Boolean {
     fn equal(&self, other: &Self) -> bool {
         self.boolval.equal(&other.boolval)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.boolval.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -376,11 +1808,23 @@ impl Equal for protobuf::String {
     fn equal(&self, other: &Self) -> bool {
         self.sval.equal(&other.sval)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.sval.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::BitString {
     fn equal(&self, other: &Self) -> bool {
         self.bsval.equal(&other.bsval)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.bsval.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -388,11 +1832,23 @@ impl Equal for protobuf::List {
     fn equal(&self, other: &Self) -> bool {
         self.items.equal(&other.items)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.items.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::OidList {
     fn equal(&self, other: &Self) -> bool {
         self.items.equal(&other.items)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.items.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -400,11 +1856,24 @@ impl Equal for protobuf::IntList {
     fn equal(&self, other: &Self) -> bool {
         self.items.equal(&other.items)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.items.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::AConst {
     fn equal(&self, other: &Self) -> bool {
         self.val.equal(&other.val) && self.isnull.equal(&other.isnull)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.val.equal_key(out);
+        self.isnull.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -420,11 +1889,48 @@ impl Equal for protobuf::a_const::Val {
             _ => false,
         }
     }
+
+    fn equal_key(&self, out: &mut String) {
+        match self {
+            Self::Ival(a) => {
+                out.push_str("Ival(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::Fval(a) => {
+                out.push_str("Fval(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::Boolval(a) => {
+                out.push_str("Boolval(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::Sval(a) => {
+                out.push_str("Sval(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::Bsval(a) => {
+                out.push_str("Bsval(");
+                a.equal_key(out);
+                out.push(')');
+            }
+        }
+    }
 }
 
 impl Equal for protobuf::Alias {
     fn equal(&self, other: &Self) -> bool {
         self.aliasname.equal(&other.aliasname) && self.colnames.equal(&other.colnames)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.aliasname.equal_key(out);
+        self.colnames.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -436,6 +1942,17 @@ impl Equal for protobuf::RangeVar {
             && self.inh.equal(&other.inh)
             && self.relpersistence.equal(&other.relpersistence)
             && self.alias.equal(&other.alias)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.catalogname.equal_key(out);
+        self.schemaname.equal_key(out);
+        self.relname.equal_key(out);
+        self.inh.equal_key(out);
+        self.relpersistence.equal_key(out);
+        self.alias.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -458,6 +1975,27 @@ impl Equal for protobuf::TableFunc {
             && self.plan.equal(&other.plan)
             && self.ordinalitycol.equal(&other.ordinalitycol)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.functype.equal_key(out);
+        self.ns_uris.equal_key(out);
+        self.ns_names.equal_key(out);
+        self.docexpr.equal_key(out);
+        self.rowexpr.equal_key(out);
+        self.colnames.equal_key(out);
+        self.coltypes.equal_key(out);
+        self.coltypmods.equal_key(out);
+        self.colcollations.equal_key(out);
+        self.colexprs.equal_key(out);
+        self.coldefexprs.equal_key(out);
+        self.colvalexprs.equal_key(out);
+        self.passingvalexprs.equal_key(out);
+        self.notnulls.equal_key(out);
+        self.plan.equal_key(out);
+        self.ordinalitycol.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::IntoClause {
@@ -470,6 +2008,19 @@ impl Equal for protobuf::IntoClause {
             && self.table_space_name.equal(&other.table_space_name)
             && self.view_query.equal(&other.view_query)
             && self.skip_data.equal(&other.skip_data)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.rel.equal_key(out);
+        self.col_names.equal_key(out);
+        self.access_method.equal_key(out);
+        self.options.equal_key(out);
+        self.on_commit.equal_key(out);
+        self.table_space_name.equal_key(out);
+        self.view_query.equal_key(out);
+        self.skip_data.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -485,6 +2036,20 @@ impl Equal for protobuf::Var {
             && self.varlevelsup.equal(&other.varlevelsup)
             && self.varreturningtype.equal(&other.varreturningtype)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.xpr.equal_key(out);
+        self.varno.equal_key(out);
+        self.varattno.equal_key(out);
+        self.vartype.equal_key(out);
+        self.vartypmod.equal_key(out);
+        self.varcollid.equal_key(out);
+        self.varnullingrels.equal_key(out);
+        self.varlevelsup.equal_key(out);
+        self.varreturningtype.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::Param {
@@ -495,6 +2060,17 @@ impl Equal for protobuf::Param {
             && self.paramtype.equal(&other.paramtype)
             && self.paramtypmod.equal(&other.paramtypmod)
             && self.paramcollid.equal(&other.paramcollid)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.xpr.equal_key(out);
+        self.paramkind.equal_key(out);
+        self.paramid.equal_key(out);
+        self.paramtype.equal_key(out);
+        self.paramtypmod.equal_key(out);
+        self.paramcollid.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -519,6 +2095,29 @@ impl Equal for protobuf::Aggref {
             && self.aggno.equal(&other.aggno)
             && self.aggtransno.equal(&other.aggtransno)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.xpr.equal_key(out);
+        self.aggfnoid.equal_key(out);
+        self.aggtype.equal_key(out);
+        self.aggcollid.equal_key(out);
+        self.inputcollid.equal_key(out);
+        self.aggargtypes.equal_key(out);
+        self.aggdirectargs.equal_key(out);
+        self.args.equal_key(out);
+        self.aggorder.equal_key(out);
+        self.aggdistinct.equal_key(out);
+        self.aggfilter.equal_key(out);
+        self.aggstar.equal_key(out);
+        self.aggvariadic.equal_key(out);
+        self.aggkind.equal_key(out);
+        self.agglevelsup.equal_key(out);
+        self.aggsplit.equal_key(out);
+        self.aggno.equal_key(out);
+        self.aggtransno.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::GroupingFunc {
@@ -526,6 +2125,14 @@ impl Equal for protobuf::GroupingFunc {
         self.xpr.equal(&other.xpr)
             && self.args.equal(&other.args)
             && self.agglevelsup.equal(&other.agglevelsup)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.xpr.equal_key(out);
+        self.args.equal_key(out);
+        self.agglevelsup.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -543,6 +2150,22 @@ impl Equal for protobuf::WindowFunc {
             && self.winstar.equal(&other.winstar)
             && self.winagg.equal(&other.winagg)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.xpr.equal_key(out);
+        self.winfnoid.equal_key(out);
+        self.wintype.equal_key(out);
+        self.wincollid.equal_key(out);
+        self.inputcollid.equal_key(out);
+        self.args.equal_key(out);
+        self.aggfilter.equal_key(out);
+        self.run_condition.equal_key(out);
+        self.winref.equal_key(out);
+        self.winstar.equal_key(out);
+        self.winagg.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::WindowFuncRunCondition {
@@ -553,6 +2176,16 @@ impl Equal for protobuf::WindowFuncRunCondition {
             && self.wfunc_left.equal(&other.wfunc_left)
             && self.arg.equal(&other.arg)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.xpr.equal_key(out);
+        self.opno.equal_key(out);
+        self.inputcollid.equal_key(out);
+        self.wfunc_left.equal_key(out);
+        self.arg.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::MergeSupportFunc {
@@ -560,6 +2193,14 @@ impl Equal for protobuf::MergeSupportFunc {
         self.xpr.equal(&other.xpr)
             && self.msftype.equal(&other.msftype)
             && self.msfcollid.equal(&other.msfcollid)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.xpr.equal_key(out);
+        self.msftype.equal_key(out);
+        self.msfcollid.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -576,6 +2217,21 @@ impl Equal for protobuf::SubscriptingRef {
             && self.refexpr.equal(&other.refexpr)
             && self.refassgnexpr.equal(&other.refassgnexpr)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.xpr.equal_key(out);
+        self.refcontainertype.equal_key(out);
+        self.refelemtype.equal_key(out);
+        self.refrestype.equal_key(out);
+        self.reftypmod.equal_key(out);
+        self.refcollid.equal_key(out);
+        self.refupperindexpr.equal_key(out);
+        self.reflowerindexpr.equal_key(out);
+        self.refexpr.equal_key(out);
+        self.refassgnexpr.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::FuncExpr {
@@ -590,6 +2246,20 @@ impl Equal for protobuf::FuncExpr {
             && self.inputcollid.equal(&other.inputcollid)
             && self.args.equal(&other.args)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.xpr.equal_key(out);
+        self.funcid.equal_key(out);
+        self.funcresulttype.equal_key(out);
+        self.funcretset.equal_key(out);
+        self.funcvariadic.equal_key(out);
+        self.funcformat.equal_key(out);
+        self.funccollid.equal_key(out);
+        self.inputcollid.equal_key(out);
+        self.args.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::NamedArgExpr {
@@ -598,6 +2268,15 @@ impl Equal for protobuf::NamedArgExpr {
             && self.arg.equal(&other.arg)
             && self.name.equal(&other.name)
             && self.argnumber.equal(&other.argnumber)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.xpr.equal_key(out);
+        self.arg.equal_key(out);
+        self.name.equal_key(out);
+        self.argnumber.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -610,6 +2289,18 @@ impl Equal for protobuf::OpExpr {
             && self.opcollid.equal(&other.opcollid)
             && self.inputcollid.equal(&other.inputcollid)
             && self.args.equal(&other.args)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.xpr.equal_key(out);
+        self.opno.equal_key(out);
+        self.opresulttype.equal_key(out);
+        self.opretset.equal_key(out);
+        self.opcollid.equal_key(out);
+        self.inputcollid.equal_key(out);
+        self.args.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -624,6 +2315,19 @@ impl Equal for protobuf::DistinctExpr {
             && self.args.equal(&other.args)
             && self.location.equal(&other.location)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.xpr.equal_key(out);
+        self.opno.equal_key(out);
+        self.opresulttype.equal_key(out);
+        self.opretset.equal_key(out);
+        self.opcollid.equal_key(out);
+        self.inputcollid.equal_key(out);
+        self.args.equal_key(out);
+        self.location.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::NullIfExpr {
@@ -637,6 +2341,19 @@ impl Equal for protobuf::NullIfExpr {
             && self.args.equal(&other.args)
             && self.location.equal(&other.location)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.xpr.equal_key(out);
+        self.opno.equal_key(out);
+        self.opresulttype.equal_key(out);
+        self.opretset.equal_key(out);
+        self.opcollid.equal_key(out);
+        self.inputcollid.equal_key(out);
+        self.args.equal_key(out);
+        self.location.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::ScalarArrayOpExpr {
@@ -647,6 +2364,16 @@ impl Equal for protobuf::ScalarArrayOpExpr {
             && self.inputcollid.equal(&other.inputcollid)
             && self.args.equal(&other.args)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.xpr.equal_key(out);
+        self.opno.equal_key(out);
+        self.use_or.equal_key(out);
+        self.inputcollid.equal_key(out);
+        self.args.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::BoolExpr {
@@ -654,6 +2381,14 @@ impl Equal for protobuf::BoolExpr {
         self.xpr.equal(&other.xpr)
             && self.boolop.equal(&other.boolop)
             && self.args.equal(&other.args)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.xpr.equal_key(out);
+        self.boolop.equal_key(out);
+        self.args.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -665,6 +2400,17 @@ impl Equal for protobuf::SubLink {
             && self.testexpr.equal(&other.testexpr)
             && self.oper_name.equal(&other.oper_name)
             && self.subselect.equal(&other.subselect)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.xpr.equal_key(out);
+        self.sub_link_type.equal_key(out);
+        self.sub_link_id.equal_key(out);
+        self.testexpr.equal_key(out);
+        self.oper_name.equal_key(out);
+        self.subselect.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -688,11 +2434,40 @@ impl Equal for protobuf::SubPlan {
             && self.startup_cost.equal(&other.startup_cost)
             && self.per_call_cost.equal(&other.per_call_cost)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.xpr.equal_key(out);
+        self.sub_link_type.equal_key(out);
+        self.testexpr.equal_key(out);
+        self.param_ids.equal_key(out);
+        self.plan_id.equal_key(out);
+        self.plan_name.equal_key(out);
+        self.first_col_type.equal_key(out);
+        self.first_col_typmod.equal_key(out);
+        self.first_col_collation.equal_key(out);
+        self.use_hash_table.equal_key(out);
+        self.unknown_eq_false.equal_key(out);
+        self.parallel_safe.equal_key(out);
+        self.set_param.equal_key(out);
+        self.par_param.equal_key(out);
+        self.args.equal_key(out);
+        self.startup_cost.equal_key(out);
+        self.per_call_cost.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::AlternativeSubPlan {
     fn equal(&self, other: &Self) -> bool {
         self.xpr.equal(&other.xpr) && self.subplans.equal(&other.subplans)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.xpr.equal_key(out);
+        self.subplans.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -705,6 +2480,17 @@ impl Equal for protobuf::FieldSelect {
             && self.resulttypmod.equal(&other.resulttypmod)
             && self.resultcollid.equal(&other.resultcollid)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.xpr.equal_key(out);
+        self.arg.equal_key(out);
+        self.fieldnum.equal_key(out);
+        self.resulttype.equal_key(out);
+        self.resulttypmod.equal_key(out);
+        self.resultcollid.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::FieldStore {
@@ -714,6 +2500,16 @@ impl Equal for protobuf::FieldStore {
             && self.newvals.equal(&other.newvals)
             && self.fieldnums.equal(&other.fieldnums)
             && self.resulttype.equal(&other.resulttype)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.xpr.equal_key(out);
+        self.arg.equal_key(out);
+        self.newvals.equal_key(out);
+        self.fieldnums.equal_key(out);
+        self.resulttype.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -726,6 +2522,17 @@ impl Equal for protobuf::RelabelType {
             && self.resultcollid.equal(&other.resultcollid)
             && self.relabelformat.equal(&other.relabelformat)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.xpr.equal_key(out);
+        self.arg.equal_key(out);
+        self.resulttype.equal_key(out);
+        self.resulttypmod.equal_key(out);
+        self.resultcollid.equal_key(out);
+        self.relabelformat.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::CoerceViaIo {
@@ -735,6 +2542,16 @@ impl Equal for protobuf::CoerceViaIo {
             && self.resulttype.equal(&other.resulttype)
             && self.resultcollid.equal(&other.resultcollid)
             && self.coerceformat.equal(&other.coerceformat)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.xpr.equal_key(out);
+        self.arg.equal_key(out);
+        self.resulttype.equal_key(out);
+        self.resultcollid.equal_key(out);
+        self.coerceformat.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -748,6 +2565,18 @@ impl Equal for protobuf::ArrayCoerceExpr {
             && self.resultcollid.equal(&other.resultcollid)
             && self.coerceformat.equal(&other.coerceformat)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.xpr.equal_key(out);
+        self.arg.equal_key(out);
+        self.elemexpr.equal_key(out);
+        self.resulttype.equal_key(out);
+        self.resulttypmod.equal_key(out);
+        self.resultcollid.equal_key(out);
+        self.coerceformat.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::ConvertRowtypeExpr {
@@ -757,6 +2586,15 @@ impl Equal for protobuf::ConvertRowtypeExpr {
             && self.resulttype.equal(&other.resulttype)
             && self.convertformat.equal(&other.convertformat)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.xpr.equal_key(out);
+        self.arg.equal_key(out);
+        self.resulttype.equal_key(out);
+        self.convertformat.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::CollateExpr {
@@ -764,6 +2602,14 @@ impl Equal for protobuf::CollateExpr {
         self.xpr.equal(&other.xpr)
             && self.arg.equal(&other.arg)
             && self.coll_oid.equal(&other.coll_oid)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.xpr.equal_key(out);
+        self.arg.equal_key(out);
+        self.coll_oid.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -776,6 +2622,17 @@ impl Equal for protobuf::CaseExpr {
             && self.args.equal(&other.args)
             && self.defresult.equal(&other.defresult)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.xpr.equal_key(out);
+        self.casetype.equal_key(out);
+        self.casecollid.equal_key(out);
+        self.arg.equal_key(out);
+        self.args.equal_key(out);
+        self.defresult.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::CaseWhen {
@@ -783,6 +2640,14 @@ impl Equal for protobuf::CaseWhen {
         self.xpr.equal(&other.xpr)
             && self.expr.equal(&other.expr)
             && self.result.equal(&other.result)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.xpr.equal_key(out);
+        self.expr.equal_key(out);
+        self.result.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -792,6 +2657,15 @@ impl Equal for protobuf::CaseTestExpr {
             && self.type_id.equal(&other.type_id)
             && self.type_mod.equal(&other.type_mod)
             && self.collation.equal(&other.collation)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.xpr.equal_key(out);
+        self.type_id.equal_key(out);
+        self.type_mod.equal_key(out);
+        self.collation.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -804,6 +2678,17 @@ impl Equal for protobuf::ArrayExpr {
             && self.elements.equal(&other.elements)
             && self.multidims.equal(&other.multidims)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.xpr.equal_key(out);
+        self.array_typeid.equal_key(out);
+        self.array_collid.equal_key(out);
+        self.element_typeid.equal_key(out);
+        self.elements.equal_key(out);
+        self.multidims.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::RowExpr {
@@ -813,6 +2698,16 @@ impl Equal for protobuf::RowExpr {
             && self.row_typeid.equal(&other.row_typeid)
             && self.row_format.equal(&other.row_format)
             && self.colnames.equal(&other.colnames)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.xpr.equal_key(out);
+        self.args.equal_key(out);
+        self.row_typeid.equal_key(out);
+        self.row_format.equal_key(out);
+        self.colnames.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -826,6 +2721,18 @@ impl Equal for protobuf::RowCompareExpr {
             && self.largs.equal(&other.largs)
             && self.rargs.equal(&other.rargs)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.xpr.equal_key(out);
+        self.cmptype.equal_key(out);
+        self.opnos.equal_key(out);
+        self.opfamilies.equal_key(out);
+        self.inputcollids.equal_key(out);
+        self.largs.equal_key(out);
+        self.rargs.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::CoalesceExpr {
@@ -834,6 +2741,15 @@ impl Equal for protobuf::CoalesceExpr {
             && self.coalescetype.equal(&other.coalescetype)
             && self.coalescecollid.equal(&other.coalescecollid)
             && self.args.equal(&other.args)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.xpr.equal_key(out);
+        self.coalescetype.equal_key(out);
+        self.coalescecollid.equal_key(out);
+        self.args.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -846,6 +2762,17 @@ impl Equal for protobuf::MinMaxExpr {
             && self.op.equal(&other.op)
             && self.args.equal(&other.args)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.xpr.equal_key(out);
+        self.minmaxtype.equal_key(out);
+        self.minmaxcollid.equal_key(out);
+        self.inputcollid.equal_key(out);
+        self.op.equal_key(out);
+        self.args.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::SqlValueFunction {
@@ -854,6 +2781,15 @@ impl Equal for protobuf::SqlValueFunction {
             && self.op.equal(&other.op)
             && self.r#type.equal(&other.r#type)
             && self.typmod.equal(&other.typmod)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.xpr.equal_key(out);
+        self.op.equal_key(out);
+        self.r#type.equal_key(out);
+        self.typmod.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -870,11 +2806,33 @@ impl Equal for protobuf::XmlExpr {
             && self.r#type.equal(&other.r#type)
             && self.typmod.equal(&other.typmod)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.xpr.equal_key(out);
+        self.op.equal_key(out);
+        self.name.equal_key(out);
+        self.named_args.equal_key(out);
+        self.arg_names.equal_key(out);
+        self.args.equal_key(out);
+        self.xmloption.equal_key(out);
+        self.indent.equal_key(out);
+        self.r#type.equal_key(out);
+        self.typmod.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::JsonFormat {
     fn equal(&self, other: &Self) -> bool {
         self.format_type.equal(&other.format_type) && self.encoding.equal(&other.encoding)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.format_type.equal_key(out);
+        self.encoding.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -884,6 +2842,14 @@ impl Equal for protobuf::JsonReturning {
             && self.typid.equal(&other.typid)
             && self.typmod.equal(&other.typmod)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.format.equal_key(out);
+        self.typid.equal_key(out);
+        self.typmod.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::JsonValueExpr {
@@ -891,6 +2857,14 @@ impl Equal for protobuf::JsonValueExpr {
         self.raw_expr.equal(&other.raw_expr)
             && self.formatted_expr.equal(&other.formatted_expr)
             && self.format.equal(&other.format)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.raw_expr.equal_key(out);
+        self.formatted_expr.equal_key(out);
+        self.format.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -905,6 +2879,19 @@ impl Equal for protobuf::JsonConstructorExpr {
             && self.absent_on_null.equal(&other.absent_on_null)
             && self.unique.equal(&other.unique)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.xpr.equal_key(out);
+        self.r#type.equal_key(out);
+        self.args.equal_key(out);
+        self.func.equal_key(out);
+        self.coercion.equal_key(out);
+        self.returning.equal_key(out);
+        self.absent_on_null.equal_key(out);
+        self.unique.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::JsonIsPredicate {
@@ -914,6 +2901,15 @@ impl Equal for protobuf::JsonIsPredicate {
             && self.item_type.equal(&other.item_type)
             && self.unique_keys.equal(&other.unique_keys)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.expr.equal_key(out);
+        self.format.equal_key(out);
+        self.item_type.equal_key(out);
+        self.unique_keys.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::JsonBehavior {
@@ -921,6 +2917,14 @@ impl Equal for protobuf::JsonBehavior {
         self.btype.equal(&other.btype)
             && self.expr.equal(&other.expr)
             && self.coerce.equal(&other.coerce)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.btype.equal_key(out);
+        self.expr.equal_key(out);
+        self.coerce.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -943,11 +2947,38 @@ impl Equal for protobuf::JsonExpr {
             && self.omit_quotes.equal(&other.omit_quotes)
             && self.collation.equal(&other.collation)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.xpr.equal_key(out);
+        self.op.equal_key(out);
+        self.column_name.equal_key(out);
+        self.formatted_expr.equal_key(out);
+        self.format.equal_key(out);
+        self.path_spec.equal_key(out);
+        self.returning.equal_key(out);
+        self.passing_names.equal_key(out);
+        self.passing_values.equal_key(out);
+        self.on_empty.equal_key(out);
+        self.on_error.equal_key(out);
+        self.use_io_coercion.equal_key(out);
+        self.use_json_coercion.equal_key(out);
+        self.wrapper.equal_key(out);
+        self.omit_quotes.equal_key(out);
+        self.collation.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::JsonTablePath {
     fn equal(&self, other: &Self) -> bool {
         self.name.equal(&other.name)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.name.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -960,6 +2991,17 @@ impl Equal for protobuf::JsonTablePathScan {
             && self.col_min.equal(&other.col_min)
             && self.col_max.equal(&other.col_max)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.plan.equal_key(out);
+        self.path.equal_key(out);
+        self.error_on_error.equal_key(out);
+        self.child.equal_key(out);
+        self.col_min.equal_key(out);
+        self.col_max.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::JsonTableSiblingJoin {
@@ -967,6 +3009,14 @@ impl Equal for protobuf::JsonTableSiblingJoin {
         self.plan.equal(&other.plan)
             && self.lplan.equal(&other.lplan)
             && self.rplan.equal(&other.rplan)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.plan.equal_key(out);
+        self.lplan.equal_key(out);
+        self.rplan.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -977,6 +3027,15 @@ impl Equal for protobuf::NullTest {
             && self.nulltesttype.equal(&other.nulltesttype)
             && self.argisrow.equal(&other.argisrow)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.xpr.equal_key(out);
+        self.arg.equal_key(out);
+        self.nulltesttype.equal_key(out);
+        self.argisrow.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::BooleanTest {
@@ -984,6 +3043,14 @@ impl Equal for protobuf::BooleanTest {
         self.xpr.equal(&other.xpr)
             && self.arg.equal(&other.arg)
             && self.booltesttype.equal(&other.booltesttype)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.xpr.equal_key(out);
+        self.arg.equal_key(out);
+        self.booltesttype.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -996,6 +3063,17 @@ impl Equal for protobuf::MergeAction {
             && self.target_list.equal(&other.target_list)
             && self.update_colnos.equal(&other.update_colnos)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.match_kind.equal_key(out);
+        self.command_type.equal_key(out);
+        self.r#override.equal_key(out);
+        self.qual.equal_key(out);
+        self.target_list.equal_key(out);
+        self.update_colnos.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::CoerceToDomain {
@@ -1007,6 +3085,17 @@ impl Equal for protobuf::CoerceToDomain {
             && self.resultcollid.equal(&other.resultcollid)
             && self.coercionformat.equal(&other.coercionformat)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.xpr.equal_key(out);
+        self.arg.equal_key(out);
+        self.resulttype.equal_key(out);
+        self.resulttypmod.equal_key(out);
+        self.resultcollid.equal_key(out);
+        self.coercionformat.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::CoerceToDomainValue {
@@ -1015,6 +3104,15 @@ impl Equal for protobuf::CoerceToDomainValue {
             && self.type_id.equal(&other.type_id)
             && self.type_mod.equal(&other.type_mod)
             && self.collation.equal(&other.collation)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.xpr.equal_key(out);
+        self.type_id.equal_key(out);
+        self.type_mod.equal_key(out);
+        self.collation.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -1025,6 +3123,15 @@ impl Equal for protobuf::SetToDefault {
             && self.type_mod.equal(&other.type_mod)
             && self.collation.equal(&other.collation)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.xpr.equal_key(out);
+        self.type_id.equal_key(out);
+        self.type_mod.equal_key(out);
+        self.collation.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::CurrentOfExpr {
@@ -1034,6 +3141,15 @@ impl Equal for protobuf::CurrentOfExpr {
             && self.cursor_name.equal(&other.cursor_name)
             && self.cursor_param.equal(&other.cursor_param)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.xpr.equal_key(out);
+        self.cvarno.equal_key(out);
+        self.cursor_name.equal_key(out);
+        self.cursor_param.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::NextValueExpr {
@@ -1041,6 +3157,14 @@ impl Equal for protobuf::NextValueExpr {
         self.xpr.equal(&other.xpr)
             && self.seqid.equal(&other.seqid)
             && self.type_id.equal(&other.type_id)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.xpr.equal_key(out);
+        self.seqid.equal_key(out);
+        self.type_id.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -1051,6 +3175,15 @@ impl Equal for protobuf::InferenceElem {
             && self.infercollid.equal(&other.infercollid)
             && self.inferopclass.equal(&other.inferopclass)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.xpr.equal_key(out);
+        self.expr.equal_key(out);
+        self.infercollid.equal_key(out);
+        self.inferopclass.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::ReturningExpr {
@@ -1059,6 +3192,15 @@ impl Equal for protobuf::ReturningExpr {
             && self.retlevelsup.equal(&other.retlevelsup)
             && self.retold.equal(&other.retold)
             && self.retexpr.equal(&other.retexpr)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.xpr.equal_key(out);
+        self.retlevelsup.equal_key(out);
+        self.retold.equal_key(out);
+        self.retexpr.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -1073,11 +3215,30 @@ impl Equal for protobuf::TargetEntry {
             && self.resorigcol.equal(&other.resorigcol)
             && self.resjunk.equal(&other.resjunk)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.xpr.equal_key(out);
+        self.expr.equal_key(out);
+        self.resno.equal_key(out);
+        self.resname.equal_key(out);
+        self.ressortgroupref.equal_key(out);
+        self.resorigtbl.equal_key(out);
+        self.resorigcol.equal_key(out);
+        self.resjunk.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::RangeTblRef {
     fn equal(&self, other: &Self) -> bool {
         self.rtindex.equal(&other.rtindex)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.rtindex.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -1093,11 +3254,32 @@ impl Equal for protobuf::JoinExpr {
             && self.alias.equal(&other.alias)
             && self.rtindex.equal(&other.rtindex)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.jointype.equal_key(out);
+        self.is_natural.equal_key(out);
+        self.larg.equal_key(out);
+        self.rarg.equal_key(out);
+        self.using_clause.equal_key(out);
+        self.join_using_alias.equal_key(out);
+        self.quals.equal_key(out);
+        self.alias.equal_key(out);
+        self.rtindex.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::FromExpr {
     fn equal(&self, other: &Self) -> bool {
         self.fromlist.equal(&other.fromlist) && self.quals.equal(&other.quals)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.fromlist.equal_key(out);
+        self.quals.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -1111,6 +3293,19 @@ impl Equal for protobuf::OnConflictExpr {
             && self.on_conflict_where.equal(&other.on_conflict_where)
             && self.excl_rel_index.equal(&other.excl_rel_index)
             && self.excl_rel_tlist.equal(&other.excl_rel_tlist)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.action.equal_key(out);
+        self.arbiter_elems.equal_key(out);
+        self.arbiter_where.equal_key(out);
+        self.constraint.equal_key(out);
+        self.on_conflict_set.equal_key(out);
+        self.on_conflict_where.equal_key(out);
+        self.excl_rel_index.equal_key(out);
+        self.excl_rel_tlist.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -1162,6 +3357,54 @@ impl Equal for protobuf::Query {
             && self.constraint_deps.equal(&other.constraint_deps)
             && self.with_check_options.equal(&other.with_check_options)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.command_type.equal_key(out);
+        self.query_source.equal_key(out);
+        self.can_set_tag.equal_key(out);
+        self.utility_stmt.equal_key(out);
+        self.result_relation.equal_key(out);
+        self.has_aggs.equal_key(out);
+        self.has_window_funcs.equal_key(out);
+        self.has_target_srfs.equal_key(out);
+        self.has_sub_links.equal_key(out);
+        self.has_distinct_on.equal_key(out);
+        self.has_recursive.equal_key(out);
+        self.has_modifying_cte.equal_key(out);
+        self.has_for_update.equal_key(out);
+        self.has_row_security.equal_key(out);
+        self.has_group_rte.equal_key(out);
+        self.is_return.equal_key(out);
+        self.cte_list.equal_key(out);
+        self.rtable.equal_key(out);
+        self.rteperminfos.equal_key(out);
+        self.jointree.equal_key(out);
+        self.merge_action_list.equal_key(out);
+        self.merge_target_relation.equal_key(out);
+        self.merge_join_condition.equal_key(out);
+        self.target_list.equal_key(out);
+        self.r#override.equal_key(out);
+        self.on_conflict.equal_key(out);
+        self.returning_old_alias.equal_key(out);
+        self.returning_new_alias.equal_key(out);
+        self.returning_list.equal_key(out);
+        self.group_clause.equal_key(out);
+        self.group_distinct.equal_key(out);
+        self.grouping_sets.equal_key(out);
+        self.having_qual.equal_key(out);
+        self.window_clause.equal_key(out);
+        self.distinct_clause.equal_key(out);
+        self.sort_clause.equal_key(out);
+        self.limit_offset.equal_key(out);
+        self.limit_count.equal_key(out);
+        self.limit_option.equal_key(out);
+        self.row_marks.equal_key(out);
+        self.set_operations.equal_key(out);
+        self.constraint_deps.equal_key(out);
+        self.with_check_options.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::TypeName {
@@ -1174,17 +3417,41 @@ impl Equal for protobuf::TypeName {
             && self.typemod.equal(&other.typemod)
             && self.array_bounds.equal(&other.array_bounds)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.names.equal_key(out);
+        self.type_oid.equal_key(out);
+        self.setof.equal_key(out);
+        self.pct_type.equal_key(out);
+        self.typmods.equal_key(out);
+        self.typemod.equal_key(out);
+        self.array_bounds.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::ColumnRef {
     fn equal(&self, other: &Self) -> bool {
         self.fields.equal(&other.fields)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.fields.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::ParamRef {
     fn equal(&self, other: &Self) -> bool {
         self.number.equal(&other.number)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.number.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -1195,11 +3462,27 @@ impl Equal for protobuf::AExpr {
             && self.lexpr.equal(&other.lexpr)
             && self.rexpr.equal(&other.rexpr)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.kind.equal_key(out);
+        self.name.equal_key(out);
+        self.lexpr.equal_key(out);
+        self.rexpr.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::TypeCast {
     fn equal(&self, other: &Self) -> bool {
         self.arg.equal(&other.arg) && self.type_name.equal(&other.type_name)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.arg.equal_key(out);
+        self.type_name.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -1207,11 +3490,25 @@ impl Equal for protobuf::CollateClause {
     fn equal(&self, other: &Self) -> bool {
         self.arg.equal(&other.arg) && self.collname.equal(&other.collname)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.arg.equal_key(out);
+        self.collname.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::RoleSpec {
     fn equal(&self, other: &Self) -> bool {
         self.roletype.equal(&other.roletype) && self.rolename.equal(&other.rolename)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.roletype.equal_key(out);
+        self.rolename.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -1228,11 +3525,31 @@ impl Equal for protobuf::FuncCall {
             && self.func_variadic.equal(&other.func_variadic)
             && self.funcformat.equal(&other.funcformat)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.funcname.equal_key(out);
+        self.args.equal_key(out);
+        self.agg_order.equal_key(out);
+        self.agg_filter.equal_key(out);
+        self.over.equal_key(out);
+        self.agg_within_group.equal_key(out);
+        self.agg_star.equal_key(out);
+        self.agg_distinct.equal_key(out);
+        self.func_variadic.equal_key(out);
+        self.funcformat.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::AStar {
     fn equal(&self, other: &Self) -> bool {
         true
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        out.push('}');
     }
 }
 
@@ -1242,17 +3559,38 @@ impl Equal for protobuf::AIndices {
             && self.lidx.equal(&other.lidx)
             && self.uidx.equal(&other.uidx)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.is_slice.equal_key(out);
+        self.lidx.equal_key(out);
+        self.uidx.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::AIndirection {
     fn equal(&self, other: &Self) -> bool {
         self.arg.equal(&other.arg) && self.indirection.equal(&other.indirection)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.arg.equal_key(out);
+        self.indirection.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::AArrayExpr {
     fn equal(&self, other: &Self) -> bool {
         self.elements.equal(&other.elements)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.elements.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -1262,6 +3600,14 @@ impl Equal for protobuf::ResTarget {
             && self.indirection.equal(&other.indirection)
             && self.val.equal(&other.val)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.name.equal_key(out);
+        self.indirection.equal_key(out);
+        self.val.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::MultiAssignRef {
@@ -1269,6 +3615,14 @@ impl Equal for protobuf::MultiAssignRef {
         self.source.equal(&other.source)
             && self.colno.equal(&other.colno)
             && self.ncolumns.equal(&other.ncolumns)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.source.equal_key(out);
+        self.colno.equal_key(out);
+        self.ncolumns.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -1278,6 +3632,15 @@ impl Equal for protobuf::SortBy {
             && self.sortby_dir.equal(&other.sortby_dir)
             && self.sortby_nulls.equal(&other.sortby_nulls)
             && self.use_op.equal(&other.use_op)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.node.equal_key(out);
+        self.sortby_dir.equal_key(out);
+        self.sortby_nulls.equal_key(out);
+        self.use_op.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -1291,6 +3654,18 @@ impl Equal for protobuf::WindowDef {
             && self.start_offset.equal(&other.start_offset)
             && self.end_offset.equal(&other.end_offset)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.name.equal_key(out);
+        self.refname.equal_key(out);
+        self.partition_clause.equal_key(out);
+        self.order_clause.equal_key(out);
+        self.frame_options.equal_key(out);
+        self.start_offset.equal_key(out);
+        self.end_offset.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::RangeSubselect {
@@ -1298,6 +3673,14 @@ impl Equal for protobuf::RangeSubselect {
         self.lateral.equal(&other.lateral)
             && self.subquery.equal(&other.subquery)
             && self.alias.equal(&other.alias)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.lateral.equal_key(out);
+        self.subquery.equal_key(out);
+        self.alias.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -1310,6 +3693,17 @@ impl Equal for protobuf::RangeFunction {
             && self.alias.equal(&other.alias)
             && self.coldeflist.equal(&other.coldeflist)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.lateral.equal_key(out);
+        self.ordinality.equal_key(out);
+        self.is_rowsfrom.equal_key(out);
+        self.functions.equal_key(out);
+        self.alias.equal_key(out);
+        self.coldeflist.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::RangeTableFunc {
@@ -1320,6 +3714,17 @@ impl Equal for protobuf::RangeTableFunc {
             && self.namespaces.equal(&other.namespaces)
             && self.columns.equal(&other.columns)
             && self.alias.equal(&other.alias)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.lateral.equal_key(out);
+        self.docexpr.equal_key(out);
+        self.rowexpr.equal_key(out);
+        self.namespaces.equal_key(out);
+        self.columns.equal_key(out);
+        self.alias.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -1332,6 +3737,17 @@ impl Equal for protobuf::RangeTableFuncCol {
             && self.colexpr.equal(&other.colexpr)
             && self.coldefexpr.equal(&other.coldefexpr)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.colname.equal_key(out);
+        self.type_name.equal_key(out);
+        self.for_ordinality.equal_key(out);
+        self.is_not_null.equal_key(out);
+        self.colexpr.equal_key(out);
+        self.coldefexpr.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::RangeTableSample {
@@ -1340,6 +3756,15 @@ impl Equal for protobuf::RangeTableSample {
             && self.method.equal(&other.method)
             && self.args.equal(&other.args)
             && self.repeatable.equal(&other.repeatable)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.relation.equal_key(out);
+        self.method.equal_key(out);
+        self.args.equal_key(out);
+        self.repeatable.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -1364,6 +3789,29 @@ impl Equal for protobuf::ColumnDef {
             && self.constraints.equal(&other.constraints)
             && self.fdwoptions.equal(&other.fdwoptions)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.colname.equal_key(out);
+        self.type_name.equal_key(out);
+        self.compression.equal_key(out);
+        self.inhcount.equal_key(out);
+        self.is_local.equal_key(out);
+        self.is_not_null.equal_key(out);
+        self.is_from_type.equal_key(out);
+        self.storage.equal_key(out);
+        self.storage_name.equal_key(out);
+        self.raw_default.equal_key(out);
+        self.cooked_default.equal_key(out);
+        self.identity.equal_key(out);
+        self.identity_sequence.equal_key(out);
+        self.generated.equal_key(out);
+        self.coll_clause.equal_key(out);
+        self.coll_oid.equal_key(out);
+        self.constraints.equal_key(out);
+        self.fdwoptions.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::TableLikeClause {
@@ -1371,6 +3819,14 @@ impl Equal for protobuf::TableLikeClause {
         self.relation.equal(&other.relation)
             && self.options.equal(&other.options)
             && self.relation_oid.equal(&other.relation_oid)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.relation.equal_key(out);
+        self.options.equal_key(out);
+        self.relation_oid.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -1385,6 +3841,19 @@ impl Equal for protobuf::IndexElem {
             && self.ordering.equal(&other.ordering)
             && self.nulls_ordering.equal(&other.nulls_ordering)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.name.equal_key(out);
+        self.expr.equal_key(out);
+        self.indexcolname.equal_key(out);
+        self.collation.equal_key(out);
+        self.opclass.equal_key(out);
+        self.opclassopts.equal_key(out);
+        self.ordering.equal_key(out);
+        self.nulls_ordering.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::DefElem {
@@ -1394,6 +3863,15 @@ impl Equal for protobuf::DefElem {
             && self.arg.equal(&other.arg)
             && self.defaction.equal(&other.defaction)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.defnamespace.equal_key(out);
+        self.defname.equal_key(out);
+        self.arg.equal_key(out);
+        self.defaction.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::LockingClause {
@@ -1401,6 +3879,14 @@ impl Equal for protobuf::LockingClause {
         self.locked_rels.equal(&other.locked_rels)
             && self.strength.equal(&other.strength)
             && self.wait_policy.equal(&other.wait_policy)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.locked_rels.equal_key(out);
+        self.strength.equal_key(out);
+        self.wait_policy.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -1411,6 +3897,15 @@ impl Equal for protobuf::XmlSerialize {
             && self.type_name.equal(&other.type_name)
             && self.indent.equal(&other.indent)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.xmloption.equal_key(out);
+        self.expr.equal_key(out);
+        self.type_name.equal_key(out);
+        self.indent.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::PartitionElem {
@@ -1420,11 +3915,27 @@ impl Equal for protobuf::PartitionElem {
             && self.collation.equal(&other.collation)
             && self.opclass.equal(&other.opclass)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.name.equal_key(out);
+        self.expr.equal_key(out);
+        self.collation.equal_key(out);
+        self.opclass.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::PartitionSpec {
     fn equal(&self, other: &Self) -> bool {
         self.strategy.equal(&other.strategy) && self.part_params.equal(&other.part_params)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.strategy.equal_key(out);
+        self.part_params.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -1439,11 +3950,31 @@ impl Equal for protobuf::PartitionBoundSpec {
             && self.upperdatums.equal(&other.upperdatums)
             && self.location.equal(&other.location)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.strategy.equal_key(out);
+        self.is_default.equal_key(out);
+        self.modulus.equal_key(out);
+        self.remainder.equal_key(out);
+        self.listdatums.equal_key(out);
+        self.lowerdatums.equal_key(out);
+        self.upperdatums.equal_key(out);
+        self.location.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::PartitionRangeDatum {
     fn equal(&self, other: &Self) -> bool {
         self.kind.equal(&other.kind) && self.value.equal(&other.value)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.kind.equal_key(out);
+        self.value.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -1452,6 +3983,14 @@ impl Equal for protobuf::PartitionCmd {
         self.name.equal(&other.name)
             && self.bound.equal(&other.bound)
             && self.concurrent.equal(&other.concurrent)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.name.equal_key(out);
+        self.bound.equal_key(out);
+        self.concurrent.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -1491,6 +4030,44 @@ impl Equal for protobuf::RangeTblEntry {
             && self.in_from_cl.equal(&other.in_from_cl)
             && self.security_quals.equal(&other.security_quals)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.alias.equal_key(out);
+        self.eref.equal_key(out);
+        self.rtekind.equal_key(out);
+        self.relid.equal_key(out);
+        self.inh.equal_key(out);
+        self.relkind.equal_key(out);
+        self.rellockmode.equal_key(out);
+        self.perminfoindex.equal_key(out);
+        self.tablesample.equal_key(out);
+        self.subquery.equal_key(out);
+        self.security_barrier.equal_key(out);
+        self.jointype.equal_key(out);
+        self.joinmergedcols.equal_key(out);
+        self.joinaliasvars.equal_key(out);
+        self.joinleftcols.equal_key(out);
+        self.joinrightcols.equal_key(out);
+        self.join_using_alias.equal_key(out);
+        self.functions.equal_key(out);
+        self.funcordinality.equal_key(out);
+        self.tablefunc.equal_key(out);
+        self.values_lists.equal_key(out);
+        self.ctename.equal_key(out);
+        self.ctelevelsup.equal_key(out);
+        self.self_reference.equal_key(out);
+        self.coltypes.equal_key(out);
+        self.coltypmods.equal_key(out);
+        self.colcollations.equal_key(out);
+        self.enrname.equal_key(out);
+        self.enrtuples.equal_key(out);
+        self.groupexprs.equal_key(out);
+        self.lateral.equal_key(out);
+        self.in_from_cl.equal_key(out);
+        self.security_quals.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::RtePermissionInfo {
@@ -1502,6 +4079,18 @@ impl Equal for protobuf::RtePermissionInfo {
             && self.selected_cols.equal(&other.selected_cols)
             && self.inserted_cols.equal(&other.inserted_cols)
             && self.updated_cols.equal(&other.updated_cols)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.relid.equal_key(out);
+        self.inh.equal_key(out);
+        self.required_perms.equal_key(out);
+        self.check_as_user.equal_key(out);
+        self.selected_cols.equal_key(out);
+        self.inserted_cols.equal_key(out);
+        self.updated_cols.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -1515,6 +4104,18 @@ impl Equal for protobuf::RangeTblFunction {
             && self.funccolcollations.equal(&other.funccolcollations)
             && self.funcparams.equal(&other.funcparams)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.funcexpr.equal_key(out);
+        self.funccolcount.equal_key(out);
+        self.funccolnames.equal_key(out);
+        self.funccoltypes.equal_key(out);
+        self.funccoltypmods.equal_key(out);
+        self.funccolcollations.equal_key(out);
+        self.funcparams.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::TableSampleClause {
@@ -1522,6 +4123,14 @@ impl Equal for protobuf::TableSampleClause {
         self.tsmhandler.equal(&other.tsmhandler)
             && self.args.equal(&other.args)
             && self.repeatable.equal(&other.repeatable)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.tsmhandler.equal_key(out);
+        self.args.equal_key(out);
+        self.repeatable.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -1532,6 +4141,16 @@ impl Equal for protobuf::WithCheckOption {
             && self.polname.equal(&other.polname)
             && self.qual.equal(&other.qual)
             && self.cascaded.equal(&other.cascaded)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.kind.equal_key(out);
+        self.relname.equal_key(out);
+        self.polname.equal_key(out);
+        self.qual.equal_key(out);
+        self.cascaded.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -1544,11 +4163,29 @@ impl Equal for protobuf::SortGroupClause {
             && self.nulls_first.equal(&other.nulls_first)
             && self.hashable.equal(&other.hashable)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.tle_sort_group_ref.equal_key(out);
+        self.eqop.equal_key(out);
+        self.sortop.equal_key(out);
+        self.reverse_sort.equal_key(out);
+        self.nulls_first.equal_key(out);
+        self.hashable.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::GroupingSet {
     fn equal(&self, other: &Self) -> bool {
         self.kind.equal(&other.kind) && self.content.equal(&other.content)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.kind.equal_key(out);
+        self.content.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -1569,6 +4206,25 @@ impl Equal for protobuf::WindowClause {
             && self.winref.equal(&other.winref)
             && self.copied_order.equal(&other.copied_order)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.name.equal_key(out);
+        self.refname.equal_key(out);
+        self.partition_clause.equal_key(out);
+        self.order_clause.equal_key(out);
+        self.frame_options.equal_key(out);
+        self.start_offset.equal_key(out);
+        self.end_offset.equal_key(out);
+        self.start_in_range_func.equal_key(out);
+        self.end_in_range_func.equal_key(out);
+        self.in_range_coll.equal_key(out);
+        self.in_range_asc.equal_key(out);
+        self.in_range_nulls_first.equal_key(out);
+        self.winref.equal_key(out);
+        self.copied_order.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::RowMarkClause {
@@ -1578,11 +4234,27 @@ impl Equal for protobuf::RowMarkClause {
             && self.wait_policy.equal(&other.wait_policy)
             && self.pushed_down.equal(&other.pushed_down)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.rti.equal_key(out);
+        self.strength.equal_key(out);
+        self.wait_policy.equal_key(out);
+        self.pushed_down.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::WithClause {
     fn equal(&self, other: &Self) -> bool {
         self.ctes.equal(&other.ctes) && self.recursive.equal(&other.recursive)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.ctes.equal_key(out);
+        self.recursive.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -1591,6 +4263,14 @@ impl Equal for protobuf::InferClause {
         self.index_elems.equal(&other.index_elems)
             && self.where_clause.equal(&other.where_clause)
             && self.conname.equal(&other.conname)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.index_elems.equal_key(out);
+        self.where_clause.equal_key(out);
+        self.conname.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -1601,6 +4281,15 @@ impl Equal for protobuf::OnConflictClause {
             && self.target_list.equal(&other.target_list)
             && self.where_clause.equal(&other.where_clause)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.action.equal_key(out);
+        self.infer.equal_key(out);
+        self.target_list.equal_key(out);
+        self.where_clause.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::CteSearchClause {
@@ -1608,6 +4297,14 @@ impl Equal for protobuf::CteSearchClause {
         self.search_col_list.equal(&other.search_col_list)
             && self.search_breadth_first.equal(&other.search_breadth_first)
             && self.search_seq_column.equal(&other.search_seq_column)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.search_col_list.equal_key(out);
+        self.search_breadth_first.equal_key(out);
+        self.search_seq_column.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -1622,6 +4319,20 @@ impl Equal for protobuf::CteCycleClause {
             && self.cycle_mark_typmod.equal(&other.cycle_mark_typmod)
             && self.cycle_mark_collation.equal(&other.cycle_mark_collation)
             && self.cycle_mark_neop.equal(&other.cycle_mark_neop)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.cycle_col_list.equal_key(out);
+        self.cycle_mark_column.equal_key(out);
+        self.cycle_mark_value.equal_key(out);
+        self.cycle_mark_default.equal_key(out);
+        self.cycle_path_column.equal_key(out);
+        self.cycle_mark_type.equal_key(out);
+        self.cycle_mark_typmod.equal_key(out);
+        self.cycle_mark_collation.equal_key(out);
+        self.cycle_mark_neop.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -1640,6 +4351,23 @@ impl Equal for protobuf::CommonTableExpr {
             && self.ctecoltypmods.equal(&other.ctecoltypmods)
             && self.ctecolcollations.equal(&other.ctecolcollations)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.ctename.equal_key(out);
+        self.aliascolnames.equal_key(out);
+        self.ctematerialized.equal_key(out);
+        self.ctequery.equal_key(out);
+        self.search_clause.equal_key(out);
+        self.cycle_clause.equal_key(out);
+        self.cterecursive.equal_key(out);
+        self.cterefcount.equal_key(out);
+        self.ctecolnames.equal_key(out);
+        self.ctecoltypes.equal_key(out);
+        self.ctecoltypmods.equal_key(out);
+        self.ctecolcollations.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::MergeWhenClause {
@@ -1651,17 +4379,42 @@ impl Equal for protobuf::MergeWhenClause {
             && self.target_list.equal(&other.target_list)
             && self.values.equal(&other.values)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.match_kind.equal_key(out);
+        self.command_type.equal_key(out);
+        self.r#override.equal_key(out);
+        self.condition.equal_key(out);
+        self.target_list.equal_key(out);
+        self.values.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::ReturningOption {
     fn equal(&self, other: &Self) -> bool {
         self.option.equal(&other.option) && self.value.equal(&other.value)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.option.equal_key(out);
+        self.value.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::ReturningClause {
     fn equal(&self, other: &Self) -> bool {
         self.options.equal(&other.options) && self.exprs.equal(&other.exprs)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.options.equal_key(out);
+        self.exprs.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -1671,17 +4424,39 @@ impl Equal for protobuf::TriggerTransition {
             && self.is_new.equal(&other.is_new)
             && self.is_table.equal(&other.is_table)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.name.equal_key(out);
+        self.is_new.equal_key(out);
+        self.is_table.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::JsonOutput {
     fn equal(&self, other: &Self) -> bool {
         self.type_name.equal(&other.type_name) && self.returning.equal(&other.returning)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.type_name.equal_key(out);
+        self.returning.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::JsonArgument {
     fn equal(&self, other: &Self) -> bool {
         self.val.equal(&other.val) && self.name.equal(&other.name)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.val.equal_key(out);
+        self.name.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -1698,11 +4473,33 @@ impl Equal for protobuf::JsonFuncExpr {
             && self.wrapper.equal(&other.wrapper)
             && self.quotes.equal(&other.quotes)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.op.equal_key(out);
+        self.column_name.equal_key(out);
+        self.context_item.equal_key(out);
+        self.pathspec.equal_key(out);
+        self.passing.equal_key(out);
+        self.output.equal_key(out);
+        self.on_empty.equal_key(out);
+        self.on_error.equal_key(out);
+        self.wrapper.equal_key(out);
+        self.quotes.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::JsonTablePathSpec {
     fn equal(&self, other: &Self) -> bool {
         self.string.equal(&other.string) && self.name.equal(&other.name)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.string.equal_key(out);
+        self.name.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -1715,6 +4512,18 @@ impl Equal for protobuf::JsonTable {
             && self.on_error.equal(&other.on_error)
             && self.alias.equal(&other.alias)
             && self.lateral.equal(&other.lateral)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.context_item.equal_key(out);
+        self.pathspec.equal_key(out);
+        self.passing.equal_key(out);
+        self.columns.equal_key(out);
+        self.on_error.equal_key(out);
+        self.alias.equal_key(out);
+        self.lateral.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -1731,11 +4540,33 @@ impl Equal for protobuf::JsonTableColumn {
             && self.on_empty.equal(&other.on_empty)
             && self.on_error.equal(&other.on_error)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.coltype.equal_key(out);
+        self.name.equal_key(out);
+        self.type_name.equal_key(out);
+        self.pathspec.equal_key(out);
+        self.format.equal_key(out);
+        self.wrapper.equal_key(out);
+        self.quotes.equal_key(out);
+        self.columns.equal_key(out);
+        self.on_empty.equal_key(out);
+        self.on_error.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::JsonKeyValue {
     fn equal(&self, other: &Self) -> bool {
         self.key.equal(&other.key) && self.value.equal(&other.value)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.key.equal_key(out);
+        self.value.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -1745,17 +4576,39 @@ impl Equal for protobuf::JsonParseExpr {
             && self.output.equal(&other.output)
             && self.unique_keys.equal(&other.unique_keys)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.expr.equal_key(out);
+        self.output.equal_key(out);
+        self.unique_keys.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::JsonScalarExpr {
     fn equal(&self, other: &Self) -> bool {
         self.expr.equal(&other.expr) && self.output.equal(&other.output)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.expr.equal_key(out);
+        self.output.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::JsonSerializeExpr {
     fn equal(&self, other: &Self) -> bool {
         self.expr.equal(&other.expr) && self.output.equal(&other.output)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.expr.equal_key(out);
+        self.output.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -1766,6 +4619,15 @@ impl Equal for protobuf::JsonObjectConstructor {
             && self.absent_on_null.equal(&other.absent_on_null)
             && self.unique.equal(&other.unique)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.exprs.equal_key(out);
+        self.output.equal_key(out);
+        self.absent_on_null.equal_key(out);
+        self.unique.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::JsonArrayConstructor {
@@ -1773,6 +4635,14 @@ impl Equal for protobuf::JsonArrayConstructor {
         self.exprs.equal(&other.exprs)
             && self.output.equal(&other.output)
             && self.absent_on_null.equal(&other.absent_on_null)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.exprs.equal_key(out);
+        self.output.equal_key(out);
+        self.absent_on_null.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -1783,6 +4653,15 @@ impl Equal for protobuf::JsonArrayQueryConstructor {
             && self.format.equal(&other.format)
             && self.absent_on_null.equal(&other.absent_on_null)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.query.equal_key(out);
+        self.output.equal_key(out);
+        self.format.equal_key(out);
+        self.absent_on_null.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::JsonAggConstructor {
@@ -1791,6 +4670,15 @@ impl Equal for protobuf::JsonAggConstructor {
             && self.agg_filter.equal(&other.agg_filter)
             && self.agg_order.equal(&other.agg_order)
             && self.over.equal(&other.over)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.output.equal_key(out);
+        self.agg_filter.equal_key(out);
+        self.agg_order.equal_key(out);
+        self.over.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -1801,6 +4689,15 @@ impl Equal for protobuf::JsonObjectAgg {
             && self.absent_on_null.equal(&other.absent_on_null)
             && self.unique.equal(&other.unique)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.constructor.equal_key(out);
+        self.arg.equal_key(out);
+        self.absent_on_null.equal_key(out);
+        self.unique.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::JsonArrayAgg {
@@ -1809,11 +4706,25 @@ impl Equal for protobuf::JsonArrayAgg {
             && self.arg.equal(&other.arg)
             && self.absent_on_null.equal(&other.absent_on_null)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.constructor.equal_key(out);
+        self.arg.equal_key(out);
+        self.absent_on_null.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::RawStmt {
     fn equal(&self, other: &Self) -> bool {
         self.stmt.equal(&other.stmt)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.stmt.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -1827,6 +4738,18 @@ impl Equal for protobuf::InsertStmt {
             && self.with_clause.equal(&other.with_clause)
             && self.r#override.equal(&other.r#override)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.relation.equal_key(out);
+        self.cols.equal_key(out);
+        self.select_stmt.equal_key(out);
+        self.on_conflict_clause.equal_key(out);
+        self.returning_clause.equal_key(out);
+        self.with_clause.equal_key(out);
+        self.r#override.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::DeleteStmt {
@@ -1836,6 +4759,16 @@ impl Equal for protobuf::DeleteStmt {
             && self.where_clause.equal(&other.where_clause)
             && self.returning_clause.equal(&other.returning_clause)
             && self.with_clause.equal(&other.with_clause)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.relation.equal_key(out);
+        self.using_clause.equal_key(out);
+        self.where_clause.equal_key(out);
+        self.returning_clause.equal_key(out);
+        self.with_clause.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -1848,6 +4781,17 @@ impl Equal for protobuf::UpdateStmt {
             && self.returning_clause.equal(&other.returning_clause)
             && self.with_clause.equal(&other.with_clause)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.relation.equal_key(out);
+        self.target_list.equal_key(out);
+        self.where_clause.equal_key(out);
+        self.from_clause.equal_key(out);
+        self.returning_clause.equal_key(out);
+        self.with_clause.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::MergeStmt {
@@ -1858,6 +4802,17 @@ impl Equal for protobuf::MergeStmt {
             && self.merge_when_clauses.equal(&other.merge_when_clauses)
             && self.returning_clause.equal(&other.returning_clause)
             && self.with_clause.equal(&other.with_clause)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.relation.equal_key(out);
+        self.source_relation.equal_key(out);
+        self.join_condition.equal_key(out);
+        self.merge_when_clauses.equal_key(out);
+        self.returning_clause.equal_key(out);
+        self.with_clause.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -1884,6 +4839,31 @@ impl Equal for protobuf::SelectStmt {
             && self.larg.equal(&other.larg)
             && self.rarg.equal(&other.rarg)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.distinct_clause.equal_key(out);
+        self.into_clause.equal_key(out);
+        self.target_list.equal_key(out);
+        self.from_clause.equal_key(out);
+        self.where_clause.equal_key(out);
+        self.group_clause.equal_key(out);
+        self.group_distinct.equal_key(out);
+        self.having_clause.equal_key(out);
+        self.window_clause.equal_key(out);
+        self.values_lists.equal_key(out);
+        self.sort_clause.equal_key(out);
+        self.limit_offset.equal_key(out);
+        self.limit_count.equal_key(out);
+        self.limit_option.equal_key(out);
+        self.locking_clause.equal_key(out);
+        self.with_clause.equal_key(out);
+        self.op.equal_key(out);
+        self.all.equal_key(out);
+        self.larg.equal_key(out);
+        self.rarg.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::SetOperationStmt {
@@ -1897,11 +4877,30 @@ impl Equal for protobuf::SetOperationStmt {
             && self.col_collations.equal(&other.col_collations)
             && self.group_clauses.equal(&other.group_clauses)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.op.equal_key(out);
+        self.all.equal_key(out);
+        self.larg.equal_key(out);
+        self.rarg.equal_key(out);
+        self.col_types.equal_key(out);
+        self.col_typmods.equal_key(out);
+        self.col_collations.equal_key(out);
+        self.group_clauses.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::ReturnStmt {
     fn equal(&self, other: &Self) -> bool {
         self.returnval.equal(&other.returnval)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.returnval.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -1912,6 +4911,15 @@ impl Equal for protobuf::PlAssignStmt {
             && self.nnames.equal(&other.nnames)
             && self.val.equal(&other.val)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.name.equal_key(out);
+        self.indirection.equal_key(out);
+        self.nnames.equal_key(out);
+        self.val.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::CreateSchemaStmt {
@@ -1921,6 +4929,15 @@ impl Equal for protobuf::CreateSchemaStmt {
             && self.schema_elts.equal(&other.schema_elts)
             && self.if_not_exists.equal(&other.if_not_exists)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.schemaname.equal_key(out);
+        self.authrole.equal_key(out);
+        self.schema_elts.equal_key(out);
+        self.if_not_exists.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::AlterTableStmt {
@@ -1929,6 +4946,15 @@ impl Equal for protobuf::AlterTableStmt {
             && self.cmds.equal(&other.cmds)
             && self.objtype.equal(&other.objtype)
             && self.missing_ok.equal(&other.missing_ok)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.relation.equal_key(out);
+        self.cmds.equal_key(out);
+        self.objtype.equal_key(out);
+        self.missing_ok.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -1943,6 +4969,19 @@ impl Equal for protobuf::AlterTableCmd {
             && self.missing_ok.equal(&other.missing_ok)
             && self.recurse.equal(&other.recurse)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.subtype.equal_key(out);
+        self.name.equal_key(out);
+        self.num.equal_key(out);
+        self.newowner.equal_key(out);
+        self.def.equal_key(out);
+        self.behavior.equal_key(out);
+        self.missing_ok.equal_key(out);
+        self.recurse.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::AtAlterConstraint {
@@ -1956,17 +4995,43 @@ impl Equal for protobuf::AtAlterConstraint {
             && self.alter_inheritability.equal(&other.alter_inheritability)
             && self.noinherit.equal(&other.noinherit)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.conname.equal_key(out);
+        self.alter_enforceability.equal_key(out);
+        self.is_enforced.equal_key(out);
+        self.alter_deferrability.equal_key(out);
+        self.deferrable.equal_key(out);
+        self.initdeferred.equal_key(out);
+        self.alter_inheritability.equal_key(out);
+        self.noinherit.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::ReplicaIdentityStmt {
     fn equal(&self, other: &Self) -> bool {
         self.identity_type.equal(&other.identity_type) && self.name.equal(&other.name)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.identity_type.equal_key(out);
+        self.name.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::AlterCollationStmt {
     fn equal(&self, other: &Self) -> bool {
         self.collname.equal(&other.collname)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.collname.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -1978,6 +5043,17 @@ impl Equal for protobuf::AlterDomainStmt {
             && self.def.equal(&other.def)
             && self.behavior.equal(&other.behavior)
             && self.missing_ok.equal(&other.missing_ok)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.subtype.equal_key(out);
+        self.type_name.equal_key(out);
+        self.name.equal_key(out);
+        self.def.equal_key(out);
+        self.behavior.equal_key(out);
+        self.missing_ok.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -1993,6 +5069,20 @@ impl Equal for protobuf::GrantStmt {
             && self.grantor.equal(&other.grantor)
             && self.behavior.equal(&other.behavior)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.is_grant.equal_key(out);
+        self.targtype.equal_key(out);
+        self.objtype.equal_key(out);
+        self.objects.equal_key(out);
+        self.privileges.equal_key(out);
+        self.grantees.equal_key(out);
+        self.grant_option.equal_key(out);
+        self.grantor.equal_key(out);
+        self.behavior.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::ObjectWithArgs {
@@ -2002,11 +5092,27 @@ impl Equal for protobuf::ObjectWithArgs {
             && self.objfuncargs.equal(&other.objfuncargs)
             && self.args_unspecified.equal(&other.args_unspecified)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.objname.equal_key(out);
+        self.objargs.equal_key(out);
+        self.objfuncargs.equal_key(out);
+        self.args_unspecified.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::AccessPriv {
     fn equal(&self, other: &Self) -> bool {
         self.priv_name.equal(&other.priv_name) && self.cols.equal(&other.cols)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.priv_name.equal_key(out);
+        self.cols.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -2019,11 +5125,29 @@ impl Equal for protobuf::GrantRoleStmt {
             && self.grantor.equal(&other.grantor)
             && self.behavior.equal(&other.behavior)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.granted_roles.equal_key(out);
+        self.grantee_roles.equal_key(out);
+        self.is_grant.equal_key(out);
+        self.opt.equal_key(out);
+        self.grantor.equal_key(out);
+        self.behavior.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::AlterDefaultPrivilegesStmt {
     fn equal(&self, other: &Self) -> bool {
         self.options.equal(&other.options) && self.action.equal(&other.action)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.options.equal_key(out);
+        self.action.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -2038,6 +5162,19 @@ impl Equal for protobuf::CopyStmt {
             && self.options.equal(&other.options)
             && self.where_clause.equal(&other.where_clause)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.relation.equal_key(out);
+        self.query.equal_key(out);
+        self.attlist.equal_key(out);
+        self.is_from.equal_key(out);
+        self.is_program.equal_key(out);
+        self.filename.equal_key(out);
+        self.options.equal_key(out);
+        self.where_clause.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::VariableSetStmt {
@@ -2048,11 +5185,27 @@ impl Equal for protobuf::VariableSetStmt {
             && self.jumble_args.equal(&other.jumble_args)
             && self.is_local.equal(&other.is_local)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.kind.equal_key(out);
+        self.name.equal_key(out);
+        self.args.equal_key(out);
+        self.jumble_args.equal_key(out);
+        self.is_local.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::VariableShowStmt {
     fn equal(&self, other: &Self) -> bool {
         self.name.equal(&other.name)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.name.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -2071,6 +5224,24 @@ impl Equal for protobuf::CreateStmt {
             && self.tablespacename.equal(&other.tablespacename)
             && self.access_method.equal(&other.access_method)
             && self.if_not_exists.equal(&other.if_not_exists)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.relation.equal_key(out);
+        self.table_elts.equal_key(out);
+        self.inh_relations.equal_key(out);
+        self.partbound.equal_key(out);
+        self.partspec.equal_key(out);
+        self.of_typename.equal_key(out);
+        self.constraints.equal_key(out);
+        self.nnconstraints.equal_key(out);
+        self.options.equal_key(out);
+        self.oncommit.equal_key(out);
+        self.tablespacename.equal_key(out);
+        self.access_method.equal_key(out);
+        self.if_not_exists.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -2111,6 +5282,45 @@ impl Equal for protobuf::Constraint {
             && self.old_conpfeqop.equal(&other.old_conpfeqop)
             && self.old_pktable_oid.equal(&other.old_pktable_oid)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.contype.equal_key(out);
+        self.conname.equal_key(out);
+        self.deferrable.equal_key(out);
+        self.initdeferred.equal_key(out);
+        self.is_enforced.equal_key(out);
+        self.skip_validation.equal_key(out);
+        self.initially_valid.equal_key(out);
+        self.is_no_inherit.equal_key(out);
+        self.raw_expr.equal_key(out);
+        self.cooked_expr.equal_key(out);
+        self.generated_when.equal_key(out);
+        self.generated_kind.equal_key(out);
+        self.nulls_not_distinct.equal_key(out);
+        self.keys.equal_key(out);
+        self.without_overlaps.equal_key(out);
+        self.including.equal_key(out);
+        self.exclusions.equal_key(out);
+        self.options.equal_key(out);
+        self.indexname.equal_key(out);
+        self.indexspace.equal_key(out);
+        self.reset_default_tblspc.equal_key(out);
+        self.access_method.equal_key(out);
+        self.where_clause.equal_key(out);
+        self.pktable.equal_key(out);
+        self.fk_attrs.equal_key(out);
+        self.pk_attrs.equal_key(out);
+        self.fk_with_period.equal_key(out);
+        self.pk_with_period.equal_key(out);
+        self.fk_matchtype.equal_key(out);
+        self.fk_upd_action.equal_key(out);
+        self.fk_del_action.equal_key(out);
+        self.fk_del_set_cols.equal_key(out);
+        self.old_conpfeqop.equal_key(out);
+        self.old_pktable_oid.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::CreateTableSpaceStmt {
@@ -2120,11 +5330,27 @@ impl Equal for protobuf::CreateTableSpaceStmt {
             && self.location.equal(&other.location)
             && self.options.equal(&other.options)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.tablespacename.equal_key(out);
+        self.owner.equal_key(out);
+        self.location.equal_key(out);
+        self.options.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::DropTableSpaceStmt {
     fn equal(&self, other: &Self) -> bool {
         self.tablespacename.equal(&other.tablespacename) && self.missing_ok.equal(&other.missing_ok)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.tablespacename.equal_key(out);
+        self.missing_ok.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -2133,6 +5359,14 @@ impl Equal for protobuf::AlterTableSpaceOptionsStmt {
         self.tablespacename.equal(&other.tablespacename)
             && self.options.equal(&other.options)
             && self.is_reset.equal(&other.is_reset)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.tablespacename.equal_key(out);
+        self.options.equal_key(out);
+        self.is_reset.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -2144,6 +5378,16 @@ impl Equal for protobuf::AlterTableMoveAllStmt {
             && self.new_tablespacename.equal(&other.new_tablespacename)
             && self.nowait.equal(&other.nowait)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.orig_tablespacename.equal_key(out);
+        self.objtype.equal_key(out);
+        self.roles.equal_key(out);
+        self.new_tablespacename.equal_key(out);
+        self.nowait.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::CreateExtensionStmt {
@@ -2152,11 +5396,26 @@ impl Equal for protobuf::CreateExtensionStmt {
             && self.if_not_exists.equal(&other.if_not_exists)
             && self.options.equal(&other.options)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.extname.equal_key(out);
+        self.if_not_exists.equal_key(out);
+        self.options.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::AlterExtensionStmt {
     fn equal(&self, other: &Self) -> bool {
         self.extname.equal(&other.extname) && self.options.equal(&other.options)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.extname.equal_key(out);
+        self.options.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -2167,6 +5426,15 @@ impl Equal for protobuf::AlterExtensionContentsStmt {
             && self.objtype.equal(&other.objtype)
             && self.object.equal(&other.object)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.extname.equal_key(out);
+        self.action.equal_key(out);
+        self.objtype.equal_key(out);
+        self.object.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::CreateFdwStmt {
@@ -2175,6 +5443,14 @@ impl Equal for protobuf::CreateFdwStmt {
             && self.func_options.equal(&other.func_options)
             && self.options.equal(&other.options)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.fdwname.equal_key(out);
+        self.func_options.equal_key(out);
+        self.options.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::AlterFdwStmt {
@@ -2182,6 +5458,14 @@ impl Equal for protobuf::AlterFdwStmt {
         self.fdwname.equal(&other.fdwname)
             && self.func_options.equal(&other.func_options)
             && self.options.equal(&other.options)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.fdwname.equal_key(out);
+        self.func_options.equal_key(out);
+        self.options.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -2194,6 +5478,17 @@ impl Equal for protobuf::CreateForeignServerStmt {
             && self.if_not_exists.equal(&other.if_not_exists)
             && self.options.equal(&other.options)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.servername.equal_key(out);
+        self.servertype.equal_key(out);
+        self.version.equal_key(out);
+        self.fdwname.equal_key(out);
+        self.if_not_exists.equal_key(out);
+        self.options.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::AlterForeignServerStmt {
@@ -2203,6 +5498,15 @@ impl Equal for protobuf::AlterForeignServerStmt {
             && self.options.equal(&other.options)
             && self.has_version.equal(&other.has_version)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.servername.equal_key(out);
+        self.version.equal_key(out);
+        self.options.equal_key(out);
+        self.has_version.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::CreateForeignTableStmt {
@@ -2210,6 +5514,14 @@ impl Equal for protobuf::CreateForeignTableStmt {
         self.base_stmt.equal(&other.base_stmt)
             && self.servername.equal(&other.servername)
             && self.options.equal(&other.options)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.base_stmt.equal_key(out);
+        self.servername.equal_key(out);
+        self.options.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -2220,6 +5532,15 @@ impl Equal for protobuf::CreateUserMappingStmt {
             && self.if_not_exists.equal(&other.if_not_exists)
             && self.options.equal(&other.options)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.user.equal_key(out);
+        self.servername.equal_key(out);
+        self.if_not_exists.equal_key(out);
+        self.options.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::AlterUserMappingStmt {
@@ -2228,6 +5549,14 @@ impl Equal for protobuf::AlterUserMappingStmt {
             && self.servername.equal(&other.servername)
             && self.options.equal(&other.options)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.user.equal_key(out);
+        self.servername.equal_key(out);
+        self.options.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::DropUserMappingStmt {
@@ -2235,6 +5564,14 @@ impl Equal for protobuf::DropUserMappingStmt {
         self.user.equal(&other.user)
             && self.servername.equal(&other.servername)
             && self.missing_ok.equal(&other.missing_ok)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.user.equal_key(out);
+        self.servername.equal_key(out);
+        self.missing_ok.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -2246,6 +5583,17 @@ impl Equal for protobuf::ImportForeignSchemaStmt {
             && self.list_type.equal(&other.list_type)
             && self.table_list.equal(&other.table_list)
             && self.options.equal(&other.options)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.server_name.equal_key(out);
+        self.remote_schema.equal_key(out);
+        self.local_schema.equal_key(out);
+        self.list_type.equal_key(out);
+        self.table_list.equal_key(out);
+        self.options.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -2259,6 +5607,18 @@ impl Equal for protobuf::CreatePolicyStmt {
             && self.qual.equal(&other.qual)
             && self.with_check.equal(&other.with_check)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.policy_name.equal_key(out);
+        self.table.equal_key(out);
+        self.cmd_name.equal_key(out);
+        self.permissive.equal_key(out);
+        self.roles.equal_key(out);
+        self.qual.equal_key(out);
+        self.with_check.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::AlterPolicyStmt {
@@ -2269,6 +5629,16 @@ impl Equal for protobuf::AlterPolicyStmt {
             && self.qual.equal(&other.qual)
             && self.with_check.equal(&other.with_check)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.policy_name.equal_key(out);
+        self.table.equal_key(out);
+        self.roles.equal_key(out);
+        self.qual.equal_key(out);
+        self.with_check.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::CreateAmStmt {
@@ -2276,6 +5646,14 @@ impl Equal for protobuf::CreateAmStmt {
         self.amname.equal(&other.amname)
             && self.handler_name.equal(&other.handler_name)
             && self.amtype.equal(&other.amtype)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.amname.equal_key(out);
+        self.handler_name.equal_key(out);
+        self.amtype.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -2297,6 +5675,26 @@ impl Equal for protobuf::CreateTrigStmt {
             && self.initdeferred.equal(&other.initdeferred)
             && self.constrrel.equal(&other.constrrel)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.replace.equal_key(out);
+        self.isconstraint.equal_key(out);
+        self.trigname.equal_key(out);
+        self.relation.equal_key(out);
+        self.funcname.equal_key(out);
+        self.args.equal_key(out);
+        self.row.equal_key(out);
+        self.timing.equal_key(out);
+        self.events.equal_key(out);
+        self.columns.equal_key(out);
+        self.when_clause.equal_key(out);
+        self.transition_rels.equal_key(out);
+        self.deferrable.equal_key(out);
+        self.initdeferred.equal_key(out);
+        self.constrrel.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::CreateEventTrigStmt {
@@ -2306,11 +5704,27 @@ impl Equal for protobuf::CreateEventTrigStmt {
             && self.whenclause.equal(&other.whenclause)
             && self.funcname.equal(&other.funcname)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.trigname.equal_key(out);
+        self.eventname.equal_key(out);
+        self.whenclause.equal_key(out);
+        self.funcname.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::AlterEventTrigStmt {
     fn equal(&self, other: &Self) -> bool {
         self.trigname.equal(&other.trigname) && self.tgenabled.equal(&other.tgenabled)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.trigname.equal_key(out);
+        self.tgenabled.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -2323,6 +5737,17 @@ impl Equal for protobuf::CreatePLangStmt {
             && self.plvalidator.equal(&other.plvalidator)
             && self.pltrusted.equal(&other.pltrusted)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.replace.equal_key(out);
+        self.plname.equal_key(out);
+        self.plhandler.equal_key(out);
+        self.plinline.equal_key(out);
+        self.plvalidator.equal_key(out);
+        self.pltrusted.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::CreateRoleStmt {
@@ -2330,6 +5755,14 @@ impl Equal for protobuf::CreateRoleStmt {
         self.stmt_type.equal(&other.stmt_type)
             && self.role.equal(&other.role)
             && self.options.equal(&other.options)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.stmt_type.equal_key(out);
+        self.role.equal_key(out);
+        self.options.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -2339,6 +5772,14 @@ impl Equal for protobuf::AlterRoleStmt {
             && self.options.equal(&other.options)
             && self.action.equal(&other.action)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.role.equal_key(out);
+        self.options.equal_key(out);
+        self.action.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::AlterRoleSetStmt {
@@ -2347,11 +5788,26 @@ impl Equal for protobuf::AlterRoleSetStmt {
             && self.database.equal(&other.database)
             && self.setstmt.equal(&other.setstmt)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.role.equal_key(out);
+        self.database.equal_key(out);
+        self.setstmt.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::DropRoleStmt {
     fn equal(&self, other: &Self) -> bool {
         self.roles.equal(&other.roles) && self.missing_ok.equal(&other.missing_ok)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.roles.equal_key(out);
+        self.missing_ok.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -2363,6 +5819,16 @@ impl Equal for protobuf::CreateSeqStmt {
             && self.for_identity.equal(&other.for_identity)
             && self.if_not_exists.equal(&other.if_not_exists)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.sequence.equal_key(out);
+        self.options.equal_key(out);
+        self.owner_id.equal_key(out);
+        self.for_identity.equal_key(out);
+        self.if_not_exists.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::AlterSeqStmt {
@@ -2371,6 +5837,15 @@ impl Equal for protobuf::AlterSeqStmt {
             && self.options.equal(&other.options)
             && self.for_identity.equal(&other.for_identity)
             && self.missing_ok.equal(&other.missing_ok)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.sequence.equal_key(out);
+        self.options.equal_key(out);
+        self.for_identity.equal_key(out);
+        self.missing_ok.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -2384,6 +5859,18 @@ impl Equal for protobuf::DefineStmt {
             && self.if_not_exists.equal(&other.if_not_exists)
             && self.replace.equal(&other.replace)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.kind.equal_key(out);
+        self.oldstyle.equal_key(out);
+        self.defnames.equal_key(out);
+        self.args.equal_key(out);
+        self.definition.equal_key(out);
+        self.if_not_exists.equal_key(out);
+        self.replace.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::CreateDomainStmt {
@@ -2392,6 +5879,15 @@ impl Equal for protobuf::CreateDomainStmt {
             && self.type_name.equal(&other.type_name)
             && self.coll_clause.equal(&other.coll_clause)
             && self.constraints.equal(&other.constraints)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.domainname.equal_key(out);
+        self.type_name.equal_key(out);
+        self.coll_clause.equal_key(out);
+        self.constraints.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -2404,6 +5900,17 @@ impl Equal for protobuf::CreateOpClassStmt {
             && self.items.equal(&other.items)
             && self.is_default.equal(&other.is_default)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.opclassname.equal_key(out);
+        self.opfamilyname.equal_key(out);
+        self.amname.equal_key(out);
+        self.datatype.equal_key(out);
+        self.items.equal_key(out);
+        self.is_default.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::CreateOpClassItem {
@@ -2415,11 +5922,29 @@ impl Equal for protobuf::CreateOpClassItem {
             && self.class_args.equal(&other.class_args)
             && self.storedtype.equal(&other.storedtype)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.itemtype.equal_key(out);
+        self.name.equal_key(out);
+        self.number.equal_key(out);
+        self.order_family.equal_key(out);
+        self.class_args.equal_key(out);
+        self.storedtype.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::CreateOpFamilyStmt {
     fn equal(&self, other: &Self) -> bool {
         self.opfamilyname.equal(&other.opfamilyname) && self.amname.equal(&other.amname)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.opfamilyname.equal_key(out);
+        self.amname.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -2429,6 +5954,15 @@ impl Equal for protobuf::AlterOpFamilyStmt {
             && self.amname.equal(&other.amname)
             && self.is_drop.equal(&other.is_drop)
             && self.items.equal(&other.items)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.opfamilyname.equal_key(out);
+        self.amname.equal_key(out);
+        self.is_drop.equal_key(out);
+        self.items.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -2440,6 +5974,16 @@ impl Equal for protobuf::DropStmt {
             && self.missing_ok.equal(&other.missing_ok)
             && self.concurrent.equal(&other.concurrent)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.objects.equal_key(out);
+        self.remove_type.equal_key(out);
+        self.behavior.equal_key(out);
+        self.missing_ok.equal_key(out);
+        self.concurrent.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::TruncateStmt {
@@ -2448,6 +5992,14 @@ impl Equal for protobuf::TruncateStmt {
             && self.restart_seqs.equal(&other.restart_seqs)
             && self.behavior.equal(&other.behavior)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.relations.equal_key(out);
+        self.restart_seqs.equal_key(out);
+        self.behavior.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::CommentStmt {
@@ -2455,6 +6007,14 @@ impl Equal for protobuf::CommentStmt {
         self.objtype.equal(&other.objtype)
             && self.object.equal(&other.object)
             && self.comment.equal(&other.comment)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.objtype.equal_key(out);
+        self.object.equal_key(out);
+        self.comment.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -2465,6 +6025,15 @@ impl Equal for protobuf::SecLabelStmt {
             && self.provider.equal(&other.provider)
             && self.label.equal(&other.label)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.objtype.equal_key(out);
+        self.object.equal_key(out);
+        self.provider.equal_key(out);
+        self.label.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::DeclareCursorStmt {
@@ -2473,11 +6042,25 @@ impl Equal for protobuf::DeclareCursorStmt {
             && self.options.equal(&other.options)
             && self.query.equal(&other.query)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.portalname.equal_key(out);
+        self.options.equal_key(out);
+        self.query.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::ClosePortalStmt {
     fn equal(&self, other: &Self) -> bool {
         self.portalname.equal(&other.portalname)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.portalname.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -2487,6 +6070,15 @@ impl Equal for protobuf::FetchStmt {
             && self.how_many.equal(&other.how_many)
             && self.portalname.equal(&other.portalname)
             && self.ismove.equal(&other.ismove)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.direction.equal_key(out);
+        self.how_many.equal_key(out);
+        self.portalname.equal_key(out);
+        self.ismove.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -2522,6 +6114,36 @@ impl Equal for protobuf::IndexStmt {
             && self.if_not_exists.equal(&other.if_not_exists)
             && self.reset_default_tblspc.equal(&other.reset_default_tblspc)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.idxname.equal_key(out);
+        self.relation.equal_key(out);
+        self.access_method.equal_key(out);
+        self.table_space.equal_key(out);
+        self.index_params.equal_key(out);
+        self.index_including_params.equal_key(out);
+        self.options.equal_key(out);
+        self.where_clause.equal_key(out);
+        self.exclude_op_names.equal_key(out);
+        self.idxcomment.equal_key(out);
+        self.index_oid.equal_key(out);
+        self.old_number.equal_key(out);
+        self.old_create_subid.equal_key(out);
+        self.old_first_relfilelocator_subid.equal_key(out);
+        self.unique.equal_key(out);
+        self.nulls_not_distinct.equal_key(out);
+        self.primary.equal_key(out);
+        self.isconstraint.equal_key(out);
+        self.iswithoutoverlaps.equal_key(out);
+        self.deferrable.equal_key(out);
+        self.initdeferred.equal_key(out);
+        self.transformed.equal_key(out);
+        self.concurrent.equal_key(out);
+        self.if_not_exists.equal_key(out);
+        self.reset_default_tblspc.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::CreateStatsStmt {
@@ -2534,11 +6156,30 @@ impl Equal for protobuf::CreateStatsStmt {
             && self.transformed.equal(&other.transformed)
             && self.if_not_exists.equal(&other.if_not_exists)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.defnames.equal_key(out);
+        self.stat_types.equal_key(out);
+        self.exprs.equal_key(out);
+        self.relations.equal_key(out);
+        self.stxcomment.equal_key(out);
+        self.transformed.equal_key(out);
+        self.if_not_exists.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::StatsElem {
     fn equal(&self, other: &Self) -> bool {
         self.name.equal(&other.name) && self.expr.equal(&other.expr)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.name.equal_key(out);
+        self.expr.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -2547,6 +6188,14 @@ impl Equal for protobuf::AlterStatsStmt {
         self.defnames.equal(&other.defnames)
             && self.stxstattarget.equal(&other.stxstattarget)
             && self.missing_ok.equal(&other.missing_ok)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.defnames.equal_key(out);
+        self.stxstattarget.equal_key(out);
+        self.missing_ok.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -2560,6 +6209,18 @@ impl Equal for protobuf::CreateFunctionStmt {
             && self.options.equal(&other.options)
             && self.sql_body.equal(&other.sql_body)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.is_procedure.equal_key(out);
+        self.replace.equal_key(out);
+        self.funcname.equal_key(out);
+        self.parameters.equal_key(out);
+        self.return_type.equal_key(out);
+        self.options.equal_key(out);
+        self.sql_body.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::FunctionParameter {
@@ -2569,6 +6230,15 @@ impl Equal for protobuf::FunctionParameter {
             && self.mode.equal(&other.mode)
             && self.defexpr.equal(&other.defexpr)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.name.equal_key(out);
+        self.arg_type.equal_key(out);
+        self.mode.equal_key(out);
+        self.defexpr.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::AlterFunctionStmt {
@@ -2577,11 +6247,25 @@ impl Equal for protobuf::AlterFunctionStmt {
             && self.func.equal(&other.func)
             && self.actions.equal(&other.actions)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.objtype.equal_key(out);
+        self.func.equal_key(out);
+        self.actions.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::DoStmt {
     fn equal(&self, other: &Self) -> bool {
         self.args.equal(&other.args)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.args.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -2592,6 +6276,15 @@ impl Equal for protobuf::InlineCodeBlock {
             && self.lang_is_trusted.equal(&other.lang_is_trusted)
             && self.atomic.equal(&other.atomic)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.source_text.equal_key(out);
+        self.lang_oid.equal_key(out);
+        self.lang_is_trusted.equal_key(out);
+        self.atomic.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::CallStmt {
@@ -2600,11 +6293,25 @@ impl Equal for protobuf::CallStmt {
             && self.funcexpr.equal(&other.funcexpr)
             && self.outargs.equal(&other.outargs)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.funccall.equal_key(out);
+        self.funcexpr.equal_key(out);
+        self.outargs.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::CallContext {
     fn equal(&self, other: &Self) -> bool {
         self.atomic.equal(&other.atomic)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.atomic.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -2619,6 +6326,19 @@ impl Equal for protobuf::RenameStmt {
             && self.behavior.equal(&other.behavior)
             && self.missing_ok.equal(&other.missing_ok)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.rename_type.equal_key(out);
+        self.relation_type.equal_key(out);
+        self.relation.equal_key(out);
+        self.object.equal_key(out);
+        self.subname.equal_key(out);
+        self.newname.equal_key(out);
+        self.behavior.equal_key(out);
+        self.missing_ok.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::AlterObjectDependsStmt {
@@ -2628,6 +6348,16 @@ impl Equal for protobuf::AlterObjectDependsStmt {
             && self.object.equal(&other.object)
             && self.extname.equal(&other.extname)
             && self.remove.equal(&other.remove)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.object_type.equal_key(out);
+        self.relation.equal_key(out);
+        self.object.equal_key(out);
+        self.extname.equal_key(out);
+        self.remove.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -2639,6 +6369,16 @@ impl Equal for protobuf::AlterObjectSchemaStmt {
             && self.newschema.equal(&other.newschema)
             && self.missing_ok.equal(&other.missing_ok)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.object_type.equal_key(out);
+        self.relation.equal_key(out);
+        self.object.equal_key(out);
+        self.newschema.equal_key(out);
+        self.missing_ok.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::AlterOwnerStmt {
@@ -2648,17 +6388,40 @@ impl Equal for protobuf::AlterOwnerStmt {
             && self.object.equal(&other.object)
             && self.newowner.equal(&other.newowner)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.object_type.equal_key(out);
+        self.relation.equal_key(out);
+        self.object.equal_key(out);
+        self.newowner.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::AlterOperatorStmt {
     fn equal(&self, other: &Self) -> bool {
         self.opername.equal(&other.opername) && self.options.equal(&other.options)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.opername.equal_key(out);
+        self.options.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::AlterTypeStmt {
     fn equal(&self, other: &Self) -> bool {
         self.type_name.equal(&other.type_name) && self.options.equal(&other.options)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.type_name.equal_key(out);
+        self.options.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -2672,11 +6435,30 @@ impl Equal for protobuf::RuleStmt {
             && self.actions.equal(&other.actions)
             && self.replace.equal(&other.replace)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.relation.equal_key(out);
+        self.rulename.equal_key(out);
+        self.where_clause.equal_key(out);
+        self.event.equal_key(out);
+        self.instead.equal_key(out);
+        self.actions.equal_key(out);
+        self.replace.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::NotifyStmt {
     fn equal(&self, other: &Self) -> bool {
         self.conditionname.equal(&other.conditionname) && self.payload.equal(&other.payload)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.conditionname.equal_key(out);
+        self.payload.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -2684,11 +6466,23 @@ impl Equal for protobuf::ListenStmt {
     fn equal(&self, other: &Self) -> bool {
         self.conditionname.equal(&other.conditionname)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.conditionname.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::UnlistenStmt {
     fn equal(&self, other: &Self) -> bool {
         self.conditionname.equal(&other.conditionname)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.conditionname.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -2700,11 +6494,28 @@ impl Equal for protobuf::TransactionStmt {
             && self.gid.equal(&other.gid)
             && self.chain.equal(&other.chain)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.kind.equal_key(out);
+        self.options.equal_key(out);
+        self.savepoint_name.equal_key(out);
+        self.gid.equal_key(out);
+        self.chain.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::CompositeTypeStmt {
     fn equal(&self, other: &Self) -> bool {
         self.typevar.equal(&other.typevar) && self.coldeflist.equal(&other.coldeflist)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.typevar.equal_key(out);
+        self.coldeflist.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -2712,11 +6523,25 @@ impl Equal for protobuf::CreateEnumStmt {
     fn equal(&self, other: &Self) -> bool {
         self.type_name.equal(&other.type_name) && self.vals.equal(&other.vals)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.type_name.equal_key(out);
+        self.vals.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::CreateRangeStmt {
     fn equal(&self, other: &Self) -> bool {
         self.type_name.equal(&other.type_name) && self.params.equal(&other.params)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.type_name.equal_key(out);
+        self.params.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -2731,6 +6556,17 @@ impl Equal for protobuf::AlterEnumStmt {
                 .skip_if_new_val_exists
                 .equal(&other.skip_if_new_val_exists)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.type_name.equal_key(out);
+        self.old_val.equal_key(out);
+        self.new_val.equal_key(out);
+        self.new_val_neighbor.equal_key(out);
+        self.new_val_is_after.equal_key(out);
+        self.skip_if_new_val_exists.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::ViewStmt {
@@ -2742,11 +6578,28 @@ impl Equal for protobuf::ViewStmt {
             && self.options.equal(&other.options)
             && self.with_check_option.equal(&other.with_check_option)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.view.equal_key(out);
+        self.aliases.equal_key(out);
+        self.query.equal_key(out);
+        self.replace.equal_key(out);
+        self.options.equal_key(out);
+        self.with_check_option.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::LoadStmt {
     fn equal(&self, other: &Self) -> bool {
         self.filename.equal(&other.filename)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.filename.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -2754,11 +6607,25 @@ impl Equal for protobuf::CreatedbStmt {
     fn equal(&self, other: &Self) -> bool {
         self.dbname.equal(&other.dbname) && self.options.equal(&other.options)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.dbname.equal_key(out);
+        self.options.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::AlterDatabaseStmt {
     fn equal(&self, other: &Self) -> bool {
         self.dbname.equal(&other.dbname) && self.options.equal(&other.options)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.dbname.equal_key(out);
+        self.options.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -2766,11 +6633,24 @@ impl Equal for protobuf::AlterDatabaseRefreshCollStmt {
     fn equal(&self, other: &Self) -> bool {
         self.dbname.equal(&other.dbname)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.dbname.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::AlterDatabaseSetStmt {
     fn equal(&self, other: &Self) -> bool {
         self.dbname.equal(&other.dbname) && self.setstmt.equal(&other.setstmt)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.dbname.equal_key(out);
+        self.setstmt.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -2780,11 +6660,25 @@ impl Equal for protobuf::DropdbStmt {
             && self.missing_ok.equal(&other.missing_ok)
             && self.options.equal(&other.options)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.dbname.equal_key(out);
+        self.missing_ok.equal_key(out);
+        self.options.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::AlterSystemStmt {
     fn equal(&self, other: &Self) -> bool {
         self.setstmt.equal(&other.setstmt)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.setstmt.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -2794,6 +6688,14 @@ impl Equal for protobuf::ClusterStmt {
             && self.indexname.equal(&other.indexname)
             && self.params.equal(&other.params)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.relation.equal_key(out);
+        self.indexname.equal_key(out);
+        self.params.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::VacuumStmt {
@@ -2801,6 +6703,14 @@ impl Equal for protobuf::VacuumStmt {
         self.options.equal(&other.options)
             && self.rels.equal(&other.rels)
             && self.is_vacuumcmd.equal(&other.is_vacuumcmd)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.options.equal_key(out);
+        self.rels.equal_key(out);
+        self.is_vacuumcmd.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -2810,11 +6720,26 @@ impl Equal for protobuf::VacuumRelation {
             && self.oid.equal(&other.oid)
             && self.va_cols.equal(&other.va_cols)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.relation.equal_key(out);
+        self.oid.equal_key(out);
+        self.va_cols.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::ExplainStmt {
     fn equal(&self, other: &Self) -> bool {
         self.query.equal(&other.query) && self.options.equal(&other.options)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.query.equal_key(out);
+        self.options.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -2826,6 +6751,16 @@ impl Equal for protobuf::CreateTableAsStmt {
             && self.is_select_into.equal(&other.is_select_into)
             && self.if_not_exists.equal(&other.if_not_exists)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.query.equal_key(out);
+        self.into.equal_key(out);
+        self.objtype.equal_key(out);
+        self.is_select_into.equal_key(out);
+        self.if_not_exists.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::RefreshMatViewStmt {
@@ -2834,17 +6769,36 @@ impl Equal for protobuf::RefreshMatViewStmt {
             && self.skip_data.equal(&other.skip_data)
             && self.relation.equal(&other.relation)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.concurrent.equal_key(out);
+        self.skip_data.equal_key(out);
+        self.relation.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::CheckPointStmt {
     fn equal(&self, other: &Self) -> bool {
         true
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::DiscardStmt {
     fn equal(&self, other: &Self) -> bool {
         self.target.equal(&other.target)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.target.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -2854,11 +6808,26 @@ impl Equal for protobuf::LockStmt {
             && self.mode.equal(&other.mode)
             && self.nowait.equal(&other.nowait)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.relations.equal_key(out);
+        self.mode.equal_key(out);
+        self.nowait.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::ConstraintsSetStmt {
     fn equal(&self, other: &Self) -> bool {
         self.constraints.equal(&other.constraints) && self.deferred.equal(&other.deferred)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.constraints.equal_key(out);
+        self.deferred.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -2868,6 +6837,15 @@ impl Equal for protobuf::ReindexStmt {
             && self.relation.equal(&other.relation)
             && self.name.equal(&other.name)
             && self.params.equal(&other.params)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.kind.equal_key(out);
+        self.relation.equal_key(out);
+        self.name.equal_key(out);
+        self.params.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -2879,6 +6857,16 @@ impl Equal for protobuf::CreateConversionStmt {
             && self.func_name.equal(&other.func_name)
             && self.def.equal(&other.def)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.conversion_name.equal_key(out);
+        self.for_encoding_name.equal_key(out);
+        self.to_encoding_name.equal_key(out);
+        self.func_name.equal_key(out);
+        self.def.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::CreateCastStmt {
@@ -2888,6 +6876,16 @@ impl Equal for protobuf::CreateCastStmt {
             && self.func.equal(&other.func)
             && self.context.equal(&other.context)
             && self.inout.equal(&other.inout)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.sourcetype.equal_key(out);
+        self.targettype.equal_key(out);
+        self.func.equal_key(out);
+        self.context.equal_key(out);
+        self.inout.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -2899,6 +6897,16 @@ impl Equal for protobuf::CreateTransformStmt {
             && self.fromsql.equal(&other.fromsql)
             && self.tosql.equal(&other.tosql)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.replace.equal_key(out);
+        self.type_name.equal_key(out);
+        self.lang.equal_key(out);
+        self.fromsql.equal_key(out);
+        self.tosql.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::PrepareStmt {
@@ -2907,11 +6915,26 @@ impl Equal for protobuf::PrepareStmt {
             && self.argtypes.equal(&other.argtypes)
             && self.query.equal(&other.query)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.name.equal_key(out);
+        self.argtypes.equal_key(out);
+        self.query.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::ExecuteStmt {
     fn equal(&self, other: &Self) -> bool {
         self.name.equal(&other.name) && self.params.equal(&other.params)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.name.equal_key(out);
+        self.params.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -2919,11 +6942,25 @@ impl Equal for protobuf::DeallocateStmt {
     fn equal(&self, other: &Self) -> bool {
         self.name.equal(&other.name) && self.isall.equal(&other.isall)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.name.equal_key(out);
+        self.isall.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::DropOwnedStmt {
     fn equal(&self, other: &Self) -> bool {
         self.roles.equal(&other.roles) && self.behavior.equal(&other.behavior)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.roles.equal_key(out);
+        self.behavior.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -2931,11 +6968,25 @@ impl Equal for protobuf::ReassignOwnedStmt {
     fn equal(&self, other: &Self) -> bool {
         self.roles.equal(&other.roles) && self.newrole.equal(&other.newrole)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.roles.equal_key(out);
+        self.newrole.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::AlterTsDictionaryStmt {
     fn equal(&self, other: &Self) -> bool {
         self.dictname.equal(&other.dictname) && self.options.equal(&other.options)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.dictname.equal_key(out);
+        self.options.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -2949,6 +7000,18 @@ impl Equal for protobuf::AlterTsConfigurationStmt {
             && self.replace.equal(&other.replace)
             && self.missing_ok.equal(&other.missing_ok)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.kind.equal_key(out);
+        self.cfgname.equal_key(out);
+        self.tokentype.equal_key(out);
+        self.dicts.equal_key(out);
+        self.r#override.equal_key(out);
+        self.replace.equal_key(out);
+        self.missing_ok.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::PublicationTable {
@@ -2956,6 +7019,14 @@ impl Equal for protobuf::PublicationTable {
         self.relation.equal(&other.relation)
             && self.where_clause.equal(&other.where_clause)
             && self.columns.equal(&other.columns)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.relation.equal_key(out);
+        self.where_clause.equal_key(out);
+        self.columns.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -2965,6 +7036,14 @@ impl Equal for protobuf::PublicationObjSpec {
             && self.name.equal(&other.name)
             && self.pubtable.equal(&other.pubtable)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.pubobjtype.equal_key(out);
+        self.name.equal_key(out);
+        self.pubtable.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::CreatePublicationStmt {
@@ -2973,6 +7052,15 @@ impl Equal for protobuf::CreatePublicationStmt {
             && self.options.equal(&other.options)
             && self.pubobjects.equal(&other.pubobjects)
             && self.for_all_tables.equal(&other.for_all_tables)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.pubname.equal_key(out);
+        self.options.equal_key(out);
+        self.pubobjects.equal_key(out);
+        self.for_all_tables.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -2984,6 +7072,16 @@ impl Equal for protobuf::AlterPublicationStmt {
             && self.for_all_tables.equal(&other.for_all_tables)
             && self.action.equal(&other.action)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.pubname.equal_key(out);
+        self.options.equal_key(out);
+        self.pubobjects.equal_key(out);
+        self.for_all_tables.equal_key(out);
+        self.action.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::CreateSubscriptionStmt {
@@ -2992,6 +7090,15 @@ impl Equal for protobuf::CreateSubscriptionStmt {
             && self.conninfo.equal(&other.conninfo)
             && self.publication.equal(&other.publication)
             && self.options.equal(&other.options)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.subname.equal_key(out);
+        self.conninfo.equal_key(out);
+        self.publication.equal_key(out);
+        self.options.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -3003,6 +7110,16 @@ impl Equal for protobuf::AlterSubscriptionStmt {
             && self.publication.equal(&other.publication)
             && self.options.equal(&other.options)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.kind.equal_key(out);
+        self.subname.equal_key(out);
+        self.conninfo.equal_key(out);
+        self.publication.equal_key(out);
+        self.options.equal_key(out);
+        out.push('}');
+    }
 }
 
 impl Equal for protobuf::DropSubscriptionStmt {
@@ -3010,6 +7127,14 @@ impl Equal for protobuf::DropSubscriptionStmt {
         self.subname.equal(&other.subname)
             && self.missing_ok.equal(&other.missing_ok)
             && self.behavior.equal(&other.behavior)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.subname.equal_key(out);
+        self.missing_ok.equal_key(out);
+        self.behavior.equal_key(out);
+        out.push('}');
     }
 }
 
@@ -3019,5 +7144,14 @@ impl Equal for protobuf::ScanToken {
             && self.end.equal(&other.end)
             && self.token.equal(&other.token)
             && self.keyword_kind.equal(&other.keyword_kind)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.start.equal_key(out);
+        self.end.equal_key(out);
+        self.token.equal_key(out);
+        self.keyword_kind.equal_key(out);
+        out.push('}');
     }
 }
