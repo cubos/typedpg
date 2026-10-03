@@ -278,3 +278,58 @@ fn implicit_row_in_grouping_set_groups_its_members() {
         .unwrap();
     assert_cols(&s, vec![c("region", text()), c("product", text())]);
 }
+
+/// A cast to the column's own type and typmod is no coercion
+/// (`coerce_type` / `coerce_type_typmod` return their input): grouping by
+/// it groups by the column, which a grouping set can then leave out.
+#[test]
+fn noop_cast_groups_by_the_column() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE tc (a int NOT NULL, b bigint NOT NULL, v varchar(5) NOT NULL, \
+         n numeric(10,2) NOT NULL);",
+    )
+    .unwrap();
+    for (sql, col, ty) in [
+        ("SELECT a FROM tc GROUP BY a::int", "a", int4()),
+        ("SELECT a FROM tc GROUP BY CAST(a AS integer)", "a", int4()),
+        ("SELECT a FROM tc GROUP BY a::int::int4", "a", int4()),
+        ("SELECT b FROM tc GROUP BY b::int8", "b", int8()),
+        ("SELECT v FROM tc GROUP BY v::varchar(5)", "v", varchar_n(5)),
+        (
+            "SELECT n FROM tc GROUP BY n::numeric(10,2)",
+            "n",
+            numeric_ps(10, 2),
+        ),
+    ] {
+        let s = db.analyze(sql).unwrap();
+        assert_cols(&s, vec![c(col, ty)]);
+    }
+    // The column is NULL in the rows of a set leaving the cast out.
+    let s = db
+        .analyze("SELECT a, a::int AS x, grouping(a::int) AS g FROM tc GROUP BY ROLLUP (a::int)")
+        .unwrap();
+    assert_cols(&s, vec![cn("a", int4()), cn("x", int4()), c("g", int4())]);
+    let s = db
+        .analyze("SELECT a, grouping(a) AS g FROM tc GROUP BY CUBE (a::int)")
+        .unwrap();
+    assert_cols(&s, vec![cn("a", int4()), c("g", int4())]);
+    let s = db
+        .analyze("SELECT a::int AS x, grouping(a::int) AS g FROM tc GROUP BY ROLLUP (a)")
+        .unwrap();
+    assert_cols(&s, vec![cn("x", int4()), c("g", int4())]);
+    // A cast changing the type or the typmod is a coercion: an expression.
+    for (sql, col) in [
+        ("SELECT a FROM tc GROUP BY a::int8", "tc.a"),
+        ("SELECT v FROM tc GROUP BY v::varchar", "tc.v"),
+        ("SELECT n FROM tc GROUP BY n::numeric(10,3)", "tc.n"),
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::GroupingError(_),
+            &format!(
+                "column \"{col}\" must appear in the GROUP BY clause or be used in an aggregate function"
+            )
+        );
+    }
+}
