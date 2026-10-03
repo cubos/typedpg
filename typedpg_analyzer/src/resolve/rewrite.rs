@@ -24,7 +24,7 @@ pub(crate) enum DmlEvent {
 }
 
 impl DmlEvent {
-    fn cmd_type(self) -> CmdType {
+    pub(crate) fn cmd_type(self) -> CmdType {
         match self {
             DmlEvent::Insert => CmdType::CmdInsert,
             DmlEvent::Update => CmdType::CmdUpdate,
@@ -32,11 +32,35 @@ impl DmlEvent {
         }
     }
 
-    fn trigger_bit(self) -> i32 {
+    pub(crate) fn trigger_bit(self) -> i32 {
         match self {
             DmlEvent::Insert => TRIGGER_TYPE_INSERT,
             DmlEvent::Update => TRIGGER_TYPE_UPDATE,
             DmlEvent::Delete => TRIGGER_TYPE_DELETE,
+        }
+    }
+}
+
+/// An INSERT's `OVERRIDING` clause.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Overriding {
+    #[default]
+    NotSet,
+    /// `OVERRIDING USER VALUE`: the values given for identity columns are
+    /// discarded in favour of the sequence (rewriteTargetListIU).
+    UserValue,
+    /// `OVERRIDING SYSTEM VALUE`: a GENERATED ALWAYS identity column takes
+    /// the value given.
+    SystemValue,
+}
+
+impl Overriding {
+    /// The parse tree's `OverridingKind`.
+    pub(crate) fn from_kind(kind: i32) -> Self {
+        match protobuf::OverridingKind::try_from(kind) {
+            Ok(protobuf::OverridingKind::OverridingUserValue) => Overriding::UserValue,
+            Ok(protobuf::OverridingKind::OverridingSystemValue) => Overriding::SystemValue,
+            _ => Overriding::NotSet,
         }
     }
 }
@@ -57,8 +81,8 @@ pub(crate) struct Action {
     pub(crate) event: Option<DmlEvent>,
     /// The target list (INSERT / UPDATE).
     pub(crate) assigns: Vec<Assign>,
-    /// `OVERRIDING SYSTEM VALUE` / `OVERRIDING USER VALUE`.
-    pub(crate) overriding: bool,
+    /// The INSERT's `OVERRIDING` clause.
+    pub(crate) overriding: Overriding,
 }
 
 /// What the rewriter sees of a data-modifying statement.
@@ -79,7 +103,7 @@ pub(crate) struct Rewrite {
 
 impl Rewrite {
     /// A plain INSERT / UPDATE / DELETE.
-    pub(crate) fn single(event: DmlEvent, assigns: Vec<Assign>, overriding: bool) -> Self {
+    pub(crate) fn single(event: DmlEvent, assigns: Vec<Assign>, overriding: Overriding) -> Self {
         Rewrite {
             listed: assigns.iter().map(|a| a.column.clone()).collect(),
             merge: false,
@@ -235,7 +259,7 @@ fn rewrite_level(
             attrs,
             DmlEvent::Update,
             set,
-            false,
+            Overriding::NotSet,
             is_view,
         )?)),
         other => other.clone(),
@@ -384,7 +408,7 @@ fn target_list_iu(
     attrs: &[crate::pg_catalog::PgAttribute],
     event: DmlEvent,
     assigns: &[Assign],
-    overriding: bool,
+    overriding: Overriding,
     is_view: bool,
 ) -> Result<Vec<Assign>, AnalyzeError> {
     let mut out = Vec::new();
@@ -401,10 +425,23 @@ fn target_list_iu(
             }
             continue;
         };
+        // OVERRIDING USER VALUE: an identity column takes its sequence's
+        // next value, whatever was given.
+        if event == DmlEvent::Insert
+            && overriding == Overriding::UserValue
+            && att.attidentity.is_some()
+        {
+            out.push(Assign {
+                column: att.attname.clone(),
+                default: false,
+                null: false,
+            });
+            continue;
+        }
         if !assigned.default {
             let identity_always = att.attidentity == Some(AttIdentity::Always);
             match event {
-                DmlEvent::Insert if identity_always && !overriding => {
+                DmlEvent::Insert if identity_always && overriding == Overriding::NotSet => {
                     return Err(crate::pgmsg::insert_non_default_into_generated(
                         &att.attname,
                         true,

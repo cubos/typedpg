@@ -172,7 +172,14 @@ NULL column (or NOT NULL domain) is rejected at compile time in UPDATE and
 MERGE too, although PG fails only the executions that touch a row (an UPDATE
 or MERGE matching nothing succeeds). Such a statement is a bug whenever it
 does anything, so typedpg reports it; those tests call `skip_pg_sanity`,
-since the oracle's execute fallback runs against empty tables.
+since the oracle's execute fallback runs against empty tables. A column's
+own NOT NULL is checked only after the BEFORE ROW triggers
+(`ExecConstraints`), so the NULL is accepted when a BEFORE ROW trigger for
+the event — on the table, on a partition the row is routed to, or (UPDATE)
+a BEFORE ROW INSERT one on a partition a row may move to — can replace it.
+A NOT NULL domain fails as the row is built, before any trigger, and stays
+rejected. A NULL given for an identity column under `OVERRIDING USER VALUE`
+is never stored (the sequence's value is) and is accepted too.
 
 When a query has **multiple simultaneous errors**, we deliberately do **not**
 require the analyzer to pick the *same* error PG reports first. PG's

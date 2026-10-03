@@ -38,6 +38,8 @@ mod dml;
 mod dml_clause_kinds;
 #[path = "query/dml_returning_narrowing.rs"]
 mod dml_returning_narrowing;
+#[path = "query/dml_soundness.rs"]
+mod dml_soundness;
 #[path = "query/expression_facts.rs"]
 mod expression_facts;
 #[path = "query/expressions.rs"]

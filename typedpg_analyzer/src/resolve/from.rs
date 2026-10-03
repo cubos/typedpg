@@ -132,9 +132,31 @@ pub(crate) fn process_from_item(
                             .is_some_and(|a| snapshot.attr_never_null(a))
                     });
                 }
+                // The row a statement writes through the view whose body
+                // this is: not a stored row (see `with_written_relation`).
+                let written = super::take_written_relation(class.oid);
+                if let Some(events) = &written
+                    && class.relkind == crate::pg_catalog::RelKind::View
+                {
+                    let attrs = super::written_row_attrs(
+                        snapshot,
+                        class.oid,
+                        snapshot.attributes_of(class.oid),
+                        events,
+                    );
+                    for c in &mut src.columns {
+                        c.base_not_null &= attrs
+                            .iter()
+                            .find(|a| a.attname == c.name)
+                            .is_some_and(|a| snapshot.attr_never_null(a));
+                    }
+                }
                 // Where each column's values come from: this scan of the
-                // table, or what a view reads.
-                if class.relkind == crate::pg_catalog::RelKind::View {
+                // table, or what a view reads — nowhere a foreign key can
+                // be trusted, for the written row.
+                if written.is_some() {
+                    // No origin.
+                } else if class.relkind == crate::pg_catalog::RelKind::View {
                     if let Some(origins) = view_origins(snapshot, class) {
                         for (c, o) in src.columns.iter_mut().zip(origins) {
                             c.origin = o;

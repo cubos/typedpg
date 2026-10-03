@@ -269,8 +269,27 @@ pub(crate) fn analyze_merge_with_outer_ctes(
         }
     }
     // Rows inserted or updated through a view are not the view's rows.
-    let both =
-        super::dml::with_written_target(&both, &target_alias, snapshot, table_oid, &table_attrs);
+    let events: Vec<DmlEvent> = merge
+        .merge_when_clauses
+        .iter()
+        .filter_map(|n| match n.node.as_ref() {
+            Some(node::Node::MergeWhenClause(w)) => match CmdType::try_from(w.command_type) {
+                Ok(CmdType::CmdInsert) => Some(DmlEvent::Insert),
+                Ok(CmdType::CmdUpdate) => Some(DmlEvent::Update),
+                Ok(CmdType::CmdDelete) => Some(DmlEvent::Delete),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    let both = super::dml::with_written_target(
+        &both,
+        &target_alias,
+        snapshot,
+        table_oid,
+        &table_attrs,
+        &events,
+    );
     MERGE_RETURNING_DEPTH.with(|d| d.set(d.get() + 1));
     let columns = resolve_returning(
         &merge.returning_clause,
@@ -316,26 +335,23 @@ pub(crate) fn analyze_merge_with_outer_ctes(
                             null: is_sql_null_literal(v),
                         })
                         .collect(),
-                    overriding: when.r#override
-                        == protobuf::OverridingKind::OverridingUserValue as i32
-                        || when.r#override
-                            == protobuf::OverridingKind::OverridingSystemValue as i32,
+                    overriding: Overriding::from_kind(when.r#override),
                 }
             }
             Ok(CmdType::CmdUpdate) => Action {
                 event: Some(DmlEvent::Update),
                 assigns: set_list_assigns(&when.target_list),
-                overriding: false,
+                overriding: Overriding::NotSet,
             },
             Ok(CmdType::CmdDelete) => Action {
                 event: Some(DmlEvent::Delete),
                 assigns: Vec::new(),
-                overriding: false,
+                overriding: Overriding::NotSet,
             },
             _ => Action {
                 event: None,
                 assigns: Vec::new(),
-                overriding: false,
+                overriding: Overriding::NotSet,
             },
         });
     }
@@ -448,10 +464,15 @@ fn merge_when_insert(
             })
             .collect::<Result<_, _>>()?
     };
+    // OVERRIDING USER VALUE discards the values given for identity columns.
+    let discards = |c: &crate::pg_catalog::PgAttribute| {
+        Overriding::from_kind(when.r#override) == Overriding::UserValue && c.attidentity.is_some()
+    };
     for (i, val) in when.values.iter().enumerate() {
         let target_col = target_attrs.get(i).copied();
         if let Some(tc) = target_col {
             if is_sql_null_literal(val)
+                && !discards(tc)
                 && let Some(err) = null_assignment_error(tc, snapshot, table_relname, "insert")
             {
                 return Err(err);
@@ -481,7 +502,7 @@ fn merge_when_insert(
         }
         if let Some(node::Node::ParamRef(p)) = val.node.as_ref()
             && let Some(tc) = target_col
-            && !tc.attnotnull
+            && (!tc.attnotnull || discards(tc))
         {
             params.infer_nullable(p.number, true);
         }
@@ -740,13 +761,18 @@ impl MergeArms<'_> {
                     &mut scratch,
                     goal,
                 ) {
-                    Ok(t) => Some(ValueInfo::of(val, t.nullable, attr.atttypid, self.snapshot)),
+                    Ok(t) => Some(ValueInfo::assigned(val, &t, attr, self.snapshot)),
                     Err(_) => Some(ValueInfo::default()),
                 }
             };
             row.push((name.clone(), info));
         }
         params.absorb_non_null_reads(&scratch);
-        inserted_rows_knowledge(self.snapshot, self.wt, &[row])
+        inserted_rows_knowledge(
+            self.snapshot,
+            self.wt,
+            &[row],
+            Overriding::from_kind(when.r#override),
+        )
     }
 }

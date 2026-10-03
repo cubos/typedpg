@@ -98,7 +98,25 @@ pub(crate) fn analyze_insert_with_outer_ctes(
         snapshot,
         insert_target_alias(relation),
         target_qn.clone(),
-        &written_row_attrs(snapshot, tgt.oid, &tgt.attrs),
+        &tgt.attrs,
+    );
+    // The rows RETURNING reads: inserted ones, or — ON CONFLICT DO UPDATE
+    // — updated ones.
+    let mut events = vec![DmlEvent::Insert];
+    if ins
+        .on_conflict_clause
+        .as_ref()
+        .is_some_and(|oc| oc.action == protobuf::OnConflictAction::OnconflictUpdate as i32)
+    {
+        events.push(DmlEvent::Update);
+    }
+    let mut ret_scope = with_written_target(
+        &ret_scope,
+        insert_target_alias(relation),
+        snapshot,
+        tgt.oid,
+        &tgt.attrs,
+        &events,
     );
     // ON CONFLICT DO UPDATE's EXCLUDED is in the range table but not the
     // namespace RETURNING sees: referencing it is PG's `invalid reference
@@ -199,16 +217,18 @@ fn insert_knowledge(
                 .collect()
         })
         .collect();
-    inserted_rows_knowledge(snapshot, wt, &rows)
+    inserted_rows_knowledge(snapshot, wt, &rows, tgt.overriding)
 }
 
 /// What every row an INSERT (or MERGE's INSERT action) stores holds, by
 /// base column: each row's values for the target columns it names
-/// (`None`: DEFAULT), and the defaults of the others.
+/// (`None`: DEFAULT), and the defaults of the others. Under OVERRIDING
+/// USER VALUE an identity column takes its sequence's value either way.
 pub(crate) fn inserted_rows_knowledge(
     snapshot: &PgCatalog,
     wt: &WriteTarget,
     rows: &[Vec<(String, Option<ValueInfo>)>],
+    overriding: Overriding,
 ) -> RowKnowledge {
     let base_attrs: Vec<&crate::pg_catalog::PgAttribute> = snapshot
         .attributes_of(wt.base)
@@ -219,10 +239,13 @@ pub(crate) fn inserted_rows_knowledge(
     let mut combined: HashMap<String, ValueInfo> = HashMap::new();
     for row in rows {
         for b in &base_attrs {
-            let given: Vec<&Option<ValueInfo>> = match wt.target_column(&b.attname) {
-                Some(t) => row.iter().filter(|(c, _)| c == t).map(|(_, v)| v).collect(),
-                None => Vec::new(),
-            };
+            // Every target column storing the base column (a view may
+            // expose one twice).
+            let given: Vec<&Option<ValueInfo>> = row
+                .iter()
+                .filter(|(c, _)| wt.to_base.get(c) == Some(&b.attname))
+                .map(|(_, v)| v)
+                .collect();
             let mut omitted = || {
                 defaults
                     .entry(b.attname.clone())
@@ -230,9 +253,13 @@ pub(crate) fn inserted_rows_knowledge(
                     .clone()
             };
             let info = match given.as_slice() {
+                _ if overriding == Overriding::UserValue && b.attidentity.is_some() => {
+                    default_value(snapshot, wt.base, b)
+                }
                 [] | [None] => omitted(),
                 [Some(v)] => v.clone(),
-                // Several assignments into the column.
+                // Several assignments into the column (an error, unless
+                // all but one are DEFAULTs no default replaces).
                 _ => ValueInfo::default(),
             };
             combined
@@ -370,10 +397,19 @@ struct InsertTarget {
     /// The indirection (`arr[1]`, `p.x`) of each named column, parallel to
     /// `col_names`.
     col_indirection: Vec<Vec<protobuf::Node>>,
-    /// `OVERRIDING SYSTEM VALUE` or `OVERRIDING USER VALUE` was requested —
-    /// either lets a value be written to a GENERATED ALWAYS identity column
-    /// (USER VALUE then discards it in favour of the sequence).
-    overriding: bool,
+    /// `OVERRIDING SYSTEM VALUE` or `OVERRIDING USER VALUE`. Either lets a
+    /// value be written to a GENERATED ALWAYS identity column; USER VALUE
+    /// then discards it — and any value given for a BY DEFAULT one — in
+    /// favour of the sequence.
+    overriding: Overriding,
+}
+
+impl InsertTarget {
+    /// Whether the value given for column `c` is discarded for its
+    /// identity sequence's next value (OVERRIDING USER VALUE).
+    fn discards(&self, c: &crate::pg_catalog::PgAttribute) -> bool {
+        self.overriding == Overriding::UserValue && c.attidentity.is_some()
+    }
 }
 
 /// Resolve the INSERT target relation, validate that every column named in the
@@ -471,8 +507,6 @@ fn resolve_insert_target(
         })
         .collect();
 
-    // PG enum for `Insert.override`:
-    //   1 = OVERRIDING_NOT_SET, 2 = USER_VALUE, 3 = SYSTEM_VALUE.
     // `OVERRIDING SYSTEM VALUE` on a table without any identity column is a
     // no-op for PG (silently accepted), so we don't reject the construct
     // here even though it's almost always a caller mistake — keeping
@@ -484,7 +518,7 @@ fn resolve_insert_target(
         attrs: table_attrs,
         col_names,
         col_indirection,
-        overriding: ins.r#override == 2 || ins.r#override == 3,
+        overriding: Overriding::from_kind(ins.r#override),
     })
 }
 
@@ -634,6 +668,7 @@ fn analyze_insert_values(
             if let Some(tc) = target_col
                 && !indirected
                 && is_sql_null_literal(val)
+                && !tgt.discards(tc)
                 && let Some(err) = null_assignment_error(tc, snapshot, &tgt.relname, "insert")
             {
                 row_violations.push(NullViolation::of(tc, snapshot, err));
@@ -686,13 +721,13 @@ fn analyze_insert_values(
                 _ if is_set_to_default(val) => None,
                 // A value stored inside the column says nothing of it.
                 Some(_) if indirected => Some(ValueInfo::default()),
-                Some(tc) => Some(ValueInfo::of(val, inferred.nullable, tc.atttypid, snapshot)),
+                Some(tc) => Some(ValueInfo::assigned(val, &inferred, tc, snapshot)),
                 None => Some(ValueInfo::default()),
             });
 
             if let Some(node::Node::ParamRef(p)) = val.node.as_ref()
                 && let Some(tc) = target_col
-                && (!tc.attnotnull || indirected)
+                && (!tc.attnotnull || indirected || tgt.discards(tc))
             {
                 params.infer_nullable(p.number, true);
             }
@@ -942,13 +977,13 @@ fn analyze_insert_select(
                 .col_indirection
                 .get(i)
                 .is_some_and(|ind| !ind.is_empty());
-            if !tc.attnotnull || indirected {
+            if !tc.attnotnull || indirected || tgt.discards(tc) {
                 params.infer_nullable(p.number, true);
             }
         }
     }
-    // What each output column writes (nothing known of a value stored
-    // inside its column).
+    // What each output column writes, once coerced to its column's type
+    // (nothing known of a value stored inside its column).
     Ok(sel_cols
         .iter()
         .enumerate()
@@ -957,8 +992,16 @@ fn analyze_insert_select(
                 .col_indirection
                 .get(i)
                 .is_some_and(|ind| !ind.is_empty());
+            let nullable = match target_types.get(i) {
+                Some(Some(target)) => expr::assignment_nullable(
+                    &expr::ExprType::scalar(c.type_oid, c.nullable),
+                    *target,
+                    snapshot,
+                ),
+                _ => c.nullable,
+            };
             ValueInfo {
-                not_null: !c.nullable && !indirected,
+                not_null: !nullable && !indirected,
                 ..ValueInfo::default()
             }
         })
@@ -1420,7 +1463,14 @@ pub(crate) fn analyze_update_with_outer_ctes(
         rows.new_proven.extend(new_nn);
     }
 
-    let ret_scope = with_written_target(&scope, alias, snapshot, table_oid, &table_attrs);
+    let ret_scope = with_written_target(
+        &scope,
+        alias,
+        snapshot,
+        table_oid,
+        &table_attrs,
+        &[DmlEvent::Update],
+    );
     let columns = resolve_returning(
         &upd.returning_clause,
         alias,
@@ -1428,7 +1478,11 @@ pub(crate) fn analyze_update_with_outer_ctes(
         expr::Ctx::new(&ret_scope, &null_ctx, snapshot),
         params,
     )?;
-    let mut rw = Rewrite::single(DmlEvent::Update, set_list_assigns(&upd.target_list), false);
+    let mut rw = Rewrite::single(
+        DmlEvent::Update,
+        set_list_assigns(&upd.target_list),
+        Overriding::NotSet,
+    );
     rw.returning = has_returning(&upd.returning_clause);
     check_rewrite(snapshot, table_oid, &rw)?;
     Ok((columns, None))
@@ -1566,6 +1620,15 @@ pub(crate) fn analyze_delete_with_outer_ctes(
         prove_columns(&mut null_ctx, alias, &old_nn);
         rows.old_proven.extend(old_nn);
     }
+    // A DO INSTEAD rule (or an INSTEAD OF trigger) returns rows of its own.
+    if has_returning(&del.returning_clause)
+        && returning_rewritten(snapshot, table_oid, &[DmlEvent::Delete])
+        && let Some(target) = scope.sources.iter_mut().find(|s| s.alias == alias)
+    {
+        for c in &mut target.columns {
+            c.base_not_null = false;
+        }
+    }
 
     let columns = resolve_returning(
         &del.returning_clause,
@@ -1574,47 +1637,57 @@ pub(crate) fn analyze_delete_with_outer_ctes(
         expr::Ctx::new(&scope, &null_ctx, snapshot),
         params,
     )?;
-    let mut rw = Rewrite::single(DmlEvent::Delete, Vec::new(), false);
+    let mut rw = Rewrite::single(DmlEvent::Delete, Vec::new(), Overriding::NotSet);
     rw.returning = has_returning(&del.returning_clause);
     check_rewrite(snapshot, table_oid, &rw)?;
     Ok((columns, None))
 }
 
 /// The target's attributes as RETURNING reads them in the rows an INSERT,
-/// UPDATE or MERGE writes. A table's are its own. A row written through a
-/// view is not a row of the view: it need not pass the view's WHERE (no
-/// CHECK OPTION is assumed), and an INSTEAD OF trigger or a DO INSTEAD
-/// rule returns what it likes — so a view column is NOT NULL there only
-/// when the view's expressions are over any base row, and never with a
-/// trigger or rule.
+/// UPDATE or MERGE (doing `events`) writes. A table's are its own. A row
+/// written through a view is not a row of the view: it need not pass the
+/// view's WHERE (no CHECK OPTION is assumed), nor that of a view below it,
+/// and the foreign keys of the row being written promise nothing yet (its
+/// parent may be one the statement's snapshot doesn't see) — so a view
+/// column is NOT NULL there only when the view's expressions are over any
+/// row written to the relation below it ([`with_written_relation`]). An
+/// INSTEAD OF trigger or a DO INSTEAD rule, on the target or down its view
+/// chain, returns what it likes ([`returning_rewritten`]): nothing is NOT
+/// NULL then.
 pub(crate) fn written_row_attrs(
     snapshot: &PgCatalog,
     relid: crate::oid::PgClassOid,
     attrs: &[crate::pg_catalog::PgAttribute],
+    events: &[DmlEvent],
 ) -> Vec<crate::pg_catalog::PgAttribute> {
     let is_view = snapshot
         .pg_class
         .get(&relid)
         .is_some_and(|c| c.relkind == crate::pg_catalog::RelKind::View);
-    if !is_view {
+    let rewritten = returning_rewritten(snapshot, relid, events)
+        || (is_view
+            && (snapshot.rules.get(&relid).is_some_and(|r| !r.is_empty())
+                || snapshot
+                    .triggers
+                    .get(&relid)
+                    .is_some_and(|ts| ts.iter().any(|t| t.instead_row_events != 0))));
+    if !is_view && !rewritten {
         return attrs.to_vec();
     }
-    let rewritten = snapshot.rules.get(&relid).is_some_and(|r| !r.is_empty())
-        || snapshot
-            .triggers
-            .get(&relid)
-            .is_some_and(|ts| ts.iter().any(|t| t.instead_row_events != 0));
     let not_null: Option<Vec<bool>> = if rewritten {
         None
     } else {
         use prost::Message;
+        let base = snapshot.view_updatability.get(&relid).and_then(|u| u.base);
         snapshot
             .view_body(relid)
             .and_then(|body| protobuf::Node::decode(body.ast.as_slice()).ok())
             .and_then(|node| {
                 let inner = node.node.as_ref()?;
                 crate::nonnull::without_narrowing(|| {
-                    crate::resolve::analyze_raw_node(snapshot, inner, &[]).ok()
+                    with_written_relation(base, events, || {
+                        crate::resolve::analyze_raw_node(snapshot, inner, &[]).ok()
+                    })
                 })
             })
             .map(|(cols, _)| cols.iter().map(|c| !c.nullable).collect())
@@ -1633,7 +1706,7 @@ pub(crate) fn written_row_attrs(
 }
 
 /// `scope` with the target entry `alias`'s columns as RETURNING reads
-/// them in the rows written through relation `relid`
+/// them in the rows written through relation `relid` by `events`
 /// ([`written_row_attrs`]).
 pub(crate) fn with_written_target(
     scope: &Scope,
@@ -1641,19 +1714,98 @@ pub(crate) fn with_written_target(
     snapshot: &PgCatalog,
     relid: crate::oid::PgClassOid,
     attrs: &[crate::pg_catalog::PgAttribute],
+    events: &[DmlEvent],
 ) -> Scope {
-    let written = written_row_attrs(snapshot, relid, attrs);
+    let rewritten = returning_rewritten(snapshot, relid, events);
+    let written = written_row_attrs(snapshot, relid, attrs, events);
     let mut scope = scope.clone();
     if let Some(target) = scope.sources.iter_mut().find(|s| s.alias == alias) {
         for c in &mut target.columns {
             if let Some(a) = written.iter().find(|a| a.attname == c.name)
-                && !snapshot.attr_never_null(a)
+                && (rewritten || !snapshot.attr_never_null(a))
             {
                 c.base_not_null = false;
             }
         }
     }
     scope
+}
+
+/// Whether RETURNING reads something else than the rows `events` write
+/// into `relid`: a DO INSTEAD rule for one of them on `relid` or on a
+/// relation down its view chain makes it its actions' RETURNING list
+/// (over another relation, and NEW / OLD as the statement gave them), and
+/// an INSTEAD OF trigger on a view there returns the row it likes
+/// (RewriteQuery, rewriteTargetView).
+pub(crate) fn returning_rewritten(
+    snapshot: &PgCatalog,
+    relid: crate::oid::PgClassOid,
+    events: &[DmlEvent],
+) -> bool {
+    let mut cur = relid;
+    for _ in 0..16 {
+        let Some(class) = snapshot.pg_class.get(&cur) else {
+            return false;
+        };
+        if snapshot.rules.get(&cur).is_some_and(|rs| {
+            rs.iter()
+                .any(|r| r.instead && events.iter().any(|e| r.event == e.cmd_type()))
+        }) {
+            return true;
+        }
+        if class.relkind != crate::pg_catalog::RelKind::View {
+            return false;
+        }
+        if snapshot.triggers.get(&cur).is_some_and(|ts| {
+            ts.iter()
+                .any(|t| events.iter().any(|e| t.is_instead_row_for(e.trigger_bit())))
+        }) {
+            return true;
+        }
+        match snapshot.view_updatability.get(&cur).and_then(|u| u.base) {
+            Some(base) => cur = base,
+            None => return false,
+        }
+    }
+    true
+}
+
+thread_local! {
+    /// The relation a view body being re-read for the rows written
+    /// through the view stores them in, and the events writing them (see
+    /// [`with_written_relation`]).
+    static WRITTEN_RELATION: std::cell::RefCell<Option<(crate::oid::PgClassOid, Vec<DmlEvent>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` — the analysis of an automatically updatable view's body for
+/// the rows written through it — with its FROM entry over `base` read as
+/// the row being written rather than a stored one: a view's columns as
+/// [`written_row_attrs`] has them (not narrowed by its WHERE), a table's
+/// with no [`crate::scope::Origin`], so no foreign key of the row vouches
+/// for its parent.
+pub(crate) fn with_written_relation<R>(
+    base: Option<crate::oid::PgClassOid>,
+    events: &[DmlEvent],
+    f: impl FnOnce() -> R,
+) -> R {
+    let before = WRITTEN_RELATION.with(|w| w.replace(base.map(|b| (b, events.to_vec()))));
+    let out = f();
+    WRITTEN_RELATION.with(|w| *w.borrow_mut() = before);
+    out
+}
+
+/// The events writing the rows of `relid`, when the FROM entry being
+/// added over it is the written row of [`with_written_relation`] — the
+/// first one over it, the view body's single FROM item.
+pub(crate) fn take_written_relation(relid: crate::oid::PgClassOid) -> Option<Vec<DmlEvent>> {
+    WRITTEN_RELATION.with(|w| {
+        let mut w = w.borrow_mut();
+        match w.as_ref() {
+            Some((r, _)) if *r == relid => w.take().map(|(_, e)| e),
+            _ => None,
+        }
+    })
 }
 
 /// What an UPDATE's / DELETE's WHERE proves non-NULL for RETURNING: the

@@ -628,8 +628,8 @@ pub(crate) fn cte_returns_one_row(ctes: &HashMap<String, Vec<ScopeColumn>>, name
 }
 
 /// Whether INSERT … RETURNING `ins` returns exactly one row whenever it
-/// succeeds: it inserts one row (one VALUES row, or DEFAULT VALUES) into a
-/// table without rules, and no BEFORE ROW trigger can skip it (return
+/// succeeds: it inserts one row (one VALUES row without a set-returning
+/// function, or DEFAULT VALUES) into a table without rules, and no BEFORE ROW trigger can skip it (return
 /// NULL) — nor ON CONFLICT DO NOTHING, nor a DO UPDATE WHERE. ON CONFLICT
 /// DO UPDATE without WHERE returns the inserted row or the updated one.
 fn insert_returns_one_row(ins: &protobuf::InsertStmt, snapshot: &PgCatalog) -> bool {
@@ -640,6 +640,12 @@ fn insert_returns_one_row(ins: &protobuf::InsertStmt, snapshot: &PgCatalog) -> b
                 && sel.with_clause.is_none()
                 && sel.limit_count.is_none()
                 && sel.limit_offset.is_none()
+                // A set-returning function in the row (the INSERT's own
+                // target list) makes it any number of rows, none included.
+                && sel.values_lists.iter().all(|row| match row.node.as_ref() {
+                    Some(node::Node::List(l)) => count_srf_calls(&l.items, snapshot) == 0,
+                    _ => false,
+                })
         }
         _ => false,
     };

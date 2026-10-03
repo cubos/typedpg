@@ -850,6 +850,10 @@ fn rename_column_refs(
 /// Both branches start with PG's exact runtime wording so the `pg_sanity`
 /// execute-fallback prefix check passes; the analyzer's stricter form
 /// (table+column qualified) follows in parentheses for the macro caller.
+///
+/// A NOT NULL domain fails as the row is built; the column's own NOT NULL
+/// only in ExecConstraints, after the BEFORE ROW triggers — one of which
+/// may replace the NULL, so the column's is not reported then.
 fn null_assignment_error(
     tc: &crate::pg_catalog::PgAttribute,
     snapshot: &PgCatalog,
@@ -868,7 +872,12 @@ fn null_assignment_error(
         .pg_class
         .get(&tc.attrelid)
         .is_some_and(|c| c.relkind == crate::pg_catalog::RelKind::View);
-    if tc.attnotnull && !on_view {
+    let event = if op == "insert" {
+        DmlEvent::Insert
+    } else {
+        DmlEvent::Update
+    };
+    if tc.attnotnull && !on_view && !before_row_trigger_rewrites(snapshot, tc.attrelid, event) {
         let verb = match op {
             "insert" => "insert NULL into",
             _ => "assign NULL to",

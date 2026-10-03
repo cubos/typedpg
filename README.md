@@ -376,8 +376,10 @@ its `WHERE` proved about the columns it keeps. `ON CONFLICT DO UPDATE`
 returns the inserted row or the updated one, and `MERGE` one row per action
 it runs, past its `WHEN` condition. Every returned row satisfies the table's
 CHECK constraints. An automatically updatable view writes its base table's
-rows. A BEFORE ROW trigger, a rule or an INSTEAD OF trigger may rewrite the
-row, so the values aren't trusted there (only the constraints are):
+rows, which need not pass its `WHERE`. A BEFORE ROW trigger or a rule may
+rewrite the row, so the values aren't trusted there (only the constraints
+are), and a `DO INSTEAD` rule or an `INSTEAD OF` trigger returns rows of its
+own, of which nothing is known:
 
 ```rust
 // DEFAULT 'draft', and a SET of a non-NULL value
@@ -389,9 +391,10 @@ let rows = sql!(pool, "UPDATE users SET age = 18 WHERE age IS NULL RETURNING age
 // rows[0].age : i32
 ```
 
-A data-modifying CTE that inserts one `VALUES` row (without `ON CONFLICT DO
-NOTHING`, a `DO UPDATE ... WHERE` or a BEFORE ROW trigger, which may skip it)
-returns exactly one row, so `(SELECT id FROM ins)` is that row's `id`.
+A data-modifying CTE that inserts one `VALUES` row (without a set-returning
+function, which makes it any number of rows, nor `ON CONFLICT DO NOTHING`, a
+`DO UPDATE ... WHERE` or a BEFORE ROW trigger, which may skip it) returns
+exactly one row, so `(SELECT id FROM ins)` is that row's `id`.
 
 ### Nullability annotations
 
