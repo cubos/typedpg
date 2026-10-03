@@ -196,6 +196,16 @@ pub(crate) fn analyze_set_operation(
             (None, false) => target,
         };
         let typmod = if l.typmod == r.typmod { l.typmod } else { None };
+        // Each arm's column is coerced to the common type, which may map a
+        // value — or an array's element — to NULL.
+        for c in [&mut l, &mut r] {
+            if expr::coercion_can_return_null(c.type_oid, type_oid, snapshot) {
+                c.nullable = true;
+            }
+            if expr::coercion_can_null_elements(c.type_oid, type_oid, snapshot) {
+                c.elem_nullable = Some(true);
+            }
+        }
         // transformSetOperationTree: every set operation but UNION ALL
         // compares the rows, so the column type needs an equality operator.
         let union_all = op_label == "UNION" && sel.all;

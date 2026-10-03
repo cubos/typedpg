@@ -114,6 +114,24 @@ pub(crate) fn infer_type_cast(
             crate::error::node_location(inner).and_then(crate::error::SourceSpan::from_node_token);
         return Err(crate::error::RawError::invalid_literal(msg, span).finalize_implicit());
     }
+    // The cast then applies the target's typmod (a domain's: its base
+    // type's), `numeric(p, s)`'s `apply_typmod` failing every execution
+    // for a literal out of range (`'123.45'::numeric(4,2)`).
+    let cast_typmod = if snapshot.unwrap_domain(target_oid) == target_oid {
+        written_typmod
+    } else {
+        snapshot.effective_typmod(target_oid, None)
+    };
+    if let Some(msg) = crate::typmod::numeric_literal_overflow(
+        snapshot,
+        snapshot.unwrap_domain(target_oid),
+        cast_typmod,
+        inner,
+    ) {
+        let span =
+            crate::error::node_location(inner).and_then(crate::error::SourceSpan::from_node_token);
+        return Err(crate::error::RawError::invalid(msg, span, None).finalize_implicit());
+    }
 
     // An explicit cast (::type / CAST) overrides type checking — we do NOT
     // check compatibility of the inner expression against the target type.
@@ -129,9 +147,12 @@ pub(crate) fn infer_type_cast(
             .get_type(snapshot.unwrap_domain(target_oid))
             .map(|t| t.typtype),
     ) {
-        (Some(node::Node::RowExpr(_)), Some(TypType::Composite)) => {
-            TypeGoal::assignment(target_oid)
-        }
+        // (An explicit cast: coerce_record_to_complex converts each field
+        // in the explicit context.)
+        (Some(node::Node::RowExpr(_)), Some(TypType::Composite)) => TypeGoal {
+            coercion: CoercionContext::Explicit,
+            ..TypeGoal::assignment(target_oid)
+        },
         _ => TypeGoal::NONE,
     };
     // transformTypeCast: an `ARRAY[…]` operand of a cast to an array type
@@ -297,12 +318,19 @@ pub(crate) fn cast_function_can_return_null(
     if cast.castmethod != crate::pg_catalog::CastMethod::Function {
         return false;
     }
-    // A user-defined cast function that isn't STRICT runs on any input and
-    // may return NULL, like any user-defined function.
+    // A user-defined cast function may return NULL like any user-defined
+    // function (`functions::operator_result_nullable` has the same rule):
+    // one in SQL, PL/pgSQL, … for any input — `STRICT` only says a NULL
+    // argument skips the call — and a compiled (C / internal) one unless
+    // it is STRICT.
     if let Some(f) = cast.castfunc.and_then(|oid| snapshot.pg_proc.get(&oid))
         && snapshot.namespace_name(f.pronamespace) != Some("pg_catalog")
     {
-        return !f.proisstrict;
+        let compiled = matches!(
+            f.prolang,
+            crate::pg_catalog::C_LANGUAGE | crate::pg_catalog::INTERNAL_LANGUAGE
+        );
+        return !f.proisstrict || !compiled;
     }
     let (Some(src), Some(tgt)) = (snapshot.get_type(source), snapshot.get_type(target)) else {
         return false;
@@ -315,4 +343,42 @@ pub(crate) fn cast_function_can_return_null(
             let sig = format!("{}({})", f.proname, src.typname);
             f.proisstrict && crate::builtin_nullability::NULLABLE_STRICT.contains(&sig.as_str())
         })
+}
+
+/// Whether implicitly coercing a non-NULL value of type `from` to `to` — a
+/// call argument to its parameter's type, a CASE / COALESCE / UNION branch
+/// to the common type — can yield NULL: the coercion runs a cast function
+/// that can ([`cast_function_can_return_null`]). Nothing runs between equal
+/// types, nor for an untyped literal (read by `to`'s input function).
+pub(crate) fn coercion_can_return_null(
+    from: PgTypeOid,
+    to: PgTypeOid,
+    snapshot: &PgCatalog,
+) -> bool {
+    from != to
+        && from != oid::UNKNOWN
+        && to != oid::UNKNOWN
+        && cast_function_can_return_null(from, to, snapshot)
+}
+
+/// Whether that coercion can turn a non-NULL *element* of an array into
+/// NULL: with no cast between the array types themselves, `find_coercion_pathway`
+/// coerces an array to another array type element by element
+/// (`ArrayCoerceExpr`), through the elements' cast.
+pub(crate) fn coercion_can_null_elements(
+    from: PgTypeOid,
+    to: PgTypeOid,
+    snapshot: &PgCatalog,
+) -> bool {
+    let (f, t) = (snapshot.unwrap_domain(from), snapshot.unwrap_domain(to));
+    if f == t || from == oid::UNKNOWN || snapshot.cast_by_pair.contains_key(&(f, t)) {
+        return false;
+    }
+    match (
+        coerce::element_type(f, snapshot),
+        coerce::element_type(t, snapshot),
+    ) {
+        (Some(fe), Some(te)) => coercion_can_return_null(fe, te, snapshot),
+        _ => false,
+    }
 }

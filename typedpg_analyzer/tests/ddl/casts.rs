@@ -126,8 +126,9 @@ fn create_cast_with_domain_without_function_is_rejected() {
 #[test]
 fn user_cast_backed_by_a_non_strict_function_is_nullable() {
     // The cast function runs on any input and may return NULL (a SQL
-    // function is CALLED ON NULL INPUT by default); a STRICT one is NULL only
-    // on a NULL input.
+    // function is CALLED ON NULL INPUT by default) — and so may a STRICT
+    // one in SQL: STRICT only skips the call on a NULL input (only a
+    // compiled one, C or internal, is taken to be NULL just then).
     let db = build_db(&[(
         "0001.sql",
         "CREATE TYPE mood AS ENUM ('a');
@@ -143,7 +144,7 @@ fn user_cast_backed_by_a_non_strict_function_is_nullable() {
     );
     assert_cols(
         &db.analyze("SELECT 'a'::mood2::int AS m").unwrap(),
-        vec![c("m", int4())],
+        vec![cn("m", int4())],
     );
 }
 

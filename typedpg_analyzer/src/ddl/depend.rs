@@ -1125,7 +1125,7 @@ fn delete_object_now(interp: &mut PgCatalog, addr: ObjectAddress) -> Result<(), 
         }
         c if c == PG_OPERATOR_RELID => {
             if let Some(op) = PgOperatorOid::new(oid) {
-                interp.remove_pg_operator(op);
+                super::operators::remove_operator(interp, op);
             }
         }
         c if c == PG_CAST_RELID => {

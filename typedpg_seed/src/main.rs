@@ -496,7 +496,8 @@ fn export_operators(client: &mut postgres::Client) -> Result<Vec<PgOperator>, po
     // No filter — shell operators (oprresult = 0) round-trip too. Operator
     // resolution skips them at lookup time.
     let rows = client.query(
-        "SELECT oid, oprname, oprnamespace, oprleft, oprright, oprresult, oprcode::oid, oprcom \
+        "SELECT oid, oprname, oprnamespace, oprleft, oprright, oprresult, oprcode::oid, oprcom, \
+                oprnegate \
          FROM pg_catalog.pg_operator \
          ORDER BY oid",
         &[],
@@ -511,6 +512,7 @@ fn export_operators(client: &mut postgres::Client) -> Result<Vec<PgOperator>, po
             let oprresult: u32 = r.get(5);
             let oprcode: u32 = r.get(6);
             let oprcom: u32 = r.get(7);
+            let oprnegate: u32 = r.get(8);
             PgOperator {
                 oid: PgOperatorOid::new(oid).expect("pg_operator.oid is non-zero"),
                 oprname: r.get(1),
@@ -520,6 +522,7 @@ fn export_operators(client: &mut postgres::Client) -> Result<Vec<PgOperator>, po
                 oprresult: PgTypeOid::new(oprresult),
                 oprcode: PgProcOid::new(oprcode),
                 oprcom: PgOperatorOid::new(oprcom),
+                oprnegate: PgOperatorOid::new(oprnegate),
             }
         })
         .collect())

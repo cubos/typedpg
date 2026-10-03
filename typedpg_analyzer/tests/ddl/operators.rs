@@ -185,6 +185,81 @@ fn create_operator_follows_operator_create_checks() {
 }
 
 #[test]
+fn commutator_and_negator_links_are_kept_like_pg() {
+    // OperatorUpd links the commutator / negator back — refusing one that
+    // already links to a third operator — and a dropped operator's links
+    // are cleared; filling in a shell replaces its row, links included.
+    const FNS: &str = "
+        CREATE FUNCTION myeq(int, int) RETURNS bool LANGUAGE sql AS 'select $1 = $2';
+        CREATE FUNCTION myne(int, int) RETURNS bool LANGUAGE sql AS 'select $1 <> $2';";
+    assert_ddl_err!(
+        try_apply(&[(
+            "0001.sql",
+            &format!(
+                "{FNS} CREATE OPERATOR !== (leftarg = int, rightarg = int, function = myne, \
+                 negator = =);"
+            ),
+        )]),
+        DdlError::Parse(_),
+        "negator operator = is already the negator of operator <>"
+    );
+    assert_ddl_err!(
+        try_apply(&[(
+            "0001.sql",
+            &format!(
+                "{FNS} CREATE OPERATOR <#< (leftarg = int, rightarg = int, function = myne, \
+                 commutator = >);"
+            ),
+        )]),
+        DdlError::Parse(_),
+        "commutator operator > is already the commutator of operator <"
+    );
+    let db = build(&[(
+        "0001.sql",
+        &format!(
+            "{FNS}
+             CREATE OPERATOR === (leftarg = int, rightarg = int, function = myeq, negator = !==);
+             CREATE OPERATOR !== (leftarg = int, rightarg = int, function = myne);
+             CREATE OPERATOR =#= (leftarg = int, rightarg = int, function = myeq);
+             CREATE OPERATOR !#! (leftarg = int, rightarg = int, function = myne);
+             ALTER OPERATOR =#= (int, int) SET (NEGATOR = !#!);
+             CREATE OPERATOR =%= (leftarg = int, rightarg = int, function = myeq);
+             CREATE OPERATOR !%! (leftarg = int, rightarg = int, function = myne,
+                 negator = =%=);
+             DROP OPERATOR !%! (int, int);"
+        ),
+    )]);
+    let ops = db.pg_operator();
+    let by_name = |name: &str| ops.values().find(|o| o.oprname == name).unwrap();
+    let negator = |name: &str| {
+        by_name(name)
+            .oprnegate
+            .map(|n| ops.get(&n).unwrap().oprname.clone())
+    };
+    assert_eq!(negator("==="), Some("!==".into()));
+    assert_eq!(negator("!=="), None);
+    assert_eq!(negator("=#="), Some("!#!".into()));
+    assert_eq!(negator("!#!"), Some("=#=".into()));
+    assert_eq!(negator("=%="), None);
+    // A link already set can't be changed.
+    assert_ddl_err!(
+        try_apply(&[(
+            "0001.sql",
+            &format!(
+                "{FNS}
+                 CREATE OPERATOR === (leftarg = int, rightarg = int, function = myeq);
+                 CREATE OPERATOR !== (leftarg = int, rightarg = int, function = myne,
+                     negator = ===);
+                 CREATE OPERATOR !#! (leftarg = int, rightarg = int, function = myne);
+                 ALTER OPERATOR === (int, int) SET (NEGATOR = !#!);"
+            ),
+        )]),
+        DdlError::Parse(_),
+        "operator attribute \"negator\" cannot be changed if it has already been set"
+    );
+}
+
+#[test]
 fn a_commutator_reference_makes_a_shell_operator() {
     let db = build(&[(
         "0001.sql",

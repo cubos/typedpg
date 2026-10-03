@@ -132,24 +132,30 @@ pub(crate) fn infer_sublink(
                 // operator can't yield NULL for non-NULL inputs (an empty
                 // subquery gives FALSE / TRUE).
                 let mut result_nullable = false;
+                let mut ops = Vec::with_capacity(lhs_nodes.len());
                 for (lhs_node, col) in lhs_nodes.iter().zip(cols.iter()) {
                     let lhs = infer_expr(lhs_node, ctx, params, TypeGoal::NONE)?;
                     let l_oid = lhs.type_oid;
                     let r_oid = col.type_oid;
                     result_nullable |= lhs.nullable || col.nullable;
-                    match snapshot.find_operator(&op_name, Some(l_oid), r_oid) {
+                    let found = snapshot.find_operator(&op_name, Some(l_oid), r_oid);
+                    ops.push(found.clone());
+                    match found {
                         Some(op) if l_oid != oid::UNKNOWN && r_oid != oid::UNKNOWN => {
                             strict &= ctx.proc_is_strict(op.code);
                             let builtin = op
                                 .code
                                 .and_then(|c| snapshot.pg_proc.get(&c))
                                 .is_some_and(|p| Some(p.pronamespace) == snapshot.pg_catalog_oid());
+                            // (Coercing either side to the operator's
+                            // declared types may map it to NULL.)
                             result_nullable |= !builtin
-                                || functions::operator_result_nullable(
+                                || operator_call_nullable(
                                     snapshot,
                                     &op_name,
-                                    op.code,
-                                    &[false, false],
+                                    &op,
+                                    Some(l_oid),
+                                    r_oid,
                                 );
                         }
                         _ => {
@@ -191,6 +197,10 @@ pub(crate) fn infer_sublink(
                         )
                         .finalize_implicit());
                     }
+                }
+                // A row is compared by make_row_comparison_op.
+                if lhs_row.is_some() {
+                    check_row_comparison_interpretation(snapshot, &op_name, &ops, sub.location)?;
                 }
                 ctx.note_strict(sub.location, crate::nonnull::StrictNode::Sublink, strict);
                 return Ok(ExprType::scalar(oid::BOOL, result_nullable));

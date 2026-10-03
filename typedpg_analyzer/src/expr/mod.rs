@@ -460,6 +460,20 @@ impl ExprType {
         (self.collation, self.explicit_collation) = state;
         self
     }
+
+    /// Account for this value being implicitly coerced to `to` (a call
+    /// argument to its parameter's type, a branch to a common type): the
+    /// cast function the coercion runs may map it — or, coercing an array
+    /// element by element, one of its elements — to NULL. The type is left
+    /// alone; only the nullability the coerced value can have changes.
+    pub(crate) fn note_coerced_to(&mut self, to: PgTypeOid, snapshot: &PgCatalog) {
+        if literals::coercion_can_return_null(self.type_oid, to, snapshot) {
+            self.nullable = true;
+        }
+        if literals::coercion_can_null_elements(self.type_oid, to, snapshot) {
+            self.elem_nullable = Some(true);
+        }
+    }
 }
 
 /// The element nullability of an array built from parts whose element (or
@@ -974,10 +988,16 @@ fn infer_expr_unlocated(
                     coerce_unknown_to(arg, ctx, params, resolved_type)?;
                 }
             }
+            // Each argument is coerced to the common type, which may map it
+            // to NULL.
+            let kept = conditional::coerce_branches(&mut args, resolved_type, snapshot);
             // GREATEST/LEAST over ≥1 NOT NULL arg are never NULL.
             let nullable = args.is_empty()
                 || (args.iter().all(|t| t.nullable)
-                    && !conditional::some_column_non_null(&mm.args, ctx));
+                    && !conditional::some_column_non_null(
+                        conditional::kept_nodes(&mm.args, &kept),
+                        ctx,
+                    ));
             Ok(ExprType::scalar_with_typmod(
                 resolved_type,
                 nullable,
@@ -1054,15 +1074,17 @@ fn infer_expr_unlocated(
                 let mut shape = Vec::with_capacity(row.args.len());
                 for (i, (arg, field)) in row.args.iter().zip(composite_fields.iter()).enumerate() {
                     // coerce_record_to_complex: a field that doesn't
-                    // coerce fails the whole record's cast, worded as
-                    // such (42846), not as the field's own mismatch.
+                    // coerce — in the context of the record's own coercion:
+                    // explicit for a cast, assignment for a stored value —
+                    // fails the whole record's cast, worded as such
+                    // (42846), not as the field's own mismatch.
                     let mut scratch = params.clone();
                     let own = infer_expr(arg, ctx, &mut scratch, TypeGoal::NONE)?;
                     if own.type_oid != oid::UNKNOWN
                         && !crate::coerce::can_coerce(
                             own.type_oid,
                             field.atttypid,
-                            CoercionContext::Assignment,
+                            goal.coercion,
                             snapshot,
                         )
                     {
@@ -1082,7 +1104,15 @@ fn infer_expr_unlocated(
                         .with_primary_label("record value")
                         .finalize_implicit());
                     }
-                    let t = infer_expr(arg, ctx, params, TypeGoal::assignment(field.atttypid))?;
+                    let t = infer_expr(
+                        arg,
+                        ctx,
+                        params,
+                        TypeGoal {
+                            coercion: goal.coercion,
+                            ..TypeGoal::assignment(field.atttypid)
+                        },
+                    )?;
                     // coerce_record_to_complex keeps each value, coerced to
                     // its field's type: still non-NULL when no cast runs
                     // (same type) or an untyped literal is read by the
@@ -1750,7 +1780,7 @@ mod conditional;
 mod func_call;
 mod indirection;
 mod json;
-mod literals;
+pub(crate) mod literals;
 pub(crate) mod operators;
 mod sublink;
 mod xml;
@@ -1763,13 +1793,15 @@ pub(crate) use conditional::failing_input_span;
 use conditional::*;
 use func_call::*;
 pub(crate) use func_call::{
-    aggregate_reads_rows, backfill_call_args, check_window_clause, effective_frame_options,
+    aggregate_reads_rows, arg_coercions_nullable, backfill_call_args, check_window_clause,
+    effective_frame_options,
 };
 use indirection::*;
 pub(crate) use indirection::{expand_indirection_star, transform_container_subscripts};
 use json::*;
 pub(crate) use literals::assignment_nullable;
 use literals::*;
+pub(crate) use literals::{coercion_can_null_elements, coercion_can_return_null};
 pub(crate) use operators::check_regex_restrictions;
 use operators::*;
 use sublink::*;

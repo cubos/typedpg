@@ -144,7 +144,8 @@ pub(crate) fn validate_with_typmod(
     }
     match t.typname.as_str() {
         "uuid" => validate_uuid(content),
-        "json" | "jsonb" => validate_json(content),
+        "json" => validate_json(content, false),
+        "jsonb" => validate_json(content, true),
         "jsonpath" => crate::jsonpath_input::validate(content),
         // The object-resolving reg* family: an OID, or a name looked up at
         // parse time — see `reg_input`.
@@ -712,9 +713,10 @@ pub(crate) fn validate_numeric(content: &str) -> Result<(), String> {
 
 // ─── uuid ───────────────────────────────────────────────────────────────────
 
-/// Mirrors `uuid_in`: exactly 32 hex digits, optionally wrapped in one pair
-/// of braces, with hyphens allowed only on the standard group boundaries
-/// (after hex digits 8, 12, 16, 20). No surrounding whitespace.
+/// Mirrors `uuid_in` (`string_to_uuid`): exactly 32 hex digits, optionally
+/// wrapped in one pair of braces, with a single hyphen allowed after any
+/// group of four digits but the last (`a0ee-bc99-…`, not only the standard
+/// 8-4-4-4-12 grouping). No surrounding whitespace.
 fn validate_uuid(content: &str) -> Result<(), String> {
     let err = || crate::pgmsg::invalid_input_syntax_for_type("uuid", content);
     let s = match content.strip_prefix('{') {
@@ -722,12 +724,17 @@ fn validate_uuid(content: &str) -> Result<(), String> {
         None => content,
     };
     let mut ndigits = 0u32;
+    let mut after_hyphen = false;
     for c in s.chars() {
         if c == '-' {
-            if !matches!(ndigits, 8 | 12 | 16 | 20) {
+            if after_hyphen || !ndigits.is_multiple_of(4) || !(4..32).contains(&ndigits) {
                 return Err(err());
             }
-        } else if c.is_ascii_hexdigit() {
+            after_hyphen = true;
+            continue;
+        }
+        after_hyphen = false;
+        if c.is_ascii_hexdigit() {
             ndigits += 1;
             if ndigits > 32 {
                 return Err(err());
@@ -745,16 +752,21 @@ fn validate_uuid(content: &str) -> Result<(), String> {
 // ─── json ───────────────────────────────────────────────────────────────────
 
 /// Structural RFC 8259 validation, mirroring PG's `json_lex`/`parse_json`.
-/// `\u` escapes only check for 4 hex digits — the jsonb-only surrogate-pair
-/// and `\u0000` restrictions produce *different* PG messages and are
-/// deliberately not modeled (accepted). The message carries no content:
-/// PG emits a bare `invalid input syntax for type json` (the specifics go in
-/// the DETAIL field, which the prefix contract doesn't cover).
-fn validate_json(content: &str) -> Result<(), String> {
+/// The message carries no content: PG emits a bare `invalid input syntax
+/// for type json` (the specifics go in the DETAIL field, which the prefix
+/// contract doesn't cover).
+///
+/// `jsonb_in` also de-escapes the strings (`need_escapes`), which `json_in`
+/// doesn't: a `\u` escape must then pair UTF-16 surrogates (a lone one is
+/// `invalid input syntax for type json` too), and `\u0000` is
+/// `unsupported Unicode escape sequence` (22P05) — text can't hold it.
+fn validate_json(content: &str, jsonb: bool) -> Result<(), String> {
     let mut p = JsonParser {
         bytes: content.as_bytes(),
         pos: 0,
         depth: 0,
+        jsonb,
+        code_point_zero: false,
     };
     let ok = (|| {
         p.skip_ws();
@@ -767,6 +779,7 @@ fn validate_json(content: &str) -> Result<(), String> {
     })();
     match ok {
         Some(()) => Ok(()),
+        None if p.code_point_zero => Err("unsupported Unicode escape sequence".to_string()),
         None => Err("invalid input syntax for type json".to_string()),
     }
 }
@@ -775,6 +788,10 @@ struct JsonParser<'a> {
     bytes: &'a [u8],
     pos: usize,
     depth: u32,
+    /// De-escape strings as `jsonb_in` does (see [`validate_json`]).
+    jsonb: bool,
+    /// The failure was a `\u0000` (`jsonb` only).
+    code_point_zero: bool,
 }
 
 impl JsonParser<'_> {
@@ -885,8 +902,16 @@ impl JsonParser<'_> {
 
     fn string(&mut self) -> Option<()> {
         self.eat(b'"')?;
+        // `json_lex_string` with `need_escapes`: a pending high surrogate
+        // must be followed by a low one right away.
+        let mut hi_surrogate = false;
         loop {
-            match self.peek()? {
+            let c = self.peek()?;
+            let unicode_escape = c == b'\\' && self.bytes.get(self.pos + 1) == Some(&b'u');
+            if hi_surrogate && !unicode_escape {
+                return None;
+            }
+            match c {
                 b'"' => {
                     self.pos += 1;
                     return Some(());
@@ -897,11 +922,25 @@ impl JsonParser<'_> {
                         b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => self.pos += 1,
                         b'u' => {
                             self.pos += 1;
+                            let mut ch = 0u32;
                             for _ in 0..4 {
-                                if !self.peek()?.is_ascii_hexdigit() {
-                                    return None;
-                                }
+                                let d = char::from(self.peek()?).to_digit(16)?;
+                                ch = ch * 16 + d;
                                 self.pos += 1;
+                            }
+                            if self.jsonb {
+                                match ch {
+                                    0xd800..=0xdbff if hi_surrogate => return None,
+                                    0xd800..=0xdbff => hi_surrogate = true,
+                                    0xdc00..=0xdfff if !hi_surrogate => return None,
+                                    0xdc00..=0xdfff => hi_surrogate = false,
+                                    _ if hi_surrogate => return None,
+                                    0 => {
+                                        self.code_point_zero = true;
+                                        return None;
+                                    }
+                                    _ => {}
+                                }
                             }
                         }
                         _ => return None,
@@ -2184,6 +2223,9 @@ mod tests {
             "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11",
             "A0EEBC999C0B4EF8BB6D6BB9BD380A11",
             "{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}",
+            // A hyphen may follow any group of four digits.
+            "{a0eebc99-9c0b4ef8-bb6d6bb9-bd380a11}",
+            "a0ee-bc99-9c0b-4ef8-bb6d-6bb9-bd38-0a11",
         ] {
             assert!(validate_uuid(ok).is_ok(), "{ok:?} should be valid");
         }
@@ -2191,6 +2233,11 @@ mod tests {
             "",
             "xyz",
             "a0-eebc999c0b4ef8bb6d6bb9bd380a11",
+            "a0e-ebc999c0b4ef8bb6d6bb9bd380a11",
+            "a0eebc99--9c0b4ef8bb6d6bb9bd380a11",
+            "-a0eebc999c0b4ef8bb6d6bb9bd380a11",
+            "a0eebc999c0b4ef8bb6d6bb9bd380a11-",
+            "{a0eebc999c0b4ef8bb6d6bb9bd380a11",
             " a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11 ",
             "a0eebc999c0b4ef8bb6d6bb9bd380a111",
         ] {
@@ -2208,8 +2255,39 @@ mod tests {
             "[1 , 2]",
             "-0",
         ] {
-            assert!(validate_json(ok).is_ok(), "{ok:?} should be valid");
+            assert!(validate_json(ok, false).is_ok(), "{ok:?} should be valid");
+            assert!(
+                validate_json(ok, true).is_ok(),
+                "{ok:?} should be valid jsonb"
+            );
         }
+        // Escapes only jsonb_in de-escapes (and must be able to).
+        for ok_json_only in [
+            "\"\\u0000\"",
+            "\"\\ud800\"",
+            "\"\\udc00\"",
+            "\"\\ud800x\"",
+            "\"\\ud800\\ud800\"",
+        ] {
+            assert!(
+                validate_json(ok_json_only, false).is_ok(),
+                "{ok_json_only:?}"
+            );
+            assert!(
+                validate_json(ok_json_only, true).is_err(),
+                "{ok_json_only:?}"
+            );
+        }
+        assert_eq!(
+            validate_json("\"a\\u0000\"", true).unwrap_err(),
+            "unsupported Unicode escape sequence"
+        );
+        // The first error wins: a lone surrogate before a `\u0000`.
+        assert_eq!(
+            validate_json("\"\\ud800\\u0000\"", true).unwrap_err(),
+            "invalid input syntax for type json"
+        );
+        assert!(validate_json("\"\\ud83d\\ude00 \\\\u0000\"", true).is_ok());
         for bad in [
             "",
             "  ",
@@ -2221,7 +2299,14 @@ mod tests {
             "{1:2}",
             "'x'",
         ] {
-            assert!(validate_json(bad).is_err(), "{bad:?} should be invalid");
+            assert!(
+                validate_json(bad, false).is_err(),
+                "{bad:?} should be invalid"
+            );
+            assert!(
+                validate_json(bad, true).is_err(),
+                "{bad:?} should be invalid jsonb"
+            );
         }
     }
 

@@ -914,6 +914,11 @@ pub struct PgOperator {
     /// (PG: `0`).
     #[serde(with = "crate::oid::oid_or_zero")]
     pub oprcom: Option<PgOperatorOid>,
+    /// FK `pg_operator.oid` of the negator. `None` when it has none (PG:
+    /// `0`). A row comparison reads a `<>` through it
+    /// (`get_op_index_interpretation`).
+    #[serde(with = "crate::oid::oid_or_zero")]
+    pub oprnegate: Option<PgOperatorOid>,
 }
 
 /// `pg_cast`: a cast rule between two types.

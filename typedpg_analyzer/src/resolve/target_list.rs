@@ -381,6 +381,14 @@ pub(crate) fn analyze_values_lists(
         }
     }
 
+    // Each cell is coerced to its column's common type, which may map a
+    // value to NULL.
+    for (i, types) in column_types.iter().enumerate() {
+        column_nullable[i] |= types
+            .iter()
+            .any(|&t| expr::coercion_can_return_null(t, common[i], snapshot));
+    }
+
     // Back-fill: re-walk cells whose type stayed UNKNOWN with the column's
     // resolved common type as the goal, so `(VALUES (42), ($1))` pins the
     // param to int4 (matching PG's Describe) and string-literal contents
