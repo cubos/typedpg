@@ -151,9 +151,8 @@ impl<T: Executor + Sync> Executor for &T {
         (**self).query_stream(sql, params).await
     }
 
-    // Not an `async fn`: forwarding the inner future sidesteps Rust 1.88
-    // (the MSRV) rejecting the generic's lifetime bound in one
-    // (rust#100013).
+    // Not an `async fn`: forwarding the inner future sidesteps rustc
+    // rejecting the generic's lifetime bound in one (rust#100013).
     fn copy_in<'a, I>(
         &'a self,
         describe_sql: &'a str,

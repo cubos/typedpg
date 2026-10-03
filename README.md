@@ -811,7 +811,7 @@ Measured on a schema of ~300 tables: replaying the migrations goes from ~0.5 s t
 
 ## Requirements
 
-- Rust 1.88+
+- Rust 1.89+
 
 ## License
 

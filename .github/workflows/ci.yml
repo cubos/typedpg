@@ -67,7 +67,7 @@ jobs:
           FUZZ_STRICT: single
 
   msrv:
-    name: minimum Rust version (1.88)
+    name: minimum Rust version (1.89)
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -75,7 +75,7 @@ jobs:
         with:
           submodules: true
       # Keep in sync with `rust-version` in the workspace Cargo.toml.
-      - uses: dtolnay/rust-toolchain@1.88
+      - uses: dtolnay/rust-toolchain@1.89
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets
 
