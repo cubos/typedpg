@@ -38,6 +38,24 @@ pub(crate) fn infer_func_call(
 
     validate_within_group(func)?;
 
+    // A window call reads the other rows of its partition: what only
+    // holds of the row the value is read for (a CASE branch's WHEN, the
+    // AND / OR arms before it) says nothing of them.
+    if func.over.is_some()
+        && let Some(level) = ctx.null_ctx.for_other_rows()
+    {
+        return infer_func_call(func, ctx.with_null_ctx(&level), params);
+    }
+    // An aggregate's arguments are evaluated for its input rows — rows
+    // past FROM and WHERE, even where the level's own row may come from
+    // no input (see `NullabilityContext::where_exprs_off`).
+    if func.over.is_none() && ctx.null_ctx.where_exprs_off && only_aggregates_named(func, snapshot)
+    {
+        let mut rows = ctx.null_ctx.clone();
+        rows.where_exprs_off = false;
+        return infer_func_call(func, ctx.with_null_ctx(&rows), params);
+    }
+
     // `x(t)` may be the column projection `(t).x` (tried before lookup).
     if let Some(field) = try_column_projection(func, ctx, params)? {
         return Ok(field);
@@ -93,6 +111,24 @@ pub(crate) fn infer_func_call(
 
     check_call_shape(func, Some(&resolved), &args, &notation, ctx)?;
     ctx.note_proc(Some(resolved.oid));
+    // A call leaving parameters out runs their DEFAULT expressions — unless
+    // the function is inlined (a simple SQL body, which CheckMutability
+    // judges by itself).
+    if snapshot
+        .pg_proc
+        .get(&resolved.oid)
+        .is_some_and(|p| func.args.len() < p.proargtypes.len())
+        && !snapshot.inline_sql_bodies.contains_key(&resolved.oid)
+    {
+        for &p in snapshot
+            .proc_default_procs
+            .get(&resolved.oid)
+            .into_iter()
+            .flatten()
+        {
+            ctx.note_proc(Some(p));
+        }
+    }
     // A plain call of a strict function is NULL for a NULL argument — not
     // an aggregate or window call, nor a variadic one, whose arguments are
     // packed into an array the function sees whole.
@@ -109,6 +145,16 @@ pub(crate) fn infer_func_call(
                 .iter()
                 .zip(&resolved.arg_types)
                 .all(|(&a, &d)| ctx.coercion_is_strict(a, d)),
+    );
+    // `num_nulls` / `num_nonnulls` as the analyzer counts them: the
+    // built-in ones, not a user function of the name the call resolved to.
+    ctx.note_strict(
+        func.location,
+        crate::nonnull::StrictNode::NullCount,
+        snapshot.pg_proc.get(&resolved.oid).is_some_and(|p| {
+            matches!(p.proname.as_str(), "num_nulls" | "num_nonnulls")
+                && snapshot.namespace_name(p.pronamespace) == Some("pg_catalog")
+        }),
     );
     for (&actual, &declared) in args.types.iter().zip(&resolved.arg_types) {
         ctx.note_coercion(actual, declared);
@@ -164,6 +210,9 @@ pub(crate) fn infer_func_call(
     // are inferred and validated.
     let filter_log = crate::nonnull::StrictLog::default();
     walk_func_modifiers(func, ctx, params, &filter_log)?;
+    if let Some(outer) = ctx.strict_log {
+        outer.absorb(&filter_log);
+    }
     let mut args = args;
     if resolved.is_aggregate {
         narrow_by_filter(func, &mut args, ctx, params, &filter_log);
@@ -968,6 +1017,21 @@ pub(crate) fn is_nonempty_1d_array_agg(
 /// none), a window frame holding the current row, or a group — every
 /// GROUP BY group has rows, the empty grouping set's has them when the
 /// input does (`input_not_empty`: a constant source, or HAVING proving it).
+/// Every function the call's name may resolve to is an aggregate.
+fn only_aggregates_named(func: &protobuf::FuncCall, snapshot: &PgCatalog) -> bool {
+    let parts = extract_string_fields(&func.funcname);
+    let (schema, name) = match parts.as_slice() {
+        [n] => (None, n.as_str()),
+        [s, n] => (Some(s.as_str()), n.as_str()),
+        _ => return false,
+    };
+    let candidates = snapshot.find_functions(schema, name);
+    !candidates.is_empty()
+        && candidates
+            .iter()
+            .all(|p| matches!(p.prokind, crate::pg_catalog::ProKind::Aggregate))
+}
+
 pub(crate) fn aggregate_reads_rows(
     has_filter: bool,
     over: Option<&protobuf::WindowDef>,
@@ -1839,10 +1903,17 @@ fn resolve_func_nullability(
             // whatever rows there are, a NULL one included.
             false
         } else {
-            // A proven-present value is a row.
+            // A proven-present value is a row. An aggregate of an outer
+            // level (over its columns only: `(SELECT max(t.h))`) reads
+            // that level's rows, which this level knows nothing of.
             let rows =
-                aggregate_reads_rows(func.agg_filter.is_some(), func.over.as_deref(), null_ctx)
-                    || value_args.iter().any(|&i| proven(i));
+                func.over.is_some() || crate::grouping::aggregate_levels_up(func, ctx.scope) == 0;
+            let rows = rows
+                && (aggregate_reads_rows(
+                    func.agg_filter.is_some(),
+                    func.over.as_deref(),
+                    null_ctx,
+                ) || value_args.iter().any(|&i| proven(i)));
             !rows || over_rows()
         }
     } else if resolved.schema == "pg_catalog"

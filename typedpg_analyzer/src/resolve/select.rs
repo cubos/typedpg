@@ -316,9 +316,12 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
             correlated = Some(facts.clone().restricted_to(&outer));
         }
         null_ctx.add_where_facts(facts.restricted_to(&own));
-        null_ctx.where_exprs_off = (sel.group_clause.is_empty() || null_ctx.has_empty_grouping_set)
-            && may_aggregate(sel, &scope, snapshot);
     }
+    // An empty grouping set yields its row from no input, aggregates or
+    // not (`GROUP BY ()`, `GROUPING SETS ((), ())`); so does an aggregate
+    // query without GROUP BY.
+    null_ctx.where_exprs_off = null_ctx.has_empty_grouping_set
+        || (sel.group_clause.is_empty() && may_aggregate(sel, &scope, snapshot));
     // FROM and WHERE always leaving a row: an aggregate without GROUP BY
     // sees rows, and the level yields one.
     let input_nonempty = input_nonempty(sel, &scope, &log, snapshot);
@@ -375,7 +378,7 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
         // omits (those groups are the ones HAVING drops).
         let facts = crate::nonnull::nonnullable(having, true, &scope, &log, snapshot)
             .restricted_to(&crate::nonnull::own_aliases(&scope));
-        null_ctx.add_local_facts(facts);
+        null_ctx.add_having_facts(facts);
         // What the groups left must hold: rows, non-NULL aggregated values.
         let facts = crate::having::having_facts(having, &scope, snapshot);
         null_ctx.input_not_empty |= facts.input_not_empty;

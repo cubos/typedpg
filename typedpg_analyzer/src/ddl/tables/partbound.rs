@@ -20,6 +20,17 @@ pub(crate) struct PartSpec {
     keys: Vec<PartKey>,
 }
 
+impl PartSpec {
+    /// RENAME COLUMN `old` TO `new` of the partitioned table.
+    pub(crate) fn rename_key_column(&mut self, old: &str, new: &str) {
+        for k in &mut self.keys {
+            if k.name.as_deref() == Some(old) {
+                k.name = Some(new.to_owned());
+            }
+        }
+    }
+}
+
 /// One partition key column or expression.
 #[derive(Clone, Debug)]
 struct PartKey {
@@ -38,6 +49,9 @@ struct PartKey {
     /// The attnums of the columns the key is strict in: the key column
     /// itself, or those a key expression is NULL for when they are.
     strict_attnums: Vec<i16>,
+    /// A key column's type modifier (`varchar(2)`): a bound value is
+    /// coerced to it (transformPartitionBoundValue).
+    typmod: Option<i32>,
 }
 
 /// The collation a `COLLATE` clause names.
@@ -204,6 +218,7 @@ pub(super) fn record_partition_spec(
                     || compares_bytes(interp, opclass),
                 opclass,
                 strict_attnums: attr.map(|a| a.attnum).into_iter().collect(),
+                typmod: attr.and_then(|a| interp.effective_typmod(a.atttypid, a.atttypmod)),
             });
         } else if let Some(expr) = pe.expr.as_deref() {
             let typ = match crate::ddl::volatile::infer_over_relation(interp, relid, expr, None) {
@@ -226,6 +241,7 @@ pub(super) fn record_partition_spec(
                     || compares_bytes(interp, opclass),
                 opclass,
                 strict_attnums,
+                typmod: None,
             });
         }
     }
@@ -307,6 +323,7 @@ fn transform_bound(
                 code_point_order: false,
                 opclass: None,
                 strict_attnums: Vec::new(),
+                typmod: None,
             });
             let mut values: Vec<Option<Datum>> = Vec::new();
             for v in &spec.listdatums {
@@ -453,7 +470,21 @@ fn bound_value(
         infer_expr(v, ctx(), &mut params, TypeGoal::assignment(*key_type))
             .map_err(|e| DdlError::Parse(e.to_string()))?;
     }
-    let datum = normalize(interp, v, key);
+    let datum = match normalize(interp, v, key) {
+        // The value coerced to a `varchar(n)` / `char(n)` key: too long
+        // is an error unless the excess is blanks, which go.
+        Datum::Text(t) | Datum::CodePoints(t)
+            if let Some(msg) = crate::typmod::char_length_violation(
+                interp,
+                interp.unwrap_domain(*key_type),
+                key.typmod,
+                &t,
+            ) =>
+        {
+            return Err(DdlError::Parse(msg));
+        }
+        d => d,
+    };
     // evaluate_expr: the value coerced to an integer key must fit it (the
     // cast's "smallint out of range").
     let base = interp.unwrap_domain(*key_type);
@@ -489,13 +520,54 @@ fn normalize(
         Some(crate::pg_catalog::TypCategory::String)
     );
     let bool_key = key == oid::BOOL;
+    // A constant cast to a type that keeps its value as the key's: the
+    // key's own type, another integer type (or numeric) for an integer
+    // key, text / varchar for a text or varchar one. Not through a type
+    // modifier (`'bc'::char(1)` is `'b'`, `15::numeric(1,-1)` is 20), nor
+    // through `bpchar` (whose trailing blanks a text key loses) or a date
+    // (a timestamp key's time of day).
+    let keeps_value = |tc: &typedpg_pg_query::protobuf::TypeCast| {
+        let Some(t) = crate::nonnull::cast_target(tc, interp).map(|t| interp.unwrap_domain(t))
+        else {
+            return false;
+        };
+        let texts = [oid::TEXT, oid::VARCHAR];
+        t == key
+            || (integer_key && [oid::INT2, oid::INT4, oid::INT8, oid::NUMERIC].contains(&t))
+            || (texts.contains(&key) && texts.contains(&t))
+    };
     let literal = match v.node.as_ref() {
         Some(node::Node::AConst(c)) => c.val.as_ref(),
-        Some(node::Node::TypeCast(tc)) => match tc.arg.as_deref().and_then(|a| a.node.as_ref()) {
-            Some(node::Node::AConst(c)) => c.val.as_ref(),
-            _ => None,
-        },
+        Some(node::Node::TypeCast(tc)) if keeps_value(tc) => {
+            match tc.arg.as_deref().and_then(|a| a.node.as_ref()) {
+                Some(node::Node::AConst(c)) => c.val.as_ref(),
+                _ => None,
+            }
+        }
         _ => None,
+    };
+    // The key's typmod: a `varchar(n)` / `char(n)` value loses the blanks
+    // past its `n`th character (more is an error, see `bound_value`); a
+    // `char(n)` value compares without its trailing blanks.
+    let fitted = |s: &str| -> String {
+        let n = match crate::typmod::decode(interp, key, part_key.typmod) {
+            crate::typmod::DecodedTypmod::Length(n) => usize::try_from(n).ok(),
+            _ => None,
+        };
+        let fit: String = match n {
+            Some(n)
+                if crate::typmod::char_length_violation(interp, key, part_key.typmod, s)
+                    .is_none() =>
+            {
+                s.chars().take(n).collect()
+            }
+            _ => s.to_owned(),
+        };
+        if key == oid::BPCHAR {
+            fit.trim_end_matches(' ').to_owned()
+        } else {
+            fit
+        }
     };
     if integer_key && let Some(i) = fold_integer(v) {
         return Datum::Int(i);
@@ -519,9 +591,9 @@ fn normalize(
             iso_datetime(&s.sval).map_or(Datum::Opaque, Datum::Stamp)
         }
         Some(Val::Sval(s)) if text_key && part_key.code_point_order => {
-            Datum::CodePoints(s.sval.clone())
+            Datum::CodePoints(fitted(&s.sval))
         }
-        Some(Val::Sval(s)) if text_key => Datum::Text(s.sval.clone()),
+        Some(Val::Sval(s)) if text_key => Datum::Text(fitted(&s.sval)),
         _ => Datum::Opaque,
     }
 }

@@ -97,8 +97,8 @@ pub(crate) fn fk_follows(
     parent_rel: crate::oid::PgClassOid,
     wanted: &BTreeSet<(String, String)>,
 ) -> bool {
-    if snapshot.ri_triggers_disabled.contains(&child_rel)
-        || snapshot.ri_triggers_disabled.contains(&parent_rel)
+    if crate::ddl::tables::inherit::fk_triggers_disabled(snapshot, child_rel)
+        || crate::ddl::tables::inherit::fk_triggers_disabled(snapshot, parent_rel)
     {
         return false;
     }

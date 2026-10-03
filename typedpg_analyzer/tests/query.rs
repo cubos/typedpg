@@ -46,6 +46,8 @@ mod dml_soundness;
 mod expression_facts;
 #[path = "query/expressions.rs"]
 mod expressions;
+#[path = "query/fact_soundness.rs"]
+mod fact_soundness;
 #[path = "query/function_aggregate_narrowing.rs"]
 mod function_aggregate_narrowing;
 #[path = "query/function_soundness.rs"]

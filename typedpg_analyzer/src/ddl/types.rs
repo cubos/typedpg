@@ -72,10 +72,11 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
         .unwrap_or((TypCategory::UserDefined, false));
 
     // `CREATE DOMAIN d AS T NOT NULL` lands in `stmt.constraints` as a
-    // `Constraint { contype = CONSTR_NOTNULL }`. PG also forbids null defaults
-    // on a NOT NULL domain, but the analyzer doesn't model defaults yet.
+    // `Constraint { contype = CONSTR_NOTNULL }`. A DEFAULT is recorded only
+    // as there (`domain_defaults`), not as a value.
     let mut constraints: Vec<DomainConstraint> = Vec::new();
     let mut saw_default = false;
+    let mut has_default = false;
     let mut null_defined = false;
     let mut typ_not_null = false;
     for n in &stmt.constraints {
@@ -149,6 +150,7 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
             && let Some(expr) = c.raw_expr.as_deref()
         {
             super::defaults::check_default(interp, expr, &name, base_type_oid)?;
+            has_default = !is_null_constant(expr);
         }
         add_domain_constraint(interp, &name, base_type_oid, c, &mut constraints)?;
     }
@@ -187,9 +189,21 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
     });
 
     register_array_type(interp, nsoid, &name, oid)?;
+    if has_default {
+        interp.domain_defaults.insert(oid);
+    }
     interp.domain_constraints.insert(oid, constraints);
     record_domain_constraint_dependencies(interp, oid)?;
     Ok(())
+}
+
+/// A bare `NULL`, cast or not: a default that is no default.
+fn is_null_constant(expr: &typedpg_pg_query::protobuf::Node) -> bool {
+    match expr.node.as_ref() {
+        Some(node::Node::AConst(c)) => c.isnull,
+        Some(node::Node::TypeCast(tc)) => tc.arg.as_deref().is_some_and(is_null_constant),
+        _ => false,
+    }
 }
 
 /// A named domain constraint (`pg_constraint` row with `contypid` set).
@@ -202,6 +216,9 @@ pub(crate) struct DomainConstraint {
     /// What a CHECK's expression refers to, until the constraint's
     /// dependencies are recorded.
     pub(crate) refs: Vec<super::depend::Reference>,
+    /// NULL fails it: a NOT NULL, or a CHECK that is FALSE for a NULL
+    /// `VALUE` (`CHECK (VALUE IS NOT NULL)`).
+    pub(crate) rejects_null: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -223,11 +240,15 @@ fn add_domain_constraint(
     existing: &mut Vec<DomainConstraint>,
 ) -> Result<(), DdlError> {
     let mut refs = Vec::new();
+    let mut rejects_null = false;
     let kind = match ConstrType::try_from(c.contype) {
-        Ok(ConstrType::ConstrNotnull) => DomainConstraintKind::NotNull,
+        Ok(ConstrType::ConstrNotnull) => {
+            rejects_null = true;
+            DomainConstraintKind::NotNull
+        }
         Ok(ConstrType::ConstrCheck) => {
             if let Some(expr) = c.raw_expr.as_deref() {
-                refs = check_domain_check_expression(interp, base_type, expr)?;
+                (refs, rejects_null) = check_domain_check_expression(interp, base_type, expr)?;
             }
             DomainConstraintKind::Check
         }
@@ -274,6 +295,7 @@ fn add_domain_constraint(
         name,
         kind,
         refs,
+        rejects_null,
     });
     Ok(())
 }
@@ -303,12 +325,13 @@ fn record_domain_constraint_dependencies(
 }
 
 /// A domain CHECK expression sees `VALUE` as a value of the base type and
-/// must yield boolean (`domainAddCheckConstraint`).
+/// must yield boolean (`domainAddCheckConstraint`). Returns what it refers
+/// to, and whether it is FALSE for a NULL `VALUE` (see [`crate::nonnull::subst`]).
 fn check_domain_check_expression(
     interp: &PgCatalog,
     base_type: PgTypeOid,
     expr: &typedpg_pg_query::protobuf::Node,
-) -> Result<Vec<super::depend::Reference>, DdlError> {
+) -> Result<(Vec<super::depend::Reference>, bool), DdlError> {
     use crate::expr::{TypeGoal, infer_expr};
     use crate::nullability::NullabilityContext;
     use crate::param_collector::ParamCollector;
@@ -351,10 +374,11 @@ fn check_domain_check_expression(
     {
         return Err(DdlError::Parse(format!("there is no parameter ${number}")));
     }
+    let log = crate::nonnull::StrictLog::default();
     let (result, refs) = super::depend::collect(|| {
         infer_expr(
             expr,
-            crate::expr::Ctx::new(&scope, &null_ctx, interp),
+            crate::expr::Ctx::new(&scope, &null_ctx, interp).logging_strictness(&log),
             &mut params,
             TypeGoal::NONE,
         )
@@ -367,7 +391,20 @@ fn check_domain_check_expression(
             super::util::format_type_for_message(interp, result.type_oid)
         )));
     }
-    Ok(refs)
+    let value_col = scope
+        .sources
+        .first()
+        .map(|s| (s.alias.clone(), "value".to_owned()))
+        .unwrap_or_default();
+    let rejects_null = crate::nonnull::subst::Subst {
+        null: &value_col,
+        scope: &scope,
+        log: &log,
+        snapshot: interp,
+    }
+    .eval(expr)
+        == crate::nonnull::subst::Val::Bool(false);
+    Ok((refs, rejects_null))
 }
 
 // ─── ALTER DOMAIN ───────────────────────────────────────────────────────────
@@ -451,6 +488,14 @@ pub fn alter_domain(
         "T" => {
             if let Some(expr) = stmt.def.as_deref() {
                 super::defaults::check_default(interp, expr, name, base_type)?;
+            }
+            match stmt.def.as_deref() {
+                Some(expr) if !is_null_constant(expr) => {
+                    interp.domain_defaults.insert(type_oid);
+                }
+                _ => {
+                    interp.domain_defaults.remove(&type_oid);
+                }
             }
         }
         _ => {}
@@ -1017,6 +1062,9 @@ pub fn alter_enum(interp: &mut PgCatalog, stmt: &AlterEnumStmt) -> Result<(), Dd
                 .uncommitted_enum_labels
                 .insert((oid, stmt.new_val.clone()));
         }
+        // PG keeps the label's OID in stored expressions: they read the
+        // new label.
+        super::stored_exprs::rename_enum_label(interp, oid, &stmt.old_val, &stmt.new_val);
         return Ok(());
     }
 

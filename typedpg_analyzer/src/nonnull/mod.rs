@@ -96,18 +96,103 @@ pub(crate) enum StrictNode {
     /// where the comparison is read.
     DistinctLeftNonNull,
     DistinctRightNonNull,
+    /// An `A_Expr` (or a simple CASE's `test = value`, at its WHEN) whose
+    /// every operator is a built-in comparison (`=` `<>` `<` `<=` `>` `>=`
+    /// of `pg_catalog`, run by a `pg_catalog` function, returning
+    /// boolean): what [`column_pred`] and the CHECK reading take it to be.
+    /// A user-defined `=` (an exact-signature one on an enum or a domain,
+    /// which beats the built-in) may mean anything.
+    BuiltinCompare,
+    /// A call that resolved to `pg_catalog.num_nulls` /
+    /// `pg_catalog.num_nonnulls` (not a user function of the name).
+    NullCount,
+    /// A COALESCE / GREATEST / LEAST whose common type keeps the integer,
+    /// text and boolean constants [`subst`] folds exactly (no float, no
+    /// typmod): its folded value is the one PG computes.
+    ExactFold,
+    /// A COALESCE / GREATEST / LEAST of a float type: it keeps an integer
+    /// constant only up to the float's precision (`16777217::real` is
+    /// 16777216).
+    FloatFold,
+    /// `StdCompare` with a float operand: integer constants compare as
+    /// written only up to the float's precision.
+    FloatCompare,
+}
+
+/// What a node being trusted means: [`StrictLog::is_strict`], or the same
+/// question asked of what a CHECK constraint resolved to when it was
+/// created ([`TrustedNodes`]).
+pub(crate) trait Trust {
+    fn trusts(&self, location: i32, kind: StrictNode) -> bool;
+}
+
+impl Trust for StrictLog {
+    fn trusts(&self, location: i32, kind: StrictNode) -> bool {
+        self.is_strict(location, kind)
+    }
+}
+
+/// The nodes of a stored expression a [`StrictLog`] recorded as strict
+/// (or as a built-in comparison, …) when the expression was resolved — as
+/// PG keeps a CHECK constraint's operators and functions by OID — and the
+/// type each untyped string literal in it was coerced to.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TrustedNodes {
+    pub nodes: HashSet<(i32, StrictNode)>,
+    pub literal_types: HashMap<i32, crate::oid::PgTypeOid>,
+}
+
+impl Trust for TrustedNodes {
+    fn trusts(&self, location: i32, kind: StrictNode) -> bool {
+        location >= 0 && self.nodes.contains(&(location, kind))
+    }
 }
 
 /// Per-node strictness recorded while a qual is typed, plus what the
 /// `EXISTS` sublinks in it prove of the enclosing level's columns (keyed
-/// by the sublink's location; see [`capture_correlation`]).
+/// by the sublink's location; see [`capture_correlation`]), and the type
+/// each untyped string literal was coerced to (by its location).
 #[derive(Debug, Default)]
 pub(crate) struct StrictLog(
     RefCell<HashMap<(i32, StrictNode), bool>>,
     RefCell<HashMap<i32, Facts>>,
+    RefCell<HashMap<i32, crate::oid::PgTypeOid>>,
 );
 
 impl StrictLog {
+    /// Record that the untyped string literal at `location` was coerced
+    /// to `type_oid`.
+    pub fn note_literal_type(&self, location: i32, type_oid: crate::oid::PgTypeOid) {
+        if location >= 0 {
+            self.2.borrow_mut().insert(location, type_oid);
+        }
+    }
+
+    /// Add what `other` (a log kept for part of the expression this one
+    /// is about) recorded.
+    pub fn absorb(&self, other: &StrictLog) {
+        for (&(location, kind), &strict) in other.0.borrow().iter() {
+            self.note(location, kind, strict);
+        }
+        self.2
+            .borrow_mut()
+            .extend(other.2.borrow().iter().map(|(k, v)| (*k, *v)));
+    }
+
+    /// What this log trusts, kept apart from it.
+    pub fn trusted(&self) -> TrustedNodes {
+        TrustedNodes {
+            nodes: self
+                .0
+                .borrow()
+                .iter()
+                .filter(|(_, s)| **s)
+                .map(|(k, _)| *k)
+                .collect(),
+            literal_types: self.2.borrow().clone(),
+        }
+    }
+
     /// Record that the node of `kind` at `location` runs strict code
     /// (`strict`): a NULL input gives a NULL output. Several records for
     /// one node (BETWEEN's two comparisons) must all be strict.
@@ -707,7 +792,7 @@ fn nonnullable_node(
         },
         node::Node::AExpr(e) => {
             use protobuf::AExprKind as K;
-            if top_level && let Some(f) = null_count_facts(e, scope) {
+            if top_level && let Some(f) = null_count_facts(e, scope, log) {
                 return f;
             }
             match K::try_from(e.kind) {
@@ -783,7 +868,7 @@ fn nonnullable_node(
                 Ok(K::AexprOp) => {
                     let strict = walk_opt(&e.lexpr, false).union(walk_opt(&e.rexpr, false));
                     if top_level {
-                        strict.union(comparison_facts(e, scope, snapshot))
+                        strict.union(comparison_facts(e, scope, log, snapshot))
                     } else {
                         strict
                     }
@@ -796,10 +881,10 @@ fn nonnullable_node(
                 // `x <> item`), BETWEEN an AND / OR of comparisons on `x`:
                 // all strict in `x` at any level.
                 Ok(K::AexprIn) if top_level => {
-                    walk_opt(&e.lexpr, false).union(comparison_facts(e, scope, snapshot))
+                    walk_opt(&e.lexpr, false).union(comparison_facts(e, scope, log, snapshot))
                 }
                 Ok(K::AexprBetween) if top_level => {
-                    walk_opt(&e.lexpr, false).union(between_facts(e, scope, snapshot))
+                    walk_opt(&e.lexpr, false).union(between_facts(e, scope, log, snapshot))
                 }
                 Ok(
                     K::AexprIn
@@ -813,8 +898,8 @@ fn nonnullable_node(
                 // `ALL` over an empty array is TRUE whatever `x` is.
                 Ok(K::AexprOpAny) if top_level => walk_opt(&e.lexpr, false)
                     .union(walk_opt(&e.rexpr, false))
-                    .union(comparison_facts(e, scope, snapshot)),
-                Ok(K::AexprOpAll) if top_level => comparison_facts(e, scope, snapshot),
+                    .union(comparison_facts(e, scope, log, snapshot)),
+                Ok(K::AexprOpAll) if top_level => comparison_facts(e, scope, log, snapshot),
                 _ => Facts::default(),
             }
         }
@@ -1120,7 +1205,7 @@ fn value_pred(
         // The operator resolved (and, being strict, is one of the
         // comparison operators `column_pred` reads).
         node::Node::AExpr(e) if log.is_strict(e.location, StrictNode::Op) => {
-            column_pred(e, scope, snapshot)
+            column_pred(e, scope, log, snapshot)
         }
         _ => None,
     }
@@ -1276,7 +1361,8 @@ pub(crate) fn literal(n: &protobuf::Node) -> Option<Literal> {
 /// another type, nor under a COLLATE: the comparison would then be
 /// another type's or collation's (`'A'::citext`, a nondeterministic
 /// collation make `'A'` equal `'a'`), and its equality says nothing a
-/// CHECK on the column can use.
+/// CHECK on the column can use. Nor one cast with a type modifier
+/// ([`cast_target`]): `'abc'::varchar(2)` is `'ab'`.
 pub(crate) fn literal_for(
     n: &protobuf::Node,
     column_type: crate::oid::PgTypeOid,
@@ -1284,7 +1370,7 @@ pub(crate) fn literal_for(
 ) -> Option<Literal> {
     match n.node.as_ref()? {
         node::Node::TypeCast(tc) => {
-            let target = crate::ddl::util::resolve_type_name(tc.type_name.as_ref()?, snapshot)?;
+            let target = cast_target(tc, snapshot)?;
             (target == column_type)
                 .then(|| literal(tc.arg.as_deref()?))
                 .flatten()
@@ -1293,11 +1379,41 @@ pub(crate) fn literal_for(
     }
 }
 
+/// The type an explicit cast converts to, when the conversion keeps a
+/// constant's value as written: `None` when it applies a type modifier —
+/// written (`varchar(2)`, `numeric(1,-1)`, `char` — which is `char(1)`) or
+/// a domain's (`CREATE DOMAIN d AS varchar(2)`) — which may truncate,
+/// round or pad the value.
+pub(crate) fn cast_target(
+    tc: &protobuf::TypeCast,
+    snapshot: &PgCatalog,
+) -> Option<crate::oid::PgTypeOid> {
+    let type_name = tc.type_name.as_ref()?;
+    if !type_name.typmods.is_empty() {
+        return None;
+    }
+    let target = crate::ddl::util::resolve_type_name(type_name, snapshot)?;
+    // An array of a domain with a modifier applies it to each element.
+    let elem = snapshot
+        .pg_type
+        .get(&target)
+        .and_then(|t| t.typelem)
+        .unwrap_or(target);
+    (snapshot.effective_typmod(target, None).is_none()
+        && snapshot.effective_typmod(elem, None).is_none())
+    .then_some(target)
+}
+
 /// `col op constant` (either way round), `col IN (…)`, `col = ANY (…)`
 /// and `col <> ALL (…)` over constants, TRUE: what it says of the column
 /// (equal to a constant, one or none of several, ordered against one).
-fn comparison_facts(e: &protobuf::AExpr, scope: &Scope, snapshot: &PgCatalog) -> Facts {
-    let Some((c, p)) = column_pred(e, scope, snapshot) else {
+fn comparison_facts(
+    e: &protobuf::AExpr,
+    scope: &Scope,
+    log: &StrictLog,
+    snapshot: &PgCatalog,
+) -> Facts {
+    let Some((c, p)) = column_pred(e, scope, log, snapshot) else {
         return Facts::default();
     };
     let mut f = Facts::default();
@@ -1310,11 +1426,20 @@ fn comparison_facts(e: &protobuf::AExpr, scope: &Scope, snapshot: &PgCatalog) ->
     f
 }
 
-/// `col BETWEEN a AND b` over constants, TRUE: `col >= a AND col <= b`.
-fn between_facts(e: &protobuf::AExpr, scope: &Scope, snapshot: &PgCatalog) -> Facts {
+/// `col BETWEEN a AND b` over constants, TRUE: `col >= a AND col <= b`
+/// (when both comparisons are the built-in ones).
+fn between_facts(
+    e: &protobuf::AExpr,
+    scope: &Scope,
+    log: &StrictLog,
+    snapshot: &PgCatalog,
+) -> Facts {
     let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) else {
         return Facts::default();
     };
+    if !log.trusts(e.location, StrictNode::BuiltinCompare) {
+        return Facts::default();
+    }
     let (Some((c, t)), Some(node::Node::List(list))) = (plain_column(l, scope), r.node.as_ref())
     else {
         return Facts::default();
@@ -1333,13 +1458,19 @@ fn between_facts(e: &protobuf::AExpr, scope: &Scope, snapshot: &PgCatalog) -> Fa
 /// `c = ANY (…)` and `c <> ALL (…)` over an `ARRAY[…]` of constants or an
 /// array literal (`'{a,b}'`). A NULL in an IN list or an `ANY` array
 /// never makes it TRUE and is dropped; one in a NOT IN list or an `ALL`
-/// array makes it never TRUE, and nothing is said.
+/// array makes it never TRUE, and nothing is said. Only for the built-in
+/// comparisons (`trust` says which the expression resolved to): a
+/// user-defined `=` may hold for values that differ.
 pub(crate) fn column_pred(
     e: &protobuf::AExpr,
     scope: &Scope,
+    trust: &dyn Trust,
     snapshot: &PgCatalog,
 ) -> Option<(Col, ValPred)> {
     use protobuf::AExprKind as K;
+    if !trust.trusts(e.location, StrictNode::BuiltinCompare) {
+        return None;
+    }
     let op = crate::expr::extract_string_fields(&e.name).join(".");
     let (l, r) = (e.lexpr.as_deref()?, e.rexpr.as_deref()?);
     match K::try_from(e.kind).ok()? {
@@ -1443,7 +1574,7 @@ pub(crate) fn array_constants(
     match n.node.as_ref()? {
         node::Node::AArrayExpr(a) => constants(a.elements.iter(), t, drop_nulls, snapshot),
         node::Node::TypeCast(tc) => {
-            let target = crate::ddl::util::resolve_type_name(tc.type_name.as_ref()?, snapshot)?;
+            let target = cast_target(tc, snapshot)?;
             if snapshot.pg_type.get(&t).and_then(|ty| ty.typarray) != Some(target) {
                 return None;
             }
@@ -1512,8 +1643,16 @@ pub(crate) fn array_constants(
 }
 
 /// How many of `num_nonnulls(args)` / `num_nulls(args)` a comparison with
-/// an integer constant allows non-NULL: `(at least, at most)`.
-pub(crate) fn null_count_bounds(e: &protobuf::AExpr) -> Option<(&[protobuf::Node], i64, i64)> {
+/// an integer constant allows non-NULL: `(at least, at most)` — when the
+/// call is `pg_catalog`'s (`trust` says what it resolved to) and so is
+/// the comparison.
+pub(crate) fn null_count_bounds<'e>(
+    e: &'e protobuf::AExpr,
+    trust: &dyn Trust,
+) -> Option<(&'e [protobuf::Node], i64, i64)> {
+    if !trust.trusts(e.location, StrictNode::BuiltinCompare) {
+        return None;
+    }
     let op = crate::expr::extract_string_fields(&e.name).join(".");
     let (l, r) = (e.lexpr.as_deref()?, e.rexpr.as_deref()?);
     // `f(args) op n` or `n op f(args)` (flipped).
@@ -1546,7 +1685,11 @@ pub(crate) fn null_count_bounds(e: &protobuf::AExpr) -> Option<(&[protobuf::Node
         ["num_nulls"] | ["pg_catalog", "num_nulls"] => false,
         _ => return None,
     };
-    if call.func_variadic || call.agg_filter.is_some() || call.over.is_some() {
+    if call.func_variadic
+        || call.agg_filter.is_some()
+        || call.over.is_some()
+        || !trust.trusts(call.location, StrictNode::NullCount)
+    {
         return None;
     }
     let m = call.args.len() as i64;
@@ -1569,8 +1712,8 @@ pub(crate) fn null_count_bounds(e: &protobuf::AExpr) -> Option<(&[protobuf::Node
 
 /// `num_nonnulls(a, b) > 0` and kin over plain columns: at least one of
 /// them non-NULL — or every one, when all must be.
-fn null_count_facts(e: &protobuf::AExpr, scope: &Scope) -> Option<Facts> {
-    let (args, at_least, _) = null_count_bounds(e)?;
+fn null_count_facts(e: &protobuf::AExpr, scope: &Scope, log: &StrictLog) -> Option<Facts> {
+    let (args, at_least, _) = null_count_bounds(e, log)?;
     let cols: Option<BTreeSet<Col>> = args
         .iter()
         .map(|a| plain_column(a, scope).map(|(c, _)| c))

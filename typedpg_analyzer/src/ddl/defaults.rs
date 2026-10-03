@@ -69,12 +69,13 @@ pub(crate) fn check_function_default(
     expr: &protobuf::Node,
     param_type: PgTypeOid,
     polymorphic: bool,
+    used: &std::cell::RefCell<Vec<crate::oid::PgProcOid>>,
 ) -> Result<PgTypeOid, DdlError> {
     check_default_kind(interp, expr, false)?;
     let scope = Scope::default();
     let null_ctx = NullabilityContext::default();
     let mut params = ParamCollector::default();
-    let ctx = || crate::expr::Ctx::new(&scope, &null_ctx, interp);
+    let ctx = || crate::expr::Ctx::new(&scope, &null_ctx, interp).recording(used);
     let wrap = |e: crate::error::AnalyzeError| DdlError::UnsupportedDdl(format!("{e}"));
     let result = infer_expr(expr, ctx(), &mut params, TypeGoal::NONE).map_err(wrap)?;
     if polymorphic {

@@ -327,6 +327,8 @@ pub(crate) struct ParameterList {
     pub required_result: Option<PgTypeOid>,
     /// What the DEFAULT expressions refer to.
     pub default_refs: Vec<super::depend::Reference>,
+    /// The functions the DEFAULT expressions run.
+    pub default_procs: Vec<crate::oid::PgProcOid>,
     /// Whether any parameter has an OUT or VARIADIC mode (PG then stores
     /// `proallargtypes` / `proargmodes`).
     pub has_modes: bool,
@@ -349,6 +351,7 @@ pub(crate) fn interpret_function_parameter_list(
         variadic: None,
         required_result: None,
         default_refs: Vec::new(),
+        default_procs: Vec::new(),
         has_modes: false,
     };
     let mut out_count = 0;
@@ -458,11 +461,13 @@ pub(crate) fn interpret_function_parameter_list(
             }
             Some(expr) => {
                 let polymorphic = crate::polymorphic::is_polymorphic(toid);
+                let used = std::cell::RefCell::new(Vec::new());
                 let (default_type, refs) = super::depend::collect(|| {
-                    super::defaults::check_function_default(interp, expr, toid, polymorphic)
+                    super::defaults::check_function_default(interp, expr, toid, polymorphic, &used)
                 });
                 list.default_types.push(default_type?);
                 list.default_refs.extend(refs);
+                list.default_procs.extend(used.into_inner());
                 have_defaults = true;
             }
             None => {
@@ -617,6 +622,9 @@ pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Res
     );
 
     super::function_body::check_pseudo_types(interp, Some(&language), &proc)?;
+    interp
+        .proc_default_procs
+        .insert(proc.oid, params.default_procs.clone());
     if let Some(body) = super::function_body::inlinable_body(stmt, &proc) {
         interp.inline_sql_bodies.insert(proc.oid, body);
     }

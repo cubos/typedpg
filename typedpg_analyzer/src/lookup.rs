@@ -222,6 +222,68 @@ impl PgCatalog {
         None
     }
 
+    /// The domains of `oid`'s chain, outermost first (empty for a type that
+    /// isn't one).
+    fn domain_chain(&self, oid: PgTypeOid) -> Vec<PgTypeOid> {
+        let mut out = Vec::new();
+        let mut current = oid;
+        for _ in 0..32 {
+            match self.pg_type.get(&current) {
+                Some(t) if t.typtype == TypType::Domain => {
+                    out.push(current);
+                    match t.typbasetype {
+                        Some(base) => current = base,
+                        None => break,
+                    }
+                }
+                _ => break,
+            }
+        }
+        out
+    }
+
+    /// Whether a column of type `oid` without a DEFAULT of its own takes
+    /// one from its domain (or a domain under it).
+    pub(crate) fn domain_has_default(&self, oid: PgTypeOid) -> bool {
+        self.domain_chain(oid)
+            .iter()
+            .any(|d| self.domain_defaults.contains(d))
+    }
+
+    /// The error coercing a NULL to type `oid` raises: a domain of its
+    /// chain is NOT NULL, or has a CHECK a NULL fails. The NOT NULL is
+    /// checked first, then the CHECKs from the base domain out, by name
+    /// within one (`load_domaintype_info`); the message names `oid`
+    /// itself (`format_type_be` of the coercion's result type).
+    pub(crate) fn domain_null_violation(&self, oid: PgTypeOid) -> Option<String> {
+        let chain = self.domain_chain(oid);
+        let target = || crate::ddl::util::format_type_for_message(self, oid);
+        if chain
+            .iter()
+            .any(|d| self.pg_type.get(d).is_some_and(|t| t.typnotnull))
+        {
+            return Some(format!("domain {} does not allow null values", target()));
+        }
+        for d in chain.iter().rev() {
+            let mut checks: Vec<&crate::ddl::types::DomainConstraint> = self
+                .domain_constraints
+                .get(d)
+                .into_iter()
+                .flatten()
+                .filter(|c| c.kind == crate::ddl::types::DomainConstraintKind::Check)
+                .collect();
+            checks.sort_by(|a, b| a.name.cmp(&b.name));
+            if let Some(c) = checks.into_iter().find(|c| c.rejects_null) {
+                return Some(format!(
+                    "value for domain {} violates check constraint \"{}\"",
+                    target(),
+                    c.name
+                ));
+            }
+        }
+        None
+    }
+
     /// True when the type chain forces non-nullable semantics on the column,
     /// independent of `pg_attribute.attnotnull`.
     pub(crate) fn type_is_not_null(&self, oid: PgTypeOid) -> bool {

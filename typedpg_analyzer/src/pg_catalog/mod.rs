@@ -245,6 +245,9 @@ pub struct PgCatalog {
     /// with `contypid` set): what `ALTER DOMAIN ... DROP CONSTRAINT name`
     /// resolves against. The domain's effective NOT NULL lives in
     /// `pg_type.typnotnull`.
+    /// Domains with a DEFAULT (other than a bare NULL): a column of one
+    /// (or of a domain over one) without a DEFAULT of its own takes it.
+    pub(crate) domain_defaults: Shared<std::collections::HashSet<PgTypeOid>>,
     pub(crate) domain_constraints:
         Shared<HashMap<PgTypeOid, Vec<crate::ddl::types::DomainConstraint>>>,
     /// Type of each column DEFAULT expression as `strip_implicit_coercions`
@@ -269,6 +272,10 @@ pub struct PgCatalog {
     /// which PG substitutes for the call before checking an index or
     /// generation expression's mutability.
     pub(crate) inline_sql_bodies: Shared<HashMap<PgProcOid, typedpg_pg_query::protobuf::Node>>,
+    /// The functions the parameter DEFAULT expressions of each routine
+    /// created by the migrations run (PG expands them into a call that
+    /// leaves the parameters out). Built-in routines aren't listed.
+    pub(crate) proc_default_procs: Shared<HashMap<PgProcOid, Vec<PgProcOid>>>,
     /// Seeded `pg_get_functiondef` sources behind `inline_sql_bodies`,
     /// kept so `to_seed` round-trips them.
     sql_function_defs: HashMap<PgProcOid, String>,
@@ -657,11 +664,13 @@ impl PgCatalog {
             search_path_guc: Default::default(),
             session_identity: Default::default(),
             domain_constraints: Shared::default(),
+            domain_defaults: Shared::default(),
             attr_default_types: Shared::default(),
             attr_default_exprs: HashMap::new(),
             generated_refs: Shared::default(),
             check_function_bodies: true,
             inline_sql_bodies: Shared::default(),
+            proc_default_procs: Shared::default(),
             sql_function_defs: HashMap::new(),
             partition_keys: Shared::default(),
             triggers: Shared::default(),
@@ -1413,6 +1422,7 @@ impl PgCatalog {
         self.pg_enum.remove(&oid);
         self.pg_range.remove(&oid);
         self.domain_constraints.remove(&oid);
+        self.domain_defaults.remove(&oid);
         Some(row)
     }
 
@@ -1526,6 +1536,7 @@ impl PgCatalog {
 
     pub(crate) fn remove_pg_proc(&mut self, oid: PgProcOid) -> Option<PgProc> {
         self.inline_sql_bodies.remove(&oid);
+        self.proc_default_procs.remove(&oid);
         self.sql_function_defs.remove(&oid);
         let row = self.pg_proc.remove(&oid)?;
         if let Some(v) = self

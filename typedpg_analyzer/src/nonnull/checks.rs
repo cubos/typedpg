@@ -32,12 +32,18 @@
 //! never-NULL literals is. A conjunct left with one arm is also knowledge
 //! the others are refuted with (`CHECK (kind IN ('a', 'b'))`), and a
 //! column known to hold one of a few values is split into those cases.
+//!
+//! A comparison (and a `num_nulls` call) is read only when it resolved to
+//! the built-in one when the constraint was created — as PG keeps it, by
+//! OID (see [`crate::ddl::tables::check_inherit::CheckDef::cook`]): an
+//! exact-signature `=` of a user's on an enum or a domain says nothing of
+//! the values it compares.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use typedpg_pg_query::protobuf::{self, node};
 
-use super::{CmpOp, Col, Facts, LitKind, Literal, ValPred};
+use super::{CmpOp, Col, Facts, LitKind, Literal, StrictNode, Trust, TrustedNodes, ValPred};
 use crate::oid::{PgClassOid, PgTypeOid};
 use crate::pg_catalog::PgCatalog;
 
@@ -311,11 +317,13 @@ pub(crate) struct Knowledge<'a> {
     pub preds: &'a dyn Fn(&str) -> Vec<ValPred>,
 }
 
-/// What reading a constraint needs to know of the relation's columns.
+/// What reading a constraint needs to know of the relation's columns, and
+/// what its operators and functions resolved to when it was created.
 struct Cx<'a> {
     is_composite: &'a dyn Fn(&str) -> bool,
     column_type: &'a dyn Fn(&str) -> Option<PgTypeOid>,
     snapshot: &'a PgCatalog,
+    trust: &'a TrustedNodes,
 }
 
 /// The arms past which an OR of DNF arms grows too large to keep.
@@ -356,11 +364,7 @@ impl RelationChecks {
                 .is_none_or(|a| crate::coerce::is_complex(a.atttypid, snapshot))
         };
         let column_type = |name: &str| attrs.iter().find(|a| a.attname == name).map(|a| a.atttypid);
-        let cx = Cx {
-            is_composite: &is_composite,
-            column_type: &column_type,
-            snapshot,
-        };
+        let untrusted = TrustedNodes::default();
         let mut clauses = Vec::new();
         let mut constraints: Vec<_> = snapshot
             .pg_constraint
@@ -381,6 +385,12 @@ impl RelationChecks {
             }
             let crate::ddl::tables::check_inherit::StoredExpr::Written(expr) = &def.expr else {
                 continue;
+            };
+            let cx = Cx {
+                is_composite: &is_composite,
+                column_type: &column_type,
+                snapshot,
+                trust: def.trusted.as_ref().unwrap_or(&untrusted),
             };
             for conjunct in conjuncts(expr) {
                 if let Some(arms) = dnf(conjunct, true, &cx)
@@ -633,6 +643,21 @@ impl RelationChecks {
         out
     }
 
+    /// Whether no row of the relation can satisfy the constraints, with
+    /// only its columns' own NOT NULL (`base_not_null`) known.
+    pub(crate) fn contradict_alone(&self, base_not_null: &HashMap<String, bool>) -> bool {
+        let non_null = |c: &str| base_not_null.get(c) == Some(&true);
+        let nothing = |_: &str| false;
+        let no_value = |_: &str| None;
+        let no_preds = |_: &str| Vec::new();
+        self.contradicts(&Knowledge {
+            non_null: &non_null,
+            null: &nothing,
+            equals: &no_value,
+            preds: &no_preds,
+        })
+    }
+
     /// Whether no row of the relation can be what `k` says of it.
     pub(crate) fn contradicts(&self, k: &Knowledge<'_>) -> bool {
         let s = self.solve(k, None);
@@ -800,7 +825,7 @@ fn below_not_null(snapshot: &PgCatalog, rel: PgClassOid, depth: u32) -> HashSet<
 /// columns are all NULL or none is (`RI_FKey_check` rejects a mix). Not
 /// with the relation's RI triggers disabled.
 fn match_full_clauses(snapshot: &PgCatalog, relid: PgClassOid) -> Vec<Clause> {
-    if snapshot.ri_triggers_disabled.contains(&relid) {
+    if crate::ddl::tables::inherit::fk_triggers_disabled(snapshot, relid) {
         return Vec::new();
     }
     let attrs = snapshot.attributes_of(relid);
@@ -952,11 +977,12 @@ fn dnf(n: &protobuf::Node, positive: bool, cx: &Cx<'_>) -> Option<Vec<Vec<Lit>>>
     }
 }
 
-/// `P = Q` / `P <> Q` between two conditions.
+/// `P = Q` / `P <> Q` between two conditions (the built-in `bool` ones).
 fn boolean_equality(e: &protobuf::AExpr, cx: &Cx<'_>) -> bool {
     let op = crate::expr::extract_string_fields(&e.name).join(".");
     protobuf::AExprKind::try_from(e.kind) == Ok(protobuf::AExprKind::AexprOp)
         && (op == "=" || op == "<>")
+        && cx.trust.trusts(e.location, StrictNode::BuiltinCompare)
         && e.lexpr.as_deref().is_some_and(|n| is_condition(n, cx))
         && e.rexpr.as_deref().is_some_and(|n| is_condition(n, cx))
 }
@@ -1004,11 +1030,14 @@ fn case_dnf(c: &protobuf::CaseExpr, positive: bool, cx: &Cx<'_>) -> Option<Vec<V
         .arg
         .as_deref()
         .map(|t| column_name(t).filter(|n| !(cx.is_composite)(n)));
-    let when_dnf = |w: &protobuf::Node, pos: bool| -> Option<Vec<Vec<Lit>>> {
+    let when_dnf = |when: &protobuf::CaseWhen, w: &protobuf::Node, pos: bool| {
         match &test {
             None => dnf(w, pos, cx),
             Some(None) => Some(one(Lit::Other)),
-            // `test = value`.
+            // `test = value`, by the built-in `=` (resolved at the WHEN).
+            Some(Some(_)) if !cx.trust.trusts(when.location, StrictNode::BuiltinCompare) => {
+                Some(one(Lit::Other))
+            }
             Some(Some(col)) => {
                 let v = (cx.column_type)(col).and_then(|t| super::literal_for(w, t, cx.snapshot));
                 Some(match v {
@@ -1030,9 +1059,9 @@ fn case_dnf(c: &protobuf::CaseExpr, positive: bool, cx: &Cx<'_>) -> Option<Vec<V
         let (Some(cond), Some(result)) = (w.expr.as_deref(), w.result.as_deref()) else {
             return Some(one(Lit::Other));
         };
-        let taken = product(&none_before, &when_dnf(cond, true)?)?;
+        let taken = product(&none_before, &when_dnf(w, cond, true)?)?;
         out = either(out, product(&taken, &dnf(result, positive, cx)?)?)?;
-        none_before = product(&none_before, &when_dnf(cond, false)?)?;
+        none_before = product(&none_before, &when_dnf(w, cond, false)?)?;
     }
     let default = match c.defresult.as_deref() {
         Some(d) => dnf(d, positive, cx)?,
@@ -1111,7 +1140,7 @@ fn atom(n: &protobuf::Node, positive: bool, cx: &Cx<'_>) -> Vec<Vec<Lit>> {
         }
         Some(node::Node::AExpr(e)) => {
             use protobuf::AExprKind as K;
-            if let Some((args, lo, hi)) = super::null_count_bounds(e) {
+            if let Some((args, lo, hi)) = super::null_count_bounds(e, cx.trust) {
                 let cols: Option<BTreeSet<String>> = args.iter().map(column_name).collect();
                 let Some(cols) = cols.filter(|c| !c.is_empty()) else {
                     return other;
@@ -1144,6 +1173,11 @@ fn atom(n: &protobuf::Node, positive: bool, cx: &Cx<'_>) -> Vec<Vec<Lit>> {
             let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) else {
                 return other;
             };
+            // Every comparison read below, as the built-in one: a
+            // user-defined `=` may hold for different values.
+            if !cx.trust.trusts(e.location, StrictNode::BuiltinCompare) {
+                return other;
+            }
             match K::try_from(e.kind) {
                 Ok(K::AexprOp) => {
                     let (c, v, flipped) = match (column_name(l), column_name(r)) {

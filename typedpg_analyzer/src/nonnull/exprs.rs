@@ -28,6 +28,13 @@ pub(crate) fn key(n: &protobuf::Node) -> String {
 /// bare column, constant or parameter, evaluating the same way each time
 /// for one row of one statement.
 pub(crate) fn reusable(n: &protobuf::Node, scope: &Scope, snapshot: &PgCatalog) -> bool {
+    // An implicit cast may run anywhere an argument meets a parameter of
+    // another type (`fc(x)` over an `int` `x` for `fc(c)`): with a volatile
+    // one in the catalog, no expression is assumed to give the same value
+    // twice.
+    if has_volatile_cast(snapshot, true) {
+        return false;
+    }
     match n.node.as_ref() {
         None
         | Some(
@@ -88,7 +95,7 @@ pub(crate) fn reusable(n: &protobuf::Node, scope: &Scope, snapshot: &PgCatalog) 
         | NodeRef::TypeName(_)
         | NodeRef::SortBy(_) => true,
         NodeRef::WindowDef(_) => !in_subquery,
-        NodeRef::TypeCast(_) => !has_volatile_cast(snapshot),
+        NodeRef::TypeCast(_) => !has_volatile_cast(snapshot, false),
         NodeRef::AExpr(e) => operator_not_volatile(e, snapshot),
         NodeRef::FuncCall(f) => function_not_volatile(f, in_subquery, snapshot),
         // A scalar sublink over a subquery that reads the same rows each
@@ -118,24 +125,34 @@ pub(crate) fn reusable(n: &protobuf::Node, scope: &Scope, snapshot: &PgCatalog) 
 }
 
 /// Whether some cast of the catalog runs a volatile function (none built
-/// in does): then no cast is assumed to give the same value twice.
-fn has_volatile_cast(snapshot: &PgCatalog) -> bool {
+/// in does) — an implicit one only, when `implicit_only`: then no cast
+/// (that kind of cast) is assumed to give the same value twice.
+fn has_volatile_cast(snapshot: &PgCatalog, implicit_only: bool) -> bool {
     snapshot.pg_cast.values().any(|c| {
-        c.castfunc
-            .and_then(|f| snapshot.pg_proc.get(&f))
-            .is_some_and(|p| p.provolatile == ProVolatile::Volatile)
+        (!implicit_only || c.castcontext == crate::pg_catalog::CastContext::Implicit)
+            && c.castfunc
+                .and_then(|f| snapshot.pg_proc.get(&f))
+                .is_some_and(|p| p.provolatile == ProVolatile::Volatile)
     })
 }
 
-/// No operator of this name runs a volatile function (so neither does the
-/// one the expression resolved to).
+/// No operator the expression may have resolved to runs a volatile
+/// function: none of the name it is written with — or, for BETWEEN, of
+/// the comparisons PG rewrites it into (`transformAExprBetween`: `a >= b
+/// AND a <= c`, `a < b OR a > c`).
 fn operator_not_volatile(e: &protobuf::AExpr, snapshot: &PgCatalog) -> bool {
+    use protobuf::AExprKind as K;
     let name = crate::expr::extract_string_fields(&e.name);
-    let Some(op) = name.last() else {
-        return true;
+    let names: Vec<&str> = match K::try_from(e.kind) {
+        Ok(K::AexprBetween | K::AexprBetweenSym) => vec![">=", "<="],
+        Ok(K::AexprNotBetween | K::AexprNotBetweenSym) => vec!["<", ">"],
+        _ => match name.last() {
+            Some(op) => vec![op.as_str()],
+            None => return true,
+        },
     };
     !snapshot.pg_operator.values().any(|o| {
-        &o.oprname == op
+        names.contains(&o.oprname.as_str())
             && o.oprcode
                 .and_then(|f| snapshot.pg_proc.get(&f))
                 .is_none_or(|p| p.provolatile == ProVolatile::Volatile)
@@ -156,9 +173,26 @@ fn function_not_volatile(f: &protobuf::FuncCall, in_subquery: bool, snapshot: &P
         _ => return false,
     };
     let candidates = snapshot.find_functions(schema, name);
+    // A call leaving parameters out runs their DEFAULT expressions too: a
+    // built-in function's are constants; a migration's are known by the
+    // functions they run.
+    let relies_on_defaults = |p: &crate::pg_catalog::PgProc| {
+        p.pronargdefaults > 0
+            && f.args.len() < p.proargtypes.len()
+            && snapshot.namespace_name(p.pronamespace) != Some("pg_catalog")
+            && snapshot.proc_default_procs.get(&p.oid).is_none_or(|procs| {
+                procs.iter().any(|d| {
+                    snapshot
+                        .pg_proc
+                        .get(d)
+                        .is_none_or(|d| d.provolatile == ProVolatile::Volatile)
+                })
+            })
+    };
     !candidates.is_empty()
         && candidates.iter().all(|p| {
             p.provolatile != ProVolatile::Volatile
+                && !relies_on_defaults(p)
                 && !(in_subquery
                     && matches!(p.prokind, crate::pg_catalog::ProKind::Aggregate)
                     && snapshot.namespace_name(p.pronamespace) != Some("pg_catalog"))
@@ -177,11 +211,18 @@ fn relation_is_stable(
     snapshot: &PgCatalog,
 ) -> bool {
     if rv.schemaname.is_empty() {
-        if own_ctes.contains(rv.relname.as_str()) {
-            return true;
-        }
         if scope.ctes.contains_key(&rv.relname) {
             return false;
+        }
+        // A CTE of the subquery's own may be out of scope where the name
+        // is read (`WITH v AS …` in a nested query doesn't hide view `v`
+        // from the query around it): then it is the relation, which must
+        // be stable too — if there is one.
+        if own_ctes.contains(rv.relname.as_str()) {
+            return match crate::ddl::util::lookup_relation(snapshot, rv) {
+                Ok(_) => relation_is_stable(rv, &HashSet::new(), scope, snapshot),
+                Err(_) => true,
+            };
         }
     }
     let Ok((_, relid)) = crate::ddl::util::lookup_relation(snapshot, rv) else {

@@ -558,6 +558,7 @@ fn handle_any_all(
                     && !op_name.contains('.')
                     && let Some(op) = snapshot.find_operator(&op_name, Some(left_oid), elem)
                 {
+                    note_builtin_compare(expr.location, &op_name, &op, ctx);
                     ctx.note_strict(
                         expr.location,
                         crate::nonnull::StrictNode::Op,
@@ -602,6 +603,7 @@ fn handle_any_all(
             match snapshot.find_operator(&op_name, Some(left_oid), elem_oid) {
                 // The per-element operator call can itself yield NULL.
                 Some(op) => {
+                    note_builtin_compare(expr.location, &op_name, &op, ctx);
                     ctx.note_strict(
                         expr.location,
                         crate::nonnull::StrictNode::Op,
@@ -1452,10 +1454,38 @@ fn is_restriction_variable(node: &protobuf::Node, ctx: Ctx<'_>) -> bool {
     walk(node, ctx, &mut rel) && rel.is_some()
 }
 
-/// Record whether the comparison at `location` is one the NULL
-/// substitution of [`crate::nonnull::subst`] may compute over constants:
-/// a built-in `=` `<>` `<` `>` `<=` `>=` between integer, numeric or float
-/// operands (or `=` / `<>` between booleans) — and, separately, a
+/// A `pg_catalog` operator run by a `pg_catalog` function.
+fn is_builtin_operator(snapshot: &PgCatalog, op: &crate::lookup::ResolvedOperator) -> bool {
+    snapshot.pg_operator.get(&op.oid).is_some_and(|o| {
+        snapshot.namespace_name(o.oprnamespace) == Some("pg_catalog")
+            && o.oprcode
+                .and_then(|f| snapshot.pg_proc.get(&f))
+                .is_some_and(|p| snapshot.namespace_name(p.pronamespace) == Some("pg_catalog"))
+    })
+}
+
+/// Record whether the operator at `location` is a built-in comparison
+/// (see [`crate::nonnull::StrictNode::BuiltinCompare`]).
+fn note_builtin_compare(
+    location: i32,
+    op_name: &str,
+    op: &crate::lookup::ResolvedOperator,
+    ctx: Ctx<'_>,
+) {
+    ctx.note_strict(
+        location,
+        crate::nonnull::StrictNode::BuiltinCompare,
+        is_builtin_operator(ctx.snapshot, op)
+            && matches!(op_name, "=" | "<>" | "<" | ">" | "<=" | ">=")
+            && op.result_type_oid == oid::BOOL,
+    );
+}
+
+/// Record whether the comparison at `location` is a built-in one (see
+/// [`crate::nonnull::StrictNode::BuiltinCompare`]), and whether it is one
+/// the NULL substitution of [`crate::nonnull::subst`] may compute over
+/// constants: a built-in `=` `<>` `<` `>` `<=` `>=` between integer or
+/// numeric operands (or `=` / `<>` between booleans) — and, separately, a
 /// built-in `text = text` / `text <> text` under a deterministic
 /// collation, whose result is then byte equality.
 fn note_std_compare(
@@ -1467,25 +1497,15 @@ fn note_std_compare(
     ctx: Ctx<'_>,
 ) {
     let snapshot = ctx.snapshot;
-    let builtin = snapshot.pg_operator.get(&op.oid).is_some_and(|o| {
-        snapshot.namespace_name(o.oprnamespace) == Some("pg_catalog")
-            && o.oprcode
-                .and_then(|f| snapshot.pg_proc.get(&f))
-                .is_some_and(|p| snapshot.namespace_name(p.pronamespace) == Some("pg_catalog"))
-    });
+    let builtin = is_builtin_operator(snapshot, op);
     let equality = matches!(op_name, "=" | "<>");
     let ordering = equality || matches!(op_name, "<" | ">" | "<=" | ">=");
-    let numeric = |t: PgTypeOid| {
-        [
-            oid::INT2,
-            oid::INT4,
-            oid::INT8,
-            oid::NUMERIC,
-            oid::FLOAT4,
-            oid::FLOAT8,
-        ]
-        .contains(&t)
-    };
+    note_builtin_compare(location, op_name, op, ctx);
+    // Exact types only: an integer constant converted to float4 / float8
+    // may become another number (16777217::real is 16777216), so integer
+    // arithmetic on the constants as written says nothing of a float
+    // comparison.
+    let numeric = |t: PgTypeOid| [oid::INT2, oid::INT4, oid::INT8, oid::NUMERIC].contains(&t);
     let (Some(l), r) = (op.left_type_oid, op.right_type_oid) else {
         ctx.note_strict(location, crate::nonnull::StrictNode::StdCompare, false);
         ctx.note_strict(location, crate::nonnull::StrictNode::TextEquality, false);
@@ -1496,6 +1516,17 @@ fn note_std_compare(
         && ((ordering && numeric(l) && numeric(r))
             || (equality && l == oid::BOOL && r == oid::BOOL));
     ctx.note_strict(location, crate::nonnull::StrictNode::StdCompare, std);
+    let float = |t: PgTypeOid| [oid::FLOAT4, oid::FLOAT8].contains(&t);
+    ctx.note_strict(
+        location,
+        crate::nonnull::StrictNode::FloatCompare,
+        builtin
+            && op.result_type_oid == oid::BOOL
+            && ordering
+            && (float(l) || float(r))
+            && (numeric(l) || float(l))
+            && (numeric(r) || float(r)),
+    );
     // PG's database default (100), "C" (950) and "POSIX" (951) compare
     // bytes; a nondeterministic collation may equal different strings.
     let deterministic = derive_collation(left.iter().chain(right.iter()), oid::TEXT, snapshot)

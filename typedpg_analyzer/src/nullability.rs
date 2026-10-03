@@ -105,6 +105,12 @@ pub(crate) struct NullabilityContext {
     /// What holds where the value is read: HAVING (after grouping), a CASE
     /// branch's WHEN or an aggregate's FILTER.
     local_facts: Facts,
+    /// The part of `local_facts` HAVING proves: what holds of every row
+    /// the level yields, not just the one a value is read for.
+    having_facts: Facts,
+    /// The columns some grouping set leaves out, before a CASE branch
+    /// (`WHEN grouping(g) = 0`) narrowed them for its rows.
+    level_grouping_omitted: HashSet<(String, String)>,
     /// Entries some fact above proves not null-extended: the outer joins
     /// with one on their nullable side are reduced (`reduce_outer_joins`).
     forced_rels: HashSet<String>,
@@ -167,10 +173,11 @@ pub(crate) struct NullabilityContext {
     /// The frame options (`FRAMEOPTION_*` bits) of each window the SELECT's
     /// WINDOW clause names — what `OVER w` runs over.
     pub window_frames: std::collections::HashMap<String, i32>,
-    /// The query may yield a row no row past WHERE made: an aggregate
-    /// query without GROUP BY (or with an empty grouping set) over an
-    /// empty input. What WHERE proves of an expression then doesn't hold
-    /// for the select list's (uncorrelated) expressions.
+    /// The query may yield a row no row past FROM and WHERE made: an
+    /// aggregate query without GROUP BY (or with an empty grouping set)
+    /// over an empty input. What WHERE proves of an expression then
+    /// doesn't hold for the select list's expressions, and no qual or
+    /// constraint ruling every row out makes a value unreachable.
     pub where_exprs_off: bool,
 }
 
@@ -402,11 +409,45 @@ impl NullabilityContext {
     }
 
     /// Add what holds where the value is read (HAVING, a WHEN, a FILTER).
+    /// Under grouping sets, a column non-NULL as read is so in its row
+    /// too, but the other NOT NULL columns of that row a non-NULL column
+    /// passed through vouches for ([`Self::translated`]) may be ones the
+    /// row's grouping set nulls out.
     pub fn add_local_facts(&mut self, facts: Facts) {
-        let facts = self.translated(facts);
+        let read: HashSet<Col> = self.translated_aliases(facts.clone()).columns;
+        let mut facts = self.translated(facts);
+        if !self.grouping_omitted.is_empty() {
+            facts
+                .columns
+                .retain(|c| read.contains(c) || !self.grouping_omitted.contains(c));
+        }
         self.forced_rels.extend(facts.rels.iter().cloned());
         self.local_facts = std::mem::take(&mut self.local_facts).union(facts);
         self.recompute();
+    }
+
+    /// Add what HAVING proves: it holds of every row of the level.
+    pub fn add_having_facts(&mut self, facts: Facts) {
+        self.add_local_facts(facts);
+        self.having_facts = self.local_facts.clone();
+    }
+
+    /// This context for reading other rows of the level than the one a
+    /// value is read for — what a window function's arguments are: without
+    /// what only holds of this row (a CASE branch's WHEN, the arms of an
+    /// AND / OR before it), keeping what holds of every row (WHERE,
+    /// HAVING). `None` when nothing is only this row's.
+    pub fn for_other_rows(&self) -> Option<NullabilityContext> {
+        if self.local_facts == self.having_facts
+            && self.grouping_omitted == self.level_grouping_omitted
+        {
+            return None;
+        }
+        let mut level = self.clone();
+        level.local_facts = self.having_facts.clone();
+        level.grouping_omitted = self.level_grouping_omitted.clone();
+        level.recompute();
+        Some(level)
     }
 
     /// This context with `facts` holding too, if they say anything.
@@ -562,17 +603,34 @@ impl NullabilityContext {
                 if level != Level::Matched && self.alias_is_nullable(&entry.alias) {
                     continue;
                 }
+                // A constraint speaks of a row's values. Read after
+                // grouping, a column some grouping set nulls out is the
+                // row's value only where it reads non-NULL: otherwise what
+                // holds of it as read (NULL, or a value when not NULL)
+                // says nothing of the row, and only what held of the rows
+                // before grouping does.
+                let level_of = |c: &str| {
+                    let key = (entry.alias.clone(), c.to_owned());
+                    let row_value = level != Level::Local
+                        || !self.grouping_omitted.contains(&key)
+                        || self.local_facts.columns.contains(&key)
+                        || self.derived_local.columns.contains(&key);
+                    if row_value { level } else { Level::Where }
+                };
                 let non_null = |c: &str| {
                     !self.nullable_at(
-                        level,
+                        level_of(c),
                         &entry.alias,
                         c,
                         entry.base_not_null.get(c) == Some(&true),
                     )
                 };
-                let null = |c: &str| self.null_at(level, &(entry.alias.clone(), c.to_owned()));
-                let equals = |c: &str| self.equals_at(level, &(entry.alias.clone(), c.to_owned()));
-                let preds = |c: &str| self.preds_at(level, &(entry.alias.clone(), c.to_owned()));
+                let null =
+                    |c: &str| self.null_at(level_of(c), &(entry.alias.clone(), c.to_owned()));
+                let equals =
+                    |c: &str| self.equals_at(level_of(c), &(entry.alias.clone(), c.to_owned()));
+                let preds =
+                    |c: &str| self.preds_at(level_of(c), &(entry.alias.clone(), c.to_owned()));
                 let k = Knowledge {
                     non_null: &non_null,
                     null: &null,
@@ -721,7 +779,9 @@ impl NullabilityContext {
     /// allows). `column` gives a column's own NOT NULL and how its values
     /// compare (`None` for one it can't tell).
     pub fn unreachable(&self, column: &dyn Fn(&Col) -> Option<(bool, Space)>) -> bool {
-        if crate::nonnull::disabled() {
+        // The row an aggregate makes from no input is there however
+        // impossible a row of the input is.
+        if crate::nonnull::disabled() || self.where_exprs_off {
             return false;
         }
         let levels = [&self.matched_facts, &self.where_facts, &self.local_facts];
@@ -757,8 +817,12 @@ impl NullabilityContext {
         if !self.grouping_omitted.is_empty() {
             return false;
         }
+        // Constraints no row can satisfy on their own are misread (or the
+        // table is empty): no proof that a row isn't there.
         self.checks.iter().any(|entry| {
-            if self.alias_is_nullable(&entry.alias) {
+            if self.alias_is_nullable(&entry.alias)
+                || entry.checks.contradict_alone(&entry.base_not_null)
+            {
                 return false;
             }
             self.with_local_knowledge(entry, |k| entry.checks.contradicts(k))
@@ -836,6 +900,7 @@ impl NullabilityContext {
                 all.insert(col.clone());
             }
         }
+        self.level_grouping_omitted = all.clone();
         self.grouping_omitted = all;
     }
 
@@ -890,7 +955,10 @@ impl NullabilityContext {
         }
         let names: Vec<String> = cols.iter().map(|c| c.1.clone()).collect();
         self.checks.iter().any(|entry| {
-            if entry.alias != alias || self.alias_is_nullable(&entry.alias) {
+            if entry.alias != alias
+                || self.alias_is_nullable(&entry.alias)
+                || entry.checks.contradict_alone(&entry.base_not_null)
+            {
                 return false;
             }
             self.with_local_knowledge(entry, |k| entry.checks.some_non_null(k, &names))

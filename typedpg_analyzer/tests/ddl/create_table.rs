@@ -1475,6 +1475,50 @@ fn partition_bound_values_are_coerced_to_the_key_type() {
 }
 
 #[test]
+fn partition_bound_strings_take_the_key_columns_modifier() {
+    // transformPartitionBoundValue coerces a bound to the key column's
+    // type *and* modifier: a varchar(n) / char(n) value loses the blanks
+    // past its length (more is an error), and a char(n) one compares
+    // without its trailing blanks. A cast with a modifier of its own
+    // applies it first ('bc'::char(1) is 'b').
+    let setup = "CREATE TABLE q (k varchar(2)) PARTITION BY LIST (k);
+                 CREATE TABLE q1 PARTITION OF q FOR VALUES IN ('ab   ');
+                 CREATE TABLE r (k char(3)) PARTITION BY LIST (k);
+                 CREATE TABLE r1 PARTITION OF r FOR VALUES IN ('a');
+                 CREATE TABLE s (k text) PARTITION BY LIST (k);
+                 CREATE TABLE s1 PARTITION OF s FOR VALUES IN ('bc'::char(1));";
+    for (stmt, msg) in [
+        (
+            "CREATE TABLE q2 PARTITION OF q FOR VALUES IN ('abc');",
+            "value too long for type character varying(2)",
+        ),
+        (
+            "CREATE TABLE q2 PARTITION OF q FOR VALUES IN ('xyz'::text);",
+            "value too long for type character varying(2)",
+        ),
+        (
+            "CREATE TABLE q2 PARTITION OF q FOR VALUES IN ('ab');",
+            "partition \"q2\" would overlap partition \"q1\"",
+        ),
+        (
+            "CREATE TABLE r2 PARTITION OF r FOR VALUES IN ('a  ');",
+            "partition \"r2\" would overlap partition \"r1\"",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "CREATE TABLE q2 PARTITION OF q FOR VALUES IN ('xy  '::text);
+             CREATE TABLE s2 PARTITION OF s FOR VALUES IN ('bc');",
+        ),
+    ]);
+}
+
+#[test]
 fn a_partition_keys_operator_class_is_its_notion_of_equality_and_order() {
     // ComputePartitionAttrs records the key's operator class (partclass):
     // DefineIndex requires a unique / primary key / exclusion index on a

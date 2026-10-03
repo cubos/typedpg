@@ -463,12 +463,13 @@ pub(crate) fn generation_not_null(
     scope.sources.push(TableSource::derived(&relname, columns));
     let null_ctx = NullabilityContext::default();
     let mut params = ParamCollector::default();
+    let expr = crate::ddl::stored_exprs::over_own_row(interp, relid, expr);
     // Analyzed on a level of its own, and without noting what it refers
     // to as a dependency of the statement being analyzed.
     let (inferred, _) = crate::ddl::depend::collect(|| {
         let _level = crate::resolve::QueryLevel::enter();
         crate::expr::infer_expr(
-            expr,
+            &expr,
             crate::expr::Ctx::new(&scope, &null_ctx, interp),
             &mut params,
             crate::expr::TypeGoal::assignment(attr.atttypid)

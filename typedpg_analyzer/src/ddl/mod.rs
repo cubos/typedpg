@@ -41,6 +41,7 @@ pub(crate) mod seqparams;
 pub mod sequences;
 pub(crate) mod session;
 pub(crate) mod statistics;
+pub(crate) mod stored_exprs;
 pub mod tables;
 pub(crate) mod text_search;
 pub(crate) mod triggers;
