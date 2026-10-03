@@ -342,7 +342,7 @@ fn regtype_in(content: &str, snapshot: &PgCatalog) -> Result<(), String> {
         crate::ddl::DdlError::TypeNotFound(msg) | crate::ddl::DdlError::Parse(msg) => msg,
         other => other.to_string(),
     })?;
-    crate::typmod::encode(snapshot, t, &tn.typmods)
+    crate::typmod::encode(snapshot, t, tn)
         .map(|_| ())
         .map_err(|e| e.to_string())
 }

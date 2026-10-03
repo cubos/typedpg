@@ -217,7 +217,7 @@ pub(crate) fn parse_column_def(
     // Encode any `(n)` / `(p,s)` modifier sitting next to the type name.
     // Empty `typmods` (`varchar` plain) yields `None`.
     let typmod = match cd.type_name.as_ref() {
-        Some(tn) => crate::typmod::encode(interp, type_oid, &tn.typmods)?,
+        Some(tn) => crate::typmod::encode(interp, type_oid, tn)?,
         None => None,
     };
 
@@ -1381,7 +1381,7 @@ pub(crate) fn alter_column_type(
     };
 
     let new_typmod = match cd.type_name.as_ref() {
-        Some(tn) => crate::typmod::encode(interp, new_type_oid, &tn.typmods)?,
+        Some(tn) => crate::typmod::encode(interp, new_type_oid, tn)?,
         None => None,
     };
 

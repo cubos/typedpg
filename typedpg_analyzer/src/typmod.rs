@@ -28,7 +28,7 @@
 //! `Ok(None)` so custom types with their own typmodin function don't break
 //! the migration — we just don't track typmod for those.
 
-use typedpg_pg_query::protobuf::{Node, node};
+use typedpg_pg_query::protobuf::{Node, TypeName, node};
 
 use crate::ddl::DdlError;
 use crate::error::AnalyzeError;
@@ -62,22 +62,24 @@ pub enum DecodedTypmod {
     Other(i32),
 }
 
-/// Encode an AST `typmods: Vec<Node>` into the packed `i32` PG would store —
-/// the analyzer's port of the type's `typmodin` function, reached like PG's
-/// `typenameTypeMod`.
+/// Encode the typmods a [`TypeName`] carries into the packed `i32` PG would
+/// store — the analyzer's port of the type's `typmodin` function, reached
+/// like PG's `typenameTypeMod`.
 ///
 /// `Ok(None)` means either (a) no typmods supplied (`varchar` plain), (b) a
 /// modifier that PG itself reduces to `-1` (`interval` over the full
 /// range), or (c) a non-`pg_catalog` base type whose `typmodin` we don't
 /// model. `Ok(Some(v))` is the encoded value. `Err` is for inputs PG
 /// rejects: a type without a `typmodin` (`type modifier is not allowed for
-/// type "text"`), the wrong modifier count, or an out-of-range value.
+/// type "text"`), a modifier that is no simple constant or identifier, one
+/// that is no integer, the wrong modifier count, or an out-of-range value.
 /// An array type uses its element's `typmodin` (so `varchar(5)[]` is 9).
 pub fn encode(
     snapshot: &PgCatalog,
     type_oid: PgTypeOid,
-    typmods: &[Node],
+    type_name: &TypeName,
 ) -> Result<Option<i32>, DdlError> {
+    let typmods = &type_name.typmods;
     if typmods.is_empty() {
         return Ok(None);
     }
@@ -88,16 +90,19 @@ pub fn encode(
         && let Some(elem) = t.typelem
         && snapshot.array_type_of(elem) == Some(type_oid)
     {
-        return encode(snapshot, elem, typmods);
+        return encode(snapshot, elem, type_name);
     }
 
-    // Pull integer values out of each typmod node. PG's parser only emits
-    // `AConst::Integer` for numeric typmods; anything else is invalid.
-    let raw: Result<Vec<i32>, DdlError> = typmods.iter().map(extract_int).collect();
-    let raw = raw?;
+    // `ArrayGetIntegerTypmods`, which every modeled `typmodin` starts with.
+    let raw = || -> Result<Vec<i32>, DdlError> {
+        typmod_strings(typmods)?
+            .iter()
+            .map(|s| typmod_integer(s))
+            .collect()
+    };
 
     if is_pgvector_type(snapshot, type_oid) {
-        return encode_vector(&raw).map(Some);
+        return encode_vector(&raw()?).map(Some);
     }
 
     let in_pg_catalog = snapshot.namespace_name(t.typnamespace) == Some("pg_catalog");
@@ -105,28 +110,36 @@ pub fn encode(
     match (type_oid, in_pg_catalog.then_some(typname)) {
         // `anychar_typmodin` names bpchar `char` in its messages.
         (builtin_oid::VARCHAR, _) => {
-            encode_length(&raw, "varchar", MAX_ATTR_SIZE, VARHDRSZ).map(Some)
+            encode_length(&raw()?, "varchar", MAX_ATTR_SIZE, VARHDRSZ).map(Some)
         }
-        (builtin_oid::BPCHAR, _) => encode_length(&raw, "char", MAX_ATTR_SIZE, VARHDRSZ).map(Some),
-        (builtin_oid::NUMERIC, _) => encode_numeric(&raw).map(Some),
-        (_, Some("time")) => encode_precision(&raw, "TIME", "").map(Some),
-        (_, Some("timetz")) => encode_precision(&raw, "TIME", " WITH TIME ZONE").map(Some),
-        (_, Some("timestamp")) => encode_precision(&raw, "TIMESTAMP", "").map(Some),
+        (builtin_oid::BPCHAR, _) => {
+            encode_length(&raw()?, "char", MAX_ATTR_SIZE, VARHDRSZ).map(Some)
+        }
+        (builtin_oid::NUMERIC, _) => encode_numeric(&raw()?).map(Some),
+        (_, Some("time")) => encode_precision(&raw()?, "TIME", "").map(Some),
+        (_, Some("timetz")) => encode_precision(&raw()?, "TIME", " WITH TIME ZONE").map(Some),
+        (_, Some("timestamp")) => encode_precision(&raw()?, "TIMESTAMP", "").map(Some),
         (_, Some("timestamptz")) => {
-            encode_precision(&raw, "TIMESTAMP", " WITH TIME ZONE").map(Some)
+            encode_precision(&raw()?, "TIMESTAMP", " WITH TIME ZONE").map(Some)
         }
-        (_, Some("interval")) => encode_interval(&raw),
+        (_, Some("interval")) => encode_interval(&raw()?),
         // `anybit_typmodin`: the length itself, no VARHDRSZ.
         (_, Some(name @ ("bit" | "varbit"))) => {
-            encode_length(&raw, name, MAX_ATTR_SIZE * BITS_PER_BYTE, 0).map(Some)
+            encode_length(&raw()?, name, MAX_ATTR_SIZE * BITS_PER_BYTE, 0).map(Some)
         }
         // A non-pg_catalog base type (extension / user C type) may have a
-        // typmodin we don't model — drop the typmod rather than reject.
-        (_, None) if t.typtype == crate::pg_catalog::TypType::Base => Ok(None),
+        // typmodin we don't model — drop the typmod rather than reject,
+        // once `typenameTypeMod` has turned the modifiers into strings.
+        (_, None) if t.typtype == crate::pg_catalog::TypType::Base => {
+            typmod_strings(typmods)?;
+            Ok(None)
+        }
         // Everything else has no typmodin: pg_catalog types outside the
         // list above, domains, enums, composites, ranges, pseudo-types.
+        // `typenameTypeMod` names the type as written (`TypeNameToString`).
         _ => Err(DdlError::UnsupportedDdl(format!(
-            "type modifier is not allowed for type \"{typname}\""
+            "type modifier is not allowed for type \"{}\"",
+            crate::ddl::util::type_name_to_string(type_name)
         ))),
     }
 }
@@ -313,18 +326,45 @@ fn encode_vector(raw: &[i32]) -> Result<i32, DdlError> {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
-fn extract_int(node: &Node) -> Result<i32, DdlError> {
-    match node.node.as_ref() {
-        Some(node::Node::AConst(c)) => match c.val.as_ref() {
-            Some(typedpg_pg_query::protobuf::a_const::Val::Ival(i)) => Ok(i.ival),
-            _ => Err(DdlError::UnsupportedDdl(
-                "non-integer typmod argument".into(),
-            )),
-        },
-        _ => Err(DdlError::UnsupportedDdl(
-            "non-literal typmod argument".into(),
-        )),
-    }
+/// `typenameTypeMod`'s modifiers as the strings handed to `typmodin`: an
+/// integer, a numeric or string literal as written, or a bare identifier.
+fn typmod_strings(typmods: &[Node]) -> Result<Vec<String>, DdlError> {
+    use typedpg_pg_query::protobuf::a_const::Val;
+    typmods
+        .iter()
+        .map(|tm| match tm.node.as_ref() {
+            Some(node::Node::AConst(c)) => match c.val.as_ref() {
+                Some(Val::Ival(i)) => Some(i.ival.to_string()),
+                Some(Val::Fval(f)) => Some(f.fval.clone()),
+                Some(Val::Sval(s)) => Some(s.sval.clone()),
+                _ => None,
+            },
+            Some(node::Node::ColumnRef(cr)) => match cr.fields.as_slice() {
+                [f] => match f.node.as_ref() {
+                    Some(node::Node::String(s)) => Some(s.sval.clone()),
+                    _ => None,
+                },
+                _ => None,
+            },
+            _ => None,
+        })
+        .map(|s| {
+            s.ok_or_else(|| {
+                DdlError::UnsupportedDdl(
+                    "type modifiers must be simple constants or identifiers".into(),
+                )
+            })
+        })
+        .collect()
+}
+
+/// `ArrayGetIntegerTypmods`' `pg_strtoint32` of one modifier.
+fn typmod_integer(s: &str) -> Result<i32, DdlError> {
+    crate::literal_input::validate_int(s, i32::MIN.into(), i32::MAX.into(), "integer")
+        .map_err(DdlError::Parse)?;
+    crate::literal_input::parse_pg_integer(s)
+        .and_then(|v| i32::try_from(v).ok())
+        .ok_or_else(|| DdlError::Internal(format!("typmod {s:?} validated but unparsed")))
 }
 
 /// True when `oid` resolves to pgvector's `vector` type (any namespace,

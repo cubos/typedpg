@@ -89,10 +89,8 @@ pub(crate) fn infer_type_cast(
     // typenameTypeIdAndMod: the target's typmod is resolved (and validated)
     // before the operand is transformed.
     let written_typmod = match cast.type_name.as_ref() {
-        Some(tn) if !tn.typmods.is_empty() => {
-            crate::typmod::encode(snapshot, target_oid, &tn.typmods)
-                .map_err(|e| AnalyzeError::Invalid(e.to_string()))?
-        }
+        Some(tn) if !tn.typmods.is_empty() => crate::typmod::encode(snapshot, target_oid, tn)
+            .map_err(|e| AnalyzeError::Invalid(e.to_string()))?,
         _ => None,
     };
 

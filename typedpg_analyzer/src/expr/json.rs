@@ -72,8 +72,8 @@ fn json_output(
             "returning pseudo-types is not supported in SQL/JSON functions".into(),
         ));
     }
-    let typmod = crate::typmod::encode(snapshot, t, &tn.typmods)
-        .map_err(|e| AnalyzeError::Invalid(e.to_string()))?;
+    let typmod =
+        crate::typmod::encode(snapshot, t, tn).map_err(|e| AnalyzeError::Invalid(e.to_string()))?;
     // checkJsonOutputFormat.
     let explicit = format_type_of(format);
     if !allow_format_for_non_strings
