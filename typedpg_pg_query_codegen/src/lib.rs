@@ -11,7 +11,7 @@
 //! - `src/equal.rs`: PostgreSQL's `equal()` over the messages — every field
 //!   compared except the ones `equalfuncs.c` skips (parse locations and
 //!   `equal_ignore` fields), read from the PostgreSQL headers libpg_query
-//!   vendors.
+//!   vendors — and the matching key, a string over the same fields.
 //!
 //! A child walker visits every field of a message: a `Node` field yields the
 //! node it wraps, a field whose message type is itself a `Node` variant
@@ -483,6 +483,13 @@ use crate::protobuf;
 /// Structural equality of AST values, as PostgreSQL's `equal()`.
 pub trait Equal {
     fn equal(&self, other: &Self) -> bool;
+
+    /// Append the value's key: a string over the fields `equal()` compares,
+    /// the same for two values exactly when they are `equal()` — what to
+    /// hash or store in place of the value. Every key is self-delimiting
+    /// (a scalar ends in `;`, a message is braced, a list bracketed), so a
+    /// sequence of keys reads back one way.
+    fn equal_key(&self, out: &mut String);
 }
 
 impl<T: Equal> Equal for Option<T> {
@@ -493,17 +500,39 @@ impl<T: Equal> Equal for Option<T> {
             _ => false,
         }
     }
+
+    fn equal_key(&self, out: &mut String) {
+        match self {
+            Some(a) => {
+                out.push('?');
+                a.equal_key(out);
+            }
+            None => out.push('~'),
+        }
+    }
 }
 
 impl<T: Equal> Equal for Box<T> {
     fn equal(&self, other: &Self) -> bool {
         (**self).equal(other)
     }
+
+    fn equal_key(&self, out: &mut String) {
+        (**self).equal_key(out)
+    }
 }
 
 impl<T: Equal> Equal for Vec<T> {
     fn equal(&self, other: &Self) -> bool {
         self.len() == other.len() && self.iter().zip(other).all(|(a, b)| a.equal(b))
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('[');
+        for a in self {
+            a.equal_key(out);
+        }
+        out.push(']');
     }
 }
 
@@ -512,6 +541,11 @@ macro_rules! scalar {
         impl Equal for $t {
             fn equal(&self, other: &Self) -> bool {
                 self == other
+            }
+
+            fn equal_key(&self, out: &mut String) {
+                use std::fmt::Write;
+                let _ = write!(out, "{self:?};");
             }
         }
     )*};
@@ -531,38 +565,45 @@ fn equality(fds: &FileDescriptorSet, ignored: &HashSet<(String, String)>) -> Str
             continue;
         }
         let ty = type_ident(m.name());
-        let mut terms: Vec<String> = Vec::new();
+        let mut fields: Vec<String> = Vec::new();
         let mut oneofs_done = HashSet::new();
         for field in &m.field {
             if let Some(i) = field.oneof_index
                 && !field.proto3_optional()
             {
                 if oneofs_done.insert(i) {
-                    let f = field_ident(m.oneof_decl[i as usize].name());
-                    terms.push(format!("self.{f}.equal(&other.{f})"));
+                    fields.push(field_ident(m.oneof_decl[i as usize].name()));
                 }
                 continue;
             }
             if ignored.contains(&(m.name().to_string(), field.json_name().to_string())) {
                 continue;
             }
-            let f = field_ident(field.name());
-            terms.push(format!("self.{f}.equal(&other.{f})"));
+            fields.push(field_ident(field.name()));
         }
-        let body = if terms.is_empty() {
+        let body = if fields.is_empty() {
             "true".to_string()
         } else {
-            terms.join(" && ")
+            fields
+                .iter()
+                .map(|f| format!("self.{f}.equal(&other.{f})"))
+                .collect::<Vec<_>>()
+                .join(" && ")
         };
+        let key: String = fields
+            .iter()
+            .map(|f| format!("        self.{f}.equal_key(out);\n"))
+            .collect();
         writeln!(
             s,
-            "impl Equal for protobuf::{ty} {{\n    fn equal(&self, other: &Self) -> bool {{\n        {body}\n    }}\n}}\n"
+            "impl Equal for protobuf::{ty} {{\n    fn equal(&self, other: &Self) -> bool {{\n        {body}\n    }}\n\n    fn equal_key(&self, out: &mut String) {{\n        out.push('{{');\n{key}        out.push('}}');\n    }}\n}}\n"
         )
         .unwrap();
         for (i, oneof) in m.oneof_decl.iter().enumerate() {
             let module = m.name().to_snake_case();
             let enum_ty = oneof.name().to_upper_camel_case();
             let mut arms = String::new();
+            let mut key_arms = String::new();
             for field in m.field.iter().filter(|f| f.oneof_index == Some(i as i32)) {
                 let v = field.name().to_upper_camel_case();
                 writeln!(
@@ -570,10 +611,15 @@ fn equality(fds: &FileDescriptorSet, ignored: &HashSet<(String, String)>) -> Str
                     "            (Self::{v}(a), Self::{v}(b)) => a.equal(b),"
                 )
                 .unwrap();
+                writeln!(
+                    key_arms,
+                    "            Self::{v}(a) => {{\n                out.push_str(\"{v}(\");\n                a.equal_key(out);\n                out.push(')');\n            }}"
+                )
+                .unwrap();
             }
             writeln!(
                 s,
-                "impl Equal for protobuf::{module}::{enum_ty} {{\n    fn equal(&self, other: &Self) -> bool {{\n        #[allow(unreachable_patterns)]\n        match (self, other) {{\n{arms}            _ => false,\n        }}\n    }}\n}}\n"
+                "impl Equal for protobuf::{module}::{enum_ty} {{\n    fn equal(&self, other: &Self) -> bool {{\n        #[allow(unreachable_patterns)]\n        match (self, other) {{\n{arms}            _ => false,\n        }}\n    }}\n\n    fn equal_key(&self, out: &mut String) {{\n        match self {{\n{key_arms}        }}\n    }}\n}}\n"
             )
             .unwrap();
         }
