@@ -204,3 +204,31 @@ fn equal_compares_trees_like_postgres_equal() {
     assert!(!expr("(a > 0)::int").equal(&expr("(a > 0)::bigint")));
     assert!(!expr("x IN (1, 2)").equal(&expr("x IN (2, 1)")));
 }
+
+#[test]
+fn rewrite_replaces_nodes_bottom_up() {
+    // Replace every `x::int` with `x`, below a node `descend` refuses
+    // excepted: the nested cast goes first, so both layers go.
+    let parsed =
+        typedpg_pg_query::parse("SELECT a::int::int + 1, (SELECT b::int), c::text").unwrap();
+    let mut stmt = *parsed.protobuf.stmts[0].stmt.clone().unwrap();
+    stmt.rewrite(
+        &mut |n| !matches!(n.node, Some(NodeEnum::SubLink(_))),
+        &mut |n| {
+            if let Some(NodeEnum::TypeCast(tc)) = n.node.as_mut()
+                && tc.type_name.as_ref().is_some_and(|tn| {
+                    tn.names
+                        .iter()
+                        .any(|s| matches!(&s.node, Some(NodeEnum::String(s)) if s.sval == "int4"))
+                })
+                && let Some(arg) = tc.arg.as_deref_mut()
+            {
+                *n = std::mem::take(arg);
+            }
+        },
+    );
+    assert_eq!(
+        stmt.deparse().unwrap(),
+        "SELECT a + 1, (SELECT b::int), c::text"
+    );
+}

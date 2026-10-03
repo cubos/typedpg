@@ -333,4 +333,22 @@ impl protobuf::Node {
             None => Err(Error::parse_message("empty node")),
         }
     }
+
+    /// Rewrite this tree bottom-up: `f` sees each node once the nodes below
+    /// it are rewritten, and may replace it with a node of any kind. The
+    /// subtree below a node `descend` refuses is left as it is.
+    pub fn rewrite(
+        &mut self,
+        descend: &mut dyn FnMut(&protobuf::Node) -> bool,
+        f: &mut dyn FnMut(&mut protobuf::Node),
+    ) {
+        if descend(self)
+            && let Some(e) = &mut self.node
+        {
+            // SAFETY: `e` is borrowed mutably for the whole walk, and the
+            // slots handed out are disjoint fields below it.
+            unsafe { node::child_slots_mut(e.to_mut(), &mut |slot| slot.rewrite(descend, f)) };
+        }
+        f(self);
+    }
 }

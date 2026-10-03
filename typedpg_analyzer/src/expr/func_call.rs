@@ -555,8 +555,8 @@ fn same_expression(a: &protobuf::Node, b: &protobuf::Node, ctx: Ctx<'_>) -> bool
             return x == y;
         }
     }
-    crate::grouping::typed_fingerprint(a, ctx.snapshot)
-        == crate::grouping::typed_fingerprint(b, ctx.snapshot)
+    crate::grouping::typed_fingerprint(a, ctx.scope, ctx.snapshot)
+        == crate::grouping::typed_fingerprint(b, ctx.scope, ctx.snapshot)
 }
 
 /// PG's `unify_hypothetical_args` (parse_func.c): each hypothetical direct

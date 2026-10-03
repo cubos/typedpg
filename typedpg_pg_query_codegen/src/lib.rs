@@ -211,12 +211,12 @@ fn walk_fn(ty: &str, mutable: bool) -> String {
 fn visit(target: &Target<'_>, mutable: bool) -> String {
     match (target, mutable) {
         (Target::Node, false) => "visit_node(x, out);".into(),
-        (Target::Node, true) => "visit_node_mut(x, out);".into(),
+        (Target::Node, true) => "out.slot(x);".into(),
         (Target::Variant(variant, ty), false) => {
             format!("let x: &'a protobuf::{ty} = x; out(NodeRef::{variant}(x));")
         }
         (Target::Variant(variant, ty), true) => {
-            format!("let x: &mut protobuf::{ty} = x; out(NodeMut::{variant}(x));")
+            format!("let x: &mut protobuf::{ty} = x; out.node(NodeMut::{variant}(x));")
         }
         (Target::Plain(ty), false) => {
             format!(
@@ -298,9 +298,15 @@ fn walkers(fds: &FileDescriptorSet) -> String {
         .unwrap();
     }
     s.push_str(
-        "    }\n}\n\n/// Call `out` on every direct child node of `node`.\n///\n\
+        "    }\n}\n\n\
+         /// What the mutable walkers report: a `Node` field (`slot`) or a field\n\
+         /// of one node kind's own type (`node`).\n\
+         trait MutVisitor {\n    \
+         fn slot(&mut self, n: &mut protobuf::Node);\n    \
+         fn node(&mut self, n: NodeMut);\n}\n\n\
+         /// Walk the fields of `node` holding nodes.\n///\n\
          /// # Safety\n/// `node` must point to a live node no one else accesses.\n\
-         pub(crate) unsafe fn children_mut(node: NodeMut, out: &mut dyn FnMut(NodeMut)) {\n    \
+         unsafe fn walk_mut(node: NodeMut, out: &mut dyn MutVisitor) {\n    \
          match node {\n",
     );
     for (variant, ty) in &model.variants {
@@ -313,10 +319,27 @@ fn walkers(fds: &FileDescriptorSet) -> String {
     }
     s.push_str(
         "    }\n}\n\n\
+         struct Children<'f>(&'f mut dyn FnMut(NodeMut));\n\n\
+         impl MutVisitor for Children<'_> {\n    \
+         fn slot(&mut self, n: &mut protobuf::Node) {\n        \
+         if let Some(e) = &mut n.node { (self.0)(e.to_mut()); }\n    }\n    \
+         fn node(&mut self, n: NodeMut) { (self.0)(n); }\n}\n\n\
+         /// Call `out` on every direct child node of `node`.\n///\n\
+         /// # Safety\n/// `node` must point to a live node no one else accesses.\n\
+         pub(crate) unsafe fn children_mut(node: NodeMut, out: &mut dyn FnMut(NodeMut)) {\n    \
+         unsafe { walk_mut(node, &mut Children(out)) }\n}\n\n\
+         struct Slots<'f>(&'f mut dyn FnMut(&mut protobuf::Node));\n\n\
+         impl MutVisitor for Slots<'_> {\n    \
+         fn slot(&mut self, n: &mut protobuf::Node) { (self.0)(n); }\n    \
+         fn node(&mut self, n: NodeMut) { unsafe { walk_mut(n, self) } }\n}\n\n\
+         /// Call `out` on every `Node` field below `node` reached without\n\
+         /// passing through another one: the places a child node can be\n\
+         /// replaced by a node of another kind.\n///\n\
+         /// # Safety\n/// `node` must point to a live node no one else accesses.\n\
+         pub(crate) unsafe fn child_slots_mut(node: NodeMut, out: &mut dyn FnMut(&mut protobuf::Node)) {\n    \
+         unsafe { walk_mut(node, &mut Slots(out)) }\n}\n\n\
          fn visit_node<'a>(n: &'a protobuf::Node, out: &mut dyn FnMut(NodeRef<'a>)) {\n    \
-         if let Some(e) = &n.node { out(e.to_ref()); }\n}\n\n\
-         fn visit_node_mut(n: &mut protobuf::Node, out: &mut dyn FnMut(NodeMut)) {\n    \
-         if let Some(e) = &mut n.node { out(e.to_mut()); }\n}\n\n",
+         if let Some(e) = &n.node { out(e.to_ref()); }\n}\n\n",
     );
 
     // One walker per message.
@@ -330,7 +353,7 @@ fn walkers(fds: &FileDescriptorSet) -> String {
             if mutable {
                 writeln!(
                     s,
-                    "unsafe fn {}(m: *mut protobuf::{ty}, out: &mut dyn FnMut(NodeMut)) {{\n    \
+                    "unsafe fn {}(m: *mut protobuf::{ty}, out: &mut dyn MutVisitor) {{\n    \
                      let m = unsafe {{ &mut *m }};\n{body}}}\n",
                     walk_fn(&ty, true)
                 )
