@@ -164,7 +164,13 @@ pub(crate) fn infer_func_call(
     if resolved.is_aggregate {
         narrow_by_filter(func, &mut args, ctx, params, &filter_log);
     }
+    // The result's collation derives from the arguments' (assign_collations).
+    let (collation, explicit_collation) =
+        derive_collation(&args.exprs, resolved.return_type_oid, snapshot)?;
 
+    // The rules below read arguments by parameter position.
+    let (func, args) = in_declared_order(func, args, &resolved);
+    let func: &protobuf::FuncCall = &func;
     let nullable = resolve_func_nullability(func, name, &resolved, ctx, params, &args);
 
     // SRFs / OUT-arg functions carry a static row shape — propagate it as
@@ -187,9 +193,6 @@ pub(crate) fn infer_func_call(
         }
         Some(fields.into())
     };
-    // The result's collation derives from the arguments' (assign_collations).
-    let (collation, explicit_collation) =
-        derive_collation(&args.exprs, resolved.return_type_oid, snapshot)?;
     Ok(ExprType {
         type_oid: resolved.return_type_oid,
         nullable,
@@ -202,6 +205,41 @@ pub(crate) fn infer_func_call(
         record_fields,
         elem_nullable: builtin_array_elem_nullable(func, &resolved, &args),
     })
+}
+
+/// The call with its arguments in positional notation, for the rules that
+/// read them by parameter position: named arguments (`string_agg(delimiter
+/// => ',', value => x)`) moved to the parameter each binds to, with their
+/// [`FuncArgs`] entries. A parameter left to its default before a later
+/// named one is an empty node (matching no rule), its default taken as
+/// non-NULL as an omitted trailing one is.
+fn in_declared_order<'a>(
+    func: &'a protobuf::FuncCall,
+    args: FuncArgs,
+    resolved: &functions::ResolvedFunction,
+) -> (std::borrow::Cow<'a, protobuf::FuncCall>, FuncArgs) {
+    if !func
+        .args
+        .iter()
+        .any(|a| matches!(a.node.as_ref(), Some(node::Node::NamedArgExpr(_))))
+    {
+        return (std::borrow::Cow::Borrowed(func), args);
+    }
+    let values: Vec<protobuf::Node> = func
+        .args
+        .iter()
+        .map(|a| functions::call_arg_value(a).clone())
+        .collect();
+    let mut positional = func.clone();
+    positional.args = resolved.in_declared_order(&values, protobuf::Node::default());
+    let args = FuncArgs {
+        types: resolved.in_declared_order(&args.types, oid::UNKNOWN),
+        nullable: resolved.in_declared_order(&args.nullable, false),
+        any_nullable: args.any_nullable,
+        exprs: resolved.in_declared_order(&args.exprs, ExprType::scalar(oid::UNKNOWN, false)),
+        direct_count: positional.args.len(),
+    };
+    (std::borrow::Cow::Owned(positional), args)
 }
 
 /// Whether the elements of the array a `pg_catalog` routine returns can be
@@ -440,7 +478,8 @@ fn check_call_shape(
 
 /// Whether two argument/sort expressions are the same (PG compares the
 /// transformed trees with `equal()`): structurally equal ignoring source
-/// locations, or column references resolving to the same column.
+/// locations and type-name spellings, or column references resolving to
+/// the same column.
 fn same_expression(a: &protobuf::Node, b: &protobuf::Node, ctx: Ctx<'_>) -> bool {
     if let (Some(node::Node::ColumnRef(ca)), Some(node::Node::ColumnRef(cb))) =
         (a.node.as_ref(), b.node.as_ref())
@@ -461,7 +500,8 @@ fn same_expression(a: &protobuf::Node, b: &protobuf::Node, ctx: Ctx<'_>) -> bool
             return x == y;
         }
     }
-    crate::resolve::node_fingerprint(a) == crate::resolve::node_fingerprint(b)
+    crate::grouping::typed_fingerprint(a, ctx.snapshot)
+        == crate::grouping::typed_fingerprint(b, ctx.snapshot)
 }
 
 /// PG's `unify_hypothetical_args` (parse_func.c): each hypothetical direct
@@ -943,24 +983,90 @@ fn is_zero_offset(n: &protobuf::Node) -> bool {
     match n.node.as_ref() {
         Some(node::Node::AConst(c)) if !c.isnull => match &c.val {
             Some(Val::Ival(i)) => i.ival == 0,
-            Some(Val::Fval(f)) => f.fval.parse::<f64>().is_ok_and(|x| x == 0.0),
-            Some(Val::Sval(s)) => {
-                // A zero quantity, optionally followed by a unit word.
-                let s = s.sval.trim();
-                let digits_end = s
-                    .find(|c: char| !(c.is_ascii_digit() || c == '.'))
-                    .unwrap_or(s.len());
-                let (num, unit) = s.split_at(digits_end);
-                num.chars().any(|c| c.is_ascii_digit())
-                    && num.chars().all(|c| c == '0' || c == '.')
-                    && num.matches('.').count() <= 1
-                    && unit.trim().chars().all(|c| c.is_ascii_alphabetic())
-            }
+            Some(Val::Fval(f)) => is_zero_decimal(&f.fval),
+            Some(Val::Sval(s)) => is_zero_string(&s.sval),
             _ => false,
         },
         Some(node::Node::TypeCast(c)) => c.arg.as_deref().is_some_and(is_zero_offset),
         _ => false,
     }
+}
+
+/// Plain decimal digits with at most one point, all zeros (`0`, `00`,
+/// `0.`, `.0`).
+fn is_zero_decimal(s: &str) -> bool {
+    s.chars().any(|c| c.is_ascii_digit())
+        && s.chars().all(|c| c == '0' || c == '.')
+        && s.matches('.').count() <= 1
+}
+
+/// A string literal every offset type reads as zero: a zero quantity
+/// (`'0'`, `' 0.0 '`), or for an interval one followed, after a space, by
+/// a unit (`'0 day'`, `'0 hours'`). A unit glued to the number is refused:
+/// `int8` reads `'0xa'` as 10, `'0o7'` as 7 and `'0b1'` as 1.
+fn is_zero_string(s: &str) -> bool {
+    /// `datetime.c`'s `deltatktbl` units (any of them over zero is zero).
+    const UNITS: &[&str] = &[
+        "c",
+        "cent",
+        "centuries",
+        "century",
+        "d",
+        "day",
+        "days",
+        "dec",
+        "decade",
+        "decades",
+        "decs",
+        "h",
+        "hour",
+        "hours",
+        "hr",
+        "hrs",
+        "m",
+        "microsecon",
+        "microsecond",
+        "microseconds",
+        "mil",
+        "millennia",
+        "millennium",
+        "millisecon",
+        "millisecond",
+        "milliseconds",
+        "mils",
+        "min",
+        "mins",
+        "minute",
+        "minutes",
+        "mon",
+        "mons",
+        "month",
+        "months",
+        "ms",
+        "msec",
+        "msecs",
+        "s",
+        "sec",
+        "second",
+        "seconds",
+        "secs",
+        "us",
+        "usec",
+        "usecs",
+        "w",
+        "week",
+        "weeks",
+        "y",
+        "year",
+        "years",
+        "yr",
+        "yrs",
+    ];
+    let mut words = s.split_ascii_whitespace();
+    let (Some(num), unit, None) = (words.next(), words.next(), words.next()) else {
+        return false;
+    };
+    is_zero_decimal(num) && unit.is_none_or(|u| UNITS.contains(&u.to_ascii_lowercase().as_str()))
 }
 
 /// Built-ins whose only NULL results (beyond NULL arguments) depend on
@@ -986,21 +1092,13 @@ fn value_gated_non_null(
     params: &ParamCollector,
 ) -> bool {
     let proname = resolved.signature.split('(').next().unwrap_or_default();
-    let positional: Vec<&protobuf::Node> = func
-        .args
-        .iter()
-        .take_while(|a| !matches!(a.node.as_ref(), Some(node::Node::NamedArgExpr(_))))
-        .collect();
-    let named = |name: &str| {
-        func.args.iter().find_map(|a| match a.node.as_ref() {
-            Some(node::Node::NamedArgExpr(na)) if na.name == name => na.arg.as_deref(),
-            _ => None,
-        })
-    };
-    let first_type = resolved.arg_types.first().copied();
+    // (In positional notation: see [`in_declared_order`].)
+    let positional: Vec<&protobuf::Node> = func.args.iter().collect();
+    let declared_types = resolved.in_declared_order(&resolved.arg_types, oid::UNKNOWN);
+    let first_type = declared_types.first().copied();
     match proname {
         "jsonb_path_exists" | "jsonb_path_exists_tz" => {
-            let silent = positional.get(3).copied().or_else(|| named("silent"));
+            let silent = positional.get(3).copied();
             silent.is_none_or(|s| {
                 matches!(
                     s.node.as_ref(),
@@ -1032,7 +1130,7 @@ fn value_gated_non_null(
         }
         "extract" | "date_part" if func.args.len() == 2 && positional.len() == 2 => {
             matches!(first_type, Some(t) if t == oid::TEXT)
-                && resolved.arg_types.get(1).is_some_and(|&t| {
+                && declared_types.get(1).is_some_and(|&t| {
                     t == oid::TIMESTAMP || t == oid::TIMESTAMPTZ || t == oid::DATE
                 })
                 && finite_time_source(positional[1], ctx)
@@ -1563,8 +1661,12 @@ fn resolve_func_nullability(
     // NULL for the first row of each partition. A 3-arg `lag(col, offset,
     // default)`/`lead(...)` replaces the boundary NULL with `default`, so
     // the result is only nullable when the value, the offset (a NULL
-    // offset gives NULL) or the default are.
+    // offset gives NULL) or the default are. Only the `pg_catalog` window
+    // functions behave so: an aggregate named `lag` or `first_value` used
+    // with OVER is whatever its definition makes it.
     let is_value_window = func.over.is_some()
+        && resolved.is_window
+        && resolved.schema == "pg_catalog"
         && matches!(
             name,
             "lag" | "lead" | "first_value" | "last_value" | "nth_value"
@@ -1579,7 +1681,6 @@ fn resolve_func_nullability(
     {
         nullable
     } else if is_value_window {
-        let builtin = resolved.schema == "pg_catalog";
         let frame_has_current_row = || {
             func.over
                 .as_deref()
@@ -1589,9 +1690,7 @@ fn resolve_func_nullability(
         match name {
             // An offset of 0 is the current row itself, whatever the
             // default (`WinGetFuncArgInPartition` at relpos 0).
-            "lag" | "lead" if builtin && func.args.get(1).is_some_and(is_zero_constant) => {
-                arg_is_nullable(0)
-            }
+            "lag" | "lead" if func.args.get(1).is_some_and(is_zero_constant) => arg_is_nullable(0),
             "lag" | "lead" if func.args.len() >= 3 => {
                 arg_is_nullable(0) || arg_is_nullable(1) || arg_is_nullable(2)
             }
@@ -1599,16 +1698,15 @@ fn resolve_func_nullability(
             // frame holds the current row — and so does `nth_value(x, 1)`.
             "first_value" | "last_value" => arg_is_nullable(0) || !frame_has_current_row(),
             "nth_value"
-                if builtin
-                    && func.args.get(1).is_some_and(|n| {
-                        matches!(
-                            n.node.as_ref(),
-                            Some(node::Node::AConst(protobuf::AConst {
-                                val: Some(typedpg_pg_query::protobuf::a_const::Val::Ival(i)),
-                                ..
-                            })) if i.ival == 1
-                        )
-                    }) =>
+                if func.args.get(1).is_some_and(|n| {
+                    matches!(
+                        n.node.as_ref(),
+                        Some(node::Node::AConst(protobuf::AConst {
+                            val: Some(typedpg_pg_query::protobuf::a_const::Val::Ival(i)),
+                            ..
+                        })) if i.ival == 1
+                    )
+                }) =>
             {
                 arg_is_nullable(0) || !frame_has_current_row()
             }
@@ -1623,7 +1721,7 @@ fn resolve_func_nullability(
         // nothing).
         let value_args: Vec<usize> = if func.agg_within_group {
             (args.direct_count..args.nullable.len()).collect()
-        } else if name == "string_agg" {
+        } else if builtin && name == "string_agg" {
             vec![0]
         } else {
             (0..args.nullable.len()).collect()
@@ -1650,6 +1748,15 @@ fn resolve_func_nullability(
                     .and_then(|n| crate::having::column_of(n, ctx.scope))
                     .is_some_and(|c| null_ctx.nonnull_agg_inputs.contains(&c))
         };
+        // A row whose every value is non-NULL — one a strict transition
+        // function reads. HAVING proves each column present in *some* row
+        // of the group: for an aggregate of several values (`regr_sxx(b,
+        // c)`, `covar_pop(b, c)`), `count(b) > 0 AND count(c) > 0` holds of
+        // a group whose rows are (1, NULL) and (NULL, 1). So a proof counts
+        // only when the other values are never NULL.
+        let proven_row = value_args
+            .iter()
+            .any(|&i| proven(i) && value_args.iter().all(|&j| j == i || !arg_is_nullable(j)));
         // An aggregate over a non-empty set of rows: NULL only when every
         // value it reads is NULL (for the strict ones), never for those
         // keeping NULL inputs (`array_agg`, `json_agg`, …) — except for
@@ -1662,7 +1769,7 @@ fn resolve_func_nullability(
                 || match class {
                     crate::having::AggregateClass::Strict => {
                         direct_nullable
-                            || value_args.iter().any(|&i| arg_is_nullable(i) && !proven(i))
+                            || (value_args.iter().any(|&i| arg_is_nullable(i)) && !proven_row)
                     }
                     _ => false,
                 }

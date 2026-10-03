@@ -46,6 +46,8 @@ mod expression_facts;
 mod expressions;
 #[path = "query/function_aggregate_narrowing.rs"]
 mod function_aggregate_narrowing;
+#[path = "query/function_soundness.rs"]
+mod function_soundness;
 #[path = "query/join_row_guarantees.rs"]
 mod join_row_guarantees;
 #[path = "query/join_rules.rs"]

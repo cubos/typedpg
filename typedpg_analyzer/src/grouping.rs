@@ -54,6 +54,7 @@ pub(crate) fn expand_grouping_sets(
     group_clause: &[protobuf::Node],
     scope: &Scope,
     targets: &[ExpandedTarget<'_>],
+    snapshot: &PgCatalog,
 ) -> GroupingExpansion {
     // Too many sets is an error of its own (parseCheckAggregates); don't
     // materialize them.
@@ -66,7 +67,7 @@ pub(crate) fn expand_grouping_sets(
     let mut per_entry: Vec<Vec<HashSet<(String, String)>>> = Vec::new();
     let mut saw_grouping_set = false;
     for node in group_clause {
-        let alts = alternatives_for(node, scope, targets, &mut saw_grouping_set);
+        let alts = alternatives_for(node, scope, targets, snapshot, &mut saw_grouping_set);
         per_entry.push(alts);
     }
 
@@ -145,14 +146,15 @@ fn alternatives_for(
     node: &protobuf::Node,
     scope: &Scope,
     targets: &[ExpandedTarget<'_>],
+    snapshot: &PgCatalog,
     saw_grouping_set: &mut bool,
 ) -> Vec<HashSet<(String, String)>> {
     match node.node.as_ref() {
         Some(node::Node::GroupingSet(gs)) => {
             *saw_grouping_set = true;
-            alternatives_for_grouping_set(gs, scope, targets, saw_grouping_set)
+            alternatives_for_grouping_set(gs, scope, targets, snapshot, saw_grouping_set)
         }
-        _ => vec![singleton_set(node, scope, targets)],
+        _ => vec![singleton_set(node, scope, targets, snapshot)],
     }
 }
 
@@ -160,6 +162,7 @@ fn alternatives_for_grouping_set(
     gs: &protobuf::GroupingSet,
     scope: &Scope,
     targets: &[ExpandedTarget<'_>],
+    snapshot: &PgCatalog,
     saw_grouping_set: &mut bool,
 ) -> Vec<HashSet<(String, String)>> {
     let kind = GroupingSetKind::try_from(gs.kind).unwrap_or(GroupingSetKind::Undefined);
@@ -169,7 +172,7 @@ fn alternatives_for_grouping_set(
             // `(a, b)` — a single set with the union of its members.
             let mut set = HashSet::new();
             for item in &gs.content {
-                set.extend(singleton_set(item, scope, targets));
+                set.extend(singleton_set(item, scope, targets, snapshot));
             }
             vec![set]
         }
@@ -178,7 +181,7 @@ fn alternatives_for_grouping_set(
             let items: Vec<HashSet<(String, String)>> = gs
                 .content
                 .iter()
-                .map(|n| singleton_set(n, scope, targets))
+                .map(|n| singleton_set(n, scope, targets, snapshot))
                 .collect();
             let mut alts = Vec::with_capacity(items.len() + 1);
             for cut in (0..=items.len()).rev() {
@@ -195,7 +198,7 @@ fn alternatives_for_grouping_set(
             let items: Vec<HashSet<(String, String)>> = gs
                 .content
                 .iter()
-                .map(|n| singleton_set(n, scope, targets))
+                .map(|n| singleton_set(n, scope, targets, snapshot))
                 .collect();
             let n = items.len();
             let mut alts = Vec::with_capacity(1usize << n.min(16));
@@ -216,7 +219,13 @@ fn alternatives_for_grouping_set(
             // alt = singleton) or a nested `GroupingSet`.
             let mut alts = Vec::new();
             for child in &gs.content {
-                alts.extend(alternatives_for(child, scope, targets, saw_grouping_set));
+                alts.extend(alternatives_for(
+                    child,
+                    scope,
+                    targets,
+                    snapshot,
+                    saw_grouping_set,
+                ));
             }
             if alts.is_empty() {
                 vec![HashSet::new()]
@@ -253,14 +262,15 @@ fn singleton_set(
     node: &protobuf::Node,
     scope: &Scope,
     targets: &[ExpandedTarget<'_>],
+    snapshot: &PgCatalog,
 ) -> HashSet<(String, String)> {
     if let Some(items) = implicit_row_items(node) {
         return items
             .iter()
-            .flat_map(|i| singleton_set(i, scope, targets))
+            .flat_map(|i| singleton_set(i, scope, targets, snapshot))
             .collect();
     }
-    match group_leaf(node, scope, targets) {
+    match group_leaf(node, scope, targets, snapshot) {
         GroupLeaf::Column(key) => HashSet::from([key]),
         GroupLeaf::Expr(fingerprint) => HashSet::from([(EXPR_KEY.to_owned(), fingerprint)]),
         GroupLeaf::Other | GroupLeaf::Unresolved => HashSet::new(),
@@ -283,11 +293,16 @@ enum GroupLeaf {
 /// is a position in the (star-expanded) target list, a bare name is an
 /// input column first and an output-column alias otherwise, anything else is
 /// an expression of its own.
-fn group_leaf(node: &protobuf::Node, scope: &Scope, targets: &[ExpandedTarget<'_>]) -> GroupLeaf {
+fn group_leaf(
+    node: &protobuf::Node,
+    scope: &Scope,
+    targets: &[ExpandedTarget<'_>],
+    snapshot: &PgCatalog,
+) -> GroupLeaf {
     let target_column = |rt: &protobuf::ResTarget| match rt.val.as_deref() {
         Some(v) => match resolve_group_column(v, scope) {
             Some(key) => GroupLeaf::Column(key),
-            None => GroupLeaf::Expr(expr_key(v)),
+            None => GroupLeaf::Expr(expr_key(v, snapshot)),
         },
         None => GroupLeaf::Other,
     };
@@ -324,7 +339,7 @@ fn group_leaf(node: &protobuf::Node, scope: &Scope, targets: &[ExpandedTarget<'_
             });
             target.map_or(GroupLeaf::Unresolved, target_column)
         }
-        Some(_) => GroupLeaf::Expr(expr_key(node)),
+        Some(_) => GroupLeaf::Expr(expr_key(node, snapshot)),
         None => GroupLeaf::Other,
     }
 }
@@ -335,9 +350,59 @@ pub(crate) const EXPR_KEY: &str = "\u{0}expr";
 
 /// The key of an expression in grouping sets: its parse tree without
 /// locations or column qualifiers (`t.g + 1` and `g + 1` are one key —
-/// erring towards matching, which only makes more values nullable).
-pub(crate) fn expr_key(node: &protobuf::Node) -> String {
-    crate::resolve::node_fingerprint(&crate::resolve::predtest_unqualify(node))
+/// erring towards matching, which only makes more values nullable), its
+/// type names resolved as the GROUP BY check compares them
+/// ([`resolve_type_names`]: `CAST(g AS bigint)` is `g::int8`).
+pub(crate) fn expr_key(node: &protobuf::Node, snapshot: &PgCatalog) -> String {
+    crate::resolve::node_fingerprint(&crate::resolve::predtest_unqualify(&resolve_type_names(
+        node, snapshot,
+    )))
+}
+
+/// [`crate::resolve::node_fingerprint`] of `node` with its type names
+/// resolved ([`resolve_type_names`]) — the same for two expressions PG's
+/// `equal()` finds equal once transformed, up to how columns are spelled.
+pub(crate) fn typed_fingerprint(node: &protobuf::Node, snapshot: &PgCatalog) -> String {
+    crate::resolve::node_fingerprint(&resolve_type_names(node, snapshot))
+}
+
+/// `node` with every type name it holds resolved to its type — PG
+/// compares *transformed* expressions, where `CAST(a AS bigint)`,
+/// `a::int8` and `a::pg_catalog.int8` are one coercion, as are `x::_int4`
+/// and `x::int[]`: the name gives way to the type's OID (with the array
+/// bounds it accounts for; a typmod stays). A name that doesn't resolve
+/// stays as written.
+pub(crate) fn resolve_type_names(node: &protobuf::Node, snapshot: &PgCatalog) -> protobuf::Node {
+    use typedpg_pg_query::NodeMut;
+    let mut tree = protobuf::ParseResult {
+        version: 0,
+        stmts: vec![protobuf::RawStmt {
+            stmt: Some(Box::new(node.clone())),
+            stmt_location: 0,
+            stmt_len: 0,
+        }],
+    };
+    // SAFETY: the tree is neither moved nor dropped while the pointers are
+    // used; only `TypeName`s are dereferenced, each once (no `TypeName`
+    // holds another), and the `String` children whose list is replaced are
+    // never dereferenced afterwards.
+    unsafe {
+        for (n, _) in tree.nodes_mut() {
+            if let NodeMut::TypeName(tn) = n
+                && let Some(oid) = crate::ddl::util::resolve_type_name(&*tn, snapshot)
+            {
+                (*tn).type_oid = oid.get();
+                (*tn).names = Vec::new();
+                (*tn).array_bounds = Vec::new();
+                (*tn).pct_type = false;
+            }
+        }
+    }
+    tree.stmts
+        .pop()
+        .and_then(|s| s.stmt)
+        .map(|b| *b)
+        .unwrap_or_default()
 }
 
 /// Resolve a `GROUP BY` entry as a single column against `scope`. Returns the
@@ -1193,13 +1258,18 @@ fn call_level(args: &[&protobuf::Node], chain: &mut Chain) -> usize {
 /// replaced by the entry and column it names — so that two spellings of
 /// the same expression (`t.a + 1`, `a + 1`) compare equal under
 /// [`Equal`], the analyzer's stand-in for PG's `equal()` on transformed
-/// expressions.
-fn canonical(node: &protobuf::Node, chain: &Chain, level: usize) -> protobuf::Node {
+/// expressions — with its type names resolved ([`resolve_type_names`]).
+fn canonical(
+    node: &protobuf::Node,
+    chain: &Chain,
+    level: usize,
+    snapshot: &PgCatalog,
+) -> protobuf::Node {
     use typedpg_pg_query::{NodeMut, NodeRef};
     let mut tree = protobuf::ParseResult {
         version: 0,
         stmts: vec![protobuf::RawStmt {
-            stmt: Some(Box::new(node.clone())),
+            stmt: Some(Box::new(resolve_type_names(node, snapshot))),
             stmt_location: 0,
             stmt_len: 0,
         }],
@@ -1275,9 +1345,10 @@ pub(crate) fn same_level_exprs_equal(
     a: &protobuf::Node,
     b: &protobuf::Node,
     scope: &Scope,
+    snapshot: &PgCatalog,
 ) -> bool {
     let chain = Chain(vec![Some(Rc::new(Namespace::of(&scope.sources)))]);
-    canonical(a, &chain, 0).equal(&canonical(b, &chain, 0))
+    canonical(a, &chain, 0, snapshot).equal(&canonical(b, &chain, 0, snapshot))
 }
 
 /// The locations of the first aggregate, `GROUPING(…)` and window call in
@@ -1412,7 +1483,11 @@ pub(crate) fn finish_select_level(
                 match call_level(&args, &mut chain) {
                     0 => own_grouping.push(g),
                     up => {
-                        let canon = g.args.iter().map(|a| canonical(a, &chain, up)).collect();
+                        let canon = g
+                            .args
+                            .iter()
+                            .map(|a| canonical(a, &chain, up, snapshot))
+                            .collect();
                         attribute_outer(up, Some(canon), g.location)?;
                     }
                 }
@@ -1440,7 +1515,7 @@ pub(crate) fn finish_select_level(
     }
 
     let mut own = Chain(vec![chain.0[0].clone()]);
-    let group = GroupExprs::collect(sel, scope, targets, &own);
+    let group = GroupExprs::collect(sel, scope, targets, &own, snapshot);
 
     // finalize_grouping_exprs.
     let grouping_error = |location: i32| {
@@ -1458,7 +1533,7 @@ pub(crate) fn finish_select_level(
     for g in own_grouping {
         if g.args
             .iter()
-            .any(|a| !group.contains(&canonical(a, &own, 0)))
+            .any(|a| !group.contains(&canonical(a, &own, 0, snapshot)))
         {
             return Err(grouping_error(g.location));
         }
@@ -1472,7 +1547,7 @@ pub(crate) fn finish_select_level(
     // Primary-key functional dependency (check_functional_grouping): a
     // table whose whole primary key is grouped — by every grouping set —
     // determines all of its columns.
-    let expansion = expand_grouping_sets(&sel.group_clause, scope, targets);
+    let expansion = expand_grouping_sets(&sel.group_clause, scope, targets, snapshot);
     let own_ns = own.0[0].clone().unwrap_or_default();
     let common: HashSet<ColKey> = match expansion.common {
         Some(common) => common
@@ -1596,6 +1671,7 @@ impl GroupExprs {
         scope: &Scope,
         targets: &[ExpandedTarget<'_>],
         own: &Chain,
+        snapshot: &PgCatalog,
     ) -> Self {
         let mut out = GroupExprs {
             vars: HashSet::new(),
@@ -1660,7 +1736,7 @@ impl GroupExprs {
                 continue;
             }
             out.have_non_var = true;
-            out.exprs.push(canonical(expr, own, 0));
+            out.exprs.push(canonical(expr, own, 0, snapshot));
         }
         out
     }
@@ -1738,7 +1814,11 @@ impl UngroupedCheck<'_> {
             }
             _ => {}
         }
-        if depth == 0 && self.group.have_non_var && self.group.contains(&canonical(node, chain, 0))
+        if depth == 0
+            && self.group.have_non_var
+            && self
+                .group
+                .contains(&canonical(node, chain, 0, self.snapshot))
         {
             return Ok(());
         }
