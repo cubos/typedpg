@@ -254,7 +254,9 @@ pub(crate) fn analyze_set_operation(
                 // EXCEPT (DISTINCT) removes every left row equal — NULLs
                 // not distinct — to a right one: a single-column right arm
                 // that always yields a NULL removes every NULL.
-                "EXCEPT" if !sel.all && n_columns == 1 && always_yields_null(right) => false,
+                "EXCEPT" if !sel.all && n_columns == 1 && always_yields_null(right, snapshot) => {
+                    false
+                }
                 "EXCEPT" => l.nullable,
                 "INTERSECT" => l.nullable && r.nullable,
                 _ => l.nullable || r.nullable,
@@ -438,8 +440,10 @@ pub(crate) fn check_set_op_member_locking(arm: &protobuf::SelectStmt) -> Result<
 
 /// Whether a set operation's single-column arm yields a NULL row whatever
 /// the data: `SELECT NULL` (cast or not) with no FROM, WHERE, grouping or
-/// LIMIT / OFFSET — exactly one row — or a VALUES list with a `(NULL)` row.
-fn always_yields_null(arm: &protobuf::SelectStmt) -> bool {
+/// LIMIT / OFFSET, nor a set-returning call (an ORDER BY one included, see
+/// [`level_srf_calls`]) — exactly one row — or a VALUES list with a
+/// `(NULL)` row.
+fn always_yields_null(arm: &protobuf::SelectStmt, snapshot: &PgCatalog) -> bool {
     fn is_null_constant(n: &protobuf::Node) -> bool {
         match n.node.as_ref() {
             Some(node::Node::AConst(c)) => c.isnull,
@@ -464,11 +468,12 @@ fn always_yields_null(arm: &protobuf::SelectStmt) -> bool {
             _ => false,
         });
     }
-    matches!(
-        arm.target_list.as_slice(),
-        [t] if matches!(
-            t.node.as_ref(),
-            Some(node::Node::ResTarget(rt)) if rt.val.as_deref().is_some_and(is_null_constant)
+    level_srf_calls(arm, snapshot).is_empty()
+        && matches!(
+            arm.target_list.as_slice(),
+            [t] if matches!(
+                t.node.as_ref(),
+                Some(node::Node::ResTarget(rt)) if rt.val.as_deref().is_some_and(is_null_constant)
+            )
         )
-    )
 }

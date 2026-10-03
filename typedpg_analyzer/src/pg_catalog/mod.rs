@@ -285,6 +285,11 @@ pub struct PgCatalog {
     /// (view_query_is_auto_updatable / view_col_is_auto_updatable over its
     /// stored query).
     pub(crate) view_updatability: Shared<HashMap<PgClassOid, crate::ddl::views::ViewUpdatability>>,
+    /// What each view's (and materialized view's) query resolved its names
+    /// to when it was defined: PG stores the query bound to OIDs and
+    /// attnums, the analyzer its text, which it re-analyzes only while it
+    /// still resolves alike (see [`crate::ddl::views::reanalyze_view`]).
+    pub(crate) view_references: Shared<HashMap<PgClassOid, Vec<crate::ddl::depend::Reference>>>,
     /// `pg_class.reloftype` of typed tables (`CREATE TABLE ... OF type`).
     pub(crate) typed_tables: Shared<HashMap<PgClassOid, PgTypeOid>>,
     /// Tables with row-level security enabled (`relrowsecurity`): their
@@ -661,6 +666,7 @@ impl PgCatalog {
             partition_keys: Shared::default(),
             triggers: Shared::default(),
             view_updatability: Shared::default(),
+            view_references: Shared::default(),
             policies: Shared::default(),
             rules: Shared::default(),
             typed_tables: Shared::default(),
@@ -1444,6 +1450,7 @@ impl PgCatalog {
         self.policies.remove(&oid);
         self.rules.remove(&oid);
         self.view_updatability.remove(&oid);
+        self.view_references.remove(&oid);
         self.typed_tables.remove(&oid);
         self.row_security.remove(&oid);
         self.ri_triggers_disabled.remove(&oid);

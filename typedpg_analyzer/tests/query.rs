@@ -52,6 +52,8 @@ mod function_soundness;
 mod join_row_guarantees;
 #[path = "query/join_rules.rs"]
 mod join_rules;
+#[path = "query/join_soundness.rs"]
+mod join_soundness;
 #[path = "query/joins.rs"]
 mod joins;
 #[path = "query/json_table.rs"]

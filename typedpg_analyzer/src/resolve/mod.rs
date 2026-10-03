@@ -291,6 +291,9 @@ pub(crate) fn analyze_static(
     let can_run_as_subquery = can_run_as_subquery(stmt);
     let (raw_columns, raw_params) =
         expr::with_plan_time_checks(|| analyze_raw_node(snapshot, stmt, param_nullability))?;
+    if let Some(e) = values_sort_srf_error(stmt, snapshot) {
+        return Err(e);
+    }
 
     let columns = raw_columns
         .into_iter()
@@ -313,6 +316,82 @@ pub(crate) fn analyze_static(
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok((columns, params_info, can_run_as_subquery))
+}
+
+/// The error every execution of `stmt` raises when the rows it reads
+/// come from a VALUES list sorted by a set-returning call (`VALUES (1)
+/// ORDER BY generate_series(1, 2)`): parse analysis accepts the call as a
+/// resjunk sort key, but a VALUES query gets no ProjectSet, so the
+/// executor initializing the expression fails (`ExecInitFunc`: 0A000
+/// `set-valued function called in context that cannot accept a set`),
+/// whatever the data. Only a VALUES certain to be planned counts: the
+/// statement's own (an arm of its set operation, an INSERT's source, what
+/// EXPLAIN plans) or a scalar / ARRAY subquery making up a whole entry of
+/// its select list — which the planner turns into a subplan, initialized
+/// with the plan even when no row ever reaches it. Elsewhere it is dropped
+/// when the planner proves it unneeded (`WHERE false`, an unreferenced
+/// CTE, `EXISTS`, `CASE WHEN false`), and the statement then runs fine.
+fn values_sort_srf_error(stmt: &node::Node, snapshot: &PgCatalog) -> Option<AnalyzeError> {
+    fn select(sel: &protobuf::SelectStmt, snapshot: &PgCatalog) -> Option<i32> {
+        if sel.op != SetOperation::SetopNone as i32 {
+            return [&sel.larg, &sel.rarg]
+                .into_iter()
+                .find_map(|arm| select(arm.as_deref()?, snapshot));
+        }
+        if sel.values_lists.is_empty() {
+            return sel.target_list.iter().find_map(|t| {
+                let node::Node::ResTarget(rt) = t.node.as_ref()? else {
+                    return None;
+                };
+                let node::Node::SubLink(sl) = rt.val.as_deref()?.node.as_ref()? else {
+                    return None;
+                };
+                if !matches!(
+                    protobuf::SubLinkType::try_from(sl.sub_link_type),
+                    Ok(protobuf::SubLinkType::ExprSublink | protobuf::SubLinkType::ArraySublink)
+                ) {
+                    return None;
+                }
+                match sl.subselect.as_deref()?.node.as_ref()? {
+                    node::Node::SelectStmt(sub) => select(sub, snapshot),
+                    _ => None,
+                }
+            });
+        }
+        let mut location = None;
+        for n in &sel.sort_clause {
+            visit_same_level(n, &mut |e| {
+                if let Some(node::Node::FuncCall(fc)) = e.node.as_ref()
+                    && location.is_none()
+                    && is_srf_call(fc, snapshot)
+                {
+                    location = Some(fc.location);
+                }
+            });
+        }
+        location
+    }
+    let location = match stmt {
+        node::Node::SelectStmt(sel) => select(sel, snapshot),
+        node::Node::InsertStmt(ins) => match ins.select_stmt.as_deref()?.node.as_ref()? {
+            node::Node::SelectStmt(sel) => select(sel, snapshot),
+            _ => None,
+        },
+        node::Node::ExplainStmt(es) => {
+            return values_sort_srf_error(es.query.as_deref()?.node.as_ref()?, snapshot);
+        }
+        _ => None,
+    }?;
+    Some(
+        crate::error::RawError::new(
+            AnalyzeError::FeatureNotSupported(
+                "set-valued function called in context that cannot accept a set".into(),
+            ),
+            crate::error::SourceSpan::from_node_qname(location),
+            None,
+        )
+        .finalize_implicit(),
+    )
 }
 
 /// True when `stmt` can appear as the body of a `SELECT * FROM (<stmt>) …`
@@ -407,9 +486,9 @@ fn analyze_raw_node_with(
     stmt: &node::Node,
     params: ParamCollector,
 ) -> Result<(Vec<RawColumn>, Vec<RawParam>), AnalyzeError> {
-    let locks = |n: typedpg_pg_query::NodeRef<'_>| matches!(n, typedpg_pg_query::NodeRef::SelectStmt(s) if !s.locking_clause.is_empty());
-    let locks = matches!(stmt, node::Node::SelectStmt(s) if !s.locking_clause.is_empty())
-        || stmt.nodes().into_iter().any(|(n, ..)| locks(n));
+    // A statement analyzed within one that locks rows (a view it reads)
+    // is re-checked along with it.
+    let locks = crate::nonnull::row_locking() || statement_locks_rows(snapshot, stmt);
     let mut seeded = params;
     loop {
         let (analysis, stale) = crate::nonnull::with_row_locking(locks, || {
@@ -422,6 +501,33 @@ fn analyze_raw_node_with(
             seeded.infer_nullable(n, true);
         }
     }
+}
+
+/// Whether `stmt` has a `FOR UPDATE` / `FOR SHARE` clause anywhere.
+pub(crate) fn locks_rows(stmt: &node::Node) -> bool {
+    let locks = |n: typedpg_pg_query::NodeRef<'_>| matches!(n, typedpg_pg_query::NodeRef::SelectStmt(s) if !s.locking_clause.is_empty());
+    matches!(stmt, node::Node::SelectStmt(s) if !s.locking_clause.is_empty())
+        || stmt.nodes().into_iter().any(|(n, ..)| locks(n))
+}
+
+/// Whether `stmt` locks rows: it has a locking clause, or reads a view
+/// whose query does ([`crate::ddl::views::view_locks_rows`]). A name a
+/// CTE takes counts as the view it would name otherwise (only ever too
+/// cautious).
+fn statement_locks_rows(snapshot: &PgCatalog, stmt: &node::Node) -> bool {
+    locks_rows(stmt)
+        || stmt.nodes().into_iter().any(|(n, ..)| match n {
+            typedpg_pg_query::NodeRef::RangeVar(rv) => {
+                let schema = (!rv.schemaname.is_empty()).then_some(rv.schemaname.as_str());
+                snapshot
+                    .resolve_table(schema, &rv.relname)
+                    .is_some_and(|c| {
+                        c.relkind == crate::pg_catalog::RelKind::View
+                            && crate::ddl::views::view_locks_rows(snapshot, c.oid)
+                    })
+            }
+            _ => false,
+        })
 }
 
 /// A statement's output columns and parameters.

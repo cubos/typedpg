@@ -468,6 +468,8 @@ fn replace_view(
         .collect();
     interp.pg_attribute.insert(view_oid, attrs);
     interp.remove_pg_rewrites_of(view_oid);
+    let bound = bound_references(interp, &deps.references);
+    interp.view_references.insert(view_oid, bound);
     let rewrite_oid = PgRewriteOid::from_nonzero(interp.alloc_oid()?);
     interp.insert_pg_rewrite(PgRewrite {
         oid: rewrite_oid,
@@ -630,6 +632,8 @@ fn install_relation(
     // PG stores the SELECT body as a `_RETURN` rule in pg_rewrite — only
     // for views/matviews; CTAS-as-table doesn't get one.
     if matches!(relkind, RelKind::View | RelKind::MaterializedView) {
+        let bound = bound_references(interp, &deps.references);
+        interp.view_references.insert(class_oid, bound);
         let rewrite_oid = PgRewriteOid::from_nonzero(interp.alloc_oid()?);
         interp.insert_pg_rewrite(PgRewrite {
             oid: rewrite_oid,
@@ -1638,9 +1642,11 @@ pub fn drop_views(snapshot: &mut PgCatalog, view_oids: &[PgClassOid]) {
 /// view over its base tables on every use, so `ALTER TABLE t ALTER b DROP NOT
 /// NULL` is immediately visible through `v`. The analyzer resolves views once
 /// at CREATE time, so it re-analyzes the stored body here. When that is not
-/// possible (the body no longer resolves, e.g. after a rename, or its shape
-/// changed) and the change can only have *added* NULLs (`relaxing`), every
-/// column of the view is conservatively marked nullable.
+/// possible (the body no longer resolves, or not to what it read at CREATE
+/// time — e.g. after a rename —, or its shape changed; see
+/// [`reanalyze_view`]) and the change can only have *added* NULLs
+/// (`relaxing`), every column of the view is conservatively marked
+/// nullable.
 ///
 /// Relation-level dependencies are used (not column-level ones) because a
 /// `SELECT *` body records no column references.
@@ -1649,8 +1655,6 @@ pub(crate) fn refresh_dependent_view_nullability(
     relid: PgClassOid,
     relaxing: bool,
 ) {
-    use prost::Message;
-
     let mut queue: std::collections::VecDeque<PgClassOid> =
         find_dependent_views(interp, relid).into();
     let mut seen = std::collections::HashSet::new();
@@ -1658,15 +1662,7 @@ pub(crate) fn refresh_dependent_view_nullability(
         if !seen.insert(view) {
             continue;
         }
-        let reanalyzed = interp
-            .view_body(view)
-            .and_then(|body| protobuf::Node::decode(body.ast.as_slice()).ok())
-            .and_then(|node| {
-                let inner = node.node.as_ref()?;
-                crate::resolve::analyze_raw_node(interp, inner, &[])
-                    .ok()
-                    .map(|(cols, _)| cols)
-            });
+        let reanalyzed = reanalyze_view(interp, view);
         let attrs = interp.attributes_of(view).to_vec();
         let new_not_null: Option<Vec<bool>> = reanalyzed.and_then(|cols| {
             (cols.len() >= attrs.len()
@@ -1973,6 +1969,90 @@ pub(crate) fn sets_check_option(options: &[protobuf::Node]) -> bool {
     options.iter().any(|o| {
         matches!(o.node.as_ref(), Some(node::Node::DefElem(de)) if de.defname == "check_option")
     })
+}
+
+/// What an analysis resolved its names to ([`super::depend::collect`]),
+/// in the order it first did: each column by its attnum (a rename keeps
+/// it), each object once (the analysis looks some up again while
+/// narrowing).
+fn bound_references(
+    interp: &PgCatalog,
+    references: &[super::depend::Reference],
+) -> Vec<super::depend::Reference> {
+    use super::depend::{ObjectAddress, Reference};
+    let mut out: Vec<Reference> = Vec::new();
+    for r in references {
+        let bound = match r {
+            Reference::Column(relid, name) => interp.attribute_by_name(*relid, name).map_or_else(
+                || r.clone(),
+                |a| Reference::Object(ObjectAddress::column(*relid, a.attnum)),
+            ),
+            other => other.clone(),
+        };
+        if !out.contains(&bound) {
+            out.push(bound);
+        }
+    }
+    out
+}
+
+/// The output columns of view (or materialized view) `relid`'s stored
+/// query, analyzed again against the current catalog — provided its names
+/// still resolve to the relations, columns, functions, operators and types
+/// they resolved to when the view was defined. PG binds a view's query to
+/// those objects then (a renamed table, a table created ahead of it on the
+/// search path, a renamed or newly added column of the same name, a new
+/// overload: none changes what the view reads), while the analyzer keeps
+/// the query's text: re-resolved by name, it could read another relation
+/// or column than PG does. `None` when it no longer resolves alike, or not
+/// at all.
+pub(crate) fn reanalyze_view(
+    snapshot: &PgCatalog,
+    relid: PgClassOid,
+) -> Option<Vec<crate::resolve::RawColumn>> {
+    let stored = snapshot.view_references.get(&relid)?;
+    let query = view_query(snapshot, relid)?;
+    let inner = query.node.as_ref()?;
+    let (analyzed, references) =
+        super::depend::collect(|| crate::resolve::analyze_raw_node(snapshot, inner, &[]));
+    let (columns, _) = analyzed.ok()?;
+    (bound_references(snapshot, &references) == *stored).then_some(columns)
+}
+
+/// Whether reading view `relid` locks rows: its query, or that of a view
+/// it reads (as it bound them, see [`reanalyze_view`]), has a `FOR UPDATE`
+/// / `FOR SHARE` clause somewhere. The rewriter expands the view into the
+/// statement, locking clause included, so the statement then re-checks
+/// concurrently updated rows like one locking them itself.
+pub(crate) fn view_locks_rows(snapshot: &PgCatalog, relid: PgClassOid) -> bool {
+    let mut todo = vec![relid];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(view) = todo.pop() {
+        if !seen.insert(view) {
+            continue;
+        }
+        if view_query(snapshot, view)
+            .and_then(|q| q.node)
+            .is_some_and(|q| crate::resolve::locks_rows(&q))
+        {
+            return true;
+        }
+        for r in snapshot.view_references.get(&view).into_iter().flatten() {
+            if let super::depend::Reference::Object(a) = r
+                && a.classid == PG_CLASS_RELID
+            {
+                let rel = PgClassOid::from_nonzero(a.objid.into_nonzero());
+                if snapshot
+                    .pg_class
+                    .get(&rel)
+                    .is_some_and(|c| c.relkind == RelKind::View)
+                {
+                    todo.push(rel);
+                }
+            }
+        }
+    }
+    false
 }
 
 /// The stored SELECT of view `relid`.

@@ -157,6 +157,23 @@ pub(crate) fn process_from_item(
                 if written.is_some() {
                     // No origin.
                 } else if class.relkind == crate::pg_catalog::RelKind::View {
+                    // A view's columns are NOT NULL as its query was
+                    // analyzed when it was defined, maybe relying on a
+                    // foreign key. Under row locking, a concurrently
+                    // updated row it reads is re-fetched and its query
+                    // re-evaluated for it against the statement's snapshot
+                    // (EvalPlanQual), which need not hold the row a new
+                    // key references: only what the query proves under
+                    // row locking holds.
+                    if crate::nonnull::row_locking() {
+                        let locked = crate::ddl::views::reanalyze_view(snapshot, class.oid);
+                        for (i, c) in src.columns.iter_mut().enumerate() {
+                            c.base_not_null &= locked
+                                .as_ref()
+                                .and_then(|cols| cols.get(i))
+                                .is_some_and(|rc| !rc.nullable);
+                        }
+                    }
                     if let Some(origins) = view_origins(snapshot, class) {
                         for (c, o) in src.columns.iter_mut().zip(origins) {
                             c.origin = o;
@@ -1040,13 +1057,17 @@ fn fk_match(
             .then_some(origins)
     };
     let try_side = |parent_side: SourceSpan, child_side: SourceSpan, parent_is_left: bool| {
-        // (child column, parent column) pairs.
+        // (child column, parent column) pairs, and whether the parent's
+        // column is the left operand.
         let mut pairs: Vec<(&crate::nonnull::Col, &crate::nonnull::Col)> = Vec::new();
+        let mut parent_left: Vec<bool> = Vec::new();
         for (a, b) in equalities {
             if in_span(parent_side, &a.0) && in_span(child_side, &b.0) {
                 pairs.push((b, a));
+                parent_left.push(true);
             } else if in_span(parent_side, &b.0) && in_span(child_side, &a.0) {
                 pairs.push((a, b));
+                parent_left.push(false);
             } else {
                 return None;
             }
@@ -1085,8 +1106,24 @@ fn fk_match(
             .zip(&parent_origins)
             .map(|(c, p)| (c.column.clone(), p.column.clone()))
             .collect();
-        let follows =
-            !child.with_children && fk_follows(snapshot, child.relid, parent.relid, &wanted);
+        let typed: Option<Vec<FkEquality<'_>>> = pairs
+            .iter()
+            .zip(child_origins.iter().zip(&parent_origins))
+            .zip(&parent_left)
+            .map(|(((c, p), (co, po)), &parent_left)| {
+                Some(FkEquality {
+                    parent_col: &po.column,
+                    child_col: &co.column,
+                    parent_type: col_of(parent_side, p)?.type_oid,
+                    child_type: col_of(child_side, c)?.type_oid,
+                    parent_left,
+                })
+            })
+            .collect();
+        let follows = !child.with_children
+            && fk_follows(snapshot, child.relid, parent.relid, &wanted)
+            && typed
+                .is_some_and(|eqs| fk_equalities_hold(snapshot, child.relid, parent.relid, &eqs));
         // A row joined to its own table on its own columns finds itself.
         let itself = || {
             scan_contains(parent, child)
@@ -1650,25 +1687,6 @@ pub(crate) fn srfs_have_equal_static_rows<'a>(
     rows.is_some()
 }
 
-/// The set-returning calls of a select list (this level's), for
-/// [`srfs_have_equal_static_rows`].
-pub(crate) fn target_list_srf_calls<'a>(
-    targets: &'a [protobuf::Node],
-    snapshot: &PgCatalog,
-) -> Vec<&'a protobuf::FuncCall> {
-    let mut out = Vec::new();
-    for t in targets {
-        crate::resolve::visit_same_level(t, &mut |e| {
-            if let Some(node::Node::FuncCall(fc)) = e.node.as_ref()
-                && crate::resolve::is_srf_call(fc, snapshot)
-            {
-                out.push(&**fc);
-            }
-        });
-    }
-    out
-}
-
 /// Whether a SELECT's input always has a row, whatever the data: no WHERE,
 /// and a FROM list (none at all is one row) of items that always do —
 /// a VALUES list, a FROM-less SELECT, a function of statically known
@@ -1717,7 +1735,7 @@ fn from_item_never_empty(item: &protobuf::Node, ctx: Ctx<'_>, params: &ParamColl
                                 && s.where_clause.is_none()
                                 && s.having_clause.is_none()
                                 && s.group_clause.is_empty()
-                                && count_srf_calls(&s.target_list, ctx.snapshot) == 0))
+                                && level_srf_calls(s, ctx.snapshot).is_empty()))
                 }
                 _ => false,
             }

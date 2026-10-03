@@ -134,17 +134,184 @@ pub(crate) fn fk_follows(
     })
 }
 
-/// Whether `=` over `type_oid` is a btree equality — reflexive, so a
-/// non-NULL value equals itself.
-pub(crate) fn reflexive_eq(snapshot: &PgCatalog, type_oid: crate::oid::PgTypeOid) -> bool {
-    snapshot
-        .find_operator("=", Some(type_oid), type_oid)
-        .is_some_and(|op| {
+/// One equality a query writes between a referenced (parent) column and a
+/// referencing (child) one, as [`fk_equalities_hold`] checks it.
+pub(crate) struct FkEquality<'a> {
+    /// The parent's column (its name in the parent table).
+    pub parent_col: &'a str,
+    /// The child's column (its name in the child table).
+    pub child_col: &'a str,
+    /// The types the query compares (the columns' own, passed through).
+    pub parent_type: crate::oid::PgTypeOid,
+    pub child_type: crate::oid::PgTypeOid,
+    /// The parent column is the left operand.
+    pub parent_left: bool,
+}
+
+/// Whether the equalities a query writes between `child_rel`'s columns and
+/// `parent_rel`'s are the comparisons a foreign key between them enforces,
+/// so the referenced row it promises satisfies them. The key's check
+/// (`RI_FKey_check`) finds a parent row by its own operator, `pfeqop`,
+/// derived from the referenced key's unique index (`ATAddForeignKeyConstraint`):
+/// the index operator family's equality between the index's input type
+/// and the referencing type, or else its plain equality with the
+/// referencing value cast to the input type. The query's `=` resolves on
+/// its own (`text = text` for a `char(n)` key referenced by a `text`
+/// column, which compares trailing blanks `bpchareq` ignores): it must be
+/// that very operator (its commutator, written the other way round), and
+/// immutable — a stable one (`timestamptz = timestamp`) depends on the
+/// session's TimeZone, which need not be the one the key was checked
+/// under.
+pub(crate) fn fk_equalities_hold(
+    snapshot: &PgCatalog,
+    child_rel: crate::oid::PgClassOid,
+    parent_rel: crate::oid::PgClassOid,
+    equalities: &[FkEquality<'_>],
+) -> bool {
+    let attr = |rel, name: &str| snapshot.attribute_by_name(rel, name);
+    let Some(key) = equalities
+        .iter()
+        .map(|e| attr(parent_rel, e.parent_col).map(|a| a.attnum))
+        .collect::<Option<BTreeSet<i16>>>()
+    else {
+        return false;
+    };
+    equalities.iter().all(|e| {
+        let (Some(pk), Some(fk)) = (attr(parent_rel, e.parent_col), attr(child_rel, e.child_col))
+        else {
+            return false;
+        };
+        if pk.atttypid != e.parent_type || fk.atttypid != e.child_type {
+            return false;
+        }
+        let Some(pfeqop) = fk_pfeqop(snapshot, parent_rel, &key, pk.attnum, fk.atttypid) else {
+            return false;
+        };
+        let Some(op) = snapshot.pg_operator.get(&pfeqop) else {
+            return false;
+        };
+        let immutable = op
+            .oprcode
+            .and_then(|f| snapshot.pg_proc.get(&f))
+            .is_some_and(|f| f.provolatile == crate::pg_catalog::ProVolatile::Immutable);
+        // The `=` the query resolves (its dependency on the operator is
+        // already noted where the analysis resolved it).
+        let (left, right) = if e.parent_left {
+            (e.parent_type, e.child_type)
+        } else {
+            (e.child_type, e.parent_type)
+        };
+        let (written, _) =
+            crate::ddl::depend::collect(|| snapshot.find_operator("=", Some(left), right));
+        let Some(written) = written else {
+            return false;
+        };
+        let same = if e.parent_left {
+            written.oid == pfeqop
+        } else {
+            op.oprcom == Some(written.oid)
+                || (written.oid == pfeqop && op.oprleft == Some(op.oprright))
+        };
+        immutable && same
+    })
+}
+
+/// A foreign key's `pfeqop` (`ATAddForeignKeyConstraint`) for parent column
+/// `pk_attnum` of the key `key` of `parent_rel` and a referencing column of
+/// type `fktype`, when the referencing value needs no conversion to it
+/// (none, or a binary-coercible one). The opclass is the one of the
+/// unique index over exactly `key` — each such index must agree, the
+/// constraint's own (`conindid`) not being recorded — or, for a catalog
+/// without index rows, the type's default btree one.
+fn fk_pfeqop(
+    snapshot: &PgCatalog,
+    parent_rel: crate::oid::PgClassOid,
+    key: &BTreeSet<i16>,
+    pk_attnum: i16,
+    fktype: crate::oid::PgTypeOid,
+) -> Option<crate::oid::PgOperatorOid> {
+    let mut opclasses: Vec<Option<crate::oid::PgOpclassOid>> = Vec::new();
+    for idx in snapshot.pg_index.values() {
+        let nkey = usize::try_from(idx.indnkeyatts).unwrap_or(0);
+        let cols = &idx.indkey[..nkey.min(idx.indkey.len())];
+        if idx.indrelid != parent_rel
+            || !idx.indisunique
+            || idx.indisexclusion
+            || idx.indpred.is_some()
+            || cols.len() != key.len()
+            || cols.iter().copied().collect::<BTreeSet<i16>>() != *key
+        {
+            continue;
+        }
+        let pos = cols.iter().position(|&a| a == pk_attnum)?;
+        opclasses.push(idx.indclass.get(pos).copied().flatten());
+    }
+    if opclasses.is_empty() {
+        let pktype = snapshot
+            .attributes_of(parent_rel)
+            .iter()
+            .find(|a| a.attnum == pk_attnum)?
+            .atttypid;
+        opclasses.push(crate::ddl::opclass::default_opclass_id(
+            snapshot, pktype, "btree",
+        ));
+    }
+    let fkbase = snapshot.unwrap_domain(fktype);
+    let mut found = None;
+    for opclass in opclasses {
+        let opclass = crate::ddl::opclass::opclass_by_oid(snapshot, opclass?)?;
+        if opclass.opcmethod != "btree" {
+            return None;
+        }
+        let member = |l, r| {
             snapshot
                 .pg_amop
                 .iter()
-                .any(|a| a.amopopr == op.oid && a.amopmethod == "btree" && a.amopstrategy == 3)
-        })
+                .find(|o| {
+                    o.amopfamily == opclass.opcfamily
+                        && o.amopfamilynamespace == opclass.opcfamilynamespace
+                        && o.amopmethod == opclass.opcmethod
+                        && o.amopstrategy == 3
+                        && o.amoplefttype == l
+                        && o.amoprighttype == r
+                })
+                .map(|o| o.amopopr)
+        };
+        let intype = opclass.opcintype;
+        let op = match (member(intype, fkbase), member(fkbase, fkbase)) {
+            (Some(pf), Some(_)) => pf,
+            // The referencing value is cast to the input type: only a
+            // no-op cast keeps the comparison the query's.
+            _ if snapshot.is_binary_coercible(fktype, intype)
+                || snapshot
+                    .pg_type
+                    .get(&intype)
+                    .is_some_and(|t| t.typtype == crate::pg_catalog::TypType::Pseudo) =>
+            {
+                member(intype, intype)?
+            }
+            _ => return None,
+        };
+        if found.is_some_and(|f| f != op) {
+            return None;
+        }
+        found = Some(op);
+    }
+    found
+}
+
+/// Whether `=` over `type_oid` is a btree equality — reflexive, so a
+/// non-NULL value equals itself.
+pub(crate) fn reflexive_eq(snapshot: &PgCatalog, type_oid: crate::oid::PgTypeOid) -> bool {
+    // A probe, not a reference the query makes (no dependency noted).
+    let (op, _) =
+        crate::ddl::depend::collect(|| snapshot.find_operator("=", Some(type_oid), type_oid));
+    op.is_some_and(|op| {
+        snapshot
+            .pg_amop
+            .iter()
+            .any(|a| a.amopopr == op.oid && a.amopmethod == "btree" && a.amopstrategy == 3)
+    })
 }
 
 /// Whether every row scan `inner` reads is among those scan `outer` reads:
@@ -229,8 +396,10 @@ pub(crate) fn input_nonempty(
     {
         conjuncts(w, &mut conj);
     }
-    // (p's column, the enclosing entry's column) per equality.
+    // (p's column, the enclosing entry's column) per equality, and
+    // whether p's column is the left operand.
     let mut pairs: Vec<(&ScopeColumn, &ScopeColumn)> = Vec::new();
+    let mut p_left: Vec<bool> = Vec::new();
     for c in conj {
         let Some(node::Node::AExpr(e)) = c.node.as_ref() else {
             return false;
@@ -253,6 +422,7 @@ pub(crate) fn input_nonempty(
             (false, true) => pairs.push((r, l)),
             _ => return false,
         }
+        p_left.push(own(l));
     }
     // Without an equality nothing ties the subquery to a row: an outer
     // aggregate query yields its row over an empty table too
@@ -291,7 +461,23 @@ pub(crate) fn input_nonempty(
         .zip(&p_cols)
         .map(|(o, pc)| (o.column.clone(), pc.clone()))
         .collect();
-    if !o_origins[0].with_children && fk_follows(snapshot, o_origins[0].relid, prel, &wanted) {
+    let equalities: Vec<FkEquality<'_>> = pairs
+        .iter()
+        .zip(&o_origins)
+        .zip(&p_cols)
+        .zip(&p_left)
+        .map(|((((pc, o), oo), pcol), &parent_left)| FkEquality {
+            parent_col: pcol,
+            child_col: &oo.column,
+            parent_type: pc.type_oid,
+            child_type: o.type_oid,
+            parent_left,
+        })
+        .collect();
+    if !o_origins[0].with_children
+        && fk_follows(snapshot, o_origins[0].relid, prel, &wanted)
+        && fk_equalities_hold(snapshot, o_origins[0].relid, prel, &equalities)
+    {
         return true;
     }
     // The enclosing entry's row is one of `p`'s.
@@ -320,7 +506,7 @@ pub(crate) fn finish_level(
         .group_clause
         .iter()
         .any(|g| matches!(g.node.as_ref(), Some(node::Node::GroupingSet(_))));
-    let no_srf = count_srf_calls(&sel.target_list, snapshot) == 0;
+    let no_srf = level_srf_calls(sel, snapshot).is_empty();
     let keeps_every_row = sel.from_clause.len() == 1
         && scope.sources.len() == 1
         && !matches!(
@@ -368,9 +554,10 @@ pub(crate) fn fresh_scans(columns: &mut [ScopeColumn]) {
 
 /// The origins of a view's columns: its stored query analyzed again
 /// (without recording dependencies — the referencing query depends on the
-/// view, not on what it reads). `None` when that fails or no longer
-/// matches the view's columns; views of the system schemas are not looked
-/// into.
+/// view, not on what it reads). `None` when that fails, reads other
+/// objects than the view does ([`crate::ddl::views::reanalyze_view`]) or
+/// no longer matches the view's columns; views of the system schemas are
+/// not looked into.
 pub(crate) fn view_origins(
     snapshot: &PgCatalog,
     class: &crate::pg_catalog::PgClass,
@@ -382,16 +569,8 @@ pub(crate) fn view_origins(
     if nsp == "pg_catalog" || nsp == "information_schema" {
         return None;
     }
-    let query = crate::ddl::views::view_query(snapshot, class.oid)?;
-    let Some(node::Node::SelectStmt(sel)) = query.node.as_ref() else {
-        return None;
-    };
-    let (result, _) = crate::ddl::depend::collect(|| {
-        let mut params = ParamCollector::default();
-        analyze_select(sel, snapshot, &mut params)
-    });
+    let cols = crate::ddl::views::reanalyze_view(snapshot, class.oid)?;
     let _ = take_level_summary();
-    let (cols, _) = result.ok()?;
     let attrs = snapshot.attributes_of(class.oid);
     (cols.len() == attrs.len()
         && attrs

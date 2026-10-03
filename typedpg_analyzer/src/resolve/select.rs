@@ -220,7 +220,7 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
         .extend(shadowed_sources.iter().cloned());
     let mut null_ctx = NullabilityContext::default();
     null_ctx.has_group_by = !sel.group_clause.is_empty();
-    null_ctx.srfs_in_lockstep = count_srf_calls(&sel.target_list, snapshot) > 1;
+    null_ctx.srfs_in_lockstep = level_srf_calls(sel, snapshot).len() > 1;
     null_ctx.window_frames = sel
         .window_clause
         .iter()
@@ -249,7 +249,7 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
         // Select-list SRFs that all yield as many rows are never padded.
         let lockstep = null_ctx.srfs_in_lockstep
             && !crate::resolve::srfs_have_equal_static_rows(
-                crate::resolve::target_list_srf_calls(&sel.target_list, snapshot),
+                crate::resolve::level_srf_calls(sel, snapshot),
                 ctx,
                 params,
             );
@@ -1341,7 +1341,7 @@ fn select_lock_blocker(sel: &protobuf::SelectStmt, snapshot: &PgCatalog) -> Opti
     if kinds.iter().any(|k| k.has_window) {
         return Some("window functions");
     }
-    if count_srf_calls(&sel.target_list, snapshot) > 0 {
+    if !level_srf_calls(sel, snapshot).is_empty() {
         return Some("set-returning functions in the target list");
     }
     None
