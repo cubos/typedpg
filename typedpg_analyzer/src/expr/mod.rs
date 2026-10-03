@@ -1768,6 +1768,7 @@ pub(crate) use func_call::{
 use indirection::*;
 pub(crate) use indirection::{expand_indirection_star, transform_container_subscripts};
 use json::*;
+pub(crate) use literals::assignment_nullable;
 use literals::*;
 pub(crate) use operators::check_regex_restrictions;
 use operators::*;

@@ -475,7 +475,9 @@ pub(crate) fn generation_not_null(
                 .with_typmod(interp.effective_typmod(attr.atttypid, attr.atttypmod)),
         )
     });
-    inferred.is_ok_and(|t| !t.nullable)
+    // Stored with the column's type, through an assignment coercion that
+    // may map a value to NULL.
+    inferred.is_ok_and(|t| !crate::expr::assignment_nullable(&t, attr.atttypid, interp))
 }
 
 impl PgCatalog {

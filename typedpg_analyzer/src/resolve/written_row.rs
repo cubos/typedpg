@@ -89,20 +89,52 @@ impl ValueInfo {
         }
     }
 
-    /// Value expression `val`, of nullability `nullable`, written to a
-    /// column of type `column_type`.
-    pub(crate) fn of(
+    /// Value expression `val`, typed `t`, stored in column `attr`: what
+    /// the assignment coercion to the column's type and typmod makes of
+    /// it. A cast function may map it to NULL, and a constant is the
+    /// stored value only when nothing converts it — no user-defined cast
+    /// function, and a typmod coercion that keeps it as written
+    /// ([`crate::typmod::keeps_literal`]: `varchar(2)` drops `'ab '`'s
+    /// trailing space, `numeric(2,-1)` rounds 15 to 20).
+    pub(crate) fn assigned(
         val: &protobuf::Node,
-        nullable: bool,
-        column_type: PgTypeOid,
+        t: &expr::ExprType,
+        attr: &crate::pg_catalog::PgAttribute,
         snapshot: &PgCatalog,
     ) -> ValueInfo {
+        let nullable = expr::assignment_nullable(t, attr.atttypid, snapshot);
+        let typmod = snapshot.effective_typmod(attr.atttypid, attr.atttypmod);
+        let literal = crate::nonnull::literal_for(val, attr.atttypid, snapshot).filter(|l| {
+            !nullable
+                && !user_cast(t.type_oid, attr.atttypid, snapshot)
+                && crate::typmod::keeps_literal(
+                    snapshot,
+                    snapshot.unwrap_domain(attr.atttypid),
+                    typmod,
+                    l,
+                )
+        });
         ValueInfo {
             not_null: !nullable,
             null: is_sql_null_literal(val),
-            literal: crate::nonnull::literal_for(val, column_type, snapshot),
+            literal,
         }
     }
+}
+
+/// Whether coercing a `source` value to `target` runs a cast function
+/// that isn't built in.
+fn user_cast(source: PgTypeOid, target: PgTypeOid, snapshot: &PgCatalog) -> bool {
+    snapshot
+        .cast_by_pair
+        .get(&(
+            snapshot.unwrap_domain(source),
+            snapshot.unwrap_domain(target),
+        ))
+        .and_then(|oid| snapshot.pg_cast.get(oid))
+        .and_then(|c| c.castfunc)
+        .and_then(|f| snapshot.pg_proc.get(&f))
+        .is_some_and(|f| snapshot.namespace_name(f.pronamespace) != Some("pg_catalog"))
 }
 
 /// The relation a statement writes rows of, when they are what it says:
@@ -117,6 +149,10 @@ pub(crate) struct WriteTarget {
     /// Each target column the base relation stores as is, and its base
     /// column (all of a table's own).
     pub to_base: HashMap<String, String>,
+    /// Each view from the target down to the base table, with the base
+    /// column each of its columns stores as is (`levels[0]`, the target's,
+    /// is `to_base`). Empty for a table.
+    levels: Vec<(PgClassOid, HashMap<String, String>)>,
 }
 
 impl WriteTarget {
@@ -142,12 +178,16 @@ impl WriteTarget {
     /// Follow `relid` down to its base table; `writing` refuses rules and
     /// INSTEAD OF triggers, which make a write something else.
     fn follow(snapshot: &PgCatalog, relid: PgClassOid, writing: bool) -> Option<WriteTarget> {
-        let mut to_base: HashMap<String, String> = snapshot
-            .attributes_of(relid)
-            .iter()
-            .filter(|a| a.attnum > 0)
-            .map(|a| (a.attname.clone(), a.attname.clone()))
-            .collect();
+        let own = |rel: PgClassOid| -> HashMap<String, String> {
+            snapshot
+                .attributes_of(rel)
+                .iter()
+                .filter(|a| a.attnum > 0)
+                .map(|a| (a.attname.clone(), a.attname.clone()))
+                .collect()
+        };
+        // Each level's columns, by the name they have at `cur`.
+        let mut levels: Vec<(PgClassOid, HashMap<String, String>)> = Vec::new();
         let mut cur = relid;
         for _ in 0..16 {
             let class = snapshot.pg_class.get(&cur)?;
@@ -159,7 +199,8 @@ impl WriteTarget {
                     return Some(WriteTarget {
                         relid,
                         base: cur,
-                        to_base,
+                        to_base: levels.first().map_or_else(|| own(cur), |l| l.1.clone()),
+                        levels,
                     });
                 }
                 crate::pg_catalog::RelKind::View => {
@@ -186,10 +227,13 @@ impl WriteTarget {
                             .find(|a| a.attnum == attnum)
                             .map(|a| a.attname.clone())
                     };
-                    to_base = to_base
-                        .into_iter()
-                        .filter_map(|(t, v)| base_name(&v).map(|b| (t, b)))
-                        .collect();
+                    levels.push((cur, own(cur)));
+                    for (_, map) in &mut levels {
+                        *map = std::mem::take(map)
+                            .into_iter()
+                            .filter_map(|(t, v)| base_name(&v).map(|b| (t, b)))
+                            .collect();
+                    }
                     cur = base;
                 }
                 _ => return None,
@@ -198,12 +242,14 @@ impl WriteTarget {
         None
     }
 
-    /// The target column storing base column `base` as is.
+    /// A target column storing base column `base` as is (the first by
+    /// name, when a view exposes it twice).
     pub(crate) fn target_column(&self, base: &str) -> Option<&str> {
         self.to_base
             .iter()
-            .find(|(_, b)| b.as_str() == base)
+            .filter(|(_, b)| b.as_str() == base)
             .map(|(t, _)| t.as_str())
+            .min()
     }
 
     /// Whether an INSERT stores its target list as is: no BEFORE ROW
@@ -244,61 +290,75 @@ impl WriteTarget {
     }
 
     /// What the INSERT writes to base column `attr` it gives no value
-    /// for: the target view's default for the column storing it, else the
-    /// base column's own.
+    /// for. rewriteTargetListIU fills in each view's defaults on the way
+    /// down: the first view whose columns storing it have a default (or
+    /// are of a domain type, whose default isn't modeled) decides, else
+    /// the base column's own default.
     pub(crate) fn omitted(
         &self,
         snapshot: &PgCatalog,
         attr: &crate::pg_catalog::PgAttribute,
     ) -> ValueInfo {
-        if self.relid != self.base
-            && let Some(t) = self.target_column(&attr.attname)
-        {
-            let view_attr = snapshot
-                .attributes_of(self.relid)
-                .iter()
-                .find(|a| a.attname == t);
-            match view_attr {
-                Some(va)
-                    if snapshot
-                        .attr_default_exprs
-                        .contains_key(&(self.relid, va.attnum)) =>
+        for (view, map) in &self.levels {
+            let mut found: Option<ValueInfo> = None;
+            for va in snapshot.attributes_of(*view) {
+                if map.get(&va.attname) != Some(&attr.attname)
+                    || (!va.atthasdef && snapshot.unwrap_domain(va.atttypid) == va.atttypid)
                 {
-                    return default_value(snapshot, self.relid, va);
+                    continue;
                 }
-                // A view of a view may have a default on the way.
-                Some(_) if !direct_base(snapshot, self.relid, self.base) => {
-                    return ValueInfo::default();
-                }
-                _ => {}
+                let v = default_value(snapshot, *view, va);
+                found = Some(match found {
+                    Some(f) => f.either(&v),
+                    None => v,
+                });
+            }
+            if let Some(v) = found {
+                return v;
             }
         }
         default_value(snapshot, self.base, attr)
     }
 
-    /// What `col = DEFAULT` writes to target column `col`.
+    /// What `col = DEFAULT` writes to target column `col` in an UPDATE:
+    /// the target's own default for it — through a view, the view's,
+    /// which is NULL without one (rewriteTargetListIU doesn't look below).
     pub(crate) fn default_of(&self, snapshot: &PgCatalog, col: &str) -> ValueInfo {
-        let Some(base_col) = self.to_base.get(col) else {
-            return ValueInfo::default();
-        };
         match snapshot
-            .attributes_of(self.base)
+            .attributes_of(self.relid)
             .iter()
-            .find(|a| &a.attname == base_col)
+            .find(|a| a.attname == col)
         {
-            Some(a) => self.omitted(snapshot, a),
-            None => ValueInfo::default(),
+            Some(a) if self.to_base.contains_key(col) => default_value(snapshot, self.relid, a),
+            _ => ValueInfo::default(),
         }
     }
 }
 
-/// Whether view `view`'s base relation is `base` itself.
-fn direct_base(snapshot: &PgCatalog, view: PgClassOid, base: PgClassOid) -> bool {
-    snapshot
-        .view_updatability
-        .get(&view)
-        .and_then(|u| u.base)
-        .is_some_and(|b| b == base)
+/// Whether a BEFORE ROW trigger may rewrite a row `event` writes into
+/// table `relid` before ExecConstraints checks it: one for the event on
+/// the table or on a partition / inheritance child the row lands in — and,
+/// for an UPDATE, a BEFORE ROW INSERT one on a partition a row moves to.
+pub(crate) fn before_row_trigger_rewrites(
+    snapshot: &PgCatalog,
+    relid: PgClassOid,
+    event: DmlEvent,
+) -> bool {
+    let fires = |r: PgClassOid, events: i32| {
+        snapshot.triggers.get(&r).is_some_and(|ts| {
+            ts.iter().any(|t| {
+                t.row
+                    && t.timing & crate::ddl::triggers::TRIGGER_TYPE_BEFORE != 0
+                    && t.events & events != 0
+            })
+        })
+    };
+    let children = descendants(snapshot, relid);
+    let child_events = match event {
+        DmlEvent::Update => event.trigger_bit() | DmlEvent::Insert.trigger_bit(),
+        _ => event.trigger_bit(),
+    };
+    fires(relid, event.trigger_bit()) || children.into_iter().any(|c| fires(c, child_events))
 }
 
 /// The inheritance children / partitions of `relid`, recursively.
@@ -355,7 +415,7 @@ pub(crate) fn default_value(
                 )
             });
             match inferred {
-                Ok(t) => ValueInfo::of(expr, t.nullable, attr.atttypid, snapshot),
+                Ok(t) => ValueInfo::assigned(expr, &t, attr, snapshot),
                 Err(_) => ValueInfo::default(),
             }
         }
@@ -507,7 +567,7 @@ pub(crate) fn set_values(
             let goal = TypeGoal::assignment(attr.atttypid)
                 .with_typmod(ctx.snapshot.effective_typmod(attr.atttypid, attr.atttypmod));
             match expr::infer_expr(val, ctx, &mut scratch, goal) {
-                Ok(t) => ValueInfo::of(val, t.nullable, attr.atttypid, ctx.snapshot),
+                Ok(t) => ValueInfo::assigned(val, &t, attr, ctx.snapshot),
                 Err(_) => continue,
             }
         };

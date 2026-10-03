@@ -259,12 +259,26 @@ pub(crate) fn infer_type_cast(
     })
 }
 
+/// Whether a value typed `t` may be NULL once assignment-coerced to a
+/// column of type `target` (`coerce_to_target_type`, as INSERT, UPDATE,
+/// a DEFAULT or a generation expression store it): when it is NULL
+/// itself, or the coercion runs a cast function that can map a non-NULL
+/// value to NULL (`time(timestamp)` on `infinity`, a user's cast). A value
+/// of the column's own type (an untyped literal read by its input
+/// function) needs no cast.
+pub(crate) fn assignment_nullable(t: &ExprType, target: PgTypeOid, snapshot: &PgCatalog) -> bool {
+    t.nullable
+        || (t.type_oid != oid::UNKNOWN
+            && snapshot.unwrap_domain(t.type_oid) != snapshot.unwrap_domain(target)
+            && cast_function_can_return_null(t.type_oid, target, snapshot))
+}
+
 /// Whether the cast from `source` to `target` runs a cast function that can
 /// return NULL for a non-NULL input — `int4(jsonb)` and the other jsonb →
 /// scalar casts yield NULL for a JSON null. PG names a built-in cast
 /// function after its target type (`pg_cast.castfunc` isn't in the
 /// snapshot), and its nullability comes from the per-overload table.
-pub(super) fn cast_function_can_return_null(
+pub(crate) fn cast_function_can_return_null(
     source: PgTypeOid,
     target: PgTypeOid,
     snapshot: &PgCatalog,

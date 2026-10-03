@@ -385,6 +385,31 @@ pub fn check_literal_assignment(
     }
 }
 
+/// Whether a column of type `type_oid` (a base type) with typmod `typmod`
+/// stores constant `lit` exactly as written: no typmod, a `varchar(n)`
+/// string of at most `n` characters (a longer one loses its trailing
+/// spaces), or an integer in a `numeric(p, s)` of scale `s ≥ 0` (which
+/// fits unchanged, or fails). Any other typmod coercion may truncate,
+/// round or pad it (`numeric(2,-1)` makes 15 20, `timestamp(0)` drops
+/// fractional seconds, `char(n)` pads).
+pub(crate) fn keeps_literal(
+    snapshot: &PgCatalog,
+    type_oid: PgTypeOid,
+    typmod: Option<i32>,
+    lit: &crate::nonnull::Literal,
+) -> bool {
+    use crate::nonnull::LitKind;
+    match decode(snapshot, type_oid, typmod) {
+        DecodedTypmod::None => true,
+        DecodedTypmod::Length(n) if type_oid == builtin_oid::VARCHAR => {
+            lit.kind != LitKind::Boolean
+                && usize::try_from(n).is_ok_and(|n| lit.text.chars().count() <= n)
+        }
+        DecodedTypmod::Numeric { scale, .. } => lit.kind == LitKind::Integer && scale >= 0,
+        _ => false,
+    }
+}
+
 /// `varchar_input` / `bpchar_input`: a `varchar(n)` / `char(n)` value
 /// longer than `n` characters is an error unless every character past the
 /// `n`th is a space (those are dropped). `None` for other types or a value
