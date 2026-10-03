@@ -470,21 +470,19 @@ fn bound_value(
         infer_expr(v, ctx(), &mut params, TypeGoal::assignment(*key_type))
             .map_err(|e| DdlError::Parse(e.to_string()))?;
     }
-    let datum = match normalize(interp, v, key) {
-        // The value coerced to a `varchar(n)` / `char(n)` key: too long
-        // is an error unless the excess is blanks, which go.
-        Datum::Text(t) | Datum::CodePoints(t)
-            if let Some(msg) = crate::typmod::char_length_violation(
-                interp,
-                interp.unwrap_domain(*key_type),
-                key.typmod,
-                &t,
-            ) =>
-        {
-            return Err(DdlError::Parse(msg));
-        }
-        d => d,
-    };
+    let datum = normalize(interp, v, key);
+    // The value coerced to a `varchar(n)` / `char(n)` key: too long is an
+    // error unless the excess is blanks, which go.
+    if let Datum::Text(t) | Datum::CodePoints(t) = &datum
+        && let Some(msg) = crate::typmod::char_length_violation(
+            interp,
+            interp.unwrap_domain(*key_type),
+            key.typmod,
+            t,
+        )
+    {
+        return Err(DdlError::Parse(msg));
+    }
     // evaluate_expr: the value coerced to an integer key must fit it (the
     // cast's "smallint out of range").
     let base = interp.unwrap_domain(*key_type);
