@@ -1884,24 +1884,35 @@ fn cast_params(analyzed: &AnalyzedQuery) -> String {
 }
 
 /// `analyzed.sql[start..end]`, with each regular parameter placeholder in
-/// it followed by a cast to its type (`$1::pg_catalog.int4`): the type the
-/// bound value is encoded as — a domain's base type, an enum itself (so a
-/// label bound as `EnumString` is accepted).
+/// it cast to its type (`($1::pg_catalog.int4)`): the type the bound value
+/// is encoded as — a domain's base type, an enum itself (so a label bound
+/// as `EnumString` is accepted). The cast is parenthesized: a subscript or
+/// field selection after the placeholder (`$1[1]`, `$1.x`) applies to the
+/// cast value, instead of being read as part of the type name
+/// (`$1::int4[][1]` is a cast to `int4[]`).
 fn cast_range(analyzed: &AnalyzedQuery, start: usize, end: usize) -> String {
+    let sql = &analyzed.sql;
     let mut insertions: Vec<(usize, String)> = Vec::new();
     for param in &analyzed.params {
         if let Some(pg_type) = param.pg_type.cast_name() {
             for &offset in &param.sql_offsets {
                 // An offset is just past its `$N`, so never at a range start.
                 if offset > start && offset <= end {
-                    insertions.push((offset, format!("::{pg_type}")));
+                    let digits = sql.as_bytes()[..offset]
+                        .iter()
+                        .rev()
+                        .take_while(|b| b.is_ascii_digit())
+                        .count();
+                    let placeholder = offset - digits - 1;
+                    debug_assert_eq!(sql.as_bytes()[placeholder], b'$');
+                    insertions.push((placeholder, "(".to_owned()));
+                    insertions.push((offset, format!("::{pg_type})")));
                 }
             }
         }
     }
     insertions.sort_by_key(|(off, _)| *off);
 
-    let sql = &analyzed.sql;
     let mut result = String::with_capacity(end - start + insertions.len() * 8);
     let mut last = start;
     for (offset, cast_str) in &insertions {
@@ -2342,5 +2353,61 @@ fn pg_type_label(ty: &Type) -> String {
         }
         Type::Array { element, .. } => format!("{}[]", pg_type_label(element)),
         Type::AnonymousRecord { .. } => "record".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cast_params;
+    use typedpg_analyzer::PgCatalog;
+
+    fn cast(sql: &str) -> String {
+        let mut db = PgCatalog::new().unwrap();
+        db.apply_sql(
+            "CREATE TABLE t (a int NOT NULL, b int);
+             CREATE TYPE pair AS (x int, y text);",
+        )
+        .unwrap();
+        cast_params(&db.analyze(sql).unwrap())
+    }
+
+    #[test]
+    fn a_parameter_cast_is_parenthesized() {
+        assert_eq!(
+            cast("SELECT a FROM t WHERE a = $a AND b = $b"),
+            "SELECT a FROM t WHERE a = ($1::pg_catalog.int4) AND b = ($2::pg_catalog.int4)"
+        );
+        // A native placeholder too, each time it occurs.
+        assert_eq!(
+            cast("SELECT a FROM t WHERE a = $1 OR a = $1 + 1"),
+            "SELECT a FROM t WHERE a = ($1::pg_catalog.int4) OR a = ($1::pg_catalog.int4) + 1"
+        );
+    }
+
+    #[test]
+    fn a_subscript_or_field_applies_to_the_cast_parameter() {
+        // Unparenthesized, `$1::int4[][1]` would be a cast to `int4[]` (array
+        // bounds are part of the type name) and `$1::public.pair.x` a
+        // cross-database type reference.
+        assert_eq!(
+            cast("SELECT a FROM t WHERE a = ANY($1) AND b = $1[1]"),
+            "SELECT a FROM t WHERE a = ANY(($1::pg_catalog.int4[])) \
+             AND b = ($1::pg_catalog.int4[])[1]"
+        );
+        assert_eq!(
+            cast("SELECT a FROM t WHERE ($p::pair).y IS NOT NULL AND b = $p.x"),
+            "SELECT a FROM t WHERE (($1::public.pair)::pair).y IS NOT NULL \
+             AND b = ($1::public.pair).x"
+        );
+    }
+
+    #[test]
+    fn fetch_first_takes_the_parenthesized_parameter() {
+        // `FETCH FIRST` takes a constant or a parenthesized expression, not
+        // a bare cast (`FETCH FIRST $1::int8 ROWS` is a syntax error).
+        assert_eq!(
+            cast("SELECT a FROM t FETCH FIRST $n ROWS ONLY"),
+            "SELECT a FROM t FETCH FIRST ($1::pg_catalog.int8) ROWS ONLY"
+        );
     }
 }

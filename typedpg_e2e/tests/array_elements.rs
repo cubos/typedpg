@@ -62,3 +62,30 @@ async fn enum_arrays_with_null_elements() {
     let statuses: Vec<Option<PostStatus>> = row.statuses;
     assert_eq!(statuses, vec![Some(PostStatus::Draft), None]);
 }
+
+#[tokio::test]
+async fn a_subscripted_array_parameter_reads_its_element() {
+    // The cast the macro puts on `$ages` must not swallow the subscript:
+    // `$1::int4[][1]` is a cast to `int4[]`, so `age = $1[1]` would
+    // compare an integer to an array.
+    let pool = common::setup().await;
+    let name = &common::unique("subscript");
+    sql!(
+        &pool,
+        "INSERT INTO users (name, email, age) VALUES ($name, $name, 30)"
+    )
+    .execute()
+    .await
+    .expect("insert");
+    for (ages, found) in [(vec![30, 40], 1), (vec![40, 30], 0)] {
+        let label = format!("{ages:?}");
+        let rows = sql!(
+            &pool,
+            "SELECT name FROM users WHERE name = $name AND age = ANY($ages) AND age = $ages[1]"
+        )
+        .fetch_all()
+        .await
+        .expect("subscripted parameter");
+        assert_eq!(rows.len(), found, "{label}");
+    }
+}

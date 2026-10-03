@@ -3,6 +3,19 @@ mod common;
 use typedpg::sql;
 
 #[tokio::test]
+async fn fetch_first_takes_a_parameter() {
+    // `FETCH FIRST` takes a constant or a parenthesized expression: the
+    // macro's cast of `$n` must leave it one.
+    let pool = common::setup().await;
+    let n: i64 = 1;
+    let rows = sql!(&pool, "SELECT 1 AS one FROM users FETCH FIRST $n ROWS ONLY")
+        .fetch_all()
+        .await
+        .expect("fetch first");
+    assert!(rows.len() <= 1);
+}
+
+#[tokio::test]
 async fn insert_returning_and_select() {
     let pool = common::setup().await;
 
