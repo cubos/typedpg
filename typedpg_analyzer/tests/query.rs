@@ -28,6 +28,8 @@ mod check_reasoning;
 mod constraint_narrowing;
 #[path = "query/copy_in.rs"]
 mod copy_in;
+#[path = "query/core_soundness.rs"]
+mod core_soundness;
 #[path = "query/cte_rules.rs"]
 mod cte_rules;
 #[path = "query/ctes.rs"]

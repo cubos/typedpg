@@ -1116,7 +1116,7 @@ fn drop_extension(
             }
             c if c == PG_OPERATOR_RELID => {
                 if let Some(o) = PgOperatorOid::new(objid.get()) {
-                    interp.remove_pg_operator(o);
+                    super::operators::remove_operator(interp, o);
                 }
                 interp.remove_dependencies_of(PG_OPERATOR_RELID, objid);
             }
@@ -1351,7 +1351,7 @@ fn drop_operator(
         let desc = super::depend::describe(interp, addr);
         super::depend::check_not_owned(interp, addr, &desc)?;
         super::depend::drop_dependents(interp, addr, &desc, cascade)?;
-        interp.remove_pg_operator(oid);
+        super::operators::remove_operator(interp, oid);
         let obj = crate::oid::PgGenericOid::from_nonzero(oid.into_nonzero());
         interp.remove_dependencies_of(PG_OPERATOR_RELID, obj);
         interp.remove_dependencies_on(PG_OPERATOR_RELID, obj);
@@ -1578,7 +1578,7 @@ fn drop_schema(
         .map(|o| o.oid)
         .collect();
     for op_oid in op_oids {
-        interp.remove_pg_operator(op_oid);
+        super::operators::remove_operator(interp, op_oid);
         let obj = crate::oid::PgGenericOid::from_nonzero(op_oid.into_nonzero());
         interp.remove_dependencies_of(PG_OPERATOR_RELID, obj);
     }

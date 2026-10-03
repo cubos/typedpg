@@ -167,11 +167,14 @@ pub(crate) fn coerce_clause_expr(
         Ok(())
     };
     let e = match inferred {
-        Ok(t) => {
+        Ok(mut t) => {
             placement()?;
             if matches!(kind, ClauseKind::Where | ClauseKind::JoinOn) {
                 expr::check_regex_restrictions(node, ctx)?;
             }
+            // The value is coerced to the clause's type, which may map it
+            // to NULL.
+            t.note_coerced_to(goal_oid, ctx.snapshot);
             return Ok(t);
         }
         Err(e) => e,

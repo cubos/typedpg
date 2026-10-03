@@ -7,7 +7,7 @@
 //! | typname                                       | encoding                                  |
 //! |-----------------------------------------------|-------------------------------------------|
 //! | `varchar`, `bpchar`                           | `n + 4` (VARHDRSZ)                        |
-//! | `numeric`                                     | `((p << 16) \| (s & 0xFFFF)) + 4`         |
+//! | `numeric`                                     | `((p << 16) \| (s & 0x7FF)) + 4`          |
 //! | `time`, `timetz`, `timestamp`, `timestamptz`  | `p` (precision, clamped to 0–6)           |
 //! | `interval`                                    | `(fields << 16) \| p` (`p` = 0xFFFF: none) |
 //! | `bit`, `varbit`                               | `n`                                       |
@@ -148,14 +148,9 @@ pub fn decode(snapshot: &PgCatalog, type_oid: PgTypeOid, typmod: Option<i32>) ->
         (builtin_oid::NUMERIC, _) => {
             let inner = t - VARHDRSZ;
             let precision = (inner >> 16) & 0xFFFF;
-            let scale_raw = inner & 0xFFFF;
-            // Scale is signed (PG allows negative scale). Sign-extend the
-            // 16-bit field.
-            let scale = if scale_raw & 0x8000 != 0 {
-                scale_raw | !0xFFFF
-            } else {
-                scale_raw
-            };
+            // numeric_typmod_scale: the scale is signed (PG allows a
+            // negative one), an 11-bit field sign-extended.
+            let scale = ((inner & 0x7FF) ^ 1024) - 1024;
             DecodedTypmod::Numeric { precision, scale }
         }
         (_, Some("time" | "timetz" | "timestamp" | "timestamptz")) => DecodedTypmod::Precision(t),
@@ -214,7 +209,8 @@ fn encode_numeric(raw: &[i32]) -> Result<i32, DdlError> {
             -MAX_NUMERIC_PRECISION
         )));
     }
-    Ok(((precision << 16) | (scale & 0xFFFF)) + VARHDRSZ)
+    // make_numeric_typmod: the scale is an 11-bit two's-complement field.
+    Ok(((precision << 16) | (scale & 0x7FF)) + VARHDRSZ)
 }
 
 /// `anytime_typmod_check` / `anytimestamp_typmod_check`: one non-negative
@@ -369,7 +365,7 @@ pub fn check_literal_assignment(
             if let Err(msg) = crate::literal_input::validate_numeric(&raw) {
                 return Some(AnalyzeError::InvalidLiteral(msg));
             }
-            check_numeric_overflow(&raw, precision, scale)
+            numeric_overflow(&raw, precision, scale).map(AnalyzeError::Invalid)
         }
         DecodedTypmod::VectorDim(n) => {
             let count = vector_literal_dim_count(value)?;
@@ -464,26 +460,125 @@ fn numeric_literal_string(node: &Node) -> Option<String> {
     }
 }
 
-fn check_numeric_overflow(raw: &str, precision: i32, scale: i32) -> Option<AnalyzeError> {
-    let s = raw.trim();
-    let s = s.strip_prefix(['+', '-']).unwrap_or(s);
-    let int_part = match s.find('.') {
-        Some(idx) => &s[..idx],
-        None => s,
+/// The error `numeric(p, s)` raises for the numeric literal `literal` (an
+/// untyped string, an integer or a decimal constant), if it provably does:
+/// a cast or assignment to a numeric typmod runs `apply_typmod` on the
+/// value. `None` for any other node, type or typmod, or a value that fits
+/// or doesn't parse (`numeric_in` reports that one).
+pub(crate) fn numeric_literal_overflow(
+    snapshot: &PgCatalog,
+    type_oid: PgTypeOid,
+    typmod: Option<i32>,
+    literal: &Node,
+) -> Option<String> {
+    let DecodedTypmod::Numeric { precision, scale } = decode(snapshot, type_oid, typmod) else {
+        return None;
     };
-    let mut int_digits = int_part.trim_start_matches('0').len() as i32;
-    if int_digits == 0 {
-        int_digits = 0;
+    let raw = match literal.node.as_ref()? {
+        node::Node::AConst(c) if !c.isnull => match c.val.as_ref()? {
+            typedpg_pg_query::protobuf::a_const::Val::Ival(i) => i.ival.to_string(),
+            typedpg_pg_query::protobuf::a_const::Val::Fval(f) => f.fval.clone(),
+            typedpg_pg_query::protobuf::a_const::Val::Sval(s) => s.sval.clone(),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    crate::literal_input::validate_numeric(&raw).ok()?;
+    numeric_overflow(&raw, precision, scale)
+}
+
+/// `apply_typmod` / `apply_typmod_special` (numeric.c) on the valid
+/// `numeric_in` input `raw`: the value is rounded (half away from zero) to
+/// `scale` fractional digits, then must have at most `precision - scale`
+/// integer digits; infinity never fits, NaN always does. `Some(message)`
+/// with PG's `numeric field overflow` and its detail when it doesn't fit.
+fn numeric_overflow(raw: &str, precision: i32, scale: i32) -> Option<String> {
+    let overflow = |detail: String| {
+        Some(format!(
+            "numeric field overflow: a field with precision {precision}, scale {scale} {detail}"
+        ))
+    };
+    let s = raw.trim_matches(|c: char| c.is_ascii_whitespace());
+    let s = s.strip_prefix(['+', '-']).unwrap_or(s);
+    match s.to_ascii_lowercase().as_str() {
+        "nan" => return None,
+        "inf" | "infinity" => return overflow("cannot hold an infinite value".into()),
+        _ => {}
     }
-    // PG: int_part_digits must fit in (precision - scale).
-    let max_int_digits = precision - scale;
-    if int_digits > max_int_digits {
-        return Some(AnalyzeError::Invalid(format!(
-            "numeric field overflow: a field with precision {precision}, scale {scale} \
-             must round to an absolute value less than 10^{max_int_digits}"
-        )));
+    // The value as `digits × 10^exp`.
+    let bytes = s.as_bytes();
+    let (digits, exp): (String, i64) =
+        if bytes.len() >= 2 && bytes[0] == b'0' && matches!(bytes[1] | 0x20, b'x' | b'o' | b'b') {
+            let radix = match bytes[1] | 0x20 {
+                b'x' => 16,
+                b'o' => 8,
+                _ => 2,
+            };
+            let mut value: u128 = 0;
+            for c in s[2..].chars().filter(|&c| c != '_') {
+                value = value
+                    .checked_mul(radix)?
+                    .checked_add(u128::from(c.to_digit(radix as u32)?))?;
+            }
+            (value.to_string(), 0)
+        } else {
+            let (mantissa, exponent) = match s.find(['e', 'E']) {
+                Some(i) => (&s[..i], s[i + 1..].replace('_', "").parse::<i64>().ok()?),
+                None => (s, 0),
+            };
+            let mantissa = mantissa.replace('_', "");
+            let (int_part, frac) = mantissa.split_once('.').unwrap_or((&mantissa, ""));
+            (
+                format!("{int_part}{frac}"),
+                exponent.checked_sub(i64::try_from(frac.len()).ok()?)?,
+            )
+        };
+    let mut digits = digits.trim_start_matches('0').to_owned();
+    let mut exp = exp;
+    // round_var(var, scale): drop the digits past `scale` fractional ones,
+    // rounding half away from zero.
+    if exp < -i64::from(scale) {
+        let drop = usize::try_from(-i64::from(scale) - exp).ok()?;
+        let round_up = drop <= digits.len() && digits.as_bytes()[digits.len() - drop] >= b'5';
+        digits.truncate(digits.len().saturating_sub(drop));
+        if round_up {
+            // Add one to the kept digits (a decimal string).
+            let mut carry = true;
+            let mut out: Vec<u8> = digits.into_bytes();
+            for d in out.iter_mut().rev() {
+                if *d == b'9' {
+                    *d = b'0';
+                } else {
+                    *d += 1;
+                    carry = false;
+                    break;
+                }
+            }
+            if carry {
+                out.insert(0, b'1');
+            }
+            digits = String::from_utf8(out).ok()?;
+        }
+        exp = -i64::from(scale);
     }
-    None
+    let digits = digits.trim_start_matches('0');
+    if digits.is_empty() {
+        // A true zero always fits.
+        return None;
+    }
+    // The number of integer digits (≤ 0 below 1).
+    let int_digits = i64::try_from(digits.len()).ok()? + exp;
+    let max_digits = precision - scale;
+    if int_digits <= i64::from(max_digits) {
+        return None;
+    }
+    // (PG displays 10^0 as 1.)
+    let bound = if max_digits == 0 {
+        "1".to_owned()
+    } else {
+        format!("10^{max_digits}")
+    };
+    overflow(format!("must round to an absolute value less than {bound}"))
 }
 
 fn vector_literal_dim_count(node: &Node) -> Option<usize> {

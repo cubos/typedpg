@@ -18,6 +18,10 @@ struct FuncArgs {
     /// Number of *direct* args (`func.args`); for ordered-set aggregates the
     /// `WITHIN GROUP (ORDER BY …)` exprs are appended to `types` after these.
     direct_count: usize,
+    /// Per argument (parallel to `nullable`), whether coercing it to the
+    /// resolved parameter type can map a non-NULL value to NULL (see
+    /// [`coerce_call_args`]).
+    coercion_nullable: Vec<bool>,
 }
 
 pub(crate) fn infer_func_call(
@@ -167,6 +171,7 @@ pub(crate) fn infer_func_call(
     // The result's collation derives from the arguments' (assign_collations).
     let (collation, explicit_collation) =
         derive_collation(&args.exprs, resolved.return_type_oid, snapshot)?;
+    coerce_call_args(&mut args, &resolved, snapshot);
 
     // The rules below read arguments by parameter position.
     let (func, args) = in_declared_order(func, args, &resolved);
@@ -238,6 +243,7 @@ fn in_declared_order<'a>(
         any_nullable: args.any_nullable,
         exprs: resolved.in_declared_order(&args.exprs, ExprType::scalar(oid::UNKNOWN, false)),
         direct_count: positional.args.len(),
+        coercion_nullable: resolved.in_declared_order(&args.coercion_nullable, false),
     };
     (std::borrow::Cow::Owned(positional), args)
 }
@@ -597,13 +603,57 @@ fn collect_arg_types(
         }
     }
 
+    let coercion_nullable = vec![false; nullable.len()];
     Ok(FuncArgs {
         types,
         nullable,
         any_nullable,
         exprs,
         direct_count,
+        coercion_nullable,
     })
+}
+
+/// Which call arguments coercing to their parameter types (`resolved`'s
+/// `arg_types`, polymorphic ones resolved) can map a non-NULL value to
+/// NULL: one whose implicit cast runs a cast function that can return NULL
+/// (`color_to_text(color)` in `upper(color_col)`).
+pub(crate) fn arg_coercions_nullable(
+    actual: &[PgTypeOid],
+    resolved: &functions::ResolvedFunction,
+    snapshot: &PgCatalog,
+) -> Vec<bool> {
+    actual
+        .iter()
+        .enumerate()
+        .map(|(i, &a)| {
+            resolved
+                .arg_types
+                .get(i)
+                .is_some_and(|&d| super::coercion_can_return_null(a, d, snapshot))
+        })
+        .collect()
+}
+
+/// Apply the coercion of each argument to its parameter type to the
+/// arguments' nullability, as the call sees them (PG's
+/// `make_fn_arguments`): a value — or an array's element — the cast
+/// function maps to NULL is a NULL argument.
+fn coerce_call_args(
+    args: &mut FuncArgs,
+    resolved: &functions::ResolvedFunction,
+    snapshot: &PgCatalog,
+) {
+    args.coercion_nullable = arg_coercions_nullable(&args.types, resolved, snapshot);
+    for (i, &coerced) in args.coercion_nullable.iter().enumerate() {
+        if coerced && let Some(n) = args.nullable.get_mut(i) {
+            *n = true;
+        }
+    }
+    for (e, &d) in args.exprs.iter_mut().zip(&resolved.arg_types) {
+        e.note_coerced_to(d, snapshot);
+    }
+    args.any_nullable = args.nullable.iter().any(|&n| n);
 }
 
 /// An aggregate reads its arguments only over the rows its FILTER passes:
@@ -710,6 +760,7 @@ pub(crate) fn backfill_call_args(
         any_nullable: false,
         exprs: Vec::new(),
         direct_count: arg_types.len(),
+        coercion_nullable: vec![false; arg_types.len()],
     };
     backfill_func_args(func, &args, resolved, ctx, params)
 }
@@ -1748,6 +1799,10 @@ fn resolve_func_nullability(
                     .and_then(|n| crate::having::column_of(n, ctx.scope))
                     .is_some_and(|c| null_ctx.nonnull_agg_inputs.contains(&c))
         };
+        // A column proven non-NULL in some row is still a NULL value there
+        // when its coercion to the parameter type can make it one.
+        let proven_value =
+            |i: usize| proven(i) && !args.coercion_nullable.get(i).copied().unwrap_or(false);
         // A row whose every value is non-NULL — one a strict transition
         // function reads. HAVING proves each column present in *some* row
         // of the group: for an aggregate of several values (`regr_sxx(b,
@@ -1756,7 +1811,7 @@ fn resolve_func_nullability(
         // only when the other values are never NULL.
         let proven_row = value_args
             .iter()
-            .any(|&i| proven(i) && value_args.iter().all(|&j| j == i || !arg_is_nullable(j)));
+            .any(|&i| proven_value(i) && value_args.iter().all(|&j| j == i || !arg_is_nullable(j)));
         // An aggregate over a non-empty set of rows: NULL only when every
         // value it reads is NULL (for the strict ones), never for those
         // keeping NULL inputs (`array_agg`, `json_agg`, …) — except for

@@ -1836,6 +1836,14 @@ fn function_rte_columns(
     // Coerce untyped arguments to the chosen signature (pins `$N`,
     // validates literal contents), as for a call anywhere else.
     expr::backfill_call_args(func_call, &arg_types, &resolved, arg_ctx, params)?;
+    // An argument whose coercion can map it to NULL is a NULL argument.
+    let arg_nullable: Vec<bool> = arg_nullable
+        .iter()
+        .zip(expr::arg_coercions_nullable(
+            &arg_types, &resolved, snapshot,
+        ))
+        .map(|(&n, c)| n || c)
+        .collect();
     // Strict in the arguments as written: not a variadic call packing them
     // into an array, nor one coercing them through a non-strict cast.
     rows.strict_srf = resolved.is_set_returning

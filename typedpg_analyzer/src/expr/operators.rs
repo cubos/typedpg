@@ -104,15 +104,35 @@ fn handle_nullif(
         ));
     }
     // A polymorphic / pseudo declared input (anyarray, anyenum, record, …)
-    // is coerced to the actual argument type, not to the pseudo-type.
-    let pseudo = snapshot
-        .get_type(declared_left)
-        .is_some_and(|t| t.typtype == TypType::Pseudo);
+    // is coerced to the actual argument type, not to the pseudo-type —
+    // except that `coerce_type` relabels a domain to its base type for the
+    // pseudo-types whose value must be a true array, enum, range or
+    // multirange (`NULLIF(intarr_col, '{}')` is `integer[]`).
+    let declared_type = snapshot.get_type(declared_left);
+    let pseudo = declared_type.is_some_and(|t| t.typtype == TypType::Pseudo);
+    let flattens_domain = declared_type.is_some_and(|t| {
+        t.typtype == TypType::Pseudo
+            && matches!(
+                t.typname.as_str(),
+                "anyarray"
+                    | "anyenum"
+                    | "anyrange"
+                    | "anymultirange"
+                    | "anycompatiblearray"
+                    | "anycompatiblerange"
+                    | "anycompatiblemultirange"
+            )
+    });
     let result_oid = if pseudo || declared_left == oid::UNKNOWN {
-        if left.type_oid == oid::UNKNOWN {
+        let actual = if left.type_oid == oid::UNKNOWN {
             right.type_oid
         } else {
             left.type_oid
+        };
+        if flattens_domain {
+            snapshot.unwrap_domain(actual)
+        } else {
+            actual
         }
     } else {
         declared_left
@@ -156,6 +176,9 @@ fn handle_distinct_from(
     } else {
         None
     };
+    // ExecEvalDistinct: two NULLs are not distinct, one NULL is; two
+    // values compare with `=`, and a NULL from it is the result.
+    let mut nullable = false;
     if let Some(arg) = null_test_of {
         let t = protobuf::NullTest {
             arg: Some(Box::new(arg.clone())),
@@ -169,12 +192,19 @@ fn handle_distinct_from(
     } else if let (Some(node::Node::RowExpr(l)), Some(node::Node::RowExpr(r))) =
         (lexpr.node.as_ref(), rexpr.node.as_ref())
     {
-        // make_row_distinct_op: a pairwise `=` per column.
-        row_pairwise_op("=", &l.args, &r.args, expr.location, ctx, params, |_| {
+        // make_row_distinct_op: a pairwise `=` per column, ORed.
+        let ops = row_pairwise_op("=", &l.args, &r.args, expr.location, ctx, params, |_| {
             "IS DISTINCT FROM requires = operator to yield boolean".to_string()
-        })?;
+        })?
+        .1;
+        nullable = ops.iter().flatten().any(|o| {
+            functions::operator_result_nullable(ctx.snapshot, "=", o.code, &[false, false])
+        });
     } else {
         infer_synthetic_op("=", lexpr, rexpr, expr.location, ctx, params)?;
+        nullable = pair_operator("=", lexpr, rexpr, ctx, params).is_some_and(|o| {
+            functions::operator_result_nullable(ctx.snapshot, "=", o.code, &[false, false])
+        });
         // Not distinct from a non-NULL side, the other side is non-NULL
         // too (see `nonnull::distinct_facts`). A peek, on a throwaway
         // collector.
@@ -190,7 +220,7 @@ fn handle_distinct_from(
             }
         }
     }
-    Ok(Some(ExprType::scalar(oid::BOOL, false)))
+    Ok(Some(ExprType::scalar(oid::BOOL, nullable)))
 }
 
 /// `expr [NOT] BETWEEN lo AND hi` (and the SYM variants) — rexpr is a
@@ -298,9 +328,21 @@ fn handle_in_list(
                     coerce_unknown_to(items[i].0, ctx, params, common)?;
                 }
                 folded[i] = true;
+                // Each item is coerced to the common type.
+                nullable |= super::coercion_can_return_null(items[i].1.type_oid, common, snapshot);
             }
             // `a op ANY(common[])` resolves `a op common`.
             infer_synthetic_op(op, a, &typed_null(common), expr.location, ctx, params)?;
+            // That comparison is itself a call, on the operands coerced to
+            // its declared types.
+            let left_oid = if left.type_oid == oid::UNKNOWN {
+                common
+            } else {
+                left.type_oid
+            };
+            if let Some(o) = snapshot.find_operator(op, Some(left_oid), common) {
+                nullable |= operator_call_nullable(snapshot, op, &o, Some(left_oid), common);
+            }
         }
     }
     // transformAExprIn builds each remaining comparison over a *copy* of
@@ -322,14 +364,16 @@ fn handle_in_list(
         if folded[i] {
             continue;
         }
+        // Each remaining comparison is an operator call: NULL-able when it
+        // can yield NULL (on top of its operands being so).
         let Some(p) = untyped_param else {
-            infer_synthetic_op(op, a, item, expr.location, ctx, params)?;
+            nullable |= infer_synthetic_op(op, a, item, expr.location, ctx, params)?.nullable;
             continue;
         };
         let (r, deduced) = params.with_param_untyped(p.number, |scratch| {
             infer_synthetic_op(op, a, item, expr.location, ctx, scratch)
         });
-        r?;
+        nullable |= r?.nullable;
         if deduced != oid::UNKNOWN
             && let Err(prev) = params.coerce_untyped(p.number, deduced)
         {
@@ -498,6 +542,7 @@ fn handle_any_all(
     // PG's Describe), not the domain's. When T has no array type at all —
     // T is itself an array; PG has no array-of-array — PG fails the same
     // lookup with `could not find array type for data type integer[]`.
+    let mut op_nullable = false;
     if left_oid != oid::UNKNOWN && right_oid == oid::UNKNOWN {
         match snapshot.array_type_of(snapshot.unwrap_domain(left_oid)) {
             Some(arr_oid) => {
@@ -521,6 +566,8 @@ fn handle_any_all(
                                 .coercion_is_strict(left_oid, op.left_type_oid.unwrap_or(left_oid))
                             && ctx.coercion_is_strict(elem, op.right_type_oid),
                     );
+                    op_nullable =
+                        operator_call_nullable(snapshot, &op_name, &op, Some(left_oid), elem);
                 }
             }
             None => {
@@ -546,7 +593,6 @@ fn handle_any_all(
     // is a different PG error ("op ANY/ALL (array) requires array on right
     // side") with riskier corner cases (jsonb, record), so that check stays
     // out of scope.
-    let mut op_nullable = false;
     if left_oid != oid::UNKNOWN
         && right_oid != oid::UNKNOWN
         && let Some(elem_oid) = array_element_type(snapshot, right_oid)
@@ -564,12 +610,10 @@ fn handle_any_all(
                                 .coercion_is_strict(left_oid, op.left_type_oid.unwrap_or(left_oid))
                             && ctx.coercion_is_strict(elem_oid, op.right_type_oid),
                     );
-                    op_nullable = functions::operator_result_nullable(
-                        snapshot,
-                        &op_name,
-                        op.code,
-                        &[false, false],
-                    );
+                    // So can the coercion of the left operand or of an
+                    // element to the operator's declared types.
+                    op_nullable =
+                        operator_call_nullable(snapshot, &op_name, &op, Some(left_oid), elem_oid);
                 }
                 None => {
                     let l = crate::ddl::util::format_type_for_message(snapshot, left_oid);
@@ -602,6 +646,25 @@ fn handle_any_all(
                 .as_deref()
                 .is_none_or(|r| array_elements_may_be_null(r, ctx, params)));
     Ok(Some(ExprType::scalar(oid::BOOL, any_nullable)))
+}
+
+/// Whether a call of the resolved operator `op` on non-NULL operands of
+/// types `left` / `right` can yield NULL: its function can
+/// ([`functions::operator_result_nullable`]), or coercing an operand to the
+/// operator's declared type runs a cast function that maps it to NULL.
+pub(crate) fn operator_call_nullable(
+    snapshot: &PgCatalog,
+    op_name: &str,
+    op: &crate::lookup::ResolvedOperator,
+    left: Option<PgTypeOid>,
+    right: PgTypeOid,
+) -> bool {
+    let operands = if left.is_some() { 2 } else { 1 };
+    functions::operator_result_nullable(snapshot, op_name, op.code, &[false, false][..operands])
+        || left
+            .zip(op.left_type_oid)
+            .is_some_and(|(a, d)| super::coercion_can_return_null(a, d, snapshot))
+        || super::coercion_can_return_null(right, op.right_type_oid, snapshot)
 }
 
 /// Whether the array value `node` evaluates to may contain NULL elements.
@@ -664,7 +727,7 @@ fn handle_row_row(
     else {
         return Ok(None);
     };
-    row_pairwise_op(
+    let (t, ops) = row_pairwise_op(
         op_name,
         &lrow.args,
         &rrow.args,
@@ -672,8 +735,9 @@ fn handle_row_row(
         ctx,
         params,
         |t| format!("row comparison operator must yield type boolean, not type {t}"),
-    )
-    .map(Some)
+    )?;
+    check_row_comparison_interpretation(ctx.snapshot, op_name, &ops, expr.location)?;
+    Ok(Some(t))
 }
 
 /// The pairwise core of `make_row_comparison_op` / `make_row_distinct_op`:
@@ -689,7 +753,7 @@ pub(crate) fn row_pairwise_op(
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
     not_bool: impl Fn(&str) -> String,
-) -> Result<ExprType, AnalyzeError> {
+) -> Result<(ExprType, Vec<Option<crate::lookup::ResolvedOperator>>), AnalyzeError> {
     let largs = &*expand_row_args(largs, ctx, params);
     let rargs = &*expand_row_args(rargs, ctx, params);
     if largs.len() != rargs.len() {
@@ -703,6 +767,7 @@ pub(crate) fn row_pairwise_op(
         ));
     }
     let mut nullable = false;
+    let mut ops = Vec::with_capacity(largs.len());
     for (l, r) in largs.iter().zip(rargs) {
         let t = infer_plain_op(op_name, l, r, location, ctx, params)?;
         if t.type_oid != oid::BOOL {
@@ -710,8 +775,80 @@ pub(crate) fn row_pairwise_op(
             return Err(AnalyzeError::DatatypeMismatch(not_bool(&name)));
         }
         nullable |= t.nullable;
+        ops.push(pair_operator(op_name, l, r, ctx, params));
     }
-    Ok(ExprType::scalar(oid::BOOL, nullable))
+    Ok((ExprType::scalar(oid::BOOL, nullable), ops))
+}
+
+/// The operator `l op r` resolved to, once both operands are typed (their
+/// types re-read on a scratch collector): `None` when it can't be told.
+fn pair_operator(
+    op_name: &str,
+    l: &protobuf::Node,
+    r: &protobuf::Node,
+    ctx: Ctx<'_>,
+    params: &ParamCollector,
+) -> Option<crate::lookup::ResolvedOperator> {
+    let mut scratch = params.clone();
+    let lt = infer_expr(l, ctx, &mut scratch, TypeGoal::NONE).ok()?;
+    let rt = infer_expr(r, ctx, &mut scratch, TypeGoal::NONE).ok()?;
+    ctx.snapshot
+        .find_operator(op_name, Some(lt.type_oid), rt.type_oid)
+}
+
+/// PG's `make_row_comparison_op` past the pairwise operators: a row of
+/// more than one column is compared with the semantics (`=`, `<>`, `<`, …)
+/// every operator shares as a member of some btree operator family — or,
+/// for `<>`, as the negator of a btree equality
+/// (`get_op_index_interpretation`). With no common one, PG can't tell what
+/// the comparison means.
+pub(crate) fn check_row_comparison_interpretation(
+    snapshot: &PgCatalog,
+    op_name: &str,
+    ops: &[Option<crate::lookup::ResolvedOperator>],
+    location: i32,
+) -> Result<(), AnalyzeError> {
+    if ops.len() < 2 || ops.iter().any(Option::is_none) {
+        return Ok(());
+    }
+    // Comparison types as bits: btree strategies 1-5 (`<` … `>`), and 6
+    // for `<>` (PG's CompareType numbering).
+    const NE: u8 = 6;
+    let interpretations = |opr: crate::oid::PgOperatorOid| -> u8 {
+        let btree = |o: crate::oid::PgOperatorOid| {
+            snapshot
+                .pg_amop
+                .iter()
+                .filter(move |a| a.amopopr == o && a.amopmethod == "btree")
+        };
+        let mut bits = btree(opr)
+            .filter(|a| (1..=5).contains(&a.amopstrategy))
+            .fold(0u8, |acc, a| acc | (1 << a.amopstrategy));
+        if bits == 0
+            && let Some(neg) = snapshot.pg_operator.get(&opr).and_then(|o| o.oprnegate)
+            && btree(neg).any(|a| a.amopstrategy == 3)
+        {
+            bits = 1 << NE;
+        }
+        bits
+    };
+    let common = ops
+        .iter()
+        .flatten()
+        .fold(u8::MAX, |acc, o| acc & interpretations(o.oid));
+    if common != 0 {
+        return Ok(());
+    }
+    // PG names the operator without its schema (`strVal(llast(opname))`).
+    let name = op_name.rsplit('.').next().unwrap_or(op_name);
+    Err(crate::error::RawError::new(
+        AnalyzeError::FeatureNotSupported(format!(
+            "could not determine interpretation of row comparison operator {name}"
+        )),
+        crate::error::SourceSpan::from_location(location),
+        Some("Row comparison operators must be associated with btree operator families.".into()),
+    )
+    .finalize_implicit())
 }
 
 /// `ROW(...)` compared against a sub-SELECT: PG counts columns at the subquery
@@ -770,6 +907,17 @@ fn handle_row_subselect(
             largs.len(),
         )));
     }
+    // make_row_comparison_op over the row and the subquery's columns.
+    let ops: Vec<Option<crate::lookup::ResolvedOperator>> = largs
+        .iter()
+        .zip(&cols)
+        .map(|(la, col)| {
+            let mut scratch = params.clone();
+            let lt = infer_expr(la, ctx, &mut scratch, TypeGoal::NONE).ok()?;
+            snapshot.find_operator(op_name, Some(lt.type_oid), col.type_oid)
+        })
+        .collect();
+    check_row_comparison_interpretation(snapshot, op_name, &ops, expr.location)?;
     Ok(Some(ExprType::scalar(oid::BOOL, true)))
 }
 
@@ -818,12 +966,6 @@ fn infer_generic_binary_op(
     let left_oid_resolved = left_oid;
     let right_oid_resolved = right_oid;
 
-    let args_nullable: Vec<bool> = left
-        .iter()
-        .chain(right.iter())
-        .map(|t| t.nullable)
-        .collect();
-
     // Operator lookup with the bottom-up types — UNKNOWN sides are resolved
     // by `find_operator`'s own rules (homogeneous probe, category and text
     // fallbacks), exactly like PG; the unknown side is *not* pre-pinned to
@@ -843,6 +985,22 @@ fn infer_generic_binary_op(
             if ctx.strict_log.is_some() {
                 note_std_compare(expr.location, op_name, &op, &left, &right, ctx);
             }
+            // The operands as the operator's function receives them, coerced
+            // to its declared types: a cast function may map one (or an
+            // array's element) to NULL.
+            let mut left = left;
+            let mut right = right;
+            if let (Some(l), Some(d)) = (left.as_mut(), op.left_type_oid) {
+                l.note_coerced_to(d, snapshot);
+            }
+            if let Some(r) = right.as_mut() {
+                r.note_coerced_to(op.right_type_oid, snapshot);
+            }
+            let args_nullable: Vec<bool> = left
+                .iter()
+                .chain(right.iter())
+                .map(|t| t.nullable)
+                .collect();
             if let (Some(actual), Some(declared)) = (left_oid_resolved, op.left_type_oid) {
                 ctx.note_coercion(actual, declared);
             }

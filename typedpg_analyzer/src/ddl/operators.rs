@@ -229,8 +229,65 @@ fn operator_shell_make(
         oprresult: None,
         oprcode: None,
         oprcom: None,
+        oprnegate: None,
     });
     Ok(oid)
+}
+
+/// `OperatorUpd`: make the commutator `com` and the negator `neg` of
+/// operator `base` link back to it — an error when one already links to a
+/// third operator — or, for a `base` being dropped, clear their links to
+/// it.
+pub(crate) fn operator_upd(
+    interp: &mut PgCatalog,
+    base: PgOperatorOid,
+    com: Option<PgOperatorOid>,
+    neg: Option<PgOperatorOid>,
+    is_delete: bool,
+) -> Result<(), DdlError> {
+    type Link = fn(&mut PgOperator) -> &mut Option<PgOperatorOid>;
+    let links: [(Option<PgOperatorOid>, Link, &str); 2] = [
+        (com, |o| &mut o.oprcom, "commutator"),
+        (neg, |o| &mut o.oprnegate, "negator"),
+    ];
+    for (other, link, what) in links {
+        let Some(other) = other else {
+            continue;
+        };
+        let third = interp
+            .pg_operator
+            .get_mut(&other)
+            .and_then(|o| *link(o))
+            .filter(|&t| t != base);
+        if let (Some(third), false) = (third, is_delete) {
+            let name = |o: PgOperatorOid| interp.pg_operator.get(&o).map(|o| o.oprname.clone());
+            let third = name(third).unwrap_or_else(|| third.get().to_string());
+            return Err(DdlError::Parse(format!(
+                "{what} operator {} is already the {what} of operator {third}",
+                name(other).unwrap_or_default()
+            )));
+        }
+        if let Some(row) = interp.pg_operator.get_mut(&other) {
+            let l = link(row);
+            if is_delete && *l == Some(base) {
+                *l = None;
+            } else if !is_delete {
+                *l = Some(base);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `RemoveOperatorById`: drop an operator, clearing its commutator's and
+/// negator's links to it.
+pub(crate) fn remove_operator(interp: &mut PgCatalog, oid: PgOperatorOid) {
+    if let Some(op) = interp.pg_operator.get(&oid) {
+        let (com, neg) = (op.oprcom, op.oprnegate);
+        // (Clearing links never fails.)
+        let _ = operator_upd(interp, oid, com, neg, true);
+    }
+    interp.remove_pg_operator(oid);
 }
 
 /// `get_other_operator`: the commutator / negator an operator names —
@@ -396,27 +453,31 @@ pub fn define_operator(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), 
         }
         commutator_oid = Some(other);
     }
+    let mut negator_oid = None;
     if let Some(names) = negator.as_deref() {
         match get_other_operator(interp, names, left, right, &op_name, nsoid, left, right)? {
             None => {
                 return Err(DdlError::Parse("operator cannot be its own negator".into()));
             }
-            Some(other) => referenced.push(ObjectAddress::operator(other)),
+            Some(other) => {
+                referenced.push(ObjectAddress::operator(other));
+                negator_oid = Some(other);
+            }
         }
     }
-    // A shell of this signature is filled in, keeping its OID — and the
-    // commutator link another operator made to it.
-    let (oid, shell_oprcom) = match existing {
+    // A shell of this signature is filled in, keeping its OID. Its row is
+    // replaced whole: a commutator / negator link another operator made to
+    // it is not kept unless restated (OperatorCreate writes the links it
+    // was given).
+    let oid = match existing {
         Some((shell, false)) => {
-            let row = interp.remove_pg_operator(shell);
-            (shell, row.and_then(|r| r.oprcom))
+            interp.remove_pg_operator(shell);
+            shell
         }
-        _ => (PgOperatorOid::from_nonzero(interp.alloc_oid()?), None),
+        _ => PgOperatorOid::from_nonzero(interp.alloc_oid()?),
     };
-    let oprcom = match commutator_oid {
-        Some(other) => Some(other.unwrap_or(oid)),
-        None => shell_oprcom,
-    };
+    let oprcom = commutator_oid.map(|other| other.unwrap_or(oid));
+    let oprnegate = negator_oid;
     interp.insert_pg_operator(PgOperator {
         oid,
         oprname: op_name,
@@ -426,14 +487,11 @@ pub fn define_operator(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), 
         oprresult: result,
         oprcode: Some(proc_oid),
         oprcom,
+        oprnegate,
     });
-    // OperatorUpd: the commutator points back at the new operator.
-    if let Some(other) = oprcom
-        && other != oid
-        && let Some(row) = interp.pg_operator.get_mut(&other)
-    {
-        row.oprcom = Some(oid);
-    }
+    // OperatorUpd: the commutator and the negator point back at the new
+    // operator.
+    operator_upd(interp, oid, oprcom, oprnegate, false)?;
     // makeOperatorDependencies: the operator depends on its function and
     // estimators (a commutator / negator link is not a dependency).
     referenced.retain(|r| r.classid == crate::pg_catalog::PG_PROC_RELID);
@@ -533,15 +591,34 @@ pub fn alter_operator(interp: &mut PgCatalog, stmt: &AlterOperatorStmt) -> Resul
             ))),
             Some((oid, true)) => Ok(oid),
         };
+    let mut commutator_oid = None;
     if let Some(names) = commutator.as_deref()
         && let Some(l) = left
     {
-        validate_reference(names, Some(right), l)?;
+        let other = validate_reference(names, Some(right), l)?;
+        // AlterOperator: a link already set can't change.
+        if op.oprcom.is_some_and(|c| c != other) {
+            return Err(DdlError::Parse(
+                "operator attribute \"commutator\" cannot be changed if it has already been set"
+                    .into(),
+            ));
+        }
+        commutator_oid = Some(other);
     }
-    if let Some(names) = negator.as_deref()
-        && validate_reference(names, left, right)? == oid
-    {
-        return Err(DdlError::Parse("operator cannot be its own negator".into()));
+    let mut negator_oid = None;
+    if let Some(names) = negator.as_deref() {
+        let other = validate_reference(names, left, right)?;
+        if other == oid {
+            return Err(DdlError::Parse("operator cannot be its own negator".into()));
+        }
+        // AlterOperator: a link already set can't change.
+        if op.oprnegate.is_some_and(|n| n != other) {
+            return Err(DdlError::Parse(
+                "operator attribute \"negator\" cannot be changed if it has already been set"
+                    .into(),
+            ));
+        }
+        negator_oid = Some(other);
     }
     operator_validate_params(
         op.oprleft,
@@ -552,5 +629,15 @@ pub fn alter_operator(interp: &mut PgCatalog, stmt: &AlterOperatorStmt) -> Resul
         join.is_some(),
         can_merge,
         can_hash,
-    )
+    )?;
+    // The new links, both ways (OperatorUpd).
+    if let Some(row) = interp.pg_operator.get_mut(&oid) {
+        if commutator_oid.is_some() {
+            row.oprcom = commutator_oid;
+        }
+        if negator_oid.is_some() {
+            row.oprnegate = negator_oid;
+        }
+    }
+    operator_upd(interp, oid, commutator_oid, negator_oid, false)
 }

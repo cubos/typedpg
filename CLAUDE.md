@@ -179,7 +179,10 @@ the event — on the table, on a partition the row is routed to, or (UPDATE)
 a BEFORE ROW INSERT one on a partition a row may move to — can replace it.
 A NOT NULL domain fails as the row is built, before any trigger, and stays
 rejected. A NULL given for an identity column under `OVERRIDING USER VALUE`
-is never stored (the sequence's value is) and is accepted too.
+is never stored (the sequence's value is) and is accepted too. Likewise, an
+expression that fails every time it is evaluated — a multidimensional
+`ARRAY[ARRAY[a], NULL]` whose sub-arrays can never agree in dimensions — is
+rejected even where no row reaches it.
 
 When a query has **multiple simultaneous errors**, we deliberately do **not**
 require the analyzer to pick the *same* error PG reports first. PG's

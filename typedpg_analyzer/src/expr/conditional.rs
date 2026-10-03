@@ -163,9 +163,12 @@ pub(crate) fn agreed_typmod(inputs: &[ExprType], common: PgTypeOid) -> Option<i3
 /// Whether at least one of the plain columns among `args` is known
 /// non-NULL where they are read (a disjunction: `a IS NOT NULL OR b IS NOT
 /// NULL`, `CHECK (num_nonnulls(a, b) = 1)`).
-pub(crate) fn some_column_non_null(args: &[protobuf::Node], ctx: Ctx<'_>) -> bool {
+pub(crate) fn some_column_non_null<'a>(
+    args: impl IntoIterator<Item = &'a protobuf::Node>,
+    ctx: Ctx<'_>,
+) -> bool {
     let cols: Vec<crate::nonnull::Col> = args
-        .iter()
+        .into_iter()
         .filter_map(|a| crate::nonnull::plain_column(a, ctx.scope).map(|(c, _)| c))
         .collect();
     cols.len() > 1 && ctx.null_ctx.some_non_null(&cols)
@@ -186,9 +189,6 @@ pub(crate) fn infer_coalesce(
     for arg in &expr.args {
         args.push(infer_expr(arg, ctx, params, TypeGoal::NONE)?);
     }
-    // NULL only when every argument is — not when the quals or CHECK
-    // constraints say one of its columns isn't.
-    let all_nullable = args.iter().all(|t| t.nullable) && !some_column_non_null(&expr.args, ctx);
 
     // Resolve over the *full* arg list (unknowns included): the
     // all-identical fast path that preserves domains must see a NULL branch
@@ -196,6 +196,12 @@ pub(crate) fn infer_coalesce(
     let types: Vec<PgTypeOid> = args.iter().map(|t| t.type_oid).collect();
     let nodes: Vec<&protobuf::Node> = expr.args.iter().collect();
     let type_oid = select_common_type("COALESCE", &types, &nodes, snapshot)?;
+    // Each argument is coerced to the common type, which may map it to NULL.
+    let kept = coerce_branches(&mut args, type_oid, snapshot);
+    // NULL only when every argument is — not when the quals or CHECK
+    // constraints say one of its (uncoerced) columns isn't.
+    let all_nullable = args.iter().all(|t| t.nullable)
+        && !some_column_non_null(kept_nodes(&expr.args, &kept), ctx);
 
     // Pass 2: back-fill UNKNOWN args with the resolved common type. Literal
     // content rejections propagate (PG raises them from this coercion).
@@ -220,6 +226,32 @@ pub(crate) fn infer_coalesce(
             .with_collation(derive_collation(&args, type_oid, snapshot)?)
             .with_elem_nullable(branches_elem_nullable(&branches, type_oid, snapshot)),
     )
+}
+
+/// Coerce each branch of a CASE / COALESCE / GREATEST / … to the common
+/// type `common` ([`ExprType::note_coerced_to`]); per branch, whether it
+/// is kept as it is — no cast function can map it to NULL.
+pub(crate) fn coerce_branches(
+    branches: &mut [ExprType],
+    common: PgTypeOid,
+    snapshot: &PgCatalog,
+) -> Vec<bool> {
+    branches
+        .iter_mut()
+        .map(|t| {
+            let kept = !super::coercion_can_return_null(t.type_oid, common, snapshot);
+            t.note_coerced_to(common, snapshot);
+            kept
+        })
+        .collect()
+}
+
+/// The nodes of `args` whose `kept` flag is set.
+pub(crate) fn kept_nodes<'a>(
+    args: &'a [protobuf::Node],
+    kept: &'a [bool],
+) -> impl Iterator<Item = &'a protobuf::Node> {
+    args.iter().zip(kept).filter(|(_, k)| **k).map(|(a, _)| a)
 }
 
 /// The columns a condition proves part of the current grouping set:
@@ -498,6 +530,8 @@ pub(crate) fn infer_case(
             coerce_unknown_to(node, ctx, params, type_oid)?;
         }
     }
+    // Each result is coerced to the common type, which may map it to NULL.
+    coerce_branches(&mut inputs, type_oid, snapshot);
 
     // The ELSE (input 0) counts only when it can be the result.
     let nullable = inputs

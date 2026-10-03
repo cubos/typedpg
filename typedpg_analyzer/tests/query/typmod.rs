@@ -461,8 +461,9 @@ fn invalid_typmods_rejected_like_typmodin() {
     ] {
         assert_err_prefix!(db.analyze(sql), AnalyzeError::Invalid(_), msg);
     }
-    // A scale above the precision is a valid typmod since PG 15.
-    let s = db.analyze("SELECT 1::numeric(2, 5) AS n").unwrap();
+    // A scale above the precision is a valid typmod since PG 15 (holding
+    // values below 10^-3).
+    let s = db.analyze("SELECT 0.0001::numeric(2, 5) AS n").unwrap();
     assert_cols(&s, vec![c("n", numeric_ps(2, 5))]);
     assert_ddl_err!(
         try_apply(&[("001.sql", "CREATE TABLE tt (a text(3));")]),

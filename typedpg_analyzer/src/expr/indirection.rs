@@ -435,6 +435,33 @@ pub(crate) fn transform_array_expr(
         }
     }
 
+    // ExecEvalArrayExpr builds a multidimensional array from sub-arrays of
+    // one shape; a NULL or empty sub-array is allowed only when every one
+    // is (the result is then empty). Sub-arrays the query fixes the shape
+    // of that can't agree fail every evaluation.
+    if multidims {
+        let shapes: Vec<SubArrayShape> = arr
+            .elements
+            .iter()
+            .map(|e| sub_array_shape(e, ctx, params))
+            .collect();
+        let mut dims = shapes.iter().filter_map(|s| match s {
+            SubArrayShape::Dims(d) => Some(d),
+            _ => None,
+        });
+        if let Some(first) = dims.next()
+            && (dims.any(|d| d != first) || shapes.contains(&SubArrayShape::Absent))
+        {
+            return Err(crate::error::RawError::invalid(
+                "multidimensional arrays must have array expressions with matching dimensions"
+                    .to_string(),
+                crate::error::SourceSpan::from_location(arr.location),
+                None,
+            )
+            .finalize_implicit());
+        }
+    }
+
     let typmod = match (target, elems.first()) {
         (_, None) => None,
         (Some(tg), _) => tg.typmod,
@@ -468,6 +495,77 @@ pub(crate) fn transform_array_expr(
     Ok(ExprType::scalar_with_typmod(array_type, false, typmod)
         .with_collation(state)
         .with_elem_nullable(elem_nullable))
+}
+
+/// What the query fixes of a sub-array of a multidimensional `ARRAY[…]`.
+#[derive(PartialEq, Eq)]
+enum SubArrayShape {
+    /// NULL or an empty array, whatever the data.
+    Absent,
+    /// A non-empty array of these dimensions (lower bounds 1), whatever the
+    /// data.
+    Dims(Vec<usize>),
+    /// Depends on the data.
+    Unknown,
+}
+
+/// The [`SubArrayShape`] of `node`: an `ARRAY[…]` constructor (cast or not)
+/// over values — or over sub-arrays all of one fixed shape — a NULL, or an
+/// empty array literal.
+fn sub_array_shape(node: &protobuf::Node, ctx: Ctx<'_>, params: &ParamCollector) -> SubArrayShape {
+    match node.node.as_ref() {
+        Some(node::Node::AConst(c)) if c.isnull => SubArrayShape::Absent,
+        Some(node::Node::AConst(protobuf::AConst {
+            val: Some(a_const::Val::Sval(sv)),
+            ..
+        })) if sv.sval.trim() == "{}" => SubArrayShape::Absent,
+        Some(node::Node::TypeCast(c)) => match c.arg.as_deref() {
+            Some(arg) => sub_array_shape(arg, ctx, params),
+            None => SubArrayShape::Unknown,
+        },
+        Some(node::Node::AArrayExpr(a)) => {
+            if a.elements.is_empty() {
+                return SubArrayShape::Absent;
+            }
+            let n = a.elements.len();
+            if a.elements
+                .iter()
+                .any(|e| matches!(e.node.as_ref(), Some(node::Node::AArrayExpr(_))))
+            {
+                // Its own sub-arrays: one shape for all of them, or (all
+                // NULL / empty) an empty array.
+                let inner: Vec<SubArrayShape> = a
+                    .elements
+                    .iter()
+                    .map(|e| sub_array_shape(e, ctx, params))
+                    .collect();
+                if inner.iter().all(|s| *s == SubArrayShape::Absent) {
+                    return SubArrayShape::Absent;
+                }
+                return match inner.first() {
+                    Some(SubArrayShape::Dims(d)) if inner.iter().all(|s| *s == inner[0]) => {
+                        SubArrayShape::Dims(std::iter::once(n).chain(d.iter().copied()).collect())
+                    }
+                    _ => SubArrayShape::Unknown,
+                };
+            }
+            // Values (not arrays, which would make it multidimensional with
+            // their own shapes) make a one-dimensional array of `n`.
+            let scalar = |e: &protobuf::Node| {
+                let mut scratch = params.clone();
+                infer_expr(e, ctx, &mut scratch, TypeGoal::NONE).is_ok_and(|t| {
+                    t.type_oid != oid::UNKNOWN
+                        && array_element_type(ctx.snapshot, t.type_oid).is_none()
+                }) || matches!(e.node.as_ref(), Some(node::Node::AConst(_)))
+            };
+            if a.elements.iter().all(scalar) {
+                SubArrayShape::Dims(vec![n])
+            } else {
+                SubArrayShape::Unknown
+            }
+        }
+        _ => SubArrayShape::Unknown,
+    }
 }
 
 /// PG's `ExpandIndirectionStar` for a SELECT-list `(expr).*`: one output
