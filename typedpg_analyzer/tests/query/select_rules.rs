@@ -324,6 +324,42 @@ fn distinct_on_must_match_leading_order_by() {
     }
 }
 
+/// A cast leaving its operand as it is (the same type and typmod) is gone
+/// once PG transforms the expression, so it doesn't keep an ORDER BY
+/// item from matching the select list or the DISTINCT ON list, nor the
+/// argument list of an aggregate with DISTINCT.
+#[test]
+fn noop_casts_match_the_expression_they_cast() {
+    let db = setup_wide();
+    for sql in [
+        "SELECT DISTINCT a FROM t ORDER BY a::int",
+        "SELECT DISTINCT a::int AS x FROM t ORDER BY a",
+        "SELECT DISTINCT a + 1 AS x FROM t ORDER BY a::int + 1",
+        "SELECT DISTINCT c FROM t ORDER BY c::varchar(10)",
+        "SELECT DISTINCT ON (a::int) a, b FROM t ORDER BY a, b",
+        "SELECT DISTINCT ON (a) a, b FROM t ORDER BY a::int, b",
+        "SELECT DISTINCT ON ((a + 1)::int) a + 1 AS k, b FROM t ORDER BY a + 1, b",
+        "SELECT array_agg(DISTINCT a ORDER BY a::int) FROM t",
+        "SELECT array_agg(DISTINCT (a + 1)::int ORDER BY a + 1) FROM t",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    for sql in [
+        "SELECT DISTINCT a FROM t ORDER BY a::int8",
+        "SELECT DISTINCT c FROM t ORDER BY c::varchar",
+    ] {
+        let err = assert_err_prefix(
+            &db,
+            sql,
+            "for SELECT DISTINCT, ORDER BY expressions must appear in select list",
+        );
+        assert!(
+            matches!(err, AnalyzeError::InvalidColumnReference(_)),
+            "{sql}: {err:?}"
+        );
+    }
+}
+
 #[test]
 fn order_by_using_needs_an_ordering_operator() {
     let db = setup_wide();

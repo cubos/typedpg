@@ -3019,11 +3019,18 @@ pub(crate) fn children<'a>(node: NodeRef<'a>, out: &mut dyn FnMut(NodeRef<'a>)) 
     }
 }
 
-/// Call `out` on every direct child node of `node`.
+/// What the mutable walkers report: a `Node` field (`slot`) or a field
+/// of one node kind's own type (`node`).
+trait MutVisitor {
+    fn slot(&mut self, n: &mut protobuf::Node);
+    fn node(&mut self, n: NodeMut);
+}
+
+/// Walk the fields of `node` holding nodes.
 ///
 /// # Safety
 /// `node` must point to a live node no one else accesses.
-pub(crate) unsafe fn children_mut(node: NodeMut, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut(node: NodeMut, out: &mut dyn MutVisitor) {
     match node {
         NodeMut::Alias(m) => unsafe { walk_mut_alias(m, out) },
         NodeMut::RangeVar(m) => unsafe { walk_mut_range_var(m, out) },
@@ -3315,15 +3322,51 @@ pub(crate) unsafe fn children_mut(node: NodeMut, out: &mut dyn FnMut(NodeMut)) {
     }
 }
 
-fn visit_node<'a>(n: &'a protobuf::Node, out: &mut dyn FnMut(NodeRef<'a>)) {
-    if let Some(e) = &n.node {
-        out(e.to_ref());
+struct Children<'f>(&'f mut dyn FnMut(NodeMut));
+
+impl MutVisitor for Children<'_> {
+    fn slot(&mut self, n: &mut protobuf::Node) {
+        if let Some(e) = &mut n.node {
+            (self.0)(e.to_mut());
+        }
+    }
+    fn node(&mut self, n: NodeMut) {
+        (self.0)(n);
     }
 }
 
-fn visit_node_mut(n: &mut protobuf::Node, out: &mut dyn FnMut(NodeMut)) {
-    if let Some(e) = &mut n.node {
-        out(e.to_mut());
+/// Call `out` on every direct child node of `node`.
+///
+/// # Safety
+/// `node` must point to a live node no one else accesses.
+pub(crate) unsafe fn children_mut(node: NodeMut, out: &mut dyn FnMut(NodeMut)) {
+    unsafe { walk_mut(node, &mut Children(out)) }
+}
+
+struct Slots<'f>(&'f mut dyn FnMut(&mut protobuf::Node));
+
+impl MutVisitor for Slots<'_> {
+    fn slot(&mut self, n: &mut protobuf::Node) {
+        (self.0)(n);
+    }
+    fn node(&mut self, n: NodeMut) {
+        unsafe { walk_mut(n, self) }
+    }
+}
+
+/// Call `out` on every `Node` field below `node` reached without
+/// passing through another one: the places a child node can be
+/// replaced by a node of another kind.
+///
+/// # Safety
+/// `node` must point to a live node no one else accesses.
+pub(crate) unsafe fn child_slots_mut(node: NodeMut, out: &mut dyn FnMut(&mut protobuf::Node)) {
+    unsafe { walk_mut(node, &mut Slots(out)) }
+}
+
+fn visit_node<'a>(n: &'a protobuf::Node, out: &mut dyn FnMut(NodeRef<'a>)) {
+    if let Some(e) = &n.node {
+        out(e.to_ref());
     }
 }
 
@@ -3334,11 +3377,11 @@ fn walk_parse_result<'a>(m: &'a protobuf::ParseResult, out: &mut dyn FnMut(NodeR
     }
 }
 
-unsafe fn walk_mut_parse_result(m: *mut protobuf::ParseResult, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_parse_result(m: *mut protobuf::ParseResult, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.stmts {
         let x: &mut protobuf::RawStmt = x;
-        out(NodeMut::RawStmt(x));
+        out.node(NodeMut::RawStmt(x));
     }
 }
 
@@ -3349,7 +3392,7 @@ fn walk_scan_result<'a>(m: &'a protobuf::ScanResult, out: &mut dyn FnMut(NodeRef
     }
 }
 
-unsafe fn walk_mut_scan_result(m: *mut protobuf::ScanResult, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_scan_result(m: *mut protobuf::ScanResult, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.tokens {
         let x: &mut protobuf::ScanToken = x;
@@ -3359,31 +3402,31 @@ unsafe fn walk_mut_scan_result(m: *mut protobuf::ScanResult, out: &mut dyn FnMut
 
 fn walk_integer<'a>(m: &'a protobuf::Integer, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_integer(m: *mut protobuf::Integer, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_integer(m: *mut protobuf::Integer, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
 }
 
 fn walk_float<'a>(m: &'a protobuf::Float, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_float(m: *mut protobuf::Float, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_float(m: *mut protobuf::Float, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
 }
 
 fn walk_boolean<'a>(m: &'a protobuf::Boolean, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_boolean(m: *mut protobuf::Boolean, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_boolean(m: *mut protobuf::Boolean, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
 }
 
 fn walk_string<'a>(m: &'a protobuf::String, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_string(m: *mut protobuf::String, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_string(m: *mut protobuf::String, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
 }
 
 fn walk_bit_string<'a>(m: &'a protobuf::BitString, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_bit_string(m: *mut protobuf::BitString, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_bit_string(m: *mut protobuf::BitString, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
 }
 
@@ -3393,10 +3436,10 @@ fn walk_list<'a>(m: &'a protobuf::List, out: &mut dyn FnMut(NodeRef<'a>)) {
     }
 }
 
-unsafe fn walk_mut_list(m: *mut protobuf::List, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_list(m: *mut protobuf::List, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.items {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -3406,10 +3449,10 @@ fn walk_oid_list<'a>(m: &'a protobuf::OidList, out: &mut dyn FnMut(NodeRef<'a>))
     }
 }
 
-unsafe fn walk_mut_oid_list(m: *mut protobuf::OidList, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_oid_list(m: *mut protobuf::OidList, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.items {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -3419,10 +3462,10 @@ fn walk_int_list<'a>(m: &'a protobuf::IntList, out: &mut dyn FnMut(NodeRef<'a>))
     }
 }
 
-unsafe fn walk_mut_int_list(m: *mut protobuf::IntList, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_int_list(m: *mut protobuf::IntList, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.items {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -3452,28 +3495,28 @@ fn walk_a_const<'a>(m: &'a protobuf::AConst, out: &mut dyn FnMut(NodeRef<'a>)) {
     }
 }
 
-unsafe fn walk_mut_a_const(m: *mut protobuf::AConst, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_a_const(m: *mut protobuf::AConst, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     match &mut m.val {
         Some(protobuf::a_const::Val::Ival(x)) => {
             let x: &mut protobuf::Integer = x;
-            out(NodeMut::Integer(x));
+            out.node(NodeMut::Integer(x));
         }
         Some(protobuf::a_const::Val::Fval(x)) => {
             let x: &mut protobuf::Float = x;
-            out(NodeMut::Float(x));
+            out.node(NodeMut::Float(x));
         }
         Some(protobuf::a_const::Val::Boolval(x)) => {
             let x: &mut protobuf::Boolean = x;
-            out(NodeMut::Boolean(x));
+            out.node(NodeMut::Boolean(x));
         }
         Some(protobuf::a_const::Val::Sval(x)) => {
             let x: &mut protobuf::String = x;
-            out(NodeMut::String(x));
+            out.node(NodeMut::String(x));
         }
         Some(protobuf::a_const::Val::Bsval(x)) => {
             let x: &mut protobuf::BitString = x;
-            out(NodeMut::BitString(x));
+            out.node(NodeMut::BitString(x));
         }
         _ => {}
     }
@@ -3485,10 +3528,10 @@ fn walk_alias<'a>(m: &'a protobuf::Alias, out: &mut dyn FnMut(NodeRef<'a>)) {
     }
 }
 
-unsafe fn walk_mut_alias(m: *mut protobuf::Alias, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_alias(m: *mut protobuf::Alias, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.colnames {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -3499,11 +3542,11 @@ fn walk_range_var<'a>(m: &'a protobuf::RangeVar, out: &mut dyn FnMut(NodeRef<'a>
     }
 }
 
-unsafe fn walk_mut_range_var(m: *mut protobuf::RangeVar, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_range_var(m: *mut protobuf::RangeVar, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.alias {
         let x: &mut protobuf::Alias = x;
-        out(NodeMut::Alias(x));
+        out.node(NodeMut::Alias(x));
     }
 }
 
@@ -3549,46 +3592,46 @@ fn walk_table_func<'a>(m: &'a protobuf::TableFunc, out: &mut dyn FnMut(NodeRef<'
     }
 }
 
-unsafe fn walk_mut_table_func(m: *mut protobuf::TableFunc, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_table_func(m: *mut protobuf::TableFunc, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.ns_uris {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.ns_names {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.docexpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.rowexpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.colnames {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.coltypes {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.coltypmods {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.colcollations {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.colexprs {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.coldefexprs {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.colvalexprs {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.passingvalexprs {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.plan {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -3609,21 +3652,21 @@ fn walk_into_clause<'a>(m: &'a protobuf::IntoClause, out: &mut dyn FnMut(NodeRef
     }
 }
 
-unsafe fn walk_mut_into_clause(m: *mut protobuf::IntoClause, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_into_clause(m: *mut protobuf::IntoClause, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.rel {
         let x: &mut protobuf::RangeVar = x;
-        out(NodeMut::RangeVar(x));
+        out.node(NodeMut::RangeVar(x));
     }
     for x in &mut m.col_names {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.options {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.view_query {
         let x: &mut protobuf::Query = x;
-        out(NodeMut::Query(x));
+        out.node(NodeMut::Query(x));
     }
 }
 
@@ -3633,10 +3676,10 @@ fn walk_var<'a>(m: &'a protobuf::Var, out: &mut dyn FnMut(NodeRef<'a>)) {
     }
 }
 
-unsafe fn walk_mut_var(m: *mut protobuf::Var, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_var(m: *mut protobuf::Var, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.xpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -3646,10 +3689,10 @@ fn walk_param<'a>(m: &'a protobuf::Param, out: &mut dyn FnMut(NodeRef<'a>)) {
     }
 }
 
-unsafe fn walk_mut_param(m: *mut protobuf::Param, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_param(m: *mut protobuf::Param, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.xpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -3677,28 +3720,28 @@ fn walk_aggref<'a>(m: &'a protobuf::Aggref, out: &mut dyn FnMut(NodeRef<'a>)) {
     }
 }
 
-unsafe fn walk_mut_aggref(m: *mut protobuf::Aggref, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_aggref(m: *mut protobuf::Aggref, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.xpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.aggargtypes {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.aggdirectargs {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.args {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.aggorder {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.aggdistinct {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.aggfilter {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -3714,16 +3757,16 @@ fn walk_grouping_func<'a>(m: &'a protobuf::GroupingFunc, out: &mut dyn FnMut(Nod
     }
 }
 
-unsafe fn walk_mut_grouping_func(m: *mut protobuf::GroupingFunc, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_grouping_func(m: *mut protobuf::GroupingFunc, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.xpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.args {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.refs {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -3742,19 +3785,19 @@ fn walk_window_func<'a>(m: &'a protobuf::WindowFunc, out: &mut dyn FnMut(NodeRef
     }
 }
 
-unsafe fn walk_mut_window_func(m: *mut protobuf::WindowFunc, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_window_func(m: *mut protobuf::WindowFunc, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.xpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.args {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.aggfilter {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.run_condition {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -3772,14 +3815,14 @@ fn walk_window_func_run_condition<'a>(
 
 unsafe fn walk_mut_window_func_run_condition(
     m: *mut protobuf::WindowFuncRunCondition,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.xpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.arg {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -3794,11 +3837,11 @@ fn walk_merge_support_func<'a>(
 
 unsafe fn walk_mut_merge_support_func(
     m: *mut protobuf::MergeSupportFunc,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.xpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -3820,25 +3863,22 @@ fn walk_subscripting_ref<'a>(m: &'a protobuf::SubscriptingRef, out: &mut dyn FnM
     }
 }
 
-unsafe fn walk_mut_subscripting_ref(
-    m: *mut protobuf::SubscriptingRef,
-    out: &mut dyn FnMut(NodeMut),
-) {
+unsafe fn walk_mut_subscripting_ref(m: *mut protobuf::SubscriptingRef, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.xpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.refupperindexpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.reflowerindexpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.refexpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.refassgnexpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -3851,13 +3891,13 @@ fn walk_func_expr<'a>(m: &'a protobuf::FuncExpr, out: &mut dyn FnMut(NodeRef<'a>
     }
 }
 
-unsafe fn walk_mut_func_expr(m: *mut protobuf::FuncExpr, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_func_expr(m: *mut protobuf::FuncExpr, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.xpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.args {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -3870,13 +3910,13 @@ fn walk_named_arg_expr<'a>(m: &'a protobuf::NamedArgExpr, out: &mut dyn FnMut(No
     }
 }
 
-unsafe fn walk_mut_named_arg_expr(m: *mut protobuf::NamedArgExpr, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_named_arg_expr(m: *mut protobuf::NamedArgExpr, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.xpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.arg {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -3889,13 +3929,13 @@ fn walk_op_expr<'a>(m: &'a protobuf::OpExpr, out: &mut dyn FnMut(NodeRef<'a>)) {
     }
 }
 
-unsafe fn walk_mut_op_expr(m: *mut protobuf::OpExpr, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_op_expr(m: *mut protobuf::OpExpr, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.xpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.args {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -3908,13 +3948,13 @@ fn walk_distinct_expr<'a>(m: &'a protobuf::DistinctExpr, out: &mut dyn FnMut(Nod
     }
 }
 
-unsafe fn walk_mut_distinct_expr(m: *mut protobuf::DistinctExpr, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_distinct_expr(m: *mut protobuf::DistinctExpr, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.xpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.args {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -3927,13 +3967,13 @@ fn walk_null_if_expr<'a>(m: &'a protobuf::NullIfExpr, out: &mut dyn FnMut(NodeRe
     }
 }
 
-unsafe fn walk_mut_null_if_expr(m: *mut protobuf::NullIfExpr, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_null_if_expr(m: *mut protobuf::NullIfExpr, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.xpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.args {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -3951,14 +3991,14 @@ fn walk_scalar_array_op_expr<'a>(
 
 unsafe fn walk_mut_scalar_array_op_expr(
     m: *mut protobuf::ScalarArrayOpExpr,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.xpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.args {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -3971,13 +4011,13 @@ fn walk_bool_expr<'a>(m: &'a protobuf::BoolExpr, out: &mut dyn FnMut(NodeRef<'a>
     }
 }
 
-unsafe fn walk_mut_bool_expr(m: *mut protobuf::BoolExpr, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_bool_expr(m: *mut protobuf::BoolExpr, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.xpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.args {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -3996,19 +4036,19 @@ fn walk_sub_link<'a>(m: &'a protobuf::SubLink, out: &mut dyn FnMut(NodeRef<'a>))
     }
 }
 
-unsafe fn walk_mut_sub_link(m: *mut protobuf::SubLink, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_sub_link(m: *mut protobuf::SubLink, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.xpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.testexpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.oper_name {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.subselect {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -4033,25 +4073,25 @@ fn walk_sub_plan<'a>(m: &'a protobuf::SubPlan, out: &mut dyn FnMut(NodeRef<'a>))
     }
 }
 
-unsafe fn walk_mut_sub_plan(m: *mut protobuf::SubPlan, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_sub_plan(m: *mut protobuf::SubPlan, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.xpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.testexpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.param_ids {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.set_param {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.par_param {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.args {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -4069,14 +4109,14 @@ fn walk_alternative_sub_plan<'a>(
 
 unsafe fn walk_mut_alternative_sub_plan(
     m: *mut protobuf::AlternativeSubPlan,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.xpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.subplans {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -4089,13 +4129,13 @@ fn walk_field_select<'a>(m: &'a protobuf::FieldSelect, out: &mut dyn FnMut(NodeR
     }
 }
 
-unsafe fn walk_mut_field_select(m: *mut protobuf::FieldSelect, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_field_select(m: *mut protobuf::FieldSelect, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.xpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.arg {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -4114,19 +4154,19 @@ fn walk_field_store<'a>(m: &'a protobuf::FieldStore, out: &mut dyn FnMut(NodeRef
     }
 }
 
-unsafe fn walk_mut_field_store(m: *mut protobuf::FieldStore, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_field_store(m: *mut protobuf::FieldStore, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.xpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.arg {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.newvals {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.fieldnums {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -4139,13 +4179,13 @@ fn walk_relabel_type<'a>(m: &'a protobuf::RelabelType, out: &mut dyn FnMut(NodeR
     }
 }
 
-unsafe fn walk_mut_relabel_type(m: *mut protobuf::RelabelType, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_relabel_type(m: *mut protobuf::RelabelType, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.xpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.arg {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -4158,13 +4198,13 @@ fn walk_coerce_via_io<'a>(m: &'a protobuf::CoerceViaIo, out: &mut dyn FnMut(Node
     }
 }
 
-unsafe fn walk_mut_coerce_via_io(m: *mut protobuf::CoerceViaIo, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_coerce_via_io(m: *mut protobuf::CoerceViaIo, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.xpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.arg {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -4180,19 +4220,16 @@ fn walk_array_coerce_expr<'a>(m: &'a protobuf::ArrayCoerceExpr, out: &mut dyn Fn
     }
 }
 
-unsafe fn walk_mut_array_coerce_expr(
-    m: *mut protobuf::ArrayCoerceExpr,
-    out: &mut dyn FnMut(NodeMut),
-) {
+unsafe fn walk_mut_array_coerce_expr(m: *mut protobuf::ArrayCoerceExpr, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.xpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.arg {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.elemexpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -4210,14 +4247,14 @@ fn walk_convert_rowtype_expr<'a>(
 
 unsafe fn walk_mut_convert_rowtype_expr(
     m: *mut protobuf::ConvertRowtypeExpr,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.xpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.arg {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -4230,13 +4267,13 @@ fn walk_collate_expr<'a>(m: &'a protobuf::CollateExpr, out: &mut dyn FnMut(NodeR
     }
 }
 
-unsafe fn walk_mut_collate_expr(m: *mut protobuf::CollateExpr, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_collate_expr(m: *mut protobuf::CollateExpr, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.xpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.arg {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -4255,19 +4292,19 @@ fn walk_case_expr<'a>(m: &'a protobuf::CaseExpr, out: &mut dyn FnMut(NodeRef<'a>
     }
 }
 
-unsafe fn walk_mut_case_expr(m: *mut protobuf::CaseExpr, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_case_expr(m: *mut protobuf::CaseExpr, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.xpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.arg {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.args {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.defresult {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -4283,16 +4320,16 @@ fn walk_case_when<'a>(m: &'a protobuf::CaseWhen, out: &mut dyn FnMut(NodeRef<'a>
     }
 }
 
-unsafe fn walk_mut_case_when(m: *mut protobuf::CaseWhen, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_case_when(m: *mut protobuf::CaseWhen, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.xpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.expr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.result {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -4302,10 +4339,10 @@ fn walk_case_test_expr<'a>(m: &'a protobuf::CaseTestExpr, out: &mut dyn FnMut(No
     }
 }
 
-unsafe fn walk_mut_case_test_expr(m: *mut protobuf::CaseTestExpr, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_case_test_expr(m: *mut protobuf::CaseTestExpr, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.xpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -4318,13 +4355,13 @@ fn walk_array_expr<'a>(m: &'a protobuf::ArrayExpr, out: &mut dyn FnMut(NodeRef<'
     }
 }
 
-unsafe fn walk_mut_array_expr(m: *mut protobuf::ArrayExpr, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_array_expr(m: *mut protobuf::ArrayExpr, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.xpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.elements {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -4340,16 +4377,16 @@ fn walk_row_expr<'a>(m: &'a protobuf::RowExpr, out: &mut dyn FnMut(NodeRef<'a>))
     }
 }
 
-unsafe fn walk_mut_row_expr(m: *mut protobuf::RowExpr, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_row_expr(m: *mut protobuf::RowExpr, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.xpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.args {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.colnames {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -4374,28 +4411,25 @@ fn walk_row_compare_expr<'a>(m: &'a protobuf::RowCompareExpr, out: &mut dyn FnMu
     }
 }
 
-unsafe fn walk_mut_row_compare_expr(
-    m: *mut protobuf::RowCompareExpr,
-    out: &mut dyn FnMut(NodeMut),
-) {
+unsafe fn walk_mut_row_compare_expr(m: *mut protobuf::RowCompareExpr, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.xpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.opnos {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.opfamilies {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.inputcollids {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.largs {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.rargs {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -4408,13 +4442,13 @@ fn walk_coalesce_expr<'a>(m: &'a protobuf::CoalesceExpr, out: &mut dyn FnMut(Nod
     }
 }
 
-unsafe fn walk_mut_coalesce_expr(m: *mut protobuf::CoalesceExpr, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_coalesce_expr(m: *mut protobuf::CoalesceExpr, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.xpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.args {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -4427,13 +4461,13 @@ fn walk_min_max_expr<'a>(m: &'a protobuf::MinMaxExpr, out: &mut dyn FnMut(NodeRe
     }
 }
 
-unsafe fn walk_mut_min_max_expr(m: *mut protobuf::MinMaxExpr, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_min_max_expr(m: *mut protobuf::MinMaxExpr, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.xpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.args {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -4448,11 +4482,11 @@ fn walk_sql_value_function<'a>(
 
 unsafe fn walk_mut_sql_value_function(
     m: *mut protobuf::SqlValueFunction,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.xpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -4471,25 +4505,25 @@ fn walk_xml_expr<'a>(m: &'a protobuf::XmlExpr, out: &mut dyn FnMut(NodeRef<'a>))
     }
 }
 
-unsafe fn walk_mut_xml_expr(m: *mut protobuf::XmlExpr, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_xml_expr(m: *mut protobuf::XmlExpr, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.xpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.named_args {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.arg_names {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.args {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
 fn walk_json_format<'a>(m: &'a protobuf::JsonFormat, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_json_format(m: *mut protobuf::JsonFormat, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_json_format(m: *mut protobuf::JsonFormat, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
 }
 
@@ -4500,11 +4534,11 @@ fn walk_json_returning<'a>(m: &'a protobuf::JsonReturning, out: &mut dyn FnMut(N
     }
 }
 
-unsafe fn walk_mut_json_returning(m: *mut protobuf::JsonReturning, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_json_returning(m: *mut protobuf::JsonReturning, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.format {
         let x: &mut protobuf::JsonFormat = x;
-        out(NodeMut::JsonFormat(x));
+        out.node(NodeMut::JsonFormat(x));
     }
 }
 
@@ -4521,17 +4555,17 @@ fn walk_json_value_expr<'a>(m: &'a protobuf::JsonValueExpr, out: &mut dyn FnMut(
     }
 }
 
-unsafe fn walk_mut_json_value_expr(m: *mut protobuf::JsonValueExpr, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_json_value_expr(m: *mut protobuf::JsonValueExpr, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.raw_expr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.formatted_expr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.format {
         let x: &mut protobuf::JsonFormat = x;
-        out(NodeMut::JsonFormat(x));
+        out.node(NodeMut::JsonFormat(x));
     }
 }
 
@@ -4559,24 +4593,24 @@ fn walk_json_constructor_expr<'a>(
 
 unsafe fn walk_mut_json_constructor_expr(
     m: *mut protobuf::JsonConstructorExpr,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.xpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.args {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.func {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.coercion {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.returning {
         let x: &mut protobuf::JsonReturning = x;
-        out(NodeMut::JsonReturning(x));
+        out.node(NodeMut::JsonReturning(x));
     }
 }
 
@@ -4590,17 +4624,14 @@ fn walk_json_is_predicate<'a>(m: &'a protobuf::JsonIsPredicate, out: &mut dyn Fn
     }
 }
 
-unsafe fn walk_mut_json_is_predicate(
-    m: *mut protobuf::JsonIsPredicate,
-    out: &mut dyn FnMut(NodeMut),
-) {
+unsafe fn walk_mut_json_is_predicate(m: *mut protobuf::JsonIsPredicate, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.expr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.format {
         let x: &mut protobuf::JsonFormat = x;
-        out(NodeMut::JsonFormat(x));
+        out.node(NodeMut::JsonFormat(x));
     }
 }
 
@@ -4610,10 +4641,10 @@ fn walk_json_behavior<'a>(m: &'a protobuf::JsonBehavior, out: &mut dyn FnMut(Nod
     }
 }
 
-unsafe fn walk_mut_json_behavior(m: *mut protobuf::JsonBehavior, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_json_behavior(m: *mut protobuf::JsonBehavior, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.expr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -4651,44 +4682,44 @@ fn walk_json_expr<'a>(m: &'a protobuf::JsonExpr, out: &mut dyn FnMut(NodeRef<'a>
     }
 }
 
-unsafe fn walk_mut_json_expr(m: *mut protobuf::JsonExpr, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_json_expr(m: *mut protobuf::JsonExpr, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.xpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.formatted_expr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.format {
         let x: &mut protobuf::JsonFormat = x;
-        out(NodeMut::JsonFormat(x));
+        out.node(NodeMut::JsonFormat(x));
     }
     if let Some(x) = &mut m.path_spec {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.returning {
         let x: &mut protobuf::JsonReturning = x;
-        out(NodeMut::JsonReturning(x));
+        out.node(NodeMut::JsonReturning(x));
     }
     for x in &mut m.passing_names {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.passing_values {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.on_empty {
         let x: &mut protobuf::JsonBehavior = x;
-        out(NodeMut::JsonBehavior(x));
+        out.node(NodeMut::JsonBehavior(x));
     }
     if let Some(x) = &mut m.on_error {
         let x: &mut protobuf::JsonBehavior = x;
-        out(NodeMut::JsonBehavior(x));
+        out.node(NodeMut::JsonBehavior(x));
     }
 }
 
 fn walk_json_table_path<'a>(m: &'a protobuf::JsonTablePath, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_json_table_path(m: *mut protobuf::JsonTablePath, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_json_table_path(m: *mut protobuf::JsonTablePath, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
 }
 
@@ -4710,18 +4741,18 @@ fn walk_json_table_path_scan<'a>(
 
 unsafe fn walk_mut_json_table_path_scan(
     m: *mut protobuf::JsonTablePathScan,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.plan {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.path {
         let x: &mut protobuf::JsonTablePath = x;
-        out(NodeMut::JsonTablePath(x));
+        out.node(NodeMut::JsonTablePath(x));
     }
     if let Some(x) = &mut m.child {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -4742,17 +4773,17 @@ fn walk_json_table_sibling_join<'a>(
 
 unsafe fn walk_mut_json_table_sibling_join(
     m: *mut protobuf::JsonTableSiblingJoin,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.plan {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.lplan {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.rplan {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -4765,13 +4796,13 @@ fn walk_null_test<'a>(m: &'a protobuf::NullTest, out: &mut dyn FnMut(NodeRef<'a>
     }
 }
 
-unsafe fn walk_mut_null_test(m: *mut protobuf::NullTest, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_null_test(m: *mut protobuf::NullTest, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.xpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.arg {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -4784,13 +4815,13 @@ fn walk_boolean_test<'a>(m: &'a protobuf::BooleanTest, out: &mut dyn FnMut(NodeR
     }
 }
 
-unsafe fn walk_mut_boolean_test(m: *mut protobuf::BooleanTest, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_boolean_test(m: *mut protobuf::BooleanTest, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.xpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.arg {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -4806,16 +4837,16 @@ fn walk_merge_action<'a>(m: &'a protobuf::MergeAction, out: &mut dyn FnMut(NodeR
     }
 }
 
-unsafe fn walk_mut_merge_action(m: *mut protobuf::MergeAction, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_merge_action(m: *mut protobuf::MergeAction, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.qual {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.target_list {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.update_colnos {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -4828,16 +4859,13 @@ fn walk_coerce_to_domain<'a>(m: &'a protobuf::CoerceToDomain, out: &mut dyn FnMu
     }
 }
 
-unsafe fn walk_mut_coerce_to_domain(
-    m: *mut protobuf::CoerceToDomain,
-    out: &mut dyn FnMut(NodeMut),
-) {
+unsafe fn walk_mut_coerce_to_domain(m: *mut protobuf::CoerceToDomain, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.xpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.arg {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -4852,11 +4880,11 @@ fn walk_coerce_to_domain_value<'a>(
 
 unsafe fn walk_mut_coerce_to_domain_value(
     m: *mut protobuf::CoerceToDomainValue,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.xpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -4866,10 +4894,10 @@ fn walk_set_to_default<'a>(m: &'a protobuf::SetToDefault, out: &mut dyn FnMut(No
     }
 }
 
-unsafe fn walk_mut_set_to_default(m: *mut protobuf::SetToDefault, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_set_to_default(m: *mut protobuf::SetToDefault, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.xpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -4879,10 +4907,10 @@ fn walk_current_of_expr<'a>(m: &'a protobuf::CurrentOfExpr, out: &mut dyn FnMut(
     }
 }
 
-unsafe fn walk_mut_current_of_expr(m: *mut protobuf::CurrentOfExpr, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_current_of_expr(m: *mut protobuf::CurrentOfExpr, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.xpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -4892,10 +4920,10 @@ fn walk_next_value_expr<'a>(m: &'a protobuf::NextValueExpr, out: &mut dyn FnMut(
     }
 }
 
-unsafe fn walk_mut_next_value_expr(m: *mut protobuf::NextValueExpr, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_next_value_expr(m: *mut protobuf::NextValueExpr, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.xpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -4908,13 +4936,13 @@ fn walk_inference_elem<'a>(m: &'a protobuf::InferenceElem, out: &mut dyn FnMut(N
     }
 }
 
-unsafe fn walk_mut_inference_elem(m: *mut protobuf::InferenceElem, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_inference_elem(m: *mut protobuf::InferenceElem, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.xpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.expr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -4927,13 +4955,13 @@ fn walk_returning_expr<'a>(m: &'a protobuf::ReturningExpr, out: &mut dyn FnMut(N
     }
 }
 
-unsafe fn walk_mut_returning_expr(m: *mut protobuf::ReturningExpr, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_returning_expr(m: *mut protobuf::ReturningExpr, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.xpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.retexpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -4946,19 +4974,19 @@ fn walk_target_entry<'a>(m: &'a protobuf::TargetEntry, out: &mut dyn FnMut(NodeR
     }
 }
 
-unsafe fn walk_mut_target_entry(m: *mut protobuf::TargetEntry, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_target_entry(m: *mut protobuf::TargetEntry, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.xpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.expr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
 fn walk_range_tbl_ref<'a>(m: &'a protobuf::RangeTblRef, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_range_tbl_ref(m: *mut protobuf::RangeTblRef, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_range_tbl_ref(m: *mut protobuf::RangeTblRef, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
 }
 
@@ -4985,27 +5013,27 @@ fn walk_join_expr<'a>(m: &'a protobuf::JoinExpr, out: &mut dyn FnMut(NodeRef<'a>
     }
 }
 
-unsafe fn walk_mut_join_expr(m: *mut protobuf::JoinExpr, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_join_expr(m: *mut protobuf::JoinExpr, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.larg {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.rarg {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.using_clause {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.join_using_alias {
         let x: &mut protobuf::Alias = x;
-        out(NodeMut::Alias(x));
+        out.node(NodeMut::Alias(x));
     }
     if let Some(x) = &mut m.quals {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.alias {
         let x: &mut protobuf::Alias = x;
-        out(NodeMut::Alias(x));
+        out.node(NodeMut::Alias(x));
     }
 }
 
@@ -5018,13 +5046,13 @@ fn walk_from_expr<'a>(m: &'a protobuf::FromExpr, out: &mut dyn FnMut(NodeRef<'a>
     }
 }
 
-unsafe fn walk_mut_from_expr(m: *mut protobuf::FromExpr, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_from_expr(m: *mut protobuf::FromExpr, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.fromlist {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.quals {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -5046,25 +5074,22 @@ fn walk_on_conflict_expr<'a>(m: &'a protobuf::OnConflictExpr, out: &mut dyn FnMu
     }
 }
 
-unsafe fn walk_mut_on_conflict_expr(
-    m: *mut protobuf::OnConflictExpr,
-    out: &mut dyn FnMut(NodeMut),
-) {
+unsafe fn walk_mut_on_conflict_expr(m: *mut protobuf::OnConflictExpr, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.arbiter_elems {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.arbiter_where {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.on_conflict_set {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.on_conflict_where {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.excl_rel_tlist {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -5139,75 +5164,75 @@ fn walk_query<'a>(m: &'a protobuf::Query, out: &mut dyn FnMut(NodeRef<'a>)) {
     }
 }
 
-unsafe fn walk_mut_query(m: *mut protobuf::Query, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_query(m: *mut protobuf::Query, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.utility_stmt {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.cte_list {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.rtable {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.rteperminfos {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.jointree {
         let x: &mut protobuf::FromExpr = x;
-        out(NodeMut::FromExpr(x));
+        out.node(NodeMut::FromExpr(x));
     }
     for x in &mut m.merge_action_list {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.merge_join_condition {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.target_list {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.on_conflict {
         let x: &mut protobuf::OnConflictExpr = x;
-        out(NodeMut::OnConflictExpr(x));
+        out.node(NodeMut::OnConflictExpr(x));
     }
     for x in &mut m.returning_list {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.group_clause {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.grouping_sets {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.having_qual {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.window_clause {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.distinct_clause {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.sort_clause {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.limit_offset {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.limit_count {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.row_marks {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.set_operations {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.constraint_deps {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.with_check_options {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -5223,16 +5248,16 @@ fn walk_type_name<'a>(m: &'a protobuf::TypeName, out: &mut dyn FnMut(NodeRef<'a>
     }
 }
 
-unsafe fn walk_mut_type_name(m: *mut protobuf::TypeName, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_type_name(m: *mut protobuf::TypeName, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.names {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.typmods {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.array_bounds {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -5242,16 +5267,16 @@ fn walk_column_ref<'a>(m: &'a protobuf::ColumnRef, out: &mut dyn FnMut(NodeRef<'
     }
 }
 
-unsafe fn walk_mut_column_ref(m: *mut protobuf::ColumnRef, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_column_ref(m: *mut protobuf::ColumnRef, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.fields {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
 fn walk_param_ref<'a>(m: &'a protobuf::ParamRef, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_param_ref(m: *mut protobuf::ParamRef, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_param_ref(m: *mut protobuf::ParamRef, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
 }
 
@@ -5267,16 +5292,16 @@ fn walk_a_expr<'a>(m: &'a protobuf::AExpr, out: &mut dyn FnMut(NodeRef<'a>)) {
     }
 }
 
-unsafe fn walk_mut_a_expr(m: *mut protobuf::AExpr, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_a_expr(m: *mut protobuf::AExpr, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.name {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.lexpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.rexpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -5290,14 +5315,14 @@ fn walk_type_cast<'a>(m: &'a protobuf::TypeCast, out: &mut dyn FnMut(NodeRef<'a>
     }
 }
 
-unsafe fn walk_mut_type_cast(m: *mut protobuf::TypeCast, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_type_cast(m: *mut protobuf::TypeCast, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.arg {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.type_name {
         let x: &mut protobuf::TypeName = x;
-        out(NodeMut::TypeName(x));
+        out.node(NodeMut::TypeName(x));
     }
 }
 
@@ -5310,19 +5335,19 @@ fn walk_collate_clause<'a>(m: &'a protobuf::CollateClause, out: &mut dyn FnMut(N
     }
 }
 
-unsafe fn walk_mut_collate_clause(m: *mut protobuf::CollateClause, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_collate_clause(m: *mut protobuf::CollateClause, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.arg {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.collname {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
 fn walk_role_spec<'a>(m: &'a protobuf::RoleSpec, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_role_spec(m: *mut protobuf::RoleSpec, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_role_spec(m: *mut protobuf::RoleSpec, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
 }
 
@@ -5345,29 +5370,29 @@ fn walk_func_call<'a>(m: &'a protobuf::FuncCall, out: &mut dyn FnMut(NodeRef<'a>
     }
 }
 
-unsafe fn walk_mut_func_call(m: *mut protobuf::FuncCall, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_func_call(m: *mut protobuf::FuncCall, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.funcname {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.args {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.agg_order {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.agg_filter {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.over {
         let x: &mut protobuf::WindowDef = x;
-        out(NodeMut::WindowDef(x));
+        out.node(NodeMut::WindowDef(x));
     }
 }
 
 fn walk_a_star<'a>(m: &'a protobuf::AStar, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_a_star(m: *mut protobuf::AStar, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_a_star(m: *mut protobuf::AStar, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
 }
 
@@ -5380,13 +5405,13 @@ fn walk_a_indices<'a>(m: &'a protobuf::AIndices, out: &mut dyn FnMut(NodeRef<'a>
     }
 }
 
-unsafe fn walk_mut_a_indices(m: *mut protobuf::AIndices, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_a_indices(m: *mut protobuf::AIndices, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.lidx {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.uidx {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -5399,13 +5424,13 @@ fn walk_a_indirection<'a>(m: &'a protobuf::AIndirection, out: &mut dyn FnMut(Nod
     }
 }
 
-unsafe fn walk_mut_a_indirection(m: *mut protobuf::AIndirection, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_a_indirection(m: *mut protobuf::AIndirection, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.arg {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.indirection {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -5415,10 +5440,10 @@ fn walk_a_array_expr<'a>(m: &'a protobuf::AArrayExpr, out: &mut dyn FnMut(NodeRe
     }
 }
 
-unsafe fn walk_mut_a_array_expr(m: *mut protobuf::AArrayExpr, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_a_array_expr(m: *mut protobuf::AArrayExpr, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.elements {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -5431,13 +5456,13 @@ fn walk_res_target<'a>(m: &'a protobuf::ResTarget, out: &mut dyn FnMut(NodeRef<'
     }
 }
 
-unsafe fn walk_mut_res_target(m: *mut protobuf::ResTarget, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_res_target(m: *mut protobuf::ResTarget, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.indirection {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.val {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -5447,13 +5472,10 @@ fn walk_multi_assign_ref<'a>(m: &'a protobuf::MultiAssignRef, out: &mut dyn FnMu
     }
 }
 
-unsafe fn walk_mut_multi_assign_ref(
-    m: *mut protobuf::MultiAssignRef,
-    out: &mut dyn FnMut(NodeMut),
-) {
+unsafe fn walk_mut_multi_assign_ref(m: *mut protobuf::MultiAssignRef, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.source {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -5466,13 +5488,13 @@ fn walk_sort_by<'a>(m: &'a protobuf::SortBy, out: &mut dyn FnMut(NodeRef<'a>)) {
     }
 }
 
-unsafe fn walk_mut_sort_by(m: *mut protobuf::SortBy, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_sort_by(m: *mut protobuf::SortBy, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.node {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.use_op {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -5491,19 +5513,19 @@ fn walk_window_def<'a>(m: &'a protobuf::WindowDef, out: &mut dyn FnMut(NodeRef<'
     }
 }
 
-unsafe fn walk_mut_window_def(m: *mut protobuf::WindowDef, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_window_def(m: *mut protobuf::WindowDef, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.partition_clause {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.order_clause {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.start_offset {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.end_offset {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -5517,14 +5539,14 @@ fn walk_range_subselect<'a>(m: &'a protobuf::RangeSubselect, out: &mut dyn FnMut
     }
 }
 
-unsafe fn walk_mut_range_subselect(m: *mut protobuf::RangeSubselect, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_range_subselect(m: *mut protobuf::RangeSubselect, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.subquery {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.alias {
         let x: &mut protobuf::Alias = x;
-        out(NodeMut::Alias(x));
+        out.node(NodeMut::Alias(x));
     }
 }
 
@@ -5541,17 +5563,17 @@ fn walk_range_function<'a>(m: &'a protobuf::RangeFunction, out: &mut dyn FnMut(N
     }
 }
 
-unsafe fn walk_mut_range_function(m: *mut protobuf::RangeFunction, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_range_function(m: *mut protobuf::RangeFunction, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.functions {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.alias {
         let x: &mut protobuf::Alias = x;
-        out(NodeMut::Alias(x));
+        out.node(NodeMut::Alias(x));
     }
     for x in &mut m.coldeflist {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -5574,26 +5596,23 @@ fn walk_range_table_func<'a>(m: &'a protobuf::RangeTableFunc, out: &mut dyn FnMu
     }
 }
 
-unsafe fn walk_mut_range_table_func(
-    m: *mut protobuf::RangeTableFunc,
-    out: &mut dyn FnMut(NodeMut),
-) {
+unsafe fn walk_mut_range_table_func(m: *mut protobuf::RangeTableFunc, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.docexpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.rowexpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.namespaces {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.columns {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.alias {
         let x: &mut protobuf::Alias = x;
-        out(NodeMut::Alias(x));
+        out.node(NodeMut::Alias(x));
     }
 }
 
@@ -5615,18 +5634,18 @@ fn walk_range_table_func_col<'a>(
 
 unsafe fn walk_mut_range_table_func_col(
     m: *mut protobuf::RangeTableFuncCol,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.type_name {
         let x: &mut protobuf::TypeName = x;
-        out(NodeMut::TypeName(x));
+        out.node(NodeMut::TypeName(x));
     }
     if let Some(x) = &mut m.colexpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.coldefexpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -5650,20 +5669,20 @@ fn walk_range_table_sample<'a>(
 
 unsafe fn walk_mut_range_table_sample(
     m: *mut protobuf::RangeTableSample,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.relation {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.method {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.args {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.repeatable {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -5694,31 +5713,31 @@ fn walk_column_def<'a>(m: &'a protobuf::ColumnDef, out: &mut dyn FnMut(NodeRef<'
     }
 }
 
-unsafe fn walk_mut_column_def(m: *mut protobuf::ColumnDef, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_column_def(m: *mut protobuf::ColumnDef, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.type_name {
         let x: &mut protobuf::TypeName = x;
-        out(NodeMut::TypeName(x));
+        out.node(NodeMut::TypeName(x));
     }
     if let Some(x) = &mut m.raw_default {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.cooked_default {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.identity_sequence {
         let x: &mut protobuf::RangeVar = x;
-        out(NodeMut::RangeVar(x));
+        out.node(NodeMut::RangeVar(x));
     }
     if let Some(x) = &mut m.coll_clause {
         let x: &mut protobuf::CollateClause = x;
-        out(NodeMut::CollateClause(x));
+        out.node(NodeMut::CollateClause(x));
     }
     for x in &mut m.constraints {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.fdwoptions {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -5729,14 +5748,11 @@ fn walk_table_like_clause<'a>(m: &'a protobuf::TableLikeClause, out: &mut dyn Fn
     }
 }
 
-unsafe fn walk_mut_table_like_clause(
-    m: *mut protobuf::TableLikeClause,
-    out: &mut dyn FnMut(NodeMut),
-) {
+unsafe fn walk_mut_table_like_clause(m: *mut protobuf::TableLikeClause, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.relation {
         let x: &mut protobuf::RangeVar = x;
-        out(NodeMut::RangeVar(x));
+        out.node(NodeMut::RangeVar(x));
     }
 }
 
@@ -5755,19 +5771,19 @@ fn walk_index_elem<'a>(m: &'a protobuf::IndexElem, out: &mut dyn FnMut(NodeRef<'
     }
 }
 
-unsafe fn walk_mut_index_elem(m: *mut protobuf::IndexElem, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_index_elem(m: *mut protobuf::IndexElem, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.expr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.collation {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.opclass {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.opclassopts {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -5777,10 +5793,10 @@ fn walk_def_elem<'a>(m: &'a protobuf::DefElem, out: &mut dyn FnMut(NodeRef<'a>))
     }
 }
 
-unsafe fn walk_mut_def_elem(m: *mut protobuf::DefElem, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_def_elem(m: *mut protobuf::DefElem, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.arg {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -5790,10 +5806,10 @@ fn walk_locking_clause<'a>(m: &'a protobuf::LockingClause, out: &mut dyn FnMut(N
     }
 }
 
-unsafe fn walk_mut_locking_clause(m: *mut protobuf::LockingClause, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_locking_clause(m: *mut protobuf::LockingClause, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.locked_rels {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -5807,14 +5823,14 @@ fn walk_xml_serialize<'a>(m: &'a protobuf::XmlSerialize, out: &mut dyn FnMut(Nod
     }
 }
 
-unsafe fn walk_mut_xml_serialize(m: *mut protobuf::XmlSerialize, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_xml_serialize(m: *mut protobuf::XmlSerialize, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.expr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.type_name {
         let x: &mut protobuf::TypeName = x;
-        out(NodeMut::TypeName(x));
+        out.node(NodeMut::TypeName(x));
     }
 }
 
@@ -5830,16 +5846,16 @@ fn walk_partition_elem<'a>(m: &'a protobuf::PartitionElem, out: &mut dyn FnMut(N
     }
 }
 
-unsafe fn walk_mut_partition_elem(m: *mut protobuf::PartitionElem, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_partition_elem(m: *mut protobuf::PartitionElem, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.expr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.collation {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.opclass {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -5849,10 +5865,10 @@ fn walk_partition_spec<'a>(m: &'a protobuf::PartitionSpec, out: &mut dyn FnMut(N
     }
 }
 
-unsafe fn walk_mut_partition_spec(m: *mut protobuf::PartitionSpec, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_partition_spec(m: *mut protobuf::PartitionSpec, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.part_params {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -5873,17 +5889,17 @@ fn walk_partition_bound_spec<'a>(
 
 unsafe fn walk_mut_partition_bound_spec(
     m: *mut protobuf::PartitionBoundSpec,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     for x in &mut m.listdatums {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.lowerdatums {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.upperdatums {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -5898,11 +5914,11 @@ fn walk_partition_range_datum<'a>(
 
 unsafe fn walk_mut_partition_range_datum(
     m: *mut protobuf::PartitionRangeDatum,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.value {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -5917,15 +5933,15 @@ fn walk_partition_cmd<'a>(m: &'a protobuf::PartitionCmd, out: &mut dyn FnMut(Nod
     }
 }
 
-unsafe fn walk_mut_partition_cmd(m: *mut protobuf::PartitionCmd, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_partition_cmd(m: *mut protobuf::PartitionCmd, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.name {
         let x: &mut protobuf::RangeVar = x;
-        out(NodeMut::RangeVar(x));
+        out.node(NodeMut::RangeVar(x));
     }
     if let Some(x) = &mut m.bound {
         let x: &mut protobuf::PartitionBoundSpec = x;
-        out(NodeMut::PartitionBoundSpec(x));
+        out.node(NodeMut::PartitionBoundSpec(x));
     }
 }
 
@@ -5986,61 +6002,61 @@ fn walk_range_tbl_entry<'a>(m: &'a protobuf::RangeTblEntry, out: &mut dyn FnMut(
     }
 }
 
-unsafe fn walk_mut_range_tbl_entry(m: *mut protobuf::RangeTblEntry, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_range_tbl_entry(m: *mut protobuf::RangeTblEntry, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.alias {
         let x: &mut protobuf::Alias = x;
-        out(NodeMut::Alias(x));
+        out.node(NodeMut::Alias(x));
     }
     if let Some(x) = &mut m.eref {
         let x: &mut protobuf::Alias = x;
-        out(NodeMut::Alias(x));
+        out.node(NodeMut::Alias(x));
     }
     if let Some(x) = &mut m.tablesample {
         let x: &mut protobuf::TableSampleClause = x;
-        out(NodeMut::TableSampleClause(x));
+        out.node(NodeMut::TableSampleClause(x));
     }
     if let Some(x) = &mut m.subquery {
         let x: &mut protobuf::Query = x;
-        out(NodeMut::Query(x));
+        out.node(NodeMut::Query(x));
     }
     for x in &mut m.joinaliasvars {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.joinleftcols {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.joinrightcols {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.join_using_alias {
         let x: &mut protobuf::Alias = x;
-        out(NodeMut::Alias(x));
+        out.node(NodeMut::Alias(x));
     }
     for x in &mut m.functions {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.tablefunc {
         let x: &mut protobuf::TableFunc = x;
-        out(NodeMut::TableFunc(x));
+        out.node(NodeMut::TableFunc(x));
     }
     for x in &mut m.values_lists {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.coltypes {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.coltypmods {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.colcollations {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.groupexprs {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.security_quals {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -6052,7 +6068,7 @@ fn walk_rte_permission_info<'a>(
 
 unsafe fn walk_mut_rte_permission_info(
     m: *mut protobuf::RtePermissionInfo,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
 }
@@ -6080,23 +6096,23 @@ fn walk_range_tbl_function<'a>(
 
 unsafe fn walk_mut_range_tbl_function(
     m: *mut protobuf::RangeTblFunction,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.funcexpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.funccolnames {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.funccoltypes {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.funccoltypmods {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.funccolcollations {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -6114,14 +6130,14 @@ fn walk_table_sample_clause<'a>(
 
 unsafe fn walk_mut_table_sample_clause(
     m: *mut protobuf::TableSampleClause,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     for x in &mut m.args {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.repeatable {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -6131,22 +6147,16 @@ fn walk_with_check_option<'a>(m: &'a protobuf::WithCheckOption, out: &mut dyn Fn
     }
 }
 
-unsafe fn walk_mut_with_check_option(
-    m: *mut protobuf::WithCheckOption,
-    out: &mut dyn FnMut(NodeMut),
-) {
+unsafe fn walk_mut_with_check_option(m: *mut protobuf::WithCheckOption, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.qual {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
 fn walk_sort_group_clause<'a>(m: &'a protobuf::SortGroupClause, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_sort_group_clause(
-    m: *mut protobuf::SortGroupClause,
-    out: &mut dyn FnMut(NodeMut),
-) {
+unsafe fn walk_mut_sort_group_clause(m: *mut protobuf::SortGroupClause, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
 }
 
@@ -6156,10 +6166,10 @@ fn walk_grouping_set<'a>(m: &'a protobuf::GroupingSet, out: &mut dyn FnMut(NodeR
     }
 }
 
-unsafe fn walk_mut_grouping_set(m: *mut protobuf::GroupingSet, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_grouping_set(m: *mut protobuf::GroupingSet, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.content {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -6178,25 +6188,25 @@ fn walk_window_clause<'a>(m: &'a protobuf::WindowClause, out: &mut dyn FnMut(Nod
     }
 }
 
-unsafe fn walk_mut_window_clause(m: *mut protobuf::WindowClause, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_window_clause(m: *mut protobuf::WindowClause, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.partition_clause {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.order_clause {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.start_offset {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.end_offset {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
 fn walk_row_mark_clause<'a>(m: &'a protobuf::RowMarkClause, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_row_mark_clause(m: *mut protobuf::RowMarkClause, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_row_mark_clause(m: *mut protobuf::RowMarkClause, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
 }
 
@@ -6206,10 +6216,10 @@ fn walk_with_clause<'a>(m: &'a protobuf::WithClause, out: &mut dyn FnMut(NodeRef
     }
 }
 
-unsafe fn walk_mut_with_clause(m: *mut protobuf::WithClause, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_with_clause(m: *mut protobuf::WithClause, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.ctes {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -6222,13 +6232,13 @@ fn walk_infer_clause<'a>(m: &'a protobuf::InferClause, out: &mut dyn FnMut(NodeR
     }
 }
 
-unsafe fn walk_mut_infer_clause(m: *mut protobuf::InferClause, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_infer_clause(m: *mut protobuf::InferClause, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.index_elems {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.where_clause {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -6250,18 +6260,18 @@ fn walk_on_conflict_clause<'a>(
 
 unsafe fn walk_mut_on_conflict_clause(
     m: *mut protobuf::OnConflictClause,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.infer {
         let x: &mut protobuf::InferClause = x;
-        out(NodeMut::InferClause(x));
+        out.node(NodeMut::InferClause(x));
     }
     for x in &mut m.target_list {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.where_clause {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -6271,13 +6281,10 @@ fn walk_cte_search_clause<'a>(m: &'a protobuf::CteSearchClause, out: &mut dyn Fn
     }
 }
 
-unsafe fn walk_mut_cte_search_clause(
-    m: *mut protobuf::CteSearchClause,
-    out: &mut dyn FnMut(NodeMut),
-) {
+unsafe fn walk_mut_cte_search_clause(m: *mut protobuf::CteSearchClause, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.search_col_list {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -6293,19 +6300,16 @@ fn walk_cte_cycle_clause<'a>(m: &'a protobuf::CteCycleClause, out: &mut dyn FnMu
     }
 }
 
-unsafe fn walk_mut_cte_cycle_clause(
-    m: *mut protobuf::CteCycleClause,
-    out: &mut dyn FnMut(NodeMut),
-) {
+unsafe fn walk_mut_cte_cycle_clause(m: *mut protobuf::CteCycleClause, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.cycle_col_list {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.cycle_mark_value {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.cycle_mark_default {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -6338,36 +6342,33 @@ fn walk_common_table_expr<'a>(m: &'a protobuf::CommonTableExpr, out: &mut dyn Fn
     }
 }
 
-unsafe fn walk_mut_common_table_expr(
-    m: *mut protobuf::CommonTableExpr,
-    out: &mut dyn FnMut(NodeMut),
-) {
+unsafe fn walk_mut_common_table_expr(m: *mut protobuf::CommonTableExpr, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.aliascolnames {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.ctequery {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.search_clause {
         let x: &mut protobuf::CteSearchClause = x;
-        out(NodeMut::CtesearchClause(x));
+        out.node(NodeMut::CtesearchClause(x));
     }
     if let Some(x) = &mut m.cycle_clause {
         let x: &mut protobuf::CteCycleClause = x;
-        out(NodeMut::CtecycleClause(x));
+        out.node(NodeMut::CtecycleClause(x));
     }
     for x in &mut m.ctecolnames {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.ctecoltypes {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.ctecoltypmods {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.ctecolcollations {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -6383,28 +6384,22 @@ fn walk_merge_when_clause<'a>(m: &'a protobuf::MergeWhenClause, out: &mut dyn Fn
     }
 }
 
-unsafe fn walk_mut_merge_when_clause(
-    m: *mut protobuf::MergeWhenClause,
-    out: &mut dyn FnMut(NodeMut),
-) {
+unsafe fn walk_mut_merge_when_clause(m: *mut protobuf::MergeWhenClause, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.condition {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.target_list {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.values {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
 fn walk_returning_option<'a>(m: &'a protobuf::ReturningOption, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_returning_option(
-    m: *mut protobuf::ReturningOption,
-    out: &mut dyn FnMut(NodeMut),
-) {
+unsafe fn walk_mut_returning_option(m: *mut protobuf::ReturningOption, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
 }
 
@@ -6417,16 +6412,13 @@ fn walk_returning_clause<'a>(m: &'a protobuf::ReturningClause, out: &mut dyn FnM
     }
 }
 
-unsafe fn walk_mut_returning_clause(
-    m: *mut protobuf::ReturningClause,
-    out: &mut dyn FnMut(NodeMut),
-) {
+unsafe fn walk_mut_returning_clause(m: *mut protobuf::ReturningClause, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.options {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.exprs {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -6438,7 +6430,7 @@ fn walk_trigger_transition<'a>(
 
 unsafe fn walk_mut_trigger_transition(
     m: *mut protobuf::TriggerTransition,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
 }
@@ -6454,15 +6446,15 @@ fn walk_json_output<'a>(m: &'a protobuf::JsonOutput, out: &mut dyn FnMut(NodeRef
     }
 }
 
-unsafe fn walk_mut_json_output(m: *mut protobuf::JsonOutput, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_json_output(m: *mut protobuf::JsonOutput, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.type_name {
         let x: &mut protobuf::TypeName = x;
-        out(NodeMut::TypeName(x));
+        out.node(NodeMut::TypeName(x));
     }
     if let Some(x) = &mut m.returning {
         let x: &mut protobuf::JsonReturning = x;
-        out(NodeMut::JsonReturning(x));
+        out.node(NodeMut::JsonReturning(x));
     }
 }
 
@@ -6473,11 +6465,11 @@ fn walk_json_argument<'a>(m: &'a protobuf::JsonArgument, out: &mut dyn FnMut(Nod
     }
 }
 
-unsafe fn walk_mut_json_argument(m: *mut protobuf::JsonArgument, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_json_argument(m: *mut protobuf::JsonArgument, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.val {
         let x: &mut protobuf::JsonValueExpr = x;
-        out(NodeMut::JsonValueExpr(x));
+        out.node(NodeMut::JsonValueExpr(x));
     }
 }
 
@@ -6506,29 +6498,29 @@ fn walk_json_func_expr<'a>(m: &'a protobuf::JsonFuncExpr, out: &mut dyn FnMut(No
     }
 }
 
-unsafe fn walk_mut_json_func_expr(m: *mut protobuf::JsonFuncExpr, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_json_func_expr(m: *mut protobuf::JsonFuncExpr, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.context_item {
         let x: &mut protobuf::JsonValueExpr = x;
-        out(NodeMut::JsonValueExpr(x));
+        out.node(NodeMut::JsonValueExpr(x));
     }
     if let Some(x) = &mut m.pathspec {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.passing {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.output {
         let x: &mut protobuf::JsonOutput = x;
-        out(NodeMut::JsonOutput(x));
+        out.node(NodeMut::JsonOutput(x));
     }
     if let Some(x) = &mut m.on_empty {
         let x: &mut protobuf::JsonBehavior = x;
-        out(NodeMut::JsonBehavior(x));
+        out.node(NodeMut::JsonBehavior(x));
     }
     if let Some(x) = &mut m.on_error {
         let x: &mut protobuf::JsonBehavior = x;
-        out(NodeMut::JsonBehavior(x));
+        out.node(NodeMut::JsonBehavior(x));
     }
 }
 
@@ -6543,11 +6535,11 @@ fn walk_json_table_path_spec<'a>(
 
 unsafe fn walk_mut_json_table_path_spec(
     m: *mut protobuf::JsonTablePathSpec,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.string {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -6576,29 +6568,29 @@ fn walk_json_table<'a>(m: &'a protobuf::JsonTable, out: &mut dyn FnMut(NodeRef<'
     }
 }
 
-unsafe fn walk_mut_json_table(m: *mut protobuf::JsonTable, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_json_table(m: *mut protobuf::JsonTable, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.context_item {
         let x: &mut protobuf::JsonValueExpr = x;
-        out(NodeMut::JsonValueExpr(x));
+        out.node(NodeMut::JsonValueExpr(x));
     }
     if let Some(x) = &mut m.pathspec {
         let x: &mut protobuf::JsonTablePathSpec = x;
-        out(NodeMut::JsonTablePathSpec(x));
+        out.node(NodeMut::JsonTablePathSpec(x));
     }
     for x in &mut m.passing {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.columns {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.on_error {
         let x: &mut protobuf::JsonBehavior = x;
-        out(NodeMut::JsonBehavior(x));
+        out.node(NodeMut::JsonBehavior(x));
     }
     if let Some(x) = &mut m.alias {
         let x: &mut protobuf::Alias = x;
-        out(NodeMut::Alias(x));
+        out.node(NodeMut::Alias(x));
     }
 }
 
@@ -6628,33 +6620,30 @@ fn walk_json_table_column<'a>(m: &'a protobuf::JsonTableColumn, out: &mut dyn Fn
     }
 }
 
-unsafe fn walk_mut_json_table_column(
-    m: *mut protobuf::JsonTableColumn,
-    out: &mut dyn FnMut(NodeMut),
-) {
+unsafe fn walk_mut_json_table_column(m: *mut protobuf::JsonTableColumn, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.type_name {
         let x: &mut protobuf::TypeName = x;
-        out(NodeMut::TypeName(x));
+        out.node(NodeMut::TypeName(x));
     }
     if let Some(x) = &mut m.pathspec {
         let x: &mut protobuf::JsonTablePathSpec = x;
-        out(NodeMut::JsonTablePathSpec(x));
+        out.node(NodeMut::JsonTablePathSpec(x));
     }
     if let Some(x) = &mut m.format {
         let x: &mut protobuf::JsonFormat = x;
-        out(NodeMut::JsonFormat(x));
+        out.node(NodeMut::JsonFormat(x));
     }
     for x in &mut m.columns {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.on_empty {
         let x: &mut protobuf::JsonBehavior = x;
-        out(NodeMut::JsonBehavior(x));
+        out.node(NodeMut::JsonBehavior(x));
     }
     if let Some(x) = &mut m.on_error {
         let x: &mut protobuf::JsonBehavior = x;
-        out(NodeMut::JsonBehavior(x));
+        out.node(NodeMut::JsonBehavior(x));
     }
 }
 
@@ -6668,14 +6657,14 @@ fn walk_json_key_value<'a>(m: &'a protobuf::JsonKeyValue, out: &mut dyn FnMut(No
     }
 }
 
-unsafe fn walk_mut_json_key_value(m: *mut protobuf::JsonKeyValue, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_json_key_value(m: *mut protobuf::JsonKeyValue, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.key {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.value {
         let x: &mut protobuf::JsonValueExpr = x;
-        out(NodeMut::JsonValueExpr(x));
+        out.node(NodeMut::JsonValueExpr(x));
     }
 }
 
@@ -6690,15 +6679,15 @@ fn walk_json_parse_expr<'a>(m: &'a protobuf::JsonParseExpr, out: &mut dyn FnMut(
     }
 }
 
-unsafe fn walk_mut_json_parse_expr(m: *mut protobuf::JsonParseExpr, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_json_parse_expr(m: *mut protobuf::JsonParseExpr, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.expr {
         let x: &mut protobuf::JsonValueExpr = x;
-        out(NodeMut::JsonValueExpr(x));
+        out.node(NodeMut::JsonValueExpr(x));
     }
     if let Some(x) = &mut m.output {
         let x: &mut protobuf::JsonOutput = x;
-        out(NodeMut::JsonOutput(x));
+        out.node(NodeMut::JsonOutput(x));
     }
 }
 
@@ -6712,17 +6701,14 @@ fn walk_json_scalar_expr<'a>(m: &'a protobuf::JsonScalarExpr, out: &mut dyn FnMu
     }
 }
 
-unsafe fn walk_mut_json_scalar_expr(
-    m: *mut protobuf::JsonScalarExpr,
-    out: &mut dyn FnMut(NodeMut),
-) {
+unsafe fn walk_mut_json_scalar_expr(m: *mut protobuf::JsonScalarExpr, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.expr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.output {
         let x: &mut protobuf::JsonOutput = x;
-        out(NodeMut::JsonOutput(x));
+        out.node(NodeMut::JsonOutput(x));
     }
 }
 
@@ -6742,16 +6728,16 @@ fn walk_json_serialize_expr<'a>(
 
 unsafe fn walk_mut_json_serialize_expr(
     m: *mut protobuf::JsonSerializeExpr,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.expr {
         let x: &mut protobuf::JsonValueExpr = x;
-        out(NodeMut::JsonValueExpr(x));
+        out.node(NodeMut::JsonValueExpr(x));
     }
     if let Some(x) = &mut m.output {
         let x: &mut protobuf::JsonOutput = x;
-        out(NodeMut::JsonOutput(x));
+        out.node(NodeMut::JsonOutput(x));
     }
 }
 
@@ -6770,15 +6756,15 @@ fn walk_json_object_constructor<'a>(
 
 unsafe fn walk_mut_json_object_constructor(
     m: *mut protobuf::JsonObjectConstructor,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     for x in &mut m.exprs {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.output {
         let x: &mut protobuf::JsonOutput = x;
-        out(NodeMut::JsonOutput(x));
+        out.node(NodeMut::JsonOutput(x));
     }
 }
 
@@ -6797,15 +6783,15 @@ fn walk_json_array_constructor<'a>(
 
 unsafe fn walk_mut_json_array_constructor(
     m: *mut protobuf::JsonArrayConstructor,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     for x in &mut m.exprs {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.output {
         let x: &mut protobuf::JsonOutput = x;
-        out(NodeMut::JsonOutput(x));
+        out.node(NodeMut::JsonOutput(x));
     }
 }
 
@@ -6828,19 +6814,19 @@ fn walk_json_array_query_constructor<'a>(
 
 unsafe fn walk_mut_json_array_query_constructor(
     m: *mut protobuf::JsonArrayQueryConstructor,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.query {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.output {
         let x: &mut protobuf::JsonOutput = x;
-        out(NodeMut::JsonOutput(x));
+        out.node(NodeMut::JsonOutput(x));
     }
     if let Some(x) = &mut m.format {
         let x: &mut protobuf::JsonFormat = x;
-        out(NodeMut::JsonFormat(x));
+        out.node(NodeMut::JsonFormat(x));
     }
 }
 
@@ -6866,22 +6852,22 @@ fn walk_json_agg_constructor<'a>(
 
 unsafe fn walk_mut_json_agg_constructor(
     m: *mut protobuf::JsonAggConstructor,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.output {
         let x: &mut protobuf::JsonOutput = x;
-        out(NodeMut::JsonOutput(x));
+        out.node(NodeMut::JsonOutput(x));
     }
     if let Some(x) = &mut m.agg_filter {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.agg_order {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.over {
         let x: &mut protobuf::WindowDef = x;
-        out(NodeMut::WindowDef(x));
+        out.node(NodeMut::WindowDef(x));
     }
 }
 
@@ -6896,15 +6882,15 @@ fn walk_json_object_agg<'a>(m: &'a protobuf::JsonObjectAgg, out: &mut dyn FnMut(
     }
 }
 
-unsafe fn walk_mut_json_object_agg(m: *mut protobuf::JsonObjectAgg, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_json_object_agg(m: *mut protobuf::JsonObjectAgg, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.constructor {
         let x: &mut protobuf::JsonAggConstructor = x;
-        out(NodeMut::JsonAggConstructor(x));
+        out.node(NodeMut::JsonAggConstructor(x));
     }
     if let Some(x) = &mut m.arg {
         let x: &mut protobuf::JsonKeyValue = x;
-        out(NodeMut::JsonKeyValue(x));
+        out.node(NodeMut::JsonKeyValue(x));
     }
 }
 
@@ -6919,15 +6905,15 @@ fn walk_json_array_agg<'a>(m: &'a protobuf::JsonArrayAgg, out: &mut dyn FnMut(No
     }
 }
 
-unsafe fn walk_mut_json_array_agg(m: *mut protobuf::JsonArrayAgg, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_json_array_agg(m: *mut protobuf::JsonArrayAgg, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.constructor {
         let x: &mut protobuf::JsonAggConstructor = x;
-        out(NodeMut::JsonAggConstructor(x));
+        out.node(NodeMut::JsonAggConstructor(x));
     }
     if let Some(x) = &mut m.arg {
         let x: &mut protobuf::JsonValueExpr = x;
-        out(NodeMut::JsonValueExpr(x));
+        out.node(NodeMut::JsonValueExpr(x));
     }
 }
 
@@ -6937,10 +6923,10 @@ fn walk_raw_stmt<'a>(m: &'a protobuf::RawStmt, out: &mut dyn FnMut(NodeRef<'a>))
     }
 }
 
-unsafe fn walk_mut_raw_stmt(m: *mut protobuf::RawStmt, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_raw_stmt(m: *mut protobuf::RawStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.stmt {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -6969,29 +6955,29 @@ fn walk_insert_stmt<'a>(m: &'a protobuf::InsertStmt, out: &mut dyn FnMut(NodeRef
     }
 }
 
-unsafe fn walk_mut_insert_stmt(m: *mut protobuf::InsertStmt, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_insert_stmt(m: *mut protobuf::InsertStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.relation {
         let x: &mut protobuf::RangeVar = x;
-        out(NodeMut::RangeVar(x));
+        out.node(NodeMut::RangeVar(x));
     }
     for x in &mut m.cols {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.select_stmt {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.on_conflict_clause {
         let x: &mut protobuf::OnConflictClause = x;
-        out(NodeMut::OnConflictClause(x));
+        out.node(NodeMut::OnConflictClause(x));
     }
     if let Some(x) = &mut m.returning_clause {
         let x: &mut protobuf::ReturningClause = x;
-        out(NodeMut::ReturningClause(x));
+        out.node(NodeMut::ReturningClause(x));
     }
     if let Some(x) = &mut m.with_clause {
         let x: &mut protobuf::WithClause = x;
-        out(NodeMut::WithClause(x));
+        out.node(NodeMut::WithClause(x));
     }
 }
 
@@ -7016,25 +7002,25 @@ fn walk_delete_stmt<'a>(m: &'a protobuf::DeleteStmt, out: &mut dyn FnMut(NodeRef
     }
 }
 
-unsafe fn walk_mut_delete_stmt(m: *mut protobuf::DeleteStmt, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_delete_stmt(m: *mut protobuf::DeleteStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.relation {
         let x: &mut protobuf::RangeVar = x;
-        out(NodeMut::RangeVar(x));
+        out.node(NodeMut::RangeVar(x));
     }
     for x in &mut m.using_clause {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.where_clause {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.returning_clause {
         let x: &mut protobuf::ReturningClause = x;
-        out(NodeMut::ReturningClause(x));
+        out.node(NodeMut::ReturningClause(x));
     }
     if let Some(x) = &mut m.with_clause {
         let x: &mut protobuf::WithClause = x;
-        out(NodeMut::WithClause(x));
+        out.node(NodeMut::WithClause(x));
     }
 }
 
@@ -7062,28 +7048,28 @@ fn walk_update_stmt<'a>(m: &'a protobuf::UpdateStmt, out: &mut dyn FnMut(NodeRef
     }
 }
 
-unsafe fn walk_mut_update_stmt(m: *mut protobuf::UpdateStmt, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_update_stmt(m: *mut protobuf::UpdateStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.relation {
         let x: &mut protobuf::RangeVar = x;
-        out(NodeMut::RangeVar(x));
+        out.node(NodeMut::RangeVar(x));
     }
     for x in &mut m.target_list {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.where_clause {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.from_clause {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.returning_clause {
         let x: &mut protobuf::ReturningClause = x;
-        out(NodeMut::ReturningClause(x));
+        out.node(NodeMut::ReturningClause(x));
     }
     if let Some(x) = &mut m.with_clause {
         let x: &mut protobuf::WithClause = x;
-        out(NodeMut::WithClause(x));
+        out.node(NodeMut::WithClause(x));
     }
 }
 
@@ -7111,28 +7097,28 @@ fn walk_merge_stmt<'a>(m: &'a protobuf::MergeStmt, out: &mut dyn FnMut(NodeRef<'
     }
 }
 
-unsafe fn walk_mut_merge_stmt(m: *mut protobuf::MergeStmt, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_merge_stmt(m: *mut protobuf::MergeStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.relation {
         let x: &mut protobuf::RangeVar = x;
-        out(NodeMut::RangeVar(x));
+        out.node(NodeMut::RangeVar(x));
     }
     if let Some(x) = &mut m.source_relation {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.join_condition {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.merge_when_clauses {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.returning_clause {
         let x: &mut protobuf::ReturningClause = x;
-        out(NodeMut::ReturningClause(x));
+        out.node(NodeMut::ReturningClause(x));
     }
     if let Some(x) = &mut m.with_clause {
         let x: &mut protobuf::WithClause = x;
-        out(NodeMut::WithClause(x));
+        out.node(NodeMut::WithClause(x));
     }
 }
 
@@ -7191,59 +7177,59 @@ fn walk_select_stmt<'a>(m: &'a protobuf::SelectStmt, out: &mut dyn FnMut(NodeRef
     }
 }
 
-unsafe fn walk_mut_select_stmt(m: *mut protobuf::SelectStmt, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_select_stmt(m: *mut protobuf::SelectStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.distinct_clause {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.into_clause {
         let x: &mut protobuf::IntoClause = x;
-        out(NodeMut::IntoClause(x));
+        out.node(NodeMut::IntoClause(x));
     }
     for x in &mut m.target_list {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.from_clause {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.where_clause {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.group_clause {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.having_clause {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.window_clause {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.values_lists {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.sort_clause {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.limit_offset {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.limit_count {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.locking_clause {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.with_clause {
         let x: &mut protobuf::WithClause = x;
-        out(NodeMut::WithClause(x));
+        out.node(NodeMut::WithClause(x));
     }
     if let Some(x) = &mut m.larg {
         let x: &mut protobuf::SelectStmt = x;
-        out(NodeMut::SelectStmt(x));
+        out.node(NodeMut::SelectStmt(x));
     }
     if let Some(x) = &mut m.rarg {
         let x: &mut protobuf::SelectStmt = x;
-        out(NodeMut::SelectStmt(x));
+        out.node(NodeMut::SelectStmt(x));
     }
 }
 
@@ -7273,26 +7259,26 @@ fn walk_set_operation_stmt<'a>(
 
 unsafe fn walk_mut_set_operation_stmt(
     m: *mut protobuf::SetOperationStmt,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.larg {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.rarg {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.col_types {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.col_typmods {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.col_collations {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.group_clauses {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -7302,10 +7288,10 @@ fn walk_return_stmt<'a>(m: &'a protobuf::ReturnStmt, out: &mut dyn FnMut(NodeRef
     }
 }
 
-unsafe fn walk_mut_return_stmt(m: *mut protobuf::ReturnStmt, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_return_stmt(m: *mut protobuf::ReturnStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.returnval {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -7319,14 +7305,14 @@ fn walk_pl_assign_stmt<'a>(m: &'a protobuf::PlAssignStmt, out: &mut dyn FnMut(No
     }
 }
 
-unsafe fn walk_mut_pl_assign_stmt(m: *mut protobuf::PlAssignStmt, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_pl_assign_stmt(m: *mut protobuf::PlAssignStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.indirection {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.val {
         let x: &mut protobuf::SelectStmt = x;
-        out(NodeMut::SelectStmt(x));
+        out.node(NodeMut::SelectStmt(x));
     }
 }
 
@@ -7345,15 +7331,15 @@ fn walk_create_schema_stmt<'a>(
 
 unsafe fn walk_mut_create_schema_stmt(
     m: *mut protobuf::CreateSchemaStmt,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.authrole {
         let x: &mut protobuf::RoleSpec = x;
-        out(NodeMut::RoleSpec(x));
+        out.node(NodeMut::RoleSpec(x));
     }
     for x in &mut m.schema_elts {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -7367,17 +7353,14 @@ fn walk_alter_table_stmt<'a>(m: &'a protobuf::AlterTableStmt, out: &mut dyn FnMu
     }
 }
 
-unsafe fn walk_mut_alter_table_stmt(
-    m: *mut protobuf::AlterTableStmt,
-    out: &mut dyn FnMut(NodeMut),
-) {
+unsafe fn walk_mut_alter_table_stmt(m: *mut protobuf::AlterTableStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.relation {
         let x: &mut protobuf::RangeVar = x;
-        out(NodeMut::RangeVar(x));
+        out.node(NodeMut::RangeVar(x));
     }
     for x in &mut m.cmds {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -7391,14 +7374,14 @@ fn walk_alter_table_cmd<'a>(m: &'a protobuf::AlterTableCmd, out: &mut dyn FnMut(
     }
 }
 
-unsafe fn walk_mut_alter_table_cmd(m: *mut protobuf::AlterTableCmd, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_alter_table_cmd(m: *mut protobuf::AlterTableCmd, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.newowner {
         let x: &mut protobuf::RoleSpec = x;
-        out(NodeMut::RoleSpec(x));
+        out.node(NodeMut::RoleSpec(x));
     }
     if let Some(x) = &mut m.def {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -7410,7 +7393,7 @@ fn walk_at_alter_constraint<'a>(
 
 unsafe fn walk_mut_at_alter_constraint(
     m: *mut protobuf::AtAlterConstraint,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
 }
@@ -7423,7 +7406,7 @@ fn walk_replica_identity_stmt<'a>(
 
 unsafe fn walk_mut_replica_identity_stmt(
     m: *mut protobuf::ReplicaIdentityStmt,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
 }
@@ -7439,11 +7422,11 @@ fn walk_alter_collation_stmt<'a>(
 
 unsafe fn walk_mut_alter_collation_stmt(
     m: *mut protobuf::AlterCollationStmt,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     for x in &mut m.collname {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -7456,16 +7439,13 @@ fn walk_alter_domain_stmt<'a>(m: &'a protobuf::AlterDomainStmt, out: &mut dyn Fn
     }
 }
 
-unsafe fn walk_mut_alter_domain_stmt(
-    m: *mut protobuf::AlterDomainStmt,
-    out: &mut dyn FnMut(NodeMut),
-) {
+unsafe fn walk_mut_alter_domain_stmt(m: *mut protobuf::AlterDomainStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.type_name {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.def {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -7485,20 +7465,20 @@ fn walk_grant_stmt<'a>(m: &'a protobuf::GrantStmt, out: &mut dyn FnMut(NodeRef<'
     }
 }
 
-unsafe fn walk_mut_grant_stmt(m: *mut protobuf::GrantStmt, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_grant_stmt(m: *mut protobuf::GrantStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.objects {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.privileges {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.grantees {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.grantor {
         let x: &mut protobuf::RoleSpec = x;
-        out(NodeMut::RoleSpec(x));
+        out.node(NodeMut::RoleSpec(x));
     }
 }
 
@@ -7514,19 +7494,16 @@ fn walk_object_with_args<'a>(m: &'a protobuf::ObjectWithArgs, out: &mut dyn FnMu
     }
 }
 
-unsafe fn walk_mut_object_with_args(
-    m: *mut protobuf::ObjectWithArgs,
-    out: &mut dyn FnMut(NodeMut),
-) {
+unsafe fn walk_mut_object_with_args(m: *mut protobuf::ObjectWithArgs, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.objname {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.objargs {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.objfuncargs {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -7536,10 +7513,10 @@ fn walk_access_priv<'a>(m: &'a protobuf::AccessPriv, out: &mut dyn FnMut(NodeRef
     }
 }
 
-unsafe fn walk_mut_access_priv(m: *mut protobuf::AccessPriv, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_access_priv(m: *mut protobuf::AccessPriv, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.cols {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -7559,20 +7536,20 @@ fn walk_grant_role_stmt<'a>(m: &'a protobuf::GrantRoleStmt, out: &mut dyn FnMut(
     }
 }
 
-unsafe fn walk_mut_grant_role_stmt(m: *mut protobuf::GrantRoleStmt, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_grant_role_stmt(m: *mut protobuf::GrantRoleStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.granted_roles {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.grantee_roles {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.opt {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.grantor {
         let x: &mut protobuf::RoleSpec = x;
-        out(NodeMut::RoleSpec(x));
+        out.node(NodeMut::RoleSpec(x));
     }
 }
 
@@ -7591,15 +7568,15 @@ fn walk_alter_default_privileges_stmt<'a>(
 
 unsafe fn walk_mut_alter_default_privileges_stmt(
     m: *mut protobuf::AlterDefaultPrivilegesStmt,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     for x in &mut m.options {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.action {
         let x: &mut protobuf::GrantStmt = x;
-        out(NodeMut::GrantStmt(x));
+        out.node(NodeMut::GrantStmt(x));
     }
 }
 
@@ -7622,23 +7599,23 @@ fn walk_copy_stmt<'a>(m: &'a protobuf::CopyStmt, out: &mut dyn FnMut(NodeRef<'a>
     }
 }
 
-unsafe fn walk_mut_copy_stmt(m: *mut protobuf::CopyStmt, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_copy_stmt(m: *mut protobuf::CopyStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.relation {
         let x: &mut protobuf::RangeVar = x;
-        out(NodeMut::RangeVar(x));
+        out.node(NodeMut::RangeVar(x));
     }
     if let Some(x) = &mut m.query {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.attlist {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.options {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.where_clause {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -7648,13 +7625,10 @@ fn walk_variable_set_stmt<'a>(m: &'a protobuf::VariableSetStmt, out: &mut dyn Fn
     }
 }
 
-unsafe fn walk_mut_variable_set_stmt(
-    m: *mut protobuf::VariableSetStmt,
-    out: &mut dyn FnMut(NodeMut),
-) {
+unsafe fn walk_mut_variable_set_stmt(m: *mut protobuf::VariableSetStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.args {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -7666,7 +7640,7 @@ fn walk_variable_show_stmt<'a>(
 
 unsafe fn walk_mut_variable_show_stmt(
     m: *mut protobuf::VariableShowStmt,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
 }
@@ -7705,38 +7679,38 @@ fn walk_create_stmt<'a>(m: &'a protobuf::CreateStmt, out: &mut dyn FnMut(NodeRef
     }
 }
 
-unsafe fn walk_mut_create_stmt(m: *mut protobuf::CreateStmt, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_create_stmt(m: *mut protobuf::CreateStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.relation {
         let x: &mut protobuf::RangeVar = x;
-        out(NodeMut::RangeVar(x));
+        out.node(NodeMut::RangeVar(x));
     }
     for x in &mut m.table_elts {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.inh_relations {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.partbound {
         let x: &mut protobuf::PartitionBoundSpec = x;
-        out(NodeMut::PartitionBoundSpec(x));
+        out.node(NodeMut::PartitionBoundSpec(x));
     }
     if let Some(x) = &mut m.partspec {
         let x: &mut protobuf::PartitionSpec = x;
-        out(NodeMut::PartitionSpec(x));
+        out.node(NodeMut::PartitionSpec(x));
     }
     if let Some(x) = &mut m.of_typename {
         let x: &mut protobuf::TypeName = x;
-        out(NodeMut::TypeName(x));
+        out.node(NodeMut::TypeName(x));
     }
     for x in &mut m.constraints {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.nnconstraints {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.options {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -7777,41 +7751,41 @@ fn walk_constraint<'a>(m: &'a protobuf::Constraint, out: &mut dyn FnMut(NodeRef<
     }
 }
 
-unsafe fn walk_mut_constraint(m: *mut protobuf::Constraint, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_constraint(m: *mut protobuf::Constraint, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.raw_expr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.keys {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.including {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.exclusions {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.options {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.where_clause {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.pktable {
         let x: &mut protobuf::RangeVar = x;
-        out(NodeMut::RangeVar(x));
+        out.node(NodeMut::RangeVar(x));
     }
     for x in &mut m.fk_attrs {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.pk_attrs {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.fk_del_set_cols {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.old_conpfeqop {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -7830,15 +7804,15 @@ fn walk_create_table_space_stmt<'a>(
 
 unsafe fn walk_mut_create_table_space_stmt(
     m: *mut protobuf::CreateTableSpaceStmt,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.owner {
         let x: &mut protobuf::RoleSpec = x;
-        out(NodeMut::RoleSpec(x));
+        out.node(NodeMut::RoleSpec(x));
     }
     for x in &mut m.options {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -7850,7 +7824,7 @@ fn walk_drop_table_space_stmt<'a>(
 
 unsafe fn walk_mut_drop_table_space_stmt(
     m: *mut protobuf::DropTableSpaceStmt,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
 }
@@ -7866,11 +7840,11 @@ fn walk_alter_table_space_options_stmt<'a>(
 
 unsafe fn walk_mut_alter_table_space_options_stmt(
     m: *mut protobuf::AlterTableSpaceOptionsStmt,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     for x in &mut m.options {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -7885,11 +7859,11 @@ fn walk_alter_table_move_all_stmt<'a>(
 
 unsafe fn walk_mut_alter_table_move_all_stmt(
     m: *mut protobuf::AlterTableMoveAllStmt,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     for x in &mut m.roles {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -7904,11 +7878,11 @@ fn walk_create_extension_stmt<'a>(
 
 unsafe fn walk_mut_create_extension_stmt(
     m: *mut protobuf::CreateExtensionStmt,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     for x in &mut m.options {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -7923,11 +7897,11 @@ fn walk_alter_extension_stmt<'a>(
 
 unsafe fn walk_mut_alter_extension_stmt(
     m: *mut protobuf::AlterExtensionStmt,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     for x in &mut m.options {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -7942,11 +7916,11 @@ fn walk_alter_extension_contents_stmt<'a>(
 
 unsafe fn walk_mut_alter_extension_contents_stmt(
     m: *mut protobuf::AlterExtensionContentsStmt,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.object {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -7959,13 +7933,13 @@ fn walk_create_fdw_stmt<'a>(m: &'a protobuf::CreateFdwStmt, out: &mut dyn FnMut(
     }
 }
 
-unsafe fn walk_mut_create_fdw_stmt(m: *mut protobuf::CreateFdwStmt, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_create_fdw_stmt(m: *mut protobuf::CreateFdwStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.func_options {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.options {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -7978,13 +7952,13 @@ fn walk_alter_fdw_stmt<'a>(m: &'a protobuf::AlterFdwStmt, out: &mut dyn FnMut(No
     }
 }
 
-unsafe fn walk_mut_alter_fdw_stmt(m: *mut protobuf::AlterFdwStmt, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_alter_fdw_stmt(m: *mut protobuf::AlterFdwStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.func_options {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.options {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -7999,11 +7973,11 @@ fn walk_create_foreign_server_stmt<'a>(
 
 unsafe fn walk_mut_create_foreign_server_stmt(
     m: *mut protobuf::CreateForeignServerStmt,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     for x in &mut m.options {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -8018,11 +7992,11 @@ fn walk_alter_foreign_server_stmt<'a>(
 
 unsafe fn walk_mut_alter_foreign_server_stmt(
     m: *mut protobuf::AlterForeignServerStmt,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     for x in &mut m.options {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -8041,15 +8015,15 @@ fn walk_create_foreign_table_stmt<'a>(
 
 unsafe fn walk_mut_create_foreign_table_stmt(
     m: *mut protobuf::CreateForeignTableStmt,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.base_stmt {
         let x: &mut protobuf::CreateStmt = x;
-        out(NodeMut::CreateStmt(x));
+        out.node(NodeMut::CreateStmt(x));
     }
     for x in &mut m.options {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -8068,15 +8042,15 @@ fn walk_create_user_mapping_stmt<'a>(
 
 unsafe fn walk_mut_create_user_mapping_stmt(
     m: *mut protobuf::CreateUserMappingStmt,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.user {
         let x: &mut protobuf::RoleSpec = x;
-        out(NodeMut::RoleSpec(x));
+        out.node(NodeMut::RoleSpec(x));
     }
     for x in &mut m.options {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -8095,15 +8069,15 @@ fn walk_alter_user_mapping_stmt<'a>(
 
 unsafe fn walk_mut_alter_user_mapping_stmt(
     m: *mut protobuf::AlterUserMappingStmt,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.user {
         let x: &mut protobuf::RoleSpec = x;
-        out(NodeMut::RoleSpec(x));
+        out.node(NodeMut::RoleSpec(x));
     }
     for x in &mut m.options {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -8119,12 +8093,12 @@ fn walk_drop_user_mapping_stmt<'a>(
 
 unsafe fn walk_mut_drop_user_mapping_stmt(
     m: *mut protobuf::DropUserMappingStmt,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.user {
         let x: &mut protobuf::RoleSpec = x;
-        out(NodeMut::RoleSpec(x));
+        out.node(NodeMut::RoleSpec(x));
     }
 }
 
@@ -8142,14 +8116,14 @@ fn walk_import_foreign_schema_stmt<'a>(
 
 unsafe fn walk_mut_import_foreign_schema_stmt(
     m: *mut protobuf::ImportForeignSchemaStmt,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     for x in &mut m.table_list {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.options {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -8174,21 +8148,21 @@ fn walk_create_policy_stmt<'a>(
 
 unsafe fn walk_mut_create_policy_stmt(
     m: *mut protobuf::CreatePolicyStmt,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.table {
         let x: &mut protobuf::RangeVar = x;
-        out(NodeMut::RangeVar(x));
+        out.node(NodeMut::RangeVar(x));
     }
     for x in &mut m.roles {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.qual {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.with_check {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -8208,23 +8182,20 @@ fn walk_alter_policy_stmt<'a>(m: &'a protobuf::AlterPolicyStmt, out: &mut dyn Fn
     }
 }
 
-unsafe fn walk_mut_alter_policy_stmt(
-    m: *mut protobuf::AlterPolicyStmt,
-    out: &mut dyn FnMut(NodeMut),
-) {
+unsafe fn walk_mut_alter_policy_stmt(m: *mut protobuf::AlterPolicyStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.table {
         let x: &mut protobuf::RangeVar = x;
-        out(NodeMut::RangeVar(x));
+        out.node(NodeMut::RangeVar(x));
     }
     for x in &mut m.roles {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.qual {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.with_check {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -8234,10 +8205,10 @@ fn walk_create_am_stmt<'a>(m: &'a protobuf::CreateAmStmt, out: &mut dyn FnMut(No
     }
 }
 
-unsafe fn walk_mut_create_am_stmt(m: *mut protobuf::CreateAmStmt, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_create_am_stmt(m: *mut protobuf::CreateAmStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.handler_name {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -8267,33 +8238,30 @@ fn walk_create_trig_stmt<'a>(m: &'a protobuf::CreateTrigStmt, out: &mut dyn FnMu
     }
 }
 
-unsafe fn walk_mut_create_trig_stmt(
-    m: *mut protobuf::CreateTrigStmt,
-    out: &mut dyn FnMut(NodeMut),
-) {
+unsafe fn walk_mut_create_trig_stmt(m: *mut protobuf::CreateTrigStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.relation {
         let x: &mut protobuf::RangeVar = x;
-        out(NodeMut::RangeVar(x));
+        out.node(NodeMut::RangeVar(x));
     }
     for x in &mut m.funcname {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.args {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.columns {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.when_clause {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.transition_rels {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.constrrel {
         let x: &mut protobuf::RangeVar = x;
-        out(NodeMut::RangeVar(x));
+        out.node(NodeMut::RangeVar(x));
     }
 }
 
@@ -8311,14 +8279,14 @@ fn walk_create_event_trig_stmt<'a>(
 
 unsafe fn walk_mut_create_event_trig_stmt(
     m: *mut protobuf::CreateEventTrigStmt,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     for x in &mut m.whenclause {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.funcname {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -8330,7 +8298,7 @@ fn walk_alter_event_trig_stmt<'a>(
 
 unsafe fn walk_mut_alter_event_trig_stmt(
     m: *mut protobuf::AlterEventTrigStmt,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
 }
@@ -8347,19 +8315,16 @@ fn walk_create_p_lang_stmt<'a>(m: &'a protobuf::CreatePLangStmt, out: &mut dyn F
     }
 }
 
-unsafe fn walk_mut_create_p_lang_stmt(
-    m: *mut protobuf::CreatePLangStmt,
-    out: &mut dyn FnMut(NodeMut),
-) {
+unsafe fn walk_mut_create_p_lang_stmt(m: *mut protobuf::CreatePLangStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.plhandler {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.plinline {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.plvalidator {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -8369,13 +8334,10 @@ fn walk_create_role_stmt<'a>(m: &'a protobuf::CreateRoleStmt, out: &mut dyn FnMu
     }
 }
 
-unsafe fn walk_mut_create_role_stmt(
-    m: *mut protobuf::CreateRoleStmt,
-    out: &mut dyn FnMut(NodeMut),
-) {
+unsafe fn walk_mut_create_role_stmt(m: *mut protobuf::CreateRoleStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.options {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -8389,14 +8351,14 @@ fn walk_alter_role_stmt<'a>(m: &'a protobuf::AlterRoleStmt, out: &mut dyn FnMut(
     }
 }
 
-unsafe fn walk_mut_alter_role_stmt(m: *mut protobuf::AlterRoleStmt, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_alter_role_stmt(m: *mut protobuf::AlterRoleStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.role {
         let x: &mut protobuf::RoleSpec = x;
-        out(NodeMut::RoleSpec(x));
+        out.node(NodeMut::RoleSpec(x));
     }
     for x in &mut m.options {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -8416,16 +8378,16 @@ fn walk_alter_role_set_stmt<'a>(
 
 unsafe fn walk_mut_alter_role_set_stmt(
     m: *mut protobuf::AlterRoleSetStmt,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.role {
         let x: &mut protobuf::RoleSpec = x;
-        out(NodeMut::RoleSpec(x));
+        out.node(NodeMut::RoleSpec(x));
     }
     if let Some(x) = &mut m.setstmt {
         let x: &mut protobuf::VariableSetStmt = x;
-        out(NodeMut::VariableSetStmt(x));
+        out.node(NodeMut::VariableSetStmt(x));
     }
 }
 
@@ -8435,10 +8397,10 @@ fn walk_drop_role_stmt<'a>(m: &'a protobuf::DropRoleStmt, out: &mut dyn FnMut(No
     }
 }
 
-unsafe fn walk_mut_drop_role_stmt(m: *mut protobuf::DropRoleStmt, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_drop_role_stmt(m: *mut protobuf::DropRoleStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.roles {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -8452,14 +8414,14 @@ fn walk_create_seq_stmt<'a>(m: &'a protobuf::CreateSeqStmt, out: &mut dyn FnMut(
     }
 }
 
-unsafe fn walk_mut_create_seq_stmt(m: *mut protobuf::CreateSeqStmt, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_create_seq_stmt(m: *mut protobuf::CreateSeqStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.sequence {
         let x: &mut protobuf::RangeVar = x;
-        out(NodeMut::RangeVar(x));
+        out.node(NodeMut::RangeVar(x));
     }
     for x in &mut m.options {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -8473,14 +8435,14 @@ fn walk_alter_seq_stmt<'a>(m: &'a protobuf::AlterSeqStmt, out: &mut dyn FnMut(No
     }
 }
 
-unsafe fn walk_mut_alter_seq_stmt(m: *mut protobuf::AlterSeqStmt, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_alter_seq_stmt(m: *mut protobuf::AlterSeqStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.sequence {
         let x: &mut protobuf::RangeVar = x;
-        out(NodeMut::RangeVar(x));
+        out.node(NodeMut::RangeVar(x));
     }
     for x in &mut m.options {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -8496,16 +8458,16 @@ fn walk_define_stmt<'a>(m: &'a protobuf::DefineStmt, out: &mut dyn FnMut(NodeRef
     }
 }
 
-unsafe fn walk_mut_define_stmt(m: *mut protobuf::DefineStmt, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_define_stmt(m: *mut protobuf::DefineStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.defnames {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.args {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.definition {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -8531,22 +8493,22 @@ fn walk_create_domain_stmt<'a>(
 
 unsafe fn walk_mut_create_domain_stmt(
     m: *mut protobuf::CreateDomainStmt,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     for x in &mut m.domainname {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.type_name {
         let x: &mut protobuf::TypeName = x;
-        out(NodeMut::TypeName(x));
+        out.node(NodeMut::TypeName(x));
     }
     if let Some(x) = &mut m.coll_clause {
         let x: &mut protobuf::CollateClause = x;
-        out(NodeMut::CollateClause(x));
+        out.node(NodeMut::CollateClause(x));
     }
     for x in &mut m.constraints {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -8571,21 +8533,21 @@ fn walk_create_op_class_stmt<'a>(
 
 unsafe fn walk_mut_create_op_class_stmt(
     m: *mut protobuf::CreateOpClassStmt,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     for x in &mut m.opclassname {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.opfamilyname {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.datatype {
         let x: &mut protobuf::TypeName = x;
-        out(NodeMut::TypeName(x));
+        out.node(NodeMut::TypeName(x));
     }
     for x in &mut m.items {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -8611,22 +8573,22 @@ fn walk_create_op_class_item<'a>(
 
 unsafe fn walk_mut_create_op_class_item(
     m: *mut protobuf::CreateOpClassItem,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.name {
         let x: &mut protobuf::ObjectWithArgs = x;
-        out(NodeMut::ObjectWithArgs(x));
+        out.node(NodeMut::ObjectWithArgs(x));
     }
     for x in &mut m.order_family {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.class_args {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.storedtype {
         let x: &mut protobuf::TypeName = x;
-        out(NodeMut::TypeName(x));
+        out.node(NodeMut::TypeName(x));
     }
 }
 
@@ -8641,11 +8603,11 @@ fn walk_create_op_family_stmt<'a>(
 
 unsafe fn walk_mut_create_op_family_stmt(
     m: *mut protobuf::CreateOpFamilyStmt,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     for x in &mut m.opfamilyname {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -8663,14 +8625,14 @@ fn walk_alter_op_family_stmt<'a>(
 
 unsafe fn walk_mut_alter_op_family_stmt(
     m: *mut protobuf::AlterOpFamilyStmt,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     for x in &mut m.opfamilyname {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.items {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -8680,10 +8642,10 @@ fn walk_drop_stmt<'a>(m: &'a protobuf::DropStmt, out: &mut dyn FnMut(NodeRef<'a>
     }
 }
 
-unsafe fn walk_mut_drop_stmt(m: *mut protobuf::DropStmt, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_drop_stmt(m: *mut protobuf::DropStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.objects {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -8693,10 +8655,10 @@ fn walk_truncate_stmt<'a>(m: &'a protobuf::TruncateStmt, out: &mut dyn FnMut(Nod
     }
 }
 
-unsafe fn walk_mut_truncate_stmt(m: *mut protobuf::TruncateStmt, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_truncate_stmt(m: *mut protobuf::TruncateStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.relations {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -8706,10 +8668,10 @@ fn walk_comment_stmt<'a>(m: &'a protobuf::CommentStmt, out: &mut dyn FnMut(NodeR
     }
 }
 
-unsafe fn walk_mut_comment_stmt(m: *mut protobuf::CommentStmt, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_comment_stmt(m: *mut protobuf::CommentStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.object {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -8719,10 +8681,10 @@ fn walk_sec_label_stmt<'a>(m: &'a protobuf::SecLabelStmt, out: &mut dyn FnMut(No
     }
 }
 
-unsafe fn walk_mut_sec_label_stmt(m: *mut protobuf::SecLabelStmt, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_sec_label_stmt(m: *mut protobuf::SecLabelStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.object {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -8737,26 +8699,23 @@ fn walk_declare_cursor_stmt<'a>(
 
 unsafe fn walk_mut_declare_cursor_stmt(
     m: *mut protobuf::DeclareCursorStmt,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.query {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
 fn walk_close_portal_stmt<'a>(m: &'a protobuf::ClosePortalStmt, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_close_portal_stmt(
-    m: *mut protobuf::ClosePortalStmt,
-    out: &mut dyn FnMut(NodeMut),
-) {
+unsafe fn walk_mut_close_portal_stmt(m: *mut protobuf::ClosePortalStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
 }
 
 fn walk_fetch_stmt<'a>(m: &'a protobuf::FetchStmt, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_fetch_stmt(m: *mut protobuf::FetchStmt, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_fetch_stmt(m: *mut protobuf::FetchStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
 }
 
@@ -8782,26 +8741,26 @@ fn walk_index_stmt<'a>(m: &'a protobuf::IndexStmt, out: &mut dyn FnMut(NodeRef<'
     }
 }
 
-unsafe fn walk_mut_index_stmt(m: *mut protobuf::IndexStmt, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_index_stmt(m: *mut protobuf::IndexStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.relation {
         let x: &mut protobuf::RangeVar = x;
-        out(NodeMut::RangeVar(x));
+        out.node(NodeMut::RangeVar(x));
     }
     for x in &mut m.index_params {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.index_including_params {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.options {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.where_clause {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.exclude_op_names {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -8820,22 +8779,19 @@ fn walk_create_stats_stmt<'a>(m: &'a protobuf::CreateStatsStmt, out: &mut dyn Fn
     }
 }
 
-unsafe fn walk_mut_create_stats_stmt(
-    m: *mut protobuf::CreateStatsStmt,
-    out: &mut dyn FnMut(NodeMut),
-) {
+unsafe fn walk_mut_create_stats_stmt(m: *mut protobuf::CreateStatsStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.defnames {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.stat_types {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.exprs {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.relations {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -8845,10 +8801,10 @@ fn walk_stats_elem<'a>(m: &'a protobuf::StatsElem, out: &mut dyn FnMut(NodeRef<'
     }
 }
 
-unsafe fn walk_mut_stats_elem(m: *mut protobuf::StatsElem, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_stats_elem(m: *mut protobuf::StatsElem, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.expr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -8861,16 +8817,13 @@ fn walk_alter_stats_stmt<'a>(m: &'a protobuf::AlterStatsStmt, out: &mut dyn FnMu
     }
 }
 
-unsafe fn walk_mut_alter_stats_stmt(
-    m: *mut protobuf::AlterStatsStmt,
-    out: &mut dyn FnMut(NodeMut),
-) {
+unsafe fn walk_mut_alter_stats_stmt(m: *mut protobuf::AlterStatsStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.defnames {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.stxstattarget {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -8898,24 +8851,24 @@ fn walk_create_function_stmt<'a>(
 
 unsafe fn walk_mut_create_function_stmt(
     m: *mut protobuf::CreateFunctionStmt,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     for x in &mut m.funcname {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.parameters {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.return_type {
         let x: &mut protobuf::TypeName = x;
-        out(NodeMut::TypeName(x));
+        out.node(NodeMut::TypeName(x));
     }
     for x in &mut m.options {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.sql_body {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -8934,15 +8887,15 @@ fn walk_function_parameter<'a>(
 
 unsafe fn walk_mut_function_parameter(
     m: *mut protobuf::FunctionParameter,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.arg_type {
         let x: &mut protobuf::TypeName = x;
-        out(NodeMut::TypeName(x));
+        out.node(NodeMut::TypeName(x));
     }
     if let Some(x) = &mut m.defexpr {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -8961,15 +8914,15 @@ fn walk_alter_function_stmt<'a>(
 
 unsafe fn walk_mut_alter_function_stmt(
     m: *mut protobuf::AlterFunctionStmt,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.func {
         let x: &mut protobuf::ObjectWithArgs = x;
-        out(NodeMut::ObjectWithArgs(x));
+        out.node(NodeMut::ObjectWithArgs(x));
     }
     for x in &mut m.actions {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -8979,19 +8932,16 @@ fn walk_do_stmt<'a>(m: &'a protobuf::DoStmt, out: &mut dyn FnMut(NodeRef<'a>)) {
     }
 }
 
-unsafe fn walk_mut_do_stmt(m: *mut protobuf::DoStmt, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_do_stmt(m: *mut protobuf::DoStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.args {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
 fn walk_inline_code_block<'a>(m: &'a protobuf::InlineCodeBlock, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_inline_code_block(
-    m: *mut protobuf::InlineCodeBlock,
-    out: &mut dyn FnMut(NodeMut),
-) {
+unsafe fn walk_mut_inline_code_block(m: *mut protobuf::InlineCodeBlock, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
 }
 
@@ -9009,24 +8959,24 @@ fn walk_call_stmt<'a>(m: &'a protobuf::CallStmt, out: &mut dyn FnMut(NodeRef<'a>
     }
 }
 
-unsafe fn walk_mut_call_stmt(m: *mut protobuf::CallStmt, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_call_stmt(m: *mut protobuf::CallStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.funccall {
         let x: &mut protobuf::FuncCall = x;
-        out(NodeMut::FuncCall(x));
+        out.node(NodeMut::FuncCall(x));
     }
     if let Some(x) = &mut m.funcexpr {
         let x: &mut protobuf::FuncExpr = x;
-        out(NodeMut::FuncExpr(x));
+        out.node(NodeMut::FuncExpr(x));
     }
     for x in &mut m.outargs {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
 fn walk_call_context<'a>(m: &'a protobuf::CallContext, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_call_context(m: *mut protobuf::CallContext, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_call_context(m: *mut protobuf::CallContext, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
 }
 
@@ -9040,14 +8990,14 @@ fn walk_rename_stmt<'a>(m: &'a protobuf::RenameStmt, out: &mut dyn FnMut(NodeRef
     }
 }
 
-unsafe fn walk_mut_rename_stmt(m: *mut protobuf::RenameStmt, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_rename_stmt(m: *mut protobuf::RenameStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.relation {
         let x: &mut protobuf::RangeVar = x;
-        out(NodeMut::RangeVar(x));
+        out.node(NodeMut::RangeVar(x));
     }
     if let Some(x) = &mut m.object {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -9070,19 +9020,19 @@ fn walk_alter_object_depends_stmt<'a>(
 
 unsafe fn walk_mut_alter_object_depends_stmt(
     m: *mut protobuf::AlterObjectDependsStmt,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.relation {
         let x: &mut protobuf::RangeVar = x;
-        out(NodeMut::RangeVar(x));
+        out.node(NodeMut::RangeVar(x));
     }
     if let Some(x) = &mut m.object {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.extname {
         let x: &mut protobuf::String = x;
-        out(NodeMut::String(x));
+        out.node(NodeMut::String(x));
     }
 }
 
@@ -9101,15 +9051,15 @@ fn walk_alter_object_schema_stmt<'a>(
 
 unsafe fn walk_mut_alter_object_schema_stmt(
     m: *mut protobuf::AlterObjectSchemaStmt,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.relation {
         let x: &mut protobuf::RangeVar = x;
-        out(NodeMut::RangeVar(x));
+        out.node(NodeMut::RangeVar(x));
     }
     if let Some(x) = &mut m.object {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -9127,21 +9077,18 @@ fn walk_alter_owner_stmt<'a>(m: &'a protobuf::AlterOwnerStmt, out: &mut dyn FnMu
     }
 }
 
-unsafe fn walk_mut_alter_owner_stmt(
-    m: *mut protobuf::AlterOwnerStmt,
-    out: &mut dyn FnMut(NodeMut),
-) {
+unsafe fn walk_mut_alter_owner_stmt(m: *mut protobuf::AlterOwnerStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.relation {
         let x: &mut protobuf::RangeVar = x;
-        out(NodeMut::RangeVar(x));
+        out.node(NodeMut::RangeVar(x));
     }
     if let Some(x) = &mut m.object {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.newowner {
         let x: &mut protobuf::RoleSpec = x;
-        out(NodeMut::RoleSpec(x));
+        out.node(NodeMut::RoleSpec(x));
     }
 }
 
@@ -9160,15 +9107,15 @@ fn walk_alter_operator_stmt<'a>(
 
 unsafe fn walk_mut_alter_operator_stmt(
     m: *mut protobuf::AlterOperatorStmt,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.opername {
         let x: &mut protobuf::ObjectWithArgs = x;
-        out(NodeMut::ObjectWithArgs(x));
+        out.node(NodeMut::ObjectWithArgs(x));
     }
     for x in &mut m.options {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -9181,13 +9128,13 @@ fn walk_alter_type_stmt<'a>(m: &'a protobuf::AlterTypeStmt, out: &mut dyn FnMut(
     }
 }
 
-unsafe fn walk_mut_alter_type_stmt(m: *mut protobuf::AlterTypeStmt, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_alter_type_stmt(m: *mut protobuf::AlterTypeStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.type_name {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.options {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -9204,35 +9151,35 @@ fn walk_rule_stmt<'a>(m: &'a protobuf::RuleStmt, out: &mut dyn FnMut(NodeRef<'a>
     }
 }
 
-unsafe fn walk_mut_rule_stmt(m: *mut protobuf::RuleStmt, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_rule_stmt(m: *mut protobuf::RuleStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.relation {
         let x: &mut protobuf::RangeVar = x;
-        out(NodeMut::RangeVar(x));
+        out.node(NodeMut::RangeVar(x));
     }
     if let Some(x) = &mut m.where_clause {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.actions {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
 fn walk_notify_stmt<'a>(m: &'a protobuf::NotifyStmt, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_notify_stmt(m: *mut protobuf::NotifyStmt, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_notify_stmt(m: *mut protobuf::NotifyStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
 }
 
 fn walk_listen_stmt<'a>(m: &'a protobuf::ListenStmt, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_listen_stmt(m: *mut protobuf::ListenStmt, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_listen_stmt(m: *mut protobuf::ListenStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
 }
 
 fn walk_unlisten_stmt<'a>(m: &'a protobuf::UnlistenStmt, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_unlisten_stmt(m: *mut protobuf::UnlistenStmt, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_unlisten_stmt(m: *mut protobuf::UnlistenStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
 }
 
@@ -9242,13 +9189,10 @@ fn walk_transaction_stmt<'a>(m: &'a protobuf::TransactionStmt, out: &mut dyn FnM
     }
 }
 
-unsafe fn walk_mut_transaction_stmt(
-    m: *mut protobuf::TransactionStmt,
-    out: &mut dyn FnMut(NodeMut),
-) {
+unsafe fn walk_mut_transaction_stmt(m: *mut protobuf::TransactionStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.options {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -9267,15 +9211,15 @@ fn walk_composite_type_stmt<'a>(
 
 unsafe fn walk_mut_composite_type_stmt(
     m: *mut protobuf::CompositeTypeStmt,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.typevar {
         let x: &mut protobuf::RangeVar = x;
-        out(NodeMut::RangeVar(x));
+        out.node(NodeMut::RangeVar(x));
     }
     for x in &mut m.coldeflist {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -9288,16 +9232,13 @@ fn walk_create_enum_stmt<'a>(m: &'a protobuf::CreateEnumStmt, out: &mut dyn FnMu
     }
 }
 
-unsafe fn walk_mut_create_enum_stmt(
-    m: *mut protobuf::CreateEnumStmt,
-    out: &mut dyn FnMut(NodeMut),
-) {
+unsafe fn walk_mut_create_enum_stmt(m: *mut protobuf::CreateEnumStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.type_name {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.vals {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -9310,16 +9251,13 @@ fn walk_create_range_stmt<'a>(m: &'a protobuf::CreateRangeStmt, out: &mut dyn Fn
     }
 }
 
-unsafe fn walk_mut_create_range_stmt(
-    m: *mut protobuf::CreateRangeStmt,
-    out: &mut dyn FnMut(NodeMut),
-) {
+unsafe fn walk_mut_create_range_stmt(m: *mut protobuf::CreateRangeStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.type_name {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.params {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -9329,10 +9267,10 @@ fn walk_alter_enum_stmt<'a>(m: &'a protobuf::AlterEnumStmt, out: &mut dyn FnMut(
     }
 }
 
-unsafe fn walk_mut_alter_enum_stmt(m: *mut protobuf::AlterEnumStmt, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_alter_enum_stmt(m: *mut protobuf::AlterEnumStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.type_name {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -9352,26 +9290,26 @@ fn walk_view_stmt<'a>(m: &'a protobuf::ViewStmt, out: &mut dyn FnMut(NodeRef<'a>
     }
 }
 
-unsafe fn walk_mut_view_stmt(m: *mut protobuf::ViewStmt, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_view_stmt(m: *mut protobuf::ViewStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.view {
         let x: &mut protobuf::RangeVar = x;
-        out(NodeMut::RangeVar(x));
+        out.node(NodeMut::RangeVar(x));
     }
     for x in &mut m.aliases {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.query {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.options {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
 fn walk_load_stmt<'a>(m: &'a protobuf::LoadStmt, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_load_stmt(m: *mut protobuf::LoadStmt, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_load_stmt(m: *mut protobuf::LoadStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
 }
 
@@ -9381,10 +9319,10 @@ fn walk_createdb_stmt<'a>(m: &'a protobuf::CreatedbStmt, out: &mut dyn FnMut(Nod
     }
 }
 
-unsafe fn walk_mut_createdb_stmt(m: *mut protobuf::CreatedbStmt, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_createdb_stmt(m: *mut protobuf::CreatedbStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.options {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -9399,11 +9337,11 @@ fn walk_alter_database_stmt<'a>(
 
 unsafe fn walk_mut_alter_database_stmt(
     m: *mut protobuf::AlterDatabaseStmt,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     for x in &mut m.options {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -9415,7 +9353,7 @@ fn walk_alter_database_refresh_coll_stmt<'a>(
 
 unsafe fn walk_mut_alter_database_refresh_coll_stmt(
     m: *mut protobuf::AlterDatabaseRefreshCollStmt,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
 }
@@ -9432,12 +9370,12 @@ fn walk_alter_database_set_stmt<'a>(
 
 unsafe fn walk_mut_alter_database_set_stmt(
     m: *mut protobuf::AlterDatabaseSetStmt,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.setstmt {
         let x: &mut protobuf::VariableSetStmt = x;
-        out(NodeMut::VariableSetStmt(x));
+        out.node(NodeMut::VariableSetStmt(x));
     }
 }
 
@@ -9447,10 +9385,10 @@ fn walk_dropdb_stmt<'a>(m: &'a protobuf::DropdbStmt, out: &mut dyn FnMut(NodeRef
     }
 }
 
-unsafe fn walk_mut_dropdb_stmt(m: *mut protobuf::DropdbStmt, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_dropdb_stmt(m: *mut protobuf::DropdbStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.options {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -9461,14 +9399,11 @@ fn walk_alter_system_stmt<'a>(m: &'a protobuf::AlterSystemStmt, out: &mut dyn Fn
     }
 }
 
-unsafe fn walk_mut_alter_system_stmt(
-    m: *mut protobuf::AlterSystemStmt,
-    out: &mut dyn FnMut(NodeMut),
-) {
+unsafe fn walk_mut_alter_system_stmt(m: *mut protobuf::AlterSystemStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.setstmt {
         let x: &mut protobuf::VariableSetStmt = x;
-        out(NodeMut::VariableSetStmt(x));
+        out.node(NodeMut::VariableSetStmt(x));
     }
 }
 
@@ -9482,14 +9417,14 @@ fn walk_cluster_stmt<'a>(m: &'a protobuf::ClusterStmt, out: &mut dyn FnMut(NodeR
     }
 }
 
-unsafe fn walk_mut_cluster_stmt(m: *mut protobuf::ClusterStmt, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_cluster_stmt(m: *mut protobuf::ClusterStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.relation {
         let x: &mut protobuf::RangeVar = x;
-        out(NodeMut::RangeVar(x));
+        out.node(NodeMut::RangeVar(x));
     }
     for x in &mut m.params {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -9502,13 +9437,13 @@ fn walk_vacuum_stmt<'a>(m: &'a protobuf::VacuumStmt, out: &mut dyn FnMut(NodeRef
     }
 }
 
-unsafe fn walk_mut_vacuum_stmt(m: *mut protobuf::VacuumStmt, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_vacuum_stmt(m: *mut protobuf::VacuumStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.options {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.rels {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -9522,14 +9457,14 @@ fn walk_vacuum_relation<'a>(m: &'a protobuf::VacuumRelation, out: &mut dyn FnMut
     }
 }
 
-unsafe fn walk_mut_vacuum_relation(m: *mut protobuf::VacuumRelation, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_vacuum_relation(m: *mut protobuf::VacuumRelation, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.relation {
         let x: &mut protobuf::RangeVar = x;
-        out(NodeMut::RangeVar(x));
+        out.node(NodeMut::RangeVar(x));
     }
     for x in &mut m.va_cols {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -9542,13 +9477,13 @@ fn walk_explain_stmt<'a>(m: &'a protobuf::ExplainStmt, out: &mut dyn FnMut(NodeR
     }
 }
 
-unsafe fn walk_mut_explain_stmt(m: *mut protobuf::ExplainStmt, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_explain_stmt(m: *mut protobuf::ExplainStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.query {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.options {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -9567,15 +9502,15 @@ fn walk_create_table_as_stmt<'a>(
 
 unsafe fn walk_mut_create_table_as_stmt(
     m: *mut protobuf::CreateTableAsStmt,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.query {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.into {
         let x: &mut protobuf::IntoClause = x;
-        out(NodeMut::IntoClause(x));
+        out.node(NodeMut::IntoClause(x));
     }
 }
 
@@ -9591,27 +9526,24 @@ fn walk_refresh_mat_view_stmt<'a>(
 
 unsafe fn walk_mut_refresh_mat_view_stmt(
     m: *mut protobuf::RefreshMatViewStmt,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.relation {
         let x: &mut protobuf::RangeVar = x;
-        out(NodeMut::RangeVar(x));
+        out.node(NodeMut::RangeVar(x));
     }
 }
 
 fn walk_check_point_stmt<'a>(m: &'a protobuf::CheckPointStmt, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_check_point_stmt(
-    m: *mut protobuf::CheckPointStmt,
-    out: &mut dyn FnMut(NodeMut),
-) {
+unsafe fn walk_mut_check_point_stmt(m: *mut protobuf::CheckPointStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
 }
 
 fn walk_discard_stmt<'a>(m: &'a protobuf::DiscardStmt, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_discard_stmt(m: *mut protobuf::DiscardStmt, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_discard_stmt(m: *mut protobuf::DiscardStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
 }
 
@@ -9621,10 +9553,10 @@ fn walk_lock_stmt<'a>(m: &'a protobuf::LockStmt, out: &mut dyn FnMut(NodeRef<'a>
     }
 }
 
-unsafe fn walk_mut_lock_stmt(m: *mut protobuf::LockStmt, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_lock_stmt(m: *mut protobuf::LockStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.relations {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -9639,11 +9571,11 @@ fn walk_constraints_set_stmt<'a>(
 
 unsafe fn walk_mut_constraints_set_stmt(
     m: *mut protobuf::ConstraintsSetStmt,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     for x in &mut m.constraints {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -9657,14 +9589,14 @@ fn walk_reindex_stmt<'a>(m: &'a protobuf::ReindexStmt, out: &mut dyn FnMut(NodeR
     }
 }
 
-unsafe fn walk_mut_reindex_stmt(m: *mut protobuf::ReindexStmt, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_reindex_stmt(m: *mut protobuf::ReindexStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.relation {
         let x: &mut protobuf::RangeVar = x;
-        out(NodeMut::RangeVar(x));
+        out.node(NodeMut::RangeVar(x));
     }
     for x in &mut m.params {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -9682,14 +9614,14 @@ fn walk_create_conversion_stmt<'a>(
 
 unsafe fn walk_mut_create_conversion_stmt(
     m: *mut protobuf::CreateConversionStmt,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     for x in &mut m.conversion_name {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.func_name {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -9708,22 +9640,19 @@ fn walk_create_cast_stmt<'a>(m: &'a protobuf::CreateCastStmt, out: &mut dyn FnMu
     }
 }
 
-unsafe fn walk_mut_create_cast_stmt(
-    m: *mut protobuf::CreateCastStmt,
-    out: &mut dyn FnMut(NodeMut),
-) {
+unsafe fn walk_mut_create_cast_stmt(m: *mut protobuf::CreateCastStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.sourcetype {
         let x: &mut protobuf::TypeName = x;
-        out(NodeMut::TypeName(x));
+        out.node(NodeMut::TypeName(x));
     }
     if let Some(x) = &mut m.targettype {
         let x: &mut protobuf::TypeName = x;
-        out(NodeMut::TypeName(x));
+        out.node(NodeMut::TypeName(x));
     }
     if let Some(x) = &mut m.func {
         let x: &mut protobuf::ObjectWithArgs = x;
-        out(NodeMut::ObjectWithArgs(x));
+        out.node(NodeMut::ObjectWithArgs(x));
     }
 }
 
@@ -9747,20 +9676,20 @@ fn walk_create_transform_stmt<'a>(
 
 unsafe fn walk_mut_create_transform_stmt(
     m: *mut protobuf::CreateTransformStmt,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.type_name {
         let x: &mut protobuf::TypeName = x;
-        out(NodeMut::TypeName(x));
+        out.node(NodeMut::TypeName(x));
     }
     if let Some(x) = &mut m.fromsql {
         let x: &mut protobuf::ObjectWithArgs = x;
-        out(NodeMut::ObjectWithArgs(x));
+        out.node(NodeMut::ObjectWithArgs(x));
     }
     if let Some(x) = &mut m.tosql {
         let x: &mut protobuf::ObjectWithArgs = x;
-        out(NodeMut::ObjectWithArgs(x));
+        out.node(NodeMut::ObjectWithArgs(x));
     }
 }
 
@@ -9773,13 +9702,13 @@ fn walk_prepare_stmt<'a>(m: &'a protobuf::PrepareStmt, out: &mut dyn FnMut(NodeR
     }
 }
 
-unsafe fn walk_mut_prepare_stmt(m: *mut protobuf::PrepareStmt, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_prepare_stmt(m: *mut protobuf::PrepareStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.argtypes {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.query {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -9789,16 +9718,16 @@ fn walk_execute_stmt<'a>(m: &'a protobuf::ExecuteStmt, out: &mut dyn FnMut(NodeR
     }
 }
 
-unsafe fn walk_mut_execute_stmt(m: *mut protobuf::ExecuteStmt, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_execute_stmt(m: *mut protobuf::ExecuteStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.params {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
 fn walk_deallocate_stmt<'a>(m: &'a protobuf::DeallocateStmt, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_deallocate_stmt(m: *mut protobuf::DeallocateStmt, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_deallocate_stmt(m: *mut protobuf::DeallocateStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
 }
 
@@ -9808,10 +9737,10 @@ fn walk_drop_owned_stmt<'a>(m: &'a protobuf::DropOwnedStmt, out: &mut dyn FnMut(
     }
 }
 
-unsafe fn walk_mut_drop_owned_stmt(m: *mut protobuf::DropOwnedStmt, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_drop_owned_stmt(m: *mut protobuf::DropOwnedStmt, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     for x in &mut m.roles {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -9830,15 +9759,15 @@ fn walk_reassign_owned_stmt<'a>(
 
 unsafe fn walk_mut_reassign_owned_stmt(
     m: *mut protobuf::ReassignOwnedStmt,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     for x in &mut m.roles {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     if let Some(x) = &mut m.newrole {
         let x: &mut protobuf::RoleSpec = x;
-        out(NodeMut::RoleSpec(x));
+        out.node(NodeMut::RoleSpec(x));
     }
 }
 
@@ -9856,14 +9785,14 @@ fn walk_alter_ts_dictionary_stmt<'a>(
 
 unsafe fn walk_mut_alter_ts_dictionary_stmt(
     m: *mut protobuf::AlterTsDictionaryStmt,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     for x in &mut m.dictname {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.options {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -9884,17 +9813,17 @@ fn walk_alter_ts_configuration_stmt<'a>(
 
 unsafe fn walk_mut_alter_ts_configuration_stmt(
     m: *mut protobuf::AlterTsConfigurationStmt,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     for x in &mut m.cfgname {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.tokentype {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.dicts {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -9911,20 +9840,17 @@ fn walk_publication_table<'a>(m: &'a protobuf::PublicationTable, out: &mut dyn F
     }
 }
 
-unsafe fn walk_mut_publication_table(
-    m: *mut protobuf::PublicationTable,
-    out: &mut dyn FnMut(NodeMut),
-) {
+unsafe fn walk_mut_publication_table(m: *mut protobuf::PublicationTable, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.relation {
         let x: &mut protobuf::RangeVar = x;
-        out(NodeMut::RangeVar(x));
+        out.node(NodeMut::RangeVar(x));
     }
     if let Some(x) = &mut m.where_clause {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.columns {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -9940,12 +9866,12 @@ fn walk_publication_obj_spec<'a>(
 
 unsafe fn walk_mut_publication_obj_spec(
     m: *mut protobuf::PublicationObjSpec,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     if let Some(x) = &mut m.pubtable {
         let x: &mut protobuf::PublicationTable = x;
-        out(NodeMut::PublicationTable(x));
+        out.node(NodeMut::PublicationTable(x));
     }
 }
 
@@ -9963,14 +9889,14 @@ fn walk_create_publication_stmt<'a>(
 
 unsafe fn walk_mut_create_publication_stmt(
     m: *mut protobuf::CreatePublicationStmt,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     for x in &mut m.options {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.pubobjects {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -9988,14 +9914,14 @@ fn walk_alter_publication_stmt<'a>(
 
 unsafe fn walk_mut_alter_publication_stmt(
     m: *mut protobuf::AlterPublicationStmt,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     for x in &mut m.options {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.pubobjects {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -10013,14 +9939,14 @@ fn walk_create_subscription_stmt<'a>(
 
 unsafe fn walk_mut_create_subscription_stmt(
     m: *mut protobuf::CreateSubscriptionStmt,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     for x in &mut m.publication {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.options {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -10038,14 +9964,14 @@ fn walk_alter_subscription_stmt<'a>(
 
 unsafe fn walk_mut_alter_subscription_stmt(
     m: *mut protobuf::AlterSubscriptionStmt,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
     for x in &mut m.publication {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
     for x in &mut m.options {
-        visit_node_mut(x, out);
+        out.slot(x);
     }
 }
 
@@ -10057,19 +9983,19 @@ fn walk_drop_subscription_stmt<'a>(
 
 unsafe fn walk_mut_drop_subscription_stmt(
     m: *mut protobuf::DropSubscriptionStmt,
-    out: &mut dyn FnMut(NodeMut),
+    out: &mut dyn MutVisitor,
 ) {
     let m = unsafe { &mut *m };
 }
 
 fn walk_scan_token<'a>(m: &'a protobuf::ScanToken, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_scan_token(m: *mut protobuf::ScanToken, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_scan_token(m: *mut protobuf::ScanToken, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
 }
 
 fn walk_summary_result<'a>(m: &'a protobuf::SummaryResult, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_summary_result(m: *mut protobuf::SummaryResult, out: &mut dyn FnMut(NodeMut)) {
+unsafe fn walk_mut_summary_result(m: *mut protobuf::SummaryResult, out: &mut dyn MutVisitor) {
     let m = unsafe { &mut *m };
 }

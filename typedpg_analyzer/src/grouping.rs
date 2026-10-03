@@ -302,7 +302,7 @@ fn group_leaf(
     let target_column = |rt: &protobuf::ResTarget| match rt.val.as_deref() {
         Some(v) => match resolve_group_column(v, scope, snapshot) {
             Some(key) => GroupLeaf::Column(key),
-            None => GroupLeaf::Expr(expr_key(v, snapshot)),
+            None => GroupLeaf::Expr(expr_key(v, scope, snapshot)),
         },
         None => GroupLeaf::Other,
     };
@@ -341,7 +341,7 @@ fn group_leaf(
         }
         Some(_) => match resolve_group_column(node, scope, snapshot) {
             Some(key) => GroupLeaf::Column(key),
-            None => GroupLeaf::Expr(expr_key(node, snapshot)),
+            None => GroupLeaf::Expr(expr_key(node, scope, snapshot)),
         },
         None => GroupLeaf::Other,
     }
@@ -354,19 +354,28 @@ pub(crate) const EXPR_KEY: &str = "\u{0}expr";
 /// The key of an expression in grouping sets: its parse tree without
 /// locations or column qualifiers (`t.g + 1` and `g + 1` are one key —
 /// erring towards matching, which only makes more values nullable), its
-/// type names resolved as the GROUP BY check compares them
-/// ([`resolve_type_names`]: `CAST(g AS bigint)` is `g::int8`).
-pub(crate) fn expr_key(node: &protobuf::Node, snapshot: &PgCatalog) -> String {
+/// casts that are no coercion dropped ([`strip_noop_casts`]: `g::int + 1`
+/// is `g + 1` on an `int` column) and its type names resolved as the GROUP
+/// BY check compares them ([`resolve_type_names`]: `CAST(g AS bigint)` is
+/// `g::int8`).
+pub(crate) fn expr_key(node: &protobuf::Node, scope: &Scope, snapshot: &PgCatalog) -> String {
+    let node = strip_noop_casts(node, scope, snapshot, &|_| true);
     crate::resolve::node_fingerprint(&crate::resolve::predtest_unqualify(&resolve_type_names(
-        node, snapshot,
+        &node, snapshot,
     )))
 }
 
-/// [`crate::resolve::node_fingerprint`] of `node` with its type names
-/// resolved ([`resolve_type_names`]) — the same for two expressions PG's
-/// `equal()` finds equal once transformed, up to how columns are spelled.
-pub(crate) fn typed_fingerprint(node: &protobuf::Node, snapshot: &PgCatalog) -> String {
-    crate::resolve::node_fingerprint(&resolve_type_names(node, snapshot))
+/// [`crate::resolve::node_fingerprint`] of `node` with its casts that are
+/// no coercion dropped ([`strip_noop_casts`]) and its type names resolved
+/// ([`resolve_type_names`]) — the same for two expressions PG's `equal()`
+/// finds equal once transformed, up to how columns are spelled.
+pub(crate) fn typed_fingerprint(
+    node: &protobuf::Node,
+    scope: &Scope,
+    snapshot: &PgCatalog,
+) -> String {
+    let node = strip_noop_casts(node, scope, snapshot, &|_| true);
+    crate::resolve::node_fingerprint(&resolve_type_names(&node, snapshot))
 }
 
 /// `node` with every type name it holds resolved to its type — PG
@@ -410,13 +419,13 @@ pub(crate) fn resolve_type_names(node: &protobuf::Node, snapshot: &PgCatalog) ->
 
 /// Resolve a `GROUP BY` entry as a single column against `scope`. Returns the
 /// `(table_alias, column_name)` for a plain `ColumnRef` (or a cast of one
-/// that is no coercion, [`peel_noop_casts`]), or `None` for any other shape (expression, grouping set, select-list alias, …).
+/// that is no coercion, [`strip_noop_casts`]), or `None` for any other shape (expression, grouping set, select-list alias, …).
 fn resolve_group_column(
     node: &protobuf::Node,
     scope: &Scope,
     snapshot: &PgCatalog,
 ) -> Option<ColKey> {
-    let node = peel_noop_casts(node, scope, snapshot);
+    let node = strip_noop_casts(node, scope, snapshot, &|_| true);
     let node::Node::ColumnRef(cr) = node.node.as_ref()? else {
         return None;
     };
@@ -435,54 +444,104 @@ fn resolve_group_column(
         .map(|c| (c.table_alias.clone(), c.name.clone()))
 }
 
-/// `node` without the casts over a column of `scope` that leave it as it
-/// is: PG's `coerce_type` returns its input unchanged when the target type
-/// is the input's, and `coerce_type_typmod` when the typmod is too, so
-/// `GROUP BY a::int` on an `int` column groups by the column itself (and
-/// `ROLLUP (a::int)` leaves `a` NULL in the total row). A cast changing
-/// the typmod — `v::varchar` on a `varchar(5)` column — stays a coercion.
-fn peel_noop_casts<'a>(
-    node: &'a protobuf::Node,
+/// `node` with the casts that leave their operand as it is replaced by
+/// the operand: PG's `coerce_type` returns its input unchanged when the
+/// target type is the input's, and `coerce_type_typmod` when the typmod is
+/// too, so `GROUP BY a::int` on an `int` column groups by the column itself
+/// (and `ROLLUP (a::int)` leaves `a` NULL in the total row), `a + 1` is the
+/// grouped `a::int + 1` and `(a + 1)::int`. A cast changing the typmod —
+/// `v::varchar` on a `varchar(5)` column — stays a coercion. Of the column
+/// references, only those `own` accepts are looked at; subqueries are left
+/// as they are.
+fn strip_noop_casts(
+    node: &protobuf::Node,
     scope: &Scope,
     snapshot: &PgCatalog,
-) -> &'a protobuf::Node {
-    let Some(node::Node::TypeCast(tc)) = node.node.as_ref() else {
-        return node;
-    };
-    let (Some(arg), Some(tn)) = (tc.arg.as_deref(), tc.type_name.as_ref()) else {
-        return node;
-    };
-    let inner = peel_noop_casts(arg, scope, snapshot);
-    let Some(node::Node::ColumnRef(cr)) = inner.node.as_ref() else {
-        return node;
-    };
-    let parts = expr::extract_string_fields(&cr.fields);
-    if parts.len() != cr.fields.len() {
-        return node;
-    }
-    let (table, column) = match parts.as_slice() {
-        [col] => (None, col.as_str()),
-        [tbl, col] | [_, tbl, col] => (Some(tbl.as_str()), col.as_str()),
-        _ => return node,
-    };
-    let Ok(col) = scope.resolve_column(table, column, None) else {
-        return node;
+    own: &dyn Fn(&protobuf::ColumnRef) -> bool,
+) -> protobuf::Node {
+    let mut out = node.clone();
+    out.rewrite(
+        &mut |n| !matches!(n.node, Some(node::Node::SelectStmt(_))),
+        &mut |n| {
+            if let Some(node::Node::TypeCast(tc)) = n.node.as_mut()
+                && let Some(arg) = tc.arg.as_deref_mut()
+                && tc
+                    .type_name
+                    .as_ref()
+                    .is_some_and(|tn| is_noop_cast(arg, tn, scope, snapshot, own))
+            {
+                *n = std::mem::take(arg);
+            }
+        },
+    );
+    out
+}
+
+/// Whether casting `arg` to `tn` is no coercion: `arg` already has that
+/// type, and that typmod (both unspecified included). A constant or a
+/// parameter takes the type it is cast to instead, and an operand holding
+/// a subquery or a column `own` refuses isn't typed here: neither is
+/// reported.
+fn is_noop_cast(
+    arg: &protobuf::Node,
+    tn: &protobuf::TypeName,
+    scope: &Scope,
+    snapshot: &PgCatalog,
+    own: &dyn Fn(&protobuf::ColumnRef) -> bool,
+) -> bool {
+    use typedpg_pg_query::NodeRef;
+    let (type_oid, typmod) = match arg.node.as_ref() {
+        None | Some(node::Node::AConst(_) | node::Node::ParamRef(_)) => return false,
+        Some(node::Node::ColumnRef(cr)) => {
+            if !own(cr) {
+                return false;
+            }
+            let parts = expr::extract_string_fields(&cr.fields);
+            if parts.len() != cr.fields.len() {
+                return false;
+            }
+            let (table, column) = match parts.as_slice() {
+                [col] => (None, col.as_str()),
+                [tbl, col] | [_, tbl, col] => (Some(tbl.as_str()), col.as_str()),
+                _ => return false,
+            };
+            match scope.resolve_column(table, column, None) {
+                Ok(col) => (col.type_oid, col.typmod),
+                Err(_) => return false,
+            }
+        }
+        Some(n) => {
+            if n.nodes().iter().any(|(m, _)| match m {
+                NodeRef::SelectStmt(_) => true,
+                NodeRef::ColumnRef(cr) => !own(cr),
+                _ => false,
+            }) {
+                return false;
+            }
+            let null_ctx = crate::nullability::NullabilityContext::default();
+            let mut params = crate::param_collector::ParamCollector::default();
+            match expr::infer_expr(
+                arg,
+                expr::Ctx::new(scope, &null_ctx, snapshot),
+                &mut params,
+                expr::TypeGoal::NONE,
+            ) {
+                Ok(t) => (t.type_oid, t.typmod),
+                Err(_) => return false,
+            }
+        }
     };
     let Some(target) = crate::ddl::util::resolve_type_name(tn, snapshot) else {
-        return node;
+        return false;
     };
     // A typmod we can't encode (a type whose `typmodin` isn't modeled)
     // isn't known to match.
-    let typmod = match crate::typmod::encode(snapshot, target, tn) {
-        Ok(None) if !tn.typmods.is_empty() => return node,
+    let target_typmod = match crate::typmod::encode(snapshot, target, tn) {
+        Ok(None) if !tn.typmods.is_empty() => return false,
         Ok(m) => m,
-        Err(_) => return node,
+        Err(_) => return false,
     };
-    if target == col.type_oid && typmod == col.typmod {
-        inner
-    } else {
-        node
-    }
+    target == type_oid && target_typmod == typmod
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1317,13 +1376,27 @@ fn call_level(args: &[&protobuf::Node], chain: &mut Chain) -> usize {
 /// the same expression (`t.a + 1`, `a + 1`) compare equal under
 /// [`Equal`], the analyzer's stand-in for PG's `equal()` on transformed
 /// expressions — with its type names resolved ([`resolve_type_names`]).
+/// Given `scope`, the scope of level `level`, the casts over its columns
+/// that are no coercion are dropped too ([`strip_noop_casts`]), as PG's
+/// transformation drops them.
 fn canonical(
     node: &protobuf::Node,
     chain: &Chain,
     level: usize,
+    scope: Option<&Scope>,
     snapshot: &PgCatalog,
 ) -> protobuf::Node {
     use typedpg_pg_query::{NodeMut, NodeRef};
+    let stripped;
+    let node = match scope {
+        Some(scope) => {
+            stripped = strip_noop_casts(node, scope, snapshot, &|cr| {
+                chain.resolve(cr).is_some_and(|t| t.level == level)
+            });
+            &stripped
+        }
+        None => node,
+    };
     let mut tree = protobuf::ParseResult {
         version: 0,
         stmts: vec![protobuf::RawStmt {
@@ -1406,7 +1479,13 @@ pub(crate) fn same_level_exprs_equal(
     snapshot: &PgCatalog,
 ) -> bool {
     let chain = Chain(vec![Some(Rc::new(Namespace::of(&scope.sources)))]);
-    canonical(a, &chain, 0, snapshot).equal(&canonical(b, &chain, 0, snapshot))
+    canonical(a, &chain, 0, Some(scope), snapshot).equal(&canonical(
+        b,
+        &chain,
+        0,
+        Some(scope),
+        snapshot,
+    ))
 }
 
 /// The locations of the first aggregate, `GROUPING(…)` and window call in
@@ -1567,7 +1646,7 @@ pub(crate) fn finish_select_level(
                         let canon = g
                             .args
                             .iter()
-                            .map(|a| canonical(a, &chain, up, snapshot))
+                            .map(|a| canonical(a, &chain, up, None, snapshot))
                             .collect();
                         attribute_outer(up, Some(canon), g.location)?;
                     }
@@ -1612,10 +1691,10 @@ pub(crate) fn finish_select_level(
         .finalize_implicit()
     };
     for g in own_grouping {
-        if g.args.iter().any(|a| {
-            let a = peel_noop_casts(a, scope, snapshot);
-            !group.contains(&canonical(a, &own, 0, snapshot))
-        }) {
+        if g.args
+            .iter()
+            .any(|a| !group.contains(&canonical(a, &own, 0, Some(scope), snapshot)))
+        {
             return Err(grouping_error(g.location));
         }
     }
@@ -1809,24 +1888,22 @@ impl GroupExprs {
                 Some(ExpandedTarget::StarColumn { column: None, .. }) => continue,
                 None => g,
             };
-            // A cast that is no coercion is the column itself; the cast
-            // stays a grouping expression too, for `GROUPING(a::int)`.
-            let column = peel_noop_casts(expr, scope, snapshot);
-            if let Some(node::Node::ColumnRef(cr)) = column.node.as_ref()
+            // A cast that is no coercion is the column itself.
+            let expr = &strip_noop_casts(expr, scope, snapshot, &|cr| {
+                matches!(own.resolve(cr), Some(RefTarget { level: 0, .. }))
+            });
+            if let Some(node::Node::ColumnRef(cr)) = expr.node.as_ref()
                 && let Some(RefTarget {
                     level: 0,
                     target: Some((alias, Some(col))),
                 }) = own.resolve(cr)
             {
                 out.add_column((alias, col), ns);
-                if !std::ptr::eq(column, expr) {
-                    out.have_non_var = true;
-                    out.exprs.push(canonical(expr, own, 0, snapshot));
-                }
                 continue;
             }
             out.have_non_var = true;
-            out.exprs.push(canonical(expr, own, 0, snapshot));
+            out.exprs
+                .push(canonical(expr, own, 0, Some(scope), snapshot));
         }
         out
     }
@@ -1908,7 +1985,7 @@ impl UngroupedCheck<'_> {
             && self.group.have_non_var
             && self
                 .group
-                .contains(&canonical(node, chain, 0, self.snapshot))
+                .contains(&canonical(node, chain, 0, Some(self.scope), self.snapshot))
         {
             return Ok(());
         }

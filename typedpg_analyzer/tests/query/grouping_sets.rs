@@ -318,11 +318,39 @@ fn noop_cast_groups_by_the_column() {
         .analyze("SELECT a::int AS x, grouping(a::int) AS g FROM tc GROUP BY ROLLUP (a)")
         .unwrap();
     assert_cols(&s, vec![cn("x", int4()), c("g", int4())]);
+    // Inside an expression, and over one: `a + 1` is the grouped
+    // `a::int + 1` and `(a + 1)::int`, and NULL where a set leaves it out.
+    for sql in [
+        "SELECT a + 1 AS k FROM tc GROUP BY a::int + 1",
+        "SELECT a + 1 AS k FROM tc GROUP BY (a + 1)::int",
+        "SELECT a::int::int4 + 1 AS k FROM tc GROUP BY a + 1",
+        "SELECT (a + 1)::int AS k FROM tc GROUP BY a + 1",
+        "SELECT v || 'x' AS k FROM tc GROUP BY v::varchar(5) || 'x'",
+    ] {
+        let s = db.analyze(sql).unwrap();
+        assert!(!s.columns[0].nullable, "{sql}");
+    }
+    for sql in [
+        "SELECT a + 1 AS k FROM tc GROUP BY ROLLUP (a::int + 1)",
+        "SELECT a::int + 1 AS k FROM tc GROUP BY ROLLUP (a + 1)",
+        "SELECT a + 1 AS k FROM tc GROUP BY ROLLUP ((a + 1)::int)",
+        "SELECT (a + 1)::int AS k FROM tc GROUP BY ROLLUP (a + 1)",
+        "SELECT abs(a::int) AS k FROM tc GROUP BY CUBE (abs(a))",
+    ] {
+        let s = db.analyze(sql).unwrap();
+        assert_cols(&s, vec![cn("k", int4())]);
+    }
     // A cast changing the type or the typmod is a coercion: an expression.
     for (sql, col) in [
         ("SELECT a FROM tc GROUP BY a::int8", "tc.a"),
         ("SELECT v FROM tc GROUP BY v::varchar", "tc.v"),
         ("SELECT n FROM tc GROUP BY n::numeric(10,3)", "tc.n"),
+        ("SELECT a::int8 + 1 FROM tc GROUP BY a + 1", "tc.a"),
+        ("SELECT v || 'x' FROM tc GROUP BY v::varchar || 'x'", "tc.v"),
+        (
+            "SELECT n * 2 FROM tc GROUP BY (n * 2)::numeric(10,2)",
+            "tc.n",
+        ),
     ] {
         assert_err_prefix!(
             db.analyze(sql),

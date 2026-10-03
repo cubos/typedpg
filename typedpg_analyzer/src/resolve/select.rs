@@ -427,7 +427,7 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
             return Err(e);
         }
         if plain_distinct
-            && !sort_expr_in_select_list(inner, &sel.target_list, &select_aliases, snapshot)
+            && !sort_expr_in_select_list(inner, &sel.target_list, &select_aliases, &scope, snapshot)
         {
             return Err(crate::pgmsg::distinct_order_by_not_in_select_list(
                 crate::error::node_location(inner)
@@ -532,7 +532,7 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
         expr::Ctx::new(&scope, &null_ctx, snapshot),
         params,
     )?;
-    check_distinct_on_matches_order_by(sel, &columns, snapshot)?;
+    check_distinct_on_matches_order_by(sel, &columns, &scope, snapshot)?;
     check_sort_group_keys(
         sel,
         &targets,
@@ -1123,6 +1123,7 @@ fn sort_expr_in_select_list(
     inner: &protobuf::Node,
     target_list: &[protobuf::Node],
     select_aliases: &std::collections::HashSet<String>,
+    scope: &Scope,
     snapshot: &PgCatalog,
 ) -> bool {
     if let Some(node::Node::ColumnRef(cr)) = inner.node.as_ref() {
@@ -1133,12 +1134,12 @@ fn sort_expr_in_select_list(
             return true;
         }
     }
-    let want = grouping::typed_fingerprint(inner, snapshot);
+    let want = grouping::typed_fingerprint(inner, scope, snapshot);
     target_list.iter().any(|t| {
         if let Some(node::Node::ResTarget(rt)) = t.node.as_ref()
             && let Some(val) = &rt.val
         {
-            grouping::typed_fingerprint(val, snapshot) == want
+            grouping::typed_fingerprint(val, scope, snapshot) == want
         } else {
             false
         }
@@ -1633,7 +1634,7 @@ fn sort_expr_type(
     ctx: Ctx<'_>,
     params: &ParamCollector,
 ) -> Option<PgTypeOid> {
-    match sort_target_key(inner, target_list, columns, ctx.snapshot) {
+    match sort_target_key(inner, target_list, columns, ctx.scope, ctx.snapshot) {
         SortKey::Target(i) => columns.get(i).map(|c| c.type_oid),
         SortKey::Expr(_) => {
             let mut scratch = params.clone();
@@ -1661,6 +1662,7 @@ fn sort_target_key(
     inner: &protobuf::Node,
     target_list: &[protobuf::Node],
     columns: &[RawColumn],
+    scope: &Scope,
     snapshot: &PgCatalog,
 ) -> SortKey {
     if let Some(ord) = ordinal_of(inner)
@@ -1674,7 +1676,7 @@ fn sort_target_key(
     {
         return SortKey::Target(i);
     }
-    let fp = grouping::typed_fingerprint(inner, snapshot);
+    let fp = grouping::typed_fingerprint(inner, scope, snapshot);
     // Only a plain target list (no `*`) lines up with the output columns.
     let has_star = target_list.iter().any(|t| {
         matches!(t.node.as_ref(), Some(node::Node::ResTarget(rt))
@@ -1685,7 +1687,7 @@ fn sort_target_key(
     if !has_star
         && let Some(i) = target_list.iter().position(|t| {
             matches!(t.node.as_ref(), Some(node::Node::ResTarget(rt))
-                if rt.val.as_deref().is_some_and(|v| grouping::typed_fingerprint(v, snapshot) == fp))
+                if rt.val.as_deref().is_some_and(|v| grouping::typed_fingerprint(v, scope, snapshot) == fp))
         })
     {
         return SortKey::Target(i);
@@ -1700,13 +1702,14 @@ fn sort_target_key(
 fn check_distinct_on_matches_order_by(
     sel: &protobuf::SelectStmt,
     columns: &[RawColumn],
+    scope: &Scope,
     snapshot: &PgCatalog,
 ) -> Result<(), AnalyzeError> {
     let distinct: Vec<SortKey> = sel
         .distinct_clause
         .iter()
         .filter(|n| n.node.is_some())
-        .map(|n| sort_target_key(n, &sel.target_list, columns, snapshot))
+        .map(|n| sort_target_key(n, &sel.target_list, columns, scope, snapshot))
         .collect();
     if distinct.is_empty() || sel.sort_clause.is_empty() {
         return Ok(());
@@ -1730,7 +1733,7 @@ fn check_distinct_on_matches_order_by(
         let Some(inner) = sb.node.as_deref() else {
             continue;
         };
-        let key = sort_target_key(inner, &sel.target_list, columns, snapshot);
+        let key = sort_target_key(inner, &sel.target_list, columns, scope, snapshot);
         if let Some(d) = distinct.iter().find(|d| **d == key) {
             if skipped {
                 return Err(err());
