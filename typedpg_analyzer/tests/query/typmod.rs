@@ -539,3 +539,27 @@ fn typmods_are_strings_parsed_like_integers() {
         assert_err_prefix!(db.analyze(sql), AnalyzeError::Invalid(_), msg);
     }
 }
+
+/// A base type whose `typmodin` isn't modeled takes any simple constant or
+/// identifier as a modifier (PostGIS' `geometry(Point, 4326)`); its typmod
+/// isn't tracked.
+#[test]
+fn unmodeled_typmodin_takes_identifiers() {
+    let mut db = PgCatalog::new().unwrap();
+    // The stand-in `typmodin` (`bittypmodin`) takes integers only; a real
+    // extension's would take the identifier PG rejects here.
+    db.skip_pg_sanity();
+    db.apply_sql(
+        "CREATE TYPE g;
+         CREATE FUNCTION g_in(cstring) RETURNS g LANGUAGE internal IMMUTABLE STRICT AS 'int4in';
+         CREATE FUNCTION g_out(g) RETURNS cstring LANGUAGE internal IMMUTABLE STRICT AS 'int4out';
+         CREATE FUNCTION g_tin(cstring[]) RETURNS int LANGUAGE internal IMMUTABLE STRICT
+             AS 'bittypmodin';
+         CREATE TYPE g (INPUT = g_in, OUTPUT = g_out, TYPMOD_IN = g_tin,
+             INTERNALLENGTH = 4, PASSEDBYVALUE, ALIGNMENT = int4);
+         CREATE TABLE gt (x g(Point, 4326));",
+    )
+    .unwrap();
+    let s = db.analyze("SELECT x FROM gt").unwrap();
+    assert_cols(&s, vec![cn("x", basic("public", "g"))]);
+}
