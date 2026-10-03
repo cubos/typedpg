@@ -277,7 +277,7 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
         expr::Ctx::new(&scope, &null_ctx, snapshot),
         params,
     );
-    let expansion = grouping::expand_grouping_sets(&sel.group_clause, &scope, &targets);
+    let expansion = grouping::expand_grouping_sets(&sel.group_clause, &scope, &targets, snapshot);
     null_ctx.set_grouping_omitted(expansion.omitted);
     null_ctx.has_empty_grouping_set = expansion.has_empty_set;
 
@@ -423,7 +423,9 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
         {
             return Err(e);
         }
-        if plain_distinct && !sort_expr_in_select_list(inner, &sel.target_list, &select_aliases) {
+        if plain_distinct
+            && !sort_expr_in_select_list(inner, &sel.target_list, &select_aliases, snapshot)
+        {
             return Err(crate::pgmsg::distinct_order_by_not_in_select_list(
                 crate::error::node_location(inner)
                     .and_then(crate::error::SourceSpan::from_node_qname),
@@ -527,7 +529,7 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
         expr::Ctx::new(&scope, &null_ctx, snapshot),
         params,
     )?;
-    check_distinct_on_matches_order_by(sel, &columns)?;
+    check_distinct_on_matches_order_by(sel, &columns, snapshot)?;
     check_sort_group_keys(
         sel,
         &targets,
@@ -676,6 +678,7 @@ fn sql92_key<'a>(
     targets: &[ExpandedTarget<'_>],
     columns: &[RawColumn],
     scope: &Scope,
+    snapshot: &PgCatalog,
 ) -> Result<KeyRef<'a>, AnalyzeError> {
     if let Some(ord) = ordinal_of(node) {
         return Ok(match usize::try_from(ord - 1) {
@@ -707,7 +710,7 @@ fn sql92_key<'a>(
     let first_expr = target_expr(targets, first);
     for &other in &matches[1..] {
         let same = match (&first_expr, target_expr(targets, other)) {
-            (Some(a), Some(b)) => grouping::same_level_exprs_equal(a, &b, scope),
+            (Some(a), Some(b)) => grouping::same_level_exprs_equal(a, &b, scope, snapshot),
             _ => false,
         };
         if !same {
@@ -753,7 +756,7 @@ fn check_sort_group_keys(
             .collect()
     }
     for (inner, using) in sort_items(&sel.sort_clause) {
-        let key = sql92_key(inner, "ORDER BY", targets, columns, scope)?;
+        let key = sql92_key(inner, "ORDER BY", targets, columns, scope, ctx.snapshot)?;
         keys.push((key, (!using).then_some(KeyUse::Sort), loc(inner)));
     }
     let mut stack: Vec<&protobuf::Node> = sel.group_clause.iter().rev().collect();
@@ -763,7 +766,7 @@ fn check_sort_group_keys(
         } else if let Some(items) = grouping::implicit_row_items(g) {
             stack.extend(items.iter().rev());
         } else {
-            let key = sql92_key(g, "GROUP BY", targets, columns, scope)?;
+            let key = sql92_key(g, "GROUP BY", targets, columns, scope, ctx.snapshot)?;
             keys.push((key, Some(KeyUse::Group), loc(g)));
         }
     }
@@ -779,7 +782,7 @@ fn check_sort_group_keys(
         }
     } else {
         for d in sel.distinct_clause.iter().filter(|n| n.node.is_some()) {
-            let key = sql92_key(d, "DISTINCT ON", targets, columns, scope)?;
+            let key = sql92_key(d, "DISTINCT ON", targets, columns, scope, ctx.snapshot)?;
             keys.push((key, Some(KeyUse::Group), loc(d)));
         }
     }
@@ -1097,23 +1100,16 @@ fn ordinal_of(node: &protobuf::Node) -> Option<i64> {
     None
 }
 
-/// Structural fingerprint of an expression node with the `location` fields
-/// neutralized — `Debug` output with every `location: N` span removed. Used
-/// to compare an ORDER BY expression against the projection entries (PG's
-/// "appears in select list" test), where byte positions necessarily differ.
+/// Structural fingerprint of an expression node: its key under PG's
+/// `equal()` ([`typedpg_pg_query::Equal::equal_key`]), which skips every
+/// source position — `location`, and PG 18's `list_start` / `list_end` of
+/// `ARRAY[…]` and `IN (…)` lists among them. Used to compare an ORDER BY
+/// expression against the projection entries (PG's "appears in select
+/// list" test), where byte positions necessarily differ.
 pub(crate) fn node_fingerprint(node: &protobuf::Node) -> String {
-    let dbg = format!("{node:?}");
-    let mut out = String::with_capacity(dbg.len());
-    let mut rest = dbg.as_str();
-    while let Some(pos) = rest.find("location: ") {
-        out.push_str(&rest[..pos]);
-        rest = &rest[pos + "location: ".len()..];
-        let end = rest
-            .find(|c: char| !c.is_ascii_digit() && c != '-')
-            .unwrap_or(rest.len());
-        rest = &rest[end..];
-    }
-    out.push_str(rest);
+    use typedpg_pg_query::Equal;
+    let mut out = String::new();
+    node.equal_key(&mut out);
     out
 }
 
@@ -1124,6 +1120,7 @@ fn sort_expr_in_select_list(
     inner: &protobuf::Node,
     target_list: &[protobuf::Node],
     select_aliases: &std::collections::HashSet<String>,
+    snapshot: &PgCatalog,
 ) -> bool {
     if let Some(node::Node::ColumnRef(cr)) = inner.node.as_ref() {
         let parts = expr::extract_string_fields(&cr.fields);
@@ -1133,12 +1130,12 @@ fn sort_expr_in_select_list(
             return true;
         }
     }
-    let want = node_fingerprint(inner);
+    let want = grouping::typed_fingerprint(inner, snapshot);
     target_list.iter().any(|t| {
         if let Some(node::Node::ResTarget(rt)) = t.node.as_ref()
             && let Some(val) = &rt.val
         {
-            node_fingerprint(val) == want
+            grouping::typed_fingerprint(val, snapshot) == want
         } else {
             false
         }
@@ -1633,7 +1630,7 @@ fn sort_expr_type(
     ctx: Ctx<'_>,
     params: &ParamCollector,
 ) -> Option<PgTypeOid> {
-    match sort_target_key(inner, target_list, columns) {
+    match sort_target_key(inner, target_list, columns, ctx.snapshot) {
         SortKey::Target(i) => columns.get(i).map(|c| c.type_oid),
         SortKey::Expr(_) => {
             let mut scratch = params.clone();
@@ -1661,6 +1658,7 @@ fn sort_target_key(
     inner: &protobuf::Node,
     target_list: &[protobuf::Node],
     columns: &[RawColumn],
+    snapshot: &PgCatalog,
 ) -> SortKey {
     if let Some(ord) = ordinal_of(inner)
         && ord >= 1
@@ -1673,7 +1671,7 @@ fn sort_target_key(
     {
         return SortKey::Target(i);
     }
-    let fp = node_fingerprint(inner);
+    let fp = grouping::typed_fingerprint(inner, snapshot);
     // Only a plain target list (no `*`) lines up with the output columns.
     let has_star = target_list.iter().any(|t| {
         matches!(t.node.as_ref(), Some(node::Node::ResTarget(rt))
@@ -1684,7 +1682,7 @@ fn sort_target_key(
     if !has_star
         && let Some(i) = target_list.iter().position(|t| {
             matches!(t.node.as_ref(), Some(node::Node::ResTarget(rt))
-                if rt.val.as_deref().is_some_and(|v| node_fingerprint(v) == fp))
+                if rt.val.as_deref().is_some_and(|v| grouping::typed_fingerprint(v, snapshot) == fp))
         })
     {
         return SortKey::Target(i);
@@ -1699,12 +1697,13 @@ fn sort_target_key(
 fn check_distinct_on_matches_order_by(
     sel: &protobuf::SelectStmt,
     columns: &[RawColumn],
+    snapshot: &PgCatalog,
 ) -> Result<(), AnalyzeError> {
     let distinct: Vec<SortKey> = sel
         .distinct_clause
         .iter()
         .filter(|n| n.node.is_some())
-        .map(|n| sort_target_key(n, &sel.target_list, columns))
+        .map(|n| sort_target_key(n, &sel.target_list, columns, snapshot))
         .collect();
     if distinct.is_empty() || sel.sort_clause.is_empty() {
         return Ok(());
@@ -1728,7 +1727,7 @@ fn check_distinct_on_matches_order_by(
         let Some(inner) = sb.node.as_deref() else {
             continue;
         };
-        let key = sort_target_key(inner, &sel.target_list, columns);
+        let key = sort_target_key(inner, &sel.target_list, columns, snapshot);
         if let Some(d) = distinct.iter().find(|d| **d == key) {
             if skipped {
                 return Err(err());

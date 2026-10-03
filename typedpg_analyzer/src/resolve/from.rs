@@ -1924,7 +1924,7 @@ fn function_rte_columns(
             resolved.schema == "pg_catalog"
                 && !functions::builtin_result_nullable(
                     &resolved,
-                    &arg_nullable,
+                    &resolved.in_declared_order(&arg_nullable, false),
                     func_call.func_variadic,
                 )
         }

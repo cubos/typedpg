@@ -4,6 +4,7 @@
 
 use typedpg_pg_query::protobuf::{self, node};
 
+use crate::decimal::Decimal;
 use crate::expr;
 use crate::nonnull::Col;
 use crate::pg_catalog::PgCatalog;
@@ -213,8 +214,8 @@ enum Hypothesis<'a> {
 enum Val {
     /// Certainly NULL.
     Null,
-    /// This number.
-    Num(f64),
+    /// This integer or `numeric` value (never a float: see [`Decimal`]).
+    Num(Decimal),
     /// A boolean among these outcomes (`T`, `F`, `N` bits).
     Bool(u8),
     /// Anything, NULL included.
@@ -271,31 +272,30 @@ fn eval(node: &protobuf::Node, h: &Hypothesis<'_>, scope: &Scope, snapshot: &PgC
     match inner {
         node::Node::AConst(c) if c.isnull => Val::Null,
         node::Node::AConst(c) => match &c.val {
-            Some(C::Ival(i)) => Val::Num(f64::from(i.ival)),
-            Some(C::Fval(f)) => f.fval.parse().map_or(Val::Any, Val::Num),
+            Some(C::Ival(i)) => Val::Num(Decimal::int(i64::from(i.ival))),
+            Some(C::Fval(f)) => Decimal::parse(&f.fval).map_or(Val::Any, Val::Num),
             Some(C::Boolval(b)) => Val::Bool(if b.boolval { T } else { F }),
             _ => Val::Any,
         },
         node::Node::TypeCast(c) => {
-            let numeric_target = c.type_name.as_ref().is_some_and(|tn| {
-                tn.typmods.is_empty()
-                    && tn.array_bounds.is_empty()
-                    && matches!(
-                        expr::extract_string_fields(&tn.names)
-                            .iter()
-                            .map(String::as_str)
-                            .collect::<Vec<_>>()
-                            .as_slice(),
-                        [
-                            "pg_catalog",
-                            "int2" | "int4" | "int8" | "numeric" | "float4" | "float8"
-                        ]
-                    )
+            // An exact target: an integer one rounds, `numeric` (without a
+            // typmod, which would round too) keeps the value. A float one
+            // is inexact — what its arithmetic gives isn't tracked.
+            let target = c.type_name.as_ref().and_then(|tn| {
+                let names = expr::extract_string_fields(&tn.names);
+                match names.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+                    _ if !tn.typmods.is_empty() || !tn.array_bounds.is_empty() => None,
+                    ["pg_catalog", t @ ("int2" | "int4" | "int8" | "numeric")] => {
+                        Some(t == "numeric")
+                    }
+                    _ => None,
+                }
             });
-            match c.arg.as_deref().map(sub) {
+            match (c.arg.as_deref().map(sub), target) {
                 // A cast of NULL is NULL (or fails, to a domain): not TRUE.
-                Some(Val::Null) => Val::Null,
-                Some(v @ Val::Num(_)) if numeric_target => v,
+                (Some(Val::Null), _) => Val::Null,
+                (Some(v @ Val::Num(_)), Some(true)) => v,
+                (Some(Val::Num(d)), Some(false)) => d.round().map_or(Val::Any, Val::Num),
                 _ => Val::Any,
             }
         }
@@ -308,7 +308,7 @@ fn eval(node: &protobuf::Node, h: &Hypothesis<'_>, scope: &Scope, snapshot: &PgC
             let class = aggregate_class(name);
             match h {
                 Hypothesis::Empty => match class {
-                    AggregateClass::Count => Val::Num(0.0),
+                    AggregateClass::Count => Val::Num(Decimal::ZERO),
                     AggregateClass::Hypothetical => Val::Any,
                     AggregateClass::NullKeeping | AggregateClass::Strict => Val::Null,
                 },
@@ -318,7 +318,9 @@ fn eval(node: &protobuf::Node, h: &Hypothesis<'_>, scope: &Scope, snapshot: &PgC
                         .any(|a| column_of(a, scope).as_ref() == Some(*col));
                     match class {
                         // (`count(*)` reads no column.)
-                        AggregateClass::Count if reads_col && !fc.agg_star => Val::Num(0.0),
+                        AggregateClass::Count if reads_col && !fc.agg_star => {
+                            Val::Num(Decimal::ZERO)
+                        }
                         AggregateClass::Strict if reads_col => Val::Null,
                         _ => Val::Any,
                     }
@@ -343,7 +345,7 @@ fn eval(node: &protobuf::Node, h: &Hypothesis<'_>, scope: &Scope, snapshot: &PgC
                 None => {
                     return match (op, r) {
                         (_, Val::Null) => Val::Null,
-                        ("-", Val::Num(x)) => Val::Num(-x),
+                        ("-", Val::Num(x)) => x.checked_neg().map_or(Val::Any, Val::Num),
                         ("+", Val::Num(x)) => Val::Num(x),
                         _ => Val::Any,
                     };
@@ -355,17 +357,21 @@ fn eval(node: &protobuf::Node, h: &Hypothesis<'_>, scope: &Scope, snapshot: &PgC
             let (Val::Num(a), Val::Num(b)) = (l, r) else {
                 return Val::Any;
             };
-            let cmp = |b: bool| Val::Bool(if b { T } else { F });
+            let num = |d: Option<Decimal>| d.map_or(Val::Any, Val::Num);
+            let cmp = |holds: fn(std::cmp::Ordering) -> bool| match a.compare(b) {
+                Some(o) => Val::Bool(if holds(o) { T } else { F }),
+                None => Val::Any,
+            };
             match op {
-                "<" => cmp(a < b),
-                "<=" => cmp(a <= b),
-                ">" => cmp(a > b),
-                ">=" => cmp(a >= b),
-                "=" => cmp(a == b),
-                "<>" | "!=" => cmp(a != b),
-                "+" => Val::Num(a + b),
-                "-" => Val::Num(a - b),
-                "*" => Val::Num(a * b),
+                "<" => cmp(std::cmp::Ordering::is_lt),
+                "<=" => cmp(std::cmp::Ordering::is_le),
+                ">" => cmp(std::cmp::Ordering::is_gt),
+                ">=" => cmp(std::cmp::Ordering::is_ge),
+                "=" => cmp(std::cmp::Ordering::is_eq),
+                "<>" | "!=" => cmp(std::cmp::Ordering::is_ne),
+                "+" => num(a.checked_add(b)),
+                "-" => num(a.checked_sub(b)),
+                "*" => num(a.checked_mul(b)),
                 _ => Val::Any,
             }
         }

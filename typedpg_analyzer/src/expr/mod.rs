@@ -840,7 +840,7 @@ pub(crate) fn infer_expr(
         && ctx.null_ctx.grouping_omits_exprs()
         && ctx.null_ctx.grouping_omitted.contains(&(
             crate::grouping::EXPR_KEY.to_owned(),
-            crate::grouping::expr_key(node),
+            crate::grouping::expr_key(node, ctx.snapshot),
         ))
     {
         t.nullable = true;

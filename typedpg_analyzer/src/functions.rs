@@ -109,6 +109,31 @@ pub(crate) struct ResolvedFunction {
     pub nvargs: usize,
     /// `pg_proc.provariadic` of the matched routine (PG's `vatype`).
     pub provariadic: Option<PgTypeOid>,
+    /// The parameter each call argument binds to, in call order: its
+    /// position in the declared parameter list (with a variadic parameter
+    /// expanded, its elements follow it). The identity for positional
+    /// notation; a named argument binds by name (`string_agg(delimiter =>
+    /// ',', value => x)` binds its first argument to parameter 1).
+    pub arg_positions: Vec<usize>,
+}
+
+impl ResolvedFunction {
+    /// Per-argument `values` (in call order) rearranged by the parameter
+    /// each binds to ([`Self::arg_positions`]) — what every rule keyed by
+    /// parameter position reads. A parameter the call leaves to its default
+    /// before a later named one gets `fill`.
+    pub(crate) fn in_declared_order<T: Clone>(&self, values: &[T], fill: T) -> Vec<T> {
+        if self.arg_positions.iter().enumerate().all(|(i, &p)| i == p) {
+            return values.to_vec();
+        }
+        let len = self.arg_positions.iter().max().map_or(0, |&m| m + 1);
+        let mut out = vec![fill; len];
+        for (v, &p) in values.iter().zip(&self.arg_positions) {
+            out[p] = v.clone();
+        }
+        out.extend(values.iter().skip(self.arg_positions.len()).cloned());
+        out
+    }
 }
 
 /// What a call resolved to — PG's `FuncDetailCode` for the successful
@@ -155,6 +180,9 @@ struct Candidate<'a> {
     /// The `proargtypes` positions of the defaulted parameters, in the
     /// order they follow the call's arguments in `args`.
     default_params: Vec<usize>,
+    /// The parameter position each call argument binds to, in call order
+    /// (see [`ResolvedFunction::arg_positions`]).
+    arg_positions: Vec<usize>,
     nvargs: usize,
     /// Index of the candidate's schema on the search path.
     pathpos: usize,
@@ -358,6 +386,7 @@ pub(crate) fn func_get_detail(
             .map(|a| (a.aggkind, a.aggnumdirectargs)),
         nvargs: cand.nvargs,
         provariadic: f.provariadic,
+        arg_positions: cand.arg_positions.clone(),
         return_type_oid,
         arg_types: declared,
         schema: snapshot
@@ -576,6 +605,7 @@ fn func_candidates<'a>(
                 proc: f,
                 args: order.iter().map(|&pp| param_types[pp]).collect(),
                 default_params: order[nargs..].to_vec(),
+                arg_positions: order[..nargs].to_vec(),
                 ndargs: pronargs - nargs,
                 nvargs: 0,
                 pathpos,
@@ -604,6 +634,7 @@ fn func_candidates<'a>(
                 args,
                 ndargs: pronargs.saturating_sub(nargs),
                 default_params: (nargs..pronargs).collect(),
+                arg_positions: (0..nargs).collect(),
                 nvargs,
                 pathpos,
                 ambiguous: false,
@@ -935,6 +966,10 @@ pub(crate) fn operator_result_nullable(
 /// strict function is NULL exactly on a NULL argument unless it is one of
 /// the known NULL-returning overloads; a non-strict one is nullable unless
 /// known never to be, or to be NULL only on NULL arguments.
+///
+/// `args_nullable` is by parameter position — a call in named notation
+/// rearranged with [`ResolvedFunction::in_declared_order`] — as the
+/// tables' argument indexes are.
 pub(crate) fn builtin_result_nullable(
     resolved: &ResolvedFunction,
     args_nullable: &[bool],

@@ -1060,10 +1060,7 @@ fn const_regex_pattern(
     snapshot: &PgCatalog,
 ) -> Option<Result<String, AnalyzeError>> {
     if let Some(node::Node::FuncCall(fc)) = node.node.as_ref()
-        && extract_string_fields(&fc.funcname)
-            .last()
-            .map(String::as_str)
-            == Some("similar_to_escape")
+        && is_builtin_similar_to_escape(fc, snapshot)
     {
         let pattern = const_string(fc.args.first()?, snapshot)?;
         let escape = match fc.args.get(1) {
@@ -1073,6 +1070,21 @@ fn const_regex_pattern(
         return Some(similar_escape(&pattern, escape.as_deref()));
     }
     const_string(node, snapshot).map(Ok)
+}
+
+/// The grammar's `pg_catalog.similar_to_escape`, or a call that can reach
+/// only it — not a user function of that name.
+fn is_builtin_similar_to_escape(fc: &protobuf::FuncCall, snapshot: &PgCatalog) -> bool {
+    let parts = extract_string_fields(&fc.funcname);
+    let schema = match parts.as_slice() {
+        [n] if n == "similar_to_escape" => None,
+        [s, n] if s == "pg_catalog" && n == "similar_to_escape" => Some("pg_catalog"),
+        _ => return false,
+    };
+    snapshot
+        .find_functions(schema, "similar_to_escape")
+        .iter()
+        .all(|p| snapshot.namespace_name(p.pronamespace) == Some("pg_catalog"))
 }
 
 fn check_regex_pattern(

@@ -37,6 +37,7 @@ mod clause;
 mod coerce;
 mod datetime_input;
 mod ddl;
+mod decimal;
 mod diagnostic;
 mod error;
 mod expr;

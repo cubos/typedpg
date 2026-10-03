@@ -146,10 +146,11 @@ impl Cmp {
 
 /// A constant operand. Only constants of the same kind are compared: an
 /// integer and a decimal literal resolve to different operand types, which
-/// PG may not relate through one operator family.
+/// PG may not relate through one operator family. A decimal literal is a
+/// `numeric`, compared exactly.
 enum Constant {
     Int(i64),
-    Decimal(f64),
+    Decimal(crate::decimal::Decimal),
     Text(String),
 }
 
@@ -167,7 +168,7 @@ impl Constant {
             Val::Fval(f) => match f.fval.parse::<i64>() {
                 // An integer too wide for int4 is still an integer literal.
                 Ok(i) if !f.fval.contains(['.', 'e', 'E']) => Constant::Int(i),
-                _ => Constant::Decimal(f.fval.parse().ok()?),
+                _ => Constant::Decimal(crate::decimal::Decimal::parse(&f.fval)?),
             },
             Val::Sval(s) => Constant::Text(s.sval.clone()),
             _ => return None,
@@ -177,7 +178,7 @@ impl Constant {
     fn compare(&self, other: &Constant) -> Option<std::cmp::Ordering> {
         match (self, other) {
             (Constant::Int(a), Constant::Int(b)) => Some(a.cmp(b)),
-            (Constant::Decimal(a), Constant::Decimal(b)) => a.partial_cmp(b),
+            (Constant::Decimal(a), Constant::Decimal(b)) => a.compare(*b),
             _ => None,
         }
     }
