@@ -555,13 +555,9 @@ fn add_detached_partition_check(
         connoinherit: false,
         conperiod: false,
     });
-    interp.check_defs.insert(
-        oid,
-        super::check_inherit::CheckDef {
-            expr: stored,
-            no_inherit: false,
-        },
-    );
+    let mut def = super::check_inherit::CheckDef::new(stored, false);
+    def.cook(interp, part);
+    interp.check_defs.insert(oid, def);
     Ok(())
 }
 

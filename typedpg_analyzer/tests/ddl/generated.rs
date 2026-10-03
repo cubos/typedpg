@@ -696,3 +696,34 @@ fn partitions_follow_the_parent_generation() {
         ),
     )]);
 }
+
+#[test]
+fn a_call_leaving_parameters_out_runs_their_defaults() {
+    // CheckMutability looks at a call with its DEFAULT arguments filled
+    // in: a stable `now()` default makes it mutable — unless the function
+    // is inlined (a simple SQL body), which drops an unused argument.
+    let setup = "CREATE SEQUENCE s;
+         CREATE FUNCTION f(n bigint DEFAULT nextval('s')) RETURNS int LANGUAGE sql IMMUTABLE
+             AS 'SELECT 1';
+         CREATE FUNCTION h(n timestamptz DEFAULT now()) RETURNS int LANGUAGE plpgsql IMMUTABLE
+             AS 'BEGIN RETURN 1; END';";
+    assert_err(
+        setup,
+        "CREATE TABLE t (a int, b int GENERATED ALWAYS AS (h()) STORED);",
+        "generation expression is not immutable",
+    );
+    assert_err(
+        setup,
+        "CREATE TABLE t (a int); CREATE INDEX ON t ((a + h()));",
+        "functions in index expression must be marked IMMUTABLE",
+    );
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "CREATE TABLE t (a int, b int GENERATED ALWAYS AS (f()) STORED,
+                 c int GENERATED ALWAYS AS (h('2000-01-01')) STORED);
+             CREATE INDEX ON t ((a + f()));",
+        ),
+    ]);
+}

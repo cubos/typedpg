@@ -1564,6 +1564,7 @@ pub(crate) fn alter_column_type(
         attr.attcollation,
     )?;
     recheck_dependents_of_retyped_column(interp, relid, &attr)?;
+    super::check_inherit::recook_checks_reading(interp, relid, attr.attnum);
     Ok(())
 }
 
@@ -1636,7 +1637,10 @@ fn recheck_dependents_of_retyped_column(
             && let Ok(expr) = typedpg_pg_query::protobuf::Node::decode(pred.ast.as_slice())
             && reads_column(&expr)
         {
-            infer_bool(&expr, "WHERE")?;
+            infer_bool(
+                &crate::ddl::stored_exprs::over_own_row(interp, relid, &expr),
+                "WHERE",
+            )?;
         }
     }
 
@@ -1661,7 +1665,10 @@ fn recheck_dependents_of_retyped_column(
                     ..
                 }) = interp.check_defs.get(&con.oid)
                 {
-                    infer_bool(expr, "CHECK")?;
+                    infer_bool(
+                        &crate::ddl::stored_exprs::over_own_row(interp, relid, expr),
+                        "CHECK",
+                    )?;
                 }
             }
             ConType::ForeignKey => {

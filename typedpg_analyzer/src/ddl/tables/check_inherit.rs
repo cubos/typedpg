@@ -13,6 +13,37 @@ use super::*;
 pub(crate) struct CheckDef {
     pub(crate) expr: StoredExpr,
     pub(crate) no_inherit: bool,
+    /// What the expression's operators and functions resolved to when the
+    /// constraint was created (PG keeps them by OID), and the types of its
+    /// literals: see [`CheckDef::cook`]. `None` until then — and then
+    /// nothing in it is trusted.
+    pub(crate) trusted: Option<crate::nonnull::TrustedNodes>,
+}
+
+impl CheckDef {
+    /// A definition not resolved yet.
+    pub(crate) fn new(expr: StoredExpr, no_inherit: bool) -> CheckDef {
+        CheckDef {
+            expr,
+            no_inherit,
+            trusted: None,
+        }
+    }
+
+    /// Resolve the expression over the row of `relid` as it is created
+    /// (under the search path then in effect), unless it already was (a
+    /// copy of a parent's or a LIKE source's constraint keeps what that
+    /// one resolved to).
+    pub(crate) fn cook(&mut self, interp: &PgCatalog, relid: PgClassOid) {
+        if self.trusted.is_none()
+            && let StoredExpr::Written(expr) = &self.expr
+        {
+            self.trusted = Some(
+                crate::ddl::volatile::trusted_over_relation(interp, relid, expr)
+                    .unwrap_or_default(),
+            );
+        }
+    }
 }
 
 /// A CHECK constraint's `conenforced` / `convalidated` as it is added.
@@ -58,6 +89,39 @@ impl PartialEq for StoredExpr {
             (StoredExpr::Serial(r1, a1), StoredExpr::Serial(r2, a2)) => r1 == r2 && a1 == a2,
             _ => false,
         }
+    }
+}
+
+/// ALTER COLUMN TYPE rebuilds the CHECK constraints reading the column
+/// from their definitions, over the new type: what each resolved to is
+/// what both resolutions agree on (a comparison stays trusted only if it
+/// is still the built-in one), the literals typed anew.
+pub(crate) fn recook_checks_reading(interp: &mut PgCatalog, relid: PgClassOid, attnum: i16) {
+    let oids: Vec<PgConstraintOid> = interp
+        .pg_constraint
+        .values()
+        .filter(|c| {
+            c.conrelid == relid && c.contype == ConType::Check && c.conkey.contains(&attnum)
+        })
+        .map(|c| c.oid)
+        .collect();
+    for oid in oids {
+        let Some(mut def) = interp.check_defs.get(&oid).cloned() else {
+            continue;
+        };
+        let StoredExpr::Written(expr) = &def.expr else {
+            continue;
+        };
+        let now =
+            crate::ddl::volatile::trusted_over_relation(interp, relid, expr).unwrap_or_default();
+        def.trusted = Some(match def.trusted.take() {
+            Some(before) => crate::nonnull::TrustedNodes {
+                nodes: before.nodes.intersection(&now.nodes).copied().collect(),
+                literal_types: now.literal_types,
+            },
+            None => crate::nonnull::TrustedNodes::default(),
+        });
+        interp.check_defs.insert(oid, def);
     }
 }
 
@@ -147,7 +211,8 @@ fn insert_check(
         connoinherit: def.as_ref().is_some_and(|d| d.no_inherit),
         conperiod: false,
     });
-    if let Some(def) = def {
+    if let Some(mut def) = def {
+        def.cook(interp, relid);
         interp.check_defs.insert(oid, def);
         crate::ddl::depend::record_check_constraint(interp, oid);
     }
@@ -269,10 +334,7 @@ pub(super) fn add_check(
     conkey: Vec<i16>,
     flags: CheckFlags,
 ) -> Result<(), DdlError> {
-    let def = CheckDef {
-        expr: StoredExpr::written(expr),
-        no_inherit,
-    };
+    let def = CheckDef::new(StoredExpr::written(expr), no_inherit);
     let relname = relname_of(interp, relid);
     if let Some(existing) = constraint_named(interp, relid, name) {
         // A local constraint merges only into a purely inherited one.

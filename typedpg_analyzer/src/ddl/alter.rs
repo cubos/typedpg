@@ -399,6 +399,9 @@ fn rename_column_in(
             "column name \"{new}\" conflicts with a system column name"
         )));
     }
+    // The expressions kept as written read the column by its new name
+    // (PG's read it by attnum).
+    super::stored_exprs::rename_column(interp, relid, old, new);
     if let Some(attrs) = interp.pg_attribute.get_mut(&relid)
         && let Some(col) = attrs.iter_mut().find(|c| c.attname == old)
     {

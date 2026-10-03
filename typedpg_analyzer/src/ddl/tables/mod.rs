@@ -1321,12 +1321,26 @@ fn apply_alter_subtype(
             interp.row_security.remove(&relid);
             Ok(())
         }
-        AlterTableType::AtDisableTrigAll => {
-            interp.ri_triggers_disabled.insert(relid);
-            Ok(())
-        }
-        AlterTableType::AtEnableTrigAll => {
-            interp.ri_triggers_disabled.remove(&relid);
+        // EnableDisableTrigger recurses into a partitioned table's
+        // partitions (unless ONLY), whose triggers enforce its foreign
+        // keys for their rows.
+        AlterTableType::AtDisableTrigAll | AlterTableType::AtEnableTrigAll => {
+            let partitioned = interp
+                .pg_class
+                .get(&relid)
+                .is_some_and(|c| c.relkind == RelKind::Partitioned);
+            let targets = if rec.recurse && partitioned {
+                inherit::all_inheritors(interp, relid)
+            } else {
+                vec![relid]
+            };
+            for rel in targets {
+                if subtype == AlterTableType::AtDisableTrigAll {
+                    interp.ri_triggers_disabled.insert(rel);
+                } else {
+                    interp.ri_triggers_disabled.remove(&rel);
+                }
+            }
             Ok(())
         }
         AlterTableType::AtEnableTrig

@@ -1396,6 +1396,29 @@ pub(crate) fn level_calls(
     out
 }
 
+/// How many levels out aggregate call `fc`, written at the current level,
+/// belongs: the innermost level of the columns its aggregated arguments
+/// (ORDER BY and FILTER included) read — `0` for this level's own.
+pub(crate) fn aggregate_levels_up(fc: &protobuf::FuncCall, scope: &Scope) -> usize {
+    let sort_exprs = fc.agg_order.iter().filter_map(|o| match o.node.as_ref() {
+        Some(node::Node::SortBy(sb)) => sb.node.as_deref(),
+        _ => Some(o),
+    });
+    let mut aggregated: Vec<&protobuf::Node> = if fc.agg_within_group {
+        sort_exprs.collect()
+    } else {
+        fc.args.iter().chain(sort_exprs).collect()
+    };
+    aggregated.extend(fc.agg_filter.as_deref());
+    levels_up_of(&aggregated, scope)
+}
+
+/// How many levels out an aggregate whose aggregated expressions are
+/// `aggregated`, written at the current level, belongs.
+pub(crate) fn levels_up_of(aggregated: &[&protobuf::Node], scope: &Scope) -> usize {
+    call_level(aggregated, &mut current_chain(scope))
+}
+
 /// Hand a call found at the current level that belongs `levels_up` levels
 /// out to that level: an error when the clause that level is analyzing
 /// forbids it, else it makes that level grouped. `grouping` carries a

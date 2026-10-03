@@ -2055,13 +2055,13 @@ fn validate_array(content: &str, elem: PgTypeOid, snapshot: &PgCatalog) -> Resul
 }
 
 /// `domain_check_input` on a NULL value: any NOT NULL constraint along the
-/// domain chain rejects it, naming the outermost domain.
+/// domain chain rejects it, as does a CHECK a NULL fails — naming the
+/// outermost domain.
 fn check_domain_accepts_null(ty: PgTypeOid, snapshot: &PgCatalog) -> Result<(), String> {
-    if snapshot.domain_not_null_name(ty).is_some() {
-        let name = crate::ddl::util::format_type_for_message(snapshot, ty);
-        return Err(format!("domain {name} does not allow null values"));
+    match snapshot.domain_null_violation(ty) {
+        Some(msg) => Err(msg),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// True unless the array literal `content` provably parses to an array

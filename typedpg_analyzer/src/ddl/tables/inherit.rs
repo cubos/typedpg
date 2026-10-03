@@ -570,6 +570,32 @@ pub(crate) fn validate_not_null(
 }
 
 /// `relid` and all its descendants (find_all_inheritors).
+/// Whether the triggers enforcing foreign keys may be off for some row a
+/// scan of `relid` returns, or for a row it holds: `DISABLE TRIGGER ALL`
+/// on the relation, on one of its descendants (a partition holds its own
+/// triggers) or on an ancestor (`ONLY` on a partitioned table, or
+/// partitions attached since).
+pub(crate) fn fk_triggers_disabled(interp: &PgCatalog, relid: PgClassOid) -> bool {
+    if interp.ri_triggers_disabled.is_empty() {
+        return false;
+    }
+    let mut ancestors = vec![relid];
+    let mut i = 0;
+    while i < ancestors.len() && i < 64 {
+        let rel = ancestors[i];
+        for h in interp.pg_inherits.iter().filter(|h| h.inhrelid == rel) {
+            if !ancestors.contains(&h.inhparent) {
+                ancestors.push(h.inhparent);
+            }
+        }
+        i += 1;
+    }
+    ancestors
+        .into_iter()
+        .chain(all_inheritors(interp, relid))
+        .any(|r| interp.ri_triggers_disabled.contains(&r))
+}
+
 pub(crate) fn all_inheritors(interp: &PgCatalog, relid: PgClassOid) -> Vec<PgClassOid> {
     let mut tree = vec![relid];
     let mut i = 0;

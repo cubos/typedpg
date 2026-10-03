@@ -221,11 +221,20 @@ pub(crate) fn infer_coalesce(
     }
 
     let branches: Vec<(&protobuf::Node, &ExprType)> = expr.args.iter().zip(&args).collect();
-    Ok(
-        ExprType::scalar_with_typmod(type_oid, all_nullable, agreed_typmod(&args, type_oid))
-            .with_collation(derive_collation(&args, type_oid, snapshot)?)
-            .with_elem_nullable(branches_elem_nullable(&branches, type_oid, snapshot)),
-    )
+    let typmod = agreed_typmod(&args, type_oid);
+    ctx.note_strict(
+        expr.location,
+        crate::nonnull::StrictNode::ExactFold,
+        crate::nonnull::subst::folds_exactly(type_oid, typmod, snapshot),
+    );
+    ctx.note_strict(
+        expr.location,
+        crate::nonnull::StrictNode::FloatFold,
+        crate::nonnull::subst::folds_as_float(type_oid, snapshot),
+    );
+    Ok(ExprType::scalar_with_typmod(type_oid, all_nullable, typmod)
+        .with_collation(derive_collation(&args, type_oid, snapshot)?)
+        .with_elem_nullable(branches_elem_nullable(&branches, type_oid, snapshot)))
 }
 
 /// Coerce each branch of a CASE / COALESCE / GREATEST / … to the common
@@ -412,7 +421,13 @@ pub(crate) fn infer_case(
                             .union(crate::nonnull::nonnullable(
                                 cond, false, ctx.scope, &log, snapshot,
                             ));
+                        // Only the built-in `=` says the column holds
+                        // that value (or, not TRUE, doesn't).
                         if !crate::nonnull::disabled()
+                            && log.is_strict(
+                                when.location,
+                                crate::nonnull::StrictNode::BuiltinCompare,
+                            )
                             && let Some((col, t)) = crate::nonnull::plain_column(test, ctx.scope)
                             && let Some(v) = crate::nonnull::literal_for(cond, t, snapshot)
                         {
@@ -466,6 +481,10 @@ pub(crate) fn infer_case(
             not_taken = not_taken.union(crate::nonnull::nonnullable_unless_true(
                 cond, ctx.scope, &log, snapshot,
             ));
+        }
+        // The WHEN is part of whatever expression the caller logs.
+        if let Some(outer) = ctx.strict_log {
+            outer.absorb(&log);
         }
         not_taken = not_taken.union(simple_not_taken);
     }

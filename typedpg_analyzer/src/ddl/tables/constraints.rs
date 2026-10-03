@@ -105,12 +105,12 @@ pub(crate) fn emit_constraints(
                         None,
                         Vec::new(),
                         Some((
-                            check_inherit::CheckDef {
-                                expr: check_inherit::StoredExpr::written(
+                            check_inherit::CheckDef::new(
+                                check_inherit::StoredExpr::written(
                                     &c.raw_expr.clone().map(|b| *b).unwrap_or_default(),
                                 ),
-                                no_inherit: c.is_no_inherit,
-                            },
+                                c.is_no_inherit,
+                            ),
                             c.is_enforced,
                         )),
                         c.deferrable,
@@ -211,12 +211,12 @@ pub(crate) fn emit_constraints(
                     None,
                     Vec::new(),
                     Some((
-                        check_inherit::CheckDef {
-                            expr: check_inherit::StoredExpr::written(
+                        check_inherit::CheckDef::new(
+                            check_inherit::StoredExpr::written(
                                 &c.raw_expr.clone().map(|b| *b).unwrap_or_default(),
                             ),
-                            no_inherit: c.is_no_inherit,
-                        },
+                            c.is_no_inherit,
+                        ),
                         c.is_enforced,
                     )),
                     c.deferrable,
@@ -334,7 +334,8 @@ pub(crate) fn emit_constraints(
             false,
             Some(spec),
         )?;
-        if let Some((def, enforced)) = check {
+        if let Some((mut def, enforced)) = check {
+            def.cook(interp, relid);
             // CREATE TABLE's constraints are valid unless NOT ENFORCED.
             if let Some(row) = interp.pg_constraint.get_mut(&oid) {
                 row.connoinherit = def.no_inherit;

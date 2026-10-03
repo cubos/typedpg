@@ -310,3 +310,86 @@ fn dependencies_survive_renames() {
         );
     }
 }
+
+// ── RENAME COLUMN and the expressions reading the column ────────────────────
+
+#[test]
+fn a_renamed_column_is_read_by_its_constraints_under_its_new_name() {
+    // PG keeps a CHECK by attnum: retyping the renamed column rebuilds the
+    // CHECK over it (and fails where it no longer fits), whatever it was
+    // called when the CHECK was written.
+    let result = try_apply(&[
+        (
+            "0001.sql",
+            "CREATE TABLE t (id int, x int, CHECK (x > 0), CHECK (t.x < 100));",
+        ),
+        ("0002.sql", "ALTER TABLE t RENAME COLUMN x TO y;"),
+        ("0003.sql", "ALTER TABLE t ALTER COLUMN y TYPE text;"),
+    ]);
+    let err = result.expect_err("retyping the CHECKed column");
+    assert!(
+        err.to_string()
+            .starts_with("operator does not exist: text > integer"),
+        "{err}"
+    );
+    // So are an index's expressions and predicate.
+    for (setup, msg) in [
+        (
+            "CREATE TABLE t (a int, b int); CREATE INDEX ON t ((a + 1));",
+            "operator does not exist: text + integer",
+        ),
+        (
+            "CREATE TABLE t (a int, b int); CREATE INDEX ON t (b) WHERE a > 0;",
+            "operator does not exist: text > integer",
+        ),
+    ] {
+        let err = try_apply(&[
+            ("0001.sql", setup),
+            ("0002.sql", "ALTER TABLE t RENAME COLUMN a TO x;"),
+            ("0003.sql", "ALTER TABLE t ALTER COLUMN x TYPE text;"),
+        ])
+        .expect_err(setup);
+        assert!(err.to_string().starts_with(msg), "{setup}: {err}");
+    }
+    // A column taking the old name is another column.
+    build_db(&[
+        (
+            "0001.sql",
+            "CREATE TABLE t (id int, x int, y text, CHECK (x > 0));",
+        ),
+        (
+            "0002.sql",
+            "ALTER TABLE t RENAME COLUMN x TO z;
+             ALTER TABLE t RENAME COLUMN y TO x;
+             ALTER TABLE t ALTER COLUMN x TYPE varchar(10);",
+        ),
+    ]);
+}
+
+#[test]
+fn a_constraint_reads_its_table_however_it_was_qualified() {
+    // PG stores a CHECK's columns, not the name it qualified them with:
+    // retyping a column rebuilds `t.a > 0` over the renamed table, or over
+    // a child the CHECK was copied to.
+    build_db(&[
+        (
+            "0001.sql",
+            "CREATE TABLE t (a int CHECK (t.a > 0), b int, c int GENERATED ALWAYS AS (t.b * 2) STORED);
+             CREATE TABLE p (a int CHECK (p.a > 0));
+             CREATE TABLE ch () INHERITS (p);
+             CREATE TABLE pp (k int, a int CHECK (pp.a > 0)) PARTITION BY RANGE (k);
+             CREATE TABLE w (a int, b int);
+             CREATE INDEX ON w ((w.a + 1));
+             CREATE TABLE pp1 PARTITION OF pp FOR VALUES FROM (0) TO (10);",
+        ),
+        (
+            "0002.sql",
+            "ALTER TABLE t RENAME TO u;
+             ALTER TABLE u ALTER COLUMN a TYPE bigint;
+             ALTER TABLE p ALTER COLUMN a TYPE bigint;
+             ALTER TABLE pp ALTER COLUMN a TYPE bigint;
+             ALTER TABLE w RENAME TO w2;
+             ALTER TABLE w2 ALTER COLUMN a TYPE bigint;",
+        ),
+    ]);
+}

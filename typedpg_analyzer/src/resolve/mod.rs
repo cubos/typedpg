@@ -546,12 +546,14 @@ fn analyze_raw_node_once(
         node::Node::SelectStmt(sel) if sel.into_clause.is_some() => {
             let (_, p) = analyze_select(sel, snapshot, &mut params)?;
             expr::resolve_untyped_output_params(sel, snapshot, &mut params)?;
+            check_null_domain_casts(sel, snapshot)?;
             (Vec::new(), p)
         }
         node::Node::SelectStmt(sel) => {
             let r = analyze_select(sel, snapshot, &mut params)?;
             // The statement-level `resolveTargetListUnknowns`.
             expr::resolve_untyped_output_params(sel, snapshot, &mut params)?;
+            check_null_domain_casts(sel, snapshot)?;
             r
         }
         node::Node::InsertStmt(ins) => analyze_insert(ins, snapshot, &mut params)?,
@@ -947,6 +949,69 @@ fn rename_column_refs(
         .unwrap_or_default()
 }
 
+/// A NULL cast to a domain that rejects it (`SELECT NULL::d` of a NOT NULL
+/// domain, `CAST(NULL AS d)` of one with `CHECK (VALUE IS NOT NULL)`) where
+/// every execution evaluates it: a select list with no FROM, WHERE,
+/// grouping or LIMIT (one row), or a VALUES row — of the statement itself,
+/// or of an arm of its set operation. The coercion fails when evaluated
+/// (`ExecEvalConstraintNotNull` / `ExecEvalConstraintCheck`), naming the
+/// domain cast to.
+fn check_null_domain_casts(
+    sel: &protobuf::SelectStmt,
+    snapshot: &PgCatalog,
+) -> Result<(), AnalyzeError> {
+    if sel.limit_count.is_some() || sel.limit_offset.is_some() {
+        return Ok(());
+    }
+    if sel.op != protobuf::SetOperation::SetopNone as i32 {
+        for arm in [&sel.larg, &sel.rarg].into_iter().flatten() {
+            check_null_domain_casts(arm, snapshot)?;
+        }
+        return Ok(());
+    }
+    let null_cast = |n: &protobuf::Node| -> Option<String> {
+        let Some(node::Node::TypeCast(tc)) = n.node.as_ref() else {
+            return None;
+        };
+        if !matches!(
+            tc.arg.as_deref().and_then(|a| a.node.as_ref()),
+            Some(node::Node::AConst(c)) if c.isnull
+        ) {
+            return None;
+        }
+        let target = crate::ddl::util::resolve_type_name(tc.type_name.as_ref()?, snapshot)?;
+        snapshot.domain_null_violation(target)
+    };
+    let cells: Vec<&protobuf::Node> = if !sel.values_lists.is_empty() {
+        sel.values_lists
+            .iter()
+            .filter_map(|row| match row.node.as_ref() {
+                Some(node::Node::List(l)) => Some(l.items.iter()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    } else if sel.from_clause.is_empty()
+        && sel.where_clause.is_none()
+        && sel.group_clause.is_empty()
+        && sel.having_clause.is_none()
+    {
+        sel.target_list
+            .iter()
+            .filter_map(|t| match t.node.as_ref() {
+                Some(node::Node::ResTarget(rt)) => rt.val.as_deref(),
+                _ => None,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    match cells.into_iter().find_map(null_cast) {
+        Some(msg) => Err(AnalyzeError::Invalid(msg)),
+        None => Ok(()),
+    }
+}
+
 /// If assigning a literal `NULL` to `tc` would violate a NOT-NULL guarantee
 /// (either column-level `attnotnull`, or a domain in the type chain whose
 /// `typnotnull` is set), return the matching `AnalyzeError`. `op` selects
@@ -957,19 +1022,20 @@ fn rename_column_refs(
 /// execute-fallback prefix check passes; the analyzer's stricter form
 /// (table+column qualified) follows in parentheses for the macro caller.
 ///
-/// A NOT NULL domain fails as the row is built; the column's own NOT NULL
-/// only in ExecConstraints, after the BEFORE ROW triggers — one of which
-/// may replace the NULL, so the column's is not reported then.
+/// A domain rejecting NULL (NOT NULL, or a CHECK a NULL fails) fails as
+/// the row is built; the column's own NOT NULL only in ExecConstraints,
+/// after the BEFORE ROW triggers — one of which may replace the NULL, so
+/// the column's is not reported then.
 fn null_assignment_error(
     tc: &crate::pg_catalog::PgAttribute,
     snapshot: &PgCatalog,
     table_relname: &str,
     op: &'static str,
 ) -> Option<AnalyzeError> {
-    if let Some(domain) = snapshot.domain_not_null_name(tc.atttypid) {
-        return Some(AnalyzeError::Invalid(format!(
-            "domain {domain} does not allow null values"
-        )));
+    // Coerced to the column's type as the row is built: a NOT NULL domain
+    // (or one with a CHECK a NULL fails) rejects it.
+    if let Some(msg) = snapshot.domain_null_violation(tc.atttypid) {
+        return Some(AnalyzeError::Invalid(msg));
     }
     // A view's columns carry no NOT NULL of their own (their inferred
     // non-nullability is not a constraint); the base relation's is checked

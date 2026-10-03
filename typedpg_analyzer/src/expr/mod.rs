@@ -89,6 +89,14 @@ impl<'a> Ctx<'a> {
         }
     }
 
+    /// Record that the untyped string literal at `location` was coerced to
+    /// `type_oid`.
+    pub fn note_literal_type(&self, location: i32, type_oid: PgTypeOid) {
+        if let Some(log) = self.strict_log {
+            log.note_literal_type(location, type_oid);
+        }
+    }
+
     /// Whether `proc` is strict.
     pub fn proc_is_strict(&self, proc: Option<crate::oid::PgProcOid>) -> bool {
         proc.and_then(|p| self.snapshot.pg_proc.get(&p))
@@ -998,12 +1006,21 @@ fn infer_expr_unlocated(
                         conditional::kept_nodes(&mm.args, &kept),
                         ctx,
                     ));
-            Ok(ExprType::scalar_with_typmod(
-                resolved_type,
-                nullable,
-                agreed_typmod(&args, resolved_type),
+            let typmod = agreed_typmod(&args, resolved_type);
+            ctx.note_strict(
+                mm.location,
+                crate::nonnull::StrictNode::ExactFold,
+                crate::nonnull::subst::folds_exactly(resolved_type, typmod, snapshot),
+            );
+            ctx.note_strict(
+                mm.location,
+                crate::nonnull::StrictNode::FloatFold,
+                crate::nonnull::subst::folds_as_float(resolved_type, snapshot),
+            );
+            Ok(
+                ExprType::scalar_with_typmod(resolved_type, nullable, typmod)
+                    .with_collation(derive_collation(&args, resolved_type, snapshot)?),
             )
-            .with_collation(derive_collation(&args, resolved_type, snapshot)?))
         }
         node::Node::AIndirection(ind) => {
             let t = infer_indirection(ind, ctx, params)?;
@@ -1351,6 +1368,14 @@ fn infer_expr_unlocated(
     // parse time with `invalid input syntax for type integer: "x"`. Mirror
     // it: a string literal whose type stayed UNKNOWN meeting a concrete goal
     // gets its *content* validated here.
+    if goal.has_expectation()
+        && result.type_oid == oid::UNKNOWN
+        && let Some(node::Node::AConst(ac)) = node.node.as_ref()
+        && !ac.isnull
+        && matches!(ac.val, Some(a_const::Val::Sval(_)))
+    {
+        ctx.note_literal_type(ac.location, goal.type_oid);
+    }
     if goal.has_expectation()
         && result.type_oid == oid::UNKNOWN
         && let Some(node::Node::AConst(ac)) = node.node.as_ref()

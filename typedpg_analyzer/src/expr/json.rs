@@ -364,10 +364,30 @@ fn json_agg_modifiers(
 /// A JSON aggregate is NULL only over no rows: `NULL ON NULL` appends a
 /// JSON null, `ABSENT ON NULL` skips the value but still builds `[]` /
 /// `{}` (`json[b]_agg[_strict]` / `json[b]_object_agg*` underneath).
-fn json_agg_nullable(ac: Option<&protobuf::JsonAggConstructor>, ctx: Ctx<'_>) -> bool {
+/// One of an outer level (over its columns only) reads that level's rows,
+/// which this level knows nothing of.
+fn json_agg_nullable(
+    ac: Option<&protobuf::JsonAggConstructor>,
+    values: &[&protobuf::Node],
+    ctx: Ctx<'_>,
+) -> bool {
+    let over = ac.and_then(|c| c.over.as_deref());
+    if over.is_none() {
+        let mut aggregated = values.to_vec();
+        if let Some(ac) = ac {
+            aggregated.extend(ac.agg_order.iter().filter_map(|o| match o.node.as_ref() {
+                Some(node::Node::SortBy(sb)) => sb.node.as_deref(),
+                _ => Some(o),
+            }));
+            aggregated.extend(ac.agg_filter.as_deref());
+        }
+        if crate::grouping::levels_up_of(&aggregated, ctx.scope) > 0 {
+            return true;
+        }
+    }
     !crate::expr::aggregate_reads_rows(
         ac.is_some_and(|c| c.agg_filter.is_some()),
-        ac.and_then(|c| c.over.as_deref()),
+        over,
         ctx.null_ctx,
     )
 }
@@ -413,10 +433,21 @@ pub(crate) fn infer_json_objectagg(
     if let Some(ac) = ac {
         json_agg_modifiers(ac, ctx, params)?;
     }
+    let values: Vec<&protobuf::Node> = a
+        .arg
+        .as_deref()
+        .into_iter()
+        .flat_map(|kv| {
+            kv.key
+                .as_deref()
+                .into_iter()
+                .chain(kv.value.as_deref().and_then(|v| v.raw_expr.as_deref()))
+        })
+        .collect();
     constructor_result(
         ac.and_then(|c| c.output.as_ref()),
         &args,
-        json_agg_nullable(ac, ctx),
+        json_agg_nullable(ac, &values, ctx),
         ctx.snapshot,
     )
 }
@@ -446,10 +477,16 @@ pub(crate) fn infer_json_arrayagg(
     if let Some(ac) = ac {
         json_agg_modifiers(ac, ctx, params)?;
     }
+    let values: Vec<&protobuf::Node> = a
+        .arg
+        .as_deref()
+        .and_then(|v| v.raw_expr.as_deref())
+        .into_iter()
+        .collect();
     constructor_result(
         ac.and_then(|c| c.output.as_ref()),
         &args,
-        json_agg_nullable(ac, ctx),
+        json_agg_nullable(ac, &values, ctx),
         ctx.snapshot,
     )
 }

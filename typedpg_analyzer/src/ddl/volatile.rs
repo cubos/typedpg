@@ -117,7 +117,8 @@ pub(crate) fn infer_over_relation(
     if let Some(used) = used {
         ctx = ctx.recording(used);
     }
-    Some(infer_expr(expr, ctx, &mut params, TypeGoal::NONE))
+    let expr = crate::ddl::stored_exprs::over_own_row(interp, relid, expr);
+    Some(infer_expr(&expr, ctx, &mut params, TypeGoal::NONE))
 }
 
 /// The columns of `relid` an expression over its row is strict in: when
@@ -148,6 +149,7 @@ pub(crate) fn strict_columns_over_relation(
     let mut params = crate::param_collector::ParamCollector::default();
     let log = crate::nonnull::StrictLog::default();
     let ctx = crate::expr::Ctx::new(&scope, &null_ctx, interp).logging_strictness(&log);
+    let expr = &crate::ddl::stored_exprs::over_own_row(interp, relid, expr);
     if infer_expr(expr, ctx, &mut params, TypeGoal::NONE).is_err() {
         return Vec::new();
     }
@@ -159,6 +161,42 @@ pub(crate) fn strict_columns_over_relation(
         .collect();
     cols.sort();
     cols
+}
+
+/// What an expression over the row of `relid` resolves to, as a CHECK
+/// constraint's is when it is created: its built-in comparisons and
+/// `num_nulls` calls, the strictness of its nodes and the types of its
+/// literals (see [`crate::nonnull::TrustedNodes`]). `None` when it doesn't
+/// analyze.
+pub(crate) fn trusted_over_relation(
+    interp: &PgCatalog,
+    relid: crate::oid::PgClassOid,
+    expr: &protobuf::Node,
+) -> Option<crate::nonnull::TrustedNodes> {
+    use crate::expr::{TypeGoal, infer_expr};
+    let class = interp.pg_class.get(&relid)?;
+    let nspname = interp
+        .namespace_name(class.relnamespace)
+        .unwrap_or("public")
+        .to_owned();
+    let attrs = interp.attributes_of(relid).to_vec();
+    let mut scope = crate::scope::Scope::default();
+    scope.add_dml_target(
+        interp,
+        &class.relname,
+        crate::qualified_name::QualifiedName::new(nspname, class.relname.clone()),
+        &attrs,
+    );
+    let null_ctx = crate::nullability::NullabilityContext::default();
+    let mut params = crate::param_collector::ParamCollector::default();
+    let log = crate::nonnull::StrictLog::default();
+    let ctx = crate::expr::Ctx::new(&scope, &null_ctx, interp).logging_strictness(&log);
+    let expr = crate::ddl::stored_exprs::over_own_row(interp, relid, expr);
+    let (inferred, _) = crate::ddl::depend::collect(|| {
+        let _level = crate::resolve::QueryLevel::enter();
+        infer_expr(&expr, ctx, &mut params, TypeGoal::NONE)
+    });
+    inferred.ok().map(|_| log.trusted())
 }
 
 /// `CheckMutability` over the *typed* expression: analyze `expr` over the

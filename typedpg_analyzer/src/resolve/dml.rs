@@ -80,6 +80,15 @@ pub(crate) fn analyze_insert_with_outer_ctes(
         }
     }
 
+    // DEFAULT VALUES: every column takes its default.
+    if ins.select_stmt.is_none()
+        && let Some(v) = omitted_domain_nulls(&tgt, &[], snapshot)
+            .into_iter()
+            .min_by_key(|v| v.order)
+    {
+        return Err(v.error);
+    }
+
     let arbiter = match &ins.on_conflict_clause {
         Some(on_conflict) => {
             analyze_insert_on_conflict(on_conflict, relation, &tgt, snapshot, params, &cte_scopes)?
@@ -732,6 +741,9 @@ fn analyze_insert_values(
                 params.infer_nullable(p.number, true);
             }
         }
+        // A column left to a NULL default, of a domain rejecting NULL,
+        // fails while the row is built: every execution.
+        row_violations.extend(omitted_domain_nulls(tgt, &list.items, snapshot));
         if violation.is_none() && !row_violations.is_empty() {
             row_violations.extend(omitted_not_null_columns(tgt, list.items.len(), snapshot));
             row_violations.extend(default_nulls);
@@ -755,7 +767,7 @@ struct NullViolation {
 
 impl NullViolation {
     fn of(tc: &crate::pg_catalog::PgAttribute, snapshot: &PgCatalog, error: AnalyzeError) -> Self {
-        let domain = snapshot.domain_not_null_name(tc.atttypid).is_some();
+        let domain = snapshot.domain_null_violation(tc.atttypid).is_some();
         Self {
             order: (!domain, tc.attnum),
             error,
@@ -764,13 +776,69 @@ impl NullViolation {
 }
 
 /// Whether column `c`'s default is NULL: no DEFAULT, identity or
-/// generation expression. A domain-typed column is taken as having one
-/// (its type may carry a default the snapshot doesn't model).
+/// generation expression, nor one its domain gives it.
 fn null_default(c: &crate::pg_catalog::PgAttribute, snapshot: &PgCatalog) -> bool {
     !c.atthasdef
         && c.attidentity.is_none()
         && c.attgenerated.is_none()
-        && snapshot.unwrap_domain(c.atttypid) == c.atttypid
+        && !snapshot.domain_has_default(c.atttypid)
+}
+
+/// The columns a VALUES row (`items`; none for DEFAULT VALUES) leaves to
+/// their default — omitted, or `DEFAULT` — when that is NULL and of a
+/// domain rejecting NULL (NOT NULL, or a CHECK a NULL fails): the NULL is
+/// coerced to the domain as the row is built (`expand_targetlist`), before
+/// any trigger. A table's own columns only (a view's defaults are its
+/// base table's).
+fn omitted_domain_nulls(
+    tgt: &InsertTarget,
+    items: &[protobuf::Node],
+    snapshot: &PgCatalog,
+) -> Vec<NullViolation> {
+    let is_table = snapshot.pg_class.get(&tgt.oid).is_some_and(|c| {
+        matches!(
+            c.relkind,
+            crate::pg_catalog::RelKind::Table | crate::pg_catalog::RelKind::Partitioned
+        )
+    });
+    if !is_table {
+        return Vec::new();
+    }
+    let given: Vec<&str> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| !is_set_to_default(v))
+        .filter_map(|(i, _)| target_col_at(tgt, i).map(|c| c.attname.as_str()))
+        .collect();
+    // `DEFAULT NULL` (cast or not).
+    fn null_constant(e: &protobuf::Node) -> bool {
+        match e.node.as_ref() {
+            Some(node::Node::AConst(k)) => k.isnull,
+            Some(node::Node::TypeCast(tc)) => tc.arg.as_deref().is_some_and(null_constant),
+            _ => false,
+        }
+    }
+    let null_column_default = |c: &crate::pg_catalog::PgAttribute| {
+        !c.atthasdef
+            || matches!(
+                snapshot.attr_default_exprs.get(&(tgt.oid, c.attnum)),
+                Some(crate::ddl::tables::check_inherit::StoredExpr::Written(e)) if null_constant(e)
+            )
+    };
+    tgt.attrs
+        .iter()
+        .filter(|c| c.attnum > 0 && !given.contains(&c.attname.as_str()))
+        .filter(|c| c.attidentity.is_none() && c.attgenerated.is_none() && null_column_default(c))
+        // A DEFAULT NULL of the column's own overrides the domain's.
+        .filter(|c| c.atthasdef || !snapshot.domain_has_default(c.atttypid))
+        .filter_map(|c| {
+            let msg = snapshot.domain_null_violation(c.atttypid)?;
+            Some(NullViolation {
+                order: (false, c.attnum),
+                error: AnalyzeError::Invalid(msg),
+            })
+        })
+        .collect()
 }
 
 /// NOT NULL column `c` storing its default, when that is NULL (see

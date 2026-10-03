@@ -42,6 +42,41 @@ impl Val {
     }
 }
 
+/// Whether a COALESCE / GREATEST / LEAST of type `t` (modifier `typmod`)
+/// keeps the constants [`Subst`] folds as written: an integer, numeric,
+/// text or boolean result with no modifier. A float one rounds a large
+/// integer (`coalesce(f, 16777217)` over a `real` is 16777216).
+pub(crate) fn folds_exactly(
+    t: crate::oid::PgTypeOid,
+    typmod: Option<i32>,
+    snapshot: &PgCatalog,
+) -> bool {
+    use crate::pg_catalog::oid;
+    typmod.is_none_or(|m| m < 0)
+        && [
+            oid::INT2,
+            oid::INT4,
+            oid::INT8,
+            oid::NUMERIC,
+            oid::TEXT,
+            oid::VARCHAR,
+            oid::BOOL,
+        ]
+        .contains(&snapshot.unwrap_domain(t))
+        && snapshot.effective_typmod(t, None).is_none_or(|m| m < 0)
+}
+
+/// Whether a COALESCE / GREATEST / LEAST of type `t` is a float one (see
+/// [`StrictNode::FloatFold`]).
+pub(crate) fn folds_as_float(t: crate::oid::PgTypeOid, snapshot: &PgCatalog) -> bool {
+    use crate::pg_catalog::oid;
+    [oid::FLOAT4, oid::FLOAT8].contains(&snapshot.unwrap_domain(t))
+}
+
+/// The largest integer every float type (`real`'s 24-bit mantissa) holds
+/// exactly, with every smaller one.
+const FLOAT_EXACT: i64 = 1 << 24;
+
 /// What a qual evaluates to, with column `null` replaced by NULL.
 pub(crate) struct Subst<'a> {
     pub null: &'a Col,
@@ -148,10 +183,9 @@ impl Subst<'_> {
                         Val::Unknown
                     };
                 }
-                let target = tc
-                    .type_name
-                    .as_ref()
-                    .and_then(|t| crate::ddl::util::resolve_type_name(t, self.snapshot));
+                // Not through a type modifier, which may change the value
+                // (`15::numeric(1,-1)` is 20).
+                let target = super::cast_target(tc, self.snapshot);
                 use crate::pg_catalog::oid;
                 match (v, target) {
                     (Val::Int(i), Some(t))
@@ -219,7 +253,7 @@ impl Subst<'_> {
                 for a in &c.args {
                     match self.eval(a) {
                         Val::Null => continue,
-                        v => return v,
+                        v => return self.converted(c.location, v),
                     }
                 }
                 Val::Null
@@ -250,15 +284,44 @@ impl Subst<'_> {
                 } else if ints.is_empty() {
                     Val::Null
                 } else if greatest {
-                    Val::Int(*ints.iter().max().expect("non-empty"))
+                    self.converted(m.location, Val::Int(*ints.iter().max().expect("non-empty")))
                 } else {
-                    Val::Int(*ints.iter().min().expect("non-empty"))
+                    self.converted(m.location, Val::Int(*ints.iter().min().expect("non-empty")))
                 }
             }
             node::Node::AExpr(e) => self.eval_a_expr(e),
             node::Node::FuncCall(f) => self.eval_func(f),
             _ => Val::Unknown,
         }
+    }
+
+    /// A constant `v` as the COALESCE / GREATEST / LEAST at `location`
+    /// yields it, converted to its common type: as is when the conversion
+    /// keeps it ([`folds_exactly`]), else just some non-NULL value.
+    fn converted(&self, location: i32, v: Val) -> Val {
+        if self.log.is_strict(location, StrictNode::ExactFold) {
+            return v;
+        }
+        match v {
+            Val::Int(i)
+                if i.abs() <= FLOAT_EXACT
+                    && self.log.is_strict(location, StrictNode::FloatFold) =>
+            {
+                v
+            }
+            Val::Int(_) | Val::Text(_) | Val::Bool(_) => Val::NonNull,
+            v => v,
+        }
+    }
+
+    /// Whether integer constants `a` and `b` compare as written under the
+    /// comparison at `location`: a built-in one over exact types, or over
+    /// a float type with both within its precision.
+    fn ints_compare(&self, location: i32, a: i64, b: i64) -> bool {
+        self.log.is_strict(location, StrictNode::StdCompare)
+            || (self.log.is_strict(location, StrictNode::FloatCompare)
+                && a.abs() <= FLOAT_EXACT
+                && b.abs() <= FLOAT_EXACT)
     }
 
     fn eval_a_expr(&self, e: &protobuf::AExpr) -> Val {
@@ -292,9 +355,7 @@ impl Subst<'_> {
             ) if strict && l == Some(Val::Null) => Val::Null,
             Ok(K::AexprNullif) => match (l, r) {
                 (Some(Val::Null), _) => Val::Null,
-                (Some(Val::Int(a)), Some(Val::Int(b)))
-                    if self.log.is_strict(e.location, StrictNode::StdCompare) =>
-                {
+                (Some(Val::Int(a)), Some(Val::Int(b))) if self.ints_compare(e.location, a, b) => {
                     if a == b {
                         Val::Null
                     } else {
@@ -312,6 +373,11 @@ impl Subst<'_> {
                         if v.known_non_null() =>
                     {
                         false
+                    }
+                    (Some(Val::Int(a)), Some(Val::Int(b)))
+                        if self.ints_compare(e.location, a, b) =>
+                    {
+                        a == b
                     }
                     (Some(a), Some(b))
                         if self.log.is_strict(e.location, StrictNode::StdCompare) =>
@@ -335,7 +401,7 @@ impl Subst<'_> {
             let numeric = self.log.is_strict(location, StrictNode::StdCompare);
             let text = self.log.is_strict(location, StrictNode::TextEquality);
             let ord = match (l, r) {
-                (Val::Int(a), Val::Int(b)) if numeric => Some(a.cmp(b)),
+                (Val::Int(a), Val::Int(b)) if self.ints_compare(location, *a, *b) => Some(a.cmp(b)),
                 (Val::Bool(a), Val::Bool(b)) if numeric && matches!(op, "=" | "<>") => {
                     Some(a.cmp(b))
                 }

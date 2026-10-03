@@ -96,6 +96,12 @@ pub(crate) fn infer_type_cast(
         _ => None,
     };
 
+    if let Some(node::Node::AConst(ac)) = inner.node.as_ref()
+        && !ac.isnull
+        && matches!(ac.val, Some(a_const::Val::Sval(_)))
+    {
+        ctx.note_literal_type(ac.location, target_oid);
+    }
     // PG validates the *content* of an untyped string literal against the
     // target's input function at parse time (`'x'::int` fails prepare with
     // `invalid input syntax for type integer: "x"`). Mirror it for the types
