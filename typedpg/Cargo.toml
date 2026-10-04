@@ -18,8 +18,8 @@ deadpool = ["dep:deadpool-postgres"]
 bb8 = ["dep:bb8", "dep:bb8-postgres"]
 
 [dependencies]
-typedpg_core = { path = "../typedpg_core", version = "0.3.0" }
-typedpg_macros = { path = "../typedpg_macros", version = "0.3.0" }
+typedpg_core = { path = "../typedpg_core", version = "0.4.0" }
+typedpg_macros = { path = "../typedpg_macros", version = "0.4.0" }
 tokio-postgres = { version = "0.7", features = ["with-serde_json-1", "with-chrono-0_4", "with-uuid-1", "with-cidr-0_3", "with-eui48-1"] }
 rust_decimal = { version = "1", features = ["db-tokio-postgres"] }
 deadpool-postgres = { version = "0.14", optional = true }
