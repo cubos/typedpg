@@ -110,7 +110,7 @@ fn targets_template() -> Target {
 #[tokio::test]
 async fn regular_enum_array_params_bind() {
     let pool = common::setup().await;
-    let statuses = vec![PostStatus::Draft, PostStatus::Archived];
+    let statuses = [PostStatus::Draft, PostStatus::Archived];
     let row = sql!(
         &pool,
         "SELECT $statuses::post_status[] AS echoed, 'archived'::post_status = ANY($statuses) AS hit"
@@ -195,4 +195,100 @@ async fn spread_with_regular_params_and_returning() {
     .await
     .expect("an empty spread runs nothing");
     assert_eq!(affected, 0);
+}
+
+/// `x IN $..ids`: a placeholder per item. An empty list still runs the
+/// query: `IN` it is false, `NOT IN` it true.
+#[tokio::test]
+async fn list_spread_expands_an_in_list() {
+    let pool = common::setup().await;
+    let tag = common::unique("in-list");
+    let mut ids = Vec::new();
+    for n in 0..3 {
+        let name = format!("u{n}");
+        let email = format!("{tag}-{n}@example.com");
+        let id = sql!(
+            &pool,
+            "INSERT INTO users (name, email) VALUES ($name, $email) RETURNING id"
+        )
+        .fetch_value()
+        .await
+        .expect("insert user");
+        ids.push(id);
+    }
+    let ours = format!("{tag}-%");
+
+    let picked = [ids[0], ids[2]];
+    let rows = sql!(
+        &pool,
+        "SELECT name FROM users WHERE id IN $..picked ORDER BY id"
+    )
+    .fetch_all()
+    .await
+    .expect("IN");
+    assert_eq!(
+        rows.into_iter().map(|r| r.name).collect::<Vec<_>>(),
+        ["u0", "u2"]
+    );
+    let rows = sql!(
+        &pool,
+        "SELECT name FROM users WHERE email LIKE $ours AND id NOT IN $..picked ORDER BY id",
+        ours = ours.clone()
+    )
+    .fetch_all()
+    .await
+    .expect("NOT IN");
+    assert_eq!(rows.into_iter().map(|r| r.name).collect::<Vec<_>>(), ["u1"]);
+
+    let none: Vec<i64> = Vec::new();
+    let rows = sql!(&pool, "SELECT name FROM users WHERE id IN $..none")
+        .fetch_all()
+        .await
+        .expect("IN an empty list");
+    assert!(rows.is_empty());
+    let rows = sql!(
+        &pool,
+        "SELECT name FROM users WHERE email LIKE $ours AND id NOT IN $..none ORDER BY id"
+    )
+    .fetch_all()
+    .await
+    .expect("NOT IN an empty list");
+    assert_eq!(
+        rows.into_iter().map(|r| r.name).collect::<Vec<_>>(),
+        ["u0", "u1", "u2"]
+    );
+
+    // Text elements from an array of `String`s, and a regular parameter
+    // numbered before the list's placeholders.
+    let emails = [
+        format!("{tag}-1@example.com"),
+        format!("{tag}-2@example.com"),
+    ];
+    let min = ids[2];
+    let rows = sql!(
+        &pool,
+        "SELECT name FROM users WHERE email IN $..emails AND id >= $min"
+    )
+    .fetch_all()
+    .await
+    .expect("text IN");
+    assert_eq!(rows.into_iter().map(|r| r.name).collect::<Vec<_>>(), ["u2"]);
+}
+
+/// The elements are bound as the left side's type requires: a mapped enum
+/// as its label.
+#[tokio::test]
+async fn list_spread_binds_enum_elements() {
+    let pool = common::setup().await;
+    let statuses = [PostStatus::Draft, PostStatus::Archived];
+    let row = sql!(
+        &pool,
+        "SELECT 'archived'::post_status IN $..statuses AS \"hit!\", \
+                'published'::post_status IN $..statuses AS \"miss!\""
+    )
+    .fetch_one()
+    .await
+    .expect("enum IN");
+    assert!(row.hit);
+    assert!(!row.miss);
 }

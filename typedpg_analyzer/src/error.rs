@@ -730,7 +730,14 @@ pub(crate) fn param_written_as(num: i32) -> Option<String> {
         }
         let mut rest = index - lex.params.len();
         for spread in &lex.spreads {
-            let fields = spread.fields.as_deref().unwrap_or_default();
+            let Some(fields) = spread.fields.as_deref() else {
+                // A list spread: one placeholder, its element.
+                if rest == 0 {
+                    return Some(format!("`$..{}`", spread.name));
+                }
+                rest -= 1;
+                continue;
+            };
             if let Some(f) = fields.get(rest) {
                 return Some(format!("`{}` of `$..{}`", f.name, spread.name));
             }

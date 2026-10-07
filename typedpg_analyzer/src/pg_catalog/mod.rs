@@ -23,7 +23,9 @@ use crate::oid::{
     PgCastOid, PgClassOid, PgCollationOid, PgConstraintOid, PgExtensionOid, PgGenericOid,
     PgLanguageOid, PgNamespaceOid, PgOperatorOid, PgProcOid, PgRewriteOid, PgTypeOid,
 };
-use crate::resolve::{AnalyzedQuery, analyze_static, build_spread_sample_sql, fuse};
+use crate::resolve::{
+    AnalyzedQuery, analyze_static, build_spread_sample_sql, check_spread_positions, fuse,
+};
 use crate::seed::load_seed;
 
 // ─── Built-in type OIDs ────────────────────────────────────────────────────
@@ -1101,12 +1103,14 @@ impl PgCatalog {
         let mut param_nullability: Vec<Option<bool>> =
             lex_output.params.iter().map(|p| p.nullable).collect();
         for spread in &lex_output.spreads {
-            if let Some(fields) = &spread.fields {
-                param_nullability.extend(
+            match &spread.fields {
+                Some(fields) => param_nullability.extend(
                     fields
                         .iter()
                         .map(|f| if f.nullable { Some(true) } else { None }),
-                );
+                ),
+                // A list spread's one placeholder: its element.
+                None => param_nullability.push(None),
             }
         }
 
@@ -1118,13 +1122,15 @@ impl PgCatalog {
         let analysis_lex = if lex_output.spreads.is_empty() {
             &lex_output
         } else {
-            match build_spread_sample_sql(&lex_output) {
-                Ok(l) => {
-                    sample_lex = l;
-                    &sample_lex
-                }
-                Err(e) => return (lex_output.sql.clone(), Err(e)),
+            sample_lex = build_spread_sample_sql(&lex_output);
+            let _guard = crate::error::DiagContextGuard::install(sql, &sample_lex);
+            let tree = typedpg_pg_query::parse(&sample_lex.sql).ok();
+            if let Err(e) =
+                check_spread_positions(tree.as_ref().map(|t| &t.protobuf), &lex_output, &sample_lex)
+            {
+                return (sample_lex.sql.clone(), Err(e));
             }
+            &sample_lex
         };
         let analysis_sql = analysis_lex.sql.clone();
 
@@ -1146,7 +1152,7 @@ impl PgCatalog {
             + lex_output
                 .spreads
                 .iter()
-                .map(|s| s.fields.as_ref().map(|f| f.len()).unwrap_or(0))
+                .map(|s| s.fields.as_ref().map_or(1, Vec::len))
                 .sum::<usize>();
         if info_params.len() != expected_param_count {
             return (

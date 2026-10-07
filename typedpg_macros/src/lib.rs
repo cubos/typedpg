@@ -35,7 +35,7 @@ mod query_macro;
 /// ```text
 /// sql!(
 ///     <executor>,
-///     "<SQL with $param and $..spread { field1, field2 } placeholders>",
+///     "<SQL with $param, $..rows { field1, field2 } and IN $..list placeholders>",
 ///     [name = expr, ...]
 /// )
 /// .<method>()
@@ -45,7 +45,8 @@ mod query_macro;
 /// - **executor** -- any expression implementing the `typedpg::Executor`
 ///   trait (see [Executor types](#executor-types) below).
 /// - **SQL string** -- a string literal containing your SQL. Use `$name` for
-///   named parameters and `$..name { fields }` for bulk insert spreads.
+///   named parameters, `$..name { fields }` for bulk insert spreads and
+///   `IN $..name` for lists.
 /// - **param bindings** (optional) -- zero or more `name = expr` pairs.
 ///   Parameters referenced in the SQL but not explicitly bound are captured
 ///   from the surrounding scope.
@@ -171,6 +172,29 @@ mod query_macro;
 /// ).fetch_all().await?;
 /// ```
 ///
+/// With no item, there is no row, so the query isn't run: `fetch_all`
+/// returns no row and `execute` 0.
+///
+/// # Lists with `IN $..list`
+///
+/// A spread without fields, right after `IN`, expands an iterable of values
+/// into the parenthesized list, each element typed by the `IN`'s left side:
+///
+/// ```text
+/// let ids: Vec<i64> = vec![1, 2, 3];
+/// sql!(pool, "SELECT name FROM users WHERE id IN $..ids").fetch_all().await?;
+/// // Generates: WHERE id IN ($1, $2, $3)
+/// ```
+///
+/// An empty list is `(SELECT NULL::type WHERE false)`, PG having no syntax
+/// for one, and the query runs: `x IN` it is false, `x NOT IN` it true.
+///
+/// `id = ANY($ids)`, an array parameter, is the same filter as one
+/// placeholder, whatever the list's length. They differ when the statement
+/// is prepared and run with a generic plan: there, PG prunes the partitions
+/// of a partitioned table only for an `IN` list, and estimates its rows
+/// from the list's length rather than from a default.
+///
 /// # Domain types (JSONB)
 ///
 /// Columns defined with `CREATE DOMAIN ... AS JSONB` are automatically
@@ -256,10 +280,10 @@ mod query_macro;
 /// sql!(pool, "SELECT id FROM users WHERE age > $age").fetch_all().await?;
 /// // error[E0277]: the trait bound `i32: From<&str>` is not satisfied
 ///
-/// // Missing field mapping on spread
+/// // A spread without fields is a list, which goes after IN
 /// sql!(pool, "INSERT INTO users (name, email) VALUES $..items");
-/// // error: spread `$..items` needs a field list naming the item fields to bind,
-/// //        e.g. `$..items { field1, field2 }`
+/// // error: `$..items` expands to a parenthesized list of values, so it goes
+/// //        right after IN: `x IN $..items`
 /// ```
 ///
 /// The `typedpg_compile_fail` crate in the repository pins the exact output

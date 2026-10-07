@@ -458,7 +458,22 @@ sql!(pool, "INSERT INTO users (name, email) VALUES $..new_users { name, email }"
     .execute().await?;
 ```
 
-The macro expands `$..new_users { name, email }` into a multi-row `VALUES` clause with proper parameter numbering.
+The macro expands `$..new_users { name, email }` into a multi-row `VALUES` clause with proper parameter numbering. With no item there is no row, so the query isn't run (`execute` returns 0).
+
+## Lists with `IN $..list`
+
+A spread without fields, right after `IN`, expands a list of values, each typed by the `IN`'s left side:
+
+```rust
+let ids: Vec<i64> = vec![1, 2, 3];
+
+sql!(pool, "SELECT name FROM users WHERE id IN $..ids")   // WHERE id IN ($1, $2, $3)
+    .fetch_all().await?;
+```
+
+An empty list is written `(SELECT NULL::<type> WHERE false)` — PostgreSQL has no syntax for one — and the query runs: `x IN` it is false, `x NOT IN` it true.
+
+`id = ANY($ids)`, with an array parameter, is the same filter as a single placeholder, whatever the list's length. They differ when the statement runs with a generic plan (a prepared statement executed repeatedly): there PostgreSQL prunes the partitions of a partitioned table only for an `IN` list, and estimates its rows from the list's length instead of assuming 10 elements. An `IN` list is one statement text per length, and at most 65535 parameters.
 
 ## Bulk loading with `copy_in!`
 

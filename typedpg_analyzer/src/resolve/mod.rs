@@ -61,15 +61,31 @@ pub struct AnalyzedSpreadField {
     pub nullable: bool,
 }
 
-/// A spread parameter (`$..name { ... }`) with its offset in the rewritten SQL
-/// and the typed field list.
+/// A spread parameter (`$..name { ... }` or `$..name`) with its offset in
+/// the rewritten SQL and the typed field list.
 #[derive(Debug, Clone)]
 pub struct AnalyzedSpread {
     pub name: String,
     /// Byte offset in [`AnalyzedQuery::sql`] where the expanded
-    /// `($N, $M, ...), ...` placeholders should be inserted.
+    /// placeholders should be inserted.
     pub offset: usize,
+    pub kind: SpreadKind,
+    /// A [`SpreadKind::Rows`] spread's fields; a [`SpreadKind::List`]'s one
+    /// element, named after the spread.
     pub fields: Vec<AnalyzedSpreadField>,
+}
+
+/// What a spread expands to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpreadKind {
+    /// `VALUES $..rows { a, b }`: a row per item, `($1, $2), ($3, $4)`, its
+    /// fields' values. No item makes no row, which VALUES can't have: the
+    /// query isn't run.
+    Rows,
+    /// `x IN $..ids`: the parenthesized list of the items, `($1, $2)`. No
+    /// item is `(SELECT NULL::<type> WHERE false)`, the empty list PG has no
+    /// syntax for, so `x IN` it is false and `x NOT IN` it true.
+    List,
 }
 
 /// The full result of analyzing a SQL query template.
@@ -94,25 +110,22 @@ pub struct AnalyzedQuery {
 /// Build a "sample" SQL for analysis when the query contains spreads.
 ///
 /// Replaces each spread insertion point with a single row of positional
-/// placeholders numbered after the last regular parameter. Field mapping is
-/// mandatory for spreads, so `fields.len()` gives the column count.
-///
-/// Returns [`AnalyzeError::Invalid`] for a spread written without a field
-/// list (`$..items` rather than `$..items { a, b }`): the lexer accepts the
-/// bare form, but nothing then says which item fields fill which columns.
+/// placeholders numbered after the last regular parameter, one per field —
+/// a list spread (`$..ids`, no field list) with a single placeholder, `($k)`,
+/// whose type the analysis infers from the `IN`'s left side.
 ///
 /// Returned as a [`LexOutput`] over the sample SQL whose rewrites map its
 /// offsets back to the original SQL — each spread's placeholder row maps
 /// onto the `$..name` token — so diagnostics render against what the user
 /// wrote.
-pub(crate) fn build_spread_sample_sql(lex_output: &LexOutput) -> Result<LexOutput, AnalyzeError> {
-    let sql = spread_sample_sql(lex_output)?;
+pub(crate) fn build_spread_sample_sql(lex_output: &LexOutput) -> LexOutput {
+    let sql = spread_sample_sql(lex_output);
     // The lexer records a zero-length rewrite for each spread, in the
     // spreads' order; the sample replaces it with the placeholder row.
     let mut rows = lex_output
         .spreads
         .iter()
-        .map(|s| s.fields.as_ref().map_or(0, Vec::len));
+        .map(|s| s.fields.as_ref().map_or(1, Vec::len));
     let mut shift = 0usize;
     let mut counter = lex_output.params.len();
     let mut rewrites = Vec::with_capacity(lex_output.rewrites.len());
@@ -137,16 +150,16 @@ pub(crate) fn build_spread_sample_sql(lex_output: &LexOutput) -> Result<LexOutpu
         rewrites.push(out);
     }
     debug_assert_eq!(lex_output.sql.len() + shift, sql.len());
-    Ok(LexOutput {
+    LexOutput {
         sql,
         params: lex_output.params.clone(),
         spreads: lex_output.spreads.clone(),
         rewrites,
-    })
+    }
 }
 
 /// The text of [`build_spread_sample_sql`].
-fn spread_sample_sql(lex_output: &LexOutput) -> Result<String, AnalyzeError> {
+fn spread_sample_sql(lex_output: &LexOutput) -> String {
     let base_sql = &lex_output.sql;
     let num_regular_params = lex_output.params.len();
     let mut result = String::with_capacity(base_sql.len() + 64);
@@ -155,15 +168,9 @@ fn spread_sample_sql(lex_output: &LexOutput) -> Result<String, AnalyzeError> {
 
     for spread in &lex_output.spreads {
         result.push_str(&base_sql[last_offset..spread.offset]);
-        let fields = spread.fields.as_ref().ok_or_else(|| {
-            AnalyzeError::Invalid(format!(
-                "spread `$..{0}` needs a field list naming the item fields to bind, \
-                 e.g. `$..{0} {{ field1, field2 }}`",
-                spread.name
-            ))
-        })?;
+        let placeholders = spread.fields.as_ref().map_or(1, Vec::len);
         result.push('(');
-        for (i, _) in fields.iter().enumerate() {
+        for i in 0..placeholders {
             if i > 0 {
                 result.push_str(", ");
             }
@@ -176,7 +183,137 @@ fn spread_sample_sql(lex_output: &LexOutput) -> Result<String, AnalyzeError> {
     }
 
     result.push_str(&base_sql[last_offset..]);
-    Ok(result)
+    result
+}
+
+/// Check that each spread is where its expansion is valid SQL, in the
+/// parsed sample of [`build_spread_sample_sql`] (`None` when it doesn't
+/// parse: the analysis reports that). A rows spread is a VALUES row — its
+/// expansion is rows separated by commas, which only VALUES reads as such;
+/// a list spread the whole right side of an `IN`. Both write their own
+/// parentheses, which the tree doesn't show: `IN ($..ids)` parses like
+/// `IN $..ids` in the sample, but expands to a row, `IN (($1, $2))` — so
+/// the token before each must also be `IN`, or `VALUES` / `,` for rows.
+pub(crate) fn check_spread_positions(
+    sample: Option<&typedpg_pg_query::protobuf::ParseResult>,
+    lex_output: &LexOutput,
+    sample_lex: &LexOutput,
+) -> Result<(), AnalyzeError> {
+    use typedpg_pg_query::NodeRef;
+    use typedpg_pg_query::protobuf::{AExprKind, node::Node};
+    let Some(tree) = sample else {
+        return Ok(());
+    };
+    let nodes = tree.nodes();
+    // The placeholder numbers of a parenthesized list of bare `$k`s.
+    let numbers = |items: &[typedpg_pg_query::protobuf::Node]| -> Option<Vec<i32>> {
+        items
+            .iter()
+            .map(|i| match i.node.as_ref()? {
+                Node::ParamRef(p) => Some(p.number),
+                _ => None,
+            })
+            .collect()
+    };
+    // Each spread's placeholder row in the sample, which renders as the
+    // `$..name` token: the lexer's rewrites, a zero-length one per spread,
+    // are the sample's in the same order.
+    let mut rows = sample_lex
+        .rewrites
+        .iter()
+        .zip(&lex_output.rewrites)
+        .filter(|(_, lexed)| lexed.post_lex_len == 0)
+        .map(|(row, _)| {
+            crate::error::SourceSpan::new(row.post_lex_at, row.post_lex_at + row.post_lex_len)
+        });
+    let mut first = i32::try_from(lex_output.params.len()).unwrap_or(i32::MAX) + 1;
+    for spread in &lex_output.spreads {
+        let span = rows.next();
+        let count = spread.fields.as_ref().map_or(1, Vec::len);
+        let expected: Vec<i32> = (first..).take(count).collect();
+        first += i32::try_from(count).unwrap_or(i32::MAX);
+        let before = token_before(&lex_output.sql, spread.offset);
+        let placed = match &spread.fields {
+            Some(_) => {
+                (before.eq_ignore_ascii_case("values") || before == ",")
+                    && nodes.iter().any(|(n, _)| match n {
+                        NodeRef::SelectStmt(s) => {
+                            s.values_lists.iter().any(|row| match row.node.as_ref() {
+                                Some(Node::List(l)) => {
+                                    numbers(&l.items).as_ref() == Some(&expected)
+                                }
+                                _ => false,
+                            })
+                        }
+                        _ => false,
+                    })
+            }
+            None => {
+                before.eq_ignore_ascii_case("in")
+                    && nodes.iter().any(|(n, _)| match n {
+                        NodeRef::AExpr(e) if e.kind() == AExprKind::AexprIn => {
+                            match e.rexpr.as_deref().and_then(|r| r.node.as_ref()) {
+                                Some(Node::List(l)) => {
+                                    numbers(&l.items).as_ref() == Some(&expected)
+                                }
+                                _ => false,
+                            }
+                        }
+                        _ => false,
+                    })
+            }
+        };
+        if placed {
+            continue;
+        }
+        let error = match &spread.fields {
+            Some(_) => crate::error::RawError::invalid(
+                format!(
+                    "`$..{}` expands to rows of VALUES, so it goes where a VALUES row does: \
+                     `VALUES $..{0} {{ ... }}`",
+                    spread.name
+                ),
+                span,
+                Some(format!(
+                    "a list of values, as the right side of an IN, is a spread without fields: \
+                     `x IN $..{}`",
+                    spread.name
+                )),
+            )
+            .with_primary_label("rows of VALUES"),
+            None => crate::error::RawError::invalid(
+                format!(
+                    "`$..{0}` expands to a parenthesized list of values, so it goes right \
+                     after IN: `x IN $..{0}`",
+                    spread.name
+                ),
+                span,
+                Some(format!(
+                    "rows of VALUES name the item fields that fill them: `VALUES $..{} {{ a, b }}`",
+                    spread.name
+                )),
+            )
+            .with_primary_label("a parenthesized list"),
+        };
+        return Err(error.finalize_implicit());
+    }
+    Ok(())
+}
+
+/// The token of `sql` that ends before `offset`, past whitespace: a word,
+/// or a single other character (`""` at the start).
+fn token_before(sql: &str, offset: usize) -> &str {
+    let head = sql[..offset].trim_end();
+    let word = head
+        .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .map_or(0, |i| i + 1);
+    if word < head.len() {
+        &head[word..]
+    } else {
+        head.char_indices()
+            .next_back()
+            .map_or("", |(i, _)| &head[i..])
+    }
 }
 
 pub(crate) fn fuse(
@@ -212,12 +349,10 @@ pub(crate) fn fuse(
     let mut spread_param_cursor = num_regular;
     let mut spreads = Vec::with_capacity(lex_spreads.len());
     for spread in lex_spreads {
-        let lex_fields = spread.fields.ok_or_else(|| {
-            AnalyzeError::Internal(format!(
-                "spread '${}' reached fuse() without a field list",
-                spread.name
-            ))
-        })?;
+        let (kind, lex_fields) = match spread.fields {
+            Some(fields) => (SpreadKind::Rows, fields),
+            None => (SpreadKind::List, vec![spread.name.as_str().into()]),
+        };
         let mut fields = Vec::with_capacity(lex_fields.len());
         for lf in lex_fields {
             let pi = &info_params[spread_param_cursor];
@@ -231,6 +366,7 @@ pub(crate) fn fuse(
         spreads.push(AnalyzedSpread {
             name: spread.name,
             offset: spread.offset,
+            kind,
             fields,
         });
     }
