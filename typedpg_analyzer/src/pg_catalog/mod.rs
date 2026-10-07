@@ -1119,12 +1119,14 @@ impl PgCatalog {
         // analyzer can infer the field types from surrounding context. Its
         // offset map leads back to the original SQL like the lexer's does.
         let sample_lex;
+        let mut sample_tree = None;
         let analysis_lex = if lex_output.spreads.is_empty() {
             &lex_output
         } else {
             sample_lex = build_spread_sample_sql(&lex_output);
             let _guard = crate::error::DiagContextGuard::install(sql, &sample_lex);
             let tree = typedpg_pg_query::parse(&sample_lex.sql).ok();
+            sample_tree = tree.clone();
             if let Err(e) =
                 check_spread_positions(tree.as_ref().map(|t| &t.protobuf), &lex_output, &sample_lex)
             {
@@ -1174,7 +1176,33 @@ impl PgCatalog {
             }
         }
 
-        let fused = fuse(lex_output, columns, info_params, can_run_as_subquery);
+        let Some(tree) = sample_tree else {
+            return (
+                analysis_sql,
+                fuse(lex_output, columns, info_params, can_run_as_subquery),
+            );
+        };
+        let fused = fuse(
+            lex_output.clone(),
+            columns.clone(),
+            info_params.clone(),
+            can_run_as_subquery,
+        )
+        .map(|mut analyzed| {
+            crate::resolve::prove_array_forms(
+                self,
+                &crate::resolve::Sample {
+                    lex_output: &lex_output,
+                    sample_lex: analysis_lex,
+                    tree: &tree.protobuf,
+                    nullability: &param_nullability,
+                },
+                &columns,
+                &info_params,
+                &mut analyzed,
+            );
+            analyzed
+        });
         (analysis_sql, fused)
     }
 

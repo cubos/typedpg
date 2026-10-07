@@ -7,7 +7,7 @@ error[E0277]: an element of `$..ids` expects a value for SQL type bigint NOT NUL
   |     `String` doesn't satisfy the trait bound
   |     expected a value for bigint
   |
-  = help: the trait `__TypedpgBind0` is not implemented for `String`
+  = help: the trait `__TypedpgBind1` is not implemented for `String`
   = note: an element of `$..ids` takes `i64`, or any value with `Into<i64>`
   = note: this error originates in the macro `typedpg::sql` (in Nightly builds, run with -Z macro-backtrace for more info)
 

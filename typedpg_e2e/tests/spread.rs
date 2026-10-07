@@ -385,3 +385,91 @@ async fn empty_rows_spreads_run_the_query() {
     .expect("empty insert returning");
     assert!(returned.is_none());
 }
+
+/// Above 1000 items, a spread whose array form the analysis proved the
+/// same query is bound as arrays: `= ANY($1)` for a list, `unnest` for
+/// rows. So more values than PG's 65535 parameters fit, and the results
+/// are those of the written form.
+#[tokio::test]
+async fn large_spreads_are_bound_as_arrays() {
+    let pool = common::setup().await;
+    let tag = common::unique("large");
+
+    // 30 000 rows × 2 fields: 60 000 values, one `unnest` parameter each.
+    let rows: Vec<Person> = (0..30_000)
+        .map(|n| Person {
+            name: format!("n{n}"),
+            email: format!("{tag}-{n}@example.com"),
+        })
+        .collect();
+    let inserted = sql!(
+        &pool,
+        "INSERT INTO users (name, email) VALUES $..rows { name, email } RETURNING id, name"
+    )
+    .fetch_all()
+    .await
+    .expect("unnest insert");
+    // In the items' order, as VALUES would.
+    assert!(
+        inserted
+            .iter()
+            .map(|r| &r.name)
+            .eq(rows.iter().map(|r| &r.name))
+    );
+
+    // 70 000 ids, more than the parameters a statement can have.
+    let ids: Vec<i64> = inserted
+        .iter()
+        .map(|r| r.id)
+        .chain((1..=40_000).map(|n| -n))
+        .collect();
+    let ours = format!("{tag}-%");
+    let n = sql!(
+        &pool,
+        "SELECT count(*) AS \"n!\" FROM users WHERE id IN $..ids"
+    )
+    .fetch_value()
+    .await
+    .expect("= ANY");
+    assert_eq!(n, 30_000);
+    // NOT IN, with the IN the operand of `=`: `true = (id <> ALL(…))`.
+    let some: Vec<i64> = inserted.iter().take(29_000).map(|r| r.id).collect();
+    let n = sql!(
+        &pool,
+        "SELECT count(*) AS \"n!\" FROM users WHERE email LIKE $ours AND true = id NOT IN $..some",
+        ours = ours.clone()
+    )
+    .fetch_value()
+    .await
+    .expect("<> ALL");
+    assert_eq!(n, 1_000);
+
+    // Enum elements, bound as an array of labels.
+    let statuses: Vec<PostStatus> = (0..1_500)
+        .map(|n| {
+            if n % 2 == 0 {
+                PostStatus::Draft
+            } else {
+                PostStatus::Archived
+            }
+        })
+        .collect();
+    let n = sql!(
+        &pool,
+        "SELECT count(*) AS \"n!\" FROM unnest(ARRAY['draft', 'published', 'archived']::post_status[]) s \
+         WHERE s IN $..statuses"
+    )
+    .fetch_value()
+    .await
+    .expect("enum = ANY");
+    assert_eq!(n, 2);
+
+    // No array form where it would change the query (here, the column's
+    // nullability): 2 000 placeholders, as written.
+    let values: Vec<i32> = (0..2_000).collect();
+    let hit = sql!(&pool, "SELECT 1999 IN $..values AS hit")
+        .fetch_value()
+        .await
+        .expect("written list");
+    assert!(hit);
+}
