@@ -137,6 +137,15 @@ export class TooManyRowsError extends TypedpgError {
   }
 }
 
+/**
+ * A column name as the generated module has it: without its nullability
+ * annotation (`AS "title!"` is the column `title` on the wire too), as the
+ * analyzer strips it — but `?column?`, PG's own name, is no annotation.
+ */
+function withoutAnnotation(name: string): string {
+  return name === "?column?" ? name : name.replace(/[!?]$/, "");
+}
+
 /** A table of JSON specs, each parsed the first time it is used. */
 function specTable<S>(specs: Record<string, string>, what: string): (text: string) => S {
   const parsed = new Map<string, S>();
@@ -203,7 +212,7 @@ class QueryImpl {
     const { columns } = this.spec;
     // A schema change the generated module hasn't caught up with (`SELECT *`
     // after a migration added a column) would decode the wrong columns.
-    if (fields && fields.join("\0") !== columns.map((c) => c[0]).join("\0")) {
+    if (fields && fields.map(withoutAnnotation).join("\0") !== columns.map((c) => c[0]).join("\0")) {
       throw new TypedpgError(
         `the query's columns (${fields.join(", ")}) are not the ones it was generated with ` +
           `(${columns.map((c) => c[0]).join(", ")}): run \`typedpg gen\``,

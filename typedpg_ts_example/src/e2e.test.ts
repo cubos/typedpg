@@ -112,6 +112,10 @@ for (const [name, connect] of drivers) {
         { title: "Hello", author: "Ana", body: null, who: { f1: 1, f2: "ana@example.com" } },
         { title: "World", author: "Ana", body: "text", who: { f1: 1, f2: "ana@example.com" } },
       ]);
+      assert.deepEqual(await q.annotatedPosts.fetchAll(db), [
+        { title: "Hello", author: "Ana" },
+        { title: "World", author: "Ana" },
+      ]);
       assert.deepEqual(await q.authorsWithPostCount.fetchAll(db), [
         { name: "Ana", posts: 2n, titles: ["Hello", "World"] },
         { name: "Bia", posts: 0n, titles: [null] },

@@ -217,6 +217,13 @@ export interface Queries {
     };
     value: string;
   };
+  "SELECT p.title AS \"title!\", u.name AS \"author?\" FROM posts p JOIN users u ON u.id = p.author_id ORDER BY p.id": {
+    params: {};
+    row: {
+      title: string;
+      author: string | null;
+    };
+  };
   "SELECT t.*, to_jsonb(t) AS j FROM things t WHERE t.id = $id": {
     params: {
       id: number;
@@ -304,6 +311,7 @@ export const sql = createSql<Queries>({
   "SELECT id, name, mood FROM users WHERE mood = $mood ORDER BY id": "{\"sql\":[\"SELECT id, name, mood FROM users WHERE mood = ($1::public.mood) ORDER BY id\"],\"params\":[[\"mood\",\"text\"]],\"columns\":[[\"id\",\"number\"],[\"name\",\"text\"],[\"mood\",\"text\"]],\"subquery\":true}",
   "SELECT label FROM things WHERE $color = ANY (colors) ORDER BY id": "{\"sql\":[\"SELECT label FROM things WHERE ($1::public.color) = ANY (colors) ORDER BY id\"],\"params\":[[\"color\",\"text\"]],\"columns\":[[\"label\",\"text\"]],\"subquery\":true}",
   "SELECT name FROM users ORDER BY id": "{\"sql\":[\"SELECT name FROM users ORDER BY id\"],\"params\":[],\"columns\":[[\"name\",\"text\"]],\"subquery\":true}",
+  "SELECT p.title AS \"title!\", u.name AS \"author?\" FROM posts p JOIN users u ON u.id = p.author_id ORDER BY p.id": "{\"sql\":[\"SELECT p.title AS \\\"title!\\\", u.name AS \\\"author?\\\" FROM posts p JOIN users u ON u.id = p.author_id ORDER BY p.id\"],\"params\":[],\"columns\":[[\"title\",\"text\"],[\"author\",\"text\"]],\"subquery\":true}",
   "SELECT t.*, to_jsonb(t) AS j FROM things t WHERE t.id = $id": "{\"sql\":[\"SELECT t.*, to_jsonb(t) AS j FROM things t WHERE t.id = ($1::pg_catalog.int4)\"],\"params\":[[\"id\",\"number\"]],\"columns\":[[\"id\",\"number\"],[\"label\",\"text\"],[\"email\",\"text\"],[\"qty\",\"number\"],[\"tags\",[\"array\",\"text\"]],[\"colors\",[\"array\",\"text\"]],[\"shape\",[\"record\",[[\"name\",\"text\"],[\"color\",\"text\"],[\"points\",[\"array\",[\"record\",[[\"x\",\"number\"],[\"y\",\"number\"]]]]],[\"tags\",[\"array\",\"text\"]],[\"meta\",\"json\"]]]],[\"shape_d\",[\"record\",[[\"name\",\"text\"],[\"color\",\"text\"],[\"points\",[\"array\",[\"record\",[[\"x\",\"number\"],[\"y\",\"number\"]]]]],[\"tags\",[\"array\",\"text\"]],[\"meta\",\"json\"]]]],[\"shapes\",[\"array\",[\"record\",[[\"name\",\"text\"],[\"color\",\"text\"],[\"points\",[\"array\",[\"record\",[[\"x\",\"number\"],[\"y\",\"number\"]]]]],[\"tags\",[\"array\",\"text\"]],[\"meta\",\"json\"]]]]],[\"span\",[\"range\",\"number\"]],[\"periods\",[\"multirange\",\"timestamptz\"]],[\"amounts\",[\"range\",\"text\"]],[\"dates\",[\"range\",\"text\"]],[\"dur\",\"interval\"],[\"attrs\",\"hstore\"],[\"big\",\"bigint\"],[\"bigs\",[\"array\",\"bigint\"]],[\"nums\",[\"array\",\"text\"]],[\"flags\",[\"array\",\"bool\"]],[\"blobs\",[\"array\",\"bytea\"]],[\"stamps\",[\"array\",\"timestamptz\"]],[\"docs\",[\"array\",\"json\"]],[\"day\",\"text\"],[\"at_local\",\"text\"],[\"clock\",\"text\"],[\"id_uuid\",\"text\"],[\"addr\",\"text\"],[\"money_v\",\"text\"],[\"bits\",\"text\"],[\"ch\",\"text\"],[\"j\",\"json\"]],\"subquery\":true}",
   "UPDATE users SET home = ROW($street, $number) WHERE id = $id": "{\"sql\":[\"UPDATE users SET home = ROW(($1::pg_catalog.text), ($2::pg_catalog.int4)) WHERE id = ($3::pg_catalog.int4)\"],\"params\":[[\"street\",\"text\"],[\"number\",\"number\"],[\"id\",\"number\"]],\"columns\":[]}",
   "UPDATE users SET visits = visits + $by WHERE id = ANY($ids)": "{\"sql\":[\"UPDATE users SET visits = visits + ($1::pg_catalog.int8) WHERE id = ANY(($2::pg_catalog.int4[]))\"],\"params\":[[\"by\",\"bigint\"],[\"ids\",[\"array\",\"number\"]]],\"columns\":[]}",

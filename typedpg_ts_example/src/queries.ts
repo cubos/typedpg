@@ -27,6 +27,12 @@ export const postsWithAuthor = sql(`
   ORDER BY p.id
 `);
 
+// Nullability annotations on the aliases: the server names the columns
+// `title!` / `author?`, the rows have `title` / `author`.
+export const annotatedPosts = sql(
+  'SELECT p.title AS "title!", u.name AS "author?" FROM posts p JOIN users u ON u.id = p.author_id ORDER BY p.id',
+);
+
 export const authorsWithPostCount = sql(`
   SELECT u.name, count(p.id) AS posts, array_agg(p.title ORDER BY p.id) AS titles
   FROM users u LEFT JOIN posts p ON p.author_id = u.id
@@ -87,4 +93,5 @@ export type Checks = [
   Expect<
     Equal<Row<typeof authorsWithPostCount>, { name: string; posts: bigint; titles: (string | null)[] }>
   >,
+  Expect<Equal<Row<typeof annotatedPosts>, { title: string; author: string | null }>>,
 ];
