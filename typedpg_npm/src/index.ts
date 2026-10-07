@@ -120,7 +120,22 @@ export type Params<Q> = Q extends { "~types"?: infer T extends QueryTypes } ? T[
 export type SqlPiece =
   | string
   | readonly ["list", number, string, string]
-  | readonly ["values", readonly (readonly ["row", readonly SqlPiece[]] | readonly ["rows", number])[], string];
+  | readonly ["list", number, string, string, string, string, string, string]
+  | readonly ["values", readonly ValuesItem[], string]
+  | readonly ["values", readonly ValuesItem[], string, readonly string[]];
+
+/** An item of a VALUES list: a written row, or the rows of a spread. */
+export type ValuesItem = readonly ["row", readonly SqlPiece[]] | readonly ["rows", number];
+
+/**
+ * Above this many items, a spread with an array form (`lead, keyword, op,
+ * array cast` after a list; the fields' array casts after a VALUES list of
+ * one rows spread) is written in it — `(x = ANY($1::type[]))`, `SELECT *
+ * FROM unnest($1::type[], …) AS __typedpg_rows (column1, …)`: a parameter
+ * per field, whatever the number of items. The analysis offers the form
+ * only where it is the same query.
+ */
+const ARRAY_THRESHOLD = 1000;
 
 /** What the generator writes for each query: the SQL to run and the codecs. */
 export interface QuerySpec {
@@ -222,12 +237,29 @@ class QueryImpl {
         .map((piece) => {
           if (typeof piece === "string") return piece;
           if (piece[0] === "list") {
-            const [, i, cast, empty] = piece;
+            const [, i, cast, empty, lead = "", keyword = "", op, arrayCast] = piece;
             const codec = spec.spreads![i]![1][0]![1];
             const list = items(i);
-            return list.length === 0 ? empty : `(${list.map((v) => placeholder(codec, v, cast)).join(", ")})`;
+            if (op !== undefined && arrayCast !== undefined && list.length > ARRAY_THRESHOLD) {
+              return `(${lead}${op}(${placeholder(["array", codec], list, arrayCast)}))`;
+            }
+            const written = list.length === 0 ? empty : `(${list.map((v) => placeholder(codec, v, cast)).join(", ")})`;
+            return lead + keyword + written;
           }
-          const [, rows, empty] = piece;
+          const [, rows, empty, unnest] = piece;
+          const only = rows.length === 1 && rows[0]![0] === "rows" ? rows[0]![1] : undefined;
+          if (unnest !== undefined && only !== undefined && items(only).length > ARRAY_THRESHOLD) {
+            const values = items(only) as readonly Record<string, unknown>[];
+            const arrays = spec.spreads![only]![1].map(([field, codec], c) =>
+              placeholder(
+                ["array", codec],
+                values.map((r) => r[field]),
+                unnest[c]!,
+              ),
+            );
+            const columns = arrays.map((_, c) => `column${c + 1}`);
+            return `SELECT * FROM unnest(${arrays.join(", ")}) AS __typedpg_rows (${columns.join(", ")})`;
+          }
           const written = rows
             .filter((item) => item[0] === "row" || items(item[1]).length > 0)
             .map((item) => {

@@ -125,6 +125,11 @@ can be anything PostgreSQL accepts: CTEs, window functions, `LATERAL`,
   differs under a generic plan (a prepared statement run repeatedly, as
   postgres.js does), where PostgreSQL prunes partitions only for it and
   estimates its rows from its length instead of assuming 10 elements.
+- **Large spreads**: above 1000 items, a list is bound as one array —
+  `(id = ANY($1::type[]))` — and a `VALUES` of one rows spread as `SELECT *
+  FROM unnest($1::type1[], …)`, a parameter per field: faster, and past
+  PostgreSQL's 65535-parameter limit. Only where the analyzer proves it the
+  same query (same columns, types and nullability); otherwise, as written.
 - **Reusing a query's types**: `Row<typeof q>`, `Params<typeof q>`,
   `CopyRow<typeof c>`.
 

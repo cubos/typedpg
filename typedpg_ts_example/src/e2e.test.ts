@@ -172,6 +172,23 @@ for (const [name, connect] of drivers) {
       // An aggregate over an empty VALUES has its row.
       assert.equal(await q.countTitles.fetchValue(db, { titles: [] }), 0n);
     });
+
+    // Last: it adds posts.
+    test("spreads of over 1000 items are bound as arrays", async () => {
+      // 70 000 ids, more than a statement's 65535 parameters: one array.
+      const ids = [1, 3, ...Array.from({ length: 70_000 }, (_, i) => -i)];
+      assert.deepEqual(
+        (await q.usersIn.fetchAll(db, { ids })).map((r) => r.name),
+        ["Ana", "Caio"],
+      );
+      assert.deepEqual(
+        (await q.usersNotIn.fetchAll(db, { ids })).map((r) => r.name),
+        ["Bia"],
+      );
+      // 40 000 rows × 2 fields through unnest, an array per field.
+      const second = Array.from({ length: 40_000 }, (_, i) => ({ author: 1 + (i % 3), title: `t${i}` }));
+      assert.deepEqual(await q.insertPostBatches.fetchOne(db, { first: [], second }), { a: 0n, b: 40_000n });
+    });
   });
 }
 

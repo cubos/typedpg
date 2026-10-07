@@ -291,9 +291,11 @@ fn object(members: &[String], indent: usize) -> String {
 
 /// The pieces of `a.sql[start..end]`, as the runtime writes the SQL of a
 /// query with spreads (and the Rust side's `spread_sql`): its text
-/// (parameters cast), `["list", spread, cast, empty]` for a list spread,
-/// `["values", items, empty]` for a VALUES list holding rows spreads, each
-/// item `["row", pieces]` or `["rows", spread]`.
+/// (parameters cast), `["list", spread, cast, empty]` for a list spread —
+/// with `lead, keyword, op, array cast` after where it has an array form —
+/// and `["values", items, empty]` for a VALUES list holding rows spreads,
+/// each item `["row", pieces]` or `["rows", spread]`, with the fields' array
+/// casts after where it has an `unnest` form.
 fn sql_pieces(a: &AnalyzedQuery, start: usize, end: usize) -> Vec<Value> {
     // (where, a list spread's index, or a VALUES list)
     let mut events: Vec<(usize, Result<usize, &ValuesList>)> = a
@@ -302,7 +304,8 @@ fn sql_pieces(a: &AnalyzedQuery, start: usize, end: usize) -> Vec<Value> {
         .enumerate()
         // A list may end the SQL: its offset is then `end`.
         .filter(|(_, s)| s.kind == SpreadKind::List && (start..=end).contains(&s.offset))
-        .map(|(i, s)| (s.offset, Ok(i)))
+        // With an array form, its piece starts at the IN's operand.
+        .map(|(i, s)| (s.array_form.map_or(s.offset, |f| f.open), Ok(i)))
         .chain(
             a.values_lists
                 .iter()
@@ -321,12 +324,25 @@ fn sql_pieces(a: &AnalyzedQuery, start: usize, end: usize) -> Vec<Value> {
         pieces.push(json!(cast_range(a, cursor, at)));
         match event {
             Ok(si) => {
-                let cast = cast_suffix(&a.spreads[si].fields[0].pg_type);
+                let spread = &a.spreads[si];
+                let cast = cast_suffix(&spread.fields[0].pg_type);
                 // The empty list PG has no syntax for: `x IN` it is false,
                 // `x NOT IN` it true.
                 let empty = format!("(SELECT NULL{cast} WHERE false)");
-                pieces.push(json!(["list", si, cast, empty]));
-                cursor = at;
+                pieces.push(match spread.array_form {
+                    Some(form) => json!([
+                        "list",
+                        si,
+                        cast,
+                        empty,
+                        cast_range(a, form.open, form.keyword),
+                        cast_range(a, form.keyword, spread.offset),
+                        if form.negated { "<> ALL" } else { "= ANY" },
+                        format!("{cast}[]")
+                    ]),
+                    None => json!(["list", si, cast, empty]),
+                });
+                cursor = spread.offset;
             }
             Err(list) => {
                 let mut items = Vec::new();
@@ -351,7 +367,17 @@ fn sql_pieces(a: &AnalyzedQuery, start: usize, end: usize) -> Vec<Value> {
                     "SELECT * FROM (VALUES {}) AS __typedpg_empty WHERE false",
                     null_rows.join(", ")
                 );
-                pieces.push(json!(["values", items, empty]));
+                pieces.push(match list.items.as_slice() {
+                    [ValuesItem::Spread(si)] if list.unnest => {
+                        let casts: Vec<String> = a.spreads[*si]
+                            .fields
+                            .iter()
+                            .map(|f| format!("{}[]", cast_suffix(&f.pg_type)))
+                            .collect();
+                        json!(["values", items, empty, casts])
+                    }
+                    _ => json!(["values", items, empty]),
+                });
                 cursor = list.end;
             }
         }
@@ -531,6 +557,23 @@ mod tests {
             r#""sql":["INSERT INTO users (id, name, big, tags) ",["values",[["rows",0]],"SELECT * FROM (VALUES (NULL::pg_catalog.int4, NULL::pg_catalog.text, NULL::pg_catalog.int8, NULL::pg_catalog.text[])) AS __typedpg_empty WHERE false"]," RETURNING id"]"#
         ), "{}", g.runtime);
 
+        // No `unnest` form: it would flatten `tags`, an array.
+        assert!(
+            g.runtime
+                .contains(r#"AS __typedpg_empty WHERE false"]," RETURNING id"]"#),
+            "{}",
+            g.runtime
+        );
+        // Without it, the VALUES list has one: its fields' array casts.
+        let g = ok("INSERT INTO users (id, name) VALUES $..rows { id, name } RETURNING id");
+        assert!(
+            g.runtime.contains(
+                r#"WHERE false",["::pg_catalog.int4[]","::pg_catalog.text[]"]]," RETURNING id"]"#
+            ),
+            "{}",
+            g.runtime
+        );
+
         // A list: its one field is the element, typed by the IN's left side.
         let g = ok("SELECT id FROM users WHERE big IN $..bigs AND name NOT IN $..names");
         assert!(
@@ -543,6 +586,16 @@ mod tests {
         assert!(g.runtime.contains(
             r#""spreads":[["bigs",[["bigs","bigint","::pg_catalog.int8"]],"list"],["names",[["names","text","::pg_catalog.text"]],"list"]]"#
         ), "{}", g.runtime);
+        // Each with its array form: the operand, the keyword, the operator.
+        assert!(g.runtime.contains(
+            r#"["list",0,"::pg_catalog.int8","(SELECT NULL::pg_catalog.int8 WHERE false)","big ","IN ","= ANY","::pg_catalog.int8[]"]"#
+        ), "{}", g.runtime);
+        assert!(
+            g.runtime
+                .contains(r#""name ","NOT IN ","<> ALL","::pg_catalog.text[]"]"#),
+            "{}",
+            g.runtime
+        );
     }
 
     #[test]
