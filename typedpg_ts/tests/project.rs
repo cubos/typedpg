@@ -180,7 +180,9 @@ fn embedded_migrations_and_their_errors() {
     project(root, false).sync(false);
     let out = read(&root.join("db.ts"));
     assert!(
-        out.contains("import { createCopyIn, createSql, embedMigrations } from \"@cubos/typedpg\";"),
+        out.contains(
+            "import { createCopyIn, createSql, embedMigrations } from \"@cubos/typedpg\";"
+        ),
         "{out}"
     );
     assert!(out.contains(
