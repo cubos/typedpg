@@ -121,10 +121,13 @@ can be anything PostgreSQL accepts: CTEs, window functions, `LATERAL`,
 - **Lists**: `WHERE id IN $..ids`, with `ids` an array, is `id IN ($1, $2, …)`.
   An empty list is `(SELECT NULL::<type> WHERE false)` — PostgreSQL has no
   syntax for one — and the query runs: `IN` it is false, `NOT IN` it true.
-  `id = ANY($ids)` is the same filter with one array parameter; an `IN` list
-  differs under a generic plan (a prepared statement run repeatedly, as
-  postgres.js does), where PostgreSQL prunes partitions only for it and
-  estimates its rows from its length instead of assuming 10 elements.
+  `id = ANY($ids)` is the same filter with one array parameter. The drivers
+  don't reuse prepared statements (node-postgres sends unnamed ones, and
+  postgres.js's `unsafe()` doesn't prepare), so PostgreSQL plans each query
+  with its values and the two plan alike; an `IN` list differs only under a
+  generic plan — a `Driver` of your own reusing a prepared statement —
+  where PostgreSQL prunes partitions only for it and estimates its rows
+  from its length instead of assuming 10 elements.
 - **Large spreads**: above 1000 items, a list is bound as one array —
   `(id = ANY($1::type[]))` — and a `VALUES` of one rows spread as `SELECT *
   FROM unnest($1::type1[], …)`, a parameter per field: faster, and past
