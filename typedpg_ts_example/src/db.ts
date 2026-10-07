@@ -22,8 +22,8 @@ export interface Queries {
       dates: typedpg.Range<string> | null;
       dur: typedpg.Interval | string | null;
       attrs: Readonly<Record<string, string | null>> | null;
-      big: bigint | number | null;
-      bigs: readonly (bigint | number | null)[] | null;
+      big: bigint | number | string | null;
+      bigs: readonly (bigint | number | string | null)[] | null;
       nums: readonly (string | number | null)[] | null;
       flags: readonly (boolean | null)[] | null;
       blobs: readonly (Uint8Array | null)[] | null;
@@ -45,7 +45,7 @@ export interface Queries {
   };
   "\n  INSERT INTO users (name, email, mood, tags, prefs, visits, avatar)\n  VALUES $..users { name, email, mood, tags, prefs, visits, avatar }\n  RETURNING id, name\n": {
     params: {
-      users: readonly { name: string; email: string | null; mood: "happy" | "sad" | "neutral" | null; tags: readonly (string | null)[]; prefs: UserPrefs | null; visits: bigint | number; avatar: Uint8Array | null }[];
+      users: readonly { name: string; email: string | null; mood: "happy" | "sad" | "neutral" | null; tags: readonly (string | null)[]; prefs: UserPrefs | null; visits: bigint | number | string; avatar: Uint8Array | null }[];
     };
     row: {
       id: number;
@@ -272,7 +272,7 @@ export interface Queries {
   };
   "UPDATE users SET visits = visits + $by WHERE id = ANY($ids)": {
     params: {
-      by: bigint | number;
+      by: bigint | number | string;
       ids: readonly (number | null)[];
     };
     row: {};
@@ -288,7 +288,7 @@ export interface CopyTargets {
       shape: { name: string | null; color: "red" | "green" | "with space" | "quo\"te" | "back\\slash" | "NULL" | null; points: readonly (Point2 | null)[] | null; tags: readonly (string | null)[] | null; meta: unknown | null } | null;
       span: typedpg.Range<number> | null;
       attrs: Readonly<Record<string, string | null>> | null;
-      big: bigint | number | null;
+      big: bigint | number | string | null;
       dur: typedpg.Interval | string | null;
     };
   };

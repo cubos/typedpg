@@ -153,7 +153,7 @@ says, whatever `pg.types.setTypeParser` your application set up.
 |------------|------------|
 | `bool` | `boolean` |
 | `int2`, `int4`, `float4`, `float8`, `oid` | `number` |
-| `int8` | `bigint` (see `int8`); parameters also take `number` |
+| `int8` | `bigint` (see `int8`); parameters also take `number` and `string` |
 | `numeric` | `string` (exact); parameters also take `number` |
 | `text`, `varchar`, `char`, `uuid`, `date`, `time`, `timestamp`, `timetz`, `inet`, `money`, … | `string` |
 | `timestamptz` | `Date`; parameters also take `string` |

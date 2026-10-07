@@ -104,6 +104,13 @@ for (const [name, connect] of drivers) {
       assert.equal((await q.userById.fetchOne(db, { id: 1 })).visits, 7n);
     });
 
+    test("an int8 parameter takes a string, exactly", async () => {
+      assert.equal(await q.touch.execute(db, { by: "-9007199254740993", ids: [3] }), 1);
+      assert.equal((await q.userById.fetchOne(db, { id: 3 })).visits, 0n);
+      assert.equal(await q.touch.execute(db, { by: "9007199254740993", ids: [3] }), 1);
+      assert.equal((await q.userById.fetchOne(db, { id: 3 })).visits, 9007199254740993n);
+    });
+
     test("records, joins, aggregates", async () => {
       const p1 = await q.insertPost.fetchValue(db, { author: 1, title: "Hello", body: null });
       const p2 = await q.insertPost.fetchValue(db, { author: 1, title: "World", body: "text" });

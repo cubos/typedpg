@@ -277,9 +277,11 @@ impl TypeMapper<'_> {
                 same("number".into(), Codec::Number)
             }
             "int8" => match self.int8 {
+                // A string too, as `pg` reads an int8 and applications
+                // keep it.
                 Int8::Bigint => TsType {
                     output: "bigint".into(),
-                    input: "bigint | number".into(),
+                    input: "bigint | number | string".into(),
                     codec: Codec::BigInt,
                 },
                 Int8::String => TsType {
@@ -289,7 +291,7 @@ impl TypeMapper<'_> {
                 },
                 Int8::Number => TsType {
                     output: "number".into(),
-                    input: "number | bigint".into(),
+                    input: "number | bigint | string".into(),
                     codec: Codec::Int8Number,
                 },
             },
@@ -404,7 +406,7 @@ mod tests {
         with(Int8::Bigint, |m| {
             assert_eq!(m.map(&basic_ty("int4")).output, "number");
             assert_eq!(m.map(&basic_ty("int8")).output, "bigint");
-            assert_eq!(m.map(&basic_ty("int8")).input, "bigint | number");
+            assert_eq!(m.map(&basic_ty("int8")).input, "bigint | number | string");
             assert_eq!(m.map(&basic_ty("numeric")).output, "string");
             assert_eq!(m.map(&basic_ty("tsvector")).output, "string");
             assert_eq!(m.map(&basic_ty("timestamptz")).codec, Codec::Timestamptz);
@@ -420,6 +422,7 @@ mod tests {
         assert_eq!((s.output.as_str(), s.codec), ("string", Codec::Text));
         let n = int8(Int8::Number);
         assert_eq!((n.output.as_str(), n.codec), ("number", Codec::Int8Number));
+        assert_eq!(n.input, "number | bigint | string");
         // xid8 is unsigned 64-bit whatever the int8 mode.
         with(Int8::Number, |m| {
             assert_eq!(m.map(&basic_ty("xid8")).output, "bigint")
@@ -453,7 +456,7 @@ mod tests {
             };
             let r = m.map(&range(false));
             assert_eq!(r.output, "typedpg.Range<bigint>");
-            assert_eq!(r.input, "typedpg.Range<bigint | number>");
+            assert_eq!(r.input, "typedpg.Range<bigint | number | string>");
             assert_eq!(r.codec, Codec::Range(Box::new(Codec::BigInt)));
             let mr = m.map(&range(true));
             assert_eq!(mr.output, "typedpg.Range<bigint>[]");

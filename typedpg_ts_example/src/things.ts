@@ -93,7 +93,7 @@ export type Checks = [
     >
   >,
   // Parameters take the looser input types.
-  Expect<Equal<Params<typeof insertThing>["big"], bigint | number | null>>,
+  Expect<Equal<Params<typeof insertThing>["big"], bigint | number | string | null>>,
   Expect<Equal<Params<typeof insertThing>["dur"], Interval | string | null>>,
   Expect<Equal<Params<typeof insertThing>["stamps"], readonly (Date | string | null)[] | null>>,
   // A composite parameter: the fields' input types.

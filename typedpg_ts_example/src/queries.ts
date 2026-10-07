@@ -81,6 +81,8 @@ export type Checks = [
   Expect<Equal<Awaited<ReturnType<typeof countUsers.fetchValue>>, bigint>>,
   Expect<Equal<Awaited<ReturnType<typeof userEmail.fetchValueOptional>>, string | null>>,
   Expect<Equal<Params<typeof usersByMood>, { mood: "happy" | "sad" | "neutral" }>>,
+  // An int8 parameter also takes a number or a string.
+  Expect<Equal<Params<typeof touch>, { by: bigint | number | string; ids: readonly (number | null)[] }>>,
   Expect<Equal<Params<typeof insertPost>, { author: number; title: string; body: string | null }>>,
   Expect<
     Equal<

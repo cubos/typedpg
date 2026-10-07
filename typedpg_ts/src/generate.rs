@@ -433,7 +433,7 @@ mod tests {
                     RETURNING id",
         );
         assert!(
-            g.types.contains("rows: readonly { id: number; name: string | null; big: bigint | number; tags: readonly (string | null)[] }[];"),
+            g.types.contains("rows: readonly { id: number; name: string | null; big: bigint | number | string; tags: readonly (string | null)[] }[];"),
             "{}",
             g.types
         );
