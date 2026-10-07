@@ -1,8 +1,8 @@
 {
   "name": "typedpg",
   "displayName": "typedpg",
-  "description": "SQL syntax highlighting inside typedpg sql! macros",
-  "version": "0.3.0",
+  "description": "SQL syntax highlighting inside typedpg sql! macros (Rust) and sql() / copyIn() calls (TypeScript)",
+  "version": "0.4.0",
   "publisher": "cubos",
   "engines": {
     "vscode": "^1.80.0"
@@ -17,6 +17,14 @@
         "injectTo": ["source.rust"],
         "scopeName": "inline.sql.typedpg",
         "path": "./syntaxes/typedpg.tmLanguage.json",
+        "embeddedLanguages": {
+          "meta.embedded.sql": "sql"
+        }
+      },
+      {
+        "injectTo": ["source.ts", "source.tsx"],
+        "scopeName": "inline.sql.typedpg.ts",
+        "path": "./syntaxes/typedpg-ts.tmLanguage.json",
         "embeddedLanguages": {
           "meta.embedded.sql": "sql"
         }

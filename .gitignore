@@ -3,3 +3,5 @@ target/
 .devcontainer
 .vscode
 /typedpg_compile_fail/fixture/Cargo.lock
+node_modules/
+/typedpg_npm/dist/

@@ -1,0 +1,5 @@
+{
+  "include": ["src"],
+  "out": "src/db.ts",
+  "migrations": "../migrations"
+}

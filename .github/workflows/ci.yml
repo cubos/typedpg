@@ -66,6 +66,25 @@ jobs:
           FUZZ_ITERS: 300
           FUZZ_STRICT: single
 
+  typescript:
+    name: TypeScript (generator, runtime, e2e on postgres:18)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      # The runtime's unit tests, `typedpg check`, the errors fixture, tsc
+      # 7 and 5.9 over the example, then its queries, COPY, streams and
+      # migrations on a PostgreSQL container, through node-postgres and
+      # postgres.js.
+      - run: scripts/run-ts-e2e.sh
+
   msrv:
     name: minimum Rust version (1.89)
     runs-on: ubuntu-latest
@@ -77,7 +96,9 @@ jobs:
       # Keep in sync with `rust-version` in the workspace Cargo.toml.
       - uses: dtolnay/rust-toolchain@1.89
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --workspace --all-targets
+      # typedpg_ts, the TypeScript CLI (a binary, not published to
+      # crates.io), needs a newer Rust for its oxc parser.
+      - run: cargo check --workspace --all-targets --exclude typedpg_ts
 
   old-glibc:
     name: build on glibc 2.36 (Debian bookworm)

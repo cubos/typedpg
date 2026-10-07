@@ -1,0 +1,87 @@
+name: npm
+
+# Builds the `typedpg` binary for each platform and assembles the npm
+# packages: `typedpg` (the runtime, with an optional dependency on each
+# platform's binary) and `@typedpg/cli-<target>`. A pushed `npm-v*` tag
+# publishes them; a manual run only packs them (`npm publish --dry-run`).
+
+on:
+  push:
+    tags: ["npm-v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  binary:
+    name: binary (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: linux-x64-gnu, os: ubuntu-22.04, rust: x86_64-unknown-linux-gnu }
+          - { target: linux-arm64-gnu, os: ubuntu-22.04-arm, rust: aarch64-unknown-linux-gnu }
+          - { target: linux-x64-musl, os: ubuntu-24.04, rust: x86_64-unknown-linux-musl, musl: true }
+          - { target: linux-arm64-musl, os: ubuntu-24.04-arm, rust: aarch64-unknown-linux-musl, musl: true }
+          - { target: darwin-x64, os: macos-15-intel, rust: x86_64-apple-darwin }
+          - { target: darwin-arm64, os: macos-15, rust: aarch64-apple-darwin }
+          - { target: win32-x64-msvc, os: windows-2025, rust: x86_64-pc-windows-msvc }
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust }}
+      - if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      # Built on the oldest Ubuntu runner for the glibc targets, so the
+      # binary runs on older distributions too.
+      - run: cargo build --release --locked -p typedpg_ts --bin typedpg --target ${{ matrix.rust }}
+      - shell: bash
+        run: |
+          mkdir -p bins/${{ matrix.target }}
+          ext=""; [[ "${{ matrix.target }}" == win32-* ]] && ext=".exe"
+          cp "target/${{ matrix.rust }}/release/typedpg$ext" "bins/${{ matrix.target }}/"
+          "bins/${{ matrix.target }}/typedpg$ext" --version
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bin-${{ matrix.target }}
+          path: bins
+
+  packages:
+    name: assemble and publish
+    needs: binary
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write # npm provenance
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: bin-*
+          path: bins
+          merge-multiple: true
+      - working-directory: typedpg_npm
+        run: |
+          npm ci
+          npm test
+          node scripts/assemble.mjs ../bins ../npm-dist
+      # The platform packages first: `typedpg` depends on them.
+      - shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          publish="npm publish --access public --provenance"
+          [[ "$GITHUB_REF" == refs/tags/npm-v* ]] || publish="npm publish --dry-run"
+          for dir in npm-dist/cli-*; do (cd "$dir" && $publish); done
+          (cd npm-dist/typedpg && $publish)

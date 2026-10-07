@@ -13,6 +13,8 @@ Write plain SQL, get full type safety. The `sql!` macro statically analyzes ever
 - **Zero runtime overhead** -- the macro generates concrete Rust structs with named fields. No runtime reflection, no `Box<dyn Any>`, no string-based column access.
 - **PostgreSQL-native** -- first-class support for JSONB domains (`CREATE DOMAIN ... AS JSONB` mapped to Rust structs), enums (`CREATE TYPE ... AS ENUM` mapped to Rust enums), arrays, composite types, and advisory locks.
 
+> **TypeScript** -- the same analyzer types `sql("...")` queries in TypeScript: `npx typedpg gen` generates, from your sources and migrations, the module that types and runs them on node-postgres or postgres.js. See [`typedpg_npm/README.md`](typedpg_npm/README.md).
+
 ## Quick start
 
 Add to your `Cargo.toml`:

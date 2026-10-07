@@ -1,0 +1,49 @@
+{
+  "name": "typedpg",
+  "version": "0.4.0",
+  "description": "Typed PostgreSQL queries for TypeScript, checked against your migrations without a database",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cubos/typedpg.git",
+    "directory": "typedpg_npm"
+  },
+  "keywords": ["postgres", "postgresql", "sql", "typescript", "typed", "pg", "postgres.js"],
+  "type": "module",
+  "engines": {
+    "node": ">=22.12"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "typedpg": "bin/typedpg.js"
+  },
+  "files": ["dist", "!dist/*.test.*", "bin"],
+  "sideEffects": false,
+  "scripts": {
+    "build": "rm -rf dist && tsc -p .",
+    "test": "npm run build && node --test dist/*.test.js",
+    "prepack": "npm run build"
+  },
+  "peerDependencies": {
+    "pg": ">=8.11",
+    "pg-copy-streams": ">=6",
+    "pg-cursor": ">=2.10",
+    "postgres": ">=3.4 <4"
+  },
+  "peerDependenciesMeta": {
+    "pg": { "optional": true },
+    "pg-copy-streams": { "optional": true },
+    "pg-cursor": { "optional": true },
+    "postgres": { "optional": true }
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^7.0.0"
+  }
+}
