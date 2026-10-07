@@ -158,6 +158,20 @@ for (const [name, connect] of drivers) {
       assert.deepEqual(row.b, new Uint8Array([0, 255]));
       assert.equal(row.nothing, null);
     });
+
+    // Last: it adds posts.
+    test("rows spreads with no item still run the query", async () => {
+      // Two inserts in CTEs, the first one empty: the second still inserts.
+      const posts = [
+        { author: 1, title: "x" },
+        { author: 2, title: "y" },
+      ];
+      assert.deepEqual(await q.insertPostBatches.fetchOne(db, { first: [], second: posts }), { a: 0n, b: 2n });
+      // A written row and an empty spread: the written row is inserted.
+      assert.deepEqual(await q.insertPostsAfterOne.fetchAll(db, { author: 1, more: [] }), [{ title: "first" }]);
+      // An aggregate over an empty VALUES has its row.
+      assert.equal(await q.countTitles.fetchValue(db, { titles: [] }), 0n);
+    });
   });
 }
 

@@ -26,6 +26,19 @@ export const usersIn = sql("SELECT name FROM users WHERE id IN $..ids ORDER BY i
 
 export const usersNotIn = sql("SELECT name FROM users WHERE id NOT IN $..ids ORDER BY id");
 
+// Rows spreads with no item: the query still runs, as SQL would with no row.
+export const insertPostBatches = sql(`
+  WITH a AS (INSERT INTO posts (author_id, title) VALUES $..first { author, title } RETURNING id),
+       b AS (INSERT INTO posts (author_id, title) VALUES $..second { author, title } RETURNING id)
+  SELECT (SELECT count(*) FROM a) AS "a!", (SELECT count(*) FROM b) AS "b!"
+`);
+
+export const insertPostsAfterOne = sql(
+  "INSERT INTO posts (author_id, title) VALUES ($author, 'first'), $..more { author, title } RETURNING title",
+);
+
+export const countTitles = sql('WITH v (title) AS (VALUES $..titles { title }) SELECT count(*) AS "n!" FROM v');
+
 export const usersWithMoods = sql("SELECT name FROM users WHERE mood IN $..moods AND id > $after ORDER BY id");
 
 export const postsWithAuthor = sql(`

@@ -8,6 +8,7 @@ use std::fmt::Write as _;
 use serde_json::{Value, json};
 use typedpg_analyzer::{
     AnalyzedColumn, AnalyzedCopyIn, AnalyzedQuery, LocatedError, PgCatalog, SpreadKind, Type,
+    ValuesItem, ValuesList,
 };
 
 use crate::scan::Kind;
@@ -152,15 +153,13 @@ fn generate_query(a: &AnalyzedQuery, mapper: &TypeMapper) -> Result<Generated, G
     types.push_str("  }");
 
     // ── runtime ──
-    let mut pieces = Vec::new();
-    let mut last = 0;
-    for s in &a.spreads {
-        pieces.push(cast_range(a, last, s.offset));
-        last = s.offset;
-    }
-    pieces.push(cast_range(a, last, a.sql.len()));
     let mut spec = serde_json::Map::new();
-    spec.insert("sql".into(), json!(pieces));
+    let sql = if a.spreads.is_empty() {
+        json!([cast_range(a, 0, a.sql.len())])
+    } else {
+        Value::Array(sql_pieces(a, 0, a.sql.len()))
+    };
+    spec.insert("sql".into(), sql);
     spec.insert(
         "params".into(),
         a.params
@@ -288,6 +287,77 @@ fn object(members: &[String], indent: usize) -> String {
     out.push_str(&" ".repeat(indent));
     out.push('}');
     out
+}
+
+/// The pieces of `a.sql[start..end]`, as the runtime writes the SQL of a
+/// query with spreads (and the Rust side's `spread_sql`): its text
+/// (parameters cast), `["list", spread, cast, empty]` for a list spread,
+/// `["values", items, empty]` for a VALUES list holding rows spreads, each
+/// item `["row", pieces]` or `["rows", spread]`.
+fn sql_pieces(a: &AnalyzedQuery, start: usize, end: usize) -> Vec<Value> {
+    // (where, a list spread's index, or a VALUES list)
+    let mut events: Vec<(usize, Result<usize, &ValuesList>)> = a
+        .spreads
+        .iter()
+        .enumerate()
+        // A list may end the SQL: its offset is then `end`.
+        .filter(|(_, s)| s.kind == SpreadKind::List && (start..=end).contains(&s.offset))
+        .map(|(i, s)| (s.offset, Ok(i)))
+        .chain(
+            a.values_lists
+                .iter()
+                .filter(|l| (start..end).contains(&l.start))
+                .map(|l| (l.start, Err(l))),
+        )
+        .collect();
+    events.sort_by_key(|e| e.0);
+    let mut pieces = Vec::new();
+    let mut cursor = start;
+    for (at, event) in events {
+        // Inside a VALUES list already written.
+        if at < cursor {
+            continue;
+        }
+        pieces.push(json!(cast_range(a, cursor, at)));
+        match event {
+            Ok(si) => {
+                let cast = cast_suffix(&a.spreads[si].fields[0].pg_type);
+                // The empty list PG has no syntax for: `x IN` it is false,
+                // `x NOT IN` it true.
+                let empty = format!("(SELECT NULL{cast} WHERE false)");
+                pieces.push(json!(["list", si, cast, empty]));
+                cursor = at;
+            }
+            Err(list) => {
+                let mut items = Vec::new();
+                let mut null_rows = Vec::new();
+                for item in &list.items {
+                    items.push(match *item {
+                        ValuesItem::Row { start, end } => json!(["row", sql_pieces(a, start, end)]),
+                        ValuesItem::Spread(si) => {
+                            let nulls: Vec<String> = a.spreads[si]
+                                .fields
+                                .iter()
+                                .map(|f| format!("NULL{}", cast_suffix(&f.pg_type)))
+                                .collect();
+                            null_rows.push(format!("({})", nulls.join(", ")));
+                            json!(["rows", si])
+                        }
+                    });
+                }
+                // No row: a SELECT of none, its columns typed as the
+                // list's would be.
+                let empty = format!(
+                    "SELECT * FROM (VALUES {}) AS __typedpg_empty WHERE false",
+                    null_rows.join(", ")
+                );
+                pieces.push(json!(["values", items, empty]));
+                cursor = list.end;
+            }
+        }
+    }
+    pieces.push(json!(cast_range(a, cursor, end)));
+    pieces
 }
 
 /// `::type` for a spread field's placeholder, as the Rust side writes it.
@@ -455,6 +525,11 @@ mod tests {
             r#""spreads":[["rows",[["id","number","::pg_catalog.int4"],["name","text","::pg_catalog.text"],["big","bigint","::pg_catalog.int8"],["tags",["array","text"],"::pg_catalog.text[]"]],"rows"]]"#
         ), "{}", g.runtime);
         assert!(!g.runtime.contains("subquery"));
+
+        // The SQL in pieces: the VALUES list, with what it is with no row.
+        assert!(g.runtime.contains(
+            r#""sql":["INSERT INTO users (id, name, big, tags) ",["values",[["rows",0]],"SELECT * FROM (VALUES (NULL::pg_catalog.int4, NULL::pg_catalog.text, NULL::pg_catalog.int8, NULL::pg_catalog.text[])) AS __typedpg_empty WHERE false"]," RETURNING id"]"#
+        ), "{}", g.runtime);
 
         // A list: its one field is the element, typed by the IN's left side.
         let g = ok("SELECT id FROM users WHERE big IN $..bigs AND name NOT IN $..names");

@@ -110,10 +110,22 @@ export type Row<Q> = Q extends { "~types"?: infer T extends QueryTypes } ? T["ro
 /** A parameters type: `Params<typeof query>`. */
 export type Params<Q> = Q extends { "~types"?: infer T extends QueryTypes } ? T["params"] : never;
 
+/**
+ * A piece of a query's SQL: text (rewritten to `$1`, `$2`, …), the `(…)`
+ * list of the list spread at an index of `spreads` (with the cast after
+ * each placeholder, and what it is with no item), or a VALUES list holding
+ * rows spreads (its items — a written row, or a spread's rows — and what
+ * it is when no item has a row).
+ */
+export type SqlPiece =
+  | string
+  | readonly ["list", number, string, string]
+  | readonly ["values", readonly (readonly ["row", readonly SqlPiece[]] | readonly ["rows", number])[], string];
+
 /** What the generator writes for each query: the SQL to run and the codecs. */
 export interface QuerySpec {
-  /** The SQL, rewritten to `$1`, `$2`, …; split where each spread goes. */
-  sql: readonly string[];
+  /** The SQL, in pieces where spreads go. */
+  sql: readonly SqlPiece[];
   /** The parameters, in `$1`, `$2`, … order. */
   params: readonly (readonly [string, Codec])[];
   /**
@@ -182,7 +194,7 @@ export function createSql<Q>(specs: Record<string, string>): Sql<Q> {
   return ((text: string) => new QueryImpl(text, spec(text))) as unknown as Sql<Q>;
 }
 
-type Built = { text: string; values: (string | null)[]; empty: boolean };
+type Built = { text: string; values: (string | null)[] };
 
 class QueryImpl {
   constructor(
@@ -190,51 +202,45 @@ class QueryImpl {
     private readonly spec: QuerySpec,
   ) {}
 
+  /**
+   * The SQL and its values. Spreads are written in order, their values
+   * after the parameters': with no item, a list is a subquery of no row
+   * and a VALUES list leaves the spread out — or, with no item that has a
+   * row, is a SELECT of none — so the query runs as SQL would.
+   */
   private build(params: Record<string, unknown> = {}): Built {
     const { spec } = this;
     const values = spec.params.map(([name, codec]) => encode(codec, params[name]));
-    let text = spec.sql[0]!;
-    let empty = false;
     let n = values.length;
-    spec.spreads?.forEach(([name, fields, kind], i) => {
-      if (kind === "list") {
-        // `x IN` an empty list is false, `x NOT IN` it true: PG has no
-        // syntax for one, so it is a subquery returning no row.
-        const [, codec, cast] = fields[0]!;
-        const items = params[name] as readonly unknown[];
-        text +=
-          items.length === 0
-            ? `(SELECT NULL${cast} WHERE false)`
-            : "(" +
-              items
-                .map((item) => {
-                  values.push(encode(codec, item));
-                  return `$${++n}${cast}`;
-                })
-                .join(", ") +
-              ")";
-        text += spec.sql[i + 1]!;
-        return;
-      }
-      // No row is no VALUES row: the query isn't run.
-      const rows = params[name] as readonly Record<string, unknown>[];
-      if (rows.length === 0) empty = true;
-      text += rows
-        .map(
-          (row) =>
-            "(" +
-            fields
-              .map(([field, codec, cast]) => {
-                values.push(encode(codec, row[field]));
-                return `$${++n}${cast}`;
-              })
-              .join(", ") +
-            ")",
-        )
-        .join(", ");
-      text += spec.sql[i + 1]!;
-    });
-    return { text, values, empty };
+    const placeholder = (codec: Codec, value: unknown, cast: string) => {
+      values.push(encode(codec, value));
+      return `$${++n}${cast}`;
+    };
+    const items = (i: number) => params[spec.spreads![i]![0]] as readonly unknown[];
+    const write = (pieces: readonly SqlPiece[]): string =>
+      pieces
+        .map((piece) => {
+          if (typeof piece === "string") return piece;
+          if (piece[0] === "list") {
+            const [, i, cast, empty] = piece;
+            const codec = spec.spreads![i]![1][0]![1];
+            const list = items(i);
+            return list.length === 0 ? empty : `(${list.map((v) => placeholder(codec, v, cast)).join(", ")})`;
+          }
+          const [, rows, empty] = piece;
+          const written = rows
+            .filter((item) => item[0] === "row" || items(item[1]).length > 0)
+            .map((item) => {
+              if (item[0] === "row") return write(item[1]);
+              const fields = spec.spreads![item[1]]![1];
+              const row = (r: Record<string, unknown>) =>
+                `(${fields.map(([field, codec, cast]) => placeholder(codec, r[field], cast)).join(", ")})`;
+              return (items(item[1]) as readonly Record<string, unknown>[]).map(row).join(", ");
+            });
+          return written.length === 0 ? empty : `VALUES ${written.join(", ")}`;
+        })
+        .join("");
+    return { text: write(spec.sql), values };
   }
 
   /** Fail if `fields` (when the driver reports them) aren't the generated columns. */
@@ -268,13 +274,11 @@ class QueryImpl {
 
   async fetchAll(executor: Executor, params?: Record<string, unknown>) {
     const q = this.build(params);
-    if (q.empty) return [];
     return this.decodeRows(await driverFor(executor).typedpgQuery(q.text, q.values));
   }
 
   async fetchOptional(executor: Executor, params?: Record<string, unknown>) {
     const q = this.build(params);
-    if (q.empty) return null;
     const text = this.spec.subquery ? `SELECT * FROM (${q.text}) AS __typedpg_limit LIMIT 2` : q.text;
     const rows = this.decodeRows(await driverFor(executor).typedpgQuery(text, q.values));
     if (rows.length > 1) throw new TooManyRowsError(this.text);
@@ -289,7 +293,6 @@ class QueryImpl {
 
   async *fetchStream(executor: Executor, params?: Record<string, unknown>, options?: StreamOptions) {
     const q = this.build(params);
-    if (q.empty) return;
     const driver = driverFor(executor);
     if (!driver.typedpgStream) throw unsupported("typedpgStream (fetchStream)");
     for await (const rows of driver.typedpgStream(q.text, q.values, options?.batchSize ?? 100)) {
@@ -299,7 +302,6 @@ class QueryImpl {
 
   async execute(executor: Executor, params?: Record<string, unknown>) {
     const q = this.build(params);
-    if (q.empty) return 0;
     return (await driverFor(executor).typedpgQuery(q.text, q.values)).rowCount;
   }
 

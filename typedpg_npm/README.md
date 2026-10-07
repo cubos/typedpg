@@ -114,7 +114,10 @@ can be anything PostgreSQL accepts: CTEs, window functions, `LATERAL`,
   NULL` are followed. Override it with an alias, `AS "title!"` (not null) /
   `AS "title?"` (nullable), or on a parameter, `$name?` / `$name!`.
 - **Bulk insert**: `INSERT INTO users (name, email) VALUES $..rows { name, email }`,
-  with `rows` an array of `{ name, email }`. With no row, the query isn't run.
+  with `rows` an array of `{ name, email }`. With no row the query still
+  runs, as SQL would: an empty spread next to other rows is left out, and a
+  `VALUES` of nothing but empty spreads is written as a `SELECT` of no row
+  (PostgreSQL has no `VALUES` without one).
 - **Lists**: `WHERE id IN $..ids`, with `ids` an array, is `id IN ($1, $2, …)`.
   An empty list is `(SELECT NULL::<type> WHERE false)` — PostgreSQL has no
   syntax for one — and the query runs: `IN` it is false, `NOT IN` it true.
