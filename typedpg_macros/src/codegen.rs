@@ -1103,6 +1103,9 @@ fn generate_spread(
 
     let mut fields_per_row_lits = Vec::new();
 
+    let capable: Vec<bool> = (0..analyzed.spreads.len())
+        .map(|si| array_capable(analyzed, si, config, &registry))
+        .collect();
     for (si, spread) in analyzed.spreads.iter().enumerate() {
         let col_count = spread.fields.len();
         let field_ident = format_ident!("__spread_{}", si);
@@ -1153,11 +1156,63 @@ fn generate_spread(
             });
         }
 
+        // Above the threshold, a spread with an array form binds an array
+        // per field instead (`spread_sql` writes it the same way).
+        let array_pushes = if capable[si] {
+            let mut collects = TokenStream::new();
+            let mut pushes = TokenStream::new();
+            let mut decls = TokenStream::new();
+            for (fi, field) in spread.fields.iter().enumerate() {
+                let accessor_ident = format_ident!("{}", field.name);
+                let (subject, raw) = match spread.kind {
+                    SpreadKind::Rows => (
+                        format!("field `{}` of `$..{}`", field.name, spread.name),
+                        quote::quote_spanned! {accessor_ident.span()=>
+                            ::std::clone::Clone::clone(&__item.#accessor_ident)
+                        },
+                    ),
+                    SpreadKind::List => (
+                        format!("an element of `$..{}`", spread.name),
+                        quote! { ::std::clone::Clone::clone(__item) },
+                    ),
+                };
+                let (ty, value) =
+                    build_field_type_and_value(&subject, field, config, &registry, &raw)?;
+                let array = format_ident!("__array_{}", fi);
+                decls.extend(quote! {
+                    let mut #array: ::std::vec::Vec<#ty> = ::std::vec::Vec::with_capacity(__items.len());
+                });
+                collects.extend(quote! {
+                    #[allow(clippy::clone_on_copy)]
+                    #array.push(#value);
+                });
+                pushes.extend(push_param(
+                    &ArrayOf(array_of(field)),
+                    config,
+                    &registry,
+                    &quote! { #array },
+                )?);
+            }
+            quote! {
+                if ::typedpg::__private::uses_arrays(__items.len(), true) {
+                    #decls
+                    for __item in __items.iter() {
+                        #collects
+                    }
+                    #pushes
+                    return ::std::result::Result::Ok((__items.len(), __params));
+                }
+            }
+        } else {
+            TokenStream::new()
+        };
+
         spread_struct_inits.extend(quote! {
             #field_ident: (|| {
                 let __items = &(#spread_value_expr)[..];
                 let mut __params: ::std::vec::Vec<__SpreadParam> =
                     ::std::vec::Vec::with_capacity(__items.len() * #col_count);
+                #array_pushes
                 for __item in __items.iter() {
                     #item_pushes
                 }
@@ -1179,7 +1234,7 @@ fn generate_spread(
 
     // ── The SQL, from its pieces and the spreads' sizes ─────────────────
     let num_regular_lit = proc_macro2::Literal::usize_unsuffixed(num_regular_params);
-    let pieces = spread_pieces(analyzed, 0, analyzed.sql.len());
+    let pieces = spread_pieces(analyzed, &capable, 0, analyzed.sql.len());
 
     // ── Capacity estimate ───────────────────────────────────────────────
     let mut capacity_expr = quote! { #num_regular_lit };
@@ -1699,7 +1754,12 @@ fn sql_type_name(ty: &Type) -> String {
 /// its text (parameters cast), the lists of its list spreads and the VALUES
 /// lists of its rows spreads — each written once, a list in a VALUES row
 /// within that row.
-fn spread_pieces(analyzed: &AnalyzedQuery, start: usize, end: usize) -> Vec<TokenStream> {
+fn spread_pieces(
+    analyzed: &AnalyzedQuery,
+    capable: &[bool],
+    start: usize,
+    end: usize,
+) -> Vec<TokenStream> {
     let cast = |f: &AnalyzedSpreadField| {
         f.pg_type
             .cast_name()
@@ -1713,7 +1773,11 @@ fn spread_pieces(analyzed: &AnalyzedQuery, start: usize, end: usize) -> Vec<Toke
         .enumerate()
         // A list may end the SQL: its offset is then `end`.
         .filter(|(_, s)| s.kind == SpreadKind::List && (start..=end).contains(&s.offset))
-        .map(|(i, s)| (s.offset, Ok(i)))
+        // With an array form, its piece starts at the IN's operand.
+        .map(|(i, s)| match s.array_form.filter(|_| capable[i]) {
+            Some(form) => (form.open, Ok(i)),
+            None => (s.offset, Ok(i)),
+        })
         .chain(
             analyzed
                 .values_lists
@@ -1734,14 +1798,40 @@ fn spread_pieces(analyzed: &AnalyzedQuery, start: usize, end: usize) -> Vec<Toke
         pieces.push(quote! { ::typedpg::__private::SqlPiece::Text(#text) });
         match event {
             Ok(si) => {
-                let cast = cast(&analyzed.spreads[si].fields[0]);
+                let spread = &analyzed.spreads[si];
+                let cast = cast(&spread.fields[0]);
                 // The empty list PG has no syntax for: `x IN` it is false,
                 // `x NOT IN` it true.
                 let empty = format!("(SELECT NULL{cast} WHERE false)");
+                let (lead, keyword, array) = match spread.array_form.filter(|_| capable[si]) {
+                    Some(form) => {
+                        let lead = cast_range(analyzed, form.open, form.keyword);
+                        let keyword = cast_range(analyzed, form.keyword, spread.offset);
+                        let op = if form.negated { "<> ALL" } else { "= ANY" };
+                        let array_cast = format!("{cast}[]");
+                        (
+                            lead,
+                            keyword,
+                            quote! { ::std::option::Option::Some((#op, #array_cast)) },
+                        )
+                    }
+                    None => (
+                        String::new(),
+                        String::new(),
+                        quote! { ::std::option::Option::None },
+                    ),
+                };
                 pieces.push(quote! {
-                    ::typedpg::__private::SqlPiece::List { spread: #si, cast: #cast, empty: #empty }
+                    ::typedpg::__private::SqlPiece::List {
+                        spread: #si,
+                        lead: #lead,
+                        keyword: #keyword,
+                        cast: #cast,
+                        empty: #empty,
+                        array: #array,
+                    }
                 });
-                cursor = at;
+                cursor = spread.offset;
             }
             Err(list) => {
                 let mut items = Vec::new();
@@ -1749,7 +1839,7 @@ fn spread_pieces(analyzed: &AnalyzedQuery, start: usize, end: usize) -> Vec<Toke
                 for item in &list.items {
                     items.push(match *item {
                         ValuesItem::Row { start, end } => {
-                            let row = spread_pieces(analyzed, start, end);
+                            let row = spread_pieces(analyzed, capable, start, end);
                             quote! { ::typedpg::__private::ValuesItem::Row(&[#(#row),*]) }
                         }
                         ValuesItem::Spread(si) => {
@@ -1770,8 +1860,23 @@ fn spread_pieces(analyzed: &AnalyzedQuery, start: usize, end: usize) -> Vec<Toke
                     "SELECT * FROM (VALUES {}) AS __typedpg_empty WHERE false",
                     null_rows.join(", ")
                 );
+                let unnest = match list.items.as_slice() {
+                    [ValuesItem::Spread(si)] if list.unnest && capable[*si] => {
+                        let casts: Vec<String> = analyzed.spreads[*si]
+                            .fields
+                            .iter()
+                            .map(|f| format!("{}[]", cast(f)))
+                            .collect();
+                        quote! { ::std::option::Option::Some(&[#(#casts),*]) }
+                    }
+                    _ => quote! { ::std::option::Option::None },
+                };
                 pieces.push(quote! {
-                    ::typedpg::__private::SqlPiece::Values { items: &[#(#items),*], empty: #empty }
+                    ::typedpg::__private::SqlPiece::Values {
+                        items: &[#(#items),*],
+                        empty: #empty,
+                        unnest: #unnest,
+                    }
                 });
                 cursor = list.end;
             }
@@ -1780,6 +1885,61 @@ fn spread_pieces(analyzed: &AnalyzedQuery, start: usize, end: usize) -> Vec<Toke
     let text = cast_range(analyzed, cursor, end);
     pieces.push(quote! { ::typedpg::__private::SqlPiece::Text(#text) });
     pieces
+}
+
+/// An array of `field`'s values, as one parameter of a spread's array form.
+struct ArrayOf(Type);
+
+impl TypedParam for ArrayOf {
+    fn pg_type(&self) -> &Type {
+        &self.0
+    }
+    fn nullable(&self) -> bool {
+        false
+    }
+}
+
+fn array_of(field: &AnalyzedSpreadField) -> Type {
+    Type::Array {
+        element: Box::new(field.pg_type.clone()),
+        element_nullable: Some(field.nullable),
+    }
+}
+
+/// Whether spread `si` is bound as arrays above the threshold: the analysis
+/// offered its array form, and each field's values bind as an array the
+/// way they bind one by one. Not an enum or JSON domain whose values may be
+/// `None`: bound as one array, `None` would be the JSON `null` or fail to
+/// convert, not the SQL NULL each is alone.
+fn array_capable(
+    analyzed: &AnalyzedQuery,
+    si: usize,
+    config: &ResolvedConfig,
+    registry: &RecordRegistry,
+) -> bool {
+    let spread = &analyzed.spreads[si];
+    let offered = match spread.kind {
+        SpreadKind::List => spread.array_form.is_some(),
+        SpreadKind::Rows => analyzed
+            .values_lists
+            .iter()
+            .any(|l| l.unnest && l.items.as_slice() == [ValuesItem::Spread(si)]),
+    };
+    offered
+        && spread.fields.iter().all(|f| {
+            matches!(
+                resolve_type_mapping(&array_of(f), config, registry).map(|m| m.strategy),
+                Ok(DeserStrategy::Plain { .. }
+                    | DeserStrategy::VecOfEnumAsString {
+                        nullable_elems: false,
+                        ..
+                    }
+                    | DeserStrategy::VecOfJsonbDomain {
+                        nullable_elems: false,
+                        ..
+                    })
+            )
+        })
 }
 
 /// Build the `push` statement for a param/field in the spread execution path.

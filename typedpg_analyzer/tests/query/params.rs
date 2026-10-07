@@ -1310,6 +1310,82 @@ fn values_lists_holding_rows_spreads_are_described() {
     );
 }
 
+/// A list spread's array form — `(x = ANY($k::type[]))` — is offered where
+/// analyzing it gives the same query: its parentheses start at the IN's
+/// left operand (so `a = b IN …` stays `a = (b IN …)`), `NOT IN` is
+/// `<> ALL`.
+#[test]
+fn list_spreads_get_an_array_form_proven_the_same() {
+    use typedpg_analyzer::ArrayForm;
+    let db = setup();
+    let form = |sql: &str| {
+        let s = db.analyze(sql).unwrap();
+        let f = s.spreads[0].array_form.expect("an array form");
+        let ArrayForm {
+            open,
+            keyword,
+            negated,
+        } = f;
+        (
+            s.sql[open..keyword].to_owned(),
+            s.sql[keyword..s.spreads[0].offset].to_owned(),
+            negated,
+        )
+    };
+    assert_eq!(
+        form("SELECT name FROM users WHERE id IN $..ids"),
+        ("id ".to_owned(), "IN ".to_owned(), false)
+    );
+    assert_eq!(
+        form("SELECT name FROM users WHERE age + 1 NOT IN $..ages AND id > 0"),
+        ("age + 1 ".to_owned(), "NOT IN ".to_owned(), true)
+    );
+    // The operand starts at its leftmost token, even inside parentheses.
+    assert_eq!(
+        form("SELECT name FROM users WHERE (id + 0) * 2 IN $..ids"),
+        ("id + 0) * 2 ".to_owned(), "IN ".to_owned(), false)
+    );
+    assert_eq!(
+        form("SELECT name FROM users WHERE true = id IN $..ids"),
+        ("id ".to_owned(), "IN ".to_owned(), false)
+    );
+    // Not where it would change a column: `id = ANY($1)` may be NULL (an
+    // array parameter's elements can be), `id IN ($1)` can't.
+    let s = db.analyze("SELECT id IN $..ids AS hit FROM users").unwrap();
+    assert!(!s.columns[0].nullable);
+    assert_eq!(s.spreads[0].array_form, None);
+}
+
+/// A VALUES list made of one rows spread can be `SELECT * FROM unnest(…)`
+/// — where that form analyzes the same: not with a field that is an array
+/// (unnest would flatten it) or a composite (it would expand it), nor next
+/// to a written row, nor where its columns' nullability would change.
+#[test]
+fn rows_spreads_get_an_unnest_form_proven_the_same() {
+    let mut db = setup();
+    db.apply_sql(
+        "CREATE TYPE pair AS (a int, b int);
+         CREATE TABLE things (id int, tags text[], p pair);",
+    )
+    .unwrap();
+    let unnest = |sql: &str| db.analyze(sql).unwrap().values_lists[0].unnest;
+    assert!(unnest(
+        "INSERT INTO users (id, name, email) VALUES $..rows { id, name, email } RETURNING id"
+    ));
+    // Not where the rows are read as columns: an unnested element may be
+    // NULL, a non-null parameter in VALUES can't.
+    assert!(!unnest(
+        "WITH v (id, n) AS (VALUES $..rows { id, n }) SELECT id, n FROM v"
+    ));
+    assert!(!unnest(
+        "INSERT INTO things (id, tags) VALUES $..rows { id, tags }"
+    ));
+    assert!(!unnest("INSERT INTO things (p) VALUES $..rows { p }"));
+    assert!(!unnest(
+        "INSERT INTO things (id) VALUES (1), $..rows { id }"
+    ));
+}
+
 /// A spread's expansion is valid SQL in one place only: a rows spread's
 /// rows where VALUES rows go, a list spread's parenthesized list as the
 /// right side of an IN. Elsewhere — a bare spread in VALUES, the rows of
