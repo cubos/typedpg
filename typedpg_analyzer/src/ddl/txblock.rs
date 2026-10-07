@@ -4,12 +4,14 @@
 //! (`PreventInTransactionBlock`, `RequireTransactionBlock`, read-only
 //! transactions).
 //!
-//! One migration is one simple query: the migration runner sends the file
-//! with `batch_execute`, inside a transaction it opened
-//! ([`PgCatalog::migrations_use_transaction`], unless the file's first
-//! line is `-- no-transaction`) or on its own. A query of several
-//! statements outside a transaction runs as an implicit transaction block
-//! (`exec_simple_query`), a single statement as a transaction of its own.
+//! How a migration's statements are sent ([`PgCatalog::migration_runner`]):
+//! by default the file is one simple query (`batch_execute`), where several
+//! statements outside a transaction run as an implicit transaction block
+//! (`exec_simple_query`) and a single statement as a transaction of its
+//! own. The migration runner instead sends the file inside a transaction it
+//! opened (`use_transaction`, unless the file's first line is
+//! `-- no-transaction`) or else one statement at a time, each a query — and
+//! so a transaction — of its own.
 //! A statement that fails aborts the transaction it runs in: the catalog
 //! goes back to how that transaction found it — the start of the migration,
 //! or its last `COMMIT` / `ROLLBACK`.
@@ -46,6 +48,9 @@ pub(crate) struct Transaction {
     start: Box<PgCatalog>,
     /// Open savepoints, innermost last, with the catalog each one saw.
     savepoints: Vec<(String, Box<PgCatalog>)>,
+    /// The statements are sent one at a time (the runner's unwrapped
+    /// migrations): one outside a block commits once it has run.
+    per_statement: bool,
     /// `XactReadOnly`.
     read_only: bool,
     /// A statement that takes a snapshot ran (`FirstSnapshotSet`): the
@@ -65,17 +70,17 @@ impl Transaction {
             .lines()
             .next()
             .is_some_and(|line| line.trim() == "-- no-transaction");
-        let multi = statements.len() > 1;
-        let block = if db.migrations_use_transaction && !no_transaction {
-            Block::Explicit
-        } else if multi {
-            Block::Implicit
-        } else {
-            Block::Started
+        let (block, per_statement) = match db.migration_runner {
+            Some(true) if !no_transaction => (Block::Explicit, false),
+            // The runner's `execute_each`: each statement a query of its own.
+            Some(_) => (Block::Started, true),
+            None if statements.len() > 1 => (Block::Implicit, false),
+            None => (Block::Started, false),
         };
         Transaction {
             block,
-            multi,
+            multi: !per_statement && statements.len() > 1,
+            per_statement,
             start: db.snapshot(),
             savepoints: Vec::new(),
             read_only: false,
@@ -117,8 +122,16 @@ impl Transaction {
         Ok(())
     }
 
-    /// Bookkeeping after `stmt` ran.
-    pub(crate) fn after(&mut self, stmt: &node::Node) {
+    /// Bookkeeping after `stmt` ran: sent on its own, outside a block, it
+    /// was a transaction of its own, which commits.
+    pub(crate) fn after(&mut self, db: &mut PgCatalog, stmt: &node::Node) {
+        self.track(stmt);
+        if self.per_statement && self.block == Block::Started {
+            self.end(db, false);
+        }
+    }
+
+    fn track(&mut self, stmt: &node::Node) {
         match stmt {
             node::Node::VariableSetStmt(v) => {
                 if let Some(read_only) = read_only_setting(v) {

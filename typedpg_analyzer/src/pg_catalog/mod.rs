@@ -356,11 +356,13 @@ pub struct PgCatalog {
     /// (PL/pgSQL compilation). `None` outside `apply_sql`.
     pub(crate) statement_sql: Option<String>,
     pub(crate) in_migration: bool,
-    /// The migration runner wraps each migration in a transaction of its
-    /// own (`use_transaction`), unless the file opts out with
-    /// `-- no-transaction`. Off by default: each migration is then sent as
-    /// a bare simple query, as `batch_execute` alone does.
-    pub(crate) migrations_use_transaction: bool,
+    /// How migrations are run. `None` (the default): each is sent as one
+    /// bare simple query, as `batch_execute` alone does — what the
+    /// `pg_sanity` mirror does. `Some(use_transaction)`: as the migration
+    /// runner runs them — in a transaction of its own when
+    /// `use_transaction`, unless the file opts out with `-- no-transaction`,
+    /// and otherwise one statement at a time.
+    pub(crate) migration_runner: Option<bool>,
     /// `ON COMMIT DROP` temporary tables of the current transaction.
     pub(crate) on_commit_drop: Shared<Vec<PgClassOid>>,
     /// Materialized views created or refreshed WITH NO DATA.
@@ -699,7 +701,7 @@ impl PgCatalog {
             relpersistence: Shared::default(),
             temp_namespace: None,
             in_migration: false,
-            migrations_use_transaction: false,
+            migration_runner: None,
             statement_sql: None,
             on_commit_drop: Shared::default(),
             unpopulated_matviews: Shared::default(),
@@ -1255,13 +1257,15 @@ impl PgCatalog {
         }
     }
 
-    /// Whether the migration runner wraps each migration in a transaction
-    /// (its `use_transaction` setting; off by default). A wrapped migration
-    /// runs in an explicit transaction block — savepoints work, statements
-    /// that can't run in a block fail — while an unwrapped one runs as a
-    /// bare simple query.
+    /// Apply migrations as the migration runner does, with its
+    /// `use_transaction` setting: a wrapped migration runs in an explicit
+    /// transaction block — savepoints work, statements that can't run in a
+    /// block fail — while one the runner doesn't wrap (`use_transaction`
+    /// off, or `-- no-transaction` on its first line) runs one statement at
+    /// a time, each committing on its own. Without this call, a migration
+    /// runs as one bare simple query.
     pub fn set_migrations_use_transaction(&mut self, use_transaction: bool) {
-        self.migrations_use_transaction = use_transaction;
+        self.migration_runner = Some(use_transaction);
     }
 
     /// A copy of the catalog to roll back to: the state a transaction or a
