@@ -292,3 +292,184 @@ async fn list_spread_binds_enum_elements() {
     assert!(row.hit);
     assert!(!row.miss);
 }
+
+struct Person {
+    name: String,
+    email: String,
+}
+
+struct Email {
+    email: String,
+}
+
+/// A rows spread with no item still runs the query, as SQL would with no
+/// row: an empty spread next to other rows is left out, and a VALUES list
+/// of nothing but empty spreads is a SELECT of no row.
+#[tokio::test]
+async fn empty_rows_spreads_run_the_query() {
+    let pool = common::setup().await;
+    let tag = common::unique("empty-rows");
+    let ours = format!("{tag}-%");
+    let none: Vec<Person> = Vec::new();
+    let two: Vec<Person> = (0..2)
+        .map(|n| Person {
+            name: format!("p{n}"),
+            email: format!("{tag}-{n}@example.com"),
+        })
+        .collect();
+
+    // Two inserts in CTEs, the first one empty: the second still inserts.
+    let row = sql!(
+        &pool,
+        "WITH a AS (INSERT INTO users (name, email) VALUES $..none { name, email } RETURNING id), \
+              b AS (INSERT INTO users (name, email) VALUES $..two { name, email } RETURNING id) \
+         SELECT (SELECT count(*) FROM a) AS \"a!\", (SELECT count(*) FROM b) AS \"b!\""
+    )
+    .fetch_one()
+    .await
+    .expect("CTE inserts");
+    assert_eq!((row.a, row.b), (0, 2));
+
+    // A written row and an empty spread: the written row is inserted.
+    let email = format!("{tag}-fixed@example.com");
+    let rows = sql!(
+        &pool,
+        "INSERT INTO users (name, email) VALUES ('fixed', $email), $..none { name, email } RETURNING name"
+    )
+    .fetch_all()
+    .await
+    .expect("fixed row");
+    assert_eq!(
+        rows.into_iter().map(|r| r.name).collect::<Vec<_>>(),
+        ["fixed"]
+    );
+
+    // Read from an empty VALUES: an aggregate still has its row, and
+    // `NOT IN` it keeps every row.
+    let emails: Vec<Email> = Vec::new();
+    let n = sql!(
+        &pool,
+        "WITH v (email) AS (VALUES $..emails { email }) SELECT count(*) AS \"n!\" FROM v"
+    )
+    .fetch_value()
+    .await
+    .expect("count");
+    assert_eq!(n, 0);
+    let n = sql!(
+        &pool,
+        "WITH v (email) AS (VALUES $..emails { email }) \
+         SELECT count(*) AS \"n!\" FROM users WHERE email LIKE $ours AND email NOT IN (SELECT email FROM v)",
+        ours = ours.clone()
+    )
+    .fetch_value()
+    .await
+    .expect("NOT IN");
+    assert_eq!(n, 3);
+
+    // A plain INSERT of nothing: no row, 0 affected.
+    let inserted = sql!(
+        &pool,
+        "INSERT INTO users (name, email) VALUES $..none { name, email }"
+    )
+    .execute()
+    .await
+    .expect("empty insert");
+    assert_eq!(inserted, 0);
+    let returned = sql!(
+        &pool,
+        "INSERT INTO users (name, email) VALUES $..none { name, email } \
+         ON CONFLICT (email) DO NOTHING RETURNING id"
+    )
+    .fetch_optional()
+    .await
+    .expect("empty insert returning");
+    assert!(returned.is_none());
+}
+
+/// Above 1000 items, a spread whose array form the analysis proved the
+/// same query is bound as arrays: `= ANY($1)` for a list, `unnest` for
+/// rows. So more values than PG's 65535 parameters fit, and the results
+/// are those of the written form.
+#[tokio::test]
+async fn large_spreads_are_bound_as_arrays() {
+    let pool = common::setup().await;
+    let tag = common::unique("large");
+
+    // 30 000 rows × 2 fields: 60 000 values, one `unnest` parameter each.
+    let rows: Vec<Person> = (0..30_000)
+        .map(|n| Person {
+            name: format!("n{n}"),
+            email: format!("{tag}-{n}@example.com"),
+        })
+        .collect();
+    let inserted = sql!(
+        &pool,
+        "INSERT INTO users (name, email) VALUES $..rows { name, email } RETURNING id, name"
+    )
+    .fetch_all()
+    .await
+    .expect("unnest insert");
+    // In the items' order, as VALUES would.
+    assert!(
+        inserted
+            .iter()
+            .map(|r| &r.name)
+            .eq(rows.iter().map(|r| &r.name))
+    );
+
+    // 70 000 ids, more than the parameters a statement can have.
+    let ids: Vec<i64> = inserted
+        .iter()
+        .map(|r| r.id)
+        .chain((1..=40_000).map(|n| -n))
+        .collect();
+    let ours = format!("{tag}-%");
+    let n = sql!(
+        &pool,
+        "SELECT count(*) AS \"n!\" FROM users WHERE id IN $..ids"
+    )
+    .fetch_value()
+    .await
+    .expect("= ANY");
+    assert_eq!(n, 30_000);
+    // NOT IN, with the IN the operand of `=`: `true = (id <> ALL(…))`.
+    let some: Vec<i64> = inserted.iter().take(29_000).map(|r| r.id).collect();
+    let n = sql!(
+        &pool,
+        "SELECT count(*) AS \"n!\" FROM users WHERE email LIKE $ours AND true = id NOT IN $..some",
+        ours = ours.clone()
+    )
+    .fetch_value()
+    .await
+    .expect("<> ALL");
+    assert_eq!(n, 1_000);
+
+    // Enum elements, bound as an array of labels.
+    let statuses: Vec<PostStatus> = (0..1_500)
+        .map(|n| {
+            if n % 2 == 0 {
+                PostStatus::Draft
+            } else {
+                PostStatus::Archived
+            }
+        })
+        .collect();
+    let n = sql!(
+        &pool,
+        "SELECT count(*) AS \"n!\" FROM unnest(ARRAY['draft', 'published', 'archived']::post_status[]) s \
+         WHERE s IN $..statuses"
+    )
+    .fetch_value()
+    .await
+    .expect("enum = ANY");
+    assert_eq!(n, 2);
+
+    // No array form where it would change the query (here, the column's
+    // nullability): 2 000 placeholders, as written.
+    let values: Vec<i32> = (0..2_000).collect();
+    let hit = sql!(&pool, "SELECT 1999 IN $..values AS hit")
+        .fetch_value()
+        .await
+        .expect("written list");
+    assert!(hit);
+}

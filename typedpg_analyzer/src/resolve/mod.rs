@@ -21,6 +21,7 @@ use crate::types::Type;
 
 /// Internal parameter representation produced by [`analyze_static`] before
 /// being fused with lexer-side info (name, sql offsets) into [`AnalyzedParam`].
+#[derive(Clone)]
 pub(crate) struct ParamInfo {
     pub pg_type: Type,
     pub nullable: bool,
@@ -73,19 +74,69 @@ pub struct AnalyzedSpread {
     /// A [`SpreadKind::Rows`] spread's fields; a [`SpreadKind::List`]'s one
     /// element, named after the spread.
     pub fields: Vec<AnalyzedSpreadField>,
+    /// A list spread's other form, one array parameter, where the analysis
+    /// proved it the same query (see [`ArrayForm`]).
+    pub array_form: Option<ArrayForm>,
+}
+
+/// `x IN $..list` written `(x = ANY($k::type[]))` (`NOT IN`: `<> ALL`): one
+/// parameter for any number of elements, the same filter — PG itself
+/// reads an IN list as `= ANY(ARRAY[…])`. The parentheses, from the IN's
+/// left operand to the array, keep it the operand it was: IN binds tighter
+/// than `=`, so `a = b IN …` must become `a = (b = ANY(…))`. Offered only
+/// where analyzing that form gives the same columns and parameters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArrayForm {
+    /// Where the IN's left operand starts, in [`AnalyzedQuery::sql`].
+    pub open: usize,
+    /// Where `IN` (or `NOT IN`) starts.
+    pub keyword: usize,
+    /// `NOT IN`: `<> ALL` rather than `= ANY`.
+    pub negated: bool,
 }
 
 /// What a spread expands to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpreadKind {
     /// `VALUES $..rows { a, b }`: a row per item, `($1, $2), ($3, $4)`, its
-    /// fields' values. No item makes no row, which VALUES can't have: the
-    /// query isn't run.
+    /// fields' values — in a [`ValuesList`], which says what the query is
+    /// with no item.
     Rows,
     /// `x IN $..ids`: the parenthesized list of the items, `($1, $2)`. No
     /// item is `(SELECT NULL::<type> WHERE false)`, the empty list PG has no
     /// syntax for, so `x IN` it is false and `x NOT IN` it true.
     List,
+}
+
+/// A VALUES list with rows spreads in it, in [`AnalyzedQuery::sql`]. The
+/// expansion writes `VALUES` and the items that have rows, joined by
+/// `, `. With none — PG has no VALUES without a row — it writes
+/// `SELECT * FROM (VALUES <a row of typed NULLs per spread>) AS
+/// __typedpg_empty WHERE false`: no row, the columns typed as the list's
+/// would be, valid wherever the list is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValuesList {
+    /// Where `VALUES` starts.
+    pub start: usize,
+    /// Where the list ends: past its last row, or at its last spread.
+    pub end: usize,
+    pub items: Vec<ValuesItem>,
+    /// Whether the list — one rows spread, nothing else — can be written
+    /// `SELECT * FROM unnest($k::type1[], …) AS __typedpg_rows (column1,
+    /// …)`, an array parameter per field whatever the number of rows: the
+    /// analysis of that form gave the same columns and parameters (a field
+    /// that is an array, which `unnest` would flatten, or a composite, which
+    /// it would expand, doesn't).
+    pub unnest: bool,
+}
+
+/// An item of a [`ValuesList`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValuesItem {
+    /// A row written in the SQL: `sql[start..end]`, parentheses included.
+    Row { start: usize, end: usize },
+    /// The rows of the spread at this index of [`AnalyzedQuery::spreads`].
+    Spread(usize),
 }
 
 /// The full result of analyzing a SQL query template.
@@ -97,6 +148,8 @@ pub struct AnalyzedQuery {
     pub sql: String,
     pub params: Vec<AnalyzedParam>,
     pub spreads: Vec<AnalyzedSpread>,
+    /// The VALUES lists the rows spreads are in.
+    pub values_lists: Vec<ValuesList>,
     pub columns: Vec<AnalyzedColumn>,
     /// True when the query is safe to embed as the body of a subquery
     /// (`SELECT * FROM (<query>) …`). False for top-level
@@ -160,15 +213,31 @@ pub(crate) fn build_spread_sample_sql(lex_output: &LexOutput) -> LexOutput {
 
 /// The text of [`build_spread_sample_sql`].
 fn spread_sample_sql(lex_output: &LexOutput) -> String {
+    sample_sql_with(lex_output, None)
+}
+
+/// [`spread_sample_sql`], with `replaced`'s spread written as its range of
+/// the post-lex SQL replaced by its text — which uses the spread's
+/// placeholders, numbered as in the sample.
+fn sample_sql_with(
+    lex_output: &LexOutput,
+    replaced: Option<(usize, std::ops::Range<usize>, &str)>,
+) -> String {
     let base_sql = &lex_output.sql;
-    let num_regular_params = lex_output.params.len();
     let mut result = String::with_capacity(base_sql.len() + 64);
     let mut last_offset = 0;
-    let mut param_counter = num_regular_params;
+    let mut param_counter = lex_output.params.len();
 
-    for spread in &lex_output.spreads {
-        result.push_str(&base_sql[last_offset..spread.offset]);
+    for (si, spread) in lex_output.spreads.iter().enumerate() {
         let placeholders = spread.fields.as_ref().map_or(1, Vec::len);
+        if let Some((_, range, text)) = replaced.as_ref().filter(|r| r.0 == si) {
+            result.push_str(&base_sql[last_offset..range.start]);
+            result.push_str(text);
+            param_counter += placeholders;
+            last_offset = range.end;
+            continue;
+        }
+        result.push_str(&base_sql[last_offset..spread.offset]);
         result.push('(');
         for i in 0..placeholders {
             if i > 0 {
@@ -184,6 +253,168 @@ fn spread_sample_sql(lex_output: &LexOutput) -> String {
 
     result.push_str(&base_sql[last_offset..]);
     result
+}
+
+/// A query with spreads as analyzed: lexed, its sample (the spreads as one
+/// placeholder row each), the sample's tree, and the parameters' explicit
+/// nullability.
+#[derive(Clone, Copy)]
+pub(crate) struct Sample<'a> {
+    pub lex_output: &'a LexOutput,
+    pub sample_lex: &'a LexOutput,
+    pub tree: &'a typedpg_pg_query::protobuf::ParseResult,
+    pub nullability: &'a [Option<bool>],
+}
+
+/// Offer each spread's array form — a list spread's [`ArrayForm`], a
+/// VALUES list's [`ValuesList::unnest`] — where analyzing the query with it
+/// gives exactly the columns and parameters the sample's analysis did: the
+/// array parameter typed as an array of the elements, everything else the
+/// same. A form that doesn't parse, types otherwise or names columns
+/// otherwise isn't offered.
+pub(crate) fn prove_array_forms(
+    snapshot: &PgCatalog,
+    sample: &Sample<'_>,
+    columns: &[AnalyzedColumn],
+    params: &[ParamInfo],
+    analyzed: &mut AnalyzedQuery,
+) {
+    use typedpg_pg_query::NodeRef;
+    let Sample {
+        lex_output,
+        sample_lex,
+        tree: sample,
+        nullability,
+    } = *sample;
+    use typedpg_pg_query::protobuf::{AExprKind, node::Node};
+    // Each spread's placeholder row in the sample, as (start, length).
+    let rows: Vec<(usize, usize)> = sample_lex
+        .rewrites
+        .iter()
+        .zip(&lex_output.rewrites)
+        .filter(|(_, lexed)| lexed.post_lex_len == 0)
+        .map(|(row, _)| (row.post_lex_at, row.post_lex_len))
+        .collect();
+    // A sample offset outside the rows, in the post-lex SQL.
+    let post_lex = |at: usize| {
+        at - rows
+            .iter()
+            .filter(|(start, len)| start + len <= at)
+            .map(|(_, len)| len)
+            .sum::<usize>()
+    };
+    let same =
+        |sql: &str, placeholders: std::ops::Range<usize>| {
+            let Ok((alt_columns, alt_params, _)) = analyze_static(snapshot, sql, nullability)
+            else {
+                return false;
+            };
+            let columns_same = alt_columns.len() == columns.len()
+                && alt_columns.iter().zip(columns).all(|(a, b)| {
+                    a.name == b.name && a.pg_type == b.pg_type && a.nullable == b.nullable
+                });
+            let params_same = alt_params.len() == params.len()
+            && alt_params.iter().zip(params).enumerate().all(|(i, (a, b))| {
+                if placeholders.contains(&i) {
+                    matches!(&a.pg_type, Type::Array { element, .. } if **element == b.pg_type)
+                } else {
+                    a.pg_type == b.pg_type
+                }
+            });
+            columns_same && params_same
+        };
+    let nodes = sample.nodes();
+    let mut first = lex_output.params.len();
+    for (si, spread) in lex_output.spreads.iter().enumerate() {
+        let count = spread.fields.as_ref().map_or(1, Vec::len);
+        let placeholders = first..first + count;
+        first += count;
+        let casts: Option<Vec<String>> = placeholders
+            .clone()
+            .map(|i| params[i].pg_type.cast_name())
+            .collect();
+        let Some(casts) = casts else { continue };
+        let numbers = placeholders.clone().map(|i| i + 1);
+        if spread.fields.is_none() {
+            // The IN this list is the right side of.
+            let k = i32::try_from(placeholders.start + 1).unwrap_or(i32::MAX);
+            let Some(in_expr) = nodes.iter().find_map(|(n, _)| match n {
+                NodeRef::AExpr(e) if e.kind() == AExprKind::AexprIn => {
+                    match e.rexpr.as_deref().and_then(|r| r.node.as_ref()) {
+                        Some(Node::List(l))
+                            if matches!(
+                                l.items.as_slice(),
+                                [typedpg_pg_query::protobuf::Node { node: Some(Node::ParamRef(p)) }]
+                                    if p.number == k
+                            ) =>
+                        {
+                            Some(*e)
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }) else {
+                continue;
+            };
+            let open = in_expr
+                .lexpr
+                .as_deref()
+                .and_then(|l| l.node.as_ref())
+                .and_then(|l| l.nodes().iter().filter_map(|(n, _)| n.location()).min());
+            let (Some(open), Ok(keyword)) = (open, usize::try_from(in_expr.location)) else {
+                continue;
+            };
+            let (open, keyword) = (
+                post_lex(usize::try_from(open).unwrap_or(0)),
+                post_lex(keyword),
+            );
+            let negated = super::expr::extract_string_fields(&in_expr.name)
+                .first()
+                .is_some_and(|op| op == "<>");
+            // Another spread within the operand would be written inside it.
+            let alone = lex_output
+                .spreads
+                .iter()
+                .enumerate()
+                .all(|(j, s)| j == si || !(open..=spread.offset).contains(&s.offset));
+            if !(open <= keyword && keyword <= spread.offset && alone) {
+                continue;
+            }
+            let text = format!(
+                "({}{}(${}::{}[]))",
+                &lex_output.sql[open..keyword],
+                if negated { "<> ALL" } else { "= ANY" },
+                placeholders.start + 1,
+                casts[0]
+            );
+            let sql = sample_sql_with(lex_output, Some((si, open..spread.offset, &text)));
+            if same(&sql, placeholders.clone()) {
+                analyzed.spreads[si].array_form = Some(ArrayForm {
+                    open,
+                    keyword,
+                    negated,
+                });
+            }
+        } else if let Some(list) = analyzed
+            .values_lists
+            .iter_mut()
+            .find(|l| l.items.as_slice() == [ValuesItem::Spread(si)])
+        {
+            let arrays: Vec<String> = numbers
+                .zip(&casts)
+                .map(|(n, cast)| format!("${n}::{cast}[]"))
+                .collect();
+            let names: Vec<String> = (1..=count).map(|c| format!("column{c}")).collect();
+            let text = format!(
+                "SELECT * FROM unnest({}) AS __typedpg_rows ({})",
+                arrays.join(", "),
+                names.join(", ")
+            );
+            let sql = sample_sql_with(lex_output, Some((si, list.start..list.end, &text)));
+            list.unnest = same(&sql, placeholders);
+        }
+    }
 }
 
 /// Check that each spread is where its expansion is valid SQL, in the
@@ -368,16 +599,116 @@ pub(crate) fn fuse(
             offset: spread.offset,
             kind,
             fields,
+            array_form: None,
         });
     }
 
+    let values_lists = values_lists(&sql, &spreads)?;
     Ok(AnalyzedQuery {
         sql,
         params,
         spreads,
+        values_lists,
         columns,
         can_run_as_subquery,
     })
+}
+
+/// The VALUES lists of `sql` holding the rows `spreads`, read from PG's
+/// own tokens (so a parenthesis or comma in a string or comment is not
+/// one). A spread is where its offset falls between two tokens; each must
+/// be in a list, which [`check_spread_positions`] made sure of.
+fn values_lists(sql: &str, spreads: &[AnalyzedSpread]) -> Result<Vec<ValuesList>, AnalyzeError> {
+    use typedpg_pg_query::protobuf::Token;
+    if spreads.iter().all(|s| s.kind != SpreadKind::Rows) {
+        return Ok(Vec::new());
+    }
+    let scanned = typedpg_pg_query::scan(sql)
+        .map_err(|e| AnalyzeError::Internal(format!("scanning the spread query: {e}")))?;
+    let tokens: Vec<(usize, usize, Token)> = scanned
+        .tokens
+        .iter()
+        .map(|t| {
+            let at = |n: i32| usize::try_from(n).unwrap_or(0);
+            (at(t.start), at(t.end), t.token())
+        })
+        .collect();
+    // The rows spread at `offset`, between the token ending at `from` and
+    // the next.
+    let spread_at = |from: usize, next: usize| {
+        spreads
+            .iter()
+            .position(|s| s.kind == SpreadKind::Rows && s.offset >= from && s.offset <= next)
+    };
+    let mut lists = Vec::new();
+    for (i, &(start, end, token)) in tokens.iter().enumerate() {
+        if token != Token::Values {
+            continue;
+        }
+        let mut items = Vec::new();
+        let (mut at, mut prev_end) = (i + 1, end);
+        let list_end = loop {
+            let next_start = tokens.get(at).map_or(sql.len(), |t| t.0);
+            let after = if let Some(si) = spread_at(prev_end, next_start) {
+                items.push(ValuesItem::Spread(si));
+                (spreads[si].offset, at)
+            } else if tokens.get(at).is_some_and(|t| t.2 == Token::Ascii40) {
+                // A row: to its matching `)`.
+                let mut depth = 0usize;
+                let mut close = at;
+                for (j, t) in tokens.iter().enumerate().skip(at) {
+                    match t.2 {
+                        Token::Ascii40 => depth += 1,
+                        Token::Ascii41 => depth -= 1,
+                        _ => {}
+                    }
+                    if depth == 0 {
+                        close = j;
+                        break;
+                    }
+                }
+                items.push(ValuesItem::Row {
+                    start: tokens[at].0,
+                    end: tokens[close].1,
+                });
+                (tokens[close].1, close + 1)
+            } else {
+                // Not a list of rows (`DEFAULT VALUES`), or its end.
+                break prev_end;
+            };
+            // Another item after a comma, or the list's end.
+            match tokens.get(after.1) {
+                Some(&(_, comma_end, Token::Ascii44)) => {
+                    prev_end = comma_end;
+                    at = after.1 + 1;
+                }
+                _ => break after.0,
+            }
+        };
+        if items.iter().any(|it| matches!(it, ValuesItem::Spread(_))) {
+            lists.push(ValuesList {
+                start,
+                end: list_end,
+                items,
+                unnest: false,
+            });
+        }
+    }
+    let placed = lists
+        .iter()
+        .flat_map(|l| &l.items)
+        .filter(|it| matches!(it, ValuesItem::Spread(_)))
+        .count();
+    let rows = spreads
+        .iter()
+        .filter(|s| s.kind == SpreadKind::Rows)
+        .count();
+    if placed != rows {
+        return Err(AnalyzeError::Internal(format!(
+            "{placed} of the query's {rows} rows spreads are in a VALUES list: {sql}"
+        )));
+    }
+    Ok(lists)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

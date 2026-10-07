@@ -172,8 +172,10 @@ mod query_macro;
 /// ).fetch_all().await?;
 /// ```
 ///
-/// With no item, there is no row, so the query isn't run: `fetch_all`
-/// returns no row and `execute` 0.
+/// With no item the query still runs, as SQL would with no row: an empty
+/// spread next to other rows is left out, and a `VALUES` of nothing but
+/// empty spreads, which PG has no syntax for, is written as a `SELECT` of
+/// no row.
 ///
 /// # Lists with `IN $..list`
 ///
@@ -189,11 +191,19 @@ mod query_macro;
 /// An empty list is `(SELECT NULL::type WHERE false)`, PG having no syntax
 /// for one, and the query runs: `x IN` it is false, `x NOT IN` it true.
 ///
+/// Above 1000 items, a spread is bound as arrays where the analysis proved
+/// that form the same query (same columns, same parameters): a list as
+/// `(x = ANY($1::type[]))`, a VALUES list of one rows spread as `SELECT *
+/// FROM unnest($1::type1[], …) AS __typedpg_rows (column1, …)` — a
+/// parameter per field, past PG's 65535-parameter limit.
+///
 /// `id = ANY($ids)`, an array parameter, is the same filter as one
-/// placeholder, whatever the list's length. They differ when the statement
-/// is prepared and run with a generic plan: there, PG prunes the partitions
-/// of a partitioned table only for an `IN` list, and estimates its rows
-/// from the list's length rather than from a default.
+/// placeholder, whatever the list's length. `sql!` prepares each query
+/// anew, so PG plans it with the values and the two plan alike; they differ
+/// only under a generic plan (a statement prepared once and run repeatedly,
+/// as an executor of your own might), where PG prunes the partitions of a
+/// partitioned table only for an `IN` list, and estimates its rows from the
+/// list's length rather than from a default.
 ///
 /// # Domain types (JSONB)
 ///

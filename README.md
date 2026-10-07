@@ -458,7 +458,7 @@ sql!(pool, "INSERT INTO users (name, email) VALUES $..new_users { name, email }"
     .execute().await?;
 ```
 
-The macro expands `$..new_users { name, email }` into a multi-row `VALUES` clause with proper parameter numbering. With no item there is no row, so the query isn't run (`execute` returns 0).
+The macro expands `$..new_users { name, email }` into a multi-row `VALUES` clause with proper parameter numbering. With no item the query still runs, as SQL would with no row: an empty spread next to other rows is left out, and a `VALUES` of nothing but empty spreads — which PostgreSQL has no syntax for — is written as a `SELECT` of no row (`SELECT * FROM (VALUES (NULL::type, …)) AS __typedpg_empty WHERE false`). So inserts in other CTEs of the statement happen, an aggregate over it has its row, and statement-level triggers fire.
 
 ## Lists with `IN $..list`
 
@@ -473,7 +473,9 @@ sql!(pool, "SELECT name FROM users WHERE id IN $..ids")   // WHERE id IN ($1, $2
 
 An empty list is written `(SELECT NULL::<type> WHERE false)` — PostgreSQL has no syntax for one — and the query runs: `x IN` it is false, `x NOT IN` it true.
 
-`id = ANY($ids)`, with an array parameter, is the same filter as a single placeholder, whatever the list's length. They differ when the statement runs with a generic plan (a prepared statement executed repeatedly): there PostgreSQL prunes the partitions of a partitioned table only for an `IN` list, and estimates its rows from the list's length instead of assuming 10 elements. An `IN` list is one statement text per length, and at most 65535 parameters.
+Above 1000 items, a spread is bound as arrays where that is provably the same query — the analyzer analyzes the array form and offers it only if the columns and parameters come out identical: `x IN $..ids` is written `(x = ANY($1::type[]))` (`NOT IN`: `<> ALL`), and a `VALUES` made of one rows spread `SELECT * FROM unnest($1::type1[], …) AS __typedpg_rows (column1, …)`. Large lists and batches then take a parameter per field instead of one per value — faster, and past PostgreSQL's 65535-parameter limit. Not offered where the form would differ: a field that is an array (unnest would flatten it) or a composite, a `VALUES` with written rows, a column whose nullability the array would change, an enum or JSON-domain field whose values may be `None`.
+
+`id = ANY($ids)`, with an array parameter, is the same filter as a single placeholder, whatever the list's length. `sql!` prepares each query anew (tokio-postgres's `query`), so PostgreSQL plans it with the values and the two plan alike. They differ only under a generic plan — a statement prepared once and executed repeatedly, as an executor of your own might — where PostgreSQL prunes the partitions of a partitioned table only for an `IN` list, and estimates its rows from the list's length instead of assuming 10 elements. An `IN` list is one statement text per length, and at most 65535 parameters.
 
 ## Bulk loading with `copy_in!`
 

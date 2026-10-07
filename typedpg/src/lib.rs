@@ -430,6 +430,7 @@ pub mod executor;
 pub mod from_row;
 pub mod migrate;
 mod pool; // Executor impls for pool types (deadpool, bb8)
+mod spread;
 pub mod stream;
 pub mod types;
 
@@ -468,6 +469,7 @@ pub use rust_decimal;
 pub mod __private {
     pub use crate::copy::CopyRow;
     pub use crate::decode::{read_column, read_named_column};
+    pub use crate::spread::{ARRAY_THRESHOLD, SqlPiece, ValuesItem, spread_sql, uses_arrays};
     pub use bytes;
     pub use tokio_postgres;
 

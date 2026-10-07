@@ -9,7 +9,7 @@ use syn::parse_str;
 
 use typedpg_analyzer::{
     AnalyzedColumn, AnalyzedCopyIn, AnalyzedParam, AnalyzedQuery, AnalyzedSpreadField,
-    QualifiedName, RecordField, SpreadKind, Type,
+    QualifiedName, RecordField, SpreadKind, Type, ValuesItem, ValuesList,
 };
 use typedpg_core::config::ResolvedConfig;
 
@@ -1066,7 +1066,6 @@ fn generate_spread(
     let column_impls = build_column_impls(&analyzed.columns, config, &registry)?;
     let row_mapping = build_row_mapping(&analyzed.columns, config, &registry)?;
     let num_regular_params = analyzed.params.len();
-    let num_spreads = analyzed.spreads.len();
 
     // ── Regular param fields ────────────────────────────────────────────
     let mut regular_param_fields = TokenStream::new();
@@ -1101,36 +1100,15 @@ fn generate_spread(
     let mut spread_empty_checks = TokenStream::new();
     let mut spread_param_pushes = TokenStream::new();
     let mut spread_size_args = TokenStream::new();
-    let mut spread_size_params = TokenStream::new();
 
-    // SQL pieces: the text between spread offsets
-    let mut sql_pieces: Vec<String> = Vec::new();
-    let mut spread_casts: Vec<Vec<String>> = Vec::new();
     let mut fields_per_row_lits = Vec::new();
-    let mut last_offset = 0;
 
+    let capable: Vec<bool> = (0..analyzed.spreads.len())
+        .map(|si| array_capable(analyzed, si, config, &registry))
+        .collect();
     for (si, spread) in analyzed.spreads.iter().enumerate() {
         let col_count = spread.fields.len();
         let field_ident = format_ident!("__spread_{}", si);
-        let size_ident = format_ident!("__size_{}", si);
-
-        // SQL piece before this spread
-        sql_pieces.push(cast_range(analyzed, last_offset, spread.offset));
-        last_offset = spread.offset;
-        // Each field's placeholder is cast to its type, like a regular
-        // parameter's.
-        spread_casts.push(
-            spread
-                .fields
-                .iter()
-                .map(|f| {
-                    f.pg_type
-                        .cast_name()
-                        .map(|n| format!("::{n}"))
-                        .unwrap_or_default()
-                })
-                .collect(),
-        );
         fields_per_row_lits.push(proc_macro2::Literal::usize_unsuffixed(col_count));
 
         // The spread's rows and parameters, extracted where `sql!` is
@@ -1178,11 +1156,63 @@ fn generate_spread(
             });
         }
 
+        // Above the threshold, a spread with an array form binds an array
+        // per field instead (`spread_sql` writes it the same way).
+        let array_pushes = if capable[si] {
+            let mut collects = TokenStream::new();
+            let mut pushes = TokenStream::new();
+            let mut decls = TokenStream::new();
+            for (fi, field) in spread.fields.iter().enumerate() {
+                let accessor_ident = format_ident!("{}", field.name);
+                let (subject, raw) = match spread.kind {
+                    SpreadKind::Rows => (
+                        format!("field `{}` of `$..{}`", field.name, spread.name),
+                        quote::quote_spanned! {accessor_ident.span()=>
+                            ::std::clone::Clone::clone(&__item.#accessor_ident)
+                        },
+                    ),
+                    SpreadKind::List => (
+                        format!("an element of `$..{}`", spread.name),
+                        quote! { ::std::clone::Clone::clone(__item) },
+                    ),
+                };
+                let (ty, value) =
+                    build_field_type_and_value(&subject, field, config, &registry, &raw)?;
+                let array = format_ident!("__array_{}", fi);
+                decls.extend(quote! {
+                    let mut #array: ::std::vec::Vec<#ty> = ::std::vec::Vec::with_capacity(__items.len());
+                });
+                collects.extend(quote! {
+                    #[allow(clippy::clone_on_copy)]
+                    #array.push(#value);
+                });
+                pushes.extend(push_param(
+                    &ArrayOf(array_of(field)),
+                    config,
+                    &registry,
+                    &quote! { #array },
+                )?);
+            }
+            quote! {
+                if ::typedpg::__private::uses_arrays(__items.len(), true) {
+                    #decls
+                    for __item in __items.iter() {
+                        #collects
+                    }
+                    #pushes
+                    return ::std::result::Result::Ok((__items.len(), __params));
+                }
+            }
+        } else {
+            TokenStream::new()
+        };
+
         spread_struct_inits.extend(quote! {
             #field_ident: (|| {
                 let __items = &(#spread_value_expr)[..];
                 let mut __params: ::std::vec::Vec<__SpreadParam> =
                     ::std::vec::Vec::with_capacity(__items.len() * #col_count);
+                #array_pushes
                 for __item in __items.iter() {
                     #item_pushes
                 }
@@ -1192,87 +1222,19 @@ fn generate_spread(
 
         let len_ident = format_ident!("__len_{}", si);
         let params_ident = format_ident!("__spread_params_{}", si);
-        // No row is no VALUES row, which is no query to run; an empty list
-        // is written as one (`__build_spread_sql`).
-        spread_empty_checks.extend(match spread.kind {
-            SpreadKind::Rows => quote! {
-                let (#len_ident, #params_ident) = self.#field_ident?;
-                if #len_ident == 0 { __any_empty = true; }
-            },
-            SpreadKind::List => quote! {
-                let (#len_ident, #params_ident) = self.#field_ident?;
-            },
+        spread_empty_checks.extend(quote! {
+            let (#len_ident, #params_ident) = self.#field_ident?;
         });
-
         spread_size_args.extend(quote! { #len_ident, });
-        spread_size_params.extend(quote! { #size_ident: usize, });
 
         spread_param_pushes.extend(quote! {
             __params.extend(#params_ident);
         });
     }
 
-    // Final SQL piece (after last spread)
-    sql_pieces.push(cast_range(analyzed, last_offset, analyzed.sql.len()));
-
-    // ── Generate the __build_spread_sql function body ────────────────────
+    // ── The SQL, from its pieces and the spreads' sizes ─────────────────
     let num_regular_lit = proc_macro2::Literal::usize_unsuffixed(num_regular_params);
-    let mut sql_builder_body = TokenStream::new();
-    sql_builder_body.extend(quote! {
-        let mut __sql = String::new();
-        let mut __p: usize = #num_regular_lit + 1;
-    });
-
-    for (si, spread) in analyzed.spreads.iter().enumerate() {
-        let piece = &sql_pieces[si];
-        let fpr = &fields_per_row_lits[si];
-        let size_ident = format_ident!("__size_{}", si);
-        let casts = &spread_casts[si];
-        if spread.kind == SpreadKind::List {
-            // The empty list PG has no syntax for: `x IN` it is false,
-            // `x NOT IN` it true.
-            let empty = format!("(SELECT NULL{} WHERE false)", casts[0]);
-            let cast = &casts[0];
-            sql_builder_body.extend(quote! {
-                __sql.push_str(#piece);
-                if #size_ident == 0 {
-                    __sql.push_str(#empty);
-                } else {
-                    __sql.push('(');
-                    for __r in 0..#size_ident {
-                        if __r > 0 { __sql.push_str(", "); }
-                        __sql.push('$');
-                        __sql.push_str(&__p.to_string());
-                        __sql.push_str(#cast);
-                        __p += 1;
-                    }
-                    __sql.push(')');
-                }
-            });
-            continue;
-        }
-        sql_builder_body.extend(quote! {
-            __sql.push_str(#piece);
-            let __casts: [&str; #fpr] = [#(#casts),*];
-            for __r in 0..#size_ident {
-                if __r > 0 { __sql.push_str(", "); }
-                __sql.push('(');
-                for __c in 0..#fpr {
-                    if __c > 0 { __sql.push_str(", "); }
-                    __sql.push('$');
-                    __sql.push_str(&__p.to_string());
-                    __sql.push_str(__casts[__c]);
-                    __p += 1;
-                }
-                __sql.push(')');
-            }
-        });
-    }
-    let final_piece = &sql_pieces[num_spreads];
-    sql_builder_body.extend(quote! {
-        __sql.push_str(#final_piece);
-        __sql
-    });
+    let pieces = spread_pieces(analyzed, &capable, 0, analyzed.sql.len());
 
     // ── Capacity estimate ───────────────────────────────────────────────
     let mut capacity_expr = quote! { #num_regular_lit };
@@ -1282,9 +1244,12 @@ fn generate_spread(
     }
 
     let query_preamble = quote! {
-        let mut __any_empty = false;
         #spread_empty_checks
-        let __sql = __build_spread_sql(#spread_size_args);
+        let __sql = ::typedpg::__private::spread_sql(
+            __TYPEDPG_PIECES,
+            &[#spread_size_args],
+            #num_regular_lit + 1,
+        );
         let mut __params: Vec<__SpreadParam> = Vec::with_capacity(#capacity_expr);
         #regular_param_pushes
         #spread_param_pushes
@@ -1327,16 +1292,11 @@ fn generate_spread(
                 #regular_param_fields
             }
 
-            fn __build_spread_sql(#spread_size_params) -> String {
-                #sql_builder_body
-            }
+            const __TYPEDPG_PIECES: &[::typedpg::__private::SqlPiece] = &[#(#pieces),*];
 
             impl<__E: typedpg::Executor> __typedpg_query<__E> {
                 async fn fetch_all(self) -> ::std::result::Result<::std::vec::Vec<__sql_output>, typedpg::Error> {
                     #query_preamble
-                    if __any_empty {
-                        return ::std::result::Result::Ok(::std::vec::Vec::new());
-                    }
                     let __rows = typedpg::Executor::query(&self.__executor, &__sql, &__params_ref).await?;
                     __rows.into_iter().map(|__row| {
                         ::std::result::Result::Ok(__sql_output { #row_mapping })
@@ -1345,9 +1305,6 @@ fn generate_spread(
 
                 async fn fetch_one(self) -> ::std::result::Result<__sql_output, typedpg::Error> {
                     #query_preamble
-                    if __any_empty {
-                        return ::std::result::Result::Err(typedpg::Error::no_rows(__TYPEDPG_QUERY));
-                    }
                     let __rows = typedpg::Executor::query(&self.__executor, &__sql, &__params_ref).await?;
                     let mut __iter = __rows.into_iter();
                     let __row = __iter.next().ok_or_else(|| typedpg::Error::no_rows(__TYPEDPG_QUERY))?;
@@ -1359,9 +1316,6 @@ fn generate_spread(
 
                 async fn fetch_optional(self) -> ::std::result::Result<::std::option::Option<__sql_output>, typedpg::Error> {
                     #query_preamble
-                    if __any_empty {
-                        return ::std::result::Result::Ok(::std::option::Option::None);
-                    }
                     let __rows = typedpg::Executor::query(&self.__executor, &__sql, &__params_ref).await?;
                     let mut __iter = __rows.into_iter();
                     match __iter.next() {
@@ -1379,27 +1333,18 @@ fn generate_spread(
                     #query_preamble
                     let __decode: fn(&typedpg::__private::tokio_postgres::Row) -> ::std::result::Result<__sql_output, typedpg::Error> =
                         |__row| ::std::result::Result::Ok(__sql_output { #row_mapping });
-                    if __any_empty {
-                        return ::std::result::Result::Ok(typedpg::QueryStream::new(typedpg::RowStream::empty(), __decode));
-                    }
                     let __rows = typedpg::Executor::query_stream(&self.__executor, &__sql, &__params_ref).await?;
                     ::std::result::Result::Ok(typedpg::QueryStream::new(__rows, __decode))
                 }
 
                 async fn fetch_stream_as<__T: typedpg::from_row::FromQueryRow<__sql_columns>>(self) -> ::std::result::Result<typedpg::QueryStream<__T>, typedpg::Error> {
                     #query_preamble
-                    if __any_empty {
-                        return ::std::result::Result::Ok(typedpg::QueryStream::new(typedpg::RowStream::empty(), <__T as typedpg::from_row::FromQueryRow<__sql_columns>>::from_query_row));
-                    }
                     let __rows = typedpg::Executor::query_stream(&self.__executor, &__sql, &__params_ref).await?;
                     ::std::result::Result::Ok(typedpg::QueryStream::new(__rows, <__T as typedpg::from_row::FromQueryRow<__sql_columns>>::from_query_row))
                 }
 
                 async fn execute(self) -> ::std::result::Result<u64, typedpg::Error> {
                     #query_preamble
-                    if __any_empty {
-                        return ::std::result::Result::Ok(0);
-                    }
                     typedpg::Executor::execute(&self.__executor, &__sql, &__params_ref).await
                 }
 
@@ -1407,9 +1352,6 @@ fn generate_spread(
 
                 async fn fetch_all_as<__T: typedpg::from_row::FromQueryRow<__sql_columns>>(self) -> ::std::result::Result<::std::vec::Vec<__T>, typedpg::Error> {
                     #query_preamble
-                    if __any_empty {
-                        return ::std::result::Result::Ok(::std::vec::Vec::new());
-                    }
                     let __rows = typedpg::Executor::query(&self.__executor, &__sql, &__params_ref).await?;
                     __rows.into_iter().map(|__row| {
                         <__T as typedpg::from_row::FromQueryRow<__sql_columns>>::from_query_row(&__row)
@@ -1418,9 +1360,6 @@ fn generate_spread(
 
                 async fn fetch_one_as<__T: typedpg::from_row::FromQueryRow<__sql_columns>>(self) -> ::std::result::Result<__T, typedpg::Error> {
                     #query_preamble
-                    if __any_empty {
-                        return ::std::result::Result::Err(typedpg::Error::no_rows(__TYPEDPG_QUERY));
-                    }
                     let __rows = typedpg::Executor::query(&self.__executor, &__sql, &__params_ref).await?;
                     let mut __iter = __rows.into_iter();
                     let __row = __iter.next().ok_or_else(|| typedpg::Error::no_rows(__TYPEDPG_QUERY))?;
@@ -1432,9 +1371,6 @@ fn generate_spread(
 
                 async fn fetch_optional_as<__T: typedpg::from_row::FromQueryRow<__sql_columns>>(self) -> ::std::result::Result<::std::option::Option<__T>, typedpg::Error> {
                     #query_preamble
-                    if __any_empty {
-                        return ::std::result::Result::Ok(::std::option::Option::None);
-                    }
                     let __rows = typedpg::Executor::query(&self.__executor, &__sql, &__params_ref).await?;
                     let mut __iter = __rows.into_iter();
                     match __iter.next() {
@@ -1812,6 +1748,198 @@ fn sql_type_name(ty: &Type) -> String {
         Type::Array { element, .. } => format!("{}[]", sql_type_name(element)),
         other => pg_type_label(other),
     }
+}
+
+/// The pieces of `analyzed.sql[start..end]` for `typedpg::__private::spread_sql`:
+/// its text (parameters cast), the lists of its list spreads and the VALUES
+/// lists of its rows spreads — each written once, a list in a VALUES row
+/// within that row.
+fn spread_pieces(
+    analyzed: &AnalyzedQuery,
+    capable: &[bool],
+    start: usize,
+    end: usize,
+) -> Vec<TokenStream> {
+    let cast = |f: &AnalyzedSpreadField| {
+        f.pg_type
+            .cast_name()
+            .map(|n| format!("::{n}"))
+            .unwrap_or_default()
+    };
+    // (where, a list spread's index, or a VALUES list's)
+    let mut events: Vec<(usize, Result<usize, &ValuesList>)> = analyzed
+        .spreads
+        .iter()
+        .enumerate()
+        // A list may end the SQL: its offset is then `end`.
+        .filter(|(_, s)| s.kind == SpreadKind::List && (start..=end).contains(&s.offset))
+        // With an array form, its piece starts at the IN's operand.
+        .map(|(i, s)| match s.array_form.filter(|_| capable[i]) {
+            Some(form) => (form.open, Ok(i)),
+            None => (s.offset, Ok(i)),
+        })
+        .chain(
+            analyzed
+                .values_lists
+                .iter()
+                .filter(|l| (start..end).contains(&l.start))
+                .map(|l| (l.start, Err(l))),
+        )
+        .collect();
+    events.sort_by_key(|e| e.0);
+    let mut pieces = Vec::new();
+    let mut cursor = start;
+    for (at, event) in events {
+        // Inside a VALUES list already written.
+        if at < cursor {
+            continue;
+        }
+        let text = cast_range(analyzed, cursor, at);
+        pieces.push(quote! { ::typedpg::__private::SqlPiece::Text(#text) });
+        match event {
+            Ok(si) => {
+                let spread = &analyzed.spreads[si];
+                let cast = cast(&spread.fields[0]);
+                // The empty list PG has no syntax for: `x IN` it is false,
+                // `x NOT IN` it true.
+                let empty = format!("(SELECT NULL{cast} WHERE false)");
+                let (lead, keyword, array) = match spread.array_form.filter(|_| capable[si]) {
+                    Some(form) => {
+                        let lead = cast_range(analyzed, form.open, form.keyword);
+                        let keyword = cast_range(analyzed, form.keyword, spread.offset);
+                        let op = if form.negated { "<> ALL" } else { "= ANY" };
+                        let array_cast = format!("{cast}[]");
+                        (
+                            lead,
+                            keyword,
+                            quote! { ::std::option::Option::Some((#op, #array_cast)) },
+                        )
+                    }
+                    None => (
+                        String::new(),
+                        String::new(),
+                        quote! { ::std::option::Option::None },
+                    ),
+                };
+                pieces.push(quote! {
+                    ::typedpg::__private::SqlPiece::List {
+                        spread: #si,
+                        lead: #lead,
+                        keyword: #keyword,
+                        cast: #cast,
+                        empty: #empty,
+                        array: #array,
+                    }
+                });
+                cursor = spread.offset;
+            }
+            Err(list) => {
+                let mut items = Vec::new();
+                let mut null_rows = Vec::new();
+                for item in &list.items {
+                    items.push(match *item {
+                        ValuesItem::Row { start, end } => {
+                            let row = spread_pieces(analyzed, capable, start, end);
+                            quote! { ::typedpg::__private::ValuesItem::Row(&[#(#row),*]) }
+                        }
+                        ValuesItem::Spread(si) => {
+                            let casts: Vec<String> = analyzed.spreads[si].fields.iter().map(cast).collect();
+                            null_rows.push(format!(
+                                "({})",
+                                casts.iter().map(|c| format!("NULL{c}")).collect::<Vec<_>>().join(", ")
+                            ));
+                            quote! {
+                                ::typedpg::__private::ValuesItem::Rows { spread: #si, casts: &[#(#casts),*] }
+                            }
+                        }
+                    });
+                }
+                // No row: a SELECT of none, its columns typed as the
+                // list's would be.
+                let empty = format!(
+                    "SELECT * FROM (VALUES {}) AS __typedpg_empty WHERE false",
+                    null_rows.join(", ")
+                );
+                let unnest = match list.items.as_slice() {
+                    [ValuesItem::Spread(si)] if list.unnest && capable[*si] => {
+                        let casts: Vec<String> = analyzed.spreads[*si]
+                            .fields
+                            .iter()
+                            .map(|f| format!("{}[]", cast(f)))
+                            .collect();
+                        quote! { ::std::option::Option::Some(&[#(#casts),*]) }
+                    }
+                    _ => quote! { ::std::option::Option::None },
+                };
+                pieces.push(quote! {
+                    ::typedpg::__private::SqlPiece::Values {
+                        items: &[#(#items),*],
+                        empty: #empty,
+                        unnest: #unnest,
+                    }
+                });
+                cursor = list.end;
+            }
+        }
+    }
+    let text = cast_range(analyzed, cursor, end);
+    pieces.push(quote! { ::typedpg::__private::SqlPiece::Text(#text) });
+    pieces
+}
+
+/// An array of `field`'s values, as one parameter of a spread's array form.
+struct ArrayOf(Type);
+
+impl TypedParam for ArrayOf {
+    fn pg_type(&self) -> &Type {
+        &self.0
+    }
+    fn nullable(&self) -> bool {
+        false
+    }
+}
+
+fn array_of(field: &AnalyzedSpreadField) -> Type {
+    Type::Array {
+        element: Box::new(field.pg_type.clone()),
+        element_nullable: Some(field.nullable),
+    }
+}
+
+/// Whether spread `si` is bound as arrays above the threshold: the analysis
+/// offered its array form, and each field's values bind as an array the
+/// way they bind one by one. Not an enum or JSON domain whose values may be
+/// `None`: bound as one array, `None` would be the JSON `null` or fail to
+/// convert, not the SQL NULL each is alone.
+fn array_capable(
+    analyzed: &AnalyzedQuery,
+    si: usize,
+    config: &ResolvedConfig,
+    registry: &RecordRegistry,
+) -> bool {
+    let spread = &analyzed.spreads[si];
+    let offered = match spread.kind {
+        SpreadKind::List => spread.array_form.is_some(),
+        SpreadKind::Rows => analyzed
+            .values_lists
+            .iter()
+            .any(|l| l.unnest && l.items.as_slice() == [ValuesItem::Spread(si)]),
+    };
+    offered
+        && spread.fields.iter().all(|f| {
+            matches!(
+                resolve_type_mapping(&array_of(f), config, registry).map(|m| m.strategy),
+                Ok(DeserStrategy::Plain { .. }
+                    | DeserStrategy::VecOfEnumAsString {
+                        nullable_elems: false,
+                        ..
+                    }
+                    | DeserStrategy::VecOfJsonbDomain {
+                        nullable_elems: false,
+                        ..
+                    })
+            )
+        })
 }
 
 /// Build the `push` statement for a param/field in the spread execution path.
