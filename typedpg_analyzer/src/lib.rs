@@ -100,7 +100,7 @@ pub use error::AnalyzeError;
 pub use pg_catalog::PgCatalog;
 pub use resolve::{
     AnalyzedColumn, AnalyzedCopyIn, AnalyzedParam, AnalyzedQuery, AnalyzedSpread,
-    AnalyzedSpreadField, SpreadKind, ValuesItem, ValuesList,
+    AnalyzedSpreadField, ArrayForm, SpreadKind, ValuesItem, ValuesList,
 };
 /// The "did you mean" matcher behind the analyzer's suggestions, for the
 /// macros' own errors (an unknown `sql!` argument name).

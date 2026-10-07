@@ -469,7 +469,7 @@ pub use rust_decimal;
 pub mod __private {
     pub use crate::copy::CopyRow;
     pub use crate::decode::{read_column, read_named_column};
-    pub use crate::spread::{SqlPiece, ValuesItem, spread_sql};
+    pub use crate::spread::{ARRAY_THRESHOLD, SqlPiece, ValuesItem, spread_sql, uses_arrays};
     pub use bytes;
     pub use tokio_postgres;
 

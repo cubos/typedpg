@@ -283,6 +283,29 @@ fn walkers(fds: &FileDescriptorSet) -> String {
     }
     s.push_str("        }\n    }\n}\n\n");
 
+    // The node's own token location.
+    s.push_str(
+        "impl NodeRef<'_> {\n    /// The node's `location` (a byte offset into the SQL), for the kinds\n    \
+         /// that have one; `None` for the others and for an unknown one (-1).\n    \
+         pub fn location(self) -> Option<i32> {\n        match self {\n",
+    );
+    for (variant, ty) in &model.variants {
+        let has_location = model.messages.iter().any(|m| {
+            type_ident(&format!(".pg_query.{}", m.name())) == *ty
+                && m.field
+                    .iter()
+                    .any(|f| f.name() == "location" && f.r#type() == Type::Int32)
+        });
+        if has_location {
+            writeln!(
+                s,
+                "            NodeRef::{variant}(m) => (m.location >= 0).then_some(m.location),"
+            )
+            .unwrap();
+        }
+    }
+    s.push_str("            _ => None,\n        }\n    }\n}\n\n");
+
     // Dispatch.
     s.push_str(
         "/// Call `out` on every direct child node of `node`.\n\
