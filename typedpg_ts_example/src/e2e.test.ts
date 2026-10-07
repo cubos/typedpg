@@ -104,6 +104,20 @@ for (const [name, connect] of drivers) {
       assert.equal((await q.userById.fetchOne(db, { id: 1 })).visits, 7n);
     });
 
+    test("IN a list spread, empty lists included", async () => {
+      const names = (rows: { name: string }[]) => rows.map((r) => r.name);
+      assert.deepEqual(names(await q.usersIn.fetchAll(db, { ids: [1, 3] })), ["Ana", "Caio"]);
+      assert.deepEqual(names(await q.usersNotIn.fetchAll(db, { ids: [1, 3] })), ["Bia"]);
+      // The query runs: `IN` an empty list is false, `NOT IN` it true.
+      assert.deepEqual(await q.usersIn.fetchAll(db, { ids: [] }), []);
+      assert.deepEqual(names(await q.usersNotIn.fetchAll(db, { ids: [] })), ["Ana", "Bia", "Caio"]);
+      // Enum elements, and a regular parameter numbered before them.
+      assert.deepEqual(
+        names(await q.usersWithMoods.fetchAll(db, { moods: ["happy", "sad"], after: 1 })),
+        ["Caio"],
+      );
+    });
+
     test("an int8 parameter takes a string, exactly", async () => {
       assert.equal(await q.touch.execute(db, { by: "-9007199254740993", ids: [3] }), 1);
       assert.equal((await q.userById.fetchOne(db, { id: 3 })).visits, 0n);

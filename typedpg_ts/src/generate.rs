@@ -7,7 +7,7 @@ use std::fmt::Write as _;
 
 use serde_json::{Value, json};
 use typedpg_analyzer::{
-    AnalyzedColumn, AnalyzedCopyIn, AnalyzedQuery, LocatedError, PgCatalog, Type,
+    AnalyzedColumn, AnalyzedCopyIn, AnalyzedQuery, LocatedError, PgCatalog, SpreadKind, Type,
 };
 
 use crate::scan::Kind;
@@ -118,16 +118,26 @@ fn generate_query(a: &AnalyzedQuery, mapper: &TypeMapper) -> Result<Generated, G
         params_ty.push(member(&p.name, &m.input, p.nullable));
     }
     for s in &a.spreads {
-        let fields: Vec<String> = s
-            .fields
-            .iter()
-            .map(|f| member(&f.name, &mapper.map(&f.pg_type).input, f.nullable))
-            .collect();
-        params_ty.push(format!(
-            "{}: readonly {{ {} }}[]",
-            property_key(&s.name),
-            fields.join("; ")
-        ));
+        let ty = match s.kind {
+            SpreadKind::Rows => {
+                let fields: Vec<String> = s
+                    .fields
+                    .iter()
+                    .map(|f| member(&f.name, &mapper.map(&f.pg_type).input, f.nullable))
+                    .collect();
+                format!("readonly {{ {} }}[]", fields.join("; "))
+            }
+            SpreadKind::List => {
+                let e = &s.fields[0];
+                let element = nullable(&mapper.map(&e.pg_type).input, e.nullable);
+                if element.contains('|') {
+                    format!("readonly ({element})[]")
+                } else {
+                    format!("readonly {element}[]")
+                }
+            }
+        };
+        params_ty.push(format!("{}: {ty}", property_key(&s.name)));
     }
     let (row_ty, columns_rt) = columns(&a.columns, mapper);
     let mut types = format!(
@@ -175,7 +185,11 @@ fn generate_query(a: &AnalyzedQuery, mapper: &TypeMapper) -> Result<Generated, G
                             ])
                         })
                         .collect();
-                    json!([s.name, fields])
+                    let kind = match s.kind {
+                        SpreadKind::Rows => "rows",
+                        SpreadKind::List => "list",
+                    };
+                    json!([s.name, fields, kind])
                 })
                 .collect(),
         );
@@ -438,9 +452,22 @@ mod tests {
             g.types
         );
         assert!(g.runtime.contains(
-            r#""spreads":[["rows",[["id","number","::pg_catalog.int4"],["name","text","::pg_catalog.text"],["big","bigint","::pg_catalog.int8"],["tags",["array","text"],"::pg_catalog.text[]"]]]]"#
+            r#""spreads":[["rows",[["id","number","::pg_catalog.int4"],["name","text","::pg_catalog.text"],["big","bigint","::pg_catalog.int8"],["tags",["array","text"],"::pg_catalog.text[]"]],"rows"]]"#
         ), "{}", g.runtime);
         assert!(!g.runtime.contains("subquery"));
+
+        // A list: its one field is the element, typed by the IN's left side.
+        let g = ok("SELECT id FROM users WHERE big IN $..bigs AND name NOT IN $..names");
+        assert!(
+            g.types.contains(
+                "bigs: readonly (bigint | number | string)[];\n      names: readonly string[];"
+            ),
+            "{}",
+            g.types
+        );
+        assert!(g.runtime.contains(
+            r#""spreads":[["bigs",[["bigs","bigint","::pg_catalog.int8"]],"list"],["names",[["names","text","::pg_catalog.text"]],"list"]]"#
+        ), "{}", g.runtime);
     }
 
     #[test]

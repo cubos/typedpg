@@ -112,12 +112,16 @@ export type Params<Q> = Q extends { "~types"?: infer T extends QueryTypes } ? T[
 
 /** What the generator writes for each query: the SQL to run and the codecs. */
 export interface QuerySpec {
-  /** The SQL, rewritten to `$1`, `$2`, …; split where each spread's rows go. */
+  /** The SQL, rewritten to `$1`, `$2`, …; split where each spread goes. */
   sql: readonly string[];
   /** The parameters, in `$1`, `$2`, … order. */
   params: readonly (readonly [string, Codec])[];
-  /** Each spread's name and fields: name, codec, the cast after its placeholder. */
-  spreads?: readonly (readonly [string, readonly (readonly [string, Codec, string])[]])[];
+  /**
+   * Each spread's name, fields (name, codec, the cast after its
+   * placeholder) and kind: `rows` of VALUES (`VALUES $..rows { a, b }`), or
+   * the `list` of an IN (`x IN $..ids`), whose one field is the element.
+   */
+  spreads?: readonly (readonly [string, readonly (readonly [string, Codec, string])[], "rows" | "list"])[];
   columns: readonly (readonly [string, Codec])[];
   /** Whether `fetchOne` / `fetchOptional` can wrap the SQL in `LIMIT 2`. */
   subquery?: boolean;
@@ -192,7 +196,27 @@ class QueryImpl {
     let text = spec.sql[0]!;
     let empty = false;
     let n = values.length;
-    spec.spreads?.forEach(([name, fields], i) => {
+    spec.spreads?.forEach(([name, fields, kind], i) => {
+      if (kind === "list") {
+        // `x IN` an empty list is false, `x NOT IN` it true: PG has no
+        // syntax for one, so it is a subquery returning no row.
+        const [, codec, cast] = fields[0]!;
+        const items = params[name] as readonly unknown[];
+        text +=
+          items.length === 0
+            ? `(SELECT NULL${cast} WHERE false)`
+            : "(" +
+              items
+                .map((item) => {
+                  values.push(encode(codec, item));
+                  return `$${++n}${cast}`;
+                })
+                .join(", ") +
+              ")";
+        text += spec.sql[i + 1]!;
+        return;
+      }
+      // No row is no VALUES row: the query isn't run.
       const rows = params[name] as readonly Record<string, unknown>[];
       if (rows.length === 0) empty = true;
       text += rows

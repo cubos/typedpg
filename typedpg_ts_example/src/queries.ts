@@ -21,6 +21,13 @@ export const usersByMood = sql("SELECT id, name, mood FROM users WHERE mood = $m
 
 export const touch = sql("UPDATE users SET visits = visits + $by WHERE id = ANY($ids)");
 
+// Lists: a placeholder per element, typed by the IN's left side.
+export const usersIn = sql("SELECT name FROM users WHERE id IN $..ids ORDER BY id");
+
+export const usersNotIn = sql("SELECT name FROM users WHERE id NOT IN $..ids ORDER BY id");
+
+export const usersWithMoods = sql("SELECT name FROM users WHERE mood IN $..moods AND id > $after ORDER BY id");
+
 export const postsWithAuthor = sql(`
   SELECT p.title, u.name AS author, p.body, ROW(u.id, u.email) AS who
   FROM posts p JOIN users u ON u.id = p.author_id
@@ -81,6 +88,8 @@ export type Checks = [
   Expect<Equal<Awaited<ReturnType<typeof countUsers.fetchValue>>, bigint>>,
   Expect<Equal<Awaited<ReturnType<typeof userEmail.fetchValueOptional>>, string | null>>,
   Expect<Equal<Params<typeof usersByMood>, { mood: "happy" | "sad" | "neutral" }>>,
+  Expect<Equal<Params<typeof usersIn>, { ids: readonly number[] }>>,
+  Expect<Equal<Params<typeof usersWithMoods>, { moods: readonly ("happy" | "sad" | "neutral")[]; after: number }>>,
   // An int8 parameter also takes a number or a string.
   Expect<Equal<Params<typeof touch>, { by: bigint | number | string; ids: readonly (number | null)[] }>>,
   Expect<Equal<Params<typeof insertPost>, { author: number; title: string; body: string | null }>>,

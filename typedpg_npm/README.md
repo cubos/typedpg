@@ -114,7 +114,14 @@ can be anything PostgreSQL accepts: CTEs, window functions, `LATERAL`,
   NULL` are followed. Override it with an alias, `AS "title!"` (not null) /
   `AS "title?"` (nullable), or on a parameter, `$name?` / `$name!`.
 - **Bulk insert**: `INSERT INTO users (name, email) VALUES $..rows { name, email }`,
-  with `rows` an array of `{ name, email }`.
+  with `rows` an array of `{ name, email }`. With no row, the query isn't run.
+- **Lists**: `WHERE id IN $..ids`, with `ids` an array, is `id IN ($1, $2, …)`.
+  An empty list is `(SELECT NULL::<type> WHERE false)` — PostgreSQL has no
+  syntax for one — and the query runs: `IN` it is false, `NOT IN` it true.
+  `id = ANY($ids)` is the same filter with one array parameter; an `IN` list
+  differs under a generic plan (a prepared statement run repeatedly, as
+  postgres.js does), where PostgreSQL prunes partitions only for it and
+  estimates its rows from its length instead of assuming 10 elements.
 - **Reusing a query's types**: `Row<typeof q>`, `Params<typeof q>`,
   `CopyRow<typeof c>`.
 
