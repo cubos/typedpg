@@ -1,0 +1,13 @@
+error[E0277]: an element of `$..ids` expects a value for SQL type bigint NOT NULL, not `String`
+ --> src/bin/sql_list_spread_wrong_element_type.rs:6:5
+  |
+6 |     typedpg::sql!(db, "SELECT name FROM users WHERE id IN $..ids")
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |     |
+  |     `String` doesn't satisfy the trait bound
+  |     expected a value for bigint
+  |
+  = help: the trait `__TypedpgBind0` is not implemented for `String`
+  = note: an element of `$..ids` takes `i64`, or any value with `Into<i64>`
+  = note: this error originates in the macro `typedpg::sql` (in Nightly builds, run with -Z macro-backtrace for more info)
+

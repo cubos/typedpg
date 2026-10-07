@@ -1229,19 +1229,89 @@ fn untyped_param_in_list_with_mixed_types_is_inconsistent() {
     );
 }
 
-/// The lexer accepts a bare `$..items`, but without a field list nothing
-/// says which item fields fill which columns: a user error naming the fix,
-/// not an internal analyzer error.
+/// `x IN $..ids`: a list spread, one placeholder per item, typed by the
+/// IN's left side — numbered after the regular parameters, in order with
+/// the other spreads.
 #[test]
-fn spread_without_field_list_is_a_user_error() {
+fn list_spread_takes_the_type_of_the_in_left_side() {
+    use typedpg_analyzer::SpreadKind;
+    let db = setup();
+    let s = db
+        .analyze("SELECT name FROM users WHERE id IN $..ids AND age NOT IN $..ages")
+        .unwrap();
+    let kinds: Vec<_> = s.spreads.iter().map(|sp| sp.kind).collect();
+    assert_eq!(kinds, [SpreadKind::List, SpreadKind::List]);
+    let elements: Vec<_> = s
+        .spreads
+        .iter()
+        .map(|sp| (sp.fields[0].name.as_str(), sp.fields[0].pg_type.clone()))
+        .collect();
+    assert_eq!(elements, [("ids", int8()), ("ages", int4())]);
+    assert_eq!(s.sql, "SELECT name FROM users WHERE id IN  AND age NOT IN ");
+
+    // Alongside a regular parameter and a rows spread.
+    let s = db
+        .analyze(
+            "INSERT INTO users (id, name, email) VALUES $..rows { id, name, email } \
+             ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name \
+             WHERE users.id > $min AND users.id NOT IN $..skip RETURNING id",
+        )
+        .unwrap();
+    assert_params(&s, vec![p(int8())]);
+    let kinds: Vec<_> = s.spreads.iter().map(|sp| sp.kind).collect();
+    assert_eq!(kinds, [SpreadKind::Rows, SpreadKind::List]);
+    assert_eq!(s.spreads[1].fields[0].pg_type, int8());
+}
+
+/// A spread's expansion is valid SQL in one place only: a rows spread's
+/// rows where VALUES rows go, a list spread's parenthesized list as the
+/// right side of an IN. Elsewhere — a bare spread in VALUES, the rows of
+/// a spread with fields after IN, either one wrapped in parentheses of
+/// its own (which the sample parses, the expansion doesn't) — is a user
+/// error naming the right form.
+#[test]
+fn spreads_must_be_where_their_expansion_is_valid() {
     let mut db = setup();
     // `$..spread` is typedpg syntax: PG has no counterpart error to match.
     db.skip_pg_sanity();
-    assert_err_prefix!(
+    for sql in [
+        "INSERT INTO users (id, name, email) VALUES $..items",
+        "SELECT name FROM users WHERE id IN ($..items)",
+        "SELECT name FROM users WHERE id = ANY($..items)",
+        "SELECT $..items",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::Invalid(_),
+            "`$..items` expands to a parenthesized list of values, so it goes right after IN: \
+             `x IN $..items`"
+        );
+    }
+    for sql in [
+        "SELECT name FROM users WHERE id IN $..items { id }",
+        "INSERT INTO users (id) VALUES ($..items { id })",
+        "SELECT name FROM users WHERE (id, name) IN $..items { id, name }",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::Invalid(_),
+            "`$..items` expands to rows of VALUES, so it goes where a VALUES row does: \
+             `VALUES $..items { ... }`"
+        );
+    }
+    // The diagnostic points at the spread, with the other form as a hint.
+    assert_analyze_err!(
         db.analyze("INSERT INTO users (id, name, email) VALUES $..items"),
         AnalyzeError::Invalid(_),
-        "spread `$..items` needs a field list naming the item fields to bind, \
-         e.g. `$..items { field1, field2 }`"
+        "\
+`$..items` expands to a parenthesized list of values, so it goes right after IN: `x IN $..items`
+  ╭────
+1 │ INSERT INTO users (id, name, email) VALUES $..items
+  ·                                            ────┬───
+  ·                                                ╰─ a parenthesized list
+  ╰────
+  help: rows of VALUES name the item fields that fill them: `VALUES $..items { a, b }`
+",
     );
 }
 

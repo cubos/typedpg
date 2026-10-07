@@ -9,7 +9,7 @@ use syn::parse_str;
 
 use typedpg_analyzer::{
     AnalyzedColumn, AnalyzedCopyIn, AnalyzedParam, AnalyzedQuery, AnalyzedSpreadField,
-    QualifiedName, RecordField, Type,
+    QualifiedName, RecordField, SpreadKind, Type,
 };
 use typedpg_core::config::ResolvedConfig;
 
@@ -1154,18 +1154,28 @@ fn generate_spread(
                 }
             }
         };
-        // Param push expressions: iterate spread items and push field values
+        // Param push expressions: iterate spread items and push field
+        // values — a list's item is its value.
         let mut item_pushes = TokenStream::new();
         for field in &spread.fields {
             let accessor_ident = format_ident!("{}", field.name);
-            let subject = format!("field `{}` of `$..{}`", field.name, spread.name);
-            item_pushes.extend(push_item_field(
-                &subject,
-                field,
-                config,
-                &registry,
-                &accessor_ident,
-            )?);
+            item_pushes.extend(match spread.kind {
+                SpreadKind::Rows => push_item_field(
+                    &format!("field `{}` of `$..{}`", field.name, spread.name),
+                    field,
+                    config,
+                    &registry,
+                    &accessor_ident,
+                )?,
+                SpreadKind::List => push_item_value(
+                    &format!("an element of `$..{}`", spread.name),
+                    field,
+                    config,
+                    &registry,
+                    &accessor_ident,
+                    &quote! { ::std::clone::Clone::clone(__item) },
+                )?,
+            });
         }
 
         spread_struct_inits.extend(quote! {
@@ -1182,9 +1192,16 @@ fn generate_spread(
 
         let len_ident = format_ident!("__len_{}", si);
         let params_ident = format_ident!("__spread_params_{}", si);
-        spread_empty_checks.extend(quote! {
-            let (#len_ident, #params_ident) = self.#field_ident?;
-            if #len_ident == 0 { __any_empty = true; }
+        // No row is no VALUES row, which is no query to run; an empty list
+        // is written as one (`__build_spread_sql`).
+        spread_empty_checks.extend(match spread.kind {
+            SpreadKind::Rows => quote! {
+                let (#len_ident, #params_ident) = self.#field_ident?;
+                if #len_ident == 0 { __any_empty = true; }
+            },
+            SpreadKind::List => quote! {
+                let (#len_ident, #params_ident) = self.#field_ident?;
+            },
         });
 
         spread_size_args.extend(quote! { #len_ident, });
@@ -1206,11 +1223,34 @@ fn generate_spread(
         let mut __p: usize = #num_regular_lit + 1;
     });
 
-    for si in 0..num_spreads {
+    for (si, spread) in analyzed.spreads.iter().enumerate() {
         let piece = &sql_pieces[si];
         let fpr = &fields_per_row_lits[si];
         let size_ident = format_ident!("__size_{}", si);
         let casts = &spread_casts[si];
+        if spread.kind == SpreadKind::List {
+            // The empty list PG has no syntax for: `x IN` it is false,
+            // `x NOT IN` it true.
+            let empty = format!("(SELECT NULL{} WHERE false)", casts[0]);
+            let cast = &casts[0];
+            sql_builder_body.extend(quote! {
+                __sql.push_str(#piece);
+                if #size_ident == 0 {
+                    __sql.push_str(#empty);
+                } else {
+                    __sql.push('(');
+                    for __r in 0..#size_ident {
+                        if __r > 0 { __sql.push_str(", "); }
+                        __sql.push('$');
+                        __sql.push_str(&__p.to_string());
+                        __sql.push_str(#cast);
+                        __p += 1;
+                    }
+                    __sql.push(')');
+                }
+            });
+            continue;
+        }
         sql_builder_body.extend(quote! {
             __sql.push_str(#piece);
             let __casts: [&str; #fpr] = [#(#casts),*];
@@ -1579,7 +1619,20 @@ fn push_item_field<P: TypedParam>(
     field: &syn::Ident,
 ) -> Result<TokenStream, syn::Error> {
     let raw = quote::quote_spanned! {field.span()=> ::std::clone::Clone::clone(&__item.#field) };
-    let (ty, value) = build_field_type_and_value(subject, param, config, registry, &raw)?;
+    push_item_value(subject, param, config, registry, field, &raw)
+}
+
+/// [`push_item_field`] for the value `raw` evaluates to (a list spread's
+/// item itself), bound to a local named after `field`.
+fn push_item_value<P: TypedParam>(
+    subject: &str,
+    param: &P,
+    config: &ResolvedConfig,
+    registry: &RecordRegistry,
+    field: &syn::Ident,
+    raw: &TokenStream,
+) -> Result<TokenStream, syn::Error> {
+    let (ty, value) = build_field_type_and_value(subject, param, config, registry, raw)?;
     let local = format_ident!("__field_{}", field);
     let push = push_param(param, config, registry, &quote! { #local })?;
     // The clone carries the field's span (so a type error points at the

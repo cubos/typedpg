@@ -1,4 +1,11 @@
-error: spread `$..users` needs a field list naming the item fields to bind, e.g. `$..users { field1, field2 }`
+error: `$..users` expands to a parenthesized list of values, so it goes right after IN: `x IN $..users`
+         ╭────
+       1 │ INSERT INTO users (name, email) VALUES $..users
+         ·                                        ────┬───
+         ·                                            ╰─ a parenthesized list
+         ╰────
+         help: rows of VALUES name the item fields that fill them: `VALUES $..users { a, b }`
+       
   --> src/bin/sql_spread_without_fields.rs:14:23
    |
 14 |     typedpg::sql!(db, "INSERT INTO users (name, email) VALUES $..users")
