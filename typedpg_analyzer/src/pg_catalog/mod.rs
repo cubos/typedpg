@@ -1037,6 +1037,24 @@ impl PgCatalog {
         result
     }
 
+    /// [`Self::analyze`], with an error's location: the byte offset in `sql`
+    /// its diagnostic points at, when it has one. For tools that report the
+    /// error in the file the query is written in.
+    pub fn analyze_located(&self, sql: &str) -> Result<AnalyzedQuery, LocatedError> {
+        crate::diagnostic::clear_last_primary();
+        self.analyze(sql).map_err(LocatedError::new)
+    }
+
+    /// [`Self::analyze_copy_in`], with an error's location in `target`, as
+    /// [`Self::analyze_located`].
+    pub fn analyze_copy_in_located(
+        &self,
+        target: &str,
+    ) -> Result<crate::AnalyzedCopyIn, LocatedError> {
+        crate::diagnostic::clear_last_primary();
+        self.analyze_copy_in(target).map_err(LocatedError::new)
+    }
+
     /// Inner analyze that also returns the rewritten SQL handed to the
     /// static pass — used by [`Self::analyze`] to mirror the same string on
     /// PG sanity under `pg_sanity`.
@@ -1802,4 +1820,19 @@ fn default_languages() -> HashMap<PgLanguageOid, PgLanguage> {
 /// setting.
 fn default_search_path() -> String {
     "\"$user\", public".to_owned()
+}
+
+/// An [`AnalyzeError`] and where in the analyzed text it is.
+#[derive(Debug)]
+pub struct LocatedError {
+    pub error: AnalyzeError,
+    /// The byte offset in the analyzed text the diagnostic points at.
+    pub offset: Option<usize>,
+}
+
+impl LocatedError {
+    fn new(error: AnalyzeError) -> Self {
+        let offset = crate::diagnostic::primary_offset_of(&error.to_string());
+        LocatedError { error, offset }
+    }
 }
