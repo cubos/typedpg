@@ -23,6 +23,12 @@ export {
 export type { Migration, MigrationSet, MigrationStatus, MigrationsConfig } from "./migrate.js";
 
 /** What a `json` / `jsonb` column decodes to. */
+/**
+ * `T`, which must fit `U`: the generated module checks with it that each
+ * type `types` maps a PostgreSQL type to fits what the type is read as.
+ */
+export type Fits<T extends U, U> = T;
+
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
 /** A query's types, as the generated `Queries` interface describes it. */

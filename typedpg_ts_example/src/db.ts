@@ -5,6 +5,12 @@ import { createCopyIn, createSql, embedMigrations } from "@cubos/typedpg";
 import type * as typedpg from "@cubos/typedpg";
 import type { Point2, UserPrefs } from "./domains.ts";
 
+// Each type in `types` must fit what its PostgreSQL type is read as.
+export type TypeMappingChecks = [
+  typedpg.Fits<Point2, { readonly x: number | null; readonly y: number | null }>, // public.point2
+  typedpg.Fits<UserPrefs, unknown>, // public.user_prefs
+];
+
 export interface Queries {
   "\n  INSERT INTO things (label, email, qty, tags, colors, shape, shape_d, shapes, span, periods,\n                      amounts, dates, dur, attrs, big, bigs, nums, flags, blobs, stamps, docs,\n                      day, at_local, clock, id_uuid, addr, money_v, bits, ch)\n  VALUES ($label, $email, $qty, $tags, $colors, $shape, $shape_d, $shapes, $span, $periods,\n          $amounts, $dates, $dur, $attrs, $big, $bigs, $nums, $flags, $blobs, $stamps, $docs,\n          $day, $at_local, $clock, $id_uuid, $addr, $money_v, $bits, $ch)\n  RETURNING id\n": {
     params: {

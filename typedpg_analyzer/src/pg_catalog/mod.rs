@@ -1020,6 +1020,13 @@ impl PgCatalog {
         crate::ddl::serialize_subnode(self, &select, crate::ddl::views::extract_where)
     }
 
+    /// The [`Type`] a value of the type `name` is described as, or `None`
+    /// when there is no such type.
+    pub fn type_named(&self, name: &crate::QualifiedName) -> Option<crate::Type> {
+        let t = self.resolve_type_by_name(Some(&name.schema), &name.name)?;
+        crate::resolve::column_type(t.oid, None, None, self).ok()
+    }
+
     /// Analyze a SQL query template against this catalog.
     ///
     /// Lexes `sql` to extract named parameters (`$name`), spreads (`$..name`),

@@ -7,13 +7,14 @@
 #   2. the example's generated module is up to date (`typedpg check`);
 #   3. the errors fixture reports exactly errors/expected.stderr;
 #   4. tsc (7 and 5.9) accepts the example: its type-level assertions, and
-#      every `@ts-expect-error` of the errors fixture reporting;
+#      every `@ts-expect-error` of the errors fixture reporting; and rejects
+#      the types errors/mapping maps PG types to that don't fit them;
 #   5. the queries, COPY, streams and migrations run on a real PostgreSQL
 #      through node-postgres and postgres.js, and the migrations interoperate
 #      with `typedpg migrate` (a Docker container, torn down even on
 #      failure).
 #
-# Usage: scripts/run-ts-e2e.sh            (BLESS=1 rewrites expected.stderr)
+# Usage: scripts/run-ts-e2e.sh            (BLESS=1 rewrites the expected outputs)
 
 set -euo pipefail
 
@@ -49,6 +50,23 @@ diff -u "$EXAMPLE/errors/expected.stderr" <(printf '%s\n' "$actual")
 
 echo "ts-e2e: tsc 7 and 5.9"
 (cd "$EXAMPLE" && npm run --silent typecheck)
+
+echo "ts-e2e: type mapping checks"
+# The types `types` maps to that don't fit what their PG types are read as
+# fail tsc in the generated module: tsc 7's report is pinned, tsc 5.9 (which
+# words one error differently) must fail at the same places.
+MAPPING="$EXAMPLE/errors/mapping"
+actual=$(cd "$MAPPING" && "$TYPEDPG" gen 2>&1 | grep -v '^\[typedpg\]' || true)
+tsc7=$(cd "$MAPPING" && node ../../node_modules/typescript/bin/tsc -p . || true)
+tsc5=$(cd "$MAPPING" && node ../../node_modules/typescript-5/bin/tsc -p . || true)
+if [[ "${BLESS:-}" == 1 ]]; then
+    printf '%s\n' "$actual" > "$MAPPING/expected.stderr"
+    printf '%s\n' "$tsc7" > "$MAPPING/expected.tsc"
+fi
+diff -u "$MAPPING/expected.stderr" <(printf '%s\n' "$actual")
+diff -u "$MAPPING/expected.tsc" <(printf '%s\n' "$tsc7")
+locations() { grep -o '^src/[^:]*' || true; }
+diff -u <(printf '%s\n' "$tsc7" | locations) <(printf '%s\n' "$tsc5" | locations)
 
 echo "ts-e2e: starting $PG_IMAGE as $CONTAINER_NAME..."
 docker run -d --rm --name "$CONTAINER_NAME" -e POSTGRES_PASSWORD=postgres \

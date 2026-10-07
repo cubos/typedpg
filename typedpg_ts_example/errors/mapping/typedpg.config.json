@@ -1,0 +1,16 @@
+{
+  "include": ["src"],
+  "out": "src/db.ts",
+  "migrations": "migrations",
+  "types": {
+    "embedding": "./src/types.ts#Embedding",
+    "embedding_text": "./src/types.ts#EmbeddingText",
+    "mood": "./src/types.ts#Mood",
+    "address": "./src/types.ts#Address",
+    "short_address": "./src/types.ts#ShortAddress",
+    "user_id": "./src/types.ts#UserId",
+    "prefs": "./src/types.ts#Prefs",
+    "pg_catalog.timestamptz": "./src/types.ts#Instant",
+    "jsonpath": "./src/types.ts#JsonPath"
+  }
+}

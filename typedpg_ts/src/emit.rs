@@ -46,10 +46,22 @@ pub struct Embedded<'a> {
     pub runner: &'a MigrationsConfig,
 }
 
+/// A type `types` maps a PG type to, and what that type is read as, which
+/// it must fit ([`crate::typemap::Codec::fits`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypeCheck {
+    /// The PG type, as written in the config.
+    pub pg: String,
+    /// The type imported for it.
+    pub ts: String,
+    pub fits: String,
+}
+
 pub struct Module<'a> {
     pub runtime: &'a str,
     /// `(module, type name)` the type mappings need.
     pub imports: &'a [(String, String)],
+    pub checks: &'a [TypeCheck],
     pub queries: &'a [Entry<'a>],
     pub copies: &'a [Entry<'a>],
     pub migrations: Option<Embedded<'a>>,
@@ -87,6 +99,7 @@ impl Module<'_> {
         let _ = writeln!(out, "import {{ {} }} from {runtime};", values.join(", "));
         self.type_imports(&mut out);
         out.push('\n');
+        self.type_checks(&mut out);
         self.interfaces(&mut out);
         out.push('\n');
         self.values(&mut out, "export const ", "<Queries>", "<CopyTargets>");
@@ -123,6 +136,7 @@ impl Module<'_> {
         );
         self.user_imports(&mut out);
         out.push('\n');
+        self.type_checks(&mut out);
         self.interfaces(&mut out);
         let _ = writeln!(
             out,
@@ -140,10 +154,12 @@ impl Module<'_> {
 
     fn uses_runtime_types(&self) -> bool {
         let prefix = format!("{RUNTIME_NS}.");
-        self.queries
-            .iter()
-            .chain(self.copies)
-            .any(|(_, r)| r.as_ref().is_ok_and(|g| g.types.contains(&prefix)))
+        !self.checks.is_empty()
+            || self
+                .queries
+                .iter()
+                .chain(self.copies)
+                .any(|(_, r)| r.as_ref().is_ok_and(|g| g.types.contains(&prefix)))
     }
 
     fn type_imports(&self, out: &mut String) {
@@ -175,6 +191,27 @@ impl Module<'_> {
                 js_string(module)
             );
         }
+    }
+
+    /// A type that fails to compile where a type `types` maps to doesn't
+    /// fit what its PG type is read as: the runtime would hand out values
+    /// the type doesn't describe.
+    fn type_checks(&self, out: &mut String) {
+        if self.checks.is_empty() {
+            return;
+        }
+        out.push_str(
+            "// Each type in `types` must fit what its PostgreSQL type is read as.\n\
+             export type TypeMappingChecks = [\n",
+        );
+        for c in self.checks {
+            let _ = writeln!(
+                out,
+                "  {RUNTIME_NS}.Fits<{}, {}>, // {}",
+                c.ts, c.fits, c.pg
+            );
+        }
+        out.push_str("];\n\n");
     }
 
     fn interfaces(&self, out: &mut String) {
@@ -260,6 +297,7 @@ mod tests {
         let m = Module {
             runtime: "@cubos/typedpg",
             imports: &imports,
+            checks: &[],
             queries: &queries,
             copies: &[],
             migrations: None,
@@ -289,6 +327,7 @@ mod tests {
         let m = Module {
             runtime: "@cubos/typedpg",
             imports: &[],
+            checks: &[],
             queries: &queries,
             copies: &[],
             migrations: Some(Embedded {

@@ -272,6 +272,14 @@ fn type_overrides_are_imported_once_per_module() {
         out.contains("p: Prefs | null;\n      m: Mood;\n      g: Tag | null;"),
         "{out}"
     );
+    // Each must fit what its PG type is read as, sorted by PG type.
+    assert!(
+        out.contains(
+            "export type TypeMappingChecks = [\n  typedpg.Fits<Mood, string>, // public.mood\n  \
+             typedpg.Fits<Prefs, unknown>, // public.prefs\n  typedpg.Fits<Tag, string>, // public.tag\n];"
+        ),
+        "{out}"
+    );
     // An override can't take the runtime namespace's name, nor be two
     // modules' types under one name.
     write(
@@ -296,4 +304,28 @@ fn type_overrides_are_imported_once_per_module() {
     .err()
     .unwrap();
     assert!(err.contains("two modules export a type named `T`"), "{err}");
+}
+
+#[test]
+fn a_type_override_of_no_type_is_reported_in_the_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        &root.join("typedpg.config.json"),
+        r#"{ "out": "db.ts", "types": { "jsonpath": "./types.ts#Path", "pg_catalog.int8": "./types.ts#Id" } }"#,
+    );
+    write(&root.join("migrations/0001.sql"), USERS);
+    let r = project(root, false).sync(false);
+    let messages: Vec<String> = r.diagnostics.iter().map(|d| d.render(root)).collect();
+    assert_eq!(
+        messages,
+        [
+            "typedpg.config.json: error: `types`: type \"public.jsonpath\" does not exist (an \
+          unqualified name is in `public`; a built-in type is `pg_catalog.<name>`)"
+        ]
+    );
+    assert!(
+        read(&root.join("db.ts")).contains("  typedpg.Fits<Id, bigint>, // pg_catalog.int8\n];"),
+        "the other override is still checked"
+    );
 }

@@ -1,0 +1,1 @@
+typedpg.config.json: error: `types`: type "public.jsonpath" does not exist (an unqualified name is in `public`; a built-in type is `pg_catalog.<name>`)

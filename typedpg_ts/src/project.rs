@@ -14,7 +14,7 @@ use typedpg_analyzer::PgCatalog;
 use typedpg_core::QualifiedName;
 
 use crate::config::{Config, DatabaseConfig, OutKind, OverrideModule, declaration_path, out_kind};
-use crate::emit::{Embedded, Module};
+use crate::emit::{Embedded, Module, TypeCheck};
 use crate::generate::{GenError, Generated, generate};
 use crate::scan::{Export, FileScan, Kind, ModuleExports, Position, module_exports, scan};
 use crate::typemap::{RUNTIME_NS, TypeMapper};
@@ -443,9 +443,30 @@ impl Project {
             None
         };
         let imports = override_imports(&db.config);
+        let mut checks = Vec::new();
+        let mut types: Vec<_> = db.config.types.iter().collect();
+        types.sort_by_key(|(qn, _)| *qn);
+        for (qn, o) in types {
+            match catalog.type_named(qn) {
+                Some(ty) => checks.push(TypeCheck {
+                    pg: qn.to_string(),
+                    ts: o.export.clone(),
+                    fits: mapper.map(&ty).codec.fits(),
+                }),
+                None => report.diagnostics.push(Diagnostic {
+                    file: self.config.file.clone(),
+                    pos: None,
+                    message: format!(
+                        "`types`: type \"{qn}\" does not exist (an unqualified name is in \
+                         `public`; a built-in type is `pg_catalog.<name>`)"
+                    ),
+                }),
+            }
+        }
         let module = Module {
             runtime: &self.config.runtime,
             imports: &imports,
+            checks: &checks,
             queries: &entries[0],
             copies: &entries[1],
             migrations: embedded.as_deref().map(|migrations| Embedded {
@@ -563,6 +584,7 @@ fn ensure_exists(db: &DatabaseConfig, kind: OutKind, runtime: &str) -> Result<()
     let module = Module {
         runtime,
         imports: &[],
+        checks: &[],
         queries: &[],
         copies: &[],
         migrations: None,

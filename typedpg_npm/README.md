@@ -51,7 +51,7 @@ Node.js 22.12 or later.
 | `out` | The generated module. `.ts`/`.mts`/`.cts` generates TypeScript; `.js`/`.mjs` an ES module and its `.d.ts`; `.cjs` a CommonJS module and its `.d.cts`. |
 | `migrations` | The migrations directory (default `migrations`), or `{ "dir", "table", "lockId", "useTransaction", "failOnDrift", "embed" }` — the runner's settings, as in Rust. `"embed": true` adds the migrations to the generated module. |
 | `extraMigrations` | More directories the schema is built from but the runner doesn't apply (tables another project owns). |
-| `types` | PG type → TypeScript type, as `"./src/types#Prefs"` (relative to the config) or `"package#Type"`. A JSONB domain, an enum, a composite or any other type. |
+| `types` | PG type → TypeScript type, as `"./src/types#Prefs"` (relative to the config) or `"package#Type"`. A JSONB domain, an enum, a composite or any other type; an unqualified name is in `public`, a built-in type is `pg_catalog.<name>`. See [Mapping types](#mapping-types). |
 | `int8` | `"bigint"` (default, exact), `"string"` (exact, as `pg` returns it) or `"number"` (an error beyond 2^53 instead of a rounded value). |
 | `runtime` | The module the generated code imports the runtime from (default `@cubos/typedpg`). |
 | `databases` | Several databases: `{ "main": { "out": …, "migrations": … }, "warehouse": { … } }`, each with the keys above. A query belongs to the database whose module its `sql` comes from. |
@@ -172,6 +172,21 @@ says, whatever `pg.types.setTypeParser` your application set up.
 Composite values can be parameters (from their text form); an anonymous
 record can't, as PostgreSQL has no input for it. In a `json`/`jsonb`
 parameter, `null` is SQL NULL, not the JSON `null`.
+
+### Mapping types
+
+A type `types` maps a PG type to changes what the generated module says,
+not how values are read: they are decoded as the table above says. So the
+type must fit that — a narrower one is fine (a branded `string`, a string
+`enum` for an enum, an interface for a composite, any type for JSON), a
+different one isn't: mapping a `halfvec` to `string` is a TypeScript error
+in the generated module, as its values are `number[]`.
+
+```
+src/db.ts(9,16): error TS2344: Type 'string' does not satisfy the constraint 'readonly number[]'.
+```
+
+In a `.d.ts` (a JavaScript `out`), `skipLibCheck` skips that check.
 
 ## Migrations
 

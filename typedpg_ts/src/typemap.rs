@@ -91,6 +91,39 @@ impl Codec {
     }
 }
 
+impl Codec {
+    /// The TS type of what the codec reads a value as — and so what a type
+    /// `types` maps to must fit, as the value is read the same whatever its
+    /// TS type says. Any type fits JSON.
+    pub fn fits(&self) -> String {
+        match self {
+            Codec::Text => "string".into(),
+            Codec::Bool => "boolean".into(),
+            Codec::Number | Codec::Int8Number => "number".into(),
+            Codec::BigInt => "bigint".into(),
+            Codec::Json => "unknown".into(),
+            Codec::Timestamptz => "Date".into(),
+            Codec::Bytea => "Uint8Array".into(),
+            Codec::Interval => format!("{RUNTIME_NS}.Interval"),
+            Codec::Vector => "readonly number[]".into(),
+            Codec::Hstore => "Readonly<Record<string, string | null>>".into(),
+            Codec::Void => "undefined".into(),
+            Codec::Array(c) => format!("readonly ({} | null)[]", c.fits()),
+            Codec::Record(fields) => {
+                let members: Vec<String> = fields
+                    .iter()
+                    .map(|(name, c)| {
+                        format!("readonly {}: {} | null", property_key(name), c.fits())
+                    })
+                    .collect();
+                format!("{{ {} }}", members.join("; "))
+            }
+            Codec::Range(c) => format!("{RUNTIME_NS}.Range<{}>", c.fits()),
+            Codec::Multirange(c) => format!("readonly {RUNTIME_NS}.Range<{}>[]", c.fits()),
+        }
+    }
+}
+
 /// A PG type's TypeScript mapping.
 #[derive(Debug, Clone)]
 pub struct TsType {
@@ -427,6 +460,23 @@ mod tests {
         with(Int8::Number, |m| {
             assert_eq!(m.map(&basic_ty("xid8")).output, "bigint")
         });
+    }
+
+    #[test]
+    fn what_codecs_read_values_as() {
+        let record = Codec::Record(vec![
+            ("x".into(), Codec::Number),
+            ("a b".into(), Codec::Array(Box::new(Codec::Json))),
+        ]);
+        assert_eq!(
+            record.fits(),
+            r#"{ readonly x: number | null; readonly "a b": readonly (unknown | null)[] | null }"#
+        );
+        assert_eq!(Codec::Vector.fits(), "readonly number[]");
+        assert_eq!(
+            Codec::Multirange(Box::new(Codec::Timestamptz)).fits(),
+            "readonly typedpg.Range<Date>[]"
+        );
     }
 
     #[test]

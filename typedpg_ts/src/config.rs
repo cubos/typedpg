@@ -94,6 +94,8 @@ pub enum Int8 {
 /// The loaded configuration, every path absolute.
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// The config file.
+    pub file: PathBuf,
     /// The directory of the config file; relative paths start from it.
     pub root: PathBuf,
     /// Directories (or files) whose TypeScript sources are scanned.
@@ -154,10 +156,15 @@ impl Config {
             .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
         let absolute = std::path::absolute(path).map_err(|e| e.to_string())?;
         let root = absolute.parent().unwrap_or(Path::new("/"));
-        Self::parse(&text, root).map_err(|e| format!("{}: {e}", path.display()))
+        let config = Self::parse(&text, root).map_err(|e| format!("{}: {e}", path.display()))?;
+        Ok(Config {
+            file: absolute,
+            ..config
+        })
     }
 
-    /// Parse a config file's contents, its paths relative to `root`.
+    /// Parse a config file's contents, its paths relative to `root` (and
+    /// the file `root`'s [`CONFIG_FILE`]).
     pub fn parse(text: &str, root: &Path) -> Result<Config, String> {
         let raw: RawConfig = serde_json::from_str(text).map_err(|e| e.to_string())?;
         let single = RawDatabase {
@@ -200,6 +207,7 @@ impl Config {
             .map(|p| root.join(p))
             .collect();
         Ok(Config {
+            file: root.join(CONFIG_FILE),
             root: root.to_path_buf(),
             include,
             runtime: raw.runtime.unwrap_or_else(|| "@cubos/typedpg".to_owned()),

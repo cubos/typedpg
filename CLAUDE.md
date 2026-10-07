@@ -49,7 +49,7 @@ runtime package, `typedpg_ts_example` the project the end-to-end run uses.
 cargo nextest run --release -p typedpg_ts        # scanner, codegen, incremental project
 (cd typedpg_npm && npm ci && npm test)           # runtime unit tests (codecs)
 scripts/run-ts-e2e.sh                            # everything, on a PostgreSQL container
-BLESS=1 scripts/run-ts-e2e.sh                    # rewrite typedpg_ts_example/errors/expected.stderr
+BLESS=1 scripts/run-ts-e2e.sh                    # rewrite the errors fixtures' expected outputs
 ```
 
 After changing `typedpg_npm`, `npm install` in `typedpg_ts_example`: it
