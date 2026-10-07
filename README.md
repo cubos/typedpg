@@ -458,7 +458,7 @@ sql!(pool, "INSERT INTO users (name, email) VALUES $..new_users { name, email }"
     .execute().await?;
 ```
 
-The macro expands `$..new_users { name, email }` into a multi-row `VALUES` clause with proper parameter numbering. With no item there is no row, so the query isn't run (`execute` returns 0).
+The macro expands `$..new_users { name, email }` into a multi-row `VALUES` clause with proper parameter numbering. With no item the query still runs, as SQL would with no row: an empty spread next to other rows is left out, and a `VALUES` of nothing but empty spreads — which PostgreSQL has no syntax for — is written as a `SELECT` of no row (`SELECT * FROM (VALUES (NULL::type, …)) AS __typedpg_empty WHERE false`). So inserts in other CTEs of the statement happen, an aggregate over it has its row, and statement-level triggers fire.
 
 ## Lists with `IN $..list`
 

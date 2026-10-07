@@ -1263,6 +1263,53 @@ fn list_spread_takes_the_type_of_the_in_left_side() {
     assert_eq!(s.spreads[1].fields[0].pg_type, int8());
 }
 
+/// Each VALUES list holding rows spreads is described item by item —
+/// written rows by their text, read from PG's tokens (a comma or a
+/// parenthesis in a string is not one) — so the expansion can leave an
+/// empty spread out.
+#[test]
+fn values_lists_holding_rows_spreads_are_described() {
+    use typedpg_analyzer::ValuesItem;
+    let db = setup();
+    let s = db
+        .analyze(
+            "INSERT INTO users (id, name, email) VALUES (1, 'a,(b', 'c'), $..rows { id, name, email }, \
+             (2, $name, 'e') RETURNING id",
+        )
+        .unwrap();
+    let [list] = s.values_lists.as_slice() else {
+        panic!("{:?}", s.values_lists)
+    };
+    assert!(s.sql[list.start..].starts_with("VALUES (1"));
+    let items: Vec<String> = list
+        .items
+        .iter()
+        .map(|item| match *item {
+            ValuesItem::Row { start, end } => s.sql[start..end].to_owned(),
+            ValuesItem::Spread(i) => format!("$..{}", s.spreads[i].name),
+        })
+        .collect();
+    assert_eq!(items, ["(1, 'a,(b', 'c')", "$..rows", "(2, $1, 'e')"]);
+    assert_eq!(&s.sql[list.end..], " RETURNING id");
+
+    // Two spreads, and one in a CTE's VALUES: two lists.
+    let s = db
+        .analyze(
+            "WITH a AS (INSERT INTO users (id, name, email) VALUES $..a { id, name, email } RETURNING id), \
+                  b AS (INSERT INTO posts (id, user_id, title) VALUES $..b { id, user_id, title }, $..c { id, user_id, title } RETURNING id) \
+             SELECT (SELECT count(*) FROM a) AS a, (SELECT count(*) FROM b) AS b",
+        )
+        .unwrap();
+    let items: Vec<_> = s.values_lists.iter().map(|l| l.items.clone()).collect();
+    assert_eq!(
+        items,
+        [
+            vec![ValuesItem::Spread(0)],
+            vec![ValuesItem::Spread(1), ValuesItem::Spread(2)]
+        ]
+    );
+}
+
 /// A spread's expansion is valid SQL in one place only: a rows spread's
 /// rows where VALUES rows go, a list spread's parenthesized list as the
 /// right side of an IN. Elsewhere — a bare spread in VALUES, the rows of

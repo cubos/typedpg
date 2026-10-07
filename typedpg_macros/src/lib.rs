@@ -172,8 +172,10 @@ mod query_macro;
 /// ).fetch_all().await?;
 /// ```
 ///
-/// With no item, there is no row, so the query isn't run: `fetch_all`
-/// returns no row and `execute` 0.
+/// With no item the query still runs, as SQL would with no row: an empty
+/// spread next to other rows is left out, and a `VALUES` of nothing but
+/// empty spreads, which PG has no syntax for, is written as a `SELECT` of
+/// no row.
 ///
 /// # Lists with `IN $..list`
 ///

@@ -79,13 +79,37 @@ pub struct AnalyzedSpread {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpreadKind {
     /// `VALUES $..rows { a, b }`: a row per item, `($1, $2), ($3, $4)`, its
-    /// fields' values. No item makes no row, which VALUES can't have: the
-    /// query isn't run.
+    /// fields' values — in a [`ValuesList`], which says what the query is
+    /// with no item.
     Rows,
     /// `x IN $..ids`: the parenthesized list of the items, `($1, $2)`. No
     /// item is `(SELECT NULL::<type> WHERE false)`, the empty list PG has no
     /// syntax for, so `x IN` it is false and `x NOT IN` it true.
     List,
+}
+
+/// A VALUES list with rows spreads in it, in [`AnalyzedQuery::sql`]. The
+/// expansion writes `VALUES` and the items that have rows, joined by
+/// `, `. With none — PG has no VALUES without a row — it writes
+/// `SELECT * FROM (VALUES <a row of typed NULLs per spread>) AS
+/// __typedpg_empty WHERE false`: no row, the columns typed as the list's
+/// would be, valid wherever the list is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValuesList {
+    /// Where `VALUES` starts.
+    pub start: usize,
+    /// Where the list ends: past its last row, or at its last spread.
+    pub end: usize,
+    pub items: Vec<ValuesItem>,
+}
+
+/// An item of a [`ValuesList`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValuesItem {
+    /// A row written in the SQL: `sql[start..end]`, parentheses included.
+    Row { start: usize, end: usize },
+    /// The rows of the spread at this index of [`AnalyzedQuery::spreads`].
+    Spread(usize),
 }
 
 /// The full result of analyzing a SQL query template.
@@ -97,6 +121,8 @@ pub struct AnalyzedQuery {
     pub sql: String,
     pub params: Vec<AnalyzedParam>,
     pub spreads: Vec<AnalyzedSpread>,
+    /// The VALUES lists the rows spreads are in.
+    pub values_lists: Vec<ValuesList>,
     pub columns: Vec<AnalyzedColumn>,
     /// True when the query is safe to embed as the body of a subquery
     /// (`SELECT * FROM (<query>) …`). False for top-level
@@ -371,13 +397,111 @@ pub(crate) fn fuse(
         });
     }
 
+    let values_lists = values_lists(&sql, &spreads)?;
     Ok(AnalyzedQuery {
         sql,
         params,
         spreads,
+        values_lists,
         columns,
         can_run_as_subquery,
     })
+}
+
+/// The VALUES lists of `sql` holding the rows `spreads`, read from PG's
+/// own tokens (so a parenthesis or comma in a string or comment is not
+/// one). A spread is where its offset falls between two tokens; each must
+/// be in a list, which [`check_spread_positions`] made sure of.
+fn values_lists(sql: &str, spreads: &[AnalyzedSpread]) -> Result<Vec<ValuesList>, AnalyzeError> {
+    use typedpg_pg_query::protobuf::Token;
+    if spreads.iter().all(|s| s.kind != SpreadKind::Rows) {
+        return Ok(Vec::new());
+    }
+    let scanned = typedpg_pg_query::scan(sql)
+        .map_err(|e| AnalyzeError::Internal(format!("scanning the spread query: {e}")))?;
+    let tokens: Vec<(usize, usize, Token)> = scanned
+        .tokens
+        .iter()
+        .map(|t| {
+            let at = |n: i32| usize::try_from(n).unwrap_or(0);
+            (at(t.start), at(t.end), t.token())
+        })
+        .collect();
+    // The rows spread at `offset`, between the token ending at `from` and
+    // the next.
+    let spread_at = |from: usize, next: usize| {
+        spreads
+            .iter()
+            .position(|s| s.kind == SpreadKind::Rows && s.offset >= from && s.offset <= next)
+    };
+    let mut lists = Vec::new();
+    for (i, &(start, end, token)) in tokens.iter().enumerate() {
+        if token != Token::Values {
+            continue;
+        }
+        let mut items = Vec::new();
+        let (mut at, mut prev_end) = (i + 1, end);
+        let list_end = loop {
+            let next_start = tokens.get(at).map_or(sql.len(), |t| t.0);
+            let after = if let Some(si) = spread_at(prev_end, next_start) {
+                items.push(ValuesItem::Spread(si));
+                (spreads[si].offset, at)
+            } else if tokens.get(at).is_some_and(|t| t.2 == Token::Ascii40) {
+                // A row: to its matching `)`.
+                let mut depth = 0usize;
+                let mut close = at;
+                for (j, t) in tokens.iter().enumerate().skip(at) {
+                    match t.2 {
+                        Token::Ascii40 => depth += 1,
+                        Token::Ascii41 => depth -= 1,
+                        _ => {}
+                    }
+                    if depth == 0 {
+                        close = j;
+                        break;
+                    }
+                }
+                items.push(ValuesItem::Row {
+                    start: tokens[at].0,
+                    end: tokens[close].1,
+                });
+                (tokens[close].1, close + 1)
+            } else {
+                // Not a list of rows (`DEFAULT VALUES`), or its end.
+                break prev_end;
+            };
+            // Another item after a comma, or the list's end.
+            match tokens.get(after.1) {
+                Some(&(_, comma_end, Token::Ascii44)) => {
+                    prev_end = comma_end;
+                    at = after.1 + 1;
+                }
+                _ => break after.0,
+            }
+        };
+        if items.iter().any(|it| matches!(it, ValuesItem::Spread(_))) {
+            lists.push(ValuesList {
+                start,
+                end: list_end,
+                items,
+            });
+        }
+    }
+    let placed = lists
+        .iter()
+        .flat_map(|l| &l.items)
+        .filter(|it| matches!(it, ValuesItem::Spread(_)))
+        .count();
+    let rows = spreads
+        .iter()
+        .filter(|s| s.kind == SpreadKind::Rows)
+        .count();
+    if placed != rows {
+        return Err(AnalyzeError::Internal(format!(
+            "{placed} of the query's {rows} rows spreads are in a VALUES list: {sql}"
+        )));
+    }
+    Ok(lists)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

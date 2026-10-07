@@ -292,3 +292,96 @@ async fn list_spread_binds_enum_elements() {
     assert!(row.hit);
     assert!(!row.miss);
 }
+
+struct Person {
+    name: String,
+    email: String,
+}
+
+struct Email {
+    email: String,
+}
+
+/// A rows spread with no item still runs the query, as SQL would with no
+/// row: an empty spread next to other rows is left out, and a VALUES list
+/// of nothing but empty spreads is a SELECT of no row.
+#[tokio::test]
+async fn empty_rows_spreads_run_the_query() {
+    let pool = common::setup().await;
+    let tag = common::unique("empty-rows");
+    let ours = format!("{tag}-%");
+    let none: Vec<Person> = Vec::new();
+    let two: Vec<Person> = (0..2)
+        .map(|n| Person {
+            name: format!("p{n}"),
+            email: format!("{tag}-{n}@example.com"),
+        })
+        .collect();
+
+    // Two inserts in CTEs, the first one empty: the second still inserts.
+    let row = sql!(
+        &pool,
+        "WITH a AS (INSERT INTO users (name, email) VALUES $..none { name, email } RETURNING id), \
+              b AS (INSERT INTO users (name, email) VALUES $..two { name, email } RETURNING id) \
+         SELECT (SELECT count(*) FROM a) AS \"a!\", (SELECT count(*) FROM b) AS \"b!\""
+    )
+    .fetch_one()
+    .await
+    .expect("CTE inserts");
+    assert_eq!((row.a, row.b), (0, 2));
+
+    // A written row and an empty spread: the written row is inserted.
+    let email = format!("{tag}-fixed@example.com");
+    let rows = sql!(
+        &pool,
+        "INSERT INTO users (name, email) VALUES ('fixed', $email), $..none { name, email } RETURNING name"
+    )
+    .fetch_all()
+    .await
+    .expect("fixed row");
+    assert_eq!(
+        rows.into_iter().map(|r| r.name).collect::<Vec<_>>(),
+        ["fixed"]
+    );
+
+    // Read from an empty VALUES: an aggregate still has its row, and
+    // `NOT IN` it keeps every row.
+    let emails: Vec<Email> = Vec::new();
+    let n = sql!(
+        &pool,
+        "WITH v (email) AS (VALUES $..emails { email }) SELECT count(*) AS \"n!\" FROM v"
+    )
+    .fetch_value()
+    .await
+    .expect("count");
+    assert_eq!(n, 0);
+    let n = sql!(
+        &pool,
+        "WITH v (email) AS (VALUES $..emails { email }) \
+         SELECT count(*) AS \"n!\" FROM users WHERE email LIKE $ours AND email NOT IN (SELECT email FROM v)",
+        ours = ours.clone()
+    )
+    .fetch_value()
+    .await
+    .expect("NOT IN");
+    assert_eq!(n, 3);
+
+    // A plain INSERT of nothing: no row, 0 affected.
+    let inserted = sql!(
+        &pool,
+        "INSERT INTO users (name, email) VALUES $..none { name, email }"
+    )
+    .execute()
+    .await
+    .expect("empty insert");
+    assert_eq!(inserted, 0);
+    let returned = sql!(
+        &pool,
+        "INSERT INTO users (name, email) VALUES $..none { name, email } \
+         ON CONFLICT (email) DO NOTHING RETURNING id"
+    )
+    .fetch_optional()
+    .await
+    .expect("empty insert returning");
+    assert!(returned.is_none());
+}
