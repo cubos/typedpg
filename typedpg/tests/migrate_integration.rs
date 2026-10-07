@@ -561,6 +561,36 @@ async fn concurrent_runs_on_a_fresh_database() {
     }
 }
 
+/// Two runners racing past a `CREATE INDEX CONCURRENTLY`: the runner that
+/// waits for the lock must not wait inside a statement, whose transaction
+/// the index build would wait for in turn — PG then reports a deadlock and
+/// kills one runner.
+#[tokio::test]
+async fn concurrent_runs_past_a_concurrent_index_build() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "0001_t.sql", "CREATE TABLE t (a int);");
+    write(
+        dir.path(),
+        "0002_index.sql",
+        "-- no-transaction\nCREATE INDEX CONCURRENTLY t_a ON t (a);",
+    );
+    let source = MigrationSource::from_dir(dir.path()).unwrap();
+    let config = MigrationsConfig::default();
+
+    for _ in 0..5 {
+        let (mut a, db) = fresh_db().await;
+        let mut b = second_session(&db).await;
+        let (ra, rb) = tokio::join!(
+            migrate::run(&mut a, &source, &config),
+            migrate::run(&mut b, &source, &config),
+        );
+        let (ra, rb) = (ra.expect("runner a"), rb.expect("runner b"));
+        let mut all: Vec<_> = ra.into_iter().chain(rb).collect();
+        all.sort();
+        assert_eq!(all, ["0001_t", "0002_index"], "each migration applied once");
+    }
+}
+
 /// A source baked in with `embed_migrations!` runs like one read from disk.
 #[tokio::test]
 async fn embedded_source_runs() {
