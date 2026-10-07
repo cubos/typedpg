@@ -198,10 +198,12 @@ mod query_macro;
 /// parameter per field, past PG's 65535-parameter limit.
 ///
 /// `id = ANY($ids)`, an array parameter, is the same filter as one
-/// placeholder, whatever the list's length. They differ when the statement
-/// is prepared and run with a generic plan: there, PG prunes the partitions
-/// of a partitioned table only for an `IN` list, and estimates its rows
-/// from the list's length rather than from a default.
+/// placeholder, whatever the list's length. `sql!` prepares each query
+/// anew, so PG plans it with the values and the two plan alike; they differ
+/// only under a generic plan (a statement prepared once and run repeatedly,
+/// as an executor of your own might), where PG prunes the partitions of a
+/// partitioned table only for an `IN` list, and estimates its rows from the
+/// list's length rather than from a default.
 ///
 /// # Domain types (JSONB)
 ///
