@@ -7,7 +7,7 @@ import { after, before, describe, test } from "node:test";
 
 import pg from "pg";
 import postgres from "postgres";
-import { NoRowsError, TooManyRowsError, TypedpgError, type Executor } from "typedpg";
+import { NoRowsError, TooManyRowsError, TypedpgError, type Executor } from "@cubos/typedpg";
 
 import * as q from "./queries.ts";
 import { baseUrl, drivers, freshDatabase } from "./testdb.ts";

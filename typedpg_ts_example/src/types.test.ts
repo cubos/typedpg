@@ -7,7 +7,7 @@
 import assert from "node:assert/strict";
 import { after, before, describe, test } from "node:test";
 
-import { type CopyRow, NoRowsError, type Params, range, emptyRange } from "typedpg";
+import { type CopyRow, NoRowsError, type Params, range, emptyRange } from "@cubos/typedpg";
 
 import { type Connection, baseUrl, drivers, freshDatabase, prng } from "./testdb.ts";
 import * as t from "./things.ts";

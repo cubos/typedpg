@@ -3,7 +3,7 @@
 // hstore. The type-level checks at the bottom fail tsc if an inferred type
 // is not exactly the expected one.
 
-import type { Interval, Params, Range, Row } from "typedpg";
+import type { Interval, Params, Range, Row } from "@cubos/typedpg";
 import { copyIn, sql } from "./db.ts";
 import type { Point2 } from "./domains.ts";
 
@@ -51,7 +51,7 @@ type Shape = {
   color: Color | null;
   points: (Point2 | null)[] | null;
   tags: (string | null)[] | null;
-  meta: import("typedpg").JsonValue | null;
+  meta: import("@cubos/typedpg").JsonValue | null;
 };
 
 export type Checks = [
@@ -80,7 +80,7 @@ export type Checks = [
         flags: (boolean | null)[] | null;
         blobs: (Uint8Array | null)[] | null;
         stamps: (Date | null)[] | null;
-        docs: (import("typedpg").JsonValue | null)[] | null;
+        docs: (import("@cubos/typedpg").JsonValue | null)[] | null;
         day: string | null;
         at_local: string | null;
         clock: string | null;

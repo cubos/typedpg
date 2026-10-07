@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-// Assemble the npm packages for a release: `typedpg` itself (built, with
+// Assemble the npm packages for a release: `@cubos/typedpg` itself (built, with
 // an optional dependency on each platform package) and one
-// `@typedpg/cli-<target>` per binary.
+// `@cubos/typedpg-cli-<target>` per binary.
 //
 //   node scripts/assemble.mjs <binaries-dir> <out-dir>
 //
@@ -31,7 +31,7 @@ const optional = {};
 for (const target of readdirSync(binaries).sort()) {
   const [os, cpu, libc] = target.split("-");
   const file = os === "win32" ? "typedpg.exe" : "typedpg";
-  const name = `@typedpg/cli-${target}`;
+  const name = `@cubos/typedpg-cli-${target}`;
   const dir = join(out, `cli-${target}`);
   mkdirSync(join(dir, "bin"), { recursive: true });
   cpSync(join(binaries, target, file), join(dir, "bin", file));
@@ -61,4 +61,4 @@ for (const entry of ["dist", "bin", "README.md", "LICENSE-MIT", "LICENSE-APACHE"
 const { devDependencies: _, scripts: __, ...published } = main;
 const files = [...published.files, "LICENSE-MIT", "LICENSE-APACHE"];
 writeFileSync(join(dir, "package.json"), JSON.stringify({ ...published, files, optionalDependencies: optional }, null, 2) + "\n");
-console.log(`assembled typedpg ${main.version} with ${Object.keys(optional).join(", ") || "no binaries"} in ${out}`);
+console.log(`assembled ${main.name} ${main.version} with ${Object.keys(optional).join(", ") || "no binaries"} in ${out}`);

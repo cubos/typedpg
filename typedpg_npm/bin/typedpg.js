@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // The `typedpg` command: runs the native binary of this platform, which
 // npm installed as one of this package's optional dependencies
-// (`@typedpg/cli-<platform>`). TYPEDPG_BINARY overrides it.
+// (`@cubos/typedpg-cli-<platform>`). TYPEDPG_BINARY overrides it.
 
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
@@ -22,7 +22,7 @@ function target() {
 
 function binary() {
   if (process.env.TYPEDPG_BINARY) return process.env.TYPEDPG_BINARY;
-  const pkg = `@typedpg/cli-${target()}`;
+  const pkg = `@cubos/typedpg-cli-${target()}`;
   const file = process.platform === "win32" ? "typedpg.exe" : "typedpg";
   try {
     return require.resolve(`${pkg}/bin/${file}`);

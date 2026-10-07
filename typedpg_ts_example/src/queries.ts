@@ -1,4 +1,4 @@
-import type { Row, Params } from "typedpg";
+import type { Row, Params } from "@cubos/typedpg";
 import { sql } from "./db.ts";
 import * as db from "./db.ts";
 import type { UserPrefs } from "./domains.ts";

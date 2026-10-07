@@ -1,8 +1,8 @@
 name: npm
 
 # Builds the `typedpg` binary for each platform and assembles the npm
-# packages: `typedpg` (the runtime, with an optional dependency on each
-# platform's binary) and `@typedpg/cli-<target>`. A pushed `npm-v*` tag
+# packages: `@cubos/typedpg` (the runtime, with an optional dependency on each
+# platform's binary) and `@cubos/typedpg-cli-<target>`. A pushed `npm-v*` tag
 # publishes them; a manual run only packs them (`npm publish --dry-run`).
 
 on:
@@ -76,7 +76,7 @@ jobs:
           npm ci
           npm test
           node scripts/assemble.mjs ../bins ../npm-dist
-      # The platform packages first: `typedpg` depends on them.
+      # The platform packages first: `@cubos/typedpg` depends on them.
       - shell: bash
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

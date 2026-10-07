@@ -21,7 +21,7 @@ import {
   revertMigration,
   type Executor,
   type MigrationSet,
-} from "typedpg";
+} from "@cubos/typedpg";
 
 import { migrations } from "./db.ts";
 import { baseUrl, freshDatabase } from "./testdb.ts";

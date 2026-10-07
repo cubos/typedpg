@@ -25,12 +25,12 @@ parameter of type '"typedpg: column \"nmae\" does not exist"'.
 ## Install
 
 ```sh
-npm install typedpg
+npm install @cubos/typedpg
 npm install pg            # or: npm install postgres
 ```
 
 The `typedpg` command is a native binary, installed for your platform as an
-optional dependency (`@typedpg/cli-linux-x64-gnu`, `-darwin-arm64`, …).
+optional dependency (`@cubos/typedpg-cli-linux-x64-gnu`, `-darwin-arm64`, …).
 Node.js 22.12 or later.
 
 ## Configure
@@ -53,7 +53,7 @@ Node.js 22.12 or later.
 | `extraMigrations` | More directories the schema is built from but the runner doesn't apply (tables another project owns). |
 | `types` | PG type → TypeScript type, as `"./src/types#Prefs"` (relative to the config) or `"package#Type"`. A JSONB domain, an enum, a composite or any other type. |
 | `int8` | `"bigint"` (default, exact), `"string"` (exact, as `pg` returns it) or `"number"` (an error beyond 2^53 instead of a rounded value). |
-| `runtime` | The module the generated code imports the runtime from (default `typedpg`). |
+| `runtime` | The module the generated code imports the runtime from (default `@cubos/typedpg`). |
 | `databases` | Several databases: `{ "main": { "out": …, "migrations": … }, "warehouse": { … } }`, each with the keys above. A query belongs to the database whose module its `sql` comes from. |
 
 Unknown keys are errors.
@@ -193,7 +193,7 @@ At startup, from the generated module (`"migrations": { "embed": true }`)
 or from a directory:
 
 ```ts
-import { migrate, migrationStatus, revertMigration, loadMigrations } from "typedpg";
+import { migrate, migrationStatus, revertMigration, loadMigrations } from "@cubos/typedpg";
 import { migrations } from "./db"; // or: loadMigrations("./migrations")
 
 const applied = await migrate(pool, migrations);

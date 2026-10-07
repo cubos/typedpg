@@ -1,7 +1,7 @@
 //! The generated module of a database.
 //!
 //! ```ts
-//! import { createCopyIn, createSql } from "typedpg";
+//! import { createCopyIn, createSql } from "@cubos/typedpg";
 //!
 //! export interface Queries {
 //!   "SELECT name FROM users WHERE id = $id": {
@@ -258,7 +258,7 @@ mod tests {
             ("pkg".to_owned(), "X".to_owned()),
         ];
         let m = Module {
-            runtime: "typedpg",
+            runtime: "@cubos/typedpg",
             imports: &imports,
             queries: &queries,
             copies: &[],
@@ -267,7 +267,7 @@ mod tests {
         let files = m.files(Path::new("/p/db.ts"), OutKind::TypeScript);
         assert_eq!(files.len(), 1);
         let ts = &files[0].1;
-        assert!(ts.contains("import { createCopyIn, createSql } from \"typedpg\";\nimport type * as typedpg from \"typedpg\";\nimport type { Point, Prefs } from \"./domains\";\nimport type { X } from \"pkg\";"), "{ts}");
+        assert!(ts.contains("import { createCopyIn, createSql } from \"@cubos/typedpg\";\nimport type * as typedpg from \"@cubos/typedpg\";\nimport type { Point, Prefs } from \"./domains\";\nimport type { X } from \"pkg\";"), "{ts}");
         assert!(
             ts.contains(r#"  "SELECT x": { error: "column \"x\" does not exist" };"#),
             "{ts}"
@@ -287,7 +287,7 @@ mod tests {
         let runner = MigrationsConfig::default();
         let migrations = [("0001_a".to_owned(), "CREATE TABLE a ();".to_owned(), None)];
         let m = Module {
-            runtime: "typedpg",
+            runtime: "@cubos/typedpg",
             imports: &[],
             queries: &queries,
             copies: &[],
@@ -302,7 +302,7 @@ mod tests {
         let (js, dts) = (&files[0].1, &files[1].1);
         assert!(
             js.contains(
-                "const { createCopyIn, createSql, embedMigrations } = require(\"typedpg\");"
+                "const { createCopyIn, createSql, embedMigrations } = require(\"@cubos/typedpg\");"
             ),
             "{js}"
         );

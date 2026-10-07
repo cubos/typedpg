@@ -202,7 +202,7 @@ impl Config {
         Ok(Config {
             root: root.to_path_buf(),
             include,
-            runtime: raw.runtime.unwrap_or_else(|| "typedpg".to_owned()),
+            runtime: raw.runtime.unwrap_or_else(|| "@cubos/typedpg".to_owned()),
             databases,
         })
     }

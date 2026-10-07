@@ -103,7 +103,7 @@ fn several_databases_and_javascript_outputs() {
     let main_dts = read(&root.join("src/main.d.ts"));
     assert!(main_js.starts_with("// @generated"), "{main_js}");
     assert!(
-        main_js.contains("import { createCopyIn, createSql } from \"typedpg\";"),
+        main_js.contains("import { createCopyIn, createSql } from \"@cubos/typedpg\";"),
         "{main_js}"
     );
     assert!(!main_js.contains("interface"), "{main_js}");
@@ -115,7 +115,7 @@ fn several_databases_and_javascript_outputs() {
     );
     let wh = read(&root.join("src/wh.cjs"));
     assert!(
-        wh.contains("const { createCopyIn, createSql } = require(\"typedpg\");"),
+        wh.contains("const { createCopyIn, createSql } = require(\"@cubos/typedpg\");"),
         "{wh}"
     );
     assert!(wh.contains("exports.sql = createSql({"), "{wh}");
@@ -180,7 +180,7 @@ fn embedded_migrations_and_their_errors() {
     project(root, false).sync(false);
     let out = read(&root.join("db.ts"));
     assert!(
-        out.contains("import { createCopyIn, createSql, embedMigrations } from \"typedpg\";"),
+        out.contains("import { createCopyIn, createSql, embedMigrations } from \"@cubos/typedpg\";"),
         "{out}"
     );
     assert!(out.contains(

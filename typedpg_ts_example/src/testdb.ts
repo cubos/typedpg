@@ -4,7 +4,7 @@
 
 import pg from "pg";
 import postgres from "postgres";
-import { type Executor, migrate } from "typedpg";
+import { type Executor, migrate } from "@cubos/typedpg";
 
 import { migrations } from "./db.ts";
 

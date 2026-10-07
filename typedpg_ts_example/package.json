@@ -12,7 +12,7 @@
     "pg-copy-streams": "^7.0.0",
     "pg-cursor": "^2.22.1",
     "postgres": "^3.4.0",
-    "typedpg": "file:../typedpg_npm"
+    "@cubos/typedpg": "file:../typedpg_npm"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
