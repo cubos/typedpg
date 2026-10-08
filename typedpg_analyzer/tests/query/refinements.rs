@@ -573,3 +573,71 @@ fn a_recursive_counter_settles() {
         &[("k", false, Some(0), Some(0))],
     );
 }
+
+// ── Views ────────────────────────────────────────────────────────────────────
+
+#[test]
+fn a_view_keeps_what_its_query_knows() {
+    let mut db = values_setup();
+    db.apply_sql(
+        "CREATE VIEW vv AS
+           SELECT kind, n, now() AS at, CASE WHEN n = 1 THEN 'one' ELSE 'two' END AS w,
+                  ARRAY[n] AS ns, free
+           FROM v WHERE kind = 'a';
+         CREATE VIEW over_vv AS SELECT * FROM vv;",
+    )
+    .unwrap();
+    for view in ["vv", "over_vv"] {
+        assert_values(
+            &db,
+            &format!("SELECT kind, n, w, free FROM {view}"),
+            &[
+                ("kind", Some(&["a"])),
+                ("n", Some(&["1", "2"])),
+                ("w", Some(&["one", "two"])),
+                ("free", None),
+            ],
+        );
+        let s = db.analyze(&format!("SELECT at, ns FROM {view}")).unwrap();
+        assert!(s.columns[0].refinement.finite, "{view}.at is finite");
+        assert!(
+            matches!(
+                &s.columns[1].pg_type,
+                Type::Array {
+                    element_nullable: Some(false),
+                    ..
+                }
+            ),
+            "{view}.ns has no NULL element: {:?}",
+            s.columns[1].pg_type
+        );
+    }
+    // A view's WHERE narrows what is read through it, the outer one too.
+    assert_values(
+        &db,
+        "SELECT w FROM vv WHERE w <> 'two'",
+        &[("w", Some(&["one"]))],
+    );
+}
+
+#[test]
+fn a_view_follows_its_tables_constraints_as_they_change() {
+    let mut db = values_setup();
+    db.apply_sql("CREATE VIEW kinds AS SELECT kind FROM v;")
+        .unwrap();
+    assert_values(
+        &db,
+        "SELECT kind FROM kinds",
+        &[("kind", Some(&["a", "b"]))],
+    );
+    db.apply_sql(
+        "ALTER TABLE v DROP CONSTRAINT v_kind_check;
+         ALTER TABLE v ADD CONSTRAINT v_kind_check CHECK (kind IN ('a', 'b', 'c'));",
+    )
+    .unwrap();
+    assert_values(
+        &db,
+        "SELECT kind FROM kinds",
+        &[("kind", Some(&["a", "b", "c"]))],
+    );
+}
