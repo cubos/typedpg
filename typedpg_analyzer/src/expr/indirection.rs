@@ -200,6 +200,7 @@ pub(super) fn resolve_composite_field(
             explicit_collation: false,
             record_fields,
             elem_nullable: field.ty.elem_nullable,
+            refine: field.ty.refine.clone(),
         });
     }
 

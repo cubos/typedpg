@@ -1067,9 +1067,18 @@ fn infer_generic_binary_op(
                 }
                 _ => None,
             };
+            let refine = op
+                .code
+                .and_then(|c| snapshot.pg_proc.get(&c))
+                .map(|p| {
+                    let operands: Vec<&ExprType> = left.iter().chain(right.iter()).collect();
+                    crate::refine::of_builtin_call(p, &operands, snapshot)
+                })
+                .unwrap_or_default();
             return Ok(ExprType::scalar(op.result_type_oid, nullable)
                 .with_collation(state)
-                .with_elem_nullable(elem_nullable));
+                .with_elem_nullable(elem_nullable)
+                .with_refine(refine));
         }
         crate::lookup::OperatorMatch::Ambiguous => {
             // PG (SQLSTATE 42725): `operator is not unique: <left> <op>

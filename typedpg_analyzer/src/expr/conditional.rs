@@ -234,7 +234,8 @@ pub(crate) fn infer_coalesce(
     );
     Ok(ExprType::scalar_with_typmod(type_oid, all_nullable, typmod)
         .with_collation(derive_collation(&args, type_oid, snapshot)?)
-        .with_elem_nullable(branches_elem_nullable(&branches, type_oid, snapshot)))
+        .with_elem_nullable(branches_elem_nullable(&branches, type_oid, snapshot))
+        .with_refine(branches_refine(&branches, type_oid, snapshot)))
 }
 
 /// Coerce each branch of a CASE / COALESCE / GREATEST / … to the common
@@ -352,6 +353,22 @@ pub(crate) fn branches_elem_nullable(
         return None;
     }
     merge_elem_nullable(parts)
+}
+
+/// The refinement of a COALESCE / CASE / GREATEST / LEAST over `branches`,
+/// whose result has type `common`: what every branch that can be the
+/// (non-NULL) result is, converted to `common`. A NULL constant never is.
+pub(crate) fn branches_refine(
+    branches: &[(&protobuf::Node, &ExprType)],
+    common: PgTypeOid,
+    snapshot: &PgCatalog,
+) -> crate::refine::Refinement {
+    let parts: Vec<crate::refine::Refinement> = branches
+        .iter()
+        .filter(|(node, _)| !matches!(node.node.as_ref(), Some(node::Node::AConst(c)) if c.isnull))
+        .map(|(_, t)| t.refine.converted(t.type_oid, common, snapshot))
+        .collect();
+    crate::refine::Refinement::either(&parts)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -568,6 +585,7 @@ pub(crate) fn infer_case(
     Ok(
         ExprType::scalar_with_typmod(type_oid, nullable, agreed_typmod(&inputs, type_oid))
             .with_collation(collation)
-            .with_elem_nullable(branches_elem_nullable(&branches, type_oid, snapshot)),
+            .with_elem_nullable(branches_elem_nullable(&branches, type_oid, snapshot))
+            .with_refine(branches_refine(&branches, type_oid, snapshot)),
     )
 }

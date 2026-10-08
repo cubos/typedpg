@@ -483,7 +483,8 @@ fn value_gated_builtins_are_non_null_with_safe_arguments() {
                 to_char(interval '1 day', 'HH') AS c7,
                 jsonb_path_exists(j, '$.a', silent => false) AS c8,
                 extract(month from current_date) AS c9,
-                to_char(CURRENT_TIMESTAMP, 'YYYY') AS c10
+                to_char(CURRENT_TIMESTAMP, 'YYYY') AS c10,
+                to_char(now() + interval '1 day', 'YYYY') AS c11
          FROM t",
         &[
             ("c1", false),
@@ -496,6 +497,7 @@ fn value_gated_builtins_are_non_null_with_safe_arguments() {
             ("c8", false),
             ("c9", false),
             ("c10", false),
+            ("c11", false),
         ],
     );
     assert_nullable(
@@ -503,7 +505,7 @@ fn value_gated_builtins_are_non_null_with_safe_arguments() {
         "SELECT jsonb_path_exists(j, '$.a', '{}', true) AS c1, to_char(now(), '') AS c2,
                 array_length(ARRAY[a], 2) AS c3, to_char(interval 'infinity', 'HH') AS c4,
                 array_length(ARRAY[ARRAY[a]], 1) AS c5,
-                to_char(now() + interval '1 day', 'YYYY') AS c6
+                to_char(now() + 'infinity'::interval, 'YYYY') AS c6
          FROM t",
         &[
             ("c1", true),

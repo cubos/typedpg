@@ -1,4 +1,5 @@
 use super::*;
+use crate::refine::finite_value;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Function calls — two-pass (PG chapter 10.3)
@@ -167,6 +168,15 @@ pub(crate) fn infer_func_call(
                 && snapshot.namespace_name(p.pronamespace) == Some("pg_catalog")
         }),
     );
+    // `isfinite(c)` as a CHECK keeping `c` finite reads it: the built-in
+    // one.
+    ctx.note_strict(
+        func.location,
+        crate::nonnull::StrictNode::IsFinite,
+        snapshot.pg_proc.get(&resolved.oid).is_some_and(|p| {
+            p.proname == "isfinite" && snapshot.namespace_name(p.pronamespace) == Some("pg_catalog")
+        }),
+    );
     for (&actual, &declared) in args.types.iter().zip(&resolved.arg_types) {
         ctx.note_coercion(actual, declared);
     }
@@ -232,6 +242,23 @@ pub(crate) fn infer_func_call(
     let (collation, explicit_collation) =
         derive_collation(&args.exprs, resolved.return_type_oid, snapshot)?;
     coerce_call_args(&mut args, &resolved, snapshot);
+    // Over the arguments as written: the defaults of the functions it
+    // knows are finite constants (`lag`'s offset 1 and default NULL,
+    // `make_interval`'s zeros). A function declared to return a domain:
+    // its result is coerced to it, whose CHECKs it passed.
+    let refine = snapshot
+        .pg_proc
+        .get(&resolved.oid)
+        .map(|p| {
+            let declared = if p.prorettype == resolved.return_type_oid {
+                snapshot.domain_refinement(p.prorettype)
+            } else {
+                crate::refine::Refinement::NONE
+            };
+            crate::refine::of_builtin_call(p, &args.exprs.iter().collect::<Vec<_>>(), snapshot)
+                .and(&declared)
+        })
+        .unwrap_or_default();
 
     // The rules below read arguments by parameter position.
     let (func, args) = in_declared_order(func, args, &resolved);
@@ -280,6 +307,7 @@ pub(crate) fn infer_func_call(
         } else {
             builtin_array_elem_nullable(func, &resolved, &args)
         },
+        refine,
     })
 }
 
@@ -1214,9 +1242,9 @@ fn is_zero_string(s: &str) -> bool {
 ///   (jsonpath_exec.c): without it, or with a literal `false`, errors are
 ///   raised instead;
 /// - `to_char(timestamp[tz] | interval, fmt)` is NULL for an empty format
-///   or a non-finite value: a non-empty literal format over a source that
-///   is always finite (`now()`, `CURRENT_TIMESTAMP`, a literal interval
-///   other than infinity);
+///   or a non-finite value: a non-empty literal format over a value refined
+///   finite (`now()`, `CURRENT_TIMESTAMP`, a literal interval other than
+///   infinity, a column CHECKed `isfinite`, … see [`crate::refine`]);
 /// - `extract` / `date_part` over such a finite timestamp or date has no
 ///   infinite input to be NULL for;
 /// - `array_length` / `array_lower` / `array_upper` (dimension literal 1),
@@ -1225,6 +1253,7 @@ fn is_zero_string(s: &str) -> bool {
 fn value_gated_non_null(
     func: &protobuf::FuncCall,
     resolved: &functions::ResolvedFunction,
+    args: &FuncArgs,
     ctx: Ctx<'_>,
     params: &ParamCollector,
 ) -> bool {
@@ -1256,13 +1285,12 @@ fn value_gated_non_null(
                     ..
                 })) if !s.sval.is_empty()
             );
-            let source_finite = match first_type {
-                Some(t) if t == oid::TIMESTAMP || t == oid::TIMESTAMPTZ => {
-                    finite_time_source(positional[0], ctx)
-                }
-                Some(t) if t == INTERVAL => finite_interval_literal(positional[0], ctx),
-                _ => false,
-            };
+            let source_finite = matches!(first_type, Some(t)
+                if t == oid::TIMESTAMP || t == oid::TIMESTAMPTZ || t == INTERVAL)
+                && args
+                    .exprs
+                    .first()
+                    .is_some_and(|a| finite_value(a, ctx.snapshot));
             fmt_non_empty && source_finite
         }
         "extract" | "date_part" if func.args.len() == 2 && positional.len() == 2 => {
@@ -1270,7 +1298,10 @@ fn value_gated_non_null(
                 && declared_types.get(1).is_some_and(|&t| {
                     t == oid::TIMESTAMP || t == oid::TIMESTAMPTZ || t == oid::DATE
                 })
-                && finite_time_source(positional[1], ctx)
+                && args
+                    .exprs
+                    .get(1)
+                    .is_some_and(|a| finite_value(a, ctx.snapshot))
         }
         "array_length" | "array_lower" | "array_upper"
             if func.args.len() == 2 && positional.len() == 2 =>
@@ -1293,59 +1324,6 @@ fn value_gated_non_null(
 
 /// PG's `interval` type.
 const INTERVAL: PgTypeOid = PgTypeOid::from_raw(1186);
-
-/// A timestamp source that is never infinite: the current time.
-fn finite_time_source(n: &protobuf::Node, ctx: Ctx<'_>) -> bool {
-    use protobuf::SqlValueFunctionOp as Op;
-    match n.node.as_ref() {
-        Some(node::Node::SqlvalueFunction(f)) => matches!(
-            Op::try_from(f.op),
-            Ok(Op::SvfopCurrentDate
-                | Op::SvfopCurrentTimestamp
-                | Op::SvfopCurrentTimestampN
-                | Op::SvfopLocaltimestamp
-                | Op::SvfopLocaltimestampN)
-        ),
-        Some(node::Node::FuncCall(f)) if f.args.is_empty() && f.over.is_none() => {
-            let parts = extract_string_fields(&f.funcname);
-            let (schema, name) = match parts.as_slice() {
-                [n] => (None, n.as_str()),
-                [s, n] if s == "pg_catalog" => (Some("pg_catalog"), n.as_str()),
-                _ => return false,
-            };
-            let candidates = ctx.snapshot.find_functions(schema, name);
-            matches!(
-                name,
-                "now" | "statement_timestamp" | "transaction_timestamp" | "clock_timestamp"
-            ) && !candidates.is_empty()
-                && candidates
-                    .iter()
-                    .all(|p| ctx.snapshot.namespace_name(p.pronamespace) == Some("pg_catalog"))
-        }
-        _ => false,
-    }
-}
-
-/// An interval literal that isn't (minus) infinity.
-fn finite_interval_literal(n: &protobuf::Node, ctx: Ctx<'_>) -> bool {
-    let Some(node::Node::TypeCast(tc)) = n.node.as_ref() else {
-        return false;
-    };
-    let is_interval = tc
-        .type_name
-        .as_ref()
-        .and_then(|t| crate::ddl::util::resolve_type_name(t, ctx.snapshot))
-        == Some(INTERVAL);
-    is_interval
-        && matches!(
-            tc.arg.as_deref().and_then(|a| a.node.as_ref()),
-            Some(node::Node::AConst(protobuf::AConst {
-                isnull: false,
-                val: Some(typedpg_pg_query::protobuf::a_const::Val::Sval(s)),
-                ..
-            })) if !s.sval.to_ascii_lowercase().contains("infinity")
-        )
-}
 
 /// `ARRAY[e1, …, en]` (n ≥ 1, possibly cast to an array type) over
 /// scalar elements: a one-dimensional array of n elements. The elements
@@ -1940,7 +1918,7 @@ fn resolve_func_nullability(
         }
     } else if resolved.schema == "pg_catalog"
         && (extract_unit_is_infinite_safe(func, resolved)
-            || value_gated_non_null(func, resolved, ctx, params))
+            || value_gated_non_null(func, resolved, args, ctx, params))
     {
         args.any_nullable
     } else if resolved.schema == "pg_catalog"

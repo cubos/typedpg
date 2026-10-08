@@ -172,6 +172,7 @@ pub(crate) fn resolve_target_list_explicit(
                     collation: col.collation,
                     record_fields: col.record_fields.clone(),
                     elem_nullable: col.elem_nullable,
+                    refine: col.refine.clone(),
                     origin: col.origin.clone(),
                 });
             }
@@ -196,6 +197,7 @@ pub(crate) fn resolve_target_list_explicit(
                     typmod: t.typmod,
                     collation: t.collation,
                     elem_nullable: t.elem_nullable,
+                    refine: t.refine.clone(),
                     record_fields: t.record_fields,
                     origin: None,
                 });
@@ -256,6 +258,7 @@ pub(crate) fn resolve_target_list_explicit(
             collation: expr_type.collation,
             record_fields,
             elem_nullable: expr_type.elem_nullable,
+            refine: expr_type.refine.clone(),
             // A plain column reference passes its column through as is.
             origin: scope.plain_column_ref(val).and_then(|c| c.origin.clone()),
         });
@@ -425,6 +428,7 @@ pub(crate) fn analyze_values_lists(
             collation: None,
             record_fields: None,
             elem_nullable: None,
+            refine: crate::refine::Refinement::NONE,
             origin: None,
         })
         .collect();

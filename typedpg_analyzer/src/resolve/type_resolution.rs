@@ -34,6 +34,7 @@ pub(crate) fn build_column(
         name,
         pg_type,
         nullable,
+        refinement: rc.refine,
     })
 }
 

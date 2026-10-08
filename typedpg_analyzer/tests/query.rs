@@ -76,6 +76,8 @@ mod nullability_soundness;
 mod params;
 #[path = "query/records.rs"]
 mod records;
+#[path = "query/refinements.rs"]
+mod refinements;
 #[path = "query/select.rs"]
 mod select;
 #[path = "query/select_rules.rs"]
