@@ -1031,14 +1031,29 @@ fn infer_expr_unlocated(
                 crate::nonnull::subst::folds_as_float(resolved_type, snapshot),
             );
             let branches: Vec<(&protobuf::Node, &ExprType)> = mm.args.iter().zip(&args).collect();
+            let mut refine = conditional::branches_refine(&branches, resolved_type, snapshot);
+            // GREATEST is at least each non-NULL argument (LEAST at most):
+            // a NOT NULL one bounds it whatever the others are.
+            if crate::refine::Exact::of(resolved_type, None, snapshot)
+                == Some(crate::refine::Exact::Int)
+            {
+                let mut range = refine.range.unwrap_or_default();
+                for a in args.iter().filter(|a| !a.nullable) {
+                    let Some(b) = a.refine.int_bounds() else {
+                        continue;
+                    };
+                    if label == "GREATEST" {
+                        range.lo = range.lo.max(b.lo);
+                    } else if let Some(hi) = b.hi {
+                        range.hi = Some(range.hi.map_or(hi, |h| h.min(hi)));
+                    }
+                }
+                refine.range = (range != crate::refine::IntRange::default()).then_some(range);
+            }
             Ok(
                 ExprType::scalar_with_typmod(resolved_type, nullable, typmod)
                     .with_collation(derive_collation(&args, resolved_type, snapshot)?)
-                    .with_refine(conditional::branches_refine(
-                        &branches,
-                        resolved_type,
-                        snapshot,
-                    )),
+                    .with_refine(refine),
             )
         }
         node::Node::AIndirection(ind) => {

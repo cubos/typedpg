@@ -419,6 +419,27 @@ let rows = sql!(pool,
 // rows[0].month : String, rows[0].day : Decimal
 ```
 
+### Values and ranges
+
+The analysis also knows which values a value can be, when few — an enum's
+labels, a `CHECK (kind IN (…))` list (on the table or a domain), what the
+`WHERE` or a `CASE` branch leaves (`WHERE kind <> 'draft'`), literals — and
+the bounds of an integer: a `CHECK (n BETWEEN 1 AND 100)` or `CHECK (VALUE >
+0)`, a `WHERE`, counts and positions (`count(*)`, `row_number()`, `length`),
+`min` / `max` and integer arithmetic. `NULLIF(x, v)` is NOT NULL when `x`
+can't be `v`, and a `CASE` covering every value a column can be has no
+`ELSE` to fall to:
+
+```rust
+// CHECK (attempts BETWEEN 0 AND 2)
+let rows = sql!(pool,
+    "SELECT total / NULLIF(row_number() OVER (), 0) AS avg,
+            CASE attempts WHEN 0 THEN 'new' WHEN 1 THEN 'retried' WHEN 2 THEN 'last' END AS stage
+     FROM jobs")
+    .fetch_all().await?;
+// rows[0].avg : i64, rows[0].stage : String
+```
+
 ### Nullability annotations
 
 Override the inferred nullability when you know better than the analyzer. Use `!` to force non-nullable and `?` to force nullable.

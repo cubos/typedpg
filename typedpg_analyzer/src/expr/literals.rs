@@ -33,12 +33,17 @@ pub(crate) fn infer_a_const(a_const: &protobuf::AConst) -> Result<ExprType, Anal
         Some(a_const::Val::Sval(s)) => crate::refine::Refinement::of_string_literal(&s.sval),
         Some(a_const::Val::Ival(i)) => crate::refine::Refinement {
             values: Some([i.ival.to_string()].into()),
+            range: Some(crate::refine::IntRange::exactly(i.ival.into())),
             ..crate::refine::Refinement::FINITE
         },
-        Some(a_const::Val::Fval(f)) if type_oid != oid::NUMERIC => crate::refine::Refinement {
-            values: crate::literal_input::parse_pg_integer(&f.fval).map(|i| [i.to_string()].into()),
-            ..crate::refine::Refinement::FINITE
-        },
+        Some(a_const::Val::Fval(f)) if type_oid != oid::NUMERIC => {
+            let int = crate::literal_input::parse_pg_integer(&f.fval);
+            crate::refine::Refinement {
+                values: int.map(|i| [i.to_string()].into()),
+                range: int.map(crate::refine::IntRange::exactly),
+                ..crate::refine::Refinement::FINITE
+            }
+        }
         Some(a_const::Val::Boolval(b)) => crate::refine::Refinement {
             values: Some([b.boolval.to_string()].into()),
             ..crate::refine::Refinement::FINITE

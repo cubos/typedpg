@@ -34,7 +34,11 @@ pub(crate) fn build_column(
         name,
         pg_type,
         nullable,
-        refinement: rc.refine,
+        // A range of a few integers lists them.
+        refinement: crate::refine::Refinement {
+            values: rc.refine.enumerated(),
+            ..rc.refine
+        },
     })
 }
 

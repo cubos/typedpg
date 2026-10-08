@@ -27,6 +27,97 @@ pub struct Refinement {
     /// literal of no type yet, as written: [`Refinement::converted`] reads
     /// it as the type its context gives it.
     pub values: Option<BTreeSet<String>>,
+    /// Of an integer, the bounds it lies within.
+    pub range: Option<IntRange>,
+}
+
+/// The bounds an integer lies within, each inclusive (`None`: unbounded).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct IntRange {
+    pub lo: Option<i128>,
+    pub hi: Option<i128>,
+}
+
+impl IntRange {
+    /// At least `lo`.
+    pub(crate) const fn at_least(lo: i128) -> IntRange {
+        IntRange {
+            lo: Some(lo),
+            hi: None,
+        }
+    }
+
+    /// Exactly `v`.
+    pub(crate) const fn exactly(v: i128) -> IntRange {
+        IntRange {
+            lo: Some(v),
+            hi: Some(v),
+        }
+    }
+
+    /// Whether `v` may be in it.
+    pub(crate) fn contains(&self, v: i128) -> bool {
+        self.lo.is_none_or(|lo| lo <= v) && self.hi.is_none_or(|hi| v <= hi)
+    }
+
+    /// The smallest range holding both.
+    pub(crate) fn hull(&self, other: &IntRange) -> IntRange {
+        IntRange {
+            lo: self.lo.zip(other.lo).map(|(a, b)| a.min(b)),
+            hi: self.hi.zip(other.hi).map(|(a, b)| a.max(b)),
+        }
+    }
+
+    /// What lies in both.
+    pub(crate) fn meet(&self, other: &IntRange) -> IntRange {
+        let pick = |a: Option<i128>, b: Option<i128>, f: fn(i128, i128) -> i128| match (a, b) {
+            (Some(a), Some(b)) => Some(f(a, b)),
+            (a, b) => a.or(b),
+        };
+        IntRange {
+            lo: pick(self.lo, other.lo, i128::max),
+            hi: pick(self.hi, other.hi, i128::min),
+        }
+    }
+
+    /// The range of `a + b`, `a - b`, `a * b` or `-a` (PG fails on an
+    /// overflow rather than wrap, so the arithmetic is exact).
+    pub(crate) fn add(&self, b: &IntRange) -> IntRange {
+        IntRange {
+            lo: self.lo.zip(b.lo).and_then(|(x, y)| x.checked_add(y)),
+            hi: self.hi.zip(b.hi).and_then(|(x, y)| x.checked_add(y)),
+        }
+    }
+
+    pub(crate) fn neg(&self) -> IntRange {
+        IntRange {
+            lo: self.hi.and_then(i128::checked_neg),
+            hi: self.lo.and_then(i128::checked_neg),
+        }
+    }
+
+    pub(crate) fn mul(&self, b: &IntRange) -> IntRange {
+        let (Some(a0), Some(a1), Some(b0), Some(b1)) = (self.lo, self.hi, b.lo, b.hi) else {
+            // Non-negative times non-negative stays non-negative.
+            let non_negative = |r: &IntRange| r.lo.is_some_and(|lo| lo >= 0);
+            return if non_negative(self) && non_negative(b) {
+                IntRange::at_least(0)
+            } else {
+                IntRange::default()
+            };
+        };
+        let products: Option<Vec<i128>> = [a0, a1]
+            .iter()
+            .flat_map(|x| [b0, b1].map(|y| x.checked_mul(y)))
+            .collect();
+        match products {
+            Some(p) => IntRange {
+                lo: p.iter().min().copied(),
+                hi: p.iter().max().copied(),
+            },
+            None => IntRange::default(),
+        }
+    }
 }
 
 impl Refinement {
@@ -34,13 +125,47 @@ impl Refinement {
     pub const NONE: Refinement = Refinement {
         finite: false,
         values: None,
+        range: None,
     };
 
     /// A finite value.
     pub const FINITE: Refinement = Refinement {
         finite: true,
         values: None,
+        range: None,
     };
+
+    /// The bounds an integer value lies within: its range, narrowed by its
+    /// values when they are integers.
+    pub fn int_bounds(&self) -> Option<IntRange> {
+        let from_values = self.values.as_ref().and_then(|vs| {
+            let ints: Option<Vec<i128>> = vs.iter().map(|v| v.parse().ok()).collect();
+            let ints = ints?;
+            Some(IntRange {
+                lo: ints.iter().min().copied(),
+                hi: ints.iter().max().copied(),
+            })
+        });
+        match (self.range, from_values) {
+            (Some(r), Some(v)) => Some(r.meet(&v)),
+            (r, v) => r.or(v),
+        }
+    }
+
+    /// Its values, or those of a range of at most [`ENUMERATED`] integers.
+    pub fn enumerated(&self) -> Option<BTreeSet<String>> {
+        if let Some(vs) = &self.values {
+            return Some(vs.clone());
+        }
+        let IntRange {
+            lo: Some(lo),
+            hi: Some(hi),
+        } = self.range?
+        else {
+            return None;
+        };
+        (hi >= lo && hi - lo < ENUMERATED).then(|| (lo..=hi).map(|v| v.to_string()).collect())
+    }
 
     /// Of a value that is one of `parts` (CASE branches, UNION arms): what
     /// every one of them is. Nothing for no part.
@@ -54,9 +179,15 @@ impl Refinement {
             .map(|p| p.values.as_ref())
             .collect::<Option<Vec<_>>>()
             .map(|sets| sets.into_iter().flatten().cloned().collect());
+        let range = parts
+            .iter()
+            .map(|p| p.range)
+            .collect::<Option<Vec<_>>>()
+            .and_then(|rs| rs.into_iter().reduce(|a, b| a.hull(&b)));
         Refinement {
             finite: parts.iter().all(|p| p.finite),
             values,
+            range,
         }
     }
 
@@ -69,6 +200,10 @@ impl Refinement {
                 (Some(a), Some(b)) => Some(a.intersection(b).cloned().collect()),
                 (a, b) => a.clone().or_else(|| b.clone()),
             },
+            range: match (self.range, other.range) {
+                (Some(a), Some(b)) => Some(a.meet(&b)),
+                (a, b) => a.or(b),
+            },
         }
     }
 
@@ -80,6 +215,7 @@ impl Refinement {
         Refinement {
             finite: !text.to_ascii_lowercase().contains("inf"),
             values: Some(BTreeSet::from([text.to_owned()])),
+            range: None,
         }
     }
 
@@ -117,7 +253,15 @@ impl Refinement {
             }
             _ => None,
         };
-        Refinement { finite, values }
+        // An integer is the same number in any integer type.
+        let ints = Exact::of(from, None, snapshot) == Some(Exact::Int)
+            && Exact::of(to, None, snapshot) == Some(Exact::Int);
+        let range = self.range.filter(|_| from == to || pseudo || ints);
+        Refinement {
+            finite,
+            values,
+            range,
+        }
     }
 }
 
@@ -190,6 +334,9 @@ fn read_bool(text: &str) -> Option<bool> {
         None
     }
 }
+
+/// The most integers a range is listed as values for.
+const ENUMERATED: i128 = 16;
 
 /// PG's `interval` type.
 const INTERVAL: PgTypeOid = PgTypeOid::from_raw(1186);
@@ -288,5 +435,69 @@ pub(crate) fn of_builtin_call(
     Refinement {
         finite: builtin && finite_preserving && args.iter().all(|a| finite_value(a, snapshot)),
         values: None,
+        range: builtin
+            .then(|| builtin_range(proc, args, snapshot))
+            .flatten(),
     }
+}
+
+/// The bounds of the integer result of `pg_catalog` function `proc` over
+/// `args`: counts and positions are never negative (`row_number` starts
+/// at 1), `min` / `max` / `lag` are an argument's value, and integer
+/// arithmetic is exact (PG fails on an overflow rather than wrap).
+fn builtin_range(
+    proc: &crate::pg_catalog::PgProc,
+    args: &[&crate::expr::ExprType],
+    snapshot: &PgCatalog,
+) -> Option<IntRange> {
+    let bounds = |i: usize| -> IntRange {
+        args.get(i)
+            .and_then(|a| {
+                (Exact::of(a.type_oid, None, snapshot) == Some(Exact::Int))
+                    .then(|| a.refine.int_bounds())
+                    .flatten()
+            })
+            .unwrap_or_default()
+    };
+    let int_result = Exact::of(proc.prorettype, None, snapshot) == Some(Exact::Int);
+    let name = proc.proname.as_str();
+    // `int4pl`, `int48mi`, `int2mul`, `int8um`, …
+    let arith = name
+        .strip_prefix("int")
+        .and_then(|rest| {
+            let digits = rest.trim_start_matches(['2', '4', '8']);
+            (rest.len() - digits.len() <= 2 && rest.len() > digits.len()).then_some(digits)
+        })
+        .filter(|_| int_result);
+    let range = match (name, arith) {
+        (_, Some("pl")) => bounds(0).add(&bounds(1)),
+        (_, Some("mi")) => bounds(0).add(&bounds(1).neg()),
+        (_, Some("mul")) => bounds(0).mul(&bounds(1)),
+        (_, Some("um")) => bounds(0).neg(),
+        ("count", _) => IntRange::at_least(0),
+        ("row_number" | "rank" | "dense_rank" | "ntile", _) => IntRange::at_least(1),
+        (
+            "length" | "char_length" | "character_length" | "octet_length" | "bit_length"
+            | "cardinality" | "num_nulls" | "num_nonnulls" | "abs",
+            _,
+        ) if int_result => IntRange::at_least(0),
+        ("array_length" | "array_ndims", _) => IntRange::at_least(1),
+        ("sum", _) => {
+            let b = bounds(0);
+            IntRange {
+                lo: b.lo.filter(|&lo| lo >= 0).map(|_| 0),
+                hi: b.hi.filter(|&hi| hi <= 0).map(|_| 0),
+            }
+        }
+        ("min" | "max" | "first_value" | "last_value" | "nth_value" | "lag" | "lead", _) => {
+            let mut b = bounds(0);
+            // `lag(x, n, default)` may be the default.
+            if args.len() >= 3 {
+                b = b.hull(&bounds(2));
+            }
+            b
+        }
+        _ => return None,
+    };
+    (range != IntRange::default()).then_some(range)
 }
