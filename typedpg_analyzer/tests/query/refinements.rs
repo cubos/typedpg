@@ -215,6 +215,13 @@ fn finiteness_travels_through_queries_and_conditionals() {
                           generate_series(now(), now() + interval '1 day', (SELECT i FROM t LIMIT 1)) h",
         &[("g", false, true), ("h", false, false)],
     );
+    // A record's field is either arm's.
+    assert_finite(
+        &db,
+        "SELECT (u.r).f2 AS a FROM (SELECT ROW(1, now()) AS r
+                                    UNION ALL SELECT ROW(2, 'infinity'::timestamptz)) u",
+        &[("a", false, false)],
+    );
     // A recursive CTE's column is finite when both arms are.
     assert_finite(
         &db,

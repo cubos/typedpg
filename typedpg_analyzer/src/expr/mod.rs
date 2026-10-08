@@ -345,6 +345,7 @@ pub(crate) fn merge_set_op_shapes(
         if union {
             ty.nullable |= r.ty.nullable;
             ty.elem_nullable = merge_elem_nullable([l.ty.elem_nullable, r.ty.elem_nullable]);
+            ty.refine = crate::refine::Refinement::either([&l.ty.refine, &r.ty.refine]);
             ty.record_fields = match (&l.ty.record_fields, &r.ty.record_fields) {
                 (None, None) => None,
                 (l, r) => merge_set_op_shapes(l.as_ref(), r.as_ref(), true),
