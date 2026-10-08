@@ -381,11 +381,20 @@ pub(crate) fn catalog_for<'c>(
     })?;
 
     // The selected database's runner setting, not the top-level one.
-    let catalog = get_or_build_pg_catalog(
+    let mut catalog = get_or_build_pg_catalog(
         &all_dirs,
         &migration_hash,
         resolved.migrations_use_transaction(),
     )?;
+    // A parameter bound from a chrono date or timestamp is never infinite.
+    let finite: Vec<typedpg_core::QualifiedName> = crate::pg_type_map::FINITE_PARAMETER_TYPES
+        .iter()
+        .map(|t| typedpg_core::QualifiedName::new("pg_catalog", *t))
+        .filter(|q| !resolved.types.contains_key(q))
+        .collect();
+    catalog
+        .assume_finite_parameters(&finite)
+        .map_err(|e| syn::Error::new(Span::call_site(), e))?;
     let missing: Vec<String> = all_dirs
         .iter()
         .filter(|d| !d.is_dir())
