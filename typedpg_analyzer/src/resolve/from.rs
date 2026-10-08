@@ -174,9 +174,16 @@ pub(crate) fn process_from_item(
                                 .is_some_and(|rc| !rc.nullable);
                         }
                     }
-                    if let Some(origins) = view_origins(snapshot, class) {
-                        for (c, o) in src.columns.iter_mut().zip(origins) {
-                            c.origin = o;
+                    if let Some(cols) = view_columns(snapshot, class) {
+                        for (c, rc) in src.columns.iter_mut().zip(cols) {
+                            c.origin = rc.origin;
+                            // Both hold: the column's type (a domain) and
+                            // what the view's query makes of it.
+                            c.elem_nullable = match (rc.elem_nullable, c.elem_nullable) {
+                                (Some(false), _) | (_, Some(false)) => Some(false),
+                                (a, b) => a.or(b),
+                            };
+                            c.refine = c.refine.and(&rc.refine);
                         }
                     }
                 } else {

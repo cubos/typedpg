@@ -87,8 +87,8 @@ pub enum Type {
         /// CHECK says `array_position(c, NULL) IS NULL`. `None` when nothing
         /// is known — the case for any other table's array column
         /// (PostgreSQL has no NOT NULL for elements), a parameter, or an
-        /// array that came through a view or most expressions (a subquery
-        /// or CTE keeps what its query knows).
+        /// array most expressions make (a subquery, CTE or view keeps what
+        /// its query knows).
         element_nullable: Option<bool>,
     },
     Enum {
