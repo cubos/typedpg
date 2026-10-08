@@ -168,6 +168,51 @@ impl Space {
         Space::default()
     }
 
+    /// The space with every value one of `values` (printed as
+    /// [`crate::refine::Refinement::values`] are): what a value refined so
+    /// can hold.
+    pub(crate) fn with_values(mut self, values: Option<&BTreeSet<String>>) -> Space {
+        let Some(values) = values else {
+            return self;
+        };
+        let kind = match self.kind {
+            SpaceKind::Int => LitKind::Integer,
+            SpaceKind::Bool => LitKind::Boolean,
+            SpaceKind::Str => LitKind::String,
+            SpaceKind::Opaque => return self,
+        };
+        let refined: Vec<Literal> = values
+            .iter()
+            .map(|v| Literal {
+                text: v.clone(),
+                kind,
+            })
+            .collect();
+        self.domain = Some(match self.domain.take() {
+            None => refined,
+            Some(d) => d
+                .into_iter()
+                .filter(|x| refined.iter().any(|v| self.same(x, v)))
+                .collect(),
+        });
+        self
+    }
+
+    /// `l` as printed in a [`crate::refine::Refinement::values`] set.
+    pub(crate) fn print(&self, l: &Literal) -> Option<String> {
+        Some(match self.value(l)? {
+            Value::Int(i) => i.to_string(),
+            Value::Bool(b) => b.to_string(),
+            Value::Str(s) => s,
+        })
+    }
+
+    /// The values a non-NULL value satisfying every one of `preds` can
+    /// hold, when finitely many (see [`Space::candidates`]).
+    pub(crate) fn candidates_of(&self, preds: &[ValPred]) -> Option<Vec<Literal>> {
+        self.candidates(preds)
+    }
+
     fn value(&self, l: &Literal) -> Option<Value> {
         match (self.kind, l.kind) {
             (SpaceKind::Int, LitKind::Integer) => l.text.parse().ok().map(Value::Int),
@@ -570,6 +615,38 @@ impl RelationChecks {
         s
     }
 
+    /// What the constraints say of column `c`'s value, non-NULL, in a row
+    /// the query knows `k` about (`None` when no row can be one).
+    pub(crate) fn column_preds(&self, c: &str, k: &Knowledge<'_>) -> Option<Vec<ValPred>> {
+        let s = self.solve(k, None);
+        if s.contradiction {
+            return None;
+        }
+        let mut preds = self.preds_of(c, k, &s);
+        // A clause whose every arm left says `c` is one of some values
+        // (`CHECK (n = 1 OR n = 2)`): one of the arms holds, so `c` is one
+        // of them all.
+        for clause in &self.clauses {
+            let per_arm: Option<Vec<&Vec<Literal>>> = clause
+                .arms
+                .iter()
+                .filter(|arm| !arm.iter().any(|l| self.refuted(l, k, &s)))
+                .map(|arm| {
+                    arm.iter().find_map(|l| match l {
+                        Lit::Val(col, ValPred::In(vs)) if col == c => Some(vs),
+                        _ => None,
+                    })
+                })
+                .collect();
+            if let Some(sets) = per_arm
+                && !sets.is_empty()
+            {
+                preds.push(ValPred::In(sets.into_iter().flatten().cloned().collect()));
+            }
+        }
+        Some(preds)
+    }
+
     /// Everything known of column `c`'s value when non-NULL.
     fn preds_of(&self, c: &str, k: &Knowledge<'_>, s: &Solved) -> Vec<ValPred> {
         let mut preds = (k.preds)(c);
@@ -798,6 +875,52 @@ pub(crate) fn finite_column(n: &protobuf::Node, trust: &impl Trust) -> Option<St
         .trusts(f.location, StrictNode::IsFinite)
         .then(|| column_name(arg))
         .flatten()
+}
+
+/// The values a constraint expression allows its column `c`, of type `t`
+/// under `collation`, when non-NULL and few: what its conjuncts that are
+/// `c = v`, `c IN (…)` or an OR of them (built-in comparisons with
+/// constants, see [`dnf`]) leave of the type's. `None` when the type
+/// doesn't print values as they compare ([`crate::refine::Exact`]).
+pub(crate) fn allowed_values(
+    expr: &protobuf::Node,
+    c: &str,
+    t: PgTypeOid,
+    collation: Option<crate::oid::PgCollationOid>,
+    snapshot: &PgCatalog,
+    trust: &TrustedNodes,
+) -> Option<BTreeSet<String>> {
+    crate::refine::Exact::of(t, collation, snapshot)?;
+    let is_composite = |_: &str| false;
+    let column_type = |n: &str| (n == c).then_some(t);
+    let cx = Cx {
+        is_composite: &is_composite,
+        column_type: &column_type,
+        snapshot,
+        trust,
+    };
+    let space = Space::of(t, collation, snapshot);
+    let mut preds = Vec::new();
+    for conjunct in conjuncts(expr) {
+        let Some(arms) = dnf(conjunct, true, &cx) else {
+            continue;
+        };
+        // Every arm says `c` is one of some values: it is one of them all.
+        let per_arm: Option<Vec<&Vec<Literal>>> = arms
+            .iter()
+            .map(|arm| {
+                arm.iter().find_map(|l| match l {
+                    Lit::Val(col, ValPred::In(vs)) if col == c => Some(vs),
+                    _ => None,
+                })
+            })
+            .collect();
+        if let Some(sets) = per_arm {
+            preds.push(ValPred::In(sets.into_iter().flatten().cloned().collect()));
+        }
+    }
+    let cands = space.candidates(&preds)?;
+    cands.iter().map(|l| space.print(l)).collect()
 }
 
 /// The columns a constraint expression keeps finite (see [`finite_column`]).

@@ -294,8 +294,30 @@ impl PgCatalog {
     /// The refinement every value of type `oid` has: a domain of its chain
     /// has a CHECK keeping it finite (see [`Self::domain_null_free_elements`]).
     pub(crate) fn domain_refinement(&self, oid: PgTypeOid) -> crate::refine::Refinement {
+        let mut values: Option<std::collections::BTreeSet<String>> = None;
+        for d in self.domain_chain(oid) {
+            // Under a nondeterministic collation, `VALUE IN ('a')` lets
+            // `'A'` through.
+            let collation = self.pg_type.get(&d).and_then(|t| t.typcollation);
+            if crate::refine::Exact::of(d, collation, self).is_none() {
+                continue;
+            }
+            for allowed in self
+                .domain_constraints
+                .get(&d)
+                .into_iter()
+                .flatten()
+                .filter_map(|c| c.values.as_ref())
+            {
+                values = Some(match values {
+                    None => allowed.clone(),
+                    Some(v) => v.intersection(allowed).cloned().collect(),
+                });
+            }
+        }
         crate::refine::Refinement {
             finite: self.domain_check_says(oid, |c| c.finite),
+            values,
         }
     }
 

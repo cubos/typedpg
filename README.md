@@ -312,8 +312,9 @@ let rows = sql!(pool, "SELECT done_at FROM tasks WHERE status IN ('done')")
 // rows[0].done_at : OffsetDateTime
 
 // A CASE without ELSE is NOT NULL when its WHENs cover every value: an
-// enum's labels, a CHECK (kind IN (…)) list, both booleans, IS NULL and
-// IS NOT NULL, `a > 0` and `a <= 0`
+// enum's labels, a CHECK (kind IN (…)) list (on the table or a domain), both
+// booleans, the values a subquery or CTE column is known to hold (a CASE of
+// literals), IS NULL and IS NOT NULL, `a > 0` and `a <= 0`
 let rows = sql!(pool, "SELECT CASE status WHEN 'open' THEN 1 WHEN 'closed' THEN 2 END AS n FROM tickets")
     .fetch_all().await?;
 // rows[0].n : i32  (status is a NOT NULL enum ('open', 'closed'))

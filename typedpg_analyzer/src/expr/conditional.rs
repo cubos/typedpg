@@ -518,9 +518,12 @@ pub(crate) fn infer_case(
                 .columns
                 .iter()
                 .find(|sc| sc.name == c.1)?;
+            // A column refined to a few values (a CTE's `CASE … THEN 'a'
+            // … THEN 'b' END`) holds no other.
             Some((
                 col.base_not_null,
-                crate::nonnull::checks::Space::of(col.type_oid, col.collation, snapshot),
+                crate::nonnull::checks::Space::of(col.type_oid, col.collation, snapshot)
+                    .with_values(col.refine.values.as_ref()),
             ))
         };
         null_ctx.unreachable(&column)

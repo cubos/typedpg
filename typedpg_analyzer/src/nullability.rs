@@ -773,6 +773,28 @@ impl NullabilityContext {
         })
     }
 
+    /// The values column `c` (whose values compare as `space` says) can
+    /// hold where it is read, when they are few and known: what the
+    /// conditions on it (`WHERE kind IN ('a', 'b')`, a CASE branch's WHEN,
+    /// an ON) and its table's CHECK constraints leave of what its type (an
+    /// enum's labels, `true` / `false`) or refinement allows.
+    pub fn candidates(&self, c: &Col, space: &Space) -> Option<Vec<Literal>> {
+        let mut preds = if crate::nonnull::disabled() {
+            Vec::new()
+        } else {
+            self.preds_at(Level::Local, c)
+        };
+        if !crate::nonnull::disabled()
+            && let Some(entry) = self.checks.iter().find(|e| e.alias == c.0)
+            && !entry.checks.contradict_alone(&entry.base_not_null)
+            && let Some(more) =
+                self.with_local_knowledge(entry, |k| entry.checks.column_preds(&c.1, k))
+        {
+            preds.extend(more);
+        }
+        space.candidates_of(&preds)
+    }
+
     /// Whether no row can be what holds where a value is read: a CASE's
     /// ELSE after WHENs that cover every case (`CASE WHEN a IS NULL … WHEN
     /// a IS NOT NULL …`, every label of an enum, every value a CHECK

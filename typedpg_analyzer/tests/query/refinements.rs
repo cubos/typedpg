@@ -254,3 +254,174 @@ fn a_finite_value_formats_and_extracts_to_non_null() {
         ],
     );
 }
+
+// ── Value sets ───────────────────────────────────────────────────────────────
+
+fn values_setup() -> PgCatalog {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy');
+         CREATE DOMAIN ab AS text CHECK (VALUE IN ('a', 'b'));
+         CREATE DOMAIN a_of_ab AS ab CHECK (VALUE = 'a' OR VALUE = 'c');
+         CREATE TABLE v (id int PRIMARY KEY, kind text NOT NULL CHECK (kind IN ('a', 'b')),
+                         m mood NOT NULL, n int NOT NULL CHECK (n = 1 OR n = 2),
+                         flag bool, free text, padded char(3) CHECK (padded IN ('a')),
+                         amount numeric CHECK (amount IN (1, 2)), d ab, e a_of_ab);",
+    )
+    .unwrap();
+    db
+}
+
+/// Each column's (name, value set).
+#[track_caller]
+fn assert_values(db: &PgCatalog, sql: &str, expected: &[(&str, Option<&[&str]>)]) {
+    let s = db.analyze(sql).unwrap();
+    let actual: Vec<(&str, Option<Vec<&str>>)> = s
+        .columns
+        .iter()
+        .map(|c| {
+            (
+                c.name.as_str(),
+                c.refinement
+                    .values
+                    .as_ref()
+                    .map(|vs| vs.iter().map(String::as_str).collect()),
+            )
+        })
+        .collect();
+    let expected: Vec<(&str, Option<Vec<&str>>)> = expected
+        .iter()
+        .map(|(n, v)| (*n, v.map(<[&str]>::to_vec)))
+        .collect();
+    assert_eq!(actual, expected, "value sets mismatch for `{sql}`");
+}
+
+#[test]
+fn a_column_holds_what_its_type_and_checks_allow() {
+    let db = values_setup();
+    assert_values(
+        &db,
+        "SELECT kind, n, m, flag, free, padded, amount, d, e FROM v",
+        &[
+            ("kind", Some(&["a", "b"])),
+            ("n", Some(&["1", "2"])),
+            ("m", Some(&["happy", "ok", "sad"])),
+            ("flag", Some(&["false", "true"])),
+            ("free", None),
+            // `char(3)` stores `'a  '`; `numeric` 1 may be `1.0`.
+            ("padded", None),
+            ("amount", None),
+            ("d", Some(&["a", "b"])),
+            ("e", Some(&["a"])),
+        ],
+    );
+}
+
+#[test]
+fn conditions_narrow_a_column_where_it_is_read() {
+    let db = values_setup();
+    assert_values(
+        &db,
+        "SELECT kind, m, free FROM v WHERE kind = 'a' AND m <> 'sad' AND free IN ('x', 'y')",
+        &[
+            ("kind", Some(&["a"])),
+            ("m", Some(&["happy", "ok"])),
+            ("free", Some(&["x", "y"])),
+        ],
+    );
+    assert_values(
+        &db,
+        "SELECT CASE WHEN kind = 'a' THEN kind END AS a, CASE m WHEN 'ok' THEN m END AS b FROM v",
+        &[("a", Some(&["a"])), ("b", Some(&["ok"]))],
+    );
+}
+
+#[test]
+fn literals_and_conditionals_have_their_values() {
+    let db = values_setup();
+    assert_values(
+        &db,
+        "SELECT 'x' AS a, 1 AS b, CASE WHEN n = 1 THEN 'one' ELSE 'two' END AS c,
+                CASE WHEN n = 1 THEN 'one' END AS d, CASE WHEN n = 1 THEN 'one' ELSE free END AS e,
+                coalesce(free, 'none') AS f, true AS g, 1::int8 AS h, ' 07'::int AS i,
+                'yes'::bool AS j, 1.5 AS k, 'abc'::varchar(2) AS l, coalesce(d, 'b') AS o
+         FROM v",
+        &[
+            ("a", Some(&["x"])),
+            ("b", Some(&["1"])),
+            ("c", Some(&["one", "two"])),
+            ("d", Some(&["one"])),
+            ("e", None),
+            ("f", None),
+            ("g", Some(&["true"])),
+            ("h", Some(&["1"])),
+            ("i", Some(&["7"])),
+            ("j", Some(&["true"])),
+            ("k", None),
+            ("l", None),
+            ("o", Some(&["a", "b"])),
+        ],
+    );
+    assert_values(
+        &db,
+        "SELECT 'a' AS x UNION ALL SELECT 'b' UNION ALL SELECT kind FROM v",
+        &[("x", Some(&["a", "b"]))],
+    );
+    assert_values(
+        &db,
+        "SELECT 'a' AS x UNION ALL SELECT free FROM v",
+        &[("x", None)],
+    );
+    assert_values(
+        &db,
+        "SELECT (u.r).f2 AS x FROM (SELECT ROW(1, 'x'::text) AS r
+                                    UNION ALL SELECT ROW(2, 'y'::text)) u",
+        &[("x", Some(&["x", "y"]))],
+    );
+    assert_values(
+        &db,
+        "SELECT free::ab AS a, free::a_of_ab AS b FROM v",
+        &[("a", Some(&["a", "b"])), ("b", Some(&["a"]))],
+    );
+}
+
+#[test]
+fn a_case_over_a_refined_column_can_cover_every_value() {
+    let db = values_setup();
+    let s = db
+        .analyze(
+            "WITH c AS (SELECT CASE WHEN n = 1 THEN 'one' ELSE 'two' END AS w FROM v)
+             SELECT w, CASE w WHEN 'one' THEN 1 WHEN 'two' THEN 2 END AS x,
+                    CASE w WHEN 'one' THEN 1 END AS y
+             FROM c WHERE w <> 'three'",
+        )
+        .unwrap();
+    let got: Vec<(&str, bool)> = s
+        .columns
+        .iter()
+        .map(|c| (c.name.as_str(), c.nullable))
+        .collect();
+    assert_eq!(got, [("w", false), ("x", false), ("y", true)]);
+    assert_eq!(
+        s.columns[0].refinement.values,
+        Some(["one".to_owned(), "two".to_owned()].into())
+    );
+}
+
+#[test]
+fn a_nondeterministic_collation_lets_other_spellings_through() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE COLLATION ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false);
+         CREATE DOMAIN ci_ab AS text COLLATE ci CHECK (VALUE IN ('a', 'b'));
+         CREATE TABLE c (x text COLLATE ci CHECK (x IN ('a', 'b')), y ci_ab,
+                         z text CHECK (z IN ('a', 'b')));",
+    )
+    .unwrap();
+    // `'A'` passes `IN ('a', 'b')` under `ci`.
+    assert_values(
+        &db,
+        "SELECT x, y, z FROM c WHERE x = 'a'",
+        &[("x", None), ("y", None), ("z", Some(&["a", "b"]))],
+    );
+}
