@@ -156,6 +156,17 @@ pub(crate) fn infer_func_call(
                 && snapshot.namespace_name(p.pronamespace) == Some("pg_catalog")
         }),
     );
+    // `array_position(a, NULL)` as a CHECK keeping NULL elements out reads
+    // it: the built-in one.
+    ctx.note_strict(
+        func.location,
+        crate::nonnull::StrictNode::ArrayPosition,
+        snapshot.pg_proc.get(&resolved.oid).is_some_and(|p| {
+            p.proname == "array_position"
+                && p.proargtypes.len() == 2
+                && snapshot.namespace_name(p.pronamespace) == Some("pg_catalog")
+        }),
+    );
     for (&actual, &declared) in args.types.iter().zip(&resolved.arg_types) {
         ctx.note_coercion(actual, declared);
     }
@@ -257,7 +268,18 @@ pub(crate) fn infer_func_call(
         collation,
         explicit_collation,
         record_fields,
-        elem_nullable: builtin_array_elem_nullable(func, &resolved, &args),
+        // A function declared to return a domain whose CHECK keeps NULL
+        // elements out: its result is coerced to the domain.
+        elem_nullable: if snapshot
+            .pg_proc
+            .get(&resolved.oid)
+            .is_some_and(|p| p.prorettype == resolved.return_type_oid)
+            && snapshot.domain_null_free_elements(resolved.return_type_oid)
+        {
+            Some(false)
+        } else {
+            builtin_array_elem_nullable(func, &resolved, &args)
+        },
     })
 }
 

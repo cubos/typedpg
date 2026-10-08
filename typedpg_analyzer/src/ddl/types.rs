@@ -219,6 +219,9 @@ pub(crate) struct DomainConstraint {
     /// NULL fails it: a NOT NULL, or a CHECK that is FALSE for a NULL
     /// `VALUE` (`CHECK (VALUE IS NOT NULL)`).
     pub(crate) rejects_null: bool,
+    /// A CHECK keeping NULL elements out of the array `VALUE` is
+    /// (`CHECK (array_position(VALUE, NULL) IS NULL)`).
+    pub(crate) null_free_elements: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -241,6 +244,7 @@ fn add_domain_constraint(
 ) -> Result<(), DdlError> {
     let mut refs = Vec::new();
     let mut rejects_null = false;
+    let mut null_free_elements = false;
     let kind = match ConstrType::try_from(c.contype) {
         Ok(ConstrType::ConstrNotnull) => {
             rejects_null = true;
@@ -248,7 +252,8 @@ fn add_domain_constraint(
         }
         Ok(ConstrType::ConstrCheck) => {
             if let Some(expr) = c.raw_expr.as_deref() {
-                (refs, rejects_null) = check_domain_check_expression(interp, base_type, expr)?;
+                (refs, rejects_null, null_free_elements) =
+                    check_domain_check_expression(interp, base_type, expr)?;
             }
             DomainConstraintKind::Check
         }
@@ -296,6 +301,7 @@ fn add_domain_constraint(
         kind,
         refs,
         rejects_null,
+        null_free_elements,
     });
     Ok(())
 }
@@ -326,12 +332,14 @@ fn record_domain_constraint_dependencies(
 
 /// A domain CHECK expression sees `VALUE` as a value of the base type and
 /// must yield boolean (`domainAddCheckConstraint`). Returns what it refers
-/// to, and whether it is FALSE for a NULL `VALUE` (see [`crate::nonnull::subst`]).
+/// to, whether it is FALSE for a NULL `VALUE` (see [`crate::nonnull::subst`])
+/// and whether it keeps NULL elements out of an array `VALUE` (see
+/// [`crate::nonnull::checks::null_free_arrays`]).
 fn check_domain_check_expression(
     interp: &PgCatalog,
     base_type: PgTypeOid,
     expr: &typedpg_pg_query::protobuf::Node,
-) -> Result<(Vec<super::depend::Reference>, bool), DdlError> {
+) -> Result<(Vec<super::depend::Reference>, bool, bool), DdlError> {
     use crate::expr::{TypeGoal, infer_expr};
     use crate::nullability::NullabilityContext;
     use crate::param_collector::ParamCollector;
@@ -404,7 +412,10 @@ fn check_domain_check_expression(
     }
     .eval(expr)
         == crate::nonnull::subst::Val::Bool(false);
-    Ok((refs, rejects_null))
+    let null_free_elements = crate::nonnull::checks::null_free_arrays(expr, &log)
+        .iter()
+        .any(|c| c == "value");
+    Ok((refs, rejects_null, null_free_elements))
 }
 
 // ─── ALTER DOMAIN ───────────────────────────────────────────────────────────

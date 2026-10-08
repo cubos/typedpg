@@ -736,6 +736,72 @@ fn learn(s: &mut Solved, l: &Lit) -> bool {
     }
 }
 
+/// The array columns of relation `relid` an enforced CHECK constraint keeps
+/// NULL elements out of (see [`null_free_arrays`]). A `NO INHERIT` one is
+/// skipped when the relation has children, as in [`RelationChecks::of`].
+pub(crate) fn null_free_array_columns(snapshot: &PgCatalog, relid: PgClassOid) -> HashSet<String> {
+    let has_children = snapshot.pg_inherits.iter().any(|i| i.inhparent == relid);
+    let untrusted = TrustedNodes::default();
+    let mut out = HashSet::new();
+    for con in snapshot.pg_constraint.values().filter(|c| {
+        c.conrelid == relid && c.contype == crate::pg_catalog::ConType::Check && c.conenforced
+    }) {
+        let Some(def) = snapshot.check_defs.get(&con.oid) else {
+            continue;
+        };
+        if def.no_inherit && has_children {
+            continue;
+        }
+        let crate::ddl::tables::check_inherit::StoredExpr::Written(expr) = &def.expr else {
+            continue;
+        };
+        out.extend(null_free_arrays(
+            expr,
+            def.trusted.as_ref().unwrap_or(&untrusted),
+        ));
+    }
+    out
+}
+
+/// The columns a constraint expression says hold no NULL element: a
+/// top-level conjunct `array_position(c, NULL) IS NULL`, with the built-in
+/// `array_position`. The test is never NULL, so not FALSE is TRUE: the
+/// search found no NULL — `c` is NULL, or a one-dimensional array (a
+/// multidimensional one fails the search) none of whose elements is.
+pub(crate) fn null_free_arrays(expr: &protobuf::Node, trust: &impl Trust) -> Vec<String> {
+    let is_null_const = |n: &protobuf::Node| match n.node.as_ref() {
+        Some(node::Node::AConst(c)) => c.isnull,
+        Some(node::Node::TypeCast(tc)) => tc
+            .arg
+            .as_deref()
+            .and_then(|a| a.node.as_ref())
+            .is_some_and(|a| matches!(a, node::Node::AConst(c) if c.isnull)),
+        _ => false,
+    };
+    conjuncts(expr)
+        .into_iter()
+        .filter_map(|n| {
+            let Some(node::Node::NullTest(t)) = n.node.as_ref() else {
+                return None;
+            };
+            if protobuf::NullTestType::try_from(t.nulltesttype)
+                != Ok(protobuf::NullTestType::IsNull)
+            {
+                return None;
+            }
+            let Some(node::Node::FuncCall(f)) = t.arg.as_deref()?.node.as_ref() else {
+                return None;
+            };
+            let [array, needle] = f.args.as_slice() else {
+                return None;
+            };
+            (trust.trusts(f.location, StrictNode::ArrayPosition) && is_null_const(needle))
+                .then(|| column_name(array))
+                .flatten()
+        })
+        .collect()
+}
+
 /// The constraint partition `relid`'s bound and its ancestors' put on its
 /// rows (`get_qual_from_partbound`), and — for a partitioned table — what
 /// every one of its partitions' bounds does.
