@@ -1,0 +1,38 @@
+[package]
+name = "typedpg_ts"
+version.workspace = true
+edition.workspace = true
+rust-version = "1.97"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "TypeScript code generator for typedpg: types SQL queries in .ts sources"
+publish = false
+
+[[bin]]
+name = "typedpg"
+path = "src/main.rs"
+
+[dependencies]
+typedpg_analyzer = { path = "../typedpg_analyzer", version = "0.4.0" }
+typedpg_core = { path = "../typedpg_core", version = "0.4.0" }
+typedpg = { path = "../typedpg", version = "0.4.0", default-features = false }
+typedpg_cli = { path = "../typedpg_cli", version = "0.4.0" }
+tokio = { version = "1", features = ["rt", "macros"] }
+dotenvy = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+clap = { version = "4", features = ["derive"] }
+sha2 = "0.11"
+notify = "8"
+oxc_parser = "0.153"
+oxc_ast = "0.153"
+oxc_ast_visit = "0.153"
+oxc_semantic = "0.153"
+oxc_allocator = "0.153"
+oxc_span = "0.153"
+oxc_resolver = "11.24"
+
+[dev-dependencies]
+tempfile = "3"

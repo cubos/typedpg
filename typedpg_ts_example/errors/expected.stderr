@@ -1,0 +1,13 @@
+src/bad.ts:12:25: error: column "nmae" does not exist
+  ╭────
+1 │ SELECT id, nmae FROM users
+  ·            ──┬─
+  ·              ╰─ column does not exist
+  ╰────
+  help: Perhaps you meant to reference the column "users.name".
+src/bad.ts:24:13: error: the query passed to sql() must be a string literal, for typedpg to analyze it
+src/bad.ts:26:13: error: positional placeholder `$1` is not supported in sql(): name the parameter (e.g. `$id`) so it can be bound
+src/bad.ts:30:13: error: anonymous record-typed query parameters are not supported — pass the fields individually using a ROW(...) constructor in SQL
+src/bad.ts:32:13: error: duplicate column name "id" in the query's output: a row object has one property per name, so give the columns distinct names (`AS ...`)
+src/bad.ts:40:16: error: column "nope" of relation "users" does not exist
+src/bad.ts:44:9: error: sql is called as a function, not as a template tag: sql(`...`)

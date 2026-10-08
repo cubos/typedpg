@@ -2743,6 +2743,70 @@ fn migrations_the_runner_wraps_in_a_transaction() {
 }
 
 #[test]
+fn migrations_the_runner_runs_one_statement_at_a_time() {
+    // A migration the runner doesn't wrap — `-- no-transaction`, or
+    // `use_transaction` off — is sent one statement at a time
+    // (`execute_each`): each statement is a transaction of its own, so the
+    // statements that refuse a transaction block run, even several of them.
+    let runner = |use_transaction: bool, sql: &str| {
+        let mut db = PgCatalog::new().unwrap();
+        db.skip_pg_sanity();
+        db.set_migrations_use_transaction(use_transaction);
+        db.apply_sql("CREATE TABLE t (a int); CREATE TYPE e AS ENUM ('a');")
+            .unwrap();
+        db.apply_sql(sql).map(|()| db)
+    };
+    runner(
+        true,
+        "-- no-transaction\nCREATE INDEX CONCURRENTLY i1 ON t (a);\nCREATE INDEX CONCURRENTLY i2 ON t (a);",
+    )
+    .unwrap();
+    runner(
+        false,
+        "SELECT 1; CREATE INDEX CONCURRENTLY ON t (a); VACUUM t;",
+    )
+    .unwrap();
+    // A label added by one statement is committed for the next.
+    runner(
+        true,
+        "-- no-transaction\nALTER TYPE e ADD VALUE 'b'; SELECT 'b'::e;",
+    )
+    .unwrap();
+    let Err(err) = runner(true, "ALTER TYPE e ADD VALUE 'b'; SELECT 'b'::e;") else {
+        panic!("a label added in the runner's transaction was usable in it");
+    };
+    assert!(
+        err.to_string()
+            .starts_with("unsafe use of new value \"b\" of enum type e"),
+        "got: {err}"
+    );
+    // An explicit block still spans the statements it covers.
+    let db = runner(
+        false,
+        "BEGIN; CREATE TABLE u (a int); ROLLBACK; CREATE TABLE v (a int);",
+    )
+    .unwrap();
+    assert!(db.resolve_table(None, "u").is_none());
+    assert!(db.resolve_table(None, "v").is_some());
+    // Each statement alone is outside any block.
+    for (sql, msg) in [
+        (
+            "-- no-transaction\nLOCK TABLE t;",
+            "LOCK TABLE can only be used in transaction blocks",
+        ),
+        (
+            "-- no-transaction\nSELECT 1; SAVEPOINT a;",
+            "SAVEPOINT can only be used in transaction blocks",
+        ),
+    ] {
+        let Err(err) = runner(true, sql) else {
+            panic!("{sql} ran");
+        };
+        assert!(err.to_string().starts_with(msg), "{sql}\n  got: {err}");
+    }
+}
+
+#[test]
 fn rename_constraint_needs_a_free_name() {
     // PG 18 RenameConstraintById / RenameRelationInternal /
     // get_domain_constraint_oid.

@@ -561,11 +561,23 @@ async fn ensure_table(client: &Client, config: &MigrationsConfig) -> Result<(), 
     Ok(())
 }
 
+/// Take the runner's advisory lock, polling `pg_try_advisory_lock` rather
+/// than waiting in `pg_advisory_lock`: a session waiting inside a statement
+/// is a transaction the holder's `CREATE INDEX CONCURRENTLY` waits for in
+/// turn, which PG reports as a deadlock (and kills one of the two).
 async fn acquire_lock(client: &Client, config: &MigrationsConfig) -> Result<(), crate::Error> {
-    client
-        .execute("SELECT pg_advisory_lock($1)", &[&config.lock_id])
-        .await?;
-    Ok(())
+    let mut delay = std::time::Duration::from_millis(20);
+    loop {
+        let locked: bool = client
+            .query_one("SELECT pg_try_advisory_lock($1)", &[&config.lock_id])
+            .await?
+            .get(0);
+        if locked {
+            return Ok(());
+        }
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(std::time::Duration::from_millis(500));
+    }
 }
 
 async fn release_lock(client: &Client, config: &MigrationsConfig) -> Result<(), crate::Error> {

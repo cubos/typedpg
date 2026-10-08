@@ -1,0 +1,5 @@
+src/db.ts(6,59): error TS6196: 'JsonPath' is declared but never used.
+src/db.ts(10,16): error TS2344: Type 'string' does not satisfy the constraint 'Date'.
+src/db.ts(13,16): error TS2344: Type 'string' does not satisfy the constraint 'readonly number[]'.
+src/db.ts(16,16): error TS2741: Property 'number' is missing in type 'ShortAddress' but required in type '{ readonly street: string | null; readonly number: number | null; }'.
+src/db.ts(17,16): error TS2344: Type 'UserId' does not satisfy the constraint 'bigint'.

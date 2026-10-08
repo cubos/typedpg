@@ -1332,6 +1332,10 @@ fn validate_on_conflict_target(
         protobuf::Node::decode(ast.ast.as_slice()).ok()
     };
 
+    let types = predtest::Types {
+        snapshot,
+        table: table_oid,
+    };
     let index_matches = snapshot.pg_index.values().any(|idx| {
         // A WITHOUT OVERLAPS key is unique but really an exclusion
         // constraint: inference skips it, and invalid indexes too.
@@ -1361,7 +1365,7 @@ fn validate_on_conflict_target(
             return false;
         }
         let pred = idx.indpred.as_ref().and_then(decode);
-        predtest::predicate_implied_by(pred.as_ref(), where_clause.as_ref())
+        predtest::predicate_implied_by(pred.as_ref(), where_clause.as_ref(), &types)
     });
     // Constraint-backed keys, for catalogs whose constraints carry no
     // pg_index row (and so no collations or operator classes to match).

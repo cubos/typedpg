@@ -373,11 +373,13 @@ pub struct PgCatalog {
     /// (PL/pgSQL compilation). `None` outside `apply_sql`.
     pub(crate) statement_sql: Option<String>,
     pub(crate) in_migration: bool,
-    /// The migration runner wraps each migration in a transaction of its
-    /// own (`use_transaction`), unless the file opts out with
-    /// `-- no-transaction`. Off by default: each migration is then sent as
-    /// a bare simple query, as `batch_execute` alone does.
-    pub(crate) migrations_use_transaction: bool,
+    /// How migrations are run. `None` (the default): each is sent as one
+    /// bare simple query, as `batch_execute` alone does — what the
+    /// `pg_sanity` mirror does. `Some(use_transaction)`: as the migration
+    /// runner runs them — in a transaction of its own when
+    /// `use_transaction`, unless the file opts out with `-- no-transaction`,
+    /// and otherwise one statement at a time.
+    pub(crate) migration_runner: Option<bool>,
     /// `ON COMMIT DROP` temporary tables of the current transaction.
     pub(crate) on_commit_drop: Shared<Vec<PgClassOid>>,
     /// Materialized views created or refreshed WITH NO DATA.
@@ -719,7 +721,7 @@ impl PgCatalog {
             relpersistence: Shared::default(),
             temp_namespace: None,
             in_migration: false,
-            migrations_use_transaction: false,
+            migration_runner: None,
             statement_sql: None,
             on_commit_drop: Shared::default(),
             unpopulated_matviews: Shared::default(),
@@ -1038,6 +1040,13 @@ impl PgCatalog {
         crate::ddl::serialize_subnode(self, &select, crate::ddl::views::extract_where)
     }
 
+    /// The [`Type`] a value of the type `name` is described as, or `None`
+    /// when there is no such type.
+    pub fn type_named(&self, name: &crate::QualifiedName) -> Option<crate::Type> {
+        let t = self.resolve_type_by_name(Some(&name.schema), &name.name)?;
+        crate::resolve::column_type(t.oid, None, None, self).ok()
+    }
+
     /// Analyze a SQL query template against this catalog.
     ///
     /// Lexes `sql` to extract named parameters (`$name`), spreads (`$..name`),
@@ -1053,6 +1062,24 @@ impl PgCatalog {
         }
 
         result
+    }
+
+    /// [`Self::analyze`], with an error's location: the byte offset in `sql`
+    /// its diagnostic points at, when it has one. For tools that report the
+    /// error in the file the query is written in.
+    pub fn analyze_located(&self, sql: &str) -> Result<AnalyzedQuery, LocatedError> {
+        crate::diagnostic::clear_last_primary();
+        self.analyze(sql).map_err(LocatedError::new)
+    }
+
+    /// [`Self::analyze_copy_in`], with an error's location in `target`, as
+    /// [`Self::analyze_located`].
+    pub fn analyze_copy_in_located(
+        &self,
+        target: &str,
+    ) -> Result<crate::AnalyzedCopyIn, LocatedError> {
+        crate::diagnostic::clear_last_primary();
+        self.analyze_copy_in(target).map_err(LocatedError::new)
     }
 
     /// Inner analyze that also returns the rewritten SQL handed to the
@@ -1275,13 +1302,15 @@ impl PgCatalog {
         }
     }
 
-    /// Whether the migration runner wraps each migration in a transaction
-    /// (its `use_transaction` setting; off by default). A wrapped migration
-    /// runs in an explicit transaction block — savepoints work, statements
-    /// that can't run in a block fail — while an unwrapped one runs as a
-    /// bare simple query.
+    /// Apply migrations as the migration runner does, with its
+    /// `use_transaction` setting: a wrapped migration runs in an explicit
+    /// transaction block — savepoints work, statements that can't run in a
+    /// block fail — while one the runner doesn't wrap (`use_transaction`
+    /// off, or `-- no-transaction` on its first line) runs one statement at
+    /// a time, each committing on its own. Without this call, a migration
+    /// runs as one bare simple query.
     pub fn set_migrations_use_transaction(&mut self, use_transaction: bool) {
-        self.migrations_use_transaction = use_transaction;
+        self.migration_runner = Some(use_transaction);
     }
 
     /// A copy of the catalog to roll back to: the state a transaction or a
@@ -1833,4 +1862,19 @@ fn default_languages() -> HashMap<PgLanguageOid, PgLanguage> {
 /// setting.
 fn default_search_path() -> String {
     "\"$user\", public".to_owned()
+}
+
+/// An [`AnalyzeError`] and where in the analyzed text it is.
+#[derive(Debug)]
+pub struct LocatedError {
+    pub error: AnalyzeError,
+    /// The byte offset in the analyzed text the diagnostic points at.
+    pub offset: Option<usize>,
+}
+
+impl LocatedError {
+    fn new(error: AnalyzeError) -> Self {
+        let offset = crate::diagnostic::primary_offset_of(&error.to_string());
+        LocatedError { error, offset }
+    }
 }

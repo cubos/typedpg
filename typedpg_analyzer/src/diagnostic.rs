@@ -24,8 +24,33 @@
 //! offsets are translated from the post-lex SQL back into the original SQL
 //! via the lexer's offset map.
 
+use std::cell::RefCell;
+
 use crate::error::{RawError, SourceSpan};
 use crate::param::LexOutput;
+
+thread_local! {
+    /// The last diagnostic [`render`] produced with a primary location: the
+    /// rendered text and the location's byte offset in the original SQL,
+    /// for [`crate::PgCatalog::analyze_located`].
+    static LAST_PRIMARY: RefCell<Option<(String, usize)>> = const { RefCell::new(None) };
+}
+
+/// Forget the last rendered location.
+pub(crate) fn clear_last_primary() {
+    LAST_PRIMARY.with(|slot| *slot.borrow_mut() = None);
+}
+
+/// The byte offset in the original SQL of the primary location of the
+/// error that rendered to `rendered`, if it was the last one rendered.
+pub(crate) fn primary_offset_of(rendered: &str) -> Option<usize> {
+    LAST_PRIMARY.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .filter(|(text, _)| text == rendered)
+            .map(|(_, offset)| *offset)
+    })
+}
 
 /// Render a `RawError` into the final multi-line diagnostic string.
 pub(crate) fn render(
@@ -34,10 +59,14 @@ pub(crate) fn render(
     sql_original: &str,
     lex_output: &LexOutput,
 ) -> String {
-    let primary = raw.primary.as_ref().and_then(|l| {
-        span_to_position(translate(l.span, lex_output), sql_original)
-            .map(|p| (p, l.message.as_str()))
-    });
+    let primary_span = raw.primary.as_ref().map(|l| translate(l.span, lex_output));
+    let primary = raw
+        .primary
+        .as_ref()
+        .zip(primary_span)
+        .and_then(|(l, span)| {
+            span_to_position(span, sql_original).map(|p| (p, l.message.as_str()))
+        });
 
     let secondaries: Vec<(Position, &str)> = raw
         .secondaries
@@ -109,6 +138,9 @@ pub(crate) fn render(
 
     out.push_str(&format!("{gutter_pad} ╰────\n"));
     push_trailer(&mut out, raw);
+    if let (Some(span), Some(_)) = (primary_span, &primary) {
+        LAST_PRIMARY.with(|slot| *slot.borrow_mut() = Some((out.clone(), span.start)));
+    }
     out
 }
 

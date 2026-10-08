@@ -3,8 +3,13 @@
 //! clause: the index predicate must be implied by the ON CONFLICT WHERE.
 //!
 //! Both sides are raw ASTs over the single target relation, compared after
-//! dropping column qualifiers. Proven, like PG:
-//! - AND / OR structure (`predicate_implied_by_recurse`);
+//! dropping column qualifiers. Each comparison's operands are typed as PG
+//! types them (see [`normalize`]), so an implicit cast and the explicit one
+//! compare equal, as `equal()` ignores how a coercion was written. Proven,
+//! like PG:
+//! - AND / OR structure (`predicate_implied_by_recurse`), with `x IN (...)`,
+//!   `x NOT IN (...)` and `x op ANY|ALL (ARRAY[...])` read as the OR / AND
+//!   of their comparisons (`predicate_classify`);
 //! - structurally equal atoms;
 //! - `x IS NOT NULL` from a (strict) comparison on `x`;
 //! - `x op1 c1` ⇒ `x op2 c2` for btree comparison operators over constants
@@ -16,6 +21,45 @@
 use typedpg_pg_query::protobuf::{self, node};
 
 use super::node_fingerprint;
+use crate::coerce::{CoercionContext, CoercionPath, coercion_pathway};
+use crate::oid::{PgClassOid, PgTypeOid};
+use crate::pg_catalog::{PgCatalog, oid};
+
+/// The catalog a comparison is typed against, and the relation its
+/// columns are of.
+pub(crate) struct Types<'a> {
+    pub snapshot: &'a PgCatalog,
+    pub table: PgClassOid,
+}
+
+impl Types<'_> {
+    fn column(&self, name: &str) -> Option<PgTypeOid> {
+        self.snapshot
+            .attributes_of(self.table)
+            .iter()
+            .find(|a| a.attname == name && a.attnum > 0)
+            .map(|a| a.atttypid)
+    }
+
+    fn type_name(&self, tn: &protobuf::TypeName) -> Option<PgTypeOid> {
+        crate::ddl::util::resolve_type_name(tn, self.snapshot)
+    }
+
+    /// The input types of the operator `name` resolves to for operands of
+    /// types `l` and `r`.
+    fn operator(&self, name: &str, l: PgTypeOid, r: PgTypeOid) -> Option<(PgTypeOid, PgTypeOid)> {
+        let op = self.snapshot.find_operator(name, Some(l), r)?;
+        Some((op.left_type_oid?, op.right_type_oid))
+    }
+
+    /// Is coercing `from` to `to` a RelabelType (binary compatible, to a
+    /// type that is no domain)?
+    fn relabel(&self, from: PgTypeOid, to: PgTypeOid) -> bool {
+        self.snapshot.unwrap_domain(to) == to
+            && coercion_pathway(to, from, CoercionContext::Explicit, self.snapshot)
+                == Some(CoercionPath::Relabel)
+    }
+}
 
 /// PG's `predicate_implied_by(predicate, clause, weak = false)`: is
 /// `predicate` true whenever `clause` is? No predicate is always implied;
@@ -23,6 +67,7 @@ use super::node_fingerprint;
 pub(crate) fn predicate_implied_by(
     predicate: Option<&protobuf::Node>,
     clause: Option<&protobuf::Node>,
+    types: &Types,
 ) -> bool {
     let Some(predicate) = predicate else {
         return true;
@@ -30,7 +75,241 @@ pub(crate) fn predicate_implied_by(
     let Some(clause) = clause else {
         return false;
     };
-    implied_by_recurse(&unqualify(clause), &unqualify(predicate))
+    implied_by_recurse(
+        &normalize(&unqualify(clause), types),
+        &normalize(&unqualify(predicate), types),
+    )
+}
+
+/// `predicate_classify` caps the arrays it expands (MAX_SAOP_ARRAY_SIZE).
+const MAX_SAOP_ARRAY_SIZE: usize = 100;
+
+/// `n` with each `x IN (...)` / `x NOT IN (...)` / `x op ANY|ALL
+/// (ARRAY[...])` expanded into the OR / AND of `x op element` (as
+/// `predicate_classify` reads a ScalarArrayOpExpr), and each comparison
+/// typed ([`typed_comparison`]).
+fn normalize(n: &protobuf::Node, types: &Types) -> protobuf::Node {
+    use protobuf::AExprKind as K;
+    let Some(inner) = n.node.as_ref() else {
+        return n.clone();
+    };
+    match inner {
+        node::Node::BoolExpr(b) => {
+            let mut b = (**b).clone();
+            b.args = b.args.iter().map(|a| normalize(a, types)).collect();
+            protobuf::Node {
+                node: Some(node::Node::BoolExpr(Box::new(b))),
+            }
+        }
+        node::Node::AExpr(e) if matches!(e.kind(), K::AexprIn | K::AexprOpAny | K::AexprOpAll) => {
+            let elements = match (e.kind(), e.rexpr.as_deref().and_then(|r| r.node.as_ref())) {
+                (K::AexprIn, Some(node::Node::List(l))) => &l.items,
+                (K::AexprOpAny | K::AexprOpAll, Some(node::Node::AArrayExpr(a))) => &a.elements,
+                _ => return n.clone(),
+            };
+            let Some(x) = e.lexpr.as_deref() else {
+                return n.clone();
+            };
+            if elements.is_empty() || elements.len() > MAX_SAOP_ARRAY_SIZE {
+                return n.clone();
+            }
+            // `IN` is `= ANY`, `NOT IN` is `<> ALL`.
+            let any = match e.kind() {
+                K::AexprIn => matches!(
+                    super::expr::extract_string_fields(&e.name).as_slice(),
+                    [op] if op == "="
+                ),
+                K::AexprOpAny => true,
+                _ => false,
+            };
+            let args = elements
+                .iter()
+                .map(|el| {
+                    let mut cmp = (**e).clone();
+                    cmp.set_kind(K::AexprOp);
+                    cmp.lexpr = Some(Box::new(x.clone()));
+                    cmp.rexpr = Some(Box::new(el.clone()));
+                    typed_comparison(cmp, types)
+                })
+                .collect();
+            protobuf::Node {
+                node: Some(node::Node::BoolExpr(Box::new(protobuf::BoolExpr {
+                    boolop: if any {
+                        protobuf::BoolExprType::OrExpr
+                    } else {
+                        protobuf::BoolExprType::AndExpr
+                    } as i32,
+                    args,
+                    ..Default::default()
+                }))),
+            }
+        }
+        node::Node::AExpr(e) if e.kind() == K::AexprOp => typed_comparison((**e).clone(), types),
+        _ => n.clone(),
+    }
+}
+
+/// The comparison `e` with its operands as PG's `make_op` leaves them:
+/// one whose type isn't the resolved operator's input type cast to it (the
+/// implicit cast PG adds, which `equal()` doesn't tell from an explicit
+/// one), and a constant of that type a bare literal (`'x'::text` against a
+/// text operand — how pg_dump writes an index predicate — is `'x'`). Any
+/// operand whose type the raw AST doesn't tell leaves `e` as written.
+fn typed_comparison(mut e: protobuf::AExpr, types: &Types) -> protobuf::Node {
+    let unchanged = |e: protobuf::AExpr| protobuf::Node {
+        node: Some(node::Node::AExpr(Box::new(e))),
+    };
+    let op = match super::expr::extract_string_fields(&e.name).as_slice() {
+        [op] => op.clone(),
+        _ => return unchanged(e),
+    };
+    let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) else {
+        return unchanged(e);
+    };
+    let (Some(lt), Some(rt)) = (operand_type(l, types), operand_type(r, types)) else {
+        return unchanged(e);
+    };
+    let Some((dl, dr)) = types.operator(&op, lt, rt) else {
+        return unchanged(e);
+    };
+    let (Some(l), Some(r)) = (
+        typed_operand(l, lt, dl, types),
+        typed_operand(r, rt, dr, types),
+    ) else {
+        return unchanged(e);
+    };
+    e.lexpr = Some(Box::new(l));
+    e.rexpr = Some(Box::new(r));
+    unchanged(e)
+}
+
+/// The operand `x`, of type `t`, as an operator taking `declared` reads it;
+/// `None` when that can't be written in the canonical form.
+fn typed_operand(
+    x: &protobuf::Node,
+    t: PgTypeOid,
+    declared: PgTypeOid,
+    types: &Types,
+) -> Option<protobuf::Node> {
+    let constant = match x.node.as_ref()? {
+        node::Node::AConst(_) => Some(x),
+        node::Node::TypeCast(tc) => tc
+            .arg
+            .as_deref()
+            .filter(|a| matches!(a.node.as_ref(), Some(node::Node::AConst(_)))),
+        _ => None,
+    };
+    if let Some(c) = constant {
+        // An unknown literal takes the operator's type.
+        return (t == declared || t == oid::UNKNOWN).then(|| c.clone());
+    }
+    Some(coerce(canonical(x, types)?, t, declared, types))
+}
+
+/// `x` with its casts written canonically ([`coerce`]); `None` for a type
+/// name with a modifier or array bounds, which is another expression.
+fn canonical(x: &protobuf::Node, types: &Types) -> Option<protobuf::Node> {
+    let Some(node::Node::TypeCast(tc)) = x.node.as_ref() else {
+        return Some(x.clone());
+    };
+    let (arg, written) = (tc.arg.as_deref()?, tc.type_name.as_ref()?);
+    if !written.typmods.is_empty() || !written.array_bounds.is_empty() || written.pct_type {
+        return None;
+    }
+    let from = operand_type(arg, types)?;
+    let to = types.type_name(written)?;
+    Some(coerce(canonical(arg, types)?, from, to, types))
+}
+
+/// `x`, of type `from`, coerced to `to` as `coerce_type` leaves it — the
+/// type named by its oid so that every spelling of it (`text`,
+/// `pg_catalog.text`) compares equal, and an implicit coercion like an
+/// explicit one. No coercion to its own type; a binary-compatible one is a
+/// RelabelType, which `applyRelabelType` stacks on no other and drops when
+/// the relabelings net out to nothing (`t::varchar::text` is `t`).
+fn coerce(x: protobuf::Node, from: PgTypeOid, to: PgTypeOid, types: &Types) -> protobuf::Node {
+    if from == to {
+        return x;
+    }
+    if !types.relabel(from, to) {
+        return cast_node(x, ["coerce".to_owned(), to.get().to_string()]);
+    }
+    let (inner, inner_type) = match relabeled(&x) {
+        Some(r) => r,
+        None => (x, from),
+    };
+    if inner_type == to {
+        return inner;
+    }
+    let names = [
+        "relabel".to_owned(),
+        inner_type.get().to_string(),
+        to.get().to_string(),
+    ];
+    cast_node(inner, names)
+}
+
+/// A RelabelType [`coerce`] wrote: its operand and that operand's type.
+fn relabeled(x: &protobuf::Node) -> Option<(protobuf::Node, PgTypeOid)> {
+    let Some(node::Node::TypeCast(tc)) = x.node.as_ref() else {
+        return None;
+    };
+    match super::expr::extract_string_fields(&tc.type_name.as_ref()?.names).as_slice() {
+        [kind, from, _] if kind == "relabel" => Some((
+            (**tc.arg.as_ref()?).clone(),
+            PgTypeOid::new(from.parse().ok()?)?,
+        )),
+        _ => None,
+    }
+}
+
+fn cast_node<const N: usize>(x: protobuf::Node, names: [String; N]) -> protobuf::Node {
+    protobuf::Node {
+        node: Some(node::Node::TypeCast(Box::new(protobuf::TypeCast {
+            arg: Some(Box::new(x)),
+            type_name: Some(protobuf::TypeName {
+                names: names
+                    .into_iter()
+                    .map(|sval| protobuf::Node {
+                        node: Some(node::Node::String(protobuf::String { sval })),
+                    })
+                    .collect(),
+                typemod: -1,
+                ..Default::default()
+            }),
+            location: 0,
+        }))),
+    }
+}
+
+/// The type of an operand whose type the raw AST tells: a column's, a
+/// cast's (`c::text`), a literal's.
+fn operand_type(x: &protobuf::Node, types: &Types) -> Option<PgTypeOid> {
+    use protobuf::a_const::Val;
+    match x.node.as_ref()? {
+        node::Node::ColumnRef(cr) => match cr.fields.as_slice() {
+            [
+                protobuf::Node {
+                    node: Some(node::Node::String(s)),
+                },
+            ] => types.column(&s.sval),
+            _ => None,
+        },
+        node::Node::TypeCast(tc) => types.type_name(tc.type_name.as_ref()?),
+        // `make_const`: an integer literal is an int4, one too wide an
+        // int8, a decimal a numeric.
+        node::Node::AConst(c) if !c.isnull => Some(match c.val.as_ref()? {
+            Val::Ival(_) => oid::INT4,
+            Val::Fval(f) if !f.fval.contains(['.', 'e', 'E']) && f.fval.parse::<i64>().is_ok() => {
+                oid::INT8
+            }
+            Val::Fval(_) => oid::NUMERIC,
+            Val::Sval(_) => oid::UNKNOWN,
+            Val::Boolval(_) => oid::BOOL,
+            Val::Bsval(_) => return None,
+        }),
+        _ => None,
+    }
 }
 
 /// How `predicate_implied_by_recurse` classifies a node.

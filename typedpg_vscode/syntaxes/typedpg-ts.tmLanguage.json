@@ -1,0 +1,71 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "scopeName": "inline.sql.typedpg.ts",
+  "injectionSelector": "L:source.ts, L:source.tsx",
+  "patterns": [
+    {
+      "comment": "sql(...) / copyIn(...) of a typedpg generated module (single and multi-line)",
+      "begin": "\\b(?:sql|copyIn)\\s*\\(",
+      "end": "(?=\\))",
+      "patterns": [
+        { "include": "#sql-string" }
+      ]
+    }
+  ],
+  "repository": {
+    "sql-string": {
+      "patterns": [
+        {
+          "comment": "Template literal (no ${} — typedpg analyzes literals only)",
+          "name": "meta.embedded.sql.typedpg",
+          "begin": "(`)",
+          "beginCaptures": { "1": { "name": "punctuation.definition.string.template.begin.sql.typedpg" } },
+          "end": "(`)",
+          "endCaptures": { "1": { "name": "punctuation.definition.string.template.end.sql.typedpg" } },
+          "contentName": "meta.embedded.sql",
+          "patterns": [
+            { "include": "#spread-param" },
+            { "include": "#named-param" },
+            { "include": "source.sql" }
+          ]
+        },
+        {
+          "name": "meta.embedded.sql.typedpg",
+          "begin": "(\")",
+          "beginCaptures": { "1": { "name": "punctuation.definition.string.begin.sql.typedpg" } },
+          "end": "(\")",
+          "endCaptures": { "1": { "name": "punctuation.definition.string.end.sql.typedpg" } },
+          "contentName": "meta.embedded.sql",
+          "patterns": [
+            { "include": "#spread-param" },
+            { "include": "#named-param" },
+            { "include": "source.sql" }
+          ]
+        },
+        {
+          "name": "meta.embedded.sql.typedpg",
+          "begin": "(')",
+          "beginCaptures": { "1": { "name": "punctuation.definition.string.begin.sql.typedpg" } },
+          "end": "(')",
+          "endCaptures": { "1": { "name": "punctuation.definition.string.end.sql.typedpg" } },
+          "contentName": "meta.embedded.sql",
+          "patterns": [
+            { "include": "#spread-param" },
+            { "include": "#named-param" },
+            { "include": "source.sql" }
+          ]
+        }
+      ]
+    },
+    "spread-param": {
+      "comment": "Matches $..identifier and optionally $..identifier { field1, field2 }",
+      "name": "variable.spread.typedpg",
+      "match": "\\$\\.\\.([a-zA-Z_][a-zA-Z0-9_]*)(\\s*\\{[^}]*\\})?"
+    },
+    "named-param": {
+      "comment": "Matches $identifier (but not $..identifier which is handled above)",
+      "name": "variable.parameter.typedpg",
+      "match": "\\$(?!\\.\\.)([a-zA-Z_][a-zA-Z0-9_]*[?!]?)"
+    }
+  }
+}

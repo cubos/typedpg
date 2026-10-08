@@ -189,7 +189,7 @@ pub(crate) fn apply_migration(db: &mut PgCatalog, sql: &str) -> Result<(), Migra
                 tx.abort(db);
                 return Err(e);
             }
-            tx.after(stmt);
+            tx.after(db, stmt);
         }
         tx.finish(db);
         Ok(())

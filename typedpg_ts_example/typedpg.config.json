@@ -1,0 +1,9 @@
+{
+  "include": ["src"],
+  "out": "src/db.ts",
+  "migrations": { "dir": "migrations", "embed": true },
+  "types": {
+    "user_prefs": "./src/domains.ts#UserPrefs",
+    "point2": "./src/domains.ts#Point2"
+  }
+}

@@ -39,6 +39,22 @@ cargo nextest run --release -p typedpg_compile_fail           # check
 BLESS=1 cargo nextest run --release -p typedpg_compile_fail   # rewrite snapshots
 ```
 
+### TypeScript
+
+`typedpg_ts` is the TypeScript CLI (`typedpg gen|check|migrate`; it needs a
+newer Rust than the workspace's MSRV, for oxc), `typedpg_npm` the npm
+runtime package, `typedpg_ts_example` the project the end-to-end run uses.
+
+```bash
+cargo nextest run --release -p typedpg_ts        # scanner, codegen, incremental project
+(cd typedpg_npm && npm ci && npm test)           # runtime unit tests (codecs)
+scripts/run-ts-e2e.sh                            # everything, on a PostgreSQL container
+BLESS=1 scripts/run-ts-e2e.sh                    # rewrite the errors fixtures' expected outputs
+```
+
+After changing `typedpg_npm`, `npm install` in `typedpg_ts_example`: it
+installs the runtime as a copy (`install-links`), as from the registry.
+
 ## Regenerating `seed.json`
 
 Never hand-migrate `typedpg_analyzer/src/seed.json` (e.g. with a Python

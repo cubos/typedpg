@@ -11,6 +11,9 @@ description = "CLI for typedpg migrations"
 keywords = ["postgres", "migrations", "cli", "sql"]
 categories = ["command-line-utilities", "database"]
 
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
 name = "cargo-typedpg"
 path = "src/main.rs"

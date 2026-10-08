@@ -45,10 +45,7 @@ impl QualifiedName {
     /// identifier containing a `.` stays a single part — `"foo.bar"` parses as
     /// the name `foo.bar` in `default_schema`, not as schema `foo` / name
     /// `bar`. Unquoted identifiers are case-folded to lowercase, as PG does.
-    pub(crate) fn parse_in_schema(
-        s: &str,
-        default_schema: &str,
-    ) -> Result<Self, ParseQualifiedNameError> {
+    pub fn parse_in_schema(s: &str, default_schema: &str) -> Result<Self, ParseQualifiedNameError> {
         let mut parser = Parser::new(s);
         let first = parser.read_ident()?;
         if parser.peek() == Some('.') {

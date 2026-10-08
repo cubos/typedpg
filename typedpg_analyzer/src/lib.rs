@@ -98,7 +98,7 @@ pub use pg_catalog::{
 
 pub use ddl::DdlError;
 pub use error::AnalyzeError;
-pub use pg_catalog::PgCatalog;
+pub use pg_catalog::{LocatedError, PgCatalog};
 pub use refine::Refinement;
 pub use resolve::{
     AnalyzedColumn, AnalyzedCopyIn, AnalyzedParam, AnalyzedQuery, AnalyzedSpread,

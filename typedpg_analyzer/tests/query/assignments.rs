@@ -460,6 +460,107 @@ fn on_conflict_partial_index_predicate_is_implied() {
     }
 }
 
+/// predicate_classify: a ScalarArrayOpExpr over an array of elements reads
+/// as the AND (`op ALL`, `NOT IN`) or OR (`op ANY`, `IN`) of its comparisons,
+/// so `NOT IN ('a', 'b')` and pg_dump's `<> ALL (ARRAY['a'::text, ...])`
+/// prove each other. A constant cast to its column's own type is the bare
+/// literal.
+#[test]
+fn on_conflict_partial_index_predicate_over_a_list_is_implied() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE m (k int, status text NOT NULL, v int, w int);
+         CREATE UNIQUE INDEX m_live ON m (k) WHERE (status <> ALL (ARRAY['revoked'::text, 'expired'::text]));
+         CREATE UNIQUE INDEX m_v ON m (v) WHERE v = ANY (ARRAY[1, 2]);
+         CREATE UNIQUE INDEX m_w ON m (w) WHERE w::bigint <> ALL (ARRAY[1::bigint]);",
+    )
+    .unwrap();
+    let insert = |target: &str, clause: &str| {
+        format!(
+            "INSERT INTO m (k, status, v) VALUES (1, 'active', 1) ON CONFLICT ({target}) {clause} DO NOTHING"
+        )
+    };
+    for (target, clause) in [
+        ("k", "WHERE status NOT IN ('revoked', 'expired')"),
+        ("k", "WHERE status NOT IN ('expired', 'revoked')"),
+        ("k", "WHERE status NOT IN ('revoked', 'other', 'expired')"),
+        ("k", "WHERE status <> ALL (ARRAY['revoked', 'expired'])"),
+        ("k", "WHERE m.status = 'active'"),
+        ("k", "WHERE status IN ('active', 'pending')"),
+        ("v", "WHERE v IN (1)"),
+        ("v", "WHERE v = ANY (ARRAY[2, 1])"),
+        // The constant is cast to the type of `w::bigint`, its operand.
+        ("w", "WHERE w::bigint <> 1"),
+    ] {
+        let sql = insert(target, clause);
+        db.analyze(&sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    for (target, clause) in [
+        ("k", "WHERE status NOT IN ('revoked')"),
+        ("k", "WHERE status <> 'revoked'"),
+        ("k", "WHERE status IN ('active', 'revoked')"),
+        ("v", "WHERE v IN (1, 3)"),
+        // `w`, not `w::bigint`: another operand.
+        ("w", "WHERE w NOT IN (1)"),
+    ] {
+        let sql = insert(target, clause);
+        let err = db.analyze(&sql).unwrap_err();
+        assert!(
+            matches!(err, AnalyzeError::InvalidColumnReference(_)),
+            "{sql}: {err:?}"
+        );
+    }
+}
+
+/// A comparison is matched as PG types it: `c <> 'a'::text` on a citext
+/// column compares texts, `c::text <> 'a'::text` with the cast PG adds, so
+/// a text comparison written with the cast proves it and `c NOT IN ('a')`,
+/// a citext comparison, doesn't. A cast to the operand's own type is no
+/// cast, nor binary-compatible ones that net out to nothing; another cast
+/// makes another operand.
+#[test]
+fn on_conflict_partial_index_predicate_is_matched_as_typed() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE EXTENSION citext;
+         CREATE TABLE m (k int, c citext, t text, v varchar);
+         CREATE UNIQUE INDEX m_c ON m (k) WHERE c <> ALL (ARRAY['a'::text]);
+         CREATE UNIQUE INDEX m_t ON m (t) WHERE t <> 'x';
+         CREATE UNIQUE INDEX m_v ON m (v) WHERE v <> 'y';",
+    )
+    .unwrap();
+    for (target, clause) in [
+        ("k", "WHERE c::text <> 'a'"),
+        ("k", "WHERE c::pg_catalog.text NOT IN ('a'::text, 'b')"),
+        ("t", "WHERE t::text <> 'x'"),
+        ("t", "WHERE t <> 'x'::text"),
+        ("v", "WHERE v::text <> 'y'"),
+        // Binary-compatible relabelings that net out to nothing.
+        ("t", "WHERE t::varchar <> 'x'"),
+        ("t", "WHERE t::varchar::text <> 'x'"),
+    ] {
+        let sql = format!(
+            "INSERT INTO m ({target}) VALUES (NULL) ON CONFLICT ({target}) {clause} DO NOTHING"
+        );
+        db.analyze(&sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+    }
+    for (target, clause) in [
+        ("k", "WHERE c NOT IN ('a')"),
+        ("k", "WHERE c <> 'a'::citext"),
+        ("t", "WHERE t::char(1) <> 'x'"),
+        ("t", "WHERE t::name <> 'x'"),
+    ] {
+        let sql = format!(
+            "INSERT INTO m ({target}) VALUES (NULL) ON CONFLICT ({target}) {clause} DO NOTHING"
+        );
+        let err = db.analyze(&sql).unwrap_err();
+        assert!(
+            matches!(err, AnalyzeError::InvalidColumnReference(_)),
+            "{sql}: {err:?}"
+        );
+    }
+}
+
 /// resolve_unique_index_expr: no ordering options, index expressions are
 /// transformed (so their errors are PG's), operator classes must exist,
 /// and a system column is a valid (never matching) element.
