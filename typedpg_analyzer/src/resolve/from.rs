@@ -176,6 +176,10 @@ pub(crate) fn process_from_item(
                     }
                     if let Some(cols) = view_columns(snapshot, class) {
                         for (c, rc) in src.columns.iter_mut().zip(cols) {
+                            // What the query makes of it now (calls read
+                            // as their bodies, see `expr::inline`) holds
+                            // as well as what was found at CREATE VIEW.
+                            c.base_not_null |= !rc.nullable;
                             c.origin = rc.origin;
                             // Both hold: the column's type (a domain) and
                             // what the view's query makes of it.

@@ -27,6 +27,25 @@ const MAX_DEPTH: usize = 8;
 thread_local! {
     /// The functions whose bodies are being read.
     static READING: RefCell<Vec<PgProcOid>> = const { RefCell::new(Vec::new()) };
+    /// Calls are only resolved, not read as their bodies (see
+    /// [`resolving_only`]).
+    static RESOLVING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether calls are only being resolved (a DDL statement is running: see
+/// [`resolving_only`]).
+pub(crate) fn resolving() -> bool {
+    RESOLVING.with(std::cell::Cell::get)
+}
+
+/// Run `f` with calls only resolved, not read as their bodies: what an
+/// expression resolves to (a CHECK constraint's, kept by OID; a DDL
+/// statement's validation) doesn't depend on them.
+pub(crate) fn resolving_only<R>(f: impl FnOnce() -> R) -> R {
+    let outer = RESOLVING.with(|r| r.replace(true));
+    let result = f();
+    RESOLVING.with(|r| r.set(outer));
+    result
 }
 
 /// What the body of function `proc` makes of the arguments `args` (in
@@ -41,7 +60,8 @@ pub(crate) fn inline_call(
 ) -> Option<ExprType> {
     let snapshot = ctx.snapshot;
     let body = snapshot.inline_sql_bodies.get(&proc.oid)?;
-    if snapshot.procs_with_config.contains(&proc.oid)
+    if resolving()
+        || snapshot.procs_with_config.contains(&proc.oid)
         || args.len() != proc.proargtypes.len()
         || READING.with(|r| {
             let r = r.borrow();

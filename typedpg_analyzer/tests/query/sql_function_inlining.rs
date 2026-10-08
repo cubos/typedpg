@@ -116,3 +116,13 @@ fn some_calls_are_not_read_as_their_body() {
         ],
     );
 }
+
+#[test]
+fn a_view_reads_calls_as_bodies_when_queried() {
+    let mut db = setup();
+    // At CREATE VIEW calls are only resolved; reading the view, its query
+    // reads `zero_if_null` as its body.
+    db.apply_sql("CREATE VIEW zv AS SELECT zero_if_null(a) AS z, ident(a) AS i FROM t;")
+        .unwrap();
+    assert_nullable(&db, "SELECT z, i FROM zv", &[("z", false), ("i", true)]);
+}
