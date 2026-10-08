@@ -260,6 +260,8 @@ pub(crate) fn infer_func_call(
         })
         .unwrap_or_default();
 
+    // Parameters the call leaves to their defaults (see `inline_call`).
+    let written_args = func.args.len();
     // The rules below read arguments by parameter position.
     let (func, args) = in_declared_order(func, args, &resolved);
     let func: &protobuf::FuncCall = &func;
@@ -285,7 +287,7 @@ pub(crate) fn infer_func_call(
         }
         Some(fields.into())
     };
-    Ok(ExprType {
+    let mut out = ExprType {
         type_oid: resolved.return_type_oid,
         nullable,
         // Functions / aggregates / window calls never propagate the
@@ -308,7 +310,27 @@ pub(crate) fn infer_func_call(
             builtin_array_elem_nullable(func, &resolved, &args)
         },
         refine,
-    })
+    };
+    // A call of a `LANGUAGE sql` function is its body over the arguments:
+    // both what the call is said to be and what its body makes hold.
+    if resolved.schema != "pg_catalog"
+        && !resolved.is_aggregate
+        && !resolved.is_window
+        && func.over.is_none()
+        && resolved.nvargs == 0
+        && let Some(proc) = snapshot.pg_proc.get(&resolved.oid)
+        && written_args == proc.proargtypes.len()
+        && let Some(body) =
+            super::inline::inline_call(proc, &args.exprs, resolved.return_type_oid, ctx)
+    {
+        out.nullable &= body.nullable;
+        out.refine = out.refine.and(&body.refine);
+        out.elem_nullable = match (out.elem_nullable, body.elem_nullable) {
+            (Some(false), _) | (_, Some(false)) => Some(false),
+            (a, b) => a.or(b),
+        };
+    }
+    Ok(out)
 }
 
 /// The call with its arguments in positional notation, for the rules that

@@ -274,6 +274,10 @@ pub struct PgCatalog {
     /// which PG substitutes for the call before checking an index or
     /// generation expression's mutability.
     pub(crate) inline_sql_bodies: Shared<HashMap<PgProcOid, typedpg_pg_query::protobuf::Node>>,
+    /// Routines with SET items (`SET search_path = …`): their body's names
+    /// resolve under settings of their own, so a call isn't read as its
+    /// body ([`crate::expr::inline`]).
+    pub(crate) procs_with_config: Shared<std::collections::HashSet<PgProcOid>>,
     /// The functions the parameter DEFAULT expressions of each routine
     /// created by the migrations run (PG expands them into a call that
     /// leaves the parameters out). Built-in routines aren't listed.
@@ -672,6 +676,7 @@ impl PgCatalog {
             generated_refs: Shared::default(),
             check_function_bodies: true,
             inline_sql_bodies: Shared::default(),
+            procs_with_config: Shared::default(),
             proc_default_procs: Shared::default(),
             sql_function_defs: HashMap::new(),
             partition_keys: Shared::default(),
@@ -1570,6 +1575,7 @@ impl PgCatalog {
 
     pub(crate) fn remove_pg_proc(&mut self, oid: PgProcOid) -> Option<PgProc> {
         self.inline_sql_bodies.remove(&oid);
+        self.procs_with_config.remove(&oid);
         self.proc_default_procs.remove(&oid);
         self.sql_function_defs.remove(&oid);
         let row = self.pg_proc.remove(&oid)?;

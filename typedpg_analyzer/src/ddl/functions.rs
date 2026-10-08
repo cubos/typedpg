@@ -625,8 +625,15 @@ pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Res
     interp
         .proc_default_procs
         .insert(proc.oid, params.default_procs.clone());
-    if let Some(body) = super::function_body::inlinable_body(stmt, &proc) {
-        interp.inline_sql_bodies.insert(proc.oid, body);
+    // A replaced body replaces what was inlined of the old one.
+    match super::function_body::inlinable_body(stmt, &proc) {
+        Some(body) => interp.inline_sql_bodies.insert(proc.oid, body),
+        None => interp.inline_sql_bodies.remove(&proc.oid),
+    };
+    if attrs.common.set_items.is_empty() {
+        interp.procs_with_config.remove(&proc.oid);
+    } else {
+        interp.procs_with_config.insert(proc.oid);
     }
     // The language's validator, with the routine already in the catalog (a
     // recursive SQL function resolves).
@@ -1279,6 +1286,9 @@ pub fn alter_function(
     common.cost = None;
     common.validate(interp)?;
     deferred_sets.validate(interp)?;
+    if !deferred_sets.set_items.is_empty() {
+        interp.procs_with_config.insert(oid);
+    }
     let volatility = common.volatility();
     let strict = common.strict();
     if let Some(p) = interp.pg_proc.get_mut(&oid) {

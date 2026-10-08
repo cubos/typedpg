@@ -88,6 +88,8 @@ mod set_operations;
 mod set_returning_functions;
 #[path = "query/special.rs"]
 mod special;
+#[path = "query/sql_function_inlining.rs"]
+mod sql_function_inlining;
 #[path = "query/sql_json.rs"]
 mod sql_json;
 #[path = "query/subqueries.rs"]

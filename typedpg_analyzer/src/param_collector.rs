@@ -42,9 +42,28 @@ pub(crate) struct ParamCollector {
     /// `COALESCE`, or as the value of a nullable column) makes those reads
     /// stale: see [`Self::stale_non_null_reads`].
     read_non_null: HashSet<i32>,
+    /// A `LANGUAGE sql` function body's `$1`, `$2`, …: the arguments of
+    /// the call it stands for (see [`crate::expr::inline`]).
+    bound: Vec<crate::expr::ExprType>,
 }
 
 impl ParamCollector {
+    /// The parameters of a function body read as the call's arguments.
+    pub fn bound(args: Vec<crate::expr::ExprType>) -> Self {
+        ParamCollector {
+            bound: args,
+            ..ParamCollector::default()
+        }
+    }
+
+    /// The argument `$param_num` stands for in a function body.
+    pub fn bound_arg(&self, param_num: i32) -> Option<&crate::expr::ExprType> {
+        usize::try_from(param_num)
+            .ok()
+            .and_then(|n| n.checked_sub(1))
+            .and_then(|i| self.bound.get(i))
+    }
+
     /// Record that a parameter was referenced (even if type is unknown).
     pub fn see(&mut self, param_num: i32) {
         self.seen.insert(param_num);
