@@ -552,16 +552,17 @@ pub(crate) fn fresh_scans(columns: &mut [ScopeColumn]) {
     }
 }
 
-/// The origins of a view's columns: its stored query analyzed again
-/// (without recording dependencies — the referencing query depends on the
+/// A view's columns as its stored query, analyzed again, makes them —
+/// where each comes from, its array elements' nullability, its refinement
+/// (without recording dependencies: the referencing query depends on the
 /// view, not on what it reads). `None` when that fails, reads other
 /// objects than the view does ([`crate::ddl::views::reanalyze_view`]) or
 /// no longer matches the view's columns; views of the system schemas are
 /// not looked into.
-pub(crate) fn view_origins(
+pub(crate) fn view_columns(
     snapshot: &PgCatalog,
     class: &crate::pg_catalog::PgClass,
-) -> Option<Vec<Option<Origin>>> {
+) -> Option<Vec<super::RawColumn>> {
     if class.relkind != crate::pg_catalog::RelKind::View {
         return None;
     }
@@ -577,5 +578,5 @@ pub(crate) fn view_origins(
             .iter()
             .zip(&cols)
             .all(|(a, c)| a.atttypid == c.type_oid))
-    .then(|| cols.into_iter().map(|c| c.origin).collect())
+    .then_some(cols)
 }

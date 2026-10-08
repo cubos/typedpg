@@ -174,9 +174,20 @@ pub(crate) fn process_from_item(
                                 .is_some_and(|rc| !rc.nullable);
                         }
                     }
-                    if let Some(origins) = view_origins(snapshot, class) {
-                        for (c, o) in src.columns.iter_mut().zip(origins) {
-                            c.origin = o;
+                    if let Some(cols) = view_columns(snapshot, class) {
+                        for (c, rc) in src.columns.iter_mut().zip(cols) {
+                            // What the query makes of it now (calls read
+                            // as their bodies, see `expr::inline`) holds
+                            // as well as what was found at CREATE VIEW.
+                            c.base_not_null |= !rc.nullable;
+                            c.origin = rc.origin;
+                            // Both hold: the column's type (a domain) and
+                            // what the view's query makes of it.
+                            c.elem_nullable = match (rc.elem_nullable, c.elem_nullable) {
+                                (Some(false), _) | (_, Some(false)) => Some(false),
+                                (a, b) => a.or(b),
+                            };
+                            c.refine = c.refine.and(&rc.refine);
                         }
                     }
                 } else {
@@ -340,6 +351,7 @@ pub(crate) fn process_from_item(
                         collation: rc.collation,
                         record_fields: rc.record_fields,
                         elem_nullable: rc.elem_nullable,
+                        refine: rc.refine.clone(),
                         origin: rc.origin,
                     })
                     .collect();
@@ -588,6 +600,7 @@ fn process_range_function(
             collation: None,
             record_fields: None,
             elem_nullable: None,
+            refine: crate::refine::Refinement::NONE,
             origin: None,
         });
     }
@@ -1368,6 +1381,10 @@ fn merge_using_columns(
             table_alias: String::new(),
             record_fields: None,
             elem_nullable: crate::expr::merge_elem_nullable([l.elem_nullable, r.elem_nullable]),
+            refine: crate::refine::Refinement::either([
+                &l.refine.converted(l.type_oid, type_oid, snapshot),
+                &r.refine.converted(r.type_oid, type_oid, snapshot),
+            ]),
             origin: None,
         });
         hide.push((l_idx, name.clone()));
@@ -1474,19 +1491,20 @@ fn infer_srf_arg_types(
     func_call: &protobuf::FuncCall,
     arg_ctx: Ctx<'_>,
     params: &mut ParamCollector,
-) -> Result<(Vec<PgTypeOid>, Vec<bool>), AnalyzeError> {
-    let mut arg_types = Vec::with_capacity(func_call.args.len());
-    let mut arg_nullable = Vec::with_capacity(func_call.args.len());
+) -> Result<Vec<crate::expr::ExprType>, AnalyzeError> {
+    let mut exprs = Vec::with_capacity(func_call.args.len());
     for arg in &func_call.args {
         // Any error transforming an argument aborts the query, as in PG's
         // `transformRangeFunction`: an unknown column, a FROM item that isn't
         // visible yet (`FROM f(t.c), t`), the left side of a RIGHT / FULL join.
-        let e = expr::infer_expr(arg, arg_ctx, params, crate::expr::TypeGoal::NONE)?;
-        let (t, n) = (e.type_oid, e.nullable);
-        arg_types.push(t);
-        arg_nullable.push(n);
+        exprs.push(expr::infer_expr(
+            arg,
+            arg_ctx,
+            params,
+            crate::expr::TypeGoal::NONE,
+        )?);
     }
-    Ok((arg_types, arg_nullable))
+    Ok(exprs)
 }
 
 /// Nullability of the elements a strict `pg_catalog` set-returning function
@@ -1808,7 +1826,9 @@ fn function_rte_columns(
         &func_name_parts,
         crate::error::SourceSpan::from_node_qname(func_call.location),
     )?;
-    let (arg_types, arg_nullable) = infer_srf_arg_types(func_call, arg_ctx, params)?;
+    let arg_exprs = infer_srf_arg_types(func_call, arg_ctx, params)?;
+    let arg_types: Vec<PgTypeOid> = arg_exprs.iter().map(|e| e.type_oid).collect();
+    let arg_nullable: Vec<bool> = arg_exprs.iter().map(|e| e.nullable).collect();
     // nodeFunctionscan.c evaluates only the top-level call as a set.
     if func_call
         .args
@@ -1896,6 +1916,7 @@ fn function_rte_columns(
                 table_alias: alias.to_owned(),
                 record_fields: None,
                 elem_nullable: None,
+                refine: crate::refine::Refinement::NONE,
                 origin: None,
             })
             .collect());
@@ -1927,6 +1948,7 @@ fn function_rte_columns(
                 table_alias: alias.to_owned(),
                 record_fields: None,
                 elem_nullable: None,
+                refine: crate::refine::Refinement::NONE,
                 origin: None,
             })
             .collect());
@@ -1969,6 +1991,15 @@ fn function_rte_columns(
         collation: None,
         record_fields: None,
         elem_nullable: None,
+        // `generate_series` of finite bounds and step (see
+        // `refine::of_builtin_call`).
+        refine: snapshot
+            .pg_proc
+            .get(&resolved.oid)
+            .map(|p| {
+                crate::refine::of_builtin_call(p, &arg_exprs.iter().collect::<Vec<_>>(), snapshot)
+            })
+            .unwrap_or_default(),
         origin: None,
     }])
 }
@@ -2007,6 +2038,7 @@ fn coldeflist_columns(
             table_alias: alias.to_owned(),
             record_fields: None,
             elem_nullable: None,
+            refine: crate::refine::Refinement::NONE,
             origin: None,
         });
     }
@@ -2350,6 +2382,7 @@ fn json_table_columns(
             table_alias: alias.to_owned(),
             record_fields: None,
             elem_nullable: None,
+            refine: crate::refine::Refinement::NONE,
             origin: None,
         });
     }

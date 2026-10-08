@@ -674,8 +674,10 @@ impl NullabilityContext {
                 Level::Local => &mut self.derived_local,
             };
             if level == Level::Matched {
-                // A row-is-there fact forces nothing.
+                // A row-is-there fact forces nothing; nor is an
+                // expression of a NULL-extended row non-NULL.
                 found.rels.clear();
+                found.exprs.clear();
             }
             *target = std::mem::take(target).union(found);
         }
@@ -771,6 +773,27 @@ impl NullabilityContext {
             equals: &equals,
             preds: &preds,
         })
+    }
+
+    /// What holds of column `c`'s value, non-NULL, where it is read: the
+    /// conditions on it (`WHERE kind IN ('a', 'b')`, a CASE branch's WHEN,
+    /// an ON) and its table's CHECK constraints — from which a [`Space`]
+    /// tells the values or bounds it is left.
+    pub fn column_preds(&self, c: &Col) -> Vec<ValPred> {
+        let mut preds = if crate::nonnull::disabled() {
+            Vec::new()
+        } else {
+            self.preds_at(Level::Local, c)
+        };
+        if !crate::nonnull::disabled()
+            && let Some(entry) = self.checks.iter().find(|e| e.alias == c.0)
+            && !entry.checks.contradict_alone(&entry.base_not_null)
+            && let Some(more) =
+                self.with_local_knowledge(entry, |k| entry.checks.column_preds(&c.1, k))
+        {
+            preds.extend(more);
+        }
+        preds
     }
 
     /// Whether no row can be what holds where a value is read: a CASE's
@@ -912,12 +935,17 @@ impl NullabilityContext {
         self.local_facts.exprs.contains(key)
             || (self.grouping_omitted.is_empty()
                 && !self.where_exprs_off
-                && self.where_facts.exprs.contains(key))
+                && (self.where_facts.exprs.contains(key)
+                    || self.derived_where.exprs.contains(key)
+                    || self.derived_local.exprs.contains(key)))
     }
 
     /// Whether any expression fact holds here (a cheap pre-check).
     pub fn has_expr_facts(&self) -> bool {
-        !self.local_facts.exprs.is_empty() || !self.where_facts.exprs.is_empty()
+        !self.local_facts.exprs.is_empty()
+            || !self.where_facts.exprs.is_empty()
+            || !self.derived_where.exprs.is_empty()
+            || !self.derived_local.exprs.is_empty()
     }
 
     /// Whether at least one of `cols` is known non-NULL where the value is

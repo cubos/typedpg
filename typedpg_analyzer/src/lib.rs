@@ -62,6 +62,7 @@ mod polymorphic;
 #[cfg(feature = "pg_sanity")]
 pub use pg_sanity::{Divergence, DivergenceKind};
 mod range_input;
+mod refine;
 mod reg_input;
 mod regex_input;
 mod resolve;
@@ -98,6 +99,7 @@ pub use pg_catalog::{
 pub use ddl::DdlError;
 pub use error::AnalyzeError;
 pub use pg_catalog::{LocatedError, PgCatalog};
+pub use refine::Refinement;
 pub use resolve::{
     AnalyzedColumn, AnalyzedCopyIn, AnalyzedParam, AnalyzedQuery, AnalyzedSpread,
     AnalyzedSpreadField, ArrayForm, SpreadKind, ValuesItem, ValuesList,

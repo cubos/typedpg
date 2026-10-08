@@ -18,6 +18,7 @@ fn system_columns_for(alias: &str) -> Vec<ScopeColumn> {
             table_alias: alias.to_owned(),
             record_fields: None,
             elem_nullable: None,
+            refine: crate::refine::Refinement::NONE,
             origin: None,
         })
         .collect()
@@ -46,6 +47,8 @@ pub(crate) struct ScopeColumn {
     /// For an array column, whether its elements can be NULL, where the
     /// query producing it knows (see [`crate::types::Type::Array`]).
     pub elem_nullable: Option<bool>,
+    /// What every non-NULL value of the column is (see [`crate::refine`]).
+    pub refine: crate::refine::Refinement,
     /// The base-table column this column's value is read from, when it
     /// is one passed through unchanged (see [`Origin`]).
     pub origin: Option<Origin>,
@@ -559,6 +562,8 @@ impl Scope {
         let relname = table.relname.clone();
         // A view has no system attributes.
         let is_view = table.relkind == crate::pg_catalog::RelKind::View;
+        let null_free = crate::nonnull::checks::null_free_array_columns(snapshot, table_oid);
+        let finite = crate::nonnull::checks::finite_columns(snapshot, table_oid);
 
         let columns: Vec<ScopeColumn> = snapshot
             .attributes_of(table_oid)
@@ -576,7 +581,15 @@ impl Scope {
                 collation: c.attcollation,
                 table_alias: alias.to_owned(),
                 record_fields: None,
-                elem_nullable: None,
+                elem_nullable: (null_free.contains(&c.attname)
+                    || snapshot.domain_null_free_elements(c.atttypid))
+                .then_some(false),
+                refine: crate::refine::Refinement {
+                    finite: finite.contains(&c.attname),
+                    values: None,
+                    range: None,
+                }
+                .and(&snapshot.domain_refinement(c.atttypid)),
                 origin: None,
             })
             .collect();
@@ -641,6 +654,14 @@ impl Scope {
                     .is_some_and(|a| snapshot.attr_never_null(a))
             })
         };
+        let null_free = columns
+            .first()
+            .map(|c| crate::nonnull::checks::null_free_array_columns(snapshot, c.attrelid))
+            .unwrap_or_default();
+        let finite = columns
+            .first()
+            .map(|c| crate::nonnull::checks::finite_columns(snapshot, c.attrelid))
+            .unwrap_or_default();
         let cols = columns
             .iter()
             .map(|c| ScopeColumn {
@@ -652,7 +673,15 @@ impl Scope {
                 collation: c.attcollation,
                 table_alias: alias.to_owned(),
                 record_fields: None,
-                elem_nullable: None,
+                elem_nullable: (null_free.contains(&c.attname)
+                    || snapshot.domain_null_free_elements(c.atttypid))
+                .then_some(false),
+                refine: crate::refine::Refinement {
+                    finite: finite.contains(&c.attname),
+                    values: None,
+                    range: None,
+                }
+                .and(&snapshot.domain_refinement(c.atttypid)),
                 origin: None,
             })
             .collect();

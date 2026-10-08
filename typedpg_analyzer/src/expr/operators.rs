@@ -141,8 +141,48 @@ fn handle_nullif(
         .then_some(left.typmod)
         .flatten();
     let state = derive_collation([&left, &right], result_oid, snapshot)?;
+    // NULL when `v1 = v2`: never, for a built-in equality, when no value
+    // `v2` can be is one `v1` can (`NULLIF(count(*), 0)` under `HAVING
+    // count(*) > 0`, `NULLIF(kind, 'c')` of a `CHECK (kind IN ('a', 'b'))`
+    // column) — and never `v2`'s value otherwise.
+    let builtin_eq = op
+        .code
+        .and_then(|c| snapshot.pg_proc.get(&c))
+        .is_some_and(|p| {
+            snapshot.namespace_name(p.pronamespace) == Some("pg_catalog")
+                && (p.proname.ends_with("eq") || p.proname == "enum_eq")
+        })
+        && !left.explicit_collation
+        && !right.explicit_collation;
+    let right_values = right
+        .refine
+        .converted(right.type_oid, op.right_type_oid, snapshot)
+        .values
+        .filter(|_| {
+            builtin_eq
+                && crate::refine::Exact::of(op.right_type_oid, None, snapshot)
+                    == crate::refine::Exact::of(left.type_oid, left.collation, snapshot)
+                && crate::refine::Exact::of(left.type_oid, left.collation, snapshot).is_some()
+        });
+    let mut refine = left.refine.converted(left.type_oid, result_oid, snapshot);
+    let mut never_equal = false;
+    if let Some(rv) = &right_values {
+        let possible = |v: &String| {
+            left.refine.values.as_ref().is_none_or(|vs| vs.contains(v))
+                && left
+                    .refine
+                    .int_bounds()
+                    .is_none_or(|b| v.parse::<i128>().map_or(true, |i| b.contains(i)))
+        };
+        never_equal = !rv.iter().any(possible);
+        if let Some(vs) = &mut refine.values {
+            vs.retain(|v| !rv.contains(v) || rv.len() > 1);
+        }
+    }
     Ok(Some(
-        ExprType::scalar_with_typmod(result_oid, true, typmod).with_collation(state),
+        ExprType::scalar_with_typmod(result_oid, left.nullable || !never_equal, typmod)
+            .with_collation(state)
+            .with_refine(refine),
     ))
 }
 
@@ -1067,9 +1107,27 @@ fn infer_generic_binary_op(
                 }
                 _ => None,
             };
+            // A built-in jsonb operator, for a CHECK's JSON reading.
+            if let Some(b) = op
+                .code
+                .and_then(|c| snapshot.pg_proc.get(&c))
+                .filter(|p| snapshot.namespace_name(p.pronamespace) == Some("pg_catalog"))
+                .and_then(|p| crate::nonnull::JsonbBuiltin::of(&p.proname))
+            {
+                ctx.note_strict(expr.location, crate::nonnull::StrictNode::Jsonb(b), true);
+            }
+            let refine = op
+                .code
+                .and_then(|c| snapshot.pg_proc.get(&c))
+                .map(|p| {
+                    let operands: Vec<&ExprType> = left.iter().chain(right.iter()).collect();
+                    crate::refine::of_builtin_call(p, &operands, snapshot)
+                })
+                .unwrap_or_default();
             return Ok(ExprType::scalar(op.result_type_oid, nullable)
                 .with_collation(state)
-                .with_elem_nullable(elem_nullable));
+                .with_elem_nullable(elem_nullable)
+                .with_refine(refine));
         }
         crate::lookup::OperatorMatch::Ambiguous => {
             // PG (SQLSTATE 42725): `operator is not unique: <left> <op>

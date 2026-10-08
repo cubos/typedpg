@@ -106,6 +106,16 @@ pub(crate) enum StrictNode {
     /// A call that resolved to `pg_catalog.num_nulls` /
     /// `pg_catalog.num_nonnulls` (not a user function of the name).
     NullCount,
+    /// A call that resolved to `pg_catalog.array_position(anycompatiblearray,
+    /// anycompatible)` (not a user function of the name).
+    ArrayPosition,
+    /// A call that resolved to `pg_catalog.isfinite` (not a user function
+    /// of the name).
+    IsFinite,
+    /// An operator or function call that resolved to the built-in jsonb
+    /// one: `?` (`jsonb_exists`), `?&` (`jsonb_exists_all`), `->` / `->>`
+    /// by key (`jsonb_object_field[_text]`), `jsonb_typeof`.
+    Jsonb(JsonbBuiltin),
     /// A COALESCE / GREATEST / LEAST whose common type keeps the integer,
     /// text and boolean constants [`subst`] folds exactly (no float, no
     /// typmod): its folded value is the one PG computes.
@@ -117,6 +127,31 @@ pub(crate) enum StrictNode {
     /// `StdCompare` with a float operand: integer constants compare as
     /// written only up to the float's precision.
     FloatCompare,
+}
+
+/// The built-in jsonb operators and functions a CHECK constraint's JSON
+/// reading knows (see [`StrictNode::Jsonb`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum JsonbBuiltin {
+    Exists,
+    ExistsAll,
+    Field,
+    FieldText,
+    Typeof,
+}
+
+impl JsonbBuiltin {
+    /// The built-in `proname` resolved to.
+    pub(crate) fn of(proname: &str) -> Option<JsonbBuiltin> {
+        Some(match proname {
+            "jsonb_exists" => JsonbBuiltin::Exists,
+            "jsonb_exists_all" => JsonbBuiltin::ExistsAll,
+            "jsonb_object_field" => JsonbBuiltin::Field,
+            "jsonb_object_field_text" => JsonbBuiltin::FieldText,
+            "jsonb_typeof" => JsonbBuiltin::Typeof,
+            _ => return None,
+        })
+    }
 }
 
 /// What a node being trusted means: [`StrictLog::is_strict`], or the same
@@ -140,6 +175,15 @@ impl Trust for StrictLog {
 pub(crate) struct TrustedNodes {
     pub nodes: HashSet<(i32, StrictNode)>,
     pub literal_types: HashMap<i32, crate::oid::PgTypeOid>,
+    /// The routine each plain function call resolved to, by location.
+    pub calls: HashMap<i32, crate::oid::PgProcOid>,
+}
+
+impl TrustedNodes {
+    /// The routine the plain call at `location` resolved to.
+    pub(crate) fn call(&self, location: i32) -> Option<crate::oid::PgProcOid> {
+        self.calls.get(&location).copied()
+    }
 }
 
 impl Trust for TrustedNodes {
@@ -157,9 +201,18 @@ pub(crate) struct StrictLog(
     RefCell<HashMap<(i32, StrictNode), bool>>,
     RefCell<HashMap<i32, Facts>>,
     RefCell<HashMap<i32, crate::oid::PgTypeOid>>,
+    RefCell<HashMap<i32, crate::oid::PgProcOid>>,
 );
 
 impl StrictLog {
+    /// Record that the plain function call at `location` resolved to
+    /// `proc`.
+    pub fn note_call(&self, location: i32, proc: crate::oid::PgProcOid) {
+        if location >= 0 {
+            self.3.borrow_mut().insert(location, proc);
+        }
+    }
+
     /// Record that the untyped string literal at `location` was coerced
     /// to `type_oid`.
     pub fn note_literal_type(&self, location: i32, type_oid: crate::oid::PgTypeOid) {
@@ -177,6 +230,9 @@ impl StrictLog {
         self.2
             .borrow_mut()
             .extend(other.2.borrow().iter().map(|(k, v)| (*k, *v)));
+        self.3
+            .borrow_mut()
+            .extend(other.3.borrow().iter().map(|(k, v)| (*k, *v)));
     }
 
     /// What this log trusts, kept apart from it.
@@ -190,6 +246,7 @@ impl StrictLog {
                 .map(|(k, _)| *k)
                 .collect(),
             literal_types: self.2.borrow().clone(),
+            calls: self.3.borrow().clone(),
         }
     }
 
@@ -262,6 +319,56 @@ pub(crate) fn deposit_correlation(sel: &protobuf::SelectStmt, mut facts: Facts) 
             *slot = Some(facts);
         }
     });
+}
+
+/// What a subquery's level proves of its own rows (see [`capture_own`]):
+/// its WHERE's facts about its own FROM entries, those entries (alias and
+/// relation), and the column its single target is, when it is one.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct OwnRows {
+    pub facts: Facts,
+    pub sources: Vec<(String, Option<crate::oid::PgClassOid>)>,
+    pub target: Option<Col>,
+}
+
+thread_local! {
+    /// The subquery whose own rows' facts are being captured: the
+    /// `SelectStmt`'s address, and what it deposited.
+    static OWN_ROWS: RefCell<Option<(usize, Option<OwnRows>)>> = const { RefCell::new(None) };
+}
+
+/// Run `f` (the analysis of subquery `sel`), capturing what `sel`'s level
+/// proves of its own rows (see [`OwnRows`]), when every row it returns
+/// passed its WHERE. Only `sel` itself deposits, by address.
+pub(crate) fn capture_own<R>(
+    sel: &protobuf::SelectStmt,
+    f: impl FnOnce() -> R,
+) -> (R, Option<OwnRows>) {
+    let key = sel as *const protobuf::SelectStmt as usize;
+    let before = OWN_ROWS.with(|c| c.replace(Some((key, None))));
+    let out = f();
+    let got = OWN_ROWS.with(|c| c.replace(before));
+    (out, got.and_then(|(_, own)| own))
+}
+
+/// Deposit what `sel`'s level proves of its own rows, if `sel` is the
+/// subquery being captured (see [`capture_own`]).
+pub(crate) fn deposit_own(sel: &protobuf::SelectStmt, mut own: OwnRows) {
+    let key = sel as *const protobuf::SelectStmt as usize;
+    own.facts.exprs.clear();
+    OWN_ROWS.with(|c| {
+        if let Some((k, slot)) = c.borrow_mut().as_mut()
+            && *k == key
+        {
+            *slot = Some(own);
+        }
+    });
+}
+
+/// Whether some query is capturing `sel`'s own rows' facts.
+pub(crate) fn own_wanted(sel: &protobuf::SelectStmt) -> bool {
+    let key = sel as *const protobuf::SelectStmt as usize;
+    OWN_ROWS.with(|c| c.borrow().as_ref().is_some_and(|(k, _)| *k == key))
 }
 
 /// Whether some query is capturing `sel`'s correlation facts.
@@ -573,6 +680,26 @@ impl Facts {
     }
 
     /// Only the facts about the FROM entries named in `aliases`.
+    /// These facts with every column of `from` read as the same column of
+    /// `to`, and nothing about any other entry.
+    pub fn moved(&self, from: &str, to: &str) -> Facts {
+        let one: HashSet<String> = std::iter::once(from.to_owned()).collect();
+        let mut f = self.clone().restricted_to(&one);
+        let mv = |(_, c): &Col| (to.to_owned(), c.clone());
+        f.columns = f.columns.iter().map(mv).collect();
+        f.rels = f.rels.iter().map(|_| to.to_owned()).collect();
+        f.nulls = f.nulls.iter().map(mv).collect();
+        f.disjunctions = f
+            .disjunctions
+            .iter()
+            .map(|d| d.iter().map(mv).collect())
+            .collect();
+        f.equals = f.equals.iter().map(|(c, l)| (mv(c), l.clone())).collect();
+        f.preds = f.preds.iter().map(|(c, p)| (mv(c), p.clone())).collect();
+        f.exprs.clear();
+        f
+    }
+
     pub fn restricted_to(mut self, aliases: &HashSet<String>) -> Facts {
         self.columns.retain(|(a, _)| aliases.contains(a));
         self.rels.retain(|a| aliases.contains(a));
@@ -975,20 +1102,26 @@ fn nonnullable_node(
         {
             log.correlated(sub.location)
         }
-        // `x IN (SELECT …)` / `x op ANY (SELECT …)`: like `op ANY(array)`.
-        node::Node::SubLink(sub)
-            if top_level && log.is_strict(sub.location, StrictNode::Sublink) =>
-        {
-            match sub.testexpr.as_deref() {
-                Some(t) => match t.node.as_ref() {
-                    Some(node::Node::RowExpr(r)) => r
-                        .args
-                        .iter()
-                        .fold(Facts::default(), |acc, a| acc.union(walk(a, false))),
-                    _ => walk(t, false),
-                },
-                None => Facts::default(),
-            }
+        // `x IN (SELECT …)` / `x op ANY (SELECT …)`: like `op ANY(array)`;
+        // and, for `k IN (SELECT k FROM t … FOR UPDATE)` over a key of the
+        // same table, what the subquery's WHERE proves of the row (noted
+        // by `expr::sublink`).
+        node::Node::SubLink(sub) if top_level => {
+            let tested = if log.is_strict(sub.location, StrictNode::Sublink) {
+                match sub.testexpr.as_deref() {
+                    Some(t) => match t.node.as_ref() {
+                        Some(node::Node::RowExpr(r)) => r
+                            .args
+                            .iter()
+                            .fold(Facts::default(), |acc, a| acc.union(walk(a, false))),
+                        _ => walk(t, false),
+                    },
+                    None => Facts::default(),
+                }
+            } else {
+                Facts::default()
+            };
+            tested.union(log.correlated(sub.location))
         }
         // Boolean tests that are not TRUE for a NULL input.
         node::Node::BooleanTest(t)

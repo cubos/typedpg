@@ -314,8 +314,9 @@ let rows = sql!(pool, "SELECT done_at FROM tasks WHERE status IN ('done')")
 // rows[0].done_at : OffsetDateTime
 
 // A CASE without ELSE is NOT NULL when its WHENs cover every value: an
-// enum's labels, a CHECK (kind IN (…)) list, both booleans, IS NULL and
-// IS NOT NULL, `a > 0` and `a <= 0`
+// enum's labels, a CHECK (kind IN (…)) list (on the table or a domain), both
+// booleans, the values a subquery or CTE column is known to hold (a CASE of
+// literals), IS NULL and IS NOT NULL, `a > 0` and `a <= 0`
 let rows = sql!(pool, "SELECT CASE status WHEN 'open' THEN 1 WHEN 'closed' THEN 2 END AS n FROM tickets")
     .fetch_all().await?;
 // rows[0].n : i32  (status is a NOT NULL enum ('open', 'closed'))
@@ -324,7 +325,9 @@ let rows = sql!(pool, "SELECT CASE status WHEN 'open' THEN 1 WHEN 'closed' THEN 
 A partition's bound counts as a constraint too (a range partition key, or a
 list one with no NULL, is never NULL — in the partitioned table as well, when
 no partition takes a NULL key), and so does a `MATCH FULL` foreign key: one of
-its columns non-NULL makes all of them so.
+its columns non-NULL makes all of them so. PostgreSQL has no NOT NULL for an
+array's elements; `CHECK (array_position(tags, NULL) IS NULL)` on the column,
+or on a domain over the array (`VALUE`), stands for one.
 
 A referenced table under row-level security doesn't count: its policies may
 hide the row. The foreign key holds just the same through subqueries, CTEs,
@@ -397,6 +400,47 @@ A data-modifying CTE that inserts one `VALUES` row (without a set-returning
 function, which makes it any number of rows, nor `ON CONFLICT DO NOTHING`, a
 `DO UPDATE ... WHERE` or a BEFORE ROW trigger, which may skip it) returns
 exactly one row, so `(SELECT id FROM ins)` is that row's `id`.
+
+### Finite dates and times
+
+`to_char` and `EXTRACT` / `date_part` of most fields are NULL for an infinite
+date, timestamp or interval. The analysis knows a value is finite when it is
+the current time (`now()`, `CURRENT_DATE`, …), a literal other than
+`infinity`, arithmetic, truncation or a conversion of finite values, the
+`min` / `max` / `lag` of them, or a column whose table (or domain) says so
+with `CHECK (isfinite(col))`. It follows the value through subqueries, CTEs,
+`UNION`, `CASE` and `COALESCE`:
+
+```rust
+// CHECK (isfinite(created_at))
+let rows = sql!(pool,
+    "SELECT to_char(created_at, 'YYYY-MM') AS month,
+            extract(day FROM now() - interval '1 week') AS day
+     FROM posts")
+    .fetch_all().await?;
+// rows[0].month : String, rows[0].day : Decimal
+```
+
+### Values and ranges
+
+The analysis also knows which values a value can be, when few — an enum's
+labels, a `CHECK (kind IN (…))` list (on the table or a domain), what the
+`WHERE` or a `CASE` branch leaves (`WHERE kind <> 'draft'`), literals — and
+the bounds of an integer: a `CHECK (n BETWEEN 1 AND 100)` or `CHECK (VALUE >
+0)`, a `WHERE`, counts and positions (`count(*)`, `row_number()`, `length`),
+`min` / `max` and integer arithmetic. `NULLIF(x, v)` is NOT NULL when `x`
+can't be `v`, and a `CASE` covering every value a column can be has no
+`ELSE` to fall to:
+
+```rust
+// CHECK (attempts BETWEEN 0 AND 2)
+let rows = sql!(pool,
+    "SELECT total / NULLIF(row_number() OVER (), 0) AS avg,
+            CASE attempts WHEN 0 THEN 'new' WHEN 1 THEN 'retried' WHEN 2 THEN 'last' END AS stage
+     FROM jobs")
+    .fetch_all().await?;
+// rows[0].avg : i64, rows[0].stage : String
+```
 
 ### Nullability annotations
 

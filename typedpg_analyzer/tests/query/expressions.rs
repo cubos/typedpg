@@ -1342,9 +1342,10 @@ fn non_variadic_overload_beats_an_equal_variadic_expansion() {
     let s = db
         .analyze("SELECT ov(1) AS plain, ov(1, 2) AS spread, ov2(1) AS one")
         .unwrap();
+    // `ov(1)` is its body, `'plain'`; a variadic call isn't read as one.
     assert_cols(
         &s,
-        vec![cn("plain", text()), cn("spread", int4()), cn("one", int4())],
+        vec![c("plain", text()), cn("spread", int4()), cn("one", int4())],
     );
     // Two variadic expansions with the same signature stay tied.
     assert_err_prefix(

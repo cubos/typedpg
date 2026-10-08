@@ -83,11 +83,12 @@ pub enum Type {
         /// Whether the array's elements can be NULL, where the analysis
         /// knows: `Some(true)` for `array_agg(nullable_col)` or
         /// `ARRAY[a, NULL]`, `Some(false)` for `array_agg(not_null_col)` or
-        /// `string_to_array(s, ',')`. `None` when nothing is known — always
-        /// the case for a table's array column (PostgreSQL has no NOT NULL
-        /// for elements), a parameter, or an array that came through a
-        /// view or most expressions (a subquery or CTE keeps what its
-        /// query knows).
+        /// `string_to_array(s, ',')`, or a table's column (or a domain) whose
+        /// CHECK says `array_position(c, NULL) IS NULL`. `None` when nothing
+        /// is known — the case for any other table's array column
+        /// (PostgreSQL has no NOT NULL for elements), a parameter, or an
+        /// array most expressions make (a subquery, CTE or view keeps what
+        /// its query knows).
         element_nullable: Option<bool>,
     },
     Enum {

@@ -286,6 +286,7 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
     // boolean, not type X`. Catch the generic coerce error and rewrite to
     // PG's exact message so `pglite_sanity` matches.
     let mut correlated: Option<crate::nonnull::Facts> = None;
+    let mut own_facts: Option<crate::nonnull::Facts> = None;
     let log = crate::nonnull::StrictLog::default();
     if let Some(where_clause) = &sel.where_clause {
         // PG rejects aggregate / window function calls inside WHERE (they
@@ -314,6 +315,11 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
                 .filter(|a| !own.contains(a))
                 .collect();
             correlated = Some(facts.clone().restricted_to(&outer));
+        }
+        // An `IN` subquery hands what it proves of its own rows up (see
+        // `nonnull::capture_own`).
+        if crate::nonnull::own_wanted(sel) {
+            own_facts = Some(facts.clone().restricted_to(&own));
         }
         null_ctx.add_where_facts(facts.restricted_to(&own));
     }
@@ -560,6 +566,36 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
         };
         if rows_from_where {
             crate::nonnull::deposit_correlation(sel, facts);
+        }
+    }
+    if let Some(facts) = own_facts {
+        let rows_from_where = sel.group_clause.is_empty()
+            && sel.having_clause.is_none()
+            && !grouping::level_info(sel).is_some_and(|l| l.has_aggs);
+        let target = match sel.target_list.as_slice() {
+            [t] => match t.node.as_ref() {
+                Some(node::Node::ResTarget(rt)) => rt
+                    .val
+                    .as_deref()
+                    .and_then(|v| crate::nonnull::plain_column(v, &scope))
+                    .map(|(col, _)| col),
+                _ => None,
+            },
+            _ => None,
+        };
+        if rows_from_where {
+            crate::nonnull::deposit_own(
+                sel,
+                crate::nonnull::OwnRows {
+                    facts,
+                    sources: scope
+                        .sources
+                        .iter()
+                        .map(|s| (s.alias.clone(), s.relid))
+                        .collect(),
+                    target,
+                },
+            );
         }
     }
 
@@ -917,6 +953,7 @@ fn values_sort_and_limit(
             table_alias: alias.clone(),
             record_fields: c.record_fields.clone(),
             elem_nullable: c.elem_nullable,
+            refine: c.refine.clone(),
             origin: None,
         })
         .collect();

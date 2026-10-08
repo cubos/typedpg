@@ -68,13 +68,16 @@ pub(crate) fn infer_sublink(
             if let Some(subselect) = &sub.subselect
                 && let Some(node::Node::SelectStmt(sel)) = subselect.node.as_ref()
             {
-                let (cols, _) = crate::resolve::analyze_correlated_select(
-                    sel,
-                    snapshot,
-                    params,
-                    scope,
-                    ctx.null_ctx,
-                )?;
+                let (analyzed, own) = crate::nonnull::capture_own(sel, || {
+                    crate::resolve::analyze_correlated_select(
+                        sel,
+                        snapshot,
+                        params,
+                        scope,
+                        ctx.null_ctx,
+                    )
+                });
+                let (cols, _) = analyzed?;
 
                 // Arity check: `lhs IN (SELECT …)` / `lhs = ANY(SELECT …)`
                 // requires the LHS and the subquery to match column counts.
@@ -121,6 +124,13 @@ pub(crate) fn infer_sublink(
                         joined
                     }
                 };
+                if sub_type == protobuf::SubLinkType::AnySublink
+                    && op_name == "="
+                    && let (Some(own), Some(log)) = (own, ctx.strict_log)
+                    && let Some(facts) = same_row_facts(sub, sel, &own, scope, snapshot)
+                {
+                    log.note_correlated(sub.location, facts);
+                }
                 // `x op ANY (SELECT …)` is NULL or FALSE for a NULL `x` when
                 // every comparison is strict (a row's `=` is an AND of its
                 // fields' comparisons, never TRUE with a NULL field).
@@ -306,4 +316,79 @@ fn single_sublink_column(
         first.type_oid = oid::TEXT;
     }
     Ok((first, min_one_row))
+}
+
+/// What `k IN (SELECT k FROM t … FOR UPDATE)` being TRUE proves of the row
+/// of `t` it tests, `k` a key of `t` and the subquery a plain one over `t`
+/// alone: everything the subquery's WHERE proves of its rows, read of that
+/// row — the queue claim, `UPDATE t … WHERE id IN (SELECT id FROM t WHERE
+/// … FOR UPDATE SKIP LOCKED)`. `None` unless all of it holds:
+///
+/// - the tested expression is a column of a FROM entry of this level, over
+///   a plain table (no partitions or inheritance children: a key is unique
+///   in one table), and the subquery selects that column of its single FROM
+///   item, the same table;
+/// - a unique, non-partial index on that column alone, of its collation,
+///   makes the row with the value the row the subquery returned;
+/// - the subquery locks that row — FOR UPDATE, NO KEY UPDATE or SHARE,
+///   each conflicting with any update. A statement may read a row anew
+///   (EvalPlanQual: an UPDATE's or a locking SELECT's re-fetched target)
+///   after the subquery read it; a lock taken while the subquery checks
+///   its WHERE on the row's newest version keeps that version until the
+///   transaction ends.
+fn same_row_facts(
+    sub: &protobuf::SubLink,
+    sel: &protobuf::SelectStmt,
+    own: &crate::nonnull::OwnRows,
+    scope: &Scope,
+    snapshot: &PgCatalog,
+) -> Option<crate::nonnull::Facts> {
+    use protobuf::LockClauseStrength as S;
+    let ((outer, column), _) = crate::nonnull::plain_column(sub.testexpr.as_deref()?, scope)?;
+    let [(inner, Some(relid))] = own.sources.as_slice() else {
+        return None;
+    };
+    let (target_alias, target_column) = own.target.as_ref()?;
+    if target_alias != inner || *target_column != column {
+        return None;
+    }
+    let source = scope.sources.iter().find(|s| s.alias == outer)?;
+    if source.relid != Some(*relid) {
+        return None;
+    }
+    let plain_table = snapshot
+        .pg_class
+        .get(relid)
+        .is_some_and(|c| c.relkind == crate::pg_catalog::RelKind::Table)
+        && !snapshot.pg_inherits.iter().any(|i| i.inhparent == *relid);
+    if !plain_table {
+        return None;
+    }
+    let attr = snapshot
+        .attributes_of(*relid)
+        .iter()
+        .find(|a| a.attname == column && a.attnum > 0)?;
+    let keyed = snapshot.pg_index.values().any(|idx| {
+        idx.indrelid == *relid
+            && idx.indisunique
+            && !idx.indisexclusion
+            && idx.indpred.is_none()
+            && idx.indnkeyatts == 1
+            && idx.indkey.first() == Some(&attr.attnum)
+            && idx.indcollation.first().copied().flatten() == attr.attcollation
+            && !snapshot.invalid_indexes.contains(&idx.indexrelid)
+    });
+    let locked = sel.locking_clause.iter().any(|l| match l.node.as_ref() {
+        Some(node::Node::LockingClause(lc)) => {
+            matches!(
+                S::try_from(lc.strength),
+                Ok(S::LcsForupdate | S::LcsFornokeyupdate | S::LcsForshare)
+            ) && (lc.locked_rels.is_empty()
+                || lc.locked_rels.iter().any(|r| {
+                    matches!(r.node.as_ref(), Some(node::Node::RangeVar(rv)) if rv.relname == *inner)
+                }))
+        }
+        _ => false,
+    });
+    (keyed && locked).then(|| own.facts.moved(inner, &outer))
 }

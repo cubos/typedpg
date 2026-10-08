@@ -15,9 +15,14 @@ pub(crate) fn build_column(
         rc.record_fields.as_deref(),
         snapshot,
     )?;
+    // A domain over an array has its elements too.
+    let mut array = &mut pg_type;
+    while let Type::Domain { base, .. } = array {
+        array = base;
+    }
     if let Type::Array {
         element_nullable, ..
-    } = &mut pg_type
+    } = array
     {
         *element_nullable = rc.elem_nullable;
     }
@@ -29,6 +34,11 @@ pub(crate) fn build_column(
         name,
         pg_type,
         nullable,
+        // A range of a few integers lists them.
+        refinement: crate::refine::Refinement {
+            values: rc.refine.enumerated(),
+            ..rc.refine
+        },
     })
 }
 

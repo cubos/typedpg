@@ -89,6 +89,14 @@ impl<'a> Ctx<'a> {
         }
     }
 
+    /// Record that the plain function call at `location` resolved to
+    /// `proc`.
+    pub fn note_call(&self, location: i32, proc: crate::oid::PgProcOid) {
+        if let Some(log) = self.strict_log {
+            log.note_call(location, proc);
+        }
+    }
+
     /// Record that the untyped string literal at `location` was coerced to
     /// `type_oid`.
     pub fn note_literal_type(&self, location: i32, type_oid: PgTypeOid) {
@@ -289,6 +297,8 @@ pub(crate) struct ExprType {
     /// For an array value, whether its elements can be NULL, where known
     /// (see [`crate::types::Type::Array`]); `None` otherwise.
     pub elem_nullable: Option<bool>,
+    /// What every non-NULL value is (see [`crate::refine`]).
+    pub refine: crate::refine::Refinement,
 }
 
 /// The row shape of a record value: its fields, and whether PostgreSQL
@@ -343,6 +353,7 @@ pub(crate) fn merge_set_op_shapes(
         if union {
             ty.nullable |= r.ty.nullable;
             ty.elem_nullable = merge_elem_nullable([l.ty.elem_nullable, r.ty.elem_nullable]);
+            ty.refine = crate::refine::Refinement::either([&l.ty.refine, &r.ty.refine]);
             ty.record_fields = match (&l.ty.record_fields, &r.ty.record_fields) {
                 (None, None) => None,
                 (l, r) => merge_set_op_shapes(l.as_ref(), r.as_ref(), true),
@@ -417,6 +428,7 @@ impl ExprType {
             explicit_collation: false,
             record_fields: None,
             elem_nullable: None,
+            refine: crate::refine::Refinement::NONE,
         }
     }
 
@@ -432,6 +444,7 @@ impl ExprType {
             explicit_collation: false,
             record_fields: None,
             elem_nullable: None,
+            refine: crate::refine::Refinement::NONE,
         }
     }
 
@@ -453,7 +466,14 @@ impl ExprType {
             explicit_collation: false,
             record_fields: None,
             elem_nullable: None,
+            refine: crate::refine::Refinement::NONE,
         }
+    }
+
+    /// The same value, refined.
+    pub fn with_refine(mut self, refine: crate::refine::Refinement) -> Self {
+        self.refine = refine;
+        self
     }
 
     /// The same value, with its array elements' nullability.
@@ -481,6 +501,7 @@ impl ExprType {
         if literals::coercion_can_null_elements(self.type_oid, to, snapshot) {
             self.elem_nullable = Some(true);
         }
+        self.refine = self.refine.converted(self.type_oid, to, snapshot);
     }
 }
 
@@ -948,6 +969,9 @@ fn infer_expr_unlocated(
         node::Node::CaseExpr(expr) => infer_case(expr, ctx, params),
         node::Node::SubLink(sub) => infer_sublink(sub, ctx, params),
         node::Node::ParamRef(p) => {
+            if let Some(arg) = params.bound_arg(p.number) {
+                return Ok(arg.clone());
+            }
             params.see(p.number);
             // If the param is still untyped and the context provides a goal,
             // record the goal type — this is our equivalent of PG's
@@ -1017,9 +1041,30 @@ fn infer_expr_unlocated(
                 crate::nonnull::StrictNode::FloatFold,
                 crate::nonnull::subst::folds_as_float(resolved_type, snapshot),
             );
+            let branches: Vec<(&protobuf::Node, &ExprType)> = mm.args.iter().zip(&args).collect();
+            let mut refine = conditional::branches_refine(&branches, resolved_type, snapshot);
+            // GREATEST is at least each non-NULL argument (LEAST at most):
+            // a NOT NULL one bounds it whatever the others are.
+            if crate::refine::Exact::of(resolved_type, None, snapshot)
+                == Some(crate::refine::Exact::Int)
+            {
+                let mut range = refine.range.unwrap_or_default();
+                for a in args.iter().filter(|a| !a.nullable) {
+                    let Some(b) = a.refine.int_bounds() else {
+                        continue;
+                    };
+                    if label == "GREATEST" {
+                        range.lo = range.lo.max(b.lo);
+                    } else if let Some(hi) = b.hi {
+                        range.hi = Some(range.hi.map_or(hi, |h| h.min(hi)));
+                    }
+                }
+                refine.range = (range != crate::refine::IntRange::default()).then_some(range);
+            }
             Ok(
                 ExprType::scalar_with_typmod(resolved_type, nullable, typmod)
-                    .with_collation(derive_collation(&args, resolved_type, snapshot)?),
+                    .with_collation(derive_collation(&args, resolved_type, snapshot)?)
+                    .with_refine(refine),
             )
         }
         node::Node::AIndirection(ind) => {
@@ -1186,6 +1231,7 @@ fn infer_expr_unlocated(
                 explicit_collation: false,
                 record_fields: Some(fields.into()),
                 elem_nullable: None,
+                refine: crate::refine::Refinement::NONE,
             })
         }
         node::Node::SetToDefault(d) => {
@@ -1333,7 +1379,9 @@ fn infer_expr_unlocated(
             // `CURRENT_SCHEMA` evaluates `current_schema()`, which is NULL
             // when no schema on the search path exists.
             let nullable = op == Op::SvfopCurrentSchema;
-            Ok(ExprType::scalar_with_typmod(type_oid, nullable, typmod))
+            // The current date and time are finite.
+            Ok(ExprType::scalar_with_typmod(type_oid, nullable, typmod)
+                .with_refine(crate::refine::Refinement::FINITE))
         }
         node::Node::MergeSupportFunc(f) => crate::resolve::infer_merge_support_func(f),
         // `WHERE CURRENT OF cursor` (UPDATE / DELETE only, by grammar): a
@@ -1804,6 +1852,7 @@ mod column_refs;
 mod conditional;
 mod func_call;
 mod indirection;
+pub(crate) mod inline;
 mod json;
 pub(crate) mod literals;
 pub(crate) mod operators;

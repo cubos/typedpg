@@ -548,3 +548,100 @@ fn one_row_insert_cte() {
         &[("id", true)],
     );
 }
+
+// ── The queue claim: a key IN a locking subquery over the same table ────────
+
+fn queue() -> PgCatalog {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE q (id int PRIMARY KEY, c int, m text, claimed timestamptz, slug text,
+             u int UNIQUE, p int);
+         CREATE UNIQUE INDEX q_p ON q (p) WHERE p > 0;
+         CREATE TABLE other (id int PRIMARY KEY, c int);
+         CREATE TABLE parent (id int PRIMARY KEY, c int);
+         CREATE TABLE child () INHERITS (parent);",
+    )
+    .unwrap();
+    db
+}
+
+/// `UPDATE q … WHERE id IN (SELECT id FROM q WHERE c IS NOT NULL … FOR
+/// UPDATE SKIP LOCKED)`: the row updated is the row the subquery locked
+/// (`id` a key), on whose newest version its WHERE held — what it proves
+/// holds for RETURNING, as for the statement's own WHERE.
+#[test]
+fn a_locked_key_subquery_over_the_same_table_narrows_the_row() {
+    let db = queue();
+    for lock in [
+        "FOR UPDATE SKIP LOCKED",
+        "FOR NO KEY UPDATE",
+        "FOR SHARE",
+        "FOR UPDATE OF q",
+    ] {
+        assert_nullable(
+            &db,
+            &format!(
+                "UPDATE q SET claimed = now() WHERE id IN (
+                   SELECT id FROM q WHERE c IS NOT NULL AND m IS NOT NULL ORDER BY id LIMIT 5 {lock}
+                 ) RETURNING c, m, slug"
+            ),
+            &[("c", false), ("m", false), ("slug", true)],
+        );
+    }
+    // Another unique key, an alias inside, DELETE, a locking SELECT.
+    assert_nullable(
+        &db,
+        "UPDATE q SET claimed = now() WHERE u IN (SELECT x.u FROM q x WHERE x.c > 0 FOR UPDATE)
+         RETURNING c",
+        &[("c", false)],
+    );
+    assert_nullable(
+        &db,
+        "DELETE FROM q WHERE id IN (SELECT id FROM q WHERE c IS NOT NULL FOR UPDATE) RETURNING c",
+        &[("c", false)],
+    );
+    assert_nullable(
+        &db,
+        "SELECT c FROM q WHERE id IN (SELECT id FROM q WHERE c IS NOT NULL FOR UPDATE) FOR UPDATE",
+        &[("c", false)],
+    );
+    // The SET still decides what it writes.
+    assert_nullable(
+        &db,
+        "UPDATE q SET c = NULL WHERE id IN (SELECT id FROM q WHERE c IS NOT NULL FOR UPDATE)
+         RETURNING c",
+        &[("c", true)],
+    );
+}
+
+/// Without each condition, the row tested may not be the row the WHERE
+/// held for: no lock (or KEY SHARE, which lets updates through) leaves a
+/// re-fetched row free to have changed (so does locking only another
+/// table of a join); a column that isn't a key — or a
+/// key only partly unique — may match other rows; another table, or one
+/// with inheritance children, has other rows; NOT IN and `<>` ANY match
+/// other rows by design.
+#[test]
+fn the_row_is_narrowed_only_when_it_is_the_locked_one() {
+    let db = queue();
+    for sql in [
+        "UPDATE q SET claimed = now() WHERE id IN (SELECT id FROM q WHERE c IS NOT NULL) RETURNING c",
+        "UPDATE q SET claimed = now() WHERE id IN (SELECT id FROM q WHERE c IS NOT NULL FOR KEY SHARE) RETURNING c",
+        "UPDATE q SET claimed = now() WHERE id IN (SELECT q.id FROM q JOIN other o ON o.id = q.id WHERE q.c IS NOT NULL FOR UPDATE OF o) RETURNING c",
+        "UPDATE q SET claimed = now() WHERE slug IN (SELECT slug FROM q WHERE c IS NOT NULL FOR UPDATE) RETURNING c",
+        "UPDATE q SET claimed = now() WHERE p IN (SELECT p FROM q WHERE c IS NOT NULL FOR UPDATE) RETURNING c",
+        "UPDATE q SET claimed = now() WHERE id IN (SELECT u FROM q WHERE c IS NOT NULL FOR UPDATE) RETURNING c",
+        "UPDATE q SET claimed = now() WHERE id IN (SELECT id FROM other WHERE c IS NOT NULL FOR UPDATE) RETURNING c",
+        "UPDATE q SET claimed = now() WHERE id <> ALL (SELECT id FROM q WHERE c IS NOT NULL FOR UPDATE) RETURNING c",
+        "UPDATE q SET claimed = now() WHERE NOT (id IN (SELECT id FROM q WHERE c IS NOT NULL FOR UPDATE)) RETURNING c",
+        "UPDATE q SET claimed = now() WHERE id IN (SELECT max(id) FROM q WHERE c IS NOT NULL) RETURNING c",
+    ] {
+        assert_nullable(&db, sql, &[("c", true)]);
+    }
+    assert_nullable(
+        &db,
+        "UPDATE parent SET c = c WHERE id IN (SELECT id FROM parent WHERE c IS NOT NULL FOR UPDATE)
+         RETURNING c",
+        &[("c", true)],
+    );
+}

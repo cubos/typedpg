@@ -22,6 +22,8 @@ mod assignments;
 mod call;
 #[path = "query/casts_and_coercion.rs"]
 mod casts_and_coercion;
+#[path = "query/check_json_facts.rs"]
+mod check_json_facts;
 #[path = "query/check_reasoning.rs"]
 mod check_reasoning;
 #[path = "query/constraint_narrowing.rs"]
@@ -76,6 +78,8 @@ mod nullability_soundness;
 mod params;
 #[path = "query/records.rs"]
 mod records;
+#[path = "query/refinements.rs"]
+mod refinements;
 #[path = "query/select.rs"]
 mod select;
 #[path = "query/select_rules.rs"]
@@ -86,6 +90,8 @@ mod set_operations;
 mod set_returning_functions;
 #[path = "query/special.rs"]
 mod special;
+#[path = "query/sql_function_inlining.rs"]
+mod sql_function_inlining;
 #[path = "query/sql_json.rs"]
 mod sql_json;
 #[path = "query/subqueries.rs"]

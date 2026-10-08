@@ -30,6 +30,34 @@ pub(crate) fn check_column_ref_length(col_ref: &protobuf::ColumnRef) -> Result<(
     Err(err.finalize_implicit())
 }
 
+/// What a column read here is: its own refinement, and the values its
+/// type, its table's CHECK constraints and the conditions holding here
+/// leave it (`WHERE kind IN ('a', 'b')` makes `kind` one of those).
+fn column_refinement(col: &crate::scope::ScopeColumn, ctx: Ctx<'_>) -> crate::refine::Refinement {
+    let mut refine = col.refine.clone();
+    if crate::refine::Exact::of(col.type_oid, col.collation, ctx.snapshot).is_some() {
+        let space = crate::nonnull::checks::Space::of(col.type_oid, col.collation, ctx.snapshot)
+            .with_values(col.refine.enumerated().as_ref());
+        let key = (col.table_alias.clone(), col.name.clone());
+        let preds = ctx.null_ctx.column_preds(&key);
+        if let Some(cands) = space.candidates_of(&preds) {
+            refine.values = cands.iter().map(|l| space.print(l)).collect();
+        }
+        if let Some(bounds) = space
+            .bounds(&preds)
+            .filter(|b| *b != crate::refine::IntRange::default())
+        {
+            refine.range = Some(match refine.range {
+                Some(r) => r.meet(&bounds),
+                None => bounds,
+            });
+        }
+    } else {
+        refine.values = None;
+    }
+    refine
+}
+
 pub(crate) fn infer_column_ref(
     col_ref: &protobuf::ColumnRef,
     ctx: Ctx<'_>,
@@ -88,6 +116,7 @@ pub(crate) fn infer_column_ref(
                 // see through to the field types.
                 record_fields: col.record_fields.clone(),
                 elem_nullable: col.elem_nullable,
+                refine: column_refinement(col, ctx),
             })
         }
         Err(e) => {
@@ -270,6 +299,7 @@ fn whole_row_ref(
                     explicit_collation: false,
                     record_fields: c.record_fields.clone(),
                     elem_nullable: c.elem_nullable,
+                    refine: c.refine.clone(),
                 });
             }
         }
@@ -284,6 +314,7 @@ fn whole_row_ref(
         explicit_collation: false,
         record_fields: Some(shape_of_columns(&source.columns).into()),
         elem_nullable: None,
+        refine: crate::refine::Refinement::NONE,
     })
 }
 
@@ -302,6 +333,7 @@ fn shape_of_columns(columns: &[crate::scope::ScopeColumn]) -> Vec<RecordField> {
                 explicit_collation: false,
                 record_fields: c.record_fields.clone(),
                 elem_nullable: c.elem_nullable,
+                refine: c.refine.clone(),
             },
         })
         .collect()

@@ -391,8 +391,13 @@ fn with_statement_sql(
     // Statements may apply nested SQL (extension scripts): restore the
     // outer statement's text afterwards.
     let outer = std::mem::replace(&mut db.statement_sql, text);
-    let result = f(db);
+    // A DDL statement's expressions are resolved (and validated), not read
+    // for what calls in them make: that is for the queries. (Reading every
+    // JSON-schema CHECK's nested functions while a schema dump is applied
+    // made it several times slower.)
+    let result = crate::expr::inline::resolving_only(|| f(db));
     db.statement_sql = outer;
+    db.forget_inline_body_trust();
     result
 }
 

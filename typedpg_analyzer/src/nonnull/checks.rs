@@ -72,6 +72,64 @@ struct Clause {
     arms: Vec<Vec<Lit>>,
 }
 
+impl Clause {
+    /// The same, its arms read whole: an arm whose comparisons of one
+    /// subject can't all hold of a value holds only of NULL (each is "NULL
+    /// or …"), so it says the subject is NULL — and is impossible besides
+    /// a literal saying it isn't.
+    fn normalized(self, spaces: &HashMap<String, Space>) -> Clause {
+        let arms = self
+            .arms
+            .into_iter()
+            .filter_map(|arm| {
+                let mut preds: HashMap<&String, Vec<ValPred>> = HashMap::new();
+                for l in &arm {
+                    if let Lit::Val(c, p) = l {
+                        preds.entry(c).or_default().push(p.clone());
+                    }
+                }
+                let null: Vec<String> = preds
+                    .iter()
+                    .filter(|(c, ps)| spaces.get(**c).is_some_and(|s| s.contradictory(ps)))
+                    .map(|(c, _)| (*c).clone())
+                    .collect();
+                if null.is_empty() {
+                    return Some(arm);
+                }
+                if arm
+                    .iter()
+                    .any(|l| matches!(l, Lit::NotNull(c) if null.contains(c)))
+                {
+                    return None;
+                }
+                let mut out: Vec<Lit> = arm
+                    .into_iter()
+                    .filter(|l| !matches!(l, Lit::Val(c, _) if null.contains(c)))
+                    .collect();
+                out.extend(null.into_iter().map(Lit::IsNull));
+                Some(out)
+            })
+            .collect();
+        Clause { arms }
+    }
+
+    /// The names its literals are about.
+    fn names(&self) -> impl Iterator<Item = &String> {
+        self.arms
+            .iter()
+            .flatten()
+            .flat_map(|l| -> Box<dyn Iterator<Item = &String>> {
+                match l {
+                    Lit::NotNull(c) | Lit::IsNull(c) | Lit::Val(c, _) => {
+                        Box::new(std::iter::once(c))
+                    }
+                    Lit::SomeNonNull(cs) | Lit::AllNonNull(cs) => Box::new(cs.iter()),
+                    Lit::Other => Box::new(std::iter::empty()),
+                }
+            })
+    }
+}
+
 /// How the values of a column compare with constants: what makes two
 /// constants the same value, or different ones.
 #[derive(Debug, Clone, Default)]
@@ -168,6 +226,51 @@ impl Space {
         Space::default()
     }
 
+    /// The space with every value one of `values` (printed as
+    /// [`crate::refine::Refinement::values`] are): what a value refined so
+    /// can hold.
+    pub(crate) fn with_values(mut self, values: Option<&BTreeSet<String>>) -> Space {
+        let Some(values) = values else {
+            return self;
+        };
+        let kind = match self.kind {
+            SpaceKind::Int => LitKind::Integer,
+            SpaceKind::Bool => LitKind::Boolean,
+            SpaceKind::Str => LitKind::String,
+            SpaceKind::Opaque => return self,
+        };
+        let refined: Vec<Literal> = values
+            .iter()
+            .map(|v| Literal {
+                text: v.clone(),
+                kind,
+            })
+            .collect();
+        self.domain = Some(match self.domain.take() {
+            None => refined,
+            Some(d) => d
+                .into_iter()
+                .filter(|x| refined.iter().any(|v| self.same(x, v)))
+                .collect(),
+        });
+        self
+    }
+
+    /// `l` as printed in a [`crate::refine::Refinement::values`] set.
+    pub(crate) fn print(&self, l: &Literal) -> Option<String> {
+        Some(match self.value(l)? {
+            Value::Int(i) => i.to_string(),
+            Value::Bool(b) => b.to_string(),
+            Value::Str(s) => s,
+        })
+    }
+
+    /// The values a non-NULL value satisfying every one of `preds` can
+    /// hold, when finitely many (see [`Space::candidates`]).
+    pub(crate) fn candidates_of(&self, preds: &[ValPred]) -> Option<Vec<Literal>> {
+        self.candidates(preds)
+    }
+
     fn value(&self, l: &Literal) -> Option<Value> {
         match (self.kind, l.kind) {
             (SpaceKind::Int, LitKind::Integer) => l.text.parse().ok().map(Value::Int),
@@ -222,6 +325,24 @@ impl Space {
     /// hold, when they are finitely many (and known).
     fn candidates(&self, preds: &[ValPred]) -> Option<Vec<Literal>> {
         let mut cands = self.domain.clone();
+        // An integer between two near bounds is one of the few between.
+        if cands.is_none()
+            && let Some(crate::refine::IntRange {
+                lo: Some(lo),
+                hi: Some(hi),
+            }) = self.bounds(preds)
+            && hi >= lo
+            && hi - lo < MAX_ENUMERATED
+        {
+            cands = Some(
+                (lo..=hi)
+                    .map(|v| Literal {
+                        text: v.to_string(),
+                        kind: LitKind::Integer,
+                    })
+                    .collect(),
+            );
+        }
         for p in preds {
             if let ValPred::In(vs) = p {
                 cands = Some(match cands {
@@ -238,6 +359,45 @@ impl Space {
                 .filter(|x| !preds.iter().any(|p| self.fails(p, x)))
                 .collect()
         })
+    }
+
+    /// The bounds the ordering comparisons and value lists among `preds`
+    /// leave a non-NULL integer column (`None` for a space of another kind).
+    pub(crate) fn bounds(&self, preds: &[ValPred]) -> Option<crate::refine::IntRange> {
+        if self.kind != SpaceKind::Int || !self.integral {
+            return None;
+        }
+        let mut r = crate::refine::IntRange::default();
+        for p in preds {
+            let b = match p {
+                ValPred::Cmp(op, v) => {
+                    let Some(v) = self.int(v) else { continue };
+                    match op {
+                        CmpOp::Gt => crate::refine::IntRange::at_least(v + 1),
+                        CmpOp::Ge => crate::refine::IntRange::at_least(v),
+                        CmpOp::Lt => crate::refine::IntRange {
+                            lo: None,
+                            hi: Some(v - 1),
+                        },
+                        CmpOp::Le => crate::refine::IntRange {
+                            lo: None,
+                            hi: Some(v),
+                        },
+                    }
+                }
+                ValPred::In(vs) => {
+                    let ints: Option<Vec<i128>> = vs.iter().map(|v| self.int(v)).collect();
+                    let Some(ints) = ints else { continue };
+                    crate::refine::IntRange {
+                        lo: ints.iter().min().copied(),
+                        hi: ints.iter().max().copied(),
+                    }
+                }
+                ValPred::NotIn(_) => continue,
+            };
+            r = r.meet(&b);
+        }
+        Some(r)
     }
 
     /// The interval the ordering comparisons among `preds` (and `extra`)
@@ -304,8 +464,16 @@ impl Space {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RelationChecks {
     clauses: Vec<Clause>,
+    /// The clauses about expression subjects (see [`Subject`]): read only
+    /// for the facts about expressions they prove, after the columns'.
+    expr_clauses: Vec<Clause>,
     /// How each column's values compare with constants.
     spaces: HashMap<String, Space>,
+    /// The expression subjects literals name (see [`Subject`]).
+    subjects: HashMap<String, Subject>,
+    /// The subject a `jsonb_typeof(x)` subject is of, by name: non-NULL
+    /// as `x` is.
+    typeof_of: HashMap<String, String>,
 }
 
 /// What a query knows of one row of the relation (keyed by column name).
@@ -324,16 +492,221 @@ struct Cx<'a> {
     column_type: &'a dyn Fn(&str) -> Option<PgTypeOid>,
     snapshot: &'a PgCatalog,
     trust: &'a TrustedNodes,
+    /// The expression subjects read so far, by name (see [`Subject`]).
+    subjects: &'a std::cell::RefCell<HashMap<String, Subject>>,
+    /// Reading the body of a `LANGUAGE sql` function a constraint calls:
+    /// what its parameters (by name and as `$n`) stand for.
+    env: Option<&'a HashMap<String, Subject>>,
+    /// How many function bodies deep the reading is.
+    depth: usize,
+}
+
+/// How many function bodies deep a constraint is read.
+const MAX_INLINE_DEPTH: usize = 8;
+
+/// What a literal of a constraint is about: a column, or an expression
+/// over one whose value a JSON constraint speaks of — a key of a jsonb
+/// value (`x -> 'k'`, as text `x ->> 'k'`) or the JSON type of one
+/// (`jsonb_typeof(x)`), with the built-in operators and function.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum Subject {
+    Column(String),
+    Field(Box<Subject>, String, bool),
+    Typeof(Box<Subject>),
+}
+
+impl Subject {
+    /// The name literals know it by: a column's own, or one no column has.
+    pub(crate) fn name(&self) -> String {
+        match self {
+            Subject::Column(c) => c.clone(),
+            other => format!("\u{2}{other:?}"),
+        }
+    }
+
+    /// The type of its values.
+    fn ty(&self, column_type: &dyn Fn(&str) -> Option<PgTypeOid>) -> Option<PgTypeOid> {
+        use crate::pg_catalog::oid;
+        match self {
+            Subject::Column(c) => column_type(c),
+            Subject::Field(_, _, false) => Some(oid::JSONB),
+            Subject::Field(_, _, true) | Subject::Typeof(_) => Some(oid::TEXT),
+        }
+    }
+
+    /// The same, over the column `rename` gives.
+    fn renamed(&self, rename: &dyn Fn(&str) -> String) -> Subject {
+        match self {
+            Subject::Column(c) => Subject::Column(rename(c)),
+            Subject::Field(x, k, t) => Subject::Field(Box::new(x.renamed(rename)), k.clone(), *t),
+            Subject::Typeof(x) => Subject::Typeof(Box::new(x.renamed(rename))),
+        }
+    }
+
+    /// The expression as the parser makes it, its column qualified by
+    /// `qualifier` (or bare): what a query reading it writes.
+    pub(crate) fn node(&self, qualifier: Option<&str>) -> protobuf::Node {
+        let string = |s: &str| protobuf::Node {
+            node: Some(node::Node::String(protobuf::String { sval: s.to_owned() })),
+        };
+        match self {
+            Subject::Column(c) => protobuf::Node {
+                node: Some(node::Node::ColumnRef(protobuf::ColumnRef {
+                    fields: qualifier
+                        .into_iter()
+                        .chain([c.as_str()])
+                        .map(string)
+                        .collect(),
+                    location: -1,
+                })),
+            },
+            Subject::Field(x, k, text) => protobuf::Node {
+                node: Some(node::Node::AExpr(Box::new(protobuf::AExpr {
+                    kind: protobuf::AExprKind::AexprOp as i32,
+                    name: vec![string(if *text { "->>" } else { "->" })],
+                    lexpr: Some(Box::new(x.node(qualifier))),
+                    rexpr: Some(Box::new(protobuf::Node {
+                        node: Some(node::Node::AConst(protobuf::AConst {
+                            isnull: false,
+                            val: Some(protobuf::a_const::Val::Sval(protobuf::String {
+                                sval: k.clone(),
+                            })),
+                            location: -1,
+                        })),
+                    })),
+                    rexpr_list_start: -1,
+                    rexpr_list_end: -1,
+                    location: -1,
+                }))),
+            },
+            Subject::Typeof(x) => protobuf::Node {
+                node: Some(node::Node::FuncCall(Box::new(protobuf::FuncCall {
+                    funcname: vec![string("jsonb_typeof")],
+                    args: vec![x.node(qualifier)],
+                    funcformat: protobuf::CoercionForm::CoerceExplicitCall as i32,
+                    location: -1,
+                    ..Default::default()
+                }))),
+            },
+        }
+    }
+}
+
+impl Cx<'_> {
+    /// What `n` is about, when a literal can be: a column, a parameter
+    /// standing for one, or a key / JSON type of one.
+    fn subject_of(&self, n: &protobuf::Node) -> Option<Subject> {
+        use crate::nonnull::{JsonbBuiltin as J, StrictNode as S};
+        match n.node.as_ref()? {
+            node::Node::ColumnRef(_) => {
+                let c = column_name(n)?;
+                match self.env {
+                    // A body's names are its parameters.
+                    Some(env) => env.get(&c).cloned(),
+                    None => ((self.column_type)(&c).is_some() && !(self.is_composite)(&c))
+                        .then_some(Subject::Column(c)),
+                }
+            }
+            node::Node::ParamRef(p) => self.env?.get(&format!("${}", p.number)).cloned(),
+            // A conversion of a jsonb value (of a domain over jsonb) to
+            // jsonb changes nothing.
+            node::Node::TypeCast(tc) => {
+                let inner = self.subject_of(tc.arg.as_deref()?)?;
+                let target =
+                    crate::ddl::util::resolve_type_name(tc.type_name.as_ref()?, self.snapshot)?;
+                let jsonb = crate::pg_catalog::oid::JSONB;
+                (target == jsonb
+                    && inner
+                        .ty(self.column_type)
+                        .is_some_and(|t| self.snapshot.unwrap_domain(t) == jsonb))
+                .then_some(inner)
+            }
+            node::Node::AExpr(e) => {
+                let op = crate::expr::extract_string_fields(&e.name).join(".");
+                let text = match op.as_str() {
+                    "->" if self.trust.trusts(e.location, S::Jsonb(J::Field)) => false,
+                    "->>" if self.trust.trusts(e.location, S::Jsonb(J::FieldText)) => true,
+                    _ => return None,
+                };
+                let x = self.subject_of(e.lexpr.as_deref()?)?;
+                let key = string_constant(e.rexpr.as_deref()?)?;
+                Some(Subject::Field(Box::new(x), key, text))
+            }
+            node::Node::FuncCall(f) if self.trust.trusts(f.location, S::Jsonb(J::Typeof)) => {
+                let [arg] = f.args.as_slice() else {
+                    return None;
+                };
+                Some(Subject::Typeof(Box::new(self.subject_of(arg)?)))
+            }
+            _ => None,
+        }
+    }
+
+    /// The name of what `n` is about (see [`Cx::subject_of`]), registered.
+    fn subject(&self, n: &protobuf::Node) -> Option<String> {
+        let s = self.subject_of(n)?;
+        let name = s.name();
+        if !matches!(s, Subject::Column(_)) {
+            self.subjects.borrow_mut().insert(name.clone(), s);
+        }
+        Some(name)
+    }
+
+    /// The type of the values of the subject named `name`.
+    fn subject_type(&self, name: &str) -> Option<PgTypeOid> {
+        match self.subjects.borrow().get(name) {
+            Some(s) => s.ty(self.column_type),
+            None => (self.column_type)(name),
+        }
+    }
+}
+
+/// `f`, asked once per argument.
+fn memoized<'a>(f: &'a dyn Fn(&str) -> bool) -> impl Fn(&str) -> bool + 'a {
+    let cache = std::cell::RefCell::new(HashMap::<String, bool>::new());
+    move |c: &str| {
+        if let Some(&v) = cache.borrow().get(c) {
+            return v;
+        }
+        let v = f(c);
+        cache.borrow_mut().insert(c.to_owned(), v);
+        v
+    }
+}
+
+/// For each `jsonb_typeof(x)` subject of `subjects`, by name, `x`'s name.
+fn typeof_of(subjects: &HashMap<String, Subject>) -> HashMap<String, String> {
+    subjects
+        .iter()
+        .filter_map(|(n, s)| match s {
+            Subject::Typeof(x) => Some((n.clone(), x.name())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A string constant (`'k'`).
+fn string_constant(n: &protobuf::Node) -> Option<String> {
+    match n.node.as_ref()? {
+        node::Node::AConst(c) if !c.isnull => match c.val.as_ref()? {
+            protobuf::a_const::Val::Sval(s) => Some(s.sval.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// The arms past which an OR of DNF arms grows too large to keep.
 const MAX_ARMS: usize = 16;
 
+/// The most integers an interval is listed as candidates for.
+const MAX_ENUMERATED: i128 = 16;
+
 /// The most values a column is split into cases over.
 const MAX_CASES: usize = 8;
 
 /// What the constraints prove of a row, as column names.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct Solved {
     /// No row can be what the query knows of it.
     contradiction: bool,
@@ -351,6 +724,25 @@ impl RelationChecks {
     /// the relation also returns, so it is skipped when the relation has
     /// any; nor does a foreign key.
     pub(crate) fn of(snapshot: &PgCatalog, relid: PgClassOid) -> Option<RelationChecks> {
+        // Read once per catalog state: a relation's constraints, the
+        // functions they call, are the same for every query. Not while a
+        // DDL statement runs: it changes the catalog as it goes (a view's
+        // nullability is worked out again after a constraint is dropped).
+        if crate::expr::inline::resolving() {
+            return Self::build(snapshot, relid);
+        }
+        let cache = snapshot.relation_checks.clone();
+        if let Some(hit) = cache.lock().ok().and_then(|c| c.get(&relid).cloned()) {
+            return hit;
+        }
+        let built = Self::build(snapshot, relid);
+        if let Ok(mut c) = cache.lock() {
+            c.insert(relid, built.clone());
+        }
+        built
+    }
+
+    fn build(snapshot: &PgCatalog, relid: PgClassOid) -> Option<RelationChecks> {
         let has_children = snapshot.pg_inherits.iter().any(|i| i.inhparent == relid);
         let partitioned = snapshot
             .pg_class
@@ -365,6 +757,7 @@ impl RelationChecks {
         };
         let column_type = |name: &str| attrs.iter().find(|a| a.attname == name).map(|a| a.atttypid);
         let untrusted = TrustedNodes::default();
+        let subjects = std::cell::RefCell::new(HashMap::new());
         let mut clauses = Vec::new();
         let mut constraints: Vec<_> = snapshot
             .pg_constraint
@@ -391,14 +784,18 @@ impl RelationChecks {
                 column_type: &column_type,
                 snapshot,
                 trust: def.trusted.as_ref().unwrap_or(&untrusted),
+                subjects: &subjects,
+                env: None,
+                depth: 0,
             };
             for conjunct in conjuncts(expr) {
-                if let Some(arms) = dnf(conjunct, true, &cx)
-                    && arms
+                for arms in cnf(conjunct, &cx) {
+                    if arms
                         .iter()
                         .any(|arm| arm.iter().any(|l| !matches!(l, Lit::Other)))
-                {
-                    clauses.push(Clause { arms });
+                    {
+                        clauses.push(Clause { arms });
+                    }
                 }
             }
         }
@@ -409,7 +806,8 @@ impl RelationChecks {
         if clauses.is_empty() {
             return None;
         }
-        let spaces = attrs
+        let subjects = subjects.into_inner();
+        let mut spaces: HashMap<String, Space> = attrs
             .iter()
             .map(|a| {
                 (
@@ -418,14 +816,40 @@ impl RelationChecks {
                 )
             })
             .collect();
-        Some(RelationChecks { clauses, spaces })
+        for (name, s) in &subjects {
+            if let Some(t) = s.ty(&column_type) {
+                spaces.insert(name.clone(), Space::of(t, None, snapshot));
+            }
+        }
+        let typeof_of = typeof_of(&subjects);
+        let clauses: Vec<Clause> = clauses.into_iter().map(|c| c.normalized(&spaces)).collect();
+        let (expr_clauses, clauses): (Vec<Clause>, Vec<Clause>) = clauses
+            .into_iter()
+            .partition(|c| c.names().any(|n| subjects.contains_key(n)));
+        Some(RelationChecks {
+            clauses,
+            expr_clauses,
+            spaces,
+            subjects,
+            typeof_of,
+        })
     }
 
     /// The constraints over the columns of a relation exposing column `c`
     /// as `rename(c)` (a view's plain columns): one it doesn't expose gets
     /// a name no column has, so nothing is known of it.
     pub(crate) fn renamed(&self, rename: impl Fn(&str) -> Option<String>) -> RelationChecks {
-        let name = |c: &String| rename(c).unwrap_or_else(|| format!("\u{1}hidden:{c}"));
+        let column = |c: &str| rename(c).unwrap_or_else(|| format!("\u{1}hidden:{c}"));
+        // An expression subject is renamed over its renamed column.
+        let renamed_subjects: HashMap<String, Subject> = self
+            .subjects
+            .iter()
+            .map(|(n, s)| (n.clone(), s.renamed(&column)))
+            .collect();
+        let name = |c: &String| match renamed_subjects.get(c) {
+            Some(s) => s.name(),
+            None => column(c),
+        };
         let lit = |l: &Lit| match l {
             Lit::NotNull(c) => Lit::NotNull(name(c)),
             Lit::IsNull(c) => Lit::IsNull(name(c)),
@@ -434,22 +858,30 @@ impl RelationChecks {
             Lit::AllNonNull(cs) => Lit::AllNonNull(cs.iter().map(name).collect()),
             Lit::Other => Lit::Other,
         };
-        RelationChecks {
-            clauses: self
-                .clauses
+        let clause = |cl: &Clause| Clause {
+            arms: cl
+                .arms
                 .iter()
-                .map(|cl| Clause {
-                    arms: cl
-                        .arms
-                        .iter()
-                        .map(|arm| arm.iter().map(lit).collect())
-                        .collect(),
-                })
+                .map(|arm| arm.iter().map(lit).collect())
                 .collect(),
+        };
+        RelationChecks {
+            clauses: self.clauses.iter().map(clause).collect(),
+            expr_clauses: self.expr_clauses.iter().map(clause).collect(),
             spaces: self
                 .spaces
                 .iter()
                 .map(|(c, s)| (name(c), s.clone()))
+                .collect(),
+            typeof_of: typeof_of(
+                &renamed_subjects
+                    .values()
+                    .map(|s| (s.name(), s.clone()))
+                    .collect(),
+            ),
+            subjects: renamed_subjects
+                .into_values()
+                .map(|s| (s.name(), s))
                 .collect(),
         }
     }
@@ -458,9 +890,24 @@ impl RelationChecks {
         self.spaces.get(c).cloned().unwrap_or_default()
     }
 
+    /// How column `c`'s values compare, without a copy.
+    fn space_ref(&self, c: &str) -> &Space {
+        static OPAQUE: std::sync::LazyLock<Space> = std::sync::LazyLock::new(Space::default);
+        self.spaces.get(c).unwrap_or(&OPAQUE)
+    }
+
     /// Run the constraints over what `k` (and `assume`: a column holding a
     /// value) says of a row, until nothing new is learned.
     fn solve(&self, k: &Knowledge<'_>, assume: Option<(&str, &Literal)>) -> Solved {
+        // What the query knows of a column is asked of every literal on
+        // every pass: once per column is enough.
+        let (non_null, null) = (memoized(k.non_null), memoized(k.null));
+        let k = &Knowledge {
+            non_null: &non_null,
+            null: &null,
+            equals: k.equals,
+            preds: k.preds,
+        };
         let mut s = Solved::default();
         if let Some((c, v)) = assume {
             s.preds
@@ -570,6 +1017,145 @@ impl RelationChecks {
         s
     }
 
+    /// What the constraints say of column `c`'s value, non-NULL, in a row
+    /// the query knows `k` about (`None` when no row can be one).
+    pub(crate) fn column_preds(&self, c: &str, k: &Knowledge<'_>) -> Option<Vec<ValPred>> {
+        let s = self.solve(k, None);
+        if s.contradiction {
+            return None;
+        }
+        let mut preds = self.preds_of(c, k, &s);
+        // A clause whose every arm left says `c` is one of some values
+        // (`CHECK (n = 1 OR n = 2)`): one of the arms holds, so `c` is one
+        // of them all.
+        for clause in &self.clauses {
+            let per_arm: Option<Vec<&Vec<Literal>>> = clause
+                .arms
+                .iter()
+                .filter(|arm| !arm.iter().any(|l| self.refuted(l, k, &s)))
+                .map(|arm| {
+                    arm.iter().find_map(|l| match l {
+                        Lit::Val(col, ValPred::In(vs)) if col == c => Some(vs),
+                        _ => None,
+                    })
+                })
+                .collect();
+            if let Some(sets) = per_arm
+                && !sets.is_empty()
+            {
+                preds.push(ValPred::In(sets.into_iter().flatten().cloned().collect()));
+            }
+        }
+        Some(preds)
+    }
+
+    /// What the clauses about expressions add to `s` (what the columns'
+    /// proved), until nothing new is learned.
+    fn learn_expressions(&self, k: &Knowledge<'_>, s: &Solved) -> Solved {
+        let (non_null, null) = (memoized(k.non_null), memoized(k.null));
+        let k = &Knowledge {
+            non_null: &non_null,
+            null: &null,
+            equals: k.equals,
+            preds: k.preds,
+        };
+        let mut s = s.clone();
+        for _ in 0..=self.expr_clauses.len() {
+            let mut changed = false;
+            for clause in &self.expr_clauses {
+                let survivors: Vec<&Vec<Lit>> = clause
+                    .arms
+                    .iter()
+                    .filter(|arm| !arm.iter().any(|l| self.refuted(l, k, &s)))
+                    .collect();
+                if let [arm] = survivors.as_slice() {
+                    for l in arm.iter() {
+                        changed |= learn(&mut s, l);
+                    }
+                    continue;
+                }
+                // Every arm left says a subject is one of some values (a
+                // CASE over a JSON discriminant): it is one of them all.
+                let Some(first) = survivors.first() else {
+                    continue;
+                };
+                for c in first.iter().filter_map(|l| match l {
+                    Lit::Val(c, ValPred::In(_)) => Some(c),
+                    _ => None,
+                }) {
+                    let sets: Option<Vec<&Vec<Literal>>> = survivors
+                        .iter()
+                        .map(|arm| {
+                            arm.iter().find_map(|l| match l {
+                                Lit::Val(d, ValPred::In(vs)) if d == c => Some(vs),
+                                _ => None,
+                            })
+                        })
+                        .collect();
+                    if let Some(sets) = sets {
+                        let union = Lit::Val(
+                            c.clone(),
+                            ValPred::In(sets.into_iter().flatten().cloned().collect()),
+                        );
+                        changed |= learn(&mut s, &union);
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        s
+    }
+
+    /// Whether `c` is known non-NULL: by the query or the constraints —
+    /// or, the JSON type of a value, as that value is.
+    fn non_null(&self, c: &str, k: &Knowledge<'_>, s: &Solved) -> bool {
+        (k.non_null)(c)
+            || s.non_null.contains(c)
+            || self
+                .typeof_of
+                .get(c)
+                .is_some_and(|x| self.non_null(x, k, s))
+    }
+
+    /// The facts about expressions the constraints prove of a row of FROM
+    /// entry `alias` (see [`RelationChecks::derive`]): an expression
+    /// subject proven non-NULL, and `x ->> 'k'` of a key `x -> 'k'` proven
+    /// non-NULL whose JSON type isn't `null`. Each under the forms a
+    /// query writes it in: qualified by the alias, or bare.
+    fn expression_facts(&self, alias: &str, k: &Knowledge<'_>, s: &Solved) -> HashSet<String> {
+        let keys = |subject: &Subject| {
+            [Some(alias), None]
+                .map(|q| super::exprs::key(&subject.node(q)))
+                .into_iter()
+        };
+        let mut out = HashSet::new();
+        for (name, subject) in &self.subjects {
+            if !s.non_null.contains(name) {
+                continue;
+            }
+            out.extend(keys(subject));
+            if let Subject::Field(x, key, false) = subject {
+                // Its JSON type, or the JSON values it is one of
+                // (`CASE (v -> 'type') WHEN '"a"'::jsonb …`), aren't null.
+                let ty = Subject::Typeof(Box::new(subject.clone())).name();
+                let not_json_null = self
+                    .space(&ty)
+                    .candidates(&self.preds_of(&ty, k, s))
+                    .is_some_and(|ts| !ts.iter().any(|t| t.text == "null"))
+                    || self
+                        .space(name)
+                        .candidates(&self.preds_of(name, k, s))
+                        .is_some_and(|vs| !vs.iter().any(|v| v.text.trim() == "null"));
+                if not_json_null {
+                    out.extend(keys(&Subject::Field(x.clone(), key.clone(), true)));
+                }
+            }
+        }
+        out
+    }
+
     /// Everything known of column `c`'s value when non-NULL.
     fn preds_of(&self, c: &str, k: &Knowledge<'_>, s: &Solved) -> Vec<ValPred> {
         let mut preds = (k.preds)(c);
@@ -633,6 +1219,10 @@ impl RelationChecks {
         }
         for c in &non_null {
             out = out.union(Facts::column(alias, c));
+        }
+        if !self.expr_clauses.is_empty() {
+            let se = self.learn_expressions(k, &s);
+            out.exprs.extend(self.expression_facts(alias, k, &se));
         }
         for c in &s.null {
             out.nulls.insert(col(c));
@@ -698,11 +1288,11 @@ impl RelationChecks {
     /// `s`) describes.
     fn refuted(&self, l: &Lit, k: &Knowledge<'_>, s: &Solved) -> bool {
         let null = |c: &str| (k.null)(c) || s.null.contains(c);
-        let non_null = |c: &str| (k.non_null)(c) || s.non_null.contains(c);
+        let non_null = |c: &str| self.non_null(c, k, s);
         match l {
             Lit::NotNull(c) => null(c),
             Lit::IsNull(c) => non_null(c),
-            Lit::Val(c, p) => non_null(c) && self.space(c).refutes(&self.preds_of(c, k, s), p),
+            Lit::Val(c, p) => non_null(c) && self.space_ref(c).refutes(&self.preds_of(c, k, s), p),
             Lit::SomeNonNull(cs) => cs.iter().all(|c| null(c)),
             Lit::AllNonNull(cs) => cs.iter().any(|c| null(c)),
             Lit::Other => false,
@@ -734,6 +1324,186 @@ fn learn(s: &mut Solved, l: &Lit) -> bool {
         }
         _ => false,
     }
+}
+
+/// The top-level conjuncts of the enforced CHECK constraints of relation
+/// `relid` that bind every row a scan of it returns (a `NO INHERIT` one
+/// doesn't when the relation has children, as in [`RelationChecks::of`]),
+/// each with what its constraint resolved to when it was created.
+fn binding_conjuncts(
+    snapshot: &PgCatalog,
+    relid: PgClassOid,
+) -> Vec<(&protobuf::Node, &TrustedNodes)> {
+    static UNTRUSTED: std::sync::LazyLock<TrustedNodes> =
+        std::sync::LazyLock::new(TrustedNodes::default);
+    let has_children = snapshot.pg_inherits.iter().any(|i| i.inhparent == relid);
+    let mut out = Vec::new();
+    for con in snapshot.pg_constraint.values().filter(|c| {
+        c.conrelid == relid && c.contype == crate::pg_catalog::ConType::Check && c.conenforced
+    }) {
+        let Some(def) = snapshot.check_defs.get(&con.oid) else {
+            continue;
+        };
+        if def.no_inherit && has_children {
+            continue;
+        }
+        let crate::ddl::tables::check_inherit::StoredExpr::Written(expr) = &def.expr else {
+            continue;
+        };
+        let trust = def.trusted.as_ref().unwrap_or(&UNTRUSTED);
+        out.extend(conjuncts(expr).into_iter().map(|c| (c, trust)));
+    }
+    out
+}
+
+/// The array columns of relation `relid` an enforced CHECK constraint keeps
+/// NULL elements out of (see [`null_free_arrays`]).
+pub(crate) fn null_free_array_columns(snapshot: &PgCatalog, relid: PgClassOid) -> HashSet<String> {
+    binding_conjuncts(snapshot, relid)
+        .into_iter()
+        .filter_map(|(c, trust)| null_free_array(c, trust))
+        .collect()
+}
+
+/// The columns of relation `relid` an enforced CHECK constraint keeps
+/// finite (see [`finite_column`]).
+pub(crate) fn finite_columns(snapshot: &PgCatalog, relid: PgClassOid) -> HashSet<String> {
+    binding_conjuncts(snapshot, relid)
+        .into_iter()
+        .filter_map(|(c, trust)| finite_column(c, trust))
+        .collect()
+}
+
+/// The column a constraint conjunct keeps finite: `isfinite(c)`, with the
+/// built-in `isfinite`. Not FALSE, it is TRUE (`c` is finite) or NULL (`c`
+/// is NULL).
+pub(crate) fn finite_column(n: &protobuf::Node, trust: &impl Trust) -> Option<String> {
+    let Some(node::Node::FuncCall(f)) = n.node.as_ref() else {
+        return None;
+    };
+    let [arg] = f.args.as_slice() else {
+        return None;
+    };
+    trust
+        .trusts(f.location, StrictNode::IsFinite)
+        .then(|| column_name(arg))
+        .flatten()
+}
+
+/// What a constraint expression allows its column `c`, of type `t` under
+/// `collation`, when non-NULL: the values its conjuncts that are `c = v`,
+/// `c IN (…)` or an OR of them leave of the type's, and the bounds its
+/// comparisons with constants set (built-in ones, see [`dnf`]). `None`
+/// when the type doesn't print values as they compare
+/// ([`crate::refine::Exact`]).
+pub(crate) fn allowed_values(
+    expr: &protobuf::Node,
+    c: &str,
+    t: PgTypeOid,
+    collation: Option<crate::oid::PgCollationOid>,
+    snapshot: &PgCatalog,
+    trust: &TrustedNodes,
+) -> Option<crate::refine::Refinement> {
+    crate::refine::Exact::of(t, collation, snapshot)?;
+    let is_composite = |_: &str| false;
+    let column_type = |n: &str| (n == c).then_some(t);
+    let subjects = std::cell::RefCell::new(HashMap::new());
+    let cx = Cx {
+        is_composite: &is_composite,
+        column_type: &column_type,
+        snapshot,
+        trust,
+        subjects: &subjects,
+        env: None,
+        depth: 0,
+    };
+    let space = Space::of(t, collation, snapshot);
+    let mut preds = Vec::new();
+    for conjunct in conjuncts(expr) {
+        let Some(arms) = dnf(conjunct, true, &cx) else {
+            continue;
+        };
+        // Every arm says `c` is one of some values: it is one of them all.
+        let per_arm: Option<Vec<&Vec<Literal>>> = arms
+            .iter()
+            .map(|arm| {
+                arm.iter().find_map(|l| match l {
+                    Lit::Val(col, ValPred::In(vs)) if col == c => Some(vs),
+                    _ => None,
+                })
+            })
+            .collect();
+        if let Some(sets) = per_arm {
+            preds.push(ValPred::In(sets.into_iter().flatten().cloned().collect()));
+        }
+        // A single arm: everything it says of `c` holds (`VALUE > 0`).
+        if let [arm] = arms.as_slice() {
+            preds.extend(arm.iter().filter_map(|l| match l {
+                Lit::Val(col, p @ ValPred::Cmp(..)) if col == c => Some(p.clone()),
+                _ => None,
+            }));
+        }
+    }
+    let values = space
+        .candidates(&preds)
+        .and_then(|cands| cands.iter().map(|l| space.print(l)).collect());
+    let range = space
+        .bounds(&preds)
+        .filter(|r| *r != crate::refine::IntRange::default());
+    Some(crate::refine::Refinement {
+        values,
+        range,
+        ..crate::refine::Refinement::NONE
+    })
+}
+
+/// The columns a constraint expression keeps finite (see [`finite_column`]).
+pub(crate) fn finite_columns_of(expr: &protobuf::Node, trust: &impl Trust) -> Vec<String> {
+    conjuncts(expr)
+        .into_iter()
+        .filter_map(|c| finite_column(c, trust))
+        .collect()
+}
+
+/// The columns a constraint expression says hold no NULL element (see
+/// [`null_free_array`]).
+pub(crate) fn null_free_arrays(expr: &protobuf::Node, trust: &impl Trust) -> Vec<String> {
+    conjuncts(expr)
+        .into_iter()
+        .filter_map(|c| null_free_array(c, trust))
+        .collect()
+}
+
+/// The column a constraint conjunct says holds no NULL element:
+/// `array_position(c, NULL) IS NULL`, with the built-in `array_position`.
+/// The test is never NULL, so not FALSE is TRUE: the search found no NULL
+/// — `c` is NULL, or a one-dimensional array (a multidimensional one fails
+/// the search) none of whose elements is.
+fn null_free_array(n: &protobuf::Node, trust: &impl Trust) -> Option<String> {
+    let is_null_const = |n: &protobuf::Node| match n.node.as_ref() {
+        Some(node::Node::AConst(c)) => c.isnull,
+        Some(node::Node::TypeCast(tc)) => tc
+            .arg
+            .as_deref()
+            .and_then(|a| a.node.as_ref())
+            .is_some_and(|a| matches!(a, node::Node::AConst(c) if c.isnull)),
+        _ => false,
+    };
+    let Some(node::Node::NullTest(t)) = n.node.as_ref() else {
+        return None;
+    };
+    if protobuf::NullTestType::try_from(t.nulltesttype) != Ok(protobuf::NullTestType::IsNull) {
+        return None;
+    }
+    let Some(node::Node::FuncCall(f)) = t.arg.as_deref()?.node.as_ref() else {
+        return None;
+    };
+    let [array, needle] = f.args.as_slice() else {
+        return None;
+    };
+    (trust.trusts(f.location, StrictNode::ArrayPosition) && is_null_const(needle))
+        .then(|| column_name(array))
+        .flatten()
 }
 
 /// The constraint partition `relid`'s bound and its ancestors' put on its
@@ -878,6 +1648,170 @@ fn conjuncts(n: &protobuf::Node) -> Vec<&protobuf::Node> {
         }
         _ => vec![n],
     }
+}
+
+/// `n` read not FALSE as a conjunction of clauses (each an OR of AND-arms,
+/// see [`dnf`]): an AND is each of its arms; a CASE whose results but one
+/// are constants is `(P AND R1 AND R2) OR Q` — the guard `P` of the one,
+/// `Q` the other ways — so `(P OR Q) AND (R1 OR Q) AND (R2 OR Q)`; a call
+/// of a `LANGUAGE sql` function, its body. What doesn't split is one
+/// clause, as [`dnf`] reads it (none, past its size).
+fn cnf(n: &protobuf::Node, cx: &Cx<'_>) -> Vec<Vec<Vec<Lit>>> {
+    use protobuf::BoolExprType as B;
+    match n.node.as_ref() {
+        Some(node::Node::BoolExpr(b)) if B::try_from(b.boolop) == Ok(B::AndExpr) => {
+            b.args.iter().flat_map(|a| cnf(a, cx)).collect()
+        }
+        Some(node::Node::CaseExpr(c)) if c.arg.is_none() => {
+            case_cnf(c, cx).unwrap_or_else(|| dnf(n, true, cx).into_iter().collect())
+        }
+        Some(node::Node::FuncCall(f)) => match inline_cnf(f, cx) {
+            Some(clauses) => clauses,
+            None => dnf(n, true, cx).into_iter().collect(),
+        },
+        _ => dnf(n, true, cx).into_iter().collect(),
+    }
+}
+
+/// A searched CASE with one result that isn't a constant (see [`cnf`]).
+fn case_cnf(c: &protobuf::CaseExpr, cx: &Cx<'_>) -> Option<Vec<Vec<Vec<Lit>>>> {
+    let constant = |n: &protobuf::Node| matches!(n.node.as_ref(), Some(node::Node::AConst(_)));
+    let mut whens = Vec::new();
+    for arg in &c.args {
+        let Some(node::Node::CaseWhen(w)) = arg.node.as_ref() else {
+            return None;
+        };
+        whens.push((w.expr.as_deref()?, w.result.as_deref()?));
+    }
+    let default = c.defresult.as_deref();
+    let open: Vec<usize> = whens
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, r))| !constant(r))
+        .map(|(i, _)| i)
+        .collect();
+    let default_open = default.is_some_and(|d| !constant(d));
+    // `P`: the guard of the one non-constant result, `Q`: every other way.
+    let (guard, rest, result) = match (open.as_slice(), default_open) {
+        ([i], false) => {
+            let mut none_before = vec![Vec::new()];
+            let mut q: Vec<Vec<Lit>> = Vec::new();
+            let mut p = None;
+            for (j, (w, r)) in whens.iter().enumerate() {
+                let taken = product(&none_before, &dnf(w, true, cx)?)?;
+                if j == *i {
+                    p = Some(taken);
+                } else {
+                    q = either(q, product(&taken, &dnf(r, true, cx)?)?)?;
+                }
+                none_before = product(&none_before, &dnf(w, false, cx)?)?;
+            }
+            let d = match default {
+                Some(d) => dnf(d, true, cx)?,
+                None => vec![Vec::new()],
+            };
+            q = either(q, product(&none_before, &d)?)?;
+            (p?, q, whens[*i].1)
+        }
+        ([], true) => {
+            let mut none_before = vec![Vec::new()];
+            let mut q: Vec<Vec<Lit>> = Vec::new();
+            for (w, r) in &whens {
+                let taken = product(&none_before, &dnf(w, true, cx)?)?;
+                q = either(q, product(&taken, &dnf(r, true, cx)?)?)?;
+                none_before = product(&none_before, &dnf(w, false, cx)?)?;
+            }
+            (none_before, q, default?)
+        }
+        _ => return None,
+    };
+    let mut out = vec![either(guard, rest.clone())?];
+    for clause in cnf(result, cx) {
+        out.push(either(clause, rest.clone())?);
+    }
+    Some(out)
+}
+
+/// A call of a `LANGUAGE sql` function of one expression (the one the
+/// constraint resolved to when created, see [`TrustedNodes::calls`]): its
+/// body read over what the arguments are about, with what the body
+/// resolves to, as clauses. A STRICT one is also NULL — neither FALSE nor
+/// TRUE — for a NULL argument. `None` when the call isn't one, or past a
+/// depth.
+fn inline_cnf(f: &protobuf::FuncCall, cx: &Cx<'_>) -> Option<Vec<Vec<Vec<Lit>>>> {
+    let snapshot = cx.snapshot;
+    if cx.depth >= MAX_INLINE_DEPTH {
+        return None;
+    }
+    let oid = cx.trust.call(f.location)?;
+    if snapshot.procs_with_config.contains(&oid) {
+        return None;
+    }
+    let proc = snapshot.pg_proc.get(&oid)?;
+    let body = snapshot.inline_sql_bodies.get(&oid)?;
+    let trust = crate::expr::inline::cached_body_trust(snapshot, oid)?;
+    if f.args.len() != proc.proargtypes.len()
+        || f.args
+            .iter()
+            .any(|a| matches!(a.node.as_ref(), Some(node::Node::NamedArgExpr(_))))
+    {
+        return None;
+    }
+    let names: Vec<&String> = proc
+        .proargnames
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| {
+            proc.proargmodes.get(*i).is_none_or(|m| {
+                matches!(
+                    m,
+                    crate::pg_catalog::ArgMode::In
+                        | crate::pg_catalog::ArgMode::InOut
+                        | crate::pg_catalog::ArgMode::Variadic
+                )
+            })
+        })
+        .map(|(_, n)| n)
+        .collect();
+    let mut env = HashMap::new();
+    let mut strict_nulls: Vec<Vec<Lit>> = Vec::new();
+    for (i, arg) in f.args.iter().enumerate() {
+        let s = cx.subject_of(arg);
+        if proc.proisstrict {
+            strict_nulls.push(match &s {
+                Some(s) => {
+                    let name = s.name();
+                    if !matches!(s, Subject::Column(_)) {
+                        cx.subjects.borrow_mut().insert(name.clone(), s.clone());
+                    }
+                    vec![Lit::IsNull(name)]
+                }
+                None => vec![Lit::Other],
+            });
+        }
+        let Some(s) = s else { continue };
+        env.insert(format!("${}", i + 1), s.clone());
+        if let Some(n) = names.get(i).filter(|n| !n.is_empty()) {
+            env.insert((*n).clone(), s);
+        }
+    }
+    let sub = Cx {
+        is_composite: cx.is_composite,
+        column_type: cx.column_type,
+        snapshot,
+        trust: &trust,
+        subjects: cx.subjects,
+        env: Some(&env),
+        depth: cx.depth + 1,
+    };
+    let mut clauses = cnf(body, &sub);
+    if !strict_nulls.is_empty() {
+        clauses = clauses
+            .into_iter()
+            .filter_map(|c| either(c, strict_nulls.clone()))
+            .collect();
+    }
+    Some(clauses)
 }
 
 /// Every arm of `a` joined with every arm of `b`; `None` past
@@ -1026,10 +1960,7 @@ fn is_condition(n: &protobuf::Node, cx: &Cx<'_>) -> bool {
 /// omitted one is NULL) applies when none is. A WHEN being TRUE is read as
 /// it being not FALSE (more rows).
 fn case_dnf(c: &protobuf::CaseExpr, positive: bool, cx: &Cx<'_>) -> Option<Vec<Vec<Lit>>> {
-    let test = c
-        .arg
-        .as_deref()
-        .map(|t| column_name(t).filter(|n| !(cx.is_composite)(n)));
+    let test = c.arg.as_deref().map(|t| cx.subject(t));
     let when_dnf = |when: &protobuf::CaseWhen, w: &protobuf::Node, pos: bool| {
         match &test {
             None => dnf(w, pos, cx),
@@ -1039,7 +1970,9 @@ fn case_dnf(c: &protobuf::CaseExpr, positive: bool, cx: &Cx<'_>) -> Option<Vec<V
                 Some(one(Lit::Other))
             }
             Some(Some(col)) => {
-                let v = (cx.column_type)(col).and_then(|t| super::literal_for(w, t, cx.snapshot));
+                let v = cx
+                    .subject_type(col)
+                    .and_then(|t| super::literal_for(w, t, cx.snapshot));
                 Some(match v {
                     Some(v) => {
                         let p = ValPred::In(vec![v]);
@@ -1086,12 +2019,74 @@ fn column_name(n: &protobuf::Node) -> Option<String> {
         .cloned()
 }
 
+/// `x ? 'k'` / `x ?& ARRAY['k', …]` (the built-in `jsonb_exists[_all]`):
+/// TRUE when `x` holds the keys — for an object, that `x -> 'k'` isn't
+/// NULL; an array holding the string `'k'` is TRUE too. So not FALSE:
+/// `x` is NULL, not an object, or has the keys; not TRUE (one key): `x`
+/// is NULL, not an object, or hasn't it.
+fn json_key_atom(
+    e: &protobuf::AExpr,
+    op: &str,
+    l: &protobuf::Node,
+    r: &protobuf::Node,
+    positive: bool,
+    cx: &Cx<'_>,
+) -> Option<Vec<Vec<Lit>>> {
+    use crate::nonnull::{JsonbBuiltin as J, StrictNode as S};
+    let keys: Vec<String> = match op {
+        "?" if cx.trust.trusts(e.location, S::Jsonb(J::Exists)) => vec![string_constant(r)?],
+        "?&" if positive && cx.trust.trusts(e.location, S::Jsonb(J::ExistsAll)) => {
+            string_array_constant(r)?
+        }
+        _ => return None,
+    };
+    let x = cx.subject_of(l)?;
+    let register = |s: Subject| {
+        let name = s.name();
+        if !matches!(s, Subject::Column(_)) {
+            cx.subjects.borrow_mut().insert(name.clone(), s);
+        }
+        name
+    };
+    let ty = register(Subject::Typeof(Box::new(x.clone())));
+    let fields: Vec<String> = keys
+        .into_iter()
+        .map(|k| register(Subject::Field(Box::new(x.clone()), k, false)))
+        .collect();
+    let x = register(x);
+    let not_object = Lit::Val(ty, ValPred::NotIn(vec![json_type("object")]));
+    let has = if positive {
+        fields.into_iter().map(Lit::NotNull).collect()
+    } else {
+        fields.into_iter().map(Lit::IsNull).collect()
+    };
+    Some(vec![vec![Lit::IsNull(x)], vec![not_object], has])
+}
+
+/// The name `jsonb_typeof` gives a JSON type, as a text literal.
+fn json_type(t: &str) -> Literal {
+    Literal {
+        text: t.to_owned(),
+        kind: LitKind::String,
+    }
+}
+
+/// `ARRAY['a', 'b']` (maybe cast to `text[]`) of string constants.
+fn string_array_constant(n: &protobuf::Node) -> Option<Vec<String>> {
+    match n.node.as_ref()? {
+        node::Node::TypeCast(tc) => string_array_constant(tc.arg.as_deref()?),
+        node::Node::AArrayExpr(a) => a.elements.iter().map(string_constant).collect(),
+        _ => None,
+    }
+}
+
 /// A literal (or arms of literals) for `n`, not FALSE (`positive`) or not
 /// TRUE.
 fn atom(n: &protobuf::Node, positive: bool, cx: &Cx<'_>) -> Vec<Vec<Lit>> {
-    let scalar = |a: &protobuf::Node| column_name(a).filter(|c| !(cx.is_composite)(c));
+    let scalar = |a: &protobuf::Node| cx.subject(a);
     let lit = |n: &protobuf::Node, c: &str| {
-        (cx.column_type)(c).and_then(|t| super::literal_for(n, t, cx.snapshot))
+        cx.subject_type(c)
+            .and_then(|t| super::literal_for(n, t, cx.snapshot))
     };
     let val = |c: String, p: ValPred| one(Lit::Val(c, if positive { p } else { p.negated() }));
     let all_null = |cols: &BTreeSet<String>| -> Vec<Vec<Lit>> {
@@ -1173,6 +2168,9 @@ fn atom(n: &protobuf::Node, positive: bool, cx: &Cx<'_>) -> Vec<Vec<Lit>> {
             let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) else {
                 return other;
             };
+            if let Some(arms) = json_key_atom(e, &op, l, r, positive, cx) {
+                return arms;
+            }
             // Every comparison read below, as the built-in one: a
             // user-defined `=` may hold for different values.
             if !cx.trust.trusts(e.location, StrictNode::BuiltinCompare) {
@@ -1180,7 +2178,7 @@ fn atom(n: &protobuf::Node, positive: bool, cx: &Cx<'_>) -> Vec<Vec<Lit>> {
             }
             match K::try_from(e.kind) {
                 Ok(K::AexprOp) => {
-                    let (c, v, flipped) = match (column_name(l), column_name(r)) {
+                    let (c, v, flipped) = match (scalar(l), scalar(r)) {
                         (Some(c), None) => match lit(r, &c) {
                             Some(v) => (c, v, false),
                             None => return other,
@@ -1204,11 +2202,11 @@ fn atom(n: &protobuf::Node, positive: bool, cx: &Cx<'_>) -> Vec<Vec<Lit>> {
                 // A NULL in the list makes `IN` NULL rather than FALSE:
                 // such a list says nothing.
                 Ok(K::AexprIn) => {
-                    let (Some(c), Some(node::Node::List(list))) = (column_name(l), r.node.as_ref())
+                    let (Some(c), Some(node::Node::List(list))) = (scalar(l), r.node.as_ref())
                     else {
                         return other;
                     };
-                    let Some(t) = (cx.column_type)(&c) else {
+                    let Some(t) = cx.subject_type(&c) else {
                         return other;
                     };
                     match (
@@ -1221,10 +2219,10 @@ fn atom(n: &protobuf::Node, positive: bool, cx: &Cx<'_>) -> Vec<Vec<Lit>> {
                     }
                 }
                 Ok(kind @ (K::AexprOpAny | K::AexprOpAll)) => {
-                    let Some(c) = column_name(l) else {
+                    let Some(c) = scalar(l) else {
                         return other;
                     };
-                    let Some(t) = (cx.column_type)(&c) else {
+                    let Some(t) = cx.subject_type(&c) else {
                         return other;
                     };
                     match (
@@ -1269,7 +2267,7 @@ fn atom(n: &protobuf::Node, positive: bool, cx: &Cx<'_>) -> Vec<Vec<Lit>> {
                 }
                 // `c BETWEEN a AND b` is `c >= a AND c <= b`.
                 Ok(kind @ (K::AexprBetween | K::AexprNotBetween)) => {
-                    let (Some(c), Some(node::Node::List(list))) = (column_name(l), r.node.as_ref())
+                    let (Some(c), Some(node::Node::List(list))) = (scalar(l), r.node.as_ref())
                     else {
                         return other;
                     };

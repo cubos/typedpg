@@ -284,6 +284,54 @@ impl PgCatalog {
         None
     }
 
+    /// Whether no value of type `oid` holds a NULL element: a domain of its
+    /// chain has a CHECK keeping them out. Every value of a domain type
+    /// passed its CHECKs (`NOT VALID` ones are trusted) or is NULL.
+    pub(crate) fn domain_null_free_elements(&self, oid: PgTypeOid) -> bool {
+        self.domain_check_says(oid, |c| c.null_free_elements)
+    }
+
+    /// The refinement every value of type `oid` has: a domain of its chain
+    /// has a CHECK keeping it finite (see [`Self::domain_null_free_elements`]).
+    pub(crate) fn domain_refinement(&self, oid: PgTypeOid) -> crate::refine::Refinement {
+        let mut allowed = crate::refine::Refinement::NONE;
+        for d in self.domain_chain(oid) {
+            // Under a nondeterministic collation, `VALUE IN ('a')` lets
+            // `'A'` through.
+            let collation = self.pg_type.get(&d).and_then(|t| t.typcollation);
+            if crate::refine::Exact::of(d, collation, self).is_none() {
+                continue;
+            }
+            for a in self
+                .domain_constraints
+                .get(&d)
+                .into_iter()
+                .flatten()
+                .filter_map(|c| c.allowed.as_ref())
+            {
+                allowed = allowed.and(a);
+            }
+        }
+        crate::refine::Refinement {
+            finite: self.domain_check_says(oid, |c| c.finite),
+            ..allowed
+        }
+    }
+
+    /// Whether a CHECK of a domain of `oid`'s chain says `what`.
+    fn domain_check_says(
+        &self,
+        oid: PgTypeOid,
+        what: impl Fn(&crate::ddl::types::DomainConstraint) -> bool,
+    ) -> bool {
+        !self.domain_constraints.is_empty()
+            && self.domain_chain(oid).iter().any(|d| {
+                self.domain_constraints
+                    .get(d)
+                    .is_some_and(|cs| cs.iter().any(&what))
+            })
+    }
+
     /// True when the type chain forces non-nullable semantics on the column,
     /// independent of `pg_attribute.attnotnull`.
     pub(crate) fn type_is_not_null(&self, oid: PgTypeOid) -> bool {

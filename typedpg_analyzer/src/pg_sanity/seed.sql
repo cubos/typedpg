@@ -9,7 +9,8 @@
 -- (or NULL when no candidate value is accepted by the type's input
 -- function and domain constraints). Variant 1 is the adversarial value —
 -- a composite with every field NULL, an array holding a NULL element, an
--- empty range — and variant 2 a "full" one with every part non-NULL.
+-- empty range, an infinite date, timestamp or interval — and variant 2 a
+-- "full" one with every part non-NULL.
 --
 -- `typedpg_seed(mode)` inserts one row into every user table it can:
 -- mode 1 leaves every nullable column NULL, mode 2 fills every column.
@@ -98,12 +99,17 @@ BEGIN
         WHEN 'B' THEN ARRAY[['false', 'true']]
         WHEN 'S' THEN ARRAY[['a', 'b']]
         WHEN 'N' THEN ARRAY[['1', '2']]
-        WHEN 'D' THEN ARRAY[['2000-01-01', '2001-01-01'], ['01:00', '02:00']]
-        WHEN 'T' THEN ARRAY[['1 day', '2 days']]
+        WHEN 'D' THEN ARRAY[['infinity', '2001-01-01'], ['2000-01-01', '2001-01-01'],
+                            ['01:00', '02:00']]
+        WHEN 'T' THEN ARRAY[['infinity', '2 days'], ['1 day', '2 days']]
         WHEN 'I' THEN ARRAY[['127.0.0.1', '127.0.0.2']]
         WHEN 'G' THEN ARRAY[['(0,0)', '(1,1)'], ['((0,0),(1,1))', '((0,0),(2,2))'],
                             ['{1,1,1}', '{1,2,1}'], ['<(0,0),1>', '<(0,0),2>']]
         WHEN 'V' THEN ARRAY[['1', '0']]
+        -- jsonb (and other 'U' types, which reject it): an object with
+        -- the keys a JSON constraint may require; adversarially, an array
+        -- holding them as strings (`? 'a'` is TRUE of it too).
+        WHEN 'U' THEN ARRAY[['["a", "k", "n"]', '{"a": "a", "k": 1, "n": {"x": 1}}']]
         ELSE ARRAY[['1', '2']]
     END || ARRAY[
         ['1', '2'], ['a', 'b'], ['false', 'true'],

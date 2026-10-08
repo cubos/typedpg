@@ -27,8 +27,31 @@ pub(crate) fn infer_a_const(a_const: &protobuf::AConst) -> Result<ExprType, Anal
         }
         None => oid::UNKNOWN,
     };
+    // A number, a boolean or a bit string is never an infinity; a string
+    // is when it spells one.
+    let refine = match &a_const.val {
+        Some(a_const::Val::Sval(s)) => crate::refine::Refinement::of_string_literal(&s.sval),
+        Some(a_const::Val::Ival(i)) => crate::refine::Refinement {
+            values: Some([i.ival.to_string()].into()),
+            range: Some(crate::refine::IntRange::exactly(i.ival.into())),
+            ..crate::refine::Refinement::FINITE
+        },
+        Some(a_const::Val::Fval(f)) if type_oid != oid::NUMERIC => {
+            let int = crate::literal_input::parse_pg_integer(&f.fval);
+            crate::refine::Refinement {
+                values: int.map(|i| [i.to_string()].into()),
+                range: int.map(crate::refine::IntRange::exactly),
+                ..crate::refine::Refinement::FINITE
+            }
+        }
+        Some(a_const::Val::Boolval(b)) => crate::refine::Refinement {
+            values: Some([b.boolval.to_string()].into()),
+            ..crate::refine::Refinement::FINITE
+        },
+        _ => crate::refine::Refinement::FINITE,
+    };
 
-    Ok(ExprType::scalar(type_oid, false))
+    Ok(ExprType::scalar(type_oid, false).with_refine(refine))
 }
 
 /// Type of an `Fval` (PG `T_Float`) constant, mirroring PG's `make_const`.
@@ -255,8 +278,11 @@ pub(crate) fn infer_type_cast(
     // for the target or an array of the same type keeps its own (a
     // relabeling or typmod coercion maps no element to NULL); an element
     // conversion (`jsonb[]` → `int[]`, …) may.
+    // A domain whose CHECK keeps NULL elements out checks the value.
     let elem_nullable = if array_element_type(snapshot, target_base).is_none() {
         None
+    } else if snapshot.domain_null_free_elements(target_oid) {
+        Some(false)
     } else if let Some(node::Node::AConst(ac)) = inner.node.as_ref() {
         match &ac.val {
             Some(a_const::Val::Sval(sv)) if !ac.isnull => Some(
@@ -281,6 +307,17 @@ pub(crate) fn infer_type_cast(
         ..ExprType::scalar_with_typmod(target_oid, nullable, written_typmod)
             .with_collation(state)
             .with_elem_nullable(elem_nullable)
+            .with_refine({
+                let mut refine = inner_type
+                    .refine
+                    .converted(inner_type.type_oid, target_oid, snapshot)
+                    .and(&snapshot.domain_refinement(target_oid));
+                // An explicit cast to `varchar(n)` truncates.
+                if cast_typmod.is_some() {
+                    refine.values = None;
+                }
+                refine
+            })
     })
 }
 
