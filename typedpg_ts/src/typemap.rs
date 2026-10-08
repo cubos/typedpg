@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 
-use typedpg_analyzer::{RecordField, Type};
+use typedpg_analyzer::{RecordField, Refinement, Type};
 use typedpg_core::QualifiedName;
 
 use crate::config::Int8;
@@ -144,6 +144,75 @@ pub struct TypeMapper<'a> {
 }
 
 impl TypeMapper<'_> {
+    /// The mapping of a value of `ty` the analysis refined to `refinement`:
+    /// one of a few known values reads as their literal union (`"a" | "b"`,
+    /// `1 | 2`, `1n`, `true`), where the type maps to TypeScript's own
+    /// string, number, bigint or boolean (or is an enum) — not where a type
+    /// mapping names one of the application's. Only the output: a
+    /// parameter takes any value of its type.
+    pub fn map_refined(&self, ty: &Type, refinement: &Refinement) -> TsType {
+        let mut mapped = self.map(ty);
+        let Some(values) = &refinement.values else {
+            return mapped;
+        };
+        if self.overridden(ty) {
+            return mapped;
+        }
+        let mut inner = ty;
+        while let Type::Domain { base, .. } = inner {
+            inner = base;
+        }
+        // Every value of the type: its own mapping says as much, in its
+        // own order (an enum's labels as declared).
+        let whole = match inner {
+            Type::Enum { labels, .. } => values.len() >= labels.len(),
+            _ => mapped.output == "boolean" && values.len() >= 2,
+        };
+        if whole {
+            return mapped;
+        }
+        // The types whose values the analysis lists (`refine::Exact`), as
+        // their TypeScript type prints them.
+        let literal: fn(&str) -> String = match (inner, mapped.output.as_str()) {
+            (Type::Enum { .. }, _) => |v| js_string(v),
+            (Type::Basic { schema, name, .. }, output) if schema == "pg_catalog" => {
+                match (name.as_str(), output) {
+                    ("text" | "varchar" | "int8", "string") => |v| js_string(v),
+                    ("int2" | "int4" | "int8", "number") | ("bool", "boolean") => str::to_owned,
+                    ("int8", "bigint") => |v| format!("{v}n"),
+                    _ => return mapped,
+                }
+            }
+            _ => return mapped,
+        };
+        let mut values: Vec<&String> = values.iter().collect();
+        // Integers in numeric order.
+        values.sort_by_key(|v| (v.parse::<i128>().ok(), (*v).clone()));
+        mapped.output = if values.is_empty() {
+            "never".to_owned()
+        } else {
+            values
+                .iter()
+                .map(|v| literal(v))
+                .collect::<Vec<_>>()
+                .join(" | ")
+        };
+        mapped
+    }
+
+    /// Whether a type mapping names `ty` (or a domain it is over).
+    fn overridden(&self, ty: &Type) -> bool {
+        match ty {
+            Type::Domain {
+                schema, name, base, ..
+            } => self.override_for(schema, name).is_some() || self.overridden(base),
+            Type::Basic { schema, name, .. } | Type::Enum { schema, name, .. } => {
+                self.override_for(schema, name).is_some()
+            }
+            _ => false,
+        }
+    }
+
     /// The mapping of a value of `ty` (its own nullability is the caller's).
     pub fn map(&self, ty: &Type) -> TsType {
         match ty {
@@ -545,6 +614,53 @@ mod tests {
                 extension: None,
             };
             assert_eq!(m.map(&ty).output, r#""happy" | "it's \"ok\"""#);
+        });
+    }
+
+    #[test]
+    fn refined_values_read_as_literal_unions() {
+        let refined = |vs: &[&str]| Refinement {
+            values: Some(vs.iter().map(|v| (*v).to_owned()).collect()),
+            ..Refinement::NONE
+        };
+        let int8 = |mode| {
+            with(mode, |m| {
+                m.map_refined(&basic_ty("int8"), &refined(&["1"])).output
+            })
+        };
+        assert_eq!(int8(Int8::Bigint), "1n");
+        assert_eq!(int8(Int8::String), r#""1""#);
+        assert_eq!(int8(Int8::Number), "1");
+        with(Int8::Bigint, |m| {
+            let out = |ty: &Type, vs: &[&str]| m.map_refined(ty, &refined(vs)).output;
+            assert_eq!(out(&basic_ty("text"), &["b", "a"]), r#""a" | "b""#);
+            assert_eq!(out(&basic_ty("int4"), &["10", "2"]), "2 | 10");
+            assert_eq!(out(&basic_ty("bool"), &["true"]), "true");
+            assert_eq!(out(&basic_ty("bool"), &["false", "true"]), "boolean");
+            assert_eq!(out(&basic_ty("text"), &[]), "never");
+            // Not a type TypeScript prints its values as.
+            assert_eq!(out(&basic_ty("uuid"), &["x"]), "string");
+            assert_eq!(out(&basic_ty("numeric"), &["1"]), "string");
+            let mood = Type::Enum {
+                schema: "public".into(),
+                name: "mood".into(),
+                labels: vec!["sad".into(), "ok".into(), "happy".into()],
+                extension: None,
+            };
+            assert_eq!(out(&mood, &["ok", "happy"]), r#""happy" | "ok""#);
+            assert_eq!(
+                out(&mood, &["ok", "happy", "sad"]),
+                r#""sad" | "ok" | "happy""#
+            );
+            // Unrefined, and the input: any value of the type.
+            assert_eq!(
+                m.map_refined(&basic_ty("text"), &Refinement::NONE).output,
+                "string"
+            );
+            assert_eq!(
+                m.map_refined(&basic_ty("text"), &refined(&["a"])).input,
+                "string"
+            );
         });
     }
 
