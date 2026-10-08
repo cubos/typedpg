@@ -41,7 +41,8 @@
 //! claim, not an inference, and isn't checked.
 //!
 //! A column's [`crate::Refinement`] is a promise too: one refined finite
-//! never comes back an infinite date, timestamp or interval.
+//! never comes back an infinite date, timestamp or interval, and one
+//! refined to a set of values never comes back another.
 //!
 //! Only SELECT / INSERT / UPDATE / DELETE / MERGE statements run; queries
 //! calling server-administration functions with effects that outlive a
@@ -472,6 +473,29 @@ fn refinement_violation(col: &crate::AnalyzedColumn, bytes: &[u8]) -> Option<Str
     let mut ty = &col.pg_type;
     while let Type::Domain { base, .. } = ty {
         ty = base;
+    }
+    if let Some(values) = &col.refinement.values {
+        // `int2send` / … big-endian, `boolsend` a byte, `textsend` /
+        // `enum_send` the text.
+        let printed = match ty {
+            Type::Enum { .. } => std::str::from_utf8(bytes).ok().map(str::to_owned),
+            Type::Basic { schema, name, .. } if schema == "pg_catalog" => match name.as_str() {
+                "int2" => Some(i16::from_be_bytes(bytes.try_into().ok()?).to_string()),
+                "int4" => Some(i32::from_be_bytes(bytes.try_into().ok()?).to_string()),
+                "int8" => Some(i64::from_be_bytes(bytes.try_into().ok()?).to_string()),
+                "bool" => Some((bytes.first()? != &0).to_string()),
+                "text" | "varchar" => std::str::from_utf8(bytes).ok().map(str::to_owned),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(v) = printed
+            && !values.contains(&v)
+        {
+            return Some(format!(
+                "the value is {v:?}, not one of {values:?} (refinement: values)"
+            ));
+        }
     }
     let Type::Basic { schema, name, .. } = ty else {
         return None;

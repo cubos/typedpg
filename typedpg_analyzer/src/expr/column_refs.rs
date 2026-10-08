@@ -30,6 +30,24 @@ pub(crate) fn check_column_ref_length(col_ref: &protobuf::ColumnRef) -> Result<(
     Err(err.finalize_implicit())
 }
 
+/// What a column read here is: its own refinement, and the values its
+/// type, its table's CHECK constraints and the conditions holding here
+/// leave it (`WHERE kind IN ('a', 'b')` makes `kind` one of those).
+fn column_refinement(col: &crate::scope::ScopeColumn, ctx: Ctx<'_>) -> crate::refine::Refinement {
+    let mut refine = col.refine.clone();
+    if crate::refine::Exact::of(col.type_oid, col.collation, ctx.snapshot).is_some() {
+        let space = crate::nonnull::checks::Space::of(col.type_oid, col.collation, ctx.snapshot)
+            .with_values(col.refine.values.as_ref());
+        let key = (col.table_alias.clone(), col.name.clone());
+        if let Some(cands) = ctx.null_ctx.candidates(&key, &space) {
+            refine.values = cands.iter().map(|l| space.print(l)).collect();
+        }
+    } else {
+        refine.values = None;
+    }
+    refine
+}
+
 pub(crate) fn infer_column_ref(
     col_ref: &protobuf::ColumnRef,
     ctx: Ctx<'_>,
@@ -88,7 +106,7 @@ pub(crate) fn infer_column_ref(
                 // see through to the field types.
                 record_fields: col.record_fields.clone(),
                 elem_nullable: col.elem_nullable,
-                refine: col.refine.clone(),
+                refine: column_refinement(col, ctx),
             })
         }
         Err(e) => {

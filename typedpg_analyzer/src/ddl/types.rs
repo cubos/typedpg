@@ -224,6 +224,10 @@ pub(crate) struct DomainConstraint {
     pub(crate) null_free_elements: bool,
     /// A CHECK keeping `VALUE` finite (`CHECK (isfinite(VALUE))`).
     pub(crate) finite: bool,
+    /// The values a CHECK allows `VALUE` (`CHECK (VALUE IN ('a', 'b'))`),
+    /// as [`crate::refine::Refinement::values`] are printed, compared under
+    /// the base type's collation (see [`crate::nonnull::checks::allowed_values`]).
+    pub(crate) values: Option<std::collections::BTreeSet<String>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -248,6 +252,7 @@ fn add_domain_constraint(
     let mut rejects_null = false;
     let mut null_free_elements = false;
     let mut finite = false;
+    let mut values = None;
     let kind = match ConstrType::try_from(c.contype) {
         Ok(ConstrType::ConstrNotnull) => {
             rejects_null = true;
@@ -255,8 +260,14 @@ fn add_domain_constraint(
         }
         Ok(ConstrType::ConstrCheck) => {
             if let Some(expr) = c.raw_expr.as_deref() {
-                (refs, rejects_null, null_free_elements, finite) =
-                    check_domain_check_expression(interp, base_type, expr)?;
+                let checked = check_domain_check_expression(interp, base_type, expr)?;
+                (refs, rejects_null, null_free_elements, finite, values) = (
+                    checked.refs,
+                    checked.rejects_null,
+                    checked.null_free_elements,
+                    checked.finite,
+                    checked.values,
+                );
             }
             DomainConstraintKind::Check
         }
@@ -306,6 +317,7 @@ fn add_domain_constraint(
         rejects_null,
         null_free_elements,
         finite,
+        values,
     });
     Ok(())
 }
@@ -334,17 +346,29 @@ fn record_domain_constraint_dependencies(
     Ok(())
 }
 
+/// What a domain CHECK expression says (see [`check_domain_check_expression`]).
+struct DomainCheck {
+    /// What it refers to.
+    refs: Vec<super::depend::Reference>,
+    /// FALSE for a NULL `VALUE` (see [`crate::nonnull::subst`]).
+    rejects_null: bool,
+    /// Keeps NULL elements out of an array `VALUE` (see
+    /// [`crate::nonnull::checks::null_free_arrays`]).
+    null_free_elements: bool,
+    /// Keeps `VALUE` finite (see [`crate::nonnull::checks::finite_column`]).
+    finite: bool,
+    /// The values it allows `VALUE` (see
+    /// [`crate::nonnull::checks::allowed_values`]).
+    values: Option<std::collections::BTreeSet<String>>,
+}
+
 /// A domain CHECK expression sees `VALUE` as a value of the base type and
-/// must yield boolean (`domainAddCheckConstraint`). Returns what it refers
-/// to, whether it is FALSE for a NULL `VALUE` (see [`crate::nonnull::subst`])
-/// whether it keeps NULL elements out of an array `VALUE` (see
-/// [`crate::nonnull::checks::null_free_arrays`]) and whether it keeps
-/// `VALUE` finite (see [`crate::nonnull::checks::finite_column`]).
+/// must yield boolean (`domainAddCheckConstraint`).
 fn check_domain_check_expression(
     interp: &PgCatalog,
     base_type: PgTypeOid,
     expr: &typedpg_pg_query::protobuf::Node,
-) -> Result<(Vec<super::depend::Reference>, bool, bool, bool), DdlError> {
+) -> Result<DomainCheck, DdlError> {
     use crate::expr::{TypeGoal, infer_expr};
     use crate::nullability::NullabilityContext;
     use crate::param_collector::ParamCollector;
@@ -423,7 +447,22 @@ fn check_domain_check_expression(
     let finite = crate::nonnull::checks::finite_columns_of(expr, &log)
         .iter()
         .any(|c| c == "value");
-    Ok((refs, rejects_null, null_free_elements, finite))
+    let collation = interp.pg_type.get(&base_type).and_then(|t| t.typcollation);
+    let values = crate::nonnull::checks::allowed_values(
+        expr,
+        "value",
+        base_type,
+        collation,
+        interp,
+        &log.trusted(),
+    );
+    Ok(DomainCheck {
+        refs,
+        rejects_null,
+        null_free_elements,
+        finite,
+        values,
+    })
 }
 
 // ─── ALTER DOMAIN ───────────────────────────────────────────────────────────

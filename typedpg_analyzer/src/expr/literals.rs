@@ -31,6 +31,18 @@ pub(crate) fn infer_a_const(a_const: &protobuf::AConst) -> Result<ExprType, Anal
     // is when it spells one.
     let refine = match &a_const.val {
         Some(a_const::Val::Sval(s)) => crate::refine::Refinement::of_string_literal(&s.sval),
+        Some(a_const::Val::Ival(i)) => crate::refine::Refinement {
+            values: Some([i.ival.to_string()].into()),
+            ..crate::refine::Refinement::FINITE
+        },
+        Some(a_const::Val::Fval(f)) if type_oid != oid::NUMERIC => crate::refine::Refinement {
+            values: crate::literal_input::parse_pg_integer(&f.fval).map(|i| [i.to_string()].into()),
+            ..crate::refine::Refinement::FINITE
+        },
+        Some(a_const::Val::Boolval(b)) => crate::refine::Refinement {
+            values: Some([b.boolval.to_string()].into()),
+            ..crate::refine::Refinement::FINITE
+        },
         _ => crate::refine::Refinement::FINITE,
     };
 
@@ -290,12 +302,17 @@ pub(crate) fn infer_type_cast(
         ..ExprType::scalar_with_typmod(target_oid, nullable, written_typmod)
             .with_collation(state)
             .with_elem_nullable(elem_nullable)
-            .with_refine(
-                inner_type
+            .with_refine({
+                let mut refine = inner_type
                     .refine
                     .converted(inner_type.type_oid, target_oid, snapshot)
-                    .and(&snapshot.domain_refinement(target_oid)),
-            )
+                    .and(&snapshot.domain_refinement(target_oid));
+                // An explicit cast to `varchar(n)` truncates.
+                if cast_typmod.is_some() {
+                    refine.values = None;
+                }
+                refine
+            })
     })
 }
 

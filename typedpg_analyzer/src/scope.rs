@@ -586,6 +586,7 @@ impl Scope {
                 .then_some(false),
                 refine: crate::refine::Refinement {
                     finite: finite.contains(&c.attname),
+                    values: None,
                 }
                 .and(&snapshot.domain_refinement(c.atttypid)),
                 origin: None,
@@ -676,6 +677,7 @@ impl Scope {
                 .then_some(false),
                 refine: crate::refine::Refinement {
                     finite: finite.contains(&c.attname),
+                    values: None,
                 }
                 .and(&snapshot.domain_refinement(c.atttypid)),
                 origin: None,
