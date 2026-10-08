@@ -264,6 +264,56 @@ pub(crate) fn deposit_correlation(sel: &protobuf::SelectStmt, mut facts: Facts) 
     });
 }
 
+/// What a subquery's level proves of its own rows (see [`capture_own`]):
+/// its WHERE's facts about its own FROM entries, those entries (alias and
+/// relation), and the column its single target is, when it is one.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct OwnRows {
+    pub facts: Facts,
+    pub sources: Vec<(String, Option<crate::oid::PgClassOid>)>,
+    pub target: Option<Col>,
+}
+
+thread_local! {
+    /// The subquery whose own rows' facts are being captured: the
+    /// `SelectStmt`'s address, and what it deposited.
+    static OWN_ROWS: RefCell<Option<(usize, Option<OwnRows>)>> = const { RefCell::new(None) };
+}
+
+/// Run `f` (the analysis of subquery `sel`), capturing what `sel`'s level
+/// proves of its own rows (see [`OwnRows`]), when every row it returns
+/// passed its WHERE. Only `sel` itself deposits, by address.
+pub(crate) fn capture_own<R>(
+    sel: &protobuf::SelectStmt,
+    f: impl FnOnce() -> R,
+) -> (R, Option<OwnRows>) {
+    let key = sel as *const protobuf::SelectStmt as usize;
+    let before = OWN_ROWS.with(|c| c.replace(Some((key, None))));
+    let out = f();
+    let got = OWN_ROWS.with(|c| c.replace(before));
+    (out, got.and_then(|(_, own)| own))
+}
+
+/// Deposit what `sel`'s level proves of its own rows, if `sel` is the
+/// subquery being captured (see [`capture_own`]).
+pub(crate) fn deposit_own(sel: &protobuf::SelectStmt, mut own: OwnRows) {
+    let key = sel as *const protobuf::SelectStmt as usize;
+    own.facts.exprs.clear();
+    OWN_ROWS.with(|c| {
+        if let Some((k, slot)) = c.borrow_mut().as_mut()
+            && *k == key
+        {
+            *slot = Some(own);
+        }
+    });
+}
+
+/// Whether some query is capturing `sel`'s own rows' facts.
+pub(crate) fn own_wanted(sel: &protobuf::SelectStmt) -> bool {
+    let key = sel as *const protobuf::SelectStmt as usize;
+    OWN_ROWS.with(|c| c.borrow().as_ref().is_some_and(|(k, _)| *k == key))
+}
+
 /// Whether some query is capturing `sel`'s correlation facts.
 pub(crate) fn correlation_wanted(sel: &protobuf::SelectStmt) -> bool {
     let key = sel as *const protobuf::SelectStmt as usize;
@@ -573,6 +623,26 @@ impl Facts {
     }
 
     /// Only the facts about the FROM entries named in `aliases`.
+    /// These facts with every column of `from` read as the same column of
+    /// `to`, and nothing about any other entry.
+    pub fn moved(&self, from: &str, to: &str) -> Facts {
+        let one: HashSet<String> = std::iter::once(from.to_owned()).collect();
+        let mut f = self.clone().restricted_to(&one);
+        let mv = |(_, c): &Col| (to.to_owned(), c.clone());
+        f.columns = f.columns.iter().map(mv).collect();
+        f.rels = f.rels.iter().map(|_| to.to_owned()).collect();
+        f.nulls = f.nulls.iter().map(mv).collect();
+        f.disjunctions = f
+            .disjunctions
+            .iter()
+            .map(|d| d.iter().map(mv).collect())
+            .collect();
+        f.equals = f.equals.iter().map(|(c, l)| (mv(c), l.clone())).collect();
+        f.preds = f.preds.iter().map(|(c, p)| (mv(c), p.clone())).collect();
+        f.exprs.clear();
+        f
+    }
+
     pub fn restricted_to(mut self, aliases: &HashSet<String>) -> Facts {
         self.columns.retain(|(a, _)| aliases.contains(a));
         self.rels.retain(|a| aliases.contains(a));
@@ -975,20 +1045,26 @@ fn nonnullable_node(
         {
             log.correlated(sub.location)
         }
-        // `x IN (SELECT …)` / `x op ANY (SELECT …)`: like `op ANY(array)`.
-        node::Node::SubLink(sub)
-            if top_level && log.is_strict(sub.location, StrictNode::Sublink) =>
-        {
-            match sub.testexpr.as_deref() {
-                Some(t) => match t.node.as_ref() {
-                    Some(node::Node::RowExpr(r)) => r
-                        .args
-                        .iter()
-                        .fold(Facts::default(), |acc, a| acc.union(walk(a, false))),
-                    _ => walk(t, false),
-                },
-                None => Facts::default(),
-            }
+        // `x IN (SELECT …)` / `x op ANY (SELECT …)`: like `op ANY(array)`;
+        // and, for `k IN (SELECT k FROM t … FOR UPDATE)` over a key of the
+        // same table, what the subquery's WHERE proves of the row (noted
+        // by `expr::sublink`).
+        node::Node::SubLink(sub) if top_level => {
+            let tested = if log.is_strict(sub.location, StrictNode::Sublink) {
+                match sub.testexpr.as_deref() {
+                    Some(t) => match t.node.as_ref() {
+                        Some(node::Node::RowExpr(r)) => r
+                            .args
+                            .iter()
+                            .fold(Facts::default(), |acc, a| acc.union(walk(a, false))),
+                        _ => walk(t, false),
+                    },
+                    None => Facts::default(),
+                }
+            } else {
+                Facts::default()
+            };
+            tested.union(log.correlated(sub.location))
         }
         // Boolean tests that are not TRUE for a NULL input.
         node::Node::BooleanTest(t)
