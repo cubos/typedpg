@@ -425,3 +425,151 @@ fn a_nondeterministic_collation_lets_other_spellings_through() {
         &[("x", None), ("y", None), ("z", Some(&["a", "b"]))],
     );
 }
+
+// ── Integer ranges ───────────────────────────────────────────────────────────
+
+fn ranges_setup() -> PgCatalog {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE DOMAIN positive AS int CHECK (VALUE > 0);
+         CREATE TABLE q (id int PRIMARY KEY, n int NOT NULL CHECK (n BETWEEN 1 AND 100),
+                         m int NOT NULL, small int NOT NULL CHECK (small >= 0 AND small < 3),
+                         d positive, name text NOT NULL);",
+    )
+    .unwrap();
+    db
+}
+
+/// Each column's (name, nullable, lower bound, upper bound).
+#[track_caller]
+fn assert_ranges(db: &PgCatalog, sql: &str, expected: &[(&str, bool, Option<i128>, Option<i128>)]) {
+    let s = db.analyze(sql).unwrap();
+    let actual: Vec<(&str, bool, Option<i128>, Option<i128>)> = s
+        .columns
+        .iter()
+        .map(|c| {
+            let r = c.refinement.range.unwrap_or_default();
+            (c.name.as_str(), c.nullable, r.lo, r.hi)
+        })
+        .collect();
+    assert_eq!(
+        actual, expected,
+        "(name, nullable, lo, hi) mismatch for `{sql}`"
+    );
+}
+
+#[test]
+fn checks_conditions_and_literals_bound_integers() {
+    let db = ranges_setup();
+    assert_ranges(
+        &db,
+        "SELECT n, m, small, d, 7 AS seven FROM q",
+        &[
+            ("n", false, Some(1), Some(100)),
+            ("m", false, None, None),
+            ("small", false, Some(0), Some(2)),
+            ("d", true, Some(1), None),
+            ("seven", false, Some(7), Some(7)),
+        ],
+    );
+    assert_ranges(
+        &db,
+        "SELECT m FROM q WHERE m > 5 AND m <= 10",
+        &[("m", false, Some(6), Some(10))],
+    );
+    // A few integers are listed as values too.
+    assert_values(
+        &db,
+        "SELECT small, m FROM q WHERE m > 5 AND m <= 7",
+        &[("small", Some(&["0", "1", "2"])), ("m", Some(&["6", "7"]))],
+    );
+}
+
+#[test]
+fn arithmetic_counts_and_conditionals_carry_bounds() {
+    let db = ranges_setup();
+    assert_ranges(
+        &db,
+        "SELECT n + 1 AS a, n - small AS b, n * 2 AS c, -n AS e, abs(m) AS f,
+                length(name) AS g, row_number() OVER () AS h,
+                CASE WHEN m > 0 THEN 1 ELSE n END AS i, greatest(m, 0) AS j,
+                least(n, 10) AS k, n * m AS l
+         FROM q",
+        &[
+            ("a", false, Some(2), Some(101)),
+            ("b", false, Some(-1), Some(100)),
+            ("c", false, Some(2), Some(200)),
+            ("e", false, Some(-100), Some(-1)),
+            ("f", false, Some(0), None),
+            ("g", false, Some(0), None),
+            ("h", false, Some(1), None),
+            ("i", false, Some(1), Some(100)),
+            ("j", false, Some(0), None),
+            ("k", false, Some(1), Some(10)),
+            ("l", false, None, None),
+        ],
+    );
+    assert_ranges(
+        &db,
+        "SELECT count(*) AS a, sum(small) AS b, min(n) AS c, max(d) AS e FROM q",
+        &[
+            ("a", false, Some(0), None),
+            ("b", true, Some(0), None),
+            ("c", true, Some(1), Some(100)),
+            ("e", true, Some(1), None),
+        ],
+    );
+}
+
+#[test]
+fn nullif_of_a_value_out_of_range_is_not_null() {
+    let db = ranges_setup();
+    assert_ranges(
+        &db,
+        "SELECT nullif(n, 0) AS a, nullif(m, 0) AS b, nullif(row_number() OVER (), 0) AS c,
+                nullif(small, 3) AS e, nullif(small, 2) AS f
+         FROM q",
+        &[
+            ("a", false, Some(1), Some(100)),
+            ("b", true, None, None),
+            ("c", false, Some(1), None),
+            ("e", false, Some(0), Some(2)),
+            ("f", true, Some(0), Some(2)),
+        ],
+    );
+    // NULLIF never returns the value it compares with.
+    assert_values(
+        &db,
+        "SELECT nullif(small, 2) AS f FROM q",
+        &[("f", Some(&["0", "1"]))],
+    );
+}
+
+#[test]
+fn a_case_over_a_checked_interval_covers_it() {
+    let db = ranges_setup();
+    let s = db
+        .analyze(
+            "SELECT CASE small WHEN 0 THEN 'a' WHEN 1 THEN 'b' WHEN 2 THEN 'c' END AS x FROM q",
+        )
+        .unwrap();
+    assert!(!s.columns[0].nullable);
+}
+
+#[test]
+fn a_recursive_counter_settles() {
+    let db = ranges_setup();
+    // The range grows each step: it is dropped rather than guessed.
+    assert_ranges(
+        &db,
+        "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 100)
+         SELECT n FROM r",
+        &[("n", false, None, None)],
+    );
+    assert_ranges(
+        &db,
+        "WITH RECURSIVE r(n, k) AS (SELECT 1, 0 UNION ALL SELECT n + 1, k FROM r WHERE n < 3)
+         SELECT k FROM r",
+        &[("k", false, Some(0), Some(0))],
+    );
+}

@@ -523,7 +523,7 @@ pub(crate) fn infer_case(
             Some((
                 col.base_not_null,
                 crate::nonnull::checks::Space::of(col.type_oid, col.collation, snapshot)
-                    .with_values(col.refine.values.as_ref()),
+                    .with_values(col.refine.enumerated().as_ref()),
             ))
         };
         null_ctx.unreachable(&column)

@@ -267,6 +267,24 @@ impl Space {
     /// hold, when they are finitely many (and known).
     fn candidates(&self, preds: &[ValPred]) -> Option<Vec<Literal>> {
         let mut cands = self.domain.clone();
+        // An integer between two near bounds is one of the few between.
+        if cands.is_none()
+            && let Some(crate::refine::IntRange {
+                lo: Some(lo),
+                hi: Some(hi),
+            }) = self.bounds(preds)
+            && hi >= lo
+            && hi - lo < MAX_ENUMERATED
+        {
+            cands = Some(
+                (lo..=hi)
+                    .map(|v| Literal {
+                        text: v.to_string(),
+                        kind: LitKind::Integer,
+                    })
+                    .collect(),
+            );
+        }
         for p in preds {
             if let ValPred::In(vs) = p {
                 cands = Some(match cands {
@@ -283,6 +301,45 @@ impl Space {
                 .filter(|x| !preds.iter().any(|p| self.fails(p, x)))
                 .collect()
         })
+    }
+
+    /// The bounds the ordering comparisons and value lists among `preds`
+    /// leave a non-NULL integer column (`None` for a space of another kind).
+    pub(crate) fn bounds(&self, preds: &[ValPred]) -> Option<crate::refine::IntRange> {
+        if self.kind != SpaceKind::Int || !self.integral {
+            return None;
+        }
+        let mut r = crate::refine::IntRange::default();
+        for p in preds {
+            let b = match p {
+                ValPred::Cmp(op, v) => {
+                    let Some(v) = self.int(v) else { continue };
+                    match op {
+                        CmpOp::Gt => crate::refine::IntRange::at_least(v + 1),
+                        CmpOp::Ge => crate::refine::IntRange::at_least(v),
+                        CmpOp::Lt => crate::refine::IntRange {
+                            lo: None,
+                            hi: Some(v - 1),
+                        },
+                        CmpOp::Le => crate::refine::IntRange {
+                            lo: None,
+                            hi: Some(v),
+                        },
+                    }
+                }
+                ValPred::In(vs) => {
+                    let ints: Option<Vec<i128>> = vs.iter().map(|v| self.int(v)).collect();
+                    let Some(ints) = ints else { continue };
+                    crate::refine::IntRange {
+                        lo: ints.iter().min().copied(),
+                        hi: ints.iter().max().copied(),
+                    }
+                }
+                ValPred::NotIn(_) => continue,
+            };
+            r = r.meet(&b);
+        }
+        Some(r)
     }
 
     /// The interval the ordering comparisons among `preds` (and `extra`)
@@ -373,6 +430,9 @@ struct Cx<'a> {
 
 /// The arms past which an OR of DNF arms grows too large to keep.
 const MAX_ARMS: usize = 16;
+
+/// The most integers an interval is listed as candidates for.
+const MAX_ENUMERATED: i128 = 16;
 
 /// The most values a column is split into cases over.
 const MAX_CASES: usize = 8;
@@ -877,11 +937,12 @@ pub(crate) fn finite_column(n: &protobuf::Node, trust: &impl Trust) -> Option<St
         .flatten()
 }
 
-/// The values a constraint expression allows its column `c`, of type `t`
-/// under `collation`, when non-NULL and few: what its conjuncts that are
-/// `c = v`, `c IN (…)` or an OR of them (built-in comparisons with
-/// constants, see [`dnf`]) leave of the type's. `None` when the type
-/// doesn't print values as they compare ([`crate::refine::Exact`]).
+/// What a constraint expression allows its column `c`, of type `t` under
+/// `collation`, when non-NULL: the values its conjuncts that are `c = v`,
+/// `c IN (…)` or an OR of them leave of the type's, and the bounds its
+/// comparisons with constants set (built-in ones, see [`dnf`]). `None`
+/// when the type doesn't print values as they compare
+/// ([`crate::refine::Exact`]).
 pub(crate) fn allowed_values(
     expr: &protobuf::Node,
     c: &str,
@@ -889,7 +950,7 @@ pub(crate) fn allowed_values(
     collation: Option<crate::oid::PgCollationOid>,
     snapshot: &PgCatalog,
     trust: &TrustedNodes,
-) -> Option<BTreeSet<String>> {
+) -> Option<crate::refine::Refinement> {
     crate::refine::Exact::of(t, collation, snapshot)?;
     let is_composite = |_: &str| false;
     let column_type = |n: &str| (n == c).then_some(t);
@@ -918,9 +979,25 @@ pub(crate) fn allowed_values(
         if let Some(sets) = per_arm {
             preds.push(ValPred::In(sets.into_iter().flatten().cloned().collect()));
         }
+        // A single arm: everything it says of `c` holds (`VALUE > 0`).
+        if let [arm] = arms.as_slice() {
+            preds.extend(arm.iter().filter_map(|l| match l {
+                Lit::Val(col, p @ ValPred::Cmp(..)) if col == c => Some(p.clone()),
+                _ => None,
+            }));
+        }
     }
-    let cands = space.candidates(&preds)?;
-    cands.iter().map(|l| space.print(l)).collect()
+    let values = space
+        .candidates(&preds)
+        .and_then(|cands| cands.iter().map(|l| space.print(l)).collect());
+    let range = space
+        .bounds(&preds)
+        .filter(|r| *r != crate::refine::IntRange::default());
+    Some(crate::refine::Refinement {
+        values,
+        range,
+        ..crate::refine::Refinement::NONE
+    })
 }
 
 /// The columns a constraint expression keeps finite (see [`finite_column`]).

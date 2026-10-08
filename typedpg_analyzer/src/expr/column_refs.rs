@@ -37,10 +37,20 @@ fn column_refinement(col: &crate::scope::ScopeColumn, ctx: Ctx<'_>) -> crate::re
     let mut refine = col.refine.clone();
     if crate::refine::Exact::of(col.type_oid, col.collation, ctx.snapshot).is_some() {
         let space = crate::nonnull::checks::Space::of(col.type_oid, col.collation, ctx.snapshot)
-            .with_values(col.refine.values.as_ref());
+            .with_values(col.refine.enumerated().as_ref());
         let key = (col.table_alias.clone(), col.name.clone());
-        if let Some(cands) = ctx.null_ctx.candidates(&key, &space) {
+        let preds = ctx.null_ctx.column_preds(&key);
+        if let Some(cands) = space.candidates_of(&preds) {
             refine.values = cands.iter().map(|l| space.print(l)).collect();
+        }
+        if let Some(bounds) = space
+            .bounds(&preds)
+            .filter(|b| *b != crate::refine::IntRange::default())
+        {
+            refine.range = Some(match refine.range {
+                Some(r) => r.meet(&bounds),
+                None => bounds,
+            });
         }
     } else {
         refine.values = None;

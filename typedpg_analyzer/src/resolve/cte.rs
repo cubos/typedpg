@@ -25,20 +25,19 @@ pub(crate) struct AnalyzedCte {
 /// Every nullability flag of `columns` (their own, their array elements',
 /// their record fields') and their refinements, to tell when a recursive
 /// CTE's have settled.
-fn nullability_signature(columns: &[ScopeColumn]) -> Vec<Option<bool>> {
-    fn shape(out: &mut Vec<Option<bool>>, s: Option<&crate::expr::RecordShape>) {
+fn nullability_signature(
+    columns: &[ScopeColumn],
+) -> Vec<(Option<bool>, Option<bool>, crate::refine::Refinement)> {
+    type Signature = Vec<(Option<bool>, Option<bool>, crate::refine::Refinement)>;
+    fn shape(out: &mut Signature, s: Option<&crate::expr::RecordShape>) {
         for f in s.into_iter().flat_map(|s| s.iter()) {
-            out.push(Some(f.ty.nullable));
-            out.push(f.ty.elem_nullable);
-            out.push(Some(f.ty.refine.finite));
+            out.push((Some(f.ty.nullable), f.ty.elem_nullable, f.ty.refine.clone()));
             shape(out, f.ty.record_fields.as_ref());
         }
     }
     let mut out = Vec::new();
     for c in columns {
-        out.push(Some(c.base_not_null));
-        out.push(c.elem_nullable);
-        out.push(Some(c.refine.finite));
+        out.push((Some(c.base_not_null), c.elem_nullable, c.refine.clone()));
         shape(&mut out, c.record_fields.as_ref());
     }
     out
@@ -227,10 +226,13 @@ pub(crate) fn analyze_cte(
             // `a` NULL on the second step). Analyze it again over the
             // columns as they stand until their nullability settles — it
             // only turns on, so this ends; the bound is a safety net, past
-            // which nothing is assumed NOT NULL.
+            // which nothing is assumed NOT NULL. A refinement can grow step
+            // after step (`n + 1` widens a range by one each time): one
+            // still changing after a few steps is dropped, so it settles.
             let mut columns = merge(&rec_cols);
+            let mut widened = vec![false; columns.len()];
             let mut settled = false;
-            for _ in 0..32 {
+            for step in 0..32 {
                 let mut scopes = body_ctes.clone();
                 register_cte(
                     &mut scopes,
@@ -240,7 +242,13 @@ pub(crate) fn analyze_cte(
                     owner_depth,
                 );
                 let (rec_cols, _) = analyze_body(rarg, params, &scopes)?;
-                let next = merge(&rec_cols);
+                let mut next = merge(&rec_cols);
+                for ((n, c), widened) in next.iter_mut().zip(&columns).zip(&mut widened) {
+                    *widened |= step >= 3 && n.refine != c.refine;
+                    if *widened {
+                        n.refine = crate::refine::Refinement::NONE;
+                    }
+                }
                 if nullability_signature(&next) == nullability_signature(&columns) {
                     settled = true;
                     break;

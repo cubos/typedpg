@@ -227,7 +227,7 @@ enum SetValue<'a> {
     /// `col = expr`, or one element of `(a, b) = ROW(x, y)`.
     Expr(&'a protobuf::Node),
     /// Column `n` of `(a, b) = (SELECT …)`.
-    SubqueryColumn(RawColumn),
+    SubqueryColumn(Box<RawColumn>),
 }
 
 /// Expand `SET (a, b) = (…)` like PG's `transformMultiAssignRef`
@@ -308,7 +308,7 @@ fn expand_set_items<'a>(
                 }
                 // A scalar sub-SELECT yields NULL when it returns no row.
                 col.nullable = true;
-                out.push((rt.as_ref(), SetValue::SubqueryColumn(col)));
+                out.push((rt.as_ref(), SetValue::SubqueryColumn(Box::new(col))));
             }
             _ => {
                 return Err(crate::error::RawError::new(

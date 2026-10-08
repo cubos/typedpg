@@ -41,8 +41,9 @@
 //! claim, not an inference, and isn't checked.
 //!
 //! A column's [`crate::Refinement`] is a promise too: one refined finite
-//! never comes back an infinite date, timestamp or interval, and one
-//! refined to a set of values never comes back another.
+//! never comes back an infinite date, timestamp or interval, one refined
+//! to a set of values never comes back another, and an integer never
+//! comes back out of its range.
 //!
 //! Only SELECT / INSERT / UPDATE / DELETE / MERGE statements run; queries
 //! calling server-administration functions with effects that outlive a
@@ -500,6 +501,23 @@ fn refinement_violation(col: &crate::AnalyzedColumn, bytes: &[u8]) -> Option<Str
     let Type::Basic { schema, name, .. } = ty else {
         return None;
     };
+    if let Some(range) = &col.refinement.range
+        && schema == "pg_catalog"
+    {
+        let int: Option<i128> = match name.as_str() {
+            "int2" => Some(i16::from_be_bytes(bytes.try_into().ok()?).into()),
+            "int4" => Some(i32::from_be_bytes(bytes.try_into().ok()?).into()),
+            "int8" => Some(i64::from_be_bytes(bytes.try_into().ok()?).into()),
+            _ => None,
+        };
+        if let Some(v) = int
+            && !range.contains(v)
+        {
+            return Some(format!(
+                "the value is {v}, out of {range:?} (refinement: range)"
+            ));
+        }
+    }
     if !col.refinement.finite || schema != "pg_catalog" {
         return None;
     }
