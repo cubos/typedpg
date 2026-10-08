@@ -88,6 +88,7 @@ pub(crate) fn infer_column_ref(
                 // see through to the field types.
                 record_fields: col.record_fields.clone(),
                 elem_nullable: col.elem_nullable,
+                refine: col.refine.clone(),
             })
         }
         Err(e) => {
@@ -270,6 +271,7 @@ fn whole_row_ref(
                     explicit_collation: false,
                     record_fields: c.record_fields.clone(),
                     elem_nullable: c.elem_nullable,
+                    refine: c.refine.clone(),
                 });
             }
         }
@@ -284,6 +286,7 @@ fn whole_row_ref(
         explicit_collation: false,
         record_fields: Some(shape_of_columns(&source.columns).into()),
         elem_nullable: None,
+        refine: crate::refine::Refinement::NONE,
     })
 }
 
@@ -302,6 +305,7 @@ fn shape_of_columns(columns: &[crate::scope::ScopeColumn]) -> Vec<RecordField> {
                 explicit_collation: false,
                 record_fields: c.record_fields.clone(),
                 elem_nullable: c.elem_nullable,
+                refine: c.refine.clone(),
             },
         })
         .collect()

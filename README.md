@@ -398,6 +398,26 @@ function, which makes it any number of rows, nor `ON CONFLICT DO NOTHING`, a
 `DO UPDATE ... WHERE` or a BEFORE ROW trigger, which may skip it) returns
 exactly one row, so `(SELECT id FROM ins)` is that row's `id`.
 
+### Finite dates and times
+
+`to_char` and `EXTRACT` / `date_part` of most fields are NULL for an infinite
+date, timestamp or interval. The analysis knows a value is finite when it is
+the current time (`now()`, `CURRENT_DATE`, …), a literal other than
+`infinity`, arithmetic, truncation or a conversion of finite values, the
+`min` / `max` / `lag` of them, or a column whose table (or domain) says so
+with `CHECK (isfinite(col))`. It follows the value through subqueries, CTEs,
+`UNION`, `CASE` and `COALESCE`:
+
+```rust
+// CHECK (isfinite(created_at))
+let rows = sql!(pool,
+    "SELECT to_char(created_at, 'YYYY-MM') AS month,
+            extract(day FROM now() - interval '1 week') AS day
+     FROM posts")
+    .fetch_all().await?;
+// rows[0].month : String, rows[0].day : Decimal
+```
+
 ### Nullability annotations
 
 Override the inferred nullability when you know better than the analyzer. Use `!` to force non-nullable and `?` to force nullable.

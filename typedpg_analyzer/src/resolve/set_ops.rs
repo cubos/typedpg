@@ -205,6 +205,7 @@ pub(crate) fn analyze_set_operation(
             if expr::coercion_can_null_elements(c.type_oid, type_oid, snapshot) {
                 c.elem_nullable = Some(true);
             }
+            c.refine = c.refine.converted(c.type_oid, type_oid, snapshot);
         }
         // transformSetOperationTree: every set operation but UNION ALL
         // compares the rows, so the column type needs an equality operator.
@@ -278,6 +279,11 @@ pub(crate) fn analyze_set_operation(
                 "EXCEPT" | "INTERSECT" => l.elem_nullable,
                 _ => crate::expr::merge_elem_nullable([l.elem_nullable, r.elem_nullable]),
             },
+            // A row of EXCEPT or INTERSECT is a left one.
+            refine: match op_label {
+                "EXCEPT" | "INTERSECT" => l.refine,
+                _ => crate::refine::Refinement::either([&l.refine, &r.refine]),
+            },
             origin: None,
         });
     }
@@ -310,6 +316,7 @@ fn set_operation_sort_and_limit(
             table_alias: alias.clone(),
             record_fields: c.record_fields.clone(),
             elem_nullable: c.elem_nullable,
+            refine: c.refine.clone(),
             origin: None,
         })
         .collect();

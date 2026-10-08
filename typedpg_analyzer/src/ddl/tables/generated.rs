@@ -456,6 +456,7 @@ pub(crate) fn generation_not_null(
             table_alias: relname.clone(),
             record_fields: None,
             elem_nullable: None,
+            refine: crate::refine::Refinement::NONE,
             origin: None,
         })
         .collect();

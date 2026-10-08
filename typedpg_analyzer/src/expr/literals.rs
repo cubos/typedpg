@@ -27,8 +27,14 @@ pub(crate) fn infer_a_const(a_const: &protobuf::AConst) -> Result<ExprType, Anal
         }
         None => oid::UNKNOWN,
     };
+    // A number, a boolean or a bit string is never an infinity; a string
+    // is when it spells one.
+    let refine = match &a_const.val {
+        Some(a_const::Val::Sval(s)) => crate::refine::Refinement::of_string_literal(&s.sval),
+        _ => crate::refine::Refinement::FINITE,
+    };
 
-    Ok(ExprType::scalar(type_oid, false))
+    Ok(ExprType::scalar(type_oid, false).with_refine(refine))
 }
 
 /// Type of an `Fval` (PG `T_Float`) constant, mirroring PG's `make_const`.
@@ -284,6 +290,12 @@ pub(crate) fn infer_type_cast(
         ..ExprType::scalar_with_typmod(target_oid, nullable, written_typmod)
             .with_collation(state)
             .with_elem_nullable(elem_nullable)
+            .with_refine(
+                inner_type
+                    .refine
+                    .converted(inner_type.type_oid, target_oid, snapshot)
+                    .and(&snapshot.domain_refinement(target_oid)),
+            )
     })
 }
 

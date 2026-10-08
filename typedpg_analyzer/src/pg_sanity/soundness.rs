@@ -15,7 +15,8 @@
 //!    joins against an empty side.
 //! 2. `nulls` — plus one row per table with every nullable column NULL
 //!    (NOT NULL composite columns get a value whose fields are all NULL,
-//!    NOT NULL arrays one holding a NULL element).
+//!    NOT NULL arrays one holding a NULL element, NOT NULL dates,
+//!    timestamps and intervals infinity).
 //! 3. `full` — plus one row per table with every column filled. Foreign
 //!    keys of both rows point at the referenced table's first row, so the
 //!    second parent row has no children: outer joins see matched and
@@ -38,6 +39,9 @@
 //! break the analyzer's premise, not its inference). A column whose
 //! PG-side name carries the `!` annotation is the user's own NOT NULL
 //! claim, not an inference, and isn't checked.
+//!
+//! A column's [`crate::Refinement`] is a promise too: one refined finite
+//! never comes back an infinite date, timestamp or interval.
 //!
 //! Only SELECT / INSERT / UPDATE / DELETE / MERGE statements run; queries
 //! calling server-administration functions with effects that outlive a
@@ -178,11 +182,11 @@ impl Soundness {
             .iter()
             .map(|c| !c.name().ends_with('!'))
             .collect();
-        let has_promise = ours
-            .columns
-            .iter()
-            .zip(&checked)
-            .any(|(c, &on)| on && (!c.nullable || has_inner_promise(&c.pg_type)));
+        let has_promise = ours.columns.iter().zip(&checked).any(|(c, &on)| {
+            on && (!c.nullable
+                || has_inner_promise(&c.pg_type)
+                || c.refinement != crate::refine::Refinement::NONE)
+        });
         if !has_promise {
             self.stats.no_promise += 1;
             return None;
@@ -286,7 +290,8 @@ impl Soundness {
                     let problem = match raw {
                         None if !col.nullable => Some("the value is NULL".to_string()),
                         None => None,
-                        Some(bytes) => inner_violation(&col.pg_type, bytes),
+                        Some(bytes) => inner_violation(&col.pg_type, bytes)
+                            .or_else(|| refinement_violation(col, bytes)),
                     };
                     if let Some(problem) = problem {
                         let message = render(sql, ours, i, r, &problem, scenario, &values, &seeded);
@@ -459,6 +464,42 @@ fn is_executable(sql: &str) -> bool {
                 | Node::MergeStmt(_)
         )
     )
+}
+
+/// What the binary value `bytes` of column `col` isn't of what its
+/// refinement says it is.
+fn refinement_violation(col: &crate::AnalyzedColumn, bytes: &[u8]) -> Option<String> {
+    let mut ty = &col.pg_type;
+    while let Type::Domain { base, .. } = ty {
+        ty = base;
+    }
+    let Type::Basic { schema, name, .. } = ty else {
+        return None;
+    };
+    if !col.refinement.finite || schema != "pg_catalog" {
+        return None;
+    }
+    // `date_send` / `timestamp_send` / `interval_send`: the infinities are
+    // the extreme values (DATEVAL_NOBEGIN / DT_NOEND, every field of an
+    // interval at once).
+    let infinite = match name.as_str() {
+        "date" => {
+            let v = read_i32(bytes, 0)?;
+            v == i32::MIN || v == i32::MAX
+        }
+        "timestamp" | "timestamptz" => {
+            let v = i64::from_be_bytes(bytes.get(..8)?.try_into().ok()?);
+            v == i64::MIN || v == i64::MAX
+        }
+        "interval" => {
+            let time = i64::from_be_bytes(bytes.get(..8)?.try_into().ok()?);
+            let (day, month) = (read_i32(bytes, 8)?, read_i32(bytes, 12)?);
+            (time == i64::MIN && day == i32::MIN && month == i32::MIN)
+                || (time == i64::MAX && day == i32::MAX && month == i32::MAX)
+        }
+        _ => false,
+    };
+    infinite.then(|| "the value is infinite (refinement: finite)".to_string())
 }
 
 /// Find a NULL inside the binary value `bytes` of type `ty` where `ty`

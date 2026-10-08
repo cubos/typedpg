@@ -288,11 +288,28 @@ impl PgCatalog {
     /// chain has a CHECK keeping them out. Every value of a domain type
     /// passed its CHECKs (`NOT VALID` ones are trusted) or is NULL.
     pub(crate) fn domain_null_free_elements(&self, oid: PgTypeOid) -> bool {
+        self.domain_check_says(oid, |c| c.null_free_elements)
+    }
+
+    /// The refinement every value of type `oid` has: a domain of its chain
+    /// has a CHECK keeping it finite (see [`Self::domain_null_free_elements`]).
+    pub(crate) fn domain_refinement(&self, oid: PgTypeOid) -> crate::refine::Refinement {
+        crate::refine::Refinement {
+            finite: self.domain_check_says(oid, |c| c.finite),
+        }
+    }
+
+    /// Whether a CHECK of a domain of `oid`'s chain says `what`.
+    fn domain_check_says(
+        &self,
+        oid: PgTypeOid,
+        what: impl Fn(&crate::ddl::types::DomainConstraint) -> bool,
+    ) -> bool {
         !self.domain_constraints.is_empty()
             && self.domain_chain(oid).iter().any(|d| {
                 self.domain_constraints
                     .get(d)
-                    .is_some_and(|cs| cs.iter().any(|c| c.null_free_elements))
+                    .is_some_and(|cs| cs.iter().any(&what))
             })
     }
 
