@@ -397,6 +397,7 @@ fn with_statement_sql(
     // made it several times slower.)
     let result = crate::expr::inline::resolving_only(|| f(db));
     db.statement_sql = outer;
+    db.forget_inline_body_trust();
     result
 }
 

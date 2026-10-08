@@ -22,6 +22,8 @@ mod assignments;
 mod call;
 #[path = "query/casts_and_coercion.rs"]
 mod casts_and_coercion;
+#[path = "query/check_json_facts.rs"]
+mod check_json_facts;
 #[path = "query/check_reasoning.rs"]
 mod check_reasoning;
 #[path = "query/constraint_narrowing.rs"]

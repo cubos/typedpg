@@ -1107,6 +1107,15 @@ fn infer_generic_binary_op(
                 }
                 _ => None,
             };
+            // A built-in jsonb operator, for a CHECK's JSON reading.
+            if let Some(b) = op
+                .code
+                .and_then(|c| snapshot.pg_proc.get(&c))
+                .filter(|p| snapshot.namespace_name(p.pronamespace) == Some("pg_catalog"))
+                .and_then(|p| crate::nonnull::JsonbBuiltin::of(&p.proname))
+            {
+                ctx.note_strict(expr.location, crate::nonnull::StrictNode::Jsonb(b), true);
+            }
             let refine = op
                 .code
                 .and_then(|c| snapshot.pg_proc.get(&c))

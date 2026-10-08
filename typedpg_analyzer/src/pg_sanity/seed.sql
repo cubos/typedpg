@@ -106,6 +106,10 @@ BEGIN
         WHEN 'G' THEN ARRAY[['(0,0)', '(1,1)'], ['((0,0),(1,1))', '((0,0),(2,2))'],
                             ['{1,1,1}', '{1,2,1}'], ['<(0,0),1>', '<(0,0),2>']]
         WHEN 'V' THEN ARRAY[['1', '0']]
+        -- jsonb (and other 'U' types, which reject it): an object with
+        -- the keys a JSON constraint may require; adversarially, an array
+        -- holding them as strings (`? 'a'` is TRUE of it too).
+        WHEN 'U' THEN ARRAY[['["a", "k", "n"]', '{"a": "a", "k": 1, "n": {"x": 1}}']]
         ELSE ARRAY[['1', '2']]
     END || ARRAY[
         ['1', '2'], ['a', 'b'], ['false', 'true'],

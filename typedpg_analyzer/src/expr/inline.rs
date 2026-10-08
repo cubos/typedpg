@@ -93,42 +93,7 @@ pub(crate) fn inline_call(
             t
         })
         .collect();
-    // Named parameters are columns of a source named after the function
-    // (`v`, `f.v`); `$n` are the bound arguments.
-    let alias = proc.proname.clone();
-    // The input parameters' names (`proargnames` lists OUT ones too, by
-    // `proargmodes`).
-    let input_names = proc.proargnames.iter().enumerate().filter(|(i, _)| {
-        proc.proargmodes.get(*i).is_none_or(|m| {
-            matches!(
-                m,
-                crate::pg_catalog::ArgMode::In
-                    | crate::pg_catalog::ArgMode::InOut
-                    | crate::pg_catalog::ArgMode::Variadic
-            )
-        })
-    });
-    let columns: Vec<crate::scope::ScopeColumn> = input_names
-        .map(|(_, name)| name)
-        .zip(&bound)
-        .filter(|(name, _)| !name.is_empty())
-        .map(|(name, t)| crate::scope::ScopeColumn {
-            name: name.clone(),
-            type_oid: t.type_oid,
-            base_not_null: !t.nullable,
-            typmod: t.typmod,
-            collation: t.collation,
-            table_alias: alias.clone(),
-            record_fields: t.record_fields.clone(),
-            elem_nullable: t.elem_nullable,
-            refine: t.refine.clone(),
-            origin: None,
-        })
-        .collect();
-    let mut scope = crate::scope::Scope::default();
-    scope
-        .add_derived(&alias, columns, crate::scope::SourceKind::Other)
-        .ok()?;
+    let scope = body_scope(proc, &bound)?;
     let null_ctx = crate::nullability::NullabilityContext::default();
     let mut params = crate::param_collector::ParamCollector::bound(bound);
     READING.with(|r| r.borrow_mut().push(proc.oid));
@@ -155,4 +120,108 @@ pub(crate) fn inline_call(
         t.nullable = true;
     }
     Some(t)
+}
+
+/// The scope a body of `proc` reads its named parameters in: columns of a
+/// source named after the function (`v`, `f.v`), each the argument
+/// `bound` holds for it (`proargnames` lists OUT ones too, by
+/// `proargmodes`).
+fn body_scope(proc: &crate::pg_catalog::PgProc, bound: &[ExprType]) -> Option<crate::scope::Scope> {
+    let alias = proc.proname.clone();
+    let input_names = proc.proargnames.iter().enumerate().filter(|(i, _)| {
+        proc.proargmodes.get(*i).is_none_or(|m| {
+            matches!(
+                m,
+                crate::pg_catalog::ArgMode::In
+                    | crate::pg_catalog::ArgMode::InOut
+                    | crate::pg_catalog::ArgMode::Variadic
+            )
+        })
+    });
+    let columns: Vec<crate::scope::ScopeColumn> = input_names
+        .map(|(_, name)| name)
+        .zip(bound)
+        .filter(|(name, _)| !name.is_empty())
+        .map(|(name, t)| crate::scope::ScopeColumn {
+            name: name.clone(),
+            type_oid: t.type_oid,
+            base_not_null: !t.nullable,
+            typmod: t.typmod,
+            collation: t.collation,
+            table_alias: alias.clone(),
+            record_fields: t.record_fields.clone(),
+            elem_nullable: t.elem_nullable,
+            refine: t.refine.clone(),
+            origin: None,
+        })
+        .collect();
+    let mut scope = crate::scope::Scope::default();
+    scope
+        .add_derived(&alias, columns, crate::scope::SourceKind::Other)
+        .ok()?;
+    Some(scope)
+}
+
+/// What the body of `proc` resolved to over its declared parameter types
+/// (as a CHECK constraint's expression is kept, by OID): what a CHECK
+/// reading the body trusts of it. `None` for a body that doesn't analyze
+/// or a routine with polymorphic parameters.
+pub(crate) fn body_trust(
+    snapshot: &crate::pg_catalog::PgCatalog,
+    proc: &crate::pg_catalog::PgProc,
+    body: &typedpg_pg_query::protobuf::Node,
+) -> Option<crate::nonnull::TrustedNodes> {
+    let bound: Option<Vec<ExprType>> = proc
+        .proargtypes
+        .iter()
+        .map(|&t| {
+            let pseudo = snapshot
+                .pg_type
+                .get(&t)
+                .is_some_and(|ty| ty.typtype == crate::pg_catalog::TypType::Pseudo);
+            (!pseudo).then(|| ExprType::scalar(t, true))
+        })
+        .collect();
+    let bound = bound?;
+    let scope = body_scope(proc, &bound)?;
+    let null_ctx = crate::nullability::NullabilityContext::default();
+    let mut params = crate::param_collector::ParamCollector::bound(bound);
+    let log = crate::nonnull::StrictLog::default();
+    // Only what it resolves to: no narrowing (the facts of each WHEN of a
+    // large body cost the most), no call read as its body.
+    let outer = RESOLVING.with(|r| r.replace(true));
+    let (result, _) = crate::ddl::depend::collect(|| {
+        let _level = crate::resolve::QueryLevel::enter();
+        crate::nonnull::without_narrowing(|| {
+            infer_expr(
+                body,
+                Ctx::new(&scope, &null_ctx, snapshot).logging_strictness(&log),
+                &mut params,
+                TypeGoal::NONE,
+            )
+        })
+    });
+    RESOLVING.with(|r| r.set(outer));
+    result.ok().map(|_| log.trusted())
+}
+
+/// What the body of routine `oid` resolves to (see [`body_trust`]), worked
+/// out once per catalog state — afresh while a DDL statement runs, which
+/// changes the catalog as it goes.
+pub(crate) fn cached_body_trust(
+    snapshot: &crate::pg_catalog::PgCatalog,
+    oid: PgProcOid,
+) -> Option<std::borrow::Cow<'_, crate::nonnull::TrustedNodes>> {
+    let cell = snapshot.inline_body_trust.get(&oid)?;
+    let compute = || {
+        let proc = snapshot.pg_proc.get(&oid)?;
+        let body = snapshot.inline_sql_bodies.get(&oid)?;
+        body_trust(snapshot, proc, body)
+    };
+    if resolving() {
+        return compute().map(std::borrow::Cow::Owned);
+    }
+    cell.get_or_init(compute)
+        .as_ref()
+        .map(std::borrow::Cow::Borrowed)
 }

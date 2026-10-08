@@ -168,6 +168,20 @@ pub(crate) fn infer_func_call(
                 && snapshot.namespace_name(p.pronamespace) == Some("pg_catalog")
         }),
     );
+    // The routine a plain call resolved to, for a CHECK reading the body
+    // of a `LANGUAGE sql` one; and a built-in jsonb function.
+    if !resolved.is_aggregate && !resolved.is_window && func.over.is_none() && resolved.nvargs == 0
+    {
+        ctx.note_call(func.location, resolved.oid);
+    }
+    let jsonb_builtin = snapshot
+        .pg_proc
+        .get(&resolved.oid)
+        .filter(|p| snapshot.namespace_name(p.pronamespace) == Some("pg_catalog"))
+        .and_then(|p| crate::nonnull::JsonbBuiltin::of(&p.proname));
+    if let Some(b) = jsonb_builtin {
+        ctx.note_strict(func.location, crate::nonnull::StrictNode::Jsonb(b), true);
+    }
     // `isfinite(c)` as a CHECK keeping `c` finite reads it: the built-in
     // one.
     ctx.note_strict(

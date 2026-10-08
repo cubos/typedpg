@@ -112,6 +112,10 @@ pub(crate) enum StrictNode {
     /// A call that resolved to `pg_catalog.isfinite` (not a user function
     /// of the name).
     IsFinite,
+    /// An operator or function call that resolved to the built-in jsonb
+    /// one: `?` (`jsonb_exists`), `?&` (`jsonb_exists_all`), `->` / `->>`
+    /// by key (`jsonb_object_field[_text]`), `jsonb_typeof`.
+    Jsonb(JsonbBuiltin),
     /// A COALESCE / GREATEST / LEAST whose common type keeps the integer,
     /// text and boolean constants [`subst`] folds exactly (no float, no
     /// typmod): its folded value is the one PG computes.
@@ -123,6 +127,31 @@ pub(crate) enum StrictNode {
     /// `StdCompare` with a float operand: integer constants compare as
     /// written only up to the float's precision.
     FloatCompare,
+}
+
+/// The built-in jsonb operators and functions a CHECK constraint's JSON
+/// reading knows (see [`StrictNode::Jsonb`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum JsonbBuiltin {
+    Exists,
+    ExistsAll,
+    Field,
+    FieldText,
+    Typeof,
+}
+
+impl JsonbBuiltin {
+    /// The built-in `proname` resolved to.
+    pub(crate) fn of(proname: &str) -> Option<JsonbBuiltin> {
+        Some(match proname {
+            "jsonb_exists" => JsonbBuiltin::Exists,
+            "jsonb_exists_all" => JsonbBuiltin::ExistsAll,
+            "jsonb_object_field" => JsonbBuiltin::Field,
+            "jsonb_object_field_text" => JsonbBuiltin::FieldText,
+            "jsonb_typeof" => JsonbBuiltin::Typeof,
+            _ => return None,
+        })
+    }
 }
 
 /// What a node being trusted means: [`StrictLog::is_strict`], or the same
@@ -146,6 +175,15 @@ impl Trust for StrictLog {
 pub(crate) struct TrustedNodes {
     pub nodes: HashSet<(i32, StrictNode)>,
     pub literal_types: HashMap<i32, crate::oid::PgTypeOid>,
+    /// The routine each plain function call resolved to, by location.
+    pub calls: HashMap<i32, crate::oid::PgProcOid>,
+}
+
+impl TrustedNodes {
+    /// The routine the plain call at `location` resolved to.
+    pub(crate) fn call(&self, location: i32) -> Option<crate::oid::PgProcOid> {
+        self.calls.get(&location).copied()
+    }
 }
 
 impl Trust for TrustedNodes {
@@ -163,9 +201,18 @@ pub(crate) struct StrictLog(
     RefCell<HashMap<(i32, StrictNode), bool>>,
     RefCell<HashMap<i32, Facts>>,
     RefCell<HashMap<i32, crate::oid::PgTypeOid>>,
+    RefCell<HashMap<i32, crate::oid::PgProcOid>>,
 );
 
 impl StrictLog {
+    /// Record that the plain function call at `location` resolved to
+    /// `proc`.
+    pub fn note_call(&self, location: i32, proc: crate::oid::PgProcOid) {
+        if location >= 0 {
+            self.3.borrow_mut().insert(location, proc);
+        }
+    }
+
     /// Record that the untyped string literal at `location` was coerced
     /// to `type_oid`.
     pub fn note_literal_type(&self, location: i32, type_oid: crate::oid::PgTypeOid) {
@@ -183,6 +230,9 @@ impl StrictLog {
         self.2
             .borrow_mut()
             .extend(other.2.borrow().iter().map(|(k, v)| (*k, *v)));
+        self.3
+            .borrow_mut()
+            .extend(other.3.borrow().iter().map(|(k, v)| (*k, *v)));
     }
 
     /// What this log trusts, kept apart from it.
@@ -196,6 +246,7 @@ impl StrictLog {
                 .map(|(k, _)| *k)
                 .collect(),
             literal_types: self.2.borrow().clone(),
+            calls: self.3.borrow().clone(),
         }
     }
 

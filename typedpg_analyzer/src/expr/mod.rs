@@ -89,6 +89,14 @@ impl<'a> Ctx<'a> {
         }
     }
 
+    /// Record that the plain function call at `location` resolved to
+    /// `proc`.
+    pub fn note_call(&self, location: i32, proc: crate::oid::PgProcOid) {
+        if let Some(log) = self.strict_log {
+            log.note_call(location, proc);
+        }
+    }
+
     /// Record that the untyped string literal at `location` was coerced to
     /// `type_oid`.
     pub fn note_literal_type(&self, location: i32, type_oid: PgTypeOid) {

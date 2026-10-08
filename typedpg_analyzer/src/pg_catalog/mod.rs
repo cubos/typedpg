@@ -57,6 +57,7 @@ pub(crate) mod oid {
     pub const TIMESTAMPTZ: PgTypeOid = PgTypeOid::from_raw(1184);
     pub const TIMETZ: PgTypeOid = PgTypeOid::from_raw(1266);
     pub const NUMERIC: PgTypeOid = PgTypeOid::from_raw(1700);
+    pub const JSONB: PgTypeOid = PgTypeOid::from_raw(3802);
     pub const RECORD: PgTypeOid = PgTypeOid::from_raw(2249);
 }
 
@@ -278,6 +279,18 @@ pub struct PgCatalog {
     /// resolve under settings of their own, so a call isn't read as its
     /// body ([`crate::expr::inline`]).
     pub(crate) procs_with_config: Shared<std::collections::HashSet<PgProcOid>>,
+    /// What each inlinable body resolves to (see
+    /// [`crate::expr::inline::body_trust`]), worked out when first needed —
+    /// with every routine it calls there, whatever order they were created
+    /// in — and forgotten after each DDL statement.
+    pub(crate) inline_body_trust:
+        Shared<HashMap<PgProcOid, std::sync::OnceLock<Option<crate::nonnull::TrustedNodes>>>>,
+    /// Each relation's CHECK constraints as read (see
+    /// [`crate::nonnull::checks::RelationChecks::of`]), forgotten after each
+    /// DDL statement.
+    pub(crate) relation_checks: std::sync::Arc<
+        std::sync::Mutex<HashMap<PgClassOid, Option<crate::nonnull::checks::RelationChecks>>>,
+    >,
     /// The functions the parameter DEFAULT expressions of each routine
     /// created by the migrations run (PG expands them into a call that
     /// leaves the parameters out). Built-in routines aren't listed.
@@ -677,6 +690,8 @@ impl PgCatalog {
             check_function_bodies: true,
             inline_sql_bodies: Shared::default(),
             procs_with_config: Shared::default(),
+            inline_body_trust: Shared::default(),
+            relation_checks: Default::default(),
             proc_default_procs: Shared::default(),
             sql_function_defs: HashMap::new(),
             partition_keys: Shared::default(),
@@ -1573,9 +1588,23 @@ impl PgCatalog {
         self.pg_proc.insert(row.oid, row);
     }
 
+    /// Forget what the inlinable bodies resolved to: a DDL statement may
+    /// change what their names resolve to.
+    pub(crate) fn forget_inline_body_trust(&mut self) {
+        if self.relation_checks.lock().is_ok_and(|c| !c.is_empty()) {
+            self.relation_checks = Default::default();
+        }
+        if self.inline_body_trust.values().any(|t| t.get().is_some()) {
+            for t in self.inline_body_trust.values_mut() {
+                *t = std::sync::OnceLock::new();
+            }
+        }
+    }
+
     pub(crate) fn remove_pg_proc(&mut self, oid: PgProcOid) -> Option<PgProc> {
         self.inline_sql_bodies.remove(&oid);
         self.procs_with_config.remove(&oid);
+        self.inline_body_trust.remove(&oid);
         self.proc_default_procs.remove(&oid);
         self.sql_function_defs.remove(&oid);
         let row = self.pg_proc.remove(&oid)?;

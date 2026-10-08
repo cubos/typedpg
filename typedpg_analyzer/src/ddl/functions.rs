@@ -627,8 +627,16 @@ pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Res
         .insert(proc.oid, params.default_procs.clone());
     // A replaced body replaces what was inlined of the old one.
     match super::function_body::inlinable_body(stmt, &proc) {
-        Some(body) => interp.inline_sql_bodies.insert(proc.oid, body),
-        None => interp.inline_sql_bodies.remove(&proc.oid),
+        Some(body) => {
+            interp
+                .inline_body_trust
+                .insert(proc.oid, std::sync::OnceLock::new());
+            interp.inline_sql_bodies.insert(proc.oid, body)
+        }
+        None => {
+            interp.inline_body_trust.remove(&proc.oid);
+            interp.inline_sql_bodies.remove(&proc.oid)
+        }
     };
     if attrs.common.set_items.is_empty() {
         interp.procs_with_config.remove(&proc.oid);
