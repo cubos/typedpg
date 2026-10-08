@@ -79,6 +79,9 @@ export const visitorKinds = sql(`
   FROM users WHERE mood <> 'neutral'
 `);
 
+// A timestamp parameter is a Date, never `infinity`: formatting it is never NULL.
+export const yearOf = sql("SELECT to_char($at::timestamptz, 'YYYY') AS year");
+
 // ── type-level checks: `tsc` fails if an inferred type is not the expected one ──
 
 type Equal<A, B> = (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2 ? true : false;
@@ -104,6 +107,8 @@ export type Checks = [
     >
   >,
   Expect<Equal<Params<typeof userById>, { id: number }>>,
+  Expect<Equal<Row<typeof yearOf>, { year: string }>>,
+  Expect<Equal<Params<typeof yearOf>, { at: Date }>>,
   Expect<Equal<Row<typeof visitorKinds>, { kind: "new" | "regular"; mood: "happy" | "sad"; two: 2n }>>,
   Expect<Equal<Row<typeof countUsers>, { n: bigint }>>,
   Expect<Equal<Awaited<ReturnType<typeof countUsers.fetchValue>>, bigint>>,

@@ -45,7 +45,8 @@ const fixed: ThingParams = {
   stamps: [new Date("2024-02-29T12:34:56.789Z"), null, new Date("0044-03-15T12:00:00Z"), new Date(-62200000000000)],
   docs: [{ a: 1, "k\"ey": ["x", { y: null }] }, null, [1, "x"], "str", 42, true],
   day: "2024-02-29",
-  at_local: "2024-02-29 12:34:56.789",
+  // No time zone: read and written as UTC.
+  at_local: new Date("2024-02-29T12:34:56.789Z"),
   clock: "04:05:06+02",
   id_uuid: "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11",
   addr: "192.168.0.1/24",

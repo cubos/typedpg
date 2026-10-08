@@ -44,7 +44,7 @@ export interface Queries {
   "SELECT id, nmae FROM users": { error: "column \"nmae\" does not exist" };
   "SELECT now() - $d AS t": {
     params: {
-      d: Date | string;
+      d: Date;
     };
     row: {
       t: typedpg.Interval;

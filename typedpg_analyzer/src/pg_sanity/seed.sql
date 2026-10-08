@@ -146,11 +146,11 @@ $fn$;
 
 -- The text form of a variant-1 sample of `typ`, for binding a non-null
 -- parameter in text format.
-CREATE FUNCTION pg_temp.typedpg_param_text(typ oid)
+CREATE FUNCTION pg_temp.typedpg_param_text(typ oid, variant int DEFAULT 1)
 RETURNS text
 LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $fn$
 DECLARE
-    e text := pg_temp.typedpg_sample(typ, 1);
+    e text := pg_temp.typedpg_sample(typ, variant);
     v text;
 BEGIN
     IF e IS NULL THEN

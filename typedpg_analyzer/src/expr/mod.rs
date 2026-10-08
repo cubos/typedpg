@@ -980,7 +980,12 @@ fn infer_expr_unlocated(
                 params.record(p.number, goal.type_oid);
             }
             let type_oid = params.get(p.number);
-            Ok(ExprType::scalar(type_oid, params.read_nullable(p.number)))
+            let refine = if ctx.snapshot.finite_param(type_oid) {
+                crate::refine::Refinement::FINITE
+            } else {
+                crate::refine::Refinement::NONE
+            };
+            Ok(ExprType::scalar(type_oid, params.read_nullable(p.number)).with_refine(refine))
         }
         node::Node::MinMaxExpr(mm) => {
             // `GREATEST`/`LEAST` are non-strict: they skip NULL args and

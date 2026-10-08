@@ -173,8 +173,8 @@ says, whatever `pg.types.setTypeParser` your application set up.
 | `int2`, `int4`, `float4`, `float8`, `oid` | `number` |
 | `int8` | `bigint` (see `int8`); parameters also take `number` and `string` |
 | `numeric` | `string` (exact); parameters also take `number` |
-| `text`, `varchar`, `char`, `uuid`, `date`, `time`, `timestamp`, `timetz`, `inet`, `money`, … | `string` |
-| `timestamptz` | `Date`; parameters also take `string` |
+| `text`, `varchar`, `char`, `uuid`, `date`, `time`, `timetz`, `inet`, `money`, … | `string` |
+| `timestamptz`, `timestamp` | `Date`, parameters too (a `timestamp`, which has no time zone, is read and written as UTC). A `Date` is never `infinity`: `to_char` and `extract` of a parameter are never NULL |
 | `interval` | `Interval` (`{ months, days, microseconds: bigint }`, as PostgreSQL stores it); parameters also take `string` |
 | `json`, `jsonb` | `JsonValue`; parameters take `unknown` (stringified) |
 | `bytea` | `Uint8Array` |
