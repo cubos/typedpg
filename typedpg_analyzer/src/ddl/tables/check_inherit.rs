@@ -118,6 +118,12 @@ pub(crate) fn recook_checks_reading(interp: &mut PgCatalog, relid: PgClassOid, a
             Some(before) => crate::nonnull::TrustedNodes {
                 nodes: before.nodes.intersection(&now.nodes).copied().collect(),
                 literal_types: now.literal_types,
+                // A call still resolving to the routine it did.
+                calls: now
+                    .calls
+                    .into_iter()
+                    .filter(|(l, p)| before.calls.get(l) == Some(p))
+                    .collect(),
             },
             None => crate::nonnull::TrustedNodes::default(),
         });

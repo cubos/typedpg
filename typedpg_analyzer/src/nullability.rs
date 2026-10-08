@@ -674,8 +674,10 @@ impl NullabilityContext {
                 Level::Local => &mut self.derived_local,
             };
             if level == Level::Matched {
-                // A row-is-there fact forces nothing.
+                // A row-is-there fact forces nothing; nor is an
+                // expression of a NULL-extended row non-NULL.
                 found.rels.clear();
+                found.exprs.clear();
             }
             *target = std::mem::take(target).union(found);
         }
@@ -933,12 +935,17 @@ impl NullabilityContext {
         self.local_facts.exprs.contains(key)
             || (self.grouping_omitted.is_empty()
                 && !self.where_exprs_off
-                && self.where_facts.exprs.contains(key))
+                && (self.where_facts.exprs.contains(key)
+                    || self.derived_where.exprs.contains(key)
+                    || self.derived_local.exprs.contains(key)))
     }
 
     /// Whether any expression fact holds here (a cheap pre-check).
     pub fn has_expr_facts(&self) -> bool {
-        !self.local_facts.exprs.is_empty() || !self.where_facts.exprs.is_empty()
+        !self.local_facts.exprs.is_empty()
+            || !self.where_facts.exprs.is_empty()
+            || !self.derived_where.exprs.is_empty()
+            || !self.derived_local.exprs.is_empty()
     }
 
     /// Whether at least one of `cols` is known non-NULL where the value is
