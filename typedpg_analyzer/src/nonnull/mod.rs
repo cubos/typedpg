@@ -106,6 +106,9 @@ pub(crate) enum StrictNode {
     /// A call that resolved to `pg_catalog.num_nulls` /
     /// `pg_catalog.num_nonnulls` (not a user function of the name).
     NullCount,
+    /// A call that resolved to `pg_catalog.array_position(anycompatiblearray,
+    /// anycompatible)` (not a user function of the name).
+    ArrayPosition,
     /// A COALESCE / GREATEST / LEAST whose common type keeps the integer,
     /// text and boolean constants [`subst`] folds exactly (no float, no
     /// typmod): its folded value is the one PG computes.

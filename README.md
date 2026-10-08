@@ -322,7 +322,9 @@ let rows = sql!(pool, "SELECT CASE status WHEN 'open' THEN 1 WHEN 'closed' THEN 
 A partition's bound counts as a constraint too (a range partition key, or a
 list one with no NULL, is never NULL — in the partitioned table as well, when
 no partition takes a NULL key), and so does a `MATCH FULL` foreign key: one of
-its columns non-NULL makes all of them so.
+its columns non-NULL makes all of them so. PostgreSQL has no NOT NULL for an
+array's elements; `CHECK (array_position(tags, NULL) IS NULL)` on the column,
+or on a domain over the array (`VALUE`), stands for one.
 
 A referenced table under row-level security doesn't count: its policies may
 hide the row. The foreign key holds just the same through subqueries, CTEs,

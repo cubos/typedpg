@@ -255,8 +255,11 @@ pub(crate) fn infer_type_cast(
     // for the target or an array of the same type keeps its own (a
     // relabeling or typmod coercion maps no element to NULL); an element
     // conversion (`jsonb[]` → `int[]`, …) may.
+    // A domain whose CHECK keeps NULL elements out checks the value.
     let elem_nullable = if array_element_type(snapshot, target_base).is_none() {
         None
+    } else if snapshot.domain_null_free_elements(target_oid) {
+        Some(false)
     } else if let Some(node::Node::AConst(ac)) = inner.node.as_ref() {
         match &ac.val {
             Some(a_const::Val::Sval(sv)) if !ac.isnull => Some(

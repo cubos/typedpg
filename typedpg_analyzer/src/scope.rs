@@ -559,6 +559,7 @@ impl Scope {
         let relname = table.relname.clone();
         // A view has no system attributes.
         let is_view = table.relkind == crate::pg_catalog::RelKind::View;
+        let null_free = crate::nonnull::checks::null_free_array_columns(snapshot, table_oid);
 
         let columns: Vec<ScopeColumn> = snapshot
             .attributes_of(table_oid)
@@ -576,7 +577,9 @@ impl Scope {
                 collation: c.attcollation,
                 table_alias: alias.to_owned(),
                 record_fields: None,
-                elem_nullable: None,
+                elem_nullable: (null_free.contains(&c.attname)
+                    || snapshot.domain_null_free_elements(c.atttypid))
+                .then_some(false),
                 origin: None,
             })
             .collect();
@@ -641,6 +644,10 @@ impl Scope {
                     .is_some_and(|a| snapshot.attr_never_null(a))
             })
         };
+        let null_free = columns
+            .first()
+            .map(|c| crate::nonnull::checks::null_free_array_columns(snapshot, c.attrelid))
+            .unwrap_or_default();
         let cols = columns
             .iter()
             .map(|c| ScopeColumn {
@@ -652,7 +659,9 @@ impl Scope {
                 collation: c.attcollation,
                 table_alias: alias.to_owned(),
                 record_fields: None,
-                elem_nullable: None,
+                elem_nullable: (null_free.contains(&c.attname)
+                    || snapshot.domain_null_free_elements(c.atttypid))
+                .then_some(false),
                 origin: None,
             })
             .collect();
