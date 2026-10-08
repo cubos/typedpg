@@ -187,6 +187,23 @@ says, whatever `pg.types.setTypeParser` your application set up.
 | `hstore` | `Record<string, string \| null>` |
 | anything else | `string`, its text form |
 
+A column the query proves holds one of a few values reads as their literal
+union, for text, `varchar`, the integer types, `boolean` and enums: a `CASE`
+of literals, a column whose table or domain says `CHECK (kind IN ('a', 'b'))`,
+an enum or text column narrowed by the `WHERE` (`mood <> 'neutral'`), a
+constant:
+
+```ts
+const kinds = sql(`
+  SELECT CASE WHEN visits > 10 THEN 'regular' ELSE 'new' END AS kind, mood
+  FROM users WHERE mood <> 'neutral'
+`);
+// row: { kind: "new" | "regular"; mood: "happy" | "sad" }
+```
+
+Parameters still take any value of their type, and a type `types` maps
+keeps its mapping.
+
 Composite values can be parameters (from their text form); an anonymous
 record can't, as PostgreSQL has no input for it. In a `json`/`jsonb`
 parameter, `null` is SQL NULL, not the JSON `null`.

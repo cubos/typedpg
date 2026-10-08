@@ -147,7 +147,7 @@ fn generate_query(a: &AnalyzedQuery, mapper: &TypeMapper) -> Result<Generated, G
         object(&row_ty, 4)
     );
     if let [c] = a.columns.as_slice() {
-        let m = mapper.map(&c.pg_type);
+        let m = mapper.map_refined(&c.pg_type, &c.refinement);
         let _ = writeln!(types, "    value: {};", nullable(&m.output, c.nullable));
     }
     types.push_str("  }");
@@ -255,7 +255,7 @@ fn columns(cols: &[AnalyzedColumn], mapper: &TypeMapper) -> (Vec<String>, Vec<Va
     let mut row = Vec::new();
     let mut codecs = Vec::new();
     for c in cols {
-        let m = mapper.map(&c.pg_type);
+        let m = mapper.map_refined(&c.pg_type, &c.refinement);
         row.push(member(&c.name, &m.output, c.nullable));
         codecs.push(json!([c.name, m.codec.to_json()]));
     }

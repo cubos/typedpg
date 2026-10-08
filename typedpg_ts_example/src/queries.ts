@@ -72,6 +72,13 @@ export const valuesQuery = sql(
   "SELECT 1.5::float8 AS f, 'NaN'::float8 AS nan, now() AS now, '\\x00ff'::bytea AS b, NULL::text AS nothing",
 );
 
+// Values the query proves are literal types: a CASE of literals, an enum
+// narrowed by the WHERE, a constant.
+export const visitorKinds = sql(`
+  SELECT CASE WHEN visits > 10 THEN 'regular' ELSE 'new' END AS kind, mood, 2::int8 AS two
+  FROM users WHERE mood <> 'neutral'
+`);
+
 // ── type-level checks: `tsc` fails if an inferred type is not the expected one ──
 
 type Equal<A, B> = (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2 ? true : false;
@@ -97,6 +104,7 @@ export type Checks = [
     >
   >,
   Expect<Equal<Params<typeof userById>, { id: number }>>,
+  Expect<Equal<Row<typeof visitorKinds>, { kind: "new" | "regular"; mood: "happy" | "sad"; two: 2n }>>,
   Expect<Equal<Row<typeof countUsers>, { n: bigint }>>,
   Expect<Equal<Awaited<ReturnType<typeof countUsers.fetchValue>>, bigint>>,
   Expect<Equal<Awaited<ReturnType<typeof userEmail.fetchValueOptional>>, string | null>>,
