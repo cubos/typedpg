@@ -406,9 +406,11 @@ exactly one row, so `(SELECT id FROM ins)` is that row's `id`.
 `to_char` and `EXTRACT` / `date_part` of most fields are NULL for an infinite
 date, timestamp or interval. The analysis knows a value is finite when it is
 the current time (`now()`, `CURRENT_DATE`, …), a literal other than
-`infinity`, arithmetic, truncation or a conversion of finite values, the
-`min` / `max` / `lag` of them, or a column whose table (or domain) says so
-with `CHECK (isfinite(col))`. It follows the value through subqueries, CTEs,
+`infinity`, a `date` / `timestamp` / `timestamptz` parameter (chrono's
+types, which `sql!` binds them from, can't hold an infinity — unless
+`[types]` maps the type), arithmetic, truncation or a conversion of finite
+values, the `min` / `max` / `lag` of them, or a column whose table (or
+domain) says so with `CHECK (isfinite(col))`. It follows the value through subqueries, CTEs,
 `UNION`, `CASE` and `COALESCE`:
 
 ```rust

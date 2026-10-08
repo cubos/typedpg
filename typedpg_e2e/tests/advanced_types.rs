@@ -105,3 +105,29 @@ async fn timestamptz_roundtrip() {
         "created_at too far from now: {diff}"
     );
 }
+
+#[tokio::test]
+async fn a_date_or_timestamp_parameter_is_finite() {
+    let pool = common::setup().await;
+
+    // chrono's dates and timestamps can't be `infinity`: formatting or
+    // extracting from one is never NULL.
+    let at = DateTime::parse_from_rfc3339("2024-02-29T12:34:56Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let day = at.date_naive();
+    let local = at.naive_utc();
+    let row = sql!(
+        &pool,
+        "SELECT to_char($at::timestamptz AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS a,
+                extract(month FROM $day::date) AS b, to_char($local::timestamp, 'HH24:MI') AS c"
+    )
+    .fetch_one()
+    .await
+    .expect("select");
+    let (a, b, c): (String, Decimal, String) = (row.a, row.b, row.c);
+    assert_eq!(
+        (a.as_str(), b, c.as_str()),
+        ("2024-02-29", Decimal::from(2), "12:34")
+    );
+}

@@ -27,6 +27,15 @@
 /// The mapped Rust types are emitted literally into generated code, so the
 /// corresponding crates (`chrono`, `uuid`, `cidr`, `eui48`, …) must be added
 /// to the consumer's `Cargo.toml` if they appear in any query.
+/// The types whose default Rust types can't hold `infinity` / `-infinity`
+/// (chrono's `NaiveDate`, `NaiveDateTime` and `DateTime<Utc>`, which
+/// `ToSql` writes as days or microseconds from 2000 — their ±262 000 years
+/// never reach PG's infinity sentinels): a parameter of one is finite, so
+/// the analysis takes it to be (`PgCatalog::assume_finite_parameters`)
+/// unless `[types]` maps the type. Not `interval`: an `Interval` with every
+/// field at its maximum is PG's infinite one.
+pub(crate) const FINITE_PARAMETER_TYPES: &[&str] = &["date", "timestamp", "timestamptz"];
+
 static BUILTIN_MAP: &[(&str, &str, &str)] = &[
     // (schema, pg_name, rust_type)
     ("pg_catalog", "bool", "bool"),
