@@ -188,7 +188,8 @@ fn default_expansion_colliding_with_exact_overload_is_not_unique() {
 fn domain_parameter_accepts_its_base_type() {
     let db = setup();
     let s = db.analyze("SELECT f_dom(1) AS a").unwrap();
-    assert_cols(&s, vec![cn("a", domain("public", "posint", int4()))]);
+    // Its body, `a`: 1.
+    assert_cols(&s, vec![c("a", domain("public", "posint", int4()))]);
 }
 
 // ── Polymorphic resolution (#45, #46, #47) ───────────────────────────────────
@@ -208,9 +209,10 @@ fn anycompatible_family_unifies_to_a_common_type() {
         vec![
             c("a", array_of(numeric())),
             c("b", array_of(numeric())),
-            cn("c", array_of(numeric())),
-            cn("d", array_of(float4())),
-            cn("e", array_of(text())),
+            // `ARRAY[a, b]`.
+            c("c", array_of(numeric())),
+            c("d", array_of(float4())),
+            c("e", array_of(text())),
         ],
     );
     let s = db

@@ -64,7 +64,8 @@ fn named_args_in_any_order_with_defaults() {
     let s = db
         .analyze("SELECT f(b => 'y', a => 1) AS x, f(a => 1) AS y, f(1, b => 'q') AS z")
         .unwrap();
-    assert_cols(&s, vec![cn("x", text()), cn("y", text()), cn("z", text())]);
+    // Read as its body (`b`) unless a parameter is left to its default.
+    assert_cols(&s, vec![c("x", text()), cn("y", text()), c("z", text())]);
 }
 
 #[test]
@@ -77,7 +78,7 @@ fn names_select_the_overload() {
         .unwrap();
     assert_cols(
         &s,
-        vec![cn("by_c", text()), cn("by_a", int4()), cn("by_ab", int4())],
+        vec![c("by_c", text()), cn("by_a", int4()), c("by_ab", int4())],
     );
 }
 
@@ -102,7 +103,7 @@ fn types_select_among_same_named_overloads() {
     let s = db
         .analyze("SELECT ov(a => 1) AS i, ov(a => 'x') AS t")
         .unwrap();
-    assert_cols(&s, vec![cn("i", int4()), cn("t", text())]);
+    assert_cols(&s, vec![c("i", int4()), c("t", text())]);
 }
 
 #[test]
@@ -111,14 +112,14 @@ fn polymorphic_named_args() {
     let s = db
         .analyze("SELECT pa(b => 1, a => 2) AS x, pa(a => 2) AS y")
         .unwrap();
-    assert_cols(&s, vec![cn("x", int4()), cn("y", int4())]);
+    assert_cols(&s, vec![c("x", int4()), cn("y", int4())]);
 }
 
 #[test]
 fn out_params_are_not_nameable() {
     let db = setup();
     let s = db.analyze("SELECT h(b => 3, a => 1) AS r").unwrap();
-    assert_cols(&s, vec![cn("r", int4())]);
+    assert_cols(&s, vec![c("r", int4())]);
     assert_err_starts_with(
         &db,
         "SELECT h(o => 3, a => 1)",
@@ -145,7 +146,7 @@ fn variadic_needs_the_variadic_keyword() {
     let s = db
         .analyze("SELECT v(1, VARIADIC r => ARRAY[2]) AS r")
         .unwrap();
-    assert_cols(&s, vec![cn("r", int4())]);
+    assert_cols(&s, vec![c("r", int4())]);
     assert_err_starts_with(
         &db,
         "SELECT v(a => 1, r => 2)",

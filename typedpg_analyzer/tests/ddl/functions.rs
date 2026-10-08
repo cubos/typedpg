@@ -38,9 +38,11 @@ fn create_function_defaults_let_calls_omit_trailing_args() {
     let s = snap
         .analyze("SELECT f(1) AS one, f(1, 'y') AS two, f(1, 'y', 2) AS three")
         .unwrap();
+    // `f(1, 'y', 2)` is its body, `b`: 'y'. A call leaving parameters to
+    // their defaults isn't read as its body.
     assert_cols(
         &s,
-        vec![cn("one", text()), cn("two", text()), cn("three", text())],
+        vec![cn("one", text()), cn("two", text()), c("three", text())],
     );
 }
 
@@ -454,7 +456,8 @@ fn create_function_pct_type_resolves_to_column_type() {
          CREATE FUNCTION f(x t.a%TYPE) RETURNS t.a%TYPE LANGUAGE sql AS 'select x';",
     )]);
     let info = db.analyze("SELECT f(1)").unwrap();
-    assert_cols(&info, vec![cn("f", int8())]);
+    // Its body, `x`: 1.
+    assert_cols(&info, vec![c("f", int8())]);
 }
 
 #[test]
@@ -534,7 +537,8 @@ fn valid_sql_function_bodies_are_accepted() {
          CREATE FUNCTION f10() RETURNS int LANGUAGE sql AS 'select a from nosuch';
          RESET check_function_bodies;",
     )]);
-    assert_cols(&db.analyze("SELECT f2(1)").unwrap(), vec![cn("f2", int4())]);
+    // Its body, `x + 1`, of 1.
+    assert_cols(&db.analyze("SELECT f2(1)").unwrap(), vec![c("f2", int4())]);
 }
 
 #[test]
@@ -748,9 +752,10 @@ fn polymorphic_parameter_defaults_take_part_in_resolution() {
         &db.analyze("SELECT pd2()").unwrap(),
         vec![cn("pd2", int8())],
     );
+    // Its body, `a`: 1.
     assert_cols(
         &db.analyze("SELECT pd2(1)").unwrap(),
-        vec![cn("pd2", int4())],
+        vec![c("pd2", int4())],
     );
     assert_cols(
         &db.analyze("SELECT pd3(1)").unwrap(),

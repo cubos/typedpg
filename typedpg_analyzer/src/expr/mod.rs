@@ -961,6 +961,9 @@ fn infer_expr_unlocated(
         node::Node::CaseExpr(expr) => infer_case(expr, ctx, params),
         node::Node::SubLink(sub) => infer_sublink(sub, ctx, params),
         node::Node::ParamRef(p) => {
+            if let Some(arg) = params.bound_arg(p.number) {
+                return Ok(arg.clone());
+            }
             params.see(p.number);
             // If the param is still untyped and the context provides a goal,
             // record the goal type — this is our equivalent of PG's
@@ -1841,6 +1844,7 @@ mod column_refs;
 mod conditional;
 mod func_call;
 mod indirection;
+pub(crate) mod inline;
 mod json;
 pub(crate) mod literals;
 pub(crate) mod operators;
