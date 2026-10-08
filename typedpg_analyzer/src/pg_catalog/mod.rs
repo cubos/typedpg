@@ -288,6 +288,10 @@ pub struct PgCatalog {
     /// Each relation's CHECK constraints as read (see
     /// [`crate::nonnull::checks::RelationChecks::of`]), forgotten after each
     /// DDL statement.
+    /// Types whose parameters are never infinite: the code generator binds
+    /// them from values that can't be (a JS `Date`), see
+    /// [`PgCatalog::assume_finite_parameters`].
+    pub(crate) finite_param_types: std::collections::HashSet<PgTypeOid>,
     pub(crate) relation_checks: std::sync::Arc<
         std::sync::Mutex<HashMap<PgClassOid, Option<crate::nonnull::checks::RelationChecks>>>,
     >,
@@ -694,6 +698,7 @@ impl PgCatalog {
             procs_with_config: Shared::default(),
             inline_body_trust: Shared::default(),
             relation_checks: Default::default(),
+            finite_param_types: Default::default(),
             proc_default_procs: Shared::default(),
             sql_function_defs: HashMap::new(),
             partition_keys: Shared::default(),
@@ -1038,6 +1043,39 @@ impl PgCatalog {
     pub fn serialize_predicate(&self, pred_sql: &str) -> Result<SerializedAst, DdlError> {
         let select = format!("SELECT 1 WHERE {pred_sql}");
         crate::ddl::serialize_subnode(self, &select, crate::ddl::views::extract_where)
+    }
+
+    /// Take a parameter of each of `types` (or of a domain over one) to be
+    /// finite — never `infinity` / `-infinity` — as when the code generator
+    /// binds it from a value that can't be one (a JS `Date`): `to_char`,
+    /// `extract` and the like of it are then non-NULL. A name that isn't a
+    /// type is an error.
+    pub fn assume_finite_parameters(
+        &mut self,
+        types: &[crate::QualifiedName],
+    ) -> Result<(), String> {
+        for name in types {
+            let t = self
+                .resolve_type_by_name(Some(&name.schema), &name.name)
+                .ok_or_else(|| format!("type {name} does not exist"))?;
+            self.finite_param_types.insert(t.oid);
+        }
+        Ok(())
+    }
+
+    /// The types parameters of are taken to be finite, as the soundness
+    /// oracle samples them: built-in ones, whose OIDs the mirror shares (it
+    /// resolves a domain over one itself).
+    #[cfg(feature = "pg_sanity")]
+    fn finite_param_oids(&self) -> std::collections::HashSet<u32> {
+        self.finite_param_types.iter().map(|t| t.get()).collect()
+    }
+
+    /// Whether a parameter of type `t` is taken to be finite (see
+    /// [`PgCatalog::assume_finite_parameters`]).
+    pub(crate) fn finite_param(&self, t: PgTypeOid) -> bool {
+        !self.finite_param_types.is_empty()
+            && self.finite_param_types.contains(&self.unwrap_domain(t))
     }
 
     /// The [`Type`] a value of the type `name` is described as, or `None`
@@ -1401,7 +1439,10 @@ impl PgCatalog {
         analysis_sql: &str,
         result: &Result<AnalyzedQuery, AnalyzeError>,
     ) {
-        self.with_pg_sanity::<()>(|server| server.assert_analyze_matches(analysis_sql, result));
+        let finite_params = self.finite_param_oids();
+        self.with_pg_sanity::<()>(|server| {
+            server.assert_analyze_matches(analysis_sql, result, &finite_params)
+        });
     }
 
     /// Analyze `sql` and cross-check the result against the embedded PG
@@ -1427,7 +1468,9 @@ impl PgCatalog {
             return (result, None);
         }
         let divergence = self
-            .with_pg_sanity(|server| server.compare_analyze_matches(&analysis_sql, &result))
+            .with_pg_sanity(|server| {
+                server.compare_analyze_matches(&analysis_sql, &result, &self.finite_param_oids())
+            })
             .flatten();
         (result, divergence)
     }

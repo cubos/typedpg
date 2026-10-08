@@ -82,7 +82,7 @@ export type Checks = [
         stamps: (Date | null)[] | null;
         docs: (import("@cubos/typedpg").JsonValue | null)[] | null;
         day: string | null;
-        at_local: string | null;
+        at_local: Date | null;
         clock: string | null;
         id_uuid: string | null;
         addr: string | null;
@@ -95,7 +95,9 @@ export type Checks = [
   // Parameters take the looser input types.
   Expect<Equal<Params<typeof insertThing>["big"], bigint | number | string | null>>,
   Expect<Equal<Params<typeof insertThing>["dur"], Interval | string | null>>,
-  Expect<Equal<Params<typeof insertThing>["stamps"], readonly (Date | string | null)[] | null>>,
+  // A timestamp is a Date in and out.
+  Expect<Equal<Params<typeof insertThing>["stamps"], readonly (Date | null)[] | null>>,
+  Expect<Equal<Params<typeof insertThing>["at_local"], Date | null>>,
   // A composite parameter: the fields' input types.
   Expect<
     Equal<

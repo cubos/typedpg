@@ -142,7 +142,7 @@ pub(super) struct Soundness {
     /// valid for one schema generation only.
     schema_gen: u64,
     plans: HashMap<(u64, i32), SeedPlan>,
-    param_texts: HashMap<(u64, u32), Option<String>>,
+    param_texts: HashMap<(u64, u32, i32), Option<String>>,
     stats: Stats,
 }
 
@@ -174,6 +174,7 @@ impl Soundness {
         sql: &str,
         ours: &AnalyzedQuery,
         stmt: &Statement,
+        finite_params: &std::collections::HashSet<u32>,
     ) -> Option<Divergence> {
         if !self.enabled {
             return None;
@@ -224,7 +225,14 @@ impl Soundness {
                 values.push(None);
                 continue;
             }
-            let Some(text) = self.param_text(client, ty.oid()) else {
+            // A parameter the generator binds from a value that can't be
+            // infinite gets a finite sample (the adversarial one is).
+            let variant = if finite_params.contains(&self.base_type(client, ty.oid())) {
+                2
+            } else {
+                1
+            };
+            let Some(text) = self.param_text(client, ty.oid(), variant) else {
                 self.stats.no_param_sample += 1;
                 return None;
             };
@@ -374,14 +382,34 @@ impl Soundness {
     }
 
     /// The text form of a sample value of type `oid`, if it has one.
-    fn param_text(&mut self, client: &mut Client, oid: u32) -> Option<String> {
-        let key = (self.schema_gen, oid);
+    /// The type a domain `oid` is over (in the mirror: its OIDs for the
+    /// schema's types aren't the analyzer's), or `oid` itself.
+    fn base_type(&mut self, client: &mut Client, oid: u32) -> u32 {
+        client
+            .query_one(
+                &format!(
+                    "WITH RECURSIVE d(oid, base) AS (
+                         SELECT oid, typbasetype FROM pg_catalog.pg_type WHERE oid = {oid}::pg_catalog.oid
+                         UNION ALL
+                         SELECT t.oid, t.typbasetype FROM pg_catalog.pg_type t JOIN d ON t.oid = d.base)
+                     SELECT oid::pg_catalog.int8 FROM d WHERE base = 0"
+                ),
+                &[],
+            )
+            .ok()
+            .and_then(|row| row.try_get::<_, i64>(0).ok())
+            .and_then(|o| u32::try_from(o).ok())
+            .unwrap_or(oid)
+    }
+
+    fn param_text(&mut self, client: &mut Client, oid: u32, variant: i32) -> Option<String> {
+        let key = (self.schema_gen, oid, variant);
         if let Some(v) = self.param_texts.get(&key) {
             return v.clone();
         }
         let v = client
             .query_one(
-                &format!("SELECT pg_temp.typedpg_param_text({oid}::pg_catalog.oid)"),
+                &format!("SELECT pg_temp.typedpg_param_text({oid}::pg_catalog.oid, {variant})"),
                 &[],
             )
             .ok()

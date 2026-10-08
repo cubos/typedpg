@@ -328,7 +328,17 @@ impl Project {
         if migrations == db.migrations && db.catalog.is_ok() {
             return;
         }
-        db.catalog = build_catalog(&migrations, db.config.runner.use_transaction);
+        db.catalog =
+            build_catalog(&migrations, db.config.runner.use_transaction).and_then(|mut catalog| {
+                // Parameters bound from a `Date` are never infinite.
+                let finite: Vec<QualifiedName> = crate::typemap::FINITE_PARAMETER_TYPES
+                    .iter()
+                    .map(|t| QualifiedName::new("pg_catalog", *t))
+                    .filter(|q| !db.overrides.contains_key(q))
+                    .collect();
+                catalog.assume_finite_parameters(&finite)?;
+                Ok(catalog)
+            });
         db.migrations = migrations;
         db.cache.clear();
     }

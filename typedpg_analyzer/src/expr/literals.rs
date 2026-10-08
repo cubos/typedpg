@@ -316,6 +316,13 @@ pub(crate) fn infer_type_cast(
                 if cast_typmod.is_some() {
                     refine.values = None;
                 }
+                // A parameter cast to a type the generator binds finite
+                // (`$at::timestamptz`) is of that type.
+                if matches!(inner.node.as_ref(), Some(node::Node::ParamRef(_)))
+                    && snapshot.finite_param(target_oid)
+                {
+                    refine.finite = true;
+                }
                 refine
             })
     })

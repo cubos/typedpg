@@ -37,7 +37,8 @@ pub enum Codec {
     Int8Number,
     /// `json` / `jsonb`, parsed / stringified.
     Json,
-    /// `timestamptz` ↔ `Date`.
+    /// `timestamptz` / `timestamp` ↔ `Date` (a `timestamp`, which has no
+    /// time zone, read and written as UTC).
     Timestamptz,
     /// `bytea` ↔ `Uint8Array`.
     Bytea,
@@ -414,11 +415,11 @@ impl TypeMapper<'_> {
                 input: "unknown".into(),
                 codec: Codec::Json,
             },
-            "timestamptz" => TsType {
-                output: "Date".into(),
-                input: "Date | string".into(),
-                codec: Codec::Timestamptz,
-            },
+            // A `Date` both ways, never a string: a parameter is never
+            // `infinity` (see `FINITE_PARAMETER_TYPES`). A `timestamp` is
+            // read and written as UTC (PG ignores the `Z` it is written
+            // with).
+            "timestamptz" | "timestamp" => same("Date".into(), Codec::Timestamptz),
             "interval" => TsType {
                 output: format!("{RUNTIME_NS}.Interval"),
                 input: format!("{RUNTIME_NS}.Interval | string"),
@@ -430,6 +431,11 @@ impl TypeMapper<'_> {
         }
     }
 }
+
+/// The types whose parameters the generated module binds from a `Date`,
+/// which is never infinite: the analysis takes them finite
+/// (`PgCatalog::assume_finite_parameters`) unless `types` maps them.
+pub const FINITE_PARAMETER_TYPES: &[&str] = &["timestamptz", "timestamp"];
 
 /// Whether `ty` is (an array of) an anonymous record, which PG has no
 /// input for: a value of it can't be a parameter.
@@ -512,6 +518,9 @@ mod tests {
             assert_eq!(m.map(&basic_ty("numeric")).output, "string");
             assert_eq!(m.map(&basic_ty("tsvector")).output, "string");
             assert_eq!(m.map(&basic_ty("timestamptz")).codec, Codec::Timestamptz);
+            assert_eq!(m.map(&basic_ty("timestamptz")).input, "Date");
+            assert_eq!(m.map(&basic_ty("timestamp")).output, "Date");
+            assert_eq!(m.map(&basic_ty("timestamp")).input, "Date");
             assert_eq!(m.map(&basic_ty("interval")).output, "typedpg.Interval");
             assert_eq!(m.map(&basic_ty("jsonb")).output, "typedpg.JsonValue");
         });

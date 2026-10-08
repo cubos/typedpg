@@ -282,8 +282,9 @@ impl PgSanityServer {
         &mut self,
         analysis_sql: &str,
         our_result: &Result<AnalyzedQuery, AnalyzeError>,
+        finite_params: &std::collections::HashSet<u32>,
     ) {
-        if let Some(div) = self.compare_analyze_matches(analysis_sql, our_result) {
+        if let Some(div) = self.compare_analyze_matches(analysis_sql, our_result, finite_params) {
             panic!("{}", div.message);
         }
     }
@@ -300,6 +301,7 @@ impl PgSanityServer {
         &mut self,
         analysis_sql: &str,
         our_result: &Result<AnalyzedQuery, AnalyzeError>,
+        finite_params: &std::collections::HashSet<u32>,
     ) -> Option<Divergence> {
         let pg_result = self.query_client.prepare(analysis_sql);
 
@@ -441,8 +443,13 @@ impl PgSanityServer {
                         });
                     }
                 }
-                self.soundness
-                    .check(&mut self.query_client, analysis_sql, ours, stmt)
+                self.soundness.check(
+                    &mut self.query_client,
+                    analysis_sql,
+                    ours,
+                    stmt,
+                    finite_params,
+                )
             }
             (Err(e), Err(_)) => {
                 let our_msg = format!("{e}");

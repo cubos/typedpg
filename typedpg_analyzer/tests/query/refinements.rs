@@ -641,3 +641,44 @@ fn a_view_follows_its_tables_constraints_as_they_change() {
         &[("kind", Some(&["a", "b", "c"]))],
     );
 }
+
+#[test]
+fn parameters_a_generator_binds_finite_are_finite() {
+    let mut db = setup();
+    db.apply_sql("CREATE DOMAIN moment_d AS timestamptz;")
+        .unwrap();
+    let sql = "SELECT to_char($t::timestamptz, 'YYYY') AS a, to_char($u::timestamp, 'YYYY') AS b,
+                      extract(month FROM $v::moment_d) AS c, to_char($w::date, 'YYYY') AS e";
+    assert_finite(
+        &db,
+        sql,
+        &[
+            ("a", true, false),
+            ("b", true, false),
+            ("c", true, false),
+            ("e", true, false),
+        ],
+    );
+    db.assume_finite_parameters(&[
+        QualifiedName::new("pg_catalog", "timestamptz"),
+        QualifiedName::new("pg_catalog", "timestamp"),
+    ])
+    .unwrap();
+    assert_finite(
+        &db,
+        &sql.replace("$t", "$t!")
+            .replace("$u", "$u!")
+            .replace("$v", "$v!")
+            .replace("$w", "$w!"),
+        &[
+            ("a", false, false),
+            ("b", false, false),
+            ("c", false, false),
+            ("e", true, false),
+        ],
+    );
+    assert!(
+        db.assume_finite_parameters(&[QualifiedName::new("pg_catalog", "nosuch")])
+            .is_err()
+    );
+}

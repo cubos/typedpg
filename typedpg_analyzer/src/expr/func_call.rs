@@ -249,6 +249,15 @@ pub(crate) fn infer_func_call(
         outer.absorb(&filter_log);
     }
     let mut args = args;
+    // A parameter the call typed: finite when its type is one the
+    // generator binds finite (see `PgCatalog::assume_finite_parameters`).
+    for (arg, t) in func.args.iter().zip(args.exprs.iter_mut()) {
+        if let Some(node::Node::ParamRef(p)) = arg.node.as_ref()
+            && snapshot.finite_param(params.get(p.number))
+        {
+            t.refine.finite = true;
+        }
+    }
     if resolved.is_aggregate {
         narrow_by_filter(func, &mut args, ctx, params, &filter_log);
     }
