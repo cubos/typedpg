@@ -454,13 +454,39 @@ pub(crate) fn migration_file_paths(dirs: &[&Path]) -> Vec<PathBuf> {
 /// dependencies of the generated code.
 ///
 /// The items are anonymous constants, so the migrations' contents do not
-/// end up in the binary — only the dependency Cargo needs does.
+/// end up in the binary — only the dependency Cargo needs does. They do
+/// land in the crate's metadata, though, so they are emitted once per
+/// crate: every query would otherwise carry a copy of the migrations.
 pub(crate) fn tracked_migrations_items(paths: &[PathBuf]) -> Vec<TokenStream> {
+    // The crates whose migrations are already recorded: the macro server
+    // serves every crate of a build, so the set is keyed by the crate.
+    let mut tracked = TRACKED.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(crate_dir) = std::env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from) else {
+        // No crate to key on: record them every time.
+        return items(paths);
+    };
+    if !tracked.insert(crate_dir) {
+        return Vec::new();
+    }
+    items(paths)
+}
+
+/// The crates whose migrations are already recorded as dependencies.
+static TRACKED: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<PathBuf>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// The `include_str!` items for each path.
+fn items(paths: &[PathBuf]) -> Vec<TokenStream> {
     paths
         .iter()
-        .map(|path| {
-            let path = syn::LitStr::new(&path.to_string_lossy(), Span::call_site());
-            quote::quote! { const _: &str = include_str!(#path); }
+        .filter_map(|path| {
+            // A path that is not UTF-8 cannot be written as a literal:
+            // the dependency is not recorded, but the analysis still reads
+            // the file.
+            let path = path.to_str()?;
+            let path = syn::LitStr::new(path, Span::call_site());
+            Some(quote::quote! { const _: &str = include_str!(#path); })
         })
         .collect()
 }
