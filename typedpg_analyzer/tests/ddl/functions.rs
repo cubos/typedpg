@@ -591,7 +591,9 @@ fn sql_function_result_rows_are_checked_like_check_sql_fn_retval() {
              CREATE FUNCTION r11() RETURNS TABLE (a int, b text) LANGUAGE sql AS $$ SELECT 1, 'x' $$;
              CREATE FUNCTION r13() RETURNS record LANGUAGE sql AS $$ SELECT 1, 2 $$;
              CREATE FUNCTION r14() RETURNS pair LANGUAGE sql AS $$ SELECT 1::int8, 'x' $$;
-             CREATE FUNCTION r15() RETURNS pair LANGUAGE sql AS $$ SELECT 1.5, 'x' $$;"
+             CREATE FUNCTION r15() RETURNS pair LANGUAGE sql AS $$ SELECT 1.5, 'x' $$;
+             CREATE FUNCTION r16() RETURNS pair LANGUAGE sql AS $$ SELECT ROW(1,'x') $$;
+             CREATE FUNCTION r17() RETURNS text LANGUAGE sql AS $$ SELECT NULL $$;"
         ),
     )]);
     for (function, msg) in [
@@ -622,6 +624,25 @@ fn sql_function_result_rows_are_checked_like_check_sql_fn_retval() {
         (
             "CREATE FUNCTION r12() RETURNS TABLE (a int, b int) LANGUAGE sql AS $$ SELECT 1, 'x'::text $$;",
             "return type mismatch in function declared to return record (Final statement returns text instead of integer at column 2.)",
+        ),
+        (
+            // A `record` result is cast to the composite type: PG checks the
+            // field count when the function is created.
+            "CREATE FUNCTION r18() RETURNS pair LANGUAGE sql AS $$ SELECT ROW(1) $$;",
+            "cannot cast type record to pair (Input has too few columns.)",
+        ),
+        (
+            "CREATE FUNCTION r19() RETURNS pair LANGUAGE sql AS $$ SELECT ROW(1,2,3) $$;",
+            "cannot cast type record to pair (Input has too many columns.)",
+        ),
+        (
+            // PG resolves the body's untyped output columns to `text`.
+            "CREATE FUNCTION r20() RETURNS int LANGUAGE sql AS $$ SELECT NULL $$;",
+            "return type mismatch in function declared to return integer (Actual return type is text.)",
+        ),
+        (
+            "CREATE FUNCTION r21() RETURNS pair LANGUAGE sql AS $$ SELECT NULL $$;",
+            "return type mismatch in function declared to return pair (Final statement returns text instead of integer at column 1.)",
         ),
     ] {
         let sql = format!("{setup}\n{function}");

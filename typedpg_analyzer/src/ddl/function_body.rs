@@ -92,6 +92,7 @@ fn validate_sql_body(
             last = Some(LastStatement {
                 returns_rows: false,
                 column_types: None,
+                record_fields: None,
             });
             continue;
         }
@@ -123,9 +124,18 @@ fn validate_sql_body(
             ) => None,
             Err(e) => return Err(DdlError::UnsupportedDdl(format!("{e}"))),
         };
+        // The shape of a `record` result: PG casts it to the composite type
+        // the function returns, so only its field count is checked when the
+        // function is created — the field types only when it is called.
+        let record_fields = columns
+            .as_ref()
+            .and_then(|cols| cols.first())
+            .and_then(|c| c.record_fields.as_ref())
+            .map(|shape| shape.len());
         last = Some(LastStatement {
             returns_rows: returns_rows(inner),
             column_types: columns.map(|cols| cols.iter().map(|c| c.type_oid).collect()),
+            record_fields,
         });
     }
     check_return_type(interp, proc, last.as_ref())
@@ -136,6 +146,9 @@ struct LastStatement {
     returns_rows: bool,
     /// The result column types, `None` when the analyzer couldn't tell.
     column_types: Option<Vec<PgTypeOid>>,
+    /// The field count of a `record` result, when the analyzer knows its
+    /// shape.
+    record_fields: Option<usize>,
 }
 
 /// `check_sql_fn_retval`: the final statement must return rows, and its
@@ -208,10 +221,38 @@ fn check_return_type(
     let Some(column_types) = last.and_then(|l| l.column_types.as_deref()) else {
         return Ok(());
     };
+    // PG resolves the body's untyped output columns to `text`
+    // (`resolveTargetListUnknowns`), so an output column that is still
+    // `unknown` is a `text` one.
+    let column_types: Vec<PgTypeOid> = column_types
+        .iter()
+        .map(|&t| if t == oid::UNKNOWN { oid::TEXT } else { t })
+        .collect();
+    let column_types = column_types.as_slice();
     let fits = |actual: PgTypeOid, declared: PgTypeOid| {
-        actual == oid::UNKNOWN || can_coerce(actual, declared, CoercionContext::Assignment, interp)
+        can_coerce(actual, declared, CoercionContext::Assignment, interp)
     };
     let name = |t: PgTypeOid| super::util::format_type_for_message(interp, t);
+    // A `record` result is cast to the composite type the function returns:
+    // PG checks the field count when the function is created, and the field
+    // types only when it is called (an assignment cast applies then).
+    if let [single] = column_types
+        && interp.unwrap_domain(*single) == oid::RECORD
+        && let Some(row) = row.as_ref()
+    {
+        let Some(got) = last.and_then(|l| l.record_fields) else {
+            return Ok(());
+        };
+        let detail = match got.cmp(&row.len()) {
+            std::cmp::Ordering::Less => "Input has too few columns.",
+            std::cmp::Ordering::Greater => "Input has too many columns.",
+            std::cmp::Ordering::Equal => return Ok(()),
+        };
+        return Err(DdlError::Parse(format!(
+            "cannot cast type record to {} ({detail})",
+            name(rettype)
+        )));
+    }
     let Some(row) = row else {
         return match column_types {
             [single] if fits(*single, rettype) => Ok(()),
