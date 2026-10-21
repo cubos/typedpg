@@ -592,6 +592,9 @@ fn sql_function_result_rows_are_checked_like_check_sql_fn_retval() {
              CREATE FUNCTION r13() RETURNS record LANGUAGE sql AS $$ SELECT 1, 2 $$;
              CREATE FUNCTION r14() RETURNS pair LANGUAGE sql AS $$ SELECT 1::int8, 'x' $$;
              CREATE FUNCTION r15() RETURNS pair LANGUAGE sql AS $$ SELECT 1.5, 'x' $$;
+             CREATE FUNCTION r25() RETURNS pair LANGUAGE sql AS $$ SELECT ROW(1,'x') $$;
+             CREATE FUNCTION r26() RETURNS TABLE(a int, b text) LANGUAGE sql AS $$ SELECT ROW(1) $$;
+             CREATE FUNCTION r27() RETURNS record LANGUAGE sql AS $$ SELECT ROW(1) $$;
              CREATE FUNCTION r16() RETURNS pair LANGUAGE sql AS $$ SELECT ROW(1,'x') $$;
              CREATE FUNCTION r17() RETURNS text LANGUAGE sql AS $$ SELECT NULL $$;"
         ),
@@ -643,6 +646,21 @@ fn sql_function_result_rows_are_checked_like_check_sql_fn_retval() {
         (
             "CREATE FUNCTION r21() RETURNS pair LANGUAGE sql AS $$ SELECT NULL $$;",
             "return type mismatch in function declared to return pair (Final statement returns text instead of integer at column 1.)",
+        ),
+        // Only a `ROW(...)` constructor (or a whole-row reference) can be
+        // cast to a composite type.
+        (
+            "CREATE FUNCTION r22() RETURNS pair LANGUAGE sql AS $$ SELECT (SELECT ROW(1,'x')) $$;",
+            "cannot cast type record to pair",
+        ),
+        (
+            "CREATE FUNCTION r23() RETURNS pair LANGUAGE sql AS $$ SELECT (ROW(1, ROW(2,3))).f2 $$;",
+            "cannot cast type record to pair",
+        ),
+        // The fields' types are checked when the function is created.
+        (
+            "CREATE FUNCTION r24() RETURNS pair LANGUAGE sql AS $$ SELECT ROW(NULL::text, NULL::text) $$;",
+            "cannot cast type record to pair (Cannot cast type text to integer in column 1.)",
         ),
     ] {
         let sql = format!("{setup}\n{function}");
