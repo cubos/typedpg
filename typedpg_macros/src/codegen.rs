@@ -52,6 +52,31 @@ fn make_field_ident(name: &str) -> proc_macro2::Ident {
     }
 }
 
+/// A Rust identifier for a name the user wrote — a parameter's name, a
+/// spread's or one of its fields'.
+///
+/// It has to be one: the generated code refers to the variable that holds
+/// the value by that name. A name that is not an identifier (`$€`) is a
+/// valid SQL parameter, but there is no variable to bind it to.
+fn user_ident(name: &str) -> Result<proc_macro2::Ident, syn::Error> {
+    // A keyword is an identifier lexically: Rust wants it raw.
+    if RUST_KEYWORDS.contains(&name) {
+        return Ok(proc_macro2::Ident::new_raw(
+            name,
+            proc_macro2::Span::call_site(),
+        ));
+    }
+    syn::parse_str::<syn::Ident>(name).map_err(|_| {
+        syn::Error::new(
+            proc_macro2::Span::call_site(),
+            format!(
+                "`{name}` is not a valid Rust identifier: a parameter's name is also the name \
+                 of the variable that holds its value"
+            ),
+        )
+    })
+}
+
 /// Wrap the SQL in a `SELECT * FROM (<sql>) AS __typedpg_limit LIMIT 2`
 /// subquery so that `fetch_one` / `fetch_optional` can detect more-than-one-
 /// row without fetching the entire result set.
@@ -1082,7 +1107,7 @@ fn generate_spread(
         )?;
 
         regular_param_fields.extend(quote! { #field_name: #field_type, });
-        let param_ident = format_ident!("__{}", param.name);
+        let param_ident = user_ident(&format!("__{}", param.name))?;
         regular_param_inits.extend(quote! {
             #field_name: { let #param_ident: #field_type = #value_expr; #param_ident },
         });
@@ -1127,7 +1152,7 @@ fn generate_spread(
             match assignment {
                 Some(ParamAssignment { expr: Some(e), .. }) => quote! { #e },
                 _ => {
-                    let ident = format_ident!("{}", spread.name);
+                    let ident = user_ident(&spread.name)?;
                     quote! { #ident }
                 }
             }
@@ -1136,7 +1161,7 @@ fn generate_spread(
         // values — a list's item is its value.
         let mut item_pushes = TokenStream::new();
         for field in &spread.fields {
-            let accessor_ident = format_ident!("{}", field.name);
+            let accessor_ident = user_ident(&field.name)?;
             item_pushes.extend(match spread.kind {
                 SpreadKind::Rows => push_item_field(
                     &format!("field `{}` of `$..{}`", field.name, spread.name),
@@ -1163,7 +1188,7 @@ fn generate_spread(
             let mut pushes = TokenStream::new();
             let mut decls = TokenStream::new();
             for (fi, field) in spread.fields.iter().enumerate() {
-                let accessor_ident = format_ident!("{}", field.name);
+                let accessor_ident = user_ident(&field.name)?;
                 let (subject, raw) = match spread.kind {
                     SpreadKind::Rows => (
                         format!("field `{}` of `$..{}`", field.name, spread.name),
@@ -1534,7 +1559,7 @@ fn build_param_fields(
             #field_name: #field_type,
         });
 
-        let param_ident = format_ident!("__{}", param.name);
+        let param_ident = user_ident(&format!("__{}", param.name))?;
         inits.extend(quote! {
             #field_name: { let #param_ident: #field_type = #value_expr; #param_ident },
         });
@@ -2050,7 +2075,7 @@ fn resolve_param_value(
     match assignment {
         Some(ParamAssignment { expr: Some(e), .. }) => Ok(quote! { #e }),
         Some(ParamAssignment { expr: None, .. }) | None => {
-            let ident = format_ident!("{}", param_name);
+            let ident = user_ident(param_name)?;
             Ok(quote! { #ident })
         }
     }

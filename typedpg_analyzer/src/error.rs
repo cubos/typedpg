@@ -930,8 +930,11 @@ fn scan_identifier(bytes: &[u8], start: usize) -> Option<usize> {
     }
 }
 
+/// PG's identifier characters (`scan.l`'s `ident_start` / `ident_cont`): a
+/// letter — ASCII or any high-bit one — or an underscore, plus a digit and
+/// a `$` for the continuation.
 fn is_ident_start(b: u8) -> bool {
-    b.is_ascii_alphabetic() || b == b'_'
+    b.is_ascii_alphabetic() || b == b'_' || b >= 0x80
 }
 
 fn is_ident_cont(b: u8) -> bool {
