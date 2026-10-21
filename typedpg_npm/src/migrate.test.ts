@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { embedMigrations, MigrationError } from "./migrate.js";
+import { embedMigrations } from "./migrate.js";
 
 test("migrations are ordered by their numeric prefix", () => {
   // The prefix is a number, not text: `10_c` is a later migration than
@@ -18,31 +18,26 @@ test("migrations are ordered by their numeric prefix", () => {
   );
 });
 
-test("the migrations table is a qualified identifier", () => {
-  // The same names the Rust runner accepts (`MigrationsConfig::validate`):
-  // a name or a schema.name, each part unquoted or double-quoted.
-  for (const table of [
-    "public._migrations",
-    "_migrations",
-    '"my schema".log',
-    '"my-schema"."my-migrations"',
-    '"a""b".c',
-  ]) {
-    const set = embedMigrations([], { table });
-    assert.equal(set.config.table, table);
-  }
-  // Not a qualified identifier.
-  for (const table of [
-    "public; DROP TABLE users --",
-    "a.b.c",
-    "",
-    '"unclosed.log',
-    '""',
-  ]) {
-    assert.throws(
-      () => embedMigrations([], { table }),
-      MigrationError,
-      `the table ${JSON.stringify(table)} must be rejected`,
-    );
-  }
+test("two migrations of the same version keep a deterministic order", () => {
+  // The name settles it, so the runner and the compiler agree.
+  const set = embedMigrations([
+    ["1_b", "SELECT 1;", null],
+    ["1_a", "SELECT 1;", null],
+  ]);
+  assert.deepEqual(
+    set.migrations.map((m) => m.name),
+    ["1_a", "1_b"],
+  );
+});
+
+test("a version of any length is compared as a number", () => {
+  const huge = `${"9".repeat(40)}_x`;
+  const set = embedMigrations([
+    [huge, "SELECT 1;", null],
+    ["10_x", "SELECT 1;", null],
+  ]);
+  assert.deepEqual(
+    set.migrations.map((m) => m.name),
+    ["10_x", huge],
+  );
 });

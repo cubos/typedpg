@@ -18,7 +18,7 @@ import { type Driver, type Executor, driverFor, unsupported } from "./adapters.j
 export interface Migration {
   /** The file stem: `0001_create_users`. */
   readonly name: string;
-  /** The numeric prefix, which orders the migrations (as text, as in Rust). */
+  /** The numeric prefix, which orders the migrations (as a number). */
   readonly version: string;
   readonly sql: string;
   readonly downSql: string | null;
@@ -128,10 +128,29 @@ function migration(name: string, path: string, sql: string, downSql: string | nu
   return { name, version, sql, downSql, noTransaction: firstLine.trim() === "-- no-transaction" };
 }
 
+/**
+ * Compare two migration versions — the numeric prefix of their names — as
+ * numbers: `2` before `10`.
+ *
+ * The prefixes are decimal strings, compared by their value whatever their
+ * length: a forty-digit prefix is still a number. The mirror of
+ * `typedpg_core::migrations::compare_versions`.
+ */
+export function compareVersions(a: string, b: string): number {
+  const norm = (s: string) => s.replace(/^0+/, "") || "0";
+  const x = norm(a);
+  const y = norm(b);
+  if (x.length !== y.length) return x.length - y.length;
+  return x < y ? -1 : x > y ? 1 : 0;
+}
+
 function sortByVersion(migrations: Migration[]): Migration[] {
   // By the prefix as a number, not as text: `10_x` is a later migration
-  // than `2_x`. The Rust runner's order.
-  return migrations.sort((a, b) => Number(a.version) - Number(b.version));
+  // than `2_x`, and the name settles the order of two with the same
+  // prefix. The Rust runner's order.
+  return migrations.sort(
+    (a, b) => compareVersions(a.version, b.version) || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0),
+  );
 }
 
 /** The MD5 of the migration's UTF-8 bytes; the server's `STORED_HASH` matches it. */

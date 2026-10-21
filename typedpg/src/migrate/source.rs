@@ -151,7 +151,8 @@ impl MigrationSource {
             });
         }
 
-        migrations.sort_by(by_version);
+        migrations
+            .sort_by(|a, b| typedpg_core::migrations::compare_migration_names(&a.name, &b.name));
 
         Ok(Self { migrations })
     }
@@ -231,7 +232,8 @@ impl MigrationSource {
                 no_transaction,
             });
         }
-        migrations.sort_by(by_version);
+        migrations
+            .sort_by(|a, b| typedpg_core::migrations::compare_migration_names(&a.name, &b.name));
         Ok(Self { migrations })
     }
 
@@ -264,21 +266,6 @@ impl MigrationSource {
     /// ```
     pub fn find(&self, name: &str) -> Option<&Migration> {
         self.migrations.iter().find(|m| m.name == name)
-    }
-}
-
-/// Migrations are ordered by their numeric prefix: `2` before `10`. The
-/// prefix is a number, not text — `10_x` is a later migration than `2_x`.
-///
-/// Two migrations with the same prefix keep the order they were read in.
-fn by_version(a: &Migration, b: &Migration) -> std::cmp::Ordering {
-    match (a.version.parse::<u128>(), b.version.parse::<u128>()) {
-        (Ok(x), Ok(y)) => x.cmp(&y),
-        // The prefix is a number (`parse_migration_name` checks), so this
-        // never happens: keep the order anyway.
-        (Err(_), Ok(_)) => std::cmp::Ordering::Less,
-        (Ok(_), Err(_)) => std::cmp::Ordering::Greater,
-        (Err(_), Err(_)) => std::cmp::Ordering::Equal,
     }
 }
 
@@ -322,7 +309,7 @@ mod tests {
     }
 
     /// The prefix is a number, not text: `10_x` is a later migration than
-    /// `2_x`.
+    /// `2_x`. The name settles the order of two with the same prefix.
     #[test]
     fn migrations_are_ordered_by_their_numeric_prefix() {
         let dir = create_temp_dir();
@@ -350,6 +337,19 @@ mod tests {
             .map(|m| m.version.as_str())
             .collect();
         assert_eq!(versions, ["1", "2", "10"]);
+
+        // Two migrations of the same version: the name settles it.
+        let source = MigrationSource::from_embedded([
+            ("1_b", "SELECT 1;", None),
+            ("1_a", "SELECT 1;", None),
+        ])
+        .unwrap();
+        let names: Vec<&str> = source
+            .migrations()
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect();
+        assert_eq!(names, ["1_a", "1_b"]);
     }
 
     #[test]
