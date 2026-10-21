@@ -51,6 +51,12 @@ test("records", () => {
 
 test("encode", () => {
   assert.equal(encode("bool", false), "f");
+  assert.equal(encode("bool", true), "t");
+  // A boolean, not a truthy value: `encode("bool", "false")` would store
+  // `t`, silently.
+  assert.throws(() => encode("bool", "false"), TypeError);
+  assert.throws(() => encode("bool", 0), TypeError);
+  assert.throws(() => encode("bool", {}), TypeError);
   assert.equal(encode("bigint", 12n), "12");
   assert.equal(encode("json", { a: "x" }), '{"a":"x"}');
   assert.equal(encode("json", "x"), '"x"');
