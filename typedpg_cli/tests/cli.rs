@@ -192,7 +192,7 @@ async fn sslmode_is_honored() {
 
     let stderr = failed(&status(format!("{url}?sslmode=verify-full")));
     assert!(
-        stderr.starts_with("Error: invalid DATABASE_URL:"),
+        stderr.contains("unsupported sslmode `verify-full`"),
         "{stderr}"
     );
 }
@@ -203,8 +203,19 @@ async fn sslmode_is_honored() {
 #[tokio::test]
 async fn sslmode_prefer_keeps_the_connection_encrypted() {
     let url = fresh_url().await;
-    for mode in ["prefer", "require"] {
-        let client = connect(&format!("{url}?sslmode={mode}"))
+    // The default, `prefer` and `require` all encrypt; `disable` does not.
+    for (mode, encrypted) in [
+        ("", true),
+        ("prefer", true),
+        ("require", true),
+        ("disable", false),
+    ] {
+        let query = if mode.is_empty() {
+            String::new()
+        } else {
+            format!("?sslmode={mode}")
+        };
+        let client = connect(&format!("{url}{query}"))
             .await
             .unwrap_or_else(|e| panic!("sslmode={mode}: {e}"));
         let ssl: bool = client
@@ -215,9 +226,6 @@ async fn sslmode_prefer_keeps_the_connection_encrypted() {
             .await
             .expect("pg_stat_ssl")
             .get(0);
-        assert!(
-            ssl,
-            "sslmode={mode} must not fall back to a plain connection"
-        );
+        assert_eq!(ssl, encrypted, "sslmode={mode}");
     }
 }
