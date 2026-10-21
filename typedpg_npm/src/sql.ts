@@ -1,0 +1,135 @@
+// The bits of SQL text the runtime needs outside the codecs.
+
+/**
+ * The SQL without what follows its last statement: a trailing `;`, and
+ * trailing comments.
+ *
+ * PostgreSQL rejects a `;` inside a subquery, and a trailing `--` comment
+ * would swallow the subquery's closing parenthesis — so a query that ends
+ * with either cannot be embedded in one.
+ *
+ * The mirror of `typedpg_analyzer::strip_trailing_junk`.
+ */
+export function stripTrailingJunk(sql: string): string {
+  let i = 0;
+  // The end of the last significant character: what follows it is
+  // whitespace or a comment.
+  let codeEnd = 0;
+  while (i < sql.length) {
+    const c = sql[i]!;
+    let step: number;
+    let significant = true;
+    if (c === "'") {
+      step = skipString(sql, i);
+    } else if (c === '"') {
+      step = skipQuotedIdentifier(sql, i);
+    } else if (c === "-" && sql[i + 1] === "-") {
+      step = skipLineComment(sql, i);
+      significant = false;
+    } else if (c === "/" && sql[i + 1] === "*") {
+      step = skipBlockComment(sql, i);
+      significant = false;
+    } else if (c === "$") {
+      step = dollarQuoteEnd(sql, i) ?? i + 1;
+    } else if (isWhitespace(c)) {
+      step = i + 1;
+      significant = false;
+    } else {
+      step = i + 1;
+    }
+    i = step;
+    if (significant) codeEnd = i;
+  }
+  return sql.slice(0, codeEnd).replace(/;\s*$/, "").trimEnd();
+}
+
+function isWhitespace(c: string): boolean {
+  return c === " " || c === "\t" || c === "\n" || c === "\r" || c === "\v" || c === "\f";
+}
+
+/** The index past the string literal opened at `open`. */
+function skipString(sql: string, open: number): number {
+  // `E'…'`: a string where a backslash escapes the next character.
+  const escape =
+    open >= 1 &&
+    (sql[open - 1] === "E" || sql[open - 1] === "e") &&
+    (open < 2 || !isIdentChar(sql[open - 2]!));
+  let i = open + 1;
+  while (i < sql.length) {
+    if (sql[i] === "\\" && escape) {
+      i += 2;
+    } else if (sql[i] === "'") {
+      // `''` is an escaped quote.
+      if (sql[i + 1] === "'") i += 2;
+      else return i + 1;
+    } else {
+      i += 1;
+    }
+  }
+  return sql.length;
+}
+
+/** The index past the quoted identifier opened at `open`. */
+function skipQuotedIdentifier(sql: string, open: number): number {
+  let i = open + 1;
+  while (i < sql.length) {
+    if (sql[i] === '"') {
+      // `""` is an escaped quote.
+      if (sql[i + 1] === '"') i += 2;
+      else return i + 1;
+    } else {
+      i += 1;
+    }
+  }
+  return sql.length;
+}
+
+/** The index past the line comment opened at `open`, its newline included. */
+function skipLineComment(sql: string, open: number): number {
+  let i = open + 2;
+  while (i < sql.length && sql[i] !== "\n") i++;
+  return i < sql.length ? i + 1 : i;
+}
+
+/** The index past the (nested) block comment opened at `open`. */
+function skipBlockComment(sql: string, open: number): number {
+  let depth = 0;
+  let i = open;
+  while (i < sql.length) {
+    if (sql[i] === "/" && sql[i + 1] === "*") {
+      depth++;
+      i += 2;
+    } else if (sql[i] === "*" && sql[i + 1] === "/") {
+      depth--;
+      i += 2;
+      if (depth === 0) return i;
+    } else {
+      i++;
+    }
+  }
+  return sql.length;
+}
+
+/** The index past the dollar-quoted string opened at `open`, when `open` starts one. */
+function dollarQuoteEnd(sql: string, open: number): number | undefined {
+  let i = open + 1;
+  if (i < sql.length && isIdentStart(sql[i]!)) {
+    while (i < sql.length && isIdentChar(sql[i]!)) i++;
+  }
+  if (sql[i] !== "$") return undefined;
+  const delimiter = sql.slice(open, i + 1);
+  const close = sql.indexOf(delimiter, i + 1);
+  return close < 0 ? undefined : close + delimiter.length;
+}
+
+/**
+ * PG's identifier characters: a letter — ASCII or any high-bit one, PG's
+ * `\200-\377` — or an underscore, plus a digit for the continuation.
+ */
+function isIdentStart(c: string): boolean {
+  return (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || c === "_" || c >= "\u0080";
+}
+
+function isIdentChar(c: string): boolean {
+  return isIdentStart(c) || (c >= "0" && c <= "9");
+}

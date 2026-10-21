@@ -15,6 +15,32 @@ async fn fetch_first_takes_a_parameter() {
     assert!(rows.len() <= 1);
 }
 
+/// `fetch_one` and `fetch_optional` wrap the query in a `LIMIT 2` subquery,
+/// where PostgreSQL rejects a trailing `;` and a trailing `--` comment would
+/// swallow the closing parenthesis.
+#[tokio::test]
+async fn a_query_ending_with_a_semicolon_or_a_comment_is_fetchable() {
+    let pool = common::setup().await;
+
+    let one = sql!(&pool, "SELECT 1 AS one;")
+        .fetch_one()
+        .await
+        .expect("fetch one with a semicolon");
+    assert_eq!(one.one, 1);
+
+    let one = sql!(&pool, "SELECT 1 AS one -- a note")
+        .fetch_one()
+        .await
+        .expect("fetch one with a comment");
+    assert_eq!(one.one, 1);
+
+    let one = sql!(&pool, "SELECT 1 AS one; -- a note")
+        .fetch_optional()
+        .await
+        .expect("fetch optional with a semicolon and a comment");
+    assert_eq!(one.expect("a row").one, 1);
+}
+
 #[tokio::test]
 async fn insert_returning_and_select() {
     let pool = common::setup().await;

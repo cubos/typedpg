@@ -8,6 +8,7 @@
 
 import { type Codec, decode, encode, setOwn } from "./codec.js";
 import { type Executor, type RawResult, driverFor, unsupported } from "./adapters.js";
+import { stripTrailingJunk } from "./sql.js";
 
 export { DecodeError, emptyRange, range } from "./codec.js";
 export type { Codec, Interval, Range, RangeBound } from "./codec.js";
@@ -344,7 +345,12 @@ class QueryImpl {
 
   async fetchOptional(executor: Executor, params?: Record<string, unknown>) {
     const q = this.build(params);
-    const text = this.spec.subquery ? `SELECT * FROM (${q.text}) AS __typedpg_limit LIMIT 2` : q.text;
+    // PostgreSQL rejects a `;` inside a subquery, and a trailing `--`
+    // comment would swallow its closing parenthesis: what follows the
+    // statement is dropped.
+    const text = this.spec.subquery
+      ? `SELECT * FROM (${stripTrailingJunk(q.text)}) AS __typedpg_limit LIMIT 2`
+      : q.text;
     const rows = this.decodeRows(await driverFor(executor).typedpgQuery(text, q.values));
     if (rows.length > 1) throw new TooManyRowsError(this.text);
     return rows[0] ?? null;
