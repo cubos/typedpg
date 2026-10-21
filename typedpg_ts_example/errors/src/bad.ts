@@ -30,6 +30,8 @@ export async function cases() {
   await sql("SELECT $r::record AS r").fetchAll(pool, { r: "(1)" });
   // @ts-expect-error: two columns named id
   await sql("SELECT u.id, p.id FROM users u JOIN posts p ON p.author_id = u.id").fetchAll(pool);
+  // @ts-expect-error: a parameter and a spread with the same name
+  await sql("SELECT id FROM users WHERE id IN $..ids AND name = $ids").fetchAll(pool);
   // @ts-expect-error: a range is a typedpg Range, not a number
   await sql("SELECT id FROM things WHERE span @> $n").fetchAll(pool, { n: 5, extra: 1 });
   // @ts-expect-error: a number for an interval

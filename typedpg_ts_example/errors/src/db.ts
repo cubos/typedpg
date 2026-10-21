@@ -25,6 +25,7 @@ export interface Queries {
     };
     value: number;
   };
+  "SELECT id FROM users WHERE id IN $..ids AND name = $ids": { error: "duplicate parameter name \"ids\": a parameter and a spread can't share one name" };
   "SELECT id FROM users WHERE mood = $mood": {
     params: {
       mood: "happy" | "sad" | "neutral";

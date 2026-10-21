@@ -183,6 +183,29 @@ function withoutAnnotation(name: string): string {
   return name === "?column?" ? name : name.replace(/[!?]$/, "");
 }
 
+/**
+ * A name may appear once in the spec: the same name for a parameter and a
+ * spread would bind the spread's value to the parameter (and the parameter's
+ * to the spread), silently.
+ */
+function checkSpecNames(spec: QuerySpec): void {
+  const names = new Set<string>();
+  for (const [name] of spec.params) {
+    if (names.has(name)) {
+      throw new TypedpgError(`the query has two parameters named \`${name}\``);
+    }
+    names.add(name);
+  }
+  for (const [name] of spec.spreads ?? []) {
+    if (names.has(name)) {
+      throw new TypedpgError(
+        `the query has a parameter and a spread named \`${name}\`: they can't share one name`,
+      );
+    }
+    names.add(name);
+  }
+}
+
 /** A table of JSON specs, each parsed the first time it is used. */
 function specTable<S>(specs: Record<string, string>, what: string): (text: string) => S {
   const parsed = new Map<string, S>();

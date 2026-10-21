@@ -96,17 +96,28 @@ fn generate_query(a: &AnalyzedQuery, mapper: &TypeMapper) -> Result<Generated, G
         }
     }
     check_unique_columns(a.columns.iter().map(|c| c.name.as_str()))?;
-    // The row's `params` object has one property per name: a parameter and
-    // a spread can't share one.
-    let mut param_names: Vec<&str> = a.params.iter().map(|p| p.name.as_str()).collect();
+    // The query's `params` object has one property per name: a parameter and
+    // a spread can't share one, and neither can two spreads.
+    let mut param_names: std::collections::HashSet<&str> =
+        a.params.iter().map(|p| p.name.as_str()).collect();
     for spread in &a.spreads {
-        if param_names.contains(&spread.name.as_str()) {
-            return Err(GenError::plain(format!(
-                "duplicate parameter name \"{}\": a parameter and a spread can't share one name",
-                spread.name
-            )));
+        if param_names.contains(spread.name.as_str()) {
+            return Err(GenError::plain(
+                if a.params.iter().any(|p| p.name == spread.name) {
+                    format!(
+                        "duplicate parameter name \"{}\": a parameter and a spread can't share one \
+                     name",
+                        spread.name
+                    )
+                } else {
+                    format!(
+                        "duplicate spread name \"{}\": two spreads can't share one name",
+                        spread.name
+                    )
+                },
+            ));
         }
-        param_names.push(&spread.name);
+        param_names.insert(spread.name.as_str());
     }
     // PG has no input for an anonymous record: a `record` parameter can't
     // be bound (a named composite can, from its text form).
@@ -648,12 +659,15 @@ mod tests {
         assert!(
             err("SELECT id FROM users WHERE id IN $..ids AND name = $ids")
                 .message
-                .contains("duplicate parameter name \"ids\"")
+                .contains(
+                    "duplicate parameter name \"ids\": a parameter and a spread can't \
+                 share one name"
+                )
         );
         assert!(
             err("SELECT id FROM users WHERE id IN $..ids AND name IN $..ids")
                 .message
-                .contains("duplicate parameter name \"ids\"")
+                .contains("duplicate spread name \"ids\": two spreads can't share one name")
         );
     }
 }
