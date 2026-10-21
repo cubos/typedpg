@@ -155,6 +155,40 @@ fn param_nullable_in_where_comparison() {
     assert!(col(&info, "is_match").nullable);
 }
 
+/// The `!` and `?` of the nullability annotation are operator characters, and
+/// PG lexes a maximal run of them as one operator: `!=`, `!~`, `?|` and `?&`
+/// are operators. Taking their `!` / `?` for an annotation would change the
+/// query — `$v!=1` would become `$v=1`, and the query would return the
+/// wrong rows.
+#[test]
+fn an_operator_after_a_param_is_not_an_annotation() {
+    let db = setup();
+    for (sql, expected) in [
+        (
+            "SELECT id FROM users WHERE age != $age",
+            "SELECT id FROM users WHERE age != $1",
+        ),
+        (
+            "SELECT id FROM users WHERE age!=$age",
+            "SELECT id FROM users WHERE age!=$1",
+        ),
+        (
+            "SELECT id FROM users WHERE name !~ $name",
+            "SELECT id FROM users WHERE name !~ $1",
+        ),
+        (
+            "SELECT id FROM users WHERE name!~$name",
+            "SELECT id FROM users WHERE name!~$1",
+        ),
+    ] {
+        let info = db.analyze(sql).unwrap();
+        assert_eq!(info.sql, expected, "{sql}");
+        // The operator is not an annotation: the parameter keeps the
+        // nullability its context gives it.
+        assert!(!info.params[0].nullable, "{sql}");
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Tests: auto-inferred param nullability from INSERT/UPDATE target columns
 // ──────────────────────────────────────────────────────────────────────────────
