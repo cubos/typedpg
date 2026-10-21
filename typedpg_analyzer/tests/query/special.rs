@@ -631,6 +631,53 @@ fn stress_annotation_on_left_join_star() {
     assert!(!col(&info, "title").nullable);
 }
 
+// ── The annotation is the alias, not the column's name ───────────────────────
+
+#[test]
+fn a_column_named_with_a_bang_keeps_its_name_and_its_nullability() {
+    // The `!` / `?` annotation is the alias the user wrote (`AS "col!"`).
+    // A column whose *name* ends in `!` is an ordinary PostgreSQL column:
+    // it keeps its name and its nullability.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE t (\"weird!\" int, \"q?\" int, plain int NOT NULL)")
+        .unwrap();
+
+    let info = db.analyze("SELECT \"weird!\" FROM t").unwrap();
+    assert_eq!(info.columns[0].name, "weird!");
+    assert!(info.columns[0].nullable, "a nullable column stays nullable");
+
+    let info = db.analyze("SELECT \"q?\" FROM t").unwrap();
+    assert_eq!(info.columns[0].name, "q?");
+    assert!(info.columns[0].nullable);
+
+    // The star expansion keeps them too.
+    let info = db.analyze("SELECT * FROM t").unwrap();
+    assert_eq!(
+        info.columns
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>(),
+        ["weird!", "q?", "plain"]
+    );
+    assert!(info.columns[0].nullable);
+    assert!(info.columns[1].nullable);
+    assert!(!info.columns[2].nullable);
+}
+
+#[test]
+fn the_annotation_still_works_on_an_alias() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE t (a int)").unwrap();
+
+    let info = db.analyze("SELECT a AS \"a!\" FROM t").unwrap();
+    assert_eq!(info.columns[0].name, "a");
+    assert!(!info.columns[0].nullable, "`!` forces NOT NULL");
+
+    let info = db.analyze("SELECT a AS \"a?\" FROM t").unwrap();
+    assert_eq!(info.columns[0].name, "a");
+    assert!(info.columns[0].nullable, "`?` forces nullable");
+}
+
 // ── Parse-error message fidelity ─────────────────────────────────────────────
 
 #[test]

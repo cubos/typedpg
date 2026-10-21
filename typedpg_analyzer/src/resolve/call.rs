@@ -61,6 +61,7 @@ pub(crate) fn analyze_call(
         .iter()
         .map(|a| RawColumn {
             name: a.name.clone(),
+            aliased: false,
             type_oid: a.type_oid,
             nullable: true,
             typmod: None,

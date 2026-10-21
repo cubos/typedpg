@@ -257,6 +257,7 @@ pub(crate) fn analyze_set_operation(
         );
         columns.push(RawColumn {
             name: l.name,
+            aliased: l.aliased,
             type_oid,
             // EXCEPT only emits left rows; INTERSECT only left rows equal
             // (NULLs not distinct) to a right one — a NULL there needs

@@ -166,6 +166,7 @@ pub(crate) fn resolve_target_list_explicit(
                 explicit.push(false);
                 columns.push(RawColumn {
                     name: col.name.clone(),
+                    aliased: false,
                     type_oid: col.type_oid,
                     nullable,
                     typmod: col.typmod,
@@ -192,6 +193,7 @@ pub(crate) fn resolve_target_list_explicit(
                 explicit.push(t.explicit_collation);
                 columns.push(RawColumn {
                     name,
+                    aliased: false,
                     type_oid: t.type_oid,
                     nullable: t.nullable,
                     typmod: t.typmod,
@@ -252,6 +254,9 @@ pub(crate) fn resolve_target_list_explicit(
         explicit.push(expr_type.explicit_collation);
         columns.push(RawColumn {
             name,
+            // The `!` / `?` nullability annotation is the alias the user
+            // wrote, not the column's real name.
+            aliased: !rt.name.is_empty(),
             type_oid,
             nullable: expr_type.nullable,
             typmod: expr_type.typmod,
@@ -411,6 +416,7 @@ pub(crate) fn analyze_values_lists(
     let columns = (0..arity)
         .map(|i| RawColumn {
             name: format!("column{}", i + 1),
+            aliased: false,
             type_oid: common[i],
             nullable: column_nullable[i],
             // `select_common_typmod`: rows agreeing on type *and* typmod

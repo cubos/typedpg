@@ -27,8 +27,14 @@ pub(crate) fn build_column(
         *element_nullable = rc.elem_nullable;
     }
 
-    // Handle nullability annotations (! and ?).
-    let (name, nullable) = parse_nullability_annotation(&rc.name, rc.nullable);
+    // Handle nullability annotations (! and ?): they belong to the alias the
+    // user wrote (`AS "col!"`), not to the column's real name — a column
+    // named `col!` in the schema keeps its name and its nullability.
+    let (name, nullable) = if rc.aliased {
+        parse_nullability_annotation(&rc.name, rc.nullable)
+    } else {
+        (rc.name.clone(), rc.nullable)
+    };
 
     Ok(AnalyzedColumn {
         name,

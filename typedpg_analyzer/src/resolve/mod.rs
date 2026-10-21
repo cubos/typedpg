@@ -1066,6 +1066,7 @@ fn analyze_raw_node_once(
             (
                 vec![RawColumn {
                     name: "QUERY PLAN".to_owned(),
+                    aliased: false,
                     type_oid: oid::TEXT,
                     nullable: false,
                     typmod: None,
@@ -1546,6 +1547,11 @@ fn null_assignment_error(
 #[derive(Clone)]
 pub(crate) struct RawColumn {
     pub name: String,
+    /// Whether the name is an alias the user wrote (`AS "col!"`), which is
+    /// where the `!` / `?` nullability annotation lives: it belongs to the
+    /// alias, not to the column's real name — a column named `col!` in the
+    /// schema keeps its name and its nullability.
+    pub aliased: bool,
     pub type_oid: PgTypeOid,
     pub nullable: bool,
     /// Optional `pg_attribute.atttypmod`-shaped modifier (`varchar(n)` length,
