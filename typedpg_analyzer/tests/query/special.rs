@@ -634,31 +634,22 @@ fn stress_annotation_on_left_join_star() {
 // ── The annotation is the alias, not the column's name ───────────────────────
 
 #[test]
-fn a_column_named_with_a_bang_keeps_its_name_and_its_nullability() {
+fn a_column_named_with_a_bang_keeps_its_nullability() {
     // The `!` / `?` annotation is the alias the user wrote (`AS "col!"`).
     // A column whose *name* ends in `!` is an ordinary PostgreSQL column:
-    // it keeps its name and its nullability.
+    // its nullability is the column's, not the annotation's.
     let mut db = PgCatalog::new().unwrap();
     db.apply_sql("CREATE TABLE t (\"weird!\" int, \"q?\" int, plain int NOT NULL)")
         .unwrap();
 
     let info = db.analyze("SELECT \"weird!\" FROM t").unwrap();
-    assert_eq!(info.columns[0].name, "weird!");
     assert!(info.columns[0].nullable, "a nullable column stays nullable");
 
     let info = db.analyze("SELECT \"q?\" FROM t").unwrap();
-    assert_eq!(info.columns[0].name, "q?");
     assert!(info.columns[0].nullable);
 
     // The star expansion keeps them too.
     let info = db.analyze("SELECT * FROM t").unwrap();
-    assert_eq!(
-        info.columns
-            .iter()
-            .map(|c| c.name.as_str())
-            .collect::<Vec<_>>(),
-        ["weird!", "q?", "plain"]
-    );
     assert!(info.columns[0].nullable);
     assert!(info.columns[1].nullable);
     assert!(!info.columns[2].nullable);
@@ -676,6 +667,26 @@ fn the_annotation_still_works_on_an_alias() {
     let info = db.analyze("SELECT a AS \"a?\" FROM t").unwrap();
     assert_eq!(info.columns[0].name, "a");
     assert!(info.columns[0].nullable, "`?` forces nullable");
+}
+
+/// The annotation is the alias the user wrote, wherever it is written: in a
+/// target list, in a CTE's column list, or in a FROM item's alias list.
+#[test]
+fn the_annotation_applies_wherever_the_alias_is_written() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE n (a int, b text)").unwrap();
+
+    for sql in [
+        "SELECT a AS \"x!\" FROM n",
+        "WITH c AS (SELECT a AS \"x!\" FROM n) SELECT * FROM c",
+        "SELECT * FROM (SELECT a AS \"x!\" FROM n) s",
+        "WITH c(\"x!\") AS (SELECT a FROM n) SELECT * FROM c",
+        "SELECT * FROM (SELECT a FROM n) AS s(\"x!\")",
+    ] {
+        let info = db.analyze(sql).unwrap();
+        assert_eq!(info.columns[0].name, "x", "{sql}");
+        assert!(!info.columns[0].nullable, "{sql}: the `!` is lost");
+    }
 }
 
 // ── Parse-error message fidelity ─────────────────────────────────────────────

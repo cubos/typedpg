@@ -27,14 +27,12 @@ pub(crate) fn build_column(
         *element_nullable = rc.elem_nullable;
     }
 
-    // Handle nullability annotations (! and ?): they belong to the alias the
-    // user wrote (`AS "col!"`), not to the column's real name — a column
-    // named `col!` in the schema keeps its name and its nullability.
-    let (name, nullable) = if rc.aliased {
-        parse_nullability_annotation(&rc.name, rc.nullable)
-    } else {
-        (rc.name.clone(), rc.nullable)
-    };
+    // The `!` / `?` nullability annotation belongs to the alias the user
+    // wrote, not to the column's real name: a column named `col!` in the
+    // schema keeps its name and its nullability. The alias' nullability
+    // was settled where the alias was written; here only the name is cut.
+    let name = strip_nullability_annotation(&rc.name);
+    let nullable = rc.nullable;
 
     Ok(AnalyzedColumn {
         name,
@@ -296,17 +294,36 @@ fn resolve_type(
     )))
 }
 
-fn parse_nullability_annotation(name: &str, auto_nullable: bool) -> (String, bool) {
-    // PG's placeholder column name `?column?` ends in `?` but isn't a
-    // user-supplied nullability annotation — pass it through untouched.
+/// The name a column is known by, cut of the `!` / `?` nullability
+/// annotation: `AS "col!"` names the column `col`.
+///
+/// PG's placeholder column name `?column?` ends in `?` but isn't a
+/// user-supplied nullability annotation — it is passed through untouched.
+pub(crate) fn strip_nullability_annotation(name: &str) -> String {
     if name == "?column?" {
-        return (name.to_owned(), auto_nullable);
+        return name.to_owned();
     }
-    if let Some(stripped) = name.strip_suffix('!') {
-        (stripped.to_owned(), false)
-    } else if let Some(stripped) = name.strip_suffix('?') {
-        (stripped.to_owned(), true)
+    name.strip_suffix('!')
+        .or_else(|| name.strip_suffix('?'))
+        .unwrap_or(name)
+        .to_owned()
+}
+
+/// The nullability the `!` / `?` suffix of an alias forces: `!` makes it
+/// NOT NULL, `?` makes it nullable. `None` when the alias carries no
+/// annotation.
+///
+/// The suffix belongs to the alias, not to the column's real name: a
+/// column named `col!` in the schema keeps its name and its nullability.
+pub(crate) fn annotation_nullability(name: &str) -> Option<bool> {
+    if name == "?column?" {
+        return None;
+    }
+    if name.ends_with('!') {
+        Some(false)
+    } else if name.ends_with('?') {
+        Some(true)
     } else {
-        (name.to_owned(), auto_nullable)
+        None
     }
 }

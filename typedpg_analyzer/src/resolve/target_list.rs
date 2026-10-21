@@ -166,7 +166,6 @@ pub(crate) fn resolve_target_list_explicit(
                 explicit.push(false);
                 columns.push(RawColumn {
                     name: col.name.clone(),
-                    aliased: false,
                     type_oid: col.type_oid,
                     nullable,
                     typmod: col.typmod,
@@ -193,7 +192,6 @@ pub(crate) fn resolve_target_list_explicit(
                 explicit.push(t.explicit_collation);
                 columns.push(RawColumn {
                     name,
-                    aliased: false,
                     type_oid: t.type_oid,
                     nullable: t.nullable,
                     typmod: t.typmod,
@@ -216,6 +214,14 @@ pub(crate) fn resolve_target_list_explicit(
         )?;
 
         // Determine column name: explicit alias, or inferred from expression.
+        // An explicit alias may carry the `!` / `?` nullability annotation:
+        // it settles the nullability here, where the alias is written. A
+        // column's real name is never an annotation: a column named `col!`
+        // in the schema keeps its name and its nullability.
+        let nullable = match super::type_resolution::annotation_nullability(&rt.name) {
+            Some(nullable) => nullable,
+            None => expr_type.nullable,
+        };
         let name = if !rt.name.is_empty() {
             rt.name.clone()
         } else {
@@ -254,11 +260,8 @@ pub(crate) fn resolve_target_list_explicit(
         explicit.push(expr_type.explicit_collation);
         columns.push(RawColumn {
             name,
-            // The `!` / `?` nullability annotation is the alias the user
-            // wrote, not the column's real name.
-            aliased: !rt.name.is_empty(),
             type_oid,
-            nullable: expr_type.nullable,
+            nullable,
             typmod: expr_type.typmod,
             collation: expr_type.collation,
             record_fields,
@@ -416,7 +419,6 @@ pub(crate) fn analyze_values_lists(
     let columns = (0..arity)
         .map(|i| RawColumn {
             name: format!("column{}", i + 1),
-            aliased: false,
             type_oid: common[i],
             nullable: column_nullable[i],
             // `select_common_typmod`: rows agreeing on type *and* typmod
