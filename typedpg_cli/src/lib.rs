@@ -40,7 +40,12 @@ pub fn create_migration(dir: &Path, name: &str) -> std::io::Result<(PathBuf, Pat
     let up_file = dir.join(format!("{timestamp}_{name}.sql"));
     let down_file = dir.join(format!("{timestamp}_{name}.down.sql"));
     write_new(&up_file)?;
-    write_new(&down_file)?;
+    if let Err(e) = write_new(&down_file) {
+        // Nothing is left behind: a migration whose down file could not be
+        // written is a half-created one, and the runner would apply it.
+        let _ = fs::remove_file(&up_file);
+        return Err(e);
+    }
     Ok((up_file, down_file))
 }
 
@@ -55,7 +60,12 @@ fn write_new(path: &Path) -> std::io::Result<()> {
             if e.kind() == std::io::ErrorKind::AlreadyExists {
                 std::io::Error::new(
                     e.kind(),
-                    format!("{} already exists: it would be overwritten", path.display()),
+                    format!(
+                        "refusing to overwrite {}: a file with that name already exists (the \
+                         migration's name carries a second-resolution timestamp — retry in a \
+                         moment, or use a different name)",
+                        path.display()
+                    ),
                 )
             } else {
                 e

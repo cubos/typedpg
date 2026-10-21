@@ -124,6 +124,44 @@ fn create_never_overwrites_an_existing_migration() {
     panic!("the second create never landed in the same second");
 }
 
+/// A migration whose *down* file already exists leaves nothing behind: the
+/// up file it would have created is removed.
+#[test]
+fn create_leaves_nothing_behind_when_the_down_file_exists() {
+    let dir = project(&[]);
+    fs::remove_dir(dir.path().join("db")).unwrap();
+    let db = dir.path().join("db");
+    fs::create_dir_all(&db).unwrap();
+
+    // The clock may move to the next second: keep the down file's name in
+    // step with it.
+    for _ in 0..5 {
+        let stamp = chrono::Utc::now().format("%Y%m%d%H%M%S");
+        let down = db.join(format!("{stamp}_add_users.down.sql"));
+        fs::write(&down, "-- my rollback\n").unwrap();
+
+        let err = match create_migration(&db, "add_users") {
+            Err(e) => e,
+            Ok(_) => continue,
+        };
+        assert!(err.to_string().contains("already exists"), "{err}");
+        assert_eq!(
+            fs::read_to_string(&down).unwrap(),
+            "-- my rollback\n",
+            "the down file must not be emptied"
+        );
+        // No up file was left behind.
+        let ups: Vec<String> = fs::read_dir(&db)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.ends_with(".sql") && !n.ends_with(".down.sql"))
+            .collect();
+        assert!(ups.is_empty(), "the up file was left behind: {ups:?}");
+        return;
+    }
+    panic!("the create never landed in the same second as the down file");
+}
+
 #[test]
 fn database_commands_need_database_url() {
     let dir = project(&[]);
