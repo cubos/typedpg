@@ -96,6 +96,18 @@ fn generate_query(a: &AnalyzedQuery, mapper: &TypeMapper) -> Result<Generated, G
         }
     }
     check_unique_columns(a.columns.iter().map(|c| c.name.as_str()))?;
+    // The row's `params` object has one property per name: a parameter and
+    // a spread can't share one.
+    let mut param_names: Vec<&str> = a.params.iter().map(|p| p.name.as_str()).collect();
+    for spread in &a.spreads {
+        if param_names.contains(&spread.name.as_str()) {
+            return Err(GenError::plain(format!(
+                "duplicate parameter name \"{}\": a parameter and a spread can't share one name",
+                spread.name
+            )));
+        }
+        param_names.push(&spread.name);
+    }
     // PG has no input for an anonymous record: a `record` parameter can't
     // be bound (a named composite can, from its text form).
     let anonymous = a
@@ -632,6 +644,16 @@ mod tests {
             err("SELECT $r::record")
                 .message
                 .contains("anonymous record")
+        );
+        assert!(
+            err("SELECT id FROM users WHERE id IN $..ids AND name = $ids")
+                .message
+                .contains("duplicate parameter name \"ids\"")
+        );
+        assert!(
+            err("SELECT id FROM users WHERE id IN $..ids AND name IN $..ids")
+                .message
+                .contains("duplicate parameter name \"ids\"")
         );
     }
 }
