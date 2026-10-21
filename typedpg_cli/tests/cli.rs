@@ -6,6 +6,8 @@ use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
 
+use typedpg_cli::connect;
+
 const MANIFEST: &str = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
                         [package.metadata.typedpg.database]\nmigrations = \"./db\"\n";
 
@@ -169,26 +171,53 @@ async fn up_status_and_down() {
     );
 }
 
-/// The server has TLS on with a self-signed certificate the client cannot
-/// verify. `prefer` (also the default) must fall back to a plain
-/// connection, as libpq does; `require` must fail rather than go plain.
+/// The server has TLS on with a self-signed certificate. libpq does not
+/// verify the certificate for `require` and `prefer` — it only checks that
+/// the server presents one — so both connect over TLS.
 #[tokio::test]
 async fn sslmode_is_honored() {
     let url = fresh_url().await;
     let dir = project(&[("0001_users.sql", "CREATE TABLE users (id INT);")]);
     let status = |url: String| cli(dir.path(), Some(&url), &["migrate", "status"]);
 
-    for query in ["", "?sslmode=prefer", "?sslmode=disable"] {
+    for query in [
+        "",
+        "?sslmode=prefer",
+        "?sslmode=require",
+        "?sslmode=disable",
+    ] {
         let out = ok(&status(format!("{url}{query}")));
         assert!(out.contains("0001_users"), "{query}: {out}");
     }
-
-    let stderr = failed(&status(format!("{url}?sslmode=require")));
-    assert!(stderr.contains("TLS"), "{stderr}");
 
     let stderr = failed(&status(format!("{url}?sslmode=verify-full")));
     assert!(
         stderr.starts_with("Error: invalid DATABASE_URL:"),
         "{stderr}"
     );
+}
+
+/// `prefer` (also the default) must keep the connection encrypted: falling
+/// back to a plain one would send the password and the migration SQL in the
+/// clear, where libpq keeps it encrypted.
+#[tokio::test]
+async fn sslmode_prefer_keeps_the_connection_encrypted() {
+    let url = fresh_url().await;
+    for mode in ["prefer", "require"] {
+        let client = connect(&format!("{url}?sslmode={mode}"))
+            .await
+            .unwrap_or_else(|e| panic!("sslmode={mode}: {e}"));
+        let ssl: bool = client
+            .query_one(
+                "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()",
+                &[],
+            )
+            .await
+            .expect("pg_stat_ssl")
+            .get(0);
+        assert!(
+            ssl,
+            "sslmode={mode} must not fall back to a plain connection"
+        );
+    }
 }

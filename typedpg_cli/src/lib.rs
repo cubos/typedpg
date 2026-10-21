@@ -44,8 +44,13 @@ pub fn create_migration(dir: &Path, name: &str) -> std::io::Result<(PathBuf, Pat
 /// Connect honoring the URL's `sslmode` as libpq does: `disable` is plain,
 /// `require` is TLS or nothing, and `prefer` (the default) tries TLS and
 /// falls back to a plain connection when that attempt fails — for instance
-/// on a server with a self-signed certificate, which the TLS connector
-/// (verifying against the system roots) rejects.
+/// on a server that does not offer TLS.
+///
+/// libpq does not verify the certificate for `require` and `prefer`: it only
+/// checks that the server presents one. Verifying would make a server with
+/// a self-signed certificate unreachable — and `prefer` would then fall
+/// back to a plain connection, sending the password and the migration SQL
+/// in the clear where libpq keeps the connection encrypted.
 pub async fn connect(
     database_url: &str,
 ) -> Result<tokio_postgres::Client, Box<dyn std::error::Error>> {
@@ -73,7 +78,12 @@ pub async fn connect(
 async fn connect_tls(
     config: &tokio_postgres::Config,
 ) -> Result<tokio_postgres::Client, Box<dyn std::error::Error>> {
-    let tls_connector = native_tls::TlsConnector::builder().build()?;
+    // libpq's `require` and `prefer`: the connection is encrypted, but the
+    // certificate is not verified.
+    let mut builder = native_tls::TlsConnector::builder();
+    builder.danger_accept_invalid_certs(true);
+    builder.danger_accept_invalid_hostnames(true);
+    let tls_connector = builder.build()?;
     let tls = postgres_native_tls::MakeTlsConnector::new(tls_connector);
     let (client, connection) = config.connect(tls).await?;
     tokio::spawn(async move {
