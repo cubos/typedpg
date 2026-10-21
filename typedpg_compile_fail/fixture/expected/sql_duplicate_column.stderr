@@ -1,0 +1,8 @@
+error: duplicate column name "id" in the query's output: the generated struct has one field per name, so give the columns distinct names (`AS ...`)
+ --> src/bin/sql_duplicate_column.rs:5:5
+  |
+5 |     typedpg::sql!(db, "SELECT u.id, p.id FROM users u JOIN users p ON p.id = u.id")
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the macro `typedpg::sql` (in Nightly builds, run with -Z macro-backtrace for more info)
+

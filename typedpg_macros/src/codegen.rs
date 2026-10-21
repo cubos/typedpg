@@ -779,11 +779,55 @@ pub fn generate(
     executor_expr: &syn::Expr,
     assignments: &[ParamAssignment],
 ) -> Result<TokenStream, syn::Error> {
+    check_unique_columns(&analyzed.columns)?;
     if analyzed.spreads.is_empty() {
         generate_regular(analyzed, config, executor_expr, assignments)
     } else {
         generate_spread(analyzed, config, executor_expr, assignments)
     }
+}
+
+/// The output struct has one field per column: two columns of the same name
+/// would be two fields of the same name, which Rust rejects with a
+/// confusing error of its own (`field `id` is already declared`, and a
+/// conflicting `Column<K>` impl). PostgreSQL accepts the query — the row
+/// just needs distinct names.
+fn check_unique_columns(columns: &[AnalyzedColumn]) -> Result<(), syn::Error> {
+    let mut names: Vec<&str> = Vec::with_capacity(columns.len());
+    // The Rust identifier each column's name spells, and the column it
+    // came from: two different names can spell the same identifier (`a b`
+    // and `a_b` both become `a_b`).
+    let mut idents: Vec<(String, &str)> = Vec::with_capacity(columns.len());
+    for c in columns {
+        if names.contains(&c.name.as_str()) {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                format!(
+                    "duplicate column name \"{}\" in the query's output: the generated struct \
+                     has one field per name, so give the columns distinct names (`AS ...`)",
+                    c.name
+                ),
+            ));
+        }
+        let ident = {
+            use syn::ext::IdentExt;
+            make_field_ident(&c.name).unraw().to_string()
+        };
+        if let Some((_, other)) = idents.iter().find(|(i, _)| *i == ident) {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                format!(
+                    "duplicate field name \"{ident}\" in the query's output: the columns \
+                     \"{other}\" and \"{}\" spell the same Rust identifier, so give them \
+                     distinct names (`AS ...`)",
+                    c.name
+                ),
+            ));
+        }
+        names.push(&c.name);
+        idents.push((ident, &c.name));
+    }
+    Ok(())
 }
 
 /// Generate the future a `copy_in!` invocation evaluates to: each item of
@@ -2539,7 +2583,7 @@ fn pg_type_label(ty: &Type) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::cast_params;
+    use super::{cast_params, check_unique_columns};
     use typedpg_analyzer::PgCatalog;
 
     fn cast(sql: &str) -> String {
@@ -2562,6 +2606,22 @@ mod tests {
         assert_eq!(
             cast("SELECT a FROM t WHERE a = $1 OR a = $1 + 1"),
             "SELECT a FROM t WHERE a = ($1::pg_catalog.int4) OR a = ($1::pg_catalog.int4) + 1"
+        );
+    }
+
+    /// The output struct has one field per column name: two columns of the
+    /// same name would be two fields of the same name, which Rust rejects
+    /// with an error of its own.
+    #[test]
+    fn two_columns_of_the_same_name_are_reported() {
+        let mut db = PgCatalog::new().unwrap();
+        db.apply_sql("CREATE TABLE t (a int NOT NULL, b int);")
+            .unwrap();
+        let info = db.analyze("SELECT a, a FROM t").unwrap();
+        let err = check_unique_columns(&info.columns).expect_err("the check must reject it");
+        assert!(
+            err.to_string().contains("duplicate column name \"a\""),
+            "{err}"
         );
     }
 
