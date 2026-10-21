@@ -472,9 +472,8 @@ pub(crate) fn tracked_migrations_items(paths: &[PathBuf]) -> Vec<TokenStream> {
 }
 
 /// The crates whose migrations are already recorded as dependencies.
-static TRACKED: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashSet<PathBuf>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+static TRACKED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 
 /// The `include_str!` items for each path.
 fn items(paths: &[PathBuf]) -> Vec<TokenStream> {
