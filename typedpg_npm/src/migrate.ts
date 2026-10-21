@@ -129,8 +129,9 @@ function migration(name: string, path: string, sql: string, downSql: string | nu
 }
 
 function sortByVersion(migrations: Migration[]): Migration[] {
-  // Stable, by the prefix as text: the Rust runner's order.
-  return migrations.sort((a, b) => (a.version < b.version ? -1 : a.version > b.version ? 1 : 0));
+  // By the prefix as a number, not as text: `10_x` is a later migration
+  // than `2_x`. The Rust runner's order.
+  return migrations.sort((a, b) => Number(a.version) - Number(b.version));
 }
 
 /** The MD5 of the migration's UTF-8 bytes; the server's `STORED_HASH` matches it. */

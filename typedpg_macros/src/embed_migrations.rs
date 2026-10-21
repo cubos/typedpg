@@ -87,7 +87,7 @@ pub fn expand(input: EmbedInput) -> syn::Result<TokenStream> {
         let down_path = down_files.remove(&stem);
         entries.push((stem, up_path, down_path));
     }
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    entries.sort_by(|a, b| by_version(&a.0, &b.0));
 
     // Generate the call to MigrationSource::from_embedded. Each up/down
     // path goes through include_str!, so cargo re-runs the macro when any
@@ -111,6 +111,21 @@ pub fn expand(input: EmbedInput) -> syn::Result<TokenStream> {
         ])
         .expect("embed_migrations! produced an invalid MigrationSource (this is a bug)")
     })
+}
+
+/// Migrations are ordered by their numeric prefix: `2` before `10`. The
+/// prefix is a number, not text — `10_x` is a later migration than `2_x`.
+fn by_version(a: &str, b: &str) -> std::cmp::Ordering {
+    let version = |stem: &str| {
+        stem.split_once('_')
+            .and_then(|(prefix, _)| prefix.parse::<u128>().ok())
+    };
+    match (version(a), version(b)) {
+        (Some(x), Some(y)) => x.cmp(&y),
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (None, None) => a.cmp(b),
+    }
 }
 
 /// Inline copy of `MigrationSource::from_dir`'s stem validator. Returning

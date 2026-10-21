@@ -151,7 +151,7 @@ impl MigrationSource {
             });
         }
 
-        migrations.sort_by(|a, b| a.version.cmp(&b.version));
+        migrations.sort_by(by_version);
 
         Ok(Self { migrations })
     }
@@ -231,7 +231,7 @@ impl MigrationSource {
                 no_transaction,
             });
         }
-        migrations.sort_by(|a, b| a.version.cmp(&b.version));
+        migrations.sort_by(by_version);
         Ok(Self { migrations })
     }
 
@@ -264,6 +264,21 @@ impl MigrationSource {
     /// ```
     pub fn find(&self, name: &str) -> Option<&Migration> {
         self.migrations.iter().find(|m| m.name == name)
+    }
+}
+
+/// Migrations are ordered by their numeric prefix: `2` before `10`. The
+/// prefix is a number, not text — `10_x` is a later migration than `2_x`.
+///
+/// Two migrations with the same prefix keep the order they were read in.
+fn by_version(a: &Migration, b: &Migration) -> std::cmp::Ordering {
+    match (a.version.parse::<u128>(), b.version.parse::<u128>()) {
+        (Ok(x), Ok(y)) => x.cmp(&y),
+        // The prefix is a number (`parse_migration_name` checks), so this
+        // never happens: keep the order anyway.
+        (Err(_), Ok(_)) => std::cmp::Ordering::Less,
+        (Ok(_), Err(_)) => std::cmp::Ordering::Greater,
+        (Err(_), Err(_)) => std::cmp::Ordering::Equal,
     }
 }
 
@@ -304,6 +319,37 @@ mod tests {
 
     fn create_temp_dir() -> tempfile::TempDir {
         tempfile::tempdir().expect("failed to create temp dir")
+    }
+
+    /// The prefix is a number, not text: `10_x` is a later migration than
+    /// `2_x`.
+    #[test]
+    fn migrations_are_ordered_by_their_numeric_prefix() {
+        let dir = create_temp_dir();
+        for name in ["1_a.sql", "2_b.sql", "10_c.sql", "20_d.sql"] {
+            fs::write(dir.path().join(name), "SELECT 1;").unwrap();
+        }
+        let source = MigrationSource::from_dir(dir.path()).unwrap();
+        let versions: Vec<&str> = source
+            .migrations()
+            .iter()
+            .map(|m| m.version.as_str())
+            .collect();
+        assert_eq!(versions, ["1", "2", "10", "20"]);
+
+        // The embedded source orders them the same way.
+        let source = MigrationSource::from_embedded([
+            ("10_c", "SELECT 1;", None),
+            ("2_b", "SELECT 1;", None),
+            ("1_a", "SELECT 1;", None),
+        ])
+        .unwrap();
+        let versions: Vec<&str> = source
+            .migrations()
+            .iter()
+            .map(|m| m.version.as_str())
+            .collect();
+        assert_eq!(versions, ["1", "2", "10"]);
     }
 
     #[test]
