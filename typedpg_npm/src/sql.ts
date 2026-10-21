@@ -6,41 +6,46 @@
  *
  * PostgreSQL rejects a `;` inside a subquery, and a trailing `--` comment
  * would swallow the subquery's closing parenthesis — so a query that ends
- * with either cannot be embedded in one.
+ * with either cannot be embedded in one. A `;` ends the statement, so
+ * everything after it is junk too.
  *
  * The mirror of `typedpg_analyzer::strip_trailing_junk`.
  */
 export function stripTrailingJunk(sql: string): string {
   let i = 0;
-  // The end of the last significant character: what follows it is
-  // whitespace or a comment.
+  // The end of the last *code* token: what follows it is whitespace, a
+  // comment, or a `;` — the statement's terminator, not part of it.
   let codeEnd = 0;
   while (i < sql.length) {
     const c = sql[i]!;
     let step: number;
-    let significant = true;
+    let isCode = true;
     if (c === "'") {
       step = skipString(sql, i);
     } else if (c === '"') {
       step = skipQuotedIdentifier(sql, i);
     } else if (c === "-" && sql[i + 1] === "-") {
       step = skipLineComment(sql, i);
-      significant = false;
+      isCode = false;
     } else if (c === "/" && sql[i + 1] === "*") {
       step = skipBlockComment(sql, i);
-      significant = false;
+      isCode = false;
     } else if (c === "$") {
       step = dollarQuoteEnd(sql, i) ?? i + 1;
+    } else if (c === ";") {
+      // A `;` ends the statement: it is not part of the code.
+      step = i + 1;
+      isCode = false;
     } else if (isWhitespace(c)) {
       step = i + 1;
-      significant = false;
+      isCode = false;
     } else {
       step = i + 1;
     }
     i = step;
-    if (significant) codeEnd = i;
+    if (isCode) codeEnd = i;
   }
-  return sql.slice(0, codeEnd).replace(/;\s*$/, "").trimEnd();
+  return sql.slice(0, codeEnd).trimEnd();
 }
 
 function isWhitespace(c: string): boolean {

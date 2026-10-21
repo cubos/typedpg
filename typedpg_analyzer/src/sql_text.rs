@@ -5,7 +5,8 @@
 ///
 /// PostgreSQL rejects a `;` inside a subquery, and a trailing `--` comment
 /// would swallow the subquery's closing parenthesis — so a query that ends
-/// with either cannot be embedded in one.
+/// with either cannot be embedded in one. A `;` ends the statement, so
+/// everything after it is junk too.
 ///
 /// ```
 /// use typedpg_analyzer::strip_trailing_junk;
@@ -17,11 +18,11 @@
 pub fn strip_trailing_junk(sql: &str) -> &str {
     let bytes = sql.as_bytes();
     let mut i = 0;
-    // The end of the last significant character: what follows it is
-    // whitespace or a comment.
+    // The end of the last *code* token: what follows it is whitespace, a
+    // comment, or a `;` — the statement's terminator, not part of it.
     let mut code_end = 0;
     while i < bytes.len() {
-        let (step, significant) = match bytes[i] {
+        let (step, is_code) = match bytes[i] {
             b'\'' => (skip_string(sql, i), true),
             b'"' => (skip_quoted_identifier(sql, i), true),
             b'-' if bytes.get(i + 1) == Some(&b'-') => (skip_line_comment(bytes, i), false),
@@ -30,16 +31,17 @@ pub fn strip_trailing_junk(sql: &str) -> &str {
                 Some(end) => (end, true),
                 None => (next_char(sql, i), true),
             },
+            // A `;` ends the statement: it is not part of the code.
+            b';' => (i + 1, false),
             c if c.is_ascii_whitespace() => (next_char(sql, i), false),
             _ => (next_char(sql, i), true),
         };
         i = step;
-        if significant {
+        if is_code {
             code_end = i;
         }
     }
-    let code = sql.get(..code_end).unwrap_or(sql).trim_end();
-    code.strip_suffix(';').unwrap_or(code).trim_end()
+    sql.get(..code_end).unwrap_or(sql).trim_end()
 }
 
 /// The index past the character at `i`.
@@ -197,6 +199,20 @@ mod tests {
         assert_eq!(strip_trailing_junk("SELECT E'a\\';b'"), "SELECT E'a\\';b'");
         assert_eq!(strip_trailing_junk("SELECT '--'"), "SELECT '--'");
         assert_eq!(strip_trailing_junk("SELECT '/*'"), "SELECT '/*'");
+    }
+
+    /// A `;` is the statement's terminator, not part of it: what follows
+    /// it — a comment, another `;` — is junk too.
+    #[test]
+    fn a_semicolon_ends_the_statement() {
+        assert_eq!(strip_trailing_junk("SELECT 1 -- a note\n;"), "SELECT 1");
+        assert_eq!(strip_trailing_junk("SELECT 1; -- a note\n;"), "SELECT 1");
+        assert_eq!(strip_trailing_junk("SELECT 1;;"), "SELECT 1");
+        assert_eq!(strip_trailing_junk("SELECT 1 /* a note */;"), "SELECT 1");
+        assert_eq!(
+            strip_trailing_junk("SELECT 1; SELECT 2"),
+            "SELECT 1; SELECT 2"
+        );
     }
 
     #[test]

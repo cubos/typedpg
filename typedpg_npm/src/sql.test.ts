@@ -29,6 +29,16 @@ test("a semicolon inside a literal is kept", () => {
   assert.equal(stripTrailingJunk("SELECT '/*'"), "SELECT '/*'");
 });
 
+test("a semicolon ends the statement", () => {
+  // A `;` is the statement's terminator, not part of it: what follows
+  // it — a comment, another `;` — is junk too.
+  assert.equal(stripTrailingJunk("SELECT 1 -- a note\n;"), "SELECT 1");
+  assert.equal(stripTrailingJunk("SELECT 1; -- a note\n;"), "SELECT 1");
+  assert.equal(stripTrailingJunk("SELECT 1;;"), "SELECT 1");
+  assert.equal(stripTrailingJunk("SELECT 1 /* a note */;"), "SELECT 1");
+  assert.equal(stripTrailingJunk("SELECT 1; SELECT 2"), "SELECT 1; SELECT 2");
+});
+
 test("a query without junk is untouched", () => {
   assert.equal(stripTrailingJunk("SELECT 1"), "SELECT 1");
   assert.equal(stripTrailingJunk("SELECT 1 "), "SELECT 1");
