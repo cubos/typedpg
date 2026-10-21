@@ -169,7 +169,7 @@ says, whatever `pg.types.setTypeParser` your application set up.
 
 | PostgreSQL | TypeScript |
 |------------|------------|
-| `bool` | `boolean` |
+| `bool` | `boolean`; a parameter must be a boolean (`true` / `false`) — a string or a number is refused |
 | `int2`, `int4`, `float4`, `float8`, `oid` | `number` |
 | `int8` | `bigint` (see `int8`); parameters also take `number` and `string` |
 | `numeric` | `string` (exact); parameters also take `number` |
