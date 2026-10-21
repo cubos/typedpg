@@ -106,13 +106,22 @@ pub fn expand(input: CopyInInput) -> Result<TokenStream, syn::Error> {
         }
     }
 
-    codegen::generate_copy_in(
+    let generated = codegen::generate_copy_in(
         &target,
         resolved,
         &input.executor,
         &input.source,
         &input.fields,
-    )
+    )?;
+
+    // The target's columns come from the migrations: Cargo must know the
+    // crate depends on them, so that a change to one re-runs the analysis.
+    let tracked = crate::query_macro::tracked_migrations_items(&built.tracked_migrations);
+
+    Ok(quote::quote! {{
+        #(#tracked)*
+        #generated
+    }})
 }
 
 #[cfg(test)]

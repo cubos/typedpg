@@ -58,6 +58,12 @@ const FINGERPRINT_ENV: &str = "TYPEDPG_MIGRATIONS_FINGERPRINT";
 ///   itself is recompiled — and every `sql!` re-analyzed — when the migrations
 ///   change.
 ///
+/// `sql!` already records the migration files it read as dependencies of the
+/// generated code (through `include_str!`), so editing or deleting one
+/// re-analyzes the queries without this. What a file dependency cannot cover
+/// is a migration **added** to the directory: Cargo watches the directory
+/// itself here, which is what catches it.
+///
 /// `Cargo.toml` is tracked as well, so changing the migrations path also
 /// triggers a rebuild.
 ///

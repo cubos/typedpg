@@ -59,7 +59,9 @@ for user in &users {
 
 The macro reads your migration files, builds the schema in memory, and type-checks the query. The generated struct has correctly typed fields with proper nullability.
 
-**Optional:** add a `build.rs` (with `typedpg` also under `[build-dependencies]`) so `cargo` re-runs `sql!` automatically whenever a migration file changes:
+Editing or deleting a migration re-runs the analysis: `sql!` records the migration files it read as dependencies of the generated code (the way `include_str!` does), so Cargo rebuilds the crate — and the macro with it — when one changes. The migrations' contents stay out of the binary.
+
+**Optional:** add a `build.rs` (with `typedpg` also under `[build-dependencies]`) so that *adding* a migration file re-runs the analysis too — Cargo watches the directory, which a file dependency cannot:
 
 ```rust
 // build.rs
@@ -68,7 +70,7 @@ fn main() {
 }
 ```
 
-Without it everything still works — you just have to invalidate the build manually after editing a migration.
+Without it everything still works — you just have to invalidate the build manually after adding a migration.
 
 ## Compile-time error detection
 
