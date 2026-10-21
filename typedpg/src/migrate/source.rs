@@ -135,10 +135,7 @@ impl MigrationSource {
             let (version, _description) = parse_migration_name(file_stem, &path)?;
 
             let sql = std::fs::read_to_string(&path)?;
-            let no_transaction = sql
-                .lines()
-                .next()
-                .is_some_and(|line| line.trim() == "-- no-transaction");
+            let no_transaction = has_no_transaction_marker(&sql);
 
             let down_sql = down_files.remove(file_stem);
 
@@ -220,10 +217,7 @@ impl MigrationSource {
             // identical — pass the stem as the file path for nice errors.
             let synthetic_path = std::path::PathBuf::from(format!("{stem}.sql"));
             let (version, _description) = parse_migration_name(stem, &synthetic_path)?;
-            let no_transaction = up
-                .lines()
-                .next()
-                .is_some_and(|line| line.trim() == "-- no-transaction");
+            let no_transaction = has_no_transaction_marker(up);
             migrations.push(Migration {
                 version,
                 name: stem.to_owned(),
@@ -266,6 +260,25 @@ impl MigrationSource {
     /// ```
     pub fn find(&self, name: &str) -> Option<&Migration> {
         self.migrations.iter().find(|m| m.name == name)
+    }
+}
+
+/// Whether the SQL's first line is the `-- no-transaction` marker: the
+/// migration runs outside a transaction.
+///
+/// The marker is the marker, not a word: a file edited on Windows may start
+/// with a BOM, and the marker may carry a note after it.
+pub(crate) fn has_no_transaction_marker(sql: &str) -> bool {
+    let Some(first) = sql.lines().next() else {
+        return false;
+    };
+    let first = first.trim_start_matches('\u{feff}').trim();
+    match first.strip_prefix("-- no-transaction") {
+        Some(rest) => match rest.chars().next() {
+            None => true,
+            Some(c) => !c.is_alphanumeric() && c != '_',
+        },
+        None => false,
     }
 }
 
@@ -521,6 +534,28 @@ mod tests {
 
         let source = MigrationSource::from_dir(dir.path()).unwrap();
         assert!(source.migrations()[0].no_transaction);
+    }
+
+    /// The marker is the marker: a file edited on Windows may start with a
+    /// BOM, and the marker may carry a note after it.
+    #[test]
+    fn detects_the_no_transaction_marker_through_a_bom_or_a_note() {
+        assert!(has_no_transaction_marker("-- no-transaction\nSELECT 1;"));
+        assert!(has_no_transaction_marker(
+            "\u{feff}-- no-transaction\nSELECT 1;"
+        ));
+        assert!(has_no_transaction_marker(
+            "-- no-transaction (for CONCURRENTLY)\nSELECT 1;"
+        ));
+        assert!(has_no_transaction_marker(
+            "  -- no-transaction  \nSELECT 1;"
+        ));
+        // Not the marker.
+        assert!(!has_no_transaction_marker("SELECT 1;"));
+        assert!(!has_no_transaction_marker(
+            "-- no-transactions are bad\nSELECT 1;"
+        ));
+        assert!(!has_no_transaction_marker("-- no transaction\nSELECT 1;"));
     }
 
     #[test]

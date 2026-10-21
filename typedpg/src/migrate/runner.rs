@@ -2,6 +2,7 @@ use tokio_postgres::Client;
 
 use super::MigrationsConfig;
 use super::source::MigrationSource;
+use super::source::has_no_transaction_marker;
 use super::split::split_statements;
 
 /// Computes the MD5 hex digest of a migration's SQL content.
@@ -461,7 +462,11 @@ async fn revert_inner(
 
     match &migration.down_sql {
         Some(down_sql) => {
-            let use_tx = config.use_transaction && !migration.no_transaction;
+            // The down SQL may ask for no transaction of its own: a
+            // `CREATE INDEX CONCURRENTLY` cannot run inside one.
+            let use_tx = config.use_transaction
+                && !migration.no_transaction
+                && !has_no_transaction_marker(down_sql);
 
             if use_tx {
                 let tx = client.transaction().await?;
