@@ -165,20 +165,20 @@ fn an_operator_after_a_param_is_not_an_annotation() {
     let db = setup();
     for (sql, expected) in [
         (
-            "SELECT id FROM users WHERE age != $age",
-            "SELECT id FROM users WHERE age != $1",
+            "SELECT id FROM users WHERE $age != 18",
+            "SELECT id FROM users WHERE $1 != 18",
         ),
         (
-            "SELECT id FROM users WHERE age!=$age",
-            "SELECT id FROM users WHERE age!=$1",
+            "SELECT id FROM users WHERE $age!=18",
+            "SELECT id FROM users WHERE $1!=18",
         ),
         (
-            "SELECT id FROM users WHERE name !~ $name",
-            "SELECT id FROM users WHERE name !~ $1",
+            "SELECT id FROM users WHERE $name !~ 'x'",
+            "SELECT id FROM users WHERE $1 !~ 'x'",
         ),
         (
-            "SELECT id FROM users WHERE name!~$name",
-            "SELECT id FROM users WHERE name!~$1",
+            "SELECT id FROM users WHERE $name!~'x'",
+            "SELECT id FROM users WHERE $1!~'x'",
         ),
     ] {
         let info = db.analyze(sql).unwrap();

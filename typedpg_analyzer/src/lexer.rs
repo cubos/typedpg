@@ -118,10 +118,14 @@ fn is_op_char(c: char) -> bool {
     )
 }
 
-/// Whether `c` can start an operand: a literal, a column or a parameter
-/// reference, a function call.
-fn starts_operand(c: char) -> bool {
-    c.is_alphanumeric() || matches!(c, '_' | '$' | '\'' | '"' | '(' | '[')
+/// Whether `c` starts an operand that cannot be a SQL keyword: a literal, a
+/// parameter, a parenthesised expression, an array.
+///
+/// A word could be a keyword (`$v? AND x` is the annotation, not the
+/// jsonb operator), so a word is not one of these. PG's identifiers may hold
+/// any high-bit letter, so a non-ASCII character is an operand.
+fn starts_operand_hard(c: char) -> bool {
+    matches!(c, '\'' | '"' | '$' | '(' | '[') || c.is_ascii_digit() || !c.is_ascii()
 }
 
 /// The nullability annotation at `at`, if the characters there spell one: a
@@ -130,20 +134,37 @@ fn starts_operand(c: char) -> bool {
 /// `!` and `?` are operator characters, so PG lexes a maximal run of them as
 /// one operator: `!=`, `!~`, `!~*`, `!~~`, `?|` and `?&` are operators, and
 /// eating their `!` / `?` would silently change the query — `$v!=1` would
-/// become `$v=1`. The annotation is therefore the `!` or `?` alone, and,
-/// since `?` is PG's jsonb / hstore existence operator on its own, it only
-/// when no operand follows it.
+/// become `$v=1`. The annotation is therefore the `!` or `?` alone.
+///
+/// What follows it decides the rest:
+/// - a comment (`--`, `/*`) — the annotation, and the comment with it;
+/// - a longer operator run — an operator;
+/// - an operand — an operator (`?` is PG's jsonb / hstore existence
+///   operator on its own, and the operand may be a space away).
 fn annotation_after(chars: &[char], at: usize) -> Option<bool> {
     let c = *chars.get(at)?;
     if c != '!' && c != '?' {
         return None;
     }
+    let next = chars.get(at + 1).copied();
+    // A comment starts: the `!` / `?` is the annotation, and the comment
+    // with it.
+    let comment = matches!(next, Some('-') if chars.get(at + 2) == Some(&'-'))
+        || matches!(next, Some('/') if chars.get(at + 2) == Some(&'*'));
+    if comment {
+        return Some(c == '?');
+    }
     // A longer operator run is an operator, not an annotation.
-    if chars.get(at + 1).copied().is_some_and(is_op_char) {
+    if next.is_some_and(is_op_char) {
         return None;
     }
-    // An operand follows: the `!` / `?` is an operator.
-    if chars.get(at + 1).copied().is_some_and(starts_operand) {
+    // An operand follows: the `!` / `?` is an operator. It may be a space
+    // away (`$v? 'k'`).
+    let mut after = at + 1;
+    while chars.get(after).is_some_and(|c| c.is_whitespace()) {
+        after += 1;
+    }
+    if chars.get(after).copied().is_some_and(starts_operand_hard) {
         return None;
     }
     Some(c == '?')
@@ -814,6 +835,40 @@ mod tests {
         ] {
             let out = lex(sql).unwrap();
             assert_eq!(out.params[0].nullable, nullable, "{sql}");
+        }
+    }
+
+    /// A comment after the `!` / `?` is the annotation's: the comment
+    /// swallows what follows it.
+    #[test]
+    fn an_annotation_may_be_followed_by_a_comment() {
+        for (sql, nullable) in [
+            ("SELECT $v?-- a note", Some(true)),
+            ("SELECT $v!/* a note */", Some(false)),
+            ("SELECT $v? -- a note", Some(true)),
+        ] {
+            let out = lex(sql).unwrap();
+            assert_eq!(out.params[0].nullable, nullable, "{sql}");
+            // The comment stays: it is the query's own text.
+            assert!(out.sql.starts_with("SELECT $1"), "{sql}: {}", out.sql);
+        }
+    }
+
+    /// `?` is PostgreSQL's jsonb / hstore existence operator: with an
+    /// operand after it, it is the operator, not the annotation. The operand
+    /// may be a space away.
+    #[test]
+    fn a_question_mark_before_an_operand_is_an_operator() {
+        for sql in [
+            "SELECT $v? 'k'",
+            "SELECT $v? 1",
+            "SELECT $v? (1)",
+            "SELECT $v? $x",
+            "SELECT $v?\u{20ac}",
+        ] {
+            let out = lex(sql).unwrap();
+            assert_eq!(out.params[0].nullable, None, "{sql}");
+            assert!(out.sql.contains('?'), "{sql}: {}", out.sql);
         }
     }
 
