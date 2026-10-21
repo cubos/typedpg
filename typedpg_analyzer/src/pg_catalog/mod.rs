@@ -928,6 +928,9 @@ impl PgCatalog {
     }
 
     fn apply_sql_located(&mut self, sql: &str) -> Result<(), crate::ddl::MigrationFailure> {
+        // A file edited on Windows starts with a byte-order mark, which the
+        // parser rejects as a syntax error.
+        let sql = typedpg_core::migration_marker::strip_bom(sql);
         let (result, location) = match crate::ddl::apply_migration(self, sql) {
             Ok(()) => (Ok(()), None),
             Err(failure) => (Err(failure.error), failure.location),

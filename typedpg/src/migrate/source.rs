@@ -38,7 +38,8 @@ pub struct Migration {
     /// SQL content of the down migration file, if `NNNN_description.down.sql` exists.
     pub down_sql: Option<String>,
     /// If `true`, this migration should run outside a transaction.
-    /// Set automatically when the first line of the SQL file is `-- no-transaction`.
+    /// Set automatically when the first line of the SQL file starts with
+    /// `-- no-transaction`.
     pub no_transaction: bool,
 }
 
@@ -134,7 +135,10 @@ impl MigrationSource {
 
             let (version, _description) = parse_migration_name(file_stem, &path)?;
 
-            let sql = std::fs::read_to_string(&path)?;
+            // A file edited on Windows starts with a BOM, which PostgreSQL
+            // rejects as a syntax error.
+            let sql = typedpg_core::migration_marker::strip_bom(&std::fs::read_to_string(&path)?)
+                .to_owned();
             let no_transaction = has_no_transaction_marker(&sql);
 
             let down_sql = down_files.remove(file_stem);
@@ -266,20 +270,10 @@ impl MigrationSource {
 /// Whether the SQL's first line is the `-- no-transaction` marker: the
 /// migration runs outside a transaction.
 ///
-/// The marker is the marker, not a word: a file edited on Windows may start
-/// with a BOM, and the marker may carry a note after it.
+/// The rule is shared with the analyzer that replays the migrations
+/// (`typedpg_core::migration_marker`).
 pub(crate) fn has_no_transaction_marker(sql: &str) -> bool {
-    let Some(first) = sql.lines().next() else {
-        return false;
-    };
-    let first = first.trim_start_matches('\u{feff}').trim();
-    match first.strip_prefix("-- no-transaction") {
-        Some(rest) => match rest.chars().next() {
-            None => true,
-            Some(c) => !c.is_alphanumeric() && c != '_',
-        },
-        None => false,
-    }
+    typedpg_core::migration_marker::has_no_transaction_marker(sql)
 }
 
 /// Parses a migration file stem like "0001_create_users" into ("0001", "create_users").

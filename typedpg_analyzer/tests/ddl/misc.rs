@@ -2732,6 +2732,10 @@ fn migrations_the_runner_wraps_in_a_transaction() {
     wrapped("SAVEPOINT sp;").unwrap();
     wrapped("LOCK TABLE t;").unwrap();
     wrapped("-- no-transaction\nCREATE INDEX CONCURRENTLY ON t (a);").unwrap();
+    // The marker is read the way the runner reads it: a note after it, and
+    // the byte-order mark a file edited on Windows starts with.
+    wrapped("-- no-transaction (for CONCURRENTLY)\nCREATE INDEX CONCURRENTLY ON t (a);").unwrap();
+    wrapped("\u{feff}-- no-transaction\nCREATE INDEX CONCURRENTLY ON t (a);").unwrap();
     let Err(err) = wrapped("CREATE INDEX CONCURRENTLY ON t (a);") else {
         panic!("CREATE INDEX CONCURRENTLY ran in the runner's transaction");
     };

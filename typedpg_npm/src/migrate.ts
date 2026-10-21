@@ -24,6 +24,8 @@ export interface Migration {
   readonly downSql: string | null;
   /** The file's first line is `-- no-transaction`. */
   readonly noTransaction: boolean;
+  /** The down file's first line is `-- no-transaction`. */
+  readonly downNoTransaction: boolean;
 }
 
 /** The runner's settings: those of `typedpg.config.json`'s `migrations`. */
@@ -75,6 +77,33 @@ export function embedMigrations(
 }
 
 /**
+ * The SQL without the byte-order mark a file edited on Windows starts
+ * with: PostgreSQL rejects it as a syntax error.
+ */
+export function stripBom(sql: string): string {
+  return sql.startsWith("\uFEFF") ? sql.slice(1) : sql;
+}
+
+/**
+ * Whether the SQL's first line is the `-- no-transaction` marker: the
+ * migration runs outside a transaction.
+ *
+ * The marker is the marker, not a word: a file edited on Windows may
+ * start with a BOM, and the marker may carry a note after it. The mirror
+ * of `typedpg_core::migration_marker::has_no_transaction_marker`.
+ */
+export function hasNoTransactionMarker(sql: string): boolean {
+  const first = sql.split("\n", 1)[0]!.replace(/^\uFEFF/, "").trim();
+  const rest = first.startsWith("-- no-transaction")
+    ? first.slice("-- no-transaction".length)
+    : null;
+  if (rest === null) return false;
+  if (rest === "") return true;
+  const c = rest[0]!;
+  return !/[A-Za-z0-9_]/.test(c);
+}
+
+/**
  * The migrations in `dir` (none when it doesn't exist), as the Rust
  * runner's `MigrationSource::from_dir` reads them.
  */
@@ -91,12 +120,19 @@ export function loadMigrations(dir: string, config: Partial<MigrationsConfig> = 
   for (const name of names) {
     const path = join(dir, name);
     if (statSync(path).isDirectory()) continue;
-    if (name.endsWith(".down.sql")) down.set(name.slice(0, -".down.sql".length), readFileSync(path, "utf8"));
+    if (name.endsWith(".down.sql")) {
+      down.set(name.slice(0, -".down.sql".length), stripBom(readFileSync(path, "utf8")));
+    }
     else if (name.endsWith(".sql")) up.push(name);
   }
   const migrations = up.map((file) => {
     const stem = file.slice(0, -".sql".length);
-    return migration(stem, join(dir, file), readFileSync(join(dir, file), "utf8"), down.get(stem) ?? null);
+    return migration(
+      stem,
+      join(dir, file),
+      stripBom(readFileSync(join(dir, file), "utf8")),
+      down.get(stem) ?? null,
+    );
   });
   return { migrations: sortByVersion(migrations), config: settings(config) };
 }
@@ -177,8 +213,14 @@ function migration(name: string, path: string, sql: string, downSql: string | nu
   if (underscore === name.length - 1) {
     throw new MigrationError(`migration file has no description after prefix: ${path}`);
   }
-  const firstLine = sql.split("\n", 1)[0]!;
-  return { name, version, sql, downSql, noTransaction: firstLine.trim() === "-- no-transaction" };
+  return {
+    name,
+    version,
+    sql,
+    downSql,
+    noTransaction: hasNoTransactionMarker(sql),
+    downNoTransaction: downSql !== null && hasNoTransactionMarker(downSql),
+  };
 }
 
 /**

@@ -65,11 +65,8 @@ impl Transaction {
         sql: &str,
         statements: &[typedpg_pg_query::protobuf::RawStmt],
     ) -> Transaction {
-        // MigrationSource: the first line, trimmed.
-        let no_transaction = sql
-            .lines()
-            .next()
-            .is_some_and(|line| line.trim() == "-- no-transaction");
+        // The runner's rule, shared (`typedpg_core::migration_marker`).
+        let no_transaction = typedpg_core::migration_marker::has_no_transaction_marker(sql);
         let (block, per_statement) = match db.migration_runner {
             Some(true) if !no_transaction => (Block::Explicit, false),
             // The runner's `execute_each`: each statement a query of its own.
