@@ -89,8 +89,15 @@ fn user_ident(name: &str) -> Result<proc_macro2::Ident, syn::Error> {
 /// without `RETURNING`), utility statements (`EXPLAIN`/`NOTIFY`/…), and
 /// `WITH … (DML …) SELECT …` — for those we send the SQL unwrapped and
 /// let the runtime materialize all returned rows before the row-count check.
+///
+/// The SQL is stripped of what follows its last statement: PostgreSQL
+/// rejects a `;` inside a subquery, and a trailing `--` comment would
+/// swallow the subquery's closing parenthesis.
 fn wrap_with_limit(sql: &str, can_run_as_subquery: bool) -> Option<String> {
-    can_run_as_subquery.then(|| format!("SELECT * FROM ({sql}) AS __typedpg_limit LIMIT 2"))
+    can_run_as_subquery.then(|| {
+        let sql = typedpg_analyzer::strip_trailing_junk(sql);
+        format!("SELECT * FROM ({sql}) AS __typedpg_limit LIMIT 2")
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2611,7 +2618,7 @@ fn pg_type_label(ty: &Type) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{cast_params, check_unique_columns, make_field_ident};
+    use super::{cast_params, check_unique_columns, make_field_ident, wrap_with_limit};
     use typedpg_analyzer::PgCatalog;
 
     fn cast(sql: &str) -> String {
@@ -2678,6 +2685,34 @@ mod tests {
             err.to_string().contains("duplicate column name \"a\""),
             "{err}"
         );
+    }
+
+    /// `fetch_one` wraps the SQL in a subquery, where PostgreSQL rejects a
+    /// trailing `;` and a trailing `--` comment would swallow the closing
+    /// parenthesis.
+    #[test]
+    fn the_row_count_subquery_drops_what_follows_the_statement() {
+        assert_eq!(
+            wrap_with_limit("SELECT 1", true).unwrap(),
+            "SELECT * FROM (SELECT 1) AS __typedpg_limit LIMIT 2"
+        );
+        assert_eq!(
+            wrap_with_limit("SELECT 1;", true).unwrap(),
+            "SELECT * FROM (SELECT 1) AS __typedpg_limit LIMIT 2"
+        );
+        assert_eq!(
+            wrap_with_limit("SELECT 1 -- a note", true).unwrap(),
+            "SELECT * FROM (SELECT 1) AS __typedpg_limit LIMIT 2"
+        );
+        assert_eq!(
+            wrap_with_limit("SELECT 1; -- a note", true).unwrap(),
+            "SELECT * FROM (SELECT 1) AS __typedpg_limit LIMIT 2"
+        );
+        assert_eq!(
+            wrap_with_limit("SELECT 1 /* a note */", true).unwrap(),
+            "SELECT * FROM (SELECT 1) AS __typedpg_limit LIMIT 2"
+        );
+        assert!(wrap_with_limit("SELECT 1", false).is_none());
     }
 
     #[test]

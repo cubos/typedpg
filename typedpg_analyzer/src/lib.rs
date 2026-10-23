@@ -68,6 +68,7 @@ mod regex_input;
 mod resolve;
 mod scope;
 mod seed;
+mod sql_text;
 mod suggest;
 mod tsearch_input;
 mod types;
@@ -104,6 +105,7 @@ pub use resolve::{
     AnalyzedColumn, AnalyzedCopyIn, AnalyzedParam, AnalyzedQuery, AnalyzedSpread,
     AnalyzedSpreadField, ArrayForm, SpreadKind, ValuesItem, ValuesList,
 };
+pub use sql_text::strip_trailing_junk;
 /// The "did you mean" matcher behind the analyzer's suggestions, for the
 /// macros' own errors (an unknown `sql!` argument name).
 pub use suggest::suggest_similar;
