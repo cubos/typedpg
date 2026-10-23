@@ -6,7 +6,7 @@ use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
 
-use typedpg_cli::connect;
+use typedpg_cli::{connect, create_migration};
 
 const MANIFEST: &str = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
                         [package.metadata.typedpg.database]\nmigrations = \"./db\"\n";
@@ -89,6 +89,77 @@ fn create_writes_timestamped_up_and_down_files() {
     );
     // The new migration parses as a valid source.
     typedpg::migrate::MigrationSource::from_dir(&dir.path().join("db")).unwrap();
+}
+
+/// A migration is never emptied: creating one again in the same second
+/// (the name carries a timestamp with a second's resolution) must fail
+/// rather than overwrite it.
+#[test]
+fn create_never_overwrites_an_existing_migration() {
+    let dir = project(&[]);
+    fs::remove_dir(dir.path().join("db")).unwrap();
+    let db = dir.path().join("db");
+    fs::create_dir_all(&db).unwrap();
+
+    // The name carries the current second: write the file the next
+    // `create` would write, and try to create it.
+    for _ in 0..5 {
+        let stamp = chrono::Utc::now().format("%Y%m%d%H%M%S");
+        let path = db.join(format!("{stamp}_add_users.sql"));
+        fs::write(&path, "-- my migration\n").unwrap();
+
+        let err = match create_migration(&db, "add_users") {
+            Err(e) => e,
+            // The clock moved to the next second: the name is another one.
+            Ok(_) => continue,
+        };
+        assert!(err.to_string().contains("already exists"), "{err}");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "-- my migration\n",
+            "the migration must not be emptied"
+        );
+        return;
+    }
+    panic!("the second create never landed in the same second");
+}
+
+/// A migration whose *down* file already exists leaves nothing behind: the
+/// up file it would have created is removed.
+#[test]
+fn create_leaves_nothing_behind_when_the_down_file_exists() {
+    let dir = project(&[]);
+    fs::remove_dir(dir.path().join("db")).unwrap();
+    let db = dir.path().join("db");
+    fs::create_dir_all(&db).unwrap();
+
+    // The clock may move to the next second: keep the down file's name in
+    // step with it.
+    for _ in 0..5 {
+        let stamp = chrono::Utc::now().format("%Y%m%d%H%M%S");
+        let down = db.join(format!("{stamp}_add_users.down.sql"));
+        fs::write(&down, "-- my rollback\n").unwrap();
+
+        let err = match create_migration(&db, "add_users") {
+            Err(e) => e,
+            Ok(_) => continue,
+        };
+        assert!(err.to_string().contains("already exists"), "{err}");
+        assert_eq!(
+            fs::read_to_string(&down).unwrap(),
+            "-- my rollback\n",
+            "the down file must not be emptied"
+        );
+        // No up file was left behind.
+        let ups: Vec<String> = fs::read_dir(&db)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.ends_with(".sql") && !n.ends_with(".down.sql"))
+            .collect();
+        assert!(ups.is_empty(), "the up file was left behind: {ups:?}");
+        return;
+    }
+    panic!("the create never landed in the same second as the down file");
 }
 
 #[test]

@@ -31,14 +31,46 @@ pub enum MigrateAction {
 
 /// Write an empty `<timestamp>_<name>.sql` and its `.down.sql` in `dir`;
 /// returns the two paths.
+///
+/// Neither file is overwritten: a migration written by hand, or one created
+/// a moment ago, is never silently emptied.
 pub fn create_migration(dir: &Path, name: &str) -> std::io::Result<(PathBuf, PathBuf)> {
     let timestamp = Utc::now().format("%Y%m%d%H%M%S");
     fs::create_dir_all(dir)?;
     let up_file = dir.join(format!("{timestamp}_{name}.sql"));
     let down_file = dir.join(format!("{timestamp}_{name}.down.sql"));
-    fs::write(&up_file, "")?;
-    fs::write(&down_file, "")?;
+    write_new(&up_file)?;
+    if let Err(e) = write_new(&down_file) {
+        // Nothing is left behind: a migration whose down file could not be
+        // written is a half-created one, and the runner would apply it.
+        let _ = fs::remove_file(&up_file);
+        return Err(e);
+    }
     Ok((up_file, down_file))
+}
+
+/// Write an empty file, failing when it already exists.
+fn write_new(path: &Path) -> std::io::Result<()> {
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map(|_| ())
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "refusing to overwrite {}: a file with that name already exists (the \
+                         migration's name carries a second-resolution timestamp — retry in a \
+                         moment, or use a different name)",
+                        path.display()
+                    ),
+                )
+            } else {
+                e
+            }
+        })
 }
 
 /// Connect honoring the URL's `sslmode` as libpq does: `disable` is plain,
