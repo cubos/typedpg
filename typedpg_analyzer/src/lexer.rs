@@ -78,12 +78,16 @@ enum LexState {
     QuotedIdentifier(usize),
 }
 
+/// PG's identifier characters (`scan.l`'s `ident_start` and `ident_cont`):
+/// a letter — ASCII or any high-bit one, PG's `\200-\377` — or an
+/// underscore, plus a digit for the continuation. PG's identifiers, and so
+/// its dollar-quote tags, are not restricted to ASCII.
 fn is_ident_start(c: char) -> bool {
-    c.is_ascii_alphabetic() || c == '_'
+    c.is_ascii_alphabetic() || c == '_' || !c.is_ascii()
 }
 
 fn is_ident_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '_'
+    is_ident_start(c) || c.is_ascii_digit()
 }
 
 fn read_ident(chars: &[char], start: usize) -> &[char] {
@@ -613,6 +617,31 @@ mod tests {
         let out = lex("SELECT $fn$body $falso$fn$ WHERE id = $id").unwrap();
         assert_eq!(out.params.len(), 1);
         assert_eq!(out.params[0].name, "id");
+    }
+
+    /// PG's identifiers — and so its dollar-quote tags — are not restricted
+    /// to ASCII: the tag follows PG's `dolq_start` / `dolq_cont`, which
+    /// accept any high-bit letter.
+    #[test]
+    fn a_dollar_quote_tag_may_hold_a_non_ascii_letter() {
+        for sql in [
+            "SELECT $café$body$café$",
+            "SELECT $日本$body$日本$",
+            "SELECT $aé$body$aé$",
+            "SELECT $tag1$body$tag1$",
+        ] {
+            let out = lex(sql).unwrap();
+            assert_eq!(out.sql, sql, "{sql}");
+            assert_eq!(out.params.len(), 0, "{sql}");
+        }
+    }
+
+    /// A parameter's name follows PG's identifier rules too.
+    #[test]
+    fn a_param_name_may_hold_a_non_ascii_letter() {
+        let out = lex("SELECT $café FROM t").unwrap();
+        assert_eq!(out.sql, "SELECT $1 FROM t");
+        assert_eq!(out.params[0].name, "café");
     }
 
     #[test]

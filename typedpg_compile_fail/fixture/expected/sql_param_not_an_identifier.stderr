@@ -1,0 +1,8 @@
+error: `€` is not a valid Rust identifier: a parameter's name is also the name of the variable that holds its value
+ --> src/bin/sql_param_not_an_identifier.rs:5:5
+  |
+5 |     typedpg::sql!(db, "SELECT id FROM users WHERE name = $€")
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the macro `typedpg::sql` (in Nightly builds, run with -Z macro-backtrace for more info)
+
