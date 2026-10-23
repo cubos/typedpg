@@ -98,6 +98,82 @@ fn read_ident(chars: &[char], start: usize) -> &[char] {
     &chars[start..end]
 }
 
+/// PG's operator characters (`scan.l`'s `self`): PG lexes a maximal run of
+/// them as a single operator.
+fn is_op_char(c: char) -> bool {
+    matches!(
+        c,
+        '+' | '-'
+            | '*'
+            | '/'
+            | '<'
+            | '>'
+            | '='
+            | '~'
+            | '!'
+            | '@'
+            | '#'
+            | '%'
+            | '^'
+            | '&'
+            | '|'
+            | '`'
+            | '?'
+    )
+}
+
+/// Whether `c` starts an operand that cannot be a SQL keyword: a literal, a
+/// parameter, a parenthesised expression, an array.
+///
+/// A word could be a keyword (`$v? AND x` is the annotation, not the
+/// jsonb operator), so a word is not one of these. PG's identifiers may hold
+/// any high-bit letter, so a non-ASCII character is an operand.
+fn starts_operand_hard(c: char) -> bool {
+    matches!(c, '\'' | '"' | '$' | '(' | '[') || c.is_ascii_digit() || !c.is_ascii()
+}
+
+/// The nullability annotation at `at`, if the characters there spell one: a
+/// lone `!` (not NULL) or a lone `?` (nullable).
+///
+/// `!` and `?` are operator characters, so PG lexes a maximal run of them as
+/// one operator: `!=`, `!~`, `!~*`, `!~~`, `?|` and `?&` are operators, and
+/// eating their `!` / `?` would silently change the query — `$v!=1` would
+/// become `$v=1`. The annotation is therefore the `!` or `?` alone.
+///
+/// What follows it decides the rest:
+/// - a comment (`--`, `/*`) — the annotation, and the comment with it;
+/// - a longer operator run — an operator;
+/// - an operand — an operator (`?` is PG's jsonb / hstore existence
+///   operator on its own, and the operand may be a space away).
+fn annotation_after(chars: &[char], at: usize) -> Option<bool> {
+    let c = *chars.get(at)?;
+    if c != '!' && c != '?' {
+        return None;
+    }
+    let next = chars.get(at + 1).copied();
+    // A comment starts: the `!` / `?` is the annotation, and the comment
+    // with it.
+    let comment = matches!(next, Some('-') if chars.get(at + 2) == Some(&'-'))
+        || matches!(next, Some('/') if chars.get(at + 2) == Some(&'*'));
+    if comment {
+        return Some(c == '?');
+    }
+    // A longer operator run is an operator, not an annotation.
+    if next.is_some_and(is_op_char) {
+        return None;
+    }
+    // An operand follows: the `!` / `?` is an operator. It may be a space
+    // away (`$v? 'k'`).
+    let mut after = at + 1;
+    while chars.get(after).is_some_and(|c| c.is_whitespace()) {
+        after += 1;
+    }
+    if chars.get(after).copied().is_some_and(starts_operand_hard) {
+        return None;
+    }
+    Some(c == '?')
+}
+
 /// Lex a SQL template string, extracting named and spread parameters.
 ///
 /// Rewrites `$name` placeholders to positional PostgreSQL placeholders
@@ -299,12 +375,9 @@ fn lex_with_base(sql: &str, base: usize) -> Result<(LexOutput, usize), LexError>
                             i = after + 1;
                         } else {
                             // Named param $ident — check for nullability annotation `?` or `!`
-                            let (nullable, consume_to) = if after < len && chars[after] == '?' {
-                                (Some(true), after + 1)
-                            } else if after < len && chars[after] == '!' {
-                                (Some(false), after + 1)
-                            } else {
-                                (None, after)
+                            let (nullable, consume_to) = match annotation_after(&chars, after) {
+                                Some(nullable) => (Some(nullable), after + 1),
+                                None => (None, after),
                             };
 
                             // Deduplicate by name
@@ -750,6 +823,82 @@ mod tests {
         assert_eq!(out.params.len(), 1);
         assert_eq!(out.params[0].name, "age");
         assert_eq!(out.params[0].nullable, Some(false));
+    }
+
+    /// The `!` and `?` of an annotation are operator characters, and PG lexes
+    /// a maximal run of them as one operator: `!=`, `!~`, `!~*`, `!~~`, `?|`
+    /// and `?&` are operators. Eating their `!` / `?` would change the query
+    /// (`$v!=1` would become `$v=1`).
+    #[test]
+    fn an_operator_after_a_param_is_not_an_annotation() {
+        for (sql, expected) in [
+            ("SELECT $v!=1", "SELECT $1!=1"),
+            ("SELECT $v !~ 'x'", "SELECT $1 !~ 'x'"),
+            ("SELECT $v!~'x'", "SELECT $1!~'x'"),
+            ("SELECT $v!~*'x'", "SELECT $1!~*'x'"),
+            ("SELECT $v!~~'x'", "SELECT $1!~~'x'"),
+            ("SELECT $v!~~*'x'", "SELECT $1!~~*'x'"),
+            ("SELECT $v?'k'", "SELECT $1?'k'"),
+            ("SELECT $v?|array['k']", "SELECT $1?|array['k']"),
+            ("SELECT $v?&array['k']", "SELECT $1?&array['k']"),
+        ] {
+            let out = lex(sql).unwrap();
+            assert_eq!(out.sql, expected, "{sql}");
+            // The operator is not an annotation: the parameter keeps the
+            // nullability its context gives it.
+            assert_eq!(out.params[0].nullable, None, "{sql}");
+        }
+    }
+
+    /// The annotation is still the `!` or `?` alone, and what follows it
+    /// can't be an operand.
+    #[test]
+    fn an_annotation_is_the_bang_or_question_alone() {
+        for (sql, nullable) in [
+            ("SELECT $v!", Some(false)),
+            ("SELECT $v?", Some(true)),
+            ("SELECT $v! = 1", Some(false)),
+            ("SELECT $v? AND x", Some(true)),
+            ("SELECT $v?)", Some(true)),
+            ("SELECT $v?, x", Some(true)),
+        ] {
+            let out = lex(sql).unwrap();
+            assert_eq!(out.params[0].nullable, nullable, "{sql}");
+        }
+    }
+
+    /// A comment after the `!` / `?` is the annotation's: the comment
+    /// swallows what follows it.
+    #[test]
+    fn an_annotation_may_be_followed_by_a_comment() {
+        for (sql, nullable) in [
+            ("SELECT $v?-- a note", Some(true)),
+            ("SELECT $v!/* a note */", Some(false)),
+            ("SELECT $v? -- a note", Some(true)),
+        ] {
+            let out = lex(sql).unwrap();
+            assert_eq!(out.params[0].nullable, nullable, "{sql}");
+            // The comment stays: it is the query's own text.
+            assert!(out.sql.starts_with("SELECT $1"), "{sql}: {}", out.sql);
+        }
+    }
+
+    /// `?` is PostgreSQL's jsonb / hstore existence operator: with an
+    /// operand after it, it is the operator, not the annotation. The operand
+    /// may be a space away.
+    #[test]
+    fn a_question_mark_before_an_operand_is_an_operator() {
+        for sql in [
+            "SELECT $v? 'k'",
+            "SELECT $v? 1",
+            "SELECT $v? (1)",
+            "SELECT $v? $x",
+            "SELECT $v?\u{20ac}",
+        ] {
+            let out = lex(sql).unwrap();
+            assert_eq!(out.params[0].nullable, None, "{sql}");
+            assert!(out.sql.contains('?'), "{sql}: {}", out.sql);
+        }
     }
 
     #[test]
