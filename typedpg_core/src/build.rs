@@ -1,9 +1,12 @@
 //! Build-script support for migration change detection.
 //!
 //! A proc macro that reads files (like `typedpg`'s `sql!`) cannot, on stable
-//! Rust, tell the compiler that those files are build inputs. So editing or
-//! adding a migration would not, on its own, trigger recompilation — and `sql!`
-//! would keep producing types from a stale schema.
+//! Rust, tell the compiler that those files are build inputs for free: the
+//! only mechanism is `include_str!`, which copies the files' contents into
+//! the crate's metadata. `sql!` pays that for the migrations it reads, so
+//! editing or deleting one re-runs the analysis. Adding one to the directory
+//! is what this build script covers: Cargo watches the directory itself, and
+//! a file dependency cannot.
 //!
 //! Calling [`track_migrations`] from a `build.rs` fixes this. It emits a
 //! `cargo:rerun-if-changed` directive for every migration directory (Cargo
@@ -57,6 +60,12 @@ const FINGERPRINT_ENV: &str = "TYPEDPG_MIGRATIONS_FINGERPRINT";
 /// - folds the file contents into a `cargo:rustc-env` fingerprint, so the crate
 ///   itself is recompiled — and every `sql!` re-analyzed — when the migrations
 ///   change.
+///
+/// `sql!` already records the migration files it read as dependencies of the
+/// generated code (through `include_str!`), so editing or deleting one
+/// re-analyzes the queries without this. What a file dependency cannot cover
+/// is a migration **added** to the directory: Cargo watches the directory
+/// itself here, which is what catches it.
 ///
 /// `Cargo.toml` is tracked as well, so changing the migrations path also
 /// triggers a rebuild.

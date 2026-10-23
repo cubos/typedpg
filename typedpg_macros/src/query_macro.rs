@@ -4,9 +4,9 @@
 //! runs static analysis, and generates typed Rust code.
 
 use std::cell::RefCell;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use proc_macro2::Span;
+use proc_macro2::{Span, TokenStream};
 use syn::parse::{Parse, ParseStream};
 use syn::{Expr, Ident, LitStr, Token};
 use typedpg_analyzer::PgCatalog;
@@ -349,6 +349,10 @@ pub(crate) struct BuiltCatalog<'c> {
     /// missing directory counts as no migrations, so a typo in the path
     /// shows up as every table being missing. Appended to analysis errors.
     pub missing_dirs_note: Option<String>,
+    /// The migration files the analysis reads, so that the generated code
+    /// can record them as dependencies: a change to one must re-run the
+    /// analysis (see [`tracked_migrations`]).
+    pub tracked_migrations: Vec<PathBuf>,
 }
 
 impl BuiltCatalog<'_> {
@@ -422,7 +426,75 @@ pub(crate) fn catalog_for<'c>(
         catalog,
         resolved,
         missing_dirs_note,
+        tracked_migrations: migration_file_paths(&all_dirs),
     })
+}
+
+/// The migration files the analysis reads, sorted.
+///
+/// The generated code records them as dependencies (`include_str!`), so
+/// that a change to one re-runs the analysis: the macro reads them at
+/// expansion time, and Cargo would otherwise never learn the crate
+/// depends on them — leaving the analysis frozen at the schema of the
+/// last build.
+pub(crate) fn migration_file_paths(dirs: &[&Path]) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            let name = path.to_string_lossy();
+            // The down migrations do not change the schema the analysis
+            // sees; the runtime reads them from disk.
+            if name.ends_with(".sql") && !name.ends_with(".down.sql") {
+                paths.push(path);
+            }
+        }
+    }
+    paths.sort();
+    paths
+}
+
+/// The `include_str!` items that record the migration files as
+/// dependencies of the generated code.
+///
+/// The items are anonymous constants, so the migrations' contents do not
+/// end up in the binary — only the dependency Cargo needs does. They do
+/// land in the crate's metadata, though, so they are emitted once per
+/// crate: every query would otherwise carry a copy of the migrations.
+pub(crate) fn tracked_migrations_items(paths: &[PathBuf]) -> Vec<TokenStream> {
+    // The crates whose migrations are already recorded: the macro server
+    // serves every crate of a build, so the set is keyed by the crate.
+    let mut tracked = TRACKED.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(crate_dir) = std::env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from) else {
+        // No crate to key on: record them every time.
+        return items(paths);
+    };
+    if !tracked.insert(crate_dir) {
+        return Vec::new();
+    }
+    items(paths)
+}
+
+/// The crates whose migrations are already recorded as dependencies.
+static TRACKED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// The `include_str!` items for each path.
+fn items(paths: &[PathBuf]) -> Vec<TokenStream> {
+    paths
+        .iter()
+        .filter_map(|path| {
+            // A path that is not UTF-8 cannot be written as a literal:
+            // the dependency is not recorded, but the analysis still reads
+            // the file.
+            let path = path.to_str()?;
+            let path = syn::LitStr::new(path, Span::call_site());
+            Some(quote::quote! { const _: &str = include_str!(#path); })
+        })
+        .collect()
 }
 
 pub fn expand(input: QueryInput) -> Result<proc_macro2::TokenStream, syn::Error> {
@@ -514,12 +586,54 @@ pub fn expand(input: QueryInput) -> Result<proc_macro2::TokenStream, syn::Error>
     }
 
     // 6. Generate typed Rust code.
-    codegen::generate(&analyzed, resolved, &input.executor, &input.assignments)
+    let generated = codegen::generate(&analyzed, resolved, &input.executor, &input.assignments)?;
+
+    // Cargo must know the crate depends on the migration files: the macro
+    // reads them at expansion time, so without this a change to one would
+    // leave the analysis frozen at the schema of the last build. The
+    // `include_str!` records the dependency, the way `embed_migrations!`
+    // does — and its contents stay out of the binary.
+    let tracked = tracked_migrations_items(&built.tracked_migrations);
+
+    Ok(quote::quote! {{
+        #(#tracked)*
+        #generated
+    }})
 }
 
 #[cfg(test)]
 mod catalog_tests {
     use super::get_or_build_pg_catalog;
+
+    /// The macro reads the migrations at expansion time, so Cargo must
+    /// learn the crate depends on them: without that, a change to one
+    /// leaves the analysis frozen at the schema of the last build.
+    #[test]
+    fn the_migration_files_are_recorded_as_dependencies() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("0001_a.sql"), "CREATE TABLE a ();").unwrap();
+        std::fs::write(dir.path().join("0002_b.sql"), "CREATE TABLE b ();").unwrap();
+        // The down migrations do not change the schema the analysis sees.
+        std::fs::write(dir.path().join("0002_b.down.sql"), "DROP TABLE b;").unwrap();
+
+        let paths = super::migration_file_paths(&[dir.path()]);
+        assert_eq!(
+            paths
+                .iter()
+                .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            ["0001_a.sql", "0002_b.sql"]
+        );
+
+        let items = super::tracked_migrations_items(&paths);
+        assert_eq!(items.len(), 2);
+        let text: String = items.iter().map(|i| i.to_string()).collect();
+        assert!(text.contains("include_str"), "{text}");
+        assert!(text.contains("0001_a.sql"), "{text}");
+        // An anonymous constant: the migrations' contents stay out of the
+        // binary.
+        assert!(text.contains("const _"), "{text}");
+    }
 
     #[test]
     fn a_failing_migration_is_reported_in_full_once() {
