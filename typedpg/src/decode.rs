@@ -88,7 +88,10 @@ pub fn field_name_of_column(name: &str) -> String {
             }
         })
         .collect();
-    if sanitized.is_empty() {
+    // `_` is Rust's wildcard: it cannot name a field. A name that is
+    // nothing but characters an identifier cannot hold (`á`, `—`) lands
+    // there, and is named like the empty one.
+    if sanitized.is_empty() || sanitized == "_" {
         "_unnamed".to_string()
     } else if sanitized.starts_with(|c: char| c.is_ascii_digit()) {
         format!("_{sanitized}")
