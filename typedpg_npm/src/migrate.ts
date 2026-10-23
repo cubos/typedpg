@@ -104,12 +104,65 @@ export function loadMigrations(dir: string, config: Partial<MigrationsConfig> = 
 function settings(config: Partial<MigrationsConfig>): MigrationsConfig {
   const s = { ...DEFAULTS, ...config };
   // Interpolated into every statement: only a plain qualified identifier.
-  if (!/^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$/.test(s.table)) {
+  if (!isQualifiedIdentifier(s.table)) {
     throw new MigrationError(
-      `invalid migrations table "${s.table}": expected \`name\` or \`schema.name\` of letters, digits and _`,
+      `invalid migrations table "${s.table}": expected \`name\` or \`schema.name\`, each part ` +
+        `unquoted or double-quoted`,
     );
   }
   return s;
+}
+
+/**
+ * Whether the name is a qualified identifier the Rust runner accepts
+ * (`MigrationsConfig::validate`): a `name` or a `schema.name`, each part
+ * either unquoted (`[A-Za-z_][A-Za-z0-9_]*`) or double-quoted, with `""`
+ * for an escaped quote.
+ */
+function isQualifiedIdentifier(name: string): boolean {
+  const parts = splitQualifiedName(name);
+  if (parts === null || parts.length === 0 || parts.length > 2) return false;
+  return parts.every(isIdentifier);
+}
+
+/** The name's parts, split on the `.` that are not inside a quoted part. */
+function splitQualifiedName(name: string): string[] | null {
+  const parts: string[] = [];
+  let start = 0;
+  let inQuote = false;
+  for (let i = 0; i < name.length; i++) {
+    const c = name[i]!;
+    if (c === '"') {
+      if (inQuote && name[i + 1] === '"') {
+        // An escaped quote.
+        i++;
+        continue;
+      }
+      inQuote = !inQuote;
+    } else if (c === "." && !inQuote) {
+      parts.push(name.slice(start, i));
+      start = i + 1;
+    }
+  }
+  if (inQuote) return null;
+  parts.push(name.slice(start));
+  return parts;
+}
+
+/** Whether the part is an unquoted or a double-quoted PostgreSQL identifier. */
+function isIdentifier(part: string): boolean {
+  if (part.length >= 2 && part.startsWith('"') && part.endsWith('"')) {
+    const inner = part.slice(1, -1);
+    if (inner.length === 0 || inner.includes("\0")) return false;
+    // `""` is an escaped quote; a lone `"` is not.
+    for (let i = 0; i < inner.length; i++) {
+      if (inner[i] !== '"') continue;
+      if (inner[i + 1] !== '"') return false;
+      i++;
+    }
+    return true;
+  }
+  return /^[A-Za-z_][A-Za-z0-9_]*$/.test(part);
 }
 
 function migration(name: string, path: string, sql: string, downSql: string | null): Migration {
