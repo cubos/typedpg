@@ -92,6 +92,7 @@ fn validate_sql_body(
             last = Some(LastStatement {
                 returns_rows: false,
                 column_types: None,
+                record_shape: None,
             });
             continue;
         }
@@ -123,9 +124,19 @@ fn validate_sql_body(
             ) => None,
             Err(e) => return Err(DdlError::UnsupportedDdl(format!("{e}"))),
         };
+        // The shape of a `record` result, when the analyzer knows it: PG
+        // casts it to the composite type the function returns, and only a
+        // `ROW(...)` constructor (or a whole-row reference) can be cast.
+        let record_shape = columns.as_ref().and_then(|cols| {
+            let c = cols.first()?;
+            (c.type_oid == oid::RECORD)
+                .then(|| c.record_fields.clone())
+                .flatten()
+        });
         last = Some(LastStatement {
             returns_rows: returns_rows(inner),
             column_types: columns.map(|cols| cols.iter().map(|c| c.type_oid).collect()),
+            record_shape,
         });
     }
     check_return_type(interp, proc, last.as_ref())
@@ -136,6 +147,10 @@ struct LastStatement {
     returns_rows: bool,
     /// The result column types, `None` when the analyzer couldn't tell.
     column_types: Option<Vec<PgTypeOid>>,
+    /// The shape of a `record` result, when the analyzer knows it: PG casts
+    /// a `record` to the composite type the function returns, and only a
+    /// `ROW(...)` constructor (or a whole-row reference) can be cast.
+    record_shape: Option<crate::expr::RecordShape>,
 }
 
 /// `check_sql_fn_retval`: the final statement must return rows, and its
@@ -208,10 +223,70 @@ fn check_return_type(
     let Some(column_types) = last.and_then(|l| l.column_types.as_deref()) else {
         return Ok(());
     };
+    // PG resolves the body's untyped output columns to `text`
+    // (`resolveTargetListUnknowns`), so an output column that is still
+    // `unknown` is a `text` one.
+    let column_types: Vec<PgTypeOid> = column_types
+        .iter()
+        .map(|&t| if t == oid::UNKNOWN { oid::TEXT } else { t })
+        .collect();
+    let column_types = column_types.as_slice();
     let fits = |actual: PgTypeOid, declared: PgTypeOid| {
-        actual == oid::UNKNOWN || can_coerce(actual, declared, CoercionContext::Assignment, interp)
+        can_coerce(actual, declared, CoercionContext::Assignment, interp)
     };
     let name = |t: PgTypeOid| super::util::format_type_for_message(interp, t);
+    // A `record` result is cast to the composite type the function returns
+    // (PG's `coerce_record_to_complex`): only a `ROW(...)` constructor or a
+    // whole-row reference can be cast, and PG checks the field count and
+    // the field types when the function is created.
+    //
+    // A `record` *return* type is a different case: the coercion is a
+    // no-op, and the OUT parameters are the row.
+    if let [single] = column_types
+        && interp.unwrap_domain(*single) == oid::RECORD
+        && rettype != oid::RECORD
+        && let Some(row) = row.as_ref()
+    {
+        let cannot_cast =
+            || DdlError::Parse(format!("cannot cast type record to {}", name(rettype)));
+        // The shape PG can cast: a `ROW(...)` or a whole-row reference. A
+        // shape PG cannot see is one it cannot cast either.
+        let Some(shape) = last.and_then(|l| l.record_shape.as_ref()) else {
+            return Err(cannot_cast());
+        };
+        if shape.hidden {
+            return Err(cannot_cast());
+        }
+        match shape.fields.len().cmp(&row.len()) {
+            std::cmp::Ordering::Less => {
+                return Err(DdlError::Parse(format!(
+                    "cannot cast type record to {} (Input has too few columns.)",
+                    name(rettype)
+                )));
+            }
+            std::cmp::Ordering::Greater => {
+                return Err(DdlError::Parse(format!(
+                    "cannot cast type record to {} (Input has too many columns.)",
+                    name(rettype)
+                )));
+            }
+            std::cmp::Ordering::Equal => {}
+        }
+        // The fields' types, with an assignment coercion — as PG does.
+        for (i, (field, &declared)) in shape.fields.iter().zip(row).enumerate() {
+            let actual = field.ty.type_oid;
+            if !fits(actual, declared) {
+                return Err(DdlError::Parse(format!(
+                    "cannot cast type record to {} (Cannot cast type {} to {} in column {}.)",
+                    name(rettype),
+                    name(actual),
+                    name(declared),
+                    i + 1
+                )));
+            }
+        }
+        return Ok(());
+    }
     let Some(row) = row else {
         return match column_types {
             [single] if fits(*single, rettype) => Ok(()),
