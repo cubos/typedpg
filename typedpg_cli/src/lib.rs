@@ -44,13 +44,23 @@ pub fn create_migration(dir: &Path, name: &str) -> std::io::Result<(PathBuf, Pat
 /// Connect honoring the URL's `sslmode` as libpq does: `disable` is plain,
 /// `require` is TLS or nothing, and `prefer` (the default) tries TLS and
 /// falls back to a plain connection when that attempt fails — for instance
-/// on a server with a self-signed certificate, which the TLS connector
-/// (verifying against the system roots) rejects.
+/// on a server that does not offer TLS, or when the TLS handshake itself
+/// fails.
+///
+/// libpq does not verify the certificate for `require` and `prefer`: it only
+/// checks that the server presents one. Verifying would make a server with
+/// a self-signed certificate unreachable — and `prefer` would then fall
+/// back to a plain connection, sending the password and the migration SQL
+/// in the clear where libpq keeps the connection encrypted.
+///
+/// The modes that do verify (`verify-ca`, `verify-full`) are not supported:
+/// the connection library behind this CLI has no way to ask for them.
 pub async fn connect(
     database_url: &str,
 ) -> Result<tokio_postgres::Client, Box<dyn std::error::Error>> {
     use tokio_postgres::config::SslMode;
 
+    check_sslmode(database_url)?;
     let config: tokio_postgres::Config = database_url
         .parse()
         .map_err(|e| format!("invalid DATABASE_URL: {e}"))?;
@@ -60,6 +70,11 @@ pub async fn connect(
         _ => match connect_tls(&config).await {
             Ok(client) => Ok(client),
             Err(tls_err) => {
+                eprintln!(
+                    "typedpg: the TLS handshake failed ({}); falling back to an unencrypted \
+                     connection — the password and the migration SQL will travel in clear",
+                    tls_err
+                );
                 let mut plain = config.clone();
                 plain.ssl_mode(SslMode::Disable);
                 connect_plain(&plain)
@@ -70,10 +85,48 @@ pub async fn connect(
     }
 }
 
+/// The `sslmode` the URL asks for, when it is one this CLI cannot honor.
+///
+/// The connection library takes `disable`, `prefer` and `require`; the modes
+/// that verify the server's certificate (`verify-ca`, `verify-full`) are
+/// rejected by it with a message that says nothing about which parameter was
+/// wrong. The CLI says it instead — and says what it can do.
+fn check_sslmode(database_url: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(value) = parameter(database_url, "sslmode") else {
+        return Ok(());
+    };
+    match value.as_str() {
+        "disable" | "prefer" | "require" | "allow" => Ok(()),
+        other => Err(format!(
+            "unsupported sslmode `{other}`: this CLI connects with `disable`, `prefer` or \
+             `require`, and never verifies the server's certificate"
+        )
+        .into()),
+    }
+}
+
+/// The value of the `name` parameter in a libpq connection string or URL.
+fn parameter(url: &str, name: &str) -> Option<String> {
+    let value = if let Some(query) = url.split_once('?').map(|(_, q)| q) {
+        query
+            .split('&')
+            .find_map(|pair| pair.strip_prefix(&format!("{name}=")))
+    } else {
+        url.split_whitespace()
+            .find_map(|word| word.strip_prefix(&format!("{name}=")))
+    }?;
+    Some(value.trim_matches('\'').to_owned())
+}
+
 async fn connect_tls(
     config: &tokio_postgres::Config,
 ) -> Result<tokio_postgres::Client, Box<dyn std::error::Error>> {
-    let tls_connector = native_tls::TlsConnector::builder().build()?;
+    // libpq's `require` and `prefer`: the connection is encrypted, but the
+    // certificate is not verified.
+    let mut builder = native_tls::TlsConnector::builder();
+    builder.danger_accept_invalid_certs(true);
+    builder.danger_accept_invalid_hostnames(true);
+    let tls_connector = builder.build()?;
     let tls = postgres_native_tls::MakeTlsConnector::new(tls_connector);
     let (client, connection) = config.connect(tls).await?;
     tokio::spawn(async move {
