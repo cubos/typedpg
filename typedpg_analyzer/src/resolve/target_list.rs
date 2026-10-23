@@ -214,6 +214,14 @@ pub(crate) fn resolve_target_list_explicit(
         )?;
 
         // Determine column name: explicit alias, or inferred from expression.
+        // An explicit alias may carry the `!` / `?` nullability annotation:
+        // it settles the nullability here, where the alias is written. A
+        // column's real name is never an annotation: a column named `col!`
+        // in the schema keeps its name and its nullability.
+        let nullable = match super::type_resolution::annotation_nullability(&rt.name) {
+            Some(nullable) => nullable,
+            None => expr_type.nullable,
+        };
         let name = if !rt.name.is_empty() {
             rt.name.clone()
         } else {
@@ -253,7 +261,7 @@ pub(crate) fn resolve_target_list_explicit(
         columns.push(RawColumn {
             name,
             type_oid,
-            nullable: expr_type.nullable,
+            nullable,
             typmod: expr_type.typmod,
             collation: expr_type.collation,
             record_fields,

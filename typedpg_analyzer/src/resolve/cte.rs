@@ -573,9 +573,19 @@ fn apply_cte_column_aliases(
     Ok(cols
         .into_iter()
         .enumerate()
-        .map(|(i, c)| RawColumn {
-            name: names.get(i).cloned().unwrap_or(c.name),
-            ..c
+        .map(|(i, c)| {
+            // The alias list is a name the user wrote: it may carry the
+            // `!` / `?` nullability annotation.
+            let name = names.get(i).cloned().unwrap_or(c.name);
+            let nullable = match super::type_resolution::annotation_nullability(&name) {
+                Some(nullable) => nullable,
+                None => c.nullable,
+            };
+            RawColumn {
+                name,
+                nullable,
+                ..c
+            }
         })
         .collect())
 }

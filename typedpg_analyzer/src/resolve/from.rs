@@ -366,6 +366,13 @@ pub(crate) fn process_from_item(
                 }
                 for (i, alias_name) in col_aliases.iter().enumerate() {
                     if let Some(c) = scope_cols.get_mut(i) {
+                        // The alias list is a name the user wrote: it may
+                        // carry the `!` / `?` nullability annotation.
+                        if let Some(nullable) =
+                            super::type_resolution::annotation_nullability(alias_name)
+                        {
+                            c.base_not_null = !nullable;
+                        }
                         c.name = alias_name.clone();
                     }
                 }
@@ -619,6 +626,11 @@ fn process_range_function(
         );
     }
     for (c, alias_name) in cols.iter_mut().zip(col_aliases) {
+        // The alias list is a name the user wrote: it may carry the
+        // `!` / `?` nullability annotation.
+        if let Some(nullable) = super::type_resolution::annotation_nullability(&alias_name) {
+            c.base_not_null = !nullable;
+        }
         c.name = alias_name;
     }
 
@@ -1434,6 +1446,11 @@ fn apply_alias_column_names(
     }
     for (i, name) in colnames.into_iter().enumerate() {
         if let Some(c) = src.columns.get_mut(i) {
+            // The alias list is a name the user wrote: it may carry the
+            // `!` / `?` nullability annotation.
+            if let Some(nullable) = super::type_resolution::annotation_nullability(&name) {
+                c.base_not_null = !nullable;
+            }
             c.name = name;
         }
     }
