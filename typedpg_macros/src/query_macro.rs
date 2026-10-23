@@ -135,12 +135,17 @@ fn collect_migration_files(dirs: &[&Path]) -> Result<Vec<(String, String)>, syn:
                 // the path from the crate root when it is under it, as
                 // rustc's own paths are.
                 let filename = display_path(&path);
-                let content = std::fs::read_to_string(&path).map_err(|e| {
-                    syn::Error::new(
-                        Span::call_site(),
-                        format!("failed to read migration '{}': {e}", path.display()),
-                    )
-                })?;
+                // A file edited on Windows starts with a BOM, which the
+                // parser rejects as a syntax error.
+                let content = typedpg_core::migration_marker::strip_bom(
+                    &std::fs::read_to_string(&path).map_err(|e| {
+                        syn::Error::new(
+                            Span::call_site(),
+                            format!("failed to read migration '{}': {e}", path.display()),
+                        )
+                    })?,
+                )
+                .to_owned();
                 files.push((entry.file_name(), filename, content));
             }
         }

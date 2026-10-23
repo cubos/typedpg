@@ -341,6 +341,83 @@ async fn no_transaction_migration() {
     assert!(table_exists(&client, "idx_users_name").await);
 }
 
+/// The down SQL may ask for no transaction of its own: a `CREATE INDEX
+/// CONCURRENTLY` cannot run inside one.
+#[tokio::test]
+async fn a_down_migration_may_ask_for_no_transaction() {
+    let (mut client, _db) = fresh_db().await;
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "0001_create_users.sql",
+        "CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT NOT NULL);",
+    );
+    write(
+        dir.path(),
+        "0001_create_users.down.sql",
+        "-- no-transaction\nDROP INDEX CONCURRENTLY IF EXISTS idx_users_name;",
+    );
+    write(
+        dir.path(),
+        "0002_add_index.sql",
+        "CREATE INDEX idx_users_name ON users(name);",
+    );
+    write(
+        dir.path(),
+        "0002_add_index.down.sql",
+        "-- no-transaction\nDROP INDEX CONCURRENTLY idx_users_name;",
+    );
+    let source = MigrationSource::from_dir(dir.path()).unwrap();
+    let config = MigrationsConfig::default();
+    migrate::run(&mut client, &source, &config).await.unwrap();
+
+    // The down SQL runs outside a transaction: `DROP INDEX CONCURRENTLY`
+    // refuses to run inside one.
+    migrate::revert(&mut client, &source, "0002_add_index", false, &config)
+        .await
+        .unwrap();
+    assert!(!table_exists(&client, "idx_users_name").await);
+}
+
+/// The down SQL's own `-- no-transaction` marker decides how it runs: the
+/// up's marker speaks about the up's statements, and the down is the other
+/// way round.
+#[tokio::test]
+async fn the_down_marker_decides_how_the_down_runs() {
+    let (mut client, _db) = fresh_db().await;
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "0001_create_users.sql",
+        "CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT NOT NULL);",
+    );
+    write(
+        dir.path(),
+        "0001_create_users.down.sql",
+        "-- no-transaction\nDROP INDEX CONCURRENTLY IF EXISTS idx_users_name;",
+    );
+    write(
+        dir.path(),
+        "0002_add_index.sql",
+        "CREATE INDEX idx_users_name ON users(name);",
+    );
+    write(
+        dir.path(),
+        "0002_add_index.down.sql",
+        "-- no-transaction\nDROP INDEX CONCURRENTLY idx_users_name;",
+    );
+    let source = MigrationSource::from_dir(dir.path()).unwrap();
+    let config = MigrationsConfig::default();
+    migrate::run(&mut client, &source, &config).await.unwrap();
+
+    // The down SQL runs outside a transaction: `DROP INDEX CONCURRENTLY`
+    // refuses to run inside one.
+    migrate::revert(&mut client, &source, "0002_add_index", false, &config)
+        .await
+        .unwrap();
+    assert!(!table_exists(&client, "idx_users_name").await);
+}
+
 /// A `-- no-transaction` migration may hold several statements that refuse
 /// to run in a transaction block. Sent as one multi-statement query they
 /// would all run in PG's implicit transaction block and fail.

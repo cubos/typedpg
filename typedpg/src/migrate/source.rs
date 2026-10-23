@@ -38,7 +38,8 @@ pub struct Migration {
     /// SQL content of the down migration file, if `NNNN_description.down.sql` exists.
     pub down_sql: Option<String>,
     /// If `true`, this migration should run outside a transaction.
-    /// Set automatically when the first line of the SQL file is `-- no-transaction`.
+    /// Set automatically when the first line of the SQL file starts with
+    /// `-- no-transaction`.
     pub no_transaction: bool,
 }
 
@@ -134,11 +135,11 @@ impl MigrationSource {
 
             let (version, _description) = parse_migration_name(file_stem, &path)?;
 
-            let sql = std::fs::read_to_string(&path)?;
-            let no_transaction = sql
-                .lines()
-                .next()
-                .is_some_and(|line| line.trim() == "-- no-transaction");
+            // A file edited on Windows starts with a BOM, which PostgreSQL
+            // rejects as a syntax error.
+            let sql = typedpg_core::migration_marker::strip_bom(&std::fs::read_to_string(&path)?)
+                .to_owned();
+            let no_transaction = has_no_transaction_marker(&sql);
 
             let down_sql = down_files.remove(file_stem);
 
@@ -220,10 +221,7 @@ impl MigrationSource {
             // identical — pass the stem as the file path for nice errors.
             let synthetic_path = std::path::PathBuf::from(format!("{stem}.sql"));
             let (version, _description) = parse_migration_name(stem, &synthetic_path)?;
-            let no_transaction = up
-                .lines()
-                .next()
-                .is_some_and(|line| line.trim() == "-- no-transaction");
+            let no_transaction = has_no_transaction_marker(up);
             migrations.push(Migration {
                 version,
                 name: stem.to_owned(),
@@ -267,6 +265,15 @@ impl MigrationSource {
     pub fn find(&self, name: &str) -> Option<&Migration> {
         self.migrations.iter().find(|m| m.name == name)
     }
+}
+
+/// Whether the SQL's first line is the `-- no-transaction` marker: the
+/// migration runs outside a transaction.
+///
+/// The rule is shared with the analyzer that replays the migrations
+/// (`typedpg_core::migration_marker`).
+pub(crate) fn has_no_transaction_marker(sql: &str) -> bool {
+    typedpg_core::migration_marker::has_no_transaction_marker(sql)
 }
 
 /// Parses a migration file stem like "0001_create_users" into ("0001", "create_users").
@@ -521,6 +528,28 @@ mod tests {
 
         let source = MigrationSource::from_dir(dir.path()).unwrap();
         assert!(source.migrations()[0].no_transaction);
+    }
+
+    /// The marker is the marker: a file edited on Windows may start with a
+    /// BOM, and the marker may carry a note after it.
+    #[test]
+    fn detects_the_no_transaction_marker_through_a_bom_or_a_note() {
+        assert!(has_no_transaction_marker("-- no-transaction\nSELECT 1;"));
+        assert!(has_no_transaction_marker(
+            "\u{feff}-- no-transaction\nSELECT 1;"
+        ));
+        assert!(has_no_transaction_marker(
+            "-- no-transaction (for CONCURRENTLY)\nSELECT 1;"
+        ));
+        assert!(has_no_transaction_marker(
+            "  -- no-transaction  \nSELECT 1;"
+        ));
+        // Not the marker.
+        assert!(!has_no_transaction_marker("SELECT 1;"));
+        assert!(!has_no_transaction_marker(
+            "-- no-transactions are bad\nSELECT 1;"
+        ));
+        assert!(!has_no_transaction_marker("-- no transaction\nSELECT 1;"));
     }
 
     #[test]

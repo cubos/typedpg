@@ -16,6 +16,7 @@
 pub mod build;
 pub mod config;
 mod keywords;
+pub mod migration_marker;
 pub mod migrations;
 mod qualified_name;
 

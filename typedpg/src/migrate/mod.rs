@@ -23,7 +23,8 @@
 //! By default, each migration runs inside a transaction. You can disable
 //! transactions globally via [`MigrationsConfig::use_transaction`],
 //! or per-migration by adding `-- no-transaction` as the first line of the SQL file
-//! (useful for `CREATE INDEX CONCURRENTLY` and similar statements).
+//! (useful for `CREATE INDEX CONCURRENTLY` and similar statements). The down
+//! migration may carry the marker too: it decides how the down runs.
 //!
 //! Outside a transaction the statements of a migration run one at a time,
 //! each committing on its own: a failure leaves the statements before it

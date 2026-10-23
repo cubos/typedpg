@@ -2,6 +2,7 @@ use tokio_postgres::Client;
 
 use super::MigrationsConfig;
 use super::source::MigrationSource;
+use super::source::has_no_transaction_marker;
 use super::split::split_statements;
 
 /// Computes the MD5 hex digest of a migration's SQL content.
@@ -381,8 +382,8 @@ pub async fn status(
 /// [`Error::Migration`](crate::Error::Migration) -- unless `force` is `true`, in which
 /// case it removes the tracking record without executing any SQL.
 ///
-/// The down SQL runs in a transaction following the same rules as the up migration
-/// (`config.use_transaction` and the `-- no-transaction` marker).
+/// The down SQL runs in a transaction following `config.use_transaction` and
+/// its own `-- no-transaction` marker.
 ///
 /// Acquires an advisory lock for the duration of the operation.
 ///
@@ -461,7 +462,11 @@ async fn revert_inner(
 
     match &migration.down_sql {
         Some(down_sql) => {
-            let use_tx = config.use_transaction && !migration.no_transaction;
+            // The down SQL's own marker decides: the up's marker speaks
+            // about the up's statements, and the down is the other way
+            // round. A `CREATE INDEX CONCURRENTLY` cannot run inside a
+            // transaction.
+            let use_tx = config.use_transaction && !has_no_transaction_marker(down_sql);
 
             if use_tx {
                 let tx = client.transaction().await?;
