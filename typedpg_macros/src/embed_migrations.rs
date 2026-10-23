@@ -87,7 +87,7 @@ pub fn expand(input: EmbedInput) -> syn::Result<TokenStream> {
         let down_path = down_files.remove(&stem);
         entries.push((stem, up_path, down_path));
     }
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    entries.sort_by(|a, b| typedpg_core::migrations::compare_migration_names(&a.0, &b.0));
 
     // Generate the call to MigrationSource::from_embedded. Each up/down
     // path goes through include_str!, so cargo re-runs the macro when any

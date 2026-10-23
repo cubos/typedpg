@@ -656,7 +656,14 @@ fn collect_migrations(dirs: &[PathBuf], root: &Path) -> Result<Vec<(String, Stri
             }
         }
     }
-    files.sort_by(|a, b| a.0.cmp(&b.0));
+    // The migrations are applied in the order the runner applies them: by
+    // their numeric prefix, not by their name.
+    files.sort_by(|a, b| {
+        typedpg_core::migrations::compare_migration_names(
+            &a.0.to_string_lossy(),
+            &b.0.to_string_lossy(),
+        )
+    });
     Ok(files
         .into_iter()
         .map(|(_, name, sql)| (name, sql))
