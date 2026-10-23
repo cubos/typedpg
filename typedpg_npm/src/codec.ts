@@ -143,6 +143,11 @@ export function encode(codec: Codec, value: unknown): string | null {
   }
   switch (codec) {
     case "bool":
+      // A boolean, not a truthy value: `encode("bool", "false")` would
+      // store `t`, silently.
+      if (typeof value !== "boolean") {
+        throw new TypeError(`typedpg: a bool parameter must be a boolean, not ${typeof value}`);
+      }
       return value ? "t" : "f";
     case "json":
       return JSON.stringify(value);

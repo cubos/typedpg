@@ -51,6 +51,18 @@ test("records", () => {
 
 test("encode", () => {
   assert.equal(encode("bool", false), "f");
+  assert.equal(encode("bool", true), "t");
+  // A boolean, not a truthy value: `encode("bool", "false")` would store
+  // `t`, silently.
+  assert.throws(() => encode("bool", "false"), TypeError);
+  assert.throws(() => encode("bool", 0), TypeError);
+  assert.throws(() => encode("bool", {}), TypeError);
+  // NULL is the `Option<bool>` of Rust, not a boolean.
+  assert.equal(encode("bool", null), null);
+  assert.equal(encode("bool", undefined), null);
+  // The nested paths encoded it as `t` too.
+  assert.throws(() => encode(["array", "bool"], ["false"]), TypeError);
+  assert.throws(() => encode(["record", [["f", "bool"]]], { f: "false" }), TypeError);
   assert.equal(encode("bigint", 12n), "12");
   assert.equal(encode("json", { a: "x" }), '{"a":"x"}');
   assert.equal(encode("json", "x"), '"x"');

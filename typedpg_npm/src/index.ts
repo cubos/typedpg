@@ -248,7 +248,17 @@ class QueryImpl {
    */
   private build(params: Record<string, unknown> = {}): Built {
     const { spec } = this;
-    const values = spec.params.map(([name, codec]) => encode(codec, params[name]));
+    const values = spec.params.map(([name, codec]) => {
+      try {
+        return encode(codec, params[name]);
+      } catch (e) {
+        // The codec knows the value, not the parameter it belongs to.
+        if (e instanceof TypeError) {
+          throw new TypeError(`the parameter \`${name}\`: ${e.message}`);
+        }
+        throw e;
+      }
+    });
     let n = values.length;
     const placeholder = (codec: Codec, value: unknown, cast: string) => {
       values.push(encode(codec, value));
