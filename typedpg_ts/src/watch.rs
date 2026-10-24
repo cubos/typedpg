@@ -1,6 +1,6 @@
 //! `typedpg gen --watch`: keep the [`Project`] and update it as files
-//! change — a source is rescanned alone, a migration rebuilds its
-//! database's catalog, the config file reloads everything.
+//! change — a source or `.sql` file is read again alone, a migration
+//! rebuilds its database's catalog, the config file reloads everything.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -81,6 +81,7 @@ pub fn run(config_path: &Path) -> Result<(), String> {
             }
         } else {
             let mut rescanned = 0;
+            let mut sql_read = 0;
             let mut resolution_changed = false;
             let mut migrations = BTreeSet::new();
             for p in &paths {
@@ -91,6 +92,9 @@ pub fn run(config_path: &Path) -> Result<(), String> {
                     resolution_changed = true;
                 } else if project.is_generated(p) {
                     // Our own writes.
+                } else if project.is_sql_source(p) {
+                    project.rescan_sql(p);
+                    sql_read += 1;
                 } else if project.is_reexporter(p)
                     || (structural.contains(p) && project.is_source(p))
                 {
@@ -109,6 +113,12 @@ pub fn run(config_path: &Path) -> Result<(), String> {
                 what.push(format!(
                     "{rescanned} source{} rescanned",
                     if rescanned == 1 { "" } else { "s" }
+                ));
+            }
+            if sql_read > 0 {
+                what.push(format!(
+                    "{sql_read} .sql file{} read",
+                    if sql_read == 1 { "" } else { "s" }
                 ));
             }
             for &db in &migrations {
@@ -132,19 +142,28 @@ pub fn print_report(project: &Project, report: &SyncReport, start: Instant, what
     for d in &report.diagnostics {
         eprintln!("{}", d.render(root));
     }
-    let written: Vec<String> = report
-        .changed
-        .iter()
-        .map(|p| p.strip_prefix(root).unwrap_or(p).display().to_string())
-        .collect();
+    let shown = |paths: &[PathBuf]| -> Vec<String> {
+        paths
+            .iter()
+            .map(|p| p.strip_prefix(root).unwrap_or(p).display().to_string())
+            .collect()
+    };
+    let (written, removed) = (shown(&report.changed), shown(&report.removed));
+    let mut output = Vec::new();
+    if !written.is_empty() {
+        output.push(format!("wrote {}", written.join(", ")));
+    }
+    if !removed.is_empty() {
+        output.push(format!("deleted {}", removed.join(", ")));
+    }
     eprintln!(
         "[typedpg] {what}: {} quer{} analyzed, {}, {} error{} ({} ms)",
         report.analyzed,
         if report.analyzed == 1 { "y" } else { "ies" },
-        if written.is_empty() {
+        if output.is_empty() {
             "output unchanged".to_owned()
         } else {
-            format!("wrote {}", written.join(", "))
+            output.join(", ")
         },
         report.diagnostics.len(),
         if report.diagnostics.len() == 1 {

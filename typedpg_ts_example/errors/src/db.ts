@@ -15,7 +15,7 @@ export interface Queries {
     };
     value: number;
   };
-  "SELECT id FROM users WHERE id = $1": { error: "positional placeholder `$1` is not supported in sql(): name the parameter (e.g. `$id`) so it can be bound" };
+  "SELECT id FROM users WHERE id = $1": { error: "positional placeholder `$1` is not supported: name the parameter (e.g. `$id`) so it can be bound" };
   "SELECT id FROM users WHERE id = $id": {
     params: {
       id: number;

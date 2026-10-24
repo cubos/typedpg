@@ -5,6 +5,12 @@
 //
 //   import { sql } from "./db";
 //   const user = await sql("SELECT name FROM users WHERE id = $id").fetchOne(pool, { id });
+//
+// The module of a `.sql` file (generated beside it, or compiled by a loader)
+// exports a `createQuery` per query instead:
+//
+//   import { userById } from "./queries.ts";
+//   const user = await userById.fetchOne(pool, { id });
 
 import { type Codec, decode, encode, setOwn } from "./codec.js";
 import { type Executor, type RawResult, driverFor, unsupported } from "./adapters.js";
@@ -77,7 +83,37 @@ export interface ValueQuery<T extends QueryTypes> extends Query<T> {
   fetchValueOptional(executor: Executor, ...args: Args<T>): Promise<T["value"] | null>;
 }
 
-type QueryOf<T> = T extends QueryTypes ? ("value" extends keyof T ? ValueQuery<T> : Query<T>) : never;
+/**
+ * The query of types `T`. `Checks` holds what the module checks where the
+ * query is (each type `types` maps a PostgreSQL type to fits what it is read
+ * as); it is not part of the type.
+ */
+export type QueryOf<T, Checks extends readonly unknown[] = []> = Checks extends readonly unknown[]
+  ? T extends QueryTypes
+    ? "value" extends keyof T
+      ? ValueQuery<T>
+      : Query<T>
+    : never
+  : never;
+
+/** Each method of a {@link BrokenQuery}: it takes the error, which no argument is. */
+type Broken<E extends string> = (error: `typedpg: ${E}`, ...rest: unknown[]) => never;
+
+/**
+ * A query of a `.sql` file with an error: using it fails to type-check, the
+ * error as the type its first argument is not assignable to — and throws.
+ */
+export interface BrokenQuery<E extends string> {
+  readonly text: string;
+  readonly "~types"?: { params: any; row: any; value: any };
+  fetchAll: Broken<E>;
+  fetchOne: Broken<E>;
+  fetchOptional: Broken<E>;
+  fetchStream: Broken<E>;
+  execute: Broken<E>;
+  fetchValue: Broken<E>;
+  fetchValueOptional: Broken<E>;
+}
 
 /**
  * The text itself when the generated module has it without an error;
@@ -233,13 +269,50 @@ export function createSql<Q>(specs: Record<string, string>): Sql<Q> {
   return ((text: string) => new QueryImpl(text, spec(text))) as unknown as Sql<Q>;
 }
 
+/**
+ * Called by the module of a `.sql` file, with the query's text and its
+ * {@link QuerySpec} as JSON — parsed the first time the query runs.
+ */
+export function createQuery<T extends QueryTypes, Checks extends readonly unknown[] = []>(
+  text: string,
+  spec: string,
+): QueryOf<T, Checks> {
+  return new QueryImpl(text, spec) as unknown as QueryOf<T, Checks>;
+}
+
+/** Called by the module of a `.sql` file for a query with an error. */
+export function createBrokenQuery<E extends string>(text: string, error: E): BrokenQuery<E> {
+  const fail = (): never => {
+    throw new TypedpgError(`this query has an error, run \`typedpg gen\`: ${error}\n  ${text}`);
+  };
+  return {
+    text,
+    fetchAll: fail,
+    fetchOne: fail,
+    fetchOptional: fail,
+    fetchStream: fail,
+    execute: fail,
+    fetchValue: fail,
+    fetchValueOptional: fail,
+  };
+}
+
 type Built = { text: string; values: (string | null)[] };
 
 class QueryImpl {
+  private parsed: QuerySpec | string;
+
   constructor(
     readonly text: string,
-    private readonly spec: QuerySpec,
-  ) {}
+    spec: QuerySpec | string,
+  ) {
+    this.parsed = spec;
+  }
+
+  private get spec(): QuerySpec {
+    if (typeof this.parsed === "string") this.parsed = JSON.parse(this.parsed) as QuerySpec;
+    return this.parsed;
+  }
 
   /**
    * The SQL and its values. Spreads are written in order, their values

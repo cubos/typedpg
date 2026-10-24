@@ -6,9 +6,24 @@ src/bad.ts:12:25: error: column "nmae" does not exist
   ╰────
   help: Perhaps you meant to reference the column "users.name".
 src/bad.ts:24:13: error: the query passed to sql() must be a string literal, for typedpg to analyze it
-src/bad.ts:26:13: error: positional placeholder `$1` is not supported in sql(): name the parameter (e.g. `$id`) so it can be bound
+src/bad.ts:26:13: error: positional placeholder `$1` is not supported: name the parameter (e.g. `$id`) so it can be bound
 src/bad.ts:30:13: error: anonymous record-typed query parameters are not supported — pass the fields individually using a ROW(...) constructor in SQL
 src/bad.ts:32:13: error: duplicate column name "id" in the query's output: a row object has one property per name, so give the columns distinct names (`AS ...`)
 src/bad.ts:34:13: error: duplicate parameter name "ids": a parameter and a spread can't share one name
 src/bad.ts:42:16: error: column "nope" of relation "users" does not exist
 src/bad.ts:46:9: error: sql is called as a function, not as a template tag: sql(`...`)
+src/broken.sql:3:1: error: SQL outside a query: each query starts with a `/* @name queryName */` comment
+src/broken.sql:6:12: error: column "nmae" does not exist
+  ╭────
+1 │ SELECT id, nmae FROM users
+  ·            ──┬─
+  ·              ╰─ column does not exist
+  ╰────
+  help: Perhaps you meant to reference the column "users.name".
+src/broken.sql:8:4: error: `@name` needs a name: `/* @name userById */`
+src/broken.sql:11:24: error: `@param` is not read by typedpg: a `/* @name */` comment holds the name only (parameters are `$name` and `$..name` in the SQL)
+src/broken.sql:14:10: error: a query named `typo` is already in this file
+src/broken.sql:18:11: error: a second statement after query `twoStatements`: each query is one statement, after its own `/* @name */` comment
+src/broken.sql:20:10: error: `default` is a reserved word in JavaScript: name the query otherwise
+src/broken.sql:24:1: error: positional placeholder `$1` is not supported: name the parameter (e.g. `$id`) so it can be bound
+src/broken.sql:26:10: error: query `empty` has no statement after its `/* @name */`
