@@ -10,7 +10,8 @@
 //! `typedpg.Interval` / `typedpg.JsonValue`: the generated module imports
 //! them as a namespace, so a type the user maps to can't collide with them.
 
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{BTreeSet, HashMap};
 
 use typedpg_analyzer::{RecordField, Refinement, Type};
 use typedpg_core::QualifiedName;
@@ -142,6 +143,8 @@ pub struct TypeMapper<'a> {
     /// PG type → the TS type name the generated module imports for it.
     pub overrides: &'a HashMap<QualifiedName, String>,
     pub int8: Int8,
+    /// The overrides' TS names mapped since this was last taken.
+    pub used: RefCell<BTreeSet<String>>,
 }
 
 impl TypeMapper<'_> {
@@ -347,9 +350,9 @@ impl TypeMapper<'_> {
     }
 
     fn override_for(&self, schema: &str, name: &str) -> Option<String> {
-        self.overrides
-            .get(&QualifiedName::new(schema, name))
-            .cloned()
+        let ts = self.overrides.get(&QualifiedName::new(schema, name))?;
+        self.used.borrow_mut().insert(ts.clone());
+        Some(ts.clone())
     }
 
     fn basic(&self, schema: &str, name: &str, extension: Option<&str>) -> TsType {
@@ -506,6 +509,7 @@ mod tests {
         f(&TypeMapper {
             overrides: &overrides,
             int8,
+            used: Default::default(),
         })
     }
 
@@ -725,6 +729,7 @@ mod tests {
         let m = TypeMapper {
             overrides: &o,
             int8: Int8::Bigint,
+            used: Default::default(),
         };
         let ty = Type::Domain {
             schema: "public".into(),

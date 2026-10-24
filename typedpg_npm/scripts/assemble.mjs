@@ -6,7 +6,7 @@
 //   node scripts/assemble.mjs <binaries-dir> <out-dir>
 //
 // <binaries-dir> holds `<target>/typedpg` (`typedpg.exe` on Windows), the
-// targets named as bin/typedpg.js's target() does: linux-x64-gnu,
+// targets named as src/binary.ts's target() does: linux-x64-gnu,
 // linux-arm64-musl, darwin-arm64, win32-x64-msvc, … Each <out-dir>/<name>
 // is then ready for `npm publish`.
 

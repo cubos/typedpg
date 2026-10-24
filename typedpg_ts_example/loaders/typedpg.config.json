@@ -1,0 +1,5 @@
+{
+  "sql": { "include": ["src/*.sql"], "emit": "dts" },
+  "migrations": "../migrations",
+  "types": { "user_prefs": "../src/domains.ts#UserPrefs" }
+}

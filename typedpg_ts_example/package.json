@@ -17,7 +17,10 @@
   "devDependencies": {
     "@types/node": "^24.0.0",
     "@types/pg": "^8.15.0",
+    "esbuild": "^0.28.2",
+    "rollup": "^4.65.0",
     "typescript": "^7.0.0",
-    "typescript-5": "npm:typescript@5.9"
+    "typescript-5": "npm:typescript@5.9",
+    "typescript-7.1": "npm:typescript@^7.1.0-beta"
   }
 }
