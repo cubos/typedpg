@@ -703,16 +703,16 @@ pub(crate) fn unmatched_projection_error(
 /// (`ParseFuncOrColumn` → `ParseComplexProjection`): `x(t)` with an
 /// unqualified name, no decoration and a composite / record argument is
 /// `(t).x` when the argument's row type has a field `x` — tried before any
-/// function lookup. `Ok(None)` when the call doesn't qualify or no such
-/// field exists (the caller goes on to function resolution).
+/// function lookup. When the call doesn't qualify or no such field exists,
+/// the caller goes on to function resolution.
 pub(crate) fn try_column_projection(
     func: &protobuf::FuncCall,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
-) -> Result<Option<ExprType>, AnalyzeError> {
+) -> Result<ColumnProjection, AnalyzeError> {
     let snapshot = ctx.snapshot;
     let Some((arg, name)) = projection_candidate(func) else {
-        return Ok(None);
+        return Ok(ColumnProjection::Not(None));
     };
     let t = infer_expr(arg, ctx, params, TypeGoal::NONE)?;
     let base = snapshot.unwrap_domain(t.type_oid);
@@ -721,7 +721,7 @@ pub(crate) fn try_column_projection(
             .get_type(base)
             .is_some_and(|e| e.typtype == TypType::Composite);
     if !complex {
-        return Ok(None);
+        return Ok(ColumnProjection::Not(Some(t)));
     }
     let has_field = match &t.record_fields {
         // A hidden shape has no field PG could find.
@@ -739,9 +739,19 @@ pub(crate) fn try_column_projection(
             }),
     };
     if !has_field {
-        return Ok(None);
+        return Ok(ColumnProjection::Not(Some(t)));
     }
-    resolve_composite_field(&t, &name.sval, snapshot, None).map(Some)
+    resolve_composite_field(&t, &name.sval, snapshot, None).map(ColumnProjection::Field)
+}
+
+/// What [`try_column_projection`] found a one-argument call to be.
+pub(crate) enum ColumnProjection {
+    /// The projection `(t).x`: the field.
+    Field(ExprType),
+    /// A call: the type its argument was inferred to, if it was — the call
+    /// takes it as is, as inferring the argument again would, at each level
+    /// of nested calls, double the work (2^depth).
+    Not(Option<ExprType>),
 }
 
 /// The leading run of consecutive `[…]` steps of an indirection list.
