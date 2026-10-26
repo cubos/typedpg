@@ -3,13 +3,21 @@ name: npm
 # Builds the `typedpg` binary for each platform and assembles the npm
 # packages: `@cubos/typedpg` (the runtime, with an optional dependency on each
 # platform's binary) and `@cubos/typedpg-cli-<target>`. The release tag
-# (`v0.5.0`, the version of the crates and of the packages) publishes them; a
-# manual run only packs them (`npm publish --dry-run`).
+# (`v0.5.0`, the version of the crates and of the packages) stages them for
+# publishing (`npm stage publish`): each goes live once a maintainer approves
+# it with 2FA on npmjs.com (Staged Packages) or with `npm stage approve`. A
+# manual run only packs them (`npm publish --dry-run`), or stages them too
+# with `stage` set.
 
 on:
   push:
     tags: ["v[0-9]*"]
   workflow_dispatch:
+    inputs:
+      stage:
+        description: Stage the packages for publishing, as a release tag does
+        type: boolean
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -102,12 +110,18 @@ jobs:
           npm ci
           npm test
           node scripts/assemble.mjs ../bins ../npm-dist
-      # The platform packages first: `@cubos/typedpg` depends on them.
+      # Staged publishing needs npm 11.15 (Node 24 may bundle an older one).
+      - run: npm install --global npm@^11.15.0 && npm --version
+      # The platform packages first: `@cubos/typedpg` depends on them (and
+      # are worth approving first, for the same reason).
       - shell: bash
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          STAGE: ${{ inputs.stage }}
         run: |
-          publish="npm publish --access public --provenance"
-          [[ "$GITHUB_REF" == refs/tags/v* ]] || publish="npm publish --dry-run"
+          publish="npm publish --dry-run"
+          if [[ "$GITHUB_REF" == refs/tags/v* || "$STAGE" == true ]]; then
+            publish="npm stage publish --access public --provenance"
+          fi
           for dir in npm-dist/cli-*; do (cd "$dir" && $publish); done
           (cd npm-dist/typedpg && $publish)
