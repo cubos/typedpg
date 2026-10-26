@@ -36,6 +36,8 @@ mod core_soundness;
 mod cte_rules;
 #[path = "query/ctes.rs"]
 mod ctes;
+#[path = "query/deep_queries.rs"]
+mod deep_queries;
 #[path = "query/dml.rs"]
 mod dml;
 #[path = "query/dml_clause_kinds.rs"]

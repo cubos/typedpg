@@ -37,7 +37,11 @@ include = [
 ]
 
 [dependencies]
-prost = "0.14"
+# libpg_query bounds a tree's depth itself (10,000 levels): prost's own limit
+# (100) cut ordinary queries short (47 terms of `1 + 1 + …`). The stack for
+# deeper ones is src/stack.rs's.
+prost = { version = "0.14", features = ["no-recursion-limit"] }
+stacker = "0.1"
 serde_json = "1"
 thiserror = "2"
 

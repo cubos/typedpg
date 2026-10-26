@@ -858,6 +858,15 @@ pub(crate) fn infer_expr(
     params: &mut ParamCollector,
     goal: TypeGoal,
 ) -> Result<ExprType, AnalyzeError> {
+    crate::stack::step(|| infer_expr_here(node, ctx, params, goal))
+}
+
+fn infer_expr_here(
+    node: &protobuf::Node,
+    ctx: Ctx<'_>,
+    params: &mut ParamCollector,
+    goal: TypeGoal,
+) -> Result<ExprType, AnalyzeError> {
     // An error raised with no location points at the innermost expression
     // being inferred when it was.
     let mut t = infer_expr_unlocated(node, ctx, params, goal)
@@ -1507,13 +1516,26 @@ pub(crate) fn coerce_unknown_to(
 /// An entry that fails to resolve there fails in PG before any later
 /// clause is looked at: its error is returned, so a query wrong in both
 /// its select list and its WHERE reports the select list's, as PG does.
+/// But past the last bare `$N`, an entry holding a subquery is left to the
+/// final pass: replaying it would analyze the subquery here and again
+/// there — at each level of nested sublinks, so 2^depth times — for an
+/// error the final pass reports anyway (only which of several errors comes
+/// first may then differ from PG).
 pub(crate) fn note_untyped_output_params(
     target_list: &[protobuf::Node],
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<(), AnalyzeError> {
+    let bare_param = |target: &protobuf::Node| {
+        matches!(
+            target.node.as_ref(),
+            Some(node::Node::ResTarget(rt))
+                if matches!(rt.val.as_deref().and_then(|v| v.node.as_ref()), Some(node::Node::ParamRef(_)))
+        )
+    };
+    let last_bare_param = target_list.iter().rposition(bare_param);
     let mut scratch = params.clone();
-    for target in target_list {
+    for (i, target) in target_list.iter().enumerate() {
         let Some(node::Node::ResTarget(rt)) = target.node.as_ref() else {
             continue;
         };
@@ -1539,9 +1561,23 @@ pub(crate) fn note_untyped_output_params(
             Some(node::Node::AIndirection(i)) if star(&i.indirection) => continue,
             _ => {}
         }
+        if last_bare_param.is_none_or(|last| i > last) && has_sublink(val) {
+            continue;
+        }
         infer_expr(val, ctx, &mut scratch, TypeGoal::NONE)?;
     }
     Ok(())
+}
+
+/// Whether `expr` is or holds a subquery.
+fn has_sublink(expr: &protobuf::Node) -> bool {
+    expr.node.as_ref().is_some_and(|inner| {
+        matches!(inner, node::Node::SubLink(_))
+            || inner
+                .nodes()
+                .into_iter()
+                .any(|(n, ..)| matches!(n, typedpg_pg_query::NodeRef::SubLink(_)))
+    })
 }
 
 /// PG's `resolveTargetListUnknowns` for the bare-parameter output columns

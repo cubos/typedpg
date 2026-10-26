@@ -135,6 +135,28 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
     correlated_sources: &[crate::scope::TableSource],
     shadowed_sources: &[crate::scope::TableSource],
 ) -> AnalyzeResult {
+    crate::stack::step(|| {
+        analyze_select_here(
+            sel,
+            snapshot,
+            params,
+            outer_ctes,
+            lateral_sources,
+            correlated_sources,
+            shadowed_sources,
+        )
+    })
+}
+
+fn analyze_select_here(
+    sel: &protobuf::SelectStmt,
+    snapshot: &PgCatalog,
+    params: &mut ParamCollector,
+    outer_ctes: &HashMap<String, Vec<ScopeColumn>>,
+    lateral_sources: &[crate::scope::TableSource],
+    correlated_sources: &[crate::scope::TableSource],
+    shadowed_sources: &[crate::scope::TableSource],
+) -> AnalyzeResult {
     let _level = QueryLevel::enter();
     // Start with outer CTEs (from parent WITH clause).
     let mut cte_scopes: HashMap<String, Vec<ScopeColumn>> = outer_ctes.clone();

@@ -14,6 +14,31 @@ struct Patch {
 
 const PATCHES: &[Patch] = &[
     Patch {
+        file: "src/pg_query.c",
+        why: "libpg_query sizes its stack budget (max_stack_depth) from the thread's stack bounds; typedpg runs it on stack segments it grows (stacker, src/stack.rs), where those bounds are another stack's: the budget would be wrong, or the 100 kB default. It asks the Rust side how much stack is left instead.",
+        find: r#"	char		stack_here;
+	char*		lowest_stackaddr = get_lowest_stackaddr();
+	ssize_t		usable_stack_depth;
+	ssize_t		new_limit;
+
+	if (lowest_stackaddr == NULL)
+		return;
+
+	usable_stack_depth = (ssize_t) (&stack_here - lowest_stackaddr);
+	if (usable_stack_depth < 0)
+		return;
+"#,
+        replace: r#"	extern size_t typedpg_remaining_stack(void);
+	ssize_t		usable_stack_depth;
+	ssize_t		new_limit;
+
+	/* typedpg: the stack left, as the Rust caller measures it (stack.rs). */
+	usable_stack_depth = (ssize_t) typedpg_remaining_stack();
+	if (usable_stack_depth <= 0)
+		return;
+"#,
+    },
+    Patch {
         file: "src/postgres/include/pg_config.h",
         why: "pg_config.h declared strlcpy available on every non-Windows target, so PostgreSQL's fallback (src_port_strlcpy.c) was never compiled; glibc only has strlcpy since 2.38, and on an older one (Debian bookworm's 2.36) the symbol stayed undefined, so the sql! proc macro failed to load (`can't find crate for typedpg_macros`). Same version test as libpg_query's own strchrnul block above it.",
         find: r#"#else

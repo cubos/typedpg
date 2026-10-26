@@ -791,7 +791,17 @@ pub(crate) fn grammar_error(message: String, span: Option<SourceSpan>) -> RawErr
         "precision for type float must be less than 54 bits",
         "unrecognized JSON encoding: ",
     ];
-    let kind = if WINDOWING.iter().any(|m| message.starts_with(m)) {
+    // A query nested too deep: libpg_query either runs out of the stack
+    // budget it sizes like PG (`check_stack_depth`), or reaches its own
+    // 10,000 levels serializing the tree — deeper than PG with its default
+    // `max_stack_depth` takes anyway (`1 + 1 + …` stops there at 4,995
+    // terms): `stack depth limit exceeded`, SQLSTATE 54001, either way.
+    const STACK_DEPTH: &str = "stack depth limit exceeded";
+    let kind = if message.starts_with(STACK_DEPTH)
+        || message == "parse tree is nested too deeply to serialize to protobuf"
+    {
+        AnalyzeError::StatementTooComplex(STACK_DEPTH.to_owned())
+    } else if WINDOWING.iter().any(|m| message.starts_with(m)) {
         AnalyzeError::WindowingError(message)
     } else if FEATURE_NOT_SUPPORTED.iter().any(|m| message.starts_with(m)) {
         AnalyzeError::FeatureNotSupported(message)

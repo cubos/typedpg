@@ -58,12 +58,13 @@ pub(crate) fn infer_func_call(
     }
 
     // `x(t)` may be the column projection `(t).x` (tried before lookup).
-    if let Some(field) = try_column_projection(func, ctx, params)? {
-        return Ok(field);
-    }
+    let first_arg = match try_column_projection(func, ctx, params)? {
+        ColumnProjection::Field(field) => return Ok(field),
+        ColumnProjection::Not(first_arg) => first_arg,
+    };
 
     // Pass 1: infer argument types bottom-up.
-    let args = collect_arg_types(func, ctx, params)?;
+    let args = collect_arg_types(func, ctx, params, first_arg)?;
     let notation = functions::CallNotation::of(func)?;
 
     // Resolve the call (PG's func_get_detail). A single-argument call named
@@ -713,17 +714,22 @@ fn validate_within_group(func: &protobuf::FuncCall) -> Result<(), AnalyzeError> 
 /// aggregates) append the `WITHIN GROUP (ORDER BY …)` expression types so
 /// overload resolution sees the full signature — PG records both direct args
 /// and ordered args in `pg_proc.proargtypes`.
+/// `first`: the first argument's type, when already inferred.
 fn collect_arg_types(
     func: &protobuf::FuncCall,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
+    mut first: Option<ExprType>,
 ) -> Result<FuncArgs, AnalyzeError> {
     let mut types = Vec::with_capacity(func.args.len());
     let mut nullable = Vec::with_capacity(func.args.len());
     let mut any_nullable = false;
     let mut exprs = Vec::with_capacity(func.args.len());
     for arg in &func.args {
-        let t = infer_expr(arg, ctx, params, TypeGoal::NONE)?;
+        let t = match first.take() {
+            Some(t) => t,
+            None => infer_expr(arg, ctx, params, TypeGoal::NONE)?,
+        };
         any_nullable = any_nullable || t.nullable;
         nullable.push(t.nullable);
         types.push(t.type_oid);

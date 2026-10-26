@@ -143,6 +143,10 @@ impl std::error::Error for DdlError {
 /// On failure, also returns where in `sql` the error is (see
 /// [`MigrationFailure`]).
 pub(crate) fn apply_migration(db: &mut PgCatalog, sql: &str) -> Result<(), MigrationFailure> {
+    crate::stack::with_stack(|| apply_migration_here(db, sql))
+}
+
+fn apply_migration_here(db: &mut PgCatalog, sql: &str) -> Result<(), MigrationFailure> {
     // Errors the analyzer raises while the statements are applied keep their
     // plain messages (that is what `DdlError` reports), but their spans —
     // AST locations, offsets into `sql` — and hints are captured to locate
