@@ -881,11 +881,11 @@ plpgsql_parse_cwordrowtype(List *idents)
     },
     Patch {
         file: "src/pg_query_parse_plpgsql.c",
-        why: "A CREATE FUNCTION with no string body (none at all, or a BEGIN ATOMIC / RETURN body) failed a C assert and aborted the process; raise interpret_AS_clause's errors (functioncmds.c) instead. Without LANGUAGE, an inline body is SQL, not PL/pgSQL.",
-        find: r#"	assert(proc_source != NULL);
-
-	if (strcmp(language, "plpgsql") != 0)
+        why: "Without LANGUAGE, an inline body (BEGIN ATOMIC / RETURN) is SQL, as CreateFunction (functioncmds.c) defaults it, but libpg_query took it for PL/pgSQL and raised \"inline SQL function body only valid for language SQL\".",
+        find: r#"	if (strcmp(language, "plpgsql") != 0)
 		return (PLpgSQL_function *) palloc0(sizeof(PLpgSQL_function));
+
+	/* Mirrors the checks in upstream interpret_AS_clause */
 "#,
         replace: r#"	{
 		bool		language_given = false;
@@ -903,19 +903,7 @@ plpgsql_parse_cwordrowtype(List *idents)
 	if (strcmp(language, "plpgsql") != 0)
 		return (PLpgSQL_function *) palloc0(sizeof(PLpgSQL_function));
 
-	/* interpret_AS_clause (functioncmds.c) */
-	if (stmt->sql_body == NULL && proc_source == NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
-				 errmsg("no function body specified")));
-	if (stmt->sql_body != NULL && proc_source != NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
-				 errmsg("duplicate function body specified")));
-	if (stmt->sql_body != NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
-				 errmsg("inline SQL function body only valid for language SQL")));
+	/* Mirrors the checks in upstream interpret_AS_clause */
 "#,
     },
 ];

@@ -3841,6 +3841,7 @@ dependencies = [
  "serde_json",
  "testcontainers",
  "typedpg_analyzer",
+ "typedpg_pg_query",
 ]
 
 [[package]]

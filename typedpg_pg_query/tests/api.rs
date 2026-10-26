@@ -17,6 +17,33 @@ fn parses_with_postgres_18_grammar() {
 }
 
 #[test]
+fn comments_between_tokens_are_ignored() {
+    // libpg_query 18.0 failed on a comment between tokens the grammar
+    // looks at together (`NOT IN`, string constants concatenated).
+    for sql in [
+        "SELECT 1 WHERE 1 NOT /* not */ IN (2)",
+        "SELECT 'a' -- the first half\n 'b'",
+    ] {
+        typedpg_pg_query::parse(sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+    }
+}
+
+#[test]
+fn a_too_deep_query_is_an_error_not_a_crash() {
+    // libpg_query 18.0 overflowed the stack (and aborted the process: the
+    // compiler, under the sql! macro).
+    // Not parentheses: the grammar's own stack limit ("memory exhausted")
+    // stops those first. A UNION chain parses flat but nests deep.
+    let sql = format!("SELECT 1{}", " UNION SELECT 1".repeat(100_000));
+    let err = typedpg_pg_query::parse(&sql).unwrap_err();
+    assert!(
+        matches!(&err, typedpg_pg_query::Error::Parse { message, .. }
+            if message.starts_with("stack depth limit exceeded")),
+        "{err:?}"
+    );
+}
+
+#[test]
 fn parse_errors_carry_the_server_message() {
     let err = typedpg_pg_query::parse("SELECT FROM WHERE").unwrap_err();
     assert_eq!(

@@ -87,9 +87,11 @@ fn main() {
     build
         .files(glob(&lib.join("src")).into_iter().map(source))
         .files(glob(&lib.join("src/postgres")).into_iter().map(source))
-        .file(lib.join("vendor/protobuf-c/protobuf-c.c"))
         .file(lib.join("vendor/xxhash/xxhash.c"))
-        .file(lib.join("protobuf/pg_query.pb-c.c"))
+        // Protobuf, through upb (libpg_query's Makefile: UPB_SRC_FILES).
+        .file(lib.join("vendor/upb/upb.c"))
+        .file(lib.join("vendor/upb/third_party/utf8_range/utf8_range.c"))
+        .file(lib.join("protobuf/pg_query.upb_minitable.c"))
         // The catalog hooks (patched lookups call into them).
         .file("csrc/catalog.c")
         .include("csrc")
@@ -98,10 +100,17 @@ fn main() {
         .include(lib.join("src"))
         .include(lib.join("src/postgres"))
         .include(lib.join("vendor"))
+        .include(lib.join("vendor/upb"))
+        .include(lib.join("vendor/upb/third_party/utf8_range"))
         .include(&includes)
         .include(lib.join("src/include"))
         // libpg_query's own warnings are its maintainers' concern.
         .warnings(false);
+    // What PostgreSQL's C is written for (libpg_query's Makefile, and
+    // PostgreSQL's configure): signed overflow wraps, and pointers of
+    // different types may alias. MSVC does neither optimization.
+    build.flag_if_supported("-fwrapv");
+    build.flag_if_supported("-fno-strict-aliasing");
     let target = std::env::var("TARGET").unwrap_or_default();
     if target.contains("windows") {
         build.include(includes.join("port/win32"));
