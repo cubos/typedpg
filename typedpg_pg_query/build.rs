@@ -106,6 +106,11 @@ fn main() {
         .include(lib.join("src/include"))
         // libpg_query's own warnings are its maintainers' concern.
         .warnings(false);
+    // What PostgreSQL's C is written for (libpg_query's Makefile, and
+    // PostgreSQL's configure): signed overflow wraps, and pointers of
+    // different types may alias. MSVC does neither optimization.
+    build.flag_if_supported("-fwrapv");
+    build.flag_if_supported("-fno-strict-aliasing");
     let target = std::env::var("TARGET").unwrap_or_default();
     if target.contains("windows") {
         build.include(includes.join("port/win32"));
