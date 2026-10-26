@@ -69,6 +69,7 @@ mod resolve;
 mod scope;
 mod seed;
 mod sql_text;
+mod stack;
 mod suggest;
 mod tsearch_input;
 mod types;

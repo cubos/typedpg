@@ -70,6 +70,10 @@ impl PgCatalog {
     /// Check `target` — `table` or `table (column, ...)`, as written after
     /// `COPY` — as the target of a `COPY ... FROM STDIN`.
     pub fn analyze_copy_in(&self, target: &str) -> Result<AnalyzedCopyIn, AnalyzeError> {
+        crate::stack::with_stack(|| self.analyze_copy_in_here(target))
+    }
+
+    fn analyze_copy_in_here(&self, target: &str) -> Result<AnalyzedCopyIn, AnalyzeError> {
         let invalid = |msg: String| AnalyzeError::Invalid(msg);
         const PREFIX: &str = "COPY ";
         let sql = format!("{PREFIX}{target} FROM STDIN");

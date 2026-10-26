@@ -20,6 +20,7 @@ mod ffi;
 mod node;
 #[allow(clippy::all, missing_docs)]
 pub mod protobuf;
+mod stack;
 
 use std::collections::VecDeque;
 use std::ffi::{CStr, CString};
@@ -143,6 +144,10 @@ pub fn parse_type_name(text: &str) -> Result<ParseResult> {
 }
 
 fn parse_with_options(sql: &str, options: std::ffi::c_int) -> Result<ParseResult> {
+    stack::with_stack(|| parse_with_options_here(sql, options))
+}
+
+fn parse_with_options_here(sql: &str, options: std::ffi::c_int) -> Result<ParseResult> {
     let input = CString::new(sql)?;
     let result = unsafe { ffi::pg_query_parse_protobuf_opts(input.as_ptr(), options) };
     let parsed = if result.error.is_null() {
@@ -168,6 +173,10 @@ fn parse_with_options(sql: &str, options: std::ffi::c_int) -> Result<ParseResult
 
 /// Split `sql` into PostgreSQL's lexical tokens.
 pub fn scan(sql: &str) -> Result<protobuf::ScanResult> {
+    stack::with_stack(|| scan_here(sql))
+}
+
+fn scan_here(sql: &str) -> Result<protobuf::ScanResult> {
     let input = CString::new(sql)?;
     let result = unsafe { ffi::pg_query_scan(input.as_ptr()) };
     let scanned = if result.error.is_null() {
@@ -183,6 +192,10 @@ pub fn scan(sql: &str) -> Result<protobuf::ScanResult> {
 
 /// Turn a parse tree back into SQL.
 pub fn deparse(tree: &protobuf::ParseResult) -> Result<String> {
+    stack::with_stack(|| deparse_here(tree))
+}
+
+fn deparse_here(tree: &protobuf::ParseResult) -> Result<String> {
     let buffer = tree.encode_to_vec();
     let input = ffi::PgQueryProtobuf {
         len: buffer.len(),
@@ -207,6 +220,10 @@ pub fn deparse(tree: &protobuf::ParseResult) -> Result<String> {
 /// any other type name is assumed to be a row type (see
 /// [`parse_plpgsql_with_catalog`]).
 pub fn parse_plpgsql(sql: &str) -> Result<serde_json::Value> {
+    stack::with_stack(|| parse_plpgsql_here(sql))
+}
+
+fn parse_plpgsql_here(sql: &str) -> Result<serde_json::Value> {
     let input = CString::new(sql)?;
     let result = unsafe { ffi::pg_query_parse_plpgsql(input.as_ptr()) };
     let parsed = if result.error.is_null() {

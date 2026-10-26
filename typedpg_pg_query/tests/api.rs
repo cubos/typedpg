@@ -44,6 +44,20 @@ fn a_too_deep_query_is_an_error_not_a_crash() {
 }
 
 #[test]
+fn the_deepest_query_parses_on_a_small_stack() {
+    // 4,995 terms: libpg_query's 10,000 levels. Parsing and decoding it
+    // takes about 10 MB of stack, grown as needed (src/stack.rs).
+    let sql = format!("SELECT 1{}", " + 1".repeat(4995));
+    let parsed = std::thread::Builder::new()
+        .stack_size(256 << 10)
+        .spawn(move || typedpg_pg_query::parse(&sql).map(|p| p.protobuf.stmts.len()))
+        .unwrap()
+        .join()
+        .unwrap();
+    assert_eq!(parsed.unwrap(), 1);
+}
+
+#[test]
 fn parse_errors_carry_the_server_message() {
     let err = typedpg_pg_query::parse("SELECT FROM WHERE").unwrap_err();
     assert_eq!(

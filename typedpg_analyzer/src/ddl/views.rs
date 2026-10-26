@@ -886,6 +886,15 @@ pub(crate) fn serialize_subnode(
     sql: &str,
     pick: impl Fn(&protobuf::Node) -> Option<&protobuf::Node>,
 ) -> Result<crate::pg_catalog::SerializedAst, super::DdlError> {
+    crate::stack::with_stack(|| serialize_subnode_here(snapshot, sql, pick))
+}
+
+#[cfg(any(test, feature = "internal"))]
+fn serialize_subnode_here(
+    snapshot: &PgCatalog,
+    sql: &str,
+    pick: impl Fn(&protobuf::Node) -> Option<&protobuf::Node>,
+) -> Result<crate::pg_catalog::SerializedAst, super::DdlError> {
     let parsed = typedpg_pg_query::parse(sql)
         .map_err(|e| super::DdlError::Parse(format!("failed to parse `{sql}`: {e}")))?;
     let proto = parsed.protobuf;

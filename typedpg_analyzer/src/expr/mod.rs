@@ -858,6 +858,15 @@ pub(crate) fn infer_expr(
     params: &mut ParamCollector,
     goal: TypeGoal,
 ) -> Result<ExprType, AnalyzeError> {
+    crate::stack::step(|| infer_expr_here(node, ctx, params, goal))
+}
+
+fn infer_expr_here(
+    node: &protobuf::Node,
+    ctx: Ctx<'_>,
+    params: &mut ParamCollector,
+    goal: TypeGoal,
+) -> Result<ExprType, AnalyzeError> {
     // An error raised with no location points at the innermost expression
     // being inferred when it was.
     let mut t = infer_expr_unlocated(node, ctx, params, goal)

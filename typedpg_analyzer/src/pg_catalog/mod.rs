@@ -1127,6 +1127,10 @@ impl PgCatalog {
     /// static pass — used by [`Self::analyze`] to mirror the same string on
     /// PG sanity under `pg_sanity`.
     fn analyze_with_sql(&self, sql: &str) -> (String, Result<AnalyzedQuery, AnalyzeError>) {
+        crate::stack::with_stack(|| self.analyze_with_sql_here(sql))
+    }
+
+    fn analyze_with_sql_here(&self, sql: &str) -> (String, Result<AnalyzedQuery, AnalyzeError>) {
         // PG's wording for each lex-level failure — kept verbatim so the
         // `pg_sanity` prefix check matches. `at or near "..."` echoes a
         // snippet of the offending token; we approximate that by taking
