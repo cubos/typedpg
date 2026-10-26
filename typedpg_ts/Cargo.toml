@@ -35,12 +35,12 @@ clap = { version = "4", features = ["derive"] }
 sha2 = "0.11"
 notify = "8"
 globset = "0.4"
-oxc_parser = "0.153"
-oxc_ast = "0.153"
-oxc_ast_visit = "0.153"
-oxc_semantic = "0.153"
-oxc_allocator = "0.153"
-oxc_span = "0.153"
+oxc_parser = "0.155"
+oxc_ast = "0.155"
+oxc_ast_visit = "0.155"
+oxc_semantic = "0.155"
+oxc_allocator = "0.155"
+oxc_span = "0.155"
 oxc_resolver = "11.24"
 
 [dev-dependencies]
