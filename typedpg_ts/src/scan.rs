@@ -140,14 +140,21 @@ pub fn scan(
         for s in import.specifiers.iter().flatten() {
             let (local, name) = match s {
                 ImportDeclarationSpecifier::ImportSpecifier(s) if !s.import_kind.is_type() => {
-                    (&s.local, export_name(&s.imported).to_owned())
+                    let Some(name) = export_name(&s.imported) else {
+                        continue;
+                    };
+                    (&s.local, name.to_owned())
                 }
                 ImportDeclarationSpecifier::ImportNamespaceSpecifier(s) => {
                     (&s.local, "*".to_owned())
                 }
                 _ => continue,
             };
-            imported.push((local, import.source.value.as_str().to_owned(), name));
+            // A specifier with a lone surrogate names no file.
+            let Some(spec) = import.source.value.as_str() else {
+                continue;
+            };
+            imported.push((local, spec.to_owned(), name));
         }
     }
     if imported.is_empty() {
@@ -214,17 +221,18 @@ pub fn module_exports(path: &Path, source: &str) -> Option<ModuleExports> {
     // Imported bindings, by local name: module scope, so a name suffices.
     let mut imports: HashMap<&str, (&str, &str)> = HashMap::new();
     for stmt in &parsed.program.body {
-        if let Statement::ImportDeclaration(import) = stmt {
+        if let Statement::ImportDeclaration(import) = stmt
+            && let Some(spec) = import.source.value.as_str()
+        {
             for s in import.specifiers.iter().flatten() {
                 match s {
                     ImportDeclarationSpecifier::ImportSpecifier(s) => {
-                        imports.insert(
-                            s.local.name.as_str(),
-                            (import.source.value.as_str(), export_name(&s.imported)),
-                        );
+                        if let Some(name) = export_name(&s.imported) {
+                            imports.insert(s.local.name.as_str(), (spec, name));
+                        }
                     }
                     ImportDeclarationSpecifier::ImportNamespaceSpecifier(s) => {
-                        imports.insert(s.local.name.as_str(), (import.source.value.as_str(), "*"));
+                        imports.insert(s.local.name.as_str(), (spec, "*"));
                     }
                     ImportDeclarationSpecifier::ImportDefaultSpecifier(_) => {}
                 }
@@ -238,16 +246,23 @@ pub fn module_exports(path: &Path, source: &str) -> Option<ModuleExports> {
                 named_exports(&export.specifiers, None, &imports, &mut entries);
             }
             Statement::ExportFromDeclaration(export) if !export.export_kind.is_type() => {
-                let spec = export.source.value.as_str();
-                named_exports(&export.specifiers, Some(spec), &imports, &mut entries);
+                if let Some(spec) = export.source.value.as_str() {
+                    named_exports(&export.specifiers, Some(spec), &imports, &mut entries);
+                }
             }
             Statement::ExportAllDeclaration(export) if !export.export_kind.is_type() => {
-                let spec = export.source.value.as_str().to_owned();
+                let Some(spec) = export.source.value.as_str() else {
+                    continue;
+                };
+                let spec = spec.to_owned();
                 entries.push(match &export.exported {
-                    Some(name) => ExportEntry::Named {
-                        exported: export_name(name).to_owned(),
-                        spec,
-                        name: "*".to_owned(),
+                    Some(name) => match export_name(name) {
+                        Some(exported) => ExportEntry::Named {
+                            exported: exported.to_owned(),
+                            spec,
+                            name: "*".to_owned(),
+                        },
+                        None => continue,
                     },
                     None => ExportEntry::All { spec },
                 });
@@ -268,8 +283,11 @@ fn named_exports(
         if s.export_kind.is_type() {
             continue;
         }
-        let exported = export_name(&s.exported).to_owned();
-        let local = export_name(&s.local);
+        let (Some(exported), Some(local)) = (export_name(&s.exported), export_name(&s.local))
+        else {
+            continue;
+        };
+        let exported = exported.to_owned();
         let (spec, name) = match source {
             Some(spec) => (spec, local),
             None => match imports.get(local) {
@@ -292,10 +310,12 @@ struct Binding {
     name: String,
 }
 
-fn export_name<'a>(name: &'a ModuleExportName<'a>) -> &'a str {
+/// `None` for a string name with a lone surrogate, which the spec rejects
+/// (`IsStringWellFormedUnicode`): no import or export can use it.
+fn export_name<'a>(name: &'a ModuleExportName<'a>) -> Option<&'a str> {
     match name {
-        ModuleExportName::IdentifierName(n) => n.name.as_str(),
-        ModuleExportName::IdentifierReference(n) => n.name.as_str(),
+        ModuleExportName::IdentifierName(n) => Some(n.name.as_str()),
+        ModuleExportName::IdentifierReference(n) => Some(n.name.as_str()),
         ModuleExportName::StringLiteral(s) => s.value.as_str(),
     }
 }
@@ -412,6 +432,12 @@ impl<'a> Visit<'a> for Finder<'_, '_> {
     }
 }
 
+/// A literal whose value has a lone surrogate (an unpaired `\uD800` to
+/// `\uDFFF` escape): not UTF-8, which is all PostgreSQL takes — Node would
+/// send U+FFFD in its place, another query than the one written.
+const LONE_SURROGATE: &str = "the literal has a lone surrogate (an unpaired \\uD800 to \\uDFFF escape): PostgreSQL \
+     takes only UTF-8";
+
 impl Finder<'_, '_> {
     fn record(&mut self, call: &CallExpression, db: usize, kind: Kind) {
         let what = match kind {
@@ -419,8 +445,12 @@ impl Finder<'_, '_> {
             Kind::CopyIn => "the target passed to copyIn()",
         };
         let literal = match call.arguments.as_slice() {
+            [Argument::StringLiteral(s)] if s.value.as_str().is_none() => {
+                self.diagnostic(s.span.start, LONE_SURROGATE);
+                None
+            }
             [Argument::StringLiteral(s)] => Some((
-                s.value.as_str().to_owned(),
+                s.value.as_str().unwrap_or_default().to_owned(),
                 s.span.start,
                 Literal {
                     content_start: s.span.start as usize + 1,
@@ -433,9 +463,13 @@ impl Finder<'_, '_> {
             )),
             [Argument::TemplateLiteral(t)] if t.expressions.is_empty() => {
                 let quasi = &t.quasis[0];
-                match &quasi.value.cooked {
-                    Some(cooked) => Some((
-                        cooked.as_str().to_owned(),
+                match quasi.value.cooked.map(|c| c.as_str()) {
+                    Some(None) => {
+                        self.diagnostic(t.span.start, LONE_SURROGATE);
+                        None
+                    }
+                    Some(Some(cooked)) => Some((
+                        cooked.to_owned(),
                         t.span.start,
                         Literal {
                             content_start: quasi.span.start as usize,
@@ -686,6 +720,25 @@ sql('SELECT 1');
     fn template_literal_values_are_cooked() {
         let s = run("import { sql } from './db';\nsql(`SELECT\n  'a\\tb'`);\n");
         assert_eq!(texts(&s), vec![(0, Kind::Query, "SELECT\n  'a\tb'")]);
+    }
+
+    #[test]
+    fn lone_surrogates_are_reported() {
+        // A pair is one character; an unpaired half is not UTF-8.
+        let s = run(r#"
+import { sql } from './db';
+sql('SELECT \uD83D\uDE00');
+sql('SELECT \uD800');
+sql(`SELECT \uDC00`);
+"#);
+        assert_eq!(texts(&s), vec![(0, Kind::Query, "SELECT 😀")]);
+        let msgs: Vec<_> = s.diagnostics.iter().map(|d| d.message.as_str()).collect();
+        assert_eq!(msgs.len(), 2, "{msgs:?}");
+        assert!(
+            msgs.iter().all(|m| m.contains("lone surrogate")),
+            "{msgs:?}"
+        );
+        assert_eq!(s.diagnostics[0].pos, Position { line: 4, col: 5 });
     }
 
     #[test]

@@ -11,4 +11,4 @@ description = "Generates typedpg_pg_query's protobuf types and AST walkers from 
 heck = "0.5"
 prost-build = "0.14"
 prost-types = "0.14"
-protox = "0.9"
+protox = "0.10"
