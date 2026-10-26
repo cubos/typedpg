@@ -14,7 +14,7 @@
 //! settings: `{ "dir", "table", "lockId", "useTransaction", "failOnDrift",
 //! "embed" }`. Several databases go under `databases`, each with the
 //! per-database keys (`out`, `sql`, `migrations`, `extraMigrations`,
-//! `types`, `int8`); the top level then carries none of them.
+//! `types`); the top level then carries none of them.
 //!
 //! `sql` takes the queries of `.sql` files, each a `/* @name x */` block
 //! (see [`crate::sqlfile`]):
@@ -57,7 +57,6 @@ struct RawConfig {
     migrations: Option<RawMigrations>,
     extra_migrations: Option<Vec<PathBuf>>,
     types: Option<BTreeMap<String, String>>,
-    int8: Option<Int8>,
     databases: Option<BTreeMap<String, RawDatabase>>,
 }
 
@@ -69,7 +68,6 @@ struct RawDatabase {
     migrations: Option<RawMigrations>,
     extra_migrations: Option<Vec<PathBuf>>,
     types: Option<BTreeMap<String, String>>,
-    int8: Option<Int8>,
 }
 
 impl RawDatabase {
@@ -79,7 +77,6 @@ impl RawDatabase {
             && self.migrations.is_none()
             && self.extra_migrations.is_none()
             && self.types.is_none()
-            && self.int8.is_none()
     }
 }
 
@@ -115,19 +112,6 @@ struct RawMigrationsTable {
     use_transaction: Option<bool>,
     fail_on_drift: Option<bool>,
     embed: Option<bool>,
-}
-
-/// How an `int8` (`bigint` column, `count(*)`) reaches TypeScript.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Int8 {
-    /// `bigint`: exact. The default.
-    #[default]
-    Bigint,
-    /// `string`: exact, as `pg` returns it.
-    String,
-    /// `number`: a value beyond 2^53 is an error rather than rounded.
-    Number,
 }
 
 /// What `typedpg gen` writes for a `.sql` file.
@@ -301,7 +285,6 @@ pub struct DatabaseConfig {
     pub embed_migrations: bool,
     /// PG type → the TypeScript type it maps to.
     pub types: HashMap<QualifiedName, TypeOverride>,
-    pub int8: Int8,
 }
 
 impl DatabaseConfig {
@@ -353,14 +336,13 @@ impl Config {
             migrations: raw.migrations,
             extra_migrations: raw.extra_migrations,
             types: raw.types,
-            int8: raw.int8,
         };
         let databases = match raw.databases {
             Some(dbs) => {
                 if !single.is_empty() {
                     return Err(
-                        "`out`, `sql`, `migrations`, `extraMigrations`, `types` and `int8` go \
-                         in each entry of `databases` when it is set"
+                        "`out`, `sql`, `migrations`, `extraMigrations` and `types` go in each \
+                         entry of `databases` when it is set"
                             .to_owned(),
                     );
                 }
@@ -498,7 +480,6 @@ fn database(root: &Path, name: String, raw: RawDatabase) -> Result<DatabaseConfi
         runner,
         embed_migrations,
         types,
-        int8: raw.int8.unwrap_or_default(),
     })
 }
 
@@ -618,7 +599,6 @@ mod tests {
         assert_eq!(db.out, Some(PathBuf::from("/p/src/db.ts")));
         assert_eq!(db.migrations_dirs(), vec![PathBuf::from("/p/migrations")]);
         assert_eq!(db.runner.table, "public._migrations");
-        assert_eq!(db.int8, Int8::Bigint);
         assert!(!db.embed_migrations);
         let o = &db.types[&QualifiedName::new("public", "prefs")];
         assert_eq!(o.module, OverrideModule::Path("/p/./src/domains".into()));
@@ -626,9 +606,9 @@ mod tests {
     }
 
     #[test]
-    fn migrations_object_and_int8() {
+    fn migrations_object() {
         let c = Config::parse(
-            r#"{ "out": "db.js", "int8": "string", "extraMigrations": ["../shared"],
+            r#"{ "out": "db.js", "extraMigrations": ["../shared"],
                  "migrations": { "dir": "db/m", "table": "app.schema_log", "lockId": 7,
                                  "useTransaction": false, "failOnDrift": false, "embed": true } }"#,
             Path::new("/p"),
@@ -643,7 +623,6 @@ mod tests {
         assert_eq!(db.runner.lock_id, 7);
         assert!(!db.runner.use_transaction && !db.runner.fail_on_drift);
         assert!(db.embed_migrations);
-        assert_eq!(db.int8, Int8::String);
         let out = db.out.as_deref().unwrap();
         assert_eq!(out_kind(out), Ok(OutKind::EsModule));
         assert_eq!(declaration_path(out), Some(PathBuf::from("/p/db.d.ts")));
@@ -755,7 +734,7 @@ mod tests {
             err(r#"{ "out": "a.ts", "migrations": { "table": "x; DROP" } }"#)
                 .contains("migrations.table")
         );
-        assert!(err(r#"{ "out": "a.ts", "int8": "long" }"#).contains("long"));
+        assert!(err(r#"{ "out": "a.ts", "int8": "bigint" }"#).contains("unknown field `int8`"));
         assert!(
             err(r#"{ "databases": { "a": { "out": "x.ts" }, "b": { "out": "x.ts" } } }"#)
                 .contains("same `out`")

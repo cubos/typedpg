@@ -9,7 +9,6 @@ export type Codec =
   | "bool"
   | "number"
   | "bigint"
-  | "int8number"
   | "json"
   | "timestamptz"
   | "bytea"
@@ -102,13 +101,6 @@ export function decode(codec: Codec, text: string): unknown {
       return Number(text);
     case "bigint":
       return BigInt(text);
-    case "int8number": {
-      const n = Number(text);
-      if (!Number.isSafeInteger(n)) {
-        throw new DecodeError(`typedpg: int8 value ${text} is beyond what a number holds exactly; use "int8": "bigint"`);
-      }
-      return n;
-    }
     case "json":
       return parseJson(text);
     case "timestamptz":

@@ -53,7 +53,6 @@ Node.js 22.12 or later.
 | `migrations` | The migrations directory (default `migrations`), or `{ "dir", "table", "lockId", "useTransaction", "failOnDrift", "embed" }` — the runner's settings, as in Rust. `"embed": true` adds the migrations to the generated module. |
 | `extraMigrations` | More directories the schema is built from but the runner doesn't apply (tables another project owns). |
 | `types` | PG type → TypeScript type, as `"./src/types#Prefs"` (relative to the config) or `"package#Type"`. A JSONB domain, an enum, a composite or any other type; an unqualified name is in `public`, a built-in type is `pg_catalog.<name>`. See [Mapping types](#mapping-types). |
-| `int8` | `"bigint"` (default, exact), `"string"` (exact, as `pg` returns it) or `"number"` (an error beyond 2^53 instead of a rounded value). |
 | `runtime` | The module the generated code imports the runtime from (default `@cubos/typedpg`). |
 | `databases` | Several databases: `{ "main": { "out": …, "migrations": … }, "warehouse": { … } }`, each with the keys above. A query belongs to the database whose module its `sql` comes from. |
 
@@ -264,7 +263,7 @@ says, whatever `pg.types.setTypeParser` your application set up.
 |------------|------------|
 | `bool` | `boolean`; a parameter must be a boolean (`true` / `false`) — a string or a number is refused |
 | `int2`, `int4`, `float4`, `float8`, `oid` | `number` |
-| `int8` | `bigint` (see `int8`); parameters also take `number` and `string` |
+| `int8` | `bigint`; parameters also take `number` and `string` |
 | `numeric` | `string` (exact); parameters also take `number` |
 | `text`, `varchar`, `char`, `uuid`, `date`, `time`, `timetz`, `inet`, `money`, … | `string` |
 | `timestamptz`, `timestamp` | `Date`, parameters too (a `timestamp`, which has no time zone, is read and written as UTC). A `Date` is never `infinity`: `to_char` and `extract` of a parameter are never NULL |

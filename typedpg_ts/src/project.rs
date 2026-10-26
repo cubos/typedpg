@@ -584,7 +584,6 @@ impl Project {
         };
         let mapper = TypeMapper {
             overrides: &db.overrides,
-            int8: db.config.int8,
             used: Default::default(),
         };
         // Drop what no source uses anymore.
@@ -817,7 +816,6 @@ impl Project {
         let catalog = db.catalog.as_ref().map_err(Clone::clone)?;
         let mapper = TypeMapper {
             overrides: &db.overrides,
-            int8: db.config.int8,
             used: Default::default(),
         };
         for q in &file.queries {

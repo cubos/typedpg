@@ -75,7 +75,7 @@ fn several_databases_and_javascript_outputs() {
     write(
         &root.join("typedpg.config.json"),
         r#"{ "include": ["src"], "databases": {
-              "main": { "out": "src/main.js", "migrations": "m1", "int8": "string" },
+              "main": { "out": "src/main.js", "migrations": "m1" },
               "wh": { "out": "src/wh.cjs", "migrations": "m2" } } }"#,
     );
     write(&root.join("m1/0001.sql"), USERS);
@@ -107,8 +107,7 @@ fn several_databases_and_javascript_outputs() {
         "{main_js}"
     );
     assert!(!main_js.contains("interface"), "{main_js}");
-    // int8 as string for this database.
-    assert!(main_dts.contains("n: string;"), "{main_dts}");
+    assert!(main_dts.contains("n: bigint;"), "{main_dts}");
     assert!(
         main_dts.contains("export declare const sql: typedpg.Sql<Queries>;"),
         "{main_dts}"

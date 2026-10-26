@@ -479,7 +479,6 @@ fn cast_range(a: &AnalyzedQuery, start: usize, end: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Int8;
     use std::collections::HashMap;
 
     const DDL: &str = "CREATE TYPE mood AS ENUM ('happy', 'sad');
@@ -496,7 +495,6 @@ mod tests {
         let overrides = HashMap::new();
         let mapper = TypeMapper {
             overrides: &overrides,
-            int8: Int8::Bigint,
             used: Default::default(),
         };
         generate(&c, &mapper, kind, sql)
