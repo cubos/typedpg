@@ -2,7 +2,7 @@
   "name": "typedpg",
   "displayName": "typedpg",
   "description": "SQL syntax highlighting inside typedpg sql! macros (Rust) and sql() / copyIn() calls (TypeScript); errors of .sql files through TypeScript 7.1's content mapper",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "publisher": "cubos",
   "engines": {
     "vscode": "^1.80.0"

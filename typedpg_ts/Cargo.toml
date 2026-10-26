@@ -21,10 +21,10 @@ path = "src/main.rs"
 vendored-openssl = ["native-tls/vendored"]
 
 [dependencies]
-typedpg_analyzer = { path = "../typedpg_analyzer", version = "0.4.0" }
-typedpg_core = { path = "../typedpg_core", version = "0.4.0" }
-typedpg = { path = "../typedpg", version = "0.4.0", default-features = false }
-typedpg_cli = { path = "../typedpg_cli", version = "0.4.0" }
+typedpg_analyzer = { path = "../typedpg_analyzer", version = "0.5.0" }
+typedpg_core = { path = "../typedpg_core", version = "0.5.0" }
+typedpg = { path = "../typedpg", version = "0.5.0", default-features = false }
+typedpg_cli = { path = "../typedpg_cli", version = "0.5.0" }
 # Only for `vendored-openssl`: the TLS `typedpg migrate` connects with.
 native-tls = "0.2"
 tokio = { version = "1", features = ["rt", "macros"] }
