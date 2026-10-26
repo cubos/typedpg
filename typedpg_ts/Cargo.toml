@@ -14,11 +14,19 @@ publish = false
 name = "typedpg"
 path = "src/main.rs"
 
+[features]
+# OpenSSL built from source and linked in, where native-tls uses it (Linux):
+# the npm package's binaries can't count on the machine having a libssl, nor
+# on its version (none in node:22-slim; musl targets have none to link).
+vendored-openssl = ["native-tls/vendored"]
+
 [dependencies]
 typedpg_analyzer = { path = "../typedpg_analyzer", version = "0.4.0" }
 typedpg_core = { path = "../typedpg_core", version = "0.4.0" }
 typedpg = { path = "../typedpg", version = "0.4.0", default-features = false }
 typedpg_cli = { path = "../typedpg_cli", version = "0.4.0" }
+# Only for `vendored-openssl`: the TLS `typedpg migrate` connects with.
+native-tls = "0.2"
 tokio = { version = "1", features = ["rt", "macros"] }
 dotenvy = "0.15"
 serde = { version = "1", features = ["derive"] }
