@@ -2093,6 +2093,8 @@ pub struct DefElem {
     pub defaction: i32,
     #[prost(int32, tag = "5")]
     pub location: i32,
+    #[prost(int32, tag = "6")]
+    pub arg_location: i32,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct LockingClause {
@@ -3858,6 +3860,8 @@ pub struct NotifyStmt {
     pub conditionname: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
     pub payload: ::prost::alloc::string::String,
+    #[prost(int32, tag = "3")]
+    pub payload_location: i32,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ListenStmt {
@@ -4226,6 +4230,8 @@ pub struct CreateSubscriptionStmt {
     pub publication: ::prost::alloc::vec::Vec<Node>,
     #[prost(message, repeated, tag = "4")]
     pub options: ::prost::alloc::vec::Vec<Node>,
+    #[prost(int32, tag = "5")]
+    pub conninfo_location: i32,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct AlterSubscriptionStmt {
@@ -4239,6 +4245,8 @@ pub struct AlterSubscriptionStmt {
     pub publication: ::prost::alloc::vec::Vec<Node>,
     #[prost(message, repeated, tag = "5")]
     pub options: ::prost::alloc::vec::Vec<Node>,
+    #[prost(int32, tag = "6")]
+    pub conninfo_location: i32,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DropSubscriptionStmt {

@@ -48,8 +48,9 @@ from; they are read from the vendored `pg_query.h` at build time.
    the problem.
 4. Adapt typedpg_analyzer to the AST changes, regenerate the seed
    (`cargo run -p typedpg_seed` — the seed stores protobuf-encoded ASTs), and
-   run the test suites, including `scripts/run-pg-sanity.sh` against the
-   matching PostgreSQL release.
+   run the test suites, including `scripts/run-pg-sanity.sh`. Both the seed
+   and the oracle run `postgres:<PG_VERSION>`, the release the new tag's
+   grammar comes from, so the catalog, the oracle and the parser agree.
 
 ## Patches
 
@@ -59,8 +60,8 @@ the copy. They fall in three groups:
 
 - **Catalog hooks** — route the mocked catalog lookups to an installed
   `Catalog`, and restore PostgreSQL's `%TYPE` / `%ROWTYPE` code while one is.
-- **PL/pgSQL JSON dump fixes** — libpg_query 18.0.0 wrote a trigger
-  function's `TG_*` promise datums as empty objects (invalid JSON), and left
+- **PL/pgSQL JSON dump fixes** — libpg_query (still in 18.1.0) writes a trigger
+  function's `TG_*` promise datums as empty objects (invalid JSON), and leaves
   out `retvarno`, a record variable's declared type and the type name as
   written.
 - **Mock fixes**, for compiling without a catalog: the mock `pg_type` rows

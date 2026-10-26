@@ -87,9 +87,11 @@ fn main() {
     build
         .files(glob(&lib.join("src")).into_iter().map(source))
         .files(glob(&lib.join("src/postgres")).into_iter().map(source))
-        .file(lib.join("vendor/protobuf-c/protobuf-c.c"))
         .file(lib.join("vendor/xxhash/xxhash.c"))
-        .file(lib.join("protobuf/pg_query.pb-c.c"))
+        // Protobuf, through upb (libpg_query's Makefile: UPB_SRC_FILES).
+        .file(lib.join("vendor/upb/upb.c"))
+        .file(lib.join("vendor/upb/third_party/utf8_range/utf8_range.c"))
+        .file(lib.join("protobuf/pg_query.upb_minitable.c"))
         // The catalog hooks (patched lookups call into them).
         .file("csrc/catalog.c")
         .include("csrc")
@@ -98,6 +100,8 @@ fn main() {
         .include(lib.join("src"))
         .include(lib.join("src/postgres"))
         .include(lib.join("vendor"))
+        .include(lib.join("vendor/upb"))
+        .include(lib.join("vendor/upb/third_party/utf8_range"))
         .include(&includes)
         .include(lib.join("src/include"))
         // libpg_query's own warnings are its maintainers' concern.
