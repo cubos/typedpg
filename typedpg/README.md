@@ -19,7 +19,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-typedpg = "0.4"
+typedpg = "0.5"
 deadpool-postgres = "0.14"
 tokio-postgres = "0.7"
 tokio = { version = "1", features = ["full"] }
