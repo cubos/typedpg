@@ -39,8 +39,9 @@ jobs:
       - if: matrix.musl
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       # Built on the oldest Ubuntu runner for the glibc targets, so the
-      # binary runs on older distributions too.
-      - run: cargo build --release --locked -p typedpg_ts --bin typedpg --target ${{ matrix.rust }}
+      # binary runs on older distributions too; with OpenSSL linked in, so it
+      # needs no libssl there (a no-op on macOS and Windows).
+      - run: cargo build --release --locked -p typedpg_ts --bin typedpg --features vendored-openssl --target ${{ matrix.rust }}
       - shell: bash
         run: |
           mkdir -p bins/${{ matrix.target }}

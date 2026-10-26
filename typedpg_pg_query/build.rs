@@ -49,8 +49,11 @@ fn main() {
     let mut patched: std::collections::BTreeMap<&str, String> = std::collections::BTreeMap::new();
     for patch in PATCHES {
         let text = patched.entry(patch.file).or_insert_with(|| {
+            // With LF line endings, as the patches are written: a checkout
+            // with `core.autocrlf` (Windows) has CRLF ones.
             std::fs::read_to_string(lib.join(patch.file))
                 .unwrap_or_else(|e| panic!("reading libpg_query/{}: {e}", patch.file))
+                .replace("\r\n", "\n")
         });
         let found = text.matches(patch.find).count();
         assert!(
