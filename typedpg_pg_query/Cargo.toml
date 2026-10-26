@@ -26,11 +26,13 @@ include = [
     "/tests/**/*.rs",
     "/libpg_query/LICENSE",
     "/libpg_query/pg_query.h",
+    "/libpg_query/pg_query_scan_tokens.h",
     "/libpg_query/postgres_deparse.h",
     "/libpg_query/src/**/*",
     "/libpg_query/vendor/**/*",
-    "/libpg_query/protobuf/pg_query.pb-c.c",
-    "/libpg_query/protobuf/pg_query.pb-c.h",
+    "/libpg_query/protobuf/pg_query.upb.h",
+    "/libpg_query/protobuf/pg_query.upb_minitable.c",
+    "/libpg_query/protobuf/pg_query.upb_minitable.h",
     "/libpg_query/protobuf/pg_query.proto",
 ]
 
