@@ -277,6 +277,10 @@ mod tests {
     fn generated(types: &str) -> Result<Generated, GenError> {
         Ok(Generated {
             types: types.to_owned(),
+            params: Vec::new(),
+            row: Vec::new(),
+            value: None,
+            overrides: Vec::new(),
             runtime: "{\"sql\":[\"x\"]}".to_owned(),
         })
     }

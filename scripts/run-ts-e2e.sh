@@ -4,15 +4,21 @@
 # on the project in typedpg_ts_example:
 #
 #   1. the runtime builds and its unit tests pass;
-#   2. the example's generated module is up to date (`typedpg check`);
+#   2. the example's generated modules are up to date (`typedpg check`);
 #   3. the errors fixture reports exactly errors/expected.stderr;
 #   4. tsc (7 and 5.9) accepts the example: its type-level assertions, and
 #      every `@ts-expect-error` of the errors fixture reporting; and rejects
 #      the types errors/mapping maps PG types to that don't fit them;
-#   5. the queries, COPY, streams and migrations run on a real PostgreSQL
+#   5. loaders/, which imports a .sql file itself, type-checks from its
+#      users.d.sql.ts (tsc 7 and 5.9) and from the content mapper alone
+#      (tsc 7.1, `--runExternalCode`);
+#   6. the queries, COPY, streams and migrations run on a real PostgreSQL
 #      through node-postgres and postgres.js, and the migrations interoperate
 #      with `typedpg migrate` (a Docker container, torn down even on
-#      failure).
+#      failure);
+#   7. loaders/ runs on it through the Node hook (the cache cold, so the
+#      hook runs `typedpg build`, then warm, without the binary), esbuild and
+#      Rollup bundles, and Bun's plugin when `bun` is installed.
 #
 # Usage: scripts/run-ts-e2e.sh            (BLESS=1 rewrites the expected outputs)
 
@@ -23,8 +29,10 @@ EXAMPLE="$ROOT/typedpg_ts_example"
 PG_IMAGE="${PG_IMAGE:-postgres:18}"
 CONTAINER_NAME="typedpg-ts-e2e-$$"
 
+LOADERS_CACHE="$(mktemp -d)"
 cleanup() {
     docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+    rm -rf "$LOADERS_CACHE"
 }
 trap cleanup EXIT INT TERM
 
@@ -68,6 +76,14 @@ diff -u "$MAPPING/expected.tsc" <(printf '%s\n' "$tsc7")
 locations() { grep -o '^src/[^:]*' || true; }
 diff -u <(printf '%s\n' "$tsc7" | locations) <(printf '%s\n' "$tsc5" | locations)
 
+echo "ts-e2e: loaders: .d.sql.ts (tsc 7 and 5.9), content mapper (tsc 7.1)"
+LOADERS="$EXAMPLE/loaders"
+(cd "$LOADERS" && "$TYPEDPG" check)
+(cd "$LOADERS" && node ../node_modules/typescript/bin/tsc -p .)
+(cd "$LOADERS" && node ../node_modules/typescript-5/bin/tsc -p .)
+(cd "$LOADERS" && TYPEDPG_BINARY="$TYPEDPG" \
+    node ../node_modules/typescript-7.1/bin/tsc -p tsconfig.mapper.json --runExternalCode)
+
 echo "ts-e2e: starting $PG_IMAGE as $CONTAINER_NAME..."
 docker run -d --rm --name "$CONTAINER_NAME" -e POSTGRES_PASSWORD=postgres \
     -p 127.0.0.1:0:5432 "$PG_IMAGE" >/dev/null
@@ -91,3 +107,30 @@ fi
 echo "ts-e2e: running on PostgreSQL"
 (cd "$EXAMPLE" && DATABASE_URL="postgres://postgres:postgres@127.0.0.1:$PG_PORT/postgres" \
     TYPEDPG_BIN="$TYPEDPG" npm test --silent)
+
+echo "ts-e2e: loaders on PostgreSQL"
+docker exec "$CONTAINER_NAME" psql -h 127.0.0.1 -U postgres -c "CREATE DATABASE typedpg_loaders" >/dev/null
+expected='{"user":{"id":1,"name":"Ana","email":null,"prefs":{"theme":"dark"}},"email":null,"count":"1"}'
+# `run <what> <binary> <command...>`: the command's output in loaders/ must
+# be `expected`.
+run() {
+    local what=$1 binary=$2
+    shift 2
+    local actual
+    actual=$(cd "$LOADERS" && DATABASE_URL="postgres://postgres:postgres@127.0.0.1:$PG_PORT/typedpg_loaders" \
+        TYPEDPG_CACHE_DIR="$LOADERS_CACHE" TYPEDPG_BINARY="$binary" "$@")
+    if [[ "$actual" != "$expected" ]]; then
+        echo "ts-e2e: $what printed $actual" >&2
+        exit 1
+    fi
+}
+run "the Node hook, cold cache" "$TYPEDPG" node --import @cubos/typedpg/register src/main.ts
+# A warm cache needs no binary: the hook's keys are the binary's.
+run "the Node hook, warm cache" /nonexistent node --import @cubos/typedpg/register src/main.ts
+run "esbuild" /nonexistent sh -c 'node build-esbuild.mjs && node out/esbuild.mjs'
+run "Rollup" /nonexistent sh -c '../node_modules/.bin/rollup -c --silent && node out/rollup.mjs'
+if command -v bun >/dev/null; then
+    run "Bun" /nonexistent bun --preload @cubos/typedpg/bun src/main.ts
+else
+    echo "ts-e2e: bun is not installed, its plugin is not run"
+fi

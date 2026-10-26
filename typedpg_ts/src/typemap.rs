@@ -10,12 +10,11 @@
 //! `typedpg.Interval` / `typedpg.JsonValue`: the generated module imports
 //! them as a namespace, so a type the user maps to can't collide with them.
 
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{BTreeSet, HashMap};
 
 use typedpg_analyzer::{RecordField, Refinement, Type};
 use typedpg_core::QualifiedName;
-
-use crate::config::Int8;
 
 /// The namespace the generated module imports the runtime's types under.
 pub const RUNTIME_NS: &str = "typedpg";
@@ -33,8 +32,6 @@ pub enum Codec {
     Number,
     /// `int8` / `xid8` ↔ `bigint`.
     BigInt,
-    /// `int8` ↔ `number`, an error beyond 2^53 rather than a rounded value.
-    Int8Number,
     /// `json` / `jsonb`, parsed / stringified.
     Json,
     /// `timestamptz` / `timestamp` ↔ `Date` (a `timestamp`, which has no
@@ -70,7 +67,6 @@ impl Codec {
             Codec::Bool => json!("bool"),
             Codec::Number => json!("number"),
             Codec::BigInt => json!("bigint"),
-            Codec::Int8Number => json!("int8number"),
             Codec::Json => json!("json"),
             Codec::Timestamptz => json!("timestamptz"),
             Codec::Bytea => json!("bytea"),
@@ -100,7 +96,7 @@ impl Codec {
         match self {
             Codec::Text => "string".into(),
             Codec::Bool => "boolean".into(),
-            Codec::Number | Codec::Int8Number => "number".into(),
+            Codec::Number => "number".into(),
             Codec::BigInt => "bigint".into(),
             Codec::Json => "unknown".into(),
             Codec::Timestamptz => "Date".into(),
@@ -141,7 +137,8 @@ pub struct TsType {
 pub struct TypeMapper<'a> {
     /// PG type → the TS type name the generated module imports for it.
     pub overrides: &'a HashMap<QualifiedName, String>,
-    pub int8: Int8,
+    /// The overrides' TS names mapped since this was last taken.
+    pub used: RefCell<BTreeSet<String>>,
 }
 
 impl TypeMapper<'_> {
@@ -178,8 +175,8 @@ impl TypeMapper<'_> {
             (Type::Enum { .. }, _) => |v| js_string(v),
             (Type::Basic { schema, name, .. }, output) if schema == "pg_catalog" => {
                 match (name.as_str(), output) {
-                    ("text" | "varchar" | "int8", "string") => |v| js_string(v),
-                    ("int2" | "int4" | "int8", "number") | ("bool", "boolean") => str::to_owned,
+                    ("text" | "varchar", "string") => |v| js_string(v),
+                    ("int2" | "int4", "number") | ("bool", "boolean") => str::to_owned,
                     ("int8", "bigint") => |v| format!("{v}n"),
                     _ => return mapped,
                 }
@@ -347,9 +344,9 @@ impl TypeMapper<'_> {
     }
 
     fn override_for(&self, schema: &str, name: &str) -> Option<String> {
-        self.overrides
-            .get(&QualifiedName::new(schema, name))
-            .cloned()
+        let ts = self.overrides.get(&QualifiedName::new(schema, name))?;
+        self.used.borrow_mut().insert(ts.clone());
+        Some(ts.clone())
     }
 
     fn basic(&self, schema: &str, name: &str, extension: Option<&str>) -> TsType {
@@ -379,24 +376,12 @@ impl TypeMapper<'_> {
             "int2" | "int4" | "oid" | "xid" | "cid" | "float4" | "float8" => {
                 same("number".into(), Codec::Number)
             }
-            "int8" => match self.int8 {
-                // A string too, as `pg` reads an int8 and applications
-                // keep it.
-                Int8::Bigint => TsType {
-                    output: "bigint".into(),
-                    input: "bigint | number | string".into(),
-                    codec: Codec::BigInt,
-                },
-                Int8::String => TsType {
-                    output: "string".into(),
-                    input: "string | bigint | number".into(),
-                    codec: Codec::Text,
-                },
-                Int8::Number => TsType {
-                    output: "number".into(),
-                    input: "number | bigint | string".into(),
-                    codec: Codec::Int8Number,
-                },
+            // Exact. A parameter takes a string too, as `pg` reads an int8
+            // and applications keep it.
+            "int8" => TsType {
+                output: "bigint".into(),
+                input: "bigint | number | string".into(),
+                codec: Codec::BigInt,
             },
             // Unsigned 64-bit: only a bigint holds every value.
             "xid8" => TsType {
@@ -501,20 +486,21 @@ mod tests {
         }
     }
 
-    fn with<R>(int8: Int8, f: impl FnOnce(&TypeMapper) -> R) -> R {
+    fn with<R>(f: impl FnOnce(&TypeMapper) -> R) -> R {
         let overrides = HashMap::new();
         f(&TypeMapper {
             overrides: &overrides,
-            int8,
+            used: Default::default(),
         })
     }
 
     #[test]
     fn scalars() {
-        with(Int8::Bigint, |m| {
+        with(|m| {
             assert_eq!(m.map(&basic_ty("int4")).output, "number");
             assert_eq!(m.map(&basic_ty("int8")).output, "bigint");
             assert_eq!(m.map(&basic_ty("int8")).input, "bigint | number | string");
+            assert_eq!(m.map(&basic_ty("xid8")).output, "bigint");
             assert_eq!(m.map(&basic_ty("numeric")).output, "string");
             assert_eq!(m.map(&basic_ty("tsvector")).output, "string");
             assert_eq!(m.map(&basic_ty("timestamptz")).codec, Codec::Timestamptz);
@@ -523,20 +509,6 @@ mod tests {
             assert_eq!(m.map(&basic_ty("timestamp")).input, "Date");
             assert_eq!(m.map(&basic_ty("interval")).output, "typedpg.Interval");
             assert_eq!(m.map(&basic_ty("jsonb")).output, "typedpg.JsonValue");
-        });
-    }
-
-    #[test]
-    fn int8_modes() {
-        let int8 = |mode| with(mode, |m| m.map(&basic_ty("int8")));
-        let s = int8(Int8::String);
-        assert_eq!((s.output.as_str(), s.codec), ("string", Codec::Text));
-        let n = int8(Int8::Number);
-        assert_eq!((n.output.as_str(), n.codec), ("number", Codec::Int8Number));
-        assert_eq!(n.input, "number | bigint | string");
-        // xid8 is unsigned 64-bit whatever the int8 mode.
-        with(Int8::Number, |m| {
-            assert_eq!(m.map(&basic_ty("xid8")).output, "bigint")
         });
     }
 
@@ -559,7 +531,7 @@ mod tests {
 
     #[test]
     fn arrays_follow_element_nullability() {
-        with(Int8::Bigint, |m| {
+        with(|m| {
             let arr = |n| Type::Array {
                 element: Box::new(basic_ty("text")),
                 element_nullable: n,
@@ -573,7 +545,7 @@ mod tests {
 
     #[test]
     fn ranges_and_multiranges() {
-        with(Int8::Bigint, |m| {
+        with(|m| {
             let range = |multirange| Type::Range {
                 schema: "pg_catalog".into(),
                 name: "int8range".into(),
@@ -594,7 +566,7 @@ mod tests {
 
     #[test]
     fn extension_types() {
-        with(Int8::Bigint, |m| {
+        with(|m| {
             let ext = |ext: &str, name: &str| Type::Basic {
                 schema: "public".into(),
                 name: name.into(),
@@ -615,7 +587,7 @@ mod tests {
 
     #[test]
     fn enums_are_label_unions() {
-        with(Int8::Bigint, |m| {
+        with(|m| {
             let ty = Type::Enum {
                 schema: "public".into(),
                 name: "mood".into(),
@@ -632,15 +604,11 @@ mod tests {
             values: Some(vs.iter().map(|v| (*v).to_owned()).collect()),
             ..Refinement::NONE
         };
-        let int8 = |mode| {
-            with(mode, |m| {
-                m.map_refined(&basic_ty("int8"), &refined(&["1"])).output
-            })
-        };
-        assert_eq!(int8(Int8::Bigint), "1n");
-        assert_eq!(int8(Int8::String), r#""1""#);
-        assert_eq!(int8(Int8::Number), "1");
-        with(Int8::Bigint, |m| {
+        assert_eq!(
+            with(|m| m.map_refined(&basic_ty("int8"), &refined(&["1"])).output),
+            "1n"
+        );
+        with(|m| {
             let out = |ty: &Type, vs: &[&str]| m.map_refined(ty, &refined(vs)).output;
             assert_eq!(out(&basic_ty("text"), &["b", "a"]), r#""a" | "b""#);
             assert_eq!(out(&basic_ty("int4"), &["10", "2"]), "2 | 10");
@@ -675,7 +643,7 @@ mod tests {
 
     #[test]
     fn records_quote_odd_keys_and_nest() {
-        with(Int8::Bigint, |m| {
+        with(|m| {
             let inner = Type::AnonymousRecord {
                 fields: vec![RecordField {
                     name: "f1".into(),
@@ -724,7 +692,7 @@ mod tests {
         );
         let m = TypeMapper {
             overrides: &o,
-            int8: Int8::Bigint,
+            used: Default::default(),
         };
         let ty = Type::Domain {
             schema: "public".into(),

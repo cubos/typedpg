@@ -41,9 +41,16 @@ BLESS=1 cargo nextest run --release -p typedpg_compile_fail   # rewrite snapshot
 
 ### TypeScript
 
-`typedpg_ts` is the TypeScript CLI (`typedpg gen|check|migrate`; it needs a
-newer Rust than the workspace's MSRV, for oxc), `typedpg_npm` the npm
-runtime package, `typedpg_ts_example` the project the end-to-end run uses.
+`typedpg_ts` is the TypeScript CLI (`typedpg gen|check|build|serve|migrate`;
+it needs a newer Rust than the workspace's MSRV, for oxc), `typedpg_npm` the
+npm runtime package (with the loaders and bundler plugins of `.sql` files),
+`typedpg_vscode` the editor extension (SQL highlighting, `.sql` files' errors),
+`typedpg_ts_example` the project the end-to-end run uses (`loaders/` in it
+imports a `.sql` file itself).
+
+The loaders' cache key is computed twice, by `typedpg_ts/src/cache.rs` and
+`typedpg_npm/src/sqlfiles.ts`: change the recipe in both (the e2e runs the
+Node hook on a cache `typedpg build` filled, without the binary).
 
 ```bash
 cargo nextest run --release -p typedpg_ts        # scanner, codegen, incremental project

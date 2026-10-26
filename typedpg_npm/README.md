@@ -48,11 +48,11 @@ Node.js 22.12 or later.
 | Key | |
 |-----|---|
 | `include` | Directories (or files) whose `.ts`/`.tsx`/`.mts`/`.cts` sources are scanned. Default `["."]`; `node_modules` and hidden directories are skipped. |
-| `out` | The generated module. `.ts`/`.mts`/`.cts` generates TypeScript; `.js`/`.mjs` an ES module and its `.d.ts`; `.cjs` a CommonJS module and its `.d.cts`. |
+| `out` | The generated module of the queries in sources. `.ts`/`.mts`/`.cts` generates TypeScript; `.js`/`.mjs` an ES module and its `.d.ts`; `.cjs` a CommonJS module and its `.d.cts`. |
+| `sql` | The `.sql` files of queries: `{ "include", "emit", "out", "typeNames" }`, see [Queries in .sql files](#queries-in-sql-files). A database has `out`, `sql` or both. |
 | `migrations` | The migrations directory (default `migrations`), or `{ "dir", "table", "lockId", "useTransaction", "failOnDrift", "embed" }` — the runner's settings, as in Rust. `"embed": true` adds the migrations to the generated module. |
 | `extraMigrations` | More directories the schema is built from but the runner doesn't apply (tables another project owns). |
 | `types` | PG type → TypeScript type, as `"./src/types#Prefs"` (relative to the config) or `"package#Type"`. A JSONB domain, an enum, a composite or any other type; an unqualified name is in `public`, a built-in type is `pg_catalog.<name>`. See [Mapping types](#mapping-types). |
-| `int8` | `"bigint"` (default, exact), `"string"` (exact, as `pg` returns it) or `"number"` (an error beyond 2^53 instead of a rounded value). |
 | `runtime` | The module the generated code imports the runtime from (default `@cubos/typedpg`). |
 | `databases` | Several databases: `{ "main": { "out": …, "migrations": … }, "warehouse": { … } }`, each with the keys above. A query belongs to the database whose module its `sql` comes from. |
 
@@ -64,6 +64,7 @@ Unknown keys are errors.
 npx typedpg gen            # write the generated modules
 npx typedpg gen --watch    # and keep them up to date
 npx typedpg check          # in CI: fail if a module is stale or a query has an error
+npx typedpg build          # compile the .sql files into the loaders' cache
 ```
 
 `gen` prints each error at its place in your sources, the line and column of
@@ -148,6 +149,97 @@ Streams the rows through `COPY ... FROM STDIN`: an array, any iterable, or
 an async iterable, encoded one at a time. A failing row (or source) aborts
 the COPY and no row is kept. On node-postgres it needs `pg-copy-streams`.
 
+## Queries in .sql files
+
+Queries can live in `.sql` files instead, each a `/* @name */` comment and
+one statement, with the same `$name` parameters, `$..spreads` and
+`"col!"` annotations:
+
+```sql
+-- src/users/queries.sql
+/* @name userById */
+SELECT id, name, email FROM users WHERE id = $id;
+
+/* @name renameUser */
+UPDATE users SET name = $name WHERE id = $id;
+```
+
+```json
+{ "sql": { "include": ["src/**/queries.sql"] } }
+```
+
+Each query is an export, typed with an interface per query
+(`UserByIdParams`, `UserByIdRow`):
+
+```ts
+import { userById, type UserByIdRow } from "./users/queries.ts";
+
+const user = await userById.fetchOne(pool, { id: 42 });
+```
+
+`include` takes globs relative to the config's directory (`*` stays in a
+directory, `**` crosses them; the migrations directories are never read).
+An error points into the file (`src/users/queries.sql:2:8: error: …`), and
+a query with one is still exported, so each use of it fails to type-check
+with the error. `typeNames` names the interfaces: `{ "params":
+"{Name}Params", "row": "{Name}Row" }` by default, `{Name}` the query's name
+with its first letter capitalized — `"I{Name}Params"` / `"I{Name}Result"`
+are pgtyped's.
+
+What `typedpg gen` writes for each file is `emit`:
+
+| `emit` | Writes | Code imports | Types for |
+|---|---|---|---|
+| `"ts"` (default) | the module beside it, at `out` (default `"{dir}/{name}.ts"`; `.js`, `.mjs`, `.cjs` work as for the database's `out`) | `./queries.ts` | any tsc, `bun check` |
+| `"dts"` | `queries.d.sql.ts`, the types alone | `./queries.sql` (a loader runs it) | any tsc with `allowArbitraryExtensions`, `bun check` |
+| `"none"` | nothing | `./queries.sql` (a loader runs it) | tsc 7.1+, through the content mapper |
+
+`gen` won't overwrite a file it didn't generate (but pgtyped's, to ease
+moving from it), and deletes the module of a `.sql` file that is gone.
+
+### Importing .sql files
+
+With `emit` `"dts"` or `"none"`, the code imports the `.sql` file itself,
+and a loader or bundler plugin gives its module:
+
+| Runtime or bundler | |
+|---|---|
+| Node.js 22.15+ | `node --import @cubos/typedpg/register app.ts` |
+| Bun | `bun --preload @cubos/typedpg/bun app.ts` (or `preload` in `bunfig.toml`); `Bun.build({ plugins: [typedpg] })` with `import typedpg from "@cubos/typedpg/bun"` |
+| esbuild | `plugins: [typedpg()]`, `import typedpg from "@cubos/typedpg/esbuild"` |
+| Vite, vitest, Rollup, Rolldown | `plugins: [typedpg()]`, `import typedpg from "@cubos/typedpg/vite"` (or `/rollup`) |
+| webpack, rspack | `{ test: /\.sql$/, loader: "@cubos/typedpg/webpack", type: "javascript/esm" }` |
+
+None of them analyzes a query: they read the module from a cache,
+`node_modules/.cache/typedpg` (`TYPEDPG_CACHE_DIR` to move it), keyed by the
+typedpg version, the config, the migrations and the file. A file with no
+entry runs `typedpg build` once, which compiles every file missing one. Run
+`typedpg build` when building an image: the cache is then complete, and the
+image needs neither the binary nor the analysis at startup.
+
+### The content mapper (TypeScript 7.1)
+
+TypeScript 7.1 reads a `.sql` file's types from typedpg itself, with no
+file written (`emit: "none"`):
+
+```json
+{
+  "compilerOptions": { … },
+  "contentMappers": [{ "package": "@cubos/typedpg", "extensions": [".sql"] }]
+}
+```
+
+`tsc --runExternalCode` then checks the `.sql` files too, each error at its
+place in the file. In VS Code it needs a trusted workspace, and the
+[typedpg extension](../typedpg_vscode/README.md) for the errors inside an
+open `.sql` file (the hover and types where it is imported work without it). The
+`typedpg.config.json` is the nearest one above `tsconfig.json`, or the
+mapper's `"options": { "config": "path/to/typedpg.config.json" }`. With a
+`.d.sql.ts` present too, the mapper wins: commit them (`emit: "dts"`) for
+the tools without content mappers, and tsc 7.1 still reads the `.sql` file.
+A new migration file is seen once the config or a known migration changes
+(TypeScript watches the files the mapper names, not directories).
+
 ## Executors and drivers
 
 Pass what your application already has:
@@ -171,7 +263,7 @@ says, whatever `pg.types.setTypeParser` your application set up.
 |------------|------------|
 | `bool` | `boolean`; a parameter must be a boolean (`true` / `false`) — a string or a number is refused |
 | `int2`, `int4`, `float4`, `float8`, `oid` | `number` |
-| `int8` | `bigint` (see `int8`); parameters also take `number` and `string` |
+| `int8` | `bigint`; parameters also take `number` and `string` |
 | `numeric` | `string` (exact); parameters also take `number` |
 | `text`, `varchar`, `char`, `uuid`, `date`, `time`, `timetz`, `inet`, `money`, … | `string` |
 | `timestamptz`, `timestamp` | `Date`, parameters too (a `timestamp`, which has no time zone, is read and written as UTC). A `Date` is never `infinity`: `to_char` and `extract` of a parameter are never NULL |

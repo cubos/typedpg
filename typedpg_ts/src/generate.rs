@@ -20,6 +20,14 @@ pub struct Generated {
     /// The member's type: `{ params: …; row: …; value: … }` for a query,
     /// `{ row: … }` for a COPY target.
     pub types: String,
+    /// The members of `params` (none for a COPY target), `name: type`.
+    pub params: Vec<String>,
+    /// The members of `row`.
+    pub row: Vec<String>,
+    /// The single column's type, for a query with one column.
+    pub value: Option<String>,
+    /// The TS names of the `types` overrides the types use, sorted.
+    pub overrides: Vec<String>,
     /// The runtime table's entry, as JSON: `{"sql":[…],"params":[…],…}`. A
     /// string in the generated module rather than an object literal: tsc
     /// then has one string type to check per query instead of a tree of
@@ -61,10 +69,15 @@ pub fn generate(
     kind: Kind,
     text: &str,
 ) -> Result<Generated, GenError> {
-    match kind {
+    mapper.used.borrow_mut().clear();
+    let mut g = match kind {
         Kind::Query => generate_query(&catalog.analyze_located(text)?, mapper),
         Kind::CopyIn => generate_copy_in(&catalog.analyze_copy_in_located(text)?, mapper),
-    }
+    }?;
+    g.overrides = std::mem::take(&mut *mapper.used.borrow_mut())
+        .into_iter()
+        .collect();
+    Ok(g)
 }
 
 const RECORD_PARAM: &str = "anonymous record-typed query parameters are not supported — pass \
@@ -79,8 +92,8 @@ fn generate_query(a: &AnalyzedQuery, mapper: &TypeMapper) -> Result<Generated, G
         .find(|p| p.name.starts_with(|c: char| c.is_ascii_digit()))
     {
         return Err(GenError::plain(format!(
-            "positional placeholder `${}` is not supported in sql(): name the parameter (e.g. \
-             `$id`) so it can be bound",
+            "positional placeholder `${}` is not supported: name the parameter (e.g. `$id`) so it \
+             can be bound",
             p.name
         )));
     }
@@ -169,9 +182,15 @@ fn generate_query(a: &AnalyzedQuery, mapper: &TypeMapper) -> Result<Generated, G
         object(&params_ty, 4),
         object(&row_ty, 4)
     );
-    if let [c] = a.columns.as_slice() {
-        let m = mapper.map_refined(&c.pg_type, &c.refinement);
-        let _ = writeln!(types, "    value: {};", nullable(&m.output, c.nullable));
+    let value = match a.columns.as_slice() {
+        [c] => Some(nullable(
+            &mapper.map_refined(&c.pg_type, &c.refinement).output,
+            c.nullable,
+        )),
+        _ => None,
+    };
+    if let Some(v) = &value {
+        let _ = writeln!(types, "    value: {v};");
     }
     types.push_str("  }");
 
@@ -224,6 +243,10 @@ fn generate_query(a: &AnalyzedQuery, mapper: &TypeMapper) -> Result<Generated, G
     }
     Ok(Generated {
         types,
+        params: params_ty,
+        row: row_ty,
+        value,
+        overrides: Vec::new(),
         runtime: Value::Object(spec).to_string(),
     })
 }
@@ -255,6 +278,10 @@ fn generate_copy_in(c: &AnalyzedCopyIn, mapper: &TypeMapper) -> Result<Generated
         .collect();
     Ok(Generated {
         types: format!("{{\n    row: {};\n  }}", object(&row, 4)),
+        params: Vec::new(),
+        row,
+        value: None,
+        overrides: Vec::new(),
         runtime: json!({ "sql": copy_sql, "columns": columns }).to_string(),
     })
 }
@@ -298,7 +325,7 @@ fn member(name: &str, ty: &str, is_nullable: bool) -> String {
 }
 
 /// `{ a: T; b: U }` over several lines, or `{}`.
-fn object(members: &[String], indent: usize) -> String {
+pub fn object(members: &[String], indent: usize) -> String {
     if members.is_empty() {
         return "{}".to_owned();
     }
@@ -452,7 +479,6 @@ fn cast_range(a: &AnalyzedQuery, start: usize, end: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Int8;
     use std::collections::HashMap;
 
     const DDL: &str = "CREATE TYPE mood AS ENUM ('happy', 'sad');
@@ -469,7 +495,7 @@ mod tests {
         let overrides = HashMap::new();
         let mapper = TypeMapper {
             overrides: &overrides,
-            int8: Int8::Bigint,
+            used: Default::default(),
         };
         generate(&c, &mapper, kind, sql)
     }
