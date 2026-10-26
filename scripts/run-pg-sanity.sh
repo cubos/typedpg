@@ -20,7 +20,9 @@
 
 set -euo pipefail
 
-PG_IMAGE="${PG_IMAGE:-postgres:18}"
+# The release typedpg_pg_query's grammar (and the seed) comes from.
+PG_VERSION=$(sed -n 's/^#define PG_VERSION "\(.*\)"$/\1/p' "$(dirname "$0")/../typedpg_pg_query/libpg_query/pg_query.h")
+PG_IMAGE="${PG_IMAGE:-postgres:$PG_VERSION}"
 CONTAINER_NAME="typedpg-pg-sanity-$$"
 PG_USER="postgres"
 PG_PASS="postgres"
