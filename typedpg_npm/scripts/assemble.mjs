@@ -50,7 +50,7 @@ rmSync(out, { recursive: true, force: true });
 /** Copy a package's build, README and the repository's licenses into `to`. */
 function copyInto(from, to, entries) {
   for (const entry of entries) {
-    const src = ["LICENSE-MIT", "LICENSE-APACHE"].includes(entry) ? join(repo, entry) : join(from, entry);
+    const src = entry === "LICENSE" ? join(repo, entry) : join(from, entry);
     if (existsSync(src)) cpSync(src, join(to, entry), { recursive: true, filter: (p) => !/\.test\.(js|d\.ts)$/.test(p) });
   }
 }
@@ -85,9 +85,9 @@ for (const target of readdirSync(binaries).sort()) {
 {
   const dir = join(out, "typedpg");
   mkdirSync(dir, { recursive: true });
-  copyInto(pkgDir, dir, ["dist", "README.md", "LICENSE-MIT", "LICENSE-APACHE"]);
+  copyInto(pkgDir, dir, ["dist", "README.md", "LICENSE"]);
   const { devDependencies: _, scripts: __, ...published } = main;
-  const files = [...published.files, "LICENSE-MIT", "LICENSE-APACHE"];
+  const files = [...published.files, "LICENSE"];
   writeFileSync(join(dir, "package.json"), JSON.stringify({ ...published, files }, null, 2) + "\n");
 }
 
@@ -96,10 +96,10 @@ for (const target of readdirSync(binaries).sort()) {
 {
   const dir = join(out, "typedpg-cli");
   mkdirSync(dir, { recursive: true });
-  copyInto(cliDir, dir, ["dist", "bin", "README.md", "LICENSE-MIT", "LICENSE-APACHE"]);
+  copyInto(cliDir, dir, ["dist", "bin", "README.md", "LICENSE"]);
   const { devDependencies: _, scripts: __, ...published } = cli;
   const dependencies = { ...published.dependencies, [main.name]: main.version };
-  const files = [...published.files, "LICENSE-MIT", "LICENSE-APACHE"];
+  const files = [...published.files, "LICENSE"];
   writeFileSync(
     join(dir, "package.json"),
     JSON.stringify({ ...published, dependencies, files, optionalDependencies: optional }, null, 2) + "\n",

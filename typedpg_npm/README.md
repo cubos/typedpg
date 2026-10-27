@@ -399,4 +399,4 @@ Pass a pool or a client, not a transaction: each migration runs in its own.
 
 ## License
 
-MIT OR Apache-2.0.
+MIT.
