@@ -133,7 +133,8 @@ impl MigrationSource {
                 crate::Error::Migration(format!("invalid file name: {}", path.display()))
             })?;
 
-            let (version, _description) = parse_migration_name(file_stem, &path)?;
+            let version = typedpg_core::migrations::parse_migration_name(file_stem)
+                .map_err(|e| crate::Error::Migration(e.message(path.display())))?;
 
             // A file edited on Windows starts with a BOM, which PostgreSQL
             // rejects as a syntax error.
@@ -144,7 +145,7 @@ impl MigrationSource {
             let down_sql = down_files.remove(file_stem);
 
             migrations.push(Migration {
-                version,
+                version: version.to_owned(),
                 name: file_stem.to_string(),
                 sql,
                 down_sql,
@@ -220,10 +221,11 @@ impl MigrationSource {
             // Reuse from_dir's parser so the format error wording stays
             // identical — pass the stem as the file path for nice errors.
             let synthetic_path = std::path::PathBuf::from(format!("{stem}.sql"));
-            let (version, _description) = parse_migration_name(stem, &synthetic_path)?;
+            let version = typedpg_core::migrations::parse_migration_name(stem)
+                .map_err(|e| crate::Error::Migration(e.message(synthetic_path.display())))?;
             let no_transaction = has_no_transaction_marker(up);
             migrations.push(Migration {
-                version,
+                version: version.to_owned(),
                 name: stem.to_owned(),
                 sql: up.to_owned(),
                 down_sql: down.map(str::to_owned),
@@ -274,36 +276,6 @@ impl MigrationSource {
 /// (`typedpg_core::migration_marker`).
 pub(crate) fn has_no_transaction_marker(sql: &str) -> bool {
     typedpg_core::migration_marker::has_no_transaction_marker(sql)
-}
-
-/// Parses a migration file stem like "0001_create_users" into ("0001", "create_users").
-/// Returns an error if the format is invalid.
-fn parse_migration_name(stem: &str, file_path: &Path) -> Result<(String, String), crate::Error> {
-    let underscore_pos = stem.find('_').ok_or_else(|| {
-        crate::Error::Migration(format!(
-            "migration file does not follow NNNN_description.sql format: {}",
-            file_path.display()
-        ))
-    })?;
-
-    let prefix = &stem[..underscore_pos];
-    let description = &stem[underscore_pos + 1..];
-
-    if prefix.is_empty() || !prefix.chars().all(|c| c.is_ascii_digit()) {
-        return Err(crate::Error::Migration(format!(
-            "migration file does not have a numeric prefix (NNNN_...): {}",
-            file_path.display()
-        )));
-    }
-
-    if description.is_empty() {
-        return Err(crate::Error::Migration(format!(
-            "migration file has no description after prefix: {}",
-            file_path.display()
-        )));
-    }
-
-    Ok((prefix.to_string(), description.to_string()))
 }
 
 #[cfg(test)]

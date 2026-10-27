@@ -12,6 +12,8 @@
 //! - [`config`] -- Parses `[package.metadata.typedpg]` from `Cargo.toml`.
 //! - [`build`] -- Build-script helper that re-runs `sql!` when migrations change.
 //! - [`qualified_name`] -- PostgreSQL schema-qualified identifiers.
+//! - [`migrations`] -- The pure helpers both migration runners share (order,
+//!   file names, statement splitting, drift).
 
 pub mod build;
 pub mod config;

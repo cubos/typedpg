@@ -13,6 +13,7 @@ than the extra build time costs).
 ```bash
 cargo build                                          # build all crates
 cargo build -p typedpg                             # build specific crate
+cargo build -p typedpg_wasm --target wasm32-unknown-unknown --profile wasm  # npm runtime's helpers
 cargo nextest run --release                          # all tests (no Docker needed)
 cargo nextest run --release -p typedpg_core        # core crate only
 cargo nextest run --release -p typedpg_macros      # macro crate only
@@ -48,13 +49,25 @@ npm runtime package (with the loaders and bundler plugins of `.sql` files),
 `typedpg_ts_example` the project the end-to-end run uses (`loaders/` in it
 imports a `.sql` file itself).
 
+The npm runtime and the Rust runner must agree on what a migration is: they
+share the pure helpers (statement splitting, drift normalization and hash,
+ordering, file-name and tracking-table validation, error and drift messages)
+from `typedpg_core`, compiled to WebAssembly by `typedpg_wasm`. Building
+`typedpg_npm` (`npm run build` there) runs `scripts/wasm.mjs` (cargo, wasm32)
+and embeds the module in a generated `src/wasm.generated.ts`, so building or
+testing the package needs Rust and the wasm target:
+
+```bash
+rustup target add wasm32-unknown-unknown
+```
+
 The loaders' cache key is computed twice, by `typedpg_ts/src/cache.rs` and
 `typedpg_npm/src/sqlfiles.ts`: change the recipe in both (the e2e runs the
 Node hook on a cache `typedpg build` filled, without the binary).
 
 ```bash
 cargo nextest run --release -p typedpg_ts        # scanner, codegen, incremental project
-(cd typedpg_npm && npm ci && npm test)           # runtime unit tests (codecs)
+(cd typedpg_npm && npm ci && npm test)           # runtime unit tests (codecs, wasm bridge)
 scripts/run-ts-e2e.sh                            # everything, on a PostgreSQL container
 BLESS=1 scripts/run-ts-e2e.sh                    # rewrite the errors fixtures' expected outputs
 ```
@@ -84,11 +97,14 @@ Workspace with crates:
 ```
 typedpg_cli (binary: `cargo typedpg migrate up/down/status/create`)
     └── typedpg (runtime: Pool, Executor, migrate)
-            ├── typedpg_core (shared config only — kept small so runtime does not pull pg_query)
+            ├── typedpg_core (shared config and migration helpers — kept small so runtime does not pull pg_query)
             └── typedpg_macros (proc macro: sql!)
                     ├── typedpg_core
                     └── typedpg_analyzer (compile-time only: lexer, param types, query_info, type_map, static SQL analyzer)
                             └── typedpg_pg_query (PostgreSQL parser: our libpg_query binding)
+
+typedpg_wasm (the same migration helpers, compiled to WebAssembly for typedpg_npm)
+    └── typedpg_core
 ```
 
 `typedpg_pg_query` compiles libpg_query from a git submodule pinned to a

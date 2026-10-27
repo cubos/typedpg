@@ -14,7 +14,18 @@ members = [
     "typedpg_compile_fail",
     "typedpg_test_support",
     "typedpg_ts",
+    "typedpg_wasm",
 ]
+
+# The npm runtime's copy of the migration helpers, compiled to WebAssembly:
+# small and self-contained (it must fit in a JS string).
+[profile.wasm]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
 
 # Shared metadata inherited by the publishable crates via `<field>.workspace = true`.
 [workspace.package]

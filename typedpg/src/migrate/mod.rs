@@ -69,10 +69,8 @@
 //! # }
 //! ```
 
-mod normalize;
 mod runner;
 mod source;
-mod split;
 
 pub use runner::{MigrationStatus, accept, revert, run, status};
 pub use source::{Migration, MigrationSource};
