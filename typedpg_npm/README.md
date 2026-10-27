@@ -328,17 +328,26 @@ npx typedpg migrate create add_posts   # migrations/<timestamp>_add_posts.sql + 
 npx typedpg migrate up                 # DATABASE_URL (a .env is read), or --url
 npx typedpg migrate status
 npx typedpg migrate down [name] [--force]
+npx typedpg migrate accept <name>      # record an intentional edit; runs nothing
 npx typedpg migrate up --db warehouse  # with several databases
 ```
+
+Editing an applied migration's statements is drift: with `failOnDrift` (the
+default) the run aborts before applying anything new and prints a unified diff
+of the applied text against the file; with `failOnDrift: false` it only warns.
+Comments, whitespace and the case of unquoted words do not count. An
+intentional edit that does not need to run again is recorded with
+`acceptMigration` (or `typedpg migrate accept <name>`) without running it.
 
 At startup, from the generated module (`"migrations": { "embed": true }`)
 or from a directory:
 
 ```ts
-import { migrate, migrationStatus, revertMigration, loadMigrations } from "@cubos/typedpg";
+import { acceptMigration, migrate, migrationStatus, revertMigration, loadMigrations } from "@cubos/typedpg";
 import { migrations } from "./db"; // or: loadMigrations("./migrations")
 
 const applied = await migrate(pool, migrations);
+await acceptMigration(pool, migrations, "0002_add_email"); // after an intentional edit
 ```
 
 Pass a pool or a client, not a transaction: each migration runs in its own.

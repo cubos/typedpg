@@ -1,22 +1,32 @@
 use tokio_postgres::Client;
 
 use super::MigrationsConfig;
+use super::normalize::{HASH_VERSION, hash};
 use super::source::MigrationSource;
 use super::source::has_no_transaction_marker;
 use super::split::split_statements;
 
-/// Computes the MD5 hex digest of a migration's SQL content.
-///
-/// Must match the hash the server computes for the stored text,
-/// [`STORED_SQL_HASH`], so the two can be compared.
-fn sql_hash(sql: &str) -> String {
-    format!("{:x}", md5::compute(sql.as_bytes()))
+/// An applied migration's stored drift hash, as `run` reads it: no
+/// `sql_source` download, only the hash and the algorithm that made it.
+#[derive(Debug, Clone)]
+struct AppliedMigration {
+    hash: Option<String>,
+    hash_version: Option<i32>,
 }
 
-/// The MD5 of a stored migration's UTF-8 bytes. `md5(text)` would hash
-/// the text in the *database* encoding: on a LATIN1 database every
-/// migration with a non-ASCII character would look drifted.
-const STORED_SQL_HASH: &str = "md5(convert_to(sql_source, 'UTF8'))";
+impl AppliedMigration {
+    /// Whether the stored hash differs from the file's, computed with the
+    /// current algorithm. A row without a hash (no `sql_source` stored, from
+    /// before that column existed) is not checked, and neither is one whose
+    /// hash predates the current algorithm — `run` re-hashes it first.
+    fn drifted(&self, sql: &str) -> bool {
+        self.hash_version == Some(HASH_VERSION)
+            && self
+                .hash
+                .as_deref()
+                .is_some_and(|stored| stored != hash(sql))
+    }
+}
 
 /// Formats a `tokio_postgres::Error` including the underlying Postgres
 /// `DbError` details (severity, message, detail, hint, position), which are
@@ -104,7 +114,9 @@ pub struct MigrationStatus {
     pub applied: bool,
     /// Timestamp when the migration was applied, or `None` if it is still pending.
     pub applied_at: Option<chrono::DateTime<chrono::Utc>>,
-    /// `true` if the migration's SQL source on disk differs from what was originally applied.
+    /// `true` if the migration's statements on disk differ from what was
+    /// originally applied. Comments, whitespace and unquoted case do not
+    /// count.
     pub drifted: bool,
 }
 
@@ -177,6 +189,7 @@ async fn run_inner(
     source: &MigrationSource,
     config: &MigrationsConfig,
 ) -> Result<Vec<String>, crate::Error> {
+    backfill_hashes(client, config).await?;
     let applied = get_applied(client, config).await?;
     let mut newly_applied = Vec::new();
 
@@ -184,23 +197,23 @@ async fn run_inner(
     // runs: a pending migration can sort before an applied one (merged out
     // of order), and must not run when the run is going to abort.
     for migration in source.migrations() {
-        let Some(Some(h)) = applied.get(&migration.name) else {
+        let Some(stored) = applied.get(&migration.name) else {
             continue;
         };
-        if *h != sql_hash(&migration.sql) {
-            if config.fail_on_drift {
-                return Err(crate::Error::Migration(format!(
-                    "migration '{}' has been modified since it was applied; \
-                     set [package.metadata.typedpg.migrations] fail_on_drift = false \
-                     to downgrade to a warning",
-                    migration.name
-                )));
-            }
-            eprintln!(
-                "warning: migration '{}' has been modified since it was applied",
-                migration.name
-            );
+        if !stored.drifted(&migration.sql) {
+            continue;
         }
+        let stored_sql = stored_sql_source(client, config, &migration.name).await?;
+        let message = drift_message(
+            &migration.name,
+            stored_sql.as_deref(),
+            &migration.sql,
+            config.fail_on_drift,
+        );
+        if config.fail_on_drift {
+            return Err(crate::Error::Migration(message));
+        }
+        eprintln!("warning: {message}");
     }
 
     for migration in source.migrations() {
@@ -209,6 +222,7 @@ async fn run_inner(
         }
 
         let use_tx = config.use_transaction && !migration.no_transaction;
+        let migration_hash = hash(&migration.sql);
 
         if use_tx {
             let tx = client.transaction().await?;
@@ -223,10 +237,16 @@ async fn run_inner(
 
             tx.execute(
                 &format!(
-                    "INSERT INTO {} (name, sql_source) VALUES ($1, $2)",
+                    "INSERT INTO {} (name, sql_source, hash, hash_version) \
+                     VALUES ($1, $2, $3, $4)",
                     config.table
                 ),
-                &[&migration.name, &migration.sql],
+                &[
+                    &migration.name,
+                    &migration.sql,
+                    &migration_hash,
+                    &HASH_VERSION,
+                ],
             )
             .await?;
 
@@ -245,10 +265,16 @@ async fn run_inner(
             client
                 .execute(
                     &format!(
-                        "INSERT INTO {} (name, sql_source) VALUES ($1, $2)",
+                        "INSERT INTO {} (name, sql_source, hash, hash_version) \
+                         VALUES ($1, $2, $3, $4)",
                         config.table
                     ),
-                    &[&migration.name, &migration.sql],
+                    &[
+                        &migration.name,
+                        &migration.sql,
+                        &migration_hash,
+                        &HASH_VERSION,
+                    ],
                 )
                 .await?;
         }
@@ -257,6 +283,88 @@ async fn run_inner(
     }
 
     Ok(newly_applied)
+}
+
+/// The one-time upgrade of a tracking table's stored hashes: every row whose
+/// `hash_version` is not the current one gets the normalized hash of its
+/// stored text, when it has one. Rows without `sql_source` stay unhashed —
+/// they can never drift.
+async fn backfill_hashes(client: &Client, config: &MigrationsConfig) -> Result<(), crate::Error> {
+    let rows = client
+        .query(
+            &format!(
+                "SELECT name, sql_source FROM {} \
+                 WHERE hash_version IS DISTINCT FROM $1::int4 AND sql_source IS NOT NULL",
+                config.table
+            ),
+            &[&HASH_VERSION],
+        )
+        .await?;
+    for row in &rows {
+        let name: String = row.get(0);
+        let sql: String = row.get(1);
+        client
+            .execute(
+                &format!(
+                    "UPDATE {} SET hash = $1, hash_version = $2 WHERE name = $3",
+                    config.table
+                ),
+                &[&hash(&sql), &HASH_VERSION, &name],
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+/// The stored `sql_source` of a drifted migration, for its diff.
+async fn stored_sql_source(
+    client: &Client,
+    config: &MigrationsConfig,
+    name: &str,
+) -> Result<Option<String>, crate::Error> {
+    let row = client
+        .query_opt(
+            &format!("SELECT sql_source FROM {} WHERE name = $1", config.table),
+            &[&name],
+        )
+        .await?;
+    Ok(row.and_then(|row| row.get(0)))
+}
+
+/// The drift message: the migration's name, a unified diff of what was
+/// applied against the file (when its text is stored), and how to make an
+/// intentional edit stop being drift. The error also says how to downgrade
+/// drift to a warning.
+fn drift_message(
+    name: &str,
+    stored_sql: Option<&str>,
+    file_sql: &str,
+    fail_on_drift: bool,
+) -> String {
+    let mut message = format!("migration '{name}' has been modified since it was applied:");
+    if let Some(stored_sql) = stored_sql {
+        let file_name = format!("{name}.sql");
+        let diff = similar::TextDiff::from_lines(stored_sql, file_sql)
+            .unified_diff()
+            .context_radius(3)
+            .header("applied", &file_name)
+            .to_string();
+        message.push('\n');
+        message.push_str(diff.trim_end());
+    }
+    message.push_str(&format!(
+        "\nIf the change is intentional (it does not need to run again), record the file as \
+         applied with `typedpg migrate accept {name}`; otherwise restore the file and add a new \
+         migration."
+    ));
+    if fail_on_drift {
+        message.push_str(
+            "\nSet fail_on_drift = false ([package.metadata.typedpg.migrations] in Cargo.toml) \
+             or \"failOnDrift\": false (\"migrations\" in typedpg.config.json) to downgrade this \
+             to a warning.",
+        );
+    }
+    message
 }
 
 /// Returns the status of all known migrations (applied and pending).
@@ -296,56 +404,102 @@ pub async fn status(
 ) -> Result<Vec<MigrationStatus>, crate::Error> {
     validate(config)?;
 
-    // Read-only, so neither create the table nor add the column `run`
+    // Read-only, so neither create the table nor add the columns `run`
     // would: a table from before `sql_source` existed reads with no stored
     // text, and no table at all as nothing applied.
-    let (exists, has_sql_source): (bool, bool) = {
+    let (exists, has_sql_source, has_hash, has_hash_version): (bool, bool, bool, bool) = {
         let row = client
             .query_one(
                 "SELECT c.oid IS NOT NULL,
                         EXISTS (SELECT 1 FROM pg_catalog.pg_attribute a
                                 WHERE a.attrelid = c.oid AND a.attname = 'sql_source'
+                                  AND NOT a.attisdropped),
+                        EXISTS (SELECT 1 FROM pg_catalog.pg_attribute a
+                                WHERE a.attrelid = c.oid AND a.attname = 'hash'
+                                  AND NOT a.attisdropped),
+                        EXISTS (SELECT 1 FROM pg_catalog.pg_attribute a
+                                WHERE a.attrelid = c.oid AND a.attname = 'hash_version'
                                   AND NOT a.attisdropped)
                  FROM (SELECT pg_catalog.to_regclass($1) AS oid) AS c",
                 &[&config.table],
             )
             .await?;
-        (row.get(0), row.get(1))
-    };
-    let rows = if !exists {
-        Vec::new()
-    } else {
-        let source_column = if has_sql_source {
-            STORED_SQL_HASH
-        } else {
-            "NULL::text"
-        };
-        client
-            .query(
-                &format!(
-                    "SELECT name, applied_at, {source_column} FROM {} ORDER BY name",
-                    config.table
-                ),
-                &[],
-            )
-            .await?
+        (row.get(0), row.get(1), row.get(2), row.get(3))
     };
 
     let mut applied: std::collections::HashMap<
         String,
         (chrono::DateTime<chrono::Utc>, Option<String>),
-    > = std::collections::HashMap::with_capacity(rows.len());
-    for row in &rows {
-        let name: String = row
-            .try_get(0)
-            .map_err(|e| crate::Error::Migration(format!("failed to read migration name: {e}")))?;
-        let applied_at: chrono::DateTime<chrono::Utc> = row
-            .try_get(1)
-            .map_err(|e| crate::Error::Migration(format!("failed to read applied_at: {e}")))?;
-        let stored_hash: Option<String> = row
-            .try_get(2)
-            .map_err(|e| crate::Error::Migration(format!("failed to read sql_hash: {e}")))?;
-        applied.insert(name, (applied_at, stored_hash));
+    > = std::collections::HashMap::new();
+    if exists {
+        let hash_column = if has_hash { "hash" } else { "NULL::text" };
+        let version_column = if has_hash_version {
+            "hash_version"
+        } else {
+            "NULL::int4"
+        };
+        let rows = client
+            .query(
+                &format!(
+                    "SELECT name, applied_at, {hash_column}, {version_column} \
+                     FROM {} ORDER BY name",
+                    config.table
+                ),
+                &[],
+            )
+            .await?;
+        for row in &rows {
+            let name: String = row.try_get(0).map_err(|e| {
+                crate::Error::Migration(format!("failed to read migration name: {e}"))
+            })?;
+            let applied_at: chrono::DateTime<chrono::Utc> = row
+                .try_get(1)
+                .map_err(|e| crate::Error::Migration(format!("failed to read applied_at: {e}")))?;
+            let stored_hash: Option<String> = row
+                .try_get(2)
+                .map_err(|e| crate::Error::Migration(format!("failed to read hash: {e}")))?;
+            let hash_version: Option<i32> = row.try_get(3).map_err(|e| {
+                crate::Error::Migration(format!("failed to read hash_version: {e}"))
+            })?;
+            // Only a current-algorithm hash is read; an older row's text is
+            // hashed in memory below.
+            let stored_hash = if hash_version == Some(HASH_VERSION) {
+                stored_hash
+            } else {
+                None
+            };
+            applied.insert(name, (applied_at, stored_hash));
+        }
+
+        // The stale rows' text is fetched (and hashed) here, never written
+        // back: `status` only reads.
+        if has_sql_source {
+            let stale_filter = if has_hash_version {
+                " AND hash_version IS DISTINCT FROM $1::int4"
+            } else {
+                ""
+            };
+            let sql = format!(
+                "SELECT name, sql_source FROM {} WHERE sql_source IS NOT NULL{stale_filter}",
+                config.table
+            );
+            let rows = if has_hash_version {
+                client.query(&sql, &[&HASH_VERSION]).await?
+            } else {
+                client.query(&sql, &[]).await?
+            };
+            for row in &rows {
+                let name: String = row.try_get(0).map_err(|e| {
+                    crate::Error::Migration(format!("failed to read migration name: {e}"))
+                })?;
+                let stored_sql: String = row.try_get(1).map_err(|e| {
+                    crate::Error::Migration(format!("failed to read sql_source: {e}"))
+                })?;
+                if let Some((_, stored_hash)) = applied.get_mut(&name) {
+                    *stored_hash = Some(hash(&stored_sql));
+                }
+            }
+        }
     }
 
     let statuses = source
@@ -353,10 +507,11 @@ pub async fn status(
         .iter()
         .map(|m| {
             let info = applied.get(&m.name);
-            let drifted = match &info {
-                Some((_, Some(stored))) => *stored != sql_hash(&m.sql),
-                _ => false,
-            };
+            let drifted = info.is_some_and(|(_, stored)| {
+                stored
+                    .as_deref()
+                    .is_some_and(|stored| stored != hash(&m.sql))
+            });
             if drifted {
                 eprintln!(
                     "warning: migration '{}' has been modified since it was applied",
@@ -523,6 +678,90 @@ async fn revert_inner(
     Ok(())
 }
 
+/// Records an applied migration's current file as applied, without running
+/// it.
+///
+/// For an intentional edit of an applied migration that does not need to
+/// run again: the file's text and normalized hash replace the stored ones,
+/// so the run no longer reports drift. `applied_at` and the database are
+/// untouched.
+///
+/// Acquires an advisory lock for the duration of the operation.
+///
+/// # Errors
+///
+/// - [`Error::Migration`](crate::Error::Migration) if `name` is not in the
+///   source, or has not been applied.
+/// - [`Error::Database`](crate::Error::Database) on connection or lock errors.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use typedpg::migrate::{MigrationSource, MigrationsConfig, accept};
+/// use std::path::Path;
+///
+/// # async fn example(client: &mut tokio_postgres::Client) -> Result<(), typedpg::Error> {
+/// let source = MigrationSource::from_dir(Path::new("./migrations"))?;
+/// let config = MigrationsConfig::default();
+///
+/// // The file's comment was fixed after it ran: record it, run nothing.
+/// accept(client, &source, &config, "0002_add_email").await?;
+/// # Ok(())
+/// # }
+/// ```
+pub async fn accept(
+    client: &mut Client,
+    source: &MigrationSource,
+    config: &MigrationsConfig,
+    name: &str,
+) -> Result<(), crate::Error> {
+    validate(config)?;
+    acquire_lock(client, config).await?;
+
+    // Under the lock, as in `run`.
+    let result = match ensure_table(client, config).await {
+        Ok(()) => accept_inner(client, source, config, name).await,
+        Err(e) => Err(e),
+    };
+
+    let release = release_lock(client, config).await;
+    match (&result, release) {
+        (Ok(_), Ok(_)) => result,
+        (Ok(_), Err(rel_err)) => Err(rel_err),
+        (Err(_), Err(rel_err)) => {
+            eprintln!("typedpg: failed to release advisory lock: {rel_err}");
+            result
+        }
+        (Err(_), Ok(_)) => result,
+    }
+}
+
+async fn accept_inner(
+    client: &Client,
+    source: &MigrationSource,
+    config: &MigrationsConfig,
+    name: &str,
+) -> Result<(), crate::Error> {
+    let migration = source
+        .find(name)
+        .ok_or_else(|| crate::Error::Migration(format!("no migration file named '{name}'")))?;
+    if !get_applied(client, config).await?.contains_key(name) {
+        return Err(crate::Error::Migration(format!(
+            "migration '{name}' has not been applied: nothing to accept"
+        )));
+    }
+    client
+        .execute(
+            &format!(
+                "UPDATE {} SET sql_source = $1, hash = $2, hash_version = $3 WHERE name = $4",
+                config.table
+            ),
+            &[&migration.sql, &hash(&migration.sql), &HASH_VERSION, &name],
+        )
+        .await?;
+    Ok(())
+}
+
 /// Run `sql` outside a transaction, one statement at a time: sent whole,
 /// PG would run its statements in one implicit transaction block (see
 /// [`split_statements`]). Fails with the 1-based number of the failing
@@ -555,11 +794,15 @@ async fn ensure_table(client: &Client, config: &MigrationsConfig) -> Result<(), 
     validate(config)?;
     let sql = format!(
         "CREATE TABLE IF NOT EXISTS {} (
-            name       TEXT PRIMARY KEY,
-            applied_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-            sql_source TEXT
+            name         TEXT PRIMARY KEY,
+            applied_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+            sql_source   TEXT,
+            hash         TEXT,
+            hash_version INTEGER
         );
-        ALTER TABLE {0} ADD COLUMN IF NOT EXISTS sql_source TEXT;",
+        ALTER TABLE {0} ADD COLUMN IF NOT EXISTS sql_source TEXT;
+        ALTER TABLE {0} ADD COLUMN IF NOT EXISTS hash TEXT;
+        ALTER TABLE {0} ADD COLUMN IF NOT EXISTS hash_version INTEGER;",
         config.table
     );
     client.batch_execute(&sql).await?;
@@ -592,14 +835,15 @@ async fn release_lock(client: &Client, config: &MigrationsConfig) -> Result<(), 
     Ok(())
 }
 
-/// Returns a map of applied migration names to their stored SQL hash (if any).
+/// Returns a map of applied migration names to their stored drift hash (and
+/// the algorithm that computed it).
 async fn get_applied(
     client: &Client,
     config: &MigrationsConfig,
-) -> Result<std::collections::HashMap<String, Option<String>>, crate::Error> {
+) -> Result<std::collections::HashMap<String, AppliedMigration>, crate::Error> {
     let rows = client
         .query(
-            &format!("SELECT name, {STORED_SQL_HASH} FROM {}", config.table),
+            &format!("SELECT name, hash, hash_version FROM {}", config.table),
             &[],
         )
         .await?;
@@ -608,7 +852,8 @@ async fn get_applied(
     for row in &rows {
         let name: String = row.get(0);
         let hash: Option<String> = row.get(1);
-        map.insert(name, hash);
+        let hash_version: Option<i32> = row.get(2);
+        map.insert(name, AppliedMigration { hash, hash_version });
     }
 
     Ok(map)

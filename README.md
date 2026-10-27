@@ -789,9 +789,21 @@ cargo typedpg migrate down 20260406120000_add_posts_table
 
 # Force revert even without a .down.sql file
 cargo typedpg migrate down --force
+
+# Record an applied migration's edited file as applied, without running it
+cargo typedpg migrate accept 20260406120000_add_posts_table
 ```
 
 The CLI reads configuration from `[package.metadata.typedpg]` in your `Cargo.toml` and connects using the `DATABASE_URL` environment variable (supports `.env` files).
+
+Editing an applied migration's statements is drift: with `fail_on_drift` (the
+default) the run aborts before applying anything new, and prints a unified diff
+of the applied text against the file; with `fail_on_drift = false` it only
+warns. Comments, whitespace and the case of unquoted words do not count — only
+a change to the statements does. If an edit is intentional and does not need
+to run again, `cargo typedpg migrate accept <name>` records the file as
+applied without running it; otherwise restore the file and add a new
+migration.
 
 ### Programmatic
 
@@ -839,7 +851,9 @@ table = "public._migrations"       # optional — migration tracking table
 lock_id = 713705                   # optional — advisory lock ID
 use_transaction = true             # optional — wrap each migration in a tx
 fail_on_drift = true               # optional — abort if an already-applied
-                                   # migration file has been edited since
+                                   # migration's statements have been edited
+                                   # since (comments, whitespace and unquoted
+                                   # case do not count)
 
 [package.metadata.typedpg.types]       # optional — PG type → Rust type
 user_preferences = "crate::UserPrefs"  # JSONB domain → Rust struct (serde)

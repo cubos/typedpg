@@ -240,6 +240,15 @@ async fn up_status_and_down() {
         stderr.contains("migration '0001_users' has been modified since it was applied"),
         "{stderr}"
     );
+
+    // `accept` records the intentional edit without running it.
+    assert_eq!(
+        ok(&run(&["migrate", "accept", "0001_users"])),
+        "Accepted 0001_users: its current file is recorded as applied (nothing ran)\n"
+    );
+    assert_eq!(ok(&run(&["migrate", "up"])), "No pending migrations\n");
+    let status = ok(&run(&["migrate", "status"]));
+    assert!(!status.contains("[MODIFIED]"), "{status}");
 }
 
 /// The server has TLS on with a self-signed certificate. libpq does not

@@ -17,7 +17,7 @@
 //! table = "public._migrations"   # tracking table name (default: "public._migrations")
 //! lock_id = 713705               # advisory lock ID (default: 713705)
 //! use_transaction = true         # wrap each migration in a transaction (default: true)
-//! fail_on_drift = true           # abort if an applied migration's file changed (default: true)
+//! fail_on_drift = true           # abort if an applied migration's statements changed (default: true)
 //!
 //! [package.metadata.typedpg.types]
 //! user_preferences = "crate::domains::UserPreferences"  # JSONB domain
@@ -183,10 +183,12 @@ pub struct MigrationsConfig {
     #[serde(default = "MigrationsConfig::default_use_transaction")]
     pub use_transaction: bool,
 
-    /// Whether drift (an applied migration's file changing on disk after
-    /// it ran) is treated as a fatal error. With `true` the migration
+    /// Whether drift (an applied migration's statements changing on disk
+    /// after it ran) is treated as a fatal error. Comments, whitespace and
+    /// the case of unquoted words do not count. With `true` the migration
     /// runner aborts before applying anything new; with `false` it only
-    /// logs a warning and continues. Default: true.
+    /// logs a warning and continues. `accept` records an intentional edit.
+    /// Default: true.
     #[serde(default = "MigrationsConfig::default_fail_on_drift")]
     pub fail_on_drift: bool,
 }

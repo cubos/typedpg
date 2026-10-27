@@ -29,6 +29,19 @@ async fn table_exists(client: &Client, name: &str) -> bool {
         .get(0)
 }
 
+async fn column_exists(client: &Client, table: &str, column: &str) -> bool {
+    client
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_attribute a
+                            WHERE a.attrelid = pg_catalog.to_regclass($1)
+                              AND a.attname = $2 AND NOT a.attisdropped)",
+            &[&table, &column],
+        )
+        .await
+        .unwrap()
+        .get(0)
+}
+
 async fn recorded(client: &Client, table: &str) -> Vec<String> {
     client
         .query(&format!("SELECT name FROM {table} ORDER BY name"), &[])
@@ -570,7 +583,7 @@ async fn drift_is_a_warning_without_fail_on_drift() {
     migrate::run(&mut client, &first, &config).await.unwrap();
 
     let edited = MigrationSource::from_embedded([
-        ("0001_a", "CREATE TABLE a (id INT); -- edited", None),
+        ("0001_a", "CREATE TABLE a (id BIGINT);", None),
         ("0002_b", "CREATE TABLE b (id INT);", None),
     ])
     .unwrap();
@@ -580,6 +593,245 @@ async fn drift_is_a_warning_without_fail_on_drift() {
     let statuses = migrate::status(&client, &edited, &config).await.unwrap();
     assert!(statuses[0].applied && statuses[0].drifted);
     assert!(statuses[1].applied && !statuses[1].drifted);
+}
+
+/// A comment, whitespace or unquoted-case edit changes no statement, so it
+/// is not drift: the run goes ahead and `status` does not flag the file.
+#[tokio::test]
+async fn comment_whitespace_and_case_edits_are_not_drift() {
+    let (mut client, _db) = fresh_db().await;
+    let config = MigrationsConfig::default();
+    let original =
+        MigrationSource::from_embedded([("0001_a", "CREATE TABLE a (id INT);", None)]).unwrap();
+    migrate::run(&mut client, &original, &config).await.unwrap();
+
+    let edited = MigrationSource::from_embedded([(
+        "0001_a",
+        "-- a note\ncreate table a\n(id int);\n/* trailing */",
+        None,
+    )])
+    .unwrap();
+    let applied = migrate::run(&mut client, &edited, &config).await.unwrap();
+    assert!(applied.is_empty(), "the applied migration ran again");
+
+    let statuses = migrate::status(&client, &edited, &config).await.unwrap();
+    assert!(statuses[0].applied && !statuses[0].drifted);
+}
+
+/// A real edit is drift: the error carries a unified diff of the applied
+/// text against the file, and the command that records an intentional edit.
+#[tokio::test]
+async fn a_real_edit_reports_the_diff_and_the_accept_hint() {
+    let (mut client, _db) = fresh_db().await;
+    let config = MigrationsConfig::default();
+    let original = "CREATE TABLE a (\n    id INT\n);";
+    let first = MigrationSource::from_embedded([("0001_a", original, None)]).unwrap();
+    migrate::run(&mut client, &first, &config).await.unwrap();
+
+    let edited =
+        MigrationSource::from_embedded([("0001_a", "CREATE TABLE a (\n    id BIGINT\n);", None)])
+            .unwrap();
+    let err = migrate::run(&mut client, &edited, &config)
+        .await
+        .unwrap_err()
+        .to_string();
+    for needle in [
+        "migration '0001_a' has been modified since it was applied:",
+        "--- applied",
+        "+++ 0001_a.sql",
+        "@@ -1,3 +1,3 @@",
+        "-    id INT",
+        "+    id BIGINT",
+        "typedpg migrate accept 0001_a",
+        "fail_on_drift = false",
+    ] {
+        assert!(err.contains(needle), "missing {needle:?} in:\n{err}");
+    }
+
+    let statuses = migrate::status(&client, &edited, &config).await.unwrap();
+    assert!(statuses[0].drifted);
+}
+
+/// `accept` records the edited file as applied: nothing runs, `applied_at`
+/// is unchanged, and the next run and `status` agree the migration is not
+/// drifted.
+#[tokio::test]
+async fn accept_records_the_edited_file_without_running_it() {
+    let (mut client, _db) = fresh_db().await;
+    let config = MigrationsConfig::default();
+    let first =
+        MigrationSource::from_embedded([("0001_a", "CREATE TABLE a (id INT);", None)]).unwrap();
+    migrate::run(&mut client, &first, &config).await.unwrap();
+    let applied_at: chrono::DateTime<chrono::Utc> = client
+        .query_one(
+            "SELECT applied_at FROM public._migrations WHERE name = '0001_a'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+
+    let edited = MigrationSource::from_embedded([(
+        "0001_a",
+        "CREATE TABLE a (id BIGINT);\nCREATE TABLE b (id INT);",
+        None,
+    )])
+    .unwrap();
+    assert!(migrate::run(&mut client, &edited, &config).await.is_err());
+
+    migrate::accept(&mut client, &edited, &config, "0001_a")
+        .await
+        .unwrap();
+
+    // `accept` runs no SQL, and the recorded migration does not either.
+    assert!(!table_exists(&client, "b").await, "accept ran the file");
+    assert!(
+        migrate::run(&mut client, &edited, &config)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let statuses = migrate::status(&client, &edited, &config).await.unwrap();
+    assert!(statuses[0].applied && !statuses[0].drifted);
+
+    let row = client
+        .query_one(
+            "SELECT applied_at, sql_source, hash, hash_version FROM public._migrations \
+             WHERE name = '0001_a'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, chrono::DateTime<chrono::Utc>>(0), applied_at);
+    assert_eq!(row.get::<_, String>(1), edited.migrations()[0].sql);
+    let stored_hash: String = row.get(2);
+    assert_eq!(stored_hash.len(), 32, "not an MD5 hex digest");
+    assert_eq!(row.get::<_, i32>(3), 1);
+}
+
+/// A tracking table from before the hash columns: a run adds them, fills
+/// each row's hash from its stored text, and a comment-only edit of such a
+/// migration is not drift.
+#[tokio::test]
+async fn run_upgrades_a_table_from_before_the_hash_columns() {
+    let (mut client, _db) = fresh_db().await;
+    client
+        .batch_execute(
+            "CREATE TABLE public._migrations (
+                 name       TEXT PRIMARY KEY,
+                 applied_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                 sql_source TEXT
+             );
+             CREATE TABLE a (id INT);
+             INSERT INTO public._migrations (name, sql_source)
+             VALUES ('0001_a', 'CREATE TABLE a (id INT);');",
+        )
+        .await
+        .unwrap();
+    assert!(!column_exists(&client, "public._migrations", "hash").await);
+
+    let source = MigrationSource::from_embedded([
+        (
+            "0001_a",
+            "CREATE TABLE a (id INT); -- edited comment\n",
+            None,
+        ),
+        ("0002_b", "CREATE TABLE b (id INT);", None),
+    ])
+    .unwrap();
+    let config = MigrationsConfig::default();
+    let applied = migrate::run(&mut client, &source, &config).await.unwrap();
+    assert_eq!(applied, ["0002_b"]);
+
+    assert!(column_exists(&client, "public._migrations", "hash").await);
+    assert!(column_exists(&client, "public._migrations", "hash_version").await);
+    let row = client
+        .query_one(
+            "SELECT hash, hash_version FROM public._migrations WHERE name = '0001_a'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(
+        row.get::<_, Option<String>>(0).is_some(),
+        "the old row was not hashed"
+    );
+    assert_eq!(row.get::<_, i32>(1), 1);
+
+    let statuses = migrate::status(&client, &source, &config).await.unwrap();
+    assert!(!statuses[0].drifted);
+}
+
+/// `status` on a table from before the hash columns writes nothing — the
+/// columns are still absent afterwards — and still sees a real edit.
+#[tokio::test]
+async fn status_on_an_old_table_writes_nothing_and_sees_drift() {
+    let (client, _db) = fresh_db().await;
+    client
+        .batch_execute(
+            "CREATE TABLE public._migrations (
+                 name       TEXT PRIMARY KEY,
+                 applied_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                 sql_source TEXT
+             );
+             INSERT INTO public._migrations (name, sql_source)
+             VALUES ('0001_a', 'CREATE TABLE a (id INT);');",
+        )
+        .await
+        .unwrap();
+    let config = MigrationsConfig::default();
+
+    let same =
+        MigrationSource::from_embedded([("0001_a", "CREATE TABLE a (id INT);", None)]).unwrap();
+    let statuses = migrate::status(&client, &same, &config).await.unwrap();
+    assert!(statuses[0].applied && !statuses[0].drifted);
+    assert!(!column_exists(&client, "public._migrations", "hash").await);
+    assert!(!column_exists(&client, "public._migrations", "hash_version").await);
+
+    // A comment-only edit normalizes to the stored text: still no drift.
+    let commented =
+        MigrationSource::from_embedded([("0001_a", "-- a note\nCREATE TABLE a (id INT);", None)])
+            .unwrap();
+    assert!(!migrate::status(&client, &commented, &config).await.unwrap()[0].drifted);
+
+    let edited =
+        MigrationSource::from_embedded([("0001_a", "CREATE TABLE a (id BIGINT);", None)]).unwrap();
+    assert!(migrate::status(&client, &edited, &config).await.unwrap()[0].drifted);
+    assert!(
+        !column_exists(&client, "public._migrations", "hash").await,
+        "status wrote the hash column"
+    );
+    assert!(
+        !column_exists(&client, "public._migrations", "hash_version").await,
+        "status wrote the hash_version column"
+    );
+}
+
+/// `accept` only accepts a known, applied migration.
+#[tokio::test]
+async fn accept_rejects_unknown_and_unapplied_migrations() {
+    let (mut client, _db) = fresh_db().await;
+    let source =
+        MigrationSource::from_embedded([("0001_a", "CREATE TABLE a (id INT);", None)]).unwrap();
+    let config = MigrationsConfig::default();
+
+    let err = migrate::accept(&mut client, &source, &config, "0009_nope")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("no migration file named '0009_nope'"),
+        "unexpected error: {err}"
+    );
+
+    let err = migrate::accept(&mut client, &source, &config, "0001_a")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("migration '0001_a' has not been applied: nothing to accept"),
+        "unexpected error: {err}"
+    );
 }
 
 /// Drift compares the migration text as applied, whatever the database

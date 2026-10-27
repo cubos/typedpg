@@ -14,6 +14,7 @@ import pg from "pg";
 import postgres from "postgres";
 import {
   MigrationError,
+  acceptMigration,
   embedMigrations,
   loadMigrations,
   migrate,
@@ -111,19 +112,32 @@ describe("migrations", { skip }, () => {
     });
   });
 
-  test("an applied migration edited since is drift", async () => {
+  test("drift is a statement change; comments, whitespace and case are not", async () => {
     const url = await freshDatabase("typedpg_migrate_drift", false);
     await withPool(url, async (pool) => {
       await migrate(pool, migrations);
       const [first, ...rest] = migrations.migrations;
+      const restEntries = rest.map((m) => [m.name, m.sql, m.downSql] as const);
+      const commented = embedMigrations([
+        [first!.name, `-- edited\n${first!.sql.replace("CREATE TABLE users (", "create table users\n(")}`, first!.downSql],
+        ...restEntries,
+      ]);
+      // A comment, a line break and an unquoted word's case are not drift.
+      assert.deepEqual(await migrate(pool, commented), []);
+      assert.equal((await migrationStatus(pool, commented))[0]!.drifted, false);
+
       const edited = embedMigrations([
-        [first!.name, first!.sql + "\n-- edited\n", first!.downSql],
-        ...rest.map((m) => [m.name, m.sql, m.downSql] as const),
+        [first!.name, first!.sql.replace("name text NOT NULL", "name text NOT NULL DEFAULT ''"), first!.downSql],
+        ...restEntries,
         ["0004_more", "CREATE TABLE more (a int);", null],
       ]);
       await assert.rejects(migrate(pool, edited), (e: unknown) => {
         assert.ok(e instanceof MigrationError);
-        assert.match(e.message, /migration '0001_init' has been modified since it was applied/);
+        assert.match(e.message, /migration '0001_init' has been modified since it was applied:/);
+        assert.match(e.message, /--- applied\n\+\+\+ 0001_init\.sql\n@@ /);
+        assert.match(e.message, /-    name text NOT NULL,/);
+        assert.match(e.message, /\+    name text NOT NULL DEFAULT '',/);
+        assert.match(e.message, /typedpg migrate accept 0001_init/);
         return true;
       });
       // Nothing ran: the check comes first.
@@ -134,8 +148,29 @@ describe("migrations", { skip }, () => {
         { failOnDrift: false, onWarning: (w) => warnings.push(w) },
       );
       assert.deepEqual(await migrate(pool, lenient), ["0004_more"]);
-      assert.deepEqual(warnings, ["warning: migration '0001_init' has been modified since it was applied"]);
+      assert.equal(warnings.length, 1);
+      assert.match(
+        warnings[0]!,
+        /^warning: migration '0001_init' has been modified since it was applied:[\s\S]*typedpg migrate accept 0001_init/,
+      );
       assert.equal((await migrationStatus(pool, lenient))[0]!.drifted, true);
+
+      // An intentional edit, accepted: the file becomes what is recorded,
+      // and nothing runs.
+      const before = (await pool.query("SELECT applied_at FROM public._migrations WHERE name = $1", ["0001_init"])).rows[0].applied_at;
+      await acceptMigration(pool, lenient, "0001_init");
+      assert.deepEqual(await migrate(pool, lenient), []);
+      assert.equal((await migrationStatus(pool, lenient))[0]!.drifted, false);
+      const row = (await pool.query("SELECT applied_at, sql_source FROM public._migrations WHERE name = $1", ["0001_init"])).rows[0];
+      assert.deepEqual(row.applied_at, before);
+      assert.equal(row.sql_source, lenient.migrations[0]!.sql);
+
+      await assert.rejects(acceptMigration(pool, lenient, "0009_nope"), /no migration file named '0009_nope'/);
+      const unapplied = withExtra(lenient, "0005_new", "CREATE TABLE new_t (a int);");
+      await assert.rejects(
+        acceptMigration(pool, unapplied, "0005_new"),
+        /migration '0005_new' has not been applied: nothing to accept/,
+      );
     });
   });
 

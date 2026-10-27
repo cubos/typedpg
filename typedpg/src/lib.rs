@@ -88,7 +88,7 @@
 //! table = "public._migrations"            # optional, tracking table name
 //! lock_id = 713705                        # optional, advisory lock ID
 //! use_transaction = true                  # optional, wrap each migration in a tx
-//! fail_on_drift = true                    # optional, abort if applied migration changed
+//! fail_on_drift = true                    # optional, abort if applied migration's statements changed
 //!
 //! [package.metadata.typedpg.types]          # optional, PG type → Rust type
 //! user_preferences = "crate::UserPrefs"   # a JSONB domain (serde)
