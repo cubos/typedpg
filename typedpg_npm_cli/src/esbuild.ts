@@ -1,14 +1,20 @@
 // esbuild: `plugins: [typedpg()]` bundles the module of each `.sql` file
 // imported, from the cache `typedpg build` fills (`@cubos/typedpg`'s
-// sqlfiles.ts, reached through its internal API).
+// sqlfiles.ts, reached through its internal API). A cache miss compiles
+// through the persistent `typedpg serve` watch mode keeps around.
 
 import { dirname } from "node:path";
-import { compileSql } from "@cubos/typedpg/internal";
+import { compileSqlAsync } from "@cubos/typedpg/internal";
 
 interface EsbuildPluginBuild {
   onLoad(
     options: { filter: RegExp; namespace?: string },
-    callback: (args: { path: string }) => { contents: string; loader: "js"; resolveDir: string; watchFiles: string[] },
+    callback: (args: { path: string }) => Promise<{
+      contents: string;
+      loader: "js";
+      resolveDir: string;
+      watchFiles: string[];
+    }>,
   ): void;
 }
 
@@ -21,9 +27,14 @@ export default function typedpg(): EsbuildPlugin {
   return {
     name: "typedpg",
     setup(build) {
-      build.onLoad({ filter: /\.sql$/, namespace: "file" }, ({ path }) => {
-        const compiled = compileSql(path);
-        return { contents: compiled.code, loader: "js", resolveDir: dirname(path), watchFiles: compiled.dependencies };
+      build.onLoad({ filter: /\.sql$/, namespace: "file" }, async ({ path }) => {
+        const compiled = await compileSqlAsync(path);
+        return {
+          contents: compiled.code,
+          loader: "js",
+          resolveDir: dirname(path),
+          watchFiles: compiled.dependencies,
+        };
       });
     },
   };

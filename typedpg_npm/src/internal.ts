@@ -3,5 +3,5 @@
 // change with it.
 
 export { binary, target } from "./binary.js";
-export { compileSql } from "./sqlfiles.js";
+export { compileSql, compileSqlAsync } from "./sqlfiles.js";
 export type { CompiledSql } from "./sqlfiles.js";

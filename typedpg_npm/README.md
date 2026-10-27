@@ -236,13 +236,17 @@ The runtime ships the Node and Bun loaders, which run in production; the
 bundler plugins are in `@cubos/typedpg-cli`, a devDependency. None of them
 analyzes a query: they read the module from a cache,
 `node_modules/.cache/typedpg` (`TYPEDPG_CACHE_DIR` to move it), keyed by the
-typedpg version, the config, the migrations and the file. A file with no
-entry runs `typedpg build` once — when the CLI is installed, as it is in
-development — which compiles every file missing one. Run `typedpg build`
-when building an image: the cache is then complete, and the image needs
-neither the binary nor the analysis at startup. A production install has no
-binary, so a cache miss there is an error that says which file and cache
-directory, and to run `typedpg build` where the project is built.
+typedpg version, the config, the migrations and the file. On a miss, when
+the CLI is installed, as it is in development, the bundler plugins and Bun's
+loader compile through a persistent `typedpg serve` — one child per binary,
+which keeps the schema in memory between edits and exits after five minutes
+without a request (`TYPEDPG_SERVE_IDLE_TIMEOUT`, in seconds); the next miss
+spawns another. (The Node hook is synchronous and runs `typedpg build`
+once, which compiles every file missing an entry.) Run `typedpg build` when
+building an image: the cache is then complete, and the image needs neither
+the binary nor the analysis at startup. A production install has no binary,
+so a cache miss there is an error that says which file and cache directory,
+and to run `typedpg build` where the project is built.
 
 ### The content mapper (TypeScript 7.1)
 

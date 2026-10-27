@@ -1,8 +1,8 @@
 //! typedpg for TypeScript: finds the `sql("...")` queries of a project's
 //! sources and the queries of its `.sql` files, analyzes them against the
 //! schema its migrations build, and generates the modules that type and run
-//! them — or compiles a `.sql` file alone, for a loader's cache (`build`)
-//! or TypeScript's content mapper (`serve`).
+//! them — or compiles a `.sql` file alone, for a loader's cache (`build`, or
+//! `serve`'s `typedpg/compile`) or TypeScript's content mapper (`serve`).
 
 pub mod cache;
 pub mod config;

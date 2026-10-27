@@ -53,8 +53,11 @@ project the end-to-end run uses (`loaders/` in it imports a `.sql` file
 itself).
 
 `@cubos/typedpg` carries no binary: its loaders run from the cache `typedpg
-build` fills, and the CLI — a devDependency — compiles on demand. The CLI
-imports the runtime's cache and binary lookup through
+build` fills, and the CLI — a devDependency — compiles on demand. The
+asynchronous loaders (Bun's `onLoad`, the bundler plugins) compile through a
+persistent `typedpg serve` per binary, which keeps the schema in memory and
+exits after an idle timeout; the Node hook is synchronous and runs `typedpg
+build`. The CLI imports the runtime's cache and binary lookup through
 `@cubos/typedpg/internal`, which is not a public API.
 
 The npm runtime and the Rust runner must agree on what a migration is: the
