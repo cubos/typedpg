@@ -13,6 +13,8 @@
 //! - [`normalize`] / [`hash`] — the text drift detection compares.
 //! - [`drift_message`] — the error (or warning) drift produces.
 //! - [`locate_position`] — a server error's line and column in the file.
+//! - [`machine`] — the whole runner as a sans-I/O state machine, driven by
+//!   both runners.
 
 use std::cmp::Ordering;
 
@@ -22,6 +24,8 @@ mod name;
 mod normalize;
 mod position;
 mod split;
+
+pub mod machine;
 
 pub use drift::drift_message;
 pub use name::{MigrationNameError, parse_migration_name};

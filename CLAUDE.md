@@ -49,10 +49,16 @@ npm runtime package (with the loaders and bundler plugins of `.sql` files),
 `typedpg_ts_example` the project the end-to-end run uses (`loaders/` in it
 imports a `.sql` file itself).
 
-The npm runtime and the Rust runner must agree on what a migration is: they
-share the pure helpers (statement splitting, drift normalization and hash,
-ordering, file-name and tracking-table validation, error and drift messages)
-from `typedpg_core`, compiled to WebAssembly by `typedpg_wasm`. Building
+The npm runtime and the Rust runner must agree on what a migration is: the
+runner's whole logic — the advisory lock and its backoff, the tracking table,
+drift checks, the apply/revert/accept flows, every message — is one sans-I/O
+state machine in `typedpg_core::migrations::machine`. The Rust runner
+(`typedpg/src/migrate/runner.rs`) and the npm one (`typedpg_npm/src/migrate.ts`)
+are drivers: they perform each `Step` on their own client and reply. The pure
+helpers (statement splitting, drift normalization and hash, ordering,
+file-name and tracking-table validation, error and drift messages) live in
+the same module. `typedpg_wasm` exports the machine (with handles, so runs
+can interleave across awaits) plus those helpers to the npm runtime. Building
 `typedpg_npm` (`npm run build` there) runs `scripts/wasm.mjs` (cargo, wasm32)
 and embeds the module in a generated `src/wasm.generated.ts`, so building or
 testing the package needs Rust and the wasm target:
