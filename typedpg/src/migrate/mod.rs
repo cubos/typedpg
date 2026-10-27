@@ -30,6 +30,16 @@
 //! each committing on its own: a failure leaves the statements before it
 //! applied (and the migration unrecorded).
 //!
+//! # One implementation, two drivers
+//!
+//! The orchestration — the lock and its backoff, the tracking table, drift
+//! checks, the apply/revert/accept flows, every message — is a sans-I/O
+//! state machine in `typedpg_core::migrations::machine`. It knows which
+//! query, script or sleep comes next, never runs one, and the functions
+//! below perform each step on the `tokio_postgres::Client`. The npm runner
+//! (`@cubos/typedpg`) drives the same machine, compiled to WebAssembly, so
+//! the two cannot disagree about what a migration is or how it runs.
+//!
 //! # Concurrency safety
 //!
 //! The [`run`], [`revert`] and [`accept`] functions acquire a PostgreSQL advisory lock

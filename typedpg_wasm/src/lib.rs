@@ -1,11 +1,13 @@
-//! The npm runtime's copy of the migration helpers, as WebAssembly.
+//! The npm runtime's copy of the migration runner, as WebAssembly.
 //!
-//! `@cubos/typedpg`'s runner reimplements the Rust runner's pure logic — how
-//! a migration splits into statements, what drift is, how a name or a
-//! tracking table validates, how errors and drift read. This crate exports
-//! that logic once, from [`typedpg_core`], so the two runners cannot drift
-//! apart. The runner's I/O (the advisory lock, transactions, inserts, …)
-//! stays in TypeScript, on the caller's driver.
+//! `@cubos/typedpg`'s runner and the Rust one must agree: they share the
+//! pure logic — how a migration splits into statements, what drift is, how a
+//! name or a tracking table validates, how errors and drift read — and the
+//! orchestration itself. This crate exports both once, from
+//! [`typedpg_core`], so the two runners cannot drift apart: the migration
+//! machine ([`typedpg_core::migrations::machine`]) decides every query,
+//! script and message, and the TypeScript side only performs each step on
+//! the caller's driver.
 //!
 //! # ABI
 //!
@@ -20,8 +22,9 @@
 //!   buffer. JS is single-threaded, and reads it before the next call; no
 //!   other call may run in between.
 //! - Every operation returns `0` on success and `1` on failure, the UTF-8
-//!   message in the output buffer. Inputs come from JS strings, so the only
-//!   failure is input that is not UTF-8; anything else (an allocation
+//!   message in the output buffer. The pure helpers' inputs come from JS
+//!   strings, so their only failure is input that is not UTF-8; the machine
+//!   also rejects a malformed binary input. Anything else (an allocation
 //!   failure, a bug) traps, which JS sees as a `WebAssembly.RuntimeError` —
 //!   never silently.
 //!
@@ -29,22 +32,90 @@
 //!
 //! | export | output |
 //! |--------|--------|
-//! | `split_statements` | little-endian `(start: u32, len: u32)` pairs into the input |
-//! | `normalize`, `hash`, `drift_message`, `locate_position`, `strip_bom` | UTF-8 text |
-//! | `hash_version` | little-endian `i32` |
-//! | `parse_migration_name` | the UTF-8 version (the numeric prefix) |
+//! | `parse_migration_name`, `strip_bom` | UTF-8 text |
 //! | `validate_table_name` | empty |
-//! | `compare_versions`, `compare_migration_names` | one byte: `<`, `=` or `>` |
+//! | `compare_migration_names` | one byte: `<`, `=` or `>` |
 //! | `has_no_transaction_marker` | one byte: `0` or `1` |
+//! | `migrator_new` | nothing; the machine handle is the return value (`0` on failure) |
+//! | `migrator_step` | the encoded step |
+//! | `migrator_free` | nothing |
+//!
+//! # The migration machine
+//!
+//! `migrator_new(input_ptr, input_len) -> usize` decodes an input and returns
+//! a handle (`0` on failure, the message in the output buffer).
+//! `migrator_step(handle, reply_ptr, reply_len) -> i32` decodes the reply,
+//! advances the machine and puts the encoded step in the output buffer.
+//! `migrator_free(handle)` drops it; handles let several runs interleave
+//! across awaits in one JS process. `typedpg_npm/src/core.ts` encodes and
+//! decodes the same format.
+//!
+//! The format is hand-written — a tag byte, little-endian `u32` lengths and
+//! a null flag for an optional string — rather than serde or bincode, to
+//! keep the module small. `string` is a `u32` byte length followed by that
+//! many UTF-8 bytes; `optional X` is a `u8` tag (`0` absent, `1` present)
+//! followed by `X` when present, so a null differs from an empty string.
+//!
+//! Input (`migrator_new`):
+//!
+//! ```text
+//! u8 action                    0 Up, 1 Status, 2 Revert, 3 Accept
+//!   Revert: optional string name, u8 force
+//!   Accept: string name
+//! string table
+//! i64 lock_id
+//! u8 use_transaction
+//! u8 fail_on_drift
+//! u32 migration count
+//!   per migration: string name, string sql, optional string down_sql,
+//!                  u8 no_transaction, u8 down_no_transaction
+//! ```
+//!
+//! Reply (`migrator_step`'s input):
+//!
+//! ```text
+//! u8 tag                       0 Start, 1 Rows, 2 Done, 3 DbError
+//!   Rows: u32 rows; per row: u32 cols; per value: optional string
+//!   DbError: optional string code, string message, optional string severity,
+//!            optional string detail, optional string hint,
+//!            optional u32 position, optional u32 internal_position,
+//!            optional string internal_query
+//! ```
+//!
+//! Step (`migrator_step`'s output):
+//!
+//! ```text
+//! u8 tag                       0 Query, 1 Execute, 2 Sleep, 3 Warn,
+//!                              4 Finish, 5 Fail
+//!   Query:   string sql, u32 params; per param: optional string
+//!   Execute: string sql
+//!   Sleep:   u64 ms
+//!   Warn:    string message
+//!   Finish:  u8 outcome
+//!              0 Applied:  u32 names; per name: string
+//!              1 Status:   u32 rows; per row: string name, u8 applied,
+//!                          optional string applied_at, u8 drifted
+//!              2 Reverted: string name
+//!              3 Accepted
+//!   Fail:    u8 failure         0 Message: string, 1 Db
+//! ```
 
 use std::cmp::Ordering;
 use std::sync::Mutex;
 
+use typedpg_core::migrations::machine::Migrator;
 use typedpg_core::{config, migration_marker, migrations};
+
+mod codec;
 
 /// The output buffer. A `Mutex` because statics must be `Sync`; the module
 /// is single-threaded, so it is never contended.
 static OUTPUT: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+
+/// The live migration machines, by handle (`index + 1`). A `Vec` of
+/// `Option`s so freeing leaves a reusable hole and a stale handle finds
+/// nothing rather than another run's machine.
+static MIGRATORS: Mutex<Vec<Option<Box<Migrator>>>> = Mutex::new(Vec::new());
 
 /// The message for an input JS passed as invalid UTF-8 (impossible through
 /// `TextEncoder`, but the ABI allows any bytes).
@@ -75,12 +146,24 @@ fn fail(message: &str) -> i32 {
 /// `ptr..ptr + len` must be initialized memory of this module, as the ABI
 /// requires; it must stay alive for the returned borrow.
 unsafe fn text_at<'a>(ptr: usize, len: usize) -> Option<&'a str> {
+    std::str::from_utf8(unsafe { bytes_at(ptr, len) }?).ok()
+}
+
+/// The bytes at `ptr..ptr + len`.
+///
+/// # Safety
+///
+/// `ptr..ptr + len` must be initialized memory of this module, as the ABI
+/// requires; it must stay alive for the returned borrow.
+unsafe fn bytes_at<'a>(ptr: usize, len: usize) -> Option<&'a [u8]> {
     if len == 0 {
-        return Some("");
+        return Some(&[]);
+    }
+    if ptr == 0 {
+        return None;
     }
     // SAFETY: the caller guarantees the range is initialized and in bounds.
-    let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
-    std::str::from_utf8(bytes).ok()
+    Some(unsafe { std::slice::from_raw_parts(ptr as *const u8, len) })
 }
 
 /// Allocate `len` bytes for JS to write an input into.
@@ -127,88 +210,6 @@ pub extern "C" fn output_len() -> usize {
     }
 }
 
-/// The statements of the input, as `(start, len)` byte pairs.
-#[unsafe(no_mangle)]
-pub extern "C" fn split_statements(ptr: usize, len: usize) -> i32 {
-    let Some(sql) = (unsafe { text_at(ptr, len) }) else {
-        return fail(INVALID_UTF8);
-    };
-    let mut out = Vec::new();
-    for statement in migrations::split_statements(sql) {
-        // `split_statements` returns slices of `sql`.
-        let start = statement.as_ptr() as usize - sql.as_ptr() as usize;
-        out.extend_from_slice(&(start as u32).to_le_bytes());
-        out.extend_from_slice(&(statement.len() as u32).to_le_bytes());
-    }
-    set_output(out)
-}
-
-/// The normalized text drift detection compares.
-#[unsafe(no_mangle)]
-pub extern "C" fn normalize(ptr: usize, len: usize) -> i32 {
-    let Some(sql) = (unsafe { text_at(ptr, len) }) else {
-        return fail(INVALID_UTF8);
-    };
-    set_output(migrations::normalize(sql).into_bytes())
-}
-
-/// The stored drift hash of the input.
-#[unsafe(no_mangle)]
-pub extern "C" fn hash(ptr: usize, len: usize) -> i32 {
-    let Some(sql) = (unsafe { text_at(ptr, len) }) else {
-        return fail(INVALID_UTF8);
-    };
-    set_output(migrations::hash(sql).into_bytes())
-}
-
-/// The normalization whose hashes the tracking table stores.
-#[unsafe(no_mangle)]
-pub extern "C" fn hash_version() -> i32 {
-    set_output(migrations::HASH_VERSION.to_le_bytes().to_vec())
-}
-
-/// The drift message: name, diff of `stored` against `file` (when
-/// `has_stored` is non-zero) and what to do about it.
-#[unsafe(no_mangle)]
-pub extern "C" fn drift_message(
-    name_ptr: usize,
-    name_len: usize,
-    stored_ptr: usize,
-    stored_len: usize,
-    has_stored: u32,
-    file_ptr: usize,
-    file_len: usize,
-    fail_on_drift: u32,
-) -> i32 {
-    let Some(name) = (unsafe { text_at(name_ptr, name_len) }) else {
-        return fail(INVALID_UTF8);
-    };
-    let stored = if has_stored == 0 {
-        None
-    } else {
-        match unsafe { text_at(stored_ptr, stored_len) } {
-            Some(stored) => Some(stored),
-            None => return fail(INVALID_UTF8),
-        }
-    };
-    let Some(file) = (unsafe { text_at(file_ptr, file_len) }) else {
-        return fail(INVALID_UTF8);
-    };
-    set_output(migrations::drift_message(name, stored, file, fail_on_drift != 0).into_bytes())
-}
-
-/// PG's error position as a line and a caret, over the whole migration.
-///
-/// `base` is the byte offset in `sql` of the text that was sent; `position`
-/// is PG's 1-based character index into it.
-#[unsafe(no_mangle)]
-pub extern "C" fn locate_position(ptr: usize, len: usize, base: u32, position: u32) -> i32 {
-    let Some(sql) = (unsafe { text_at(ptr, len) }) else {
-        return fail(INVALID_UTF8);
-    };
-    set_output(migrations::locate_position(sql, base as usize, position).into_bytes())
-}
-
 /// A migration file stem's version (numeric prefix), or why it is malformed.
 #[unsafe(no_mangle)]
 pub extern "C" fn parse_migration_name(
@@ -227,18 +228,6 @@ pub extern "C" fn parse_migration_name(
         Ok(version) => set_output(version.as_bytes().to_vec()),
         Err(error) => fail(&error.message(path)),
     }
-}
-
-/// Compare two migration versions as numbers (`2` before `10`).
-#[unsafe(no_mangle)]
-pub extern "C" fn compare_versions(a_ptr: usize, a_len: usize, b_ptr: usize, b_len: usize) -> i32 {
-    let Some(a) = (unsafe { text_at(a_ptr, a_len) }) else {
-        return fail(INVALID_UTF8);
-    };
-    let Some(b) = (unsafe { text_at(b_ptr, b_len) }) else {
-        return fail(INVALID_UTF8);
-    };
-    ordering(migrations::compare_versions(a, b))
 }
 
 /// Compare two migration names by version, then by name.
@@ -298,4 +287,73 @@ fn ordering(ordering: Ordering) -> i32 {
         Ordering::Equal => b'=',
         Ordering::Greater => b'>',
     }])
+}
+
+/// Create a migration machine from an encoded input; `0` on failure, the
+/// message in the output buffer.
+#[unsafe(no_mangle)]
+pub extern "C" fn migrator_new(ptr: usize, len: usize) -> usize {
+    let Some(bytes) = (unsafe { bytes_at(ptr, len) }) else {
+        fail("typedpg_wasm: the migration input is not readable");
+        return 0;
+    };
+    match codec::decode_input(bytes) {
+        Ok(input) => {
+            let mut migrators = match MIGRATORS.lock() {
+                Ok(migrators) => migrators,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            migrators.push(Some(Box::new(Migrator::new(input))));
+            migrators.len()
+        }
+        Err(message) => {
+            fail(&message);
+            0
+        }
+    }
+}
+
+/// Advance a migration machine with an encoded reply; the encoded step goes
+/// in the output buffer.
+#[unsafe(no_mangle)]
+pub extern "C" fn migrator_step(handle: usize, ptr: usize, len: usize) -> i32 {
+    let Some(bytes) = (unsafe { bytes_at(ptr, len) }) else {
+        return fail("typedpg_wasm: the migration reply is not readable");
+    };
+    let reply = match codec::decode_reply(bytes) {
+        Ok(reply) => reply,
+        Err(message) => return fail(&message),
+    };
+    let step = {
+        let mut migrators = match MIGRATORS.lock() {
+            Ok(migrators) => migrators,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let Some(index) = handle.checked_sub(1) else {
+            drop(migrators);
+            return fail("typedpg_wasm: unknown migration handle");
+        };
+        let Some(Some(migrator)) = migrators.get_mut(index) else {
+            drop(migrators);
+            return fail("typedpg_wasm: unknown migration handle");
+        };
+        migrator.step(reply)
+    };
+    set_output(codec::encode_step(&step))
+}
+
+/// Drop a migration machine. Freeing twice, or an unknown handle, is a
+/// no-op.
+#[unsafe(no_mangle)]
+pub extern "C" fn migrator_free(handle: usize) {
+    let Some(index) = handle.checked_sub(1) else {
+        return;
+    };
+    let mut migrators = match MIGRATORS.lock() {
+        Ok(migrators) => migrators,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some(slot) = migrators.get_mut(index) {
+        *slot = None;
+    }
 }
