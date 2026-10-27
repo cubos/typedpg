@@ -4,13 +4,26 @@
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { test } from "node:test";
 import { pathToFileURL } from "node:url";
 
+import {
+  cacheDatabases,
+  cacheKey,
+  cacheMigrationFiles,
+  cacheSchemaIdentity,
+} from "./core.js";
 import { compileSqlAsync } from "./sqlfiles.js";
 
 // A stand-in for the binary: speaks the same `Content-Length` framing,
@@ -120,8 +133,40 @@ function environment(root: string, log: string, mode: string): Record<string, st
   };
 }
 
-test("two cache misses reuse one serve child", async () => {
-  const { root, sql } = project();
+// The same fixture as `typedpg_core/tests/loader_cache.rs`; the identity and
+// key were recorded from the old TypeScript implementation before the recipe
+// moved to Rust. This checks the wasm bridge's encoding, byte for byte.
+test("the wasm cache recipe matches the hex the old implementation wrote", () => {
+  const root = join(import.meta.dirname, "../../typedpg_core/tests/fixtures/cache-project");
+  const config = readFileSync(join(root, "typedpg.config.json"));
+  const databases = cacheDatabases(config.toString("utf8")).map(({ name, dirs }) => {
+    const listings = dirs.map((dir) => {
+      const path = join(root, dir);
+      let names: string[];
+      try {
+        names = readdirSync(path);
+      } catch {
+        names = [];
+      }
+      return { path, names };
+    });
+    const migrations = cacheMigrationFiles(listings.map((listing) => listing.names)).map(
+      ({ directory, name }) => ({
+        name,
+        bytes: readFileSync(join(listings[directory].path, name)),
+      }),
+    );
+    return { name, migrations };
+  });
+  const identity = cacheSchemaIdentity(config, databases);
+  assert.equal(identity, "0c5150f3a5595a50853b2ee0e72de02671b22bf714ac5e86161ddadb89e4db0b");
+  assert.equal(
+    cacheKey(identity, "q/users.sql", readFileSync(join(root, "q/users.sql"), "utf8")),
+    "52cbab702fbc9a811464ba8661d29b45f6a85378c717c294a99e92e60f545d63",
+  );
+});
+
+test("two cache misses reuse one serve child", async () => {  const { root, sql } = project();
   const log = join(root, "fake.log");
   await withEnv(environment(root, log, "respond"), async () => {
     const first = await compileSqlAsync(sql);

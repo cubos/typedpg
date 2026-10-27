@@ -14,10 +14,13 @@
 //! - [`qualified_name`] -- PostgreSQL schema-qualified identifiers.
 //! - [`migrations`] -- The pure helpers both migration runners share (order,
 //!   file names, statement splitting, drift).
+//! - [`loader_cache`] -- The `.sql` loaders' cache recipe, shared with the npm
+//!   runtime through `typedpg_wasm`.
 
 pub mod build;
 pub mod config;
 mod keywords;
+pub mod loader_cache;
 pub mod migration_marker;
 pub mod migrations;
 mod qualified_name;

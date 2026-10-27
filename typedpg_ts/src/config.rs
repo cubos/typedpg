@@ -66,18 +66,11 @@ struct RawDatabase {
     out: Option<PathBuf>,
     sql: Option<RawSql>,
     migrations: Option<RawMigrations>,
+    // Read by `loader_cache::databases`; listed here so that
+    // `deny_unknown_fields` accepts it.
+    #[allow(dead_code)]
     extra_migrations: Option<Vec<PathBuf>>,
     types: Option<BTreeMap<String, String>>,
-}
-
-impl RawDatabase {
-    fn is_empty(&self) -> bool {
-        self.out.is_none()
-            && self.sql.is_none()
-            && self.migrations.is_none()
-            && self.extra_migrations.is_none()
-            && self.types.is_none()
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -99,13 +92,18 @@ struct RawTypeNames {
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum RawMigrations {
-    Dir(PathBuf),
+    // The directory is read by `loader_cache::databases`; the variant only
+    // tells this model that a string is a valid `migrations` shape.
+    Dir(#[allow(dead_code)] PathBuf),
     Full(RawMigrationsTable),
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct RawMigrationsTable {
+    // Read by `loader_cache::databases`; listed here so that
+    // `deny_unknown_fields` accepts it.
+    #[allow(dead_code)]
     dir: Option<PathBuf>,
     table: Option<String>,
     lock_id: Option<i64>,
@@ -337,26 +335,29 @@ impl Config {
             extra_migrations: raw.extra_migrations,
             types: raw.types,
         };
+        // The databases' names and migration directories are also the `.sql`
+        // loaders' cache recipe: `loader_cache::databases` is the one
+        // interpretation, so the binary that fills the cache and the runtime
+        // that reads it cannot disagree about what an entry depends on.
+        let listed = typedpg_core::loader_cache::databases(text)?;
         let databases = match raw.databases {
-            Some(dbs) => {
-                if !single.is_empty() {
-                    return Err(
-                        "`out`, `sql`, `migrations`, `extraMigrations` and `types` go in each \
-                         entry of `databases` when it is set"
-                            .to_owned(),
-                    );
-                }
-                if dbs.is_empty() {
-                    return Err("`databases` is empty".to_owned());
-                }
-                dbs.into_iter()
-                    .map(|(name, db)| {
-                        database(root, name.clone(), db)
-                            .map_err(|e| format!("databases.{name}: {e}"))
-                    })
-                    .collect::<Result<Vec<_>, _>>()?
+            // Both maps are `BTreeMap`s parsed from the same text, so they
+            // iterate in the same order.
+            Some(dbs) => listed
+                .into_iter()
+                .zip(dbs)
+                .map(|(listed, (name, db))| {
+                    database(root, name.clone(), db, listed.dirs)
+                        .map_err(|e| format!("databases.{name}: {e}"))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            None => {
+                let listed = listed
+                    .into_iter()
+                    .next()
+                    .expect("the single-database form lists one database");
+                vec![database(root, "default".to_owned(), single, listed.dirs)?]
             }
-            None => vec![database(root, "default".to_owned(), single)?],
         };
         let mut outs: Vec<&Path> = databases.iter().filter_map(|d| d.out.as_deref()).collect();
         outs.sort();
@@ -403,7 +404,12 @@ impl Config {
     }
 }
 
-fn database(root: &Path, name: String, raw: RawDatabase) -> Result<DatabaseConfig, String> {
+fn database(
+    root: &Path,
+    name: String,
+    raw: RawDatabase,
+    dirs: Vec<String>,
+) -> Result<DatabaseConfig, String> {
     if raw.out.is_none() && raw.sql.is_none() {
         return Err(
             "missing `out` (the module generated for the queries in TypeScript sources) \
@@ -415,13 +421,11 @@ fn database(root: &Path, name: String, raw: RawDatabase) -> Result<DatabaseConfi
         out_kind(out)?;
     }
     let sql = raw.sql.map(sql_config).transpose()?;
+    // The runner settings; the directory itself was read by
+    // `loader_cache::databases` above.
     let table = match raw.migrations {
-        None => RawMigrationsTable::default(),
-        Some(RawMigrations::Dir(dir)) => RawMigrationsTable {
-            dir: Some(dir),
-            ..RawMigrationsTable::default()
-        },
-        Some(RawMigrations::Full(t)) => t,
+        None | Some(RawMigrations::Dir(_)) => RawMigrationsTable::default(),
+        Some(RawMigrations::Full(table)) => table,
     };
     let defaults = MigrationsConfig::default();
     let runner = MigrationsConfig {
@@ -466,17 +470,14 @@ fn database(root: &Path, name: String, raw: RawDatabase) -> Result<DatabaseConfi
             "`migrations.embed` needs `out`: the migrations are embedded in that module".to_owned(),
         );
     }
+    let mut dirs = dirs.into_iter();
+    let migrations_dir = root.join(dirs.next().unwrap_or_else(|| "migrations".to_owned()));
     Ok(DatabaseConfig {
         name,
         out: raw.out.map(|out| root.join(out)),
         sql,
-        migrations_dir: root.join(table.dir.unwrap_or_else(|| "migrations".into())),
-        extra_migrations: raw
-            .extra_migrations
-            .unwrap_or_default()
-            .iter()
-            .map(|p| root.join(p))
-            .collect(),
+        migrations_dir,
+        extra_migrations: dirs.map(|p| root.join(p)).collect(),
         runner,
         embed_migrations,
         types,

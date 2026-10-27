@@ -198,13 +198,13 @@ pub fn encode_step(step: &Step) -> Vec<u8> {
 }
 
 /// A bounds-checked reader over the input.
-struct Reader<'a> {
+pub(crate) struct Reader<'a> {
     bytes: &'a [u8],
     position: usize,
 }
 
 impl<'a> Reader<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
+    pub(crate) fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, position: 0 }
     }
 
@@ -223,6 +223,10 @@ impl<'a> Reader<'a> {
         Ok(self.take(1)?[0])
     }
 
+    pub(crate) fn bytes(&mut self, len: usize) -> Result<&'a [u8], String> {
+        self.take(len)
+    }
+
     fn boolean(&mut self) -> Result<bool, String> {
         match self.u8()? {
             0 => Ok(false),
@@ -231,7 +235,7 @@ impl<'a> Reader<'a> {
         }
     }
 
-    fn u32(&mut self) -> Result<u32, String> {
+    pub(crate) fn u32(&mut self) -> Result<u32, String> {
         let bytes = self.take(4)?;
         Ok(u32::from_le_bytes(bytes.try_into().expect("four bytes")))
     }
@@ -249,7 +253,7 @@ impl<'a> Reader<'a> {
         })
     }
 
-    fn string(&mut self) -> Result<String, String> {
+    pub(crate) fn string(&mut self) -> Result<String, String> {
         let len = self.u32()? as usize;
         let bytes = self.take(len)?;
         String::from_utf8(bytes.to_vec())
@@ -266,7 +270,7 @@ impl<'a> Reader<'a> {
 
     /// Reject trailing bytes: an input the JS side did not mean to send is a
     /// bug, not a forward-compatible extension.
-    fn finish(&self) -> Result<(), String> {
+    pub(crate) fn finish(&self) -> Result<(), String> {
         if self.position == self.bytes.len() {
             Ok(())
         } else {
@@ -276,12 +280,12 @@ impl<'a> Reader<'a> {
 }
 
 /// A writer for the output; lengths are `u32`, as in the reader.
-struct Writer {
+pub(crate) struct Writer {
     bytes: Vec<u8>,
 }
 
 impl Writer {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self { bytes: Vec::new() }
     }
 
@@ -289,7 +293,7 @@ impl Writer {
         self.bytes.push(value);
     }
 
-    fn u32(&mut self, value: u32) {
+    pub(crate) fn u32(&mut self, value: u32) {
         self.bytes.extend_from_slice(&value.to_le_bytes());
     }
 
@@ -297,9 +301,13 @@ impl Writer {
         self.bytes.extend_from_slice(&value.to_le_bytes());
     }
 
-    fn string(&mut self, value: &str) {
+    pub(crate) fn string(&mut self, value: &str) {
         self.u32(value.len() as u32);
         self.bytes.extend_from_slice(value.as_bytes());
+    }
+
+    pub(crate) fn into_bytes(self) -> Vec<u8> {
+        self.bytes
     }
 
     fn optional_string(&mut self, value: Option<&str>) {

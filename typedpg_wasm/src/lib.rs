@@ -23,10 +23,11 @@
 //!   other call may run in between.
 //! - Every operation returns `0` on success and `1` on failure, the UTF-8
 //!   message in the output buffer. The pure helpers' inputs come from JS
-//!   strings, so their only failure is input that is not UTF-8; the machine
-//!   also rejects a malformed binary input. Anything else (an allocation
-//!   failure, a bug) traps, which JS sees as a `WebAssembly.RuntimeError` —
-//!   never silently.
+//!   strings, so their only failure is input that is not UTF-8; the cache
+//!   operations also reject an invalid config or a malformed encoded input,
+//!   and the machine also rejects a malformed binary input. Anything else (an
+//!   allocation failure, a bug) traps, which JS sees as a
+//!   `WebAssembly.RuntimeError` — never silently.
 //!
 //! On success the output buffer holds, per operation:
 //!
@@ -39,6 +40,31 @@
 //! | `migrator_new` | nothing; the machine handle is the return value (`0` on failure) |
 //! | `migrator_step` | the encoded step |
 //! | `migrator_free` | nothing |
+//! | `cache_databases` | the config's databases |
+//! | `cache_migration_files` | the selected migration file names |
+//! | `cache_schema_identity`, `cache_key` | UTF-8 hex |
+//!
+//! # The loaders' cache
+//!
+//! The `.sql` loaders' cache recipe ([`typedpg_core::loader_cache`]) is
+//! exported so the npm runtime computes the same keys as `typedpg build`.
+//! Inputs and outputs continue the same format:
+//!
+//! ```text
+//! cache_databases: the config's UTF-8 JSON (the whole input)
+//!   output: u32 databases; per database: string name, u32 dirs;
+//!           per dir: string
+//! cache_migration_files:
+//!   u32 directories; per directory: u32 names; per name: string
+//!   output: u32 files; per file: u32 directory, string name
+//! cache_schema_identity:
+//!   u32 config_len, bytes; u32 databases;
+//!   per database: string name, u32 migrations;
+//!   per migration: string name, bytes
+//!   output: the hex identity
+//! cache_key: string identity, string relative_path, string content
+//!   output: the hex key
+//! ```
 //!
 //! # The migration machine
 //!
@@ -107,6 +133,7 @@ use typedpg_core::migrations::machine::Migrator;
 use typedpg_core::{config, migration_marker, migrations};
 
 mod codec;
+mod loader_cache;
 
 /// The output buffer. A `Mutex` because statics must be `Sync`; the module
 /// is single-threaded, so it is never contended.
@@ -278,6 +305,42 @@ pub extern "C" fn has_no_transaction_marker(ptr: usize, len: usize) -> i32 {
     set_output(vec![u8::from(migration_marker::has_no_transaction_marker(
         sql,
     ))])
+}
+
+/// The databases a config declares, as [`typedpg_core::loader_cache::databases`]
+/// reads it.
+#[unsafe(no_mangle)]
+pub extern "C" fn cache_databases(ptr: usize, len: usize) -> i32 {
+    cache_export(ptr, len, loader_cache::databases)
+}
+
+/// The files of each directory's listing that the cache recipe hashes.
+#[unsafe(no_mangle)]
+pub extern "C" fn cache_migration_files(ptr: usize, len: usize) -> i32 {
+    cache_export(ptr, len, loader_cache::migration_files)
+}
+
+/// The schema identity of a config and its migrations.
+#[unsafe(no_mangle)]
+pub extern "C" fn cache_schema_identity(ptr: usize, len: usize) -> i32 {
+    cache_export(ptr, len, loader_cache::schema_identity)
+}
+
+/// The cache key of a `.sql` file.
+#[unsafe(no_mangle)]
+pub extern "C" fn cache_key(ptr: usize, len: usize) -> i32 {
+    cache_export(ptr, len, loader_cache::key)
+}
+
+/// Run a cache operation over the input at `ptr..ptr + len`.
+fn cache_export(ptr: usize, len: usize, f: fn(&[u8]) -> Result<Vec<u8>, String>) -> i32 {
+    let Some(input) = (unsafe { bytes_at(ptr, len) }) else {
+        return fail("typedpg_wasm: the cache input is not readable");
+    };
+    match f(input) {
+        Ok(output) => set_output(output),
+        Err(message) => fail(&message),
+    }
 }
 
 /// A comparison as the one byte JS reads: `<`, `=` or `>`.
