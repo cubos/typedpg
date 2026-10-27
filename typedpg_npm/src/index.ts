@@ -21,6 +21,7 @@ export type { Codec, Interval, Range, RangeBound } from "./codec.js";
 export type { Driver, Executor, PgQueryable, PostgresJsSql, RawResult } from "./adapters.js";
 export {
   MigrationError,
+  acceptMigration,
   embedMigrations,
   loadMigrations,
   migrate,

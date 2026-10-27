@@ -1,0 +1,290 @@
+[
+  {
+    "a": "SELECT 1;",
+    "b": "-- note\nSELECT 1;",
+    "same": true,
+    "why": "a line comment added is not drift"
+  },
+  {
+    "a": "SELECT 1; -- note\n",
+    "b": "SELECT 1;",
+    "same": true,
+    "why": "a line comment removed is not drift"
+  },
+  {
+    "a": "-- first\nSELECT 1;",
+    "b": "-- second\nSELECT 1;",
+    "same": true,
+    "why": "a line comment edited is not drift"
+  },
+  {
+    "a": "SELECT 1;",
+    "b": "/* a /* nested */ b */ SELECT 1;",
+    "same": true,
+    "why": "a nested block comment added is not drift"
+  },
+  {
+    "a": "SELECT /* a /* nested */ b */ 1;",
+    "b": "SELECT /* other */ 1;",
+    "same": true,
+    "why": "a nested block comment edited is not drift"
+  },
+  {
+    "a": "SELECT a, b\nFROM t;",
+    "b": "SELECT\n    a,\n    b\n  FROM t;",
+    "same": true,
+    "why": "indentation is not drift"
+  },
+  {
+    "a": "SELECT a, b FROM t;",
+    "b": "SELECT a, b\nFROM t;",
+    "same": true,
+    "why": "a line break where whitespace already is, is not drift"
+  },
+  {
+    "a": "SELECT 1;",
+    "b": "select 1;",
+    "same": true,
+    "why": "keyword case is not drift"
+  },
+  {
+    "a": "SELECT Foo FROM Bar;",
+    "b": "select foo from bar;",
+    "same": true,
+    "why": "unquoted identifier case is not drift"
+  },
+  {
+    "a": "SELECT \"Foo\" FROM t;",
+    "b": "SELECT \"foo\" FROM t;",
+    "same": false,
+    "why": "a quoted identifier's case is its content"
+  },
+  {
+    "a": "SELECT 'a';",
+    "b": "SELECT 'b';",
+    "same": false,
+    "why": "a string literal's content is its content"
+  },
+  {
+    "a": "SELECT 'a';",
+    "b": "SELECT 'A';",
+    "same": false,
+    "why": "a string literal's case is its content"
+  },
+  {
+    "a": "SELECT 'a b';",
+    "b": "SELECT 'a  b';",
+    "same": false,
+    "why": "whitespace inside a string literal is its content"
+  },
+  {
+    "a": "SELECT E'a\\'--b';",
+    "b": "SELECT E'a\\'--b'; -- trailing",
+    "same": true,
+    "why": "in an E-string an escaped quote hides `--`: it is no comment"
+  },
+  {
+    "a": "SELECT E'a\\'--b';",
+    "b": "SELECT E'a\\'--c';",
+    "same": false,
+    "why": "the body of an E-string is its content"
+  },
+  {
+    "a": "SELECT E'a\\'b';",
+    "b": "SELECT e'a\\'b';",
+    "same": true,
+    "why": "the E prefix is an unquoted word, so its case does not count"
+  },
+  {
+    "a": "CREATE FUNCTION f() RETURNS int AS $$ BEGIN -- one\nRETURN 1; END; $$ LANGUAGE plpgsql;",
+    "b": "CREATE FUNCTION f() RETURNS int AS $$ BEGIN -- two\nRETURN 1; END; $$ LANGUAGE plpgsql;",
+    "same": false,
+    "why": "a comment inside a dollar-quoted body is stored by PostgreSQL"
+  },
+  {
+    "a": "SELECT $$body$$;",
+    "b": "/* comment */ SELECT $$body$$;",
+    "same": true,
+    "why": "a comment outside a dollar-quoted body is not drift"
+  },
+  {
+    "a": "SELECT $Tag$body$Tag$;",
+    "b": "SELECT $tag$body$tag$;",
+    "same": false,
+    "why": "a dollar-quote tag is case-sensitive"
+  },
+  {
+    "a": "CREATE INDEX CONCURRENTLY i ON t (a);",
+    "b": "-- no-transaction\nCREATE INDEX CONCURRENTLY i ON t (a);",
+    "same": false,
+    "why": "the no-transaction marker decides how the migration runs"
+  },
+  {
+    "a": "-- no-transaction\nCREATE INDEX CONCURRENTLY i ON t (a);",
+    "b": "CREATE INDEX CONCURRENTLY i ON t (a);",
+    "same": false,
+    "why": "removing the no-transaction marker changes how the migration runs"
+  },
+  {
+    "a": "SELECT a/**/b;",
+    "b": "SELECT ab;",
+    "same": false,
+    "why": "a comment separates tokens, so a/**/b is not ab"
+  },
+  {
+    "a": "SELECT a  -  b;",
+    "b": "SELECT a - b;",
+    "same": true,
+    "why": "a whitespace run around a token is one space"
+  },
+  {
+    "a": "SELECT $1 + $2 FROM t;",
+    "b": "select\n$1\n+\n$2\nfrom t;",
+    "same": true,
+    "why": "$1 is a parameter, not a dollar quote"
+  },
+  {
+    "a": "SELECT 'abc -- x",
+    "b": "SELECT 'abc -- y",
+    "same": false,
+    "why": "an unterminated string copies the rest verbatim"
+  },
+  {
+    "a": "SELECT 'abc -- not a comment",
+    "b": "SELECT 'abc -- not a comment",
+    "same": true,
+    "why": "an unterminated string is not a comment"
+  },
+  {
+    "a": "SELECT Ä FROM t;",
+    "b": "SELECT ä FROM t;",
+    "same": false,
+    "why": "PostgreSQL folds ASCII letters only in unquoted words"
+  },
+  {
+    "a": "SELECT a/*x*/b;",
+    "b": "SELECT a b;",
+    "same": true,
+    "why": "a comment between tokens is the space it stands for"
+  },
+  {
+    "a": "-- lead\nSELECT 1;\n/* trail */",
+    "b": "SELECT 1;",
+    "same": true,
+    "why": "leading and trailing comment runs are dropped"
+  },
+  {
+    "a": "SELECT 1;\r\n",
+    "b": "SELECT 1;\n",
+    "same": true,
+    "why": "line-ending style is whitespace"
+  },
+  {
+    "a": "SELECT \"a\"\"B\" FROM t;",
+    "b": "SELECT \"a\"\"b\" FROM t;",
+    "same": false,
+    "why": "an escaped quote inside a quoted identifier keeps its case"
+  },
+  {
+    "a": "SELECT \"a b\" FROM t;",
+    "b": "SELECT \"a  b\" FROM t;",
+    "same": false,
+    "why": "whitespace inside a quoted identifier is its content"
+  },
+  {
+    "a": "SELECT $$x$$;",
+    "b": "SELECT $tag$x$tag$;",
+    "same": false,
+    "why": "a dollar-quote tag is part of the stored text"
+  },
+  {
+    "a": "SELECT 1 /* unclosed",
+    "b": "SELECT 1",
+    "same": true,
+    "why": "an unterminated block comment runs to the end"
+  },
+  {
+    "a": "CREATE TABLE t (a INT);",
+    "b": "CREATE TABLE t\n(\n  a INT\n);",
+    "same": true,
+    "why": "line-break placement is not drift: no boundary needs a space next to `(` or `)`"
+  },
+  {
+    "a": "foo (x)",
+    "b": "foo(x)",
+    "same": true,
+    "why": "a space before `(` is not drift: a word and punctuation never fuse"
+  },
+  {
+    "a": "a - b",
+    "b": "a-b",
+    "same": true,
+    "why": "a space around an operator is not drift: a word and an operator never fuse"
+  },
+  {
+    "a": "x :: int",
+    "b": "x::int",
+    "same": true,
+    "why": "a space around `:` is not drift: a word and `:` never fuse"
+  },
+  {
+    "a": "SELECT 1 - -1",
+    "b": "SELECT 1 --1",
+    "same": false,
+    "why": "`- -1` is two operators while `--1` is a comment: operator runs keep their space"
+  },
+  {
+    "a": "a < = b",
+    "b": "a <= b",
+    "same": false,
+    "why": "two operators keep their space: `< =` is not `<=`"
+  },
+  {
+    "a": "1 .5",
+    "b": "1.5",
+    "same": false,
+    "why": "a digit and `.` are both word class: `1 .5` is two tokens, `1.5` one"
+  },
+  {
+    "a": "E 'x'",
+    "b": "E'x'",
+    "same": false,
+    "why": "a word and a string's opening quote are both word class: `E 'x'` is not the E-string `E'x'`"
+  },
+  {
+    "a": "a/**/b",
+    "b": "ab",
+    "same": false,
+    "why": "a comment between two word characters keeps the space: `a/**/b` is `a b`, not `ab`"
+  },
+  {
+    "a": "a/**/(b)",
+    "b": "a(b)",
+    "same": true,
+    "why": "a dropped comment run before `(` leaves no space"
+  },
+  {
+    "a": "CREATE TABLE t (a INT, b TEXT, c BOOLEAN);",
+    "b": "CREATE TABLE t (\n    a INT, -- the first\n    b TEXT, /* the second */\n    c BOOLEAN\n);",
+    "same": true,
+    "why": "a one-column-per-line CREATE TABLE with comments is not drift"
+  },
+  {
+    "a": "$1 ,$2",
+    "b": "$1, $2",
+    "same": true,
+    "why": "`$1` and `$2` are parameters: a run next to a comma is dropped"
+  },
+  {
+    "a": "'a'\n'b'",
+    "b": "'a' 'b'",
+    "same": true,
+    "why": "the accepted string-continuation exception: PostgreSQL concatenates `'a'\\n'b'` but not `'a' 'b'`, and drift cannot tell them apart"
+  },
+  {
+    "a": "ção ção",
+    "b": "çãoção",
+    "same": false,
+    "why": "non-ASCII characters are word class: `ção ção` is two words, `çãoção` one"
+  }
+]

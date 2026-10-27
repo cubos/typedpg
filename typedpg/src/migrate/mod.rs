@@ -32,8 +32,16 @@
 //!
 //! # Concurrency safety
 //!
-//! The [`run`] and [`revert`] functions acquire a PostgreSQL advisory lock
+//! The [`run`], [`revert`] and [`accept`] functions acquire a PostgreSQL advisory lock
 //! before applying changes, preventing concurrent migration runs from conflicting.
+//!
+//! # Drift
+//!
+//! An applied migration edited since is drift: [`run`] aborts (or warns,
+//! with [`MigrationsConfig::fail_on_drift`] off) and prints a diff of the
+//! text that was applied against the file. Comments, whitespace and the
+//! case of unquoted words do not count. [`accept`] records an intentional
+//! edit as applied without running it.
 //!
 //! # Usage
 //!
@@ -61,11 +69,12 @@
 //! # }
 //! ```
 
+mod normalize;
 mod runner;
 mod source;
 mod split;
 
-pub use runner::{MigrationStatus, revert, run, status};
+pub use runner::{MigrationStatus, accept, revert, run, status};
 pub use source::{Migration, MigrationSource};
 
 /// Migration runner settings (tracking table, advisory lock id, transaction

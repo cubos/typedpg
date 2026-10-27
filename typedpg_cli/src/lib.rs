@@ -22,6 +22,11 @@ pub enum MigrateAction {
         #[arg(long)]
         force: bool,
     },
+    /// Record an applied migration's edited file as applied, without running it
+    Accept {
+        /// Name of the applied migration to accept
+        name: String,
+    },
     /// Create a new empty migration file
     Create {
         /// Migration name (e.g., "add_users_table")
@@ -236,6 +241,10 @@ pub async fn run_migrate_action(
             };
             migrate::revert(client, source, &revert_name, force, config).await?;
             println!("Reverting {revert_name}... done");
+        }
+        MigrateAction::Accept { name } => {
+            migrate::accept(client, source, config, &name).await?;
+            println!("Accepted {name}: its current file is recorded as applied (nothing ran)");
         }
         MigrateAction::Create { .. } => unreachable!(),
     }

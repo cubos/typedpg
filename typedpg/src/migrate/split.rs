@@ -136,17 +136,17 @@ impl StatementState {
     }
 }
 
-fn is_ident_start(b: u8) -> bool {
+pub(crate) fn is_ident_start(b: u8) -> bool {
     b.is_ascii_alphabetic() || b == b'_' || b >= 0x80
 }
 
-fn is_ident_cont(b: u8) -> bool {
+pub(crate) fn is_ident_cont(b: u8) -> bool {
     is_ident_start(b) || b.is_ascii_digit() || b == b'$'
 }
 
 /// The index past a quoted run opened at `open` (`'…'` or `"…"`, the quote
 /// doubled to escape it; with `backslash`, `\` escapes the next byte too).
-fn skip_quoted(bytes: &[u8], open: usize, quote: u8, backslash: bool) -> usize {
+pub(crate) fn skip_quoted(bytes: &[u8], open: usize, quote: u8, backslash: bool) -> usize {
     let mut i = open + 1;
     while i < bytes.len() {
         if backslash && bytes[i] == b'\\' {
@@ -165,7 +165,7 @@ fn skip_quoted(bytes: &[u8], open: usize, quote: u8, backslash: bool) -> usize {
 }
 
 /// The index past a `/* … */` comment opened at `open`; they nest.
-fn skip_block_comment(bytes: &[u8], open: usize) -> usize {
+pub(crate) fn skip_block_comment(bytes: &[u8], open: usize) -> usize {
     let mut depth = 0;
     let mut i = open;
     while i < bytes.len() {

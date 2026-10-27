@@ -6,14 +6,17 @@
 // `NNNN_description.down.sql`. A run takes an advisory lock, applies each
 // pending migration in a transaction (unless the runner's `useTransaction`
 // is off or the file starts with `-- no-transaction`, where its statements
-// run one at a time) and records it with its text, whose MD5 later detects
-// an applied migration edited since.
+// run one at a time) and records it with its text and normalized hash. A
+// changed statement later is drift; comments, whitespace and unquoted case
+// are not (see `normalize.ts`).
 
-import { createHash } from "node:crypto";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 
 import { type Driver, type Executor, driverFor, unsupported } from "./adapters.js";
+import { HASH_VERSION, hasNoTransactionMarker, hash, unifiedDiff } from "./normalize.js";
+
+export { hasNoTransactionMarker } from "./normalize.js";
 
 export interface Migration {
   /** The file stem: `0001_create_users`. */
@@ -36,7 +39,11 @@ export interface MigrationsConfig {
   lockId: number | bigint;
   /** Run each migration in a transaction. Default true. */
   useTransaction: boolean;
-  /** Abort a run when an applied migration was edited since; else warn. Default true. */
+  /**
+   * Abort a run when an applied migration's statements were edited since;
+   * else warn. Comments, whitespace and unquoted case do not count. Default
+   * true. `acceptMigration` records an intentional edit.
+   */
   failOnDrift: boolean;
   /** Where warnings go. Default `console.warn`. */
   onWarning?: (message: string) => void;
@@ -52,7 +59,7 @@ export interface MigrationStatus {
   readonly name: string;
   readonly applied: boolean;
   readonly appliedAt: Date | null;
-  /** Applied, and edited since. */
+  /** Applied, and its statements edited since (comments and whitespace are not). */
   readonly drifted: boolean;
 }
 
@@ -82,25 +89,6 @@ export function embedMigrations(
  */
 export function stripBom(sql: string): string {
   return sql.startsWith("\uFEFF") ? sql.slice(1) : sql;
-}
-
-/**
- * Whether the SQL's first line is the `-- no-transaction` marker: the
- * migration runs outside a transaction.
- *
- * The marker is the marker, not a word: a file edited on Windows may
- * start with a BOM, and the marker may carry a note after it. The mirror
- * of `typedpg_core::migration_marker::has_no_transaction_marker`.
- */
-export function hasNoTransactionMarker(sql: string): boolean {
-  const first = sql.split("\n", 1)[0]!.replace(/^\uFEFF/, "").trim();
-  const rest = first.startsWith("-- no-transaction")
-    ? first.slice("-- no-transaction".length)
-    : null;
-  if (rest === null) return false;
-  if (rest === "") return true;
-  const c = rest[0]!;
-  return !/[A-Za-z0-9_]/.test(c);
 }
 
 /**
@@ -248,14 +236,6 @@ function sortByVersion(migrations: Migration[]): Migration[] {
   );
 }
 
-/** The MD5 of the migration's UTF-8 bytes; the server's `STORED_HASH` matches it. */
-function hash(sql: string): string {
-  return createHash("md5").update(sql, "utf8").digest("hex");
-}
-
-/** `md5(text)` would hash in the database encoding: compare UTF-8 bytes. */
-const STORED_HASH = "md5(convert_to(sql_source, 'UTF8'))";
-
 /** Run `f` on one connection of `executor`. */
 async function withSession<T>(executor: Executor, f: (d: Driver) => Promise<T>): Promise<T> {
   const driver = driverFor(executor);
@@ -285,11 +265,15 @@ async function locked<T>(d: Driver, config: MigrationsConfig, f: () => Promise<T
     // otherwise both find the table missing.
     await d.typedpgSimple!(
       `CREATE TABLE IF NOT EXISTS ${config.table} (
-         name       TEXT PRIMARY KEY,
-         applied_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-         sql_source TEXT
+         name         TEXT PRIMARY KEY,
+         applied_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+         sql_source   TEXT,
+         hash         TEXT,
+         hash_version INTEGER
        );
-       ALTER TABLE ${config.table} ADD COLUMN IF NOT EXISTS sql_source TEXT;`,
+       ALTER TABLE ${config.table} ADD COLUMN IF NOT EXISTS sql_source TEXT;
+       ALTER TABLE ${config.table} ADD COLUMN IF NOT EXISTS hash TEXT;
+       ALTER TABLE ${config.table} ADD COLUMN IF NOT EXISTS hash_version INTEGER;`,
     );
     result = await f();
   } catch (e) {
@@ -302,9 +286,67 @@ async function locked<T>(d: Driver, config: MigrationsConfig, f: () => Promise<T
   return result;
 }
 
-async function appliedHashes(d: Driver, config: MigrationsConfig): Promise<Map<string, string | null>> {
-  const { rows } = await d.typedpgQuery(`SELECT name, ${STORED_HASH} FROM ${config.table}`, []);
-  return new Map(rows.map(([name, h]) => [name!, h ?? null]));
+/** An applied migration's stored drift hash, as `migrate` reads it. */
+interface AppliedMigration {
+  hash: string | null;
+  hashVersion: number | null;
+}
+
+async function appliedHashes(d: Driver, config: MigrationsConfig): Promise<Map<string, AppliedMigration>> {
+  const { rows } = await d.typedpgQuery(`SELECT name, hash, hash_version::text FROM ${config.table}`, []);
+  return new Map(
+    rows.map(([name, h, v]) => [
+      name!,
+      { hash: h ?? null, hashVersion: v === null || v === undefined ? null : Number(v) },
+    ]),
+  );
+}
+
+/**
+ * The one-time upgrade of the tracking table's stored hashes: every row
+ * whose `hash_version` is not the current one gets the normalized hash of
+ * its stored text, when it has one. Rows without `sql_source` stay unhashed
+ * — they can never drift.
+ */
+async function backfillHashes(d: Driver, config: MigrationsConfig): Promise<void> {
+  const { rows } = await d.typedpgQuery(
+    `SELECT name, sql_source FROM ${config.table}
+     WHERE hash_version IS DISTINCT FROM ($1::pg_catalog.int4) AND sql_source IS NOT NULL`,
+    [String(HASH_VERSION)],
+  );
+  for (const [name, sql] of rows) {
+    if (sql === null || sql === undefined) continue;
+    await d.typedpgQuery(
+      `UPDATE ${config.table} SET hash = ($1::pg_catalog.text), hash_version = ($2::pg_catalog.int4)
+       WHERE name = ($3::pg_catalog.text)`,
+      [hash(sql), String(HASH_VERSION), name!],
+    );
+  }
+}
+
+/** The stored `sql_source` of a drifted migration, for its diff. */
+async function storedSqlSource(d: Driver, config: MigrationsConfig, name: string): Promise<string | null> {
+  const { rows } = await d.typedpgQuery(
+    `SELECT sql_source FROM ${config.table} WHERE name = ($1::pg_catalog.text)`,
+    [name],
+  );
+  return rows[0]?.[0] ?? null;
+}
+
+/**
+ * The drift message: the migration's name, a unified diff of what was
+ * applied against the file (when its text is stored), and how to make an
+ * intentional edit stop being drift. The error also says how to downgrade
+ * drift to a warning.
+ */
+function driftMessage(name: string, storedSql: string | null, fileSql: string, failOnDrift: boolean): string {
+  let message = `migration '${name}' has been modified since it was applied:`;
+  if (storedSql !== null) message += `\n${unifiedDiff(storedSql, fileSql, `${name}.sql`)}`;
+  message +=
+    `\nIf the change is intentional (it does not need to run again), record the file as applied ` +
+    `with \`typedpg migrate accept ${name}\`; otherwise restore the file and add a new migration.`;
+  if (failOnDrift) message += `\nSet migrations.failOnDrift = false to downgrade this to a warning.`;
+  return message;
 }
 
 function warn(config: MigrationsConfig, message: string) {
@@ -319,28 +361,34 @@ export async function migrate(executor: Executor, set: MigrationSet): Promise<st
   const { config } = set;
   return withSession(executor, (d) =>
     locked(d, config, async () => {
+      await backfillHashes(d, config);
       const applied = await appliedHashes(d, config);
       // Drift is checked over every applied migration before anything new
       // runs: a pending migration can sort before an applied one.
       for (const m of set.migrations) {
         const stored = applied.get(m.name);
-        if (stored && stored !== hash(m.sql)) {
-          if (config.failOnDrift) {
-            throw new MigrationError(
-              `migration '${m.name}' has been modified since it was applied; set ` +
-                `migrations.failOnDrift = false to downgrade to a warning`,
-            );
-          }
-          warn(config, `warning: migration '${m.name}' has been modified since it was applied`);
+        if (
+          !stored ||
+          stored.hashVersion !== HASH_VERSION ||
+          stored.hash === null ||
+          stored.hash === hash(m.sql)
+        ) {
+          continue;
         }
+        const storedSql = await storedSqlSource(d, config, m.name);
+        const message = driftMessage(m.name, storedSql, m.sql, config.failOnDrift);
+        if (config.failOnDrift) throw new MigrationError(message);
+        warn(config, `warning: ${message}`);
       }
       const done: string[] = [];
       for (const m of set.migrations) {
         if (applied.has(m.name)) continue;
+        const mHash = hash(m.sql);
         await runScript(d, config, m, m.sql, "apply", () =>
           d.typedpgQuery(
-            `INSERT INTO ${config.table} (name, sql_source) VALUES (($1::pg_catalog.text), ($2::pg_catalog.text))`,
-            [m.name, m.sql],
+            `INSERT INTO ${config.table} (name, sql_source, hash, hash_version)
+             VALUES (($1::pg_catalog.text), ($2::pg_catalog.text), ($3::pg_catalog.text), ($4::pg_catalog.int4))`,
+            [m.name, m.sql, mHash, String(HASH_VERSION)],
           ),
         );
         done.push(m.name);
@@ -401,19 +449,44 @@ export async function migrationStatus(executor: Executor, set: MigrationSet): Pr
   const exists = await d.typedpgQuery(
     `SELECT c.oid IS NOT NULL,
             EXISTS (SELECT 1 FROM pg_catalog.pg_attribute a
-                    WHERE a.attrelid = c.oid AND a.attname = 'sql_source' AND NOT a.attisdropped)
+                    WHERE a.attrelid = c.oid AND a.attname = 'sql_source' AND NOT a.attisdropped),
+            EXISTS (SELECT 1 FROM pg_catalog.pg_attribute a
+                    WHERE a.attrelid = c.oid AND a.attname = 'hash' AND NOT a.attisdropped),
+            EXISTS (SELECT 1 FROM pg_catalog.pg_attribute a
+                    WHERE a.attrelid = c.oid AND a.attname = 'hash_version' AND NOT a.attisdropped)
      FROM (SELECT pg_catalog.to_regclass(($1::pg_catalog.text)) AS oid) AS c`,
     [config.table],
   );
-  const [tableExists, hasSource] = exists.rows[0]!;
+  const [tableExists, hasSource, hasHash, hasHashVersion] = exists.rows[0]!;
   const applied = new Map<string, [Date, string | null]>();
   if (tableExists === "t") {
-    const source = hasSource === "t" ? STORED_HASH : "NULL::text";
+    const hashColumn = hasHash === "t" ? "hash" : "NULL::text";
+    const versionColumn = hasHashVersion === "t" ? "hash_version::text" : "NULL::text";
     const { rows } = await d.typedpgQuery(
-      `SELECT name, extract(epoch FROM applied_at)::text, ${source} FROM ${config.table} ORDER BY name`,
+      `SELECT name, extract(epoch FROM applied_at)::text, ${hashColumn}, ${versionColumn}
+       FROM ${config.table} ORDER BY name`,
       [],
     );
-    for (const [name, at, h] of rows) applied.set(name!, [new Date(Number(at) * 1000), h ?? null]);
+    for (const [name, at, h, v] of rows) {
+      // Only a current-algorithm hash is read; an older row's text is
+      // hashed in memory below.
+      const current = v !== null && v !== undefined && Number(v) === HASH_VERSION;
+      applied.set(name!, [new Date(Number(at) * 1000), current ? (h ?? null) : null]);
+    }
+    // The stale rows' text is fetched (and hashed) here, never written
+    // back: `migrationStatus` only reads.
+    if (hasSource === "t") {
+      const staleFilter =
+        hasHashVersion === "t" ? " AND hash_version IS DISTINCT FROM ($1::pg_catalog.int4)" : "";
+      const { rows } = await d.typedpgQuery(
+        `SELECT name, sql_source FROM ${config.table} WHERE sql_source IS NOT NULL${staleFilter}`,
+        hasHashVersion === "t" ? [String(HASH_VERSION)] : [],
+      );
+      for (const [name, sql] of rows) {
+        const info = applied.get(name!);
+        if (info && sql !== null && sql !== undefined) info[1] = hash(sql);
+      }
+    }
   }
   return set.migrations.map((m) => {
     const info = applied.get(m.name);
@@ -421,6 +494,31 @@ export async function migrationStatus(executor: Executor, set: MigrationSet): Pr
     if (drifted) warn(config, `warning: migration '${m.name}' has been modified since it was applied`);
     return { name: m.name, applied: info !== undefined, appliedAt: info?.[0] ?? null, drifted };
   });
+}
+
+/**
+ * Record an applied migration's edited file as applied, without running it:
+ * the stored text and normalized hash become the file's, and `appliedAt`
+ * and the database are untouched. For an intentional edit that does not
+ * need to run again.
+ */
+export async function acceptMigration(executor: Executor, set: MigrationSet, name: string): Promise<void> {
+  const { config } = set;
+  return withSession(executor, (d) =>
+    locked(d, config, async () => {
+      const m = set.migrations.find((m) => m.name === name);
+      if (!m) throw new MigrationError(`no migration file named '${name}'`);
+      const applied = await appliedHashes(d, config);
+      if (!applied.has(name)) {
+        throw new MigrationError(`migration '${name}' has not been applied: nothing to accept`);
+      }
+      await d.typedpgQuery(
+        `UPDATE ${config.table} SET sql_source = ($1::pg_catalog.text), hash = ($2::pg_catalog.text),
+         hash_version = ($3::pg_catalog.int4) WHERE name = ($4::pg_catalog.text)`,
+        [m.sql, hash(m.sql), String(HASH_VERSION), name],
+      );
+    }),
+  );
 }
 
 /**
