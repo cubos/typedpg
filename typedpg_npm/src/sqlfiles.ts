@@ -3,8 +3,9 @@
 //
 // The cache is keyed by everything a module depends on — the typedpg
 // version, the config file, every database's migrations, the file's path and
-// content — computed here as the binary computes it (typedpg_ts/src/cache.rs:
-// change the recipe in both). A file with no entry compiles on demand when
+// content — computed by `typedpg_core::loader_cache`, which the binary and
+// this runtime share through `typedpg_wasm`: a cache `typedpg build` filled
+// is read here without a binary. A file with no entry compiles on demand when
 // the install has a binary, which only a devDependency on
 // `@cubos/typedpg-cli` gives it: `compileSql` runs `typedpg build` once
 // (the Node hook is synchronous), `compileSqlAsync` sends the file to a
@@ -13,21 +14,21 @@
 // (`typedpg build` in the image's build) needs no binary at all.
 
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
-import { createHash } from "node:crypto";
 import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import type { Readable, Writable } from "node:stream";
 import { binary } from "./binary.js";
+import {
+  cacheDatabases,
+  cacheKey as cacheKeyOf,
+  cacheMigrationFiles,
+  cacheSchemaIdentity,
+} from "./core.js";
 
-const FORMAT = "typedpg-cache-1";
 const CONFIG_FILE = "typedpg.config.json";
 /** How long a serve child lives without a request, in seconds, unless
  * `TYPEDPG_SERVE_IDLE_TIMEOUT` says otherwise. */
 const DEFAULT_IDLE_TIMEOUT = 300;
-
-const VERSION: string = (
-  JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string }
-).version;
 
 /** A compiled `.sql` file: its module, and the files it depends on (to watch). */
 export interface CompiledSql {
@@ -114,7 +115,7 @@ function prepare(file: string): Lookup {
   }
   const project = load(configFile);
   const content = readFileSync(file, "utf8");
-  const key = cacheKey(project, file, content);
+  const key = cacheKeyOf(project.identity, relativePath(project.root, file), content);
   const dir = cacheDir(project.root);
   return {
     configFile,
@@ -396,36 +397,27 @@ interface MigrationFile {
 
 /** The databases of a config, sorted by name: `[name, migration directories]`. */
 function databases(root: string, text: string): [string, string[]][] {
-  type Db = { migrations?: string | { dir?: string }; extraMigrations?: string[] };
-  const config = JSON.parse(text) as Db & { databases?: Record<string, Db> };
-  const entries: [string, Db][] = config.databases
-    ? Object.entries(config.databases).sort((a, b) => Buffer.compare(Buffer.from(a[0]), Buffer.from(b[0])))
-    : [["default", config]];
-  return entries.map(([name, db]) => {
-    const dir = typeof db.migrations === "string" ? db.migrations : (db.migrations?.dir ?? "migrations");
-    return [name, [dir, ...(db.extraMigrations ?? [])].map((d) => resolve(root, d))];
-  });
+  return cacheDatabases(text).map(({ name, dirs }) => [name, dirs.map((dir) => resolve(root, dir))]);
 }
 
 /**
- * The migrations of `dirs` as the catalog applies them: `.sql` files but
- * `.down.sql` ones, by file name (bytes), a directory's before the next's on
- * a tie.
+ * The migrations of `dirs` as the catalog applies them, in the recipe's
+ * order: `typedpg_core::loader_cache::migration_files` selects them from each
+ * directory's listing, and this reads the chosen files.
  */
 function migrations(dirs: string[]): MigrationFile[] {
-  const files: MigrationFile[] = [];
+  const listed: { dir: string; names: string[] }[] = [];
   for (const dir of dirs) {
-    let names: string[];
     try {
-      names = readdirSync(dir);
+      listed.push({ dir, names: readdirSync(dir) });
     } catch {
-      continue;
-    }
-    for (const name of names) {
-      if (name.endsWith(".sql") && !name.endsWith(".down.sql")) files.push({ name, path: join(dir, name) });
+      // A directory that cannot be read contributes no migrations.
     }
   }
-  return files.sort((a, b) => Buffer.compare(Buffer.from(a.name), Buffer.from(b.name)));
+  return cacheMigrationFiles(listed.map((entry) => entry.names)).map(({ directory, name }) => ({
+    name,
+    path: join(listed[directory].dir, name),
+  }));
 }
 
 function migrationFiles(root: string, text: string): MigrationFile[] {
@@ -435,34 +427,18 @@ function migrationFiles(root: string, text: string): MigrationFile[] {
 /** A SHA-256 of the config file and every database's migrations. */
 function schemaIdentity(root: string, configFile: string): string {
   const text = readFileSync(configFile);
-  const h = createHash("sha256");
-  h.update("typedpg-schema-1\n");
-  h.update(text);
-  h.update("\n");
-  for (const [name, dirs] of databases(root, text.toString("utf8"))) {
-    h.update(`db:${name}\n`);
-    for (const m of migrations(dirs)) {
-      h.update(m.name);
-      h.update("\0");
-      h.update(readFileSync(m.path));
-      h.update("\0");
-    }
-  }
-  return h.digest("hex");
+  return cacheSchemaIdentity(
+    text,
+    databases(root, text.toString("utf8")).map(([name, dirs]) => ({
+      name,
+      migrations: migrations(dirs).map((m) => ({ name: m.name, bytes: readFileSync(m.path) })),
+    })),
+  );
 }
 
 /** `file` relative to `root`, with `/`, both without symlinks. */
 function relativePath(root: string, file: string): string {
   return relative(realpathSync(root), realpathSync(file)).split(sep).join("/");
-}
-
-function cacheKey(project: Project, file: string, content: string): string {
-  const h = createHash("sha256");
-  for (const part of [FORMAT, VERSION, project.identity, relativePath(project.root, file), content]) {
-    h.update(part);
-    h.update("\n");
-  }
-  return h.digest("hex");
 }
 
 function cacheDir(root: string): string {

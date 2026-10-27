@@ -69,7 +69,8 @@ are drivers: they perform each `Step` on their own client and reply. The pure
 helpers (statement splitting, drift normalization and hash, ordering,
 file-name and tracking-table validation, error and drift messages) live in
 the same module. `typedpg_wasm` exports the machine (with handles, so runs
-can interleave across awaits) plus those helpers to the npm runtime. Building
+can interleave across awaits) plus those helpers, and the `.sql` loaders'
+cache recipe (`typedpg_core::loader_cache`), to the npm runtime. Building
 `typedpg_npm` (`npm run build` there) runs `scripts/wasm.mjs` (cargo, wasm32)
 and embeds the module in a generated `src/wasm.generated.ts`, so building or
 testing the package needs Rust and the wasm target:
@@ -78,9 +79,12 @@ testing the package needs Rust and the wasm target:
 rustup target add wasm32-unknown-unknown
 ```
 
-The loaders' cache key is computed twice, by `typedpg_ts/src/cache.rs` and
-`typedpg_npm/src/sqlfiles.ts`: change the recipe in both (the e2e runs the
-Node hook on a cache `typedpg build` filled, without the binary).
+The loaders' cache key is one recipe in `typedpg_core::loader_cache`, used by
+`typedpg_ts/src/cache.rs` and, through `typedpg_wasm`, by
+`typedpg_npm/src/sqlfiles.ts`: change it once, in core, and bump `FORMAT` when
+the output must change (the e2e runs the Node hook on a cache `typedpg build`
+filled, without the binary). The recipe's actual key material must not change
+casually: an existing cache stays valid.
 
 ```bash
 cargo nextest run --release -p typedpg_ts        # scanner, codegen, incremental project

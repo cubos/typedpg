@@ -1,0 +1,17 @@
+{
+  "databases": {
+    "zeta": {
+      "sql": { "include": ["q/*.sql"], "emit": "none" },
+      "migrations": { "dir": "db/zeta/schema", "table": "zeta._migrations", "lockId": 7 }
+    },
+    "alpha": {
+      "sql": { "include": ["q/*.sql"], "emit": "none" },
+      "migrations": "db/alpha/schema",
+      "extraMigrations": ["db/shared", "./db/alpha/more"]
+    },
+    "no-dir": {
+      "sql": { "include": ["q/*.sql"], "emit": "none" },
+      "migrations": {}
+    }
+  }
+}

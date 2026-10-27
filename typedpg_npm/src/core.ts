@@ -1,14 +1,16 @@
-// The bridge to `typedpg_wasm`, the Rust migration runner compiled to
-// WebAssembly: the sans-I/O migration machine and the file-name, ordering
-// and tracking-table helpers around it, so the npm runner and the Rust one
-// cannot disagree. Statement splitting, drift normalization and hashing, and
-// the error and drift messages live inside the machine now. See
+// The bridge to `typedpg_wasm`, the Rust migration runner and `.sql` cache
+// recipe compiled to WebAssembly: the sans-I/O migration machine and the
+// file-name, ordering and tracking-table helpers around it, plus the cache
+// key the loaders share with `typedpg build`, so the npm runtime and the Rust
+// side cannot disagree. Statement splitting, drift normalization and hashing,
+// and the error and drift messages live inside the machine now. See
 // typedpg_wasm/src/lib.rs for the ABI.
 //
 // The module is compiled lazily, on the first call that needs it — never
-// when the package is imported. Query-only users (`createSql`, codecs,
-// loaders) never pay for it, and a Cloudflare Worker, where compiling wasm
-// from bytes is forbidden, only hits it if it runs migrations.
+// when the package is imported. Query-only users (`createSql`, codecs) never
+// pay for it; the `.sql` loaders compile it on their first cache lookup
+// (never on import), and a Cloudflare Worker only hits it if it runs
+// migrations or loads a `.sql` file.
 
 import { WASM_MODULE_BASE64 } from "./wasm.generated.js";
 
@@ -33,6 +35,10 @@ interface Exports {
   validate_table_name(ptr: number, len: number): number;
   strip_bom(ptr: number, len: number): number;
   has_no_transaction_marker(ptr: number, len: number): number;
+  cache_databases(ptr: number, len: number): number;
+  cache_migration_files(ptr: number, len: number): number;
+  cache_schema_identity(ptr: number, len: number): number;
+  cache_key(ptr: number, len: number): number;
 }
 
 const encoder = new TextEncoder();
@@ -159,6 +165,101 @@ export function hasNoTransactionMarker(sql: string): boolean {
   const outcome = run((exports, input) => exports.has_no_transaction_marker(...input(sql)));
   text(outcome);
   return outcome.output[0] === 1;
+}
+
+// The `.sql` loaders' cache: the config's databases, the migration files a
+// directory listing contributes, and the hashes. The logic is
+// `typedpg_core::loader_cache`; the format mirrors `typedpg_wasm`'s ABI (see
+// typedpg_wasm/src/lib.rs).
+
+/** A database as the config declares it. */
+export interface CacheDatabase {
+  readonly name: string;
+  /** The migration directories as written, relative to the config's directory. */
+  readonly dirs: readonly string[];
+}
+
+/** A migration file the cache recipe hashes. */
+export interface CacheMigration {
+  /** The index of the directory it came from. */
+  readonly directory: number;
+  readonly name: string;
+}
+
+/** A database's migrations, in the order [`cacheMigrationFiles`] selected them. */
+export interface CacheDatabaseMigrations {
+  readonly name: string;
+  readonly migrations: readonly { readonly name: string; readonly bytes: Uint8Array }[];
+}
+
+/** The databases a config declares, sorted by name. Throws on an invalid config. */
+export function cacheDatabases(configJson: string): CacheDatabase[] {
+  const outcome = run((exports, input) => exports.cache_databases(...input(configJson)));
+  const message = errorText(outcome);
+  if (message !== null) throw new Error(message);
+  const reader = new Reader(outcome.output);
+  const count = reader.u32();
+  const databases: CacheDatabase[] = [];
+  for (let i = 0; i < count; i++) {
+    const name = reader.string();
+    const dirCount = reader.u32();
+    const dirs: string[] = [];
+    for (let j = 0; j < dirCount; j++) dirs.push(reader.string());
+    databases.push({ name, dirs });
+  }
+  return databases;
+}
+
+/** The migration files of each directory's raw listing, in the order the cache hashes them. */
+export function cacheMigrationFiles(
+  directories: readonly (readonly string[])[],
+): CacheMigration[] {
+  const writer = new Writer();
+  writer.u32(directories.length);
+  for (const names of directories) {
+    writer.u32(names.length);
+    for (const name of names) writer.string(name);
+  }
+  const outcome = run((exports, input) => exports.cache_migration_files(...input(writer.finish())));
+  const message = errorText(outcome);
+  if (message !== null) throw new Error(message);
+  const reader = new Reader(outcome.output);
+  const count = reader.u32();
+  const migrations: CacheMigration[] = [];
+  for (let i = 0; i < count; i++) {
+    migrations.push({ directory: reader.u32(), name: reader.string() });
+  }
+  return migrations;
+}
+
+/** The identity of a config and the migrations the recipe hashes. */
+export function cacheSchemaIdentity(
+  config: Uint8Array,
+  databases: readonly CacheDatabaseMigrations[],
+): string {
+  const writer = new Writer();
+  writer.u32(config.length);
+  writer.raw(config);
+  writer.u32(databases.length);
+  for (const database of databases) {
+    writer.string(database.name);
+    writer.u32(database.migrations.length);
+    for (const migration of database.migrations) {
+      writer.string(migration.name);
+      writer.u32(migration.bytes.length);
+      writer.raw(migration.bytes);
+    }
+  }
+  return text(run((exports, input) => exports.cache_schema_identity(...input(writer.finish()))));
+}
+
+/** The key of a `.sql` file at `relativePath`, with `content`. */
+export function cacheKey(identity: string, relativePath: string, content: string): string {
+  const writer = new Writer();
+  writer.string(identity);
+  writer.string(relativePath);
+  writer.string(content);
+  return text(run((exports, input) => exports.cache_key(...input(writer.finish()))));
 }
 
 // The migration machine: the whole runner as a sans-I/O state machine in
@@ -440,6 +541,11 @@ class Writer {
   string(value: string): void {
     const bytes = encoder.encode(value);
     this.u32(bytes.length);
+    this.chunks.push(bytes);
+    this.length += bytes.length;
+  }
+
+  raw(bytes: Uint8Array): void {
     this.chunks.push(bytes);
     this.length += bytes.length;
   }
