@@ -1,29 +1,6 @@
-// Vite, Rollup and Rolldown (and vitest): `plugins: [typedpg()]` loads the
-// module of each `.sql` file imported, from the cache `typedpg build` fills
-// (see sqlfiles.ts); the config file and the migrations are watched.
+// Moved to `@cubos/typedpg-cli/vite` in 0.6.0; this subpath stays so the
+// import says where it went (see moved.ts).
 
-import { compileSql } from "./sqlfiles.js";
+import { moved } from "./moved.js";
 
-interface PluginContext {
-  addWatchFile(file: string): void;
-}
-
-export interface VitePlugin {
-  name: string;
-  enforce: "pre";
-  load(this: PluginContext, id: string): string | null;
-}
-
-export default function typedpg(): VitePlugin {
-  return {
-    name: "typedpg",
-    enforce: "pre",
-    load(id) {
-      // `\0`: a virtual module; `?raw` and other queries: not the module.
-      if (id.startsWith("\0") || id.includes("?") || !id.endsWith(".sql")) return null;
-      const compiled = compileSql(id);
-      for (const file of compiled.dependencies) this.addWatchFile(file);
-      return compiled.code;
-    },
-  };
-}
+throw moved("vite");

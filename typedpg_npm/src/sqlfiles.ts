@@ -5,9 +5,11 @@
 // version, the config file, every database's migrations, the file's path and
 // content — computed here as the binary computes it (typedpg_ts/src/cache.rs:
 // change the recipe in both). A file with no entry runs `typedpg build`
-// once, which compiles every file of the project missing one: importing a
-// `.sql` file never analyzes it in this process, and a warm cache (`typedpg
-// build` in the image's build) needs no binary at all.
+// once — when the install has a binary, which only a devDependency on
+// `@cubos/typedpg-cli` gives it — and that compiles every file of the
+// project missing one: importing a `.sql` file never analyzes it in this
+// process, and a warm cache (`typedpg build` in the image's build) needs no
+// binary at all.
 
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -55,7 +57,16 @@ export function compileSql(file: string): CompiledSql {
   const dependencies = [...project.files];
   if (existsSync(entry)) return { code: readFileSync(entry, "utf8"), dependencies };
 
-  const report = build(configFile);
+  const bin = binary(resolve(configFile));
+  if (bin === null) {
+    const rel = relativePath(project.root, file);
+    throw new Error(
+      `typedpg: ${rel} has no entry in the typedpg cache (${dir}), and no \`typedpg\` binary is ` +
+        `installed to compile it: run \`typedpg build\` (from @cubos/typedpg-cli) where the project ` +
+        `is built, or install @cubos/typedpg-cli as a devDependency to compile on demand.`,
+    );
+  }
+  const report = build(bin, configFile);
   if (existsSync(entry)) return { code: readFileSync(entry, "utf8"), dependencies };
   const rel = relativePath(project.root, file);
   const errors = report.diagnostics.filter((d) => d.file === rel || d.file === rel.split("/").join(sep));
@@ -83,11 +94,11 @@ interface Report {
   diagnostics: { file: string; line: number | null; col: number | null; message: string }[];
 }
 
-/** Run `typedpg build`, which fills the cache. */
-function build(configFile: string): Report {
+/** Run `bin` (`typedpg build`), which fills the cache. */
+function build(bin: string, configFile: string): Report {
   let stdout: string;
   try {
-    stdout = execFileSync(binary(), ["build", "--json", "--config", configFile], {
+    stdout = execFileSync(bin, ["build", "--json", "--config", configFile], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "inherit"],
       maxBuffer: 64 * 1024 * 1024,

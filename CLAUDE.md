@@ -44,10 +44,18 @@ BLESS=1 cargo nextest run --release -p typedpg_compile_fail   # rewrite snapshot
 
 `typedpg_ts` is the TypeScript CLI (`typedpg gen|check|build|serve|migrate`;
 it needs a newer Rust than the workspace's MSRV, for oxc), `typedpg_npm` the
-npm runtime package (with the loaders and bundler plugins of `.sql` files),
-`typedpg_vscode` the editor extension (SQL highlighting, `.sql` files' errors),
-`typedpg_ts_example` the project the end-to-end run uses (`loaders/` in it
-imports a `.sql` file itself).
+npm runtime package (the query runtime, the migration runner and the `.sql`
+loaders a production install runs from the cache), `typedpg_npm_cli` the npm
+development package (the `typedpg` command and the bundler plugins, with the
+platform binaries as optional dependencies), `typedpg_vscode` the editor
+extension (SQL highlighting, `.sql` files' errors), `typedpg_ts_example` the
+project the end-to-end run uses (`loaders/` in it imports a `.sql` file
+itself).
+
+`@cubos/typedpg` carries no binary: its loaders run from the cache `typedpg
+build` fills, and the CLI — a devDependency — compiles on demand. The CLI
+imports the runtime's cache and binary lookup through
+`@cubos/typedpg/internal`, which is not a public API.
 
 The npm runtime and the Rust runner must agree on what a migration is: the
 runner's whole logic — the advisory lock and its backoff, the tracking table,
@@ -74,12 +82,14 @@ Node hook on a cache `typedpg build` filled, without the binary).
 ```bash
 cargo nextest run --release -p typedpg_ts        # scanner, codegen, incremental project
 (cd typedpg_npm && npm ci && npm test)           # runtime unit tests (codecs, wasm bridge)
+(cd typedpg_npm_cli && npm ci && npm test)       # command package (after typedpg_npm builds)
 scripts/run-ts-e2e.sh                            # everything, on a PostgreSQL container
 BLESS=1 scripts/run-ts-e2e.sh                    # rewrite the errors fixtures' expected outputs
 ```
 
-After changing `typedpg_npm`, `npm install` in `typedpg_ts_example`: it
-installs the runtime as a copy (`install-links`), as from the registry.
+After changing `typedpg_npm` or `typedpg_npm_cli`, build both (`npm run
+build` in each, the runtime first) and `npm install` in `typedpg_ts_example`:
+it installs them as copies (`install-links`), as from the registry.
 
 ## Regenerating `seed.json`
 
