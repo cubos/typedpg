@@ -15,6 +15,7 @@
     "@cubos/typedpg": "file:../typedpg_npm"
   },
   "devDependencies": {
+    "@cubos/typedpg-cli": "file:../typedpg_npm_cli",
     "@types/node": "^24.0.0",
     "@types/pg": "^8.15.0",
     "esbuild": "^0.28.2",

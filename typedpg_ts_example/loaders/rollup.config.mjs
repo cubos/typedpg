@@ -1,6 +1,6 @@
 // Bundles main.ts and its .sql file with Rollup (esbuild strips the types).
 import { transform } from "esbuild";
-import typedpg from "@cubos/typedpg/rollup";
+import typedpg from "@cubos/typedpg-cli/rollup";
 
 const typescript = {
   name: "typescript",

@@ -67,7 +67,7 @@ jobs:
           FUZZ_STRICT: single
 
   typescript:
-    name: TypeScript (generator, runtime, e2e on postgres:18)
+    name: TypeScript (generator, runtime, CLI, e2e on postgres:18)
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -82,10 +82,10 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 24
-      # The runtime's unit tests, `typedpg check`, the errors fixture, tsc
-      # 7 and 5.9 over the example, then its queries, COPY, streams and
-      # migrations on a PostgreSQL container, through node-postgres and
-      # postgres.js.
+      # Builds and unit-tests the runtime and the CLI, then runs
+      # `typedpg check`, the errors fixture, tsc 7 and 5.9 over the example,
+      # then its queries, COPY, streams and migrations on a PostgreSQL
+      # container, through node-postgres and postgres.js.
       - run: scripts/run-ts-e2e.sh
 
   msrv:

@@ -3,7 +3,7 @@
 // documents of the languages it registered, and TypeScript knows a
 // project's `contentMappers` only once it opened that project. The
 // mapping itself is the project's: `contentMappers` in its tsconfig.json
-// names @cubos/typedpg, whose `typedpg serve` TypeScript runs.
+// names @cubos/typedpg-cli, whose `typedpg serve` TypeScript runs.
 
 const vscode = require("vscode");
 

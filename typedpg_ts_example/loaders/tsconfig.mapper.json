@@ -1,5 +1,5 @@
 {
   "extends": "./tsconfig.json",
   "compilerOptions": { "allowArbitraryExtensions": false },
-  "contentMappers": [{ "package": "@cubos/typedpg", "extensions": [".sql"] }]
+  "contentMappers": [{ "package": "@cubos/typedpg-cli", "extensions": [".sql"] }]
 }

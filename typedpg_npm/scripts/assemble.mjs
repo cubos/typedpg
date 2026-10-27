@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-// Assemble the npm packages for a release: `@cubos/typedpg` itself (built, with
-// an optional dependency on each platform package) and one
-// `@cubos/typedpg-cli-<target>` per binary.
+// Assemble the npm packages for a release: `@cubos/typedpg` (the runtime),
+// `@cubos/typedpg-cli` (the `typedpg` command and the bundler plugins) and
+// one `@cubos/typedpg-cli-<target>` per binary.
 //
 //   node scripts/assemble.mjs <binaries-dir> <out-dir>
 //
@@ -9,6 +9,12 @@
 // targets named as src/binary.ts's target() does: linux-x64-gnu,
 // linux-arm64-musl, darwin-arm64, win32-x64-msvc, … Each <out-dir>/<name>
 // is then ready for `npm publish`.
+//
+// The runtime carries no binary and no bin: an application installs it as a
+// production dependency. The CLI is the devDependency: the platform packages
+// become its optional dependencies, and its dependency on the runtime is the
+// exact version both are published at (its package.json names the runtime by
+// path in the repository, so the two build together).
 
 import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -20,13 +26,35 @@ if (!binaries || !out) {
   process.exit(2);
 }
 const pkgDir = dirname(dirname(fileURLToPath(import.meta.url)));
+const repo = dirname(pkgDir);
+const cliDir = join(repo, "typedpg_npm_cli");
 const main = JSON.parse(readFileSync(join(pkgDir, "package.json"), "utf8"));
-if (!existsSync(join(pkgDir, "dist", "index.js"))) {
-  console.error("assemble.mjs: build the package first (npm run build)");
+const cli = JSON.parse(readFileSync(join(cliDir, "package.json"), "utf8"));
+
+for (const [name, dir, file] of [
+  [main.name, pkgDir, "index.js"],
+  [cli.name, cliDir, "esbuild.js"],
+]) {
+  if (!existsSync(join(dir, "dist", file))) {
+    console.error(`assemble.mjs: build ${name} first (npm run build in ${dir})`);
+    process.exit(1);
+  }
+}
+if (cli.version !== main.version) {
+  console.error(`assemble.mjs: ${main.name} is ${main.version} but ${cli.name} is ${cli.version}`);
   process.exit(1);
 }
 
 rmSync(out, { recursive: true, force: true });
+
+/** Copy a package's build, README and the repository's licenses into `to`. */
+function copyInto(from, to, entries) {
+  for (const entry of entries) {
+    const src = ["LICENSE-MIT", "LICENSE-APACHE"].includes(entry) ? join(repo, entry) : join(from, entry);
+    if (existsSync(src)) cpSync(src, join(to, entry), { recursive: true, filter: (p) => !/\.test\.(js|d\.ts)$/.test(p) });
+  }
+}
+
 const optional = {};
 for (const target of readdirSync(binaries).sort()) {
   const [os, cpu, libc] = target.split("-");
@@ -52,13 +80,33 @@ for (const target of readdirSync(binaries).sort()) {
   optional[name] = main.version;
 }
 
-const dir = join(out, "typedpg");
-mkdirSync(dir, { recursive: true });
-for (const entry of ["dist", "bin", "README.md", "LICENSE-MIT", "LICENSE-APACHE"]) {
-  const from = ["LICENSE-MIT", "LICENSE-APACHE"].includes(entry) ? join(pkgDir, "..", entry) : join(pkgDir, entry);
-  if (existsSync(from)) cpSync(from, join(dir, entry), { recursive: true, filter: (p) => !/\.test\.(js|d\.ts)$/.test(p) });
+// The runtime: the query runtime, codecs, adapters, migration runner and the
+// Node and Bun loaders — no binary, and no bin.
+{
+  const dir = join(out, "typedpg");
+  mkdirSync(dir, { recursive: true });
+  copyInto(pkgDir, dir, ["dist", "README.md", "LICENSE-MIT", "LICENSE-APACHE"]);
+  const { devDependencies: _, scripts: __, ...published } = main;
+  const files = [...published.files, "LICENSE-MIT", "LICENSE-APACHE"];
+  writeFileSync(join(dir, "package.json"), JSON.stringify({ ...published, files }, null, 2) + "\n");
 }
-const { devDependencies: _, scripts: __, ...published } = main;
-const files = [...published.files, "LICENSE-MIT", "LICENSE-APACHE"];
-writeFileSync(join(dir, "package.json"), JSON.stringify({ ...published, files, optionalDependencies: optional }, null, 2) + "\n");
-console.log(`assembled ${main.name} ${main.version} with ${Object.keys(optional).join(", ") || "no binaries"} in ${out}`);
+
+// The CLI: the command, the bundler plugins, the platform packages as its
+// optional dependencies and the runtime at the version being released.
+{
+  const dir = join(out, "typedpg-cli");
+  mkdirSync(dir, { recursive: true });
+  copyInto(cliDir, dir, ["dist", "bin", "README.md", "LICENSE-MIT", "LICENSE-APACHE"]);
+  const { devDependencies: _, scripts: __, ...published } = cli;
+  const dependencies = { ...published.dependencies, [main.name]: main.version };
+  const files = [...published.files, "LICENSE-MIT", "LICENSE-APACHE"];
+  writeFileSync(
+    join(dir, "package.json"),
+    JSON.stringify({ ...published, dependencies, files, optionalDependencies: optional }, null, 2) + "\n",
+  );
+}
+
+console.log(
+  `assembled ${main.name} ${main.version} and ${cli.name} ` +
+    `with ${Object.keys(optional).join(", ") || "no binaries"} in ${out}`,
+);

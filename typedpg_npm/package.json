@@ -26,6 +26,10 @@
       "types": "./dist/bun.d.ts",
       "default": "./dist/bun.js"
     },
+    "./internal": {
+      "types": "./dist/internal.d.ts",
+      "default": "./dist/internal.js"
+    },
     "./esbuild": {
       "types": "./dist/esbuild.d.ts",
       "default": "./dist/esbuild.js"
@@ -35,8 +39,8 @@
       "default": "./dist/vite.js"
     },
     "./rollup": {
-      "types": "./dist/vite.d.ts",
-      "default": "./dist/vite.js"
+      "types": "./dist/rollup.d.ts",
+      "default": "./dist/rollup.js"
     },
     "./webpack": {
       "types": "./dist/webpack.d.ts",
@@ -44,16 +48,7 @@
     },
     "./package.json": "./package.json"
   },
-  "bin": {
-    "typedpg": "bin/typedpg.js"
-  },
-  "files": ["dist", "!dist/*.test.*", "bin"],
-  "typescript": {
-    "contentMapper": {
-      "exec": ["node", "bin/typedpg.js", "serve"],
-      "dynamicConfig": true
-    }
-  },
+  "files": ["dist", "!dist/*.test.*"],
   "sideEffects": ["./dist/register.js", "./dist/bun.js"],
   "scripts": {
     "build": "node scripts/wasm.mjs && rm -rf dist && tsc -p .",

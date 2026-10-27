@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
-# End-to-end check of typedpg for TypeScript (typedpg_ts + typedpg_npm),
+# End-to-end check of typedpg for TypeScript (typedpg_ts + the npm packages),
 # on the project in typedpg_ts_example:
 #
-#   1. the runtime builds and its unit tests pass;
+#   1. the runtime and the CLI build and their unit tests pass;
 #   2. the example's generated modules are up to date (`typedpg check`);
 #   3. the errors fixture reports exactly errors/expected.stderr;
 #   4. tsc (7 and 5.9) accepts the example: its type-level assertions, and
@@ -18,7 +18,9 @@
 #      failure);
 #   7. loaders/ runs on it through the Node hook (the cache cold, so the
 #      hook runs `typedpg build`, then warm, without the binary), esbuild and
-#      Rollup bundles, and Bun's plugin when `bun` is installed.
+#      Rollup bundles, and Bun's plugin when `bun` is installed — and, with
+#      no binary installed at all (a production image's node_modules), from
+#      a warm cache and, cold, with the error saying how to fill it.
 #
 # Usage: scripts/run-ts-e2e.sh            (BLESS=1 rewrites the expected outputs)
 
@@ -30,9 +32,13 @@ PG_IMAGE="${PG_IMAGE:-postgres:18}"
 CONTAINER_NAME="typedpg-ts-e2e-$$"
 
 LOADERS_CACHE="$(mktemp -d)"
+PROD=""      # a project with the runtime only, as a production image has
+PROD_CACHE=""
 cleanup() {
     docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
     rm -rf "$LOADERS_CACHE"
+    if [[ -n "$PROD" ]]; then rm -rf "$PROD"; fi
+    if [[ -n "$PROD_CACHE" ]]; then rm -rf "$PROD_CACHE"; fi
 }
 trap cleanup EXIT INT TERM
 
@@ -41,8 +47,12 @@ TYPEDPG="$ROOT/target/release/typedpg"
 
 echo "ts-e2e: runtime"
 (cd "$ROOT/typedpg_npm" && npm ci --silent && npm test --silent)
-# The example installs the runtime as a copy (`install-links`), as from the
-# registry: refresh it.
+# The CLI's plugins import the runtime's internal export: build the runtime
+# (above) first.
+echo "ts-e2e: cli"
+(cd "$ROOT/typedpg_npm_cli" && npm ci --silent && npm test --silent)
+# The example installs both as copies (`install-links`), as from the
+# registry: refresh them.
 (cd "$EXAMPLE" && npm ci --silent)
 
 echo "ts-e2e: typedpg check"
@@ -134,3 +144,48 @@ if command -v bun >/dev/null; then
 else
     echo "ts-e2e: bun is not installed, its plugin is not run"
 fi
+
+# A production image has @cubos/typedpg only: the CLI — and so the binary —
+# is a devDependency. With the cache warm (the runs above filled it; the
+# project copies the same config, migrations and files, so the same keys),
+# the Node hook and Bun must run without looking for a binary.
+echo "ts-e2e: loaders with no binary (production install)"
+PROD="$(mktemp -d)"
+PROD_CACHE="$(mktemp -d)"
+mkdir -p "$PROD/node_modules/@cubos" "$PROD/project"
+for entry in "$EXAMPLE"/node_modules/*; do
+    [[ "$(basename "$entry")" == "@cubos" ]] && continue
+    ln -s "$entry" "$PROD/node_modules/$(basename "$entry")"
+done
+ln -s "$EXAMPLE/node_modules/@cubos/typedpg" "$PROD/node_modules/@cubos/typedpg"
+cp -r "$LOADERS/src" "$PROD/project/src"
+cp "$LOADERS/typedpg.config.json" "$PROD/project/"
+cp -r "$EXAMPLE/src" "$PROD/src"
+cp -r "$EXAMPLE/migrations" "$PROD/migrations"
+
+run_prod() {
+    local what=$1 cache=$2
+    shift 2
+    local actual
+    actual=$(cd "$PROD/project" && DATABASE_URL="postgres://postgres:postgres@127.0.0.1:$PG_PORT/typedpg_loaders" \
+        TYPEDPG_CACHE_DIR="$cache" TYPEDPG_BINARY= "$@")
+    if [[ "$actual" != "$expected" ]]; then
+        echo "ts-e2e: $what printed $actual" >&2
+        exit 1
+    fi
+}
+run_prod "the Node hook, production install" "$LOADERS_CACHE" node --import @cubos/typedpg/register src/main.ts
+if command -v bun >/dev/null; then
+    run_prod "Bun, production install" "$LOADERS_CACHE" bun --preload @cubos/typedpg/bun src/main.ts
+fi
+
+# Cold, with no binary: the error names the file and the cache, and says to
+# run `typedpg build` (from @cubos/typedpg-cli) or install the CLI.
+cold=$(cd "$PROD/project" && DATABASE_URL="postgres://postgres:postgres@127.0.0.1:$PG_PORT/typedpg_loaders" \
+    TYPEDPG_CACHE_DIR="$PROD_CACHE" TYPEDPG_BINARY= node --import @cubos/typedpg/register src/main.ts 2>&1 || true)
+for text in "src/users.sql has no entry in the typedpg cache" "$PROD_CACHE" "@cubos/typedpg-cli"; do
+    if [[ "$cold" != *"$text"* ]]; then
+        echo "ts-e2e: a cold cache with no binary did not say \"$text\": $cold" >&2
+        exit 1
+    fi
+done

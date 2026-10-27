@@ -5,3 +5,4 @@ target/
 /typedpg_compile_fail/fixture/Cargo.lock
 node_modules/
 /typedpg_npm/dist/
+/typedpg_npm_cli/dist/

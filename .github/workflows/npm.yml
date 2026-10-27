@@ -1,7 +1,8 @@
 name: npm
 
 # Builds the `typedpg` binary for each platform and assembles the npm
-# packages: `@cubos/typedpg` (the runtime, with an optional dependency on each
+# packages: `@cubos/typedpg` (the runtime, no binary), `@cubos/typedpg-cli`
+# (the command and bundler plugins, with an optional dependency on each
 # platform's binary) and `@cubos/typedpg-cli-<target>`. The release tag
 # (`v0.5.0`, the version of the crates and of the packages) stages them for
 # publishing (`npm stage publish`): each goes live once a maintainer approves
@@ -30,14 +31,19 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       # The loaders' cache key holds the version twice — the binary's (the
-      # crates') and the package's — so the two must agree, and the tag
-      # must be theirs.
+      # crates') and the runtime package's — so the two must agree, and the
+      # tag must be theirs. The CLI is released in lockstep with the runtime.
       - shell: bash
         run: |
           npm=$(node -p 'require("./typedpg_npm/package.json").version')
+          cli=$(node -p 'require("./typedpg_npm_cli/package.json").version')
           cargo=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
           if [[ "$npm" != "$cargo" ]]; then
             echo "::error::typedpg_npm/package.json is $npm but Cargo.toml is $cargo"
+            exit 1
+          fi
+          if [[ "$cli" != "$npm" ]]; then
+            echo "::error::typedpg_npm_cli/package.json is $cli but typedpg_npm/package.json is $npm"
             exit 1
           fi
           if [[ "$GITHUB_REF" == refs/tags/* && "$GITHUB_REF" != "refs/tags/v$npm" ]]; then
@@ -117,11 +123,22 @@ jobs:
         run: |
           npm ci
           npm test
-          node scripts/assemble.mjs ../bins ../npm-dist
+      # The CLI's plugins import the runtime's internal export: build the
+      # runtime (above) before it.
+      - working-directory: typedpg_npm_cli
+        run: |
+          npm ci
+          npm test
+      - working-directory: typedpg_npm
+        run: node scripts/assemble.mjs ../bins ../npm-dist
       # Staged publishing needs npm 11.15 (Node 24 may bundle an older one).
       - run: npm install --global npm@^11.15.0 && npm --version
-      # The platform packages first: `@cubos/typedpg` depends on them (and
-      # are worth approving first, for the same reason).
+      # The platform packages first: the CLI depends on them (and are worth
+      # approving first, for the same reason), then the runtime, then the CLI,
+      # which depends on it. `npm stage publish` only stages a package that
+      # already exists on the registry: `@cubos/typedpg-cli` is a new name in
+      # 0.6.0, so publish a placeholder by hand once before that release
+      # (`0.0.0-stage` works; only the first release of a name needs it).
       - shell: bash
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -133,3 +150,4 @@ jobs:
           fi
           for dir in npm-dist/cli-*; do (cd "$dir" && $publish); done
           (cd npm-dist/typedpg && $publish)
+          (cd npm-dist/typedpg-cli && $publish)

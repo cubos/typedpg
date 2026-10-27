@@ -25,13 +25,32 @@ parameter of type '"typedpg: column \"nmae\" does not exist"'.
 ## Install
 
 ```sh
-npm install @cubos/typedpg
-npm install pg            # or: npm install postgres
+npm install @cubos/typedpg                  # the runtime
+npm install pg                              # or: npm install postgres
+npm install --save-dev @cubos/typedpg-cli   # the `typedpg` command and the bundler plugins
 ```
 
-The `typedpg` command is a native binary, installed for your platform as an
-optional dependency (`@cubos/typedpg-cli-linux-x64-gnu`, `-darwin-arm64`, …).
-Node.js 22.12 or later.
+`@cubos/typedpg` is the runtime your application deploys: the query runtime,
+codecs, adapters and the migration runner. It holds no native binary. The
+`typedpg` command and the bundler plugins live in `@cubos/typedpg-cli`, which
+you install as a devDependency. The command is a native binary, installed for
+your platform as an optional dependency of the CLI
+(`@cubos/typedpg-cli-linux-x64-gnu`, `-darwin-arm64`, …), so `npm install
+--prod` never downloads it. Node.js 22.12 or later.
+
+## Upgrading to 0.6.0
+
+The `typedpg` command and the bundler plugins moved out of `@cubos/typedpg`
+into `@cubos/typedpg-cli`:
+
+- add it as a devDependency: `npm install --save-dev @cubos/typedpg-cli`;
+- import the bundler plugins from `@cubos/typedpg-cli/esbuild`, `/vite`,
+  `/rollup` or `/webpack` — the old `@cubos/typedpg/<plugin>` subpaths still
+  resolve, but throw an error saying where they moved;
+- `npx typedpg` comes from `@cubos/typedpg-cli`;
+- a production install of `@cubos/typedpg` no longer carries the binary: run
+  `typedpg build` when building the image (see
+  [Importing .sql files](#importing-sql-files)).
 
 ## Configure
 
@@ -66,6 +85,9 @@ npx typedpg gen --watch    # and keep them up to date
 npx typedpg check          # in CI: fail if a module is stale or a query has an error
 npx typedpg build          # compile the .sql files into the loaders' cache
 ```
+
+`typedpg` is `@cubos/typedpg-cli`'s binary; `npx` finds it in your
+devDependencies.
 
 `gen` prints each error at its place in your sources, the line and column of
 the offending token inside the SQL:
@@ -206,26 +228,32 @@ and a loader or bundler plugin gives its module:
 |---|---|
 | Node.js 22.15+ | `node --import @cubos/typedpg/register app.ts` |
 | Bun | `bun --preload @cubos/typedpg/bun app.ts` (or `preload` in `bunfig.toml`); `Bun.build({ plugins: [typedpg] })` with `import typedpg from "@cubos/typedpg/bun"` |
-| esbuild | `plugins: [typedpg()]`, `import typedpg from "@cubos/typedpg/esbuild"` |
-| Vite, vitest, Rollup, Rolldown | `plugins: [typedpg()]`, `import typedpg from "@cubos/typedpg/vite"` (or `/rollup`) |
-| webpack, rspack | `{ test: /\.sql$/, loader: "@cubos/typedpg/webpack", type: "javascript/esm" }` |
+| esbuild | `plugins: [typedpg()]`, `import typedpg from "@cubos/typedpg-cli/esbuild"` |
+| Vite, vitest, Rollup, Rolldown | `plugins: [typedpg()]`, `import typedpg from "@cubos/typedpg-cli/vite"` (or `/rollup`) |
+| webpack, rspack | `{ test: /\.sql$/, loader: "@cubos/typedpg-cli/webpack", type: "javascript/esm" }` |
 
-None of them analyzes a query: they read the module from a cache,
+The runtime ships the Node and Bun loaders, which run in production; the
+bundler plugins are in `@cubos/typedpg-cli`, a devDependency. None of them
+analyzes a query: they read the module from a cache,
 `node_modules/.cache/typedpg` (`TYPEDPG_CACHE_DIR` to move it), keyed by the
 typedpg version, the config, the migrations and the file. A file with no
-entry runs `typedpg build` once, which compiles every file missing one. Run
-`typedpg build` when building an image: the cache is then complete, and the
-image needs neither the binary nor the analysis at startup.
+entry runs `typedpg build` once — when the CLI is installed, as it is in
+development — which compiles every file missing one. Run `typedpg build`
+when building an image: the cache is then complete, and the image needs
+neither the binary nor the analysis at startup. A production install has no
+binary, so a cache miss there is an error that says which file and cache
+directory, and to run `typedpg build` where the project is built.
 
 ### The content mapper (TypeScript 7.1)
 
-TypeScript 7.1 reads a `.sql` file's types from typedpg itself, with no
-file written (`emit: "none"`):
+TypeScript 7.1 reads a `.sql` file's types from `@cubos/typedpg-cli` — the
+`typedpg serve` command TypeScript runs — with no file written (`emit:
+"none"`), so the CLI must be a devDependency:
 
 ```json
 {
   "compilerOptions": { … },
-  "contentMappers": [{ "package": "@cubos/typedpg", "extensions": [".sql"] }]
+  "contentMappers": [{ "package": "@cubos/typedpg-cli", "extensions": [".sql"] }]
 }
 ```
 

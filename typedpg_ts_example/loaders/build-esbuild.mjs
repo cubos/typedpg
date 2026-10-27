@@ -1,6 +1,6 @@
 // Bundles main.ts and its .sql file with esbuild.
 import { build } from "esbuild";
-import typedpg from "@cubos/typedpg/esbuild";
+import typedpg from "@cubos/typedpg-cli/esbuild";
 
 await build({
   entryPoints: ["src/main.ts"],
