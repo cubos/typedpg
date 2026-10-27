@@ -1,10 +1,11 @@
 use tokio_postgres::Client;
 
 use super::MigrationsConfig;
-use super::normalize::{HASH_VERSION, hash};
 use super::source::MigrationSource;
 use super::source::has_no_transaction_marker;
-use super::split::split_statements;
+use typedpg_core::migrations::{
+    HASH_VERSION, drift_message, hash, locate_position, split_statements,
+};
 
 /// An applied migration's stored drift hash, as `run` reads it: no
 /// `sql_source` download, only the hash and the algorithm that made it.
@@ -61,30 +62,6 @@ fn format_pg_error(e: &tokio_postgres::Error, sql: &str, base: usize) -> String 
     } else {
         e.to_string()
     }
-}
-
-/// PG's error position `position` — a 1-based character index into
-/// `sql[base..]`, the text that was sent — as psql shows it: `LINE n:` and
-/// the line, then a caret under the column. `n` counts lines of the whole
-/// `sql`.
-fn locate_position(sql: &str, base: usize, position: u32) -> String {
-    let sent = sql.get(base..).unwrap_or_default();
-    let chars = usize::try_from(position).unwrap_or(0).saturating_sub(1);
-    let at = base
-        + sent
-            .char_indices()
-            .nth(chars)
-            .map_or(sent.len(), |(i, _)| i);
-    let line_start = sql[..at].rfind('\n').map_or(0, |i| i + 1);
-    let line_end = sql[at..].find('\n').map_or(sql.len(), |i| at + i);
-    let line_no = sql[..at].matches('\n').count() + 1;
-    let column = sql[line_start..at].chars().count();
-    let prefix = format!("LINE {line_no}: ");
-    format!(
-        "\n{prefix}{}\n{}^",
-        &sql[line_start..line_end],
-        " ".repeat(prefix.len() + column)
-    )
 }
 
 /// Status of a single migration, indicating whether it has been applied.
@@ -329,42 +306,6 @@ async fn stored_sql_source(
         )
         .await?;
     Ok(row.and_then(|row| row.get(0)))
-}
-
-/// The drift message: the migration's name, a unified diff of what was
-/// applied against the file (when its text is stored), and how to make an
-/// intentional edit stop being drift. The error also says how to downgrade
-/// drift to a warning.
-fn drift_message(
-    name: &str,
-    stored_sql: Option<&str>,
-    file_sql: &str,
-    fail_on_drift: bool,
-) -> String {
-    let mut message = format!("migration '{name}' has been modified since it was applied:");
-    if let Some(stored_sql) = stored_sql {
-        let file_name = format!("{name}.sql");
-        let diff = similar::TextDiff::from_lines(stored_sql, file_sql)
-            .unified_diff()
-            .context_radius(3)
-            .header("applied", &file_name)
-            .to_string();
-        message.push('\n');
-        message.push_str(diff.trim_end());
-    }
-    message.push_str(&format!(
-        "\nIf the change is intentional (it does not need to run again), record the file as \
-         applied with `typedpg migrate accept {name}`; otherwise restore the file and add a new \
-         migration."
-    ));
-    if fail_on_drift {
-        message.push_str(
-            "\nSet fail_on_drift = false ([package.metadata.typedpg.migrations] in Cargo.toml) \
-             or \"failOnDrift\": false (\"migrations\" in typedpg.config.json) to downgrade this \
-             to a warning.",
-        );
-    }
-    message
 }
 
 /// Returns the status of all known migrations (applied and pending).
@@ -857,31 +798,4 @@ async fn get_applied(
     }
 
     Ok(map)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::locate_position;
-
-    #[test]
-    fn positions_are_lines_and_columns_of_the_migration() {
-        let sql = "CREATE TABLE a (id int);\nCREATE TABL b (id int);\n";
-        // The whole migration sent: PG's position 33 is `TABL` on line 2.
-        assert_eq!(
-            locate_position(sql, 0, 33),
-            "\nLINE 2: CREATE TABL b (id int);\n               ^"
-        );
-        // One statement sent (non-transactional run): the position is
-        // relative to it, the line still the file's.
-        let second = sql.find("CREATE TABL b").unwrap();
-        assert_eq!(
-            locate_position(sql, second, 8),
-            "\nLINE 2: CREATE TABL b (id int);\n               ^"
-        );
-        // PG counts characters, not bytes.
-        assert_eq!(
-            locate_position("SELECT 'é' x y", 0, 14),
-            "\nLINE 1: SELECT 'é' x y\n                     ^"
-        );
-    }
 }

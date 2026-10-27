@@ -2,20 +2,23 @@
 //!
 //! Drift must notice a change to a migration's statements, and nothing
 //! else: comments, whitespace and the case of unquoted words do not count.
-//! The scan follows psql's lexer, as `split.rs` does, for the constructs
-//! where those characters are content — strings, quoted identifiers and
-//! dollar-quoted bodies — which are copied verbatim.
+//! The scan follows psql's lexer, as [`super::split`] does, for the
+//! constructs where those characters are content — strings, quoted
+//! identifiers and dollar-quoted bodies — which are copied verbatim.
+//!
+//! Shared with `typedpg_wasm`, which the npm runtime calls: a database
+//! looks drifted to one runner exactly when it does to the other.
 
-use super::source::has_no_transaction_marker;
 use super::split::{is_ident_cont, is_ident_start, skip_block_comment, skip_quoted};
+use crate::migration_marker::has_no_transaction_marker;
 
 /// Which normalization the stored hashes use. A row's `hash_version` names
 /// the algorithm that computed its `hash`; `run` re-hashes rows of another
 /// version from their `sql_source`.
-pub(crate) const HASH_VERSION: i32 = 1;
+pub const HASH_VERSION: i32 = 1;
 
 /// The MD5 hex digest of [`normalize`]'s UTF-8 bytes.
-pub(crate) fn hash(sql: &str) -> String {
+pub fn hash(sql: &str) -> String {
     format!("{:x}", md5::compute(normalize(sql).as_bytes()))
 }
 
@@ -50,7 +53,7 @@ pub(crate) fn hash(sql: &str) -> String {
 ///
 /// The `-- no-transaction` marker decides how the migration runs, so it is
 /// part of the normalized text (the comment scan drops it otherwise).
-pub(crate) fn normalize(sql: &str) -> String {
+pub fn normalize(sql: &str) -> String {
     let bytes = sql.as_bytes();
     let mut out = String::with_capacity(sql.len());
     let mut last: Option<Class> = None;
@@ -232,9 +235,9 @@ mod tests {
         why: String,
     }
 
-    /// The cases are shared with the TypeScript runtime's own test: the two
-    /// runners must agree on what drift is, or one database would look
-    /// drifted to one CLI and not the other.
+    /// The cases are shared with the TypeScript runtime's own test (now run
+    /// through `typedpg_wasm`): the two runners must agree on what drift is,
+    /// or one database would look drifted to one CLI and not the other.
     #[test]
     fn normalization_cases_are_the_shared_ones() {
         let json = include_str!("../../tests/fixtures/normalize.json");

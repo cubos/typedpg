@@ -13,10 +13,13 @@
 //! `BEGIN ATOMIC … END` body of a `CREATE [OR REPLACE] FUNCTION|PROCEDURE`,
 //! which psql tracks with the same `BEGIN`/`CASE`/`END` depth heuristic used
 //! here.
+//!
+//! Shared with `typedpg_wasm`, which the npm runtime calls: both runners
+//! send the same statements, in the same order.
 
 /// The statements of `sql`, each with its terminating `;` (the last one may
 /// have none). Pieces holding only whitespace and comments are dropped.
-pub(crate) fn split_statements(sql: &str) -> Vec<&str> {
+pub fn split_statements(sql: &str) -> Vec<&str> {
     let bytes = sql.as_bytes();
     let mut out = Vec::new();
     let mut start = 0;

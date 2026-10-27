@@ -8,15 +8,36 @@
 // is off or the file starts with `-- no-transaction`, where its statements
 // run one at a time) and records it with its text and normalized hash. A
 // changed statement later is drift; comments, whitespace and unquoted case
-// are not (see `normalize.ts`).
+// are not (see `core.ts`, the Rust helper compiled to wasm).
+//
+// The I/O stays here, on the caller's driver: the pure helpers both runners
+// share (splitting, normalization, names, order, messages) come from
+// `typedpg_core` through `typedpg_wasm`.
 
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 
 import { type Driver, type Executor, driverFor, unsupported } from "./adapters.js";
-import { HASH_VERSION, hasNoTransactionMarker, hash, unifiedDiff } from "./normalize.js";
+import {
+  compareMigrationNames,
+  driftMessage,
+  hash,
+  hashVersion,
+  hasNoTransactionMarker,
+  locatePosition,
+  parseMigrationName,
+  splitStatements,
+  stripBom,
+  validateTableName,
+} from "./core.js";
 
-export { hasNoTransactionMarker } from "./normalize.js";
+export {
+  compareVersions,
+  hasNoTransactionMarker,
+  locatePosition,
+  splitStatements,
+  stripBom,
+} from "./core.js";
 
 export interface Migration {
   /** The file stem: `0001_create_users`. */
@@ -84,14 +105,6 @@ export function embedMigrations(
 }
 
 /**
- * The SQL without the byte-order mark a file edited on Windows starts
- * with: PostgreSQL rejects it as a syntax error.
- */
-export function stripBom(sql: string): string {
-  return sql.startsWith("\uFEFF") ? sql.slice(1) : sql;
-}
-
-/**
  * The migrations in `dir` (none when it doesn't exist), as the Rust
  * runner's `MigrationSource::from_dir` reads them.
  */
@@ -127,83 +140,21 @@ export function loadMigrations(dir: string, config: Partial<MigrationsConfig> = 
 
 function settings(config: Partial<MigrationsConfig>): MigrationsConfig {
   const s = { ...DEFAULTS, ...config };
-  // Interpolated into every statement: only a plain qualified identifier.
-  if (!isQualifiedIdentifier(s.table)) {
-    throw new MigrationError(
-      `invalid migrations table "${s.table}": expected \`name\` or \`schema.name\`, each part ` +
-        `unquoted or double-quoted`,
-    );
-  }
+  // Interpolated into every statement: the Rust runner's validation, so
+  // both runners accept exactly the same names.
+  const invalid = validateTableName(s.table);
+  if (invalid !== null) throw new MigrationError(invalid);
   return s;
 }
 
-/**
- * Whether the name is a qualified identifier the Rust runner accepts
- * (`MigrationsConfig::validate`): a `name` or a `schema.name`, each part
- * either unquoted (`[A-Za-z_][A-Za-z0-9_]*`) or double-quoted, with `""`
- * for an escaped quote.
- */
-function isQualifiedIdentifier(name: string): boolean {
-  const parts = splitQualifiedName(name);
-  if (parts === null || parts.length === 0 || parts.length > 2) return false;
-  return parts.every(isIdentifier);
-}
-
-/** The name's parts, split on the `.` that are not inside a quoted part. */
-function splitQualifiedName(name: string): string[] | null {
-  const parts: string[] = [];
-  let start = 0;
-  let inQuote = false;
-  for (let i = 0; i < name.length; i++) {
-    const c = name[i]!;
-    if (c === '"') {
-      if (inQuote && name[i + 1] === '"') {
-        // An escaped quote.
-        i++;
-        continue;
-      }
-      inQuote = !inQuote;
-    } else if (c === "." && !inQuote) {
-      parts.push(name.slice(start, i));
-      start = i + 1;
-    }
-  }
-  if (inQuote) return null;
-  parts.push(name.slice(start));
-  return parts;
-}
-
-/** Whether the part is an unquoted or a double-quoted PostgreSQL identifier. */
-function isIdentifier(part: string): boolean {
-  if (part.length >= 2 && part.startsWith('"') && part.endsWith('"')) {
-    const inner = part.slice(1, -1);
-    if (inner.length === 0 || inner.includes("\0")) return false;
-    // `""` is an escaped quote; a lone `"` is not.
-    for (let i = 0; i < inner.length; i++) {
-      if (inner[i] !== '"') continue;
-      if (inner[i + 1] !== '"') return false;
-      i++;
-    }
-    return true;
-  }
-  return /^[A-Za-z_][A-Za-z0-9_]*$/.test(part);
-}
-
 function migration(name: string, path: string, sql: string, downSql: string | null): Migration {
-  const underscore = name.indexOf("_");
-  if (underscore === -1) {
-    throw new MigrationError(`migration file does not follow NNNN_description.sql format: ${path}`);
-  }
-  const version = name.slice(0, underscore);
-  if (!/^\d+$/.test(version)) {
-    throw new MigrationError(`migration file does not have a numeric prefix (NNNN_...): ${path}`);
-  }
-  if (underscore === name.length - 1) {
-    throw new MigrationError(`migration file has no description after prefix: ${path}`);
-  }
+  // The Rust runner's parser, message included: the two runners must accept
+  // and reject the same file names.
+  const parsed = parseMigrationName(name, path);
+  if ("error" in parsed) throw new MigrationError(parsed.error);
   return {
     name,
-    version,
+    version: parsed.version,
     sql,
     downSql,
     noTransaction: hasNoTransactionMarker(sql),
@@ -211,29 +162,11 @@ function migration(name: string, path: string, sql: string, downSql: string | nu
   };
 }
 
-/**
- * Compare two migration versions — the numeric prefix of their names — as
- * numbers: `2` before `10`.
- *
- * The prefixes are decimal strings, compared by their value whatever their
- * length: a forty-digit prefix is still a number. The mirror of
- * `typedpg_core::migrations::compare_versions`.
- */
-export function compareVersions(a: string, b: string): number {
-  const norm = (s: string) => s.replace(/^0+/, "") || "0";
-  const x = norm(a);
-  const y = norm(b);
-  if (x.length !== y.length) return x.length - y.length;
-  return x < y ? -1 : x > y ? 1 : 0;
-}
-
 function sortByVersion(migrations: Migration[]): Migration[] {
   // By the prefix as a number, not as text: `10_x` is a later migration
   // than `2_x`, and the name settles the order of two with the same
-  // prefix. The Rust runner's order.
-  return migrations.sort(
-    (a, b) => compareVersions(a.version, b.version) || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0),
-  );
+  // prefix. The Rust runner's order, from the shared helper.
+  return migrations.sort((a, b) => compareMigrationNames(a.name, b.name));
 }
 
 /** Run `f` on one connection of `executor`. */
@@ -312,14 +245,14 @@ async function backfillHashes(d: Driver, config: MigrationsConfig): Promise<void
   const { rows } = await d.typedpgQuery(
     `SELECT name, sql_source FROM ${config.table}
      WHERE hash_version IS DISTINCT FROM ($1::pg_catalog.int4) AND sql_source IS NOT NULL`,
-    [String(HASH_VERSION)],
+    [String(hashVersion())],
   );
   for (const [name, sql] of rows) {
     if (sql === null || sql === undefined) continue;
     await d.typedpgQuery(
       `UPDATE ${config.table} SET hash = ($1::pg_catalog.text), hash_version = ($2::pg_catalog.int4)
        WHERE name = ($3::pg_catalog.text)`,
-      [hash(sql), String(HASH_VERSION), name!],
+      [hash(sql), String(hashVersion()), name!],
     );
   }
 }
@@ -331,22 +264,6 @@ async function storedSqlSource(d: Driver, config: MigrationsConfig, name: string
     [name],
   );
   return rows[0]?.[0] ?? null;
-}
-
-/**
- * The drift message: the migration's name, a unified diff of what was
- * applied against the file (when its text is stored), and how to make an
- * intentional edit stop being drift. The error also says how to downgrade
- * drift to a warning.
- */
-function driftMessage(name: string, storedSql: string | null, fileSql: string, failOnDrift: boolean): string {
-  let message = `migration '${name}' has been modified since it was applied:`;
-  if (storedSql !== null) message += `\n${unifiedDiff(storedSql, fileSql, `${name}.sql`)}`;
-  message +=
-    `\nIf the change is intentional (it does not need to run again), record the file as applied ` +
-    `with \`typedpg migrate accept ${name}\`; otherwise restore the file and add a new migration.`;
-  if (failOnDrift) message += `\nSet migrations.failOnDrift = false to downgrade this to a warning.`;
-  return message;
 }
 
 function warn(config: MigrationsConfig, message: string) {
@@ -369,7 +286,7 @@ export async function migrate(executor: Executor, set: MigrationSet): Promise<st
         const stored = applied.get(m.name);
         if (
           !stored ||
-          stored.hashVersion !== HASH_VERSION ||
+          stored.hashVersion !== hashVersion() ||
           stored.hash === null ||
           stored.hash === hash(m.sql)
         ) {
@@ -388,7 +305,7 @@ export async function migrate(executor: Executor, set: MigrationSet): Promise<st
           d.typedpgQuery(
             `INSERT INTO ${config.table} (name, sql_source, hash, hash_version)
              VALUES (($1::pg_catalog.text), ($2::pg_catalog.text), ($3::pg_catalog.text), ($4::pg_catalog.int4))`,
-            [m.name, m.sql, mHash, String(HASH_VERSION)],
+            [m.name, m.sql, mHash, String(hashVersion())],
           ),
         );
         done.push(m.name);
@@ -470,7 +387,7 @@ export async function migrationStatus(executor: Executor, set: MigrationSet): Pr
     for (const [name, at, h, v] of rows) {
       // Only a current-algorithm hash is read; an older row's text is
       // hashed in memory below.
-      const current = v !== null && v !== undefined && Number(v) === HASH_VERSION;
+      const current = v !== null && v !== undefined && Number(v) === hashVersion();
       applied.set(name!, [new Date(Number(at) * 1000), current ? (h ?? null) : null]);
     }
     // The stale rows' text is fetched (and hashed) here, never written
@@ -480,7 +397,7 @@ export async function migrationStatus(executor: Executor, set: MigrationSet): Pr
         hasHashVersion === "t" ? " AND hash_version IS DISTINCT FROM ($1::pg_catalog.int4)" : "";
       const { rows } = await d.typedpgQuery(
         `SELECT name, sql_source FROM ${config.table} WHERE sql_source IS NOT NULL${staleFilter}`,
-        hasHashVersion === "t" ? [String(HASH_VERSION)] : [],
+        hasHashVersion === "t" ? [String(hashVersion())] : [],
       );
       for (const [name, sql] of rows) {
         const info = applied.get(name!);
@@ -515,7 +432,7 @@ export async function acceptMigration(executor: Executor, set: MigrationSet, nam
       await d.typedpgQuery(
         `UPDATE ${config.table} SET sql_source = ($1::pg_catalog.text), hash = ($2::pg_catalog.text),
          hash_version = ($3::pg_catalog.int4) WHERE name = ($4::pg_catalog.text)`,
-        [m.sql, hash(m.sql), String(HASH_VERSION), name],
+        [m.sql, hash(m.sql), String(hashVersion()), name],
       );
     }),
   );
@@ -583,154 +500,4 @@ function formatPgError(e: unknown, sql: string, base: number): string {
     out += `\nINTERNAL POSITION: ${err.internalPosition}\nQUERY: ${err.internalQuery}`;
   }
   return out;
-}
-
-/** PG's 1-based character `position` in `sql.slice(base)` as `LINE n:` and a caret. */
-export function locatePosition(sql: string, base: number, position: number): string {
-  const sent = [...sql.slice(base)];
-  const at = base + sent.slice(0, Math.max(position - 1, 0)).join("").length;
-  const lineStart = sql.lastIndexOf("\n", at - 1) + 1;
-  const lineEnd = sql.indexOf("\n", at) === -1 ? sql.length : sql.indexOf("\n", at);
-  const lineNo = sql.slice(0, at).split("\n").length;
-  const column = [...sql.slice(lineStart, at)].length;
-  const prefix = `LINE ${lineNo}: `;
-  return `\n${prefix}${sql.slice(lineStart, lineEnd)}\n${" ".repeat(prefix.length + column)}^`;
-}
-
-/**
- * The statements of `sql`, with their offsets, for a migration outside a
- * transaction: PostgreSQL runs a multi-statement simple query in one
- * implicit transaction block, where `CREATE INDEX CONCURRENTLY` fails. A
- * port of the Rust runner's splitter, which follows psql's lexer: a `;`
- * ends a statement unless it is in a string, quoted identifier,
- * dollar-quoted body, comment, parentheses, or a `BEGIN ATOMIC … END`
- * routine body. Pieces with only whitespace and comments are dropped.
- */
-export function splitStatements(sql: string): [number, string][] {
-  const out: [number, string][] = [];
-  let start = 0;
-  let i = 0;
-  let state = new StatementState();
-  const n = sql.length;
-  while (i < n) {
-    const c = sql[i]!;
-    if (c === "-" && sql[i + 1] === "-") {
-      while (i < n && sql[i] !== "\n") i++;
-      continue;
-    }
-    if (c === "/" && sql[i + 1] === "*") {
-      i = skipBlockComment(sql, i);
-      continue;
-    }
-    if (c === "'" || c === '"') {
-      state.hasToken = true;
-      i = skipQuoted(sql, i, c, false);
-      continue;
-    }
-    if (c === "$") {
-      state.hasToken = true;
-      i = dollarQuoteEnd(sql, i) ?? i + 1;
-      continue;
-    }
-    if (c === "(") state.parenDepth++;
-    else if (c === ")") state.parenDepth = Math.max(state.parenDepth - 1, 0);
-    else if (c === ";" && state.parenDepth === 0 && state.beginDepth === 0) {
-      if (state.hasToken) out.push([start, sql.slice(start, i + 1)]);
-      start = i + 1;
-      state = new StatementState();
-      i++;
-      continue;
-    } else if (isIdentStart(c)) {
-      const begin = i;
-      while (i < n && isIdentCont(sql[i]!)) i++;
-      const word = sql.slice(begin, i);
-      // `E'…'`: a string where backslash escapes.
-      if (word.toLowerCase() === "e" && sql[i] === "'") i = skipQuoted(sql, i, "'", true);
-      state.identifier(word);
-      continue;
-    }
-    if (!/\s/.test(c)) state.hasToken = true;
-    i++;
-  }
-  if (state.hasToken) out.push([start, sql.slice(start)]);
-  return out;
-}
-
-class StatementState {
-  hasToken = false;
-  parenDepth = 0;
-  beginDepth = 0;
-  identifierCount = 0;
-  /** psql's `identifiers[4]`: the first letter of each of the first four identifiers among its keywords. */
-  identifiers = ["", "", "", ""];
-
-  identifier(word: string) {
-    this.hasToken = true;
-    const w = word.toLowerCase();
-    if (["create", "function", "procedure", "or", "replace"].includes(w) && this.identifierCount < 4) {
-      this.identifiers[this.identifierCount] = w[0]!;
-    }
-    this.identifierCount++;
-    const ids = this.identifiers;
-    const createsRoutine =
-      ids[0] === "c" &&
-      (ids[1] === "f" || ids[1] === "p" || (ids[1] === "o" && ids[2] === "r" && (ids[3] === "f" || ids[3] === "p")));
-    if (createsRoutine && this.parenDepth === 0) {
-      if (w === "begin") this.beginDepth++;
-      // CASE ends with END too; it only matters inside a BEGIN.
-      else if (w === "case") {
-        if (this.beginDepth >= 1) this.beginDepth++;
-      } else if (w === "end") this.beginDepth = Math.max(this.beginDepth - 1, 0);
-    }
-  }
-}
-
-function isIdentStart(c: string): boolean {
-  return /[A-Za-z_]/.test(c) || c.charCodeAt(0) >= 0x80;
-}
-
-function isIdentCont(c: string): boolean {
-  return isIdentStart(c) || /[0-9$]/.test(c);
-}
-
-/** The index past a quoted run opened at `open` (doubled quote; with `backslash`, `\` escapes too). */
-function skipQuoted(sql: string, open: number, quote: string, backslash: boolean): number {
-  let i = open + 1;
-  while (i < sql.length) {
-    if (backslash && sql[i] === "\\") i += 2;
-    else if (sql[i] === quote) {
-      if (sql[i + 1] === quote) i += 2;
-      else return i + 1;
-    } else i++;
-  }
-  return sql.length;
-}
-
-/** The index past a `/* … *\/` comment opened at `open`; they nest. */
-function skipBlockComment(sql: string, open: number): number {
-  let depth = 0;
-  let i = open;
-  while (i < sql.length) {
-    if (sql[i] === "/" && sql[i + 1] === "*") {
-      depth++;
-      i += 2;
-    } else if (sql[i] === "*" && sql[i + 1] === "/") {
-      depth--;
-      i += 2;
-      if (depth === 0) return i;
-    } else i++;
-  }
-  return sql.length;
-}
-
-/** Past the closing delimiter of a dollar quote opened at `open`; `undefined` for any other `$`. */
-function dollarQuoteEnd(sql: string, open: number): number | undefined {
-  let i = open + 1;
-  if (i < sql.length && isIdentStart(sql[i]!)) {
-    while (i < sql.length && (isIdentStart(sql[i]!) || /[0-9]/.test(sql[i]!))) i++;
-  }
-  if (sql[i] !== "$") return undefined;
-  const delimiter = sql.slice(open, i + 1);
-  const close = sql.indexOf(delimiter, i + 1);
-  return close === -1 ? undefined : close + delimiter.length;
 }

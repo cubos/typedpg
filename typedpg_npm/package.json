@@ -56,7 +56,7 @@
   },
   "sideEffects": ["./dist/register.js", "./dist/bun.js"],
   "scripts": {
-    "build": "rm -rf dist && tsc -p .",
+    "build": "node scripts/wasm.mjs && rm -rf dist && tsc -p .",
     "test": "npm run build && node --test dist/*.test.js",
     "prepack": "npm run build"
   },

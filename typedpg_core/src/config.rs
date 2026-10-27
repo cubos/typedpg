@@ -226,11 +226,45 @@ impl MigrationsConfig {
     /// Accepts `name` or `schema.name`, where each part matches `[a-zA-Z_][a-zA-Z0-9_]*`.
     /// This prevents SQL injection since the table name is interpolated into queries.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        validate_qualified_name(&self.table).map_err(|msg| ConfigError::InvalidTable {
-            table: self.table.clone(),
-            reason: msg,
+        validate_table_name(&self.table).map_err(|e| ConfigError::InvalidTable {
+            table: e.table,
+            reason: e.reason,
         })
     }
+}
+
+/// An invalid tracking-table name, as the runner reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidTableName {
+    /// The name as configured.
+    pub table: String,
+    /// Why it is not a valid qualified identifier.
+    pub reason: String,
+}
+
+impl std::fmt::Display for InvalidTableName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "invalid migration table name '{}': {}",
+            self.table, self.reason
+        )
+    }
+}
+
+impl std::error::Error for InvalidTableName {}
+
+/// Validate a tracking-table name as [`MigrationsConfig::validate`] does:
+/// `name` or `schema.name`, each part unquoted or double-quoted. The name is
+/// interpolated into every runner query, so this is the injection guard.
+///
+/// Shared with `typedpg_wasm`: the npm runner accepts exactly the names the
+/// Rust runner does.
+pub fn validate_table_name(table: &str) -> Result<(), InvalidTableName> {
+    validate_qualified_name(table).map_err(|reason| InvalidTableName {
+        table: table.to_owned(),
+        reason,
+    })
 }
 
 /// Checks if a string is a valid unquoted PG identifier: `[a-zA-Z_][a-zA-Z0-9_]*`.
@@ -828,6 +862,25 @@ migrations = "/opt/migrations"
             ..Default::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    /// The npm runner validates through this function: it must accept and
+    /// reject exactly what `validate` does, with the same message.
+    #[test]
+    fn validate_table_name_is_the_runners_rule() {
+        assert!(validate_table_name("public._migrations").is_ok());
+        assert!(validate_table_name(r#""my schema".log"#).is_ok());
+        for table in ["", "a.b.c", "1abc", r#""""#] {
+            let config = MigrationsConfig {
+                table: table.into(),
+                ..Default::default()
+            };
+            assert_eq!(
+                validate_table_name(table).unwrap_err().to_string(),
+                config.validate().unwrap_err().to_string(),
+                "table {table:?}"
+            );
+        }
     }
 
     #[test]

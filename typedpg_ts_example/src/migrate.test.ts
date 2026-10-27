@@ -223,6 +223,6 @@ describe("migrations", { skip }, () => {
     assert.throws(at("abc_x.sql"), /does not have a numeric prefix/);
     assert.throws(at("0001_.sql"), /has no description after prefix/);
     assert.deepEqual(loadMigrations(join(dir, "missing")).migrations, []);
-    assert.throws(() => embedMigrations([], { table: "x; DROP TABLE y" }), /invalid migrations table/);
+    assert.throws(() => embedMigrations([], { table: "x; DROP TABLE y" }), /invalid migration table name/);
   });
 });

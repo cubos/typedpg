@@ -3198,15 +3198,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
-name = "similar"
-version = "3.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2f8bec09ae8fae0f4f265a4559a9334be3929d8504e9b536df0a41302bd1733"
-dependencies = [
- "bstr",
-]
-
-[[package]]
 name = "siphasher"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3744,11 +3735,9 @@ dependencies = [
  "deadpool-postgres",
  "futures-core",
  "futures-util",
- "md5",
  "rust_decimal",
  "serde",
  "serde_json",
- "similar",
  "tempfile",
  "thiserror",
  "tokio",
@@ -3807,6 +3796,7 @@ dependencies = [
 name = "typedpg_core"
 version = "0.5.0"
 dependencies = [
+ "md5",
  "serde",
  "serde_json",
  "sha2",
@@ -3930,6 +3920,13 @@ dependencies = [
  "typedpg",
  "typedpg_analyzer",
  "typedpg_cli",
+ "typedpg_core",
+]
+
+[[package]]
+name = "typedpg_wasm"
+version = "0.5.0"
+dependencies = [
  "typedpg_core",
 ]
 

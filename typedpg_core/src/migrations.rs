@@ -1,6 +1,33 @@
-//! The order of the migrations.
+//! The pure helpers both migration runners share.
+//!
+//! The Rust runner (`typedpg::migrate`) and the npm one (`@cubos/typedpg`,
+//! through `typedpg_wasm`) manage the same tracking table: they must parse
+//! the same file names, split statements the same way, agree on what drift
+//! is, and explain it with the same message. Everything here is free of I/O
+//! and of database types, so `typedpg_core` stays buildable for
+//! `wasm32-unknown-unknown`.
+//!
+//! - [`compare_versions`] / [`compare_migration_names`] — migration order.
+//! - [`parse_migration_name`] — the `NNNN_description` rule.
+//! - [`split_statements`] — a migration as the statements the runner sends.
+//! - [`normalize`] / [`hash`] — the text drift detection compares.
+//! - [`drift_message`] — the error (or warning) drift produces.
+//! - [`locate_position`] — a server error's line and column in the file.
 
 use std::cmp::Ordering;
+
+mod diff;
+mod drift;
+mod name;
+mod normalize;
+mod position;
+mod split;
+
+pub use drift::drift_message;
+pub use name::{MigrationNameError, parse_migration_name};
+pub use normalize::{HASH_VERSION, hash, normalize};
+pub use position::locate_position;
+pub use split::split_statements;
 
 /// Compare two migration versions — the numeric prefix of their names — as
 /// numbers: `2` before `10`.
