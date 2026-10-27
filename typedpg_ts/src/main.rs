@@ -47,9 +47,13 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Serve TypeScript as the content mapper of .sql files (JSON-RPC on
-    /// stdin / stdout; TypeScript starts it).
-    Serve,
+    /// Serve TypeScript as the content mapper of .sql files, and compile
+    /// .sql files for the loaders (JSON-RPC on stdin / stdout).
+    Serve {
+        /// Exit after this many seconds without a request (default: never).
+        #[arg(long)]
+        idle_timeout: Option<f64>,
+    },
     /// Run database migrations.
     Migrate {
         #[arg(long, default_value = CONFIG_FILE, global = true)]
@@ -76,7 +80,7 @@ fn main() -> ExitCode {
         Command::Gen { config, .. } => generate(&config, false),
         Command::Check { config } => generate(&config, true),
         Command::Build { config, json } => build(&config, json),
-        Command::Serve => typedpg_ts::serve::run().map(|()| true),
+        Command::Serve { idle_timeout } => typedpg_ts::serve::run(idle_timeout).map(|()| true),
         Command::Migrate {
             config,
             db,

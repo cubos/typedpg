@@ -1,14 +1,16 @@
 // Bun: importing a `.sql` file loads its module, from the cache `typedpg
 // build` fills (see sqlfiles.ts). As a preload it registers itself for the
 // runtime (`bunfig.toml`: `preload = ["@cubos/typedpg/bun"]`); its default
-// export is the plugin, for `Bun.build({ plugins: [typedpg] })`.
+// export is the plugin, for `Bun.build({ plugins: [typedpg] })`. Bun's
+// `onLoad` may be asynchronous: a cache miss compiles through the
+// persistent `typedpg serve`.
 
-import { compileSql } from "./sqlfiles.js";
+import { compileSqlAsync } from "./sqlfiles.js";
 
 interface BunPluginBuild {
   onLoad(
     options: { filter: RegExp },
-    callback: (args: { path: string }) => { contents: string; loader: "js" },
+    callback: (args: { path: string }) => Promise<{ contents: string; loader: "js" }>,
   ): void;
 }
 
@@ -20,7 +22,10 @@ export interface BunPlugin {
 const typedpg: BunPlugin = {
   name: "typedpg",
   setup(build) {
-    build.onLoad({ filter: /\.sql$/ }, ({ path }) => ({ contents: compileSql(path).code, loader: "js" }));
+    build.onLoad({ filter: /\.sql$/ }, async ({ path }) => ({
+      contents: (await compileSqlAsync(path)).code,
+      loader: "js",
+    }));
   },
 };
 
