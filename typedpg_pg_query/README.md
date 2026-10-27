@@ -72,6 +72,6 @@ the copy. They fall in three groups:
 
 ## License
 
-The Rust code is MIT OR Apache-2.0. The bundled libpg_query is BSD-3-Clause
+The Rust code is MIT. The bundled libpg_query is BSD-3-Clause
 (`libpg_query/LICENSE`), and the PostgreSQL sources it embeds are under the
 PostgreSQL License.

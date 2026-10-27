@@ -2,7 +2,7 @@
   "name": "@cubos/typedpg",
   "version": "0.5.0",
   "description": "Typed PostgreSQL queries for TypeScript, checked against your migrations without a database",
-  "license": "MIT OR Apache-2.0",
+  "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/cubos/typedpg.git",

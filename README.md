@@ -899,4 +899,4 @@ Measured on a schema of ~300 tables: replaying the migrations goes from ~0.5 s t
 
 ## License
 
-Proprietary -- Cubos Tecnologia.
+MIT.

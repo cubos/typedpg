@@ -47,4 +47,4 @@ exact published version when releasing. Build the runtime first:
 
 ## License
 
-MIT OR Apache-2.0.
+MIT.
