@@ -81,7 +81,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-node@v7
         with:
-          node-version: 24
+          node-version: 26
       # Builds and unit-tests the runtime and the CLI, then runs
       # `typedpg check`, the errors fixture, tsc 7 and 5.9 over the example,
       # then its queries, COPY, streams and migrations on a PostgreSQL
