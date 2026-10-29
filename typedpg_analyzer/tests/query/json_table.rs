@@ -213,7 +213,7 @@ fn json_table_rejects_invalid_behaviors() {
         db.analyze(
             "SELECT * FROM JSON_TABLE(jsonb '1', '$' COLUMNS (a bit(3) DEFAULT 1 ON ERROR))"
         ),
-        AnalyzeError::Invalid(_),
+        AnalyzeError::CannotCoerce(_),
         "cannot cast behavior expression of type integer to bit"
     );
     for sql in [

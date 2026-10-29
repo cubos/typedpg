@@ -100,6 +100,13 @@ pub enum AnalyzeError {
     #[error("{0}")]
     DatatypeMismatch(String),
 
+    /// A value that PG's coercion machinery can't convert to the type a
+    /// construct settled on (`ARRAY could not convert type A to B`,
+    /// `cannot cast behavior expression of type A to B`). Equivalent to PG
+    /// `cannot_coerce` (SQLSTATE 42846).
+    #[error("{0}")]
+    CannotCoerce(String),
+
     /// Aggregate placement / grouping rules: aggregates not allowed in a
     /// clause, ungrouped column references, nested aggregates. Equivalent
     /// to PG `grouping_error` (SQLSTATE 42803).
@@ -316,6 +323,7 @@ impl AnalyzeError {
             InvalidColumnReference(_) => Some("42P10"),
             DuplicateAlias(_) => Some("42712"),
             DatatypeMismatch(_) => Some("42804"),
+            CannotCoerce(_) => Some("42846"),
             GroupingError(_) => Some("42803"),
             WindowingError(_) => Some("42P20"),
             GeneratedAlways(_) => Some("428C9"),
@@ -1327,6 +1335,7 @@ fn replace_message(e: AnalyzeError, rendered: String) -> AnalyzeError {
         AnalyzeError::InvalidColumnReference(_) => AnalyzeError::InvalidColumnReference(rendered),
         AnalyzeError::DuplicateAlias(_) => AnalyzeError::DuplicateAlias(rendered),
         AnalyzeError::DatatypeMismatch(_) => AnalyzeError::DatatypeMismatch(rendered),
+        AnalyzeError::CannotCoerce(_) => AnalyzeError::CannotCoerce(rendered),
         AnalyzeError::GroupingError(_) => AnalyzeError::GroupingError(rendered),
         AnalyzeError::WindowingError(_) => AnalyzeError::WindowingError(rendered),
         AnalyzeError::GeneratedAlways(_) => AnalyzeError::GeneratedAlways(rendered),

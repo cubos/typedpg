@@ -1170,7 +1170,7 @@ fn array_constructor_type_errors_match_pg() {
     );
     assert_err_prefix!(
         db.analyze("SELECT ARRAY[ARRAY[1], ARRAY['2']]"),
-        AnalyzeError::Invalid(_),
+        AnalyzeError::CannotCoerce(_),
         "ARRAY could not convert type text[] to integer[]"
     );
     assert_err_prefix!(

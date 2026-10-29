@@ -390,7 +390,7 @@ fn json_behavior_default_must_cast_to_the_returning_type() {
             "cannot cast behavior expression of type integer to date",
         ),
     ] {
-        assert_err_prefix!(db.analyze(sql), AnalyzeError::Invalid(_), msg);
+        assert_err_prefix!(db.analyze(sql), AnalyzeError::CannotCoerce(_), msg);
     }
     for sql in [
         "SELECT JSON_VALUE(jsonb '1', '$' RETURNING bit(3) DEFAULT B'101' ON ERROR) AS a",
