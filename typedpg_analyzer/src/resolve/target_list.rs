@@ -38,6 +38,8 @@ pub(crate) fn expanded_target_entries<'a>(
         let Some(val) = &rt.val else {
             continue;
         };
+        let param_star = param_star(val, scope, ctx.snapshot);
+        let val = param_star.as_ref().unwrap_or(val);
         match val.node.as_ref() {
             Some(node::Node::ColumnRef(cr))
                 if cr
@@ -86,6 +88,22 @@ pub(crate) fn expanded_target_entries<'a>(
     out
 }
 
+/// A SQL function parameter's `v.*` as the `(v).*` it stands for
+/// ([`expr::sql_function_param_star`]).
+fn param_star(
+    val: &protobuf::Node,
+    scope: &Scope,
+    snapshot: &PgCatalog,
+) -> Option<Box<protobuf::Node>> {
+    let Some(node::Node::ColumnRef(cr)) = val.node.as_ref() else {
+        return None;
+    };
+    let ind = expr::sql_function_param_star(cr, scope, snapshot)?;
+    Some(Box::new(protobuf::Node {
+        node: Some(node::Node::AIndirection(Box::new(ind))),
+    }))
+}
+
 pub(crate) fn resolve_target_list(
     target_list: &[protobuf::Node],
     ctx: Ctx<'_>,
@@ -121,6 +139,8 @@ pub(crate) fn resolve_target_list_explicit(
             Some(v) => v,
             None => continue,
         };
+        let param_star = param_star(val, scope, snapshot);
+        let val = param_star.as_ref().unwrap_or(val);
 
         // Check for SELECT * or t.*.
         if let Some(node::Node::ColumnRef(cr)) = val.node.as_ref()
@@ -311,11 +331,11 @@ pub(crate) fn analyze_values_lists(
         .iter()
         .filter_map(|n| match n.node.as_ref()? {
             node::Node::List(l) => {
-                Some(expr::expand_row_args(&l.items, ctx(), params).into_owned())
+                Some(expr::expand_row_args(&l.items, ctx(), params).map(|r| r.into_owned()))
             }
             _ => None,
         })
-        .collect();
+        .collect::<Result<_, _>>()?;
     // An empty VALUES list would be a grammar error in PG, but we guard
     // anyway for robustness.
     let first = rows

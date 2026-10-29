@@ -796,8 +796,9 @@ pub(crate) fn row_pairwise_op(
     params: &mut ParamCollector,
     not_bool: impl Fn(&str) -> String,
 ) -> Result<(ExprType, Vec<Option<crate::lookup::ResolvedOperator>>), AnalyzeError> {
-    let largs = &*expand_row_args(largs, ctx, params);
-    let rargs = &*expand_row_args(rargs, ctx, params);
+    let largs = expand_row_args(largs, ctx, params)?;
+    let rargs = expand_row_args(rargs, ctx, params)?;
+    let (largs, rargs) = (&*largs, &*rargs);
     if largs.len() != rargs.len() {
         return Err(AnalyzeError::SyntaxError(
             "unequal number of entries in row expressions".to_owned(),
@@ -931,7 +932,7 @@ fn handle_row_subselect(
     };
 
     // transformExpressionList expands the ROW's `t.*` / `(expr).*` items.
-    let largs = expand_row_args(&lrow.args, ctx, params);
+    let largs = expand_row_args(&lrow.args, ctx, params)?;
     for la in largs.iter() {
         let _ = infer_expr(la, ctx, params, TypeGoal::NONE);
     }

@@ -36,6 +36,90 @@ fn multi_column_update_forms() {
 }
 
 #[test]
+fn row_of_a_star_expands_in_a_multiple_assignment() {
+    // transformMultiAssignRef transforms a ROW(...) source with
+    // transformRowExpr, whose transformExpressionList expands `rel.*` and
+    // `(expr).*` into one element per column before the count is checked.
+    let db = setup();
+    db.analyze(
+        "INSERT INTO t VALUES (1, 2, 'x')
+         ON CONFLICT (id) DO UPDATE SET (id, a, b) = ROW(excluded.*)",
+    )
+    .unwrap();
+    db.analyze(
+        "UPDATE t SET (a, b) = ROW(v.*) FROM (VALUES (21, 'y')) AS v(i, j) WHERE t.id = v.i",
+    )
+    .unwrap();
+    db.analyze("UPDATE t SET (id, a, b) = ROW(v.*, 'z') FROM (VALUES (21, 3)) AS v(i, j)")
+        .unwrap();
+    // A composite's fields, likewise.
+    db.analyze("UPDATE t SET (a, b) = ROW((j.p).*) FROM j WHERE j.id = t.id")
+        .unwrap();
+    // The expanded elements are what is counted.
+    let err = db
+        .analyze("UPDATE t SET (a, b) = ROW(v.*) FROM (VALUES (1, 'y', 3)) AS v(i, j, k)")
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("number of columns does not match number of values"),
+        "{err}"
+    );
+    // And each one is assigned to its own column, typed and nullable as
+    // that element.
+    let err = db
+        .analyze("UPDATE t SET (b, a) = ROW(v.*) FROM (VALUES (1, 'y')) AS v(i, j)")
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("column \"a\" is of type integer but expression is of type text"),
+        "{err}"
+    );
+    let s = db
+        .analyze(
+            "UPDATE t SET (a, b) = ROW(v.*) FROM (VALUES (1, NULL::text)) AS v(i, j) \
+             RETURNING a, b",
+        )
+        .unwrap();
+    assert_cols(&s, vec![c("a", int4()), cn("b", text())]);
+    // MERGE's UPDATE SET, likewise.
+    db.analyze(
+        "MERGE INTO t USING (VALUES (1, 'y')) AS v(i, j) ON t.id = v.i \
+         WHEN MATCHED THEN UPDATE SET (a, b) = ROW(v.*)",
+    )
+    .unwrap();
+    let err = db
+        .analyze(
+            "MERGE INTO t USING (VALUES (1, 'y', 3)) AS v(i, j, k) ON t.id = v.i \
+             WHEN MATCHED THEN UPDATE SET (a, b) = ROW(v.*)",
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("number of columns does not match number of values"),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_default_after_a_star_in_a_multiple_assignment_is_its_own_column() {
+    // The rewriter (rewriteTargetListIU) sees the expanded row: the DEFAULT
+    // is the element after all of `x.*`'s.
+    let mut db = setup();
+    db.apply_sql("CREATE TABLE gi (id int GENERATED ALWAYS AS IDENTITY, a int, b int);")
+        .unwrap();
+    db.analyze("UPDATE gi SET (a, b, id) = ROW(x.*, DEFAULT) FROM (VALUES (1, 2)) x(p, q)")
+        .unwrap();
+    let err = db
+        .analyze("UPDATE gi SET (a, id, b) = ROW(x.*, DEFAULT) FROM (VALUES (1, 2)) x(p, q)")
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("column \"id\" can only be updated to DEFAULT"),
+        "{err}"
+    );
+}
+
+#[test]
 fn multi_column_update_errors() {
     let db = setup();
     for sql in [

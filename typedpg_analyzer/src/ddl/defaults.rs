@@ -43,6 +43,10 @@ pub(crate) fn check_default(
         infer_expr(expr, ctx(), &mut params, goal).map_err(wrap)?;
         return Ok(type_oid);
     }
+    if record_to_complex(interp, result.type_oid, type_oid) {
+        infer_expr(expr, ctx(), &mut params, TypeGoal::assignment(type_oid)).map_err(wrap)?;
+        return Ok(type_oid);
+    }
     if !can_coerce(
         result.type_oid,
         type_oid,
@@ -85,6 +89,10 @@ pub(crate) fn check_function_default(
         infer_expr(expr, ctx(), &mut params, TypeGoal::assignment(param_type)).map_err(wrap)?;
         return Ok(param_type);
     }
+    if record_to_complex(interp, result.type_oid, param_type) {
+        infer_expr(expr, ctx(), &mut params, TypeGoal::assignment(param_type)).map_err(wrap)?;
+        return Ok(param_type);
+    }
     if !can_coerce(
         result.type_oid,
         param_type,
@@ -98,6 +106,15 @@ pub(crate) fn check_function_default(
         )));
     }
     Ok(param_type)
+}
+
+/// Whether a stored expression of type `source` reaches `target` through
+/// `can_coerce_type`'s rule that `record` coerces to any composite (or
+/// domain over one): `coerce_record_to_complex` then converts a row
+/// constructor field by field, raising PG's `cannot cast type record to …`
+/// itself — what inferring it toward the composite does.
+pub(crate) fn record_to_complex(interp: &PgCatalog, source: PgTypeOid, target: PgTypeOid) -> bool {
+    source == oid::RECORD && crate::coerce::is_complex(target, interp)
 }
 
 /// The `EXPR_KIND_COLUMN_DEFAULT` / `EXPR_KIND_FUNCTION_DEFAULT`

@@ -2019,6 +2019,41 @@ fn update_composite_with_wrong_field_types_errors() {
 }
 
 #[test]
+fn nested_row_constructors_cast_to_nested_composites() {
+    // coerce_record_to_complex coerces each field of a ROW(...) cast to its
+    // field's type — a nested ROW(...) to a nested composite the same way
+    // (regress/sql/rowtypes.sql: `row((3.3,4.4),(5.5,null))::quad`).
+    let mut db = setup();
+    db.apply_sql(
+        "CREATE TYPE complex AS (r float8, i float8);
+         CREATE TYPE quad AS (c1 complex, c2 complex);",
+    )
+    .unwrap();
+    db.analyze("SELECT row((3.3,4.4),(5.5,null))::quad")
+        .unwrap();
+    db.analyze("SELECT row(1, row('s', 'c', 'z'))::company")
+        .unwrap();
+    db.analyze("SELECT (row('n', row('s', NULL, 'z'))::company).hq")
+        .unwrap();
+    db.analyze("UPDATE companies SET info = ROW('n', ROW('s', 'c', 'z')) WHERE id = 1")
+        .unwrap();
+    // A nested field that doesn't coerce fails the nested record's cast,
+    // reported for the nested composite (no bool → float8; one field too
+    // many).
+    for sql in [
+        "SELECT row((true, 4.4), (5.5, null))::quad",
+        "SELECT row((3.3, 4.4, 5.5), (5.5, null))::quad",
+    ] {
+        let err = db.analyze(sql).unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("cannot cast type record to complex"),
+            "{sql}: {err}"
+        );
+    }
+}
+
+#[test]
 fn update_composite_with_int_into_text_field_accepted() {
     // `address.zip` is TEXT and PG coerces any scalar to a string-category
     // target via its I/O functions in assignment context, so feeding an int4

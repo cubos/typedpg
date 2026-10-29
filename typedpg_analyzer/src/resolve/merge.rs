@@ -182,7 +182,9 @@ pub(crate) fn analyze_merge_with_outer_ctes(
     let mut rows = ReturningRows::default();
     // What each WHEN clause's condition proves, where its action runs.
     let mut when_facts: Vec<crate::nonnull::Facts> = Vec::new();
-    for when_node in &merge.merge_when_clauses {
+    // The WHEN clauses with their UPDATE SET lists expanded, when one was.
+    let mut expanded_whens: Option<Vec<protobuf::Node>> = None;
+    for (i, when_node) in merge.merge_when_clauses.iter().enumerate() {
         if let Some(node::Node::MergeWhenClause(when)) = when_node.node.as_ref() {
             // An INSERT action returns a row with no old version, a DELETE
             // action one with no new version.
@@ -203,7 +205,7 @@ pub(crate) fn analyze_merge_with_outer_ctes(
                 _ => &both,
             };
             let log = crate::nonnull::StrictLog::default();
-            walk_merge_when_clause(
+            let set_list = walk_merge_when_clause(
                 when,
                 expr::Ctx::new(when_scope, &null_ctx, snapshot),
                 &log,
@@ -211,6 +213,17 @@ pub(crate) fn analyze_merge_with_outer_ctes(
                 &table_attrs,
                 &table_relname,
             )?;
+            if let Some(target_list) = set_list {
+                let whens = expanded_whens.get_or_insert_with(|| merge.merge_when_clauses.clone());
+                whens[i] = protobuf::Node {
+                    node: Some(node::Node::MergeWhenClause(Box::new(
+                        protobuf::MergeWhenClause {
+                            target_list,
+                            ..(**when).clone()
+                        },
+                    ))),
+                };
+            }
             when_facts.push(match &when.condition {
                 Some(c) => crate::nonnull::nonnullable(c, true, when_scope, &log, snapshot)
                     .restricted_to(&crate::nonnull::own_aliases(when_scope)),
@@ -218,6 +231,18 @@ pub(crate) fn analyze_merge_with_outer_ctes(
             });
         }
     }
+    // What follows reads the SET lists as expanded.
+    let expanded_merge;
+    let merge = match expanded_whens {
+        Some(merge_when_clauses) => {
+            expanded_merge = protobuf::MergeStmt {
+                merge_when_clauses,
+                ..merge.clone()
+            };
+            &expanded_merge
+        }
+        None => merge,
+    };
 
     // RETURNING sees the source and the target (plus the OLD / NEW rows).
     // The target columns are the inserted / updated / deleted row, so they
@@ -369,6 +394,8 @@ pub(crate) fn analyze_merge_with_outer_ctes(
     Ok((columns, None))
 }
 
+/// Returns an UPDATE action's SET list when [`analyze_set_clause`] expanded
+/// it.
 fn walk_merge_when_clause(
     when: &protobuf::MergeWhenClause,
     ctx: Ctx<'_>,
@@ -376,7 +403,7 @@ fn walk_merge_when_clause(
     params: &mut ParamCollector,
     table_attrs: &[crate::pg_catalog::PgAttribute],
     table_relname: &str,
-) -> Result<(), AnalyzeError> {
+) -> Result<Option<Vec<protobuf::Node>>, AnalyzeError> {
     if let Some(condition) = &when.condition {
         // transformMergeStmt: transformWhereClause(…, EXPR_KIND_MERGE_WHEN,
         // "WHEN").
@@ -392,11 +419,13 @@ fn walk_merge_when_clause(
     let cmd = CmdType::try_from(when.command_type).unwrap_or(CmdType::Undefined);
     match cmd {
         CmdType::CmdUpdate => merge_when_update(when, ctx, params, table_attrs, table_relname),
-        CmdType::CmdInsert => merge_when_insert(when, ctx, params, table_attrs, table_relname),
+        CmdType::CmdInsert => {
+            merge_when_insert(when, ctx, params, table_attrs, table_relname).map(|()| None)
+        }
         CmdType::CmdDelete | CmdType::CmdNothing => {
             // No target / value expressions to walk beyond the optional
             // `AND condition` already handled above.
-            Ok(())
+            Ok(None)
         }
         _ => Err(AnalyzeError::Unsupported(format!(
             "typedpg does not support the MERGE action {} yet",
@@ -406,22 +435,27 @@ fn walk_merge_when_clause(
 }
 
 /// `WHEN MATCHED THEN UPDATE SET col = expr [, …]` — the shared UPDATE
-/// SET analysis against the target table.
+/// SET analysis against the target table. Returns the SET list when it
+/// expanded it.
 fn merge_when_update(
     when: &protobuf::MergeWhenClause,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
     table_attrs: &[crate::pg_catalog::PgAttribute],
     table_relname: &str,
-) -> Result<(), AnalyzeError> {
-    analyze_set_clause(
+) -> Result<Option<Vec<protobuf::Node>>, AnalyzeError> {
+    let set_list = analyze_set_clause(
         &when.target_list,
         table_attrs,
         table_relname,
         ctx,
         params,
         true,
-    )
+    )?;
+    Ok(match set_list {
+        std::borrow::Cow::Borrowed(_) => None,
+        std::borrow::Cow::Owned(list) => Some(list),
+    })
 }
 
 /// `WHEN NOT MATCHED THEN INSERT (cols…) VALUES (vals…)` — `target_list` holds

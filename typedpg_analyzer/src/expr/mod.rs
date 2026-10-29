@@ -1103,7 +1103,7 @@ fn infer_expr_unlocated(
         node::Node::AArrayExpr(arr) => infer_array_expr(arr, ctx, params),
         node::Node::RowExpr(row) => {
             let expanded;
-            let row: &protobuf::RowExpr = match expand_row_args(&row.args, ctx, params) {
+            let row: &protobuf::RowExpr = match expand_row_args(&row.args, ctx, params)? {
                 std::borrow::Cow::Borrowed(_) => row,
                 std::borrow::Cow::Owned(args) => {
                     expanded = protobuf::RowExpr {
@@ -1156,7 +1156,14 @@ fn infer_expr_unlocated(
                     // (42846), not as the field's own mismatch.
                     let mut scratch = params.clone();
                     let own = infer_expr(arg, ctx, &mut scratch, TypeGoal::NONE)?;
+                    // can_coerce_type lets `record` reach any composite;
+                    // coerce_record_to_complex then converts a nested row
+                    // constructor field by field — the composite goal below
+                    // does, reporting a failure for the nested type.
+                    let nested_record = own.type_oid == oid::RECORD
+                        && crate::coerce::is_complex(field.atttypid, snapshot);
                     if own.type_oid != oid::UNKNOWN
+                        && !nested_record
                         && !crate::coerce::can_coerce(
                             own.type_oid,
                             field.atttypid,
@@ -1198,8 +1205,12 @@ fn infer_expr_unlocated(
                         arg.node.as_ref(),
                         Some(node::Node::AConst(c)) if !c.isnull
                     );
-                    let kept =
-                        own.type_oid == field.atttypid || (own.type_oid == oid::UNKNOWN && literal);
+                    // A nested row constructor becomes the nested
+                    // composite's own row constructor: never NULL either.
+                    let row = matches!(arg.node.as_ref(), Some(node::Node::RowExpr(_)));
+                    let kept = own.type_oid == field.atttypid
+                        || (own.type_oid == oid::UNKNOWN && literal)
+                        || (nested_record && row);
                     shape.push(RecordField {
                         name: field.attname.clone(),
                         ty: ExprType::scalar_with_typmod(
@@ -1663,12 +1674,13 @@ pub(crate) fn plan_time_checks() -> bool {
 /// (`ExpandColumnRefStar`) and a `(expr).*` indirection to one field
 /// selection per field (`ExpandIndirectionStar`), so `ROW(t.*)` is
 /// `ROW(t.a, t.b, …)`, not a one-field record holding the whole row.
-/// Borrowed when no argument is a star.
+/// Borrowed when no argument is a star. A `(expr).*` over a value with no
+/// fields fails as `ExpandIndirectionStar` does.
 pub(crate) fn expand_row_args<'a>(
     args: &'a [protobuf::Node],
     ctx: Ctx<'_>,
     params: &ParamCollector,
-) -> std::borrow::Cow<'a, [protobuf::Node]> {
+) -> Result<std::borrow::Cow<'a, [protobuf::Node]>, AnalyzeError> {
     let ends_in_star = |fields: &[protobuf::Node]| {
         matches!(
             fields.last().and_then(|f| f.node.as_ref()),
@@ -1681,10 +1693,36 @@ pub(crate) fn expand_row_args<'a>(
         _ => false,
     };
     if !args.iter().any(is_star) {
-        return std::borrow::Cow::Borrowed(args);
+        return Ok(std::borrow::Cow::Borrowed(args));
     }
     let string = |s: &str| protobuf::Node {
         node: Some(node::Node::String(protobuf::String { sval: s.to_owned() })),
+    };
+    // `(expr).*`: one field selection per field of `expr`'s composite type.
+    let expand_indirection = |ind: &protobuf::AIndirection,
+                              arg: &protobuf::Node,
+                              out: &mut Vec<protobuf::Node>|
+     -> Result<(), AnalyzeError> {
+        let mut scratch = params.clone();
+        match expand_indirection_star(ind, ctx, &mut scratch)? {
+            Some(fields) => {
+                let prefix = &ind.indirection[..ind.indirection.len() - 1];
+                out.extend(fields.iter().map(|(name, _)| {
+                    protobuf::Node {
+                        node: Some(node::Node::AIndirection(Box::new(protobuf::AIndirection {
+                            arg: ind.arg.clone(),
+                            indirection: prefix
+                                .iter()
+                                .cloned()
+                                .chain(std::iter::once(string(name)))
+                                .collect(),
+                        }))),
+                    }
+                }));
+            }
+            None => out.push(arg.clone()),
+        }
+        Ok(())
     };
     let mut out = Vec::with_capacity(args.len());
     for arg in args {
@@ -1704,36 +1742,20 @@ pub(crate) fn expand_row_args<'a>(
                             location: cr.location,
                         })),
                     })),
-                    None => out.push(arg.clone()),
+                    // A SQL function parameter's `v.*` is `(v).*`.
+                    None => match sql_function_param_star(cr, ctx.scope, ctx.snapshot) {
+                        Some(ind) => expand_indirection(&ind, arg, &mut out)?,
+                        None => out.push(arg.clone()),
+                    },
                 }
             }
             Some(node::Node::AIndirection(ind)) if ends_in_star(&ind.indirection) => {
-                let mut scratch = params.clone();
-                match expand_indirection_star(ind, ctx, &mut scratch) {
-                    Ok(Some(fields)) => {
-                        let prefix = &ind.indirection[..ind.indirection.len() - 1];
-                        out.extend(fields.iter().map(|(name, _)| {
-                            protobuf::Node {
-                                node: Some(node::Node::AIndirection(Box::new(
-                                    protobuf::AIndirection {
-                                        arg: ind.arg.clone(),
-                                        indirection: prefix
-                                            .iter()
-                                            .cloned()
-                                            .chain(std::iter::once(string(name)))
-                                            .collect(),
-                                    },
-                                ))),
-                            }
-                        }));
-                    }
-                    _ => out.push(arg.clone()),
-                }
+                expand_indirection(ind, arg, &mut out)?;
             }
             _ => out.push(arg.clone()),
         }
     }
-    std::borrow::Cow::Owned(out)
+    Ok(std::borrow::Cow::Owned(out))
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1949,7 +1971,7 @@ mod xml;
 
 use column_refs::*;
 pub(crate) use column_refs::{
-    SqlFunctionParams, check_column_ref_length, with_sql_function_params,
+    SqlFunctionParams, check_column_ref_length, sql_function_param_star, with_sql_function_params,
 };
 pub(crate) use conditional::failing_input_span;
 use conditional::*;

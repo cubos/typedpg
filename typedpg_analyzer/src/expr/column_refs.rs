@@ -193,6 +193,40 @@ fn sql_function_param(parts: &[String], snapshot: &PgCatalog) -> Option<ExprType
     })
 }
 
+/// `rel.*` that names no relation, read as PG's `ExpandColumnRefStar` reads
+/// it once the relation lookup failed: through the parser hook, which in a
+/// SQL function body (`sql_fn_post_column_ref`) takes `v.*`, `f.v.*` or
+/// `v.fld.*` for parameter `v` — whose fields the star then stands for
+/// (`ExpandRowReference`). Returns that as the equivalent `(v).*`.
+pub(crate) fn sql_function_param_star(
+    col_ref: &protobuf::ColumnRef,
+    scope: &Scope,
+    snapshot: &PgCatalog,
+) -> Option<protobuf::AIndirection> {
+    let (star, names) = col_ref.fields.split_last()?;
+    if !matches!(star.node.as_ref(), Some(node::Node::AStar(_)))
+        || !names
+            .iter()
+            .all(|f| matches!(f.node.as_ref(), Some(node::Node::String(_))))
+    {
+        return None;
+    }
+    let names_str = extract_string_fields(names);
+    if scope.find_source(names_str.last()?).is_some() {
+        return None;
+    }
+    sql_function_param(&names_str, snapshot)?;
+    Some(protobuf::AIndirection {
+        arg: Some(Box::new(protobuf::Node {
+            node: Some(node::Node::ColumnRef(protobuf::ColumnRef {
+                fields: names.to_vec(),
+                location: col_ref.location,
+            })),
+        })),
+        indirection: vec![star.clone()],
+    })
+}
+
 /// Resolve `alias.*` (or `schema.alias.*`) to the composite type of the
 /// underlying relation. The composite is the per-table `TypeEntry` that
 /// `create_table` registers alongside the table — same OID that a call site

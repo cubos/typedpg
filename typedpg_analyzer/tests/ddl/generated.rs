@@ -256,6 +256,43 @@ fn virtual_columns_have_built_in_non_domain_types() {
     ]);
 }
 
+#[test]
+fn generated_composite_column_from_a_row_constructor() {
+    // cookDefault coerces the expression to the column's type in the
+    // assignment context (as a parameter's DEFAULT is coerced to its type):
+    // a row constructor goes through coerce_record_to_complex, field by
+    // field (regress/sql/generated_stored.sql).
+    build_db(&[(
+        "0001.sql",
+        "CREATE TYPE double_int AS (a int, b int);
+         CREATE TABLE gtest4 (a int, b double_int GENERATED ALWAYS AS ((a * 2, a * 3)) STORED);
+         CREATE TABLE gtest5 (a int, b double_int GENERATED ALWAYS AS (ROW(a, 1)) STORED);
+         CREATE TABLE gtest6 (a int, b double_int DEFAULT (1, 2));
+         CREATE FUNCTION fd(x double_int DEFAULT (1, 2)) RETURNS int AS 'select 1' LANGUAGE sql;",
+    )]);
+    let setup = "CREATE TYPE double_int AS (a int, b int);";
+    assert_err(
+        setup,
+        "CREATE TABLE g (a int, b double_int GENERATED ALWAYS AS (ROW(a)) STORED);",
+        "cannot cast type record to double_int",
+    );
+    assert_err(
+        setup,
+        "CREATE TABLE g (a int, b double_int GENERATED ALWAYS AS (ROW(a, true)) STORED);",
+        "cannot cast type record to double_int",
+    );
+    assert_err(
+        setup,
+        "CREATE TABLE g (a int, b double_int DEFAULT (1, true));",
+        "cannot cast type record to double_int",
+    );
+    assert_err(
+        setup,
+        "CREATE FUNCTION fd(x double_int DEFAULT (1, true)) RETURNS int AS 'select 1' LANGUAGE sql;",
+        "cannot cast type record to double_int",
+    );
+}
+
 // ── The generation expression ───────────────────────────────────────────────
 
 #[test]
