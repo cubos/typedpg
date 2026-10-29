@@ -1717,3 +1717,47 @@ fn unique_index_covers_the_partition_key_only_with_its_equality() {
         ],
     );
 }
+
+#[test]
+fn an_adopted_constraint_index_goes_with_its_parent_index() {
+    // A plain partitioned index that adopted a partition's constraint
+    // index holds it (DEPENDENCY_PARTITION_PRI): the constraint can't be
+    // dropped alone, nor the parent index without CASCADE. Errors from
+    // PG 18.6.
+    let setup = "CREATE TABLE b (a int, b int) PARTITION BY RANGE (a);
+                 CREATE TABLE bp (a int, b int, CONSTRAINT k UNIQUE (a));
+                 ALTER TABLE b ATTACH PARTITION bp FOR VALUES FROM (0) TO (5);
+                 CREATE UNIQUE INDEX bi ON b (a);";
+    assert_rejected(
+        setup,
+        &[
+            (
+                "ALTER TABLE bp DROP CONSTRAINT k;",
+                "cannot drop index k because index bi requires it (You can drop index bi \
+                 instead.)",
+            ),
+            (
+                "DROP INDEX bi;",
+                "cannot drop index bi because other objects depend on it (constraint k on \
+                 table bp depends on index bi)",
+            ),
+            (
+                "DROP INDEX k;",
+                "cannot drop index k because index bi requires it (You can drop index bi \
+                 instead.)",
+            ),
+        ],
+    );
+    assert_accepted(
+        setup,
+        &["ALTER TABLE b DETACH PARTITION bp; ALTER TABLE bp DROP CONSTRAINT k;"],
+    );
+    // CASCADE takes the constraint along.
+    let db = build_db(&[("0001.sql", setup), ("0002.sql", "DROP INDEX bi CASCADE;")]);
+    assert!(user_indexes(&db).is_empty());
+    assert!(
+        db.constraints_of_table("bp")
+            .iter()
+            .all(|c| c.conname != "k")
+    );
+}

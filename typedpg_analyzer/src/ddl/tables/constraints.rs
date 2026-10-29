@@ -1239,6 +1239,25 @@ pub(crate) fn drop_constraint(
         )));
     }
 
+    // A local constraint whose index a plain partitioned index adopted:
+    // the index goes only with its parent index (findDependentObjects,
+    // DEPENDENCY_PARTITION_PRI).
+    if !rec.recursing
+        && let Some(nsoid) = interp.pg_class.get(&relid).map(|c| c.relnamespace)
+        && let Some(&idx_oid) = interp.class_by_qname.get(&(nsoid, conname.clone()))
+        && let Some(parent) = super::partidx::parent_index_of(interp, idx_oid)
+    {
+        let parent_name = interp
+            .pg_class
+            .get(&parent)
+            .map(|c| c.relname.clone())
+            .unwrap_or_default();
+        return Err(DdlError::DependencyError(format!(
+            "cannot drop index {conname} because index {parent_name} requires it (You can drop \
+             index {parent_name} instead.)"
+        )));
+    }
+
     // Refuse to drop a UNIQUE/PK constraint that an FK depends on.
     let is_pkey_or_unique = interp
         .pg_constraint

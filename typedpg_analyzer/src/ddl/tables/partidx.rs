@@ -9,7 +9,7 @@
 use super::*;
 
 /// The constraint an index backs, if any (the constraint shares its name).
-fn backing_constraint(interp: &PgCatalog, index: PgClassOid) -> Option<PgConstraint> {
+pub(crate) fn backing_constraint(interp: &PgCatalog, index: PgClassOid) -> Option<PgConstraint> {
     let class = interp.pg_class.get(&index)?;
     let table = interp.pg_index.get(&index)?.indrelid;
     interp
