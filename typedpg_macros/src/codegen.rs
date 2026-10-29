@@ -24,7 +24,14 @@ const RUST_KEYWORDS: &[&str] = &[
     "macro", "override", "priv", "try", "typeof", "unsized", "virtual",
 ];
 
+/// The keywords that start a path (`self::`, `crate::`): unlike the other
+/// keywords, they have no raw form — `r#self` is not an identifier.
+const PATH_KEYWORDS: &[&str] = &["self", "Self", "super", "crate"];
+
 /// Sanitize a SQL column name into a valid Rust identifier.
+///
+/// A keyword is named raw (`r#type`), except a path keyword, which cannot
+/// be: it gets a trailing underscore (`self_`).
 fn make_field_ident(name: &str) -> proc_macro2::Ident {
     let sanitized: String = name
         .chars()
@@ -48,7 +55,9 @@ fn make_field_ident(name: &str) -> proc_macro2::Ident {
         sanitized
     };
 
-    if RUST_KEYWORDS.contains(&sanitized.as_str()) {
+    if PATH_KEYWORDS.contains(&sanitized.as_str()) {
+        format_ident!("{}_", sanitized)
+    } else if RUST_KEYWORDS.contains(&sanitized.as_str()) {
         proc_macro2::Ident::new_raw(&sanitized, proc_macro2::Span::call_site())
     } else {
         format_ident!("{}", sanitized)
@@ -62,6 +71,16 @@ fn make_field_ident(name: &str) -> proc_macro2::Ident {
 /// the value by that name. A name that is not an identifier (`$€`) is a
 /// valid SQL parameter, but there is no variable to bind it to.
 fn user_ident(name: &str) -> Result<proc_macro2::Ident, syn::Error> {
+    // A path keyword has no raw form, and cannot name a variable.
+    if PATH_KEYWORDS.contains(&name) {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            format!(
+                "`{name}` cannot name a variable: a parameter's name is also the name of the \
+                 variable that holds its value"
+            ),
+        ));
+    }
     // A keyword is an identifier lexically: Rust wants it raw.
     if RUST_KEYWORDS.contains(&name) {
         return Ok(proc_macro2::Ident::new_raw(
@@ -2618,7 +2637,7 @@ fn pg_type_label(ty: &Type) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{cast_params, check_unique_columns, make_field_ident, wrap_with_limit};
+    use super::{cast_params, check_unique_columns, make_field_ident, user_ident, wrap_with_limit};
     use typedpg_analyzer::PgCatalog;
 
     fn cast(sql: &str) -> String {
@@ -2672,6 +2691,47 @@ mod tests {
         assert_eq!(make_field_ident("á").to_string(), "_unnamed");
         assert_eq!(make_field_ident("").to_string(), "_unnamed");
         assert_eq!(make_field_ident("a b").to_string(), "a_b");
+    }
+
+    // `self`, `Self`, `super` and `crate` can't be raw identifiers:
+    // `proc_macro2::Ident::new_raw` panics, so `SELECT name AS self` made
+    // `sql!` panic instead of naming the field.
+    #[test]
+    fn path_keywords_name_a_field() {
+        for name in ["self", "Self", "super", "crate"] {
+            let ident = std::panic::catch_unwind(|| make_field_ident(name).to_string());
+            assert!(ident.is_ok(), "make_field_ident({name:?}) panicked");
+        }
+        assert_eq!(make_field_ident("self").to_string(), "self_");
+        assert_eq!(make_field_ident("Self").to_string(), "Self_");
+        // The other keywords stay raw.
+        assert_eq!(make_field_ident("type").to_string(), "r#type");
+    }
+
+    /// A parameter is a variable: a path keyword can't be one, and is
+    /// reported instead of panicking.
+    #[test]
+    fn a_path_keyword_parameter_is_reported() {
+        for name in ["self", "Self", "super", "crate"] {
+            let err = user_ident(name).expect_err(name);
+            assert!(err.to_string().contains("cannot name a variable"), "{err}");
+        }
+        assert_eq!(user_ident("type").unwrap().to_string(), "r#type");
+        assert_eq!(user_ident("self_").unwrap().to_string(), "self_");
+    }
+
+    /// A column `self` is named `self_`, so it collides with one named so.
+    #[test]
+    fn a_path_keyword_field_collides_with_its_underscored_name() {
+        let mut db = PgCatalog::new().unwrap();
+        db.apply_sql("CREATE TABLE t (a int NOT NULL, b int);")
+            .unwrap();
+        let info = db.analyze("SELECT a AS self, b AS self_ FROM t").unwrap();
+        let err = check_unique_columns(&info.columns).expect_err("the check must reject it");
+        assert!(
+            err.to_string().contains("duplicate field name \"self_\""),
+            "{err}"
+        );
     }
 
     #[test]

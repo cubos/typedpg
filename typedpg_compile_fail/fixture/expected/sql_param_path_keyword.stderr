@@ -1,0 +1,8 @@
+error: `self` cannot name a variable: a parameter's name is also the name of the variable that holds its value
+ --> src/bin/sql_param_path_keyword.rs:5:5
+  |
+5 |     typedpg::sql!(db, "SELECT id FROM users WHERE name = $self")
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the macro `typedpg::sql` (in Nightly builds, run with -Z macro-backtrace for more info)
+

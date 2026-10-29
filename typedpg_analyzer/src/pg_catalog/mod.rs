@@ -1166,6 +1166,9 @@ impl PgCatalog {
                     "unterminated quoted identifier at or near \"{}\"",
                     near(*position)
                 ),
+                L::ConflictingAnnotations { name, .. } => {
+                    crate::lexer::conflicting_annotations_message(name)
+                }
             }
         }
         let lex_output = match lex(sql) {
