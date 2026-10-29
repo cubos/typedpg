@@ -62,7 +62,32 @@ pub(crate) fn infer_indirection(
                     record_var_shape_visible(&current, snapshot)?;
                 }
                 let alias_hint = if i == 0 { arg_is_bare_alias } else { None };
-                current = resolve_composite_field(&current, &s.sval, snapshot, alias_hint)?;
+                current = match resolve_composite_field(&current, &s.sval, snapshot, alias_hint) {
+                    Ok(field) => field,
+                    // No such field: `(x).f` is the call `f(x)`, on the
+                    // value selected so far (transformIndirection).
+                    Err(e) => {
+                        let value = if i == 0 {
+                            arg.clone()
+                        } else {
+                            protobuf::Node {
+                                node: Some(node::Node::AIndirection(Box::new(
+                                    protobuf::AIndirection {
+                                        arg: ind.arg.clone(),
+                                        indirection: steps[..i].to_vec(),
+                                    },
+                                ))),
+                            }
+                        };
+                        let location = crate::error::node_location(arg).unwrap_or(-1);
+                        match super::func_call::infer_column_notation_call(
+                            &s.sval, value, location, ctx, params,
+                        ) {
+                            Some(call) => call?,
+                            None => return Err(e),
+                        }
+                    }
+                };
                 i += 1;
             }
             Some(node::Node::AIndices(_)) => {

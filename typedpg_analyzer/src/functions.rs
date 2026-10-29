@@ -890,35 +890,37 @@ pub(crate) fn func_select_candidate(
     None
 }
 
-/// Build the named output-argument list for an SRF / OUT-arg function from
-/// its `pg_proc` row. Returns an empty vec when the function has no OUT-like
-/// args.
+/// Build the output-argument list for an SRF / OUT-arg function from its
+/// `pg_proc` row. Returns an empty vec when the function has no OUT-like
+/// args, or a single unnamed one (the function is then a plain scalar,
+/// whose column takes the call's alias). An unnamed OUT argument of a
+/// row is named `columnN` after its position among them, as PG's
+/// `build_function_result_tupdesc_d` does.
 fn build_out_args(p: &PgProc) -> Vec<OutArg> {
-    if p.proargmodes.is_empty() {
+    let len = p.proallargtypes.len().min(p.proargmodes.len());
+    let outs: Vec<(Option<&String>, PgTypeOid)> = (0..len)
+        .filter(|&i| {
+            matches!(
+                p.proargmodes[i],
+                ArgMode::Out | ArgMode::InOut | ArgMode::Table
+            )
+        })
+        .map(|i| {
+            let name = p.proargnames.get(i).filter(|n| !n.is_empty());
+            (name, p.proallargtypes[i])
+        })
+        .collect();
+    if let [(None, _)] = outs.as_slice() {
         return Vec::new();
     }
-    let mut out = Vec::new();
-    let len = p
-        .proallargtypes
-        .len()
-        .min(p.proargmodes.len())
-        .min(p.proargnames.len());
-    for i in 0..len {
-        let mode = p.proargmodes[i];
-        if !matches!(mode, ArgMode::Out | ArgMode::InOut | ArgMode::Table) {
-            continue;
-        }
-        let name = &p.proargnames[i];
-        if name.is_empty() {
-            continue;
-        }
-        out.push(OutArg {
-            name: name.clone(),
-            type_oid: p.proallargtypes[i],
+    outs.into_iter()
+        .enumerate()
+        .map(|(k, (name, type_oid))| OutArg {
+            name: name.cloned().unwrap_or_else(|| format!("column{}", k + 1)),
+            type_oid,
             not_null: false,
-        });
-    }
-    out
+        })
+        .collect()
 }
 
 /// Whether an operator's result can be NULL, given which operands can be:

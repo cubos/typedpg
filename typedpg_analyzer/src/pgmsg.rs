@@ -1246,6 +1246,19 @@ pub(crate) fn coldeflist_redundant_composite() -> RawError {
     )
 }
 
+/// `function return row and query-specified return row do not match` —
+/// SQLSTATE 42804 (`tupledesc_match`, raised by every execution), with
+/// PG's detail.
+pub(crate) fn function_row_mismatch(detail: &str) -> RawError {
+    RawError::new(
+        AnalyzeError::DatatypeMismatch(format!(
+            "function return row and query-specified return row do not match ({detail})"
+        )),
+        None,
+        None,
+    )
+}
+
 /// `ROWS FROM() with multiple functions cannot have a column definition
 /// list` — SQLSTATE 42601 (`transformRangeFunction`).
 pub(crate) fn rows_from_multiple_coldeflist() -> RawError {

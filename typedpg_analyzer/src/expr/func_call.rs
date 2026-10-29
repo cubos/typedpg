@@ -25,6 +25,73 @@ struct FuncArgs {
     coercion_nullable: Vec<bool>,
 }
 
+/// `ParseFuncOrColumn` in column notation: `t.f` / `(x).f` naming no
+/// column of `t` (field of `x`) is the call `f(t)` / `f(x)` — `arg` is the
+/// whole-row or value expression. `None` when no function, or several,
+/// match: the caller then reports its own missing-column error, as PG does.
+pub(crate) fn infer_column_notation_call(
+    name: &str,
+    arg: protobuf::Node,
+    location: i32,
+    ctx: Ctx<'_>,
+    params: &mut ParamCollector,
+) -> Option<Result<ExprType, AnalyzeError>> {
+    crate::error::speculative(|| column_notation_call(name, arg, location, ctx, params))
+}
+
+fn column_notation_call(
+    name: &str,
+    arg: protobuf::Node,
+    location: i32,
+    ctx: Ctx<'_>,
+    params: &mut ParamCollector,
+) -> Option<Result<ExprType, AnalyzeError>> {
+    let mut scratch = params.clone();
+    let arg_type = infer_expr(&arg, ctx, &mut scratch, TypeGoal::NONE)
+        .ok()?
+        .type_oid;
+    let call = protobuf::FuncCall {
+        funcname: vec![protobuf::Node {
+            node: Some(node::Node::String(protobuf::String {
+                sval: name.to_owned(),
+            })),
+        }],
+        args: vec![arg],
+        funcformat: protobuf::CoercionForm::CoerceExplicitCall as i32,
+        location,
+        ..Default::default()
+    };
+    let notation = functions::CallNotation::of(&call).ok()?;
+    let detail = functions::func_get_detail(
+        ctx.snapshot,
+        None,
+        name,
+        &[arg_type],
+        &notation,
+        Some(false),
+        None,
+    );
+    match detail {
+        // FUNCDETAIL_NOTFOUND / FUNCDETAIL_MULTIPLE.
+        Err(e) if matches!(e.sqlstate(), Some("42883" | "42725")) => None,
+        Err(e) => Some(Err(e)),
+        // An aggregate (`t.count` is `count(t)`) would make the level an
+        // aggregating one, which the clause checks only see in call syntax.
+        Ok(functions::FuncDetail::Routine(r)) if r.is_aggregate => {
+            Some(Err(AnalyzeError::Unsupported(format!(
+                "typedpg does not support calling the aggregate {name} in column notation; \
+                 write {name}(…) instead"
+            ))))
+        }
+        Ok(_) => {
+            let node = protobuf::Node {
+                node: Some(node::Node::FuncCall(Box::new(call))),
+            };
+            Some(infer_expr(&node, ctx, params, TypeGoal::NONE))
+        }
+    }
+}
+
 pub(crate) fn infer_func_call(
     func: &protobuf::FuncCall,
     ctx: Ctx<'_>,

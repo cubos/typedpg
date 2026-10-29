@@ -498,6 +498,20 @@ pub(crate) struct CapturedDiagnostic {
     pub notes: Vec<String>,
 }
 
+/// Run an attempt whose errors the caller may discard: when `f` gives up
+/// (`None`), the diagnostics recorded by any error it finalized are
+/// dropped, so the error the caller reports instead keeps its own.
+pub(crate) fn speculative<R>(f: impl FnOnce() -> Option<R>) -> Option<R> {
+    let captured = CAPTURED.with(|c| c.borrow().clone());
+    let unlocated = LAST_UNLOCATED.with(|c| c.borrow().clone());
+    let out = f();
+    if out.is_none() {
+        CAPTURED.with(|c| *c.borrow_mut() = captured);
+        LAST_UNLOCATED.with(|c| *c.borrow_mut() = unlocated);
+    }
+    out
+}
+
 /// Take the diagnostic recorded by the last error finalized in capture
 /// mode, clearing it.
 pub(crate) fn take_captured() -> Option<CapturedDiagnostic> {

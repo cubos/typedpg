@@ -941,7 +941,7 @@ fn infer_expr_unlocated(
         .ok_or_else(|| AnalyzeError::Unsupported("empty node".into()))?;
 
     let result = match inner {
-        node::Node::ColumnRef(col_ref) => infer_column_ref(col_ref, ctx),
+        node::Node::ColumnRef(col_ref) => infer_column_ref(col_ref, ctx, params),
         node::Node::AConst(a_const) => infer_a_const(a_const),
         node::Node::TypeCast(cast) => match passthrough_cast_operand(node, snapshot, params) {
             Some(operand) => infer_expr(operand, ctx, params, goal.clone()),
