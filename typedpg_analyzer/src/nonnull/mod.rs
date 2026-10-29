@@ -700,6 +700,31 @@ impl Facts {
         f
     }
 
+    /// These facts with entry `from` named `to`. Expression facts name
+    /// entries by the query's text: kept only with `keep_exprs` (`from`
+    /// keeps answering to that text).
+    pub fn renamed(mut self, from: &str, to: &str, keep_exprs: bool) -> Facts {
+        let mv = |c: Col| if c.0 == from { (to.to_owned(), c.1) } else { c };
+        self.columns = self.columns.into_iter().map(mv).collect();
+        self.rels = self
+            .rels
+            .into_iter()
+            .map(|a| if a == from { to.to_owned() } else { a })
+            .collect();
+        self.nulls = self.nulls.into_iter().map(mv).collect();
+        self.disjunctions = self
+            .disjunctions
+            .into_iter()
+            .map(|d| d.into_iter().map(mv).collect())
+            .collect();
+        self.equals = self.equals.into_iter().map(|(c, l)| (mv(c), l)).collect();
+        self.preds = self.preds.into_iter().map(|(c, p)| (mv(c), p)).collect();
+        if !keep_exprs {
+            self.exprs.clear();
+        }
+        self
+    }
+
     pub fn restricted_to(mut self, aliases: &HashSet<String>) -> Facts {
         self.columns.retain(|(a, _)| aliases.contains(a));
         self.rels.retain(|a| aliases.contains(a));

@@ -242,6 +242,79 @@ impl NullabilityContext {
         }
     }
 
+    /// Name entry `from` `to` in everything recorded about it. An entry
+    /// hidden for good (`keep_exprs` false) loses the expression facts of
+    /// the joins it is in and its own: they name it by the query's text,
+    /// which another entry may take up.
+    pub fn rename_alias(&mut self, from: &str, to: &str, keep_exprs: bool) {
+        let name = |a: String| if a == from { to.to_owned() } else { a };
+        let col = |c: Col| if c.0 == from { (to.to_owned(), c.1) } else { c };
+        let set = |s: HashSet<String>| s.into_iter().map(name).collect::<HashSet<_>>();
+        let cols = |s: HashSet<Col>| s.into_iter().map(col).collect::<HashSet<_>>();
+        self.nullable_aliases = set(std::mem::take(&mut self.nullable_aliases));
+        self.forced_rels = set(std::mem::take(&mut self.forced_rels));
+        for j in &mut self.joins {
+            let keep = keep_exprs || !(j.left.contains(from) || j.right.contains(from));
+            j.left = set(std::mem::take(&mut j.left));
+            j.right = set(std::mem::take(&mut j.right));
+            j.on = std::mem::take(&mut j.on).renamed(from, to, keep);
+            if let Some(fk) = &mut j.fk {
+                for (c, _) in &mut fk.child_cols {
+                    *c = col(std::mem::take(c));
+                }
+            }
+            for side in j.full_sides.iter_mut().flatten() {
+                for c in side.iter_mut() {
+                    *c = col(std::mem::take(c));
+                }
+            }
+        }
+        for f in [
+            &mut self.where_facts,
+            &mut self.local_facts,
+            &mut self.having_facts,
+        ] {
+            *f = std::mem::take(f).renamed(from, to, true);
+        }
+        self.level_grouping_omitted = cols(std::mem::take(&mut self.level_grouping_omitted));
+        self.grouping_omitted = cols(std::mem::take(&mut self.grouping_omitted));
+        for c in &mut self.nonnull_agg_inputs {
+            *c = col(std::mem::take(c));
+        }
+        self.merged = std::mem::take(&mut self.merged)
+            .into_iter()
+            .map(|(k, mut m)| {
+                m.left.0 = col(m.left.0);
+                m.right.0 = col(m.right.0);
+                (col(k), m)
+            })
+            .collect();
+        self.aliased = std::mem::take(&mut self.aliased)
+            .into_iter()
+            .map(|(k, (inner, base))| (col(k), (col(inner), base)))
+            .collect();
+        for e in &mut self.checks {
+            if e.alias == from {
+                e.alias = to.to_owned();
+            }
+        }
+        self.origins = std::mem::take(&mut self.origins)
+            .into_iter()
+            .map(|(k, o)| (col(k), o))
+            .collect();
+        for home in self.homes.values_mut() {
+            if home == from {
+                *home = to.to_owned();
+            }
+        }
+        for (alias, facts) in &mut self.entry_facts {
+            let keep = keep_exprs || alias != from;
+            *alias = name(std::mem::take(alias));
+            *facts = std::mem::take(facts).renamed(from, to, keep);
+        }
+        self.recompute();
+    }
+
     /// Register where the columns of entry `alias` come from (their
     /// [`crate::scope::Origin`]s); `home` when the entry is the scan
     /// itself.

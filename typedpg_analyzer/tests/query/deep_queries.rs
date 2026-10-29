@@ -70,3 +70,46 @@ fn too_deep_is_an_error() {
         "{err}"
     );
 }
+
+#[test]
+fn a_self_recursive_view_is_an_error_not_a_crash() {
+    // PG accepts the CREATE OR REPLACE (regress/sql/lock.sql) and fails
+    // the query. The analyzer recursed until the process aborted — inside
+    // `sql!`, rustc itself.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE t (a int);
+         CREATE VIEW v2 AS SELECT a FROM t;
+         CREATE VIEW v3 AS SELECT a FROM v2;
+         CREATE OR REPLACE VIEW v2 AS SELECT a FROM v3;
+         -- A view definition isn't expanded: storing one over the loop is fine.
+         CREATE VIEW v4 AS SELECT * FROM v2;",
+    )
+    .unwrap();
+    // fireRIRrules names the view it meets a second time.
+    for (sql, relation) in [
+        ("SELECT * FROM v2", "v2"),
+        ("SELECT a FROM v3", "v3"),
+        ("SELECT * FROM v4", "v2"),
+        ("SELECT (SELECT a FROM v2)", "v2"),
+        ("SELECT * FROM t WHERE a IN (SELECT a FROM v3)", "v3"),
+        ("SELECT * FROM v2 FOR UPDATE", "v2"),
+        ("UPDATE v2 SET a = 1", "v2"),
+        ("INSERT INTO v2 VALUES (1)", "v2"),
+    ] {
+        let err = db.analyze(sql).expect_err(sql);
+        assert!(
+            matches!(err, AnalyzeError::InvalidObjectDefinition(_)),
+            "{sql}: {err:?}"
+        );
+        assert!(
+            err.to_string().starts_with(&format!(
+                "infinite recursion detected in rules for relation \"{relation}\""
+            )),
+            "{sql}: {err}"
+        );
+    }
+    // A CTE of the same name is no view.
+    db.analyze("WITH v2 AS (SELECT 1 AS a) SELECT * FROM v2")
+        .unwrap();
+}

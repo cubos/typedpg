@@ -39,6 +39,12 @@ pub enum AnalyzeError {
     #[error("{0}")]
     AmbiguousColumn(String),
 
+    /// Several FROM entries of one query level match a qualifier (`table
+    /// reference "t" is ambiguous`). Equivalent to PG `ambiguous_alias`
+    /// (SQLSTATE 42P09).
+    #[error("{0}")]
+    AmbiguousAlias(String),
+
     /// Several function or operator overloads survived every resolution
     /// tiebreak (`operator is not unique`, `function … is not unique`).
     /// Equivalent to PG `ambiguous_function` (SQLSTATE 42725).
@@ -294,6 +300,7 @@ impl AnalyzeError {
             UndefinedTable(_) => Some("42P01"),
             UndefinedColumn(_) => Some("42703"),
             AmbiguousColumn(_) => Some("42702"),
+            AmbiguousAlias(_) => Some("42P09"),
             UndefinedType(_) | UndefinedObject(_) => Some("42704"),
             UndefinedSchema(_) => Some("3F000"),
             FeatureNotSupported(_) => Some("0A000"),
@@ -1313,6 +1320,7 @@ fn replace_message(e: AnalyzeError, rendered: String) -> AnalyzeError {
         AnalyzeError::InvalidLiteral(_) => AnalyzeError::InvalidLiteral(rendered),
         AnalyzeError::UndefinedType(_) => AnalyzeError::UndefinedType(rendered),
         AnalyzeError::AmbiguousColumn(_) => AnalyzeError::AmbiguousColumn(rendered),
+        AnalyzeError::AmbiguousAlias(_) => AnalyzeError::AmbiguousAlias(rendered),
         AnalyzeError::AmbiguousFunction(_) => AnalyzeError::AmbiguousFunction(rendered),
         AnalyzeError::UndefinedObject(_) => AnalyzeError::UndefinedObject(rendered),
         AnalyzeError::WrongObjectType(_) => AnalyzeError::WrongObjectType(rendered),

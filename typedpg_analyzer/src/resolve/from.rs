@@ -13,9 +13,38 @@ pub(crate) fn process_from_clause(
     params: &mut ParamCollector,
 ) -> Result<(), AnalyzeError> {
     for node in from_clause {
+        let (asides, start) = (scope.asides.len(), scope.sources.len());
         with_rows_kept(true, || {
             process_from_item(node, scope, null_ctx, snapshot, cte_scopes, params)
         })?;
+        restore_asides(scope, null_ctx, asides, 0..start)?;
+    }
+    Ok(())
+}
+
+/// Set aside the visible entry named `alias` before a FROM item taking
+/// that name is added (see [`Scope::asides`]).
+fn set_aside(
+    scope: &mut Scope,
+    null_ctx: &mut NullabilityContext,
+    alias: &str,
+    span: Option<crate::error::SourceSpan>,
+) {
+    if let Some(key) = scope.set_aside(alias, span) {
+        null_ctx.rename_alias(alias, &key, true);
+    }
+}
+
+/// The FROM item that started when `scope.asides` had `from` entries is
+/// done, joined to the entries at `beside`: see [`Scope::restore_asides`].
+fn restore_asides(
+    scope: &mut Scope,
+    null_ctx: &mut NullabilityContext,
+    from: usize,
+    beside: std::ops::Range<usize>,
+) -> Result<(), AnalyzeError> {
+    for (key, alias) in scope.restore_asides(from, beside)? {
+        null_ctx.rename_alias(&key, &alias, true);
     }
     Ok(())
 }
@@ -59,6 +88,12 @@ pub(crate) fn process_from_item(
                 .as_ref()
                 .map(|a| a.aliasname.as_str())
                 .unwrap_or(&rv.relname);
+            set_aside(
+                scope,
+                null_ctx,
+                alias,
+                crate::error::SourceSpan::from_node_qname(rv.location),
+            );
 
             // Check CTEs first.
             if rv.schemaname.is_empty()
@@ -110,6 +145,14 @@ pub(crate) fn process_from_item(
             if let Some(class) = snapshot.resolve_table(schema, &rv.relname)
                 && let Some(src) = scope.sources.last_mut()
             {
+                // The rewriter expands the views a statement reads (a view
+                // definition is stored unexpanded).
+                if crate::expr::plan_time_checks()
+                    && let Some(relname) =
+                        crate::ddl::views::view_rule_recursion(snapshot, class.oid)
+                {
+                    return Err(crate::pgmsg::infinite_rule_recursion(&relname).finalize_implicit());
+                }
                 src.lock_error = view_lock_error(class, snapshot);
                 src.partial_scan =
                     !rv.inh && class.relkind == crate::pg_catalog::RelKind::Partitioned;
@@ -376,6 +419,7 @@ pub(crate) fn process_from_item(
                         c.name = alias_name.clone();
                     }
                 }
+                set_aside(scope, null_ctx, alias, None);
                 scope.add_derived(
                     alias,
                     scope_cols,
@@ -443,6 +487,8 @@ pub(crate) fn process_from_item(
             process_tablesample(ts, scope, snapshot, params)?;
         }
         node::Node::JsonTable(jt) => {
+            let alias = jt.alias.as_ref().map_or("json_table", |a| &a.aliasname);
+            set_aside(scope, null_ctx, alias, None);
             process_json_table(jt, scope, null_ctx, snapshot, params)?;
         }
         _ => {
@@ -564,6 +610,7 @@ fn process_range_function(
             .unwrap_or_else(|| "_srf".into()),
     };
     let alias = alias_owned.as_str();
+    set_aside(scope, null_ctx, alias, None);
 
     let arg_scope = srf_arg_scope(scope);
     let log = crate::nonnull::StrictLog::default();
@@ -838,6 +885,7 @@ fn process_join_expr(
             .collect();
         scope.lateral_blocked_aliases.extend(left_aliases);
     }
+    let asides = scope.asides.len();
     let right = SourceSpan::capture(scope, |scope| match &join.rarg {
         Some(rarg) => with_rows_kept(
             kept && matches!(join_type, JoinType::JoinInner | JoinType::JoinRight),
@@ -845,8 +893,9 @@ fn process_join_expr(
         ),
         None => Ok(()),
     });
-    scope.lateral_blocked_aliases = blocked_before;
     let right = right?;
+    restore_asides(scope, null_ctx, asides, left.start..left.end)?;
+    scope.lateral_blocked_aliases = blocked_before;
 
     // Walk the ON clause *before* applying outer-join nullability:
     // PG evaluates `ON` on paired rows where right-side columns are
@@ -1004,7 +1053,9 @@ fn process_join_expr(
         scope.sources.insert(
             left.start,
             crate::scope::TableSource {
-                kind: crate::scope::SourceKind::Join,
+                kind: crate::scope::SourceKind::Join {
+                    using_alias: join.join_using_alias.is_some(),
+                },
                 ..crate::scope::TableSource::derived(&alias, columns)
             },
         );
@@ -1250,7 +1301,18 @@ fn alias_join(
     start: usize,
     end: usize,
 ) -> Result<(), AnalyzeError> {
-    let inner: Vec<crate::scope::TableSource> = scope.sources.drain(start..end).collect();
+    let mut inner: Vec<crate::scope::TableSource> = scope.sources.drain(start..end).collect();
+    // The alias hides the entries inside: their names may be taken again
+    // (`(t a JOIN u b) j, t a`), so the nullability context knows them by
+    // fresh ones from now on.
+    let names: Vec<String> = inner.iter().map(|s| s.alias.clone()).collect();
+    for s in &mut inner {
+        if !crate::scope::is_hidden_alias(&s.alias) {
+            let key = crate::scope::hidden_alias("inner");
+            null_ctx.rename_alias(&s.alias, &key, false);
+            s.rename(&key);
+        }
+    }
     // What each column is inside the join: its nullability follows that
     // column's, as later quals narrow it or reduce the join it's in.
     let inner_cols: Vec<(String, String, bool)> = inner
@@ -1297,16 +1359,39 @@ fn alias_join(
             null_ctx.record_aliased((alias.aliasname.clone(), c.name.clone()), (ia, ic), ibase);
         }
     }
-    scope.shadowed_sources.extend(
-        inner
-            .into_iter()
-            .filter(|s| !crate::scope::is_hidden_alias(&s.alias)),
-    );
+    // Still range-table entries, for PG's `invalid reference to
+    // FROM-clause entry` and the grouping checks — except a `USING (…) AS
+    // x` name, which is no range-table entry's (`missing FROM-clause
+    // entry`). Those an inner aliased join hid are now behind its key.
+    for (s, name) in inner.iter().zip(&names) {
+        for h in scope
+            .shadowed_sources
+            .iter_mut()
+            .filter_map(|s| s.hidden.as_mut())
+        {
+            if &h.join == name {
+                h.join = s.alias.clone();
+            }
+        }
+    }
+    scope
+        .shadowed_sources
+        .extend(inner.into_iter().zip(names).filter_map(|(mut s, name)| {
+            let using_alias =
+                matches!(s.kind, crate::scope::SourceKind::Join { using_alias: true });
+            (!crate::scope::is_hidden_alias(&name) && !using_alias).then(|| {
+                s.hidden = Some(crate::scope::HiddenEntry {
+                    name,
+                    join: alias.aliasname.clone(),
+                });
+                s
+            })
+        }));
     null_ctx.register_origins(&alias.aliasname, &columns, false);
     scope.sources.insert(
         start,
         crate::scope::TableSource {
-            kind: crate::scope::SourceKind::Join,
+            kind: crate::scope::SourceKind::Join { using_alias: false },
             ..crate::scope::TableSource::derived(&alias.aliasname, columns)
         },
     );
@@ -2779,7 +2864,9 @@ pub(crate) fn view_lock_error(
         return None;
     }
     match crate::ddl::views::view_query(snapshot, class.oid)?.node? {
-        node::Node::SelectStmt(s) => pushed_lock_error(&s, snapshot),
+        node::Node::SelectStmt(s) => {
+            crate::ddl::views::expanding_view(class.oid, || pushed_lock_error(&s, snapshot))?
+        }
         _ => None,
     }
 }

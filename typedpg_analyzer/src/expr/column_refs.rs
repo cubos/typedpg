@@ -135,6 +135,7 @@ pub(crate) fn infer_column_ref(
                 && matches!(e, AnalyzeError::UndefinedColumn(_))
                 && let Some(src) = scope.find_source(column)
             {
+                scope.check_refname_unique(column, None)?;
                 return whole_row_ref(src, null_ctx, snapshot);
             }
             // `t.f` naming no column of a FROM entry `t` is the function
@@ -289,6 +290,7 @@ fn infer_star_ref(
             AnalyzeError::Unsupported("unqualified * has no relation — use alias.* instead".into())
         })?;
 
+    scope.check_refname_unique(alias, None)?;
     let source = scope.find_source(alias).ok_or_else(|| {
         AnalyzeError::UndefinedTable(format!("missing FROM-clause entry for table \"{alias}\""))
     })?;

@@ -1607,7 +1607,7 @@ fn check_locking_clause(
             let what = match source.kind {
                 SourceKind::Cte => Some("a WITH query"),
                 SourceKind::Function => Some("a function"),
-                SourceKind::Join => Some("a join"),
+                SourceKind::Join { .. } => Some("a join"),
                 _ => None,
             };
             if let Some(what) = what {

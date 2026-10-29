@@ -706,11 +706,11 @@ fn join_flattening(
 
     /// Where a FROM item's entries are: at `sources[start..]`, or — inside
     /// an aliased join, whose entries PG hides behind the alias — among
-    /// the shadowed entries, by name.
+    /// the shadowed entries that join entry (by its alias) hides, by name.
     #[derive(Clone, Copy)]
-    enum Place {
+    enum Place<'a> {
         Span(usize),
-        Shadowed,
+        Shadowed(&'a str),
     }
 
     struct Ctx<'a> {
@@ -751,14 +751,18 @@ fn join_flattening(
     /// The output columns of FROM item `n` (PG's join output order: the
     /// USING columns, then the left side's others, then the right side's),
     /// recording what the USING and aliased-join columns stand for.
-    fn item(n: &protobuf::Node, place: Place, cx: &mut Ctx<'_>) -> Option<Vec<OutColumn>> {
+    fn item<'a>(n: &protobuf::Node, place: Place<'a>, cx: &mut Ctx<'a>) -> Option<Vec<OutColumn>> {
+        let hidden = |shadowed: &'a [TableSource], join: &str, name: &str| {
+            shadowed.iter().find(|s| {
+                s.hidden
+                    .as_ref()
+                    .is_some_and(|h| h.join == join && h.name == name)
+            })
+        };
         let node::Node::JoinExpr(j) = n.node.as_ref()? else {
             let source = match place {
                 Place::Span(start) => cx.sources.get(start)?,
-                Place::Shadowed => {
-                    let name = entry_name(n)?;
-                    cx.shadowed.iter().rev().find(|s| s.alias == name)?
-                }
+                Place::Shadowed(join) => hidden(cx.shadowed, join, &entry_name(n)?)?,
             };
             return Some(
                 source
@@ -781,8 +785,14 @@ fn join_flattening(
         let using = crate::expr::extract_string_fields(&j.using_clause);
         // An aliased join's entries are behind its alias; its own entry is
         // where the join is.
-        let (inner, merged_at) = match (j.alias.as_ref(), place) {
-            (Some(_), _) | (None, Place::Shadowed) => (Place::Shadowed, None),
+        let alias_entry: Option<&'a TableSource> = match (j.alias.as_ref(), place) {
+            (None, _) => None,
+            (Some(_), Place::Span(at)) => Some(cx.sources.get(at)?),
+            (Some(a), Place::Shadowed(join)) => Some(hidden(cx.shadowed, join, &a.aliasname)?),
+        };
+        let (inner, merged_at) = match (alias_entry, place) {
+            (Some(entry), _) => (Place::Shadowed(&entry.alias), None),
+            (None, Place::Shadowed(join)) => (Place::Shadowed(join), None),
             (None, Place::Span(start)) => {
                 let left = start + usize::from(!using.is_empty());
                 (Place::Span(left), (!using.is_empty()).then_some(start))
@@ -790,7 +800,7 @@ fn join_flattening(
         };
         let right_place = match inner {
             Place::Span(left) => Place::Span(left + count(larg)?),
-            Place::Shadowed => Place::Shadowed,
+            shadowed => shadowed,
         };
         let left = item(larg, inner, cx)?;
         let right = item(rarg, right_place, cx)?;
@@ -798,13 +808,6 @@ fn join_flattening(
         let merged_entry: Option<&TableSource> = match merged_at {
             Some(at) => Some(cx.sources.get(at)?),
             None => None,
-        };
-        let alias_entry: Option<&TableSource> = match (j.alias.as_ref(), place) {
-            (None, _) => None,
-            (Some(_), Place::Span(at)) => Some(cx.sources.get(at)?),
-            (Some(a), Place::Shadowed) => {
-                Some(cx.shadowed.iter().rev().find(|s| s.alias == a.aliasname)?)
-            }
         };
         for (i, name) in using.iter().enumerate() {
             let find = |side: &[OutColumn]| side.iter().find(|c| &c.0 == name).cloned();
@@ -844,7 +847,7 @@ fn join_flattening(
         if let (Some(alias), Some(entry)) = (j.alias.as_ref(), alias_entry) {
             // The aliased join's entry: its columns, renamed by the alias'
             // column list, stand for the join's output columns.
-            if entry.alias != alias.aliasname || entry.columns.len() != output.len() {
+            if entry.refname() != alias.aliasname || entry.columns.len() != output.len() {
                 return None;
             }
             let renamed: Vec<OutColumn> = entry
@@ -2208,8 +2211,16 @@ impl UngroupedCheck<'_> {
         if self.fully_grouped.contains(alias) {
             return Ok(());
         }
-        // A JOIN USING column reads as the join side PG flattens it to.
-        let shown_alias = if crate::scope::is_hidden_alias(alias) {
+        // An entry an aliased join hides goes by its name; a JOIN USING
+        // column reads as the join side PG flattens it to.
+        let hidden = self
+            .scope
+            .shadowed_sources
+            .iter()
+            .find(|s| s.alias == alias && s.hidden.is_some());
+        let shown_alias = if let Some(s) = hidden {
+            s.refname()
+        } else if crate::scope::is_hidden_alias(alias) {
             col.and_then(|c| {
                 self.scope
                     .sources

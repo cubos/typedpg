@@ -2022,10 +2022,75 @@ pub(crate) fn reanalyze_view(
     let stored = snapshot.view_references.get(&relid)?;
     let query = view_query(snapshot, relid)?;
     let inner = query.node.as_ref()?;
-    let (analyzed, references) =
-        super::depend::collect(|| crate::resolve::analyze_raw_node(snapshot, inner, &[]));
+    let (analyzed, references) = expanding_view(relid, || {
+        super::depend::collect(|| crate::resolve::analyze_raw_node(snapshot, inner, &[]))
+    })?;
     let (columns, _) = analyzed.ok()?;
     (bound_references(snapshot, &references) == *stored).then_some(columns)
+}
+
+thread_local! {
+    /// The views whose stored query is being looked into, outermost first.
+    static EXPANDING_VIEWS: std::cell::RefCell<Vec<PgClassOid>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Run `f` looking into view `relid`'s stored query — `None` when that
+/// query is already being looked into: views made to read each other
+/// (`CREATE OR REPLACE VIEW` can close the loop) would recurse forever.
+/// A statement reading such a view fails ([`view_rule_recursion`]); a
+/// definition merely naming one is stored as PG stores it.
+pub(crate) fn expanding_view<R>(relid: PgClassOid, f: impl FnOnce() -> R) -> Option<R> {
+    if EXPANDING_VIEWS.with(|v| v.borrow().contains(&relid)) {
+        return None;
+    }
+    EXPANDING_VIEWS.with(|v| v.borrow_mut().push(relid));
+    let out = f();
+    EXPANDING_VIEWS.with(|v| v.borrow_mut().pop());
+    Some(out)
+}
+
+/// The rewriter's `fireRIRrules`: expanding view `relid` in a statement,
+/// and the views its query reads in turn, depth first in the order the
+/// query names them, reaches a view already being expanded — the
+/// relation PG names in `infinite recursion detected in rules for
+/// relation "…"`.
+pub(crate) fn view_rule_recursion(snapshot: &PgCatalog, relid: PgClassOid) -> Option<String> {
+    /// `done`: views whose expansion reached no loop (none reachable from
+    /// them can then close one), each walked once.
+    fn walk(
+        snapshot: &PgCatalog,
+        relid: PgClassOid,
+        active: &mut Vec<PgClassOid>,
+        done: &mut std::collections::HashSet<PgClassOid>,
+    ) -> Option<String> {
+        let class = snapshot.pg_class.get(&relid)?;
+        if class.relkind != RelKind::View || done.contains(&relid) {
+            return None;
+        }
+        if active.contains(&relid) {
+            return Some(class.relname.clone());
+        }
+        active.push(relid);
+        let found = snapshot
+            .view_references
+            .get(&relid)
+            .into_iter()
+            .flatten()
+            .find_map(|r| match r {
+                super::depend::Reference::Object(a) if a.classid == PG_CLASS_RELID => walk(
+                    snapshot,
+                    PgClassOid::from_nonzero(a.objid.into_nonzero()),
+                    active,
+                    done,
+                ),
+                _ => None,
+            });
+        active.pop();
+        done.insert(relid);
+        found
+    }
+    walk(snapshot, relid, &mut Vec::new(), &mut Default::default())
 }
 
 /// Whether reading view `relid` locks rows: its query, or that of a view
