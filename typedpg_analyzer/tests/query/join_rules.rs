@@ -469,6 +469,25 @@ fn a_using_join_alias_under_an_outer_alias_is_missing() {
     assert_cols(&s, vec![c("id", int4())]);
     db.analyze("SELECT * FROM (t JOIN u USING (id) AS x) xx, (t JOIN u USING (id) AS x) yy")
         .unwrap();
+    // Nor does it conflict with a visible `x` beside the aliased join, on
+    // either side; `x` is then that entry.
+    for sql in [
+        "SELECT x.a FROM t x, (t JOIN u USING (id) AS x) j",
+        "SELECT x.a FROM (t JOIN u USING (id) AS x) j, t x",
+        "SELECT x.a FROM t x JOIN (t JOIN u USING (id) AS x) j ON true",
+        "SELECT x.a FROM (t JOIN u USING (id) AS x) j JOIN t x ON true",
+    ] {
+        let s = db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        assert_cols(&s, vec![c("a", int4())]);
+    }
+    // Unaliased, the join exposes it.
+    for sql in [
+        "SELECT 1 FROM t x, (t JOIN u USING (id) AS x)",
+        "SELECT 1 FROM (t JOIN u USING (id) AS x), t x",
+        "SELECT 1 FROM t x JOIN (t JOIN u USING (id) AS x) ON true",
+    ] {
+        assert_err_starts_with(&db, sql, "table name \"x\" specified more than once");
+    }
 }
 
 #[test]

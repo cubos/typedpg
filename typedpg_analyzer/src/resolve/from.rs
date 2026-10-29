@@ -1030,9 +1030,17 @@ fn process_join_expr(
                 c
             })
             .collect();
-        if scope.sources.iter().any(|s| s.alias == alias) {
+        // PG checks the name against the join's own namespace only
+        // (`checkNameSpaceConflicts` with `my_namespace`); an outer entry
+        // of that name is set aside, to conflict only if the join still
+        // exposes it (`t x, (t JOIN u USING (id) AS x) j` is fine).
+        if scope.sources[left.start..right.end]
+            .iter()
+            .any(|s| s.alias == alias)
+        {
             return Err(crate::pgmsg::duplicate_table_alias(&alias, None).finalize_implicit());
         }
+        set_aside(scope, null_ctx, &alias, None);
         null_ctx.record_merged(
             parts
                 .into_iter()
