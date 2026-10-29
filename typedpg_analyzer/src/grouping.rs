@@ -592,6 +592,8 @@ struct NsSource {
     alias: String,
     /// The columns an unqualified reference reaches.
     visible: HashSet<String>,
+    /// The columns a qualified reference reaches.
+    all: HashSet<String>,
 }
 
 impl Namespace {
@@ -607,6 +609,12 @@ impl Namespace {
                         .chain(s.system_columns.iter().filter(|_| !s.table_only))
                         .map(|c| c.name.clone())
                         .collect(),
+                    all: s
+                        .columns
+                        .iter()
+                        .chain(&s.system_columns)
+                        .map(|c| c.name.clone())
+                        .collect(),
                 })
                 .collect(),
         }
@@ -614,6 +622,14 @@ impl Namespace {
 
     fn has_alias(&self, alias: &str) -> bool {
         self.sources.iter().any(|s| s.alias == alias)
+    }
+
+    /// Whether entry `alias` has a column `col` a qualified reference
+    /// reaches.
+    fn has_column(&self, alias: &str, col: &str) -> bool {
+        self.sources
+            .iter()
+            .any(|s| s.alias == alias && s.all.contains(col))
     }
 
     /// What column `key` of this level stands for once JOIN USING columns
@@ -944,6 +960,42 @@ impl Chain {
             }
             _ => None,
         }
+    }
+
+    /// For a qualified reference `t.f` naming no column of its entry, the
+    /// function `f` it calls on the entry's whole row (column notation, as
+    /// the expression analysis resolved it) and that whole-row reference
+    /// (`t.*`).
+    fn column_notation(&self, cr: &protobuf::ColumnRef) -> Option<(String, protobuf::Node)> {
+        let (last, prefix) = cr.fields.split_last()?;
+        let Some(node::Node::String(f)) = last.node.as_ref() else {
+            return None;
+        };
+        let Some(node::Node::String(table)) = prefix.last()?.node.as_ref() else {
+            return None;
+        };
+        let RefTarget {
+            level,
+            target: Some((alias, Some(_))),
+        } = self.resolve(cr)?
+        else {
+            return None;
+        };
+        let ns = self.0.get(level)?.as_ref()?;
+        if alias != table.sval || ns.has_column(&alias, &f.sval) {
+            return None;
+        }
+        let mut fields = prefix.to_vec();
+        fields.push(protobuf::Node {
+            node: Some(node::Node::AStar(protobuf::AStar {})),
+        });
+        let whole_row = protobuf::Node {
+            node: Some(node::Node::ColumnRef(protobuf::ColumnRef {
+                fields,
+                location: cr.location,
+            })),
+        };
+        Some((f.sval.clone(), whole_row))
     }
 
     fn enter(&mut self, ns: Rc<Namespace>) {
@@ -1420,6 +1472,7 @@ fn canonical(
     snapshot: &PgCatalog,
 ) -> protobuf::Node {
     use typedpg_pg_query::{NodeMut, NodeRef};
+    let node = &column_notation_calls(node, chain);
     let stripped;
     let node = match scope {
         Some(scope) => {
@@ -1490,6 +1543,31 @@ fn canonical(
         .and_then(|s| s.stmt)
         .map(|b| *b)
         .unwrap_or_default()
+}
+
+/// `node` with each column notation `t.f` of its level (not inside its
+/// sublinks) written as the call `f(t.*)` it stands for, so both spellings
+/// compare equal.
+fn column_notation_calls(node: &protobuf::Node, chain: &Chain) -> protobuf::Node {
+    let mut out = node.clone();
+    out.rewrite(
+        &mut |n| !matches!(n.node, Some(node::Node::SelectStmt(_))),
+        &mut |n| {
+            if let Some(node::Node::ColumnRef(cr)) = n.node.as_ref()
+                && let Some((name, whole_row)) = chain.column_notation(cr)
+            {
+                let call = protobuf::FuncCall {
+                    funcname: vec![string_node(&name)],
+                    args: vec![whole_row],
+                    funcformat: protobuf::CoercionForm::CoerceExplicitCall as i32,
+                    location: cr.location,
+                    ..Default::default()
+                };
+                n.node = Some(node::Node::FuncCall(Box::new(call)));
+            }
+        },
+    );
+    out
 }
 
 /// The name [`canonical`] gives a reference to column `column` of `alias`.
@@ -1933,6 +2011,7 @@ impl GroupExprs {
                     level: 0,
                     target: Some((alias, Some(col))),
                 }) = own.resolve(cr)
+                && own.column_notation(cr).is_none()
             {
                 out.add_column((alias, col), ns);
                 continue;
@@ -2044,6 +2123,11 @@ impl UngroupedCheck<'_> {
                 }) = chain.resolve(cr)
                     && level == depth
                 {
+                    // Column notation `t.f` is the call `f(t.*)`: it reads
+                    // the whole row.
+                    if let Some((_, whole_row)) = chain.column_notation(cr) {
+                        return self.expr(&whole_row, depth, chain);
+                    }
                     let named = match col {
                         Some(col) => vec![col],
                         // A whole row coerced to a composite is its columns.

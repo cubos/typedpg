@@ -401,6 +401,58 @@ fn functional_notation_calls_a_function_of_the_row() {
     );
 }
 
+/// The grouping checks see column notation `t.f` as the call `f(t.*)` it
+/// is: it reads the whole row, and matches a GROUP BY entry spelled either
+/// way.
+#[test]
+fn functional_notation_under_group_by() {
+    let mut db = setup();
+    db.apply_sql(
+        "CREATE TABLE person (name text);
+         CREATE TABLE pk (id int PRIMARY KEY, name text);
+         CREATE FUNCTION upname(person) RETURNS text
+             AS 'select upper($1.name)' LANGUAGE sql;
+         CREATE FUNCTION upname(pk) RETURNS text
+             AS 'select upper($1.name)' LANGUAGE sql;",
+    )
+    .unwrap();
+    for sql in [
+        "SELECT p.upname FROM person p GROUP BY p",
+        "SELECT p.upname FROM person p GROUP BY p.upname",
+        "SELECT upname(p) FROM person p GROUP BY p.upname",
+        "SELECT p.upname FROM person p GROUP BY upname(p)",
+        "SELECT k.upname FROM pk k GROUP BY k.id",
+    ] {
+        let s = db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        assert_cols(&s, vec![cn("upname", text())]);
+    }
+    for (sql, msg) in [
+        (
+            "SELECT p.upname FROM person p GROUP BY p.name",
+            "column \"p.*\" must appear in the GROUP BY clause or be used in an aggregate function",
+        ),
+        (
+            "SELECT p FROM person p GROUP BY p.upname",
+            "column \"p.*\" must appear in the GROUP BY clause or be used in an aggregate function",
+        ),
+        (
+            "SELECT p.name FROM person p GROUP BY p.upname",
+            "column \"p.name\" must appear in the GROUP BY clause or be used in an aggregate function",
+        ),
+        (
+            "SELECT 1 FROM person p GROUP BY p.name HAVING p.upname = 'x'",
+            "column \"p.*\" must appear in the GROUP BY clause or be used in an aggregate function",
+        ),
+    ] {
+        assert_err_kind!(db, sql, AnalyzeError::GroupingError(_), msg);
+    }
+    assert_err_starts_with(
+        &db,
+        "SELECT (SELECT p.upname) FROM person p GROUP BY p.name",
+        "subquery uses ungrouped column \"p.*\" from outer query",
+    );
+}
+
 #[test]
 fn variadic_any_argument_must_be_an_array() {
     let db = setup();
