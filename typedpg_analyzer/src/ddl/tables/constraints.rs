@@ -1241,10 +1241,13 @@ pub(crate) fn drop_constraint(
 
     // A local constraint whose index a plain partitioned index adopted:
     // the index goes only with its parent index (findDependentObjects,
-    // DEPENDENCY_PARTITION_PRI).
+    // DEPENDENCY_PARTITION_PRI). The index shares the constraint's name,
+    // but a constraint without an index (a foreign key) may share an
+    // unrelated index's name: the index must back this very constraint.
     if !rec.recursing
         && let Some(nsoid) = interp.pg_class.get(&relid).map(|c| c.relnamespace)
         && let Some(&idx_oid) = interp.class_by_qname.get(&(nsoid, conname.clone()))
+        && super::partidx::backing_constraint(interp, idx_oid).is_some_and(|c| c.oid == oid)
         && let Some(parent) = super::partidx::parent_index_of(interp, idx_oid)
     {
         let parent_name = interp

@@ -1750,7 +1750,12 @@ fn an_adopted_constraint_index_goes_with_its_parent_index() {
     );
     assert_accepted(
         setup,
-        &["ALTER TABLE b DETACH PARTITION bp; ALTER TABLE bp DROP CONSTRAINT k;"],
+        &[
+            "ALTER TABLE b DETACH PARTITION bp; ALTER TABLE bp DROP CONSTRAINT k;",
+            // Another table's constraint of the same name has no index.
+            "CREATE TABLE c (x int, CONSTRAINT k FOREIGN KEY (x) REFERENCES bp (a));
+             ALTER TABLE c DROP CONSTRAINT k;",
+        ],
     );
     // CASCADE takes the constraint along.
     let db = build_db(&[("0001.sql", setup), ("0002.sql", "DROP INDEX bi CASCADE;")]);
