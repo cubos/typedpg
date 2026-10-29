@@ -806,6 +806,67 @@ fn param_as_element_in_any_lhs() {
     assert_params(&info, vec![p(text())]);
 }
 
+#[test]
+fn any_of_a_param_against_an_unknown_is_an_array() {
+    // `1 = ANY($1)` gets int4[]; with an unknown or a parameter on the
+    // left, PG still deduces text[] for the array operand: the unknown
+    // resolves to text, and the right side is the array of that.
+    let db = empty_db();
+    assert_param_types(&db, "SELECT 'a' = ANY($1)", &[array_of(text())]);
+    assert_param_types(&db, "SELECT $1 = ANY($2)", &[text(), array_of(text())]);
+    assert_param_types(&db, "SELECT $1 = ALL($2)", &[text(), array_of(text())]);
+    assert_param_types(&db, "SELECT 1 = ANY($1)", &[array_of(int4())]);
+    assert_param_types(&db, "SELECT 'a' < ANY($1)", &[array_of(text())]);
+    assert_param_types(&db, "SELECT 'a' <> ALL($1)", &[array_of(text())]);
+    // The array is of the operator's declared right type: varchar has no
+    // `=` of its own, `text = text` is chosen.
+    assert_param_types(&db, "SELECT 'a'::varchar = ANY($1)", &[array_of(text())]);
+    assert_param_types(&db, "SELECT $1 = ANY('{a}'::varchar[])", &[text()]);
+    assert_param_types(&db, "SELECT 1::int8 = ANY($1)", &[array_of(int8())]);
+    for (sql, msg) in [
+        (
+            "SELECT $1 = ANY($1)",
+            "inconsistent types deduced for parameter $1",
+        ),
+        (
+            "SELECT $1 + ANY($2)",
+            "operator is not unique: unknown + unknown",
+        ),
+        (
+            "SELECT 1 || ANY($1)",
+            "op ANY/ALL (array) requires operator to yield boolean",
+        ),
+        (
+            "SELECT '{}'::jsonb ~~ ANY($1)",
+            "operator does not exist: jsonb ~~ unknown",
+        ),
+        (
+            "SELECT 1 = ANY('{a}')",
+            "invalid input syntax for type integer: \"a\"",
+        ),
+    ] {
+        let err = db.analyze(sql).unwrap_err();
+        assert!(err.to_string().starts_with(msg), "`{sql}`: got: {err}");
+    }
+}
+
+#[test]
+fn any_over_a_domain_array_names_the_base_type() {
+    // A domain over int[] is an array only through its base: PG looks up
+    // the array of the base type for the parameter and reports `integer[]`.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE DOMAIN da AS int[]; CREATE TABLE t (c da);")
+        .unwrap();
+    let err = db.analyze("SELECT * FROM t WHERE c = ANY($1)").unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("could not find array type for data type integer[]"),
+        "got: {err}"
+    );
+    // The array itself is a fine ANY operand.
+    db.analyze("SELECT * FROM t WHERE 1 = ANY(c)").unwrap();
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Tests: mixed param types across the query (migrated from identical/nullability)
 // ──────────────────────────────────────────────────────────────────────────────
@@ -957,6 +1018,149 @@ fn bare_param_in_null_test_is_indeterminate() {
     );
     // …but a use typed *before* the null test is fine.
     db.analyze("SELECT $p1 = 1, $p1 IS NULL").unwrap();
+}
+
+#[test]
+fn inconsistent_parameter_types_are_rejected() {
+    // Every `$1` transformed while its type is still unknown stays an
+    // unknown node; coercing two of them to different types fails PG's
+    // `variable_coerce_param_hook` (42P08).
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE a (id int PRIMARY KEY, x int NOT NULL DEFAULT 0, y text, d date);")
+        .unwrap();
+    for sql in [
+        "INSERT INTO a (id, y) VALUES ($1, $1)",
+        "UPDATE a SET x = $1, y = $1",
+        "UPDATE a SET (x, y) = ($1, $1)",
+        "SELECT ($1, $2) = (1, $1)",
+        "UPDATE a SET y = $1, d = $1",
+        "UPDATE a SET y = $1, x = $1::int",
+        "SELECT ($1, $2) IS DISTINCT FROM (1, $1)",
+        "INSERT INTO a (id, y) VALUES ($1, $1 || 'a')",
+        "DELETE FROM a RETURNING $1, $1::int",
+        "UPDATE a SET y = $1 RETURNING $1, $1::int",
+    ] {
+        let err = db.analyze(sql).unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("inconsistent types deduced for parameter $1"),
+            "`{sql}`: got: {err}"
+        );
+    }
+    // Once the type is set, a later `$1` is a typed parameter that casts or
+    // coerces like any other expression.
+    assert_param_types(&db, "INSERT INTO a (id, x) VALUES ($1, $1)", &[int4()]);
+    assert_param_types(&db, "SELECT $1::int, $1::text", &[int4()]);
+    assert_param_types(&db, "SELECT $1::varchar, $1::text", &[varchar()]);
+    assert_param_types(&db, "UPDATE a SET x = $1 WHERE id = $1", &[int4()]);
+    assert_param_types(&db, "INSERT INTO a (id, y) VALUES ($1::int, $1)", &[int4()]);
+    assert_param_types(
+        &db,
+        "INSERT INTO a (id, x) VALUES (1, $1), (2, $1)",
+        &[int4()],
+    );
+    assert_param_types(&db, "SELECT ($1, 1) = ($1, 2)", &[text()]);
+    assert_param_types(
+        &db,
+        "INSERT INTO a (id, y) VALUES ($1, 'a') ON CONFLICT (id) DO UPDATE SET y = $1, x = $1",
+        &[int4()],
+    );
+}
+
+#[test]
+fn parameter_types_follow_pg_clause_order() {
+    // PG transforms a SELECT's target list before WHERE / HAVING / ORDER
+    // BY / LIMIT, and an UPDATE's FROM, WHERE and RETURNING before its SET:
+    // the first clause to type `$1` wins.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE a (id int PRIMARY KEY, x int NOT NULL DEFAULT 0, y text);")
+        .unwrap();
+    for sql in [
+        "SELECT $1::int FROM a WHERE y = $1",
+        "SELECT $1 + 1 FROM a WHERE y = $1",
+        "SELECT $1::int FROM a ORDER BY y = $1",
+        "SELECT $1::int FROM a GROUP BY y HAVING y = $1",
+        "SELECT (SELECT $1::int) FROM a WHERE y = $1",
+        "SELECT count(*) FROM a GROUP BY y = $1 HAVING $1::int > 0",
+    ] {
+        let err = db.analyze(sql).unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("operator does not exist: text = integer"),
+            "`{sql}`: got: {err}"
+        );
+    }
+    assert_param_types(&db, "SELECT $1::int FROM a LIMIT $1", &[int4()]);
+    assert_param_types(&db, "SELECT y = $1 FROM a WHERE $1::int = 1", &[text()]);
+    assert_param_types(&db, "UPDATE a SET y = $1 RETURNING $1::int", &[int4()]);
+    assert_param_types(&db, "UPDATE a SET y = $1 WHERE x = $1", &[int4()]);
+    assert_param_types(&db, "UPDATE a SET y = $1 RETURNING $1 + 1", &[int4()]);
+    assert_param_types(
+        &db,
+        "UPDATE a SET y = $1 FROM a b WHERE b.x = $1",
+        &[int4()],
+    );
+    // INSERT transforms its VALUES before RETURNING.
+    assert_param_types(
+        &db,
+        "INSERT INTO a (id, y) VALUES (1, $1) RETURNING $1::int",
+        &[text()],
+    );
+    // OFFSET comes before LIMIT.
+    assert_param_types(&db, "SELECT 1 FROM a LIMIT $1::int OFFSET $1", &[int8()]);
+    assert_param_types(&db, "SELECT 1 FROM a LIMIT $1 OFFSET $1::int", &[int4()]);
+    let err = db
+        .analyze("SELECT 1 FROM a ORDER BY y = $1 OFFSET $1")
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("argument of OFFSET must be type bigint, not type text"),
+        "got: {err}"
+    );
+    // RETURNING resolves a bare `$1` as text before the SET list is coerced.
+    let err = db.analyze("UPDATE a SET x = $1 RETURNING $1").unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with(r#"column "x" is of type integer but expression is of type text"#),
+        "got: {err}"
+    );
+    assert_param_types(&db, "UPDATE a SET y = $1 RETURNING $1", &[text()]);
+    // A null test in the select list locks `$1` untyped before WHERE.
+    let err = db
+        .analyze("SELECT $1 IS NULL FROM a WHERE x = $1")
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("could not determine data type of parameter $1"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn record_arguments_reject_unknown_literals() {
+    // A `record` parameter takes no unknown literal (`record_in` refuses an
+    // anonymous composite), but a `$n` there is typed `record`.
+    let db = empty_db();
+    for sql in ["SELECT row_to_json('1')", "SELECT hash_record('1')"] {
+        let err = db.analyze(sql).unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("input of anonymous composite types is not implemented"),
+            "`{sql}`: got: {err}"
+        );
+    }
+    assert_param_types(
+        &db,
+        "SELECT hash_record($1)",
+        &[basic("pg_catalog", "record")],
+    );
+    assert_param_types(
+        &db,
+        "SELECT row_to_json($1)",
+        &[basic("pg_catalog", "record")],
+    );
+    db.analyze("SELECT row_to_json(NULL)").unwrap();
+    db.analyze("SELECT row_to_json(ROW(1, 'a'))").unwrap();
 }
 
 #[test]

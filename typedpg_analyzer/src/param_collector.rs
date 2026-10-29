@@ -186,16 +186,46 @@ impl ParamCollector {
         param_num: i32,
         f: impl FnOnce(&mut ParamCollector) -> T,
     ) -> (T, PgTypeOid) {
+        let (out, deduced) = self.with_params_untyped(&[param_num], f);
+        (out, deduced[0])
+    }
+
+    /// [`Self::with_param_untyped`] for several parameters at once (the two
+    /// operands of one row-comparison column, both still-`unknown` nodes):
+    /// returns the type the copy deduced for each of `param_nums`, in order.
+    pub fn with_params_untyped<T>(
+        &mut self,
+        param_nums: &[i32],
+        f: impl FnOnce(&mut ParamCollector) -> T,
+    ) -> (T, Vec<PgTypeOid>) {
         let mut scratch = self.clone();
-        scratch.constraints.remove(&param_num);
+        for n in param_nums {
+            scratch.constraints.remove(n);
+        }
         let out = f(&mut scratch);
-        let deduced = scratch.get(param_num);
-        match self.constraints.get(&param_num) {
-            Some(&t) => scratch.constraints.insert(param_num, t),
-            None => scratch.constraints.remove(&param_num),
-        };
+        let deduced = param_nums.iter().map(|&n| scratch.get(n)).collect();
+        for &n in param_nums {
+            match self.constraints.get(&n) {
+                Some(&t) => scratch.constraints.insert(n, t),
+                None => scratch.constraints.remove(&n),
+            };
+        }
         *self = scratch;
         (out, deduced)
+    }
+
+    /// Keep the parameter types a scratch copy of this collector deduced
+    /// (and the parameters it locked untyped), where the analyzer replays a
+    /// clause on a copy at the point PG transforms it — before clauses the
+    /// analyzer itself walks first (see [`crate::expr::replay_transform`]).
+    /// Nothing else the copy recorded (nullability, reads) is kept.
+    pub fn adopt_types(&mut self, scratch: &ParamCollector) {
+        for (&n, &t) in &scratch.constraints {
+            self.seen.insert(n);
+            self.constraints.entry(n).or_insert(t);
+        }
+        self.indeterminate_locked
+            .extend(scratch.indeterminate_locked.iter().copied());
     }
 
     /// Remember that the bare `$N` output column at `location` was

@@ -430,25 +430,6 @@ fn analyze_select_here(
         })
         .collect();
 
-    // Process GROUP BY expressions — no type expectation, but we still need
-    // to walk them so any parameters referenced are collected and typed
-    // and column refs validated. `GroupingSet` nodes (`GROUPING SETS` /
-    // `ROLLUP` / `CUBE`) are not real expressions; recurse into their
-    // `content` to reach the underlying column references and
-    // aggregate-rejection checks.
-    grouping::with_clause(Some("GROUP BY"), || {
-        for group_node in &sel.group_clause {
-            walk_group_clause_node(
-                group_node,
-                expr::Ctx::new(&scope, &null_ctx, snapshot),
-                params,
-                &select_aliases,
-                &targets,
-            )?;
-        }
-        Ok::<(), AnalyzeError>(())
-    })?;
-
     // Process HAVING clause — same boolean goal as WHERE, but aggregates
     // are of course allowed there.
     if let Some(having) = &sel.having_clause {
@@ -524,6 +505,27 @@ fn analyze_select_here(
         }
     }
 
+    // Process GROUP BY expressions — after ORDER BY, as transformSelectStmt
+    // does (the first clause to type a `$N` fixes its type) — no type
+    // expectation, but we still need
+    // to walk them so any parameters referenced are collected and typed
+    // and column refs validated. `GroupingSet` nodes (`GROUPING SETS` /
+    // `ROLLUP` / `CUBE`) are not real expressions; recurse into their
+    // `content` to reach the underlying column references and
+    // aggregate-rejection checks.
+    grouping::with_clause(Some("GROUP BY"), || {
+        for group_node in &sel.group_clause {
+            walk_group_clause_node(
+                group_node,
+                expr::Ctx::new(&scope, &null_ctx, snapshot),
+                params,
+                &select_aliases,
+                &targets,
+            )?;
+        }
+        Ok::<(), AnalyzeError>(())
+    })?;
+
     // Process `DISTINCT ON (…)` expressions the same way — they resolve
     // like ORDER BY items (select-list aliases allowed). A plain `DISTINCT`
     // parses as a single empty node; skip it. Without this walk, a `$N`
@@ -583,9 +585,9 @@ fn analyze_select_here(
     }
     // The WINDOW clause's own definitions, and the inline windows that
     // inherit from them (PG's transformWindowDefinitions).
-    expr::check_window_clause(sel, expr::Ctx::new(&scope, &null_ctx, snapshot), params)?;
-
+    // PG transforms OFFSET / LIMIT before the WINDOW clause.
     analyze_limit_offset(sel, expr::Ctx::new(&scope, &null_ctx, snapshot), params)?;
+    expr::check_window_clause(sel, expr::Ctx::new(&scope, &null_ctx, snapshot), params)?;
 
     // Resolve target list (SELECT expressions) — no type expectation.
     let (mut columns, explicit_collations) = resolve_target_list_explicit(
@@ -1693,13 +1695,14 @@ pub(crate) fn analyze_limit_offset(
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<(), AnalyzeError> {
+    // transformSelectStmt: OFFSET first.
     for (limit_node, kind, label) in [
-        (&sel.limit_count, crate::clause::ClauseKind::Limit, "LIMIT"),
         (
             &sel.limit_offset,
             crate::clause::ClauseKind::Offset,
             "OFFSET",
         ),
+        (&sel.limit_count, crate::clause::ClauseKind::Limit, "LIMIT"),
     ] {
         let Some(limit_node) = limit_node else {
             continue;

@@ -41,7 +41,109 @@ pub(crate) fn resolve_returning(
     let Some(clause) = clause else {
         return Ok(Vec::new());
     };
-    let mut scope = ctx.scope.clone();
+    let scope = returning_scope(clause, target_alias, &rows, ctx.scope)?;
+
+    // EXPR_KIND_RETURNING / EXPR_KIND_MERGE_RETURNING.
+    for target in &clause.exprs {
+        if let Some(node::Node::ResTarget(rt)) = target.node.as_ref()
+            && let Some(val) = &rt.val
+        {
+            crate::clause::check_no_aggregates_or_windows(val, ctx.snapshot, "RETURNING")?;
+            check_no_srf_in_clause(val, ctx.snapshot, "RETURNING")?;
+        }
+    }
+    // (Only a bare `$N` changes anything here: any other parameter is typed
+    // alike by the walk below.)
+    let bare_param = |t: &protobuf::Node| {
+        matches!(t.node.as_ref(), Some(node::Node::ResTarget(rt))
+            if matches!(rt.val.as_deref().and_then(|v| v.node.as_ref()), Some(node::Node::ParamRef(_))))
+    };
+    if clause.exprs.iter().any(bare_param) {
+        resolve_unknown_returning_params(
+            clause,
+            expr::Ctx::new(&scope, ctx.null_ctx, ctx.snapshot),
+            params,
+        )?;
+    }
+
+    let columns = crate::grouping::with_clause(Some("RETURNING"), || {
+        resolve_target_list(
+            &clause.exprs,
+            expr::Ctx::new(&scope, ctx.null_ctx, ctx.snapshot),
+            params,
+        )
+    })?;
+    // A nonempty list that expanded to nothing (stars over a zero-column
+    // table) would read as "no RETURNING".
+    if columns.is_empty()
+        && let Some(first) = clause.exprs.first()
+    {
+        let span =
+            crate::error::node_location(first).and_then(crate::error::SourceSpan::from_node_token);
+        return Err(crate::pgmsg::returning_without_columns(span).finalize_implicit());
+    }
+    // transformReturningClause's resolveTargetListUnknowns.
+    super::select::resolve_unknown_values(&clause.exprs, &columns, ctx.snapshot)?;
+    Ok(columns)
+}
+
+/// The parameter types RETURNING deduces, where PG transforms it before
+/// the analyzer resolves it: ahead of an UPDATE's SET list
+/// (transformUpdateStmt). Errors are left to [`resolve_returning`].
+pub(crate) fn type_returning_params(
+    clause: &Option<protobuf::ReturningClause>,
+    target_alias: &str,
+    ctx: Ctx<'_>,
+    params: &mut ParamCollector,
+) -> Result<(), AnalyzeError> {
+    let Some(clause) = clause else {
+        return Ok(());
+    };
+    let Ok(scope) = returning_scope(clause, target_alias, &ReturningRows::default(), ctx.scope)
+    else {
+        return Ok(());
+    };
+    resolve_unknown_returning_params(
+        clause,
+        expr::Ctx::new(&scope, ctx.null_ctx, ctx.snapshot),
+        params,
+    )
+}
+
+/// transformReturningClause transforms the list like a select list, then
+/// resolves its still-untyped outputs as `text` right away
+/// (resolveTargetListUnknowns): a bare `$N` untyped when transformed is
+/// deduced `text` — or, typed meanwhile by a later entry, inconsistent.
+fn resolve_unknown_returning_params(
+    clause: &protobuf::ReturningClause,
+    ctx: Ctx<'_>,
+    params: &mut ParamCollector,
+) -> Result<(), AnalyzeError> {
+    let items: Vec<&protobuf::Node> = clause
+        .exprs
+        .iter()
+        .filter_map(|t| match t.node.as_ref() {
+            Some(node::Node::ResTarget(rt)) => rt.val.as_deref(),
+            _ => None,
+        })
+        .collect();
+    let untyped = expr::replay_transform(&items, ctx, params);
+    for (item, untyped) in items.into_iter().zip(untyped) {
+        if untyped && let Some(node::Node::ParamRef(p)) = item.node.as_ref() {
+            expr::coerce_untyped_param(p, oid::TEXT, ctx.snapshot, params)?;
+        }
+    }
+    Ok(())
+}
+
+/// The namespace RETURNING resolves in: `scope` plus the OLD / NEW rows.
+fn returning_scope(
+    clause: &protobuf::ReturningClause,
+    target_alias: &str,
+    rows: &ReturningRows,
+    scope: &Scope,
+) -> Result<Scope, AnalyzeError> {
+    let mut scope = scope.clone();
     let Some(target) = scope
         .sources
         .iter()
@@ -84,7 +186,7 @@ pub(crate) fn resolve_returning(
         }
         scope
             .sources
-            .push(row_copy(&target, &opt.value, null_row, old, &rows));
+            .push(row_copy(&target, &opt.value, null_row, old, rows));
     }
     for (named, name, null_row, old) in [
         (old_named, "old", rows.old_may_be_null, true),
@@ -93,39 +195,10 @@ pub(crate) fn resolve_returning(
         if !named && !namespace_has(&scope, name) {
             scope
                 .sources
-                .push(row_copy(&target, name, null_row, old, &rows));
+                .push(row_copy(&target, name, null_row, old, rows));
         }
     }
-
-    // EXPR_KIND_RETURNING / EXPR_KIND_MERGE_RETURNING.
-    for target in &clause.exprs {
-        if let Some(node::Node::ResTarget(rt)) = target.node.as_ref()
-            && let Some(val) = &rt.val
-        {
-            crate::clause::check_no_aggregates_or_windows(val, ctx.snapshot, "RETURNING")?;
-            check_no_srf_in_clause(val, ctx.snapshot, "RETURNING")?;
-        }
-    }
-
-    let columns = crate::grouping::with_clause(Some("RETURNING"), || {
-        resolve_target_list(
-            &clause.exprs,
-            expr::Ctx::new(&scope, ctx.null_ctx, ctx.snapshot),
-            params,
-        )
-    })?;
-    // A nonempty list that expanded to nothing (stars over a zero-column
-    // table) would read as "no RETURNING".
-    if columns.is_empty()
-        && let Some(first) = clause.exprs.first()
-    {
-        let span =
-            crate::error::node_location(first).and_then(crate::error::SourceSpan::from_node_token);
-        return Err(crate::pgmsg::returning_without_columns(span).finalize_implicit());
-    }
-    // transformReturningClause's resolveTargetListUnknowns.
-    super::select::resolve_unknown_values(&clause.exprs, &columns, ctx.snapshot)?;
-    Ok(columns)
+    Ok(scope)
 }
 
 /// RETURNING's OLD / NEW row `alias`, a copy of the target entry knowing

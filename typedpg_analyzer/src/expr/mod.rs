@@ -1483,15 +1483,20 @@ pub(crate) fn coerce_unknown_to(
 /// scratch collector at PG's point (the caller runs it right after FROM) and
 /// records each such occurrence ([`ParamCollector::mark_untyped_output`]);
 /// [`resolve_untyped_output_params`] then applies PG's coercion to text.
+/// The types the replay deduces are kept: they are the ones PG fixes
+/// before WHERE & co. are looked at (`SELECT $1::int … WHERE text_col =
+/// $1` is `text = integer`).
 ///
 /// An entry that fails to resolve there fails in PG before any later
 /// clause is looked at: its error is returned, so a query wrong in both
 /// its select list and its WHERE reports the select list's, as PG does.
 /// But past the last bare `$N`, an entry holding a subquery is left to the
-/// final pass: replaying it would analyze the subquery here and again
-/// there — at each level of nested sublinks, so 2^depth times — for an
-/// error the final pass reports anyway (only which of several errors comes
-/// first may then differ from PG).
+/// final pass when it holds no parameter to type, or when this is already
+/// the replay of an enclosing level's subquery: replaying it at every level
+/// of nested sublinks would analyze the innermost one 2^depth times (only
+/// which of several errors comes first may then differ from PG, or a
+/// parameter typed only inside a subquery nested in a select-list subquery
+/// be typed by a later clause first).
 pub(crate) fn note_untyped_output_params(
     target_list: &[protobuf::Node],
     ctx: Ctx<'_>,
@@ -1505,7 +1510,35 @@ pub(crate) fn note_untyped_output_params(
         )
     };
     let last_bare_param = target_list.iter().rposition(is_bare_param);
+    let nested = REPLAYING_TARGETS.with(|r| r.replace(true));
     let mut scratch = params.clone();
+    let replayed = replay_targets(
+        target_list,
+        last_bare_param,
+        nested,
+        ctx,
+        params,
+        &mut scratch,
+    );
+    REPLAYING_TARGETS.with(|r| r.set(nested));
+    replayed?;
+    params.adopt_types(&scratch);
+    Ok(())
+}
+
+thread_local! {
+    /// Whether [`note_untyped_output_params`] is replaying a target list.
+    static REPLAYING_TARGETS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn replay_targets(
+    target_list: &[protobuf::Node],
+    last_bare_param: Option<usize>,
+    nested: bool,
+    ctx: Ctx<'_>,
+    params: &mut ParamCollector,
+    scratch: &mut ParamCollector,
+) -> Result<(), AnalyzeError> {
     for (i, target) in target_list.iter().enumerate() {
         let Some(node::Node::ResTarget(rt)) = target.node.as_ref() else {
             continue;
@@ -1532,12 +1565,98 @@ pub(crate) fn note_untyped_output_params(
             Some(node::Node::AIndirection(i)) if star(&i.indirection) => continue,
             _ => {}
         }
-        if last_bare_param.is_none_or(|last| i > last) && has_sublink(val) {
+        if last_bare_param.is_none_or(|last| i > last)
+            && has_sublink(val)
+            && (nested || !has_param_ref(val))
+        {
             continue;
         }
-        infer_expr(val, ctx, &mut scratch, TypeGoal::NONE)?;
+        infer_expr(val, ctx, scratch, TypeGoal::NONE)?;
     }
     Ok(())
+}
+
+/// PG transforms a whole expression list before coercing any of it to its
+/// targets: an INSERT row (`transformInsertRow`), an UPDATE's SET list
+/// (`transformUpdateTargetList`), a RETURNING list, the two rows of a row
+/// comparison. A bare `$N` transformed while `$N` is still untyped stays
+/// an `unknown` node until that coercion, which goes through
+/// `variable_coerce_param_hook`: `inconsistent types deduced for parameter
+/// $N` when the parameter got another type meanwhile. The analyzer types
+/// each item against its target in one go, so this replays the transform
+/// of `items`, in order, on a scratch collector; keeps the types it
+/// deduced (PG deduces them before any of the coercions); and tells, per
+/// item, whether it is such an untyped bare `$N` — for the caller to
+/// coerce with [`coerce_untyped_param`]. An item failing here is left to
+/// the caller's own pass, which reports it in its context.
+pub(crate) fn replay_transform(
+    items: &[&protobuf::Node],
+    ctx: Ctx<'_>,
+    params: &mut ParamCollector,
+) -> Vec<bool> {
+    let mut scratch = params.clone();
+    let untyped = items
+        .iter()
+        .map(|item| match item.node.as_ref() {
+            Some(node::Node::ParamRef(p)) => {
+                let untyped =
+                    params.bound_arg(p.number).is_none() && scratch.get(p.number) == oid::UNKNOWN;
+                scratch.see(p.number);
+                untyped
+            }
+            _ => {
+                let before = scratch.clone();
+                if infer_expr(item, ctx, &mut scratch, TypeGoal::NONE).is_err() {
+                    scratch = before;
+                }
+                false
+            }
+        })
+        .collect();
+    params.adopt_types(&scratch);
+    untyped
+}
+
+/// `variable_coerce_param_hook` on a bare `$N` that was transformed while
+/// untyped (see [`replay_transform`]), coerced to `target`.
+pub(crate) fn coerce_untyped_param(
+    p: &protobuf::ParamRef,
+    target: PgTypeOid,
+    snapshot: &PgCatalog,
+    params: &mut ParamCollector,
+) -> Result<(), AnalyzeError> {
+    params.coerce_untyped(p.number, target).map_err(|deduced| {
+        inconsistent_param_error(p.number, deduced, target, p.location, snapshot)
+    })
+}
+
+/// [`coerce_unknown_to`] for an operand that was transformed `unknown`: a
+/// bare `$N` among them is an untyped parameter node, coerced through
+/// [`coerce_untyped_param`] (`$1 = ANY($1)` deduces text, then text[]).
+pub(crate) fn coerce_unknown_operand(
+    node: &protobuf::Node,
+    ctx: Ctx<'_>,
+    params: &mut ParamCollector,
+    target: PgTypeOid,
+) -> Result<(), AnalyzeError> {
+    match node.node.as_ref() {
+        Some(node::Node::ParamRef(p)) if params.bound_arg(p.number).is_none() => {
+            coerce_untyped_param(p, target, ctx.snapshot, params)?;
+            coerce_unknown_to(node, ctx, params, target)
+        }
+        _ => coerce_unknown_to(node, ctx, params, target),
+    }
+}
+
+/// Whether `expr` is or holds a `$N`.
+fn has_param_ref(expr: &protobuf::Node) -> bool {
+    expr.node.as_ref().is_some_and(|inner| {
+        matches!(inner, node::Node::ParamRef(_))
+            || inner
+                .nodes()
+                .into_iter()
+                .any(|(n, ..)| matches!(n, typedpg_pg_query::NodeRef::ParamRef(_)))
+    })
 }
 
 /// Whether `expr` is or holds a subquery.

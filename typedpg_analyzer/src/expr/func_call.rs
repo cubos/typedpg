@@ -1085,11 +1085,14 @@ fn backfill_func_args(
             && expected != oid::UNKNOWN
             // A pseudo-type slot (`"any"`, anyelement, …) is not a concrete
             // coercion target — recording it would leak the pseudo OID into
-            // a param's type.
-            && ctx
-                .snapshot
-                .get_type(expected)
-                .is_none_or(|t| t.typtype != TypType::Pseudo)
+            // a param's type. `record` is: coerce_type feeds an unknown
+            // literal to record_in (which refuses it) and types a `$N`
+            // `record`.
+            && (expected == oid::RECORD
+                || ctx
+                    .snapshot
+                    .get_type(expected)
+                    .is_none_or(|t| t.typtype != TypType::Pseudo))
         {
             // Speculative re-walk: ordinary failures are swallowed, but a
             // literal-content rejection is the parse-time error PG itself

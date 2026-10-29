@@ -713,6 +713,13 @@ fn analyze_insert_values(
                     .and_then(crate::error::expr_span),
             ));
         }
+        // The row is transformed whole, then coerced to its columns
+        // (transformInsertRow).
+        let untyped = expr::replay_transform(
+            &list.items.iter().collect::<Vec<_>>(),
+            expr::Ctx::new(&scope, &null_ctx, snapshot),
+            params,
+        );
         for (i, val) in list.items.iter().enumerate() {
             let target_col = target_col_at(tgt, i);
             let target = target_at(tgt, i, expr::Ctx::new(&scope, &null_ctx, snapshot), params)?;
@@ -776,6 +783,12 @@ fn analyze_insert_values(
             }
             // EXPR_KIND_VALUES / EXPR_KIND_VALUES_SINGLE.
             crate::clause::check_no_aggregates_or_windows(val, snapshot, "VALUES")?;
+            if untyped[i]
+                && let Some(node::Node::ParamRef(p)) = val.node.as_ref()
+                && let Some(t) = &target
+            {
+                expr::coerce_untyped_param(p, t.type_oid, snapshot, params)?;
+            }
             let inferred = match &target {
                 Some(t) => t.infer_value(val, goal, ctx, params)?,
                 None if is_set_to_default(val) => expr::ExprType::scalar(oid::UNKNOWN, false),
@@ -1529,15 +1542,9 @@ pub(crate) fn analyze_update_with_outer_ctes(
         params,
     )?;
 
-    // SET col = expr / (a, b) = (…) / col[i] = expr — assignment context.
-    let set_list = analyze_set_clause(
-        &upd.target_list,
-        &table_attrs,
-        &table_relname,
-        expr::Ctx::new(&scope, &null_ctx, snapshot),
-        params,
-        true,
-    )?;
+    // transformUpdateStmt transforms WHERE and RETURNING before the SET
+    // list: the first of them to type a `$N` fixes its type.
+    let set_null_ctx = null_ctx.clone();
 
     // WHERE — BOOL goal with assignment coercion.
     let mut rows = ReturningRows::default();
@@ -1555,7 +1562,9 @@ pub(crate) fn analyze_update_with_outer_ctes(
         // it only in the columns nothing rewrites: not SET, not generated
         // (recomputed), with no BEFORE ROW trigger, rule or row movement
         // between WHERE and RETURNING. The old row keeps all of it.
-        let assigned: std::collections::HashSet<String> = set_list_assigns(&set_list)
+        // Only the assigned columns' names are read: the SET list's row
+        // expansion ([`analyze_set_clause`], after WHERE) leaves them as is.
+        let assigned: std::collections::HashSet<String> = set_list_assigns(&upd.target_list)
             .into_iter()
             .map(|a| a.column)
             .collect();
@@ -1579,6 +1588,31 @@ pub(crate) fn analyze_update_with_outer_ctes(
         null_ctx.add_where_facts(facts);
         old_facts = Some(all);
     }
+
+    let ret_scope = with_written_target(
+        &scope,
+        alias,
+        snapshot,
+        table_oid,
+        &table_attrs,
+        &[DmlEvent::Update],
+    );
+    super::returning::type_returning_params(
+        &upd.returning_clause,
+        alias,
+        expr::Ctx::new(&ret_scope, &null_ctx, snapshot),
+        params,
+    )?;
+
+    // SET col = expr / (a, b) = (…) / col[i] = expr — assignment context.
+    let set_list = analyze_set_clause(
+        &upd.target_list,
+        &table_attrs,
+        &table_relname,
+        expr::Ctx::new(&scope, &set_null_ctx, snapshot),
+        params,
+        true,
+    )?;
 
     // The old row is a stored row past WHERE; the new one, with no BEFORE
     // ROW trigger or row movement, that row with the SET values (computed
@@ -1621,14 +1655,6 @@ pub(crate) fn analyze_update_with_outer_ctes(
         rows.new_proven.extend(new_nn);
     }
 
-    let ret_scope = with_written_target(
-        &scope,
-        alias,
-        snapshot,
-        table_oid,
-        &table_attrs,
-        &[DmlEvent::Update],
-    );
     let columns = resolve_returning(
         &upd.returning_clause,
         alias,

@@ -400,6 +400,16 @@ pub(crate) fn analyze_set_clause<'a>(
     let snapshot = ctx.snapshot;
     let target_list = expand_multi_assign_rows(target_list, ctx, params)?;
     let items = expand_set_items(&target_list, ctx, params)?;
+    // transformUpdateTargetList transforms every value, then coerces each
+    // to its column.
+    let values: Vec<&protobuf::Node> = items
+        .iter()
+        .filter_map(|(_, v)| match v {
+            SetValue::Expr(val) => Some(*val),
+            SetValue::SubqueryColumn(_) => None,
+        })
+        .collect();
+    let mut untyped = crate::expr::replay_transform(&values, ctx, params).into_iter();
     // `(column, indirected)` of every assignment, for the rewriter's
     // `multiple assignments to same column` rule.
     let mut assigned: Vec<(&str, bool)> = Vec::with_capacity(items.len());
@@ -435,6 +445,11 @@ pub(crate) fn analyze_set_clause<'a>(
         assigned.push((tc.attname.as_str(), target.indirected));
         match value {
             SetValue::Expr(val) => {
+                if untyped.next() == Some(true)
+                    && let Some(node::Node::ParamRef(p)) = val.node.as_ref()
+                {
+                    crate::expr::coerce_untyped_param(p, target.type_oid, snapshot, params)?;
+                }
                 // Catch `UPDATE … SET not_null_col = NULL` statically — PG
                 // raises a runtime `null value in column … violates
                 // not-null constraint` error. A NULL stored *inside* the
