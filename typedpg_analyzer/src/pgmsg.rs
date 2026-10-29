@@ -454,6 +454,84 @@ pub(crate) fn cannot_assign_to_system_column(column: &str, span: Option<SourceSp
     )
 }
 
+/// `functions returning type "internal" cannot be called explicitly` (or
+/// `accepting`) — SQLSTATE 0A000 (`ParseFuncOrColumn`).
+pub(crate) fn internal_function_call(returning: bool, span: Option<SourceSpan>) -> RawError {
+    let verb = if returning { "returning" } else { "accepting" };
+    RawError::new(
+        AnalyzeError::FeatureNotSupported(format!(
+            "functions {verb} type \"internal\" cannot be called explicitly"
+        )),
+        span,
+        None,
+    )
+}
+
+/// `cannot use system column "xmin" in MERGE WHEN condition` — SQLSTATE
+/// 42P10 (`scanNSItemForColumn`).
+pub(crate) fn merge_when_system_column(column: &str, span: Option<SourceSpan>) -> RawError {
+    RawError::new(
+        AnalyzeError::InvalidColumnReference(format!(
+            "cannot use system column \"{column}\" in MERGE WHEN condition"
+        )),
+        span,
+        None,
+    )
+}
+
+/// `WITH RECURSIVE is not supported for MERGE statement` — SQLSTATE 42601
+/// (`transformMergeStmt`).
+pub(crate) fn merge_with_recursive() -> RawError {
+    RawError::new(
+        AnalyzeError::SyntaxError("WITH RECURSIVE is not supported for MERGE statement".into()),
+        None,
+        None,
+    )
+}
+
+/// `SELECT ... INTO is not allowed here` — SQLSTATE 42601: an INTO
+/// anywhere but on the top-level SELECT (`transformSelectStmt`,
+/// `transformSetOperationStmt`).
+pub(crate) fn select_into_not_allowed(span: Option<SourceSpan>) -> RawError {
+    RawError::new(
+        AnalyzeError::SyntaxError("SELECT ... INTO is not allowed here".into()),
+        span,
+        None,
+    )
+}
+
+/// `INTO is only allowed on first SELECT of UNION/INTERSECT/EXCEPT` —
+/// SQLSTATE 42601 (`transformSetOperationTree`).
+pub(crate) fn into_not_on_first_set_op_member(span: Option<SourceSpan>) -> RawError {
+    RawError::new(
+        AnalyzeError::SyntaxError(
+            "INTO is only allowed on first SELECT of UNION/INTERSECT/EXCEPT".into(),
+        ),
+        span,
+        None,
+    )
+}
+
+/// `FOR UPDATE cannot be applied to VALUES` (any lock strength) —
+/// SQLSTATE 0A000 (`transformValuesClause`).
+pub(crate) fn locking_values(strength: &str) -> RawError {
+    RawError::new(
+        AnalyzeError::FeatureNotSupported(format!("{strength} cannot be applied to VALUES")),
+        None,
+        None,
+    )
+}
+
+/// `cannot use subquery in CALL argument` — SQLSTATE 0A000
+/// (`transformSubLink` under EXPR_KIND_CALL_ARGUMENT).
+pub(crate) fn call_argument_subquery(span: Option<SourceSpan>) -> RawError {
+    RawError::new(
+        AnalyzeError::FeatureNotSupported("cannot use subquery in CALL argument".into()),
+        span,
+        None,
+    )
+}
+
 /// `name "t" specified more than once` — SQLSTATE 42712: a MERGE whose
 /// target and data source share a name (`transformMergeStmt`).
 pub(crate) fn merge_name_specified_twice(name: &str) -> RawError {
@@ -1745,6 +1823,14 @@ mod tests {
             (update_generated_to_non_default("g", true).kind, "428C9"),
             (infinite_rule_recursion("t").kind, "42P17"),
             (cannot_change_relation("sequence", "s").kind, "42809"),
+            (any_all_operator_not_boolean(None).kind, "42809"),
+            (internal_function_call(true, None).kind, "0A000"),
+            (merge_when_system_column("xmin", None).kind, "42P10"),
+            (merge_with_recursive().kind, "42601"),
+            (select_into_not_allowed(None).kind, "42601"),
+            (into_not_on_first_set_op_member(None).kind, "42601"),
+            (locking_values("FOR UPDATE").kind, "0A000"),
+            (call_argument_subquery(None).kind, "0A000"),
             (
                 view_not_updatable(crate::resolve::DmlEvent::Insert, "v", "x", false).kind,
                 "55000",

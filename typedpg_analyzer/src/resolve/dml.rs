@@ -720,6 +720,7 @@ fn analyze_insert_values(
             expr::Ctx::new(&scope, &null_ctx, snapshot),
             params,
         );
+        let lands_in = row_relation(tgt, &list.items, snapshot);
         for (i, val) in list.items.iter().enumerate() {
             let target_col = target_col_at(tgt, i);
             let target = target_at(tgt, i, expr::Ctx::new(&scope, &null_ctx, snapshot), params)?;
@@ -740,16 +741,16 @@ fn analyze_insert_values(
                 && !indirected
                 && is_sql_null_literal(val)
                 && !tgt.discards(tc)
-                && let Some(err) = null_assignment_error(tc, snapshot, &tgt.relname, "insert")
+                && let Some(err) = null_assignment_error(tc, snapshot, &lands_in.1, "insert")
             {
-                row_violations.push(NullViolation::of(tc, snapshot, err));
+                row_violations.push(NullViolation::of(tc, snapshot, err, lands_in.0));
             }
             // An explicit DEFAULT that is NULL competes like an omitted
             // column.
             if let Some(tc) = target_col
                 && !indirected
                 && is_set_to_default(val)
-                && let Some(v) = null_default_violation(tc, tgt, snapshot)
+                && let Some(v) = null_default_violation(tc, snapshot, &lands_in)
             {
                 default_nulls.push(v);
             }
@@ -813,7 +814,12 @@ fn analyze_insert_values(
         // fails while the row is built: every execution.
         row_violations.extend(omitted_domain_nulls(tgt, &list.items, snapshot));
         if violation.is_none() && !row_violations.is_empty() {
-            row_violations.extend(omitted_not_null_columns(tgt, list.items.len(), snapshot));
+            row_violations.extend(omitted_not_null_columns(
+                tgt,
+                list.items.len(),
+                snapshot,
+                &lands_in,
+            ));
             row_violations.extend(default_nulls);
             violation = row_violations.into_iter().min_by_key(|v| v.order);
         }
@@ -834,18 +840,58 @@ struct NullViolation {
 }
 
 impl NullViolation {
-    fn of(tc: &crate::pg_catalog::PgAttribute, snapshot: &PgCatalog, error: AnalyzeError) -> Self {
+    /// Column `tc`'s violation, in the order of the relation `rel` the row
+    /// lands in (a partition's columns may be ordered differently).
+    fn of(
+        tc: &crate::pg_catalog::PgAttribute,
+        snapshot: &PgCatalog,
+        error: AnalyzeError,
+        rel: crate::oid::PgClassOid,
+    ) -> Self {
         let domain = snapshot.domain_null_violation(tc.atttypid).is_some();
+        let attnum = snapshot
+            .attribute_by_name(rel, &tc.attname)
+            .map_or(tc.attnum, |a| a.attnum);
         Self {
-            order: (!domain, tc.attnum),
+            order: (!domain, attnum),
             error,
         }
     }
 }
 
+/// The relation a VALUES row is checked in, and its name: the partition
+/// ExecFindPartition routes it to when the target is partitioned and the
+/// analyzer can tell (see `partbound::route_row`), else the target itself.
+fn row_relation(
+    tgt: &InsertTarget,
+    items: &[protobuf::Node],
+    snapshot: &PgCatalog,
+) -> (crate::oid::PgClassOid, String) {
+    // A column's value in the row: given, or its default when that is NULL
+    // (`Some(None)` for NULL); `None` when unknown.
+    let value_of = |name: &str| -> Option<Option<&protobuf::Node>> {
+        let c = tgt.attrs.iter().find(|c| c.attname == name)?;
+        let given =
+            (0..items.len()).find(|&i| target_col_at(tgt, i).is_some_and(|t| t.attname == name));
+        match given {
+            Some(i) if !tgt.col_indirection.get(i).is_none_or(Vec::is_empty) || tgt.discards(c) => {
+                None
+            }
+            Some(i) if !is_set_to_default(&items[i]) => {
+                Some((!is_sql_null_literal(&items[i])).then_some(&items[i]))
+            }
+            _ => null_default(c, snapshot).then_some(None),
+        }
+    };
+    crate::ddl::tables::partbound::route_row(snapshot, tgt.oid, &value_of)
+        .filter(|&leaf| leaf != tgt.oid)
+        .and_then(|leaf| Some((leaf, snapshot.pg_class.get(&leaf)?.relname.clone())))
+        .unwrap_or_else(|| (tgt.oid, tgt.relname.clone()))
+}
+
 /// Whether column `c`'s default is NULL: no DEFAULT, identity or
 /// generation expression, nor one its domain gives it.
-fn null_default(c: &crate::pg_catalog::PgAttribute, snapshot: &PgCatalog) -> bool {
+pub(crate) fn null_default(c: &crate::pg_catalog::PgAttribute, snapshot: &PgCatalog) -> bool {
     !c.atthasdef
         && c.attidentity.is_none()
         && c.attgenerated.is_none()
@@ -913,14 +959,14 @@ fn omitted_domain_nulls(
 /// [`null_default`]).
 fn null_default_violation(
     c: &crate::pg_catalog::PgAttribute,
-    tgt: &InsertTarget,
     snapshot: &PgCatalog,
+    lands_in: &(crate::oid::PgClassOid, String),
 ) -> Option<NullViolation> {
     if !(c.attnum > 0 && c.attnotnull && null_default(c, snapshot)) {
         return None;
     }
-    null_assignment_error(c, snapshot, &tgt.relname, "insert")
-        .map(|e| NullViolation::of(c, snapshot, e))
+    null_assignment_error(c, snapshot, &lands_in.1, "insert")
+        .map(|e| NullViolation::of(c, snapshot, e, lands_in.0))
 }
 
 /// The NOT NULL columns an INSERT row giving `given` values leaves to a
@@ -929,6 +975,7 @@ fn omitted_not_null_columns(
     tgt: &InsertTarget,
     given: usize,
     snapshot: &PgCatalog,
+    lands_in: &(crate::oid::PgClassOid, String),
 ) -> Vec<NullViolation> {
     let provided: Vec<&str> = (0..given)
         .filter_map(|i| target_col_at(tgt, i).map(|c| c.attname.as_str()))
@@ -936,7 +983,7 @@ fn omitted_not_null_columns(
     tgt.attrs
         .iter()
         .filter(|c| !provided.contains(&c.attname.as_str()))
-        .filter_map(|c| null_default_violation(c, tgt, snapshot))
+        .filter_map(|c| null_default_violation(c, snapshot, lands_in))
         .collect()
 }
 

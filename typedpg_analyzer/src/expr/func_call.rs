@@ -179,6 +179,7 @@ pub(crate) fn infer_func_call(
     };
 
     check_call_shape(func, Some(&resolved), &args, &notation, ctx)?;
+    check_not_internal(&resolved, snapshot, func.location)?;
     ctx.note_proc(Some(resolved.oid));
     // A call leaving parameters out runs their DEFAULT expressions — unless
     // the function is inlined (a simple SQL body, which CheckMutability
@@ -430,6 +431,31 @@ pub(crate) fn infer_func_call(
         };
     }
     Ok(out)
+}
+
+/// ParseFuncOrColumn: a function taking or returning the pseudo-type
+/// `internal` — a support function (`internal_in`, an index AM handler)
+/// — can't be called from SQL (0A000). The parameters left to their
+/// defaults count.
+fn check_not_internal(
+    resolved: &functions::ResolvedFunction,
+    snapshot: &PgCatalog,
+    location: i32,
+) -> Result<(), AnalyzeError> {
+    const INTERNAL: PgTypeOid = PgTypeOid::from_raw(2281);
+    let span = crate::error::SourceSpan::from_node_qname(location);
+    let declared = snapshot
+        .pg_proc
+        .get(&resolved.oid)
+        .map(|p| p.proargtypes.as_slice())
+        .unwrap_or_default();
+    if resolved.arg_types.contains(&INTERNAL) || declared.contains(&INTERNAL) {
+        return Err(crate::pgmsg::internal_function_call(false, span).finalize_implicit());
+    }
+    if resolved.return_type_oid == INTERNAL {
+        return Err(crate::pgmsg::internal_function_call(true, span).finalize_implicit());
+    }
+    Ok(())
 }
 
 /// The call with its arguments in positional notation, for the rules that

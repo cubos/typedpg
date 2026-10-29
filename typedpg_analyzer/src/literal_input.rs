@@ -164,11 +164,12 @@ pub(crate) fn validate_with_typmod(
                 None => Ok(()),
             }
         }
-        // Internal statistics / parse-tree types whose input functions
-        // unconditionally refuse input. The message string is the input
-        // function's own (note `pg_brin_minmax_multi_summary`'s drops the
-        // prefix) — verified against PG 18.
+        // Internal statistics / parse-tree / index-support types whose
+        // input functions unconditionally refuse input. The message string
+        // is the input function's own (note `pg_brin_minmax_multi_summary`'s
+        // drops the prefix) — verified against PG 18.
         name @ ("pg_node_tree"
+        | "gtsvector"
         | "pg_ndistinct"
         | "pg_dependencies"
         | "pg_mcv_list"

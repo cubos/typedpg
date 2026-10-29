@@ -474,6 +474,68 @@ fn insert_null_reports_the_first_null_column_in_table_order() {
     );
 }
 
+/// A row inserted into a partitioned table is routed to its partition
+/// before ExecConstraints runs, so PG names the partition the row lands
+/// in — through every level of sub-partitioning.
+#[test]
+fn not_null_violation_names_the_partition_the_row_goes_to() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE errtst (a text, b text NOT NULL, c int) PARTITION BY LIST (a);
+         CREATE TABLE errtst_part_1 PARTITION OF errtst FOR VALUES IN ('aaa');
+         CREATE TABLE errtst_part_2 PARTITION OF errtst FOR VALUES IN ('bbb', NULL)
+             PARTITION BY RANGE (c);
+         CREATE TABLE errtst_part_2_lo PARTITION OF errtst_part_2 FOR VALUES FROM (0) TO (10);
+         CREATE TABLE errtst_part_2_hi PARTITION OF errtst_part_2
+             FOR VALUES FROM (10) TO (MAXVALUE);
+         CREATE TABLE errtst_default PARTITION OF errtst DEFAULT;",
+    )
+    .unwrap();
+    let not_null = |relation: &str| {
+        format!(r#"null value in column "b" of relation "{relation}" violates not-null constraint"#)
+    };
+    for (sql, relation) in [
+        (
+            "INSERT INTO errtst (a, b) VALUES ('aaa', NULL)",
+            "errtst_part_1",
+        ),
+        (
+            "INSERT INTO errtst VALUES ('bbb', NULL, 3)",
+            "errtst_part_2_lo",
+        ),
+        (
+            "INSERT INTO errtst (c, b) VALUES (12, NULL)",
+            "errtst_part_2_hi",
+        ),
+        (
+            "INSERT INTO errtst (a, b, c) VALUES ('zzz', NULL, 1)",
+            "errtst_default",
+        ),
+        // The second row is the first to fail.
+        (
+            "INSERT INTO errtst (a, b) VALUES ('aaa', 'x'), ('aaa', NULL)",
+            "errtst_part_1",
+        ),
+        // A sub-partitioned table is a partition too.
+        (
+            "INSERT INTO errtst_part_2 VALUES ('bbb', NULL, 50)",
+            "errtst_part_2_hi",
+        ),
+        // MERGE inserts through the same routing.
+        (
+            "MERGE INTO errtst t USING (SELECT 1 k) s ON false \
+             WHEN NOT MATCHED THEN INSERT (a, b) VALUES ('aaa', NULL)",
+            "errtst_part_1",
+        ),
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::Invalid(_),
+            &not_null(relation)
+        );
+    }
+}
+
 #[test]
 fn insert_values_row_wrong_arity_rejected() {
     let db = setup();

@@ -1027,6 +1027,97 @@ pub(crate) fn bound_facts(
     }
 }
 
+/// The leaf partition ExecFindPartition routes a row inserted into
+/// `relid` to, through every level of sub-partitioning (`relid` itself
+/// when it is not partitioned) — where the analyzer can tell: each key a
+/// column whose value `value_of` gives (`Some(None)`: NULL), compared as
+/// the bounds are. `None` when it can't, and when no partition takes the
+/// row (ExecFindPartition's own error then).
+pub(crate) fn route_row<'a>(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+    value_of: &dyn Fn(&str) -> Option<Option<&'a typedpg_pg_query::protobuf::Node>>,
+) -> Option<PgClassOid> {
+    let Some(spec) = interp.partition_specs.get(&relid) else {
+        return Some(relid);
+    };
+    let mut row: Vec<Option<Datum>> = Vec::new();
+    for key in &spec.keys {
+        let value = match value_of(key.name.as_deref()?)? {
+            None => None,
+            Some(v) => match normalize(interp, v, key) {
+                Datum::Opaque => return None,
+                // Equality of strings is byte equality under a deterministic
+                // collation — every built-in one; a user's may not be.
+                Datum::Text(_)
+                    if key.collation.is_some_and(|c| {
+                        interp.pg_collation.get(&c).is_none_or(|c| {
+                            interp.namespace_name(c.collnamespace) != Some("pg_catalog")
+                        })
+                    }) =>
+                {
+                    return None;
+                }
+                d => Some(d),
+            },
+        };
+        row.push(value);
+    }
+    let mut bounds = Vec::new();
+    for child in inherit::children_of(interp, relid) {
+        bounds.push((child, interp.partition_bounds.get(&child)?));
+    }
+    let default = || {
+        bounds
+            .iter()
+            .find(|(_, b)| matches!(b, Bound::Default))
+            .map(|(c, _)| *c)
+    };
+    // Whether every bound compared with the row: no partition taking it
+    // then means none does.
+    let mut decided = true;
+    let mut found = None;
+    match spec.strategy {
+        Strategy::Hash => return None,
+        Strategy::List => {
+            let value = row.first()?;
+            for (child, bound) in &bounds {
+                let Bound::List(values) = bound else { continue };
+                if values.contains(value) {
+                    found = Some(*child);
+                    break;
+                }
+                decided &= !values.contains(&Some(Datum::Opaque));
+            }
+        }
+        // A NULL in a range key goes to the default partition.
+        Strategy::Range if row.iter().any(Option::is_none) => {}
+        Strategy::Range => {
+            let row: Vec<RangeDatum> = row.into_iter().flatten().map(RangeDatum::Value).collect();
+            for (child, bound) in &bounds {
+                let Bound::Range { lower, upper } = bound else {
+                    continue;
+                };
+                match (cmp_range(lower, &row), cmp_range(&row, upper)) {
+                    (Some(lo), Some(hi)) => {
+                        if lo != std::cmp::Ordering::Greater && hi == std::cmp::Ordering::Less {
+                            found = Some(*child);
+                            break;
+                        }
+                    }
+                    _ => decided = false,
+                }
+            }
+        }
+    }
+    let target = match found {
+        Some(child) => child,
+        None if decided => default()?,
+        None => return None,
+    };
+    route_row(interp, target, value_of)
+}
+
 /// The partitions of `parent` in PartitionDesc order (partition_bounds_create):
 /// range partitions by lower bound, list partitions by their smallest
 /// non-NULL value (a NULL-only one after those), hash partitions by

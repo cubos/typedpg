@@ -40,6 +40,7 @@ pub(crate) fn analyze_set_operation(
         .as_ref()
         .ok_or_else(|| AnalyzeError::Unsupported("UNION without right side".into()))?;
 
+    check_set_op_tree_into(sel)?;
     // The arms are subqueries of the set operation: outer references reach
     // them as correlated ones, and the FROM entries a non-LATERAL subquery
     // can't see stay unreachable (PG's `invalid reference to FROM-clause
@@ -162,11 +163,24 @@ pub(crate) fn analyze_set_operation(
         // When both sides carry concrete types (not UNKNOWN), their common
         // type must exist — PG rejects `SELECT 1 UNION SELECT 'x'` with
         // `UNION types integer and text cannot be matched`.
-        let common = crate::coerce::find_common_type(&[l.type_oid, r.type_oid], snapshot);
+        let common = crate::coerce::select_common_type(&[l.type_oid, r.type_oid], snapshot);
         let both_concrete = l.type_oid != oid::UNKNOWN && r.type_oid != oid::UNKNOWN;
         let type_oid = match (common, both_concrete) {
-            (Some(t), _) => t,
-            (None, true) => {
+            (Ok(t), _) => t,
+            // Types of one category neither of which converts to the other
+            // implicitly: select_common_type keeps the left one and
+            // coerce_to_common_type fails on the right (42846).
+            (Err(crate::coerce::CommonTypeError::CannotConvert { from, to }), true) => {
+                let name = |t| crate::ddl::util::format_type_for_message(snapshot, t);
+                return Err(crate::pgmsg::could_not_convert_type(
+                    op_label,
+                    &name(from),
+                    &name(to),
+                    branch_column_span(right, i),
+                )
+                .finalize_implicit());
+            }
+            (Err(_), true) => {
                 // PG (SQLSTATE 42804): `UNION types A and B cannot be
                 // matched` — INTERSECT/EXCEPT use their own name. Use
                 // `Invalid` to keep `TypeMismatch::Display`'s generic prefix
@@ -188,8 +202,10 @@ pub(crate) fn analyze_set_operation(
                 .finalize_implicit());
             }
             // Both arms unknown: select_common_type resolves to text.
-            (None, false) if l.type_oid == oid::UNKNOWN && r.type_oid == oid::UNKNOWN => oid::TEXT,
-            (None, false) => target,
+            (Err(_), false) if l.type_oid == oid::UNKNOWN && r.type_oid == oid::UNKNOWN => {
+                oid::TEXT
+            }
+            (Err(_), false) => target,
         };
         let typmod = if l.typmod == r.typmod { l.typmod } else { None };
         // Each arm's column is coerced to the common type, which may map a
@@ -438,6 +454,33 @@ fn arm_unknown_literal(arm: &protobuf::SelectStmt, i: usize) -> Option<&str> {
 
 /// transformSetOperationTree: no member of a set-operation tree may carry
 /// a locking clause (0A000), checked as each member is reached.
+/// transformSetOperationTree: no member of the operation's tree may carry
+/// an INTO (the leftmost one's is reported before, see
+/// `analyze_select_here`). A member with its own ORDER BY, LIMIT, locking
+/// or WITH is a subquery of the tree, analyzed on its own.
+fn check_set_op_tree_into(sel: &protobuf::SelectStmt) -> Result<(), AnalyzeError> {
+    for arm in [sel.larg.as_deref(), sel.rarg.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        if let Some(into) = &arm.into_clause {
+            return Err(
+                crate::pgmsg::into_not_on_first_set_op_member(into_span(into)).finalize_implicit(),
+            );
+        }
+        let leaf = arm.op == SetOperation::SetopNone as i32
+            || !arm.sort_clause.is_empty()
+            || arm.limit_offset.is_some()
+            || arm.limit_count.is_some()
+            || !arm.locking_clause.is_empty()
+            || arm.with_clause.is_some();
+        if !leaf {
+            check_set_op_tree_into(arm)?;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn check_set_op_member_locking(arm: &protobuf::SelectStmt) -> Result<(), AnalyzeError> {
     match arm.locking_clause.first().and_then(|n| n.node.as_ref()) {
         Some(node::Node::LockingClause(lc)) => Err(crate::error::RawError::new(

@@ -767,6 +767,13 @@ impl Scope {
 
     /// Every source this level can resolve against: its own FROM items, the
     /// LATERAL tier, then the correlated outer tier.
+    /// Whether `col`, as [`Scope::resolve_column`] returned it, is a
+    /// relation's system column rather than a column of that name.
+    pub fn is_system_column(&self, col: &ScopeColumn) -> bool {
+        self.all_tiers()
+            .any(|s| s.system_columns.iter().any(|c| std::ptr::eq(c, col)))
+    }
+
     fn all_tiers(&self) -> impl Iterator<Item = &TableSource> {
         self.sources
             .iter()
