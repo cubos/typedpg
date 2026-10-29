@@ -87,6 +87,50 @@ fn drop_table_cascade_transitive_views() {
     );
 }
 
+#[test]
+fn create_table_as_does_not_depend_on_its_source() {
+    // CREATE TABLE AS stores rows, not the query: the new table depends on
+    // its columns' types only (intorel_startup → heap_create_with_catalog).
+    for setup in [
+        "CREATE TABLE src (a int);
+         CREATE TABLE dst AS SELECT a FROM src;",
+        "CREATE TABLE src (i int, j int);
+         CREATE TABLE dst (ii, jj) AS SELECT i, j FROM src WITH NO DATA;",
+        "CREATE TABLE src (a int);
+         SELECT a INTO dst FROM src;",
+        "CREATE TABLE src (a int);
+         CREATE VIEW vsrc AS SELECT a FROM src;
+         CREATE TABLE dst AS SELECT a FROM vsrc;
+         DROP VIEW vsrc;",
+    ] {
+        build(&[("0001.sql", setup), ("0002.sql", "DROP TABLE src;")]);
+    }
+    build(&[(
+        "0001.sql",
+        "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'select 1';
+         CREATE TABLE dst AS SELECT f() AS x;
+         DROP FUNCTION f();",
+    )]);
+    assert_ddl_rejections(&[
+        // A materialized view keeps its query, and what it reads.
+        (
+            "CREATE TABLE src (a int);
+             CREATE MATERIALIZED VIEW mv AS SELECT a FROM src;",
+            "DROP TABLE src;",
+            "cannot drop table src because other objects depend on it",
+        ),
+        // The new table's columns hold on to their types.
+        (
+            "CREATE TYPE e AS ENUM ('x');
+             CREATE TABLE src (a e);
+             CREATE TABLE dst AS SELECT a FROM src;
+             DROP TABLE src;",
+            "DROP TYPE e;",
+            "cannot drop type e because other objects depend on it",
+        ),
+    ]);
+}
+
 // ── DROP TYPE with dependent table column ──────────────────────────────────
 
 #[test]
@@ -105,6 +149,62 @@ fn drop_type_with_dependent_column_errors() {
         DdlError::DependencyError(_),
         "cannot drop type status because other objects depend on it (table(s) public.t depend on this type)"
     );
+}
+
+#[test]
+fn dropping_a_composite_type_releases_its_attribute_types() {
+    build(&[(
+        "0001.sql",
+        "CREATE DOMAIN js_nn AS int NOT NULL;
+         CREATE TYPE rec_nn AS (i js_nn);
+         DROP TYPE rec_nn;
+         DROP DOMAIN js_nn;",
+    )]);
+    build(&[(
+        "0001.sql",
+        "CREATE TYPE e AS ENUM ('x');
+         CREATE TYPE r AS (a int, b e);
+         ALTER TYPE r DROP ATTRIBUTE b;
+         DROP TYPE e;",
+    )]);
+    // While the composite type stands, its attributes pin their types.
+    assert_ddl_rejections(&[(
+        "CREATE DOMAIN js_nn AS int NOT NULL;
+         CREATE TYPE rec_nn AS (i js_nn);",
+        "DROP DOMAIN js_nn;",
+        "cannot drop type js_nn because other objects depend on it",
+    )]);
+}
+
+#[test]
+fn a_domain_over_a_domain_pins_its_base() {
+    assert_ddl_rejections(&[
+        (
+            "CREATE DOMAIN ddt int4;
+             CREATE DOMAIN dependent ddt;",
+            "DROP DOMAIN ddt;",
+            "cannot drop type ddt because other objects depend on it",
+        ),
+        (
+            "CREATE TYPE e AS ENUM ('x');
+             CREATE DOMAIN de e;",
+            "DROP TYPE e;",
+            "cannot drop type e because other objects depend on it",
+        ),
+    ]);
+    // CASCADE takes the domains built on it, and what uses them.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE DOMAIN ddt int4;
+         CREATE DOMAIN dependent ddt;
+         CREATE DOMAIN dependent2 dependent;
+         CREATE TABLE td (a int, d dependent2);
+         DROP DOMAIN ddt CASCADE;",
+    )]);
+    assert!(db.resolve_type_by_name(None, "dependent").is_none());
+    assert!(db.resolve_type_by_name(None, "dependent2").is_none());
+    let q = db.analyze("SELECT * FROM td").unwrap();
+    assert_eq!(q.columns.len(), 1);
 }
 
 // ── DROP FUNCTION: overload-safe ──────────────────────────────────────────
@@ -501,6 +601,34 @@ fn objects_built_on_a_function_block_its_drop() {
 }
 
 #[test]
+fn a_partition_key_expression_pins_its_function() {
+    assert_ddl_rejections(&[
+        (
+            "CREATE FUNCTION plusone(a int) RETURNS int AS $$ SELECT a+1; $$ LANGUAGE sql IMMUTABLE;
+             CREATE TABLE pk (a int, b int) PARTITION BY RANGE (plusone(b));",
+            "DROP FUNCTION plusone(int);",
+            "cannot drop function plusone(integer) because other objects depend on it",
+        ),
+        (
+            "CREATE FUNCTION plusone(a int) RETURNS int AS $$ SELECT a+1; $$ LANGUAGE sql IMMUTABLE;
+             CREATE TABLE pk (a int, b int) PARTITION BY RANGE (a, (plusone(b) * 2));",
+            "DROP FUNCTION plusone(int);",
+            "cannot drop function plusone(integer) because other objects depend on it",
+        ),
+    ]);
+    // The key is part of the table: CASCADE drops the table.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE FUNCTION plusone(a int) RETURNS int AS $$ SELECT a+1; $$ LANGUAGE sql IMMUTABLE;
+         CREATE TABLE pk (a int, b int) PARTITION BY RANGE (plusone(b));
+         CREATE TABLE pk1 PARTITION OF pk FOR VALUES FROM (1) TO (10);
+         DROP FUNCTION plusone(int) CASCADE;",
+    )]);
+    assert!(db.resolve_table(None, "pk").is_none());
+    assert!(db.resolve_table(None, "pk1").is_none());
+}
+
+#[test]
 fn drop_function_cascade_takes_what_is_built_on_it() {
     let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
@@ -628,6 +756,88 @@ fn rules_policies_triggers_and_views_hold_on_to_what_they_use() {
     )
     .unwrap();
     assert!(db.resolve_table(None, "vs").is_none());
+}
+
+#[test]
+fn a_functionally_dependent_view_pins_the_primary_key() {
+    // A view selecting columns grouped through the primary key relies on
+    // the key (check_functional_grouping → query->constraintDeps).
+    let setup = "CREATE TABLE articles (id int CONSTRAINT articles_pkey PRIMARY KEY, title text);
+                 CREATE VIEW av AS SELECT id, title FROM articles GROUP BY id;";
+    assert_ddl_rejections(&[
+        (
+            setup,
+            "ALTER TABLE articles DROP CONSTRAINT articles_pkey RESTRICT;",
+            "cannot drop constraint articles_pkey on table articles because other objects depend on it",
+        ),
+        (
+            "CREATE TABLE articles (id int CONSTRAINT articles_pkey PRIMARY KEY, title text);
+             CREATE FUNCTION af() RETURNS SETOF text LANGUAGE sql
+                 BEGIN ATOMIC SELECT title FROM articles GROUP BY id; END;",
+            "ALTER TABLE articles DROP CONSTRAINT articles_pkey;",
+            "cannot drop constraint articles_pkey on table articles because other objects depend on it",
+        ),
+    ]);
+    let db = build_db(&[(
+        "0001.sql",
+        &format!("{setup} ALTER TABLE articles DROP CONSTRAINT articles_pkey CASCADE;"),
+    )]);
+    assert!(db.resolve_table(None, "av").is_none());
+    // Grouping by every column it selects, the view needs no key.
+    build(&[(
+        "0001.sql",
+        "CREATE TABLE articles (id int CONSTRAINT articles_pkey PRIMARY KEY, title text);
+         CREATE VIEW av AS SELECT id, title FROM articles GROUP BY id, title;
+         CREATE VIEW av2 AS SELECT id FROM articles GROUP BY id;
+         ALTER TABLE articles DROP CONSTRAINT articles_pkey;",
+    )]);
+}
+
+#[test]
+fn a_view_over_a_rowtype_function_pins_the_table_columns() {
+    // regress/sql/create_view.sql (tt14t): the view's columns come from
+    // tt14t's row type, through the function (process_function_rte_ref).
+    let base = "CREATE TABLE tt14t (f1 text, f3 text, f4 text);
+                CREATE FUNCTION tt14f() RETURNS SETOF tt14t AS 'select * from tt14t' LANGUAGE sql;";
+    assert_ddl_rejections(&[
+        (
+            &format!("{base} CREATE VIEW tt14v AS SELECT t.* FROM tt14f() t;"),
+            "ALTER TABLE tt14t DROP COLUMN f3;",
+            "cannot drop column f3 of table tt14t because other objects depend on it",
+        ),
+        (
+            &format!("{base} CREATE VIEW tt14v AS SELECT t.f1, t.f4 FROM tt14f() t;"),
+            "ALTER TABLE tt14t ALTER COLUMN f4 TYPE integer USING f4::integer;",
+            "cannot alter type of a column used by a view or rule",
+        ),
+        (
+            &format!(
+                "{base} ALTER TABLE tt14t DROP COLUMN f1;
+                 CREATE VIEW tt14v AS SELECT f4 FROM tt14f() WITH ORDINALITY AS t;"
+            ),
+            "ALTER TABLE tt14t DROP COLUMN f4;",
+            "cannot drop column f4 of table tt14t because other objects depend on it",
+        ),
+        // A composite type's attribute, read under a column alias.
+        (
+            "CREATE TYPE ct AS (x int, y int);
+             CREATE FUNCTION cf() RETURNS ct LANGUAGE sql AS 'select 1, 2';
+             CREATE VIEW cv AS SELECT b FROM cf() AS f(a, b);
+             ALTER TYPE ct DROP ATTRIBUTE x;",
+            "ALTER TYPE ct DROP ATTRIBUTE y;",
+            "cannot drop column y of composite type ct because other objects depend on it",
+        ),
+    ]);
+    // Only the columns the view reads are pinned; CASCADE takes the view.
+    let db = build_db(&[(
+        "0001.sql",
+        &format!(
+            "{base} CREATE VIEW tt14v AS SELECT t.f1, t.f4 FROM tt14f() t;
+             ALTER TABLE tt14t DROP COLUMN f3;
+             ALTER TABLE tt14t DROP COLUMN f4 CASCADE;"
+        ),
+    )]);
+    assert!(db.resolve_table(None, "tt14v").is_none());
 }
 
 #[test]

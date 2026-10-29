@@ -758,6 +758,15 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
         key_attrs.dedup();
         interp.partition_key_attrs.insert(class_oid, key_attrs);
         partbound::record_partition_spec(interp, class_oid, spec);
+        let key_exprs: Vec<&typedpg_pg_query::protobuf::Node> = spec
+            .part_params
+            .iter()
+            .filter_map(|elem| match elem.node.as_ref() {
+                Some(node::Node::PartitionElem(pe)) if pe.name.is_empty() => pe.expr.as_deref(),
+                _ => None,
+            })
+            .collect();
+        crate::ddl::depend::record_partition_key_expressions(interp, class_oid, &key_exprs);
     }
 
     // DefineRelation: the table access method.

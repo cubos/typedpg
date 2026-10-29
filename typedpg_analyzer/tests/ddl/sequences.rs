@@ -86,6 +86,35 @@ fn drop_sequence_existing_removes_it() {
 }
 
 #[test]
+fn nextval_of_text_does_not_depend_on_the_sequence() {
+    // Only a regclass constant records a dependency on the sequence
+    // (find_expr_references_walker looks at Const nodes of type regclass);
+    // nextval('s3'::text) resolves the name at each call (regress/sql/
+    // sequence.sql: "This however will work").
+    for setup in [
+        "CREATE SEQUENCE s3; CREATE TABLE t1 (f3 int DEFAULT nextval('s3'::text));",
+        "CREATE SEQUENCE s3; CREATE TABLE t1 (f3 int DEFAULT nextval(('s3'::text)::regclass));",
+        "CREATE SEQUENCE s3; CREATE VIEW v1 AS SELECT nextval('s3'::text) AS n;",
+        "CREATE SEQUENCE s3; CREATE TABLE t1 (f3 int CHECK (f3 < nextval('s3'::text)));",
+    ] {
+        build(&[("0001.sql", setup), ("0002.sql", "DROP SEQUENCE s3;")]);
+    }
+    // A regclass constant does pin it, wherever it appears.
+    assert_ddl_rejections(&[
+        (
+            "CREATE SEQUENCE s3; CREATE VIEW v1 AS SELECT nextval('s3') AS n;",
+            "DROP SEQUENCE s3;",
+            "cannot drop sequence s3 because other objects depend on it",
+        ),
+        (
+            "CREATE SEQUENCE s3; CREATE VIEW v1 AS SELECT 's3'::regclass AS r;",
+            "DROP SEQUENCE s3;",
+            "cannot drop sequence s3 because other objects depend on it",
+        ),
+    ]);
+}
+
+#[test]
 fn drop_sequence_missing_errors() {
     let result = try_apply(&[("0001.sql", "DROP SEQUENCE missing;")]);
 

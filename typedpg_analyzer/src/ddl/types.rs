@@ -188,6 +188,13 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
         typisdefined: true,
     });
 
+    // GenerateTypeDependencies: a domain depends on its base type.
+    super::depend::record(
+        interp,
+        super::depend::ObjectAddress::type_(oid),
+        [super::depend::ObjectAddress::type_(base_type_oid)],
+        crate::pg_catalog::DepType::Normal,
+    );
     register_array_type(interp, nsoid, &name, oid)?;
     if has_default {
         interp.domain_defaults.insert(oid);

@@ -1016,6 +1016,16 @@ fn drop_type_oid(interp: &mut PgCatalog, type_oid: PgTypeOid, deps: TypeDependen
         interp.remove_dependencies_of(PG_TYPE_RELID, arr_obj);
         interp.remove_dependencies_on(PG_TYPE_RELID, arr_obj);
     }
+    // A composite type's relation (relkind 'c') is internal to it: it goes
+    // along, and with it its attributes and what they depend on.
+    if let Some(rel) = interp
+        .pg_type
+        .get(&type_oid)
+        .and_then(|t| t.typrelid)
+        .filter(|r| interp.pg_class.get(r).map(|c| c.relkind) == Some(RelKind::CompositeType))
+    {
+        drop_relation_by_oid(interp, rel);
+    }
     interp.remove_pg_type(type_oid);
     let type_obj = crate::oid::PgGenericOid::from_nonzero(type_oid.into_nonzero());
     interp.remove_dependencies_of(PG_TYPE_RELID, type_obj);

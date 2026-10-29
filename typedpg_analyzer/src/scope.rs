@@ -112,6 +112,10 @@ pub(crate) struct TableSource {
     /// The relation behind a FROM item that names one (dependencies on its
     /// columns are noted as they are resolved).
     pub relid: Option<crate::oid::PgClassOid>,
+    /// For a FROM function returning a named composite type: each column's
+    /// attribute of the type's relation, by position (dependencies on them
+    /// are noted as the columns are resolved — process_function_rte_ref).
+    pub rowtype_columns: Vec<Option<(crate::oid::PgClassOid, String)>>,
     /// What kind of range-table entry PG would build for this FROM item —
     /// drives the locking-clause rules (`transformLockingClause`).
     pub kind: SourceKind,
@@ -261,6 +265,7 @@ impl TableSource {
             system_columns: Vec::new(),
             source_qn: None,
             relid: None,
+            rowtype_columns: Vec::new(),
             join_hidden: Default::default(),
             lateral_blocked: false,
             kind: SourceKind::Other,
@@ -304,6 +309,13 @@ impl TableSource {
     pub(crate) fn note_column(&self, name: &str) {
         if let Some(relid) = self.relid {
             crate::ddl::depend::note_column(relid, name);
+        } else if let Some(Some((relid, attname))) = self
+            .columns
+            .iter()
+            .position(|c| c.name == name)
+            .and_then(|i| self.rowtype_columns.get(i))
+        {
+            crate::ddl::depend::note_column(*relid, attname);
         }
     }
 

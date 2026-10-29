@@ -1281,6 +1281,16 @@ pub(crate) fn drop_constraint(
         }
     }
 
+    // What else depends on the constraint: a query relying on a primary key
+    // for its GROUP BY (check_functional_grouping's constraintDeps).
+    let addr = crate::ddl::depend::ObjectAddress::new(
+        crate::ddl::depend::PG_CONSTRAINT_RELID,
+        oid.into_nonzero(),
+        0,
+    );
+    let desc = crate::ddl::depend::describe(interp, addr);
+    crate::ddl::depend::drop_dependents(interp, addr, &desc, cascade)?;
+
     // Drop the backing index (`<conname>` shares the relname with the
     // constraint for PK/UNIQUE) before dropping the constraint itself —
     // with CASCADE, the foreign keys referencing it go too.

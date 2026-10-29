@@ -2142,7 +2142,8 @@ pub(crate) fn finish_select_level(
             .collect(),
         None => group.vars.clone(),
     };
-    let mut fully_grouped: HashSet<String> = HashSet::new();
+    // Each such table's alias, with the primary key the query then relies on.
+    let mut fully_grouped: HashMap<String, crate::oid::PgConstraintOid> = HashMap::new();
     // The tables behind an aliased join are range-table entries too (its
     // columns flatten to theirs).
     for src in scope.sources.iter().chain(&scope.shadowed_sources) {
@@ -2165,7 +2166,7 @@ pub(crate) fn finish_select_level(
                         .is_some_and(|a| common.contains(&(src.alias.clone(), a.attname.clone())))
                 });
             if all_grouped {
-                fully_grouped.insert(src.alias.clone());
+                fully_grouped.insert(src.alias.clone(), pk.oid);
             }
         }
     }
@@ -2539,7 +2540,7 @@ struct UngroupedCheck<'a> {
     snapshot: &'a PgCatalog,
     scope: &'a Scope,
     group: &'a GroupExprs,
-    fully_grouped: &'a HashSet<String>,
+    fully_grouped: &'a HashMap<String, crate::oid::PgConstraintOid>,
 }
 
 impl UngroupedCheck<'_> {
@@ -2691,7 +2692,14 @@ impl UngroupedCheck<'_> {
         {
             return Ok(());
         }
-        if self.fully_grouped.contains(alias) {
+        if let Some(pk) = self.fully_grouped.get(alias) {
+            // check_functional_grouping: the query now depends on the key
+            // (query->constraintDeps).
+            crate::ddl::depend::note(crate::ddl::depend::ObjectAddress::new(
+                crate::ddl::depend::PG_CONSTRAINT_RELID,
+                pk.into_nonzero(),
+                0,
+            ));
             return Ok(());
         }
         // An entry an aliased join hides goes by its name; a JOIN USING

@@ -726,7 +726,11 @@ fn install_relation(
         typisdefined: true,
     });
 
-    record_view_dependencies(interp, class_oid, &deps);
+    // CREATE TABLE AS stores the query's rows, not the query: the table
+    // depends on nothing it read (intorel_startup creates a plain table).
+    if matches!(relkind, RelKind::View | RelKind::MaterializedView) {
+        record_view_dependencies(interp, class_oid, &deps);
+    }
     Ok(())
 }
 

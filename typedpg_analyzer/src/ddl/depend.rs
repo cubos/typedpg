@@ -1165,7 +1165,15 @@ fn delete_object_now(interp: &mut PgCatalog, addr: ObjectAddress) -> Result<(), 
                                 .retain(|_, c| !(c.conrelid == table && c.conname == name));
                         }
                     }
-                    _ => super::drop::drop_relation_by_oid(interp, relid),
+                    _ => {
+                        // Its inheritance children and partitions go along
+                        // (a partition is part of its parent; a child
+                        // depends on it).
+                        for child in super::tables::inherit::children_of(interp, relid) {
+                            delete_object(interp, ObjectAddress::relation(child))?;
+                        }
+                        super::drop::drop_relation_by_oid(interp, relid);
+                    }
                 }
             }
         }
@@ -1487,6 +1495,17 @@ pub(crate) fn record_column_expression(interp: &mut PgCatalog, relid: PgClassOid
         &[&expr],
         Some(relid),
     );
+}
+
+/// A partitioned table depends on what its key expressions refer to
+/// (StorePartitionKey → recordDependencyOnSingleRelExpr); the columns of
+/// its own it reads are guarded by ATExecDropColumn.
+pub(crate) fn record_partition_key_expressions(
+    interp: &mut PgCatalog,
+    relid: PgClassOid,
+    exprs: &[&typedpg_pg_query::protobuf::Node],
+) {
+    record_expressions(interp, ObjectAddress::relation(relid), exprs, Some(relid));
 }
 
 /// An index depends on what its expressions and predicate refer to
