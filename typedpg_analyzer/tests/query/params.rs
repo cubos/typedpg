@@ -1087,6 +1087,15 @@ fn parameter_types_follow_pg_clause_order() {
         "SELECT $1::int FROM a ORDER BY y = $1",
         "SELECT $1::int FROM a GROUP BY y HAVING y = $1",
         "SELECT (SELECT $1::int) FROM a WHERE y = $1",
+        // A subquery's select list is transformed before its own WHERE,
+        // at any depth.
+        "SELECT (SELECT (SELECT $1::int) FROM a WHERE y = $1)",
+        "SELECT (SELECT (SELECT $1::int) FROM a ORDER BY y = $1 LIMIT 1)",
+        "SELECT (SELECT (SELECT (SELECT $1::int)) FROM a WHERE y = $1)",
+        "SELECT (SELECT (SELECT $1::int) FROM a WHERE y = $1) FROM a WHERE y = $1",
+        "SELECT 1 FROM a WHERE EXISTS (SELECT (SELECT $1::int) FROM a WHERE y = $1)",
+        "SELECT (SELECT ROW((SELECT $1::int), 1) FROM a WHERE y = $1).*",
+        "SELECT (SELECT a FROM a WHERE x = (SELECT (SELECT $1::int) FROM a WHERE y = $1)).*",
         "SELECT count(*) FROM a GROUP BY y = $1 HAVING $1::int > 0",
     ] {
         let err = db.analyze(sql).unwrap_err();
@@ -1097,6 +1106,11 @@ fn parameter_types_follow_pg_clause_order() {
         );
     }
     assert_param_types(&db, "SELECT $1::int FROM a LIMIT $1", &[int4()]);
+    assert_param_types(
+        &db,
+        "SELECT (SELECT (SELECT $1) FROM a WHERE y = $1)",
+        &[text()],
+    );
     assert_param_types(&db, "SELECT y = $1 FROM a WHERE $1::int = 1", &[text()]);
     assert_param_types(&db, "UPDATE a SET y = $1 RETURNING $1::int", &[int4()]);
     assert_param_types(&db, "UPDATE a SET y = $1 WHERE x = $1", &[int4()]);

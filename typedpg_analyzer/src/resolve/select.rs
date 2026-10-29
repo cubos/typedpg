@@ -620,12 +620,21 @@ fn analyze_select_here(
     analyze_limit_offset(sel, expr::Ctx::new(&scope, &null_ctx, snapshot), params)?;
     expr::check_window_clause(sel, expr::Ctx::new(&scope, &null_ctx, snapshot), params)?;
 
-    // Resolve target list (SELECT expressions) — no type expectation.
-    let (mut columns, explicit_collations) = resolve_target_list_explicit(
-        &sel.target_list,
-        expr::Ctx::new(&scope, &null_ctx, snapshot),
-        params,
-    )?;
+    // Resolve target list (SELECT expressions) — no type expectation. The
+    // replay after FROM analyzed its subqueries in full, except under a
+    // `(…).*`, which it leaves to this pass.
+    let mut resolve_targets = || {
+        resolve_target_list_explicit(
+            &sel.target_list,
+            expr::Ctx::new(&scope, &null_ctx, snapshot),
+            params,
+        )
+    };
+    let (mut columns, explicit_collations) = if star_over_expression(&sel.target_list) {
+        resolve_targets()
+    } else {
+        expr::with_targets_replayed(resolve_targets)
+    }?;
     // An entry that is a grouping item of its own some grouping set omits
     // is NULL in that set's rows, whatever the item its key reads (unless
     // an alias' annotation settles it).
@@ -741,6 +750,21 @@ fn analyze_select_here(
         snapshot,
     ));
     Ok((columns, None))
+}
+
+/// Whether a target list holds a `(expr).*`.
+fn star_over_expression(target_list: &[protobuf::Node]) -> bool {
+    target_list.iter().any(|t| {
+        matches!(
+            t.node.as_ref(),
+            Some(node::Node::ResTarget(rt))
+                if matches!(
+                    rt.val.as_deref().and_then(|v| v.node.as_ref()),
+                    Some(node::Node::AIndirection(i))
+                        if i.indirection.iter().any(|f| matches!(f.node.as_ref(), Some(node::Node::AStar(_))))
+                )
+        )
+    })
 }
 
 /// Whether `sel` may be an aggregate query: HAVING, or a call that may be

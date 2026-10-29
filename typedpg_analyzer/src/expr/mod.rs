@@ -1490,13 +1490,16 @@ pub(crate) fn coerce_unknown_to(
 /// An entry that fails to resolve there fails in PG before any later
 /// clause is looked at: its error is returned, so a query wrong in both
 /// its select list and its WHERE reports the select list's, as PG does.
-/// But past the last bare `$N`, an entry holding a subquery is left to the
-/// final pass when it holds no parameter to type, or when this is already
-/// the replay of an enclosing level's subquery: replaying it at every level
-/// of nested sublinks would analyze the innermost one 2^depth times (only
-/// which of several errors comes first may then differ from PG, or a
-/// parameter typed only inside a subquery nested in a select-list subquery
-/// be typed by a later clause first).
+/// But past the last bare `$N`, an entry holding a subquery and no
+/// parameter to type is left to the final pass (only which of several
+/// errors comes first may then differ from PG).
+///
+/// A subquery replayed here is analyzed in full, its own select-list
+/// replay included, so the types it deduces at any depth are fixed before
+/// this level's WHERE & co. Re-analyzing it in the final pass would replay
+/// it again, at each level of nested sublinks — 2^depth times — for types
+/// already fixed: the caller runs that pass under
+/// [`with_targets_replayed`], where every subquery entry is skipped here.
 pub(crate) fn note_untyped_output_params(
     target_list: &[protobuf::Node],
     ctx: Ctx<'_>,
@@ -1510,31 +1513,44 @@ pub(crate) fn note_untyped_output_params(
         )
     };
     let last_bare_param = target_list.iter().rposition(is_bare_param);
-    let nested = REPLAYING_TARGETS.with(|r| r.replace(true));
+    let replayed = TARGETS_REPLAYED.with(std::cell::Cell::get);
     let mut scratch = params.clone();
-    let replayed = replay_targets(
+    replay_targets(
         target_list,
         last_bare_param,
-        nested,
+        replayed,
         ctx,
         params,
         &mut scratch,
-    );
-    REPLAYING_TARGETS.with(|r| r.set(nested));
-    replayed?;
+    )?;
     params.adopt_types(&scratch);
     Ok(())
 }
 
 thread_local! {
-    /// Whether [`note_untyped_output_params`] is replaying a target list.
-    static REPLAYING_TARGETS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether the analysis is inside [`with_targets_replayed`].
+    static TARGETS_REPLAYED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` — a SELECT's final pass over a target list that
+/// [`note_untyped_output_params`] just replayed — with the replay of
+/// every subquery entry skipped in the subqueries `f` analyzes: the replay
+/// already analyzed them in full and fixed the types they deduce.
+pub(crate) fn with_targets_replayed<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TARGETS_REPLAYED.with(|r| r.set(self.0));
+        }
+    }
+    let _restore = Restore(TARGETS_REPLAYED.with(|r| r.replace(true)));
+    f()
 }
 
 fn replay_targets(
     target_list: &[protobuf::Node],
     last_bare_param: Option<usize>,
-    nested: bool,
+    replayed: bool,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
     scratch: &mut ParamCollector,
@@ -1565,9 +1581,8 @@ fn replay_targets(
             Some(node::Node::AIndirection(i)) if star(&i.indirection) => continue,
             _ => {}
         }
-        if last_bare_param.is_none_or(|last| i > last)
-            && has_sublink(val)
-            && (nested || !has_param_ref(val))
+        if has_sublink(val)
+            && (replayed || (last_bare_param.is_none_or(|last| i > last) && !has_param_ref(val)))
         {
             continue;
         }
