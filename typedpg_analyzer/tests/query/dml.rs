@@ -536,6 +536,63 @@ fn not_null_violation_names_the_partition_the_row_goes_to() {
     }
 }
 
+/// Where the analyzer can't tell which partition PG routes the row to, the
+/// NOT NULL violation names the target table rather than guess a partition.
+/// PG names the leaf it routes the row to at run time (or, for a row no
+/// partition takes, reports that first), so these diverge from it by
+/// design and opt out of the mirror.
+#[test]
+fn not_null_violation_names_the_target_when_the_partition_is_unknown() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE errtst (a text, b text NOT NULL, c int) PARTITION BY LIST (a);
+         CREATE TABLE errtst_part_1 PARTITION OF errtst FOR VALUES IN ('aaa');
+         CREATE TABLE errtst_part_2 PARTITION OF errtst FOR VALUES IN ('bbb', NULL)
+             PARTITION BY RANGE (c);
+         CREATE TABLE errtst_part_2_lo PARTITION OF errtst_part_2 FOR VALUES FROM (0) TO (10);
+         CREATE TABLE errtst_default PARTITION OF errtst DEFAULT;
+         CREATE TABLE hashed (a int, b text NOT NULL) PARTITION BY HASH (a);
+         CREATE TABLE hashed_0 PARTITION OF hashed FOR VALUES WITH (MODULUS 2, REMAINDER 0);
+         CREATE TABLE hashed_1 PARTITION OF hashed FOR VALUES WITH (MODULUS 2, REMAINDER 1);
+         CREATE COLLATION user_c FROM \"C\";
+         CREATE TABLE collated (a text COLLATE user_c, b text NOT NULL) PARTITION BY LIST (a);
+         CREATE TABLE collated_aaa PARTITION OF collated FOR VALUES IN ('aaa');
+         CREATE TABLE collated_default PARTITION OF collated DEFAULT;",
+    )
+    .unwrap();
+    db.skip_pg_sanity();
+    let not_null = |relation: &str| {
+        format!(r#"null value in column "b" of relation "{relation}" violates not-null constraint"#)
+    };
+    for (sql, relation) in [
+        // A parameter key: the partition depends on its value.
+        ("INSERT INTO errtst (a, b) VALUES ($1, NULL)", "errtst"),
+        // A key that is not a literal (PG routes it to errtst_part_1).
+        (
+            "INSERT INTO errtst (a, b) VALUES ('a' || 'aa', NULL)",
+            "errtst",
+        ),
+        // HASH partitioning (PG routes 1 to hashed_0).
+        ("INSERT INTO hashed VALUES (1, NULL)", "hashed"),
+        // A text key under a user's collation (PG routes it to collated_aaa).
+        ("INSERT INTO collated VALUES ('aaa', NULL)", "collated"),
+        // A sub-partition no partition of which takes the row: PG reports
+        // `no partition of relation "errtst_part_2" found for row` first.
+        ("INSERT INTO errtst VALUES ('bbb', NULL, -5)", "errtst"),
+        (
+            "MERGE INTO errtst t USING (SELECT 1 k) s ON false \
+             WHEN NOT MATCHED THEN INSERT (a, b) VALUES ($1, NULL)",
+            "errtst",
+        ),
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::Invalid(_),
+            &not_null(relation)
+        );
+    }
+}
+
 #[test]
 fn insert_values_row_wrong_arity_rejected() {
     let db = setup();

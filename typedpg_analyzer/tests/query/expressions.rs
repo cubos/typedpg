@@ -1063,6 +1063,20 @@ fn internal_support_functions_are_not_callable() {
     for sql in ["SELECT gtsvectorout('1')", "SELECT '1'::gtsvector"] {
         assert_err_prefix(&db, sql, "cannot accept a value of type gtsvector");
     }
+    // Nothing coerces to `internal`, an unknown parameter included: a
+    // function accepting it has no candidate (PG reaches its "accepting
+    // type internal" check only for a parameter PREPARE declares
+    // `internal`).
+    assert_err_prefix(
+        &db,
+        "SELECT array_typanalyze($1)",
+        "function array_typanalyze(unknown) does not exist",
+    );
+    assert_err_prefix(
+        &db,
+        "SELECT array_typanalyze(internal_in('1'))",
+        r#"functions returning type "internal" cannot be called explicitly"#,
+    );
     // The type's output function is callable, on a value it never gets.
     db.analyze("SELECT gtsvectorout(NULL), textin('a'::cstring)")
         .unwrap();
