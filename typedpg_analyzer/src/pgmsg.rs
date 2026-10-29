@@ -454,6 +454,15 @@ pub(crate) fn cannot_assign_to_system_column(column: &str, span: Option<SourceSp
     )
 }
 
+/// `row comparison operator must yield type boolean, not type integer` —
+/// SQLSTATE 42804 (`make_row_comparison_op`, which a row `IN` / `ANY` /
+/// `ALL` subquery comparison goes through even for a single column).
+pub(crate) fn row_comparison_operator_not_boolean(type_name: &str) -> AnalyzeError {
+    AnalyzeError::DatatypeMismatch(format!(
+        "row comparison operator must yield type boolean, not type {type_name}"
+    ))
+}
+
 /// `functions returning type "internal" cannot be called explicitly` (or
 /// `accepting`) — SQLSTATE 0A000 (`ParseFuncOrColumn`).
 pub(crate) fn internal_function_call(returning: bool, span: Option<SourceSpan>) -> RawError {
@@ -1824,6 +1833,7 @@ mod tests {
             (infinite_rule_recursion("t").kind, "42P17"),
             (cannot_change_relation("sequence", "s").kind, "42809"),
             (any_all_operator_not_boolean(None).kind, "42809"),
+            (row_comparison_operator_not_boolean("integer"), "42804"),
             (internal_function_call(true, None).kind, "0A000"),
             (merge_when_system_column("xmin", None).kind, "42P10"),
             (merge_with_recursive().kind, "42601"),

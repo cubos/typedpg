@@ -158,9 +158,7 @@ pub(crate) fn infer_sublink(
                     {
                         let name =
                             crate::ddl::util::format_type_for_message(snapshot, op.result_type_oid);
-                        return Err(AnalyzeError::DatatypeMismatch(format!(
-                            "row comparison operator must yield type boolean, not type {name}"
-                        )));
+                        return Err(crate::pgmsg::row_comparison_operator_not_boolean(&name));
                     }
                     ops.push(found.clone());
                     match found {
