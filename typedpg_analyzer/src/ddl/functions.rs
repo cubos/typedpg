@@ -997,13 +997,8 @@ fn funcname_get_candidates(
             "schema \"{s}\" does not exist"
         )));
     }
-    // Routines are never looked up in the temporary schema implicitly.
-    let temp = interp.temp_namespace.filter(|_| schema.is_none());
     let mut out: Vec<FuncCandidate> = Vec::new();
-    for nsoid in interp.schemas_for_lookup(schema) {
-        if Some(nsoid) == temp {
-            continue;
-        }
+    for nsoid in interp.schemas_for_function_lookup(schema) {
         let Some(oids) = interp.proc_by_qname.get(&(nsoid, name.to_owned())) else {
             continue;
         };

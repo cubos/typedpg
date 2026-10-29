@@ -127,6 +127,19 @@ impl PgCatalog {
         out
     }
 
+    /// [`Self::schemas_for_lookup`] for routines: the temporary schema is
+    /// never searched for them implicitly (FuncnameGetCandidates), so a
+    /// function in `pg_temp` is only reached by its qualified name.
+    pub(crate) fn schemas_for_function_lookup(&self, schema: Option<&str>) -> Vec<PgNamespaceOid> {
+        let mut out = self.schemas_for_lookup(schema);
+        if schema.is_none()
+            && let Some(temp) = self.temp_namespace
+        {
+            out.retain(|&ns| ns != temp);
+        }
+        out
+    }
+
     // ── Relation / type / function lookups ──────────────────────────────
 
     /// Look up a relation by name, walking the search path when `schema` is
@@ -469,7 +482,7 @@ impl PgCatalog {
         &'a self,
         schema: Option<&'a str>,
     ) -> impl Iterator<Item = &'a str> + 'a {
-        self.schemas_for_lookup(schema)
+        self.schemas_for_function_lookup(schema)
             .into_iter()
             .flat_map(move |nsoid| {
                 self.proc_by_qname
@@ -487,7 +500,7 @@ impl PgCatalog {
     /// `pg_catalog` if not explicitly listed) are concatenated.
     pub fn find_functions(&self, schema: Option<&str>, name: &str) -> Vec<&PgProc> {
         let mut out = Vec::new();
-        for nsoid in self.schemas_for_lookup(schema) {
+        for nsoid in self.schemas_for_function_lookup(schema) {
             if let Some(oids) = self.proc_by_qname.get(&(nsoid, name.to_owned())) {
                 for &oid in oids {
                     if let Some(p) = self.pg_proc.get(&oid) {
@@ -617,6 +630,7 @@ impl PgCatalog {
             &actuals,
             &mut declared,
             result,
+            false,
             self,
         ) {
             Ok((result_type_oid, _)) => {

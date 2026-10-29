@@ -25,6 +25,11 @@ pub(crate) struct CallNotation {
     /// since PG 14 — its OUT parameters take arguments too
     /// (`include_out_arguments`), so candidates match over `proallargtypes`.
     pub proc_call: bool,
+    /// The argument types may be polymorphic themselves, and then match
+    /// the same pseudo-type without binding it (`allow_poly`): how
+    /// `lookup_agg_function` resolves a polymorphic aggregate's support
+    /// functions.
+    pub allow_poly: bool,
 }
 
 impl CallNotation {
@@ -61,6 +66,7 @@ impl CallNotation {
             names,
             variadic: fc.func_variadic,
             proc_call: false,
+            allow_poly: false,
         })
     }
 }
@@ -354,6 +360,7 @@ pub(crate) fn func_get_detail(
         &actuals,
         &mut declared,
         rettype,
+        notation.allow_poly,
         snapshot,
     )
     .map_err(|e| crate::error::RawError::new(e, span, None).finalize_implicit())?;
@@ -578,7 +585,7 @@ fn func_candidates<'a>(
     nargs: usize,
     notation: &CallNotation,
 ) -> Vec<Candidate<'a>> {
-    let path = snapshot.schemas_for_lookup(schema);
+    let path = snapshot.schemas_for_function_lookup(schema);
     let mut out: Vec<Candidate<'a>> = Vec::new();
     for f in snapshot.find_functions(schema, name) {
         let pathpos = path

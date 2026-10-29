@@ -519,7 +519,7 @@ pub(crate) fn transform_array_expr(
     // one shape; a NULL or empty sub-array is allowed only when every one
     // is (the result is then empty). Sub-arrays the query fixes the shape
     // of that can't agree fail every evaluation.
-    if multidims {
+    if multidims && crate::resolve::executes() {
         let shapes: Vec<SubArrayShape> = arr
             .elements
             .iter()

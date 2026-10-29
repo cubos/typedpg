@@ -269,6 +269,31 @@ fn comment_on_requires_an_existing_target() {
             "COMMENT ON FUNCTION nosuch(int) IS 'x';",
             "function nosuch(integer) does not exist",
         ),
+        // get_object_address looks routines up with LookupFuncWithArgs.
+        (
+            "COMMENT ON AGGREGATE nosuchagg (*) IS 'x';",
+            "aggregate nosuchagg(*) does not exist",
+        ),
+        (
+            "COMMENT ON AGGREGATE count (int) IS 'x';",
+            "aggregate count(integer) does not exist",
+        ),
+        (
+            "COMMENT ON AGGREGATE abs (int) IS 'x';",
+            "function abs(integer) is not an aggregate",
+        ),
+        (
+            "COMMENT ON PROCEDURE abs (int) IS 'x';",
+            "abs(integer) is not a procedure",
+        ),
+        (
+            "COMMENT ON FUNCTION nosuch(nosuchtype) IS 'x';",
+            "type \"nosuchtype\" does not exist",
+        ),
+        (
+            "COMMENT ON FUNCTION nosuchf IS 'x';",
+            "could not find a function named \"nosuchf\"",
+        ),
         (
             "COMMENT ON SCHEMA nosuch IS 'x';",
             "schema \"nosuch\" does not exist",
@@ -292,7 +317,9 @@ fn comment_on_requires_an_existing_target() {
          COMMENT ON TABLE t IS 'x';
          COMMENT ON COLUMN t.a IS NULL;
          COMMENT ON CONSTRAINT t_pkey ON t IS 'pk';
-         COMMENT ON SCHEMA public IS 'p';",
+         COMMENT ON SCHEMA public IS 'p';
+         COMMENT ON AGGREGATE count(*) IS 'c';
+         COMMENT ON FUNCTION abs(int) IS 'a';",
     )]);
 }
 
@@ -2184,6 +2211,43 @@ fn rule_returning_lists_and_the_return_rule_are_validated() {
 }
 
 #[test]
+fn a_rule_action_is_not_executed_at_create_rule() {
+    // PG 18 transformRuleStmt only parses and analyzes the actions: a
+    // literal NULL written into a NOT NULL column fails when the rule
+    // fires, not when it is created.
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int NOT NULL, b int);
+         CREATE VIEW vv AS SELECT a FROM t;
+         CREATE RULE r1 AS ON INSERT TO vv DO INSTEAD INSERT INTO t VALUES (NULL, 3) RETURNING b;
+         CREATE RULE r2 AS ON UPDATE TO vv DO INSTEAD UPDATE t SET a = NULL;
+         CREATE DOMAIN d AS int NOT NULL;
+         CREATE MATERIALIZED VIEW mv AS SELECT 1 AS a;
+         CREATE RULE r3 AS ON DELETE TO vv DO INSTEAD (
+             SELECT NULL::d, ARRAY[ARRAY[1], NULL];
+             INSERT INTO mv VALUES (1));
+         CREATE TABLE t2 (x int);
+         CREATE RULE r4 AS ON INSERT TO t2 WHERE new.x > 0 DO ALSO INSERT INTO t VALUES (NULL, new.x);
+         INSERT INTO t2 VALUES (-1);",
+    )]);
+    // A conditional rule's action runs only for the rows its qual accepts.
+    db.analyze("INSERT INTO t2 VALUES ($1)").unwrap();
+    // A statement firing the rule runs its action: every execution fails —
+    // for the UPDATE, every one changing a row (PG fails only those; the
+    // oracle's empty tables would not).
+    db.skip_pg_sanity();
+    for sql in ["INSERT INTO vv VALUES (1)", "UPDATE vv SET a = 2"] {
+        let err = db.analyze(sql).expect_err(sql);
+        assert!(
+            err.to_string().starts_with(
+                "null value in column \"a\" of relation \"t\" violates not-null constraint"
+            ),
+            "{sql}\n  got: {err}"
+        );
+    }
+}
+
+#[test]
 fn rules_depend_on_the_relations_their_actions_name() {
     // PG 18 InsertRule records the rule's dependencies on what its actions
     // and qualification read (recordDependencyOnExpr): dropping one needs
@@ -3207,6 +3271,19 @@ fn extended_statistics_are_validated_and_tracked() {
             "CREATE STATISTICS s9 ON a FROM t;",
             "extended statistics require at least 2 columns",
         ),
+        // ProcessUtilitySlow: one FROM item, then a plain relation name.
+        (
+            "CREATE STATISTICS tst ON a FROM (VALUES (x)) AS foo;",
+            "CREATE STATISTICS only supports relation names in the FROM clause",
+        ),
+        (
+            "CREATE STATISTICS tst ON a, b FROM t JOIN u ON true;",
+            "CREATE STATISTICS only supports relation names in the FROM clause",
+        ),
+        (
+            "CREATE STATISTICS tst ON a, b FROM (VALUES (1)) AS foo, t;",
+            "only a single relation is allowed in CREATE STATISTICS",
+        ),
         (
             "CREATE STATISTICS s9 ON a, nosuch FROM t;",
             "column \"nosuch\" does not exist",
@@ -3883,6 +3960,49 @@ fn foreign_data_wrappers_servers_and_user_mappings() {
             "DROP SERVER s CASCADE; SELECT * FROM ft;",
             "relation \"ft\" does not exist",
         ),
+        // transformGenericOptions: each option once (names are folded to
+        // lower case like any identifier).
+        (
+            "CREATE FOREIGN DATA WRAPPER foo OPTIONS (testing '1', testing '2');",
+            "option \"testing\" provided more than once",
+        ),
+        (
+            "CREATE FOREIGN DATA WRAPPER foo OPTIONS (testing '1', Testing '2');",
+            "option \"testing\" provided more than once",
+        ),
+        (
+            "ALTER FOREIGN DATA WRAPPER w OPTIONS (a '1', a '2');",
+            "option \"a\" provided more than once",
+        ),
+        (
+            "CREATE SERVER s2 FOREIGN DATA WRAPPER w OPTIONS (a '1', a '2');",
+            "option \"a\" provided more than once",
+        ),
+        (
+            "ALTER SERVER s OPTIONS (ADD a '1', a '2');",
+            "option \"a\" provided more than once",
+        ),
+        (
+            "CREATE USER MAPPING FOR current_user SERVER s OPTIONS (a '1', a '2');",
+            "option \"a\" provided more than once",
+        ),
+        (
+            "ALTER USER MAPPING FOR public SERVER s OPTIONS (a '1', a '2');",
+            "option \"a\" provided more than once",
+        ),
+        (
+            "CREATE FOREIGN TABLE ft2 (a int OPTIONS (x '1', x '2')) SERVER s;",
+            "option \"x\" provided more than once",
+        ),
+        (
+            "CREATE FOREIGN TABLE ft2 (a int) SERVER s OPTIONS (x '1', x '2');",
+            "option \"x\" provided more than once",
+        ),
+        // The server is looked up first.
+        (
+            "CREATE FOREIGN TABLE ft2 (a int) SERVER nosuch OPTIONS (x '1', x '2');",
+            "server \"nosuch\" does not exist",
+        ),
     ] {
         let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
         assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
@@ -3895,6 +4015,7 @@ fn foreign_data_wrappers_servers_and_user_mappings() {
              ALTER SERVER s RENAME TO s2;
              CREATE FOREIGN TABLE ft3 (a int) SERVER s2;
              ALTER SERVER s2 OPTIONS (ADD host 'x');
+             ALTER SERVER s2 OPTIONS (DROP host, ADD host 'y');
              DROP USER MAPPING IF EXISTS FOR public SERVER nosuch;
              DROP USER MAPPING FOR public SERVER s2;
              DROP SERVER IF EXISTS nosuch;

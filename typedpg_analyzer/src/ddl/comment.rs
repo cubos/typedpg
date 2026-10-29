@@ -208,73 +208,9 @@ pub(crate) fn resolve_object(
         | ObjectType::ObjectProcedure
         | ObjectType::ObjectRoutine
         | ObjectType::ObjectAggregate => {
-            let unspecified = matches!(object, node::Node::ObjectWithArgs(o) if o.args_unspecified);
-            let object = Some(Box::new(typedpg_pg_query::protobuf::Node {
-                node: Some(object.clone()),
-            }));
-            let Some((schema, name, arg_oids)) = super::alter::extract_func_target(&object, interp)
-            else {
-                return Ok(());
-            };
-            let kind = match objtype {
-                ObjectType::ObjectProcedure => "procedure",
-                ObjectType::ObjectAggregate => "aggregate",
-                _ => "function",
-            };
-            // LookupFuncWithArgs without an argument list: the name must be
-            // unique.
-            if unspecified {
-                let candidates = interp.find_functions(schema.as_deref(), &name);
-                return match candidates.len() {
-                    0 => Err(DdlError::TypeNotFound(format!(
-                        "could not find a {kind} named \"{name}\""
-                    ))),
-                    1 => Ok(()),
-                    _ => Err(DdlError::DependencyError(format!(
-                        "{kind} name \"{name}\" is not unique"
-                    ))),
-                };
-            }
-            let found = super::alter::find_proc(interp, schema.as_deref(), &name, &|p| {
-                p.proargtypes == arg_oids
-            });
-            let signature = || {
-                let args = arg_oids
-                    .iter()
-                    .map(|&t| super::util::format_type_for_message(interp, t))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("{name}({args})")
-            };
-            let Some((_, oid)) = found else {
-                return Err(DdlError::DependencyError(format!(
-                    "{kind} {} does not exist",
-                    signature()
-                )));
-            };
-            // LookupFuncWithArgs: the object type must match the kind.
-            let prokind = interp.pg_proc.get(&oid).map(|p| p.prokind);
-            use crate::pg_catalog::ProKind;
-            match objtype {
-                ObjectType::ObjectFunction if prokind == Some(ProKind::Procedure) => {
-                    return Err(DdlError::Parse(format!(
-                        "{} is not a function",
-                        signature()
-                    )));
-                }
-                ObjectType::ObjectProcedure if prokind != Some(ProKind::Procedure) => {
-                    return Err(DdlError::Parse(format!(
-                        "{} is not a procedure",
-                        signature()
-                    )));
-                }
-                ObjectType::ObjectAggregate if prokind != Some(ProKind::Aggregate) => {
-                    return Err(DdlError::Parse(format!(
-                        "function {} is not an aggregate",
-                        signature()
-                    )));
-                }
-                _ => {}
+            // get_object_address: LookupFuncWithArgs.
+            if let node::Node::ObjectWithArgs(owa) = object {
+                super::functions::lookup_func_with_args(interp, objtype, owa, false)?;
             }
         }
         ObjectType::ObjectTsconfiguration

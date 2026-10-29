@@ -119,7 +119,9 @@ fn validate_sql_body(
         // check_function_bodies off an inline body is only parsed.
         let analyzed = crate::expr::with_rewriting(check_bodies, || {
             crate::expr::with_sql_function_params(namespace(), || {
-                crate::resolve::analyze_raw_node_with_param_types(interp, inner, &param_types)
+                crate::resolve::without_execution(|| {
+                    crate::resolve::analyze_raw_node_with_param_types(interp, inner, &param_types)
+                })
             })
         });
         let columns = match analyzed {

@@ -106,6 +106,36 @@ fn check_functions(
     Ok(())
 }
 
+/// transformGenericOptions: an option may be given once. The options
+/// aren't stored, so an ALTER's list is checked on its own — an ADD (or a
+/// bare option) repeating one set earlier in the same list, and not
+/// dropped since, fails whatever the object held before.
+pub(crate) fn check_generic_options(
+    options: &[typedpg_pg_query::protobuf::Node],
+) -> Result<(), DdlError> {
+    use typedpg_pg_query::protobuf::DefElemAction;
+    let mut seen: Vec<&str> = Vec::new();
+    for opt in options {
+        let Some(node::Node::DefElem(de)) = opt.node.as_ref() else {
+            continue;
+        };
+        let name = de.defname.as_str();
+        match DefElemAction::try_from(de.defaction) {
+            Ok(DefElemAction::DefelemDrop) => seen.retain(|n| *n != name),
+            Ok(DefElemAction::DefelemSet) => {}
+            _ => {
+                if seen.contains(&name) {
+                    return Err(DdlError::DuplicateObject(format!(
+                        "option \"{name}\" provided more than once"
+                    )));
+                }
+                seen.push(name);
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn create_fdw(interp: &mut PgCatalog, stmt: &CreateFdwStmt) -> Result<(), DdlError> {
     if interp.foreign_data.wrappers.contains(&stmt.fdwname) {
         return Err(DdlError::DuplicateObject(format!(
@@ -114,6 +144,7 @@ pub fn create_fdw(interp: &mut PgCatalog, stmt: &CreateFdwStmt) -> Result<(), Dd
         )));
     }
     check_functions(interp, &stmt.func_options)?;
+    check_generic_options(&stmt.options)?;
     interp.foreign_data.wrappers.push(stmt.fdwname.clone());
     Ok(())
 }
@@ -123,7 +154,8 @@ pub fn alter_fdw(
     stmt: &typedpg_pg_query::protobuf::AlterFdwStmt,
 ) -> Result<(), DdlError> {
     check_fdw(interp, &stmt.fdwname)?;
-    check_functions(interp, &stmt.func_options)
+    check_functions(interp, &stmt.func_options)?;
+    check_generic_options(&stmt.options)
 }
 
 pub fn create_server(
@@ -145,6 +177,7 @@ pub fn create_server(
         )));
     }
     check_fdw(interp, &stmt.fdwname)?;
+    check_generic_options(&stmt.options)?;
     interp
         .foreign_data
         .servers
@@ -156,7 +189,8 @@ pub fn alter_server(
     interp: &PgCatalog,
     stmt: &typedpg_pg_query::protobuf::AlterForeignServerStmt,
 ) -> Result<(), DdlError> {
-    check_server(interp, &stmt.servername)
+    check_server(interp, &stmt.servername)?;
+    check_generic_options(&stmt.options)
 }
 
 /// The role a user mapping is for, as PG names it in messages.
@@ -186,6 +220,7 @@ pub fn create_user_mapping(
             stmt.servername
         )));
     }
+    check_generic_options(&stmt.options)?;
     interp.foreign_data.user_mappings.push(key);
     Ok(())
 }
@@ -206,7 +241,7 @@ pub fn alter_user_mapping(
             stmt.servername
         )));
     }
-    Ok(())
+    check_generic_options(&stmt.options)
 }
 
 pub fn drop_user_mapping(

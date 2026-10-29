@@ -152,7 +152,11 @@ fn define_rule(
         pseudo_refs(action, false)?;
         check_action_relations(interp, action)?;
         let ((checked, refs), rewrites) = crate::resolve::rewrite::collect_rule_actions(|| {
-            super::depend::collect(|| check_action_query(interp, relid, action, has_old, has_new))
+            super::depend::collect(|| {
+                crate::resolve::without_execution(|| {
+                    check_action_query(interp, relid, action, has_old, has_new)
+                })
+            })
         });
         outputs.push(checked?);
         references.extend(refs);

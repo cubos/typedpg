@@ -1492,7 +1492,7 @@ fn check_null_domain_casts(
     sel: &protobuf::SelectStmt,
     snapshot: &PgCatalog,
 ) -> Result<(), AnalyzeError> {
-    if sel.limit_count.is_some() || sel.limit_offset.is_some() {
+    if !executes() || sel.limit_count.is_some() || sel.limit_offset.is_some() {
         return Ok(());
     }
     if sel.op != protobuf::SetOperation::SetopNone as i32 {
@@ -1544,6 +1544,28 @@ fn check_null_domain_casts(
     }
 }
 
+thread_local! {
+    static UNEXECUTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` analyzing a statement PG parses and analyzes but doesn't run —
+/// a rule's action (transformRuleStmt), a SQL function's body
+/// (fmgr_sql_validator): the errors only its execution raises, however
+/// certain (a NULL stored into a NOT NULL column or domain, a NULL cast to
+/// a NOT NULL domain, sub-arrays that can't agree, a result relation the
+/// executor can't change), are not reported.
+pub(crate) fn without_execution<R>(f: impl FnOnce() -> R) -> R {
+    let prev = UNEXECUTED.with(|c| c.replace(true));
+    let out = f();
+    UNEXECUTED.with(|c| c.set(prev));
+    out
+}
+
+/// Whether the statement being analyzed runs (see [`without_execution`]).
+pub(crate) fn executes() -> bool {
+    !UNEXECUTED.with(std::cell::Cell::get)
+}
+
 /// If assigning a literal `NULL` to `tc` would violate a NOT-NULL guarantee
 /// (either column-level `attnotnull`, or a domain in the type chain whose
 /// `typnotnull` is set), return the matching `AnalyzeError`. `op` selects
@@ -1564,6 +1586,9 @@ fn null_assignment_error(
     table_relname: &str,
     op: &'static str,
 ) -> Option<AnalyzeError> {
+    if !executes() {
+        return None;
+    }
     let event = if op == "insert" {
         DmlEvent::Insert
     } else {

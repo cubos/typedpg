@@ -1058,7 +1058,7 @@ fn omitted_domain_nulls(
             crate::pg_catalog::RelKind::Table | crate::pg_catalog::RelKind::Partitioned
         )
     });
-    if !is_table {
+    if !is_table || !super::executes() {
         return Vec::new();
     }
     let given: Vec<&str> = items

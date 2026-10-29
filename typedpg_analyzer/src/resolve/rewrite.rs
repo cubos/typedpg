@@ -235,8 +235,12 @@ pub(crate) fn collect_rule_actions<R>(f: impl FnOnce() -> R) -> (R, Vec<RuleActi
 }
 
 /// One `RewriteQuery` level. `execution_error` collects the NOT NULL
-/// violation a bare `NULL` written through a view to the base relation
-/// raises at execution — after every rewriter error; `rewrite_events` holds
+/// violation a bare `NULL` written through a view to the base relation, or
+/// by an unconditional rule's action (whose analysis at CREATE RULE doesn't
+/// report it), raises at execution — after every rewriter error; `depth`
+/// is 0 where none is reported: for the statement itself, whose analysis
+/// did, and for a conditional rule's action, which runs only for the rows
+/// its qualification accepts; `rewrite_events` holds
 /// the (relation, event) pairs whose product queries are being rewritten.
 fn rewrite_level(
     snapshot: &PgCatalog,
@@ -263,6 +267,7 @@ fn rewrite_level(
     };
     if let Some(kind) = unchangeable
         && !rw.merge
+        && super::executes()
         && execution_error.is_none()
     {
         *execution_error =
@@ -386,8 +391,10 @@ fn rewrite_level(
     // and event already being rewritten means the rules recurse.
     let mut products: Vec<(&RuleAction, usize)> = matching
         .iter()
-        .flat_map(|r| r.actions.iter())
-        .map(|p| (p, 0))
+        .flat_map(|r| {
+            let depth = if r.conditional { 0 } else { depth + 1 };
+            r.actions.iter().map(move |p| (p, depth))
+        })
         .collect();
     if let Some(view) = &view_product {
         let at = if event == Some(DmlEvent::Insert) {

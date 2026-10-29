@@ -165,6 +165,8 @@ pub fn ensure_qualified_name(
 ) -> Result<(PgNamespaceOid, String), DdlError> {
     let parts: Vec<&str> = names.iter().filter_map(node_string).collect();
     let (schema, name) = match parts.as_slice() {
+        // `pg_temp` is the session's temporary schema, created on first use.
+        ["pg_temp", name] => return Ok((temp_namespace(interp)?, (*name).to_owned())),
         [schema, name] => ((*schema).to_owned(), (*name).to_owned()),
         [name] => (creation_schema(interp)?, (*name).to_owned()),
         _ => ("public".to_owned(), String::new()),

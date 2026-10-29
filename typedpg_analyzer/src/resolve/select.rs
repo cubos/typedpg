@@ -1822,7 +1822,7 @@ pub(crate) fn analyze_limit_offset(
 
 /// Whether `cr` resolves against this query level's own FROM items (as
 /// opposed to an enclosing query's).
-fn references_local_column(cr: &protobuf::ColumnRef, scope: &Scope) -> bool {
+pub(crate) fn references_local_column(cr: &protobuf::ColumnRef, scope: &Scope) -> bool {
     let parts = expr::extract_string_fields(&cr.fields);
     match parts.as_slice() {
         [col] => scope

@@ -599,7 +599,10 @@ fn lookup_agg_function(
         schema,
         name,
         input_types,
-        &crate::functions::CallNotation::default(),
+        &crate::functions::CallNotation {
+            allow_poly: true,
+            ..Default::default()
+        },
         false,
         None,
     )

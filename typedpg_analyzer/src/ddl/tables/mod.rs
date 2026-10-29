@@ -978,6 +978,13 @@ pub fn create_foreign_table(
     }
     // CreateForeignTable: GetForeignServerByName.
     crate::ddl::fdw::check_server(interp, &stmt.servername)?;
+    // The columns' and the table's generic options.
+    for elt in &base.table_elts {
+        if let Some(node::Node::ColumnDef(cd)) = elt.node.as_ref() {
+            crate::ddl::fdw::check_generic_options(&cd.fdwoptions)?;
+        }
+    }
+    crate::ddl::fdw::check_generic_options(&stmt.options)?;
     if let Some(rv) = base.relation.as_ref() {
         let (schema, name) = range_var_names(rv, interp);
         if let Some(oid) = interp
