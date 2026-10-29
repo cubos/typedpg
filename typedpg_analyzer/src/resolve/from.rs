@@ -2555,10 +2555,12 @@ fn process_tablesample(
 ///   jsonb`. PASSING values are plain expressions;
 /// - columns: `FOR ORDINALITY` is integer; regular, `FORMAT JSON` and
 ///   `EXISTS` columns take their declared type (with typmod); `NESTED PATH`
-///   contributes its own columns. Column and path names must be unique
-///   (42712 `duplicate JSON_TABLE column or path name`). OMIT QUOTES with a
-///   wrapper is 42601, and a DEFAULT behavior must be a constant expression
-///   coercible to the column (42804 / the input function's error);
+///   contributes its own columns, after the columns of the list it is in.
+///   Column and path names must be unique (42712 `duplicate JSON_TABLE
+///   column or path name`). OMIT QUOTES with a wrapper is 42601; a column's
+///   ON EMPTY / ON ERROR behaviors are those of the JSON_VALUE, JSON_QUERY
+///   or JSON_EXISTS it runs as, and the table's own ON ERROR is only ERROR
+///   or EMPTY [ARRAY];
 /// - every column is nullable (no match, ON EMPTY / ON ERROR, sibling
 ///   nested paths) except the top-level ordinality;
 /// - the RTE is named by the alias (default `json_table`), whose column
@@ -2570,6 +2572,24 @@ fn process_json_table(
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
 ) -> Result<(), AnalyzeError> {
+    if let Some(b) = jt.on_error.as_deref() {
+        use protobuf::JsonBehaviorType as B;
+        if !matches!(
+            B::try_from(b.btype),
+            Ok(B::JsonBehaviorError | B::JsonBehaviorEmpty | B::JsonBehaviorEmptyArray)
+        ) {
+            return Err(crate::error::RawError::new(
+                AnalyzeError::SyntaxError("invalid ON ERROR behavior".into()),
+                crate::error::SourceSpan::from_location(b.location),
+                Some(
+                    "Only EMPTY [ ARRAY ] or ERROR is allowed in the top-level ON ERROR clause."
+                        .into(),
+                ),
+            )
+            .finalize_implicit());
+        }
+    }
+
     let arg_scope = srf_arg_scope(scope);
     let ctx = expr::Ctx::new(&arg_scope, null_ctx, snapshot);
 
@@ -2638,10 +2658,11 @@ fn process_json_table(
         .map(|a| expr::extract_string_fields(&a.colnames))
         .unwrap_or_default();
     if col_aliases.len() > cols.len() {
-        return Err(
-            crate::pgmsg::too_many_column_aliases(alias, cols.len(), col_aliases.len())
-                .finalize_implicit(),
-        );
+        return Err(crate::pgmsg::too_many_json_table_column_aliases(
+            cols.len(),
+            col_aliases.len(),
+        )
+        .finalize_implicit());
     }
     for (c, n) in cols.iter_mut().zip(col_aliases) {
         c.name = n;
@@ -2665,8 +2686,9 @@ fn json_table_path_literal(
     }
 }
 
-/// The columns of one JSON_TABLE `COLUMNS (…)` list, recursing into
-/// `NESTED PATH` lists.
+/// The columns of one JSON_TABLE `COLUMNS (…)` list, then those of its
+/// `NESTED PATH` lists in turn (`transformJsonTableColumns`: a list's own
+/// columns come before its nested paths', wherever they are written).
 fn json_table_columns(
     columns: &[protobuf::Node],
     top_level: bool,
@@ -2692,6 +2714,7 @@ fn json_table_columns(
         names.push(name.to_owned());
         Ok(())
     };
+    let mut nested = Vec::new();
     for n in columns {
         let Some(node::Node::JsonTableColumn(col)) = n.node.as_ref() else {
             continue;
@@ -2704,7 +2727,7 @@ fn json_table_columns(
             {
                 claim(&ps.name, names)?;
             }
-            json_table_columns(&col.columns, false, alias, names, out, ctx, params)?;
+            nested.push(col);
             continue;
         }
         claim(&col.name, names)?;
@@ -2739,39 +2762,34 @@ fn json_table_columns(
             )
             .finalize_implicit());
         }
-        for behavior in [col.on_empty.as_deref(), col.on_error.as_deref()]
-            .into_iter()
-            .flatten()
-        {
-            let Some(default) = behavior.expr.as_deref() else {
-                continue;
-            };
-            // transformJsonBehavior: the DEFAULT must not reference
-            // columns or parameters.
-            let mut volatile = false;
-            visit_same_level(default, &mut |e| {
-                if matches!(
-                    e.node.as_ref(),
-                    Some(
-                        node::Node::ColumnRef(_) | node::Node::ParamRef(_) | node::Node::SubLink(_)
-                    )
-                ) {
-                    volatile = true;
-                }
-            });
-            if volatile {
-                return Err(crate::error::RawError::new(
-                    AnalyzeError::DatatypeMismatch(
-                        "can only specify a constant, non-aggregate function, or operator \
-                         expression for DEFAULT"
-                            .into(),
-                    ),
-                    None,
-                    None,
-                )
-                .finalize_implicit());
+        // A column runs as JSON_EXISTS (EXISTS), JSON_QUERY (FORMAT JSON,
+        // or a regular column with a wrapper / quotes clause or of a type
+        // JSON_QUERY handles better) or JSON_VALUE (appendJsonTableColumns).
+        let op = match kind {
+            Kind::JtcExists => Some(protobuf::JsonExprOp::JsonExistsOp),
+            Kind::JtcFormatted => Some(protobuf::JsonExprOp::JsonQueryOp),
+            Kind::JtcRegular
+                if json_table_query_type(type_oid, snapshot)
+                    || protobuf::JsonQuotes::try_from(col.quotes)
+                        .is_ok_and(|q| q != protobuf::JsonQuotes::JsQuotesUnspec)
+                    || protobuf::JsonWrapper::try_from(col.wrapper)
+                        .is_ok_and(|w| w != protobuf::JsonWrapper::JswUnspec) =>
+            {
+                Some(protobuf::JsonExprOp::JsonQueryOp)
             }
-            expr::coerce_unknown_to(default, ctx, params, type_oid)?;
+            Kind::JtcRegular => Some(protobuf::JsonExprOp::JsonValueOp),
+            _ => None,
+        };
+        if let Some(op) = op {
+            expr::json_behaviors(
+                op,
+                col.on_empty.as_deref(),
+                col.on_error.as_deref(),
+                Some(&col.name),
+                type_oid,
+                ctx,
+                params,
+            )?;
         }
         out.push(ScopeColumn {
             name: col.name.clone(),
@@ -2786,7 +2804,25 @@ fn json_table_columns(
             origin: None,
         });
     }
+    for col in nested {
+        json_table_columns(&col.columns, false, alias, names, out, ctx, params)?;
+    }
     Ok(())
+}
+
+/// parse_jsontable.c's `isCompositeType`: json, jsonb, record, an array, a
+/// composite type or a domain over one of them — the types a regular
+/// JSON_TABLE column reads with JSON_QUERY rather than JSON_VALUE.
+fn json_table_query_type(t: PgTypeOid, snapshot: &PgCatalog) -> bool {
+    const JSON: PgTypeOid = PgTypeOid::from_raw(114);
+    let t = snapshot.unwrap_domain(t);
+    t == JSON
+        || t == oid::JSONB
+        || t == oid::RECORD
+        || crate::coerce::element_type(t, snapshot).is_some()
+        || snapshot
+            .get_type(t)
+            .is_some_and(|ty| ty.typtype == TypType::Composite)
 }
 
 /// What a locking clause pushed into query `sel` — a FROM subquery or a

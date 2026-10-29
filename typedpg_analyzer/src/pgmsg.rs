@@ -590,6 +590,19 @@ pub(crate) fn too_many_column_aliases(alias: &str, available: usize, specified: 
     )
 }
 
+/// `JSON_TABLE function has N columns available but M columns specified` —
+/// SQLSTATE 42P10 (`addRangeTableEntryForTableFunc`): a JSON_TABLE's column
+/// alias list is longer than its columns.
+pub(crate) fn too_many_json_table_column_aliases(available: usize, specified: usize) -> RawError {
+    RawError::new(
+        AnalyzeError::InvalidColumnReference(format!(
+            "JSON_TABLE function has {available} columns available but {specified} columns specified"
+        )),
+        None,
+        None,
+    )
+}
+
 /// `join expression "j" has 4 columns available but 5 columns specified` —
 /// SQLSTATE 42P10 (`addRangeTableEntryForJoin`): an aliased JOIN's column
 /// alias list is longer than its output.
@@ -1461,6 +1474,22 @@ pub(crate) fn could_not_convert_type(
     )
 }
 
+/// `cannot cast behavior expression of type A to B` — SQLSTATE 42846
+/// (`cannot_coerce`, no dedicated variant): `transformJsonBehavior`, for a
+/// SQL/JSON `DEFAULT expr ON EMPTY / ON ERROR` with no cast to the result
+/// type.
+pub(crate) fn cannot_cast_behavior_expression(from: &str, to: &str) -> RawError {
+    RawError::new(
+        AnalyzeError::Invalid(format!(
+            "cannot cast behavior expression of type {from} to {to}"
+        )),
+        None,
+        Some(format!(
+            "You will need to explicitly cast the expression to type {to}."
+        )),
+    )
+}
+
 /// `inconsistent types deduced for parameter $N` — SQLSTATE 42P08
 /// (`ambiguous_parameter`): PG's `variable_coerce_param_hook` coercing an
 /// untyped parameter occurrence to `target` after an earlier coercion
@@ -1692,6 +1721,7 @@ mod tests {
             (duplicate_table_alias("u", None).kind, "42712"),
             (ambiguous_table_reference("t", None).kind, "42P09"),
             (too_many_column_aliases("t", 1, 2).kind, "42P10"),
+            (too_many_json_table_column_aliases(1, 2).kind, "42P10"),
             (values_lists_length(2, 1, None).kind, "42601"),
             (unknown_value_not_coercible("text", None).kind, "XX000"),
             (

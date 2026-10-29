@@ -364,6 +364,90 @@ fn sql_json_returning_format_and_wrapper_rules() {
         .unwrap();
 }
 
+/// A DEFAULT behavior is cast to the RETURNING type at parse time
+/// (transformJsonBehavior): by an assignment cast to a string or bit string
+/// type, an explicit one otherwise (42846 when there is none). A NULL, a
+/// jsonb value or a boolean (unless the result is an integer) is coerced at
+/// run time instead, so any result type takes it.
+#[test]
+fn json_behavior_default_must_cast_to_the_returning_type() {
+    let db = setup();
+    for (sql, msg) in [
+        (
+            "SELECT JSON_VALUE(jsonb '1234', '$' RETURNING bit(3) DEFAULT 1 ON ERROR)",
+            "cannot cast behavior expression of type integer to bit",
+        ),
+        (
+            "SELECT JSON_VALUE(jsonb '1', '$' RETURNING varbit DEFAULT 1 ON EMPTY)",
+            "cannot cast behavior expression of type integer to bit varying",
+        ),
+        (
+            "SELECT JSON_VALUE(jsonb '1', '$' RETURNING bit(3) DEFAULT '1'::text ON ERROR)",
+            "cannot cast behavior expression of type text to bit",
+        ),
+        (
+            "SELECT JSON_QUERY(jsonb '1', '$' RETURNING date DEFAULT 1 ON ERROR)",
+            "cannot cast behavior expression of type integer to date",
+        ),
+    ] {
+        assert_err_prefix!(db.analyze(sql), AnalyzeError::Invalid(_), msg);
+    }
+    for sql in [
+        "SELECT JSON_VALUE(jsonb '1', '$' RETURNING bit(3) DEFAULT B'101' ON ERROR) AS a",
+        "SELECT JSON_VALUE(jsonb '1', '$' RETURNING bit(3) DEFAULT NULL::int ON ERROR) AS a",
+        "SELECT JSON_VALUE(jsonb '1', '$' RETURNING varchar DEFAULT 1 ON ERROR) AS a",
+        "SELECT JSON_VALUE(jsonb '1', '$' RETURNING char(3) DEFAULT 1 ON ERROR) AS a",
+        "SELECT JSON_VALUE(jsonb '1', '$' RETURNING int DEFAULT 1.5 ON ERROR) AS a",
+        "SELECT JSON_VALUE(jsonb '\"2020-01-01\"', '$' RETURNING date DEFAULT true ON ERROR) AS a",
+        "SELECT JSON_VALUE(jsonb '\"2020-01-01\"', '$' RETURNING date \
+         DEFAULT '{}'::jsonb ON ERROR) AS a",
+        "SELECT JSON_QUERY(jsonb '1', '$' RETURNING text DEFAULT 1 ON ERROR) AS a",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
+
+/// `JSON(… WITH UNIQUE KEYS)` reads its input as text to check the keys
+/// (transformJsonParseArg): a string, bytea or untyped input only — json
+/// and jsonb are rejected along with any other type.
+#[test]
+fn json_with_unique_keys_needs_a_string_input() {
+    let db = setup();
+    for sql in [
+        "SELECT JSON('   1   '::json WITH UNIQUE KEYS)",
+        "SELECT JSON(j WITH UNIQUE KEYS) FROM t",
+        "SELECT JSON(id WITH UNIQUE KEYS) FROM t",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::DatatypeMismatch(_),
+            "cannot use non-string types with WITH UNIQUE KEYS clause"
+        );
+    }
+    assert_err_prefix!(
+        db.analyze("SELECT JSON(s FORMAT JSON ENCODING UTF8 WITH UNIQUE KEYS) FROM t"),
+        AnalyzeError::FeatureNotSupported(_),
+        "cannot use JSON FORMAT ENCODING clause for non-bytea input types"
+    );
+    let s = db
+        .analyze(
+            "SELECT JSON(s WITH UNIQUE KEYS) AS a, JSON(vc WITH UNIQUE KEYS) AS b, \
+             JSON(b FORMAT JSON ENCODING UTF8 WITH UNIQUE KEYS) AS c, \
+             JSON('{}' WITH UNIQUE KEYS) AS d, JSON(js WITHOUT UNIQUE KEYS) AS e FROM t",
+        )
+        .unwrap();
+    assert_cols(
+        &s,
+        vec![
+            c("a", json()),
+            cn("b", json()),
+            cn("c", json()),
+            c("d", json()),
+            cn("e", json()),
+        ],
+    );
+}
+
 #[test]
 fn jsonpath_like_regex_pattern_is_compiled_at_input() {
     // makeItemLikeRegex compiles the pattern while jsonpath_in parses the
