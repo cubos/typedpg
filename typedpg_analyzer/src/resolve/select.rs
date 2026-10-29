@@ -483,6 +483,9 @@ fn analyze_select_here(
                 )
                 .finalize_implicit());
             }
+            if let ExpandedTarget::Expr(rt) = targets[ord as usize - 1] {
+                resolve_unknown_target(rt, snapshot, params)?;
+            }
             continue;
         }
         if let Err(e) = expr::infer_expr(
@@ -493,6 +496,12 @@ fn analyze_select_here(
         ) && !is_select_alias_reference(inner, &select_aliases, &e)
         {
             return Err(e);
+        }
+        // addTargetToSortList resolves the key's entry still `unknown` as
+        // text, before the next key is transformed.
+        match aliased_target(inner, &targets) {
+            Some(rt) => resolve_unknown_target(rt, snapshot, params)?,
+            None => expr::resolve_unknown_key(inner, snapshot, params)?,
         }
         if plain_distinct
             && !sort_expr_in_select_list(inner, &sel.target_list, &select_aliases, &scope, snapshot)
@@ -531,6 +540,11 @@ fn analyze_select_here(
     // parses as a single empty node; skip it. Without this walk, a `$N`
     // referenced only inside DISTINCT ON was never registered with the
     // collector and analysis died on the param-count invariant.
+    // transformDistinctOnClause transforms every key, then resolves those
+    // still `unknown` as text (addTargetToGroupList): `unknown_keys` are
+    // the select-list entries keys name, and the bare `$N` keys transformed
+    // untyped.
+    let mut unknown_keys: Vec<Result<&protobuf::ResTarget, &protobuf::ParamRef>> = Vec::new();
     for distinct_node in &sel.distinct_clause {
         if let Some(ord) = sql92_position(distinct_node, "DISTINCT ON")? {
             if ord < 1 || ord as usize > n_targets {
@@ -542,7 +556,18 @@ fn analyze_select_here(
                 )
                 .finalize_implicit());
             }
+            if let ExpandedTarget::Expr(rt) = targets[ord as usize - 1] {
+                unknown_keys.push(Ok(rt));
+            }
             continue;
+        }
+        if let Some(rt) = aliased_target(distinct_node, &targets) {
+            unknown_keys.push(Ok(rt));
+        } else if let Some(node::Node::ParamRef(p)) = distinct_node.node.as_ref()
+            && params.bound_arg(p.number).is_none()
+            && params.get(p.number) == oid::UNKNOWN
+        {
+            unknown_keys.push(Err(p));
         }
         if distinct_node.node.is_some()
             && let Err(e) = expr::infer_expr(
@@ -554,6 +579,12 @@ fn analyze_select_here(
             && !is_select_alias_reference(distinct_node, &select_aliases, &e)
         {
             return Err(e);
+        }
+    }
+    for key in unknown_keys {
+        match key {
+            Ok(rt) => resolve_unknown_target(rt, snapshot, params)?,
+            Err(p) => expr::coerce_untyped_param(p, oid::TEXT, snapshot, params)?,
         }
     }
 
@@ -1376,7 +1407,10 @@ fn walk_group_clause_node(
         // checkTargetlistEntrySQL92: the referenced target must not
         // contain aggregates (GROUPING included).
         return match targets[ord as usize - 1] {
-            ExpandedTarget::Expr(rt) => check_group_target_has_no_aggregates(Some(rt), snapshot),
+            ExpandedTarget::Expr(rt) => {
+                check_group_target_has_no_aggregates(Some(rt), snapshot)?;
+                resolve_unknown_target(rt, snapshot, params)
+            }
             ExpandedTarget::StarColumn { .. } => Ok(()),
         };
     }
@@ -1417,7 +1451,11 @@ fn walk_group_clause_node(
             ExpandedTarget::Expr(rt) if alias.first() == Some(&target_resname(rt)) => Some(*rt),
             _ => None,
         });
-        return check_group_target_has_no_aggregates(target, snapshot);
+        check_group_target_has_no_aggregates(target, snapshot)?;
+        return match target {
+            Some(rt) => resolve_unknown_target(rt, snapshot, params),
+            None => Ok(()),
+        };
     }
     crate::clause::check_level_calls(
         group_node,
@@ -1425,7 +1463,49 @@ fn walk_group_clause_node(
         "GROUP BY",
         true,
     )?;
-    Ok(())
+    // addTargetToGroupList resolves the key still `unknown` as text,
+    // before the next key is transformed.
+    expr::resolve_unknown_key(group_node, snapshot, params)
+}
+
+/// The select-list entry an ORDER BY or DISTINCT ON key names by its
+/// output name — a bare name, which findTargetlistEntrySQL92 matches
+/// against the output names before the input columns.
+fn aliased_target<'a>(
+    key: &protobuf::Node,
+    targets: &[ExpandedTarget<'a>],
+) -> Option<&'a protobuf::ResTarget> {
+    let Some(node::Node::ColumnRef(cr)) = key.node.as_ref() else {
+        return None;
+    };
+    let [field] = cr.fields.as_slice() else {
+        return None;
+    };
+    let Some(node::Node::String(name)) = field.node.as_ref() else {
+        return None;
+    };
+    targets.iter().find_map(|t| match t {
+        ExpandedTarget::Expr(rt) if rt.name == name.sval => Some(*rt),
+        _ => None,
+    })
+}
+
+/// addTargetToSortList / addTargetToGroupList on a key naming a
+/// select-list entry (by ordinal or output name): an entry that is a bare
+/// `$N` the select list transformed untyped is still `unknown`, and is
+/// resolved as text right there — `inconsistent types deduced` if a
+/// clause transformed meanwhile (WHERE, HAVING) typed `$N` otherwise.
+fn resolve_unknown_target(
+    rt: &protobuf::ResTarget,
+    snapshot: &crate::pg_catalog::PgCatalog,
+    params: &mut ParamCollector,
+) -> Result<(), AnalyzeError> {
+    match rt.val.as_deref().and_then(|v| v.node.as_ref()) {
+        Some(node::Node::ParamRef(p)) if params.is_untyped_output(p.location) => {
+            expr::coerce_untyped_param(p, oid::TEXT, snapshot, params)
+        }
+        _ => Ok(()),
+    }
 }
 
 /// PG's checkTargetlistEntrySQL92 for GROUP BY: a projection entry referenced

@@ -1151,6 +1151,8 @@ fn walk_func_modifiers(
                 && let Some(inner) = sb.node.as_deref()
             {
                 infer_expr(inner, ctx, params, TypeGoal::NONE)?;
+                // transformAggregateCall's transformSortClause.
+                crate::expr::resolve_unknown_key(inner, ctx.snapshot, params)?;
             }
         }
     }
@@ -1161,10 +1163,12 @@ fn walk_func_modifiers(
     if let Some(over) = &func.over
         && over.name.is_empty()
     {
+        // Its keys still `unknown` are resolved with the WINDOW clause's,
+        // after LIMIT ([`check_window_clause`]).
         if over.refname.is_empty() {
-            transform_window_def(over, None, ctx, params)?;
+            transform_window_def(over, None, ctx, params, false)?;
         } else {
-            infer_window_exprs(over, ctx, params)?;
+            infer_window_exprs(over, ctx, params, false)?;
         }
     }
     Ok(())
@@ -1619,15 +1623,41 @@ fn window_order_exprs(wd: &protobuf::WindowDef) -> Vec<&protobuf::Node> {
         .collect()
 }
 
-/// Infer a window definition's PARTITION BY / ORDER BY expressions, so
-/// parameters are typed and column references validated.
+/// Infer a window definition's ORDER BY, then PARTITION BY expressions
+/// (transformWindowDefinitions' order), so parameters are typed and column
+/// references validated; with `resolve_unknown`, each key still `unknown`
+/// is resolved as text right after it, as transformSortClause /
+/// transformGroupClause do.
 fn infer_window_exprs(
     wd: &protobuf::WindowDef,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
+    resolve_unknown: bool,
 ) -> Result<(), AnalyzeError> {
-    for e in wd.partition_clause.iter().chain(window_order_exprs(wd)) {
+    for e in window_order_exprs(wd)
+        .into_iter()
+        .chain(&wd.partition_clause)
+    {
         infer_expr(e, ctx, params, TypeGoal::NONE)?;
+        if resolve_unknown {
+            crate::expr::resolve_unknown_key(e, ctx.snapshot, params)?;
+        }
+    }
+    Ok(())
+}
+
+/// The keys of a window definition already inferred (an inline window,
+/// walked with its call), resolved as [`infer_window_exprs`] does.
+fn resolve_unknown_window_keys(
+    wd: &protobuf::WindowDef,
+    ctx: Ctx<'_>,
+    params: &mut ParamCollector,
+) -> Result<(), AnalyzeError> {
+    for e in window_order_exprs(wd)
+        .into_iter()
+        .chain(&wd.partition_clause)
+    {
+        crate::expr::resolve_unknown_key(e, ctx.snapshot, params)?;
     }
     Ok(())
 }
@@ -1653,6 +1683,7 @@ fn transform_window_def(
     base: Option<&protobuf::WindowDef>,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
+    resolve_unknown: bool,
 ) -> Result<(), AnalyzeError> {
     use crate::pgmsg;
     let span = crate::error::SourceSpan::from_node_qname(wd.location);
@@ -1673,7 +1704,7 @@ fn transform_window_def(
             return fail(pgmsg::window_in_window_definition(span));
         }
     }
-    infer_window_exprs(wd, ctx, params)?;
+    infer_window_exprs(wd, ctx, params, resolve_unknown)?;
 
     let mut order = window_order_exprs(wd);
     if let Some(base) = base {
@@ -1896,51 +1927,50 @@ pub(crate) fn check_window_clause(
                     })?,
             )
         };
-        transform_window_def(wd, base, ctx, params)?;
+        transform_window_def(wd, base, ctx, params, true)?;
     }
 
+    // Then the inline windows, in the order their calls were transformed.
     let mut inline: Vec<&protobuf::WindowDef> = Vec::new();
     for t in &sel.target_list {
         if let Some(node::Node::ResTarget(rt)) = t.node.as_ref()
             && let Some(val) = rt.val.as_deref()
         {
-            collect_inheriting_windows(val, &mut inline);
+            collect_inline_windows(val, &mut inline);
         }
     }
     for s in &sel.sort_clause {
         if let Some(node::Node::SortBy(sb)) = s.node.as_ref()
             && let Some(inner) = sb.node.as_deref()
         {
-            collect_inheriting_windows(inner, &mut inline);
+            collect_inline_windows(inner, &mut inline);
         }
     }
     for wd in inline {
-        if let Some(base) = defs.iter().find(|d| d.name == wd.refname) {
-            transform_window_def(wd, Some(base), ctx, params)?;
+        if wd.refname.is_empty() {
+            resolve_unknown_window_keys(wd, ctx, params)?;
+        } else if let Some(base) = defs.iter().find(|d| d.name == wd.refname) {
+            transform_window_def(wd, Some(base), ctx, params, true)?;
         }
     }
     Ok(())
 }
 
-/// Inline `OVER (w …)` windows of the window calls in an expression
+/// Inline `OVER (…)` windows of the window calls in an expression
 /// (subqueries excluded — their windows belong to the inner query).
-fn collect_inheriting_windows<'a>(
-    node: &'a protobuf::Node,
-    out: &mut Vec<&'a protobuf::WindowDef>,
-) {
+fn collect_inline_windows<'a>(node: &'a protobuf::Node, out: &mut Vec<&'a protobuf::WindowDef>) {
     let Some(inner) = node.node.as_ref() else {
         return;
     };
     fn each<'a>(nodes: &'a [protobuf::Node], out: &mut Vec<&'a protobuf::WindowDef>) {
         for n in nodes {
-            collect_inheriting_windows(n, out);
+            collect_inline_windows(n, out);
         }
     }
     match inner {
         node::Node::FuncCall(f) => {
             if let Some(over) = f.over.as_deref()
                 && over.name.is_empty()
-                && !over.refname.is_empty()
             {
                 out.push(over);
             }
@@ -1948,12 +1978,12 @@ fn collect_inheriting_windows<'a>(
         }
         node::Node::AExpr(e) => {
             for n in [&e.lexpr, &e.rexpr].into_iter().flatten() {
-                collect_inheriting_windows(n, out);
+                collect_inline_windows(n, out);
             }
         }
         node::Node::TypeCast(c) => {
             if let Some(a) = &c.arg {
-                collect_inheriting_windows(a, out);
+                collect_inline_windows(a, out);
             }
         }
         node::Node::BoolExpr(b) => each(&b.args, out),
@@ -1961,12 +1991,12 @@ fn collect_inheriting_windows<'a>(
         node::Node::CaseExpr(c) => {
             each(&c.args, out);
             if let Some(d) = &c.defresult {
-                collect_inheriting_windows(d, out);
+                collect_inline_windows(d, out);
             }
         }
         node::Node::CaseWhen(w) => {
             for n in [&w.expr, &w.result].into_iter().flatten() {
-                collect_inheriting_windows(n, out);
+                collect_inline_windows(n, out);
             }
         }
         _ => {}

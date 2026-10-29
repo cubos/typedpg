@@ -1630,6 +1630,25 @@ pub(crate) fn coerce_untyped_param(
     })
 }
 
+/// addTargetToSortList / addTargetToGroupList (parse_clause.c) resolve a
+/// sort or grouping key still `unknown` as text, right as the key is
+/// transformed: a bare `$N` still untyped there is deduced text, before
+/// any later key or clause is looked at (`ORDER BY $1, x = $1` with an
+/// integer `x` is `integer = text`).
+pub(crate) fn resolve_unknown_key(
+    key: &protobuf::Node,
+    snapshot: &PgCatalog,
+    params: &mut ParamCollector,
+) -> Result<(), AnalyzeError> {
+    if let Some(node::Node::ParamRef(p)) = key.node.as_ref()
+        && params.bound_arg(p.number).is_none()
+        && params.get(p.number) == oid::UNKNOWN
+    {
+        coerce_untyped_param(p, oid::TEXT, snapshot, params)?;
+    }
+    Ok(())
+}
+
 /// [`coerce_unknown_to`] for an operand that was transformed `unknown`: a
 /// bare `$N` among them is an untyped parameter node, coerced through
 /// [`coerce_untyped_param`] (`$1 = ANY($1)` deduces text, then text[]).

@@ -1039,6 +1039,12 @@ fn inconsistent_parameter_types_are_rejected() {
         "INSERT INTO a (id, y) VALUES ($1, $1 || 'a')",
         "DELETE FROM a RETURNING $1, $1::int",
         "UPDATE a SET y = $1 RETURNING $1, $1::int",
+        "MERGE INTO a USING (SELECT 1 AS k) s ON a.id = s.k \
+         WHEN NOT MATCHED THEN INSERT (id, y) VALUES ($1, $1)",
+        "MERGE INTO a USING (SELECT 1 AS k) s ON a.id = s.k \
+         WHEN NOT MATCHED THEN INSERT VALUES ($1, 1, $1)",
+        "MERGE INTO a USING (SELECT 1 AS k) s ON a.id = s.k \
+         WHEN MATCHED THEN UPDATE SET y = $1 RETURNING $1, $1::int",
     ] {
         let err = db.analyze(sql).unwrap_err();
         assert!(
@@ -1125,6 +1131,28 @@ fn parameter_types_follow_pg_clause_order() {
         "got: {err}"
     );
     assert_param_types(&db, "UPDATE a SET y = $1 RETURNING $1", &[text()]);
+    // MERGE transforms RETURNING before its WHEN clauses.
+    let merge = "MERGE INTO a USING (SELECT 1 AS k) s ON a.id = s.k";
+    assert_param_types(
+        &db,
+        &format!("{merge} WHEN MATCHED THEN UPDATE SET y = $1 RETURNING $1::int"),
+        &[int4()],
+    );
+    assert_param_types(
+        &db,
+        &format!("{merge} WHEN NOT MATCHED THEN INSERT (id, y) VALUES (2, $1) RETURNING $1 + 1"),
+        &[int4()],
+    );
+    let err = db
+        .analyze(&format!(
+            "{merge} WHEN MATCHED THEN UPDATE SET x = $1 RETURNING $1"
+        ))
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with(r#"column "x" is of type integer but expression is of type text"#),
+        "got: {err}"
+    );
     // A null test in the select list locks `$1` untyped before WHERE.
     let err = db
         .analyze("SELECT $1 IS NULL FROM a WHERE x = $1")
@@ -1133,6 +1161,112 @@ fn parameter_types_follow_pg_clause_order() {
         err.to_string()
             .starts_with("could not determine data type of parameter $1"),
         "got: {err}"
+    );
+}
+
+#[test]
+fn unknown_sort_and_group_keys_resolve_as_text() {
+    // addTargetToSortList / addTargetToGroupList resolve a key still
+    // `unknown` — a bare `$1`, or a select-list `$1` named by ordinal or
+    // output name — as text right where the key is transformed, before
+    // any later key or clause.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE a (id int PRIMARY KEY, x int NOT NULL DEFAULT 0, y text);")
+        .unwrap();
+    for (sql, message) in [
+        (
+            "SELECT * FROM a ORDER BY $1, x = $1",
+            "operator does not exist: integer = text",
+        ),
+        (
+            "SELECT $1 FROM a ORDER BY 1, x = $1",
+            "operator does not exist: integer = text",
+        ),
+        (
+            "SELECT $1 AS p FROM a ORDER BY p, x = $1",
+            "operator does not exist: integer = text",
+        ),
+        (
+            "SELECT count(*) FROM a GROUP BY $1 LIMIT $1",
+            "argument of LIMIT must be type bigint, not type text",
+        ),
+        (
+            "SELECT count(*) FROM a GROUP BY ROLLUP ($1) LIMIT $1",
+            "argument of LIMIT must be type bigint, not type text",
+        ),
+        (
+            "SELECT DISTINCT ON ($1) x FROM a ORDER BY $1 LIMIT $1",
+            "argument of LIMIT must be type bigint, not type text",
+        ),
+        (
+            "SELECT DISTINCT ON (1) $1 FROM a LIMIT $1",
+            "argument of LIMIT must be type bigint, not type text",
+        ),
+        (
+            "SELECT x FROM a ORDER BY $1 OFFSET $1",
+            "argument of OFFSET must be type bigint, not type text",
+        ),
+        // DISTINCT ON transforms all its keys before resolving any.
+        (
+            "SELECT DISTINCT ON ($1, x = $1) x FROM a",
+            "inconsistent types deduced for parameter $1",
+        ),
+        // HAVING comes before GROUP BY, which then resolves the select
+        // list's still-unknown `$1`.
+        (
+            "SELECT $1 AS p FROM a GROUP BY p HAVING max(x) = $1",
+            "inconsistent types deduced for parameter $1",
+        ),
+        (
+            "SELECT $1 FROM a GROUP BY 1 HAVING max(x) = $1",
+            "inconsistent types deduced for parameter $1",
+        ),
+        // An aggregate's ORDER BY is resolved with the call.
+        (
+            "SELECT string_agg(y, ',' ORDER BY $1), $1 + 1 FROM a",
+            "operator does not exist: text + integer",
+        ),
+        // A window's ORDER BY comes before its PARTITION BY, and the WINDOW
+        // clause's windows in order.
+        (
+            "SELECT count(*) OVER w FROM a WINDOW w AS (PARTITION BY x = $1 ORDER BY $1)",
+            "operator does not exist: integer = text",
+        ),
+        (
+            "SELECT count(*) OVER w FROM a WINDOW w AS (PARTITION BY $1), w2 AS (ORDER BY x = $1)",
+            "operator does not exist: integer = text",
+        ),
+    ] {
+        let err = db.analyze(sql).unwrap_err();
+        assert!(err.to_string().starts_with(message), "`{sql}`: got: {err}");
+    }
+    assert_param_types(&db, "SELECT x FROM a ORDER BY $1", &[text()]);
+    assert_param_types(&db, "SELECT x FROM a GROUP BY x, $1", &[text()]);
+    assert_param_types(&db, "SELECT x FROM a WHERE x = $1 ORDER BY $1", &[int4()]);
+    assert_param_types(
+        &db,
+        "SELECT * FROM a GROUP BY id, $1 HAVING x = $1",
+        &[int4()],
+    );
+    assert_param_types(
+        &db,
+        "SELECT x FROM a GROUP BY x, $1 ORDER BY x = $1",
+        &[int4()],
+    );
+    assert_param_types(&db, "SELECT $1 AS p FROM a ORDER BY p", &[text()]);
+    assert_param_types(&db, "SELECT $1::int AS p FROM a GROUP BY p", &[int4()]);
+    assert_param_types(&db, "SELECT array_agg(x ORDER BY $1), $1 FROM a", &[text()]);
+    // Inline windows are transformed after LIMIT.
+    assert_param_types(&db, "SELECT count(*) OVER (ORDER BY $1) FROM a", &[text()]);
+    assert_param_types(
+        &db,
+        "SELECT count(*) OVER (ORDER BY $1), $1 + 1 FROM a",
+        &[int4()],
+    );
+    assert_param_types(
+        &db,
+        "SELECT count(*) OVER (ORDER BY $1) FROM a LIMIT $1",
+        &[int8()],
     );
 }
 
