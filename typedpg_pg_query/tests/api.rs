@@ -65,6 +65,7 @@ fn parse_errors_carry_the_server_message() {
         typedpg_pg_query::Error::Parse {
             message: "syntax error at or near \"WHERE\"".into(),
             position: Some(12),
+            funcname: Some("scanner_yyerror".into()),
         }
     );
     // The position is a byte offset, though PG counts characters.
@@ -85,8 +86,25 @@ fn parse_errors_carry_the_server_message() {
         typedpg_pg_query::Error::Parse {
             message: "syntax error at end of input".into(),
             position: Some(10),
+            funcname: Some("scanner_yyerror".into()),
         }
     );
+    // The raising function tells apart errors PG words alike: the scanner's
+    // malformed `E''` escape from the parser's malformed `U&''` one.
+    for (sql, func) in [
+        (r"SELECT E'\u006'", "core_yylex"),
+        (r"SELECT U&'\zz'", "str_udeescape"),
+    ] {
+        let err = typedpg_pg_query::parse(sql).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                typedpg_pg_query::Error::Parse { message, funcname, .. }
+                    if message == "invalid Unicode escape" && funcname.as_deref() == Some(func)
+            ),
+            "{sql}: {err:?}"
+        );
+    }
     assert!(matches!(
         typedpg_pg_query::parse("SELECT '\0'"),
         Err(typedpg_pg_query::Error::Conversion(_))

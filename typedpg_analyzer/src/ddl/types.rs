@@ -831,7 +831,6 @@ pub fn create_range(interp: &mut PgCatalog, stmt: &CreateRangeStmt) -> Result<()
             return Err(conflicting());
         }
     }
-    let _ = subtype_opclass;
     let Some(subtype_oid) = subtype_oid else {
         return Err(DdlError::Parse(
             "type attribute \"subtype\" is required".into(),
@@ -847,6 +846,10 @@ pub fn create_range(interp: &mut PgCatalog, stmt: &CreateRangeStmt) -> Result<()
         .pg_type
         .get(&subtype_oid)
         .is_some_and(|t| t.typcollation.is_some());
+    let mut collation = interp
+        .pg_type
+        .get(&subtype_oid)
+        .and_then(|t| t.typcollation);
     if let Some(coll) = collation_name.as_deref() {
         if !collatable {
             return Err(DdlError::UnsupportedDdl(
@@ -858,12 +861,24 @@ pub fn create_range(interp: &mut PgCatalog, stmt: &CreateRangeStmt) -> Result<()
             [n] => (None, n.as_str()),
             _ => (None, ""),
         };
-        if interp.resolve_collation(schema, cname).is_none() {
+        let Some(c) = interp.resolve_collation(schema, cname) else {
             return Err(DdlError::Parse(format!(
                 "collation \"{cname}\" for encoding \"UTF8\" does not exist"
             )));
-        }
+        };
+        collation = Some(c.oid);
     }
+    // The subtype's btree operator class: the one named, else its default.
+    let subtype_opclass = match subtype_opclass.as_deref() {
+        Some([schema, opclass]) => {
+            super::opclass::find_opclass(interp, Some(schema), opclass, "btree").map(|c| c.oid)
+        }
+        Some([opclass]) => {
+            super::opclass::find_opclass(interp, None, opclass, "btree").map(|c| c.oid)
+        }
+        Some(_) => None,
+        None => super::opclass::default_opclass_id(interp, subtype_oid, "btree"),
+    };
     // The support functions (findRangeCanonicalFunction /
     // findRangeSubtypeDiffFunction).
     let mut support: Vec<PgProcOid> = Vec::new();
@@ -972,6 +987,8 @@ pub fn create_range(interp: &mut PgCatalog, stmt: &CreateRangeStmt) -> Result<()
         rngtypid: oid,
         rngsubtype: subtype_oid,
         rngmultitypid: Some(mr_oid),
+        rngcollation: collation,
+        rngsubopc: subtype_opclass,
     });
 
     // makeRangeConstructors / makeMultirangeConstructors: `name(sub, sub)`

@@ -119,7 +119,10 @@ fn compares_bytes(interp: &PgCatalog, opclass: Option<crate::oid::PgOpclassOid>)
 /// The collations whose order is the strings' code point order: C / POSIX
 /// (byte order, which for UTF-8 is code point order), `ucs_basic`, and the
 /// builtin provider's `pg_c_utf8` / `pg_unicode_fast`.
-fn orders_by_code_point(interp: &PgCatalog, collation: crate::oid::PgCollationOid) -> bool {
+pub(crate) fn orders_by_code_point(
+    interp: &PgCatalog,
+    collation: crate::oid::PgCollationOid,
+) -> bool {
     interp.pg_collation.get(&collation).is_some_and(|c| {
         matches!(
             c.collname.as_str(),

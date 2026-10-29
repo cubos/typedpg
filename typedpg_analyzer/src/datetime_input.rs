@@ -18,8 +18,8 @@
 //!
 //! - whether a full time zone name exists in the server's tz database
 //!   (only the names present in every current tzdata install are treated
-//!   as known; legacy backward-compatibility links, and unknown names under
-//!   a known area such as `America/…`, are unsure);
+//!   as known; legacy backward-compatibility links and the `posix/…` /
+//!   `right/…` trees some distributions ship are unsure);
 //! - the current time of day (`'now pm'` depends on it);
 //! - the session time zone / named zone offset when a timestamptz lands
 //!   within a day of the timestamp range limits;
@@ -95,7 +95,7 @@ type DtResult<T> = Result<T, Dterr>;
 /// accepts it (or we can't tell), `Err(message)` with PG's verbatim error.
 pub(crate) fn validate(content: &str, ty: DatetimeType) -> Result<(), String> {
     let outcome = match ty {
-        DatetimeType::Interval => interval_in_range(content, INTERVAL_FULL_RANGE),
+        DatetimeType::Interval => interval_in_typmod(content, -1),
         DatetimeType::Date => date_in(content),
         DatetimeType::Time | DatetimeType::TimeTz => time_in(content),
         DatetimeType::Timestamp => timestamp_in(content, false),
@@ -112,15 +112,44 @@ pub(crate) fn validate(content: &str, ty: DatetimeType) -> Result<(), String> {
 /// `mm:ss` fields decode, so with it known the literal is decided exactly
 /// instead of only when every restriction agrees ([`validate`]).
 pub(crate) fn validate_interval(content: &str, typmod: i32) -> Result<(), String> {
-    let range = if typmod < 0 {
-        INTERVAL_FULL_RANGE
-    } else {
-        (typmod >> 16) & INTERVAL_FULL_RANGE
-    };
-    match interval_in_range(content, range) {
+    match interval_in_typmod(content, typmod) {
         Ok(()) | Err(Dterr::Unsure) => Ok(()),
         Err(e) => Err(message(&e, content, DatetimeType::Interval)),
     }
+}
+
+/// Whether `content`, read by `interval_in` under any typmod, may be
+/// `±infinity`: spelled so, or with the extreme field values PG 17+
+/// reserves for them (`2147483647 months 2147483647 days
+/// 9223372036854775807 us` is `infinity`). A typmod's truncation and
+/// rounding never produce those values, but its field restriction changes
+/// how the literal decodes, so every restriction is tried.
+pub(crate) fn interval_may_be_infinite(content: &str) -> bool {
+    let m = interval_mask;
+    [
+        INTERVAL_FULL_RANGE,
+        m(YEAR),
+        m(MONTH),
+        m(DAY),
+        m(HOUR),
+        m(MINUTE),
+        m(SECOND),
+        m(YEAR) | m(MONTH),
+        m(DAY) | m(HOUR),
+        m(DAY) | m(HOUR) | m(MINUTE),
+        m(DAY) | m(HOUR) | m(MINUTE) | m(SECOND),
+        m(HOUR) | m(MINUTE),
+        m(HOUR) | m(MINUTE) | m(SECOND),
+        m(MINUTE) | m(SECOND),
+    ]
+    .into_iter()
+    .any(|range| match interval_in_range(content, range) {
+        Ok(Some(value)) => {
+            value == (i32::MAX, i32::MAX, i64::MAX) || value == (i32::MIN, i32::MIN, i64::MIN)
+        }
+        Ok(None) => true,
+        Err(_) => false,
+    })
 }
 
 /// `DateTimeParseError` (datetime.c) plus the input functions' range
@@ -439,29 +468,6 @@ enum ZoneLookup {
     Unsure,
 }
 
-/// Top-level directories of the tz database, plus the `posix/` and
-/// `right/` trees some distributions ship.
-const TZ_AREAS: &[&str] = &[
-    "africa",
-    "america",
-    "antarctica",
-    "arctic",
-    "asia",
-    "atlantic",
-    "australia",
-    "brazil",
-    "canada",
-    "chile",
-    "etc",
-    "europe",
-    "indian",
-    "mexico",
-    "pacific",
-    "posix",
-    "right",
-    "us",
-];
-
 /// `pg_tzset`: `GMT`, then a tz database file (case-insensitive), then a
 /// POSIX-style zone spec (`tzparse`, localtime.c). `name` is lowercase.
 fn pg_tzset(name: &[u8]) -> ZoneLookup {
@@ -484,15 +490,16 @@ fn pg_tzset(name: &[u8]) -> ZoneLookup {
         return ZoneLookup::Known { fixed };
     }
     // Legacy backward-compatibility links (`Japan`, `US/Eastern`, …) are
-    // only installed by some distributions; `localtime` / `posixrules`
-    // are host-dependent; a new zone under a known area may postdate our
-    // list.
-    let area_known = lower
+    // only installed by some distributions, as are the `posix/` and
+    // `right/` copies of the database; `localtime` / `posixrules` are
+    // host-dependent. Any other name — `America/Does_not_exist` — is not
+    // in the tz database [`KNOWN_ZONES`] lists in full.
+    let host_tree = lower
         .split_once('/')
-        .is_some_and(|(area, _)| TZ_AREAS.contains(&area));
+        .is_some_and(|(area, _)| matches!(area, "posix" | "right"));
     if LEGACY_ZONES.binary_search(&lower.as_ref()).is_ok()
         || matches!(lower.as_ref(), "localtime" | "posixrules")
-        || area_known
+        || host_tree
     {
         return ZoneLookup::Unsure;
     }
@@ -1899,7 +1906,54 @@ fn timestamp_in(content: &str, with_tz: bool) -> DtResult<()> {
     }
 }
 
-fn interval_in_range(content: &str, range: i32) -> DtResult<()> {
+/// `interval_in` with `typmod` (`-1` for none): the field restriction
+/// steers the decoding, then `AdjustIntervalForTypmod` truncates the time
+/// to the last field and rounds it to the precision, which can overflow.
+fn interval_in_typmod(content: &str, typmod: i32) -> DtResult<()> {
+    let range = if typmod < 0 {
+        INTERVAL_FULL_RANGE
+    } else {
+        (typmod >> 16) & INTERVAL_FULL_RANGE
+    };
+    let Some((months, days, mut time)) = interval_in_range(content, range)? else {
+        return Ok(());
+    };
+    // INTERVAL_NOT_FINITE: the typmod has no effect on ±infinity.
+    if typmod < 0
+        || (months, days, time) == (i32::MAX, i32::MAX, i64::MAX)
+        || (months, days, time) == (i32::MIN, i32::MIN, i64::MIN)
+    {
+        return Ok(());
+    }
+    let has = |field: i32| range & interval_mask(field) != 0;
+    if range != INTERVAL_FULL_RANGE && !has(SECOND) {
+        let unit = if has(MINUTE) {
+            USECS_PER_MINUTE
+        } else if has(HOUR) {
+            USECS_PER_HOUR
+        } else {
+            0
+        };
+        time = if unit == 0 { 0 } else { time / unit * unit };
+    }
+    let precision = typmod & 0xFFFF;
+    if (0..=6).contains(&precision) {
+        let offset = [500_000, 50_000, 5_000, 500, 50, 5, 0][precision as usize];
+        let rounded = if time >= 0 {
+            time.checked_add(offset)
+        } else {
+            time.checked_sub(offset)
+        };
+        if rounded.is_none() {
+            return Err(Dterr::IntervalOutOfRange);
+        }
+    }
+    Ok(())
+}
+
+/// The `(months, days, time)` `interval_in` decodes `content` to, under
+/// the field restriction `range`; `None` for `±infinity`.
+fn interval_in_range(content: &str, range: i32) -> DtResult<Option<(i32, i32, i64)>> {
     let mut itm = ItmIn::default();
     let mut dtype = DTK_DELTA;
     let mut r = parse_date_time(content.as_bytes(), 256)
@@ -1918,11 +1972,12 @@ fn interval_in_range(content: &str, range: i32) -> DtResult<()> {
     if dtype == DTK_DELTA {
         // itmin2interval
         let months = i64::from(itm.year) * i64::from(MONTHS_PER_YEAR) + i64::from(itm.mon);
-        if months > i64::from(i32::MAX) || months < i64::from(i32::MIN) {
+        let Ok(months) = i32::try_from(months) else {
             return Err(Dterr::IntervalOutOfRange);
-        }
+        };
+        return Ok(Some((months, itm.mday, itm.usec)));
     }
-    Ok(())
+    Ok(None)
 }
 
 // ─── DecodeInterval / DecodeISO8601Interval ─────────────────────────────────

@@ -91,6 +91,28 @@ fn what_may_be_infinite_is_not_finite() {
     );
 }
 
+/// PG 17+ reserves an interval's extreme field values for ±infinity, so a
+/// literal spelling them is infinite: `interval '2147483647 months
+/// 2147483647 days 9223372036854775807 us' = 'infinity'` is true. One
+/// microsecond short of them is finite.
+#[test]
+fn extreme_interval_literals_are_infinite() {
+    let db = setup();
+    assert_finite(
+        &db,
+        "SELECT interval '2147483647 months 2147483647 days 9223372036854775807 us' AS a,
+                interval '-2147483648 months -2147483648 days -9223372036854775808 us' AS b,
+                '178956970 years 7 months 2147483647 days 9223372036854775807 us'::interval AS c,
+                interval '2147483647 months 2147483647 days 9223372036854775806 us' AS d",
+        &[
+            ("a", false, false),
+            ("b", false, false),
+            ("c", false, false),
+            ("d", false, true),
+        ],
+    );
+}
+
 #[test]
 fn a_check_or_a_domain_keeps_a_column_finite() {
     let mut db = setup();

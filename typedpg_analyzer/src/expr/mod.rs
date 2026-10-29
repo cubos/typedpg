@@ -1984,7 +1984,7 @@ fn resolve_type_name(
         let hint = crate::suggest::suggest_similar(name, snapshot.visible_type_names(schema))
             .map(|c| format!("did you mean \"{c}\"?"));
         let span = crate::error::SourceSpan::from_node_qname(tn.location);
-        let qualified = parts.join(".");
+        let qualified = crate::ddl::util::type_name_to_string(tn);
         crate::error::RawError {
             kind: AnalyzeError::UndefinedType(format!("type \"{qualified}\" does not exist")),
             primary: span.map(|s| crate::error::DiagnosticLabel::new(s, "type does not exist")),
@@ -2005,9 +2005,16 @@ fn resolve_type_name(
     }
 
     // The array type is the element's `typarray`, whatever its name
-    // (makeArrayTypeName can't always use `_name`).
-    if is_array && let Some(arr_oid) = snapshot.array_type_of(type_entry.oid) {
-        return Ok(arr_oid);
+    // (makeArrayTypeName can't always use `_name`). An array type has none
+    // (`_int4[]`): LookupTypeName finds no type, reported by
+    // TypeNameToString, brackets included.
+    if is_array {
+        return snapshot.array_type_of(type_entry.oid).ok_or_else(|| {
+            AnalyzeError::UndefinedType(format!(
+                "type \"{}\" does not exist",
+                crate::ddl::util::type_name_to_string(tn)
+            ))
+        });
     }
 
     Ok(type_entry.oid)

@@ -268,6 +268,13 @@ struct Lexer<'a> {
     s: &'a [u8],
     i: usize,
     out: Vec<Tok>,
+    /// A `\u` high surrogate awaiting its low half, which must be the
+    /// next escape of the same `{unicode}+` run (`addUnicode`).
+    hi_surrogate: Option<u32>,
+    /// Where the current run of valid `\u` escapes starts and ends: a
+    /// failing escape right after it is reported with the whole run
+    /// (`{unicode}*{unicodefail}`).
+    unicode_run: Option<(usize, usize)>,
 }
 
 impl<'a> Lexer<'a> {
@@ -276,6 +283,8 @@ impl<'a> Lexer<'a> {
             s: content.as_bytes(),
             i: 0,
             out: Vec::new(),
+            hi_surrogate: None,
+            unicode_run: None,
         }
     }
 
@@ -473,19 +482,43 @@ impl<'a> Lexer<'a> {
                         (2 + n, None)
                     }
                 };
+                let run_start = match self.unicode_run {
+                    Some((run_start, end)) if end == start => run_start,
+                    _ => start,
+                };
                 let Some(v) = value else {
-                    let t = self.text(start, start + len);
+                    let t = self.text(run_start, start + len);
                     return Err(yyerror("invalid Unicode escape sequence", &t));
                 };
-                if v == 0 {
-                    return Err("unsupported Unicode escape sequence".to_string());
-                }
-                // Surrogate pairing is not modeled — accept (conservative).
-                if let Some(ch) = char::from_u32(v) {
-                    let mut buf = [0u8; 4];
-                    out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                // `addUnicode`: a UTF-16 surrogate pair decodes to one
+                // character; an unpaired half is an error.
+                let surrogate_err = || "invalid input syntax for type jsonpath".to_string();
+                let ch = match (self.hi_surrogate.take(), v) {
+                    (None, 0xD800..=0xDBFF) => {
+                        self.hi_surrogate = Some(v);
+                        None
+                    }
+                    (Some(hi), 0xDC00..=0xDFFF) => {
+                        Some(0x10000 + ((hi - 0xD800) << 10) + (v - 0xDC00))
+                    }
+                    (Some(_), _) | (None, 0xDC00..=0xDFFF) => return Err(surrogate_err()),
+                    (None, v) => Some(v),
+                };
+                if let Some(ch) = ch {
+                    if ch == 0 {
+                        return Err("unsupported Unicode escape sequence".to_string());
+                    }
+                    if let Some(ch) = char::from_u32(ch) {
+                        let mut buf = [0u8; 4];
+                        out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                    }
                 }
                 self.i += len;
+                self.unicode_run = Some((run_start, self.i));
+                // The run of `\u` escapes ends without the low half.
+                if self.hi_surrogate.is_some() && !s[self.i..].starts_with(b"\\u") {
+                    return Err(surrogate_err());
+                }
             }
             b'x' => {
                 let hex = |i: usize| s.get(i).is_some_and(u8::is_ascii_hexdigit);
@@ -1091,8 +1124,10 @@ impl Parser {
             }
             Kw::Time | Kw::TimeTz | Kw::Timestamp | Kw::TimestampTz => {
                 self.bump();
+                // `datetime_precision: INT_P` — unlike `.decimal()`'s
+                // arguments, no sign.
                 if self.kind() != K::Char(b')') {
-                    self.parse_int_elem()?;
+                    self.expect(K::Int)?;
                 }
                 self.expect(K::Char(b')'))?;
             }
@@ -1146,6 +1181,9 @@ mod tests {
             "$.**{1 to last}",
             "$.datetime(\"yyyy\")",
             "$.decimal(4, 2)",
+            "$.decimal(-1, +2)",
+            "$.time(1)",
+            "\"\\ud83d\\ude04\\u{1F604}\"",
             "$ ? (@ starts with $x)",
             "$ like_regex \"a\" flag \"iq\"",
             "$ like_regex \"(\" flag \"xq\"",
@@ -1207,6 +1245,29 @@ mod tests {
             (
                 "$ like_regex \"a\" flag \"xz\"",
                 "invalid input syntax for type jsonpath",
+            ),
+            (
+                "\"\\ud83d\\u12\"",
+                "invalid Unicode escape sequence at or near \"\\ud83d\\u12\" of jsonpath input",
+            ),
+            (
+                "\"\\ud83d\\ud83d\"",
+                "invalid input syntax for type jsonpath",
+            ),
+            ("\"\\ude04\"", "invalid input syntax for type jsonpath"),
+            ("\"\\ud83d\\x41\"", "invalid input syntax for type jsonpath"),
+            (
+                "\"\\ud83d\\u0000\"",
+                "invalid input syntax for type jsonpath",
+            ),
+            ("\"\\u0000\"", "unsupported Unicode escape sequence"),
+            (
+                "$.time(-1)",
+                "syntax error at or near \"-\" of jsonpath input",
+            ),
+            (
+                "$.timestamp_tz(+1)",
+                "syntax error at or near \"+\" of jsonpath input",
             ),
             (
                 "$ like_regex \"(\" flag \"x\"",

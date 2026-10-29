@@ -55,6 +55,11 @@ pub enum Error {
         /// reports as the error's `POSITION` (`cursorpos`). `None` when the
         /// error has no position.
         position: Option<usize>,
+        /// The PostgreSQL function that raised it (`core_yylex` for the
+        /// scanner, `base_yyparse` for the grammar, …): the same message
+        /// can carry a different SQLSTATE depending on where it comes
+        /// from. `None` when unknown.
+        funcname: Option<String>,
     },
     /// The PL/pgSQL parse tree wasn't valid JSON.
     #[error("Error parsing JSON: {0}")]
@@ -89,6 +94,7 @@ impl Error {
         Error::Parse {
             message: message.into(),
             position: None,
+            funcname: None,
         }
     }
 }
@@ -124,7 +130,17 @@ unsafe fn parse_error(error: *const ffi::PgQueryError, input: &str) -> Error {
                 .nth(chars)
                 .map_or(input.len(), |(byte, _)| byte)
         });
-    Error::Parse { message, position }
+    let funcname = unsafe { (*error).funcname };
+    let funcname = (!funcname.is_null()).then(|| {
+        unsafe { CStr::from_ptr(funcname) }
+            .to_string_lossy()
+            .into_owned()
+    });
+    Error::Parse {
+        message,
+        position,
+        funcname,
+    }
 }
 
 /// Parse `sql` with PostgreSQL's grammar.
