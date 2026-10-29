@@ -998,6 +998,10 @@ impl NullabilityContext {
         }
         self.level_grouping_omitted = all.clone();
         self.grouping_omitted = all;
+        // What was derived for the level before (from the CHECK
+        // constraints of the entries FROM registered) assumed every value
+        // read is its row's: derive again under the grouping sets.
+        self.recompute();
     }
 
     /// Whether a qual proved the expression keyed `key` (see

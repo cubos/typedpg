@@ -353,6 +353,7 @@ fn analyze_select_here(
     let expansion = grouping::expand_grouping_sets(&sel.group_clause, &scope, &targets, snapshot);
     null_ctx.set_grouping_omitted(expansion.omitted);
     null_ctx.has_empty_grouping_set = expansion.has_empty_set;
+    let omitted_targets = expansion.omitted_targets;
 
     // Process WHERE clause — PG uses COERCION_ASSIGNMENT + BOOL goal, and
     // emits its own wording on mismatch: `argument of WHERE must be type
@@ -587,6 +588,21 @@ fn analyze_select_here(
         expr::Ctx::new(&scope, &null_ctx, snapshot),
         params,
     )?;
+    // An entry that is a grouping item of its own some grouping set omits
+    // is NULL in that set's rows, whatever the item its key reads (unless
+    // an alias' annotation settles it).
+    for &i in &omitted_targets {
+        let annotated = matches!(
+            targets.get(i),
+            Some(ExpandedTarget::Expr(rt))
+                if super::type_resolution::annotation_nullability(&rt.name).is_some()
+        );
+        if let Some(c) = columns.get_mut(i)
+            && !annotated
+        {
+            c.nullable = true;
+        }
+    }
     grouping::set_output_columns(
         sel,
         columns.iter().map(|c| c.name.clone()).collect(),

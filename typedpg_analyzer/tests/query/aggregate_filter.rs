@@ -73,6 +73,27 @@ fn multiple_filters_side_by_side() {
     assert_cols(&s, vec![c("many", int8()), c("none", int8())]);
 }
 
+/// An aggregate of an outer query in a subquery's FILTER belongs to the
+/// outer query: the inner FILTER sees it as a constant.
+#[test]
+fn filter_may_hold_an_outer_level_aggregate() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE a (x int); CREATE TABLE b (y int);")
+        .unwrap();
+    for sql in [
+        "SELECT (SELECT max(y) FILTER (WHERE sum(x) > 0) FROM b) FROM a",
+        "SELECT (SELECT count(*) FILTER (WHERE count(a.x) > y) FROM b) FROM a",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    // The subquery's own aggregate still can't sit in its FILTER.
+    assert_err_prefix!(
+        db.analyze("SELECT (SELECT max(y) FILTER (WHERE sum(y) > 0) FROM b) FROM a"),
+        AnalyzeError::GroupingError(_),
+        "aggregate functions are not allowed in FILTER"
+    );
+}
+
 // ── DISTINCT inside an aggregate ─────────────────────────────────────────────
 
 #[test]

@@ -41,7 +41,20 @@ pub(crate) struct GroupingExpansion {
     /// can functionally determine others (PG's groupClauseCommonVars).
     /// `None` without grouping sets: every grouped column counts.
     pub common: Option<HashSet<(String, String)>>,
+    /// The (star-expanded) target-list positions that are grouping items
+    /// of their own (named by an ordinal or an output alias), other than
+    /// the item their key reads ([`Self::omitted`]), which some grouping
+    /// set omits: PG's Agg NULLs such an entry in those sets' rows even
+    /// where an equal expression is grouped by an item every set holds
+    /// (`SELECT g AS a, g AS b … GROUP BY a, ROLLUP (b)` NULLs `b`).
+    pub omitted_targets: HashSet<usize>,
 }
+
+/// A grouping item: the target-list position PG's grouping clause points
+/// at (its `ressortgroupref`), `None` for an expression the target list
+/// doesn't hold (a resjunk entry), and the item's key — its column, or
+/// its expression's [`expr_key`].
+type GroupItem = (Option<usize>, (String, String));
 
 /// Resolve `group_clause` into the columns that some grouping set omits and
 /// whether any of those sets is empty.
@@ -64,7 +77,7 @@ pub(crate) fn expand_grouping_sets(
 
     // Per top-level entry, the alternatives it contributes (each alternative
     // is one grouping set fragment).
-    let mut per_entry: Vec<Vec<HashSet<(String, String)>>> = Vec::new();
+    let mut per_entry: Vec<Vec<HashSet<GroupItem>>> = Vec::new();
     let mut saw_grouping_set = false;
     for node in group_clause {
         let alts = alternatives_for(node, scope, targets, snapshot, &mut saw_grouping_set);
@@ -79,7 +92,7 @@ pub(crate) fn expand_grouping_sets(
 
     // Cartesian product of alternatives — each combination yields one final
     // grouping set (the union of one alternative from each entry).
-    let mut sets: Vec<HashSet<(String, String)>> = vec![HashSet::new()];
+    let mut sets: Vec<HashSet<GroupItem>> = vec![HashSet::new()];
     for alts in &per_entry {
         if alts.is_empty() {
             continue;
@@ -99,17 +112,55 @@ pub(crate) fn expand_grouping_sets(
         return GroupingExpansion::default();
     }
 
-    let union: HashSet<(String, String)> = sets.iter().flatten().cloned().collect();
-    let mut intersection = sets[0].clone();
+    // An entry of the target list is one item, however its key was spelled.
+    let in_every_set = |item: &GroupItem| match item.0 {
+        Some(t) => sets.iter().all(|s| s.iter().any(|i| i.0 == Some(t))),
+        None => sets.iter().all(|s| s.contains(item)),
+    };
+    let items: HashSet<&GroupItem> = sets.iter().flatten().collect();
+    // A reference to a grouped expression outside the entry that is its
+    // grouping item reads the first grouping column equal to it (setrefs
+    // matches the Agg's input target list in order: the target list's
+    // entries first, resjunk ones after): the key is NULL where that item
+    // is omitted.
+    let mut first: HashMap<&(String, String), &GroupItem> = HashMap::new();
+    for item in &items {
+        let order = |i: &GroupItem| (i.0.is_none(), i.0);
+        first
+            .entry(&item.1)
+            .and_modify(|f| {
+                if order(item) < order(f) {
+                    *f = item;
+                }
+            })
+            .or_insert(item);
+    }
+    let omitted = first
+        .iter()
+        .filter(|(_, item)| !in_every_set(item))
+        .map(|(key, _)| (*key).clone())
+        .collect();
+    // An entry that is an item of its own, not the one its key reads.
+    let omitted_targets = items
+        .iter()
+        .filter(|item| item.0.is_some() && first.get(&item.1).map(|f| f.0) != Some(item.0))
+        .filter(|item| !in_every_set(item))
+        .filter_map(|item| item.0)
+        .collect();
+    let keys = |s: &HashSet<GroupItem>| -> HashSet<(String, String)> {
+        s.iter().map(|(_, key)| key.clone()).collect()
+    };
+    let mut intersection = keys(&sets[0]);
     for s in &sets[1..] {
+        let s = keys(s);
         intersection.retain(|x| s.contains(x));
     }
-    let omitted = union.difference(&intersection).cloned().collect();
     let has_empty_set = sets.iter().any(|s| s.is_empty());
     GroupingExpansion {
         omitted,
         has_empty_set,
         common: Some(intersection),
+        omitted_targets,
     }
 }
 
@@ -148,7 +199,7 @@ fn alternatives_for(
     targets: &[ExpandedTarget<'_>],
     snapshot: &PgCatalog,
     saw_grouping_set: &mut bool,
-) -> Vec<HashSet<(String, String)>> {
+) -> Vec<HashSet<GroupItem>> {
     match node.node.as_ref() {
         Some(node::Node::GroupingSet(gs)) => {
             *saw_grouping_set = true;
@@ -164,7 +215,7 @@ fn alternatives_for_grouping_set(
     targets: &[ExpandedTarget<'_>],
     snapshot: &PgCatalog,
     saw_grouping_set: &mut bool,
-) -> Vec<HashSet<(String, String)>> {
+) -> Vec<HashSet<GroupItem>> {
     let kind = GroupingSetKind::try_from(gs.kind).unwrap_or(GroupingSetKind::Undefined);
     match kind {
         GroupingSetKind::GroupingSetEmpty => vec![HashSet::new()],
@@ -178,7 +229,7 @@ fn alternatives_for_grouping_set(
         }
         GroupingSetKind::GroupingSetRollup => {
             // ROLLUP(a, b, c) → [{a,b,c}, {a,b}, {a}, {}]
-            let items: Vec<HashSet<(String, String)>> = gs
+            let items: Vec<HashSet<GroupItem>> = gs
                 .content
                 .iter()
                 .map(|n| singleton_set(n, scope, targets, snapshot))
@@ -195,7 +246,7 @@ fn alternatives_for_grouping_set(
         }
         GroupingSetKind::GroupingSetCube => {
             // CUBE(a, b) → powerset — 2^n sets.
-            let items: Vec<HashSet<(String, String)>> = gs
+            let items: Vec<HashSet<GroupItem>> = gs
                 .content
                 .iter()
                 .map(|n| singleton_set(n, scope, targets, snapshot))
@@ -253,26 +304,29 @@ pub(crate) fn implicit_row_items(node: &protobuf::Node) -> Option<&Vec<protobuf:
     }
 }
 
-/// Resolve a GROUP BY leaf as a single column. Returns a singleton set
-/// `{(table_alias, column_name)}` when the leaf denotes a column — directly,
-/// or through a projection ordinal / output alias ([`group_leaf`]) — or an
-/// empty set otherwise (opaque expression — does not drive nullability
-/// promotion).
+/// Resolve a GROUP BY leaf as a grouping item. Returns a singleton set
+/// holding the item when the leaf denotes a column or an expression —
+/// directly, or through a projection ordinal / output alias
+/// ([`group_leaf`]) — or an empty set otherwise (does not drive
+/// nullability promotion).
 fn singleton_set(
     node: &protobuf::Node,
     scope: &Scope,
     targets: &[ExpandedTarget<'_>],
     snapshot: &PgCatalog,
-) -> HashSet<(String, String)> {
+) -> HashSet<GroupItem> {
     if let Some(items) = implicit_row_items(node) {
         return items
             .iter()
             .flat_map(|i| singleton_set(i, scope, targets, snapshot))
             .collect();
     }
-    match group_leaf(node, scope, targets, snapshot) {
-        GroupLeaf::Column(key) => HashSet::from([key]),
-        GroupLeaf::Expr(fingerprint) => HashSet::from([(EXPR_KEY.to_owned(), fingerprint)]),
+    let (leaf, target) = group_leaf(node, scope, targets, snapshot);
+    match leaf {
+        GroupLeaf::Column(key) => HashSet::from([(target, key)]),
+        GroupLeaf::Expr(fingerprint) => {
+            HashSet::from([(target, (EXPR_KEY.to_owned(), fingerprint))])
+        }
         GroupLeaf::Other | GroupLeaf::Unresolved => HashSet::new(),
     }
 }
@@ -292,13 +346,15 @@ enum GroupLeaf {
 /// PG's `findTargetlistEntrySQL92` for a GROUP BY leaf: an integer constant
 /// is a position in the (star-expanded) target list, a bare name is an
 /// input column first and an output-column alias otherwise, anything else is
-/// an expression of its own.
+/// an expression of its own — which `findTargetlistEntrySQL99` matches to
+/// the first target-list entry equal to it. Returns what the leaf denotes
+/// and the position of the entry it is, if any.
 fn group_leaf(
     node: &protobuf::Node,
     scope: &Scope,
     targets: &[ExpandedTarget<'_>],
     snapshot: &PgCatalog,
-) -> GroupLeaf {
+) -> (GroupLeaf, Option<usize>) {
     let target_column = |rt: &protobuf::ResTarget| match rt.val.as_deref() {
         Some(v) => match resolve_group_column(v, scope, snapshot) {
             Some(key) => GroupLeaf::Column(key),
@@ -306,23 +362,51 @@ fn group_leaf(
         },
         None => GroupLeaf::Other,
     };
+    // findTargetlistEntrySQL99: the first entry equal to the expression.
+    let equal_target = |node: &protobuf::Node, column: Option<&ColKey>| {
+        targets.iter().position(|t| match t {
+            ExpandedTarget::Expr(rt) => rt.val.as_deref().is_some_and(|v| match column {
+                Some(key) => resolve_group_column(v, scope, snapshot).as_ref() == Some(key),
+                None => same_level_exprs_equal(v, node, scope, snapshot),
+            }),
+            ExpandedTarget::StarColumn {
+                column: Some((alias, col)),
+                ..
+            } => column.is_some_and(|(a, c)| a == alias && c == col),
+            ExpandedTarget::StarColumn { column: None, .. } => false,
+        })
+    };
+    let expression = |node: &protobuf::Node| match resolve_group_column(node, scope, snapshot) {
+        Some(key) => {
+            let target = equal_target(node, Some(&key));
+            (GroupLeaf::Column(key), target)
+        }
+        None => (
+            GroupLeaf::Expr(expr_key(node, scope, snapshot)),
+            equal_target(node, None),
+        ),
+    };
     match node.node.as_ref() {
         Some(node::Node::AConst(ac)) => match &ac.val {
             Some(protobuf::a_const::Val::Ival(i)) => {
-                match targets.get((i.ival as usize).wrapping_sub(1)) {
-                    Some(ExpandedTarget::Expr(rt)) => target_column(rt),
+                let position = (i.ival as usize).wrapping_sub(1);
+                match targets.get(position) {
+                    Some(ExpandedTarget::Expr(rt)) => (target_column(rt), Some(position)),
                     Some(ExpandedTarget::StarColumn {
                         column: Some((alias, col)),
                         ..
-                    }) => GroupLeaf::Column((alias.to_string(), col.to_string())),
-                    _ => GroupLeaf::Other,
+                    }) => (
+                        GroupLeaf::Column((alias.to_string(), col.to_string())),
+                        Some(position),
+                    ),
+                    _ => (GroupLeaf::Other, None),
                 }
             }
-            _ => GroupLeaf::Other,
+            _ => (GroupLeaf::Other, None),
         },
         Some(node::Node::ColumnRef(cr)) => {
-            if let Some(key) = resolve_group_column(node, scope, snapshot) {
-                return GroupLeaf::Column(key);
+            if resolve_group_column(node, scope, snapshot).is_some() {
+                return expression(node);
             }
             let alias = match cr.fields.as_slice() {
                 [f] => match f.node.as_ref() {
@@ -332,20 +416,19 @@ fn group_leaf(
                 _ => None,
             };
             let target = alias.and_then(|a| {
-                targets.iter().find_map(|t| match t {
+                targets.iter().enumerate().find_map(|(i, t)| match t {
                     ExpandedTarget::Expr(rt) if crate::resolve::target_resname(rt) == a => {
-                        Some(*rt)
+                        Some((i, *rt))
                     }
                     _ => None,
                 })
             });
-            target.map_or(GroupLeaf::Unresolved, target_column)
+            target.map_or((GroupLeaf::Unresolved, None), |(i, rt)| {
+                (target_column(rt), Some(i))
+            })
         }
-        Some(_) => match resolve_group_column(node, scope, snapshot) {
-            Some(key) => GroupLeaf::Column(key),
-            None => GroupLeaf::Expr(expr_key(node, scope, snapshot)),
-        },
-        None => GroupLeaf::Other,
+        Some(_) => expression(node),
+        None => (GroupLeaf::Other, None),
     }
 }
 
@@ -898,10 +981,13 @@ struct RefTarget {
 
 /// The namespaces of the query levels a reference can reach, innermost
 /// first. `None` stands for a level whose FROM clause is still being
-/// analyzed (a LATERAL item's parent): a reference reaching it is taken to
-/// belong to it.
+/// analyzed (a LATERAL item's parent, a CTE's or a FROM subquery's
+/// enclosing level): a reference reaching it is taken to belong to it —
+/// unless the second field, the entries of those levels the innermost one
+/// can see at all (LATERAL or correlated ones; `None`: unknown), says
+/// none of them has the name.
 #[derive(Clone, Default)]
-struct Chain(Vec<Option<Rc<Namespace>>>);
+struct Chain(Vec<Option<Rc<Namespace>>>, Option<Rc<Namespace>>);
 
 impl Chain {
     /// PG's transformColumnRef level search: an unqualified name is a
@@ -921,6 +1007,11 @@ impl Chain {
             [Some(col)] => {
                 for (level, ns) in self.0.iter().enumerate() {
                     let Some(ns) = ns else {
+                        // A FROM subquery's or a CTE's enclosing level, whose
+                        // entries it can't see, holds no column it names.
+                        if self.1.as_ref().is_some_and(|r| r.column(col).is_none()) {
+                            continue;
+                        }
                         return Some(RefTarget {
                             level,
                             target: None,
@@ -933,13 +1024,19 @@ impl Chain {
                         });
                     }
                 }
-                self.0
-                    .iter()
-                    .position(|ns| ns.as_ref().is_some_and(|ns| ns.has_alias(col)))
-                    .map(|level| RefTarget {
+                // Not a column: a whole-row reference to the nearest entry
+                // of that name.
+                self.0.iter().enumerate().find_map(|(level, ns)| match ns {
+                    Some(ns) if ns.has_alias(col) => Some(RefTarget {
                         level,
                         target: Some(((*col).to_owned(), None)),
-                    })
+                    }),
+                    None if self.1.as_ref().is_some_and(|r| r.has_alias(col)) => Some(RefTarget {
+                        level,
+                        target: None,
+                    }),
+                    _ => None,
+                })
             }
             [.., Some(table), last] => {
                 for (level, ns) in self.0.iter().enumerate() {
@@ -1180,7 +1277,13 @@ fn current_chain(scope: &Scope) -> Chain {
             .unwrap_or_else(|| Rc::new(Namespace::of(&scope.sources)));
         let mut chain = vec![Some(own)];
         chain.extend(f.iter().rev().skip(1).map(|fr| fr.ns.clone()));
-        Chain(chain)
+        let reachable: Vec<TableSource> = scope
+            .lateral_sources
+            .iter()
+            .chain(&scope.outer_sources)
+            .cloned()
+            .collect();
+        Chain(chain, Some(Rc::new(Namespace::of(&reachable))))
     })
 }
 
@@ -1458,6 +1561,129 @@ fn call_level(args: &[&protobuf::Node], chain: &mut Chain) -> usize {
     min.unwrap_or(0)
 }
 
+/// What PG's check_agg_arguments_walker finds in expressions written at
+/// the innermost level of a chain, sublinks included: the nearest level
+/// (`0`: that one) a column reference, and an aggregate or `GROUPING(…)`
+/// call, belongs to — each with its location.
+#[derive(Default)]
+struct ArgLevels {
+    var: Option<(usize, i32)>,
+    agg: Option<(usize, i32)>,
+}
+
+fn arg_levels(args: &[&protobuf::Node], chain: &mut Chain, snapshot: &PgCatalog) -> ArgLevels {
+    fn lower(slot: &mut Option<(usize, i32)>, level: usize, location: i32) {
+        if slot.is_none_or(|(l, _)| level < l) {
+            *slot = Some((level, location));
+        }
+    }
+    fn walk(
+        node: &protobuf::Node,
+        depth: usize,
+        chain: &mut Chain,
+        snapshot: &PgCatalog,
+        out: &mut ArgLevels,
+    ) {
+        match node.node.as_ref() {
+            Some(node::Node::ColumnRef(cr)) => {
+                if let Some(t) = chain.resolve(cr)
+                    && t.level >= depth
+                {
+                    lower(&mut out.var, t.level - depth, cr.location);
+                }
+                return;
+            }
+            Some(node::Node::SubLink(sl)) => {
+                if let Some(t) = sl.testexpr.as_deref() {
+                    walk(t, depth, chain, snapshot, out);
+                }
+                if let Some(sub) = sl.subselect.as_deref() {
+                    visit_select(sub, depth + 1, chain, &mut |e, d, c| {
+                        walk(e, d, c, snapshot, out)
+                    });
+                }
+                return;
+            }
+            Some(node::Node::JsonArrayQueryConstructor(q)) => {
+                if let Some(sub) = q.query.as_deref() {
+                    visit_select(sub, depth + 1, chain, &mut |e, d, c| {
+                        walk(e, d, c, snapshot, out)
+                    });
+                }
+                return;
+            }
+            _ => {}
+        }
+        // An aggregate's level, seen from where it is written; then on
+        // into its arguments, as PG's walker goes on.
+        let call = match call_of(node, snapshot) {
+            Some(Call::Aggregate {
+                aggregated,
+                location,
+                ..
+            }) => Some((call_level(&aggregated, chain), location)),
+            Some(Call::Grouping(g)) => {
+                let args: Vec<&protobuf::Node> = g.args.iter().collect();
+                Some((call_level(&args, chain), g.location))
+            }
+            Some(Call::Window(_)) | None => None,
+        };
+        if let Some((up, location)) = call
+            && up >= depth
+        {
+            lower(&mut out.agg, up - depth, location);
+        }
+        for c in level_children(node) {
+            walk(c, depth, chain, snapshot, out);
+        }
+    }
+    let mut out = ArgLevels::default();
+    for a in args {
+        walk(a, 0, chain, snapshot, &mut out);
+    }
+    out
+}
+
+/// PG's check_agg_arguments for an aggregate written at the innermost
+/// level of `chain`, belonging `level` levels out: no aggregate of that
+/// level among its aggregated arguments, and no variable of a lower level
+/// nor aggregate of that level or a lower one among its direct arguments —
+/// sublinks included (`avg((SELECT count(t.x) FROM u))` nests `t`'s
+/// aggregates).
+fn check_agg_arguments(
+    aggregated: &[&protobuf::Node],
+    direct: &[&protobuf::Node],
+    level: usize,
+    chain: &mut Chain,
+    snapshot: &PgCatalog,
+) -> Result<(), AnalyzeError> {
+    let span = crate::error::SourceSpan::from_node_qname;
+    let nested = |location: i32| crate::pgmsg::nested_aggregate(span(location)).finalize_implicit();
+    if let Some((l, location)) = arg_levels(aggregated, chain, snapshot).agg
+        && l <= level
+    {
+        return Err(nested(location));
+    }
+    if direct.is_empty() {
+        return Ok(());
+    }
+    let found = arg_levels(direct, chain, snapshot);
+    if let Some((l, location)) = found.var
+        && l < level
+    {
+        return Err(
+            crate::pgmsg::outer_aggregate_direct_argument_variable(span(location))
+                .finalize_implicit(),
+        );
+    }
+    if let Some((l, location)) = found.agg
+        && l <= level
+    {
+        return Err(nested(location));
+    }
+    Ok(())
+}
+
 /// `node` with every column reference that resolves, from the innermost
 /// level of `chain`, to level `level` (not those inside its sublinks)
 /// replaced by the entry and column it names — so that two spellings of
@@ -1592,7 +1818,7 @@ pub(crate) fn same_level_exprs_equal(
     scope: &Scope,
     snapshot: &PgCatalog,
 ) -> bool {
-    let chain = Chain(vec![Some(Rc::new(Namespace::of(&scope.sources)))]);
+    let chain = Chain(vec![Some(Rc::new(Namespace::of(&scope.sources)))], None);
     canonical(a, &chain, 0, Some(scope), snapshot).equal(&canonical(
         b,
         &chain,
@@ -1740,12 +1966,16 @@ pub(crate) fn finish_select_level(
         match call {
             Call::Aggregate {
                 aggregated,
+                direct,
                 location,
-                ..
-            } => match call_level(&aggregated, &mut chain) {
-                0 => own_aggs = true,
-                up => attribute_outer(up, None, location)?,
-            },
+            } => {
+                let level = call_level(&aggregated, &mut chain);
+                check_agg_arguments(&aggregated, &direct, level, &mut chain, snapshot)?;
+                match level {
+                    0 => own_aggs = true,
+                    up => attribute_outer(up, None, location)?,
+                }
+            }
             Call::Grouping(g) => {
                 if g.args.len() >= 32 {
                     return Err(crate::pgmsg::grouping_too_many_arguments(
@@ -1788,7 +2018,7 @@ pub(crate) fn finish_select_level(
         return Err(crate::pgmsg::too_many_grouping_sets().finalize_implicit());
     }
 
-    let mut own = Chain(vec![chain.0[0].clone()]);
+    let mut own = Chain(vec![chain.0[0].clone()], None);
     let group = GroupExprs::collect(sel, scope, targets, &own, snapshot);
 
     // finalize_grouping_exprs.

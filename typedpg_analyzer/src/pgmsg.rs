@@ -493,6 +493,20 @@ pub(crate) fn nested_aggregate(span: Option<SourceSpan>) -> RawError {
     )
 }
 
+/// `outer-level aggregate cannot contain a lower-level variable in its
+/// direct arguments` — SQLSTATE 42803 (`check_agg_arguments`), at the
+/// variable.
+pub(crate) fn outer_aggregate_direct_argument_variable(span: Option<SourceSpan>) -> RawError {
+    RawError::new(
+        AnalyzeError::GroupingError(
+            "outer-level aggregate cannot contain a lower-level variable in its direct arguments"
+                .into(),
+        ),
+        span,
+        None,
+    )
+}
+
 /// `aggregate function calls cannot contain window function calls` —
 /// SQLSTATE 42803, at the window function.
 pub(crate) fn window_in_aggregate(span: Option<SourceSpan>) -> RawError {
@@ -1747,6 +1761,7 @@ mod tests {
             ),
             (distinct_aggregate_order_by_not_in_args(None).kind, "42P10"),
             (aggregate_in_filter(None).kind, "42803"),
+            (outer_aggregate_direct_argument_variable(None).kind, "42803"),
             (window_in_filter(None).kind, "42P20"),
             (variadic_argument_must_be_array(None).kind, "42804"),
             (polymorphic_type_from_unknown(None), "42804"),

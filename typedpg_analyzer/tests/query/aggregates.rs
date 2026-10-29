@@ -905,6 +905,66 @@ fn outer_level_aggregate_belongs_to_the_outer_query() {
         .unwrap();
 }
 
+/// An aggregate belongs to the outermost level its arguments reference,
+/// so one inside another's argument — even through sublinks and
+/// another level's aggregate — is still nested in it.
+#[test]
+fn aggregates_nested_through_an_outer_reference_are_rejected() {
+    let db = grouping_rules_db();
+    for sql in [
+        // `avg(a2.x)` is the outermost query's, inside its own `avg(...)`.
+        "SELECT avg((SELECT avg(a1.id ORDER BY (SELECT avg(a2.x) FROM b a3)) FROM b a1))
+         FROM a a2",
+        "SELECT sum((SELECT count(a.x) FROM b)) FROM a",
+        "SELECT sum((SELECT max(b.id) FILTER (WHERE count(a.x) > 0) FROM b)) FROM a",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::GroupingError(_),
+            "aggregate function calls cannot be nested"
+        );
+    }
+    // The inner aggregate of the subquery's own level isn't nested.
+    for sql in [
+        "SELECT avg((SELECT avg(a1.id ORDER BY (SELECT avg(a3.id) FROM b a3)) FROM b a1))
+         FROM a a2",
+        "SELECT sum((SELECT count(b.id) FROM b WHERE b.id = a.x)) FROM a",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
+
+/// An ordered-set aggregate that belongs to an outer level (its ordering
+/// columns are outer) can't take a subquery's columns as direct
+/// arguments.
+#[test]
+fn ordered_set_direct_arguments_must_not_hold_lower_level_variables() {
+    let db = grouping_rules_db();
+    for sql in [
+        "SELECT array(SELECT percentile_disc(a) WITHIN GROUP (ORDER BY x)
+                      FROM (VALUES (0.3), (0.7)) v(a) GROUP BY a)
+         FROM generate_series(1,5) g(x)",
+        "SELECT (SELECT percentile_cont(b.id::float8) WITHIN GROUP (ORDER BY a.x) FROM b LIMIT 1)
+         FROM a",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::GroupingError(_),
+            "outer-level aggregate cannot contain a lower-level variable in its direct arguments"
+        );
+    }
+    // Direct arguments of the aggregate's own level, or constants, are fine.
+    for sql in [
+        "SELECT array(SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY x)
+                      FROM (VALUES (0.3), (0.7)) v(a))
+         FROM generate_series(1,5) g(x)",
+        "SELECT percentile_disc(a) WITHIN GROUP (ORDER BY x)
+         FROM (VALUES (0.3, 1), (0.7, 2)) v(a, x) GROUP BY a",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
+
 /// A grouped query's sublinks may only use its grouped columns
 /// (`subquery uses ungrouped column … from outer query`).
 #[test]
@@ -1059,4 +1119,56 @@ fn aggregate_rejected_as_from_function() {
         AnalyzeError::GroupingError(_),
         "aggregate functions are not allowed in functions in FROM"
     );
+}
+
+/// An aggregate over a whole-row reference works in a FROM subquery or a
+/// CTE as it does at the top level.
+#[test]
+fn whole_row_aggregates_in_a_from_subquery_or_cte() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE t (a int NOT NULL, b int); CREATE TABLE u (x int);")
+        .unwrap();
+    for (sql, col) in [
+        (
+            "SELECT j FROM (SELECT json_agg(x) j FROM t x) s",
+            cn("j", json_ty()),
+        ),
+        (
+            "WITH c AS (SELECT json_agg(t) j FROM t) SELECT j FROM c",
+            cn("j", json_ty()),
+        ),
+        (
+            "SELECT * FROM (SELECT count(t) FROM t) s",
+            c("count", int8()),
+        ),
+        (
+            "SELECT * FROM (SELECT count(x.*) FROM t x) s",
+            c("count", int8()),
+        ),
+        (
+            "SELECT j FROM (SELECT json_agg(t) j FROM t) s",
+            cn("j", json_ty()),
+        ),
+    ] {
+        let s = db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        assert_cols(&s, vec![col]);
+    }
+    // A LATERAL subquery sees its parent's entries: a name its own entries
+    // don't hold as a column is the parent's column, or its row.
+    for sql in [
+        "SELECT * FROM t, LATERAL (SELECT json_agg(t) FROM u) s",
+        "SELECT * FROM u, LATERAL (SELECT json_agg(x) FROM t x) s",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::GroupingError(_),
+            "aggregate functions are not allowed in FROM clause of their own query level"
+        );
+    }
+    // `count(t)` is the outer query's: over an empty `u` the subquery has
+    // no row, so NULL.
+    let s = db
+        .analyze("SELECT (SELECT count(t) FROM u) AS n FROM t")
+        .unwrap();
+    assert_cols(&s, vec![cn("n", int8())]);
 }
