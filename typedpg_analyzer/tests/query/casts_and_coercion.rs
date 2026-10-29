@@ -97,6 +97,51 @@ fn cast_array_literal_to_int8_array() {
     assert_cols(&s, vec![c("xs", array_of(int8()))]);
 }
 
+#[test]
+fn user_defined_range_casts_to_its_multirange() {
+    // CREATE TYPE ... AS RANGE also creates the multirange and registers a
+    // range → multirange cast (`pg_cast`, castmethod 'f', explicit), backed
+    // by the multirange constructor taking one range.
+    let mut db = setup();
+    db.apply_sql(r#"CREATE TYPE textrange AS RANGE (subtype = text, collation = "C");"#)
+        .unwrap();
+    let s = db
+        .analyze("SELECT textrange('a', 'c')::textmultirange AS m")
+        .unwrap();
+    assert_eq!(
+        s.columns[0].pg_type.cast_name().unwrap(),
+        "public.textmultirange"
+    );
+    db.analyze("SELECT 'empty'::textrange::textmultirange")
+        .unwrap();
+    // The cast function is strict: a NULL range stays NULL.
+    let s = db
+        .analyze("SELECT NULL::textrange::textmultirange AS m")
+        .unwrap();
+    assert!(s.columns[0].nullable);
+    // Explicit only: no assignment cast.
+    db.apply_sql("CREATE TABLE spans (m textmultirange);")
+        .unwrap();
+    let err = db
+        .analyze("INSERT INTO spans VALUES (textrange('a', 'c'))")
+        .unwrap_err();
+    assert!(
+        err.to_string().starts_with(
+            "column \"m\" is of type textmultirange but expression is of type textrange"
+        ),
+        "{err}"
+    );
+    // The cast goes with the types: re-creating them doesn't collide.
+    db.apply_sql(
+        r#"DROP TABLE spans;
+           DROP TYPE textrange;
+           CREATE TYPE textrange AS RANGE (subtype = text, collation = "C");"#,
+    )
+    .unwrap();
+    db.analyze("SELECT textrange('a', 'c')::textmultirange")
+        .unwrap();
+}
+
 // ── Cast inside a VALUES list projected from a subquery ──────────────────────
 
 #[test]

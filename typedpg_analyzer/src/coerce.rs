@@ -62,14 +62,15 @@ pub(crate) fn type_category_preferred(
 }
 
 /// Element type of a *true* array type — PG's `get_element_type`, which
-/// requires `typelem` and the array subscript handler (category `A`: the
-/// `_foo` arrays plus `int2vector`/`oidvector`, but not `name` or `point`,
-/// whose `typelem` only drives raw subscripting).
+/// requires `typelem` and the array subscript handler: the category-`A`
+/// types (the `_foo` arrays plus `int2vector`/`oidvector`) and `_record`,
+/// a pseudo-type (category `P`) that is still its element's `typarray` —
+/// but not `name` or `point`, whose `typelem` only drives raw subscripting.
 pub(crate) fn element_type(t: PgTypeOid, snapshot: &PgCatalog) -> Option<PgTypeOid> {
-    snapshot
-        .get_type(t)
-        .filter(|ty| ty.typcategory == TypCategory::Array)
-        .and_then(|ty| ty.typelem)
+    let ty = snapshot.get_type(t)?;
+    let elem = ty.typelem?;
+    (ty.typcategory == TypCategory::Array || snapshot.array_type_of(elem) == Some(t))
+        .then_some(elem)
 }
 
 /// PG's `ISCOMPLEX` (`typeOrDomainTypeRelid`): a composite type, or a

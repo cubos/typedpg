@@ -1857,11 +1857,7 @@ fn type_display_name(oid: PgTypeOid, snapshot: &PgCatalog) -> String {
 /// That includes `_record` (category P) but not `point` / `name`, whose
 /// `typelem` makes them subscriptable without being arrays.
 pub(crate) fn array_element_type(snapshot: &PgCatalog, t: PgTypeOid) -> Option<PgTypeOid> {
-    let base = snapshot.unwrap_domain(t);
-    let entry = snapshot.get_type(base)?;
-    let elem = entry.typelem?;
-    (entry.typcategory == TypCategory::Array || snapshot.array_type_of(elem) == Some(base))
-        .then_some(elem)
+    crate::coerce::element_type(snapshot.unwrap_domain(t), snapshot)
 }
 
 /// Return `text` when `node` is an untyped string literal (`'x'`) and its
