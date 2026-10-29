@@ -334,6 +334,7 @@ pub(crate) fn analyze_values_lists(
     let mut column_typmods: Vec<Vec<Option<i32>>> = vec![Vec::new(); arity];
     let mut column_nullable: Vec<bool> = vec![false; arity];
     let mut unknown_values: Vec<(usize, &protobuf::Node)> = Vec::new();
+    let mut column_exprs: Vec<Vec<expr::ExprType>> = vec![Vec::new(); arity];
 
     for row in &rows {
         // PG (SQLSTATE 42601): every row must have the first row's arity.
@@ -358,6 +359,7 @@ pub(crate) fn analyze_values_lists(
             if t.unknown_value {
                 unknown_values.push((i, item));
             }
+            column_exprs[i].push(t);
         }
     }
 
@@ -445,6 +447,14 @@ pub(crate) fn analyze_values_lists(
         }
     }
 
+    // transformValuesClause: select_common_collation per column — an
+    // explicit collation wins (two different ones are an error), two
+    // different implicit ones leave the column without one.
+    let mut collations = Vec::with_capacity(arity);
+    for (exprs, &t) in column_exprs.iter().zip(&common) {
+        collations.push(expr::derive_collation(exprs, t, snapshot)?.0);
+    }
+
     let columns = (0..arity)
         .map(|i| RawColumn {
             name: format!("column{}", i + 1),
@@ -459,10 +469,7 @@ pub(crate) fn analyze_values_lists(
                 .then(|| column_typmods[i].first().copied().flatten())
                 .flatten()
                 .filter(|m| column_typmods[i].iter().all(|x| *x == Some(*m))),
-            // VALUES literals don't carry a column-level collation — PG
-            // leaves it indeterminate and lets a surrounding `INSERT INTO
-            // table (cols)` re-attach the target column's attcollation.
-            collation: None,
+            collation: collations[i],
             record_fields: None,
             elem_nullable: None,
             refine: crate::refine::Refinement::NONE,

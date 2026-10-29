@@ -806,6 +806,25 @@ pub(crate) fn recursive_query_column_type(
     )
 }
 
+/// `recursive query "r" column N has collation "A" in non-recursive term
+/// but collation "B" overall` — SQLSTATE 42P21: PG fixes a recursive CTE's
+/// column collations from the non-recursive term alone.
+pub(crate) fn recursive_query_column_collation(
+    cte_name: &str,
+    column: usize,
+    seed_collation: &str,
+    overall_collation: &str,
+) -> RawError {
+    RawError::new(
+        AnalyzeError::CollationMismatch(format!(
+            "recursive query \"{cte_name}\" column {column} has collation \"{seed_collation}\" in \
+             non-recursive term but collation \"{overall_collation}\" overall"
+        )),
+        None,
+        Some("Use the COLLATE clause to set the collation of the non-recursive term.".into()),
+    )
+}
+
 /// A parse error from `typedpg_pg_query`, which carries PG's message and the
 /// function raising it, but not its SQLSTATE. Most grammar errors are
 /// `syntax_error` (42601), but gram.y raises a few with another code; those
@@ -1776,6 +1795,10 @@ mod tests {
             (
                 recursive_query_column_type("r", 1, "integer", "text").kind,
                 "42804",
+            ),
+            (
+                recursive_query_column_collation("r", 1, "C", "POSIX").kind,
+                "42P21",
             ),
             (coldeflist_required().kind, "42601"),
             (coldeflist_only_for_record().kind, "42601"),
