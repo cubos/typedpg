@@ -791,7 +791,7 @@ pub(super) fn emit_constraint_with_backing_index(
 }
 
 /// index_check_primary_key (index.c): a table has at most one primary key.
-fn check_no_primary_key(interp: &PgCatalog, relid: PgClassOid) -> Result<(), DdlError> {
+pub(super) fn check_no_primary_key(interp: &PgCatalog, relid: PgClassOid) -> Result<(), DdlError> {
     if interp
         .pg_index
         .values()
@@ -1966,6 +1966,8 @@ pub(crate) fn copy_like_constraints(
             .collect();
         checks.sort_by_key(|c| c.oid);
         for c in checks {
+            // expandTableLikeClause → StoreRelCheck.
+            super::check_inherit::check_no_inherit_allowed(interp, relid, c.connoinherit)?;
             let conkey = c.conkey.iter().map(|&an| new_attnum(interp, an)).collect();
             let oid = PgConstraintOid::from_nonzero(interp.alloc_oid()?);
             if let Some(def) = interp.check_defs.get(&c.oid).cloned() {

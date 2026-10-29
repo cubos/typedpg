@@ -513,16 +513,7 @@ pub fn choose_constraint_index_name(
 /// columns' names (`expr` for expressions, deduplicated with a counter),
 /// joined with `_`.
 pub fn index_name_addition(colnames: &[String]) -> String {
-    let mut chosen: Vec<String> = Vec::new();
-    for base in colnames {
-        let mut name = base.clone();
-        let mut i = 0;
-        while chosen.contains(&name) {
-            i += 1;
-            name = format!("{base}{i}");
-        }
-        chosen.push(name);
-    }
+    let chosen = choose_index_column_names(colnames);
     let mut out = String::new();
     for name in &chosen {
         if !out.is_empty() {
@@ -534,6 +525,22 @@ pub fn index_name_addition(colnames: &[String]) -> String {
         }
     }
     out
+}
+
+/// PG's `ChooseIndexColumnNames`: an index's column names, a repeated one
+/// suffixed with a counter (`expr`, `expr1`).
+pub(crate) fn choose_index_column_names(colnames: &[String]) -> Vec<String> {
+    let mut chosen: Vec<String> = Vec::new();
+    for base in colnames {
+        let mut name = base.clone();
+        let mut i = 0;
+        while chosen.contains(&name) {
+            i += 1;
+            name = format!("{base}{i}");
+        }
+        chosen.push(name);
+    }
+    chosen
 }
 
 /// `heap_create_with_catalog`'s checks for a new relation: its name must be

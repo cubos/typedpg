@@ -56,7 +56,9 @@ pub(crate) fn ensure_partition_index(
     let indkey = map_attnums(interp, pi.indrelid, part, &pi.indkey);
     let am = interp.index_access_methods.get(&parent_index).cloned();
 
-    // An equivalent, unattached index of the partition (CompareIndexInfo).
+    // An equivalent, unattached index of the partition (CompareIndexInfo);
+    // a constraint's index needs one backing a constraint, a plain index
+    // takes any.
     let existing = interp
         .pg_index
         .values()
@@ -64,20 +66,22 @@ pub(crate) fn ensure_partition_index(
             i.indrelid == part
                 && i.indisunique == pi.indisunique
                 && i.indkey == indkey
-                && i.indexprs == pi.indexprs
-                && i.indpred == pi.indpred
+                && same_exprs(&i.indexprs, &pi.indexprs)
+                && same_exprs(i.indpred.as_slice(), pi.indpred.as_slice())
                 && same_key_classes(interp, &pi, i)
-                && interp.index_access_methods.get(&i.indexrelid) == am.as_ref()
+                && access_method(interp, i.indexrelid) == access_method(interp, parent_index)
                 && !interp.index_parents.contains_key(&i.indexrelid)
                 && !interp.invalid_indexes.contains(&i.indexrelid)
         })
         .map(|i| i.indexrelid)
-        .filter(|&i| backing_constraint(interp, i).is_some() == parent_con.is_some())
+        .filter(|&i| parent_con.is_none() || backing_constraint(interp, i).is_some())
         .min();
     let child_index = match existing {
         Some(index) => {
-            // Its constraint becomes inherited.
-            if let Some(con) = backing_constraint(interp, index)
+            // Its constraint becomes inherited — when the parent index
+            // backs one too (else it stays local).
+            if parent_con.is_some()
+                && let Some(con) = backing_constraint(interp, index)
                 && let Some(row) = interp.pg_constraint.get_mut(&con.oid)
             {
                 row.coninhcount += 1;
@@ -86,6 +90,14 @@ pub(crate) fn ensure_partition_index(
             index
         }
         None => {
+            // DefineIndex → index_check_primary_key: the copy of a primary
+            // key is the partition's, which may not have one already.
+            if pi.indisprimary {
+                constraints::check_no_primary_key(interp, part)?;
+            }
+            crate::ddl::indexes::check_partition_copy_covers_partition_key(
+                interp, &pi, part, &indkey,
+            )?;
             let clone = create_clone(interp, &pi, parent_con.as_ref(), part, indkey, am)?;
             if interp.nonimmediate_indexes.contains(&parent_index) {
                 interp.nonimmediate_indexes.insert(clone);
@@ -313,9 +325,27 @@ fn index_definitions_match(interp: &PgCatalog, parent: &PgIndex, child: &PgIndex
         && child.indnatts == parent.indnatts
         && child.indnkeyatts == parent.indnkeyatts
         && child.indkey == map_attnums(interp, parent.indrelid, child.indrelid, &parent.indkey)
-        && child.indexprs == parent.indexprs
-        && child.indpred == parent.indpred
+        && same_exprs(&child.indexprs, &parent.indexprs)
+        && same_exprs(child.indpred.as_slice(), parent.indpred.as_slice())
         && access_method(interp, child.indexrelid) == access_method(interp, parent.indexrelid)
+}
+
+/// CompareIndexInfo: two indexes' expressions (or predicates) are equal
+/// parse trees, source locations aside.
+fn same_exprs(
+    a: &[crate::pg_catalog::SerializedAst],
+    b: &[crate::pg_catalog::SerializedAst],
+) -> bool {
+    use prost::Message;
+    use typedpg_pg_query::Equal;
+    let decode = |e: &crate::pg_catalog::SerializedAst| {
+        typedpg_pg_query::protobuf::Node::decode(e.ast.as_slice()).ok()
+    };
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(a, b)| match (decode(a), decode(b)) {
+            (Some(a), Some(b)) => a.equal(&b),
+            _ => a.ast == b.ast,
+        })
 }
 
 /// An index's access method (`relam`; btree unless recorded otherwise).

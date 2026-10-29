@@ -528,6 +528,67 @@ fn create_index_target_errors() {
 }
 
 #[test]
+fn index_expressions_reject_record() {
+    // index_create's ConstructTupleDescriptor runs CheckAttributeType on
+    // each expression column, named as ChooseIndexColumnNames names it:
+    // `record` has operator classes, but isn't storable.
+    assert_rejected(
+        "CREATE TABLE fih (f1 text, f2 text);",
+        &[
+            (
+                "CREATE INDEX ON fih ((f1 || f2), (row(f1, f2)));",
+                r#"column "row" has pseudo-type record"#,
+            ),
+            (
+                "CREATE INDEX ix ON fih (f1, (row(f1, f2)::record));",
+                r#"column "row" has pseudo-type record"#,
+            ),
+            (
+                "CREATE INDEX ON fih ((ARRAY[row(f1, f2)]));",
+                r#"column "array" has pseudo-type record[]"#,
+            ),
+            (
+                "ALTER TABLE fih ADD EXCLUDE ((row(f1, f2)) WITH =);",
+                r#"column "row" has pseudo-type record"#,
+            ),
+        ],
+    );
+    assert_accepted(
+        "CREATE TABLE fih (f1 int, f2 int); CREATE TYPE pr AS (x int, y int);",
+        &[
+            "CREATE INDEX ON fih ((row(f1, f2)::pr));",
+            "CREATE INDEX ON fih ((ARRAY[f1, f2]));",
+        ],
+    );
+}
+
+#[test]
+fn unnamed_indexes_are_named_after_their_columns() {
+    // ChooseIndexColumnNames: an expression column is named as a SELECT
+    // would name it (FigureColnameInternal), else `expr`; repeated names
+    // are numbered. Names from PG 18.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int, b int, c text);
+         CREATE INDEX ON t ((CASE WHEN a > 0 THEN b END), ('x'::text), (coalesce(a, b)),
+             (c::varchar), (ARRAY[a]), (greatest(a, b)), (nullif(a, b)), (a + 1));
+         CREATE INDEX ON t ((lower(c)), (lower(c)), (a + 1), (a + 2));",
+    )]);
+    let mut names: Vec<String> = user_indexes(&db)
+        .into_iter()
+        .map(|i| db.pg_class()[&i.indexrelid].relname.clone())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        [
+            "t_case_text_coalesce_c_array_greatest_nullif_expr_idx",
+            "t_lower_lower1_expr_expr1_idx",
+        ]
+    );
+}
+
+#[test]
 fn stable_functions_are_not_immutable_in_indexes_or_generated_columns() {
     // PG 18: CheckMutability rejects STABLE callees too; a STABLE SQL
     // function that inlines to an immutable expression is fine.
@@ -761,6 +822,88 @@ fn attaching_indexes_of_constraints() {
     assert!(con.conislocal && con.coninhcount == 0);
 }
 
+#[test]
+fn attach_a_partition_index_by_name() {
+    // DefineIndex's recursion adopts a matching index of the partition —
+    // a plain index takes a constraint's (tp_pkey), whose constraint stays
+    // local — and ATTACH PARTITION of the adopted one is a no-op.
+    let setup = "CREATE TABLE t (a integer, b integer) PARTITION BY HASH (a, b);
+                 CREATE TABLE tp (a integer, b integer, PRIMARY KEY (a, b), UNIQUE (b, a));
+                 ALTER TABLE t ATTACH PARTITION tp FOR VALUES WITH (MODULUS 1, REMAINDER 0);";
+    let db = build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "CREATE UNIQUE INDEX t_a_idx ON t (a, b);
+             ALTER INDEX t_a_idx ATTACH PARTITION tp_pkey;",
+        ),
+    ]);
+    let mut names: Vec<String> = user_indexes(&db)
+        .into_iter()
+        .map(|i| db.pg_class()[&i.indexrelid].relname.clone())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["t_a_idx", "tp_b_a_key", "tp_pkey"]);
+    let con = db
+        .constraints_of_table("tp")
+        .into_iter()
+        .find(|c| c.conname == "tp_pkey")
+        .unwrap();
+    assert!(con.conislocal && con.coninhcount == 0);
+    // A constraint's index still needs a constraint's: t_pk gets a copy.
+    assert_rejected(
+        "CREATE TABLE t (a integer NOT NULL, b integer) PARTITION BY HASH (a);
+         CREATE TABLE tp (a integer NOT NULL, b integer);
+         CREATE UNIQUE INDEX tp_a ON tp (a);
+         ALTER TABLE t ATTACH PARTITION tp FOR VALUES WITH (MODULUS 1, REMAINDER 0);
+         ALTER TABLE t ADD CONSTRAINT t_pk PRIMARY KEY (a);",
+        &[(
+            "ALTER INDEX t_pk ATTACH PARTITION tp_a;",
+            "cannot attach index \"tp_a\" as a partition of index \"t_pk\" (Another index is \
+             already attached for partition \"tp\".)",
+        )],
+    );
+}
+
+#[test]
+fn attach_a_matching_expression_index() {
+    // CompareIndexInfo compares expressions and predicates as parse trees,
+    // whatever their spelling.
+    let setup = "CREATE TABLE idxpart (a int, b int) PARTITION BY RANGE (a);
+                 CREATE TABLE idxpart1 PARTITION OF idxpart FOR VALUES FROM (0) TO (10);";
+    assert_accepted(
+        setup,
+        &[
+            "CREATE INDEX idxpart_expr_idx ON ONLY idxpart ((a + b));
+             CREATE INDEX idxpart1_expr_idx ON idxpart1 ((a + b));
+             ALTER INDEX idxpart_expr_idx ATTACH PARTITION idxpart1_expr_idx;",
+            "CREATE INDEX ip ON ONLY idxpart (a) WHERE b > 0;
+             CREATE INDEX ip1 ON idxpart1 (a) WHERE (b>0);
+             ALTER INDEX ip ATTACH PARTITION ip1;",
+        ],
+    );
+    assert_rejected(
+        setup,
+        &[(
+            "CREATE INDEX idxpart_expr_idx ON ONLY idxpart ((a + b));
+             CREATE INDEX idxpart1_expr_idx ON idxpart1 ((b + a));
+             ALTER INDEX idxpart_expr_idx ATTACH PARTITION idxpart1_expr_idx;",
+            "cannot attach index \"idxpart1_expr_idx\" as a partition of index \
+             \"idxpart_expr_idx\" (The index definitions do not match.)",
+        )],
+    );
+    // An index created on the parent adopts the partition's equal one.
+    let db = build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "CREATE INDEX idxpart1_expr_idx ON idxpart1 ((a + b));
+             CREATE INDEX idxpart_expr_idx ON idxpart ((a+b));",
+        ),
+    ]);
+    assert_eq!(user_indexes(&db).len(), 2);
+}
+
 /// Apply `setup` then each statement, expecting PG's error `message` (a
 /// prefix of the analyzer's) for every one.
 fn assert_rejected(setup: &str, cases: &[(&str, &str)]) {
@@ -849,6 +992,52 @@ fn constraint_index_options_are_validated() {
     assert_accepted(
         "",
         &["CREATE TABLE t (a int PRIMARY KEY WITH (fillfactor=50));"],
+    );
+}
+
+#[test]
+fn brin_bloom_operator_class_options() {
+    // brin_bloom_options: two real options, n_distinct_per_range and
+    // false_positive_rate.
+    let setup = "CREATE TABLE bb (b bytea);";
+    assert_accepted(
+        setup,
+        &[
+            "CREATE INDEX ON bb USING brin (b bytea_bloom_ops(n_distinct_per_range = 100));",
+            "CREATE INDEX ON bb USING brin \
+             (b bytea_bloom_ops(false_positive_rate = 0.05, n_distinct_per_range = -0.5));",
+        ],
+    );
+    assert_rejected(
+        setup,
+        &[
+            (
+                "CREATE INDEX ON bb USING brin (b bytea_bloom_ops(n_distinct_per_range = -2));",
+                "value -2 out of bounds for option \"n_distinct_per_range\" (Valid values are \
+                 between \"-1.000000\" and \"2147483647.000000\".)",
+            ),
+            (
+                "CREATE INDEX ON bb USING brin (b bytea_bloom_ops(false_positive_rate = 1e-5));",
+                "value 1e-5 out of bounds for option \"false_positive_rate\" (Valid values are \
+                 between \"0.000100\" and \"0.250000\".)",
+            ),
+            (
+                "CREATE INDEX ON bb USING brin (b bytea_bloom_ops(false_positive_rate = 'x'));",
+                "invalid value for floating point option \"false_positive_rate\": x",
+            ),
+            (
+                "CREATE INDEX ON bb USING brin (b bytea_bloom_ops(false_positive_rate));",
+                "invalid value for floating point option \"false_positive_rate\": true",
+            ),
+            (
+                "CREATE INDEX ON bb USING brin (b bytea_bloom_ops(siglen = 1));",
+                "unrecognized parameter \"siglen\"",
+            ),
+            (
+                "CREATE INDEX ON bb USING brin (b bytea_minmax_ops(n_distinct_per_range = 1));",
+                "operator class bytea_minmax_ops has no options",
+            ),
+        ],
     );
 }
 
@@ -1455,6 +1644,54 @@ fn partition_indexes_match_on_collation_and_operator_family() {
         ],
     );
     assert_accepted(setup, &["ALTER INDEX qj ATTACH PARTITION q1_bp;"]);
+}
+
+#[test]
+fn unique_constraints_cover_every_level_of_partition_keys() {
+    // DefineIndex recurses into a partitioned partition with its own
+    // partition key, which the copy must cover too — as must the copies
+    // ATTACH PARTITION and PARTITION OF make.
+    let setup = "CREATE EXTENSION btree_gist;
+                 CREATE TABLE ip (a int, b int) PARTITION BY RANGE (a);
+                 CREATE TABLE ip2 PARTITION OF ip FOR VALUES FROM (0) TO (1000) \
+                     PARTITION BY RANGE (b);
+                 CREATE TABLE jp (a int, b int, UNIQUE (a)) PARTITION BY RANGE (a);
+                 CREATE TABLE kp (a int, b int) PARTITION BY RANGE (a);
+                 CREATE TABLE kp1 PARTITION OF kp FOR VALUES FROM (0) TO (10) \
+                     PARTITION BY LIST ((b + 1));";
+    let lacks = "unique constraint on partitioned table must include all partitioning columns";
+    assert_rejected(
+        setup,
+        &[
+            ("ALTER TABLE ip ADD PRIMARY KEY (a);", lacks),
+            ("ALTER TABLE ip ADD UNIQUE (a);", lacks),
+            ("CREATE UNIQUE INDEX ON ip (a);", lacks),
+            ("ALTER TABLE ip ADD EXCLUDE USING gist (a WITH =);", lacks),
+            (
+                "CREATE TABLE jp2 PARTITION OF jp FOR VALUES FROM (10) TO (20) \
+                 PARTITION BY LIST (b);",
+                lacks,
+            ),
+            (
+                "CREATE TABLE ip3 (a int, b int) PARTITION BY LIST (b);
+                 ALTER TABLE jp ATTACH PARTITION ip3 FOR VALUES FROM (0) TO (10);",
+                lacks,
+            ),
+            (
+                "ALTER TABLE kp ADD PRIMARY KEY (a);",
+                "unsupported PRIMARY KEY constraint with partition key definition",
+            ),
+        ],
+    );
+    assert_accepted(
+        setup,
+        &[
+            "ALTER TABLE ip ADD PRIMARY KEY (a, b);",
+            "CREATE UNIQUE INDEX ON ONLY ip (a);",
+            "ALTER TABLE ip ADD EXCLUDE USING gist (a WITH =, b WITH =);",
+            "CREATE TABLE jp3 PARTITION OF jp FOR VALUES FROM (20) TO (30) PARTITION BY LIST (a);",
+        ],
+    );
 }
 
 #[test]

@@ -30,20 +30,47 @@ pub(crate) fn check_attribute_type(
     is_virtual: bool,
 ) -> Result<(), DdlError> {
     let mut containing: Vec<PgTypeOid> = containing.into_iter().collect();
-    check_attribute_type_rec(interp, attname, typid, &mut containing, is_virtual)
+    check_attribute_type_rec(interp, attname, typid, &mut containing, is_virtual, false)
 }
 
+/// `CheckAttributeType` with `CHKATYPE_IS_PARTKEY` (ComputePartitionAttrs),
+/// for the type of partition key expression number `keycol` (1-based): the
+/// checks of a column's type, the key reported by number.
+pub(crate) fn check_partition_key_type(
+    interp: &PgCatalog,
+    keycol: usize,
+    typid: PgTypeOid,
+) -> Result<(), DdlError> {
+    check_attribute_type_rec(
+        interp,
+        &keycol.to_string(),
+        typid,
+        &mut Vec::new(),
+        false,
+        true,
+    )
+}
+
+/// `partkey`: `attname` is a partition key column number
+/// (`CHKATYPE_IS_PARTKEY`, dropped for a composite's attributes).
 fn check_attribute_type_rec(
     interp: &PgCatalog,
     attname: &str,
     typid: PgTypeOid,
     containing: &mut Vec<PgTypeOid>,
     is_virtual: bool,
+    partkey: bool,
 ) -> Result<(), DdlError> {
     let Some(typ) = interp.pg_type.get(&typid) else {
         return Ok(());
     };
     match typ.typtype {
+        TypType::Pseudo if partkey => {
+            return Err(DdlError::Parse(format!(
+                "partition key column {attname} has pseudo-type {}",
+                super::super::util::format_type_for_message(interp, typid)
+            )));
+        }
         TypType::Pseudo => {
             return Err(DdlError::Parse(format!(
                 "column \"{attname}\" has pseudo-type {}",
@@ -57,7 +84,7 @@ fn check_attribute_type_rec(
                 )));
             }
             if let Some(base) = typ.typbasetype {
-                check_attribute_type_rec(interp, attname, base, containing, is_virtual)?;
+                check_attribute_type_rec(interp, attname, base, containing, is_virtual, partkey)?;
             }
         }
         TypType::Composite => {
@@ -76,6 +103,7 @@ fn check_attribute_type_rec(
                         attr.atttypid,
                         containing,
                         is_virtual,
+                        false,
                     )?;
                 }
                 containing.pop();
@@ -89,6 +117,7 @@ fn check_attribute_type_rec(
                     range.rngsubtype,
                     containing,
                     is_virtual,
+                    partkey,
                 )?;
             }
         }
@@ -98,14 +127,21 @@ fn check_attribute_type_rec(
                 .values()
                 .find(|r| r.rngmultitypid == Some(typid))
             {
-                check_attribute_type_rec(interp, attname, range.rngtypid, containing, is_virtual)?;
+                check_attribute_type_rec(
+                    interp,
+                    attname,
+                    range.rngtypid,
+                    containing,
+                    is_virtual,
+                    partkey,
+                )?;
             }
         }
         _ => {
             if typ.typcategory == TypCategory::Array
                 && let Some(elem) = typ.typelem
             {
-                check_attribute_type_rec(interp, attname, elem, containing, is_virtual)?;
+                check_attribute_type_rec(interp, attname, elem, containing, is_virtual, partkey)?;
             }
         }
     }
