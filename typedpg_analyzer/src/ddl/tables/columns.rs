@@ -805,11 +805,7 @@ fn add_column_to(
     // ATExecAddColumn: regular inheritance children don't inherit an
     // identity column, so one can't be added recursively to a table that
     // has some (partitions do share it).
-    if col.identity.is_some()
-        && rec.recurse
-        && !cx.partitioned
-        && !children.is_empty()
-    {
+    if col.identity.is_some() && rec.recurse && !cx.partitioned && !children.is_empty() {
         return Err(DdlError::Parse(
             "cannot recursively add identity column to table that has child tables".into(),
         ));
