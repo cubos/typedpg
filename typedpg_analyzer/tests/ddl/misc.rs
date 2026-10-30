@@ -4003,6 +4003,51 @@ fn foreign_data_wrappers_servers_and_user_mappings() {
             "CREATE FOREIGN TABLE ft2 (a int) SERVER nosuch OPTIONS (x '1', x '2');",
             "server \"nosuch\" does not exist",
         ),
+        // ALTER FOREIGN TABLE: ATExecGenericOptions and
+        // ATExecAlterColumnGenericOptions, which also takes a new column's
+        // options (transformColumnDefinition).
+        (
+            "ALTER FOREIGN TABLE ft OPTIONS (x '1', x '2');",
+            "option \"x\" provided more than once",
+        ),
+        (
+            "ALTER TABLE ft OPTIONS (ADD x '1', x '2');",
+            "option \"x\" provided more than once",
+        ),
+        (
+            "ALTER FOREIGN TABLE ft ALTER COLUMN a OPTIONS (x '1', x '2');",
+            "option \"x\" provided more than once",
+        ),
+        (
+            "ALTER FOREIGN TABLE ft ADD COLUMN b int OPTIONS (x '1', x '2');",
+            "option \"x\" provided more than once",
+        ),
+        // The column is looked up first.
+        (
+            "ALTER FOREIGN TABLE ft ALTER COLUMN nosuch OPTIONS (x '1', x '2');",
+            "column \"nosuch\" of relation \"ft\" does not exist",
+        ),
+        (
+            "ALTER FOREIGN TABLE ft ALTER COLUMN ctid OPTIONS (x '1');",
+            "cannot alter system column \"ctid\"",
+        ),
+        // Only a foreign table has them.
+        (
+            "CREATE TABLE t (a int); ALTER TABLE t OPTIONS (x '1');",
+            "ALTER action OPTIONS cannot be performed on relation \"t\"",
+        ),
+        (
+            "CREATE TABLE t (a int); ALTER TABLE t ALTER COLUMN a OPTIONS (x '1');",
+            "ALTER action ALTER COLUMN ... OPTIONS cannot be performed on relation \"t\"",
+        ),
+        (
+            "CREATE TABLE t (a int); ALTER TABLE t ADD COLUMN b int OPTIONS (x '1');",
+            "\"t\" is not a foreign table",
+        ),
+        (
+            "CREATE TABLE t (a int OPTIONS (x '1'));",
+            "\"t\" is not a foreign table",
+        ),
     ] {
         let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
         assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
@@ -4016,6 +4061,10 @@ fn foreign_data_wrappers_servers_and_user_mappings() {
              CREATE FOREIGN TABLE ft3 (a int) SERVER s2;
              ALTER SERVER s2 OPTIONS (ADD host 'x');
              ALTER SERVER s2 OPTIONS (DROP host, ADD host 'y');
+             ALTER FOREIGN TABLE ft3 OPTIONS (ADD x '1', DROP x, ADD x '2');
+             ALTER FOREIGN TABLE ft3 ALTER COLUMN a OPTIONS (y '1'), OPTIONS (y '1');
+             ALTER FOREIGN TABLE ft3 ADD COLUMN IF NOT EXISTS a int OPTIONS (x '1', x '2');
+             ALTER FOREIGN TABLE IF EXISTS nosuch OPTIONS (x '1', x '2');
              DROP USER MAPPING IF EXISTS FOR public SERVER nosuch;
              DROP USER MAPPING FOR public SERVER s2;
              DROP SERVER IF EXISTS nosuch;

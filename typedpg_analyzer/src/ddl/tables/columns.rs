@@ -944,6 +944,9 @@ fn add_column_to(
             )?;
         }
         add_column_constraints(interp, relid, cd)?;
+        // transformColumnDefinition: the column's generic options are an
+        // ALTER FOREIGN TABLE ... ALTER COLUMN ... OPTIONS run afterwards.
+        super::column_generic_options_stmt(interp, relid, &cd.colname, &cd.fdwoptions)?;
     }
     Ok(())
 }

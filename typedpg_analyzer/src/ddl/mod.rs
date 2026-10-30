@@ -415,7 +415,7 @@ fn with_statement_sql(
 fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError> {
     match stmt {
         // ── Tables ──────────────────────────────────────────────────
-        node::Node::CreateStmt(s) => tables::create_table(db, s),
+        node::Node::CreateStmt(s) => tables::create_plain_table(db, s),
         node::Node::AlterTableStmt(s) => tables::alter_table(db, s),
         node::Node::CreateForeignTableStmt(s) => tables::create_foreign_table(db, s),
         node::Node::RefreshMatViewStmt(s) => views::refresh_materialized_view(db, s),
