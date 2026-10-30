@@ -292,6 +292,61 @@ fn arrays_of_records_resolve_like_other_arrays() {
 }
 
 #[test]
+fn record_array_parameters_and_casts() {
+    // A `$N::record[]` (or a `$N` an array of rows types) is an array like
+    // any other: array functions, unnest, comparisons and `||` resolve. The
+    // parameter's type itself is checked against PG's Describe (`record[]`)
+    // by the pg_sanity oracle.
+    let db = setup();
+    for (sql, params, cols) in [
+        ("SELECT array_length($1::record[], 1)", 1, vec![int4()]),
+        (
+            "SELECT array_length(NULL::record[], 1), cardinality($1::record[])",
+            1,
+            vec![int4(), int4()],
+        ),
+        ("SELECT array_ndims($1::record[])", 1, vec![int4()]),
+        ("SELECT ARRAY[ROW(1, 2)] = $1", 1, vec![bool_ty()]),
+        ("SELECT ARRAY[ROW(1, 2)] < $1", 1, vec![bool_ty()]),
+        ("SELECT $1::record[] = $2", 2, vec![bool_ty()]),
+        ("SELECT ARRAY[ROW(1, 2)] = ARRAY[ROW(1, 2)]", 0, vec![bool_ty()]),
+        ("SELECT ROW(1, 2) = ANY($1::record[])", 1, vec![bool_ty()]),
+        ("SELECT 1 FROM (SELECT unnest($1::record[])) s", 1, vec![int4()]),
+    ] {
+        let s = db
+            .analyze(sql)
+            .unwrap_or_else(|e| panic!("PG accepts `{sql}`: {e}"));
+        assert_eq!(s.params.len(), params, "`{sql}`");
+        let got: Vec<_> = s.columns.iter().map(|c| c.pg_type.clone()).collect();
+        assert_eq!(got, cols, "`{sql}`");
+    }
+    for sql in [
+        "SELECT unnest($1::record[])",
+        "SELECT $1::record[]",
+        "SELECT '{}'::record[]",
+        "SELECT ARRAY[ROW(1, 2)] || $1",
+    ] {
+        db.analyze(sql)
+            .unwrap_or_else(|e| panic!("PG accepts `{sql}`: {e}"));
+    }
+    // unnest's rows are bare records: one column, whatever the lhs width,
+    // and FROM needs a column definition list.
+    for (sql, msg) in [
+        (
+            "SELECT ROW(1, 2) IN (SELECT unnest($1::record[]))",
+            "subquery has too few columns",
+        ),
+        (
+            "SELECT * FROM unnest($1::record[])",
+            "a column definition list is required for functions returning \"record\"",
+        ),
+    ] {
+        let err = db.analyze(sql).unwrap_err().to_string();
+        assert!(err.starts_with(msg), "`{sql}`: {err}");
+    }
+}
+
+#[test]
 fn search_depth_first_sequence_column_is_orderable() {
     // SEARCH DEPTH FIRST adds a `record[]` path column; PG orders it with
     // `array_ops` (`anyarray < anyarray`), comparing the records field by field.
