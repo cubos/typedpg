@@ -119,8 +119,12 @@ pub(crate) fn coerce_record_to_complex(
         )
     };
     let mut shape = Vec::with_capacity(fields.len());
-    match node.node.as_ref() {
-        Some(node::Node::RowExpr(row)) => {
+    let whole_row = match node.node.as_ref() {
+        Some(node::Node::ColumnRef(cr)) => whole_row_source(cr, ctx.scope).map(|s| (cr, s)),
+        _ => None,
+    };
+    match (node.node.as_ref(), whole_row) {
+        (Some(node::Node::RowExpr(row)), _) => {
             // transformRowExpr has expanded the stars already.
             let args = expand_row_args(&row.args, ctx, params)?;
             for (i, field) in fields.iter().enumerate() {
@@ -176,7 +180,7 @@ pub(crate) fn coerce_record_to_complex(
                 return Err(too_many());
             }
         }
-        Some(node::Node::ColumnRef(cr)) if let Some(source) = whole_row_source(cr, ctx.scope) => {
+        (_, Some((cr, source))) => {
             // expandNSItemVars: one Var per column of the entry, each NULL
             // where a reference to that column would be (its own
             // nullability, an outer join's nullable side, a grouping set
