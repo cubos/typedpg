@@ -1384,6 +1384,166 @@ fn a_column_without_a_collation_stays_without_one() {
 }
 
 #[test]
+fn a_sublink_without_a_collation_is_an_implicit_none() {
+    // PG 18 (assign_collations_walker, T_Query): a scalar or ARRAY sublink
+    // takes its subquery's column collation at strength IMPLICIT, even when
+    // that column has none (InvalidOid). Unlike a Var of strength NONE, it
+    // beats the default collation, bubbles up through every collatable node
+    // over it (a function, an operator, a cast, CASE, COALESCE, ARRAY[...],
+    // a subscript, a VALUES column it is merged into) and conflicts with any
+    // other non-default implicit collation; only an explicit COLLATE settles
+    // it. A Var reading it through a subquery is of strength NONE, so a
+    // node over that Var takes its type's default.
+    let setup = r#"CREATE TABLE c1 (b text COLLATE "C");
+                   CREATE TABLE c2 (b text COLLATE "POSIX");
+                   CREATE DOMAIN d AS text;"#;
+    let u = "(SELECT b FROM c1 UNION ALL SELECT b FROM c2)";
+    let sub = format!("(SELECT x.b FROM {u} x LIMIT 1)");
+    let arr = format!("ARRAY(SELECT x.b FROM {u} x)");
+    let no_collation =
+        |ty: &str| format!(r#"no collation was derived for column "a" with collatable type {ty}"#);
+    for (query, ty) in [
+        (format!("SELECT unnest({arr}) AS a"), "text"),
+        (format!("SELECT * FROM unnest({arr}) AS a"), "text"),
+        (format!("SELECT {arr} || ARRAY['a'] AS a"), "text[]"),
+        (format!("SELECT {arr} AS a"), "text[]"),
+        (format!("SELECT {arr}::text[] AS a"), "text[]"),
+        (format!("SELECT ({arr})[1] AS a"), "text"),
+        (format!("SELECT array_append({arr}, 'q') AS a"), "text[]"),
+        (format!("SELECT upper({sub}) AS a"), "text"),
+        (format!("SELECT {sub} || 'q' AS a"), "text"),
+        (format!("SELECT {sub} || c1.b AS a FROM c1"), "text"),
+        (format!("SELECT {sub}::varchar AS a"), "character varying"),
+        (format!("SELECT {sub}::d AS a"), "d"),
+        // A Var reading it has strength NONE, and no collation either.
+        (format!("SELECT s.a FROM (SELECT {sub} AS a) s"), "text"),
+        (format!("SELECT COALESCE({sub}, 'q') AS a"), "text"),
+        (
+            format!("SELECT CASE WHEN true THEN {sub} ELSE 'q' END AS a"),
+            "text",
+        ),
+        (format!("SELECT ARRAY[{sub}] AS a"), "text[]"),
+        (format!("SELECT unnest(ARRAY[{sub}]) AS a"), "text"),
+        (format!("SELECT {sub} AS a UNION ALL SELECT 'q'"), "text"),
+        (format!("SELECT 'q' AS a UNION ALL SELECT {sub}"), "text"),
+        (
+            format!("SELECT v.a FROM (VALUES ({sub}), ('q')) v(a)"),
+            "text",
+        ),
+        (
+            format!("SELECT v.a FROM (VALUES ('q'), ({sub})) v(a)"),
+            "text",
+        ),
+        (
+            format!("SELECT v.a FROM (VALUES ({sub}), ('q'::text)) v(a)"),
+            "text",
+        ),
+        (
+            format!("SELECT v.a FROM (VALUES ({sub}), (NULL)) v(a)"),
+            "text",
+        ),
+        (
+            format!("SELECT v.a FROM (VALUES ({sub}), (upper('q'))) v(a)"),
+            "text",
+        ),
+        (
+            format!("SELECT v.a FROM (VALUES ({sub}), ((SELECT b FROM c1 LIMIT 1))) v(a)"),
+            "text",
+        ),
+    ] {
+        let stmt = format!("CREATE TABLE t AS {query} WITH NO DATA;");
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", &stmt)]).expect_err(&stmt);
+        assert!(
+            err.to_string().starts_with(&no_collation(ty)),
+            "{stmt}\n  got: {err}"
+        );
+    }
+    for query in [
+        format!("SELECT v.a FROM (VALUES ({sub}), ('q')) v(a)"),
+        format!("SELECT unnest({arr}) AS a"),
+    ] {
+        let stmt = format!("CREATE VIEW t AS {query};");
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", &stmt)]).expect_err(&stmt);
+        assert!(
+            err.to_string()
+                .starts_with(r#"could not determine which collation to use for view column "a""#),
+            "{stmt}\n  got: {err}"
+        );
+    }
+    let db = build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            &format!(
+                r#"CREATE TABLE a1 AS SELECT {sub} COLLATE "C" AS a WITH NO DATA;
+                   CREATE TABLE a2 AS SELECT {sub} || ('q' COLLATE "POSIX") AS a WITH NO DATA;
+                   CREATE TABLE a4 AS SELECT upper(s.a) AS a FROM (SELECT {sub} AS a) s
+                                      WITH NO DATA;
+                   CREATE TABLE a5 AS SELECT length({sub}) AS a WITH NO DATA;
+                   CREATE TABLE a6 AS SELECT unnest({arr}) COLLATE "C" AS a WITH NO DATA;
+                   CREATE TABLE a7 AS SELECT v.a FROM (VALUES ({sub} COLLATE "POSIX"), ('q')) v(a)
+                                      WITH NO DATA;
+                   CREATE TABLE a8 AS SELECT (SELECT b FROM c1 LIMIT 1) || 'q' AS a WITH NO DATA;"#
+            ),
+        ),
+    ]);
+    let collated = |c: &str| basic_with_collation("pg_catalog", "text", c);
+    for (table, ty) in [
+        ("a1", collated("C")),
+        ("a2", collated("POSIX")),
+        ("a4", text()),
+        ("a5", basic("pg_catalog", "int4")),
+        ("a6", collated("C")),
+        ("a7", collated("POSIX")),
+        ("a8", collated("C")),
+    ] {
+        let info = db.analyze(&format!("SELECT a FROM {table}")).unwrap();
+        assert_cols(&info, vec![cn("a", ty)]);
+    }
+}
+
+#[test]
+fn a_scalar_from_function_column_takes_the_calls_collation() {
+    // addRangeTableEntryForFunction (PG 18): a scalar result's column (one
+    // OUT parameter included) has exprCollation(funcexpr), the collation
+    // the call derives from its arguments — none when they conflict.
+    let setup = r#"CREATE TABLE c1 (b text COLLATE "C");
+                   CREATE TABLE c2 (b text COLLATE "POSIX");"#;
+    let stmt =
+        "CREATE TABLE t AS SELECT a FROM c1, c2, unnest(ARRAY[c1.b || c2.b]) a WITH NO DATA;";
+    let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+    assert!(
+        err.to_string()
+            .starts_with(r#"no collation was derived for column "a" with collatable type text"#),
+        "{stmt}\n  got: {err}"
+    );
+    let db = build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "CREATE TABLE f1 AS SELECT a FROM c1, unnest(ARRAY[c1.b]) a WITH NO DATA;
+             CREATE TABLE f2 AS SELECT a FROM c1, upper(c1.b) a WITH NO DATA;
+             CREATE TABLE f4 AS SELECT a FROM c1, unnest(ARRAY[c1.b], ARRAY[1]) a(a, n)
+                                WITH NO DATA;
+             CREATE TABLE f5 AS SELECT a FROM c1, regexp_split_to_table(c1.b, ',') a
+                                WITH NO DATA;
+             CREATE TABLE f6 AS SELECT a FROM c1, ROWS FROM (upper(c1.b), lower('x')) a(a, z)
+                                WITH NO DATA;
+             CREATE TABLE f7 AS SELECT a FROM c1, unnest(ARRAY[c1.b]) WITH ORDINALITY a(a, o)
+                                WITH NO DATA;
+             CREATE TABLE f8 AS SELECT lower('x') AS a FROM c1 WITH NO DATA;",
+        ),
+    ]);
+    let collated = basic_with_collation("pg_catalog", "text", "C");
+    for table in ["f1", "f2", "f4", "f5", "f6", "f7"] {
+        let info = db.analyze(&format!("SELECT a FROM {table}")).unwrap();
+        assert_cols(&info, vec![cn("a", collated.clone())]);
+    }
+    let info = db.analyze("SELECT a FROM f8").unwrap();
+    assert_cols(&info, vec![cn("a", text())]);
+}
+
+#[test]
 fn collatable_index_and_partition_expressions_need_a_collation() {
     // ComputeIndexAttrs / ComputePartitionAttrs (PG 18): a collatable key
     // expression without a collation can't be indexed unless the key's

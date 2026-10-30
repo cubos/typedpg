@@ -2122,6 +2122,13 @@ fn function_rte_columns(
         .map(|nullable| !nullable);
     let out_columns_nullable =
         srf_out_columns_nullable(&resolved).filter(|n| n.len() == resolved.out_args.len());
+    // A scalar result's column takes the call's collation, which derives
+    // from its arguments' (addRangeTableEntryForFunction: TYPEFUNC_SCALAR
+    // is exprCollation(funcexpr)) — none included.
+    let scalar_collation = || {
+        expr::derive_collation(&arg_exprs, resolved.return_type_oid, snapshot)
+            .map(|d| (d.collation, d.missing.is_some()))
+    };
 
     if !resolved.out_args.is_empty() {
         if has_coldeflist {
@@ -2130,8 +2137,10 @@ fn function_rte_columns(
         // A single OUT parameter makes the function scalar
         // (TYPEFUNC_SCALAR): a whole-row reference is its value, not a
         // record of it.
+        let mut out_collation = (None, false);
         if resolved.out_args.len() == 1 {
             *whole_row = crate::scope::WholeRow::Scalar;
+            out_collation = scalar_collation()?;
         }
         return Ok(resolved
             .out_args
@@ -2145,8 +2154,8 @@ fn function_rte_columns(
                     None => single_out_not_null.unwrap_or(f.not_null),
                 },
                 typmod: None,
-                collation: None,
-                no_collation: false,
+                collation: out_collation.0,
+                no_collation: out_collation.1,
                 table_alias: alias.to_owned(),
                 record_fields: None,
                 elem_nullable: None,
@@ -2202,14 +2211,15 @@ fn function_rte_columns(
     // with several functions each column keeps its function's name.
     let col_name = if nfuncs == 1 { alias } else { name };
     *whole_row = crate::scope::WholeRow::Scalar;
+    let (collation, no_collation) = scalar_collation()?;
     Ok(vec![ScopeColumn {
         name: col_name.to_owned(),
         type_oid: resolved.return_type_oid,
         base_not_null: not_null,
         table_alias: alias.to_owned(),
         typmod: None,
-        collation: None,
-        no_collation: false,
+        collation,
+        no_collation,
         record_fields: None,
         elem_nullable: None,
         // `generate_series` of finite bounds and step (see

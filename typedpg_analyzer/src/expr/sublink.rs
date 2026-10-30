@@ -56,7 +56,7 @@ pub(crate) fn infer_sublink(
                 // NULL, not an array with other elements).
                 return Ok(
                     ExprType::scalar_with_typmod(first.type_oid, nullable, first.typmod)
-                        .with_collation(first.leaf_collation())
+                        .with_collation(first.sublink_collation())
                         .with_elem_nullable(first.elem_nullable),
                 );
             }
@@ -249,7 +249,7 @@ pub(crate) fn infer_sublink(
                 // ARRAY sublink is its subquery column's) and, implicitly,
                 // its collation.
                 typmod = first.typmod;
-                collation = first.leaf_collation();
+                collation = first.sublink_collation();
                 let elem = first.type_oid;
                 let elem_array = snapshot.array_type_of(elem);
                 // The elements are the column's values (or, for an array

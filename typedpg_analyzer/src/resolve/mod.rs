@@ -1642,13 +1642,17 @@ pub(crate) struct RawColumn {
 }
 
 impl RawColumn {
-    /// The collation state of a leaf reading this column (a Var of the
-    /// subquery, a scalar sublink): its collation implicitly, or none.
-    pub(crate) fn leaf_collation(&self) -> crate::expr::DerivedCollation {
+    /// The collation state of an EXPR or ARRAY sublink whose subquery's
+    /// column this is: assign_collations_walker (T_Query) takes the
+    /// column's collation at strength IMPLICIT, even when it is
+    /// `InvalidOid` ([`crate::expr::NoCollation::Implicit`]).
+    pub(crate) fn sublink_collation(&self) -> crate::expr::DerivedCollation {
         crate::expr::DerivedCollation {
             collation: self.collation,
             explicit: false,
-            missing: self.no_collation.map(|_| crate::expr::NoCollation::Unset),
+            missing: self
+                .no_collation
+                .map(|_| crate::expr::NoCollation::Implicit),
         }
     }
 }

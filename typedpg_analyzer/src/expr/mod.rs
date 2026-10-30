@@ -590,10 +590,22 @@ pub(crate) enum NoCollation {
     /// It is the weakest state: any implicit collation beside it wins, and
     /// a node over it with a collatable result takes its type's default.
     Unset,
+    /// Strength IMPLICIT, collation `InvalidOid`: a sublink whose column has
+    /// none (the subquery's column counts as an implicit collation, see
+    /// [`crate::resolve::RawColumn::sublink_collation`]), and every node over it that
+    /// inherits it. Unlike [`NoCollation::Unset`] it is not the weakest
+    /// state: like a non-default implicit collation, it beats the default
+    /// one, bubbles up through a collatable node (`upper(...)`, `||`, a
+    /// cast) and conflicts with any other non-default implicit collation.
+    Implicit,
     /// Strength CONFLICT: two different non-default implicit collations
-    /// met. It beats implicit collations and bubbles up through every node
-    /// with a collatable result, until an explicit one settles it.
-    Conflict(crate::oid::PgCollationOid, crate::oid::PgCollationOid),
+    /// met (`None` for an [`NoCollation::Implicit`] one, `InvalidOid`). It
+    /// beats implicit collations and bubbles up through every node with a
+    /// collatable result, until an explicit one settles it.
+    Conflict(
+        Option<crate::oid::PgCollationOid>,
+        Option<crate::oid::PgCollationOid>,
+    ),
 }
 
 /// The collation state [`derive_collation`] assigns a node: its collation
@@ -626,13 +638,28 @@ pub(crate) fn derive_collation<'a>(
     result_type: PgTypeOid,
     snapshot: &PgCatalog,
 ) -> Result<DerivedCollation, AnalyzeError> {
+    type Collation = Option<crate::oid::PgCollationOid>;
     let mut explicit: Option<crate::oid::PgCollationOid> = None;
-    let mut implicit: Option<crate::oid::PgCollationOid> = None;
-    let mut conflict: Option<(crate::oid::PgCollationOid, crate::oid::PgCollationOid)> = None;
+    // The non-default implicit collation seen, `Some(None)` for
+    // `InvalidOid` (an implicit one without a collation).
+    let mut implicit: Option<Collation> = None;
+    let mut conflict: Option<(Collation, Collation)> = None;
     for t in inputs {
-        if let Some(NoCollation::Conflict(a, b)) = t.no_collation {
-            conflict.get_or_insert((a, b));
-            continue;
+        match t.no_collation {
+            Some(NoCollation::Conflict(a, b)) => {
+                conflict.get_or_insert((a, b));
+                continue;
+            }
+            Some(NoCollation::Implicit) => {
+                if conflict.is_none() {
+                    match implicit {
+                        Some(Some(i)) => conflict = Some((Some(i), None)),
+                        _ => implicit = Some(None),
+                    }
+                }
+                continue;
+            }
+            Some(NoCollation::Unset) | None => {}
         }
         let Some(c) = t.collation else {
             continue;
@@ -656,8 +683,8 @@ pub(crate) fn derive_collation<'a>(
             }
         } else if c != DEFAULT_COLLATION && conflict.is_none() {
             match implicit {
-                Some(i) if i != c => conflict = Some((i, c)),
-                _ => implicit = Some(c),
+                Some(i) if i != Some(c) => conflict = Some((i, Some(c))),
+                _ => implicit = Some(Some(c)),
             }
         }
     }
@@ -679,9 +706,11 @@ pub(crate) fn derive_collation<'a>(
             missing: Some(NoCollation::Conflict(a, b)),
         },
         (None, None) => DerivedCollation {
-            collation: implicit,
+            collation: implicit.flatten(),
             explicit: false,
-            missing: None,
+            missing: implicit
+                .is_some_and(|i| i.is_none())
+                .then_some(NoCollation::Implicit),
         },
     })
 }

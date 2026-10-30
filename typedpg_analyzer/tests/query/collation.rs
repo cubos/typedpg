@@ -597,6 +597,56 @@ fn a_column_without_a_collation_is_a_var_of_strength_none() {
     );
 }
 
+/// A sublink whose column has no collation is an implicit `InvalidOid`
+/// (assign_collations_walker, T_Query): it conflicts with another
+/// non-default implicit collation, which a set operation other than UNION
+/// ALL reports naming it `(null)` (get_collation_name's NULL).
+#[test]
+fn a_sublink_without_a_collation_conflicts_as_null() {
+    let db = collation_db();
+    let sub = "(SELECT x.b FROM (SELECT sc AS b FROM tc UNION ALL SELECT sp FROM tc) x LIMIT 1)";
+    for (sql, msg) in [
+        (
+            format!("SELECT {sub} UNION SELECT sc FROM tc"),
+            r#"collation mismatch between implicit collations "(null)" and "C""#,
+        ),
+        (
+            format!("SELECT sc FROM tc UNION SELECT {sub}"),
+            r#"collation mismatch between implicit collations "C" and "(null)""#,
+        ),
+        (
+            format!("SELECT upper({sub}) INTERSECT SELECT sp FROM tc"),
+            r#"collation mismatch between implicit collations "(null)" and "POSIX""#,
+        ),
+    ] {
+        assert_err_prefix!(db.analyze(&sql), AnalyzeError::CollationMismatch(_), msg);
+    }
+    // Beside the default collation it stays: PREPARE accepts these, the
+    // comparison fails only as it runs.
+    for sql in [
+        format!("SELECT {sub} UNION SELECT 'q'"),
+        format!("SELECT {sub} UNION ALL SELECT sc FROM tc"),
+        format!("SELECT {sub} || s AS a FROM tc"),
+    ] {
+        db.analyze(&sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    // An explicit collation beside it wins; a sublink over a collated
+    // column carries that collation.
+    let s = db
+        .analyze(&format!(
+            "SELECT {sub} || ('q' COLLATE \"POSIX\") AS a, \
+             (SELECT sc FROM tc LIMIT 1) || 'q' AS b"
+        ))
+        .unwrap();
+    assert_cols(
+        &s,
+        vec![
+            cn("a", basic_with_collation("pg_catalog", "text", "POSIX")),
+            cn("b", basic_with_collation("pg_catalog", "text", "C")),
+        ],
+    );
+}
+
 /// transformValuesClause: select_common_collation over each column's
 /// cells — two different explicit collations are 42P21.
 #[test]

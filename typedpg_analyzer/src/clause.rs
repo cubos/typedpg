@@ -466,10 +466,17 @@ impl CollationState {
         match missing {
             None => Self::of_value(snapshot, t, collation, explicit),
             Some(crate::expr::NoCollation::Unset) => Self::NONE,
+            // An implicit `InvalidOid`: a collation of its own, as far as
+            // merge_collation_state goes.
+            Some(crate::expr::NoCollation::Implicit) => CollationState {
+                strength: Strength::Implicit,
+                collation: None,
+                other: None,
+            },
             Some(crate::expr::NoCollation::Conflict(a, b)) => CollationState {
                 strength: Strength::Conflict,
-                collation: Some(a),
-                other: Some(b),
+                collation: a,
+                other: b,
             },
         }
     }
@@ -499,10 +506,19 @@ impl CollationState {
         if self.strength != Strength::Conflict {
             return Ok(());
         }
+        // get_collation_name(InvalidOid) is NULL, which PG's `%s` prints
+        // as `(null)`.
         let name = |c: Option<crate::oid::PgCollationOid>| {
-            c.and_then(|c| snapshot.pg_collation.get(&c))
-                .map(|c| c.collname.clone())
-                .unwrap_or_default()
+            c.map_or_else(
+                || "(null)".to_string(),
+                |c| {
+                    snapshot
+                        .pg_collation
+                        .get(&c)
+                        .map(|c| c.collname.clone())
+                        .unwrap_or_default()
+                },
+            )
         };
         Err(crate::pgmsg::collation_mismatch_implicit(
             &name(self.collation),
