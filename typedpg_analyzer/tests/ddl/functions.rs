@@ -542,6 +542,156 @@ fn valid_sql_function_bodies_are_accepted() {
 }
 
 #[test]
+fn a_routines_own_settings_apply_to_its_validation() {
+    // ProcedureCreate: with check_function_bodies on, the validator runs
+    // under the routine's SET clauses — its own check_function_bodies and
+    // search_path included; with it off, they aren't applied and nothing is
+    // checked. An inline body is parsed before, under the session's
+    // settings; only its result check follows the routine's. The analyzer
+    // ignored the routine's settings.
+    const SCHEMA: &str = "CREATE SCHEMA s; CREATE TABLE s.t (a int);";
+    build(&[
+        ("0001.sql", SCHEMA),
+        (
+            "0002.sql",
+            "CREATE FUNCTION a1() RETURNS int LANGUAGE sql AS 'SELECT a FROM nonexist'
+                 SET check_function_bodies = off;
+             CREATE FUNCTION a2() RETURNS int LANGUAGE sql AS 'SELECT a FROM nonexist'
+                 SET check_function_bodies TO 'of';
+             CREATE FUNCTION a3() RETURNS int LANGUAGE sql AS 'SELECT a FROM nonexist'
+                 SET check_function_bodies = 0;
+             CREATE FUNCTION a4() RETURNS int LANGUAGE sql AS 'SELECT a FROM nonexist'
+                 SET check_function_bodies = fals;
+             -- The last item for a setting wins.
+             CREATE FUNCTION a5() RETURNS int LANGUAGE sql AS 'SELECT a FROM nonexist'
+                 SET check_function_bodies = on SET check_function_bodies = off;
+             CREATE FUNCTION a6() RETURNS int LANGUAGE sql AS 'SELECT ''x''::text'
+                 SET check_function_bodies = off;
+             CREATE PROCEDURE a7() LANGUAGE sql AS 'SELECT a FROM nonexist'
+                 SET check_function_bodies = off;
+             CREATE FUNCTION a8() RETURNS int LANGUAGE plpgsql
+                 SET check_function_bodies = off AS $$ BEGIN RETURN 1 END $$;
+             -- An inline body is parsed anyway, but its result not checked.
+             CREATE FUNCTION a9() RETURNS int LANGUAGE sql
+                 SET check_function_bodies = off BEGIN ATOMIC SELECT 'x'::text; END;
+             -- The routine's search_path.
+             CREATE FUNCTION b1() RETURNS int LANGUAGE sql AS 'SELECT a FROM t'
+                 SET search_path = s;
+             CREATE FUNCTION b2() RETURNS int LANGUAGE sql AS 'SELECT a FROM t'
+                 SET search_path = public, s;
+             CREATE FUNCTION b3() RETURNS int LANGUAGE plpgsql SET search_path = s
+                 AS $$ DECLARE x t.a%TYPE; BEGIN RETURN x; END $$;
+             SET search_path = s;
+             CREATE FUNCTION public.b4() RETURNS int LANGUAGE sql AS 'SELECT a FROM t'
+                 SET search_path FROM CURRENT;
+             RESET search_path;
+             -- Session off: the routine's settings aren't applied.
+             SET check_function_bodies = off;
+             CREATE FUNCTION c1() RETURNS int LANGUAGE sql AS 'SELECT a FROM nonexist'
+                 SET check_function_bodies = on;
+             CREATE FUNCTION c2() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT 'x'::text; END;
+             RESET check_function_bodies;
+             -- set_config sets it as SET does.
+             SELECT set_config('check_function_bodies', 'off', false);
+             CREATE FUNCTION d1() RETURNS int LANGUAGE sql AS 'SELECT a FROM nonexist';
+             RESET check_function_bodies;
+             BEGIN;
+             SET LOCAL check_function_bodies = off;
+             CREATE FUNCTION d2() RETURNS int LANGUAGE sql AS 'SELECT a FROM nonexist';
+             COMMIT;",
+        ),
+    ]);
+    for (sql, msg) in [
+        (
+            "CREATE FUNCTION e() RETURNS int LANGUAGE sql AS 'SELECT a FROM t';",
+            "relation \"t\" does not exist",
+        ),
+        // Parsed under the session's search_path.
+        (
+            "CREATE FUNCTION e() RETURNS int LANGUAGE sql SET search_path = s
+                 BEGIN ATOMIC SELECT a FROM t; END;",
+            "relation \"t\" does not exist",
+        ),
+        (
+            "CREATE FUNCTION e() RETURNS int LANGUAGE sql SET check_function_bodies = off
+                 BEGIN ATOMIC SELECT a FROM nonexist; END;",
+            "relation \"nonexist\" does not exist",
+        ),
+        (
+            "CREATE FUNCTION e() RETURNS int LANGUAGE plpgsql
+                 AS $$ DECLARE x t.a%TYPE; BEGIN RETURN x; END $$;",
+            "relation \"t\" does not exist",
+        ),
+        // FROM CURRENT takes the session's value: on.
+        (
+            "CREATE FUNCTION e() RETURNS int LANGUAGE sql AS 'SELECT a FROM nonexist'
+                 SET check_function_bodies FROM CURRENT;",
+            "relation \"nonexist\" does not exist",
+        ),
+        (
+            "CREATE FUNCTION e() RETURNS int LANGUAGE sql AS 'SELECT a FROM nonexist'
+                 SET check_function_bodies = off SET check_function_bodies = on;",
+            "relation \"nonexist\" does not exist",
+        ),
+        // DEFAULT / RESET drop an earlier item.
+        (
+            "CREATE FUNCTION e() RETURNS int LANGUAGE sql AS 'SELECT a FROM nonexist'
+                 SET check_function_bodies = off SET check_function_bodies TO DEFAULT;",
+            "relation \"nonexist\" does not exist",
+        ),
+        (
+            "CREATE FUNCTION e() RETURNS int LANGUAGE sql AS 'SELECT a FROM t'
+                 SET search_path = s RESET search_path;",
+            "relation \"t\" does not exist",
+        ),
+        (
+            "CREATE FUNCTION e() RETURNS int LANGUAGE sql AS 'SELECT a FROM t'
+                 SET search_path = 'S';",
+            "relation \"t\" does not exist",
+        ),
+        // The routine's search_path lasts for its validation only.
+        (
+            "CREATE FUNCTION e1() RETURNS int LANGUAGE sql AS 'SELECT a FROM t'
+                 SET search_path = s;
+             CREATE FUNCTION e2() RETURNS int LANGUAGE sql AS 'SELECT a FROM t';",
+            "relation \"t\" does not exist",
+        ),
+        // SET LOCAL lapses at the end of the transaction.
+        (
+            "BEGIN;
+             SET LOCAL check_function_bodies = off;
+             COMMIT;
+             CREATE FUNCTION e() RETURNS int LANGUAGE sql AS 'SELECT a FROM nonexist';",
+            "relation \"nonexist\" does not exist",
+        ),
+        (
+            "BEGIN;
+             SELECT set_config('check_function_bodies', 'off', true);
+             COMMIT;
+             CREATE FUNCTION e() RETURNS int LANGUAGE sql AS 'SELECT a FROM nonexist';",
+            "relation \"nonexist\" does not exist",
+        ),
+        // A session SET replaces a pending SET LOCAL.
+        (
+            "BEGIN;
+             SET LOCAL check_function_bodies = off;
+             SET check_function_bodies = on;
+             CREATE FUNCTION e() RETURNS int LANGUAGE sql AS 'SELECT a FROM nonexist';
+             COMMIT;",
+            "relation \"nonexist\" does not exist",
+        ),
+        (
+            "CREATE FUNCTION e() RETURNS int LANGUAGE sql AS 'SELECT 1'
+                 SET check_function_bodies = maybe;",
+            "parameter \"check_function_bodies\" requires a Boolean value",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", SCHEMA), ("0002.sql", sql)]).expect_err(sql);
+        assert!(err.to_string().starts_with(msg), "{sql}\n  got: {err}");
+    }
+}
+
+#[test]
 fn sql_function_parameter_names_resolve_after_columns() {
     // PG's sql_fn_post_column_ref: a column wins over a same-named
     // parameter, `fname.param` names the parameter, and a body whose

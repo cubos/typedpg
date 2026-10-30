@@ -1588,6 +1588,14 @@ fn a_view_loop_fails_what_the_rewriter_expands() {
              INSERT INTO tu VALUES (1);
              CREATE RULE rn AS ON DELETE TO tu DO INSTEAD NOTHING;
              DELETE FROM tu;
+             -- The routine's own setting: its validator doesn't check.
+             CREATE FUNCTION fs() RETURNS SETOF int LANGUAGE sql AS 'SELECT a FROM v2'
+                 SET check_function_bodies = off;
+             CREATE FUNCTION ft() RETURNS SETOF int LANGUAGE sql AS 'SELECT a FROM v2'
+                 SET check_function_bodies TO off;
+             CREATE FUNCTION fu() RETURNS SETOF int LANGUAGE sql
+                 SET check_function_bodies = off
+                 BEGIN ATOMIC SELECT a FROM v2; END;
              SET check_function_bodies = off;
              CREATE FUNCTION fo() RETURNS SETOF int LANGUAGE sql AS 'SELECT a FROM v2';
              CREATE FUNCTION fa() RETURNS SETOF int LANGUAGE sql

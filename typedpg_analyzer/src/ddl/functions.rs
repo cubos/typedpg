@@ -648,8 +648,23 @@ pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Res
     if language == "internal" {
         fmgr_internal_validator(attrs.as_clause, &proc)?;
     }
-    let body_refs = super::function_body::validate_sql_function(interp, stmt, &proc)?;
-    super::function_body::validate_plpgsql_function(interp, stmt)?;
+    let settings = super::session::RoutineSettings::of(interp, &attrs.common.set_items);
+    // An inline body was parsed (interpret_AS_clause) before the routine's
+    // settings apply; only the validator runs under them.
+    let body_refs = if stmt.sql_body.is_some() {
+        super::function_body::validate_sql_function(interp, stmt, &proc, settings.check_bodies)?
+    } else {
+        settings.apply(interp, |interp| {
+            let refs = super::function_body::validate_sql_function(
+                interp,
+                stmt,
+                &proc,
+                settings.check_bodies,
+            )?;
+            super::function_body::validate_plpgsql_function(interp, stmt, settings.check_bodies)?;
+            Ok::<_, DdlError>(refs)
+        })?
+    };
     // What the inline body and the parameter defaults refer to.
     let addr = super::depend::ObjectAddress::proc(proc.oid);
     super::depend::record_references(interp, addr, &body_refs, DepType::Normal);

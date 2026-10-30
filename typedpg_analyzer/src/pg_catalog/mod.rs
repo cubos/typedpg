@@ -269,7 +269,7 @@ pub struct PgCatalog {
     /// takes the generated column along; ALTER COLUMN TYPE of it is refused.
     pub(crate) generated_refs: Shared<HashMap<(PgClassOid, i16), Vec<i16>>>,
     /// The `check_function_bodies` GUC (pg_dump output turns it off).
-    pub(crate) check_function_bodies: bool,
+    pub(crate) check_function_bodies: crate::ddl::session::BoolGuc,
     /// The single expression of each inlinable `LANGUAGE sql` function
     /// (`SELECT expr` / `RETURN expr`, as `inline_function` requires),
     /// which PG substitutes for the call before checking an index or
@@ -693,7 +693,7 @@ impl PgCatalog {
             attr_default_types: Shared::default(),
             attr_default_exprs: HashMap::new(),
             generated_refs: Shared::default(),
-            check_function_bodies: true,
+            check_function_bodies: crate::ddl::session::BoolGuc::new(true),
             inline_sql_bodies: Shared::default(),
             procs_with_config: Shared::default(),
             inline_body_trust: Shared::default(),

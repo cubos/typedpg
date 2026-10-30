@@ -1,4 +1,5 @@
-//! Session state set by migrations: the `search_path` GUC, and the
+//! Session state set by migrations: the `search_path` and
+//! `check_function_bodies` GUCs, and the
 //! session's user identity (`SET ROLE`, `SET SESSION AUTHORIZATION`), which
 //! `$user` in the search path names.
 //!
@@ -21,6 +22,7 @@ use typedpg_pg_query::protobuf::{
 };
 
 use super::DdlError;
+use super::reloptions::parse_bool;
 use crate::pg_catalog::PgCatalog;
 
 /// PG 18's predefined roles (`pg_authid` rows every cluster has). Any other
@@ -155,6 +157,107 @@ impl SearchPathGuc {
     }
 }
 
+/// A boolean setting with its session value and a pending `SET LOCAL` one.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BoolGuc {
+    /// The value its boot / RESET leaves.
+    default: bool,
+    session: bool,
+    local: Option<bool>,
+}
+
+impl BoolGuc {
+    pub(crate) const fn new(default: bool) -> Self {
+        Self {
+            default,
+            session: default,
+            local: None,
+        }
+    }
+
+    /// The value in effect.
+    pub(crate) fn get(&self) -> bool {
+        self.local.unwrap_or(self.session)
+    }
+
+    /// `SET [LOCAL]` (`value`), or `SET ... TO DEFAULT` / `RESET` (`None`).
+    fn set(&mut self, value: Option<bool>, is_local: bool) {
+        let value = value.unwrap_or(self.default);
+        if is_local {
+            self.local = Some(value);
+        } else {
+            // A session-level SET replaces a pending SET LOCAL value too.
+            self.local = None;
+            self.session = value;
+        }
+    }
+}
+
+/// The settings a routine's `SET` clauses give it (`proconfig`), as the
+/// validator runs under them.
+pub(crate) struct RoutineSettings {
+    /// Whether the validator checks the body.
+    pub(crate) check_bodies: bool,
+    /// `search_path`'s value for the validation, when the routine sets one.
+    search_path: Option<Vec<String>>,
+}
+
+impl RoutineSettings {
+    /// ProcedureCreate: with `check_function_bodies` on, the validator runs
+    /// under the routine's `proconfig` (its own `SET check_function_bodies
+    /// = off` included); with it off, `proconfig` isn't applied and nothing
+    /// is checked. Each item replaces an earlier one for the same setting,
+    /// and `SET name TO DEFAULT` removes it (`update_proconfig_value`).
+    pub(crate) fn of(interp: &PgCatalog, set_items: &[&node::Node]) -> Self {
+        let session = interp.check_function_bodies.get();
+        let mut check_bodies = None;
+        let mut search_path = None;
+        for item in set_items {
+            let node::Node::VariableSetStmt(set) = item else {
+                continue;
+            };
+            let kind = VariableSetKind::try_from(set.kind).unwrap_or(VariableSetKind::Undefined);
+            if set.name.eq_ignore_ascii_case("check_function_bodies") {
+                check_bodies = match kind {
+                    // FROM CURRENT: the session's value, which is on here.
+                    VariableSetKind::VarSetCurrent => Some(session),
+                    VariableSetKind::VarSetValue => match set.args.as_slice() {
+                        [arg] => const_arg_string(arg).and_then(|v| parse_bool(&v)),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+            } else if set.name.eq_ignore_ascii_case("search_path") {
+                search_path = match kind {
+                    VariableSetKind::VarSetCurrent => {
+                        Some(interp.search_path_guc.effective().to_vec())
+                    }
+                    VariableSetKind::VarSetValue => search_path_args(set),
+                    _ => None,
+                };
+            }
+        }
+        Self {
+            check_bodies: session && check_bodies.unwrap_or(true),
+            search_path: search_path.filter(|_| session),
+        }
+    }
+
+    /// Run `f` with the routine's `search_path` in effect, as the validator
+    /// of a body given as a string runs (an inline body was parsed before,
+    /// under the session's path).
+    pub(crate) fn apply<R>(&self, interp: &mut PgCatalog, f: impl FnOnce(&PgCatalog) -> R) -> R {
+        let Some(path) = &self.search_path else {
+            return f(interp);
+        };
+        let saved = interp.search_path_guc.clone();
+        interp.set_search_path(Some(path.clone()), true);
+        let result = f(interp);
+        interp.restore_search_path(saved);
+        result
+    }
+}
+
 impl PgCatalog {
     /// Re-derive [`PgCatalog::search_path`] from the textual setting: every
     /// entry naming an existing schema, in order, without duplicates.
@@ -208,6 +311,7 @@ impl PgCatalog {
 
     /// End of the current transaction: `SET LOCAL` values lapse.
     pub(crate) fn end_transaction_scope(&mut self) {
+        self.check_function_bodies.local = None;
         let local_identity = self.session_identity.local.take().is_some();
         if self.search_path_guc.local.take().is_some() || local_identity {
             self.refresh_search_path();
@@ -312,7 +416,7 @@ pub(crate) fn variable_set(interp: &mut PgCatalog, stmt: &VariableSetStmt) -> Re
     // RESET ALL leaves the identity alone (GUC_NO_RESET_ALL).
     if kind == VariableSetKind::VarResetAll {
         interp.set_search_path(None, false);
-        interp.check_function_bodies = true;
+        interp.check_function_bodies = BoolGuc::new(true);
         return Ok(());
     }
     // The parameter must exist and be settable, and a new value valid.
@@ -330,20 +434,19 @@ pub(crate) fn variable_set(interp: &mut PgCatalog, stmt: &VariableSetStmt) -> Re
         super::guc::check_value(interp, &setting, &value)?;
     }
     if stmt.name.eq_ignore_ascii_case("check_function_bodies") {
-        interp.check_function_bodies = match kind {
-            VariableSetKind::VarSetValue => stmt.args.first().is_none_or(|arg| {
-                !matches!(arg.node.as_ref(), Some(node::Node::AConst(c)) if match c.val.as_ref() {
-                    Some(a_const::Val::Sval(s)) => matches!(
-                        s.sval.to_ascii_lowercase().as_str(),
-                        "off" | "false" | "no" | "0" | "f" | "n"
-                    ),
-                    Some(a_const::Val::Ival(i)) => i.ival == 0,
-                    Some(a_const::Val::Boolval(b)) => !b.boolval,
-                    _ => false,
-                })
-            }),
-            _ => true,
-        };
+        match kind {
+            VariableSetKind::VarSetValue => {
+                if let [arg] = stmt.args.as_slice()
+                    && let Some(value) = const_arg_string(arg).and_then(|v| parse_bool(&v))
+                {
+                    interp.check_function_bodies.set(Some(value), stmt.is_local);
+                }
+            }
+            VariableSetKind::VarSetDefault | VariableSetKind::VarReset => {
+                interp.check_function_bodies.set(None, stmt.is_local);
+            }
+            _ => {}
+        }
         return Ok(());
     }
     if !stmt.name.eq_ignore_ascii_case("search_path") {
@@ -467,8 +570,13 @@ pub(crate) fn select_side_effects(
         {
             super::guc::check_value(interp, &known, &value)?;
         }
-        if let Some((value, is_local)) = constant_search_path_set_config(fc) {
+        if let Some((value, is_local)) = constant_named_set_config(fc, "search_path") {
             interp.set_search_path(Some(split_identifier_string(&value)), is_local);
+        }
+        if let Some((value, is_local)) = constant_named_set_config(fc, "check_function_bodies")
+            && let Some(value) = parse_bool(&value)
+        {
+            interp.check_function_bodies.set(Some(value), is_local);
         }
     }
     Ok(())
@@ -553,7 +661,9 @@ fn constant_identity_set_config(fc: &FuncCall) -> Option<(String, String, bool)>
     Some((setting.sval, value.sval, is_local))
 }
 
-fn constant_search_path_set_config(fc: &FuncCall) -> Option<(String, bool)> {
+/// `set_config('<setting>', '<value>', <is_local>)` with constant
+/// arguments.
+fn constant_named_set_config(fc: &FuncCall, setting_name: &str) -> Option<(String, bool)> {
     let name: Vec<&str> = fc
         .funcname
         .iter()
@@ -575,7 +685,7 @@ fn constant_search_path_set_config(fc: &FuncCall) -> Option<(String, bool)> {
     let Some(a_const::Val::Sval(setting)) = as_const(setting) else {
         return None;
     };
-    if !setting.sval.eq_ignore_ascii_case("search_path") {
+    if !setting.sval.eq_ignore_ascii_case(setting_name) {
         return None;
     }
     let Some(a_const::Val::Sval(value)) = as_const(value) else {
