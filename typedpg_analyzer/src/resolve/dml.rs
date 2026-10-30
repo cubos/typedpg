@@ -40,7 +40,13 @@ pub(crate) fn analyze_insert_with_outer_ctes(
     if let Some(select_node) = &ins.select_stmt
         && let Some(node::Node::SelectStmt(val_sel)) = select_node.node.as_ref()
     {
-        if !val_sel.values_lists.is_empty() {
+        // transformInsertStmt's isGeneralSelect: a VALUES carrying ORDER
+        // BY, LIMIT / OFFSET, a locking clause or its own WITH is analyzed
+        // as a standalone SELECT whose output columns are then assigned —
+        // its column types resolved across the rows (an untyped literal,
+        // NULL or `$N` alone becomes text), DEFAULT not allowed. Only a
+        // plain VALUES list is the INSERT's own rows.
+        if !val_sel.values_lists.is_empty() && !is_general_select(val_sel) {
             let expanded = expand_values_rows(val_sel, snapshot, params, &cte_scopes)?;
             let val_sel: &protobuf::SelectStmt = &expanded;
             written = analyze_insert_values(ins, val_sel, &tgt, snapshot, params, &cte_scopes)?;
@@ -592,6 +598,16 @@ fn insert_arity(tgt: &InsertTarget) -> usize {
     } else {
         tgt.col_names.len()
     }
+}
+
+/// transformInsertStmt's `isGeneralSelect`, for a VALUES source: a VALUES
+/// list with a sort, limit, locking or WITH clause is a full SELECT.
+fn is_general_select(sel: &protobuf::SelectStmt) -> bool {
+    !sel.sort_clause.is_empty()
+        || sel.limit_offset.is_some()
+        || sel.limit_count.is_some()
+        || !sel.locking_clause.is_empty()
+        || sel.with_clause.is_some()
 }
 
 /// PG's transformInsertRow arity rule: more values than target columns is
@@ -1209,10 +1225,26 @@ fn analyze_insert_select(
         }
     }
 
-    for (i, target) in direct_targets.iter().enumerate() {
-        if let Some(node::Node::ResTarget(rt)) = target.node.as_ref()
-            && let Some(val) = &rt.val
-            && let Some(node::Node::ParamRef(p)) = val.node.as_ref()
+    // The expressions each output column takes its value from: the select
+    // list's entries, or — a VALUES source with ORDER BY / LIMIT & co. —
+    // every row's value at that position.
+    let mut outputs: Vec<(usize, &protobuf::Node)> = direct_targets
+        .iter()
+        .enumerate()
+        .filter_map(|(i, t)| match t.node.as_ref() {
+            Some(node::Node::ResTarget(rt)) => Some((i, rt.val.as_deref()?)),
+            _ => None,
+        })
+        .collect();
+    if val_sel.op == SetOperation::SetopNone as i32 {
+        for row in &val_sel.values_lists {
+            if let Some(node::Node::List(list)) = row.node.as_ref() {
+                outputs.extend(list.items.iter().enumerate());
+            }
+        }
+    }
+    for (i, val) in outputs {
+        if let Some(node::Node::ParamRef(p)) = val.node.as_ref()
             && let Some(tc) = target_col_at(tgt, i)
             && let Some(Some(target_oid)) = target_types.get(i)
         {

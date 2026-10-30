@@ -183,6 +183,76 @@ fn a_values_list_sorted_by_a_set_returning_call_the_planner_drops_runs() {
     }
 }
 
+// ── A VALUES list sorted by an aggregate or window call ─────────────────────
+
+#[test]
+fn a_values_list_sorted_by_an_aggregate_or_window_call_fails_every_execution() {
+    // Parse analysis takes the call as a resjunk sort key, but a VALUES plan
+    // has no Agg / WindowAgg node: initializing it raises XX000.
+    let db = setup();
+    for (sql, msg) in [
+        (
+            "VALUES (1) ORDER BY sum(1)",
+            "Aggref found in non-Agg plan node",
+        ),
+        (
+            "VALUES (1) ORDER BY sum(column1)",
+            "Aggref found in non-Agg plan node",
+        ),
+        (
+            "VALUES (1) ORDER BY count(*) FILTER (WHERE false)",
+            "Aggref found in non-Agg plan node",
+        ),
+        (
+            "SELECT (VALUES (1) ORDER BY sum(1)) AS a FROM p WHERE false",
+            "Aggref found in non-Agg plan node",
+        ),
+        (
+            "(VALUES (1) ORDER BY sum(1)) UNION ALL SELECT 2",
+            "Aggref found in non-Agg plan node",
+        ),
+        (
+            "EXPLAIN VALUES (1) ORDER BY sum(1)",
+            "Aggref found in non-Agg plan node",
+        ),
+        (
+            "INSERT INTO c (id, pid) VALUES (1, 1) ORDER BY sum(1)",
+            "Aggref found in non-Agg plan node",
+        ),
+        (
+            "VALUES (1) ORDER BY rank() OVER ()",
+            "WindowFunc found in non-WindowAgg plan node",
+        ),
+        (
+            "INSERT INTO c (id, pid) VALUES (1, 1) ORDER BY count(*) OVER ()",
+            "WindowFunc found in non-WindowAgg plan node",
+        ),
+    ] {
+        let err = db.analyze(sql).unwrap_err();
+        assert!(
+            matches!(err, AnalyzeError::PgInternalError(_)),
+            "{sql}: {err:?}"
+        );
+        assert!(err.to_string().starts_with(msg), "{sql}: {err}");
+    }
+}
+
+#[test]
+fn a_values_list_sorted_by_an_aggregate_elsewhere_runs() {
+    let db = setup();
+    for sql in [
+        // An outer column makes it the outer query's aggregate.
+        "SELECT (VALUES (1) ORDER BY sum(p.id)) AS a FROM p",
+        // The sub-select's own aggregate.
+        "VALUES (1) ORDER BY (SELECT sum(1))",
+        // Dropped by the planner before anything initializes it.
+        "SELECT 1 AS a WHERE false AND EXISTS (VALUES (1) ORDER BY sum(1))",
+        "SELECT 1 AS a FROM (VALUES (1) ORDER BY sum(1)) s WHERE false",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
+
 // ── A foreign key's own equality ─────────────────────────────────────────────
 
 #[test]

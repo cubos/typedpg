@@ -2367,3 +2367,134 @@ fn insert_without_column_list_may_supply_fewer_values() {
         assert!(err.to_string().starts_with(msg), "{sql}: {err}");
     }
 }
+
+// ── INSERT … VALUES with ORDER BY / LIMIT / locking / WITH ──────────────────
+
+/// transformInsertStmt's `isGeneralSelect`: a VALUES source carrying ORDER
+/// BY, LIMIT / OFFSET, a locking clause or its own WITH is analyzed as a
+/// standalone SELECT, its output columns then assigned to the targets.
+fn general_values_db() -> PgCatalog {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE gv (x int, y text); CREATE TABLE gvn (x int NOT NULL);")
+        .unwrap();
+    db
+}
+
+#[test]
+fn insert_values_with_select_clauses_reports_the_select_errors() {
+    let db = general_values_db();
+    for (sql, msg) in [
+        (
+            "INSERT INTO gv (x) VALUES (1) ORDER BY nonexistent",
+            "column \"nonexistent\" does not exist",
+        ),
+        (
+            "INSERT INTO gv (x) VALUES (1) ORDER BY column1 LIMIT 'x'",
+            "invalid input syntax for type bigint: \"x\"",
+        ),
+        (
+            "INSERT INTO gv (x) VALUES (1) LIMIT sum(1)",
+            "aggregate functions are not allowed in LIMIT",
+        ),
+        (
+            "INSERT INTO gv (x) VALUES (1) ORDER BY 2",
+            "ORDER BY position 2 is not in select list",
+        ),
+        // The target's columns are not in the VALUES' scope.
+        (
+            "INSERT INTO gv (x) VALUES (1) LIMIT x",
+            "column \"x\" does not exist",
+        ),
+        (
+            "INSERT INTO gv (x) VALUES (DEFAULT) LIMIT 1",
+            "DEFAULT is not allowed in this context",
+        ),
+        (
+            "INSERT INTO gv (x) VALUES (generate_series(1, 2)) LIMIT 5",
+            "set-returning functions are not allowed in VALUES",
+        ),
+        (
+            "INSERT INTO gv (x) VALUES (1) FOR UPDATE",
+            "FOR UPDATE cannot be applied to VALUES",
+        ),
+        (
+            "INSERT INTO gv (x) VALUES (1, 2) LIMIT 1",
+            "INSERT has more expressions than target columns",
+        ),
+        (
+            "INSERT INTO gv (x, y) VALUES (1) LIMIT 1",
+            "INSERT has more target columns than expressions",
+        ),
+        (
+            "INSERT INTO gv VALUES (1), (2, 'b') LIMIT 1",
+            "VALUES lists must all be the same length",
+        ),
+        // The VALUES' columns are resolved on their own: an untyped literal,
+        // NULL or parameter alone in its column is text.
+        (
+            "INSERT INTO gv (x) VALUES ('1') ORDER BY 1",
+            "column \"x\" is of type integer but expression is of type text",
+        ),
+        (
+            "INSERT INTO gvn VALUES (NULL) LIMIT 1",
+            "column \"x\" is of type integer but expression is of type text",
+        ),
+        (
+            "INSERT INTO gv (x) VALUES ($1) LIMIT 1",
+            "column \"x\" is of type integer but expression is of type text",
+        ),
+        (
+            "INSERT INTO gv (x) VALUES ('2020-01-01'::date) OFFSET 0",
+            "column \"x\" is of type integer but expression is of type date",
+        ),
+    ] {
+        let err = db.analyze(sql).expect_err(sql);
+        assert!(err.to_string().starts_with(msg), "{sql}: {err}");
+    }
+}
+
+#[test]
+fn insert_values_with_select_clauses_is_accepted_like_pg() {
+    let db = general_values_db();
+    for sql in [
+        "INSERT INTO gv (x) VALUES (1) OFFSET 0",
+        "INSERT INTO gv (x) VALUES (2), (1) ORDER BY column1 LIMIT 1",
+        "INSERT INTO gv (x) VALUES (1) ORDER BY column1 + 1",
+        "INSERT INTO gv (x) VALUES (1) LIMIT (SELECT max(x) FROM gv)",
+        "INSERT INTO gv (x) WITH c AS (SELECT 1 AS v) VALUES ((SELECT v FROM c))",
+        "INSERT INTO gv (x) VALUES (1.5::numeric) LIMIT 1",
+        "INSERT INTO gv (y) VALUES (1) LIMIT 1",
+        "INSERT INTO gv (x, y) VALUES (NULL::int, NULL) LIMIT 1",
+        // The common type of the rows is int: the NULL row may be cut by
+        // the LIMIT, and is no literal NULL assigned to the column.
+        "INSERT INTO gvn (x) VALUES (1), (NULL) LIMIT 1",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
+
+#[test]
+fn insert_values_with_select_clauses_types_params_like_pg() {
+    let db = general_values_db();
+    // A parameter alone in its column is text; next to an int it is int.
+    // Either may be NULL when its target column is nullable, as in a plain
+    // VALUES list.
+    let s = db
+        .analyze("INSERT INTO gv (y) VALUES ($1) LIMIT 1")
+        .unwrap();
+    assert_params(&s, vec![pn(text())]);
+    let s = db
+        .analyze("INSERT INTO gv (x) VALUES ($1), (2) LIMIT 1")
+        .unwrap();
+    assert_params(&s, vec![pn(int4())]);
+    let s = db
+        .analyze("INSERT INTO gvn (x) VALUES ($1), (2) LIMIT 1")
+        .unwrap();
+    assert_params(&s, vec![p(int4())]);
+    // LIMIT's own parameter is bigint.
+    let s = db
+        .analyze("INSERT INTO gv (x) VALUES (1) LIMIT $1 RETURNING x")
+        .unwrap();
+    assert_params(&s, vec![p(int8())]);
+    assert_cols(&s, vec![c("x", int4())]);
+}
