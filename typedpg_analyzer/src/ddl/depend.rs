@@ -230,11 +230,6 @@ fn push(reference: Reference) {
     });
 }
 
-/// Whether a [`collect`] is active (references are being recorded).
-pub(crate) fn collecting() -> bool {
-    COLLECTOR.with(|c| c.borrow().is_some())
-}
-
 /// The analyzer resolved a reference to `addr` (a function, operator,
 /// relation, type ...). A no-op outside [`collect`].
 pub(crate) fn note(addr: ObjectAddress) {

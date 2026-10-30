@@ -98,6 +98,8 @@ fn functions_in_pg_temp() {
          CREATE OPERATOR pg_temp.=== (leftarg = int, rightarg = int, function = pg_temp.eqx);
          SET search_path = pg_temp, public;
          SELECT 1 OPERATOR(pg_temp.===) 1;
+         SELECT 'pg_temp.eqx(int, int)'::regprocedure, 'pg_temp.===(int,int)'::regoperator,
+                'pg_temp.eqx'::regproc, 'pg_temp.==='::regoper;
          ALTER FUNCTION pg_temp.eqx(int, int) STABLE;
          DROP OPERATOR pg_temp.=== (int, int);",
     )]);
@@ -154,6 +156,34 @@ fn functions_in_pg_temp() {
              SET search_path = pg_temp, public;
              DROP OPERATOR === (int, int);",
             "operator does not exist: integer === integer",
+        ),
+        // The reg* inputs look routines and operators up the same way
+        // (regprocedurein, regoperatorin, regprocin, regoperin).
+        (
+            "CREATE FUNCTION pg_temp.eqx(int, int) RETURNS bool LANGUAGE sql AS 'select $1 = $2';
+             CREATE OPERATOR pg_temp.=== (leftarg = int, rightarg = int, function = pg_temp.eqx);
+             SET search_path = pg_temp, public;
+             SELECT '===(int,int)'::regoperator;",
+            "operator does not exist: ===(int,int)",
+        ),
+        (
+            "CREATE FUNCTION pg_temp.eqx(int, int) RETURNS bool LANGUAGE sql AS 'select $1 = $2';
+             CREATE OPERATOR pg_temp.=== (leftarg = int, rightarg = int, function = pg_temp.eqx);
+             SET search_path = pg_temp, public;
+             SELECT '==='::regoper;",
+            "operator does not exist: ===",
+        ),
+        (
+            "CREATE FUNCTION pg_temp.whoami() RETURNS text AS 'select 1::text' LANGUAGE sql;
+             SET search_path = pg_temp, public;
+             SELECT 'whoami()'::regprocedure;",
+            "function \"whoami()\" does not exist",
+        ),
+        (
+            "CREATE FUNCTION pg_temp.whoami() RETURNS text AS 'select 1::text' LANGUAGE sql;
+             SET search_path = pg_temp, public;
+             SELECT 'whoami'::regproc;",
+            "function \"whoami\" does not exist",
         ),
     ] {
         let err = try_apply(&[("0001.sql", stmt)]).expect_err(stmt);

@@ -983,6 +983,13 @@ fn drop_type(
     // What else pg_depend knows depends on it (a cast, a base type's
     // functions, ...).
     super::depend::drop_dependents(interp, addr, &desc, cascade)?;
+    // The array type is internal to it (DEPENDENCY_INTERNAL): what depends
+    // on the array (a `NULL::_t` cast, a `'t[]'::regtype` literal) depends
+    // on the type.
+    if let Some(array) = deps.array {
+        let array_addr = super::depend::ObjectAddress::type_(array);
+        super::depend::drop_dependents(interp, array_addr, &desc, cascade)?;
+    }
     drop_type_oid(interp, type_oid, deps);
     Ok(())
 }
@@ -1050,7 +1057,17 @@ impl TypeDependents {
             .collect();
         Self {
             typed_tables: crate::ddl::tables::typed::typed_tables_of(interp, type_oid),
-            views: views::find_views_depending_on_type(interp, type_oid),
+            // Views on the array type too (it is internal to the type).
+            views: {
+                let mut views: Vec<PgClassOid> = [Some(type_oid), array]
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|t| views::find_views_depending_on_type(interp, t))
+                    .collect();
+                views.sort();
+                views.dedup();
+                views
+            },
             own_types,
             array,
             constructors,
@@ -1071,6 +1088,10 @@ pub(crate) fn drop_type_cascade(interp: &mut PgCatalog, type_oid: PgTypeOid) {
     let addr = super::depend::ObjectAddress::type_(type_oid);
     let desc = super::depend::describe(interp, addr);
     let _ = super::depend::drop_dependents(interp, addr, &desc, true);
+    if let Some(array) = interp.array_type_of(type_oid) {
+        let array_addr = super::depend::ObjectAddress::type_(array);
+        let _ = super::depend::drop_dependents(interp, array_addr, &desc, true);
+    }
     let deps = TypeDependents::of(interp, type_oid);
     drop_type_oid(interp, type_oid, deps);
 }
