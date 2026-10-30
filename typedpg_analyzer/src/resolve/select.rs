@@ -55,17 +55,20 @@ pub(crate) fn analyze_correlated_select(
         }
         outer.push(far);
     }
-    let (mut cols, p) = analyze_select_with_ctes_and_outer(
-        sel,
-        snapshot,
-        params,
-        &outer_scope.ctes,
-        &[],
-        &outer,
-        // Unreferencable entries stay so inside the sublink (errorMissingRTE
-        // searches every enclosing range table).
-        &outer_scope.shadowed_sources,
-    )?;
+    // The sublink sees the enclosing level's entries its expression does.
+    let (mut cols, p) = grouping::with_visible_entries(&outer_scope.sources, || {
+        analyze_select_with_ctes_and_outer(
+            sel,
+            snapshot,
+            params,
+            &outer_scope.ctes,
+            &[],
+            &outer,
+            // Unreferencable entries stay so inside the sublink
+            // (errorMissingRTE searches every enclosing range table).
+            &outer_scope.shadowed_sources,
+        )
+    })?;
     resolve_unknown_outputs(sel, &mut cols, params, snapshot)?;
     Ok((cols, p))
 }

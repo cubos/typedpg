@@ -1172,3 +1172,91 @@ fn whole_row_aggregates_in_a_from_subquery_or_cte() {
         .unwrap();
     assert_cols(&s, vec![cn("n", int8())]);
 }
+
+/// A name reaching a level whose FROM clause is still being analyzed
+/// belongs to it only if an entry of it the inner query can see has the
+/// name; else, like PG's level search, it goes on outward. A plain FROM
+/// subquery or a CTE sees none of that level's entries, a LATERAL item
+/// those to its left, a JOIN condition's or FROM function's sublink the
+/// inputs.
+#[test]
+fn outer_names_skip_a_level_whose_from_clause_is_being_analyzed() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE a (x int); CREATE TABLE b (y int); CREATE TABLE c (z int);")
+        .unwrap();
+    // `x` and `a` are the outermost level's: their aggregates are values
+    // inside the middle level's FROM clause.
+    for sql in [
+        "SELECT (SELECT 1 FROM b CROSS JOIN LATERAL (SELECT sum(x)) s) FROM a",
+        "SELECT (SELECT 1 FROM b CROSS JOIN LATERAL (SELECT sum(x) FROM c) s) FROM a",
+        "SELECT (SELECT 1 FROM b, (SELECT sum(x) FROM c) s) FROM a",
+        "SELECT (SELECT 1 FROM b CROSS JOIN LATERAL (SELECT count(a)) s) FROM a",
+        "SELECT (SELECT 1 FROM b CROSS JOIN LATERAL (SELECT json_agg(a)) s) FROM a",
+        "SELECT (SELECT 1 FROM b CROSS JOIN LATERAL (SELECT sum(a.x)) s) FROM a",
+        "SELECT (SELECT 1 FROM b, (SELECT sum(a.x) FROM c) s) FROM a",
+        "SELECT (SELECT 1 FROM b JOIN c ON (SELECT sum(x)) > 0) FROM a",
+        "SELECT (SELECT 1 FROM b, generate_series(1, (SELECT sum(x))::int)) FROM a",
+        "SELECT (WITH w AS (SELECT sum(x) FROM c) SELECT 1 FROM w) FROM a",
+        "SELECT (SELECT 1 FROM b CROSS JOIN LATERAL \
+         (SELECT 1 FROM c CROSS JOIN LATERAL (SELECT sum(x)) t) s) FROM a",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    // They make the outermost level grouped.
+    for sql in [
+        "SELECT x, (SELECT 1 FROM b CROSS JOIN LATERAL (SELECT sum(x)) s) FROM a",
+        "SELECT x, (SELECT 1 FROM b, (SELECT count(a) FROM c) s) FROM a",
+        "SELECT x, (SELECT 1 FROM b JOIN c ON (SELECT sum(x)) > 0) FROM a",
+        "SELECT x, (WITH w AS (SELECT sum(x)) SELECT 1 FROM w) FROM a",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::GroupingError(_),
+            "column \"a.x\" must appear in the GROUP BY clause or be used in an aggregate function"
+        );
+    }
+    let s = db
+        .analyze("SELECT (SELECT s.v FROM b CROSS JOIN LATERAL (SELECT sum(x) AS v) s) AS n FROM a")
+        .unwrap();
+    assert_cols(&s, vec![cn("n", int8())]);
+    // A name an entry it sees has is the middle level's, whose FROM clause
+    // can't hold its aggregate.
+    for (sql, clause) in [
+        (
+            "SELECT (SELECT 1 FROM b CROSS JOIN LATERAL (SELECT sum(y)) s) FROM a",
+            "FROM clause of their own query level",
+        ),
+        (
+            "SELECT (SELECT 1 FROM b CROSS JOIN LATERAL (SELECT count(b)) s) FROM a",
+            "FROM clause of their own query level",
+        ),
+        (
+            "SELECT (SELECT 1 FROM b CROSS JOIN LATERAL \
+             (SELECT 1 FROM c CROSS JOIN LATERAL (SELECT sum(y)) t) s) FROM a",
+            "FROM clause of their own query level",
+        ),
+        (
+            "SELECT (SELECT 1 FROM b CROSS JOIN LATERAL (SELECT 1 FROM c, (SELECT sum(y)) t) s) \
+             FROM a",
+            "FROM clause of their own query level",
+        ),
+        (
+            "SELECT (SELECT 1 FROM b JOIN c ON (SELECT sum(y)) > 0) FROM a",
+            "JOIN conditions",
+        ),
+        (
+            "SELECT (SELECT 1 FROM b, generate_series(1, (SELECT sum(y))::int)) FROM a",
+            "functions in FROM",
+        ),
+        (
+            "UPDATE b SET y = (SELECT 1 FROM c CROSS JOIN LATERAL (SELECT sum(y)) s)",
+            "UPDATE",
+        ),
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::GroupingError(_),
+            &format!("aggregate functions are not allowed in {clause}")
+        );
+    }
+}

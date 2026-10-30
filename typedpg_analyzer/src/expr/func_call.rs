@@ -544,20 +544,12 @@ fn check_call_shape(
     let is_aggregate = resolved.is_some_and(|r| r.is_aggregate);
     let is_window = resolved.is_some_and(|r| r.is_window);
 
+    // PG's placement rules for the FILTER clause (EXPR_KIND_FILTER),
+    // reported at the offending call. Only this level's aggregates and
+    // GROUPING(…) count: an outer query's (`FILTER (WHERE sum(outer.x) >
+    // 0)`) is a value here.
     if let Some(filter) = &func.agg_filter {
-        let kinds = detect_func_kinds(filter, ctx.snapshot);
-        // Only an aggregate of this level: one of an outer query's
-        // (`FILTER (WHERE sum(outer.x) > 0)`) is a value here.
-        if kinds.has_aggregate
-            && crate::grouping::level_calls(filter, ctx.scope, ctx.snapshot)
-                .aggregate
-                .is_some()
-        {
-            return fail(pgmsg::aggregate_in_filter(span));
-        }
-        if kinds.has_window {
-            return fail(pgmsg::window_in_filter(span));
-        }
+        crate::clause::check_level_calls(filter, ctx, "FILTER", true)?;
     }
 
     if !is_aggregate && !is_window {

@@ -1004,24 +1004,6 @@ pub(crate) fn distinct_aggregate_order_by_not_in_args(span: Option<SourceSpan>) 
     )
 }
 
-/// `aggregate functions are not allowed in FILTER` — SQLSTATE 42803.
-pub(crate) fn aggregate_in_filter(span: Option<SourceSpan>) -> RawError {
-    RawError::new(
-        AnalyzeError::GroupingError("aggregate functions are not allowed in FILTER".into()),
-        span,
-        None,
-    )
-}
-
-/// `window functions are not allowed in FILTER` — SQLSTATE 42P20.
-pub(crate) fn window_in_filter(span: Option<SourceSpan>) -> RawError {
-    RawError::new(
-        AnalyzeError::WindowingError("window functions are not allowed in FILTER".into()),
-        span,
-        None,
-    )
-}
-
 // ── Window definitions (transformWindowDefinitions, transformFrameOffset) ─
 
 fn windowing(message: String, span: Option<SourceSpan>, hint: Option<String>) -> RawError {
@@ -1760,9 +1742,7 @@ mod tests {
                 "0A000",
             ),
             (distinct_aggregate_order_by_not_in_args(None).kind, "42P10"),
-            (aggregate_in_filter(None).kind, "42803"),
             (outer_aggregate_direct_argument_variable(None).kind, "42803"),
-            (window_in_filter(None).kind, "42P20"),
             (variadic_argument_must_be_array(None).kind, "42804"),
             (polymorphic_type_from_unknown(None), "42804"),
             (polymorphic_args_not_alike("anyelement"), "42804"),

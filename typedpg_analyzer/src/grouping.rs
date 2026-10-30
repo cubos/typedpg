@@ -980,16 +980,50 @@ struct RefTarget {
 }
 
 /// The namespaces of the query levels a reference can reach, innermost
-/// first. `None` stands for a level whose FROM clause is still being
-/// analyzed (a LATERAL item's parent, a CTE's or a FROM subquery's
-/// enclosing level): a reference reaching it is taken to belong to it —
-/// unless the second field, the entries of those levels the innermost one
-/// can see at all (LATERAL or correlated ones; `None`: unknown), says
-/// none of them has the name.
+/// first.
 #[derive(Clone, Default)]
-struct Chain(Vec<Option<Rc<Namespace>>>, Option<Rc<Namespace>>);
+struct Chain {
+    /// Per level, its namespace; `None` for a level whose FROM clause is
+    /// still being analyzed (a LATERAL item's parent, a CTE's or a FROM
+    /// subquery's enclosing level, a JOIN condition's sublink's).
+    levels: Vec<Option<Rc<Namespace>>>,
+    /// Per level whose namespace is `None`, the entries of it the
+    /// innermost level can see at all (a LATERAL item's left siblings, a
+    /// JOIN condition's inputs; none for a plain FROM subquery or a CTE):
+    /// a reference reaching that level belongs to it only if one of these
+    /// has the name — else it goes on outward, as PG's search does past a
+    /// level whose matching entries are all invisible. `None`: unknown,
+    /// see [`Self::reachable`].
+    visible: Vec<Option<Rc<Namespace>>>,
+    /// Every entry of the enclosing levels the innermost level can see:
+    /// what decides for a level whose visible entries are unknown.
+    reachable: Rc<Namespace>,
+}
 
 impl Chain {
+    /// A chain of one level, `ns`.
+    fn single(ns: Option<Rc<Namespace>>) -> Self {
+        Chain {
+            levels: vec![ns],
+            visible: vec![None],
+            reachable: Rc::default(),
+        }
+    }
+
+    /// Level `level`'s namespace, if known.
+    fn namespace(&self, level: usize) -> Option<Rc<Namespace>> {
+        self.levels.get(level).cloned().flatten()
+    }
+
+    /// Whether a name reaching level `level`, whose namespace is unknown,
+    /// belongs to it: `has` says whether a namespace holds it.
+    fn pending_owns(&self, level: usize, has: impl Fn(&Namespace) -> bool) -> bool {
+        match self.visible.get(level).cloned().flatten() {
+            Some(visible) => has(&visible),
+            None => has(&self.reachable),
+        }
+    }
+
     /// PG's transformColumnRef level search: an unqualified name is a
     /// column of the nearest level exposing it (else a whole-row reference
     /// to the nearest entry of that name); a qualified one belongs to the
@@ -1005,17 +1039,15 @@ impl Chain {
             .collect();
         match parts.as_slice() {
             [Some(col)] => {
-                for (level, ns) in self.0.iter().enumerate() {
+                for (level, ns) in self.levels.iter().enumerate() {
                     let Some(ns) = ns else {
-                        // A FROM subquery's or a CTE's enclosing level, whose
-                        // entries it can't see, holds no column it names.
-                        if self.1.as_ref().is_some_and(|r| r.column(col).is_none()) {
-                            continue;
+                        if self.pending_owns(level, |ns| ns.column(col).is_some()) {
+                            return Some(RefTarget {
+                                level,
+                                target: None,
+                            });
                         }
-                        return Some(RefTarget {
-                            level,
-                            target: None,
-                        });
+                        continue;
                     };
                     if let Some(alias) = ns.column(col) {
                         return Some(RefTarget {
@@ -1026,22 +1058,27 @@ impl Chain {
                 }
                 // Not a column: a whole-row reference to the nearest entry
                 // of that name.
-                self.0.iter().enumerate().find_map(|(level, ns)| match ns {
-                    Some(ns) if ns.has_alias(col) => Some(RefTarget {
-                        level,
-                        target: Some(((*col).to_owned(), None)),
-                    }),
-                    None if self.1.as_ref().is_some_and(|r| r.has_alias(col)) => Some(RefTarget {
-                        level,
-                        target: None,
-                    }),
-                    _ => None,
-                })
+                self.levels
+                    .iter()
+                    .enumerate()
+                    .find_map(|(level, ns)| match ns {
+                        Some(ns) if ns.has_alias(col) => Some(RefTarget {
+                            level,
+                            target: Some(((*col).to_owned(), None)),
+                        }),
+                        None if self.pending_owns(level, |ns| ns.has_alias(col)) => {
+                            Some(RefTarget {
+                                level,
+                                target: None,
+                            })
+                        }
+                        _ => None,
+                    })
             }
             [.., Some(table), last] => {
-                for (level, ns) in self.0.iter().enumerate() {
+                for (level, ns) in self.levels.iter().enumerate() {
                     match ns {
-                        None => {
+                        None if self.pending_owns(level, |ns| ns.has_alias(table)) => {
                             return Some(RefTarget {
                                 level,
                                 target: None,
@@ -1081,7 +1118,7 @@ impl Chain {
         else {
             return None;
         };
-        let ns = self.0.get(level)?.as_ref()?;
+        let ns = self.namespace(level)?;
         if alias != table.sval || ns.has_column(&alias, &f.sval) {
             return None;
         }
@@ -1099,11 +1136,13 @@ impl Chain {
     }
 
     fn enter(&mut self, ns: Rc<Namespace>) {
-        self.0.insert(0, Some(ns));
+        self.levels.insert(0, Some(ns));
+        self.visible.insert(0, None);
     }
 
     fn leave(&mut self) {
-        self.0.remove(0);
+        self.levels.remove(0);
+        self.visible.remove(0);
     }
 }
 
@@ -1112,6 +1151,9 @@ impl Chain {
 struct Frame {
     /// Its FROM clause's names, once processed.
     ns: Option<Rc<Namespace>>,
+    /// Before that, the entries of it the level being analyzed inside it
+    /// can see (see [`with_visible_entries`]; `None`: unknown).
+    visible: Option<Rc<Namespace>>,
     /// PG's ParseExprKindName of the clause being analyzed, when that
     /// clause forbids aggregates — what an aggregate of this level found in
     /// a sublink there is rejected with.
@@ -1264,6 +1306,30 @@ pub(crate) fn with_clause<R>(clause: Option<&'static str>, f: impl FnOnce() -> R
     out
 }
 
+/// Run `f` with the current level's entries seen by the query level `f`
+/// analyzes inside it being `entries`: the entries to its left for a
+/// LATERAL item, a JOIN condition's or FROM function's inputs for a
+/// sublink there, none for a plain FROM subquery or a CTE. Only matters
+/// while the current level's FROM clause is being analyzed (see
+/// [`Chain::visible`]).
+pub(crate) fn with_visible_entries<R>(entries: &[TableSource], f: impl FnOnce() -> R) -> R {
+    let ns = Rc::new(Namespace::of(entries));
+    let prev = FRAMES.with(|fr| {
+        fr.borrow_mut()
+            .last_mut()
+            .map(|top| top.visible.replace(ns))
+    });
+    let out = f();
+    if let Some(prev) = prev {
+        FRAMES.with(|fr| {
+            if let Some(top) = fr.borrow_mut().last_mut() {
+                top.visible = prev;
+            }
+        });
+    }
+    out
+}
+
 /// The chain seen from the current level, whose own FROM items (so far)
 /// are `scope.sources`.
 fn current_chain(scope: &Scope) -> Chain {
@@ -1275,15 +1341,21 @@ fn current_chain(scope: &Scope) -> Chain {
             .last()
             .and_then(|top| top.ns.clone())
             .unwrap_or_else(|| Rc::new(Namespace::of(&scope.sources)));
-        let mut chain = vec![Some(own)];
-        chain.extend(f.iter().rev().skip(1).map(|fr| fr.ns.clone()));
+        let mut levels = vec![Some(own)];
+        levels.extend(f.iter().rev().skip(1).map(|fr| fr.ns.clone()));
+        let mut visible = vec![None];
+        visible.extend(f.iter().rev().skip(1).map(|fr| fr.visible.clone()));
         let reachable: Vec<TableSource> = scope
             .lateral_sources
             .iter()
             .chain(&scope.outer_sources)
             .cloned()
             .collect();
-        Chain(chain, Some(Rc::new(Namespace::of(&reachable))))
+        Chain {
+            levels,
+            visible,
+            reachable: Rc::new(Namespace::of(&reachable)),
+        }
     })
 }
 
@@ -1455,6 +1527,15 @@ fn visit_level<'a>(node: &'a protobuf::Node, f: &mut dyn FnMut(&'a protobuf::Nod
     for c in level_children(node) {
         visit_level(c, f);
     }
+}
+
+/// Post-order visit of `node` and its same-level sub-expressions: PG's
+/// order of transforming the calls, each after its arguments.
+fn visit_level_post<'a>(node: &'a protobuf::Node, f: &mut dyn FnMut(&'a protobuf::Node)) {
+    for c in level_children(node) {
+        visit_level_post(c, f);
+    }
+    f(node);
 }
 
 /// Run `f` on every same-level expression of the SELECT `node` with
@@ -1746,7 +1827,7 @@ fn canonical(
                 }) = chain.resolve(cr)
                 && l == level
             {
-                let name = match (column, chain.0.get(level).cloned().flatten()) {
+                let name = match (column, chain.namespace(level)) {
                     (Some(col), Some(ns)) => ns.canonical_name(&(alias, col)),
                     (column, _) => column_key(&alias, column.as_deref().unwrap_or("*")),
                 };
@@ -1818,7 +1899,7 @@ pub(crate) fn same_level_exprs_equal(
     scope: &Scope,
     snapshot: &PgCatalog,
 ) -> bool {
-    let chain = Chain(vec![Some(Rc::new(Namespace::of(&scope.sources)))], None);
+    let chain = Chain::single(Some(Rc::new(Namespace::of(&scope.sources))));
     canonical(a, &chain, 0, Some(scope), snapshot).equal(&canonical(
         b,
         &chain,
@@ -1831,7 +1912,9 @@ pub(crate) fn same_level_exprs_equal(
 /// The locations of the first aggregate, `GROUPING(…)` and window call in
 /// `node` that belong to the current level — PG's placement rules only
 /// concern those (in `SELECT (SELECT 1 FROM u WHERE count(t.a) > 0) FROM
-/// t` the aggregate is the outer query's, and allowed there).
+/// t` the aggregate is the outer query's, and allowed there). "First" in
+/// PG's transform order, a call after its arguments: in `sum(count(x))`
+/// the rule fails at `count`.
 #[derive(Default)]
 pub(crate) struct LevelCalls {
     pub aggregate: Option<i32>,
@@ -1847,7 +1930,7 @@ pub(crate) fn level_calls(
     let mut chain = current_chain(scope);
     let mut out = LevelCalls::default();
     let mut calls: Vec<Call<'_>> = Vec::new();
-    visit_level(node, &mut |n| calls.extend(call_of(n, snapshot)));
+    visit_level_post(node, &mut |n| calls.extend(call_of(n, snapshot)));
     for call in calls {
         match call {
             Call::Aggregate {
@@ -2018,7 +2101,7 @@ pub(crate) fn finish_select_level(
         return Err(crate::pgmsg::too_many_grouping_sets().finalize_implicit());
     }
 
-    let mut own = Chain(vec![chain.0[0].clone()], None);
+    let mut own = Chain::single(chain.namespace(0));
     let group = GroupExprs::collect(sel, scope, targets, &own, snapshot);
 
     // finalize_grouping_exprs.
@@ -2052,7 +2135,7 @@ pub(crate) fn finish_select_level(
     // table whose whole primary key is grouped — by every grouping set —
     // determines all of its columns.
     let expansion = expand_grouping_sets(&sel.group_clause, scope, targets, snapshot);
-    let own_ns = own.0[0].clone().unwrap_or_default();
+    let own_ns = own.namespace(0).unwrap_or_default();
     let common: HashSet<ColKey> = match expansion.common {
         Some(common) => common
             .iter()
@@ -2183,7 +2266,11 @@ impl GroupExprs {
             have_non_var: false,
         };
         let empty = Namespace::default();
-        let ns: &Namespace = own.0.first().and_then(|n| n.as_deref()).unwrap_or(&empty);
+        let ns: &Namespace = own
+            .levels
+            .first()
+            .and_then(|n| n.as_deref())
+            .unwrap_or(&empty);
         let mut stack: Vec<&protobuf::Node> = sel.group_clause.iter().rev().collect();
         while let Some(g) = stack.pop() {
             if let Some(node::Node::GroupingSet(gs)) = g.node.as_ref() {
@@ -2372,7 +2459,7 @@ impl UngroupedCheck<'_> {
                     for col in named {
                         // A JOIN USING column reads the columns it flattens to.
                         let key = (alias.clone(), col);
-                        let columns = match chain.0.get(depth).cloned().flatten() {
+                        let columns = match chain.namespace(depth) {
                             Some(ns) => ns.flat_columns(&key),
                             None => vec![key],
                         };

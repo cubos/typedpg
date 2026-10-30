@@ -364,16 +364,22 @@ pub(crate) fn process_from_item(
                 // WHERE proves of the entries to its left holds for every
                 // row of this level (see `nonnull::capture_correlation`).
                 let capture = sub.lateral && rows_kept();
+                // Of this level's entries, only a LATERAL subquery sees
+                // any: those to its left.
+                let visible: &[crate::scope::TableSource] =
+                    if sub.lateral { &scope.sources } else { &[] };
                 let (analyzed, correlated) = crate::nonnull::capture_correlation(sel, || {
-                    analyze_select_with_ctes_and_outer(
-                        sel,
-                        snapshot,
-                        params,
-                        cte_scopes,
-                        &lateral_sources,
-                        &enclosing,
-                        &shadowed_sources,
-                    )
+                    crate::grouping::with_visible_entries(visible, || {
+                        analyze_select_with_ctes_and_outer(
+                            sel,
+                            snapshot,
+                            params,
+                            cte_scopes,
+                            &lateral_sources,
+                            &enclosing,
+                            &shadowed_sources,
+                        )
+                    })
                 });
                 let (mut cols, _) = analyzed?;
                 let summary = take_level_summary();
