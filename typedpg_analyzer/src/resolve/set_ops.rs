@@ -113,7 +113,7 @@ pub(crate) fn analyze_set_operation(
             // (`expr::note_untyped_output_params`).
             if let Some(node::Node::ResTarget(rt)) = target.node.as_ref()
                 && let Some(val) = &rt.val
-                && let Some(node::Node::ParamRef(p)) = val.node.as_ref()
+                && let Some(p) = expr::bare_param(val, snapshot)
                 && (own_cols.get(i).is_some_and(|c| c.type_oid == oid::UNKNOWN)
                     || params.is_untyped_output(p.location))
                 && let Some(peer) = peer_cols.get(i)

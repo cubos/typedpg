@@ -244,7 +244,7 @@ fn object_key(
     params: &mut ParamCollector,
 ) -> Result<ExprType, AnalyzeError> {
     let t = infer_expr(key, ctx, params, TypeGoal::NONE)?;
-    if let Some(node::Node::ParamRef(p)) = key.node.as_ref() {
+    if let Some(p) = super::bare_param(key, ctx.snapshot) {
         params.mark_indeterminate_locked(p.number);
     }
     Ok(t)

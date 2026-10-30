@@ -224,7 +224,7 @@ pub(crate) fn infer_func_call(
     for (i, arg) in func.args.iter().enumerate() {
         if declared_any(i)
             && !hypothetical
-            && let Some(node::Node::ParamRef(p)) = functions::call_arg_value(arg).node.as_ref()
+            && let Some(p) = super::bare_param(functions::call_arg_value(arg), ctx.snapshot)
         {
             params.mark_indeterminate_locked(p.number);
         }

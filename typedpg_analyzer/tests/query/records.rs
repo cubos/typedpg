@@ -3080,16 +3080,42 @@ fn whole_row_cast_to_a_composite_checks_its_columns() {
         err(sql, "c", None);
     }
     // can_coerce_type has no other target for `record` than a composite,
-    // `record` itself and (I/O) the string types.
+    // `record` itself, (I/O) the string types and the polymorphic
+    // pseudo-types a `record` is consistent with — not the array, enum and
+    // range ones, nor a non-polymorphic pseudo-type.
     for (sql, target) in [
         ("SELECT s::int FROM (SELECT 1 AS a, 'x' AS b) s", "integer"),
         ("SELECT s::c[] FROM (SELECT 1 AS a, 'x' AS b) s", "c[]"),
         ("SELECT ROW(1)::json", "json"),
         ("SELECT ROW(1)::\"char\"", "\"char\""),
+        ("SELECT ROW(1)::record[]", "record[]"),
+        ("SELECT s::anyarray FROM (SELECT 1 AS a) s", "anyarray"),
+        ("SELECT ROW(1)::anyenum", "anyenum"),
+        ("SELECT ROW(1)::anyrange", "anyrange"),
+        ("SELECT ROW(1)::anymultirange", "anymultirange"),
+        ("SELECT ROW(1)::anycompatiblearray", "anycompatiblearray"),
+        ("SELECT ROW(1)::anycompatiblerange", "anycompatiblerange"),
+        ("SELECT ROW(1)::cstring", "cstring"),
+        ("SELECT ROW(1)::void", "void"),
+        ("SELECT ROW(1)::trigger", "trigger"),
     ] {
         err(sql, target, None);
     }
     db.analyze("SELECT ROW(1)::name").unwrap();
+    for sql in [
+        "SELECT ROW(1)::anyelement",
+        "SELECT s::anyelement FROM (SELECT 1 AS a) s",
+        "SELECT ROW(1)::anynonarray",
+        "SELECT s::anycompatible FROM (SELECT 1 AS a) s",
+        "SELECT ROW(1)::anycompatiblenonarray",
+    ] {
+        let info = db.analyze(sql).unwrap();
+        assert!(
+            matches!(info.columns[0].pg_type, Type::AnonymousRecord { .. }),
+            "{sql}: {:?}",
+            info.columns[0].pg_type
+        );
+    }
     // A function returning a scalar, a table's row type: no record.
     assert_err_prefix!(
         db.analyze("SELECT f::c FROM generate_series(1, 2) f"),

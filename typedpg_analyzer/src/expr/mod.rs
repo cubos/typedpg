@@ -916,7 +916,10 @@ fn infer_expr_unlocated(
     let result = match inner {
         node::Node::ColumnRef(col_ref) => infer_column_ref(col_ref, ctx),
         node::Node::AConst(a_const) => infer_a_const(a_const),
-        node::Node::TypeCast(cast) => infer_type_cast(cast, ctx, params),
+        node::Node::TypeCast(cast) => match passthrough_cast_operand(node, snapshot, params) {
+            Some(operand) => infer_expr(operand, ctx, params, goal.clone()),
+            None => infer_type_cast(cast, ctx, params),
+        },
         node::Node::FuncCall(func) => infer_func_call(func, ctx, params),
         // `name => value` only occurs as a function-call argument; its type is
         // the value's. The enclosing call resolves the name.
@@ -946,7 +949,7 @@ fn infer_expr_unlocated(
                 // `SELECT $1 IS NULL, $1 = 1` is `could not determine data
                 // type of parameter $1` (42P08) even though the later use
                 // would pin int4. A param typed *before* this point is fine.
-                if let Some(node::Node::ParamRef(p)) = arg.node.as_ref() {
+                if let Some(p) = bare_param(arg, snapshot) {
                     params.mark_indeterminate_locked(p.number);
                 }
             }
@@ -1140,7 +1143,7 @@ fn infer_expr_unlocated(
             let mut fields = Vec::with_capacity(row.args.len());
             for (i, arg) in row.args.iter().enumerate() {
                 let ty = infer_expr(arg, ctx, params, TypeGoal::NONE)?;
-                if let Some(node::Node::ParamRef(p)) = arg.node.as_ref() {
+                if let Some(p) = bare_param(arg, snapshot) {
                     params.mark_indeterminate_required(p.number);
                 }
                 fields.push(RecordField {
@@ -1447,14 +1450,14 @@ pub(crate) fn note_untyped_output_params(
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<(), AnalyzeError> {
-    let bare_param = |target: &protobuf::Node| {
+    let is_bare_param = |target: &protobuf::Node| {
         matches!(
             target.node.as_ref(),
             Some(node::Node::ResTarget(rt))
-                if matches!(rt.val.as_deref().and_then(|v| v.node.as_ref()), Some(node::Node::ParamRef(_)))
+                if rt.val.as_deref().and_then(|v| bare_param(v, ctx.snapshot)).is_some()
         )
     };
-    let last_bare_param = target_list.iter().rposition(bare_param);
+    let last_bare_param = target_list.iter().rposition(is_bare_param);
     let mut scratch = params.clone();
     for (i, target) in target_list.iter().enumerate() {
         let Some(node::Node::ResTarget(rt)) = target.node.as_ref() else {
@@ -1463,7 +1466,7 @@ pub(crate) fn note_untyped_output_params(
         let Some(val) = rt.val.as_deref() else {
             continue;
         };
-        if let Some(node::Node::ParamRef(p)) = val.node.as_ref() {
+        if let Some(p) = bare_param(val, ctx.snapshot) {
             if scratch.get(p.number) == oid::UNKNOWN {
                 params.mark_untyped_output(p.location);
             }
@@ -1521,7 +1524,7 @@ pub(crate) fn resolve_untyped_output_params(
         let Some(node::Node::ResTarget(rt)) = target.node.as_ref() else {
             continue;
         };
-        let Some(node::Node::ParamRef(p)) = rt.val.as_deref().and_then(|v| v.node.as_ref()) else {
+        let Some(p) = rt.val.as_deref().and_then(|v| bare_param(v, snapshot)) else {
             continue;
         };
         if !params.is_untyped_output(p.location) {
@@ -1872,6 +1875,7 @@ use indirection::*;
 pub(crate) use indirection::{expand_indirection_star, transform_container_subscripts};
 use json::*;
 pub(crate) use literals::assignment_nullable;
+pub(crate) use literals::bare_param;
 use literals::*;
 pub(crate) use literals::{coercion_can_null_elements, coercion_can_return_null};
 pub(crate) use operators::check_regex_restrictions;

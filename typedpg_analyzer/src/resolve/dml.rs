@@ -1024,7 +1024,10 @@ fn analyze_insert_select(
         // `variable_coerce_param_hook` (42P08 if WHERE & co. deduced
         // another type — see `expr::note_untyped_output_params`).
         if let Some(node::Node::ResTarget(rt)) = direct_targets.get(i).and_then(|t| t.node.as_ref())
-            && let Some(node::Node::ParamRef(p)) = rt.val.as_deref().and_then(|v| v.node.as_ref())
+            && let Some(p) = rt
+                .val
+                .as_deref()
+                .and_then(|v| expr::bare_param(v, snapshot))
             && params.is_untyped_output(p.location)
         {
             if let Err(prev) = params.coerce_untyped(p.number, target_oid) {

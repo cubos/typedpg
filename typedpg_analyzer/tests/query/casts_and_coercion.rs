@@ -786,3 +786,264 @@ fn float_precision_out_of_range_is_a_grammar_error() {
         "precision for type float must be less than 54 bits"
     );
 }
+
+/// can_coerce_type's pseudo-type targets: `"any"` and a polymorphic
+/// pseudo-type take a value consistent with them, and coerce_type leaves it
+/// as it is (an array, enum or range target strips a domain); any other
+/// pseudo-type is reachable only through pg_cast or the I/O rule.
+#[test]
+fn casts_to_pseudo_types_follow_can_coerce_type() {
+    let mut db = setup();
+    db.apply_sql(
+        "CREATE DOMAIN posint AS int CHECK (VALUE > 0);
+         CREATE DOMAIN ia AS int[];
+         CREATE TABLE tv (v varchar(3) NOT NULL, n numeric(4, 1));",
+    )
+    .unwrap();
+    for (sql, expected) in [
+        ("SELECT 1::anyelement AS a", int4()),
+        ("SELECT 1::anynonarray AS a", int4()),
+        ("SELECT 1::anycompatible AS a", int4()),
+        ("SELECT 1::anycompatiblenonarray AS a", int4()),
+        ("SELECT 1::\"any\" AS a", int4()),
+        (
+            "SELECT ARRAY[1]::anyelement AS a",
+            array_with_elems(int4(), false),
+        ),
+        (
+            "SELECT ARRAY[1]::anyarray AS a",
+            array_with_elems(int4(), false),
+        ),
+        (
+            "SELECT ARRAY[1]::anycompatiblearray AS a",
+            array_with_elems(int4(), false),
+        ),
+        (
+            "SELECT ARRAY[1]::ia::anyarray AS a",
+            array_with_elems(int4(), false),
+        ),
+        ("SELECT v::text::anyelement AS a FROM tv", text()),
+        // coerce_type_typmod relabels a value with a typmod to the target.
+        (
+            "SELECT v::anyelement AS a FROM tv",
+            basic("pg_catalog", "anyelement"),
+        ),
+        (
+            "SELECT n::anycompatible AS a FROM tv",
+            basic("pg_catalog", "anycompatible"),
+        ),
+        ("SELECT v::\"any\" AS a FROM tv", basic("pg_catalog", "any")),
+    ] {
+        let s = db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        assert_eq!(s.columns[0].pg_type, expected, "{sql}");
+    }
+    // The value keeps its type: a range, a domain (but an array, enum or
+    // range target strips it).
+    let ty = |sql: &str| {
+        db.analyze(sql)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+            .columns[0]
+            .pg_type
+            .clone()
+    };
+    for (sql, same_as) in [
+        (
+            "SELECT '[1,2]'::int4range::anyrange AS a",
+            "SELECT '[1,2]'::int4range AS a",
+        ),
+        (
+            "SELECT '[1,2]'::int4range::anycompatiblerange AS a",
+            "SELECT '[1,2]'::int4range AS a",
+        ),
+        (
+            "SELECT '{[1,2]}'::int4multirange::anymultirange AS a",
+            "SELECT '{[1,2]}'::int4multirange AS a",
+        ),
+        ("SELECT 1::posint::anyelement AS a", "SELECT 1::posint AS a"),
+    ] {
+        assert_eq!(ty(sql), ty(same_as), "{sql}");
+    }
+    for (sql, message) in [
+        ("SELECT 1::anyarray", "cannot cast type integer to anyarray"),
+        ("SELECT 1::anyenum", "cannot cast type integer to anyenum"),
+        ("SELECT 1::anyrange", "cannot cast type integer to anyrange"),
+        (
+            "SELECT 1::anymultirange",
+            "cannot cast type integer to anymultirange",
+        ),
+        (
+            "SELECT 1::anycompatiblemultirange",
+            "cannot cast type integer to anycompatiblemultirange",
+        ),
+        (
+            "SELECT ARRAY[1]::anynonarray",
+            "cannot cast type integer[] to anynonarray",
+        ),
+        (
+            "SELECT ARRAY[1]::anymultirange",
+            "cannot cast type integer[] to anymultirange",
+        ),
+        (
+            "SELECT 'a'::varchar::anyarray",
+            "cannot cast type character varying to anyarray",
+        ),
+        ("SELECT 1::cstring", "cannot cast type integer to cstring"),
+        ("SELECT 1::void", "cannot cast type integer to void"),
+        ("SELECT 1::internal", "cannot cast type integer to internal"),
+        ("SELECT 1::trigger", "cannot cast type integer to trigger"),
+        ("SELECT 1::record", "cannot cast type integer to record"),
+        (
+            "SELECT 'a'::cstring::int",
+            "cannot cast type cstring to integer",
+        ),
+        (
+            "SELECT pg_sleep(0)::int",
+            "cannot cast type void to integer",
+        ),
+    ] {
+        assert_err_prefix!(db.analyze(sql), AnalyzeError::Invalid(_), message);
+    }
+    // The I/O rule reaches a pseudo-type from a string type and back.
+    for sql in [
+        "SELECT 'a'::text::cstring AS a",
+        "SELECT pg_sleep(0)::text AS a",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    // `unknown` and `internal` take no cast but their own; `anyenum` no
+    // untyped value.
+    for (sql, message) in [
+        ("SELECT 1::unknown", "cannot cast type integer to unknown"),
+        (
+            "SELECT ROW(1, 2)::unknown",
+            "cannot cast type record to unknown",
+        ),
+        (
+            "SELECT 'a'::internal",
+            "cannot cast type unknown to internal",
+        ),
+        (
+            "SELECT NULL::internal",
+            "cannot cast type unknown to internal",
+        ),
+        (
+            "SELECT $1::internal",
+            "cannot cast type unknown to internal",
+        ),
+        (
+            "SELECT 'a'::text::internal",
+            "cannot cast type text to internal",
+        ),
+        ("SELECT 'a'::anyenum", "cannot cast type unknown to anyenum"),
+        (
+            "SELECT NULL::anyenum",
+            "cannot cast type unknown to anyenum",
+        ),
+        ("SELECT $1::anyenum", "cannot cast type unknown to anyenum"),
+    ] {
+        assert_err_prefix!(db.analyze(sql), AnalyzeError::Invalid(_), message);
+    }
+}
+
+/// An untyped literal or parameter cast to `"any"`, `anyelement`,
+/// `anynonarray`, `anycompatible` or `anycompatiblenonarray` is handed back
+/// untouched by coerce_type: it is still untyped, and resolves as if the
+/// cast weren't there (an output column to `text`).
+#[test]
+fn untyped_operand_passes_through_a_polymorphic_cast() {
+    let db = setup();
+    for target in [
+        "\"any\"",
+        "anyelement",
+        "anynonarray",
+        "anycompatible",
+        "anycompatiblenonarray",
+    ] {
+        for sql in [
+            format!("SELECT 'a'::{target} AS a"),
+            format!("SELECT NULL::{target} AS a"),
+            format!("SELECT x FROM (SELECT 'a'::{target} AS x) s"),
+            format!("SELECT ('a'::{target})::anyelement AS a"),
+        ] {
+            let s = db.analyze(&sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+            assert_eq!(s.columns[0].pg_type, text(), "{sql}");
+        }
+        let sql = format!("SELECT $1::{target} AS a");
+        let s = db.analyze(&sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        assert_eq!(s.columns[0].pg_type, text(), "{sql}");
+        assert_eq!(s.params[0].pg_type, text(), "{sql}");
+    }
+    // As an operator's operand it is an unknown one.
+    let s = db.analyze("SELECT $1::anyelement || 'x' AS a").unwrap();
+    assert_eq!(s.params[0].pg_type, text());
+    // The literal's content is checked by the outer cast.
+    assert_err_prefix!(
+        db.analyze("SELECT ('a'::anyelement)::int"),
+        AnalyzeError::InvalidLiteral(_),
+        "invalid input syntax for type integer: \"a\""
+    );
+    // Nothing gives the parameter a type.
+    assert_err_prefix!(
+        db.analyze("SELECT 1 AS a WHERE $1::anyelement IS NULL"),
+        AnalyzeError::IndeterminateType(_),
+        "could not determine data type of parameter $1"
+    );
+    // A bare output parameter is coerced to text, which conflicts with a
+    // type a later clause deduced.
+    assert_err_prefix!(
+        db.analyze("SELECT $1::anyelement AS a, $1 = 1 AS b"),
+        AnalyzeError::AmbiguousParameter(_),
+        "inconsistent types deduced for parameter $1"
+    );
+}
+
+/// stringTypeDatum runs the target's input function on an untyped literal:
+/// a pseudo-type whose input function is a dummy refuses every value, and
+/// a NULL one too when that function isn't strict. A parameter is never
+/// read at parse time.
+#[test]
+fn literal_of_a_pseudo_type_without_input() {
+    let db = setup();
+    for (target, strict) in [
+        ("anyarray", true),
+        ("anyrange", true),
+        ("anymultirange", true),
+        ("anycompatiblearray", true),
+        ("anycompatiblerange", true),
+        ("anycompatiblemultirange", true),
+        ("trigger", false),
+        ("event_trigger", false),
+        ("language_handler", false),
+        ("fdw_handler", false),
+        ("table_am_handler", false),
+        ("index_am_handler", false),
+        ("tsm_handler", false),
+    ] {
+        let message = format!("cannot accept a value of type {target}");
+        assert_err_prefix!(
+            db.analyze(&format!("SELECT 'a'::{target}")),
+            AnalyzeError::FeatureNotSupported(_),
+            &message
+        );
+        let null = format!("SELECT NULL::{target} AS a");
+        if strict {
+            let s = db.analyze(&null).unwrap_or_else(|e| panic!("{null}: {e}"));
+            assert_eq!(s.columns[0].pg_type, basic("pg_catalog", target), "{null}");
+        } else {
+            assert_err_prefix!(
+                db.analyze(&null),
+                AnalyzeError::FeatureNotSupported(_),
+                &message
+            );
+        }
+        let param = format!("SELECT $1::{target} AS a");
+        let s = db
+            .analyze(&param)
+            .unwrap_or_else(|e| panic!("{param}: {e}"));
+        assert_eq!(s.params[0].pg_type, basic("pg_catalog", target), "{param}");
+    }
+    // Pseudo-types with a real input function.
+    for sql in ["SELECT 'a'::cstring AS a", "SELECT 'a'::void AS a"] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}

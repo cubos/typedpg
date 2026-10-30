@@ -1567,6 +1567,21 @@ pub(crate) fn too_many_grouping_sets() -> RawError {
     )
 }
 
+/// PSEUDOTYPE_DUMMY_INPUT_FUNC (pseudotypes.c): the input function of a
+/// pseudo-type no value can be written for — `cannot accept a value of
+/// type anyarray` — SQLSTATE 0A000.
+pub(crate) fn cannot_accept_a_value_of_type(
+    type_name: &str,
+    span: Option<crate::error::SourceSpan>,
+) -> RawError {
+    RawError::new(
+        AnalyzeError::FeatureNotSupported(format!("cannot accept a value of type {type_name}")),
+        span,
+        None,
+    )
+    .with_primary_label("this literal")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1621,6 +1636,10 @@ mod tests {
                 "0A000",
             ),
             (merge_view_partial_instead_triggers("v").kind, "0A000"),
+            (
+                cannot_accept_a_value_of_type("anyarray", None).kind,
+                "0A000",
+            ),
             (merge_on_relation_with_rules("t").kind, "0A000"),
             (on_conflict_with_rules().kind, "0A000"),
             (
