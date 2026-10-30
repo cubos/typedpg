@@ -392,15 +392,6 @@ fn json_agg_nullable(
     )
 }
 
-/// An aggregate's argument may not itself contain an aggregate.
-fn check_not_nested(n: &protobuf::Node, snapshot: &PgCatalog) -> Result<(), AnalyzeError> {
-    let kinds = detect_func_kinds(n, snapshot);
-    if kinds.has_aggregate || kinds.has_grouping {
-        return Err(crate::pgmsg::nested_aggregate(kinds.aggregate_span()).finalize_implicit());
-    }
-    Ok(())
-}
-
 /// `JSON_OBJECTAGG(k VALUE v)` — `transformJsonObjectAgg`. NULL over an
 /// empty input.
 pub(crate) fn infer_json_objectagg(
@@ -411,13 +402,9 @@ pub(crate) fn infer_json_objectagg(
     let mut args = Vec::new();
     if let Some(kv) = a.arg.as_deref() {
         if let Some(key) = kv.key.as_deref() {
-            check_not_nested(key, ctx.snapshot)?;
             args.push(object_key(key, ctx, params)?.type_oid);
         }
         if let Some(v) = kv.value.as_deref() {
-            if let Some(raw) = v.raw_expr.as_deref() {
-                check_not_nested(raw, ctx.snapshot)?;
-            }
             let t = json_value_expr(
                 v,
                 ctx,
@@ -460,9 +447,6 @@ pub(crate) fn infer_json_arrayagg(
 ) -> Result<ExprType, AnalyzeError> {
     let mut args = Vec::new();
     if let Some(v) = a.arg.as_deref() {
-        if let Some(raw) = v.raw_expr.as_deref() {
-            check_not_nested(raw, ctx.snapshot)?;
-        }
         let t = json_value_expr(
             v,
             ctx,

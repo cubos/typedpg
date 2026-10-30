@@ -89,6 +89,65 @@ fn cube_makes_grouped_columns_nullable() {
     );
 }
 
+/// A grouping set that omits an expression NULLs it, even when the plain
+/// GROUP BY groups the same expression under another alias: the sets of
+/// `GROUP BY alias1, ROLLUP(alias2)` are `(g, g)` and `(g)`, and the second
+/// fills `alias2` with NULL (PG's groupingsets.sql: 1, 2, 3 then 1, 2, 3
+/// with alias2 NULL).
+#[test]
+fn rollup_of_an_expression_also_grouped_plainly_is_nullable() {
+    let db = setup();
+    let s = db
+        .analyze(
+            "SELECT g AS alias1, g AS alias2 FROM generate_series(1,3) g
+             GROUP BY alias1, ROLLUP(alias2)",
+        )
+        .unwrap();
+    assert_cols(&s, vec![c("alias1", int4()), cn("alias2", int4())]);
+    // HAVING reads `g` as the item every set holds: it says nothing of
+    // `alias2`'s.
+    let s = db
+        .analyze(
+            "SELECT g AS alias1, g AS alias2 FROM generate_series(1,3) g
+             GROUP BY alias1, ROLLUP(alias2) HAVING g IS NOT NULL",
+        )
+        .unwrap();
+    assert_cols(&s, vec![c("alias1", int4()), cn("alias2", int4())]);
+    let s = db
+        .analyze("SELECT region AS r1, region AS r2 FROM sales GROUP BY region, CUBE(r2)")
+        .unwrap();
+    assert_cols(&s, vec![c("r1", text()), cn("r2", text())]);
+    // Present in every set, the expression stays NOT NULL.
+    let s = db
+        .analyze("SELECT region FROM sales GROUP BY region, ROLLUP(region)")
+        .unwrap();
+    assert_cols(&s, vec![c("region", text())]);
+}
+
+/// A column known NOT NULL only through a view's WHERE and a CHECK is
+/// still NULLed by the grouping sets that omit it (with a row (1, 5, 0),
+/// PG returns q = 5 and the grand total's q = NULL).
+#[test]
+fn grouping_sets_null_a_view_column_known_not_null() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE d (id int PRIMARY KEY, q int, r int NOT NULL,
+             CHECK ((q IS NULL) = (r > 0)));
+         CREATE VIEW vd AS SELECT id, q FROM d WHERE q IS NOT NULL;",
+    )
+    .unwrap();
+    for sql in [
+        "SELECT q FROM vd GROUP BY ROLLUP (q)",
+        "SELECT q FROM vd GROUP BY CUBE (q)",
+        "SELECT q FROM vd GROUP BY GROUPING SETS ((q), ())",
+        "SELECT q + 1 AS q FROM vd GROUP BY ROLLUP (q)",
+    ] {
+        assert_cols(&db.analyze(sql).unwrap(), vec![cn("q", int4())]);
+    }
+    let s = db.analyze("SELECT q FROM vd GROUP BY q").unwrap();
+    assert_cols(&s, vec![c("q", int4())]);
+}
+
 // ── GROUPING() function ─────────────────────────────────────────────────────
 
 #[test]

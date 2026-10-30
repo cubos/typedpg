@@ -73,6 +73,152 @@ fn multiple_filters_side_by_side() {
     assert_cols(&s, vec![c("many", int8()), c("none", int8())]);
 }
 
+/// An aggregate of an outer query in a subquery's FILTER belongs to the
+/// outer query: the inner FILTER sees it as a constant.
+#[test]
+fn filter_may_hold_an_outer_level_aggregate() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE a (x int); CREATE TABLE b (y int);")
+        .unwrap();
+    for sql in [
+        "SELECT (SELECT max(y) FILTER (WHERE sum(x) > 0) FROM b) FROM a",
+        "SELECT (SELECT count(*) FILTER (WHERE count(a.x) > y) FROM b) FROM a",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    // The subquery's own aggregate still can't sit in its FILTER.
+    assert_err_prefix!(
+        db.analyze("SELECT (SELECT max(y) FILTER (WHERE sum(y) > 0) FROM b) FROM a"),
+        AnalyzeError::GroupingError(_),
+        "aggregate functions are not allowed in FILTER"
+    );
+}
+
+/// PG rejects a call FILTER can't hold where it transforms it, after its
+/// arguments: the error points at that call, not at the aggregate the
+/// FILTER belongs to.
+#[test]
+fn filter_errors_point_at_the_offending_call() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE a (x int); CREATE TABLE b (y int);")
+        .unwrap();
+    assert_analyze_err!(
+        db.analyze("SELECT max(y) FILTER (WHERE sum(y) > 0) FROM b"),
+        AnalyzeError::GroupingError(_),
+        "\
+aggregate functions are not allowed in FILTER
+  ╭────
+1 │ SELECT max(y) FILTER (WHERE sum(y) > 0) FROM b
+  ·                             ─┬─
+  ·                              ╰─ aggregate not allowed here
+  ╰────
+",
+    );
+    // `sum(sum(y))`: the inner call is transformed, and rejected, first.
+    assert_analyze_err!(
+        db.analyze("SELECT max(y) FILTER (WHERE y + sum(sum(y)) > 0) FROM b"),
+        AnalyzeError::GroupingError(_),
+        "\
+aggregate functions are not allowed in FILTER
+  ╭────
+1 │ SELECT max(y) FILTER (WHERE y + sum(sum(y)) > 0) FROM b
+  ·                                     ─┬─
+  ·                                      ╰─ aggregate not allowed here
+  ╰────
+",
+    );
+    assert_analyze_err!(
+        db.analyze("SELECT (SELECT max(y) FILTER (WHERE sum(y) > 0) FROM b) FROM a"),
+        AnalyzeError::GroupingError(_),
+        "\
+aggregate functions are not allowed in FILTER
+  ╭────
+1 │ SELECT (SELECT max(y) FILTER (WHERE sum(y) > 0) FROM b) FROM a
+  ·                                     ─┬─
+  ·                                      ╰─ aggregate not allowed here
+  ╰────
+",
+    );
+    assert_analyze_err!(
+        db.analyze("SELECT max(y) FILTER (WHERE row_number() OVER () > 0) FROM b"),
+        AnalyzeError::WindowingError(_),
+        "\
+window functions are not allowed in FILTER
+  ╭────
+1 │ SELECT max(y) FILTER (WHERE row_number() OVER () > 0) FROM b
+  ·                             ─────┬────
+  ·                                  ╰─ window function not allowed here
+  ╰────
+",
+    );
+    assert_err_prefix!(
+        db.analyze("SELECT count(*) FILTER (WHERE grouping(y) = 0) FROM b GROUP BY y"),
+        AnalyzeError::GroupingError(_),
+        "grouping operations are not allowed in FILTER"
+    );
+    // An aggregate of the FILTER's level reached through a sublink is
+    // rejected by the FILTER's rule too, not as a nesting: PG checks it
+    // against the clause its level is transforming (EXPR_KIND_FILTER).
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE a (x int); CREATE TABLE b (y int); CREATE TABLE c (z int);")
+        .unwrap();
+    assert_analyze_err!(
+        db.analyze("SELECT max(y) FILTER (WHERE (SELECT sum(y)) > 0) FROM b"),
+        AnalyzeError::GroupingError(_),
+        "\
+aggregate functions are not allowed in FILTER
+  ╭────
+1 │ SELECT max(y) FILTER (WHERE (SELECT sum(y)) > 0) FROM b
+  ·                                     ─┬─
+  ·                                      ╰─ aggregate not allowed here
+  ╰────
+",
+    );
+    for sql in [
+        "SELECT max(y) FILTER (WHERE (SELECT sum(y) FROM c) > 0) FROM b",
+        "SELECT max(y) FILTER (WHERE (SELECT (SELECT sum(y))) > 0) FROM b",
+        "SELECT max(y) FILTER (WHERE (SELECT max(sum(y)) FROM c) > 0) FROM b",
+        "SELECT max(y) FILTER (WHERE (SELECT 1 WHERE (SELECT sum(y)) > 0) > 0) FROM b",
+        "SELECT max(y) FILTER (WHERE (SELECT sum(z) FROM c WHERE (SELECT sum(y)) > 0) > 0) FROM b",
+        "SELECT max(y) FILTER (WHERE EXISTS (SELECT 1 FROM c GROUP BY z HAVING sum(y) > 0)) FROM b",
+        "SELECT max(y) FILTER (WHERE (SELECT count(*) FILTER (WHERE (SELECT sum(y)) > 0) FROM c) > 0) \
+         FROM b",
+        "SELECT y FROM b GROUP BY y HAVING max(y) FILTER (WHERE (SELECT sum(y)) > 0) > 0",
+        "SELECT json_agg(y) FILTER (WHERE (SELECT sum(y)) > 0) FROM b",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::GroupingError(_),
+            "aggregate functions are not allowed in FILTER"
+        );
+    }
+    assert_err_prefix!(
+        db.analyze("SELECT max(y) FILTER (WHERE (SELECT grouping(y)) = 0) FROM b GROUP BY y"),
+        AnalyzeError::GroupingError(_),
+        "grouping operations are not allowed in FILTER"
+    );
+    // The aggregate in the FILTER's sublink belongs to the level outside
+    // the FILTER's aggregate, which the FILTER doesn't constrain: there it
+    // nests in that aggregate (an aggregate of the same level).
+    assert_err_prefix!(
+        db.analyze("SELECT (SELECT max(y) FILTER (WHERE (SELECT sum(y)) > 0) FROM c) FROM b"),
+        AnalyzeError::GroupingError(_),
+        "aggregate function calls cannot be nested"
+    );
+    // A window function or an aggregate in a sublink of the FILTER is the
+    // sublink's own, as is an outer level's aggregate in a FILTER.
+    for sql in [
+        "SELECT max(y) FILTER (WHERE (SELECT sum(y + z) FROM c) > 0) FROM b",
+        "SELECT (SELECT max(z) FILTER (WHERE sum(y) > 0) FROM c) FROM b",
+        "SELECT (SELECT max(z) FILTER (WHERE (SELECT sum(y)) > 0) FROM c) FROM b",
+        "SELECT y FROM b GROUP BY y \
+         HAVING max(y) FILTER (WHERE (SELECT row_number() OVER ()) > 0) > 0",
+        "SELECT count(*) FILTER (WHERE (SELECT sum(x) FROM a) > 0) FROM b",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
+
 // ── DISTINCT inside an aggregate ─────────────────────────────────────────────
 
 #[test]

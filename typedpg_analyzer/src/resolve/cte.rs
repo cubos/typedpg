@@ -801,6 +801,19 @@ pub(crate) fn analyze_with_clause(
     outer_ctes: &HashMap<String, Vec<ScopeColumn>>,
     outer_sources: &[crate::scope::TableSource],
 ) -> Result<HashMap<String, Vec<ScopeColumn>>, AnalyzeError> {
+    // A CTE body sees none of the entries of the level owning the WITH.
+    crate::grouping::with_visible_entries(&[], || {
+        analyze_with_clause_here(with, snapshot, params, outer_ctes, outer_sources)
+    })
+}
+
+fn analyze_with_clause_here(
+    with: &protobuf::WithClause,
+    snapshot: &PgCatalog,
+    params: &mut ParamCollector,
+    outer_ctes: &HashMap<String, Vec<ScopeColumn>>,
+    outer_sources: &[crate::scope::TableSource],
+) -> Result<HashMap<String, Vec<ScopeColumn>>, AnalyzeError> {
     let ctes: Vec<&protobuf::CommonTableExpr> = with
         .ctes
         .iter()

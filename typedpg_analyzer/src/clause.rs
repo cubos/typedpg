@@ -112,20 +112,26 @@ impl ClauseKind {
         }
     }
 
-    /// Whether this is a clause of its query level (as opposed to an
-    /// expression inside one): an aggregate belonging to the level that a
-    /// sublink in the clause holds is checked against it.
-    fn is_level_clause(self) -> bool {
-        matches!(
-            self,
+    /// `Some` when this is a clause of its query level (PG sets the level's
+    /// `p_expr_kind` while transforming it), as opposed to an expression
+    /// inside one: an aggregate belonging to the level that a sublink in
+    /// the clause holds is checked against the clause's rule — rejected
+    /// with `Some(context)`, allowed with `None`. FILTER is one too
+    /// (EXPR_KIND_FILTER), whose own calls `check_call_shape` checks:
+    /// `max(y) FILTER (WHERE (SELECT sum(y)) > 0)` is "aggregate functions
+    /// are not allowed in FILTER", not a nesting.
+    fn level_clause(self) -> Option<Option<&'static str>> {
+        match self {
             ClauseKind::Where
-                | ClauseKind::Having
-                | ClauseKind::JoinOn
-                | ClauseKind::MergeWhen
-                | ClauseKind::Limit
-                | ClauseKind::Offset
-                | ClauseKind::FrameOffset(_)
-        )
+            | ClauseKind::Having
+            | ClauseKind::JoinOn
+            | ClauseKind::MergeWhen
+            | ClauseKind::Limit
+            | ClauseKind::Offset
+            | ClauseKind::FrameOffset(_) => Some(self.aggregate_context()),
+            ClauseKind::Filter => Some(Some("FILTER")),
+            _ => None,
+        }
     }
 
     /// Whether the diagnostic carries a caret label under the offending
@@ -150,8 +156,8 @@ pub(crate) fn coerce_clause_expr(
     let (goal_oid, goal_name) = kind.expected();
     // Sublinks analyzed inside a clause of the level hand the aggregates
     // they hold for the level to the clause's placement rule.
-    let inferred = if kind.is_level_clause() {
-        crate::grouping::with_clause(kind.aggregate_context(), || {
+    let inferred = if let Some(clause) = kind.level_clause() {
+        crate::grouping::with_clause(clause, || {
             expr::infer_expr(node, ctx, params, TypeGoal::assignment(goal_oid))
         })
     } else {

@@ -266,7 +266,7 @@ pub(crate) fn infer_func_call(
     if func.over.is_some() {
         check_no_nested_windows(func, snapshot)?;
     } else if resolved.is_aggregate {
-        check_no_nested_aggregates(func, snapshot)?;
+        check_no_windows_in_aggregate(func, snapshot)?;
     }
 
     // The pseudo-type `"any"` (plain and VARIADIC, e.g. `concat`,
@@ -544,14 +544,12 @@ fn check_call_shape(
     let is_aggregate = resolved.is_some_and(|r| r.is_aggregate);
     let is_window = resolved.is_some_and(|r| r.is_window);
 
+    // PG's placement rules for the FILTER clause (EXPR_KIND_FILTER),
+    // reported at the offending call. Only this level's aggregates and
+    // GROUPING(…) count: an outer query's (`FILTER (WHERE sum(outer.x) >
+    // 0)`) is a value here.
     if let Some(filter) = &func.agg_filter {
-        let kinds = detect_func_kinds(filter, ctx.snapshot);
-        if kinds.has_aggregate {
-            return fail(pgmsg::aggregate_in_filter(span));
-        }
-        if kinds.has_window {
-            return fail(pgmsg::window_in_filter(span));
-        }
+        crate::clause::check_level_calls(filter, ctx, "FILTER", true)?;
     }
 
     if !is_aggregate && !is_window {
@@ -942,18 +940,18 @@ fn check_no_nested_windows(
     Ok(())
 }
 
-/// PG forbids aggregates / window functions nested inside aggregate arguments
-/// (`SUM(COUNT(*))`). Catch it after resolution, using each arg's AST.
-fn check_no_nested_aggregates(
+/// PG forbids window functions inside aggregate arguments
+/// (`sum(row_number() OVER ())`). Catch it after resolution, using each
+/// arg's AST. A nested aggregate (`sum(count(*))`) is a matter of query
+/// levels — in `(SELECT max(sum(t.x) + u.y) FROM u)` the inner `sum` is the
+/// outer query's — which `grouping::finish_select_level` settles, after the
+/// inner call has met its own level's clause rule, as PG checks them.
+fn check_no_windows_in_aggregate(
     func: &protobuf::FuncCall,
     snapshot: &PgCatalog,
 ) -> Result<(), AnalyzeError> {
     for arg in &func.args {
         let kinds = detect_func_kinds(arg, snapshot);
-        // A GROUPING(…) inside an aggregate is an aggregate nesting too.
-        if kinds.has_aggregate || kinds.has_grouping {
-            return Err(crate::pgmsg::nested_aggregate(kinds.aggregate_span()).finalize_implicit());
-        }
         if kinds.has_window {
             return Err(crate::pgmsg::window_in_aggregate(kinds.window_span()).finalize_implicit());
         }

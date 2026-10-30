@@ -493,6 +493,20 @@ pub(crate) fn nested_aggregate(span: Option<SourceSpan>) -> RawError {
     )
 }
 
+/// `outer-level aggregate cannot contain a lower-level variable in its
+/// direct arguments` — SQLSTATE 42803 (`check_agg_arguments`), at the
+/// variable.
+pub(crate) fn outer_aggregate_direct_argument_variable(span: Option<SourceSpan>) -> RawError {
+    RawError::new(
+        AnalyzeError::GroupingError(
+            "outer-level aggregate cannot contain a lower-level variable in its direct arguments"
+                .into(),
+        ),
+        span,
+        None,
+    )
+}
+
 /// `aggregate function calls cannot contain window function calls` —
 /// SQLSTATE 42803, at the window function.
 pub(crate) fn window_in_aggregate(span: Option<SourceSpan>) -> RawError {
@@ -625,6 +639,15 @@ pub(crate) fn unknown_value_not_coercible(target: &str, span: Option<SourceSpan>
                 .into(),
         ),
     )
+}
+
+/// `Aggref found in non-Agg plan node` and its GroupingFunc / WindowFunc
+/// siblings — SQLSTATE XX000, raised by `ExecInitExprRec` when a plan has
+/// no Agg / WindowAgg node to compute the call (a VALUES list sorted by an
+/// aggregate of its own level). `message` is
+/// [`crate::grouping::UnplannedCall::message`].
+pub(crate) fn call_without_plan_node(message: &str, span: Option<SourceSpan>) -> RawError {
+    RawError::new(AnalyzeError::PgInternalError(message.into()), span, None)
 }
 
 /// `VALUES lists must all be the same length` — SQLSTATE 42601
@@ -985,24 +1008,6 @@ pub(crate) fn distinct_aggregate_order_by_not_in_args(span: Option<SourceSpan>) 
             "in an aggregate with DISTINCT, ORDER BY expressions must appear in argument list"
                 .into(),
         ),
-        span,
-        None,
-    )
-}
-
-/// `aggregate functions are not allowed in FILTER` — SQLSTATE 42803.
-pub(crate) fn aggregate_in_filter(span: Option<SourceSpan>) -> RawError {
-    RawError::new(
-        AnalyzeError::GroupingError("aggregate functions are not allowed in FILTER".into()),
-        span,
-        None,
-    )
-}
-
-/// `window functions are not allowed in FILTER` — SQLSTATE 42P20.
-pub(crate) fn window_in_filter(span: Option<SourceSpan>) -> RawError {
-    RawError::new(
-        AnalyzeError::WindowingError("window functions are not allowed in FILTER".into()),
         span,
         None,
     )
@@ -1746,8 +1751,7 @@ mod tests {
                 "0A000",
             ),
             (distinct_aggregate_order_by_not_in_args(None).kind, "42P10"),
-            (aggregate_in_filter(None).kind, "42803"),
-            (window_in_filter(None).kind, "42P20"),
+            (outer_aggregate_direct_argument_variable(None).kind, "42803"),
             (variadic_argument_must_be_array(None).kind, "42804"),
             (polymorphic_type_from_unknown(None), "42804"),
             (polymorphic_args_not_alike("anyelement"), "42804"),
