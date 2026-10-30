@@ -51,6 +51,20 @@ pub(crate) fn drop_target_identity(
                 .flatten()?;
             Some((kind, oid.get()))
         }
+        (ObjectType::ObjectCollation, node::Node::List(list)) => {
+            let names: Vec<&str> = list
+                .items
+                .iter()
+                .filter_map(super::util::node_string)
+                .collect();
+            let (schema, name) = match names.as_slice() {
+                [n] => (None, *n),
+                [s, n] => (Some(*s), *n),
+                _ => return None,
+            };
+            let oid = interp.resolve_collation(schema, name)?.oid;
+            Some((kind, oid.get()))
+        }
         (ObjectType::ObjectOperator, node::Node::ObjectWithArgs(_)) => {
             let oid = super::drop::operator_target(interp, obj_node)?;
             Some((kind, oid.get()))
@@ -113,6 +127,12 @@ impl ObjectAddress {
     pub(crate) fn language(oid: crate::oid::PgLanguageOid) -> Self {
         Self::new(crate::pg_catalog::PG_LANGUAGE_RELID, oid.into_nonzero(), 0)
     }
+    pub(crate) fn collation(oid: crate::oid::PgCollationOid) -> Self {
+        Self::new(crate::pg_catalog::PG_COLLATION_RELID, oid.into_nonzero(), 0)
+    }
+    pub(crate) fn namespace(oid: crate::oid::PgNamespaceOid) -> Self {
+        Self::new(crate::pg_catalog::PG_NAMESPACE_RELID, oid.into_nonzero(), 0)
+    }
 
     /// The address of what [`drop_target_identity`] found for `obj_type`.
     pub(crate) fn of_drop_target(obj_type: ObjectType, oid: u32) -> Option<Self> {
@@ -130,6 +150,7 @@ impl ObjectAddress {
             | ObjectType::ObjectRoutine
             | ObjectType::ObjectAggregate => PG_PROC_RELID,
             ObjectType::ObjectOperator => PG_OPERATOR_RELID,
+            ObjectType::ObjectCollation => crate::pg_catalog::PG_COLLATION_RELID,
             _ => return None,
         };
         Some(Self::new(classid, nz, 0))
@@ -142,8 +163,8 @@ impl ObjectAddress {
 const FIRST_UNPINNED_OBJECT_ID: u32 = 12000;
 
 /// `recordDependencyOn` for each of `referenced` (deduplicated, like
-/// `record_object_address_dependencies`), skipping built-in objects and
-/// the depender itself.
+/// `record_object_address_dependencies`), skipping pinned objects and the
+/// depender itself.
 pub(crate) fn record(
     interp: &mut PgCatalog,
     depender: ObjectAddress,
@@ -152,7 +173,7 @@ pub(crate) fn record(
 ) {
     let mut refs: Vec<ObjectAddress> = referenced
         .into_iter()
-        .filter(|r| r.objid.get() >= FIRST_UNPINNED_OBJECT_ID)
+        .filter(|r| !is_pinned(*r))
         .filter(|r| (r.classid, r.objid) != (depender.classid, depender.objid))
         .collect();
     refs.sort();
@@ -207,6 +228,11 @@ fn push(reference: Reference) {
             refs.push(reference);
         }
     });
+}
+
+/// Whether a [`collect`] is active (references are being recorded).
+pub(crate) fn collecting() -> bool {
+    COLLECTOR.with(|c| c.borrow().is_some())
 }
 
 /// The analyzer resolved a reference to `addr` (a function, operator,
@@ -614,6 +640,11 @@ fn exists(interp: &PgCatalog, addr: ObjectAddress) -> bool {
         c if c == PG_TYPE_RELID => {
             PgTypeOid::new(oid).is_some_and(|o| interp.pg_type.contains_key(&o))
         }
+        c if c == crate::pg_catalog::PG_COLLATION_RELID => crate::oid::PgCollationOid::new(oid)
+            .is_some_and(|o| interp.pg_collation.contains_key(&o)),
+        c if c == crate::pg_catalog::PG_NAMESPACE_RELID => {
+            crate::oid::PgNamespaceOid::new(oid).is_some_and(|o| interp.namespace_name(o).is_some())
+        }
         c if c == PG_CLASS_RELID => PgClassOid::new(oid).is_some_and(|relid| {
             interp.pg_class.contains_key(&relid)
                 && (addr.objsubid == 0
@@ -746,6 +777,31 @@ pub(crate) fn describe(interp: &PgCatalog, addr: ObjectAddress) -> String {
             Some(t) => format!("type {}", type_name(t)),
             None => "type".into(),
         },
+        c if c == crate::pg_catalog::PG_COLLATION_RELID => {
+            let Some(coll) =
+                crate::oid::PgCollationOid::new(oid).and_then(|o| interp.pg_collation.get(&o))
+            else {
+                return "collation".into();
+            };
+            // CollationIsVisible: the first collation of its name along
+            // the search path.
+            let visible = interp
+                .resolve_collation(None, &coll.collname)
+                .map(|c| c.oid)
+                == Some(coll.oid);
+            format!(
+                "collation {}",
+                qualify_unless_visible(interp, coll.collnamespace, &coll.collname, visible)
+            )
+        }
+        // getObjectDescription: `schema %s`, the name neither qualified
+        // nor quoted.
+        c if c == crate::pg_catalog::PG_NAMESPACE_RELID => {
+            match crate::oid::PgNamespaceOid::new(oid).and_then(|o| interp.namespace_name(o)) {
+                Some(name) => format!("schema {name}"),
+                None => "schema".into(),
+            }
+        }
         c if c == PG_CLASS_RELID => {
             let Some(relid) = PgClassOid::new(oid) else {
                 return "relation".into();
@@ -947,6 +1003,7 @@ fn dependents_of(interp: &mut PgCatalog, target: ObjectAddress) -> Vec<(ObjectAd
             )
         })
         .filter(|(dep, _)| (dep.classid, dep.objid) != (target.classid, target.objid))
+        .chain(implicit_array(interp, target).map(|a| (a, DepType::Internal)))
         .collect();
     let mut live = Vec::new();
     for (dep, deptype) in rows {
@@ -1041,6 +1098,10 @@ fn find_blocker(
         at += 1;
         let dependents: Vec<(ObjectAddress, DepType)> = dependents_of(interp, from)
             .into_iter()
+            // A relation's row type is part of it: what depends on the
+            // type depends on the relation (it goes when the relation's
+            // pg_type row does, see drop_relation_by_oid).
+            .chain(row_type_of(interp, from).map(|t| (t, DepType::Internal)))
             .filter(|(d, _)| !in_progress(*d))
             .collect();
         for (d, deptype) in dependents {
@@ -1157,6 +1218,40 @@ fn implied_owner(interp: &PgCatalog, target: ObjectAddress) -> Option<ObjectAddr
     (interp.pg_type.get(&elem)?.typarray == Some(typ.oid)).then(|| ObjectAddress::type_(elem))
 }
 
+/// Drop `addr` as a dependent of something a DROP ... CASCADE removes,
+/// with what depends on it in turn.
+pub(crate) fn cascade_delete(
+    interp: &mut PgCatalog,
+    addr: ObjectAddress,
+) -> Result<(), super::DdlError> {
+    delete_object(interp, addr)
+}
+
+/// The row type of relation `target`, unless it is a standalone composite
+/// type (whose relation is part of the type instead).
+fn row_type_of(interp: &PgCatalog, target: ObjectAddress) -> Option<ObjectAddress> {
+    if target.classid != PG_CLASS_RELID || target.objsubid != 0 {
+        return None;
+    }
+    let class = interp.pg_class.get(&PgClassOid::new(target.objid.get())?)?;
+    if class.relkind == RelKind::CompositeType {
+        return None;
+    }
+    class.reltype.map(ObjectAddress::type_)
+}
+
+/// The implicit array type of type `target` — part of it
+/// (GenerateTypeDependencies' DEPENDENCY_INTERNAL), which the analyzer
+/// reads off `pg_type` rather than `pg_depend` (see [`implied_owner`]).
+fn implicit_array(interp: &PgCatalog, target: ObjectAddress) -> Option<ObjectAddress> {
+    if target.classid != PG_TYPE_RELID || target.objsubid != 0 {
+        return None;
+    }
+    let elem = PgTypeOid::new(target.objid.get())?;
+    let array = interp.pg_type.get(&elem)?.typarray?;
+    (interp.pg_type.get(&array)?.typelem == Some(elem)).then(|| ObjectAddress::type_(array))
+}
+
 /// Drop one dependent object in a cascade (`deleteOneObject`), after what
 /// depends on it in turn.
 fn delete_object(interp: &mut PgCatalog, addr: ObjectAddress) -> Result<(), super::DdlError> {
@@ -1193,6 +1288,11 @@ fn delete_object_now(interp: &mut PgCatalog, addr: ObjectAddress) -> Result<(), 
         c if c == PG_TYPE_RELID => {
             if let Some(t) = PgTypeOid::new(oid) {
                 super::drop::drop_type_cascade(interp, t);
+            }
+        }
+        c if c == crate::pg_catalog::PG_COLLATION_RELID => {
+            if let Some(coll) = crate::oid::PgCollationOid::new(oid) {
+                super::collations::drop_collation_oid(interp, coll, true)?;
             }
         }
         c if c == PG_CLASS_RELID => {

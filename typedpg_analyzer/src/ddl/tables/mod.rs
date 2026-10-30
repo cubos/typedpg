@@ -1655,6 +1655,6 @@ pub(crate) mod partidx;
 pub(crate) mod typed;
 
 use columns::*;
-pub(crate) use columns::{column_collation, type_collation};
+pub(crate) use columns::{column_collation, drop_column, type_collation};
 pub(crate) use constraints::check_unique_covers_partition_key;
 use constraints::*;

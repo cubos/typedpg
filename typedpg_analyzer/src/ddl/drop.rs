@@ -125,6 +125,9 @@ fn drop_each(
             ObjectType::ObjectCast => {
                 drop_cast(interp, obj_node, stmt.missing_ok, cascade)?;
             }
+            ObjectType::ObjectCollation => {
+                super::collations::drop_collation(interp, obj_node, stmt.missing_ok, cascade)?;
+            }
             ObjectType::ObjectOperator => {
                 drop_operator(interp, obj_node, stmt.missing_ok, cascade)?;
             }
@@ -645,6 +648,13 @@ fn defaults_using_sequence(interp: &PgCatalog, seq: PgClassOid) -> Vec<(PgClassO
 /// the array wrapping the composite. Mirrors what `DROP TABLE` /
 /// `DROP VIEW` does in PG.
 pub(crate) fn drop_relation_by_oid(interp: &mut PgCatalog, class_oid: PgClassOid) {
+    // What depends on its row type (or the array over it) goes too: the
+    // type is part of the relation.
+    if let Some(row_type) = interp.pg_class.get(&class_oid).and_then(|c| c.reltype) {
+        let addr = super::depend::ObjectAddress::type_(row_type);
+        let desc = super::depend::describe(interp, addr);
+        let _ = super::depend::drop_dependents(interp, addr, &desc, true);
+    }
     // Sequences the relation owns (serial / identity / OWNED BY) go with it.
     let owned = super::sequences::owned_sequences(interp, class_oid, None);
     let Some(class) = interp.remove_pg_class(class_oid) else {
@@ -1597,26 +1607,74 @@ fn drop_schema(
         )));
     }
 
+    // Everything in the schema depends on it (DEPENDENCY_NORMAL): without
+    // CASCADE any of it blocks the DROP.
     let has_objects = interp.pg_class.values().any(|c| c.relnamespace == nsoid)
         || interp.pg_type.values().any(|t| t.typnamespace == nsoid)
-        || interp.pg_proc.values().any(|p| p.pronamespace == nsoid);
+        || interp.pg_proc.values().any(|p| p.pronamespace == nsoid)
+        || interp.pg_operator.values().any(|o| o.oprnamespace == nsoid)
+        || interp
+            .pg_collation
+            .values()
+            .any(|c| c.collnamespace == nsoid)
+        || interp.pg_ts_objects.iter().any(|o| o.namespace == nsoid)
+        || interp.pg_opclass.iter().any(|c| c.opcnamespace == nsoid)
+        || interp.pg_opfamily.iter().any(|f| f.opfnamespace == nsoid)
+        || interp.conversions.iter().any(|(_, ns)| *ns == nsoid)
+        || interp.statistics.iter().any(|s| s.namespace == nsoid);
 
     if has_objects && !cascade {
         return Err(DdlError::DependencyError(format!(
             "cannot drop schema {name} because other objects depend on it"
         )));
     }
+    // Objects outside it that refer to it (a `regnamespace` constant) need
+    // CASCADE too — checked before anything goes.
+    let ns_addr = super::depend::ObjectAddress::namespace(nsoid);
+    let ns_desc = super::depend::describe(interp, ns_addr);
+    if !cascade {
+        super::depend::drop_dependents(interp, ns_addr, &ns_desc, false)?;
+    }
 
-    // CASCADE: gather everything in this schema.
-    let class_oids: Vec<PgClassOid> = interp
+    // CASCADE: everything in this schema goes, with what depends on it
+    // wherever it is (findDependentObjects from the schema).
+    let mut class_oids: Vec<PgClassOid> = interp
         .pg_class
         .values()
         .filter(|c| c.relnamespace == nsoid)
         .map(|c| c.oid)
         .collect();
-    views::drop_views(interp, &class_oids);
-    for class_oid in class_oids {
-        if interp.pg_class.contains_key(&class_oid) {
+    class_oids.sort();
+    for &class_oid in &class_oids {
+        let Some(relkind) = interp.pg_class.get(&class_oid).map(|c| c.relkind) else {
+            continue;
+        };
+        let kind = match relkind {
+            // An index goes with its table, a composite type's relation
+            // with its type.
+            RelKind::Index | RelKind::PartitionedIndex | RelKind::CompositeType => continue,
+            RelKind::View => "view",
+            RelKind::MaterializedView => "materialized view",
+            RelKind::Sequence => "sequence",
+            RelKind::ForeignTable => "foreign table",
+            _ => "table",
+        };
+        // A relation that is part of another object (an identity column's
+        // sequence) goes with it.
+        let addr = super::depend::ObjectAddress::relation(class_oid);
+        if super::depend::check_not_owned(interp, addr, "").is_err() {
+            continue;
+        }
+        drop_relation_oid(interp, class_oid, kind, true, &class_oids, None)?;
+    }
+    // What is left belonged to something else in the schema (an identity
+    // column's sequence, an index of a table) or to an extension.
+    for &class_oid in &class_oids {
+        if interp
+            .pg_class
+            .get(&class_oid)
+            .is_some_and(|c| c.relkind != RelKind::CompositeType)
+        {
             drop_relation_by_oid(interp, class_oid);
         }
     }
@@ -1642,10 +1700,10 @@ fn drop_schema(
         .map(|p| p.oid)
         .collect();
     for proc_oid in proc_oids {
-        interp.remove_pg_proc(proc_oid);
-        let obj = crate::oid::PgGenericOid::from_nonzero(proc_oid.into_nonzero());
-        interp.remove_dependencies_of(PG_PROC_RELID, obj);
-        interp.remove_dependencies_on(PG_PROC_RELID, obj);
+        let addr = super::depend::ObjectAddress::proc(proc_oid);
+        if super::depend::object_exists(interp, addr) {
+            super::depend::cascade_delete(interp, addr)?;
+        }
     }
 
     let op_oids: Vec<PgOperatorOid> = interp
@@ -1655,10 +1713,68 @@ fn drop_schema(
         .map(|o| o.oid)
         .collect();
     for op_oid in op_oids {
-        super::operators::remove_operator(interp, op_oid);
-        let obj = crate::oid::PgGenericOid::from_nonzero(op_oid.into_nonzero());
-        interp.remove_dependencies_of(PG_OPERATOR_RELID, obj);
+        let addr = super::depend::ObjectAddress::operator(op_oid);
+        if super::depend::object_exists(interp, addr) {
+            super::depend::cascade_delete(interp, addr)?;
+        }
     }
+
+    let collation_oids: Vec<crate::oid::PgCollationOid> = interp
+        .pg_collation
+        .values()
+        .filter(|c| c.collnamespace == nsoid)
+        .map(|c| c.oid)
+        .collect();
+    for collation in collation_oids {
+        super::collations::drop_collation_oid(interp, collation, true)?;
+    }
+
+    // Operator classes and families, text search objects: what depends on
+    // them goes too.
+    let named: Vec<super::depend::ObjectAddress> = interp
+        .pg_opclass
+        .iter()
+        .filter(|c| c.opcnamespace == nsoid)
+        .map(|c| super::depend::NamedObject::Opclass {
+            name: c.opcname.clone(),
+            namespace: c.opcnamespace,
+            method: c.opcmethod.clone(),
+        })
+        .chain(
+            interp
+                .pg_opfamily
+                .iter()
+                .filter(|f| f.opfnamespace == nsoid)
+                .map(|f| super::depend::NamedObject::Opfamily {
+                    name: f.opfname.clone(),
+                    namespace: f.opfnamespace,
+                    method: f.opfmethod.clone(),
+                }),
+        )
+        .chain(
+            interp
+                .pg_ts_objects
+                .iter()
+                .filter(|o| o.namespace == nsoid && (o.kind == "c" || o.kind == "d"))
+                .map(|o| super::depend::NamedObject::TsObject {
+                    kind: o.kind.clone(),
+                    name: o.name.clone(),
+                    namespace: o.namespace,
+                }),
+        )
+        .filter_map(|o| super::depend::named_address_of(interp, &o))
+        .collect();
+    for addr in named {
+        if super::depend::object_exists(interp, addr) {
+            super::depend::cascade_delete(interp, addr)?;
+        }
+    }
+    interp.pg_ts_objects.retain(|o| o.namespace != nsoid);
+    interp.conversions.retain(|(_, ns)| *ns != nsoid);
+    interp.statistics.retain(|s| s.namespace != nsoid);
+
+    // What refers to the schema itself.
+    super::depend::drop_dependents(interp, ns_addr, &ns_desc, true)?;
 
     interp.search_path.retain(|&s| s != nsoid);
     interp.remove_pg_namespace(nsoid);

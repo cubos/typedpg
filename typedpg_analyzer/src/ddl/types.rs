@@ -862,6 +862,7 @@ pub fn create_range(interp: &mut PgCatalog, stmt: &CreateRangeStmt) -> Result<()
         .pg_type
         .get(&subtype_oid)
         .is_some_and(|t| t.typcollation.is_some());
+    // DefineRange: the collation given, else the subtype's.
     let mut collation = interp
         .pg_type
         .get(&subtype_oid)
@@ -1006,6 +1007,13 @@ pub fn create_range(interp: &mut PgCatalog, stmt: &CreateRangeStmt) -> Result<()
         super::depend::ObjectAddress::type_(mr_oid),
         [super::depend::ObjectAddress::type_(oid)],
         crate::pg_catalog::DepType::Internal,
+    );
+    // RangeCreate: the range type depends on its collation.
+    super::depend::record(
+        interp,
+        super::depend::ObjectAddress::type_(oid),
+        collation.map(super::depend::ObjectAddress::collation),
+        crate::pg_catalog::DepType::Normal,
     );
     interp.insert_pg_range(PgRange {
         rngtypid: oid,

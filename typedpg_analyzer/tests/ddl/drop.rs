@@ -1336,3 +1336,411 @@ fn a_stored_insert_on_conflict_depends_on_what_it_infers() {
         build(&[("0001.sql", &setup), ("0002.sql", stmt)]);
     }
 }
+
+// ── DROP SCHEMA: what depends on its objects, and on it ────────────────────
+
+/// `sql` applied to a fresh catalog; `query` must then fail with `message`.
+fn assert_gone(sql: &str, query: &str, message: &str) {
+    let db = build_db(&[("0001.sql", sql)]);
+    let err = db.analyze(query).unwrap_err();
+    assert!(err.to_string().starts_with(message), "{query}: {err}");
+}
+
+#[test]
+fn drop_schema_cascade_takes_what_uses_its_types() {
+    // The row type of a composite type or of a table in the schema goes
+    // with it, and so does what uses that type elsewhere.
+    assert_gone(
+        "CREATE SCHEMA s;
+         CREATE TYPE s.ty AS (a int);
+         CREATE VIEW v5 AS SELECT NULL::s.ty AS p;
+         DROP SCHEMA s CASCADE;",
+        "SELECT * FROM v5",
+        "relation \"v5\" does not exist",
+    );
+    assert_gone(
+        "CREATE SCHEMA s;
+         CREATE TABLE s.tb (a int);
+         CREATE VIEW v5 AS SELECT NULL::s.tb AS p;
+         DROP SCHEMA s CASCADE;",
+        "SELECT * FROM v5",
+        "relation \"v5\" does not exist",
+    );
+    assert_gone(
+        "CREATE SCHEMA s;
+         CREATE TABLE s.tb (a int);
+         CREATE FUNCTION f(s.tb) RETURNS int LANGUAGE sql AS 'SELECT 1';
+         DROP SCHEMA s CASCADE;",
+        "SELECT f(NULL)",
+        "function f(unknown) does not exist",
+    );
+    assert_gone(
+        "CREATE SCHEMA s;
+         CREATE TABLE s.tb (a int);
+         CREATE FUNCTION g() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT (NULL::s.tb).a; END;
+         DROP SCHEMA s CASCADE;",
+        "SELECT g()",
+        "function g() does not exist",
+    );
+    // A column of the type in another schema's table goes; the table stays.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE SCHEMA s;
+         CREATE TABLE s.tb (a int);
+         CREATE TABLE t2 (x s.tb, y int);
+         DROP SCHEMA s CASCADE;",
+    )]);
+    let q = db.analyze("SELECT * FROM t2").unwrap();
+    assert_eq!(q.columns.len(), 1);
+    // A table's row type pins it like the table itself.
+    assert_ddl_rejections(&[
+        (
+            "CREATE TABLE tb (a int);
+             CREATE FUNCTION g() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT (NULL::tb).a; END;",
+            "DROP TABLE tb;",
+            "cannot drop table tb because other objects depend on it",
+        ),
+        (
+            "CREATE TABLE tb (a int);
+             CREATE TABLE t2 (b int DEFAULT (NULL::tb).a);",
+            "DROP TABLE tb;",
+            "cannot drop table tb because other objects depend on it",
+        ),
+    ]);
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE tb (a int);
+         CREATE TABLE t2 (b int DEFAULT (NULL::tb).a);
+         DROP TABLE tb CASCADE;
+         INSERT INTO t2 DEFAULT VALUES;",
+    )]);
+    assert!(db.resolve_table(None, "tb").is_none());
+}
+
+#[test]
+fn drop_schema_honours_what_refers_to_it() {
+    // A stored `regnamespace` constant depends on its schema.
+    assert_ddl_rejections(&[
+        (
+            "CREATE SCHEMA s;
+             CREATE VIEW v6 AS SELECT 's'::regnamespace AS p;",
+            "DROP SCHEMA s;",
+            "cannot drop schema s because other objects depend on it",
+        ),
+        (
+            "CREATE SCHEMA s;
+             CREATE TABLE t (a int DEFAULT ('s'::regnamespace)::oid::int);",
+            "DROP SCHEMA s RESTRICT;",
+            "cannot drop schema s because other objects depend on it",
+        ),
+        // `public` isn't pinned: the dependency is recorded.
+        (
+            "CREATE VIEW v6 AS SELECT 'public'::regnamespace AS p;",
+            "DROP SCHEMA public;",
+            "cannot drop schema public because other objects depend on it",
+        ),
+        // So does everything in the schema.
+        (
+            "CREATE SCHEMA s; CREATE COLLATION s.co (locale = 'C');",
+            "DROP SCHEMA s;",
+            "cannot drop schema s because other objects depend on it",
+        ),
+        (
+            "CREATE SCHEMA s; CREATE TEXT SEARCH CONFIGURATION s.c (COPY = simple);",
+            "DROP SCHEMA s;",
+            "cannot drop schema s because other objects depend on it",
+        ),
+        (
+            "CREATE SCHEMA s;
+             CREATE FUNCTION f(int) RETURNS int LANGUAGE sql AS 'SELECT 1';
+             CREATE OPERATOR s.### (rightarg = int, function = f);",
+            "DROP SCHEMA s;",
+            "cannot drop schema s because other objects depend on it",
+        ),
+    ]);
+    assert_gone(
+        "CREATE SCHEMA s;
+         CREATE VIEW v6 AS SELECT 's'::regnamespace AS p;
+         DROP SCHEMA s CASCADE;",
+        "SELECT * FROM v6",
+        "relation \"v6\" does not exist",
+    );
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE SCHEMA s;
+         CREATE TABLE t (a int DEFAULT ('s'::regnamespace)::oid::int);
+         DROP SCHEMA s CASCADE;
+         INSERT INTO t DEFAULT VALUES;",
+    )]);
+    assert!(db.resolve_table(None, "t").is_some());
+    // Cast from text, the name is looked up when the view runs: no
+    // dependency.
+    build(&[(
+        "0001.sql",
+        "CREATE SCHEMA s;
+         CREATE VIEW v6 AS SELECT 's'::text::regnamespace AS p;
+         DROP SCHEMA s;",
+    )]);
+    // An operator of the schema goes with it.
+    assert_gone(
+        "CREATE SCHEMA s;
+         CREATE FUNCTION f(int) RETURNS int LANGUAGE sql AS 'SELECT 1';
+         CREATE OPERATOR s.### (rightarg = int, function = f);
+         DROP SCHEMA s CASCADE;",
+        "SELECT OPERATOR(s.###) 1",
+        "schema \"s\" does not exist",
+    );
+}
+
+// ── DROP COLLATION ─────────────────────────────────────────────────────────
+
+#[test]
+fn drop_collation_honours_what_uses_it() {
+    let blocked = "cannot drop collation co because other objects depend on it";
+    let co = "CREATE COLLATION co (locale = 'C');";
+    let cases: Vec<(String, &str, &str)> = vec![
+        (
+            format!("{co} CREATE TABLE t (a text COLLATE co);"),
+            "DROP COLLATION co;",
+            blocked,
+        ),
+        (
+            format!("{co} CREATE TYPE ct AS (a text COLLATE co, b int);"),
+            "DROP COLLATION co;",
+            blocked,
+        ),
+        (
+            format!("{co} CREATE VIEW v AS SELECT 'a'::text COLLATE co AS x;"),
+            "DROP COLLATION co;",
+            blocked,
+        ),
+        (
+            format!("{co} CREATE VIEW v AS SELECT 'co'::regcollation AS x;"),
+            "DROP COLLATION co RESTRICT;",
+            blocked,
+        ),
+        (
+            format!("{co} CREATE DOMAIN d AS text COLLATE co;"),
+            "DROP COLLATION co;",
+            blocked,
+        ),
+        (
+            format!("{co} CREATE TABLE t (a text); CREATE INDEX i ON t (a COLLATE co);"),
+            "DROP COLLATION co;",
+            blocked,
+        ),
+        (
+            format!("{co} CREATE TYPE r AS RANGE (subtype = text, collation = co);"),
+            "DROP COLLATION co;",
+            blocked,
+        ),
+        (
+            format!("{co} CREATE TABLE t (a text CHECK (a > 'x' COLLATE co));"),
+            "DROP COLLATION co;",
+            blocked,
+        ),
+        (
+            format!(
+                "{co} CREATE FUNCTION f() RETURNS text LANGUAGE sql
+                     BEGIN ATOMIC SELECT 'a' COLLATE co; END;"
+            ),
+            "DROP COLLATION co;",
+            blocked,
+        ),
+        (
+            "CREATE SCHEMA s; CREATE COLLATION s.co (locale = 'C');
+             CREATE TABLE t (a text COLLATE s.co);"
+                .into(),
+            "DROP COLLATION s.co;",
+            "cannot drop collation s.co because other objects depend on it",
+        ),
+        (
+            "CREATE SCHEMA s; CREATE COLLATION s.co (locale = 'C');
+             CREATE TABLE t (a text COLLATE s.co);"
+                .into(),
+            "DROP SCHEMA s;",
+            "cannot drop schema s because other objects depend on it",
+        ),
+        (
+            "".into(),
+            "DROP COLLATION nope;",
+            "collation \"nope\" for encoding \"UTF8\" does not exist",
+        ),
+        (
+            "".into(),
+            "DROP COLLATION s.nope;",
+            "schema \"s\" does not exist",
+        ),
+        (
+            "".into(),
+            "DROP COLLATION \"C\";",
+            "cannot drop collation \"C\" because it is required by the database system",
+        ),
+    ];
+    for (setup, stmt, msg) in &cases {
+        assert_ddl_rejections(&[(setup, stmt, msg)]);
+    }
+
+    // Without dependents, or with CASCADE, it goes — with them.
+    build(&[(
+        "0001.sql",
+        "CREATE COLLATION co (locale = 'C');
+         CREATE VIEW v AS SELECT 'co'::text::regcollation AS x;
+         DROP COLLATION co;
+         DROP COLLATION IF EXISTS co;
+         DROP COLLATION IF EXISTS s.nope;
+         CREATE COLLATION co (locale = 'C');",
+    )]);
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE COLLATION co (locale = 'C');
+         CREATE TABLE t (a text COLLATE co, b int);
+         CREATE VIEW v AS SELECT a FROM t;
+         CREATE INDEX ON t (a);
+         CREATE TABLE pa (a text COLLATE co, c int);
+         CREATE TABLE ch (b int) INHERITS (pa);
+         CREATE TYPE ct AS (a text COLLATE co, b int);
+         CREATE DOMAIN d AS text COLLATE co;
+         CREATE TABLE td (x d, y int);
+         CREATE TABLE ti (a text, b int);
+         CREATE INDEX i ON ti (a COLLATE co);
+         CREATE TYPE r AS RANGE (subtype = text, collation = co);
+         CREATE TABLE p (a text COLLATE co, b int) PARTITION BY LIST (a);
+         CREATE TABLE p1 PARTITION OF p FOR VALUES IN ('x');
+         CREATE TABLE q (a text COLLATE co, b int) PARTITION BY LIST (b);
+         CREATE TABLE q1 PARTITION OF q FOR VALUES IN (1);
+         CREATE VIEW vc AS SELECT 'a'::text COLLATE co AS x;
+         DROP COLLATION co CASCADE;",
+    )]);
+    for (query, columns) in [
+        ("SELECT * FROM t", 1),
+        ("SELECT * FROM pa", 1),
+        ("SELECT * FROM ch", 2),
+        ("SELECT (NULL::ct).*", 1),
+        ("SELECT * FROM td", 1),
+        ("SELECT * FROM ti", 2),
+        ("SELECT * FROM q", 1),
+        ("SELECT * FROM q1", 1),
+    ] {
+        let q = db.analyze(query).unwrap();
+        assert_eq!(q.columns.len(), columns, "{query}");
+    }
+    for (query, message) in [
+        ("SELECT * FROM v", "relation \"v\" does not exist"),
+        ("SELECT * FROM vc", "relation \"vc\" does not exist"),
+        ("SELECT * FROM p", "relation \"p\" does not exist"),
+        ("SELECT * FROM p1", "relation \"p1\" does not exist"),
+        ("SELECT NULL::d", "type \"d\" does not exist"),
+        ("SELECT NULL::r", "type \"r\" does not exist"),
+        (
+            "SELECT 'a' COLLATE co",
+            "collation \"co\" for encoding \"UTF8\" does not exist",
+        ),
+    ] {
+        let err = db.analyze(query).unwrap_err();
+        assert!(err.to_string().starts_with(message), "{query}: {err}");
+    }
+    assert!(db.resolve_table(None, "i").is_none());
+
+    // DROP SCHEMA ... CASCADE takes its collation, and what uses it.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE SCHEMA s;
+         CREATE COLLATION s.co (locale = 'C');
+         CREATE TABLE t (a text COLLATE s.co, b int);
+         CREATE VIEW v AS SELECT 'a'::text COLLATE s.co AS x;
+         DROP SCHEMA s CASCADE;",
+    )]);
+    assert_eq!(db.analyze("SELECT * FROM t").unwrap().columns.len(), 1);
+    assert!(db.resolve_table(None, "v").is_none());
+}
+
+#[test]
+fn a_stored_reg_constant_pins_what_it_names() {
+    // find_expr_references_walker: a regproc / regprocedure / regoper /
+    // regoperator / regtype / regclass constant depends on its object.
+    let f = "CREATE FUNCTION f(int) RETURNS int LANGUAGE sql AS 'SELECT 1';";
+    let op = "CREATE FUNCTION f2(int, int) RETURNS int LANGUAGE sql AS 'SELECT 1';
+              CREATE OPERATOR ### (leftarg = int, rightarg = int, function = f2);";
+    let cases: Vec<(String, &str, &str)> = vec![
+        (
+            format!("{f} CREATE VIEW v AS SELECT 'f'::regproc AS p;"),
+            "DROP FUNCTION f(int);",
+            "cannot drop function f(integer) because other objects depend on it",
+        ),
+        (
+            format!("{f} CREATE VIEW v AS SELECT 'f(int)'::regprocedure AS p;"),
+            "DROP FUNCTION f(int);",
+            "cannot drop function f(integer) because other objects depend on it",
+        ),
+        (
+            format!("{op} CREATE VIEW v AS SELECT '###'::regoper AS p;"),
+            "DROP OPERATOR ###(int, int);",
+            "cannot drop operator ###(integer,integer) because other objects depend on it",
+        ),
+        (
+            format!("{op} CREATE VIEW v AS SELECT '###(int,int)'::regoperator AS p;"),
+            "DROP OPERATOR ###(int, int);",
+            "cannot drop operator ###(integer,integer) because other objects depend on it",
+        ),
+        (
+            "CREATE TYPE ty AS (a int); CREATE VIEW v AS SELECT 'ty'::regtype AS p;".into(),
+            "DROP TYPE ty;",
+            "cannot drop type ty because other objects depend on it",
+        ),
+        // On the array type, which is part of its element type.
+        (
+            "CREATE TYPE ty AS (a int); CREATE VIEW v AS SELECT 'ty[]'::regtype AS p;".into(),
+            "DROP TYPE ty;",
+            "cannot drop type ty because other objects depend on it",
+        ),
+        (
+            "CREATE TABLE tt (a int); CREATE VIEW v AS SELECT '_tt'::regtype AS p;".into(),
+            "DROP TABLE tt;",
+            "cannot drop table tt because other objects depend on it",
+        ),
+    ];
+    for (setup, stmt, msg) in &cases {
+        assert_ddl_rejections(&[(setup, stmt, msg)]);
+    }
+    // With CASCADE the view goes; a name cast from text is looked up when
+    // the view runs and pins nothing.
+    for (setup, stmt) in [
+        (
+            format!("{f} CREATE VIEW v AS SELECT 'f(int)'::regprocedure AS p;"),
+            "DROP FUNCTION f(int) CASCADE;",
+        ),
+        (
+            format!("{op} CREATE VIEW v AS SELECT '###(int,int)'::regoperator AS p;"),
+            "DROP OPERATOR ###(int, int) CASCADE;",
+        ),
+        (
+            "CREATE TYPE ty AS (a int); CREATE VIEW v AS SELECT 'ty[]'::regtype AS p;".into(),
+            "DROP TYPE ty CASCADE;",
+        ),
+        (
+            format!(
+                "{f} CREATE VIEW w AS SELECT 'f'::text::regproc AS p; CREATE VIEW v AS SELECT 1 AS p;"
+            ),
+            "DROP FUNCTION f(int); DROP VIEW v;",
+        ),
+    ] {
+        assert_gone(
+            &format!("{setup} {stmt}"),
+            "SELECT * FROM v",
+            "relation \"v\" does not exist",
+        );
+    }
+}
+
+#[test]
+fn what_a_table_owns_may_use_its_row_type() {
+    // A table's own CHECK constraint and policy go with it, whatever they
+    // refer to of it — its row type included.
+    build(&[(
+        "0001.sql",
+        "CREATE TABLE tb (a int CHECK (ROW(a)::tb IS NOT NULL));
+         CREATE POLICY p ON tb USING ((NULL::tb).a IS NULL);
+         DROP TABLE tb;",
+    )]);
+}
