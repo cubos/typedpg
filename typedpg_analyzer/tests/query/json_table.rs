@@ -56,6 +56,50 @@ fn json_table_columns_and_types() {
     assert_cols(&s, vec![cn("v", int4())]);
 }
 
+/// A COLUMNS list's own columns come first, then each NESTED PATH's, in
+/// turn and recursively — wherever the NESTED PATH is written
+/// (transformJsonTableColumns).
+#[test]
+fn json_table_parent_columns_come_before_nested_ones() {
+    let db = setup();
+    let names = |sql: &str| -> Vec<String> {
+        db.analyze(sql)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+            .columns
+            .into_iter()
+            .map(|c| c.name)
+            .collect()
+    };
+    assert_eq!(
+        names(
+            "SELECT * FROM JSON_TABLE(jsonb '{}', '$' COLUMNS (
+                 NESTED PATH '$.a' COLUMNS (c int PATH '$'),
+                 xx1 int PATH '$.c'))"
+        ),
+        ["xx1", "c"]
+    );
+    assert_eq!(
+        names(
+            "SELECT * FROM JSON_TABLE(jsonb '{}', '$' COLUMNS (
+                 NESTED PATH '$.a' COLUMNS (
+                     c int PATH '$', NESTED PATH '$.b' COLUMNS (d int), e int),
+                 xx1 int PATH '$.c',
+                 NESTED PATH '$.z' COLUMNS (z int),
+                 yy int))"
+        ),
+        ["xx1", "yy", "c", "e", "d", "z"]
+    );
+    // The column alias list follows that order.
+    assert_eq!(
+        names(
+            "SELECT * FROM JSON_TABLE(jsonb '{}', '$' COLUMNS (
+                 NESTED PATH '$.a' COLUMNS (c int PATH '$'),
+                 xx1 int PATH '$.c')) jt (p, q)"
+        ),
+        ["p", "q"]
+    );
+}
+
 /// PG 18 types an untyped context-item or PASSING parameter as text.
 #[test]
 fn json_table_parameters() {
@@ -114,6 +158,138 @@ fn json_table_errors() {
         let err = db.analyze(sql).unwrap_err();
         assert!(err.to_string().starts_with(msg), "{sql}: {err}");
     }
+}
+
+/// A JSON_TABLE's own ON ERROR is only ERROR or EMPTY [ARRAY]; a column's
+/// ON EMPTY / ON ERROR are those of what it runs as: JSON_EXISTS for an
+/// EXISTS column, JSON_QUERY for a FORMAT JSON column or a regular one with
+/// a wrapper / quotes clause or of a json, array or composite type,
+/// JSON_VALUE otherwise. The messages name the column.
+#[test]
+fn json_table_rejects_invalid_behaviors() {
+    let db = setup();
+    for (sql, msg) in [
+        (
+            "SELECT * FROM JSON_TABLE(jsonb '1', '$' COLUMNS (a int) NULL ON ERROR)",
+            "invalid ON ERROR behavior",
+        ),
+        (
+            "SELECT * FROM JSON_TABLE('[]', 'strict $.a' COLUMNS (js2 int PATH '$') DEFAULT 1 ON ERROR)",
+            "invalid ON ERROR behavior",
+        ),
+        (
+            "SELECT * FROM JSON_TABLE(jsonb '1', '$' COLUMNS (a int) EMPTY OBJECT ON ERROR)",
+            "invalid ON ERROR behavior",
+        ),
+        (
+            "SELECT * FROM JSON_TABLE(jsonb '1', '$' COLUMNS (a int true on empty))",
+            r#"invalid ON EMPTY behavior for column "a""#,
+        ),
+        (
+            "SELECT * FROM JSON_TABLE(jsonb '1', '$' COLUMNS (a int PATH '$' EMPTY ON ERROR))",
+            r#"invalid ON ERROR behavior for column "a""#,
+        ),
+        (
+            "SELECT * FROM JSON_TABLE(jsonb '1', '$' COLUMNS (a int omit quotes true on error))",
+            r#"invalid ON ERROR behavior for column "a""#,
+        ),
+        (
+            "SELECT * FROM JSON_TABLE(jsonb '1', '$' COLUMNS (a int FORMAT JSON TRUE ON ERROR))",
+            r#"invalid ON ERROR behavior for column "a""#,
+        ),
+        (
+            "SELECT * FROM JSON_TABLE(jsonb '1', '$' COLUMNS (a int exists empty object on error))",
+            r#"invalid ON ERROR behavior for column "a""#,
+        ),
+        (
+            "SELECT * FROM JSON_TABLE(jsonb '1', '$' COLUMNS (\
+             NESTED PATH '$' COLUMNS (\"B c\" int NULL ON EMPTY TRUE ON ERROR)))",
+            r#"invalid ON ERROR behavior for column "B c""#,
+        ),
+    ] {
+        assert_err_prefix!(db.analyze(sql), AnalyzeError::SyntaxError(_), msg);
+    }
+    assert_err_prefix!(
+        db.analyze(
+            "SELECT * FROM JSON_TABLE(jsonb '1', '$' COLUMNS (a bit(3) DEFAULT 1 ON ERROR))"
+        ),
+        AnalyzeError::CannotCoerce(_),
+        "cannot cast behavior expression of type integer to bit"
+    );
+    for sql in [
+        "SELECT * FROM JSON_TABLE(jsonb '1', '$' COLUMNS (a int) ERROR ON ERROR)",
+        "SELECT * FROM JSON_TABLE(jsonb '1', '$' COLUMNS (a int) EMPTY ON ERROR)",
+        "SELECT * FROM JSON_TABLE(jsonb '1', '$' COLUMNS (a int) EMPTY ARRAY ON ERROR)",
+        "SELECT * FROM JSON_TABLE(jsonb '1', '$' COLUMNS (a int[] EMPTY ARRAY ON ERROR))",
+        "SELECT * FROM JSON_TABLE(jsonb '1', '$' COLUMNS (a jsonb EMPTY OBJECT ON ERROR))",
+        "SELECT * FROM JSON_TABLE(jsonb '1', '$' COLUMNS (a text KEEP QUOTES EMPTY ON EMPTY))",
+        "SELECT * FROM JSON_TABLE(jsonb '1', '$' \
+         COLUMNS (a text WITHOUT WRAPPER EMPTY OBJECT ON ERROR))",
+        "SELECT * FROM JSON_TABLE(jsonb '1', '$' COLUMNS (a int EXISTS UNKNOWN ON ERROR))",
+        "SELECT * FROM JSON_TABLE(jsonb '1', '$' COLUMNS (a int PATH '$' DEFAULT 2 ON EMPTY))",
+        "SELECT * FROM JSON_TABLE(jsonb '1', '$' COLUMNS (a int PATH '$' DEFAULT true ON ERROR))",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
+
+/// A column's DEFAULT is checked as JSON_VALUE's is (transformJsonBehavior):
+/// a constant, function or operator expression without column references
+/// — parameters and subqueries inside an operator are fine.
+#[test]
+fn json_table_column_default_shape() {
+    let db = setup();
+    for (sql, msg) in [
+        (
+            "SELECT * FROM t, JSON_TABLE(jsonb '1', '$' \
+             COLUMNS (a int PATH '$' DEFAULT t.id + 1 ON ERROR)) jt",
+            "DEFAULT expression must not contain column references",
+        ),
+        (
+            "SELECT * FROM t, JSON_TABLE(jsonb '1', '$' \
+             COLUMNS (a int PATH '$' DEFAULT t.id ON ERROR)) jt",
+            "can only specify a constant, non-aggregate function, or operator expression \
+             for DEFAULT",
+        ),
+    ] {
+        assert_err_prefix!(db.analyze(sql), AnalyzeError::DatatypeMismatch(_), msg);
+    }
+    let s = db
+        .analyze(
+            "SELECT * FROM JSON_TABLE(jsonb '1', '$' \
+             COLUMNS (a int PATH '$' DEFAULT $1 + 1 ON ERROR)) jt",
+        )
+        .unwrap();
+    assert_params(&s, vec![p(int4())]);
+    db.analyze(
+        "SELECT * FROM JSON_TABLE(jsonb '1', '$' \
+         COLUMNS (a int PATH '$' DEFAULT (SELECT 1) + 1 ON ERROR)) jt",
+    )
+    .unwrap();
+}
+
+/// Too many column aliases: PG names the function, not the alias
+/// (addRangeTableEntryForTableFunc).
+#[test]
+fn json_table_alias_count_message() {
+    let db = setup();
+    assert_err_prefix!(
+        db.analyze(
+            "SELECT * FROM JSON_TABLE(NULL::jsonb, '$' COLUMNS (v1 timestamp)) AS f (v1, v2)"
+        ),
+        AnalyzeError::InvalidColumnReference(_),
+        "JSON_TABLE function has 1 columns available but 2 columns specified"
+    );
+    assert_err_prefix!(
+        db.analyze(
+            "SELECT * FROM JSON_TABLE(jsonb '{}', '$' COLUMNS (a int, \
+             NESTED PATH '$' COLUMNS (b int))) AS f (x, y, z)"
+        ),
+        AnalyzeError::InvalidColumnReference(_),
+        "JSON_TABLE function has 2 columns available but 3 columns specified"
+    );
+    db.analyze("SELECT * FROM JSON_TABLE(NULL::jsonb, '$' COLUMNS (v1 timestamp)) AS f (v1)")
+        .unwrap();
 }
 
 /// A non-constant JSON_TABLE path is rejected by the grammar as a feature

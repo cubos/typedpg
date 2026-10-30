@@ -590,6 +590,19 @@ pub(crate) fn too_many_column_aliases(alias: &str, available: usize, specified: 
     )
 }
 
+/// `JSON_TABLE function has N columns available but M columns specified` —
+/// SQLSTATE 42P10 (`addRangeTableEntryForTableFunc`): a JSON_TABLE's column
+/// alias list is longer than its columns.
+pub(crate) fn too_many_json_table_column_aliases(available: usize, specified: usize) -> RawError {
+    RawError::new(
+        AnalyzeError::InvalidColumnReference(format!(
+            "JSON_TABLE function has {available} columns available but {specified} columns specified"
+        )),
+        None,
+        None,
+    )
+}
+
 /// `join expression "j" has 4 columns available but 5 columns specified` —
 /// SQLSTATE 42P10 (`addRangeTableEntryForJoin`): an aliased JOIN's column
 /// alias list is longer than its output.
@@ -1446,7 +1459,7 @@ pub(crate) fn cannot_cast_record_to(
 }
 
 /// `<CONTEXT> could not convert type A to B` — SQLSTATE 42846
-/// (`cannot_coerce`, no dedicated variant): PG's coerce_to_common_type
+/// (`cannot_coerce`): PG's coerce_to_common_type
 /// after select_common_type chose B for a construct (ARRAY, CASE, …).
 pub(crate) fn could_not_convert_type(
     context: &str,
@@ -1455,9 +1468,25 @@ pub(crate) fn could_not_convert_type(
     span: Option<SourceSpan>,
 ) -> RawError {
     RawError::new(
-        AnalyzeError::Invalid(format!("{context} could not convert type {from} to {to}")),
+        AnalyzeError::CannotCoerce(format!("{context} could not convert type {from} to {to}")),
         span,
         None,
+    )
+}
+
+/// `cannot cast behavior expression of type A to B` — SQLSTATE 42846
+/// (`cannot_coerce`): `transformJsonBehavior`, for a
+/// SQL/JSON `DEFAULT expr ON EMPTY / ON ERROR` with no cast to the result
+/// type.
+pub(crate) fn cannot_cast_behavior_expression(from: &str, to: &str) -> RawError {
+    RawError::new(
+        AnalyzeError::CannotCoerce(format!(
+            "cannot cast behavior expression of type {from} to {to}"
+        )),
+        None,
+        Some(format!(
+            "You will need to explicitly cast the expression to type {to}."
+        )),
     )
 }
 
@@ -1692,6 +1721,7 @@ mod tests {
             (duplicate_table_alias("u", None).kind, "42712"),
             (ambiguous_table_reference("t", None).kind, "42P09"),
             (too_many_column_aliases("t", 1, 2).kind, "42P10"),
+            (too_many_json_table_column_aliases(1, 2).kind, "42P10"),
             (values_lists_length(2, 1, None).kind, "42601"),
             (unknown_value_not_coercible("text", None).kind, "XX000"),
             (
@@ -1732,6 +1762,14 @@ mod tests {
                 "42804",
             ),
             (set_op_column_count("UNION", 2, 1, None).kind, "42601"),
+            (
+                could_not_convert_type("ARRAY", "text[]", "integer[]", None).kind,
+                "42846",
+            ),
+            (
+                cannot_cast_behavior_expression("integer", "bit").kind,
+                "42846",
+            ),
             (no_array_type_for("integer[]"), "42704"),
             (
                 prefix_operator_does_not_exist("-", "text", None).kind,

@@ -250,7 +250,7 @@ fn case_result_conversion_errors_name_the_branch_as_pg_does() {
         db.analyze(
             "SELECT CASE WHEN age IS NULL THEN '\\x00'::bytea ELSE gen_random_uuid() END FROM users"
         ),
-        AnalyzeError::Invalid(_),
+        AnalyzeError::CannotCoerce(_),
         "CASE/WHEN could not convert type bytea to uuid"
     );
 }

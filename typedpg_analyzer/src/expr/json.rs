@@ -476,7 +476,10 @@ pub(crate) fn infer_json_arrayagg(
 }
 
 /// `JSON(expr)` — `transformJsonParseExpr`: the input is cast to json
-/// (text-like or bytea input, json passes). NULL in, NULL out.
+/// (text-like or bytea input, json passes). With `WITH UNIQUE KEYS` the
+/// input is instead read as text by the executor, which checks the keys:
+/// it must be a string, bytea or untyped (`transformJsonParseArg`), so a
+/// json / jsonb input is rejected too. NULL in, NULL out.
 pub(crate) fn infer_json_parse(
     p: &protobuf::JsonParseExpr,
     ctx: Ctx<'_>,
@@ -486,15 +489,30 @@ pub(crate) fn infer_json_parse(
         .expr
         .as_deref()
         .ok_or_else(|| AnalyzeError::Internal("JSON() without argument".into()))?;
-    let arg = json_value_expr(
-        ve,
-        ctx,
-        params,
-        protobuf::JsonFormatType::JsFormatJson,
-        Some(JSON),
-        false,
-    )?;
-    match json_output(p.output.as_ref(), ctx.snapshot, true)? {
+    let returning = json_output(p.output.as_ref(), ctx.snapshot, true)?;
+    let arg = if p.unique_keys {
+        let raw = ve
+            .raw_expr
+            .as_deref()
+            .ok_or_else(|| AnalyzeError::Internal("JSON value expression without expr".into()))?;
+        let (ty, t) = json_parse_arg(raw, ve.format.as_ref(), ctx, params)?;
+        if ty != oid::TEXT {
+            return Err(AnalyzeError::DatatypeMismatch(
+                "cannot use non-string types with WITH UNIQUE KEYS clause".into(),
+            ));
+        }
+        t
+    } else {
+        json_value_expr(
+            ve,
+            ctx,
+            params,
+            protobuf::JsonFormatType::JsFormatJson,
+            Some(JSON),
+            false,
+        )?
+    };
+    match returning {
         Some((t, typmod)) => Ok(ExprType::scalar_with_typmod(t, arg.nullable, typmod)),
         None => Ok(ExprType::scalar(JSON, arg.nullable)),
     }
@@ -575,6 +593,28 @@ pub(crate) fn infer_json_is_predicate(
         .expr
         .as_deref()
         .ok_or_else(|| AnalyzeError::Internal("IS JSON without operand".into()))?;
+    let (ty, t) = json_parse_arg(e, p.format.as_ref(), ctx, params)?;
+    if ty != oid::TEXT && ty != JSON && ty != JSONB {
+        return Err(AnalyzeError::DatatypeMismatch(format!(
+            "cannot use type {} in IS JSON predicate",
+            type_name(snapshot, ty)
+        )));
+    }
+    Ok(ExprType::scalar(oid::BOOL, t.nullable))
+}
+
+/// `transformJsonParseArg`: the input of `IS JSON` and of `JSON(… WITH
+/// UNIQUE KEYS)`, both parsed as text by the executor. Bytea and string
+/// inputs (an untyped one included) are read as text; any other type is
+/// returned as its base type, for the caller to judge. Returns that type
+/// and the input's own inference.
+fn json_parse_arg(
+    e: &protobuf::Node,
+    format: Option<&protobuf::JsonFormat>,
+    ctx: Ctx<'_>,
+    params: &mut ParamCollector,
+) -> Result<(PgTypeOid, ExprType), AnalyzeError> {
+    let snapshot = ctx.snapshot;
     let t = infer_expr(e, ctx, params, TypeGoal::NONE)?;
     let base = snapshot.unwrap_domain(t.type_oid);
     let mut ty = base;
@@ -587,19 +627,13 @@ pub(crate) fn infer_json_is_predicate(
         } else if is_string_category(snapshot, base) {
             ty = oid::TEXT;
         }
-        if has_encoding(p.format.as_ref()) {
-            return Err(AnalyzeError::DatatypeMismatch(
+        if has_encoding(format) {
+            return Err(AnalyzeError::FeatureNotSupported(
                 "cannot use JSON FORMAT ENCODING clause for non-bytea input types".into(),
             ));
         }
     }
-    if ty != oid::TEXT && ty != JSON && ty != JSONB {
-        return Err(AnalyzeError::DatatypeMismatch(format!(
-            "cannot use type {} in IS JSON predicate",
-            type_name(snapshot, ty)
-        )));
-    }
-    Ok(ExprType::scalar(oid::BOOL, t.nullable))
+    Ok((ty, t))
 }
 
 /// `JSON_VALUE` / `JSON_QUERY` / `JSON_EXISTS` — `transformJsonFuncExpr`.
@@ -618,16 +652,11 @@ pub(crate) fn infer_json_func_expr(
     use protobuf::JsonExprOp as Op;
     let snapshot = ctx.snapshot;
     let op = protobuf::JsonExprOp::try_from(f.op).unwrap_or(Op::Undefined);
-    let fname = match op {
-        Op::JsonExistsOp => "JSON_EXISTS()",
-        Op::JsonQueryOp => "JSON_QUERY()",
-        Op::JsonValueOp => "JSON_VALUE()",
-        _ => {
-            return Err(AnalyzeError::Unsupported(
-                "JSON_TABLE is only valid in FROM".into(),
-            ));
-        }
-    };
+    if !matches!(op, Op::JsonExistsOp | Op::JsonQueryOp | Op::JsonValueOp) {
+        return Err(AnalyzeError::Unsupported(
+            "JSON_TABLE is only valid in FROM".into(),
+        ));
+    }
 
     let context = f
         .context_item
@@ -707,14 +736,46 @@ pub(crate) fn infer_json_func_expr(
         },
     };
 
+    let unknown_on_error = json_behaviors(
+        op,
+        f.on_empty.as_deref(),
+        f.on_error.as_deref(),
+        None,
+        ret,
+        ctx,
+        params,
+    )?;
+
+    let nullable = match op {
+        Op::JsonExistsOp => ctx_t.nullable || path_nullable || unknown_on_error,
+        _ => true,
+    };
+    Ok(ExprType::scalar_with_typmod(ret, nullable, typmod))
+}
+
+/// The ON EMPTY / ON ERROR behaviors of a JSON_VALUE / JSON_QUERY /
+/// JSON_EXISTS call, or of the JSON_TABLE column (`column`) that runs as
+/// one (`transformJsonFuncExpr`): each must be one the function allows —
+/// a column's message names it — and a DEFAULT expression must be coercible
+/// to `ret`. Returns whether ON ERROR is UNKNOWN (JSON_EXISTS's NULL).
+pub(crate) fn json_behaviors(
+    op: protobuf::JsonExprOp,
+    on_empty: Option<&protobuf::JsonBehavior>,
+    on_error: Option<&protobuf::JsonBehavior>,
+    column: Option<&str>,
+    ret: PgTypeOid,
+    ctx: Ctx<'_>,
+    params: &mut ParamCollector,
+) -> Result<bool, AnalyzeError> {
+    use protobuf::JsonBehaviorType as B;
+    use protobuf::JsonExprOp as Op;
     let mut unknown_on_error = false;
-    for (behavior, when) in [(&f.on_empty, "ON EMPTY"), (&f.on_error, "ON ERROR")] {
-        let Some(b) = behavior.as_deref() else {
+    for (behavior, when) in [(on_empty, "ON EMPTY"), (on_error, "ON ERROR")] {
+        let Some(b) = behavior else {
             continue;
         };
-        use protobuf::JsonBehaviorType as B;
         let btype = protobuf::JsonBehaviorType::try_from(b.btype).unwrap_or(B::Undefined);
-        let (allowed, list): (&[B], &str) = match op {
+        let (allowed, list, fname, columns): (&[B], &str, &str, &str) = match op {
             Op::JsonExistsOp => (
                 &[
                     B::JsonBehaviorError,
@@ -723,6 +784,8 @@ pub(crate) fn infer_json_func_expr(
                     B::JsonBehaviorUnknown,
                 ],
                 "ERROR, TRUE, FALSE, or UNKNOWN",
+                "JSON_EXISTS()",
+                "EXISTS columns",
             ),
             Op::JsonQueryOp => (
                 &[
@@ -733,6 +796,8 @@ pub(crate) fn infer_json_func_expr(
                     B::JsonBehaviorDefault,
                 ],
                 "ERROR, NULL, EMPTY ARRAY, EMPTY OBJECT, or DEFAULT expression",
+                "JSON_QUERY()",
+                "formatted columns",
             ),
             _ => (
                 &[
@@ -741,6 +806,8 @@ pub(crate) fn infer_json_func_expr(
                     B::JsonBehaviorDefault,
                 ],
                 "ERROR, NULL, or DEFAULT expression",
+                "JSON_VALUE()",
+                "scalar columns",
             ),
         };
         // `EMPTY` is the older spelling of EMPTY ARRAY.
@@ -750,10 +817,19 @@ pub(crate) fn infer_json_func_expr(
             btype
         };
         if !allowed.contains(&effective) {
+            // PG prints the column name raw: `invalid %s behavior for
+            // column \"%s\"`.
+            let (message, target) = match column {
+                Some(name) => (
+                    format!("invalid {when} behavior for column \"{name}\""),
+                    columns,
+                ),
+                None => (format!("invalid {when} behavior"), fname),
+            };
             return Err(crate::error::RawError::new(
-                AnalyzeError::SyntaxError(format!("invalid {when} behavior")),
+                AnalyzeError::SyntaxError(message),
                 crate::error::SourceSpan::from_location(b.location),
-                Some(format!("Only {list} is allowed in {when} for {fname}.")),
+                Some(format!("Only {list} is allowed in {when} for {target}.")),
             )
             .finalize_implicit());
         }
@@ -766,12 +842,7 @@ pub(crate) fn infer_json_func_expr(
             json_behavior_default(e, ret, ctx, params)?;
         }
     }
-
-    let nullable = match op {
-        Op::JsonExistsOp => ctx_t.nullable || path_nullable || unknown_on_error,
-        _ => true,
-    };
-    Ok(ExprType::scalar_with_typmod(ret, nullable, typmod))
+    Ok(unknown_on_error)
 }
 
 /// A `DEFAULT expr ON EMPTY/ERROR` (transformJsonBehavior): only a constant,
@@ -814,13 +885,46 @@ fn json_behavior_default(
     }
     let t = infer_expr(e, ctx, params, TypeGoal::NONE)?;
     if t.type_oid == oid::UNKNOWN {
-        coerce_unknown_to(e, ctx, params, ret)?;
-    } else if t.type_oid != ret && !coerce::can_cast_explicit(t.type_oid, ret, snapshot) {
-        return Err(AnalyzeError::DatatypeMismatch(format!(
-            "cannot cast behavior expression of type {} to {}",
-            type_name(snapshot, t.type_oid),
-            type_name(snapshot, ret)
-        )));
+        return coerce_unknown_to(e, ctx, params, ret);
+    }
+    if t.type_oid == ret {
+        return Ok(());
+    }
+    // A NULL constant (a cast of one folds into a typed NULL constant), a
+    // jsonb value and a boolean — unless the result is (a domain over)
+    // integer, which has a cast from boolean — are coerced at run time,
+    // by json_populate_type.
+    fn null_const(n: &protobuf::Node) -> bool {
+        match n.node.as_ref() {
+            Some(node::Node::AConst(c)) => c.isnull,
+            Some(node::Node::TypeCast(c)) => c.arg.as_deref().is_some_and(null_const),
+            _ => false,
+        }
+    }
+    if null_const(e)
+        || t.type_oid == JSONB
+        || (t.type_oid == oid::BOOL && snapshot.unwrap_domain(ret) != oid::INT4)
+    {
+        return Ok(());
+    }
+    // Any other value needs a cast: an assignment one to a string or bit
+    // string type (so a too-long input errors instead of being
+    // truncated), an explicit one otherwise.
+    let castable = match coerce::type_category(ret, snapshot) {
+        Some(TypCategory::String | TypCategory::BitString) => coerce::can_coerce(
+            t.type_oid,
+            ret,
+            coerce::CoercionContext::Assignment,
+            snapshot,
+        ),
+        _ => coerce::can_cast_explicit(t.type_oid, ret, snapshot),
+    };
+    if !castable {
+        return Err(crate::pgmsg::cannot_cast_behavior_expression(
+            &type_name(snapshot, t.type_oid),
+            &type_name(snapshot, ret),
+        )
+        .finalize_implicit());
     }
     Ok(())
 }

@@ -1909,6 +1909,7 @@ pub(crate) use func_call::{
 };
 use indirection::*;
 pub(crate) use indirection::{expand_indirection_star, transform_container_subscripts};
+pub(crate) use json::json_behaviors;
 use json::*;
 pub(crate) use literals::assignment_nullable;
 pub(crate) use literals::bare_param;
