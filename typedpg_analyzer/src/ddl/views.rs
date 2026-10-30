@@ -51,15 +51,18 @@ pub fn create_view(interp: &mut PgCatalog, stmt: &ViewStmt) -> Result<(), DdlErr
     if let Some(query) = stmt.query.as_deref() {
         check_no_parameters(query)?;
     }
+    // DefineView only analyzes the query: no error its execution would
+    // raise is reported (a query reading the view runs it).
     let resolved = match stmt.query.as_deref() {
         Some(query_node) => {
-            resolve_view_now(interp, query_node, &aliases).map_err(|e| match e {
-                DdlError::ViewAnalysis { source, .. } => DdlError::ViewAnalysis {
-                    view: qn_label.clone(),
-                    source,
-                },
-                other => other,
-            })?
+            crate::resolve::without_execution(|| resolve_view_now(interp, query_node, &aliases))
+                .map_err(|e| match e {
+                    DdlError::ViewAnalysis { source, .. } => DdlError::ViewAnalysis {
+                        view: qn_label.clone(),
+                        source,
+                    },
+                    other => other,
+                })?
         }
         None => ResolvedView::default(),
     };
@@ -226,6 +229,17 @@ fn create_relation_as(
     if let Some(query) = query {
         check_no_parameters(query)?;
     }
+    // The query runs to fill the relation, unless WITH NO DATA; a
+    // materialized view's under a restricted search_path.
+    let run = |f: &dyn Fn() -> Result<ResolvedView, DdlError>| {
+        if into.skip_data {
+            crate::resolve::without_execution(f)
+        } else if kind == RelKind::MaterializedView {
+            crate::resolve::with_restricted_execution(f)
+        } else {
+            f()
+        }
+    };
     let mut resolved = match query {
         // CREATE TABLE ... AS EXECUTE (ExecuteQuery): the prepared SELECT's
         // columns, its arguments checked. The cached plan is revalidated
@@ -237,8 +251,15 @@ fn create_relation_as(
             if !prepared.is_select() {
                 return Err(DdlError::Parse("prepared statement is not a SELECT".into()));
             }
-            crate::expr::with_rewriting(true, || {
-                resolve_view_with_params(interp, &prepared.query, &aliases, &prepared.param_types)
+            run(&|| {
+                crate::expr::with_rewriting(true, || {
+                    resolve_view_with_params(
+                        interp,
+                        &prepared.query,
+                        &aliases,
+                        &prepared.param_types,
+                    )
+                })
             })
             .map_err(|e| match e {
                 DdlError::ViewAnalysis { source, .. } => DdlError::ViewAnalysis {
@@ -250,8 +271,10 @@ fn create_relation_as(
         }
         // ExecCreateTableAs rewrites the query it fills the relation with;
         // WITH NO DATA only creates the relation (create_ctas_nodata).
-        Some(query_node) => crate::expr::with_rewriting(!into.skip_data, || {
-            resolve_view_now(interp, query_node, &aliases)
+        Some(query_node) => run(&|| {
+            crate::expr::with_rewriting(!into.skip_data, || {
+                resolve_view_now(interp, query_node, &aliases)
+            })
         })
         .map_err(|e| match e {
             DdlError::ViewAnalysis { source, .. } => DdlError::ViewAnalysis {
@@ -650,11 +673,33 @@ pub fn refresh_materialized_view(
             if stmt.skip_data {
                 interp.unpopulated_matviews.insert(oid);
             } else {
+                check_refill(interp, oid)?;
                 interp.unpopulated_matviews.remove(&oid);
             }
             Ok(())
         }
     }
+}
+
+/// RefreshMatViewByOid runs materialized view `relid`'s query, under the
+/// restricted `search_path`: an error every run of it raises (a NULL cast
+/// to a NOT NULL domain, ...) fails the refresh. Checked only while the
+/// query still resolves to what the view bound ([`reanalyze_view`]).
+fn check_refill(interp: &PgCatalog, relid: PgClassOid) -> Result<(), DdlError> {
+    if reanalyze_view(interp, relid).is_none() {
+        return Ok(());
+    }
+    let Some(query) = view_query(interp, relid) else {
+        return Ok(());
+    };
+    let Some(inner) = query.node.as_ref() else {
+        return Ok(());
+    };
+    crate::resolve::with_restricted_execution(|| {
+        crate::resolve::analyze_raw_node(interp, inner, &[])
+    })
+    .map(|_| ())
+    .map_err(|e| DdlError::UnsupportedDdl(e.to_string()))
 }
 
 /// Bundle of analyzer outputs that [`install_relation`] needs to wire up a
@@ -2158,8 +2203,13 @@ pub(crate) fn reanalyze_view(
     let stored = snapshot.view_references.get(&relid)?;
     let query = view_query(snapshot, relid)?;
     let inner = query.node.as_ref()?;
+    // The query's shape only: whether it would run is the caller's.
     let (analyzed, references) = expanding_view(relid, || {
-        super::depend::collect(|| crate::resolve::analyze_raw_node(snapshot, inner, &[]))
+        super::depend::collect(|| {
+            crate::resolve::without_execution(|| {
+                crate::resolve::analyze_raw_node(snapshot, inner, &[])
+            })
+        })
     })?;
     let (columns, _) = analyzed.ok()?;
     (bound_references(snapshot, &references) == *stored).then_some(columns)

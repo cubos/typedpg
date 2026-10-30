@@ -2248,6 +2248,127 @@ fn a_rule_action_is_not_executed_at_create_rule() {
 }
 
 #[test]
+fn a_query_is_not_executed_where_it_is_only_stored() {
+    // PG 18 DefineView, PrepareQuery and CREATE TABLE AS / MATERIALIZED
+    // VIEW ... WITH NO DATA only analyze the query: an error every run of
+    // it raises is reported where it runs — reading the view, EXECUTE,
+    // REFRESH MATERIALIZED VIEW.
+    let setup = "CREATE DOMAIN d AS int NOT NULL;
+                 CREATE TABLE t (a int NOT NULL);
+                 CREATE MATERIALIZED VIEW mv0 AS SELECT 1 AS a;
+                 CREATE VIEW v AS SELECT NULL::d AS x, 1 AS y;
+                 CREATE VIEW v2 AS SELECT ARRAY[ARRAY[1], NULL] AS a, 1 AS b;
+                 CREATE VIEW v3 AS VALUES (NULL::d, 1);
+                 CREATE VIEW v4 AS SELECT 1 AS a UNION ALL SELECT NULL::d;
+                 CREATE VIEW v5 AS SELECT 1 AS a, 2 AS b UNION ALL SELECT NULL::d, 3;
+                 CREATE VIEW v6 AS SELECT 1 AS a WHERE false INTERSECT SELECT NULL::d;
+                 CREATE VIEW v7 AS SELECT count(*) AS c, generate_series(1, 2) AS g;
+                 CREATE VIEW w AS SELECT x, y FROM v;
+                 CREATE MATERIALIZED VIEW m1 AS SELECT NULL::d AS x WITH NO DATA;
+                 CREATE MATERIALIZED VIEW m2 AS SELECT ARRAY[ARRAY[1], NULL] AS a WITH NO DATA;
+                 CREATE TABLE c1 AS SELECT NULL::d AS x WITH NO DATA;
+                 PREPARE p1 AS SELECT NULL::d;
+                 PREPARE p2 AS SELECT ARRAY[ARRAY[1], NULL];
+                 PREPARE p3 AS INSERT INTO t VALUES (NULL);
+                 PREPARE p4 AS INSERT INTO mv0 VALUES (1);
+                 CREATE TABLE c2 AS EXECUTE p1 WITH NO DATA;
+                 REFRESH MATERIALIZED VIEW m1 WITH NO DATA;";
+    for (stmt, msg) in [
+        ("EXECUTE p1;", "domain d does not allow null values"),
+        (
+            "EXECUTE p2;",
+            "multidimensional arrays must have array expressions with matching dimensions",
+        ),
+        (
+            "EXECUTE p3;",
+            "null value in column \"a\" of relation \"t\" violates not-null constraint",
+        ),
+        (
+            "CREATE TABLE c3 AS EXECUTE p1;",
+            "domain d does not allow null values",
+        ),
+        (
+            "CREATE TABLE c3 AS SELECT * FROM v;",
+            "domain d does not allow null values",
+        ),
+        // A materialized view is filled under a restricted search_path
+        // (RestrictSearchPath), which qualifies the domain's name.
+        (
+            "CREATE MATERIALIZED VIEW m3 AS SELECT NULL::d AS x;",
+            "domain public.d does not allow null values",
+        ),
+        (
+            "CREATE MATERIALIZED VIEW m3 AS SELECT * FROM v;",
+            "domain public.d does not allow null values",
+        ),
+        (
+            "REFRESH MATERIALIZED VIEW m1;",
+            "domain public.d does not allow null values",
+        ),
+        (
+            "CREATE MATERIALIZED VIEW m3 AS SELECT * FROM v2;",
+            "multidimensional arrays must have array expressions with matching dimensions",
+        ),
+        (
+            "REFRESH MATERIALIZED VIEW m2;",
+            "multidimensional arrays must have array expressions with matching dimensions",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    let db = build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "CREATE MATERIALIZED VIEW m4 AS SELECT y FROM v;
+             CREATE TABLE c4 AS SELECT * FROM v WITH NO DATA;",
+        ),
+    ]);
+    // Reading a column the view's query can't compute fails; the planner
+    // drops the columns a query doesn't read.
+    let domain = Some("domain d does not allow null values");
+    let arrays =
+        Some("multidimensional arrays must have array expressions with matching dimensions");
+    for (sql, fails) in [
+        ("SELECT * FROM v", domain),
+        ("SELECT x FROM v", domain),
+        ("SELECT v.x FROM v", domain),
+        ("SELECT v FROM v", domain),
+        ("SELECT DISTINCT x FROM v ORDER BY x", domain),
+        ("SELECT q FROM v AS vv(q)", domain),
+        ("SELECT NULL::d FROM v", domain),
+        ("SELECT * FROM w", domain),
+        ("SELECT column1 FROM v3", domain),
+        ("SELECT a FROM v4", domain),
+        // A UNION's arm is evaluated whole.
+        ("SELECT b FROM v5", domain),
+        ("SELECT x FROM v UNION ALL SELECT 1", domain),
+        ("SELECT y FROM v", None),
+        ("SELECT y FROM w", None),
+        ("SELECT count(*) FROM v", None),
+        ("SELECT column2 FROM v3", None),
+        ("SELECT x FROM v WHERE y = 2", None),
+        ("SELECT a FROM v2 LIMIT 0", None),
+        ("SELECT a FROM v2", arrays),
+        ("SELECT b FROM v2", None),
+        ("SELECT a FROM v6", None),
+        ("SELECT * FROM v7", None),
+    ] {
+        match (db.analyze(sql), fails) {
+            (Err(err), Some(msg)) => {
+                assert!(err.to_string().starts_with(msg), "{sql}\n  got: {err}")
+            }
+            (Ok(_), None) => {}
+            (other, _) => panic!("{sql}: {other:?}"),
+        }
+    }
+    // The view's column keeps the type and nullability its query gives.
+    let cols = db.analyze("SELECT y FROM v").unwrap().columns;
+    assert!(!cols[0].nullable);
+}
+
+#[test]
 fn a_conditional_rule_qualifies_the_rules_its_action_fires() {
     // PG 18 rewriteRuleAction ANDs a conditional rule's qualification into
     // its action, and the action's qualification into the actions of the

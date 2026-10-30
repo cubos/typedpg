@@ -1066,14 +1066,14 @@ fn analyze_raw_node_once(
             let sel = select_into.as_ref().expect("guarded by the match arm");
             let (_, p) = analyze_select(sel, snapshot, &mut params)?;
             expr::resolve_untyped_output_params(sel, snapshot, &mut params)?;
-            check_null_domain_casts(sel, snapshot)?;
+            failing_rows::check_null_domain_casts(sel, snapshot)?;
             (Vec::new(), p)
         }
         node::Node::SelectStmt(sel) => {
             let r = analyze_select(sel, snapshot, &mut params)?;
             // The statement-level `resolveTargetListUnknowns`.
             expr::resolve_untyped_output_params(sel, snapshot, &mut params)?;
-            check_null_domain_casts(sel, snapshot)?;
+            failing_rows::check_null_domain_casts(sel, snapshot)?;
             r
         }
         node::Node::InsertStmt(ins) => analyze_insert(ins, snapshot, &mut params)?,
@@ -1481,89 +1481,69 @@ fn rename_column_refs(
         .unwrap_or_default()
 }
 
-/// A NULL cast to a domain that rejects it (`SELECT NULL::d` of a NOT NULL
-/// domain, `CAST(NULL AS d)` of one with `CHECK (VALUE IS NOT NULL)`) where
-/// every execution evaluates it: a select list with no FROM, WHERE,
-/// grouping or LIMIT (one row), or a VALUES row — of the statement itself,
-/// or of an arm of its set operation. The coercion fails when evaluated
-/// (`ExecEvalConstraintNotNull` / `ExecEvalConstraintCheck`), naming the
-/// domain cast to.
-fn check_null_domain_casts(
-    sel: &protobuf::SelectStmt,
-    snapshot: &PgCatalog,
-) -> Result<(), AnalyzeError> {
-    if !executes() || sel.limit_count.is_some() || sel.limit_offset.is_some() {
-        return Ok(());
-    }
-    if sel.op != protobuf::SetOperation::SetopNone as i32 {
-        for arm in [&sel.larg, &sel.rarg].into_iter().flatten() {
-            check_null_domain_casts(arm, snapshot)?;
-        }
-        return Ok(());
-    }
-    let null_cast = |n: &protobuf::Node| -> Option<String> {
-        let Some(node::Node::TypeCast(tc)) = n.node.as_ref() else {
-            return None;
-        };
-        if !matches!(
-            tc.arg.as_deref().and_then(|a| a.node.as_ref()),
-            Some(node::Node::AConst(c)) if c.isnull
-        ) {
-            return None;
-        }
-        let target = crate::ddl::util::resolve_type_name(tc.type_name.as_ref()?, snapshot)?;
-        snapshot.domain_null_violation(target)
-    };
-    let cells: Vec<&protobuf::Node> = if !sel.values_lists.is_empty() {
-        sel.values_lists
-            .iter()
-            .filter_map(|row| match row.node.as_ref() {
-                Some(node::Node::List(l)) => Some(l.items.iter()),
-                _ => None,
-            })
-            .flatten()
-            .collect()
-    } else if sel.from_clause.is_empty()
-        && sel.where_clause.is_none()
-        && sel.group_clause.is_empty()
-        && sel.having_clause.is_none()
-    {
-        sel.target_list
-            .iter()
-            .filter_map(|t| match t.node.as_ref() {
-                Some(node::Node::ResTarget(rt)) => rt.val.as_deref(),
-                _ => None,
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-    match cells.into_iter().find_map(null_cast) {
-        Some(msg) => Err(AnalyzeError::Invalid(msg)),
-        None => Ok(()),
-    }
+/// How the statement being analyzed is run, for the errors only its
+/// execution raises.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Execution {
+    /// It runs, under the session's `search_path`.
+    Runs,
+    /// It runs under the `search_path` RestrictSearchPath sets
+    /// (`pg_catalog, pg_temp`): a materialized view's query, filled at
+    /// CREATE MATERIALIZED VIEW or REFRESH. Names were resolved before, so
+    /// only the messages execution raises render names differently.
+    RunsRestricted,
+    /// It is parsed and analyzed but not run (see [`without_execution`]).
+    NotRun,
 }
 
 thread_local! {
-    static UNEXECUTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static EXECUTION: std::cell::Cell<Execution> = const { std::cell::Cell::new(Execution::Runs) };
+}
+
+/// Restores the execution mode a [`with_execution`] replaced, even when
+/// the analysis unwinds.
+struct ExecutionGuard(Execution);
+
+impl Drop for ExecutionGuard {
+    fn drop(&mut self) {
+        EXECUTION.with(|c| c.set(self.0));
+    }
+}
+
+fn with_execution<R>(mode: Execution, f: impl FnOnce() -> R) -> R {
+    let _guard = ExecutionGuard(EXECUTION.with(|c| c.replace(mode)));
+    f()
 }
 
 /// Run `f` analyzing a statement PG parses and analyzes but doesn't run —
 /// a rule's action (transformRuleStmt), a SQL function's body
-/// (fmgr_sql_validator): the errors only its execution raises, however
-/// certain (a NULL stored into a NOT NULL column or domain, a NULL cast to
-/// a NOT NULL domain, sub-arrays that can't agree, a result relation the
+/// (fmgr_sql_validator), a view's query (DefineView), a prepared
+/// statement (PrepareQuery), a CREATE TABLE AS / materialized view
+/// `WITH NO DATA`: the errors only its execution raises, however certain
+/// (a NULL stored into a NOT NULL column or domain, a NULL cast to a NOT
+/// NULL domain, sub-arrays that can't agree, a result relation the
 /// executor can't change), are not reported.
 pub(crate) fn without_execution<R>(f: impl FnOnce() -> R) -> R {
-    let prev = UNEXECUTED.with(|c| c.replace(true));
-    let out = f();
-    UNEXECUTED.with(|c| c.set(prev));
-    out
+    with_execution(Execution::NotRun, f)
+}
+
+/// Run `f` analyzing a materialized view's query that is run to fill it:
+/// RefreshMatViewByOid and ExecCreateTableAs restrict `search_path` to
+/// `pg_catalog, pg_temp` while it runs, so the names its execution errors
+/// print are qualified unless visible there.
+pub(crate) fn with_restricted_execution<R>(f: impl FnOnce() -> R) -> R {
+    with_execution(Execution::RunsRestricted, f)
 }
 
 /// Whether the statement being analyzed runs (see [`without_execution`]).
 pub(crate) fn executes() -> bool {
-    !UNEXECUTED.with(std::cell::Cell::get)
+    EXECUTION.with(std::cell::Cell::get) != Execution::NotRun
+}
+
+/// Whether the statement being analyzed runs under the restricted
+/// `search_path` (see [`with_restricted_execution`]).
+pub(crate) fn execution_search_path_restricted() -> bool {
+    EXECUTION.with(std::cell::Cell::get) == Execution::RunsRestricted
 }
 
 /// If assigning a literal `NULL` to `tc` would violate a NOT-NULL guarantee
@@ -1601,7 +1581,7 @@ fn null_assignment_error(
     }
     // Coerced to the column's type as the row is built: a NOT NULL domain
     // (or one with a CHECK a NULL fails) rejects it.
-    if let Some(msg) = snapshot.domain_null_violation(tc.atttypid) {
+    if let Some(msg) = snapshot.domain_null_violation_at_execution(tc.atttypid) {
         return Some(AnalyzeError::Invalid(msg));
     }
     // A view's columns carry no NOT NULL of their own (their inferred
@@ -1694,6 +1674,7 @@ mod call;
 mod copy_in;
 mod cte;
 mod dml;
+mod failing_rows;
 mod from;
 mod merge;
 mod predtest;

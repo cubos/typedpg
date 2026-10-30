@@ -43,7 +43,8 @@ fn analysis_error(e: AnalyzeError) -> Option<DdlError> {
 
 /// `PREPARE name [(types)] AS query` (PrepareQuery): the name must be
 /// free; the query is analyzed with the declared parameter types, and the
-/// ones it uses beyond them are inferred.
+/// ones it uses beyond them are inferred. It isn't run: the errors only
+/// its execution raises are EXECUTE's.
 pub(crate) fn prepare(interp: &mut PgCatalog, stmt: &PrepareStmt) -> Result<(), DdlError> {
     let Some(query) = stmt.query.as_deref() else {
         return Ok(());
@@ -62,9 +63,12 @@ pub(crate) fn prepare(interp: &mut PgCatalog, stmt: &PrepareStmt) -> Result<(), 
     }
     let mut param_types = declared.clone();
     if let Some(inner) = query.node.as_ref() {
-        // PrepareQuery rewrites the analyzed query (and caches the plan).
-        match crate::expr::with_rewriting(true, || {
-            crate::resolve::analyze_raw_node_with_param_types(interp, inner, &declared)
+        // PrepareQuery analyzes and rewrites the query (and caches the
+        // plan); it runs at EXECUTE.
+        match crate::resolve::without_execution(|| {
+            crate::expr::with_rewriting(true, || {
+                crate::resolve::analyze_raw_node_with_param_types(interp, inner, &declared)
+            })
         }) {
             Ok((_, params)) => {
                 for (number, typ, _) in params {

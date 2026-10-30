@@ -281,8 +281,23 @@ impl PgCatalog {
     /// within one (`load_domaintype_info`); the message names `oid`
     /// itself (`format_type_be` of the coercion's result type).
     pub(crate) fn domain_null_violation(&self, oid: PgTypeOid) -> Option<String> {
+        self.domain_null_violation_with(oid, crate::ddl::util::format_type_for_message)
+    }
+
+    /// [`Self::domain_null_violation`] raised by a statement's execution,
+    /// which names the domain under the `search_path` it runs with
+    /// ([`crate::ddl::util::format_type_at_execution`]).
+    pub(crate) fn domain_null_violation_at_execution(&self, oid: PgTypeOid) -> Option<String> {
+        self.domain_null_violation_with(oid, crate::ddl::util::format_type_at_execution)
+    }
+
+    fn domain_null_violation_with(
+        &self,
+        oid: PgTypeOid,
+        format: fn(&PgCatalog, PgTypeOid) -> String,
+    ) -> Option<String> {
         let chain = self.domain_chain(oid);
-        let target = || crate::ddl::util::format_type_for_message(self, oid);
+        let target = || format(self, oid);
         if chain
             .iter()
             .any(|d| self.pg_type.get(d).is_some_and(|t| t.typnotnull))

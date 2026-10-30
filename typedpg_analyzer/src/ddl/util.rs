@@ -357,6 +357,21 @@ pub fn type_name_to_string(tn: &TypeName) -> String {
 ///    unqualified). `QualifiedName::Display` handles the PG identifier
 ///    quoting rules.
 pub fn format_type_for_message(snapshot: &PgCatalog, oid: PgTypeOid) -> String {
+    format_type_with_path(snapshot, oid, false)
+}
+
+/// [`format_type_for_message`] as a statement's execution renders it: under
+/// a materialized view's restricted `search_path` (`pg_catalog, pg_temp`,
+/// RestrictSearchPath) while one is filled.
+pub(crate) fn format_type_at_execution(snapshot: &PgCatalog, oid: PgTypeOid) -> String {
+    format_type_with_path(
+        snapshot,
+        oid,
+        crate::resolve::execution_search_path_restricted(),
+    )
+}
+
+fn format_type_with_path(snapshot: &PgCatalog, oid: PgTypeOid, restricted: bool) -> String {
     let Some(t) = snapshot.pg_type.get(&oid) else {
         return format!("oid={oid}");
     };
@@ -371,7 +386,10 @@ pub fn format_type_for_message(snapshot: &PgCatalog, oid: PgTypeOid) -> String {
     if let Some(elem_oid) = t.typelem
         && snapshot.array_type_of(elem_oid) == Some(oid)
     {
-        return format!("{}[]", format_type_for_message(snapshot, elem_oid));
+        return format!(
+            "{}[]",
+            format_type_with_path(snapshot, elem_oid, restricted)
+        );
     }
 
     // Special-case the SQL-standard built-ins. Mirrors the big `switch
@@ -406,10 +424,21 @@ pub fn format_type_for_message(snapshot: &PgCatalog, oid: PgTypeOid) -> String {
     // Default handling: catalog name, qualified iff the type isn't visible
     // on the search path. `pg_catalog` types are always visible without
     // qualification; for everything else we ask the lookup.
-    let visible = snapshot
-        .resolve_type_by_name(None, &t.typname)
-        .map(|found| found.oid == oid)
-        .unwrap_or(false);
+    let visible = if restricted {
+        [
+            snapshot.pg_catalog_oid(),
+            snapshot.temp_namespace.filter(|_| snapshot.in_migration),
+        ]
+        .into_iter()
+        .flatten()
+        .find_map(|ns| snapshot.type_by_qname.get(&(ns, t.typname.clone())))
+            == Some(&oid)
+    } else {
+        snapshot
+            .resolve_type_by_name(None, &t.typname)
+            .map(|found| found.oid == oid)
+            .unwrap_or(false)
+    };
     if !visible && let Some(ns) = snapshot.namespace_name(t.typnamespace) {
         return QualifiedName::new(ns, &t.typname).to_string();
     }

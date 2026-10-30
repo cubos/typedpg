@@ -1089,7 +1089,7 @@ fn omitted_domain_nulls(
         // A DEFAULT NULL of the column's own overrides the domain's.
         .filter(|c| c.atthasdef || !snapshot.domain_has_default(c.atttypid))
         .filter_map(|c| {
-            let msg = snapshot.domain_null_violation(c.atttypid)?;
+            let msg = snapshot.domain_null_violation_at_execution(c.atttypid)?;
             Some(RowViolation {
                 order: (false, c.attnum),
                 error: AnalyzeError::Invalid(msg),
