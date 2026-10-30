@@ -321,7 +321,22 @@ pub(crate) fn transform_array_expr(
             multidims = true;
             transform_array_expr(sub, ctx, params, target)?
         } else {
-            let t = infer_expr(elem, ctx, params, TypeGoal::NONE)?;
+            // coerce_record_to_complex: a `ROW(...)` element of a cast to
+            // an array of composites is converted field by field, so its
+            // arity and fields are checked against the target's
+            // (`ARRAY[ROW(1, 2, 3)]::t[]` is `cannot cast type record to t`).
+            let goal = match (elem.node.as_ref(), target) {
+                (Some(node::Node::RowExpr(_)), Some(tg))
+                    if coerce::is_complex(tg.element_type, snapshot) =>
+                {
+                    TypeGoal {
+                        coercion: CoercionContext::Explicit,
+                        ..TypeGoal::assignment(tg.element_type)
+                    }
+                }
+                _ => TypeGoal::NONE,
+            };
+            let t = infer_expr(elem, ctx, params, goal)?;
             if !multidims
                 && !matches!(
                     snapshot.get_type(t.type_oid).map(|e| e.typname.as_str()),
@@ -409,7 +424,11 @@ pub(crate) fn transform_array_expr(
         if t.type_oid == oid::UNKNOWN {
             coerce_unknown_to(elem, ctx, params, coerce_type)?;
         } else if hard {
-            if !coerce::can_cast_explicit(t.type_oid, coerce_type, snapshot) {
+            if !coerce::can_cast_explicit(t.type_oid, coerce_type, snapshot)
+                || (t.type_oid == oid::RECORD
+                    && coerce::is_complex(coerce_type, snapshot)
+                    && !super::record_converts_to_complex(elem, ctx.scope))
+            {
                 let span = crate::error::node_location(elem)
                     .and_then(crate::error::SourceSpan::from_node_qname);
                 return Err(crate::error::RawError::invalid(

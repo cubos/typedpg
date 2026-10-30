@@ -117,7 +117,21 @@ pub(crate) fn infer_type_cast(
         _ => None,
     };
 
+    // coerce_type returns the operand of a cast to `"any"`, `anyelement`,
+    // `anynonarray`, `anycompatible` or `anycompatiblenonarray` as it is —
+    // its own type, not the pseudo-type (`1::anyelement` is an integer; an
+    // untyped literal or parameter stays unknown, to resolve as text).
+    const PASS_THROUGH: [PgTypeOid; 5] = [
+        PgTypeOid::from_raw(2276), // "any"
+        PgTypeOid::from_raw(2283), // anyelement
+        PgTypeOid::from_raw(2776), // anynonarray
+        PgTypeOid::from_raw(5077), // anycompatible
+        PgTypeOid::from_raw(5079), // anycompatiblenonarray
+    ];
+    let pass_through = PASS_THROUGH.contains(&target_oid);
+
     if let Some(node::Node::AConst(ac)) = inner.node.as_ref()
+        && !pass_through
         && !ac.isnull
         && matches!(ac.val, Some(a_const::Val::Sval(_)))
     {
@@ -214,6 +228,7 @@ pub(crate) fn infer_type_cast(
     };
 
     if let Some(node::Node::ParamRef(p)) = inner.node.as_ref()
+        && !pass_through
         && params.get(p.number) == oid::UNKNOWN
     {
         params.record(p.number, target_oid);
@@ -222,7 +237,11 @@ pub(crate) fn infer_type_cast(
     // PG rejects an explicit cast with no legal path (e.g. boolean → double
     // precision) at parse time — `cannot cast type X to Y`. Mirror that, but
     // only after the inner expression's own type is known.
-    if !coerce::can_cast_explicit(inner_type.type_oid, target_oid, snapshot) {
+    if !coerce::can_cast_explicit(inner_type.type_oid, target_oid, snapshot)
+        || (inner_type.type_oid == oid::RECORD
+            && coerce::is_complex(target_oid, snapshot)
+            && !super::record_converts_to_complex(inner, ctx.scope))
+    {
         let from = crate::ddl::util::format_type_for_message(snapshot, inner_type.type_oid);
         let to = crate::ddl::util::format_type_for_message(snapshot, target_oid);
         let span = crate::error::node_location(inner).and_then(|loc| {
@@ -236,6 +255,29 @@ pub(crate) fn infer_type_cast(
         )
         .with_primary_label(format!("this is {from}"))
         .finalize_implicit());
+    }
+
+    if pass_through {
+        return Ok(inner_type);
+    }
+    // The other polymorphic targets (`anyarray`, `anyenum`, `anyrange`,
+    // `anymultirange` and their `anycompatible` forms) need an actual
+    // array, enum, range or multirange: a typed operand is returned as it
+    // is, relabeled from a domain to its base type (`'{1}'::ia::anyarray`
+    // is `integer[]`). (An unknown literal fails the pseudo-type's input
+    // function — see `literal_input` — and an untyped parameter or NULL
+    // takes the pseudo-type itself.)
+    if crate::polymorphic::is_polymorphic(target_oid) && inner_type.type_oid != oid::UNKNOWN {
+        let base = snapshot.unwrap_domain(inner_type.type_oid);
+        if base == inner_type.type_oid {
+            return Ok(inner_type);
+        }
+        return Ok(ExprType {
+            record_fields: None,
+            ..ExprType::scalar(base, inner_type.nullable)
+                .with_collation(derive_collation([&inner_type], base, snapshot)?)
+                .with_elem_nullable(inner_type.elem_nullable)
+        });
     }
 
     // coerce_type: a composite value cast to `record` (or an array of one to

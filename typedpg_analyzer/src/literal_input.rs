@@ -174,7 +174,24 @@ pub(crate) fn validate_with_typmod(
         | "pg_mcv_list"
         | "pg_brin_bloom_summary"
         | "pg_brin_minmax_multi_summary"
-        | "pg_ddl_command") => {
+        | "pg_ddl_command"
+        // Pseudo-types with a dummy input function. (The polymorphic ones
+        // a cast returns its typed operand as — `anyelement`, `"any"`, … —
+        // never reach their input function, and `anyenum` refuses an
+        // unknown operand before it: `cannot cast type unknown to anyenum`.)
+        | "anyarray"
+        | "anyrange"
+        | "anymultirange"
+        | "anycompatiblearray"
+        | "anycompatiblerange"
+        | "anycompatiblemultirange"
+        | "trigger"
+        | "event_trigger"
+        | "language_handler"
+        | "fdw_handler"
+        | "table_am_handler"
+        | "index_am_handler"
+        | "tsm_handler") => {
             let msg_name = match name {
                 "pg_brin_minmax_multi_summary" => "brin_minmax_multi_summary",
                 other => other,

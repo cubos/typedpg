@@ -1860,6 +1860,57 @@ pub(crate) fn array_element_type(snapshot: &PgCatalog, t: PgTypeOid) -> Option<P
     crate::coerce::element_type(snapshot.unwrap_domain(t), snapshot)
 }
 
+/// PG's `coerce_record_to_complex` (parse_coerce.c), which converts a
+/// `record` value to a composite type field by field: it needs those
+/// fields at parse time, so only a `ROW(...)` (or `(a, b)`) or a whole-row
+/// reference (`s`, `s.*` — a whole-row Var) converts; anything else of type
+/// `record` — a parameter, `NULL::record`, a scalar subquery, a function
+/// result, a CASE — is `cannot cast type record to t`, while
+/// `can_coerce_type` accepted the pair. A cast to `record` itself changes
+/// nothing (`coerce_type` returns a record operand as it is), so
+/// `ROW(1, 'a')::record::t` still converts.
+///
+/// A column reference naming a column (`r::t` over `SELECT ROW(1, 'a') r`)
+/// is a Var of that column, not a whole-row one, and is refused too; one
+/// naming no column of `scope` reads as a whole row (or, in a SQL function
+/// body, a parameter — accepted, never rejecting valid SQL).
+pub(crate) fn record_converts_to_complex(node: &protobuf::Node, scope: &Scope) -> bool {
+    match node.node.as_ref() {
+        Some(node::Node::RowExpr(_)) => true,
+        Some(node::Node::ColumnRef(cr)) => {
+            if cr
+                .fields
+                .iter()
+                .any(|f| matches!(f.node.as_ref(), Some(node::Node::AStar(_))))
+            {
+                return true;
+            }
+            let parts = extract_string_fields(&cr.fields);
+            let (table, column) = match parts.as_slice() {
+                [col] => (None, col.as_str()),
+                [tbl, col] | [_, tbl, col] => (Some(tbl.as_str()), col.as_str()),
+                _ => return true,
+            };
+            scope.resolve_column(table, column, None).is_err()
+        }
+        Some(node::Node::TypeCast(tc)) => {
+            let to_record = tc.type_name.as_ref().is_some_and(|tn| {
+                tn.array_bounds.is_empty()
+                    && matches!(
+                        tn.names.last().and_then(|n| n.node.as_ref()),
+                        Some(node::Node::String(s)) if s.sval == "record"
+                    )
+            });
+            to_record
+                && tc
+                    .arg
+                    .as_deref()
+                    .is_some_and(|arg| record_converts_to_complex(arg, scope))
+        }
+        _ => false,
+    }
+}
+
 /// Return `text` when `node` is an untyped string literal (`'x'`) and its
 /// inferred type is still UNKNOWN. Used by constructs that need to treat a
 /// bare string constant as text for type-compatibility checks — NULLIF,

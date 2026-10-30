@@ -309,9 +309,17 @@ fn record_array_parameters_and_casts() {
         ("SELECT ARRAY[ROW(1, 2)] = $1", 1, vec![bool_ty()]),
         ("SELECT ARRAY[ROW(1, 2)] < $1", 1, vec![bool_ty()]),
         ("SELECT $1::record[] = $2", 2, vec![bool_ty()]),
-        ("SELECT ARRAY[ROW(1, 2)] = ARRAY[ROW(1, 2)]", 0, vec![bool_ty()]),
+        (
+            "SELECT ARRAY[ROW(1, 2)] = ARRAY[ROW(1, 2)]",
+            0,
+            vec![bool_ty()],
+        ),
         ("SELECT ROW(1, 2) = ANY($1::record[])", 1, vec![bool_ty()]),
-        ("SELECT 1 FROM (SELECT unnest($1::record[])) s", 1, vec![int4()]),
+        (
+            "SELECT 1 FROM (SELECT unnest($1::record[])) s",
+            1,
+            vec![int4()],
+        ),
     ] {
         let s = db
             .analyze(sql)
@@ -343,6 +351,136 @@ fn record_array_parameters_and_casts() {
     ] {
         let err = db.analyze(sql).unwrap_err().to_string();
         assert!(err.starts_with(msg), "`{sql}`: {err}");
+    }
+}
+
+#[test]
+fn casts_from_records_and_record_arrays_follow_can_coerce_type() {
+    // An explicit cast is PG's can_coerce_type under COERCION_EXPLICIT:
+    // nothing converts *from* `record[]` but the I/O conversion to a string
+    // type, `record` only to and from composites, and a row type only to
+    // the one it inherits from or is the typed table of. A `record` value
+    // converts to a composite only when its fields are known at parse time
+    // (coerce_record_to_complex): a ROW(...) or a whole-row reference.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE t (a int, b text);
+         CREATE TABLE u (x int);
+         CREATE TABLE child () INHERITS (t);
+         CREATE TYPE ct AS (a int, b text);
+         CREATE TABLE typed OF ct;",
+    )
+    .unwrap();
+    for (sql, msg) in [
+        (
+            "SELECT $1::record[]::record",
+            "cannot cast type record[] to record",
+        ),
+        (
+            "SELECT $1::record[]::t[]",
+            "cannot cast type record[] to t[]",
+        ),
+        (
+            "SELECT $1::record[]::int[]",
+            "cannot cast type record[] to integer[]",
+        ),
+        (
+            "SELECT ARRAY[ROW(1, 'a')]::record[]::t[]",
+            "cannot cast type record[] to t[]",
+        ),
+        (
+            "SELECT $1::int[]::record[]",
+            "cannot cast type integer[] to record[]",
+        ),
+        (
+            "SELECT $1::record::record[]",
+            "cannot cast type record to record[]",
+        ),
+        (
+            "SELECT $1::record::int",
+            "cannot cast type record to integer",
+        ),
+        (
+            "SELECT $1::int::record",
+            "cannot cast type integer to record",
+        ),
+        ("SELECT 1::record", "cannot cast type integer to record"),
+        ("SELECT $1::t::int", "cannot cast type t to integer"),
+        ("SELECT $1::t::u", "cannot cast type t to u"),
+        ("SELECT $1::ct::typed", "cannot cast type ct to typed"),
+        ("SELECT $1::child[]::t[]", "cannot cast type child[] to t[]"),
+        ("SELECT 1::unknown", "cannot cast type integer to unknown"),
+        ("SELECT 1::anyarray", "cannot cast type integer to anyarray"),
+        (
+            "SELECT ARRAY[1]::anynonarray",
+            "cannot cast type integer[] to anynonarray",
+        ),
+        // Elements of an ARRAY[...] cast to an array type are cast to its
+        // element type.
+        (
+            "SELECT ARRAY[ROW(1, 2)]::int[]",
+            "cannot cast type record to integer",
+        ),
+        (
+            "SELECT ARRAY[ROW(1, 2, 3)]::t[]",
+            "cannot cast type record to t",
+        ),
+        ("SELECT ARRAY[ROW(1)]::t[]", "cannot cast type record to t"),
+        (
+            "SELECT ARRAY[ROW(1, 2)]::u[]",
+            "cannot cast type record to u",
+        ),
+        (
+            "SELECT ARRAY[$1::record]::t[]",
+            "cannot cast type record to t",
+        ),
+        // A record whose fields aren't known at parse time.
+        ("SELECT $1::record::t", "cannot cast type record to t"),
+        ("SELECT NULL::record::t", "cannot cast type record to t"),
+        ("SELECT $1::text::record::t", "cannot cast type record to t"),
+        (
+            "SELECT (SELECT ROW(1, 'a'))::t",
+            "cannot cast type record to t",
+        ),
+        (
+            "SELECT r::t FROM (SELECT ROW(1, 'a') r) c",
+            "cannot cast type record to t",
+        ),
+    ] {
+        let err = db
+            .analyze(sql)
+            .err()
+            .unwrap_or_else(|| panic!("PG rejects `{sql}`"))
+            .to_string();
+        assert!(err.starts_with(msg), "`{sql}`: {err}");
+    }
+    for sql in [
+        "SELECT $1::record[]::text",
+        "SELECT $1::record[]::text[]",
+        "SELECT $1::record[]::record[]",
+        "SELECT $1::t[]::record[]",
+        "SELECT $1::t[]::text[]",
+        "SELECT ARRAY[$1::t]::record[]",
+        "SELECT ARRAY[ROW(1, 'a')]::record[]",
+        "SELECT ARRAY[ROW(1, 2)]::t[]",
+        "SELECT ARRAY[ARRAY[ROW(1, 'a')]]::t[]",
+        "SELECT ARRAY[s]::t[] FROM (SELECT 1, 'a') s",
+        "SELECT $1::text::record",
+        "SELECT $1::record::text",
+        "SELECT ROW(1, 'a')::record::t",
+        "SELECT s::t FROM (SELECT 1, 'a') s",
+        "SELECT (s.*)::t FROM (SELECT 1, 'a') s",
+        "WITH c AS (SELECT 1, 'a') SELECT c::t FROM c",
+        "SELECT $1::child::t",
+        "SELECT $1::typed::ct",
+        "SELECT $1::int2vector::int[]",
+        "SELECT 1::anyelement",
+        "SELECT '1'::anyelement",
+        "SELECT 1::\"any\"",
+        "SELECT ARRAY[1]::anyarray",
+    ] {
+        db.analyze(sql)
+            .unwrap_or_else(|e| panic!("PG accepts `{sql}`: {e}"));
     }
 }
 
