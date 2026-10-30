@@ -219,6 +219,16 @@ pub(crate) fn analyze_insert_with_outer_ctes(
     if let (Some(on_conflict), Some(arbiter)) = (&ins.on_conflict_clause, &arbiter) {
         validate_on_conflict_target(on_conflict, arbiter, snapshot, tgt.oid, &tgt.relname)?;
     }
+    // Every execution evaluates the rows the SELECT yields. (Not followed
+    // in a WITH, whose earlier CTEs its names could mean.)
+    if let Some(node::Node::SelectStmt(sel)) =
+        ins.select_stmt.as_deref().and_then(|s| s.node.as_ref())
+        && outer_ctes.is_empty()
+        && ins.with_clause.as_ref().is_none_or(|w| !w.recursive)
+    {
+        let ctes = ins.with_clause.as_ref().map_or(&[][..], |w| &w.ctes[..]);
+        super::failing_rows::check_insert_select(sel, ctes, tgt.oid, snapshot)?;
+    }
 
     Ok((columns, None))
 }

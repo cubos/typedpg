@@ -2369,6 +2369,165 @@ fn a_query_is_not_executed_where_it_is_only_stored() {
 }
 
 #[test]
+fn a_null_domain_cast_fails_where_every_execution_evaluates_its_row() {
+    // PG 18 evaluates a select list for each row that reaches it: a WHERE
+    // the planner folds to true keeps the row (`y = 1` over the view's
+    // `1 AS y`), a LIMIT other than 0 returns it, an OFFSET skips it only
+    // after fetching it, and a scalar or ARRAY subquery reads its column.
+    // A WHERE that may be false, LIMIT 0, an EXISTS (whose select list
+    // the planner drops) or a FROM item whose rows are unknown leave it
+    // unevaluated.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE DOMAIN d AS int NOT NULL;
+         CREATE TABLE t (a int);
+         CREATE TABLE r (a int);
+         CREATE RULE r_nothing AS ON INSERT TO r DO INSTEAD NOTHING;
+         CREATE VIEW v AS SELECT NULL::d AS x, 1 AS y;
+         CREATE VIEW vs AS SELECT NULL::d AS x, 'a' AS y;
+         CREATE VIEW vu AS SELECT 1 AS a UNION ALL SELECT NULL::d;",
+    )]);
+    let domain = Some("domain d does not allow null values");
+    for (sql, fails) in [
+        ("SELECT x FROM v LIMIT 1", domain),
+        ("SELECT x FROM v LIMIT 2", domain),
+        ("SELECT x FROM v LIMIT ALL", domain),
+        ("SELECT x FROM v LIMIT NULL", domain),
+        ("SELECT x FROM v LIMIT 1 OFFSET 0", domain),
+        ("SELECT x FROM v OFFSET 1", domain),
+        ("SELECT x FROM v ORDER BY y LIMIT 1", domain),
+        (
+            "SELECT x FROM v ORDER BY 1 FETCH FIRST 1 ROW WITH TIES",
+            domain,
+        ),
+        ("SELECT x FROM v WHERE y = 1", domain),
+        ("SELECT x FROM v WHERE y <> 2", domain),
+        ("SELECT x FROM v WHERE y > 0 AND y < 5", domain),
+        ("SELECT x FROM v WHERE y = 1 OR y = 2", domain),
+        ("SELECT x FROM v WHERE NOT (y = 2)", domain),
+        ("SELECT x FROM v WHERE y IN (1, 2)", domain),
+        ("SELECT x FROM v WHERE y IS NOT NULL", domain),
+        ("SELECT x FROM v WHERE y = '1'", domain),
+        ("SELECT x FROM v WHERE true", domain),
+        ("SELECT x FROM v WHERE 'a' = 'a'", domain),
+        ("SELECT x FROM vs WHERE y = 'a'", domain),
+        ("SELECT x FROM v WHERE y = 1 LIMIT 1", domain),
+        ("SELECT x IS NULL FROM v", domain),
+        ("SELECT 1 FROM v WHERE x IS NULL", domain),
+        ("SELECT 1 FROM v WHERE x IS NULL AND y = 1", domain),
+        (
+            "SELECT count(*) FROM (SELECT 1 FROM v WHERE x IS NULL) s",
+            domain,
+        ),
+        ("SELECT (SELECT x FROM v)", domain),
+        ("SELECT (SELECT x FROM v) IS NULL", domain),
+        ("SELECT ARRAY(SELECT x FROM v)", domain),
+        ("SELECT ARRAY(SELECT a FROM vu)", domain),
+        ("SELECT (SELECT NULL::d)", domain),
+        ("SELECT (SELECT x FROM v LIMIT 1)", domain),
+        ("SELECT 1 FROM v WHERE (SELECT x FROM v) IS NULL", domain),
+        (
+            "WITH c AS (SELECT x FROM v) SELECT (SELECT x FROM c)",
+            domain,
+        ),
+        (
+            "SELECT x FROM (SELECT (SELECT x FROM v) AS x, 1 AS y) s",
+            domain,
+        ),
+        (
+            "SELECT x FROM (SELECT NULL::d AS x, 1 AS y) s WHERE y = 1",
+            domain,
+        ),
+        (
+            "SELECT x FROM (SELECT NULL::d AS x, 1 AS y) s LIMIT 1",
+            domain,
+        ),
+        (
+            "SELECT x FROM (SELECT NULL::d AS x, 1 AS y LIMIT 1) s",
+            domain,
+        ),
+        (
+            "SELECT x FROM (SELECT NULL::d AS x, 1 AS y WHERE 1 = 1) s",
+            domain,
+        ),
+        ("SELECT x FROM (SELECT NULL::d AS x OFFSET 1) s", domain),
+        ("SELECT 1 EXCEPT SELECT NULL::d", domain),
+        ("SELECT NULL::d INTERSECT SELECT 1", domain),
+        ("SELECT NULL::d, generate_series(1, 0)", domain),
+        (
+            "SELECT x FROM (SELECT x, generate_series(1, 0) AS g FROM v) s",
+            domain,
+        ),
+        ("SELECT x FROM v WHERE y = 2", None),
+        ("SELECT x FROM v WHERE y = 1 AND y = 2", None),
+        ("SELECT x FROM v WHERE y IN (2, 3)", None),
+        ("SELECT x FROM v WHERE NULL", None),
+        ("SELECT x FROM v WHERE y IS NULL", None),
+        ("SELECT x FROM vs WHERE y = 'b'", None),
+        ("SELECT x FROM v WHERE y = $1", None),
+        ("SELECT x FROM v LIMIT 0", None),
+        ("SELECT x FROM v LIMIT $1", None),
+        ("SELECT y FROM v LIMIT 1", None),
+        ("SELECT 1 FROM v WHERE x IS NULL AND y = 2", None),
+        ("SELECT 1 FROM v WHERE y = 2 AND x IS NULL", None),
+        ("SELECT EXISTS (SELECT x FROM v)", None),
+        ("SELECT 1 WHERE EXISTS (SELECT x FROM v)", None),
+        ("SELECT (SELECT x FROM v) FROM t", None),
+        ("SELECT (SELECT x FROM v LIMIT 0)", None),
+        ("SELECT (SELECT x FROM v WHERE y = 2)", None),
+        ("SELECT (SELECT y FROM v)", None),
+        (
+            "SELECT y FROM (SELECT (SELECT x FROM v) AS x, 1 AS y) s",
+            None,
+        ),
+        ("SELECT NULL::d FROM (SELECT 1 OFFSET 1) s", None),
+        (
+            "SELECT NULL::d FROM (SELECT generate_series(1, 0) AS g) s",
+            None,
+        ),
+        ("SELECT a FROM vu LIMIT 1", None),
+        ("SELECT 1 UNION ALL SELECT NULL::d LIMIT 1", None),
+        ("SELECT 1 WHERE false INTERSECT SELECT NULL::d", None),
+        ("SELECT 1 WHERE false EXCEPT SELECT NULL::d", None),
+        (
+            "(SELECT 1 UNION ALL SELECT NULL::d) INTERSECT SELECT 1 WHERE false",
+            None,
+        ),
+        ("INSERT INTO t SELECT x FROM v", domain),
+        ("INSERT INTO t (a) SELECT x FROM v LIMIT 1", domain),
+        ("INSERT INTO t SELECT x FROM v RETURNING a", domain),
+        ("INSERT INTO t SELECT x FROM v UNION ALL SELECT 1", domain),
+        ("INSERT INTO t SELECT (SELECT x FROM v)", domain),
+        ("INSERT INTO t SELECT NULL::d", domain),
+        ("INSERT INTO t VALUES (NULL::d)", domain),
+        (
+            "WITH c AS (SELECT x FROM v) INSERT INTO t SELECT x FROM c",
+            domain,
+        ),
+        ("INSERT INTO t SELECT y FROM v", None),
+        ("INSERT INTO t SELECT x FROM v WHERE y = 2", None),
+        ("INSERT INTO t SELECT x FROM v LIMIT 0", None),
+        ("INSERT INTO r SELECT x FROM v", None),
+        // A data-modifying WITH query runs whether read or not.
+        ("WITH i AS (INSERT INTO t SELECT x FROM v) SELECT 1", domain),
+        // A CTE named like the view hides it.
+        (
+            "WITH v AS (SELECT 1 AS x), i AS (INSERT INTO t SELECT x FROM v) SELECT 1",
+            None,
+        ),
+        ("WITH v AS (SELECT 1 AS x) SELECT (SELECT x FROM v)", None),
+    ] {
+        match (db.analyze(sql), fails) {
+            (Err(err), Some(msg)) => {
+                assert!(err.to_string().starts_with(msg), "{sql}\n  got: {err}")
+            }
+            (Ok(_), None) => {}
+            (other, _) => panic!("{sql}: {other:?}"),
+        }
+    }
+}
+
+#[test]
 fn a_conditional_rule_qualifies_the_rules_its_action_fires() {
     // PG 18 rewriteRuleAction ANDs a conditional rule's qualification into
     // its action, and the action's qualification into the actions of the
