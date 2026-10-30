@@ -591,7 +591,7 @@ fn analyze_select_here(
     // Named-window references: `OVER w` (and `OVER (w …)` inheritance) must
     // name a window defined in this SELECT's WINDOW clause — PG (42704):
     // `window "w" does not exist`. Window calls only appear in the target
-    // list and ORDER BY.
+    // list, ORDER BY and DISTINCT ON.
     let defined_windows: std::collections::HashSet<&str> = sel
         .window_clause
         .iter()
@@ -613,6 +613,9 @@ fn analyze_select_here(
         {
             check_window_refs(inner, &defined_windows)?;
         }
+    }
+    for distinct_node in &sel.distinct_clause {
+        check_window_refs(distinct_node, &defined_windows)?;
     }
     // The WINDOW clause's own definitions, and the inline windows that
     // inherit from them (PG's transformWindowDefinitions).
@@ -1179,115 +1182,45 @@ fn values_sort_and_limit(
     Ok(scope.sources)
 }
 
-/// Recursively find window-function calls and verify that any *named*
-/// window they reference (`OVER w` sets `WindowDef.name`; `OVER (w …)`
-/// inheritance sets `refname`) is defined in the SELECT's WINDOW clause.
-/// SubLinks are skipped — their windows belong to the inner query.
+/// Find window calls (a function's or a JSON aggregate's) and verify that
+/// any *named* window they reference (`OVER w` sets `WindowDef.name`;
+/// `OVER (w …)` inheritance sets `refname`) is defined in the SELECT's
+/// WINDOW clause. SubLinks are skipped — their windows belong to the inner
+/// query.
 fn check_window_refs(
     node: &protobuf::Node,
     defined: &std::collections::HashSet<&str>,
 ) -> Result<(), AnalyzeError> {
-    let Some(inner) = node.node.as_ref() else {
-        return Ok(());
-    };
-    let check_name = |name: &str, location: i32| -> Result<(), AnalyzeError> {
-        if !name.is_empty() && !defined.contains(name) {
-            // PG positions it at the window's name.
-            let span = crate::error::SourceSpan::from_node_qname(location);
-            return Err(crate::pgmsg::window_does_not_exist(name, span).finalize_implicit());
+    let mut missing: Option<(&str, i32)> = None;
+    visit_same_level(node, &mut |n| {
+        let over = match n.node.as_ref() {
+            Some(node::Node::FuncCall(fc)) => fc.over.as_deref(),
+            Some(node::Node::JsonObjectAgg(a)) => {
+                a.constructor.as_deref().and_then(|c| c.over.as_deref())
+            }
+            Some(node::Node::JsonArrayAgg(a)) => {
+                a.constructor.as_deref().and_then(|c| c.over.as_deref())
+            }
+            _ => None,
+        };
+        if missing.is_none()
+            && let Some(over) = over
+            && let Some(name) = [over.name.as_str(), over.refname.as_str()]
+                .into_iter()
+                .find(|name| !name.is_empty() && !defined.contains(name))
+        {
+            missing = Some((name, over.location));
         }
-        Ok(())
-    };
-    match inner {
-        node::Node::FuncCall(fc) => {
-            if let Some(over) = &fc.over {
-                check_name(&over.name, over.location)?;
-                check_name(&over.refname, over.location)?;
-            }
-            for arg in &fc.args {
-                check_window_refs(arg, defined)?;
-            }
-            if let Some(f) = &fc.agg_filter {
-                check_window_refs(f, defined)?;
-            }
-        }
-        node::Node::AExpr(e) => {
-            if let Some(l) = &e.lexpr {
-                check_window_refs(l, defined)?;
-            }
-            if let Some(r) = &e.rexpr {
-                check_window_refs(r, defined)?;
-            }
-        }
-        node::Node::BoolExpr(b) => {
-            for a in &b.args {
-                check_window_refs(a, defined)?;
-            }
-        }
-        node::Node::TypeCast(c) => {
-            if let Some(a) = &c.arg {
-                check_window_refs(a, defined)?;
-            }
-        }
-        node::Node::NamedArgExpr(na) => {
-            if let Some(a) = &na.arg {
-                check_window_refs(a, defined)?;
-            }
-        }
-        node::Node::CaseExpr(c) => {
-            for w in &c.args {
-                check_window_refs(w, defined)?;
-            }
-            if let Some(d) = &c.defresult {
-                check_window_refs(d, defined)?;
-            }
-        }
-        node::Node::CaseWhen(w) => {
-            if let Some(e) = &w.expr {
-                check_window_refs(e, defined)?;
-            }
-            if let Some(r) = &w.result {
-                check_window_refs(r, defined)?;
-            }
-        }
-        node::Node::CoalesceExpr(c) => {
-            for a in &c.args {
-                check_window_refs(a, defined)?;
-            }
-        }
-        node::Node::MinMaxExpr(m) => {
-            for a in &m.args {
-                check_window_refs(a, defined)?;
-            }
-        }
-        node::Node::NullTest(t) => {
-            if let Some(a) = &t.arg {
-                check_window_refs(a, defined)?;
-            }
-        }
-        node::Node::BooleanTest(t) => {
-            if let Some(a) = &t.arg {
-                check_window_refs(a, defined)?;
-            }
-        }
-        node::Node::AArrayExpr(a) => {
-            for e in &a.elements {
-                check_window_refs(e, defined)?;
-            }
-        }
-        node::Node::RowExpr(r) => {
-            for a in &r.args {
-                check_window_refs(a, defined)?;
-            }
-        }
-        node::Node::List(l) => {
-            for i in &l.items {
-                check_window_refs(i, defined)?;
-            }
-        }
-        _ => {}
+    });
+    match missing {
+        // PG positions it at the window's name.
+        Some((name, location)) => Err(crate::pgmsg::window_does_not_exist(
+            name,
+            crate::error::SourceSpan::from_node_qname(location),
+        )
+        .finalize_implicit()),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// findTargetlistEntrySQL92's constant rule for an ORDER BY / GROUP BY /

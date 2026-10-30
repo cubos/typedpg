@@ -161,9 +161,12 @@ fn resolve_type(
         let extension = snapshot.extension_of_type(type_oid).map(str::to_owned);
 
         // Arrays first: in PG, `_int4` is typtype=Base + typcategory=Array +
-        // typelem=int4. They aren't a separate `typtype`.
-        if te.typcategory == TypCategory::Array
-            && let Some(elem) = te.typelem
+        // typelem=int4. They aren't a separate `typtype`. `_record` is a
+        // pseudo-type of category P, and as true an array (PG's Describe
+        // says `record[]`): the array type of its element.
+        if let Some(elem) = te.typelem
+            && (te.typcategory == TypCategory::Array
+                || snapshot.array_type_of(elem) == Some(type_oid))
         {
             // Array columns store the modifier on the element type
             // (`varchar(20)[]` → element typmod = 24, array typmod = -1).

@@ -682,6 +682,12 @@ mod tests {
                 .message
                 .contains("anonymous record")
         );
+        // `ROW(…) = ANY($rs)` types `$rs` `record[]`, an array of them.
+        assert!(
+            err("SELECT (id, name) = ANY($rs) FROM users")
+                .message
+                .contains("anonymous record")
+        );
         assert!(
             err("SELECT id FROM users WHERE id IN $..ids AND name = $ids")
                 .message

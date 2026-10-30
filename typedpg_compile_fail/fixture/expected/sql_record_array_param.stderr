@@ -1,0 +1,8 @@
+error: no Rust mapping for PostgreSQL type pg_catalog.record — cast it in the query to a type that has one (e.g. `::text`), or add it to [package.metadata.typedpg.types] in your Cargo.toml
+ --> src/bin/sql_record_array_param.rs:6:5
+  |
+6 |     typedpg::sql!(db, "SELECT (id, name) = ANY($rows) AS hit FROM users")
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the macro `typedpg::sql` (in Nightly builds, run with -Z macro-backtrace for more info)
+

@@ -340,24 +340,17 @@ fn json_agg_modifiers(
     if let Some(filter) = ac.agg_filter.as_deref() {
         crate::clause::coerce_clause_expr(filter, ctx, params, crate::clause::ClauseKind::Filter)?;
     }
-    let sort_items = ac.agg_order.iter().chain(
-        ac.over
-            .as_deref()
-            .map(|w| w.order_clause.as_slice())
-            .unwrap_or_default(),
-    );
-    for item in sort_items {
+    for item in &ac.agg_order {
         if let Some(node::Node::SortBy(sb)) = item.node.as_ref()
             && let Some(inner) = sb.node.as_deref()
         {
             infer_expr(inner, ctx, params, TypeGoal::NONE)?;
+            // transformJsonAggConstructor's transformSortClause.
+            crate::expr::resolve_unknown_key(inner, ctx.snapshot, params)?;
         }
     }
-    if let Some(over) = ac.over.as_deref() {
-        for item in &over.partition_clause {
-            infer_expr(item, ctx, params, TypeGoal::NONE)?;
-        }
-    }
+    // Its window, like a function's, is transformed with the query's
+    // windows (`check_window_clause`).
     Ok(())
 }
 

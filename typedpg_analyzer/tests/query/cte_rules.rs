@@ -112,7 +112,10 @@ fn search_sequence_column_types() {
             "{TREE_CTE} SEARCH DEPTH FIRST BY id SET ord SELECT * FROM r"
         ))
         .unwrap();
-    assert_eq!(col(&s, "ord").pg_type, basic("pg_catalog", "_record"));
+    assert_eq!(
+        col(&s, "ord").pg_type,
+        array_of(basic("pg_catalog", "record"))
+    );
     assert!(!col(&s, "ord").nullable);
     let s = db
         .analyze(&format!(

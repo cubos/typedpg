@@ -224,8 +224,10 @@ impl AssignTarget {
 
 /// The value source of one SET item after multi-assignment expansion.
 enum SetValue<'a> {
-    /// `col = expr`, or one element of `(a, b) = ROW(x, y)`.
-    Expr(&'a protobuf::Node),
+    /// `col = expr`, or one element of `(a, b) = ROW(x, y)`; and whether
+    /// it is a bare `$N` transformed while `$N` was untyped
+    /// ([`crate::expr::replay_transform`]).
+    Expr(&'a protobuf::Node, bool),
     /// Column `n` of `(a, b) = (SELECT …)`.
     SubqueryColumn(Box<RawColumn>),
 }
@@ -290,10 +292,27 @@ pub(crate) fn expand_multi_assign_rows<'a>(
 /// (parse_expr.c): a `ROW(…)` source contributes its elements, a sub-SELECT
 /// its output columns (analyzed once, as a correlated subquery); anything
 /// else is 0A000. The counts must agree (42601).
+///
+/// transformUpdateTargetList transforms every value — a sub-SELECT at its
+/// place in the list — then coerces each to its column: the values are
+/// replayed in that order ([`crate::expr::TransformReplay`]), so a bare
+/// `$N` before a sub-SELECT that types it is still an untyped node.
 fn expand_set_items<'a>(
     target_list: &'a [protobuf::Node],
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
+) -> Result<Vec<(&'a protobuf::ResTarget, SetValue<'a>)>, AnalyzeError> {
+    let mut replay = crate::expr::TransformReplay::new(params);
+    let out = expand_set_items_replayed(target_list, ctx, params, &mut replay);
+    replay.finish(params);
+    out
+}
+
+fn expand_set_items_replayed<'a>(
+    target_list: &'a [protobuf::Node],
+    ctx: Ctx<'_>,
+    params: &mut ParamCollector,
+    replay: &mut crate::expr::TransformReplay,
 ) -> Result<Vec<(&'a protobuf::ResTarget, SetValue<'a>)>, AnalyzeError> {
     let mut out = Vec::with_capacity(target_list.len());
     let mut subquery_cols: Vec<RawColumn> = Vec::new();
@@ -305,7 +324,8 @@ fn expand_set_items<'a>(
             continue;
         };
         let Some(node::Node::MultiAssignRef(mar)) = val.node.as_ref() else {
-            out.push((rt.as_ref(), SetValue::Expr(val)));
+            let untyped = replay.item(val, ctx, params);
+            out.push((rt.as_ref(), SetValue::Expr(val, untyped)));
             continue;
         };
         let source = mar.source.as_deref();
@@ -326,7 +346,9 @@ fn expand_set_items<'a>(
                 if row.args.len() != ncolumns {
                     return Err(count_mismatch());
                 }
-                out.push((rt.as_ref(), SetValue::Expr(&row.args[colno - 1])));
+                let elem = &row.args[colno - 1];
+                let untyped = replay.item(elem, ctx, params);
+                out.push((rt.as_ref(), SetValue::Expr(elem, untyped)));
             }
             Some(node::Node::SubLink(sl))
                 if matches!(
@@ -340,14 +362,16 @@ fn expand_set_items<'a>(
                     else {
                         unreachable!("guarded above");
                     };
-                    let (cols, _) = crate::grouping::with_clause(Some("UPDATE"), || {
-                        analyze_correlated_select(
-                            sel,
-                            ctx.snapshot,
-                            params,
-                            ctx.scope,
-                            ctx.null_ctx,
-                        )
+                    let (cols, _) = replay.analyze_in_place(params, |params| {
+                        crate::grouping::with_clause(Some("UPDATE"), || {
+                            analyze_correlated_select(
+                                sel,
+                                ctx.snapshot,
+                                params,
+                                ctx.scope,
+                                ctx.null_ctx,
+                            )
+                        })
                     })?;
                     if cols.len() != ncolumns {
                         return Err(count_mismatch());
@@ -400,16 +424,6 @@ pub(crate) fn analyze_set_clause<'a>(
     let snapshot = ctx.snapshot;
     let target_list = expand_multi_assign_rows(target_list, ctx, params)?;
     let items = expand_set_items(&target_list, ctx, params)?;
-    // transformUpdateTargetList transforms every value, then coerces each
-    // to its column.
-    let values: Vec<&protobuf::Node> = items
-        .iter()
-        .filter_map(|(_, v)| match v {
-            SetValue::Expr(val) => Some(*val),
-            SetValue::SubqueryColumn(_) => None,
-        })
-        .collect();
-    let mut untyped = crate::expr::replay_transform(&values, ctx, params).into_iter();
     // `(column, indirected)` of every assignment, for the rewriter's
     // `multiple assignments to same column` rule.
     let mut assigned: Vec<(&str, bool)> = Vec::with_capacity(items.len());
@@ -444,10 +458,8 @@ pub(crate) fn analyze_set_clause<'a>(
         let target = assignment_target(tc, &rt.indirection, ctx, params)?;
         assigned.push((tc.attname.as_str(), target.indirected));
         match value {
-            SetValue::Expr(val) => {
-                if untyped.next() == Some(true)
-                    && let Some(node::Node::ParamRef(p)) = val.node.as_ref()
-                {
+            SetValue::Expr(val, untyped) => {
+                if untyped && let Some(node::Node::ParamRef(p)) = val.node.as_ref() {
                     crate::expr::coerce_untyped_param(p, target.type_oid, snapshot, params)?;
                 }
                 // Catch `UPDATE … SET not_null_col = NULL` statically — PG

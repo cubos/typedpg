@@ -1609,27 +1609,73 @@ pub(crate) fn replay_transform(
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Vec<bool> {
-    let mut scratch = params.clone();
+    let mut replay = TransformReplay::new(params);
     let untyped = items
         .iter()
-        .map(|item| match item.node.as_ref() {
+        .map(|item| replay.item(item, ctx, params))
+        .collect();
+    replay.finish(params);
+    untyped
+}
+
+/// [`replay_transform`], one item at a time, for a list whose items PG
+/// transforms in order with something else in between — a `(a, b) =
+/// (SELECT …)` in an UPDATE's SET list, whose subquery is transformed at
+/// its place in the list: [`Self::analyze_in_place`] runs that analysis on
+/// the real collector, seeing the types the items before it deduced.
+pub(crate) struct TransformReplay {
+    scratch: ParamCollector,
+}
+
+impl TransformReplay {
+    pub(crate) fn new(params: &ParamCollector) -> Self {
+        Self {
+            scratch: params.clone(),
+        }
+    }
+
+    /// Replays the transform of `item`; whether it is a bare `$N`
+    /// transformed while `$N` was untyped.
+    pub(crate) fn item(
+        &mut self,
+        item: &protobuf::Node,
+        ctx: Ctx<'_>,
+        params: &ParamCollector,
+    ) -> bool {
+        match item.node.as_ref() {
             Some(node::Node::ParamRef(p)) => {
-                let untyped =
-                    params.bound_arg(p.number).is_none() && scratch.get(p.number) == oid::UNKNOWN;
-                scratch.see(p.number);
+                let untyped = params.bound_arg(p.number).is_none()
+                    && self.scratch.get(p.number) == oid::UNKNOWN;
+                self.scratch.see(p.number);
                 untyped
             }
             _ => {
-                let before = scratch.clone();
-                if infer_expr(item, ctx, &mut scratch, TypeGoal::NONE).is_err() {
-                    scratch = before;
+                let before = self.scratch.clone();
+                if infer_expr(item, ctx, &mut self.scratch, TypeGoal::NONE).is_err() {
+                    self.scratch = before;
                 }
                 false
             }
-        })
-        .collect();
-    params.adopt_types(&scratch);
-    untyped
+        }
+    }
+
+    /// Runs `f` on `params` at this point of the list: with the types the
+    /// items replayed so far deduced, which then sees the types `f` deduces.
+    pub(crate) fn analyze_in_place<T>(
+        &mut self,
+        params: &mut ParamCollector,
+        f: impl FnOnce(&mut ParamCollector) -> T,
+    ) -> T {
+        params.adopt_types(&self.scratch);
+        let out = f(params);
+        self.scratch.adopt_types(params);
+        out
+    }
+
+    /// Keeps the types the replay deduced.
+    pub(crate) fn finish(self, params: &mut ParamCollector) {
+        params.adopt_types(&self.scratch);
+    }
 }
 
 /// `variable_coerce_param_hook` on a bare `$N` that was transformed while

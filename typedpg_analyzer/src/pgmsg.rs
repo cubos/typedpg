@@ -789,9 +789,6 @@ pub(crate) fn set_op_column_count(
     )
 }
 
-/// `could not find array type for data type T` — SQLSTATE 42704: typing a
-/// bare parameter as `T[]` when no such array type exists (T is itself an
-/// array).
 /// `op ANY/ALL (array) requires operator to yield boolean` — SQLSTATE 42809
 /// (make_scalar_array_op).
 pub(crate) fn any_all_operator_not_boolean(span: Option<SourceSpan>) -> RawError {
@@ -804,6 +801,9 @@ pub(crate) fn any_all_operator_not_boolean(span: Option<SourceSpan>) -> RawError
     )
 }
 
+/// `could not find array type for data type T` — SQLSTATE 42704: typing a
+/// bare parameter as `T[]` when no such array type exists (T is itself an
+/// array).
 pub(crate) fn no_array_type_for(type_name: &str) -> AnalyzeError {
     AnalyzeError::UndefinedObject(format!(
         "could not find array type for data type {type_name}"
