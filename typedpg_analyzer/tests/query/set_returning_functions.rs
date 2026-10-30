@@ -188,6 +188,59 @@ fn coldeflist_defines_record_function_columns() {
     assert_cols(&s, vec![cn("a", varchar_n(3)), cn("b", numeric_ps(5, 2))]);
 }
 
+/// get_type_func_class: a function returning a pseudo-type makes no
+/// relation, except `record`, `void` and `cstring` (42804).
+#[test]
+fn function_in_from_returning_a_pseudo_type() {
+    let db = setup_rte();
+    for (sql, function, type_name) in [
+        ("SELECT * FROM unknownin('a')", "unknownin", "unknown"),
+        (
+            "SELECT x::text AS x FROM unknownin('a') x",
+            "unknownin",
+            "unknown",
+        ),
+        (
+            "SELECT * FROM unknownin('a') WITH ORDINALITY",
+            "unknownin",
+            "unknown",
+        ),
+        (
+            "SELECT * FROM ROWS FROM (generate_series(1, 2), pg_catalog.unknownin('a'))",
+            "unknownin",
+            "unknown",
+        ),
+        (
+            "SELECT * FROM suppress_redundant_updates_trigger()",
+            "suppress_redundant_updates_trigger",
+            "trigger",
+        ),
+        (
+            "SELECT * FROM plpgsql_call_handler()",
+            "plpgsql_call_handler",
+            "language_handler",
+        ),
+    ] {
+        let message =
+            format!("function \"{function}\" in FROM has unsupported return type {type_name}");
+        assert_err_prefix!(db.analyze(sql), AnalyzeError::DatatypeMismatch(_), &message);
+    }
+    for sql in [
+        "SELECT * FROM pg_sleep(0)",
+        "SELECT * FROM textout('a')",
+        // Called in the select list, they are values like any other.
+        "SELECT suppress_redundant_updates_trigger() AS a",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    // A column definition list is refused first.
+    assert_err_prefix!(
+        db.analyze("SELECT * FROM unknownin('a') AS x(a int)"),
+        AnalyzeError::SyntaxError(_),
+        "a column definition list is only allowed for functions returning \"record\""
+    );
+}
+
 #[test]
 fn coldeflist_rejected_on_non_record_functions() {
     let db = setup_rte();

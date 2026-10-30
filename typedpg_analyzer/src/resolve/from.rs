@@ -1979,6 +1979,24 @@ fn function_rte_columns(
     if has_coldeflist {
         return Err(crate::pgmsg::coldeflist_only_for_record().finalize_implicit());
     }
+    // get_type_func_class: a pseudo-type other than `record`, `void` and
+    // `cstring` (`unknownin`, a trigger function) makes no relation —
+    // checked after the column definition list, as PG does.
+    const VOID: PgTypeOid = PgTypeOid::from_raw(2278);
+    const CSTRING: PgTypeOid = PgTypeOid::from_raw(2275);
+    if resolved.return_type_oid != VOID
+        && resolved.return_type_oid != CSTRING
+        && snapshot
+            .get_type(resolved.return_type_oid)
+            .is_some_and(|t| t.typtype == TypType::Pseudo)
+    {
+        return Err(crate::pgmsg::function_in_from_unsupported_return_type(
+            name,
+            &crate::ddl::util::format_type_for_message(snapshot, resolved.return_type_oid),
+            crate::error::SourceSpan::from_node_qname(func_call.location),
+        )
+        .finalize_implicit());
+    }
 
     // A strict catalog SRF's elements are NOT NULL unless the function
     // emits NULLs itself (`unnest` of an array with NULL elements); other

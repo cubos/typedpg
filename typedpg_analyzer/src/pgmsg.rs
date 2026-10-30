@@ -1192,6 +1192,23 @@ pub(crate) fn coldeflist_required() -> RawError {
     )
 }
 
+/// `function "f" in FROM has unsupported return type T` — SQLSTATE 42804,
+/// addRangeTableEntryForFunction's error for a function returning a
+/// pseudo-type that makes no relation (TYPEFUNC_OTHER).
+pub(crate) fn function_in_from_unsupported_return_type(
+    function: &str,
+    type_name: &str,
+    span: Option<SourceSpan>,
+) -> RawError {
+    RawError::new(
+        AnalyzeError::DatatypeMismatch(format!(
+            "function \"{function}\" in FROM has unsupported return type {type_name}"
+        )),
+        span,
+        None,
+    )
+}
+
 /// `a column definition list is only allowed for functions returning
 /// "record"` — SQLSTATE 42601.
 pub(crate) fn coldeflist_only_for_record() -> RawError {
@@ -1627,6 +1644,10 @@ mod tests {
             (too_many_column_aliases("t", 1, 2).kind, "42P10"),
             (values_lists_length(2, 1, None).kind, "42601"),
             (unknown_value_not_coercible("text", None).kind, "XX000"),
+            (
+                function_in_from_unsupported_return_type("unknownin", "unknown", None).kind,
+                "42804",
+            ),
             (no_on_conflict_arbiter("t").kind, "42P10"),
             (insert_non_default_into_generated("g", false).kind, "428C9"),
             (update_generated_to_non_default("g", true).kind, "428C9"),
