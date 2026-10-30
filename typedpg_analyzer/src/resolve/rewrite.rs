@@ -180,7 +180,7 @@ pub(crate) fn check_rewrite(
         snapshot,
         relid,
         rw,
-        0,
+        Reach::Statement,
         &mut execution_error,
         &mut Vec::new(),
         &mut rule_reads,
@@ -234,19 +234,47 @@ pub(crate) fn collect_rule_actions<R>(f: impl FnOnce() -> R) -> (R, Vec<RuleActi
     (out, actions)
 }
 
+/// Where a query `RewriteQuery` rewrites comes from, for the NOT NULL
+/// violation a bare `NULL` it writes raises at execution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reach {
+    /// The statement itself, whose analysis reported it.
+    Statement,
+    /// A product query run whenever the statement is: an unconditional
+    /// rule's action (whose analysis at CREATE RULE didn't report it), the
+    /// statement rewritten through a view to its base relation — reached
+    /// through those only.
+    Always,
+    /// A product query run only for the rows a rule's qualification
+    /// accepts: a conditional rule's action, and every product query
+    /// derived from it (rewriteRuleAction ANDs the query's qualification
+    /// into the actions of the rules it fires, and the view's rewrite keeps
+    /// it).
+    Conditional,
+}
+
+impl Reach {
+    /// The reach of a product query of this one: a rule's action
+    /// (`conditional` for a rule with a WHERE) or the view's rewrite.
+    fn product(self, conditional: bool) -> Reach {
+        if conditional || self == Reach::Conditional {
+            Reach::Conditional
+        } else {
+            Reach::Always
+        }
+    }
+}
+
 /// One `RewriteQuery` level. `execution_error` collects the NOT NULL
-/// violation a bare `NULL` written through a view to the base relation, or
-/// by an unconditional rule's action (whose analysis at CREATE RULE doesn't
-/// report it), raises at execution — after every rewriter error; `depth`
-/// is 0 where none is reported: for the statement itself, whose analysis
-/// did, and for a conditional rule's action, which runs only for the rows
-/// its qualification accepts; `rewrite_events` holds
-/// the (relation, event) pairs whose product queries are being rewritten.
+/// violation a bare `NULL` written by a product query that always runs
+/// (see [`Reach`]) raises at execution — after every rewriter error;
+/// `rewrite_events` holds the (relation, event) pairs whose product
+/// queries are being rewritten.
 fn rewrite_level(
     snapshot: &PgCatalog,
     relid: crate::oid::PgClassOid,
     rw: &Rewrite,
-    depth: usize,
+    reach: Reach,
     execution_error: &mut Option<AnalyzeError>,
     rewrite_events: &mut Vec<(crate::oid::PgClassOid, Option<DmlEvent>)>,
     rule_reads: &mut Vec<crate::oid::PgClassOid>,
@@ -333,7 +361,7 @@ fn rewrite_level(
         rule_reads.extend(rule_relations(snapshot, rule));
     }
 
-    if depth > 0 && !is_view && execution_error.is_none() {
+    if reach == Reach::Always && !is_view && execution_error.is_none() {
         let written = actions
             .iter()
             .filter_map(|a| Some((a.event?, &a.assigns)))
@@ -389,11 +417,11 @@ fn rewrite_level(
     // rewritten against a view's base relation (after the actions for
     // INSERT, before them otherwise) — are rewritten in turn; a relation
     // and event already being rewritten means the rules recurse.
-    let mut products: Vec<(&RuleAction, usize)> = matching
+    let mut products: Vec<(&RuleAction, Reach)> = matching
         .iter()
         .flat_map(|r| {
-            let depth = if r.conditional { 0 } else { depth + 1 };
-            r.actions.iter().map(move |p| (p, depth))
+            let reach = reach.product(r.conditional);
+            r.actions.iter().map(move |p| (p, reach))
         })
         .collect();
     if let Some(view) = &view_product {
@@ -402,19 +430,19 @@ fn rewrite_level(
         } else {
             0
         };
-        products.insert(at, (view, depth + 1));
+        products.insert(at, (view, reach.product(false)));
     }
     if product_queries || view_product.is_some() {
         if rewrite_events.contains(&(relid, event)) {
             return Err(crate::pgmsg::infinite_rule_recursion(relname).finalize_implicit());
         }
         rewrite_events.push((relid, event));
-        for ((target, product), depth) in products {
+        for ((target, product), reach) in products {
             rewrite_level(
                 snapshot,
                 *target,
                 product,
-                depth,
+                reach,
                 execution_error,
                 rewrite_events,
                 rule_reads,

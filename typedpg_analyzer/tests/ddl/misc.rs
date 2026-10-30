@@ -2248,6 +2248,64 @@ fn a_rule_action_is_not_executed_at_create_rule() {
 }
 
 #[test]
+fn a_conditional_rule_qualifies_the_rules_its_action_fires() {
+    // PG 18 rewriteRuleAction ANDs a conditional rule's qualification into
+    // its action, and the action's qualification into the actions of the
+    // rules it fires in turn, and keeps it through a view's rewrite: an
+    // unconditional rule reached through a conditional one writes its NULL
+    // only for the rows the condition accepts.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int NOT NULL, b int);
+         CREATE VIEW vt AS SELECT a, b FROM t;
+         CREATE TABLE u (x int);
+         CREATE RULE r_u AS ON INSERT TO u DO ALSO INSERT INTO t VALUES (NULL, new.x);
+         CREATE TABLE cond (x int);
+         CREATE RULE r_cond AS ON INSERT TO cond WHERE new.x > 0
+             DO ALSO INSERT INTO u VALUES (new.x);
+         CREATE TABLE cond_view (x int);
+         CREATE RULE r_cond_view AS ON INSERT TO cond_view WHERE new.x > 0
+             DO ALSO INSERT INTO vt VALUES (NULL, new.x);
+         CREATE TABLE cond_instead (x int);
+         CREATE RULE r_cond_instead AS ON INSERT TO cond_instead WHERE new.x > 0
+             DO INSTEAD INSERT INTO u VALUES (new.x);
+         CREATE TABLE u2 (x int);
+         CREATE RULE r_u2 AS ON INSERT TO u2 WHERE new.x > 0
+             DO ALSO INSERT INTO t VALUES (NULL, new.x);
+         CREATE TABLE uncond_then_cond (x int);
+         CREATE RULE r_uncond_then_cond AS ON INSERT TO uncond_then_cond
+             DO ALSO INSERT INTO u2 VALUES (new.x);
+         CREATE TABLE uncond (x int);
+         CREATE RULE r_uncond AS ON INSERT TO uncond DO ALSO INSERT INTO u VALUES (new.x);
+         INSERT INTO cond VALUES (-1);
+         INSERT INTO cond_view VALUES (-1);
+         INSERT INTO cond_instead VALUES (-1);
+         INSERT INTO uncond_then_cond VALUES (-1);",
+    )]);
+    for sql in [
+        "INSERT INTO cond VALUES ($1)",
+        "INSERT INTO cond_view VALUES ($1)",
+        "INSERT INTO cond_instead VALUES ($1)",
+        "INSERT INTO uncond_then_cond VALUES ($1)",
+    ] {
+        db.analyze(sql).expect(sql);
+    }
+    // Unconditional all the way down: every execution fails.
+    for sql in [
+        "INSERT INTO uncond VALUES ($1)",
+        "INSERT INTO u VALUES ($1)",
+    ] {
+        let err = db.analyze(sql).expect_err(sql);
+        assert!(
+            err.to_string().starts_with(
+                "null value in column \"a\" of relation \"t\" violates not-null constraint"
+            ),
+            "{sql}\n  got: {err}"
+        );
+    }
+}
+
+#[test]
 fn rules_depend_on_the_relations_their_actions_name() {
     // PG 18 InsertRule records the rule's dependencies on what its actions
     // and qualification read (recordDependencyOnExpr): dropping one needs
