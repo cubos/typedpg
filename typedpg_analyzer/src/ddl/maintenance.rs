@@ -292,7 +292,7 @@ pub fn copy(
         }
     }
     if let Some(query) = stmt.query.as_deref().and_then(|q| q.node.as_ref()) {
-        return super::dml::check_statement(interp, query);
+        return super::dml::check_executed(interp, query);
     }
     let Some(rv) = stmt.relation.as_ref() else {
         return Ok(());

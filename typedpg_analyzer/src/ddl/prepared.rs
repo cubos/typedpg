@@ -159,11 +159,13 @@ pub(crate) fn lookup_execute(
 }
 
 /// `EXECUTE name [(args)]`: the statement runs, its query re-analyzed
-/// against the current catalog (a changed schema replans it).
+/// against the current catalog (a changed schema replans it) — and
+/// planned, with the checks of a query that runs
+/// ([`crate::resolve::analyze_executed`]).
 pub(crate) fn execute(interp: &PgCatalog, stmt: &ExecuteStmt) -> Result<(), DdlError> {
     let prepared = lookup_execute(interp, stmt)?;
     if let Some(inner) = prepared.query.node.as_ref()
-        && let Err(e) = crate::expr::with_rewriting(true, || {
+        && let Err(e) = crate::resolve::analyze_executed(interp, inner, || {
             crate::resolve::analyze_raw_node_with_param_types(interp, inner, &prepared.param_types)
         })
         && let Some(e) = analysis_error(e)
@@ -188,11 +190,12 @@ pub(crate) fn deallocate(interp: &mut PgCatalog, stmt: &DeallocateStmt) -> Resul
     Ok(())
 }
 
-/// `DISCARD ALL` deallocates every prepared statement (among the rest of
-/// the session state the analyzer doesn't keep).
+/// `DISCARD ALL` deallocates every prepared statement and closes every
+/// cursor (among the rest of the session state the analyzer doesn't keep).
 pub(crate) fn discard(interp: &mut PgCatalog, stmt: &DiscardStmt) -> Result<(), DdlError> {
     if DiscardMode::try_from(stmt.target) == Ok(DiscardMode::DiscardAll) {
         interp.prepared_statements.clear();
+        interp.cursors.close_all();
     }
     Ok(())
 }

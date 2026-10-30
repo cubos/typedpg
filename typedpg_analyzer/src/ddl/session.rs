@@ -528,7 +528,8 @@ fn search_path_args(stmt: &VariableSetStmt) -> Option<Vec<String>> {
 }
 
 /// `COMMIT` / `ROLLBACK` (and their prepared / savepoint-less variants) end
-/// the transaction scope of `SET LOCAL`.
+/// the transaction scope of `SET LOCAL`, and close the transaction's
+/// cursors.
 pub(crate) fn transaction(interp: &mut PgCatalog, stmt: &TransactionStmt) -> Result<(), DdlError> {
     let kind = TransactionStmtKind::try_from(stmt.kind).unwrap_or(TransactionStmtKind::Undefined);
     if matches!(
@@ -537,6 +538,11 @@ pub(crate) fn transaction(interp: &mut PgCatalog, stmt: &TransactionStmt) -> Res
             | TransactionStmtKind::TransStmtRollback
             | TransactionStmtKind::TransStmtPrepare
     ) {
+        if kind == TransactionStmtKind::TransStmtRollback {
+            interp.cursors.abort();
+        } else {
+            interp.cursors.commit();
+        }
         interp.end_transaction_scope();
     }
     Ok(())
@@ -740,7 +746,10 @@ fn split_identifier_string(value: &str) -> Vec<String> {
 /// `EXPLAIN [(options)] statement` (ExplainQuery): the options are
 /// validated (ParseExplainOptionList), then the statement is analyzed and
 /// planned — and with ANALYZE, run (without, only its executor is
-/// started: see [`crate::resolve::planned_only`]).
+/// started: see [`crate::resolve::planned_only`]). Planning raises what it
+/// raises for a query that runs ([`super::dml::check_executed`]), even
+/// for `CREATE TABLE AS ... WITH NO DATA`, whose query EXPLAIN plans
+/// anyway.
 pub(crate) fn explain(
     interp: &mut PgCatalog,
     stmt: &typedpg_pg_query::protobuf::ExplainStmt,
@@ -751,65 +760,29 @@ pub(crate) fn explain(
     let Some(query) = stmt.query.as_deref().and_then(|q| q.node.as_ref()) else {
         return Ok(());
     };
-    if analyze {
-        return super::apply_statement(interp, query);
-    }
-    let interp = &*interp;
-    crate::resolve::planned_only(|| match query {
-        node::Node::ExecuteStmt(e) => super::prepared::execute(interp, e),
-        node::Node::CreateTableAsStmt(ctas) => {
-            match ctas.query.as_deref().and_then(|q| q.node.as_ref()) {
-                // ExplainExecuteQuery revalidates the cached plan.
-                Some(node::Node::ExecuteStmt(e)) => super::prepared::execute(interp, e),
-                Some(q) => super::dml::check_statement(interp, q),
-                None => Ok(()),
-            }
+    match query {
+        // ExplainOneUtility explains the cursor's query; no cursor opens.
+        node::Node::DeclareCursorStmt(d) if analyze => super::cursors::check_declare(interp, d),
+        node::Node::CreateTableAsStmt(ctas) if analyze => {
+            super::views::create_table_as_planned(interp, ctas, true)
         }
-        node::Node::DeclareCursorStmt(d) => declare_cursor(interp, d),
-        _ => super::dml::check_statement(interp, query),
-    })
-}
-
-/// `DECLARE name CURSOR FOR query`: the query is analyzed
-/// (transformDeclareCursorStmt) and rewritten when the cursor opens
-/// (PerformCursorOpen). Cursor names aren't tracked.
-pub(crate) fn declare_cursor(
-    interp: &PgCatalog,
-    stmt: &typedpg_pg_query::protobuf::DeclareCursorStmt,
-) -> Result<(), DdlError> {
-    // CURSOR_OPT_* (parsenodes.h).
-    const SCROLL: i32 = 0x0002;
-    const INSENSITIVE: i32 = 0x0008;
-    const HOLD: i32 = 0x0020;
-    let Some(query) = stmt.query.as_deref() else {
-        return Ok(());
-    };
-    let Some(inner) = query.node.as_ref() else {
-        return Ok(());
-    };
-    super::dml::check_statement(interp, inner)?;
-    if super::views::has_modifying_cte(query) {
-        return Err(DdlError::UnsupportedDdl(
-            "DECLARE CURSOR must not contain data-modifying statements in WITH".into(),
-        ));
-    }
-    let Some(strength) = first_row_mark_strength(inner) else {
-        return Ok(());
-    };
-    let refused = if stmt.options & HOLD != 0 {
-        Some(("CURSOR WITH HOLD", "supported", "Holdable"))
-    } else if stmt.options & SCROLL != 0 {
-        Some(("SCROLL CURSOR", "supported", "Scrollable"))
-    } else if stmt.options & INSENSITIVE != 0 {
-        Some(("INSENSITIVE CURSOR", "valid", "Insensitive"))
-    } else {
-        None
-    };
-    match refused {
-        Some((what, verdict, kind)) => Err(DdlError::UnsupportedDdl(format!(
-            "DECLARE {what} ... {strength} is not {verdict} ({kind} cursors must be READ ONLY.)"
-        ))),
-        None => Ok(()),
+        _ if analyze => super::apply_statement(interp, query),
+        _ => {
+            let interp = &*interp;
+            crate::resolve::planned_only(|| match query {
+                node::Node::DeclareCursorStmt(d) => super::cursors::check_declare(interp, d),
+                node::Node::ExecuteStmt(e) => super::prepared::execute(interp, e),
+                node::Node::CreateTableAsStmt(ctas) => {
+                    match ctas.query.as_deref().and_then(|q| q.node.as_ref()) {
+                        // ExplainExecuteQuery revalidates the cached plan.
+                        Some(node::Node::ExecuteStmt(e)) => super::prepared::execute(interp, e),
+                        Some(q) => super::dml::check_executed(interp, q),
+                        None => Ok(()),
+                    }
+                }
+                _ => super::dml::check_executed(interp, query),
+            })
+        }
     }
 }
 
@@ -818,7 +791,7 @@ pub(crate) fn declare_cursor(
 /// target — the relation it names first, or without `OF` the first
 /// relation or subquery of the FROM clause — at the strongest strength a
 /// clause asks of it (applyLockingClause keeps one mark per relation).
-fn first_row_mark_strength(stmt: &node::Node) -> Option<&'static str> {
+pub(super) fn first_row_mark_strength(stmt: &node::Node) -> Option<&'static str> {
     use typedpg_pg_query::protobuf::LockingClause;
     let node::Node::SelectStmt(sel) = stmt else {
         return None;

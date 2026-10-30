@@ -14,6 +14,7 @@ pub mod collations;
 mod comment;
 mod conversion_procs;
 pub(crate) mod conversions;
+pub(crate) mod cursors;
 mod defaults;
 pub(crate) mod depend;
 mod dml;
@@ -411,6 +412,15 @@ fn with_statement_sql(
     result
 }
 
+/// The statement being applied defines or runs user code, which may open
+/// or close cursors ([`cursors::Cursors::note_user_code`]).
+fn note_user_code(db: &mut PgCatalog) {
+    if let Some(text) = db.statement_sql.as_deref() {
+        let text = text.to_owned();
+        db.cursors.note_user_code(&text);
+    }
+}
+
 /// Dispatch a single parsed statement.
 fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError> {
     match stmt {
@@ -439,7 +449,11 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         node::Node::AlterSeqStmt(s) => sequences::alter_sequence(db, s),
 
         // ── Functions ───────────────────────────────────────────────
-        node::Node::CreateFunctionStmt(s) => functions::create_function(db, s),
+        node::Node::CreateFunctionStmt(s) => {
+            functions::create_function(db, s)?;
+            note_user_code(db);
+            Ok(())
+        }
         node::Node::AlterFunctionStmt(s) => functions::alter_function(db, s),
 
         // ── Views ───────────────────────────────────────────────────
@@ -482,14 +496,14 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         node::Node::TransactionStmt(s) => session::transaction(db, s),
         node::Node::SelectStmt(s) if s.into_clause.is_some() => views::select_into(db, s),
         node::Node::SelectStmt(s) => {
-            dml::check_statement(db, stmt)?;
+            dml::check_executed(db, stmt)?;
             session::select_side_effects(db, s)
         }
         node::Node::InsertStmt(_)
         | node::Node::UpdateStmt(_)
         | node::Node::DeleteStmt(_)
         | node::Node::MergeStmt(_)
-        | node::Node::CallStmt(_) => dml::check_statement(db, stmt),
+        | node::Node::CallStmt(_) => dml::check_executed(db, stmt),
 
         // ── Indexes ─────────────────────────────────────────────────
         // Indexes don't change query result types, but expression indexes
@@ -524,6 +538,7 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         // Compiled first (plpgsql_compile_inline), then run.
         node::Node::DoStmt(s) => {
             function_body::do_block(db, s)?;
+            note_user_code(db);
             do_block::execute(db, s)
         }
         node::Node::AlterExtensionContentsStmt(s) => extensions::alter_extension_contents(db, s),
@@ -550,7 +565,6 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         node::Node::AlterDefaultPrivilegesStmt(s) => acl::alter_default_privileges(db, s),
         node::Node::ConstraintsSetStmt(s) => session::set_constraints(db, s),
         node::Node::ExplainStmt(s) => session::explain(db, s),
-        node::Node::DeclareCursorStmt(s) => session::declare_cursor(db, s),
         node::Node::CreateTableSpaceStmt(s) => cluster::create_tablespace(db, s),
         node::Node::DropTableSpaceStmt(s) => cluster::drop_tablespace(db, s),
         node::Node::CreateSubscriptionStmt(s) => cluster::create_subscription(db, s),
@@ -566,14 +580,12 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         | node::Node::UnlistenStmt(_)
         // Statements PG accepts in a migration that don't change anything the
         // static analysis reads: DML and procedure calls (like the SELECT /
-        // INSERT above), prepared statements and cursors, statistics,
-        // database / role / system settings, ownership, publications and
-        // subscriptions, event triggers, operator families, text search
-        // configuration, foreign-data wrappers / servers / user mappings,
+        // INSERT above), statistics, database / role / system settings,
+        // ownership, publications and subscriptions, event triggers,
+        // operator families, text search configuration, foreign-data
+        // wrappers / servers / user mappings,
         // tablespaces, conversions, languages, transforms, security labels,
         // and type property changes (`ALTER TYPE t SET (...)`).
-        | node::Node::FetchStmt(_)
-        | node::Node::ClosePortalStmt(_)
         | node::Node::CheckPointStmt(_)
         | node::Node::LoadStmt(_)
         | node::Node::AlterDatabaseStmt(_)
@@ -593,6 +605,9 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         node::Node::ExecuteStmt(s) => prepared::execute(db, s),
         node::Node::DeallocateStmt(s) => prepared::deallocate(db, s),
         node::Node::DiscardStmt(s) => prepared::discard(db, s),
+        node::Node::DeclareCursorStmt(s) => cursors::declare(db, s),
+        node::Node::FetchStmt(s) => cursors::fetch(db, s),
+        node::Node::ClosePortalStmt(s) => cursors::close(db, s),
 
         // ── Unknown DDL — surface as an error ───────────────────────
         // Name the statement, never dump its tree.
