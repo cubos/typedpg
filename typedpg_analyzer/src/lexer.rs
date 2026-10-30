@@ -269,6 +269,9 @@ fn lex_with_base(sql: &str, base: usize) -> Result<(LexOutput, usize), LexError>
         });
     }
     let mut i = 0;
+    // Where the last whole identifier `E` / `e` ends: a quote right there
+    // opens an escape string.
+    let mut escape_prefix_end: Option<usize> = None;
     // Track byte position incrementally (avoids a separate Vec<usize> allocation).
     let char_byte_lens: Vec<u8> = sql.chars().map(|c| c.len_utf8() as u8).collect();
     let byte_offset_of =
@@ -279,12 +282,11 @@ fn lex_with_base(sql: &str, base: usize) -> Result<(LexOutput, usize), LexError>
             LexState::Normal => {
                 if chars[i] == '\'' {
                     // `E'…'` / `e'…'` escape strings: backslash escapes the
-                    // next char. The prefix only counts when the E is its own
-                    // token (not the tail of an identifier like `tablE` or
-                    // `a$E`).
-                    let escape = i > 0
-                        && matches!(chars[i - 1], 'E' | 'e')
-                        && (i < 2 || !(is_ident_char(chars[i - 2]) || chars[i - 2] == '$'));
+                    // next char. The prefix only counts when the E is a whole
+                    // identifier of its own (not the tail of one like `tablE`
+                    // or `a$E`) — after a dollar quote's closer (`$$a$$E'…'`)
+                    // it is.
+                    let escape = escape_prefix_end == Some(i);
                     state = LexState::StringLiteral(byte_offset_of(i, &char_byte_lens), escape);
                     out.push('\'');
                     i += 1;
@@ -494,6 +496,9 @@ fn lex_with_base(sql: &str, base: usize) -> Result<(LexOutput, usize), LexError>
                     let ident = read_sql_ident(&chars, i);
                     out.extend(ident);
                     i += ident.len();
+                    if matches!(ident, ['E' | 'e']) {
+                        escape_prefix_end = Some(i);
+                    }
                 } else {
                     out.push(chars[i]);
                     i += 1;
@@ -802,6 +807,16 @@ mod tests {
         let out = lex("SELECT x$E'\\' FROM t WHERE id = $id").unwrap();
         assert_eq!(out.params.len(), 1);
         assert_eq!(out.params[0].name, "id");
+        // After a dollar quote's closer, `E` is its own token: `E'\''` is
+        // an escape string holding a quote.
+        for sql in [
+            "SELECT $$a$$E'\\'' FROM t WHERE id = $id",
+            "SELECT $t$x$t$e'\\'' FROM t WHERE id = $id",
+        ] {
+            let out = lex(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+            assert_eq!(out.params.len(), 1, "{sql}");
+            assert_eq!(out.params[0].name, "id", "{sql}");
+        }
         // A word ends at a non-identifier character: `a+$p` and `($p)`
         // still hold a parameter.
         for sql in ["SELECT a+$p FROM t", "SELECT ($p) FROM t"] {
