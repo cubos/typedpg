@@ -20,6 +20,7 @@ use std::collections::HashSet;
 use std::ops::Range;
 
 use crate::scan::{LineIndex, Position};
+use crate::sqlmodule::MODULE_BINDINGS;
 
 /// A query of a `.sql` file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -273,6 +274,14 @@ impl Parser<'_> {
             self.error(
                 name_at,
                 format!("`{name}` is a reserved word in JavaScript: name the query otherwise"),
+            );
+        } else if MODULE_BINDINGS.contains(&name) {
+            exported = false;
+            self.error(
+                name_at,
+                format!(
+                    "`{name}` is a name the generated module declares: name the query otherwise"
+                ),
             );
         } else if !name.is_empty() && !self.names.insert(name.to_owned()) {
             exported = false;
@@ -536,6 +545,30 @@ mod tests {
         // can't export them.
         let names: Vec<&str> = f.queries.iter().map(|q| q.name.as_str()).collect();
         assert_eq!(names, ["a", "c"]);
+    }
+
+    #[test]
+    fn names_the_generated_module_binds_are_rejected() {
+        // The module imports `createQuery`, `createBrokenQuery` and the
+        // `typedpg` namespace: a query exported under one of those names
+        // would redeclare it.
+        for name in ["createQuery", "createBrokenQuery", "typedpg"] {
+            let f = parse(&format!("/* @name {name} */ SELECT 1;"));
+            assert_eq!(
+                errors(&f),
+                [format!(
+                    "1:10: `{name}` is a name the generated module declares: name the query otherwise"
+                )]
+            );
+            assert!(f.queries.is_empty(), "{name} exported");
+        }
+        // Only those exact names: identifiers are case-sensitive.
+        let f = parse("/* @name Typedpg */ SELECT 1;\n/* @name createQueryFor */ SELECT 2;");
+        assert_eq!(errors(&f), Vec::<String>::new());
+        assert_eq!(
+            names(&f),
+            [("Typedpg", "SELECT 1"), ("createQueryFor", "SELECT 2")]
+        );
     }
 
     #[test]

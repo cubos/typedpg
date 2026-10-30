@@ -54,6 +54,10 @@ pub struct SqlModule<'a> {
     pub type_names: &'a TypeNames,
 }
 
+/// The names a module declares besides its queries: the runtime's values
+/// and its types' namespace. A query can't be named one of them.
+pub const MODULE_BINDINGS: &[&str] = &["createQuery", "createBrokenQuery", RUNTIME_NS];
+
 /// The first line of a module `typedpg gen` writes for a `.sql` file, up to
 /// the file's name (unlike a database module's, `from the queries in this
 /// project's sources`).
