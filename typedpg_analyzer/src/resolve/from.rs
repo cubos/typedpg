@@ -156,6 +156,7 @@ pub(crate) fn process_from_item(
                 src.lock_error = view_lock_error(class, snapshot);
                 src.partial_scan =
                     !rv.inh && class.relkind == crate::pg_catalog::RelKind::Partitioned;
+                src.only = !rv.inh;
                 // A scan of an inheritance parent returns its children's
                 // rows too: a column is NOT NULL only if it is in each of
                 // them (a parent's `NOT NULL NO INHERIT` isn't).
@@ -948,12 +949,29 @@ fn process_join_expr(
         // the no-aggregates placement rule, then PG's clause wording
         // (`argument of JOIN/ON must be type boolean, not type X`).
         let log = crate::nonnull::StrictLog::default();
-        crate::clause::coerce_clause_expr(
-            quals,
-            expr::Ctx::new(&on_scope, null_ctx, snapshot).logging_strictness(&log),
-            params,
-            crate::clause::ClauseKind::JoinOn,
-        )?;
+        // The nullable side of a LEFT / RIGHT join is not estimated when
+        // `remove_useless_joins` drops it first.
+        let nullable_side = match join_type {
+            JoinType::JoinLeft => right.sources(scope),
+            JoinType::JoinRight => left.sources(scope),
+            _ => &[],
+        };
+        let removable: Vec<String> = if nullable_side
+            .iter()
+            .any(|s| expr::plan_fold::may_be_removed(s, snapshot))
+        {
+            nullable_side.iter().map(|s| s.alias.clone()).collect()
+        } else {
+            Vec::new()
+        };
+        expr::plan_fold::skip_restrictions_on(removable, || {
+            crate::clause::coerce_clause_expr(
+                quals,
+                expr::Ctx::new(&on_scope, null_ctx, snapshot).logging_strictness(&log),
+                params,
+                crate::clause::ClauseKind::JoinOn,
+            )
+        })?;
         check_no_srf_in_clause(quals, snapshot, "JOIN conditions")?;
         on_facts = crate::nonnull::nonnullable(quals, true, &on_scope, &log, snapshot);
         equalities = on_equalities(quals, &on_scope, &log, snapshot);

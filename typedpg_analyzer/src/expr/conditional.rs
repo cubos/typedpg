@@ -36,6 +36,9 @@ pub(crate) fn infer_bool_expr(
     let mut before = crate::nonnull::Facts::default();
     let mut any_nullable = false;
     let mut decided = false;
+    // Folding stops at an argument that decides the AND / OR: the planner
+    // never reaches the ones after it.
+    let mut dead = false;
     for arg in &expr.args {
         let narrowed = if and_or {
             ctx.null_ctx
@@ -47,7 +50,13 @@ pub(crate) fn infer_bool_expr(
             Some(n) => ctx.with_null_ctx(n),
             None => ctx,
         };
-        let t = crate::clause::coerce_clause_expr(arg, arg_ctx, params, kind)?;
+        let t = super::plan_fold::unless_dead(dead, || {
+            crate::clause::coerce_clause_expr(arg, arg_ctx, params, kind)
+        })?;
+        if and_or {
+            dead = dead
+                || super::plan_fold::stops_after(super::plan_fold::fold(arg, ctx.snapshot), or);
+        }
         any_nullable = any_nullable || t.nullable;
         if and_or {
             decided |= matches!(
@@ -186,8 +195,14 @@ pub(crate) fn infer_coalesce(
     // `COALESCE(int_col, '42')` is integer and `COALESCE(int_col, 'x')`
     // fails with PG's `invalid input syntax for type integer: "x"`.
     let mut args = Vec::with_capacity(expr.args.len());
+    // Folding stops at the first non-NULL constant argument.
+    let mut dead = false;
     for arg in &expr.args {
-        args.push(infer_expr(arg, ctx, params, TypeGoal::NONE)?);
+        args.push(super::plan_fold::unless_dead(dead, || {
+            infer_expr(arg, ctx, params, TypeGoal::NONE)
+        })?);
+        dead =
+            dead || super::plan_fold::coalesce_stops_after(super::plan_fold::fold(arg, snapshot));
     }
 
     // Resolve over the *full* arg list (unknowns included): the
@@ -413,10 +428,21 @@ pub(crate) fn infer_case(
     let own = crate::nonnull::own_aliases(ctx.scope);
     let mut not_taken = crate::nonnull::Facts::default();
     let mut results: Vec<(&protobuf::Node, ExprType)> = Vec::new();
+    // Folding skips a branch whose WHEN is FALSE or NULL, and stops at one
+    // that is TRUE: the planner never reaches what it drops.
+    let test_fold = expr
+        .arg
+        .as_deref()
+        .map(|a| super::plan_fold::fold(a, snapshot));
+    let mut stopped = false;
     for arg in &expr.args {
         let Some(node::Node::CaseWhen(when)) = arg.node.as_ref() else {
             continue;
         };
+        let when_fold = super::plan_fold::case_when(test_fold, when.expr.as_deref(), snapshot);
+        let cond_dead = stopped;
+        let result_dead = stopped || !super::plan_fold::case_result_reached(when_fold);
+        stopped = stopped || super::plan_fold::case_stops_after(when_fold);
         let log = crate::nonnull::StrictLog::default();
         let mut taken = crate::nonnull::Facts::default();
         let mut simple_not_taken = crate::nonnull::Facts::default();
@@ -424,14 +450,16 @@ pub(crate) fn infer_case(
             let cond_ctx = ctx.logging_strictness(&log);
             match (test_oid, expr.arg.as_deref()) {
                 (Some(test_oid), Some(test)) => {
-                    infer_synthetic_op(
-                        "=",
-                        &typed_null(test_oid),
-                        cond,
-                        when.location,
-                        cond_ctx,
-                        params,
-                    )?;
+                    super::plan_fold::unless_dead(cond_dead, || {
+                        infer_synthetic_op(
+                            "=",
+                            &typed_null(test_oid),
+                            cond,
+                            when.location,
+                            cond_ctx,
+                            params,
+                        )
+                    })?;
                     // `test = value` TRUE: both non-NULL, if `=` is strict
                     // — and a column test equals a constant value. Not
                     // TRUE, a non-NULL test column isn't that value.
@@ -460,12 +488,14 @@ pub(crate) fn infer_case(
                 // `argument of CASE/WHEN must be type boolean, not type X` —
                 // wording and ordering live in the shared clause walker.
                 _ => {
-                    crate::clause::coerce_clause_expr(
-                        cond,
-                        cond_ctx,
-                        params,
-                        crate::clause::ClauseKind::CaseWhen,
-                    )?;
+                    super::plan_fold::unless_dead(cond_dead, || {
+                        crate::clause::coerce_clause_expr(
+                            cond,
+                            cond_ctx,
+                            params,
+                            crate::clause::ClauseKind::CaseWhen,
+                        )
+                    })?;
                     taken = crate::nonnull::nonnullable(cond, true, ctx.scope, &log, snapshot);
                 }
             }
@@ -493,7 +523,9 @@ pub(crate) fn infer_case(
             };
             results.push((
                 result,
-                infer_expr(result, result_ctx, params, TypeGoal::NONE)?,
+                super::plan_fold::unless_dead(result_dead, || {
+                    infer_expr(result, result_ctx, params, TypeGoal::NONE)
+                })?,
             ));
         }
         if let (None, Some(cond)) = (&expr.arg, &when.expr) {
@@ -540,7 +572,9 @@ pub(crate) fn infer_case(
             };
             Some((
                 d.as_ref(),
-                infer_expr(d, default_ctx, params, TypeGoal::NONE)?,
+                super::plan_fold::unless_dead(stopped, || {
+                    infer_expr(d, default_ctx, params, TypeGoal::NONE)
+                })?,
             ))
         }
         None => None,

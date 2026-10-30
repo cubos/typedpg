@@ -1277,14 +1277,61 @@ fn regex_operator_icase(snapshot: &PgCatalog, code: Option<crate::oid::PgProcOid
 }
 
 /// The value of a string constant as the planner folds it: an untyped or
-/// string-typed literal, possibly cast between string types or
-/// concatenated with `||`. `None` for anything else.
-fn const_string(node: &protobuf::Node, snapshot: &PgCatalog) -> Option<String> {
+/// string-typed literal, possibly cast between string types, concatenated
+/// with `||`, the first non-NULL argument of a COALESCE of such, the
+/// built-in `lower` / `upper` of one (when no locale's case mapping can
+/// matter: ASCII without `i`, which a Turkish locale maps apart), or a
+/// parameter of an EXECUTE's custom plan bound to one. `None` for
+/// anything else.
+pub(crate) fn const_string(node: &protobuf::Node, snapshot: &PgCatalog) -> Option<String> {
     match node.node.as_ref()? {
         node::Node::AConst(ac) if !ac.isnull => match &ac.val {
             Some(a_const::Val::Sval(sv)) => Some(sv.sval.clone()),
             _ => None,
         },
+        node::Node::ParamRef(p) => super::plan_fold::bound_param(p.number),
+        node::Node::CoalesceExpr(c) => {
+            for a in &c.args {
+                if super::plan_fold::fold(a, snapshot) == super::plan_fold::Folded::Null {
+                    continue;
+                }
+                return const_string(a, snapshot);
+            }
+            None
+        }
+        node::Node::FuncCall(fc)
+            if fc.args.len() == 1
+                && fc.agg_order.is_empty()
+                && fc.agg_filter.is_none()
+                && fc.over.is_none()
+                && !fc.agg_star
+                && !fc.agg_distinct
+                && !fc.func_variadic =>
+        {
+            let parts = extract_string_fields(&fc.funcname);
+            let (schema, name) = match parts.as_slice() {
+                [n] => (None, n.as_str()),
+                [s, n] if s == "pg_catalog" => (Some("pg_catalog"), n.as_str()),
+                _ => return None,
+            };
+            if !matches!(name, "lower" | "upper")
+                || !snapshot
+                    .find_functions(schema, name)
+                    .iter()
+                    .all(|p| snapshot.namespace_name(p.pronamespace) == Some("pg_catalog"))
+            {
+                return None;
+            }
+            let v = const_string(fc.args.first()?, snapshot)?;
+            if !v.is_ascii() || v.contains(['i', 'I']) {
+                return None;
+            }
+            Some(if name == "lower" {
+                v.to_ascii_lowercase()
+            } else {
+                v.to_ascii_uppercase()
+            })
+        }
         node::Node::TypeCast(c) => {
             let tn = c.type_name.as_ref()?;
             if !tn.typmods.is_empty() || !tn.array_bounds.is_empty() {
@@ -1451,18 +1498,28 @@ fn similar_escape(pattern: &str, escape: Option<&str>) -> Result<String, Analyze
 /// constant pattern whenever the other side is a restriction variable — an
 /// expression over one relation's columns — so an invalid pattern fails
 /// every execution, however many rows the relation has. Walks the qual's
-/// AND / OR / NOT tree, the part `clauselist_selectivity` estimates.
+/// AND / OR / NOT tree, the part `clauselist_selectivity` estimates, as
+/// constant folding leaves it; only relations the planner certainly
+/// estimates count (see [`super::plan_fold`]).
 pub(crate) fn check_regex_restrictions(
     node: &protobuf::Node,
     ctx: Ctx<'_>,
 ) -> Result<(), AnalyzeError> {
-    if !plan_time_checks() {
+    if !plan_time_checks() || super::plan_fold::level_may_be_empty() {
+        return Ok(());
+    }
+    regex_restrictions(node, ctx)
+}
+
+fn regex_restrictions(node: &protobuf::Node, ctx: Ctx<'_>) -> Result<(), AnalyzeError> {
+    // A part folded to a constant estimates nothing.
+    if super::plan_fold::fold(node, ctx.snapshot) != super::plan_fold::Folded::Var {
         return Ok(());
     }
     match node.node.as_ref() {
         Some(node::Node::BoolExpr(b)) => {
             for a in &b.args {
-                check_regex_restrictions(a, ctx)?;
+                regex_restrictions(a, ctx)?;
             }
             Ok(())
         }
@@ -1481,7 +1538,16 @@ pub(crate) fn check_regex_restrictions(
             let Some(pattern) = const_regex_pattern(r, ctx.snapshot) else {
                 return Ok(());
             };
-            if !is_restriction_variable(l, ctx) {
+            let Some(alias) = restriction_variable(l, ctx) else {
+                return Ok(());
+            };
+            if !ctx
+                .scope
+                .sources
+                .iter()
+                .find(|s| s.alias == alias)
+                .is_some_and(|s| super::plan_fold::restriction_estimated(s, ctx.snapshot))
+            {
                 return Ok(());
             }
             // Only the string types' regex operators (not, e.g., ltree's `~`).
@@ -1503,8 +1569,8 @@ pub(crate) fn check_regex_restrictions(
 
 /// `get_restriction_variable`'s test: the expression references columns
 /// of exactly one relation of this query level (and nothing we can't
-/// classify).
-fn is_restriction_variable(node: &protobuf::Node, ctx: Ctx<'_>) -> bool {
+/// classify) — that relation's alias.
+fn restriction_variable(node: &protobuf::Node, ctx: Ctx<'_>) -> Option<String> {
     fn walk(n: &protobuf::Node, ctx: Ctx<'_>, rel: &mut Option<String>) -> bool {
         match n.node.as_ref() {
             Some(node::Node::ColumnRef(cr)) => {
@@ -1548,7 +1614,7 @@ fn is_restriction_variable(node: &protobuf::Node, ctx: Ctx<'_>) -> bool {
         }
     }
     let mut rel = None;
-    walk(node, ctx, &mut rel) && rel.is_some()
+    if walk(node, ctx, &mut rel) { rel } else { None }
 }
 
 /// A `pg_catalog` operator run by a `pg_catalog` function.

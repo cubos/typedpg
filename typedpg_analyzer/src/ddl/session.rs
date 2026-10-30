@@ -434,6 +434,11 @@ pub(crate) fn variable_set(interp: &mut PgCatalog, stmt: &VariableSetStmt) -> Re
     {
         super::guc::check_value(interp, &setting, &value)?;
     }
+    if stmt.name.eq_ignore_ascii_case("constraint_exclusion")
+        || stmt.name.eq_ignore_ascii_case("plan_cache_mode")
+    {
+        interp.planner_settings_changed = true;
+    }
     if stmt.name.eq_ignore_ascii_case("check_function_bodies") {
         match kind {
             VariableSetKind::VarSetValue => {
@@ -767,22 +772,19 @@ pub(crate) fn explain(
             super::views::create_table_as_planned(interp, ctas, true)
         }
         _ if analyze => super::apply_statement(interp, query),
-        _ => {
-            let interp = &*interp;
-            crate::resolve::planned_only(|| match query {
-                node::Node::DeclareCursorStmt(d) => super::cursors::check_declare(interp, d),
-                node::Node::ExecuteStmt(e) => super::prepared::execute(interp, e),
-                node::Node::CreateTableAsStmt(ctas) => {
-                    match ctas.query.as_deref().and_then(|q| q.node.as_ref()) {
-                        // ExplainExecuteQuery revalidates the cached plan.
-                        Some(node::Node::ExecuteStmt(e)) => super::prepared::execute(interp, e),
-                        Some(q) => super::dml::check_executed(interp, q),
-                        None => Ok(()),
-                    }
+        _ => crate::resolve::planned_only(|| match query {
+            node::Node::DeclareCursorStmt(d) => super::cursors::check_declare(interp, d),
+            node::Node::ExecuteStmt(e) => super::prepared::execute(interp, e),
+            node::Node::CreateTableAsStmt(ctas) => {
+                match ctas.query.as_deref().and_then(|q| q.node.as_ref()) {
+                    // ExplainExecuteQuery revalidates the cached plan.
+                    Some(node::Node::ExecuteStmt(e)) => super::prepared::execute(interp, e),
+                    Some(q) => super::dml::check_executed(interp, q),
+                    None => Ok(()),
                 }
-                _ => super::dml::check_executed(interp, query),
-            })
-        }
+            }
+            _ => super::dml::check_executed(interp, query),
+        }),
     }
 }
 

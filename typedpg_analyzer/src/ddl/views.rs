@@ -54,16 +54,16 @@ pub fn create_view(interp: &mut PgCatalog, stmt: &ViewStmt) -> Result<(), DdlErr
     // DefineView only analyzes the query: no error its execution would
     // raise is reported (a query reading the view runs it).
     let resolved = match stmt.query.as_deref() {
-        Some(query_node) => {
-            crate::resolve::without_execution(|| resolve_view_now(interp, query_node, &aliases, false))
-                .map_err(|e| match e {
-                    DdlError::ViewAnalysis { source, .. } => DdlError::ViewAnalysis {
-                        view: qn_label.clone(),
-                        source,
-                    },
-                    other => other,
-                })?
-        }
+        Some(query_node) => crate::resolve::without_execution(|| {
+            resolve_view_now(interp, query_node, &aliases, false)
+        })
+        .map_err(|e| match e {
+            DdlError::ViewAnalysis { source, .. } => DdlError::ViewAnalysis {
+                view: qn_label.clone(),
+                source,
+            },
+            other => other,
+        })?,
         None => ResolvedView::default(),
     };
     // DefineView: parse analysis allows these; a view can't have them.
@@ -276,17 +276,24 @@ fn create_relation_as(
             if !prepared.is_select() {
                 return Err(DdlError::Parse("prepared statement is not a SELECT".into()));
             }
-            run(&|| {
-                crate::expr::with_rewriting(true, || {
-                    resolve_view_with_params(
-                        interp,
-                        &prepared.query,
-                        &aliases,
-                        &prepared.param_types,
-                        planned,
-                    )
+            let resolve = |interp: &PgCatalog| {
+                run(&|| {
+                    crate::expr::with_rewriting(true, || {
+                        resolve_view_with_params(
+                            interp,
+                            &prepared.query,
+                            &aliases,
+                            &prepared.param_types,
+                            planned,
+                        )
+                    })
                 })
-            })
+            };
+            if planned {
+                super::prepared::planned_for_arguments(interp, estmt, &prepared, resolve)
+            } else {
+                resolve(interp)
+            }
             .map_err(|e| match e {
                 DdlError::ViewAnalysis { source, .. } => DdlError::ViewAnalysis {
                     view: qn_label.clone(),
@@ -718,9 +725,9 @@ fn check_refill(interp: &PgCatalog, relid: PgClassOid) -> Result<(), DdlError> {
         return Ok(());
     }
     match view_query(interp, relid).and_then(|q| q.node) {
-        Some(inner) => crate::resolve::with_restricted_execution(|| {
-            super::dml::check_executed(interp, &inner)
-        }),
+        Some(inner) => {
+            crate::resolve::with_restricted_execution(|| super::dml::check_executed(interp, &inner))
+        }
         None => Ok(()),
     }
 }

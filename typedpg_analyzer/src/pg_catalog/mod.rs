@@ -271,6 +271,10 @@ pub struct PgCatalog {
     pub(crate) generated_refs: Shared<HashMap<(PgClassOid, i16), Vec<i16>>>,
     /// The `check_function_bodies` GUC (pg_dump output turns it off).
     pub(crate) check_function_bodies: crate::ddl::session::BoolGuc,
+    /// The migration set `constraint_exclusion` or `plan_cache_mode`: the
+    /// planner may then prove more relations empty, or plan an EXECUTE
+    /// generically, than the defaults the plan-time checks assume.
+    pub(crate) planner_settings_changed: bool,
     /// The single expression of each inlinable `LANGUAGE sql` function
     /// (`SELECT expr` / `RETURN expr`, as `inline_function` requires),
     /// which PG substitutes for the call before checking an index or
@@ -710,6 +714,7 @@ impl PgCatalog {
             attr_default_exprs: HashMap::new(),
             generated_refs: Shared::default(),
             check_function_bodies: crate::ddl::session::BoolGuc::new(true),
+            planner_settings_changed: false,
             inline_sql_bodies: Shared::default(),
             procs_with_config: Shared::default(),
             inline_body_trust: Shared::default(),
