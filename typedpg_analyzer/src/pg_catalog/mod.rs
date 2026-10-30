@@ -1760,6 +1760,18 @@ impl PgCatalog {
         self.pg_cast.insert(row.oid, row);
     }
 
+    /// The `pg_cast` row for `source → target` as PostgreSQL has it, for
+    /// the commands naming a cast (DROP CAST, COMMENT ON CAST): no cast
+    /// targets `record` there — the row type → record casts the analyzer
+    /// keeps (`register_composite_to_record_cast`) stand for a coercion
+    /// PG makes without one.
+    pub(crate) fn catalog_cast(&self, source: PgTypeOid, target: PgTypeOid) -> Option<PgCastOid> {
+        if target == oid::RECORD {
+            return None;
+        }
+        self.cast_by_pair.get(&(source, target)).copied()
+    }
+
     pub(crate) fn remove_pg_cast(&mut self, oid: PgCastOid) -> Option<PgCast> {
         let row = self.pg_cast.remove(&oid)?;
         self.cast_by_pair.remove(&(row.castsource, row.casttarget));

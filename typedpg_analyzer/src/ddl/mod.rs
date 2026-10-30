@@ -510,7 +510,7 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         node::Node::AlterPolicyStmt(s) => {
             policies::alter_policy(db, s).and_then(|()| coldeps::record_policy_alter(db, s))
         }
-        node::Node::RuleStmt(s) => rules::create_rule(db, s).and_then(|()| coldeps::record_rule(db, s)),
+        node::Node::RuleStmt(s) => rules::create_rule(db, s).and_then(|refs| coldeps::record_rule(db, s, &refs)),
         node::Node::CreateAmStmt(s) => opclass::create_am(db, s),
         node::Node::CreateConversionStmt(s) => conversions::create_conversion(db, s),
         node::Node::CreatePlangStmt(s) => languages::create_language(db, s),

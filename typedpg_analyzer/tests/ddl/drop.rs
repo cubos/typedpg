@@ -979,3 +979,360 @@ fn a_partition_dependent_blocks_the_drop_of_its_parent() {
         ("0002.sql", "DROP TABLE p CASCADE; DROP TABLE q CASCADE;"),
     ]);
 }
+
+// ── Objects that are part of others ─────────────────────────────────────────
+
+#[test]
+fn a_range_types_internal_objects_go_only_with_it() {
+    // DefineRange: the multirange type, the constructors of both and the
+    // range → multirange cast (through `mr(range)`) are part of the range
+    // type — DEPENDENCY_INTERNAL, which CASCADE doesn't override.
+    let range = "CREATE TYPE textrange AS RANGE (subtype = text);";
+    assert_ddl_rejections(&[
+        (
+            range,
+            "DROP CAST (textrange AS textmultirange);",
+            "cannot drop cast from textrange to textmultirange because function \
+             textmultirange(textrange) requires it",
+        ),
+        (
+            range,
+            "DROP CAST (textrange AS textmultirange) CASCADE;",
+            "cannot drop cast from textrange to textmultirange because function \
+             textmultirange(textrange) requires it",
+        ),
+        (
+            range,
+            "DROP TYPE textmultirange;",
+            "cannot drop type textmultirange because type textrange requires it",
+        ),
+        (
+            range,
+            "DROP FUNCTION textmultirange(textrange) CASCADE;",
+            "cannot drop function textmultirange(textrange) because type textmultirange \
+             requires it",
+        ),
+        (
+            range,
+            "DROP FUNCTION textrange(text, text);",
+            "cannot drop function textrange(text,text) because type textrange requires it",
+        ),
+        (
+            range,
+            "DROP TYPE textmultirange[];",
+            "cannot drop type textmultirange[] because type textmultirange requires it",
+        ),
+        (
+            range,
+            "CREATE CAST (textrange AS textmultirange) WITH INOUT;",
+            "cast from type textrange to type textmultirange already exists",
+        ),
+        // The multirange constructors live in the range type's schema,
+        // whatever the multirange type's.
+        (
+            "CREATE SCHEMA s;
+             CREATE TYPE textrange AS RANGE (subtype = text, multirange_type_name = s.tmr);",
+            "DROP CAST (textrange AS s.tmr);",
+            "cannot drop cast from textrange to s.tmr because function tmr(textrange) \
+             requires it",
+        ),
+        // A view casting to the multirange calls the constructor.
+        (
+            "CREATE TYPE textrange AS RANGE (subtype = text);
+             CREATE VIEW v AS SELECT textrange('a', 'b')::textmultirange AS m;",
+            "DROP TYPE textrange;",
+            "cannot drop type textrange because other objects depend on it",
+        ),
+    ]);
+    // The range type takes them all along; naming them in the same DROP is
+    // fine.
+    build(&[(
+        "0001.sql",
+        "CREATE TYPE textrange AS RANGE (subtype = text);
+         CREATE VIEW v AS SELECT textrange('a', 'b')::textmultirange AS m;
+         DROP TYPE textrange CASCADE;
+         CREATE TYPE textmultirange AS ENUM ('x');
+         CREATE FUNCTION textmultirange(int) RETURNS int LANGUAGE sql AS 'select 1';
+         CREATE TYPE r1 AS RANGE (subtype = text);
+         DROP TYPE r1, r1_multirange;
+         CREATE TYPE r2 AS RANGE (subtype = text);
+         DROP TYPE r2_multirange, r2;
+         CREATE TYPE r3 AS RANGE (subtype = text);
+         DROP TYPE r3;
+         CREATE TYPE r3 AS RANGE (subtype = text);",
+    )]);
+}
+
+#[test]
+fn array_and_row_types_go_only_with_their_owner() {
+    // GenerateTypeDependencies: an implicit array type is part of its
+    // element type, a relation's row type part of the relation.
+    let setup = "CREATE TYPE e AS ENUM ('x');
+                 CREATE TYPE c AS (a int);
+                 CREATE DOMAIN d AS int;
+                 CREATE TABLE t (a int);
+                 CREATE VIEW v AS SELECT 1 AS a;";
+    assert_ddl_rejections(&[
+        (
+            setup,
+            "DROP TYPE e[];",
+            "cannot drop type e[] because type e requires it",
+        ),
+        (
+            setup,
+            "DROP TYPE _e CASCADE;",
+            "cannot drop type e[] because type e requires it",
+        ),
+        (
+            setup,
+            "DROP TYPE c[];",
+            "cannot drop type c[] because type c requires it",
+        ),
+        (
+            setup,
+            "DROP TYPE d[];",
+            "cannot drop type d[] because type d requires it",
+        ),
+        (setup, "DROP DOMAIN d[];", "\"d[]\" is not a domain"),
+        (
+            setup,
+            "DROP TYPE t;",
+            "cannot drop type t because table t requires it",
+        ),
+        (
+            setup,
+            "DROP TYPE _t;",
+            "cannot drop type t[] because type t requires it",
+        ),
+        (
+            setup,
+            "DROP TYPE v;",
+            "cannot drop type v because view v requires it",
+        ),
+        (
+            setup,
+            "DROP TYPE v[];",
+            "cannot drop type v[] because type v requires it",
+        ),
+        (
+            "",
+            "DROP TYPE nonexist[];",
+            "type \"nonexist[]\" does not exist",
+        ),
+    ]);
+    // `e[]` names the array type, not e: e stays.
+    let db = build(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "DROP TYPE IF EXISTS nonexist[];
+             CREATE TYPE e2 AS ENUM ('y');
+             DROP TYPE e2[], e2;
+             CREATE TYPE e3 AS ENUM ('y');
+             DROP TYPE e3, e3[];",
+        ),
+    ]);
+    assert!(db.resolve_type_by_name(None, "e").is_some());
+    assert!(db.resolve_type_by_name(None, "e2").is_none());
+    assert!(db.resolve_type_by_name(None, "e3").is_none());
+}
+
+#[test]
+fn built_in_objects_are_required_by_the_database_system() {
+    // findDependentObjects refuses a pinned object before anything else,
+    // CASCADE or not.
+    assert_ddl_rejections(&[
+        (
+            "",
+            "DROP FUNCTION int4pl(int4, int4);",
+            "cannot drop function int4pl(integer,integer) because it is required by the \
+             database system",
+        ),
+        (
+            "",
+            "DROP AGGREGATE sum(int4);",
+            "cannot drop function sum(integer) because it is required by the database system",
+        ),
+        (
+            "",
+            "DROP OPERATOR + (int4, int4);",
+            "cannot drop operator +(integer,integer) because it is required by the database \
+             system",
+        ),
+        (
+            "",
+            "DROP TYPE int4 CASCADE;",
+            "cannot drop type integer because it is required by the database system",
+        ),
+        (
+            "",
+            "DROP CAST (int4 AS int8) CASCADE;",
+            "cannot drop cast from integer to bigint because it is required by the database \
+             system",
+        ),
+        (
+            "",
+            "DROP CAST (int4range AS int4multirange);",
+            "cannot drop cast from int4range to int4multirange because it is required by the \
+             database system",
+        ),
+        (
+            "",
+            "DROP SCHEMA pg_catalog CASCADE;",
+            "cannot drop schema pg_catalog because it is required by the database system",
+        ),
+    ]);
+}
+
+// ── What a stored INSERT writes ─────────────────────────────────────────────
+
+#[test]
+fn a_stored_insert_depends_on_every_column_it_writes() {
+    // find_expr_references_walker: an INSERT depends on each target column
+    // of its target list — without a column list, as many leading columns
+    // as its source has values once `*` is expanded.
+    let tables = "CREATE TABLE src (a int, b int);
+                  CREATE TABLE dst (a int, b int, c int);";
+    let body = |insert: &str| {
+        format!(
+            "{tables}
+             CREATE FUNCTION f() RETURNS void LANGUAGE sql BEGIN ATOMIC {insert}; END;"
+        )
+    };
+    let rule = |action: &str| {
+        format!(
+            "{tables}
+             CREATE TABLE t (a int, b int);
+             CREATE RULE r AS ON INSERT TO t DO ALSO {action};"
+        )
+    };
+    let blocked = "cannot drop column b of table dst because other objects depend on it";
+    let blocked_c = "cannot drop column c of table dst because other objects depend on it";
+    let cases = [
+        (body("INSERT INTO dst SELECT * FROM src"), "b"),
+        (body("INSERT INTO dst SELECT s.*, 1 FROM src s"), "c"),
+        (body("INSERT INTO dst TABLE src"), "b"),
+        (
+            body("WITH w AS (SELECT * FROM src) INSERT INTO dst SELECT * FROM w"),
+            "b",
+        ),
+        (
+            body("INSERT INTO dst SELECT 1, 2 UNION ALL SELECT 3, 4"),
+            "b",
+        ),
+        (body("INSERT INTO dst VALUES (1, 2), (3, 4)"), "b"),
+        (
+            body("INSERT INTO dst VALUES ((SELECT s FROM src s LIMIT 1).*)"),
+            "b",
+        ),
+        (rule("INSERT INTO dst VALUES (NEW.*)"), "b"),
+        (rule("INSERT INTO dst VALUES (NEW.*, 1)"), "c"),
+        (rule("INSERT INTO dst SELECT NEW.*"), "b"),
+    ];
+    for (setup, column) in &cases {
+        let (stmt, msg) = if *column == "b" {
+            ("ALTER TABLE dst DROP COLUMN b;", blocked)
+        } else {
+            ("ALTER TABLE dst DROP COLUMN c;", blocked_c)
+        };
+        assert_ddl_rejections(&[(setup, stmt, msg)]);
+    }
+    assert_ddl_rejections(&[(
+        &rule("INSERT INTO dst VALUES (NEW.*)"),
+        "ALTER TABLE dst ALTER COLUMN b TYPE bigint;",
+        "cannot alter type of a column used by a view or rule",
+    )]);
+    // A dropped leading column takes no position.
+    assert_ddl_rejections(&[(
+        "CREATE TABLE src (a int, b int);
+         CREATE TABLE dst (x int, a int, b int);
+         ALTER TABLE dst DROP COLUMN x;
+         CREATE FUNCTION f() RETURNS void LANGUAGE sql
+             BEGIN ATOMIC INSERT INTO dst SELECT * FROM src; END;",
+        "ALTER TABLE dst DROP COLUMN b;",
+        blocked,
+    )]);
+    // The columns past the values, and DEFAULT VALUES, aren't written.
+    for setup in [
+        body("INSERT INTO dst VALUES (1, 2)"),
+        body("INSERT INTO dst SELECT * FROM src"),
+        body("INSERT INTO dst DEFAULT VALUES"),
+        rule("INSERT INTO dst VALUES (NEW.*)"),
+        rule("INSERT INTO dst DEFAULT VALUES"),
+        rule("INSERT INTO dst VALUES (NEW.a, NEW.b), (NEW.b, 1)"),
+    ] {
+        build(&[
+            ("0001.sql", &setup),
+            ("0002.sql", "ALTER TABLE dst DROP COLUMN c;"),
+        ]);
+    }
+}
+
+#[test]
+fn a_stored_insert_on_conflict_depends_on_what_it_infers() {
+    // transformOnConflictClause: DO UPDATE reads EXCLUDED, a Var per column
+    // of the target (exclRelTlist); the inference elements are Vars of
+    // their columns; ON CONSTRAINT names the constraint
+    // (OnConflictExpr.constraint).
+    let body = |insert: &str| {
+        format!(
+            "CREATE TABLE dst (a int PRIMARY KEY, b int CONSTRAINT bu UNIQUE, c int);
+             CREATE FUNCTION f() RETURNS void LANGUAGE sql BEGIN ATOMIC {insert}; END;"
+        )
+    };
+    let rule = |action: &str| {
+        format!(
+            "CREATE TABLE dst (a int PRIMARY KEY, b int CONSTRAINT bu UNIQUE, c int);
+             CREATE TABLE t (a int, b int);
+             CREATE RULE r AS ON INSERT TO t DO ALSO {action};"
+        )
+    };
+    let blocked = |column: &str| {
+        format!("cannot drop column {column} of table dst because other objects depend on it")
+    };
+    let cases = [
+        (
+            body("INSERT INTO dst (a) VALUES (1) ON CONFLICT (a) DO UPDATE SET b = 1"),
+            "ALTER TABLE dst DROP COLUMN c;",
+            blocked("c"),
+        ),
+        (
+            rule("INSERT INTO dst (a) VALUES (NEW.a) ON CONFLICT (a) DO UPDATE SET b = 1"),
+            "ALTER TABLE dst DROP COLUMN c;",
+            blocked("c"),
+        ),
+        (
+            body("INSERT INTO dst (a) VALUES (1) ON CONFLICT (b) DO NOTHING"),
+            "ALTER TABLE dst DROP COLUMN b;",
+            blocked("b"),
+        ),
+        (
+            body("INSERT INTO dst (a) VALUES (1) ON CONFLICT ON CONSTRAINT bu DO NOTHING"),
+            "ALTER TABLE dst DROP CONSTRAINT bu;",
+            "cannot drop constraint bu on table dst because other objects depend on it".into(),
+        ),
+        // The column takes its UNIQUE constraint along, and that the
+        // routine depends on.
+        (
+            body("INSERT INTO dst (a) VALUES (1) ON CONFLICT ON CONSTRAINT bu DO NOTHING"),
+            "ALTER TABLE dst DROP COLUMN b;",
+            blocked("b"),
+        ),
+    ];
+    for (setup, stmt, msg) in &cases {
+        assert_ddl_rejections(&[(setup, stmt, msg)]);
+    }
+    for (setup, stmt) in [
+        (
+            body("INSERT INTO dst (a) VALUES (1) ON CONFLICT (a) DO NOTHING"),
+            "ALTER TABLE dst DROP COLUMN c;",
+        ),
+        (
+            body("INSERT INTO dst (a) VALUES (1) ON CONFLICT ON CONSTRAINT bu DO NOTHING"),
+            "ALTER TABLE dst DROP CONSTRAINT bu CASCADE;
+             CREATE FUNCTION f() RETURNS int LANGUAGE sql RETURN 1;",
+        ),
+    ] {
+        build(&[("0001.sql", &setup), ("0002.sql", stmt)]);
+    }
+}

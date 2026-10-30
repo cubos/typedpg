@@ -404,7 +404,7 @@ pub(crate) fn resolve_object(
             };
             let source = super::util::lookup_type_name(source, interp)?;
             let target = super::util::lookup_type_name(target, interp)?;
-            if !interp.cast_by_pair.contains_key(&(source, target)) {
+            if interp.catalog_cast(source, target).is_none() {
                 return Err(DdlError::TypeNotFound(format!(
                     "cast from type {} to type {} does not exist",
                     super::util::format_type_for_message(interp, source),

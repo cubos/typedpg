@@ -345,6 +345,40 @@ fn insert_select_arity_uses_output_columns() {
     );
 }
 
+/// A `(row).*` value of a VALUES row expands to one value per field
+/// before the row meets the target columns (transformInsertStmt →
+/// transformExpressionList), in a single row as in a multi-row VALUES.
+#[test]
+fn insert_values_expand_stars() {
+    let db = setup();
+    for sql in [
+        "INSERT INTO t VALUES ((ROW(1, 2, 'x')::t).*)",
+        "INSERT INTO t VALUES ((ROW(1, 2, 'x')::t).*), (2, 3, 'y')",
+        "INSERT INTO t VALUES (2, 3, 'y'), ((ROW(1, 2, 'x')::t).*)",
+        "INSERT INTO t (id, a, b) VALUES ((ROW(1, 2, 'x')::t).*)",
+        "INSERT INTO t (id, a, b) VALUES (1, (ROW(2, 'x')::pt).*)",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    for (sql, msg) in [
+        (
+            "INSERT INTO t VALUES ((ROW(1, 2, 'x')::t).*, 5)",
+            "INSERT has more expressions than target columns",
+        ),
+        (
+            "INSERT INTO t (id, a, b) VALUES ((ROW(2, 'x')::pt).*)",
+            "INSERT has more target columns than expressions",
+        ),
+        (
+            "INSERT INTO t VALUES (1, (ROW(2, 'x')::pt).*), (1, 2)",
+            "VALUES lists must all be the same length",
+        ),
+    ] {
+        let err = db.analyze(sql).unwrap_err();
+        assert!(err.to_string().starts_with(msg), "{sql}: {err}");
+    }
+}
+
 // ── ON CONFLICT arbiter inference ────────────────────────────────────────────
 
 fn setup_arbiters() -> PgCatalog {

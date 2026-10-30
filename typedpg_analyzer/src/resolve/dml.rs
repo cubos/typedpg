@@ -93,6 +93,8 @@ pub(crate) fn analyze_insert_with_outer_ctes(
         }
     }
 
+    note_written_columns(&tgt, written.first().map_or(0, Vec::len));
+
     // DEFAULT VALUES: every column takes its default — a row that may
     // still go to no partition.
     if ins.select_stmt.is_none()
@@ -496,32 +498,10 @@ fn resolve_insert_target(
         }
     }
     check_insert_target_duplicates(&ins.cols)?;
-    // The columns the INSERT writes (the leading ones, without a column
-    // list) — what a stored query depends on.
+    // A stored query depends on the relation it writes; on the columns it
+    // writes once the source's width is known
+    // ([`note_written_columns`]).
     crate::ddl::depend::note(crate::ddl::depend::ObjectAddress::relation(table_oid));
-    let written: Vec<&str> = if col_names.is_empty() {
-        let arity = match ins.select_stmt.as_deref().and_then(|s| s.node.as_ref()) {
-            Some(node::Node::SelectStmt(sel)) => match sel.values_lists.first() {
-                Some(row) => match row.node.as_ref() {
-                    Some(node::Node::List(l)) => l.items.len(),
-                    _ => 0,
-                },
-                None => sel.target_list.len(),
-            },
-            _ => 0,
-        };
-        table_attrs
-            .iter()
-            .filter(|a| a.attnum > 0)
-            .take(arity)
-            .map(|a| a.attname.as_str())
-            .collect()
-    } else {
-        col_names.iter().map(String::as_str).collect()
-    };
-    for name in written {
-        crate::ddl::depend::note_column(table_oid, name);
-    }
     let col_indirection = ins
         .cols
         .iter()
@@ -563,6 +543,18 @@ fn build_insert_cte_scopes(
         cte_scopes = analyze_with_clause(with, snapshot, params, &cte_scopes, &[])?;
     }
     Ok(cte_scopes)
+}
+
+/// `find_expr_references_walker` for an INSERT: a stored INSERT depends on
+/// each column its target list writes — the listed ones, or as many
+/// leading columns as the source has values (`width`, after `*`
+/// expansion). The relation is noted when the target is resolved.
+fn note_written_columns(tgt: &InsertTarget, width: usize) {
+    for i in 0..width {
+        if let Some(c) = target_col_at(tgt, i) {
+            crate::ddl::depend::note_column(tgt.oid, &c.attname);
+        }
+    }
 }
 
 /// The column targeted by position `i` in a VALUES row / SELECT list, honoring
@@ -1566,6 +1558,12 @@ fn analyze_insert_on_conflict(
     if !update {
         return Ok((arbiter, Vec::new()));
     }
+    // transformOnConflictClause builds the EXCLUDED pseudo-relation's
+    // target list (exclRelTlist) of a Var per column of the target: a
+    // stored INSERT ... ON CONFLICT DO UPDATE depends on every column.
+    for a in tgt.attrs.iter().filter(|a| a.attnum > 0) {
+        crate::ddl::depend::note_column(tgt.oid, &a.attname);
+    }
     let mut conflict_scope = target_scope;
     conflict_scope.sources.extend(excluded_holder.sources);
     let conflict_null_ctx = NullabilityContext::default();
@@ -1642,6 +1640,8 @@ fn transform_on_conflict_arbiter(
             if let Some(a) = tgt.attrs.iter().find(|a| a.attname == ie.name) {
                 arbiter.cols.insert(a.attnum);
                 elem_attnum = Some(a.attnum);
+                // The inference element is a Var of the column.
+                crate::ddl::depend::note_column(tgt.oid, &a.attname);
             } else if let Some(&(_, _, attnum)) = crate::pg_catalog::SYSTEM_COLUMNS
                 .iter()
                 .find(|(n, ..)| *n == ie.name)
@@ -1712,11 +1712,19 @@ fn transform_on_conflict_arbiter(
         check_index_expr_kind(w, snapshot, "index predicates", "index predicate")?;
         arbiter.where_clause = Some(w.clone());
     }
-    if !infer.conname.is_empty()
-        && !snapshot
+    if !infer.conname.is_empty() {
+        let constraint = snapshot
             .pg_constraint_values()
-            .any(|c| c.conrelid == tgt.oid && c.conname == infer.conname)
-    {
+            .find(|c| c.conrelid == tgt.oid && c.conname == infer.conname);
+        if let Some(c) = constraint {
+            // OnConflictExpr.constraint: a stored INSERT depends on it.
+            crate::ddl::depend::note(crate::ddl::depend::ObjectAddress::new(
+                crate::ddl::depend::PG_CONSTRAINT_RELID,
+                c.oid.into_nonzero(),
+                0,
+            ));
+            return Ok(arbiter);
+        }
         return Err(crate::error::RawError::new(
             AnalyzeError::UndefinedObject(format!(
                 "constraint \"{}\" for table \"{}\" does not exist",

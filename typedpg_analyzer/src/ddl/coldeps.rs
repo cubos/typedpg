@@ -74,6 +74,7 @@ fn store(
     dep: &Dependent,
     refs: Vec<(PgClassOid, i16)>,
     functions: Vec<PgProcOid>,
+    analyzed: Vec<ObjectAddress>,
 ) -> Result<(), DdlError> {
     let Some(named) = dep.named() else {
         return Ok(());
@@ -89,7 +90,12 @@ fn store(
         .into_iter()
         .filter(|&(r, a)| !(r == owner && a == 0))
         .map(|(r, a)| ObjectAddress::column(r, a))
-        .chain(functions.into_iter().map(ObjectAddress::proc));
+        .chain(functions.into_iter().map(ObjectAddress::proc))
+        .chain(
+            analyzed
+                .into_iter()
+                .filter(|a| *a != ObjectAddress::relation(owner)),
+        );
     super::depend::record(interp, addr, referenced, DepType::Normal);
     super::depend::record(
         interp,
@@ -272,27 +278,11 @@ fn statement_refs(interp: &PgCatalog, stmt: &Node, extra_from: &[Node]) -> Vec<(
                 && let Some(relid) = relation_of(interp, rv)
             {
                 refs.push((relid, 0));
-                refs.extend(names_of(interp, relid, &ins.cols));
                 // Without a column list the values go to the leading
-                // columns (transformInsertStmt's implicit target list).
-                if ins.cols.is_empty() {
-                    let given = match ins.select_stmt.as_deref().and_then(|s| s.node.as_ref()) {
-                        Some(node::Node::SelectStmt(sel)) => match sel.values_lists.first() {
-                            Some(row) => match row.node.as_ref() {
-                                Some(node::Node::List(l)) => Some(l.items.len()),
-                                _ => None,
-                            },
-                            None => Some(sel.target_list.len()),
-                        },
-                        _ => None,
-                    };
-                    let columns = interp.attributes_of(relid).iter().filter(|a| a.attnum > 0);
-                    refs.extend(
-                        columns
-                            .take(given.unwrap_or(usize::MAX))
-                            .map(|a| (relid, a.attnum)),
-                    );
-                }
+                // columns, as many as the source has after `*` expansion
+                // (transformInsertStmt's implicit target list): the
+                // analysis of the statement tells those (record_rule).
+                refs.extend(names_of(interp, relid, &ins.cols));
             }
             if let Some(source) = ins.select_stmt.as_deref() {
                 refs.extend(statement_refs(interp, source, extra_from));
@@ -472,7 +462,7 @@ pub(crate) fn record_policy(
         relid,
         name: stmt.policy_name.clone(),
     };
-    store(interp, &dep, refs, functions)?;
+    store(interp, &dep, refs, functions, Vec::new())?;
     interp
         .column_deps
         .policy_quals
@@ -510,7 +500,7 @@ pub(crate) fn record_policy_alter(
         relid,
         name: stmt.policy_name.clone(),
     };
-    store(interp, &dep, refs, functions)?;
+    store(interp, &dep, refs, functions, Vec::new())?;
     interp.column_deps.policy_quals.insert(key, quals);
     Ok(())
 }
@@ -547,6 +537,7 @@ pub(crate) fn record_trigger(
         },
         refs,
         Vec::new(),
+        Vec::new(),
     )
 }
 
@@ -555,6 +546,7 @@ pub(crate) fn record_trigger(
 pub(crate) fn record_rule(
     interp: &mut PgCatalog,
     stmt: &protobuf::RuleStmt,
+    analyzed: &[super::depend::Reference],
 ) -> Result<(), DdlError> {
     let Some(rv) = stmt.relation.as_ref() else {
         return Ok(());
@@ -604,5 +596,6 @@ pub(crate) fn record_rule(
         relid,
         name: stmt.rulename.clone(),
     };
-    store(interp, &dep, refs, functions)
+    let analyzed = super::depend::reference_addresses(interp, analyzed);
+    store(interp, &dep, refs, functions, analyzed)
 }

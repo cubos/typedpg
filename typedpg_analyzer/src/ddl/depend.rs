@@ -261,6 +261,12 @@ pub(crate) fn record_references(
     refs: &[Reference],
     deptype: DepType,
 ) {
+    let addrs = reference_addresses(interp, refs);
+    record(interp, depender, addrs, deptype);
+}
+
+/// The objects `refs` name, as they are now.
+pub(crate) fn reference_addresses(interp: &PgCatalog, refs: &[Reference]) -> Vec<ObjectAddress> {
     let mut addrs: Vec<ObjectAddress> = Vec::new();
     for r in refs {
         match r {
@@ -273,7 +279,7 @@ pub(crate) fn record_references(
             Reference::Named(object) => addrs.extend(named_address_of(interp, object)),
         }
     }
-    record(interp, depender, addrs, deptype);
+    addrs
 }
 
 // ─── Objects without an OID in the analyzer ────────────────────────────────
@@ -1035,13 +1041,16 @@ fn find_blocker(
         at += 1;
         let dependents: Vec<(ObjectAddress, DepType)> = dependents_of(interp, from)
             .into_iter()
-            .filter(|(d, _)| !in_progress(*d) && !is_drop_target(*d))
+            .filter(|(d, _)| !in_progress(*d))
             .collect();
         for (d, deptype) in dependents {
             // An object that belongs to what is dropped (automatically or
             // internally — a table's policies, triggers and rules) goes
-            // with it, whatever else of it it depends on normally.
+            // with it, whatever else of it it depends on normally; so does
+            // one the same DROP names, and what belongs to it in turn (a
+            // range type's multirange type's constructors).
             let owned = deptype != DepType::Normal
+                || is_drop_target(d)
                 || (from.objsubid == 0
                     && interp.pg_depend.iter().any(|row| {
                         row.classid == d.classid
@@ -1067,32 +1076,52 @@ fn find_blocker(
         .find_map(|(d, silent, via)| via.filter(|_| !silent).map(|via| (d, via)))
 }
 
-/// `findDependentObjects`' owner check for a DROP of `target`: an object
-/// that is part of another one (an identity column's sequence, an
-/// extension's member) can only go with it.
+/// `IsPinnedObject`: the objects below [`FIRST_UNPINNED_OBJECT_ID`], the
+/// core of the system — except the `public` schema, which may be dropped.
+pub(crate) fn is_pinned(addr: ObjectAddress) -> bool {
+    const PG_PUBLIC_NAMESPACE: u32 = 2200;
+    addr.objid.get() < FIRST_UNPINNED_OBJECT_ID
+        && !(addr.classid == crate::pg_catalog::PG_NAMESPACE_RELID
+            && addr.objid.get() == PG_PUBLIC_NAMESPACE)
+}
+
+/// `findDependentObjects`' first checks for a DROP of `target`, before
+/// anything that depends on it: a pinned object can't be dropped at all,
+/// and an object that is part of another one (an identity column's
+/// sequence, an extension's member, a range type's constructor) can only
+/// go with it.
 pub(crate) fn check_not_owned(
     interp: &PgCatalog,
     target: ObjectAddress,
     target_desc: &str,
 ) -> Result<(), super::DdlError> {
-    let owner = interp.pg_depend.iter().find(|d| {
-        d.classid == target.classid
-            && d.objid == target.objid
-            && matches!(d.deptype, DepType::Internal | DepType::Extension)
-    });
-    let Some(owner) = owner else {
+    if is_pinned(target) {
+        return Err(super::DdlError::DependencyError(format!(
+            "cannot drop {target_desc} because it is required by the database system"
+        )));
+    }
+    let owner = interp
+        .pg_depend
+        .iter()
+        .find(|d| {
+            d.classid == target.classid
+                && d.objid == target.objid
+                && matches!(d.deptype, DepType::Internal | DepType::Extension)
+        })
+        .map(|owner| ObjectAddress {
+            classid: owner.refclassid,
+            objid: owner.refobjid,
+            objsubid: owner.refobjsubid,
+        })
+        .or_else(|| implied_owner(interp, target));
+    let Some(owner_addr) = owner else {
         return Ok(());
-    };
-    let owner_addr = ObjectAddress {
-        classid: owner.refclassid,
-        objid: owner.refobjid,
-        objsubid: owner.refobjsubid,
     };
     if is_drop_target(owner_addr) {
         return Ok(());
     }
-    let owner_desc = if owner.refclassid == crate::pg_catalog::PG_EXTENSION_RELID {
-        crate::oid::PgExtensionOid::new(owner.refobjid.get())
+    let owner_desc = if owner_addr.classid == crate::pg_catalog::PG_EXTENSION_RELID {
+        crate::oid::PgExtensionOid::new(owner_addr.objid.get())
             .and_then(|e| interp.pg_extension.get(&e))
             .map(|e| format!("extension {}", e.extname))
             .unwrap_or_else(|| "extension".into())
@@ -1103,6 +1132,29 @@ pub(crate) fn check_not_owned(
         "cannot drop {target_desc} because {owner_desc} requires it (You can drop {owner_desc} \
          instead.)"
     )))
+}
+
+/// The owner `GenerateTypeDependencies` records for a type
+/// (DEPENDENCY_INTERNAL), which the analyzer keeps in `pg_type` itself
+/// rather than in `pg_depend`: a table's, view's or other relation's row
+/// type is part of the relation (not a standalone composite type, whose
+/// relation is part of it instead), and an implicit array type — the one
+/// its element's `typarray` names — is part of its element type.
+fn implied_owner(interp: &PgCatalog, target: ObjectAddress) -> Option<ObjectAddress> {
+    if target.classid != PG_TYPE_RELID {
+        return None;
+    }
+    let typ = interp.pg_type.get(&PgTypeOid::new(target.objid.get())?)?;
+    if let Some(relid) = typ.typrelid
+        && interp
+            .pg_class
+            .get(&relid)
+            .is_some_and(|c| c.relkind != RelKind::CompositeType)
+    {
+        return Some(ObjectAddress::relation(relid));
+    }
+    let elem = typ.typelem?;
+    (interp.pg_type.get(&elem)?.typarray == Some(typ.oid)).then(|| ObjectAddress::type_(elem))
 }
 
 /// Drop one dependent object in a cascade (`deleteOneObject`), after what
