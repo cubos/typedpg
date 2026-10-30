@@ -516,7 +516,9 @@ fn lex_with_base(sql: &str, base: usize) -> Result<(LexOutput, usize), LexError>
             }
             LexState::LineComment => {
                 out.push(chars[i]);
-                if chars[i] == '\n' {
+                // scan.l's `non_newline` is `[^\n\r]`: a lone CR ends the
+                // comment too.
+                if matches!(chars[i], '\n' | '\r') {
                     state = LexState::Normal;
                 }
                 i += 1;
@@ -1051,6 +1053,20 @@ mod tests {
         assert_eq!(out.sql, "SELECT 1 -- $ignored\n WHERE id = $1");
         assert_eq!(out.params.len(), 1);
         assert_eq!(out.params[0].name, "id");
+    }
+
+    #[test]
+    fn a_carriage_return_ends_a_line_comment() {
+        // scan.l's `non_newline` is `[^\n\r]`: a lone CR closes the
+        // comment, so the parameter after it is live.
+        let out = lex("SELECT $a -- $ignored\r, $b").unwrap();
+        assert_eq!(out.sql, "SELECT $1 -- $ignored\r, $2");
+        let names: Vec<_> = out.params.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["a", "b"]);
+        // CRLF, and a quote after the CR opens a string.
+        let out = lex("SELECT 1 -- x\r\n, $a, '$b' -- y\r, ';'").unwrap();
+        assert_eq!(out.sql, "SELECT 1 -- x\r\n, $1, '$b' -- y\r, ';'");
+        assert_eq!(out.params.len(), 1);
     }
 
     #[test]

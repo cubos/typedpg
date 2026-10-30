@@ -1540,3 +1540,22 @@ could not determine data type of parameter $1 (`$flag`)
 ",
     );
 }
+
+#[test]
+fn a_carriage_return_ends_a_line_comment() {
+    // scan.l's `non_newline` is `[^\n\r]`: the `$b` after a lone CR is a
+    // parameter, not part of the comment.
+    let db = setup();
+    let info = db
+        .analyze("SELECT id, $a::int4 AS a -- $ignored\r, $b::text AS b FROM users")
+        .unwrap();
+    let names: Vec<_> = info.params.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["a", "b"]);
+    assert_param_types(
+        &db,
+        "SELECT id, $a::int4 AS a -- $ignored\r, $b::text AS b FROM users",
+        &[int4(), text()],
+    );
+    let columns: Vec<_> = info.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(columns, ["id", "a", "b"]);
+}

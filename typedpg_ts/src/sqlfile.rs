@@ -155,8 +155,10 @@ impl Parser<'_> {
         while i < bytes.len() {
             let b = bytes[i];
             match b {
+                // scan.l's `non_newline` is `[^\n\r]`: a lone CR ends a
+                // `--` comment too.
                 b'-' if bytes.get(i + 1) == Some(&b'-') => {
-                    while i < bytes.len() && bytes[i] != b'\n' {
+                    while i < bytes.len() && !matches!(bytes[i], b'\n' | b'\r') {
                         i += 1;
                     }
                 }
@@ -478,6 +480,29 @@ mod tests {
         assert_eq!(
             f.queries[0].text,
             "SELECT ';', $$ ; $$, $f$ $$;$$ $f$, E'\\';', /* ; /* ; */ ; */ (SELECT 1; 2), $id"
+        );
+    }
+
+    #[test]
+    fn a_carriage_return_ends_a_line_comment() {
+        // scan.l's `non_newline` is `[^\n\r]`: what follows a lone CR is
+        // SQL again — the rest of the statement, its `;`, the next `@name`.
+        let f = parse("/* @name a */ SELECT 1 -- one\r, 2; /* @name b */ SELECT 3 -- x\r");
+        assert_eq!(errors(&f), Vec::<String>::new());
+        assert_eq!(
+            names(&f),
+            [("a", "SELECT 1 -- one\r, 2"), ("b", "SELECT 3")]
+        );
+        // CRLF, as before.
+        let f = parse("/* @name a */\r\nSELECT 1 -- one\r\n, 2;\r\n");
+        assert_eq!(names(&f), [("a", "SELECT 1 -- one\r\n, 2")]);
+        // A stray statement after a lone CR is reported.
+        let f = parse("/* @name a */ SELECT 1; -- x\rSELECT 2");
+        assert_eq!(
+            errors(&f),
+            [
+                "1:30: a second statement after query `a`: each query is one statement, after its own `/* @name */` comment"
+            ]
         );
     }
 

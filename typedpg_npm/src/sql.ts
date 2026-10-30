@@ -89,10 +89,11 @@ function skipQuotedIdentifier(sql: string, open: number): number {
   return sql.length;
 }
 
-/** The index past the line comment opened at `open`, its newline included. */
+/** The index past the line comment opened at `open`, its line break included. */
 function skipLineComment(sql: string, open: number): number {
   let i = open + 2;
-  while (i < sql.length && sql[i] !== "\n") i++;
+  // scan.l's `non_newline` is `[^\n\r]`: a lone CR ends the comment too.
+  while (i < sql.length && sql[i] !== "\n" && sql[i] !== "\r") i++;
   return i < sql.length ? i + 1 : i;
 }
 

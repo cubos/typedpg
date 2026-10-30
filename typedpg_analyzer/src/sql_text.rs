@@ -96,11 +96,12 @@ fn skip_quoted_identifier(sql: &str, open: usize) -> usize {
     bytes.len()
 }
 
-/// The index past the line comment opened at `open`, its newline included:
-/// what follows the comment is the next statement, not part of it.
+/// The index past the line comment opened at `open`, its line break
+/// included: what follows the comment is code again. scan.l's
+/// `non_newline` is `[^\n\r]`, so a lone CR ends it too.
 fn skip_line_comment(bytes: &[u8], open: usize) -> usize {
     let mut i = open + 2;
-    while i < bytes.len() && bytes[i] != b'\n' {
+    while i < bytes.len() && !matches!(bytes[i], b'\n' | b'\r') {
         i += 1;
     }
     if i < bytes.len() { i + 1 } else { i }
@@ -183,6 +184,23 @@ mod tests {
         assert_eq!(
             strip_trailing_junk("SELECT 1 /* a note */ -- another"),
             "SELECT 1"
+        );
+    }
+
+    #[test]
+    fn a_carriage_return_ends_a_line_comment() {
+        // scan.l's `non_newline` is `[^\n\r]`: what follows a lone CR is
+        // code, not the comment.
+        assert_eq!(
+            strip_trailing_junk("SELECT 1 -- a note\r, 2"),
+            "SELECT 1 -- a note\r, 2"
+        );
+        assert_eq!(strip_trailing_junk("SELECT 1 -- a note\r;"), "SELECT 1");
+        assert_eq!(strip_trailing_junk("SELECT 1 -- a note\r"), "SELECT 1");
+        assert_eq!(strip_trailing_junk("SELECT 1 -- a note\r\n"), "SELECT 1");
+        assert_eq!(
+            strip_trailing_junk("SELECT 1 -- a\r\n, 2 -- b\r"),
+            "SELECT 1 -- a\r\n, 2"
         );
     }
 

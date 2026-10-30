@@ -318,7 +318,11 @@ fn first_token_offset(sql: &str, mut at: usize) -> usize {
             at += 1;
         }
         if bytes[at..].starts_with(b"--") {
-            at = sql[at..].find('\n').map_or(sql.len(), |n| at + n + 1);
+            // scan.l's `non_newline` is `[^\n\r]`: a lone CR ends the
+            // comment too.
+            at = sql[at..]
+                .find(['\n', '\r'])
+                .map_or(sql.len(), |n| at + n + 1);
         } else if bytes[at..].starts_with(b"/*") {
             // Block comments nest.
             let mut depth = 0usize;
