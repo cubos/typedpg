@@ -77,6 +77,7 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
     let mut constraints: Vec<DomainConstraint> = Vec::new();
     let mut saw_default = false;
     let mut has_default = false;
+    let mut default_refs: Vec<super::depend::Reference> = Vec::new();
     let mut null_defined = false;
     let mut typ_not_null = false;
     for n in &stmt.constraints {
@@ -149,7 +150,11 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
         if c.contype == ConstrType::ConstrDefault as i32
             && let Some(expr) = c.raw_expr.as_deref()
         {
-            super::defaults::check_default(interp, expr, &name, base_type_oid)?;
+            let (checked, refs) = super::depend::collect(|| {
+                super::defaults::check_default(interp, expr, &name, base_type_oid)
+            });
+            checked?;
+            default_refs = refs;
             has_default = !is_null_constant(expr);
         }
         add_domain_constraint(interp, &name, base_type_oid, c, &mut constraints)?;
@@ -193,6 +198,13 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
         interp,
         super::depend::ObjectAddress::type_(oid),
         [super::depend::ObjectAddress::type_(base_type_oid)],
+        crate::pg_catalog::DepType::Normal,
+    );
+    // ... and on what its default refers to.
+    super::depend::record_references(
+        interp,
+        super::depend::ObjectAddress::type_(oid),
+        &default_refs,
         crate::pg_catalog::DepType::Normal,
     );
     register_array_type(interp, nsoid, &name, oid)?;
@@ -560,9 +572,31 @@ pub fn alter_domain(
         // SET DEFAULT: cooked like the domain's own DEFAULT
         // (AlterDomainDefault). DROP DEFAULT has no effect on typing.
         "T" => {
+            let mut default_refs = Vec::new();
             if let Some(expr) = stmt.def.as_deref() {
-                super::defaults::check_default(interp, expr, name, base_type)?;
+                let (checked, refs) = super::depend::collect(|| {
+                    super::defaults::check_default(interp, expr, name, base_type)
+                });
+                checked?;
+                default_refs = refs;
             }
+            // GenerateTypeDependencies(rebuild): the domain's dependencies
+            // are recorded anew — on its base type and what the new default
+            // refers to.
+            let addr = super::depend::ObjectAddress::type_(type_oid);
+            super::depend::forget_dependencies_of(interp, addr);
+            super::depend::record(
+                interp,
+                addr,
+                [super::depend::ObjectAddress::type_(base_type)],
+                crate::pg_catalog::DepType::Normal,
+            );
+            super::depend::record_references(
+                interp,
+                addr,
+                &default_refs,
+                crate::pg_catalog::DepType::Normal,
+            );
             match stmt.def.as_deref() {
                 Some(expr) if !is_null_constant(expr) => {
                     interp.domain_defaults.insert(type_oid);

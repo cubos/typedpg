@@ -707,6 +707,38 @@ fn unnamed_indexes_are_named_like_pg() {
 }
 
 #[test]
+fn unnamed_expression_indexes_are_named_like_select_items() {
+    // FigureIndexColname is FigureColnameInternal: a cast of a constant is
+    // named after its type, CASE / COALESCE / ARRAY / NULLIF after the
+    // construct, a subscript after its array; an operator is `expr`.
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int, b text, j jsonb, r int[]);
+         CREATE INDEX ON t (('int4'::regtype::oid));
+         CREATE INDEX ON t ((1::int));
+         CREATE INDEX ON t ((CASE WHEN a > 0 THEN b END));
+         CREATE INDEX ON t ((CASE WHEN a > 0 THEN b ELSE b END));
+         CREATE INDEX ON t ((coalesce(a, 0)));
+         CREATE INDEX ON t ((greatest(a, 0)));
+         CREATE INDEX ON t ((j->'k'));
+         CREATE INDEX ON t ((r[1]));
+         CREATE INDEX ON t ((b COLLATE \"C\"));
+         CREATE INDEX ON t ((nullif(a, 0)));
+         CREATE INDEX ON t ((ARRAY[a]));
+         CREATE INDEX ON t ((a::text::int));
+         CREATE INDEX ON t ((a IS NULL));
+         CREATE TABLE e (a int, b int, EXCLUDE USING btree ((a::text) WITH =, (1::int + b) WITH =));",
+    )]);
+    db.apply_sql(
+        "DROP INDEX t_oid_idx, t_int4_idx, t_case_idx, t_b_idx, t_coalesce_idx,
+                    t_greatest_idx, t_expr_idx, t_r_idx, t_b_idx1, t_nullif_idx,
+                    t_array_idx, t_a_idx, t_expr_idx1;
+         ALTER TABLE e DROP CONSTRAINT e_a_expr_excl;",
+    )
+    .unwrap();
+}
+
+#[test]
 fn create_unique_index_is_not_a_constraint() {
     // PG 18: a plain unique index is an ON CONFLICT (a) arbiter and an FK
     // target, but not a constraint: ON CONSTRAINT / DROP CONSTRAINT by its

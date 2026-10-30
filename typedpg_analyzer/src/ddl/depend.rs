@@ -1112,6 +1112,7 @@ fn find_blocker(
             // range type's multirange type's constructors).
             let owned = deptype != DepType::Normal
                 || is_drop_target(d)
+                || belongs_to_owner_relation(interp, from, d)
                 || (from.objsubid == 0
                     && interp.pg_depend.iter().any(|row| {
                         row.classid == d.classid
@@ -1135,6 +1136,37 @@ fn find_blocker(
     reached
         .into_iter()
         .find_map(|(d, silent, via)| via.filter(|_| !silent).map(|via| (d, via)))
+}
+
+/// Whether `d` — an index or a constraint — belongs to the relation
+/// `from` is the row type of (or that row type's array type). The analyzer
+/// keeps that ownership in `pg_index` / `pg_constraint` rather than as the
+/// automatic dependency on the relation PG records (index_create,
+/// CreateConstraintEntry), so it goes with the relation even when it
+/// names the relation's row type (`'tt'::regtype`).
+fn belongs_to_owner_relation(interp: &PgCatalog, from: ObjectAddress, d: ObjectAddress) -> bool {
+    let mut owner = from;
+    while owner.classid == PG_TYPE_RELID {
+        match implied_owner(interp, owner) {
+            Some(next) => owner = next,
+            None => return false,
+        }
+    }
+    if owner.classid != PG_CLASS_RELID || owner == from {
+        return false;
+    }
+    let Some(relid) = PgClassOid::new(owner.objid.get()) else {
+        return false;
+    };
+    if d.classid == PG_CLASS_RELID {
+        return PgClassOid::new(d.objid.get())
+            .and_then(|index| interp.pg_index.get(&index))
+            .is_some_and(|i| i.indrelid == relid);
+    }
+    d.classid == PG_CONSTRAINT_RELID
+        && crate::oid::PgConstraintOid::new(d.objid.get())
+            .and_then(|c| interp.pg_constraint.get(&c))
+            .is_some_and(|c| c.conrelid == relid)
 }
 
 /// `IsPinnedObject`: the objects below [`FIRST_UNPINNED_OBJECT_ID`], the
@@ -1587,6 +1619,30 @@ pub(crate) fn expression_references(
     refs
 }
 
+/// What an expression stored as a value of type `target` (a column or
+/// domain default, a generation expression) refers to: an untyped literal
+/// is coerced to `target` (coerce_type → stringTypeDatum), so a reg* one
+/// becomes a constant naming its object.
+pub(crate) fn coerced_expression_references(
+    interp: &PgCatalog,
+    expr: &typedpg_pg_query::protobuf::Node,
+    relid: Option<PgClassOid>,
+    target: Option<crate::oid::PgTypeOid>,
+) -> Vec<Reference> {
+    use typedpg_pg_query::protobuf::a_const;
+    let mut refs = expression_references(interp, expr, relid);
+    if let Some(target) = target
+        && let Some(node::Node::AConst(ac)) = expr.node.as_ref()
+        && !ac.isnull
+        && let Some(a_const::Val::Sval(sv)) = &ac.val
+    {
+        let (_, literal) =
+            collect(|| crate::literal_input::validate_with_typmod(&sv.sval, target, None, interp));
+        refs.extend(literal);
+    }
+    refs
+}
+
 /// `recordDependencyOnSingleRelExpr`: `depender` depends on what `exprs`
 /// refer to — normally, except for the columns of its own relation
 /// `relid`, which it depends on automatically (it goes with them).
@@ -1596,9 +1652,21 @@ fn record_expressions(
     exprs: &[&typedpg_pg_query::protobuf::Node],
     relid: Option<PgClassOid>,
 ) {
+    record_coerced_expressions(interp, depender, exprs, relid, None);
+}
+
+/// [`record_expressions`], for expressions stored as values of type
+/// `target` (see [`coerced_expression_references`]).
+fn record_coerced_expressions(
+    interp: &mut PgCatalog,
+    depender: ObjectAddress,
+    exprs: &[&typedpg_pg_query::protobuf::Node],
+    relid: Option<PgClassOid>,
+    target: Option<crate::oid::PgTypeOid>,
+) {
     let refs: Vec<Reference> = exprs
         .iter()
-        .flat_map(|e| expression_references(interp, e, relid))
+        .flat_map(|e| coerced_expression_references(interp, e, relid, target))
         .collect();
     let own = |r: &Reference| match r {
         Reference::Column(rel, _) => Some(*rel) == relid,
@@ -1641,11 +1709,17 @@ pub(crate) fn record_column_expression(interp: &mut PgCatalog, relid: PgClassOid
     else {
         return;
     };
-    record_expressions(
+    let target = interp
+        .attributes_of(relid)
+        .iter()
+        .find(|a| a.attnum == attnum)
+        .map(|a| a.atttypid);
+    record_coerced_expressions(
         interp,
         ObjectAddress::column(relid, attnum),
         &[&expr],
         Some(relid),
+        target,
     );
 }
 

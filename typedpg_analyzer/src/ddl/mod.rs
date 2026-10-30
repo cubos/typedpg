@@ -584,8 +584,9 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         | node::Node::ReassignOwnedStmt(_)
         | node::Node::DropOwnedStmt(_)
         | node::Node::AlterTableSpaceOptionsStmt(_)
-        | node::Node::AlterCollationStmt(_)
         | node::Node::AlterObjectDependsStmt(_) => Ok(()),
+        // `ALTER COLLATION name REFRESH VERSION`: only the name matters.
+        node::Node::AlterCollationStmt(s) => collations::refresh_version(db, s),
         node::Node::AlterTypeStmt(s) => types::alter_type(db, s),
         node::Node::AlterTableMoveAllStmt(s) => tables::alter_table_move_all(db, s),
         node::Node::PrepareStmt(s) => prepared::prepare(db, s),

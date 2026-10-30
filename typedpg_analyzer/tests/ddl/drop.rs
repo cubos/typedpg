@@ -1656,6 +1656,146 @@ fn drop_collation_honours_what_uses_it() {
 }
 
 #[test]
+fn alter_collation_renames_and_moves_it() {
+    // AlterObjectRename_internal / AlterObjectNamespace_internal: the
+    // collation keeps its OID, so what uses it follows it.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE COLLATION co (locale = 'C');
+         ALTER COLLATION co RENAME TO co2;
+         CREATE COLLATION co (provider = icu, locale = 'und');
+         DROP COLLATION co;
+         CREATE SCHEMA s;
+         ALTER COLLATION co2 SET SCHEMA s;
+         ALTER COLLATION s.co2 SET SCHEMA s;
+         CREATE TABLE t (a text COLLATE s.co2);
+         CREATE VIEW v AS SELECT 'a'::text COLLATE s.co2 AS x;
+         ALTER COLLATION s.co2 RENAME TO co3;
+         ALTER COLLATION s.co3 SET SCHEMA public;
+         ALTER COLLATION co3 REFRESH VERSION;
+         COMMENT ON COLLATION co3 IS 'c';",
+    )]);
+    assert_eq!(db.analyze("SELECT * FROM v").unwrap().columns.len(), 1);
+    db.analyze("SELECT a COLLATE co3 FROM t").unwrap();
+    for query in ["SELECT 'a' COLLATE co2", "SELECT 'a' COLLATE s.co3"] {
+        let err = db.analyze(query).unwrap_err();
+        assert!(err.to_string().contains("does not exist"), "{query}: {err}");
+    }
+    build(&[(
+        "0001.sql",
+        "CREATE COLLATION co (locale = 'C');
+         ALTER COLLATION co RENAME TO co2;
+         DROP COLLATION co2;
+         CREATE SCHEMA s;
+         CREATE COLLATION co (locale = 'C');
+         ALTER COLLATION co SET SCHEMA s;
+         DROP COLLATION s.co;
+         CREATE COLLATION co (locale = 'C');
+         CREATE TABLE t (a text COLLATE co);
+         ALTER COLLATION co RENAME TO co2;
+         DROP COLLATION co2 CASCADE;",
+    )]);
+
+    let two = "CREATE COLLATION c1 (locale = 'C');
+               CREATE COLLATION c2 (provider = icu, locale = 'und');
+               CREATE SCHEMA s;
+               CREATE COLLATION s.c1 (provider = icu, locale = 'und');
+               CREATE COLLATION s.c2 (locale = 'C');";
+    assert_ddl_rejections(&[
+        (
+            two,
+            "ALTER COLLATION c2 RENAME TO c1;",
+            "collation \"c1\" for encoding \"UTF8\" already exists in schema \"public\"",
+        ),
+        (
+            two,
+            "ALTER COLLATION c1 RENAME TO c2;",
+            "collation \"c2\" already exists in schema \"public\"",
+        ),
+        (
+            two,
+            "ALTER COLLATION c1 SET SCHEMA s;",
+            "collation \"c1\" already exists in schema \"s\"",
+        ),
+        (
+            two,
+            "ALTER COLLATION c2 SET SCHEMA s;",
+            "collation \"c2\" for encoding \"UTF8\" already exists in schema \"s\"",
+        ),
+        (
+            two,
+            "CREATE COLLATION c1 (locale = 'C');",
+            "collation \"c1\" for encoding \"UTF8\" already exists",
+        ),
+        (
+            two,
+            "CREATE COLLATION c2 (locale = 'C');",
+            "collation \"c2\" already exists",
+        ),
+        (
+            two,
+            "CREATE COLLATION c1 (provider = icu, locale = 'und');",
+            "collation \"c1\" already exists",
+        ),
+        (
+            two,
+            "CREATE COLLATION c1 FROM \"C\";",
+            "collation \"c1\" already exists",
+        ),
+        (
+            two,
+            "ALTER COLLATION c1 SET SCHEMA pg_temp;",
+            "cannot move objects into or out of temporary schemas",
+        ),
+        (
+            two,
+            "ALTER COLLATION c1 SET SCHEMA pg_toast;",
+            "cannot move objects into or out of TOAST schema",
+        ),
+        (
+            two,
+            "ALTER COLLATION c1 SET SCHEMA nosch;",
+            "schema \"nosch\" does not exist",
+        ),
+        (
+            "",
+            "ALTER COLLATION nope SET SCHEMA nosch;",
+            "collation \"nope\" for encoding \"UTF8\" does not exist",
+        ),
+        (
+            "",
+            "ALTER COLLATION nope RENAME TO x;",
+            "collation \"nope\" for encoding \"UTF8\" does not exist",
+        ),
+        (
+            "",
+            "ALTER COLLATION public.nope RENAME TO x;",
+            "collation \"public.nope\" for encoding \"UTF8\" does not exist",
+        ),
+        (
+            "",
+            "ALTER COLLATION nosch.nope RENAME TO x;",
+            "schema \"nosch\" does not exist",
+        ),
+        (
+            "",
+            "ALTER COLLATION nope REFRESH VERSION;",
+            "collation \"nope\" for encoding \"UTF8\" does not exist",
+        ),
+        (
+            "",
+            "ALTER COLLATION nope OWNER TO CURRENT_USER;",
+            "collation \"nope\" for encoding \"UTF8\" does not exist",
+        ),
+        (
+            "",
+            "COMMENT ON COLLATION nosch.nope IS 'x';",
+            "schema \"nosch\" does not exist",
+        ),
+    ]);
+}
+
+#[test]
 fn a_stored_reg_constant_pins_what_it_names() {
     // find_expr_references_walker: a regproc / regprocedure / regoper /
     // regoperator / regtype / regclass constant depends on its object.
@@ -1699,6 +1839,72 @@ fn a_stored_reg_constant_pins_what_it_names() {
             "DROP TABLE tt;",
             "cannot drop table tt because other objects depend on it",
         ),
+        // An untyped literal coerced to the reg type is a constant too.
+        (
+            "CREATE TYPE ty AS (a int); CREATE TABLE t (a regtype DEFAULT 'ty');".into(),
+            "DROP TYPE ty;",
+            "cannot drop type ty because other objects depend on it",
+        ),
+        (
+            format!("{f} CREATE TABLE t (a regproc DEFAULT 'f');"),
+            "DROP FUNCTION f(int);",
+            "cannot drop function f(integer) because other objects depend on it",
+        ),
+        (
+            format!("{f} CREATE TABLE t (a regprocedure DEFAULT 'f(int)');"),
+            "DROP FUNCTION f(int);",
+            "cannot drop function f(integer) because other objects depend on it",
+        ),
+        (
+            "CREATE COLLATION co (locale = 'C'); CREATE TABLE t (a regcollation DEFAULT 'co');"
+                .into(),
+            "DROP COLLATION co;",
+            "cannot drop collation co because other objects depend on it",
+        ),
+        (
+            "CREATE SCHEMA s; CREATE TABLE t (a regnamespace DEFAULT 's');".into(),
+            "DROP SCHEMA s;",
+            "cannot drop schema s because other objects depend on it",
+        ),
+        (
+            "CREATE TYPE ty AS (a int); CREATE DOMAIN dr AS regtype;
+             CREATE TABLE t (a dr DEFAULT 'ty');"
+                .into(),
+            "DROP TYPE ty;",
+            "cannot drop type ty because other objects depend on it",
+        ),
+        (
+            "CREATE TYPE ty AS (a int); CREATE TABLE t (a regtype);
+             ALTER TABLE t ALTER a SET DEFAULT 'ty';"
+                .into(),
+            "DROP TYPE ty;",
+            "cannot drop type ty because other objects depend on it",
+        ),
+        (
+            "CREATE TYPE ty AS (a int);
+             CREATE TABLE t (a regtype GENERATED ALWAYS AS ('ty') STORED);"
+                .into(),
+            "DROP TYPE ty;",
+            "cannot drop type ty because other objects depend on it",
+        ),
+        (
+            "CREATE TYPE ty AS (a int); CREATE DOMAIN d AS regtype DEFAULT 'ty';".into(),
+            "DROP TYPE ty;",
+            "cannot drop type ty because other objects depend on it",
+        ),
+        (
+            "CREATE TYPE ty AS (a int); CREATE VIEW v AS SELECT COALESCE(NULL::regtype, 'ty') AS x;"
+                .into(),
+            "DROP TYPE ty;",
+            "cannot drop type ty because other objects depend on it",
+        ),
+        (
+            "CREATE SCHEMA s; CREATE TABLE t (a regnamespace); CREATE TABLE u (b int);
+             CREATE RULE r AS ON INSERT TO u DO ALSO INSERT INTO t VALUES ('s');"
+                .into(),
+            "DROP SCHEMA s;",
+            "cannot drop schema s because other objects depend on it",
+        ),
     ];
     for (setup, stmt, msg) in &cases {
         assert_ddl_rejections(&[(setup, stmt, msg)]);
@@ -1724,6 +1930,14 @@ fn a_stored_reg_constant_pins_what_it_names() {
             ),
             "DROP FUNCTION f(int); DROP VIEW v;",
         ),
+        // Nor does an array of them: the dependency is on a scalar
+        // constant only.
+        (
+            "CREATE TYPE ty AS (a int); CREATE TABLE t (a regtype[] DEFAULT '{ty}');
+             CREATE VIEW w AS SELECT '{ty}'::regtype[] AS p; CREATE VIEW v AS SELECT 1 AS p;"
+                .into(),
+            "DROP TYPE ty; DROP VIEW v;",
+        ),
     ] {
         assert_gone(
             &format!("{setup} {stmt}"),
@@ -1735,12 +1949,83 @@ fn a_stored_reg_constant_pins_what_it_names() {
 
 #[test]
 fn what_a_table_owns_may_use_its_row_type() {
-    // A table's own CHECK constraint and policy go with it, whatever they
-    // refer to of it — its row type included.
+    // A table's own CHECK constraints, indexes and policies go with it,
+    // whatever they refer to of it — its row type and that type's array
+    // type included.
     build(&[(
         "0001.sql",
         "CREATE TABLE tb (a int CHECK (ROW(a)::tb IS NOT NULL));
          CREATE POLICY p ON tb USING ((NULL::tb).a IS NULL);
-         DROP TABLE tb;",
+         DROP TABLE tb;
+         CREATE TABLE tt (a int, CHECK ('tt[]'::regtype IS NOT NULL),
+                          CHECK ('tt'::regtype IS NOT NULL));
+         CREATE INDEX ON tt (('tt'::regtype::oid));
+         CREATE INDEX ON tt (a) WHERE 'tt[]'::regtype IS NOT NULL;
+         DROP TABLE tt;
+         CREATE TABLE tt (b int);
+         CREATE INDEX tt_oid_idx ON tt (b);",
     )]);
+    // Another table's are not its own.
+    assert_ddl_rejections(&[
+        (
+            "CREATE TABLE tt (a int); CREATE TABLE o (a int, CHECK ('tt'::regtype IS NOT NULL));",
+            "DROP TABLE tt;",
+            "cannot drop table tt because other objects depend on it",
+        ),
+        (
+            "CREATE TABLE tt (a int); CREATE TABLE o (a int);
+             CREATE INDEX ON o (('tt[]'::regtype::oid));",
+            "DROP TABLE tt;",
+            "cannot drop table tt because other objects depend on it",
+        ),
+    ]);
+}
+
+#[test]
+fn a_domain_depends_on_what_its_default_uses() {
+    // GenerateTypeDependencies: a domain depends on its default's
+    // objects; ALTER DOMAIN ... SET / DROP DEFAULT records them anew.
+    let f = "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT 1';";
+    assert_ddl_rejections(&[
+        (
+            &format!("{f} CREATE DOMAIN d AS int DEFAULT f();"),
+            "DROP FUNCTION f();",
+            "cannot drop function f() because other objects depend on it",
+        ),
+        (
+            &format!("{f} CREATE DOMAIN d AS int; ALTER DOMAIN d SET DEFAULT f();"),
+            "DROP FUNCTION f();",
+            "cannot drop function f() because other objects depend on it",
+        ),
+        // The base type stays depended on.
+        (
+            "CREATE TYPE ty AS (a int); CREATE DOMAIN d AS ty DEFAULT NULL;
+             ALTER DOMAIN d SET DEFAULT NULL; ALTER DOMAIN d DROP DEFAULT;",
+            "DROP TYPE ty;",
+            "cannot drop type ty because other objects depend on it",
+        ),
+    ]);
+    build(&[(
+        "0001.sql",
+        &format!(
+            "{f} CREATE DOMAIN d AS int DEFAULT f(); ALTER DOMAIN d SET DEFAULT 1;
+             DROP FUNCTION f();
+             {f} ALTER DOMAIN d SET DEFAULT f(); ALTER DOMAIN d DROP DEFAULT;
+             DROP FUNCTION f();"
+        ),
+    )]);
+    // With CASCADE the domain goes, and the columns of it.
+    let db = build_db(&[(
+        "0001.sql",
+        &format!(
+            "{f} CREATE DOMAIN d AS int DEFAULT f(); CREATE TABLE t (a d, b int);
+             DROP FUNCTION f() CASCADE;"
+        ),
+    )]);
+    assert_eq!(db.analyze("SELECT * FROM t").unwrap().columns.len(), 1);
+    let err = db.analyze("SELECT NULL::d").unwrap_err();
+    assert!(
+        err.to_string().starts_with("type \"d\" does not exist"),
+        "{err}"
+    );
 }

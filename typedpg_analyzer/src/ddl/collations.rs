@@ -9,7 +9,8 @@
 //!    row inherits its encoding.
 //!
 //! Either way the analyzer just needs a valid `pg_collation` row so
-//! subsequent `COLLATE "name"` references resolve.
+//! subsequent `COLLATE "name"` references resolve. `ALTER COLLATION`
+//! renames and moves it, `DROP COLLATION` drops it.
 
 use typedpg_pg_query::protobuf::{DefineStmt, node};
 
@@ -18,31 +19,36 @@ use super::util::ensure_qualified_name;
 use crate::oid::PgCollationOid;
 use crate::pg_catalog::{PgCatalog, PgCollation};
 
+/// `pg_collation.collencoding` of a collation for the database encoding
+/// (UTF8, `PG_UTF8`); `-1` is one for any encoding.
+const DATABASE_ENCODING: i32 = 6;
+
 pub fn define_collation(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), DdlError> {
     let (nsoid, name) = ensure_qualified_name(interp, &stmt.defnames)?;
 
-    // PG: `collation "<name>" already exists`. Names are unique per schema.
-    if interp
-        .collation_by_qname
-        .contains_key(&(nsoid, name.clone()))
-    {
-        if stmt.if_not_exists {
-            return Ok(());
-        }
-        return Err(DdlError::DuplicateObject(format!(
-            "collation \"{name}\" for encoding \"UTF8\" already exists"
-        )));
-    }
-
     // `CREATE COLLATION x FROM y` parses as a `DefElem { defname = "from",
     // arg = List([String("y")]) }`; we use it to resolve the source and
-    // inherit its encoding. Option-style `(LOCALE = …, PROVIDER = …)` parses
-    // as a list of DefElems we don't read today — collencoding stays `-1`.
-    let mut collencoding: i32 = -1;
+    // inherit its encoding. Option-style `(LOCALE = …, PROVIDER = …)`:
+    // a libc collation is for the database encoding, an ICU or builtin
+    // one for any (DefineCollation).
+    let mut collencoding: i32 = DATABASE_ENCODING;
     for opt in &stmt.definition {
         let Some(node::Node::DefElem(de)) = opt.node.as_ref() else {
             continue;
         };
+        if de.defname.eq_ignore_ascii_case("provider") {
+            // defGetString: a bare word arrives as a type name.
+            let provider = match de.arg.as_deref().and_then(|a| a.node.as_ref()) {
+                Some(node::Node::String(s)) => Some(s.sval.as_str()),
+                Some(node::Node::TypeName(tn)) => {
+                    tn.names.last().and_then(super::util::node_string)
+                }
+                _ => None,
+            };
+            if provider.is_some_and(|p| !p.eq_ignore_ascii_case("libc")) {
+                collencoding = -1;
+            }
+        }
         if de.defname.eq_ignore_ascii_case("from")
             && let Some(arg) = de.arg.as_deref()
         {
@@ -74,6 +80,25 @@ pub fn define_collation(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(),
         }
     }
 
+    // CollationCreate: names are unique per schema — under the database
+    // encoding, a name for any encoding clashes with one for this one.
+    if let Some(existing) = interp
+        .collation_by_qname
+        .get(&(nsoid, name.clone()))
+        .and_then(|oid| interp.pg_collation.get(oid))
+    {
+        if stmt.if_not_exists {
+            return Ok(());
+        }
+        return Err(DdlError::DuplicateObject(
+            if collencoding == DATABASE_ENCODING && existing.collencoding == DATABASE_ENCODING {
+                format!("collation \"{name}\" for encoding \"UTF8\" already exists")
+            } else {
+                format!("collation \"{name}\" already exists")
+            },
+        ));
+    }
+
     let oid = PgCollationOid::from_nonzero(interp.alloc_oid()?);
     interp.insert_pg_collation(PgCollation {
         oid,
@@ -84,16 +109,16 @@ pub fn define_collation(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(),
     Ok(())
 }
 
-/// DROP COLLATION name [CASCADE | RESTRICT] (`RemoveObjects` →
-/// `performDeletion`).
-pub(crate) fn drop_collation(
-    interp: &mut PgCatalog,
+/// The collation a statement names (get_collation_oid): a missing schema
+/// is reported as such (LookupExplicitNamespace), then a missing
+/// collation. `Ok(None)` when it's missing and `missing_ok`.
+pub(crate) fn lookup_collation(
+    interp: &PgCatalog,
     obj_node: &typedpg_pg_query::protobuf::Node,
     missing_ok: bool,
-    cascade: bool,
-) -> Result<(), DdlError> {
+) -> Result<Option<PgCollationOid>, DdlError> {
     let Some(node::Node::List(list)) = obj_node.node.as_ref() else {
-        return Ok(());
+        return Ok(None);
     };
     let names: Vec<&str> = list
         .items
@@ -103,31 +128,150 @@ pub(crate) fn drop_collation(
     let (schema, name) = match names.as_slice() {
         [n] => (None, *n),
         [s, n] => (Some(*s), *n),
-        _ => return Ok(()),
+        _ => return Ok(None),
     };
-    // get_collation_oid: a missing schema is reported as such
-    // (LookupExplicitNamespace) — skipped under IF EXISTS.
     if let Some(s) = schema
         && interp.namespace_oid(s).is_none()
     {
         if missing_ok {
-            return Ok(());
+            return Ok(None);
         }
-        return Err(DdlError::DependencyError(format!(
+        return Err(DdlError::TableNotFound(format!(
             "schema \"{s}\" does not exist"
         )));
     }
-    let Some(oid) = interp.resolve_collation(schema, name).map(|c| c.oid) else {
-        if missing_ok {
-            return Ok(());
-        }
+    match interp.resolve_collation(schema, name) {
+        Some(c) => Ok(Some(c.oid)),
+        None if missing_ok => Ok(None),
         // NameListToString: the name as written, joined, unquoted.
-        return Err(DdlError::DependencyError(format!(
+        None => Err(DdlError::TypeNotFound(format!(
             "collation \"{}\" for encoding \"UTF8\" does not exist",
             names.join(".")
-        )));
+        ))),
+    }
+}
+
+/// IsThereCollationInNamespace: no collation `name` usable under the
+/// database encoding (one of it, or one for any encoding) may be in schema
+/// `nsoid` already.
+fn check_collation_name_free(
+    interp: &PgCatalog,
+    name: &str,
+    nsoid: crate::oid::PgNamespaceOid,
+) -> Result<(), DdlError> {
+    let Some(existing) = interp
+        .collation_by_qname
+        .get(&(nsoid, name.to_owned()))
+        .and_then(|oid| interp.pg_collation.get(oid))
+    else {
+        return Ok(());
     };
-    drop_collation_oid(interp, oid, cascade)
+    let schema = interp.namespace_name(nsoid).unwrap_or_default();
+    Err(DdlError::DuplicateObject(
+        if existing.collencoding == DATABASE_ENCODING {
+            format!(
+                "collation \"{name}\" for encoding \"UTF8\" already exists in schema \"{schema}\""
+            )
+        } else {
+            format!("collation \"{name}\" already exists in schema \"{schema}\"")
+        },
+    ))
+}
+
+/// `ALTER COLLATION name RENAME TO new` (AlterObjectRename_internal).
+pub(crate) fn rename_collation(
+    interp: &mut PgCatalog,
+    stmt: &typedpg_pg_query::protobuf::RenameStmt,
+) -> Result<(), DdlError> {
+    let Some(obj) = stmt.object.as_deref() else {
+        return Ok(());
+    };
+    let Some(oid) = lookup_collation(interp, obj, stmt.missing_ok)? else {
+        return Ok(());
+    };
+    let Some(mut row) = interp.pg_collation.get(&oid).cloned() else {
+        return Ok(());
+    };
+    check_collation_name_free(interp, &stmt.newname, row.collnamespace)?;
+    interp.remove_pg_collation(oid);
+    row.collname.clone_from(&stmt.newname);
+    interp.insert_pg_collation(row);
+    Ok(())
+}
+
+/// `ALTER COLLATION name SET SCHEMA s` (AlterObjectNamespace_internal):
+/// the collation is looked up before the schema; moving it where it
+/// already is does nothing.
+pub(crate) fn set_collation_schema(
+    interp: &mut PgCatalog,
+    stmt: &typedpg_pg_query::protobuf::AlterObjectSchemaStmt,
+) -> Result<(), DdlError> {
+    let Some(obj) = stmt.object.as_deref() else {
+        return Ok(());
+    };
+    let Some(oid) = lookup_collation(interp, obj, stmt.missing_ok)? else {
+        return Ok(());
+    };
+    let Some(mut row) = interp.pg_collation.get(&oid).cloned() else {
+        return Ok(());
+    };
+    // LookupCreationNamespace: `pg_temp` is the session's temporary
+    // schema, which CheckSetNamespace refuses.
+    if stmt.newschema == "pg_temp" {
+        return Err(DdlError::Parse(
+            "cannot move objects into or out of temporary schemas".into(),
+        ));
+    }
+    let new_nsoid = super::util::existing_namespace(interp, &stmt.newschema)?;
+    if new_nsoid == row.collnamespace {
+        return Ok(());
+    }
+    // CheckSetNamespace.
+    if interp.temp_namespace == Some(new_nsoid) || interp.temp_namespace == Some(row.collnamespace)
+    {
+        return Err(DdlError::Parse(
+            "cannot move objects into or out of temporary schemas".into(),
+        ));
+    }
+    let toast = interp.namespace_oid("pg_toast");
+    if toast.is_some() && (toast == Some(new_nsoid) || toast == Some(row.collnamespace)) {
+        return Err(DdlError::Parse(
+            "cannot move objects into or out of TOAST schema".into(),
+        ));
+    }
+    check_collation_name_free(interp, &row.collname, new_nsoid)?;
+    interp.remove_pg_collation(oid);
+    row.collnamespace = new_nsoid;
+    interp.insert_pg_collation(row);
+    Ok(())
+}
+
+/// `ALTER COLLATION name REFRESH VERSION` (AlterCollation): the version
+/// isn't modelled; the collation must exist.
+pub(crate) fn refresh_version(
+    interp: &PgCatalog,
+    stmt: &typedpg_pg_query::protobuf::AlterCollationStmt,
+) -> Result<(), DdlError> {
+    let list = typedpg_pg_query::protobuf::Node {
+        node: Some(node::Node::List(typedpg_pg_query::protobuf::List {
+            items: stmt.collname.clone(),
+        })),
+    };
+    lookup_collation(interp, &list, false).map(|_| ())
+}
+
+/// DROP COLLATION name [CASCADE | RESTRICT] (`RemoveObjects` →
+/// `performDeletion`).
+pub(crate) fn drop_collation(
+    interp: &mut PgCatalog,
+    obj_node: &typedpg_pg_query::protobuf::Node,
+    missing_ok: bool,
+    cascade: bool,
+) -> Result<(), DdlError> {
+    match lookup_collation(interp, obj_node, missing_ok)? {
+        Some(oid) => drop_collation_oid(interp, oid, cascade),
+        None => Ok(()),
+    }
 }
 
 /// Drop collation `oid`: what depends on it needs CASCADE, and goes with

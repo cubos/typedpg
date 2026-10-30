@@ -255,7 +255,12 @@ pub(crate) fn record_default_dependencies(
     }
     // Functions, operators, types, ... the expression refers to.
     if let Some(expr) = expr {
-        let refs = super::depend::expression_references(interp, expr, Some(relid));
+        let target = interp
+            .attributes_of(relid)
+            .iter()
+            .find(|a| a.attnum == attnum)
+            .map(|a| a.atttypid);
+        let refs = super::depend::coerced_expression_references(interp, expr, Some(relid), target);
         super::depend::record_references(
             interp,
             super::depend::ObjectAddress::column(relid, attnum),
