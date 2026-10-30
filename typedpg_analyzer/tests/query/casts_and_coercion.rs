@@ -1152,6 +1152,14 @@ fn a_value_cast_to_unknown_is_no_literal() {
         ("SELECT 'a'::text::unknown::int AS a", "integer"),
         ("SELECT 'a'::text::unknown::json AS a", "json"),
         ("SELECT 'a'::text::unknown::\"char\" AS a", "\"char\""),
+        // An `ARRAY[…]` cast to an array type coerces its elements to the
+        // element type explicitly.
+        ("SELECT ARRAY['a'::text::unknown]::int[] AS a", "integer"),
+        ("SELECT ARRAY['a'::text::unknown, 'b']::json[] AS a", "json"),
+        (
+            "SELECT ARRAY[ARRAY[name::unknown]]::int[] AS a FROM users",
+            "integer",
+        ),
         // Assignment: likewise.
         (
             "INSERT INTO users (id, age) VALUES (1, 'a'::text::unknown)",
@@ -1216,6 +1224,17 @@ fn a_value_cast_to_unknown_is_no_literal() {
         "SELECT 'a'::text::unknown::name AS a",
         "SELECT 'a'::text::unknown::bpchar AS a",
         "SELECT 'a'::text::unknown::short_text AS a",
+        // ... and so are the elements of an `ARRAY[…]` cast to an array of
+        // one (transformArrayExpr coerces them with COERCION_EXPLICIT).
+        "SELECT ARRAY['a'::text::unknown]::text[] AS a",
+        "SELECT ARRAY['a'::text::unknown, 'b']::text[] AS a",
+        "SELECT CAST(ARRAY['a'::text::unknown] AS text[]) AS a",
+        "SELECT ARRAY[name::unknown]::varchar[] AS a FROM users",
+        "SELECT ARRAY['a'::text::unknown]::name[] AS a",
+        "SELECT ARRAY[(ROW('x')).f1]::text[] AS a",
+        "SELECT ARRAY[ARRAY[name::unknown], ARRAY['b']]::text[] AS a FROM users",
+        "SELECT ARRAY['a'::text::unknown]::short_text[] AS a",
+        "SELECT 'a' = ANY(ARRAY['a'::text::unknown]::text[]) AS a",
         "INSERT INTO users (id, name) VALUES (1, 'a'::text::unknown)",
         "INSERT INTO users (id, name) VALUES (1, 'a'::text::unknown), (2, 'b'::text::unknown)",
         "INSERT INTO users (id, name) SELECT 1, 'a'::text::unknown",

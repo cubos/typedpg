@@ -424,14 +424,36 @@ pub(crate) fn transform_array_expr(
     };
 
     for (elem, t) in arr.elements.iter().zip(&elems) {
-        if t.type_oid == oid::UNKNOWN {
+        if t.type_oid == oid::UNKNOWN && hard {
+            // transformArrayExpr coerces each element to the cast's element
+            // type with coerce_to_target_type(..., COERCION_EXPLICIT): an
+            // `unknown` value that is no literal reaches a string type
+            // through I/O (`ARRAY['a'::text::unknown]::text[]`).
+            swallow_unless_literal(infer_expr(
+                elem,
+                ctx,
+                params,
+                TypeGoal {
+                    coercion: CoercionContext::Explicit,
+                    ..TypeGoal::implicit(coerce_type)
+                },
+            ))?;
+        } else if t.type_oid == oid::UNKNOWN {
             coerce_unknown_to(elem, ctx, params, coerce_type)?;
         } else if hard {
-            if !coerce::can_cast_explicit(t.type_oid, coerce_type, snapshot)
-                || (t.type_oid == oid::RECORD
-                    && coerce::is_complex(coerce_type, snapshot)
-                    && !super::record_converts_to_complex(elem, ctx.scope))
-            {
+            if t.type_oid == oid::RECORD && coerce::is_complex(coerce_type, snapshot) {
+                // ... and a `record` element to a composite goes through
+                // coerce_record_to_complex, field by field, explicitly:
+                // `ARRAY[ROW(1, 'x')]::pair[]` checks each field's
+                // coercion, and its column count.
+                super::coerce_record_to_complex(
+                    elem,
+                    coerce_type,
+                    CoercionContext::Explicit,
+                    ctx,
+                    params,
+                )?;
+            } else if !coerce::can_cast_explicit(t.type_oid, coerce_type, snapshot) {
                 let span = crate::error::node_location(elem)
                     .and_then(crate::error::SourceSpan::from_node_qname);
                 return Err(crate::error::RawError::invalid(

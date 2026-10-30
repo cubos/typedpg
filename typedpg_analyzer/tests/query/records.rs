@@ -3222,6 +3222,79 @@ fn whole_row_record_coerces_where_a_composite_is_expected() {
         .unwrap();
 }
 
+/// An `ARRAY[…]` cast to an array of a composite coerces each element to
+/// the composite explicitly (transformArrayExpr): a `record` element goes
+/// through `coerce_record_to_complex`, which checks its column count and
+/// each field's coercion — an `unknown` value that is no literal reaches a
+/// string field only.
+#[test]
+fn array_of_records_cast_to_a_composite_array_coerces_each_row() {
+    let db = record_cast_setup();
+    for sql in [
+        "SELECT ARRAY[ROW(1, 'x')]::c[] AS r",
+        "SELECT ARRAY[ROW(1, 'x'), ROW(2, 'y')]::c[] AS r",
+        // Explicit context: boolean → integer, integer → text (I/O).
+        "SELECT ARRAY[ROW(true, 'x')]::c[] AS r",
+        "SELECT ARRAY[ROW(1, 2)]::c[] AS r",
+        "SELECT ARRAY[ROW(1, y::unknown)]::c[] AS r FROM t",
+        "SELECT ARRAY[s]::c[] AS r FROM (SELECT 1 AS a, 'x' AS b) s",
+        "SELECT ARRAY[ARRAY[ROW(1, 'x')]]::c[] AS r",
+        "SELECT ARRAY[ROW(1, 'x')]::cd[] AS r",
+    ] {
+        let s = db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        assert_eq!(s.columns.len(), 1, "{sql}");
+    }
+    let s = db.analyze("SELECT ARRAY[ROW(1, 'x')]::c[] AS r").unwrap();
+    match &s.columns[0].pg_type {
+        Type::Array { element, .. } => assert!(
+            matches!(&**element, Type::Composite { name, .. } if name == "c"),
+            "{element:?}"
+        ),
+        other => panic!("expected an array of c, got {other:?}"),
+    }
+    // A parameter in a field takes the field's type.
+    let s = db.analyze("SELECT ARRAY[ROW($1, 'x')]::c[] AS r").unwrap();
+    assert_eq!(s.params[0].pg_type, int4());
+    let few = Some("Input has too few columns.");
+    for (sql, target, detail) in [
+        ("SELECT ARRAY[ROW(1)]::c[]", "c", few),
+        (
+            "SELECT ARRAY[ROW(1, 'x', 'y')]::c[]",
+            "c",
+            Some("Input has too many columns."),
+        ),
+        ("SELECT ARRAY[ROW(1, 'x'), ROW(2)]::c[]", "c", few),
+        (
+            "SELECT ARRAY[ROW(current_date, 'x')]::c[]",
+            "c",
+            Some("Cannot cast type date to integer in column 1."),
+        ),
+        ("SELECT ARRAY[ROW(1)]::cd[]", "cd", few),
+        ("SELECT ARRAY[ARRAY[ROW(1)]]::c[]", "c", few),
+        ("SELECT ARRAY[s]::c[] FROM (SELECT 1 AS a) s", "c", few),
+        ("SELECT ARRAY[fr()]::c[]", "c", None),
+    ] {
+        assert_record_cast_err(
+            &db,
+            sql,
+            &format!("cannot cast type record to {target}"),
+            detail,
+        );
+    }
+    for sql in [
+        "SELECT ARRAY[ROW(y::unknown, 'x')]::c[] FROM t",
+        "SELECT ARRAY[ROW(y::unknown)]::c[] FROM t",
+        "SELECT ARRAY[ROW((ROW('x')).f1, 'y')]::c[]",
+        "SELECT ARRAY[ARRAY[ROW(y::unknown, 'x')]]::c[] FROM t",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::PgInternalError(_),
+            "failed to find conversion function from unknown to integer"
+        );
+    }
+}
+
 /// `coerce_record_to_complex` replaces the whole row with its columns, so
 /// the grouped-column check sees those: `GROUP BY s.a, s.b` covers `s::c`,
 /// `GROUP BY s` (the whole row) doesn't — unless `s` names the output
