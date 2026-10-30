@@ -29,6 +29,9 @@ pub(crate) enum LexError {
     UnclosedDollarQuote { tag: String, position: usize },
     /// A double-quoted identifier (`"..."`) was opened but never closed.
     UnclosedQuotedIdentifier { position: usize },
+    /// A named parameter is annotated `?` (nullable) at one occurrence and
+    /// `!` (not NULL) at another; `position` is the later one.
+    ConflictingAnnotations { name: String, position: usize },
 }
 
 impl LexError {
@@ -38,7 +41,8 @@ impl LexError {
             Self::UnclosedString { position }
             | Self::UnclosedBlockComment { position }
             | Self::UnclosedDollarQuote { position, .. }
-            | Self::UnclosedQuotedIdentifier { position } => *position,
+            | Self::UnclosedQuotedIdentifier { position }
+            | Self::ConflictingAnnotations { position, .. } => *position,
         }
     }
 }
@@ -58,11 +62,24 @@ impl std::fmt::Display for LexError {
             Self::UnclosedQuotedIdentifier { position } => {
                 write!(f, "unclosed quoted identifier at byte {position}")
             }
+            Self::ConflictingAnnotations { name, position } => {
+                let message = conflicting_annotations_message(name);
+                write!(f, "{message} (at byte {position})")
+            }
         }
     }
 }
 
 impl std::error::Error for LexError {}
+
+/// The message for [`LexError::ConflictingAnnotations`]: typedpg's own
+/// error, PG has no named parameters.
+pub(crate) fn conflicting_annotations_message(name: &str) -> String {
+    format!(
+        "parameter ${name} is annotated both `?` (nullable) and `!` (not NULL): annotate it \
+         one way, on any of its occurrences"
+    )
+}
 
 /// Internal state machine states for the lexer.
 enum LexState {
@@ -82,6 +99,10 @@ enum LexState {
 /// a letter — ASCII or any high-bit one, PG's `\200-\377` — or an
 /// underscore, plus a digit for the continuation. PG's identifiers, and so
 /// its dollar-quote tags, are not restricted to ASCII.
+///
+/// PG's `ident_cont` also holds `$`, which a dollar-quote tag (`dolq_cont`)
+/// and a parameter's name can't: an identifier is read with
+/// [`read_sql_ident`].
 fn is_ident_start(c: char) -> bool {
     c.is_ascii_alphabetic() || c == '_' || !c.is_ascii()
 }
@@ -93,6 +114,17 @@ fn is_ident_char(c: char) -> bool {
 fn read_ident(chars: &[char], start: usize) -> &[char] {
     let mut end = start;
     while end < chars.len() && is_ident_char(chars[end]) {
+        end += 1;
+    }
+    &chars[start..end]
+}
+
+/// A SQL identifier (or keyword) at `start`, which [`is_ident_start`]: PG's
+/// `ident_cont` holds `$`, so `a$b`, `a$1` and `a$$` are each one
+/// identifier, with no parameter or dollar quote in them.
+fn read_sql_ident(chars: &[char], start: usize) -> &[char] {
+    let mut end = start;
+    while end < chars.len() && (is_ident_char(chars[end]) || chars[end] == '$') {
         end += 1;
     }
     &chars[start..end]
@@ -237,6 +269,9 @@ fn lex_with_base(sql: &str, base: usize) -> Result<(LexOutput, usize), LexError>
         });
     }
     let mut i = 0;
+    // Where the last whole identifier `E` / `e` ends: a quote right there
+    // opens an escape string.
+    let mut escape_prefix_end: Option<usize> = None;
     // Track byte position incrementally (avoids a separate Vec<usize> allocation).
     let char_byte_lens: Vec<u8> = sql.chars().map(|c| c.len_utf8() as u8).collect();
     let byte_offset_of =
@@ -247,11 +282,11 @@ fn lex_with_base(sql: &str, base: usize) -> Result<(LexOutput, usize), LexError>
             LexState::Normal => {
                 if chars[i] == '\'' {
                     // `E'…'` / `e'…'` escape strings: backslash escapes the
-                    // next char. The prefix only counts when the E is its own
-                    // token (not the tail of an identifier like `tablE`).
-                    let escape = i > 0
-                        && matches!(chars[i - 1], 'E' | 'e')
-                        && (i < 2 || !is_ident_char(chars[i - 2]));
+                    // next char. The prefix only counts when the E is a whole
+                    // identifier of its own (not the tail of one like `tablE`
+                    // or `a$E`) — after a dollar quote's closer (`$$a$$E'…'`)
+                    // it is.
+                    let escape = escape_prefix_end == Some(i);
                     state = LexState::StringLiteral(byte_offset_of(i, &char_byte_lens), escape);
                     out.push('\'');
                     i += 1;
@@ -380,8 +415,20 @@ fn lex_with_base(sql: &str, base: usize) -> Result<(LexOutput, usize), LexError>
                                 None => (None, after),
                             };
 
-                            // Deduplicate by name
+                            // Deduplicate by name. An annotation on any
+                            // occurrence applies; opposite ones conflict.
                             let next_idx = if let Some(&idx) = param_indices.get(&ident) {
+                                let param = &mut params[idx - 1];
+                                match (param.nullable, nullable) {
+                                    (Some(a), Some(b)) if a != b => {
+                                        return Err(LexError::ConflictingAnnotations {
+                                            name: ident,
+                                            position: pos,
+                                        });
+                                    }
+                                    (None, Some(_)) => param.nullable = nullable,
+                                    _ => {}
+                                }
                                 idx
                             } else {
                                 let idx = base + param_indices.len() + 1;
@@ -443,6 +490,14 @@ fn lex_with_base(sql: &str, base: usize) -> Result<(LexOutput, usize), LexError>
                         // Literal `$`.
                         out.push('$');
                         i += 1;
+                    }
+                } else if is_ident_start(chars[i]) {
+                    // A whole identifier: a `$` in it is part of it.
+                    let ident = read_sql_ident(&chars, i);
+                    out.extend(ident);
+                    i += ident.len();
+                    if matches!(ident, ['E' | 'e']) {
+                        escape_prefix_end = Some(i);
                     }
                 } else {
                     out.push(chars[i]);
@@ -726,6 +781,50 @@ mod tests {
         assert_eq!(out.params[0].name, "id");
     }
 
+    // PG's `ident_cont` includes `$`: `a$b`, `a$1` and `a$$` are each one
+    // identifier (`SELECT 1 AS a$b, 2 AS a$$` returns columns `a$b`, `a$$`).
+    #[test]
+    fn a_dollar_inside_an_identifier_is_part_of_it() {
+        for sql in [
+            "SELECT a$b FROM t",
+            "SELECT a$1 FROM t",
+            "SELECT a$$ FROM t",
+        ] {
+            let out = lex(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+            assert_eq!(out.sql, sql);
+            assert!(out.params.is_empty(), "{sql}: {:?}", out.params);
+        }
+    }
+
+    #[test]
+    fn a_dollar_inside_an_identifier_leaves_what_follows_alone() {
+        // `a$$` does not open a dollar quote: `$p` after it is a parameter.
+        let out = lex("SELECT a$$, $p FROM t").unwrap();
+        assert_eq!(out.sql, "SELECT a$$, $1 FROM t");
+        assert_eq!(out.params[0].name, "p");
+        // `x$E` is one identifier: the string after it is not an escape
+        // string, so its backslash does not escape the quote.
+        let out = lex("SELECT x$E'\\' FROM t WHERE id = $id").unwrap();
+        assert_eq!(out.params.len(), 1);
+        assert_eq!(out.params[0].name, "id");
+        // After a dollar quote's closer, `E` is its own token: `E'\''` is
+        // an escape string holding a quote.
+        for sql in [
+            "SELECT $$a$$E'\\'' FROM t WHERE id = $id",
+            "SELECT $t$x$t$e'\\'' FROM t WHERE id = $id",
+        ] {
+            let out = lex(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+            assert_eq!(out.params.len(), 1, "{sql}");
+            assert_eq!(out.params[0].name, "id", "{sql}");
+        }
+        // A word ends at a non-identifier character: `a+$p` and `($p)`
+        // still hold a parameter.
+        for sql in ["SELECT a+$p FROM t", "SELECT ($p) FROM t"] {
+            let out = lex(sql).unwrap();
+            assert_eq!(out.params[0].name, "p", "{sql}");
+        }
+    }
+
     #[test]
     fn string_with_escape() {
         let out = lex("SELECT 'it''s $falso' FROM t WHERE id = $id").unwrap();
@@ -947,6 +1046,38 @@ mod tests {
         assert_eq!(out.params.len(), 1);
         assert_eq!(out.params[0].name, "x");
         assert_eq!(out.params[0].nullable, Some(true));
+    }
+
+    #[test]
+    fn an_annotation_on_a_later_occurrence_counts() {
+        // The `?` is consumed from the text, so it can't just be ignored.
+        let out = lex("SELECT 1 WHERE a = $x OR b = $x?").unwrap();
+        assert_eq!(out.params[0].nullable, Some(true));
+        let out = lex("SELECT 1 WHERE a = $x OR b = $x! OR c = $x").unwrap();
+        assert_eq!(out.sql, "SELECT 1 WHERE a = $1 OR b = $1 OR c = $1");
+        assert_eq!(out.params[0].nullable, Some(false));
+    }
+
+    #[test]
+    fn opposite_annotations_on_one_param_are_an_error() {
+        let sql = "SELECT 1 WHERE a = $x? OR b = $x!";
+        let err = lex(sql).unwrap_err();
+        assert_eq!(
+            err,
+            LexError::ConflictingAnnotations {
+                name: "x".into(),
+                position: sql.rfind('$').unwrap(),
+            }
+        );
+        assert!(
+            err.to_string()
+                .starts_with("parameter $x is annotated both `?` (nullable) and `!` (not NULL)"),
+            "{err}"
+        );
+        // Another parameter's annotation is no conflict.
+        let out = lex("SELECT 1 WHERE a = $x? OR b = $y!").unwrap();
+        assert_eq!(out.params[0].nullable, Some(true));
+        assert_eq!(out.params[1].nullable, Some(false));
     }
 
     #[test]
