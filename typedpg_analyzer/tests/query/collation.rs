@@ -323,6 +323,103 @@ fn conflicting_explicit_collations_rejected() {
     }
 }
 
+/// transformValuesClause: a VALUES column's collation is its cells'
+/// common one, as for a set operation's column.
+#[test]
+fn values_column_collation_is_its_cells_common_one() {
+    let db = collation_db();
+    assert_err_prefix!(
+        db.analyze("SELECT * FROM (VALUES ('a' COLLATE \"C\"), ('b' COLLATE \"POSIX\")) v"),
+        AnalyzeError::CollationMismatch(_),
+        "collation mismatch between explicit collations \"C\" and \"POSIX\""
+    );
+    let s = db
+        .analyze(
+            "SELECT x, y FROM (VALUES ('a' COLLATE \"C\", 'b'), ('c', 'd' COLLATE \"POSIX\")) v(x, y)",
+        )
+        .unwrap();
+    assert_cols(
+        &s,
+        vec![
+            c("x", basic_with_collation("pg_catalog", "text", "C")),
+            c("y", basic_with_collation("pg_catalog", "text", "POSIX")),
+        ],
+    );
+    // The column carries it on: `x` meets `sp`'s implicit POSIX.
+    assert_err_prefix!(
+        db.analyze("SELECT x || sp FROM (VALUES ('a' COLLATE \"C\"), ('b')) v(x), tc ORDER BY 1"),
+        AnalyzeError::CollationMismatch(_),
+        "collation mismatch between implicit collations \"C\" and \"POSIX\""
+    );
+    // Each row of an INSERT's VALUES stands alone.
+    db.analyze("INSERT INTO tc (s) VALUES ('a' COLLATE \"C\"), ('b' COLLATE \"POSIX\")")
+        .unwrap();
+}
+
+/// assign_hypothetical_collations: a hypothetical-set aggregate's direct
+/// argument and the aggregated argument it is ranked among are compared
+/// under one collation, so theirs must agree — explicit or implicit.
+#[test]
+fn within_group_collations_must_agree() {
+    let db = collation_db();
+    assert_err_prefix!(
+        db.analyze(
+            r#"SELECT rank('adam'::text COLLATE "C") WITHIN GROUP (ORDER BY x COLLATE "POSIX")
+               FROM (VALUES ('fred'), ('jim')) v(x)"#
+        ),
+        AnalyzeError::CollationMismatch(_),
+        "collation mismatch between explicit collations \"C\" and \"POSIX\""
+    );
+    assert_err_prefix!(
+        db.analyze("SELECT rank(sc) WITHIN GROUP (ORDER BY sp) FROM tc GROUP BY sc"),
+        AnalyzeError::CollationMismatch(_),
+        "collation mismatch between implicit collations \"C\" and \"POSIX\""
+    );
+    for sql in [
+        // An explicit collation decides over an implicit one.
+        "SELECT rank('a' COLLATE \"C\") WITHIN GROUP (ORDER BY sp) FROM tc",
+        "SELECT rank(sc) WITHIN GROUP (ORDER BY sc) FROM tc GROUP BY sc",
+        "SELECT rank(sc) WITHIN GROUP (ORDER BY s) FROM tc GROUP BY sc",
+        // Non-hypothetical direct arguments are not compared.
+        "SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY sp) FROM tc",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
+
+/// assign_ordered_set_collations: an ordered-set aggregate's result takes
+/// the collation of its single aggregated argument (attcollation of the
+/// equivalent view columns on PG 18).
+#[test]
+fn ordered_set_aggregate_result_takes_the_aggregated_collation() {
+    let db = collation_db();
+    let s = db
+        .analyze(
+            "SELECT mode() WITHIN GROUP (ORDER BY s COLLATE \"C\") AS a, \
+             percentile_disc(0.5) WITHIN GROUP (ORDER BY sc) AS b FROM tc",
+        )
+        .unwrap();
+    assert_cols(
+        &s,
+        vec![
+            cn("a", basic_with_collation("pg_catalog", "text", "C")),
+            cn("b", basic_with_collation("pg_catalog", "text", "C")),
+        ],
+    );
+    assert_err_prefix!(
+        db.analyze("SELECT mode() WITHIN GROUP (ORDER BY sc) || sp FROM tc GROUP BY sp ORDER BY 1"),
+        AnalyzeError::CollationMismatch(_),
+        "collation mismatch between implicit collations \"C\" and \"POSIX\""
+    );
+    assert_err_prefix!(
+        db.analyze(
+            "SELECT mode() WITHIN GROUP (ORDER BY s COLLATE \"C\") || 'x' COLLATE \"POSIX\" FROM tc"
+        ),
+        AnalyzeError::CollationMismatch(_),
+        "collation mismatch between explicit collations \"C\" and \"POSIX\""
+    );
+}
+
 #[test]
 fn collation_flows_through_functions_operators_and_constructs() {
     // attcollation of the equivalent view columns on PG 18.

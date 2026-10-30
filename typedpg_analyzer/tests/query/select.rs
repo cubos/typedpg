@@ -244,6 +244,53 @@ fn order_by() {
 }
 
 #[test]
+fn order_by_names_an_output_column_named_after_its_function() {
+    let db = setup();
+    // An unaliased output column is named after its function (`count`),
+    // and ORDER BY finds output columns by that name as by an alias.
+    let s = db
+        .analyze("SELECT name, count(*) FROM users GROUP BY name ORDER BY count DESC, name")
+        .unwrap();
+    assert_cols(&s, vec![c("name", text()), c("count", int8())]);
+    // Any derived name: a cast's type, a CASE, a column of a function.
+    db.analyze("SELECT (age + 1)::text FROM users ORDER BY text")
+        .unwrap();
+    db.analyze("SELECT CASE WHEN age > 0 THEN 1 END FROM users ORDER BY \"case\"")
+        .unwrap();
+    db.analyze("SELECT upper(name) FROM users ORDER BY upper")
+        .unwrap();
+    // GROUP BY finds them the same way, when no input column has the name.
+    db.analyze("SELECT upper(name) FROM users GROUP BY upper ORDER BY upper")
+        .unwrap();
+}
+
+#[test]
+fn order_by_derived_name_follows_pg_rules() {
+    let db = setup();
+    // `?column?` is a name too.
+    db.analyze("SELECT age + 1 FROM users ORDER BY \"?column?\"")
+        .unwrap();
+    // Two output columns named `count` with different expressions.
+    let err = db
+        .analyze("SELECT count(*), count(age) FROM users ORDER BY count")
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with(r#"ORDER BY "count" is ambiguous"#),
+        "{err}"
+    );
+    // A name no output column carries still fails.
+    let err = db
+        .analyze("SELECT count(*) FROM users ORDER BY counts")
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with(r#"column "counts" does not exist"#),
+        "{err}"
+    );
+}
+
+#[test]
 fn limit_offset_literals() {
     let db = setup();
     let s = db
@@ -270,6 +317,28 @@ fn select_distinct() {
     let db = setup();
     let s = db.analyze("SELECT DISTINCT name FROM users").unwrap();
     assert_cols(&s, vec![c("name", text())]);
+}
+
+#[test]
+fn order_by_using_under_distinct() {
+    let db = setup();
+    // `USING op` sorts by the select-list entry the item names, as `ASC`
+    // or `DESC` would.
+    db.analyze("SELECT DISTINCT users.age FROM users ORDER BY age USING >")
+        .unwrap();
+    db.analyze("SELECT DISTINCT age FROM users ORDER BY age USING <")
+        .unwrap();
+    db.analyze("SELECT DISTINCT age AS a FROM users ORDER BY a USING >")
+        .unwrap();
+    // Still bound to the select list.
+    let err = db
+        .analyze("SELECT DISTINCT age FROM users ORDER BY id USING >")
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("for SELECT DISTINCT, ORDER BY expressions must appear in select list"),
+        "{err}"
+    );
 }
 
 #[test]

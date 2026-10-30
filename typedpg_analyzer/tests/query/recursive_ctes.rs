@@ -410,3 +410,71 @@ fn recursive_term_type_must_match_non_recursive_term() {
     )
     .unwrap();
 }
+
+#[test]
+fn recursive_cte_terms_must_agree_on_collation_and_typmod() {
+    // The non-recursive term fixes the typmod and collation too: one the
+    // recursive term changes (the set operation's typmod is kept only when
+    // both terms agree; its collation is select_common_collation's) is an
+    // error, not a widening.
+    let mut db = setup();
+    db.apply_sql("CREATE TABLE tc (s text, sc text COLLATE \"C\", sp text COLLATE \"POSIX\");")
+        .unwrap();
+    let rejects = |sql: &str, msg: &str| {
+        let err = db.analyze(sql).unwrap_err();
+        assert!(err.to_string().starts_with(msg), "`{sql}`: got {err}");
+    };
+    rejects(
+        r#"WITH RECURSIVE foo(x) AS (
+               SELECT x FROM (VALUES ('a' COLLATE "C"), ('b')) t(x)
+               UNION ALL
+               SELECT (x || 'c') COLLATE "POSIX" FROM foo WHERE length(x) < 10
+           ) SELECT * FROM foo"#,
+        r#"recursive query "foo" column 1 has collation "C" in non-recursive term but collation "POSIX" overall"#,
+    );
+    rejects(
+        "WITH RECURSIVE foo(i) AS (
+             SELECT i::numeric(3,0) FROM (VALUES (1), (2)) t(i)
+             UNION ALL
+             SELECT (i+1)::numeric(10,0) FROM foo WHERE i < 10
+         ) SELECT * FROM foo",
+        r#"recursive query "foo" column 1 has type numeric(3,0) in non-recursive term but type numeric overall"#,
+    );
+    rejects(
+        "WITH RECURSIVE foo(i) AS (SELECT 1::numeric(3,0) UNION ALL SELECT i + 1 FROM foo WHERE i < 10)
+         SELECT * FROM foo",
+        r#"recursive query "foo" column 1 has type numeric(3,0) in non-recursive term but type numeric overall"#,
+    );
+    // A non-default implicit collation beats the default one.
+    rejects(
+        "WITH RECURSIVE foo(x) AS (SELECT s FROM tc UNION ALL SELECT sc FROM tc, foo) SELECT * FROM foo",
+        r#"recursive query "foo" column 1 has collation "default" in non-recursive term but collation "C" overall"#,
+    );
+    // Two implicit ones leave UNION ALL's column without a collation, and
+    // are an error of their own under UNION.
+    rejects(
+        "WITH RECURSIVE foo(x) AS (SELECT sc FROM tc UNION ALL SELECT sp FROM tc, foo) SELECT * FROM foo",
+        r#"recursive query "foo" column 1 has collation "C" in non-recursive term but collation "(null)" overall"#,
+    );
+    rejects(
+        "WITH RECURSIVE foo(x) AS (SELECT sc FROM tc UNION SELECT sp FROM tc, foo) SELECT * FROM foo",
+        r#"collation mismatch between implicit collations "C" and "POSIX""#,
+    );
+    rejects(
+        r#"WITH RECURSIVE foo(x) AS (SELECT s COLLATE "C" FROM tc UNION ALL SELECT x COLLATE "POSIX" FROM foo)
+           SELECT * FROM foo"#,
+        r#"collation mismatch between explicit collations "C" and "POSIX""#,
+    );
+    // Terms that agree, or a recursive term the non-recursive one decides.
+    for sql in [
+        "WITH RECURSIVE foo(i) AS (SELECT 1::numeric(3,0) UNION ALL SELECT i FROM foo WHERE i < 10)
+         SELECT * FROM foo",
+        "WITH RECURSIVE foo(x) AS (SELECT 'a'::varchar(5) UNION ALL SELECT x FROM foo) SELECT * FROM foo",
+        "WITH RECURSIVE foo(x) AS (SELECT sc FROM tc UNION ALL SELECT x || 'a' FROM foo) SELECT * FROM foo",
+        "WITH RECURSIVE foo(x) AS (SELECT sc FROM tc UNION ALL SELECT s FROM tc, foo) SELECT * FROM foo",
+        r#"WITH RECURSIVE foo(x) AS (SELECT s COLLATE "C" FROM tc UNION ALL SELECT s FROM tc, foo)
+           SELECT * FROM foo"#,
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}

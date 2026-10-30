@@ -138,16 +138,30 @@ pub(crate) fn analyze_cte(
             }
 
             // PG fixes a recursive CTE's column types from the
-            // *non-recursive* term alone; if common-type resolution with the
-            // recursive term lands anywhere else, it errors rather than
-            // widening (SQLSTATE 42804): `recursive query "r" column 1 has
-            // type integer in non-recursive term but type numeric overall`.
+            // *non-recursive* term alone. transformSetOperationTree first
+            // resolves each column over both terms — select_common_type
+            // failing when the types don't meet at all, then
+            // select_common_collation (an explicit collation wins, two
+            // different explicit ones are an error, two different implicit
+            // ones too unless it is UNION ALL, which leaves no collation);
+            // then analyzeCTE requires that result to be the non-recursive
+            // term's own type, typmod and collation, erroring rather than
+            // widening: `recursive query "r" column 1 has type integer in
+            // non-recursive term but type numeric overall` (42804), `… has
+            // collation "C" in non-recursive term but collation "POSIX"
+            // overall` (42P21).
+            let collation_name = |c: Option<crate::oid::PgCollationOid>| {
+                // PG prints a missing collation's NULL name as glibc does.
+                c.and_then(|c| snapshot.pg_collation.get(&c))
+                    .map_or_else(|| "(null)".to_string(), |c| c.collname.clone())
+            };
+            let union_all = sel.all;
+            let mut overall = Vec::with_capacity(seed_cols.len());
             for (i, (s, r)) in seed_cols.iter().zip(rec_cols.iter()).enumerate() {
                 if s.type_oid == oid::UNKNOWN || r.type_oid == oid::UNKNOWN {
+                    overall.push(None);
                     continue;
                 }
-                // transformSetOperationTree's select_common_type fails first
-                // when the terms' types don't meet at all.
                 let Some(common) =
                     crate::coerce::find_common_type(&[s.type_oid, r.type_oid], snapshot)
                 else {
@@ -165,14 +179,57 @@ pub(crate) fn analyze_cte(
                     )
                     .finalize_implicit());
                 };
-                if common != s.type_oid {
-                    let seed_ty = crate::ddl::util::format_type_for_message(snapshot, s.type_oid);
-                    let overall = crate::ddl::util::format_type_for_message(snapshot, common);
+                let typmod = if s.type_oid == r.type_oid && s.typmod == r.typmod {
+                    s.typmod
+                } else {
+                    None
+                };
+                let term_state = |term: &protobuf::SelectStmt, c: &RawColumn| {
+                    let explicit = term.op == SetOperation::SetopNone as i32
+                        && crate::grouping::level_info(term).is_some_and(|l| {
+                            l.explicit_collations.get(i).copied().unwrap_or(false)
+                        });
+                    crate::clause::CollationState::column(snapshot, common, c.collation, explicit)
+                };
+                let (ls, rs) = (term_state(larg, s), term_state(rarg, r));
+                if let (Some(a), Some(b)) = (ls.explicit(), rs.explicit())
+                    && a != b
+                {
+                    return Err(crate::pgmsg::collation_mismatch_explicit(
+                        &collation_name(Some(a)),
+                        &collation_name(Some(b)),
+                    ));
+                }
+                let merged = ls.merged(rs);
+                if !union_all {
+                    merged.check_determinate(snapshot, None)?;
+                }
+                overall.push(Some((common, typmod, merged.collation())));
+            }
+            for (i, (s, o)) in seed_cols.iter().zip(overall).enumerate() {
+                let Some((common, typmod, collation)) = o else {
+                    continue;
+                };
+                if common != s.type_oid || typmod != s.typmod {
+                    let format = crate::ddl::util::format_type_with_typmod;
                     return Err(crate::pgmsg::recursive_query_column_type(
                         &cte.ctename,
                         i + 1,
-                        &seed_ty,
-                        &overall,
+                        &format(snapshot, s.type_oid, s.typmod),
+                        &format(snapshot, common, typmod),
+                    )
+                    .finalize_implicit());
+                }
+                // A collatable column without one recorded has the type's.
+                let seed_collation =
+                    crate::clause::CollationState::column(snapshot, s.type_oid, s.collation, false)
+                        .collation();
+                if collation != seed_collation {
+                    return Err(crate::pgmsg::recursive_query_column_collation(
+                        &cte.ctename,
+                        i + 1,
+                        &collation_name(seed_collation),
+                        &collation_name(collation),
                     )
                     .finalize_implicit());
                 }

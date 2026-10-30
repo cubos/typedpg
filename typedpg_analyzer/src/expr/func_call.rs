@@ -330,8 +330,14 @@ pub(crate) fn infer_func_call(
         narrow_by_filter(func, &mut args, ctx, params, &filter_log);
     }
     // The result's collation derives from the arguments' (assign_collations).
+    let collation_inputs = match resolved.aggregate {
+        Some((kind, _)) if func.agg_within_group => std::borrow::Cow::Owned(
+            within_group_collation_inputs(func, &args, kind, &resolved, ctx, params)?,
+        ),
+        _ => std::borrow::Cow::Borrowed(&args.exprs),
+    };
     let (collation, explicit_collation) =
-        derive_collation(&args.exprs, resolved.return_type_oid, snapshot)?;
+        derive_collation(collation_inputs.iter(), resolved.return_type_oid, snapshot)?;
     coerce_call_args(&mut args, &resolved, snapshot);
     // Over the arguments as written: the defaults of the functions it
     // knows are finite constants (`lag`'s offset 1 and default NULL,
@@ -761,6 +767,83 @@ fn unify_hypothetical_args(
         }
     }
     Ok(())
+}
+
+/// The inputs an ordered-set aggregate's collation derives from (PG's
+/// assign_ordered_set_collations / assign_hypothetical_collations): its
+/// direct arguments, and its aggregated argument when it has exactly one
+/// and isn't variadic. A hypothetical-set aggregate first merges each
+/// hypothetical direct argument with its aggregated argument — both are
+/// compared with that collation — so the two must agree: two explicit
+/// collations are `collation mismatch between explicit collations`, two
+/// implicit non-default ones `… implicit collations` (42P21 both).
+fn within_group_collation_inputs(
+    func: &protobuf::FuncCall,
+    args: &FuncArgs,
+    kind: crate::pg_catalog::AggKind,
+    resolved: &functions::ResolvedFunction,
+    ctx: Ctx<'_>,
+    params: &ParamCollector,
+) -> Result<Vec<ExprType>, AnalyzeError> {
+    let snapshot = ctx.snapshot;
+    let mut aggregated = Vec::new();
+    for item in &func.agg_order {
+        let inner = match item.node.as_ref() {
+            Some(node::Node::SortBy(sb)) => sb.node.as_deref(),
+            _ => Some(item),
+        };
+        if let Some(inner) = inner {
+            let t = infer_expr(inner, ctx, &mut params.clone(), TypeGoal::NONE)?;
+            aggregated.push((inner, t));
+        }
+    }
+    let merge_sort = aggregated.len() == 1
+        && snapshot
+            .pg_proc
+            .get(&resolved.oid)
+            .is_none_or(|p| p.provariadic.is_none());
+    let direct = &args.exprs[..args.direct_count.min(args.exprs.len())];
+    if kind != crate::pg_catalog::AggKind::Hypothetical {
+        let mut inputs = direct.to_vec();
+        if merge_sort {
+            inputs.extend(aggregated.into_iter().map(|(_, t)| t));
+        }
+        return Ok(inputs);
+    }
+    let Some(extra) = direct.len().checked_sub(aggregated.len()) else {
+        return Ok(direct.to_vec());
+    };
+    let mut inputs = direct[..extra].to_vec();
+    for (h, (s_node, s)) in direct[extra..].iter().zip(aggregated) {
+        let (collation, explicit_collation) = derive_collation([h, &s], s.type_oid, snapshot)?;
+        let non_default = |t: &ExprType| t.collation.filter(|&c| c != DEFAULT_COLLATION);
+        if collation.is_none()
+            && let (Some(a), Some(b)) = (non_default(h), non_default(&s))
+            && a != b
+        {
+            let name = |c| {
+                snapshot
+                    .pg_collation
+                    .get(&c)
+                    .map(|c| c.collname.clone())
+                    .unwrap_or_default()
+            };
+            return Err(crate::pgmsg::collation_mismatch_implicit(
+                &name(a),
+                &name(b),
+                crate::error::expr_span(s_node),
+            )
+            .finalize_implicit());
+        }
+        if merge_sort {
+            inputs.push(ExprType {
+                collation,
+                explicit_collation,
+                ..s
+            });
+        }
+    }
+    Ok(inputs)
 }
 
 /// `WITHIN GROUP (ORDER BY …)` marks an ordered-set aggregate. PG's grammar

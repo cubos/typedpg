@@ -414,19 +414,19 @@ fn analyze_select_here(
         null_ctx.input_not_empty = true;
     }
 
-    // Collect select-list aliases so GROUP BY / ORDER BY can fall back to
-    // them when a bare identifier doesn't resolve against the FROM scope.
-    // PG accepts `SELECT name AS n FROM t GROUP BY n ORDER BY n`; without
-    // this fallback, propagating errors from those walks would regress
-    // legitimate queries.
-    // PG matches the entries' resnames: an implicit one (`SELECT upper(x)
-    // … GROUP BY upper`) as well as an alias.
-    let select_aliases: std::collections::HashSet<String> = sel
-        .target_list
+    // Collect the select list's output-column names so GROUP BY / ORDER BY
+    // can fall back to them when a bare identifier doesn't resolve against
+    // the FROM scope. PG accepts `SELECT name AS n FROM t GROUP BY n ORDER
+    // BY n`; without this fallback, propagating errors from those walks
+    // would regress legitimate queries. PG matches the target entry's
+    // `resname`, which for an unaliased expression is the name it derives
+    // (`count` for `count(*)`); a `*` column is one the FROM scope
+    // resolves.
+    let select_aliases: std::collections::HashSet<String> = targets
         .iter()
-        .filter_map(|t| match t.node.as_ref()? {
-            node::Node::ResTarget(rt) => Some(target_resname(rt)),
-            _ => None,
+        .filter_map(|t| match t {
+            ExpandedTarget::Expr(rt) => Some(target_resname(rt)),
+            ExpandedTarget::StarColumn { .. } => None,
         })
         .collect();
 
