@@ -1354,6 +1354,132 @@ fn create_table_as_with_data_takes_the_planned_collation() {
 }
 
 #[test]
+fn create_table_as_with_data_folds_virtual_generated_columns() {
+    // PG 18 (expand_virtual_generated_columns): the planner replaces a
+    // virtual generated column by its expression, then folds it — a CASE
+    // conditioned on one whose expression is constant becomes the branch it
+    // picks. A stored generated column, or a virtual one reading a stored
+    // column, stays a Var.
+    let setup = r#"CREATE TABLE g (s int, b text COLLATE "C",
+                                   k bool GENERATED ALWAYS AS (true) VIRTUAL,
+                                   k2 bool GENERATED ALWAYS AS (s > 0) VIRTUAL,
+                                   ks bool GENERATED ALWAYS AS (true) STORED,
+                                   m int GENERATED ALWAYS AS (length(b)) VIRTUAL,
+                                   w text GENERATED ALWAYS AS ('k') VIRTUAL,
+                                   z int GENERATED ALWAYS AS (NULL::int) VIRTUAL);
+                   CREATE TABLE c2 (b text COLLATE "POSIX");"#;
+    let no_collation = r#"no collation was derived for column "x" with collatable type text"#;
+    for stmt in [
+        "CREATE TABLE t AS SELECT CASE WHEN g.k2 THEN g.b ELSE c2.b END AS x FROM g, c2;",
+        "CREATE TABLE t AS SELECT CASE WHEN g.ks THEN g.b ELSE c2.b END AS x FROM g, c2;",
+        "CREATE TABLE t AS SELECT CASE WHEN g.m > 0 THEN g.b ELSE c2.b END AS x FROM g, c2;",
+        "CREATE TABLE t AS SELECT CASE WHEN g.k AND g.s > 0 THEN g.b ELSE c2.b END AS x \
+         FROM g, c2;",
+        // A view and WITH NO DATA read the parsed query.
+        "CREATE TABLE t AS SELECT CASE WHEN g.k THEN g.b ELSE c2.b END AS x FROM g, c2 \
+         WITH NO DATA;",
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(
+            err.to_string().starts_with(no_collation),
+            "{stmt}\n  got: {err}"
+        );
+    }
+    let stmt = "CREATE VIEW t AS SELECT CASE WHEN g.k THEN g.b ELSE c2.b END AS x FROM g, c2;";
+    let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+    assert!(
+        err.to_string()
+            .starts_with(r#"could not determine which collation to use for view column "x""#),
+        "{stmt}\n  got: {err}"
+    );
+    let db = build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            r#"CREATE TABLE a1 AS SELECT CASE WHEN g.k THEN g.b ELSE c2.b END AS x FROM g, c2;
+               CREATE TABLE a2 AS SELECT CASE WHEN NOT g.k THEN c2.b ELSE g.b END AS x
+                                  FROM g, c2;
+               CREATE TABLE a3 AS SELECT COALESCE(g.k::text, g.b, c2.b) AS x FROM g, c2;
+               -- `z > 0` folds to NULL (POSIX, the ELSE), which the
+               -- analyzer doesn't evaluate: accepted, collation unknown.
+               CREATE TABLE a4 AS SELECT CASE WHEN g.z > 0 THEN g.b ELSE c2.b END AS x
+                                  FROM g, c2;
+               CREATE TABLE a5 AS SELECT CASE WHEN g.k OR g.s > 0 THEN g.b ELSE c2.b END AS x
+                                  FROM g, c2;
+               CREATE TABLE a6 AS SELECT COALESCE(g.w, g.b, c2.b) AS x FROM g, c2;"#,
+        ),
+    ]);
+    let collated = |c: &str| basic_with_collation("pg_catalog", "text", c);
+    for (table, ty) in [
+        ("a1", collated("C")),
+        ("a2", collated("C")),
+        ("a3", text()),
+        ("a5", collated("C")),
+        ("a6", text()),
+    ] {
+        let info = db.analyze(&format!("SELECT x FROM {table}")).unwrap();
+        assert_cols(&info, vec![cn("x", ty)]);
+    }
+}
+
+#[test]
+fn a_column_whose_planned_collation_is_unknown_conflicts_with_none() {
+    // PG 18: where the planner may fold what the analyzer can't evaluate
+    // (`1 = 1`), it doesn't know the collation CREATE TABLE AS stores: here
+    // PG folds the first CASE into 'x' (the default collation, although the
+    // parsed CASE has "C") and the second into c1.b ("C"). Such a column
+    // conflicts with no other collation — in a later query, an inheritance
+    // child or LIKE copy of it, ALTER TABLE INHERIT or OF — so what PG
+    // accepts, the analyzer accepts.
+    build_db(&[
+        (
+            "0001.sql",
+            r#"CREATE TABLE c1 (b text COLLATE "C");
+               CREATE TABLE c2 (b text COLLATE "POSIX");
+               CREATE TABLE t AS SELECT CASE WHEN 1 = 1 THEN 'x' ELSE c1.b END AS x FROM c1;
+               CREATE TABLE t4 AS SELECT CASE WHEN 1 = 1 THEN c1.b ELSE 'x' END AS x FROM c1;"#,
+        ),
+        (
+            "0002.sql",
+            r#"CREATE VIEW v AS SELECT t.x || c2.b AS y FROM t, c2;
+               CREATE TABLE u AS SELECT t.x || c2.b AS y FROM t, c2;
+               CREATE TABLE u2 AS SELECT t.x || c2.b AS y FROM t, c2 WITH NO DATA;
+               CREATE MATERIALIZED VIEW m AS SELECT t.x || c2.b AS y FROM t, c2;
+               CREATE TABLE t5 AS SELECT x FROM t;
+               CREATE VIEW v5 AS SELECT t5.x || c2.b AS y FROM t5, c2;
+               CREATE TABLE ch4 (x text COLLATE "C") INHERITS (t4);
+               CREATE TABLE l4 (LIKE t4);
+               CREATE TABLE ch6 (x text COLLATE "C") INHERITS (l4);
+               CREATE TABLE ch7 () INHERITS (t4);
+               CREATE TABLE p (x text COLLATE "C");
+               ALTER TABLE t4 INHERIT p;
+               CREATE TYPE ct AS (x text COLLATE "C");
+               CREATE TABLE t8 AS SELECT CASE WHEN 1 = 1 THEN c1.b ELSE 'x' END AS x FROM c1;
+               ALTER TABLE t8 OF ct;
+               CREATE VIEW vv AS SELECT x FROM t4;
+               CREATE OR REPLACE VIEW vv AS SELECT x COLLATE "C" AS x FROM t4;
+               CREATE TABLE pt (x text COLLATE "C") PARTITION BY LIST (x);
+               CREATE TABLE t9 AS SELECT CASE WHEN 1 = 1 THEN c1.b ELSE 'x' END AS x FROM c1;
+               ALTER TABLE pt ATTACH PARTITION t9 FOR VALUES IN ('b');"#,
+        ),
+    ]);
+    // ALTER COLUMN TYPE gives the column a known collation again.
+    let err = try_apply(&[(
+        "0001.sql",
+        r#"CREATE TABLE c1 (b text COLLATE "C");
+           CREATE TABLE t AS SELECT CASE WHEN 1 = 1 THEN 'x' ELSE c1.b END AS x FROM c1;
+           ALTER TABLE t ALTER COLUMN x TYPE text;
+           CREATE TABLE ch (x text COLLATE "C") INHERITS (t);"#,
+    )])
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with(r#"column "x" has a collation conflict"#),
+        "got: {err}"
+    );
+}
+
+#[test]
 fn a_column_without_a_collation_stays_without_one() {
     // PG 18: a column with no collation (exprCollation InvalidOid) — two
     // conflicting implicit collations met, or a UNION ALL of them — is read

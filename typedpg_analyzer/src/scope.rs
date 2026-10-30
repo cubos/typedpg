@@ -47,7 +47,9 @@ pub(crate) struct ScopeColumn {
     /// Planning may replace a reference to the column by an expression
     /// whose collation the analyzer doesn't know (see
     /// [`crate::expr::Planned`]): a pulled-up subquery's or inlined CTE's
-    /// expression the planner folds, an inlined SQL function's column.
+    /// expression the planner folds, an inlined SQL function's column — or
+    /// the column's own collation is unknown (a table column in
+    /// `PgCatalog::uncertain_collations`).
     pub planned_unknown: bool,
     /// The alias of the table this column belongs to.
     pub table_alias: String,
@@ -680,7 +682,11 @@ impl Scope {
                 typmod: snapshot.effective_typmod(c.atttypid, c.atttypmod),
                 collation: c.attcollation,
                 no_collation: false,
-                planned_unknown: false,
+                // A column whose collation the analyzer doesn't know (see
+                // `PgCatalog::uncertain_collations`).
+                planned_unknown: snapshot
+                    .uncertain_collations
+                    .contains(&(c.attrelid, c.attnum)),
                 table_alias: alias.to_owned(),
                 record_fields: None,
                 elem_nullable: (null_free.contains(&c.attname)
@@ -774,7 +780,11 @@ impl Scope {
                 typmod: snapshot.effective_typmod(c.atttypid, c.atttypmod),
                 collation: c.attcollation,
                 no_collation: false,
-                planned_unknown: false,
+                // A column whose collation the analyzer doesn't know (see
+                // `PgCatalog::uncertain_collations`).
+                planned_unknown: snapshot
+                    .uncertain_collations
+                    .contains(&(c.attrelid, c.attnum)),
                 table_alias: alias.to_owned(),
                 record_fields: None,
                 elem_nullable: (null_free.contains(&c.attname)

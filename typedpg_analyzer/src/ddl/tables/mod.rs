@@ -438,6 +438,11 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
             attislocal: col.is_local,
             attinhcount: col.inhcount,
         });
+        if col.uncertain_collation {
+            interp
+                .uncertain_collations
+                .insert((class_oid, (i + 1) as i16));
+        }
     }
     // attstorage: the merged definition's (a parent's, a LIKE ...
     // INCLUDING STORAGE source's), else the STORAGE clause's.
@@ -1002,6 +1007,9 @@ struct ParsedColumn {
     generated: Option<AttGenerated>,
     identity: Option<AttIdentity>,
     collation: Option<crate::oid::PgCollationOid>,
+    /// The analyzer doesn't know the collation PG gives the column: it is
+    /// inherited or copied from one in `PgCatalog::uncertain_collations`.
+    uncertain_collation: bool,
     /// The definition's compression method name, as MergeAttributes
     /// compares them: a COMPRESSION clause's (`default` included), or a
     /// parent's / LIKE source's method.

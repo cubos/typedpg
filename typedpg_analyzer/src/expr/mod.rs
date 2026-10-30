@@ -596,7 +596,8 @@ pub(crate) fn merge_elem_nullable(parts: impl IntoIterator<Item = Option<bool>>)
 }
 
 /// PG's `DEFAULT_COLLATION_OID`.
-const DEFAULT_COLLATION: crate::oid::PgCollationOid = crate::oid::PgCollationOid::from_raw(100);
+pub(crate) const DEFAULT_COLLATION: crate::oid::PgCollationOid =
+    crate::oid::PgCollationOid::from_raw(100);
 
 /// Why a value of a collatable type has no collation (PG's `exprCollation`
 /// is `InvalidOid`). A table or view can't store such a column, and the

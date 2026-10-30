@@ -30,6 +30,13 @@ pub(crate) enum Folding {
 
 /// What `node` folds into.
 pub(crate) fn folding(node: &protobuf::Node, ctx: Ctx<'_>) -> Folding {
+    fold(node, ctx, false)
+}
+
+/// What `node` folds into; `generation` when it is a virtual generated
+/// column's expression, whose column references are the table's stored
+/// columns (a generation expression can't read another generated column).
+fn fold(node: &protobuf::Node, ctx: Ctx<'_>, generation: bool) -> Folding {
     let Some(inner) = node.node.as_ref() else {
         return Folding::Maybe;
     };
@@ -42,6 +49,7 @@ pub(crate) fn folding(node: &protobuf::Node, ctx: Ctx<'_>) -> Folding {
         },
         // A Var of a table (read directly or passed through as is) stays
         // a Var.
+        node::Node::ColumnRef(_) if generation => Folding::Never,
         node::Node::ColumnRef(cr) => {
             let parts = super::extract_string_fields(&cr.fields);
             if parts.len() != cr.fields.len() {
@@ -53,8 +61,33 @@ pub(crate) fn folding(node: &protobuf::Node, ctx: Ctx<'_>) -> Folding {
                 [_, t, c] => (Some(t.as_str()), c.as_str()),
                 _ => return Folding::Maybe,
             };
-            match ctx.scope.resolve_column(table, column, None) {
-                Ok(col) if col.origin.is_some() => Folding::Never,
+            let Ok(col) = ctx.scope.resolve_column(table, column, None) else {
+                return Folding::Maybe;
+            };
+            let Some(origin) = col.origin.as_ref() else {
+                return Folding::Maybe;
+            };
+            let Some(attr) = snapshot
+                .attributes_of(origin.relid)
+                .iter()
+                .find(|a| a.attname == origin.column && a.attnum > 0)
+            else {
+                return Folding::Never;
+            };
+            if attr.attgenerated != Some(crate::pg_catalog::AttGenerated::Virtual) {
+                return Folding::Never;
+            }
+            // expand_virtual_generated_columns: the planner replaces a
+            // virtual generated column by its expression (under a
+            // CollateExpr giving it the column's collation, which a
+            // constant absorbs), then folds that.
+            match snapshot
+                .attr_default_exprs
+                .get(&(origin.relid, attr.attnum))
+            {
+                Some(crate::ddl::tables::check_inherit::StoredExpr::Written(expr)) => {
+                    fold(expr, ctx, true)
+                }
                 _ => Folding::Maybe,
             }
         }
@@ -64,6 +97,12 @@ pub(crate) fn folding(node: &protobuf::Node, ctx: Ctx<'_>) -> Folding {
             let Some(arg) = c.arg.as_deref() else {
                 return Folding::Maybe;
             };
+            // coerce_type makes a NULL literal a NULL constant of the type.
+            if let Some(node::Node::AConst(a)) = arg.node.as_ref()
+                && a.isnull
+            {
+                return Folding::Null;
+            }
             let Some(target) = c
                 .type_name
                 .as_ref()
@@ -75,7 +114,7 @@ pub(crate) fn folding(node: &protobuf::Node, ctx: Ctx<'_>) -> Folding {
                 (cast.casttarget == target || cast.casttarget == snapshot.unwrap_domain(target))
                     && cast.castfunc.is_some_and(|f| is_sql(snapshot, f))
             });
-            match folding(arg, ctx) {
+            match fold(arg, ctx, generation) {
                 Folding::Never if !sql_cast => Folding::Never,
                 _ => Folding::Maybe,
             }
@@ -99,16 +138,16 @@ pub(crate) fn folding(node: &protobuf::Node, ctx: Ctx<'_>) -> Folding {
                 e.lexpr
                     .iter()
                     .chain(e.rexpr.iter())
-                    .map(|a| folding(a, ctx)),
+                    .map(|a| fold(a, ctx, generation)),
             )
         }
         node::Node::BoolExpr(b) => {
-            let args = b.args.iter().map(|a| folding(a, ctx));
+            let args = b.args.iter().map(|a| fold(a, ctx, generation));
             match protobuf::BoolExprType::try_from(b.boolop) {
                 Ok(protobuf::BoolExprType::AndExpr) => bool_args(args, false),
                 Ok(protobuf::BoolExprType::OrExpr) => bool_args(args, true),
                 Ok(protobuf::BoolExprType::NotExpr) => {
-                    match b.args.first().map(|a| folding(a, ctx)) {
+                    match b.args.first().map(|a| fold(a, ctx, generation)) {
                         Some(Folding::Bool(v)) => Folding::Bool(!v),
                         Some(f @ (Folding::Null | Folding::Never)) => f,
                         _ => Folding::Maybe,
@@ -117,11 +156,11 @@ pub(crate) fn folding(node: &protobuf::Node, ctx: Ctx<'_>) -> Folding {
                 _ => Folding::Maybe,
             }
         }
-        node::Node::NullTest(t) => match t.arg.as_deref().map(|a| folding(a, ctx)) {
+        node::Node::NullTest(t) => match t.arg.as_deref().map(|a| fold(a, ctx, generation)) {
             Some(Folding::Never) => Folding::Never,
             _ => Folding::Maybe,
         },
-        node::Node::BooleanTest(t) => match t.arg.as_deref().map(|a| folding(a, ctx)) {
+        node::Node::BooleanTest(t) => match t.arg.as_deref().map(|a| fold(a, ctx, generation)) {
             Some(Folding::Never) => Folding::Never,
             _ => Folding::Maybe,
         },
@@ -152,8 +191,8 @@ pub(crate) fn folding(node: &protobuf::Node, ctx: Ctx<'_>) -> Folding {
                     Some(node::Node::NamedArgExpr(na)) => na
                         .arg
                         .as_deref()
-                        .map_or(Folding::Maybe, |a| folding(a, ctx)),
-                    _ => folding(a, ctx),
+                        .map_or(Folding::Maybe, |a| fold(a, ctx, generation)),
+                    _ => fold(a, ctx, generation),
                 }
             }))
         }

@@ -424,6 +424,15 @@ pub struct PgCatalog {
     /// `attcompression` of the columns with a compression method set
     /// (`pglz` / `lz4`; a column without one uses the server's default).
     pub(crate) attr_compression: Shared<HashMap<(PgClassOid, i16), &'static str>>,
+    /// The columns whose `attcollation` the analyzer can't know: a CREATE
+    /// TABLE AS column whose collation the planner may change in ways it
+    /// doesn't model (see [`crate::expr::Planned::Unknown`]), and the
+    /// columns that copy it (a view or table reading it as is, an
+    /// inheritance child, LIKE). Their `attcollation` is the default one,
+    /// which conflicts with no other implicit collation, and the checks that
+    /// compare it with another column's skip them: whatever PG stored, the
+    /// analyzer accepts.
+    pub(crate) uncertain_collations: Shared<std::collections::HashSet<(PgClassOid, i16)>>,
     /// The column / relation dependencies of policies, triggers, rules and
     /// SQL-standard function bodies.
     pub(crate) column_deps: crate::ddl::coldeps::ColumnDeps,
@@ -745,6 +754,7 @@ impl PgCatalog {
             toast_tables: Shared::default(),
             attr_storage: Shared::default(),
             attr_compression: Shared::default(),
+            uncertain_collations: Shared::default(),
             column_deps: Default::default(),
             next_oid: USER_OID_START_NZ,
             #[cfg(feature = "pg_sanity")]
@@ -1619,6 +1629,7 @@ impl PgCatalog {
         self.toast_tables.remove(&oid);
         self.attr_storage.retain(|(relid, _), _| *relid != oid);
         self.attr_compression.retain(|(relid, _), _| *relid != oid);
+        self.uncertain_collations.retain(|(relid, _)| *relid != oid);
         for p in &mut self.publications {
             p.forget_relation(oid);
         }

@@ -433,6 +433,7 @@ pub(crate) fn parse_column_def(
         generated,
         identity,
         collation,
+        uncertain_collation: false,
         owned_sequence: if identity.is_some() {
             Some(crate::pg_catalog::DepType::Internal)
         } else if is_serial {
@@ -1615,6 +1616,8 @@ pub(crate) fn alter_column_type(
     // compression method is reset.
     interp.attr_storage.remove(&(relid, attr.attnum));
     interp.attr_compression.remove(&(relid, attr.attnum));
+    // The collation is the one the command names (or the type's default).
+    interp.uncertain_collations.remove(&(relid, attr.attnum));
     crate::ddl::indexes::rebuild_indexes_for_column_type(
         interp,
         relid,

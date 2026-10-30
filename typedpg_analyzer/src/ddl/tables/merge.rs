@@ -189,6 +189,7 @@ fn of_type_columns(
                 generated: None,
                 identity: None,
                 collation: attr.attcollation,
+                uncertain_collation: false,
                 compression: None,
                 storage: None,
                 owned_sequence: None,
@@ -259,6 +260,7 @@ fn expand_like(
                 generated,
                 identity,
                 collation: attr.attcollation,
+                uncertain_collation: interp.uncertain_collations.contains(&(source, attr.attnum)),
                 compression: (opts & LIKE_COMPRESSION != 0)
                     .then(|| interp.attr_compression.get(&(source, attr.attnum)))
                     .flatten()
@@ -428,6 +430,7 @@ fn inherited_columns(
                 .get(&(parent, attr.attnum))
                 .map(|m| (*m).to_owned());
             let parent_storage = attr_storage(interp, parent, attr.attnum, attr.atttypid);
+            let uncertain_collation = interp.uncertain_collations.contains(&(parent, attr.attnum));
             if let Some(existing) = columns.iter_mut().find(|c| c.name == attr.attname) {
                 if existing.type_oid != attr.atttypid || existing.typmod != attr.atttypmod {
                     return Err(DdlError::Parse(format!(
@@ -435,7 +438,13 @@ fn inherited_columns(
                         attr.attname
                     )));
                 }
-                if existing.collation != attr.attcollation {
+                // A collation the analyzer doesn't know conflicts with
+                // none: PG either fails or merges equal ones, so the known
+                // one is the column's.
+                if existing.uncertain_collation {
+                    existing.collation = attr.attcollation;
+                    existing.uncertain_collation = uncertain_collation;
+                } else if !uncertain_collation && existing.collation != attr.attcollation {
                     return Err(DdlError::Parse(format!(
                         "inherited column \"{}\" has a collation conflict",
                         attr.attname
@@ -489,6 +498,7 @@ fn inherited_columns(
                 generated: attr.attgenerated,
                 identity,
                 collation: attr.attcollation,
+                uncertain_collation,
                 compression: parent_compression,
                 storage: Some(parent_storage),
                 owned_sequence: None,
@@ -519,7 +529,13 @@ fn merge_child_column(inh: &mut ParsedColumn, local: ParsedColumn) -> Result<(),
             local.name
         )));
     }
-    if local.collation.is_some() && local.collation != inh.collation {
+    if local.uncertain_collation {
+        // A collation the analyzer doesn't know conflicts with none: PG
+        // either fails or keeps the same one.
+    } else if inh.uncertain_collation && local.collation.is_some() {
+        inh.collation = local.collation;
+        inh.uncertain_collation = false;
+    } else if local.collation.is_some() && local.collation != inh.collation {
         return Err(DdlError::Parse(format!(
             "column \"{}\" has a collation conflict",
             local.name

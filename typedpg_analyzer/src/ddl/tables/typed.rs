@@ -132,7 +132,10 @@ pub(super) fn add_of(
         }
         if table_attr.atttypid != type_attr.atttypid
             || table_attr.atttypmod != type_attr.atttypmod
-            || table_attr.attcollation != type_attr.attcollation
+            || (table_attr.attcollation != type_attr.attcollation
+                && !interp
+                    .uncertain_collations
+                    .contains(&(relid, table_attr.attnum)))
         {
             return Err(DdlError::Parse(format!(
                 "table \"{relname}\" has different type for column \"{}\"",
