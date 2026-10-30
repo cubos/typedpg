@@ -234,8 +234,12 @@ pub(crate) fn analyze_set_operation(
         // collation (a COLLATE in a plain arm's select list) wins, two
         // different explicit ones are an error, and two different implicit
         // ones leave the column without a collation — an error too unless
-        // it is UNION ALL, which never compares.
+        // it is UNION ALL, which never compares. An arm column without a
+        // collation (a nested UNION ALL's) brings none.
         let arm_state = |arm: &protobuf::SelectStmt, c: &RawColumn| {
+            if c.no_collation {
+                return crate::clause::CollationState::NONE;
+            }
             let explicit = arm.op == SetOperation::SetopNone as i32
                 && crate::grouping::level_info(arm)
                     .is_some_and(|l| l.explicit_collations.get(i).copied().unwrap_or(false));
@@ -262,6 +266,10 @@ pub(crate) fn analyze_set_operation(
             merged.check_determinate(snapshot, None)?;
         }
         let collation = merged.collation();
+        let no_collation = collation.is_none()
+            && snapshot
+                .get_type(type_oid)
+                .is_some_and(|t| t.typcollation.is_some());
         let record_fields = crate::expr::merge_set_op_shapes(
             l.record_fields.as_ref(),
             r.record_fields.as_ref(),
@@ -286,6 +294,7 @@ pub(crate) fn analyze_set_operation(
             },
             typmod,
             collation,
+            no_collation,
             record_fields,
             elem_nullable: match op_label {
                 "EXCEPT" | "INTERSECT" => l.elem_nullable,

@@ -180,20 +180,29 @@ pub fn ensure_range_var(
 ) -> Result<(PgNamespaceOid, String), DdlError> {
     // A temporary relation goes in the session's temporary schema; an
     // explicit `pg_temp` makes the relation temporary.
-    if rv.relpersistence == "t" || rv.schemaname == "pg_temp" {
+    let nsoid = if rv.relpersistence == "t" || rv.schemaname == "pg_temp" {
         if !rv.schemaname.is_empty() && rv.schemaname != "pg_temp" {
             return Err(DdlError::UnsupportedDdl(
                 "cannot create temporary relation in non-temporary schema".into(),
             ));
         }
-        return Ok((temp_namespace(interp)?, rv.relname.clone()));
-    }
-    let schema = if rv.schemaname.is_empty() {
-        creation_schema(interp)?
+        temp_namespace(interp)?
     } else {
-        rv.schemaname.clone()
+        let schema = if rv.schemaname.is_empty() {
+            creation_schema(interp)?
+        } else {
+            rv.schemaname.clone()
+        };
+        existing_namespace(interp, &schema)?
     };
-    Ok((existing_namespace(interp, &schema)?, rv.relname.clone()))
+    // RangeVarAdjustRelationPersistence: an unlogged relation can't go in
+    // the temporary schema.
+    if rv.relpersistence == "u" && Some(nsoid) == interp.temp_namespace {
+        return Err(DdlError::UnsupportedDdl(
+            "only temporary relations may be created in temporary schemas".into(),
+        ));
+    }
+    Ok((nsoid, rv.relname.clone()))
 }
 
 /// Resolve a `TypeName` AST node to a type OID in the snapshot.

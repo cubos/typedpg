@@ -1125,6 +1125,7 @@ fn analyze_raw_node_once(
                     nullable: false,
                     typmod: None,
                     collation: None,
+                    no_collation: false,
                     record_fields: None,
                     elem_nullable: None,
                     refine: crate::refine::Refinement::NONE,
@@ -1616,6 +1617,11 @@ pub(crate) struct RawColumn {
     /// Threaded straight from the inner [`ExprType::collation`] so the
     /// final `Type` can render the non-default name.
     pub collation: Option<crate::oid::PgCollationOid>,
+    /// The column is of a collatable type but has no collation (PG's
+    /// `exprCollation` is `InvalidOid`): a UNION ALL column whose arms
+    /// carry different implicit collations. A table or view can't store
+    /// such a column (`CheckAttributeType`).
+    pub no_collation: bool,
     /// Named-field structure when this column holds a record. Sourced from
     /// SRF out_args, ROW constructors, or propagated through subqueries.
     /// Used both to surface `Type::AnonymousRecord` in the final output and

@@ -16,6 +16,7 @@
 use super::*;
 
 /// `TableLikeOption` bits (`parsenodes.h`).
+pub(crate) const LIKE_COMPRESSION: u32 = 1 << 1;
 pub(crate) const LIKE_CONSTRAINTS: u32 = 1 << 2;
 pub(crate) const LIKE_DEFAULTS: u32 = 1 << 3;
 pub(crate) const LIKE_GENERATED: u32 = 1 << 4;
@@ -188,6 +189,7 @@ fn of_type_columns(
                 generated: None,
                 identity: None,
                 collation: attr.attcollation,
+                compression: None,
                 owned_sequence: None,
                 identity_options: Vec::new(),
                 nn_local: false,
@@ -256,6 +258,10 @@ fn expand_like(
                 generated,
                 identity,
                 collation: attr.attcollation,
+                compression: (opts & LIKE_COMPRESSION != 0)
+                    .then(|| interp.attr_compression.get(&(source, attr.attnum)))
+                    .flatten()
+                    .map(|m| (*m).to_owned()),
                 owned_sequence: identity.map(|_| crate::pg_catalog::DepType::Internal),
                 // transformTableLikeClause: the source sequence's options.
                 identity_options: identity
@@ -414,6 +420,10 @@ fn inherited_columns(
                 .attr_default_exprs
                 .get(&(parent, attr.attnum))
                 .cloned();
+            let parent_compression = interp
+                .attr_compression
+                .get(&(parent, attr.attnum))
+                .map(|m| (*m).to_owned());
             if let Some(existing) = columns.iter_mut().find(|c| c.name == attr.attname) {
                 if existing.type_oid != attr.atttypid || existing.typmod != attr.atttypmod {
                     return Err(DdlError::Parse(format!(
@@ -427,6 +437,9 @@ fn inherited_columns(
                         attr.attname
                     )));
                 }
+                // MergeInheritedAttribute: a method set by two parents
+                // must be the same one.
+                merge_compression(&mut existing.compression, parent_compression, &attr.attname)?;
                 if existing.generated != attr.attgenerated {
                     return Err(DdlError::Parse(format!(
                         "inherited column \"{}\" has a generation conflict",
@@ -459,6 +472,7 @@ fn inherited_columns(
                 generated: attr.attgenerated,
                 identity,
                 collation: attr.attcollation,
+                compression: parent_compression,
                 owned_sequence: None,
                 identity_options: Vec::new(),
                 nn_local: false,
@@ -493,6 +507,7 @@ fn merge_child_column(inh: &mut ParsedColumn, local: ParsedColumn) -> Result<(),
             local.name
         )));
     }
+    merge_compression(&mut inh.compression, local.compression.clone(), &local.name)?;
     inh.not_null |= local.not_null;
     inh.nn_local |= local.nn_local;
     inh.nn_no_inherit |= local.nn_no_inherit;
@@ -511,6 +526,26 @@ fn merge_child_column(inh: &mut ParsedColumn, local: ParsedColumn) -> Result<(),
     if local.identity.is_some() {
         inh.identity = local.identity;
         inh.owned_sequence = local.owned_sequence;
+    }
+    Ok(())
+}
+
+/// MergeInheritedAttribute / MergeChildAttribute: a compression method
+/// fills an unset one and must otherwise be the same — compared by name, so
+/// an explicit `default` conflicts with a parent's method.
+fn merge_compression(
+    merged: &mut Option<String>,
+    new: Option<String>,
+    column: &str,
+) -> Result<(), DdlError> {
+    match (merged.as_ref(), new) {
+        (None, new) => *merged = new,
+        (Some(prev), Some(new)) if *prev != new => {
+            return Err(DdlError::Parse(format!(
+                "column \"{column}\" has a compression method conflict ({prev} versus {new})"
+            )));
+        }
+        _ => {}
     }
     Ok(())
 }

@@ -421,6 +421,9 @@ pub struct PgCatalog {
     /// `attstorage` of the columns whose storage isn't their type's
     /// `typstorage` (a STORAGE clause, ALTER COLUMN SET STORAGE).
     pub(crate) attr_storage: Shared<HashMap<(PgClassOid, i16), TypStorage>>,
+    /// `attcompression` of the columns with a compression method set
+    /// (`pglz` / `lz4`; a column without one uses the server's default).
+    pub(crate) attr_compression: Shared<HashMap<(PgClassOid, i16), &'static str>>,
     /// The column / relation dependencies of policies, triggers, rules and
     /// SQL-standard function bodies.
     pub(crate) column_deps: crate::ddl::coldeps::ColumnDeps,
@@ -741,6 +744,7 @@ impl PgCatalog {
             check_defs: Shared::default(),
             toast_tables: Shared::default(),
             attr_storage: Shared::default(),
+            attr_compression: Shared::default(),
             column_deps: Default::default(),
             next_oid: USER_OID_START_NZ,
             #[cfg(feature = "pg_sanity")]
@@ -1614,6 +1618,7 @@ impl PgCatalog {
         self.relpersistence.remove(&oid);
         self.toast_tables.remove(&oid);
         self.attr_storage.retain(|(relid, _), _| *relid != oid);
+        self.attr_compression.retain(|(relid, _), _| *relid != oid);
         for p in &mut self.publications {
             p.forget_relation(oid);
         }

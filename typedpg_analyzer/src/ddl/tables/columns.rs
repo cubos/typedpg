@@ -440,6 +440,7 @@ pub(crate) fn parse_column_def(
         } else {
             None
         },
+        compression: (!cd.compression.is_empty()).then(|| cd.compression.clone()),
         identity_options,
         nn_local: not_null,
         nn_name,
@@ -819,15 +820,20 @@ fn add_column_to(
     }
 
     // ATExecAddColumn: a column with a default — or a constrained domain
-    // type, whose NULL default is checked — rewrites a table's rows.
+    // type, whose NULL default is checked — rewrites a table's rows. A
+    // DEFAULT that is a null constant is no default.
+    let null_default = column_default_expr(cd).is_some_and(|e| {
+        crate::ddl::defaults::is_null_default(interp, e, col.type_oid, col.typmod)
+    });
     if interp.pg_class.get(&relid).map(|c| c.relkind) == Some(RelKind::Table)
-        && (col.has_default || domain_has_constraints(interp, col.type_oid))
+        && ((col.has_default && !null_default) || domain_has_constraints(interp, col.type_oid))
         && let Some(row_type) = interp.pg_class.get(&relid).and_then(|c| c.reltype)
     {
         find_composite_type_dependencies(interp, row_type, relid)?;
     }
     // ATExecAddColumn: BuildDescForRelation's STORAGE and COMPRESSION.
-    let storage = super::column_options::check_column_def_options(interp, cd, col.type_oid)?;
+    let (storage, compression) =
+        super::column_options::check_column_def_options(interp, cd, col.type_oid)?;
     // ATExecAddColumn: CheckAttributeType, within the relation's row type.
     super::generated::check_attribute_type(
         interp,
@@ -864,6 +870,7 @@ fn add_column_to(
     if let Some(storage) = storage {
         super::column_options::record_attr_storage(interp, relid, next_attnum, storage);
     }
+    super::column_options::record_attr_compression(interp, relid, next_attnum, compression);
     if let Some(default_type) = default_type {
         interp
             .attr_default_types
@@ -1196,6 +1203,7 @@ pub(crate) fn drop_column(
     interp.attr_default_types.remove(&(relid, target.attnum));
     interp.attr_default_exprs.remove(&(relid, target.attnum));
     interp.attr_storage.remove(&(relid, target.attnum));
+    interp.attr_compression.remove(&(relid, target.attnum));
     crate::ddl::statistics::drop_column_statistics(interp, relid, target.attnum);
     crate::ddl::defaults::forget_default_dependencies(interp, relid, target.attnum);
     if let Some(attrs) = interp.pg_attribute.get_mut(&relid) {
@@ -1434,10 +1442,27 @@ pub(crate) fn alter_column_type(
         interp.pg_class.get(&relid).and_then(|c| c.reltype),
         attr.attgenerated == Some(AttGenerated::Virtual),
     )?;
-    // ATPrepAlterColumnType: the old value (or the USING expression) must
-    // be assignment-coercible to the new type — a virtual column stores
-    // none.
-    if !rec.recursing && attr.attgenerated != Some(AttGenerated::Virtual) {
+    // ATPrepAlterColumnType: a table's old value (or the USING expression)
+    // must be assignment-coercible to the new type — a virtual column, and
+    // any other relation kind (a composite type, a foreign table), stores
+    // none to convert, and takes no USING.
+    let stores_values = matches!(
+        interp.pg_class.get(&relid).map(|c| c.relkind),
+        Some(RelKind::Table | RelKind::Partitioned)
+    );
+    if attr.attgenerated != Some(AttGenerated::Virtual)
+        && !stores_values
+        && cd.raw_default.is_some()
+    {
+        return Err(DdlError::UnsupportedDdl(format!(
+            "\"{}\" is not a table",
+            interp
+                .pg_class
+                .get(&relid)
+                .map_or("", |c| c.relname.as_str())
+        )));
+    }
+    if !rec.recursing && attr.attgenerated != Some(AttGenerated::Virtual) && stores_values {
         match cd.raw_default.as_deref() {
             Some(using) => check_using_expression(interp, relid, &attr, using, new_type_oid)?,
             None => {
@@ -1585,8 +1610,10 @@ pub(crate) fn alter_column_type(
         col.atttypmod = new_typmod;
         col.attcollation = new_collation;
     }
-    // ATExecAlterColumnType: attstorage becomes the new type's.
+    // ATExecAlterColumnType: attstorage becomes the new type's, and the
+    // compression method is reset.
     interp.attr_storage.remove(&(relid, attr.attnum));
+    interp.attr_compression.remove(&(relid, attr.attnum));
     crate::ddl::indexes::rebuild_indexes_for_column_type(
         interp,
         relid,

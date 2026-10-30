@@ -7,14 +7,16 @@ use super::*;
 /// `confrelid`/`confkey` so the dependency graph is traversable.
 ///
 /// DefineRelation's order: the CHECK constraints, then the not-null ones
-/// (`record_not_nulls`), then the index-backed ones, then the foreign keys.
+/// (`record_not_nulls`), then the index-backed ones. The foreign keys are
+/// returned, for [`add_pending_foreign_keys`] once the rest of the
+/// statement — LIKE clauses included — has run.
 pub(crate) fn emit_constraints(
     interp: &mut PgCatalog,
     relid: PgClassOid,
     relname: &str,
     stmt: &CreateStmt,
     record_not_nulls: &dyn Fn(&mut PgCatalog) -> Result<(), DdlError>,
-) -> Result<(), DdlError> {
+) -> Result<Vec<PendingFk>, DdlError> {
     let attinfo_by_name: std::collections::HashMap<String, (i16, PgTypeOid)> = interp
         .attributes_of(relid)
         .iter()
@@ -26,16 +28,6 @@ pub(crate) fn emit_constraints(
     // The parse node of each `to_emit` entry, for DefineIndex's checks of
     // the index-backed ones.
     let mut specs: Vec<&typedpg_pg_query::protobuf::Constraint> = Vec::new();
-    // FOREIGN KEYs are resolved only after this table's own PRIMARY KEY /
-    // UNIQUE constraints exist, so a self-reference finds them — PG likewise
-    // adds FKs after creating the table and its indexes
-    // (transformFKConstraints queues them as ALTER TABLE ADD CONSTRAINT).
-    // `(constraint, local columns, default name)`.
-    type PendingFk<'a> = (
-        &'a typedpg_pg_query::protobuf::Constraint,
-        Vec<String>,
-        ConName,
-    );
     let mut pending_fks: Vec<PendingFk> = Vec::new();
 
     // Column-level constraints.
@@ -121,7 +113,7 @@ pub(crate) fn emit_constraints(
                 }
                 Ok(ConstrType::ConstrForeign) => {
                     pending_fks.push((
-                        c,
+                        (*c).clone(),
                         vec![cd.colname.clone()],
                         ConName::Constraint {
                             addition: cd.colname.clone(),
@@ -263,7 +255,7 @@ pub(crate) fn emit_constraints(
                     addition: crate::ddl::util::index_name_addition(&fk_names),
                     label: "fkey",
                 };
-                pending_fks.push((c, fk_names, default_name));
+                pending_fks.push(((**c).clone(), fk_names, default_name));
             }
             _ => {}
         }
@@ -349,18 +341,35 @@ pub(crate) fn emit_constraints(
     if n_all == n_checks {
         record_not_nulls(interp)?;
     }
+    let _ = relname;
+    Ok(pending_fks)
+}
+
+/// A FOREIGN KEY of a CREATE TABLE: `(constraint, local columns, default
+/// name)`.
+pub(crate) type PendingFk = (typedpg_pg_query::protobuf::Constraint, Vec<String>, ConName);
+
+/// Add a CREATE TABLE's FOREIGN KEYs. They come last, after this table's
+/// own PRIMARY KEY / UNIQUE constraints and its LIKE clauses' indexes, so
+/// a self-reference finds them: transformCreateStmt queues the LIKE
+/// clauses ahead of the foreign keys, which transformFKConstraints turns
+/// into ALTER TABLE ADD CONSTRAINT.
+pub(crate) fn add_pending_foreign_keys(
+    interp: &mut PgCatalog,
+    relid: PgClassOid,
+    pending_fks: Vec<PendingFk>,
+) -> Result<(), DdlError> {
     for (c, local_names, default_name) in pending_fks {
         super::foreign_keys::add_foreign_key(
             interp,
             relid,
-            c,
+            &c,
             &local_names,
             default_name,
             true,
             true,
         )?;
     }
-    let _ = relname;
     Ok(())
 }
 

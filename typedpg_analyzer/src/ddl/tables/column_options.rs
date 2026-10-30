@@ -76,7 +76,8 @@ pub(super) fn alter_column_setting(
         AlterTableType::AtSetCompression => {
             let method = def_name().unwrap_or_default();
             if !method.is_empty() {
-                get_attribute_compression(interp, attr.atttypid, &method)?;
+                let method = get_attribute_compression(interp, attr.atttypid, &method)?;
+                record_attr_compression(interp, relid, attr.attnum, method);
             }
         }
         AlterTableType::AtSetOptions => check_attribute_options(cmd.def.as_deref())?,
@@ -118,49 +119,67 @@ pub(crate) fn get_attribute_storage(
 }
 
 /// GetAttributeCompression (tablecmds.c): the compression method `method`
-/// for a column of type `typid` — none for a type that can't be toasted.
+/// for a column of type `typid` — none for a type that can't be toasted,
+/// nor for `default`.
 pub(crate) fn get_attribute_compression(
     interp: &PgCatalog,
     typid: PgTypeOid,
     method: &str,
-) -> Result<(), DdlError> {
+) -> Result<Option<&'static str>, DdlError> {
+    if method == "default" {
+        return Ok(None);
+    }
     let typstorage = interp
         .pg_type
         .get(&typid)
         .map_or(TypStorage::Plain, |t| t.typstorage);
     if typstorage == TypStorage::Plain {
-        if method == "default" {
-            return Ok(());
-        }
         return Err(DdlError::UnsupportedDdl(format!(
             "column data type {} does not support compression",
             format_type_for_message(interp, typid)
         )));
     }
-    if !matches!(method, "default" | "pglz" | "lz4") {
-        return Err(DdlError::UnsupportedDdl(format!(
+    match method {
+        "pglz" => Ok(Some("pglz")),
+        "lz4" => Ok(Some("lz4")),
+        _ => Err(DdlError::UnsupportedDdl(format!(
             "invalid compression method \"{method}\""
-        )));
+        ))),
     }
-    Ok(())
+}
+
+/// Remember column `relid.attnum`'s `attcompression` (`None`: the default).
+pub(crate) fn record_attr_compression(
+    interp: &mut PgCatalog,
+    relid: PgClassOid,
+    attnum: i16,
+    method: Option<&'static str>,
+) {
+    match method {
+        Some(method) => interp.attr_compression.insert((relid, attnum), method),
+        None => interp.attr_compression.remove(&(relid, attnum)),
+    };
 }
 
 /// BuildDescForRelation: a column definition's STORAGE and COMPRESSION
-/// clauses, for its type. Returns the STORAGE clause's mode.
+/// clauses, for its type. Returns the STORAGE clause's mode and the
+/// COMPRESSION clause's method.
 pub(crate) fn check_column_def_options(
     interp: &PgCatalog,
     cd: &typedpg_pg_query::protobuf::ColumnDef,
     typid: PgTypeOid,
-) -> Result<Option<TypStorage>, DdlError> {
+) -> Result<(Option<TypStorage>, Option<&'static str>), DdlError> {
     let storage = if cd.storage_name.is_empty() {
         None
     } else {
         Some(get_attribute_storage(interp, typid, &cd.storage_name)?)
     };
-    if !cd.compression.is_empty() {
-        get_attribute_compression(interp, typid, &cd.compression)?;
-    }
-    Ok(storage)
+    let compression = if cd.compression.is_empty() {
+        None
+    } else {
+        get_attribute_compression(interp, typid, &cd.compression)?
+    };
+    Ok((storage, compression))
 }
 
 /// Remember column `relid.attnum`'s `attstorage` when it isn't its type's.

@@ -99,6 +99,14 @@ pub fn create_view(interp: &mut PgCatalog, stmt: &ViewStmt) -> Result<(), DdlErr
         false,
     )?;
 
+    // DefineVirtualRelation: a collatable column needs a collation.
+    if let Some(col) = resolved.columns.iter().find(|c| c.no_collation) {
+        return Err(DdlError::Parse(format!(
+            "could not determine which collation to use for view column \"{}\"",
+            col.name
+        )));
+    }
+
     // DefineVirtualRelation: OR REPLACE redefines an existing *view* in
     // place (keeping its OID, so dependents stay attached); any other
     // existing relation is an error.
@@ -279,6 +287,29 @@ fn create_relation_as(
             "too many column names were specified".into(),
         ));
     }
+    // intorel_startup / create_ctas_nodata: a collatable column needs a
+    // collation.
+    if let Some(col) = resolved.columns.iter().find(|c| c.no_collation) {
+        return Err(DdlError::Parse(format!(
+            "no collation was derived for column \"{}\" with collatable type {}",
+            col.name,
+            super::util::format_type_for_message(interp, col.type_oid)
+        )));
+    }
+    // DefineRelation: ON COMMIT applies to temporary tables only — tested
+    // on the statement's TEMP, before the namespace lookup that would make
+    // a `pg_temp.name` temporary.
+    use protobuf::OnCommitAction;
+    let on_commit = OnCommitAction::try_from(into.on_commit).unwrap_or(OnCommitAction::Undefined);
+    if !matches!(
+        on_commit,
+        OnCommitAction::OncommitNoop | OnCommitAction::Undefined
+    ) && rv.relpersistence != "t"
+    {
+        return Err(DdlError::UnsupportedDdl(
+            "ON COMMIT can only be used on temporary tables".into(),
+        ));
+    }
     check_duplicate_columns(&resolved.columns)?;
     super::util::check_relation_name_free(interp, nsoid, &name)?;
     super::tables::check_tablespace_placement(&into.table_space_name)?;
@@ -307,6 +338,11 @@ fn create_relation_as(
         && let Some(oid) = oid
     {
         interp.relpersistence.insert(oid, p);
+    }
+    if on_commit == OnCommitAction::OncommitDrop
+        && let Some(oid) = oid
+    {
+        interp.on_commit_drop.push(oid);
     }
     // WITH NO DATA leaves a materialized view unpopulated.
     if kind == RelKind::MaterializedView
@@ -797,6 +833,9 @@ struct ResolvedColumn {
     /// The expression's collation (`exprCollation`), which PG stores as the
     /// view / CTAS column's `attcollation`.
     collation: Option<crate::oid::PgCollationOid>,
+    /// Of a collatable type, the expression has no collation (see
+    /// [`crate::resolve::RawColumn::no_collation`]).
+    no_collation: bool,
 }
 
 #[derive(Default, Clone)]
@@ -870,6 +909,7 @@ fn resolve_view_with_params(
                 collation: col
                     .collation
                     .or_else(|| interp_type_collation(snapshot, type_oid)),
+                no_collation: col.no_collation,
             }
         })
         .collect();

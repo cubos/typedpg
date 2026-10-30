@@ -402,7 +402,7 @@ pub(crate) struct CollationState {
 }
 
 impl CollationState {
-    const NONE: CollationState = CollationState {
+    pub(crate) const NONE: CollationState = CollationState {
         strength: Strength::None,
         collation: None,
         other: None,

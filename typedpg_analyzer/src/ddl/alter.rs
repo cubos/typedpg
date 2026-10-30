@@ -12,7 +12,6 @@ use super::util::{node_string, resolve_type_name};
 use super::views;
 use crate::oid::{PgClassOid, PgNamespaceOid, PgProcOid, PgTypeOid};
 use crate::pg_catalog::{PgCatalog, PgProc};
-use crate::qualified_name::QualifiedName;
 
 // ─── ALTER ... RENAME TO ────────────────────────────────────────────────────
 
@@ -96,27 +95,12 @@ fn rename_constraint(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), Dd
     let Some(rv) = stmt.relation.as_ref() else {
         return Ok(());
     };
-    let (schema_name, relname) = crate::ddl::util::range_var_names(rv, interp);
-    let Some(nsoid) = interp.namespace_oid(&schema_name) else {
-        if stmt.missing_ok {
-            return Ok(());
-        }
-        return Err(DdlError::TableNotFound(
-            QualifiedName::new(&schema_name, &relname).to_string(),
-        ));
+    let (nsoid, class_oid) = match crate::ddl::util::lookup_relation(interp, rv) {
+        Ok(found) => found,
+        Err(_) if stmt.missing_ok => return Ok(()),
+        Err(e) => return Err(e),
     };
-    let Some(class_oid) = interp
-        .class_by_qname
-        .get(&(nsoid, relname.clone()))
-        .copied()
-    else {
-        if stmt.missing_ok {
-            return Ok(());
-        }
-        return Err(DdlError::TableNotFound(
-            QualifiedName::new(&schema_name, &relname).to_string(),
-        ));
-    };
+    let relname = rv.relname.clone();
 
     // PG (RENAME CONSTRAINT) emits `constraint "x" for table "t" does not
     // exist` (note "for table", not "of relation" — DROP CONSTRAINT uses the
@@ -298,26 +282,10 @@ fn rename_column(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlErr
     let Some(rv) = stmt.relation.as_ref() else {
         return Ok(());
     };
-    let schema_name = crate::ddl::util::range_var_names(rv, interp).0;
-    let Some(nsoid) = interp.namespace_oid(&schema_name) else {
-        if stmt.missing_ok {
-            return Ok(());
-        }
-        return Err(DdlError::TableNotFound(
-            QualifiedName::new(&schema_name, &rv.relname).to_string(),
-        ));
-    };
-    let Some(relid) = interp
-        .class_by_qname
-        .get(&(nsoid, rv.relname.clone()))
-        .copied()
-    else {
-        if stmt.missing_ok {
-            return Ok(());
-        }
-        return Err(DdlError::TableNotFound(
-            QualifiedName::new(&schema_name, &rv.relname).to_string(),
-        ));
+    let relid = match crate::ddl::util::lookup_relation(interp, rv) {
+        Ok((_, relid)) => relid,
+        Err(_) if stmt.missing_ok => return Ok(()),
+        Err(e) => return Err(e),
     };
 
     // renameatt_check / find_typed_table_dependencies.

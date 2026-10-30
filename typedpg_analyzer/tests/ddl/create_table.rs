@@ -110,6 +110,54 @@ fn create_schema_with_table() {
     assert_eq!(snap.namespace_name(table.relnamespace), Some("myapp"));
 }
 
+#[test]
+fn on_commit_requires_a_temporary_table() {
+    // DefineRelation (PG 18, 42P16): any ON COMMIT, PRESERVE ROWS included,
+    // needs TEMP. CREATE TABLE AS tests it before the namespace lookup that
+    // makes `pg_temp.name` temporary; CREATE TABLE after it.
+    for sql in [
+        "CREATE TABLE tt2 (col) ON COMMIT DELETE ROWS AS SELECT 1;",
+        "CREATE TABLE tt3 (col) ON COMMIT PRESERVE ROWS AS SELECT 1;",
+        "CREATE TABLE pg_temp.tt4 (col) ON COMMIT DROP AS SELECT 1;",
+        "CREATE TABLE tt5 (col int) ON COMMIT DELETE ROWS;",
+    ] {
+        let err = try_apply(&[("0001.sql", sql)]).expect_err(sql);
+        assert!(
+            err.to_string()
+                .starts_with("ON COMMIT can only be used on temporary tables"),
+            "{sql}\n  got: {err}"
+        );
+    }
+    build_db(&[(
+        "0001.sql",
+        "CREATE TEMP TABLE tt6 (col) ON COMMIT DELETE ROWS AS SELECT 1;
+         CREATE TEMP TABLE tt7 ON COMMIT PRESERVE ROWS AS SELECT 1 AS x WITH NO DATA;
+         CREATE TABLE pg_temp.tt8 (col int) ON COMMIT DELETE ROWS;",
+    )]);
+}
+
+#[test]
+fn pg_temp_only_takes_temporary_relations() {
+    // RangeVarAdjustRelationPersistence (PG 18, 42P16): an UNLOGGED relation
+    // can't go in the temporary schema; a permanent one becomes temporary.
+    for sql in [
+        "CREATE UNLOGGED TABLE pg_temp.unlogged3 (a int primary key);",
+        "CREATE UNLOGGED TABLE pg_temp.u4 AS SELECT 1;",
+        "CREATE UNLOGGED SEQUENCE pg_temp.s1;",
+    ] {
+        let err = try_apply(&[("0001.sql", sql)]).expect_err(sql);
+        assert!(
+            err.to_string()
+                .starts_with("only temporary relations may be created in temporary schemas"),
+            "{sql}\n  got: {err}"
+        );
+    }
+    build_db(&[(
+        "0001.sql",
+        "CREATE TABLE pg_temp.u5 (a int); CREATE UNLOGGED TABLE u6 (a int);",
+    )]);
+}
+
 // ── No-op DDL shouldn't fail ────────────────────────────────────────────────
 
 #[test]
@@ -1091,6 +1139,103 @@ fn view_columns_keep_their_expression_collation() {
         &info,
         vec![cn("t", basic_with_collation("pg_catalog", "text", "C"))],
     );
+}
+
+#[test]
+fn create_table_as_needs_a_derived_collation() {
+    // PG 18 (42P22): a UNION ALL column whose arms carry different implicit
+    // collations has none, which a table or view column can't store. A
+    // COLLATE, or an arm with a non-conflicting collation, settles it.
+    let setup = r#"CREATE TABLE c1 (b text COLLATE "C");
+                   CREATE TABLE c2 (b text COLLATE "POSIX");
+                   CREATE TABLE c3 (b text);"#;
+    for (stmt, msg) in [
+        (
+            "CREATE TABLE test_u AS SELECT b FROM c1 UNION ALL SELECT b FROM c2;",
+            r#"no collation was derived for column "b" with collatable type text"#,
+        ),
+        (
+            "CREATE TABLE test_u AS SELECT b FROM c1 UNION ALL SELECT b FROM c2 WITH NO DATA;",
+            r#"no collation was derived for column "b" with collatable type text"#,
+        ),
+        (
+            "CREATE MATERIALIZED VIEW test_u AS SELECT b FROM c1 UNION ALL SELECT b FROM c2;",
+            r#"no collation was derived for column "b" with collatable type text"#,
+        ),
+        (
+            "CREATE TABLE test_u AS SELECT ARRAY[b] FROM c1 UNION ALL SELECT ARRAY[b] FROM c2;",
+            r#"no collation was derived for column "array" with collatable type text[]"#,
+        ),
+        (
+            "CREATE VIEW test_u AS SELECT b FROM c1 UNION ALL SELECT b FROM c2;",
+            r#"could not determine which collation to use for view column "b""#,
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            r#"CREATE TABLE t4 AS SELECT b COLLATE "C" AS b FROM c1 UNION ALL SELECT b FROM c2;
+               CREATE TABLE t5 AS SELECT b FROM c1 UNION ALL SELECT b FROM c3;
+               CREATE TABLE t7 AS (SELECT b FROM c1 UNION ALL SELECT b FROM c2)
+                                  UNION ALL SELECT b FROM c1;
+               CREATE VIEW v8 AS SELECT upper(b) FROM (SELECT b FROM c1 UNION ALL
+                                                      SELECT b FROM c2) s;"#,
+        ),
+    ]);
+}
+
+#[test]
+fn inherited_compression_methods_must_agree() {
+    // MergeInheritedAttribute / MergeChildAttribute (PG 18, 42804): two
+    // definitions setting different compression methods conflict — an
+    // explicit `default` too; an unset one takes the other's method.
+    let setup = "CREATE TABLE cm1 (f1 text COMPRESSION pglz);
+                 CREATE TABLE cm2 (f1 text COMPRESSION lz4);
+                 CREATE TABLE cm3 (f1 text);";
+    for stmt in [
+        "CREATE TABLE cminh () INHERITS (cm1, cm2);",
+        "CREATE TABLE cminh (f1 text) INHERITS (cm1, cm2);",
+        "CREATE TABLE cminh (f1 text COMPRESSION lz4) INHERITS (cm1);",
+        "CREATE TABLE cminh (f1 text COMPRESSION default) INHERITS (cm1);",
+        "CREATE TABLE cminh (LIKE cm2 INCLUDING COMPRESSION) INHERITS (cm1);",
+        // The method a child inherited, added or was set to later.
+        "CREATE TABLE c (f1 text COMPRESSION pglz) INHERITS (cm1, cm3);
+         CREATE TABLE cminh () INHERITS (c, cm2);",
+        "CREATE TABLE c (); ALTER TABLE c ADD COLUMN f1 text COMPRESSION lz4;
+         CREATE TABLE cminh () INHERITS (cm1, c);",
+        "CREATE TABLE p (); CREATE TABLE c () INHERITS (p);
+         ALTER TABLE p ADD COLUMN f1 text COMPRESSION lz4;
+         CREATE TABLE cminh () INHERITS (c, cm1);",
+        "ALTER TABLE cm3 ALTER COLUMN f1 SET COMPRESSION lz4;
+         CREATE TABLE cminh () INHERITS (cm1, cm3);",
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(
+            err.to_string()
+                .starts_with(r#"column "f1" has a compression method conflict"#),
+            "{stmt}\n  got: {err}"
+        );
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "CREATE TABLE a1 () INHERITS (cm1, cm3);
+             CREATE TABLE a2 () INHERITS (cm3, cm2);
+             CREATE TABLE a3 (f1 text COMPRESSION pglz) INHERITS (cm1);
+             CREATE TABLE a4 (LIKE cm2) INHERITS (cm1);
+             CREATE TABLE a5 (f1 text COMPRESSION lz4); ALTER TABLE a5 ALTER f1 TYPE text;
+             CREATE TABLE a6 () INHERITS (cm1, a5);
+             CREATE TABLE a7 (f1 text COMPRESSION lz4);
+             ALTER TABLE a7 ALTER f1 SET COMPRESSION default;
+             CREATE TABLE a8 () INHERITS (cm1, a7);
+             ALTER TABLE cm2 INHERIT cm1;",
+        ),
+    ]);
 }
 
 #[test]

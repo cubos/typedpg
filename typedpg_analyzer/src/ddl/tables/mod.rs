@@ -407,7 +407,7 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
     for elt in &stmt.table_elts {
         if let Some(node::Node::ColumnDef(cd)) = elt.node.as_ref()
             && let Some(col) = columns.iter().find(|c| c.name == cd.colname)
-            && let Some(storage) =
+            && let (Some(storage), _) =
                 column_options::check_column_def_options(interp, cd, col.type_oid)?
         {
             storage_clauses.push((cd.colname.clone(), storage));
@@ -452,6 +452,11 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
             });
         if let Some(storage) = storage {
             column_options::record_attr_storage(interp, class_oid, (i + 1) as i16, storage);
+        }
+        // attcompression: the merged definition's method (MergeAttributes).
+        if let Some(method) = col.compression.as_deref() {
+            let method = column_options::get_attribute_compression(interp, col.type_oid, method)?;
+            column_options::record_attr_compression(interp, class_oid, (i + 1) as i16, method);
         }
     }
     let phys = crate::ddl::types::TypePhysical::COMPOSITE;
@@ -816,7 +821,7 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
     }
     // Emit pg_constraint rows so ON CONFLICT, DROP CASCADE, and FK
     // dependency checks can consult them later. FK validation runs here.
-    emit_constraints(interp, class_oid, &name, stmt, &|interp| {
+    let pending_fks = emit_constraints(interp, class_oid, &name, stmt, &|interp| {
         inherit::record_not_nulls(interp, class_oid, &columns)
     })?;
     check_inherit::inherit_parent_checks(interp, class_oid)?;
@@ -826,6 +831,7 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
     for like in &likes {
         copy_like_constraints(interp, class_oid, &name, like)?;
     }
+    constraints::add_pending_foreign_keys(interp, class_oid, pending_fks)?;
 
     Ok(())
 }
@@ -985,6 +991,10 @@ struct ParsedColumn {
     generated: Option<AttGenerated>,
     identity: Option<AttIdentity>,
     collation: Option<crate::oid::PgCollationOid>,
+    /// The definition's compression method name, as MergeAttributes
+    /// compares them: a COMPRESSION clause's (`default` included), or a
+    /// parent's / LIKE source's method.
+    compression: Option<String>,
     /// Implicit sequence the column owns: `Auto` for serial columns,
     /// `Internal` for identity columns.
     owned_sequence: Option<crate::pg_catalog::DepType>,
