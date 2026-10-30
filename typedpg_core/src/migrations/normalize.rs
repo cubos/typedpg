@@ -9,7 +9,9 @@
 //! Shared with `typedpg_wasm`, which the npm runtime calls: a database
 //! looks drifted to one runner exactly when it does to the other.
 
-use super::split::{is_ident_cont, is_ident_start, skip_block_comment, skip_quoted};
+use super::split::{
+    is_ident_cont, is_ident_start, skip_block_comment, skip_line_comment, skip_quoted,
+};
 use crate::migration_marker::has_no_transaction_marker;
 
 /// Which normalization the stored hashes use. A row's `hash_version` names
@@ -51,6 +53,10 @@ pub fn hash(sql: &str) -> String {
 /// string literals (`'a'\n'b'`) makes PostgreSQL concatenate them, while a
 /// plain space (`'a' 'b'`) leaves two literals; both normalize alike.
 ///
+/// One sequence keeps a space no run spelled: the word `u`, the operator
+/// `&` and a quoted literal, which touching would be the Unicode-escape
+/// literal `u&'…'` (`u&"…"`), become `u& '…'` however they were spaced.
+///
 /// The `-- no-transaction` marker decides how the migration runs, so it is
 /// part of the normalized text (the comment scan drops it otherwise).
 pub fn normalize(sql: &str) -> String {
@@ -58,6 +64,8 @@ pub fn normalize(sql: &str) -> String {
     let mut out = String::with_capacity(sql.len());
     let mut last: Option<Class> = None;
     let mut pending_run = false;
+    // The tokens just written, as far as a Unicode-escape prefix goes.
+    let mut prefix = UnicodePrefix::None;
     let mut i = 0;
 
     while i < bytes.len() {
@@ -66,9 +74,7 @@ pub fn normalize(sql: &str) -> String {
             // Comments and whitespace form one maximal run: whether it
             // leaves a space is decided when the next token starts.
             b'-' if bytes.get(i + 1) == Some(&b'-') => {
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
-                }
+                i = skip_line_comment(bytes, i);
                 pending_run = true;
             }
             b'/' if bytes.get(i + 1) == Some(&b'*') => {
@@ -86,22 +92,28 @@ pub fn normalize(sql: &str) -> String {
                     && matches!(bytes[i - 1], b'e' | b'E')
                     && (i < 2 || !is_ident_cont(bytes[i - 2]));
                 let end = skip_quoted(bytes, i, b'\'', escapes);
+                keep_apart_from_u_amp(&mut out, &mut last, &mut pending_run, prefix);
                 copy_verbatim(&mut out, &mut last, &mut pending_run, &sql[i..end]);
+                prefix = UnicodePrefix::None;
                 i = end;
             }
             b'"' => {
                 let end = skip_quoted(bytes, i, b'"', false);
+                keep_apart_from_u_amp(&mut out, &mut last, &mut pending_run, prefix);
                 copy_verbatim(&mut out, &mut last, &mut pending_run, &sql[i..end]);
+                prefix = UnicodePrefix::None;
                 i = end;
             }
             b'$' => match dollar_quote_span(bytes, i) {
                 Some(end) => {
                     copy_verbatim(&mut out, &mut last, &mut pending_run, &sql[i..end]);
+                    prefix = UnicodePrefix::None;
                     i = end;
                 }
                 None => {
                     // A `$1` parameter, or any other `$`: ordinary text.
                     copy_ordinary(&mut out, &mut last, &mut pending_run, b);
+                    prefix = UnicodePrefix::None;
                     i += 1;
                 }
             },
@@ -112,10 +124,36 @@ pub fn normalize(sql: &str) -> String {
                 while i < bytes.len() && is_ident_cont(bytes[i]) {
                     i += 1;
                 }
-                copy_word(&mut out, &mut last, &mut pending_run, &sql[start..i]);
+                let word = &sql[start..i];
+                let is_u = word.eq_ignore_ascii_case("u");
+                match bytes.get(i..i + 2) {
+                    // scan.l's `xusstart`/`xuistart`: `U&'…'` and `U&"…"`,
+                    // the `U&` touching the quote, are one Unicode-escape
+                    // literal (no backslash escapes, the quote doubled).
+                    Some([b'&', quote @ (b'\'' | b'"')]) if is_u => {
+                        let end = skip_quoted(bytes, i + 1, *quote, false);
+                        copy_word(&mut out, &mut last, &mut pending_run, word);
+                        out.push_str(&sql[i..end]);
+                        prefix = UnicodePrefix::None;
+                        i = end;
+                    }
+                    _ => {
+                        copy_word(&mut out, &mut last, &mut pending_run, word);
+                        prefix = if is_u {
+                            UnicodePrefix::U
+                        } else {
+                            UnicodePrefix::None
+                        };
+                    }
+                }
             }
             _ => {
                 copy_ordinary(&mut out, &mut last, &mut pending_run, b);
+                prefix = if prefix == UnicodePrefix::U && b == b'&' {
+                    UnicodePrefix::UAmp
+                } else {
+                    UnicodePrefix::None
+                };
                 i += 1;
             }
         }
@@ -156,6 +194,32 @@ impl Class {
         } else {
             Class::Other
         }
+    }
+}
+
+/// The word `u` and the operator `&` just written, as separate tokens.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UnicodePrefix {
+    None,
+    /// The last token is the word `u` (or `U`).
+    U,
+    /// The last two tokens are the word `u` and a lone `&`.
+    UAmp,
+}
+
+/// Before a quoted literal: if the separate tokens `u` and `&` precede it,
+/// write a space, so the text cannot read as the Unicode-escape literal
+/// `u&'…'` (which is written without one). `u & 'a'`, `u &'a'` and
+/// `u& 'a'` all lex as `u`, `&`, `'a'`, and normalize to `u& 'a'`.
+fn keep_apart_from_u_amp(
+    out: &mut String,
+    last: &mut Option<Class>,
+    pending_run: &mut bool,
+    prefix: UnicodePrefix,
+) {
+    if prefix == UnicodePrefix::UAmp {
+        separate(out, last, pending_run, Class::Word);
+        out.push(' ');
     }
 }
 
@@ -253,6 +317,48 @@ mod tests {
                 case.b
             );
         }
+    }
+
+    #[test]
+    fn a_carriage_return_ends_a_line_comment() {
+        assert_ne!(
+            hash("select 1 -- c\rselect 2;"),
+            hash("select 1 -- c\rselect 3;")
+        );
+        // A CRLF line break normalizes as before.
+        assert_eq!(normalize("select 1 -- c\r\nfrom t;"), "select 1 from t;");
+    }
+
+    // `u&'a'` is one Unicode-escape string; `u & 'a'` is column `u`
+    // bitwise-and a string.
+    #[test]
+    fn a_unicode_escape_string_is_not_an_and() {
+        assert_ne!(hash("SELECT u&'a' FROM t;"), hash("SELECT u & 'a' FROM t;"));
+        assert_ne!(
+            hash(r#"SELECT u&"a" FROM t;"#),
+            hash(r#"SELECT u & "a" FROM t;"#)
+        );
+        // The literal itself normalizes as it always did: stored hashes of
+        // migrations using it stay valid.
+        assert_eq!(
+            normalize(r"SELECT U&'d\0061t' UESCAPE '\' FROM t;"),
+            r"select u&'d\0061t' uescape '\' from t;"
+        );
+        // However `u` and `&` are spaced, they are two tokens.
+        assert_eq!(normalize("SELECT u &'a' FROM t;"), "select u& 'a' from t;");
+        assert_eq!(
+            normalize("SELECT u&/**/'a' FROM t;"),
+            "select u& 'a' from t;"
+        );
+        // `au`, `&&`: no Unicode prefix to keep apart from.
+        assert_eq!(
+            normalize("SELECT au & 'a' FROM t;"),
+            "select au&'a' from t;"
+        );
+        assert_eq!(
+            normalize("SELECT u && 'a' FROM t;"),
+            "select u&&'a' from t;"
+        );
     }
 
     /// Both runners hash the normalized text's UTF-8 bytes: a non-ASCII

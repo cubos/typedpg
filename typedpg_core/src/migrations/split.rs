@@ -30,9 +30,7 @@ pub fn split_statements(sql: &str) -> Vec<&str> {
         let b = bytes[i];
         match b {
             b'-' if bytes.get(i + 1) == Some(&b'-') => {
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
-                }
+                i = skip_line_comment(bytes, i);
                 continue;
             }
             b'/' if bytes.get(i + 1) == Some(&b'*') => {
@@ -167,6 +165,16 @@ pub(crate) fn skip_quoted(bytes: &[u8], open: usize, quote: u8, backslash: bool)
     bytes.len()
 }
 
+/// The index of the line break ending a `--` comment opened at `open`:
+/// scan.l's `non_newline` is `[^\n\r]`, so a lone CR ends it too.
+pub(crate) fn skip_line_comment(bytes: &[u8], open: usize) -> usize {
+    let mut i = open;
+    while i < bytes.len() && !matches!(bytes[i], b'\n' | b'\r') {
+        i += 1;
+    }
+    i
+}
+
 /// The index past a `/* … */` comment opened at `open`; they nest.
 pub(crate) fn skip_block_comment(bytes: &[u8], open: usize) -> usize {
     let mut depth = 0;
@@ -249,6 +257,18 @@ mod tests {
                 "INSERT INTO \"t;1\" VALUES ('a;''b', E'c\\';d');",
                 "/* x; /* nested; */ y; */ SELECT 2;"
             ]
+        );
+    }
+
+    // scan.l: `comment ("--"{non_newline}*)` with `non_newline [^\n\r]` — a
+    // lone CR ends the comment (`printf 'select 1 -- c\rselect 2;' | psql`
+    // is a syntax error at "2").
+    #[test]
+    fn a_carriage_return_ends_a_line_comment() {
+        assert_eq!(split("select 1 -- c\r;select 2;").len(), 2);
+        assert_eq!(
+            split("select 1 -- c\r\n;select 2; -- d;\r\n"),
+            ["select 1 -- c\r\n;", "select 2;"]
         );
     }
 

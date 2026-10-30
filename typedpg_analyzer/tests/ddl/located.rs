@@ -120,3 +120,16 @@ fn function_body_errors_point_at_the_statement() {
         "unexpected location:\n{rendered}"
     );
 }
+
+#[test]
+fn a_carriage_return_ends_a_line_comment() {
+    // scan.l's `non_newline` is `[^\n\r]`: a statement after a `--`
+    // comment ended by a lone CR starts right after the CR, and an error
+    // without a position of its own points there (not past the end).
+    let sql = "-- note\rCREATE FUNCTION f() RETURNS text LANGUAGE sql AS 'SELECT titel FROM posts';\n-- end\n";
+    let rendered = located_error(POSTS, "0005.sql", sql);
+    assert!(
+        rendered.contains("  --> 0005.sql:1:9\n"),
+        "unexpected location:\n{rendered}"
+    );
+}

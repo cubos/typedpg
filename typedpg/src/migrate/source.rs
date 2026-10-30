@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
+use typedpg_core::migration_marker::strip_bom;
 
 /// A single migration read from disk.
 ///
@@ -118,8 +119,9 @@ impl MigrationSource {
                 .unwrap_or("");
 
             if let Some(base_name) = file_name.strip_suffix(".down.sql") {
+                // Like the up file's, a BOM would be a syntax error.
                 let sql = std::fs::read_to_string(&entry_path)?;
-                down_files.insert(base_name.to_string(), sql);
+                down_files.insert(base_name.to_string(), strip_bom(&sql).to_owned());
             } else if file_name.ends_with(".sql") {
                 up_entries.push(entry);
             }
@@ -138,8 +140,7 @@ impl MigrationSource {
 
             // A file edited on Windows starts with a BOM, which PostgreSQL
             // rejects as a syntax error.
-            let sql = typedpg_core::migration_marker::strip_bom(&std::fs::read_to_string(&path)?)
-                .to_owned();
+            let sql = strip_bom(&std::fs::read_to_string(&path)?).to_owned();
             let no_transaction = has_no_transaction_marker(&sql);
 
             let down_sql = down_files.remove(file_stem);
@@ -223,12 +224,14 @@ impl MigrationSource {
             let synthetic_path = std::path::PathBuf::from(format!("{stem}.sql"));
             let version = typedpg_core::migrations::parse_migration_name(stem)
                 .map_err(|e| crate::Error::Migration(e.message(synthetic_path.display())))?;
+            // Embedded files carry their BOM too: strip it as `from_dir` does.
+            let up = strip_bom(up);
             let no_transaction = has_no_transaction_marker(up);
             migrations.push(Migration {
                 version: version.to_owned(),
                 name: stem.to_owned(),
                 sql: up.to_owned(),
-                down_sql: down.map(str::to_owned),
+                down_sql: down.map(|down| strip_bom(down).to_owned()),
                 no_transaction,
             });
         }
@@ -562,6 +565,54 @@ mod tests {
         )])
         .unwrap();
         assert!(source.migrations()[0].no_transaction);
+    }
+
+    // PostgreSQL rejects a BOM (`syntax error at or near "\u{feff}select"`);
+    // the analyzer and the npm runner strip it from up and down files alike.
+    #[test]
+    fn from_dir_strips_the_bom_of_a_down_file() {
+        let dir = create_temp_dir();
+        fs::write(
+            dir.path().join("0001_a.sql"),
+            "\u{feff}CREATE TABLE a (id int);",
+        )
+        .unwrap();
+        fs::write(dir.path().join("0001_a.down.sql"), "\u{feff}DROP TABLE a;").unwrap();
+        let source = MigrationSource::from_dir(dir.path()).unwrap();
+        let m = &source.migrations()[0];
+        assert_eq!(m.sql, "CREATE TABLE a (id int);");
+        assert_eq!(m.down_sql.as_deref(), Some("DROP TABLE a;"));
+    }
+
+    #[test]
+    fn from_embedded_strips_the_bom() {
+        let source = MigrationSource::from_embedded([(
+            "0001_a",
+            "\u{feff}-- no-transaction\nCREATE INDEX CONCURRENTLY i ON a (id);",
+            Some("\u{feff}DROP INDEX i;"),
+        )])
+        .unwrap();
+        let m = &source.migrations()[0];
+        assert_eq!(
+            m.sql,
+            "-- no-transaction\nCREATE INDEX CONCURRENTLY i ON a (id);"
+        );
+        assert_eq!(m.down_sql.as_deref(), Some("DROP INDEX i;"));
+        assert!(m.no_transaction);
+    }
+
+    /// Only a leading BOM is a file's byte-order mark; elsewhere it is text.
+    #[test]
+    fn only_a_leading_bom_is_stripped() {
+        let source = MigrationSource::from_embedded([(
+            "0001_a",
+            "SELECT '\u{feff}';",
+            Some("SELECT '\u{feff}';"),
+        )])
+        .unwrap();
+        let m = &source.migrations()[0];
+        assert_eq!(m.sql, "SELECT '\u{feff}';");
+        assert_eq!(m.down_sql.as_deref(), Some("SELECT '\u{feff}';"));
     }
 
     #[test]

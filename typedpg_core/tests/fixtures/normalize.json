@@ -286,5 +286,41 @@
     "b": "çãoção",
     "same": false,
     "why": "non-ASCII characters are word class: `ção ção` is two words, `çãoção` one"
+  },
+  {
+    "a": "select 1 -- c\rselect 2;",
+    "b": "select 1 -- c\rselect 3;",
+    "same": false,
+    "why": "a lone CR ends a `--` comment, as scan.l's `non_newline` is `[^\\n\\r]`: what follows it is a statement"
+  },
+  {
+    "a": "select 1 -- c\r\nfrom t;",
+    "b": "select 1 -- c\nfrom t;",
+    "same": true,
+    "why": "a CRLF line break ends a comment like a LF one"
+  },
+  {
+    "a": "SELECT u&'a' FROM t;",
+    "b": "SELECT u & 'a' FROM t;",
+    "same": false,
+    "why": "`u&'a'` is one Unicode-escape string, `u & 'a'` the column `u` bitwise-and a string"
+  },
+  {
+    "a": "SELECT u&\"a\" FROM t;",
+    "b": "SELECT u & \"a\" FROM t;",
+    "same": false,
+    "why": "`u&\"a\"` is one Unicode-escape identifier, `u & \"a\"` an operator between two identifiers"
+  },
+  {
+    "a": "SELECT u &'a' FROM t;",
+    "b": "SELECT u& /* c */ 'a' FROM t;",
+    "same": true,
+    "why": "`u`, `&` and `'a'` are three tokens however they are spaced, unless `u&'` touch"
+  },
+  {
+    "a": "SELECT U&'a' FROM t;",
+    "b": "SELECT u&'a' FROM t;",
+    "same": true,
+    "why": "the `U&` prefix folds like a word"
   }
 ]

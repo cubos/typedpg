@@ -18,6 +18,16 @@ test("trailing comments are dropped", () => {
   assert.equal(stripTrailingJunk("SELECT 1 /* a note */ -- another"), "SELECT 1");
 });
 
+test("a carriage return ends a line comment", () => {
+  // scan.l's `non_newline` is `[^\n\r]`: what follows a lone CR is code,
+  // not the comment.
+  assert.equal(stripTrailingJunk("SELECT 1 -- a note\r, 2"), "SELECT 1 -- a note\r, 2");
+  assert.equal(stripTrailingJunk("SELECT 1 -- a note\r;"), "SELECT 1");
+  assert.equal(stripTrailingJunk("SELECT 1 -- a note\r"), "SELECT 1");
+  assert.equal(stripTrailingJunk("SELECT 1 -- a note\r\n"), "SELECT 1");
+  assert.equal(stripTrailingJunk("SELECT 1 -- a\r\n, 2 -- b\r"), "SELECT 1 -- a\r\n, 2");
+});
+
 test("a semicolon inside a literal is kept", () => {
   assert.equal(stripTrailingJunk("SELECT ';'"), "SELECT ';'");
   assert.equal(stripTrailingJunk("SELECT 'a; b'"), "SELECT 'a; b'");
