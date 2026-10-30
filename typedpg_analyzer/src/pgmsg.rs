@@ -595,18 +595,23 @@ pub(crate) fn no_on_conflict_arbiter(table: &str) -> RawError {
     )
 }
 
-/// `failed to find conversion function from unknown to text` — SQLSTATE
+/// `failed to find conversion function from unknown to <type>` — SQLSTATE
 /// XX000, raised by PG's `coerce_type` when an `unknown` value that is
-/// neither a literal nor a parameter must be coerced implicitly: a field
+/// neither a literal nor a parameter (`'a'::text::unknown`, a field
 /// selected from an anonymous record over an untyped literal,
-/// `(ROW(1, 'x')).f2`, used as an output column or an argument.
-pub(crate) fn unknown_field_not_coercible(target: &str, span: Option<SourceSpan>) -> RawError {
+/// `(ROW(1, 'x')).f2`) must be coerced where `find_coercion_pathway` finds
+/// no way: implicitly to anything, or to a type outside the string category.
+pub(crate) fn unknown_value_not_coercible(target: &str, span: Option<SourceSpan>) -> RawError {
     RawError::new(
         AnalyzeError::PgInternalError(format!(
             "failed to find conversion function from unknown to {target}"
         )),
         span,
-        Some("cast the field explicitly, e.g. `(r).f2::text`".into()),
+        Some(
+            "only a literal or a parameter of type unknown converts to any type; \
+             give the value a type before it becomes unknown, e.g. `'x'::text`"
+                .into(),
+        ),
     )
 }
 
@@ -1621,7 +1626,7 @@ mod tests {
             (duplicate_table_alias("u", None).kind, "42712"),
             (too_many_column_aliases("t", 1, 2).kind, "42P10"),
             (values_lists_length(2, 1, None).kind, "42601"),
-            (unknown_field_not_coercible("text", None).kind, "XX000"),
+            (unknown_value_not_coercible("text", None).kind, "XX000"),
             (no_on_conflict_arbiter("t").kind, "42P10"),
             (insert_non_default_into_generated("g", false).kind, "428C9"),
             (update_generated_to_non_default("g", true).kind, "428C9"),

@@ -967,7 +967,10 @@ fn analyze_insert_select(
     // cleanly. PG (transformInsertStmt) analyzes the SELECT first and only
     // then compares its *output* width — after `*` expansion and set
     // operations — with the target list.
-    let (sel_cols, _) = analyze_select_with_ctes(val_sel, snapshot, params, cte_scopes)?;
+    // (Its outputs are coerced to the target columns, not resolved first.)
+    let (sel_cols, _) = super::select::keeping_unknown_outputs(|| {
+        analyze_select_with_ctes(val_sel, snapshot, params, cte_scopes)
+    })?;
     let expected_len = insert_arity(tgt);
     if arity_mismatch(tgt, sel_cols.len(), expected_len) {
         return Err(insert_arity_error(
@@ -1035,6 +1038,22 @@ fn analyze_insert_select(
                     p.number, prev, target_oid, p.location, snapshot,
                 ));
             }
+            continue;
+        }
+        // A Var of the SELECT's `unknown` output that is no literal: only
+        // the I/O conversion to a string type assigns it.
+        if sel_col.unknown_value {
+            let fallback = protobuf::Node { node: None };
+            let node = match direct_targets.get(i).and_then(|t| t.node.as_ref()) {
+                Some(node::Node::ResTarget(rt)) => rt.val.as_deref(),
+                _ => None,
+            };
+            expr::unknown_value_coercion(
+                target_oid,
+                crate::coerce::CoercionContext::Assignment,
+                snapshot,
+                node.unwrap_or(&fallback),
+            )?;
             continue;
         }
         if sel_col.type_oid == oid::UNKNOWN || sel_col.type_oid == target_oid {

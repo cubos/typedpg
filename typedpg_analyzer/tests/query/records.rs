@@ -2640,6 +2640,34 @@ fn unknown_field_of_an_anonymous_record_is_not_coercible() {
     }
 }
 
+/// The field is an `unknown` value like any other that is no literal: a
+/// set operation's arm or an INSERT's SELECT keeps it unresolved, and an
+/// assignment or explicit cast converts it to a string type only.
+#[test]
+fn unknown_field_of_an_anonymous_record_converts_to_a_string_type_only() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE t (a int, b text);").unwrap();
+    for sql in [
+        "SELECT (ROW(1, 'x')).f2 AS a UNION SELECT 'y'",
+        "INSERT INTO t (b) SELECT (ROW(1, 'x')).f2",
+        "INSERT INTO t (b) VALUES ((ROW(1, 'x')).f2)",
+        "INSERT INTO t (a, b) SELECT (ROW(1, 'x')).*",
+        "UPDATE t SET b = (ROW(1, 'x')).f2",
+        "SELECT (ROW(1, 'x')).f2::varchar AS a",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    for (sql, target) in [
+        ("SELECT (ROW(1, 'x')).f2::int AS a", "integer"),
+        ("UPDATE t SET a = (ROW(1, 'x')).f2", "integer"),
+        ("INSERT INTO t (a) SELECT (ROW(1, 'x')).f2", "integer"),
+        ("SELECT * FROM (SELECT (ROW(1, 'x')).*) s", "text"),
+    ] {
+        let message = format!("failed to find conversion function from unknown to {target}");
+        assert_err_prefix!(db.analyze(sql), AnalyzeError::PgInternalError(_), &message);
+    }
+}
+
 #[test]
 fn whole_row_of_null_extended_side_is_nullable() {
     let mut db = PgCatalog::new().unwrap();

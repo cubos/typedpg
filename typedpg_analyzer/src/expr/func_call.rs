@@ -334,6 +334,8 @@ pub(crate) fn infer_func_call(
             builtin_array_elem_nullable(func, &resolved, &args)
         },
         refine,
+        // `unknownin(…)`: a call, no literal.
+        unknown_value: resolved.return_type_oid == oid::UNKNOWN,
     };
     // A call of a `LANGUAGE sql` function is its body over the arguments:
     // both what the call is said to be and what its body makes hold.

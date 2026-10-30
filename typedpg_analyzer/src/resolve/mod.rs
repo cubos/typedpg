@@ -1078,6 +1078,7 @@ fn analyze_raw_node_once(
                     elem_nullable: None,
                     refine: crate::refine::Refinement::NONE,
                     origin: None,
+                    unknown_value: false,
                 }],
                 None,
             )
@@ -1571,6 +1572,10 @@ pub(crate) struct RawColumn {
     pub refine: crate::refine::Refinement,
     /// The base-table column the value is passed through from, if any.
     pub origin: Option<crate::scope::Origin>,
+    /// An `unknown` output that is no literal nor parameter
+    /// ([`crate::expr::ExprType::unknown_value`]): resolving it as `text`
+    /// fails, see [`select::resolve_unknown_values`].
+    pub unknown_value: bool,
 }
 
 /// Return type for analyze_* functions: columns + optional pre-sorted params.

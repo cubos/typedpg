@@ -322,6 +322,16 @@ pub(crate) fn infer_type_cast(
         params.record(p.number, target_oid);
     }
 
+    // An `unknown` value that is no literal casts through I/O to a string
+    // type only, and passes through `unknown` itself and the pseudo-types
+    // coerce_type hands it to untouched.
+    if inner_type.unknown_value {
+        super::unknown_value_coercion(target_oid, CoercionContext::Explicit, snapshot, inner)?;
+        if target_oid == oid::UNKNOWN || crate::polymorphic::passes_operand_through(target_oid) {
+            return Ok(inner_type);
+        }
+    }
+
     // PG rejects an explicit cast with no legal path (e.g. boolean → double
     // precision) at parse time — `cannot cast type X to Y`. Mirror that, but
     // only after the inner expression's own type is known.
@@ -475,6 +485,8 @@ pub(crate) fn infer_type_cast(
     });
     Ok(ExprType {
         record_fields,
+        // A typed value cast to `unknown` (a CoerceViaIO) is no literal.
+        unknown_value: target_oid == oid::UNKNOWN && inner_type.type_oid != oid::UNKNOWN,
         ..ExprType::scalar_with_typmod(target_oid, nullable, written_typmod)
             .with_collation(state)
             .with_elem_nullable(elem_nullable)

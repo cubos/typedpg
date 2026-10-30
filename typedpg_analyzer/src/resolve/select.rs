@@ -91,6 +91,10 @@ pub(crate) fn resolve_unknown_outputs(
             continue;
         }
         col.type_oid = oid::TEXT;
+        // (Only a recursive CTE's non-recursive term, which keeps its
+        // unknowns, still has an `unknown` value here: analyzeCTETargetList
+        // labels its column text, no coercion runs.)
+        col.unknown_value = false;
         if direct
             && let Some(node::Node::ResTarget(rt)) = sel.target_list[i].node.as_ref()
             && let Some(node::Node::ParamRef(p)) = rt.val.as_deref().and_then(|v| v.node.as_ref())
@@ -148,6 +152,52 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
     })
 }
 
+thread_local! {
+    /// Whether the next query level analyzed keeps its `unknown` outputs
+    /// (see [`keeping_unknown_outputs`]).
+    static KEEP_UNKNOWN_OUTPUTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f`, which analyzes one query level, with PG's `p_resolve_unknowns`
+/// off for that level: a set-operation arm (transformSetOperationTree) and
+/// INSERT … SELECT's SELECT (transformInsertStmt) leave an `unknown` output
+/// to the coercion the set operation or the target column applies, instead
+/// of resolving it as `text`. Every level below resolves its own.
+pub(crate) fn keeping_unknown_outputs<T>(f: impl FnOnce() -> T) -> T {
+    let prev = KEEP_UNKNOWN_OUTPUTS.with(|k| k.replace(true));
+    let r = f();
+    KEEP_UNKNOWN_OUTPUTS.with(|k| k.set(prev));
+    r
+}
+
+/// PG's `resolveTargetListUnknowns` for an `unknown` output that is no
+/// literal nor parameter ([`RawColumn::unknown_value`]): its coercion to
+/// `text` fails (`SELECT 'a'::text::unknown`).
+pub(crate) fn resolve_unknown_values(
+    target_list: &[protobuf::Node],
+    columns: &[RawColumn],
+    snapshot: &PgCatalog,
+) -> Result<(), AnalyzeError> {
+    let Some(i) = columns.iter().position(|c| c.unknown_value) else {
+        return Ok(());
+    };
+    // The entry, when the select list has no `*` before it.
+    let fallback = protobuf::Node { node: None };
+    let node = (target_list.len() == columns.len())
+        .then(|| match target_list[i].node.as_ref() {
+            Some(node::Node::ResTarget(rt)) => rt.val.as_deref(),
+            _ => None,
+        })
+        .flatten()
+        .unwrap_or(&fallback);
+    expr::unknown_value_coercion(
+        oid::TEXT,
+        crate::coerce::CoercionContext::Implicit,
+        snapshot,
+        node,
+    )
+}
+
 fn analyze_select_here(
     sel: &protobuf::SelectStmt,
     snapshot: &PgCatalog,
@@ -158,6 +208,7 @@ fn analyze_select_here(
     shadowed_sources: &[crate::scope::TableSource],
 ) -> AnalyzeResult {
     let _level = QueryLevel::enter();
+    let resolve_unknowns = !KEEP_UNKNOWN_OUTPUTS.with(|k| k.replace(false));
     // Start with outer CTEs (from parent WITH clause).
     let mut cte_scopes: HashMap<String, Vec<ScopeColumn>> = outer_ctes.clone();
 
@@ -570,6 +621,9 @@ fn analyze_select_here(
         expr::Ctx::new(&scope, &null_ctx, snapshot),
         params,
     )?;
+    if resolve_unknowns {
+        resolve_unknown_values(&sel.target_list, &columns, snapshot)?;
+    }
 
     // `FOR UPDATE [OF …]` (and FOR SHARE / NO KEY UPDATE / KEY SHARE) —
     // PG checks it last in transformSelectStmt.
@@ -919,6 +973,30 @@ fn check_sort_group_keys(
             .map(|(n, u)| (KeyRef::Expr(n), Some(u), loc(n))),
     );
 
+    // addTargetToSortList / addTargetToGroupList resolve an `unknown` key
+    // as `text`, which fails for one that is no literal.
+    for (key, _, _) in &keys {
+        let node = match key {
+            KeyRef::Target(i) if columns.get(*i).is_some_and(|c| c.unknown_value) => {
+                target_expr(targets, *i)
+            }
+            KeyRef::Expr(n)
+                if expr::infer_expr(n, ctx, &mut params.clone(), TypeGoal::NONE)
+                    .is_ok_and(|t| t.unknown_value) =>
+            {
+                Some((*n).clone())
+            }
+            _ => None,
+        };
+        if let Some(node) = node {
+            expr::unknown_value_coercion(
+                oid::TEXT,
+                crate::coerce::CoercionContext::Implicit,
+                ctx.snapshot,
+                &node,
+            )?;
+        }
+    }
     let key_type = |key: &KeyRef<'_>| match key {
         KeyRef::Target(i) => columns.get(*i).map(|c| c.type_oid),
         KeyRef::Expr(n) => {

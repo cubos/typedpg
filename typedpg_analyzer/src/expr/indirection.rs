@@ -201,6 +201,9 @@ pub(super) fn resolve_composite_field(
             record_fields,
             elem_nullable: field.ty.elem_nullable,
             refine: field.ty.refine.clone(),
+            // A FieldSelect: an `unknown` field (over an untyped literal,
+            // `(ROW(1, 'x')).f2`) is no literal any more.
+            unknown_value: field.ty.type_oid == oid::UNKNOWN,
         });
     }
 

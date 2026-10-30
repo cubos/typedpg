@@ -100,7 +100,9 @@ pub(crate) fn analyze_cte(
                 body_ctes = analyze_with_clause(with, snapshot, params, &body_ctes, outer_sources)?;
             }
             check_set_op_member_locking(larg)?;
-            let (mut seed_cols, _) = analyze_body(larg, params, &body_ctes)?;
+            // Both terms are set-operation arms: they keep their unknowns.
+            let (mut seed_cols, _) =
+                keeping_unknown_outputs(|| analyze_body(larg, params, &body_ctes))?;
             // UNION [ALL] keeps a row of the non-recursive term.
             min_one_row = take_level_summary().min_one_row;
             // analyzeCTETargetList: a recursive CTE exposes an `unknown`
@@ -122,7 +124,8 @@ pub(crate) fn analyze_cte(
             );
 
             check_set_op_member_locking(rarg)?;
-            let (rec_cols, _) = analyze_body(rarg, params, &scopes_with_self)?;
+            let (rec_cols, _) =
+                keeping_unknown_outputs(|| analyze_body(rarg, params, &scopes_with_self))?;
             check_no_aggregates_in_recursive_term(rarg, snapshot)?;
             if seed_cols.len() != rec_cols.len() {
                 return Err(crate::pgmsg::set_op_column_count(
@@ -241,7 +244,8 @@ pub(crate) fn analyze_cte(
                     search_cycle.clone(),
                     owner_depth,
                 );
-                let (rec_cols, _) = analyze_body(rarg, params, &scopes)?;
+                let (rec_cols, _) =
+                    keeping_unknown_outputs(|| analyze_body(rarg, params, &scopes))?;
                 let mut next = merge(&rec_cols);
                 for ((n, c), widened) in next.iter_mut().zip(&columns).zip(&mut widened) {
                     *widened |= step >= 3 && n.refine != c.refine;

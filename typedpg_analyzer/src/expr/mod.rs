@@ -299,6 +299,13 @@ pub(crate) struct ExprType {
     pub elem_nullable: Option<bool>,
     /// What every non-NULL value is (see [`crate::refine`]).
     pub refine: crate::refine::Refinement,
+    /// An `unknown` value that is neither an untyped literal nor a
+    /// parameter — a cast to `unknown` (`'a'::text::unknown`), a field
+    /// selected from a record over a literal, `unknownin(…)`. PG's
+    /// `coerce_type` turns a literal or a parameter into any type, but such a
+    /// value only through `find_coercion_pathway`, which has no pg_cast entry
+    /// from `unknown`: see [`unknown_value_coercion`].
+    pub unknown_value: bool,
 }
 
 /// The row shape of a record value: its fields, and whether PostgreSQL
@@ -429,6 +436,7 @@ impl ExprType {
             record_fields: None,
             elem_nullable: None,
             refine: crate::refine::Refinement::NONE,
+            unknown_value: false,
         }
     }
 
@@ -445,6 +453,7 @@ impl ExprType {
             record_fields: None,
             elem_nullable: None,
             refine: crate::refine::Refinement::NONE,
+            unknown_value: false,
         }
     }
 
@@ -467,6 +476,24 @@ impl ExprType {
             record_fields: None,
             elem_nullable: None,
             refine: crate::refine::Refinement::NONE,
+            unknown_value: false,
+        }
+    }
+
+    /// [`unknown_value_coercion`] of this value, when it is an
+    /// [`Self::unknown_value`]: what a clause coercing its expression to
+    /// its type checks (`coerce_to_boolean` for a CHECK, a policy, …).
+    pub(crate) fn check_unknown_value_coercion(
+        &self,
+        target: PgTypeOid,
+        context: CoercionContext,
+        snapshot: &PgCatalog,
+        node: &protobuf::Node,
+    ) -> Result<(), AnalyzeError> {
+        if self.unknown_value {
+            unknown_value_coercion(target, context, snapshot, node)
+        } else {
+            Ok(())
         }
     }
 
@@ -1085,25 +1112,7 @@ fn infer_expr_unlocated(
                     .with_refine(refine),
             )
         }
-        node::Node::AIndirection(ind) => {
-            let t = infer_indirection(ind, ctx, params)?;
-            // PG's coerce_type can implicitly convert an `unknown` literal or
-            // parameter, but not an `unknown` field selected from an
-            // anonymous record; only an explicit cast (via I/O) works.
-            if t.type_oid == oid::UNKNOWN
-                && goal.has_expectation()
-                && goal.coercion != CoercionContext::Explicit
-            {
-                let target = crate::ddl::util::format_type_for_message(snapshot, goal.type_oid);
-                return Err(crate::pgmsg::unknown_field_not_coercible(
-                    &target,
-                    crate::error::node_location(node)
-                        .and_then(crate::error::SourceSpan::from_node_qname),
-                )
-                .finalize_implicit());
-            }
-            Ok(t)
-        }
+        node::Node::AIndirection(ind) => infer_indirection(ind, ctx, params),
         node::Node::AArrayExpr(arr) => infer_array_expr(arr, ctx, params),
         node::Node::RowExpr(row) => {
             // When the enclosing context expects a registered composite
@@ -1160,6 +1169,7 @@ fn infer_expr_unlocated(
                 record_fields: Some(fields.into()),
                 elem_nullable: None,
                 refine: crate::refine::Refinement::NONE,
+                unknown_value: false,
             })
         }
         node::Node::SetToDefault(d) => {
@@ -1263,6 +1273,7 @@ fn infer_expr_unlocated(
             // from the inner expression (PG's "explicit" derivation tier).
             return Ok(ExprType {
                 explicit_collation: resolved_collation.is_some(),
+                unknown_value: result.unknown_value,
                 ..ExprType::scalar_with_collation(
                     result.type_oid,
                     result.nullable,
@@ -1379,6 +1390,10 @@ fn infer_expr_unlocated(
         return coerce_record_to_complex(node, goal.type_oid, goal.coercion, ctx, params);
     }
 
+    if goal.has_expectation() && result.unknown_value {
+        unknown_value_coercion(goal.type_oid, goal.coercion, snapshot, node)?;
+    }
+
     // Verify result is compatible with the goal type. Pass the location
     // of the offending expression so a `TypeMismatch` carries a snippet.
     check_goal_compatibility(&result, &goal, snapshot, crate::error::node_location(node))?;
@@ -1386,12 +1401,44 @@ fn infer_expr_unlocated(
     Ok(result)
 }
 
+/// PG's `coerce_type` for an [`ExprType::unknown_value`] — an `unknown`
+/// value that is neither a literal nor a parameter — meeting `target` in
+/// `context`. Nothing happens for `unknown` itself, `"any"`, `anyelement`,
+/// `anynonarray`, `anycompatible` and `anycompatiblenonarray` (the value is
+/// passed as it is); any other target needs `find_coercion_pathway`, which
+/// knows no cast from `unknown` and takes only its I/O rule: assignment or
+/// an explicit cast to a string type (`INSERT INTO t (text_col) VALUES
+/// ('a'::text::unknown)`). Anything else fails to prepare with
+/// `failed to find conversion function from unknown to …` (XX000).
+pub(crate) fn unknown_value_coercion(
+    target: PgTypeOid,
+    context: CoercionContext,
+    snapshot: &PgCatalog,
+    node: &protobuf::Node,
+) -> Result<(), AnalyzeError> {
+    if target == oid::UNKNOWN
+        || crate::polymorphic::passes_operand_through(target)
+        || coerce::coercion_pathway(target, oid::UNKNOWN, context, snapshot).is_some()
+    {
+        return Ok(());
+    }
+    let span = crate::error::node_location(node).and_then(|loc| {
+        crate::error::SourceSpan::from_node_qname(loc)
+            .or_else(|| crate::error::SourceSpan::from_node_token(loc))
+    });
+    Err(crate::pgmsg::unknown_value_not_coercible(
+        &crate::ddl::util::format_type_for_message(snapshot, target),
+        span,
+    )
+    .finalize_implicit())
+}
+
 /// Filter for *speculative* re-inference sites (operator / CASE / COALESCE /
 /// function-argument back-fills): most failures there just mean the candidate
 /// goal didn't fit and are deliberately swallowed, but a literal-content
 /// rejection is exactly the error PG itself raises from that coercion, so it
 /// must survive — as must `coerce_type`'s failure on an `unknown` value
-/// that is no literal ([`crate::pgmsg::unknown_field_not_coercible`]).
+/// that is no literal ([`unknown_value_coercion`]).
 /// Returns `Err` only for those two.
 fn swallow_unless_literal<T>(r: Result<T, AnalyzeError>) -> Result<(), AnalyzeError> {
     match r {

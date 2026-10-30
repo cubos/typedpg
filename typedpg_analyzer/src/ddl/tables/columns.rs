@@ -1615,6 +1615,15 @@ fn recheck_dependents_of_retyped_column(
             &mut params,
             TypeGoal::NONE,
         )
+        .and_then(|r| {
+            r.check_unknown_value_coercion(
+                oid::BOOL,
+                crate::coerce::CoercionContext::Assignment,
+                interp,
+                expr,
+            )?;
+            Ok(r)
+        })
         .map_err(|e| DdlError::UnsupportedDdl(e.to_string()))?;
         if found.type_oid != oid::BOOL && found.type_oid != oid::UNKNOWN {
             return Err(DdlError::UnsupportedDdl(format!(

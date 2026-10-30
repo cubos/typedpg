@@ -194,6 +194,7 @@ pub(crate) fn resolve_target_list_explicit(
                     elem_nullable: col.elem_nullable,
                     refine: col.refine.clone(),
                     origin: col.origin.clone(),
+                    unknown_value: false,
                 });
             }
             continue;
@@ -208,7 +209,6 @@ pub(crate) fn resolve_target_list_explicit(
             )?
         {
             for (name, t) in fields {
-                unknown_field_output_check(val, t.type_oid)?;
                 explicit.push(t.explicit_collation);
                 columns.push(RawColumn {
                     name,
@@ -220,6 +220,8 @@ pub(crate) fn resolve_target_list_explicit(
                     refine: t.refine.clone(),
                     record_fields: t.record_fields,
                     origin: None,
+                    // Each a FieldSelect: an `unknown` one is no literal.
+                    unknown_value: t.type_oid == oid::UNKNOWN,
                 });
             }
             continue;
@@ -273,9 +275,6 @@ pub(crate) fn resolve_target_list_explicit(
         // subquery reconciliation a concrete type to compare against so
         // `SELECT 1 UNION SELECT 'x'` fails instead of silently coercing.
         let type_oid = expr::unknown_literal_as_text(Some(val), expr_type.type_oid);
-        if matches!(val.node.as_ref(), Some(node::Node::AIndirection(_))) {
-            unknown_field_output_check(val, type_oid)?;
-        }
 
         explicit.push(expr_type.explicit_collation);
         columns.push(RawColumn {
@@ -289,28 +288,11 @@ pub(crate) fn resolve_target_list_explicit(
             refine: expr_type.refine.clone(),
             // A plain column reference passes its column through as is.
             origin: scope.plain_column_ref(val).and_then(|c| c.origin.clone()),
+            unknown_value: expr_type.unknown_value,
         });
     }
 
     Ok((columns, explicit))
-}
-
-/// PG resolves an `unknown` output column to `text` (`resolveTargetListUnknowns`,
-/// or the set operation / INSERT target it feeds), which its `coerce_type`
-/// can't do for a field selected from an anonymous record over an untyped
-/// literal: `SELECT (ROW(1, 'x')).f2` fails to prepare.
-fn unknown_field_output_check(
-    val: &protobuf::Node,
-    type_oid: PgTypeOid,
-) -> Result<(), AnalyzeError> {
-    if type_oid != oid::UNKNOWN {
-        return Ok(());
-    }
-    Err(crate::pgmsg::unknown_field_not_coercible(
-        "text",
-        crate::error::node_location(val).and_then(crate::error::SourceSpan::from_node_qname),
-    )
-    .finalize_implicit())
 }
 
 /// Analyze a `VALUES (…), (…)` list. Each row must have the same arity;
@@ -347,6 +329,7 @@ pub(crate) fn analyze_values_lists(
     let mut column_types: Vec<Vec<PgTypeOid>> = vec![Vec::new(); arity];
     let mut column_typmods: Vec<Vec<Option<i32>>> = vec![Vec::new(); arity];
     let mut column_nullable: Vec<bool> = vec![false; arity];
+    let mut unknown_values: Vec<(usize, &protobuf::Node)> = Vec::new();
 
     for row in &rows {
         // PG (SQLSTATE 42601): every row must have the first row's arity.
@@ -363,6 +346,9 @@ pub(crate) fn analyze_values_lists(
             column_types[i].push(t.type_oid);
             column_typmods[i].push(t.typmod);
             column_nullable[i] |= t.nullable;
+            if t.unknown_value {
+                unknown_values.push((i, item));
+            }
         }
     }
 
@@ -412,6 +398,20 @@ pub(crate) fn analyze_values_lists(
         }
     }
 
+    // A column of `unknown` values only is text (select_common_type), and
+    // coerce_to_common_type converts a literal to it but no other `unknown`
+    // value. (A typed column's coercion is the back-fill below.)
+    for &(i, item) in &unknown_values {
+        if common[i] == oid::UNKNOWN {
+            expr::unknown_value_coercion(
+                oid::TEXT,
+                crate::coerce::CoercionContext::Implicit,
+                snapshot,
+                item,
+            )?;
+        }
+    }
+
     // Each cell is coerced to its column's common type, which may map a
     // value to NULL.
     for (i, types) in column_types.iter().enumerate() {
@@ -458,6 +458,7 @@ pub(crate) fn analyze_values_lists(
             elem_nullable: None,
             refine: crate::refine::Refinement::NONE,
             origin: None,
+            unknown_value: false,
         })
         .collect();
 

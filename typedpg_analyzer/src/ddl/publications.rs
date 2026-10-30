@@ -421,6 +421,14 @@ fn check_row_filter(
         return Ok(());
     };
     let result = result.map_err(unsupported)?;
+    result
+        .check_unknown_value_coercion(
+            crate::pg_catalog::oid::BOOL,
+            crate::coerce::CoercionContext::Assignment,
+            interp,
+            filter,
+        )
+        .map_err(unsupported)?;
     crate::clause::check_no_aggregates_or_windows(filter, interp, "WHERE").map_err(unsupported)?;
     crate::resolve::check_no_srf_in_clause(filter, interp, "WHERE").map_err(unsupported)?;
     // coerce_to_boolean.

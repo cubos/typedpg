@@ -45,25 +45,21 @@ pub(crate) fn analyze_set_operation(
     // can't see stay unreachable (PG's `invalid reference to FROM-clause
     // entry`).
     check_set_op_member_locking(left)?;
-    let (left_cols, _) = analyze_select_with_ctes_and_outer(
-        left,
-        snapshot,
-        params,
-        cte_scopes,
-        &[],
-        outer,
-        shadowed,
-    )?;
+    let (left_cols, _) = super::select::keeping_unknown_outputs(|| {
+        analyze_select_with_ctes_and_outer(left, snapshot, params, cte_scopes, &[], outer, shadowed)
+    })?;
     check_set_op_member_locking(right)?;
-    let (right_cols, _) = analyze_select_with_ctes_and_outer(
-        right,
-        snapshot,
-        params,
-        cte_scopes,
-        &[],
-        outer,
-        shadowed,
-    )?;
+    let (right_cols, _) = super::select::keeping_unknown_outputs(|| {
+        analyze_select_with_ctes_and_outer(
+            right,
+            snapshot,
+            params,
+            cte_scopes,
+            &[],
+            outer,
+            shadowed,
+        )
+    })?;
 
     // PG names the operation in both error messages below.
     let op_label = match protobuf::SetOperation::try_from(sel.op) {
@@ -285,6 +281,8 @@ pub(crate) fn analyze_set_operation(
                 _ => crate::refine::Refinement::either([&l.refine, &r.refine]),
             },
             origin: None,
+            // select_common_type: never `unknown`.
+            unknown_value: false,
         });
     }
 

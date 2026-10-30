@@ -1047,3 +1047,205 @@ fn literal_of_a_pseudo_type_without_input() {
         db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
 }
+
+/// A value cast to `unknown` (a CoerceViaIO, no literal) is not what an
+/// untyped literal is: PG's coerce_type reads a literal or a parameter as
+/// any type, but finds no conversion for such a value except the I/O one to
+/// a string type, on assignment or by an explicit cast. Every implicit use
+/// — an output column resolved as text, an operator or function argument,
+/// a branch of CASE, an element, a sort key, a clause's boolean — fails to
+/// prepare (XX000).
+#[test]
+fn a_value_cast_to_unknown_is_no_literal() {
+    let mut db = setup();
+    db.apply_sql("CREATE DOMAIN short_text AS text; CREATE TABLE notes (n short_text);")
+        .unwrap();
+    for (sql, target) in [
+        ("SELECT 'a'::text::unknown AS a", "text"),
+        ("SELECT NULL::text::unknown AS a", "text"),
+        ("SELECT name::unknown AS a FROM users", "text"),
+        ("SELECT 'a'::varchar::unknown AS a", "text"),
+        ("SELECT ('a'::text::unknown)::unknown AS a", "text"),
+        ("SELECT ('a'::text::unknown) COLLATE \"C\" AS a", "text"),
+        ("SELECT unknownin('a') AS a", "text"),
+        ("SELECT x FROM (SELECT 'a'::text::unknown AS x) s", "text"),
+        (
+            "WITH c AS (SELECT 'a'::text::unknown AS x) SELECT 1 AS a FROM c",
+            "text",
+        ),
+        ("SELECT EXISTS (SELECT 'a'::text::unknown) AS a", "text"),
+        ("SELECT (SELECT 'a'::text::unknown) AS a", "text"),
+        ("SELECT ARRAY(SELECT 'a'::text::unknown) AS a", "text"),
+        (
+            "SELECT 1 AS a FROM users WHERE name IN (SELECT 'a'::text::unknown)",
+            "text",
+        ),
+        ("VALUES ('a'::text::unknown)", "text"),
+        ("VALUES ('a'::text::unknown), ('b')", "text"),
+        ("VALUES (1), ('a'::text::unknown)", "integer"),
+        (
+            "SELECT 1 AS a FROM users WHERE name = 'a'::text::unknown",
+            "text",
+        ),
+        (
+            "SELECT 1 AS a FROM users WHERE age = 'a'::text::unknown",
+            "integer",
+        ),
+        ("SELECT 'a'::text::unknown = 'b' AS a", "text"),
+        ("SELECT 'a'::text::unknown || 'b' AS a", "text"),
+        ("SELECT 'a'::text::unknown BETWEEN 'a' AND 'b' AS a", "text"),
+        (
+            "SELECT 'a'::text::unknown IS DISTINCT FROM 'b' AS a",
+            "text",
+        ),
+        (
+            "SELECT 1 AS a FROM users WHERE 'x'::text::unknown IN ('a', 'b')",
+            "text",
+        ),
+        ("SELECT ('a'::text::unknown, 1) = ('a', 1) AS a", "text"),
+        ("SELECT length('a'::text::unknown) AS a", "text"),
+        ("SELECT max('a'::text::unknown) AS a", "text"),
+        (
+            "SELECT array_append(ARRAY['x'], 'a'::text::unknown) AS a",
+            "text",
+        ),
+        ("SELECT coalesce('a'::text::unknown, 'b') AS a", "text"),
+        ("SELECT NULLIF('a'::text::unknown, 'b') AS a", "text"),
+        ("SELECT GREATEST('a'::text::unknown, 'b') AS a", "text"),
+        (
+            "SELECT CASE WHEN true THEN 'a'::text::unknown END AS a",
+            "text",
+        ),
+        (
+            "SELECT CASE 'a'::text::unknown WHEN 'a' THEN 1 END AS a",
+            "text",
+        ),
+        ("SELECT ARRAY['a'::text::unknown] AS a", "text"),
+        ("SELECT 'a'::text::unknown IS DOCUMENT AS a", "xml"),
+        (
+            "SELECT 1 AS a FROM users WHERE 'a'::text::unknown",
+            "boolean",
+        ),
+        (
+            "SELECT 1 AS a FROM users LIMIT 'a'::text::unknown",
+            "bigint",
+        ),
+        (
+            "SELECT count(*) AS a FROM users GROUP BY 'a'::text::unknown",
+            "text",
+        ),
+        ("SELECT name FROM users ORDER BY 'a'::text::unknown", "text"),
+        (
+            "SELECT DISTINCT ON ('a'::text::unknown) name FROM users",
+            "text",
+        ),
+        ("SELECT count(DISTINCT 'a'::text::unknown) AS a", "text"),
+        (
+            "SELECT string_agg('x', ',' ORDER BY 'a'::text::unknown) AS a",
+            "text",
+        ),
+        (
+            "SELECT row_number() OVER (PARTITION BY 'a'::text::unknown) AS a",
+            "text",
+        ),
+        // Explicit casts: through I/O to a string type only.
+        ("SELECT 'a'::text::unknown::int AS a", "integer"),
+        ("SELECT 'a'::text::unknown::json AS a", "json"),
+        ("SELECT 'a'::text::unknown::\"char\" AS a", "\"char\""),
+        // Assignment: likewise.
+        (
+            "INSERT INTO users (id, age) VALUES (1, 'a'::text::unknown)",
+            "integer",
+        ),
+        (
+            "INSERT INTO users (id, age) SELECT 1, 'a'::text::unknown",
+            "integer",
+        ),
+        ("UPDATE users SET age = 'a'::text::unknown", "integer"),
+        // An INSERT's SELECT keeps its unknowns, not the levels below it, nor
+        // its sort keys.
+        (
+            "INSERT INTO users (id, name) SELECT 1, x FROM (SELECT 'a'::text::unknown AS x) s",
+            "text",
+        ),
+        (
+            "INSERT INTO users (id, name) SELECT 1, 'a'::text::unknown ORDER BY 2",
+            "text",
+        ),
+        (
+            "UPDATE users SET (name) = (SELECT 'a'::text::unknown)",
+            "text",
+        ),
+        (
+            "INSERT INTO users (id, name) VALUES (1, 'a') RETURNING 'a'::text::unknown",
+            "text",
+        ),
+        (
+            "WITH w AS (DELETE FROM users RETURNING name::unknown AS x) SELECT 1 AS a",
+            "text",
+        ),
+        // A set operation's arm keeps them too, but not its own ORDER BY.
+        (
+            "(SELECT 'a'::text::unknown ORDER BY 1) UNION SELECT 'b'",
+            "text",
+        ),
+    ] {
+        let message = format!("failed to find conversion function from unknown to {target}");
+        assert_err_prefix!(db.analyze(sql), AnalyzeError::PgInternalError(_), &message);
+    }
+    for sql in [
+        // A literal cast to `unknown` is still a literal.
+        "SELECT 'a'::unknown AS a",
+        "SELECT 'a'::unknown::unknown AS a",
+        "SELECT 1 AS a FROM users WHERE age = '1'::unknown::unknown::text::int",
+        // No coercion: IS NULL, `"any"` arguments, a row's field.
+        "SELECT 'a'::text::unknown IS NULL AS a",
+        "SELECT pg_typeof('a'::text::unknown) AS a",
+        "SELECT count('a'::text::unknown) AS a",
+        "SELECT format('%s', 'a'::text::unknown) AS a",
+        "SELECT concat('a'::text::unknown) AS a",
+        "SELECT num_nulls('a'::text::unknown) AS a",
+        "SELECT jsonb_build_object('k', 'a'::text::unknown) AS a",
+        "SELECT ROW('a'::text::unknown) AS a",
+        "SELECT ROW('a'::text::unknown)::text AS a",
+        "SELECT 'a'::text::unknown::anyelement IS NULL AS a",
+        // Explicit and assignment casts to a string type (or a domain over
+        // one).
+        "SELECT 'a'::text::unknown::text AS a",
+        "SELECT ('a'::text::unknown)::varchar(1) AS a",
+        "SELECT 'a'::text::unknown::name AS a",
+        "SELECT 'a'::text::unknown::bpchar AS a",
+        "SELECT 'a'::text::unknown::short_text AS a",
+        "INSERT INTO users (id, name) VALUES (1, 'a'::text::unknown)",
+        "INSERT INTO users (id, name) VALUES (1, 'a'::text::unknown), (2, 'b'::text::unknown)",
+        "INSERT INTO users (id, name) SELECT 1, 'a'::text::unknown",
+        "INSERT INTO users (id, name) SELECT 1, 'a'::text::unknown UNION SELECT 2, 'b'",
+        "INSERT INTO notes (n) VALUES ('a'::text::unknown)",
+        "INSERT INTO users (id, name) VALUES (1, 'a') ON CONFLICT (id) DO UPDATE SET name = 'z'::text::unknown",
+        "UPDATE users SET name = 'a'::text::unknown",
+        "UPDATE users SET (age, name) = (1, 'a'::text::unknown)",
+        "MERGE INTO users u USING (SELECT 1 AS k) s ON u.id = s.k \
+         WHEN MATCHED THEN UPDATE SET name = 'a'::text::unknown \
+         WHEN NOT MATCHED THEN INSERT (id, name) VALUES (s.k, 'a'::text::unknown)",
+        // A set operation's arm is not coerced at parse time (the planner
+        // may fold the value to a constant first).
+        "SELECT 'a'::text::unknown AS a UNION SELECT 'b'",
+        "SELECT 'a'::text::unknown AS a UNION SELECT 'b'::text::unknown",
+        "SELECT 1 AS a UNION SELECT name::unknown FROM users",
+        "SELECT 'a'::text::unknown AS a INTERSECT SELECT 1",
+        "SELECT x FROM (SELECT 'a'::text::unknown UNION SELECT 'b'::text) s(x)",
+        "WITH RECURSIVE c(x) AS (SELECT 'a'::text::unknown UNION ALL SELECT x FROM c WHERE false) \
+         SELECT x FROM c",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    // The set operation's column is select_common_type's.
+    for (sql, expected) in [
+        ("SELECT 'a'::text::unknown AS a UNION SELECT 'b'", text()),
+        ("SELECT 'a'::text::unknown AS a UNION SELECT 1", int4()),
+        ("SELECT 'a'::text::unknown::name AS a", name_ty()),
+    ] {
+        let s = db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        assert_eq!(s.columns[0].pg_type, expected, "{sql}");
+    }
+}

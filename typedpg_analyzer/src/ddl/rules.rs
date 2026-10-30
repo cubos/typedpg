@@ -434,6 +434,15 @@ fn check_rule_qual(
         &mut params,
         TypeGoal::NONE,
     )
+    .and_then(|r| {
+        r.check_unknown_value_coercion(
+            crate::pg_catalog::oid::BOOL,
+            crate::coerce::CoercionContext::Assignment,
+            interp,
+            qual,
+        )?;
+        Ok(r)
+    })
     .map_err(|e| DdlError::UnsupportedDdl(e.to_string()))?;
     let (bool_oid, unknown) = (
         crate::pg_catalog::oid::BOOL,
