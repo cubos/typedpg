@@ -10,7 +10,7 @@ authors.workspace = true
 description = "Typed PostgreSQL access with compile-time verification"
 keywords = ["postgres", "postgresql", "sql", "async", "type-safe"]
 categories = ["database"]
-readme = "README.md"
+readme = "../README.md"
 
 [features]
 default = ["deadpool"]
