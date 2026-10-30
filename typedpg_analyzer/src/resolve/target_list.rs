@@ -195,6 +195,7 @@ pub(crate) fn resolve_target_list_explicit(
                     typmod: col.typmod,
                     collation: col.collation,
                     no_collation: col.no_collation.then_some(crate::expr::NoCollation::Unset),
+                    planned: col.planned(),
                     record_fields: col.record_fields.clone(),
                     elem_nullable: col.elem_nullable,
                     refine: col.refine.clone(),
@@ -222,6 +223,12 @@ pub(crate) fn resolve_target_list_explicit(
                     typmod: t.typmod,
                     collation: t.collation,
                     no_collation: t.no_collation,
+                    // A FieldSelect keeps its collation when planned; a FROM
+                    // entry's column (a Var) may not.
+                    planned: match t.planned {
+                        crate::expr::Planned::Unknown => crate::expr::Planned::Unknown,
+                        _ => crate::expr::Planned::AsParsed,
+                    },
                     elem_nullable: t.elem_nullable,
                     refine: t.refine.clone(),
                     record_fields: t.record_fields,
@@ -290,6 +297,7 @@ pub(crate) fn resolve_target_list_explicit(
             typmod: expr_type.typmod,
             collation: expr_type.collation,
             no_collation: expr_type.no_collation,
+            planned: expr_type.planned,
             record_fields,
             elem_nullable: expr_type.elem_nullable,
             refine: expr_type.refine.clone(),
@@ -488,6 +496,16 @@ pub(crate) fn analyze_values_lists(
             no_collation: collations[i]
                 .missing
                 .map(|_| crate::expr::NoCollation::Unset),
+            planned: if column_exprs[i].len() == 1
+                && column_exprs[i]
+                    .iter()
+                    .any(|t| t.planned != crate::expr::Planned::AsParsed)
+            {
+                // A one-row VALUES in FROM is pulled up into its Vars.
+                crate::expr::Planned::Unknown
+            } else {
+                crate::expr::Planned::AsParsed
+            },
             record_fields: None,
             elem_nullable: None,
             refine: crate::refine::Refinement::NONE,

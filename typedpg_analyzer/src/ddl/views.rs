@@ -287,6 +287,31 @@ fn create_relation_as(
             "too many column names were specified".into(),
         ));
     }
+    // ExecCreateTableAs: a table created with data (or from EXECUTE, which
+    // always plans) takes its columns from the planned query — whose
+    // collations planning may have changed (see `Planned`); a materialized
+    // view, or WITH NO DATA, from the parsed one.
+    let is_execute = matches!(
+        query.and_then(|q| q.node.as_ref()),
+        Some(node::Node::ExecuteStmt(_))
+    );
+    if kind == RelKind::Table && (!into.skip_data || is_execute) {
+        for col in &mut resolved.columns {
+            match col.planned {
+                crate::expr::Planned::AsParsed => {}
+                // Whatever it may be, it may have one.
+                crate::expr::Planned::Unknown => col.no_collation = false,
+                crate::expr::Planned::Folded { collation, missing } => {
+                    col.no_collation = missing;
+                    col.collation = if missing {
+                        None
+                    } else {
+                        collation.or_else(|| interp_type_collation(interp, col.type_oid))
+                    };
+                }
+            }
+        }
+    }
     // intorel_startup / create_ctas_nodata: a collatable column needs a
     // collation.
     if let Some(col) = resolved.columns.iter().find(|c| c.no_collation) {
@@ -836,6 +861,8 @@ struct ResolvedColumn {
     /// Of a collatable type, the expression has no collation (see
     /// [`crate::resolve::RawColumn::no_collation`]).
     no_collation: bool,
+    /// What planning makes of the collation (see [`crate::expr::Planned`]).
+    planned: crate::expr::Planned,
 }
 
 #[derive(Default, Clone)]
@@ -910,6 +937,7 @@ fn resolve_view_with_params(
                     .collation
                     .or_else(|| interp_type_collation(snapshot, type_oid)),
                 no_collation: col.no_collation.is_some(),
+                planned: col.planned,
             }
         })
         .collect();

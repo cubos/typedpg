@@ -232,10 +232,12 @@ pub(crate) fn infer_coalesce(
         crate::nonnull::StrictNode::FloatFold,
         crate::nonnull::subst::folds_as_float(type_oid, snapshot),
     );
-    Ok(ExprType::scalar_with_typmod(type_oid, all_nullable, typmod)
+    let mut out = ExprType::scalar_with_typmod(type_oid, all_nullable, typmod)
         .with_collation(derive_collation(&args, type_oid, snapshot)?)
         .with_elem_nullable(branches_elem_nullable(&branches, type_oid, snapshot))
-        .with_refine(branches_refine(&branches, type_oid, snapshot)))
+        .with_refine(branches_refine(&branches, type_oid, snapshot));
+    out.planned = super::folding::coalesce_planned(expr, &args, type_oid, ctx);
+    Ok(out)
 }
 
 /// Coerce each branch of a CASE / COALESCE / GREATEST / … to the common
@@ -585,10 +587,18 @@ pub(crate) fn infer_case(
         .chain(results.iter())
         .map(|(n, t)| (*n, t))
         .collect();
-    Ok(
+    let mut out =
         ExprType::scalar_with_typmod(type_oid, nullable, agreed_typmod(&inputs, type_oid))
             .with_collation(collation)
             .with_elem_nullable(branches_elem_nullable(&branches, type_oid, snapshot))
-            .with_refine(branches_refine(&branches, type_oid, snapshot)),
-    )
+            .with_refine(branches_refine(&branches, type_oid, snapshot));
+    let result_types: Vec<ExprType> = results.iter().map(|(_, t)| t.clone()).collect();
+    out.planned = super::folding::case_planned(
+        expr,
+        &result_types,
+        default.as_ref().map(|(_, t)| t),
+        type_oid,
+        ctx,
+    );
+    Ok(out)
 }

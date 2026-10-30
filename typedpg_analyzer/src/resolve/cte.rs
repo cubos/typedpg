@@ -75,6 +75,7 @@ pub(crate) fn analyze_cte(
         typmod: rc.typmod,
         collation: rc.collation,
         no_collation: rc.no_collation.is_some(),
+        planned_unknown: rc.planned != crate::expr::Planned::AsParsed,
         record_fields: rc.record_fields,
         elem_nullable: rc.elem_nullable,
         refine: rc.refine.clone(),
@@ -252,6 +253,7 @@ pub(crate) fn analyze_cte(
                             typmod,
                             collation,
                             no_collation: s.no_collation.is_some(),
+                            planned_unknown: false,
                             table_alias: cte.ctename.clone(),
                             record_fields: crate::expr::merge_set_op_shapes(
                                 s.record_fields.as_ref(),
@@ -412,6 +414,7 @@ fn search_cycle_columns(
         typmod: None,
         collation: None,
         no_collation: false,
+        planned_unknown: false,
         record_fields: None,
         elem_nullable: None,
         refine: crate::refine::Refinement::NONE,

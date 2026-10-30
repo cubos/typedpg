@@ -476,10 +476,31 @@ pub(crate) fn infer_type_cast(
         coerce::is_complex(target_oid, snapshot)
             && snapshot.unwrap_domain(inner_type.type_oid) == snapshot.unwrap_domain(target_oid)
     });
+    // What planning makes of the cast's collation (see `Planned`): a cast
+    // to the type the value already has adds no node (the value's own
+    // shows through), a cast function in `LANGUAGE sql` may be inlined, a
+    // length coercion may be planned into a relabeling of its input
+    // (`varchar_support`), collated like that; any other node keeps its
+    // collation.
+    let planned = if inner_type.type_oid == target_oid
+        && written_typmod.is_none()
+        && inner_type.typmod.is_none()
+    {
+        inner_type.planned
+    } else if cast_func
+        .and_then(|f| snapshot.pg_proc.get(&f))
+        .is_some_and(|p| p.prolang == crate::pg_catalog::SQL_LANGUAGE)
+        || (written_typmod.is_some() && inner_type.planned != super::Planned::AsParsed)
+    {
+        super::Planned::Unknown
+    } else {
+        super::Planned::AsParsed
+    };
     Ok(ExprType {
         record_fields,
         // A typed value cast to `unknown` (a CoerceViaIO) is no literal.
         unknown_value: target_oid == oid::UNKNOWN && inner_type.type_oid != oid::UNKNOWN,
+        planned,
         ..ExprType::scalar_with_typmod(target_oid, nullable, written_typmod)
             .with_collation(state)
             .with_elem_nullable(elem_nullable)

@@ -226,6 +226,13 @@ pub(super) fn resolve_composite_field(
             // A field of a FROM entry's row is its column, a Var (PG's
             // ParseComplexProjection): none when the column has none.
             no_collation: field.ty.no_collation.map(|_| super::NoCollation::Unset),
+            // A FieldSelect keeps its collation when planned (it folds only
+            // into a field of that collation), but a FROM entry's column
+            // may not.
+            planned: match field.ty.planned {
+                super::Planned::Unknown => super::Planned::Unknown,
+                _ => super::Planned::AsParsed,
+            },
             record_fields,
             elem_nullable: field.ty.elem_nullable,
             refine: field.ty.refine.clone(),

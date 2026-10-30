@@ -504,6 +504,7 @@ pub(crate) fn generation_not_null(
             typmod: interp.effective_typmod(a.atttypid, a.atttypmod),
             collation: a.attcollation,
             no_collation: false,
+            planned_unknown: false,
             table_alias: relname.clone(),
             record_fields: None,
             elem_nullable: None,

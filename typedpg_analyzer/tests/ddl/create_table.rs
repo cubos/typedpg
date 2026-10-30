@@ -1189,6 +1189,171 @@ fn create_table_as_needs_a_derived_collation() {
 }
 
 #[test]
+fn create_table_as_with_data_takes_the_planned_collation() {
+    // PG 18 (ExecCreateTableAs): CREATE TABLE AS / SELECT INTO with data,
+    // and CREATE TABLE AS EXECUTE, take their columns from the *planned*
+    // query, where eval_const_expressions has replaced a CASE with constant
+    // conditions by the result it picks, a COALESCE by its leading
+    // constant, a sublink by a Param of the planned subquery's collation —
+    // and a node over them keeps its parsed collation. A view, a
+    // materialized view and WITH NO DATA read the parsed query.
+    let setup = r#"CREATE TABLE c1 (b text COLLATE "C", v varchar(20) COLLATE "C");
+                   CREATE TABLE c2 (b text COLLATE "POSIX");
+                   CREATE FUNCTION f(a text, b text) RETURNS text LANGUAGE sql AS 'SELECT a';"#;
+    let fold = "CASE WHEN true THEN c1.b ELSE c2.b END";
+    let no_collation =
+        |ty: &str| format!(r#"no collation was derived for column "x" with collatable type {ty}"#);
+    for (stmt, msg) in [
+        (
+            format!("CREATE TABLE t AS SELECT {fold} AS x FROM c1, c2 WITH NO DATA;"),
+            no_collation("text"),
+        ),
+        (
+            format!("CREATE MATERIALIZED VIEW t AS SELECT {fold} AS x FROM c1, c2;"),
+            no_collation("text"),
+        ),
+        (
+            format!("CREATE MATERIALIZED VIEW t AS SELECT {fold} AS x FROM c1, c2 WITH NO DATA;"),
+            no_collation("text"),
+        ),
+        (
+            format!("CREATE VIEW t AS SELECT {fold} AS x FROM c1, c2;"),
+            r#"could not determine which collation to use for view column "x""#.into(),
+        ),
+        // The folded CASE is a subquery's column that has none.
+        (
+            "CREATE TABLE t AS SELECT CASE WHEN true THEN s.b ELSE 'x' END AS x \
+             FROM (SELECT c1.b || c2.b AS b FROM c1, c2) s;"
+                .into(),
+            no_collation("text"),
+        ),
+        (
+            "CREATE TABLE t AS SELECT CASE WHEN true THEN s.b ELSE 'x' END AS x \
+             FROM (SELECT b FROM c1 UNION ALL SELECT b FROM c2) s;"
+                .into(),
+            no_collation("text"),
+        ),
+        // Conditions that aren't constant keep the CASE.
+        (
+            "CREATE TABLE t AS SELECT CASE WHEN c1.b = 'a' THEN c1.b WHEN true THEN c2.b END \
+             AS x FROM c1, c2;"
+                .into(),
+            no_collation("text"),
+        ),
+        (
+            "CREATE TABLE t AS SELECT CASE WHEN c1.b IS NULL THEN c1.b ELSE c2.b END AS x \
+             FROM c1, c2;"
+                .into(),
+            no_collation("text"),
+        ),
+        (
+            "CREATE TABLE t AS SELECT CASE WHEN length(c1.b) > 1 THEN c1.b ELSE c2.b END AS x \
+             FROM c1, c2;"
+                .into(),
+            no_collation("text"),
+        ),
+        (
+            "CREATE TABLE t AS SELECT CASE c1.b WHEN 'a' THEN c1.b ELSE c2.b END AS x \
+             FROM c1, c2;"
+                .into(),
+            no_collation("text"),
+        ),
+        // COALESCE stays unless a constant leads it.
+        (
+            "CREATE TABLE t AS SELECT COALESCE(NULL, c1.b, c2.b) AS x FROM c1, c2;".into(),
+            no_collation("text"),
+        ),
+        // A node over a folded one keeps its own collation.
+        (
+            "CREATE TABLE t AS SELECT COALESCE(NULL, c1.b) || c2.b AS x FROM c1, c2;".into(),
+            no_collation("text"),
+        ),
+        (
+            format!("CREATE TABLE t AS SELECT ({fold})::varchar AS x FROM c1, c2;"),
+            no_collation("character varying"),
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", &stmt)]).expect_err(&stmt);
+        assert!(err.to_string().starts_with(&msg), "{stmt}\n  got: {err}");
+    }
+    let db = build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            &format!(
+                r#"CREATE TABLE a1 AS SELECT {fold} AS x FROM c1, c2;
+                   CREATE TABLE a2 AS SELECT {fold} AS x FROM c1, c2 WITH DATA;
+                   SELECT {fold} AS x INTO a3 FROM c1, c2;
+                   PREPARE p AS SELECT {fold} AS x FROM c1, c2;
+                   CREATE TABLE a4 AS EXECUTE p WITH NO DATA;
+                   CREATE TABLE a5 AS SELECT CASE WHEN false THEN c1.b ELSE c2.b END AS x
+                                      FROM c1, c2;
+                   CREATE TABLE a6 AS SELECT CASE WHEN NULL THEN c1.b WHEN true THEN c2.b END AS x
+                                      FROM c1, c2;
+                   CREATE TABLE a7 AS SELECT CASE WHEN false THEN c1.b || c2.b END AS x
+                                      FROM c1, c2;
+                   CREATE TABLE a8 AS SELECT CASE WHEN false THEN c1.b ELSE 'x' END AS x FROM c1;
+                   CREATE TABLE a9 AS SELECT COALESCE('a', c1.b, c2.b) AS x FROM c1, c2;
+                   CREATE TABLE a10 AS SELECT COALESCE(NULL, 'a', c1.b) AS x FROM c1, c2;
+                   CREATE TABLE a11 AS SELECT ({fold})::text AS x FROM c1, c2;
+                   CREATE TABLE a12 AS SELECT (SELECT {fold} FROM c1, c2) AS x;
+                   CREATE TABLE a13 AS SELECT CASE WHEN true THEN c1.v ELSE c2.b END AS x
+                                       FROM c1, c2;
+                   CREATE TABLE a14 AS SELECT CASE WHEN NOT (false AND c1.b = 'a') THEN c1.b
+                                       ELSE c2.b END AS x FROM c1, c2;
+                   CREATE TABLE a15 AS SELECT CASE WHEN true THEN s.b ELSE 'x' END AS x
+                                       FROM (SELECT c1.b || c2.b AS b FROM c1, c2) s
+                                       WITH NO DATA;
+                   CREATE TABLE a16 AS SELECT CASE WHEN true OR c1.b = 'a' THEN c1.b ELSE c2.b END
+                                      AS x FROM c1, c2;
+                   CREATE TABLE a17 AS SELECT ARRAY(SELECT {fold} FROM c1, c2) AS x;"#
+            ),
+        ),
+    ]);
+    let collated = |c: &str| basic_with_collation("pg_catalog", "text", c);
+    for (table, ty) in [
+        ("a1", collated("C")),
+        ("a2", collated("C")),
+        ("a3", collated("C")),
+        ("a4", collated("C")),
+        ("a5", collated("POSIX")),
+        ("a6", collated("POSIX")),
+        ("a7", text()),
+        ("a8", text()),
+        ("a9", text()),
+        ("a10", text()),
+        ("a11", collated("C")),
+        ("a12", collated("C")),
+        ("a13", collated("C")),
+        ("a14", collated("C")),
+        ("a15", text()),
+        ("a16", collated("C")),
+    ] {
+        let info = db.analyze(&format!("SELECT x FROM {table}")).unwrap();
+        assert_cols(&info, vec![cn("x", ty)]);
+    }
+    let info = db.analyze("SELECT x FROM a17").unwrap();
+    assert_cols(&info, vec![cn("x", array_of(collated("C")))]);
+    // Where PG folds what the analyzer doesn't evaluate (`1 = 1`), a
+    // pulled-up subquery or CTE, an inlined SQL function: PG accepts these
+    // (collated "C"), and so does the analyzer.
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            &format!(
+                r#"CREATE TABLE b1 AS SELECT CASE WHEN 1 = 1 THEN c1.b ELSE c2.b END AS x
+                                      FROM c1, c2;
+                   CREATE TABLE b3 AS SELECT x FROM (SELECT {fold} AS x FROM c1, c2) s;
+                   CREATE TABLE b4 AS WITH s AS (SELECT {fold} AS x FROM c1, c2) SELECT x FROM s;
+                   CREATE TABLE b5 AS SELECT (s).x FROM (SELECT {fold} AS x FROM c1, c2) s;
+                   CREATE TABLE b6 AS SELECT f(c1.b, c2.b) AS x FROM c1, c2;"#
+            ),
+        ),
+    ]);
+}
+
+#[test]
 fn a_column_without_a_collation_stays_without_one() {
     // PG 18: a column with no collation (exprCollation InvalidOid) — two
     // conflicting implicit collations met, or a UNION ALL of them — is read

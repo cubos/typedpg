@@ -264,6 +264,7 @@ pub(crate) fn analyze_set_operation(
             typmod,
             collation,
             no_collation,
+            planned: crate::expr::Planned::AsParsed,
             record_fields,
             elem_nullable: match op_label {
                 "EXCEPT" | "INTERSECT" => l.elem_nullable,
@@ -306,6 +307,7 @@ fn set_operation_sort_and_limit(
             typmod: c.typmod,
             collation: c.collation,
             no_collation: c.no_collation.is_some(),
+            planned_unknown: false,
             table_alias: alias.clone(),
             record_fields: c.record_fields.clone(),
             elem_nullable: c.elem_nullable,

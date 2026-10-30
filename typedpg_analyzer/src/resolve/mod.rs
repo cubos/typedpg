@@ -1126,6 +1126,7 @@ fn analyze_raw_node_once(
                     typmod: None,
                     collation: None,
                     no_collation: None,
+                    planned: crate::expr::Planned::AsParsed,
                     record_fields: None,
                     elem_nullable: None,
                     refine: crate::refine::Refinement::NONE,
@@ -1623,6 +1624,9 @@ pub(crate) struct RawColumn {
     /// a subquery's column that has none. A table or view can't store such
     /// a column (`CheckAttributeType`).
     pub no_collation: Option<crate::expr::NoCollation>,
+    /// What planning makes of the column's collation (see
+    /// [`crate::expr::Planned`]).
+    pub planned: crate::expr::Planned,
     /// Named-field structure when this column holds a record. Sourced from
     /// SRF out_args, ROW constructors, or propagated through subqueries.
     /// Used both to surface `Type::AnonymousRecord` in the final output and

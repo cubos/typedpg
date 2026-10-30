@@ -1153,10 +1153,20 @@ fn infer_generic_binary_op(
                     crate::refine::of_builtin_call(p, &operands, snapshot)
                 })
                 .unwrap_or_default();
-            return Ok(ExprType::scalar(op.result_type_oid, nullable)
+            let mut out = ExprType::scalar(op.result_type_oid, nullable)
                 .with_collation(state)
                 .with_elem_nullable(elem_nullable)
-                .with_refine(refine));
+                .with_refine(refine);
+            // inline_function: an operator whose function is `LANGUAGE sql`
+            // may be replaced by the function's body when planned.
+            if op
+                .code
+                .and_then(|c| snapshot.pg_proc.get(&c))
+                .is_some_and(|p| p.prolang == crate::pg_catalog::SQL_LANGUAGE)
+            {
+                out.planned = super::Planned::Unknown;
+            }
+            return Ok(out);
         }
         crate::lookup::OperatorMatch::Ambiguous => {
             // PG (SQLSTATE 42725): `operator is not unique: <left> <op>

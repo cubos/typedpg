@@ -399,6 +399,7 @@ pub(crate) fn process_from_item(
                         typmod: rc.typmod,
                         collation: rc.collation,
                         no_collation: rc.no_collation.is_some(),
+                        planned_unknown: rc.planned != crate::expr::Planned::AsParsed,
                         record_fields: rc.record_fields,
                         elem_nullable: rc.elem_nullable,
                         refine: rc.refine.clone(),
@@ -685,6 +686,7 @@ fn process_range_function(
             typmod: None,
             collation: None,
             no_collation: false,
+            planned_unknown: false,
             record_fields: None,
             elem_nullable: None,
             refine: crate::refine::Refinement::NONE,
@@ -1591,6 +1593,7 @@ fn merge_using_columns(
             typmod,
             collation,
             no_collation,
+            planned_unknown: l.planned_unknown || r.planned_unknown,
             // Set by the caller once the source's alias is known.
             table_alias: String::new(),
             record_fields: None,
@@ -2106,6 +2109,12 @@ fn function_rte_columns(
             .iter()
             .zip(&resolved.arg_types)
             .all(|(&a, &d)| arg_ctx.coercion_is_strict(a, d));
+    // inline_set_returning_function: the planner may replace a SQL
+    // function's scan by its body, collated however that is.
+    let sql_function = snapshot
+        .pg_proc
+        .get(&resolved.oid)
+        .is_some_and(|p| p.prolang == crate::pg_catalog::SQL_LANGUAGE);
     rows.min_one_row |= resolved.schema == "pg_catalog"
         && name == "generate_series"
         && !func_call.func_variadic
@@ -2156,6 +2165,7 @@ fn function_rte_columns(
                 typmod: None,
                 collation: out_collation.0,
                 no_collation: out_collation.1,
+                planned_unknown: sql_function,
                 table_alias: alias.to_owned(),
                 record_fields: None,
                 elem_nullable: None,
@@ -2170,6 +2180,7 @@ fn function_rte_columns(
         alias,
         snapshot,
         whole_row,
+        sql_function,
     )? {
         return Ok(cols);
     }
@@ -2177,7 +2188,11 @@ fn function_rte_columns(
         if !has_coldeflist {
             return Err(crate::pgmsg::coldeflist_required().finalize_implicit());
         }
-        return coldeflist_columns(f.coldeflist, alias, snapshot);
+        let mut cols = coldeflist_columns(f.coldeflist, alias, snapshot)?;
+        for c in &mut cols {
+            c.planned_unknown = sql_function;
+        }
+        return Ok(cols);
     }
     if has_coldeflist {
         return Err(crate::pgmsg::coldeflist_only_for_record().finalize_implicit());
@@ -2220,6 +2235,7 @@ fn function_rte_columns(
         typmod: None,
         collation,
         no_collation,
+        planned_unknown: sql_function,
         record_fields: None,
         elem_nullable: None,
         // `generate_series` of finite bounds and step (see
@@ -2264,7 +2280,9 @@ fn expr_rte_columns(
     }
     let has_coldeflist = !f.coldeflist.is_empty();
     if let Some(cols) =
-        composite_rte_columns(value.type_oid, has_coldeflist, alias, snapshot, whole_row)?
+        // A Var over an expression keeps its parsed collation: only an
+        // inlined SQL function's scan is replaced by planning.
+        composite_rte_columns(value.type_oid, has_coldeflist, alias, snapshot, whole_row, false)?
     {
         return Ok(cols);
     }
@@ -2292,6 +2310,8 @@ fn expr_rte_columns(
         typmod: value.typmod,
         collation: value.collation,
         no_collation: value.no_collation.is_some(),
+        // A Var over the expression: planning doesn't replace it.
+        planned_unknown: false,
         record_fields: None,
         elem_nullable: value.elem_nullable,
         refine: value.refine,
@@ -2322,13 +2342,16 @@ fn noop_cast_of_call<'a>(
 /// A function RTE item returning a composite type — named, or a domain
 /// over one (TYPEFUNC_COMPOSITE / TYPEFUNC_COMPOSITE_DOMAIN): the type's
 /// attributes are its columns, and a column definition list is redundant.
-/// `None` for any other type.
+/// `None` for any other type. `planned_unknown`: planning may replace the
+/// scan (an inlined SQL function), collating its columns however the
+/// body does.
 fn composite_rte_columns(
     type_oid: PgTypeOid,
     has_coldeflist: bool,
     alias: &str,
     snapshot: &PgCatalog,
     whole_row: &mut crate::scope::WholeRow,
+    planned_unknown: bool,
 ) -> Result<Option<Vec<ScopeColumn>>, AnalyzeError> {
     let Some(typrelid) = snapshot
         .get_type(snapshot.unwrap_domain(type_oid))
@@ -2363,6 +2386,7 @@ fn composite_rte_columns(
                 typmod: snapshot.effective_typmod(f.atttypid, f.atttypmod),
                 collation: f.attcollation,
                 no_collation: false,
+                planned_unknown,
                 table_alias: alias.to_owned(),
                 record_fields: None,
                 elem_nullable: None,
@@ -2499,6 +2523,7 @@ fn coldeflist_columns(
             typmod: snapshot.effective_typmod(type_oid, typmod),
             collation: None,
             no_collation: false,
+            planned_unknown: false,
             table_alias: alias.to_owned(),
             record_fields: None,
             elem_nullable: None,
@@ -2866,6 +2891,7 @@ fn json_table_columns(
             typmod: snapshot.effective_typmod(type_oid, typmod),
             collation: None,
             no_collation: false,
+            planned_unknown: false,
             table_alias: alias.to_owned(),
             record_fields: None,
             elem_nullable: None,

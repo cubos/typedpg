@@ -297,6 +297,8 @@ pub(crate) struct ExprType {
     /// `exprCollation` is `InvalidOid`); `collation` is then `None`. See
     /// [`NoCollation`].
     pub no_collation: Option<NoCollation>,
+    /// What planning makes of this node's collation (see [`Planned`]).
+    pub planned: Planned,
     pub record_fields: Option<RecordShape>,
     /// For an array value, whether its elements can be NULL, where known
     /// (see [`crate::types::Type::Array`]); `None` otherwise.
@@ -438,6 +440,7 @@ impl ExprType {
             collation: None,
             explicit_collation: false,
             no_collation: None,
+            planned: Planned::AsParsed,
             record_fields: None,
             elem_nullable: None,
             refine: crate::refine::Refinement::NONE,
@@ -456,6 +459,7 @@ impl ExprType {
             collation: None,
             explicit_collation: false,
             no_collation: None,
+            planned: Planned::AsParsed,
             record_fields: None,
             elem_nullable: None,
             refine: crate::refine::Refinement::NONE,
@@ -480,6 +484,7 @@ impl ExprType {
             collation,
             explicit_collation: false,
             no_collation: None,
+            planned: Planned::AsParsed,
             record_fields: None,
             elem_nullable: None,
             refine: crate::refine::Refinement::NONE,
@@ -522,7 +527,20 @@ impl ExprType {
         self.collation = state.collation;
         self.explicit_collation = state.explicit;
         self.no_collation = state.missing;
+        self.planned = Planned::AsParsed;
         self
+    }
+
+    /// What a node the planner replaces with this value ends up with: the
+    /// collation this value has once planned.
+    pub(crate) fn planned_replacement(&self) -> Planned {
+        match self.planned {
+            Planned::AsParsed => Planned::Folded {
+                collation: self.collation,
+                missing: self.no_collation.is_some(),
+            },
+            other => other,
+        }
     }
 
     /// This value's own collation state, as a leaf node (`Var`, `Param`,
@@ -606,6 +624,34 @@ pub(crate) enum NoCollation {
         Option<crate::oid::PgCollationOid>,
         Option<crate::oid::PgCollationOid>,
     ),
+}
+
+/// What planning makes of a node's collation. CREATE TABLE AS and SELECT
+/// INTO with data (`intorel_startup`, createas.c) — unlike a view, a
+/// materialized view or WITH NO DATA, which read the parsed query — take
+/// their columns' collations from the *planned* query: by then
+/// `eval_const_expressions` has replaced a CASE whose conditions are
+/// constant by the result it picks (`CASE WHEN true THEN c1.b ELSE c2.b
+/// END` is `c1.b`, collated like it, although the CASE has no collation),
+/// subqueries have been pulled up into their Vars and SQL functions
+/// inlined. The planner never re-derives a node's collation, so only a
+/// node it replaces can change.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Planned {
+    /// Planning keeps the node, and the collation parse analysis gave it.
+    #[default]
+    AsParsed,
+    /// Planning may replace the node by one whose collation the analyzer
+    /// doesn't know (a pulled-up subquery's expression it folds, an inlined
+    /// SQL function's body, a condition PG may fold that the analyzer
+    /// can't evaluate).
+    Unknown,
+    /// Planning replaces the node by one with this collation (`None` for
+    /// its type's default), or none at all (`missing`).
+    Folded {
+        collation: Option<crate::oid::PgCollationOid>,
+        missing: bool,
+    },
 }
 
 /// The collation state [`derive_collation`] assigns a node: its collation
@@ -1045,7 +1091,7 @@ fn infer_expr_unlocated(
         .as_ref()
         .ok_or_else(|| AnalyzeError::Unsupported("empty node".into()))?;
 
-    let result = match inner {
+    let mut result = match inner {
         node::Node::ColumnRef(col_ref) => infer_column_ref(col_ref, ctx, params),
         node::Node::AConst(a_const) => infer_a_const(a_const),
         node::Node::TypeCast(cast) => match passthrough_cast_operand(node, snapshot, params) {
@@ -1279,6 +1325,7 @@ fn infer_expr_unlocated(
                 collation: None,
                 explicit_collation: false,
                 no_collation: None,
+                planned: Planned::AsParsed,
                 record_fields: Some(fields.into()),
                 elem_nullable: None,
                 refine: crate::refine::Refinement::NONE,
@@ -1464,6 +1511,7 @@ fn infer_expr_unlocated(
         )
         .finalize_implicit()),
     }?;
+    result.planned = planned_after(inner, result.planned);
 
     // PG runs the target type's input function on untyped string-literal
     // constants the moment a context coerces them to a concrete type
@@ -1547,6 +1595,35 @@ pub(crate) fn unknown_value_coercion(
         span,
     )
     .finalize_implicit())
+}
+
+/// What planning makes of the collation of a node of kind `inner`, given
+/// what its inference said (see [`Planned`]). Only a node the planner can
+/// replace — a CASE or COALESCE it folds, a Var of a pulled-up subquery, a
+/// sublink (its Param takes the planned subquery's collation), an inlined
+/// SQL function or operator, a cast that adds no node of its own (decided
+/// by `infer_type_cast`) — may change; every other node keeps the
+/// collation it was parsed with, whatever its inputs become, so what an
+/// inference copied from an input is dropped.
+fn planned_after(inner: &node::Node, inferred: Planned) -> Planned {
+    match inner {
+        node::Node::ColumnRef(_)
+        | node::Node::CaseExpr(_)
+        | node::Node::CoalesceExpr(_)
+        | node::Node::SubLink(_)
+        | node::Node::TypeCast(_)
+        | node::Node::NamedArgExpr(_) => inferred,
+        // A function or operator keeps its node unless it is inlined (a
+        // column in functional notation, `b(s)`, is a Var). A field of a
+        // FROM entry's row is its column, a Var.
+        node::Node::FuncCall(_) | node::Node::AExpr(_) | node::Node::AIndirection(_) => {
+            match inferred {
+                Planned::Unknown => Planned::Unknown,
+                _ => Planned::AsParsed,
+            }
+        }
+        _ => Planned::AsParsed,
+    }
 }
 
 /// Filter for *speculative* re-inference sites (operator / CASE / COALESCE /
@@ -2207,6 +2284,7 @@ pub(crate) fn unknown_literal_as_text(
 
 mod column_refs;
 mod conditional;
+mod folding;
 mod func_call;
 mod indirection;
 pub(crate) mod inline;
