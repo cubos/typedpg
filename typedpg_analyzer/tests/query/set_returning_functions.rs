@@ -373,7 +373,7 @@ fn unnamed_out_parameters_are_result_columns() {
 #[test]
 fn anyarray_returning_function_in_from_is_rejected() {
     let db = setup();
-    assert_analyze_err!(
+    assert_err_prefix!(
         db.analyze("SELECT * FROM array_in('{1,2,3}', 'int4'::regtype, -1)"),
         AnalyzeError::DatatypeMismatch(_),
         "function \"array_in\" in FROM has unsupported return type anyarray"
