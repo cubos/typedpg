@@ -593,7 +593,9 @@ fn merge_when_insert(
     };
     let lands_in = table_attrs
         .first()
-        .and_then(|a| crate::ddl::tables::partbound::route_row(snapshot, a.attrelid, &value_of))
+        .and_then(|a| {
+            crate::ddl::tables::partbound::route_row(snapshot, a.attrelid, &value_of).leaf()
+        })
         .and_then(|leaf| snapshot.pg_class.get(&leaf))
         .map_or(table_relname, |c| c.relname.as_str());
     for (i, val) in when.values.iter().enumerate() {

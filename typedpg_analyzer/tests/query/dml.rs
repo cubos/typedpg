@@ -576,9 +576,6 @@ fn not_null_violation_names_the_target_when_the_partition_is_unknown() {
         ("INSERT INTO hashed VALUES (1, NULL)", "hashed"),
         // A text key under a user's collation (PG routes it to collated_aaa).
         ("INSERT INTO collated VALUES ('aaa', NULL)", "collated"),
-        // A sub-partition no partition of which takes the row: PG reports
-        // `no partition of relation "errtst_part_2" found for row` first.
-        ("INSERT INTO errtst VALUES ('bbb', NULL, -5)", "errtst"),
         (
             "MERGE INTO errtst t USING (SELECT 1 k) s ON false \
              WHEN NOT MATCHED THEN INSERT (a, b) VALUES ($1, NULL)",
@@ -590,6 +587,150 @@ fn not_null_violation_names_the_target_when_the_partition_is_unknown() {
             AnalyzeError::Invalid(_),
             &not_null(relation)
         );
+    }
+}
+
+/// A VALUES row no partition takes fails every execution in
+/// ExecFindPartition (`no partition of relation "…" found for row`,
+/// 23514): rejected where the analyzer can tell, naming the partitioned
+/// table — the root or a sub-partition — whose partitions all refuse it.
+/// Routing comes after the row is built and before its NOT NULL checks.
+#[test]
+fn insert_row_no_partition_takes_is_rejected() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE errtst (a text, b text NOT NULL, c int) PARTITION BY LIST (a);
+         CREATE TABLE errtst_part_1 PARTITION OF errtst FOR VALUES IN ('aaa');
+         CREATE TABLE errtst_part_2 PARTITION OF errtst FOR VALUES IN ('bbb', NULL)
+             PARTITION BY RANGE (c);
+         CREATE TABLE errtst_part_2_lo PARTITION OF errtst_part_2 FOR VALUES FROM (0) TO (10);
+         CREATE TABLE errtst_default PARTITION OF errtst DEFAULT;
+         CREATE DOMAIN nn_text AS text NOT NULL;
+         CREATE TABLE nodef (a int, b text NOT NULL, d nn_text DEFAULT 'd')
+             PARTITION BY LIST (a);
+         CREATE TABLE nodef_1 PARTITION OF nodef FOR VALUES IN (1);
+         CREATE TABLE rng (a int, b int) PARTITION BY RANGE (a, b);
+         CREATE TABLE rng_1 PARTITION OF rng FOR VALUES FROM (0, 0) TO (10, 10);
+         CREATE TABLE dt (a date) PARTITION BY RANGE (a);
+         CREATE TABLE dt_1 PARTITION OF dt FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');",
+    )
+    .unwrap();
+    for (sql, relation) in [
+        // The sub-partition errtst_part_2 takes 'bbb', but none of its
+        // own partitions takes c = -5.
+        (
+            "INSERT INTO errtst VALUES ('bbb', 'x', -5)",
+            "errtst_part_2",
+        ),
+        // A NULL range key goes only to a default partition.
+        ("INSERT INTO errtst (b) VALUES ('x')", "errtst_part_2"),
+        ("INSERT INTO nodef VALUES (2, 'x')", "nodef"),
+        ("INSERT INTO nodef VALUES (NULL, 'x')", "nodef"),
+        ("INSERT INTO nodef (b) VALUES ('x')", "nodef"),
+        ("INSERT INTO nodef DEFAULT VALUES", "nodef"),
+        // Before the row's NULL into a NOT NULL column.
+        ("INSERT INTO nodef VALUES (2, NULL)", "nodef"),
+        // The second row is the first to fail.
+        ("INSERT INTO nodef VALUES (1, 'x'), (2, 'x')", "nodef"),
+        // ON CONFLICT doesn't save it: the row is routed first.
+        (
+            "INSERT INTO nodef VALUES (2, 'x') ON CONFLICT DO NOTHING",
+            "nodef",
+        ),
+        // Multi-column range bounds compare lexicographically.
+        ("INSERT INTO rng VALUES (10, 10)", "rng"),
+        ("INSERT INTO rng VALUES (-1, 5)", "rng"),
+        ("INSERT INTO rng VALUES (NULL, 1)", "rng"),
+        // Constant keys as PG folds and coerces them.
+        ("INSERT INTO nodef VALUES (1 + 1, 'x')", "nodef"),
+        ("INSERT INTO nodef VALUES (2.5, 'x')", "nodef"),
+        ("INSERT INTO dt VALUES ('2025-01-01')", "dt"),
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::CheckViolation(_),
+            &format!(r#"no partition of relation "{relation}" found for row"#)
+        );
+    }
+    // The row is built first: a NULL into a NOT NULL domain fails before
+    // routing.
+    assert_err_prefix!(
+        db.analyze("INSERT INTO nodef VALUES (2, 'x', NULL)"),
+        AnalyzeError::Invalid(_),
+        r#"domain nn_text does not allow null values"#
+    );
+    // A row a partition takes.
+    for sql in [
+        "INSERT INTO nodef VALUES (1, 'x')",
+        "INSERT INTO rng VALUES (10, 9)",
+        "INSERT INTO rng VALUES (0, 0)",
+        "INSERT INTO errtst VALUES ('bbb', 'x', 5)",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
+
+/// Where the analyzer can't tell that no partition takes the row — or the
+/// statement doesn't insert it every time — the INSERT stays accepted.
+#[test]
+fn insert_row_routing_uncertain_is_accepted() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE nodef (a int, b text) PARTITION BY LIST (a);
+         CREATE TABLE nodef_1 PARTITION OF nodef FOR VALUES IN (1);
+         CREATE TABLE keydef (a int DEFAULT 2, b text) PARTITION BY LIST (a);
+         CREATE TABLE keydef_1 PARTITION OF keydef FOR VALUES IN (1);
+         CREATE TABLE hashed (a int) PARTITION BY HASH (a);
+         CREATE TABLE hashed_0 PARTITION OF hashed FOR VALUES WITH (MODULUS 2, REMAINDER 0);
+         CREATE COLLATION user_c FROM \"C\";
+         CREATE TABLE collated (a text COLLATE user_c) PARTITION BY LIST (a);
+         CREATE TABLE collated_aaa PARTITION OF collated FOR VALUES IN ('aaa');
+         CREATE TABLE exprkey (a int) PARTITION BY LIST ((a + 1));
+         CREATE TABLE exprkey_1 PARTITION OF exprkey FOR VALUES IN (1);
+         CREATE TABLE sk (a int2) PARTITION BY LIST (a);
+         CREATE TABLE sk_1 PARTITION OF sk FOR VALUES IN (1);
+         CREATE TABLE bigk (a int8) PARTITION BY LIST (a);
+         CREATE TABLE bigk_1 PARTITION OF bigk FOR VALUES IN (1);
+         CREATE DOMAIN pos AS int CHECK (VALUE > 0);
+         CREATE TABLE dk (a pos) PARTITION BY LIST (a);
+         CREATE TABLE dk_1 PARTITION OF dk FOR VALUES IN (1);
+         CREATE TABLE tz (a timestamptz) PARTITION BY RANGE (a);
+         CREATE TABLE tz_1 PARTITION OF tz FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+         CREATE TABLE ruled (a int) PARTITION BY LIST (a);
+         CREATE TABLE ruled_1 PARTITION OF ruled FOR VALUES IN (1);
+         CREATE TABLE sink (a int);
+         CREATE RULE r AS ON INSERT TO ruled DO INSTEAD INSERT INTO sink VALUES (NEW.a);",
+    )
+    .unwrap();
+    for sql in [
+        // A parameter key: the partition depends on its value.
+        "INSERT INTO nodef VALUES ($1, 'x')",
+        // A key that is not a constant.
+        "INSERT INTO nodef VALUES (length('ab'), 'x')",
+        // A key out of its type's range: PG fails on that first.
+        "INSERT INTO sk VALUES (32767 + 1)",
+        "INSERT INTO bigk VALUES (2147483647 + 1)",
+        // A domain's CHECK may reject the key first.
+        "INSERT INTO dk VALUES (-5)",
+        // A timestamptz literal reads in the session's time zone.
+        "INSERT INTO tz VALUES ('2025-02-01')",
+        // A key left to a non-NULL default.
+        "INSERT INTO keydef (b) VALUES ('x')",
+        // INSERT … SELECT: the rows come from the query.
+        "INSERT INTO nodef SELECT 2, 'x'",
+        // HASH partitioning.
+        "INSERT INTO hashed VALUES (1)",
+        // A text key under a user's collation.
+        "INSERT INTO collated VALUES ('zzz')",
+        // An expression key.
+        "INSERT INTO exprkey VALUES (5)",
+        // A DO INSTEAD rule replaces the INSERT.
+        "INSERT INTO ruled VALUES (2)",
+        // MERGE inserts only for source rows matching nothing.
+        "MERGE INTO nodef t USING (SELECT 1 k) s ON false \
+         WHEN NOT MATCHED THEN INSERT VALUES (2, 'x')",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
 }
 

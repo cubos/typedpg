@@ -282,6 +282,10 @@ pub enum AnalyzeError {
     /// SQLSTATE 54023 (`too_many_arguments`).
     #[error("{0}")]
     TooManyArguments(String),
+
+    /// SQLSTATE 23514 (`check_violation`).
+    #[error("{0}")]
+    CheckViolation(String),
 }
 
 impl AnalyzeError {
@@ -333,6 +337,7 @@ impl AnalyzeError {
             TooManyColumns(_) => Some("54011"),
             StatementTooComplex(_) => Some("54001"),
             TooManyArguments(_) => Some("54023"),
+            CheckViolation(_) => Some("23514"),
             TypeMismatch { .. }
             | Invalid(_)
             | InvalidLiteral(_)
@@ -1356,6 +1361,7 @@ fn replace_message(e: AnalyzeError, rendered: String) -> AnalyzeError {
         AnalyzeError::TooManyColumns(_) => AnalyzeError::TooManyColumns(rendered),
         AnalyzeError::StatementTooComplex(_) => AnalyzeError::StatementTooComplex(rendered),
         AnalyzeError::TooManyArguments(_) => AnalyzeError::TooManyArguments(rendered),
+        AnalyzeError::CheckViolation(_) => AnalyzeError::CheckViolation(rendered),
         AnalyzeError::TypeMismatch {
             actual, expected, ..
         } => AnalyzeError::TypeMismatch {

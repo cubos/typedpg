@@ -463,6 +463,17 @@ pub(crate) fn row_comparison_operator_not_boolean(type_name: &str) -> AnalyzeErr
     ))
 }
 
+/// `no partition of relation "t" found for row` — SQLSTATE 23514
+/// (`ExecFindPartition`): `relname` is the partitioned table — the root or
+/// a sub-partition — none of whose partitions takes the row, unqualified
+/// and unquoted as PG's `RelationGetRelationName` renders it. PG's errdetail
+/// (`Partition key of the failing row contains …`) is not reproduced.
+pub(crate) fn no_partition_for_row(relname: &str) -> AnalyzeError {
+    AnalyzeError::CheckViolation(format!(
+        "no partition of relation \"{relname}\" found for row"
+    ))
+}
+
 /// `functions returning type "internal" cannot be called explicitly` (or
 /// `accepting`) — SQLSTATE 0A000 (`ParseFuncOrColumn`).
 pub(crate) fn internal_function_call(returning: bool, span: Option<SourceSpan>) -> RawError {
@@ -1834,6 +1845,7 @@ mod tests {
             (cannot_change_relation("sequence", "s").kind, "42809"),
             (any_all_operator_not_boolean(None).kind, "42809"),
             (row_comparison_operator_not_boolean("integer"), "42804"),
+            (no_partition_for_row("t"), "23514"),
             (internal_function_call(true, None).kind, "0A000"),
             (merge_when_system_column("xmin", None).kind, "42P10"),
             (merge_with_recursive().kind, "42601"),

@@ -234,7 +234,9 @@ fn handle_distinct_from(
     {
         // make_row_distinct_op: a pairwise `=` per column, ORed.
         let ops = row_pairwise_op("=", &l.args, &r.args, expr.location, ctx, params, |_| {
-            "IS DISTINCT FROM requires = operator to yield boolean".to_string()
+            AnalyzeError::DatatypeMismatch(
+                "IS DISTINCT FROM requires = operator to yield boolean".to_owned(),
+            )
         })?
         .1;
         nullable = ops.iter().flatten().any(|o| {
@@ -775,7 +777,7 @@ fn handle_row_row(
         expr.location,
         ctx,
         params,
-        |t| format!("row comparison operator must yield type boolean, not type {t}"),
+        crate::pgmsg::row_comparison_operator_not_boolean,
     )?;
     check_row_comparison_interpretation(ctx.snapshot, op_name, &ops, expr.location)?;
     Ok(Some(t))
@@ -784,8 +786,8 @@ fn handle_row_row(
 /// The pairwise core of `make_row_comparison_op` / `make_row_distinct_op`:
 /// equal arity (`unequal number of entries in row expressions`), at least
 /// one column (`cannot compare rows of zero length`), and each pair's
-/// operator resolved and required to return boolean (`not_bool` renders
-/// the construct's wording). The result is bool, nullable if any column is.
+/// operator resolved and required to return boolean (`not_bool` builds the
+/// construct's error from the offending type's name). The result is bool, nullable if any column is.
 pub(crate) fn row_pairwise_op(
     op_name: &str,
     largs: &[protobuf::Node],
@@ -793,7 +795,7 @@ pub(crate) fn row_pairwise_op(
     location: i32,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
-    not_bool: impl Fn(&str) -> String,
+    not_bool: impl Fn(&str) -> AnalyzeError,
 ) -> Result<(ExprType, Vec<Option<crate::lookup::ResolvedOperator>>), AnalyzeError> {
     let largs = expand_row_args(largs, ctx, params)?;
     let rargs = expand_row_args(rargs, ctx, params)?;
@@ -841,7 +843,7 @@ pub(crate) fn row_pairwise_op(
         };
         if t.type_oid != oid::BOOL {
             let name = crate::ddl::util::format_type_for_message(ctx.snapshot, t.type_oid);
-            return Err(AnalyzeError::DatatypeMismatch(not_bool(&name)));
+            return Err(not_bool(&name));
         }
         nullable |= t.nullable;
         ops.push(pair_operator(op_name, l, r, ctx, params));

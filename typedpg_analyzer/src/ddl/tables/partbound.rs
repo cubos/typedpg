@@ -1027,26 +1027,77 @@ pub(crate) fn bound_facts(
     }
 }
 
-/// The leaf partition ExecFindPartition routes a row inserted into
-/// `relid` to, through every level of sub-partitioning (`relid` itself
-/// when it is not partitioned) — where the analyzer can tell: each key a
-/// column whose value `value_of` gives (`Some(None)`: NULL), compared as
-/// the bounds are. `None` when it can't, and when no partition takes the
-/// row (ExecFindPartition's own error then).
+/// Where ExecFindPartition sends a row inserted into a relation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Route {
+    /// The leaf partition the row lands in (the relation itself when it is
+    /// not partitioned).
+    Leaf(PgClassOid),
+    /// No partition of this partitioned table (the root or a
+    /// sub-partition the row was routed to) takes the row:
+    /// `no partition of relation "…" found for row`.
+    NoPartition(PgClassOid),
+    /// The analyzer can't tell.
+    Unknown,
+}
+
+impl Route {
+    /// The leaf, when known.
+    pub(crate) fn leaf(self) -> Option<PgClassOid> {
+        match self {
+            Route::Leaf(oid) => Some(oid),
+            _ => None,
+        }
+    }
+}
+
+/// Where ExecFindPartition routes a row inserted into `relid`, through
+/// every level of sub-partitioning — where the analyzer can tell: each key
+/// a column whose value `value_of` gives (`Some(None)`: NULL), compared as
+/// the bounds are. No partition takes the row only when it was compared
+/// with every bound of its level and there is no default partition.
 pub(crate) fn route_row<'a>(
     interp: &PgCatalog,
     relid: PgClassOid,
     value_of: &dyn Fn(&str) -> Option<Option<&'a typedpg_pg_query::protobuf::Node>>,
-) -> Option<PgClassOid> {
+) -> Route {
+    route_row_opt(interp, relid, value_of).unwrap_or(Route::Unknown)
+}
+
+/// [`route_row`], `None` standing for [`Route::Unknown`].
+fn route_row_opt<'a>(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+    value_of: &dyn Fn(&str) -> Option<Option<&'a typedpg_pg_query::protobuf::Node>>,
+) -> Option<Route> {
     let Some(spec) = interp.partition_specs.get(&relid) else {
-        return Some(relid);
+        return Some(Route::Leaf(relid));
     };
     let mut row: Vec<Option<Datum>> = Vec::new();
     for key in &spec.keys {
         let value = match value_of(key.name.as_deref()?)? {
             None => None,
+            // A domain's CHECK may reject the value as the row is built,
+            // and a `timestamptz` literal without a zone reads in the
+            // session's TimeZone, which may not be the one the bounds were
+            // read in.
+            Some(_)
+                if interp.domain_has_checks(key.type_oid)
+                    || interp.unwrap_domain(key.type_oid)
+                        == crate::pg_catalog::oid::TIMESTAMPTZ =>
+            {
+                return None;
+            }
             Some(v) => match normalize(interp, v, key) {
                 Datum::Opaque => return None,
+                // Out of the key type's range: PG fails on that first
+                // (`integer out of range`).
+                Datum::Int(i)
+                    if !int_fits(interp.unwrap_domain(key.type_oid), i)
+                        || !folds_within_int4(v) =>
+                {
+                    return None;
+                }
                 // Equality of strings is byte equality under a deterministic
                 // collation — every built-in one; a user's may not be.
                 Datum::Text(_)
@@ -1112,10 +1163,44 @@ pub(crate) fn route_row<'a>(
     }
     let target = match found {
         Some(child) => child,
-        None if decided => default()?,
+        None if decided => match default() {
+            Some(child) => child,
+            // get_partition_for_tuple found no partition, and there is no
+            // default one to fall back on.
+            None => return Some(Route::NoPartition(relid)),
+        },
         None => return None,
     };
-    route_row(interp, target, value_of)
+    route_row_opt(interp, target, value_of)
+}
+
+/// Whether every operation of an integer constant expression `v` (see
+/// [`fold_integer`]) stays within `integer`'s range — the type of its
+/// literals' arithmetic, which overflows (`integer out of range`) past it.
+/// A plain constant does; so does anything that isn't arithmetic.
+fn folds_within_int4(v: &typedpg_pg_query::protobuf::Node) -> bool {
+    match v.node.as_ref() {
+        Some(node::Node::AExpr(e)) => {
+            fold_integer(v).is_some_and(|i| i32::try_from(i).is_ok())
+                && [e.lexpr.as_deref(), e.rexpr.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .all(folds_within_int4)
+        }
+        _ => true,
+    }
+}
+
+/// Whether integer `i` is a value of integer type `ty` (any other type:
+/// true — its values are not integers).
+fn int_fits(ty: PgTypeOid, i: i128) -> bool {
+    use crate::pg_catalog::oid;
+    match ty {
+        t if t == oid::INT2 => i16::try_from(i).is_ok(),
+        t if t == oid::INT4 => i32::try_from(i).is_ok(),
+        t if t == oid::INT8 => i64::try_from(i).is_ok(),
+        _ => true,
+    }
 }
 
 /// The partitions of `parent` in PartitionDesc order (partition_bounds_create):

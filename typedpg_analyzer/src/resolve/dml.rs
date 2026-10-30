@@ -82,10 +82,12 @@ pub(crate) fn analyze_insert_with_outer_ctes(
         }
     }
 
-    // DEFAULT VALUES: every column takes its default.
+    // DEFAULT VALUES: every column takes its default — a row that may
+    // still go to no partition.
     if ins.select_stmt.is_none()
         && let Some(v) = omitted_domain_nulls(&tgt, &[], snapshot)
             .into_iter()
+            .chain(row_relation(&tgt, &[], snapshot).1)
             .min_by_key(|v| v.order)
     {
         return Err(v.error);
@@ -675,7 +677,7 @@ fn analyze_insert_values(
     // attnum order (ExecConstraints) — omitted columns with no default
     // included — after any NOT NULL domain (checked while the row is
     // built).
-    let mut violation: Option<NullViolation> = None;
+    let mut violation: Option<RowViolation> = None;
     let mut first_len: Option<usize> = None;
     // What each row writes at each position (`None`: DEFAULT).
     let mut written: Vec<Vec<Option<ValueInfo>>> = Vec::new();
@@ -684,8 +686,8 @@ fn analyze_insert_values(
             continue;
         };
         let mut row_written: Vec<Option<ValueInfo>> = Vec::with_capacity(list.items.len());
-        let mut row_violations: Vec<NullViolation> = Vec::new();
-        let mut default_nulls: Vec<NullViolation> = Vec::new();
+        let mut row_violations: Vec<RowViolation> = Vec::new();
+        let mut default_nulls: Vec<RowViolation> = Vec::new();
         // transformInsertStmt: every row of a multi-row VALUES must be as
         // long as the first one, which already passed transformInsertRow's
         // arity check.
@@ -720,7 +722,8 @@ fn analyze_insert_values(
             expr::Ctx::new(&scope, &null_ctx, snapshot),
             params,
         );
-        let lands_in = row_relation(tgt, &list.items, snapshot);
+        let (lands_in, unrouted) = row_relation(tgt, &list.items, snapshot);
+        row_violations.extend(unrouted);
         for (i, val) in list.items.iter().enumerate() {
             let target_col = target_col_at(tgt, i);
             let target = target_at(tgt, i, expr::Ctx::new(&scope, &null_ctx, snapshot), params)?;
@@ -743,7 +746,7 @@ fn analyze_insert_values(
                 && !tgt.discards(tc)
                 && let Some(err) = null_assignment_error(tc, snapshot, &lands_in.1, "insert")
             {
-                row_violations.push(NullViolation::of(tc, snapshot, err, lands_in.0));
+                row_violations.push(RowViolation::of(tc, snapshot, err, lands_in.0));
             }
             // An explicit DEFAULT that is NULL competes like an omitted
             // column.
@@ -831,15 +834,17 @@ fn analyze_insert_values(
     }
 }
 
-/// A NULL a row of an INSERT would store into a NOT NULL column or domain.
-struct NullViolation {
+/// An error a row of an INSERT raises every time: a NULL it would store
+/// into a NOT NULL column or domain, or no partition taking it.
+struct RowViolation {
     /// When PG reports it: NOT NULL domains while the row is built, then
-    /// the columns' NOT NULL in attnum order.
+    /// routing (ExecFindPartition), then the columns' NOT NULL in attnum
+    /// order (ExecConstraints, on the partition the row landed in).
     order: (bool, i16),
     error: AnalyzeError,
 }
 
-impl NullViolation {
+impl RowViolation {
     /// Column `tc`'s violation, in the order of the relation `rel` the row
     /// lands in (a partition's columns may be ordered differently).
     fn of(
@@ -857,16 +862,29 @@ impl NullViolation {
             error,
         }
     }
+
+    /// No partition of `parent` takes the row: reported after the row is
+    /// built, before any column's NOT NULL.
+    fn no_partition(parent: crate::oid::PgClassOid, snapshot: &PgCatalog) -> Option<Self> {
+        let relname = &snapshot.pg_class.get(&parent)?.relname;
+        Some(Self {
+            order: (true, i16::MIN),
+            error: crate::pgmsg::no_partition_for_row(relname),
+        })
+    }
 }
 
-/// The relation a VALUES row is checked in, and its name: the partition
-/// ExecFindPartition routes it to when the target is partitioned and the
-/// analyzer can tell (see `partbound::route_row`), else the target itself.
+/// The relation a VALUES row (`items`; none for DEFAULT VALUES) is checked
+/// in, and its name: the partition ExecFindPartition routes it to when the
+/// target is partitioned and the analyzer can tell (see
+/// `partbound::route_row`), else the target itself. Plus the routing
+/// failure when the analyzer can tell no partition takes the row — unless
+/// a DO INSTEAD rule replaces the INSERT.
 fn row_relation(
     tgt: &InsertTarget,
     items: &[protobuf::Node],
     snapshot: &PgCatalog,
-) -> (crate::oid::PgClassOid, String) {
+) -> ((crate::oid::PgClassOid, String), Option<RowViolation>) {
     // A column's value in the row: given, or its default when that is NULL
     // (`Some(None)` for NULL); `None` when unknown.
     let value_of = |name: &str| -> Option<Option<&protobuf::Node>> {
@@ -883,10 +901,22 @@ fn row_relation(
             _ => null_default(c, snapshot).then_some(None),
         }
     };
-    crate::ddl::tables::partbound::route_row(snapshot, tgt.oid, &value_of)
+    use crate::ddl::tables::partbound::Route;
+    let route = crate::ddl::tables::partbound::route_row(snapshot, tgt.oid, &value_of);
+    let lands_in = route
+        .leaf()
         .filter(|&leaf| leaf != tgt.oid)
         .and_then(|leaf| Some((leaf, snapshot.pg_class.get(&leaf)?.relname.clone())))
-        .unwrap_or_else(|| (tgt.oid, tgt.relname.clone()))
+        .unwrap_or_else(|| (tgt.oid, tgt.relname.clone()));
+    let unrouted = match route {
+        Route::NoPartition(parent)
+            if !returning_rewritten(snapshot, tgt.oid, &[DmlEvent::Insert]) =>
+        {
+            RowViolation::no_partition(parent, snapshot)
+        }
+        _ => None,
+    };
+    (lands_in, unrouted)
 }
 
 /// Whether column `c`'s default is NULL: no DEFAULT, identity or
@@ -908,7 +938,7 @@ fn omitted_domain_nulls(
     tgt: &InsertTarget,
     items: &[protobuf::Node],
     snapshot: &PgCatalog,
-) -> Vec<NullViolation> {
+) -> Vec<RowViolation> {
     let is_table = snapshot.pg_class.get(&tgt.oid).is_some_and(|c| {
         matches!(
             c.relkind,
@@ -947,7 +977,7 @@ fn omitted_domain_nulls(
         .filter(|c| c.atthasdef || !snapshot.domain_has_default(c.atttypid))
         .filter_map(|c| {
             let msg = snapshot.domain_null_violation(c.atttypid)?;
-            Some(NullViolation {
+            Some(RowViolation {
                 order: (false, c.attnum),
                 error: AnalyzeError::Invalid(msg),
             })
@@ -961,12 +991,12 @@ fn null_default_violation(
     c: &crate::pg_catalog::PgAttribute,
     snapshot: &PgCatalog,
     lands_in: &(crate::oid::PgClassOid, String),
-) -> Option<NullViolation> {
+) -> Option<RowViolation> {
     if !(c.attnum > 0 && c.attnotnull && null_default(c, snapshot)) {
         return None;
     }
     null_assignment_error(c, snapshot, &lands_in.1, "insert")
-        .map(|e| NullViolation::of(c, snapshot, e, lands_in.0))
+        .map(|e| RowViolation::of(c, snapshot, e, lands_in.0))
 }
 
 /// The NOT NULL columns an INSERT row giving `given` values leaves to a
@@ -976,7 +1006,7 @@ fn omitted_not_null_columns(
     given: usize,
     snapshot: &PgCatalog,
     lands_in: &(crate::oid::PgClassOid, String),
-) -> Vec<NullViolation> {
+) -> Vec<RowViolation> {
     let provided: Vec<&str> = (0..given)
         .filter_map(|i| target_col_at(tgt, i).map(|c| c.attname.as_str()))
         .collect();

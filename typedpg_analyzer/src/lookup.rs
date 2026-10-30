@@ -250,6 +250,17 @@ impl PgCatalog {
             .any(|d| self.domain_defaults.contains(d))
     }
 
+    /// Whether a domain of `oid`'s chain has a CHECK constraint, which a
+    /// value coerced to it may fail.
+    pub(crate) fn domain_has_checks(&self, oid: PgTypeOid) -> bool {
+        self.domain_chain(oid).iter().any(|d| {
+            self.domain_constraints.get(d).is_some_and(|cs| {
+                cs.iter()
+                    .any(|c| c.kind == crate::ddl::types::DomainConstraintKind::Check)
+            })
+        })
+    }
+
     /// The error coercing a NULL to type `oid` raises: a domain of its
     /// chain is NOT NULL, or has a CHECK a NULL fails. The NOT NULL is
     /// checked first, then the CHECKs from the base domain out, by name
