@@ -59,7 +59,7 @@
     "pg": ">=8.11",
     "pg-copy-streams": ">=6",
     "pg-cursor": ">=2.10",
-    "postgres": ">=3.4 <4"
+    "postgres": ">=3.4 <5"
   },
   "peerDependenciesMeta": {
     "pg": { "optional": true },
