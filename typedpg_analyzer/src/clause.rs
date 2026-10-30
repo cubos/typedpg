@@ -326,9 +326,9 @@ fn type_has_operators(snapshot: &PgCatalog, t: PgTypeOid, equality: bool, depth:
     let Some(ty) = snapshot.get_type(t) else {
         return true;
     };
-    if ty.typcategory == crate::pg_catalog::TypCategory::Array
-        && let Some(elem) = ty.typelem
-    {
+    // `array_ops` takes any true array (`_record` included, which is no
+    // category-A type), then checks the element's own operators.
+    if let Some(elem) = crate::coerce::element_type(t, snapshot) {
         return type_has_operators(snapshot, elem, equality, depth + 1);
     }
     if ty.typtype == crate::pg_catalog::TypType::Composite

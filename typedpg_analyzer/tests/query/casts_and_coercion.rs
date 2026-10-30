@@ -97,6 +97,139 @@ fn cast_array_literal_to_int8_array() {
     assert_cols(&s, vec![c("xs", array_of(int8()))]);
 }
 
+#[test]
+fn user_defined_range_casts_to_its_multirange() {
+    // CREATE TYPE ... AS RANGE also creates the multirange and registers a
+    // range → multirange cast (`pg_cast`, castmethod 'f', explicit), backed
+    // by the multirange constructor taking one range.
+    let mut db = setup();
+    db.apply_sql(r#"CREATE TYPE textrange AS RANGE (subtype = text, collation = "C");"#)
+        .unwrap();
+    let s = db
+        .analyze("SELECT textrange('a', 'c')::textmultirange AS m")
+        .unwrap();
+    assert_eq!(
+        s.columns[0].pg_type.cast_name().unwrap(),
+        "public.textmultirange"
+    );
+    db.analyze("SELECT 'empty'::textrange::textmultirange")
+        .unwrap();
+    // The cast function is strict: a NULL range stays NULL.
+    let s = db
+        .analyze("SELECT NULL::textrange::textmultirange AS m")
+        .unwrap();
+    assert!(s.columns[0].nullable);
+    // Explicit only: no assignment cast.
+    db.apply_sql("CREATE TABLE spans (m textmultirange);")
+        .unwrap();
+    let err = db
+        .analyze("INSERT INTO spans VALUES (textrange('a', 'c'))")
+        .unwrap_err();
+    assert!(
+        err.to_string().starts_with(
+            "column \"m\" is of type textmultirange but expression is of type textrange"
+        ),
+        "{err}"
+    );
+    // The cast goes with the types: re-creating them doesn't collide.
+    db.apply_sql(
+        r#"DROP TABLE spans;
+           DROP TYPE textrange;
+           CREATE TYPE textrange AS RANGE (subtype = text, collation = "C");"#,
+    )
+    .unwrap();
+    db.analyze("SELECT textrange('a', 'c')::textmultirange")
+        .unwrap();
+}
+
+#[test]
+fn casts_to_polymorphic_pseudo_types_keep_the_operand_type() {
+    // coerce_type returns the operand of a cast to "any", anyelement,
+    // anynonarray, anycompatible or anycompatiblenonarray as it is; the
+    // array / range / multirange ones need an actual such value, relabeled
+    // from a domain to its base type. An untyped literal or parameter stays
+    // unknown (text) under the former, and fails the pseudo-type's input
+    // function (a literal) or takes the pseudo-type (a parameter) under
+    // the latter.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE DOMAIN ia AS int[];").unwrap();
+    let s = db
+        .analyze(
+            "SELECT 1::anyelement AS a, 1::\"any\" AS b, 1::anycompatible AS c, \
+                    'x'::text::anynonarray AS d, '1'::anyelement AS e, \
+                    NULL::anyelement AS f, ARRAY[1]::anyarray AS g, \
+                    '{1}'::ia::anyarray AS h, ARRAY[1]::anycompatiblearray AS i, \
+                    int4range(1, 2)::anyrange AS j",
+        )
+        .unwrap();
+    let got: Vec<_> = s
+        .columns
+        .iter()
+        .map(|c| c.pg_type.cast_name().unwrap())
+        .collect();
+    assert_eq!(
+        got,
+        [
+            "pg_catalog.int4",
+            "pg_catalog.int4",
+            "pg_catalog.int4",
+            "pg_catalog.text",
+            "pg_catalog.text",
+            "pg_catalog.text",
+            "pg_catalog.int4[]",
+            "pg_catalog.int4[]",
+            "pg_catalog.int4[]",
+            "pg_catalog.int4range",
+        ]
+    );
+    let s = db.analyze("SELECT $1::anyelement AS v").unwrap();
+    assert_eq!(s.params[0].pg_type, text());
+    assert_eq!(s.columns[0].pg_type, text());
+    let s = db.analyze("SELECT $1::int::anyelement AS v").unwrap();
+    assert_eq!(s.columns[0].pg_type, int4());
+    for (sql, msg) in [
+        (
+            "SELECT '{1}'::anyarray",
+            "cannot accept a value of type anyarray",
+        ),
+        (
+            "SELECT 'x'::anyrange",
+            "cannot accept a value of type anyrange",
+        ),
+        (
+            "SELECT 'x'::anycompatiblemultirange",
+            "cannot accept a value of type anycompatiblemultirange",
+        ),
+        (
+            "SELECT 'x'::trigger",
+            "cannot accept a value of type trigger",
+        ),
+        ("SELECT 'x'::anyenum", "cannot cast type unknown to anyenum"),
+        ("SELECT 1::anyarray", "cannot cast type integer to anyarray"),
+        // Nothing converts to or from `internal`, an untyped value included.
+        ("SELECT 1::internal", "cannot cast type integer to internal"),
+        (
+            "SELECT 'x'::internal",
+            "cannot cast type unknown to internal",
+        ),
+        (
+            "SELECT $1::internal",
+            "cannot cast type unknown to internal",
+        ),
+        (
+            "SELECT NULL::internal",
+            "cannot cast type unknown to internal",
+        ),
+    ] {
+        let err = db
+            .analyze(sql)
+            .err()
+            .unwrap_or_else(|| panic!("PG rejects `{sql}`"))
+            .to_string();
+        assert!(err.starts_with(msg), "`{sql}`: {err}");
+    }
+}
+
 // ── Cast inside a VALUES list projected from a subquery ──────────────────────
 
 #[test]

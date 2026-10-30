@@ -233,6 +233,291 @@ fn array_position_returns_int4() {
     assert_cols(&s, vec![cn("pos", int4())]);
 }
 
+// ── Arrays of records ────────────────────────────────────────────────────────
+
+#[test]
+fn arrays_of_records_match_anyarray() {
+    // `record[]` is an array type (`typelem` = record), so PG binds it to
+    // `anyarray` / `anycompatiblearray` like any other array; the element is
+    // `record` (pseudo-type, but a valid element of a polymorphic match).
+    let db = setup();
+    let q = "FROM (SELECT 1 AS a, 2 AS b) q";
+    for sql in [
+        format!("SELECT array_to_json(array_agg(q)) {q}"),
+        format!("SELECT array_to_json(array_agg(q), true) {q}"),
+        format!("SELECT array_dims(array_agg(q)) {q}"),
+        format!("SELECT cardinality(array_agg(q)) {q}"),
+        format!("SELECT unnest(array_agg(q)) {q}"),
+        format!("SELECT array_agg(q) || array_agg(q) {q}"),
+        format!("SELECT ROW(1, 2) || array_agg(q) {q}"),
+        "SELECT array_position(ids, (1, 1)) FROM (VALUES (ARRAY[(0, 0), (1, 1)])) AS f (ids)"
+            .to_string(),
+    ] {
+        db.analyze(&sql)
+            .unwrap_or_else(|e| panic!("PG accepts `{sql}`: {e}"));
+    }
+}
+
+#[test]
+fn arrays_of_records_resolve_like_other_arrays() {
+    let db = setup();
+    let q = "FROM (SELECT 1 AS a, 2 AS b) q";
+    for sql in [
+        format!("SELECT array(SELECT array_agg(q) {q})"),
+        format!("SELECT array_agg(q) {q} GROUP BY 1 = 1 ORDER BY array_agg(q)"),
+        "SELECT ids FROM (VALUES (ARRAY[(0, 0), (1, 1)])) AS f (ids) GROUP BY ids ORDER BY ids"
+            .to_string(),
+        format!("SELECT array_length(array_agg(q), 1), array_upper(array_agg(q), 1) {q}"),
+        format!("SELECT to_json(array_agg(q)) {q}"),
+        format!("SELECT array_append(array_agg(q), ROW(3, 4)) {q}"),
+        "SELECT array_fill(ROW(1, 2), ARRAY[2])".to_string(),
+    ] {
+        db.analyze(&sql)
+            .unwrap_or_else(|e| panic!("PG accepts `{sql}`: {e}"));
+    }
+    // A record itself is no array.
+    for (sql, msg) in [
+        (
+            "SELECT array_ndims(ROW(1, 2))",
+            "function array_ndims(record) does not exist",
+        ),
+        (
+            "SELECT unnest(ROW(1, 2))",
+            "function unnest(record) does not exist",
+        ),
+    ] {
+        let err = db.analyze(sql).unwrap_err().to_string();
+        assert!(err.starts_with(msg), "`{sql}`: {err}");
+    }
+}
+
+#[test]
+fn record_array_parameters_and_casts() {
+    // A `$N::record[]` (or a `$N` an array of rows types) is an array like
+    // any other: array functions, unnest, comparisons and `||` resolve. The
+    // parameter's type itself is checked against PG's Describe (`record[]`)
+    // by the pg_sanity oracle.
+    let db = setup();
+    for (sql, params, cols) in [
+        ("SELECT array_length($1::record[], 1)", 1, vec![int4()]),
+        (
+            "SELECT array_length(NULL::record[], 1), cardinality($1::record[])",
+            1,
+            vec![int4(), int4()],
+        ),
+        ("SELECT array_ndims($1::record[])", 1, vec![int4()]),
+        ("SELECT ARRAY[ROW(1, 2)] = $1", 1, vec![bool_ty()]),
+        ("SELECT ARRAY[ROW(1, 2)] < $1", 1, vec![bool_ty()]),
+        ("SELECT $1::record[] = $2", 2, vec![bool_ty()]),
+        (
+            "SELECT ARRAY[ROW(1, 2)] = ARRAY[ROW(1, 2)]",
+            0,
+            vec![bool_ty()],
+        ),
+        ("SELECT ROW(1, 2) = ANY($1::record[])", 1, vec![bool_ty()]),
+        (
+            "SELECT 1 FROM (SELECT unnest($1::record[])) s",
+            1,
+            vec![int4()],
+        ),
+    ] {
+        let s = db
+            .analyze(sql)
+            .unwrap_or_else(|e| panic!("PG accepts `{sql}`: {e}"));
+        assert_eq!(s.params.len(), params, "`{sql}`");
+        let got: Vec<_> = s.columns.iter().map(|c| c.pg_type.clone()).collect();
+        assert_eq!(got, cols, "`{sql}`");
+    }
+    for sql in [
+        "SELECT unnest($1::record[])",
+        "SELECT $1::record[]",
+        "SELECT '{}'::record[]",
+        "SELECT ARRAY[ROW(1, 2)] || $1",
+    ] {
+        db.analyze(sql)
+            .unwrap_or_else(|e| panic!("PG accepts `{sql}`: {e}"));
+    }
+    // unnest's rows are bare records: one column, whatever the lhs width,
+    // and FROM needs a column definition list.
+    for (sql, msg) in [
+        (
+            "SELECT ROW(1, 2) IN (SELECT unnest($1::record[]))",
+            "subquery has too few columns",
+        ),
+        (
+            "SELECT * FROM unnest($1::record[])",
+            "a column definition list is required for functions returning \"record\"",
+        ),
+    ] {
+        let err = db.analyze(sql).unwrap_err().to_string();
+        assert!(err.starts_with(msg), "`{sql}`: {err}");
+    }
+}
+
+#[test]
+fn casts_from_records_and_record_arrays_follow_can_coerce_type() {
+    // An explicit cast is PG's can_coerce_type under COERCION_EXPLICIT:
+    // nothing converts *from* `record[]` but the I/O conversion to a string
+    // type, `record` only to and from composites, and a row type only to
+    // the one it inherits from or is the typed table of. A `record` value
+    // converts to a composite only when its fields are known at parse time
+    // (coerce_record_to_complex): a ROW(...) or a whole-row reference.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE t (a int, b text);
+         CREATE TABLE u (x int);
+         CREATE TABLE child () INHERITS (t);
+         CREATE TYPE ct AS (a int, b text);
+         CREATE TABLE typed OF ct;",
+    )
+    .unwrap();
+    for (sql, msg) in [
+        (
+            "SELECT $1::record[]::record",
+            "cannot cast type record[] to record",
+        ),
+        (
+            "SELECT $1::record[]::t[]",
+            "cannot cast type record[] to t[]",
+        ),
+        (
+            "SELECT $1::record[]::int[]",
+            "cannot cast type record[] to integer[]",
+        ),
+        (
+            "SELECT ARRAY[ROW(1, 'a')]::record[]::t[]",
+            "cannot cast type record[] to t[]",
+        ),
+        (
+            "SELECT $1::int[]::record[]",
+            "cannot cast type integer[] to record[]",
+        ),
+        (
+            "SELECT $1::record::record[]",
+            "cannot cast type record to record[]",
+        ),
+        (
+            "SELECT $1::record::int",
+            "cannot cast type record to integer",
+        ),
+        (
+            "SELECT $1::int::record",
+            "cannot cast type integer to record",
+        ),
+        ("SELECT 1::record", "cannot cast type integer to record"),
+        ("SELECT $1::t::int", "cannot cast type t to integer"),
+        ("SELECT $1::t::u", "cannot cast type t to u"),
+        ("SELECT $1::ct::typed", "cannot cast type ct to typed"),
+        ("SELECT $1::child[]::t[]", "cannot cast type child[] to t[]"),
+        ("SELECT 1::unknown", "cannot cast type integer to unknown"),
+        ("SELECT 1::anyarray", "cannot cast type integer to anyarray"),
+        (
+            "SELECT ARRAY[1]::anynonarray",
+            "cannot cast type integer[] to anynonarray",
+        ),
+        // Elements of an ARRAY[...] cast to an array type are cast to its
+        // element type.
+        (
+            "SELECT ARRAY[ROW(1, 2)]::int[]",
+            "cannot cast type record to integer",
+        ),
+        (
+            "SELECT ARRAY[ROW(1, 2, 3)]::t[]",
+            "cannot cast type record to t",
+        ),
+        ("SELECT ARRAY[ROW(1)]::t[]", "cannot cast type record to t"),
+        (
+            "SELECT ARRAY[ROW(1, 2)]::u[]",
+            "cannot cast type record to u",
+        ),
+        (
+            "SELECT ARRAY[$1::record]::t[]",
+            "cannot cast type record to t",
+        ),
+        // A record whose fields aren't known at parse time.
+        ("SELECT $1::record::t", "cannot cast type record to t"),
+        ("SELECT NULL::record::t", "cannot cast type record to t"),
+        ("SELECT $1::text::record::t", "cannot cast type record to t"),
+        (
+            "SELECT (SELECT ROW(1, 'a'))::t",
+            "cannot cast type record to t",
+        ),
+        (
+            "SELECT r::t FROM (SELECT ROW(1, 'a') r) c",
+            "cannot cast type record to t",
+        ),
+    ] {
+        let err = db
+            .analyze(sql)
+            .err()
+            .unwrap_or_else(|| panic!("PG rejects `{sql}`"))
+            .to_string();
+        assert!(err.starts_with(msg), "`{sql}`: {err}");
+    }
+    for sql in [
+        "SELECT $1::record[]::text",
+        "SELECT $1::record[]::text[]",
+        "SELECT $1::record[]::record[]",
+        "SELECT $1::t[]::record[]",
+        "SELECT $1::t[]::text[]",
+        "SELECT ARRAY[$1::t]::record[]",
+        "SELECT ARRAY[ROW(1, 'a')]::record[]",
+        "SELECT ARRAY[ROW(1, 2)]::t[]",
+        "SELECT ARRAY[ARRAY[ROW(1, 'a')]]::t[]",
+        "SELECT ARRAY[s]::t[] FROM (SELECT 1, 'a') s",
+        "SELECT $1::text::record",
+        "SELECT $1::record::text",
+        "SELECT ROW(1, 'a')::record::t",
+        "SELECT s::t FROM (SELECT 1, 'a') s",
+        "SELECT (s.*)::t FROM (SELECT 1, 'a') s",
+        "WITH c AS (SELECT 1, 'a') SELECT c::t FROM c",
+        "SELECT $1::child::t",
+        "SELECT $1::typed::ct",
+        "SELECT $1::int2vector::int[]",
+        "SELECT 1::anyelement",
+        "SELECT '1'::anyelement",
+        "SELECT 1::\"any\"",
+        "SELECT ARRAY[1]::anyarray",
+    ] {
+        db.analyze(sql)
+            .unwrap_or_else(|e| panic!("PG accepts `{sql}`: {e}"));
+    }
+}
+
+#[test]
+fn search_depth_first_sequence_column_is_orderable() {
+    // SEARCH DEPTH FIRST adds a `record[]` path column; PG orders it with
+    // `array_ops` (`anyarray < anyarray`), comparing the records field by field.
+    let mut db = setup();
+    db.apply_sql("CREATE TABLE graph0 (f int, t int, label text);")
+        .unwrap();
+    let s = db
+        .analyze(
+            "WITH RECURSIVE sg(f, t, label) AS (
+                 SELECT * FROM graph0 g
+                 UNION ALL
+                 SELECT g.* FROM graph0 g, sg WHERE g.f = sg.t
+             ) SEARCH DEPTH FIRST BY f, t SET seq
+             SELECT * FROM sg ORDER BY seq",
+        )
+        .unwrap();
+    assert_eq!(s.columns.len(), 4);
+    // So is CYCLE's `record[]` path, and both group (`=`) as well.
+    let recursive = "WITH RECURSIVE sg(f, t, label) AS (
+             SELECT * FROM graph0 g
+             UNION ALL
+             SELECT g.* FROM graph0 g, sg WHERE g.f = sg.t
+         )";
+    for sql in [
+        format!("{recursive} CYCLE f, t SET is_cycle USING path SELECT * FROM sg ORDER BY path"),
+        format!("{recursive} SEARCH DEPTH FIRST BY f, t SET seq SELECT DISTINCT seq FROM sg"),
+        format!("{recursive} SEARCH BREADTH FIRST BY f, t SET seq SELECT * FROM sg ORDER BY seq"),
+    ] {
+        db.analyze(&sql)
+            .unwrap_or_else(|e| panic!("PG accepts `{sql}`: {e}"));
+    }
+}
+
 // ── unnest in the projection ─────────────────────────────────────────────────
 
 #[test]
@@ -249,6 +534,33 @@ fn unnest_in_select_list_int() {
     // `nums` is NOT NULL, but its elements may still be NULL (PG 18:
     // `unnest('{1,NULL}'::int[]) IS NULL` is true for the second row).
     assert_cols(&s, vec![cn("n", int4())]);
+}
+
+#[test]
+fn unnest_of_an_array_of_int2vector() {
+    // `int2vector` is itself a true array (of int2), but it has an array
+    // type, so `ARRAY(SELECT int2vector)` is `int2vector[]`
+    // (get_promoted_array_type), not a two-dimensional int2 array — and
+    // unnest yields int2vector values (which typedpg types as an int2
+    // array, as it does any int2vector), not their int2 elements.
+    let db = setup();
+    let s = db
+        .analyze("SELECT unnest(array(SELECT '11 22 33'::int2vector)) AS v")
+        .unwrap();
+    assert_cols(&s, vec![c("v", array_of(int2()))]);
+    let s = db
+        .analyze("SELECT array(SELECT '11 22 33'::int2vector) AS a")
+        .unwrap();
+    assert_cols(&s, vec![c("a", array_of(array_of(int2())))]);
+    let s = db
+        .analyze("SELECT unnest(array(SELECT '1 2'::oidvector)) AS v")
+        .unwrap();
+    assert_cols(&s, vec![c("v", array_of(oid_ty()))]);
+    // A real array column still makes a multidimensional array of itself.
+    let s = db
+        .analyze("SELECT array(SELECT nums FROM users) AS a")
+        .unwrap();
+    assert_cols(&s, vec![c("a", array_of(int4()))]);
 }
 
 // ── Slice extras ─────────────────────────────────────────────────────────────

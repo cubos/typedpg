@@ -221,9 +221,11 @@ pub(crate) fn infer_sublink(
             // `ARRAY(SELECT expr FROM …)` — returns an array of the subquery's
             // single output column. The array itself is always NOT NULL (an
             // empty result produces `{}`, not NULL), even though individual
-            // elements may be nullable. PG (transformSubLink): when the
-            // element is itself an array the result is that same array type
-            // (a multi-dimensional array), otherwise its array type.
+            // elements may be nullable. PG (`get_promoted_array_type`): the
+            // column's array type; failing that, when the column is itself
+            // an array, that same array type (a multi-dimensional array).
+            // `int2vector` / `oidvector` are true arrays that have an array
+            // type, so they get `int2vector[]` / `oidvector[]`.
             let mut array_oid = oid::UNKNOWN;
             let mut typmod = None;
             let mut collation = (None, false);
@@ -238,20 +240,18 @@ pub(crate) fn infer_sublink(
                 typmod = first.typmod;
                 collation = (first.collation, false);
                 let elem = first.type_oid;
-                let elem_is_array = snapshot
-                    .get_type(elem)
-                    .is_some_and(|t| t.typcategory == TypCategory::Array && t.typelem.is_some());
+                let elem_array = snapshot.array_type_of(elem);
                 // The elements are the column's values (or, for an array
                 // column, the multidimensional result's sub-arrays').
-                elem_nullable = (!elem_is_array).then_some(first.nullable);
-                array_oid = if elem_is_array {
-                    elem
-                } else {
-                    snapshot.array_type_of(elem).ok_or_else(|| {
-                        crate::pgmsg::no_array_type_for(&crate::ddl::util::format_type_for_message(
-                            snapshot, elem,
-                        ))
-                    })?
+                elem_nullable = elem_array.is_some().then_some(first.nullable);
+                array_oid = match elem_array {
+                    Some(array) => array,
+                    None if crate::coerce::element_type(elem, snapshot).is_some() => elem,
+                    None => {
+                        return Err(crate::pgmsg::no_array_type_for(
+                            &crate::ddl::util::format_type_for_message(snapshot, elem),
+                        ));
+                    }
                 };
             }
             Ok(ExprType::scalar_with_typmod(array_oid, false, typmod)

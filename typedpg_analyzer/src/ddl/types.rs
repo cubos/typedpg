@@ -1016,8 +1016,12 @@ pub fn create_range(interp: &mut PgCatalog, stmt: &CreateRangeStmt) -> Result<()
         (&mr_name, mr_nsoid, vec![oid], mr_oid, true, false),
         (&mr_name, mr_nsoid, vec![range_array], mr_oid, true, true),
     ];
+    let mut range_to_multirange = None;
     for (proname, pronamespace, proargtypes, prorettype, proisstrict, variadic) in constructors {
         let proc_oid = crate::oid::PgProcOid::from_nonzero(interp.alloc_oid()?);
+        if prorettype == mr_oid && proargtypes == [oid] {
+            range_to_multirange = Some(proc_oid);
+        }
         interp.insert_pg_proc(crate::pg_catalog::PgProc {
             oid: proc_oid,
             proname: proname.to_owned(),
@@ -1045,6 +1049,30 @@ pub fn create_range(interp: &mut PgCatalog, stmt: &CreateRangeStmt) -> Result<()
             prolang: crate::pg_catalog::INTERNAL_LANGUAGE,
         });
     }
+    // DefineRange: the explicit range → multirange cast, through the
+    // one-range constructor, internal to the types (CastCreate with
+    // DEPENDENCY_INTERNAL: it goes when they go).
+    let cast_oid = PgCastOid::from_nonzero(interp.alloc_oid()?);
+    interp.insert_pg_cast(PgCast {
+        oid: cast_oid,
+        castsource: oid,
+        casttarget: mr_oid,
+        castcontext: CastContext::Explicit,
+        castmethod: CastMethod::Function,
+        castfunc: range_to_multirange,
+    });
+    super::depend::record(
+        interp,
+        super::depend::ObjectAddress::cast(cast_oid),
+        range_to_multirange
+            .map(super::depend::ObjectAddress::proc)
+            .into_iter()
+            .chain([
+                super::depend::ObjectAddress::type_(oid),
+                super::depend::ObjectAddress::type_(mr_oid),
+            ]),
+        crate::pg_catalog::DepType::Internal,
+    );
     super::depend::record(
         interp,
         super::depend::ObjectAddress::type_(oid),

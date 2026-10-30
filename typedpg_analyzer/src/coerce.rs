@@ -62,14 +62,15 @@ pub(crate) fn type_category_preferred(
 }
 
 /// Element type of a *true* array type — PG's `get_element_type`, which
-/// requires `typelem` and the array subscript handler (category `A`: the
-/// `_foo` arrays plus `int2vector`/`oidvector`, but not `name` or `point`,
-/// whose `typelem` only drives raw subscripting).
+/// requires `typelem` and the array subscript handler: the category-`A`
+/// types (the `_foo` arrays plus `int2vector`/`oidvector`) and `_record`,
+/// a pseudo-type (category `P`) that is still its element's `typarray` —
+/// but not `name` or `point`, whose `typelem` only drives raw subscripting.
 pub(crate) fn element_type(t: PgTypeOid, snapshot: &PgCatalog) -> Option<PgTypeOid> {
-    snapshot
-        .get_type(t)
-        .filter(|ty| ty.typcategory == TypCategory::Array)
-        .and_then(|ty| ty.typelem)
+    let ty = snapshot.get_type(t)?;
+    let elem = ty.typelem?;
+    (ty.typcategory == TypCategory::Array || snapshot.array_type_of(elem) == Some(t))
+        .then_some(elem)
 }
 
 /// PG's `ISCOMPLEX` (`typeOrDomainTypeRelid`): a composite type, or a
@@ -146,21 +147,45 @@ pub(crate) fn coercion_pathway(
 }
 
 /// PG's `can_coerce_type` (parse_coerce.c) under `COERCION_IMPLICIT`: can
-/// every `inputs[i]` be coerced to `targets[i]`? Unknown inputs coerce to
-/// anything, `"any"` accepts anything, polymorphic targets are accepted
-/// position-wise and then cross-checked together by
-/// [`crate::polymorphic::check_generic_type_consistency`], and `record`
-/// relabels to and from composites.
+/// every `inputs[i]` be coerced to `targets[i]`? See [`can_coerce_types_in`].
 pub(crate) fn can_coerce_types(
     inputs: &[PgTypeOid],
     targets: &[PgTypeOid],
     snapshot: &PgCatalog,
 ) -> bool {
+    can_coerce_types_in(inputs, targets, CoercionContext::Implicit, snapshot)
+}
+
+/// PG's `can_coerce_type` (parse_coerce.c) under `context`. Unknown inputs
+/// coerce to anything, `"any"` accepts anything, polymorphic targets are
+/// accepted position-wise and then cross-checked together by
+/// [`crate::polymorphic::check_generic_type_consistency`], `internal`
+/// converts to and from nothing; otherwise a
+/// [`coercion_pathway`] is needed, except that `record` relabels to and
+/// from composites, an array of composites to `record[]`, and a row type to
+/// the row type of a table it inherits from or the type of its typed table.
+/// Nothing converts *from* `record[]` but the I/O conversion to a string
+/// type (`record[]` to `t[]` or to `record` is `cannot cast`).
+fn can_coerce_types_in(
+    inputs: &[PgTypeOid],
+    targets: &[PgTypeOid],
+    context: CoercionContext,
+    snapshot: &PgCatalog,
+) -> bool {
     const ANY: PgTypeOid = PgTypeOid::from_raw(2276);
     const RECORDARRAY: PgTypeOid = PgTypeOid::from_raw(2287);
+    const INTERNAL: PgTypeOid = PgTypeOid::from_raw(2281);
     let mut have_generics = false;
     for (&input, &target) in inputs.iter().zip(targets) {
-        if input == target || target == ANY {
+        if input == target {
+            continue;
+        }
+        // Nothing converts to or from `internal`, not even an untyped
+        // literal or parameter.
+        if input == INTERNAL || target == INTERNAL {
+            return false;
+        }
+        if target == ANY {
             continue;
         }
         if crate::polymorphic::is_polymorphic(target) {
@@ -168,18 +193,29 @@ pub(crate) fn can_coerce_types(
             continue;
         }
         if input == oid::UNKNOWN
-            || coercion_pathway(target, input, CoercionContext::Implicit, snapshot).is_some()
+            || coercion_pathway(target, input, context, snapshot).is_some()
             || (input == oid::RECORD && is_complex(target, snapshot))
             || (target == oid::RECORD && is_complex(input, snapshot))
             || (target == RECORDARRAY
                 && element_type(input, snapshot).is_some_and(|e| is_complex(e, snapshot)))
             || type_inherits_from(input, target, snapshot)
+            || type_is_of_typed_table(input, target, snapshot)
         {
             continue;
         }
         return false;
     }
     !have_generics || crate::polymorphic::check_generic_type_consistency(inputs, targets, snapshot)
+}
+
+/// PG's `typeIsOfTypedTable`: `reltype` is the row type of a typed table
+/// (`CREATE TABLE ... OF reloftype`).
+fn type_is_of_typed_table(reltype: PgTypeOid, reloftype: PgTypeOid, snapshot: &PgCatalog) -> bool {
+    snapshot
+        .get_type(reltype)
+        .and_then(|ty| ty.typrelid)
+        .and_then(|relid| snapshot.typed_tables.get(&relid))
+        == Some(&reloftype)
 }
 
 /// PG's `typeInheritsFrom`: `sub` is the row type of a table that inherits
@@ -264,77 +300,21 @@ pub(crate) fn verify_common_type_from_oids(
 }
 
 /// Whether an *explicit* cast (`x::T` / `CAST(x AS T)`) from `source` to
-/// `target` is legal, mirroring PostgreSQL's `can_coerce_type` under
-/// `COERCION_EXPLICIT`. Deliberately more permissive than [`can_coerce`]: in
-/// addition to any registered `pg_cast` entry, PG allows an explicit I/O cast
-/// whenever either side is a string-category type, and relabels freely between
-/// domains/base, composites/record, and element-castable arrays.
+/// `target` is legal: PG's `can_coerce_type` under `COERCION_EXPLICIT`,
+/// which `transformTypeCast` reports as `cannot cast type X to Y`. Beyond
+/// [`can_coerce`]'s paths this allows every `pg_cast` row and the I/O
+/// conversion from a string type.
 ///
-/// Errs toward allowing: it returns `false` only for clear-cut scalar
-/// refusals (e.g. `boolean → double precision`), so callers never reject a
-/// cast PG would have accepted.
+/// A `record` source passes for any composite target, as in PG; whether
+/// the value can actually be converted (only a `ROW(...)` or a whole-row
+/// reference can) is the caller's to check — see
+/// [`crate::expr::record_converts_to_complex`].
 pub(crate) fn can_cast_explicit(
     source: PgTypeOid,
     target: PgTypeOid,
     snapshot: &PgCatalog,
 ) -> bool {
-    if source == target {
-        return true;
-    }
-    let s = snapshot.unwrap_domain(source);
-    let t = snapshot.unwrap_domain(target);
-    if s == t {
-        return true;
-    }
-    // Untyped literals (`unknown`) coerce to anything; a pseudo `any`-style
-    // target accepts anything.
-    if s == oid::UNKNOWN || t == oid::UNKNOWN {
-        return true;
-    }
-    // Any registered cast — implicit, assignment, explicit, or
-    // binary-coercible — makes it legal (`cast_by_pair` is keyed by pair,
-    // independent of context).
-    if snapshot.cast_by_pair.contains_key(&(s, t)) {
-        return true;
-    }
-    let scat = snapshot.get_type(s).map(|ty| ty.typcategory);
-    let tcat = snapshot.get_type(t).map(|ty| ty.typcategory);
-    // Explicit I/O cast: PG allows casting to or from any string-category type.
-    if scat == Some(TypCategory::String) || tcat == Some(TypCategory::String) {
-        return true;
-    }
-    // Pseudo-types (incl. `record`, `any*`) and unknowns cast freely — they're
-    // resolved structurally and PG accepts almost anything to/from them.
-    let pseudo_or_unknown =
-        |cat: Option<TypCategory>| matches!(cat, Some(TypCategory::Pseudo | TypCategory::Unknown));
-    if pseudo_or_unknown(scat) || pseudo_or_unknown(tcat) {
-        return true;
-    }
-    // Casting *to* a composite is allowed from `record` (a pseudo source,
-    // handled above), a string type (handled above), or the row type of a
-    // table inheriting from the target's (`typeInheritsFrom`, a
-    // ConvertRowtypeExpr) — never from an unrelated composite or a scalar:
-    // `(u.*)::t` and `numeric::some_composite` are `cannot cast type X to
-    // Y` (can_coerce_type has no other composite rule and pg_cast no rows).
-    if tcat == Some(TypCategory::Composite) {
-        return scat == Some(TypCategory::Composite) && type_inherits_from(s, t, snapshot);
-    }
-    // A composite *source* to a non-composite target is rare; err toward
-    // allowing (composite→record/text are already covered above).
-    if scat == Some(TypCategory::Composite) {
-        return true;
-    }
-    // Array → array: legal when the element types are themselves castable.
-    if scat == Some(TypCategory::Array) && tcat == Some(TypCategory::Array) {
-        return match (
-            snapshot.get_type(s).and_then(|ty| ty.typelem),
-            snapshot.get_type(t).and_then(|ty| ty.typelem),
-        ) {
-            (Some(se), Some(te)) => can_cast_explicit(se, te, snapshot),
-            _ => true,
-        };
-    }
-    false
+    can_coerce_types_in(&[source], &[target], CoercionContext::Explicit, snapshot)
 }
 
 /// Find the common supertype for a list of types.
