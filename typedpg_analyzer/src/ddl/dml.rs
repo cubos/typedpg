@@ -17,8 +17,24 @@ pub(crate) fn check_statement(interp: &PgCatalog, stmt: &node::Node) -> Result<(
 }
 
 /// [`check_statement`], returning the statement's result columns when the
-/// analysis could tell them.
+/// analysis could tell them. The statement runs: it is rewritten too.
 pub(crate) fn analyze_statement(
+    interp: &PgCatalog,
+    stmt: &node::Node,
+) -> Result<Option<Vec<crate::resolve::RawColumn>>, DdlError> {
+    crate::expr::with_rewriting(true, || analyze_parsed(interp, stmt))
+}
+
+/// [`analyze_statement`] for a statement only stored (a rule's action):
+/// parse analysis alone, the rewriter runs once something fires it.
+pub(crate) fn analyze_stored_statement(
+    interp: &PgCatalog,
+    stmt: &node::Node,
+) -> Result<Option<Vec<crate::resolve::RawColumn>>, DdlError> {
+    crate::expr::with_rewriting(false, || analyze_parsed(interp, stmt))
+}
+
+fn analyze_parsed(
     interp: &PgCatalog,
     stmt: &node::Node,
 ) -> Result<Option<Vec<crate::resolve::RawColumn>>, DdlError> {

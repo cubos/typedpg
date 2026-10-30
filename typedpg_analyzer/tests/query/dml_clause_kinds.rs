@@ -159,3 +159,51 @@ fn allowed_placements() {
         db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
 }
+
+#[test]
+fn a_target_named_excluded_is_ambiguous_in_on_conflict() {
+    // DO UPDATE's SET list and WHERE see the target and EXCLUDED: a target
+    // that is itself named `excluded` makes the qualifier name both
+    // (scanNameSpaceForRefname, 42P09) — a plain column, both columns.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE excluded (key int PRIMARY KEY, data text);")
+        .unwrap();
+    for sql in [
+        "INSERT INTO excluded VALUES (1, '2')
+         ON CONFLICT (key) DO UPDATE SET data = excluded.data RETURNING *",
+        "INSERT INTO excluded VALUES (1, '2')
+         ON CONFLICT (key) DO UPDATE SET data = 'x' WHERE excluded.key = 1",
+        "INSERT INTO excluded VALUES (1, '2')
+         ON CONFLICT (key) DO UPDATE SET data = (SELECT excluded.data)",
+        "INSERT INTO excluded VALUES (1, '2')
+         ON CONFLICT (key) DO UPDATE SET data = excluded",
+    ] {
+        let err = db.analyze(sql).expect_err(sql);
+        assert!(
+            matches!(err, AnalyzeError::AmbiguousAlias(_)),
+            "{sql}: {err:?}"
+        );
+        assert!(
+            err.to_string()
+                .starts_with(r#"table reference "excluded" is ambiguous"#),
+            "{sql}\n  got: {err}"
+        );
+    }
+    let err = db
+        .analyze("INSERT INTO excluded VALUES (1, '2') ON CONFLICT (key) DO UPDATE SET data = data")
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with(r#"column reference "data" is ambiguous"#),
+        "{err}"
+    );
+    // RETURNING sees the target alone; an alias tells the two apart.
+    for sql in [
+        "INSERT INTO excluded VALUES (1, '2')
+         ON CONFLICT (key) DO UPDATE SET data = 'x' RETURNING excluded.key, excluded.*",
+        "INSERT INTO excluded AS e VALUES (1, '2')
+         ON CONFLICT (key) DO UPDATE SET data = excluded.data WHERE e.key = 1 RETURNING e.*",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}

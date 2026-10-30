@@ -135,6 +135,17 @@ pub fn create_rule(interp: &mut PgCatalog, stmt: &RuleStmt) -> Result<(), DdlErr
         });
         outputs.push(checked?);
         actions.extend(rewrites);
+        // transformRuleStmt: a conditional rule's action must be a query
+        // (the condition is added to it); NOTIFY is a utility statement.
+        if stmt.where_clause.is_some()
+            && matches!(action.node.as_ref(), Some(node::Node::NotifyStmt(_)))
+        {
+            return Err(DdlError::UnsupportedDdl(
+                "rules with WHERE conditions can only have SELECT, INSERT, UPDATE, or DELETE \
+                 actions"
+                    .into(),
+            ));
+        }
     }
     define_query_rewrite(interp, relid, stmt, event, &outputs)?;
     if event == CmdType::CmdSelect {
@@ -524,7 +535,7 @@ fn check_action_query(
         .flatten()
         .collect();
     crate::scope::with_rule_pseudo_relations(interp, relation, &attrs, &names, || {
-        super::dml::analyze_statement(interp, inner)
+        super::dml::analyze_stored_statement(interp, inner)
     })
 }
 

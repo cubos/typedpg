@@ -431,6 +431,18 @@ pub(crate) fn duplicate_table_alias(alias: &str, span: Option<SourceSpan>) -> Ra
     )
 }
 
+/// `table reference "t" is ambiguous` — SQLSTATE 42P09
+/// (`ambiguous_alias`): a qualifier two FROM entries of the nearest level
+/// answer to (`scanNameSpaceForRefname`), such as a table named
+/// `excluded` and ON CONFLICT's EXCLUDED.
+pub(crate) fn ambiguous_table_reference(name: &str, span: Option<SourceSpan>) -> RawError {
+    RawError::new(
+        AnalyzeError::AmbiguousAlias(format!("table reference \"{name}\" is ambiguous")),
+        span,
+        None,
+    )
+}
+
 /// `cannot assign to system column "ctid"` — SQLSTATE 0A000: an UPDATE /
 /// ON CONFLICT DO UPDATE / MERGE UPDATE SET item naming a system column
 /// (`transformAssignedExpr`).
@@ -1654,6 +1666,7 @@ mod tests {
             ),
             (distinct_order_by_not_in_select_list(None).kind, "42P10"),
             (duplicate_table_alias("u", None).kind, "42712"),
+            (ambiguous_table_reference("t", None).kind, "42P09"),
             (too_many_column_aliases("t", 1, 2).kind, "42P10"),
             (values_lists_length(2, 1, None).kind, "42601"),
             (unknown_value_not_coercible("text", None).kind, "XX000"),

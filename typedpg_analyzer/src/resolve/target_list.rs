@@ -161,6 +161,10 @@ pub(crate) fn resolve_target_list_explicit(
                 // Any entry the reference can see — this level's, a LATERAL
                 // one, or an outer query's (PG's `ExpandColumnRefStar`
                 // resolves the name like any qualifier).
+                scope.check_refname_unique(
+                    tbl,
+                    crate::error::SourceSpan::from_node_qname(cr.location),
+                )?;
                 match scope.find_source(tbl) {
                     Some(src) => {
                         src.note_star_columns();

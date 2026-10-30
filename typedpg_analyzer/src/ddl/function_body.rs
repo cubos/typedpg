@@ -27,12 +27,17 @@ use crate::pg_catalog::{ArgMode, PgCatalog, PgProc, TypCategory, TypType, oid};
 /// Returns what an inline (`BEGIN ATOMIC` / `RETURN`) body refers to: PG
 /// stores it parsed, and the routine depends on those objects
 /// (ProcedureCreate → recordDependencyOnExpr).
+///
+/// `check_bodies` is `check_function_bodies` as the validator sees it — the
+/// routine's own `SET` clauses applied.
 pub(crate) fn validate_sql_function(
     interp: &PgCatalog,
     stmt: &CreateFunctionStmt,
     proc: &PgProc,
+    check_bodies: bool,
 ) -> Result<Vec<super::depend::Reference>, DdlError> {
-    let (result, refs) = super::depend::collect(|| validate_sql_body(interp, stmt, proc));
+    let (result, refs) =
+        super::depend::collect(|| validate_sql_body(interp, stmt, proc, check_bodies));
     result?;
     Ok(if stmt.sql_body.is_some() {
         refs
@@ -45,6 +50,7 @@ fn validate_sql_body(
     interp: &PgCatalog,
     stmt: &CreateFunctionStmt,
     proc: &PgProc,
+    check_bodies: bool,
 ) -> Result<(), DdlError> {
     if !language_is_sql(stmt) {
         return Ok(());
@@ -54,7 +60,7 @@ fn validate_sql_body(
         Some(found) => found,
         None => return Ok(()),
     };
-    if !always_check && !interp.check_function_bodies {
+    if !always_check && !check_bodies {
         return Ok(());
     }
     // A string body was parsed on its own: its locations are offsets into
@@ -109,8 +115,12 @@ fn validate_sql_body(
         if highest > param_types.len() as i32 {
             return Err(DdlError::Parse(format!("there is no parameter ${highest}")));
         }
-        let analyzed = crate::expr::with_sql_function_params(namespace(), || {
-            crate::resolve::analyze_raw_node_with_param_types(interp, inner, &param_types)
+        // fmgr_sql_validator rewrites what it analyzed; with
+        // check_function_bodies off an inline body is only parsed.
+        let analyzed = crate::expr::with_rewriting(check_bodies, || {
+            crate::expr::with_sql_function_params(namespace(), || {
+                crate::resolve::analyze_raw_node_with_param_types(interp, inner, &param_types)
+            })
         });
         let columns = match analyzed {
             Ok((columns, _)) => Some(columns),
@@ -138,6 +148,11 @@ fn validate_sql_body(
             column_types: columns.map(|cols| cols.iter().map(|c| c.type_oid).collect()),
             record_shape,
         });
+    }
+    // fmgr_sql_validator: the result is checked only with
+    // check_function_bodies on (an inline body was parsed regardless).
+    if !check_bodies {
+        return Ok(());
     }
     check_return_type(interp, proc, last.as_ref())
 }
@@ -592,6 +607,7 @@ pub(crate) fn inlinable_body(stmt: &CreateFunctionStmt, proc: &PgProc) -> Option
 pub(crate) fn validate_plpgsql_function(
     interp: &PgCatalog,
     stmt: &CreateFunctionStmt,
+    check_bodies: bool,
 ) -> Result<(), DdlError> {
     let is_plpgsql = stmt.options.iter().any(|n| {
         matches!(n.node.as_ref(), Some(node::Node::DefElem(de))
@@ -599,7 +615,7 @@ pub(crate) fn validate_plpgsql_function(
                 && matches!(de.arg.as_deref().and_then(|a| a.node.as_ref()),
                     Some(node::Node::String(s)) if s.sval.eq_ignore_ascii_case("plpgsql")))
     });
-    if !is_plpgsql || !interp.check_function_bodies {
+    if !is_plpgsql || !check_bodies {
         return Ok(());
     }
     // The statement as written: libpg_query's PL/pgSQL entry point takes SQL

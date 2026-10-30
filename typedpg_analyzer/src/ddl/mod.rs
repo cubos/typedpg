@@ -550,6 +550,7 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         node::Node::AlterDefaultPrivilegesStmt(s) => acl::alter_default_privileges(db, s),
         node::Node::ConstraintsSetStmt(s) => session::set_constraints(db, s),
         node::Node::ExplainStmt(s) => session::explain(db, s),
+        node::Node::DeclareCursorStmt(s) => session::declare_cursor(db, s),
         node::Node::CreateTableSpaceStmt(s) => cluster::create_tablespace(db, s),
         node::Node::DropTableSpaceStmt(s) => cluster::drop_tablespace(db, s),
         node::Node::CreateSubscriptionStmt(s) => cluster::create_subscription(db, s),
@@ -571,7 +572,6 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         // configuration, foreign-data wrappers / servers / user mappings,
         // tablespaces, conversions, languages, transforms, security labels,
         // and type property changes (`ALTER TYPE t SET (...)`).
-        | node::Node::DeclareCursorStmt(_)
         | node::Node::FetchStmt(_)
         | node::Node::ClosePortalStmt(_)
         | node::Node::CheckPointStmt(_)

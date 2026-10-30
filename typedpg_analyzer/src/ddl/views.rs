@@ -220,7 +220,8 @@ fn create_relation_as(
     }
     let mut resolved = match query {
         // CREATE TABLE ... AS EXECUTE (ExecuteQuery): the prepared SELECT's
-        // columns, its arguments checked.
+        // columns, its arguments checked. The cached plan is revalidated
+        // (rewritten again) even WITH NO DATA.
         Some(protobuf::Node {
             node: Some(node::Node::ExecuteStmt(estmt)),
         }) => {
@@ -228,17 +229,10 @@ fn create_relation_as(
             if !prepared.is_select() {
                 return Err(DdlError::Parse("prepared statement is not a SELECT".into()));
             }
-            resolve_view_with_params(interp, &prepared.query, &aliases, &prepared.param_types)
-                .map_err(|e| match e {
-                    DdlError::ViewAnalysis { source, .. } => DdlError::ViewAnalysis {
-                        view: qn_label.clone(),
-                        source,
-                    },
-                    other => other,
-                })?
-        }
-        Some(query_node) => {
-            resolve_view_now(interp, query_node, &aliases).map_err(|e| match e {
+            crate::expr::with_rewriting(true, || {
+                resolve_view_with_params(interp, &prepared.query, &aliases, &prepared.param_types)
+            })
+            .map_err(|e| match e {
                 DdlError::ViewAnalysis { source, .. } => DdlError::ViewAnalysis {
                     view: qn_label.clone(),
                     source,
@@ -246,6 +240,18 @@ fn create_relation_as(
                 other => other,
             })?
         }
+        // ExecCreateTableAs rewrites the query it fills the relation with;
+        // WITH NO DATA only creates the relation (create_ctas_nodata).
+        Some(query_node) => crate::expr::with_rewriting(!into.skip_data, || {
+            resolve_view_now(interp, query_node, &aliases)
+        })
+        .map_err(|e| match e {
+            DdlError::ViewAnalysis { source, .. } => DdlError::ViewAnalysis {
+                view: qn_label.clone(),
+                source,
+            },
+            other => other,
+        })?,
         None => ResolvedView::default(),
     };
     // transformCreateTableAsStmt: a materialized view outlives the session
@@ -413,7 +419,7 @@ fn check_no_parameters(query: &protobuf::Node) -> Result<(), DdlError> {
 
 /// Whether a CTE of the query's WITH is an INSERT / UPDATE / DELETE /
 /// MERGE (`hasModifyingCTE`).
-fn has_modifying_cte(query: &protobuf::Node) -> bool {
+pub(crate) fn has_modifying_cte(query: &protobuf::Node) -> bool {
     let Some(node::Node::SelectStmt(sel)) = query.node.as_ref() else {
         return false;
     };
@@ -551,6 +557,16 @@ pub fn refresh_materialized_view(
                         crate::qualified_name::QualifiedName::new(schema, &c.relname)
                     )));
                 }
+            }
+            // refresh_matview_datafill rewrites the stored query.
+            if !stmt.skip_data
+                && let Some(relname) = query_rule_recursion(interp, oid)
+            {
+                return Err(DdlError::UnsupportedDdl(
+                    crate::pgmsg::infinite_rule_recursion(&relname)
+                        .finalize_implicit()
+                        .to_string(),
+                ));
             }
             if stmt.skip_data {
                 interp.unpopulated_matviews.insert(oid);
@@ -2022,10 +2038,113 @@ pub(crate) fn reanalyze_view(
     let stored = snapshot.view_references.get(&relid)?;
     let query = view_query(snapshot, relid)?;
     let inner = query.node.as_ref()?;
-    let (analyzed, references) =
-        super::depend::collect(|| crate::resolve::analyze_raw_node(snapshot, inner, &[]));
+    let (analyzed, references) = expanding_view(relid, || {
+        super::depend::collect(|| crate::resolve::analyze_raw_node(snapshot, inner, &[]))
+    })?;
     let (columns, _) = analyzed.ok()?;
     (bound_references(snapshot, &references) == *stored).then_some(columns)
+}
+
+thread_local! {
+    /// The views whose stored query is being looked into, outermost first.
+    static EXPANDING_VIEWS: std::cell::RefCell<Vec<PgClassOid>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Run `f` looking into view `relid`'s stored query — `None` when that
+/// query is already being looked into: views made to read each other
+/// (`CREATE OR REPLACE VIEW` can close the loop) would recurse forever.
+/// A statement reading such a view fails ([`view_rule_recursion`]); a
+/// definition merely naming one is stored as PG stores it.
+pub(crate) fn expanding_view<R>(relid: PgClassOid, f: impl FnOnce() -> R) -> Option<R> {
+    /// Pops the view pushed below when dropped — also when `f` unwinds, so
+    /// a panic caught by the caller leaves no stale entry behind.
+    struct Expanding;
+    impl Drop for Expanding {
+        fn drop(&mut self) {
+            EXPANDING_VIEWS.with(|v| v.borrow_mut().pop());
+        }
+    }
+    if EXPANDING_VIEWS.with(|v| v.borrow().contains(&relid)) {
+        return None;
+    }
+    EXPANDING_VIEWS.with(|v| v.borrow_mut().push(relid));
+    let _expanding = Expanding;
+    Some(f())
+}
+
+/// The rewriter's `fireRIRrules`: expanding view `relid` in a statement,
+/// and the views its query reads in turn, depth first in the order the
+/// query names them, reaches a view already being expanded — the
+/// relation PG names in `infinite recursion detected in rules for
+/// relation "…"`.
+pub(crate) fn view_rule_recursion(snapshot: &PgCatalog, relid: PgClassOid) -> Option<String> {
+    /// `done`: views whose expansion reached no loop (none reachable from
+    /// them can then close one), each walked once.
+    fn walk(
+        snapshot: &PgCatalog,
+        relid: PgClassOid,
+        active: &mut Vec<PgClassOid>,
+        done: &mut std::collections::HashSet<PgClassOid>,
+    ) -> Option<String> {
+        let class = snapshot.pg_class.get(&relid)?;
+        if class.relkind != RelKind::View || done.contains(&relid) {
+            return None;
+        }
+        if active.contains(&relid) {
+            return Some(class.relname.clone());
+        }
+        active.push(relid);
+        let found = snapshot
+            .view_references
+            .get(&relid)
+            .into_iter()
+            .flatten()
+            .find_map(|r| match r {
+                super::depend::Reference::Object(a) if a.classid == PG_CLASS_RELID => walk(
+                    snapshot,
+                    PgClassOid::from_nonzero(a.objid.into_nonzero()),
+                    active,
+                    done,
+                ),
+                _ => None,
+            });
+        active.pop();
+        done.insert(relid);
+        found
+    }
+    walk(snapshot, relid, &mut Vec::new(), &mut Default::default())
+}
+
+/// [`view_rule_recursion`] for the stored query of view or materialized
+/// view `relid`, as it bound its relations: expanding the views it reads,
+/// in the order it first named them, reaches a loop.
+pub(crate) fn query_rule_recursion(snapshot: &PgCatalog, relid: PgClassOid) -> Option<String> {
+    relations_rule_recursion(
+        snapshot,
+        snapshot
+            .view_references
+            .get(&relid)
+            .into_iter()
+            .flatten()
+            .filter_map(|r| match r {
+                super::depend::Reference::Object(a) if a.classid == PG_CLASS_RELID => {
+                    Some(PgClassOid::from_nonzero(a.objid.into_nonzero()))
+                }
+                _ => None,
+            }),
+    )
+}
+
+/// `fireRIRrules` over a query reading `relations`, in range-table order:
+/// the relation PG names for the first view loop their expansion meets.
+pub(crate) fn relations_rule_recursion(
+    snapshot: &PgCatalog,
+    relations: impl IntoIterator<Item = PgClassOid>,
+) -> Option<String> {
+    relations
+        .into_iter()
+        .find_map(|r| view_rule_recursion(snapshot, r))
 }
 
 /// Whether reading view `relid` locks rows: its query, or that of a view

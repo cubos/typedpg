@@ -1,4 +1,5 @@
-//! Session state set by migrations: the `search_path` GUC, and the
+//! Session state set by migrations: the `search_path` and
+//! `check_function_bodies` GUCs, and the
 //! session's user identity (`SET ROLE`, `SET SESSION AUTHORIZATION`), which
 //! `$user` in the search path names.
 //!
@@ -21,6 +22,7 @@ use typedpg_pg_query::protobuf::{
 };
 
 use super::DdlError;
+use super::reloptions::parse_bool;
 use crate::pg_catalog::PgCatalog;
 
 /// PG 18's predefined roles (`pg_authid` rows every cluster has). Any other
@@ -155,6 +157,107 @@ impl SearchPathGuc {
     }
 }
 
+/// A boolean setting with its session value and a pending `SET LOCAL` one.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BoolGuc {
+    /// The value its boot / RESET leaves.
+    default: bool,
+    session: bool,
+    local: Option<bool>,
+}
+
+impl BoolGuc {
+    pub(crate) const fn new(default: bool) -> Self {
+        Self {
+            default,
+            session: default,
+            local: None,
+        }
+    }
+
+    /// The value in effect.
+    pub(crate) fn get(&self) -> bool {
+        self.local.unwrap_or(self.session)
+    }
+
+    /// `SET [LOCAL]` (`value`), or `SET ... TO DEFAULT` / `RESET` (`None`).
+    fn set(&mut self, value: Option<bool>, is_local: bool) {
+        let value = value.unwrap_or(self.default);
+        if is_local {
+            self.local = Some(value);
+        } else {
+            // A session-level SET replaces a pending SET LOCAL value too.
+            self.local = None;
+            self.session = value;
+        }
+    }
+}
+
+/// The settings a routine's `SET` clauses give it (`proconfig`), as the
+/// validator runs under them.
+pub(crate) struct RoutineSettings {
+    /// Whether the validator checks the body.
+    pub(crate) check_bodies: bool,
+    /// `search_path`'s value for the validation, when the routine sets one.
+    search_path: Option<Vec<String>>,
+}
+
+impl RoutineSettings {
+    /// ProcedureCreate: with `check_function_bodies` on, the validator runs
+    /// under the routine's `proconfig` (its own `SET check_function_bodies
+    /// = off` included); with it off, `proconfig` isn't applied and nothing
+    /// is checked. Each item replaces an earlier one for the same setting,
+    /// and `SET name TO DEFAULT` removes it (`update_proconfig_value`).
+    pub(crate) fn of(interp: &PgCatalog, set_items: &[&node::Node]) -> Self {
+        let session = interp.check_function_bodies.get();
+        let mut check_bodies = None;
+        let mut search_path = None;
+        for item in set_items {
+            let node::Node::VariableSetStmt(set) = item else {
+                continue;
+            };
+            let kind = VariableSetKind::try_from(set.kind).unwrap_or(VariableSetKind::Undefined);
+            if set.name.eq_ignore_ascii_case("check_function_bodies") {
+                check_bodies = match kind {
+                    // FROM CURRENT: the session's value, which is on here.
+                    VariableSetKind::VarSetCurrent => Some(session),
+                    VariableSetKind::VarSetValue => match set.args.as_slice() {
+                        [arg] => const_arg_string(arg).and_then(|v| parse_bool(&v)),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+            } else if set.name.eq_ignore_ascii_case("search_path") {
+                search_path = match kind {
+                    VariableSetKind::VarSetCurrent => {
+                        Some(interp.search_path_guc.effective().to_vec())
+                    }
+                    VariableSetKind::VarSetValue => search_path_args(set),
+                    _ => None,
+                };
+            }
+        }
+        Self {
+            check_bodies: session && check_bodies.unwrap_or(true),
+            search_path: search_path.filter(|_| session),
+        }
+    }
+
+    /// Run `f` with the routine's `search_path` in effect, as the validator
+    /// of a body given as a string runs (an inline body was parsed before,
+    /// under the session's path).
+    pub(crate) fn apply<R>(&self, interp: &mut PgCatalog, f: impl FnOnce(&PgCatalog) -> R) -> R {
+        let Some(path) = &self.search_path else {
+            return f(interp);
+        };
+        let saved = interp.search_path_guc.clone();
+        interp.set_search_path(Some(path.clone()), true);
+        let result = f(interp);
+        interp.restore_search_path(saved);
+        result
+    }
+}
+
 impl PgCatalog {
     /// Re-derive [`PgCatalog::search_path`] from the textual setting: every
     /// entry naming an existing schema, in order, without duplicates.
@@ -208,6 +311,7 @@ impl PgCatalog {
 
     /// End of the current transaction: `SET LOCAL` values lapse.
     pub(crate) fn end_transaction_scope(&mut self) {
+        self.check_function_bodies.local = None;
         let local_identity = self.session_identity.local.take().is_some();
         if self.search_path_guc.local.take().is_some() || local_identity {
             self.refresh_search_path();
@@ -312,7 +416,7 @@ pub(crate) fn variable_set(interp: &mut PgCatalog, stmt: &VariableSetStmt) -> Re
     // RESET ALL leaves the identity alone (GUC_NO_RESET_ALL).
     if kind == VariableSetKind::VarResetAll {
         interp.set_search_path(None, false);
-        interp.check_function_bodies = true;
+        interp.check_function_bodies = BoolGuc::new(true);
         return Ok(());
     }
     // The parameter must exist and be settable, and a new value valid.
@@ -330,20 +434,19 @@ pub(crate) fn variable_set(interp: &mut PgCatalog, stmt: &VariableSetStmt) -> Re
         super::guc::check_value(interp, &setting, &value)?;
     }
     if stmt.name.eq_ignore_ascii_case("check_function_bodies") {
-        interp.check_function_bodies = match kind {
-            VariableSetKind::VarSetValue => stmt.args.first().is_none_or(|arg| {
-                !matches!(arg.node.as_ref(), Some(node::Node::AConst(c)) if match c.val.as_ref() {
-                    Some(a_const::Val::Sval(s)) => matches!(
-                        s.sval.to_ascii_lowercase().as_str(),
-                        "off" | "false" | "no" | "0" | "f" | "n"
-                    ),
-                    Some(a_const::Val::Ival(i)) => i.ival == 0,
-                    Some(a_const::Val::Boolval(b)) => !b.boolval,
-                    _ => false,
-                })
-            }),
-            _ => true,
-        };
+        match kind {
+            VariableSetKind::VarSetValue => {
+                if let [arg] = stmt.args.as_slice()
+                    && let Some(value) = const_arg_string(arg).and_then(|v| parse_bool(&v))
+                {
+                    interp.check_function_bodies.set(Some(value), stmt.is_local);
+                }
+            }
+            VariableSetKind::VarSetDefault | VariableSetKind::VarReset => {
+                interp.check_function_bodies.set(None, stmt.is_local);
+            }
+            _ => {}
+        }
         return Ok(());
     }
     if !stmt.name.eq_ignore_ascii_case("search_path") {
@@ -467,8 +570,13 @@ pub(crate) fn select_side_effects(
         {
             super::guc::check_value(interp, &known, &value)?;
         }
-        if let Some((value, is_local)) = constant_search_path_set_config(fc) {
+        if let Some((value, is_local)) = constant_named_set_config(fc, "search_path") {
             interp.set_search_path(Some(split_identifier_string(&value)), is_local);
+        }
+        if let Some((value, is_local)) = constant_named_set_config(fc, "check_function_bodies")
+            && let Some(value) = parse_bool(&value)
+        {
+            interp.check_function_bodies.set(Some(value), is_local);
         }
     }
     Ok(())
@@ -553,7 +661,9 @@ fn constant_identity_set_config(fc: &FuncCall) -> Option<(String, String, bool)>
     Some((setting.sval, value.sval, is_local))
 }
 
-fn constant_search_path_set_config(fc: &FuncCall) -> Option<(String, bool)> {
+/// `set_config('<setting>', '<value>', <is_local>)` with constant
+/// arguments.
+fn constant_named_set_config(fc: &FuncCall, setting_name: &str) -> Option<(String, bool)> {
     let name: Vec<&str> = fc
         .funcname
         .iter()
@@ -575,7 +685,7 @@ fn constant_search_path_set_config(fc: &FuncCall) -> Option<(String, bool)> {
     let Some(a_const::Val::Sval(setting)) = as_const(setting) else {
         return None;
     };
-    if !setting.sval.eq_ignore_ascii_case("search_path") {
+    if !setting.sval.eq_ignore_ascii_case(setting_name) {
         return None;
     }
     let Some(a_const::Val::Sval(value)) = as_const(value) else {
@@ -644,19 +754,143 @@ pub(crate) fn explain(
         node::Node::ExecuteStmt(e) => super::prepared::execute(interp, e),
         node::Node::CreateTableAsStmt(ctas) => {
             match ctas.query.as_deref().and_then(|q| q.node.as_ref()) {
-                Some(node::Node::ExecuteStmt(e)) => {
-                    super::prepared::lookup_execute(interp, e).map(drop)
-                }
+                // ExplainExecuteQuery revalidates the cached plan.
+                Some(node::Node::ExecuteStmt(e)) => super::prepared::execute(interp, e),
                 Some(q) => super::dml::check_statement(interp, q),
                 None => Ok(()),
             }
         }
-        node::Node::DeclareCursorStmt(d) => d
-            .query
-            .as_deref()
-            .and_then(|q| q.node.as_ref())
-            .map_or(Ok(()), |q| super::dml::check_statement(interp, q)),
+        node::Node::DeclareCursorStmt(d) => declare_cursor(interp, d),
         _ => super::dml::check_statement(interp, query),
+    }
+}
+
+/// `DECLARE name CURSOR FOR query`: the query is analyzed
+/// (transformDeclareCursorStmt) and rewritten when the cursor opens
+/// (PerformCursorOpen). Cursor names aren't tracked.
+pub(crate) fn declare_cursor(
+    interp: &PgCatalog,
+    stmt: &typedpg_pg_query::protobuf::DeclareCursorStmt,
+) -> Result<(), DdlError> {
+    // CURSOR_OPT_* (parsenodes.h).
+    const SCROLL: i32 = 0x0002;
+    const INSENSITIVE: i32 = 0x0008;
+    const HOLD: i32 = 0x0020;
+    let Some(query) = stmt.query.as_deref() else {
+        return Ok(());
+    };
+    let Some(inner) = query.node.as_ref() else {
+        return Ok(());
+    };
+    super::dml::check_statement(interp, inner)?;
+    if super::views::has_modifying_cte(query) {
+        return Err(DdlError::UnsupportedDdl(
+            "DECLARE CURSOR must not contain data-modifying statements in WITH".into(),
+        ));
+    }
+    let Some(strength) = first_row_mark_strength(inner) else {
+        return Ok(());
+    };
+    let refused = if stmt.options & HOLD != 0 {
+        Some(("CURSOR WITH HOLD", "supported", "Holdable"))
+    } else if stmt.options & SCROLL != 0 {
+        Some(("SCROLL CURSOR", "supported", "Scrollable"))
+    } else if stmt.options & INSENSITIVE != 0 {
+        Some(("INSENSITIVE CURSOR", "valid", "Insensitive"))
+    } else {
+        None
+    };
+    match refused {
+        Some((what, verdict, kind)) => Err(DdlError::UnsupportedDdl(format!(
+            "DECLARE {what} ... {strength} is not {verdict} ({kind} cursors must be READ ONLY.)"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// `LCS_asString` of the first row mark of a SELECT's own locking clauses
+/// (`query->rowMarks`; a subquery's are its own): the first clause's first
+/// target — the relation it names first, or without `OF` the first
+/// relation or subquery of the FROM clause — at the strongest strength a
+/// clause asks of it (applyLockingClause keeps one mark per relation).
+fn first_row_mark_strength(stmt: &node::Node) -> Option<&'static str> {
+    use typedpg_pg_query::protobuf::LockingClause;
+    let node::Node::SelectStmt(sel) = stmt else {
+        return None;
+    };
+    let clauses: Vec<&LockingClause> = sel
+        .locking_clause
+        .iter()
+        .filter_map(|c| match c.node.as_ref() {
+            Some(node::Node::LockingClause(lc)) => Some(lc),
+            _ => None,
+        })
+        .collect();
+    let first = clauses.first()?;
+    let names = |lc: &LockingClause| -> Vec<String> {
+        lc.locked_rels
+            .iter()
+            .filter_map(|n| match n.node.as_ref() {
+                Some(node::Node::RangeVar(rv)) => Some(rv.relname.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    let ctes: Vec<&str> = sel
+        .with_clause
+        .iter()
+        .flat_map(|w| &w.ctes)
+        .filter_map(|c| match c.node.as_ref() {
+            Some(node::Node::CommonTableExpr(c)) => Some(c.ctename.as_str()),
+            _ => None,
+        })
+        .collect();
+    let target = match names(first).into_iter().next() {
+        Some(name) => Some(name),
+        None => sel
+            .from_clause
+            .iter()
+            .find_map(|item| first_lockable(item, &ctes)),
+    };
+    let strongest = clauses
+        .iter()
+        .filter(|lc| {
+            let named = names(lc);
+            named.is_empty() || target.as_ref().is_some_and(|t| named.contains(t))
+        })
+        .max_by_key(|lc| lc.strength)?;
+    Some(crate::resolve::lock_strength_name(strongest))
+}
+
+/// The name of the first relation or subquery of FROM item `item`, in
+/// range-table order (a join's left side first): what a locking clause
+/// without `OF` marks first. Functions, VALUES and CTE references take no
+/// mark.
+fn first_lockable(item: &typedpg_pg_query::protobuf::Node, ctes: &[&str]) -> Option<String> {
+    match item.node.as_ref()? {
+        node::Node::RangeVar(rv) => {
+            if rv.schemaname.is_empty() && ctes.contains(&rv.relname.as_str()) {
+                return None;
+            }
+            Some(
+                rv.alias
+                    .as_ref()
+                    .map_or_else(|| rv.relname.clone(), |a| a.aliasname.clone()),
+            )
+        }
+        // An unnamed subquery is marked too, though no `OF` can name it.
+        node::Node::RangeSubselect(rs) => Some(
+            rs.alias
+                .as_ref()
+                .map(|a| a.aliasname.clone())
+                .unwrap_or_default(),
+        ),
+        node::Node::JoinExpr(j) => j
+            .larg
+            .as_deref()
+            .and_then(|l| first_lockable(l, ctes))
+            .or_else(|| j.rarg.as_deref().and_then(|r| first_lockable(r, ctes))),
+        _ => None,
     }
 }
 

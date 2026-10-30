@@ -1444,3 +1444,186 @@ fn view_and_materialized_view_ddl_follows_postgres_checks() {
          REFRESH MATERIALIZED VIEW CONCURRENTLY mv;",
     )]);
 }
+
+#[test]
+fn a_view_loop_fails_what_the_rewriter_expands() {
+    // Views made to read each other: PG stores what merely names the loop
+    // and fails whatever it rewrites — a statement it runs, the query
+    // CREATE TABLE AS / CREATE MATERIALIZED VIEW fill a relation with, a
+    // SQL function body fmgr_sql_validator checks, the rules a statement
+    // fires. The analyzer accepted all of them.
+    const LOOP: &str = "CREATE TABLE t (a int);
+         CREATE VIEW v2 AS SELECT a FROM t;
+         CREATE VIEW v3 AS SELECT a FROM v2;
+         CREATE OR REPLACE VIEW v2 AS SELECT a FROM v3;";
+    let rejected = [
+        ("CREATE TABLE c AS SELECT * FROM v2;", "v2"),
+        ("CREATE TABLE c (x) AS SELECT * FROM v2;", "v2"),
+        ("CREATE TABLE c AS SELECT (SELECT a FROM v3);", "v3"),
+        (
+            "CREATE TABLE c AS WITH x AS (SELECT * FROM v2) SELECT 1;",
+            "v2",
+        ),
+        ("SELECT * INTO c FROM v2;", "v2"),
+        ("CREATE MATERIALIZED VIEW m AS SELECT * FROM v2;", "v2"),
+        (
+            "CREATE MATERIALIZED VIEW m AS SELECT * FROM v2 WITH NO DATA;
+             REFRESH MATERIALIZED VIEW m;",
+            "v2",
+        ),
+        (
+            "CREATE FUNCTION f() RETURNS SETOF int LANGUAGE sql AS 'SELECT a FROM v2';",
+            "v2",
+        ),
+        (
+            "CREATE FUNCTION f() RETURNS SETOF int LANGUAGE sql
+             BEGIN ATOMIC SELECT a FROM v2; END;",
+            "v2",
+        ),
+        (
+            "CREATE FUNCTION f() RETURNS void LANGUAGE sql
+             AS 'INSERT INTO t SELECT a FROM v3';",
+            "v3",
+        ),
+        (
+            "CREATE FUNCTION f() RETURNS void LANGUAGE sql
+             AS 'CREATE TABLE z (a int); SELECT a FROM v2';",
+            "v2",
+        ),
+        (
+            "CREATE PROCEDURE p() LANGUAGE sql BEGIN ATOMIC SELECT a FROM v2; END;",
+            "v2",
+        ),
+        ("INSERT INTO t SELECT a FROM v2;", "v2"),
+        ("UPDATE t SET a = 1 WHERE a IN (SELECT a FROM v2);", "v2"),
+        ("DELETE FROM t USING v3;", "v3"),
+        ("EXPLAIN SELECT * FROM v2;", "v2"),
+        (
+            "EXPLAIN CREATE TABLE c AS SELECT * FROM v2 WITH NO DATA;",
+            "v2",
+        ),
+        ("PREPARE q AS SELECT * FROM v2;", "v2"),
+        ("COPY (SELECT * FROM v2) TO STDOUT;", "v2"),
+        (
+            "CREATE RULE r AS ON INSERT TO t DO ALSO SELECT * FROM v2;
+             INSERT INTO t VALUES (1);",
+            "v2",
+        ),
+        (
+            "CREATE RULE r AS ON INSERT TO t WHERE EXISTS (SELECT FROM v3) DO ALSO SELECT 1;
+             INSERT INTO t VALUES (1);",
+            "v3",
+        ),
+        (
+            "CREATE TABLE tv (a int);
+             CREATE VIEW vv AS SELECT a FROM tv;
+             CREATE RULE r AS ON INSERT TO vv DO INSTEAD INSERT INTO tv SELECT a FROM v2;
+             INSERT INTO vv VALUES (1);",
+            "v2",
+        ),
+        // A rule fired by a rule's action.
+        (
+            "CREATE TABLE tv (a int);
+             CREATE TABLE tw (a int);
+             CREATE RULE ra AS ON INSERT TO tv DO ALSO INSERT INTO tw VALUES (new.a);
+             CREATE RULE rb AS ON INSERT TO tw DO ALSO SELECT FROM v3;
+             INSERT INTO tv VALUES (1);",
+            "v3",
+        ),
+        // The prepared plan is revalidated: rewritten again.
+        (
+            "CREATE TABLE tt (a int);
+             CREATE VIEW w1 AS SELECT a FROM tt;
+             PREPARE q AS SELECT * FROM w1;
+             CREATE VIEW w2 AS SELECT a FROM w1;
+             CREATE OR REPLACE VIEW w1 AS SELECT a FROM w2;
+             EXECUTE q;",
+            "w1",
+        ),
+        (
+            "CREATE TABLE tt (a int);
+             CREATE VIEW w1 AS SELECT a FROM tt;
+             PREPARE q AS SELECT * FROM w1;
+             CREATE VIEW w2 AS SELECT a FROM w1;
+             CREATE OR REPLACE VIEW w1 AS SELECT a FROM w2;
+             CREATE TABLE c AS EXECUTE q WITH NO DATA;",
+            "w1",
+        ),
+        (
+            "CREATE TABLE tt (a int);
+             CREATE VIEW w1 AS SELECT a FROM tt;
+             PREPARE q AS SELECT * FROM w1;
+             CREATE VIEW w2 AS SELECT a FROM w1;
+             CREATE OR REPLACE VIEW w1 AS SELECT a FROM w2;
+             EXPLAIN CREATE TABLE c AS EXECUTE q;",
+            "w1",
+        ),
+    ];
+    for (sql, relation) in rejected {
+        let err = try_apply(&[("0001.sql", LOOP), ("0002.sql", sql)]).expect_err(sql);
+        assert!(
+            err.to_string().starts_with(&format!(
+                "infinite recursion detected in rules for relation \"{relation}\""
+            )),
+            "{sql}: {err}"
+        );
+    }
+    // What is only stored, or not filled.
+    build(&[
+        ("0001.sql", LOOP),
+        (
+            "0002.sql",
+            "CREATE VIEW v4 AS SELECT * FROM v2;
+             CREATE OR REPLACE VIEW v3 AS SELECT a FROM v2;
+             CREATE TABLE c AS SELECT * FROM v2 WITH NO DATA;
+             CREATE MATERIALIZED VIEW m AS SELECT * FROM v2 WITH NO DATA;
+             REFRESH MATERIALIZED VIEW m WITH NO DATA;
+             -- Polymorphic: only parsed.
+             CREATE FUNCTION fp(anyelement) RETURNS SETOF int LANGUAGE sql
+                 AS 'SELECT a FROM v2';
+             CREATE RULE r AS ON INSERT TO t DO ALSO SELECT * FROM v2;
+             -- A rule that doesn't fire for the event.
+             CREATE TABLE tu (a int);
+             CREATE RULE ru AS ON UPDATE TO tu DO ALSO SELECT * FROM v2;
+             INSERT INTO tu VALUES (1);
+             CREATE RULE rn AS ON DELETE TO tu DO INSTEAD NOTHING;
+             DELETE FROM tu;
+             -- The routine's own setting: its validator doesn't check.
+             CREATE FUNCTION fs() RETURNS SETOF int LANGUAGE sql AS 'SELECT a FROM v2'
+                 SET check_function_bodies = off;
+             CREATE FUNCTION ft() RETURNS SETOF int LANGUAGE sql AS 'SELECT a FROM v2'
+                 SET check_function_bodies TO off;
+             CREATE FUNCTION fu() RETURNS SETOF int LANGUAGE sql
+                 SET check_function_bodies = off
+                 BEGIN ATOMIC SELECT a FROM v2; END;
+             SET check_function_bodies = off;
+             CREATE FUNCTION fo() RETURNS SETOF int LANGUAGE sql AS 'SELECT a FROM v2';
+             CREATE FUNCTION fa() RETURNS SETOF int LANGUAGE sql
+                 BEGIN ATOMIC SELECT a FROM v2; END;",
+        ),
+    ]);
+}
+
+#[test]
+fn a_conditional_rule_cannot_notify() {
+    // transformRuleStmt: a rule with a WHERE condition adds it to each
+    // action, which must be a query.
+    let err = try_apply(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int);
+         CREATE RULE r AS ON INSERT TO t WHERE new.a > 0 DO ALSO NOTIFY x;",
+    )])
+    .unwrap_err();
+    assert!(
+        err.to_string().starts_with(
+            "rules with WHERE conditions can only have SELECT, INSERT, UPDATE, or DELETE actions"
+        ),
+        "{err}"
+    );
+    build(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int);
+         CREATE RULE r AS ON INSERT TO t DO ALSO NOTIFY x;
+         CREATE RULE r2 AS ON INSERT TO t WHERE new.a > 0 DO ALSO SELECT 1;",
+    )]);
+}

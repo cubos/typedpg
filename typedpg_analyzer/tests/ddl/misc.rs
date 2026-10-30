@@ -6019,3 +6019,71 @@ fn copy_from_refuses_generated_columns_and_views_without_a_trigger() {
         assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
     }
 }
+
+#[test]
+fn declare_cursor_analyzes_its_query() {
+    // transformDeclareCursorStmt analyzes the query and PerformCursorOpen
+    // rewrites it; the analyzer took any DECLARE unchecked.
+    let t = "CREATE TABLE u1 (a int); CREATE TABLE u2 (a int);";
+    for (sql, message) in [
+        (
+            "DECLARE c CURSOR FOR SELECT * FROM nope;",
+            "relation \"nope\" does not exist",
+        ),
+        (
+            "DECLARE c CURSOR FOR SELECT b FROM u1;",
+            "column \"b\" does not exist",
+        ),
+        (
+            "DECLARE c CURSOR FOR WITH x AS (INSERT INTO u1 VALUES (1) RETURNING a)
+             SELECT * FROM x;",
+            "DECLARE CURSOR must not contain data-modifying statements in WITH",
+        ),
+        (
+            "DECLARE c SCROLL CURSOR FOR SELECT * FROM u1 FOR SHARE FOR UPDATE;",
+            "DECLARE SCROLL CURSOR ... FOR UPDATE is not supported",
+        ),
+        (
+            "DECLARE c SCROLL CURSOR FOR SELECT * FROM u1, u2 FOR SHARE OF u2 FOR UPDATE OF u1;",
+            "DECLARE SCROLL CURSOR ... FOR SHARE is not supported",
+        ),
+        (
+            "DECLARE c SCROLL CURSOR FOR SELECT * FROM u1, u2 FOR UPDATE OF u2 FOR SHARE OF u1;",
+            "DECLARE SCROLL CURSOR ... FOR UPDATE is not supported",
+        ),
+        (
+            "DECLARE c INSENSITIVE CURSOR FOR SELECT * FROM u1 FOR KEY SHARE;",
+            "DECLARE INSENSITIVE CURSOR ... FOR KEY SHARE is not valid",
+        ),
+        (
+            "DECLARE c CURSOR WITH HOLD FOR SELECT * FROM u1 FOR NO KEY UPDATE;",
+            "DECLARE CURSOR WITH HOLD ... FOR NO KEY UPDATE is not supported",
+        ),
+        (
+            "CREATE VIEW v2 AS SELECT a FROM u1;
+             CREATE VIEW v3 AS SELECT a FROM v2;
+             CREATE OR REPLACE VIEW v2 AS SELECT a FROM v3;
+             DECLARE c CURSOR FOR SELECT * FROM v2;",
+            "infinite recursion detected in rules for relation \"v2\"",
+        ),
+        (
+            "EXPLAIN DECLARE c SCROLL CURSOR FOR SELECT * FROM u1 FOR UPDATE;",
+            "DECLARE SCROLL CURSOR ... FOR UPDATE is not supported",
+        ),
+    ] {
+        // A cursor lives in a transaction block.
+        let block = format!("BEGIN; {sql} COMMIT;");
+        let err = try_apply(&[("0001.sql", t), ("0002.sql", &block)]).expect_err(sql);
+        assert!(err.to_string().starts_with(message), "{sql}: {err}");
+    }
+    build(&[(
+        "0001.sql",
+        "CREATE TABLE u1 (a int);
+         BEGIN;
+         DECLARE c1 CURSOR FOR SELECT * FROM u1 FOR UPDATE;
+         DECLARE c2 SCROLL CURSOR FOR SELECT * FROM (SELECT * FROM u1 FOR UPDATE) s;
+         DECLARE c3 CURSOR WITH HOLD FOR SELECT a FROM u1;
+         DECLARE c4 NO SCROLL CURSOR FOR SELECT * FROM u1 FOR SHARE;
+         COMMIT;",
+    )]);
+}

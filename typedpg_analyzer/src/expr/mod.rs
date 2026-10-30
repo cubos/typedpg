@@ -1610,18 +1610,58 @@ pub(crate) fn inconsistent_param_error(
 
 thread_local! {
     static PLAN_TIME_CHECKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static REWRITTEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Sets a thread-local flag for its lifetime and restores the previous
+/// value when dropped — also when the analysis it guards unwinds.
+struct FlagGuard {
+    flag: &'static std::thread::LocalKey<std::cell::Cell<bool>>,
+    prev: bool,
+}
+
+impl FlagGuard {
+    fn set(flag: &'static std::thread::LocalKey<std::cell::Cell<bool>>, on: bool) -> Self {
+        FlagGuard {
+            flag,
+            prev: flag.with(|c| c.replace(on)),
+        }
+    }
+}
+
+impl Drop for FlagGuard {
+    fn drop(&mut self) {
+        self.flag.with(|c| c.set(self.prev));
+    }
 }
 
 /// Run `f` analyzing a statement that will be *planned and executed* (an
 /// application query), as opposed to DDL that only stores an expression
 /// (a view, a default, a function body): the checks for errors the
 /// planner raises on every execution — constant folding, selectivity
-/// estimation — apply only here.
+/// estimation — apply only here. A planned statement is rewritten first
+/// ([`with_rewriting`]).
 pub(crate) fn with_plan_time_checks<R>(f: impl FnOnce() -> R) -> R {
-    let prev = PLAN_TIME_CHECKS.with(|c| c.replace(true));
-    let out = f();
-    PLAN_TIME_CHECKS.with(|c| c.set(prev));
-    out
+    let _plan = FlagGuard::set(&PLAN_TIME_CHECKS, true);
+    let _rewrite = FlagGuard::set(&REWRITTEN, true);
+    f()
+}
+
+/// Run `f` analyzing a statement the rewriter expands (`on`) — one run,
+/// prepared or explained (`QueryRewrite`), the query CREATE TABLE AS /
+/// CREATE MATERIALIZED VIEW fills the relation from, a SQL function body
+/// `fmgr_sql_validator` checks — or one only stored (`!on`: a view's
+/// query, a rule's actions), which PG rewrites only once a statement
+/// reads it.
+pub(crate) fn with_rewriting<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let _rewrite = FlagGuard::set(&REWRITTEN, on);
+    f()
+}
+
+/// Whether the statement analyzed is rewritten ([`with_rewriting`]): the
+/// views it reads are expanded (`fireRIRrules`), and the rules it fires.
+pub(crate) fn rewritten() -> bool {
+    REWRITTEN.with(std::cell::Cell::get)
 }
 
 /// Whether [`with_plan_time_checks`] is in effect.

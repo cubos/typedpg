@@ -348,6 +348,149 @@ fn aliased_join_hides_the_relations_inside() {
 }
 
 #[test]
+fn an_aliased_join_hides_its_inner_aliases() {
+    // regress/sql/join.sql, bug #8444: an alias on the join hides `x`
+    // inside it, so the outer `x` isn't duplicated.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE x1 (q1 int); CREATE TABLE y1 (f1 int);")
+        .unwrap();
+    let s = db
+        .analyze("SELECT * FROM x1 x JOIN (y1 x CROSS JOIN y1 y(ff)) j ON q1 = f1")
+        .unwrap();
+    assert_cols(&s, vec![c("q1", int4()), c("f1", int4()), cn("ff", int4())]);
+}
+
+/// PG's checkNameSpaceConflicts compares only the namespaces a join (or
+/// the FROM list) puts together: an aliased join exposes just its alias.
+#[test]
+fn hidden_names_may_repeat_visible_ones() {
+    let db = setup();
+    for sql in [
+        "SELECT x.a, j.t_id FROM t x JOIN (u x CROSS JOIN nn) j ON x.id = j.t_id",
+        "SELECT * FROM t x, (u x CROSS JOIN nn) j",
+        "SELECT * FROM (u x CROSS JOIN nn) j, t x",
+        "SELECT * FROM (t a JOIN u b ON true) j, (t a JOIN u b ON true) k",
+        "SELECT * FROM t x JOIN ((u x CROSS JOIN nn) j CROSS JOIN k x) l ON true",
+        // The ON clause inside sees its own sides' `x`.
+        "SELECT * FROM t x JOIN (u x JOIN nn ON x.id = nn.id) j ON true",
+        // A LATERAL item before the inner `x` sees the outer one.
+        "SELECT * FROM t x JOIN (LATERAL (SELECT x.a) s CROSS JOIN u x) j ON true",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    // Two `x` in the namespaces one join or FROM list puts together.
+    for sql in [
+        "SELECT * FROM t x JOIN (u x CROSS JOIN nn) ON true",
+        "SELECT * FROM t x, (u x CROSS JOIN nn)",
+        "SELECT * FROM t x JOIN (u x CROSS JOIN nn) j ON true JOIN k x ON true",
+        "SELECT * FROM t x JOIN (u y CROSS JOIN nn) x ON true",
+        "SELECT * FROM t x, LATERAL (SELECT 1) x",
+    ] {
+        assert_err_starts_with(&db, sql, "table name \"x\" specified more than once");
+    }
+    // After the inner `x`, a LATERAL reference could mean either.
+    assert_err_starts_with(
+        &db,
+        "SELECT * FROM t x JOIN (u x CROSS JOIN LATERAL (SELECT x.y) s) j ON true",
+        "table reference \"x\" is ambiguous",
+    );
+}
+
+/// Entries sharing a name, one of them hidden, are still two entries: what
+/// is known of one says nothing of the other.
+#[test]
+fn hidden_entries_keep_their_own_nullability() {
+    let db = setup();
+    // The inner `x` is NULL-extended (`ON false`); the outer one isn't.
+    let s = db
+        .analyze("SELECT x.x, j.x AS jx FROM u x LEFT JOIN (u x CROSS JOIN nn) j ON false")
+        .unwrap();
+    assert_cols(&s, vec![c("x", text()), cn("jx", text())]);
+    let s = db
+        .analyze("SELECT x.a, j.a AS ja FROM nn LEFT JOIN t x ON false, (t x CROSS JOIN u) j")
+        .unwrap();
+    assert_cols(&s, vec![cn("a", int4()), c("ja", int4())]);
+    // `j2.b IS NOT NULL` proves nothing of `j1`'s `b`, NULL-extended.
+    let s = db
+        .analyze(
+            "SELECT j1.bq FROM (t a LEFT JOIN t b ON false) j1(ai, aa, ab, ac, bi, bq),
+                 (t a CROSS JOIN t b) j2(ai, aa, ab, ac, bi, bq) WHERE j2.bq IS NOT NULL",
+        )
+        .unwrap();
+    assert_cols(&s, vec![cn("bq", int4())]);
+}
+
+/// The grouping checks tell hidden entries from visible ones of the same
+/// name: grouping one's primary key doesn't group the other's columns.
+#[test]
+fn hidden_entries_are_grouped_apart() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE p (id int PRIMARY KEY, v int); CREATE TABLE y1 (f1 int);")
+        .unwrap();
+    for sql in [
+        "SELECT x.v FROM p x JOIN (p x CROSS JOIN y1) j ON true GROUP BY j.id",
+        "SELECT j.v FROM p x JOIN (p x CROSS JOIN y1) j ON true GROUP BY x.id",
+        "SELECT j.v FROM (p x CROSS JOIN y1) j, (p x CROSS JOIN y1) k GROUP BY k.id",
+    ] {
+        assert_err_starts_with(
+            &db,
+            sql,
+            "column \"x.v\" must appear in the GROUP BY clause",
+        );
+    }
+    for sql in [
+        "SELECT j.v FROM p x JOIN (p x CROSS JOIN y1) j ON true GROUP BY j.id",
+        "SELECT x.v FROM p x JOIN (p x CROSS JOIN y1) j ON true GROUP BY x.id",
+        "SELECT j.v FROM (p x CROSS JOIN y1) j, (p x CROSS JOIN y1) k GROUP BY j.id",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
+
+#[test]
+fn a_using_join_alias_under_an_outer_alias_is_missing() {
+    // The `USING (…) AS x` name is no range-table entry's: hidden by the
+    // outer alias, it's missing, not unreachable like `t` (errorMissingRTE).
+    let db = setup();
+    for sql in [
+        "SELECT * FROM (t JOIN u USING (id) AS x) AS xx WHERE x.id = 1",
+        "SELECT x.* FROM (t JOIN u USING (id) AS x) AS xx",
+    ] {
+        assert_err_starts_with(&db, sql, "missing FROM-clause entry for table \"x\"");
+    }
+    assert_err_starts_with(
+        &db,
+        "SELECT * FROM (t JOIN u USING (id) AS x) AS xx WHERE t.id = 1",
+        "invalid reference to FROM-clause entry for table \"t\"",
+    );
+    let s = db
+        .analyze("SELECT xx.id FROM (t JOIN u USING (id) AS x) AS xx")
+        .unwrap();
+    assert_cols(&s, vec![c("id", int4())]);
+    db.analyze("SELECT * FROM (t JOIN u USING (id) AS x) xx, (t JOIN u USING (id) AS x) yy")
+        .unwrap();
+    // Nor does it conflict with a visible `x` beside the aliased join, on
+    // either side; `x` is then that entry.
+    for sql in [
+        "SELECT x.a FROM t x, (t JOIN u USING (id) AS x) j",
+        "SELECT x.a FROM (t JOIN u USING (id) AS x) j, t x",
+        "SELECT x.a FROM t x JOIN (t JOIN u USING (id) AS x) j ON true",
+        "SELECT x.a FROM (t JOIN u USING (id) AS x) j JOIN t x ON true",
+    ] {
+        let s = db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        assert_cols(&s, vec![c("a", int4())]);
+    }
+    // Unaliased, the join exposes it.
+    for sql in [
+        "SELECT 1 FROM t x, (t JOIN u USING (id) AS x)",
+        "SELECT 1 FROM (t JOIN u USING (id) AS x), t x",
+        "SELECT 1 FROM t x JOIN (t JOIN u USING (id) AS x) ON true",
+    ] {
+        assert_err_starts_with(&db, sql, "table name \"x\" specified more than once");
+    }
+}
+
+#[test]
 fn aliased_join_alias_errors() {
     let db = setup();
     assert_err_starts_with(

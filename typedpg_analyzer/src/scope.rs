@@ -150,6 +150,18 @@ pub(crate) struct TableSource {
     /// LATERAL one reads): a FROM-less query, an aggregate without GROUP
     /// BY, a lookup a foreign key guarantees, ...
     pub min_one_row: bool,
+    /// An entry an aliased join hides (in [`Scope::shadowed_sources`]),
+    /// whose alias is then a fresh one: names may repeat across hidden
+    /// entries (`(t a JOIN u b) j, (t a JOIN u b) k`).
+    pub hidden: Option<HiddenEntry>,
+}
+
+/// What a hidden entry was: its name in the query, and the alias of the
+/// join entry that hides it.
+#[derive(Debug, Clone)]
+pub(crate) struct HiddenEntry {
+    pub name: String,
+    pub join: String,
 }
 
 /// Why a locking clause can't be pushed into a view or subquery.
@@ -189,8 +201,10 @@ pub(crate) enum SourceKind {
     Cte,
     /// A FROM function (`RTE_FUNCTION`).
     Function,
-    /// A JOIN's merged USING columns (`RTE_JOIN`).
-    Join,
+    /// A join (`RTE_JOIN`): an aliased one, or the merged columns of a
+    /// `JOIN USING` — named by its `AS` alias when `using_alias`, a name
+    /// in the join's namespace only, not the range table's.
+    Join { using_alias: bool },
     /// Anything else (VALUES lists, the INSERT `excluded` pseudo-relation).
     #[default]
     Other,
@@ -221,6 +235,22 @@ pub(crate) fn is_hidden_alias(alias: &str) -> bool {
     alias.starts_with(HIDDEN_ALIAS_MARK)
 }
 
+/// The key a visible FROM item named `original` is set aside under while
+/// a FROM item of another namespace takes that name (see
+/// [`Scope::asides`]). It still answers to `original`.
+fn aside_alias(original: &str) -> String {
+    format!("{}{HIDDEN_ALIAS_MARK}{original}", hidden_alias("aside"))
+}
+
+/// The name an alias made by [`aside_alias`] answers to.
+fn aside_original(alias: &str) -> Option<&str> {
+    alias
+        .strip_prefix(HIDDEN_ALIAS_MARK)?
+        .strip_prefix("aside")?
+        .split_once(HIDDEN_ALIAS_MARK)
+        .map(|(_, original)| original)
+}
+
 impl TableSource {
     /// A source that holds only `columns` (a CTE, subquery, function, or
     /// merged USING columns).
@@ -242,6 +272,31 @@ impl TableSource {
             partial_scan: false,
             inherits_rows: false,
             min_one_row: false,
+            hidden: None,
+        }
+    }
+
+    /// The name the query gives this entry (a hidden one's, not its fresh
+    /// alias).
+    pub(crate) fn refname(&self) -> &str {
+        self.hidden.as_ref().map_or(&self.alias, |h| &h.name)
+    }
+
+    /// Whether a qualifier `name` reaches this entry: its alias, or the
+    /// one it was set aside from.
+    pub(crate) fn answers_to(&self, name: &str) -> bool {
+        self.alias == name || aside_original(&self.alias) == Some(name)
+    }
+
+    /// Name this entry, and its columns, `alias`.
+    pub(crate) fn rename(&mut self, alias: &str) {
+        self.alias = alias.to_owned();
+        for c in self
+            .columns
+            .iter_mut()
+            .chain(self.system_columns.iter_mut())
+        {
+            c.table_alias = alias.to_owned();
         }
     }
 
@@ -359,6 +414,16 @@ pub(crate) struct Scope {
     /// being processed: a LATERAL item there sees them only as
     /// [`TableSource::lateral_blocked`] entries.
     pub lateral_blocked_aliases: std::collections::HashSet<String>,
+    /// The FROM items set aside — `(key, name)` — while a FROM item of
+    /// another namespace that takes their name is processed: `x` in `x1 x
+    /// JOIN (y1 x CROSS JOIN y1 y) j`, whose join alias hides the inner
+    /// `x` (PG's `checkNameSpaceConflicts` compares only the namespaces
+    /// joined). Each entry is known to the nullability context by its
+    /// alias, so the two must not share it; a set-aside one still answers
+    /// to its name ([`TableSource::answers_to`]).
+    /// The location of the item that took the name goes along, for the
+    /// conflict error.
+    pub asides: Vec<(String, String, Option<SourceSpan>)>,
     /// CTEs visible at this query level (its own WITH plus the enclosing
     /// ones). Sublinks and nested subqueries inherit them — PG resolves a
     /// CTE name by walking up the parse-state chain (`scanNameSpaceForCTE`).
@@ -425,6 +490,7 @@ impl Default for Scope {
             outer_sources: RULE_PSEUDO_RELATIONS.with(|r| r.borrow().clone()),
             shadowed_sources: Vec::new(),
             lateral_blocked_aliases: Default::default(),
+            asides: Vec::new(),
             ctes: Default::default(),
         }
     }
@@ -761,12 +827,82 @@ impl Scope {
         self.resolve_column(table, column, None).ok()
     }
 
+    /// Set aside the visible entry named `alias`, if any, before a FROM
+    /// item of another namespace takes the name (see [`Self::asides`]).
+    /// `span` locates the item taking the name. Returns the key, to rename
+    /// the entry in the nullability context too.
+    pub(crate) fn set_aside(&mut self, alias: &str, span: Option<SourceSpan>) -> Option<String> {
+        if is_hidden_alias(alias) {
+            return None;
+        }
+        let source = self.sources.iter_mut().find(|s| s.alias == alias)?;
+        let key = aside_alias(alias);
+        source.rename(&key);
+        if self.lateral_blocked_aliases.remove(alias) {
+            self.lateral_blocked_aliases.insert(key.clone());
+        }
+        self.asides.push((key.clone(), alias.to_owned(), span));
+        Some(key)
+    }
+
+    /// The FROM item that started when `asides.len()` was `from` is done,
+    /// joined to the entries at `beside` (a join's left side, the FROM
+    /// list's earlier items): give those of them it set aside their names
+    /// back — PG's `checkNameSpaceConflicts` (42712) if it still exposes
+    /// the name. Returns them as `(key, name)`, to rename in the
+    /// nullability context too. The ones set aside further out wait for
+    /// the join that meets them.
+    pub(crate) fn restore_asides(
+        &mut self,
+        from: usize,
+        beside: std::ops::Range<usize>,
+    ) -> Result<Vec<(String, String)>, AnalyzeError> {
+        let mut restored = Vec::new();
+        let mut kept = Vec::new();
+        for (key, alias, span) in self.asides.split_off(from).into_iter().rev() {
+            let Some(at) = self.sources.iter().position(|s| s.alias == key) else {
+                continue;
+            };
+            if !beside.contains(&at) {
+                kept.push((key, alias, span));
+                continue;
+            }
+            if self.sources.iter().any(|s| s.alias == alias) {
+                return Err(crate::pgmsg::duplicate_table_alias(&alias, span).finalize_implicit());
+            }
+            self.sources[at].rename(&alias);
+            if self.lateral_blocked_aliases.remove(&key) {
+                self.lateral_blocked_aliases.insert(alias.clone());
+            }
+            restored.push((key, alias));
+        }
+        self.asides.extend(kept.into_iter().rev());
+        Ok(restored)
+    }
+
+    /// PG's `scanNameSpaceForRefname`: a qualifier two entries of the
+    /// nearest level holding it answer to is ambiguous (42P09) — a table
+    /// named `excluded` beside ON CONFLICT's EXCLUDED.
+    pub(crate) fn check_refname_unique(
+        &self,
+        alias: &str,
+        span: Option<SourceSpan>,
+    ) -> Result<(), AnalyzeError> {
+        let nearest = [&self.sources, &self.lateral_sources, &self.outer_sources]
+            .into_iter()
+            .find(|tier| tier.iter().any(|s| s.answers_to(alias)));
+        if nearest.is_some_and(|tier| tier.iter().filter(|s| s.answers_to(alias)).count() > 1) {
+            return Err(crate::pgmsg::ambiguous_table_reference(alias, span).finalize_implicit());
+        }
+        Ok(())
+    }
+
     pub fn find_source(&self, alias: &str) -> Option<&TableSource> {
         self.sources
             .iter()
             .chain(self.lateral_sources.iter())
             .chain(self.outer_sources.iter())
-            .find(|s| s.alias == alias)
+            .find(|s| s.answers_to(alias))
     }
 
     pub fn resolve_column(
@@ -776,15 +912,16 @@ impl Scope {
         span: Option<SourceSpan>,
     ) -> Result<&ScopeColumn, AnalyzeError> {
         if let Some(t) = table {
+            self.check_refname_unique(t, span)?;
             // PG's `refnameNamespaceItem` stops at the nearest level whose
             // namespace has an entry of that name: an inner `u` hides an
             // outer one even when only the outer has the column.
             let nearest = [&self.sources, &self.lateral_sources, &self.outer_sources]
                 .into_iter()
-                .find(|tier| tier.iter().any(|s| s.alias == t))
+                .find(|tier| tier.iter().any(|s| s.answers_to(t)))
                 .map_or(&[][..], |tier| tier.as_slice());
             for source in nearest {
-                if source.alias != t {
+                if !source.answers_to(t) {
                     continue;
                 }
                 // PG checks the entry's LATERAL visibility before looking
@@ -813,7 +950,7 @@ impl Scope {
             // missing-column wording, formatted through identifier quoting
             // rules (`column t.col does not exist`, `column "T".col does
             // not exist` when `T` needs quoting).
-            let alias_exists = self.all_tiers().any(|s| s.alias == t);
+            let alias_exists = self.all_tiers().any(|s| s.answers_to(t));
             if alias_exists {
                 return Err(undefined_column_error(
                     self,
@@ -833,9 +970,9 @@ impl Scope {
             let aliased_as = self
                 .all_tiers()
                 .chain(self.shadowed_sources.iter())
-                .find(|s| s.alias != t && s.source_qn.as_ref().is_some_and(|qn| qn.name == t))
-                .map(|s| s.alias.clone());
-            let shadowed = self.shadowed_sources.iter().any(|s| s.alias == t);
+                .find(|s| s.refname() != t && s.source_qn.as_ref().is_some_and(|qn| qn.name == t))
+                .map(|s| s.refname().to_owned());
+            let shadowed = self.shadowed_sources.iter().any(|s| s.refname() == t);
             if aliased_as.is_some() || shadowed {
                 // PG classifies this as undefined_table (42P01): the entry
                 // exists but is not referencable from here. Its hint
