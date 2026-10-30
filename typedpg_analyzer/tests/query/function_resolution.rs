@@ -333,6 +333,126 @@ fn from_function_argument_referencing_a_later_from_item() {
     );
 }
 
+/// A TABLESAMPLE argument can't see the FROM items of its own level, but
+/// in a LATERAL subquery it sees the enclosing level's, like any outer
+/// reference.
+#[test]
+fn tablesample_arguments_see_lateral_columns() {
+    let mut db = setup();
+    db.apply_sql("CREATE TABLE ten (u int)").unwrap();
+    let s = db
+        .analyze(
+            "SELECT * FROM (VALUES (0), (100)) v(pct),
+                 LATERAL (SELECT count(*) FROM ten TABLESAMPLE bernoulli (pct)) ss",
+        )
+        .unwrap();
+    assert_cols(&s, vec![c("pct", int4()), c("count", int8())]);
+    let s = db
+        .analyze("SELECT (SELECT count(*) FROM ten TABLESAMPLE bernoulli (t.x)) FROM t")
+        .unwrap();
+    assert_cols(&s, vec![c("count", int8())]);
+    assert_err_kind!(
+        db,
+        "SELECT * FROM (VALUES (0)) v(pct), ten TABLESAMPLE bernoulli (pct)",
+        AnalyzeError::UndefinedColumn(_),
+        "column \"pct\" does not exist"
+    );
+}
+
+/// `t.f` naming no column of `t` is the call `f(t)` (and `(x).f` the call
+/// `f(x)`): PG's `ParseFuncOrColumn` in column notation. A name that
+/// matches no function stays a missing column.
+#[test]
+fn functional_notation_calls_a_function_of_the_row() {
+    let mut db = setup();
+    db.apply_sql(
+        "CREATE TABLE person (name text);
+         CREATE FUNCTION upname(person) RETURNS text
+             AS 'select upper($1.name)' LANGUAGE sql;",
+    )
+    .unwrap();
+    for sql in [
+        "SELECT p.upname FROM person p",
+        "SELECT person.upname FROM person",
+        "SELECT public.person.upname FROM person",
+        "SELECT (p).upname FROM person p",
+    ] {
+        let s = db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        assert_cols(&s, vec![cn("upname", text())]);
+    }
+    let s = db.analyze("SELECT (5).abs").unwrap();
+    assert_cols(&s, vec![c("abs", int4())]);
+    assert_err_kind!(
+        db,
+        "SELECT p.nosuch FROM person p",
+        AnalyzeError::UndefinedColumn(_),
+        "column p.nosuch does not exist"
+    );
+    assert_err_kind!(
+        db,
+        "SELECT (p).nosuch FROM person p",
+        AnalyzeError::UndefinedColumn(_),
+        "column p.nosuch does not exist"
+    );
+    assert_err_starts_with(
+        &db,
+        "SELECT (p).upname.foo FROM person p",
+        "column notation .foo applied to type text, which is not a composite type",
+    );
+}
+
+/// The grouping checks see column notation `t.f` as the call `f(t.*)` it
+/// is: it reads the whole row, and matches a GROUP BY entry spelled either
+/// way.
+#[test]
+fn functional_notation_under_group_by() {
+    let mut db = setup();
+    db.apply_sql(
+        "CREATE TABLE person (name text);
+         CREATE TABLE pk (id int PRIMARY KEY, name text);
+         CREATE FUNCTION upname(person) RETURNS text
+             AS 'select upper($1.name)' LANGUAGE sql;
+         CREATE FUNCTION upname(pk) RETURNS text
+             AS 'select upper($1.name)' LANGUAGE sql;",
+    )
+    .unwrap();
+    for sql in [
+        "SELECT p.upname FROM person p GROUP BY p",
+        "SELECT p.upname FROM person p GROUP BY p.upname",
+        "SELECT upname(p) FROM person p GROUP BY p.upname",
+        "SELECT p.upname FROM person p GROUP BY upname(p)",
+        "SELECT k.upname FROM pk k GROUP BY k.id",
+    ] {
+        let s = db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        assert_cols(&s, vec![cn("upname", text())]);
+    }
+    for (sql, msg) in [
+        (
+            "SELECT p.upname FROM person p GROUP BY p.name",
+            "column \"p.*\" must appear in the GROUP BY clause or be used in an aggregate function",
+        ),
+        (
+            "SELECT p FROM person p GROUP BY p.upname",
+            "column \"p.*\" must appear in the GROUP BY clause or be used in an aggregate function",
+        ),
+        (
+            "SELECT p.name FROM person p GROUP BY p.upname",
+            "column \"p.name\" must appear in the GROUP BY clause or be used in an aggregate function",
+        ),
+        (
+            "SELECT 1 FROM person p GROUP BY p.name HAVING p.upname = 'x'",
+            "column \"p.*\" must appear in the GROUP BY clause or be used in an aggregate function",
+        ),
+    ] {
+        assert_err_kind!(db, sql, AnalyzeError::GroupingError(_), msg);
+    }
+    assert_err_starts_with(
+        &db,
+        "SELECT (SELECT p.upname) FROM person p GROUP BY p.name",
+        "subquery uses ungrouped column \"p.*\" from outer query",
+    );
+}
+
 #[test]
 fn variadic_any_argument_must_be_an_array() {
     let db = setup();

@@ -304,6 +304,149 @@ fn coldeflist_errors() {
     );
 }
 
+/// A function returning a domain over a composite type expands like one
+/// returning the composite (TYPEFUNC_COMPOSITE_DOMAIN): its attributes are
+/// the columns, and a column definition list is redundant.
+#[test]
+fn function_returning_a_composite_domain_expands_in_from() {
+    let mut db = setup();
+    db.apply_sql(
+        "CREATE TYPE comptype AS (r float8, i float8);
+         CREATE DOMAIN dcomptype AS comptype CHECK ((value).r > 0);
+         CREATE FUNCTION makedcomp(r float8, i float8) RETURNS dcomptype
+             AS 'select row(r, i)' LANGUAGE sql;",
+    )
+    .unwrap();
+    let s = db.analyze("SELECT * FROM makedcomp(1,2) m").unwrap();
+    assert_cols(&s, vec![cn("r", float8()), cn("i", float8())]);
+    let s = db
+        .analyze("SELECT x, y FROM makedcomp(1,2) AS m(x, y)")
+        .unwrap();
+    assert_cols(&s, vec![cn("x", float8()), cn("y", float8())]);
+    let s = db.analyze("SELECT (m).r FROM makedcomp(1,2) m").unwrap();
+    assert_cols(&s, vec![cn("r", float8())]);
+    assert_analyze_err!(
+        db.analyze("SELECT * FROM makedcomp(1,2) AS m(a int)"),
+        AnalyzeError::SyntaxError(_),
+        "a column definition list is redundant for a function returning a named composite type"
+    );
+}
+
+/// PG names an unnamed OUT parameter of a row `columnN`, after its
+/// position among the OUT parameters (`build_function_result_tupdesc_d`);
+/// a lone unnamed one leaves the function scalar, its column named after
+/// the alias.
+#[test]
+fn unnamed_out_parameters_are_result_columns() {
+    let mut db = setup();
+    db.apply_sql(
+        "CREATE FUNCTION f_out(in f1 int, out f2 int, out text)
+             AS 'select $1, ''x''' LANGUAGE sql;
+         CREATE FUNCTION f_inout(in f1 int, inout f2 int, out text)
+             AS 'select $2, ''x''' LANGUAGE sql;
+         CREATE FUNCTION f_anon(out int, out text) AS 'select 1, ''x''' LANGUAGE sql;
+         CREATE FUNCTION f_one(out int) AS 'select 1' LANGUAGE sql;",
+    )
+    .unwrap();
+    let s = db.analyze("SELECT * FROM f_out(42)").unwrap();
+    assert_cols(&s, vec![cn("f2", int4()), cn("column2", text())]);
+    let s = db.analyze("SELECT * FROM f_inout(42, 99)").unwrap();
+    assert_cols(&s, vec![cn("f2", int4()), cn("column2", text())]);
+    let s = db.analyze("SELECT * FROM f_out(42) AS p(a, b)").unwrap();
+    assert_cols(&s, vec![cn("a", int4()), cn("b", text())]);
+    let s = db.analyze("SELECT * FROM f_anon()").unwrap();
+    assert_cols(&s, vec![cn("column1", int4()), cn("column2", text())]);
+    let s = db.analyze("SELECT (f_anon()).column2").unwrap();
+    assert_cols(&s, vec![cn("column2", text())]);
+    let s = db.analyze("SELECT * FROM f_one() z").unwrap();
+    assert_cols(&s, vec![cn("z", int4())]);
+    assert_analyze_err!(
+        db.analyze("SELECT * FROM f_anon() AS x(a int, b text)"),
+        AnalyzeError::SyntaxError(_),
+        "a column definition list is redundant for a function with OUT parameters"
+    );
+}
+
+/// A pseudo-type result other than `void` and `cstring` — here `anyarray`
+/// that no polymorphic argument resolves — is TYPEFUNC_OTHER, which a
+/// function RTE rejects; the same call is fine in the select list.
+#[test]
+fn anyarray_returning_function_in_from_is_rejected() {
+    let db = setup();
+    assert_err_prefix!(
+        db.analyze("SELECT * FROM array_in('{1,2,3}', 'int4'::regtype, -1)"),
+        AnalyzeError::DatatypeMismatch(_),
+        "function \"array_in\" in FROM has unsupported return type anyarray"
+    );
+    db.analyze("SELECT array_in('{1,2,3}', 'int4'::regtype, -1)")
+        .unwrap();
+    let s = db.analyze("SELECT * FROM textout('abc')").unwrap();
+    assert_cols(&s, vec![c("textout", basic("pg_catalog", "cstring"))]);
+}
+
+// ── Other expressions in FROM ────────────────────────────────────────────────
+
+/// `func_expr_windowless` also admits `COALESCE`, `CAST`, `NULLIF`, …: PG
+/// classifies their result type like a function's, so a `record` takes a
+/// column definition list and a scalar is one column named after the
+/// alias or the expression.
+#[test]
+fn coalesce_in_from_with_a_column_definition_list() {
+    let db = setup();
+    let s = db
+        .analyze("SELECT * FROM coalesce(row(1,2)) AS (a int, b int)")
+        .unwrap();
+    assert_cols(&s, vec![cn("a", int4()), cn("b", int4())]);
+    let s = db
+        .analyze("SELECT * FROM coalesce(NULL, row(1,2)) AS (a int, b int)")
+        .unwrap();
+    assert_cols(&s, vec![cn("a", int4()), cn("b", int4())]);
+    assert_analyze_err!(
+        db.analyze("SELECT * FROM coalesce(row(1,2)) AS x"),
+        AnalyzeError::SyntaxError(_),
+        "a column definition list is required for functions returning \"record\"\n  \
+         help: add one after the alias, e.g. `AS x(a int, b text)`\n"
+    );
+    assert_analyze_err!(
+        db.analyze("SELECT * FROM coalesce(1) AS x(a int)"),
+        AnalyzeError::SyntaxError(_),
+        "a column definition list is only allowed for functions returning \"record\""
+    );
+    let s = db.analyze("SELECT * FROM coalesce(1, 2)").unwrap();
+    assert_cols(&s, vec![c("coalesce", int4())]);
+    let s = db.analyze("SELECT * FROM coalesce(1, 2) AS x").unwrap();
+    assert_cols(&s, vec![c("x", int4())]);
+    let s = db.analyze("SELECT * FROM cast('1' as int)").unwrap();
+    assert_cols(&s, vec![c("int4", int4())]);
+    let s = db.analyze("SELECT * FROM n, nullif(n.x, 2) v").unwrap();
+    assert_cols(&s, vec![c("id", int4()), cn("x", int4()), cn("v", int4())]);
+}
+
+/// The row a `record` item returns must match the column definition list
+/// exactly (`tupledesc_match`): where it is a `ROW(…)` the query fixes,
+/// every execution fails with this error.
+#[test]
+fn record_expression_in_from_must_match_its_column_definition_list() {
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("SELECT * FROM coalesce(row(1)) AS (a int, b int)"),
+        AnalyzeError::DatatypeMismatch(_),
+        "function return row and query-specified return row do not match \
+         (Returned row contains 1 attribute, but query expects 2.)"
+    );
+    assert_analyze_err!(
+        db.analyze("SELECT * FROM coalesce(row(1,2)) AS (a int8, b int)"),
+        AnalyzeError::DatatypeMismatch(_),
+        "function return row and query-specified return row do not match \
+         (Returned type integer at ordinal position 1, but query expects bigint.)"
+    );
+    // The second row is never returned: the first is never NULL.
+    let s = db
+        .analyze("SELECT * FROM coalesce(row(1,2), row(1)) AS (a int, b int)")
+        .unwrap();
+    assert_cols(&s, vec![cn("a", int4()), cn("b", int4())]);
+}
+
 // ── ROWS FROM (…) ────────────────────────────────────────────────────────────
 
 /// Every function contributes its columns; the shorter results are padded
@@ -439,6 +582,18 @@ fn srf_placement_rules() {
             "SELECT * FROM generate_series(1, generate_series(1,2))",
             "set-returning functions must appear at top level of FROM",
         ),
+        (
+            "SELECT * FROM cast(generate_series(1,2) as int8)",
+            "set-returning functions must appear at top level of FROM",
+        ),
+        (
+            "SELECT * FROM nullif(generate_series(1,2), 1)",
+            "set-returning functions must appear at top level of FROM",
+        ),
+        (
+            "SELECT * FROM coalesce(generate_series(1,2))",
+            "set-returning functions are not allowed in COALESCE",
+        ),
     ];
     for (sql, msg) in cases {
         let err = db.analyze(sql).unwrap_err();
@@ -453,6 +608,8 @@ fn srf_placement_rules() {
         "SELECT id FROM t GROUP BY generate_series(1,2), id",
         "INSERT INTO n VALUES (generate_series(1,2), 1)",
         "SELECT generate_series(1, generate_series(1, 2))",
+        // A cast to the call's own type is no cast: the call is top level.
+        "SELECT * FROM cast(generate_series(1,2) as int4)",
     ] {
         db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
     }

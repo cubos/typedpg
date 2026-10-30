@@ -61,6 +61,7 @@ fn column_refinement(col: &crate::scope::ScopeColumn, ctx: Ctx<'_>) -> crate::re
 pub(crate) fn infer_column_ref(
     col_ref: &protobuf::ColumnRef,
     ctx: Ctx<'_>,
+    params: &mut ParamCollector,
 ) -> Result<ExprType, AnalyzeError> {
     let Ctx {
         scope,
@@ -135,6 +136,32 @@ pub(crate) fn infer_column_ref(
                 && let Some(src) = scope.find_source(column)
             {
                 return whole_row_ref(src, null_ctx, snapshot);
+            }
+            // `t.f` naming no column of a FROM entry `t` is the function
+            // call `f(t)` on its whole row (transformColumnRef).
+            if let Some(table) = table
+                && matches!(e, AnalyzeError::UndefinedColumn(_))
+                && scope.find_source(table).is_some()
+            {
+                let mut fields = col_ref.fields[..col_ref.fields.len() - 1].to_vec();
+                fields.push(protobuf::Node {
+                    node: Some(node::Node::AStar(protobuf::AStar {})),
+                });
+                let whole_row = protobuf::Node {
+                    node: Some(node::Node::ColumnRef(protobuf::ColumnRef {
+                        fields,
+                        location: col_ref.location,
+                    })),
+                };
+                if let Some(call) = super::func_call::infer_column_notation_call(
+                    column,
+                    whole_row,
+                    col_ref.location,
+                    ctx,
+                    params,
+                ) {
+                    return call;
+                }
             }
             // Inside a SQL function body, a name no column or relation
             // claims may name one of the function's parameters.

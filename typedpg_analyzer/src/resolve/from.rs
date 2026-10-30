@@ -491,17 +491,28 @@ fn process_range_function(
                 "RangeFunction without function call".into(),
             ));
         };
-        let call = match pair.items.first().and_then(|n| n.node.as_ref()) {
-            Some(node::Node::FuncCall(fc)) => fc.as_ref(),
-            _ => {
-                return Err(AnalyzeError::Unsupported(
-                    "RangeFunction item is not a FuncCall".into(),
-                ));
-            }
-        };
         let coldeflist: &[protobuf::Node] = match pair.items.get(1).and_then(|n| n.node.as_ref()) {
             Some(node::Node::List(l)) => &l.items,
             _ => &[],
+        };
+        let call = match pair.items.first() {
+            Some(protobuf::Node {
+                node: Some(node::Node::FuncCall(fc)),
+            }) => fc.as_ref(),
+            // `func_expr_windowless`'s other forms — `COALESCE(…)`,
+            // `CAST(…)`, `CURRENT_DATE`, … — are plain expressions.
+            Some(n @ protobuf::Node { node: Some(_) }) => {
+                funcs.push(RteFunction {
+                    call: RteCall::Expr(n),
+                    coldeflist,
+                });
+                continue;
+            }
+            _ => {
+                return Err(AnalyzeError::Unsupported(
+                    "RangeFunction item without an expression".into(),
+                ));
+            }
         };
         if coldeflist.is_empty() && is_sql_standard_unnest(call) {
             for arg in &call.args {
@@ -514,14 +525,14 @@ fn process_range_function(
                     .collect();
                 single.args = vec![arg.clone()];
                 funcs.push(RteFunction {
-                    call: std::borrow::Cow::Owned(single),
+                    call: RteCall::Func(std::borrow::Cow::Owned(single)),
                     coldeflist: &[],
                 });
             }
             continue;
         }
         funcs.push(RteFunction {
-            call: std::borrow::Cow::Borrowed(call),
+            call: RteCall::Func(std::borrow::Cow::Borrowed(call)),
             coldeflist,
         });
     }
@@ -549,7 +560,7 @@ fn process_range_function(
         Some(a) => a.aliasname.clone(),
         None => funcs
             .first()
-            .and_then(|f| expr::extract_string_fields(&f.call.funcname).pop())
+            .map(RteFunction::name)
             .unwrap_or_else(|| "_srf".into()),
     };
     let alias = alias_owned.as_str();
@@ -574,10 +585,7 @@ fn process_range_function(
                 &mut whole_row,
                 &mut rows,
             )?);
-            let call = protobuf::Node {
-                node: Some(node::Node::FuncCall(Box::new(f.call.clone().into_owned()))),
-            };
-            crate::clause::check_level_calls(&call, arg_ctx, "functions in FROM", true)?;
+            crate::clause::check_level_calls(&f.node(), arg_ctx, "functions in FROM", true)?;
         }
         Ok::<(), AnalyzeError>(())
     })?;
@@ -586,7 +594,9 @@ fn process_range_function(
     if nfuncs != 1 || rf.ordinality {
         whole_row = crate::scope::WholeRow::Record;
     }
-    if nfuncs > 1 && !srfs_have_equal_static_rows(funcs.iter().map(|f| &*f.call), arg_ctx, params) {
+    let calls: Option<Vec<&protobuf::FuncCall>> = funcs.iter().map(RteFunction::func).collect();
+    if nfuncs > 1 && !calls.is_some_and(|calls| srfs_have_equal_static_rows(calls, arg_ctx, params))
+    {
         // nodeFunctionscan.c pads every function that runs out of rows
         // first with NULLs — unless they all yield as many.
         for c in &mut cols {
@@ -638,10 +648,12 @@ fn process_range_function(
     // with a NULL argument not at all: no row. So wherever a row of a lone
     // one is, its arguments were non-NULL (several functions pad each
     // other's missing rows with NULLs).
-    if nfuncs == 1 && rows.strict_srf {
+    if nfuncs == 1
+        && rows.strict_srf
+        && let Some(call) = funcs[0].func()
+    {
         let own = crate::nonnull::own_aliases(scope);
-        let facts = funcs[0]
-            .call
+        let facts = call
             .args
             .iter()
             .fold(crate::nonnull::Facts::default(), |acc, a| {
@@ -692,8 +704,46 @@ fn constant_series_is_non_empty(args: &[protobuf::Node]) -> bool {
 /// One function of a function RTE after `transformRangeFunction`'s
 /// preprocessing: the call and the column definition list attached to it.
 struct RteFunction<'a> {
-    call: std::borrow::Cow<'a, protobuf::FuncCall>,
+    call: RteCall<'a>,
     coldeflist: &'a [protobuf::Node],
+}
+
+/// What a function RTE item evaluates: a function call, or another
+/// expression of the function-call syntax (`COALESCE(…)`, `CAST(…)`, …).
+enum RteCall<'a> {
+    Func(std::borrow::Cow<'a, protobuf::FuncCall>),
+    Expr(&'a protobuf::Node),
+}
+
+impl RteFunction<'_> {
+    fn func(&self) -> Option<&protobuf::FuncCall> {
+        match &self.call {
+            RteCall::Func(fc) => Some(fc),
+            RteCall::Expr(_) => None,
+        }
+    }
+
+    fn node(&self) -> protobuf::Node {
+        match &self.call {
+            RteCall::Func(fc) => protobuf::Node {
+                node: Some(node::Node::FuncCall(Box::new(fc.clone().into_owned()))),
+            },
+            RteCall::Expr(n) => (*n).clone(),
+        }
+    }
+
+    /// `FigureColname` of the item: the RTE's default alias, the column
+    /// name of a scalar result, and the name in `unsupported return type`.
+    fn name(&self) -> String {
+        match &self.call {
+            RteCall::Func(fc) => expr::extract_string_fields(&fc.funcname)
+                .pop()
+                .unwrap_or_default(),
+            RteCall::Expr(n) => {
+                super::target_list::infer_column_name(n).unwrap_or_else(|| "?column?".into())
+            }
+        }
+    }
 }
 
 /// PG rewrites `unnest(a, b, …)` into `ROWS FROM (unnest(a), unnest(b), …)`
@@ -1837,7 +1887,21 @@ fn function_rte_columns(
     rows: &mut RteFunctionRows,
 ) -> Result<Vec<ScopeColumn>, AnalyzeError> {
     let snapshot = arg_ctx.snapshot;
-    let func_call: &protobuf::FuncCall = &f.call;
+    let func_call: &protobuf::FuncCall = match &f.call {
+        RteCall::Func(fc) => fc,
+        RteCall::Expr(node) => {
+            if let Some(fc) = noop_cast_of_call(node, arg_ctx, params) {
+                let call = RteFunction {
+                    call: RteCall::Func(std::borrow::Cow::Borrowed(fc)),
+                    coldeflist: f.coldeflist,
+                };
+                return function_rte_columns(
+                    &call, alias, nfuncs, arg_ctx, params, whole_row, rows,
+                );
+            }
+            return expr_rte_columns(f, node, alias, nfuncs, arg_ctx, params, whole_row);
+        }
+    };
     let func_name_parts = expr::extract_string_fields(&func_call.funcname);
     let (schema, name) = expr::deconstruct_qualified_name(
         &func_name_parts,
@@ -1938,37 +2002,14 @@ fn function_rte_columns(
             })
             .collect());
     }
-    if let Some(typrelid) = snapshot.get_type(resolved.return_type_oid).and_then(|t| {
-        (t.typtype == TypType::Composite)
-            .then_some(t.typrelid)
-            .flatten()
-    }) {
-        if has_coldeflist {
-            return Err(crate::pgmsg::coldeflist_redundant_composite().finalize_implicit());
-        }
-        *whole_row = crate::scope::WholeRow::Composite(resolved.return_type_oid);
-        return Ok(snapshot
-            .attributes_of(typrelid)
-            .iter()
-            .map(|f| ScopeColumn {
-                name: f.attname.clone(),
-                type_oid: f.atttypid,
-                // A row-type *value* does not enforce its relation's NOT
-                // NULL constraints — `jsonb_populate_record(NULL::t, '{}')`
-                // and a `RETURNS SETOF t` function can both yield NULL
-                // fields, and a NULL row reads as all-NULL fields. PG's
-                // function RTE (`addRangeTableEntryForFunction`) takes only
-                // the tuple descriptor's names and types.
-                base_not_null: false,
-                typmod: snapshot.effective_typmod(f.atttypid, f.atttypmod),
-                collation: f.attcollation,
-                table_alias: alias.to_owned(),
-                record_fields: None,
-                elem_nullable: None,
-                refine: crate::refine::Refinement::NONE,
-                origin: None,
-            })
-            .collect());
+    if let Some(cols) = composite_rte_columns(
+        resolved.return_type_oid,
+        has_coldeflist,
+        alias,
+        snapshot,
+        whole_row,
+    )? {
+        return Ok(cols);
     }
     if resolved.return_type_oid == oid::RECORD {
         if !has_coldeflist {
@@ -1982,21 +2023,12 @@ fn function_rte_columns(
     // get_type_func_class: a pseudo-type other than `record`, `void` and
     // `cstring` (`unknownin`, a trigger function) makes no relation —
     // checked after the column definition list, as PG does.
-    const VOID: PgTypeOid = PgTypeOid::from_raw(2278);
-    const CSTRING: PgTypeOid = PgTypeOid::from_raw(2275);
-    if resolved.return_type_oid != VOID
-        && resolved.return_type_oid != CSTRING
-        && snapshot
-            .get_type(resolved.return_type_oid)
-            .is_some_and(|t| t.typtype == TypType::Pseudo)
-    {
-        return Err(crate::pgmsg::function_in_from_unsupported_return_type(
-            name,
-            &crate::ddl::util::format_type_for_message(snapshot, resolved.return_type_oid),
-            crate::error::SourceSpan::from_node_qname(func_call.location),
-        )
-        .finalize_implicit());
-    }
+    check_rte_scalar_type(
+        resolved.return_type_oid,
+        name,
+        snapshot,
+        crate::error::SourceSpan::from_node_qname(func_call.location),
+    )?;
 
     // A strict catalog SRF's elements are NOT NULL unless the function
     // emits NULLs itself (`unnest` of an array with NULL elements); other
@@ -2037,6 +2069,236 @@ fn function_rte_columns(
             .unwrap_or_default(),
         origin: None,
     }])
+}
+
+/// A function RTE item that is not a function call — `COALESCE(…)`,
+/// `CAST(…)`, `CURRENT_DATE`, … (`func_expr_windowless`): PG classifies
+/// its result type the same way (`get_expr_result_type`), and names a
+/// scalar column after the alias or the item's `FigureColname`.
+fn expr_rte_columns(
+    f: &RteFunction<'_>,
+    node: &protobuf::Node,
+    alias: &str,
+    nfuncs: usize,
+    arg_ctx: Ctx<'_>,
+    params: &mut ParamCollector,
+    whole_row: &mut crate::scope::WholeRow,
+) -> Result<Vec<ScopeColumn>, AnalyzeError> {
+    let snapshot = arg_ctx.snapshot;
+    crate::resolve::walk::check_srf_nesting(node, snapshot)?;
+    let value = expr::infer_expr(node, arg_ctx, params, TypeGoal::NONE)?;
+    // transformRangeFunction: only the top-level call may return a set.
+    if count_srf_calls(std::slice::from_ref(node), snapshot) > 0 {
+        return Err(crate::error::RawError::new(
+            AnalyzeError::FeatureNotSupported(
+                "set-returning functions must appear at top level of FROM".into(),
+            ),
+            None,
+            None,
+        )
+        .finalize_implicit());
+    }
+    let has_coldeflist = !f.coldeflist.is_empty();
+    if let Some(cols) =
+        composite_rte_columns(value.type_oid, has_coldeflist, alias, snapshot, whole_row)?
+    {
+        return Ok(cols);
+    }
+    if value.type_oid == oid::RECORD {
+        if !has_coldeflist {
+            return Err(crate::pgmsg::coldeflist_required().finalize_implicit());
+        }
+        let cols = coldeflist_columns(f.coldeflist, alias, snapshot)?;
+        if let Some(shape) = static_row_shape(node, arg_ctx, params) {
+            check_row_matches_coldeflist(&shape, &cols, snapshot)?;
+        }
+        return Ok(cols);
+    }
+    if has_coldeflist {
+        return Err(crate::pgmsg::coldeflist_only_for_record().finalize_implicit());
+    }
+    let name = f.name();
+    check_rte_scalar_type(value.type_oid, &name, snapshot, None)?;
+    *whole_row = crate::scope::WholeRow::Scalar;
+    Ok(vec![ScopeColumn {
+        name: if nfuncs == 1 { alias.to_owned() } else { name },
+        type_oid: value.type_oid,
+        base_not_null: !value.nullable,
+        table_alias: alias.to_owned(),
+        typmod: value.typmod,
+        collation: value.collation,
+        record_fields: None,
+        elem_nullable: value.elem_nullable,
+        refine: value.refine,
+        origin: None,
+    }])
+}
+
+/// The call under a cast to its own type — no cast at all
+/// (`coerce_type`), so the item is the call, which may return a set.
+fn noop_cast_of_call<'a>(
+    node: &'a protobuf::Node,
+    ctx: Ctx<'_>,
+    params: &ParamCollector,
+) -> Option<&'a protobuf::FuncCall> {
+    let node::Node::TypeCast(tc) = node.node.as_ref()? else {
+        return None;
+    };
+    let call = tc.arg.as_deref()?;
+    let node::Node::FuncCall(fc) = call.node.as_ref()? else {
+        return None;
+    };
+    let mut scratch = params.clone();
+    let cast = expr::infer_expr(node, ctx, &mut scratch, TypeGoal::NONE).ok()?;
+    let value = expr::infer_expr(call, ctx, &mut scratch, TypeGoal::NONE).ok()?;
+    (cast.type_oid == value.type_oid && cast.typmod == value.typmod).then_some(fc)
+}
+
+/// A function RTE item returning a composite type — named, or a domain
+/// over one (TYPEFUNC_COMPOSITE / TYPEFUNC_COMPOSITE_DOMAIN): the type's
+/// attributes are its columns, and a column definition list is redundant.
+/// `None` for any other type.
+fn composite_rte_columns(
+    type_oid: PgTypeOid,
+    has_coldeflist: bool,
+    alias: &str,
+    snapshot: &PgCatalog,
+    whole_row: &mut crate::scope::WholeRow,
+) -> Result<Option<Vec<ScopeColumn>>, AnalyzeError> {
+    let Some(typrelid) = snapshot
+        .get_type(snapshot.unwrap_domain(type_oid))
+        .and_then(|t| {
+            (t.typtype == TypType::Composite)
+                .then_some(t.typrelid)
+                .flatten()
+        })
+    else {
+        return Ok(None);
+    };
+    if has_coldeflist {
+        return Err(crate::pgmsg::coldeflist_redundant_composite().finalize_implicit());
+    }
+    // makeWholeRowVar: the whole row is a value of the function's own
+    // result type, the domain included.
+    *whole_row = crate::scope::WholeRow::Composite(type_oid);
+    Ok(Some(
+        snapshot
+            .attributes_of(typrelid)
+            .iter()
+            .map(|f| ScopeColumn {
+                name: f.attname.clone(),
+                type_oid: f.atttypid,
+                // A row-type *value* does not enforce its relation's NOT
+                // NULL constraints — `jsonb_populate_record(NULL::t, '{}')`
+                // and a `RETURNS SETOF t` function can both yield NULL
+                // fields, and a NULL row reads as all-NULL fields. PG's
+                // function RTE (`addRangeTableEntryForFunction`) takes only
+                // the tuple descriptor's names and types.
+                base_not_null: false,
+                typmod: snapshot.effective_typmod(f.atttypid, f.atttypmod),
+                collation: f.attcollation,
+                table_alias: alias.to_owned(),
+                record_fields: None,
+                elem_nullable: None,
+                refine: crate::refine::Refinement::NONE,
+                origin: None,
+            })
+            .collect(),
+    ))
+}
+
+/// `get_type_func_class`: a pseudo-type result other than `void` and
+/// `cstring` (which PG treats as scalars) — `anyarray` left unresolved,
+/// `trigger`, `internal`, … — is TYPEFUNC_OTHER, which a function RTE
+/// rejects (`addRangeTableEntryForFunction`, 42804).
+fn check_rte_scalar_type(
+    type_oid: PgTypeOid,
+    name: &str,
+    snapshot: &PgCatalog,
+    span: Option<crate::error::SourceSpan>,
+) -> Result<(), AnalyzeError> {
+    let unsupported = snapshot.get_type(type_oid).is_some_and(|t| {
+        t.typtype == TypType::Pseudo && !matches!(t.typname.as_str(), "void" | "cstring")
+    });
+    if unsupported {
+        let ty = crate::ddl::util::format_type_for_message(snapshot, type_oid);
+        return Err(
+            crate::pgmsg::function_in_from_unsupported_return_type(name, &ty, span)
+                .finalize_implicit(),
+        );
+    }
+    Ok(())
+}
+
+/// The column types of the row an anonymous-record item always returns,
+/// when the expression alone fixes it: a `ROW(…)` constructor, or the
+/// `COALESCE` whose first argument not a NULL literal is such a row (and
+/// never NULL, so it is the one returned). `None` when unknown.
+fn static_row_shape(
+    node: &protobuf::Node,
+    ctx: Ctx<'_>,
+    params: &ParamCollector,
+) -> Option<Vec<PgTypeOid>> {
+    match node.node.as_ref()? {
+        node::Node::RowExpr(_) => {
+            let mut scratch = params.clone();
+            let row = expr::infer_expr(node, ctx, &mut scratch, TypeGoal::NONE).ok()?;
+            let shape = row.record_fields?;
+            (!shape.hidden).then(|| shape.fields.iter().map(|f| f.ty.type_oid).collect())
+        }
+        node::Node::CoalesceExpr(c) => {
+            let first = c.args.iter().find(|a| {
+                !matches!(
+                    a.node.as_ref(),
+                    Some(node::Node::AConst(protobuf::AConst { isnull: true, .. }))
+                )
+            })?;
+            let mut scratch = params.clone();
+            let value = expr::infer_expr(first, ctx, &mut scratch, TypeGoal::NONE).ok()?;
+            if value.nullable {
+                return None;
+            }
+            static_row_shape(first, ctx, params)
+        }
+        _ => None,
+    }
+}
+
+/// `tupledesc_match` (execSRF.c): a returned row must have exactly the
+/// column definition list's column count and types — no coercion — or
+/// every execution fails (42804). Checked where the returned row is known
+/// statically ([`static_row_shape`]).
+fn check_row_matches_coldeflist(
+    shape: &[PgTypeOid],
+    cols: &[ScopeColumn],
+    snapshot: &PgCatalog,
+) -> Result<(), AnalyzeError> {
+    let detail = if shape.len() != cols.len() {
+        Some(format!(
+            "Returned row contains {} attribute{}, but query expects {}.",
+            shape.len(),
+            if shape.len() == 1 { "" } else { "s" },
+            cols.len()
+        ))
+    } else {
+        shape
+            .iter()
+            .zip(cols)
+            .enumerate()
+            .find(|(_, (returned, col))| **returned != col.type_oid)
+            .map(|(i, (&returned, col))| {
+                format!(
+                    "Returned type {} at ordinal position {}, but query expects {}.",
+                    crate::ddl::util::format_type_for_message(snapshot, returned),
+                    i + 1,
+                    crate::ddl::util::format_type_for_message(snapshot, col.type_oid)
+                )
+            })
+    };
+    match detail {
+        Some(detail) => Err(crate::pgmsg::function_row_mismatch(&detail).finalize_implicit()),
+        None => Ok(()),
+    }
 }
 
 /// The columns a column definition list (`AS x(a int, b varchar(3))`)
@@ -2091,7 +2353,9 @@ fn coldeflist_columns(
 /// the handler's parameter list (2202H), each argument is coerced to its
 /// parameter type and REPEATABLE's seed to double precision (42804 with
 /// PG's `argument of TABLESAMPLE must be type …` wording). The arguments
-/// can't reference the sampled relation or other FROM items.
+/// can't reference the sampled relation or other FROM items of its level,
+/// but see the enclosing query levels — the ones a LATERAL subquery lets
+/// in included.
 fn process_tablesample(
     ts: &protobuf::RangeTableSample,
     scope: &Scope,
@@ -2134,6 +2398,8 @@ fn process_tablesample(
         )));
     }
     let mut arg_scope = Scope {
+        lateral_sources: scope.lateral_sources.clone(),
+        outer_sources: scope.outer_sources.clone(),
         ctes: scope.ctes.clone(),
         ..Scope::default()
     };
