@@ -699,15 +699,19 @@ pub(crate) fn function_signature(interp: &PgCatalog, oid: PgProcOid) -> String {
     let Some(p) = interp.pg_proc.get(&oid) else {
         return String::new();
     };
-    let visible = interp.schemas_for_lookup(None).into_iter().find_map(|ns| {
-        interp
-            .pg_proc
-            .values()
-            .find(|q| {
-                q.pronamespace == ns && q.proname == p.proname && q.proargtypes == p.proargtypes
-            })
-            .map(|q| q.oid)
-    }) == Some(oid);
+    let visible = interp
+        .schemas_for_function_lookup(None)
+        .into_iter()
+        .find_map(|ns| {
+            interp
+                .pg_proc
+                .values()
+                .find(|q| {
+                    q.pronamespace == ns && q.proname == p.proname && q.proargtypes == p.proargtypes
+                })
+                .map(|q| q.oid)
+        })
+        == Some(oid);
     let args: Vec<String> = p
         .proargtypes
         .iter()

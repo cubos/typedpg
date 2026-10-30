@@ -5,7 +5,7 @@ use typedpg_pg_query::protobuf::{DropBehavior, DropStmt, ObjectType, node};
 use super::DdlError;
 use super::util::{extract_names, format_type_for_message, node_string, resolve_type_name};
 use super::views;
-use crate::oid::{PgCastOid, PgClassOid, PgNamespaceOid, PgOperatorOid, PgProcOid, PgTypeOid};
+use crate::oid::{PgCastOid, PgClassOid, PgOperatorOid, PgProcOid, PgTypeOid};
 use crate::pg_catalog::{
     PG_CAST_RELID, PG_CLASS_RELID, PG_EXTENSION_RELID, PG_NAMESPACE_RELID, PG_OPERATOR_RELID,
     PG_PROC_RELID, PG_TYPE_RELID, PgCatalog, PgOperator, RelKind,
@@ -1491,18 +1491,8 @@ pub(crate) fn find_operator(
     name: &str,
     matches: &dyn Fn(&PgOperator) -> bool,
 ) -> Option<PgOperatorOid> {
-    let candidate_schemas: Vec<PgNamespaceOid> = if let Some(s) = schema {
-        snapshot.namespace_oid(s).into_iter().collect()
-    } else {
-        let mut v = Vec::new();
-        if let Some(pg_oid) = snapshot.namespace_oid("pg_catalog")
-            && !snapshot.search_path.contains(&pg_oid)
-        {
-            v.push(pg_oid);
-        }
-        v.extend(snapshot.search_path.iter().copied());
-        v
-    };
+    // OpernameGetCandidates: the temporary schema only by its name.
+    let candidate_schemas = snapshot.schemas_for_function_lookup(schema);
     for nsoid in candidate_schemas {
         if let Some(oids) = snapshot.operator_by_qname.get(&(nsoid, name.to_owned())) {
             for &oid in oids {

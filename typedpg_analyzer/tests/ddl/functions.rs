@@ -82,8 +82,9 @@ fn create_function_variadic_non_array_is_rejected() {
 #[test]
 fn functions_in_pg_temp() {
     // PG 18 QualifiedNameGetCreationNamespace: `pg_temp` names the session's
-    // temporary schema, created on first use. FuncnameGetCandidates never
-    // searches it implicitly: a temporary routine is called by its qualified
+    // temporary schema, created on first use. FuncnameGetCandidates (and
+    // OpernameGetCandidates) never search it implicitly, even when the path
+    // lists it: a temporary routine or operator is reached by its qualified
     // name only.
     let db = build_db(&[(
         "0001.sql",
@@ -92,7 +93,13 @@ fn functions_in_pg_temp() {
          SELECT pg_temp.whoami(), pg_temp.ag(1);
          CREATE TEMP TABLE tt (a int);
          CREATE FUNCTION pg_temp.f(tt) RETURNS int AS 'select 1' LANGUAGE sql;
-         DROP FUNCTION pg_temp.whoami();",
+         DROP FUNCTION pg_temp.whoami();
+         CREATE FUNCTION pg_temp.eqx(int, int) RETURNS bool LANGUAGE sql AS 'select $1 = $2';
+         CREATE OPERATOR pg_temp.=== (leftarg = int, rightarg = int, function = pg_temp.eqx);
+         SET search_path = pg_temp, public;
+         SELECT 1 OPERATOR(pg_temp.===) 1;
+         ALTER FUNCTION pg_temp.eqx(int, int) STABLE;
+         DROP OPERATOR pg_temp.=== (int, int);",
     )]);
     for (stmt, msg) in [
         (
@@ -104,6 +111,49 @@ fn functions_in_pg_temp() {
             "CREATE FUNCTION pg_temp.whoami() RETURNS text AS 'select 1::text' LANGUAGE sql;
              DROP FUNCTION whoami();",
             "function whoami() does not exist",
+        ),
+        // Not even with `pg_temp` listed on the search path.
+        (
+            "CREATE FUNCTION pg_temp.whoami() RETURNS text AS 'select 1::text' LANGUAGE sql;
+             SET search_path = pg_temp, public;
+             SELECT whoami();",
+            "function whoami() does not exist",
+        ),
+        (
+            "CREATE FUNCTION pg_temp.whoami() RETURNS text AS 'select 1::text' LANGUAGE sql;
+             SET search_path = pg_temp, public;
+             ALTER FUNCTION whoami() STABLE;",
+            "function whoami() does not exist",
+        ),
+        // CREATE TRIGGER's LookupFuncName.
+        (
+            "CREATE TABLE t (a int);
+             CREATE FUNCTION pg_temp.tf() RETURNS trigger LANGUAGE plpgsql
+                 AS 'begin return new; end';
+             SET search_path = pg_temp, public;
+             CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION tf();",
+            "function tf() does not exist",
+        ),
+        // Operators likewise (OpernameGetCandidates).
+        (
+            "CREATE FUNCTION pg_temp.eqx(int, int) RETURNS bool LANGUAGE sql AS 'select $1 = $2';
+             CREATE OPERATOR pg_temp.=== (leftarg = int, rightarg = int, function = pg_temp.eqx);
+             SELECT 1 === 1;",
+            "operator does not exist: integer === integer",
+        ),
+        (
+            "CREATE FUNCTION pg_temp.eqx(int, int) RETURNS bool LANGUAGE sql AS 'select $1 = $2';
+             CREATE OPERATOR pg_temp.=== (leftarg = int, rightarg = int, function = pg_temp.eqx);
+             SET search_path = pg_temp, public;
+             SELECT 1 === 1;",
+            "operator does not exist: integer === integer",
+        ),
+        (
+            "CREATE FUNCTION pg_temp.eqx(int, int) RETURNS bool LANGUAGE sql AS 'select $1 = $2';
+             CREATE OPERATOR pg_temp.=== (leftarg = int, rightarg = int, function = pg_temp.eqx);
+             SET search_path = pg_temp, public;
+             DROP OPERATOR === (int, int);",
+            "operator does not exist: integer === integer",
         ),
     ] {
         let err = try_apply(&[("0001.sql", stmt)]).expect_err(stmt);

@@ -127,9 +127,10 @@ impl PgCatalog {
         out
     }
 
-    /// [`Self::schemas_for_lookup`] for routines: the temporary schema is
-    /// never searched for them implicitly (FuncnameGetCandidates), so a
-    /// function in `pg_temp` is only reached by its qualified name.
+    /// [`Self::schemas_for_lookup`] for routines and operators: the
+    /// temporary schema is never searched for them implicitly
+    /// (FuncnameGetCandidates, OpernameGetCandidates), even when the path
+    /// lists `pg_temp`, so one there is only reached by its qualified name.
     pub(crate) fn schemas_for_function_lookup(&self, schema: Option<&str>) -> Vec<PgNamespaceOid> {
         let mut out = self.schemas_for_lookup(schema);
         if schema.is_none()
@@ -661,7 +662,7 @@ impl PgCatalog {
         prefix: bool,
     ) -> Vec<&PgOperator> {
         let mut out: Vec<&PgOperator> = Vec::new();
-        for nsoid in self.schemas_for_lookup(schema) {
+        for nsoid in self.schemas_for_function_lookup(schema) {
             let Some(oids) = self.operator_by_qname.get(&(nsoid, name.to_owned())) else {
                 continue;
             };

@@ -198,7 +198,7 @@ fn lookup_by_names(
                     .map(|p| ObjectAddress::proc(p.oid))
                     .collect()
             } else {
-                let path = snapshot.schemas_for_lookup(schema);
+                let path = snapshot.schemas_for_function_lookup(schema);
                 snapshot
                     .pg_operator
                     .values()
