@@ -262,11 +262,13 @@ pub fn lookup_type_name(tn: &TypeName, snapshot: &PgCatalog) -> Result<PgTypeOid
         }
     };
 
+    // An array of a type without one (an array type itself: `_int4[]`)
+    // doesn't exist either.
     if !tn.array_bounds.is_empty() {
         return snapshot.array_type_of(base_oid).ok_or_else(|| {
             DdlError::TypeNotFound(format!(
-                "could not find array type for data type {}",
-                format_type_for_message(snapshot, base_oid)
+                "type \"{}\" does not exist",
+                type_name_to_string(tn)
             ))
         });
     }

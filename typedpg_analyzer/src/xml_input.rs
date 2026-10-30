@@ -10,8 +10,10 @@
 //! and character references (only the five predefined entities exist
 //! without a DTD), malformed comments / CDATA / processing instructions,
 //! `]]>` in text, and characters outside XML's `Char` production.
-//! Anything involving a DOCTYPE (parsed as a document), namespaces, or
-//! libxml's limits is accepted unchecked.
+//! A DOCTYPE in the prolog makes PG parse the input as a document
+//! (`xmlCtxtReadDoc`): a plain `<!DOCTYPE name>` is checked as one, with
+//! a single root element; any other DOCTYPE (external ID, internal
+//! subset), namespaces, or libxml's limits are accepted unchecked.
 
 /// Why a literal can't be accepted with certainty.
 enum Verdict {
@@ -55,15 +57,15 @@ pub(crate) fn validate(content: &str) -> Result<(), String> {
 fn check(content: &str) -> Result<(), Verdict> {
     let decl_len = parse_xml_decl(content.as_bytes())?;
     let rest = &content[decl_len..];
-    if doctype_in_content(rest.as_bytes()) {
-        return Err(Verdict::Unsure);
-    }
-    Parser {
+    let mut parser = Parser {
         s: rest,
         p: 0,
         stack: Vec::new(),
+    };
+    if doctype_in_content(rest.as_bytes()) {
+        return parser.document();
     }
-    .content()
+    parser.content(false)
 }
 
 /// Port of xml.c's `parse_xml_decl`: the byte length of a leading
@@ -319,12 +321,68 @@ impl<'a> Parser<'a> {
         Ok(true)
     }
 
-    fn content(&mut self) -> Result<(), Verdict> {
+    /// A document whose prolog has a DOCTYPE (only whitespace, comments
+    /// and PIs before it, as `doctype_in_content` found): exactly one root
+    /// element, with only whitespace, comments and PIs around it.
+    fn document(&mut self) -> Result<(), Verdict> {
+        loop {
+            self.skip_blanks();
+            if self.eat("<!DOCTYPE") {
+                break;
+            }
+            self.p += 1; // `<` of a comment or PI
+            self.markup()?;
+        }
+        // Only the bare `<!DOCTYPE name>` form is modelled.
+        if !self.skip_blanks() {
+            return Err(Verdict::Unsure);
+        }
+        self.name().map_err(|_| Verdict::Unsure)?;
+        self.skip_blanks();
+        if !self.eat(">") {
+            return Err(Verdict::Unsure);
+        }
+        let mut root = false;
+        loop {
+            self.skip_blanks();
+            let Some(c) = self.peek() else {
+                break;
+            };
+            if c != '<' {
+                return self.invalid();
+            }
+            self.p += 1;
+            if self.rest().starts_with('!') && !self.rest().starts_with("!--") {
+                return self.invalid(); // a CDATA section or a second DOCTYPE
+            }
+            if !self.rest().starts_with(['!', '?', '/']) {
+                if root {
+                    return self.invalid();
+                }
+                root = true;
+            }
+            self.markup()?;
+            if !self.stack.is_empty() {
+                self.content(true)?;
+            }
+        }
+        if !root {
+            return self.invalid();
+        }
+        Ok(())
+    }
+
+    /// Text and markup up to the end of the input or, when `element` is
+    /// set, up to the end tag closing the open element.
+    fn content(&mut self, element: bool) -> Result<(), Verdict> {
         while let Some(c) = self.peek() {
             match c {
                 '<' => {
                     self.p += 1;
                     self.markup()?;
+                    if element && self.stack.is_empty() {
+                        return Ok(());
+                    }
                 }
                 '&' => {
                     self.p += 1;
@@ -495,6 +553,11 @@ mod tests {
             "<?xml  version=\"1.1\" encoding='x' standalone=\"yes\" ?>",
             "<!DOCTYPE a><a/>",
             "<?xml version=\"1.0\"?><!DOCTYPE a><a/>",
+            "<!DOCTYPE a ><a/>",
+            "<!--x--><?pi?> <!DOCTYPE a><a></a>",
+            "<!DOCTYPE a><a/>  <!--c--><?pi x?> ",
+            "<!DOCTYPE a><b>&amp;<c/>text</b>",
+            "<!DOCTYPE a SYSTEM \"x\"><a>&foo;</a>",
         ] {
             assert!(validate(ok).is_ok(), "{ok:?} should be accepted");
         }
@@ -550,6 +613,16 @@ mod tests {
             "<?XmL x?>",
             "<a/><?xml version=\"1.0\"?>",
             " <?xml version=\"1.0\"?>",
+            "<!DOCTYPE a><a/><b/>",
+            "<!DOCTYPE a>",
+            "<!DOCTYPE a>text<a/>",
+            "<!DOCTYPE a><a/>text",
+            "<!DOCTYPE a><a/>&amp;",
+            "<!DOCTYPE a><a>&foo;</a>",
+            "<!DOCTYPE a><a>",
+            "<!DOCTYPE a><a/></a>",
+            "<!DOCTYPE a><a/><![CDATA[x]]>",
+            "<!DOCTYPE a><a/><!DOCTYPE a>",
         ] {
             assert_eq!(validate(bad).unwrap_err(), "invalid XML content", "{bad:?}");
         }

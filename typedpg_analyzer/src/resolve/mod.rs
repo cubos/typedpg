@@ -732,12 +732,16 @@ fn values_lists(sql: &str, spreads: &[AnalyzedSpread]) -> Result<Vec<ValuesList>
 /// for the caret — while other variants keep their full `Display`.
 pub(crate) fn parse_failure(e: typedpg_pg_query::Error, sql: &str) -> crate::error::RawError {
     match e {
-        typedpg_pg_query::Error::Parse { message, position } => {
+        typedpg_pg_query::Error::Parse {
+            message,
+            position,
+            funcname,
+        } => {
             let span =
                 position.map(|p| crate::error::SourceSpan::syntax_error_at(sql, p, &message));
-            crate::pgmsg::grammar_error(message, span)
+            crate::pgmsg::grammar_error(message, funcname.as_deref(), span)
         }
-        other => crate::pgmsg::grammar_error(other.to_string(), None),
+        other => crate::pgmsg::grammar_error(other.to_string(), None, None),
     }
 }
 

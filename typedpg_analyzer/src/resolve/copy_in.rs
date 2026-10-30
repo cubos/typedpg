@@ -38,7 +38,10 @@ fn copy_target_syntax_error(
     target: &str,
     prefix: usize,
 ) -> AnalyzeError {
-    let typedpg_pg_query::Error::Parse { message, position } = e else {
+    let typedpg_pg_query::Error::Parse {
+        message, position, ..
+    } = e
+    else {
         return AnalyzeError::Invalid(e.to_string());
     };
     let lex = crate::param::LexOutput::identity(target);

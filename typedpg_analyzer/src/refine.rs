@@ -237,7 +237,16 @@ impl Refinement {
             .pg_type
             .get(&to)
             .is_some_and(|t| t.typtype == crate::pg_catalog::TypType::Pseudo);
+        // An interval literal may spell an infinity with its extreme field
+        // values rather than a word.
+        let extreme_interval = from == oid::UNKNOWN
+            && to == INTERVAL
+            && self.values.as_ref().is_some_and(|vs| {
+                vs.iter()
+                    .any(|v| crate::datetime_input::interval_may_be_infinite(v))
+            });
         let finite = self.finite
+            && !extreme_interval
             && (from == to || pseudo || from == oid::UNKNOWN || (datetime(from) && datetime(to)));
         let values = match &self.values {
             Some(vs) if from == oid::UNKNOWN => Exact::of(to, None, snapshot)

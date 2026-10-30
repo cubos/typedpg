@@ -359,7 +359,13 @@ fn parse_radix_digits(s: &mut &str) -> Option<(u32, String)> {
     };
     if let Some(r) = radix {
         *s = &s[2..];
-        // After the prefix the first char must be a digit (no `0x_1`).
+        // Unlike a decimal run, a prefixed one may start with an underscore
+        // (`0x_FF`), as long as a digit follows it.
+        if let Some(rest) = s.strip_prefix('_')
+            && rest.starts_with(|c: char| c.is_digit(r))
+        {
+            *s = rest;
+        }
         let digits = take_digits(s, r)?;
         Some((r, digits))
     } else {
@@ -667,11 +673,15 @@ fn validate_float(content: &str, type_name: &str) -> Result<(), String> {
 pub(crate) fn validate_numeric(content: &str) -> Result<(), String> {
     let err = || crate::pgmsg::invalid_input_syntax_for_type("numeric", content);
     let mut s = content.trim_matches(|c: char| c.is_ascii_whitespace());
+    // NaN mustn't have a sign; infinities may.
+    if s.eq_ignore_ascii_case("nan") {
+        return Ok(());
+    }
     if let Some(rest) = s.strip_prefix(['+', '-']) {
         s = rest;
     }
     let lower = s.to_ascii_lowercase();
-    if lower == "nan" || lower == "inf" || lower == "infinity" {
+    if lower == "inf" || lower == "infinity" {
         return Ok(());
     }
 
@@ -1029,62 +1039,81 @@ pub(crate) fn validate_bit(content: &str) -> Result<(), String> {
 // ─── money ──────────────────────────────────────────────────────────────────
 
 /// Mirrors `cash_in` (cash.c) under the C locale's fallback symbols
-/// (`$` currency, `,` thousands, `.` decimal): optional whitespace, an
-/// optional `(` (negative) or sign, an optional `$` (sign also accepted
-/// after it), then digits with free-form `,` separators and at most one
-/// decimal point; trailing whitespace / `)` / `$` allowed. At least one
-/// digit is required. The range check only fires for magnitudes no int64
-/// cent count could hold (≥ 18 integer digits) — kept conservative.
+/// (`$` currency, `,` thousands, `.` decimal, `+`/`-` signs, two fraction
+/// digits): optional whitespace and `$`, a `-`, `(` or `+`, whitespace and
+/// `$` again, then digits with free-form `,` separators and at most one
+/// decimal point — digits past the second decimal are dropped, the first
+/// of them rounding — then only whitespace, `)`, signs and `$`. The amount
+/// is accumulated, negated, in an int64 cent count, so a magnitude past it
+/// is out of range (`-92233720368547758.08` fits, its positive does not).
 fn validate_money(content: &str) -> Result<(), String> {
     let err = || crate::pgmsg::invalid_input_syntax_for_type("money", content);
-    let mut s = content.trim_start_matches(|c: char| c.is_ascii_whitespace());
-    if let Some(rest) = s.strip_prefix('(') {
-        s = rest;
-    } else if let Some(rest) = s.strip_prefix(['+', '-']) {
-        s = rest;
-    }
-    s = s.trim_start_matches(|c: char| c.is_ascii_whitespace());
-    if let Some(rest) = s.strip_prefix('$') {
-        s = rest;
-        if let Some(rest) = s.strip_prefix(['+', '-']) {
-            s = rest;
+    let out_of_range = || format!("value \"{content}\" is out of range for type money");
+    let b = content.as_bytes();
+    let mut p = 0;
+    let skip_space_and_symbol = |p: &mut usize| {
+        while *p < b.len() && c_isspace(b[*p]) {
+            *p += 1;
         }
+        if b.get(*p) == Some(&b'$') {
+            *p += 1;
+        }
+        while *p < b.len() && c_isspace(b[*p]) {
+            *p += 1;
+        }
+    };
+    skip_space_and_symbol(&mut p);
+    let mut negative = false;
+    match b.get(p) {
+        Some(b'-' | b'(') => {
+            negative = true;
+            p += 1;
+        }
+        Some(b'+') => p += 1,
+        _ => {}
     }
-    let mut int_digits = 0usize;
-    let mut any_digit = false;
+    skip_space_and_symbol(&mut p);
+    // Built in the negative, as cash_in does, so the most negative amount fits.
+    let mut value: i64 = 0;
+    let mut dec = 0;
     let mut seen_dot = false;
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'0'..=b'9' => {
-                any_digit = true;
-                if !seen_dot {
-                    int_digits += 1;
-                }
+    while p < b.len() {
+        let c = b[p];
+        if c.is_ascii_digit() && (!seen_dot || dec < 2) {
+            value = value
+                .checked_mul(10)
+                .and_then(|v| v.checked_sub(i64::from(c - b'0')))
+                .ok_or_else(out_of_range)?;
+            if seen_dot {
+                dec += 1;
             }
-            b',' if !seen_dot => {}
-            b'.' if !seen_dot => seen_dot = true,
-            _ => break,
+        } else if c == b'.' && !seen_dot {
+            seen_dot = true;
+        } else if c != b',' {
+            break;
         }
-        i += 1;
+        p += 1;
     }
-    // The empty string is a valid money input on PG 18 (parses as $0.00),
-    // so digits are only required once any non-money character appears.
-    if !any_digit && !s[i..].is_empty() {
-        return Err(err());
+    if b.get(p).is_some_and(|&c| (b'5'..=b'9').contains(&c)) {
+        value = value.checked_sub(1).ok_or_else(out_of_range)?;
     }
-    // Trailing: whitespace, `)`, and a trailing currency symbol are accepted.
-    if !s[i..]
-        .chars()
-        .all(|c| c.is_ascii_whitespace() || c == ')' || c == '$')
-    {
-        return Err(err());
+    for _ in dec..2 {
+        value = value.checked_mul(10).ok_or_else(out_of_range)?;
     }
-    if int_digits >= 18 {
-        return Err(format!(
-            "value \"{content}\" is out of range for type money"
-        ));
+    while p < b.len() && b[p].is_ascii_digit() {
+        p += 1;
+    }
+    while p < b.len() {
+        match b[p] {
+            c if c_isspace(c) => {}
+            b')' | b'+' | b'$' => {}
+            b'-' => negative = true,
+            _ => return Err(err()),
+        }
+        p += 1;
+    }
+    if !negative && value == i64::MIN {
+        return Err(out_of_range());
     }
     Ok(())
 }
@@ -1603,7 +1632,9 @@ fn validate_pg_snapshot(content: &str) -> Result<(), String> {
         return Err(bad());
     }
     p += end + 1;
-    if xmin == 0 || xmax == 0 || xmax < xmin {
+    // `FullTransactionIdIsValid` looks at the xid's low 32 bits only, so
+    // an epoch-aligned value (`4294967296`, `2^63`) is invalid too.
+    if xmin as u32 == 0 || xmax as u32 == 0 || xmax < xmin {
         return Err(bad());
     }
     let mut last = 0u64;
@@ -1925,30 +1956,77 @@ fn validate_aclitem(content: &str) -> Result<(), String> {
 
 // ─── system identifier types ────────────────────────────────────────────────
 
-/// Mirrors `tidin` (tid.c): `(block,offset)` with two unsigned decimal
-/// numbers. Surrounding whitespace tolerated (accept-leaning).
+/// Mirrors `tidin` (tid.c): the block number starts after the first `(`
+/// or `,`, the offset after the next `,` (scanning stops at a `)`), each
+/// read by `strtoul(…, 10)` — leading whitespace and a sign allowed, `-`
+/// wrapping — which must stop at the `,` resp. `)`. Nothing before the
+/// `(` or after the `)` is looked at. The block must fit `uint32` (or be a
+/// negative `int32`, as `'(-1,0)'` is block 4294967295), the offset 65535.
 fn validate_tid(content: &str) -> Result<(), String> {
     let err = || format!("invalid input syntax for type tid: \"{content}\"");
-    let s = content.trim_matches(|c: char| c.is_ascii_whitespace());
-    let inner = s
-        .strip_prefix('(')
-        .and_then(|r| r.strip_suffix(')'))
-        .ok_or_else(err)?;
-    let (block, offset) = inner.split_once(',').ok_or_else(err)?;
-    for part in [block, offset] {
-        let p = part.trim_matches(|c: char| c.is_ascii_whitespace());
-        if p.is_empty() || !p.chars().all(|c| c.is_ascii_digit()) {
-            return Err(err());
+    let b = content.as_bytes();
+    let mut coord = Vec::with_capacity(2);
+    for (i, &c) in b.iter().enumerate() {
+        if coord.len() == 2 || c == b')' {
+            break;
         }
+        if c == b',' || (c == b'(' && coord.is_empty()) {
+            coord.push(i + 1);
+        }
+    }
+    let [block, offset] = coord[..] else {
+        return Err(err());
+    };
+    let (block, end) = strtoul10(&b[block..]).ok_or_else(err)?;
+    if b.get(coord[0] + end) != Some(&b',')
+        || (u64::from(block as u32) != block && block as u32 as i32 as i64 as u64 != block)
+    {
+        return Err(err());
+    }
+    let (offset_value, end) = strtoul10(&b[offset..]).ok_or_else(err)?;
+    if b.get(offset + end) != Some(&b')') || offset_value > u64::from(u16::MAX) {
+        return Err(err());
     }
     Ok(())
 }
 
-/// Mirrors `pg_lsn_in`: `XXX/XXX` with 1–8 hex digits on each side.
+/// `strtoul(s, &end, 10)` on an LP64 platform (glibc): leading whitespace,
+/// an optional sign, decimal digits, `-` negating modulo 2⁶⁴. Returns the
+/// value and the end offset (`0`, the start, when no digit follows), or
+/// `None` when the magnitude overflows (`ERANGE`).
+fn strtoul10(s: &[u8]) -> Option<(u64, usize)> {
+    let mut p = 0;
+    while p < s.len() && c_isspace(s[p]) {
+        p += 1;
+    }
+    let negative = s.get(p) == Some(&b'-');
+    if matches!(s.get(p), Some(b'+' | b'-')) {
+        p += 1;
+    }
+    let digits = p;
+    let mut value: u64 = 0;
+    while p < s.len() && s[p].is_ascii_digit() {
+        value = value.checked_mul(10)?.checked_add(u64::from(s[p] - b'0'))?;
+        p += 1;
+    }
+    if p == digits {
+        return Some((0, 0));
+    }
+    Some((
+        if negative {
+            value.wrapping_neg()
+        } else {
+            value
+        },
+        p,
+    ))
+}
+
+/// Mirrors `pg_lsn_in`: `XXX/XXX` with 1–8 hex digits on each side, and
+/// nothing else — no surrounding whitespace.
 fn validate_pg_lsn(content: &str) -> Result<(), String> {
     let err = || format!("invalid input syntax for type pg_lsn: \"{content}\"");
-    let s = content.trim_matches(|c: char| c.is_ascii_whitespace());
-    let (hi, lo) = s.split_once('/').ok_or_else(err)?;
+    let (hi, lo) = content.split_once('/').ok_or_else(err)?;
     for part in [hi, lo] {
         if part.is_empty() || part.len() > 8 || !part.chars().all(|c| c.is_ascii_hexdigit()) {
             return Err(err());
@@ -2106,10 +2184,14 @@ mod tests {
             "0b101",
             "1_000",
             "0x1_F",
+            "0x_1",
+            "0b_1_0",
         ] {
             assert!(v(ok).is_ok(), "{ok:?} should be valid");
         }
-        for bad in ["", "- 42", "42abc", "0x", "1__0", "_1", "1_", "0x_1"] {
+        for bad in [
+            "", "- 42", "42abc", "0x", "1__0", "_1", "1_", "0x_", "0x__1", "0x1__0",
+        ] {
             assert_eq!(
                 v(bad).unwrap_err(),
                 format!("invalid input syntax for type integer: \"{bad}\""),

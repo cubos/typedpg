@@ -87,6 +87,34 @@ fn cast_malformed_underscore_int_forms_rejected() {
     }
 }
 
+/// After a `0x` / `0o` / `0b` prefix an underscore may come first, as long
+/// as a digit follows it (PG 16+; `int4 '0b_10_0101'` is 37 in
+/// regress/sql/int4.sql) — unlike a decimal run, which can't start with one.
+#[test]
+fn integer_literals_allow_an_underscore_after_the_base_prefix() {
+    let db = setup();
+    for sql in [
+        "SELECT int2 '0b_10_0101'",
+        "SELECT int4 '0b_10_0101'",
+        "SELECT int8 '0x_FF'",
+        "SELECT '0o_17'::numeric",
+        "SELECT ' 0X_30b1_F33a_6DF0 '::numeric",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    for (sql, ty, lit) in [
+        ("SELECT '0x_'::int", "integer", "0x_"),
+        ("SELECT '0b_'::int2", "smallint", "0b_"),
+        ("SELECT '0x__F'::int8", "bigint", "0x__F"),
+        ("SELECT '0o__7'::numeric", "numeric", "0o__7"),
+    ] {
+        assert_first_line!(
+            db.analyze(sql),
+            &format!("invalid input syntax for type {ty}: \"{lit}\"")
+        );
+    }
+}
+
 #[test]
 fn cast_out_of_range_int_rejected() {
     let db = setup();
@@ -123,12 +151,17 @@ fn cast_malformed_numeric_rejected() {
         ("SELECT '1e'::numeric", "1e"),
         ("SELECT '1.2.3'::numeric", "1.2.3"),
         ("SELECT ''::numeric", ""),
+        // numeric_in: NaN mustn't have a sign (an infinity may).
+        ("SELECT '+NaN'::numeric", "+NaN"),
+        ("SELECT '-NaN'::numeric", "-NaN"),
     ] {
         assert_first_line!(
             db.analyze(q),
             &format!("invalid input syntax for type numeric: \"{lit}\"")
         );
     }
+    db.analyze("SELECT ' NaN '::numeric AS v, '+inf'::numeric AS w")
+        .unwrap();
 }
 
 #[test]
@@ -669,6 +702,88 @@ fn cast_empty_string_to_system_identifier_types_rejected() {
     db.analyze("SELECT '42'::xid AS v").unwrap();
 }
 
+/// tidin reads each number with strtoul, which wraps a `-` (`'(-1,0)'` is
+/// block 4294967295) and must stop at the delimiter; the block must fit 32
+/// bits, the offset 16. Nothing before the `(` or after the `)` is looked
+/// at.
+#[test]
+fn tid_input_follows_tidin_bounds() {
+    let db = setup();
+    for sql in [
+        "SELECT '(-1,0)'::tid AS v",
+        "SELECT '(,1)'::tid AS v",
+        "SELECT 'xyz(1,2)'::tid AS v",
+        "SELECT '(1,2)garbage'::tid AS v",
+        "SELECT '(4294967295,65535)'::tid AS v",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    for lit in ["(4294967296,1)", "(1,65536)", "(1,-1)", "( 1 ,2)"] {
+        assert_first_line!(
+            db.analyze(&format!("SELECT '{lit}'::tid")),
+            &format!("invalid input syntax for type tid: \"{lit}\"")
+        );
+    }
+}
+
+/// pg_lsn_in takes hex digits around a `/` and nothing else.
+#[test]
+fn pg_lsn_rejects_leading_whitespace() {
+    let db = setup();
+    for lit in [" 0/12345678", "0/12345678 "] {
+        assert_first_line!(
+            db.analyze(&format!("SELECT '{lit}'::pg_lsn")),
+            &format!("invalid input syntax for type pg_lsn: \"{lit}\"")
+        );
+    }
+    db.analyze("SELECT 'FFFFFFFF/0'::pg_lsn AS v").unwrap();
+}
+
+/// cash_in accumulates the amount in int64 cents: one cent past either end
+/// (or a third decimal rounding past it) is out of range.
+#[test]
+fn money_rejects_out_of_range_values() {
+    let db = setup();
+    for v in [
+        "92233720368547758.08",
+        "-92233720368547758.09",
+        "92233720368547758.075",
+    ] {
+        assert_first_line!(
+            db.analyze(&format!("SELECT '{v}'::money")),
+            &format!("value \"{v}\" is out of range for type money")
+        );
+    }
+    db.analyze(
+        "SELECT '92233720368547758.07'::money AS v, '-92233720368547758.08'::money AS w, \
+         '92233720368547758.074'::money AS x",
+    )
+    .unwrap();
+}
+
+/// parse_snapshot checks xmin and xmax with FullTransactionIdIsValid, which
+/// looks at the low 32 bits only: an epoch-aligned xid (2^32, 2^63) is
+/// invalid however large.
+#[test]
+fn pg_snapshot_rejects_an_overflowing_xid() {
+    let db = setup();
+    for lit in [
+        "1:9223372036854775808:3",
+        "1:4294967296:",
+        "4294967296:4294967297:",
+    ] {
+        assert_first_line!(
+            db.analyze(&format!("SELECT txid_snapshot '{lit}'")),
+            &format!("invalid input syntax for type pg_snapshot: \"{lit}\"")
+        );
+    }
+    db.analyze(
+        "SELECT pg_snapshot '1:9223372036854775809:3' AS v, \
+         pg_snapshot '4294967297:4294967298:4294967297' AS w",
+    )
+    .unwrap();
+}
+
 #[test]
 fn iso_date_field_overflow_rejected() {
     // DecodeDate reads `yyyy-mm-dd` as year, month, day and ValidateDate
@@ -757,6 +872,28 @@ fn time_field_out_of_range_rejected() {
         db.analyze("SELECT '24:00:01'::time"),
         "date/time field value out of range: \"24:00:01\""
     );
+}
+
+/// A full zone name must be in the tz database, which the analyzer lists
+/// in full; only the trees some distributions add (`posix/…`, `right/…`)
+/// and the legacy links are left to the server.
+#[test]
+fn timestamptz_rejects_an_unknown_time_zone() {
+    let db = setup();
+    for (lit, zone) in [
+        (
+            "19970710 173201 America/Does_not_exist",
+            "america/does_not_exist",
+        ),
+        ("2020-01-01 10:00 Europe/Nowhere", "europe/nowhere"),
+    ] {
+        assert_first_line!(
+            db.analyze(&format!("SELECT '{lit}'::timestamptz")),
+            &format!("time zone \"{zone}\" not recognized")
+        );
+    }
+    db.analyze("SELECT '2020-01-01 10:00 America/Ciudad_Juarez'::timestamptz AS v")
+        .unwrap();
 }
 
 #[test]
@@ -1020,6 +1157,8 @@ fn range_literal_lower_above_upper_rejected() {
         "SELECT '[NaN,1]'::numrange",
         "SELECT '[2024-01-02,2024-01-01]'::daterange",
         "SELECT '[2024-01-01 10:00,2024-01-01 09:00]'::tsrange",
+        // 01:00 -08 is 09:00 UTC, after 02:00 -05 (07:00 UTC).
+        "SELECT '[2010-01-01 01:00:00 -08, 2010-01-01 02:00:00 -05)'::tstzrange",
     ] {
         assert_first_line!(
             db.analyze(q),
@@ -1033,6 +1172,39 @@ fn range_literal_lower_above_upper_rejected() {
         "SELECT '[1,1]'::int4range AS v",
         "SELECT '(,)'::int4range AS v",
         "SELECT '[1.5,1.50]'::numrange AS v",
+        "SELECT '[2010-01-01 02:00:00 -05, 2010-01-01 01:00:00 -08)'::tstzrange AS v",
+    ] {
+        db.analyze(q).unwrap_or_else(|e| panic!("{q}: {e}"));
+    }
+}
+
+/// A user-defined range orders its bounds by the subtype's default btree
+/// operator class — text under its collation, computable for "C".
+#[test]
+fn user_defined_range_literals_check_bound_order() {
+    let mut db = setup();
+    db.apply_sql(
+        r#"CREATE TYPE textrange AS RANGE (subtype = text, collation = "C");
+           CREATE TYPE intrange AS RANGE (subtype = int4, subtype_opclass = int4_ops);"#,
+    )
+    .unwrap();
+    for q in [
+        "SELECT '[z,a]'::textrange",
+        "SELECT '{[z,a]}'::textmultirange",
+        "SELECT '[Z,A]'::textrange",
+        "SELECT '[2,1]'::intrange",
+    ] {
+        assert_first_line!(
+            db.analyze(q),
+            "range lower bound must be less than or equal to range upper bound"
+        );
+    }
+    for q in [
+        "SELECT '[a,z]'::textrange AS v",
+        // "C" orders upper case before lower case.
+        "SELECT '[Z,a]'::textrange AS v",
+        "SELECT '{[a,b], [c,z]}'::textmultirange AS v",
+        "SELECT '[1,2]'::intrange AS v",
     ] {
         db.analyze(q).unwrap_or_else(|e| panic!("{q}: {e}"));
     }
@@ -1167,6 +1339,101 @@ fn xml_literal_must_be_well_formed_content() {
     }
 }
 
+/// A DOCTYPE makes xml_in parse the value as a document: one root element,
+/// with only comments, PIs and whitespace around it.
+#[test]
+fn xml_content_with_a_doctype_must_be_a_document() {
+    let db = setup();
+    for lit in [
+        "<!DOCTYPE a><a/><b/>",
+        "<!DOCTYPE a>",
+        "<!DOCTYPE a>text<a/>",
+        "<!DOCTYPE a><a/>text",
+        "<!DOCTYPE a><a>&foo;</a>",
+    ] {
+        assert_first_line!(
+            db.analyze(&format!("SELECT xml '{lit}'")),
+            "invalid XML content"
+        );
+    }
+    for q in [
+        "SELECT xml '<!DOCTYPE a><a/>' AS v",
+        "SELECT xml '<!--x--><!DOCTYPE a ><b>t<c/></b> <!--y-->' AS v",
+    ] {
+        db.analyze(q).unwrap_or_else(|e| panic!("{q}: {e}"));
+    }
+}
+
+/// jsonpath's scanner pairs UTF-16 surrogates within one run of `\u`
+/// escapes (addUnicode); an unpaired half is an error.
+#[test]
+fn jsonpath_rejects_unpaired_surrogates() {
+    let db = setup();
+    for lit in [
+        r#""\ud83d\ud83d""#,
+        r#""\ude04\ud83d""#,
+        r#""\ud83dX""#,
+        r#"$."\ude04X""#,
+        r#""\ud83d\x41""#,
+    ] {
+        assert_first_line!(
+            db.analyze(&format!("SELECT '{lit}'::jsonpath")),
+            "invalid input syntax for type jsonpath"
+        );
+    }
+    // A bad escape ending a run is reported with the whole run.
+    assert_first_line!(
+        db.analyze(r#"SELECT '"\ud83d\u12"'::jsonpath"#),
+        r#"invalid Unicode escape sequence at or near "\ud83d\u12" of jsonpath input"#
+    );
+    db.analyze(r#"SELECT '"\ud83d\ude04"'::jsonpath AS v, '$."\u{1F604}"'::jsonpath AS w"#)
+        .unwrap();
+}
+
+/// `.time()` and its siblings take an unsigned `INT_P` precision (unlike
+/// `.decimal()`'s signed arguments).
+#[test]
+fn jsonpath_datetime_methods_reject_a_negative_precision() {
+    let db = setup();
+    for m in ["time", "time_tz", "timestamp", "timestamp_tz"] {
+        assert_first_line!(
+            db.analyze(&format!("SELECT '$.{m}(-1)'::jsonpath")),
+            r#"syntax error at or near "-" of jsonpath input"#
+        );
+    }
+    assert_first_line!(
+        db.analyze("SELECT '$.time(+1)'::jsonpath"),
+        r#"syntax error at or near "+" of jsonpath input"#
+    );
+    db.analyze("SELECT '$.time(1)'::jsonpath AS v, '$.decimal(-1, +2)'::jsonpath AS w")
+        .unwrap();
+}
+
+/// The scanner raises a malformed `E'\u'` escape as
+/// invalid_escape_sequence (22025); the parser words a malformed `U&''`
+/// escape the same, as a syntax error (42601).
+#[test]
+fn invalid_unicode_escape_is_an_invalid_escape_sequence() {
+    let db = setup();
+    for sql in [r"SELECT E'wrong: \U0061'", r"SELECT E'\u006'"] {
+        let err = db.analyze(sql).unwrap_err();
+        assert!(
+            err.to_string().starts_with("invalid Unicode escape"),
+            "{sql}: {err}"
+        );
+        assert!(
+            matches!(err, AnalyzeError::InvalidEscapeSequence(_)),
+            "{sql}: PG's SQLSTATE is 22025 (invalid_escape_sequence), got {err:?}"
+        );
+    }
+    let err = db.analyze(r"SELECT U&'\zz'").unwrap_err();
+    assert!(
+        err.to_string().starts_with("invalid Unicode escape"),
+        "{err}"
+    );
+    assert!(matches!(err, AnalyzeError::Parse(_)), "{err:?}");
+}
+
 #[test]
 fn cidr_literal_host_bits_rejected() {
     let db = setup();
@@ -1207,6 +1474,27 @@ fn interval_cast_literal_uses_the_written_field_restriction() {
     db.analyze("SELECT '[1,2)'::interval hour AS v").unwrap();
     db.analyze("SELECT '1:30'::interval minute to second AS v")
         .unwrap();
+}
+
+/// AdjustIntervalForTypmod rounds the time to the typmod's precision,
+/// which overflows next to the int64 limit.
+#[test]
+fn interval_typmod_rounding_checks_the_range() {
+    let db = setup();
+    for sql in [
+        "SELECT interval '2562047788:00:54.775807' second(2)",
+        "SELECT interval '-2562047788:00:54.775807' second(2)",
+        "SELECT interval '2562047788:00:54.775806' second(0)",
+    ] {
+        assert_first_line!(db.analyze(sql), "interval out of range");
+    }
+    for sql in [
+        "SELECT interval '2562047788:00:54.775807' second(6) AS v",
+        "SELECT interval '2562047788:00:54.775807' AS v",
+        "SELECT interval '2562047788:00:54.775807' hour AS v",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
 }
 
 /// An assigned literal is read by interval_in with the target column's
@@ -1272,6 +1560,16 @@ fn reg_type_literals_are_parsed_and_looked_up() {
             "SELECT 'nosuch[]'::regtype",
             "type \"nosuch[]\" does not exist",
         ),
+        // An array type has no array type of its own.
+        (
+            "SELECT '_int4[]'::regtype",
+            "type \"_int4[]\" does not exist",
+        ),
+        (
+            "SELECT CAST(NULL AS _int4[])",
+            "type \"_int4[]\" does not exist",
+        ),
+        ("SELECT NULL::nosuch[]", "type \"nosuch[]\" does not exist"),
         (
             "SELECT 'setof int'::regtype",
             "invalid type name \"setof int\"",

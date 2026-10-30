@@ -129,6 +129,11 @@ pub enum AnalyzeError {
     #[error("{0}")]
     SyntaxError(String),
 
+    /// A malformed escape in a string constant (`E'\U0061'`). Equivalent to
+    /// PG `invalid_escape_sequence` (SQLSTATE 22025).
+    #[error("{0}")]
+    InvalidEscapeSequence(String),
+
     /// A column name defined twice where names must be unique (a column
     /// definition list, an INSERT target list). Equivalent to PG
     /// `duplicate_column` (SQLSTATE 42701).
@@ -285,6 +290,7 @@ impl AnalyzeError {
         use AnalyzeError::*;
         match self {
             Lex(_) | Parse(_) | SyntaxError(_) => Some("42601"),
+            InvalidEscapeSequence(_) => Some("22025"),
             UndefinedTable(_) => Some("42P01"),
             UndefinedColumn(_) => Some("42703"),
             AmbiguousColumn(_) => Some("42702"),
@@ -1307,6 +1313,7 @@ fn replace_message(e: AnalyzeError, rendered: String) -> AnalyzeError {
         }
         AnalyzeError::InvalidObjectDefinition(_) => AnalyzeError::InvalidObjectDefinition(rendered),
         AnalyzeError::SyntaxError(_) => AnalyzeError::SyntaxError(rendered),
+        AnalyzeError::InvalidEscapeSequence(_) => AnalyzeError::InvalidEscapeSequence(rendered),
         AnalyzeError::UndefinedSchema(_) => AnalyzeError::UndefinedSchema(rendered),
         AnalyzeError::FeatureNotSupported(_) => AnalyzeError::FeatureNotSupported(rendered),
         AnalyzeError::DuplicateColumn(_) => AnalyzeError::DuplicateColumn(rendered),

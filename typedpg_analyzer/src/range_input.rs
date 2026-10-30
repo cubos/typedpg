@@ -4,12 +4,14 @@
 //! multirangetypes.c `multirange_in`), used by [`crate::literal_input`].
 //!
 //! Bound strings are validated with the subtype's own input rules (through
-//! [`crate::literal_input::validate`]). The `lower <= upper` check and the
-//! integer canonicalization overflow are modelled for the built-in range
-//! types, whose subtype ordering is the default btree order and computable
-//! exactly here — and only when both bounds are in a shape we can order
-//! without ambiguity (see [`BoundKey`]); anything else skips the ordering
-//! check (accepts).
+//! [`crate::literal_input::validate`]). The `lower <= upper` check is
+//! modelled for ranges whose subtype ordering is computable exactly here —
+//! the built-in range types, and user-defined ones ordering a built-in
+//! subtype by its default btree operator class (text only under a
+//! code-point collation) — and only when both bounds are in a shape we can
+//! order without ambiguity (see [`BoundKey`]); anything else skips the
+//! ordering check (accepts). The integer canonicalization overflow is
+//! modelled for the built-in range types.
 
 use crate::oid::PgTypeOid;
 use crate::pg_catalog::PgCatalog;
@@ -144,7 +146,7 @@ pub(crate) fn validate_range(
         // An infinite bound always orders below / above the other one.
         return check_canonical(&parts, range_oid, snapshot);
     };
-    let Some(kind) = builtin_range_kind(range_oid, snapshot) else {
+    let Some(kind) = ordering_kind(range_oid, snapshot) else {
         return Ok(());
     };
     let (Some(lo), Some(hi)) = (BoundKey::parse(lower, kind), BoundKey::parse(upper, kind)) else {
@@ -194,6 +196,8 @@ enum Kind {
     Date,
     Timestamp,
     Timestamptz,
+    /// Text under a collation ordering by code point.
+    Text,
 }
 
 /// The built-in range types (default subtype opclass, known canonical
@@ -215,6 +219,46 @@ fn builtin_range_kind(range_oid: PgTypeOid, snapshot: &PgCatalog) -> Option<Kind
     })
 }
 
+/// How the bounds of `range_oid` order, when that is computable: a
+/// built-in range type, or a user-defined one whose subtype is ordered by
+/// its default btree operator class (`pg_range.rngsubopc`) — a custom one
+/// may order any way — and, for text, under a code-point collation.
+fn ordering_kind(range_oid: PgTypeOid, snapshot: &PgCatalog) -> Option<Kind> {
+    use crate::pg_catalog::oid;
+    if let Some(kind) = builtin_range_kind(range_oid, snapshot) {
+        return Some(kind);
+    }
+    let range = snapshot.pg_range.get(&range_oid)?;
+    let opclass = crate::ddl::opclass::opclass_by_oid(snapshot, range.rngsubopc?)?;
+    let opcintype = match range.rngsubtype {
+        oid::VARCHAR => oid::TEXT,
+        t => t,
+    };
+    if !opclass.opcdefault
+        || opclass.opcmethod != "btree"
+        || opclass.opcintype != opcintype
+        || snapshot.namespace_name(opclass.opcnamespace) != Some("pg_catalog")
+    {
+        return None;
+    }
+    Some(match range.rngsubtype {
+        oid::INT4 => Kind::Int4,
+        oid::INT8 => Kind::Int8,
+        oid::NUMERIC => Kind::Numeric,
+        oid::DATE => Kind::Date,
+        oid::TIMESTAMP => Kind::Timestamp,
+        oid::TIMESTAMPTZ => Kind::Timestamptz,
+        oid::TEXT | oid::VARCHAR
+            if range.rngcollation.is_some_and(|c| {
+                crate::ddl::tables::partbound::orders_by_code_point(snapshot, c)
+            }) =>
+        {
+            Kind::Text
+        }
+        _ => return None,
+    })
+}
+
 /// A bound value reduced to a totally ordered key matching the subtype's
 /// btree order. `parse` returns `None` for any shape it can't order with
 /// certainty.
@@ -228,6 +272,8 @@ enum BoundKey {
     PosInf,
     /// numeric `NaN` sorts above everything, including `Infinity`.
     NaN,
+    /// A text value, in code point order (only compared with another).
+    Str(String),
 }
 
 impl BoundKey {
@@ -236,6 +282,7 @@ impl BoundKey {
             Kind::Int4 | Kind::Int8 => crate::literal_input::parse_pg_integer(s).map(BoundKey::Int),
             Kind::Numeric => parse_numeric_key(s),
             Kind::Date | Kind::Timestamp | Kind::Timestamptz => parse_datetime_key(s, kind),
+            Kind::Text => Some(BoundKey::Str(s.to_string())),
         }
     }
 }
@@ -424,7 +471,9 @@ fn parse_datetime_key(s: &str, kind: Kind) -> Option<BoundKey> {
     match kind {
         Kind::Timestamp => tail.is_empty().then_some(BoundKey::Int(value)),
         _ => {
-            // ±HH or ±HH:MM, within PG's ±15:59 zone limit.
+            // ±HH or ±HH:MM, within PG's ±15:59 zone limit — a field of
+            // its own, so whitespace may precede it.
+            let tail = &tail[tail.iter().take_while(|&&c| c == b' ').count()..];
             let sign = match tail.first()? {
                 b'+' => 1,
                 b'-' => -1,

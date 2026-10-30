@@ -157,7 +157,9 @@ fn apply_migration_here(db: &mut PgCatalog, sql: &str) -> Result<(), MigrationFa
     let result = in_migration(db, |db| {
         let parsed = typedpg_pg_query::parse(sql).map_err(|e| {
             let (message, position) = match e {
-                typedpg_pg_query::Error::Parse { message, position } => (message, position),
+                typedpg_pg_query::Error::Parse {
+                    message, position, ..
+                } => (message, position),
                 other => (other.to_string(), None),
             };
             located = position.map(|p| crate::error::CapturedDiagnostic {

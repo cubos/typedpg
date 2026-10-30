@@ -428,6 +428,14 @@ pub struct PgRange {
     /// column still load; regenerate via `cargo run -p typedpg_seed`.
     #[serde(default)]
     pub rngmultitypid: Option<PgTypeOid>,
+    /// FK `pg_collation.oid`: the collation the subtype's values are
+    /// ordered under (`None` for a non-collatable subtype).
+    #[serde(default)]
+    pub rngcollation: Option<PgCollationOid>,
+    /// FK `pg_opclass.oid`: the btree operator class ordering the subtype
+    /// (`None` when unknown).
+    #[serde(default)]
+    pub rngsubopc: Option<PgOpclassOid>,
 }
 
 /// `pg_constraint.contype`. PG chars: `c` check, `f` foreign key, `n` not

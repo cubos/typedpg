@@ -766,13 +766,21 @@ pub(crate) fn recursive_query_column_type(
     )
 }
 
-/// A parse error from `typedpg_pg_query`, which carries PG's message but not its
-/// SQLSTATE. Most grammar errors are `syntax_error` (42601), but gram.y
-/// raises a few with another code; those messages (from PG 18's gram.y,
-/// the query-level ones) get the variant carrying that code — the frame
-/// bound checks of `opt_frame_clause` are `windowing_error` (42P20), a
-/// non-constant JSON_TABLE path `feature_not_supported` (0A000).
-pub(crate) fn grammar_error(message: String, span: Option<SourceSpan>) -> RawError {
+/// A parse error from `typedpg_pg_query`, which carries PG's message and the
+/// function raising it, but not its SQLSTATE. Most grammar errors are
+/// `syntax_error` (42601), but gram.y raises a few with another code; those
+/// messages (from PG 18's gram.y, the query-level ones) get the variant
+/// carrying that code — the frame bound checks of `opt_frame_clause` are
+/// `windowing_error` (42P20), a non-constant JSON_TABLE path
+/// `feature_not_supported` (0A000). The scanner's (`core_yylex`) malformed
+/// `E'\u…'` escape is `invalid_escape_sequence` (22025), while parser.c's
+/// `str_udeescape` words a malformed `U&'…'` escape the same as a
+/// `syntax_error`.
+pub(crate) fn grammar_error(
+    message: String,
+    funcname: Option<&str>,
+    span: Option<SourceSpan>,
+) -> RawError {
     const WINDOWING: &[&str] = &[
         "frame start cannot be UNBOUNDED FOLLOWING",
         "frame starting from following row cannot end with current row",
@@ -797,7 +805,9 @@ pub(crate) fn grammar_error(message: String, span: Option<SourceSpan>) -> RawErr
     // `max_stack_depth` takes anyway (`1 + 1 + …` stops there at 4,995
     // terms): `stack depth limit exceeded`, SQLSTATE 54001, either way.
     const STACK_DEPTH: &str = "stack depth limit exceeded";
-    let kind = if message.starts_with(STACK_DEPTH)
+    let kind = if message == "invalid Unicode escape" && funcname == Some("core_yylex") {
+        AnalyzeError::InvalidEscapeSequence(message)
+    } else if message.starts_with(STACK_DEPTH)
         || message == "parse tree is nested too deeply to serialize to protobuf"
     {
         AnalyzeError::StatementTooComplex(STACK_DEPTH.to_owned())
