@@ -934,6 +934,167 @@ fn aggregates_nested_through_an_outer_reference_are_rejected() {
     }
 }
 
+/// An aggregate is nested only in an aggregate of its own level (or a
+/// lower one): in `(SELECT max(sum(a.x) + b.y) FROM b)`, `max` reads `b`
+/// and is the subquery's, while `sum` is the outer query's — a value
+/// there, not a nesting.
+#[test]
+fn outer_aggregate_in_an_inner_aggregate_is_not_nested() {
+    let db = grouping_rules_db();
+    for sql in [
+        "SELECT (SELECT max(sum(a.x) + b.y) FROM b) FROM a",
+        "SELECT (SELECT max(b.y + sum(a.x)) FROM b) FROM a GROUP BY a.id",
+        "SELECT (SELECT json_agg(sum(a.x) + b.y) FROM b) FROM a",
+        "SELECT (SELECT json_arrayagg(sum(a.x) + b.y) FROM b) FROM a",
+        "SELECT (SELECT json_objectagg(b.y : sum(a.x)) FROM b) FROM a",
+        "SELECT (SELECT array_agg(b.y ORDER BY sum(a.x)) FROM b) FROM a",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    // With no column of its own, the inner call takes the level of the
+    // aggregate it holds: a nesting.
+    for sql in [
+        "SELECT (SELECT max(sum(a.x)) FROM b) FROM a",
+        "SELECT (SELECT json_arrayagg(sum(a.x)) FROM b) FROM a",
+        "SELECT sum(count(*)) FROM a",
+        "SELECT json_arrayagg(sum(x)) FROM a",
+        "SELECT json_objectagg(id : count(*)) FROM a",
+        "SELECT json_agg(sum(x) + x) FROM a",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::GroupingError(_),
+            "aggregate function calls cannot be nested"
+        );
+    }
+}
+
+/// A VALUES list's rows can't hold an aggregate, `GROUPING(…)` or window
+/// call of its own level (EXPR_KIND_VALUES), even nested in another or
+/// reached through a sublink; an outer level's makes that level grouped.
+#[test]
+fn values_rows_hold_no_calls_of_their_level() {
+    let db = grouping_rules_db();
+    assert_analyze_err!(
+        db.analyze("SELECT 1 FROM (VALUES (1), (sum(2))) v"),
+        AnalyzeError::GroupingError(_),
+        "\
+aggregate functions are not allowed in VALUES
+  ╭────
+1 │ SELECT 1 FROM (VALUES (1), (sum(2))) v
+  ·                             ─┬─
+  ·                              ╰─ aggregate not allowed here
+  ╰────
+",
+    );
+    for sql in [
+        "VALUES (sum(1))",
+        // The inner call is transformed, and rejected, first.
+        "VALUES (sum(sum(1)))",
+        "VALUES (sum(1)), (generate_series(1, 2))",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::GroupingError(_),
+            "aggregate functions are not allowed in VALUES"
+        );
+    }
+    assert_err_prefix!(
+        db.analyze("VALUES (row_number() OVER ())"),
+        AnalyzeError::WindowingError(_),
+        "window functions are not allowed in VALUES"
+    );
+    assert_err_prefix!(
+        db.analyze("SELECT a.x, (VALUES (sum(a.x))) FROM a"),
+        AnalyzeError::GroupingError(_),
+        "column \"a.x\" must appear in the GROUP BY clause or be used in an aggregate function"
+    );
+    for sql in [
+        "SELECT (VALUES (sum(a.x))) FROM a",
+        "SELECT (SELECT 1 FROM (VALUES (sum(a.x))) v) FROM a",
+        "SELECT (VALUES (grouping(a.x))) FROM a GROUP BY a.x",
+        "VALUES ((SELECT sum(1)))",
+        "SELECT (VALUES ((SELECT sum(a.x)))) FROM a",
+        // `column1` is `o`'s: the rows don't see their own columns.
+        "SELECT (SELECT 1 FROM (VALUES ((SELECT sum(column1)))) v) FROM (VALUES (5)) o",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
+
+/// A call of a VALUES list's own level in its ORDER BY passes parse
+/// analysis as a sort key, but the plan has no Agg / WindowAgg node to run
+/// it: every execution fails initializing it (`ExecInitExprRec`, XX000) —
+/// where the VALUES is certain to be planned.
+#[test]
+fn values_sort_keys_hold_no_calls_of_their_level() {
+    let db = grouping_rules_db();
+    for (sql, message) in [
+        (
+            "VALUES (1) ORDER BY sum(1)",
+            "Aggref found in non-Agg plan node",
+        ),
+        (
+            "VALUES (1) ORDER BY 1 + count(*)",
+            "Aggref found in non-Agg plan node",
+        ),
+        (
+            "VALUES (1) ORDER BY sum(column1)",
+            "Aggref found in non-Agg plan node",
+        ),
+        (
+            "VALUES (1) ORDER BY (SELECT sum(column1))",
+            "Aggref found in non-Agg plan node",
+        ),
+        (
+            "SELECT (VALUES (1) ORDER BY sum(column1)) FROM (VALUES (5)) o",
+            "Aggref found in non-Agg plan node",
+        ),
+        (
+            "VALUES (1) ORDER BY grouping(column1)",
+            "GroupingFunc found in non-Agg plan node",
+        ),
+        (
+            "VALUES (1) ORDER BY row_number() OVER ()",
+            "WindowFunc found in non-WindowAgg plan node",
+        ),
+        // The sort keys are initialized in order.
+        (
+            "VALUES (1) ORDER BY row_number() OVER (), sum(1)",
+            "WindowFunc found in non-WindowAgg plan node",
+        ),
+        (
+            "VALUES (1) ORDER BY sum(1), row_number() OVER ()",
+            "Aggref found in non-Agg plan node",
+        ),
+        (
+            "EXPLAIN VALUES (1) ORDER BY sum(1)",
+            "Aggref found in non-Agg plan node",
+        ),
+        (
+            "SELECT (VALUES (1) ORDER BY sum(1))",
+            "Aggref found in non-Agg plan node",
+        ),
+    ] {
+        assert_err_prefix!(db.analyze(sql), AnalyzeError::PgInternalError(_), message);
+    }
+    // An outer level's aggregate is a value there; a VALUES the planner
+    // drops, or never runs, raises nothing.
+    for sql in [
+        "SELECT (VALUES (1) ORDER BY sum(a.x)) FROM a",
+        "SELECT (VALUES (1) ORDER BY (SELECT sum(a.x))) FROM a",
+        "SELECT * FROM (VALUES (1) ORDER BY sum(1)) v WHERE false",
+        "SELECT EXISTS (VALUES (1) ORDER BY sum(1))",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    assert_err_prefix!(
+        db.analyze("SELECT a.x, (VALUES (1) ORDER BY sum(a.x)) FROM a"),
+        AnalyzeError::GroupingError(_),
+        "column \"a.x\" must appear in the GROUP BY clause or be used in an aggregate function"
+    );
+}
+
 /// An ordered-set aggregate that belongs to an outer level (its ordering
 /// columns are outer) can't take a subquery's columns as direct
 /// arguments.

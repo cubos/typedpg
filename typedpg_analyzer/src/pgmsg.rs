@@ -641,6 +641,15 @@ pub(crate) fn unknown_value_not_coercible(target: &str, span: Option<SourceSpan>
     )
 }
 
+/// `Aggref found in non-Agg plan node` and its GroupingFunc / WindowFunc
+/// siblings — SQLSTATE XX000, raised by `ExecInitExprRec` when a plan has
+/// no Agg / WindowAgg node to compute the call (a VALUES list sorted by an
+/// aggregate of its own level). `message` is
+/// [`crate::grouping::UnplannedCall::message`].
+pub(crate) fn call_without_plan_node(message: &str, span: Option<SourceSpan>) -> RawError {
+    RawError::new(AnalyzeError::PgInternalError(message.into()), span, None)
+}
+
 /// `VALUES lists must all be the same length` — SQLSTATE 42601
 /// (`syntax_error`).
 pub(crate) fn values_lists_length(

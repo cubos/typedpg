@@ -345,7 +345,12 @@ pub(crate) fn analyze_values_lists(
             );
         }
         for (i, item) in row.iter().enumerate() {
-            let t = expr::infer_expr(item, ctx(), params, TypeGoal::NONE)?;
+            // EXPR_KIND_VALUES: no aggregate, GROUPING(…) or window call of
+            // this level, in the row or (an aggregate) in a sublink of it.
+            let t = crate::grouping::with_clause(Some("VALUES"), || {
+                expr::infer_expr(item, ctx(), params, TypeGoal::NONE)
+            })?;
+            crate::clause::check_level_calls(item, ctx(), "VALUES", true)?;
             check_no_srf_in_clause(item, snapshot, "VALUES")?;
             column_types[i].push(t.type_oid);
             column_typmods[i].push(t.typmod);

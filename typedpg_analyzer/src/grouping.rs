@@ -1521,14 +1521,6 @@ fn select_level_exprs(sel: &protobuf::SelectStmt) -> Vec<&protobuf::Node> {
     out
 }
 
-/// Pre-order visit of `node` and its same-level sub-expressions.
-fn visit_level<'a>(node: &'a protobuf::Node, f: &mut dyn FnMut(&'a protobuf::Node)) {
-    f(node);
-    for c in level_children(node) {
-        visit_level(c, f);
-    }
-}
-
 /// Post-order visit of `node` and its same-level sub-expressions: PG's
 /// order of transforming the calls, each after its arguments.
 fn visit_level_post<'a>(node: &'a protobuf::Node, f: &mut dyn FnMut(&'a protobuf::Node)) {
@@ -2042,8 +2034,11 @@ pub(crate) fn finish_select_level(
     let mut own_aggs = false;
     let mut own_grouping: Vec<&protobuf::GroupingFunc> = Vec::new();
     let mut calls: Vec<Call<'_>> = Vec::new();
+    // In PG's transform order, a call after its arguments: in
+    // `max(sum(y))`, `sum` (an outer level's) meets that level's clause
+    // rule before `max` is checked for nesting.
     for e in select_level_exprs(sel) {
-        visit_level(e, &mut |n| calls.extend(call_of(n, snapshot)));
+        visit_level_post(e, &mut |n| calls.extend(call_of(n, snapshot)));
     }
     for call in calls {
         match call {
@@ -2240,6 +2235,177 @@ pub(crate) fn finish_select_level(
     }
     if let Some(h) = sel.having_clause.as_deref() {
         check.expr(h, 0, &mut own)?;
+    }
+    Ok(())
+}
+
+/// A call of a VALUES list's own level in its ORDER BY. Parse analysis
+/// accepts it as a resjunk sort key, but a VALUES query gets no Agg or
+/// WindowAgg node, so initializing the expression fails at every execution
+/// (`ExecInitExprRec`, XX000).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UnplannedCall {
+    Aggregate,
+    Grouping,
+    Window,
+}
+
+impl UnplannedCall {
+    /// `ExecInitExprRec`'s message for the node.
+    pub(crate) fn message(self) -> &'static str {
+        match self {
+            UnplannedCall::Aggregate => "Aggref found in non-Agg plan node",
+            UnplannedCall::Grouping => "GroupingFunc found in non-Agg plan node",
+            UnplannedCall::Window => "WindowFunc found in non-WindowAgg plan node",
+        }
+    }
+}
+
+thread_local! {
+    /// Per analyzed VALUES level (keyed by its SelectStmt's address), the
+    /// first call of its ORDER BY the executor can't run — read once the
+    /// statement is analyzed, where a VALUES certain to be planned fails
+    /// with it ([`values_sort_call`]). Cleared before each statement.
+    static VALUES_SORT_CALLS: RefCell<HashMap<usize, (UnplannedCall, i32)>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Forget what earlier statements' VALUES levels recorded.
+pub(crate) fn clear_values_sort_calls() {
+    VALUES_SORT_CALLS.with(|v| v.borrow_mut().clear());
+}
+
+/// The call of VALUES `sel`'s ORDER BY its execution fails on, if any.
+pub(crate) fn values_sort_call(sel: &protobuf::SelectStmt) -> Option<(UnplannedCall, i32)> {
+    VALUES_SORT_CALLS.with(|v| v.borrow().get(&level_key(sel)).copied())
+}
+
+/// Run `f` with the current level's namespace being `sources`: a VALUES
+/// list's ORDER BY sees its columns (`column1`, …), which its rows don't.
+pub(crate) fn with_own_namespace<R>(sources: &[TableSource], f: impl FnOnce() -> R) -> R {
+    let ns = Rc::new(Namespace::of(sources));
+    let prev = FRAMES.with(|fr| fr.borrow_mut().last_mut().map(|top| top.ns.replace(ns)));
+    let out = f();
+    if let Some(prev) = prev {
+        FRAMES.with(|fr| {
+            if let Some(top) = fr.borrow_mut().last_mut() {
+                top.ns = prev;
+            }
+        });
+    }
+    out
+}
+
+/// [`finish_select_level`] for VALUES `sel`, whose rows see `rows_scope`
+/// and whose ORDER BY also sees its own columns, `sort_sources`. The rows
+/// hold no aggregate, `GROUPING(…)` or window call of the level (rejected
+/// as they are analyzed); an outer level's is handed to it. A call of the
+/// level in the ORDER BY — directly, or an aggregate in a sublink there —
+/// is recorded for [`values_sort_call`].
+pub(crate) fn finish_values_level(
+    sel: &protobuf::SelectStmt,
+    rows_scope: &Scope,
+    sort_sources: &[TableSource],
+    snapshot: &PgCatalog,
+) -> Result<(), AnalyzeError> {
+    let rows_chain = current_chain(rows_scope);
+    let mut sort_chain = rows_chain.clone();
+    sort_chain.levels[0] = Some(Rc::new(Namespace::of(sort_sources)));
+    let rows: Vec<&protobuf::Node> = sel
+        .values_lists
+        .iter()
+        .filter_map(|row| match row.node.as_ref() {
+            Some(node::Node::List(l)) => Some(l.items.iter()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    let sort: Vec<&protobuf::Node> = sel
+        .sort_clause
+        .iter()
+        .filter_map(|s| match s.node.as_ref() {
+            Some(node::Node::SortBy(sb)) => sb.node.as_deref(),
+            _ => None,
+        })
+        .collect();
+    for (exprs, mut chain) in [(rows, rows_chain), (sort.clone(), sort_chain.clone())] {
+        let mut calls: Vec<Call<'_>> = Vec::new();
+        for e in exprs {
+            visit_level_post(e, &mut |n| calls.extend(call_of(n, snapshot)));
+        }
+        for call in calls {
+            match call {
+                Call::Aggregate {
+                    aggregated,
+                    direct,
+                    location,
+                } => {
+                    let level = call_level(&aggregated, &mut chain);
+                    check_agg_arguments(&aggregated, &direct, level, &mut chain, snapshot)?;
+                    if level > 0 {
+                        attribute_outer(level, None, location)?;
+                    }
+                }
+                Call::Grouping(g) => {
+                    let args: Vec<&protobuf::Node> = g.args.iter().collect();
+                    let up = call_level(&args, &mut chain);
+                    if up > 0 {
+                        let canon = g
+                            .args
+                            .iter()
+                            .map(|a| canonical(a, &chain, up, None, snapshot))
+                            .collect();
+                        attribute_outer(up, Some(canon), g.location)?;
+                    }
+                }
+                Call::Window(_) => {}
+            }
+        }
+    }
+    // The executor initializes the sort keys in order, each top-down.
+    fn first(
+        node: &protobuf::Node,
+        chain: &mut Chain,
+        snapshot: &PgCatalog,
+    ) -> Option<(UnplannedCall, i32)> {
+        let found = match call_of(node, snapshot) {
+            Some(Call::Window(location)) => Some((UnplannedCall::Window, location)),
+            Some(Call::Aggregate {
+                aggregated,
+                location,
+                ..
+            }) => (call_level(&aggregated, chain) == 0)
+                .then_some((UnplannedCall::Aggregate, location)),
+            Some(Call::Grouping(g)) => {
+                let args: Vec<&protobuf::Node> = g.args.iter().collect();
+                (call_level(&args, chain) == 0).then_some((UnplannedCall::Grouping, g.location))
+            }
+            None => None,
+        };
+        found.or_else(|| {
+            level_children(node)
+                .into_iter()
+                .find_map(|c| first(c, chain, snapshot))
+        })
+    }
+    let mut chain = sort_chain;
+    let own = sort.iter().find_map(|e| first(e, &mut chain, snapshot));
+    // An aggregate of the level in a sublink of the ORDER BY: the sublink's
+    // parameter holds it.
+    let (outer_aggs, outer_grouping) = FRAMES.with(|f| {
+        f.borrow_mut()
+            .last_mut()
+            .map(|top| {
+                let g = std::mem::take(&mut top.outer_grouping);
+                (top.outer_aggs, g.first().map(|(_, l)| *l))
+            })
+            .unwrap_or_default()
+    });
+    let call = own
+        .or(outer_grouping.map(|l| (UnplannedCall::Grouping, l)))
+        .or(outer_aggs.then_some((UnplannedCall::Aggregate, -1)));
+    if let Some(call) = call {
+        VALUES_SORT_CALLS.with(|v| v.borrow_mut().insert(level_key(sel), call));
     }
     Ok(())
 }

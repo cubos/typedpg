@@ -267,7 +267,9 @@ fn analyze_select_here(
             .shadowed_sources
             .extend(shadowed_sources.iter().cloned());
         let columns = analyze_values_lists(&sel.values_lists, snapshot, params, &values_scope)?;
-        values_sort_and_limit(sel, &columns, snapshot, params, &cte_scopes, &outer)?;
+        let sort_sources =
+            values_sort_and_limit(sel, &columns, snapshot, params, &cte_scopes, &outer)?;
+        grouping::finish_values_level(sel, &values_scope, &sort_sources, snapshot)?;
         set_level_summary(LevelSummary {
             min_one_row: limit_keeps_a_row(sel),
         });
@@ -1061,7 +1063,7 @@ fn values_sort_and_limit(
     params: &mut ParamCollector,
     cte_scopes: &HashMap<String, Vec<ScopeColumn>>,
     outer: &[crate::scope::TableSource],
-) -> Result<(), AnalyzeError> {
+) -> Result<Vec<crate::scope::TableSource>, AnalyzeError> {
     let alias = crate::scope::hidden_alias("values");
     let cols: Vec<ScopeColumn> = columns
         .iter()
@@ -1085,33 +1087,39 @@ fn values_sort_and_limit(
     scope.outer_sources.extend(outer.iter().cloned());
     scope.add_derived(&alias, cols, crate::scope::SourceKind::Other)?;
     let null_ctx = NullabilityContext::default();
-    for sort_node in &sel.sort_clause {
-        let Some(node::Node::SortBy(sb)) = sort_node.node.as_ref() else {
-            continue;
-        };
-        let Some(inner) = sb.node.as_deref() else {
-            continue;
-        };
-        if let Some(ord) = sql92_position(inner, "ORDER BY")? {
-            if ord < 1 || ord as usize > columns.len() {
-                return Err(crate::pgmsg::position_not_in_select_list(
-                    "ORDER BY",
-                    ord,
-                    crate::error::node_location(inner)
-                        .and_then(crate::error::SourceSpan::from_node_token),
-                )
-                .finalize_implicit());
+    // The sort keys see the VALUES' columns, and so do the sublinks in
+    // them: an aggregate there over `column1` is the VALUES level's.
+    grouping::with_own_namespace(&scope.sources, || {
+        for sort_node in &sel.sort_clause {
+            let Some(node::Node::SortBy(sb)) = sort_node.node.as_ref() else {
+                continue;
+            };
+            let Some(inner) = sb.node.as_deref() else {
+                continue;
+            };
+            if let Some(ord) = sql92_position(inner, "ORDER BY")? {
+                if ord < 1 || ord as usize > columns.len() {
+                    return Err(crate::pgmsg::position_not_in_select_list(
+                        "ORDER BY",
+                        ord,
+                        crate::error::node_location(inner)
+                            .and_then(crate::error::SourceSpan::from_node_token),
+                    )
+                    .finalize_implicit());
+                }
+                continue;
             }
-            continue;
+            expr::infer_expr(
+                inner,
+                expr::Ctx::new(&scope, &null_ctx, snapshot),
+                params,
+                TypeGoal::NONE,
+            )?;
         }
-        expr::infer_expr(
-            inner,
-            expr::Ctx::new(&scope, &null_ctx, snapshot),
-            params,
-            TypeGoal::NONE,
-        )?;
-    }
-    analyze_limit_offset(sel, expr::Ctx::new(&scope, &null_ctx, snapshot), params)
+        Ok(())
+    })?;
+    analyze_limit_offset(sel, expr::Ctx::new(&scope, &null_ctx, snapshot), params)?;
+    Ok(scope.sources)
 }
 
 /// Recursively find window-function calls and verify that any *named*

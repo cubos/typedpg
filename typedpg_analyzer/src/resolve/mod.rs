@@ -762,9 +762,10 @@ pub(crate) fn analyze_static(
         .ok_or_else(|| AnalyzeError::Parse("empty statement".into()))?;
 
     let can_run_as_subquery = can_run_as_subquery(stmt);
+    crate::grouping::clear_values_sort_calls();
     let (raw_columns, raw_params) =
         expr::with_plan_time_checks(|| analyze_raw_node(snapshot, stmt, param_nullability))?;
-    if let Some(e) = values_sort_srf_error(stmt, snapshot) {
+    if let Some(e) = values_sort_exec_error(stmt, snapshot) {
         return Err(e);
     }
 
@@ -797,15 +798,18 @@ pub(crate) fn analyze_static(
 /// resjunk sort key, but a VALUES query gets no ProjectSet, so the
 /// executor initializing the expression fails (`ExecInitFunc`: 0A000
 /// `set-valued function called in context that cannot accept a set`),
-/// whatever the data. Only a VALUES certain to be planned counts: the
-/// statement's own (an arm of its set operation, an INSERT's source, what
+/// whatever the data. Likewise for an aggregate, `GROUPING(…)` or window
+/// call of the VALUES' own level there (`VALUES (1) ORDER BY sum(1)`): no
+/// Agg / WindowAgg node, so `ExecInitExprRec` fails with XX000 (see
+/// [`crate::grouping::UnplannedCall`]). Only a VALUES certain to be
+/// planned counts: the statement's own (an arm of its set operation, an INSERT's source, what
 /// EXPLAIN plans) or a scalar / ARRAY subquery making up a whole entry of
 /// its select list — which the planner turns into a subplan, initialized
 /// with the plan even when no row ever reaches it. Elsewhere it is dropped
 /// when the planner proves it unneeded (`WHERE false`, an unreferenced
 /// CTE, `EXISTS`, `CASE WHEN false`), and the statement then runs fine.
-fn values_sort_srf_error(stmt: &node::Node, snapshot: &PgCatalog) -> Option<AnalyzeError> {
-    fn select(sel: &protobuf::SelectStmt, snapshot: &PgCatalog) -> Option<i32> {
+fn values_sort_exec_error(stmt: &node::Node, snapshot: &PgCatalog) -> Option<AnalyzeError> {
+    fn select(sel: &protobuf::SelectStmt, snapshot: &PgCatalog) -> Option<AnalyzeError> {
         if sel.op != SetOperation::SetopNone as i32 {
             return [&sel.larg, &sel.rarg]
                 .into_iter()
@@ -842,29 +846,38 @@ fn values_sort_srf_error(stmt: &node::Node, snapshot: &PgCatalog) -> Option<Anal
                 }
             });
         }
-        location
+        if let Some(location) = location {
+            return Some(
+                crate::error::RawError::new(
+                    AnalyzeError::FeatureNotSupported(
+                        "set-valued function called in context that cannot accept a set".into(),
+                    ),
+                    crate::error::SourceSpan::from_node_qname(location),
+                    None,
+                )
+                .finalize_implicit(),
+            );
+        }
+        let (call, location) = crate::grouping::values_sort_call(sel)?;
+        Some(
+            crate::pgmsg::call_without_plan_node(
+                call.message(),
+                crate::error::SourceSpan::from_node_qname(location),
+            )
+            .finalize_implicit(),
+        )
     }
-    let location = match stmt {
+    match stmt {
         node::Node::SelectStmt(sel) => select(sel, snapshot),
         node::Node::InsertStmt(ins) => match ins.select_stmt.as_deref()?.node.as_ref()? {
             node::Node::SelectStmt(sel) => select(sel, snapshot),
             _ => None,
         },
         node::Node::ExplainStmt(es) => {
-            return values_sort_srf_error(es.query.as_deref()?.node.as_ref()?, snapshot);
+            values_sort_exec_error(es.query.as_deref()?.node.as_ref()?, snapshot)
         }
         _ => None,
-    }?;
-    Some(
-        crate::error::RawError::new(
-            AnalyzeError::FeatureNotSupported(
-                "set-valued function called in context that cannot accept a set".into(),
-            ),
-            crate::error::SourceSpan::from_node_qname(location),
-            None,
-        )
-        .finalize_implicit(),
-    )
+    }
 }
 
 /// True when `stmt` can appear as the body of a `SELECT * FROM (<stmt>) …`
