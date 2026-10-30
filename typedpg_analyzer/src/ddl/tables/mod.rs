@@ -967,7 +967,7 @@ fn generic_options_of(cmd: &AlterTableCmd) -> &[typedpg_pg_query::protobuf::Node
 /// ATExecAlterColumnGenericOptions: the column is looked up (a system
 /// column can't be altered) before its options are transformed.
 fn alter_column_generic_options(
-    interp: &PgCatalog,
+    interp: &mut PgCatalog,
     relid: PgClassOid,
     colname: &str,
     options: &[typedpg_pg_query::protobuf::Node],
@@ -975,13 +975,17 @@ fn alter_column_generic_options(
     if options.is_empty() {
         return Ok(());
     }
-    if interp.attribute_by_name(relid, colname).is_none() {
+    let Some(attnum) = interp.attribute_by_name(relid, colname).map(|a| a.attnum) else {
         check_not_system_column(interp, relid, colname)?;
         return Err(DdlError::Parse(column_not_found_msg(
             interp, relid, colname,
         )));
-    }
-    crate::ddl::fdw::check_generic_options(options)
+    };
+    crate::ddl::fdw::apply_generic_options(
+        interp,
+        crate::ddl::fdw::OptionsOwner::Column(relid, attnum),
+        options,
+    )
 }
 
 /// transformColumnDefinition: a new column's `OPTIONS (...)` becomes an
@@ -989,7 +993,7 @@ fn alter_column_generic_options(
 /// relation's creation, which RangeVarCallbackForAlterRelation refuses for
 /// anything but a foreign table.
 pub(crate) fn column_generic_options_stmt(
-    interp: &PgCatalog,
+    interp: &mut PgCatalog,
     relid: PgClassOid,
     colname: &str,
     options: &[typedpg_pg_query::protobuf::Node],
@@ -1059,25 +1063,34 @@ pub fn create_foreign_table(
     }
     // CreateForeignTable: GetForeignServerByName.
     crate::ddl::fdw::check_server(interp, &stmt.servername)?;
-    // The columns' and the table's generic options.
+    let Some(rv) = base.relation.as_ref() else {
+        return Ok(());
+    };
+    let (schema, name) = range_var_names(rv, interp);
+    let Some(oid) = interp
+        .namespace_oid(&schema)
+        .and_then(|ns| interp.class_by_qname.get(&(ns, name)).copied())
+    else {
+        return Ok(());
+    };
+    if let Some(class) = interp.pg_class.get_mut(&oid) {
+        class.relkind = RelKind::ForeignTable;
+    }
+    interp
+        .foreign_data
+        .table_servers
+        .insert(oid, stmt.servername.clone());
+    // The table's generic options, then (transformColumnDefinition's
+    // ALTER FOREIGN TABLE ... ALTER COLUMN ... OPTIONS, run after the
+    // creation) its columns'.
+    crate::ddl::fdw::apply_generic_options(
+        interp,
+        crate::ddl::fdw::OptionsOwner::ForeignTable(oid),
+        &stmt.options,
+    )?;
     for elt in &base.table_elts {
         if let Some(node::Node::ColumnDef(cd)) = elt.node.as_ref() {
-            crate::ddl::fdw::check_generic_options(&cd.fdwoptions)?;
-        }
-    }
-    crate::ddl::fdw::check_generic_options(&stmt.options)?;
-    if let Some(rv) = base.relation.as_ref() {
-        let (schema, name) = range_var_names(rv, interp);
-        if let Some(oid) = interp
-            .namespace_oid(&schema)
-            .and_then(|ns| interp.class_by_qname.get(&(ns, name)).copied())
-            && let Some(class) = interp.pg_class.get_mut(&oid)
-        {
-            class.relkind = RelKind::ForeignTable;
-            interp
-                .foreign_data
-                .table_servers
-                .insert(oid, stmt.servername.clone());
+            alter_column_generic_options(interp, oid, &cd.colname, &cd.fdwoptions)?;
         }
     }
     Ok(())
@@ -1433,9 +1446,11 @@ fn apply_alter_subtype(
         }
         AlterTableType::AtSetTableSpace => check_tablespace_placement(&cmd.name),
         AlterTableType::AtAddOf => typed::add_of(interp, relid, cmd),
-        AlterTableType::AtGenericOptions => {
-            crate::ddl::fdw::check_generic_options(generic_options_of(cmd))
-        }
+        AlterTableType::AtGenericOptions => crate::ddl::fdw::apply_generic_options(
+            interp,
+            crate::ddl::fdw::OptionsOwner::ForeignTable(relid),
+            generic_options_of(cmd),
+        ),
         AlterTableType::AtAlterColumnGenericOptions => {
             alter_column_generic_options(interp, relid, &cmd.name, generic_options_of(cmd))
         }

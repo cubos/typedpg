@@ -4075,6 +4075,151 @@ fn foreign_data_wrappers_servers_and_user_mappings() {
 }
 
 #[test]
+fn generic_options_follow_what_the_object_holds() {
+    // PG 18 transformGenericOptions applies an OPTIONS list to the options
+    // the object holds: a plain or ADD option must be new, SET and DROP
+    // need it to be there.
+    let setup = "CREATE FOREIGN DATA WRAPPER w;
+                 CREATE FOREIGN DATA WRAPPER w2 OPTIONS (k '0');
+                 CREATE SERVER s FOREIGN DATA WRAPPER w;
+                 CREATE SERVER s2 FOREIGN DATA WRAPPER w OPTIONS (a '1', b '2');
+                 CREATE USER MAPPING FOR public SERVER s2 OPTIONS (u '1');
+                 CREATE FOREIGN TABLE ft (a int OPTIONS (ca '1'), b int OPTIONS (cb '1'))
+                     SERVER s OPTIONS (fo '0');";
+    for (stmt, msg) in [
+        (
+            "ALTER SERVER s OPTIONS (SET x '1', ADD x '2');",
+            "option \"x\" not found",
+        ),
+        (
+            "ALTER SERVER s OPTIONS (SET a '1');",
+            "option \"a\" not found",
+        ),
+        ("ALTER SERVER s OPTIONS (DROP a);", "option \"a\" not found"),
+        (
+            "ALTER SERVER s2 OPTIONS (ADD a '2');",
+            "option \"a\" provided more than once",
+        ),
+        (
+            "ALTER SERVER s2 OPTIONS (SET a '3', DROP a, DROP a);",
+            "option \"a\" not found",
+        ),
+        (
+            "ALTER FOREIGN DATA WRAPPER w OPTIONS (DROP nope);",
+            "option \"nope\" not found",
+        ),
+        (
+            "ALTER FOREIGN DATA WRAPPER w2 OPTIONS (ADD k '1');",
+            "option \"k\" provided more than once",
+        ),
+        (
+            "ALTER USER MAPPING FOR public SERVER s2 OPTIONS (u '2');",
+            "option \"u\" provided more than once",
+        ),
+        (
+            "ALTER USER MAPPING FOR public SERVER s2 OPTIONS (DROP nope);",
+            "option \"nope\" not found",
+        ),
+        (
+            "ALTER FOREIGN TABLE ft OPTIONS (ADD fo '1');",
+            "option \"fo\" provided more than once",
+        ),
+        (
+            "ALTER FOREIGN TABLE ft OPTIONS (DROP nope);",
+            "option \"nope\" not found",
+        ),
+        (
+            "ALTER FOREIGN TABLE ft ALTER COLUMN a OPTIONS (ADD ca '1');",
+            "option \"ca\" provided more than once",
+        ),
+        // Each column has its own.
+        (
+            "ALTER FOREIGN TABLE ft ALTER COLUMN b OPTIONS (DROP ca);",
+            "option \"ca\" not found",
+        ),
+        // Subcommands see the ones before them.
+        (
+            "ALTER FOREIGN TABLE ft OPTIONS (ADD fo2 '1'), OPTIONS (ADD fo2 '2');",
+            "option \"fo2\" provided more than once",
+        ),
+        // A renamed server or wrapper keeps its options, and so do its
+        // user mappings.
+        (
+            "ALTER SERVER s2 RENAME TO s3; ALTER SERVER s3 OPTIONS (ADD a '1');",
+            "option \"a\" provided more than once",
+        ),
+        (
+            "ALTER FOREIGN DATA WRAPPER w2 RENAME TO w3;
+             ALTER FOREIGN DATA WRAPPER w3 OPTIONS (k '1');",
+            "option \"k\" provided more than once",
+        ),
+        (
+            "ALTER SERVER s2 RENAME TO s3;
+             ALTER USER MAPPING FOR public SERVER s3 OPTIONS (DROP nope);",
+            "option \"nope\" not found",
+        ),
+        // A dropped column's go with it; a renamed one keeps them.
+        (
+            "ALTER FOREIGN TABLE ft DROP COLUMN b;
+             ALTER FOREIGN TABLE ft ADD COLUMN b int;
+             ALTER FOREIGN TABLE ft ALTER COLUMN b OPTIONS (SET cb '2');",
+            "option \"cb\" not found",
+        ),
+        (
+            "ALTER FOREIGN TABLE ft RENAME COLUMN a TO aa;
+             ALTER FOREIGN TABLE ft ALTER COLUMN aa OPTIONS (ca '2');",
+            "option \"ca\" provided more than once",
+        ),
+        // Objects created again start without any.
+        (
+            "DROP USER MAPPING FOR public SERVER s2;
+             CREATE USER MAPPING FOR public SERVER s2;
+             ALTER USER MAPPING FOR public SERVER s2 OPTIONS (SET u '1');",
+            "option \"u\" not found",
+        ),
+        (
+            "DROP FOREIGN TABLE ft;
+             CREATE FOREIGN TABLE ft (a int) SERVER s;
+             ALTER FOREIGN TABLE ft OPTIONS (SET fo '1');",
+            "option \"fo\" not found",
+        ),
+        (
+            "DROP SERVER s2 CASCADE;
+             CREATE SERVER s2 FOREIGN DATA WRAPPER w;
+             ALTER SERVER s2 OPTIONS (DROP a);",
+            "option \"a\" not found",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "ALTER SERVER s OPTIONS (ADD a '2');
+             ALTER SERVER s2 OPTIONS (DROP a, ADD a '2');
+             ALTER SERVER s2 OPTIONS (DROP b);
+             ALTER SERVER s2 OPTIONS (b '3', SET a '4');
+             ALTER FOREIGN DATA WRAPPER w2 OPTIONS (SET k '2');
+             ALTER USER MAPPING FOR public SERVER s2 OPTIONS (SET u '1', ADD um '2');
+             ALTER USER MAPPING FOR public SERVER s2 OPTIONS (DROP um);
+             ALTER FOREIGN TABLE ft OPTIONS (SET fo '1');
+             ALTER FOREIGN TABLE ft ALTER COLUMN a OPTIONS (SET ca '2');
+             ALTER FOREIGN TABLE ft ALTER COLUMN b OPTIONS (SET cb '2', ca '1');
+             ALTER FOREIGN TABLE ft OPTIONS (DROP fo), OPTIONS (ADD fo '2');
+             ALTER FOREIGN TABLE ft ADD COLUMN c int OPTIONS (cc '1');
+             ALTER FOREIGN TABLE ft ALTER COLUMN c OPTIONS (DROP cc);
+             ALTER SERVER s2 RENAME TO s3;
+             ALTER SERVER s3 OPTIONS (SET a '1');
+             ALTER USER MAPPING FOR public SERVER s3 OPTIONS (SET u '2');
+             ALTER FOREIGN DATA WRAPPER w2 RENAME TO w3;
+             ALTER FOREIGN DATA WRAPPER w3 OPTIONS (SET k '3');",
+        ),
+    ]);
+}
+
+#[test]
 fn new_objects_need_an_existing_schema() {
     // PG 18 RangeVarGetCreationNamespace / QualifiedNameGetCreationNamespace:
     // an object created in a named schema needs that schema.
