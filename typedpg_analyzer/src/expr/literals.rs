@@ -335,11 +335,7 @@ pub(crate) fn infer_type_cast(
     // PG rejects an explicit cast with no legal path (e.g. boolean → double
     // precision) at parse time — `cannot cast type X to Y`. Mirror that, but
     // only after the inner expression's own type is known.
-    if !coerce::can_cast_explicit(inner_type.type_oid, target_oid, snapshot)
-        || (inner_type.type_oid == oid::RECORD
-            && coerce::is_complex(target_oid, snapshot)
-            && !super::record_converts_to_complex(inner, ctx.scope))
-    {
+    if !coerce::can_cast_explicit(inner_type.type_oid, target_oid, snapshot) {
         let from = crate::ddl::util::format_type_for_message(snapshot, inner_type.type_oid);
         let to = crate::ddl::util::format_type_for_message(snapshot, target_oid);
         let span = crate::error::node_location(inner).and_then(|loc| {
@@ -355,27 +351,10 @@ pub(crate) fn infer_type_cast(
         .finalize_implicit());
     }
 
-    if pass_through {
+    // An operand still untyped here (no literal or parameter, which
+    // `passthrough_cast_operand` handles) is handed back as it is too.
+    if pass_through && inner_type.type_oid == oid::UNKNOWN {
         return Ok(inner_type);
-    }
-    // The other polymorphic targets (`anyarray`, `anyenum`, `anyrange`,
-    // `anymultirange` and their `anycompatible` forms) need an actual
-    // array, enum, range or multirange: a typed operand is returned as it
-    // is, relabeled from a domain to its base type (`'{1}'::ia::anyarray`
-    // is `integer[]`). (An unknown literal fails the pseudo-type's input
-    // function — see `literal_input` — and an untyped parameter or NULL
-    // takes the pseudo-type itself.)
-    if crate::polymorphic::is_polymorphic(target_oid) && inner_type.type_oid != oid::UNKNOWN {
-        let base = snapshot.unwrap_domain(inner_type.type_oid);
-        if base == inner_type.type_oid {
-            return Ok(inner_type);
-        }
-        return Ok(ExprType {
-            record_fields: None,
-            ..ExprType::scalar(base, inner_type.nullable)
-                .with_collation(derive_collation([&inner_type], base, snapshot)?)
-                .with_elem_nullable(inner_type.elem_nullable)
-        });
     }
 
     // coerce_type: a composite value cast to `record` (or an array of one to

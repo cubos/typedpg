@@ -83,6 +83,17 @@ pub(crate) fn coerce_record_to_complex(
     params: &mut ParamCollector,
 ) -> Result<ExprType, AnalyzeError> {
     let snapshot = ctx.snapshot;
+    // coerce_type hands a `record` cast to `record` back as it is, so
+    // `ROW(1, 'a')::record::t` and `s::record::t` still name their fields.
+    let mut node = node;
+    while let Some(node::Node::TypeCast(cast)) = node.node.as_ref()
+        && let Some(tn) = cast.type_name.as_ref()
+        && tn.array_bounds.is_empty()
+        && crate::ddl::util::resolve_type_name(tn, snapshot) == Some(oid::RECORD)
+        && let Some(arg) = cast.arg.as_deref()
+    {
+        node = arg;
+    }
     let composite = snapshot.unwrap_domain(target);
     let fields = snapshot
         .get_type(composite)
