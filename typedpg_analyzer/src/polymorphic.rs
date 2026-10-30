@@ -64,6 +64,18 @@ pub(crate) fn is_polymorphic(oid: PgTypeOid) -> bool {
     )
 }
 
+/// coerce_type returns a value cast to `"any"`, `anyelement`,
+/// `anynonarray`, `anycompatible` or `anycompatiblenonarray` untouched —
+/// an `unknown` one or a domain included; the other polymorphic targets
+/// relabel a domain to its base type.
+pub(crate) fn passes_operand_through(oid: PgTypeOid) -> bool {
+    const ANY: PgTypeOid = PgTypeOid::from_raw(2276);
+    matches!(
+        oid,
+        ANY | ANYELEMENT | ANYNONARRAY | ANYCOMPATIBLE | ANYCOMPATIBLENONARRAY
+    )
+}
+
 /// PG's `type_is_array_domain`: an array, or a domain over one.
 fn type_is_array_domain(t: PgTypeOid, snapshot: &PgCatalog) -> bool {
     element_type(snapshot.unwrap_domain(t), snapshot).is_some()

@@ -308,7 +308,7 @@ pub(crate) fn verify_common_type_from_oids(
 /// A `record` source passes for any composite target, as in PG; whether
 /// the value can actually be converted (only a `ROW(...)` or a whole-row
 /// reference can) is the caller's to check — see
-/// [`crate::expr::record_converts_to_complex`].
+/// [`crate::expr::coerce_record_to_complex`].
 pub(crate) fn can_cast_explicit(
     source: PgTypeOid,
     target: PgTypeOid,

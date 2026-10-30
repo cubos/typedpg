@@ -77,6 +77,69 @@ fn fval_const_type(fval: &str) -> PgTypeOid {
 // Type casts
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// coerce_type hands an `unknown` operand of a cast to `"any"`,
+/// `anyelement`, `anynonarray`, `anycompatible` or `anycompatiblenonarray`
+/// back untouched — no input function runs, no type is assigned — so such a
+/// cast of an untyped literal or a still-untyped parameter *is* that literal
+/// or parameter: `SELECT '1'::anyelement` is a `text` column, `$1::anyelement`
+/// a `text` parameter, `WHERE $1::anyelement IS NULL` leaves `$1` untyped.
+/// Returns the operand for such a cast (through nested ones), `None` for any
+/// other node. (A typed operand goes through [`infer_type_cast`], which
+/// returns it as it is too.)
+pub(crate) fn passthrough_cast_operand<'a>(
+    node: &'a protobuf::Node,
+    snapshot: &PgCatalog,
+    params: &ParamCollector,
+) -> Option<&'a protobuf::Node> {
+    let mut operand = node;
+    let mut peeled = false;
+    while let Some(node::Node::TypeCast(cast)) = operand.node.as_ref() {
+        let tn = cast.type_name.as_ref()?;
+        if !tn.typmods.is_empty() || !tn.array_bounds.is_empty() {
+            return None;
+        }
+        let target = resolve_type_name(Some(tn), snapshot).ok()?;
+        if !crate::polymorphic::passes_operand_through(target) {
+            return None;
+        }
+        operand = cast.arg.as_deref()?;
+        peeled = true;
+    }
+    let untyped = match operand.node.as_ref()? {
+        node::Node::AConst(ac) => ac.isnull || matches!(ac.val, Some(a_const::Val::Sval(_))),
+        node::Node::ParamRef(p) => params.get(p.number) == oid::UNKNOWN,
+        _ => false,
+    };
+    (peeled && untyped).then_some(operand)
+}
+
+/// The parameter an output column is, through the casts
+/// [`passthrough_cast_operand`] sees through: `$1` and `$1::anyelement`
+/// alike are a bare parameter PG's `resolveTargetListUnknowns` may coerce.
+pub(crate) fn bare_param<'a>(
+    node: &'a protobuf::Node,
+    snapshot: &PgCatalog,
+) -> Option<&'a protobuf::ParamRef> {
+    let mut operand = node;
+    loop {
+        match operand.node.as_ref()? {
+            node::Node::ParamRef(p) => return Some(p),
+            node::Node::TypeCast(cast) => {
+                let tn = cast.type_name.as_ref()?;
+                if !tn.typmods.is_empty()
+                    || !tn.array_bounds.is_empty()
+                    || !resolve_type_name(Some(tn), snapshot)
+                        .is_ok_and(crate::polymorphic::passes_operand_through)
+                {
+                    return None;
+                }
+                operand = cast.arg.as_deref()?;
+            }
+            _ => return None,
+        }
+    }
+}
+
 pub(crate) fn infer_type_cast(
     cast: &protobuf::TypeCast,
     ctx: Ctx<'_>,
@@ -87,6 +150,8 @@ pub(crate) fn infer_type_cast(
         .arg
         .as_ref()
         .ok_or_else(|| AnalyzeError::Unsupported("TypeCast without arg".into()))?;
+    // `('a'::anyelement)::int` casts the literal itself.
+    let inner = passthrough_cast_operand(inner, snapshot, params).unwrap_or(inner);
 
     // `typename $1` (like `int4 '1'`, with the parameter in the constant's
     // place) is a libpg_query grammar extension for query normalization;
@@ -136,6 +201,19 @@ pub(crate) fn infer_type_cast(
         && matches!(ac.val, Some(a_const::Val::Sval(_)))
     {
         ctx.note_literal_type(ac.location, target_oid);
+    }
+    // stringTypeDatum runs the target's input function on an untyped
+    // literal, which a pseudo-type with a dummy one refuses — on NULL too
+    // when it is not strict (`NULL::trigger`; `NULL::anyarray` is a NULL).
+    if let Some(node::Node::AConst(ac)) = inner.node.as_ref()
+        && (ac.isnull || matches!(ac.val, Some(a_const::Val::Sval(_))))
+        && let Some(strict) = dummy_input_pseudo_type(target_oid, snapshot)
+        && (!ac.isnull || !strict)
+    {
+        let name = crate::ddl::util::format_type_for_message(snapshot, target_oid);
+        let span =
+            crate::error::node_location(inner).and_then(crate::error::SourceSpan::from_node_token);
+        return Err(crate::pgmsg::cannot_accept_a_value_of_type(&name, span).finalize_implicit());
     }
     // PG validates the *content* of an untyped string literal against the
     // target's input function at parse time (`'x'::int` fails prepare with
@@ -226,6 +304,16 @@ pub(crate) fn infer_type_cast(
         Some((arr, target)) => transform_array_expr(arr, ctx, params, Some(target))?,
         None => infer_expr(inner, ctx, params, inner_goal)?,
     };
+    // coerce_type: any other `record` cast to a composite is rebuilt field
+    // by field from the row it names (a whole-row reference to a subquery,
+    // CTE, VALUES list, …) — or rejected when it names none.
+    let inner_type = if inner_type.type_oid == oid::RECORD
+        && coerce::is_complex(target_oid, snapshot)
+    {
+        super::coerce_record_to_complex(inner, target_oid, CoercionContext::Explicit, ctx, params)?
+    } else {
+        inner_type
+    };
 
     if let Some(node::Node::ParamRef(p)) = inner.node.as_ref()
         && !pass_through
@@ -234,14 +322,20 @@ pub(crate) fn infer_type_cast(
         params.record(p.number, target_oid);
     }
 
+    // An `unknown` value that is no literal casts through I/O to a string
+    // type only, and passes through `unknown` itself and the pseudo-types
+    // coerce_type hands it to untouched.
+    if inner_type.unknown_value {
+        super::unknown_value_coercion(target_oid, CoercionContext::Explicit, snapshot, inner)?;
+        if target_oid == oid::UNKNOWN || crate::polymorphic::passes_operand_through(target_oid) {
+            return Ok(inner_type);
+        }
+    }
+
     // PG rejects an explicit cast with no legal path (e.g. boolean → double
     // precision) at parse time — `cannot cast type X to Y`. Mirror that, but
     // only after the inner expression's own type is known.
-    if !coerce::can_cast_explicit(inner_type.type_oid, target_oid, snapshot)
-        || (inner_type.type_oid == oid::RECORD
-            && coerce::is_complex(target_oid, snapshot)
-            && !super::record_converts_to_complex(inner, ctx.scope))
-    {
+    if !coerce::can_cast_explicit(inner_type.type_oid, target_oid, snapshot) {
         let from = crate::ddl::util::format_type_for_message(snapshot, inner_type.type_oid);
         let to = crate::ddl::util::format_type_for_message(snapshot, target_oid);
         let span = crate::error::node_location(inner).and_then(|loc| {
@@ -257,27 +351,10 @@ pub(crate) fn infer_type_cast(
         .finalize_implicit());
     }
 
-    if pass_through {
+    // An operand still untyped here (no literal or parameter, which
+    // `passthrough_cast_operand` handles) is handed back as it is too.
+    if pass_through && inner_type.type_oid == oid::UNKNOWN {
         return Ok(inner_type);
-    }
-    // The other polymorphic targets (`anyarray`, `anyenum`, `anyrange`,
-    // `anymultirange` and their `anycompatible` forms) need an actual
-    // array, enum, range or multirange: a typed operand is returned as it
-    // is, relabeled from a domain to its base type (`'{1}'::ia::anyarray`
-    // is `integer[]`). (An unknown literal fails the pseudo-type's input
-    // function — see `literal_input` — and an untyped parameter or NULL
-    // takes the pseudo-type itself.)
-    if crate::polymorphic::is_polymorphic(target_oid) && inner_type.type_oid != oid::UNKNOWN {
-        let base = snapshot.unwrap_domain(inner_type.type_oid);
-        if base == inner_type.type_oid {
-            return Ok(inner_type);
-        }
-        return Ok(ExprType {
-            record_fields: None,
-            ..ExprType::scalar(base, inner_type.nullable)
-                .with_collation(derive_collation([&inner_type], base, snapshot)?)
-                .with_elem_nullable(inner_type.elem_nullable)
-        });
     }
 
     // coerce_type: a composite value cast to `record` (or an array of one to
@@ -291,6 +368,47 @@ pub(crate) fn infer_type_cast(
                 .is_some_and(|e| coerce::is_complex(e, snapshot)))
     {
         return Ok(inner_type);
+    }
+
+    // coerce_type: a typed value cast to `"any"` or a polymorphic
+    // pseudo-type is left as it is (`1::anyelement` is an integer) — to an
+    // array, enum or range one, relabeled to its domain's base type (typmod
+    // -1). coerce_type_typmod then relabels a value that still carries a
+    // typmod to the target itself, typmod -1: `v::anyelement` over a
+    // `varchar(3)` column is an `anyelement`, which no row can be output as
+    // (`cannot display a value of type anyelement`).
+    const ANY: PgTypeOid = PgTypeOid::from_raw(2276);
+    if target_oid != inner_type.type_oid
+        && inner_type.type_oid != oid::UNKNOWN
+        && (target_oid == ANY || crate::polymorphic::is_polymorphic(target_oid))
+    {
+        let mut result = inner_type;
+        let base = snapshot.unwrap_domain(result.type_oid);
+        if !crate::polymorphic::passes_operand_through(target_oid) && base != result.type_oid {
+            let (collation, explicit_collation) = derive_collation([&result], base, snapshot)?;
+            result = ExprType {
+                type_oid: base,
+                typmod: None,
+                collation,
+                explicit_collation,
+                ..result
+            };
+        }
+        if result.typmod.is_some_and(|t| t >= 0) {
+            let (collation, explicit_collation) =
+                derive_collation([&result], target_oid, snapshot)?;
+            result = ExprType {
+                type_oid: target_oid,
+                typmod: None,
+                collation,
+                explicit_collation,
+                record_fields: None,
+                elem_nullable: None,
+                refine: Default::default(),
+                ..result
+            };
+        }
+        return Ok(result);
     }
 
     // PG: the cast result has exactly the written typmod — `x::T(n)` is
@@ -346,6 +464,8 @@ pub(crate) fn infer_type_cast(
     });
     Ok(ExprType {
         record_fields,
+        // A typed value cast to `unknown` (a CoerceViaIO) is no literal.
+        unknown_value: target_oid == oid::UNKNOWN && inner_type.type_oid != oid::UNKNOWN,
         ..ExprType::scalar_with_typmod(target_oid, nullable, written_typmod)
             .with_collation(state)
             .with_elem_nullable(elem_nullable)
@@ -470,5 +590,29 @@ pub(crate) fn coercion_can_null_elements(
     ) {
         (Some(fe), Some(te)) => coercion_can_return_null(fe, te, snapshot),
         _ => false,
+    }
+}
+
+/// A pseudo-type whose input function is PSEUDOTYPE_DUMMY_INPUT_FUNC
+/// (pseudotypes.c), with whether that function is strict (pg_proc.dat):
+/// a string literal of the type always fails, a NULL one only when the
+/// function is not strict. (Verified against PG 18.)
+fn dummy_input_pseudo_type(t: PgTypeOid, snapshot: &PgCatalog) -> Option<bool> {
+    let ty = snapshot.get_type(t)?;
+    if ty.typtype != TypType::Pseudo
+        || snapshot.namespace_name(ty.typnamespace) != Some("pg_catalog")
+    {
+        return None;
+    }
+    match ty.typname.as_str() {
+        "anyarray"
+        | "anyrange"
+        | "anymultirange"
+        | "anycompatiblearray"
+        | "anycompatiblerange"
+        | "anycompatiblemultirange" => Some(true),
+        "trigger" | "event_trigger" | "language_handler" | "fdw_handler" | "table_am_handler"
+        | "index_am_handler" | "tsm_handler" => Some(false),
+        _ => None,
     }
 }

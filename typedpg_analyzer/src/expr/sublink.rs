@@ -87,7 +87,9 @@ pub(crate) fn infer_sublink(
                 // which expands `t.*` / `(expr).*` into their columns.
                 let lhs_row: Option<std::borrow::Cow<'_, [protobuf::Node]>> =
                     match sub.testexpr.as_deref().and_then(|n| n.node.as_ref()) {
-                        Some(node::Node::RowExpr(r)) => Some(expand_row_args(&r.args, ctx, params)),
+                        Some(node::Node::RowExpr(r)) => {
+                            Some(expand_row_args(&r.args, ctx, params)?)
+                        }
                         _ => None,
                     };
                 let lhs_arity = lhs_row.as_ref().map_or(1, |r| r.len());

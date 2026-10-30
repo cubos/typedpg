@@ -106,6 +106,15 @@ fn check_when_clause(
         &mut params,
         TypeGoal::NONE,
     )
+    .and_then(|r| {
+        r.check_unknown_value_coercion(
+            crate::pg_catalog::oid::BOOL,
+            crate::coerce::CoercionContext::Assignment,
+            interp,
+            when,
+        )?;
+        Ok(r)
+    })
     .map_err(unsupported)?;
     // transformWhereClause: coerce_to_boolean.
     if result.type_oid != crate::pg_catalog::oid::BOOL

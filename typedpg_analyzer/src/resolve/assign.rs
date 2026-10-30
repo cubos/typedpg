@@ -230,6 +230,62 @@ enum SetValue<'a> {
     SubqueryColumn(Box<RawColumn>),
 }
 
+/// The SET list with each `(a, b, …) = ROW(…)` source's elements expanded
+/// as PG's `transformMultiAssignRef` transforms it (`transformRowExpr`, whose
+/// `transformExpressionList` expands `rel.*` and `(expr).*`): `ROW(v.*)`
+/// becomes `ROW(v.x, v.y)` before its elements are counted and assigned in
+/// order. Borrowed when no source holds a star.
+pub(crate) fn expand_multi_assign_rows<'a>(
+    target_list: &'a [protobuf::Node],
+    ctx: Ctx<'_>,
+    params: &ParamCollector,
+) -> Result<std::borrow::Cow<'a, [protobuf::Node]>, AnalyzeError> {
+    let expanded_row = |item: &protobuf::Node| {
+        let Some(node::Node::ResTarget(rt)) = item.node.as_ref() else {
+            return Ok(None);
+        };
+        let Some(node::Node::MultiAssignRef(mar)) = rt.val.as_deref().and_then(|v| v.node.as_ref())
+        else {
+            return Ok(None);
+        };
+        let Some(node::Node::RowExpr(row)) = mar.source.as_deref().and_then(|s| s.node.as_ref())
+        else {
+            return Ok(None);
+        };
+        let std::borrow::Cow::Owned(args) = expr::expand_row_args(&row.args, ctx, params)? else {
+            return Ok(None);
+        };
+        let mut rt = rt.clone();
+        let mut mar = mar.clone();
+        mar.source = Some(Box::new(protobuf::Node {
+            node: Some(node::Node::RowExpr(Box::new(protobuf::RowExpr {
+                args,
+                ..(**row).clone()
+            }))),
+        }));
+        rt.val = Some(Box::new(protobuf::Node {
+            node: Some(node::Node::MultiAssignRef(mar)),
+        }));
+        Ok(Some(protobuf::Node {
+            node: Some(node::Node::ResTarget(rt)),
+        }))
+    };
+    let expanded: Vec<Option<protobuf::Node>> = target_list
+        .iter()
+        .map(expanded_row)
+        .collect::<Result<_, AnalyzeError>>()?;
+    if expanded.iter().all(Option::is_none) {
+        return Ok(std::borrow::Cow::Borrowed(target_list));
+    }
+    Ok(std::borrow::Cow::Owned(
+        target_list
+            .iter()
+            .zip(expanded)
+            .map(|(item, e)| e.unwrap_or_else(|| item.clone()))
+            .collect(),
+    ))
+}
+
 /// Expand `SET (a, b) = (…)` like PG's `transformMultiAssignRef`
 /// (parse_expr.c): a `ROW(…)` source contributes its elements, a sub-SELECT
 /// its output columns (analyzed once, as a correlated subquery); anything
@@ -330,17 +386,20 @@ fn expand_set_items<'a>(
 /// Analyze an UPDATE-style SET list against `table_attrs` — the shared core
 /// of UPDATE, ON CONFLICT DO UPDATE and MERGE ... UPDATE (PG's
 /// `transformUpdateTargetList`). `null_check` enables the static rejection
-/// of `SET not_null_col = NULL`.
-pub(crate) fn analyze_set_clause(
-    target_list: &[protobuf::Node],
+/// of `SET not_null_col = NULL`. Returns the SET list with its multiple
+/// assignments' row elements expanded ([`expand_multi_assign_rows`]), what
+/// the later passes over it read.
+pub(crate) fn analyze_set_clause<'a>(
+    target_list: &'a [protobuf::Node],
     table_attrs: &[crate::pg_catalog::PgAttribute],
     table_relname: &str,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
     null_check: bool,
-) -> Result<(), AnalyzeError> {
+) -> Result<std::borrow::Cow<'a, [protobuf::Node]>, AnalyzeError> {
     let snapshot = ctx.snapshot;
-    let items = expand_set_items(target_list, ctx, params)?;
+    let target_list = expand_multi_assign_rows(target_list, ctx, params)?;
+    let items = expand_set_items(&target_list, ctx, params)?;
     // `(column, indirected)` of every assignment, for the rewriter's
     // `multiple assignments to same column` rule.
     let mut assigned: Vec<(&str, bool)> = Vec::with_capacity(items.len());
@@ -457,7 +516,7 @@ pub(crate) fn analyze_set_clause(
             .finalize_implicit());
         }
     }
-    Ok(())
+    Ok(target_list)
 }
 
 /// PG's `checkInsertTargets`: a column may be named more than once only

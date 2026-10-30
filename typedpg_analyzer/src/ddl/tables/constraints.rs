@@ -1091,6 +1091,15 @@ pub(crate) fn validate_constraint_expressions(
                             &mut params,
                             TypeGoal::NONE,
                         )
+                        .and_then(|r| {
+                            r.check_unknown_value_coercion(
+                                oid::BOOL,
+                                crate::coerce::CoercionContext::Assignment,
+                                interp,
+                                expr,
+                            )?;
+                            Ok(r)
+                        })
                         .map_err(|e| {
                             // Forward the analyzer's message verbatim so it
                             // can match PG's wording (e.g. `column "ghost"
@@ -1151,6 +1160,15 @@ pub(crate) fn validate_constraint_expressions(
                 &mut params,
                 TypeGoal::NONE,
             )
+            .and_then(|r| {
+                r.check_unknown_value_coercion(
+                    oid::BOOL,
+                    crate::coerce::CoercionContext::Assignment,
+                    interp,
+                    expr,
+                )?;
+                Ok(r)
+            })
             .map_err(|e| {
                 DdlError::UnsupportedDdl(format!(
                     "{e} (in table-level CHECK constraint on \"{relname}\")"
@@ -1883,7 +1901,17 @@ fn validate_check_expression_for_table(
         &mut params,
         TypeGoal::NONE,
     )
-    .map_err(|e| DdlError::UnsupportedDdl(format!("CHECK on \"{relname}\": {e}")))?;
+    .and_then(|r| {
+        r.check_unknown_value_coercion(
+            oid::BOOL,
+            crate::coerce::CoercionContext::Assignment,
+            interp,
+            expr,
+        )?;
+        Ok(r)
+    })
+    // PG's message first, verbatim; the constraint after it.
+    .map_err(|e| DdlError::UnsupportedDdl(format!("{e} (CHECK constraint on \"{relname}\")")))?;
     if result.type_oid != oid::BOOL && result.type_oid != oid::UNKNOWN {
         let typname = format_type_for_message(interp, result.type_oid);
         return Err(DdlError::UnsupportedDdl(format!(

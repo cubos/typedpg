@@ -243,6 +243,15 @@ fn check_policy_expression(
         &mut params,
         TypeGoal::NONE,
     )
+    .and_then(|r| {
+        r.check_unknown_value_coercion(
+            crate::pg_catalog::oid::BOOL,
+            crate::coerce::CoercionContext::Assignment,
+            interp,
+            expr,
+        )?;
+        Ok(r)
+    })
     .map_err(|e| DdlError::UnsupportedDdl(format!("{e}")))?;
     super::expr_kind::check_expr_kind(interp, expr, super::expr_kind::ExprKind::Policy)?;
     let bool_oid = crate::pg_catalog::oid::BOOL;

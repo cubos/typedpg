@@ -421,6 +421,15 @@ fn check_domain_check_expression(
         )
     });
     let result = result
+        .and_then(|r| {
+            r.check_unknown_value_coercion(
+                oid::BOOL,
+                crate::coerce::CoercionContext::Assignment,
+                interp,
+                expr,
+            )?;
+            Ok(r)
+        })
         .map_err(|e| DdlError::UnsupportedDdl(format!("{e} (in domain CHECK constraint)")))?;
     if result.type_oid != oid::BOOL && result.type_oid != oid::UNKNOWN {
         return Err(DdlError::UnsupportedDdl(format!(

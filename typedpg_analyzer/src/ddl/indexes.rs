@@ -310,6 +310,15 @@ fn check_index_predicate(
     // transformWhereClause: a boolean over the table's row.
     match super::volatile::infer_over_relation(db, relid, pred, None) {
         Some(Err(e)) => return Err(DdlError::UnsupportedDdl(e.to_string())),
+        Some(Ok(t)) if t.unknown_value => {
+            t.check_unknown_value_coercion(
+                crate::pg_catalog::oid::BOOL,
+                crate::coerce::CoercionContext::Assignment,
+                db,
+                pred,
+            )
+            .map_err(|e| DdlError::UnsupportedDdl(e.to_string()))?;
+        }
         Some(Ok(t))
             if t.type_oid != crate::pg_catalog::oid::BOOL
                 && t.type_oid != crate::pg_catalog::oid::UNKNOWN =>

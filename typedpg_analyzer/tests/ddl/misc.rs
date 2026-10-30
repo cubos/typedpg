@@ -861,6 +861,151 @@ fn ddl_expression_kinds_reject_aggregates_windows_and_subqueries() {
     }
 }
 
+/// A value cast to `unknown` is no literal (see the query test
+/// `a_value_cast_to_unknown_is_no_literal`): a stored expression assigning
+/// it to a string type takes it, any other coercion fails (XX000), and so
+/// does a query body resolving it as text.
+#[test]
+fn ddl_expressions_coerce_an_unknown_value_like_pg() {
+    let setup = "CREATE TABLE t (a int PRIMARY KEY, b text);";
+    for stmt in [
+        "CREATE TABLE d1 (c text DEFAULT 'a'::text::unknown);",
+        "CREATE TABLE d2 (c name DEFAULT 'a'::text::unknown);",
+        "CREATE TABLE d3 (c text, g text GENERATED ALWAYS AS ('a'::text::unknown) STORED);",
+        "CREATE TABLE d4 (c text DEFAULT (ROW(1, 'x')).f2);",
+        "CREATE DOMAIN dd1 AS text DEFAULT 'a'::text::unknown;",
+        "CREATE FUNCTION f1(x text DEFAULT 'a'::text::unknown) RETURNS text \
+         LANGUAGE sql AS $$SELECT x$$;",
+        "ALTER TABLE t ALTER COLUMN b SET DEFAULT 'a'::text::unknown;",
+        "ALTER TABLE t ADD COLUMN z text DEFAULT 'a'::text::unknown;",
+        "ALTER TABLE t ALTER COLUMN b TYPE varchar USING 'a'::text::unknown;",
+        "ALTER TABLE t ADD CHECK ('a'::text::unknown IS NULL);",
+        "CREATE VIEW v1 AS SELECT 'a'::text::unknown AS x UNION SELECT 'b';",
+    ] {
+        try_apply(&[("0001.sql", setup), ("0002.sql", stmt)])
+            .unwrap_or_else(|e| panic!("{stmt}: {e}"));
+    }
+    for (stmt, target) in [
+        (
+            "CREATE TABLE e1 (c int DEFAULT 'a'::text::unknown);",
+            "integer",
+        ),
+        (
+            "CREATE TABLE e2 (c \"char\" DEFAULT 'a'::text::unknown);",
+            "\"char\"",
+        ),
+        (
+            "CREATE TABLE e3 (c text, g int GENERATED ALWAYS AS ('a'::text::unknown) STORED);",
+            "integer",
+        ),
+        (
+            "CREATE DOMAIN de1 AS int DEFAULT 'a'::text::unknown;",
+            "integer",
+        ),
+        (
+            "CREATE FUNCTION fe1(x int DEFAULT 'a'::text::unknown) RETURNS int \
+             LANGUAGE sql AS $$SELECT x$$;",
+            "integer",
+        ),
+        (
+            "ALTER TABLE t ALTER COLUMN a SET DEFAULT 'a'::text::unknown;",
+            "integer",
+        ),
+        (
+            "ALTER TABLE t ALTER COLUMN b TYPE int USING 'a'::text::unknown;",
+            "integer",
+        ),
+        // coerce_to_boolean.
+        (
+            "CREATE TABLE e4 (c text CHECK ('a'::text::unknown));",
+            "boolean",
+        ),
+        (
+            "CREATE TABLE e5 (c text, CHECK ('a'::text::unknown));",
+            "boolean",
+        ),
+        ("ALTER TABLE t ADD CHECK ('a'::text::unknown);", "boolean"),
+        (
+            "CREATE DOMAIN de2 AS text CHECK ('a'::text::unknown);",
+            "boolean",
+        ),
+        ("CREATE INDEX ON t (a) WHERE 'a'::text::unknown;", "boolean"),
+        (
+            "CREATE POLICY p ON t USING ('a'::text::unknown);",
+            "boolean",
+        ),
+        (
+            "CREATE PUBLICATION pub FOR TABLE t WHERE ('a'::text::unknown);",
+            "boolean",
+        ),
+        (
+            "CREATE RULE r AS ON INSERT TO t WHERE 'a'::text::unknown DO ALSO NOTIFY x;",
+            "boolean",
+        ),
+        (
+            "CREATE FUNCTION tf() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$; \
+             CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW WHEN ('a'::text::unknown) \
+             EXECUTE FUNCTION tf();",
+            "boolean",
+        ),
+        // Operators, query bodies.
+        (
+            "CREATE TABLE e6 (c text CHECK (c = 'a'::text::unknown));",
+            "text",
+        ),
+        (
+            "CREATE DOMAIN de3 AS text CHECK (VALUE = 'a'::text::unknown);",
+            "text",
+        ),
+        (
+            "CREATE INDEX ON t (a) WHERE b = 'a'::text::unknown;",
+            "text",
+        ),
+        ("CREATE VIEW v2 AS SELECT 'a'::text::unknown AS x;", "text"),
+        ("CREATE TABLE c1 AS SELECT 'a'::text::unknown AS x;", "text"),
+        (
+            "CREATE FUNCTION fe2() RETURNS text LANGUAGE sql AS $$SELECT 'a'::text::unknown$$;",
+            "text",
+        ),
+        (
+            "CREATE FUNCTION fe3() RETURNS text LANGUAGE sql BEGIN ATOMIC SELECT 'a'::text::unknown; END;",
+            "text",
+        ),
+        (
+            "CREATE FUNCTION fe4() RETURNS int LANGUAGE sql RETURN 'a'::text::unknown;",
+            "text",
+        ),
+        (
+            "CREATE RULE r2 AS ON INSERT TO t DO ALSO SELECT 'a'::text::unknown;",
+            "text",
+        ),
+    ] {
+        let msg = format!("failed to find conversion function from unknown to {target}");
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(&msg), "{stmt}\n  got: {err}");
+    }
+}
+
+/// ALTER TABLE … ADD CHECK reports PG's message first, as CREATE TABLE's
+/// CHECK constraints do.
+#[test]
+fn alter_table_add_check_reports_pg_message_first() {
+    let setup = "CREATE TABLE t (a int, b text);";
+    for (stmt, msg) in [
+        (
+            "ALTER TABLE t ADD CHECK (nosuch > 0);",
+            "column \"nosuch\" does not exist",
+        ),
+        (
+            "ALTER TABLE t ADD CONSTRAINT c CHECK (b > 0);",
+            "operator does not exist: text > integer",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+}
+
 #[test]
 fn builtin_sql_functions_count_by_their_inlined_body() {
     // PG 18: `text || int` runs the STABLE LANGUAGE sql textanycat, which

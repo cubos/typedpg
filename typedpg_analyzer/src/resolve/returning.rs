@@ -123,6 +123,8 @@ pub(crate) fn resolve_returning(
             crate::error::node_location(first).and_then(crate::error::SourceSpan::from_node_token);
         return Err(crate::pgmsg::returning_without_columns(span).finalize_implicit());
     }
+    // transformReturningClause's resolveTargetListUnknowns.
+    super::select::resolve_unknown_values(&clause.exprs, &columns, ctx.snapshot)?;
     Ok(columns)
 }
 

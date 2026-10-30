@@ -116,6 +116,9 @@ pub(crate) fn infer_column_ref(
                 // see through to the field types.
                 record_fields: col.record_fields.clone(),
                 elem_nullable: col.elem_nullable,
+                // (No relation has an `unknown` column: a function in FROM
+                // returning it is rejected.)
+                unknown_value: false,
                 refine: column_refinement(col, ctx),
             })
         }
@@ -190,6 +193,40 @@ fn sql_function_param(parts: &[String], snapshot: &PgCatalog) -> Option<ExprType
             None => Some(value),
             Some(fld) => resolve_composite_field(&value, fld, snapshot, None).ok(),
         }
+    })
+}
+
+/// `rel.*` that names no relation, read as PG's `ExpandColumnRefStar` reads
+/// it once the relation lookup failed: through the parser hook, which in a
+/// SQL function body (`sql_fn_post_column_ref`) takes `v.*`, `f.v.*` or
+/// `v.fld.*` for parameter `v` — whose fields the star then stands for
+/// (`ExpandRowReference`). Returns that as the equivalent `(v).*`.
+pub(crate) fn sql_function_param_star(
+    col_ref: &protobuf::ColumnRef,
+    scope: &Scope,
+    snapshot: &PgCatalog,
+) -> Option<protobuf::AIndirection> {
+    let (star, names) = col_ref.fields.split_last()?;
+    if !matches!(star.node.as_ref(), Some(node::Node::AStar(_)))
+        || !names
+            .iter()
+            .all(|f| matches!(f.node.as_ref(), Some(node::Node::String(_))))
+    {
+        return None;
+    }
+    let names_str = extract_string_fields(names);
+    if scope.find_source(names_str.last()?).is_some() {
+        return None;
+    }
+    sql_function_param(&names_str, snapshot)?;
+    Some(protobuf::AIndirection {
+        arg: Some(Box::new(protobuf::Node {
+            node: Some(node::Node::ColumnRef(protobuf::ColumnRef {
+                fields: names.to_vec(),
+                location: col_ref.location,
+            })),
+        })),
+        indirection: vec![star.clone()],
     })
 }
 
@@ -300,6 +337,7 @@ fn whole_row_ref(
                     record_fields: c.record_fields.clone(),
                     elem_nullable: c.elem_nullable,
                     refine: c.refine.clone(),
+                    unknown_value: false,
                 });
             }
         }
@@ -315,6 +353,7 @@ fn whole_row_ref(
         record_fields: Some(shape_of_columns(&source.columns).into()),
         elem_nullable: None,
         refine: crate::refine::Refinement::NONE,
+        unknown_value: false,
     })
 }
 
@@ -334,6 +373,7 @@ fn shape_of_columns(columns: &[crate::scope::ScopeColumn]) -> Vec<RecordField> {
                 record_fields: c.record_fields.clone(),
                 elem_nullable: c.elem_nullable,
                 refine: c.refine.clone(),
+                unknown_value: false,
             },
         })
         .collect()

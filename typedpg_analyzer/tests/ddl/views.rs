@@ -1186,6 +1186,82 @@ fn select_into_creates_a_table() {
     );
 }
 
+// ── `rel.*` in the VALUES of a rule action or a SQL function body ──────────
+
+#[test]
+fn rule_action_values_expand_new_star() {
+    // transformInsertStmt expands each VALUES row with
+    // transformExpressionList: `new.*` is one value per column of the rule's
+    // table, the same as in a SELECT list.
+    build_db(&[(
+        "0001.sql",
+        "CREATE TABLE tt (f1 int, data text);
+         CREATE TABLE tt_log (f1 int, data text);
+         CREATE RULE insert_tt_rule AS ON INSERT TO tt DO ALSO INSERT INTO tt_log VALUES (new.*);
+         CREATE TABLE tt_log2 (f1 int, data text, at int);
+         CREATE RULE insert_tt_rule2 AS ON INSERT TO tt DO ALSO
+             INSERT INTO tt_log2 VALUES (new.*, 1), (new.*, 2);
+         CREATE RULE update_tt_rule AS ON UPDATE TO tt DO ALSO
+             INSERT INTO tt_log2 (data, f1) VALUES ((new).data, (old).f1);",
+    )]);
+    let err = try_apply(&[(
+        "0001.sql",
+        "CREATE TABLE tt (f1 int, data text);
+         CREATE TABLE tt_log (f1 int);
+         CREATE RULE r AS ON INSERT TO tt DO ALSO INSERT INTO tt_log VALUES (new.*);",
+    )])
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("INSERT has more expressions than target columns"),
+        "{err}"
+    );
+}
+
+#[test]
+fn sql_function_values_expand_a_composite_parameter() {
+    // A parameter's `v.*` is a field selection per field (ExpandIndirectionStar
+    // after the parameter hook resolved `v`), in VALUES as anywhere else.
+    build_db(&[(
+        "0001.sql",
+        "CREATE TABLE compos (f1 int, f2 text);
+         CREATE FUNCTION fcompos1(v compos) RETURNS void
+             AS $$ insert into compos values (v.*); $$ LANGUAGE sql;
+         CREATE FUNCTION fcompos2(v compos) RETURNS void
+             AS $$ insert into compos values ((v).*); $$ LANGUAGE sql;
+         CREATE FUNCTION fcompos3(v compos) RETURNS void
+             AS $$ insert into compos select v.*; $$ LANGUAGE sql;
+         CREATE FUNCTION fcompos4(v compos) RETURNS void
+             AS $$ insert into compos values (fcompos4.v.*); $$ LANGUAGE sql;
+         CREATE FUNCTION fcompos5(v compos) RETURNS SETOF compos
+             AS $$ select v.* $$ LANGUAGE sql;",
+    )]);
+    let err = try_apply(&[(
+        "0001.sql",
+        "CREATE TABLE compos (f1 int, f2 text);
+         CREATE FUNCTION f(v compos) RETURNS void
+             AS $$ insert into compos values (v.*, 1); $$ LANGUAGE sql;",
+    )])
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("INSERT has more expressions than target columns"),
+        "{err}"
+    );
+    // A scalar parameter has no fields to expand.
+    let err = try_apply(&[(
+        "0001.sql",
+        "CREATE TABLE compos (f1 int, f2 text);
+         CREATE FUNCTION f(v int) RETURNS void
+             AS $$ insert into compos values (v.*); $$ LANGUAGE sql;",
+    )])
+    .unwrap_err();
+    assert!(
+        err.to_string().starts_with("type integer is not composite"),
+        "{err}"
+    );
+}
+
 // ── View nullability follows the base tables (PG re-expands views) ──────────
 
 #[test]

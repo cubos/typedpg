@@ -224,7 +224,7 @@ pub(crate) fn infer_func_call(
     for (i, arg) in func.args.iter().enumerate() {
         if declared_any(i)
             && !hypothetical
-            && let Some(node::Node::ParamRef(p)) = functions::call_arg_value(arg).node.as_ref()
+            && let Some(p) = super::bare_param(functions::call_arg_value(arg), ctx.snapshot)
         {
             params.mark_indeterminate_locked(p.number);
         }
@@ -334,6 +334,8 @@ pub(crate) fn infer_func_call(
             builtin_array_elem_nullable(func, &resolved, &args)
         },
         refine,
+        // `unknownin(…)`: a call, no literal.
+        unknown_value: resolved.return_type_oid == oid::UNKNOWN,
     };
     // A call of a `LANGUAGE sql` function is its body over the arguments:
     // both what the call is said to be and what its body makes hold.
@@ -945,6 +947,21 @@ fn backfill_func_args(
             // literal-content rejection is the parse-time error PG itself
             // raises from this argument coercion (`sqrt('x')`).
             coerce_unknown_to(functions::call_arg_value(arg), ctx, params, expected)?;
+        }
+        // make_fn_arguments: a `record` argument of a composite parameter
+        // (which can_coerce_type let through) is rebuilt by
+        // coerce_record_to_complex in the implicit context, or rejected.
+        if args.types[i] == oid::RECORD
+            && let Some(&expected) = resolved.arg_types.get(i)
+            && crate::coerce::is_complex(expected, ctx.snapshot)
+        {
+            super::coerce_record_to_complex(
+                functions::call_arg_value(arg),
+                expected,
+                CoercionContext::Implicit,
+                ctx,
+                params,
+            )?;
         }
     }
     Ok(())

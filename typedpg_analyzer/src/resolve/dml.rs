@@ -41,6 +41,8 @@ pub(crate) fn analyze_insert_with_outer_ctes(
         && let Some(node::Node::SelectStmt(val_sel)) = select_node.node.as_ref()
     {
         if !val_sel.values_lists.is_empty() {
+            let expanded = expand_values_rows(val_sel, snapshot, params, &cte_scopes)?;
+            let val_sel: &protobuf::SelectStmt = &expanded;
             written = analyze_insert_values(ins, val_sel, &tgt, snapshot, params, &cte_scopes)?;
             let rows: Vec<&[protobuf::Node]> = val_sel
                 .values_lists
@@ -89,11 +91,11 @@ pub(crate) fn analyze_insert_with_outer_ctes(
         return Err(v.error);
     }
 
-    let arbiter = match &ins.on_conflict_clause {
+    let (arbiter, conflict_set_list) = match &ins.on_conflict_clause {
         Some(on_conflict) => {
             analyze_insert_on_conflict(on_conflict, relation, &tgt, snapshot, params, &cte_scopes)?
         }
-        None => None,
+        None => (None, Vec::new()),
     };
 
     // Resolve RETURNING list.
@@ -164,6 +166,7 @@ pub(crate) fn analyze_insert_with_outer_ctes(
         {
             let update_arm = on_conflict_update_arm(
                 oc,
+                &conflict_set_list,
                 relation,
                 &tgt,
                 &wt,
@@ -191,7 +194,7 @@ pub(crate) fn analyze_insert_with_outer_ctes(
     rw.on_conflict = ins.on_conflict_clause.as_ref().and_then(|oc| {
         match protobuf::OnConflictAction::try_from(oc.action) {
             Ok(protobuf::OnConflictAction::OnconflictUpdate) => {
-                let set = set_list_assigns(&oc.target_list);
+                let set = set_list_assigns(&conflict_set_list);
                 rw.listed.extend(set.iter().map(|a| a.column.clone()));
                 Some(Some(set))
             }
@@ -290,9 +293,11 @@ pub(crate) fn inserted_rows_knowledge(
 /// columns `insert_not_null` are non-NULL — and its other columns as
 /// stored. Those of the arbiter's key equal the proposed row's (a NULL key
 /// never conflicts, and under NULLS NOT DISTINCT only with a NULL one).
+/// `set_list` is `oc`'s SET list as [`analyze_set_clause`] expanded it.
 #[allow(clippy::too_many_arguments)]
 fn on_conflict_update_arm(
     oc: &protobuf::OnConflictClause,
+    set_list: &[protobuf::Node],
     relation: &protobuf::RangeVar,
     tgt: &InsertTarget,
     wt: &WriteTarget,
@@ -364,13 +369,13 @@ fn on_conflict_update_arm(
         }
     }
     let set = set_values(
-        &oc.target_list,
+        set_list,
         wt,
         &tgt.attrs,
         expr::Ctx::new(&scope, &null_ctx, snapshot),
         params,
     );
-    for a in set_list_assigns(&oc.target_list) {
+    for a in set_list_assigns(set_list) {
         match set.get(&a.column) {
             Some(v) => k.write(&a.column, v),
             None => k.write(&a.column, &ValueInfo::default()),
@@ -597,6 +602,56 @@ fn arity_mismatch(tgt: &InsertTarget, given: usize, expected: usize) -> bool {
 /// `INSERT … VALUES (…)`: infer each value with the column's type as goal,
 /// enforcing arity, NOT NULL / typmod literal checks, and the
 /// generated/identity-column restrictions.
+/// `INSERT … VALUES` with each row as transformInsertStmt transforms it
+/// (transformExpressionList, single row or several): `rel.*` and
+/// `(expr).*` expanded into one value per column — a rule action's
+/// `new.*`, a SQL function parameter's `v.*` — before rows are counted
+/// against the target columns. Borrowed when no row holds a star.
+fn expand_values_rows<'a>(
+    val_sel: &'a protobuf::SelectStmt,
+    snapshot: &PgCatalog,
+    params: &ParamCollector,
+    cte_scopes: &HashMap<String, Vec<ScopeColumn>>,
+) -> Result<std::borrow::Cow<'a, protobuf::SelectStmt>, AnalyzeError> {
+    let scope = Scope {
+        ctes: cte_scopes.clone(),
+        ..Scope::default()
+    };
+    let null_ctx = NullabilityContext::default();
+    let ctx = expr::Ctx::new(&scope, &null_ctx, snapshot);
+    let rows: Vec<Option<Vec<protobuf::Node>>> = val_sel
+        .values_lists
+        .iter()
+        .map(|row| match row.node.as_ref() {
+            Some(node::Node::List(list)) => {
+                Ok(match expr::expand_row_args(&list.items, ctx, params)? {
+                    std::borrow::Cow::Owned(items) => Some(items),
+                    std::borrow::Cow::Borrowed(_) => None,
+                })
+            }
+            _ => Ok(None),
+        })
+        .collect::<Result<_, AnalyzeError>>()?;
+    if rows.iter().all(Option::is_none) {
+        return Ok(std::borrow::Cow::Borrowed(val_sel));
+    }
+    let values_lists = val_sel
+        .values_lists
+        .iter()
+        .zip(rows)
+        .map(|(row, items)| match items {
+            Some(items) => protobuf::Node {
+                node: Some(node::Node::List(protobuf::List { items })),
+            },
+            None => row.clone(),
+        })
+        .collect();
+    Ok(std::borrow::Cow::Owned(protobuf::SelectStmt {
+        values_lists,
+        ..val_sel.clone()
+    }))
+}
+
 fn analyze_insert_values(
     ins: &protobuf::InsertStmt,
     val_sel: &protobuf::SelectStmt,
@@ -912,7 +967,10 @@ fn analyze_insert_select(
     // cleanly. PG (transformInsertStmt) analyzes the SELECT first and only
     // then compares its *output* width — after `*` expansion and set
     // operations — with the target list.
-    let (sel_cols, _) = analyze_select_with_ctes(val_sel, snapshot, params, cte_scopes)?;
+    // (Its outputs are coerced to the target columns, not resolved first.)
+    let (sel_cols, _) = super::select::keeping_unknown_outputs(|| {
+        analyze_select_with_ctes(val_sel, snapshot, params, cte_scopes)
+    })?;
     let expected_len = insert_arity(tgt);
     if arity_mismatch(tgt, sel_cols.len(), expected_len) {
         return Err(insert_arity_error(
@@ -969,7 +1027,10 @@ fn analyze_insert_select(
         // `variable_coerce_param_hook` (42P08 if WHERE & co. deduced
         // another type — see `expr::note_untyped_output_params`).
         if let Some(node::Node::ResTarget(rt)) = direct_targets.get(i).and_then(|t| t.node.as_ref())
-            && let Some(node::Node::ParamRef(p)) = rt.val.as_deref().and_then(|v| v.node.as_ref())
+            && let Some(p) = rt
+                .val
+                .as_deref()
+                .and_then(|v| expr::bare_param(v, snapshot))
             && params.is_untyped_output(p.location)
         {
             if let Err(prev) = params.coerce_untyped(p.number, target_oid) {
@@ -977,6 +1038,22 @@ fn analyze_insert_select(
                     p.number, prev, target_oid, p.location, snapshot,
                 ));
             }
+            continue;
+        }
+        // A Var of the SELECT's `unknown` output that is no literal: only
+        // the I/O conversion to a string type assigns it.
+        if sel_col.unknown_value {
+            let fallback = protobuf::Node { node: None };
+            let node = match direct_targets.get(i).and_then(|t| t.node.as_ref()) {
+                Some(node::Node::ResTarget(rt)) => rt.val.as_deref(),
+                _ => None,
+            };
+            expr::unknown_value_coercion(
+                target_oid,
+                crate::coerce::CoercionContext::Assignment,
+                snapshot,
+                node.unwrap_or(&fallback),
+            )?;
             continue;
         }
         if sel_col.type_oid == oid::UNKNOWN || sel_col.type_oid == target_oid {
@@ -1008,6 +1085,17 @@ fn analyze_insert_select(
                 return Err(crate::error::RawError::invalid_literal(msg, None).finalize_implicit());
             }
             continue;
+        }
+        // The SELECT's outputs reach the INSERT as Vars of its subquery:
+        // a `record` one is no row coerce_record_to_complex can take apart
+        // (not a ROW(...) nor a whole-row reference), whatever it holds.
+        if sel_col.type_oid == oid::RECORD && crate::coerce::is_complex(target_oid, snapshot) {
+            return Err(crate::pgmsg::cannot_cast_record_to(
+                &crate::ddl::util::format_type_for_message(snapshot, target_oid),
+                None,
+                None,
+            )
+            .finalize_implicit());
         }
         if !crate::coerce::can_coerce(
             sel_col.type_oid,
@@ -1086,7 +1174,8 @@ fn analyze_insert_select(
 /// that violates NOT NULL before the conflict handler runs.
 ///
 /// Returns the transformed arbiter for the planner-stage check
-/// ([`validate_on_conflict_target`]), `None` without an inference clause.
+/// ([`validate_on_conflict_target`]), `None` without an inference clause,
+/// and the DO UPDATE SET list as [`analyze_set_clause`] expanded it.
 fn analyze_insert_on_conflict(
     on_conflict: &protobuf::OnConflictClause,
     relation: &protobuf::RangeVar,
@@ -1094,7 +1183,7 @@ fn analyze_insert_on_conflict(
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
     cte_scopes: &HashMap<String, Vec<ScopeColumn>>,
-) -> Result<Option<Arbiter>, AnalyzeError> {
+) -> Result<(Option<Arbiter>, Vec<protobuf::Node>), AnalyzeError> {
     let update = on_conflict.action() == protobuf::OnConflictAction::OnconflictUpdate;
     let target_qn = crate::qualified_name::QualifiedName::new(&tgt.nsname, &tgt.relname);
     let mut target_scope = Scope {
@@ -1148,19 +1237,20 @@ fn analyze_insert_on_conflict(
     };
 
     if !update {
-        return Ok(arbiter);
+        return Ok((arbiter, Vec::new()));
     }
     let mut conflict_scope = target_scope;
     conflict_scope.sources.extend(excluded_holder.sources);
     let conflict_null_ctx = NullabilityContext::default();
-    analyze_set_clause(
+    let set_list = analyze_set_clause(
         &on_conflict.target_list,
         &tgt.attrs,
         &tgt.relname,
         expr::Ctx::new(&conflict_scope, &conflict_null_ctx, snapshot),
         params,
         false,
-    )?;
+    )?
+    .into_owned();
     if let Some(where_clause) = &on_conflict.where_clause {
         expr::infer_expr(
             where_clause,
@@ -1171,7 +1261,7 @@ fn analyze_insert_on_conflict(
         crate::clause::check_no_aggregates_or_windows(where_clause, snapshot, "WHERE")?;
         check_no_srf_in_clause(where_clause, snapshot, "WHERE")?;
     }
-    Ok(arbiter)
+    Ok((arbiter, set_list))
 }
 
 /// PG's `transformOnConflictArbiter` / `resolve_unique_index_expr`: each
@@ -1440,7 +1530,7 @@ pub(crate) fn analyze_update_with_outer_ctes(
     )?;
 
     // SET col = expr / (a, b) = (…) / col[i] = expr — assignment context.
-    analyze_set_clause(
+    let set_list = analyze_set_clause(
         &upd.target_list,
         &table_attrs,
         &table_relname,
@@ -1465,7 +1555,7 @@ pub(crate) fn analyze_update_with_outer_ctes(
         // it only in the columns nothing rewrites: not SET, not generated
         // (recomputed), with no BEFORE ROW trigger, rule or row movement
         // between WHERE and RETURNING. The old row keeps all of it.
-        let assigned: std::collections::HashSet<String> = set_list_assigns(&upd.target_list)
+        let assigned: std::collections::HashSet<String> = set_list_assigns(&set_list)
             .into_iter()
             .map(|a| a.column)
             .collect();
@@ -1504,7 +1594,7 @@ pub(crate) fn analyze_update_with_outer_ctes(
                 set_ctx.add_where_facts(all.clone());
             }
             let set = set_values(
-                &upd.target_list,
+                &set_list,
                 &wt,
                 &table_attrs,
                 expr::Ctx::new(&scope, &set_ctx, snapshot),
@@ -1516,7 +1606,7 @@ pub(crate) fn analyze_update_with_outer_ctes(
                     k.write(&a.attname, &ValueInfo::default());
                 }
             }
-            for a in set_list_assigns(&upd.target_list) {
+            for a in set_list_assigns(&set_list) {
                 if let Some(b) = wt.to_base.get(&a.column) {
                     k.write(b, &set.get(&a.column).cloned().unwrap_or_default());
                 }
@@ -1548,7 +1638,7 @@ pub(crate) fn analyze_update_with_outer_ctes(
     )?;
     let mut rw = Rewrite::single(
         DmlEvent::Update,
-        set_list_assigns(&upd.target_list),
+        set_list_assigns(&set_list),
         Overriding::NotSet,
     );
     rw.returning = has_returning(&upd.returning_clause);

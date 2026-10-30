@@ -59,7 +59,7 @@ pub(crate) fn infer_xml_expr(
             continue;
         };
         let t = infer_expr(val, ctx, params, TypeGoal::NONE)?;
-        if let Some(node::Node::ParamRef(p)) = val.node.as_ref() {
+        if let Some(p) = super::bare_param(val, ctx.snapshot) {
             params.mark_indeterminate_locked(p.number);
         }
         named_nullable.push(t.nullable);
@@ -111,7 +111,7 @@ pub(crate) fn infer_xml_expr(
             // XMLELEMENT content: no coercion.
             _ => {
                 let t = infer_expr(e, ctx, params, TypeGoal::NONE)?;
-                if let Some(node::Node::ParamRef(p)) = e.node.as_ref() {
+                if let Some(p) = super::bare_param(e, ctx.snapshot) {
                     params.mark_indeterminate_locked(p.number);
                 }
                 t

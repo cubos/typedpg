@@ -595,18 +595,23 @@ pub(crate) fn no_on_conflict_arbiter(table: &str) -> RawError {
     )
 }
 
-/// `failed to find conversion function from unknown to text` — SQLSTATE
+/// `failed to find conversion function from unknown to <type>` — SQLSTATE
 /// XX000, raised by PG's `coerce_type` when an `unknown` value that is
-/// neither a literal nor a parameter must be coerced implicitly: a field
+/// neither a literal nor a parameter (`'a'::text::unknown`, a field
 /// selected from an anonymous record over an untyped literal,
-/// `(ROW(1, 'x')).f2`, used as an output column or an argument.
-pub(crate) fn unknown_field_not_coercible(target: &str, span: Option<SourceSpan>) -> RawError {
+/// `(ROW(1, 'x')).f2`) must be coerced where `find_coercion_pathway` finds
+/// no way: implicitly to anything, or to a type outside the string category.
+pub(crate) fn unknown_value_not_coercible(target: &str, span: Option<SourceSpan>) -> RawError {
     RawError::new(
         AnalyzeError::PgInternalError(format!(
             "failed to find conversion function from unknown to {target}"
         )),
         span,
-        Some("cast the field explicitly, e.g. `(r).f2::text`".into()),
+        Some(
+            "only a literal or a parameter of type unknown converts to any type; \
+             give the value a type before it becomes unknown, e.g. `'x'::text`"
+                .into(),
+        ),
     )
 }
 
@@ -1187,6 +1192,23 @@ pub(crate) fn coldeflist_required() -> RawError {
     )
 }
 
+/// `function "f" in FROM has unsupported return type T` — SQLSTATE 42804,
+/// addRangeTableEntryForFunction's error for a function returning a
+/// pseudo-type that makes no relation (TYPEFUNC_OTHER).
+pub(crate) fn function_in_from_unsupported_return_type(
+    function: &str,
+    type_name: &str,
+    span: Option<SourceSpan>,
+) -> RawError {
+    RawError::new(
+        AnalyzeError::DatatypeMismatch(format!(
+            "function \"{function}\" in FROM has unsupported return type {type_name}"
+        )),
+        span,
+        None,
+    )
+}
+
 /// `a column definition list is only allowed for functions returning
 /// "record"` — SQLSTATE 42601.
 pub(crate) fn coldeflist_only_for_record() -> RawError {
@@ -1354,6 +1376,24 @@ pub(crate) fn cannot_determine_type_of_empty_array(span: Option<SourceSpan>) -> 
         span,
         Some("Explicitly cast to the desired type, for example ARRAY[]::integer[].".to_string()),
     )
+}
+
+/// `cannot cast type record to T` — SQLSTATE 42846 (`cannot_coerce`, no
+/// dedicated variant): PG's `coerce_record_to_complex`, its DETAIL (`Input
+/// has too few columns.`, `Cannot cast type A to B in column N.`) carried
+/// as the hint. With no detail, the record isn't one it can rebuild (not a
+/// `ROW(...)` nor a whole-row reference).
+pub(crate) fn cannot_cast_record_to(
+    target: &str,
+    detail: Option<String>,
+    span: Option<SourceSpan>,
+) -> RawError {
+    RawError::new(
+        AnalyzeError::Invalid(format!("cannot cast type record to {target}")),
+        span,
+        detail,
+    )
+    .with_primary_label("record value")
 }
 
 /// `<CONTEXT> could not convert type A to B` — SQLSTATE 42846
@@ -1549,6 +1589,21 @@ pub(crate) fn too_many_grouping_sets() -> RawError {
     )
 }
 
+/// PSEUDOTYPE_DUMMY_INPUT_FUNC (pseudotypes.c): the input function of a
+/// pseudo-type no value can be written for — `cannot accept a value of
+/// type anyarray` — SQLSTATE 0A000.
+pub(crate) fn cannot_accept_a_value_of_type(
+    type_name: &str,
+    span: Option<crate::error::SourceSpan>,
+) -> RawError {
+    RawError::new(
+        AnalyzeError::FeatureNotSupported(format!("cannot accept a value of type {type_name}")),
+        span,
+        None,
+    )
+    .with_primary_label("this literal")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1588,7 +1643,11 @@ mod tests {
             (duplicate_table_alias("u", None).kind, "42712"),
             (too_many_column_aliases("t", 1, 2).kind, "42P10"),
             (values_lists_length(2, 1, None).kind, "42601"),
-            (unknown_field_not_coercible("text", None).kind, "XX000"),
+            (unknown_value_not_coercible("text", None).kind, "XX000"),
+            (
+                function_in_from_unsupported_return_type("unknownin", "unknown", None).kind,
+                "42804",
+            ),
             (no_on_conflict_arbiter("t").kind, "42P10"),
             (insert_non_default_into_generated("g", false).kind, "428C9"),
             (update_generated_to_non_default("g", true).kind, "428C9"),
@@ -1603,6 +1662,10 @@ mod tests {
                 "0A000",
             ),
             (merge_view_partial_instead_triggers("v").kind, "0A000"),
+            (
+                cannot_accept_a_value_of_type("anyarray", None).kind,
+                "0A000",
+            ),
             (merge_on_relation_with_rules("t").kind, "0A000"),
             (on_conflict_with_rules().kind, "0A000"),
             (

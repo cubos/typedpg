@@ -299,6 +299,13 @@ pub(crate) struct ExprType {
     pub elem_nullable: Option<bool>,
     /// What every non-NULL value is (see [`crate::refine`]).
     pub refine: crate::refine::Refinement,
+    /// An `unknown` value that is neither an untyped literal nor a
+    /// parameter — a cast to `unknown` (`'a'::text::unknown`), a field
+    /// selected from a record over a literal, `unknownin(…)`. PG's
+    /// `coerce_type` turns a literal or a parameter into any type, but such a
+    /// value only through `find_coercion_pathway`, which has no pg_cast entry
+    /// from `unknown`: see [`unknown_value_coercion`].
+    pub unknown_value: bool,
 }
 
 /// The row shape of a record value: its fields, and whether PostgreSQL
@@ -429,6 +436,7 @@ impl ExprType {
             record_fields: None,
             elem_nullable: None,
             refine: crate::refine::Refinement::NONE,
+            unknown_value: false,
         }
     }
 
@@ -445,6 +453,7 @@ impl ExprType {
             record_fields: None,
             elem_nullable: None,
             refine: crate::refine::Refinement::NONE,
+            unknown_value: false,
         }
     }
 
@@ -467,6 +476,24 @@ impl ExprType {
             record_fields: None,
             elem_nullable: None,
             refine: crate::refine::Refinement::NONE,
+            unknown_value: false,
+        }
+    }
+
+    /// [`unknown_value_coercion`] of this value, when it is an
+    /// [`Self::unknown_value`]: what a clause coercing its expression to
+    /// its type checks (`coerce_to_boolean` for a CHECK, a policy, …).
+    pub(crate) fn check_unknown_value_coercion(
+        &self,
+        target: PgTypeOid,
+        context: CoercionContext,
+        snapshot: &PgCatalog,
+        node: &protobuf::Node,
+    ) -> Result<(), AnalyzeError> {
+        if self.unknown_value {
+            unknown_value_coercion(target, context, snapshot, node)
+        } else {
+            Ok(())
         }
     }
 
@@ -886,9 +913,10 @@ fn infer_expr_here(
         t.nullable = false;
     }
     // A grouped expression some grouping set leaves out is NULL in that
-    // set's rows (`GROUP BY ROLLUP (g + 1)`'s total row).
+    // set's rows (`GROUP BY ROLLUP (g + 1)`'s total row) — a whole-row
+    // reference too (a column's own key is the column's, see
+    // `NullabilityContext::is_nullable`).
     if !t.nullable
-        && !matches!(node.node.as_ref(), Some(node::Node::ColumnRef(_)))
         && ctx.null_ctx.grouping_omits_exprs()
         && ctx.null_ctx.grouping_omitted.contains(&(
             crate::grouping::EXPR_KEY.to_owned(),
@@ -915,7 +943,10 @@ fn infer_expr_unlocated(
     let result = match inner {
         node::Node::ColumnRef(col_ref) => infer_column_ref(col_ref, ctx),
         node::Node::AConst(a_const) => infer_a_const(a_const),
-        node::Node::TypeCast(cast) => infer_type_cast(cast, ctx, params),
+        node::Node::TypeCast(cast) => match passthrough_cast_operand(node, snapshot, params) {
+            Some(operand) => infer_expr(operand, ctx, params, goal.clone()),
+            None => infer_type_cast(cast, ctx, params),
+        },
         node::Node::FuncCall(func) => infer_func_call(func, ctx, params),
         // `name => value` only occurs as a function-call argument; its type is
         // the value's. The enclosing call resolves the name.
@@ -945,7 +976,7 @@ fn infer_expr_unlocated(
                 // `SELECT $1 IS NULL, $1 = 1` is `could not determine data
                 // type of parameter $1` (42P08) even though the later use
                 // would pin int4. A param typed *before* this point is fine.
-                if let Some(node::Node::ParamRef(p)) = arg.node.as_ref() {
+                if let Some(p) = bare_param(arg, snapshot) {
                     params.mark_indeterminate_locked(p.number);
                 }
             }
@@ -1081,29 +1112,19 @@ fn infer_expr_unlocated(
                     .with_refine(refine),
             )
         }
-        node::Node::AIndirection(ind) => {
-            let t = infer_indirection(ind, ctx, params)?;
-            // PG's coerce_type can implicitly convert an `unknown` literal or
-            // parameter, but not an `unknown` field selected from an
-            // anonymous record; only an explicit cast (via I/O) works.
-            if t.type_oid == oid::UNKNOWN
-                && goal.has_expectation()
-                && goal.coercion != CoercionContext::Explicit
-            {
-                let target = crate::ddl::util::format_type_for_message(snapshot, goal.type_oid);
-                return Err(crate::pgmsg::unknown_field_not_coercible(
-                    &target,
-                    crate::error::node_location(node)
-                        .and_then(crate::error::SourceSpan::from_node_qname),
-                )
-                .finalize_implicit());
-            }
-            Ok(t)
-        }
+        node::Node::AIndirection(ind) => infer_indirection(ind, ctx, params),
         node::Node::AArrayExpr(arr) => infer_array_expr(arr, ctx, params),
         node::Node::RowExpr(row) => {
+            // When the enclosing context expects a registered composite
+            // type (a cast, `UPDATE SET composite_col = ROW(...)`, a
+            // composite function argument), PG's coerce_record_to_complex
+            // types each element against the composite's field type — so
+            // params get pinned — and the row adopts the goal's type.
+            if goal.has_expectation() && crate::coerce::is_complex(goal.type_oid, snapshot) {
+                return coerce_record_to_complex(node, goal.type_oid, goal.coercion, ctx, params);
+            }
             let expanded;
-            let row: &protobuf::RowExpr = match expand_row_args(&row.args, ctx, params) {
+            let row: &protobuf::RowExpr = match expand_row_args(&row.args, ctx, params)? {
                 std::borrow::Cow::Borrowed(_) => row,
                 std::borrow::Cow::Owned(args) => {
                     expanded = protobuf::RowExpr {
@@ -1115,107 +1136,9 @@ fn infer_expr_unlocated(
             };
             // `ROW(a, b, …)` constructs an anonymous composite. The ROW
             // value itself is never NULL — empty `ROW()` still yields a
-            // record.
-            //
-            // When the enclosing context expects a registered composite
-            // type of matching arity (UPDATE composite_col = ROW(...) or
-            // INSERT INTO t (composite_col) VALUES (ROW(...))), we type
-            // each element against the composite's declared field type so
-            // params get pinned correctly and the result adopts the goal's
-            // OID — exactly what PG does in `coerce_record_to_complex`.
-            // Otherwise the ROW types as the pseudo `record` with shape
-            // captured statically so downstream operators/indirection can
-            // see through.
-            let composite_goal = if goal.has_expectation() {
-                let target = snapshot.unwrap_domain(goal.type_oid);
-                snapshot.get_type(target).and_then(|te| {
-                    if te.typtype == TypType::Composite
-                        && let Some(relid) = te.typrelid
-                    {
-                        let fields = snapshot.attributes_of(relid).to_vec();
-                        if fields.len() == row.args.len() {
-                            Some((target, fields))
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                })
-            } else {
-                None
-            };
-
-            if let Some((composite_oid, composite_fields)) = composite_goal {
-                let mut shape = Vec::with_capacity(row.args.len());
-                for (i, (arg, field)) in row.args.iter().zip(composite_fields.iter()).enumerate() {
-                    // coerce_record_to_complex: a field that doesn't
-                    // coerce — in the context of the record's own coercion:
-                    // explicit for a cast, assignment for a stored value —
-                    // fails the whole record's cast, worded as such
-                    // (42846), not as the field's own mismatch.
-                    let mut scratch = params.clone();
-                    let own = infer_expr(arg, ctx, &mut scratch, TypeGoal::NONE)?;
-                    if own.type_oid != oid::UNKNOWN
-                        && !crate::coerce::can_coerce(
-                            own.type_oid,
-                            field.atttypid,
-                            goal.coercion,
-                            snapshot,
-                        )
-                    {
-                        let typname = snapshot
-                            .get_type(composite_oid)
-                            .map_or_else(String::new, |t| t.typname.clone());
-                        return Err(crate::error::RawError::invalid(
-                            format!("cannot cast type record to {typname}"),
-                            crate::error::SourceSpan::from_node_token(row.location),
-                            Some(format!(
-                                "Cannot cast type {} to {} in column {}.",
-                                crate::ddl::util::format_type_for_message(snapshot, own.type_oid),
-                                crate::ddl::util::format_type_for_message(snapshot, field.atttypid),
-                                i + 1,
-                            )),
-                        )
-                        .with_primary_label("record value")
-                        .finalize_implicit());
-                    }
-                    let t = infer_expr(
-                        arg,
-                        ctx,
-                        params,
-                        TypeGoal {
-                            coercion: goal.coercion,
-                            ..TypeGoal::assignment(field.atttypid)
-                        },
-                    )?;
-                    // coerce_record_to_complex keeps each value, coerced to
-                    // its field's type: still non-NULL when no cast runs
-                    // (same type) or an untyped literal is read by the
-                    // field type's input function. Any other cast may map a
-                    // value to NULL (`int4(jsonb)` on a JSON null).
-                    let literal = matches!(
-                        arg.node.as_ref(),
-                        Some(node::Node::AConst(c)) if !c.isnull
-                    );
-                    let kept =
-                        own.type_oid == field.atttypid || (own.type_oid == oid::UNKNOWN && literal);
-                    shape.push(RecordField {
-                        name: field.attname.clone(),
-                        ty: ExprType::scalar_with_typmod(
-                            field.atttypid,
-                            t.nullable || !kept,
-                            field.atttypmod,
-                        ),
-                    });
-                }
-                // ROW value is never NULL; its fields' nullability is the
-                // composite's shape (what `(ROW(a, b)::pair).x` reads).
-                return Ok(ExprType {
-                    record_fields: Some(shape.into()),
-                    ..ExprType::scalar(composite_oid, false)
-                });
-            }
+            // record. Without a composite goal, the ROW types as the pseudo
+            // `record` with shape captured statically so downstream
+            // operators/indirection can see through.
 
             // PG names anonymous ROW elements `f1`, `f2`, ... by position.
             // The element's full ExprType (with any nested record shape)
@@ -1229,7 +1152,7 @@ fn infer_expr_unlocated(
             let mut fields = Vec::with_capacity(row.args.len());
             for (i, arg) in row.args.iter().enumerate() {
                 let ty = infer_expr(arg, ctx, params, TypeGoal::NONE)?;
-                if let Some(node::Node::ParamRef(p)) = arg.node.as_ref() {
+                if let Some(p) = bare_param(arg, snapshot) {
                     params.mark_indeterminate_required(p.number);
                 }
                 fields.push(RecordField {
@@ -1246,6 +1169,7 @@ fn infer_expr_unlocated(
                 record_fields: Some(fields.into()),
                 elem_nullable: None,
                 refine: crate::refine::Refinement::NONE,
+                unknown_value: false,
             })
         }
         node::Node::SetToDefault(d) => {
@@ -1349,6 +1273,7 @@ fn infer_expr_unlocated(
             // from the inner expression (PG's "explicit" derivation tier).
             return Ok(ExprType {
                 explicit_collation: resolved_collation.is_some(),
+                unknown_value: result.unknown_value,
                 ..ExprType::scalar_with_collation(
                     result.type_oid,
                     result.nullable,
@@ -1455,6 +1380,20 @@ fn infer_expr_unlocated(
         return Err(crate::error::RawError::invalid_literal(msg, span).finalize_implicit());
     }
 
+    // A `record` meeting a composite goal is rebuilt as that composite
+    // (coerce_record_to_complex) — or rejected, when it isn't a row PG can
+    // take apart. (A ROW(...) did this above.)
+    if goal.has_expectation()
+        && result.type_oid == oid::RECORD
+        && coerce::is_complex(goal.type_oid, snapshot)
+    {
+        return coerce_record_to_complex(node, goal.type_oid, goal.coercion, ctx, params);
+    }
+
+    if goal.has_expectation() && result.unknown_value {
+        unknown_value_coercion(goal.type_oid, goal.coercion, snapshot, node)?;
+    }
+
     // Verify result is compatible with the goal type. Pass the location
     // of the offending expression so a `TypeMismatch` carries a snippet.
     check_goal_compatibility(&result, &goal, snapshot, crate::error::node_location(node))?;
@@ -1462,12 +1401,44 @@ fn infer_expr_unlocated(
     Ok(result)
 }
 
+/// PG's `coerce_type` for an [`ExprType::unknown_value`] — an `unknown`
+/// value that is neither a literal nor a parameter — meeting `target` in
+/// `context`. Nothing happens for `unknown` itself, `"any"`, `anyelement`,
+/// `anynonarray`, `anycompatible` and `anycompatiblenonarray` (the value is
+/// passed as it is); any other target needs `find_coercion_pathway`, which
+/// knows no cast from `unknown` and takes only its I/O rule: assignment or
+/// an explicit cast to a string type (`INSERT INTO t (text_col) VALUES
+/// ('a'::text::unknown)`). Anything else fails to prepare with
+/// `failed to find conversion function from unknown to …` (XX000).
+pub(crate) fn unknown_value_coercion(
+    target: PgTypeOid,
+    context: CoercionContext,
+    snapshot: &PgCatalog,
+    node: &protobuf::Node,
+) -> Result<(), AnalyzeError> {
+    if target == oid::UNKNOWN
+        || crate::polymorphic::passes_operand_through(target)
+        || coerce::coercion_pathway(target, oid::UNKNOWN, context, snapshot).is_some()
+    {
+        return Ok(());
+    }
+    let span = crate::error::node_location(node).and_then(|loc| {
+        crate::error::SourceSpan::from_node_qname(loc)
+            .or_else(|| crate::error::SourceSpan::from_node_token(loc))
+    });
+    Err(crate::pgmsg::unknown_value_not_coercible(
+        &crate::ddl::util::format_type_for_message(snapshot, target),
+        span,
+    )
+    .finalize_implicit())
+}
+
 /// Filter for *speculative* re-inference sites (operator / CASE / COALESCE /
 /// function-argument back-fills): most failures there just mean the candidate
 /// goal didn't fit and are deliberately swallowed, but a literal-content
 /// rejection is exactly the error PG itself raises from that coercion, so it
 /// must survive — as must `coerce_type`'s failure on an `unknown` value
-/// that is no literal ([`crate::pgmsg::unknown_field_not_coercible`]).
+/// that is no literal ([`unknown_value_coercion`]).
 /// Returns `Err` only for those two.
 fn swallow_unless_literal<T>(r: Result<T, AnalyzeError>) -> Result<(), AnalyzeError> {
     match r {
@@ -1526,14 +1497,14 @@ pub(crate) fn note_untyped_output_params(
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<(), AnalyzeError> {
-    let bare_param = |target: &protobuf::Node| {
+    let is_bare_param = |target: &protobuf::Node| {
         matches!(
             target.node.as_ref(),
             Some(node::Node::ResTarget(rt))
-                if matches!(rt.val.as_deref().and_then(|v| v.node.as_ref()), Some(node::Node::ParamRef(_)))
+                if rt.val.as_deref().and_then(|v| bare_param(v, ctx.snapshot)).is_some()
         )
     };
-    let last_bare_param = target_list.iter().rposition(bare_param);
+    let last_bare_param = target_list.iter().rposition(is_bare_param);
     let mut scratch = params.clone();
     for (i, target) in target_list.iter().enumerate() {
         let Some(node::Node::ResTarget(rt)) = target.node.as_ref() else {
@@ -1542,7 +1513,7 @@ pub(crate) fn note_untyped_output_params(
         let Some(val) = rt.val.as_deref() else {
             continue;
         };
-        if let Some(node::Node::ParamRef(p)) = val.node.as_ref() {
+        if let Some(p) = bare_param(val, ctx.snapshot) {
             if scratch.get(p.number) == oid::UNKNOWN {
                 params.mark_untyped_output(p.location);
             }
@@ -1600,7 +1571,7 @@ pub(crate) fn resolve_untyped_output_params(
         let Some(node::Node::ResTarget(rt)) = target.node.as_ref() else {
             continue;
         };
-        let Some(node::Node::ParamRef(p)) = rt.val.as_deref().and_then(|v| v.node.as_ref()) else {
+        let Some(p) = rt.val.as_deref().and_then(|v| bare_param(v, snapshot)) else {
             continue;
         };
         if !params.is_untyped_output(p.location) {
@@ -1663,12 +1634,13 @@ pub(crate) fn plan_time_checks() -> bool {
 /// (`ExpandColumnRefStar`) and a `(expr).*` indirection to one field
 /// selection per field (`ExpandIndirectionStar`), so `ROW(t.*)` is
 /// `ROW(t.a, t.b, …)`, not a one-field record holding the whole row.
-/// Borrowed when no argument is a star.
+/// Borrowed when no argument is a star. A `(expr).*` over a value with no
+/// fields fails as `ExpandIndirectionStar` does.
 pub(crate) fn expand_row_args<'a>(
     args: &'a [protobuf::Node],
     ctx: Ctx<'_>,
     params: &ParamCollector,
-) -> std::borrow::Cow<'a, [protobuf::Node]> {
+) -> Result<std::borrow::Cow<'a, [protobuf::Node]>, AnalyzeError> {
     let ends_in_star = |fields: &[protobuf::Node]| {
         matches!(
             fields.last().and_then(|f| f.node.as_ref()),
@@ -1681,10 +1653,36 @@ pub(crate) fn expand_row_args<'a>(
         _ => false,
     };
     if !args.iter().any(is_star) {
-        return std::borrow::Cow::Borrowed(args);
+        return Ok(std::borrow::Cow::Borrowed(args));
     }
     let string = |s: &str| protobuf::Node {
         node: Some(node::Node::String(protobuf::String { sval: s.to_owned() })),
+    };
+    // `(expr).*`: one field selection per field of `expr`'s composite type.
+    let expand_indirection = |ind: &protobuf::AIndirection,
+                              arg: &protobuf::Node,
+                              out: &mut Vec<protobuf::Node>|
+     -> Result<(), AnalyzeError> {
+        let mut scratch = params.clone();
+        match expand_indirection_star(ind, ctx, &mut scratch)? {
+            Some(fields) => {
+                let prefix = &ind.indirection[..ind.indirection.len() - 1];
+                out.extend(fields.iter().map(|(name, _)| {
+                    protobuf::Node {
+                        node: Some(node::Node::AIndirection(Box::new(protobuf::AIndirection {
+                            arg: ind.arg.clone(),
+                            indirection: prefix
+                                .iter()
+                                .cloned()
+                                .chain(std::iter::once(string(name)))
+                                .collect(),
+                        }))),
+                    }
+                }));
+            }
+            None => out.push(arg.clone()),
+        }
+        Ok(())
     };
     let mut out = Vec::with_capacity(args.len());
     for arg in args {
@@ -1704,36 +1702,20 @@ pub(crate) fn expand_row_args<'a>(
                             location: cr.location,
                         })),
                     })),
-                    None => out.push(arg.clone()),
+                    // A SQL function parameter's `v.*` is `(v).*`.
+                    None => match sql_function_param_star(cr, ctx.scope, ctx.snapshot) {
+                        Some(ind) => expand_indirection(&ind, arg, &mut out)?,
+                        None => out.push(arg.clone()),
+                    },
                 }
             }
             Some(node::Node::AIndirection(ind)) if ends_in_star(&ind.indirection) => {
-                let mut scratch = params.clone();
-                match expand_indirection_star(ind, ctx, &mut scratch) {
-                    Ok(Some(fields)) => {
-                        let prefix = &ind.indirection[..ind.indirection.len() - 1];
-                        out.extend(fields.iter().map(|(name, _)| {
-                            protobuf::Node {
-                                node: Some(node::Node::AIndirection(Box::new(
-                                    protobuf::AIndirection {
-                                        arg: ind.arg.clone(),
-                                        indirection: prefix
-                                            .iter()
-                                            .cloned()
-                                            .chain(std::iter::once(string(name)))
-                                            .collect(),
-                                    },
-                                ))),
-                            }
-                        }));
-                    }
-                    _ => out.push(arg.clone()),
-                }
+                expand_indirection(ind, arg, &mut out)?;
             }
             _ => out.push(arg.clone()),
         }
     }
-    std::borrow::Cow::Owned(out)
+    Ok(std::borrow::Cow::Owned(out))
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1764,29 +1746,6 @@ fn check_goal_compatibility(
     }
     if can_coerce(result.type_oid, goal.type_oid, goal.coercion, snapshot) {
         return Ok(());
-    }
-    // PG uses a distinct wording when the source is the pseudo `record`
-    // type and the target is a registered composite (e.g. assigning
-    // `ROW($p1, $p2)` to an `address` column with the wrong arity). Mirror
-    // it so pg_sanity's prefix check passes — the rest of the cases keep
-    // the generic `cannot coerce` form.
-    if result.type_oid == oid::RECORD
-        && let Some(target_te) = snapshot.get_type(goal.type_oid)
-        && target_te.typtype == TypType::Composite
-    {
-        // PG renders the bare composite name (search-path aware) here, not
-        // the schema-qualified form `format_type_for_message` would produce.
-        let span = location.and_then(crate::error::SourceSpan::from_node_qname);
-        return Err(crate::error::RawError::invalid(
-            format!("cannot cast type record to {}", target_te.typname),
-            span,
-            Some(format!(
-                "the ROW(...) shape doesn't match `{}` — check the field count and types",
-                target_te.typname
-            )),
-        )
-        .with_primary_label("record value")
-        .finalize_implicit());
     }
     // PG's user-facing type names (e.g. `int4` → `integer`, `bool` →
     // `boolean`) — these appear verbatim in the message so the sanity
@@ -1860,57 +1819,6 @@ pub(crate) fn array_element_type(snapshot: &PgCatalog, t: PgTypeOid) -> Option<P
     crate::coerce::element_type(snapshot.unwrap_domain(t), snapshot)
 }
 
-/// PG's `coerce_record_to_complex` (parse_coerce.c), which converts a
-/// `record` value to a composite type field by field: it needs those
-/// fields at parse time, so only a `ROW(...)` (or `(a, b)`) or a whole-row
-/// reference (`s`, `s.*` — a whole-row Var) converts; anything else of type
-/// `record` — a parameter, `NULL::record`, a scalar subquery, a function
-/// result, a CASE — is `cannot cast type record to t`, while
-/// `can_coerce_type` accepted the pair. A cast to `record` itself changes
-/// nothing (`coerce_type` returns a record operand as it is), so
-/// `ROW(1, 'a')::record::t` still converts.
-///
-/// A column reference naming a column (`r::t` over `SELECT ROW(1, 'a') r`)
-/// is a Var of that column, not a whole-row one, and is refused too; one
-/// naming no column of `scope` reads as a whole row (or, in a SQL function
-/// body, a parameter — accepted, never rejecting valid SQL).
-pub(crate) fn record_converts_to_complex(node: &protobuf::Node, scope: &Scope) -> bool {
-    match node.node.as_ref() {
-        Some(node::Node::RowExpr(_)) => true,
-        Some(node::Node::ColumnRef(cr)) => {
-            if cr
-                .fields
-                .iter()
-                .any(|f| matches!(f.node.as_ref(), Some(node::Node::AStar(_))))
-            {
-                return true;
-            }
-            let parts = extract_string_fields(&cr.fields);
-            let (table, column) = match parts.as_slice() {
-                [col] => (None, col.as_str()),
-                [tbl, col] | [_, tbl, col] => (Some(tbl.as_str()), col.as_str()),
-                _ => return true,
-            };
-            scope.resolve_column(table, column, None).is_err()
-        }
-        Some(node::Node::TypeCast(tc)) => {
-            let to_record = tc.type_name.as_ref().is_some_and(|tn| {
-                tn.array_bounds.is_empty()
-                    && matches!(
-                        tn.names.last().and_then(|n| n.node.as_ref()),
-                        Some(node::Node::String(s)) if s.sval == "record"
-                    )
-            });
-            to_record
-                && tc
-                    .arg
-                    .as_deref()
-                    .is_some_and(|arg| record_converts_to_complex(arg, scope))
-        }
-        _ => false,
-    }
-}
-
 /// Return `text` when `node` is an untyped string literal (`'x'`) and its
 /// inferred type is still UNKNOWN. Used by constructs that need to treat a
 /// bare string constant as text for type-compatibility checks — NULLIF,
@@ -1944,12 +1852,13 @@ pub(crate) mod inline;
 mod json;
 pub(crate) mod literals;
 pub(crate) mod operators;
+mod record_coercion;
 mod sublink;
 mod xml;
 
 use column_refs::*;
 pub(crate) use column_refs::{
-    SqlFunctionParams, check_column_ref_length, with_sql_function_params,
+    SqlFunctionParams, check_column_ref_length, sql_function_param_star, with_sql_function_params,
 };
 pub(crate) use conditional::failing_input_span;
 use conditional::*;
@@ -1962,10 +1871,12 @@ use indirection::*;
 pub(crate) use indirection::{expand_indirection_star, transform_container_subscripts};
 use json::*;
 pub(crate) use literals::assignment_nullable;
+pub(crate) use literals::bare_param;
 use literals::*;
 pub(crate) use literals::{coercion_can_null_elements, coercion_can_return_null};
 pub(crate) use operators::check_regex_restrictions;
 use operators::*;
+pub(crate) use record_coercion::coerce_record_to_complex;
 use sublink::*;
 use xml::*;
 

@@ -69,6 +69,7 @@ pub(crate) fn analyze_call(
             elem_nullable: None,
             refine: crate::refine::Refinement::NONE,
             origin: None,
+            unknown_value: false,
         })
         .collect();
     Ok((columns, None))

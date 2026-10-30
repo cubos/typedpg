@@ -301,6 +301,20 @@ pub(crate) fn cook_generation_expr(
             text: super::check_inherit::StoredExpr::written(expr),
         });
     }
+    if crate::ddl::defaults::record_to_complex(interp, result.type_oid, atttypid) {
+        infer_with_goal(
+            interp,
+            relid,
+            expr,
+            crate::expr::TypeGoal::assignment(atttypid),
+        )
+        .map_err(unsupported)?;
+        return Ok(CookedGeneration {
+            refs,
+            expr_type: atttypid,
+            text: super::check_inherit::StoredExpr::written(expr),
+        });
+    }
     if !crate::coerce::can_coerce(
         result.type_oid,
         atttypid,
