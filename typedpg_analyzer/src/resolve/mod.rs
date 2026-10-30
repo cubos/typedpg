@@ -1083,45 +1083,67 @@ fn analyze_raw_node_once(
         node::Node::CallStmt(call) => analyze_call(call, snapshot, &mut params)?,
         // `EXPLAIN <query>` — recurse into the wrapped statement so its
         // parameters are harvested into the outer `ParamCollector`, then
-        // replace the column list with PG's fixed `QUERY PLAN` row
-        // description (single text column, never NULL — even an empty
-        // plan emits at least one row).
+        // replace the column list with PG's `QUERY PLAN` row description
+        // (ExplainResultDesc: a single column, of the type FORMAT picks,
+        // never NULL — even an empty plan emits at least one row).
         node::Node::ExplainStmt(es) => {
             let inner = es
                 .query
                 .as_deref()
                 .and_then(|q| q.node.as_ref())
                 .ok_or_else(|| AnalyzeError::Unsupported("EXPLAIN with no inner query".into()))?;
+            // ExplainQuery: the options first. Without ANALYZE the
+            // statement is planned and its executor started, never run, so
+            // the errors only evaluating its rows raises are not reported.
+            let options = crate::ddl::session::explain_options(&es.options)?;
             // Dispatch into the same per-stmt analyzers we use at the top
             // level so the params collector stays shared (calling
             // `analyze_raw_node` recursively would allocate a fresh
             // collector and the outer call would see zero params).
-            let _ = match inner {
-                // transformExplainStmt runs transformOptionalSelectInto too.
-                node::Node::SelectStmt(sel) => match without_top_level_into(sel) {
-                    Some(sel) => analyze_select(&sel, snapshot, &mut params)?,
-                    None => analyze_select(sel, snapshot, &mut params)?,
-                },
-                node::Node::InsertStmt(ins) => analyze_insert(ins, snapshot, &mut params)?,
-                node::Node::UpdateStmt(upd) => analyze_update(upd, snapshot, &mut params)?,
-                node::Node::DeleteStmt(del) => analyze_delete(del, snapshot, &mut params)?,
-                node::Node::MergeStmt(merge) => analyze_merge(merge, snapshot, &mut params)?,
-                _ => {
-                    return Err(crate::error::RawError::unsupported(
-                        format!(
-                            "typedpg does not support EXPLAIN of {} yet",
-                            crate::error::statement_name(inner)
-                        ),
-                        crate::error::statement_span(),
-                        None,
-                    )
-                    .finalize_implicit());
+            let mut analyze_inner = || -> Result<(), AnalyzeError> {
+                match inner {
+                    // transformExplainStmt runs transformOptionalSelectInto too.
+                    node::Node::SelectStmt(sel) => {
+                        let stripped = without_top_level_into(sel);
+                        let sel = stripped.as_ref().unwrap_or(sel);
+                        analyze_select(sel, snapshot, &mut params)?;
+                        failing_rows::check_null_domain_casts(sel, snapshot)?;
+                    }
+                    node::Node::InsertStmt(ins) => {
+                        analyze_insert(ins, snapshot, &mut params)?;
+                    }
+                    node::Node::UpdateStmt(upd) => {
+                        analyze_update(upd, snapshot, &mut params)?;
+                    }
+                    node::Node::DeleteStmt(del) => {
+                        analyze_delete(del, snapshot, &mut params)?;
+                    }
+                    node::Node::MergeStmt(merge) => {
+                        analyze_merge(merge, snapshot, &mut params)?;
+                    }
+                    _ => {
+                        return Err(crate::error::RawError::unsupported(
+                            format!(
+                                "typedpg does not support EXPLAIN of {} yet",
+                                crate::error::statement_name(inner)
+                            ),
+                            crate::error::statement_span(),
+                            None,
+                        )
+                        .finalize_implicit());
+                    }
                 }
+                Ok(())
             };
+            if options.analyze {
+                analyze_inner()?;
+            } else {
+                planned_only(analyze_inner)?;
+            }
             (
                 vec![RawColumn {
                     name: "QUERY PLAN".to_owned(),
-                    type_oid: oid::TEXT,
+                    type_oid: options.result_type,
                     nullable: false,
                     typmod: None,
                     collation: None,
@@ -1492,6 +1514,9 @@ enum Execution {
     /// CREATE MATERIALIZED VIEW or REFRESH. Names were resolved before, so
     /// only the messages execution raises render names differently.
     RunsRestricted,
+    /// It is planned and its executor started, but no row is evaluated:
+    /// plain EXPLAIN (see [`planned_only`]).
+    Planned,
     /// It is parsed and analyzed but not run (see [`without_execution`]).
     NotRun,
 }
@@ -1535,8 +1560,34 @@ pub(crate) fn with_restricted_execution<R>(f: impl FnOnce() -> R) -> R {
     with_execution(Execution::RunsRestricted, f)
 }
 
-/// Whether the statement being analyzed runs (see [`without_execution`]).
+/// Run `f` analyzing a statement PG plans and starts the executor for,
+/// but doesn't run: EXPLAIN without ANALYZE (ExplainOnePlan calls
+/// ExecutorStart, never ExecutorRun). The errors ExecutorStart raises (a
+/// result relation the executor can't change, CheckValidResultRel) are
+/// reported; the ones only evaluating a row raises (a NULL stored into a
+/// NOT NULL column or domain, a NULL cast to a NOT NULL domain,
+/// sub-arrays that can't agree — unless the planner folds them, which
+/// isn't followed) are not. Inside a statement that isn't run, nothing is.
+pub(crate) fn planned_only<R>(f: impl FnOnce() -> R) -> R {
+    let mode = match EXECUTION.with(std::cell::Cell::get) {
+        Execution::NotRun => Execution::NotRun,
+        _ => Execution::Planned,
+    };
+    with_execution(mode, f)
+}
+
+/// Whether the statement being analyzed runs (see [`without_execution`],
+/// [`planned_only`]).
 pub(crate) fn executes() -> bool {
+    matches!(
+        EXECUTION.with(std::cell::Cell::get),
+        Execution::Runs | Execution::RunsRestricted
+    )
+}
+
+/// Whether the executor is started for the statement being analyzed, even
+/// if no row is evaluated (see [`planned_only`]).
+pub(crate) fn executor_starts() -> bool {
     EXECUTION.with(std::cell::Cell::get) != Execution::NotRun
 }
 

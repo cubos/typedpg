@@ -295,7 +295,7 @@ fn rewrite_level(
     };
     if let Some(kind) = unchangeable
         && !rw.merge
-        && super::executes()
+        && super::executor_starts()
         && execution_error.is_none()
     {
         *execution_error =

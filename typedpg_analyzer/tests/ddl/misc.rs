@@ -2528,6 +2528,127 @@ fn a_null_domain_cast_fails_where_every_execution_evaluates_its_row() {
 }
 
 #[test]
+fn explain_runs_its_statement_only_with_analyze() {
+    // PG 18 ExplainOnePlan: without ANALYZE the statement is planned and
+    // its executor started (ExecutorStart, where CheckValidResultRel
+    // rejects a materialized view or a sequence as result relation), but
+    // never run, so what only evaluating a row raises is not raised. With
+    // ANALYZE it runs: SELECT and INSERT alike fail as they would bare.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE DOMAIN d AS int NOT NULL;
+         CREATE TABLE t (a int);
+         CREATE TABLE tn (a int NOT NULL);
+         CREATE VIEW v AS SELECT NULL::d AS x, 1 AS y;
+         CREATE MATERIALIZED VIEW mv AS SELECT 1 AS a WITH NO DATA;
+         CREATE SEQUENCE sq;",
+    )]);
+    let domain = Some("domain d does not allow null values");
+    for (sql, fails) in [
+        ("EXPLAIN INSERT INTO t SELECT x FROM v", None),
+        (
+            "EXPLAIN WITH i AS (INSERT INTO t SELECT x FROM v) SELECT 1",
+            None,
+        ),
+        ("EXPLAIN INSERT INTO t VALUES (NULL::d)", None),
+        ("EXPLAIN INSERT INTO tn VALUES (NULL)", None),
+        ("EXPLAIN UPDATE tn SET a = NULL", None),
+        ("EXPLAIN SELECT x FROM v", None),
+        ("EXPLAIN SELECT x FROM v LIMIT 1", None),
+        ("EXPLAIN (ANALYZE false) SELECT x FROM v", None),
+        ("EXPLAIN (GENERIC_PLAN) SELECT x FROM v", None),
+        ("EXPLAIN (ANALYZE) SELECT x FROM v", domain),
+        ("EXPLAIN (ANALYZE) SELECT x FROM v LIMIT 1", domain),
+        ("EXPLAIN ANALYZE SELECT (SELECT x FROM v)", domain),
+        ("EXPLAIN (ANALYZE on) INSERT INTO t SELECT x FROM v", domain),
+        (
+            "EXPLAIN ANALYZE WITH i AS (INSERT INTO t SELECT x FROM v) SELECT 1",
+            domain,
+        ),
+        ("EXPLAIN ANALYZE INSERT INTO t VALUES (NULL::d)", domain),
+        (
+            "EXPLAIN ANALYZE INSERT INTO tn VALUES (NULL)",
+            Some("null value in column \"a\" of relation \"tn\" violates not-null constraint"),
+        ),
+        ("EXPLAIN ANALYZE SELECT y FROM v", None),
+        (
+            "EXPLAIN INSERT INTO mv VALUES (1)",
+            Some("cannot change materialized view \"mv\""),
+        ),
+        (
+            "EXPLAIN INSERT INTO sq VALUES (1)",
+            Some("cannot change sequence \"sq\""),
+        ),
+        (
+            "EXPLAIN ANALYZE INSERT INTO mv VALUES (1)",
+            Some("cannot change materialized view \"mv\""),
+        ),
+        // ParseExplainOptionList, before the statement.
+        (
+            "EXPLAIN (bogus) SELECT x FROM v",
+            Some("unrecognized EXPLAIN option \"bogus\""),
+        ),
+        (
+            "EXPLAIN (ANALYZE 'x') SELECT 1",
+            Some("analyze requires a Boolean value"),
+        ),
+        (
+            "EXPLAIN (FORMAT csv) SELECT 1",
+            Some("unrecognized value for EXPLAIN option \"format\": \"csv\""),
+        ),
+        (
+            "EXPLAIN (WAL) SELECT 1",
+            Some("EXPLAIN option WAL requires ANALYZE"),
+        ),
+        (
+            "EXPLAIN (ANALYZE, GENERIC_PLAN) SELECT 1",
+            Some("EXPLAIN options ANALYZE and GENERIC_PLAN cannot be used together"),
+        ),
+        ("EXPLAIN (ANALYZE, WAL, FORMAT json) SELECT 1", None),
+    ] {
+        match (db.analyze(sql), fails) {
+            (Err(err), Some(msg)) => {
+                assert!(err.to_string().starts_with(msg), "{sql}\n  got: {err}")
+            }
+            (Ok(_), None) => {}
+            (other, _) => panic!("{sql}: {other:?}"),
+        }
+    }
+
+    // The same in a migration: EXPLAIN EXECUTE and EXPLAIN CREATE TABLE AS
+    // plan their query without running it.
+    let setup = "CREATE DOMAIN d AS int NOT NULL;
+                 CREATE TABLE t (a int);
+                 CREATE VIEW v AS SELECT NULL::d AS x, 1 AS y;
+                 PREPARE p AS SELECT x FROM v;";
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "EXPLAIN INSERT INTO t SELECT x FROM v;
+             EXPLAIN WITH i AS (INSERT INTO t SELECT x FROM v) SELECT 1;
+             EXPLAIN SELECT x FROM v LIMIT 1;
+             EXPLAIN EXECUTE p;
+             EXPLAIN CREATE TABLE z AS SELECT x FROM v;
+             EXPLAIN CREATE TABLE z AS EXECUTE p;",
+        ),
+    ]);
+    for stmt in [
+        "EXPLAIN ANALYZE INSERT INTO t SELECT x FROM v;",
+        "EXPLAIN (ANALYZE) SELECT x FROM v LIMIT 1;",
+        "EXPLAIN ANALYZE EXECUTE p;",
+        "EXPLAIN ANALYZE CREATE TABLE z AS SELECT x FROM v;",
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(
+            err.to_string()
+                .starts_with("domain d does not allow null values"),
+            "{stmt}\n  got: {err}"
+        );
+    }
+}
+
+#[test]
 fn a_conditional_rule_qualifies_the_rules_its_action_fires() {
     // PG 18 rewriteRuleAction ANDs a conditional rule's qualification into
     // its action, and the action's qualification into the actions of the
