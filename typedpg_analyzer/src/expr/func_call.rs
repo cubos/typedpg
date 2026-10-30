@@ -946,6 +946,21 @@ fn backfill_func_args(
             // raises from this argument coercion (`sqrt('x')`).
             coerce_unknown_to(functions::call_arg_value(arg), ctx, params, expected)?;
         }
+        // make_fn_arguments: a `record` argument of a composite parameter
+        // (which can_coerce_type let through) is rebuilt by
+        // coerce_record_to_complex in the implicit context, or rejected.
+        if args.types[i] == oid::RECORD
+            && let Some(&expected) = resolved.arg_types.get(i)
+            && crate::coerce::is_complex(expected, ctx.snapshot)
+        {
+            super::coerce_record_to_complex(
+                functions::call_arg_value(arg),
+                expected,
+                CoercionContext::Implicit,
+                ctx,
+                params,
+            )?;
+        }
     }
     Ok(())
 }

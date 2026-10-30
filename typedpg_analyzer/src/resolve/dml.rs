@@ -1064,6 +1064,17 @@ fn analyze_insert_select(
             }
             continue;
         }
+        // The SELECT's outputs reach the INSERT as Vars of its subquery:
+        // a `record` one is no row coerce_record_to_complex can take apart
+        // (not a ROW(...) nor a whole-row reference), whatever it holds.
+        if sel_col.type_oid == oid::RECORD && crate::coerce::is_complex(target_oid, snapshot) {
+            return Err(crate::pgmsg::cannot_cast_record_to(
+                &crate::ddl::util::format_type_for_message(snapshot, target_oid),
+                None,
+                None,
+            )
+            .finalize_implicit());
+        }
         if !crate::coerce::can_coerce(
             sel_col.type_oid,
             target_oid,

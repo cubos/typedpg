@@ -886,9 +886,10 @@ fn infer_expr_here(
         t.nullable = false;
     }
     // A grouped expression some grouping set leaves out is NULL in that
-    // set's rows (`GROUP BY ROLLUP (g + 1)`'s total row).
+    // set's rows (`GROUP BY ROLLUP (g + 1)`'s total row) — a whole-row
+    // reference too (a column's own key is the column's, see
+    // `NullabilityContext::is_nullable`).
     if !t.nullable
-        && !matches!(node.node.as_ref(), Some(node::Node::ColumnRef(_)))
         && ctx.null_ctx.grouping_omits_exprs()
         && ctx.null_ctx.grouping_omitted.contains(&(
             crate::grouping::EXPR_KEY.to_owned(),
@@ -1102,6 +1103,14 @@ fn infer_expr_unlocated(
         }
         node::Node::AArrayExpr(arr) => infer_array_expr(arr, ctx, params),
         node::Node::RowExpr(row) => {
+            // When the enclosing context expects a registered composite
+            // type (a cast, `UPDATE SET composite_col = ROW(...)`, a
+            // composite function argument), PG's coerce_record_to_complex
+            // types each element against the composite's field type — so
+            // params get pinned — and the row adopts the goal's type.
+            if goal.has_expectation() && crate::coerce::is_complex(goal.type_oid, snapshot) {
+                return coerce_record_to_complex(node, goal.type_oid, goal.coercion, ctx, params);
+            }
             let expanded;
             let row: &protobuf::RowExpr = match expand_row_args(&row.args, ctx, params)? {
                 std::borrow::Cow::Borrowed(_) => row,
@@ -1115,118 +1124,9 @@ fn infer_expr_unlocated(
             };
             // `ROW(a, b, …)` constructs an anonymous composite. The ROW
             // value itself is never NULL — empty `ROW()` still yields a
-            // record.
-            //
-            // When the enclosing context expects a registered composite
-            // type of matching arity (UPDATE composite_col = ROW(...) or
-            // INSERT INTO t (composite_col) VALUES (ROW(...))), we type
-            // each element against the composite's declared field type so
-            // params get pinned correctly and the result adopts the goal's
-            // OID — exactly what PG does in `coerce_record_to_complex`.
-            // Otherwise the ROW types as the pseudo `record` with shape
-            // captured statically so downstream operators/indirection can
-            // see through.
-            let composite_goal = if goal.has_expectation() {
-                let target = snapshot.unwrap_domain(goal.type_oid);
-                snapshot.get_type(target).and_then(|te| {
-                    if te.typtype == TypType::Composite
-                        && let Some(relid) = te.typrelid
-                    {
-                        let fields = snapshot.attributes_of(relid).to_vec();
-                        if fields.len() == row.args.len() {
-                            Some((target, fields))
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                })
-            } else {
-                None
-            };
-
-            if let Some((composite_oid, composite_fields)) = composite_goal {
-                let mut shape = Vec::with_capacity(row.args.len());
-                for (i, (arg, field)) in row.args.iter().zip(composite_fields.iter()).enumerate() {
-                    // coerce_record_to_complex: a field that doesn't
-                    // coerce — in the context of the record's own coercion:
-                    // explicit for a cast, assignment for a stored value —
-                    // fails the whole record's cast, worded as such
-                    // (42846), not as the field's own mismatch.
-                    let mut scratch = params.clone();
-                    let own = infer_expr(arg, ctx, &mut scratch, TypeGoal::NONE)?;
-                    // can_coerce_type lets `record` reach any composite;
-                    // coerce_record_to_complex then converts a nested row
-                    // constructor field by field — the composite goal below
-                    // does, reporting a failure for the nested type.
-                    let nested_record = own.type_oid == oid::RECORD
-                        && crate::coerce::is_complex(field.atttypid, snapshot);
-                    if own.type_oid != oid::UNKNOWN
-                        && !nested_record
-                        && !crate::coerce::can_coerce(
-                            own.type_oid,
-                            field.atttypid,
-                            goal.coercion,
-                            snapshot,
-                        )
-                    {
-                        let typname = snapshot
-                            .get_type(composite_oid)
-                            .map_or_else(String::new, |t| t.typname.clone());
-                        return Err(crate::error::RawError::invalid(
-                            format!("cannot cast type record to {typname}"),
-                            crate::error::SourceSpan::from_node_token(row.location),
-                            Some(format!(
-                                "Cannot cast type {} to {} in column {}.",
-                                crate::ddl::util::format_type_for_message(snapshot, own.type_oid),
-                                crate::ddl::util::format_type_for_message(snapshot, field.atttypid),
-                                i + 1,
-                            )),
-                        )
-                        .with_primary_label("record value")
-                        .finalize_implicit());
-                    }
-                    let t = infer_expr(
-                        arg,
-                        ctx,
-                        params,
-                        TypeGoal {
-                            coercion: goal.coercion,
-                            ..TypeGoal::assignment(field.atttypid)
-                        },
-                    )?;
-                    // coerce_record_to_complex keeps each value, coerced to
-                    // its field's type: still non-NULL when no cast runs
-                    // (same type) or an untyped literal is read by the
-                    // field type's input function. Any other cast may map a
-                    // value to NULL (`int4(jsonb)` on a JSON null).
-                    let literal = matches!(
-                        arg.node.as_ref(),
-                        Some(node::Node::AConst(c)) if !c.isnull
-                    );
-                    // A nested row constructor becomes the nested
-                    // composite's own row constructor: never NULL either.
-                    let row = matches!(arg.node.as_ref(), Some(node::Node::RowExpr(_)));
-                    let kept = own.type_oid == field.atttypid
-                        || (own.type_oid == oid::UNKNOWN && literal)
-                        || (nested_record && row);
-                    shape.push(RecordField {
-                        name: field.attname.clone(),
-                        ty: ExprType::scalar_with_typmod(
-                            field.atttypid,
-                            t.nullable || !kept,
-                            field.atttypmod,
-                        ),
-                    });
-                }
-                // ROW value is never NULL; its fields' nullability is the
-                // composite's shape (what `(ROW(a, b)::pair).x` reads).
-                return Ok(ExprType {
-                    record_fields: Some(shape.into()),
-                    ..ExprType::scalar(composite_oid, false)
-                });
-            }
+            // record. Without a composite goal, the ROW types as the pseudo
+            // `record` with shape captured statically so downstream
+            // operators/indirection can see through.
 
             // PG names anonymous ROW elements `f1`, `f2`, ... by position.
             // The element's full ExprType (with any nested record shape)
@@ -1464,6 +1364,16 @@ fn infer_expr_unlocated(
         let span =
             crate::error::node_location(node).and_then(crate::error::SourceSpan::from_node_token);
         return Err(crate::error::RawError::invalid_literal(msg, span).finalize_implicit());
+    }
+
+    // A `record` meeting a composite goal is rebuilt as that composite
+    // (coerce_record_to_complex) — or rejected, when it isn't a row PG can
+    // take apart. (A ROW(...) did this above.)
+    if goal.has_expectation()
+        && result.type_oid == oid::RECORD
+        && coerce::is_complex(goal.type_oid, snapshot)
+    {
+        return coerce_record_to_complex(node, goal.type_oid, goal.coercion, ctx, params);
     }
 
     // Verify result is compatible with the goal type. Pass the location
@@ -1787,29 +1697,6 @@ fn check_goal_compatibility(
     if can_coerce(result.type_oid, goal.type_oid, goal.coercion, snapshot) {
         return Ok(());
     }
-    // PG uses a distinct wording when the source is the pseudo `record`
-    // type and the target is a registered composite (e.g. assigning
-    // `ROW($p1, $p2)` to an `address` column with the wrong arity). Mirror
-    // it so pg_sanity's prefix check passes — the rest of the cases keep
-    // the generic `cannot coerce` form.
-    if result.type_oid == oid::RECORD
-        && let Some(target_te) = snapshot.get_type(goal.type_oid)
-        && target_te.typtype == TypType::Composite
-    {
-        // PG renders the bare composite name (search-path aware) here, not
-        // the schema-qualified form `format_type_for_message` would produce.
-        let span = location.and_then(crate::error::SourceSpan::from_node_qname);
-        return Err(crate::error::RawError::invalid(
-            format!("cannot cast type record to {}", target_te.typname),
-            span,
-            Some(format!(
-                "the ROW(...) shape doesn't match `{}` — check the field count and types",
-                target_te.typname
-            )),
-        )
-        .with_primary_label("record value")
-        .finalize_implicit());
-    }
     // PG's user-facing type names (e.g. `int4` → `integer`, `bool` →
     // `boolean`) — these appear verbatim in the message so the sanity
     // prefix match works.
@@ -1966,6 +1853,7 @@ pub(crate) mod inline;
 mod json;
 pub(crate) mod literals;
 pub(crate) mod operators;
+mod record_coercion;
 mod sublink;
 mod xml;
 
@@ -1988,6 +1876,7 @@ use literals::*;
 pub(crate) use literals::{coercion_can_null_elements, coercion_can_return_null};
 pub(crate) use operators::check_regex_restrictions;
 use operators::*;
+pub(crate) use record_coercion::coerce_record_to_complex;
 use sublink::*;
 use xml::*;
 

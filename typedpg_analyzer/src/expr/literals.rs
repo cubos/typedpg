@@ -226,6 +226,16 @@ pub(crate) fn infer_type_cast(
         Some((arr, target)) => transform_array_expr(arr, ctx, params, Some(target))?,
         None => infer_expr(inner, ctx, params, inner_goal)?,
     };
+    // coerce_type: any other `record` cast to a composite is rebuilt field
+    // by field from the row it names (a whole-row reference to a subquery,
+    // CTE, VALUES list, …) — or rejected when it names none.
+    let inner_type = if inner_type.type_oid == oid::RECORD
+        && coerce::is_complex(target_oid, snapshot)
+    {
+        super::coerce_record_to_complex(inner, target_oid, CoercionContext::Explicit, ctx, params)?
+    } else {
+        inner_type
+    };
 
     if let Some(node::Node::ParamRef(p)) = inner.node.as_ref()
         && !pass_through

@@ -362,11 +362,13 @@ fn analyze_select_here(
     // PG accepts `SELECT name AS n FROM t GROUP BY n ORDER BY n`; without
     // this fallback, propagating errors from those walks would regress
     // legitimate queries.
+    // PG matches the entries' resnames: an implicit one (`SELECT upper(x)
+    // … GROUP BY upper`) as well as an alias.
     let select_aliases: std::collections::HashSet<String> = sel
         .target_list
         .iter()
         .filter_map(|t| match t.node.as_ref()? {
-            node::Node::ResTarget(rt) if !rt.name.is_empty() => Some(rt.name.clone()),
+            node::Node::ResTarget(rt) => Some(target_resname(rt)),
             _ => None,
         })
         .collect();
@@ -1271,6 +1273,24 @@ fn walk_group_clause_node(
             ExpandedTarget::StarColumn { .. } => Ok(()),
         };
     }
+    // findTargetlistEntrySQL92: a bare name that is no input column
+    // (colNameToVar — a FROM entry's name doesn't count) but an output
+    // column's name stands for that select-list entry. `GROUP BY s` with
+    // `SELECT s::c FROM (…) s` groups by `s::c`, not the whole row `s`.
+    if let Some(node::Node::ColumnRef(cr)) = group_node.node.as_ref()
+        && let [name] = expr::extract_string_fields(&cr.fields).as_slice()
+        && cr.fields.len() == 1
+        && matches!(
+            scope.resolve_column(None, name, None),
+            Err(AnalyzeError::UndefinedColumn(_))
+        )
+        && let Some(target) = targets.iter().find_map(|t| match t {
+            ExpandedTarget::Expr(rt) if &target_resname(rt) == name => Some(*rt),
+            _ => None,
+        })
+    {
+        return check_group_target_has_no_aggregates(Some(target), snapshot);
+    }
     // PG transforms the expression first (bottom-up resolution errors win)
     // and raises the no-aggregates placement error afterwards.
     if let Err(e) = expr::infer_expr(
@@ -1287,7 +1307,7 @@ fn walk_group_clause_node(
             _ => &[],
         });
         let target = targets.iter().find_map(|t| match t {
-            ExpandedTarget::Expr(rt) if Some(&rt.name) == alias.first() => Some(*rt),
+            ExpandedTarget::Expr(rt) if alias.first() == Some(&target_resname(rt)) => Some(*rt),
             _ => None,
         });
         return check_group_target_has_no_aggregates(target, snapshot);

@@ -505,6 +505,20 @@ fn resolve_funccall_record_fields(
     }
 }
 
+/// PG's `resname` of a select-list entry: its alias, else the name
+/// `FigureColname` gives its expression, else `?column?` — what
+/// `findTargetlistEntrySQL92` matches a bare GROUP BY / ORDER BY name
+/// against.
+pub(crate) fn target_resname(rt: &protobuf::ResTarget) -> String {
+    if !rt.name.is_empty() {
+        return rt.name.clone();
+    }
+    rt.val
+        .as_deref()
+        .and_then(infer_column_name)
+        .unwrap_or_else(|| "?column?".to_string())
+}
+
 /// Try to infer a default column name from an expression (for unaliased columns).
 fn infer_column_name(node: &protobuf::Node) -> Option<String> {
     figure_colname(node).1
@@ -697,8 +711,10 @@ fn sublink_target_colname(sl: &protobuf::SubLink) -> (i32, Option<String>) {
     if !rt.name.is_empty() {
         return (2, Some(rt.name.clone()));
     }
-    match rt.val.as_deref() {
-        Some(val) if figure_colname(val).0 > 0 => (2, figure_colname(val).1),
+    // (Named once: before the subquery is analyzed, each level would
+    // otherwise name the one below it twice — 2^depth.)
+    match rt.val.as_deref().map(figure_colname) {
+        Some((strength, name)) if strength > 0 => (2, name),
         _ => (0, None),
     }
 }

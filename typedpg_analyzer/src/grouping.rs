@@ -333,7 +333,9 @@ fn group_leaf(
             };
             let target = alias.and_then(|a| {
                 targets.iter().find_map(|t| match t {
-                    ExpandedTarget::Expr(rt) if rt.name == a => Some(*rt),
+                    ExpandedTarget::Expr(rt) if crate::resolve::target_resname(rt) == a => {
+                        Some(*rt)
+                    }
                     _ => None,
                 })
             });
@@ -989,6 +991,36 @@ thread_local! {
     /// Keyed by the SelectStmt's address; cleared when the outermost level
     /// is left, so no address outlives its tree.
     static LEVELS: RefCell<HashMap<usize, LevelInfo>> = RefCell::new(HashMap::new());
+    /// Whole-row references coerce_record_to_complex took apart, by the
+    /// reference's location: the entry and its columns (see
+    /// [`note_expanded_whole_row`]). Cleared with [`LEVELS`].
+    static EXPANDED_ROWS: RefCell<HashMap<i32, (String, Vec<String>)>> =
+        RefCell::new(HashMap::new());
+}
+
+/// The whole-row reference to entry `alias` at `location` was coerced to a
+/// composite: PG's `coerce_record_to_complex` replaced it with a Var per
+/// column (`expandNSItemVars`), so the grouped-column check sees those
+/// columns, not the whole row (`SELECT s::c … GROUP BY s.a, s.b` is fine,
+/// `GROUP BY s` is not).
+pub(crate) fn note_expanded_whole_row(location: i32, alias: &str, columns: Vec<String>) {
+    if location < 0 {
+        return;
+    }
+    EXPANDED_ROWS.with(|r| {
+        r.borrow_mut().insert(location, (alias.to_owned(), columns));
+    });
+}
+
+/// The columns the whole-row reference to `alias` at `location` stands
+/// for, when it was expanded (see [`note_expanded_whole_row`]).
+fn expanded_whole_row(location: i32, alias: &str) -> Option<Vec<String>> {
+    EXPANDED_ROWS.with(|r| {
+        r.borrow()
+            .get(&location)
+            .filter(|(a, _)| a == alias)
+            .map(|(_, cols)| cols.clone())
+    })
 }
 
 fn level_key(sel: &protobuf::SelectStmt) -> usize {
@@ -1009,6 +1041,7 @@ pub(crate) fn leave_query_level() {
     });
     if outermost {
         LEVELS.with(|l| l.borrow_mut().clear());
+        EXPANDED_ROWS.with(|r| r.borrow_mut().clear());
     }
 }
 
@@ -1758,10 +1791,10 @@ pub(crate) fn finish_select_level(
     // resjunk entries PG adds for ORDER BY / DISTINCT ON / window
     // definitions, then HAVING. Items naming a select-list entry (by
     // position or output name) are that entry.
-    let output_names: HashSet<&str> = targets
+    let output_names: HashSet<String> = targets
         .iter()
         .filter_map(|t| match t {
-            ExpandedTarget::Expr(rt) if !rt.name.is_empty() => Some(rt.name.as_str()),
+            ExpandedTarget::Expr(rt) => Some(crate::resolve::target_resname(rt)),
             _ => None,
         })
         .collect();
@@ -1769,7 +1802,7 @@ pub(crate) fn finish_select_level(
         Some(node::Node::AConst(_)) => true,
         Some(node::Node::ColumnRef(cr)) => matches!(
             expr::extract_string_fields(&cr.fields).as_slice(),
-            [name] if output_names.contains(name.as_str())
+            [name] if output_names.contains(name)
         ),
         _ => false,
     };
@@ -1866,7 +1899,10 @@ impl GroupExprs {
                     match expr::extract_string_fields(&cr.fields).as_slice() {
                         [name] => targets
                             .iter()
-                            .find(|t| matches!(t, ExpandedTarget::Expr(rt) if &rt.name == name))
+                            .find(|t| {
+                                matches!(t, ExpandedTarget::Expr(rt)
+                                    if &crate::resolve::target_resname(rt) == name)
+                            })
                             .copied(),
                         _ => None,
                     }
@@ -1981,7 +2017,18 @@ impl UngroupedCheck<'_> {
             }
             _ => {}
         }
+        // A whole row coerced to a composite is no longer the whole-row
+        // reference a `GROUP BY s` groups by, but its columns (below).
+        let expanded_row = match node.node.as_ref() {
+            Some(node::Node::ColumnRef(cr)) => matches!(
+                chain.resolve(cr),
+                Some(RefTarget { target: Some((alias, None)), .. })
+                    if expanded_whole_row(cr.location, &alias).is_some()
+            ),
+            _ => false,
+        };
         if depth == 0
+            && !expanded_row
             && self.group.have_non_var
             && self
                 .group
@@ -1997,17 +2044,24 @@ impl UngroupedCheck<'_> {
                 }) = chain.resolve(cr)
                     && level == depth
                 {
-                    let Some(col) = col else {
-                        return self.column(&alias, None, depth, cr.location);
+                    let named = match col {
+                        Some(col) => vec![col],
+                        // A whole row coerced to a composite is its columns.
+                        None => match expanded_whole_row(cr.location, &alias) {
+                            Some(cols) => cols,
+                            None => return self.column(&alias, None, depth, cr.location),
+                        },
                     };
-                    // A JOIN USING column reads the columns it flattens to.
-                    let key = (alias, col);
-                    let columns = match chain.0.get(depth).cloned().flatten() {
-                        Some(ns) => ns.flat_columns(&key),
-                        None => vec![key],
-                    };
-                    for (alias, col) in columns {
-                        self.column(&alias, Some(&col), depth, cr.location)?;
+                    for col in named {
+                        // A JOIN USING column reads the columns it flattens to.
+                        let key = (alias.clone(), col);
+                        let columns = match chain.0.get(depth).cloned().flatten() {
+                            Some(ns) => ns.flat_columns(&key),
+                            None => vec![key],
+                        };
+                        for (alias, col) in columns {
+                            self.column(&alias, Some(&col), depth, cr.location)?;
+                        }
                     }
                 }
                 Ok(())

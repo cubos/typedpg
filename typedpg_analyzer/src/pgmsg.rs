@@ -1356,6 +1356,24 @@ pub(crate) fn cannot_determine_type_of_empty_array(span: Option<SourceSpan>) -> 
     )
 }
 
+/// `cannot cast type record to T` — SQLSTATE 42846 (`cannot_coerce`, no
+/// dedicated variant): PG's `coerce_record_to_complex`, its DETAIL (`Input
+/// has too few columns.`, `Cannot cast type A to B in column N.`) carried
+/// as the hint. With no detail, the record isn't one it can rebuild (not a
+/// `ROW(...)` nor a whole-row reference).
+pub(crate) fn cannot_cast_record_to(
+    target: &str,
+    detail: Option<String>,
+    span: Option<SourceSpan>,
+) -> RawError {
+    RawError::new(
+        AnalyzeError::Invalid(format!("cannot cast type record to {target}")),
+        span,
+        detail,
+    )
+    .with_primary_label("record value")
+}
+
 /// `<CONTEXT> could not convert type A to B` — SQLSTATE 42846
 /// (`cannot_coerce`, no dedicated variant): PG's coerce_to_common_type
 /// after select_common_type chose B for a construct (ARRAY, CASE, …).

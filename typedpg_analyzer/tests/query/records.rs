@@ -1983,7 +1983,8 @@ fn star_on_cte_resolves_to_anonymous_record() {
 fn insert_composite_column_with_wrong_arity_errors() {
     let db = setup();
     // `address` has 3 fields; ROW(...) with 2 fields is a clear arity
-    // mismatch and must be rejected at the assignment site.
+    // mismatch and must be rejected at the assignment site, with PG's
+    // DETAIL (coerce_record_to_complex) as the help.
     assert_analyze_err!(
         db.analyze(
             "INSERT INTO users (name, work) \
@@ -1992,7 +1993,12 @@ fn insert_composite_column_with_wrong_arity_errors() {
         AnalyzeError::Invalid(_),
         concat!(
             "cannot cast type record to address\n",
-            "  help: the ROW(...) shape doesn't match `address` — check the field count and types\n",
+            "  ╭────\n",
+            "1 │ INSERT INTO users (name, work) VALUES ('n', ROW($p1, $p2)) RETURNING id\n",
+            "  ·                                             ─┬─\n",
+            "  ·                                              ╰─ record value\n",
+            "  ╰────\n",
+            "  help: Input has too few columns.\n",
         ),
     );
 }
@@ -2901,5 +2907,376 @@ fn composite_literal_is_parsed_like_record_in() {
             AnalyzeError::InvalidLiteral(_),
             msg
         );
+    }
+}
+
+/// The schema of the `coerce_record_to_complex` tests below.
+fn record_cast_setup() -> PgCatalog {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TYPE c AS (a int, b text);
+         CREATE TYPE c3 AS (a int, b text, d int);
+         CREATE TYPE cn AS (a int, n c);
+         CREATE DOMAIN cd AS c;
+         CREATE TABLE t (x int, y text);
+         CREATE TABLE tc (id int, v c);
+         CREATE FUNCTION fc(c) RETURNS int LANGUAGE sql AS 'SELECT ($1).a';
+         CREATE PROCEDURE pc(c) LANGUAGE sql AS 'SELECT 1';
+         CREATE FUNCTION fr() RETURNS record LANGUAGE sql AS 'SELECT 1, ''x''::text';",
+    )
+    .unwrap();
+    db
+}
+
+/// `coerce_record_to_complex` error with PG's DETAIL, carried as the help.
+fn assert_record_cast_err(db: &PgCatalog, sql: &str, message: &str, detail: Option<&str>) {
+    let err = db.analyze(sql).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        matches!(err, AnalyzeError::Invalid(_)) && msg.starts_with(message),
+        "{sql}: expected {message:?}, got {msg:?}"
+    );
+    match detail {
+        Some(d) => assert!(msg.contains(&format!("help: {d}")), "{sql}: {msg}"),
+        None => assert!(!msg.contains("help:"), "{sql}: {msg}"),
+    }
+}
+
+/// A whole-row reference to a FROM entry without a row type of its own (a
+/// subquery, CTE, VALUES list, join, function with a column list) is a
+/// `record` that `coerce_record_to_complex` takes apart: `expandNSItemVars`
+/// lists its columns, each coerced to the composite's field — the cast
+/// builds a row of the composite, never NULL, whose fields are NULL where
+/// the columns are.
+#[test]
+fn whole_row_of_a_derived_relation_casts_to_a_composite() {
+    let db = record_cast_setup();
+    let ty = |fields| composite("public", "c", fields);
+    for sql in [
+        "SELECT s::c AS r FROM (SELECT 1 AS a, 'x' AS b) s",
+        "SELECT CAST(s AS c) AS r FROM (SELECT 1 AS a, 'x' AS b) s",
+        "SELECT (s.*)::c AS r FROM (SELECT 1 AS a, 'x' AS b) s",
+        "WITH w AS (SELECT 1 AS a, 'x' AS b) SELECT w::c AS r FROM w",
+        "SELECT v::c AS r FROM (VALUES (1, 'x')) v",
+        "SELECT v::c AS r FROM (VALUES (1, 'x')) v(p, q)",
+        "SELECT j::c AS r FROM ((SELECT 1 AS a) x CROSS JOIN (SELECT 'x' AS b) y) j",
+    ] {
+        let s = db.analyze(sql).unwrap();
+        assert_cols(&s, vec![c("r", ty(vec![rf("a", int4()), rf("b", text())]))]);
+    }
+    // An outer query's entry.
+    db.analyze("SELECT (SELECT s::c) AS r FROM (SELECT 1 AS a, 'x' AS b) s")
+        .unwrap();
+    // Explicit context: integer → text (and text → integer, checked by the
+    // input function when it runs) through I/O.
+    let s = db
+        .analyze("SELECT s::c AS r FROM (SELECT 1 AS a, 2 AS b) s")
+        .unwrap();
+    assert_cols(&s, vec![c("r", ty(vec![rf("a", int4()), rf("b", text())]))]);
+    db.analyze("SELECT s::c AS r FROM (SELECT 'x'::text AS a, 'y' AS b) s")
+        .unwrap();
+    // Fields keep their columns' nullability: a NULL column, a column
+    // of an outer join's nullable side.
+    let s = db
+        .analyze("SELECT (s::c).a, (s::c).b FROM (SELECT 1 AS a, NULL AS b) s")
+        .unwrap();
+    assert_cols(&s, vec![c("a", int4()), cn("b", text())]);
+    let s = db
+        .analyze(
+            "SELECT s::c AS r, (s::c).a FROM (SELECT 1) q \
+             LEFT JOIN (SELECT 1 AS a, 'x' AS b) s ON false",
+        )
+        .unwrap();
+    assert_cols(
+        &s,
+        vec![
+            c("r", ty(vec![rfn("a", int4()), rfn("b", text())])),
+            cn("a", int4()),
+        ],
+    );
+    let s = db
+        .analyze(
+            "SELECT (j::c).a, (j::c).b \
+             FROM ((SELECT 1 AS a) x LEFT JOIN (SELECT 'x'::text AS b) y ON false) j",
+        )
+        .unwrap();
+    assert_cols(&s, vec![c("a", int4()), cn("b", text())]);
+    // A domain over the composite; a function with a column list; a
+    // nested whole row inside a row constructor.
+    db.analyze("SELECT s::cd FROM (SELECT 1 AS a, 'x' AS b) s")
+        .unwrap();
+    db.analyze("SELECT f::c FROM json_to_record('{\"a\":1,\"b\":\"x\"}') AS f(a int, b text)")
+        .unwrap();
+    db.analyze("SELECT f::c FROM ROWS FROM (generate_series(1, 2), generate_series(1, 2)) f")
+        .unwrap();
+    let s = db
+        .analyze("SELECT (ROW(1, s)::cn).n AS n FROM (SELECT 1 AS a, 'x' AS b) s")
+        .unwrap();
+    assert!(!s.columns[0].nullable);
+    // Through I/O, to a string type; a record stays a record.
+    db.analyze("SELECT s::text FROM (SELECT 1 AS a, 'x' AS b) s")
+        .unwrap();
+    db.analyze("SELECT s::record FROM (SELECT 1 AS a, 'x' AS b) s")
+        .unwrap();
+}
+
+/// What `coerce_record_to_complex` rejects, as PG words it: a column
+/// count that differs (`Input has too few / too many columns.`), a column
+/// with no coercion to its field in the record's context, a column holding
+/// a row (a Var, not a whole row: no detail), and any other `record` —
+/// which is no row it can take apart.
+#[test]
+fn whole_row_cast_to_a_composite_checks_its_columns() {
+    let db = record_cast_setup();
+    let err = |sql: &str, target: &str, detail: Option<&str>| {
+        assert_record_cast_err(
+            &db,
+            sql,
+            &format!("cannot cast type record to {target}"),
+            detail,
+        )
+    };
+    let few = Some("Input has too few columns.");
+    let many = Some("Input has too many columns.");
+    err("SELECT s::c3 FROM (SELECT 1 AS a, 'x' AS b) s", "c3", few);
+    err("SELECT s::c FROM (SELECT 1 AS a) s", "c", few);
+    err("SELECT s::cd FROM (SELECT 1 AS a) s", "cd", few);
+    err(
+        "SELECT s::c FROM (SELECT 1 AS a, 'x' AS b, 3 AS d) s",
+        "c",
+        many,
+    );
+    err(
+        "SELECT s::c FROM (SELECT now() AS a, 'x' AS b) s",
+        "c",
+        Some("Cannot cast type timestamp with time zone to integer in column 1."),
+    );
+    err(
+        "SELECT s::cn FROM (SELECT 1 AS a, ROW(1, 'x') AS n) s",
+        "c",
+        None,
+    );
+    // Row constructors report the same details.
+    err("SELECT ROW(1)::c", "c", few);
+    err("SELECT ROW(1, 'x', 3)::c", "c", many);
+    err(
+        "SELECT ROW(now(), 'x')::c",
+        "c",
+        Some("Cannot cast type timestamp with time zone to integer in column 1."),
+    );
+    err(
+        "SELECT ROW(s)::c FROM (SELECT 1 AS a, 'x' AS b) s",
+        "c",
+        Some("Cannot cast type record to integer in column 1."),
+    );
+    // A record that is no ROW(...) nor a whole-row reference.
+    for sql in [
+        "SELECT fr()::c",
+        "SELECT (CASE WHEN true THEN ROW(1, 'x') END)::c",
+        "SELECT COALESCE(s, ROW(1, 'x'))::c FROM (SELECT 1 AS a, 'x' AS b) s",
+        "SELECT (SELECT q FROM (SELECT 1, 'x') q)::c",
+        "SELECT x::c FROM (SELECT s FROM (SELECT 1 AS a, 'x' AS b) s) x(x)",
+    ] {
+        err(sql, "c", None);
+    }
+    // can_coerce_type has no other target for `record` than a composite,
+    // `record` itself and (I/O) the string types.
+    for (sql, target) in [
+        ("SELECT s::int FROM (SELECT 1 AS a, 'x' AS b) s", "integer"),
+        ("SELECT s::c[] FROM (SELECT 1 AS a, 'x' AS b) s", "c[]"),
+        ("SELECT ROW(1)::json", "json"),
+        ("SELECT ROW(1)::\"char\"", "\"char\""),
+    ] {
+        err(sql, target, None);
+    }
+    db.analyze("SELECT ROW(1)::name").unwrap();
+    // A function returning a scalar, a table's row type: no record.
+    assert_err_prefix!(
+        db.analyze("SELECT f::c FROM generate_series(1, 2) f"),
+        AnalyzeError::Invalid(_),
+        "cannot cast type integer to c"
+    );
+    assert_err_prefix!(
+        db.analyze("SELECT t::c FROM t"),
+        AnalyzeError::Invalid(_),
+        "cannot cast type t to c"
+    );
+}
+
+/// A whole row assigned to a composite column or passed for a composite
+/// parameter is coerced the same way — in the assignment, resp. implicit,
+/// context. An INSERT ... SELECT's outputs are Vars of its subquery, so a
+/// `record` one never coerces.
+#[test]
+fn whole_row_record_coerces_where_a_composite_is_expected() {
+    let db = record_cast_setup();
+    db.analyze("UPDATE tc SET v = s FROM (SELECT 1 AS a, 'x' AS b) s")
+        .unwrap();
+    // integer → text is an assignment cast (I/O to a string type).
+    db.analyze("UPDATE tc SET v = s FROM (SELECT 1 AS a, 2 AS b) s")
+        .unwrap();
+    assert_record_cast_err(
+        &db,
+        "UPDATE tc SET v = s FROM (SELECT 'x'::text AS a, 'x' AS b) s",
+        "cannot cast type record to c",
+        Some("Cannot cast type text to integer in column 1."),
+    );
+    assert_record_cast_err(
+        &db,
+        "UPDATE tc SET v = s FROM (SELECT 1 AS a) s",
+        "cannot cast type record to c",
+        Some("Input has too few columns."),
+    );
+    let s = db
+        .analyze("SELECT fc(s) AS r FROM (SELECT 1 AS a, 'x' AS b) s")
+        .unwrap();
+    assert_eq!(s.columns[0].pg_type, int4());
+    db.analyze("SELECT fc(s) FROM (SELECT 1::int2 AS a, 'x'::varchar AS b) s")
+        .unwrap();
+    db.analyze("CALL pc(ROW(1, 'x'))").unwrap();
+    for (sql, detail) in [
+        (
+            "SELECT fc(s) FROM (SELECT 1 AS a) s",
+            "Input has too few columns.",
+        ),
+        (
+            "SELECT fc(s) FROM (SELECT 1 AS a, 2 AS b) s",
+            "Cannot cast type integer to text in column 2.",
+        ),
+        (
+            "SELECT fc(ROW(1, 2))",
+            "Cannot cast type integer to text in column 2.",
+        ),
+        (
+            "CALL pc(ROW(1, 2))",
+            "Cannot cast type integer to text in column 2.",
+        ),
+        ("CALL pc(ROW(1))", "Input has too few columns."),
+    ] {
+        assert_record_cast_err(&db, sql, "cannot cast type record to c", Some(detail));
+    }
+    for sql in [
+        "INSERT INTO tc (v) SELECT s FROM (SELECT 1 AS a, 'x' AS b) s",
+        "INSERT INTO tc (v) SELECT ROW(1, 'x')",
+        "INSERT INTO tc (v) VALUES ((SELECT s FROM (SELECT 1 AS a, 'x' AS b) s))",
+    ] {
+        assert_record_cast_err(&db, sql, "cannot cast type record to c", None);
+    }
+    db.analyze("INSERT INTO tc (v) SELECT s::c FROM (SELECT 1 AS a, 'x' AS b) s")
+        .unwrap();
+    db.analyze("INSERT INTO tc (v) VALUES (ROW(1, 'x')), (ROW(2, 'y'))")
+        .unwrap();
+}
+
+/// `coerce_record_to_complex` replaces the whole row with its columns, so
+/// the grouped-column check sees those: `GROUP BY s.a, s.b` covers `s::c`,
+/// `GROUP BY s` (the whole row) doesn't — unless `s` names the output
+/// column `s::c` itself (findTargetlistEntrySQL92: no input column is
+/// called `s`). A grouping set leaving the columns out makes the fields
+/// NULL.
+#[test]
+fn whole_row_cast_to_a_composite_groups_by_its_columns() {
+    let db = record_cast_setup();
+    db.analyze("SELECT s::c FROM (SELECT 1 AS a, 'x' AS b) s GROUP BY s.a, s.b")
+        .unwrap();
+    db.analyze("SELECT fc(s) FROM (SELECT 1 AS a, 'x' AS b) s GROUP BY s.a, s.b")
+        .unwrap();
+    db.analyze(
+        "SELECT j::c FROM ((SELECT 1 AS a) x CROSS JOIN (SELECT 'x' AS b) y) j \
+         GROUP BY j.a, j.b",
+    )
+    .unwrap();
+    let ungrouped = |sql: &str, column: &str| {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::GroupingError(_),
+            &format!(
+                "column \"{column}\" must appear in the GROUP BY clause or be used in an \
+                 aggregate function"
+            )
+        );
+    };
+    ungrouped(
+        "SELECT s::c FROM (SELECT 1 AS a, 'x' AS b) s GROUP BY s.a",
+        "s.b",
+    );
+    ungrouped(
+        "SELECT s::c AS z FROM (SELECT 1 AS a, 'x' AS b) s GROUP BY s",
+        "s.a",
+    );
+    ungrouped(
+        "SELECT fc(s) FROM (SELECT 1 AS a, 'x' AS b) s GROUP BY s",
+        "s.a",
+    );
+    ungrouped(
+        "SELECT row_to_json(s), s::c FROM (SELECT 1 AS a, 'x' AS b) s GROUP BY s.a, s.b",
+        "s.*",
+    );
+    ungrouped(
+        "SELECT j::c FROM ((SELECT 1 AS a) x CROSS JOIN (SELECT 'x' AS b) y) j GROUP BY j.a",
+        "y.b",
+    );
+    assert_err_prefix!(
+        db.analyze("SELECT (SELECT s::c) FROM (SELECT 1 AS a, 'x' AS b) s GROUP BY s.a"),
+        AnalyzeError::GroupingError(_),
+        "subquery uses ungrouped column \"s.b\" from outer query"
+    );
+    // `GROUP BY s` names the output column `s` (the cast) here.
+    db.analyze("SELECT s::c FROM (SELECT 1 AS a, 'x' AS b) s GROUP BY s")
+        .unwrap();
+    let s = db
+        .analyze("SELECT s::c AS r, (s::c).a FROM (SELECT 1 AS a, 'x' AS b) s GROUP BY ROLLUP (r)")
+        .unwrap();
+    assert_cols(
+        &s,
+        vec![
+            cn(
+                "r",
+                composite("public", "c", vec![rf("a", int4()), rf("b", text())]),
+            ),
+            cn("a", int4()),
+        ],
+    );
+    let s = db
+        .analyze(
+            "SELECT (s::c).a, (s::c).b FROM (SELECT 1 AS a, 'x' AS b) s \
+             GROUP BY ROLLUP (s.a, s.b)",
+        )
+        .unwrap();
+    assert_cols(&s, vec![cn("a", int4()), cn("b", text())]);
+}
+
+/// findTargetlistEntrySQL92: a bare GROUP BY / ORDER BY name that is no
+/// input column matches an output column by its resname — an alias, or
+/// the name FigureColname gives an unaliased entry (`upper`, `s`,
+/// `?column?`). A grouping set leaving it out makes it NULL, a whole-row
+/// reference included.
+#[test]
+fn group_by_matches_an_implicit_output_column_name() {
+    let db = record_cast_setup();
+    let s = db
+        .analyze("SELECT upper(y) AS u0, upper(y) FROM t GROUP BY upper")
+        .unwrap();
+    assert_cols(&s, vec![cn("u0", text()), cn("upper", text())]);
+    let s = db
+        .analyze("SELECT upper('a') FROM t GROUP BY ROLLUP (upper)")
+        .unwrap();
+    assert_cols(&s, vec![cn("upper", text())]);
+    db.analyze("SELECT x + 1 FROM t GROUP BY \"?column?\"")
+        .unwrap();
+    db.analyze("SELECT upper(y) FROM t ORDER BY upper").unwrap();
+    // An input column wins over an output column of the same name.
+    assert_err_prefix!(
+        db.analyze("SELECT y AS x, x FROM t GROUP BY x"),
+        AnalyzeError::GroupingError(_),
+        "column \"t.y\" must appear in the GROUP BY clause"
+    );
+    for sql in [
+        "SELECT s FROM (SELECT 1 AS a, 'x' AS b) s GROUP BY ROLLUP (s)",
+        "SELECT s::text AS s FROM (SELECT 1 AS a, 'x' AS b) s GROUP BY ROLLUP (s)",
+        "SELECT s AS z FROM (SELECT 1 AS a, 'x' AS b) s GROUP BY ROLLUP (z)",
+    ] {
+        let s = db.analyze(sql).unwrap();
+        assert!(s.columns[0].nullable, "{sql}");
     }
 }
