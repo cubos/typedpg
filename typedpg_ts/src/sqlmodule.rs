@@ -383,6 +383,34 @@ pub fn source_from(module: &Path, source: &Path) -> String {
     rel.strip_prefix("./").map(str::to_owned).unwrap_or(rel)
 }
 
+/// The names `source`, a module, binds at its top level; panics on a
+/// syntax or binding error (a name declared twice).
+#[cfg(test)]
+pub(crate) fn top_level_bindings(source: &str, ty: oxc_span::SourceType) -> Vec<String> {
+    let allocator = oxc_allocator::Allocator::default();
+    let parsed = oxc_parser::Parser::new(&allocator, source, ty).parse();
+    assert!(
+        parsed.diagnostics.is_empty(),
+        "{:?}\n{source}",
+        parsed.diagnostics
+    );
+    let ret = oxc_semantic::SemanticBuilder::new()
+        .with_check_syntax_error(true)
+        .build(&parsed.program);
+    assert!(
+        ret.diagnostics.is_empty(),
+        "{:?}\n{source}",
+        ret.diagnostics
+    );
+    let scoping = ret.semantic.scoping();
+    let mut names: Vec<String> = scoping
+        .iter_bindings_in(scoping.root_scope_id())
+        .map(|s| scoping.symbol_name(s).to_owned())
+        .collect();
+    names.sort();
+    names
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -531,5 +559,95 @@ export const bad = createBrokenQuery("SELECT x", "column \"x\" does not exist");
             "{}",
             cjs[0].1
         );
+    }
+
+    /// Every name a module binds at its top level is a query's, one of its
+    /// types', an imported override or in `MODULE_BINDINGS`, in each form
+    /// of the module; and each of `MODULE_BINDINGS` is bound by one.
+    #[test]
+    fn module_bindings_are_every_name_the_module_binds() {
+        use oxc_span::SourceType;
+
+        let a = ok(
+            &["id: number"],
+            &["prefs: UserPrefs | null"],
+            Some("UserPrefs | null"),
+            &["UserPrefs"],
+        );
+        let typed = Ok(Generated {
+            types: "{ r: typedpg.Range<number> }".to_owned(),
+            ..ok(&[], &["r: typedpg.Range<number>"], None, &[]).unwrap()
+        });
+        let b = Err(GenError {
+            message: "column \"x\" does not exist".into(),
+            offset: None,
+        });
+        let check = TypeCheck {
+            pg: "user_prefs".into(),
+            ts: "UserPrefs".into(),
+            fits: "typedpg.JsonValue".into(),
+        };
+        let imports = [("./domains.ts".to_owned(), "UserPrefs".to_owned())];
+        let queries = [
+            SqlQuery {
+                name: "getPrefs",
+                text: "SELECT prefs FROM users WHERE id = $id",
+                result: &a,
+                checks: vec![&check],
+            },
+            SqlQuery {
+                name: "ranges",
+                text: "SELECT r FROM t",
+                result: &typed,
+                checks: vec![],
+            },
+            SqlQuery {
+                name: "bad",
+                text: "SELECT x",
+                result: &b,
+                checks: vec![],
+            },
+        ];
+        let type_names = names();
+        let m = SqlModule {
+            runtime: "@cubos/typedpg",
+            source: "queries.sql".to_owned(),
+            imports: &imports,
+            queries: &queries,
+            type_names: &type_names,
+        };
+        let mut own: Vec<String> = vec!["UserPrefs".to_owned()];
+        for q in &queries {
+            let (params, row) = type_names.of(q.name);
+            own.extend([q.name.to_owned(), params, row]);
+        }
+        let ts = m.files(Path::new("/p/q.ts"), OutKind::TypeScript);
+        let esm = m.files(Path::new("/p/q.js"), OutKind::EsModule);
+        let cjs = m.files(Path::new("/p/q.cjs"), OutKind::CommonJs);
+        let forms = [
+            ("ts", ts[0].1.clone(), SourceType::ts()),
+            ("esm", esm[0].1.clone(), SourceType::mjs()),
+            ("esm d.ts", esm[1].1.clone(), SourceType::d_ts()),
+            ("cjs", cjs[0].1.clone(), SourceType::cjs()),
+            ("cjs d.cts", cjs[1].1.clone(), SourceType::d_ts()),
+            ("dts", m.declaration_file(), SourceType::d_ts()),
+            ("loader", m.loader_module(), SourceType::mjs()),
+            ("mapped", m.mapped().text, SourceType::ts()),
+        ];
+        let mut bound = std::collections::BTreeSet::new();
+        for (form, text, ty) in forms {
+            for name in top_level_bindings(&text, ty) {
+                if !own.contains(&name) {
+                    assert!(
+                        MODULE_BINDINGS.contains(&name.as_str()),
+                        "{form}: `{name}` is not in MODULE_BINDINGS\n{text}"
+                    );
+                    bound.insert(name);
+                }
+            }
+        }
+        let listed: std::collections::BTreeSet<String> =
+            MODULE_BINDINGS.iter().map(|s| s.to_string()).collect();
+        assert_eq!(bound, listed, "a name in MODULE_BINDINGS no module binds");
     }
 }

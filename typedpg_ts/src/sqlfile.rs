@@ -16,9 +16,11 @@
 //! and every query keeps its byte offset in the file, so an error points
 //! into the file.
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::ops::Range;
 
+use crate::config::TypeNames;
 use crate::scan::{LineIndex, Position};
 use crate::sqlmodule::MODULE_BINDINGS;
 
@@ -115,8 +117,20 @@ struct Block {
     terminated: bool,
 }
 
+/// What the config adds to the names a query's module binds: a query
+/// can't take them, nor can its types.
+pub struct ModuleNames<'a> {
+    /// How the query's params and row types are named.
+    pub type_names: &'a TypeNames,
+    /// The types `types` maps to: the module imports those its queries use.
+    pub imports: &'a [String],
+}
+
 struct Parser<'a> {
     source: &'a str,
+    module: &'a ModuleNames<'a>,
+    /// The types the file's queries declare, with the query of each.
+    type_owners: HashMap<String, String>,
     lines: LineIndex,
     queries: Vec<NamedQuery>,
     diagnostics: Vec<SqlDiagnostic>,
@@ -128,10 +142,12 @@ struct Parser<'a> {
     paren_depth: usize,
 }
 
-/// Read `source`, a `.sql` file.
-pub fn parse(source: &str) -> SqlFile {
+/// Read `source`, a `.sql` file whose module binds `module`'s names.
+pub fn parse(source: &str, module: &ModuleNames) -> SqlFile {
     let mut p = Parser {
         source,
+        module,
+        type_owners: HashMap::new(),
         lines: LineIndex::new(source),
         queries: Vec::new(),
         diagnostics: Vec::new(),
@@ -206,6 +222,42 @@ impl Parser<'_> {
         }
     }
 
+    /// What `name` is when the generated module binds it besides its
+    /// queries and their types.
+    fn binding(&self, name: &str) -> Option<&'static str> {
+        if MODULE_BINDINGS.contains(&name) {
+            Some("a name the generated module declares")
+        } else if self.module.imports.iter().any(|i| i == name) {
+            Some("a type `types` maps to, which the generated module imports")
+        } else {
+            None
+        }
+    }
+
+    /// Declare query `name`'s params and row types, unless one of them is
+    /// a name the module binds already (a type of an earlier query would
+    /// merge with it, an import conflict with it): then report it.
+    fn claim_types(&mut self, name: &str, name_at: usize) -> bool {
+        let (params, row) = self.module.type_names.of(name);
+        for ty in [&params, &row] {
+            let what = match self.type_owners.get(ty) {
+                Some(owner) => format!("query `{owner}`'s too"),
+                None => match self.binding(ty) {
+                    Some(what) => what.to_owned(),
+                    None => continue,
+                },
+            };
+            self.error(
+                name_at,
+                format!("query `{name}`'s type `{ty}` is {what}: name the query otherwise"),
+            );
+            return false;
+        }
+        self.type_owners.insert(params, name.to_owned());
+        self.type_owners.insert(row, name.to_owned());
+        true
+    }
+
     fn error(&mut self, at: usize, message: impl Into<String>) {
         self.diagnostics.push(SqlDiagnostic {
             offset: at,
@@ -275,13 +327,11 @@ impl Parser<'_> {
                 name_at,
                 format!("`{name}` is a reserved word in JavaScript: name the query otherwise"),
             );
-        } else if MODULE_BINDINGS.contains(&name) {
+        } else if let Some(what) = self.binding(name) {
             exported = false;
             self.error(
                 name_at,
-                format!(
-                    "`{name}` is a name the generated module declares: name the query otherwise"
-                ),
+                format!("`{name}` is {what}: name the query otherwise"),
             );
         } else if !name.is_empty() && !self.names.insert(name.to_owned()) {
             exported = false;
@@ -289,6 +339,8 @@ impl Parser<'_> {
                 name_at,
                 format!("a query named `{name}` is already in this file"),
             );
+        } else if exported {
+            exported = self.claim_types(name, name_at);
         }
         self.block = Some(Block {
             exported,
@@ -446,6 +498,23 @@ fn dollar_quote_end(bytes: &[u8], open: usize) -> Option<usize> {
 mod tests {
     use super::*;
 
+    fn default_names() -> TypeNames {
+        TypeNames {
+            params: "{Name}Params".to_owned(),
+            row: "{Name}Row".to_owned(),
+        }
+    }
+
+    fn parse(source: &str) -> SqlFile {
+        super::parse(
+            source,
+            &ModuleNames {
+                type_names: &default_names(),
+                imports: &[],
+            },
+        )
+    }
+
     fn names(f: &SqlFile) -> Vec<(&str, &str)> {
         f.queries
             .iter()
@@ -568,6 +637,80 @@ mod tests {
         assert_eq!(
             names(&f),
             [("Typedpg", "SELECT 1"), ("createQueryFor", "SELECT 2")]
+        );
+    }
+
+    #[test]
+    fn names_the_config_makes_the_module_bind_are_rejected() {
+        // `types` maps a PG type to `UserPrefs`: the module imports it when
+        // a query uses it, so no query can be named so, whether or not one
+        // uses it.
+        let type_names = TypeNames {
+            params: "I{Name}Params".to_owned(),
+            row: "I{Name}Result".to_owned(),
+        };
+        let imports = ["IPointResult".to_owned(), "UserPrefs".to_owned()];
+        let module = ModuleNames {
+            type_names: &type_names,
+            imports: &imports,
+        };
+        let f = super::parse(
+            "/* @name UserPrefs */ SELECT 1;
+/* @name point */ SELECT 2;
+             /* @name prefs */ SELECT 3;
+/* @name Prefs */ SELECT 4;
+             /* @name userPrefs */ SELECT 5;
+/* @name typedpg */ SELECT 6;",
+            &module,
+        );
+        assert_eq!(
+            errors(&f),
+            [
+                "1:10: `UserPrefs` is a type `types` maps to, which the generated module imports: name the query otherwise",
+                "2:10: query `point`'s type `IPointResult` is a type `types` maps to, which the generated module imports: name the query otherwise",
+                "4:10: query `Prefs`'s type `IPrefsParams` is query `prefs`'s too: name the query otherwise",
+                "6:10: `typedpg` is a name the generated module declares: name the query otherwise",
+            ]
+        );
+        // `userPrefs` differs in case: its own name, and `IUserPrefsParams`.
+        assert_eq!(
+            names(&f),
+            [("prefs", "SELECT 3"), ("userPrefs", "SELECT 5")]
+        );
+    }
+
+    #[test]
+    fn types_two_queries_would_share_are_rejected() {
+        // With the default names, `foo`'s row is `FooRow` and `fooRow`'s
+        // params `FooRowParams`: distinct. `Foo` would declare `foo`'s
+        // interfaces again, which TypeScript merges into one.
+        let f = parse(
+            "/* @name foo */ SELECT 1;
+/* @name fooRow */ SELECT 2;
+/* @name Foo */ SELECT 3;",
+        );
+        assert_eq!(
+            errors(&f),
+            ["3:10: query `Foo`'s type `FooParams` is query `foo`'s too: name the query otherwise"]
+        );
+        assert_eq!(names(&f), [("foo", "SELECT 1"), ("fooRow", "SELECT 2")]);
+        // With `{Name}` alone for the params, `fooRow`'s params are `foo`'s
+        // row.
+        let type_names = TypeNames {
+            params: "{Name}".to_owned(),
+            row: "{Name}Row".to_owned(),
+        };
+        let f = super::parse(
+            "/* @name foo */ SELECT 1;
+/* @name fooRow */ SELECT 2;",
+            &ModuleNames {
+                type_names: &type_names,
+                imports: &[],
+            },
+        );
+        assert_eq!(
+            errors(&f),
+            ["2:10: query `fooRow`'s type `FooRow` is query `foo`'s too: name the query otherwise"]
         );
     }
 

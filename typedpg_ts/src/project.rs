@@ -19,7 +19,7 @@ use crate::config::{
 use crate::emit::{Embedded, Module, TypeCheck};
 use crate::generate::{GenError, Generated, generate};
 use crate::scan::{Export, FileScan, Kind, ModuleExports, Position, module_exports, scan};
-use crate::sqlfile::{SqlFile, parse as parse_sql};
+use crate::sqlfile::{ModuleNames, SqlFile};
 use crate::sqlmodule::{Mapped, SqlModule, SqlQuery, generated_source, source_from};
 use crate::typemap::{RUNTIME_NS, TypeMapper};
 
@@ -106,6 +106,32 @@ struct Database {
     cache: HashMap<(Kind, String), Result<Generated, GenError>>,
 }
 
+impl Database {
+    /// Read `source`, one of the database's `.sql` files.
+    fn parse_sql(&self, source: &str) -> SqlFile {
+        let sql = self
+            .config
+            .sql
+            .as_ref()
+            .expect("a database with .sql files has `sql`");
+        let mut imports: Vec<String> = self
+            .config
+            .types
+            .values()
+            .map(|o| o.export.clone())
+            .collect();
+        imports.sort();
+        imports.dedup();
+        crate::sqlfile::parse(
+            source,
+            &ModuleNames {
+                type_names: &sql.type_names,
+                imports: &imports,
+            },
+        )
+    }
+}
+
 /// Where a query is used: the file, its scan, the query's index in it.
 type Uses<'a> = Vec<(&'a Path, &'a FileScan, usize)>;
 
@@ -151,6 +177,17 @@ impl Project {
                     return Err(format!(
                         "`types`: `{RUNTIME_NS}` names the runtime's types in the generated \
                          module, export the type under another name"
+                    ));
+                }
+                let declared = (db.out.is_some()
+                    && crate::emit::MODULE_BINDINGS.contains(&o.export.as_str()))
+                    || (db.sql.is_some()
+                        && crate::sqlmodule::MODULE_BINDINGS.contains(&o.export.as_str()));
+                if declared {
+                    return Err(format!(
+                        "`types`: `{}` is a name the generated module declares, export the type \
+                         under another name",
+                        o.export
                     ));
                 }
                 if names
@@ -278,8 +315,8 @@ impl Project {
     pub fn rescan_sql(&mut self, path: &Path) {
         match (self.sql_db(path), std::fs::read_to_string(path)) {
             (Some(db), Ok(source)) => {
-                self.sql_files
-                    .insert(path.to_path_buf(), (db, parse_sql(&source)));
+                let file = self.dbs[db].parse_sql(&source);
+                self.sql_files.insert(path.to_path_buf(), (db, file));
             }
             _ => {
                 self.sql_files.remove(path);
@@ -312,7 +349,8 @@ impl Project {
                 if let Some(db) = self.sql_db(&path)
                     && let Ok(source) = std::fs::read_to_string(&path)
                 {
-                    self.sql_files.insert(path, (db, parse_sql(&source)));
+                    let file = self.dbs[db].parse_sql(&source);
+                    self.sql_files.insert(path, (db, file));
                 }
             } else if MODULE_EXTENSIONS.contains(&ext) && is_sql_module(&path) {
                 self.sql_generated.insert(path);
@@ -811,7 +849,7 @@ impl Project {
                 self.config.file.display()
             )
         })?;
-        let file = parse_sql(content);
+        let file = self.dbs[i].parse_sql(content);
         let db = &mut self.dbs[i];
         let catalog = db.catalog.as_ref().map_err(Clone::clone)?;
         let mapper = TypeMapper {
