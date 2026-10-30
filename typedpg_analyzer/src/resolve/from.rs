@@ -147,7 +147,7 @@ pub(crate) fn process_from_item(
             {
                 // The rewriter expands the views a statement reads (a view
                 // definition is stored unexpanded).
-                if crate::expr::plan_time_checks()
+                if crate::expr::rewritten()
                     && let Some(relname) =
                         crate::ddl::views::view_rule_recursion(snapshot, class.oid)
                 {

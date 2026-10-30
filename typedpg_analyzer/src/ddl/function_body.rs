@@ -109,8 +109,12 @@ fn validate_sql_body(
         if highest > param_types.len() as i32 {
             return Err(DdlError::Parse(format!("there is no parameter ${highest}")));
         }
-        let analyzed = crate::expr::with_sql_function_params(namespace(), || {
-            crate::resolve::analyze_raw_node_with_param_types(interp, inner, &param_types)
+        // fmgr_sql_validator rewrites what it analyzed; with
+        // check_function_bodies off an inline body is only parsed.
+        let analyzed = crate::expr::with_rewriting(interp.check_function_bodies, || {
+            crate::expr::with_sql_function_params(namespace(), || {
+                crate::resolve::analyze_raw_node_with_param_types(interp, inner, &param_types)
+            })
         });
         let columns = match analyzed {
             Ok((columns, _)) => Some(columns),

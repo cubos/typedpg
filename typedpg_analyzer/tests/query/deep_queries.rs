@@ -112,4 +112,17 @@ fn a_self_recursive_view_is_an_error_not_a_crash() {
     // A CTE of the same name is no view.
     db.analyze("WITH v2 AS (SELECT 1 AS a) SELECT * FROM v2")
         .unwrap();
+    // The rules a statement fires are rewritten too.
+    db.apply_sql(
+        "CREATE TABLE r (a int);
+         CREATE RULE rr AS ON INSERT TO r DO ALSO SELECT * FROM v3;",
+    )
+    .unwrap();
+    let err = db.analyze("INSERT INTO r VALUES (1)").unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("infinite recursion detected in rules for relation \"v3\""),
+        "{err}"
+    );
+    db.analyze("DELETE FROM r").unwrap();
 }

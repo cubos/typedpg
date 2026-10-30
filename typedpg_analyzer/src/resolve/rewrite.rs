@@ -175,6 +175,7 @@ pub(crate) fn check_rewrite(
         return Ok(());
     }
     let mut execution_error = None;
+    let mut rule_reads = Vec::new();
     rewrite_level(
         snapshot,
         relid,
@@ -182,8 +183,36 @@ pub(crate) fn check_rewrite(
         0,
         &mut execution_error,
         &mut Vec::new(),
+        &mut rule_reads,
     )?;
+    // QueryRewrite then runs fireRIRrules over every product query: the
+    // views a fired rule's condition and actions read are expanded too.
+    if crate::expr::rewritten()
+        && let Some(relname) = crate::ddl::views::relations_rule_recursion(snapshot, rule_reads)
+    {
+        return Err(crate::pgmsg::infinite_rule_recursion(&relname).finalize_implicit());
+    }
     execution_error.map_or(Ok(()), Err)
+}
+
+/// The relations rule `rule` (on `relid`) reads in its condition and
+/// actions, as it bound them when it was created (its `pg_depend` rows).
+fn rule_relations(
+    snapshot: &PgCatalog,
+    rule: &crate::ddl::rules::Rule,
+) -> Vec<crate::oid::PgClassOid> {
+    use crate::ddl::depend::PG_REWRITE_RELID;
+    use crate::pg_catalog::PG_CLASS_RELID;
+    let mut out = Vec::new();
+    for d in snapshot.iter_pg_depend() {
+        if d.classid == PG_REWRITE_RELID && d.objid == rule.oid && d.refclassid == PG_CLASS_RELID {
+            let rel = crate::oid::PgClassOid::from_nonzero(d.refobjid.into_nonzero());
+            if !out.contains(&rel) {
+                out.push(rel);
+            }
+        }
+    }
+    out
 }
 
 /// A rule action's result relation and what the rewriter sees of it.
@@ -216,6 +245,7 @@ fn rewrite_level(
     depth: usize,
     execution_error: &mut Option<AnalyzeError>,
     rewrite_events: &mut Vec<(crate::oid::PgClassOid, Option<DmlEvent>)>,
+    rule_reads: &mut Vec<crate::oid::PgClassOid>,
 ) -> Result<(), AnalyzeError> {
     let Some(class) = snapshot.pg_class.get(&relid) else {
         return Ok(());
@@ -294,6 +324,9 @@ fn rewrite_level(
         .iter()
         .any(|r| r.instead && !r.conditional && r.returning);
     let product_queries = matching.iter().any(|r| r.has_actions);
+    for rule in matching.iter().filter(|r| r.has_actions) {
+        rule_reads.extend(rule_relations(snapshot, rule));
+    }
 
     if depth > 0 && !is_view && execution_error.is_none() {
         let written = actions
@@ -377,6 +410,7 @@ fn rewrite_level(
                 depth,
                 execution_error,
                 rewrite_events,
+                rule_reads,
             )?;
         }
         rewrite_events.pop();

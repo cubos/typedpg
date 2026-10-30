@@ -62,7 +62,10 @@ pub(crate) fn prepare(interp: &mut PgCatalog, stmt: &PrepareStmt) -> Result<(), 
     }
     let mut param_types = declared.clone();
     if let Some(inner) = query.node.as_ref() {
-        match crate::resolve::analyze_raw_node_with_param_types(interp, inner, &declared) {
+        // PrepareQuery rewrites the analyzed query (and caches the plan).
+        match crate::expr::with_rewriting(true, || {
+            crate::resolve::analyze_raw_node_with_param_types(interp, inner, &declared)
+        }) {
             Ok((_, params)) => {
                 for (number, typ, _) in params {
                     let i = usize::try_from(number - 1).unwrap_or(0);
@@ -156,8 +159,9 @@ pub(crate) fn lookup_execute(
 pub(crate) fn execute(interp: &PgCatalog, stmt: &ExecuteStmt) -> Result<(), DdlError> {
     let prepared = lookup_execute(interp, stmt)?;
     if let Some(inner) = prepared.query.node.as_ref()
-        && let Err(e) =
+        && let Err(e) = crate::expr::with_rewriting(true, || {
             crate::resolve::analyze_raw_node_with_param_types(interp, inner, &prepared.param_types)
+        })
         && let Some(e) = analysis_error(e)
     {
         return Err(e);
