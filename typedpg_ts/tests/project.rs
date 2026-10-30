@@ -303,6 +303,110 @@ fn type_overrides_are_imported_once_per_module() {
     .err()
     .unwrap();
     assert!(err.contains("two modules export a type named `T`"), "{err}");
+    // Nor a name a generated module declares: the database's, or a `.sql`
+    // file's.
+    for (config, name) in [
+        (
+            r#"{ "out": "db.ts", "types": { "x": "./a#Queries" } }"#,
+            "Queries",
+        ),
+        (r#"{ "out": "db.ts", "types": { "x": "./a#sql" } }"#, "sql"),
+        (
+            r#"{ "sql": { "include": ["*.sql"] }, "types": { "x": "./a#createQuery" } }"#,
+            "createQuery",
+        ),
+    ] {
+        write(&root.join("typedpg.config.json"), config);
+        let err = Project::new(
+            Config::load(&root.join("typedpg.config.json")).unwrap(),
+            true,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(
+            err,
+            format!(
+                "`types`: `{name}` is a name the generated module declares, export the type \
+                 under another name"
+            )
+        );
+    }
+    // Only the modules the database has: without `out`, `Queries` is free.
+    write(
+        &root.join("typedpg.config.json"),
+        r#"{ "sql": { "include": ["*.sql"] }, "types": { "x": "./a#Queries" } }"#,
+    );
+    assert!(
+        Project::new(
+            Config::load(&root.join("typedpg.config.json")).unwrap(),
+            true
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn a_sql_query_cant_take_a_name_its_module_imports() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        &root.join("typedpg.config.json"),
+        r#"{ "sql": { "include": ["q/*.sql"], "typeNames": { "params": "I{Name}Params", "row": "I{Name}Result" } },
+             "types": { "pg_catalog.text": "./types.ts#Text", "pg_catalog.int4": "./types.ts#INamesResult" } }"#,
+    );
+    write(&root.join("migrations/0001.sql"), USERS);
+    write(
+        &root.join("types.ts"),
+        "export type Text = string;\nexport type INamesResult = number;\n",
+    );
+    let content = "/* @name Text */\nSELECT name FROM users;\n/* @name names */ SELECT name FROM users;\n\
+                   /* @name byId */ SELECT name FROM users WHERE id = $id;\n";
+    write(&root.join("q/users.sql"), content);
+    let mut p = project(root, false);
+    let r = p.sync(false);
+    let messages: Vec<String> = r.diagnostics.iter().map(|d| d.render(root)).collect();
+    assert_eq!(
+        messages,
+        [
+            "q/users.sql:1:10: error: `Text` is a type `types` maps to, which the generated module imports: name the query otherwise",
+            "q/users.sql:3:10: error: query `names`'s type `INamesResult` is a type `types` maps to, which the generated module imports: name the query otherwise",
+        ]
+    );
+    let module = read(&root.join("q/users.ts"));
+    assert!(
+        module.contains("import type { INamesResult, Text } from \"../types.ts\";"),
+        "{module}"
+    );
+    assert!(
+        module.contains("export const byId = createQuery<"),
+        "{module}"
+    );
+    assert!(
+        !module.contains("export const Text") && !module.contains("export const names"),
+        "{module}"
+    );
+    // The same errors where the file is compiled alone (a loader, the
+    // editor).
+    let c = p.compile_sql(&root.join("q/users.sql"), content).unwrap();
+    let errors: Vec<(&str, &str)> = c
+        .errors
+        .iter()
+        .map(|(at, len, m)| (&content[*at..*at + len], m.as_str()))
+        .collect();
+    assert_eq!(
+        errors,
+        [
+            (
+                "Text",
+                "`Text` is a type `types` maps to, which the generated module imports: name the query otherwise"
+            ),
+            (
+                "names",
+                "query `names`'s type `INamesResult` is a type `types` maps to, which the generated module imports: name the query otherwise"
+            ),
+        ]
+    );
+    assert_eq!(c.mappings.len(), 1);
 }
 
 #[test]
