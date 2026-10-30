@@ -591,13 +591,18 @@ fn merge_when_insert(
             None => null_default(c, snapshot).then_some(None),
         }
     };
+    // The partition the row lands in, when known, else the target.
     let lands_in = table_attrs
         .first()
         .and_then(|a| {
-            crate::ddl::tables::partbound::route_row(snapshot, a.attrelid, &value_of).leaf()
+            let leaf =
+                crate::ddl::tables::partbound::route_row(snapshot, a.attrelid, &value_of).leaf()?;
+            Some((leaf, snapshot.pg_class.get(&leaf)?.relname.clone()))
         })
-        .and_then(|leaf| snapshot.pg_class.get(&leaf))
-        .map_or(table_relname, |c| c.relname.as_str());
+        .or_else(|| {
+            let rel = table_attrs.first()?.attrelid;
+            Some((rel, table_relname.to_owned()))
+        });
     for (i, val) in when.values.iter().enumerate() {
         let target_col = target_attrs.get(i).copied();
         // The column, or the element / field an indirected target (`arr[1]`,
@@ -623,7 +628,10 @@ fn merge_when_insert(
         {
             if is_sql_null_literal(val)
                 && !discards(tc)
-                && let Some(err) = null_assignment_error(tc, snapshot, lands_in, "insert")
+                && let Some(err) = match &lands_in {
+                    Some(lands_in) => super::dml::insert_null_error(tc, snapshot, lands_in),
+                    None => null_assignment_error(tc, snapshot, table_relname, "insert"),
+                }
             {
                 return Err(err);
             }

@@ -72,8 +72,13 @@ pub(crate) fn analyze_insert_with_outer_ctes(
                 })
                 .collect();
         } else {
-            let selected =
+            let (selected, column_types) =
                 analyze_insert_select(val_sel, &ins.cols, &tgt, snapshot, params, &cte_scopes)?;
+            if !val_sel.values_lists.is_empty()
+                && let Some(e) = general_values_violation(val_sel, &tgt, &column_types, snapshot)
+            {
+                return Err(e);
+            }
             let width = selected.len();
             written = vec![selected.into_iter().map(Some).collect()];
             assigns = (0..width)
@@ -91,10 +96,7 @@ pub(crate) fn analyze_insert_with_outer_ctes(
     // DEFAULT VALUES: every column takes its default — a row that may
     // still go to no partition.
     if ins.select_stmt.is_none()
-        && let Some(v) = omitted_domain_nulls(&tgt, &[], snapshot)
-            .into_iter()
-            .chain(row_relation(&tgt, &[], snapshot).1)
-            .min_by_key(|v| v.order)
+        && let Some(v) = row_violation(&tgt, &[], &|_| Known::Unknown, snapshot)
     {
         return Err(v.error);
     }
@@ -687,12 +689,10 @@ fn analyze_insert_values(
     let null_ctx = NullabilityContext::default();
     let expected_len = insert_arity(tgt);
 
-    // A literal NULL into a NOT NULL column fails every execution, but at
-    // execution: PG reports it only once the whole statement has parsed,
-    // for the first failing row, and in that row for the first column in
-    // attnum order (ExecConstraints) — omitted columns with no default
-    // included — after any NOT NULL domain (checked while the row is
-    // built).
+    // A row's NULL into a NOT NULL column, or one no partition takes,
+    // fails every execution, but at execution: PG reports it only once the
+    // whole statement has parsed, for the first failing row (see
+    // [`row_violation`]).
     let mut violation: Option<RowViolation> = None;
     let mut first_len: Option<usize> = None;
     // What each row writes at each position (`None`: DEFAULT).
@@ -702,8 +702,6 @@ fn analyze_insert_values(
             continue;
         };
         let mut row_written: Vec<Option<ValueInfo>> = Vec::with_capacity(list.items.len());
-        let mut row_violations: Vec<RowViolation> = Vec::new();
-        let mut default_nulls: Vec<RowViolation> = Vec::new();
         // transformInsertStmt: every row of a multi-row VALUES must be as
         // long as the first one, which already passed transformInsertRow's
         // arity check.
@@ -738,8 +736,6 @@ fn analyze_insert_values(
             expr::Ctx::new(&scope, &null_ctx, snapshot),
             params,
         );
-        let (lands_in, unrouted) = row_relation(tgt, &list.items, snapshot);
-        row_violations.extend(unrouted);
         for (i, val) in list.items.iter().enumerate() {
             let target_col = target_col_at(tgt, i);
             let target = target_at(tgt, i, expr::Ctx::new(&scope, &null_ctx, snapshot), params)?;
@@ -756,23 +752,6 @@ fn analyze_insert_values(
                     None
                 }
             });
-            if let Some(tc) = target_col
-                && !indirected
-                && is_sql_null_literal(val)
-                && !tgt.discards(tc)
-                && let Some(err) = null_assignment_error(tc, snapshot, &lands_in.1, "insert")
-            {
-                row_violations.push(RowViolation::of(tc, snapshot, err, lands_in.0));
-            }
-            // An explicit DEFAULT that is NULL competes like an omitted
-            // column.
-            if let Some(tc) = target_col
-                && !indirected
-                && is_set_to_default(val)
-                && let Some(v) = null_default_violation(tc, snapshot, &lands_in)
-            {
-                default_nulls.push(v);
-            }
             if let Some(tc) = target_col
                 && !indirected
                 && let Some(err) = crate::typmod::check_literal_assignment(
@@ -829,18 +808,14 @@ fn analyze_insert_values(
                 params.infer_nullable(p.number, true);
             }
         }
-        // A column left to a NULL default, of a domain rejecting NULL,
-        // fails while the row is built: every execution.
-        row_violations.extend(omitted_domain_nulls(tgt, &list.items, snapshot));
-        if violation.is_none() && !row_violations.is_empty() {
-            row_violations.extend(omitted_not_null_columns(
-                tgt,
-                list.items.len(),
-                snapshot,
-                &lands_in,
-            ));
-            row_violations.extend(default_nulls);
-            violation = row_violations.into_iter().min_by_key(|v| v.order);
+        if violation.is_none() {
+            let known = |i: usize| match target_col_at(tgt, i) {
+                Some(tc) if is_null_value(&list.items[i], tc.atttypid, None, snapshot) => {
+                    Known::Null
+                }
+                _ => Known::Value(&list.items[i]),
+            };
+            violation = row_violation(tgt, &list.items, &known, snapshot);
         }
         written.push(row_written);
     }
@@ -890,15 +865,143 @@ impl RowViolation {
     }
 }
 
+/// What the row checks know of the value an INSERT row gives a column.
+#[derive(Clone, Copy)]
+enum Known<'a> {
+    /// A NULL, stored as is.
+    Null,
+    /// This expression, stored as the column's type reads it.
+    Value(&'a protobuf::Node),
+    /// Nothing.
+    Unknown,
+}
+
+/// The error inserting the row `items` (none for DEFAULT VALUES; a
+/// position's value as `known` tells, `DEFAULT` aside) raises every time,
+/// as PG reports it: a NOT NULL domain while the row is built (a NULL
+/// given, or a default left NULL), then the routing failure when no
+/// partition takes it (ExecFindPartition), then the first column in attnum
+/// order — of the partition the row lands in — storing NULL into a NOT
+/// NULL column (ExecConstraints), omitted columns included. None when a
+/// DO INSTEAD rule replaces the INSERT.
+fn row_violation<'a>(
+    tgt: &InsertTarget,
+    items: &'a [protobuf::Node],
+    known: &dyn Fn(usize) -> Known<'a>,
+    snapshot: &PgCatalog,
+) -> Option<RowViolation> {
+    if returning_rewritten(snapshot, tgt.oid, &[DmlEvent::Insert]) {
+        return None;
+    }
+    let (lands_in, unrouted) = row_relation(tgt, items, known, snapshot);
+    let mut violations: Vec<RowViolation> = unrouted.into_iter().collect();
+    for (i, val) in items.iter().enumerate() {
+        let Some(tc) = target_col_at(tgt, i) else {
+            continue;
+        };
+        // A value stored *inside* the column (`arr[1]`) is not subject to
+        // the column-level checks.
+        if !tgt.col_indirection.get(i).is_none_or(Vec::is_empty) {
+            continue;
+        }
+        if is_set_to_default(val) {
+            // An explicit DEFAULT that is NULL competes like an omitted
+            // column.
+            violations.extend(null_default_violation(tc, snapshot, &lands_in));
+            continue;
+        }
+        if tgt.discards(tc) {
+            continue;
+        }
+        match known(i) {
+            Known::Null => {
+                if let Some(err) = insert_null_error(tc, snapshot, &lands_in) {
+                    violations.push(RowViolation::of(tc, snapshot, err, lands_in.0));
+                }
+            }
+            // `NULL::d`, for a domain `d` rejecting NULL, fails as the row
+            // is built, whatever the column.
+            Known::Value(_) | Known::Unknown => {
+                if let Some(msg) = null_domain_cast(val, snapshot) {
+                    let attnum = snapshot
+                        .attribute_by_name(lands_in.0, &tc.attname)
+                        .map_or(tc.attnum, |a| a.attnum);
+                    violations.push(RowViolation {
+                        order: (false, attnum),
+                        error: AnalyzeError::Invalid(msg),
+                    });
+                }
+            }
+        }
+    }
+    // A column left to a NULL default, of a domain rejecting NULL, fails
+    // while the row is built.
+    violations.extend(omitted_domain_nulls(tgt, items, snapshot));
+    violations.extend(omitted_not_null_columns(
+        tgt,
+        items.len(),
+        snapshot,
+        &lands_in,
+    ));
+    violations.into_iter().min_by_key(|v| v.order)
+}
+
+/// Whether `val`, a value of type `source` (`None`: its own) stored into
+/// a column of type `column`, stores a NULL: a bare `NULL`, or `NULL::T`
+/// for a type `T` that isn't a domain (whose cast would check it) — when
+/// nothing but a domain coercion separates it from the column's type, as
+/// a cast function needn't keep a NULL NULL.
+fn is_null_value(
+    val: &protobuf::Node,
+    column: PgTypeOid,
+    source: Option<PgTypeOid>,
+    snapshot: &PgCatalog,
+) -> bool {
+    let own = match val.node.as_ref() {
+        Some(node::Node::AConst(c)) if c.isnull => None,
+        Some(node::Node::TypeCast(tc)) if tc.arg.as_deref().is_some_and(is_sql_null_literal) => {
+            match tc
+                .type_name
+                .as_ref()
+                .and_then(|tn| crate::ddl::util::resolve_type_name(tn, snapshot))
+            {
+                Some(t) if snapshot.unwrap_domain(t) == t => Some(t),
+                _ => return false,
+            }
+        }
+        _ => return false,
+    };
+    let base = snapshot.unwrap_domain(column);
+    match (own, source) {
+        (None, None) => true,
+        (Some(t), None) | (None, Some(t)) => t == base,
+        (Some(t), Some(s)) => t == s && s == base,
+    }
+}
+
+/// The error `NULL::d` raises when evaluated, for a domain `d` rejecting
+/// NULL (CoerceToDomain is checked at execution, never folded away).
+fn null_domain_cast(val: &protobuf::Node, snapshot: &PgCatalog) -> Option<String> {
+    let Some(node::Node::TypeCast(tc)) = val.node.as_ref() else {
+        return None;
+    };
+    if !tc.arg.as_deref().is_some_and(is_sql_null_literal) {
+        return None;
+    }
+    let t = crate::ddl::util::resolve_type_name(tc.type_name.as_ref()?, snapshot)?;
+    snapshot.domain_null_violation(t)
+}
+
 /// The relation a VALUES row (`items`; none for DEFAULT VALUES) is checked
 /// in, and its name: the partition ExecFindPartition routes it to when the
 /// target is partitioned and the analyzer can tell (see
 /// `partbound::route_row`), else the target itself. Plus the routing
 /// failure when the analyzer can tell no partition takes the row — unless
 /// a DO INSTEAD rule replaces the INSERT.
-fn row_relation(
+fn row_relation<'a>(
     tgt: &InsertTarget,
-    items: &[protobuf::Node],
+    items: &'a [protobuf::Node],
+    known: &dyn Fn(usize) -> Known<'a>,
     snapshot: &PgCatalog,
 ) -> ((crate::oid::PgClassOid, String), Option<RowViolation>) {
     // A column's value in the row: given, or its default when that is NULL
@@ -911,9 +1014,11 @@ fn row_relation(
             Some(i) if !tgt.col_indirection.get(i).is_none_or(Vec::is_empty) || tgt.discards(c) => {
                 None
             }
-            Some(i) if !is_set_to_default(&items[i]) => {
-                Some((!is_sql_null_literal(&items[i])).then_some(&items[i]))
-            }
+            Some(i) if !is_set_to_default(&items[i]) => match known(i) {
+                Known::Null => Some(None),
+                Known::Value(v) => Some(Some(v)),
+                Known::Unknown => None,
+            },
             _ => null_default(c, snapshot).then_some(None),
         }
     };
@@ -1008,11 +1113,29 @@ fn null_default_violation(
     snapshot: &PgCatalog,
     lands_in: &(crate::oid::PgClassOid, String),
 ) -> Option<RowViolation> {
-    if !(c.attnum > 0 && c.attnotnull && null_default(c, snapshot)) {
+    if !(c.attnum > 0 && null_default(c, snapshot)) {
         return None;
     }
-    null_assignment_error(c, snapshot, &lands_in.1, "insert")
-        .map(|e| RowViolation::of(c, snapshot, e, lands_in.0))
+    insert_null_error(c, snapshot, lands_in).map(|e| RowViolation::of(c, snapshot, e, lands_in.0))
+}
+
+/// The error storing NULL into target column `c` raises once the row
+/// lands in `lands_in` (see [`null_assignment_error`]): the NOT NULL may
+/// be the partition's own (`PARTITION OF … (b NOT NULL)`), checked there.
+pub(super) fn insert_null_error(
+    c: &crate::pg_catalog::PgAttribute,
+    snapshot: &PgCatalog,
+    lands_in: &(crate::oid::PgClassOid, String),
+) -> Option<AnalyzeError> {
+    null_assignment_error(c, snapshot, &lands_in.1, "insert").or_else(|| {
+        let leaf = snapshot.attribute_by_name(lands_in.0, &c.attname)?;
+        // A BEFORE ROW trigger on the target may replace the NULL too.
+        (lands_in.0 != c.attrelid
+            && leaf.attnotnull
+            && !before_row_trigger_rewrites(snapshot, c.attrelid, DmlEvent::Insert))
+        .then(|| null_assignment_error(leaf, snapshot, &lands_in.1, "insert"))
+        .flatten()
+    })
 }
 
 /// The NOT NULL columns an INSERT row giving `given` values leaves to a
@@ -1067,7 +1190,7 @@ fn analyze_insert_select(
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
     cte_scopes: &HashMap<String, Vec<ScopeColumn>>,
-) -> Result<Vec<ValueInfo>, AnalyzeError> {
+) -> Result<(Vec<ValueInfo>, Vec<PgTypeOid>), AnalyzeError> {
     // Walk the SELECT side of `INSERT … SELECT` so its params are registered
     // and any undefined-column / typo errors inside the SELECT propagate
     // cleanly. PG (transformInsertStmt) analyzes the SELECT first and only
@@ -1262,7 +1385,7 @@ fn analyze_insert_select(
     }
     // What each output column writes, once coerced to its column's type
     // (nothing known of a value stored inside its column).
-    Ok(sel_cols
+    let written = sel_cols
         .iter()
         .enumerate()
         .map(|(i, c)| {
@@ -1283,7 +1406,89 @@ fn analyze_insert_select(
                 ..ValueInfo::default()
             }
         })
-        .collect())
+        .collect();
+    Ok((written, sel_cols.iter().map(|c| c.type_oid).collect()))
+}
+
+/// The error every execution of an INSERT whose source is a VALUES with
+/// ORDER BY / LIMIT & co. (`column_types`: its output columns' types)
+/// raises for a row it stores (see [`row_violation`]) — where the analyzer
+/// can tell which rows reach the INSERT, and which fails first. Without
+/// ORDER BY the rows come in order, those OFFSET / LIMIT keep; with one
+/// their order is unknown, so it takes every row failing alike: any
+/// failing when all of them are stored, all of them when the sort decides
+/// which are. A value is known only when the VALUES column has the target
+/// column's type: another one is converted on the way.
+fn general_values_violation(
+    val_sel: &protobuf::SelectStmt,
+    tgt: &InsertTarget,
+    column_types: &[PgTypeOid],
+    snapshot: &PgCatalog,
+) -> Option<AnalyzeError> {
+    /// A constant non-negative count (`None`: a NULL / ALL one, which
+    /// doesn't count); `Err` when it isn't one.
+    fn count(n: Option<&protobuf::Node>) -> Result<Option<usize>, ()> {
+        use typedpg_pg_query::protobuf::a_const::Val;
+        match n.and_then(|n| n.node.as_ref()) {
+            None => Ok(None),
+            Some(node::Node::AConst(c)) if c.isnull => Ok(None),
+            Some(node::Node::AConst(c)) => match &c.val {
+                Some(Val::Ival(i)) => usize::try_from(i.ival).map(Some).map_err(|_| ()),
+                _ => Err(()),
+            },
+            _ => Err(()),
+        }
+    }
+    let rows: Vec<&[protobuf::Node]> = val_sel
+        .values_lists
+        .iter()
+        .filter_map(|l| match l.node.as_ref() {
+            Some(node::Node::List(list)) => Some(list.items.as_slice()),
+            _ => None,
+        })
+        .collect();
+    let offset = count(val_sel.limit_offset.as_deref()).ok()?.unwrap_or(0);
+    let limit = count(val_sel.limit_count.as_deref())
+        .ok()?
+        .unwrap_or(usize::MAX);
+    let violations: Vec<Option<RowViolation>> = rows
+        .iter()
+        .map(|items| {
+            let known = |i: usize| match (target_col_at(tgt, i), column_types.get(i)) {
+                (Some(tc), Some(&t)) if t == snapshot.unwrap_domain(tc.atttypid) => {
+                    if is_null_value(&items[i], tc.atttypid, Some(t), snapshot) {
+                        Known::Null
+                    } else {
+                        Known::Value(&items[i])
+                    }
+                }
+                _ => Known::Unknown,
+            };
+            row_violation(tgt, items, &known, snapshot)
+        })
+        .collect();
+    let stored = rows.len().saturating_sub(offset).min(limit);
+    if val_sel.sort_clause.is_empty() {
+        return violations
+            .into_iter()
+            .skip(offset)
+            .take(stored)
+            .flatten()
+            .next()
+            .map(|v| v.error);
+    }
+    let all_stored = stored == rows.len();
+    let fails = if all_stored {
+        violations.iter().any(Option::is_some)
+    } else {
+        stored > 0 && violations.iter().all(Option::is_some)
+    };
+    let mut failing = violations.into_iter().flatten();
+    let first = failing.next().filter(|_| fails)?;
+    let message = first.error.to_string();
+    failing
+        .all(|v| v.error.to_string() == message)
+        .then_some(first.error)
 }
 
 /// `ON CONFLICT (…) DO UPDATE SET …` / `DO NOTHING`, following

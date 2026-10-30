@@ -1562,6 +1562,16 @@ fn null_assignment_error(
     table_relname: &str,
     op: &'static str,
 ) -> Option<AnalyzeError> {
+    let event = if op == "insert" {
+        DmlEvent::Insert
+    } else {
+        DmlEvent::Update
+    };
+    // A DO INSTEAD rule (conditional or not) may replace the statement:
+    // the row is then never built nor stored.
+    if dml::returning_rewritten(snapshot, tc.attrelid, &[event]) {
+        return None;
+    }
     // Coerced to the column's type as the row is built: a NOT NULL domain
     // (or one with a CHECK a NULL fails) rejects it.
     if let Some(msg) = snapshot.domain_null_violation(tc.atttypid) {
@@ -1574,11 +1584,6 @@ fn null_assignment_error(
         .pg_class
         .get(&tc.attrelid)
         .is_some_and(|c| c.relkind == crate::pg_catalog::RelKind::View);
-    let event = if op == "insert" {
-        DmlEvent::Insert
-    } else {
-        DmlEvent::Update
-    };
     if tc.attnotnull && !on_view && !before_row_trigger_rewrites(snapshot, tc.attrelid, event) {
         let verb = match op {
             "insert" => "insert NULL into",
