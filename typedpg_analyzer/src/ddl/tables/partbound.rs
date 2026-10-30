@@ -224,10 +224,18 @@ pub(super) fn record_partition_spec(
                 typmod: attr.and_then(|a| interp.effective_typmod(a.atttypid, a.atttypmod)),
             });
         } else if let Some(expr) = pe.expr.as_deref() {
-            let typ = match crate::ddl::volatile::infer_over_relation(interp, relid, expr, None) {
-                Some(Ok(t)) => t.type_oid,
-                _ => crate::pg_catalog::oid::UNKNOWN,
-            };
+            let (typ, expr_collation) =
+                match crate::ddl::volatile::infer_over_relation(interp, relid, expr, None) {
+                    // The expression's collation (exprCollation), else its
+                    // type's default.
+                    Some(Ok(t)) => (
+                        t.type_oid,
+                        t.collation
+                            .or_else(|| interp.get_type(t.type_oid).and_then(|ty| ty.typcollation)),
+                    ),
+                    _ => (crate::pg_catalog::oid::UNKNOWN, None),
+                };
+            let collation = explicit.unwrap_or(expr_collation);
             let opclass = opclass_of(typ, pe);
             let strict_attnums =
                 crate::ddl::volatile::strict_columns_over_relation(interp, relid, expr)
@@ -237,10 +245,8 @@ pub(super) fn record_partition_spec(
             keys.push(PartKey {
                 type_oid: typ,
                 name: None,
-                collation: explicit.flatten(),
-                code_point_order: explicit
-                    .flatten()
-                    .is_some_and(|c| orders_by_code_point(interp, c))
+                collation,
+                code_point_order: collation.is_some_and(|c| orders_by_code_point(interp, c))
                     || compares_bytes(interp, opclass),
                 opclass,
                 strict_attnums,

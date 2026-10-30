@@ -454,15 +454,24 @@ impl CollationState {
         self
     }
 
-    /// A column value of type `t` with collation `collation` (implicit
-    /// unless `explicit`).
+    /// A value of type `t` with collation `collation` (implicit unless
+    /// `explicit`; its type's when `None`), or with none (`missing`).
     pub(crate) fn column(
         snapshot: &PgCatalog,
         t: PgTypeOid,
         collation: Option<crate::oid::PgCollationOid>,
         explicit: bool,
+        missing: Option<crate::expr::NoCollation>,
     ) -> Self {
-        Self::of_value(snapshot, t, collation, explicit)
+        match missing {
+            None => Self::of_value(snapshot, t, collation, explicit),
+            Some(crate::expr::NoCollation::Unset) => Self::NONE,
+            Some(crate::expr::NoCollation::Conflict(a, b)) => CollationState {
+                strength: Strength::Conflict,
+                collation: Some(a),
+                other: Some(b),
+            },
+        }
     }
 
     /// The collation, when explicit.
@@ -528,8 +537,16 @@ pub(crate) fn collation_state(
     }
     let children = crate::resolve::expr_children(node);
     if children.is_empty() {
+        // A leaf (a Var, a sublink) takes its collation as is: none for a
+        // subquery column that has none.
         return infer(node).map_or(CollationState::NONE, |t| {
-            CollationState::of_value(ctx.snapshot, t.type_oid, t.collation, t.explicit_collation)
+            CollationState::column(
+                ctx.snapshot,
+                t.type_oid,
+                t.collation,
+                t.explicit_collation,
+                t.no_collation,
+            )
         });
     }
     let mut merged = CollationState::NONE;

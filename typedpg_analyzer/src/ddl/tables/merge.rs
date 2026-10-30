@@ -190,6 +190,7 @@ fn of_type_columns(
                 identity: None,
                 collation: attr.attcollation,
                 compression: None,
+                storage: None,
                 owned_sequence: None,
                 identity_options: Vec::new(),
                 nn_local: false,
@@ -262,6 +263,8 @@ fn expand_like(
                     .then(|| interp.attr_compression.get(&(source, attr.attnum)))
                     .flatten()
                     .map(|m| (*m).to_owned()),
+                storage: (opts & LIKE_STORAGE != 0)
+                    .then(|| attr_storage(interp, source, attr.attnum, attr.atttypid)),
                 owned_sequence: identity.map(|_| crate::pg_catalog::DepType::Internal),
                 // transformTableLikeClause: the source sequence's options.
                 identity_options: identity
@@ -424,6 +427,7 @@ fn inherited_columns(
                 .attr_compression
                 .get(&(parent, attr.attnum))
                 .map(|m| (*m).to_owned());
+            let parent_storage = attr_storage(interp, parent, attr.attnum, attr.atttypid);
             if let Some(existing) = columns.iter_mut().find(|c| c.name == attr.attname) {
                 if existing.type_oid != attr.atttypid || existing.typmod != attr.atttypmod {
                     return Err(DdlError::Parse(format!(
@@ -437,6 +441,19 @@ fn inherited_columns(
                         attr.attname
                     )));
                 }
+                // MergeInheritedAttribute: two parents' storage modes must
+                // be the same.
+                if let Some(prev) = existing.storage
+                    && prev != parent_storage
+                {
+                    return Err(DdlError::Parse(format!(
+                        "inherited column \"{}\" has a storage parameter conflict ({} versus {})",
+                        attr.attname,
+                        storage_name(prev),
+                        storage_name(parent_storage)
+                    )));
+                }
+                existing.storage = Some(parent_storage);
                 // MergeInheritedAttribute: a method set by two parents
                 // must be the same one.
                 merge_compression(&mut existing.compression, parent_compression, &attr.attname)?;
@@ -473,6 +490,7 @@ fn inherited_columns(
                 identity,
                 collation: attr.attcollation,
                 compression: parent_compression,
+                storage: Some(parent_storage),
                 owned_sequence: None,
                 identity_options: Vec::new(),
                 nn_local: false,
@@ -507,6 +525,20 @@ fn merge_child_column(inh: &mut ParsedColumn, local: ParsedColumn) -> Result<(),
             local.name
         )));
     }
+    // A local definition brings a storage mode only from a LIKE ...
+    // INCLUDING STORAGE source.
+    match (inh.storage, local.storage) {
+        (None, new) => inh.storage = new,
+        (Some(prev), Some(new)) if prev != new => {
+            return Err(DdlError::Parse(format!(
+                "column \"{}\" has a storage parameter conflict ({} versus {})",
+                local.name,
+                storage_name(prev),
+                storage_name(new)
+            )));
+        }
+        _ => {}
+    }
     merge_compression(&mut inh.compression, local.compression.clone(), &local.name)?;
     inh.not_null |= local.not_null;
     inh.nn_local |= local.nn_local;
@@ -528,6 +560,36 @@ fn merge_child_column(inh: &mut ParsedColumn, local: ParsedColumn) -> Result<(),
         inh.owned_sequence = local.owned_sequence;
     }
     Ok(())
+}
+
+/// Column `relid.attnum`'s `attstorage`: the one it was set to, else its
+/// type's.
+pub(crate) fn attr_storage(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+    attnum: i16,
+    typid: PgTypeOid,
+) -> TypStorage {
+    interp
+        .attr_storage
+        .get(&(relid, attnum))
+        .copied()
+        .unwrap_or_else(|| {
+            interp
+                .pg_type
+                .get(&typid)
+                .map_or(TypStorage::Plain, |t| t.typstorage)
+        })
+}
+
+/// storage_name (tablecmds.c): a storage mode as messages spell it.
+fn storage_name(storage: TypStorage) -> &'static str {
+    match storage {
+        TypStorage::Plain => "PLAIN",
+        TypStorage::External => "EXTERNAL",
+        TypStorage::Extended => "EXTENDED",
+        TypStorage::Main => "MAIN",
+    }
 }
 
 /// MergeInheritedAttribute / MergeChildAttribute: a compression method

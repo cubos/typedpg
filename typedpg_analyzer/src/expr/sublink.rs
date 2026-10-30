@@ -56,7 +56,7 @@ pub(crate) fn infer_sublink(
                 // NULL, not an array with other elements).
                 return Ok(
                     ExprType::scalar_with_typmod(first.type_oid, nullable, first.typmod)
-                        .with_collation((first.collation, false))
+                        .with_collation(first.leaf_collation())
                         .with_elem_nullable(first.elem_nullable),
                 );
             }
@@ -239,7 +239,7 @@ pub(crate) fn infer_sublink(
             // type, so they get `int2vector[]` / `oidvector[]`.
             let mut array_oid = oid::UNKNOWN;
             let mut typmod = None;
-            let mut collation = (None, false);
+            let mut collation = super::DerivedCollation::default();
             let mut elem_nullable = None;
             if let Some(subselect) = &sub.subselect
                 && let Some(node::Node::SelectStmt(sel)) = subselect.node.as_ref()
@@ -249,7 +249,7 @@ pub(crate) fn infer_sublink(
                 // ARRAY sublink is its subquery column's) and, implicitly,
                 // its collation.
                 typmod = first.typmod;
-                collation = (first.collation, false);
+                collation = first.leaf_collation();
                 let elem = first.type_oid;
                 let elem_array = snapshot.array_type_of(elem);
                 // The elements are the column's values (or, for an array

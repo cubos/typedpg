@@ -1,4 +1,5 @@
 use super::*;
+use crate::expr::NoCollation;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // UNION / INTERSECT / EXCEPT
@@ -230,46 +231,14 @@ pub(crate) fn analyze_set_operation(
                 None,
             )?;
         }
-        // select_common_collation over the two arms' columns: an explicit
-        // collation (a COLLATE in a plain arm's select list) wins, two
-        // different explicit ones are an error, and two different implicit
-        // ones leave the column without a collation — an error too unless
-        // it is UNION ALL, which never compares. An arm column without a
-        // collation (a nested UNION ALL's) brings none.
-        let arm_state = |arm: &protobuf::SelectStmt, c: &RawColumn| {
-            if c.no_collation {
-                return crate::clause::CollationState::NONE;
-            }
-            let explicit = arm.op == SetOperation::SetopNone as i32
-                && crate::grouping::level_info(arm)
-                    .is_some_and(|l| l.explicit_collations.get(i).copied().unwrap_or(false));
-            crate::clause::CollationState::column(snapshot, type_oid, c.collation, explicit)
-        };
-        let (ls, rs) = (arm_state(left, &l), arm_state(right, &r));
-        if let (Some(a), Some(b)) = (ls.explicit(), rs.explicit())
-            && a != b
-        {
-            let name = |c| {
-                snapshot
-                    .pg_collation
-                    .get(&c)
-                    .map(|c| c.collname.clone())
-                    .unwrap_or_default()
-            };
-            return Err(crate::pgmsg::collation_mismatch_explicit(
-                &name(a),
-                &name(b),
-            ));
-        }
-        let merged = ls.merged(rs);
-        if !union_all {
-            merged.check_determinate(snapshot, None)?;
-        }
+        let merged =
+            set_op_column_collation((left, &l), (right, &r), i, type_oid, union_all, snapshot)?;
         let collation = merged.collation();
-        let no_collation = collation.is_none()
+        let no_collation = (collation.is_none()
             && snapshot
                 .get_type(type_oid)
-                .is_some_and(|t| t.typcollation.is_some());
+                .is_some_and(|t| t.typcollation.is_some()))
+        .then_some(NoCollation::Unset);
         let record_fields = crate::expr::merge_set_op_shapes(
             l.record_fields.as_ref(),
             r.record_fields.as_ref(),
@@ -336,6 +305,7 @@ fn set_operation_sort_and_limit(
             base_not_null: !c.nullable,
             typmod: c.typmod,
             collation: c.collation,
+            no_collation: c.no_collation.is_some(),
             table_alias: alias.clone(),
             record_fields: c.record_fields.clone(),
             elem_nullable: c.elem_nullable,
@@ -543,4 +513,53 @@ fn always_yields_null(arm: &protobuf::SelectStmt, snapshot: &PgCatalog) -> bool 
                 Some(node::Node::ResTarget(rt)) if rt.val.as_deref().is_some_and(is_null_constant)
             )
         )
+}
+
+/// select_common_collation over a set operation's column `i` of type
+/// `type_oid`, from its two arms (each an arm and its column): an explicit
+/// collation (a COLLATE in a plain arm's select list) wins, two different
+/// explicit ones are an error, and two different implicit ones leave the
+/// column without a collation — an error too unless it is UNION ALL, which
+/// never compares. A plain arm's column is its target expression, whose
+/// conflict stays one; a nested set operation's column without a
+/// collation brings none.
+pub(super) fn set_op_column_collation(
+    left: (&protobuf::SelectStmt, &RawColumn),
+    right: (&protobuf::SelectStmt, &RawColumn),
+    i: usize,
+    type_oid: PgTypeOid,
+    union_all: bool,
+    snapshot: &PgCatalog,
+) -> Result<crate::clause::CollationState, AnalyzeError> {
+    let arm_state = |(arm, c): (&protobuf::SelectStmt, &RawColumn)| {
+        let leaf = arm.op == SetOperation::SetopNone as i32;
+        let explicit = leaf
+            && crate::grouping::level_info(arm)
+                .is_some_and(|l| l.explicit_collations.get(i).copied().unwrap_or(false));
+        let missing = c
+            .no_collation
+            .map(|m| if leaf { m } else { NoCollation::Unset });
+        crate::clause::CollationState::column(snapshot, type_oid, c.collation, explicit, missing)
+    };
+    let (ls, rs) = (arm_state(left), arm_state(right));
+    if let (Some(a), Some(b)) = (ls.explicit(), rs.explicit())
+        && a != b
+    {
+        let name = |c| {
+            snapshot
+                .pg_collation
+                .get(&c)
+                .map(|c| c.collname.clone())
+                .unwrap_or_default()
+        };
+        return Err(crate::pgmsg::collation_mismatch_explicit(
+            &name(a),
+            &name(b),
+        ));
+    }
+    let merged = ls.merged(rs);
+    if !union_all {
+        merged.check_determinate(snapshot, None)?;
+    }
+    Ok(merged)
 }

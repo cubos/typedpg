@@ -337,8 +337,7 @@ pub(crate) fn infer_func_call(
         ),
         _ => std::borrow::Cow::Borrowed(&args.exprs),
     };
-    let (collation, explicit_collation) =
-        derive_collation(collation_inputs.iter(), resolved.return_type_oid, snapshot)?;
+    let derived = derive_collation(collation_inputs.iter(), resolved.return_type_oid, snapshot)?;
     coerce_call_args(&mut args, &resolved, snapshot);
     // Over the arguments as written: the defaults of the functions it
     // knows are finite constants (`lag`'s offset 1 and default NULL,
@@ -392,8 +391,9 @@ pub(crate) fn infer_func_call(
         // argument's typmod (PG matching: `lower(varchar(20))` returns
         // varchar, not varchar(20)).
         typmod: None,
-        collation,
-        explicit_collation,
+        collation: derived.collation,
+        explicit_collation: derived.explicit,
+        no_collation: derived.missing,
         record_fields,
         // A function declared to return a domain whose CHECK keeps NULL
         // elements out: its result is coerced to the domain.
@@ -841,9 +841,9 @@ fn within_group_collation_inputs(
     };
     let mut inputs = direct[..extra].to_vec();
     for (h, (s_node, s)) in direct[extra..].iter().zip(aggregated) {
-        let (collation, explicit_collation) = derive_collation([h, &s], s.type_oid, snapshot)?;
+        let merged = derive_collation([h, &s], s.type_oid, snapshot)?;
         let non_default = |t: &ExprType| t.collation.filter(|&c| c != DEFAULT_COLLATION);
-        if collation.is_none()
+        if merged.collation.is_none()
             && let (Some(a), Some(b)) = (non_default(h), non_default(&s))
             && a != b
         {
@@ -863,8 +863,9 @@ fn within_group_collation_inputs(
         }
         if merge_sort {
             inputs.push(ExprType {
-                collation,
-                explicit_collation,
+                collation: merged.collation,
+                explicit_collation: merged.explicit,
+                no_collation: merged.missing,
                 ..s
             });
         }

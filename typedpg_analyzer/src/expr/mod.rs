@@ -293,6 +293,10 @@ pub(crate) struct ExprType {
     /// column. Explicit collations win over implicit ones, and two
     /// different explicit ones meeting in one expression are an error.
     pub explicit_collation: bool,
+    /// Of a collatable type, the value has no collation (PG's
+    /// `exprCollation` is `InvalidOid`); `collation` is then `None`. See
+    /// [`NoCollation`].
+    pub no_collation: Option<NoCollation>,
     pub record_fields: Option<RecordShape>,
     /// For an array value, whether its elements can be NULL, where known
     /// (see [`crate::types::Type::Array`]); `None` otherwise.
@@ -433,6 +437,7 @@ impl ExprType {
             typmod: None,
             collation: None,
             explicit_collation: false,
+            no_collation: None,
             record_fields: None,
             elem_nullable: None,
             refine: crate::refine::Refinement::NONE,
@@ -450,6 +455,7 @@ impl ExprType {
             typmod,
             collation: None,
             explicit_collation: false,
+            no_collation: None,
             record_fields: None,
             elem_nullable: None,
             refine: crate::refine::Refinement::NONE,
@@ -473,6 +479,7 @@ impl ExprType {
             typmod,
             collation,
             explicit_collation: false,
+            no_collation: None,
             record_fields: None,
             elem_nullable: None,
             refine: crate::refine::Refinement::NONE,
@@ -511,9 +518,32 @@ impl ExprType {
 
     /// The same value with the collation state PG's `assign_collations`
     /// derives for it (see [`derive_collation`]).
-    pub fn with_collation(mut self, state: (Option<crate::oid::PgCollationOid>, bool)) -> Self {
-        (self.collation, self.explicit_collation) = state;
+    pub fn with_collation(mut self, state: DerivedCollation) -> Self {
+        self.collation = state.collation;
+        self.explicit_collation = state.explicit;
+        self.no_collation = state.missing;
         self
+    }
+
+    /// This value's own collation state, as a leaf node (`Var`, `Param`,
+    /// `SubLink`) reading it carries it: its collation implicitly, or none
+    /// at all — a conflict below it is no longer one, just `InvalidOid`.
+    pub(crate) fn leaf_collation(&self) -> DerivedCollation {
+        DerivedCollation {
+            collation: self.collation,
+            explicit: false,
+            missing: self.no_collation.map(|_| NoCollation::Unset),
+        }
+    }
+
+    /// This value's collation state, unchanged (a node PG doesn't add,
+    /// such as a cast to the type the value already has).
+    pub(crate) fn collation_state(&self) -> DerivedCollation {
+        DerivedCollation {
+            collation: self.collation,
+            explicit: self.explicit_collation,
+            missing: self.no_collation,
+        }
     }
 
     /// Account for this value being implicitly coerced to `to` (a call
@@ -550,6 +580,32 @@ pub(crate) fn merge_elem_nullable(parts: impl IntoIterator<Item = Option<bool>>)
 /// PG's `DEFAULT_COLLATION_OID`.
 const DEFAULT_COLLATION: crate::oid::PgCollationOid = crate::oid::PgCollationOid::from_raw(100);
 
+/// Why a value of a collatable type has no collation (PG's `exprCollation`
+/// is `InvalidOid`). A table or view can't store such a column, and the
+/// functions and sorts that need a collation fail on it at run time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NoCollation {
+    /// Strength NONE (parse_collate.c): a leaf — a column of a subquery, CTE
+    /// or set operation, a scalar sublink — reading a column that has none.
+    /// It is the weakest state: any implicit collation beside it wins, and
+    /// a node over it with a collatable result takes its type's default.
+    Unset,
+    /// Strength CONFLICT: two different non-default implicit collations
+    /// met. It beats implicit collations and bubbles up through every node
+    /// with a collatable result, until an explicit one settles it.
+    Conflict(crate::oid::PgCollationOid, crate::oid::PgCollationOid),
+}
+
+/// The collation state [`derive_collation`] assigns a node: its collation
+/// (`None` for its type's default, or for none), whether it is explicit,
+/// and why there is none when the type is collatable.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DerivedCollation {
+    pub collation: Option<crate::oid::PgCollationOid>,
+    pub explicit: bool,
+    pub missing: Option<NoCollation>,
+}
+
 /// PG's collation derivation for one expression node (`assign_collations_walker`
 /// and `merge_collation_state`, parse_collate.c), given its inputs' states
 /// and its result type:
@@ -557,19 +613,27 @@ const DEFAULT_COLLATION: crate::oid::PgCollationOid = crate::oid::PgCollationOid
 /// - explicit (`COLLATE`) inputs dominate; two different ones are `collation
 ///   mismatch between explicit collations "A" and "B"` (42P21) whatever the
 ///   result type;
-/// - otherwise a non-default implicit collation beats the default one, and
-///   two different non-default ones leave the collation undetermined (PG only
-///   fails later, if a collation is actually needed);
+/// - otherwise a conflict among the inputs, or two different non-default
+///   implicit collations, is a conflict ([`NoCollation::Conflict`]: PG only
+///   fails later, if a collation is actually needed); else a non-default
+///   implicit collation beats the default one;
+/// - an input without a collation ([`NoCollation::Unset`]) counts for
+///   nothing, and a collatable result with no collated input takes its
+///   type's default;
 /// - a non-collatable result has no collation.
 pub(crate) fn derive_collation<'a>(
     inputs: impl IntoIterator<Item = &'a ExprType>,
     result_type: PgTypeOid,
     snapshot: &PgCatalog,
-) -> Result<(Option<crate::oid::PgCollationOid>, bool), AnalyzeError> {
+) -> Result<DerivedCollation, AnalyzeError> {
     let mut explicit: Option<crate::oid::PgCollationOid> = None;
     let mut implicit: Option<crate::oid::PgCollationOid> = None;
-    let mut implicit_conflict = false;
+    let mut conflict: Option<(crate::oid::PgCollationOid, crate::oid::PgCollationOid)> = None;
     for t in inputs {
+        if let Some(NoCollation::Conflict(a, b)) = t.no_collation {
+            conflict.get_or_insert((a, b));
+            continue;
+        }
         let Some(c) = t.collation else {
             continue;
         };
@@ -590,9 +654,9 @@ pub(crate) fn derive_collation<'a>(
                 }
                 _ => explicit = Some(c),
             }
-        } else if c != DEFAULT_COLLATION {
+        } else if c != DEFAULT_COLLATION && conflict.is_none() {
             match implicit {
-                Some(i) if i != c => implicit_conflict = true,
+                Some(i) if i != c => conflict = Some((i, c)),
                 _ => implicit = Some(c),
             }
         }
@@ -601,12 +665,24 @@ pub(crate) fn derive_collation<'a>(
         .get_type(result_type)
         .is_some_and(|t| t.typcollation.is_some());
     if !collatable {
-        return Ok((None, false));
+        return Ok(DerivedCollation::default());
     }
-    Ok(match explicit {
-        Some(e) => (Some(e), true),
-        None if implicit_conflict => (None, false),
-        None => (implicit, false),
+    Ok(match (explicit, conflict) {
+        (Some(e), _) => DerivedCollation {
+            collation: Some(e),
+            explicit: true,
+            missing: None,
+        },
+        (None, Some((a, b))) => DerivedCollation {
+            collation: None,
+            explicit: false,
+            missing: Some(NoCollation::Conflict(a, b)),
+        },
+        (None, None) => DerivedCollation {
+            collation: implicit,
+            explicit: false,
+            missing: None,
+        },
     })
 }
 
@@ -1173,6 +1249,7 @@ fn infer_expr_unlocated(
                 typmod: None,
                 collation: None,
                 explicit_collation: false,
+                no_collation: None,
                 record_fields: Some(fields.into()),
                 elem_nullable: None,
                 refine: crate::refine::Refinement::NONE,

@@ -136,7 +136,7 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
             match super::volatile::infer_over_relation(db, indrelid, expr, None) {
                 Some(Ok(t)) => {
                     expr_types.push((key_columns.len(), t.type_oid));
-                    Some((t.type_oid, None))
+                    Some((t.type_oid, expression_collation(db, &t)))
                 }
                 _ => None,
             }
@@ -154,6 +154,9 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
             column_type.and_then(|(_, c)| c),
             None,
         )?;
+        if elem.name.is_empty() {
+            check_expression_key_collation(db, column_type.map(|(t, _)| t), key.collation)?;
+        }
         key_columns.push(key.column);
         indclass.push(key.opclass);
         indcollation.push(key.collation);
@@ -483,6 +486,38 @@ fn check_index_am(
     Ok(caps)
 }
 
+/// An index expression's collation (`exprCollation`): its own, else its
+/// type's default; `None` when the expression has none (or its type is
+/// not collatable).
+fn expression_collation(
+    db: &PgCatalog,
+    t: &crate::expr::ExprType,
+) -> Option<crate::oid::PgCollationOid> {
+    if t.no_collation.is_some() {
+        return None;
+    }
+    t.collation
+        .or_else(|| db.get_type(t.type_oid).and_then(|ty| ty.typcollation))
+}
+
+/// ComputeIndexAttrs: a collatable expression key needs a collation — its
+/// own, or the COLLATE clause's.
+fn check_expression_key_collation(
+    db: &PgCatalog,
+    typ: Option<crate::oid::PgTypeOid>,
+    collation: Option<crate::oid::PgCollationOid>,
+) -> Result<(), DdlError> {
+    let collatable = typ
+        .and_then(|t| db.get_type(t))
+        .is_some_and(|t| t.typcollation.is_some());
+    if collatable && collation.is_none() {
+        return Err(DdlError::Parse(
+            "could not determine which collation to use for index expression".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// ComputeIndexAttrs (indexcmds.c) for one key column of type `typ`
 /// (`None` when unknown): its collation — the COLLATE clause, which must
 /// name an existing collation of a collatable type, else `column_collation`
@@ -744,10 +779,10 @@ pub(crate) fn define_constraint_index(
         } else {
             (None, None)
         };
-        let typ = match (attr, elem.and_then(|e| e.expr.as_deref())) {
+        let (typ, collation) = match (attr, elem.and_then(|e| e.expr.as_deref())) {
             (Some(a), _) => {
                 colnames.push(a.attname.clone());
-                Some(a.atttypid)
+                (Some(a.atttypid), a.attcollation)
             }
             (None, Some(expr)) => {
                 colnames.push(figure_index_colname(Some(expr)));
@@ -756,25 +791,20 @@ pub(crate) fn define_constraint_index(
                     Some(Err(e)) => return Err(DdlError::UnsupportedDdl(e.to_string())),
                     Some(Ok(t)) => {
                         expr_types.push((i, t.type_oid));
-                        Some(t.type_oid)
+                        (Some(t.type_oid), expression_collation(db, &t))
                     }
-                    None => None,
+                    None => (None, None),
                 }
             }
             (None, None) => {
                 colnames.push(String::new());
-                None
+                (None, None)
             }
         };
-        let key = compute_key_column(
-            db,
-            &am,
-            caps.as_ref(),
-            elem,
-            typ,
-            attr.and_then(|a| a.attcollation),
-            opnames,
-        )?;
+        let key = compute_key_column(db, &am, caps.as_ref(), elem, typ, collation, opnames)?;
+        if attr.is_none() {
+            check_expression_key_collation(db, typ, key.collation)?;
+        }
         columns.push(key.column);
         indclass.push(key.opclass);
         indcollation.push(key.collation);

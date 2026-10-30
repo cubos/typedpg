@@ -66,7 +66,7 @@ pub(crate) fn analyze_call(
             nullable: true,
             typmod: None,
             collation: None,
-            no_collation: false,
+            no_collation: None,
             record_fields: None,
             elem_nullable: None,
             refine: crate::refine::Refinement::NONE,

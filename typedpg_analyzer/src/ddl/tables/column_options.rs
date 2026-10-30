@@ -14,6 +14,7 @@ pub(super) fn alter_column_setting(
     relid: PgClassOid,
     cmd: &AlterTableCmd,
     subtype: AlterTableType,
+    rec: super::inherit::Recursion,
 ) -> Result<(), DdlError> {
     let relname = relname_of(interp, relid);
     let is_index = interp
@@ -69,9 +70,22 @@ pub(super) fn alter_column_setting(
 
     match subtype {
         AlterTableType::AtSetStorage => {
-            let storage =
-                get_attribute_storage(interp, attr.atttypid, &def_name().unwrap_or_default())?;
+            let mode = def_name().unwrap_or_default();
+            let storage = get_attribute_storage(interp, attr.atttypid, &mode)?;
             record_attr_storage(interp, relid, attr.attnum, storage);
+            // ATSimpleRecursion: without ONLY, every descendant's column
+            // takes the mode too.
+            if rec.recurse && !rec.recursing {
+                for child in super::inherit::all_inheritors(interp, relid) {
+                    if child == relid {
+                        continue;
+                    }
+                    if let Some(a) = interp.attribute_by_name(child, &cmd.name).cloned() {
+                        let storage = get_attribute_storage(interp, a.atttypid, &mode)?;
+                        record_attr_storage(interp, child, a.attnum, storage);
+                    }
+                }
+            }
         }
         AlterTableType::AtSetCompression => {
             let method = def_name().unwrap_or_default();

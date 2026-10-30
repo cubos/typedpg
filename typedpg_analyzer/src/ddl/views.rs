@@ -909,7 +909,7 @@ fn resolve_view_with_params(
                 collation: col
                     .collation
                     .or_else(|| interp_type_collation(snapshot, type_oid)),
-                no_collation: col.no_collation,
+                no_collation: col.no_collation.is_some(),
             }
         })
         .collect();

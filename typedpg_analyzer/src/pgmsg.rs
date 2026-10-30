@@ -929,9 +929,10 @@ pub(crate) fn recursive_query_column_type(
     )
 }
 
-/// `recursive query "r" column N has collation "A" in non-recursive term
-/// but collation "B" overall` — SQLSTATE 42P21: PG fixes a recursive CTE's
-/// column collations from the non-recursive term alone.
+/// `recursive query "r" column N has collation "A" in non-recursive term but
+/// collation "B" overall` — SQLSTATE 42P21 (analyzeCTE). A column without a
+/// collation is named `(null)`, as PG's `%s` of get_collation_name's NULL
+/// prints it.
 pub(crate) fn recursive_query_column_collation(
     cte_name: &str,
     column: usize,

@@ -15,6 +15,7 @@ fn system_columns_for(alias: &str) -> Vec<ScopeColumn> {
             base_not_null: true,
             typmod: None,
             collation: None,
+            no_collation: false,
             table_alias: alias.to_owned(),
             record_fields: None,
             elem_nullable: None,
@@ -38,6 +39,10 @@ pub(crate) struct ScopeColumn {
     /// `pg_attribute.attcollation` of the source column, if any. Threaded
     /// through `infer_column_ref` into `ExprType.collation`.
     pub collation: Option<crate::oid::PgCollationOid>,
+    /// Of a collatable type, the column has no collation (a subquery, CTE
+    /// or set operation column whose expression has none): a reference to
+    /// it is a Var of strength NONE (see [`crate::expr::NoCollation`]).
+    pub no_collation: bool,
     /// The alias of the table this column belongs to.
     pub table_alias: String,
     /// Named-field structure when the column holds a record value: SRF /
@@ -657,6 +662,7 @@ impl Scope {
                 base_not_null: snapshot.attr_never_null(c),
                 typmod: snapshot.effective_typmod(c.atttypid, c.atttypmod),
                 collation: c.attcollation,
+                no_collation: false,
                 table_alias: alias.to_owned(),
                 record_fields: None,
                 elem_nullable: (null_free.contains(&c.attname)
@@ -749,6 +755,7 @@ impl Scope {
                 base_not_null: snapshot.attr_never_null(c) && not_null_everywhere(c),
                 typmod: snapshot.effective_typmod(c.atttypid, c.atttypmod),
                 collation: c.attcollation,
+                no_collation: false,
                 table_alias: alias.to_owned(),
                 record_fields: None,
                 elem_nullable: (null_free.contains(&c.attname)

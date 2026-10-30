@@ -1159,6 +1159,7 @@ fn values_sort_and_limit(
             base_not_null: !c.nullable,
             typmod: c.typmod,
             collation: c.collation,
+            no_collation: c.no_collation.is_some(),
             table_alias: alias.clone(),
             record_fields: c.record_fields.clone(),
             elem_nullable: c.elem_nullable,

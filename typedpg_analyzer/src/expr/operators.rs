@@ -1617,7 +1617,10 @@ fn note_std_compare(
     // PG's database default (100), "C" (950) and "POSIX" (951) compare
     // bytes; a nondeterministic collation may equal different strings.
     let deterministic = derive_collation(left.iter().chain(right.iter()), oid::TEXT, snapshot)
-        .is_ok_and(|(c, _)| c.is_none_or(|c| matches!(c.get(), 100 | 950 | 951)));
+        .is_ok_and(|d| {
+            d.collation
+                .is_none_or(|c| matches!(c.get(), 100 | 950 | 951))
+        });
     let text = builtin
         && equality
         && op.result_type_oid == oid::BOOL

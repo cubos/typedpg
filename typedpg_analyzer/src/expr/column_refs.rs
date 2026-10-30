@@ -112,6 +112,9 @@ pub(crate) fn infer_column_ref(
                 // does.
                 collation: col.collation,
                 explicit_collation: false,
+                // A Var takes its column's collation as is: none for a
+                // subquery column that has none (strength NONE).
+                no_collation: col.no_collation.then_some(super::NoCollation::Unset),
                 // Carry the column's record shape forward so downstream
                 // `(col).field` indirection and ROW-vs-shape coercion can
                 // see through to the field types.
@@ -363,6 +366,7 @@ fn whole_row_ref(
                     typmod: c.typmod,
                     collation: c.collation,
                     explicit_collation: false,
+                    no_collation: c.no_collation.then_some(super::NoCollation::Unset),
                     record_fields: c.record_fields.clone(),
                     elem_nullable: c.elem_nullable,
                     refine: c.refine.clone(),
@@ -379,6 +383,7 @@ fn whole_row_ref(
         typmod: None,
         collation: None,
         explicit_collation: false,
+        no_collation: None,
         record_fields: Some(shape_of_columns(&source.columns).into()),
         elem_nullable: None,
         refine: crate::refine::Refinement::NONE,
@@ -399,6 +404,7 @@ fn shape_of_columns(columns: &[crate::scope::ScopeColumn]) -> Vec<RecordField> {
                 typmod: c.typmod,
                 collation: c.collation,
                 explicit_collation: false,
+                no_collation: c.no_collation.then_some(super::NoCollation::Unset),
                 record_fields: c.record_fields.clone(),
                 elem_nullable: c.elem_nullable,
                 refine: c.refine.clone(),

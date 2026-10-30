@@ -1125,7 +1125,7 @@ fn analyze_raw_node_once(
                     nullable: false,
                     typmod: None,
                     collation: None,
-                    no_collation: false,
+                    no_collation: None,
                     record_fields: None,
                     elem_nullable: None,
                     refine: crate::refine::Refinement::NONE,
@@ -1619,9 +1619,10 @@ pub(crate) struct RawColumn {
     pub collation: Option<crate::oid::PgCollationOid>,
     /// The column is of a collatable type but has no collation (PG's
     /// `exprCollation` is `InvalidOid`): a UNION ALL column whose arms
-    /// carry different implicit collations. A table or view can't store
-    /// such a column (`CheckAttributeType`).
-    pub no_collation: bool,
+    /// carry different implicit collations, an expression over two of them,
+    /// a subquery's column that has none. A table or view can't store such
+    /// a column (`CheckAttributeType`).
+    pub no_collation: Option<crate::expr::NoCollation>,
     /// Named-field structure when this column holds a record. Sourced from
     /// SRF out_args, ROW constructors, or propagated through subqueries.
     /// Used both to surface `Type::AnonymousRecord` in the final output and
@@ -1638,6 +1639,18 @@ pub(crate) struct RawColumn {
     /// ([`crate::expr::ExprType::unknown_value`]): resolving it as `text`
     /// fails, see [`select::resolve_unknown_values`].
     pub unknown_value: bool,
+}
+
+impl RawColumn {
+    /// The collation state of a leaf reading this column (a Var of the
+    /// subquery, a scalar sublink): its collation implicitly, or none.
+    pub(crate) fn leaf_collation(&self) -> crate::expr::DerivedCollation {
+        crate::expr::DerivedCollation {
+            collation: self.collation,
+            explicit: false,
+            missing: self.no_collation.map(|_| crate::expr::NoCollation::Unset),
+        }
+    }
 }
 
 /// Return type for analyze_* functions: columns + optional pre-sorted params.

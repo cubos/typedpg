@@ -398,6 +398,7 @@ pub(crate) fn process_from_item(
                         table_alias: alias.to_owned(),
                         typmod: rc.typmod,
                         collation: rc.collation,
+                        no_collation: rc.no_collation.is_some(),
                         record_fields: rc.record_fields,
                         elem_nullable: rc.elem_nullable,
                         refine: rc.refine.clone(),
@@ -683,6 +684,7 @@ fn process_range_function(
             table_alias: alias.to_owned(),
             typmod: None,
             collation: None,
+            no_collation: false,
             record_fields: None,
             elem_nullable: None,
             refine: crate::refine::Refinement::NONE,
@@ -1438,6 +1440,41 @@ fn output_column_names(scope: &Scope, span: SourceSpan) -> Vec<String> {
         .collect()
 }
 
+/// The collation of a JOIN USING merged column (buildMergedJoinVar): the
+/// left column's (the right one's for a RIGHT JOIN), or for a FULL JOIN
+/// the one `COALESCE(l, r)` derives — a conflict when the two carry
+/// different non-default implicit collations. A side coerced to the
+/// column's type is a node over it, which takes its type's default when
+/// the side has no collation. Returns the collation and whether there is
+/// none (a reference to the column is a Var of strength NONE).
+fn merged_column_collation(
+    l: &ScopeColumn,
+    r: &ScopeColumn,
+    type_oid: PgTypeOid,
+    typmod: Option<i32>,
+    join_type: JoinType,
+    snapshot: &PgCatalog,
+) -> (Option<crate::oid::PgCollationOid>, bool) {
+    let side = |c: &ScopeColumn| {
+        let coerced = c.type_oid != type_oid || c.typmod != typmod;
+        let mut t =
+            crate::expr::ExprType::scalar_with_collation(type_oid, false, typmod, c.collation);
+        if c.no_collation && !coerced {
+            t.no_collation = Some(crate::expr::NoCollation::Unset);
+        }
+        t
+    };
+    let state = match join_type {
+        JoinType::JoinRight => side(r).leaf_collation(),
+        JoinType::JoinFull => {
+            crate::expr::derive_collation([&side(l), &side(r)], type_oid, snapshot)
+                .unwrap_or_default()
+        }
+        _ => side(l).leaf_collation(),
+    };
+    (state.collation, state.missing.is_some())
+}
+
 /// Build the merged columns for `JOIN USING` / `NATURAL JOIN` and record
 /// the constituents in their sources' `join_hidden` so unqualified
 /// resolution and the bare `*` skip them. The caller splices the merged
@@ -1544,16 +1581,16 @@ fn merge_using_columns(
             JoinType::JoinFull => l_not_null && r_not_null,
             _ => l_not_null || r_not_null || eq_strict,
         };
+        let typmod = if l.typmod == r.typmod { l.typmod } else { None };
+        let (collation, no_collation) =
+            merged_column_collation(&l, &r, type_oid, typmod, join_type, snapshot);
         merged.push(ScopeColumn {
             name: name.clone(),
             type_oid,
             base_not_null,
-            typmod: if l.typmod == r.typmod { l.typmod } else { None },
-            collation: if l.collation == r.collation {
-                l.collation
-            } else {
-                None
-            },
+            typmod,
+            collation,
+            no_collation,
             // Set by the caller once the source's alias is known.
             table_alias: String::new(),
             record_fields: None,
@@ -2109,6 +2146,7 @@ fn function_rte_columns(
                 },
                 typmod: None,
                 collation: None,
+                no_collation: false,
                 table_alias: alias.to_owned(),
                 record_fields: None,
                 elem_nullable: None,
@@ -2171,6 +2209,7 @@ fn function_rte_columns(
         table_alias: alias.to_owned(),
         typmod: None,
         collation: None,
+        no_collation: false,
         record_fields: None,
         elem_nullable: None,
         // `generate_series` of finite bounds and step (see
@@ -2242,6 +2281,7 @@ fn expr_rte_columns(
         table_alias: alias.to_owned(),
         typmod: value.typmod,
         collation: value.collation,
+        no_collation: value.no_collation.is_some(),
         record_fields: None,
         elem_nullable: value.elem_nullable,
         refine: value.refine,
@@ -2312,6 +2352,7 @@ fn composite_rte_columns(
                 base_not_null: false,
                 typmod: snapshot.effective_typmod(f.atttypid, f.atttypmod),
                 collation: f.attcollation,
+                no_collation: false,
                 table_alias: alias.to_owned(),
                 record_fields: None,
                 elem_nullable: None,
@@ -2447,6 +2488,7 @@ fn coldeflist_columns(
             base_not_null: false,
             typmod: snapshot.effective_typmod(type_oid, typmod),
             collation: None,
+            no_collation: false,
             table_alias: alias.to_owned(),
             record_fields: None,
             elem_nullable: None,
@@ -2813,6 +2855,7 @@ fn json_table_columns(
             base_not_null: top_level && kind == Kind::JtcForOrdinality,
             typmod: snapshot.effective_typmod(type_oid, typmod),
             collation: None,
+            no_collation: false,
             table_alias: alias.to_owned(),
             record_fields: None,
             elem_nullable: None,

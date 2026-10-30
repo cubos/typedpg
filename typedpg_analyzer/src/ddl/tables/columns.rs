@@ -441,6 +441,7 @@ pub(crate) fn parse_column_def(
             None
         },
         compression: (!cd.compression.is_empty()).then(|| cd.compression.clone()),
+        storage: None,
         identity_options,
         nn_local: not_null,
         nn_name,
