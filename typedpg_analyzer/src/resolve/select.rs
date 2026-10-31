@@ -430,25 +430,6 @@ fn analyze_select_here(
         })
         .collect();
 
-    // Process GROUP BY expressions — no type expectation, but we still need
-    // to walk them so any parameters referenced are collected and typed
-    // and column refs validated. `GroupingSet` nodes (`GROUPING SETS` /
-    // `ROLLUP` / `CUBE`) are not real expressions; recurse into their
-    // `content` to reach the underlying column references and
-    // aggregate-rejection checks.
-    grouping::with_clause(Some("GROUP BY"), || {
-        for group_node in &sel.group_clause {
-            walk_group_clause_node(
-                group_node,
-                expr::Ctx::new(&scope, &null_ctx, snapshot),
-                params,
-                &select_aliases,
-                &targets,
-            )?;
-        }
-        Ok::<(), AnalyzeError>(())
-    })?;
-
     // Process HAVING clause — same boolean goal as WHERE, but aggregates
     // are of course allowed there.
     if let Some(having) = &sel.having_clause {
@@ -502,6 +483,9 @@ fn analyze_select_here(
                 )
                 .finalize_implicit());
             }
+            if let ExpandedTarget::Expr(rt) = targets[ord as usize - 1] {
+                resolve_unknown_target(rt, snapshot, params)?;
+            }
             continue;
         }
         if let Err(e) = expr::infer_expr(
@@ -512,6 +496,12 @@ fn analyze_select_here(
         ) && !is_select_alias_reference(inner, &select_aliases, &e)
         {
             return Err(e);
+        }
+        // addTargetToSortList resolves the key's entry still `unknown` as
+        // text, before the next key is transformed.
+        match aliased_target(inner, &targets) {
+            Some(rt) => resolve_unknown_target(rt, snapshot, params)?,
+            None => expr::resolve_unknown_key(inner, snapshot, params)?,
         }
         if plain_distinct
             && !sort_expr_in_select_list(inner, &sel.target_list, &select_aliases, &scope, snapshot)
@@ -524,11 +514,37 @@ fn analyze_select_here(
         }
     }
 
+    // Process GROUP BY expressions — after ORDER BY, as transformSelectStmt
+    // does (the first clause to type a `$N` fixes its type) — no type
+    // expectation, but we still need
+    // to walk them so any parameters referenced are collected and typed
+    // and column refs validated. `GroupingSet` nodes (`GROUPING SETS` /
+    // `ROLLUP` / `CUBE`) are not real expressions; recurse into their
+    // `content` to reach the underlying column references and
+    // aggregate-rejection checks.
+    grouping::with_clause(Some("GROUP BY"), || {
+        for group_node in &sel.group_clause {
+            walk_group_clause_node(
+                group_node,
+                expr::Ctx::new(&scope, &null_ctx, snapshot),
+                params,
+                &select_aliases,
+                &targets,
+            )?;
+        }
+        Ok::<(), AnalyzeError>(())
+    })?;
+
     // Process `DISTINCT ON (…)` expressions the same way — they resolve
     // like ORDER BY items (select-list aliases allowed). A plain `DISTINCT`
     // parses as a single empty node; skip it. Without this walk, a `$N`
     // referenced only inside DISTINCT ON was never registered with the
     // collector and analysis died on the param-count invariant.
+    // transformDistinctOnClause transforms every key, then resolves those
+    // still `unknown` as text (addTargetToGroupList): `unknown_keys` are
+    // the select-list entries keys name, and the bare `$N` keys transformed
+    // untyped.
+    let mut unknown_keys: Vec<Result<&protobuf::ResTarget, &protobuf::ParamRef>> = Vec::new();
     for distinct_node in &sel.distinct_clause {
         if let Some(ord) = sql92_position(distinct_node, "DISTINCT ON")? {
             if ord < 1 || ord as usize > n_targets {
@@ -540,7 +556,18 @@ fn analyze_select_here(
                 )
                 .finalize_implicit());
             }
+            if let ExpandedTarget::Expr(rt) = targets[ord as usize - 1] {
+                unknown_keys.push(Ok(rt));
+            }
             continue;
+        }
+        if let Some(rt) = aliased_target(distinct_node, &targets) {
+            unknown_keys.push(Ok(rt));
+        } else if let Some(p) = expr::bare_param(distinct_node, snapshot)
+            && params.bound_arg(p.number).is_none()
+            && params.get(p.number) == oid::UNKNOWN
+        {
+            unknown_keys.push(Err(p));
         }
         if distinct_node.node.is_some()
             && let Err(e) = expr::infer_expr(
@@ -554,11 +581,17 @@ fn analyze_select_here(
             return Err(e);
         }
     }
+    for key in unknown_keys {
+        match key {
+            Ok(rt) => resolve_unknown_target(rt, snapshot, params)?,
+            Err(p) => expr::coerce_untyped_param(p, oid::TEXT, snapshot, params)?,
+        }
+    }
 
     // Named-window references: `OVER w` (and `OVER (w …)` inheritance) must
     // name a window defined in this SELECT's WINDOW clause — PG (42704):
     // `window "w" does not exist`. Window calls only appear in the target
-    // list and ORDER BY.
+    // list, ORDER BY and DISTINCT ON.
     let defined_windows: std::collections::HashSet<&str> = sel
         .window_clause
         .iter()
@@ -581,18 +614,30 @@ fn analyze_select_here(
             check_window_refs(inner, &defined_windows)?;
         }
     }
+    for distinct_node in &sel.distinct_clause {
+        check_window_refs(distinct_node, &defined_windows)?;
+    }
     // The WINDOW clause's own definitions, and the inline windows that
     // inherit from them (PG's transformWindowDefinitions).
+    // PG transforms OFFSET / LIMIT before the WINDOW clause.
+    analyze_limit_offset(sel, expr::Ctx::new(&scope, &null_ctx, snapshot), params)?;
     expr::check_window_clause(sel, expr::Ctx::new(&scope, &null_ctx, snapshot), params)?;
 
-    analyze_limit_offset(sel, expr::Ctx::new(&scope, &null_ctx, snapshot), params)?;
-
-    // Resolve target list (SELECT expressions) — no type expectation.
-    let (mut columns, explicit_collations) = resolve_target_list_explicit(
-        &sel.target_list,
-        expr::Ctx::new(&scope, &null_ctx, snapshot),
-        params,
-    )?;
+    // Resolve target list (SELECT expressions) — no type expectation. The
+    // replay after FROM analyzed its subqueries in full, except under a
+    // `(…).*`, which it leaves to this pass.
+    let mut resolve_targets = || {
+        resolve_target_list_explicit(
+            &sel.target_list,
+            expr::Ctx::new(&scope, &null_ctx, snapshot),
+            params,
+        )
+    };
+    let (mut columns, explicit_collations) = if star_over_expression(&sel.target_list) {
+        resolve_targets()
+    } else {
+        expr::with_targets_replayed(resolve_targets)
+    }?;
     // An entry that is a grouping item of its own some grouping set omits
     // is NULL in that set's rows, whatever the item its key reads (unless
     // an alias' annotation settles it).
@@ -708,6 +753,21 @@ fn analyze_select_here(
         snapshot,
     ));
     Ok((columns, None))
+}
+
+/// Whether a target list holds a `(expr).*`.
+fn star_over_expression(target_list: &[protobuf::Node]) -> bool {
+    target_list.iter().any(|t| {
+        matches!(
+            t.node.as_ref(),
+            Some(node::Node::ResTarget(rt))
+                if matches!(
+                    rt.val.as_deref().and_then(|v| v.node.as_ref()),
+                    Some(node::Node::AIndirection(i))
+                        if i.indirection.iter().any(|f| matches!(f.node.as_ref(), Some(node::Node::AStar(_))))
+                )
+        )
+    })
 }
 
 /// Whether `sel` may be an aggregate query: HAVING, or a call that may be
@@ -1122,115 +1182,45 @@ fn values_sort_and_limit(
     Ok(scope.sources)
 }
 
-/// Recursively find window-function calls and verify that any *named*
-/// window they reference (`OVER w` sets `WindowDef.name`; `OVER (w …)`
-/// inheritance sets `refname`) is defined in the SELECT's WINDOW clause.
-/// SubLinks are skipped — their windows belong to the inner query.
+/// Find window calls (a function's or a JSON aggregate's) and verify that
+/// any *named* window they reference (`OVER w` sets `WindowDef.name`;
+/// `OVER (w …)` inheritance sets `refname`) is defined in the SELECT's
+/// WINDOW clause. SubLinks are skipped — their windows belong to the inner
+/// query.
 fn check_window_refs(
     node: &protobuf::Node,
     defined: &std::collections::HashSet<&str>,
 ) -> Result<(), AnalyzeError> {
-    let Some(inner) = node.node.as_ref() else {
-        return Ok(());
-    };
-    let check_name = |name: &str, location: i32| -> Result<(), AnalyzeError> {
-        if !name.is_empty() && !defined.contains(name) {
-            // PG positions it at the window's name.
-            let span = crate::error::SourceSpan::from_node_qname(location);
-            return Err(crate::pgmsg::window_does_not_exist(name, span).finalize_implicit());
+    let mut missing: Option<(&str, i32)> = None;
+    visit_same_level(node, &mut |n| {
+        let over = match n.node.as_ref() {
+            Some(node::Node::FuncCall(fc)) => fc.over.as_deref(),
+            Some(node::Node::JsonObjectAgg(a)) => {
+                a.constructor.as_deref().and_then(|c| c.over.as_deref())
+            }
+            Some(node::Node::JsonArrayAgg(a)) => {
+                a.constructor.as_deref().and_then(|c| c.over.as_deref())
+            }
+            _ => None,
+        };
+        if missing.is_none()
+            && let Some(over) = over
+            && let Some(name) = [over.name.as_str(), over.refname.as_str()]
+                .into_iter()
+                .find(|name| !name.is_empty() && !defined.contains(name))
+        {
+            missing = Some((name, over.location));
         }
-        Ok(())
-    };
-    match inner {
-        node::Node::FuncCall(fc) => {
-            if let Some(over) = &fc.over {
-                check_name(&over.name, over.location)?;
-                check_name(&over.refname, over.location)?;
-            }
-            for arg in &fc.args {
-                check_window_refs(arg, defined)?;
-            }
-            if let Some(f) = &fc.agg_filter {
-                check_window_refs(f, defined)?;
-            }
-        }
-        node::Node::AExpr(e) => {
-            if let Some(l) = &e.lexpr {
-                check_window_refs(l, defined)?;
-            }
-            if let Some(r) = &e.rexpr {
-                check_window_refs(r, defined)?;
-            }
-        }
-        node::Node::BoolExpr(b) => {
-            for a in &b.args {
-                check_window_refs(a, defined)?;
-            }
-        }
-        node::Node::TypeCast(c) => {
-            if let Some(a) = &c.arg {
-                check_window_refs(a, defined)?;
-            }
-        }
-        node::Node::NamedArgExpr(na) => {
-            if let Some(a) = &na.arg {
-                check_window_refs(a, defined)?;
-            }
-        }
-        node::Node::CaseExpr(c) => {
-            for w in &c.args {
-                check_window_refs(w, defined)?;
-            }
-            if let Some(d) = &c.defresult {
-                check_window_refs(d, defined)?;
-            }
-        }
-        node::Node::CaseWhen(w) => {
-            if let Some(e) = &w.expr {
-                check_window_refs(e, defined)?;
-            }
-            if let Some(r) = &w.result {
-                check_window_refs(r, defined)?;
-            }
-        }
-        node::Node::CoalesceExpr(c) => {
-            for a in &c.args {
-                check_window_refs(a, defined)?;
-            }
-        }
-        node::Node::MinMaxExpr(m) => {
-            for a in &m.args {
-                check_window_refs(a, defined)?;
-            }
-        }
-        node::Node::NullTest(t) => {
-            if let Some(a) = &t.arg {
-                check_window_refs(a, defined)?;
-            }
-        }
-        node::Node::BooleanTest(t) => {
-            if let Some(a) = &t.arg {
-                check_window_refs(a, defined)?;
-            }
-        }
-        node::Node::AArrayExpr(a) => {
-            for e in &a.elements {
-                check_window_refs(e, defined)?;
-            }
-        }
-        node::Node::RowExpr(r) => {
-            for a in &r.args {
-                check_window_refs(a, defined)?;
-            }
-        }
-        node::Node::List(l) => {
-            for i in &l.items {
-                check_window_refs(i, defined)?;
-            }
-        }
-        _ => {}
+    });
+    match missing {
+        // PG positions it at the window's name.
+        Some((name, location)) => Err(crate::pgmsg::window_does_not_exist(
+            name,
+            crate::error::SourceSpan::from_node_qname(location),
+        )
+        .finalize_implicit()),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// findTargetlistEntrySQL92's constant rule for an ORDER BY / GROUP BY /
@@ -1374,7 +1364,10 @@ fn walk_group_clause_node(
         // checkTargetlistEntrySQL92: the referenced target must not
         // contain aggregates (GROUPING included).
         return match targets[ord as usize - 1] {
-            ExpandedTarget::Expr(rt) => check_group_target_has_no_aggregates(Some(rt), snapshot),
+            ExpandedTarget::Expr(rt) => {
+                check_group_target_has_no_aggregates(Some(rt), snapshot)?;
+                resolve_unknown_target(rt, snapshot, params)
+            }
             ExpandedTarget::StarColumn { .. } => Ok(()),
         };
     }
@@ -1415,7 +1408,11 @@ fn walk_group_clause_node(
             ExpandedTarget::Expr(rt) if alias.first() == Some(&target_resname(rt)) => Some(*rt),
             _ => None,
         });
-        return check_group_target_has_no_aggregates(target, snapshot);
+        check_group_target_has_no_aggregates(target, snapshot)?;
+        return match target {
+            Some(rt) => resolve_unknown_target(rt, snapshot, params),
+            None => Ok(()),
+        };
     }
     crate::clause::check_level_calls(
         group_node,
@@ -1423,7 +1420,53 @@ fn walk_group_clause_node(
         "GROUP BY",
         true,
     )?;
-    Ok(())
+    // addTargetToGroupList resolves the key still `unknown` as text,
+    // before the next key is transformed.
+    expr::resolve_unknown_key(group_node, snapshot, params)
+}
+
+/// The select-list entry an ORDER BY or DISTINCT ON key names by its
+/// output name — a bare name, which findTargetlistEntrySQL92 matches
+/// against the output names before the input columns.
+fn aliased_target<'a>(
+    key: &protobuf::Node,
+    targets: &[ExpandedTarget<'a>],
+) -> Option<&'a protobuf::ResTarget> {
+    let Some(node::Node::ColumnRef(cr)) = key.node.as_ref() else {
+        return None;
+    };
+    let [field] = cr.fields.as_slice() else {
+        return None;
+    };
+    let Some(node::Node::String(name)) = field.node.as_ref() else {
+        return None;
+    };
+    targets.iter().find_map(|t| match t {
+        ExpandedTarget::Expr(rt) if rt.name == name.sval => Some(*rt),
+        _ => None,
+    })
+}
+
+/// addTargetToSortList / addTargetToGroupList on a key naming a
+/// select-list entry (by ordinal or output name): an entry that is a bare
+/// `$N` the select list transformed untyped is still `unknown`, and is
+/// resolved as text right there — `inconsistent types deduced` if a
+/// clause transformed meanwhile (WHERE, HAVING) typed `$N` otherwise.
+fn resolve_unknown_target(
+    rt: &protobuf::ResTarget,
+    snapshot: &crate::pg_catalog::PgCatalog,
+    params: &mut ParamCollector,
+) -> Result<(), AnalyzeError> {
+    match rt
+        .val
+        .as_deref()
+        .and_then(|v| expr::bare_param(v, snapshot))
+    {
+        Some(p) if params.is_untyped_output(p.location) => {
+            expr::coerce_untyped_param(p, oid::TEXT, snapshot, params)
+        }
+        _ => Ok(()),
+    }
 }
 
 /// PG's checkTargetlistEntrySQL92 for GROUP BY: a projection entry referenced
@@ -1693,13 +1736,14 @@ pub(crate) fn analyze_limit_offset(
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<(), AnalyzeError> {
+    // transformSelectStmt: OFFSET first.
     for (limit_node, kind, label) in [
-        (&sel.limit_count, crate::clause::ClauseKind::Limit, "LIMIT"),
         (
             &sel.limit_offset,
             crate::clause::ClauseKind::Offset,
             "OFFSET",
         ),
+        (&sel.limit_count, crate::clause::ClauseKind::Limit, "LIMIT"),
     ] {
         let Some(limit_node) = limit_node else {
             continue;

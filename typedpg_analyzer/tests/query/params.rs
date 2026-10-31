@@ -806,6 +806,88 @@ fn param_as_element_in_any_lhs() {
     assert_params(&info, vec![p(text())]);
 }
 
+#[test]
+fn any_of_a_param_against_an_unknown_is_an_array() {
+    // `1 = ANY($1)` gets int4[]; with an unknown or a parameter on the
+    // left, PG still deduces text[] for the array operand: the unknown
+    // resolves to text, and the right side is the array of that.
+    let db = empty_db();
+    assert_param_types(&db, "SELECT 'a' = ANY($1)", &[array_of(text())]);
+    assert_param_types(&db, "SELECT $1 = ANY($2)", &[text(), array_of(text())]);
+    assert_param_types(&db, "SELECT $1 = ALL($2)", &[text(), array_of(text())]);
+    assert_param_types(&db, "SELECT 1 = ANY($1)", &[array_of(int4())]);
+    assert_param_types(&db, "SELECT 'a' < ANY($1)", &[array_of(text())]);
+    assert_param_types(&db, "SELECT 'a' <> ALL($1)", &[array_of(text())]);
+    // The array is of the operator's declared right type: varchar has no
+    // `=` of its own, `text = text` is chosen.
+    assert_param_types(&db, "SELECT 'a'::varchar = ANY($1)", &[array_of(text())]);
+    assert_param_types(&db, "SELECT $1 = ANY('{a}'::varchar[])", &[text()]);
+    assert_param_types(&db, "SELECT 1::int8 = ANY($1)", &[array_of(int8())]);
+    for (sql, msg) in [
+        (
+            "SELECT $1 = ANY($1)",
+            "inconsistent types deduced for parameter $1",
+        ),
+        (
+            "SELECT $1 + ANY($2)",
+            "operator is not unique: unknown + unknown",
+        ),
+        (
+            "SELECT 1 || ANY($1)",
+            "op ANY/ALL (array) requires operator to yield boolean",
+        ),
+        (
+            "SELECT '{}'::jsonb ~~ ANY($1)",
+            "operator does not exist: jsonb ~~ unknown",
+        ),
+        (
+            "SELECT 1 = ANY('{a}')",
+            "invalid input syntax for type integer: \"a\"",
+        ),
+    ] {
+        let err = db.analyze(sql).unwrap_err();
+        assert!(err.to_string().starts_with(msg), "`{sql}`: got: {err}");
+    }
+}
+
+#[test]
+fn any_of_a_row_types_a_record_array() {
+    // `ROW(…) = ANY($1)`: the operator is `record = record`, and `$1` its
+    // array, `record[]` — an array type like any other (PG's Describe).
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE a (id int PRIMARY KEY, x int NOT NULL, y text);")
+        .unwrap();
+    for sql in [
+        "SELECT ROW(1, 2) = ANY($1)",
+        "SELECT (x, y) = ANY($1) FROM a",
+        "SELECT (x, y) = ALL($1) FROM a",
+    ] {
+        assert_param_types(&db, sql, &[array_of(basic("pg_catalog", "record"))]);
+    }
+    assert_param_types(
+        &db,
+        "SELECT $1 = ANY(ARRAY[ROW(1, 2)])",
+        &[basic("pg_catalog", "record")],
+    );
+}
+
+#[test]
+fn any_over_a_domain_array_names_the_base_type() {
+    // A domain over int[] is an array only through its base: PG looks up
+    // the array of the base type for the parameter and reports `integer[]`.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE DOMAIN da AS int[]; CREATE TABLE t (c da);")
+        .unwrap();
+    let err = db.analyze("SELECT * FROM t WHERE c = ANY($1)").unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("could not find array type for data type integer[]"),
+        "got: {err}"
+    );
+    // The array itself is a fine ANY operand.
+    db.analyze("SELECT * FROM t WHERE 1 = ANY(c)").unwrap();
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Tests: mixed param types across the query (migrated from identical/nullability)
 // ──────────────────────────────────────────────────────────────────────────────
@@ -957,6 +1039,671 @@ fn bare_param_in_null_test_is_indeterminate() {
     );
     // …but a use typed *before* the null test is fine.
     db.analyze("SELECT $p1 = 1, $p1 IS NULL").unwrap();
+}
+
+#[test]
+fn inconsistent_parameter_types_are_rejected() {
+    // Every `$1` transformed while its type is still unknown stays an
+    // unknown node; coercing two of them to different types fails PG's
+    // `variable_coerce_param_hook` (42P08).
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE a (id int PRIMARY KEY, x int NOT NULL DEFAULT 0, y text, d date);")
+        .unwrap();
+    for sql in [
+        "INSERT INTO a (id, y) VALUES ($1, $1)",
+        "UPDATE a SET x = $1, y = $1",
+        "UPDATE a SET (x, y) = ($1, $1)",
+        "SELECT ($1, $2) = (1, $1)",
+        "UPDATE a SET y = $1, d = $1",
+        "UPDATE a SET y = $1, x = $1::int",
+        "SELECT ($1, $2) IS DISTINCT FROM (1, $1)",
+        "INSERT INTO a (id, y) VALUES ($1, $1 || 'a')",
+        "DELETE FROM a RETURNING $1, $1::int",
+        "UPDATE a SET y = $1 RETURNING $1, $1::int",
+        "MERGE INTO a USING (SELECT 1 AS k) s ON a.id = s.k \
+         WHEN NOT MATCHED THEN INSERT (id, y) VALUES ($1, $1)",
+        "MERGE INTO a USING (SELECT 1 AS k) s ON a.id = s.k \
+         WHEN NOT MATCHED THEN INSERT VALUES ($1, 1, $1)",
+        "MERGE INTO a USING (SELECT 1 AS k) s ON a.id = s.k \
+         WHEN MATCHED THEN UPDATE SET y = $1 RETURNING $1, $1::int",
+    ] {
+        let err = db.analyze(sql).unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("inconsistent types deduced for parameter $1"),
+            "`{sql}`: got: {err}"
+        );
+    }
+    // Once the type is set, a later `$1` is a typed parameter that casts or
+    // coerces like any other expression.
+    assert_param_types(&db, "INSERT INTO a (id, x) VALUES ($1, $1)", &[int4()]);
+    assert_param_types(&db, "SELECT $1::int, $1::text", &[int4()]);
+    assert_param_types(&db, "SELECT $1::varchar, $1::text", &[varchar()]);
+    assert_param_types(&db, "UPDATE a SET x = $1 WHERE id = $1", &[int4()]);
+    assert_param_types(&db, "INSERT INTO a (id, y) VALUES ($1::int, $1)", &[int4()]);
+    assert_param_types(
+        &db,
+        "INSERT INTO a (id, x) VALUES (1, $1), (2, $1)",
+        &[int4()],
+    );
+    assert_param_types(&db, "SELECT ($1, 1) = ($1, 2)", &[text()]);
+    assert_param_types(
+        &db,
+        "INSERT INTO a (id, y) VALUES ($1, 'a') ON CONFLICT (id) DO UPDATE SET y = $1, x = $1",
+        &[int4()],
+    );
+}
+
+#[test]
+fn parameter_types_follow_pg_clause_order() {
+    // PG transforms a SELECT's target list before WHERE / HAVING / ORDER
+    // BY / LIMIT, and an UPDATE's FROM, WHERE and RETURNING before its SET:
+    // the first clause to type `$1` wins.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE a (id int PRIMARY KEY, x int NOT NULL DEFAULT 0, y text);")
+        .unwrap();
+    for sql in [
+        "SELECT $1::int FROM a WHERE y = $1",
+        "SELECT $1 + 1 FROM a WHERE y = $1",
+        "SELECT $1::int FROM a ORDER BY y = $1",
+        "SELECT $1::int FROM a GROUP BY y HAVING y = $1",
+        "SELECT (SELECT $1::int) FROM a WHERE y = $1",
+        // A subquery's select list is transformed before its own WHERE,
+        // at any depth.
+        "SELECT (SELECT (SELECT $1::int) FROM a WHERE y = $1)",
+        "SELECT (SELECT (SELECT $1::int) FROM a ORDER BY y = $1 LIMIT 1)",
+        "SELECT (SELECT (SELECT (SELECT $1::int)) FROM a WHERE y = $1)",
+        "SELECT (SELECT (SELECT $1::int)) FROM a WHERE y = $1",
+        "SELECT (SELECT (SELECT (SELECT $1::int))) FROM a WHERE y = $1",
+        "SELECT (SELECT (SELECT (SELECT (SELECT $1::int)))) FROM a WHERE y = $1",
+        "SELECT (SELECT (SELECT $1::int) + 1) FROM a WHERE y = $1",
+        "SELECT (SELECT (SELECT $1::int)), $2 FROM a WHERE y = $1",
+        "SELECT (SELECT (SELECT $1::int)) FROM a ORDER BY y = $1",
+        "SELECT (SELECT (SELECT $1::int)) FROM a GROUP BY y HAVING y = $1",
+        "SELECT ARRAY(SELECT (SELECT $1::int)) FROM a WHERE y = $1",
+        "SELECT EXISTS(SELECT (SELECT $1::int)) FROM a WHERE y = $1",
+        "SELECT (SELECT (SELECT $1::int) FROM a WHERE x = 1) FROM a WHERE y = $1",
+        "SELECT (SELECT max((SELECT $1::int))) FROM a WHERE y = $1",
+        "SELECT (SELECT (SELECT $1::int) FROM a WHERE y = $1) FROM a WHERE y = $1",
+        "SELECT 1 FROM a WHERE EXISTS (SELECT (SELECT $1::int) FROM a WHERE y = $1)",
+        "SELECT (SELECT ROW((SELECT $1::int), 1) FROM a WHERE y = $1).*",
+        "SELECT (SELECT a FROM a WHERE x = (SELECT (SELECT $1::int) FROM a WHERE y = $1)).*",
+        "SELECT count(*) FROM a GROUP BY y = $1 HAVING $1::int > 0",
+    ] {
+        let err = db.analyze(sql).unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("operator does not exist: text = integer"),
+            "`{sql}`: got: {err}"
+        );
+    }
+    assert_param_types(&db, "SELECT $1::int FROM a LIMIT $1", &[int4()]);
+    assert_param_types(
+        &db,
+        "SELECT (SELECT (SELECT $1) FROM a WHERE y = $1)",
+        &[text()],
+    );
+    let err = db
+        .analyze("SELECT (SELECT (SELECT $1)) FROM a WHERE x = $1")
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("operator does not exist: integer = text"),
+        "got: {err}"
+    );
+    assert_param_types(
+        &db,
+        "INSERT INTO a (id, x, y) SELECT 1, (SELECT (SELECT $1::int)), $1",
+        &[int4()],
+    );
+    assert_param_types(
+        &db,
+        "UPDATE a SET x = (SELECT (SELECT $1::int)) WHERE y = $1",
+        &[text()],
+    );
+    assert_param_types(&db, "SELECT y = $1 FROM a WHERE $1::int = 1", &[text()]);
+    assert_param_types(&db, "UPDATE a SET y = $1 RETURNING $1::int", &[int4()]);
+    assert_param_types(&db, "UPDATE a SET y = $1 WHERE x = $1", &[int4()]);
+    assert_param_types(&db, "UPDATE a SET y = $1 RETURNING $1 + 1", &[int4()]);
+    assert_param_types(
+        &db,
+        "UPDATE a SET y = $1 FROM a b WHERE b.x = $1",
+        &[int4()],
+    );
+    // INSERT transforms its VALUES before RETURNING.
+    assert_param_types(
+        &db,
+        "INSERT INTO a (id, y) VALUES (1, $1) RETURNING $1::int",
+        &[text()],
+    );
+    // OFFSET comes before LIMIT.
+    assert_param_types(&db, "SELECT 1 FROM a LIMIT $1::int OFFSET $1", &[int8()]);
+    assert_param_types(&db, "SELECT 1 FROM a LIMIT $1 OFFSET $1::int", &[int4()]);
+    let err = db
+        .analyze("SELECT 1 FROM a ORDER BY y = $1 OFFSET $1")
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("argument of OFFSET must be type bigint, not type text"),
+        "got: {err}"
+    );
+    // RETURNING resolves a bare `$1` as text before the SET list is coerced.
+    let err = db.analyze("UPDATE a SET x = $1 RETURNING $1").unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with(r#"column "x" is of type integer but expression is of type text"#),
+        "got: {err}"
+    );
+    assert_param_types(&db, "UPDATE a SET y = $1 RETURNING $1", &[text()]);
+    // MERGE transforms RETURNING before its WHEN clauses.
+    let merge = "MERGE INTO a USING (SELECT 1 AS k) s ON a.id = s.k";
+    assert_param_types(
+        &db,
+        &format!("{merge} WHEN MATCHED THEN UPDATE SET y = $1 RETURNING $1::int"),
+        &[int4()],
+    );
+    assert_param_types(
+        &db,
+        &format!("{merge} WHEN NOT MATCHED THEN INSERT (id, y) VALUES (2, $1) RETURNING $1 + 1"),
+        &[int4()],
+    );
+    let err = db
+        .analyze(&format!(
+            "{merge} WHEN MATCHED THEN UPDATE SET x = $1 RETURNING $1"
+        ))
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with(r#"column "x" is of type integer but expression is of type text"#),
+        "got: {err}"
+    );
+    // A null test in the select list locks `$1` untyped before WHERE.
+    let err = db
+        .analyze("SELECT $1 IS NULL FROM a WHERE x = $1")
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("could not determine data type of parameter $1"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn unknown_only_branches_resolve_as_text_before_assignment() {
+    // A CASE / COALESCE / GREATEST / NULLIF whose inputs are all unknown
+    // (`$N`, NULL, a string literal) is resolved as text when transformed;
+    // the assignment to a column then coerces that text.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE a (id int PRIMARY KEY, x int NOT NULL, y text, v varchar(10), \
+         d date, j jsonb);",
+    )
+    .unwrap();
+    let merge = "MERGE INTO a USING (SELECT 1 AS k) s ON a.id = s.k";
+    for (sql, message) in [
+        (
+            "INSERT INTO a (id) VALUES (COALESCE($1, NULL))".to_owned(),
+            r#"column "id" is of type integer but expression is of type text"#,
+        ),
+        (
+            "INSERT INTO a (id) VALUES (COALESCE($1, $1))".to_owned(),
+            r#"column "id" is of type integer but expression is of type text"#,
+        ),
+        (
+            "INSERT INTO a (id) VALUES (CASE WHEN true THEN $1 ELSE NULL END)".to_owned(),
+            r#"column "id" is of type integer but expression is of type text"#,
+        ),
+        (
+            "INSERT INTO a (id) VALUES (CASE WHEN true THEN '1' END)".to_owned(),
+            r#"column "id" is of type integer but expression is of type text"#,
+        ),
+        (
+            "INSERT INTO a (id) VALUES (COALESCE(NULL, NULL))".to_owned(),
+            r#"column "id" is of type integer but expression is of type text"#,
+        ),
+        (
+            "INSERT INTO a (id, x) VALUES (1, COALESCE($1, $2))".to_owned(),
+            r#"column "x" is of type integer but expression is of type text"#,
+        ),
+        (
+            "INSERT INTO a (id, x) VALUES (1, GREATEST($1, NULL))".to_owned(),
+            r#"column "x" is of type integer but expression is of type text"#,
+        ),
+        (
+            "INSERT INTO a (id, x) VALUES (1, NULLIF($1, $2))".to_owned(),
+            r#"column "x" is of type integer but expression is of type text"#,
+        ),
+        (
+            "INSERT INTO a (id, x, d) VALUES (1, 1, CASE WHEN $2 THEN $1 END)".to_owned(),
+            r#"column "d" is of type date but expression is of type text"#,
+        ),
+        (
+            "INSERT INTO a (id, x, j) VALUES (1, 1, COALESCE($1, NULL))".to_owned(),
+            r#"column "j" is of type jsonb but expression is of type text"#,
+        ),
+        (
+            "INSERT INTO a (id, x) VALUES (1, 1), (2, COALESCE($1, NULL))".to_owned(),
+            r#"column "x" is of type integer but expression is of type text"#,
+        ),
+        (
+            "INSERT INTO a (id, x) SELECT 1, COALESCE($1, NULL)".to_owned(),
+            r#"column "x" is of type integer but expression is of type text"#,
+        ),
+        (
+            "INSERT INTO a (id, x) VALUES (1, 1) ON CONFLICT (id) \
+             DO UPDATE SET x = COALESCE($1, NULL)"
+                .to_owned(),
+            r#"column "x" is of type integer but expression is of type text"#,
+        ),
+        (
+            "UPDATE a SET x = CASE WHEN true THEN $1 END".to_owned(),
+            r#"column "x" is of type integer but expression is of type text"#,
+        ),
+        (
+            "UPDATE a SET (x, y) = (COALESCE($1, NULL), $2)".to_owned(),
+            r#"column "x" is of type integer but expression is of type text"#,
+        ),
+        (
+            format!("{merge} WHEN MATCHED THEN UPDATE SET x = COALESCE($1, NULL)"),
+            r#"column "x" is of type integer but expression is of type text"#,
+        ),
+        (
+            format!("{merge} WHEN NOT MATCHED THEN INSERT (id, x) VALUES (1, COALESCE($1, NULL))"),
+            r#"column "x" is of type integer but expression is of type text"#,
+        ),
+        (
+            "INSERT INTO a (id, x) VALUES (1, ARRAY[COALESCE($1, NULL)])".to_owned(),
+            r#"column "x" is of type integer but expression is of type text[]"#,
+        ),
+        (
+            "INSERT INTO a (id, x) VALUES (1, COALESCE($1, NULL) + 1)".to_owned(),
+            "operator does not exist: text + integer",
+        ),
+    ] {
+        let err = db.analyze(&sql).unwrap_err();
+        assert!(err.to_string().starts_with(message), "`{sql}`: got: {err}");
+    }
+    // A text-like column takes the text; a bare `$1` is typed by its column.
+    assert_param_types(
+        &db,
+        "INSERT INTO a (id, x, y) VALUES (1, 1, COALESCE($1, NULL))",
+        &[text()],
+    );
+    assert_param_types(
+        &db,
+        "INSERT INTO a (id, x, v) VALUES (1, 1, COALESCE($1, NULL))",
+        &[text()],
+    );
+    assert_param_types(
+        &db,
+        "INSERT INTO a (id, x) VALUES (1, COALESCE($1, NULL)::int)",
+        &[text()],
+    );
+    assert_param_types(&db, "INSERT INTO a (id, x) VALUES (1, ($1))", &[int4()]);
+}
+
+#[test]
+fn multiple_assignment_from_a_subquery_follows_pg_order() {
+    // `SET (a, b) = (SELECT …)`: the sub-SELECT's untyped outputs resolve
+    // as text, at its place in the SET list — after the values before it
+    // were transformed (a bare `$1` among them still an untyped node,
+    // coerced to its column only once the whole list is transformed), and
+    // after FROM / WHERE / RETURNING.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE a (id int PRIMARY KEY, x int NOT NULL, y text, v varchar(10), d date);",
+    )
+    .unwrap();
+    let merge = "MERGE INTO a USING (SELECT 1 AS k) s ON a.id = s.k";
+    let upsert = "INSERT INTO a (id, x) VALUES (1, 1) ON CONFLICT (id) DO UPDATE";
+    for (sql, message) in [
+        (
+            "UPDATE a SET (x, y) = (SELECT $1, $1)".to_owned(),
+            r#"column "x" is of type integer but expression is of type text"#,
+        ),
+        (
+            "UPDATE a SET (y, x) = (SELECT $1, $1)".to_owned(),
+            r#"column "x" is of type integer but expression is of type text"#,
+        ),
+        (
+            "UPDATE a SET (x, y) = (SELECT $1, $2)".to_owned(),
+            r#"column "x" is of type integer but expression is of type text"#,
+        ),
+        (
+            "UPDATE a SET (y, d) = (SELECT $1, $2)".to_owned(),
+            r#"column "d" is of type date but expression is of type text"#,
+        ),
+        (
+            "UPDATE a SET (x, y) = (SELECT $1, $1) RETURNING $1".to_owned(),
+            r#"column "x" is of type integer but expression is of type text"#,
+        ),
+        (
+            "UPDATE a SET y = $1, (x, v) = (SELECT $1, $1)".to_owned(),
+            r#"column "x" is of type integer but expression is of type text"#,
+        ),
+        (
+            "UPDATE a SET (y, v) = (SELECT $1, $1), x = $1".to_owned(),
+            r#"column "x" is of type integer but expression is of type text"#,
+        ),
+        (
+            "UPDATE a SET (x, y) = (SELECT 1, 'a'), (v, d) = (SELECT $1, $1)".to_owned(),
+            r#"column "d" is of type date but expression is of type text"#,
+        ),
+        (
+            "UPDATE a SET (x, y) = (VALUES ($1, $1))".to_owned(),
+            r#"column "x" is of type integer but expression is of type text"#,
+        ),
+        (
+            format!("{upsert} SET (x, y) = (SELECT $1, $1)"),
+            r#"column "x" is of type integer but expression is of type text"#,
+        ),
+        (
+            format!("{merge} WHEN MATCHED THEN UPDATE SET (x, y) = (SELECT $1, $1)"),
+            r#"column "x" is of type integer but expression is of type text"#,
+        ),
+        // A bare `$1` before the sub-SELECT is still untyped when it types
+        // `$1` text.
+        (
+            "UPDATE a SET x = $1, (y, v) = (SELECT $1, $1)".to_owned(),
+            "inconsistent types deduced for parameter $1",
+        ),
+        (
+            format!("{upsert} SET x = $1, (y, v) = (SELECT $1, $1)"),
+            "inconsistent types deduced for parameter $1",
+        ),
+        (
+            format!("{merge} WHEN MATCHED THEN UPDATE SET x = $1, (y, v) = (SELECT $1, $1)"),
+            "inconsistent types deduced for parameter $1",
+        ),
+        (
+            "UPDATE a SET (x, y) = (SELECT $1, $2 FROM a b WHERE b.x = $1)".to_owned(),
+            "inconsistent types deduced for parameter $1",
+        ),
+        (
+            "UPDATE a SET (x, y) = (SELECT $1, $1 UNION SELECT 1, 'a')".to_owned(),
+            "inconsistent types deduced for parameter $1",
+        ),
+        (
+            "UPDATE a SET (x, y) = ROW($1, $1)".to_owned(),
+            "inconsistent types deduced for parameter $1",
+        ),
+    ] {
+        let err = db.analyze(&sql).unwrap_err();
+        assert!(err.to_string().starts_with(message), "`{sql}`: got: {err}");
+    }
+    for (sql, expected) in [
+        ("UPDATE a SET (y, v) = (SELECT $1, $1)".to_owned(), text()),
+        (
+            "UPDATE a SET (x, y) = (SELECT $1, $1) WHERE x = $1".to_owned(),
+            int4(),
+        ),
+        (
+            "UPDATE a SET (y, v) = (SELECT $1, $1) WHERE x = $1".to_owned(),
+            int4(),
+        ),
+        (
+            "UPDATE a SET (x, y) = (SELECT $1::int, $1)".to_owned(),
+            int4(),
+        ),
+        (
+            "UPDATE a SET (x, y) = (SELECT $1 + 1, $1)".to_owned(),
+            int4(),
+        ),
+        (
+            "UPDATE a SET (y, v) = (SELECT $1, $1) RETURNING $1".to_owned(),
+            text(),
+        ),
+        (
+            "UPDATE a SET (y, v) = (SELECT $1, $1) RETURNING $1 + 1".to_owned(),
+            int4(),
+        ),
+        (
+            "UPDATE a SET x = $1, (y, v) = (SELECT $1::int, $1)".to_owned(),
+            int4(),
+        ),
+        (
+            "UPDATE a SET y = $1 || 'a', (x, v) = (SELECT $1::int, $1)".to_owned(),
+            text(),
+        ),
+        (format!("{upsert} SET (y, v) = (SELECT $1, $1)"), text()),
+        (
+            format!("{merge} WHEN MATCHED THEN UPDATE SET (y, v) = (SELECT $1, $1)"),
+            text(),
+        ),
+    ] {
+        assert_param_types(&db, &sql, &[expected]);
+    }
+}
+
+#[test]
+fn unknown_sort_and_group_keys_resolve_as_text() {
+    // addTargetToSortList / addTargetToGroupList resolve a key still
+    // `unknown` — a bare `$1`, or a select-list `$1` named by ordinal or
+    // output name — as text right where the key is transformed, before
+    // any later key or clause.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE a (id int PRIMARY KEY, x int NOT NULL DEFAULT 0, y text);")
+        .unwrap();
+    for (sql, message) in [
+        (
+            "SELECT * FROM a ORDER BY $1, x = $1",
+            "operator does not exist: integer = text",
+        ),
+        (
+            "SELECT $1 FROM a ORDER BY 1, x = $1",
+            "operator does not exist: integer = text",
+        ),
+        (
+            "SELECT $1 AS p FROM a ORDER BY p, x = $1",
+            "operator does not exist: integer = text",
+        ),
+        (
+            "SELECT count(*) FROM a GROUP BY $1 LIMIT $1",
+            "argument of LIMIT must be type bigint, not type text",
+        ),
+        (
+            "SELECT count(*) FROM a GROUP BY ROLLUP ($1) LIMIT $1",
+            "argument of LIMIT must be type bigint, not type text",
+        ),
+        (
+            "SELECT DISTINCT ON ($1) x FROM a ORDER BY $1 LIMIT $1",
+            "argument of LIMIT must be type bigint, not type text",
+        ),
+        (
+            "SELECT DISTINCT ON (1) $1 FROM a LIMIT $1",
+            "argument of LIMIT must be type bigint, not type text",
+        ),
+        (
+            "SELECT x FROM a ORDER BY $1 OFFSET $1",
+            "argument of OFFSET must be type bigint, not type text",
+        ),
+        // DISTINCT ON transforms all its keys before resolving any.
+        (
+            "SELECT DISTINCT ON ($1, x = $1) x FROM a",
+            "inconsistent types deduced for parameter $1",
+        ),
+        // HAVING comes before GROUP BY, which then resolves the select
+        // list's still-unknown `$1`.
+        (
+            "SELECT $1 AS p FROM a GROUP BY p HAVING max(x) = $1",
+            "inconsistent types deduced for parameter $1",
+        ),
+        (
+            "SELECT $1 FROM a GROUP BY 1 HAVING max(x) = $1",
+            "inconsistent types deduced for parameter $1",
+        ),
+        // An aggregate's ORDER BY is resolved with the call.
+        (
+            "SELECT string_agg(y, ',' ORDER BY $1), $1 + 1 FROM a",
+            "operator does not exist: text + integer",
+        ),
+        // A window's ORDER BY comes before its PARTITION BY, and the WINDOW
+        // clause's windows in order.
+        (
+            "SELECT count(*) OVER w FROM a WINDOW w AS (PARTITION BY x = $1 ORDER BY $1)",
+            "operator does not exist: integer = text",
+        ),
+        (
+            "SELECT count(*) OVER w FROM a WINDOW w AS (PARTITION BY $1), w2 AS (ORDER BY x = $1)",
+            "operator does not exist: integer = text",
+        ),
+        // So does an inline window's, transformed with the WINDOW clause's
+        // after LIMIT — not with its call.
+        (
+            "SELECT count(*) OVER (PARTITION BY x = $1 ORDER BY $1) FROM a",
+            "operator does not exist: integer = text",
+        ),
+        (
+            "SELECT count(*) OVER (ORDER BY $1, x = $1) FROM a",
+            "operator does not exist: integer = text",
+        ),
+        (
+            "SELECT JSON_ARRAYAGG(x) OVER (PARTITION BY x = $1 ORDER BY $1) FROM a",
+            "operator does not exist: integer = text",
+        ),
+        (
+            "SELECT count(*) OVER (PARTITION BY x = $1) FROM a WHERE y = $1",
+            "operator does not exist: integer = text",
+        ),
+        (
+            "SELECT count(*) OVER (ORDER BY $1 + x), $1::text FROM a",
+            "operator does not exist: text + integer",
+        ),
+        // A JSON aggregate's ORDER BY is resolved with the call.
+        (
+            "SELECT JSON_ARRAYAGG(x ORDER BY $1), $1 + 1 FROM a",
+            "operator does not exist: text + integer",
+        ),
+        (
+            "SELECT JSON_ARRAYAGG(x ORDER BY $1, x = $1) FROM a",
+            "operator does not exist: integer = text",
+        ),
+    ] {
+        let err = db.analyze(sql).unwrap_err();
+        assert!(err.to_string().starts_with(message), "`{sql}`: got: {err}");
+    }
+    assert_param_types(&db, "SELECT x FROM a ORDER BY $1", &[text()]);
+    assert_param_types(&db, "SELECT x FROM a GROUP BY x, $1", &[text()]);
+    assert_param_types(&db, "SELECT x FROM a WHERE x = $1 ORDER BY $1", &[int4()]);
+    assert_param_types(
+        &db,
+        "SELECT * FROM a GROUP BY id, $1 HAVING x = $1",
+        &[int4()],
+    );
+    assert_param_types(
+        &db,
+        "SELECT x FROM a GROUP BY x, $1 ORDER BY x = $1",
+        &[int4()],
+    );
+    assert_param_types(&db, "SELECT $1 AS p FROM a ORDER BY p", &[text()]);
+    assert_param_types(&db, "SELECT $1::int AS p FROM a GROUP BY p", &[int4()]);
+    assert_param_types(&db, "SELECT array_agg(x ORDER BY $1), $1 FROM a", &[text()]);
+    // Inline windows are transformed after LIMIT.
+    assert_param_types(&db, "SELECT count(*) OVER (ORDER BY $1) FROM a", &[text()]);
+    assert_param_types(
+        &db,
+        "SELECT count(*) OVER (ORDER BY $1), $1 + 1 FROM a",
+        &[int4()],
+    );
+    assert_param_types(
+        &db,
+        "SELECT count(*) OVER (ORDER BY $1) FROM a LIMIT $1",
+        &[int8()],
+    );
+    assert_param_types(
+        &db,
+        "SELECT count(*) OVER (PARTITION BY $1 ORDER BY x = $1) FROM a",
+        &[int4()],
+    );
+    assert_param_types(
+        &db,
+        "SELECT $1, count(*) OVER (ORDER BY $1) FROM a",
+        &[text()],
+    );
+    // Wherever the call sits in the select list or ORDER BY.
+    for sql in [
+        "SELECT x FROM a ORDER BY count(*) OVER (ORDER BY $1), x = $1",
+        "SELECT coalesce(count(*) OVER (ORDER BY $1), 0), x = $1 FROM a",
+        "SELECT count(*) OVER (ORDER BY $1) IS NULL, x = $1 FROM a",
+        "SELECT (count(*) OVER (ORDER BY $1)) IN (SELECT $1::int) FROM a",
+        "SELECT ROW(count(*) OVER (PARTITION BY $1)), x = $1 FROM a",
+        "SELECT count(*) OVER (ORDER BY x ROWS $1 PRECEDING), $1::int FROM a",
+        "SELECT count(*) OVER (ORDER BY $1) FROM a ORDER BY x = $1",
+        "SELECT JSON_ARRAYAGG(x) OVER (ORDER BY $1), $1 + 1 FROM a",
+        "SELECT count(*) OVER w, sum(x) OVER (w ORDER BY $1) FROM a \
+         WINDOW w AS (PARTITION BY x = $1)",
+    ] {
+        assert_param_types(&db, sql, &[int4()]);
+    }
+    assert_param_types(
+        &db,
+        "SELECT count(*) OVER (ORDER BY x RANGE $1 PRECEDING) FROM a LIMIT $1",
+        &[int8()],
+    );
+    assert_param_types(
+        &db,
+        "SELECT count(*) OVER (ORDER BY sum(x) + $1) FROM a",
+        &[int8()],
+    );
+    assert_param_types(&db, "SELECT JSON_ARRAYAGG(x ORDER BY $1) FROM a", &[text()]);
+    // DISTINCT ON's windows come after ORDER BY's.
+    assert_param_types(
+        &db,
+        "SELECT DISTINCT ON (count(*) OVER (ORDER BY $1)) x FROM a",
+        &[text()],
+    );
+    assert_param_types(
+        &db,
+        "SELECT DISTINCT ON (count(*) OVER (ORDER BY $1)) x, $1 + 1 FROM a",
+        &[int4()],
+    );
+    assert_param_types(
+        &db,
+        "SELECT JSON_ARRAYAGG(x) OVER (w ORDER BY $1) FROM a WINDOW w AS (PARTITION BY x)",
+        &[text()],
+    );
+    // A named window must exist wherever its call is.
+    for sql in [
+        "SELECT DISTINCT ON (count(*) OVER w) x FROM a",
+        "SELECT ROW(count(*) OVER (w ORDER BY $1)) FROM a",
+        "SELECT ARRAY[count(*) OVER w] FROM a",
+        "SELECT (count(*) OVER w) IS DISTINCT FROM 1 FROM a",
+        "SELECT JSON_ARRAYAGG(x) OVER w FROM a",
+        "SELECT (count(*) OVER w)::text COLLATE \"C\" FROM a",
+    ] {
+        let err = db.analyze(sql).unwrap_err();
+        assert!(
+            err.to_string().starts_with(r#"window "w" does not exist"#),
+            "`{sql}`: got: {err}"
+        );
+    }
+}
+
+#[test]
+fn record_arguments_reject_unknown_literals() {
+    // A `record` parameter takes no unknown literal (`record_in` refuses an
+    // anonymous composite), but a `$n` there is typed `record`.
+    let db = empty_db();
+    for sql in ["SELECT row_to_json('1')", "SELECT hash_record('1')"] {
+        let err = db.analyze(sql).unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("input of anonymous composite types is not implemented"),
+            "`{sql}`: got: {err}"
+        );
+    }
+    assert_param_types(
+        &db,
+        "SELECT hash_record($1)",
+        &[basic("pg_catalog", "record")],
+    );
+    assert_param_types(
+        &db,
+        "SELECT row_to_json($1)",
+        &[basic("pg_catalog", "record")],
+    );
+    db.analyze("SELECT row_to_json(NULL)").unwrap();
+    db.analyze("SELECT row_to_json(ROW(1, 'a'))").unwrap();
 }
 
 #[test]
@@ -1558,4 +2305,95 @@ fn a_carriage_return_ends_a_line_comment() {
     );
     let columns: Vec<_> = info.columns.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(columns, ["id", "a", "b"]);
+}
+
+#[test]
+fn a_cast_handing_an_untyped_parameter_back_is_the_parameter() {
+    // coerce_type returns an `unknown` operand of a cast to `unknown` (or
+    // to `anyelement` & co.) untouched: `$1::unknown` is the parameter
+    // node `$1` while `$1` is untyped — a bare `$N` to the transform
+    // replays, and typed by the operator it meets, whatever clause the
+    // analyzer reaches first.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE a (x int, y text, v text, d date);")
+        .unwrap();
+    for (sql, expected) in [
+        ("SELECT ROW($1::unknown, 1) = ROW(x, $1) FROM a", int4()),
+        ("SELECT $1::unknown = x FROM a", int4()),
+        ("SELECT x FROM a WHERE $1::unknown = x", int4()),
+        ("INSERT INTO a (x) VALUES ($1::unknown + 1)", int4()),
+        ("UPDATE a SET y = 'a' RETURNING $1::unknown + 1", int4()),
+        ("SELECT x FROM a ORDER BY $1::unknown + 1", int4()),
+        ("INSERT INTO a (x) VALUES ($1::unknown)", int4()),
+        ("SELECT $1::unknown", text()),
+        (
+            "SELECT x FROM a WHERE x = ANY($1::unknown)",
+            array_of(int4()),
+        ),
+    ] {
+        assert_param_types(&db, sql, &[expected]);
+    }
+    for (sql, message) in [
+        (
+            "INSERT INTO a (x, y) VALUES ($1::unknown, $1)",
+            "inconsistent types deduced for parameter $1",
+        ),
+        (
+            "INSERT INTO a (x, y) VALUES ($1, $1::unknown)",
+            "inconsistent types deduced for parameter $1",
+        ),
+        (
+            "INSERT INTO a (x, y) VALUES ($1, $1::anyelement)",
+            "inconsistent types deduced for parameter $1",
+        ),
+        (
+            "UPDATE a SET x = $1::unknown, y = $1",
+            "inconsistent types deduced for parameter $1",
+        ),
+        (
+            "UPDATE a SET y = 'a' RETURNING $1::unknown, $1 + 1",
+            "inconsistent types deduced for parameter $1",
+        ),
+        (
+            "UPDATE a SET y = 'a' RETURNING $1::anyelement, $1 + 1",
+            "inconsistent types deduced for parameter $1",
+        ),
+        (
+            "MERGE INTO a USING a b ON a.x = b.x \
+             WHEN NOT MATCHED THEN INSERT (x, y) VALUES ($1::unknown, $1)",
+            "inconsistent types deduced for parameter $1",
+        ),
+        (
+            "SELECT $1::unknown, x = $1 FROM a",
+            "inconsistent types deduced for parameter $1",
+        ),
+        (
+            "SELECT * FROM a ORDER BY $1::unknown, x = $1",
+            "operator does not exist: integer = text",
+        ),
+        (
+            "SELECT * FROM a ORDER BY $1::anyelement, x = $1",
+            "operator does not exist: integer = text",
+        ),
+        (
+            "SELECT ($1::unknown)::text, x = $1 FROM a",
+            "operator does not exist: integer = text",
+        ),
+        (
+            "SELECT 1 FROM a GROUP BY $1::anyelement LIMIT $1",
+            "argument of LIMIT must be type bigint, not type text",
+        ),
+        (
+            "SELECT 1 FROM a GROUP BY $1::unknown LIMIT $1",
+            "argument of LIMIT must be type bigint, not type text",
+        ),
+        // Typed before the cast is transformed: a cast of an integer.
+        (
+            "SELECT x = $1, $1::unknown FROM a",
+            "cannot cast type integer to unknown",
+        ),
+    ] {
+        let err = db.analyze(sql).unwrap_err();
+        assert!(err.to_string().starts_with(message), "`{sql}`: got: {err}");
+    }
 }

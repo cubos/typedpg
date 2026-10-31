@@ -547,7 +547,9 @@ impl PgSanityServer {
         }
         let row = self.query_client.query_one(
             &format!(
-                "SELECT n.nspname, t.typname, t.typcategory::text, t.typelem::int8 \
+                "SELECT n.nspname, t.typname, \
+                 t.typsubscript = 'pg_catalog.array_subscript_handler'::pg_catalog.regproc, \
+                 t.typelem::int8 \
                  FROM pg_catalog.pg_type t \
                  JOIN pg_catalog.pg_namespace n ON t.typnamespace = n.oid \
                  WHERE t.oid = {oid}"
@@ -556,10 +558,11 @@ impl PgSanityServer {
         )?;
         let schema: String = row.get(0);
         let name: String = row.get(1);
-        let category: String = row.get(2);
+        let true_array: bool = row.get(2);
         let typelem: u32 = row.get::<_, i64>(3) as u32;
 
-        let qualified = if category == "A" && typelem != 0 {
+        // PG's IsTrueArrayType: `_record` (a pseudo-type) included.
+        let qualified = if true_array && typelem != 0 {
             // Array — recurse to get the element's qname, then bracket.
             let elem_qname = self.qualified_type_name(typelem)?;
             format!("{elem_qname}[]")

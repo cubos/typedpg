@@ -178,6 +178,40 @@ pub(crate) fn analyze_merge_with_outer_ctes(
         check_no_srf_in_clause(join_condition, snapshot, "JOIN conditions")?;
     }
 
+    // Rows inserted or updated through a view are not the view's rows.
+    let events: Vec<DmlEvent> = merge
+        .merge_when_clauses
+        .iter()
+        .filter_map(|n| match n.node.as_ref() {
+            Some(node::Node::MergeWhenClause(w)) => match CmdType::try_from(w.command_type) {
+                Ok(CmdType::CmdInsert) => Some(DmlEvent::Insert),
+                Ok(CmdType::CmdUpdate) => Some(DmlEvent::Update),
+                Ok(CmdType::CmdDelete) => Some(DmlEvent::Delete),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    let ret_scope = super::dml::with_written_target(
+        &both,
+        &target_alias,
+        snapshot,
+        table_oid,
+        &table_attrs,
+        &events,
+    );
+    // transformMergeStmt transforms RETURNING before the WHEN clauses: the
+    // first of them to type a `$N` fixes its type.
+    MERGE_RETURNING_DEPTH.with(|d| d.set(d.get() + 1));
+    let typed = super::returning::type_returning_params(
+        &merge.returning_clause,
+        &target_alias,
+        expr::Ctx::new(&ret_scope, &null_ctx, snapshot),
+        params,
+    );
+    MERGE_RETURNING_DEPTH.with(|d| d.set(d.get() - 1));
+    typed?;
+
     let mut source_may_be_null = false;
     let mut rows = ReturningRows::default();
     // What each WHEN clause's condition proves, where its action runs.
@@ -293,34 +327,12 @@ pub(crate) fn analyze_merge_with_outer_ctes(
             }
         }
     }
-    // Rows inserted or updated through a view are not the view's rows.
-    let events: Vec<DmlEvent> = merge
-        .merge_when_clauses
-        .iter()
-        .filter_map(|n| match n.node.as_ref() {
-            Some(node::Node::MergeWhenClause(w)) => match CmdType::try_from(w.command_type) {
-                Ok(CmdType::CmdInsert) => Some(DmlEvent::Insert),
-                Ok(CmdType::CmdUpdate) => Some(DmlEvent::Update),
-                Ok(CmdType::CmdDelete) => Some(DmlEvent::Delete),
-                _ => None,
-            },
-            _ => None,
-        })
-        .collect();
-    let both = super::dml::with_written_target(
-        &both,
-        &target_alias,
-        snapshot,
-        table_oid,
-        &table_attrs,
-        &events,
-    );
     MERGE_RETURNING_DEPTH.with(|d| d.set(d.get() + 1));
     let columns = resolve_returning(
         &merge.returning_clause,
         &target_alias,
         rows,
-        expr::Ctx::new(&both, &ret_null_ctx, snapshot),
+        expr::Ctx::new(&ret_scope, &ret_null_ctx, snapshot),
         params,
     );
     MERGE_RETURNING_DEPTH.with(|d| d.set(d.get() - 1));
@@ -502,8 +514,20 @@ fn merge_when_insert(
     let discards = |c: &crate::pg_catalog::PgAttribute| {
         Overriding::from_kind(when.r#override) == Overriding::UserValue && c.attidentity.is_some()
     };
+    // The row is transformed whole, then coerced to its columns
+    // (transformInsertRow), as in a plain INSERT.
+    let untyped = expr::replay_transform(&when.values.iter().collect::<Vec<_>>(), ctx, params);
     for (i, val) in when.values.iter().enumerate() {
         let target_col = target_attrs.get(i).copied();
+        if untyped[i]
+            && let Some(p) = expr::bare_param(val, snapshot)
+            && let Some(tc) = target_col
+            && res_targets
+                .get(i)
+                .is_none_or(|rt| rt.indirection.is_empty())
+        {
+            expr::coerce_untyped_param(p, tc.atttypid, snapshot, params)?;
+        }
         if let Some(tc) = target_col {
             if is_sql_null_literal(val)
                 && !discards(tc)

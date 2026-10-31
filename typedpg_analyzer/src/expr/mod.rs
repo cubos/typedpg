@@ -944,7 +944,14 @@ fn infer_expr_unlocated(
         node::Node::ColumnRef(col_ref) => infer_column_ref(col_ref, ctx, params),
         node::Node::AConst(a_const) => infer_a_const(a_const),
         node::Node::TypeCast(cast) => match passthrough_cast_operand(node, snapshot, params) {
-            Some(operand) => infer_expr(operand, ctx, params, goal.clone()),
+            Some(operand) => {
+                if let Some(node::Node::ParamRef(p)) = operand.node.as_ref()
+                    && params.get(p.number) == oid::UNKNOWN
+                {
+                    params.mark_untyped_cast_operand(p.location);
+                }
+                infer_expr(operand, ctx, params, goal.clone())
+            }
             None => infer_type_cast(cast, ctx, params),
         },
         node::Node::FuncCall(func) => infer_func_call(func, ctx, params),
@@ -1483,15 +1490,23 @@ pub(crate) fn coerce_unknown_to(
 /// scratch collector at PG's point (the caller runs it right after FROM) and
 /// records each such occurrence ([`ParamCollector::mark_untyped_output`]);
 /// [`resolve_untyped_output_params`] then applies PG's coercion to text.
+/// The types the replay deduces are kept: they are the ones PG fixes
+/// before WHERE & co. are looked at (`SELECT $1::int … WHERE text_col =
+/// $1` is `text = integer`).
 ///
 /// An entry that fails to resolve there fails in PG before any later
 /// clause is looked at: its error is returned, so a query wrong in both
 /// its select list and its WHERE reports the select list's, as PG does.
-/// But past the last bare `$N`, an entry holding a subquery is left to the
-/// final pass: replaying it would analyze the subquery here and again
-/// there — at each level of nested sublinks, so 2^depth times — for an
-/// error the final pass reports anyway (only which of several errors comes
-/// first may then differ from PG).
+/// But past the last bare `$N`, an entry holding a subquery and no
+/// parameter to type is left to the final pass (only which of several
+/// errors comes first may then differ from PG).
+///
+/// A subquery replayed here is analyzed in full, its own select-list
+/// replay included, so the types it deduces at any depth are fixed before
+/// this level's WHERE & co. Re-analyzing it in the final pass would replay
+/// it again, at each level of nested sublinks — 2^depth times — for types
+/// already fixed: the caller runs that pass under
+/// [`with_targets_replayed`], where every subquery entry is skipped here.
 pub(crate) fn note_untyped_output_params(
     target_list: &[protobuf::Node],
     ctx: Ctx<'_>,
@@ -1505,7 +1520,48 @@ pub(crate) fn note_untyped_output_params(
         )
     };
     let last_bare_param = target_list.iter().rposition(is_bare_param);
+    let replayed = TARGETS_REPLAYED.with(std::cell::Cell::get);
     let mut scratch = params.clone();
+    replay_targets(
+        target_list,
+        last_bare_param,
+        replayed,
+        ctx,
+        params,
+        &mut scratch,
+    )?;
+    params.adopt_types(&scratch);
+    Ok(())
+}
+
+thread_local! {
+    /// Whether the analysis is inside [`with_targets_replayed`].
+    static TARGETS_REPLAYED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` — a SELECT's final pass over a target list that
+/// [`note_untyped_output_params`] just replayed — with the replay of
+/// every subquery entry skipped in the subqueries `f` analyzes: the replay
+/// already analyzed them in full and fixed the types they deduce.
+pub(crate) fn with_targets_replayed<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TARGETS_REPLAYED.with(|r| r.set(self.0));
+        }
+    }
+    let _restore = Restore(TARGETS_REPLAYED.with(|r| r.replace(true)));
+    f()
+}
+
+fn replay_targets(
+    target_list: &[protobuf::Node],
+    last_bare_param: Option<usize>,
+    replayed: bool,
+    ctx: Ctx<'_>,
+    params: &mut ParamCollector,
+    scratch: &mut ParamCollector,
+) -> Result<(), AnalyzeError> {
     for (i, target) in target_list.iter().enumerate() {
         let Some(node::Node::ResTarget(rt)) = target.node.as_ref() else {
             continue;
@@ -1516,6 +1572,7 @@ pub(crate) fn note_untyped_output_params(
         if let Some(p) = bare_param(val, ctx.snapshot) {
             if scratch.get(p.number) == oid::UNKNOWN {
                 params.mark_untyped_output(p.location);
+                params.mark_untyped_cast_operand(p.location);
             }
             scratch.see(p.number);
             continue;
@@ -1532,12 +1589,167 @@ pub(crate) fn note_untyped_output_params(
             Some(node::Node::AIndirection(i)) if star(&i.indirection) => continue,
             _ => {}
         }
-        if last_bare_param.is_none_or(|last| i > last) && has_sublink(val) {
+        if has_sublink(val)
+            && (replayed || (last_bare_param.is_none_or(|last| i > last) && !has_param_ref(val)))
+        {
             continue;
         }
-        infer_expr(val, ctx, &mut scratch, TypeGoal::NONE)?;
+        infer_expr(val, ctx, scratch, TypeGoal::NONE)?;
     }
     Ok(())
+}
+
+/// PG transforms a whole expression list before coercing any of it to its
+/// targets: an INSERT row (`transformInsertRow`), an UPDATE's SET list
+/// (`transformUpdateTargetList`), a RETURNING list, the two rows of a row
+/// comparison. A bare `$N` transformed while `$N` is still untyped stays
+/// an `unknown` node until that coercion, which goes through
+/// `variable_coerce_param_hook`: `inconsistent types deduced for parameter
+/// $N` when the parameter got another type meanwhile. The analyzer types
+/// each item against its target in one go, so this replays the transform
+/// of `items`, in order, on a scratch collector; keeps the types it
+/// deduced (PG deduces them before any of the coercions); and tells, per
+/// item, whether it is such an untyped bare `$N` — for the caller to
+/// coerce with [`coerce_untyped_param`]. An item failing here is left to
+/// the caller's own pass, which reports it in its context.
+pub(crate) fn replay_transform(
+    items: &[&protobuf::Node],
+    ctx: Ctx<'_>,
+    params: &mut ParamCollector,
+) -> Vec<bool> {
+    let mut replay = TransformReplay::new(params);
+    let untyped = items
+        .iter()
+        .map(|item| replay.item(item, ctx, params))
+        .collect();
+    replay.finish(params);
+    untyped
+}
+
+/// [`replay_transform`], one item at a time, for a list whose items PG
+/// transforms in order with something else in between — a `(a, b) =
+/// (SELECT …)` in an UPDATE's SET list, whose subquery is transformed at
+/// its place in the list: [`Self::analyze_in_place`] runs that analysis on
+/// the real collector, seeing the types the items before it deduced.
+pub(crate) struct TransformReplay {
+    scratch: ParamCollector,
+}
+
+impl TransformReplay {
+    pub(crate) fn new(params: &ParamCollector) -> Self {
+        Self {
+            scratch: params.clone(),
+        }
+    }
+
+    /// Replays the transform of `item`; whether it is a bare `$N`
+    /// transformed while `$N` was untyped.
+    pub(crate) fn item(
+        &mut self,
+        item: &protobuf::Node,
+        ctx: Ctx<'_>,
+        params: &ParamCollector,
+    ) -> bool {
+        match bare_param(item, ctx.snapshot) {
+            Some(p) => {
+                let untyped = params.bound_arg(p.number).is_none()
+                    && self.scratch.get(p.number) == oid::UNKNOWN;
+                if untyped {
+                    self.scratch.mark_untyped_cast_operand(p.location);
+                }
+                self.scratch.see(p.number);
+                untyped
+            }
+            None => {
+                let before = self.scratch.clone();
+                if infer_expr(item, ctx, &mut self.scratch, TypeGoal::NONE).is_err() {
+                    self.scratch = before;
+                }
+                false
+            }
+        }
+    }
+
+    /// Runs `f` on `params` at this point of the list: with the types the
+    /// items replayed so far deduced, which then sees the types `f` deduces.
+    pub(crate) fn analyze_in_place<T>(
+        &mut self,
+        params: &mut ParamCollector,
+        f: impl FnOnce(&mut ParamCollector) -> T,
+    ) -> T {
+        params.adopt_types(&self.scratch);
+        let out = f(params);
+        self.scratch.adopt_types(params);
+        out
+    }
+
+    /// Keeps the types the replay deduced.
+    pub(crate) fn finish(self, params: &mut ParamCollector) {
+        params.adopt_types(&self.scratch);
+    }
+}
+
+/// `variable_coerce_param_hook` on a bare `$N` that was transformed while
+/// untyped (see [`replay_transform`]), coerced to `target`.
+pub(crate) fn coerce_untyped_param(
+    p: &protobuf::ParamRef,
+    target: PgTypeOid,
+    snapshot: &PgCatalog,
+    params: &mut ParamCollector,
+) -> Result<(), AnalyzeError> {
+    params.coerce_untyped(p.number, target).map_err(|deduced| {
+        inconsistent_param_error(p.number, deduced, target, p.location, snapshot)
+    })
+}
+
+/// addTargetToSortList / addTargetToGroupList (parse_clause.c) resolve a
+/// sort or grouping key still `unknown` as text, right as the key is
+/// transformed: a bare `$N` still untyped there is deduced text, before
+/// any later key or clause is looked at (`ORDER BY $1, x = $1` with an
+/// integer `x` is `integer = text`).
+pub(crate) fn resolve_unknown_key(
+    key: &protobuf::Node,
+    snapshot: &PgCatalog,
+    params: &mut ParamCollector,
+) -> Result<(), AnalyzeError> {
+    if let Some(p) = bare_param(key, snapshot)
+        && params.bound_arg(p.number).is_none()
+        && params.get(p.number) == oid::UNKNOWN
+    {
+        params.mark_untyped_cast_operand(p.location);
+        coerce_untyped_param(p, oid::TEXT, snapshot, params)?;
+    }
+    Ok(())
+}
+
+/// [`coerce_unknown_to`] for an operand that was transformed `unknown`: a
+/// bare `$N` among them is an untyped parameter node, coerced through
+/// [`coerce_untyped_param`] (`$1 = ANY($1)` deduces text, then text[]).
+pub(crate) fn coerce_unknown_operand(
+    node: &protobuf::Node,
+    ctx: Ctx<'_>,
+    params: &mut ParamCollector,
+    target: PgTypeOid,
+) -> Result<(), AnalyzeError> {
+    match bare_param(node, ctx.snapshot) {
+        Some(p) if params.bound_arg(p.number).is_none() => {
+            params.mark_untyped_cast_operand(p.location);
+            coerce_untyped_param(p, target, ctx.snapshot, params)?;
+            coerce_unknown_to(node, ctx, params, target)
+        }
+        _ => coerce_unknown_to(node, ctx, params, target),
+    }
+}
+
+/// Whether `expr` is or holds a `$N`.
+fn has_param_ref(expr: &protobuf::Node) -> bool {
+    expr.node.as_ref().is_some_and(|inner| {
+        matches!(inner, node::Node::ParamRef(_))
+            || inner
+                .nodes()
+                .into_iter()
+                .any(|(n, ..)| matches!(n, typedpg_pg_query::NodeRef::ParamRef(_)))
+    })
 }
 
 /// Whether `expr` is or holds a subquery.

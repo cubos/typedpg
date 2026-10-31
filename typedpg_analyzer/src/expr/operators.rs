@@ -576,100 +576,99 @@ fn handle_any_all(
         .finalize_implicit());
     }
 
-    // left is concrete T, right is unknown → right must be T[]. Operators
-    // resolve over the domain's *base* type, so a domain column pins the
-    // param to the base's array (`email_col = ANY($1)` → text[], matching
-    // PG's Describe), not the domain's. When T has no array type at all —
-    // T is itself an array; PG has no array-of-array — PG fails the same
-    // lookup with `could not find array type for data type integer[]`.
+    // PG's make_scalar_array_op: the operator is resolved against the
+    // array's element type — or against `unknown` while the right side is
+    // still untyped (`$1`, a string literal) — and the untyped sides are
+    // then coerced to its declared types: the right one to the *array* of
+    // the declared right type. So `'a' = ANY($1)` and `$1 = ANY($2)`
+    // resolve `text = text` and type the array `text[]`, `varchar_col =
+    // ANY($1)` gets `text[]` too, and a domain over a type takes its base's
+    // array. Polymorphic resolution reads a domain over an array as its base
+    // (`could not find array type for data type integer[]`: PG has no array
+    // of arrays).
+    let op_name = extract_string_fields(&expr.name).join(".");
+    let rtype = if right_oid == oid::UNKNOWN {
+        oid::UNKNOWN
+    } else {
+        array_element_type(snapshot, right_oid).unwrap_or(oid::UNKNOWN)
+    };
+    // PG positions operator errors at the operator, as for a plain one.
+    let op_span = || {
+        (expr.location >= 0)
+            .then(|| crate::error::SourceSpan::at_length(expr.location as usize, op_name.len()))
+    };
+    let shown = |t: PgTypeOid| crate::ddl::util::format_type_for_message(snapshot, t);
     let mut op_nullable = false;
-    if left_oid != oid::UNKNOWN && right_oid == oid::UNKNOWN {
-        match snapshot.array_type_of(snapshot.unwrap_domain(left_oid)) {
-            Some(arr_oid) => {
-                if let Some(rexpr) = &expr.rexpr {
-                    coerce_unknown_to(rexpr, ctx, params, arr_oid)?;
-                }
-                // The per-element operator over the left type: strict or
-                // not, as for a typed array (left to PG to reject, should
-                // the lookup differ).
-                let op_name = extract_string_fields(&expr.name).join(".");
-                let elem = snapshot.unwrap_domain(left_oid);
-                if !op_name.is_empty()
-                    && !op_name.contains('.')
-                    && let Some(op) = snapshot.find_operator(&op_name, Some(left_oid), elem)
-                {
-                    note_builtin_compare(expr.location, &op_name, &op, ctx);
-                    ctx.note_strict(
-                        expr.location,
-                        crate::nonnull::StrictNode::Op,
-                        ctx.proc_is_strict(op.code)
-                            && ctx
-                                .coercion_is_strict(left_oid, op.left_type_oid.unwrap_or(left_oid))
-                            && ctx.coercion_is_strict(elem, op.right_type_oid),
-                    );
-                    op_nullable =
-                        operator_call_nullable(snapshot, &op_name, &op, Some(left_oid), elem);
-                }
+    if !op_name.is_empty() {
+        let op = match snapshot.find_operator_detailed(&op_name, Some(left_oid), rtype) {
+            crate::lookup::OperatorMatch::Found(op) => op,
+            crate::lookup::OperatorMatch::NotFound => {
+                let err = crate::pgmsg::operator_does_not_exist(
+                    &shown(left_oid),
+                    &op_name,
+                    &shown(rtype),
+                    op_span(),
+                );
+                return Err(
+                    with_cast_note(err, snapshot, &op_name, left_oid, rtype).finalize_implicit()
+                );
             }
-            None => {
-                let l = crate::ddl::util::format_type_for_message(snapshot, left_oid);
-                return Err(crate::pgmsg::no_array_type_for(&l));
+            crate::lookup::OperatorMatch::Ambiguous => {
+                return Err(crate::pgmsg::operator_is_not_unique(
+                    &shown(left_oid),
+                    &op_name,
+                    &shown(rtype),
+                    op_span(),
+                )
+                .finalize_implicit());
             }
+            crate::lookup::OperatorMatch::Error(e) => return Err(e),
+        };
+        if op.result_type_oid != oid::BOOL {
+            return Err(crate::pgmsg::any_all_operator_not_boolean(
+                crate::error::SourceSpan::from_location(expr.location),
+            )
+            .finalize_implicit());
         }
-    }
-
-    // right is concrete T[], left is unknown → left must be the element type T.
-    if right_oid != oid::UNKNOWN
-        && left_oid == oid::UNKNOWN
-        && let Some(elem_oid) = array_element_type(snapshot, right_oid)
-        && let Some(lexpr) = &expr.lexpr
-    {
-        coerce_unknown_to(lexpr, ctx, params, elem_oid)?;
-    }
-
-    // Both sides concrete: PG resolves `<left> <op> <element>` against the
-    // operator catalog — `prefs = ANY(ARRAY[1,2,3])` fails at parse time
-    // with `operator does not exist: jsonb = integer`. Mirror it (the
-    // previous behavior accepted any concrete pair). A non-array right side
-    // is a different PG error ("op ANY/ALL (array) requires array on right
-    // side") with riskier corner cases (jsonb, record), so that check stays
-    // out of scope.
-    if left_oid != oid::UNKNOWN
-        && right_oid != oid::UNKNOWN
-        && let Some(elem_oid) = array_element_type(snapshot, right_oid)
-    {
-        let op_name = extract_string_fields(&expr.name).join(".");
-        if !op_name.is_empty() && !op_name.contains('.') {
-            match snapshot.find_operator(&op_name, Some(left_oid), elem_oid) {
-                // The per-element operator call can itself yield NULL.
-                Some(op) => {
-                    note_builtin_compare(expr.location, &op_name, &op, ctx);
-                    ctx.note_strict(
-                        expr.location,
-                        crate::nonnull::StrictNode::Op,
-                        ctx.proc_is_strict(op.code)
-                            && ctx
-                                .coercion_is_strict(left_oid, op.left_type_oid.unwrap_or(left_oid))
-                            && ctx.coercion_is_strict(elem_oid, op.right_type_oid),
-                    );
-                    // So can the coercion of the left operand or of an
-                    // element to the operator's declared types.
-                    op_nullable =
-                        operator_call_nullable(snapshot, &op_name, &op, Some(left_oid), elem_oid);
-                }
-                None => {
-                    let l = crate::ddl::util::format_type_for_message(snapshot, left_oid);
-                    let r = crate::ddl::util::format_type_for_message(snapshot, elem_oid);
-                    // PG positions it at the operator, as for a plain one.
-                    let span = (expr.location >= 0).then(|| {
-                        crate::error::SourceSpan::at_length(expr.location as usize, op_name.len())
-                    });
-                    let err = crate::pgmsg::operator_does_not_exist(&l, &op_name, &r, span);
-                    return Err(with_cast_note(err, snapshot, &op_name, left_oid, elem_oid)
-                        .finalize_implicit());
+        let array = match right_oid {
+            oid::UNKNOWN if !crate::polymorphic::is_polymorphic(op.right_type_oid) => {
+                match snapshot.array_type_of(op.right_type_oid) {
+                    Some(array) => Some(array),
+                    None => return Err(crate::pgmsg::no_array_type_for(&shown(op.right_type_oid))),
                 }
             }
+            _ => None,
+        };
+        // make_fn_arguments: the left operand first.
+        let left_type = match op.left_type_oid {
+            Some(declared) if left_oid == oid::UNKNOWN => {
+                if let Some(lexpr) = &expr.lexpr {
+                    coerce_unknown_operand(lexpr, ctx, params, declared)?;
+                }
+                declared
+            }
+            _ => left_oid,
+        };
+        if let (Some(array), Some(rexpr)) = (array, &expr.rexpr) {
+            coerce_unknown_operand(rexpr, ctx, params, array)?;
         }
+        let elem = if right_oid == oid::UNKNOWN {
+            op.right_type_oid
+        } else {
+            rtype
+        };
+        // The per-element operator call can itself yield NULL; so can the
+        // coercion of the left operand or of an element to the operator's
+        // declared types.
+        note_builtin_compare(expr.location, &op_name, &op, ctx);
+        ctx.note_strict(
+            expr.location,
+            crate::nonnull::StrictNode::Op,
+            ctx.proc_is_strict(op.code)
+                && ctx.coercion_is_strict(left_type, op.left_type_oid.unwrap_or(left_type))
+                && ctx.coercion_is_strict(elem, op.right_type_oid),
+        );
+        op_nullable = operator_call_nullable(snapshot, &op_name, &op, Some(left_type), elem);
     }
 
     // ExecEvalScalarArrayOp: with no element deciding the result, a NULL
@@ -809,10 +808,37 @@ pub(crate) fn row_pairwise_op(
             "cannot compare rows of zero length".to_owned(),
         ));
     }
+    // Both rows are transformed before any column pair is resolved; a bare
+    // `$N` still untyped then is an `unknown` operand of its pair, coerced
+    // to the pair operator's declared type.
+    let untyped =
+        super::replay_transform(&largs.iter().chain(rargs).collect::<Vec<_>>(), ctx, params);
+    let (luntyped, runtyped) = untyped.split_at(largs.len());
     let mut nullable = false;
     let mut ops = Vec::with_capacity(largs.len());
-    for (l, r) in largs.iter().zip(rargs) {
-        let t = infer_plain_op(op_name, l, r, location, ctx, params)?;
+    for (i, (l, r)) in largs.iter().zip(rargs).enumerate() {
+        let untyped_param =
+            |n, untyped: bool| super::bare_param(n, ctx.snapshot).filter(|_| untyped);
+        let pair_params: Vec<&protobuf::ParamRef> =
+            [untyped_param(l, luntyped[i]), untyped_param(r, runtyped[i])]
+                .into_iter()
+                .flatten()
+                .collect();
+        let t = if pair_params.is_empty() {
+            infer_plain_op(op_name, l, r, location, ctx, params)?
+        } else {
+            let nums: Vec<i32> = pair_params.iter().map(|p| p.number).collect();
+            let (t, deduced) = params.with_params_untyped(&nums, |scratch| {
+                infer_plain_op(op_name, l, r, location, ctx, scratch)
+            });
+            let t = t?;
+            for (p, deduced) in pair_params.into_iter().zip(deduced) {
+                if deduced != oid::UNKNOWN {
+                    super::coerce_untyped_param(p, deduced, ctx.snapshot, params)?;
+                }
+            }
+            t
+        };
         if t.type_oid != oid::BOOL {
             let name = crate::ddl::util::format_type_for_message(ctx.snapshot, t.type_oid);
             return Err(AnalyzeError::DatatypeMismatch(not_bool(&name)));

@@ -36,6 +36,21 @@ fn nested_subqueries() {
 }
 
 #[test]
+fn nested_subqueries_typing_a_parameter() {
+    // Each level's select list is replayed before its WHERE (PG's
+    // transform order), and the final pass does not replay a subquery the
+    // replay analyzed: quadratic in the depth, where replaying at every
+    // level would be 2^depth.
+    let n = 50;
+    let sql = format!(
+        "SELECT {}$1::int + x{} AS v FROM t",
+        "(SELECT ".repeat(n),
+        " FROM t WHERE x = $1)".repeat(n)
+    );
+    assert_int4(&setup(), &sql);
+}
+
+#[test]
 fn nested_calls() {
     // A one-argument call inferred its argument twice: 2^depth again.
     let n = 1000;

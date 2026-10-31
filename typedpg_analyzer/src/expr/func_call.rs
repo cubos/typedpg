@@ -1085,11 +1085,14 @@ fn backfill_func_args(
             && expected != oid::UNKNOWN
             // A pseudo-type slot (`"any"`, anyelement, …) is not a concrete
             // coercion target — recording it would leak the pseudo OID into
-            // a param's type.
-            && ctx
-                .snapshot
-                .get_type(expected)
-                .is_none_or(|t| t.typtype != TypType::Pseudo)
+            // a param's type. `record` is: coerce_type feeds an unknown
+            // literal to record_in (which refuses it) and types a `$N`
+            // `record`.
+            && (expected == oid::RECORD
+                || ctx
+                    .snapshot
+                    .get_type(expected)
+                    .is_none_or(|t| t.typtype != TypType::Pseudo))
         {
             // Speculative re-walk: ordinary failures are swallowed, but a
             // literal-content rejection is the parse-time error PG itself
@@ -1117,10 +1120,9 @@ fn backfill_func_args(
 
 /// Walk aggregate modifiers so any `$N` placeholders they contain get their
 /// types inferred and column refs validated. FILTER must be bool (like a WHERE
-/// clause), per-aggregate ORDER BY items have no specific goal, and the WINDOW
-/// `OVER (…)` clause's expressions are walked too. None of these positions can
-/// reference a select-list alias — they're all row-level — so propagating
-/// errors here matches PG.
+/// clause), per-aggregate ORDER BY items have no specific goal. None of these
+/// positions can reference a select-list alias — they're all row-level — so
+/// propagating errors here matches PG.
 fn walk_func_modifiers(
     func: &protobuf::FuncCall,
     ctx: Ctx<'_>,
@@ -1148,22 +1150,15 @@ fn walk_func_modifiers(
                 && let Some(inner) = sb.node.as_deref()
             {
                 infer_expr(inner, ctx, params, TypeGoal::NONE)?;
+                // transformAggregateCall's transformSortClause.
+                crate::expr::resolve_unknown_key(inner, ctx.snapshot, params)?;
             }
         }
     }
-    // An inline window (`OVER (…)`) is a window definition of its own; one
-    // inheriting from a named window (`OVER (w …)`) is checked against it
-    // with the SELECT's WINDOW clause ([`check_window_clause`]). `OVER w`
-    // defines nothing.
-    if let Some(over) = &func.over
-        && over.name.is_empty()
-    {
-        if over.refname.is_empty() {
-            transform_window_def(over, None, ctx, params)?;
-        } else {
-            infer_window_exprs(over, ctx, params)?;
-        }
-    }
+    // An inline window (`OVER (…)`) is not transformed with its call:
+    // transformWindowFuncCall only appends it to the query's window list,
+    // whose entries transformWindowDefinitions transforms after LIMIT
+    // ([`check_window_clause`]). `OVER w` defines nothing.
     Ok(())
 }
 
@@ -1616,15 +1611,21 @@ fn window_order_exprs(wd: &protobuf::WindowDef) -> Vec<&protobuf::Node> {
         .collect()
 }
 
-/// Infer a window definition's PARTITION BY / ORDER BY expressions, so
-/// parameters are typed and column references validated.
+/// Infer a window definition's ORDER BY, then PARTITION BY expressions
+/// (transformWindowDefinitions' order), so parameters are typed and column
+/// references validated; each key still `unknown` is resolved as text
+/// right after it, as transformSortClause / transformGroupClause do.
 fn infer_window_exprs(
     wd: &protobuf::WindowDef,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<(), AnalyzeError> {
-    for e in wd.partition_clause.iter().chain(window_order_exprs(wd)) {
+    for e in window_order_exprs(wd)
+        .into_iter()
+        .chain(&wd.partition_clause)
+    {
         infer_expr(e, ctx, params, TypeGoal::NONE)?;
+        crate::expr::resolve_unknown_key(e, ctx.snapshot, params)?;
     }
     Ok(())
 }
@@ -1858,10 +1859,13 @@ fn contains_column_ref(node: &protobuf::Node) -> bool {
 }
 
 /// PG's `transformWindowDefinitions` over a SELECT's WINDOW clause and
-/// the inline windows inheriting from it: WINDOW entries are checked in
-/// order — a name may be defined once (42P20), and a reference must name
-/// an *earlier* entry (42704) — then every `OVER (w …)` in the target list
-/// and ORDER BY is checked against `w` (see [`transform_window_def`]).
+/// its inline windows, after LIMIT: WINDOW entries are checked in order —
+/// a name may be defined once (42P20), and a reference must name an
+/// *earlier* entry (42704) — then every inline `OVER (…)` in the target
+/// list, ORDER BY and DISTINCT ON is transformed, an `OVER (w …)` checked
+/// against `w` (see [`transform_window_def`]). Their keys are not walked
+/// with the calls: a `$N` first met in one is typed here, after every
+/// clause PG transforms before.
 pub(crate) fn check_window_clause(
     sel: &protobuf::SelectStmt,
     ctx: Ctx<'_>,
@@ -1896,78 +1900,52 @@ pub(crate) fn check_window_clause(
         transform_window_def(wd, base, ctx, params)?;
     }
 
+    // Then the inline windows, in the order their calls were transformed:
+    // the target list's, then ORDER BY's, then DISTINCT ON's.
     let mut inline: Vec<&protobuf::WindowDef> = Vec::new();
-    for t in &sel.target_list {
-        if let Some(node::Node::ResTarget(rt)) = t.node.as_ref()
-            && let Some(val) = rt.val.as_deref()
-        {
-            collect_inheriting_windows(val, &mut inline);
-        }
-    }
-    for s in &sel.sort_clause {
-        if let Some(node::Node::SortBy(sb)) = s.node.as_ref()
-            && let Some(inner) = sb.node.as_deref()
-        {
-            collect_inheriting_windows(inner, &mut inline);
-        }
+    let exprs = sel
+        .target_list
+        .iter()
+        .filter_map(|t| match t.node.as_ref() {
+            Some(node::Node::ResTarget(rt)) => rt.val.as_deref(),
+            _ => None,
+        })
+        .chain(
+            sel.sort_clause
+                .iter()
+                .filter_map(|s| match s.node.as_ref() {
+                    Some(node::Node::SortBy(sb)) => sb.node.as_deref(),
+                    _ => None,
+                }),
+        )
+        .chain(&sel.distinct_clause);
+    for e in exprs {
+        crate::resolve::visit_same_level(e, &mut |n| {
+            if let Some(over) = inline_window(n) {
+                inline.push(over);
+            }
+        });
     }
     for wd in inline {
-        if let Some(base) = defs.iter().find(|d| d.name == wd.refname) {
+        if wd.refname.is_empty() {
+            transform_window_def(wd, None, ctx, params)?;
+        } else if let Some(base) = defs.iter().find(|d| d.name == wd.refname) {
             transform_window_def(wd, Some(base), ctx, params)?;
         }
     }
     Ok(())
 }
 
-/// Inline `OVER (w …)` windows of the window calls in an expression
-/// (subqueries excluded — their windows belong to the inner query).
-fn collect_inheriting_windows<'a>(
-    node: &'a protobuf::Node,
-    out: &mut Vec<&'a protobuf::WindowDef>,
-) {
-    let Some(inner) = node.node.as_ref() else {
-        return;
-    };
-    fn each<'a>(nodes: &'a [protobuf::Node], out: &mut Vec<&'a protobuf::WindowDef>) {
-        for n in nodes {
-            collect_inheriting_windows(n, out);
-        }
-    }
-    match inner {
-        node::Node::FuncCall(f) => {
-            if let Some(over) = f.over.as_deref()
-                && over.name.is_empty()
-                && !over.refname.is_empty()
-            {
-                out.push(over);
-            }
-            each(&f.args, out);
-        }
-        node::Node::AExpr(e) => {
-            for n in [&e.lexpr, &e.rexpr].into_iter().flatten() {
-                collect_inheriting_windows(n, out);
-            }
-        }
-        node::Node::TypeCast(c) => {
-            if let Some(a) = &c.arg {
-                collect_inheriting_windows(a, out);
-            }
-        }
-        node::Node::BoolExpr(b) => each(&b.args, out),
-        node::Node::CoalesceExpr(c) => each(&c.args, out),
-        node::Node::CaseExpr(c) => {
-            each(&c.args, out);
-            if let Some(d) = &c.defresult {
-                collect_inheriting_windows(d, out);
-            }
-        }
-        node::Node::CaseWhen(w) => {
-            for n in [&w.expr, &w.result].into_iter().flatten() {
-                collect_inheriting_windows(n, out);
-            }
-        }
-        _ => {}
-    }
+/// The inline `OVER (…)` window of a window call (a function's or a JSON
+/// aggregate's).
+fn inline_window(node: &protobuf::Node) -> Option<&protobuf::WindowDef> {
+    let over = match node.node.as_ref()? {
+        node::Node::FuncCall(f) => f.over.as_deref(),
+        node::Node::JsonObjectAgg(a) => a.constructor.as_deref()?.over.as_deref(),
+        node::Node::JsonArrayAgg(a) => a.constructor.as_deref()?.over.as_deref(),
+        _ => None,
+    }?;
+    over.name.is_empty().then_some(over)
 }
 
 /// Decide whether a function/aggregate/window call's result is nullable.

@@ -78,11 +78,12 @@ fn fval_const_type(fval: &str) -> PgTypeOid {
 // ──────────────────────────────────────────────────────────────────────────────
 
 /// coerce_type hands an `unknown` operand of a cast to `"any"`,
-/// `anyelement`, `anynonarray`, `anycompatible` or `anycompatiblenonarray`
-/// back untouched — no input function runs, no type is assigned — so such a
-/// cast of an untyped literal or a still-untyped parameter *is* that literal
-/// or parameter: `SELECT '1'::anyelement` is a `text` column, `$1::anyelement`
-/// a `text` parameter, `WHERE $1::anyelement IS NULL` leaves `$1` untyped.
+/// `anyelement`, `anynonarray`, `anycompatible`, `anycompatiblenonarray` or
+/// `unknown` itself back untouched — no input function runs, no type is
+/// assigned — so such a cast of an untyped literal or a still-untyped
+/// parameter *is* that literal or parameter: `SELECT '1'::anyelement` is a
+/// `text` column, `$1::anyelement` a `text` parameter, `WHERE
+/// $1::anyelement IS NULL` leaves `$1` untyped.
 /// Returns the operand for such a cast (through nested ones), `None` for any
 /// other node. (A typed operand goes through [`infer_type_cast`], which
 /// returns it as it is too.)
@@ -93,29 +94,46 @@ pub(crate) fn passthrough_cast_operand<'a>(
 ) -> Option<&'a protobuf::Node> {
     let mut operand = node;
     let mut peeled = false;
+    let mut to_unknown = false;
     while let Some(node::Node::TypeCast(cast)) = operand.node.as_ref() {
         let tn = cast.type_name.as_ref()?;
         if !tn.typmods.is_empty() || !tn.array_bounds.is_empty() {
             return None;
         }
         let target = resolve_type_name(Some(tn), snapshot).ok()?;
-        if !crate::polymorphic::passes_operand_through(target) {
+        if !keeps_unknown_operand(target) {
             return None;
         }
+        to_unknown |= target == oid::UNKNOWN;
         operand = cast.arg.as_deref()?;
         peeled = true;
     }
     let untyped = match operand.node.as_ref()? {
         node::Node::AConst(ac) => ac.isnull || matches!(ac.val, Some(a_const::Val::Sval(_))),
-        node::Node::ParamRef(p) => params.get(p.number) == oid::UNKNOWN,
+        // A cast to `unknown` of a typed value fails (`cannot cast type
+        // integer to unknown`): unless this occurrence was transformed
+        // untyped, and a later clause typed it.
+        node::Node::ParamRef(p) => {
+            params.get(p.number) == oid::UNKNOWN
+                || (to_unknown && params.is_untyped_cast_operand(p.location))
+        }
         _ => false,
     };
     (peeled && untyped).then_some(operand)
 }
 
+/// Whether coerce_type hands an `unknown` operand of a cast to `target`
+/// back untouched: the pass-through pseudo-types, and `unknown` itself
+/// (`targetTypeId == inputTypeId`), so `$1::unknown` is the parameter node
+/// `$1` while `$1` is untyped.
+fn keeps_unknown_operand(target: PgTypeOid) -> bool {
+    target == oid::UNKNOWN || crate::polymorphic::passes_operand_through(target)
+}
+
 /// The parameter an output column is, through the casts
-/// [`passthrough_cast_operand`] sees through: `$1` and `$1::anyelement`
-/// alike are a bare parameter PG's `resolveTargetListUnknowns` may coerce.
+/// [`passthrough_cast_operand`] sees through: `$1`, `$1::anyelement` and
+/// `$1::unknown` alike are a bare parameter PG's `resolveTargetListUnknowns`
+/// may coerce.
 pub(crate) fn bare_param<'a>(
     node: &'a protobuf::Node,
     snapshot: &PgCatalog,
@@ -128,8 +146,7 @@ pub(crate) fn bare_param<'a>(
                 let tn = cast.type_name.as_ref()?;
                 if !tn.typmods.is_empty()
                     || !tn.array_bounds.is_empty()
-                    || !resolve_type_name(Some(tn), snapshot)
-                        .is_ok_and(crate::polymorphic::passes_operand_through)
+                    || !resolve_type_name(Some(tn), snapshot).is_ok_and(keeps_unknown_operand)
                 {
                     return None;
                 }

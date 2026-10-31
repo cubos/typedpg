@@ -789,6 +789,18 @@ pub(crate) fn set_op_column_count(
     )
 }
 
+/// `op ANY/ALL (array) requires operator to yield boolean` — SQLSTATE 42809
+/// (make_scalar_array_op).
+pub(crate) fn any_all_operator_not_boolean(span: Option<SourceSpan>) -> RawError {
+    RawError::new(
+        AnalyzeError::WrongObjectType(
+            "op ANY/ALL (array) requires operator to yield boolean".to_owned(),
+        ),
+        span,
+        None,
+    )
+}
+
 /// `could not find array type for data type T` — SQLSTATE 42704: typing a
 /// bare parameter as `T[]` when no such array type exists (T is itself an
 /// array).
