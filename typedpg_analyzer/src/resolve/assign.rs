@@ -459,7 +459,7 @@ pub(crate) fn analyze_set_clause<'a>(
         assigned.push((tc.attname.as_str(), target.indirected));
         match value {
             SetValue::Expr(val, untyped) => {
-                if untyped && let Some(node::Node::ParamRef(p)) = val.node.as_ref() {
+                if untyped && let Some(p) = crate::expr::bare_param(val, snapshot) {
                     crate::expr::coerce_untyped_param(p, target.type_oid, snapshot, params)?;
                 }
                 // Catch `UPDATE … SET not_null_col = NULL` statically — PG

@@ -37,6 +37,11 @@ pub(crate) struct ParamCollector {
     /// [`Self::mark_untyped_output`]). PG's `resolveTargetListUnknowns`
     /// later coerces exactly those occurrences to `text`.
     untyped_outputs: HashSet<i32>,
+    /// Source locations of `$N`s a cast handing an `unknown` operand back
+    /// untouched (`$N::unknown`, `$N::anyelement`) passed through while
+    /// the parameter was still untyped (see
+    /// [`Self::mark_untyped_cast_operand`]).
+    untyped_cast_operands: HashSet<i32>,
     /// Param numbers some expression read as non-NULL ([`Self::read_nullable`]).
     /// A param inferred nullable only later in the walk (inside a
     /// `COALESCE`, or as the value of a nullable column) makes those reads
@@ -226,6 +231,8 @@ impl ParamCollector {
         }
         self.indeterminate_locked
             .extend(scratch.indeterminate_locked.iter().copied());
+        self.untyped_cast_operands
+            .extend(scratch.untyped_cast_operands.iter().copied());
     }
 
     /// Remember that the bare `$N` output column at `location` was
@@ -238,6 +245,22 @@ impl ParamCollector {
     /// Whether [`Self::mark_untyped_output`] recorded `location`.
     pub fn is_untyped_output(&self, location: i32) -> bool {
         self.untyped_outputs.contains(&location)
+    }
+
+    /// Remember that the `$N` at `location` was the untyped operand of a
+    /// cast PG hands it back from untouched: PG transforms that occurrence
+    /// once, as the untyped parameter node itself, so a later pass that
+    /// sees `$N` typed meanwhile (by a clause PG transforms after it) must
+    /// not read `$N::unknown` as a cast of a typed value to `unknown`
+    /// (`SELECT $1::unknown = x` is `$1 = x`, not `cannot cast type
+    /// integer to unknown`).
+    pub fn mark_untyped_cast_operand(&mut self, location: i32) {
+        self.untyped_cast_operands.insert(location);
+    }
+
+    /// Whether [`Self::mark_untyped_cast_operand`] recorded `location`.
+    pub fn is_untyped_cast_operand(&self, location: i32) -> bool {
+        self.untyped_cast_operands.contains(&location)
     }
 
     /// Return all parameters in order, validating that every seen param has a type.

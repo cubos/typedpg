@@ -2306,3 +2306,94 @@ fn a_carriage_return_ends_a_line_comment() {
     let columns: Vec<_> = info.columns.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(columns, ["id", "a", "b"]);
 }
+
+#[test]
+fn a_cast_handing_an_untyped_parameter_back_is_the_parameter() {
+    // coerce_type returns an `unknown` operand of a cast to `unknown` (or
+    // to `anyelement` & co.) untouched: `$1::unknown` is the parameter
+    // node `$1` while `$1` is untyped — a bare `$N` to the transform
+    // replays, and typed by the operator it meets, whatever clause the
+    // analyzer reaches first.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE a (x int, y text, v text, d date);")
+        .unwrap();
+    for (sql, expected) in [
+        ("SELECT ROW($1::unknown, 1) = ROW(x, $1) FROM a", int4()),
+        ("SELECT $1::unknown = x FROM a", int4()),
+        ("SELECT x FROM a WHERE $1::unknown = x", int4()),
+        ("INSERT INTO a (x) VALUES ($1::unknown + 1)", int4()),
+        ("UPDATE a SET y = 'a' RETURNING $1::unknown + 1", int4()),
+        ("SELECT x FROM a ORDER BY $1::unknown + 1", int4()),
+        ("INSERT INTO a (x) VALUES ($1::unknown)", int4()),
+        ("SELECT $1::unknown", text()),
+        (
+            "SELECT x FROM a WHERE x = ANY($1::unknown)",
+            array_of(int4()),
+        ),
+    ] {
+        assert_param_types(&db, sql, &[expected]);
+    }
+    for (sql, message) in [
+        (
+            "INSERT INTO a (x, y) VALUES ($1::unknown, $1)",
+            "inconsistent types deduced for parameter $1",
+        ),
+        (
+            "INSERT INTO a (x, y) VALUES ($1, $1::unknown)",
+            "inconsistent types deduced for parameter $1",
+        ),
+        (
+            "INSERT INTO a (x, y) VALUES ($1, $1::anyelement)",
+            "inconsistent types deduced for parameter $1",
+        ),
+        (
+            "UPDATE a SET x = $1::unknown, y = $1",
+            "inconsistent types deduced for parameter $1",
+        ),
+        (
+            "UPDATE a SET y = 'a' RETURNING $1::unknown, $1 + 1",
+            "inconsistent types deduced for parameter $1",
+        ),
+        (
+            "UPDATE a SET y = 'a' RETURNING $1::anyelement, $1 + 1",
+            "inconsistent types deduced for parameter $1",
+        ),
+        (
+            "MERGE INTO a USING a b ON a.x = b.x \
+             WHEN NOT MATCHED THEN INSERT (x, y) VALUES ($1::unknown, $1)",
+            "inconsistent types deduced for parameter $1",
+        ),
+        (
+            "SELECT $1::unknown, x = $1 FROM a",
+            "inconsistent types deduced for parameter $1",
+        ),
+        (
+            "SELECT * FROM a ORDER BY $1::unknown, x = $1",
+            "operator does not exist: integer = text",
+        ),
+        (
+            "SELECT * FROM a ORDER BY $1::anyelement, x = $1",
+            "operator does not exist: integer = text",
+        ),
+        (
+            "SELECT ($1::unknown)::text, x = $1 FROM a",
+            "operator does not exist: integer = text",
+        ),
+        (
+            "SELECT 1 FROM a GROUP BY $1::anyelement LIMIT $1",
+            "argument of LIMIT must be type bigint, not type text",
+        ),
+        (
+            "SELECT 1 FROM a GROUP BY $1::unknown LIMIT $1",
+            "argument of LIMIT must be type bigint, not type text",
+        ),
+        // Typed before the cast is transformed: a cast of an integer.
+        (
+            "SELECT x = $1, $1::unknown FROM a",
+            "cannot cast type integer to unknown",
+        ),
+    ] {
+        let err = db.analyze(sql).unwrap_err();
+        assert!(err.to_string().starts_with(message), "`{sql}`: got: {err}");
+    }
+}

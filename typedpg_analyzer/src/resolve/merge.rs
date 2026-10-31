@@ -520,7 +520,7 @@ fn merge_when_insert(
     for (i, val) in when.values.iter().enumerate() {
         let target_col = target_attrs.get(i).copied();
         if untyped[i]
-            && let Some(node::Node::ParamRef(p)) = val.node.as_ref()
+            && let Some(p) = expr::bare_param(val, snapshot)
             && let Some(tc) = target_col
             && res_targets
                 .get(i)

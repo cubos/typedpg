@@ -563,7 +563,7 @@ fn analyze_select_here(
         }
         if let Some(rt) = aliased_target(distinct_node, &targets) {
             unknown_keys.push(Ok(rt));
-        } else if let Some(node::Node::ParamRef(p)) = distinct_node.node.as_ref()
+        } else if let Some(p) = expr::bare_param(distinct_node, snapshot)
             && params.bound_arg(p.number).is_none()
             && params.get(p.number) == oid::UNKNOWN
         {
@@ -1457,8 +1457,12 @@ fn resolve_unknown_target(
     snapshot: &crate::pg_catalog::PgCatalog,
     params: &mut ParamCollector,
 ) -> Result<(), AnalyzeError> {
-    match rt.val.as_deref().and_then(|v| v.node.as_ref()) {
-        Some(node::Node::ParamRef(p)) if params.is_untyped_output(p.location) => {
+    match rt
+        .val
+        .as_deref()
+        .and_then(|v| expr::bare_param(v, snapshot))
+    {
+        Some(p) if params.is_untyped_output(p.location) => {
             expr::coerce_untyped_param(p, oid::TEXT, snapshot, params)
         }
         _ => Ok(()),

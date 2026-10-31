@@ -944,7 +944,14 @@ fn infer_expr_unlocated(
         node::Node::ColumnRef(col_ref) => infer_column_ref(col_ref, ctx, params),
         node::Node::AConst(a_const) => infer_a_const(a_const),
         node::Node::TypeCast(cast) => match passthrough_cast_operand(node, snapshot, params) {
-            Some(operand) => infer_expr(operand, ctx, params, goal.clone()),
+            Some(operand) => {
+                if let Some(node::Node::ParamRef(p)) = operand.node.as_ref()
+                    && params.get(p.number) == oid::UNKNOWN
+                {
+                    params.mark_untyped_cast_operand(p.location);
+                }
+                infer_expr(operand, ctx, params, goal.clone())
+            }
             None => infer_type_cast(cast, ctx, params),
         },
         node::Node::FuncCall(func) => infer_func_call(func, ctx, params),
@@ -1565,6 +1572,7 @@ fn replay_targets(
         if let Some(p) = bare_param(val, ctx.snapshot) {
             if scratch.get(p.number) == oid::UNKNOWN {
                 params.mark_untyped_output(p.location);
+                params.mark_untyped_cast_operand(p.location);
             }
             scratch.see(p.number);
             continue;
@@ -1642,14 +1650,17 @@ impl TransformReplay {
         ctx: Ctx<'_>,
         params: &ParamCollector,
     ) -> bool {
-        match item.node.as_ref() {
-            Some(node::Node::ParamRef(p)) => {
+        match bare_param(item, ctx.snapshot) {
+            Some(p) => {
                 let untyped = params.bound_arg(p.number).is_none()
                     && self.scratch.get(p.number) == oid::UNKNOWN;
+                if untyped {
+                    self.scratch.mark_untyped_cast_operand(p.location);
+                }
                 self.scratch.see(p.number);
                 untyped
             }
-            _ => {
+            None => {
                 let before = self.scratch.clone();
                 if infer_expr(item, ctx, &mut self.scratch, TypeGoal::NONE).is_err() {
                     self.scratch = before;
@@ -1701,10 +1712,11 @@ pub(crate) fn resolve_unknown_key(
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
 ) -> Result<(), AnalyzeError> {
-    if let Some(node::Node::ParamRef(p)) = key.node.as_ref()
+    if let Some(p) = bare_param(key, snapshot)
         && params.bound_arg(p.number).is_none()
         && params.get(p.number) == oid::UNKNOWN
     {
+        params.mark_untyped_cast_operand(p.location);
         coerce_untyped_param(p, oid::TEXT, snapshot, params)?;
     }
     Ok(())
@@ -1719,8 +1731,9 @@ pub(crate) fn coerce_unknown_operand(
     params: &mut ParamCollector,
     target: PgTypeOid,
 ) -> Result<(), AnalyzeError> {
-    match node.node.as_ref() {
-        Some(node::Node::ParamRef(p)) if params.bound_arg(p.number).is_none() => {
+    match bare_param(node, ctx.snapshot) {
+        Some(p) if params.bound_arg(p.number).is_none() => {
+            params.mark_untyped_cast_operand(p.location);
             coerce_untyped_param(p, target, ctx.snapshot, params)?;
             coerce_unknown_to(node, ctx, params, target)
         }

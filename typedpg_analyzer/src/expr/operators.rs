@@ -817,12 +817,8 @@ pub(crate) fn row_pairwise_op(
     let mut nullable = false;
     let mut ops = Vec::with_capacity(largs.len());
     for (i, (l, r)) in largs.iter().zip(rargs).enumerate() {
-        fn untyped_param(n: &protobuf::Node, untyped: bool) -> Option<&protobuf::ParamRef> {
-            match n.node.as_ref() {
-                Some(node::Node::ParamRef(p)) if untyped => Some(p),
-                _ => None,
-            }
-        }
+        let untyped_param =
+            |n, untyped: bool| super::bare_param(n, ctx.snapshot).filter(|_| untyped);
         let pair_params: Vec<&protobuf::ParamRef> =
             [untyped_param(l, luntyped[i]), untyped_param(r, runtyped[i])]
                 .into_iter()

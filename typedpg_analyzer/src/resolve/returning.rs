@@ -54,11 +54,11 @@ pub(crate) fn resolve_returning(
     }
     // (Only a bare `$N` changes anything here: any other parameter is typed
     // alike by the walk below.)
-    let bare_param = |t: &protobuf::Node| {
+    let is_bare_param = |t: &protobuf::Node| {
         matches!(t.node.as_ref(), Some(node::Node::ResTarget(rt))
-            if matches!(rt.val.as_deref().and_then(|v| v.node.as_ref()), Some(node::Node::ParamRef(_))))
+            if rt.val.as_deref().and_then(|v| expr::bare_param(v, ctx.snapshot)).is_some())
     };
-    if clause.exprs.iter().any(bare_param) {
+    if clause.exprs.iter().any(is_bare_param) {
         resolve_unknown_returning_params(
             clause,
             expr::Ctx::new(&scope, ctx.null_ctx, ctx.snapshot),
@@ -129,7 +129,7 @@ fn resolve_unknown_returning_params(
         .collect();
     let untyped = expr::replay_transform(&items, ctx, params);
     for (item, untyped) in items.into_iter().zip(untyped) {
-        if untyped && let Some(node::Node::ParamRef(p)) = item.node.as_ref() {
+        if untyped && let Some(p) = expr::bare_param(item, ctx.snapshot) {
             expr::coerce_untyped_param(p, oid::TEXT, ctx.snapshot, params)?;
         }
     }

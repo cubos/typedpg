@@ -784,7 +784,7 @@ fn analyze_insert_values(
             // EXPR_KIND_VALUES / EXPR_KIND_VALUES_SINGLE.
             crate::clause::check_no_aggregates_or_windows(val, snapshot, "VALUES")?;
             if untyped[i]
-                && let Some(node::Node::ParamRef(p)) = val.node.as_ref()
+                && let Some(p) = expr::bare_param(val, snapshot)
                 && let Some(t) = &target
             {
                 expr::coerce_untyped_param(p, t.type_oid, snapshot, params)?;
