@@ -129,6 +129,8 @@ pub fn create_view(interp: &mut PgCatalog, stmt: &ViewStmt) -> Result<(), DdlErr
         if let Some(updatability) = updatability {
             interp.view_updatability.insert(existing_oid, updatability);
         }
+        // OR REPLACE replaces the options too (AT_ReplaceRelOptions).
+        set_security_barrier(interp, existing_oid, &stmt.options, true, false);
         return Ok(());
     }
 
@@ -158,8 +160,50 @@ pub fn create_view(interp: &mut PgCatalog, stmt: &ViewStmt) -> Result<(), DdlErr
         if let Some(updatability) = updatability {
             interp.view_updatability.insert(oid, updatability);
         }
+        set_security_barrier(interp, oid, &stmt.options, true, false);
     }
     Ok(())
+}
+
+/// Record view `relid`'s `security_barrier` option as `options` set it:
+/// with `replace` (the options replaced wholesale), an absent option is
+/// off; otherwise only the options listed change (`ALTER VIEW … SET`),
+/// to off when `reset`.
+pub(crate) fn set_security_barrier(
+    interp: &mut PgCatalog,
+    relid: PgClassOid,
+    options: &[protobuf::Node],
+    replace: bool,
+    reset: bool,
+) {
+    let given = options.iter().find_map(|o| match o.node.as_ref() {
+        Some(node::Node::DefElem(de))
+            if de.defname == "security_barrier" && de.defnamespace.is_empty() =>
+        {
+            Some(
+                !reset
+                    && match de.arg.as_deref().and_then(|a| a.node.as_ref()) {
+                        None => true,
+                        Some(node::Node::String(s)) => {
+                            super::reloptions::parse_bool(&s.sval).unwrap_or(false)
+                        }
+                        Some(node::Node::Boolean(b)) => b.boolval,
+                        Some(node::Node::Integer(i)) => i.ival != 0,
+                        _ => false,
+                    },
+            )
+        }
+        _ => None,
+    });
+    match given.or((replace).then_some(false)) {
+        Some(true) => {
+            interp.security_barrier_views.insert(relid);
+        }
+        Some(false) => {
+            interp.security_barrier_views.remove(&relid);
+        }
+        None => {}
+    }
 }
 
 pub fn create_table_as(interp: &mut PgCatalog, stmt: &CreateTableAsStmt) -> Result<(), DdlError> {
@@ -2243,11 +2287,12 @@ pub(crate) fn reanalyze_view(
     let stored = snapshot.view_references.get(&relid)?;
     let query = view_query(snapshot, relid)?;
     let inner = query.node.as_ref()?;
-    // The query's shape only: whether it would run is the caller's.
+    // The query's shape only: whether it would run, and what the planner
+    // folds of it, is the reading statement's to report.
     let (analyzed, references) = expanding_view(relid, || {
         super::depend::collect(|| {
             crate::resolve::without_execution(|| {
-                crate::resolve::analyze_raw_node(snapshot, inner, &[])
+                crate::expr::may_skip(|| crate::resolve::analyze_raw_node(snapshot, inner, &[]))
             })
         })
     })?;
@@ -2355,6 +2400,38 @@ pub(crate) fn relations_rule_recursion(
     relations
         .into_iter()
         .find_map(|r| view_rule_recursion(snapshot, r))
+}
+
+/// What the planner raises planning view `relid`'s query, once the
+/// rewriter put it in the statement reading the view and the planner
+/// pulled it up, like a FROM subquery's (see `resolve::deferred`): `None`
+/// when the planner may not pull it up (a `security_barrier` view, a
+/// query `deferred::plan_of` can't tell about, a system view), or the
+/// query no longer resolves as it did (see [`reanalyze_view`]).
+pub(crate) fn planned_view_errors(
+    snapshot: &PgCatalog,
+    relid: PgClassOid,
+) -> Option<crate::resolve::Split> {
+    /// FirstNormalObjectId (transam.h): below, what initdb made.
+    const FIRST_NORMAL_OBJECT_ID: u32 = 16384;
+    if snapshot.security_barrier_views.contains(&relid) || relid.get() < FIRST_NORMAL_OBJECT_ID {
+        return None;
+    }
+    let stored = snapshot.view_references.get(&relid)?;
+    let query = view_query(snapshot, relid)?;
+    let inner = query.node.as_ref()?;
+    let node::Node::SelectStmt(sel) = inner else {
+        return None;
+    };
+    // The query is another text: its errors keep their plain messages.
+    let _barrier = crate::error::DiagContextGuard::barrier();
+    let ((analyzed, references), split) = expanding_view(relid, || {
+        crate::resolve::planned_errors(sel, || {
+            super::depend::collect(|| crate::resolve::analyze_raw_node(snapshot, inner, &[]))
+        })
+    })??;
+    analyzed.ok()?;
+    (bound_references(snapshot, &references) == *stored).then_some(split)
 }
 
 /// Whether reading view `relid` locks rows: its query, or that of a view

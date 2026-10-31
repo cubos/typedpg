@@ -101,6 +101,7 @@ pub(crate) fn infer_column_ref(
         crate::error::SourceSpan::from_node_qname(col_ref.location),
     ) {
         Ok(col) => {
+            super::read_deferred([col], col_ref.location)?;
             let nullable = null_ctx.is_nullable(&col.table_alias, &col.name, col.base_not_null);
             Ok(ExprType {
                 type_oid: col.type_oid,
@@ -140,6 +141,7 @@ pub(crate) fn infer_column_ref(
                 && let Some(src) = scope.find_source(column)
             {
                 scope.check_refname_unique(column, None)?;
+                super::read_deferred(&src.columns, col_ref.location)?;
                 return whole_row_ref(src, null_ctx, snapshot);
             }
             // `t.f` naming no column of a FROM entry `t` is the function
@@ -298,6 +300,7 @@ fn infer_star_ref(
     let source = scope.find_source(alias).ok_or_else(|| {
         AnalyzeError::UndefinedTable(format!("missing FROM-clause entry for table \"{alias}\""))
     })?;
+    super::read_deferred(&source.columns, col_ref.location)?;
     whole_row_ref(source, null_ctx, snapshot)
 }
 

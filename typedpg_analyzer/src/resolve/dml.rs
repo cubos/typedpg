@@ -12,11 +12,47 @@ pub(crate) fn analyze_insert(
     analyze_insert_with_outer_ctes(ins, snapshot, params, &HashMap::new())
 }
 
+/// Whether an INSTEAD rule on `relation` replaces a `cmd` statement on
+/// it: the rewriter drops the statement (or, a conditional rule, keeps it
+/// under a condition), so what the planner would fold of it may never be
+/// planned — its plan-time checks are off.
+fn replaced_by_instead_rule(
+    relation: Option<&protobuf::RangeVar>,
+    cmd: CmdType,
+    snapshot: &PgCatalog,
+) -> bool {
+    let Some(r) = relation else {
+        return false;
+    };
+    let schema = (!r.schemaname.is_empty()).then_some(r.schemaname.as_str());
+    let Some(class) = snapshot.resolve_table(schema, &r.relname) else {
+        return false;
+    };
+    snapshot.rules.get(&class.oid).is_some_and(|rules| {
+        rules
+            .iter()
+            .any(|rule| rule.enabled && rule.event == cmd && rule.instead)
+    })
+}
+
 /// Like [`analyze_insert`] but accepts CTEs that were defined in an
 /// enclosing `WITH` clause (top-level `WITH … INSERT …` mixes them via
 /// [`analyze_cte`]). The outer CTEs are merged into the INSERT's local
 /// `cte_scopes` so `INSERT … SELECT … FROM <outer_cte>` resolves.
 pub(crate) fn analyze_insert_with_outer_ctes(
+    ins: &protobuf::InsertStmt,
+    snapshot: &PgCatalog,
+    params: &mut ParamCollector,
+    outer_ctes: &HashMap<String, Vec<ScopeColumn>>,
+) -> AnalyzeResult {
+    if replaced_by_instead_rule(ins.relation.as_ref(), CmdType::CmdInsert, snapshot) {
+        crate::expr::replaced_by_rule(|| analyze_insert_here(ins, snapshot, params, outer_ctes))
+    } else {
+        analyze_insert_here(ins, snapshot, params, outer_ctes)
+    }
+}
+
+fn analyze_insert_here(
     ins: &protobuf::InsertStmt,
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
@@ -107,6 +143,36 @@ pub(crate) fn analyze_insert_with_outer_ctes(
         && let Some(v) = row_violation(&tgt, &[], &|_| Known::Unknown, snapshot)
     {
         return Err(v.error);
+    }
+
+    // The columns the INSERT leaves to their default — omitted, or
+    // `DEFAULT` in some VALUES row — get the default expression, converted
+    // to the column's type (rewriteTargetListIU / rewriteValuesRTE): a
+    // constant one is folded like a written value.
+    if crate::expr::plan_time_checks() {
+        let rows: Vec<&[protobuf::Node]> =
+            match ins.select_stmt.as_deref().and_then(|n| n.node.as_ref()) {
+                Some(node::Node::SelectStmt(sel)) => sel
+                    .values_lists
+                    .iter()
+                    .filter_map(|l| match l.node.as_ref() {
+                        Some(node::Node::List(list)) => Some(list.items.as_slice()),
+                        _ => None,
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
+        for c in tgt.attrs.iter().filter(|c| c.attnum > 0) {
+            let position = (0..assigns.len())
+                .find(|&i| target_col_at(&tgt, i).is_some_and(|t| t.attnum == c.attnum));
+            let defaulted = match position {
+                None => true,
+                Some(i) => rows.iter().any(|r| r.get(i).is_some_and(is_set_to_default)),
+            };
+            if defaulted && let Some(err) = default_fold_error(c, snapshot) {
+                return Err(err);
+            }
+        }
     }
 
     let (arbiter, conflict_set_list) = match &ins.on_conflict_clause {
@@ -763,6 +829,7 @@ fn analyze_insert_values(
             });
             if let Some(tc) = target_col
                 && !indirected
+                && !tgt.discards(tc)
                 && let Some(err) = crate::typmod::check_literal_assignment(
                     snapshot,
                     tc.atttypid,
@@ -1057,6 +1124,36 @@ fn row_relation<'a>(
         _ => None,
     };
     (lands_in, unrouted)
+}
+
+/// The error the planner raises folding column `c`'s default (of table
+/// `relid`) into a statement writing it: a constant out of its column's
+/// range (`int2 DEFAULT 40000`) or failing itself (`DEFAULT 1 / 0`). PG
+/// stores such a default — only a statement using it fails.
+pub(crate) fn default_fold_error(
+    c: &crate::pg_catalog::PgAttribute,
+    snapshot: &PgCatalog,
+) -> Option<AnalyzeError> {
+    if !crate::expr::plan_time_checks() || c.attgenerated.is_some() || c.attidentity.is_some() {
+        return None;
+    }
+    let Some(crate::ddl::tables::check_inherit::StoredExpr::Written(e)) =
+        snapshot.attr_default_exprs.get(&(c.attrelid, c.attnum))
+    else {
+        return None;
+    };
+    // (The default isn't in the statement's text: no location.)
+    if let Some(err) = crate::fold::error(e, snapshot) {
+        return crate::expr::plan_time_error(None, err.raw(None).finalize_implicit());
+    }
+    crate::typmod::assignment_error(
+        snapshot,
+        c.atttypid,
+        snapshot.effective_typmod(c.atttypid, c.atttypmod),
+        e,
+        None,
+        || None,
+    )
 }
 
 /// Whether column `c`'s default is NULL: no DEFAULT, identity or
@@ -1364,6 +1461,28 @@ fn analyze_insert_select(
                 )),
             )
             .finalize_implicit());
+        }
+    }
+
+    // A SELECT the planner pulls up into the INSERT (`is_simple_subquery`)
+    // has its outputs substituted into the INSERT's target list, where
+    // their conversion to the columns' types is folded like a VALUES row's.
+    if super::deferred::pulled_up(val_sel) {
+        for (i, target) in direct_targets.iter().enumerate() {
+            if let Some(node::Node::ResTarget(rt)) = target.node.as_ref()
+                && let Some(val) = &rt.val
+                && let Some(tc) = target_col_at(tgt, i)
+                && tgt.col_indirection.get(i).is_none_or(|ind| ind.is_empty())
+                && !tgt.discards(tc)
+                && let Some(err) = crate::typmod::check_literal_assignment(
+                    snapshot,
+                    tc.atttypid,
+                    snapshot.effective_typmod(tc.atttypid, tc.atttypmod),
+                    val,
+                )
+            {
+                return Err(err);
+            }
         }
     }
 
@@ -1807,6 +1926,19 @@ pub(crate) fn analyze_update_with_outer_ctes(
     params: &mut ParamCollector,
     outer_ctes: &HashMap<String, Vec<ScopeColumn>>,
 ) -> AnalyzeResult {
+    if replaced_by_instead_rule(upd.relation.as_ref(), CmdType::CmdUpdate, snapshot) {
+        crate::expr::replaced_by_rule(|| analyze_update_here(upd, snapshot, params, outer_ctes))
+    } else {
+        analyze_update_here(upd, snapshot, params, outer_ctes)
+    }
+}
+
+fn analyze_update_here(
+    upd: &protobuf::UpdateStmt,
+    snapshot: &PgCatalog,
+    params: &mut ParamCollector,
+    outer_ctes: &HashMap<String, Vec<ScopeColumn>>,
+) -> AnalyzeResult {
     let _level = QueryLevel::enter();
     let _plan =
         expr::plan_fold::PlanLevel::enter(upd.where_clause.as_deref(), &upd.from_clause, snapshot);
@@ -2037,6 +2169,19 @@ pub(crate) fn analyze_delete(
 /// [`analyze_delete`] for a DELETE that sees the CTEs of an enclosing
 /// `WITH` (a data-modifying CTE body).
 pub(crate) fn analyze_delete_with_outer_ctes(
+    del: &protobuf::DeleteStmt,
+    snapshot: &PgCatalog,
+    params: &mut ParamCollector,
+    outer_ctes: &HashMap<String, Vec<ScopeColumn>>,
+) -> AnalyzeResult {
+    if replaced_by_instead_rule(del.relation.as_ref(), CmdType::CmdDelete, snapshot) {
+        crate::expr::replaced_by_rule(|| analyze_delete_here(del, snapshot, params, outer_ctes))
+    } else {
+        analyze_delete_here(del, snapshot, params, outer_ctes)
+    }
+}
+
+fn analyze_delete_here(
     del: &protobuf::DeleteStmt,
     snapshot: &PgCatalog,
     params: &mut ParamCollector,

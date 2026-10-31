@@ -497,6 +497,7 @@ pub(crate) fn generation_not_null(
         .attributes_of(relid)
         .iter()
         .map(|a| ScopeColumn {
+            deferred: Default::default(),
             name: a.attname.clone(),
             type_oid: a.atttypid,
             // A generation expression reads no generated column.

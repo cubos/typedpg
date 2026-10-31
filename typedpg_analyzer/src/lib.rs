@@ -41,6 +41,7 @@ mod decimal;
 mod diagnostic;
 mod error;
 mod expr;
+mod fold;
 mod functions;
 mod grouping;
 mod having;

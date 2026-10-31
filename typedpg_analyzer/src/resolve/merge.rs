@@ -604,6 +604,17 @@ fn merge_when_insert(
             let rel = table_attrs.first()?.attrelid;
             Some((rel, table_relname.to_owned()))
         });
+    // The columns the action leaves to their default — omitted, or
+    // `DEFAULT` — are written their default (see `analyze_insert`).
+    for c in table_attrs.iter().filter(|c| c.attnum > 0) {
+        let defaulted = match target_attrs.iter().position(|t| t.attnum == c.attnum) {
+            None => true,
+            Some(i) => when.values.get(i).is_none_or(is_set_to_default),
+        };
+        if defaulted && let Some(err) = super::dml::default_fold_error(c, snapshot) {
+            return Err(err);
+        }
+    }
     for (i, val) in when.values.iter().enumerate() {
         let target_col = target_attrs.get(i).copied();
         // The column, or the element / field an indirected target (`arr[1]`,
@@ -636,12 +647,14 @@ fn merge_when_insert(
             {
                 return Err(err);
             }
-            if let Some(err) = crate::typmod::check_literal_assignment(
-                snapshot,
-                tc.atttypid,
-                snapshot.effective_typmod(tc.atttypid, tc.atttypmod),
-                val,
-            ) {
+            if !discards(tc)
+                && let Some(err) = crate::typmod::check_literal_assignment(
+                    snapshot,
+                    tc.atttypid,
+                    snapshot.effective_typmod(tc.atttypid, tc.atttypmod),
+                    val,
+                )
+            {
                 return Err(err);
             }
         }

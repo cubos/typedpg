@@ -37,7 +37,9 @@ pub(crate) fn infer_bool_expr(
     let mut any_nullable = false;
     let mut decided = false;
     // Folding stops at an argument that decides the AND / OR: the planner
-    // never reaches the ones after it.
+    // never reaches the ones after it. Past an argument that may fold to
+    // one — a column of a pulled-up subquery, an inlined function, ... (see
+    // `foldable`) — nothing is certainly folded either.
     let mut dead = false;
     for arg in &expr.args {
         let narrowed = if and_or {
@@ -55,7 +57,8 @@ pub(crate) fn infer_bool_expr(
         })?;
         if and_or {
             dead = dead
-                || super::plan_fold::stops_after(super::plan_fold::fold(arg, ctx.snapshot), or);
+                || super::plan_fold::stops_after(super::plan_fold::fold(arg, ctx.snapshot), or)
+                || super::foldable::foldable(arg, ctx).value;
         }
         any_nullable = any_nullable || t.nullable;
         if and_or {
@@ -195,14 +198,16 @@ pub(crate) fn infer_coalesce(
     // `COALESCE(int_col, '42')` is integer and `COALESCE(int_col, 'x')`
     // fails with PG's `invalid input syntax for type integer: "x"`.
     let mut args = Vec::with_capacity(expr.args.len());
-    // Folding stops at the first non-NULL constant argument.
+    // Folding stops at the first non-NULL constant argument; past one that
+    // may fold to one (see `foldable`), nothing is certainly folded either.
     let mut dead = false;
     for arg in &expr.args {
         args.push(super::plan_fold::unless_dead(dead, || {
             infer_expr(arg, ctx, params, TypeGoal::NONE)
         })?);
-        dead =
-            dead || super::plan_fold::coalesce_stops_after(super::plan_fold::fold(arg, snapshot));
+        dead = dead
+            || super::plan_fold::coalesce_stops_after(super::plan_fold::fold(arg, snapshot))
+            || super::foldable::foldable(arg, ctx).value;
     }
 
     // Resolve over the *full* arg list (unknowns included): the
@@ -435,6 +440,11 @@ pub(crate) fn infer_case(
         .as_deref()
         .map(|a| super::plan_fold::fold(a, snapshot));
     let mut stopped = false;
+    // The planner drops a WHEN whose condition it folds to FALSE (its
+    // result unfolded), and every one after a condition it folds to TRUE
+    // (the ELSE too): past a condition that may fold, nothing is certainly
+    // folded.
+    let mut may_be_skipped = false;
     for arg in &expr.args {
         let Some(node::Node::CaseWhen(when)) = arg.node.as_ref() else {
             continue;
@@ -447,6 +457,7 @@ pub(crate) fn infer_case(
         let mut taken = crate::nonnull::Facts::default();
         let mut simple_not_taken = crate::nonnull::Facts::default();
         if let Some(cond) = &when.expr {
+            let _skipped = super::skipped_if(may_be_skipped);
             let cond_ctx = ctx.logging_strictness(&log);
             match (test_oid, expr.arg.as_deref()) {
                 (Some(test_oid), Some(test)) => {
@@ -500,9 +511,12 @@ pub(crate) fn infer_case(
                 }
             }
         }
+        may_be_skipped |=
+            super::foldable::case_test_may_fold(expr.arg.as_deref(), when.expr.as_deref(), ctx);
         // Untyped string literals stay UNKNOWN for branch reconciliation and
         // are validated under the resolved common type in pass 2.
         if let Some(result) = &when.result {
+            let _skipped = super::skipped_if(may_be_skipped);
             let facts = not_taken.clone().union(taken).restricted_to(&own);
             let mut narrowed = ctx.null_ctx.with_local_facts(facts);
             // `WHEN grouping(g) = 0`: the row's grouping set holds `g`.
@@ -565,6 +579,7 @@ pub(crate) fn infer_case(
     // The ELSE result (or PG's implicit `ELSE NULL`) leads the list.
     let default = match &expr.defresult {
         Some(d) => {
+            let _skipped = super::skipped_if(may_be_skipped);
             let narrowed = ctx.null_ctx.with_local_facts(not_taken.restricted_to(&own));
             let default_ctx = match &narrowed {
                 Some(n) => ctx.with_null_ctx(n),

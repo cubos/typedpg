@@ -473,6 +473,13 @@ pub(crate) fn analyze_set_clause<'a>(
                 {
                     return Err(err);
                 }
+                // `SET col = DEFAULT` writes the column's default.
+                if !target.indirected
+                    && is_set_to_default(val)
+                    && let Some(err) = super::dml::default_fold_error(tc, snapshot)
+                {
+                    return Err(err);
+                }
                 if !target.indirected
                     && let Some(err) = crate::typmod::check_literal_assignment(
                         snapshot,

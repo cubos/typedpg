@@ -495,6 +495,7 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         // statement's SQL does.
         node::Node::TransactionStmt(s) => session::transaction(db, s),
         node::Node::SelectStmt(s) if s.into_clause.is_some() => views::select_into(db, s),
+        // A migration's query runs: what the planner folds is checked.
         node::Node::SelectStmt(s) => {
             dml::check_executed(db, stmt)?;
             session::select_side_effects(db, s)

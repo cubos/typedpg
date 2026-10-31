@@ -33,6 +33,12 @@ pub(crate) fn analyze_correlated_select(
     // for unqualified references. The enclosing level's own entries carry
     // its nullability (outer joins, quals proven so far) down; the tiers
     // it received already carry their levels'.
+    // Planned only when the expression around the sublink is.
+    let _skipped = expr::skipped_if(!expr::sublink_planned(expr::Ctx::new(
+        outer_scope,
+        outer_null_ctx,
+        snapshot,
+    )));
     let mut outer: Vec<crate::scope::TableSource> =
         outer_null_ctx.bake_sources(&outer_scope.sources);
     outer.extend(outer_scope.lateral_sources.iter().cloned());
@@ -228,6 +234,7 @@ fn analyze_select_here(
             return Err(crate::pgmsg::select_into_not_allowed(into_span(into)).finalize_implicit());
         }
     }
+    let _expressions = expr::Enclosing::boundary();
     // Start with outer CTEs (from parent WITH clause).
     let mut cte_scopes: HashMap<String, Vec<ScopeColumn>> = outer_ctes.clone();
 
@@ -1156,6 +1163,7 @@ fn values_sort_and_limit(
     let cols: Vec<ScopeColumn> = columns
         .iter()
         .map(|c| ScopeColumn {
+            deferred: Default::default(),
             name: c.name.clone(),
             type_oid: c.type_oid,
             base_not_null: !c.nullable,
@@ -1786,6 +1794,19 @@ pub(crate) fn analyze_limit_offset(
             continue;
         };
         crate::clause::coerce_clause_expr(limit_node, ctx, params, kind)?;
+        // The conversion to `bigint` is folded by the planner.
+        if expr::plan_time_checks()
+            && let Some(e) = crate::fold::conversion_error(
+                limit_node,
+                crate::pg_catalog::oid::INT8,
+                None,
+                ctx.snapshot,
+            )
+            && let Some(e) =
+                expr::plan_time_error(crate::error::node_location(limit_node), e.at(limit_node))
+        {
+            return Err(e);
+        }
         check_no_srf_in_clause(limit_node, ctx.snapshot, label)?;
         let mut var: Option<i32> = None;
         visit_same_level(limit_node, &mut |e| {

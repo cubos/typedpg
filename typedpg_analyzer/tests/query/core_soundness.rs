@@ -476,7 +476,7 @@ fn a_numeric_literal_cast_beyond_its_typmod_is_rejected() {
     ] {
         assert_err_prefix!(
             db.analyze(sql),
-            AnalyzeError::Invalid(_),
+            AnalyzeError::NumericValueOutOfRange(_),
             &format!("numeric field overflow: a field with {detail}")
         );
     }

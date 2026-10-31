@@ -42,6 +42,19 @@ pub(crate) struct Rule {
     /// The command of every action, in order (`CmdUtility` for NOTIFY):
     /// the product queries firing the rule adds.
     pub(crate) action_cmds: Vec<CmdType>,
+    /// What the planner raises planning an action, conditional or not,
+    /// whenever a statement firing the rule is planned (see
+    /// [`action_plan_error`]) — unless an unconditional INSTEAD rule on
+    /// the action's result relation (`target`) replaces the action.
+    pub(crate) plan_errors: Vec<ActionPlanError>,
+}
+
+/// An error planning a rule action raises (see [`Rule::plan_errors`]).
+#[derive(Clone, Debug)]
+pub(crate) struct ActionPlanError {
+    /// The action's result relation and command; `None` for a SELECT.
+    pub(crate) target: Option<(PgClassOid, CmdType)>,
+    pub(crate) error: crate::error::AnalyzeError,
 }
 
 /// CREATE RULE. Returns what the rule's qualification and actions refer
@@ -146,6 +159,7 @@ fn define_rule(
         references.extend(refs);
     }
     let mut actions = Vec::new();
+    let mut plan_errors = Vec::new();
     // Each action's output columns, when the analysis could tell them.
     let mut outputs = Vec::new();
     for action in &stmt.actions {
@@ -172,6 +186,7 @@ fn define_rule(
                     .into(),
             ));
         }
+        plan_errors.extend(action_plan_error(interp, relid, action, has_old, has_new));
     }
     define_query_rewrite(interp, relid, stmt, event, &outputs)?;
     if event == CmdType::CmdSelect {
@@ -237,6 +252,7 @@ fn define_rule(
                 _ => CmdType::CmdUtility,
             })
             .collect(),
+        plan_errors,
     };
     let rules = interp.rules.entry(relid).or_default();
     if let Some(existing) = rules.iter_mut().find(|r| r.name == stmt.rulename) {
@@ -563,6 +579,41 @@ fn check_action_query(
     crate::scope::with_rule_pseudo_relations(interp, relation, &attrs, &names, || {
         super::dml::analyze_stored_statement(interp, inner)
     })
+}
+
+/// What the planner raises planning `action` (folding a constant out of
+/// range, …), with what replaces it: PG only stores an action when the
+/// rule is created, and plans it — conditional rule or not — in every
+/// statement that fires the rule. The action is analyzed as a planned
+/// statement, NEW and OLD standing for any value (a statement's constant
+/// may be substituted for them), its own rewriting left to when it fires.
+fn action_plan_error(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+    action: &typedpg_pg_query::protobuf::Node,
+    has_old: bool,
+    has_new: bool,
+) -> Option<ActionPlanError> {
+    let target = match action.node.as_ref()? {
+        node::Node::SelectStmt(_) => None,
+        node::Node::InsertStmt(s) => Some((s.relation.as_ref()?, CmdType::CmdInsert)),
+        node::Node::UpdateStmt(s) => Some((s.relation.as_ref()?, CmdType::CmdUpdate)),
+        node::Node::DeleteStmt(s) => Some((s.relation.as_ref()?, CmdType::CmdDelete)),
+        _ => return None,
+    };
+    let target = match target {
+        Some((rv, cmd)) => Some((super::util::lookup_relation(interp, rv).ok()?.1, cmd)),
+        None => None,
+    };
+    let (_, errors) = crate::expr::with_plan_time_checks(|| {
+        crate::expr::capture_plan_time_errors(|| {
+            crate::resolve::rewrite::collect_rule_actions(|| {
+                check_action_query(interp, relid, action, has_old, has_new)
+            })
+        })
+    });
+    let (_, error) = errors.into_iter().next()?;
+    Some(ActionPlanError { target, error })
 }
 
 /// `DROP RULE [IF EXISTS] name ON table`.

@@ -27,14 +27,19 @@ pub(crate) fn infer_sublink(
             {
                 // What the subquery's WHERE proves of this level's columns
                 // holds whenever EXISTS is TRUE (see `capture_correlation`).
+                // `simplify_EXISTS_query` discards the target list, ORDER
+                // BY, DISTINCT, … before the subquery is planned: only its
+                // FROM and WHERE are certainly folded.
                 let (analyzed, facts) = crate::nonnull::capture_correlation(sel, || {
-                    crate::resolve::analyze_correlated_select(
-                        sel,
-                        snapshot,
-                        params,
-                        scope,
-                        ctx.null_ctx,
-                    )
+                    crate::resolve::analyze_exists(sel, || {
+                        crate::resolve::analyze_correlated_select(
+                            sel,
+                            snapshot,
+                            params,
+                            scope,
+                            ctx.null_ctx,
+                        )
+                    })
                 });
                 analyzed?;
                 if let Some(log) = ctx.strict_log {

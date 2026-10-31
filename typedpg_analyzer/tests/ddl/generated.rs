@@ -764,3 +764,45 @@ fn a_call_leaving_parameters_out_runs_their_defaults() {
         ),
     ]);
 }
+
+#[test]
+fn planning_an_expression_folds_its_constants() {
+    // CheckMutability / contain_mutable_functions_after_planning plan the
+    // expression (`expression_planner`) before looking at its functions:
+    // a constant that can't fold fails the DDL statement.
+    for (stmt, msg) in [
+        (
+            "CREATE TABLE t (a int, b int2 GENERATED ALWAYS AS (40000::int2) STORED);",
+            "smallint out of range",
+        ),
+        (
+            "CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a + (2147483647 + 1)) VIRTUAL);",
+            "integer out of range",
+        ),
+        (
+            "CREATE TABLE t (a int, b numeric GENERATED ALWAYS AS (100::numeric(3,1)) VIRTUAL);",
+            "numeric field overflow",
+        ),
+        (
+            "CREATE TABLE t (a int); CREATE INDEX ON t ((a + 100::numeric(3,1)));",
+            "numeric field overflow",
+        ),
+        (
+            "CREATE TABLE t (a int); CREATE INDEX ON t (a) WHERE a < 40000::int2;",
+            "smallint out of range",
+        ),
+        (
+            "CREATE TABLE t (a int) PARTITION BY RANGE ((a + 40000::int2));",
+            "smallint out of range",
+        ),
+    ] {
+        assert_err("", stmt, msg);
+    }
+    // `a + 2147483647` reads a column: nothing to fold. The conversion to
+    // the column's type is not part of the planned expression.
+    build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a + 2147483647 + 1) STORED,
+             c int2 GENERATED ALWAYS AS (40000) STORED);",
+    )]);
+}

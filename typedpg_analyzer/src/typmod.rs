@@ -380,32 +380,69 @@ fn is_pgvector_type(snapshot: &PgCatalog, oid: PgTypeOid) -> bool {
 // ─── Validation: literal vs column typmod ─────────────────────────────────
 
 /// Check whether assigning `value` (a SQL literal node) to a column with
-/// `(type_oid, typmod)` would violate the typmod's bound. Returns
-/// `Some(error)` when we can prove a violation at compile time; `None`
-/// otherwise (param refs, expressions, or types we don't validate).
+/// `(type_oid, typmod)` would violate the typmod's bound or the type's
+/// range. Returns `Some(error)` when we can prove a violation at compile
+/// time; `None` otherwise (param refs, expressions, or types we don't
+/// validate).
+///
+/// Every one of these errors comes from a coercion the planner folds — a
+/// length coercion function (`varchar(varchar, int4, bool)`,
+/// `numeric(numeric, int4)`), a conversion (`int2(int4)`) — not from
+/// parse analysis (`coerce_type` reads an untyped literal with typmod
+/// -1): it is reported only for a statement that is planned (see
+/// [`crate::expr::with_plan_time_checks`]), not for one a function body
+/// or a rule only stores.
 pub fn check_literal_assignment(
     snapshot: &PgCatalog,
     type_oid: PgTypeOid,
     typmod: Option<i32>,
     value: &Node,
 ) -> Option<AnalyzeError> {
-    let decoded = decode(snapshot, type_oid, typmod);
-    match decoded {
+    assignment_error(
+        snapshot,
+        type_oid,
+        typmod,
+        value,
+        crate::error::node_location(value),
+        || crate::error::expr_span(value),
+    )
+}
+
+/// [`check_literal_assignment`] of a value that may not be in the
+/// statement's text (a column's default): a folding error points at
+/// `span()`, and is about the node at `location` (see
+/// [`crate::expr::plan_time_error`]).
+pub(crate) fn assignment_error(
+    snapshot: &PgCatalog,
+    type_oid: PgTypeOid,
+    typmod: Option<i32>,
+    value: &Node,
+    location: Option<i32>,
+    span: impl FnOnce() -> Option<crate::error::SourceSpan>,
+) -> Option<AnalyzeError> {
+    if !crate::expr::plan_time_checks() {
+        return None;
+    }
+    let e = assignment_error_here(snapshot, type_oid, typmod, value, span)?;
+    crate::expr::plan_time_error(location, e)
+}
+
+fn assignment_error_here(
+    snapshot: &PgCatalog,
+    type_oid: PgTypeOid,
+    typmod: Option<i32>,
+    value: &Node,
+    span: impl FnOnce() -> Option<crate::error::SourceSpan>,
+) -> Option<AnalyzeError> {
+    if let Some(e) = crate::fold::conversion_error(value, type_oid, typmod, snapshot) {
+        return Some(e.raw(span()).finalize_implicit());
+    }
+    match decode(snapshot, type_oid, typmod) {
         DecodedTypmod::Length(_)
             if matches!(type_oid, builtin_oid::VARCHAR | builtin_oid::BPCHAR) =>
         {
-            let s = string_literal(value)?;
+            let s = assigned_string(value, snapshot)?;
             char_length_violation(snapshot, type_oid, typmod, s).map(AnalyzeError::Invalid)
-        }
-        DecodedTypmod::Numeric { precision, scale } => {
-            let raw = numeric_literal_string(value)?;
-            // Content first, magnitude second — PG runs numeric_in before
-            // applying the typmod, so a malformed literal is 22P02
-            // (`invalid input syntax`), never `numeric field overflow`.
-            if let Err(msg) = crate::literal_input::validate_numeric(&raw) {
-                return Some(AnalyzeError::InvalidLiteral(msg));
-            }
-            numeric_overflow(&raw, precision, scale).map(AnalyzeError::Invalid)
         }
         DecodedTypmod::VectorDim(n) => {
             let count = vector_literal_dim_count(value)?;
@@ -413,6 +450,36 @@ pub fn check_literal_assignment(
                 Some(AnalyzeError::Invalid(format!(
                     "expected {n} dimensions, not {count}"
                 )))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The string `node` assigns, as written: a string literal, or one cast
+/// to a string type that keeps it whole (`'abc'::text`) — not to one
+/// that may truncate it (`'abcd'::varchar(2)` is `'ab'`, `::char` is
+/// `char(1)`).
+fn assigned_string<'a>(node: &'a Node, snapshot: &PgCatalog) -> Option<&'a str> {
+    match node.node.as_ref()? {
+        node::Node::AConst(c) => match c.val.as_ref()? {
+            typedpg_pg_query::protobuf::a_const::Val::Sval(s) => Some(s.sval.as_str()),
+            _ => None,
+        },
+        node::Node::TypeCast(tc) => {
+            let tn = tc.type_name.as_ref()?;
+            let keeps = tn.typmods.is_empty()
+                && tn.array_bounds.is_empty()
+                && crate::ddl::util::resolve_type_name(tn, snapshot).is_some_and(|t| {
+                    matches!(
+                        t,
+                        builtin_oid::TEXT | builtin_oid::VARCHAR | builtin_oid::BPCHAR
+                    )
+                });
+            if keeps {
+                assigned_string(tc.arg.as_deref()?, snapshot)
             } else {
                 None
             }
@@ -487,52 +554,12 @@ fn string_literal(node: &Node) -> Option<&str> {
     }
 }
 
-fn numeric_literal_string(node: &Node) -> Option<String> {
-    match node.node.as_ref()? {
-        node::Node::AConst(c) => match c.val.as_ref()? {
-            typedpg_pg_query::protobuf::a_const::Val::Ival(i) => Some(i.ival.to_string()),
-            typedpg_pg_query::protobuf::a_const::Val::Fval(f) => Some(f.fval.clone()),
-            typedpg_pg_query::protobuf::a_const::Val::Sval(s) => Some(s.sval.clone()),
-            _ => None,
-        },
-        node::Node::TypeCast(tc) => tc.arg.as_deref().and_then(numeric_literal_string),
-        _ => None,
-    }
-}
-
-/// The error `numeric(p, s)` raises for the numeric literal `literal` (an
-/// untyped string, an integer or a decimal constant), if it provably does:
-/// a cast or assignment to a numeric typmod runs `apply_typmod` on the
-/// value. `None` for any other node, type or typmod, or a value that fits
-/// or doesn't parse (`numeric_in` reports that one).
-pub(crate) fn numeric_literal_overflow(
-    snapshot: &PgCatalog,
-    type_oid: PgTypeOid,
-    typmod: Option<i32>,
-    literal: &Node,
-) -> Option<String> {
-    let DecodedTypmod::Numeric { precision, scale } = decode(snapshot, type_oid, typmod) else {
-        return None;
-    };
-    let raw = match literal.node.as_ref()? {
-        node::Node::AConst(c) if !c.isnull => match c.val.as_ref()? {
-            typedpg_pg_query::protobuf::a_const::Val::Ival(i) => i.ival.to_string(),
-            typedpg_pg_query::protobuf::a_const::Val::Fval(f) => f.fval.clone(),
-            typedpg_pg_query::protobuf::a_const::Val::Sval(s) => s.sval.clone(),
-            _ => return None,
-        },
-        _ => return None,
-    };
-    crate::literal_input::validate_numeric(&raw).ok()?;
-    numeric_overflow(&raw, precision, scale)
-}
-
 /// `apply_typmod` / `apply_typmod_special` (numeric.c) on the valid
 /// `numeric_in` input `raw`: the value is rounded (half away from zero) to
 /// `scale` fractional digits, then must have at most `precision - scale`
 /// integer digits; infinity never fits, NaN always does. `Some(message)`
 /// with PG's `numeric field overflow` and its detail when it doesn't fit.
-fn numeric_overflow(raw: &str, precision: i32, scale: i32) -> Option<String> {
+pub(crate) fn numeric_overflow(raw: &str, precision: i32, scale: i32) -> Option<String> {
     let overflow = |detail: String| {
         Some(format!(
             "numeric field overflow: a field with precision {precision}, scale {scale} {detail}"

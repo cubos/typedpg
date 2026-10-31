@@ -1793,6 +1793,49 @@ pub(crate) fn cannot_accept_a_value_of_type(
     .with_primary_label("this literal")
 }
 
+/// `smallint out of range` / `integer out of range` / `bigint out of
+/// range` — SQLSTATE 22003 (`numeric_value_out_of_range`): an integer
+/// conversion or arithmetic (`int2(int4)`, `int4pl`, `numeric_int8`, …)
+/// whose result doesn't fit `type_name` (PG's `format_type` of it).
+pub(crate) fn integer_out_of_range(type_name: &str, span: Option<SourceSpan>) -> RawError {
+    RawError::new(
+        AnalyzeError::NumericValueOutOfRange(format!("{type_name} out of range")),
+        span,
+        None,
+    )
+}
+
+/// `numeric field overflow` and its detail (built by
+/// [`crate::typmod`]) — SQLSTATE 22003: `apply_typmod` of a value too
+/// large for `numeric(p, s)`.
+pub(crate) fn numeric_field_overflow(message: String, span: Option<SourceSpan>) -> RawError {
+    RawError::new(AnalyzeError::NumericValueOutOfRange(message), span, None)
+}
+
+/// `division by zero` — SQLSTATE 22012 (`int4div`, `int4mod`,
+/// `numeric_div`, …).
+pub(crate) fn division_by_zero(span: Option<SourceSpan>) -> RawError {
+    RawError::new(
+        AnalyzeError::DivisionByZero("division by zero".to_string()),
+        span,
+        None,
+    )
+}
+
+/// `cannot convert NaN to integer` / `cannot convert infinity to bigint`
+/// — SQLSTATE 0A000 (`numeric_int4` and friends on a special value).
+pub(crate) fn cannot_convert_special_numeric(
+    value: &str,
+    type_name: &str,
+    span: Option<SourceSpan>,
+) -> RawError {
+    RawError::new(
+        AnalyzeError::FeatureNotSupported(format!("cannot convert {value} to {type_name}")),
+        span,
+        None,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1875,6 +1918,16 @@ mod tests {
                 "0A000",
             ),
             (window_does_not_exist("w", None).kind, "42704"),
+            (integer_out_of_range("smallint", None).kind, "22003"),
+            (
+                numeric_field_overflow("numeric field overflow".into(), None).kind,
+                "22003",
+            ),
+            (division_by_zero(None).kind, "22012"),
+            (
+                cannot_convert_special_numeric("NaN", "integer", None).kind,
+                "0A000",
+            ),
             (using_column_missing("id", "left").kind, "42703"),
             (join_using_types_mismatch("integer", "point").kind, "42804"),
             (nullif_types_mismatch("integer", "point"), "42883"),

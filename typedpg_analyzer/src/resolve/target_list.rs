@@ -185,6 +185,7 @@ pub(crate) fn resolve_target_list_explicit(
                 scope.star_columns()
             };
 
+            expr::read_deferred(star_cols.iter().copied(), cr.location)?;
             for col in star_cols {
                 let nullable = null_ctx.is_nullable(&col.table_alias, &col.name, col.base_not_null);
                 explicit.push(false);

@@ -262,9 +262,9 @@ fn update_numeric_overflow_rejected() {
     let mut db = PgCatalog::new().unwrap();
     db.apply_sql("CREATE TABLE t (id BIGINT PRIMARY KEY, amount NUMERIC(4,2) NOT NULL);")
         .unwrap();
-    assert_analyze_err!(
+    assert_err_prefix!(
         db.analyze("UPDATE t SET amount = 12345.67 WHERE id = $p1"),
-        AnalyzeError::Invalid(_),
+        AnalyzeError::NumericValueOutOfRange(_),
         "numeric field overflow: a field with precision 4, scale 2 must round to an absolute value less than 10^2",
     );
 }

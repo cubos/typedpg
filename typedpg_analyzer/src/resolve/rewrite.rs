@@ -179,17 +179,19 @@ pub(crate) fn check_rewrite(
     if collected {
         return Ok(());
     }
-    let mut execution_error = None;
+    let mut errors = DeferredErrors::default();
     let mut rule_reads = Vec::new();
-    rewrite_level(
-        snapshot,
-        relid,
-        rw,
-        Reach::Statement,
-        &mut execution_error,
-        &mut Vec::new(),
-        &mut rule_reads,
-    )?;
+    crate::expr::plan_time_checks_set(crate::expr::rule_products_planned(), || {
+        rewrite_level(
+            snapshot,
+            relid,
+            rw,
+            Reach::Statement,
+            &mut errors,
+            &mut Vec::new(),
+            &mut rule_reads,
+        )
+    })?;
     // QueryRewrite then runs fireRIRrules over every product query: the
     // views a fired rule's condition and actions read are expanded too.
     if crate::expr::rewritten()
@@ -197,7 +199,17 @@ pub(crate) fn check_rewrite(
     {
         return Err(crate::pgmsg::infinite_rule_recursion(&relname).finalize_implicit());
     }
-    execution_error.map_or(Ok(()), Err)
+    errors.planning.or(errors.execution).map_or(Ok(()), Err)
+}
+
+/// The errors the statement raises after the rewriter's: planning a
+/// product query (a rule action's constant out of range), then executing
+/// one (the NOT NULL violation a bare `NULL` written through a view or an
+/// unconditional rule raises).
+#[derive(Default)]
+struct DeferredErrors {
+    planning: Option<AnalyzeError>,
+    execution: Option<AnalyzeError>,
 }
 
 /// The relations rule `rule` (on `relid`) reads in its condition and
@@ -270,9 +282,10 @@ impl Reach {
     }
 }
 
-/// One `RewriteQuery` level. `execution_error` collects the NOT NULL
-/// violation a bare `NULL` written by a product query that always runs
-/// (see [`Reach`]) raises at execution — after every rewriter error;
+/// One `RewriteQuery` level. `errors` collects what the product queries
+/// raise once planned, and the NOT NULL violation a bare `NULL` written by
+/// a product query that always runs (see [`Reach`]) raises at execution —
+/// after every rewriter error;
 /// `rewrite_events` holds the (relation, event) pairs whose product
 /// queries are being rewritten.
 fn rewrite_level(
@@ -280,7 +293,7 @@ fn rewrite_level(
     relid: crate::oid::PgClassOid,
     rw: &Rewrite,
     reach: Reach,
-    execution_error: &mut Option<AnalyzeError>,
+    errors: &mut DeferredErrors,
     rewrite_events: &mut Vec<(crate::oid::PgClassOid, Option<DmlEvent>)>,
     rule_reads: &mut Vec<crate::oid::PgClassOid>,
 ) -> Result<(), AnalyzeError> {
@@ -301,9 +314,9 @@ fn rewrite_level(
     if let Some(kind) = unchangeable
         && !rw.merge
         && super::executor_starts()
-        && execution_error.is_none()
+        && errors.execution.is_none()
     {
-        *execution_error =
+        errors.execution =
             Some(crate::pgmsg::cannot_change_relation(kind, relname).finalize_implicit());
     }
     let attrs = snapshot.attributes_of(relid);
@@ -370,13 +383,32 @@ fn rewrite_level(
     // domain rejecting NULL fails there, before any NOT NULL column
     // (ExecConstraints) — unless a DO INSTEAD rule replaces it.
     if reach == Reach::Always
-        && execution_error.is_none()
+        && errors.execution.is_none()
         && let Some(msg) = &rw.row_error
         && !super::dml::returning_rewritten(snapshot, relid, &[DmlEvent::Insert])
     {
-        *execution_error = Some(AnalyzeError::Invalid(msg.clone()));
+        errors.execution = Some(AnalyzeError::Invalid(msg.clone()));
     }
-    if reach == Reach::Always && !is_view && execution_error.is_none() {
+    // The fired rules' actions are planned whenever the statement is,
+    // their condition whatever it is — but one an unconditional INSTEAD
+    // rule replaces in turn isn't.
+    if crate::expr::plan_time_checks() && errors.planning.is_none() {
+        let replaced = |target: Option<(crate::oid::PgClassOid, CmdType)>| {
+            target.is_some_and(|(rel, cmd)| {
+                snapshot.rules.get(&rel).is_some_and(|rs| {
+                    rs.iter()
+                        .any(|r| r.enabled && r.instead && !r.conditional && r.event == cmd)
+                })
+            })
+        };
+        errors.planning = matching
+            .iter()
+            .flat_map(|r| &r.plan_errors)
+            .find(|p| !replaced(p.target))
+            .map(|p| p.error.clone());
+    }
+
+    if reach == Reach::Always && !is_view && errors.execution.is_none() {
         let written = actions
             .iter()
             .filter_map(|a| Some((a.event?, &a.assigns)))
@@ -400,7 +432,7 @@ fn rewrite_level(
                         },
                     )
                 {
-                    *execution_error = Some(err);
+                    errors.execution = Some(err);
                     break 'outer;
                 }
             }
@@ -458,7 +490,7 @@ fn rewrite_level(
                 *target,
                 product,
                 reach,
-                execution_error,
+                errors,
                 rewrite_events,
                 rule_reads,
             )?;

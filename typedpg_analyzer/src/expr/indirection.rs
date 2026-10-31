@@ -971,6 +971,15 @@ pub(crate) fn transform_container_subscripts(
                 }
                 Err(e) => return Err(e),
             };
+            // transformContainerSubscripts converts the subscript to
+            // `integer`, a conversion the planner folds.
+            if plan_time_checks()
+                && let Some(e) = crate::fold::conversion_error(bound, oid::INT4, None, snapshot)
+                && let Some(e) =
+                    super::plan_time_error(crate::error::node_location(bound), e.at(bound))
+            {
+                return Err(e);
+            }
             any_bound_nullable = any_bound_nullable || t.nullable;
         }
     }
