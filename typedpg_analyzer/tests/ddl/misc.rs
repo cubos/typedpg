@@ -7270,3 +7270,85 @@ fn declare_cursor_analyzes_its_query() {
          COMMIT;",
     )]);
 }
+
+// ── What a migration plans, and what it only stores ─────────────────────────
+
+/// Apply `sql` and return its error message.
+fn migration_err(sql: &str) -> String {
+    match PgCatalog::new().unwrap().apply_sql(sql) {
+        Ok(()) => panic!("expected {sql:?} to fail"),
+        Err(e) => e.to_string(),
+    }
+}
+
+#[test]
+fn statements_a_migration_runs_fold_their_constants() {
+    // A migration's queries are planned (EXPLAIN plans without running):
+    // a constant that can't fold fails them.
+    for (sql, msg) in [
+        (
+            "CREATE TABLE t (a int2); INSERT INTO t VALUES (40000);",
+            "smallint out of range",
+        ),
+        (
+            "CREATE TABLE t (a int2); PREPARE p AS INSERT INTO t VALUES (40000); EXECUTE p;",
+            "smallint out of range",
+        ),
+        ("EXPLAIN SELECT 40000::int2;", "smallint out of range"),
+        ("COPY (SELECT 1 / 0) TO STDOUT;", "division by zero"),
+        (
+            "CREATE TABLE t AS SELECT 2147483647 + 1 AS a WHERE false;",
+            "integer out of range",
+        ),
+        // A rule's action runs with the statement firing it.
+        (
+            "CREATE TABLE t (a int NOT NULL); CREATE TABLE r (a int);
+             CREATE RULE r_ins AS ON INSERT TO r DO ALSO INSERT INTO t VALUES (NULL);
+             INSERT INTO r VALUES (1);",
+            "null value in column \"a\" of relation \"t\" violates not-null constraint",
+        ),
+        // Planned with it, its condition whatever it is.
+        (
+            "CREATE TABLE t (a int2); CREATE TABLE r (a int);
+             CREATE RULE r_ins AS ON INSERT TO r WHERE NEW.a > 5 DO ALSO
+                 INSERT INTO t VALUES (40000);
+             INSERT INTO r VALUES (1);",
+            "smallint out of range",
+        ),
+        // A FROM subquery's output, where the query reads it.
+        (
+            "CREATE TABLE t AS SELECT x.q FROM (SELECT 1 / 0 AS q) x;",
+            "division by zero",
+        ),
+    ] {
+        let err = migration_err(sql);
+        assert!(
+            err.starts_with(msg),
+            "{sql}\n  expected: {msg}\n  got: {err}"
+        );
+    }
+}
+
+#[test]
+fn statements_a_migration_only_stores_are_not_planned() {
+    // A view, a CHECK, a column default, a function body, a rule's action,
+    // a prepared statement, a DO block's branch and a table created WITH
+    // NO DATA are stored or parsed, not planned: what would fail once run
+    // doesn't fail the migration.
+    build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int2 NOT NULL, v varchar(3), n numeric(3,1) DEFAULT 100,
+             CHECK (a < 40000::int2));
+         CREATE VIEW v1 AS SELECT 40000::int2 AS a, 100::numeric(3,1) AS n, 1 / 0 AS z;
+         CREATE FUNCTION f1() RETURNS int2 LANGUAGE sql AS $$ SELECT 40000::int2 $$;
+         CREATE FUNCTION f2() RETURNS void LANGUAGE sql
+             BEGIN ATOMIC INSERT INTO t VALUES (NULL, 'abcd', 100); END;
+         CREATE FUNCTION f3() RETURNS void LANGUAGE sql
+             AS $$ INSERT INTO t (a, v) VALUES (40000, 'abcd') $$;
+         CREATE TABLE r (a int);
+         CREATE RULE r_ins AS ON INSERT TO r DO ALSO INSERT INTO t VALUES (NULL, 'abcd');
+         PREPARE p AS INSERT INTO t (a) VALUES (40000);
+         DO $$ BEGIN IF false THEN PERFORM 40000::int2; END IF; END $$;
+         CREATE TABLE c AS SELECT 40000::int2 AS a WITH NO DATA;",
+    )]);
+}

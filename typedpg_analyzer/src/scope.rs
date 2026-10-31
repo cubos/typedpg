@@ -10,6 +10,7 @@ fn system_columns_for(alias: &str) -> Vec<ScopeColumn> {
     SYSTEM_COLUMNS
         .iter()
         .map(|&(name, type_oid, _attnum)| ScopeColumn {
+            deferred: Default::default(),
             name: name.to_owned(),
             type_oid,
             base_not_null: true,
@@ -65,6 +66,22 @@ pub(crate) struct ScopeColumn {
     /// The base-table column this column's value is read from, when it
     /// is one passed through unchanged (see [`Origin`]).
     pub origin: Option<Origin>,
+    /// Errors the planner raises planning the value (see [`Deferred`]).
+    pub deferred: Deferred,
+}
+
+/// The errors the planner raises planning a FROM entry's column it
+/// substitutes — a subquery's or VALUES list's output it pulls up, a CTE
+/// it inlines or materializes — wherever the query plans them: not where
+/// the column's expression is written, as the planner drops what nobody
+/// reads (see [`crate::expr::capture_plan_time_errors`]).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Deferred {
+    /// Raised where the column is read (and the read is planned).
+    pub value: Option<Box<crate::error::AnalyzeError>>,
+    /// Raised wherever the entry is (a CTE's: its body's WHERE, an output
+    /// of a materialized one).
+    pub entry: Option<Box<crate::error::AnalyzeError>>,
 }
 
 impl ScopeColumn {
@@ -675,6 +692,7 @@ impl Scope {
             .attributes_of(table_oid)
             .iter()
             .map(|c| ScopeColumn {
+                deferred: Default::default(),
                 name: c.attname.clone(),
                 type_oid: c.atttypid,
                 // Only the column's own NOT NULL (or a generation
@@ -777,6 +795,7 @@ impl Scope {
         let cols = columns
             .iter()
             .map(|c| ScopeColumn {
+                deferred: Default::default(),
                 name: c.attname.clone(),
                 type_oid: c.atttypid,
                 // A NOT NULL domain doesn't keep NULL out (see `add_table`).

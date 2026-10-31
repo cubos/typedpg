@@ -404,8 +404,11 @@ pub(crate) fn default_value(
             let scope = Scope::default();
             let null_ctx = NullabilityContext::default();
             let mut params = ParamCollector::default();
+            // (What the default writes; whether it folds is checked by
+            // `default_fold_error`.)
             let (inferred, _) = crate::ddl::depend::collect(|| {
                 let _level = QueryLevel::enter();
+                let _skipped = expr::skipped_if(true);
                 expr::infer_expr(
                     expr,
                     expr::Ctx::new(&scope, &null_ctx, snapshot),

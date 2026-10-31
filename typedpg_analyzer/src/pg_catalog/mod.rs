@@ -422,6 +422,9 @@ pub struct PgCatalog {
     /// the CREATE or ALTER that first left them with a column needing one
     /// (needs_toast_table) made it, and it stays.
     pub(crate) toast_tables: Shared<std::collections::HashSet<PgClassOid>>,
+    /// Views with the `security_barrier` option: the planner doesn't pull
+    /// them up into the query reading them.
+    pub(crate) security_barrier_views: Shared<std::collections::HashSet<PgClassOid>>,
     /// `attstorage` of the columns whose storage isn't their type's
     /// `typstorage` (a STORAGE clause, ALTER COLUMN SET STORAGE).
     pub(crate) attr_storage: Shared<HashMap<(PgClassOid, i16), TypStorage>>,
@@ -760,6 +763,7 @@ impl PgCatalog {
             partition_bounds: Shared::default(),
             check_defs: Shared::default(),
             toast_tables: Shared::default(),
+            security_barrier_views: Shared::default(),
             attr_storage: Shared::default(),
             attr_compression: Shared::default(),
             uncertain_collations: Shared::default(),
@@ -1638,6 +1642,7 @@ impl PgCatalog {
         self.foreign_data.forget_relation(oid);
         self.relpersistence.remove(&oid);
         self.toast_tables.remove(&oid);
+        self.security_barrier_views.remove(&oid);
         self.attr_storage.retain(|(relid, _), _| *relid != oid);
         self.attr_compression.retain(|(relid, _), _| *relid != oid);
         self.uncertain_collations.retain(|(relid, _)| *relid != oid);

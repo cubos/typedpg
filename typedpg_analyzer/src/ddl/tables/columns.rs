@@ -885,6 +885,21 @@ fn add_column_to(
             },
         );
     }
+    // ATExecAddColumn evaluates a stored column's default for the rows the
+    // table has (its missing value, or the rewrite), planning it first:
+    // what the planner folds of it, converted to the column's type, fails
+    // the statement, rows or not.
+    if col.generated.is_none()
+        && interp
+            .pg_class
+            .get(&relid)
+            .is_some_and(|c| c.relkind == crate::pg_catalog::RelKind::Table)
+        && let Some(attr) = interp.attribute_by_name(relid, &col.name)
+        && let Some(e) =
+            crate::expr::with_plan_time_checks(|| crate::resolve::default_fold_error(attr, interp))
+    {
+        return Err(DdlError::UnsupportedDdl(e.to_string()));
+    }
     crate::ddl::defaults::record_default_dependencies(
         interp,
         relid,
@@ -1470,7 +1485,9 @@ pub(crate) fn alter_column_type(
     }
     if !rec.recursing && attr.attgenerated != Some(AttGenerated::Virtual) && stores_values {
         match cd.raw_default.as_deref() {
-            Some(using) => check_using_expression(interp, relid, &attr, using, new_type_oid)?,
+            Some(using) => {
+                check_using_expression(interp, relid, &attr, using, new_type_oid, new_typmod)?
+            }
             None => {
                 if !crate::coerce::can_coerce(
                     attr.atttypid,
@@ -1796,6 +1813,7 @@ fn check_using_expression(
     attr: &PgAttribute,
     expr: &typedpg_pg_query::protobuf::Node,
     new_type: PgTypeOid,
+    new_typmod: Option<i32>,
 ) -> Result<(), DdlError> {
     use crate::expr::{TypeGoal, infer_expr};
     use crate::nullability::NullabilityContext;
@@ -1853,6 +1871,29 @@ fn check_using_expression(
             attr.attname,
             format_type_for_message(interp, new_type)
         )));
+    }
+    // ATRewriteTable plans the expression, converted to the new type,
+    // before it reads a row (`ExecPrepareExpr`): what the planner folds of
+    // it fails the statement, rows or not.
+    if interp
+        .pg_class
+        .get(&relid)
+        .is_some_and(|c| c.relkind == crate::pg_catalog::RelKind::Table)
+    {
+        crate::expr::with_plan_time_checks(|| {
+            infer_expr(
+                expr,
+                crate::expr::Ctx::new(&scope, &null_ctx, interp),
+                &mut params,
+                TypeGoal::NONE,
+            )
+            .map_err(wrap)?;
+            match crate::typmod::assignment_error(interp, new_type, new_typmod, expr, None, || None)
+            {
+                Some(e) => Err(wrap(e)),
+                None => Ok(()),
+            }
+        })?;
     }
     Ok(())
 }

@@ -286,6 +286,79 @@ pub enum AnalyzeError {
     /// SQLSTATE 23514 (`check_violation`).
     #[error("{0}")]
     CheckViolation(String),
+    /// SQLSTATE 22003 (`numeric_value_out_of_range`): a constant the
+    /// planner folds overflows its type (`smallint out of range`,
+    /// `numeric field overflow`).
+    #[error("{0}")]
+    NumericValueOutOfRange(String),
+
+    /// SQLSTATE 22012 (`division_by_zero`).
+    #[error("{0}")]
+    DivisionByZero(String),
+}
+
+/// A copy of the error: the planner's errors a subquery's output or a rule
+/// action defers are raised wherever they are planned, maybe more than once.
+impl Clone for AnalyzeError {
+    fn clone(&self) -> Self {
+        use AnalyzeError::*;
+        match self {
+            Lex(m) => Lex(m.clone()),
+            Parse(m) => Parse(m.clone()),
+            UndefinedTable(m) => UndefinedTable(m.clone()),
+            UndefinedColumn(m) => UndefinedColumn(m.clone()),
+            AmbiguousColumn(m) => AmbiguousColumn(m.clone()),
+            AmbiguousAlias(m) => AmbiguousAlias(m.clone()),
+            AmbiguousFunction(m) => AmbiguousFunction(m.clone()),
+            UndefinedObject(m) => UndefinedObject(m.clone()),
+            UndefinedSchema(m) => UndefinedSchema(m.clone()),
+            FeatureNotSupported(m) => FeatureNotSupported(m.clone()),
+            CollationMismatch(m) => CollationMismatch(m.clone()),
+            WrongObjectType(m) => WrongObjectType(m.clone()),
+            InvalidColumnReference(m) => InvalidColumnReference(m.clone()),
+            DuplicateAlias(m) => DuplicateAlias(m.clone()),
+            DatatypeMismatch(m) => DatatypeMismatch(m.clone()),
+            CannotCoerce(m) => CannotCoerce(m.clone()),
+            GroupingError(m) => GroupingError(m.clone()),
+            WindowingError(m) => WindowingError(m.clone()),
+            GeneratedAlways(m) => GeneratedAlways(m.clone()),
+            ObjectNotInPrerequisiteState(m) => ObjectNotInPrerequisiteState(m.clone()),
+            InvalidObjectDefinition(m) => InvalidObjectDefinition(m.clone()),
+            SyntaxError(m) => SyntaxError(m.clone()),
+            InvalidEscapeSequence(m) => InvalidEscapeSequence(m.clone()),
+            DuplicateColumn(m) => DuplicateColumn(m.clone()),
+            InvalidRecursion(m) => InvalidRecursion(m.clone()),
+            PgInternalError(m) => PgInternalError(m.clone()),
+            UndefinedType(m) => UndefinedType(m.clone()),
+            UndefinedFunction(m) => UndefinedFunction(m.clone()),
+            UndefinedOperator(m) => UndefinedOperator(m.clone()),
+            IndeterminateType(m) => IndeterminateType(m.clone()),
+            AmbiguousParameter(m) => AmbiguousParameter(m.clone()),
+            Unsupported(m) => Unsupported(m.clone()),
+            Invalid(m) => Invalid(m.clone()),
+            InvalidLiteral(m) => InvalidLiteral(m.clone()),
+            Internal(m) => Internal(m.clone()),
+            InvalidRowCountInLimitClause(m) => InvalidRowCountInLimitClause(m.clone()),
+            TooManyColumns(m) => TooManyColumns(m.clone()),
+            StatementTooComplex(m) => StatementTooComplex(m.clone()),
+            TooManyArguments(m) => TooManyArguments(m.clone()),
+            NumericValueOutOfRange(m) => NumericValueOutOfRange(m.clone()),
+            CheckViolation(m) => CheckViolation(m.clone()),
+            DivisionByZero(m) => DivisionByZero(m.clone()),
+            TypeMismatch {
+                actual,
+                expected,
+                context,
+            } => TypeMismatch {
+                actual: actual.clone(),
+                expected: expected.clone(),
+                context: context.clone(),
+            },
+            UnsupportedJoinType(k) => UnsupportedJoinType(*k),
+            Serde(e) => Serde(<serde_json::Error as serde::de::Error>::custom(e)),
+            Io(e) => Io(std::io::Error::new(e.kind(), e.to_string())),
+        }
+    }
 }
 
 impl AnalyzeError {
@@ -338,6 +411,8 @@ impl AnalyzeError {
             StatementTooComplex(_) => Some("54001"),
             TooManyArguments(_) => Some("54023"),
             CheckViolation(_) => Some("23514"),
+            NumericValueOutOfRange(_) => Some("22003"),
+            DivisionByZero(_) => Some("22012"),
             TypeMismatch { .. }
             | Invalid(_)
             | InvalidLiteral(_)
@@ -1362,6 +1437,8 @@ fn replace_message(e: AnalyzeError, rendered: String) -> AnalyzeError {
         AnalyzeError::StatementTooComplex(_) => AnalyzeError::StatementTooComplex(rendered),
         AnalyzeError::TooManyArguments(_) => AnalyzeError::TooManyArguments(rendered),
         AnalyzeError::CheckViolation(_) => AnalyzeError::CheckViolation(rendered),
+        AnalyzeError::NumericValueOutOfRange(_) => AnalyzeError::NumericValueOutOfRange(rendered),
+        AnalyzeError::DivisionByZero(_) => AnalyzeError::DivisionByZero(rendered),
         AnalyzeError::TypeMismatch {
             actual, expected, ..
         } => AnalyzeError::TypeMismatch {

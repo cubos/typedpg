@@ -1037,7 +1037,65 @@ pub(crate) fn infer_expr(
     params: &mut ParamCollector,
     goal: TypeGoal,
 ) -> Result<ExprType, AnalyzeError> {
+    let _enclosing = Enclosing::push(node);
     crate::stack::step(|| infer_expr_here(node, ctx, params, goal))
+}
+
+thread_local! {
+    /// The expressions being inferred, innermost last, each query level's
+    /// behind a null boundary (see [`sublink_planned`]).
+    static ENCLOSING: std::cell::RefCell<Vec<*const protobuf::Node>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// An entry of [`ENCLOSING`], popped when dropped.
+pub(crate) struct Enclosing;
+
+impl Enclosing {
+    fn push(node: &protobuf::Node) -> Enclosing {
+        ENCLOSING.with(|e| e.borrow_mut().push(node));
+        Enclosing
+    }
+
+    /// A query level's start: the expressions enclosing it are another
+    /// level's.
+    pub(crate) fn boundary() -> Enclosing {
+        ENCLOSING.with(|e| e.borrow_mut().push(std::ptr::null()));
+        Enclosing
+    }
+}
+
+impl Drop for Enclosing {
+    fn drop(&mut self) {
+        ENCLOSING.with(|e| e.borrow_mut().pop());
+    }
+}
+
+/// Whether a sublink being analyzed (in the scope of `ctx`) is certainly
+/// planned: the plan-time checks are on, and no expression of this level
+/// enclosing it may fold to a constant. A sublink becomes a SubPlan only
+/// after the expression around it was folded, so one an enclosing
+/// expression folds away — `(SELECT 1 / 0) = 1 AND false`, `(SELECT …) +
+/// NULL` — is never planned, whichever side the constant is on.
+pub(crate) fn sublink_planned(ctx: Ctx<'_>) -> bool {
+    if !plan_time_checks() {
+        return false;
+    }
+    let enclosing: Vec<*const protobuf::Node> = ENCLOSING.with(|e| {
+        e.borrow()
+            .iter()
+            .rev()
+            .take_while(|p| !p.is_null())
+            .copied()
+            .collect()
+    });
+    enclosing.into_iter().all(|p| {
+        // SAFETY: each pointer was pushed by an `infer_expr` call still on
+        // the stack (its entry is popped when the call returns), borrowing
+        // the node for the whole call: the node is alive and unchanged.
+        let node = unsafe { &*p };
+        !foldable::foldable(node, ctx).may_fold()
+    })
 }
 
 fn infer_expr_here(
@@ -1104,7 +1162,8 @@ fn infer_expr_unlocated(
                 }
                 infer_expr(operand, ctx, params, goal.clone())
             }
-            None => infer_type_cast(cast, ctx, params),
+            None => infer_type_cast(cast, ctx, params)
+                .and_then(|t| check_folding(node, snapshot).map(|()| t)),
         },
         node::Node::FuncCall(func) => infer_func_call(func, ctx, params),
         // `name => value` only occurs as a function-call argument; its type is
@@ -1125,7 +1184,9 @@ fn infer_expr_unlocated(
             }
             Ok(ExprType::scalar(oid::INT4, false))
         }
-        node::Node::AExpr(expr) => infer_a_expr(expr, ctx, params),
+        node::Node::AExpr(expr) => {
+            infer_a_expr(expr, ctx, params).and_then(|t| check_folding(node, snapshot).map(|()| t))
+        }
         node::Node::BoolExpr(expr) => infer_bool_expr(expr, ctx, params),
         node::Node::NullTest(t) => {
             if let Some(arg) = &t.arg {
@@ -2087,6 +2148,140 @@ pub(crate) fn restore_plan_time_checks(prev: bool) {
     PLAN_TIME_CHECKS.with(|c| c.set(prev));
 }
 
+/// Run `f` with [`with_plan_time_checks`] set to `on`: on for an
+/// expression a DDL statement plans (an index expression, a column's
+/// default it evaluates), off for one the planner may never reach — a
+/// CASE branch after a condition it may fold, a subquery output nothing
+/// may read (see [`may_skip`]).
+pub(crate) fn plan_time_checks_set<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let prev = PLAN_TIME_CHECKS.with(|c| c.replace(on));
+    let out = f();
+    PLAN_TIME_CHECKS.with(|c| c.set(prev));
+    out
+}
+
+/// Run `f` over an expression the planner may skip: the plan-time checks
+/// are off inside, so a constant it would never fold isn't reported.
+pub(crate) fn may_skip<R>(f: impl FnOnce() -> R) -> R {
+    plan_time_checks_set(false, f)
+}
+
+/// [`may_skip`] for as long as the guard lives, when `skip`.
+pub(crate) fn skipped_if(skip: bool) -> PlanTimeChecksGuard {
+    PlanTimeChecksGuard(skip.then(|| PLAN_TIME_CHECKS.with(|c| c.replace(false))))
+}
+
+/// See [`skipped_if`]: restores the plan-time checks when dropped.
+pub(crate) struct PlanTimeChecksGuard(Option<bool>);
+
+impl Drop for PlanTimeChecksGuard {
+    fn drop(&mut self) {
+        if let Some(prev) = self.0 {
+            PLAN_TIME_CHECKS.with(|c| c.set(prev));
+        }
+    }
+}
+
+thread_local! {
+    static RULE_PRODUCTS_PLANNED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` over a statement an INSTEAD rule replaces: the rewriter drops
+/// it (or keeps it only under the rule's condition), so its own plan-time
+/// checks are off — but the queries the rule produces run as the
+/// statement would (see [`rule_products_planned`]).
+pub(crate) fn replaced_by_rule<R>(f: impl FnOnce() -> R) -> R {
+    let planned = plan_time_checks();
+    let prev = RULE_PRODUCTS_PLANNED.with(|c| c.replace(planned));
+    let out = may_skip(f);
+    RULE_PRODUCTS_PLANNED.with(|c| c.set(prev));
+    out
+}
+
+/// Whether the queries the rewriter produces from the statement being
+/// analyzed are planned and run: the statement is, or an INSTEAD rule
+/// replaces one that is ([`replaced_by_rule`]).
+pub(crate) fn rule_products_planned() -> bool {
+    plan_time_checks() || RULE_PRODUCTS_PLANNED.with(std::cell::Cell::get)
+}
+
+/// An error the planner raises, and the `location` of the node it is
+/// about (when it has one).
+pub(crate) type PlanTimeError = (Option<i32>, AnalyzeError);
+
+thread_local! {
+    static PLAN_TIME_SINK: std::cell::RefCell<Option<Vec<PlanTimeError>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// `e`, an error the planner raises while it plans the statement (about
+/// the node at `location`): handed back, for the caller to return — or,
+/// while [`capture_plan_time_errors`] runs, recorded instead (`None`).
+pub(crate) fn plan_time_error(location: Option<i32>, e: AnalyzeError) -> Option<AnalyzeError> {
+    PLAN_TIME_SINK.with(|s| match s.borrow_mut().as_mut() {
+        Some(errors) => {
+            errors.push((location, e));
+            None
+        }
+        None => Some(e),
+    })
+}
+
+/// Read `cols` at `location`: the errors the planner raises planning
+/// their values, where it plans them (see [`crate::scope::Deferred`]).
+pub(crate) fn read_deferred<'c>(
+    cols: impl IntoIterator<Item = &'c crate::scope::ScopeColumn>,
+    location: i32,
+) -> Result<(), AnalyzeError> {
+    if !plan_time_checks() {
+        return Ok(());
+    }
+    for c in cols {
+        if let Some(e) = &c.deferred.value
+            && let Some(e) = plan_time_error(Some(location), (**e).clone())
+        {
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
+/// [`plan_time_error`] of `r`'s error.
+pub(crate) fn plan_time_result(
+    location: Option<i32>,
+    r: Result<(), AnalyzeError>,
+) -> Result<(), AnalyzeError> {
+    match r {
+        Ok(()) => Ok(()),
+        Err(e) => plan_time_error(location, e).map_or(Ok(()), Err),
+    }
+}
+
+/// Run `f`, recording the errors the planner raises ([`plan_time_error`])
+/// rather than failing on them: those of a subquery's output column count
+/// only where the outer query reads the column, those of a rule action
+/// only when a statement fires the rule.
+pub(crate) fn capture_plan_time_errors<R>(f: impl FnOnce() -> R) -> (R, Vec<PlanTimeError>) {
+    let prev = PLAN_TIME_SINK.with(|s| s.replace(Some(Vec::new())));
+    let out = f();
+    let errors = PLAN_TIME_SINK.with(|s| s.replace(prev)).unwrap_or_default();
+    (out, errors)
+}
+
+/// The error the planner raises folding the constants of `node` (a cast
+/// or an operator, its operands already checked), under
+/// [`with_plan_time_checks`]: `40000::int2`, `2147483647 + 1`, `1 / 0`
+/// fail every execution (see [`crate::fold`]).
+fn check_folding(node: &protobuf::Node, snapshot: &PgCatalog) -> Result<(), AnalyzeError> {
+    if plan_time_checks()
+        && let Some(e) = crate::fold::error(node, snapshot)
+        && let Some(e) = plan_time_error(crate::error::node_location(node), e.at(node))
+    {
+        return Err(e);
+    }
+    Ok(())
+}
+
 /// PG's `transformExpressionList` for a `ROW(...)` constructor's arguments:
 /// a `rel.*` column reference expands to one reference per column of `rel`
 /// (`ExpandColumnRefStar`) and a `(expr).*` indirection to one field
@@ -2304,6 +2499,7 @@ pub(crate) fn unknown_literal_as_text(
 
 mod column_refs;
 mod conditional;
+pub(crate) mod foldable;
 mod folding;
 mod func_call;
 mod indirection;

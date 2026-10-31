@@ -1550,3 +1550,66 @@ fn policies_triggers_rules_and_sql_bodies_depend_on_what_they_read() {
         ),
     )]);
 }
+
+// ── What ALTER TABLE plans ──────────────────────────────────────────────────
+
+/// Apply `sql` and return its error message.
+fn planned_err(sql: &str) -> String {
+    match PgCatalog::new().unwrap().apply_sql(sql) {
+        Ok(()) => panic!("expected {sql:?} to fail"),
+        Err(e) => e.to_string(),
+    }
+}
+
+#[test]
+fn alter_table_plans_what_it_evaluates_over_the_rows() {
+    // ALTER TABLE evaluates a new CHECK, a new column's default and a
+    // USING expression over the table's rows, planning them first: a
+    // constant that can't fold fails the statement, rows or not.
+    for (sql, msg) in [
+        (
+            "CREATE TABLE t (a int); ALTER TABLE t ADD CHECK (a < 40000::int2);",
+            "smallint out of range",
+        ),
+        (
+            "CREATE TABLE t (a int); ALTER TABLE t ADD COLUMN b int2 DEFAULT 40000;",
+            "smallint out of range",
+        ),
+        (
+            "CREATE TABLE t (a int); ALTER TABLE t ADD COLUMN b int DEFAULT 40000::int2;",
+            "smallint out of range",
+        ),
+        (
+            "CREATE TABLE t (a int); ALTER TABLE t ADD COLUMN b numeric(3,1) DEFAULT 100;",
+            "numeric field overflow",
+        ),
+        (
+            "CREATE TABLE t (a int); ALTER TABLE t ADD COLUMN b varchar(3) DEFAULT 'abcd';",
+            "value too long for type character varying(3)",
+        ),
+        (
+            "CREATE TABLE t (a int); ALTER TABLE t ALTER COLUMN a TYPE int8 USING a + 40000::int2;",
+            "smallint out of range",
+        ),
+        (
+            "CREATE TABLE t (a int); ALTER TABLE t ALTER COLUMN a TYPE int2 USING 40000;",
+            "smallint out of range",
+        ),
+    ] {
+        let err = planned_err(sql);
+        assert!(
+            err.starts_with(msg),
+            "{sql}\n  expected: {msg}\n  got: {err}"
+        );
+    }
+    // Not validated (NOT VALID, a partitioned table with no partition, a
+    // CHECK created with its table), or only stored (a default for the
+    // rows to come): PG doesn't plan them.
+    build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int CHECK (a < 40000::int2), b int2 DEFAULT 40000);
+         ALTER TABLE t ADD CHECK (a < 40000::int2) NOT VALID;
+         CREATE TABLE p (a int) PARTITION BY RANGE (a);
+         ALTER TABLE p ADD CHECK (a < 40000::int2);",
+    )]);
+}

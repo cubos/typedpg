@@ -92,6 +92,16 @@ impl Decimal {
         Some(a.cmp(&b))
     }
 
+    /// The value, when it is an integer that fits `i128`.
+    pub(crate) fn to_integer(self) -> Option<i128> {
+        let unit = 10i128.checked_pow(self.scale)?;
+        (self.m % unit == 0).then_some(self.m / unit)
+    }
+
+    pub(crate) fn is_zero(self) -> bool {
+        self.m == 0
+    }
+
     /// The nearest integer, halves away from zero — PG's numeric to
     /// integer cast (`numericvar_to_int64` rounds; an integer is unchanged).
     pub(crate) fn round(self) -> Option<Decimal> {

@@ -617,6 +617,12 @@ fn constant_regex_patterns_compiled_by_the_planner_are_validated() {
         "SELECT id FROM rt WHERE id = 1 AND s ~ '(' AND id = 1",
         "SELECT 1 AS m WHERE coalesce('a', 'b') ~ '('",
         "SELECT id FROM rt WHERE s ~ upper('(')",
+        // The view's WHERE joins the reading query's once pulled up.
+        "SELECT id FROM rv",
+        // Folded before relation exclusion: in a level the planner may
+        // prove empty, a sublink's and a pulled-up output's constants.
+        "SELECT (SELECT 'a' ~ '(') AS m FROM rt WHERE false",
+        "SELECT * FROM (SELECT 'a' ~ '(' AS m) s WHERE false",
     ] {
         assert_err_prefix!(
             db.analyze(sql),
@@ -630,7 +636,6 @@ fn constant_regex_patterns_compiled_by_the_planner_are_validated() {
         "SELECT rt.id FROM rt JOIN rt2 ON rt.s || rt2.s ~ '('",
         "SELECT id FROM rt WHERE s ~ '(?q)('",
         "SELECT id FROM rt WHERE s SIMILAR TO '\\('",
-        "SELECT id FROM rv",
         // What constant folding drops is never compiled, and a relation
         // the planner proves empty is never estimated.
         "SELECT true OR 'a' ~ '(' AS m",
@@ -641,6 +646,8 @@ fn constant_regex_patterns_compiled_by_the_planner_are_validated() {
         "SELECT id FROM rt WHERE s ~ '(' AND NULL",
         "SELECT id FROM rt WHERE id = 1 AND id = 2 AND s ~ '('",
         "SELECT rt.id FROM rt LEFT JOIN rt2 ON rt2.id = rt.id AND rt2.s ~ '('",
+        // A pulled-up view's restriction, in a level proven empty.
+        "SELECT id FROM rv WHERE false",
     ] {
         db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
     }

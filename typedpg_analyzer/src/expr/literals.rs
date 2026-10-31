@@ -250,24 +250,12 @@ pub(crate) fn infer_type_cast(
             crate::error::node_location(inner).and_then(crate::error::SourceSpan::from_node_token);
         return Err(crate::error::RawError::invalid_literal(msg, span).finalize_implicit());
     }
-    // The cast then applies the target's typmod (a domain's: its base
-    // type's), `numeric(p, s)`'s `apply_typmod` failing every execution
-    // for a literal out of range (`'123.45'::numeric(4,2)`).
+    // The cast applies the target's typmod (a domain's: its base type's).
     let cast_typmod = if snapshot.unwrap_domain(target_oid) == target_oid {
         written_typmod
     } else {
         snapshot.effective_typmod(target_oid, None)
     };
-    if let Some(msg) = crate::typmod::numeric_literal_overflow(
-        snapshot,
-        snapshot.unwrap_domain(target_oid),
-        cast_typmod,
-        inner,
-    ) {
-        let span =
-            crate::error::node_location(inner).and_then(crate::error::SourceSpan::from_node_token);
-        return Err(crate::error::RawError::invalid(msg, span, None).finalize_implicit());
-    }
 
     // An explicit cast (::type / CAST) overrides type checking — we do NOT
     // check compatibility of the inner expression against the target type.

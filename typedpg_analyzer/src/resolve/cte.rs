@@ -68,6 +68,7 @@ pub(crate) fn analyze_cte(
     let search_cycle = search_cycle_columns(cte, snapshot, params)?;
 
     let to_scope = |rc: RawColumn| ScopeColumn {
+        deferred: Default::default(),
         name: rc.name,
         type_oid: rc.type_oid,
         base_not_null: !rc.nullable,
@@ -245,6 +246,7 @@ pub(crate) fn analyze_cte(
                         // term's (checked above to be the overall one).
                         let collation = s.collation;
                         ScopeColumn {
+                            deferred: Default::default(),
                             name: s.name.clone(),
                             type_oid,
                             // Either arm producing NULL makes the column
@@ -407,6 +409,7 @@ fn search_cycle_columns(
     params: &mut ParamCollector,
 ) -> Result<Vec<ScopeColumn>, AnalyzeError> {
     let synthetic = |name: &str, type_oid: PgTypeOid| ScopeColumn {
+        deferred: Default::default(),
         name: name.to_owned(),
         type_oid,
         base_not_null: true,
@@ -950,14 +953,21 @@ fn analyze_with_clause_here(
             )
             .finalize_implicit());
         }
-        let analyzed = analyze_cte(
-            cte,
-            recursive[i],
-            snapshot,
-            params,
-            &cte_scopes,
-            outer_sources,
-        )?;
+        // A SELECT CTE nothing reads is never planned; what planning one
+        // read raises is raised at its references (see `deferred`). A
+        // data-modifying one always runs.
+        let (analyzed, outputs, entry) = super::deferred::analyze_cte(cte, recursive[i], || {
+            analyze_cte(
+                cte,
+                recursive[i],
+                snapshot,
+                params,
+                &cte_scopes,
+                outer_sources,
+            )
+        });
+        let mut analyzed = analyzed?;
+        super::deferred::attach_to_cte(&mut analyzed.columns, outputs, entry);
         let marker = no_returning_marker(&cte.ctename);
         if returning == Some(false) {
             cte_scopes.insert(marker, Vec::new());

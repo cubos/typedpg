@@ -101,6 +101,7 @@ pub(crate) fn process_from_item(
                     cte_reference_columns(cte_scopes, &rv.relname)
             {
                 check_cte_reference(cte_scopes, &rv.relname)?;
+                super::deferred::reference_cte(&cte_cols, rv.location)?;
                 let realias = |cols: Vec<ScopeColumn>| -> Vec<ScopeColumn> {
                     cols.into_iter()
                         .map(|mut c| {
@@ -142,6 +143,24 @@ pub(crate) fn process_from_item(
                 alias,
                 crate::error::SourceSpan::from_node_qname(rv.location),
             )?;
+            // A view the planner pulls up raises what its query does, like
+            // a FROM subquery (see `deferred`).
+            if crate::expr::plan_time_checks()
+                && let Some(class) = snapshot.resolve_table(schema, &rv.relname)
+                && class.relkind == crate::pg_catalog::RelKind::View
+                && let Some(planned) = crate::ddl::views::planned_view_errors(snapshot, class.oid)
+            {
+                if let Some((_, e)) = planned.rest
+                    && let Some(e) = crate::expr::plan_time_error(Some(rv.location), e)
+                {
+                    return Err(e);
+                }
+                if let Some(src) = scope.sources.last_mut() {
+                    for (c, e) in src.columns.iter_mut().zip(planned.outputs) {
+                        c.deferred.value = e.map(Box::new);
+                    }
+                }
+            }
             if let Some(class) = snapshot.resolve_table(schema, &rv.relname)
                 && let Some(src) = scope.sources.last_mut()
             {
@@ -369,20 +388,34 @@ pub(crate) fn process_from_item(
                 // any: those to its left.
                 let visible: &[crate::scope::TableSource] =
                     if sub.lateral { &scope.sources } else { &[] };
+                // What the planner raises planning the subquery is raised
+                // where it plans it: an output where this level reads it
+                // (see `deferred`).
+                let mut planned = super::deferred::Split::default();
                 let (analyzed, correlated) = crate::nonnull::capture_correlation(sel, || {
-                    crate::grouping::with_visible_entries(visible, || {
-                        analyze_select_with_ctes_and_outer(
-                            sel,
-                            snapshot,
-                            params,
-                            cte_scopes,
-                            &lateral_sources,
-                            &enclosing,
-                            &shadowed_sources,
-                        )
-                    })
+                    let (analyzed, split) =
+                        super::deferred::analyze(super::deferred::plan_of(sel), sel, || {
+                            crate::grouping::with_visible_entries(visible, || {
+                                analyze_select_with_ctes_and_outer(
+                                    sel,
+                                    snapshot,
+                                    params,
+                                    cte_scopes,
+                                    &lateral_sources,
+                                    &enclosing,
+                                    &shadowed_sources,
+                                )
+                            })
+                        });
+                    planned = split;
+                    analyzed
                 });
                 let (mut cols, _) = analyzed?;
+                if let Some((location, e)) = planned.rest
+                    && let Some(e) = crate::expr::plan_time_error(location, e)
+                {
+                    return Err(e);
+                }
                 let summary = take_level_summary();
                 if capture {
                     null_ctx.add_where_facts(
@@ -390,9 +423,14 @@ pub(crate) fn process_from_item(
                     );
                 }
                 resolve_unknown_outputs(sel, &mut cols, params, snapshot)?;
+                let mut outputs = planned.outputs.into_iter();
                 let mut scope_cols: Vec<ScopeColumn> = cols
                     .into_iter()
                     .map(|rc| ScopeColumn {
+                        deferred: crate::scope::Deferred {
+                            value: outputs.next().flatten().map(Box::new),
+                            entry: None,
+                        },
                         name: rc.name,
                         type_oid: rc.type_oid,
                         base_not_null: !rc.nullable,
@@ -680,6 +718,7 @@ fn process_range_function(
     // column too.
     if rf.ordinality {
         cols.push(ScopeColumn {
+            deferred: Default::default(),
             name: "ordinality".into(),
             type_oid: oid::INT8,
             base_not_null: true,
@@ -1605,6 +1644,7 @@ fn merge_using_columns(
         let (collation, no_collation) =
             merged_column_collation(&l, &r, type_oid, typmod, join_type, snapshot);
         merged.push(ScopeColumn {
+            deferred: Default::default(),
             name: name.clone(),
             type_oid,
             base_not_null,
@@ -2174,6 +2214,7 @@ fn function_rte_columns(
             .iter()
             .enumerate()
             .map(|(i, f)| ScopeColumn {
+                deferred: Default::default(),
                 name: f.name.clone(),
                 type_oid: f.type_oid,
                 base_not_null: match out_columns_nullable {
@@ -2246,6 +2287,7 @@ fn function_rte_columns(
     *whole_row = crate::scope::WholeRow::Scalar;
     let (collation, no_collation) = scalar_collation()?;
     Ok(vec![ScopeColumn {
+        deferred: Default::default(),
         name: col_name.to_owned(),
         type_oid: resolved.return_type_oid,
         base_not_null: not_null,
@@ -2326,6 +2368,7 @@ fn expr_rte_columns(
     check_rte_scalar_type(value.type_oid, &name, snapshot, None)?;
     *whole_row = crate::scope::WholeRow::Scalar;
     Ok(vec![ScopeColumn {
+        deferred: Default::default(),
         name: if nfuncs == 1 { alias.to_owned() } else { name },
         type_oid: value.type_oid,
         base_not_null: !value.nullable,
@@ -2397,6 +2440,7 @@ fn composite_rte_columns(
             .attributes_of(typrelid)
             .iter()
             .map(|f| ScopeColumn {
+                deferred: Default::default(),
                 name: f.attname.clone(),
                 type_oid: f.atttypid,
                 // A row-type *value* does not enforce its relation's NOT
@@ -2540,6 +2584,7 @@ fn coldeflist_columns(
         let typmod = crate::typmod::encode(snapshot, type_oid, tn)
             .map_err(|e| AnalyzeError::Invalid(e.to_string()))?;
         cols.push(ScopeColumn {
+            deferred: Default::default(),
             name: cd.colname.clone(),
             type_oid,
             base_not_null: false,
@@ -2908,6 +2953,7 @@ fn json_table_columns(
             )?;
         }
         out.push(ScopeColumn {
+            deferred: Default::default(),
             name: col.name.clone(),
             type_oid,
             base_not_null: top_level && kind == Kind::JtcForOrdinality,

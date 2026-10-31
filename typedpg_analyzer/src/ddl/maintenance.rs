@@ -291,6 +291,7 @@ pub fn copy(
             )));
         }
     }
+    // `COPY (query) TO` runs the query.
     if let Some(query) = stmt.query.as_deref().and_then(|q| q.node.as_ref()) {
         return super::dml::check_executed(interp, query);
     }

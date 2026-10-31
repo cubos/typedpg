@@ -204,7 +204,7 @@ pub(crate) fn trusted_over_relation(
 /// through an operator or through an explicit cast — and fail on the first
 /// one that isn't IMMUTABLE. A simple SQL function counts by its inlined
 /// body (checked with the name-based walk). Analysis errors are left to the
-/// expression's own validation.
+/// expression's own validation, except the planner's.
 pub(crate) fn check_mutability(
     interp: &PgCatalog,
     relid: crate::oid::PgClassOid,
@@ -212,11 +212,17 @@ pub(crate) fn check_mutability(
     loc: ExprLocation,
 ) -> Result<(), DdlError> {
     let used = std::cell::RefCell::new(Vec::new());
-    if !matches!(
-        infer_over_relation(interp, relid, expr, Some(&used)),
-        Some(Ok(_))
-    ) {
-        return Ok(());
+    // CheckMutability plans the expression first (`expression_planner`),
+    // folding its constants: an error that adds (`40000::int2`) is the
+    // statement's.
+    match crate::expr::with_plan_time_checks(|| {
+        infer_over_relation(interp, relid, expr, Some(&used))
+    }) {
+        Some(Ok(_)) => {}
+        Some(Err(e)) if matches!(infer_over_relation(interp, relid, expr, None), Some(Ok(_))) => {
+            return Err(DdlError::UnsupportedDdl(e.to_string()));
+        }
+        _ => return Ok(()),
     }
     for oid in used.into_inner() {
         let Some(proc) = interp.pg_proc.get(&oid) else {

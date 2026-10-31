@@ -301,6 +301,7 @@ fn set_operation_sort_and_limit(
     let result_cols: Vec<ScopeColumn> = columns
         .iter()
         .map(|c| ScopeColumn {
+            deferred: Default::default(),
             name: c.name.clone(),
             type_oid: c.type_oid,
             base_not_null: !c.nullable,

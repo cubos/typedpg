@@ -1104,7 +1104,7 @@ fn infer_generic_binary_op(
                 && const_string(l, snapshot).is_some()
                 && let Some(pattern) = const_regex_pattern(r, snapshot)
             {
-                check_regex_pattern(pattern, icase)?;
+                super::plan_time_result(Some(expr.location), check_regex_pattern(pattern, icase))?;
             }
             // The operator is a call of its function: `box # box`
             // (box_intersect) is NULL for disjoint boxes, `jsonb @? jsonpath`
@@ -1561,7 +1561,7 @@ fn regex_restrictions(node: &protobuf::Node, ctx: Ctx<'_>) -> Result<(), Analyze
             {
                 return Ok(());
             }
-            check_regex_pattern(pattern, icase)
+            super::plan_time_result(Some(e.location), check_regex_pattern(pattern, icase))
         }
         _ => Ok(()),
     }

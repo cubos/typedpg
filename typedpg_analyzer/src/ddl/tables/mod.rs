@@ -1439,7 +1439,22 @@ fn apply_alter_subtype(
         }
         AlterTableType::AtSetRelOptions
         | AlterTableType::AtResetRelOptions
-        | AlterTableType::AtReplaceRelOptions => set_reloptions(interp, relid, cmd, subtype),
+        | AlterTableType::AtReplaceRelOptions => {
+            set_reloptions(interp, relid, cmd, subtype)?;
+            if interp.pg_class.get(&relid).map(|c| c.relkind) == Some(RelKind::View)
+                && let Some(node::Node::List(list)) =
+                    cmd.def.as_deref().and_then(|d| d.node.as_ref())
+            {
+                crate::ddl::views::set_security_barrier(
+                    interp,
+                    relid,
+                    &list.items,
+                    subtype == AlterTableType::AtReplaceRelOptions,
+                    subtype == AlterTableType::AtResetRelOptions,
+                );
+            }
+            Ok(())
+        }
         AlterTableType::AtDropCluster => {
             interp.clustered_indexes.remove(&relid);
             Ok(())

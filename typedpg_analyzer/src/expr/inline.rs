@@ -97,6 +97,9 @@ pub(crate) fn inline_call(
     let null_ctx = crate::nullability::NullabilityContext::default();
     let mut params = crate::param_collector::ParamCollector::bound(bound);
     READING.with(|r| r.borrow_mut().push(proc.oid));
+    // (Read for what it makes of the arguments: what the planner would
+    // fold of the body is not this analysis' to report.)
+    let _skipped = super::skipped_if(true);
     let (result, _) = crate::ddl::depend::collect(|| {
         let _level = crate::resolve::QueryLevel::enter();
         infer_expr(
@@ -143,6 +146,7 @@ fn body_scope(proc: &crate::pg_catalog::PgProc, bound: &[ExprType]) -> Option<cr
         .zip(bound)
         .filter(|(name, _)| !name.is_empty())
         .map(|(name, t)| crate::scope::ScopeColumn {
+            deferred: Default::default(),
             name: name.clone(),
             type_oid: t.type_oid,
             base_not_null: !t.nullable,
@@ -192,6 +196,7 @@ pub(crate) fn body_trust(
     // Only what it resolves to: no narrowing (the facts of each WHEN of a
     // large body cost the most), no call read as its body.
     let outer = RESOLVING.with(|r| r.replace(true));
+    let _skipped = super::skipped_if(true);
     let (result, _) = crate::ddl::depend::collect(|| {
         let _level = crate::resolve::QueryLevel::enter();
         crate::nonnull::without_narrowing(|| {

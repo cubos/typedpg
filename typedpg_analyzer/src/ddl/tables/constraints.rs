@@ -1615,6 +1615,18 @@ fn add_constraint_node(
         // No volatility walk for CHECK — PG accepts volatile expressions at
         // DDL time, only the type-must-be-bool check below has teeth.
         validate_check_expression_for_table(interp, relid, expr)?;
+        // ATRewriteTables validates a new constraint over a table's rows
+        // (validateCheckConstraint), planning it first: what the planner
+        // folds of it fails the statement, rows or not.
+        if !c.skip_validation
+            && c.is_enforced
+            && interp.pg_class.get(&relid).map(|r| r.relkind) == Some(RelKind::Table)
+            && let Some(Err(e)) = crate::expr::with_plan_time_checks(|| {
+                crate::ddl::volatile::infer_over_relation(interp, relid, expr, None)
+            })
+        {
+            return Err(DdlError::UnsupportedDdl(e.to_string()));
+        }
         // Emit pg_constraint row for the CHECK so future inspections see it.
         let conname = ConName::from_explicit(
             &c.conname,
