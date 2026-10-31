@@ -1002,6 +1002,12 @@ fn a_view_output_fails_where_it_is_read() {
         "SELECT 1 FROM grouped",
         "SELECT 1 FROM (SELECT x FROM t WHERE 1 / 0 = 1 OFFSET 0) s",
         "SELECT 1 FROM t, barrier_where WHERE false",
+        // An aggregate, window, set-returning or volatile call keeps a
+        // subquery from being pulled up too.
+        "SELECT c FROM (SELECT sum(1 / 0) AS c FROM t) s",
+        "SELECT 1 FROM (SELECT count(*) AS c FROM t WHERE 1 / 0 = 1) s",
+        "SELECT 1 FROM (SELECT random() AS r FROM t WHERE 1 / 0 = 1) s",
+        "SELECT z FROM (SELECT random() AS r, 1 / 0 AS z FROM t) s",
     ] {
         assert_err_prefix!(
             db.analyze(sql),
@@ -1022,6 +1028,10 @@ fn a_view_output_fails_where_it_is_read() {
         "SELECT b FROM (SELECT 40000::int2 AS a, 1 AS b OFFSET 0) s",
         "SELECT 1 FROM barrier_where WHERE false",
         "SELECT 1 FROM grouped WHERE false",
+        "SELECT 1 FROM (SELECT count(*) AS c FROM t WHERE 1 / 0 = 1) s WHERE false",
+        "SELECT 1 FROM (SELECT random() AS r, 1 / 0 AS z FROM t) s",
+        // The nullable side of a join the planner may remove.
+        "SELECT 1 FROM t LEFT JOIN (SELECT count(*) AS c FROM t WHERE 1 / 0 = 1) s ON true",
     ] {
         db.analyze(sql)
             .unwrap_or_else(|e| panic!("{sql}: unexpected error {e}"));

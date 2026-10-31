@@ -70,11 +70,55 @@ pub(crate) fn plan_of(sel: &protobuf::SelectStmt, snapshot: &PgCatalog) -> Plan 
         || !sel.locking_clause.is_empty()
         || !sel.window_clause.is_empty()
         || sel.with_clause.is_some()
+        || never_simple_target_list(sel, snapshot)
     {
         Plan::Separate
     } else {
         Plan::Uncertain
     }
+}
+
+/// Whether `sel`'s select list certainly keeps the planner from pulling
+/// it up: it calls an aggregate (`count(*)`, or a name only aggregates
+/// have), a window function, or a name only set-returning or volatile
+/// functions have.
+fn never_simple_target_list(sel: &protobuf::SelectStmt, snapshot: &PgCatalog) -> bool {
+    use crate::pg_catalog::{ProKind, ProVolatile};
+    sel.target_list.iter().any(|t| {
+        t.node.as_ref().is_some_and(|inner| {
+            // Not below a sublink, whose calls are its own.
+            let mut todo = vec![inner.to_ref()];
+            while let Some(n) = todo.pop() {
+                match n {
+                    typedpg_pg_query::NodeRef::SubLink(_) => continue,
+                    typedpg_pg_query::NodeRef::FuncCall(fc) => {
+                        if fc.over.is_some() || fc.agg_star {
+                            return true;
+                        }
+                        let names = crate::expr::extract_string_fields(&fc.funcname);
+                        let (schema, name) = match names.as_slice() {
+                            [n] => (None, n.as_str()),
+                            [s, n] => (Some(s.as_str()), n.as_str()),
+                            _ => continue,
+                        };
+                        let candidates = snapshot.find_functions(schema, name);
+                        if !candidates.is_empty()
+                            && candidates.iter().all(|p| {
+                                matches!(p.prokind, ProKind::Aggregate | ProKind::Window)
+                                    || p.proretset
+                                    || p.provolatile == ProVolatile::Volatile
+                            })
+                        {
+                            return true;
+                        }
+                    }
+                    _ => {}
+                }
+                todo.extend(n.children());
+            }
+            false
+        })
+    })
 }
 
 /// How the level reading a subquery planned as `plan` (never
