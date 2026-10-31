@@ -887,9 +887,7 @@ fn analyze_insert_values(
         }
         if violation.is_none() {
             let known = |i: usize| match target_col_at(tgt, i) {
-                Some(tc) if is_null_value(&list.items[i], tc.atttypid, None, snapshot) => {
-                    Known::Null
-                }
+                Some(tc) if is_null_value(&list.items[i], tc, None, snapshot) => Known::Null,
                 _ => Known::Value(&list.items[i]),
             };
             violation = row_violation(tgt, &list.items, &known, snapshot);
@@ -1024,42 +1022,39 @@ fn row_violation<'a>(
 }
 
 /// Whether `val`, a value of type `source` (`None`: its own) stored into
-/// a column of type `column`, stores a NULL: a bare `NULL`, or `NULL::T`
-/// for a type `T` that isn't a domain (whose cast would check it) — when
-/// nothing but a domain coercion separates it from the column's type, as
-/// a cast function needn't keep a NULL NULL.
+/// `column`, stores a NULL: a bare `NULL`, or a NULL under casts each
+/// mapping NULL to NULL (see [`null_under_casts`]) — then coerced to
+/// `source` (a VALUES column's common type) and to the column's type.
 fn is_null_value(
     val: &protobuf::Node,
-    column: PgTypeOid,
+    column: &crate::pg_catalog::PgAttribute,
     source: Option<PgTypeOid>,
     snapshot: &PgCatalog,
 ) -> bool {
-    let own = match val.node.as_ref() {
-        Some(node::Node::AConst(c)) if c.isnull => None,
-        Some(node::Node::TypeCast(tc)) if tc.arg.as_deref().is_some_and(is_sql_null_literal) => {
-            match tc
-                .type_name
-                .as_ref()
-                .and_then(|tn| crate::ddl::util::resolve_type_name(tn, snapshot))
-            {
-                Some(t) if snapshot.unwrap_domain(t) == t => Some(t),
-                _ => return false,
-            }
-        }
-        _ => return false,
+    use crate::coerce::CoercionContext;
+    let Some((NullCast::Null, own)) = null_under_casts(val, snapshot) else {
+        return false;
     };
-    let base = snapshot.unwrap_domain(column);
-    match (own, source) {
-        (None, None) => true,
-        (Some(t), None) | (None, Some(t)) => t == base,
-        (Some(t), Some(s)) => t == s && s == base,
-    }
+    let read = match source {
+        Some(s) if !null_coercion(own, s, None, CoercionContext::Implicit, snapshot) => {
+            return false;
+        }
+        Some(s) => s,
+        None => own,
+    };
+    null_coercion(
+        read,
+        column.atttypid,
+        column.atttypmod,
+        CoercionContext::Assignment,
+        snapshot,
+    )
 }
 
-/// The error `NULL::d` raises when evaluated, for a domain `d` rejecting
-/// NULL (CoerceToDomain is checked at execution, never folded away). None
-/// when the statement is not run (a view, rule action, SQL function body,
-/// prepared statement or plain EXPLAIN).
+/// The error a NULL cast to a domain rejecting NULL raises when evaluated
+/// (`NULL::d`, also under further casts). None when the statement is not
+/// run (a view, rule action, SQL function body, prepared statement or
+/// plain EXPLAIN).
 fn null_domain_cast(val: &protobuf::Node, snapshot: &PgCatalog) -> Option<String> {
     if !super::executes() {
         return None;
@@ -1069,14 +1064,10 @@ fn null_domain_cast(val: &protobuf::Node, snapshot: &PgCatalog) -> Option<String
 
 /// [`null_domain_cast`]'s error, whether or not the statement runs.
 fn null_domain_cast_error(val: &protobuf::Node, snapshot: &PgCatalog) -> Option<String> {
-    let Some(node::Node::TypeCast(tc)) = val.node.as_ref() else {
-        return None;
-    };
-    if !tc.arg.as_deref().is_some_and(is_sql_null_literal) {
-        return None;
+    match null_under_casts(val, snapshot)? {
+        (NullCast::Fails(msg), _) => Some(msg),
+        (NullCast::Null, _) => None,
     }
-    let t = crate::ddl::util::resolve_type_name(tc.type_name.as_ref()?, snapshot)?;
-    snapshot.domain_null_violation_at_execution(t)
 }
 
 /// The relation a VALUES row (`items`; none for DEFAULT VALUES) is checked
@@ -1158,40 +1149,133 @@ pub(crate) fn default_fold_error(
 }
 
 /// Whether column `c`'s default is NULL: no identity or generation
-/// expression, and either a stored DEFAULT that is NULL (see
-/// [`stored_default_is_null`]) or no DEFAULT at all, nor one its domain
-/// gives it.
+/// expression, and either a stored DEFAULT that evaluates to NULL (see
+/// [`stored_default`]) or no DEFAULT at all, nor one its domain gives it.
 pub(crate) fn null_default(c: &crate::pg_catalog::PgAttribute, snapshot: &PgCatalog) -> bool {
     c.attidentity.is_none()
         && c.attgenerated.is_none()
         && if c.atthasdef {
-            stored_default_is_null(c, snapshot)
+            matches!(stored_default(c, snapshot), Some(NullCast::Null))
         } else {
             !snapshot.domain_has_default(c.atttypid)
         }
 }
 
-/// Whether column `c`'s stored DEFAULT evaluates to NULL. A default
-/// cooking to a bare null constant is never stored (AddRelationNewConstraints),
-/// but on a domain column it cooks to a CoerceToDomain over the null
-/// constant, which PG keeps — overriding the domain's own default — and
-/// which still yields NULL. So does `DEFAULT NULL` on a column whose typmod
-/// adds a (strict) length coercion. A NULL cast to another type is left
-/// out: a cast function needn't keep a NULL NULL.
-fn stored_default_is_null(c: &crate::pg_catalog::PgAttribute, snapshot: &PgCatalog) -> bool {
-    matches!(
-        snapshot.attr_default_exprs.get(&(c.attrelid, c.attnum)),
-        Some(crate::ddl::tables::check_inherit::StoredExpr::Written(e))
-            if is_null_value(e, c.atttypid, None, snapshot)
-    )
+/// What evaluating a NULL under casts gives, when the analyzer can tell.
+#[derive(Debug, PartialEq, Eq)]
+enum NullCast {
+    /// NULL: every cast maps NULL to NULL.
+    Null,
+    /// The error a cast to a domain rejecting NULL raises (CoerceToDomain
+    /// is checked at execution, never folded away).
+    Fails(String),
+}
+
+/// What column `c`'s stored DEFAULT evaluates to, when it is a NULL under
+/// casts (`None` otherwise, or when a cast may turn the NULL into a
+/// value). A default cooking to a bare null constant is never stored
+/// (AddRelationNewConstraints), but on a domain column it cooks to a
+/// CoerceToDomain over the null constant, which PG keeps — overriding the
+/// domain's own default — and a typmod's length coercion or a cast to
+/// another type cooks to a function call, kept too. The column's own
+/// domain is left to the caller (`Null` then means NULL before it).
+fn stored_default(c: &crate::pg_catalog::PgAttribute, snapshot: &PgCatalog) -> Option<NullCast> {
+    let Some(crate::ddl::tables::check_inherit::StoredExpr::Written(e)) =
+        snapshot.attr_default_exprs.get(&(c.attrelid, c.attnum))
+    else {
+        return None;
+    };
+    match null_under_casts(e, snapshot)? {
+        // cookDefault's coerce_to_target_type, to the column's type.
+        (NullCast::Null, t) => null_coercion(
+            t,
+            c.atttypid,
+            c.atttypmod,
+            crate::coerce::CoercionContext::Assignment,
+            snapshot,
+        )
+        .then_some(NullCast::Null),
+        (fails, _) => Some(fails),
+    }
+}
+
+/// What `e` evaluates to when it is `NULL` under casts (`NULL::int8`,
+/// `CAST(NULL::int8 AS text)`), with the type of the result: `None` when
+/// it is something else, or when a cast may turn the NULL into a value.
+fn null_under_casts(e: &protobuf::Node, snapshot: &PgCatalog) -> Option<(NullCast, PgTypeOid)> {
+    match e.node.as_ref()? {
+        node::Node::AConst(k) if k.isnull => Some((NullCast::Null, oid::UNKNOWN)),
+        node::Node::TypeCast(tc) => {
+            let (inner, from) = null_under_casts(tc.arg.as_deref()?, snapshot)?;
+            let tn = tc.type_name.as_ref()?;
+            let target = crate::ddl::util::resolve_type_name(tn, snapshot)?;
+            if inner != NullCast::Null {
+                return Some((inner, target));
+            }
+            let typmod = crate::typmod::encode(snapshot, target, tn).ok()?;
+            if !null_coercion(
+                from,
+                target,
+                typmod,
+                crate::coerce::CoercionContext::Explicit,
+                snapshot,
+            ) {
+                return None;
+            }
+            let result = match snapshot.domain_null_violation_at_execution(target) {
+                Some(msg) => NullCast::Fails(msg),
+                None => NullCast::Null,
+            };
+            Some((result, target))
+        }
+        _ => None,
+    }
+}
+
+/// Whether `coerce_to_target_type` of a NULL of type `from` to `to` /
+/// `typmod` yields NULL, `to`'s domain checks aside: an unknown-type
+/// literal becomes a null Const; a binary-coercible cast is a RelabelType;
+/// an ArrayCoerceExpr and a strict cast function skip a NULL input; an
+/// I/O conversion calls the target's input function on NULL only if it is
+/// not strict — none built in, but a user's base type may have one — and
+/// a typmod's length coercion is a cast function too. A user's cast
+/// function needn't be strict, and a non-strict one can return a value.
+fn null_coercion(
+    from: PgTypeOid,
+    to: PgTypeOid,
+    typmod: Option<i32>,
+    context: crate::coerce::CoercionContext,
+    snapshot: &PgCatalog,
+) -> bool {
+    use crate::coerce::CoercionPath;
+    let base = snapshot.unwrap_domain(to);
+    let cast_func_strict = |source: PgTypeOid, target: PgTypeOid| {
+        snapshot
+            .cast_by_pair
+            .get(&(source, target))
+            .and_then(|oid| snapshot.pg_cast.get(oid))
+            .and_then(|c| c.castfunc)
+            .is_none_or(|f| snapshot.pg_proc.get(&f).is_some_and(|p| p.proisstrict))
+    };
+    let converted = from == oid::UNKNOWN
+        || match crate::coerce::coercion_pathway(to, from, context, snapshot) {
+            Some(CoercionPath::Relabel | CoercionPath::ArrayCoerce) => true,
+            Some(CoercionPath::Func) => cast_func_strict(snapshot.unwrap_domain(from), base),
+            Some(CoercionPath::CoerceViaIo) => snapshot.get_type(base).is_some_and(|t| {
+                !matches!(t.typtype, TypType::Base | TypType::Pseudo)
+                    || snapshot.namespace_name(t.typnamespace) == Some("pg_catalog")
+            }),
+            None => false,
+        };
+    converted && (typmod.is_none_or(|m| m < 0) || cast_func_strict(base, base))
 }
 
 /// The columns a VALUES row (`items`; none for DEFAULT VALUES) leaves to
 /// their default — omitted, or `DEFAULT` — when that is NULL and of a
-/// domain rejecting NULL (NOT NULL, or a CHECK a NULL fails): the NULL is
-/// coerced to the domain as the row is built (`expand_targetlist`), before
-/// any trigger. A table's own columns only (a view's defaults are its
-/// base table's).
+/// domain rejecting NULL (NOT NULL, or a CHECK a NULL fails), or when it
+/// casts a NULL to such a domain: the NULL is coerced to the domain as the
+/// row is built (`expand_targetlist`), before any trigger. A table's own
+/// columns only (a view's defaults are its base table's).
 fn omitted_domain_nulls(
     tgt: &InsertTarget,
     items: &[protobuf::Node],
@@ -1215,9 +1299,16 @@ fn omitted_domain_nulls(
     tgt.attrs
         .iter()
         .filter(|c| c.attnum > 0 && !given.contains(&c.attname.as_str()))
-        .filter(|c| null_default(c, snapshot))
+        .filter(|c| c.attidentity.is_none() && c.attgenerated.is_none())
         .filter_map(|c| {
-            let msg = snapshot.domain_null_violation_at_execution(c.atttypid)?;
+            // A DEFAULT casting its NULL to such a domain fails the same way.
+            let msg = match c.atthasdef.then(|| stored_default(c, snapshot)).flatten() {
+                Some(NullCast::Fails(msg)) => msg,
+                _ if null_default(c, snapshot) => {
+                    snapshot.domain_null_violation_at_execution(c.atttypid)?
+                }
+                _ => return None,
+            };
             Some(RowViolation {
                 order: (false, c.attnum),
                 error: AnalyzeError::Invalid(msg),
@@ -1598,7 +1689,7 @@ fn general_values_violation(
         .map(|items| {
             let known = |i: usize| match (target_col_at(tgt, i), column_types.get(i)) {
                 (Some(tc), Some(&t)) if t == snapshot.unwrap_domain(tc.atttypid) => {
-                    if is_null_value(&items[i], tc.atttypid, Some(t), snapshot) {
+                    if is_null_value(&items[i], tc, Some(t), snapshot) {
                         Known::Null
                     } else {
                         Known::Value(&items[i])
