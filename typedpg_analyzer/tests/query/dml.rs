@@ -474,6 +474,174 @@ fn insert_null_reports_the_first_null_column_in_table_order() {
     );
 }
 
+/// `DEFAULT NULL` on a NOT NULL column is no default: AddRelationNewConstraints
+/// stores none, so every INSERT leaving the column to it fails. On a domain
+/// column the cooked default is a CoerceToDomain over NULL, which PG keeps
+/// and which overrides the domain's own default: still NULL.
+#[test]
+fn insert_leaving_a_not_null_column_to_default_null_is_rejected() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE z2 (a int NOT NULL DEFAULT NULL, b int);
+         CREATE TABLE z (a int NOT NULL DEFAULT 1, b int);
+         ALTER TABLE z ALTER a SET DEFAULT NULL;
+         CREATE DOMAIN dm AS int DEFAULT 5;
+         CREATE TABLE z3 (a dm NOT NULL DEFAULT NULL, b int);
+         CREATE TABLE z3c (a dm NOT NULL DEFAULT NULL::int, b int);
+         CREATE DOMAIN dnn AS int NOT NULL DEFAULT 5;
+         CREATE TABLE z4 (a dnn DEFAULT NULL, b int);
+         CREATE TABLE z5 (b int);
+         ALTER TABLE z5 ADD COLUMN a int NOT NULL DEFAULT NULL;
+         CREATE TABLE z6 (a varchar(5) NOT NULL DEFAULT NULL, b int);
+         CREATE TABLE z7 (a int NOT NULL DEFAULT NULL::int, b int);
+         CREATE TABLE p (a int NOT NULL DEFAULT 7);
+         CREATE TABLE c (a int DEFAULT NULL) INHERITS (p);",
+    )
+    .unwrap();
+    let not_null = |rel: &str| {
+        format!(r#"null value in column "a" of relation "{rel}" violates not-null constraint"#)
+    };
+    for (sql, rel) in [
+        ("INSERT INTO z2 (b) VALUES (1)", "z2"),
+        ("INSERT INTO z2 DEFAULT VALUES", "z2"),
+        ("INSERT INTO z2 (a, b) VALUES (DEFAULT, 1)", "z2"),
+        ("INSERT INTO z (b) VALUES (1)", "z"),
+        ("INSERT INTO z3 (b) VALUES (1)", "z3"),
+        ("INSERT INTO z3 (a, b) VALUES (DEFAULT, 1)", "z3"),
+        ("INSERT INTO z3c (b) VALUES (1)", "z3c"),
+        ("INSERT INTO z5 (b) VALUES (1)", "z5"),
+        ("INSERT INTO z6 (b) VALUES (1)", "z6"),
+        ("INSERT INTO z7 (b) VALUES (1)", "z7"),
+        ("INSERT INTO c DEFAULT VALUES", "c"),
+    ] {
+        assert_err_prefix!(db.analyze(sql), AnalyzeError::Invalid(_), &not_null(rel));
+    }
+    // A NOT NULL domain fails as the row is built, the column's own
+    // DEFAULT NULL overriding the domain's DEFAULT 5.
+    assert_err_prefix!(
+        db.analyze("INSERT INTO z4 (b) VALUES (1)"),
+        AnalyzeError::Invalid(_),
+        "domain dnn does not allow null values"
+    );
+}
+
+/// A DEFAULT casting its NULL to another type is stored (a function call,
+/// no constant), and still evaluates to NULL when every cast maps NULL to
+/// NULL: a binary-coercible cast, an array coercion, an I/O conversion to
+/// a built-in type, a strict cast function — built-in casts are, a user's
+/// may be. A cast to a domain rejecting NULL fails as the row is built,
+/// whatever the column.
+#[test]
+fn insert_leaving_a_column_to_a_null_cast_default_is_rejected() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE p (a int NOT NULL DEFAULT NULL::int8, b int);
+         CREATE TABLE r (a int NOT NULL DEFAULT NULL::text::int, b int);
+         CREATE TABLE t (a varchar(3) NOT NULL DEFAULT NULL::text, b int);
+         CREATE TABLE u (a int[] NOT NULL DEFAULT NULL::int8[], b int);
+         CREATE TYPE myt AS (x int);
+         CREATE FUNCTION strict_cast(int8) RETURNS myt LANGUAGE sql STRICT
+             AS 'SELECT ROW($1::int)::myt';
+         CREATE CAST (int8 AS myt) WITH FUNCTION strict_cast(int8) AS ASSIGNMENT;
+         CREATE TABLE w (a myt NOT NULL DEFAULT NULL::int8, b int);
+         CREATE DOMAIN dnn AS int NOT NULL DEFAULT 5;
+         CREATE TABLE q (a dnn DEFAULT NULL::int8, b int);
+         CREATE TABLE s (a int NOT NULL DEFAULT NULL::dnn, b int);
+         CREATE TABLE s2 (a int DEFAULT NULL::dnn::int8, b int);
+         CREATE DOMAIN dck AS int CHECK (VALUE IS NOT NULL);
+         CREATE TABLE s3 (a int DEFAULT NULL::dck, b int);",
+    )
+    .unwrap();
+    for rel in ["p", "r", "t", "u", "w"] {
+        assert_err_prefix!(
+            db.analyze(&format!("INSERT INTO {rel} (b) VALUES (1)")),
+            AnalyzeError::Invalid(_),
+            &format!(
+                r#"null value in column "a" of relation "{rel}" violates not-null constraint"#
+            )
+        );
+    }
+    for (rel, msg) in [
+        ("q", "domain dnn does not allow null values"),
+        ("s", "domain dnn does not allow null values"),
+        ("s2", "domain dnn does not allow null values"),
+        (
+            "s3",
+            r#"value for domain dck violates check constraint "dck_check""#,
+        ),
+    ] {
+        assert_err_prefix!(
+            db.analyze(&format!("INSERT INTO {rel} (b) VALUES (1)")),
+            AnalyzeError::Invalid(_),
+            msg
+        );
+    }
+}
+
+/// The same casts over a NULL given in VALUES: the row stores NULL (or
+/// fails in the domain cast), in a single row or a multi-row VALUES.
+#[test]
+fn insert_of_a_null_under_casts_is_rejected() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE p (a int NOT NULL, b int);
+         CREATE DOMAIN dnn AS int NOT NULL;
+         CREATE TABLE q (a int, b int);",
+    )
+    .unwrap();
+    let not_null = r#"null value in column "a" of relation "p" violates not-null constraint"#;
+    for sql in [
+        "INSERT INTO p (a) VALUES (NULL::int8)",
+        "INSERT INTO p (a) VALUES (NULL::text::int)",
+        "INSERT INTO p (a) VALUES (NULL::int8), (1)",
+    ] {
+        assert_err_prefix!(db.analyze(sql), AnalyzeError::Invalid(_), not_null);
+    }
+    assert_err_prefix!(
+        db.analyze("INSERT INTO q (a) VALUES (NULL::dnn::int8)"),
+        AnalyzeError::Invalid(_),
+        "domain dnn does not allow null values"
+    );
+}
+
+/// Neighbours of the above PG accepts: a BEFORE ROW trigger may fill the
+/// column, a view's `DEFAULT NULL` is no default (the base table's
+/// applies), and a NULL cast through a cast function that isn't strict
+/// may come out a value.
+#[test]
+fn insert_leaving_a_column_to_default_null_is_accepted_where_it_may_succeed() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE z8 (a int NOT NULL DEFAULT NULL, b int);
+         CREATE FUNCTION fill() RETURNS trigger LANGUAGE plpgsql
+             AS $$BEGIN NEW.a := 1; RETURN NEW; END$$;
+         CREATE TRIGGER t BEFORE INSERT ON z8 FOR EACH ROW EXECUTE FUNCTION fill();
+         CREATE TABLE z (a int NOT NULL DEFAULT 3, b int);
+         CREATE VIEW v AS SELECT * FROM z;
+         ALTER VIEW v ALTER a SET DEFAULT NULL;
+         CREATE TABLE n (a int DEFAULT NULL, b int);
+         CREATE DOMAIN dm AS int DEFAULT 5;
+         CREATE TABLE nd (a dm DEFAULT NULL, b int);
+         CREATE TABLE n8 (a int DEFAULT NULL::int8, b int);
+         CREATE TYPE myt AS (x int);
+         CREATE FUNCTION lax_cast(int8) RETURNS myt LANGUAGE sql
+             AS 'SELECT ROW(coalesce($1, 0)::int)::myt';
+         CREATE CAST (int8 AS myt) WITH FUNCTION lax_cast(int8) AS ASSIGNMENT;
+         CREATE TABLE w (a myt NOT NULL DEFAULT NULL::int8, b int);",
+    )
+    .unwrap();
+    for sql in [
+        "INSERT INTO z8 (b) VALUES (1)",
+        "INSERT INTO v (b) VALUES (1) RETURNING a",
+        "INSERT INTO n (b) VALUES (1)",
+        "INSERT INTO nd (b) VALUES (1)",
+        "INSERT INTO n8 (b) VALUES (1)",
+        "INSERT INTO w (b) VALUES (1)",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
+
 /// A row inserted into a partitioned table is routed to its partition
 /// before ExecConstraints runs, so PG names the partition the row lands
 /// in — through every level of sub-partitioning.
