@@ -746,7 +746,11 @@ fn binary_coercible(interp: &PgCatalog, src: PgTypeOid, target: PgTypeOid) -> bo
         return true;
     }
     let t = interp.pg_type.get(&src);
-    let is_array = t.is_some_and(|t| t.typcategory == TypCategory::Array && t.typelem.is_some());
+    // type_is_array: a true array type — record[] (`_record`) too, though a
+    // pseudo-type.
+    let is_array = t.is_some_and(|t| {
+        t.typelem.is_some() && (t.typcategory == TypCategory::Array || t.typtype == TypType::Pseudo)
+    });
     let typtype = t.map(|t| t.typtype);
     match target.get() {
         2276 | 2283 => true,                                 // any, anyelement

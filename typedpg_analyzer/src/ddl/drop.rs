@@ -816,7 +816,39 @@ fn drop_index(
             }
         }
     }
-    for child in crate::ddl::tables::partidx::child_indexes(interp, class_oid) {
+    // A partition's constraint whose index this one adopted depends on it
+    // (through the index): CASCADE drops it, and what references it.
+    let children = crate::ddl::tables::partidx::child_indexes(interp, class_oid);
+    let child_constraints: Vec<_> = children
+        .iter()
+        .filter_map(|&child| {
+            crate::ddl::tables::partidx::backing_constraint(interp, child).map(|c| (child, c))
+        })
+        .collect();
+    if let Some((_, con)) = child_constraints.iter().find(|(_, c)| c.conislocal)
+        && !cascade
+    {
+        let table_name = interp
+            .pg_class
+            .get(&con.conrelid)
+            .map(|c| c.relname.clone())
+            .unwrap_or_default();
+        return Err(DdlError::DependencyError(format!(
+            "cannot drop index {name} because other objects depend on it (constraint {} on \
+             table {table_name} depends on index {name})",
+            con.conname
+        )));
+    }
+    for (child, con) in child_constraints {
+        let key: std::collections::BTreeSet<i16> = con.conkey.iter().copied().collect();
+        for fk in
+            crate::ddl::tables::foreign_keys::fks_relying_on(interp, con.conrelid, &key, child)
+        {
+            crate::ddl::tables::foreign_keys::drop_fk_cascaded(interp, fk);
+        }
+        interp.pg_constraint.remove(&con.oid);
+    }
+    for child in children {
         interp.remove_pg_index(child);
         interp.remove_pg_class(child);
     }

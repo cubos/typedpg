@@ -621,7 +621,7 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
         let mut key = Vec::new();
         // Every column the key reads (has_partition_attrs).
         let mut key_attrs: Vec<i16> = Vec::new();
-        for elem in &spec.part_params {
+        for (keycol, elem) in spec.part_params.iter().enumerate() {
             let Some(node::Node::PartitionElem(pe)) = elem.node.as_ref() else {
                 continue;
             };
@@ -642,6 +642,11 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
                     Some(Ok(t)) => Some(t.type_oid),
                     None => None,
                 };
+                // ComputePartitionAttrs: the expression's type must be a
+                // storable one (not `record`).
+                if let Some(typ) = typ {
+                    generated::check_partition_key_type(interp, keycol + 1, typ)?;
+                }
                 // ComputePartitionAttrs: the columns the expression reads —
                 // all of them through a whole-row reference — may be neither
                 // system nor generated columns.
@@ -797,20 +802,25 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
     {
         foreign_keys::clone_parent_fks(interp, parent, class_oid)?;
     }
+    // DefineRelation: a partition gets copies of its parent's indexes
+    // before its own are created (so a PRIMARY KEY of its own is a second
+    // one).
+    let partition_parent = interp
+        .pg_inherits
+        .iter()
+        .find(|i| i.inhrelid == class_oid)
+        .map(|i| i.inhparent)
+        .filter(|_| stmt.partbound.is_some());
+    if let Some(parent) = partition_parent {
+        partidx::clone_parent_indexes(interp, parent, class_oid)?;
+    }
     // Emit pg_constraint rows so ON CONFLICT, DROP CASCADE, and FK
     // dependency checks can consult them later. FK validation runs here.
     emit_constraints(interp, class_oid, &name, stmt, &|interp| {
         inherit::record_not_nulls(interp, class_oid, &columns)
     })?;
     check_inherit::inherit_parent_checks(interp, class_oid)?;
-    if stmt.partbound.is_some()
-        && let Some(parent) = interp
-            .pg_inherits
-            .iter()
-            .find(|i| i.inhrelid == class_oid)
-            .map(|i| i.inhparent)
-    {
-        partidx::clone_parent_indexes(interp, parent, class_oid)?;
+    if let Some(parent) = partition_parent {
         crate::ddl::triggers::clone_row_triggers_to_partition(interp, parent, class_oid)?;
     }
     for like in &likes {

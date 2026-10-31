@@ -802,6 +802,15 @@ fn add_column_to(
         )));
     }
 
+    // ATExecAddColumn: regular inheritance children don't inherit an
+    // identity column, so one can't be added recursively to a table that
+    // has some (partitions do share it).
+    if col.identity.is_some() && rec.recurse && !cx.partitioned && !children.is_empty() {
+        return Err(DdlError::Parse(
+            "cannot recursively add identity column to table that has child tables".into(),
+        ));
+    }
+
     // check_for_column_name_collision: a system column's name is taken even
     // under IF NOT EXISTS (a composite type has no system columns).
     let relkind = interp.pg_class.get(&relid).map(|c| c.relkind);
@@ -843,8 +852,11 @@ fn add_column_to(
         atthasdef: col.has_default,
         attgenerated: col.generated,
         atttypmod: col.typmod,
-        // Identity is not inherited by regular children.
-        attidentity: col.identity.filter(|_| !rec.recursing),
+        // Identity is not inherited by regular children, but partitions
+        // share it.
+        attidentity: col
+            .identity
+            .filter(|_| !rec.recursing || super::inherit_cmd::is_partition(interp, relid)),
         attcollation: col.collation,
         attislocal: !rec.recursing,
         attinhcount: i16::from(rec.recursing),

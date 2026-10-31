@@ -791,7 +791,7 @@ pub(super) fn emit_constraint_with_backing_index(
 }
 
 /// index_check_primary_key (index.c): a table has at most one primary key.
-fn check_no_primary_key(interp: &PgCatalog, relid: PgClassOid) -> Result<(), DdlError> {
+pub(super) fn check_no_primary_key(interp: &PgCatalog, relid: PgClassOid) -> Result<(), DdlError> {
     if interp
         .pg_index
         .values()
@@ -1236,6 +1236,28 @@ pub(crate) fn drop_constraint(
         return Err(DdlError::DependencyError(format!(
             "cannot drop inherited constraint \"{conname}\" of relation \"{}\"",
             relname_of(interp, relid)
+        )));
+    }
+
+    // A local constraint whose index a plain partitioned index adopted:
+    // the index goes only with its parent index (findDependentObjects,
+    // DEPENDENCY_PARTITION_PRI). The index shares the constraint's name,
+    // but a constraint without an index (a foreign key) may share an
+    // unrelated index's name: the index must back this very constraint.
+    if !rec.recursing
+        && let Some(nsoid) = interp.pg_class.get(&relid).map(|c| c.relnamespace)
+        && let Some(&idx_oid) = interp.class_by_qname.get(&(nsoid, conname.clone()))
+        && super::partidx::backing_constraint(interp, idx_oid).is_some_and(|c| c.oid == oid)
+        && let Some(parent) = super::partidx::parent_index_of(interp, idx_oid)
+    {
+        let parent_name = interp
+            .pg_class
+            .get(&parent)
+            .map(|c| c.relname.clone())
+            .unwrap_or_default();
+        return Err(DdlError::DependencyError(format!(
+            "cannot drop index {conname} because index {parent_name} requires it (You can drop \
+             index {parent_name} instead.)"
         )));
     }
 
@@ -1966,6 +1988,8 @@ pub(crate) fn copy_like_constraints(
             .collect();
         checks.sort_by_key(|c| c.oid);
         for c in checks {
+            // expandTableLikeClause → StoreRelCheck.
+            super::check_inherit::check_no_inherit_allowed(interp, relid, c.connoinherit)?;
             let conkey = c.conkey.iter().map(|&an| new_attnum(interp, an)).collect();
             let oid = PgConstraintOid::from_nonzero(interp.alloc_oid()?);
             if let Some(def) = interp.check_defs.get(&c.oid).cloned() {

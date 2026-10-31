@@ -111,6 +111,8 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
     let mut indclass = Vec::with_capacity(stmt.index_params.len());
     let mut indcollation = Vec::with_capacity(stmt.index_params.len());
     let mut indexprs: Vec<SerializedAst> = Vec::new();
+    // (key column, type) of each expression column.
+    let mut expr_types: Vec<(usize, crate::oid::PgTypeOid)> = Vec::new();
     for param in &stmt.index_params {
         let Some(node::Node::IndexElem(elem)) = param.node.as_ref() else {
             continue;
@@ -132,7 +134,10 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
             indkey.push(0);
             indexprs.push(serialize_node(expr));
             match super::volatile::infer_over_relation(db, indrelid, expr, None) {
-                Some(Ok(t)) => Some((t.type_oid, None)),
+                Some(Ok(t)) => {
+                    expr_types.push((key_columns.len(), t.type_oid));
+                    Some((t.type_oid, None))
+                }
                 _ => None,
             }
         } else {
@@ -207,24 +212,26 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
     }
     check_index_columns(db, indrelid, &indkey, &key_exprs, usage)?;
 
+    // ChooseIndexColumnNames over all the index's columns, INCLUDE ones
+    // too; expression columns are named like FigureIndexColname.
+    let colnames: Vec<String> = stmt
+        .index_params
+        .iter()
+        .chain(&stmt.index_including_params)
+        .filter_map(|param| match param.node.as_ref()? {
+            node::Node::IndexElem(elem) if !elem.name.is_empty() => Some(elem.name.clone()),
+            node::Node::IndexElem(elem) => Some(figure_index_colname(elem.expr.as_deref())),
+            _ => None,
+        })
+        .collect();
+    check_index_expression_types(db, &colnames, &expr_types)?;
+
     // ── Pick a name for the index ──
     //
     // ChooseIndexName (indexcmds.c): an unnamed index that isn't a
     // constraint's is `<table>_<columns>_idx` — unique or not — numbered
-    // when taken; expression columns are named like FigureIndexColname.
+    // when taken.
     let conname = if stmt.idxname.is_empty() {
-        // ChooseIndexColumnNames over all the index's columns, INCLUDE ones
-        // too.
-        let colnames: Vec<String> = stmt
-            .index_params
-            .iter()
-            .chain(&stmt.index_including_params)
-            .filter_map(|param| match param.node.as_ref()? {
-                node::Node::IndexElem(elem) if !elem.name.is_empty() => Some(elem.name.clone()),
-                node::Node::IndexElem(elem) => Some(figure_index_colname(elem.expr.as_deref())),
-                _ => None,
-            })
-            .collect();
         super::util::choose_relation_name(
             db,
             nsoid,
@@ -350,6 +357,25 @@ fn check_index_expression(
     }
     check_no_volatile(expr, ExprLocation::Index, db)?;
     super::volatile::check_mutability(db, relid, expr, ExprLocation::Index)
+}
+
+/// index_create's ConstructTupleDescriptor: an expression column's type must
+/// be one a table column could have (CheckAttributeType) — not `record`,
+/// for one, though it has operator classes. `colnames` are the index's
+/// columns' names before ChooseIndexColumnNames' deduplication, `expr_types`
+/// the (column, type) of each expression column.
+fn check_index_expression_types(
+    db: &PgCatalog,
+    colnames: &[String],
+    expr_types: &[(usize, crate::oid::PgTypeOid)],
+) -> Result<(), DdlError> {
+    let names = super::util::choose_index_column_names(colnames);
+    for &(column, typ) in expr_types {
+        if let Some(name) = names.get(column) {
+            super::tables::check_attribute_type(db, name, typ, None, false)?;
+        }
+    }
+    Ok(())
 }
 
 /// INDEX_MAX_KEYS (pg_config_manual.h): the most columns an index — key
@@ -696,6 +722,8 @@ pub(crate) fn define_constraint_index(
     let mut indclass = Vec::with_capacity(conkey.len());
     let mut indcollation = Vec::with_capacity(conkey.len());
     let mut exclusion_oprs = Vec::with_capacity(conkey.len());
+    let mut colnames = Vec::with_capacity(conkey.len());
+    let mut expr_types = Vec::new();
     for (i, &attnum) in conkey.iter().enumerate() {
         let attr = attrs.iter().find(|a| attnum > 0 && a.attnum == attnum);
         let (elem, opnames) = if exclusion {
@@ -717,16 +745,26 @@ pub(crate) fn define_constraint_index(
             (None, None)
         };
         let typ = match (attr, elem.and_then(|e| e.expr.as_deref())) {
-            (Some(a), _) => Some(a.atttypid),
+            (Some(a), _) => {
+                colnames.push(a.attname.clone());
+                Some(a.atttypid)
+            }
             (None, Some(expr)) => {
+                colnames.push(figure_index_colname(Some(expr)));
                 check_index_expression(db, relid, expr)?;
                 match super::volatile::infer_over_relation(db, relid, expr, None) {
                     Some(Err(e)) => return Err(DdlError::UnsupportedDdl(e.to_string())),
-                    Some(Ok(t)) => Some(t.type_oid),
+                    Some(Ok(t)) => {
+                        expr_types.push((i, t.type_oid));
+                        Some(t.type_oid)
+                    }
                     None => None,
                 }
             }
-            (None, None) => None,
+            (None, None) => {
+                colnames.push(String::new());
+                None
+            }
         };
         let key = compute_key_column(
             db,
@@ -745,6 +783,7 @@ pub(crate) fn define_constraint_index(
     if exclusion {
         check_exclusion_covers_partition_key(db, relid, conkey, &indcollation, &exclusion_oprs)?;
     }
+    check_index_expression_types(db, &colnames, &expr_types)?;
     Ok(ConstraintIndex {
         am,
         keys: IndexKeys {
@@ -825,6 +864,64 @@ fn check_exclusion_covers_partition_key(
         }
     }
     Ok(())
+}
+
+/// DefineIndex's recursion, for the copy of `parent` (an index of a
+/// partitioned table) it creates on partition `part` with key columns
+/// `indkey`: when the partition is itself partitioned, a unique or
+/// exclusion index must cover its partition key too.
+pub(crate) fn check_partition_copy_covers_partition_key(
+    db: &PgCatalog,
+    parent: &PgIndex,
+    part: PgClassOid,
+    indkey: &[i16],
+) -> Result<(), DdlError> {
+    let nkey = usize::try_from(parent.indnkeyatts)
+        .unwrap_or(0)
+        .min(indkey.len());
+    let key = &indkey[..nkey];
+    if parent.indisexclusion {
+        // The exclusion operators, resolved as for the parent's columns.
+        let oprs: Vec<_> = db
+            .index_keys
+            .get(&parent.indexrelid)
+            .map(|keys| {
+                keys.columns
+                    .iter()
+                    .zip(&parent.indclass)
+                    .map(|(c, &class)| match (c.exclusion_op.as_deref(), c.typ) {
+                        (Some(names), Some(t)) => {
+                            check_exclusion_operator(db, names, t, class).ok().flatten()
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let oprs: Vec<_> = (0..key.len())
+            .map(|j| oprs.get(j).copied().flatten())
+            .collect();
+        let collations: Vec<_> = (0..key.len())
+            .map(|j| parent.indcollation.get(j).copied().flatten())
+            .collect();
+        check_exclusion_covers_partition_key(db, part, key, &collations, &oprs)
+    } else if parent.indisunique {
+        let label = if parent.indisprimary {
+            "PRIMARY KEY"
+        } else {
+            "UNIQUE"
+        };
+        super::tables::check_unique_covers_partition_key(
+            db,
+            part,
+            key,
+            &parent.indcollation,
+            &parent.indclass,
+            label,
+        )
+    } else {
+        Ok(())
+    }
 }
 
 /// get_opfamily_member_for_cmptype(COMPARE_EQ): the equality operator of

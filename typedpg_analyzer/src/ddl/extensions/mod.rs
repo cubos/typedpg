@@ -732,6 +732,37 @@ const OPCLASS_OPTIONS: &[(&str, &str, &str, i64, i64, i64)] = &[
     ("gist", "gist__ltree_ops", "siglen", 1, 2024, 1),
 ];
 
+/// An operator class option's type and range.
+#[derive(Clone, Copy)]
+enum OpclassOption {
+    /// `add_local_int_reloption`: an integer in `min..=max`, a multiple of
+    /// `multiple`.
+    Int { min: i64, max: i64, multiple: i64 },
+    /// `add_local_real_reloption`: a real in `min..=max`.
+    Real { min: f64, max: f64 },
+}
+
+/// The BRIN `*_bloom_ops` classes' options (brin_bloom.c's
+/// `brin_bloom_options`): `n_distinct_per_range` from -1 to INT_MAX, and
+/// `false_positive_rate` between BLOOM_MIN_FALSE_POSITIVE_RATE and
+/// BLOOM_MAX_FALSE_POSITIVE_RATE.
+const BRIN_BLOOM_OPTIONS: &[(&str, OpclassOption)] = &[
+    (
+        "n_distinct_per_range",
+        OpclassOption::Real {
+            min: -1.0,
+            max: i32::MAX as f64,
+        },
+    ),
+    (
+        "false_positive_rate",
+        OpclassOption::Real {
+            min: 0.0001,
+            max: 0.25,
+        },
+    ),
+];
+
 /// `index_opclass_options` (indexam.c): options written after an index
 /// column's operator class must be the class's own, in range.
 pub(crate) fn check_opclass_options(
@@ -755,21 +786,24 @@ pub(crate) fn check_opclass_options(
     let Some(found) = super::opclass::find_opclass(interp, schema, name, am) else {
         return Ok(());
     };
-    let spec = OPCLASS_OPTIONS
-        .iter()
-        .find(|(m, c, ..)| *m == am && *c == found.opcname)
-        .copied()
-        .or_else(|| {
-            (am == "brin" && found.opcname.ends_with("_minmax_multi_ops")).then_some((
-                "brin",
-                "",
-                "values_per_range",
-                8,
-                256,
-                1,
-            ))
-        });
-    let Some((_, _, option, min, max, multiple)) = spec else {
+    let spec: Vec<(&str, OpclassOption)> = if let Some(&(_, _, option, min, max, multiple)) =
+        OPCLASS_OPTIONS
+            .iter()
+            .find(|(m, c, ..)| *m == am && *c == found.opcname)
+    {
+        vec![(option, OpclassOption::Int { min, max, multiple })]
+    } else if am == "brin" && found.opcname.ends_with("_minmax_multi_ops") {
+        vec![(
+            "values_per_range",
+            OpclassOption::Int {
+                min: 8,
+                max: 256,
+                multiple: 1,
+            },
+        )]
+    } else if am == "brin" && found.opcname.ends_with("_bloom_ops") {
+        BRIN_BLOOM_OPTIONS.to_vec()
+    } else {
         return Err(DdlError::UnsupportedDdl(format!(
             "operator class {} has no options",
             found.opcname
@@ -779,34 +813,55 @@ pub(crate) fn check_opclass_options(
         let Some(node::Node::DefElem(de)) = opt.node.as_ref() else {
             continue;
         };
-        if de.defname != option {
+        let Some(&(option, kind)) = spec.iter().find(|(o, _)| *o == de.defname) else {
             return Err(DdlError::UnsupportedDdl(format!(
                 "unrecognized parameter \"{}\"",
                 de.defname
             )));
-        }
+        };
+        // transformRelOptions: an option written without a value is `true`.
         let text = match de.arg.as_deref().and_then(|a| a.node.as_ref()) {
             Some(node::Node::Integer(i)) => i.ival.to_string(),
             Some(node::Node::String(s)) => s.sval.clone(),
             Some(node::Node::Float(f)) => f.fval.clone(),
             Some(node::Node::TypeName(tn)) => super::util::type_name_to_string(tn),
+            None => "true".to_owned(),
             _ => String::new(),
         };
-        let Ok(value) = text.trim().parse::<i64>() else {
-            return Err(DdlError::UnsupportedDdl(format!(
-                "invalid value for integer option \"{option}\": {text}"
-            )));
-        };
-        if value < min || value > max {
-            return Err(DdlError::UnsupportedDdl(format!(
-                "value {value} out of bounds for option \"{option}\" (Valid values are between \
-                 \"{min}\" and \"{max}\".)"
-            )));
-        }
-        if value % multiple != 0 {
-            return Err(DdlError::UnsupportedDdl(format!(
-                "siglen value must be a multiple of {multiple}"
-            )));
+        match kind {
+            OpclassOption::Int { min, max, multiple } => {
+                let Ok(value) = text.trim().parse::<i64>() else {
+                    return Err(DdlError::UnsupportedDdl(format!(
+                        "invalid value for integer option \"{option}\": {text}"
+                    )));
+                };
+                if value < min || value > max {
+                    return Err(DdlError::UnsupportedDdl(format!(
+                        "value {value} out of bounds for option \"{option}\" (Valid values are \
+                         between \"{min}\" and \"{max}\".)"
+                    )));
+                }
+                if value % multiple != 0 {
+                    return Err(DdlError::UnsupportedDdl(format!(
+                        "siglen value must be a multiple of {multiple}"
+                    )));
+                }
+            }
+            OpclassOption::Real { min, max } => {
+                let Ok(value) = text.trim().parse::<f64>() else {
+                    return Err(DdlError::UnsupportedDdl(format!(
+                        "invalid value for floating point option \"{option}\": {text}"
+                    )));
+                };
+                // parse_one_reloption: the value as written, the bounds as
+                // `%f`.
+                if !(min..=max).contains(&value) {
+                    return Err(DdlError::UnsupportedDdl(format!(
+                        "value {text} out of bounds for option \"{option}\" (Valid values are \
+                         between \"{min:.6}\" and \"{max:.6}\".)"
+                    )));
+                }
+            }
         }
     }
     Ok(())

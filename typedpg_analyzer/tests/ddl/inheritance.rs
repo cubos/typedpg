@@ -317,6 +317,85 @@ fn partition_of_column_options_layer_over_parent_columns() {
 }
 
 #[test]
+fn partition_keys_reject_record() {
+    // ComputePartitionAttrs: CheckAttributeType with CHKATYPE_IS_PARTKEY
+    // over an expression's type, the key column named by its number.
+    for (sql, msg) in [
+        (
+            "CREATE TABLE partitioned (a int, b int) PARTITION BY RANGE (((a, b)));",
+            "partition key column 1 has pseudo-type record",
+        ),
+        (
+            "CREATE TABLE partitioned (a int, b int) PARTITION BY RANGE (a, (row(a, b)));",
+            "partition key column 2 has pseudo-type record",
+        ),
+        (
+            "CREATE TABLE partitioned (a int, b int) PARTITION BY RANGE ((ARRAY[row(a, b)]));",
+            "partition key column 1 has pseudo-type record[]",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", sql)]).expect_err(sql);
+        assert!(err.to_string().starts_with(msg), "{sql}\n  got: {err}");
+    }
+    build(&[(
+        "0001.sql",
+        "CREATE TYPE pr AS (x int, y int);
+         CREATE TABLE partitioned (a int, b int) PARTITION BY RANGE ((row(a, b)::pr));",
+    )]);
+}
+
+#[test]
+fn a_partition_inherits_its_parents_primary_key() {
+    // DefineRelation gives a partition copies of its parent's indexes
+    // before creating its own: the copy of the parent's primary key is its
+    // primary key, so it can't declare, be given or bring another one.
+    let setup = "CREATE TABLE ip (a int PRIMARY KEY, b int) PARTITION BY RANGE (a);";
+    for (sql, msg) in [
+        (
+            "CREATE TABLE failpart PARTITION OF ip (b PRIMARY KEY) FOR VALUES FROM (0) TO (100);",
+            "multiple primary keys for table \"failpart\" are not allowed",
+        ),
+        (
+            "CREATE TABLE ip3 PARTITION OF ip FOR VALUES FROM (0) TO (100);
+             ALTER TABLE ip3 ADD PRIMARY KEY (b);",
+            "multiple primary keys for table \"ip3\" are not allowed",
+        ),
+        (
+            "CREATE TABLE ip4 (a int NOT NULL, b int NOT NULL PRIMARY KEY);
+             ALTER TABLE ip ATTACH PARTITION ip4 FOR VALUES FROM (0) TO (100);",
+            "multiple primary keys for table \"ip4\" are not allowed",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", sql)]).expect_err(sql);
+        assert!(err.to_string().starts_with(msg), "{sql}\n  got: {err}");
+    }
+    build(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "CREATE TABLE okpart PARTITION OF ip (b UNIQUE) FOR VALUES FROM (0) TO (100);
+             CREATE TABLE ip5 (a int NOT NULL PRIMARY KEY, b int);
+             ALTER TABLE ip ATTACH PARTITION ip5 FOR VALUES FROM (100) TO (200);
+             CREATE TABLE jp (a int, b int) PARTITION BY RANGE (a);
+             CREATE TABLE jpart PARTITION OF jp (b PRIMARY KEY) FOR VALUES FROM (0) TO (100);",
+        ),
+    ]);
+    // A partition's own index equal to a copy is a second index (PG 18).
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE p (a int PRIMARY KEY, b int, UNIQUE (a, b)) PARTITION BY RANGE (a);
+         CREATE TABLE p1 PARTITION OF p (UNIQUE (a, b)) FOR VALUES FROM (0) TO (10);",
+    )]);
+    let mut names: Vec<String> = db
+        .pg_index_values()
+        .filter(|i| db.pg_class()[&i.indrelid].relname == "p1")
+        .map(|i| db.pg_class()[&i.indexrelid].relname.clone())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["p1_a_b_key", "p1_a_b_key1", "p1_pkey"]);
+}
+
+#[test]
 fn partition_accepts_inserts_into_parent_columns() {
     // INSERT into a partition directly (it used to have no columns).
     let db = build_db(&[(
@@ -364,6 +443,82 @@ fn alter_parent_reaches_partitions() {
         // The range bound keeps the key `d` non-NULL.
         vec![c("id", int4()), c("d", date()), cn("note", text())],
     );
+}
+
+#[test]
+fn identity_columns_are_not_added_recursively() {
+    // ATExecAddColumn: an identity column can't be added to a table with
+    // inheritance children, which wouldn't inherit it — but it can to a
+    // child, or to a partitioned table, whose partitions share it.
+    assert_ddl_err!(
+        try_apply(&[(
+            "0001.sql",
+            "CREATE TABLE itest7d (a int);
+             CREATE TABLE itest7e () INHERITS (itest7d);
+             ALTER TABLE itest7d ADD COLUMN b int GENERATED ALWAYS AS IDENTITY;",
+        )]),
+        DdlError::Parse(_),
+        "cannot recursively add identity column to table that has child tables",
+    );
+    build(&[(
+        "0001.sql",
+        "CREATE TABLE itest7d (a int);
+         CREATE TABLE itest7e () INHERITS (itest7d);
+         ALTER TABLE itest7e ADD COLUMN b int GENERATED ALWAYS AS IDENTITY;
+         CREATE TABLE lone (a int);
+         ALTER TABLE lone ADD COLUMN b int GENERATED ALWAYS AS IDENTITY;
+         CREATE TABLE pt (a int) PARTITION BY LIST (a);
+         CREATE TABLE pt1 PARTITION OF pt FOR VALUES IN (1);
+         ALTER TABLE pt ADD COLUMN b int GENERATED ALWAYS AS IDENTITY;",
+    )]);
+}
+
+#[test]
+fn set_generated_on_a_partitioned_identity_column() {
+    // An identity column added to a partitioned table is the partitions'
+    // too, and ALTER COLUMN ... SET GENERATED reaches them.
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE pitest2 (f1 date NOT NULL, f2 text) PARTITION BY RANGE (f1);
+         CREATE TABLE pitest2_p1 PARTITION OF pitest2
+             FOR VALUES FROM ('2016-07-01') TO ('2016-08-01');
+         ALTER TABLE pitest2 ADD COLUMN f3 int GENERATED ALWAYS AS IDENTITY;",
+    )]);
+    let insert = "INSERT INTO pitest2_p1 (f1, f2, f3) VALUES ('2016-07-05', 'x', 200)";
+    let err = db.analyze(insert).unwrap_err().to_string();
+    assert!(
+        err.starts_with("cannot insert a non-DEFAULT value into column \"f3\""),
+        "{err}"
+    );
+    db.apply_sql(
+        "ALTER TABLE pitest2 ALTER COLUMN f3 SET GENERATED BY DEFAULT
+             SET INCREMENT BY 2 SET START WITH 1000 RESTART;",
+    )
+    .unwrap();
+    db.analyze("INSERT INTO pitest2 (f1, f2, f3) VALUES ('2016-07-05', 'x', 200)")
+        .unwrap();
+    db.analyze(insert).unwrap();
+}
+
+#[test]
+fn partitioned_tables_reject_no_inherit_constraints_from_like() {
+    // LIKE INCLUDING CONSTRAINTS copies a NO INHERIT CHECK, which a
+    // partitioned table can't have.
+    assert_ddl_err!(
+        try_apply(&[(
+            "0001.sql",
+            "CREATE TABLE noinh (a int CONSTRAINT c CHECK (a > 0) NO INHERIT);
+             CREATE TABLE noinh_p (LIKE noinh INCLUDING ALL) PARTITION BY LIST (a);",
+        )]),
+        DdlError::Parse(_),
+        "cannot add NO INHERIT constraint to partitioned table \"noinh_p\"",
+    );
+    build(&[(
+        "0001.sql",
+        "CREATE TABLE noinh (a int CONSTRAINT c CHECK (a > 0) NO INHERIT);
+         CREATE TABLE noinh_l (LIKE noinh INCLUDING ALL);
+         CREATE TABLE noinh_q (LIKE noinh) PARTITION BY LIST (a);",
+    )]);
 }
 
 #[test]
