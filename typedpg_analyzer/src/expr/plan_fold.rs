@@ -169,40 +169,98 @@ pub(crate) fn fold(n: &protobuf::Node, snapshot: &PgCatalog) -> Folded {
     fold_with(n, snapshot, &|_| Folded::Var)
 }
 
-/// What `n` folds to, in the scope of `ctx`: a column the planner
-/// replaces by a pulled-up subquery's output is what that folds to (see
-/// [`crate::scope::Substitution`]).
-pub(crate) fn fold_in(n: &protobuf::Node, ctx: super::Ctx<'_>) -> Folded {
-    fold_with(n, ctx.snapshot, &|cr| {
-        let parts = extract_names(&cr.fields);
-        let (table, column) = match parts.as_slice() {
-            [c] if parts.len() == cr.fields.len() => (None, c.as_str()),
-            [t, c] if parts.len() == cr.fields.len() => (Some(t.as_str()), c.as_str()),
-            _ => return Folded::Const,
-        };
-        let Ok(col) = ctx.scope.resolve_column(table, column, None) else {
-            return Folded::Const;
-        };
-        match col.deferred.substitution {
-            crate::scope::Substitution::Never if !col.planned_unknown => Folded::Var,
-            crate::scope::Substitution::Certain => match col.deferred.expr.as_deref() {
-                Some(e) => fold(e, ctx.snapshot),
-                // A table's column passed through stays a Var (unless
-                // virtual generated: its expression replaces it).
-                None if col.origin.as_ref().is_some_and(|o| {
-                    !ctx.snapshot.attributes_of(o.relid).iter().any(|a| {
-                        a.attname == o.column
-                            && a.attgenerated == Some(crate::pg_catalog::AttGenerated::Virtual)
-                    })
-                }) =>
-                {
-                    Folded::Var
+/// What qual `n` — a WHERE or JOIN ON clause, a HAVING one — folds to
+/// once the planner preprocessed it.
+pub(crate) fn fold_qual(n: &protobuf::Node, snapshot: &PgCatalog) -> Folded {
+    qual_with(n, snapshot, &|_| Folded::Var, false)
+}
+
+/// [`fold_qual`] for a part of a qual's AND / OR / NOT tree, under an odd
+/// number of NOTs when `negated`, in the scope of `ctx`: a column the
+/// planner replaces by a pulled-up subquery's output is what that folds to
+/// (see [`crate::scope::Substitution`]).
+pub(crate) fn fold_qual_in(n: &protobuf::Node, ctx: super::Ctx<'_>, negated: bool) -> Folded {
+    qual_with(n, ctx.snapshot, &|cr| column_in(cr, ctx), negated)
+}
+
+/// `eval_const_expressions` pushes a NOT down an AND / OR (`negate_clause`,
+/// De Morgan's laws), then `canonicalize_qual` (`find_duplicate_ors`), at
+/// any depth of the AND / OR tree, reduces an AND with a FALSE or NULL
+/// argument to FALSE and drops a FALSE or NULL argument of an OR: in a
+/// qual, the NULL constant is FALSE (`rt.s ~ '(' AND NULL` is FALSE, its
+/// regex never estimated). Never [`Folded::Null`].
+fn qual_with(
+    n: &protobuf::Node,
+    snapshot: &PgCatalog,
+    col: &dyn Fn(&protobuf::ColumnRef) -> Folded,
+    negated: bool,
+) -> Folded {
+    if let Some(node::Node::BoolExpr(b)) = n.node.as_ref() {
+        match protobuf::BoolExprType::try_from(b.boolop) {
+            Ok(protobuf::BoolExprType::NotExpr) => {
+                if let Some(a) = b.args.first() {
+                    return qual_with(a, snapshot, col, !negated);
                 }
-                None => Folded::Const,
-            },
-            _ => Folded::Const,
+            }
+            Ok(op) => {
+                let or = (op == protobuf::BoolExprType::OrExpr) != negated;
+                let (mut var, mut unknown) = (false, false);
+                for a in &b.args {
+                    match qual_with(a, snapshot, col, negated) {
+                        Folded::Bool(v) if v == or => return Folded::Bool(or),
+                        Folded::Bool(_) => {}
+                        Folded::Const => unknown = true,
+                        Folded::Var | Folded::Null => var = true,
+                    }
+                }
+                return if unknown {
+                    Folded::Const
+                } else if var {
+                    Folded::Var
+                } else {
+                    Folded::Bool(!or)
+                };
+            }
+            Err(_) => {}
         }
-    })
+    }
+    match fold_with(n, snapshot, col) {
+        Folded::Null => Folded::Bool(false),
+        Folded::Bool(v) => Folded::Bool(v != negated),
+        other => other,
+    }
+}
+
+/// What column `cr` folds to in the scope of `ctx` (see [`fold_qual_in`]).
+fn column_in(cr: &protobuf::ColumnRef, ctx: super::Ctx<'_>) -> Folded {
+    let parts = extract_names(&cr.fields);
+    let (table, column) = match parts.as_slice() {
+        [c] if parts.len() == cr.fields.len() => (None, c.as_str()),
+        [t, c] if parts.len() == cr.fields.len() => (Some(t.as_str()), c.as_str()),
+        _ => return Folded::Const,
+    };
+    let Ok(col) = ctx.scope.resolve_column(table, column, None) else {
+        return Folded::Const;
+    };
+    match col.deferred.substitution {
+        crate::scope::Substitution::Never if !col.planned_unknown => Folded::Var,
+        crate::scope::Substitution::Certain => match col.deferred.expr.as_deref() {
+            Some(e) => fold(e, ctx.snapshot),
+            // A table's column passed through stays a Var (unless
+            // virtual generated: its expression replaces it).
+            None if col.origin.as_ref().is_some_and(|o| {
+                !ctx.snapshot.attributes_of(o.relid).iter().any(|a| {
+                    a.attname == o.column
+                        && a.attgenerated == Some(crate::pg_catalog::AttGenerated::Virtual)
+                })
+            }) =>
+            {
+                Folded::Var
+            }
+            None => Folded::Const,
+        },
+        _ => Folded::Const,
+    }
 }
 
 fn fold_with(
@@ -679,7 +737,7 @@ impl PlanLevel {
             let mut having_quals = Vec::new();
             if let Some(h) = having {
                 flatten_and(h, &mut having_quals);
-                having_quals.retain(|q| fold(q, snapshot).may_be_const());
+                having_quals.retain(|q| fold_qual(q, snapshot).may_be_const());
             }
             let mut dummy_quals = conjuncts.clone();
             dummy_quals.extend(having_quals.iter().copied());
@@ -701,7 +759,7 @@ impl PlanLevel {
             };
             let pushable = conjuncts
                 .iter()
-                .filter(|c| fold(c, snapshot) == Folded::Var && may_prove_empty(c, snapshot))
+                .filter(|c| fold_qual(c, snapshot) == Folded::Var && may_prove_empty(c, snapshot))
                 .map(|c| (*c).clone())
                 .collect();
             PUSHABLE.with(|p| p.borrow_mut().push(pushable));
@@ -896,13 +954,13 @@ impl Group {
         let constant = self.unknown_quals
             || (self.substitutes && !self.quals.is_empty())
             || self.quals.iter().any(|q| {
-                let folded = fold(q, snapshot);
+                let folded = fold_qual(q, snapshot);
                 folded.may_be_const() && folded != Folded::Bool(true)
             });
         let column_quals: Vec<&protobuf::Node> = self
             .quals
             .iter()
-            .filter(|q| !fold(q, snapshot).may_be_const())
+            .filter(|q| !fold_qual(q, snapshot).may_be_const())
             .collect();
         (constant && rels < 2) || may_be_empty(&column_quals, snapshot)
     }
@@ -980,7 +1038,7 @@ fn may_prove_empty(c: &protobuf::Node, snapshot: &PgCatalog) -> bool {
 fn may_be_empty(conjuncts: &[&protobuf::Node], snapshot: &PgCatalog) -> bool {
     let mut equated: Vec<Option<String>> = Vec::new();
     for c in conjuncts {
-        let folded = fold(c, snapshot);
+        let folded = fold_qual(c, snapshot);
         if folded.may_be_const() && folded != Folded::Bool(true) {
             return true;
         }

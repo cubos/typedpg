@@ -639,6 +639,12 @@ fn constant_regex_patterns_compiled_by_the_planner_are_validated() {
         "SELECT x.id FROM (SELECT id FROM rt WHERE s ~ '(' ORDER BY 1) x WHERE x.id = 1",
         // A constant HAVING moves into WHERE: a gating qual there too.
         "SELECT rt.id FROM rt, rt2 WHERE rt.s ~ '(' GROUP BY rt.id HAVING false",
+        // In a qual, NULL is FALSE only as an AND / OR argument: an OR
+        // drops it, and a NOT over an AND turns into an OR.
+        "SELECT 1 AS m FROM rt2, rt WHERE rt.s ~ '(' OR NULL",
+        "SELECT 1 AS m FROM rt2, rt WHERE NOT (rt.s ~ '(' AND NULL)",
+        "SELECT 1 AS m FROM (SELECT 1 AS q FROM rt WHERE s ~ '(' OFFSET 0) x \
+         WHERE (x.q = 1 AND NULL) OR x.q = 2",
     ] {
         assert_err_prefix!(
             db.analyze(sql),
@@ -682,6 +688,27 @@ fn constant_regex_patterns_compiled_by_the_planner_are_validated() {
         "SELECT 1 AS m FROM rt2, rt WHERE rt.s ~ '(' AND rt2.id = 1 AND false",
         "SELECT 1 AS m FROM rt2 LEFT JOIN rt ON rt.s ~ '(' AND rt.id = rt2.id WHERE false",
         "SELECT 1 AS m FROM rt a JOIN rt b ON a.id = b.id AND a.s ~ '(' WHERE false",
+        // `canonicalize_qual` makes an AND with a NULL argument FALSE, in
+        // WHERE and in each ON clause, at any depth of the AND / OR tree.
+        "SELECT 1 AS m FROM rt2, rt WHERE rt.s ~ '(' AND NULL",
+        "SELECT 1 AS m FROM rt2, rt WHERE NULL AND rt.s ~ '('",
+        "SELECT 1 AS m FROM rt2, rt WHERE NULL::bool AND rt.s ~ '('",
+        "SELECT 1 AS m FROM rt2 JOIN rt ON rt.s ~ '(' AND NULL",
+        "SELECT 1 AS m FROM rt2 JOIN rt ON NULL AND rt.s ~ '('",
+        "SELECT 1 AS m FROM rt2, rt WHERE NULL AND rt.s ~ '(' AND rt2.id = 1",
+        "SELECT 1 AS m FROM rt2, rt WHERE (NULL AND rt.s ~ '(')",
+        "SELECT 1 AS m FROM rt2, rt WHERE (1 > 2 OR NULL) AND rt.s ~ '('",
+        "SELECT 1 AS m FROM rt2, rt WHERE NULL = NULL AND rt.s ~ '('",
+        "SELECT 1 AS m FROM rt2, rt WHERE NULL::int = 1 AND rt.s ~ '('",
+        "SELECT 1 AS m FROM rt2, rt WHERE NULL::int > 1 AND rt.s ~ '('",
+        "SELECT 1 AS m FROM rt2, rt WHERE (rt.s ~ '(' AND NULL) OR rt2.id = 1",
+        "SELECT 1 AS m FROM rt2, rt WHERE NOT (rt.s ~ '(' OR NULL)",
+        "SELECT 1 AS m FROM rt2, rt WHERE NOT (NOT (rt.s ~ '(' AND NULL))",
+        // Such a FALSE qual proves a single relation empty.
+        "SELECT 1 AS m FROM (SELECT 1 AS q FROM rt WHERE s ~ '(' OFFSET 0) x \
+         WHERE (x.q = 1 AND NULL) OR false",
+        "SELECT 1 AS m FROM (SELECT 1 AS q FROM rt WHERE s ~ '(' OFFSET 0) x \
+         WHERE NOT (x.q = 1 OR NULL)",
     ] {
         db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
     }

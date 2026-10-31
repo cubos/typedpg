@@ -1508,19 +1508,26 @@ pub(crate) fn check_regex_restrictions(
     if !plan_time_checks() || super::plan_fold::level_may_be_empty() {
         return Ok(());
     }
-    regex_restrictions(node, ctx)
+    regex_restrictions(node, ctx, false)
 }
 
-fn regex_restrictions(node: &protobuf::Node, ctx: Ctx<'_>) -> Result<(), AnalyzeError> {
+/// [`check_regex_restrictions`] for a part of the qual, under an odd
+/// number of NOTs when `negated`.
+fn regex_restrictions(
+    node: &protobuf::Node,
+    ctx: Ctx<'_>,
+    negated: bool,
+) -> Result<(), AnalyzeError> {
     // A part folded to a constant estimates nothing (`y.q = 2`, `y` a
-    // pulled-up `(SELECT 1 AS q)`, is FALSE).
-    if super::plan_fold::fold_in(node, ctx) != super::plan_fold::Folded::Var {
+    // pulled-up `(SELECT 1 AS q)`, is FALSE; so is `rt.s ~ '(' AND NULL`).
+    if super::plan_fold::fold_qual_in(node, ctx, negated) != super::plan_fold::Folded::Var {
         return Ok(());
     }
     match node.node.as_ref() {
         Some(node::Node::BoolExpr(b)) => {
+            let negated = negated != (b.boolop == protobuf::BoolExprType::NotExpr as i32);
             for a in &b.args {
-                regex_restrictions(a, ctx)?;
+                regex_restrictions(a, ctx, negated)?;
             }
             Ok(())
         }
