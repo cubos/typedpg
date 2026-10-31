@@ -860,6 +860,11 @@ pub struct PgProc {
     pub proargdefaulttypes: Vec<PgTypeOid>,
     /// FK `pg_language.oid`.
     pub prolang: PgLanguageOid,
+    /// FK `pg_proc.oid` of the planner support function (`SUPPORT name`),
+    /// or `None` (PG: `0`). One may simplify a call away
+    /// (`SupportRequestSimplify`), dropping its arguments' evaluation.
+    #[serde(with = "crate::oid::oid_or_zero")]
+    pub prosupport: Option<PgProcOid>,
 }
 
 /// `pg_aggregate`: extra metadata for aggregate `pg_proc` rows.

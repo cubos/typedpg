@@ -5,17 +5,22 @@
 //! naming the domain cast to, so the statement is rejected.
 //!
 //! A query is followed only where it surely evaluates a row: a select list
-//! with no grouping over no FROM item (one row) or over a single view,
-//! subquery or CTE that surely yields one; a VALUES list; a UNION [ALL] of
-//! such, or an EXCEPT or INTERSECT that surely reads one. A WHERE must be
-//! provably true over that row (`y = 1` of a view's `1 AS y`: the planner
-//! folds it), or surely fail itself. A LIMIT other than 0 keeps the row,
-//! and of several rows the first one, which every plan fetches; an OFFSET
-//! skips it after its evaluation (unless an ORDER BY could postpone that
-//! past the Limit). The planner drops a subquery's (or a view's) output
+//! over no FROM item (one row, one group if grouped) or over a single
+//! view, subquery or CTE that surely yields one; a VALUES list; a UNION
+//! [ALL] of such, or an EXCEPT or INTERSECT that surely reads one. A WHERE
+//! must be provably true over that row (`y = 1` of a view's `1 AS y`: the
+//! planner folds it), or surely fail itself, or — over a set operation —
+//! be pushed down into none of its arms, running over their projected
+//! rows. A LIMIT other than 0 keeps the row, and of several rows the first
+//! one, which every plan fetches, and the ORDER BY keys of every row, which
+//! sorting evaluates; an OFFSET skips it after its evaluation (unless an
+//! ORDER BY could postpone that past the Limit). The planner drops a
+//! subquery's (or a view's, or a flattened UNION ALL leaf's) output
 //! columns the query above doesn't use, so a failing column of one fails
 //! only where that query reads it (`x`, `s.x`, `*`, `s.*`, `s`,
-//! `x IS NULL`, `x = 1`); a scalar or ARRAY subquery reads its column.
+//! `x IS NULL`, `x = 1`); a set operation it doesn't flatten keeps them
+//! all. A scalar or ARRAY subquery reads its column; an operator its
+//! operands, where its function surely evaluates them.
 //!
 //! A view's query was analyzed without execution when the view was
 //! created (DefineView), so the expressions of its rows that every
@@ -65,7 +70,8 @@ fn check_rows(
     // What the walk looks up is the statement's business only: its
     // dependencies come from its analysis.
     let (rows, _) = crate::ddl::depend::collect(|| query_rows(sel, snapshot, ctes, 0, false));
-    match rows.and_then(|r| r.all.any()) {
+    // Nothing above the statement pushes a qualification down.
+    match rows.and_then(|r| r.all.any().or(r.projection)) {
         Some(f) => Err(AnalyzeError::Invalid(f.message)),
         None => Ok(()),
     }
@@ -154,6 +160,34 @@ struct Rows {
     /// the arm's row: a qualification above pushed down into the arms
     /// (subquery_push_qual) runs before that, and may skip it.
     projected: bool,
+    /// Each output column a qualification above can't be pushed down into
+    /// the arms by (`qual_is_pushdown_safe`): one whose type differs among
+    /// the arms (`compare_tlist_datatypes`), or any of a set operation
+    /// with an EXCEPT, a LIMIT or a component that is a set operation of
+    /// its own. Such a qualification runs over the projected rows.
+    unpushable: Vec<bool>,
+    /// A qualification reading the whole row can't be pushed down: the
+    /// set operation isn't a UNION ALL the planner flattens
+    /// (`is_simple_union_all`), so the row is a Var of the subquery
+    /// (`qual_is_pushdown_safe`'s point 4).
+    whole_row_unpushable: bool,
+    /// A set operation the planner doesn't flatten keeps every output
+    /// column (remove_unused_subquery_outputs leaves a set operation
+    /// alone): reading any of its rows projects its arms whole.
+    keeps_columns: bool,
+    /// What reading every row (the first one) of a query over such a set
+    /// operation raises projecting its arms, unless a qualification above
+    /// is pushed down into them and skips the row: what a query reading
+    /// its rows with nothing above it surely raises.
+    projection: Option<Failure>,
+    first_projection: Option<Failure>,
+    /// The column types of each leaf of a set operation (as its own
+    /// output's, unknown where not known).
+    leaf_types: Vec<Vec<Option<PgTypeOid>>>,
+    /// What sorting the rows by the query's ORDER BY surely raises: its
+    /// keys' evaluation over every row, which every plan for it does (a
+    /// Sort reads every row, a MergeAppend primes each input).
+    ordered: Option<Failure>,
     /// The constant each output column surely holds.
     values: Vec<Option<Value>>,
     /// Each output column's type, where known (an operator over it is
@@ -167,6 +201,13 @@ impl Rows {
         Rows {
             sorted: first.any(),
             projected: false,
+            unpushable: Vec::new(),
+            whole_row_unpushable: false,
+            keeps_columns: false,
+            projection: None,
+            first_projection: None,
+            leaf_types: Vec::new(),
+            ordered: None,
             all,
             first,
             values,
@@ -182,6 +223,17 @@ impl Rows {
 
     fn errors(&self, first: bool) -> &Errors {
         if first { &self.first } else { &self.all }
+    }
+
+    /// A qualification reading `read` of these rows can't be pushed down
+    /// into a set operation's arms: it reads an unpushable column, or the
+    /// whole row (`qual_is_pushdown_safe`).
+    fn unpushable(&self, read: &Read) -> bool {
+        match read {
+            Read::Column(i) => self.unpushable.get(*i).copied().unwrap_or(false),
+            Read::WholeRow => self.whole_row_unpushable,
+            Read::All | Read::Other => false,
+        }
     }
 
     /// Column `i`'s type: an unknown-typed one (`'a'`, `NULL`) is text, as
@@ -251,17 +303,32 @@ fn limit_rows(sel: &protobuf::SelectStmt, rows: Rows) -> Option<Rows> {
     }
     // A Limit fetches its input's rows in order, the first one surely (a
     // Sort below it reads them all); which ones past it a LIMIT returns
-    // are evaluated is unknown.
+    // are evaluated is unknown. A qualification above isn't pushed down
+    // into a query with a LIMIT or OFFSET (subquery_is_pushdown_safe).
+    // Nor is one pushed down through it, below: its projections are
+    // its own rows'.
+    let mut rows = rows;
+    rows.all.always = rows.all.always.take().or(rows.projection.take());
+    rows.first.always = rows.first.always.take().or(rows.first_projection.take());
     let rows = Rows {
         sorted: rows.first.any(),
+        unpushable: vec![true; rows.all.columns.len()],
+        whole_row_unpushable: true,
+        keeps_columns: rows.keeps_columns || sel.op != protobuf::SetOperation::SetopNone as i32,
         ..rows
     };
     if count.is_some() && !rows.count.at_most_one {
         if offset != 0 {
             return None;
         }
+        // Sorted, every row's ORDER BY keys are evaluated before the
+        // first one is returned.
+        let mut first = rows.first.clone();
+        first.always = first.always.or_else(|| rows.ordered.clone());
         return Some(Rows {
-            all: rows.first.clone(),
+            sorted: first.any(),
+            first: first.clone(),
+            all: first,
             count: Count {
                 at_least_one: rows.count.at_least_one,
                 at_most_one: count == Some(1),
@@ -358,7 +425,22 @@ fn select_rows(
             )
         });
     }
-    if !sel.group_clause.is_empty() || sel.having_clause.is_some() {
+    // Grouped, the one row of no FROM item is one group (a key naming an
+    // output column, or its position, is no set-returning function the
+    // select list doesn't show).
+    let grouped_row = sel.group_clause.is_empty()
+        || sel.from_clause.is_empty()
+            && sel.group_clause.iter().all(|g| {
+                matches!(
+                    g.node,
+                    Some(node::Node::ColumnRef(_))
+                        | Some(node::Node::AConst(protobuf::AConst {
+                            val: Some(protobuf::a_const::Val::Ival(_)),
+                            ..
+                        }))
+                )
+            });
+    if !grouped_row || sel.having_clause.is_some() {
         return None;
     }
     let source = match sel.from_clause.as_slice() {
@@ -371,19 +453,32 @@ fn select_rows(
         ..level
     };
     let mut count = source.as_ref().map_or(ONE, |s| s.rows.count);
-    // A WHERE not surely true must surely fail: only a row reaching it
-    // evaluates it.
-    let where_fails = match sel.where_clause.as_deref() {
-        Some(w) if level.truth(w) != Some(true) => {
-            if !count.at_least_one {
-                return None;
-            }
-            count.at_least_one = false;
-            Some(w)
-        }
-        _ => None,
+    // What reading the source's rows raises projecting a set operation's
+    // arms (see [`Rows::projection`]).
+    let projection = match source.as_ref() {
+        Some(s) if s.rows.keeps_columns => (s.rows.all.any(), s.rows.first.any()),
+        Some(s) => (s.rows.projection.clone(), s.rows.first_projection.clone()),
+        None => (None, None),
     };
-    let (all, values) = level_errors(sel, level, where_fails)?;
+    // A WHERE not surely true must surely fail: only a row reaching it
+    // evaluates it. One that is pushed down into no arm runs over the
+    // projected rows, all of them (the set operation runs whole below
+    // it), whatever it lets through.
+    let where_fails = sel
+        .where_clause
+        .as_deref()
+        .filter(|w| level.truth(w) != Some(true));
+    let unpushed = where_fails
+        .filter(|w| level.unpushed(w))
+        .map(|_| projection.clone());
+    if where_fails.is_some() {
+        if !count.at_least_one && !unpushed.as_ref().is_some_and(|(all, _)| all.is_some()) {
+            return None;
+        }
+        count.at_least_one = false;
+    }
+    let unpushed = unpushed.unwrap_or((None, None));
+    let (all, values) = level_errors(sel, level, where_fails, unpushed.0)?;
     // Over the source's first row, a WHERE that may not fail may let it
     // through or not: what the first fetch raises is unknown.
     let first = level_errors(
@@ -393,6 +488,7 @@ fn select_rows(
             ..level
         },
         where_fails,
+        unpushed.1,
     )
     .map_or_else(Errors::default, |(e, _)| e);
     // A set-returning function in the select list may leave no row, or
@@ -403,11 +499,102 @@ fn select_rows(
             at_most_one: false,
         };
     }
+    let projected = source.as_ref().is_some_and(|s| s.rows.projected);
+    let ordered = sel.sort_clause.iter().find_map(|k| match k.node.as_ref() {
+        Some(node::Node::SortBy(sb)) => order_key_error(sel, level, &all, sb.node.as_deref()?),
+        _ => None,
+    });
+    // Without a WHERE, a qualification above may still be pushed down
+    // through this query (pulled up) into the arms.
+    let (projection, first_projection) = if where_fails.is_none() {
+        projection
+    } else {
+        (None, None)
+    };
     Some(Rows {
-        projected: source.as_ref().is_some_and(|s| s.rows.projected),
+        projected,
+        unpushable: if projected {
+            level_unpushable(sel, level)
+        } else {
+            Vec::new()
+        },
+        projection,
+        first_projection,
+        ordered,
         types: level_types(sel, level),
         ..Rows::new(all, first, values, count)
     })
+}
+
+/// What evaluating ORDER BY key `key` of `sel` over every row of `level`'s
+/// source surely raises: an output column's error (by position or by
+/// alias), else the expression's.
+fn order_key_error(
+    sel: &protobuf::SelectStmt,
+    level: Level<'_>,
+    all: &Errors,
+    key: &protobuf::Node,
+) -> Option<Failure> {
+    match key.node.as_ref()? {
+        node::Node::AConst(protobuf::AConst {
+            val: Some(protobuf::a_const::Val::Ival(i)),
+            ..
+        }) => return all.column(usize::try_from(i.ival).ok()?.checked_sub(1)?),
+        node::Node::ColumnRef(cr) => {
+            if let [f] = cr.fields.as_slice()
+                && let Some(node::Node::String(name)) = f.node.as_ref()
+            {
+                // An output column's alias wins over the FROM item's
+                // columns (findTargetlistEntrySQL92).
+                let mut column = 0;
+                for target in &sel.target_list {
+                    let Some(node::Node::ResTarget(rt)) = target.node.as_ref() else {
+                        return None;
+                    };
+                    if let (Some(source), Some(node::Node::ColumnRef(cr))) = (
+                        level.source,
+                        rt.val.as_deref().and_then(|v| v.node.as_ref()),
+                    ) && let Read::All = source.read(cr)
+                    {
+                        column += source.names.len();
+                        continue;
+                    }
+                    if rt.name == name.sval {
+                        return all.column(column);
+                    }
+                    column += 1;
+                }
+            }
+        }
+        _ => {}
+    }
+    level.error(key)
+}
+
+/// Which columns `sel`'s select list yields over `level`'s projected
+/// source a qualification above can't push down: those reading such a
+/// column of it.
+fn level_unpushable(sel: &protobuf::SelectStmt, level: Level<'_>) -> Vec<bool> {
+    let mut unpushable = Vec::new();
+    for target in &sel.target_list {
+        let val = match target.node.as_ref() {
+            Some(node::Node::ResTarget(rt)) => rt.val.as_deref(),
+            _ => None,
+        };
+        let (Some(source), Some(node::Node::ColumnRef(cr))) =
+            (level.source, val.and_then(|v| v.node.as_ref()))
+        else {
+            unpushable.push(false);
+            continue;
+        };
+        match source.read(cr) {
+            Read::All => unpushable
+                .extend((0..source.names.len()).map(|i| source.rows.unpushable(&Read::Column(i)))),
+            read @ Read::Column(_) => unpushable.push(source.rows.unpushable(&read)),
+            Read::WholeRow | Read::Other => unpushable.push(false),
+        }
+    }
+    unpushable
 }
 
 /// What evaluating `sel`'s select list over `level`'s source rows (all of
@@ -418,11 +605,15 @@ fn level_errors(
     sel: &protobuf::SelectStmt,
     level: Level<'_>,
     where_fails: Option<&protobuf::Node>,
+    unpushed: Option<Failure>,
 ) -> Option<(Errors, Vec<Option<Value>>)> {
     let source = level.source;
     let mut always = source.and_then(|s| s.rows.errors(level.first).always.clone());
     if let Some(w) = where_fails {
-        always = always.or(Some(level.surely_fails(w)?));
+        always = match unpushed {
+            Some(p) => Some(p),
+            None => always.or(Some(level.surely_fails(w)?)),
+        };
     }
     // The select list's own expressions are evaluated for the rows that
     // reach it; the columns it reads of the FROM item are evaluated there.
@@ -545,11 +736,13 @@ fn set_op_rows(
                         .and_then(|b| b.sorted.clone())
                 })
             };
-            let leaf = |s: &protobuf::SelectStmt| {
+            // A grouped leaf is estimated its rows (build_setop_child_paths),
+            // at least one but where proven empty (a dummy relation).
+            let leaf = |s: &protobuf::SelectStmt, rows: Option<&Rows>| {
                 s.op == Op::SetopNone as i32
-                    && s.group_clause.is_empty()
                     && s.having_clause.is_none()
-                    && s.distinct_clause.is_empty()
+                    && (s.group_clause.is_empty() && s.distinct_clause.is_empty()
+                        || rows.is_some_and(|r| r.count.at_least_one))
             };
             // The planner puts first the input it estimates fewer groups
             // of, the left one on a tie (generate_nonunion_paths): an
@@ -557,13 +750,13 @@ fn set_op_rows(
             // leaf it estimates one row of — every one yielding at most one
             // row — is first against one estimated so too (the other's
             // rows estimate may be less for a set operation, or a grouped
-            // leaf).
+            // leaf that may be empty).
             let left_outer = left.as_ref().is_some_and(|l| l.count.at_most_one)
                 && sel
                     .larg
                     .as_deref()
                     .is_some_and(|l| l.op == Op::SetopNone as i32)
-                && sel.rarg.as_deref().is_some_and(leaf);
+                && sel.rarg.as_deref().is_some_and(|r| leaf(r, right.as_ref()));
             let first = if left_outer {
                 outer(left.as_ref()?, right.as_ref())
             } else {
@@ -583,15 +776,129 @@ fn set_op_rows(
     };
     let known = arms.iter().flatten().next()?;
     let width = width.max(known.all.columns.len());
+    // The leaves of the set operation tree (a parenthesized arm with an
+    // ORDER BY, a LIMIT or a WITH is a leaf of its own:
+    // transformSetOperationTree).
+    let mut leaf_types = Vec::new();
+    for (arm, rows) in [&sel.larg, &sel.rarg].into_iter().zip(&arms) {
+        match (arm.as_deref(), rows) {
+            (Some(a), Some(r)) if in_set_operation_tree(a) => {
+                leaf_types.extend(r.leaf_types.iter().cloned())
+            }
+            (Some(a), Some(r)) if a.op == Op::SetopNone as i32 => leaf_types.push(r.types.clone()),
+            _ => {}
+        }
+    }
+    // A UNION ALL whose leaves all yield its column types is flattened
+    // into an append relation (is_simple_union_all): a qualification
+    // above goes to each leaf. Else the set operation is a subquery,
+    // which `qual_is_pushdown_safe` pushes a qualification into only
+    // where it reads no column of a type some leaf doesn't yield
+    // (compare_tlist_datatypes), nor the whole row, and the tree has no
+    // EXCEPT nor a component that is a set operation of its own.
+    let mismatched: Vec<bool> = (0..width)
+        .map(|i| types_differ(snapshot, &leaf_types, i))
+        .collect();
+    let flattened =
+        union_all_tree(sel) && sel.sort_clause.is_empty() && !mismatched.contains(&true);
+    let unsafe_tree = pushdown_unsafe_tree(sel);
+    let unpushable: Vec<bool> = mismatched
+        .iter()
+        .map(|&m| !flattened && (unsafe_tree || m))
+        .collect();
+    // Flattened, each leaf is planned on its own, computing only the
+    // columns read above (remove_unused_subquery_outputs): a column fails
+    // where some arm's does. Else every arm is projected whole.
+    let (all_errors, first_errors) = if flattened {
+        let known: Vec<&Rows> = arms.iter().flatten().collect();
+        let all_errors = Errors {
+            columns: (0..width)
+                .map(|i| known.iter().find_map(|a| a.all.column(i)))
+                .collect(),
+            always: known.iter().find_map(|a| a.all.always.clone()),
+        };
+        // Its Append runs the arms in order (see the UNION ALL above).
+        let domain = |f: Option<Failure>| f.filter(|f| f.domain);
+        let first_errors = match left {
+            Some(l) => Errors {
+                columns: (0..width).map(|i| domain(l.first.column(i))).collect(),
+                always: domain(l.first.always.clone()),
+            },
+            None => Errors::uniform(None, width),
+        };
+        (all_errors, first_errors)
+    } else {
+        (
+            Errors::uniform(all.clone(), width),
+            Errors::uniform(first, width),
+        )
+    };
     Some(Rows {
         sorted,
         projected: true,
-        ..Rows::unknown_values(
-            Errors::uniform(all, width),
-            Errors::uniform(first, width),
-            count,
-        )
+        whole_row_unpushable: !flattened,
+        keeps_columns: !flattened,
+        unpushable,
+        leaf_types,
+        // A Sort reads every row, of each arm a MergeAppend's input.
+        ordered: (!sel.sort_clause.is_empty()).then_some(all).flatten(),
+        ..Rows::unknown_values(all_errors, first_errors, count)
     })
+}
+
+/// A set operation arm that is part of its parent's tree, not a leaf
+/// subquery of its own (transformSetOperationTree's `isLeaf`).
+fn in_set_operation_tree(s: &protobuf::SelectStmt) -> bool {
+    s.op != protobuf::SetOperation::SetopNone as i32
+        && s.sort_clause.is_empty()
+        && s.limit_count.is_none()
+        && s.limit_offset.is_none()
+        && s.locking_clause.is_empty()
+        && s.with_clause.is_none()
+}
+
+/// No qualification is pushed down into the set operation `sel`
+/// (recurse_pushdown_safe): its tree has an EXCEPT, or a component that is
+/// a set operation of its own.
+fn pushdown_unsafe_tree(sel: &protobuf::SelectStmt) -> bool {
+    sel.op == protobuf::SetOperation::SetopExcept as i32
+        || [&sel.larg, &sel.rarg].into_iter().flatten().any(|arm| {
+            if in_set_operation_tree(arm) {
+                pushdown_unsafe_tree(arm)
+            } else {
+                arm.op != protobuf::SetOperation::SetopNone as i32
+            }
+        })
+}
+
+/// `sel`'s tree is all UNION ALL, whatever its leaves
+/// (is_simple_union_all_recurse).
+fn union_all_tree(sel: &protobuf::SelectStmt) -> bool {
+    sel.op == protobuf::SetOperation::SetopUnion as i32
+        && sel.all
+        && [&sel.larg, &sel.rarg]
+            .into_iter()
+            .flatten()
+            .all(|arm| !in_set_operation_tree(arm) || union_all_tree(arm))
+}
+
+/// Two leaves surely give column `i` different types: the set operation's
+/// type then differs from one of theirs. Only concrete types count — an
+/// unknown-typed literal is coerced in the leaf itself.
+fn types_differ(snapshot: &PgCatalog, leaves: &[Vec<Option<PgTypeOid>>], i: usize) -> bool {
+    let mut known = leaves
+        .iter()
+        .filter_map(|l| l.get(i).copied().flatten())
+        .filter(|&t| {
+            snapshot
+                .pg_type
+                .get(&t)
+                .is_some_and(|ty| ty.typtype != crate::pg_catalog::TypType::Pseudo)
+        });
+    let Some(first) = known.next() else {
+        return false;
+    };
+    known.any(|t| t != first)
 }
 
 /// The leftmost arm of a set operation, which names its columns.
@@ -628,7 +935,7 @@ impl Level<'_> {
             }
             node::Node::ColumnRef(cr) => {
                 let source = self.source?;
-                if self.qual && source.rows.projected {
+                if self.qual && source.rows.projected && !source.rows.unpushable(&source.read(cr)) {
                     return None;
                 }
                 let errors = source.rows.errors(self.first);
@@ -643,9 +950,7 @@ impl Level<'_> {
             node::Node::NullTest(nt) => return self.error(nt.arg.as_deref()?),
             node::Node::SubLink(sl) => return self.sublink_error(sl),
             node::Node::AExpr(e) if e.kind() == protobuf::AExprKind::AexprOp => {
-                if self.evaluates_operands(e)
-                    && let Some(f) = e.lexpr.iter().chain(&e.rexpr).find_map(|a| self.error(a))
-                {
+                if let Some(f) = self.operator_error(e) {
                     return Some(f);
                 }
             }
@@ -692,6 +997,14 @@ impl Level<'_> {
             node::Node::AExpr(e) if e.kind() == protobuf::AExprKind::AexprOp => {
                 Some(self.operator(e)?.result_type_oid)
             }
+            node::Node::SqlvalueFunction(_) => {
+                let scope = Scope::default();
+                let null_ctx = NullabilityContext::default();
+                let ctx = Ctx::new(&scope, &null_ctx, self.snapshot);
+                expr::infer_expr(n, ctx, &mut ParamCollector::default(), TypeGoal::NONE)
+                    .ok()
+                    .map(|t| t.type_oid)
+            }
             node::Node::SubLink(sl)
                 if sl.sub_link_type == protobuf::SubLinkType::ExprSublink as i32 =>
             {
@@ -719,39 +1032,68 @@ impl Level<'_> {
         }
     }
 
-    /// The operator `e` runs a function that evaluates each of its
-    /// operands: ExecInterpExpr evaluates a call's arguments before it,
-    /// and the planner neither folds a domain's coercion
-    /// (eval_const_expressions) nor drops an argument. It may where the
-    /// function is a SQL one it inlines (whose body may ignore an
-    /// argument), or one whose support function simplifies the call
-    /// (`range_contains_elem` is false for an empty range): those, and the
-    /// functions a user could give a support function, are left alone.
-    ///
-    /// The operator is the one its operands' types resolve to; where those
-    /// aren't known, every operator of its name must qualify.
-    fn evaluates_operands(&self, e: &protobuf::AExpr) -> bool {
-        let snapshot = self.snapshot;
-        let evaluates = |code: Option<crate::oid::PgProcOid>| {
-            const SIMPLIFIED: [&str; 2] = ["range_contains_elem", "elem_contained_by_range"];
-            code.and_then(|f| snapshot.pg_proc.get(&f))
-                .is_some_and(|p| {
-                    p.prolang != crate::pg_catalog::SQL_LANGUAGE
-                        && snapshot.namespace_name(p.pronamespace) == Some("pg_catalog")
-                        && !SIMPLIFIED.contains(&p.proname.as_str())
-                })
-        };
-        if let Some(op) = self.operator(e) {
-            return evaluates(op.code);
+    /// The error an operand of the operator `e` surely raises, where the
+    /// call evaluates it (see [`operator_evaluates`]): the leftmost one
+    /// failing, as ExecInterpExpr evaluates a call's arguments in order —
+    /// unless the function is a SQL one, whose inlined body may evaluate
+    /// them in another order.
+    fn operator_error(&self, e: &protobuf::AExpr) -> Option<Failure> {
+        let operands: Vec<&protobuf::Node> = e.lexpr.iter().chain(&e.rexpr).map(|a| &**a).collect();
+        let errors: Vec<Option<Failure>> = operands.iter().map(|a| self.error(a)).collect();
+        let failing = errors.iter().position(Option::is_some)?;
+        let several = errors.iter().flatten().nth(1).is_some();
+        // Every other operand surely is no NULL constant: a strict function
+        // over one is folded to NULL (evaluate_function), and an inlined
+        // body gets it substituted.
+        let others = operands
+            .iter()
+            .enumerate()
+            .all(|(i, a)| i == failing || self.not_null_const(a));
+        let types: Vec<Option<PgTypeOid>> = operands.iter().map(|a| self.type_of(a)).collect();
+        let resolved = self.operator(e).map(|op| op.code);
+        operator_evaluates(
+            self.snapshot,
+            e,
+            resolved,
+            failing,
+            others,
+            !several,
+            &types,
+            0,
+        )
+        .then(|| errors[failing].clone())
+        .flatten()
+    }
+
+    /// `n` surely is no NULL constant once the planner simplified it: a
+    /// non-NULL literal (a string one is read by the type's input
+    /// function, which can't return NULL for one), a built-in cast of one,
+    /// a stable SQL value function (`CURRENT_DATE`, not folded), a column
+    /// holding a constant, or an expression whose evaluation surely fails.
+    fn not_null_const(&self, n: &protobuf::Node) -> bool {
+        match n.node.as_ref() {
+            Some(node::Node::AConst(c)) => !c.isnull,
+            Some(node::Node::TypeCast(tc))
+                if tc.arg.as_deref().is_some_and(|a| self.not_null_const(a))
+                    && tc
+                        .type_name
+                        .as_ref()
+                        .and_then(|t| crate::ddl::util::resolve_type_name(t, self.snapshot))
+                        .is_some_and(|t| builtin_casts_into(self.snapshot, t)) =>
+            {
+                true
+            }
+            Some(node::Node::SqlvalueFunction(_)) => true,
+            Some(node::Node::ColumnRef(cr))
+                if self.source.is_some_and(|s| match s.read(cr) {
+                    Read::Column(i) => s.rows.values.get(i).is_some_and(Option::is_some),
+                    _ => false,
+                }) =>
+            {
+                true
+            }
+            _ => self.error(n).is_some(),
         }
-        let Some(node::Node::String(name)) = e.name.last().and_then(|n| n.node.as_ref()) else {
-            return false;
-        };
-        snapshot
-            .pg_operator
-            .values()
-            .filter(|o| o.oprname == name.sval)
-            .all(|o| evaluates(o.oprcode))
     }
 
     /// `NULL::d` of a domain `d` rejecting it.
@@ -785,7 +1127,11 @@ impl Level<'_> {
         if scalar && !rows.count.at_most_one {
             return None;
         }
-        rows.all.always.clone().or_else(|| rows.all.column(0))
+        rows.all
+            .always
+            .clone()
+            .or_else(|| rows.all.column(0))
+            .or_else(|| rows.projection.clone())
     }
 
     /// The constant `n` surely is.
@@ -897,6 +1243,337 @@ impl Level<'_> {
             }
             node::Node::BoolExpr(_) => None,
             _ => level.error(n),
+        }
+    }
+
+    /// The qualification `n` over a set operation the planner keeps whole
+    /// is pushed down into none of its arms, nor folded to a constant
+    /// (which could leave the scan dummy): each of its conjuncts not
+    /// surely true reads a column that can't be pushed down
+    /// (`qual_is_pushdown_safe`), through nothing but operators, casts
+    /// and NULL tests of columns and non-NULL literals.
+    fn unpushed(&self, n: &protobuf::Node) -> bool {
+        let Some(source) = self
+            .source
+            .filter(|s| s.rows.keeps_columns || s.rows.projection.is_some())
+        else {
+            return false;
+        };
+        let mut conjuncts = vec![n];
+        let mut i = 0;
+        while i < conjuncts.len() {
+            if let Some(node::Node::BoolExpr(b)) = conjuncts[i].node.as_ref()
+                && b.boolop == protobuf::BoolExprType::AndExpr as i32
+            {
+                let and = conjuncts.remove(i);
+                if let Some(node::Node::BoolExpr(b)) = and.node.as_ref() {
+                    conjuncts.extend(b.args.iter());
+                }
+                continue;
+            }
+            i += 1;
+        }
+        conjuncts
+            .into_iter()
+            .filter(|c| self.truth(c) != Some(true))
+            .all(|c| {
+                let mut simple = true;
+                let mut reads = false;
+                super::walk::visit_same_level(c, &mut |x| match x.node.as_ref() {
+                    Some(node::Node::ColumnRef(cr)) => {
+                        reads |= source.rows.unpushable(&source.read(cr));
+                    }
+                    Some(node::Node::AConst(a)) => simple &= !a.isnull,
+                    Some(node::Node::AExpr(e)) => {
+                        simple &= e.kind() == protobuf::AExprKind::AexprOp;
+                    }
+                    Some(node::Node::TypeCast(_) | node::Node::NullTest(_)) => {}
+                    Some(node::Node::TypeName(_) | node::Node::String(_)) => {}
+                    _ => simple = false,
+                });
+                simple && reads
+            })
+    }
+}
+
+/// How deep [`call_evaluates`] reads SQL function bodies into the calls
+/// they make.
+const MAX_BODY_DEPTH: usize = 8;
+
+/// The planner support functions that never simplify a call away: they
+/// answer only index-condition and selectivity requests
+/// (`like_regex_support`, `network_subset_support`), in-place
+/// modification ones (`array_append_support`), or reduce a length
+/// coercion to its first argument (`TemporalSimplify`, `numeric_support`,
+/// `varchar_support`, `varbit_support`). Another one — say
+/// `range_contains_elem_support`, which folds `elem <@ 'empty'` to false
+/// — may drop an argument.
+const ARGUMENT_KEEPING_SUPPORT: [&str; 14] = [
+    "textlike_support",
+    "texticlike_support",
+    "textregexeq_support",
+    "texticregexeq_support",
+    "text_starts_with_support",
+    "network_subset_support",
+    "array_append_support",
+    "array_prepend_support",
+    "varchar_support",
+    "numeric_support",
+    "varbit_support",
+    "timestamp_support",
+    "interval_support",
+    "time_support",
+];
+
+/// `p` has no support function that could simplify its calls away.
+fn keeps_arguments(snapshot: &PgCatalog, p: &crate::pg_catalog::PgProc) -> bool {
+    p.prosupport.is_none_or(|s| {
+        snapshot.pg_proc.get(&s).is_some_and(|f| {
+            snapshot.namespace_name(f.pronamespace) == Some("pg_catalog")
+                && ARGUMENT_KEEPING_SUPPORT.contains(&f.proname.as_str())
+        })
+    })
+}
+
+/// FirstNormalObjectId (transam.h): below, what initdb made.
+const FIRST_NORMAL_OBJECT_ID: u32 = 16384;
+
+/// Every cast into `target` (its base type, for a domain) is built in, or
+/// needs no function: a cast of a non-NULL constant, folded by the
+/// planner, is no NULL constant (a user's cast function could return one).
+fn builtin_casts_into(snapshot: &PgCatalog, target: PgTypeOid) -> bool {
+    let target = snapshot.unwrap_domain(target);
+    snapshot
+        .pg_cast
+        .values()
+        .filter(|c| c.casttarget == target)
+        .all(|c| c.castfunc.is_none_or(|f| f.get() < FIRST_NORMAL_OBJECT_ID))
+}
+
+/// A cast into `target` evaluates its argument: none is done by a SQL
+/// function (inlined, its body could ignore it) or one whose support
+/// function could drop it.
+fn casts_evaluate_argument(snapshot: &PgCatalog, target: PgTypeOid) -> bool {
+    let target = snapshot.unwrap_domain(target);
+    snapshot
+        .pg_cast
+        .values()
+        .filter(|c| c.casttarget == target)
+        .all(|c| {
+            c.castfunc.is_none_or(|f| {
+                snapshot.pg_proc.get(&f).is_some_and(|p| {
+                    p.prolang != crate::pg_catalog::SQL_LANGUAGE && keeps_arguments(snapshot, p)
+                })
+            })
+        })
+}
+
+/// The operator `e` evaluates its operand `operand` (counted from its left
+/// one): its function — `code`, where its operands' types resolved it;
+/// else every operator of its name and arity must — evaluates that
+/// argument (see [`call_evaluates`]). `others` tells that every other
+/// operand surely is no NULL constant, which a strict function (or an
+/// inlined body) needs; `ordered`, that it doesn't matter in which order
+/// the operands are evaluated (an inlined body may reorder them).
+#[allow(clippy::too_many_arguments)]
+fn operator_evaluates(
+    snapshot: &PgCatalog,
+    e: &protobuf::AExpr,
+    code: Option<Option<crate::oid::PgProcOid>>,
+    operand: usize,
+    others: bool,
+    ordered: bool,
+    types: &[Option<PgTypeOid>],
+    depth: usize,
+) -> bool {
+    let evaluates = |code: Option<crate::oid::PgProcOid>| {
+        let Some(p) = code.and_then(|f| snapshot.pg_proc.get(&f)) else {
+            return false;
+        };
+        let sql = p.prolang == crate::pg_catalog::SQL_LANGUAGE;
+        if (p.proisstrict || sql) && !others || sql && !ordered {
+            return false;
+        }
+        call_evaluates(snapshot, p, operand, types, depth)
+    };
+    if let Some(code) = code {
+        return evaluates(code);
+    }
+    let Some(node::Node::String(name)) = e.name.last().and_then(|n| n.node.as_ref()) else {
+        return false;
+    };
+    let prefix = e.lexpr.is_none();
+    snapshot
+        .pg_operator
+        .values()
+        .filter(|o| o.oprname == name.sval && o.oprleft.is_none() == prefix)
+        .all(|o| evaluates(o.oprcode))
+}
+
+/// A call of `p` evaluates its argument `arg`, none of the others being a
+/// NULL constant: ExecInterpExpr evaluates a call's arguments before it,
+/// and the planner neither folds a domain's coercion
+/// (eval_const_expressions) nor drops an argument — unless a support
+/// function simplifies the call, or `p` is a SQL function it inlines
+/// (`inline_function`), whose body is then evaluated instead: that body
+/// must evaluate the parameter. `types` are the arguments' types, where
+/// known (the body's polymorphic parameters have them).
+fn call_evaluates(
+    snapshot: &PgCatalog,
+    p: &crate::pg_catalog::PgProc,
+    arg: usize,
+    types: &[Option<PgTypeOid>],
+    depth: usize,
+) -> bool {
+    if !keeps_arguments(snapshot, p) {
+        return false;
+    }
+    if p.prolang != crate::pg_catalog::SQL_LANGUAGE {
+        return true;
+    }
+    // A body that isn't one expression is never inlined: the call
+    // evaluates its arguments, as any other.
+    let Some(body) = snapshot.inline_sql_bodies.get(&p.oid) else {
+        return true;
+    };
+    depth < MAX_BODY_DEPTH
+        && Body {
+            snapshot,
+            proc: p,
+            types,
+            depth,
+        }
+        .evaluates(body, arg)
+}
+
+/// The expression of an inlinable SQL function's body, its parameters
+/// substituted by the call's arguments.
+struct Body<'a> {
+    snapshot: &'a PgCatalog,
+    proc: &'a crate::pg_catalog::PgProc,
+    types: &'a [Option<PgTypeOid>],
+    depth: usize,
+}
+
+impl Body<'_> {
+    /// The parameter `n` refers to: `$n`, or its name.
+    fn param(&self, n: &protobuf::Node) -> Option<usize> {
+        match n.node.as_ref()? {
+            node::Node::ParamRef(p) => usize::try_from(p.number).ok()?.checked_sub(1),
+            node::Node::ColumnRef(cr) => match cr.fields.as_slice() {
+                [f] => match f.node.as_ref()? {
+                    node::Node::String(s) => self
+                        .proc
+                        .proargnames
+                        .iter()
+                        .position(|a| !a.is_empty() && *a == s.sval),
+                    _ => None,
+                },
+                _ => None,
+            },
+            _ => None,
+        }
+        .filter(|&i| i < self.proc.proargtypes.len())
+    }
+
+    /// The type `n` surely has, where it is simple enough to tell: a
+    /// parameter's (a polymorphic one's is its argument's), a literal's,
+    /// a cast's, an operator's result.
+    fn type_of(&self, n: &protobuf::Node) -> Option<PgTypeOid> {
+        if let Some(i) = self.param(n) {
+            let declared = self.proc.proargtypes[i];
+            return if crate::polymorphic::is_polymorphic(declared) {
+                self.types.get(i).copied().flatten()
+            } else {
+                Some(declared)
+            };
+        }
+        match n.node.as_ref()? {
+            node::Node::AConst(c) => Some(expr::literals::infer_a_const(c).ok()?.type_oid),
+            node::Node::TypeCast(tc) => {
+                crate::ddl::util::resolve_type_name(tc.type_name.as_ref()?, self.snapshot)
+            }
+            node::Node::AExpr(e) if e.kind() == protobuf::AExprKind::AexprOp => {
+                Some(self.operator(e)?.result_type_oid)
+            }
+            _ => None,
+        }
+    }
+
+    fn operator(&self, e: &protobuf::AExpr) -> Option<crate::lookup::ResolvedOperator> {
+        let name = expr::extract_string_fields(&e.name).join(".");
+        let left = match e.lexpr.as_deref() {
+            Some(l) => Some(self.type_of(l)?),
+            None => None,
+        };
+        let right = self.type_of(e.rexpr.as_deref()?)?;
+        match self.snapshot.find_operator_detailed(&name, left, right) {
+            crate::lookup::OperatorMatch::Found(op) => Some(op),
+            _ => None,
+        }
+    }
+
+    /// `n` surely evaluates parameter `k` (the failing argument, no
+    /// constant), and isn't folded away.
+    fn evaluates(&self, n: &protobuf::Node, k: usize) -> bool {
+        if self.param(n) == Some(k) {
+            return true;
+        }
+        match n.node.as_ref() {
+            Some(node::Node::TypeCast(tc)) => {
+                tc.arg.as_deref().is_some_and(|a| self.evaluates(a, k))
+                    && tc
+                        .type_name
+                        .as_ref()
+                        .and_then(|t| crate::ddl::util::resolve_type_name(t, self.snapshot))
+                        .is_some_and(|t| casts_evaluate_argument(self.snapshot, t))
+            }
+            Some(node::Node::AExpr(e)) if e.kind() == protobuf::AExprKind::AexprOp => {
+                let operands: Vec<&protobuf::Node> =
+                    e.lexpr.iter().chain(&e.rexpr).map(|a| &**a).collect();
+                let reading: Vec<bool> = operands.iter().map(|a| self.evaluates(a, k)).collect();
+                let Some(operand) = reading.iter().position(|&r| r) else {
+                    return false;
+                };
+                let others = operands
+                    .iter()
+                    .enumerate()
+                    .all(|(i, a)| i == operand || self.not_null_const(a));
+                let types: Vec<Option<PgTypeOid>> =
+                    operands.iter().map(|a| self.type_of(a)).collect();
+                operator_evaluates(
+                    self.snapshot,
+                    e,
+                    self.operator(e).map(|op| op.code),
+                    operand,
+                    others,
+                    true,
+                    &types,
+                    self.depth + 1,
+                )
+            }
+            _ => false,
+        }
+    }
+
+    /// `n` surely is no NULL constant once simplified: a parameter (the
+    /// call's arguments are none), a non-NULL literal, a built-in cast of
+    /// such.
+    fn not_null_const(&self, n: &protobuf::Node) -> bool {
+        if self.param(n).is_some() {
+            return true;
+        }
+        match n.node.as_ref() {
+            Some(node::Node::AConst(c)) => !c.isnull,
+            Some(node::Node::TypeCast(tc)) => {
+                tc.arg.as_deref().is_some_and(|a| self.not_null_const(a))
+                    && tc
+                        .type_name
+                        .as_ref()
+                        .and_then(|t| crate::ddl::util::resolve_type_name(t, self.snapshot))
+                        .is_some_and(|t| builtin_casts_into(self.snapshot, t))
+            }
+            _ => false,
         }
     }
 }

@@ -699,9 +699,11 @@ fn returning_nn_domain_column_is_nullable() {
 /// evaluates a call's arguments first, and the planner folds no domain
 /// coercion): a NULL cast to a NOT NULL domain read as one fails every
 /// execution that evaluates the operator. A SQL function the planner
-/// inlines may ignore it. The operator is the one the operands' types
-/// resolve to: `+` has SQL candidates (`integer + date`), but `x + 1` runs
-/// `int4pl`.
+/// inlines runs its body instead, which must evaluate the operand:
+/// `integer + date` is `RETURN ($2 + $1)`, `anynonarray || text`
+/// `select $1::text || $2`. A strict function over a NULL constant (a
+/// custom plan's parameter is one) is folded to NULL, its operands
+/// unevaluated. The operator is the one the operands' types resolve to.
 #[test]
 fn an_operator_evaluates_a_null_domain_operand() {
     let db = build_db(&[(
@@ -752,6 +754,18 @@ fn an_operator_evaluates_a_null_domain_operand() {
             "SELECT s || 'a' FROM w",
             Some("domain t does not allow null values"),
         ),
+        ("SELECT x || 'a' FROM v", domain),
+        ("SELECT 'a' || x FROM v", domain),
+        ("SELECT 1 FROM v WHERE x || 'a' = 'b'", domain),
+        ("SELECT x + CURRENT_DATE FROM v", domain),
+        ("SELECT CURRENT_DATE + x FROM v", domain),
+        ("SELECT x + 1::bigint FROM v", domain),
+        ("SELECT x || NULL FROM v", None),
+        ("SELECT x + NULL FROM v", None),
+        ("SELECT x = NULL FROM v", None),
+        ("SELECT x + NULL::int FROM v", None),
+        ("SELECT NULL::d + NULL", None),
+        ("SELECT x + $1 FROM v", None),
         ("SELECT 1 FROM v WHERE x + 1 > 0 AND y = 2", None),
         ("SELECT 1 FROM v WHERE x + 1 > 0 OR true", None),
         ("SELECT 1 FROM v WHERE x = 1 AND y = 2", None),
@@ -759,6 +773,63 @@ fn an_operator_evaluates_a_null_domain_operand() {
         ("SELECT 1 FROM v WHERE x === 1", None),
         ("SELECT x === 1 FROM v", None),
         ("SELECT true UNION ALL SELECT x = 1 FROM v LIMIT 1", None),
+    ] {
+        match (db.analyze(sql), fails) {
+            (Err(err), Some(msg)) => {
+                assert!(err.to_string().starts_with(msg), "{sql}\n  got: {err}")
+            }
+            (Ok(_), None) => {}
+            (other, _) => panic!("{sql}: {other:?}"),
+        }
+    }
+}
+
+/// An operator of a user's function: one in any language but SQL
+/// evaluates its operands, unless a support function could simplify the
+/// call (pg_proc.prosupport — `textlike_support` only answers index and
+/// selectivity requests) or, strict, it has a NULL constant operand. A SQL
+/// one inlined runs its body, which must evaluate the operand in a strict
+/// position.
+#[test]
+fn an_operator_of_a_user_function_evaluates_a_null_domain_operand() {
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE DOMAIN d AS int NOT NULL;
+         CREATE VIEW v AS SELECT NULL::d AS x, 1 AS y;
+         CREATE FUNCTION pl(d, int) RETURNS bool LANGUAGE plpgsql IMMUTABLE
+             AS 'BEGIN RETURN true; END';
+         CREATE OPERATOR === (LEFTARG = d, RIGHTARG = int, FUNCTION = pl);
+         CREATE FUNCTION pl_strict(d, int) RETURNS bool LANGUAGE plpgsql IMMUTABLE STRICT
+             AS 'BEGIN RETURN true; END';
+         CREATE OPERATOR ==== (LEFTARG = d, RIGHTARG = int, FUNCTION = pl_strict);
+         CREATE FUNCTION pl_like(d, int) RETURNS bool LANGUAGE plpgsql IMMUTABLE
+             SUPPORT pg_catalog.textlike_support AS 'BEGIN RETURN true; END';
+         CREATE OPERATOR =#= (LEFTARG = d, RIGHTARG = int, FUNCTION = pl_like);
+         CREATE FUNCTION ignores(d, int) RETURNS bool LANGUAGE sql IMMUTABLE AS 'SELECT true';
+         CREATE OPERATOR =~= (LEFTARG = d, RIGHTARG = int, FUNCTION = ignores);
+         CREATE FUNCTION adds(d, int) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT $1 + $2';
+         CREATE OPERATOR <+> (LEFTARG = d, RIGHTARG = int, FUNCTION = adds);
+         CREATE FUNCTION adds_named(a d, b int) RETURNS int LANGUAGE sql IMMUTABLE
+             RETURN a + b;
+         CREATE OPERATOR <++> (LEFTARG = d, RIGHTARG = int, FUNCTION = adds_named);
+         CREATE FUNCTION picks(d, int) RETURNS int LANGUAGE sql IMMUTABLE
+             AS 'SELECT CASE WHEN $2 > 0 THEN 0 ELSE $2 END';
+         CREATE OPERATOR <%> (LEFTARG = d, RIGHTARG = int, FUNCTION = picks);",
+    )]);
+    let domain = Some("domain d does not allow null values");
+    for (sql, fails) in [
+        ("SELECT x === 1 FROM v", domain),
+        ("SELECT 1 FROM v WHERE x === 1", domain),
+        // Not strict: the NULL is passed, the operand evaluated.
+        ("SELECT x === NULL FROM v", domain),
+        ("SELECT x ==== 1 FROM v", domain),
+        ("SELECT x =#= 1 FROM v", domain),
+        ("SELECT x <+> 1 FROM v", domain),
+        ("SELECT x <++> 1 FROM v", domain),
+        ("SELECT x ==== NULL FROM v", None),
+        ("SELECT x <+> NULL FROM v", None),
+        ("SELECT x =~= 1 FROM v", None),
+        ("SELECT x <%> 1 FROM v", None),
     ] {
         match (db.analyze(sql), fails) {
             (Err(err), Some(msg)) => {
