@@ -2228,10 +2228,30 @@ fn a_rule_action_is_not_executed_at_create_rule() {
              INSERT INTO mv VALUES (1));
          CREATE TABLE t2 (x int);
          CREATE RULE r4 AS ON INSERT TO t2 WHERE new.x > 0 DO ALSO INSERT INTO t VALUES (NULL, new.x);
-         INSERT INTO t2 VALUES (-1);",
+         INSERT INTO t2 VALUES (-1);
+         CREATE TABLE t3 (x int);
+         CREATE RULE r5 AS ON INSERT TO t3 DO ALSO INSERT INTO t VALUES (NULL::d, 1);
+         CREATE TABLE t4 (x int);
+         CREATE RULE r6 AS ON INSERT TO t4 WHERE new.x > 0
+             DO ALSO INSERT INTO t VALUES (NULL::d, 1);
+         CREATE TABLE t5 (a d);
+         CREATE RULE r7 AS ON INSERT TO t5 DO INSTEAD NOTHING;
+         CREATE TABLE t6 (x int);
+         CREATE RULE r8 AS ON INSERT TO t6 DO ALSO INSERT INTO t5 VALUES (NULL::d);",
     )]);
     // A conditional rule's action runs only for the rows its qual accepts.
     db.analyze("INSERT INTO t2 VALUES ($1)").unwrap();
+    db.analyze("INSERT INTO t4 VALUES ($1)").unwrap();
+    // An action a DO INSTEAD NOTHING rule replaces builds no row.
+    db.analyze("INSERT INTO t6 VALUES (1)").unwrap();
+    // An unconditional one runs with the statement firing it: the NULL
+    // cast to a NOT NULL domain fails as its row is built.
+    let err = db.analyze("INSERT INTO t3 VALUES (1)").unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("domain d does not allow null values"),
+        "got: {err}"
+    );
     // A statement firing the rule runs its action: every execution fails —
     // for the UPDATE, every one changing a row (PG fails only those; the
     // oracle's empty tables would not).
@@ -2271,6 +2291,7 @@ fn a_query_is_not_executed_where_it_is_only_stored() {
                  PREPARE p2 AS SELECT ARRAY[ARRAY[1], NULL];
                  PREPARE p3 AS INSERT INTO t VALUES (NULL);
                  PREPARE p4 AS INSERT INTO mv0 VALUES (1);
+                 PREPARE p5 AS INSERT INTO t VALUES (NULL::d);
                  CREATE TABLE c2 AS EXECUTE p1 WITH NO DATA;
                  REFRESH MATERIALIZED VIEW m1 WITH NO DATA;";
     for (stmt, msg) in [
@@ -2283,6 +2304,7 @@ fn a_query_is_not_executed_where_it_is_only_stored() {
             "EXECUTE p3;",
             "null value in column \"a\" of relation \"t\" violates not-null constraint",
         ),
+        ("EXECUTE p5;", "domain d does not allow null values"),
         (
             "CREATE TABLE c3 AS EXECUTE p1;",
             "domain d does not allow null values",

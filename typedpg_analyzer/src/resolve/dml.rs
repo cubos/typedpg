@@ -34,6 +34,8 @@ pub(crate) fn analyze_insert_with_outer_ctes(
     // Match $N params in VALUES to column types, or analyze INSERT...SELECT.
     // The rewriter later sees one target list entry per supplied column.
     let mut assigns: Vec<Assign> = Vec::new();
+    // The first `NULL::d` the VALUES rows build (see `Rewrite::row_error`).
+    let mut row_error = None;
     // What each row writes at each target position (`None`: DEFAULT); no
     // row for DEFAULT VALUES, which writes the defaults.
     let mut written: Vec<Vec<Option<ValueInfo>>> = vec![Vec::new()];
@@ -58,6 +60,10 @@ pub(crate) fn analyze_insert_with_outer_ctes(
                     _ => None,
                 })
                 .collect();
+            row_error = rows
+                .iter()
+                .flat_map(|r| r.iter())
+                .find_map(|v| null_domain_cast_error(v, snapshot));
             let width = rows.first().map_or(0, |r| r.len());
             assigns = (0..width)
                 .filter_map(|i| {
@@ -202,6 +208,7 @@ pub(crate) fn analyze_insert_with_outer_ctes(
     )?;
 
     let mut rw = Rewrite::single(DmlEvent::Insert, assigns, tgt.overriding);
+    rw.row_error = row_error;
     rw.returning = has_returning(&ins.returning_clause);
     rw.on_conflict = ins.on_conflict_clause.as_ref().and_then(|oc| {
         match protobuf::OnConflictAction::try_from(oc.action) {
@@ -982,8 +989,18 @@ fn is_null_value(
 }
 
 /// The error `NULL::d` raises when evaluated, for a domain `d` rejecting
-/// NULL (CoerceToDomain is checked at execution, never folded away).
+/// NULL (CoerceToDomain is checked at execution, never folded away). None
+/// when the statement is not run (a view, rule action, SQL function body,
+/// prepared statement or plain EXPLAIN).
 fn null_domain_cast(val: &protobuf::Node, snapshot: &PgCatalog) -> Option<String> {
+    if !super::executes() {
+        return None;
+    }
+    null_domain_cast_error(val, snapshot)
+}
+
+/// [`null_domain_cast`]'s error, whether or not the statement runs.
+fn null_domain_cast_error(val: &protobuf::Node, snapshot: &PgCatalog) -> Option<String> {
     let Some(node::Node::TypeCast(tc)) = val.node.as_ref() else {
         return None;
     };
@@ -991,7 +1008,7 @@ fn null_domain_cast(val: &protobuf::Node, snapshot: &PgCatalog) -> Option<String
         return None;
     }
     let t = crate::ddl::util::resolve_type_name(tc.type_name.as_ref()?, snapshot)?;
-    snapshot.domain_null_violation(t)
+    snapshot.domain_null_violation_at_execution(t)
 }
 
 /// The relation a VALUES row (`items`; none for DEFAULT VALUES) is checked

@@ -404,6 +404,7 @@ pub(crate) fn analyze_merge_with_outer_ctes(
         actions,
         on_conflict: None,
         returning: has_returning(&merge.returning_clause),
+        row_error: None,
     };
     check_rewrite(snapshot, table_oid, &rw)?;
     Ok((columns, None))

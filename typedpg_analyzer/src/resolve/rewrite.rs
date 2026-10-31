@@ -99,6 +99,10 @@ pub(crate) struct Rewrite {
     /// Every column the statement names as a target (the result RTE's
     /// `insertedCols` / `updatedCols`), DEFAULT ones included.
     pub(crate) listed: Vec<String>,
+    /// The error building the statement's rows raises whenever it runs
+    /// (an INSERT VALUES's `NULL::d`, for a domain `d` rejecting NULL):
+    /// reported when a rule action carrying it always runs.
+    pub(crate) row_error: Option<String>,
 }
 
 impl Rewrite {
@@ -114,6 +118,7 @@ impl Rewrite {
             }],
             on_conflict: None,
             returning: false,
+            row_error: None,
         }
     }
 }
@@ -361,6 +366,16 @@ fn rewrite_level(
         rule_reads.extend(rule_relations(snapshot, rule));
     }
 
+    // A product query that always runs builds its rows: a NULL cast to a
+    // domain rejecting NULL fails there, before any NOT NULL column
+    // (ExecConstraints) — unless a DO INSTEAD rule replaces it.
+    if reach == Reach::Always
+        && execution_error.is_none()
+        && let Some(msg) = &rw.row_error
+        && !super::dml::returning_rewritten(snapshot, relid, &[DmlEvent::Insert])
+    {
+        *execution_error = Some(AnalyzeError::Invalid(msg.clone()));
+    }
     if reach == Reach::Always && !is_view && execution_error.is_none() {
         let written = actions
             .iter()
@@ -687,6 +702,7 @@ fn rewrite_target_view(
             .map(|oc| oc.as_ref().map(|set| to_base(set))),
         returning: rw.returning,
         listed: rw.listed.iter().filter_map(|c| base_name(c)).collect(),
+        row_error: rw.row_error.clone(),
     };
     Ok(Some((base, base_rw)))
 }
