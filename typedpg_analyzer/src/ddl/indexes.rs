@@ -134,7 +134,7 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
             indkey.push(0);
             indexprs.push(serialize_node(expr));
             match super::volatile::infer_over_relation(db, indrelid, expr, None) {
-                Some(Ok(t)) => {
+                Some(Ok(t)) if known_key_type(expr, &t) => {
                     expr_types.push((key_columns.len(), t.type_oid));
                     Some((t.type_oid, expression_collation(db, &t)))
                 }
@@ -362,6 +362,33 @@ fn check_index_expression(
     super::volatile::check_mutability(db, relid, expr, ExprLocation::Index)
 }
 
+/// Whether an expression of inferred type `t` is certainly of type
+/// `unknown` for PG too: an untyped string literal or NULL, or a value the
+/// analyzer knows to be `unknown` (a cast to it, `unknownin(…)`, a field
+/// of a record over a literal — see [`crate::expr::ExprType::unknown_value`]).
+/// The analyzer also infers `unknown` where it can't tell a type.
+pub(crate) fn certainly_unknown(
+    expr: &typedpg_pg_query::protobuf::Node,
+    t: &crate::expr::ExprType,
+) -> bool {
+    use typedpg_pg_query::protobuf::a_const;
+    t.type_oid == crate::pg_catalog::oid::UNKNOWN
+        && (t.unknown_value
+            || matches!(
+                expr.node.as_ref(),
+                Some(node::Node::AConst(c))
+                    if c.isnull || matches!(c.val, Some(a_const::Val::Sval(_)))
+            ))
+}
+
+/// Whether an index expression's inferred type is its type for PG: any
+/// but `unknown`, which only [`certainly_unknown`] keys are — PG resolves
+/// their operator class (ComputeIndexAttrs) and fails, `unknown` having
+/// none. Other keys are left unchecked.
+fn known_key_type(expr: &typedpg_pg_query::protobuf::Node, t: &crate::expr::ExprType) -> bool {
+    t.type_oid != crate::pg_catalog::oid::UNKNOWN || certainly_unknown(expr, t)
+}
+
 /// index_create's ConstructTupleDescriptor: an expression column's type must
 /// be one a table column could have (CheckAttributeType) — not `record`,
 /// for one, though it has operator classes. `colnames` are the index's
@@ -519,10 +546,11 @@ fn check_expression_key_collation(
 }
 
 /// ComputeIndexAttrs (indexcmds.c) for one key column of type `typ`
-/// (`None` when unknown): its collation — the COLLATE clause, which must
-/// name an existing collation of a collatable type, else `column_collation`
-/// —, its operator class (ResolveOpClass), its exclusion operator and its
-/// ordering options.
+/// (`None` when the analyzer can't tell it; `unknown` only for a
+/// [`certainly_unknown`] expression): its collation — the COLLATE clause,
+/// which must name an existing collation of a collatable type, else
+/// `column_collation` —, its operator class (ResolveOpClass), its exclusion
+/// operator and its ordering options.
 #[allow(clippy::too_many_arguments)]
 fn compute_key_column(
     db: &PgCatalog,
@@ -556,7 +584,6 @@ fn compute_key_column(
                 .is_some_and(|t| t.typcollation.is_some())
         };
         if let Some(t) = typ
-            && t != crate::pg_catalog::oid::UNKNOWN
             && !collatable(t)
         {
             return Err(DdlError::Parse(format!(
@@ -566,12 +593,12 @@ fn compute_key_column(
         }
     }
     let opclass = match typ {
-        Some(t) => super::opclass::resolve_index_opclass(
+        Some(t) => Some(super::opclass::resolve_opclass(
             db,
             elem.map_or(&[][..], |e| e.opclass.as_slice()),
             t,
             am,
-        )?,
+        )?),
         None => None,
     };
     let exclusion_op: Option<Vec<String>> = exclusion_op.map(|names| {
@@ -789,11 +816,11 @@ pub(crate) fn define_constraint_index(
                 check_index_expression(db, relid, expr)?;
                 match super::volatile::infer_over_relation(db, relid, expr, None) {
                     Some(Err(e)) => return Err(DdlError::UnsupportedDdl(e.to_string())),
-                    Some(Ok(t)) => {
+                    Some(Ok(t)) if known_key_type(expr, &t) => {
                         expr_types.push((i, t.type_oid));
                         (Some(t.type_oid), expression_collation(db, &t))
                     }
-                    None => (None, None),
+                    Some(Ok(_)) | None => (None, None),
                 }
             }
             (None, None) => {

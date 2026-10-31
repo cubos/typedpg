@@ -966,6 +966,100 @@ fn constraint_indexes_resolve_operator_classes() {
 }
 
 #[test]
+fn unknown_typed_index_keys_have_no_operator_class() {
+    // ComputeIndexAttrs runs ResolveOpClass before index_create checks the
+    // key's type (CheckAttributeType): `unknown` — an untyped literal, NULL
+    // or a cast to it — has no operator class, nor a collation.
+    let no_default = |am: &str| {
+        format!("data type unknown has no default operator class for access method \"{am}\"")
+    };
+    let btree = no_default("btree");
+    let setup = "CREATE TABLE t (a int, b text, c text);";
+    for (sql, message) in [
+        ("CREATE INDEX ON t (('a'));", btree.as_str()),
+        ("CREATE INDEX ON t (('a'::text::unknown));", &btree),
+        ("CREATE INDEX ON t ((b::unknown));", &btree),
+        ("CREATE INDEX ON t ((NULL));", &btree),
+        ("CREATE INDEX ON t ((unknownin('x')));", &btree),
+        ("CREATE INDEX ON t (((ROW('a')).f1));", &btree),
+        ("CREATE INDEX ON t ((b::unknown) DESC);", &btree),
+        (
+            "CREATE INDEX ON t USING hash ((b::unknown));",
+            &no_default("hash"),
+        ),
+        // ResolveOpClass comes before the ordering options.
+        (
+            "CREATE INDEX ON t USING hash ((b::unknown) DESC);",
+            &no_default("hash"),
+        ),
+        (
+            "CREATE INDEX ON t USING gist ((b::unknown));",
+            &no_default("gist"),
+        ),
+        (
+            "CREATE INDEX ON t USING brin ((b::unknown));",
+            &no_default("brin"),
+        ),
+        (
+            "CREATE INDEX ON t ((b::unknown) text_ops);",
+            "operator class \"text_ops\" does not accept data type unknown",
+        ),
+        (
+            "CREATE INDEX ON t ((b::unknown) nosuch_ops);",
+            "operator class \"nosuch_ops\" does not exist for access method \"btree\"",
+        ),
+        (
+            "CREATE INDEX ON t ((b::unknown) COLLATE \"C\");",
+            "collations are not supported by type unknown",
+        ),
+        (
+            "CREATE INDEX ON t (('a') COLLATE \"C\");",
+            "collations are not supported by type unknown",
+        ),
+        // An exclusion constraint's index: the operator class before the
+        // exclusion operator.
+        (
+            "ALTER TABLE t ADD EXCLUDE USING btree ((c::unknown) WITH =);",
+            &btree,
+        ),
+        (
+            "ALTER TABLE t ADD EXCLUDE USING btree (('x') WITH =);",
+            &btree,
+        ),
+        (
+            "ALTER TABLE t ADD EXCLUDE USING btree ((c::unknown) WITH <>);",
+            &btree,
+        ),
+        (
+            "ALTER TABLE t ADD EXCLUDE USING btree ((c::unknown) text_ops WITH =);",
+            "operator class \"text_ops\" does not accept data type unknown",
+        ),
+        (
+            "CREATE TABLE t2 (a int, EXCLUDE USING btree ((NULL) WITH =));",
+            &btree,
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", sql)]).expect_err(sql);
+        assert!(
+            err.to_string().starts_with(message),
+            "{sql}\n  expected: {message}\n       got: {err}"
+        );
+    }
+    // A NULL CASE resolves to text; a record key is CheckAttributeType's.
+    assert_accepted(
+        setup,
+        &["CREATE INDEX ON t ((CASE WHEN a > 0 THEN NULL END));"],
+    );
+    assert_rejected(
+        setup,
+        &[(
+            "CREATE INDEX ON t ((ROW('a')));",
+            "column \"row\" has pseudo-type record",
+        )],
+    );
+}
+
+#[test]
 fn constraint_index_options_are_validated() {
     // DefineIndex: index_reloptions over the constraint's WITH (...).
     assert_rejected(

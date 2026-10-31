@@ -835,6 +835,18 @@ pub(crate) fn resolve_index_opclass(
     if typ == crate::pg_catalog::oid::UNKNOWN {
         return Ok(None);
     }
+    resolve_opclass(interp, opclass, typ, am).map(Some)
+}
+
+/// ResolveOpClass for a column of type `typ`, `unknown` included — which
+/// has no operator class: `data type unknown has no default operator class
+/// …`, or the one named `does not accept data type unknown`.
+pub(crate) fn resolve_opclass(
+    interp: &PgCatalog,
+    opclass: &[typedpg_pg_query::protobuf::Node],
+    typ: PgTypeOid,
+    am: &str,
+) -> Result<PgOpclassOid, DdlError> {
     let typname = || super::util::format_type_for_message(interp, typ);
     if opclass.is_empty() {
         let Some(found) = default_opclass(interp, typ, am)? else {
@@ -845,7 +857,7 @@ pub(crate) fn resolve_index_opclass(
                 typname()
             )));
         };
-        return Ok(Some(found.oid));
+        return Ok(found.oid);
     }
     let (schema, name) = split_name(opclass);
     let Some(found) = find_opclass(interp, schema.as_deref(), &name, am) else {
@@ -854,7 +866,7 @@ pub(crate) fn resolve_index_opclass(
         )));
     };
     check_opclass_accepts(interp, found, typ)?;
-    Ok(Some(found.oid))
+    Ok(found.oid)
 }
 
 /// ResolveOpClass: an explicitly named operator class must accept the
@@ -900,11 +912,6 @@ pub(crate) fn default_opclass_intype(
         .ok()
         .flatten()
         .map(|c| c.opcintype)
-}
-
-/// Whether `typ` has a default btree operator class (CreateStatistics).
-pub(crate) fn has_default_btree_opclass(interp: &PgCatalog, typ: PgTypeOid) -> bool {
-    matches!(default_opclass(interp, typ, "btree"), Ok(Some(_)))
 }
 
 /// get_table_am_oid: `name` must be a table access method.
