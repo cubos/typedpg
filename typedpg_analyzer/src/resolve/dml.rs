@@ -528,14 +528,66 @@ struct InsertTarget {
     /// then discards it — and any value given for a BY DEFAULT one — in
     /// favour of the sequence.
     overriding: Overriding,
+    /// The columns of a view target that are identity columns of the
+    /// relation the row is stored in (see [`view_identity_columns`]).
+    view_identity: Vec<String>,
 }
 
 impl InsertTarget {
     /// Whether the value given for column `c` is discarded for its
-    /// identity sequence's next value (OVERRIDING USER VALUE).
+    /// identity sequence's next value (OVERRIDING USER VALUE) — also
+    /// through an automatically updatable view, whose base relation's
+    /// rewriteTargetListIU drops it.
     fn discards(&self, c: &crate::pg_catalog::PgAttribute) -> bool {
-        self.overriding == Overriding::UserValue && c.attidentity.is_some()
+        self.overriding == Overriding::UserValue
+            && (c.attidentity.is_some() || self.view_identity.contains(&c.attname))
     }
+}
+
+/// The columns of view `relid` that are identity columns of the relation
+/// an INSERT through it stores its row in, down a chain of automatically
+/// updatable views. Empty when an INSTEAD OF trigger or a DO INSTEAD rule
+/// takes the row instead.
+fn view_identity_columns(snapshot: &PgCatalog, relid: crate::oid::PgClassOid) -> Vec<String> {
+    let is_view = |r| {
+        snapshot
+            .pg_class
+            .get(&r)
+            .is_some_and(|c| c.relkind == crate::pg_catalog::RelKind::View)
+    };
+    if !is_view(relid) || returning_rewritten(snapshot, relid, &[DmlEvent::Insert]) {
+        return Vec::new();
+    }
+    snapshot
+        .attributes_of(relid)
+        .iter()
+        .filter(|c| c.attnum > 0)
+        .filter(|c| {
+            let (mut rel, mut attnum) = (relid, c.attnum);
+            for _ in 0..16 {
+                if !is_view(rel) {
+                    return snapshot
+                        .attributes_of(rel)
+                        .iter()
+                        .any(|b| b.attnum == attnum && b.attidentity.is_some());
+                }
+                let Some(upd) = snapshot.view_updatability.get(&rel) else {
+                    return false;
+                };
+                let (Some(base), Some(Ok(a))) = (
+                    upd.base,
+                    usize::try_from(attnum - 1)
+                        .ok()
+                        .and_then(|i| upd.columns.get(i)),
+                ) else {
+                    return false;
+                };
+                (rel, attnum) = (base, *a);
+            }
+            false
+        })
+        .map(|c| c.attname.clone())
+        .collect()
 }
 
 /// Resolve the INSERT target relation, validate that every column named in the
@@ -623,6 +675,7 @@ fn resolve_insert_target(
         col_names,
         col_indirection,
         overriding: Overriding::from_kind(ins.r#override),
+        view_identity: view_identity_columns(snapshot, table_oid),
     })
 }
 
@@ -984,6 +1037,18 @@ fn row_violation<'a>(
     if returning_rewritten(snapshot, tgt.oid, &[DmlEvent::Insert]) {
         return None;
     }
+    // Through an automatically updatable view, the row is stored in its
+    // base relation (rewriteTargetView): checked there.
+    if let Some((base, base_items, opaque)) = through_view(tgt, items, snapshot) {
+        let known = |i: usize| {
+            if i < items.len() && !opaque.contains(&i) {
+                known(i)
+            } else {
+                Known::Unknown
+            }
+        };
+        return row_violation(&base, &base_items, &known, snapshot);
+    }
     let (lands_in, unrouted) = row_relation(tgt, items, known, snapshot);
     let mut violations: Vec<RowViolation> = unrouted.into_iter().collect();
     for (i, val) in items.iter().enumerate() {
@@ -1035,6 +1100,88 @@ fn row_violation<'a>(
         &lands_in,
     ));
     violations.into_iter().min_by_key(|v| v.order)
+}
+
+/// The INSERT `tgt` of row `items` as rewriteTargetView hands it to the
+/// base relation of `tgt`, an automatically updatable view (down a chain
+/// of them): its columns renamed to the base columns they are, the
+/// view's defaults filling the view columns the row omits or sets to
+/// DEFAULT (rewriteTargetListIU; values the analyzer doesn't follow), the
+/// columns the view hides left to the base's defaults. Plus the positions
+/// whose value is no longer the one `items` gives there (a view default).
+/// None when `tgt` isn't such a view — or a column the row writes is not
+/// updatable, which the rewriter reports first.
+fn through_view(
+    tgt: &InsertTarget,
+    items: &[protobuf::Node],
+    snapshot: &PgCatalog,
+) -> Option<(InsertTarget, Vec<protobuf::Node>, Vec<usize>)> {
+    let class = snapshot.pg_class.get(&tgt.oid)?;
+    if class.relkind != crate::pg_catalog::RelKind::View {
+        return None;
+    }
+    let upd = snapshot.view_updatability.get(&tgt.oid)?;
+    if upd.reason(true).is_some() {
+        return None;
+    }
+    let base_oid = upd.base?;
+    let base_class = snapshot.pg_class.get(&base_oid)?;
+    let base_attrs = snapshot.attributes_of(base_oid);
+    // The base column view column `c` is.
+    let base_col = |c: &crate::pg_catalog::PgAttribute| -> Option<String> {
+        let attnum = *upd
+            .columns
+            .get(usize::try_from(c.attnum - 1).ok()?)?
+            .as_ref()
+            .ok()?;
+        Some(
+            base_attrs
+                .iter()
+                .find(|b| b.attnum == attnum)?
+                .attname
+                .clone(),
+        )
+    };
+    let mut col_names = Vec::new();
+    let mut col_indirection = Vec::new();
+    let mut base_items = Vec::new();
+    let mut opaque = Vec::new();
+    let mut given = Vec::new();
+    for (i, item) in items.iter().enumerate() {
+        let tc = target_col_at(tgt, i)?;
+        given.push(tc.attname.as_str());
+        col_names.push(base_col(tc)?);
+        col_indirection.push(tgt.col_indirection.get(i).cloned().unwrap_or_default());
+        if is_set_to_default(item) && tc.atthasdef {
+            opaque.push(i);
+            base_items.push(protobuf::Node { node: None });
+        } else {
+            base_items.push(item.clone());
+        }
+    }
+    // The view's defaults for the columns the row omits.
+    for c in tgt.attrs.iter().filter(|c| c.attnum > 0 && c.atthasdef) {
+        if !given.contains(&c.attname.as_str()) {
+            opaque.push(base_items.len());
+            col_names.push(base_col(c)?);
+            col_indirection.push(Vec::new());
+            base_items.push(protobuf::Node { node: None });
+        }
+    }
+    let base = InsertTarget {
+        oid: base_oid,
+        relname: base_class.relname.clone(),
+        nsname: snapshot
+            .namespace_name(base_class.relnamespace)
+            .map(str::to_owned)
+            .unwrap_or_default(),
+        attrs: base_attrs.to_vec(),
+        col_names,
+        col_indirection,
+        overriding: tgt.overriding,
+        view_identity: view_identity_columns(snapshot, base_oid),
+    };
+    Some((base, base_items, opaque))
 }
 
 /// Whether `val`, a value of type `source` (`None`: its own) stored into

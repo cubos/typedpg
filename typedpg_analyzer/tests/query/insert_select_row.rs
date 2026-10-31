@@ -166,3 +166,81 @@ fn insert_select_whose_row_may_not_fail_is_accepted() {
         }
     }
 }
+
+/// Through an automatically updatable view, the row is stored in the base
+/// relation and checked there: its NOT NULL columns (also ones the view
+/// hides, left to their default), its partitions, its BEFORE ROW triggers
+/// and identity columns — the view's own defaults filling the columns the
+/// row omits. VALUES rows alike.
+#[test]
+fn insert_through_a_view_checks_the_row_in_its_base_relation() {
+    let mut db = setup();
+    db.apply_sql(
+        "CREATE VIEW vp AS SELECT * FROM p;
+         CREATE VIEW vb AS SELECT b FROM p;
+         CREATE VIEW vvp AS SELECT * FROM vp;
+         CREATE VIEW vren (x, y) AS SELECT b, a FROM p;
+         CREATE VIEW vdefn AS SELECT * FROM p;
+         ALTER VIEW vdefn ALTER COLUMN b SET DEFAULT 5;
+         CREATE VIEW vdef AS SELECT * FROM p;
+         ALTER VIEW vdef ALTER COLUMN a SET DEFAULT 5;
+         CREATE VIEW vd AS SELECT * FROM d;
+         CREATE VIEW vpt AS SELECT * FROM pt;
+         CREATE VIEW vtr AS SELECT * FROM tr;
+         CREATE VIEW vidt AS SELECT * FROM idt;
+         CREATE VIEW vexp AS SELECT a, b + 1 AS c FROM p;",
+    )
+    .unwrap();
+    for sql in [
+        "INSERT INTO vp (a) SELECT NULL",
+        "INSERT INTO vp (a, b) SELECT NULL, count(*) FROM p",
+        "INSERT INTO vvp (a) SELECT NULL",
+        "INSERT INTO vren (y) SELECT NULL",
+        "INSERT INTO vp (b) SELECT 1",
+        "INSERT INTO vb SELECT 1",
+        "INSERT INTO vren (x) SELECT 1",
+        "INSERT INTO vp (b) VALUES (1)",
+        "INSERT INTO vb VALUES (1)",
+        "INSERT INTO vren (x) VALUES (1)",
+        "INSERT INTO vdefn (a, b) VALUES (DEFAULT, 1)",
+        "INSERT INTO vdefn (b) VALUES (DEFAULT)",
+    ] {
+        assert_err_prefix!(db.analyze(sql), AnalyzeError::Invalid(_), NOT_NULL);
+    }
+    assert_err_prefix!(
+        db.analyze("INSERT INTO vd (b) SELECT 1"),
+        AnalyzeError::Invalid(_),
+        "domain dnn does not allow null values"
+    );
+    for sql in [
+        "INSERT INTO vpt (k) SELECT 2",
+        "INSERT INTO vpt (k) VALUES (2)",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::CheckViolation(_),
+            r#"no partition of relation "pt" found for row"#
+        );
+    }
+    // The rewriter's error comes first.
+    assert_err_prefix!(
+        db.analyze("INSERT INTO vexp (c) SELECT NULL"),
+        AnalyzeError::FeatureNotSupported(_),
+        r#"cannot insert into column "c" of view "vexp""#
+    );
+    for sql in [
+        "INSERT INTO vdef (b) SELECT 1",
+        "INSERT INTO vdef (b) VALUES (1)",
+        "INSERT INTO vdef (a, b) VALUES (DEFAULT, 1)",
+        "INSERT INTO vtr (a) SELECT NULL",
+        "INSERT INTO vtr (a) VALUES (NULL)",
+        "INSERT INTO vidt (b) SELECT 1",
+        "INSERT INTO vidt (a, b) OVERRIDING USER VALUE SELECT NULL, count(*) FROM idt",
+        "INSERT INTO vidt (a, b) OVERRIDING USER VALUE SELECT 40000, count(*) FROM idt",
+        "INSERT INTO vidt (a, b) OVERRIDING USER VALUE VALUES (40000, 1)",
+    ] {
+        if let Err(e) = db.analyze(sql) {
+            panic!("{sql}: {e}");
+        }
+    }
+}
