@@ -123,57 +123,101 @@ pub fn create_statistics(interp: &mut PgCatalog, stmt: &CreateStatsStmt) -> Resu
             "statistics creation on virtual generated columns is not supported".into(),
         )
     };
+    let system_column = || {
+        DdlError::UnsupportedDdl("statistics creation on system columns is not supported".into())
+    };
     let mut columns: Vec<i16> = Vec::new();
     let mut exprs: Vec<super::tables::check_inherit::StoredExpr> = Vec::new();
     let mut attnums: Vec<i16> = Vec::new();
     let mut name_parts: Vec<String> = Vec::new();
+    let no_btree_opclass = |name: &str, typ| {
+        DdlError::UnsupportedDdl(format!(
+            "column \"{name}\" cannot be used in statistics because its type {} has no default \
+             btree operator class",
+            super::util::format_type_for_message(interp, typ)
+        ))
+    };
     for elem in &stmt.exprs {
         let Some(node::Node::StatsElem(se)) = elem.node.as_ref() else {
             continue;
         };
-        if !se.name.is_empty() {
-            if SYSTEM_COLUMNS.iter().any(|(n, ..)| *n == se.name) {
-                return Err(DdlError::UnsupportedDdl(
-                    "statistics creation on system columns is not supported".into(),
-                ));
+        // A column, by name or in parentheses (a Var): CreateStatistics
+        // treats `(a)` as the column `a`.
+        let column = if !se.name.is_empty() {
+            Some(se.name.as_str())
+        } else {
+            se.expr
+                .as_deref()
+                .and_then(|e| parenthesized_column(interp, relid, e))
+        };
+        if let Some(column) = column {
+            if SYSTEM_COLUMNS.iter().any(|(n, ..)| *n == column) {
+                return Err(system_column());
             }
-            let Some(attr) = interp.attribute_by_name(relid, &se.name).cloned() else {
+            let Some(attr) = interp.attribute_by_name(relid, column).cloned() else {
+                if se.name.is_empty() {
+                    // A whole-row Var, `(t)`: varattno 0.
+                    return Err(system_column());
+                }
                 return Err(DdlError::Parse(format!(
-                    "column \"{}\" does not exist",
-                    se.name
+                    "column \"{column}\" does not exist"
                 )));
             };
             if attr.attgenerated == Some(crate::pg_catalog::AttGenerated::Virtual) {
                 return Err(virtual_column());
             }
-            if !super::opclass::has_default_btree_opclass(interp, attr.atttypid) {
-                return Err(DdlError::UnsupportedDdl(format!(
-                    "column \"{}\" cannot be used in statistics because its type {} has no \
-                     default btree operator class",
-                    se.name,
-                    super::util::format_type_for_message(interp, attr.atttypid)
-                )));
+            // lookup_type_cache(TYPECACHE_LT_OPR): the `<` of the type's
+            // default btree operator class, element- / field-wise for an
+            // array or a composite.
+            if !crate::clause::has_ordering_operator(interp, attr.atttypid) {
+                return Err(no_btree_opclass(&attr.attname, attr.atttypid));
             }
             columns.push(attr.attnum);
             attnums.push(attr.attnum);
-            name_parts.push(se.name.clone());
+            name_parts.push(if se.name.is_empty() {
+                "expr".into()
+            } else {
+                se.name.clone()
+            });
         } else if let Some(expr) = se.expr.as_deref() {
-            if let Some(Err(e)) = super::volatile::infer_over_relation(interp, relid, expr, None) {
-                return Err(DdlError::UnsupportedDdl(e.to_string()));
-            }
+            let typ = match super::volatile::infer_over_relation(interp, relid, expr, None) {
+                Some(Err(e)) => return Err(DdlError::UnsupportedDdl(e.to_string())),
+                Some(Ok(t)) => Some(t),
+                None => None,
+            };
             if let Some(inner) = expr.node.as_ref() {
                 for (n, ..) in inner.nodes() {
                     if let typedpg_pg_query::NodeRef::ColumnRef(cr) = n
                         && let Some(col) = cr.fields.last().and_then(node_string)
-                        && let Some(a) = interp.attribute_by_name(relid, col)
                     {
-                        // pull_varattnos: no virtual generated column.
-                        if a.attgenerated == Some(crate::pg_catalog::AttGenerated::Virtual) {
-                            return Err(virtual_column());
+                        // pull_varattnos: no system column (nor the
+                        // whole row), no virtual generated column.
+                        if let Some(a) = interp.attribute_by_name(relid, col) {
+                            if a.attgenerated == Some(crate::pg_catalog::AttGenerated::Virtual) {
+                                return Err(virtual_column());
+                            }
+                            attnums.push(a.attnum);
+                        } else if SYSTEM_COLUMNS.iter().any(|(n, ..)| *n == col)
+                            || (cr.fields.len() == 1 && col == class.relname)
+                        {
+                            return Err(system_column());
                         }
-                        attnums.push(a.attnum);
                     }
                 }
+            }
+            // A type without `<` — but only when there are several
+            // columns: a single expression gets the regular statistics.
+            if stmt.exprs.len() > 1
+                && let Some(t) = typ.as_ref()
+                && (super::indexes::certainly_unknown(expr, t)
+                    || (t.type_oid != crate::pg_catalog::oid::UNKNOWN
+                        && !crate::clause::has_ordering_operator(interp, t.type_oid)))
+            {
+                return Err(DdlError::UnsupportedDdl(format!(
+                    "expression cannot be used in multivariate statistics because its type {} \
+                     has no default btree operator class",
+                    super::util::format_type_for_message(interp, t.type_oid)
+                )));
             }
             exprs.push(super::tables::check_inherit::StoredExpr::written(expr));
             name_parts.push("expr".into());
@@ -235,6 +279,30 @@ pub fn create_statistics(interp: &mut PgCatalog, stmt: &CreateStatsStmt) -> Resu
         attnums,
     });
     Ok(())
+}
+
+/// The column a statistics element `(…)` is when its expression is a bare
+/// column reference to the table — a Var, which CreateStatistics takes as
+/// the column: its name, or for a whole-row reference (`(t)`, attribute 0)
+/// the table's.
+fn parenthesized_column<'a>(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+    expr: &'a typedpg_pg_query::protobuf::Node,
+) -> Option<&'a str> {
+    let Some(node::Node::ColumnRef(cr)) = expr.node.as_ref() else {
+        return None;
+    };
+    let fields: Vec<&str> = cr.fields.iter().map(node_string).collect::<Option<_>>()?;
+    let (&last, qualifiers) = fields.split_last()?;
+    if interp.attribute_by_name(relid, last).is_some()
+        || SYSTEM_COLUMNS.iter().any(|(n, ..)| *n == last)
+    {
+        return Some(last);
+    }
+    // A single name that is no column is the table's row.
+    let relname = interp.pg_class.get(&relid).map(|c| c.relname.as_str());
+    (qualifiers.is_empty() && Some(last) == relname).then_some(last)
 }
 
 /// ChooseExtendedStatisticName: `<table>_<columns>_stat`, numbered when
