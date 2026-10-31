@@ -485,7 +485,7 @@ mod tests {
         CREATE TYPE address AS (street text, num int4);
         CREATE DOMAIN tags_d AS text[];
         CREATE TABLE users (id int4 PRIMARY KEY, name text, big int8 NOT NULL, m mood,
-                            tags text[] NOT NULL, prefs jsonb, home address,
+                            tags text[] NOT NULL DEFAULT '{}', prefs jsonb, home address,
                             moods mood[], span int4range, period tstzmultirange,
                             t2 tags_d NOT NULL DEFAULT '{}', homes address[]);";
 
@@ -614,10 +614,11 @@ mod tests {
             g.runtime
         );
         // Without it, the VALUES list has one: its fields' array casts.
-        let g = ok("INSERT INTO users (id, name) VALUES $..rows { id, name } RETURNING id");
+        let g =
+            ok("INSERT INTO users (id, name, big) VALUES $..rows { id, name, big } RETURNING id");
         assert!(
             g.runtime.contains(
-                r#"WHERE false",["::pg_catalog.int4[]","::pg_catalog.text[]"]]," RETURNING id"]"#
+                r#"WHERE false",["::pg_catalog.int4[]","::pg_catalog.text[]","::pg_catalog.int8[]"]]," RETURNING id"]"#
             ),
             "{}",
             g.runtime

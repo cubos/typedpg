@@ -36,6 +36,53 @@ fn union_with_incompatible_unknown_literal_rejected() {
     );
 }
 
+/// select_common_type keeps the first arm's type when two types of one
+/// category don't coerce either way implicitly; coerce_to_common_type then
+/// fails converting the other arm (42846), naming the operation.
+#[test]
+fn set_operation_type_mismatch_message() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TYPE cp AS (x int, y text); CREATE TYPE cq AS (x int, y text);")
+        .unwrap();
+    for (sql, msg) in [
+        (
+            "SELECT ARRAY[1] UNION SELECT ARRAY['a']",
+            "UNION could not convert type text[] to integer[]",
+        ),
+        (
+            "SELECT ARRAY['a'] UNION SELECT ARRAY[1]",
+            "UNION could not convert type integer[] to text[]",
+        ),
+        (
+            "SELECT int4range(1,2) UNION ALL SELECT int8range(1,2)",
+            "UNION could not convert type int8range to int4range",
+        ),
+        (
+            "SELECT 1::money UNION SELECT 1::int",
+            "UNION could not convert type integer to money",
+        ),
+        (
+            "SELECT 1::int UNION SELECT 1::bigint UNION SELECT 1::money",
+            "UNION could not convert type money to bigint",
+        ),
+        (
+            "SELECT '(1,a)'::cp INTERSECT SELECT '(1,a)'::cq",
+            "INTERSECT could not convert type cq to cp",
+        ),
+        (
+            "SELECT 1, ARRAY[1] EXCEPT SELECT 2, ARRAY[now()]",
+            "EXCEPT could not convert type timestamp with time zone[] to integer[]",
+        ),
+    ] {
+        assert_err_prefix!(db.analyze(sql), AnalyzeError::CannotCoerce(_), msg);
+    }
+    // An implicit cast between the element types converts the arrays.
+    let s = db
+        .analyze("SELECT ARRAY[1] UNION SELECT ARRAY[1::bigint]")
+        .unwrap();
+    assert_cols(&s, vec![c("array", array_of(int8()))]);
+}
+
 fn setup() -> PgCatalog {
     let mut db = PgCatalog::new().unwrap();
     db.apply_sql(

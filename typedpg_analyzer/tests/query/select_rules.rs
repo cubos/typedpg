@@ -135,6 +135,39 @@ fn locking_clause_targets() {
     }
 }
 
+/// transformValuesClause: a bare VALUES has no relation to lock (0A000),
+/// while a VALUES in FROM is skipped by an unnamed locking clause.
+#[test]
+fn for_update_cannot_apply_to_values() {
+    let db = setup();
+    for (sql, msg) in [
+        (
+            "VALUES (1) FOR UPDATE",
+            "FOR UPDATE cannot be applied to VALUES",
+        ),
+        (
+            "VALUES (1), (2) FOR SHARE",
+            "FOR SHARE cannot be applied to VALUES",
+        ),
+        (
+            "VALUES (1) ORDER BY 1 FOR KEY SHARE",
+            "FOR KEY SHARE cannot be applied to VALUES",
+        ),
+        (
+            "SELECT * FROM (VALUES (1) FOR NO KEY UPDATE) v",
+            "FOR NO KEY UPDATE cannot be applied to VALUES",
+        ),
+    ] {
+        let err = assert_err_prefix(&db, sql, msg);
+        assert!(
+            matches!(err, AnalyzeError::FeatureNotSupported(_)),
+            "{sql}: {err:?}"
+        );
+    }
+    db.analyze("SELECT * FROM (VALUES (1)) v FOR UPDATE")
+        .unwrap();
+}
+
 /// transformSetOperationTree refuses a locking clause on any member of a
 /// set operation, parenthesized or not, recursive-CTE terms included.
 #[test]
@@ -438,6 +471,49 @@ fn select_into_returns_no_rows() {
     let s = db.analyze("SELECT 'x' INTO TEMP tt").unwrap();
     assert_cols(&s, vec![]);
     assert!(!s.can_run_as_subquery);
+}
+
+/// transformSelectStmt: INTO only belongs to the top-level SELECT — not a
+/// subquery, a CTE, a set-operation member or the SELECT under INSERT
+/// (42601).
+#[test]
+fn select_into_is_only_allowed_at_the_top() {
+    let db = setup_wide();
+    for sql in [
+        "SELECT * FROM (SELECT 1 INTO f) bar",
+        "INSERT INTO t (id, a) SELECT 1, 2 INTO f",
+        "SELECT (SELECT 1 INTO f)",
+        "SELECT 1 WHERE EXISTS (SELECT 1 INTO f)",
+        "WITH w AS (SELECT 1 INTO f) SELECT * FROM w",
+        "SELECT * FROM (SELECT 1 INTO f UNION SELECT 2) x",
+        // A member with its own ORDER BY is a subquery of the operation.
+        "SELECT 1 UNION (SELECT 2 INTO f UNION SELECT 3 ORDER BY 1)",
+    ] {
+        let err = assert_err_prefix(&db, sql, "SELECT ... INTO is not allowed here");
+        assert!(
+            matches!(err, AnalyzeError::SyntaxError(_)),
+            "{sql}: {err:?}"
+        );
+    }
+    // transformSetOperationTree: a later member's INTO has its own wording.
+    for sql in [
+        "SELECT 1 UNION (SELECT 2 INTO f)",
+        "SELECT 1 UNION SELECT 2 UNION (SELECT 3 INTO f)",
+        "SELECT 1 UNION (SELECT 2 INTO f UNION SELECT 3)",
+    ] {
+        let err = assert_err_prefix(
+            &db,
+            sql,
+            "INTO is only allowed on first SELECT of UNION/INTERSECT/EXCEPT",
+        );
+        assert!(
+            matches!(err, AnalyzeError::SyntaxError(_)),
+            "{sql}: {err:?}"
+        );
+    }
+    // The first member of a set operation carries the statement's INTO.
+    let s = db.analyze("SELECT 1 INTO f UNION SELECT 2").unwrap();
+    assert_cols(&s, vec![]);
 }
 
 // ── Unknown-typed outputs ────────────────────────────────────────────────────

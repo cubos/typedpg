@@ -64,6 +64,9 @@ pub(crate) fn analyze_merge_with_outer_ctes(
     // else.
     let mut cte_scopes: HashMap<String, Vec<ScopeColumn>> = outer_ctes.clone();
     if let Some(with) = &merge.with_clause {
+        if with.recursive {
+            return Err(crate::pgmsg::merge_with_recursive().finalize_implicit());
+        }
         cte_scopes = analyze_with_clause(with, snapshot, params, &cte_scopes, &[])?;
     }
 
@@ -417,6 +420,7 @@ fn walk_merge_when_clause(
     table_relname: &str,
 ) -> Result<Option<Vec<protobuf::Node>>, AnalyzeError> {
     if let Some(condition) = &when.condition {
+        check_no_system_columns(condition, ctx.scope)?;
         // transformMergeStmt: transformWhereClause(…, EXPR_KIND_MERGE_WHEN,
         // "WHEN").
         crate::clause::coerce_clause_expr(
@@ -443,6 +447,51 @@ fn walk_merge_when_clause(
             "typedpg does not support the MERGE action {} yet",
             cmd.as_str_name()
         ))),
+    }
+}
+
+/// scanNSItemForColumn under EXPR_KIND_MERGE_WHEN: a WHEN condition may
+/// not read a relation's system column but `tableoid` (42P10). A sub-select
+/// is a query level of its own, where they are allowed.
+fn check_no_system_columns(condition: &protobuf::Node, scope: &Scope) -> Result<(), AnalyzeError> {
+    let mut found: Option<(&str, i32)> = None;
+    visit_same_level(condition, &mut |n| {
+        let Some(node::Node::ColumnRef(cr)) = n.node.as_ref() else {
+            return;
+        };
+        if found.is_some() {
+            return;
+        }
+        let names: Vec<&str> = cr
+            .fields
+            .iter()
+            .map_while(|f| match f.node.as_ref() {
+                Some(node::Node::String(s)) => Some(s.sval.as_str()),
+                _ => None,
+            })
+            .collect();
+        if names.len() != cr.fields.len() {
+            return;
+        }
+        let (table, column) = match names.as_slice() {
+            [column] => (None, *column),
+            [.., table, column] => (Some(*table), *column),
+            [] => return,
+        };
+        if column != "tableoid"
+            && let Ok(col) = scope.resolve_column(table, column, None)
+            && scope.is_system_column(col)
+        {
+            found = Some((column, cr.location));
+        }
+    });
+    match found {
+        Some((column, location)) => Err(crate::pgmsg::merge_when_system_column(
+            column,
+            crate::error::SourceSpan::from_node_qname(location),
+        )
+        .finalize_implicit()),
+        None => Ok(()),
     }
 }
 
@@ -517,21 +566,72 @@ fn merge_when_insert(
     // The row is transformed whole, then coerced to its columns
     // (transformInsertRow), as in a plain INSERT.
     let untyped = expr::replay_transform(&when.values.iter().collect::<Vec<_>>(), ctx, params);
+    // ExecMergeNotMatched inserts through ExecInsert: a row for a
+    // partitioned target is routed first, and checked in (and named after)
+    // its partition.
+    let value_of = |name: &str| -> Option<Option<&protobuf::Node>> {
+        let c = table_attrs.iter().find(|c| c.attname == name)?;
+        match target_attrs.iter().position(|t| t.attname == name) {
+            Some(i)
+                if res_targets
+                    .get(i)
+                    .is_some_and(|rt| !rt.indirection.is_empty())
+                    || discards(c) =>
+            {
+                None
+            }
+            Some(i) => {
+                let v = when.values.get(i)?;
+                if is_set_to_default(v) {
+                    null_default(c, snapshot).then_some(None)
+                } else {
+                    Some((!is_sql_null_literal(v)).then_some(v))
+                }
+            }
+            None => null_default(c, snapshot).then_some(None),
+        }
+    };
+    // The partition the row lands in, when known, else the target.
+    let lands_in = table_attrs
+        .first()
+        .and_then(|a| {
+            let leaf =
+                crate::ddl::tables::partbound::route_row(snapshot, a.attrelid, &value_of).leaf()?;
+            Some((leaf, snapshot.pg_class.get(&leaf)?.relname.clone()))
+        })
+        .or_else(|| {
+            let rel = table_attrs.first()?.attrelid;
+            Some((rel, table_relname.to_owned()))
+        });
     for (i, val) in when.values.iter().enumerate() {
         let target_col = target_attrs.get(i).copied();
+        // The column, or the element / field an indirected target (`arr[1]`,
+        // `p.x`) stores the value into.
+        let target = match target_col {
+            Some(tc) => {
+                let indirection = res_targets
+                    .get(i)
+                    .map_or(&[][..], |rt| rt.indirection.as_slice());
+                Some(assignment_target(tc, indirection, ctx, params)?)
+            }
+            None => None,
+        };
         if untyped[i]
             && let Some(p) = expr::bare_param(val, snapshot)
-            && let Some(tc) = target_col
-            && res_targets
-                .get(i)
-                .is_none_or(|rt| rt.indirection.is_empty())
+            && let Some(t) = &target
         {
-            expr::coerce_untyped_param(p, tc.atttypid, snapshot, params)?;
+            expr::coerce_untyped_param(p, t.type_oid, snapshot, params)?;
         }
-        if let Some(tc) = target_col {
+        let indirected = target.as_ref().is_some_and(|t| t.indirected);
+        if let Some(tc) = target_col
+            && !indirected
+        {
             if is_sql_null_literal(val)
                 && !discards(tc)
-                && let Some(err) = null_assignment_error(tc, snapshot, table_relname, "insert")
+                && let Some(err) = match &lands_in {
+                    Some(lands_in) => super::dml::insert_null_error(tc, snapshot, lands_in),
+                    None => null_assignment_error(tc, snapshot, table_relname, "insert"),
+                }
             {
                 return Err(err);
             }
@@ -546,21 +646,23 @@ fn merge_when_insert(
         }
         // transformInsertRow → transformAssignedExpr: a failed coercion
         // names the target column, exactly like a plain INSERT.
-        let goal = target_col
-            .map(|tc| {
-                TypeGoal::assignment(tc.atttypid)
-                    .with_source_column(&tc.attname)
-                    .with_typmod(snapshot.effective_typmod(tc.atttypid, tc.atttypmod))
-            })
-            .unwrap_or(TypeGoal::NONE);
+        match (target_col, &target) {
+            (Some(tc), Some(t)) => {
+                let goal = TypeGoal::assignment(t.type_oid).with_source_column(&tc.attname);
+                t.infer_value(val, goal, ctx, params)?;
+            }
+            _ if is_set_to_default(val) => {}
+            _ => {
+                expr::infer_expr(val, ctx, params, TypeGoal::NONE)?;
+            }
+        }
         if !is_set_to_default(val) {
-            expr::infer_expr(val, ctx, params, goal)?;
             // EXPR_KIND_VALUES_SINGLE.
             crate::clause::check_no_aggregates_or_windows(val, snapshot, "VALUES")?;
         }
         if let Some(node::Node::ParamRef(p)) = val.node.as_ref()
             && let Some(tc) = target_col
-            && (!tc.attnotnull || discards(tc))
+            && (!tc.attnotnull || indirected || discards(tc))
         {
             params.infer_nullable(p.number, true);
         }

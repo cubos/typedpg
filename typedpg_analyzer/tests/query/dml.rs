@@ -474,6 +474,468 @@ fn insert_null_reports_the_first_null_column_in_table_order() {
     );
 }
 
+/// A row inserted into a partitioned table is routed to its partition
+/// before ExecConstraints runs, so PG names the partition the row lands
+/// in — through every level of sub-partitioning.
+#[test]
+fn not_null_violation_names_the_partition_the_row_goes_to() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE errtst (a text, b text NOT NULL, c int) PARTITION BY LIST (a);
+         CREATE TABLE errtst_part_1 PARTITION OF errtst FOR VALUES IN ('aaa');
+         CREATE TABLE errtst_part_2 PARTITION OF errtst FOR VALUES IN ('bbb', NULL)
+             PARTITION BY RANGE (c);
+         CREATE TABLE errtst_part_2_lo PARTITION OF errtst_part_2 FOR VALUES FROM (0) TO (10);
+         CREATE TABLE errtst_part_2_hi PARTITION OF errtst_part_2
+             FOR VALUES FROM (10) TO (MAXVALUE);
+         CREATE TABLE errtst_default PARTITION OF errtst DEFAULT;",
+    )
+    .unwrap();
+    let not_null = |relation: &str| {
+        format!(r#"null value in column "b" of relation "{relation}" violates not-null constraint"#)
+    };
+    for (sql, relation) in [
+        (
+            "INSERT INTO errtst (a, b) VALUES ('aaa', NULL)",
+            "errtst_part_1",
+        ),
+        (
+            "INSERT INTO errtst VALUES ('bbb', NULL, 3)",
+            "errtst_part_2_lo",
+        ),
+        (
+            "INSERT INTO errtst (c, b) VALUES (12, NULL)",
+            "errtst_part_2_hi",
+        ),
+        (
+            "INSERT INTO errtst (a, b, c) VALUES ('zzz', NULL, 1)",
+            "errtst_default",
+        ),
+        // The second row is the first to fail.
+        (
+            "INSERT INTO errtst (a, b) VALUES ('aaa', 'x'), ('aaa', NULL)",
+            "errtst_part_1",
+        ),
+        // A sub-partitioned table is a partition too.
+        (
+            "INSERT INTO errtst_part_2 VALUES ('bbb', NULL, 50)",
+            "errtst_part_2_hi",
+        ),
+        // MERGE inserts through the same routing.
+        (
+            "MERGE INTO errtst t USING (SELECT 1 k) s ON false \
+             WHEN NOT MATCHED THEN INSERT (a, b) VALUES ('aaa', NULL)",
+            "errtst_part_1",
+        ),
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::Invalid(_),
+            &not_null(relation)
+        );
+    }
+}
+
+/// Where the analyzer can't tell which partition PG routes the row to, the
+/// NOT NULL violation names the target table rather than guess a partition.
+/// PG names the leaf it routes the row to at run time (or, for a row no
+/// partition takes, reports that first), so these diverge from it by
+/// design and opt out of the mirror.
+#[test]
+fn not_null_violation_names_the_target_when_the_partition_is_unknown() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE errtst (a text, b text NOT NULL, c int) PARTITION BY LIST (a);
+         CREATE TABLE errtst_part_1 PARTITION OF errtst FOR VALUES IN ('aaa');
+         CREATE TABLE errtst_part_2 PARTITION OF errtst FOR VALUES IN ('bbb', NULL)
+             PARTITION BY RANGE (c);
+         CREATE TABLE errtst_part_2_lo PARTITION OF errtst_part_2 FOR VALUES FROM (0) TO (10);
+         CREATE TABLE errtst_default PARTITION OF errtst DEFAULT;
+         CREATE TABLE hashed (a int, b text NOT NULL) PARTITION BY HASH (a);
+         CREATE TABLE hashed_0 PARTITION OF hashed FOR VALUES WITH (MODULUS 2, REMAINDER 0);
+         CREATE TABLE hashed_1 PARTITION OF hashed FOR VALUES WITH (MODULUS 2, REMAINDER 1);
+         CREATE COLLATION user_c FROM \"C\";
+         CREATE TABLE collated (a text COLLATE user_c, b text NOT NULL) PARTITION BY LIST (a);
+         CREATE TABLE collated_aaa PARTITION OF collated FOR VALUES IN ('aaa');
+         CREATE TABLE collated_default PARTITION OF collated DEFAULT;",
+    )
+    .unwrap();
+    db.skip_pg_sanity();
+    let not_null = |relation: &str| {
+        format!(r#"null value in column "b" of relation "{relation}" violates not-null constraint"#)
+    };
+    for (sql, relation) in [
+        // A parameter key: the partition depends on its value.
+        ("INSERT INTO errtst (a, b) VALUES ($1, NULL)", "errtst"),
+        // A key that is not a literal (PG routes it to errtst_part_1).
+        (
+            "INSERT INTO errtst (a, b) VALUES ('a' || 'aa', NULL)",
+            "errtst",
+        ),
+        // HASH partitioning (PG routes 1 to hashed_0).
+        ("INSERT INTO hashed VALUES (1, NULL)", "hashed"),
+        // A text key under a user's collation (PG routes it to collated_aaa).
+        ("INSERT INTO collated VALUES ('aaa', NULL)", "collated"),
+        (
+            "MERGE INTO errtst t USING (SELECT 1 k) s ON false \
+             WHEN NOT MATCHED THEN INSERT (a, b) VALUES ($1, NULL)",
+            "errtst",
+        ),
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::Invalid(_),
+            &not_null(relation)
+        );
+    }
+}
+
+/// A VALUES row no partition takes fails every execution in
+/// ExecFindPartition (`no partition of relation "…" found for row`,
+/// 23514): rejected where the analyzer can tell, naming the partitioned
+/// table — the root or a sub-partition — whose partitions all refuse it.
+/// Routing comes after the row is built and before its NOT NULL checks.
+#[test]
+fn insert_row_no_partition_takes_is_rejected() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE errtst (a text, b text NOT NULL, c int) PARTITION BY LIST (a);
+         CREATE TABLE errtst_part_1 PARTITION OF errtst FOR VALUES IN ('aaa');
+         CREATE TABLE errtst_part_2 PARTITION OF errtst FOR VALUES IN ('bbb', NULL)
+             PARTITION BY RANGE (c);
+         CREATE TABLE errtst_part_2_lo PARTITION OF errtst_part_2 FOR VALUES FROM (0) TO (10);
+         CREATE TABLE errtst_default PARTITION OF errtst DEFAULT;
+         CREATE DOMAIN nn_text AS text NOT NULL;
+         CREATE TABLE nodef (a int, b text NOT NULL, d nn_text DEFAULT 'd')
+             PARTITION BY LIST (a);
+         CREATE TABLE nodef_1 PARTITION OF nodef FOR VALUES IN (1);
+         CREATE TABLE rng (a int, b int) PARTITION BY RANGE (a, b);
+         CREATE TABLE rng_1 PARTITION OF rng FOR VALUES FROM (0, 0) TO (10, 10);
+         CREATE TABLE dt (a date) PARTITION BY RANGE (a);
+         CREATE TABLE dt_1 PARTITION OF dt FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');",
+    )
+    .unwrap();
+    for (sql, relation) in [
+        // The sub-partition errtst_part_2 takes 'bbb', but none of its
+        // own partitions takes c = -5.
+        (
+            "INSERT INTO errtst VALUES ('bbb', 'x', -5)",
+            "errtst_part_2",
+        ),
+        // A NULL range key goes only to a default partition.
+        ("INSERT INTO errtst (b) VALUES ('x')", "errtst_part_2"),
+        ("INSERT INTO nodef VALUES (2, 'x')", "nodef"),
+        ("INSERT INTO nodef VALUES (NULL, 'x')", "nodef"),
+        ("INSERT INTO nodef (b) VALUES ('x')", "nodef"),
+        ("INSERT INTO nodef DEFAULT VALUES", "nodef"),
+        // Before the row's NULL into a NOT NULL column.
+        ("INSERT INTO nodef VALUES (2, NULL)", "nodef"),
+        // The second row is the first to fail.
+        ("INSERT INTO nodef VALUES (1, 'x'), (2, 'x')", "nodef"),
+        // ON CONFLICT doesn't save it: the row is routed first.
+        (
+            "INSERT INTO nodef VALUES (2, 'x') ON CONFLICT DO NOTHING",
+            "nodef",
+        ),
+        // Multi-column range bounds compare lexicographically.
+        ("INSERT INTO rng VALUES (10, 10)", "rng"),
+        ("INSERT INTO rng VALUES (-1, 5)", "rng"),
+        ("INSERT INTO rng VALUES (NULL, 1)", "rng"),
+        // Constant keys as PG folds and coerces them.
+        ("INSERT INTO nodef VALUES (1 + 1, 'x')", "nodef"),
+        ("INSERT INTO nodef VALUES (2.5, 'x')", "nodef"),
+        ("INSERT INTO dt VALUES ('2025-01-01')", "dt"),
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::CheckViolation(_),
+            &format!(r#"no partition of relation "{relation}" found for row"#)
+        );
+    }
+    // The row is built first: a NULL into a NOT NULL domain fails before
+    // routing.
+    assert_err_prefix!(
+        db.analyze("INSERT INTO nodef VALUES (2, 'x', NULL)"),
+        AnalyzeError::Invalid(_),
+        r#"domain nn_text does not allow null values"#
+    );
+    // A row a partition takes.
+    for sql in [
+        "INSERT INTO nodef VALUES (1, 'x')",
+        "INSERT INTO rng VALUES (10, 9)",
+        "INSERT INTO rng VALUES (0, 0)",
+        "INSERT INTO errtst VALUES ('bbb', 'x', 5)",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
+
+/// Where the analyzer can't tell that no partition takes the row — or the
+/// statement doesn't insert it every time — the INSERT stays accepted.
+#[test]
+fn insert_row_routing_uncertain_is_accepted() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE nodef (a int, b text) PARTITION BY LIST (a);
+         CREATE TABLE nodef_1 PARTITION OF nodef FOR VALUES IN (1);
+         CREATE TABLE keydef (a int DEFAULT 2, b text) PARTITION BY LIST (a);
+         CREATE TABLE keydef_1 PARTITION OF keydef FOR VALUES IN (1);
+         CREATE TABLE hashed (a int) PARTITION BY HASH (a);
+         CREATE TABLE hashed_0 PARTITION OF hashed FOR VALUES WITH (MODULUS 2, REMAINDER 0);
+         CREATE COLLATION user_c FROM \"C\";
+         CREATE TABLE collated (a text COLLATE user_c) PARTITION BY LIST (a);
+         CREATE TABLE collated_aaa PARTITION OF collated FOR VALUES IN ('aaa');
+         CREATE TABLE exprkey (a int) PARTITION BY LIST ((a + 1));
+         CREATE TABLE exprkey_1 PARTITION OF exprkey FOR VALUES IN (1);
+         CREATE TABLE sk (a int2) PARTITION BY LIST (a);
+         CREATE TABLE sk_1 PARTITION OF sk FOR VALUES IN (1);
+         CREATE TABLE bigk (a int8) PARTITION BY LIST (a);
+         CREATE TABLE bigk_1 PARTITION OF bigk FOR VALUES IN (1);
+         CREATE DOMAIN pos AS int CHECK (VALUE > 0);
+         CREATE TABLE dk (a pos) PARTITION BY LIST (a);
+         CREATE TABLE dk_1 PARTITION OF dk FOR VALUES IN (1);
+         CREATE TABLE tz (a timestamptz) PARTITION BY RANGE (a);
+         CREATE TABLE tz_1 PARTITION OF tz FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+         CREATE TABLE ruled (a int) PARTITION BY LIST (a);
+         CREATE TABLE ruled_1 PARTITION OF ruled FOR VALUES IN (1);
+         CREATE TABLE sink (a int);
+         CREATE RULE r AS ON INSERT TO ruled DO INSTEAD INSERT INTO sink VALUES (NEW.a);",
+    )
+    .unwrap();
+    for sql in [
+        // A parameter key: the partition depends on its value.
+        "INSERT INTO nodef VALUES ($1, 'x')",
+        // A key that is not a constant.
+        "INSERT INTO nodef VALUES (length('ab'), 'x')",
+        // A key out of its type's range: PG fails on that first.
+        "INSERT INTO sk VALUES (32767 + 1)",
+        "INSERT INTO bigk VALUES (2147483647 + 1)",
+        // A domain's CHECK may reject the key first.
+        "INSERT INTO dk VALUES (-5)",
+        // A timestamptz literal reads in the session's time zone.
+        "INSERT INTO tz VALUES ('2025-02-01')",
+        // A key left to a non-NULL default.
+        "INSERT INTO keydef (b) VALUES ('x')",
+        // INSERT … SELECT: the rows come from the query.
+        "INSERT INTO nodef SELECT 2, 'x'",
+        // HASH partitioning.
+        "INSERT INTO hashed VALUES (1)",
+        // A text key under a user's collation.
+        "INSERT INTO collated VALUES ('zzz')",
+        // An expression key.
+        "INSERT INTO exprkey VALUES (5)",
+        // A DO INSTEAD rule replaces the INSERT.
+        "INSERT INTO ruled VALUES (2)",
+        // MERGE inserts only for source rows matching nothing.
+        "MERGE INTO nodef t USING (SELECT 1 k) s ON false \
+         WHEN NOT MATCHED THEN INSERT VALUES (2, 'x')",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
+
+/// A VALUES with ORDER BY, LIMIT / OFFSET or its own WITH is analyzed as
+/// a SELECT (transformInsertStmt's isGeneralSelect), but the rows it
+/// yields are stored all the same: one no partition takes, or storing a
+/// NULL into a NOT NULL column, fails every execution that stores it.
+/// Without ORDER BY the rows come in order, those OFFSET / LIMIT keep;
+/// with one, the rows failing must fail alike.
+#[test]
+fn insert_general_values_rows_are_checked() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE pt (a int, b int) PARTITION BY LIST (a);
+         CREATE TABLE pt1 PARTITION OF pt (b NOT NULL) FOR VALUES IN (1);
+         CREATE TABLE t (a int NOT NULL, b text NOT NULL);
+         CREATE DOMAIN nn AS int NOT NULL;
+         CREATE TABLE d (a nn);",
+    )
+    .unwrap();
+    for (sql, message) in [
+        (
+            "INSERT INTO pt VALUES (3, 1) LIMIT 1",
+            r#"no partition of relation "pt" found for row"#,
+        ),
+        (
+            "INSERT INTO pt VALUES (1, NULL::int) LIMIT 1",
+            r#"null value in column "b" of relation "pt1" violates not-null constraint"#,
+        ),
+        (
+            "INSERT INTO pt WITH x AS (SELECT 1) VALUES (3, 1)",
+            r#"no partition of relation "pt" found for row"#,
+        ),
+        // The rows LIMIT keeps, in order.
+        (
+            "INSERT INTO pt VALUES (1, 1), (3, 1) LIMIT 2",
+            r#"no partition of relation "pt" found for row"#,
+        ),
+        (
+            "INSERT INTO pt VALUES (3, 1), (1, 1) LIMIT 1",
+            r#"no partition of relation "pt" found for row"#,
+        ),
+        (
+            "INSERT INTO pt VALUES (1, 1), (3, 1) OFFSET 1",
+            r#"no partition of relation "pt" found for row"#,
+        ),
+        (
+            "INSERT INTO pt VALUES (1, NULL), (3, 1) LIMIT ALL",
+            r#"null value in column "b" of relation "pt1" violates not-null constraint"#,
+        ),
+        // Sorted: every row stored, or every row failing alike.
+        (
+            "INSERT INTO pt VALUES (1, 1), (3, 1) ORDER BY 1",
+            r#"no partition of relation "pt" found for row"#,
+        ),
+        (
+            "INSERT INTO pt VALUES (3, 1), (4, 1) ORDER BY 1 LIMIT 1",
+            r#"no partition of relation "pt" found for row"#,
+        ),
+        // A text NULL into a text column; an omitted column.
+        (
+            "INSERT INTO t VALUES (1, NULL) ORDER BY 1",
+            r#"null value in column "b" of relation "t" violates not-null constraint"#,
+        ),
+        (
+            "INSERT INTO t (b) VALUES ('x') LIMIT 1",
+            r#"null value in column "a" of relation "t" violates not-null constraint"#,
+        ),
+        (
+            "INSERT INTO d VALUES (NULL::int) LIMIT 1",
+            "domain nn does not allow null values",
+        ),
+    ] {
+        assert_err_prefix!(db.analyze(sql), _, message);
+    }
+    for sql in [
+        // No row stored, or none of those failing.
+        "INSERT INTO pt VALUES (3, 1) LIMIT 0",
+        "INSERT INTO pt VALUES (3, 1), (1, 1) OFFSET 1",
+        "INSERT INTO pt VALUES (1, 1), (3, 1) LIMIT 1",
+        // Which rows are stored depends on the sort / the parameter.
+        "INSERT INTO pt VALUES (3, 1), (1, 1) ORDER BY 1 LIMIT 1",
+        "INSERT INTO pt VALUES (3, 1) LIMIT $1",
+        // A NULL of a domain fails as the VALUES is evaluated: not the
+        // column's check (and here, no row is).
+        "INSERT INTO d VALUES (NULL::nn) LIMIT 0",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    // Rows failing differently, in an order the sort decides: which
+    // error PG reports is left to it.
+    db.analyze("INSERT INTO pt VALUES (1, NULL::int), (3, 1) ORDER BY 1")
+        .unwrap();
+}
+
+/// A NULL stored into a NOT NULL column fails every execution, wherever
+/// the NOT NULL is declared and however the NULL is written — unless
+/// something may replace the row or the statement.
+#[test]
+fn insert_null_into_not_null_forms() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE pt (a int, b int) PARTITION BY LIST (a);
+         CREATE TABLE pt1 PARTITION OF pt (b NOT NULL) FOR VALUES IN (1);
+         CREATE TABLE ptt (a int, b int) PARTITION BY LIST (a);
+         CREATE TABLE ptt1 PARTITION OF ptt (b NOT NULL) FOR VALUES IN (1);
+         CREATE FUNCTION fill() RETURNS trigger LANGUAGE plpgsql
+             AS $$BEGIN NEW.b := 5; RETURN NEW; END$$;
+         CREATE TRIGGER tr BEFORE INSERT ON ptt1 FOR EACH ROW EXECUTE FUNCTION fill();
+         CREATE TABLE t (a int NOT NULL, b text NOT NULL, c numeric NOT NULL DEFAULT 0);
+         CREATE TABLE sink (a int);
+         CREATE TABLE r (a int NOT NULL, b int);
+         CREATE RULE r_ins AS ON INSERT TO r DO INSTEAD INSERT INTO sink VALUES (NEW.b);
+         CREATE RULE r_upd AS ON UPDATE TO r DO INSTEAD NOTHING;
+         CREATE TABLE rc (a int NOT NULL, b int);
+         CREATE RULE rc_ins AS ON INSERT TO rc WHERE NEW.b = 5 DO INSTEAD NOTHING;
+         CREATE DOMAIN nn AS int NOT NULL;
+         CREATE DOMAIN pos AS int CHECK (VALUE > 0);
+         CREATE TABLE dd (a int NOT NULL, b int, c text);",
+    )
+    .unwrap();
+    for (sql, message) in [
+        // The partition's own NOT NULL, checked once the row lands there.
+        (
+            "INSERT INTO pt VALUES (1, NULL)",
+            r#"null value in column "b" of relation "pt1" violates not-null constraint"#,
+        ),
+        (
+            "INSERT INTO pt (a) VALUES (1)",
+            r#"null value in column "b" of relation "pt1" violates not-null constraint"#,
+        ),
+        // A NULL cast to the column's type is NULL all the same.
+        (
+            "INSERT INTO pt VALUES (1, NULL::int)",
+            r#"null value in column "b" of relation "pt1" violates not-null constraint"#,
+        ),
+        (
+            "MERGE INTO pt t USING (SELECT 1 k) s ON false \
+             WHEN NOT MATCHED THEN INSERT VALUES (1, NULL)",
+            r#"null value in column "b" of relation "pt1" violates not-null constraint"#,
+        ),
+        (
+            "INSERT INTO t VALUES (NULL::int, 'x')",
+            r#"null value in column "a" of relation "t" violates not-null constraint"#,
+        ),
+        // A column left to no default, with no NULL given.
+        (
+            "INSERT INTO t (b) VALUES ('x')",
+            r#"null value in column "a" of relation "t" violates not-null constraint"#,
+        ),
+        (
+            "INSERT INTO t (a, b) VALUES (DEFAULT, 'x')",
+            r#"null value in column "a" of relation "t" violates not-null constraint"#,
+        ),
+        (
+            "INSERT INTO t DEFAULT VALUES",
+            r#"null value in column "a" of relation "t" violates not-null constraint"#,
+        ),
+        // The second row is the first to fail.
+        (
+            "INSERT INTO t (a, b) VALUES (1, 'x'), (2, DEFAULT)",
+            r#"null value in column "b" of relation "t" violates not-null constraint"#,
+        ),
+        // A NULL cast to a NOT NULL domain fails as the row is built,
+        // before the columns' NOT NULL, whatever the column's type.
+        (
+            "INSERT INTO dd VALUES (NULL, NULL::nn)",
+            "domain nn does not allow null values",
+        ),
+        (
+            "INSERT INTO dd (a, c) VALUES (1, NULL::nn)",
+            "domain nn does not allow null values",
+        ),
+        (
+            "INSERT INTO dd VALUES (1, 1), (1, NULL::nn)",
+            "domain nn does not allow null values",
+        ),
+        (
+            "INSERT INTO dd VALUES (1, NULL::nn) LIMIT 1",
+            "domain nn does not allow null values",
+        ),
+    ] {
+        assert_err_prefix!(db.analyze(sql), AnalyzeError::Invalid(_), message);
+    }
+    for sql in [
+        // A BEFORE ROW trigger of the partition may fill the column in.
+        "INSERT INTO ptt VALUES (1, NULL)",
+        // Which error PG reports depends on the parameter: the partition
+        // the row lands in, or no partition.
+        "INSERT INTO pt VALUES ($1, NULL)",
+        // DO INSTEAD rules replace the statement, conditional ones
+        // depending on the row.
+        "INSERT INTO r VALUES (NULL, 1)",
+        "INSERT INTO r (b) VALUES (1)",
+        "UPDATE r SET a = NULL",
+        "INSERT INTO rc VALUES (NULL, 5)",
+        // A domain's CHECK lets a NULL through.
+        "INSERT INTO dd (a, b) VALUES (1, NULL::pos)",
+        // Filled in by the column's default.
+        "INSERT INTO t (a, b) VALUES (1, 'x')",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
+
 #[test]
 fn insert_values_row_wrong_arity_rejected() {
     let db = setup();
@@ -2106,4 +2568,135 @@ fn insert_without_column_list_may_supply_fewer_values() {
         let err = db.analyze(sql).expect_err(sql);
         assert!(err.to_string().starts_with(msg), "{sql}: {err}");
     }
+}
+
+// ── INSERT … VALUES with ORDER BY / LIMIT / locking / WITH ──────────────────
+
+/// transformInsertStmt's `isGeneralSelect`: a VALUES source carrying ORDER
+/// BY, LIMIT / OFFSET, a locking clause or its own WITH is analyzed as a
+/// standalone SELECT, its output columns then assigned to the targets.
+fn general_values_db() -> PgCatalog {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE gv (x int, y text); CREATE TABLE gvn (x int NOT NULL);")
+        .unwrap();
+    db
+}
+
+#[test]
+fn insert_values_with_select_clauses_reports_the_select_errors() {
+    let db = general_values_db();
+    for (sql, msg) in [
+        (
+            "INSERT INTO gv (x) VALUES (1) ORDER BY nonexistent",
+            "column \"nonexistent\" does not exist",
+        ),
+        (
+            "INSERT INTO gv (x) VALUES (1) ORDER BY column1 LIMIT 'x'",
+            "invalid input syntax for type bigint: \"x\"",
+        ),
+        (
+            "INSERT INTO gv (x) VALUES (1) LIMIT sum(1)",
+            "aggregate functions are not allowed in LIMIT",
+        ),
+        (
+            "INSERT INTO gv (x) VALUES (1) ORDER BY 2",
+            "ORDER BY position 2 is not in select list",
+        ),
+        // The target's columns are not in the VALUES' scope.
+        (
+            "INSERT INTO gv (x) VALUES (1) LIMIT x",
+            "column \"x\" does not exist",
+        ),
+        (
+            "INSERT INTO gv (x) VALUES (DEFAULT) LIMIT 1",
+            "DEFAULT is not allowed in this context",
+        ),
+        (
+            "INSERT INTO gv (x) VALUES (generate_series(1, 2)) LIMIT 5",
+            "set-returning functions are not allowed in VALUES",
+        ),
+        (
+            "INSERT INTO gv (x) VALUES (1) FOR UPDATE",
+            "FOR UPDATE cannot be applied to VALUES",
+        ),
+        (
+            "INSERT INTO gv (x) VALUES (1, 2) LIMIT 1",
+            "INSERT has more expressions than target columns",
+        ),
+        (
+            "INSERT INTO gv (x, y) VALUES (1) LIMIT 1",
+            "INSERT has more target columns than expressions",
+        ),
+        (
+            "INSERT INTO gv VALUES (1), (2, 'b') LIMIT 1",
+            "VALUES lists must all be the same length",
+        ),
+        // The VALUES' columns are resolved on their own: an untyped literal,
+        // NULL or parameter alone in its column is text.
+        (
+            "INSERT INTO gv (x) VALUES ('1') ORDER BY 1",
+            "column \"x\" is of type integer but expression is of type text",
+        ),
+        (
+            "INSERT INTO gvn VALUES (NULL) LIMIT 1",
+            "column \"x\" is of type integer but expression is of type text",
+        ),
+        (
+            "INSERT INTO gv (x) VALUES ($1) LIMIT 1",
+            "column \"x\" is of type integer but expression is of type text",
+        ),
+        (
+            "INSERT INTO gv (x) VALUES ('2020-01-01'::date) OFFSET 0",
+            "column \"x\" is of type integer but expression is of type date",
+        ),
+    ] {
+        let err = db.analyze(sql).expect_err(sql);
+        assert!(err.to_string().starts_with(msg), "{sql}: {err}");
+    }
+}
+
+#[test]
+fn insert_values_with_select_clauses_is_accepted_like_pg() {
+    let db = general_values_db();
+    for sql in [
+        "INSERT INTO gv (x) VALUES (1) OFFSET 0",
+        "INSERT INTO gv (x) VALUES (2), (1) ORDER BY column1 LIMIT 1",
+        "INSERT INTO gv (x) VALUES (1) ORDER BY column1 + 1",
+        "INSERT INTO gv (x) VALUES (1) LIMIT (SELECT max(x) FROM gv)",
+        "INSERT INTO gv (x) WITH c AS (SELECT 1 AS v) VALUES ((SELECT v FROM c))",
+        "INSERT INTO gv (x) VALUES (1.5::numeric) LIMIT 1",
+        "INSERT INTO gv (y) VALUES (1) LIMIT 1",
+        "INSERT INTO gv (x, y) VALUES (NULL::int, NULL) LIMIT 1",
+        // The common type of the rows is int: the NULL row may be cut by
+        // the LIMIT, and is no literal NULL assigned to the column.
+        "INSERT INTO gvn (x) VALUES (1), (NULL) LIMIT 1",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
+
+#[test]
+fn insert_values_with_select_clauses_types_params_like_pg() {
+    let db = general_values_db();
+    // A parameter alone in its column is text; next to an int it is int.
+    // Either may be NULL when its target column is nullable, as in a plain
+    // VALUES list.
+    let s = db
+        .analyze("INSERT INTO gv (y) VALUES ($1) LIMIT 1")
+        .unwrap();
+    assert_params(&s, vec![pn(text())]);
+    let s = db
+        .analyze("INSERT INTO gv (x) VALUES ($1), (2) LIMIT 1")
+        .unwrap();
+    assert_params(&s, vec![pn(int4())]);
+    let s = db
+        .analyze("INSERT INTO gvn (x) VALUES ($1), (2) LIMIT 1")
+        .unwrap();
+    assert_params(&s, vec![p(int4())]);
+    // LIMIT's own parameter is bigint.
+    let s = db
+        .analyze("INSERT INTO gv (x) VALUES (1) LIMIT $1 RETURNING x")
+        .unwrap();
+    assert_params(&s, vec![p(int8())]);
+    assert_cols(&s, vec![c("x", int4())]);
 }

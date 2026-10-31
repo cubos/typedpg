@@ -497,6 +497,37 @@ fn not_operand_error_propagates_through_case_when() {
     );
 }
 
+/// make_scalar_array_op: `op ANY/ALL (array)` needs a boolean operator
+/// (42809); the sub-select form words it as a row comparison (42804).
+#[test]
+fn any_requires_a_boolean_operator() {
+    let db = setup();
+    for sql in [
+        "SELECT 33 * any ('{1,2,3}')",
+        "SELECT 33 * ALL (ARRAY[1, 2])",
+        "SELECT 'a' || ANY (ARRAY['b'])",
+        "SELECT id + ANY ($1) FROM users",
+    ] {
+        let err = db.analyze(sql).unwrap_err();
+        assert!(
+            matches!(err, AnalyzeError::WrongObjectType(_)),
+            "{sql}: {err:?}"
+        );
+        assert!(
+            err.to_string()
+                .starts_with("op ANY/ALL (array) requires operator to yield boolean"),
+            "{sql}: {err}"
+        );
+    }
+    assert_err_prefix(
+        &db,
+        "SELECT 33 * ANY (SELECT 1)",
+        "row comparison operator must yield type boolean, not type integer",
+    );
+    db.analyze("SELECT 1 = ANY ('{1,2}'), 1 < ALL (ARRAY[2]), id <> ALL ($1) FROM users")
+        .unwrap();
+}
+
 // ── Operator with an UNKNOWN operand (NULL / untyped literal) ────────────────
 // PG resolves the unknown operand to the *other* (concrete) operand's type, so
 // these are all valid. The analyzer used to reject them with a spurious
@@ -1007,6 +1038,48 @@ fn single_overload_function_with_non_coercible_arg_rejected() {
             "          jsonb_typeof(jsonb)\n",
         ),
     );
+}
+
+/// ParseFuncOrColumn refuses a call returning (or taking) `internal`
+/// (0A000), and a support type's input function refuses every value.
+#[test]
+fn internal_support_functions_are_not_callable() {
+    let db = setup();
+    for sql in [
+        "SELECT internal_in('1')",
+        "SELECT internal_in('1'::cstring)",
+    ] {
+        let err = db.analyze(sql).unwrap_err();
+        assert!(
+            matches!(err, AnalyzeError::FeatureNotSupported(_)),
+            "{sql}: {err:?}"
+        );
+        assert!(
+            err.to_string()
+                .starts_with(r#"functions returning type "internal" cannot be called explicitly"#),
+            "{sql}: {err}"
+        );
+    }
+    for sql in ["SELECT gtsvectorout('1')", "SELECT '1'::gtsvector"] {
+        assert_err_prefix(&db, sql, "cannot accept a value of type gtsvector");
+    }
+    // Nothing coerces to `internal`, an unknown parameter included: a
+    // function accepting it has no candidate (PG reaches its "accepting
+    // type internal" check only for a parameter PREPARE declares
+    // `internal`).
+    assert_err_prefix(
+        &db,
+        "SELECT array_typanalyze($1)",
+        "function array_typanalyze(unknown) does not exist",
+    );
+    assert_err_prefix(
+        &db,
+        "SELECT array_typanalyze(internal_in('1'))",
+        r#"functions returning type "internal" cannot be called explicitly"#,
+    );
+    // The type's output function is callable, on a value it never gets.
+    db.analyze("SELECT gtsvectorout(NULL), textin('a'::cstring)")
+        .unwrap();
 }
 
 // ── Concatenation of a non-text value with a string literal ──────────────────

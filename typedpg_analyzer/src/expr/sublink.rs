@@ -151,6 +151,15 @@ pub(crate) fn infer_sublink(
                     let r_oid = col.type_oid;
                     result_nullable |= lhs.nullable || col.nullable;
                     let found = snapshot.find_operator(&op_name, Some(l_oid), r_oid);
+                    // make_row_comparison_op, which compares even a single
+                    // column: each operator must yield boolean (42804).
+                    if let Some(op) = &found
+                        && op.result_type_oid != oid::BOOL
+                    {
+                        let name =
+                            crate::ddl::util::format_type_for_message(snapshot, op.result_type_oid);
+                        return Err(crate::pgmsg::row_comparison_operator_not_boolean(&name));
+                    }
                     ops.push(found.clone());
                     match found {
                         Some(op) if l_oid != oid::UNKNOWN && r_oid != oid::UNKNOWN => {

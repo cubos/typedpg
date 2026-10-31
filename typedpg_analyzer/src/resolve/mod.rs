@@ -893,7 +893,7 @@ fn can_run_as_subquery(stmt: &node::Node) -> bool {
     let node::Node::SelectStmt(sel) = stmt else {
         return false;
     };
-    if sel.into_clause.is_some() {
+    if has_top_level_into(sel) {
         return false;
     }
     let Some(with) = &sel.with_clause else {
@@ -1016,6 +1016,35 @@ fn statement_locks_rows(snapshot: &PgCatalog, stmt: &node::Node) -> bool {
         })
 }
 
+/// transformOptionalSelectInto: a top-level `SELECT … INTO t` (the INTO on
+/// the leftmost member of a set operation) is CREATE TABLE AS over the
+/// query without it — `None` when there is no INTO. An INTO anywhere else
+/// is an error (see `analyze_select_here`).
+fn without_top_level_into(sel: &protobuf::SelectStmt) -> Option<protobuf::SelectStmt> {
+    if !has_top_level_into(sel) {
+        return None;
+    }
+    let mut stripped = sel.clone();
+    let mut leftmost = &mut stripped;
+    while leftmost.op != SetOperation::SetopNone as i32 {
+        leftmost = leftmost.larg.as_deref_mut()?;
+    }
+    leftmost.into_clause = None;
+    Some(stripped)
+}
+
+/// Whether the leftmost member of `sel` carries an INTO.
+fn has_top_level_into(sel: &protobuf::SelectStmt) -> bool {
+    let mut leftmost = sel;
+    while leftmost.op != SetOperation::SetopNone as i32 {
+        match leftmost.larg.as_deref() {
+            Some(l) => leftmost = l,
+            None => return false,
+        }
+    }
+    leftmost.into_clause.is_some()
+}
+
 /// A statement's output columns and parameters.
 type RawAnalysis = (Vec<RawColumn>, Vec<RawParam>);
 
@@ -1026,10 +1055,15 @@ fn analyze_raw_node_once(
     stmt: &node::Node,
     mut params: ParamCollector,
 ) -> Result<(RawAnalysis, Vec<i32>), AnalyzeError> {
+    let select_into = match stmt {
+        node::Node::SelectStmt(sel) => without_top_level_into(sel),
+        _ => None,
+    };
     let (raw_columns, raw_params) = match stmt {
-        // `SELECT … INTO t` is CREATE TABLE AS (transformSelectStmt turns it
-        // into a CreateTableAsStmt): it returns no rows.
-        node::Node::SelectStmt(sel) if sel.into_clause.is_some() => {
+        // `SELECT … INTO t` is CREATE TABLE AS (transformOptionalSelectInto
+        // turns it into a CreateTableAsStmt): it returns no rows.
+        node::Node::SelectStmt(_) if select_into.is_some() => {
+            let sel = select_into.as_ref().expect("guarded by the match arm");
             let (_, p) = analyze_select(sel, snapshot, &mut params)?;
             expr::resolve_untyped_output_params(sel, snapshot, &mut params)?;
             check_null_domain_casts(sel, snapshot)?;
@@ -1063,7 +1097,11 @@ fn analyze_raw_node_once(
             // `analyze_raw_node` recursively would allocate a fresh
             // collector and the outer call would see zero params).
             let _ = match inner {
-                node::Node::SelectStmt(sel) => analyze_select(sel, snapshot, &mut params)?,
+                // transformExplainStmt runs transformOptionalSelectInto too.
+                node::Node::SelectStmt(sel) => match without_top_level_into(sel) {
+                    Some(sel) => analyze_select(&sel, snapshot, &mut params)?,
+                    None => analyze_select(sel, snapshot, &mut params)?,
+                },
                 node::Node::InsertStmt(ins) => analyze_insert(ins, snapshot, &mut params)?,
                 node::Node::UpdateStmt(upd) => analyze_update(upd, snapshot, &mut params)?,
                 node::Node::DeleteStmt(del) => analyze_delete(del, snapshot, &mut params)?,
@@ -1524,6 +1562,16 @@ fn null_assignment_error(
     table_relname: &str,
     op: &'static str,
 ) -> Option<AnalyzeError> {
+    let event = if op == "insert" {
+        DmlEvent::Insert
+    } else {
+        DmlEvent::Update
+    };
+    // A DO INSTEAD rule (conditional or not) may replace the statement:
+    // the row is then never built nor stored.
+    if dml::returning_rewritten(snapshot, tc.attrelid, &[event]) {
+        return None;
+    }
     // Coerced to the column's type as the row is built: a NOT NULL domain
     // (or one with a CHECK a NULL fails) rejects it.
     if let Some(msg) = snapshot.domain_null_violation(tc.atttypid) {
@@ -1536,11 +1584,6 @@ fn null_assignment_error(
         .pg_class
         .get(&tc.attrelid)
         .is_some_and(|c| c.relkind == crate::pg_catalog::RelKind::View);
-    let event = if op == "insert" {
-        DmlEvent::Insert
-    } else {
-        DmlEvent::Update
-    };
     if tc.attnotnull && !on_view && !before_row_trigger_rewrites(snapshot, tc.attrelid, event) {
         let verb = match op {
             "insert" => "insert NULL into",

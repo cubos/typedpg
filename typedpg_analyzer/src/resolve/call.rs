@@ -32,6 +32,7 @@ pub(crate) fn analyze_call(
     let ctx = expr::Ctx::new(&scope, &null_ctx, snapshot);
     let mut arg_types = Vec::with_capacity(fc.args.len());
     for a in &fc.args {
+        check_call_argument(a, snapshot)?;
         arg_types.push(expr::infer_expr(a, ctx, params, TypeGoal::NONE)?.type_oid);
     }
     let notation = functions::CallNotation {
@@ -73,4 +74,23 @@ pub(crate) fn analyze_call(
         })
         .collect();
     Ok((columns, None))
+}
+
+/// EXPR_KIND_CALL_ARGUMENT: no sub-select (transformSubLink, 0A000), no
+/// aggregate, window or set-returning function.
+fn check_call_argument(arg: &protobuf::Node, snapshot: &PgCatalog) -> Result<(), AnalyzeError> {
+    let mut sublink = None;
+    visit_same_level(arg, &mut |n| {
+        if let Some(node::Node::SubLink(sl)) = n.node.as_ref() {
+            sublink.get_or_insert(sl.location);
+        }
+    });
+    if let Some(location) = sublink {
+        return Err(
+            crate::pgmsg::call_argument_subquery(crate::error::SourceSpan::from_location(location))
+                .finalize_implicit(),
+        );
+    }
+    crate::clause::check_no_aggregates_or_windows(arg, snapshot, "CALL arguments")?;
+    check_no_srf_in_clause(arg, snapshot, "CALL arguments")
 }

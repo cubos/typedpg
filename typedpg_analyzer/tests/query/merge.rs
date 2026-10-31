@@ -307,6 +307,117 @@ fn merge_target_and_source_need_distinct_names() {
         .unwrap();
 }
 
+/// transformMergeStmt refuses a recursive WITH (42601); a plain one is a
+/// MERGE's own.
+#[test]
+fn merge_rejects_with_recursive() {
+    let db = setup();
+    for sql in [
+        "WITH RECURSIVE c AS (SELECT 1 a) \
+         MERGE INTO t USING (SELECT 0 id) o ON t.id = o.id WHEN MATCHED THEN DELETE",
+        "WITH RECURSIVE c AS (SELECT 1 id) MERGE INTO t USING c ON t.id = c.id \
+         WHEN MATCHED THEN DELETE",
+    ] {
+        let err = db.analyze(sql).unwrap_err();
+        assert!(
+            matches!(err, AnalyzeError::SyntaxError(_)),
+            "{sql}: {err:?}"
+        );
+        assert!(
+            err.to_string()
+                .starts_with("WITH RECURSIVE is not supported for MERGE statement"),
+            "{sql}: {err}"
+        );
+    }
+    db.analyze(
+        "WITH c AS (SELECT 1 id) MERGE INTO t USING c ON t.id = c.id WHEN MATCHED THEN DELETE",
+    )
+    .unwrap();
+}
+
+/// scanNSItemForColumn: a WHEN condition may not read a system column of
+/// either relation, `tableoid` excepted (42P10). The ON condition, the
+/// actions, RETURNING and a sub-select inside the condition (a query level
+/// of its own) may.
+#[test]
+fn merge_when_conditions_reject_system_columns() {
+    let db = setup();
+    for (sql, column) in [
+        (
+            "MERGE INTO t USING s ON t.id = s.id \
+             WHEN MATCHED AND t.xmin = t.xmax THEN UPDATE SET v = t.v + s.v",
+            "xmin",
+        ),
+        (
+            "MERGE INTO t USING s ON t.id = s.id \
+             WHEN NOT MATCHED AND s.ctid IS NOT NULL THEN DO NOTHING",
+            "ctid",
+        ),
+        (
+            "MERGE INTO t USING s ON t.id = s.id \
+             WHEN NOT MATCHED BY SOURCE AND cmin IS NOT NULL THEN DELETE",
+            "cmin",
+        ),
+    ] {
+        let err = db.analyze(sql).unwrap_err();
+        assert!(
+            matches!(err, AnalyzeError::InvalidColumnReference(_)),
+            "{sql}: {err:?}"
+        );
+        assert!(
+            err.to_string().starts_with(&format!(
+                "cannot use system column \"{column}\" in MERGE WHEN condition"
+            )),
+            "{sql}: {err}"
+        );
+    }
+    for sql in [
+        "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED AND t.tableoid > 0 THEN DELETE",
+        "MERGE INTO t USING s ON t.id = s.id \
+         WHEN MATCHED AND EXISTS (SELECT 1 WHERE t.xmin IS NOT NULL) THEN DELETE",
+        "MERGE INTO t USING s ON t.id = s.id AND t.xmin IS NOT NULL \
+         WHEN MATCHED THEN UPDATE SET w = t.ctid::text RETURNING t.xmin",
+        "MERGE INTO t USING (SELECT 1 AS id, 2 AS xmin) s ON t.id = s.id \
+         WHEN MATCHED AND s.xmin > 0 THEN DELETE",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
+
+/// A WHEN NOT MATCHED INSERT into a subscripted or field target stores
+/// the value inside the column, as a plain INSERT's column list does.
+#[test]
+fn merge_insert_into_a_subscripted_column() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TYPE pt AS (x int, y text);
+         CREATE TABLE sf_target (id int, data text, filling int[], p pt);
+         CREATE TABLE src (a int, b text);",
+    )
+    .unwrap();
+    for sql in [
+        "MERGE INTO sf_target t USING src s ON s.a = t.id \
+         WHEN NOT MATCHED THEN INSERT (filling[1], id) VALUES (s.a, s.a)",
+        "MERGE INTO sf_target t USING src s ON s.a = t.id \
+         WHEN NOT MATCHED THEN INSERT (filling[1:2], p.y) VALUES (ARRAY[s.a, 2], s.b)",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    // The element type is what the value must convert to.
+    let err = db
+        .analyze(
+            "MERGE INTO sf_target t USING src s ON s.a = t.id \
+             WHEN NOT MATCHED THEN INSERT (filling[1]) VALUES (s.b)",
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string().starts_with(
+            "subscripted assignment to \"filling\" requires type integer but expression is of type text"
+        ),
+        "{err}"
+    );
+}
+
 /// transformInsertRow coerces a WHEN NOT MATCHED INSERT value like a plain
 /// INSERT's (same error variant): a value that can't be assigned is
 /// `column "x" is of type … but expression is of type …` (42804).

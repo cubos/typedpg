@@ -639,7 +639,7 @@ fn add_column_records_its_inline_constraints() {
             "t1_pkey"
         ]
     );
-    db.analyze("INSERT INTO t1 (email) VALUES ('x') ON CONFLICT (email) DO NOTHING")
+    db.analyze("INSERT INTO t1 (email, k) VALUES ('x', 1) ON CONFLICT (email) DO NOTHING")
         .unwrap();
     db.analyze("INSERT INTO t1 (k) VALUES (1) ON CONFLICT (k) DO NOTHING")
         .unwrap();

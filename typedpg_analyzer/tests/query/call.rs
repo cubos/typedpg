@@ -55,6 +55,44 @@ fn call_errors() {
     }
 }
 
+/// transformCallStmt transforms the arguments as EXPR_KIND_CALL_ARGUMENT:
+/// no sub-select (0A000), aggregate, window or set-returning function.
+#[test]
+fn call_rejects_subquery_arguments() {
+    let db = setup();
+    for sql in [
+        "CALL p_in(1, (SELECT 'a'))",
+        "CALL p_in((SELECT 1), 'a')",
+        "CALL p_in(1, (SELECT 'a') || 'b')",
+        "CALL p_in(1 + EXISTS (SELECT 1)::int, 'a')",
+        "CALL p_in(1, ARRAY(SELECT 'a')::text)",
+        "CALL p_io((SELECT 1), NULL)",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::FeatureNotSupported(_),
+            "cannot use subquery in CALL argument"
+        );
+    }
+    for (sql, msg) in [
+        (
+            "CALL p_in(count(*)::int, 'a')",
+            "aggregate functions are not allowed in CALL arguments",
+        ),
+        (
+            "CALL p_in(row_number() OVER ()::int, 'a')",
+            "window functions are not allowed in CALL arguments",
+        ),
+        (
+            "CALL p_in(generate_series(1, 2), 'a')",
+            "set-returning functions are not allowed in CALL arguments",
+        ),
+    ] {
+        let err = db.analyze(sql).unwrap_err();
+        assert!(err.to_string().starts_with(msg), "{sql}: {err}");
+    }
+}
+
 /// CALL resolves through ParseFuncOrColumn like any call — defaults, named
 /// notation, VARIADIC, polymorphism and the unknown-literal preference
 /// rules — over candidates whose OUT parameters take arguments.

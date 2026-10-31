@@ -212,6 +212,20 @@ fn analyze_select_here(
 ) -> AnalyzeResult {
     let _level = QueryLevel::enter();
     let resolve_unknowns = !KEEP_UNKNOWN_OUTPUTS.with(|k| k.replace(false));
+    // transformSetOperationStmt: an INTO on the leftmost member is the
+    // statement's only where the statement is the top level, which
+    // `analyze_raw_node` strips; here it is out of place.
+    if sel.op != SetOperation::SetopNone as i32 {
+        let mut leftmost = sel;
+        while leftmost.op != SetOperation::SetopNone as i32
+            && let Some(l) = leftmost.larg.as_deref()
+        {
+            leftmost = l;
+        }
+        if let Some(into) = &leftmost.into_clause {
+            return Err(crate::pgmsg::select_into_not_allowed(into_span(into)).finalize_implicit());
+        }
+    }
     // Start with outer CTEs (from parent WITH clause).
     let mut cte_scopes: HashMap<String, Vec<ScopeColumn>> = outer_ctes.clone();
 
@@ -252,6 +266,12 @@ fn analyze_select_here(
     // The rows see the LATERAL and correlated outer levels like any
     // expression of this level (`LATERAL (VALUES (v.a))`).
     if !sel.values_lists.is_empty() {
+        // transformValuesClause: a bare VALUES has no relation to lock.
+        if let Some(node::Node::LockingClause(lc)) =
+            sel.locking_clause.first().and_then(|n| n.node.as_ref())
+        {
+            return Err(crate::pgmsg::locking_values(lock_strength_name(lc)).finalize_implicit());
+        }
         grouping::register_level(sel, &[], &[]);
         let mut values_scope = Scope {
             ctes: cte_scopes.clone(),
@@ -274,6 +294,12 @@ fn analyze_select_here(
             min_one_row: limit_keeps_a_row(sel),
         });
         return Ok((columns, None));
+    }
+
+    // transformSelectStmt: INTO belongs to the top-level SELECT only (see
+    // `analyze_raw_node`).
+    if let Some(into) = &sel.into_clause {
+        return Err(crate::pgmsg::select_into_not_allowed(into_span(into)).finalize_implicit());
     }
 
     let mut scope = Scope {
@@ -1522,6 +1548,13 @@ fn is_select_alias_reference(
 }
 
 /// PG's `LCS_asString`: the clause's spelling in messages.
+/// Where PG positions an error about an INTO clause: its relation.
+pub(crate) fn into_span(into: &protobuf::IntoClause) -> Option<crate::error::SourceSpan> {
+    into.rel
+        .as_ref()
+        .and_then(|rv| crate::error::SourceSpan::from_node_qname(rv.location))
+}
+
 pub(crate) fn lock_strength_name(lc: &protobuf::LockingClause) -> &'static str {
     match lc.strength() {
         typedpg_pg_query::protobuf::LockClauseStrength::LcsForkeyshare => "FOR KEY SHARE",
