@@ -423,6 +423,10 @@ pub(crate) fn assignment_error(
     if !crate::expr::plan_time_checks() {
         return None;
     }
+    // A column of a subquery the planner pulled up is the subquery's
+    // output expression by the time the conversion is folded.
+    let substituted = crate::resolve::substituted(value);
+    let value = substituted.as_deref().unwrap_or(value);
     let e = assignment_error_here(snapshot, type_oid, typmod, value, span)?;
     crate::expr::plan_time_error(location, e)
 }

@@ -623,6 +623,22 @@ fn constant_regex_patterns_compiled_by_the_planner_are_validated() {
         // prove empty, a sublink's and a pulled-up output's constants.
         "SELECT (SELECT 'a' ~ '(') AS m FROM rt WHERE false",
         "SELECT * FROM (SELECT 'a' ~ '(' AS m) s WHERE false",
+        // A constant qual of a level with several relations is a gating
+        // qual above their join: each is still estimated — those of a
+        // pulled-up subquery or view, of a subquery planned on its own.
+        "SELECT 1 AS m FROM rt2 JOIN rt ON rt.s ~ '(' WHERE false",
+        "SELECT 1 AS m FROM rt2, (SELECT 1 AS q FROM rt WHERE s ~ '(') x WHERE false",
+        "SELECT 1 AS m FROM rt2, (SELECT 1 AS q FROM rt WHERE s ~ '(' OFFSET 0) x WHERE false",
+        "SELECT 1 AS m FROM rt2, (SELECT 1 AS q FROM rt WHERE s ~ '(' GROUP BY id) x WHERE false",
+        "SELECT 1 AS m FROM rt2, rv WHERE false",
+        // A pulled-up subquery's column is its table's.
+        "SELECT 1 AS m FROM rt2, (SELECT * FROM rt WHERE false) x WHERE x.s ~ '('",
+        "SELECT 1 AS m FROM rt2, (SELECT s FROM rt) x WHERE x.s ~ '('",
+        // A qual pushed down into a subquery planned on its own proves
+        // nothing empty there.
+        "SELECT x.id FROM (SELECT id FROM rt WHERE s ~ '(' ORDER BY 1) x WHERE x.id = 1",
+        // A constant HAVING moves into WHERE: a gating qual there too.
+        "SELECT rt.id FROM rt, rt2 WHERE rt.s ~ '(' GROUP BY rt.id HAVING false",
     ] {
         assert_err_prefix!(
             db.analyze(sql),
@@ -648,6 +664,55 @@ fn constant_regex_patterns_compiled_by_the_planner_are_validated() {
         "SELECT rt.id FROM rt LEFT JOIN rt2 ON rt2.id = rt.id AND rt2.s ~ '('",
         // A pulled-up view's restriction, in a level proven empty.
         "SELECT id FROM rv WHERE false",
+        // A single relation: the constant qual is its restriction, which
+        // proves it empty — a pulled-up subquery's, or one planned on its
+        // own (never planned then).
+        "SELECT 1 AS m FROM (SELECT * FROM rt WHERE s ~ '(') x WHERE false",
+        "SELECT 1 AS m FROM (SELECT * FROM rt WHERE false) x WHERE x.s ~ '('",
+        "SELECT 1 AS m FROM (SELECT 1 AS q FROM rt WHERE s ~ '(' OFFSET 0) x WHERE false",
+        "SELECT 1 AS m FROM (SELECT 1 AS q) y JOIN rt ON rt.s ~ '(' WHERE false",
+        // A constant HAVING moves into WHERE, the relation's restriction.
+        "SELECT id FROM rt WHERE s ~ '(' GROUP BY id HAVING false",
+        "SELECT id FROM rt WHERE s ~ '(' GROUP BY id HAVING 1 = 2",
+        // A pulled-up constant: `y.q = 2` is FALSE.
+        "SELECT 1 AS m FROM rt2, (SELECT 1 AS q) y, rt WHERE rt.s ~ '(' AND y.q = 2",
+        "SELECT 1 AS m FROM (SELECT 1 AS q) y JOIN rt ON rt.s ~ '(' WHERE y.q = 2",
+        "SELECT CASE WHEN y.q = 2 THEN 'a' ~ '(' END AS m FROM (SELECT 1 AS q) y",
+        // The one AND folds whole; a join removed, or merged with itself.
+        "SELECT 1 AS m FROM rt2, rt WHERE rt.s ~ '(' AND rt2.id = 1 AND false",
+        "SELECT 1 AS m FROM rt2 LEFT JOIN rt ON rt.s ~ '(' AND rt.id = rt2.id WHERE false",
+        "SELECT 1 AS m FROM rt a JOIN rt b ON a.id = b.id AND a.s ~ '(' WHERE false",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
+
+#[test]
+fn a_subquery_planned_on_its_own_estimates_its_restrictions() {
+    // A security_barrier view is never pulled up: the planner plans it on
+    // its own, once it plans the relation it is — with the quals it may
+    // push down into it, which may prove it empty.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE t (id int PRIMARY KEY, x int, s text);
+         CREATE VIEW v4 WITH (security_barrier) AS SELECT x FROM t WHERE s ~ '(';
+         CREATE VIEW v7 WITH (security_barrier) AS SELECT x FROM t WHERE x = 1 AND s ~ '(';",
+    )
+    .unwrap();
+    for sql in [
+        "SELECT 1 AS m FROM v4",
+        "SELECT 1 AS m FROM v4 WHERE x = 2",
+        "SELECT 1 AS m FROM v7 WHERE x = 1",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::Invalid(_),
+            "invalid regular expression: parentheses () not balanced"
+        );
+    }
+    for sql in [
+        "SELECT 1 AS m FROM v4 WHERE false",
+        "SELECT 1 AS m FROM v7 WHERE x = 2",
     ] {
         db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
     }

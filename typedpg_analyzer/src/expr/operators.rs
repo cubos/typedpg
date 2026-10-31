@@ -1512,8 +1512,9 @@ pub(crate) fn check_regex_restrictions(
 }
 
 fn regex_restrictions(node: &protobuf::Node, ctx: Ctx<'_>) -> Result<(), AnalyzeError> {
-    // A part folded to a constant estimates nothing.
-    if super::plan_fold::fold(node, ctx.snapshot) != super::plan_fold::Folded::Var {
+    // A part folded to a constant estimates nothing (`y.q = 2`, `y` a
+    // pulled-up `(SELECT 1 AS q)`, is FALSE).
+    if super::plan_fold::fold_in(node, ctx) != super::plan_fold::Folded::Var {
         return Ok(());
     }
     match node.node.as_ref() {
@@ -1541,13 +1542,19 @@ fn regex_restrictions(node: &protobuf::Node, ctx: Ctx<'_>) -> Result<(), Analyze
             let Some(alias) = restriction_variable(l, ctx) else {
                 return Ok(());
             };
-            if !ctx
-                .scope
-                .sources
-                .iter()
-                .find(|s| s.alias == alias)
-                .is_some_and(|s| super::plan_fold::restriction_estimated(s, ctx.snapshot))
-            {
+            let Some(source) = ctx.scope.sources.iter().find(|s| s.alias == alias) else {
+                return Ok(());
+            };
+            let estimated = if matches!(source.kind, crate::scope::SourceKind::Relation) {
+                super::plan_fold::restriction_estimated(source, ctx.snapshot)
+            } else {
+                // A subquery the planner pulls up: its columns are the
+                // table's they pass through.
+                pulled_up_relation(l, ctx).is_some_and(|relid| {
+                    super::plan_fold::table_restriction_estimated(&alias, relid, ctx.snapshot)
+                })
+            };
+            if !estimated {
                 return Ok(());
             }
             // Only the string types' regex operators (not, e.g., ltree's `~`).
@@ -1565,6 +1572,46 @@ fn regex_restrictions(node: &protobuf::Node, ctx: Ctx<'_>) -> Result<(), Analyze
         }
         _ => Ok(()),
     }
+}
+
+/// The table whose scan every column `node` reads comes from, once the
+/// planner pulled up the subquery they are columns of (never
+/// null-extended there): each is one of its outputs passed through from
+/// that one scan of the table.
+fn pulled_up_relation(node: &protobuf::Node, ctx: Ctx<'_>) -> Option<crate::oid::PgClassOid> {
+    let mut scan: Option<(u32, crate::oid::PgClassOid)> = None;
+    let mut todo = vec![node];
+    while let Some(n) = todo.pop() {
+        match n.node.as_ref() {
+            Some(node::Node::ColumnRef(cr)) => {
+                let parts = extract_string_fields(&cr.fields);
+                let (table, column) = match parts.as_slice() {
+                    [c] if parts.len() == cr.fields.len() => (None, c.as_str()),
+                    [t, c] if parts.len() == cr.fields.len() => (Some(t.as_str()), c.as_str()),
+                    _ => return None,
+                };
+                let col = ctx.scope.resolve_column(table, column, None).ok()?;
+                if col.deferred.substitution != crate::scope::Substitution::Certain {
+                    return None;
+                }
+                let origin = col.origin.as_ref().filter(|o| !o.with_children)?;
+                match scan {
+                    Some((s, _)) if s != origin.scan => return None,
+                    _ => scan = Some((origin.scan, origin.relid)),
+                }
+            }
+            Some(node::Node::AConst(_)) => {}
+            Some(node::Node::TypeCast(c)) => todo.extend(c.arg.as_deref()),
+            Some(node::Node::CollateClause(c)) => todo.extend(c.arg.as_deref()),
+            Some(node::Node::FuncCall(f)) => todo.extend(f.args.iter()),
+            Some(node::Node::AExpr(e)) => {
+                todo.extend(e.lexpr.as_deref());
+                todo.extend(e.rexpr.as_deref());
+            }
+            _ => return None,
+        }
+    }
+    scan.map(|(_, relid)| relid)
 }
 
 /// `get_restriction_variable`'s test: the expression references columns

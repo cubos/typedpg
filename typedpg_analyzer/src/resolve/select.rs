@@ -34,6 +34,7 @@ pub(crate) fn analyze_correlated_select(
     // its nullability (outer joins, quals proven so far) down; the tiers
     // it received already carry their levels'.
     // Planned only when the expression around the sublink is.
+    let subplan = expr::plan_fold::next_level_is_subplan();
     let _skipped = expr::skipped_if(!expr::sublink_planned(expr::Ctx::new(
         outer_scope,
         outer_null_ctx,
@@ -75,6 +76,9 @@ pub(crate) fn analyze_correlated_select(
             &outer_scope.shadowed_sources,
         )
     })?;
+    // A planned sublink's plan is started — a SubPlan's always, a
+    // semi-join's unless the plan around it is a dummy one.
+    super::check_values_sort(sel, snapshot, subplan)?;
     resolve_unknown_outputs(sel, &mut cols, params, snapshot)?;
     Ok((cols, p))
 }
@@ -217,8 +221,8 @@ fn analyze_select_here(
     shadowed_sources: &[crate::scope::TableSource],
 ) -> AnalyzeResult {
     let _level = QueryLevel::enter();
-    let _plan =
-        expr::plan_fold::PlanLevel::enter(sel.where_clause.as_deref(), &sel.from_clause, snapshot);
+    let _plan = expr::plan_fold::PlanLevel::enter_select(sel, outer_ctes.keys(), snapshot);
+    super::deferred::record_target_list(sel, snapshot);
     let resolve_unknowns = !KEEP_UNKNOWN_OUTPUTS.with(|k| k.replace(false));
     // transformSetOperationStmt: an INTO on the leftmost member is the
     // statement's only where the statement is the top level, which
@@ -246,7 +250,9 @@ fn analyze_select_here(
             .chain(correlated_sources)
             .cloned()
             .collect();
-        cte_scopes = analyze_with_clause(with, snapshot, params, &cte_scopes, &outer)?;
+        cte_scopes = super::cte::with_clause_owner(sel, || {
+            analyze_with_clause(with, snapshot, params, &cte_scopes, &outer)
+        })?;
     }
 
     // Handle UNION/INTERSECT/EXCEPT. The set operation is a query level of
