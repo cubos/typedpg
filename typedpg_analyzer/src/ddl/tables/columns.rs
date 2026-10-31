@@ -857,7 +857,7 @@ fn add_column_to(
         atttypid: col.type_oid,
         attnum: next_attnum,
         attnotnull: false,
-        atthasdef: col.has_default,
+        atthasdef: col.has_default && !null_default,
         attgenerated: col.generated,
         atttypmod: col.typmod,
         // Identity is not inherited by regular children, but partitions
@@ -873,7 +873,7 @@ fn add_column_to(
         super::column_options::record_attr_storage(interp, relid, next_attnum, storage);
     }
     super::column_options::record_attr_compression(interp, relid, next_attnum, compression);
-    if let Some(default_type) = default_type {
+    if let Some(default_type) = default_type.filter(|_| !null_default) {
         interp
             .attr_default_types
             .insert((relid, next_attnum), default_type);
@@ -904,7 +904,7 @@ fn add_column_to(
         interp,
         relid,
         next_attnum,
-        column_default_expr(cd),
+        column_default_expr(cd).filter(|_| !null_default),
     );
     if !rec.recursing
         && let Some(deptype) = col.owned_sequence
@@ -1293,11 +1293,16 @@ pub(crate) fn set_default(
             )));
         }
     }
+    // ATExecColumnDefault → AddRelationNewConstraints: a default cooking
+    // to a null constant is stored as none (the column's default is NULL).
+    let mut stored = cmd.def.as_deref();
     if let Some(attr) = &attr {
-        match cmd.def.as_deref() {
-            Some(expr) => {
-                let default_type =
-                    crate::ddl::defaults::check_default(interp, expr, &cmd.name, attr.atttypid)?;
+        if let Some(expr) = stored {
+            let default_type =
+                crate::ddl::defaults::check_default(interp, expr, &cmd.name, attr.atttypid)?;
+            if crate::ddl::defaults::is_null_default(interp, expr, attr.atttypid, attr.atttypmod) {
+                stored = None;
+            } else {
                 interp
                     .attr_default_types
                     .insert((relid, attr.attnum), default_type);
@@ -1306,17 +1311,12 @@ pub(crate) fn set_default(
                     super::check_inherit::StoredExpr::written(expr),
                 );
             }
-            None => {
-                interp.attr_default_types.remove(&(relid, attr.attnum));
-                interp.attr_default_exprs.remove(&(relid, attr.attnum));
-            }
         }
-        crate::ddl::defaults::record_default_dependencies(
-            interp,
-            relid,
-            attr.attnum,
-            cmd.def.as_deref(),
-        );
+        if stored.is_none() {
+            interp.attr_default_types.remove(&(relid, attr.attnum));
+            interp.attr_default_exprs.remove(&(relid, attr.attnum));
+        }
+        crate::ddl::defaults::record_default_dependencies(interp, relid, attr.attnum, stored);
     }
     if rec.recurse {
         for child in inherit::children_of(interp, relid) {
@@ -1337,7 +1337,7 @@ pub(crate) fn set_default(
             cmd.name
         )));
     };
-    col.atthasdef = cmd.def.is_some();
+    col.atthasdef = stored.is_some();
     Ok(())
 }
 
