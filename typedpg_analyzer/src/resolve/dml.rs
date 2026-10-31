@@ -1157,13 +1157,33 @@ pub(crate) fn default_fold_error(
     )
 }
 
-/// Whether column `c`'s default is NULL: no DEFAULT, identity or
-/// generation expression, nor one its domain gives it.
+/// Whether column `c`'s default is NULL: no identity or generation
+/// expression, and either a stored DEFAULT that is NULL (see
+/// [`stored_default_is_null`]) or no DEFAULT at all, nor one its domain
+/// gives it.
 pub(crate) fn null_default(c: &crate::pg_catalog::PgAttribute, snapshot: &PgCatalog) -> bool {
-    !c.atthasdef
-        && c.attidentity.is_none()
+    c.attidentity.is_none()
         && c.attgenerated.is_none()
-        && !snapshot.domain_has_default(c.atttypid)
+        && if c.atthasdef {
+            stored_default_is_null(c, snapshot)
+        } else {
+            !snapshot.domain_has_default(c.atttypid)
+        }
+}
+
+/// Whether column `c`'s stored DEFAULT evaluates to NULL. A default
+/// cooking to a bare null constant is never stored (AddRelationNewConstraints),
+/// but on a domain column it cooks to a CoerceToDomain over the null
+/// constant, which PG keeps — overriding the domain's own default — and
+/// which still yields NULL. So does `DEFAULT NULL` on a column whose typmod
+/// adds a (strict) length coercion. A NULL cast to another type is left
+/// out: a cast function needn't keep a NULL NULL.
+fn stored_default_is_null(c: &crate::pg_catalog::PgAttribute, snapshot: &PgCatalog) -> bool {
+    matches!(
+        snapshot.attr_default_exprs.get(&(c.attrelid, c.attnum)),
+        Some(crate::ddl::tables::check_inherit::StoredExpr::Written(e))
+            if is_null_value(e, c.atttypid, None, snapshot)
+    )
 }
 
 /// The columns a VALUES row (`items`; none for DEFAULT VALUES) leaves to
@@ -1192,27 +1212,10 @@ fn omitted_domain_nulls(
         .filter(|(_, v)| !is_set_to_default(v))
         .filter_map(|(i, _)| target_col_at(tgt, i).map(|c| c.attname.as_str()))
         .collect();
-    // `DEFAULT NULL` (cast or not).
-    fn null_constant(e: &protobuf::Node) -> bool {
-        match e.node.as_ref() {
-            Some(node::Node::AConst(k)) => k.isnull,
-            Some(node::Node::TypeCast(tc)) => tc.arg.as_deref().is_some_and(null_constant),
-            _ => false,
-        }
-    }
-    let null_column_default = |c: &crate::pg_catalog::PgAttribute| {
-        !c.atthasdef
-            || matches!(
-                snapshot.attr_default_exprs.get(&(tgt.oid, c.attnum)),
-                Some(crate::ddl::tables::check_inherit::StoredExpr::Written(e)) if null_constant(e)
-            )
-    };
     tgt.attrs
         .iter()
         .filter(|c| c.attnum > 0 && !given.contains(&c.attname.as_str()))
-        .filter(|c| c.attidentity.is_none() && c.attgenerated.is_none() && null_column_default(c))
-        // A DEFAULT NULL of the column's own overrides the domain's.
-        .filter(|c| c.atthasdef || !snapshot.domain_has_default(c.atttypid))
+        .filter(|c| null_default(c, snapshot))
         .filter_map(|c| {
             let msg = snapshot.domain_null_violation_at_execution(c.atttypid)?;
             Some(RowViolation {

@@ -1063,18 +1063,40 @@ pub(crate) fn validate_constraint_expressions(
         {
             let default_type =
                 crate::ddl::defaults::check_default(interp, expr, &cd.colname, attr.atttypid)?;
-            interp
-                .attr_default_types
-                .insert((class_oid, attr.attnum), default_type);
-            interp.attr_default_exprs.insert(
-                (class_oid, attr.attnum),
-                super::check_inherit::StoredExpr::written(expr),
-            );
+            // AddRelationNewConstraints stores no default that cooks to a
+            // null constant: the column has none — not even an inherited
+            // one, which this local DEFAULT overrides.
+            let stored = (!crate::ddl::defaults::is_null_default(
+                interp,
+                expr,
+                attr.atttypid,
+                attr.atttypmod,
+            ))
+            .then_some(expr);
+            if stored.is_some() {
+                interp
+                    .attr_default_types
+                    .insert((class_oid, attr.attnum), default_type);
+                interp.attr_default_exprs.insert(
+                    (class_oid, attr.attnum),
+                    super::check_inherit::StoredExpr::written(expr),
+                );
+            } else {
+                interp.attr_default_types.remove(&(class_oid, attr.attnum));
+                interp.attr_default_exprs.remove(&(class_oid, attr.attnum));
+                if let Some(a) = interp
+                    .pg_attribute
+                    .get_mut(&class_oid)
+                    .and_then(|attrs| attrs.iter_mut().find(|a| a.attnum == attr.attnum))
+                {
+                    a.atthasdef = false;
+                }
+            }
             crate::ddl::defaults::record_default_dependencies(
                 interp,
                 class_oid,
                 attr.attnum,
-                Some(expr),
+                stored,
             );
         }
         for c_node in &cd.constraints {
