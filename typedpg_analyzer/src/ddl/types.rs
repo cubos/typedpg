@@ -77,6 +77,7 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
     let mut constraints: Vec<DomainConstraint> = Vec::new();
     let mut saw_default = false;
     let mut has_default = false;
+    let mut default_refs: Vec<super::depend::Reference> = Vec::new();
     let mut null_defined = false;
     let mut typ_not_null = false;
     for n in &stmt.constraints {
@@ -149,7 +150,11 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
         if c.contype == ConstrType::ConstrDefault as i32
             && let Some(expr) = c.raw_expr.as_deref()
         {
-            super::defaults::check_default(interp, expr, &name, base_type_oid)?;
+            let (checked, refs) = super::depend::collect(|| {
+                super::defaults::check_default(interp, expr, &name, base_type_oid)
+            });
+            checked?;
+            default_refs = refs;
             has_default = !is_null_constant(expr);
         }
         add_domain_constraint(interp, &name, base_type_oid, c, &mut constraints)?;
@@ -188,6 +193,20 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
         typisdefined: true,
     });
 
+    // GenerateTypeDependencies: a domain depends on its base type.
+    super::depend::record(
+        interp,
+        super::depend::ObjectAddress::type_(oid),
+        [super::depend::ObjectAddress::type_(base_type_oid)],
+        crate::pg_catalog::DepType::Normal,
+    );
+    // ... and on what its default refers to.
+    super::depend::record_references(
+        interp,
+        super::depend::ObjectAddress::type_(oid),
+        &default_refs,
+        crate::pg_catalog::DepType::Normal,
+    );
     register_array_type(interp, nsoid, &name, oid)?;
     if has_default {
         interp.domain_defaults.insert(oid);
@@ -553,9 +572,31 @@ pub fn alter_domain(
         // SET DEFAULT: cooked like the domain's own DEFAULT
         // (AlterDomainDefault). DROP DEFAULT has no effect on typing.
         "T" => {
+            let mut default_refs = Vec::new();
             if let Some(expr) = stmt.def.as_deref() {
-                super::defaults::check_default(interp, expr, name, base_type)?;
+                let (checked, refs) = super::depend::collect(|| {
+                    super::defaults::check_default(interp, expr, name, base_type)
+                });
+                checked?;
+                default_refs = refs;
             }
+            // GenerateTypeDependencies(rebuild): the domain's dependencies
+            // are recorded anew — on its base type and what the new default
+            // refers to.
+            let addr = super::depend::ObjectAddress::type_(type_oid);
+            super::depend::forget_dependencies_of(interp, addr);
+            super::depend::record(
+                interp,
+                addr,
+                [super::depend::ObjectAddress::type_(base_type)],
+                crate::pg_catalog::DepType::Normal,
+            );
+            super::depend::record_references(
+                interp,
+                addr,
+                &default_refs,
+                crate::pg_catalog::DepType::Normal,
+            );
             match stmt.def.as_deref() {
                 Some(expr) if !is_null_constant(expr) => {
                     interp.domain_defaults.insert(type_oid);
@@ -855,6 +896,7 @@ pub fn create_range(interp: &mut PgCatalog, stmt: &CreateRangeStmt) -> Result<()
         .pg_type
         .get(&subtype_oid)
         .is_some_and(|t| t.typcollation.is_some());
+    // DefineRange: the collation given, else the subtype's.
     let mut collation = interp
         .pg_type
         .get(&subtype_oid)
@@ -992,6 +1034,21 @@ pub fn create_range(interp: &mut PgCatalog, stmt: &CreateRangeStmt) -> Result<()
         typisdefined: true,
     });
     register_array_type(interp, mr_nsoid, &mr_name, mr_oid)?;
+    // The multirange type is part of the range type (DefineRange:
+    // DEPENDENCY_INTERNAL).
+    super::depend::record(
+        interp,
+        super::depend::ObjectAddress::type_(mr_oid),
+        [super::depend::ObjectAddress::type_(oid)],
+        crate::pg_catalog::DepType::Internal,
+    );
+    // RangeCreate: the range type depends on its collation.
+    super::depend::record(
+        interp,
+        super::depend::ObjectAddress::type_(oid),
+        collation.map(super::depend::ObjectAddress::collation),
+        crate::pg_catalog::DepType::Normal,
+    );
     interp.insert_pg_range(PgRange {
         rngtypid: oid,
         rngsubtype: subtype_oid,
@@ -1021,13 +1078,31 @@ pub fn create_range(interp: &mut PgCatalog, stmt: &CreateRangeStmt) -> Result<()
             false,
             false,
         ),
-        (&mr_name, mr_nsoid, vec![], mr_oid, true, false),
-        (&mr_name, mr_nsoid, vec![oid], mr_oid, true, false),
-        (&mr_name, mr_nsoid, vec![range_array], mr_oid, true, true),
+        (&mr_name, nsoid, vec![], mr_oid, true, false),
+        (&mr_name, nsoid, vec![oid], mr_oid, true, false),
+        (&mr_name, nsoid, vec![range_array], mr_oid, true, true),
     ];
     let mut range_to_multirange = None;
     for (proname, pronamespace, proargtypes, prorettype, proisstrict, variadic) in constructors {
         let proc_oid = crate::oid::PgProcOid::from_nonzero(interp.alloc_oid()?);
+        // A constructor is part of the type it builds (DEPENDENCY_INTERNAL)
+        // and depends on its argument types like any function.
+        let proc_addr = super::depend::ObjectAddress::proc(proc_oid);
+        super::depend::record(
+            interp,
+            proc_addr,
+            proargtypes
+                .iter()
+                .copied()
+                .map(super::depend::ObjectAddress::type_),
+            crate::pg_catalog::DepType::Normal,
+        );
+        super::depend::record(
+            interp,
+            proc_addr,
+            [super::depend::ObjectAddress::type_(prorettype)],
+            crate::pg_catalog::DepType::Internal,
+        );
         if prorettype == mr_oid && proargtypes == [oid] {
             range_to_multirange = Some(proc_oid);
         }
@@ -1058,30 +1133,34 @@ pub fn create_range(interp: &mut PgCatalog, stmt: &CreateRangeStmt) -> Result<()
             prolang: crate::pg_catalog::INTERNAL_LANGUAGE,
         });
     }
-    // DefineRange: the explicit range → multirange cast, through the
-    // one-range constructor, internal to the types (CastCreate with
-    // DEPENDENCY_INTERNAL: it goes when they go).
-    let cast_oid = PgCastOid::from_nonzero(interp.alloc_oid()?);
-    interp.insert_pg_cast(PgCast {
-        oid: cast_oid,
-        castsource: oid,
-        casttarget: mr_oid,
-        castcontext: CastContext::Explicit,
-        castmethod: CastMethod::Function,
-        castfunc: range_to_multirange,
-    });
-    super::depend::record(
-        interp,
-        super::depend::ObjectAddress::cast(cast_oid),
-        range_to_multirange
-            .map(super::depend::ObjectAddress::proc)
-            .into_iter()
-            .chain([
-                super::depend::ObjectAddress::type_(oid),
-                super::depend::ObjectAddress::type_(mr_oid),
-            ]),
-        crate::pg_catalog::DepType::Internal,
-    );
+    // makeMultirangeConstructors: the explicit cast from the range to its
+    // multirange, through `mr(range)`, is part of that function
+    // (CastCreate with DEPENDENCY_INTERNAL on the function and both types;
+    // record_object_address_dependencies stores them newest OID first, so
+    // a DROP CAST names the function as what requires it).
+    if let Some(castfunc) = range_to_multirange {
+        let cast_oid = PgCastOid::from_nonzero(interp.alloc_oid()?);
+        interp.insert_pg_cast(PgCast {
+            oid: cast_oid,
+            castsource: oid,
+            casttarget: mr_oid,
+            castcontext: CastContext::Explicit,
+            castmethod: CastMethod::Function,
+            castfunc: Some(castfunc),
+        });
+        for owner in [
+            super::depend::ObjectAddress::proc(castfunc),
+            super::depend::ObjectAddress::type_(mr_oid),
+            super::depend::ObjectAddress::type_(oid),
+        ] {
+            super::depend::record(
+                interp,
+                super::depend::ObjectAddress::cast(cast_oid),
+                [owner],
+                crate::pg_catalog::DepType::Internal,
+            );
+        }
+    }
     super::depend::record(
         interp,
         super::depend::ObjectAddress::type_(oid),

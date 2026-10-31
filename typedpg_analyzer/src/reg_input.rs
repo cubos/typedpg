@@ -36,7 +36,11 @@ pub(crate) fn validate(typname: &str, content: &str, snapshot: &PgCatalog) -> Re
     }
     match typname {
         "regtype" => regtype_in(content, snapshot),
-        "regprocedure" | "regoperator" => name_and_arg_types(content).map(|_| ()),
+        "regprocedure" | "regoperator" => {
+            name_and_arg_types(content)?;
+            note_routine_or_operator(typname, content, snapshot);
+            Ok(())
+        }
         _ => {
             let names = qualified_name_list(content)?;
             lookup_by_names(typname, content, &names, snapshot)
@@ -186,19 +190,30 @@ fn lookup_by_names(
             if schema.is_some_and(|s| snapshot.namespace_oid(s).is_none()) {
                 return Err(not_found(typname, content));
             }
-            let count = if typname == "regproc" {
-                snapshot.find_functions(schema, name).len()
+            use crate::ddl::depend::{ObjectAddress, note};
+            let found: Vec<ObjectAddress> = if typname == "regproc" {
+                snapshot
+                    .find_functions(schema, name)
+                    .iter()
+                    .map(|p| ObjectAddress::proc(p.oid))
+                    .collect()
             } else {
                 let path = snapshot.schemas_for_lookup(schema);
                 snapshot
                     .pg_operator
                     .values()
                     .filter(|o| o.oprname == name && path.contains(&o.oprnamespace))
-                    .count()
+                    .map(|o| ObjectAddress::operator(o.oid))
+                    .collect()
             };
-            match count {
-                0 => Err(not_found(typname, content)),
-                1 => Ok(()),
+            match found.as_slice() {
+                [] => Err(not_found(typname, content)),
+                // A stored constant depends on what it names
+                // (find_expr_references_walker).
+                [object] => {
+                    note(*object);
+                    Ok(())
+                }
                 _ if typname == "regproc" => {
                     Err(format!("more than one function named \"{content}\""))
                 }
@@ -209,25 +224,35 @@ fn lookup_by_names(
             let [name] = names else {
                 return Err(invalid_name_syntax());
             };
-            if typname == "regnamespace"
-                && snapshot.namespace_oid(name).is_none()
-                && !is_system_schema(name)
-            {
-                return Err(format!("schema \"{name}\" does not exist"));
+            if typname == "regnamespace" {
+                match snapshot.namespace_oid(name) {
+                    // A stored `regnamespace` constant depends on its
+                    // schema (find_expr_references_walker).
+                    Some(ns) => {
+                        crate::ddl::depend::note(crate::ddl::depend::ObjectAddress::namespace(ns))
+                    }
+                    None if !is_system_schema(name) => {
+                        return Err(format!("schema \"{name}\" does not exist"));
+                    }
+                    None => {}
+                }
             }
             // Roles are not modelled.
             Ok(())
         }
         "regcollation" => {
             let (schema, name) = deconstruct(names)?;
-            if schema.is_some_and(|s| snapshot.namespace_oid(s).is_none())
-                || snapshot.resolve_collation(schema, name).is_none()
-            {
+            let found = schema
+                .is_none_or(|s| snapshot.namespace_oid(s).is_some())
+                .then(|| snapshot.resolve_collation(schema, name))
+                .flatten();
+            let Some(collation) = found else {
                 return Err(format!(
                     "collation \"{}\" for encoding \"UTF8\" does not exist",
                     joined(names)
                 ));
-            }
+            };
+            crate::ddl::depend::note(crate::ddl::depend::ObjectAddress::collation(collation.oid));
             Ok(())
         }
         "regconfig" | "regdictionary" => {
@@ -342,9 +367,55 @@ fn regtype_in(content: &str, snapshot: &PgCatalog) -> Result<(), String> {
         crate::ddl::DdlError::TypeNotFound(msg) | crate::ddl::DdlError::Parse(msg) => msg,
         other => other.to_string(),
     })?;
-    crate::typmod::encode(snapshot, t, tn)
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+    crate::typmod::encode(snapshot, t, tn).map_err(|e| e.to_string())?;
+    // A stored constant depends on its type (find_expr_references_walker).
+    crate::ddl::depend::note(crate::ddl::depend::ObjectAddress::type_(t));
+    Ok(())
+}
+
+/// A stored `regprocedure` / `regoperator` constant depends on the
+/// routine / operator it names (find_expr_references_walker): `content`
+/// (`name(argtypes)`) is looked up as DROP FUNCTION / OPERATOR would.
+/// Nothing is noted when it isn't found — the input itself is not
+/// validated here.
+fn note_routine_or_operator(typname: &str, content: &str, snapshot: &PgCatalog) {
+    use typedpg_pg_query::protobuf::{ObjectType, node};
+    if !crate::ddl::depend::collecting() {
+        return;
+    }
+    let keyword = if typname == "regprocedure" {
+        "ROUTINE"
+    } else {
+        "OPERATOR"
+    };
+    let Ok(parsed) = typedpg_pg_query::parse(&format!("DROP {keyword} {content}")) else {
+        return;
+    };
+    let [stmt] = parsed.protobuf.stmts.as_slice() else {
+        return;
+    };
+    let Some(node::Node::DropStmt(drop)) = stmt.stmt.as_deref().and_then(|n| n.node.as_ref())
+    else {
+        return;
+    };
+    let [object] = drop.objects.as_slice() else {
+        return;
+    };
+    let address = if typname == "regprocedure" {
+        let Some(node::Node::ObjectWithArgs(owa)) = object.node.as_ref() else {
+            return;
+        };
+        crate::ddl::functions::lookup_func_with_args(snapshot, ObjectType::ObjectRoutine, owa, true)
+            .ok()
+            .flatten()
+            .map(crate::ddl::depend::ObjectAddress::proc)
+    } else {
+        crate::ddl::drop::operator_target(snapshot, object)
+            .map(crate::ddl::depend::ObjectAddress::operator)
+    };
+    if let Some(address) = address {
+        crate::ddl::depend::note(address);
+    }
 }
 
 /// `parseNameAndArgTypes`: `name(type, …)` — the parentheses are checked

@@ -65,6 +65,7 @@ pub fn rename(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlError>
         ObjectType::ObjectPublication => crate::ddl::publications::rename_publication(interp, stmt),
         ObjectType::ObjectLanguage => crate::ddl::languages::rename_language(interp, stmt),
         ObjectType::ObjectConversion => crate::ddl::conversions::rename_conversion(interp, stmt),
+        ObjectType::ObjectCollation => crate::ddl::collations::rename_collation(interp, stmt),
         ObjectType::ObjectEventTrigger => {
             crate::ddl::event_triggers::rename_event_trigger(interp, stmt)
         }
@@ -462,6 +463,10 @@ pub fn set_schema(interp: &mut PgCatalog, stmt: &AlterObjectSchemaStmt) -> Resul
             | ObjectType::ObjectSequence
     ) {
         return set_relation_schema(interp, stmt, object_type, &new_schema);
+    }
+    // The collation is looked up before the schema.
+    if object_type == ObjectType::ObjectCollation {
+        return crate::ddl::collations::set_collation_schema(interp, stmt);
     }
     let new_nsoid = crate::ddl::util::existing_namespace(interp, &new_schema)?;
 

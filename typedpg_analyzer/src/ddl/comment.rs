@@ -307,18 +307,10 @@ pub(crate) fn resolve_object(
             }
         }
         ObjectType::ObjectCollation => {
-            let parts = names(object);
-            let (schema, name) = match parts.as_slice() {
-                [name] => (None, name.as_str()),
-                [schema, name] => (Some(schema.as_str()), name.as_str()),
-                _ => return Ok(()),
+            let list = typedpg_pg_query::protobuf::Node {
+                node: Some(object.clone()),
             };
-            if interp.resolve_collation(schema, name).is_none() {
-                return Err(DdlError::TypeNotFound(format!(
-                    "collation \"{}\" for encoding \"UTF8\" does not exist",
-                    parts.join(".")
-                )));
-            }
+            super::collations::lookup_collation(interp, &list, false)?;
         }
         ObjectType::ObjectTrigger | ObjectType::ObjectPolicy | ObjectType::ObjectRule => {
             let parts = names(object);
@@ -404,7 +396,7 @@ pub(crate) fn resolve_object(
             };
             let source = super::util::lookup_type_name(source, interp)?;
             let target = super::util::lookup_type_name(target, interp)?;
-            if !interp.cast_by_pair.contains_key(&(source, target)) {
+            if interp.catalog_cast(source, target).is_none() {
                 return Err(DdlError::TypeNotFound(format!(
                     "cast from type {} to type {} does not exist",
                     super::util::format_type_for_message(interp, source),

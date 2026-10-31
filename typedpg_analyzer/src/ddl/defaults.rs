@@ -255,7 +255,12 @@ pub(crate) fn record_default_dependencies(
     }
     // Functions, operators, types, ... the expression refers to.
     if let Some(expr) = expr {
-        let refs = super::depend::expression_references(interp, expr, Some(relid));
+        let target = interp
+            .attributes_of(relid)
+            .iter()
+            .find(|a| a.attnum == attnum)
+            .map(|a| a.atttypid);
+        let refs = super::depend::coerced_expression_references(interp, expr, Some(relid), target);
         super::depend::record_references(
             interp,
             super::depend::ObjectAddress::column(relid, attnum),
@@ -355,14 +360,31 @@ fn collect_sequence_refs(
     }
 }
 
-/// The text of `'name'` or `'name'::regclass`.
+/// The text of `'name'` or `'name'::regclass`: a regclass constant, the
+/// only argument find_expr_references_walker records a relation for. A
+/// literal cast to another type first (`'name'::text`) reaches the
+/// function through a run-time cast, which names no relation.
 fn regclass_literal(node: &protobuf::Node) -> Option<&str> {
     match node.node.as_ref()? {
         node::Node::AConst(c) => match c.val.as_ref()? {
             typedpg_pg_query::protobuf::a_const::Val::Sval(s) => Some(s.sval.as_str()),
             _ => None,
         },
-        node::Node::TypeCast(tc) => regclass_literal(tc.arg.as_deref()?),
+        node::Node::TypeCast(tc) => {
+            let type_name = tc.type_name.as_ref()?;
+            if !type_name.array_bounds.is_empty() {
+                return None;
+            }
+            let names: Vec<&str> = type_name
+                .names
+                .iter()
+                .filter_map(super::util::node_string)
+                .collect();
+            match names.as_slice() {
+                ["regclass"] | ["pg_catalog", "regclass"] => regclass_literal(tc.arg.as_deref()?),
+                _ => None,
+            }
+        }
         _ => None,
     }
 }

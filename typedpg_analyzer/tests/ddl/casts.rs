@@ -194,3 +194,39 @@ fn create_cast_checks_its_function_and_types() {
         ),
     ]);
 }
+
+#[test]
+fn a_row_type_coerces_to_record_without_a_cast() {
+    // PG coerces a row type to `record` with no pg_cast row: there is no
+    // cast to drop or comment on.
+    let setup = "CREATE TYPE c AS (a int); CREATE TABLE t (a int);";
+    assert_ddl_rejections(&[
+        (
+            setup,
+            "DROP CAST (c AS record);",
+            "cast from type c to type record does not exist",
+        ),
+        (
+            setup,
+            "DROP CAST (t AS record);",
+            "cast from type t to type record does not exist",
+        ),
+        (
+            setup,
+            "COMMENT ON CAST (c AS record) IS 'x';",
+            "cast from type c to type record does not exist",
+        ),
+        // DROP CAST names a type the way typenameTypeId does.
+        (
+            "",
+            "DROP CAST (nonexist AS int4);",
+            "type \"nonexist\" does not exist",
+        ),
+    ]);
+    build(&[(
+        "0001.sql",
+        "CREATE TYPE c AS (a int);
+         DROP CAST IF EXISTS (c AS record);
+         DROP CAST IF EXISTS (nonexist AS int4);",
+    )]);
+}

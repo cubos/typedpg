@@ -536,8 +536,9 @@ pub(crate) fn target_resname(rt: &protobuf::ResTarget) -> String {
         .unwrap_or_else(|| "?column?".to_string())
 }
 
-/// Try to infer a default column name from an expression (for unaliased columns).
-pub(super) fn infer_column_name(node: &protobuf::Node) -> Option<String> {
+/// Try to infer a default column name from an expression (for unaliased
+/// columns, and an index expression's column, `FigureIndexColname`).
+pub(crate) fn infer_column_name(node: &protobuf::Node) -> Option<String> {
     figure_colname(node).1
 }
 

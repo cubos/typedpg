@@ -1121,6 +1121,25 @@ pub(crate) fn drop_column(
             })
             .map(|c| c.oid)
             .collect();
+        // What depends on those constraints in turn (a stored INSERT ... ON
+        // CONFLICT ON CONSTRAINT, a query relying on a primary key for its
+        // GROUP BY) needs CASCADE, and goes with them.
+        let column_desc = crate::ddl::depend::describe(
+            interp,
+            crate::ddl::depend::ObjectAddress::column(relid, an),
+        );
+        for &oid in &always_drop {
+            crate::ddl::depend::drop_member_dependents(
+                interp,
+                crate::ddl::depend::ObjectAddress::new(
+                    crate::ddl::depend::PG_CONSTRAINT_RELID,
+                    oid.into_nonzero(),
+                    0,
+                ),
+                &column_desc,
+                cascade,
+            )?;
+        }
         for oid in always_drop {
             interp.pg_constraint.remove(&oid);
         }

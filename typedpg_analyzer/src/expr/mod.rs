@@ -1230,6 +1230,9 @@ fn infer_expr_unlocated(
                 let r = snapshot
                     .resolve_collation(schema, name)
                     .ok_or_else(|| crate::pgmsg::collation_does_not_exist(&parts.join(".")))?;
+                // A CollateExpr depends on its collation
+                // (find_expr_references_walker).
+                crate::ddl::depend::note(crate::ddl::depend::ObjectAddress::collation(r.oid));
                 Some(r.oid)
             };
             let result = infer_expr(arg, ctx, params, goal)?;

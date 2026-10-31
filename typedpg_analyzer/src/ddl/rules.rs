@@ -44,7 +44,25 @@ pub(crate) struct Rule {
     pub(crate) action_cmds: Vec<CmdType>,
 }
 
-pub fn create_rule(interp: &mut PgCatalog, stmt: &RuleStmt) -> Result<(), DdlError> {
+/// CREATE RULE. Returns what the rule's qualification and actions refer
+/// to, as their analysis found it — what InsertRule records the rule's
+/// dependencies on (recordDependencyOnExpr over the transformed queries:
+/// an INSERT's target columns after `*` expansion, the columns ON CONFLICT
+/// reads, ...).
+pub(crate) fn create_rule(
+    interp: &mut PgCatalog,
+    stmt: &RuleStmt,
+) -> Result<Vec<super::depend::Reference>, DdlError> {
+    let mut references = Vec::new();
+    define_rule(interp, stmt, &mut references)?;
+    Ok(references)
+}
+
+fn define_rule(
+    interp: &mut PgCatalog,
+    stmt: &RuleStmt,
+    references: &mut Vec<super::depend::Reference>,
+) -> Result<(), DdlError> {
     let Some(rv) = stmt.relation.as_ref() else {
         return Ok(());
     };
@@ -122,7 +140,10 @@ pub fn create_rule(interp: &mut PgCatalog, stmt: &RuleStmt) -> Result<(), DdlErr
         };
     if let Some(qual) = stmt.where_clause.as_deref() {
         pseudo_refs(qual, true)?;
-        check_rule_qual(interp, relid, qual, has_old, has_new)?;
+        let (checked, refs) =
+            super::depend::collect(|| check_rule_qual(interp, relid, qual, has_old, has_new));
+        checked?;
+        references.extend(refs);
     }
     let mut actions = Vec::new();
     // Each action's output columns, when the analysis could tell them.
@@ -130,10 +151,11 @@ pub fn create_rule(interp: &mut PgCatalog, stmt: &RuleStmt) -> Result<(), DdlErr
     for action in &stmt.actions {
         pseudo_refs(action, false)?;
         check_action_relations(interp, action)?;
-        let (checked, rewrites) = crate::resolve::rewrite::collect_rule_actions(|| {
-            check_action_query(interp, relid, action, has_old, has_new)
+        let ((checked, refs), rewrites) = crate::resolve::rewrite::collect_rule_actions(|| {
+            super::depend::collect(|| check_action_query(interp, relid, action, has_old, has_new))
         });
         outputs.push(checked?);
+        references.extend(refs);
         actions.extend(rewrites);
         // transformRuleStmt: a conditional rule's action must be a query
         // (the condition is added to it); NOTIFY is a utility statement.

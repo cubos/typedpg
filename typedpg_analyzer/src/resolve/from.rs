@@ -623,12 +623,15 @@ fn process_range_function(
     let arg_ctx = expr::Ctx::new(&arg_scope, null_ctx, snapshot).logging_strictness(&log);
     let nfuncs = funcs.len();
     let mut cols: Vec<ScopeColumn> = Vec::new();
+    let mut rowtype_columns: Vec<Option<(crate::oid::PgClassOid, String)>> = Vec::new();
     let mut whole_row = crate::scope::WholeRow::Record;
     let mut rows = RteFunctionRows::default();
     // EXPR_KIND_FROM_FUNCTION: no aggregate or window call of this level,
     // in the call itself or in a sublink of its arguments.
     crate::grouping::with_clause(Some("functions in FROM"), || {
         for f in &funcs {
+            let start = cols.len();
+            whole_row = crate::scope::WholeRow::Record;
             cols.extend(function_rte_columns(
                 f,
                 alias,
@@ -638,6 +641,18 @@ fn process_range_function(
                 &mut whole_row,
                 &mut rows,
             )?);
+            // A named composite result: its columns are its relation's.
+            let rowtype = match whole_row {
+                crate::scope::WholeRow::Composite(t) => {
+                    snapshot.get_type(t).and_then(|t| t.typrelid)
+                }
+                _ => None,
+            };
+            rowtype_columns.extend(
+                cols[start..]
+                    .iter()
+                    .map(|c| rowtype.map(|relid| (relid, c.name.clone()))),
+            );
             crate::clause::check_level_calls(&f.node(), arg_ctx, "functions in FROM", true)?;
         }
         Ok::<(), AnalyzeError>(())
@@ -721,6 +736,7 @@ fn process_range_function(
     if let Some(src) = scope.sources.last_mut() {
         src.whole_row = whole_row;
         src.min_one_row = rows.min_one_row;
+        src.rowtype_columns = rowtype_columns;
     }
     Ok(())
 }

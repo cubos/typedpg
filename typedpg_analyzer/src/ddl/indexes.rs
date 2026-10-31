@@ -1142,25 +1142,12 @@ pub(crate) fn check_index_columns(
     Ok(())
 }
 
-/// `FigureIndexColname`: a function call is named after the function, a
-/// column reference after the column (through casts), anything else `expr`.
+/// `FigureIndexColname`: the name `FigureColnameInternal` gives the
+/// expression as a select-list item — a column, a function, a cast's
+/// type, `case`, ... — or `expr` when it has none.
 pub(crate) fn figure_index_colname(expr: Option<&typedpg_pg_query::protobuf::Node>) -> String {
-    match expr.and_then(|e| e.node.as_ref()) {
-        Some(node::Node::FuncCall(fc)) => fc
-            .funcname
-            .last()
-            .and_then(super::util::node_string)
-            .unwrap_or("expr")
-            .to_owned(),
-        Some(node::Node::ColumnRef(cr)) => cr
-            .fields
-            .last()
-            .and_then(super::util::node_string)
-            .unwrap_or("expr")
-            .to_owned(),
-        Some(node::Node::TypeCast(tc)) => figure_index_colname(tc.arg.as_deref()),
-        _ => "expr".to_owned(),
-    }
+    expr.and_then(crate::resolve::infer_column_name)
+        .unwrap_or_else(|| "expr".to_owned())
 }
 
 /// Encode a `typedpg_pg_query::Node` as a `SerializedAst` (protobuf bytes + an

@@ -73,6 +73,15 @@ fn drop_each(
         if targets[i].is_some() && targets[..i].contains(&targets[i]) {
             continue;
         }
+        // An earlier target took it along (`DROP TYPE e, e[]`: the array
+        // is part of its element type): performMultipleDeletions deletes
+        // them together.
+        if let Some((_, oid)) = targets[i]
+            && let Some(addr) = super::depend::ObjectAddress::of_drop_target(obj_type, oid)
+            && !super::depend::object_exists(interp, addr)
+        {
+            continue;
+        }
         match obj_type {
             ObjectType::ObjectTable
             | ObjectType::ObjectView
@@ -92,7 +101,18 @@ fn drop_each(
                 if obj_type == ObjectType::ObjectDomain
                     && let Some(node::Node::TypeName(tn)) = obj_node.node.as_ref()
                 {
-                    super::types::check_is_domain(interp, &tn.names)?;
+                    // get_object_address_type: `"d[]" is not a domain`.
+                    if let Ok(oid) = super::util::lookup_type_name(tn, interp)
+                        && interp
+                            .pg_type
+                            .get(&oid)
+                            .is_some_and(|t| t.typtype != crate::pg_catalog::TypType::Domain)
+                    {
+                        return Err(DdlError::UnsupportedDdl(format!(
+                            "\"{}\" is not a domain",
+                            super::util::type_name_to_string(tn)
+                        )));
+                    }
                 }
                 drop_type(interp, obj_node, stmt.missing_ok, cascade)?;
             }
@@ -104,6 +124,9 @@ fn drop_each(
             }
             ObjectType::ObjectCast => {
                 drop_cast(interp, obj_node, stmt.missing_ok, cascade)?;
+            }
+            ObjectType::ObjectCollation => {
+                super::collations::drop_collation(interp, obj_node, stmt.missing_ok, cascade)?;
             }
             ObjectType::ObjectOperator => {
                 drop_operator(interp, obj_node, stmt.missing_ok, cascade)?;
@@ -251,6 +274,18 @@ fn drop_relation(
             "permission denied: \"{name}\" is a system catalog"
         )));
     }
+    // findDependentObjects checks first that the relation may be dropped
+    // at all: not part of another object (an identity column's sequence,
+    // an extension's member).
+    let desc = format!(
+        "{kind} {}",
+        super::depend::relation_display_name(interp, class_oid)
+    );
+    super::depend::check_not_owned(
+        interp,
+        super::depend::ObjectAddress::relation(class_oid),
+        &desc,
+    )?;
     drop_relation_oid(interp, class_oid, kind, cascade, named_relations, None)
 }
 
@@ -613,6 +648,13 @@ fn defaults_using_sequence(interp: &PgCatalog, seq: PgClassOid) -> Vec<(PgClassO
 /// the array wrapping the composite. Mirrors what `DROP TABLE` /
 /// `DROP VIEW` does in PG.
 pub(crate) fn drop_relation_by_oid(interp: &mut PgCatalog, class_oid: PgClassOid) {
+    // What depends on its row type (or the array over it) goes too: the
+    // type is part of the relation.
+    if let Some(row_type) = interp.pg_class.get(&class_oid).and_then(|c| c.reltype) {
+        let addr = super::depend::ObjectAddress::type_(row_type);
+        let desc = super::depend::describe(interp, addr);
+        let _ = super::depend::drop_dependents(interp, addr, &desc, true);
+    }
     // Sequences the relation owns (serial / identity / OWNED BY) go with it.
     let owned = super::sequences::owned_sequences(interp, class_oid, None);
     let Some(class) = interp.remove_pg_class(class_oid) else {
@@ -810,33 +852,50 @@ fn drop_type(
         _ => return Ok(()),
     };
 
-    let (schema, name) = extract_names(names, interp);
-    // typenameType's wording: the name as written.
-    let written = names
-        .iter()
-        .filter_map(node_string)
-        .collect::<Vec<_>>()
-        .join(".");
-    let Some(nsoid) = interp.namespace_oid(&schema) else {
-        if missing_ok {
-            return Ok(());
+    let type_oid = match obj_node.node.as_ref() {
+        // LookupTypeNameOid: `e[]` names e's array type.
+        Some(node::Node::TypeName(tn)) => match super::util::lookup_type_name(tn, interp) {
+            Ok(oid) => oid,
+            Err(_) if missing_ok => return Ok(()),
+            Err(e) => return Err(e),
+        },
+        _ => {
+            let (schema, name) = extract_names(names, interp);
+            // typenameType's wording: the name as written.
+            let written = names
+                .iter()
+                .filter_map(node_string)
+                .collect::<Vec<_>>()
+                .join(".");
+            let Some(nsoid) = interp.namespace_oid(&schema) else {
+                if missing_ok {
+                    return Ok(());
+                }
+                return Err(DdlError::TypeNotFound(format!(
+                    "schema \"{schema}\" does not exist"
+                )));
+            };
+            let Some(type_oid) = interp.type_by_qname.get(&(nsoid, name.clone())).copied() else {
+                if missing_ok {
+                    return Ok(());
+                }
+                return Err(DdlError::TypeNotFound(format!(
+                    "type \"{written}\" does not exist"
+                )));
+            };
+            type_oid
         }
-        return Err(DdlError::TypeNotFound(format!(
-            "schema \"{schema}\" does not exist"
-        )));
     };
-    let Some(type_oid) = interp.type_by_qname.get(&(nsoid, name.clone())).copied() else {
-        if missing_ok {
-            return Ok(());
-        }
-        return Err(DdlError::TypeNotFound(format!(
-            "type \"{written}\" does not exist"
-        )));
-    };
-    let deps = TypeDependents::of(interp, type_oid);
     // The messages name it as format_type_be does (qualified unless
     // visible), not as written.
     let name = format_type_for_message(interp, type_oid);
+    // findDependentObjects checks first that the type may be dropped at
+    // all: not a built-in one, nor part of another object (a range type's
+    // multirange, an array type's element, a table's row type).
+    let addr = super::depend::ObjectAddress::type_(type_oid);
+    let desc = format!("type {name}");
+    super::depend::check_not_owned(interp, addr, &desc)?;
+    let deps = TypeDependents::of(interp, type_oid);
 
     // Typed tables (`reloftype`) depend on their type.
     if let Some(&table) = deps.typed_tables.first()
@@ -890,10 +949,7 @@ fn drop_type(
         )));
     }
     // What else pg_depend knows depends on it (a cast, a base type's
-    // functions, ...), and whether it belongs to an extension.
-    let addr = super::depend::ObjectAddress::type_(type_oid);
-    let desc = format!("type {name}");
-    super::depend::check_not_owned(interp, addr, &desc)?;
+    // functions, ...).
     super::depend::drop_dependents(interp, addr, &desc, cascade)?;
     drop_type_oid(interp, type_oid, deps);
     Ok(())
@@ -931,19 +987,21 @@ impl TypeDependents {
             )
             .flatten()
             .collect();
-        let constructors: Vec<crate::oid::PgProcOid> = interp
-            .pg_proc
-            .values()
-            .filter(|p| {
-                (p.prorettype == type_oid || Some(p.prorettype) == multirange)
-                    && multirange.is_some()
-                    && interp
-                        .pg_type
-                        .get(&p.prorettype)
-                        .is_some_and(|t| t.typname == p.proname && t.typnamespace == p.pronamespace)
+        // makeRangeConstructors / makeMultirangeConstructors record each
+        // constructor as part of the type it builds.
+        let mut constructors: Vec<crate::oid::PgProcOid> = interp
+            .pg_depend
+            .iter()
+            .filter(|d| {
+                d.classid == PG_PROC_RELID
+                    && d.refclassid == PG_TYPE_RELID
+                    && d.deptype == crate::pg_catalog::DepType::Internal
+                    && own_types.iter().any(|t| t.get() == d.refobjid.get())
             })
-            .map(|p| p.oid)
+            .filter_map(|d| PgProcOid::new(d.objid.get()))
             .collect();
+        constructors.sort();
+        constructors.dedup();
         let relations: Vec<PgClassOid> = interp
             .pg_attribute
             .iter()
@@ -1015,6 +1073,16 @@ fn drop_type_oid(interp: &mut PgCatalog, type_oid: PgTypeOid, deps: TypeDependen
         let arr_obj = crate::oid::PgGenericOid::from_nonzero(arr_oid.into_nonzero());
         interp.remove_dependencies_of(PG_TYPE_RELID, arr_obj);
         interp.remove_dependencies_on(PG_TYPE_RELID, arr_obj);
+    }
+    // A composite type's relation (relkind 'c') is internal to it: it goes
+    // along, and with it its attributes and what they depend on.
+    if let Some(rel) = interp
+        .pg_type
+        .get(&type_oid)
+        .and_then(|t| t.typrelid)
+        .filter(|r| interp.pg_class.get(r).map(|c| c.relkind) == Some(RelKind::CompositeType))
+    {
+        drop_relation_by_oid(interp, rel);
     }
     interp.remove_pg_type(type_oid);
     let type_obj = crate::oid::PgGenericOid::from_nonzero(type_oid.into_nonzero());
@@ -1167,6 +1235,12 @@ fn drop_function(
     let target = Some(target);
 
     if let Some(oid) = target {
+        // findDependentObjects checks first that the routine may be
+        // dropped at all: not a built-in one, nor part of another object
+        // (an extension's member, a range type's constructor).
+        let addr = super::depend::ObjectAddress::proc(oid);
+        let desc = super::depend::describe(interp, addr);
+        super::depend::check_not_owned(interp, addr, &desc)?;
         // A trigger depends on its function.
         let dependent_triggers = super::triggers::triggers_using_function(interp, oid);
         if let Some((relid, trigger)) = dependent_triggers.first()
@@ -1216,10 +1290,7 @@ fn drop_function(
             )));
         }
         // What else depends on it (operators, casts, aggregates, types,
-        // defaults, SQL bodies, ...), and whether an extension owns it.
-        let addr = super::depend::ObjectAddress::proc(oid);
-        let desc = super::depend::describe(interp, addr);
-        super::depend::check_not_owned(interp, addr, &desc)?;
+        // defaults, SQL bodies, ...).
         super::depend::drop_dependents(interp, addr, &desc, cascade)?;
         if !dependent_views.is_empty() {
             views::drop_views(interp, &dependent_views);
@@ -1275,6 +1346,11 @@ fn drop_aggregate(
         .unwrap_or_default();
 
     if let Some(oid) = target {
+        // findDependentObjects: a built-in aggregate, or an extension's,
+        // can't be dropped on its own.
+        let addr = super::depend::ObjectAddress::proc(oid);
+        let desc = super::depend::describe(interp, addr);
+        super::depend::check_not_owned(interp, addr, &desc)?;
         let dependent_views = views::find_views_depending_on_function(interp, oid);
         if !dependent_views.is_empty() && !cascade {
             // PG renders aggregate-with-deps errors using "function"
@@ -1288,10 +1364,7 @@ fn drop_aggregate(
             )));
         }
         // What else depends on it (operators, casts, aggregates, types,
-        // defaults, SQL bodies, ...), and whether an extension owns it.
-        let addr = super::depend::ObjectAddress::proc(oid);
-        let desc = super::depend::describe(interp, addr);
-        super::depend::check_not_owned(interp, addr, &desc)?;
+        // defaults, SQL bodies, ...).
         super::depend::drop_dependents(interp, addr, &desc, cascade)?;
         if !dependent_views.is_empty() {
             views::drop_views(interp, &dependent_views);
@@ -1453,23 +1526,26 @@ fn drop_cast(
         _ => return Ok(()),
     };
 
-    let src_oid = match src_node.node.as_ref() {
-        Some(node::Node::TypeName(tn)) => resolve_type_name(tn, interp),
-        _ => None,
+    // get_object_address_type: typenameTypeId, whose error names the type
+    // as written.
+    let lookup = |n: &typedpg_pg_query::protobuf::Node| match n.node.as_ref() {
+        Some(node::Node::TypeName(tn)) => super::util::lookup_type_name(tn, interp).map(Some),
+        _ => Ok(None),
     };
-    let tgt_oid = match tgt_node.node.as_ref() {
-        Some(node::Node::TypeName(tn)) => resolve_type_name(tn, interp),
-        _ => None,
-    };
-
-    let (Some(src), Some(tgt)) = (src_oid, tgt_oid) else {
-        if missing_ok {
-            return Ok(());
+    let (src_oid, tgt_oid) = match (lookup(src_node), lookup(tgt_node)) {
+        (Ok(s), Ok(t)) => (s, t),
+        (Err(e), _) | (_, Err(e)) => {
+            if missing_ok {
+                return Ok(());
+            }
+            return Err(e);
         }
-        return Err(DdlError::TypeNotFound("cast source or target type".into()));
+    };
+    let (Some(src), Some(tgt)) = (src_oid, tgt_oid) else {
+        return Ok(());
     };
 
-    let cast_oid = interp.cast_by_pair.get(&(src, tgt)).copied();
+    let cast_oid = interp.catalog_cast(src, tgt);
     if cast_oid.is_none() && !missing_ok {
         return Err(DdlError::DependencyError(format!(
             "cast from type {} to type {} does not exist",
@@ -1519,27 +1595,86 @@ fn drop_schema(
             "schema \"{name}\" does not exist"
         )));
     };
+    // findDependentObjects: a built-in schema (`pg_catalog`, `pg_toast`)
+    // can't be dropped.
+    if super::depend::is_pinned(super::depend::ObjectAddress::new(
+        PG_NAMESPACE_RELID,
+        nsoid.into_nonzero(),
+        0,
+    )) {
+        return Err(DdlError::DependencyError(format!(
+            "cannot drop schema {name} because it is required by the database system"
+        )));
+    }
 
+    // Everything in the schema depends on it (DEPENDENCY_NORMAL): without
+    // CASCADE any of it blocks the DROP.
     let has_objects = interp.pg_class.values().any(|c| c.relnamespace == nsoid)
         || interp.pg_type.values().any(|t| t.typnamespace == nsoid)
-        || interp.pg_proc.values().any(|p| p.pronamespace == nsoid);
+        || interp.pg_proc.values().any(|p| p.pronamespace == nsoid)
+        || interp.pg_operator.values().any(|o| o.oprnamespace == nsoid)
+        || interp
+            .pg_collation
+            .values()
+            .any(|c| c.collnamespace == nsoid)
+        || interp.pg_ts_objects.iter().any(|o| o.namespace == nsoid)
+        || interp.pg_opclass.iter().any(|c| c.opcnamespace == nsoid)
+        || interp.pg_opfamily.iter().any(|f| f.opfnamespace == nsoid)
+        || interp.conversions.iter().any(|(_, ns)| *ns == nsoid)
+        || interp.statistics.iter().any(|s| s.namespace == nsoid);
 
     if has_objects && !cascade {
         return Err(DdlError::DependencyError(format!(
             "cannot drop schema {name} because other objects depend on it"
         )));
     }
+    // Objects outside it that refer to it (a `regnamespace` constant) need
+    // CASCADE too — checked before anything goes.
+    let ns_addr = super::depend::ObjectAddress::namespace(nsoid);
+    let ns_desc = super::depend::describe(interp, ns_addr);
+    if !cascade {
+        super::depend::drop_dependents(interp, ns_addr, &ns_desc, false)?;
+    }
 
-    // CASCADE: gather everything in this schema.
-    let class_oids: Vec<PgClassOid> = interp
+    // CASCADE: everything in this schema goes, with what depends on it
+    // wherever it is (findDependentObjects from the schema).
+    let mut class_oids: Vec<PgClassOid> = interp
         .pg_class
         .values()
         .filter(|c| c.relnamespace == nsoid)
         .map(|c| c.oid)
         .collect();
-    views::drop_views(interp, &class_oids);
-    for class_oid in class_oids {
-        if interp.pg_class.contains_key(&class_oid) {
+    class_oids.sort();
+    for &class_oid in &class_oids {
+        let Some(relkind) = interp.pg_class.get(&class_oid).map(|c| c.relkind) else {
+            continue;
+        };
+        let kind = match relkind {
+            // An index goes with its table, a composite type's relation
+            // with its type.
+            RelKind::Index | RelKind::PartitionedIndex | RelKind::CompositeType => continue,
+            RelKind::View => "view",
+            RelKind::MaterializedView => "materialized view",
+            RelKind::Sequence => "sequence",
+            RelKind::ForeignTable => "foreign table",
+            _ => "table",
+        };
+        // A relation that is part of another object (an identity column's
+        // sequence) goes with it.
+        let addr = super::depend::ObjectAddress::relation(class_oid);
+        if super::depend::check_not_owned(interp, addr, "").is_err() {
+            continue;
+        }
+        drop_relation_oid(interp, class_oid, kind, true, &class_oids, None)?;
+    }
+    // What is left belonged to something else in the schema (an identity
+    // column's sequence, an index of a table) or to an extension.
+    for &class_oid in &class_oids {
+        if interp
+            .pg_class
+            .get(&class_oid)
+            .is_some_and(|c| c.relkind != RelKind::CompositeType)
+        {
             drop_relation_by_oid(interp, class_oid);
         }
     }
@@ -1565,10 +1700,10 @@ fn drop_schema(
         .map(|p| p.oid)
         .collect();
     for proc_oid in proc_oids {
-        interp.remove_pg_proc(proc_oid);
-        let obj = crate::oid::PgGenericOid::from_nonzero(proc_oid.into_nonzero());
-        interp.remove_dependencies_of(PG_PROC_RELID, obj);
-        interp.remove_dependencies_on(PG_PROC_RELID, obj);
+        let addr = super::depend::ObjectAddress::proc(proc_oid);
+        if super::depend::object_exists(interp, addr) {
+            super::depend::cascade_delete(interp, addr)?;
+        }
     }
 
     let op_oids: Vec<PgOperatorOid> = interp
@@ -1578,10 +1713,68 @@ fn drop_schema(
         .map(|o| o.oid)
         .collect();
     for op_oid in op_oids {
-        super::operators::remove_operator(interp, op_oid);
-        let obj = crate::oid::PgGenericOid::from_nonzero(op_oid.into_nonzero());
-        interp.remove_dependencies_of(PG_OPERATOR_RELID, obj);
+        let addr = super::depend::ObjectAddress::operator(op_oid);
+        if super::depend::object_exists(interp, addr) {
+            super::depend::cascade_delete(interp, addr)?;
+        }
     }
+
+    let collation_oids: Vec<crate::oid::PgCollationOid> = interp
+        .pg_collation
+        .values()
+        .filter(|c| c.collnamespace == nsoid)
+        .map(|c| c.oid)
+        .collect();
+    for collation in collation_oids {
+        super::collations::drop_collation_oid(interp, collation, true)?;
+    }
+
+    // Operator classes and families, text search objects: what depends on
+    // them goes too.
+    let named: Vec<super::depend::ObjectAddress> = interp
+        .pg_opclass
+        .iter()
+        .filter(|c| c.opcnamespace == nsoid)
+        .map(|c| super::depend::NamedObject::Opclass {
+            name: c.opcname.clone(),
+            namespace: c.opcnamespace,
+            method: c.opcmethod.clone(),
+        })
+        .chain(
+            interp
+                .pg_opfamily
+                .iter()
+                .filter(|f| f.opfnamespace == nsoid)
+                .map(|f| super::depend::NamedObject::Opfamily {
+                    name: f.opfname.clone(),
+                    namespace: f.opfnamespace,
+                    method: f.opfmethod.clone(),
+                }),
+        )
+        .chain(
+            interp
+                .pg_ts_objects
+                .iter()
+                .filter(|o| o.namespace == nsoid && (o.kind == "c" || o.kind == "d"))
+                .map(|o| super::depend::NamedObject::TsObject {
+                    kind: o.kind.clone(),
+                    name: o.name.clone(),
+                    namespace: o.namespace,
+                }),
+        )
+        .filter_map(|o| super::depend::named_address_of(interp, &o))
+        .collect();
+    for addr in named {
+        if super::depend::object_exists(interp, addr) {
+            super::depend::cascade_delete(interp, addr)?;
+        }
+    }
+    interp.pg_ts_objects.retain(|o| o.namespace != nsoid);
+    interp.conversions.retain(|(_, ns)| *ns != nsoid);
+    interp.statistics.retain(|s| s.namespace != nsoid);
+
+    // What refers to the schema itself.
+    super::depend::drop_dependents(interp, ns_addr, &ns_desc, true)?;
 
     interp.search_path.retain(|&s| s != nsoid);
     interp.remove_pg_namespace(nsoid);

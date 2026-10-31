@@ -87,6 +87,50 @@ fn drop_table_cascade_transitive_views() {
     );
 }
 
+#[test]
+fn create_table_as_does_not_depend_on_its_source() {
+    // CREATE TABLE AS stores rows, not the query: the new table depends on
+    // its columns' types only (intorel_startup → heap_create_with_catalog).
+    for setup in [
+        "CREATE TABLE src (a int);
+         CREATE TABLE dst AS SELECT a FROM src;",
+        "CREATE TABLE src (i int, j int);
+         CREATE TABLE dst (ii, jj) AS SELECT i, j FROM src WITH NO DATA;",
+        "CREATE TABLE src (a int);
+         SELECT a INTO dst FROM src;",
+        "CREATE TABLE src (a int);
+         CREATE VIEW vsrc AS SELECT a FROM src;
+         CREATE TABLE dst AS SELECT a FROM vsrc;
+         DROP VIEW vsrc;",
+    ] {
+        build(&[("0001.sql", setup), ("0002.sql", "DROP TABLE src;")]);
+    }
+    build(&[(
+        "0001.sql",
+        "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'select 1';
+         CREATE TABLE dst AS SELECT f() AS x;
+         DROP FUNCTION f();",
+    )]);
+    assert_ddl_rejections(&[
+        // A materialized view keeps its query, and what it reads.
+        (
+            "CREATE TABLE src (a int);
+             CREATE MATERIALIZED VIEW mv AS SELECT a FROM src;",
+            "DROP TABLE src;",
+            "cannot drop table src because other objects depend on it",
+        ),
+        // The new table's columns hold on to their types.
+        (
+            "CREATE TYPE e AS ENUM ('x');
+             CREATE TABLE src (a e);
+             CREATE TABLE dst AS SELECT a FROM src;
+             DROP TABLE src;",
+            "DROP TYPE e;",
+            "cannot drop type e because other objects depend on it",
+        ),
+    ]);
+}
+
 // ── DROP TYPE with dependent table column ──────────────────────────────────
 
 #[test]
@@ -105,6 +149,62 @@ fn drop_type_with_dependent_column_errors() {
         DdlError::DependencyError(_),
         "cannot drop type status because other objects depend on it (table(s) public.t depend on this type)"
     );
+}
+
+#[test]
+fn dropping_a_composite_type_releases_its_attribute_types() {
+    build(&[(
+        "0001.sql",
+        "CREATE DOMAIN js_nn AS int NOT NULL;
+         CREATE TYPE rec_nn AS (i js_nn);
+         DROP TYPE rec_nn;
+         DROP DOMAIN js_nn;",
+    )]);
+    build(&[(
+        "0001.sql",
+        "CREATE TYPE e AS ENUM ('x');
+         CREATE TYPE r AS (a int, b e);
+         ALTER TYPE r DROP ATTRIBUTE b;
+         DROP TYPE e;",
+    )]);
+    // While the composite type stands, its attributes pin their types.
+    assert_ddl_rejections(&[(
+        "CREATE DOMAIN js_nn AS int NOT NULL;
+         CREATE TYPE rec_nn AS (i js_nn);",
+        "DROP DOMAIN js_nn;",
+        "cannot drop type js_nn because other objects depend on it",
+    )]);
+}
+
+#[test]
+fn a_domain_over_a_domain_pins_its_base() {
+    assert_ddl_rejections(&[
+        (
+            "CREATE DOMAIN ddt int4;
+             CREATE DOMAIN dependent ddt;",
+            "DROP DOMAIN ddt;",
+            "cannot drop type ddt because other objects depend on it",
+        ),
+        (
+            "CREATE TYPE e AS ENUM ('x');
+             CREATE DOMAIN de e;",
+            "DROP TYPE e;",
+            "cannot drop type e because other objects depend on it",
+        ),
+    ]);
+    // CASCADE takes the domains built on it, and what uses them.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE DOMAIN ddt int4;
+         CREATE DOMAIN dependent ddt;
+         CREATE DOMAIN dependent2 dependent;
+         CREATE TABLE td (a int, d dependent2);
+         DROP DOMAIN ddt CASCADE;",
+    )]);
+    assert!(db.resolve_type_by_name(None, "dependent").is_none());
+    assert!(db.resolve_type_by_name(None, "dependent2").is_none());
+    let q = db.analyze("SELECT * FROM td").unwrap();
+    assert_eq!(q.columns.len(), 1);
 }
 
 // ── DROP FUNCTION: overload-safe ──────────────────────────────────────────
@@ -501,6 +601,34 @@ fn objects_built_on_a_function_block_its_drop() {
 }
 
 #[test]
+fn a_partition_key_expression_pins_its_function() {
+    assert_ddl_rejections(&[
+        (
+            "CREATE FUNCTION plusone(a int) RETURNS int AS $$ SELECT a+1; $$ LANGUAGE sql IMMUTABLE;
+             CREATE TABLE pk (a int, b int) PARTITION BY RANGE (plusone(b));",
+            "DROP FUNCTION plusone(int);",
+            "cannot drop function plusone(integer) because other objects depend on it",
+        ),
+        (
+            "CREATE FUNCTION plusone(a int) RETURNS int AS $$ SELECT a+1; $$ LANGUAGE sql IMMUTABLE;
+             CREATE TABLE pk (a int, b int) PARTITION BY RANGE (a, (plusone(b) * 2));",
+            "DROP FUNCTION plusone(int);",
+            "cannot drop function plusone(integer) because other objects depend on it",
+        ),
+    ]);
+    // The key is part of the table: CASCADE drops the table.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE FUNCTION plusone(a int) RETURNS int AS $$ SELECT a+1; $$ LANGUAGE sql IMMUTABLE;
+         CREATE TABLE pk (a int, b int) PARTITION BY RANGE (plusone(b));
+         CREATE TABLE pk1 PARTITION OF pk FOR VALUES FROM (1) TO (10);
+         DROP FUNCTION plusone(int) CASCADE;",
+    )]);
+    assert!(db.resolve_table(None, "pk").is_none());
+    assert!(db.resolve_table(None, "pk1").is_none());
+}
+
+#[test]
 fn drop_function_cascade_takes_what_is_built_on_it() {
     let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
@@ -628,6 +756,88 @@ fn rules_policies_triggers_and_views_hold_on_to_what_they_use() {
     )
     .unwrap();
     assert!(db.resolve_table(None, "vs").is_none());
+}
+
+#[test]
+fn a_functionally_dependent_view_pins_the_primary_key() {
+    // A view selecting columns grouped through the primary key relies on
+    // the key (check_functional_grouping → query->constraintDeps).
+    let setup = "CREATE TABLE articles (id int CONSTRAINT articles_pkey PRIMARY KEY, title text);
+                 CREATE VIEW av AS SELECT id, title FROM articles GROUP BY id;";
+    assert_ddl_rejections(&[
+        (
+            setup,
+            "ALTER TABLE articles DROP CONSTRAINT articles_pkey RESTRICT;",
+            "cannot drop constraint articles_pkey on table articles because other objects depend on it",
+        ),
+        (
+            "CREATE TABLE articles (id int CONSTRAINT articles_pkey PRIMARY KEY, title text);
+             CREATE FUNCTION af() RETURNS SETOF text LANGUAGE sql
+                 BEGIN ATOMIC SELECT title FROM articles GROUP BY id; END;",
+            "ALTER TABLE articles DROP CONSTRAINT articles_pkey;",
+            "cannot drop constraint articles_pkey on table articles because other objects depend on it",
+        ),
+    ]);
+    let db = build_db(&[(
+        "0001.sql",
+        &format!("{setup} ALTER TABLE articles DROP CONSTRAINT articles_pkey CASCADE;"),
+    )]);
+    assert!(db.resolve_table(None, "av").is_none());
+    // Grouping by every column it selects, the view needs no key.
+    build(&[(
+        "0001.sql",
+        "CREATE TABLE articles (id int CONSTRAINT articles_pkey PRIMARY KEY, title text);
+         CREATE VIEW av AS SELECT id, title FROM articles GROUP BY id, title;
+         CREATE VIEW av2 AS SELECT id FROM articles GROUP BY id;
+         ALTER TABLE articles DROP CONSTRAINT articles_pkey;",
+    )]);
+}
+
+#[test]
+fn a_view_over_a_rowtype_function_pins_the_table_columns() {
+    // regress/sql/create_view.sql (tt14t): the view's columns come from
+    // tt14t's row type, through the function (process_function_rte_ref).
+    let base = "CREATE TABLE tt14t (f1 text, f3 text, f4 text);
+                CREATE FUNCTION tt14f() RETURNS SETOF tt14t AS 'select * from tt14t' LANGUAGE sql;";
+    assert_ddl_rejections(&[
+        (
+            &format!("{base} CREATE VIEW tt14v AS SELECT t.* FROM tt14f() t;"),
+            "ALTER TABLE tt14t DROP COLUMN f3;",
+            "cannot drop column f3 of table tt14t because other objects depend on it",
+        ),
+        (
+            &format!("{base} CREATE VIEW tt14v AS SELECT t.f1, t.f4 FROM tt14f() t;"),
+            "ALTER TABLE tt14t ALTER COLUMN f4 TYPE integer USING f4::integer;",
+            "cannot alter type of a column used by a view or rule",
+        ),
+        (
+            &format!(
+                "{base} ALTER TABLE tt14t DROP COLUMN f1;
+                 CREATE VIEW tt14v AS SELECT f4 FROM tt14f() WITH ORDINALITY AS t;"
+            ),
+            "ALTER TABLE tt14t DROP COLUMN f4;",
+            "cannot drop column f4 of table tt14t because other objects depend on it",
+        ),
+        // A composite type's attribute, read under a column alias.
+        (
+            "CREATE TYPE ct AS (x int, y int);
+             CREATE FUNCTION cf() RETURNS ct LANGUAGE sql AS 'select 1, 2';
+             CREATE VIEW cv AS SELECT b FROM cf() AS f(a, b);
+             ALTER TYPE ct DROP ATTRIBUTE x;",
+            "ALTER TYPE ct DROP ATTRIBUTE y;",
+            "cannot drop column y of composite type ct because other objects depend on it",
+        ),
+    ]);
+    // Only the columns the view reads are pinned; CASCADE takes the view.
+    let db = build_db(&[(
+        "0001.sql",
+        &format!(
+            "{base} CREATE VIEW tt14v AS SELECT t.f1, t.f4 FROM tt14f() t;
+             ALTER TABLE tt14t DROP COLUMN f3;
+             ALTER TABLE tt14t DROP COLUMN f4 CASCADE;"
+        ),
+    )]);
+    assert!(db.resolve_table(None, "tt14v").is_none());
 }
 
 #[test]
@@ -768,4 +978,1054 @@ fn a_partition_dependent_blocks_the_drop_of_its_parent() {
         ("0001.sql", setup),
         ("0002.sql", "DROP TABLE p CASCADE; DROP TABLE q CASCADE;"),
     ]);
+}
+
+// ── Objects that are part of others ─────────────────────────────────────────
+
+#[test]
+fn a_range_types_internal_objects_go_only_with_it() {
+    // DefineRange: the multirange type, the constructors of both and the
+    // range → multirange cast (through `mr(range)`) are part of the range
+    // type — DEPENDENCY_INTERNAL, which CASCADE doesn't override.
+    let range = "CREATE TYPE textrange AS RANGE (subtype = text);";
+    assert_ddl_rejections(&[
+        (
+            range,
+            "DROP CAST (textrange AS textmultirange);",
+            "cannot drop cast from textrange to textmultirange because function \
+             textmultirange(textrange) requires it",
+        ),
+        (
+            range,
+            "DROP CAST (textrange AS textmultirange) CASCADE;",
+            "cannot drop cast from textrange to textmultirange because function \
+             textmultirange(textrange) requires it",
+        ),
+        (
+            range,
+            "DROP TYPE textmultirange;",
+            "cannot drop type textmultirange because type textrange requires it",
+        ),
+        (
+            range,
+            "DROP FUNCTION textmultirange(textrange) CASCADE;",
+            "cannot drop function textmultirange(textrange) because type textmultirange \
+             requires it",
+        ),
+        (
+            range,
+            "DROP FUNCTION textrange(text, text);",
+            "cannot drop function textrange(text,text) because type textrange requires it",
+        ),
+        (
+            range,
+            "DROP TYPE textmultirange[];",
+            "cannot drop type textmultirange[] because type textmultirange requires it",
+        ),
+        (
+            range,
+            "CREATE CAST (textrange AS textmultirange) WITH INOUT;",
+            "cast from type textrange to type textmultirange already exists",
+        ),
+        // The multirange constructors live in the range type's schema,
+        // whatever the multirange type's.
+        (
+            "CREATE SCHEMA s;
+             CREATE TYPE textrange AS RANGE (subtype = text, multirange_type_name = s.tmr);",
+            "DROP CAST (textrange AS s.tmr);",
+            "cannot drop cast from textrange to s.tmr because function tmr(textrange) \
+             requires it",
+        ),
+        // A view casting to the multirange calls the constructor.
+        (
+            "CREATE TYPE textrange AS RANGE (subtype = text);
+             CREATE VIEW v AS SELECT textrange('a', 'b')::textmultirange AS m;",
+            "DROP TYPE textrange;",
+            "cannot drop type textrange because other objects depend on it",
+        ),
+    ]);
+    // The range type takes them all along; naming them in the same DROP is
+    // fine.
+    build(&[(
+        "0001.sql",
+        "CREATE TYPE textrange AS RANGE (subtype = text);
+         CREATE VIEW v AS SELECT textrange('a', 'b')::textmultirange AS m;
+         DROP TYPE textrange CASCADE;
+         CREATE TYPE textmultirange AS ENUM ('x');
+         CREATE FUNCTION textmultirange(int) RETURNS int LANGUAGE sql AS 'select 1';
+         CREATE TYPE r1 AS RANGE (subtype = text);
+         DROP TYPE r1, r1_multirange;
+         CREATE TYPE r2 AS RANGE (subtype = text);
+         DROP TYPE r2_multirange, r2;
+         CREATE TYPE r3 AS RANGE (subtype = text);
+         DROP TYPE r3;
+         CREATE TYPE r3 AS RANGE (subtype = text);",
+    )]);
+}
+
+#[test]
+fn array_and_row_types_go_only_with_their_owner() {
+    // GenerateTypeDependencies: an implicit array type is part of its
+    // element type, a relation's row type part of the relation.
+    let setup = "CREATE TYPE e AS ENUM ('x');
+                 CREATE TYPE c AS (a int);
+                 CREATE DOMAIN d AS int;
+                 CREATE TABLE t (a int);
+                 CREATE VIEW v AS SELECT 1 AS a;";
+    assert_ddl_rejections(&[
+        (
+            setup,
+            "DROP TYPE e[];",
+            "cannot drop type e[] because type e requires it",
+        ),
+        (
+            setup,
+            "DROP TYPE _e CASCADE;",
+            "cannot drop type e[] because type e requires it",
+        ),
+        (
+            setup,
+            "DROP TYPE c[];",
+            "cannot drop type c[] because type c requires it",
+        ),
+        (
+            setup,
+            "DROP TYPE d[];",
+            "cannot drop type d[] because type d requires it",
+        ),
+        (setup, "DROP DOMAIN d[];", "\"d[]\" is not a domain"),
+        (
+            setup,
+            "DROP TYPE t;",
+            "cannot drop type t because table t requires it",
+        ),
+        (
+            setup,
+            "DROP TYPE _t;",
+            "cannot drop type t[] because type t requires it",
+        ),
+        (
+            setup,
+            "DROP TYPE v;",
+            "cannot drop type v because view v requires it",
+        ),
+        (
+            setup,
+            "DROP TYPE v[];",
+            "cannot drop type v[] because type v requires it",
+        ),
+        (
+            "",
+            "DROP TYPE nonexist[];",
+            "type \"nonexist[]\" does not exist",
+        ),
+    ]);
+    // `e[]` names the array type, not e: e stays.
+    let db = build(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "DROP TYPE IF EXISTS nonexist[];
+             CREATE TYPE e2 AS ENUM ('y');
+             DROP TYPE e2[], e2;
+             CREATE TYPE e3 AS ENUM ('y');
+             DROP TYPE e3, e3[];",
+        ),
+    ]);
+    assert!(db.resolve_type_by_name(None, "e").is_some());
+    assert!(db.resolve_type_by_name(None, "e2").is_none());
+    assert!(db.resolve_type_by_name(None, "e3").is_none());
+}
+
+#[test]
+fn built_in_objects_are_required_by_the_database_system() {
+    // findDependentObjects refuses a pinned object before anything else,
+    // CASCADE or not.
+    assert_ddl_rejections(&[
+        (
+            "",
+            "DROP FUNCTION int4pl(int4, int4);",
+            "cannot drop function int4pl(integer,integer) because it is required by the \
+             database system",
+        ),
+        (
+            "",
+            "DROP AGGREGATE sum(int4);",
+            "cannot drop function sum(integer) because it is required by the database system",
+        ),
+        (
+            "",
+            "DROP OPERATOR + (int4, int4);",
+            "cannot drop operator +(integer,integer) because it is required by the database \
+             system",
+        ),
+        (
+            "",
+            "DROP TYPE int4 CASCADE;",
+            "cannot drop type integer because it is required by the database system",
+        ),
+        (
+            "",
+            "DROP CAST (int4 AS int8) CASCADE;",
+            "cannot drop cast from integer to bigint because it is required by the database \
+             system",
+        ),
+        (
+            "",
+            "DROP CAST (int4range AS int4multirange);",
+            "cannot drop cast from int4range to int4multirange because it is required by the \
+             database system",
+        ),
+        (
+            "",
+            "DROP SCHEMA pg_catalog CASCADE;",
+            "cannot drop schema pg_catalog because it is required by the database system",
+        ),
+    ]);
+}
+
+// ── What a stored INSERT writes ─────────────────────────────────────────────
+
+#[test]
+fn a_stored_insert_depends_on_every_column_it_writes() {
+    // find_expr_references_walker: an INSERT depends on each target column
+    // of its target list — without a column list, as many leading columns
+    // as its source has values once `*` is expanded.
+    let tables = "CREATE TABLE src (a int, b int);
+                  CREATE TABLE dst (a int, b int, c int);";
+    let body = |insert: &str| {
+        format!(
+            "{tables}
+             CREATE FUNCTION f() RETURNS void LANGUAGE sql BEGIN ATOMIC {insert}; END;"
+        )
+    };
+    let rule = |action: &str| {
+        format!(
+            "{tables}
+             CREATE TABLE t (a int, b int);
+             CREATE RULE r AS ON INSERT TO t DO ALSO {action};"
+        )
+    };
+    let blocked = "cannot drop column b of table dst because other objects depend on it";
+    let blocked_c = "cannot drop column c of table dst because other objects depend on it";
+    let cases = [
+        (body("INSERT INTO dst SELECT * FROM src"), "b"),
+        (body("INSERT INTO dst SELECT s.*, 1 FROM src s"), "c"),
+        (body("INSERT INTO dst TABLE src"), "b"),
+        (
+            body("WITH w AS (SELECT * FROM src) INSERT INTO dst SELECT * FROM w"),
+            "b",
+        ),
+        (
+            body("INSERT INTO dst SELECT 1, 2 UNION ALL SELECT 3, 4"),
+            "b",
+        ),
+        (body("INSERT INTO dst VALUES (1, 2), (3, 4)"), "b"),
+        (
+            body("INSERT INTO dst VALUES ((SELECT s FROM src s LIMIT 1).*)"),
+            "b",
+        ),
+        (rule("INSERT INTO dst VALUES (NEW.*)"), "b"),
+        (rule("INSERT INTO dst VALUES (NEW.*, 1)"), "c"),
+        (rule("INSERT INTO dst SELECT NEW.*"), "b"),
+    ];
+    for (setup, column) in &cases {
+        let (stmt, msg) = if *column == "b" {
+            ("ALTER TABLE dst DROP COLUMN b;", blocked)
+        } else {
+            ("ALTER TABLE dst DROP COLUMN c;", blocked_c)
+        };
+        assert_ddl_rejections(&[(setup, stmt, msg)]);
+    }
+    assert_ddl_rejections(&[(
+        &rule("INSERT INTO dst VALUES (NEW.*)"),
+        "ALTER TABLE dst ALTER COLUMN b TYPE bigint;",
+        "cannot alter type of a column used by a view or rule",
+    )]);
+    // A dropped leading column takes no position.
+    assert_ddl_rejections(&[(
+        "CREATE TABLE src (a int, b int);
+         CREATE TABLE dst (x int, a int, b int);
+         ALTER TABLE dst DROP COLUMN x;
+         CREATE FUNCTION f() RETURNS void LANGUAGE sql
+             BEGIN ATOMIC INSERT INTO dst SELECT * FROM src; END;",
+        "ALTER TABLE dst DROP COLUMN b;",
+        blocked,
+    )]);
+    // The columns past the values, and DEFAULT VALUES, aren't written.
+    for setup in [
+        body("INSERT INTO dst VALUES (1, 2)"),
+        body("INSERT INTO dst SELECT * FROM src"),
+        body("INSERT INTO dst DEFAULT VALUES"),
+        rule("INSERT INTO dst VALUES (NEW.*)"),
+        rule("INSERT INTO dst DEFAULT VALUES"),
+        rule("INSERT INTO dst VALUES (NEW.a, NEW.b), (NEW.b, 1)"),
+    ] {
+        build(&[
+            ("0001.sql", &setup),
+            ("0002.sql", "ALTER TABLE dst DROP COLUMN c;"),
+        ]);
+    }
+}
+
+#[test]
+fn a_stored_insert_on_conflict_depends_on_what_it_infers() {
+    // transformOnConflictClause: DO UPDATE reads EXCLUDED, a Var per column
+    // of the target (exclRelTlist); the inference elements are Vars of
+    // their columns; ON CONSTRAINT names the constraint
+    // (OnConflictExpr.constraint).
+    let body = |insert: &str| {
+        format!(
+            "CREATE TABLE dst (a int PRIMARY KEY, b int CONSTRAINT bu UNIQUE, c int);
+             CREATE FUNCTION f() RETURNS void LANGUAGE sql BEGIN ATOMIC {insert}; END;"
+        )
+    };
+    let rule = |action: &str| {
+        format!(
+            "CREATE TABLE dst (a int PRIMARY KEY, b int CONSTRAINT bu UNIQUE, c int);
+             CREATE TABLE t (a int, b int);
+             CREATE RULE r AS ON INSERT TO t DO ALSO {action};"
+        )
+    };
+    let blocked = |column: &str| {
+        format!("cannot drop column {column} of table dst because other objects depend on it")
+    };
+    let cases = [
+        (
+            body("INSERT INTO dst (a) VALUES (1) ON CONFLICT (a) DO UPDATE SET b = 1"),
+            "ALTER TABLE dst DROP COLUMN c;",
+            blocked("c"),
+        ),
+        (
+            rule("INSERT INTO dst (a) VALUES (NEW.a) ON CONFLICT (a) DO UPDATE SET b = 1"),
+            "ALTER TABLE dst DROP COLUMN c;",
+            blocked("c"),
+        ),
+        (
+            body("INSERT INTO dst (a) VALUES (1) ON CONFLICT (b) DO NOTHING"),
+            "ALTER TABLE dst DROP COLUMN b;",
+            blocked("b"),
+        ),
+        (
+            body("INSERT INTO dst (a) VALUES (1) ON CONFLICT ON CONSTRAINT bu DO NOTHING"),
+            "ALTER TABLE dst DROP CONSTRAINT bu;",
+            "cannot drop constraint bu on table dst because other objects depend on it".into(),
+        ),
+        // The column takes its UNIQUE constraint along, and that the
+        // routine depends on.
+        (
+            body("INSERT INTO dst (a) VALUES (1) ON CONFLICT ON CONSTRAINT bu DO NOTHING"),
+            "ALTER TABLE dst DROP COLUMN b;",
+            blocked("b"),
+        ),
+    ];
+    for (setup, stmt, msg) in &cases {
+        assert_ddl_rejections(&[(setup, stmt, msg)]);
+    }
+    for (setup, stmt) in [
+        (
+            body("INSERT INTO dst (a) VALUES (1) ON CONFLICT (a) DO NOTHING"),
+            "ALTER TABLE dst DROP COLUMN c;",
+        ),
+        (
+            body("INSERT INTO dst (a) VALUES (1) ON CONFLICT ON CONSTRAINT bu DO NOTHING"),
+            "ALTER TABLE dst DROP CONSTRAINT bu CASCADE;
+             CREATE FUNCTION f() RETURNS int LANGUAGE sql RETURN 1;",
+        ),
+    ] {
+        build(&[("0001.sql", &setup), ("0002.sql", stmt)]);
+    }
+}
+
+// ── DROP SCHEMA: what depends on its objects, and on it ────────────────────
+
+/// `sql` applied to a fresh catalog; `query` must then fail with `message`.
+fn assert_gone(sql: &str, query: &str, message: &str) {
+    let db = build_db(&[("0001.sql", sql)]);
+    let err = db.analyze(query).unwrap_err();
+    assert!(err.to_string().starts_with(message), "{query}: {err}");
+}
+
+#[test]
+fn drop_schema_cascade_takes_what_uses_its_types() {
+    // The row type of a composite type or of a table in the schema goes
+    // with it, and so does what uses that type elsewhere.
+    assert_gone(
+        "CREATE SCHEMA s;
+         CREATE TYPE s.ty AS (a int);
+         CREATE VIEW v5 AS SELECT NULL::s.ty AS p;
+         DROP SCHEMA s CASCADE;",
+        "SELECT * FROM v5",
+        "relation \"v5\" does not exist",
+    );
+    assert_gone(
+        "CREATE SCHEMA s;
+         CREATE TABLE s.tb (a int);
+         CREATE VIEW v5 AS SELECT NULL::s.tb AS p;
+         DROP SCHEMA s CASCADE;",
+        "SELECT * FROM v5",
+        "relation \"v5\" does not exist",
+    );
+    assert_gone(
+        "CREATE SCHEMA s;
+         CREATE TABLE s.tb (a int);
+         CREATE FUNCTION f(s.tb) RETURNS int LANGUAGE sql AS 'SELECT 1';
+         DROP SCHEMA s CASCADE;",
+        "SELECT f(NULL)",
+        "function f(unknown) does not exist",
+    );
+    assert_gone(
+        "CREATE SCHEMA s;
+         CREATE TABLE s.tb (a int);
+         CREATE FUNCTION g() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT (NULL::s.tb).a; END;
+         DROP SCHEMA s CASCADE;",
+        "SELECT g()",
+        "function g() does not exist",
+    );
+    // A column of the type in another schema's table goes; the table stays.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE SCHEMA s;
+         CREATE TABLE s.tb (a int);
+         CREATE TABLE t2 (x s.tb, y int);
+         DROP SCHEMA s CASCADE;",
+    )]);
+    let q = db.analyze("SELECT * FROM t2").unwrap();
+    assert_eq!(q.columns.len(), 1);
+    // A table's row type pins it like the table itself.
+    assert_ddl_rejections(&[
+        (
+            "CREATE TABLE tb (a int);
+             CREATE FUNCTION g() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT (NULL::tb).a; END;",
+            "DROP TABLE tb;",
+            "cannot drop table tb because other objects depend on it",
+        ),
+        (
+            "CREATE TABLE tb (a int);
+             CREATE TABLE t2 (b int DEFAULT (NULL::tb).a);",
+            "DROP TABLE tb;",
+            "cannot drop table tb because other objects depend on it",
+        ),
+    ]);
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE tb (a int);
+         CREATE TABLE t2 (b int DEFAULT (NULL::tb).a);
+         DROP TABLE tb CASCADE;
+         INSERT INTO t2 DEFAULT VALUES;",
+    )]);
+    assert!(db.resolve_table(None, "tb").is_none());
+}
+
+#[test]
+fn drop_schema_honours_what_refers_to_it() {
+    // A stored `regnamespace` constant depends on its schema.
+    assert_ddl_rejections(&[
+        (
+            "CREATE SCHEMA s;
+             CREATE VIEW v6 AS SELECT 's'::regnamespace AS p;",
+            "DROP SCHEMA s;",
+            "cannot drop schema s because other objects depend on it",
+        ),
+        (
+            "CREATE SCHEMA s;
+             CREATE TABLE t (a int DEFAULT ('s'::regnamespace)::oid::int);",
+            "DROP SCHEMA s RESTRICT;",
+            "cannot drop schema s because other objects depend on it",
+        ),
+        // `public` isn't pinned: the dependency is recorded.
+        (
+            "CREATE VIEW v6 AS SELECT 'public'::regnamespace AS p;",
+            "DROP SCHEMA public;",
+            "cannot drop schema public because other objects depend on it",
+        ),
+        // So does everything in the schema.
+        (
+            "CREATE SCHEMA s; CREATE COLLATION s.co (locale = 'C');",
+            "DROP SCHEMA s;",
+            "cannot drop schema s because other objects depend on it",
+        ),
+        (
+            "CREATE SCHEMA s; CREATE TEXT SEARCH CONFIGURATION s.c (COPY = simple);",
+            "DROP SCHEMA s;",
+            "cannot drop schema s because other objects depend on it",
+        ),
+        (
+            "CREATE SCHEMA s;
+             CREATE FUNCTION f(int) RETURNS int LANGUAGE sql AS 'SELECT 1';
+             CREATE OPERATOR s.### (rightarg = int, function = f);",
+            "DROP SCHEMA s;",
+            "cannot drop schema s because other objects depend on it",
+        ),
+    ]);
+    assert_gone(
+        "CREATE SCHEMA s;
+         CREATE VIEW v6 AS SELECT 's'::regnamespace AS p;
+         DROP SCHEMA s CASCADE;",
+        "SELECT * FROM v6",
+        "relation \"v6\" does not exist",
+    );
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE SCHEMA s;
+         CREATE TABLE t (a int DEFAULT ('s'::regnamespace)::oid::int);
+         DROP SCHEMA s CASCADE;
+         INSERT INTO t DEFAULT VALUES;",
+    )]);
+    assert!(db.resolve_table(None, "t").is_some());
+    // Cast from text, the name is looked up when the view runs: no
+    // dependency.
+    build(&[(
+        "0001.sql",
+        "CREATE SCHEMA s;
+         CREATE VIEW v6 AS SELECT 's'::text::regnamespace AS p;
+         DROP SCHEMA s;",
+    )]);
+    // An operator of the schema goes with it.
+    assert_gone(
+        "CREATE SCHEMA s;
+         CREATE FUNCTION f(int) RETURNS int LANGUAGE sql AS 'SELECT 1';
+         CREATE OPERATOR s.### (rightarg = int, function = f);
+         DROP SCHEMA s CASCADE;",
+        "SELECT OPERATOR(s.###) 1",
+        "schema \"s\" does not exist",
+    );
+}
+
+// ── DROP COLLATION ─────────────────────────────────────────────────────────
+
+#[test]
+fn drop_collation_honours_what_uses_it() {
+    let blocked = "cannot drop collation co because other objects depend on it";
+    let co = "CREATE COLLATION co (locale = 'C');";
+    let cases: Vec<(String, &str, &str)> = vec![
+        (
+            format!("{co} CREATE TABLE t (a text COLLATE co);"),
+            "DROP COLLATION co;",
+            blocked,
+        ),
+        (
+            format!("{co} CREATE TYPE ct AS (a text COLLATE co, b int);"),
+            "DROP COLLATION co;",
+            blocked,
+        ),
+        (
+            format!("{co} CREATE VIEW v AS SELECT 'a'::text COLLATE co AS x;"),
+            "DROP COLLATION co;",
+            blocked,
+        ),
+        (
+            format!("{co} CREATE VIEW v AS SELECT 'co'::regcollation AS x;"),
+            "DROP COLLATION co RESTRICT;",
+            blocked,
+        ),
+        (
+            format!("{co} CREATE DOMAIN d AS text COLLATE co;"),
+            "DROP COLLATION co;",
+            blocked,
+        ),
+        (
+            format!("{co} CREATE TABLE t (a text); CREATE INDEX i ON t (a COLLATE co);"),
+            "DROP COLLATION co;",
+            blocked,
+        ),
+        (
+            format!("{co} CREATE TYPE r AS RANGE (subtype = text, collation = co);"),
+            "DROP COLLATION co;",
+            blocked,
+        ),
+        (
+            format!("{co} CREATE TABLE t (a text CHECK (a > 'x' COLLATE co));"),
+            "DROP COLLATION co;",
+            blocked,
+        ),
+        (
+            format!(
+                "{co} CREATE FUNCTION f() RETURNS text LANGUAGE sql
+                     BEGIN ATOMIC SELECT 'a' COLLATE co; END;"
+            ),
+            "DROP COLLATION co;",
+            blocked,
+        ),
+        (
+            "CREATE SCHEMA s; CREATE COLLATION s.co (locale = 'C');
+             CREATE TABLE t (a text COLLATE s.co);"
+                .into(),
+            "DROP COLLATION s.co;",
+            "cannot drop collation s.co because other objects depend on it",
+        ),
+        (
+            "CREATE SCHEMA s; CREATE COLLATION s.co (locale = 'C');
+             CREATE TABLE t (a text COLLATE s.co);"
+                .into(),
+            "DROP SCHEMA s;",
+            "cannot drop schema s because other objects depend on it",
+        ),
+        (
+            "".into(),
+            "DROP COLLATION nope;",
+            "collation \"nope\" for encoding \"UTF8\" does not exist",
+        ),
+        (
+            "".into(),
+            "DROP COLLATION s.nope;",
+            "schema \"s\" does not exist",
+        ),
+        (
+            "".into(),
+            "DROP COLLATION \"C\";",
+            "cannot drop collation \"C\" because it is required by the database system",
+        ),
+    ];
+    for (setup, stmt, msg) in &cases {
+        assert_ddl_rejections(&[(setup, stmt, msg)]);
+    }
+
+    // Without dependents, or with CASCADE, it goes — with them.
+    build(&[(
+        "0001.sql",
+        "CREATE COLLATION co (locale = 'C');
+         CREATE VIEW v AS SELECT 'co'::text::regcollation AS x;
+         DROP COLLATION co;
+         DROP COLLATION IF EXISTS co;
+         DROP COLLATION IF EXISTS s.nope;
+         CREATE COLLATION co (locale = 'C');",
+    )]);
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE COLLATION co (locale = 'C');
+         CREATE TABLE t (a text COLLATE co, b int);
+         CREATE VIEW v AS SELECT a FROM t;
+         CREATE INDEX ON t (a);
+         CREATE TABLE pa (a text COLLATE co, c int);
+         CREATE TABLE ch (b int) INHERITS (pa);
+         CREATE TYPE ct AS (a text COLLATE co, b int);
+         CREATE DOMAIN d AS text COLLATE co;
+         CREATE TABLE td (x d, y int);
+         CREATE TABLE ti (a text, b int);
+         CREATE INDEX i ON ti (a COLLATE co);
+         CREATE TYPE r AS RANGE (subtype = text, collation = co);
+         CREATE TABLE p (a text COLLATE co, b int) PARTITION BY LIST (a);
+         CREATE TABLE p1 PARTITION OF p FOR VALUES IN ('x');
+         CREATE TABLE q (a text COLLATE co, b int) PARTITION BY LIST (b);
+         CREATE TABLE q1 PARTITION OF q FOR VALUES IN (1);
+         CREATE VIEW vc AS SELECT 'a'::text COLLATE co AS x;
+         DROP COLLATION co CASCADE;",
+    )]);
+    for (query, columns) in [
+        ("SELECT * FROM t", 1),
+        ("SELECT * FROM pa", 1),
+        ("SELECT * FROM ch", 2),
+        ("SELECT (NULL::ct).*", 1),
+        ("SELECT * FROM td", 1),
+        ("SELECT * FROM ti", 2),
+        ("SELECT * FROM q", 1),
+        ("SELECT * FROM q1", 1),
+    ] {
+        let q = db.analyze(query).unwrap();
+        assert_eq!(q.columns.len(), columns, "{query}");
+    }
+    for (query, message) in [
+        ("SELECT * FROM v", "relation \"v\" does not exist"),
+        ("SELECT * FROM vc", "relation \"vc\" does not exist"),
+        ("SELECT * FROM p", "relation \"p\" does not exist"),
+        ("SELECT * FROM p1", "relation \"p1\" does not exist"),
+        ("SELECT NULL::d", "type \"d\" does not exist"),
+        ("SELECT NULL::r", "type \"r\" does not exist"),
+        (
+            "SELECT 'a' COLLATE co",
+            "collation \"co\" for encoding \"UTF8\" does not exist",
+        ),
+    ] {
+        let err = db.analyze(query).unwrap_err();
+        assert!(err.to_string().starts_with(message), "{query}: {err}");
+    }
+    assert!(db.resolve_table(None, "i").is_none());
+
+    // DROP SCHEMA ... CASCADE takes its collation, and what uses it.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE SCHEMA s;
+         CREATE COLLATION s.co (locale = 'C');
+         CREATE TABLE t (a text COLLATE s.co, b int);
+         CREATE VIEW v AS SELECT 'a'::text COLLATE s.co AS x;
+         DROP SCHEMA s CASCADE;",
+    )]);
+    assert_eq!(db.analyze("SELECT * FROM t").unwrap().columns.len(), 1);
+    assert!(db.resolve_table(None, "v").is_none());
+}
+
+#[test]
+fn alter_collation_renames_and_moves_it() {
+    // AlterObjectRename_internal / AlterObjectNamespace_internal: the
+    // collation keeps its OID, so what uses it follows it.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE COLLATION co (locale = 'C');
+         ALTER COLLATION co RENAME TO co2;
+         CREATE COLLATION co (provider = icu, locale = 'und');
+         DROP COLLATION co;
+         CREATE SCHEMA s;
+         ALTER COLLATION co2 SET SCHEMA s;
+         ALTER COLLATION s.co2 SET SCHEMA s;
+         CREATE TABLE t (a text COLLATE s.co2);
+         CREATE VIEW v AS SELECT 'a'::text COLLATE s.co2 AS x;
+         ALTER COLLATION s.co2 RENAME TO co3;
+         ALTER COLLATION s.co3 SET SCHEMA public;
+         ALTER COLLATION co3 REFRESH VERSION;
+         COMMENT ON COLLATION co3 IS 'c';",
+    )]);
+    assert_eq!(db.analyze("SELECT * FROM v").unwrap().columns.len(), 1);
+    db.analyze("SELECT a COLLATE co3 FROM t").unwrap();
+    for query in ["SELECT 'a' COLLATE co2", "SELECT 'a' COLLATE s.co3"] {
+        let err = db.analyze(query).unwrap_err();
+        assert!(err.to_string().contains("does not exist"), "{query}: {err}");
+    }
+    build(&[(
+        "0001.sql",
+        "CREATE COLLATION co (locale = 'C');
+         ALTER COLLATION co RENAME TO co2;
+         DROP COLLATION co2;
+         CREATE SCHEMA s;
+         CREATE COLLATION co (locale = 'C');
+         ALTER COLLATION co SET SCHEMA s;
+         DROP COLLATION s.co;
+         CREATE COLLATION co (locale = 'C');
+         CREATE TABLE t (a text COLLATE co);
+         ALTER COLLATION co RENAME TO co2;
+         DROP COLLATION co2 CASCADE;",
+    )]);
+
+    let two = "CREATE COLLATION c1 (locale = 'C');
+               CREATE COLLATION c2 (provider = icu, locale = 'und');
+               CREATE SCHEMA s;
+               CREATE COLLATION s.c1 (provider = icu, locale = 'und');
+               CREATE COLLATION s.c2 (locale = 'C');";
+    assert_ddl_rejections(&[
+        (
+            two,
+            "ALTER COLLATION c2 RENAME TO c1;",
+            "collation \"c1\" for encoding \"UTF8\" already exists in schema \"public\"",
+        ),
+        (
+            two,
+            "ALTER COLLATION c1 RENAME TO c2;",
+            "collation \"c2\" already exists in schema \"public\"",
+        ),
+        (
+            two,
+            "ALTER COLLATION c1 SET SCHEMA s;",
+            "collation \"c1\" already exists in schema \"s\"",
+        ),
+        (
+            two,
+            "ALTER COLLATION c2 SET SCHEMA s;",
+            "collation \"c2\" for encoding \"UTF8\" already exists in schema \"s\"",
+        ),
+        (
+            two,
+            "CREATE COLLATION c1 (locale = 'C');",
+            "collation \"c1\" for encoding \"UTF8\" already exists",
+        ),
+        (
+            two,
+            "CREATE COLLATION c2 (locale = 'C');",
+            "collation \"c2\" already exists",
+        ),
+        (
+            two,
+            "CREATE COLLATION c1 (provider = icu, locale = 'und');",
+            "collation \"c1\" already exists",
+        ),
+        (
+            two,
+            "CREATE COLLATION c1 FROM \"C\";",
+            "collation \"c1\" already exists",
+        ),
+        (
+            two,
+            "ALTER COLLATION c1 SET SCHEMA pg_temp;",
+            "cannot move objects into or out of temporary schemas",
+        ),
+        (
+            two,
+            "ALTER COLLATION c1 SET SCHEMA pg_toast;",
+            "cannot move objects into or out of TOAST schema",
+        ),
+        (
+            two,
+            "ALTER COLLATION c1 SET SCHEMA nosch;",
+            "schema \"nosch\" does not exist",
+        ),
+        (
+            "",
+            "ALTER COLLATION nope SET SCHEMA nosch;",
+            "collation \"nope\" for encoding \"UTF8\" does not exist",
+        ),
+        (
+            "",
+            "ALTER COLLATION nope RENAME TO x;",
+            "collation \"nope\" for encoding \"UTF8\" does not exist",
+        ),
+        (
+            "",
+            "ALTER COLLATION public.nope RENAME TO x;",
+            "collation \"public.nope\" for encoding \"UTF8\" does not exist",
+        ),
+        (
+            "",
+            "ALTER COLLATION nosch.nope RENAME TO x;",
+            "schema \"nosch\" does not exist",
+        ),
+        (
+            "",
+            "ALTER COLLATION nope REFRESH VERSION;",
+            "collation \"nope\" for encoding \"UTF8\" does not exist",
+        ),
+        (
+            "",
+            "ALTER COLLATION nope OWNER TO CURRENT_USER;",
+            "collation \"nope\" for encoding \"UTF8\" does not exist",
+        ),
+        (
+            "",
+            "COMMENT ON COLLATION nosch.nope IS 'x';",
+            "schema \"nosch\" does not exist",
+        ),
+    ]);
+}
+
+#[test]
+fn a_stored_reg_constant_pins_what_it_names() {
+    // find_expr_references_walker: a regproc / regprocedure / regoper /
+    // regoperator / regtype / regclass constant depends on its object.
+    let f = "CREATE FUNCTION f(int) RETURNS int LANGUAGE sql AS 'SELECT 1';";
+    let op = "CREATE FUNCTION f2(int, int) RETURNS int LANGUAGE sql AS 'SELECT 1';
+              CREATE OPERATOR ### (leftarg = int, rightarg = int, function = f2);";
+    let cases: Vec<(String, &str, &str)> = vec![
+        (
+            format!("{f} CREATE VIEW v AS SELECT 'f'::regproc AS p;"),
+            "DROP FUNCTION f(int);",
+            "cannot drop function f(integer) because other objects depend on it",
+        ),
+        (
+            format!("{f} CREATE VIEW v AS SELECT 'f(int)'::regprocedure AS p;"),
+            "DROP FUNCTION f(int);",
+            "cannot drop function f(integer) because other objects depend on it",
+        ),
+        (
+            format!("{op} CREATE VIEW v AS SELECT '###'::regoper AS p;"),
+            "DROP OPERATOR ###(int, int);",
+            "cannot drop operator ###(integer,integer) because other objects depend on it",
+        ),
+        (
+            format!("{op} CREATE VIEW v AS SELECT '###(int,int)'::regoperator AS p;"),
+            "DROP OPERATOR ###(int, int);",
+            "cannot drop operator ###(integer,integer) because other objects depend on it",
+        ),
+        (
+            "CREATE TYPE ty AS (a int); CREATE VIEW v AS SELECT 'ty'::regtype AS p;".into(),
+            "DROP TYPE ty;",
+            "cannot drop type ty because other objects depend on it",
+        ),
+        // On the array type, which is part of its element type.
+        (
+            "CREATE TYPE ty AS (a int); CREATE VIEW v AS SELECT 'ty[]'::regtype AS p;".into(),
+            "DROP TYPE ty;",
+            "cannot drop type ty because other objects depend on it",
+        ),
+        (
+            "CREATE TABLE tt (a int); CREATE VIEW v AS SELECT '_tt'::regtype AS p;".into(),
+            "DROP TABLE tt;",
+            "cannot drop table tt because other objects depend on it",
+        ),
+        // An untyped literal coerced to the reg type is a constant too.
+        (
+            "CREATE TYPE ty AS (a int); CREATE TABLE t (a regtype DEFAULT 'ty');".into(),
+            "DROP TYPE ty;",
+            "cannot drop type ty because other objects depend on it",
+        ),
+        (
+            format!("{f} CREATE TABLE t (a regproc DEFAULT 'f');"),
+            "DROP FUNCTION f(int);",
+            "cannot drop function f(integer) because other objects depend on it",
+        ),
+        (
+            format!("{f} CREATE TABLE t (a regprocedure DEFAULT 'f(int)');"),
+            "DROP FUNCTION f(int);",
+            "cannot drop function f(integer) because other objects depend on it",
+        ),
+        (
+            "CREATE COLLATION co (locale = 'C'); CREATE TABLE t (a regcollation DEFAULT 'co');"
+                .into(),
+            "DROP COLLATION co;",
+            "cannot drop collation co because other objects depend on it",
+        ),
+        (
+            "CREATE SCHEMA s; CREATE TABLE t (a regnamespace DEFAULT 's');".into(),
+            "DROP SCHEMA s;",
+            "cannot drop schema s because other objects depend on it",
+        ),
+        (
+            "CREATE TYPE ty AS (a int); CREATE DOMAIN dr AS regtype;
+             CREATE TABLE t (a dr DEFAULT 'ty');"
+                .into(),
+            "DROP TYPE ty;",
+            "cannot drop type ty because other objects depend on it",
+        ),
+        (
+            "CREATE TYPE ty AS (a int); CREATE TABLE t (a regtype);
+             ALTER TABLE t ALTER a SET DEFAULT 'ty';"
+                .into(),
+            "DROP TYPE ty;",
+            "cannot drop type ty because other objects depend on it",
+        ),
+        (
+            "CREATE TYPE ty AS (a int);
+             CREATE TABLE t (a regtype GENERATED ALWAYS AS ('ty') STORED);"
+                .into(),
+            "DROP TYPE ty;",
+            "cannot drop type ty because other objects depend on it",
+        ),
+        (
+            "CREATE TYPE ty AS (a int); CREATE DOMAIN d AS regtype DEFAULT 'ty';".into(),
+            "DROP TYPE ty;",
+            "cannot drop type ty because other objects depend on it",
+        ),
+        (
+            "CREATE TYPE ty AS (a int); CREATE VIEW v AS SELECT COALESCE(NULL::regtype, 'ty') AS x;"
+                .into(),
+            "DROP TYPE ty;",
+            "cannot drop type ty because other objects depend on it",
+        ),
+        (
+            "CREATE SCHEMA s; CREATE TABLE t (a regnamespace); CREATE TABLE u (b int);
+             CREATE RULE r AS ON INSERT TO u DO ALSO INSERT INTO t VALUES ('s');"
+                .into(),
+            "DROP SCHEMA s;",
+            "cannot drop schema s because other objects depend on it",
+        ),
+    ];
+    for (setup, stmt, msg) in &cases {
+        assert_ddl_rejections(&[(setup, stmt, msg)]);
+    }
+    // With CASCADE the view goes; a name cast from text is looked up when
+    // the view runs and pins nothing.
+    for (setup, stmt) in [
+        (
+            format!("{f} CREATE VIEW v AS SELECT 'f(int)'::regprocedure AS p;"),
+            "DROP FUNCTION f(int) CASCADE;",
+        ),
+        (
+            format!("{op} CREATE VIEW v AS SELECT '###(int,int)'::regoperator AS p;"),
+            "DROP OPERATOR ###(int, int) CASCADE;",
+        ),
+        (
+            "CREATE TYPE ty AS (a int); CREATE VIEW v AS SELECT 'ty[]'::regtype AS p;".into(),
+            "DROP TYPE ty CASCADE;",
+        ),
+        (
+            format!(
+                "{f} CREATE VIEW w AS SELECT 'f'::text::regproc AS p; CREATE VIEW v AS SELECT 1 AS p;"
+            ),
+            "DROP FUNCTION f(int); DROP VIEW v;",
+        ),
+        // Nor does an array of them: the dependency is on a scalar
+        // constant only.
+        (
+            "CREATE TYPE ty AS (a int); CREATE TABLE t (a regtype[] DEFAULT '{ty}');
+             CREATE VIEW w AS SELECT '{ty}'::regtype[] AS p; CREATE VIEW v AS SELECT 1 AS p;"
+                .into(),
+            "DROP TYPE ty; DROP VIEW v;",
+        ),
+    ] {
+        assert_gone(
+            &format!("{setup} {stmt}"),
+            "SELECT * FROM v",
+            "relation \"v\" does not exist",
+        );
+    }
+}
+
+#[test]
+fn what_a_table_owns_may_use_its_row_type() {
+    // A table's own CHECK constraints, indexes and policies go with it,
+    // whatever they refer to of it — its row type and that type's array
+    // type included.
+    build(&[(
+        "0001.sql",
+        "CREATE TABLE tb (a int CHECK (ROW(a)::tb IS NOT NULL));
+         CREATE POLICY p ON tb USING ((NULL::tb).a IS NULL);
+         DROP TABLE tb;
+         CREATE TABLE tt (a int, CHECK ('tt[]'::regtype IS NOT NULL),
+                          CHECK ('tt'::regtype IS NOT NULL));
+         CREATE INDEX ON tt (('tt'::regtype::oid));
+         CREATE INDEX ON tt (a) WHERE 'tt[]'::regtype IS NOT NULL;
+         DROP TABLE tt;
+         CREATE TABLE tt (b int);
+         CREATE INDEX tt_oid_idx ON tt (b);",
+    )]);
+    // Another table's are not its own.
+    assert_ddl_rejections(&[
+        (
+            "CREATE TABLE tt (a int); CREATE TABLE o (a int, CHECK ('tt'::regtype IS NOT NULL));",
+            "DROP TABLE tt;",
+            "cannot drop table tt because other objects depend on it",
+        ),
+        (
+            "CREATE TABLE tt (a int); CREATE TABLE o (a int);
+             CREATE INDEX ON o (('tt[]'::regtype::oid));",
+            "DROP TABLE tt;",
+            "cannot drop table tt because other objects depend on it",
+        ),
+    ]);
+}
+
+#[test]
+fn a_domain_depends_on_what_its_default_uses() {
+    // GenerateTypeDependencies: a domain depends on its default's
+    // objects; ALTER DOMAIN ... SET / DROP DEFAULT records them anew.
+    let f = "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT 1';";
+    assert_ddl_rejections(&[
+        (
+            &format!("{f} CREATE DOMAIN d AS int DEFAULT f();"),
+            "DROP FUNCTION f();",
+            "cannot drop function f() because other objects depend on it",
+        ),
+        (
+            &format!("{f} CREATE DOMAIN d AS int; ALTER DOMAIN d SET DEFAULT f();"),
+            "DROP FUNCTION f();",
+            "cannot drop function f() because other objects depend on it",
+        ),
+        // The base type stays depended on.
+        (
+            "CREATE TYPE ty AS (a int); CREATE DOMAIN d AS ty DEFAULT NULL;
+             ALTER DOMAIN d SET DEFAULT NULL; ALTER DOMAIN d DROP DEFAULT;",
+            "DROP TYPE ty;",
+            "cannot drop type ty because other objects depend on it",
+        ),
+    ]);
+    build(&[(
+        "0001.sql",
+        &format!(
+            "{f} CREATE DOMAIN d AS int DEFAULT f(); ALTER DOMAIN d SET DEFAULT 1;
+             DROP FUNCTION f();
+             {f} ALTER DOMAIN d SET DEFAULT f(); ALTER DOMAIN d DROP DEFAULT;
+             DROP FUNCTION f();"
+        ),
+    )]);
+    // With CASCADE the domain goes, and the columns of it.
+    let db = build_db(&[(
+        "0001.sql",
+        &format!(
+            "{f} CREATE DOMAIN d AS int DEFAULT f(); CREATE TABLE t (a d, b int);
+             DROP FUNCTION f() CASCADE;"
+        ),
+    )]);
+    assert_eq!(db.analyze("SELECT * FROM t").unwrap().columns.len(), 1);
+    let err = db.analyze("SELECT NULL::d").unwrap_err();
+    assert!(
+        err.to_string().starts_with("type \"d\" does not exist"),
+        "{err}"
+    );
 }

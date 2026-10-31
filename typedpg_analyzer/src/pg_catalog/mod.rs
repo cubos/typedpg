@@ -88,6 +88,7 @@ pub const PG_OPERATOR_RELID: PgClassOid = PgClassOid::from_raw(2617);
 pub const PG_CAST_RELID: PgClassOid = PgClassOid::from_raw(2605);
 pub const PG_EXTENSION_RELID: PgClassOid = PgClassOid::from_raw(3079);
 pub const PG_LANGUAGE_RELID: PgClassOid = PgClassOid::from_raw(2612);
+pub const PG_COLLATION_RELID: PgClassOid = PgClassOid::from_raw(3456);
 
 /// The OIDs initdb gives the built-in languages (pg_language.dat).
 pub const INTERNAL_LANGUAGE: PgLanguageOid = PgLanguageOid::from_raw(12);
@@ -1760,6 +1761,18 @@ impl PgCatalog {
         self.pg_cast.insert(row.oid, row);
     }
 
+    /// The `pg_cast` row for `source → target` as PostgreSQL has it, for
+    /// the commands naming a cast (DROP CAST, COMMENT ON CAST): no cast
+    /// targets `record` there — the row type → record casts the analyzer
+    /// keeps (`register_composite_to_record_cast`) stand for a coercion
+    /// PG makes without one.
+    pub(crate) fn catalog_cast(&self, source: PgTypeOid, target: PgTypeOid) -> Option<PgCastOid> {
+        if target == oid::RECORD {
+            return None;
+        }
+        self.cast_by_pair.get(&(source, target)).copied()
+    }
+
     pub(crate) fn remove_pg_cast(&mut self, oid: PgCastOid) -> Option<PgCast> {
         let row = self.pg_cast.remove(&oid)?;
         self.cast_by_pair.remove(&(row.castsource, row.casttarget));
@@ -1797,13 +1810,17 @@ impl PgCatalog {
         self.pg_rewrite.insert(row.oid, row);
     }
 
-    #[allow(dead_code)] // Used only by user-DDL `CREATE COLLATION` once implemented;
-    // exists today so the test/internal feature surface is symmetric with
-    // `insert_pg_*` for the other catalog tables.
     pub(crate) fn insert_pg_collation(&mut self, row: PgCollation) {
         self.collation_by_qname
             .insert((row.collnamespace, row.collname.clone()), row.oid);
         self.pg_collation.insert(row.oid, row);
+    }
+
+    pub(crate) fn remove_pg_collation(&mut self, oid: PgCollationOid) -> Option<PgCollation> {
+        let row = self.pg_collation.remove(&oid)?;
+        self.collation_by_qname
+            .remove(&(row.collnamespace, row.collname.clone()));
+        Some(row)
     }
 
     /// Resolve a collation name (with optional schema) against the catalog.

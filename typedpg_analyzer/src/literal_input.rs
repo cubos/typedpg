@@ -25,6 +25,15 @@
 use crate::oid::PgTypeOid;
 use crate::pg_catalog::{PgCatalog, TypCategory, TypType, oid};
 
+/// Validate a container's elements (an array's, a record's fields, a
+/// range's bounds) without noting what reg* ones name: a stored constant
+/// depends on the object of a scalar reg* value only
+/// (find_expr_references_walker doesn't look inside an array or a
+/// composite datum).
+fn unnoted(f: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+    crate::ddl::depend::collect(f).0
+}
+
 /// Outcome of validating literal `content` against `target`: `Ok(())` when PG
 /// would accept it (or we can't tell), `Err(message)` with PG's verbatim
 /// parse-time error when it provably wouldn't.
@@ -111,19 +120,19 @@ pub(crate) fn validate_with_typmod(
     if t.typtype == TypType::Composite
         && let Some(relid) = t.typrelid
     {
-        return validate_record(content, relid, snapshot);
+        return unnoted(|| validate_record(content, relid, snapshot));
     }
 
     // Ranges and multiranges: `range_in` / `multirange_in` (see
     // `crate::range_input`), bounds validated with the subtype.
     if t.typtype == TypType::Range {
-        return crate::range_input::validate_range(content, target, snapshot);
+        return unnoted(|| crate::range_input::validate_range(content, target, snapshot));
     }
     if t.typtype == TypType::Multirange {
         let Some(range) = snapshot.range_of_multirange(target) else {
             return Ok(());
         };
-        return crate::range_input::validate_multirange(content, range, snapshot);
+        return unnoted(|| crate::range_input::validate_multirange(content, range, snapshot));
     }
 
     // True arrays: `array_in`'s grammar (see `crate::array_input`), each
@@ -135,7 +144,7 @@ pub(crate) fn validate_with_typmod(
         && let Some(elem) = t.typelem
         && snapshot.array_type_of(elem) == Some(target)
     {
-        return validate_array(content, elem, snapshot);
+        return unnoted(|| validate_array(content, elem, snapshot));
     }
 
     // Name-resolving and fixed-syntax pg_catalog builtins, keyed by name.
