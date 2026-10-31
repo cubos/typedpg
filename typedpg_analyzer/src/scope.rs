@@ -100,6 +100,11 @@ pub(crate) struct Deferred {
     /// own: [`Self::value`] and [`Self::entry`] are raised only where a
     /// reference to it is certainly planned.
     pub alone: Option<PlannedAlone>,
+    /// Raised wherever a reference to the entry is, unless it is by itself
+    /// the nullable side of a join `join_is_removable` may drop: what
+    /// estimating the restrictions of an inlined CTE's one relation,
+    /// pulled up, raises.
+    pub unless_removed: Option<Box<crate::error::AnalyzeError>>,
 }
 
 /// How the planner plans an inlined CTE it doesn't pull up: on its own,

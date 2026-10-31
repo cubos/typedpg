@@ -207,8 +207,9 @@ pub(crate) fn joined_any_sublink(
 /// (anti-) join before the clause is folded
 /// (`convert_EXISTS_sublink_to_join`): `simplify_EXISTS_query` can throw
 /// its select list away (no aggregate, window or set-returning function,
-/// grouping, HAVING, OFFSET, LIMIT but a positive one, locking, set
-/// operation or WITH), its
+/// grouping set, HAVING, OFFSET, LIMIT but a positive or NULL one,
+/// locking, set operation or WITH) with its GROUP BY, WINDOW, DISTINCT
+/// and ORDER BY clauses, its
 /// FROM reads plain relations only, and its WHERE reads a column of the
 /// level (`is_level_column`, of a column named by no FROM item of the
 /// subquery) and calls nothing volatile. Its FROM items then join the
@@ -228,15 +229,24 @@ pub(crate) fn joined_exists_sublink(
     if sel.op != protobuf::SetOperation::SetopNone as i32
         || !sel.values_lists.is_empty()
         || sel.with_clause.is_some()
-        || !sel.group_clause.is_empty()
-        || sel.having_clause.is_some()
-        || !sel.window_clause.is_empty()
-        || sel.limit_offset.is_some()
-        // A positive constant LIMIT is dropped.
+        // GROUP BY (WINDOW, DISTINCT, ORDER BY) is thrown away; grouping
+        // sets are not.
         || sel
-            .limit_count
-            .as_deref()
-            .is_some_and(|l| int_literal(l).is_none_or(|n| n <= 0))
+            .group_clause
+            .iter()
+            .filter_map(|g| g.node.as_ref())
+            .any(|g| {
+                g.nodes()
+                    .into_iter()
+                    .any(|(n, _)| matches!(n, typedpg_pg_query::NodeRef::GroupingSet(_)))
+            })
+        || sel.having_clause.is_some()
+        || sel.limit_offset.is_some()
+        // A positive or NULL (ALL) constant LIMIT is dropped.
+        || sel.limit_count.as_deref().is_some_and(|l| {
+            !matches!(l.node.as_ref(), Some(node::Node::AConst(c)) if c.isnull)
+                && int_literal(l).is_none_or(|n| n <= 0)
+        })
         || !sel.locking_clause.is_empty()
     {
         return false;
@@ -892,6 +902,10 @@ thread_local! {
     /// [`skip_restrictions_on`]).
     static SKIPPED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
     static SKIP_DEPTH: Cell<usize> = const { Cell::new(0) };
+    /// What estimating the skipped FROM items' restrictions raises, while
+    /// [`record_unless_removed`] collects it.
+    static UNLESS_REMOVED: RefCell<Option<Vec<super::PlanTimeError>>> =
+        const { RefCell::new(None) };
 }
 
 /// Run `f`, the analysis of a query level planned as `next`.
@@ -1631,6 +1645,45 @@ pub(crate) fn skip_restrictions_on<R>(aliases: Vec<String>, f: impl FnOnce() -> 
     SKIP_DEPTH.with(|d| d.set(d.get() - 1));
     SKIPPED.with(|s| *s.borrow_mut() = saved);
     out
+}
+
+/// [`skip_restrictions_on`], collecting what estimating the restrictions
+/// of `aliases` raises (see [`record_skipped`]) rather than dropping it:
+/// what a reference raises unless the join it is on removes it.
+pub(crate) fn record_unless_removed<R>(
+    aliases: Vec<String>,
+    f: impl FnOnce() -> R,
+) -> (R, Vec<super::PlanTimeError>) {
+    let prev = UNLESS_REMOVED.with(|s| s.replace(Some(Vec::new())));
+    let out = skip_restrictions_on(aliases, f);
+    let errors = UNLESS_REMOVED.with(|s| s.replace(prev)).unwrap_or_default();
+    (out, errors)
+}
+
+/// Whether FROM item `alias`'s restrictions are skipped while
+/// [`record_unless_removed`] collects them: `estimated` tells whether
+/// they would be estimated otherwise.
+pub(crate) fn records_skipped(alias: &str, estimated: impl FnOnce() -> bool) -> bool {
+    if UNLESS_REMOVED.with(|s| s.borrow().is_none())
+        || SKIP_DEPTH.with(Cell::get) == 0
+        || !SKIPPED.with(|s| s.borrow().iter().any(|a| a == alias))
+    {
+        return false;
+    }
+    let depth = SKIP_DEPTH.with(|d| d.replace(0));
+    let out = estimated();
+    SKIP_DEPTH.with(|d| d.set(depth));
+    out
+}
+
+/// Collect error `e` estimating a skipped restriction (see
+/// [`records_skipped`]).
+pub(crate) fn record_skipped(location: Option<i32>, e: crate::error::AnalyzeError) {
+    UNLESS_REMOVED.with(|s| {
+        if let Some(errors) = s.borrow_mut().as_mut() {
+            errors.push((location, e));
+        }
+    });
 }
 
 /// Whether the restrictions of FROM item `alias` of the current level are

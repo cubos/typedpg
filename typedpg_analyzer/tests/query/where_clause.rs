@@ -909,3 +909,89 @@ fn a_left_join_keeps_a_subquery_it_cannot_prove_distinct() {
         db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
 }
+
+#[test]
+fn a_pulled_up_nullable_side_the_join_removes_is_not_estimated() {
+    // A subquery (an inlined CTE, a view) pulled up as the whole nullable
+    // side of a LEFT / RIGHT join is its one relation there:
+    // `join_is_removable` drops it when the join condition equates its
+    // unique key and nothing above reads it, before its restrictions are
+    // estimated. An unused WINDOW clause doesn't keep it from being
+    // pulled up (`is_simple_subquery` asks `hasWindowFuncs`).
+    let mut db = planner_setup();
+    db.apply_sql("CREATE VIEW rv AS SELECT id FROM rt WHERE s ~ '(';")
+        .unwrap();
+    for sql in [
+        "SELECT 1 FROM rt2 LEFT JOIN (SELECT id FROM rt WHERE s ~ '(') x ON x.id = rt2.id",
+        "SELECT 1 FROM rt2 LEFT JOIN (SELECT id FROM rt WHERE s ~ '(' WINDOW w AS (ORDER BY id)) x \
+         ON x.id = rt2.id",
+        "SELECT 1 FROM rt2 LEFT JOIN (SELECT id FROM rt r WHERE r.s ~ '(') x USING (id)",
+        "SELECT 1 FROM (SELECT id FROM rt WHERE s ~ '(') x RIGHT JOIN rt2 ON x.id = rt2.id",
+        "SELECT 1 FROM rt2 LEFT JOIN rv ON rv.id = rt2.id",
+        "WITH c AS (SELECT id FROM rt WHERE s ~ '(') SELECT 1 FROM rt2 LEFT JOIN c ON c.id = rt2.id",
+        "WITH c AS (SELECT id FROM rt WHERE s ~ '(' WINDOW w AS ()) \
+         SELECT 1 FROM rt2 LEFT JOIN c ON c.id = rt2.id",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    // Kept, joined on no equality, beside another relation, or (constant
+    // folding) whatever the join: planned.
+    for sql in [
+        "SELECT 1 FROM rt2 JOIN (SELECT id FROM rt WHERE s ~ '(' WINDOW w AS (ORDER BY id)) x \
+         ON x.id = rt2.id",
+        "SELECT 1 FROM t, (SELECT id FROM rt WHERE s ~ '(' WINDOW w AS ()) x WHERE t.id IS NULL",
+        "SELECT 1 FROM rt2 LEFT JOIN (SELECT id FROM rt WHERE s ~ '(') x ON true",
+        "SELECT 1 FROM rt2 LEFT JOIN (SELECT id FROM rt WHERE s ~ '(') x ON x.id > rt2.id",
+        "SELECT 1 FROM rt2 FULL JOIN (SELECT id FROM rt WHERE s ~ '(') x ON x.id = rt2.id",
+        "SELECT 1 FROM rt2 LEFT JOIN (SELECT id, row_number() OVER w FROM rt WHERE s ~ '(' \
+         WINDOW w AS (ORDER BY id)) x ON x.id = rt2.id",
+        "SELECT 1 FROM rt2 JOIN rv ON rv.id = rt2.id",
+        "SELECT 1 FROM rt2 LEFT JOIN rv ON true",
+        "WITH c AS (SELECT id FROM rt WHERE s ~ '(') SELECT 1 FROM rt2 LEFT JOIN c ON true",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::Invalid(_),
+            "invalid regular expression: parentheses () not balanced"
+        );
+    }
+    for sql in [
+        "SELECT 1 FROM rt2 LEFT JOIN (SELECT id FROM rt WHERE 1 / 0 = 1) x ON x.id = rt2.id",
+        "WITH c AS (SELECT id FROM rt WHERE 1 / 0 = 1) SELECT 1 FROM rt2 LEFT JOIN c ON c.id = rt2.id",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::DivisionByZero(_),
+            "division by zero"
+        );
+    }
+}
+
+#[test]
+fn an_exists_sublink_drops_its_group_by_window_and_null_limit() {
+    // `simplify_EXISTS_query` throws GROUP BY, WINDOW, DISTINCT and ORDER
+    // BY away and drops a NULL (ALL) LIMIT: the EXISTS still becomes a
+    // semi-join before the FALSE qual is folded. Grouping sets keep it.
+    let db = planner_setup();
+    for sql in [
+        "SELECT 1 FROM t WHERE EXISTS (SELECT 1 FROM rt WHERE rt.id = t.id AND s ~ '(' \
+         WINDOW w AS ()) AND false",
+        "SELECT 1 FROM t WHERE EXISTS (SELECT 1 FROM rt WHERE rt.id = t.id AND s ~ '(' \
+         GROUP BY rt.id) AND false",
+        "SELECT 1 FROM t WHERE EXISTS (SELECT 1 FROM rt WHERE rt.id = t.id AND s ~ '(' \
+         LIMIT NULL) AND false",
+        "SELECT 1 FROM t WHERE EXISTS (SELECT 1 FROM rt WHERE rt.id = t.id AND s ~ '(' \
+         LIMIT ALL) AND false",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::Invalid(_),
+            "invalid regular expression: parentheses () not balanced"
+        );
+    }
+    db.analyze(
+        "SELECT 1 FROM t WHERE EXISTS (SELECT 1 FROM rt WHERE rt.id = t.id AND s ~ '(' \
+         GROUP BY ROLLUP (rt.id)) AND false",
+    )
+    .unwrap();
+}

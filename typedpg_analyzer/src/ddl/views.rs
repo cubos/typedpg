@@ -2412,6 +2412,7 @@ pub(crate) fn planned_view_errors(
     snapshot: &PgCatalog,
     relid: PgClassOid,
     kept: bool,
+    removable_side: bool,
 ) -> Option<crate::resolve::Split> {
     /// FirstNormalObjectId (transam.h): below, what initdb made.
     const FIRST_NORMAL_OBJECT_ID: u32 = 16384;
@@ -2428,7 +2429,7 @@ pub(crate) fn planned_view_errors(
     // The query is another text: its errors keep their plain messages.
     let _barrier = crate::error::DiagContextGuard::barrier();
     let ((analyzed, references), split) = expanding_view(relid, || {
-        crate::resolve::planned_errors(sel, snapshot, barrier, kept, || {
+        crate::resolve::planned_errors(sel, snapshot, barrier, kept, removable_side, || {
             super::depend::collect(|| crate::resolve::analyze_raw_node(snapshot, inner, &[]))
         })
     })??;

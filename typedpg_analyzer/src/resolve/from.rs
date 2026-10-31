@@ -54,6 +54,40 @@ thread_local! {
     /// level's rows: it is a FROM-list item, or a side of joins that
     /// preserve it all the way up.
     static ROWS_KEPT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The FROM subquery (or view) about to be processed is, by itself, the
+    /// nullable side of a LEFT / RIGHT join whose condition may equate it
+    /// to the other side: `join_is_removable` may drop it.
+    static REMOVABLE_SIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f`, processing `arg`, the nullable side of a LEFT / RIGHT join
+/// (see [`REMOVABLE_SIDE`]).
+fn with_nullable_side<R>(
+    join: &protobuf::JoinExpr,
+    arg: &protobuf::Node,
+    f: impl FnOnce() -> R,
+) -> R {
+    let equates = join.is_natural
+        || !join.using_clause.is_empty()
+        || join
+            .quals
+            .as_deref()
+            .and_then(|q| q.node.as_ref())
+            .is_some_and(|q| {
+                q.nodes().into_iter().any(|(n, _)| {
+                    matches!(n, typedpg_pg_query::NodeRef::AExpr(e)
+                    if crate::expr::extract_string_fields(&e.name).last().is_some_and(|o| o == "="))
+                })
+            });
+    let alone = equates
+        && matches!(
+            arg.node,
+            Some(node::Node::RangeSubselect(_) | node::Node::RangeVar(_))
+        );
+    let before = REMOVABLE_SIDE.with(|k| k.replace(alone));
+    let out = f();
+    REMOVABLE_SIDE.with(|k| k.set(before));
+    out
 }
 
 fn rows_kept() -> bool {
@@ -82,6 +116,7 @@ pub(crate) fn process_from_item(
 
     match inner {
         node::Node::RangeVar(rv) => {
+            let removable_side = REMOVABLE_SIDE.with(|k| k.replace(false));
             check_rangevar_catalog(rv)?;
             let alias = rv
                 .alias
@@ -102,7 +137,7 @@ pub(crate) fn process_from_item(
             {
                 check_cte_reference(cte_scopes, &rv.relname)?;
                 super::deferred::unless_planned_alone(&mut cte_cols, alias, rows_kept());
-                super::deferred::reference_cte(&cte_cols, rv.location)?;
+                super::deferred::reference_cte(&cte_cols, rv.location, removable_side)?;
                 if rows_kept()
                     && crate::expr::plan_time_checks()
                     && !crate::expr::plan_fold::level_may_be_dummy()
@@ -157,8 +192,12 @@ pub(crate) fn process_from_item(
             if crate::expr::plan_time_checks()
                 && let Some(class) = snapshot.resolve_table(schema, &rv.relname)
                 && class.relkind == crate::pg_catalog::RelKind::View
-                && let Some(planned) =
-                    crate::ddl::views::planned_view_errors(snapshot, class.oid, rows_kept())
+                && let Some(planned) = crate::ddl::views::planned_view_errors(
+                    snapshot,
+                    class.oid,
+                    rows_kept(),
+                    removable_side,
+                )
             {
                 if let Some((_, e)) = planned.rest
                     && let Some(e) = crate::expr::plan_time_error(Some(rv.location), e)
@@ -340,6 +379,7 @@ pub(crate) fn process_from_item(
             process_join_expr(join, scope, null_ctx, snapshot, cte_scopes, params)?;
         }
         node::Node::RangeSubselect(sub) => {
+            let removable_side = REMOVABLE_SIDE.with(|k| k.replace(false));
             // PG 16+ accepts an unaliased subquery and gives it no
             // referencable name.
             let alias_owned = match sub.alias.as_ref() {
@@ -415,8 +455,14 @@ pub(crate) fn process_from_item(
                 let mut planned = super::deferred::Split::default();
                 let plan = super::deferred::plan_of(sel, snapshot);
                 let (analyzed, correlated) = crate::nonnull::capture_correlation(sel, || {
-                    let (analyzed, split) =
-                        super::deferred::analyze(plan, sel, rows_kept(), alias, snapshot, || {
+                    let (analyzed, split) = super::deferred::analyze(
+                        plan,
+                        sel,
+                        rows_kept(),
+                        removable_side,
+                        alias,
+                        snapshot,
+                        || {
                             crate::grouping::with_visible_entries(visible, || {
                                 analyze_select_with_ctes_and_outer(
                                     sel,
@@ -428,7 +474,8 @@ pub(crate) fn process_from_item(
                                     &shadowed_sources,
                                 )
                             })
-                        });
+                        },
+                    );
                     planned = split;
                     analyzed
                 });
@@ -484,6 +531,7 @@ pub(crate) fn process_from_item(
                             },
                             expr: exprs.next().flatten(),
                             alone: None,
+                            unless_removed: None,
                         },
                         name: rc.name,
                         type_oid: rc.type_oid,
@@ -1001,7 +1049,14 @@ fn process_join_expr(
     let left = SourceSpan::capture(scope, |scope| match &join.larg {
         Some(larg) => with_rows_kept(
             kept && matches!(join_type, JoinType::JoinInner | JoinType::JoinLeft),
-            || process_from_item(larg, scope, null_ctx, snapshot, cte_scopes, params),
+            || {
+                let mut process =
+                    || process_from_item(larg, scope, null_ctx, snapshot, cte_scopes, params);
+                match join_type {
+                    JoinType::JoinRight => with_nullable_side(join, larg, process),
+                    _ => process(),
+                }
+            },
         ),
         None => Ok(()),
     })?;
@@ -1021,7 +1076,14 @@ fn process_join_expr(
     let right = SourceSpan::capture(scope, |scope| match &join.rarg {
         Some(rarg) => with_rows_kept(
             kept && matches!(join_type, JoinType::JoinInner | JoinType::JoinRight),
-            || process_from_item(rarg, scope, null_ctx, snapshot, cte_scopes, params),
+            || {
+                let mut process =
+                    || process_from_item(rarg, scope, null_ctx, snapshot, cte_scopes, params);
+                match join_type {
+                    JoinType::JoinLeft => with_nullable_side(join, rarg, process),
+                    _ => process(),
+                }
+            },
         ),
         None => Ok(()),
     });
