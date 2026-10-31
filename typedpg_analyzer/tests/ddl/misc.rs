@@ -4120,6 +4120,179 @@ fn access_methods_and_operator_classes() {
 }
 
 #[test]
+fn extended_statistics_need_an_ordering_operator() {
+    // CreateStatistics: a column — by name or in parentheses, a Var — needs
+    // its type's `<` (lookup_type_cache's TYPECACHE_LT_OPR, which an array
+    // or a composite has only if its element / every field has one); an
+    // expression needs it too, unless it is the only one.
+    let setup = "CREATE TYPE pc AS (x point);
+                 CREATE TABLE t (a int, b text, p point[], q pc, pt point,
+                                 g int GENERATED ALWAYS AS (a) VIRTUAL);";
+    let expression = |typ: &str| {
+        format!(
+            "expression cannot be used in multivariate statistics because its type {typ} has \
+             no default btree operator class"
+        )
+    };
+    let column = |name: &str, typ: &str| {
+        format!(
+            "column \"{name}\" cannot be used in statistics because its type {typ} has no \
+             default btree operator class"
+        )
+    };
+    let system = "statistics creation on system columns is not supported";
+    for (stmt, msg) in [
+        (
+            "CREATE STATISTICS ON (b::unknown), a FROM t;",
+            expression("unknown"),
+        ),
+        (
+            "CREATE STATISTICS ON ('a'), a FROM t;",
+            expression("unknown"),
+        ),
+        (
+            "CREATE STATISTICS ON (NULL), a FROM t;",
+            expression("unknown"),
+        ),
+        (
+            "CREATE STATISTICS ON (b::xml), a FROM t;",
+            expression("xml"),
+        ),
+        (
+            "CREATE STATISTICS ON (ARRAY[pt]), a FROM t;",
+            expression("point[]"),
+        ),
+        // Each element is checked in turn, before the duplicates.
+        (
+            "CREATE STATISTICS ON (a + 1), (b::unknown), (a + 1) FROM t;",
+            expression("unknown"),
+        ),
+        (
+            "CREATE STATISTICS ON (b::unknown), ctid FROM t;",
+            expression("unknown"),
+        ),
+        ("CREATE STATISTICS ON p, a FROM t;", column("p", "point[]")),
+        ("CREATE STATISTICS ON q, a FROM t;", column("q", "pc")),
+        (
+            "CREATE STATISTICS ON (pt), a FROM t;",
+            column("pt", "point"),
+        ),
+        ("CREATE STATISTICS ON (q), a FROM t;", column("q", "pc")),
+        ("CREATE STATISTICS ON (pt) FROM t;", column("pt", "point")),
+        (
+            "CREATE STATISTICS ON (pt::text), (pt) FROM t;",
+            column("pt", "point"),
+        ),
+        // A column in parentheses is the column.
+        (
+            "CREATE STATISTICS ON (a), a FROM t;",
+            "duplicate column name in statistics definition".into(),
+        ),
+        (
+            "CREATE STATISTICS ON (t.a), (a) FROM t;",
+            "duplicate column name in statistics definition".into(),
+        ),
+        (
+            "CREATE STATISTICS ON (a) FROM t;",
+            "extended statistics require at least 2 columns".into(),
+        ),
+        (
+            "CREATE STATISTICS (ndistinct) ON (a) FROM t;",
+            "extended statistics require at least 2 columns".into(),
+        ),
+        (
+            "CREATE STATISTICS ON (g), a FROM t;",
+            "statistics creation on virtual generated columns is not supported".into(),
+        ),
+        ("CREATE STATISTICS ON (ctid), a FROM t;", system.into()),
+        ("CREATE STATISTICS ON (t.ctid), a FROM t;", system.into()),
+        (
+            "CREATE STATISTICS ON (ctid::text), a FROM t;",
+            system.into(),
+        ),
+        // The whole row is attribute 0.
+        ("CREATE STATISTICS ON (t), a FROM t;", system.into()),
+        ("CREATE STATISTICS ON (t::text), a FROM t;", system.into()),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(&msg), "{stmt}\n  got: {err}");
+    }
+    // A single expression gets the regular statistics, whatever its type;
+    // an anonymous record's fields are only compared at run time.
+    for stmt in [
+        "CREATE STATISTICS ON (b::unknown) FROM t;",
+        "CREATE STATISTICS ON (ARRAY[pt]) FROM t;",
+        "CREATE STATISTICS ON (pt::text) FROM t;",
+        "CREATE STATISTICS ON (ROW(pt)), a FROM t;",
+        "CREATE STATISTICS ON (a), b FROM t;",
+        "CREATE STATISTICS ON (public.t.a), b FROM t;",
+    ] {
+        if let Err(err) = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]) {
+            panic!("{stmt}\n  rejected: {err}");
+        }
+    }
+}
+
+#[test]
+fn extended_statistics_field_selection_on_the_whole_row() {
+    // transformIndirection turns `(t).a` — a field of the whole-row Var —
+    // into the Var of `a`: the column, not the whole row.
+    let setup = "CREATE TYPE ct AS (f int, g text);
+                 CREATE TABLE t (a int, b text, c text, x point, co ct,
+                                 v int GENERATED ALWAYS AS (a + 1) VIRTUAL);";
+    for stmt in [
+        "CREATE STATISTICS ON ((t).a), b FROM t;",
+        "CREATE STATISTICS ON (a + (t).a), b FROM t;",
+        "CREATE STATISTICS ON ((t).a + 1), b FROM t;",
+        "CREATE STATISTICS ON (t.a + (t).a), b FROM t;",
+        "CREATE STATISTICS ON (((t).co).f), b FROM t;",
+        "CREATE STATISTICS ON (((t).co).f), (co) FROM t;",
+        "CREATE STATISTICS ON ((t).co), b FROM t;",
+    ] {
+        if let Err(err) = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]) {
+            panic!("{stmt}\n  rejected: {err}");
+        }
+    }
+    let system = "statistics creation on system columns is not supported";
+    let virt = "statistics creation on virtual generated columns is not supported";
+    for (stmt, msg) in [
+        // In parentheses, it is a column.
+        (
+            "CREATE STATISTICS ON ((t).a), a FROM t;",
+            "duplicate column name in statistics definition",
+        ),
+        (
+            "CREATE STATISTICS ON ((t).a) FROM t;",
+            "extended statistics require at least 2 columns",
+        ),
+        (
+            "CREATE STATISTICS ON ((t).x), b FROM t;",
+            "column \"x\" cannot be used in statistics because its type point has no default \
+             btree operator class",
+        ),
+        ("CREATE STATISTICS ON ((t).ctid), b FROM t;", system),
+        ("CREATE STATISTICS ON ((t).v), b FROM t;", virt),
+        ("CREATE STATISTICS ON ((t).v + 1), b FROM t;", virt),
+        (
+            "CREATE STATISTICS ON ((t).nope), b FROM t;",
+            "column t.nope does not exist",
+        ),
+        // The whole row itself is still attribute 0.
+        (
+            "CREATE STATISTICS ON (row_to_json(t)::text), b FROM t;",
+            system,
+        ),
+        (
+            "CREATE STATISTICS ON ((t).a + length(t::text)), b FROM t;",
+            system,
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+}
+
+#[test]
 fn extended_statistics_are_validated_and_tracked() {
     // PG 18 CreateStatistics / AlterStatistics / get_statistics_object_oid.
     let setup = "CREATE TABLE t (a int, b int, c int, j json);
