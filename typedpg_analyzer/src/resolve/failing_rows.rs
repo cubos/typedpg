@@ -104,7 +104,7 @@ enum Value {
 }
 
 /// An error evaluating a row surely raises.
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 struct Failure {
     message: String,
     /// Raised by a domain's coercion. That is parallel restricted
@@ -427,18 +427,34 @@ fn select_rows(
     }
     // Grouped, the one row of no FROM item is one group (a key naming an
     // output column, or its position, is no set-returning function the
-    // select list doesn't show).
+    // select list doesn't show), once per grouping set: `()` is one, as is
+    // `GROUPING SETS (())`; `GROUPING SETS ((), ())` two.
+    let mut grouping_sets = 1usize;
     let grouped_row = sel.group_clause.is_empty()
         || sel.from_clause.is_empty()
-            && sel.group_clause.iter().all(|g| {
-                matches!(
-                    g.node,
-                    Some(node::Node::ColumnRef(_))
-                        | Some(node::Node::AConst(protobuf::AConst {
-                            val: Some(protobuf::a_const::Val::Ival(_)),
-                            ..
-                        }))
-                )
+            && sel.group_clause.iter().all(|g| match g.node.as_ref() {
+                Some(node::Node::ColumnRef(_))
+                | Some(node::Node::AConst(protobuf::AConst {
+                    val: Some(protobuf::a_const::Val::Ival(_)),
+                    ..
+                })) => true,
+                Some(node::Node::GroupingSet(gs)) => match gs.kind() {
+                    protobuf::GroupingSetKind::GroupingSetEmpty => true,
+                    protobuf::GroupingSetKind::GroupingSetSets
+                        if gs.content.iter().all(|s| {
+                            matches!(
+                                s.node.as_ref(),
+                                Some(node::Node::GroupingSet(e))
+                                    if e.kind() == protobuf::GroupingSetKind::GroupingSetEmpty
+                            )
+                        }) && !gs.content.is_empty() =>
+                    {
+                        grouping_sets = grouping_sets.saturating_mul(gs.content.len());
+                        true
+                    }
+                    _ => false,
+                },
+                _ => false,
             });
     if !grouped_row || sel.having_clause.is_some() {
         return None;
@@ -453,6 +469,9 @@ fn select_rows(
         ..level
     };
     let mut count = source.as_ref().map_or(ONE, |s| s.rows.count);
+    if grouping_sets > 1 {
+        count.at_most_one = false;
+    }
     // What reading the source's rows raises projecting a set operation's
     // arms (see [`Rows::projection`]).
     let projection = match source.as_ref() {
@@ -500,8 +519,15 @@ fn select_rows(
         };
     }
     let projected = source.as_ref().is_some_and(|s| s.rows.projected);
+    let equated = equated_columns(sel.where_clause.as_deref());
     let ordered = sel.sort_clause.iter().find_map(|k| match k.node.as_ref() {
-        Some(node::Node::SortBy(sb)) => order_key_error(sel, level, &all, sb.node.as_deref()?),
+        Some(node::Node::SortBy(sb)) => {
+            let key = sb.node.as_deref()?;
+            if order_key_redundant(sel, level, key, &equated) {
+                return None;
+            }
+            order_key_error(sel, level, &all, key)
+        }
         _ => None,
     });
     // Without a WHERE, a qualification above may still be pushed down
@@ -569,6 +595,122 @@ fn order_key_error(
         _ => {}
     }
     level.error(key)
+}
+
+/// The conjuncts of the qualification `n`: its ANDed terms, flattened.
+fn conjuncts(n: &protobuf::Node) -> Vec<&protobuf::Node> {
+    match n.node.as_ref() {
+        Some(node::Node::BoolExpr(b)) if b.boolop == protobuf::BoolExprType::AndExpr as i32 => {
+            b.args.iter().flat_map(conjuncts).collect()
+        }
+        _ => vec![n],
+    }
+}
+
+/// The operator expression `e` may be an equality the planner puts in an
+/// equivalence class: an operator not named as an ordering one is (a
+/// user's could be a btree equality), and so is a single-item IN, which
+/// the parser makes one `=` (a NOT of `<>` is negated into one, too).
+fn may_equate(e: &protobuf::AExpr) -> bool {
+    let ordering = matches!(
+        expr::extract_string_fields(&e.name)
+            .last()
+            .map(String::as_str),
+        Some("<" | ">" | "<=" | ">=")
+    );
+    matches!(
+        e.kind(),
+        protobuf::AExprKind::AexprOp | protobuf::AExprKind::AexprIn
+    ) && !ordering
+}
+
+/// The column a column reference names (its last field).
+fn column_name(cr: &protobuf::ColumnRef) -> Option<&str> {
+    match cr.fields.last()?.node.as_ref()? {
+        node::Node::String(s) => Some(s.sval.as_str()),
+        _ => None,
+    }
+}
+
+/// The columns read by a conjunct of `qual` that may hold an equality
+/// (see [`may_equate`]): an equivalence class may hold them, with a
+/// constant, which leaves an ORDER BY key over them redundant
+/// (`pathkey_is_redundant`): the Sort by it is dropped, and with it the
+/// key's evaluation over every row.
+fn equated_columns(qual: Option<&protobuf::Node>) -> std::collections::HashSet<&str> {
+    let mut equated = std::collections::HashSet::new();
+    for c in qual.map(conjuncts).unwrap_or_default() {
+        let mut equality = false;
+        let mut columns = Vec::new();
+        super::walk::visit_same_level(c, &mut |x| match x.node.as_ref() {
+            Some(node::Node::AExpr(e)) => equality |= may_equate(e),
+            Some(node::Node::ColumnRef(cr)) => columns.extend(column_name(cr)),
+            _ => {}
+        });
+        if equality {
+            equated.extend(columns);
+        }
+    }
+    equated
+}
+
+/// ORDER BY key `key` of `sel` may be one the planner drops as redundant:
+/// a constant, or one whose every column (through the output column the
+/// key names, by position or alias) is in `equated` (see
+/// [`equated_columns`]).
+fn order_key_redundant(
+    sel: &protobuf::SelectStmt,
+    level: Level<'_>,
+    key: &protobuf::Node,
+    equated: &std::collections::HashSet<&str>,
+) -> bool {
+    let reads_equated = |n: &protobuf::Node| {
+        let mut all = true;
+        super::walk::visit_same_level(n, &mut |x| {
+            if let Some(node::Node::ColumnRef(cr)) = x.node.as_ref() {
+                all &= column_name(cr).is_some_and(|c| equated.contains(c));
+            }
+        });
+        all
+    };
+    let position = match key.node.as_ref() {
+        Some(node::Node::AConst(protobuf::AConst {
+            val: Some(protobuf::a_const::Val::Ival(i)),
+            ..
+        })) => usize::try_from(i.ival).ok().and_then(|i| i.checked_sub(1)),
+        _ => None,
+    };
+    let alias = match key.node.as_ref() {
+        Some(node::Node::ColumnRef(cr)) if cr.fields.len() == 1 => column_name(cr),
+        _ => None,
+    };
+    if position.is_none() && alias.is_none() {
+        return reads_equated(key);
+    }
+    // As [`order_key_error`] resolves it.
+    let mut column = 0;
+    for target in &sel.target_list {
+        let Some(node::Node::ResTarget(rt)) = target.node.as_ref() else {
+            return true;
+        };
+        let val = rt.val.as_deref();
+        if let (Some(source), Some(node::Node::ColumnRef(cr))) =
+            (level.source, val.and_then(|v| v.node.as_ref()))
+            && let Read::All = source.read(cr)
+        {
+            let width = source.names.len();
+            if let Some(p) = position.filter(|p| (column..column + width).contains(p)) {
+                return equated.contains(source.names[p - column].as_str());
+            }
+            column += width;
+            continue;
+        }
+        if position == Some(column) || alias.is_some_and(|a| a == rt.name) {
+            return val.is_none_or(reads_equated);
+        }
+        column += 1;
+    }
+    position.is_some() || reads_equated(key)
 }
 
 /// Which columns `sel`'s select list yields over `level`'s projected
@@ -932,6 +1074,17 @@ impl Level<'_> {
                 if let Some(e) = self.null_cast(tc) {
                     return Some(e);
                 }
+                // A cast evaluates its argument where no cast into the
+                // target could drop it (see [`casts_evaluate_argument`]).
+                if let Some(e) = tc.arg.as_deref().and_then(|a| self.error(a))
+                    && tc
+                        .type_name
+                        .as_ref()
+                        .and_then(|t| crate::ddl::util::resolve_type_name(t, self.snapshot))
+                        .is_some_and(|t| casts_evaluate_argument(self.snapshot, t))
+                {
+                    return Some(e);
+                }
             }
             node::Node::ColumnRef(cr) => {
                 let source = self.source?;
@@ -949,8 +1102,8 @@ impl Level<'_> {
             // folded).
             node::Node::NullTest(nt) => return self.error(nt.arg.as_deref()?),
             node::Node::SubLink(sl) => return self.sublink_error(sl),
-            node::Node::AExpr(e) if e.kind() == protobuf::AExprKind::AexprOp => {
-                if let Some(f) = self.operator_error(e) {
+            node::Node::AExpr(e) => {
+                if let Some(f) = self.a_expr_error(e) {
                     return Some(f);
                 }
             }
@@ -976,6 +1129,61 @@ impl Level<'_> {
             message: e.to_string(),
             domain: false,
         })
+    }
+
+    /// The error evaluating the operator expression `e` surely raises.
+    fn a_expr_error(&self, e: &protobuf::AExpr) -> Option<Failure> {
+        use protobuf::AExprKind as K;
+        let operands = || e.lexpr.iter().chain(&e.rexpr).find_map(|a| self.error(a));
+        match e.kind() {
+            K::AexprOp => self.operator_error(e),
+            // A DistinctExpr is folded only when every argument is a
+            // constant, and never inlined (eval_const_expressions); a
+            // NULL literal side makes it a NullTest of the other
+            // (transformAExprDistinct). A ScalarArrayOpExpr is folded only
+            // when both are constants, and evaluates both, the scalar
+            // first, whatever the array (ExecEvalScalarArrayOp).
+            K::AexprDistinct | K::AexprNotDistinct | K::AexprOpAny | K::AexprOpAll => operands(),
+            // `a BETWEEN b AND c` is `a >= b AND a <= c`, `NOT BETWEEN`
+            // `a < b OR a > c` (SYMMETRIC ORs / ANDs two of those, the
+            // same comparison first: transformAExprBetween): the first
+            // one is evaluated first.
+            K::AexprBetween | K::AexprNotBetween | K::AexprBetweenSym | K::AexprNotBetweenSym => {
+                let Some(node::Node::List(bounds)) = e.rexpr.as_deref()?.node.as_ref() else {
+                    return None;
+                };
+                let op = match e.kind() {
+                    K::AexprBetween | K::AexprBetweenSym => ">=",
+                    _ => "<",
+                };
+                self.operator_error(&comparison(op, e.lexpr.as_deref()?, bounds.items.first()?))
+            }
+            // `a IN (b, ...)` of literals is a ScalarArrayOpExpr `a = ANY
+            // (ARRAY[b, ...])`, or `a = b OR ...` where they have no
+            // common type, or `a = b` for one (transformAExprIn): `a = b`
+            // evaluating `a`, all of those do, first.
+            K::AexprIn => {
+                let Some(node::Node::List(list)) = e.rexpr.as_deref()?.node.as_ref() else {
+                    return None;
+                };
+                let literals = list
+                    .items
+                    .iter()
+                    .all(|i| matches!(i.node.as_ref(), Some(node::Node::AConst(c)) if !c.isnull));
+                if !literals {
+                    return None;
+                }
+                let name = match e.name.as_slice() {
+                    [n] => match n.node.as_ref()? {
+                        node::Node::String(s) => s.sval.as_str(),
+                        _ => return None,
+                    },
+                    _ => return None,
+                };
+                self.operator_error(&comparison(name, e.lexpr.as_deref()?, list.items.first()?))
+            }
+            _ => None,
+        }
     }
 
     /// The type `n` surely has, where it is simple enough to tell: a
@@ -1036,33 +1244,48 @@ impl Level<'_> {
     /// call evaluates it (see [`operator_evaluates`]): the leftmost one
     /// failing, as ExecInterpExpr evaluates a call's arguments in order —
     /// unless the function is a SQL one, whose inlined body may evaluate
-    /// them in another order.
+    /// them in another order: then the failing ones must raise the same
+    /// error.
     fn operator_error(&self, e: &protobuf::AExpr) -> Option<Failure> {
         let operands: Vec<&protobuf::Node> = e.lexpr.iter().chain(&e.rexpr).map(|a| &**a).collect();
         let errors: Vec<Option<Failure>> = operands.iter().map(|a| self.error(a)).collect();
-        let failing = errors.iter().position(Option::is_some)?;
-        let several = errors.iter().flatten().nth(1).is_some();
-        // Every other operand surely is no NULL constant: a strict function
-        // over one is folded to NULL (evaluate_function), and an inlined
-        // body gets it substituted.
-        let others = operands
+        let leftmost = errors.iter().position(Option::is_some)?;
+        // Failing operands all raising the same error, the order they are
+        // evaluated in doesn't matter: any one an inlined body evaluates
+        // raises it.
+        let ordered = errors
             .iter()
-            .enumerate()
-            .all(|(i, a)| i == failing || self.not_null_const(a));
+            .flatten()
+            .all(|f| Some(f) == errors[leftmost].as_ref());
         let types: Vec<Option<PgTypeOid>> = operands.iter().map(|a| self.type_of(a)).collect();
         let resolved = self.operator(e).map(|op| op.code);
-        operator_evaluates(
-            self.snapshot,
-            e,
-            resolved,
-            failing,
-            others,
-            !several,
-            &types,
-            0,
-        )
-        .then(|| errors[failing].clone())
-        .flatten()
+        let candidates: Vec<usize> = if ordered {
+            (0..operands.len())
+                .filter(|&i| errors[i].is_some())
+                .collect()
+        } else {
+            vec![leftmost]
+        };
+        let failing = candidates.into_iter().find(|&failing| {
+            // Every other operand surely is no NULL constant: a strict
+            // function over one is folded to NULL (evaluate_function), and
+            // an inlined body gets it substituted.
+            let others = operands
+                .iter()
+                .enumerate()
+                .all(|(i, a)| i == failing || self.not_null_const(a));
+            operator_evaluates(
+                self.snapshot,
+                e,
+                resolved,
+                failing,
+                others,
+                ordered,
+                &types,
+                0,
+            )
+        })?;
+        errors[failing].clone()
     }
 
     /// `n` surely is no NULL constant once the planner simplified it: a
@@ -1259,40 +1482,38 @@ impl Level<'_> {
         else {
             return false;
         };
-        let mut conjuncts = vec![n];
-        let mut i = 0;
-        while i < conjuncts.len() {
-            if let Some(node::Node::BoolExpr(b)) = conjuncts[i].node.as_ref()
-                && b.boolop == protobuf::BoolExprType::AndExpr as i32
-            {
-                let and = conjuncts.remove(i);
-                if let Some(node::Node::BoolExpr(b)) = and.node.as_ref() {
-                    conjuncts.extend(b.args.iter());
-                }
-                continue;
-            }
-            i += 1;
-        }
-        conjuncts
+        let conjuncts: Vec<&protobuf::Node> = conjuncts(n)
             .into_iter()
             .filter(|c| self.truth(c) != Some(true))
-            .all(|c| {
-                let mut simple = true;
-                let mut reads = false;
-                super::walk::visit_same_level(c, &mut |x| match x.node.as_ref() {
-                    Some(node::Node::ColumnRef(cr)) => {
-                        reads |= source.rows.unpushable(&source.read(cr));
-                    }
-                    Some(node::Node::AConst(a)) => simple &= !a.isnull,
-                    Some(node::Node::AExpr(e)) => {
-                        simple &= e.kind() == protobuf::AExprKind::AexprOp;
-                    }
-                    Some(node::Node::TypeCast(_) | node::Node::NullTest(_)) => {}
-                    Some(node::Node::TypeName(_) | node::Node::String(_)) => {}
-                    _ => simple = false,
-                });
-                simple && reads
-            })
+            .collect();
+        // Two equalities may contradict each other through their
+        // equivalence class (`b = 3 AND b = 4`, or `b = c AND b = 3 AND c
+        // = 4`): the planner derives a constant false from it, leaving the
+        // scan dummy (generate_base_implied_equalities_const).
+        let equalities = conjuncts
+            .iter()
+            .filter(|c| matches!(c.node.as_ref(), Some(node::Node::AExpr(e)) if may_equate(e)))
+            .count();
+        if equalities > 1 {
+            return false;
+        }
+        conjuncts.into_iter().all(|c| {
+            let mut simple = true;
+            let mut reads = false;
+            super::walk::visit_same_level(c, &mut |x| match x.node.as_ref() {
+                Some(node::Node::ColumnRef(cr)) => {
+                    reads |= source.rows.unpushable(&source.read(cr));
+                }
+                Some(node::Node::AConst(a)) => simple &= !a.isnull,
+                Some(node::Node::AExpr(e)) => {
+                    simple &= e.kind() == protobuf::AExprKind::AexprOp;
+                }
+                Some(node::Node::TypeCast(_) | node::Node::NullTest(_)) => {}
+                Some(node::Node::TypeName(_) | node::Node::String(_)) => {}
+                _ => simple = false,
+            });
+            simple && reads
+        })
     }
 }
 
@@ -1552,6 +1773,31 @@ impl Body<'_> {
                     self.depth + 1,
                 )
             }
+            // A NullTest of no constant isn't folded; a DistinctExpr is
+            // folded only when every argument is a constant (see
+            // [`Level::a_expr_error`]).
+            Some(node::Node::NullTest(nt)) => {
+                nt.arg.as_deref().is_some_and(|a| self.evaluates(a, k))
+            }
+            Some(node::Node::AExpr(e))
+                if matches!(
+                    e.kind(),
+                    protobuf::AExprKind::AexprDistinct | protobuf::AExprKind::AexprNotDistinct
+                ) =>
+            {
+                e.lexpr.iter().chain(&e.rexpr).any(|a| self.evaluates(a, k))
+            }
+            // COALESCE keeps its first argument, no constant, first.
+            Some(node::Node::CoalesceExpr(c)) => {
+                c.args.first().is_some_and(|a| self.evaluates(a, k))
+            }
+            // An AND or OR is folded to a constant when one of its
+            // arguments is the one deciding it (`$2 > 0` over a constant
+            // `$2`), and stops at the first one deciding it: each must
+            // evaluate the parameter (no constant then).
+            Some(node::Node::BoolExpr(b)) => {
+                !b.args.is_empty() && b.args.iter().all(|a| self.evaluates(a, k))
+            }
             _ => false,
         }
     }
@@ -1575,6 +1821,20 @@ impl Body<'_> {
             }
             _ => false,
         }
+    }
+}
+
+/// The operator expression `l <op> r`, as the parser builds out of a
+/// BETWEEN or an IN.
+fn comparison(op: &str, l: &protobuf::Node, r: &protobuf::Node) -> protobuf::AExpr {
+    protobuf::AExpr {
+        kind: protobuf::AExprKind::AexprOp as i32,
+        name: vec![protobuf::Node {
+            node: Some(node::Node::String(protobuf::String { sval: op.into() })),
+        }],
+        lexpr: Some(Box::new(l.clone())),
+        rexpr: Some(Box::new(r.clone())),
+        ..Default::default()
     }
 }
 
