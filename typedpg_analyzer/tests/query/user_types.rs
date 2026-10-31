@@ -695,6 +695,51 @@ fn returning_nn_domain_column_is_nullable() {
     assert_cols(&s, vec![cn("x", domain("public", "nn_int", int4()))]);
 }
 
+/// A built-in operator's function evaluates each operand (ExecInterpExpr
+/// evaluates a call's arguments first, and the planner folds no domain
+/// coercion): a NULL cast to a NOT NULL domain read as one fails every
+/// execution that evaluates the operator. A SQL function the planner
+/// inlines may ignore it.
+#[test]
+fn an_operator_evaluates_a_null_domain_operand() {
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE DOMAIN d AS int NOT NULL;
+         CREATE VIEW v AS SELECT NULL::d AS x, 1 AS y;
+         CREATE FUNCTION ign(d, int) RETURNS bool LANGUAGE sql IMMUTABLE AS 'SELECT true';
+         CREATE OPERATOR === (LEFTARG = d, RIGHTARG = int, FUNCTION = ign);",
+    )]);
+    let domain = Some("domain d does not allow null values");
+    for (sql, fails) in [
+        ("SELECT 1 FROM v WHERE x = 1", domain),
+        ("SELECT x = 1 FROM v", domain),
+        ("SELECT 1 WHERE NULL::d = 1", domain),
+        ("SELECT 1 WHERE 1 = NULL::d", domain),
+        ("SELECT x < 1 FROM v", domain),
+        ("SELECT - x FROM v", domain),
+        ("SELECT (x = 1) IS NULL FROM v", domain),
+        ("SELECT x OPERATOR(pg_catalog.=) 1 FROM v", domain),
+        ("SELECT 1 FROM v WHERE x = y", domain),
+        ("SELECT 1 FROM v WHERE x = 1 AND y = 1", domain),
+        ("SELECT 1 FROM v WHERE x = 1 LIMIT 1", domain),
+        ("SELECT (SELECT x FROM v) = 1", domain),
+        ("SELECT x = 1 FROM v UNION ALL SELECT true LIMIT 1", domain),
+        ("SELECT 1 FROM v WHERE x = 1 AND y = 2", None),
+        ("SELECT 1 FROM v WHERE x = 1 OR true", None),
+        ("SELECT 1 FROM v WHERE x === 1", None),
+        ("SELECT x === 1 FROM v", None),
+        ("SELECT true UNION ALL SELECT x = 1 FROM v LIMIT 1", None),
+    ] {
+        match (db.analyze(sql), fails) {
+            (Err(err), Some(msg)) => {
+                assert!(err.to_string().starts_with(msg), "{sql}\n  got: {err}")
+            }
+            (Ok(_), None) => {}
+            (other, _) => panic!("{sql}: {other:?}"),
+        }
+    }
+}
+
 #[test]
 fn schema_qualified_domain_param() {
     let db = setup_user_types();
