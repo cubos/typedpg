@@ -271,6 +271,10 @@ pub struct PgCatalog {
     pub(crate) generated_refs: Shared<HashMap<(PgClassOid, i16), Vec<i16>>>,
     /// The `check_function_bodies` GUC (pg_dump output turns it off).
     pub(crate) check_function_bodies: crate::ddl::session::BoolGuc,
+    /// The migration set `constraint_exclusion` or `plan_cache_mode`: the
+    /// planner may then prove more relations empty, or plan an EXECUTE
+    /// generically, than the defaults the plan-time checks assume.
+    pub(crate) planner_settings_changed: bool,
     /// The single expression of each inlinable `LANGUAGE sql` function
     /// (`SELECT expr` / `RETURN expr`, as `inline_function` requires),
     /// which PG substitutes for the call before checking an index or
@@ -439,6 +443,8 @@ pub struct PgCatalog {
     /// The migration session's prepared statements (PREPARE), by name.
     pub(crate) prepared_statements:
         Shared<HashMap<String, crate::ddl::prepared::PreparedStatement>>,
+    /// The migration session's open cursors (DECLARE).
+    pub(crate) cursors: crate::ddl::cursors::Cursors,
     /// `pg_type.typsubscript` of user base types, as the handler function's
     /// name (`hstore_subscript_handler`), set by `CREATE TYPE (SUBSCRIPT =
     /// …)` / `ALTER TYPE … SET (SUBSCRIPT = …)`. Built-in types aren't
@@ -690,6 +696,7 @@ impl PgCatalog {
             cluster_objects: Default::default(),
             transforms: Shared::default(),
             prepared_statements: Shared::default(),
+            cursors: Default::default(),
             namespace_by_name: Shared::default(),
             type_by_qname: Shared::default(),
             class_by_qname: Shared::default(),
@@ -707,6 +714,7 @@ impl PgCatalog {
             attr_default_exprs: HashMap::new(),
             generated_refs: Shared::default(),
             check_function_bodies: crate::ddl::session::BoolGuc::new(true),
+            planner_settings_changed: false,
             inline_sql_bodies: Shared::default(),
             procs_with_config: Shared::default(),
             inline_body_trust: Shared::default(),
@@ -1385,11 +1393,13 @@ impl PgCatalog {
     /// Roll the catalog back to `snapshot` (ROLLBACK, ROLLBACK TO
     /// SAVEPOINT, a failed statement). What isn't transactional stays: the
     /// OID counter (PG never hands an OID out twice), the session's
-    /// prepared statements, and the state of the statement being applied
-    /// and of the sanity mirror.
+    /// prepared statements and cursors (the transaction closes cursors
+    /// itself, see [`crate::ddl::cursors`]), and the state of the
+    /// statement being applied and of the sanity mirror.
     pub(crate) fn roll_back_to(&mut self, snapshot: &PgCatalog) {
         let next_oid = self.next_oid;
         let prepared_statements = std::mem::take(&mut self.prepared_statements);
+        let cursors = std::mem::take(&mut self.cursors);
         let statement_sql = self.statement_sql.take();
         let in_migration = self.in_migration;
         let installing_extension = self.installing_extension.take();
@@ -1398,6 +1408,7 @@ impl PgCatalog {
         *self = snapshot.clone();
         self.next_oid = next_oid.max(self.next_oid);
         self.prepared_statements = prepared_statements;
+        self.cursors = cursors;
         self.statement_sql = statement_sql;
         self.in_migration = in_migration;
         self.installing_extension = installing_extension;

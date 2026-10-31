@@ -14,7 +14,8 @@
 //! so a transaction — of its own.
 //! A statement that fails aborts the transaction it runs in: the catalog
 //! goes back to how that transaction found it — the start of the migration,
-//! or its last `COMMIT` / `ROLLBACK`.
+//! or its last `COMMIT` / `ROLLBACK`. The session's cursors follow the
+//! transaction's end too ([`super::cursors`]).
 
 use typedpg_pg_query::protobuf::{
     DiscardMode, ReindexObjectType, TransactionStmt, TransactionStmtKind, VariableSetKind, a_const,
@@ -124,7 +125,7 @@ impl Transaction {
     pub(crate) fn after(&mut self, db: &mut PgCatalog, stmt: &node::Node) {
         self.track(stmt);
         if self.per_statement && self.block == Block::Started {
-            self.end(db, false);
+            self.end(db, false, true);
         }
     }
 
@@ -197,7 +198,7 @@ impl Transaction {
                 if kind == K::TransStmtRollback {
                     db.roll_back_to(&self.start);
                 }
-                self.end(db, stmt.chain);
+                self.end(db, stmt.chain, kind == K::TransStmtCommit);
             }
             K::TransStmtSavepoint => {
                 self.savepoints
@@ -221,7 +222,9 @@ impl Transaction {
                 } else {
                     // The savepoint stays, the ones after it go.
                     self.savepoints.truncate(at + 1);
-                    db.roll_back_to(&self.savepoints[at].1);
+                    let savepoint = &self.savepoints[at].1;
+                    db.roll_back_to(savepoint);
+                    db.cursors.roll_back_to(&savepoint.cursors);
                 }
             }
             K::TransStmtPrepare => {
@@ -247,10 +250,16 @@ impl Transaction {
         Ok(())
     }
 
-    /// End of the current transaction: the next statement runs in a new one
-    /// — an explicit block for AND CHAIN (with the same characteristics),
-    /// else the implicit block of the rest of the query.
-    fn end(&mut self, db: &mut PgCatalog, chain: bool) {
+    /// End of the current transaction, `committed` or rolled back: the next
+    /// statement runs in a new one — an explicit block for AND CHAIN (with
+    /// the same characteristics), else the implicit block of the rest of
+    /// the query.
+    fn end(&mut self, db: &mut PgCatalog, chain: bool, committed: bool) {
+        if committed {
+            db.cursors.commit();
+        } else {
+            db.cursors.abort();
+        }
         db.end_transaction_scope();
         self.savepoints.clear();
         self.queried = false;
@@ -271,6 +280,7 @@ impl Transaction {
     /// to how it found it.
     pub(crate) fn abort(&self, db: &mut PgCatalog) {
         db.roll_back_to(&self.start);
+        db.cursors.abort();
         db.end_transaction_scope();
     }
 
@@ -278,7 +288,7 @@ impl Transaction {
     /// runner commits its own; an unterminated `BEGIN` of an unwrapped
     /// migration is taken as committed too).
     pub(crate) fn finish(mut self, db: &mut PgCatalog) {
-        self.end(db, false);
+        self.end(db, false, true);
     }
 }
 

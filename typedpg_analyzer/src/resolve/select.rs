@@ -211,6 +211,8 @@ fn analyze_select_here(
     shadowed_sources: &[crate::scope::TableSource],
 ) -> AnalyzeResult {
     let _level = QueryLevel::enter();
+    let _plan =
+        expr::plan_fold::PlanLevel::enter(sel.where_clause.as_deref(), &sel.from_clause, snapshot);
     let resolve_unknowns = !KEEP_UNKNOWN_OUTPUTS.with(|k| k.replace(false));
     // transformSetOperationStmt: an INTO on the leftmost member is the
     // statement's only where the statement is the top level, which

@@ -762,12 +762,9 @@ pub(crate) fn analyze_static(
         .ok_or_else(|| AnalyzeError::Parse("empty statement".into()))?;
 
     let can_run_as_subquery = can_run_as_subquery(stmt);
-    crate::grouping::clear_values_sort_calls();
-    let (raw_columns, raw_params) =
-        expr::with_plan_time_checks(|| analyze_raw_node(snapshot, stmt, param_nullability))?;
-    if let Some(e) = values_sort_exec_error(stmt, snapshot) {
-        return Err(e);
-    }
+    let (raw_columns, raw_params) = analyze_executed(snapshot, stmt, || {
+        analyze_raw_node(snapshot, stmt, param_nullability)
+    })?;
 
     let columns = raw_columns
         .into_iter()
@@ -790,6 +787,28 @@ pub(crate) fn analyze_static(
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok((columns, params_info, can_run_as_subquery))
+}
+
+/// Run `analyze`, the analysis of `stmt`, for a statement PG plans and
+/// starts the executor for — an application query, and in a migration the
+/// DML, `CREATE TABLE AS` / `CREATE MATERIALIZED VIEW` / `SELECT INTO`
+/// with data, `REFRESH MATERIALIZED VIEW`, `EXECUTE`, `EXPLAIN`, `COPY
+/// (query)`, `DECLARE CURSOR` — as opposed to one PG only stores (a view,
+/// a rule, a function body, `PREPARE`, `WITH NO DATA`): the errors the
+/// planner raises on every execution ([`expr::with_plan_time_checks`])
+/// and the ones the executor's start raises ([`values_sort_exec_error`])
+/// apply only here.
+pub(crate) fn analyze_executed<R>(
+    snapshot: &PgCatalog,
+    stmt: &node::Node,
+    analyze: impl FnOnce() -> Result<R, AnalyzeError>,
+) -> Result<R, AnalyzeError> {
+    crate::grouping::clear_values_sort_calls();
+    let analyzed = expr::with_plan_time_checks(analyze)?;
+    if let Some(e) = values_sort_exec_error(stmt, snapshot) {
+        return Err(e);
+    }
+    Ok(analyzed)
 }
 
 /// The error every execution of `stmt` raises when the rows it reads

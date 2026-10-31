@@ -2068,6 +2068,25 @@ pub(crate) fn plan_time_checks() -> bool {
     PLAN_TIME_CHECKS.with(std::cell::Cell::get)
 }
 
+/// Run `f` over a part of the statement the planner never reaches (see
+/// [`plan_fold`]): no plan-time check applies there.
+pub(crate) fn without_plan_time_checks<R>(f: impl FnOnce() -> R) -> R {
+    let prev = disable_plan_time_checks();
+    let out = f();
+    restore_plan_time_checks(prev);
+    out
+}
+
+/// Turn the plan-time checks off, returning whether they were on.
+pub(crate) fn disable_plan_time_checks() -> bool {
+    PLAN_TIME_CHECKS.with(|c| c.replace(false))
+}
+
+/// Undo [`disable_plan_time_checks`].
+pub(crate) fn restore_plan_time_checks(prev: bool) {
+    PLAN_TIME_CHECKS.with(|c| c.set(prev));
+}
+
 /// PG's `transformExpressionList` for a `ROW(...)` constructor's arguments:
 /// a `rel.*` column reference expands to one reference per column of `rel`
 /// (`ExpandColumnRefStar`) and a `(expr).*` indirection to one field
@@ -2292,6 +2311,7 @@ pub(crate) mod inline;
 mod json;
 pub(crate) mod literals;
 pub(crate) mod operators;
+pub(crate) mod plan_fold;
 mod record_coercion;
 mod sublink;
 mod xml;

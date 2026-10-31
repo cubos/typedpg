@@ -610,6 +610,13 @@ fn constant_regex_patterns_compiled_by_the_planner_are_validated() {
         "SELECT id FROM rt WHERE s SIMILAR TO '('",
         "SELECT rt.id FROM rt JOIN rt2 ON rt2.s ~ '(' AND rt2.id = rt.id",
         "DELETE FROM rt WHERE s ~ '('",
+        // Reached by folding: an AND / OR argument before the deciding
+        // one, a COALESCE after a NULL, a pattern folded from constants.
+        "SELECT 'a' ~ '(' OR true AS m",
+        "SELECT coalesce(NULL, 'a' ~ '(') AS m",
+        "SELECT id FROM rt WHERE id = 1 AND s ~ '(' AND id = 1",
+        "SELECT 1 AS m WHERE coalesce('a', 'b') ~ '('",
+        "SELECT id FROM rt WHERE s ~ upper('(')",
     ] {
         assert_err_prefix!(
             db.analyze(sql),
@@ -624,6 +631,16 @@ fn constant_regex_patterns_compiled_by_the_planner_are_validated() {
         "SELECT id FROM rt WHERE s ~ '(?q)('",
         "SELECT id FROM rt WHERE s SIMILAR TO '\\('",
         "SELECT id FROM rv",
+        // What constant folding drops is never compiled, and a relation
+        // the planner proves empty is never estimated.
+        "SELECT true OR 'a' ~ '(' AS m",
+        "SELECT CASE WHEN false THEN 'a' ~ '(' ELSE true END AS m",
+        "SELECT coalesce(true, 'a' ~ '(') AS m",
+        "SELECT id FROM rt WHERE false AND s ~ '('",
+        "SELECT id FROM rt WHERE s ~ '(' OR true",
+        "SELECT id FROM rt WHERE s ~ '(' AND NULL",
+        "SELECT id FROM rt WHERE id = 1 AND id = 2 AND s ~ '('",
+        "SELECT rt.id FROM rt LEFT JOIN rt2 ON rt2.id = rt.id AND rt2.s ~ '('",
     ] {
         db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
     }

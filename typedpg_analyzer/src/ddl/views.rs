@@ -54,16 +54,16 @@ pub fn create_view(interp: &mut PgCatalog, stmt: &ViewStmt) -> Result<(), DdlErr
     // DefineView only analyzes the query: no error its execution would
     // raise is reported (a query reading the view runs it).
     let resolved = match stmt.query.as_deref() {
-        Some(query_node) => {
-            crate::resolve::without_execution(|| resolve_view_now(interp, query_node, &aliases))
-                .map_err(|e| match e {
-                    DdlError::ViewAnalysis { source, .. } => DdlError::ViewAnalysis {
-                        view: qn_label.clone(),
-                        source,
-                    },
-                    other => other,
-                })?
-        }
+        Some(query_node) => crate::resolve::without_execution(|| {
+            resolve_view_now(interp, query_node, &aliases, false)
+        })
+        .map_err(|e| match e {
+            DdlError::ViewAnalysis { source, .. } => DdlError::ViewAnalysis {
+                view: qn_label.clone(),
+                source,
+            },
+            other => other,
+        })?,
         None => ResolvedView::default(),
     };
     // DefineView: parse analysis allows these; a view can't have them.
@@ -163,6 +163,16 @@ pub fn create_view(interp: &mut PgCatalog, stmt: &ViewStmt) -> Result<(), DdlErr
 }
 
 pub fn create_table_as(interp: &mut PgCatalog, stmt: &CreateTableAsStmt) -> Result<(), DdlError> {
+    create_table_as_planned(interp, stmt, false)
+}
+
+/// [`create_table_as`]; with `explained`, under `EXPLAIN ANALYZE`, which
+/// plans and runs the query even `WITH NO DATA`.
+pub(crate) fn create_table_as_planned(
+    interp: &mut PgCatalog,
+    stmt: &CreateTableAsStmt,
+    explained: bool,
+) -> Result<(), DdlError> {
     let into = stmt
         .into
         .as_deref()
@@ -171,12 +181,20 @@ pub fn create_table_as(interp: &mut PgCatalog, stmt: &CreateTableAsStmt) -> Resu
         Ok(ObjectType::ObjectMatview) => RelKind::MaterializedView,
         _ => RelKind::Table,
     };
+    // ExecCreateTableAs: WITH NO DATA creates the relation without
+    // planning the query (create_ctas_nodata) — but `AS EXECUTE` plans the
+    // prepared statement either way (ExecuteQuery).
+    let is_execute = matches!(
+        stmt.query.as_deref().and_then(|q| q.node.as_ref()),
+        Some(node::Node::ExecuteStmt(_))
+    );
     create_relation_as(
         interp,
         into,
         stmt.query.as_deref(),
         kind,
         stmt.if_not_exists,
+        explained || is_execute || !into.skip_data,
     )
 }
 
@@ -191,17 +209,19 @@ pub fn select_into(interp: &mut PgCatalog, stmt: &protobuf::SelectStmt) -> Resul
     let query_node = protobuf::Node {
         node: Some(node::Node::SelectStmt(Box::new(query))),
     };
-    create_relation_as(interp, into, Some(&query_node), RelKind::Table, false)
+    create_relation_as(interp, into, Some(&query_node), RelKind::Table, false, true)
 }
 
 /// Shared body of CREATE TABLE AS / CREATE MATERIALIZED VIEW / SELECT INTO
-/// (`ExecCreateTableAs` + `intorel_startup`, createas.c).
+/// (`ExecCreateTableAs` + `intorel_startup`, createas.c). `planned`: the
+/// query is planned and run, not only analyzed.
 fn create_relation_as(
     interp: &mut PgCatalog,
     into: &protobuf::IntoClause,
     query: Option<&protobuf::Node>,
     kind: RelKind,
     if_not_exists: bool,
+    planned: bool,
 ) -> Result<(), DdlError> {
     let rv = into
         .rel
@@ -230,9 +250,14 @@ fn create_relation_as(
         check_no_parameters(query)?;
     }
     // The query runs to fill the relation, unless WITH NO DATA; a
-    // materialized view's under a restricted search_path.
+    // materialized view's under a restricted search_path. WITH NO DATA,
+    // a query still `planned` (AS EXECUTE, EXPLAIN ANALYZE) has its
+    // executor started but reads no row (ExecuteQuery's count 0,
+    // ExplainOnePlan's NoMovementScanDirection).
     let run = |f: &dyn Fn() -> Result<ResolvedView, DdlError>| {
-        if into.skip_data {
+        if into.skip_data && planned {
+            crate::resolve::planned_only(f)
+        } else if into.skip_data {
             crate::resolve::without_execution(f)
         } else if kind == RelKind::MaterializedView {
             crate::resolve::with_restricted_execution(f)
@@ -251,16 +276,24 @@ fn create_relation_as(
             if !prepared.is_select() {
                 return Err(DdlError::Parse("prepared statement is not a SELECT".into()));
             }
-            run(&|| {
-                crate::expr::with_rewriting(true, || {
-                    resolve_view_with_params(
-                        interp,
-                        &prepared.query,
-                        &aliases,
-                        &prepared.param_types,
-                    )
+            let resolve = |interp: &PgCatalog| {
+                run(&|| {
+                    crate::expr::with_rewriting(true, || {
+                        resolve_view_with_params(
+                            interp,
+                            &prepared.query,
+                            &aliases,
+                            &prepared.param_types,
+                            planned,
+                        )
+                    })
                 })
-            })
+            };
+            if planned {
+                super::prepared::planned_for_arguments(interp, estmt, &prepared, resolve)
+            } else {
+                resolve(interp)
+            }
             .map_err(|e| match e {
                 DdlError::ViewAnalysis { source, .. } => DdlError::ViewAnalysis {
                     view: qn_label.clone(),
@@ -272,8 +305,8 @@ fn create_relation_as(
         // ExecCreateTableAs rewrites the query it fills the relation with;
         // WITH NO DATA only creates the relation (create_ctas_nodata).
         Some(query_node) => run(&|| {
-            crate::expr::with_rewriting(!into.skip_data, || {
-                resolve_view_now(interp, query_node, &aliases)
+            crate::expr::with_rewriting(planned, || {
+                resolve_view_now(interp, query_node, &aliases, planned)
             })
         })
         .map_err(|e| match e {
@@ -681,25 +714,22 @@ pub fn refresh_materialized_view(
     }
 }
 
-/// RefreshMatViewByOid runs materialized view `relid`'s query, under the
-/// restricted `search_path`: an error every run of it raises (a NULL cast
-/// to a NOT NULL domain, ...) fails the refresh. Checked only while the
-/// query still resolves to what the view bound ([`reanalyze_view`]).
+/// `REFRESH MATERIALIZED VIEW` with data plans and runs the stored query
+/// (refresh_matview_datafill, RefreshMatViewByOid), under the restricted
+/// `search_path`: what that raises on every execution — a NULL cast to a
+/// NOT NULL domain, a plan-time error — fails it; a materialized view
+/// created `WITH NO DATA` was never planned. The query is checked only
+/// while it resolves as the view bound it ([`reanalyze_view`]).
 fn check_refill(interp: &PgCatalog, relid: PgClassOid) -> Result<(), DdlError> {
     if reanalyze_view(interp, relid).is_none() {
         return Ok(());
     }
-    let Some(query) = view_query(interp, relid) else {
-        return Ok(());
-    };
-    let Some(inner) = query.node.as_ref() else {
-        return Ok(());
-    };
-    crate::resolve::with_restricted_execution(|| {
-        crate::resolve::analyze_raw_node(interp, inner, &[])
-    })
-    .map(|_| ())
-    .map_err(|e| DdlError::UnsupportedDdl(e.to_string()))
+    match view_query(interp, relid).and_then(|q| q.node) {
+        Some(inner) => {
+            crate::resolve::with_restricted_execution(|| super::dml::check_executed(interp, &inner))
+        }
+        None => Ok(()),
+    }
 }
 
 /// Bundle of analyzer outputs that [`install_relation`] needs to wire up a
@@ -955,24 +985,34 @@ fn resolve_view_now(
     snapshot: &PgCatalog,
     query_node: &protobuf::Node,
     aliases: &[String],
+    planned: bool,
 ) -> Result<ResolvedView, DdlError> {
-    resolve_view_with_params(snapshot, query_node, aliases, &[])
+    resolve_view_with_params(snapshot, query_node, aliases, &[], planned)
 }
 
 /// [`resolve_view_now`] for a query whose `$n` have types (a prepared
-/// statement's).
+/// statement's). `planned`: the query also runs (CREATE TABLE AS with
+/// data), with the checks of a query that does
+/// ([`crate::resolve::analyze_executed`]).
 fn resolve_view_with_params(
     snapshot: &PgCatalog,
     query_node: &protobuf::Node,
     aliases: &[String],
     param_types: &[PgTypeOid],
+    planned: bool,
 ) -> Result<ResolvedView, DdlError> {
     let inner = query_node
         .node
         .as_ref()
         .ok_or_else(|| DdlError::Parse("CREATE VIEW with empty query node".into()))?;
+    let analyze =
+        || crate::resolve::analyze_raw_node_with_param_types(snapshot, inner, param_types);
     let (analyzed, references) = super::depend::collect(|| {
-        crate::resolve::analyze_raw_node_with_param_types(snapshot, inner, param_types)
+        if planned {
+            crate::resolve::analyze_executed(snapshot, inner, analyze)
+        } else {
+            analyze()
+        }
     });
     let (raw_columns, _) = analyzed.map_err(|source| DdlError::ViewAnalysis {
         view: String::new(),

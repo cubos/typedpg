@@ -174,6 +174,9 @@ pub(crate) struct TableSource {
     /// also returns their rows: constraints the table doesn't pass down —
     /// foreign keys, `NO INHERIT` ones — don't bind those.
     pub inherits_rows: bool,
+    /// A relation named with `ONLY`: its inheritance children / partitions
+    /// are not scanned.
+    pub only: bool,
     /// The entry yields at least one row (for each row of the entries a
     /// LATERAL one reads): a FROM-less query, an aggregate without GROUP
     /// BY, a lookup a foreign key guarantees, ...
@@ -300,6 +303,7 @@ impl TableSource {
             lock_error: None,
             partial_scan: false,
             inherits_rows: false,
+            only: false,
             min_one_row: false,
             hidden: None,
         }

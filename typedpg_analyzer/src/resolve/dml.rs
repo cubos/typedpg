@@ -1808,6 +1808,8 @@ pub(crate) fn analyze_update_with_outer_ctes(
     outer_ctes: &HashMap<String, Vec<ScopeColumn>>,
 ) -> AnalyzeResult {
     let _level = QueryLevel::enter();
+    let _plan =
+        expr::plan_fold::PlanLevel::enter(upd.where_clause.as_deref(), &upd.from_clause, snapshot);
     let relation = upd
         .relation
         .as_ref()
@@ -1877,6 +1879,9 @@ pub(crate) fn analyze_update_with_outer_ctes(
         crate::qualified_name::QualifiedName::new(&table_nsname, &table_relname),
         &table_attrs,
     );
+    if let Some(src) = scope.sources.last_mut() {
+        src.only = !relation.inh;
+    }
 
     // Process FROM clause (UPDATE ... FROM ... WHERE ...). transformUpdateStmt
     // marks the target `p_lateral_only` without `p_lateral_ok` meanwhile:
@@ -2038,6 +2043,8 @@ pub(crate) fn analyze_delete_with_outer_ctes(
     outer_ctes: &HashMap<String, Vec<ScopeColumn>>,
 ) -> AnalyzeResult {
     let _level = QueryLevel::enter();
+    let _plan =
+        expr::plan_fold::PlanLevel::enter(del.where_clause.as_deref(), &del.using_clause, snapshot);
     let relation = del
         .relation
         .as_ref()
@@ -2099,6 +2106,9 @@ pub(crate) fn analyze_delete_with_outer_ctes(
         crate::qualified_name::QualifiedName::new(&table_nsname, &table_relname),
         &table_attrs,
     );
+    if let Some(src) = scope.sources.last_mut() {
+        src.only = !relation.inh;
+    }
 
     // `DELETE … USING t1, t2 …` is UPDATE's FROM: extra joinable sources
     // visible to WHERE and RETURNING.

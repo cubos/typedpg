@@ -3338,6 +3338,393 @@ fn transaction_control_follows_the_transaction_block() {
 }
 
 #[test]
+fn statements_a_migration_runs_get_the_checks_of_a_query_that_runs() {
+    // PG 18: what a migration plans and runs fails on what the planner
+    // (eval_const_expressions folding a regex match of constants,
+    // patternsel compiling the pattern of a restriction) and the
+    // executor's start (ExecInitFunc: a set-returning sort key of a VALUES
+    // list) raise on every execution, as an application query does. What
+    // PG only stores, or creates WITH NO DATA, isn't planned.
+    let setup = "CREATE TABLE t (a int, s text);
+                 CREATE PROCEDURE pr(b bool) LANGUAGE sql AS $$ SELECT 1 $$;";
+    let regex = "invalid regular expression: parentheses () not balanced";
+    let srf = "set-valued function called in context that cannot accept a set";
+    for (stmt, msg) in [
+        ("INSERT INTO t (a) SELECT 1 WHERE 'a' ~ '(';", regex),
+        ("UPDATE t SET s = 'x' WHERE s ~ '(';", regex),
+        ("DELETE FROM t WHERE 'a' ~ '(';", regex),
+        (
+            "MERGE INTO t USING (SELECT 1 AS a) s ON t.a = s.a
+             WHEN MATCHED AND 'a' ~ '(' THEN DELETE;",
+            regex,
+        ),
+        ("SELECT 1 WHERE 'a' ~ '(';", regex),
+        ("CALL pr('a' ~ '(');", regex),
+        ("CREATE TABLE c AS SELECT 1 WHERE 'a' ~ '(';", regex),
+        ("SELECT 1 INTO c FROM t WHERE 'a' ~ '(';", regex),
+        (
+            "CREATE MATERIALIZED VIEW mv AS SELECT 1 WHERE 'a' ~ '(';",
+            regex,
+        ),
+        (
+            "CREATE MATERIALIZED VIEW mv AS SELECT 1 WHERE 'a' ~ '(' WITH NO DATA;
+             REFRESH MATERIALIZED VIEW mv;",
+            regex,
+        ),
+        ("EXPLAIN SELECT 1 WHERE 'a' ~ '(';", regex),
+        (
+            "EXPLAIN CREATE TABLE c AS SELECT 1 WHERE 'a' ~ '(' WITH NO DATA;",
+            regex,
+        ),
+        (
+            "EXPLAIN ANALYZE CREATE TABLE c AS SELECT 1 WHERE 'a' ~ '(' WITH NO DATA;",
+            regex,
+        ),
+        ("PREPARE p AS SELECT 1 WHERE 'a' ~ '('; EXECUTE p;", regex),
+        (
+            "PREPARE p AS SELECT 1 WHERE 'a' ~ '(';
+             CREATE TABLE c AS EXECUTE p WITH NO DATA;",
+            regex,
+        ),
+        ("COPY (SELECT 1 WHERE 'a' ~ '(') TO STDOUT;", regex),
+        (
+            "BEGIN; DECLARE c CURSOR FOR SELECT 1 WHERE 'a' ~ '('; COMMIT;",
+            regex,
+        ),
+        (
+            "INSERT INTO t (a) VALUES (1) ORDER BY generate_series(1, 2);",
+            srf,
+        ),
+        (
+            "CREATE TABLE c AS VALUES (1) ORDER BY generate_series(1, 2);",
+            srf,
+        ),
+        ("EXPLAIN VALUES (1) ORDER BY generate_series(1, 2);", srf),
+        (
+            "BEGIN; DECLARE c CURSOR FOR VALUES (1) ORDER BY generate_series(1, 2); COMMIT;",
+            srf,
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    for ok in [
+        "CREATE TABLE c AS SELECT 1 WHERE 'a' ~ '(' WITH NO DATA;",
+        "CREATE TABLE c AS VALUES (1) ORDER BY generate_series(1, 2) WITH NO DATA;",
+        "CREATE MATERIALIZED VIEW mv AS SELECT 1 WHERE 'a' ~ '(' WITH NO DATA;",
+        "CREATE VIEW v AS SELECT 1 WHERE 'a' ~ '(';",
+        "PREPARE p AS SELECT 1 WHERE 'a' ~ '(';",
+        "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS $$ SELECT 1 WHERE 'a' ~ '(' $$;",
+        // A valid pattern, and a column's value matched against it.
+        "INSERT INTO t (a) SELECT 1 WHERE 'a' ~ '(a)'; UPDATE t SET s = 'x' WHERE s ~ 'a+';",
+    ] {
+        build_db(&[("0001.sql", setup), ("0002.sql", ok)]);
+    }
+}
+
+#[test]
+fn plan_time_checks_follow_what_the_planner_reaches() {
+    // PG 18: eval_const_expressions stops at an AND argument folding to
+    // FALSE, an OR one folding to TRUE, the COALESCE arguments after a
+    // non-NULL constant, and skips the CASE branches it proves unused —
+    // what it drops is never folded. A relation the planner proves empty
+    // (a constant FALSE / NULL qual, two constants equated, `IS NULL` over
+    // a NOT NULL column, pruned partitions, no partition at all, ONLY a
+    // partitioned table) or removes (a useless LEFT JOIN) never has its
+    // restrictions estimated. A custom plan of an EXECUTE folds the
+    // arguments as constants.
+    let setup = "CREATE TABLE t (a int, s text);
+                 CREATE TABLE tn (a int NOT NULL, s text);
+                 CREATE TABLE u (id int PRIMARY KEY, s text);
+                 CREATE TABLE ih (a int, s text);
+                 CREATE TABLE ihc (b int) INHERITS (ih);
+                 CREATE TABLE p (a int, s text) PARTITION BY LIST (a);
+                 CREATE TABLE p1 PARTITION OF p FOR VALUES IN (1);
+                 CREATE TABLE pe (a int, s text) PARTITION BY LIST (a);
+                 CREATE TABLE pp (a int, s text) PARTITION BY LIST (a);
+                 CREATE TABLE pp1 PARTITION OF pp FOR VALUES IN (1) PARTITION BY LIST (s);";
+    let regex = "invalid regular expression: parentheses () not balanced";
+    for stmt in [
+        "SELECT 1 WHERE 'a' ~ '(' OR true;",
+        "SELECT 1 WHERE 'a' ~ '(' AND false;",
+        "SELECT 1 WHERE NULL AND 'a' ~ '(';",
+        "SELECT coalesce(NULL, 'a' ~ '(');",
+        "SELECT CASE WHEN 1 = 0 THEN false ELSE 'a' ~ '(' END;",
+        "SELECT * FROM t WHERE (false AND s = 'x') OR 'a' ~ '(';",
+        "SELECT * FROM t WHERE random() > 2 AND 'a' ~ '(';",
+        "SELECT * FROM t WHERE now() < '2000-01-01' AND 'a' ~ '(';",
+        "SELECT * FROM tn WHERE a IS NULL AND 'x' ~ '(';",
+        "SELECT * FROM t WHERE s ~ '(' AND random() > 2;",
+        "UPDATE t SET s = 'x' WHERE a = 1 AND a = 1 AND s ~ '(';",
+        "SELECT 1 FROM t WHERE s ~ '(' AND a < 0 AND a > 0;",
+        "SELECT * FROM p WHERE s ~ '(';",
+        "SELECT * FROM ih WHERE s ~ '(';",
+        "SELECT t.a FROM t LEFT JOIN t u ON u.s ~ '(';",
+        "SELECT t.a FROM t FULL JOIN u ON u.s ~ '(';",
+        // Folded through an immutable call, or an EXECUTE's argument.
+        "SELECT 1 WHERE coalesce('a', 'b') ~ '(';",
+        "SELECT * FROM t WHERE s ~ lower('(');",
+        "SELECT * FROM t WHERE s ~ coalesce(NULL, '(');",
+        "PREPARE q(text) AS SELECT 1 WHERE 'a' ~ $1; EXECUTE q('(');",
+        "PREPARE q(text) AS SELECT * FROM t WHERE s ~ $1; EXECUTE q('(');",
+        "PREPARE q(text) AS SELECT 1 AS x WHERE 'a' ~ $1;
+         CREATE TABLE c AS EXECUTE q('(');",
+        "PREPARE q(text) AS SELECT 1 AS x WHERE 'a' ~ $1; EXPLAIN EXECUTE q('(');",
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(regex), "{stmt}\n  got: {err}");
+    }
+    for ok in [
+        "SELECT * FROM t WHERE false AND s ~ '(';",
+        "SELECT * FROM t WHERE s ~ '(' AND false;",
+        "SELECT 1 WHERE true OR 'a' ~ '(';",
+        "SELECT CASE WHEN false THEN 'a' ~ '(' ELSE true END;",
+        "SELECT CASE WHEN NULL THEN 'a' ~ '(' ELSE true END;",
+        "SELECT CASE WHEN true THEN true ELSE 'a' ~ '(' END;",
+        "SELECT CASE WHEN 1 = 1 THEN true WHEN 'a' ~ '(' THEN false END;",
+        "SELECT CASE 1 WHEN NULL THEN 'a' ~ '(' ELSE true END;",
+        "SELECT coalesce(true, 'a' ~ '(');",
+        "INSERT INTO t SELECT 1, 'a' WHERE false AND 'a' ~ '(';",
+        "SELECT 1 WHERE false AND EXISTS (SELECT 1 WHERE 'a' ~ '(');",
+        "SELECT * FROM t WHERE 1 = 0 AND s ~ '(';",
+        "SELECT * FROM t WHERE lower('A') = 'b' AND 'a' ~ '(';",
+        "SELECT * FROM t WHERE s ~ '(' OR true;",
+        "SELECT * FROM t WHERE s ~ '(' AND NULL;",
+        "SELECT * FROM t x, t y WHERE x.s ~ '(' AND NULL;",
+        "SELECT * FROM t WHERE s ~ '(' AND a = NULL;",
+        "SELECT * FROM t WHERE s ~ '(' AND 'x' = 'y';",
+        "UPDATE t SET s = 'x' WHERE a = 1 AND a = 2 AND s ~ '(';",
+        "SELECT * FROM t WHERE s ~ '(' AND a IN (1) AND a = 2;",
+        "SELECT * FROM tn WHERE a IS NULL AND s ~ '(';",
+        "DELETE FROM p WHERE a = 2 AND s ~ '(';",
+        "SELECT * FROM pe WHERE s ~ '(';",
+        "SELECT * FROM pp WHERE s ~ '(';",
+        "SELECT * FROM ONLY p WHERE s ~ '(';",
+        "UPDATE ONLY p SET s = 'x' WHERE s ~ '(';",
+        "DELETE FROM ONLY p WHERE s ~ '(';",
+        "SELECT t.* FROM t LEFT JOIN u ON u.id = t.a AND u.s ~ '(';",
+        "SELECT t.a FROM u RIGHT JOIN t ON u.id = t.a AND u.s ~ '(';",
+        "SELECT * FROM (SELECT * FROM t WHERE s ~ '(') x WHERE false;",
+        "SELECT * FROM (SELECT * FROM t WHERE s ~ '(' LIMIT 1) x WHERE false;",
+        "SELECT * FROM (SELECT * FROM t WHERE false) x WHERE x.s ~ '(';",
+        "SET constraint_exclusion = on;
+         SELECT * FROM t WHERE s ~ '(' AND a < 0 AND a > 0;",
+        "PREPARE q(text) AS SELECT 1 WHERE 'a' ~ $1; EXECUTE q('a'); EXECUTE q(NULL);",
+        "PREPARE q(bool) AS SELECT 1 WHERE $1 AND 'a' ~ '('; EXECUTE q(false);",
+        "PREPARE q(text) AS SELECT * FROM t WHERE s ~ $1;
+         EXECUTE q('a'); EXECUTE q('a'); EXECUTE q('a'); EXECUTE q('a'); EXECUTE q('a');
+         EXECUTE q('(');",
+    ] {
+        build_db(&[("0001.sql", setup), ("0002.sql", ok)]);
+    }
+}
+
+#[test]
+fn cursors_are_tracked_per_transaction() {
+    // PG 18 portalmem.c / portalcmds.c: a cursor's name is free until it
+    // closes — by CLOSE, CLOSE ALL, DISCARD ALL, or the end of the
+    // transaction that opened it, unless WITH HOLD and the transaction
+    // commits. ROLLBACK closes even a WITH HOLD one, ROLLBACK TO SAVEPOINT
+    // the ones opened since; closing is never undone.
+    let setup = "CREATE TABLE t (a int);";
+    let exists = "cursor \"c\" already exists";
+    let missing = "cursor \"c\" does not exist";
+    for (stmt, msg) in [
+        (
+            "BEGIN; DECLARE c CURSOR FOR SELECT 1; DECLARE c CURSOR FOR SELECT 2; COMMIT;",
+            exists,
+        ),
+        (
+            "DECLARE c CURSOR FOR SELECT 1; DECLARE c CURSOR FOR SELECT 2;",
+            exists,
+        ),
+        (
+            "BEGIN; DECLARE c CURSOR WITH HOLD FOR SELECT 1; COMMIT;
+             BEGIN; DECLARE c CURSOR FOR SELECT 2; COMMIT;",
+            exists,
+        ),
+        (
+            "DECLARE c CURSOR WITH HOLD FOR SELECT 1;
+             DECLARE c CURSOR WITH HOLD FOR SELECT 1;",
+            exists,
+        ),
+        ("FETCH c;", missing),
+        ("MOVE c;", missing),
+        ("CLOSE c;", missing),
+        ("BEGIN; FETCH NEXT FROM c; COMMIT;", missing),
+        (
+            "BEGIN; DECLARE c CURSOR FOR SELECT 1; COMMIT; FETCH c;",
+            missing,
+        ),
+        (
+            "BEGIN; DECLARE c CURSOR WITH HOLD FOR SELECT 1; ROLLBACK; FETCH c;",
+            missing,
+        ),
+        (
+            "DECLARE c CURSOR WITH HOLD FOR SELECT 1; FETCH c; CLOSE c; CLOSE c;",
+            missing,
+        ),
+        (
+            "BEGIN; DECLARE c CURSOR FOR SELECT 1; CLOSE ALL; FETCH c;",
+            missing,
+        ),
+        (
+            "BEGIN; SAVEPOINT s; DECLARE c CURSOR FOR SELECT 1; ROLLBACK TO s; FETCH c;",
+            missing,
+        ),
+        (
+            "BEGIN; DECLARE c CURSOR FOR SELECT 1; SAVEPOINT s; CLOSE c; ROLLBACK TO s; FETCH c;",
+            missing,
+        ),
+        (
+            "BEGIN; DECLARE c CURSOR WITH HOLD FOR SELECT 1; COMMIT;
+             BEGIN; CLOSE c; ROLLBACK; FETCH c;",
+            missing,
+        ),
+        // EXPLAIN plans the cursor's query; no cursor opens.
+        (
+            "BEGIN; EXPLAIN DECLARE c CURSOR FOR SELECT 1; FETCH c;",
+            missing,
+        ),
+        (
+            "BEGIN; EXPLAIN ANALYZE DECLARE c CURSOR FOR SELECT 1; FETCH c;",
+            missing,
+        ),
+        // transformDeclareCursorStmt.
+        (
+            "BEGIN; DECLARE c SCROLL NO SCROLL CURSOR FOR SELECT 1;",
+            "cannot specify both SCROLL and NO SCROLL",
+        ),
+        (
+            "BEGIN; DECLARE c ASENSITIVE INSENSITIVE CURSOR FOR SELECT 1;",
+            "cannot specify both ASENSITIVE and INSENSITIVE",
+        ),
+        (
+            "BEGIN; DECLARE c CURSOR FOR SELECT nope FROM t;",
+            "column \"nope\" does not exist",
+        ),
+        (
+            "BEGIN; DECLARE c CURSOR FOR
+             WITH x AS (INSERT INTO t VALUES (1) RETURNING a) SELECT * FROM x;",
+            "DECLARE CURSOR must not contain data-modifying statements in WITH",
+        ),
+        (
+            "DECLARE c CURSOR WITH HOLD FOR SELECT * FROM t FOR SHARE;",
+            "DECLARE CURSOR WITH HOLD ... FOR SHARE is not supported",
+        ),
+        (
+            "BEGIN; DECLARE c SCROLL CURSOR FOR SELECT * FROM t FOR NO KEY UPDATE;",
+            "DECLARE SCROLL CURSOR ... FOR NO KEY UPDATE is not supported",
+        ),
+        (
+            "BEGIN; DECLARE c SCROLL CURSOR FOR SELECT * FROM (SELECT 1) s FOR UPDATE;",
+            "DECLARE SCROLL CURSOR ... FOR UPDATE is not supported",
+        ),
+        // The first row mark, in clause order, holds the strongest lock
+        // its source is given.
+        (
+            "BEGIN; DECLARE c SCROLL CURSOR FOR
+             SELECT * FROM t x JOIN t y ON true FOR KEY SHARE OF y FOR UPDATE OF x;",
+            "DECLARE SCROLL CURSOR ... FOR KEY SHARE is not supported",
+        ),
+        (
+            "BEGIN; DECLARE c SCROLL CURSOR FOR
+             SELECT * FROM t x JOIN t y ON true FOR KEY SHARE OF y FOR UPDATE;",
+            "DECLARE SCROLL CURSOR ... FOR UPDATE is not supported",
+        ),
+        (
+            "BEGIN; DECLARE c INSENSITIVE CURSOR FOR SELECT * FROM t FOR UPDATE;",
+            "DECLARE INSENSITIVE CURSOR ... FOR UPDATE is not valid",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    for ok in [
+        "BEGIN; DECLARE c CURSOR FOR SELECT 1; DECLARE d CURSOR FOR SELECT a FROM t;
+         FETCH c; MOVE NEXT IN d; FETCH ALL FROM c; CLOSE c; CLOSE d;
+         DECLARE c CURSOR FOR SELECT 2; COMMIT;",
+        "BEGIN; DECLARE c CURSOR FOR SELECT 1; COMMIT; BEGIN; DECLARE c CURSOR FOR SELECT 2; COMMIT;",
+        "BEGIN; DECLARE c CURSOR FOR SELECT 1; ROLLBACK; BEGIN; DECLARE c CURSOR FOR SELECT 2; COMMIT;",
+        "BEGIN; DECLARE c CURSOR WITH HOLD FOR SELECT 1; COMMIT; FETCH c; CLOSE c;",
+        "DECLARE c CURSOR WITH HOLD FOR SELECT 1; FETCH c; CLOSE ALL;
+         DECLARE c CURSOR WITH HOLD FOR SELECT 1;",
+        "BEGIN; SAVEPOINT s; DECLARE c CURSOR FOR SELECT 1; RELEASE s; FETCH c; COMMIT;",
+        "BEGIN; DECLARE c CURSOR FOR SELECT 1; SAVEPOINT s; FETCH c; ROLLBACK TO s; FETCH c; COMMIT;",
+        "BEGIN; SAVEPOINT s; DECLARE c CURSOR FOR SELECT 1; ROLLBACK TO s;
+         DECLARE c CURSOR FOR SELECT 2; COMMIT;",
+        "BEGIN; EXPLAIN DECLARE c CURSOR FOR SELECT 1; DECLARE c CURSOR FOR SELECT 1; COMMIT;",
+        // No row source to lock: no row mark.
+        "BEGIN; DECLARE c SCROLL CURSOR FOR SELECT 1 FOR UPDATE; COMMIT;",
+        "BEGIN; DECLARE c SCROLL CURSOR FOR SELECT * FROM generate_series(1, 2) FOR UPDATE;
+         COMMIT;",
+        "BEGIN; DECLARE c SCROLL CURSOR FOR WITH w AS (SELECT 1) SELECT * FROM w FOR UPDATE;
+         COMMIT;",
+        "BEGIN; DECLARE c CURSOR FOR SELECT * FROM t FOR UPDATE; COMMIT;",
+    ] {
+        build_db(&[("0001.sql", setup), ("0002.sql", ok)]);
+    }
+    // A WITH HOLD cursor outlives its migration: the session is the
+    // runner's.
+    let err = try_apply(&[
+        ("0001.sql", setup),
+        ("0002.sql", "DECLARE c CURSOR WITH HOLD FOR SELECT 1;"),
+        ("0003.sql", "DECLARE c CURSOR WITH HOLD FOR SELECT 2;"),
+    ])
+    .expect_err("held cursor");
+    assert!(err.to_string().starts_with(exists), "got: {err}");
+    build_db(&[
+        ("0001.sql", setup),
+        ("0002.sql", "DECLARE c CURSOR WITH HOLD FOR SELECT 1;"),
+        ("0003.sql", "FETCH c; CLOSE c;"),
+    ]);
+    // DISCARD ALL (alone: not in a transaction block) closes them all.
+    let err = try_apply(&[
+        ("0001.sql", setup),
+        ("0002.sql", "DECLARE c CURSOR WITH HOLD FOR SELECT 1;"),
+        ("0003.sql", "DISCARD ALL;"),
+        ("0004.sql", "FETCH c;"),
+    ])
+    .expect_err("discarded cursor");
+    assert!(err.to_string().starts_with(missing), "got: {err}");
+}
+
+#[test]
+fn cursors_user_code_may_open_or_close_are_not_certain() {
+    // A function or DO block can open (OPEN, an EXECUTEd DECLARE, a SQL
+    // function's DECLARE) and close cursors the analyzer can't follow:
+    // once one may, neither "already exists" nor "does not exist" is
+    // certain.
+    for ok in [
+        "CREATE FUNCTION f() RETURNS int LANGUAGE sql
+             AS 'DECLARE c CURSOR WITH HOLD FOR SELECT 1; SELECT 1';
+         SELECT f(); FETCH c;",
+        "DO $$ BEGIN EXECUTE 'DECLARE c CURSOR WITH HOLD FOR SELECT 1'; END $$; FETCH c;",
+        "BEGIN;
+         DO $$ DECLARE r refcursor := 'c'; BEGIN OPEN r FOR SELECT 1; END $$;
+         FETCH c; COMMIT;",
+        "CREATE FUNCTION close_c() RETURNS void LANGUAGE plpgsql
+             AS $$ BEGIN EXECUTE 'CLOSE c'; END $$;
+         BEGIN; DECLARE c CURSOR FOR SELECT 1; SELECT close_c();
+         DECLARE c CURSOR FOR SELECT 2; COMMIT;",
+    ] {
+        build_db(&[("0001.sql", ok)]);
+    }
+    // Code that can't: the names stay certain.
+    let err = try_apply(&[(
+        "0001.sql",
+        "CREATE FUNCTION g() RETURNS int LANGUAGE sql AS 'SELECT 1';
+         DO $$ BEGIN PERFORM g(); END $$;
+         FETCH c;",
+    )])
+    .expect_err("FETCH");
+    assert!(
+        err.to_string().starts_with("cursor \"c\" does not exist"),
+        "got: {err}"
+    );
+}
+
+#[test]
 fn rollback_undoes_the_catalog_changes_of_its_transaction() {
     // PG 18: ROLLBACK and ROLLBACK TO SAVEPOINT undo everything since the
     // transaction / savepoint started — catalog changes and settings alike.
