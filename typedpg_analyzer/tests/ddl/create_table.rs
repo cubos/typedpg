@@ -64,6 +64,78 @@ fn create_table_with_default() {
     assert!(!name_col.atthasdef);
 }
 
+/// AddRelationNewConstraints stores no default that cooks to a bare null
+/// constant: `pg_attribute.atthasdef` stays false, in CREATE TABLE, ADD
+/// COLUMN and ALTER COLUMN SET DEFAULT alike. A domain column's cooks to a
+/// CoerceToDomain, and a typmod's length coercion or a cast to another type
+/// is no constant either: those are kept.
+#[test]
+fn null_constant_default_is_no_default() {
+    let snap = build(&[(
+        "0001.sql",
+        "CREATE DOMAIN dm AS int DEFAULT 5;
+         CREATE TABLE t (
+            a int NOT NULL DEFAULT NULL,
+            b int DEFAULT NULL::int,
+            c text DEFAULT CAST(NULL AS text),
+            d dm DEFAULT NULL,
+            e varchar(5) DEFAULT NULL,
+            f int DEFAULT NULL::int8,
+            g int NOT NULL DEFAULT 1,
+            h int DEFAULT 2
+         );
+         ALTER TABLE t ALTER g SET DEFAULT NULL;
+         ALTER TABLE t ADD COLUMN i int DEFAULT NULL;
+         ALTER TABLE t ALTER h SET DEFAULT NULL::int8;
+         CREATE TABLE p (a int NOT NULL DEFAULT 7);
+         CREATE TABLE c (a int DEFAULT NULL) INHERITS (p);",
+    )]);
+    let has_default = |rel: &str, col: &str| {
+        let table = snap.resolve_table(None, rel).unwrap();
+        snap.attributes_of(table.oid)
+            .iter()
+            .find(|a| a.attname == col)
+            .unwrap()
+            .atthasdef
+    };
+    for (rel, col, expected) in [
+        ("t", "a", false),
+        ("t", "b", false),
+        ("t", "c", false),
+        ("t", "d", true),
+        ("t", "e", true),
+        ("t", "f", true),
+        ("t", "g", false),
+        ("t", "h", true),
+        ("t", "i", false),
+        ("p", "a", true),
+        // The child's own DEFAULT NULL overrides the parent's default.
+        ("c", "a", false),
+    ] {
+        assert_eq!(has_default(rel, col), expected, "{rel}.{col}");
+    }
+    // ATExecAddIdentity refuses a column with a default only.
+    build(&[(
+        "0001.sql",
+        "CREATE TABLE idt (a int NOT NULL DEFAULT NULL);
+         ALTER TABLE idt ALTER a ADD GENERATED ALWAYS AS IDENTITY;
+         CREATE TABLE idt2 (a int NOT NULL DEFAULT 1);
+         ALTER TABLE idt2 ALTER a SET DEFAULT NULL;
+         ALTER TABLE idt2 ALTER a ADD GENERATED ALWAYS AS IDENTITY;",
+    )]);
+    let err = try_apply(&[(
+        "0001.sql",
+        "CREATE TABLE idt3 (a int NOT NULL DEFAULT NULL::int8);
+         ALTER TABLE idt3 ALTER a ADD GENERATED ALWAYS AS IDENTITY;",
+    )])
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("column \"a\" of relation \"idt3\" already has a default value"),
+        "{err}"
+    );
+}
+
 #[test]
 fn create_table_registers_composite_and_array_types() {
     let snap = build(&[(
