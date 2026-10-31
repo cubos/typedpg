@@ -156,6 +156,9 @@ struct Rows {
     projected: bool,
     /// The constant each output column surely holds.
     values: Vec<Option<Value>>,
+    /// Each output column's type, where known (an operator over it is
+    /// resolved by it).
+    types: Vec<Option<PgTypeOid>>,
     count: Count,
 }
 
@@ -167,6 +170,7 @@ impl Rows {
             all,
             first,
             values,
+            types: Vec::new(),
             count,
         }
     }
@@ -178,6 +182,13 @@ impl Rows {
 
     fn errors(&self, first: bool) -> &Errors {
         if first { &self.first } else { &self.all }
+    }
+
+    /// Column `i`'s type: an unknown-typed one (`'a'`, `NULL`) is text, as
+    /// a query's output (resolveTargetListUnknowns).
+    fn type_of(&self, i: usize) -> Option<PgTypeOid> {
+        let t = self.types.get(i).copied().flatten()?;
+        Some(if t == oid::UNKNOWN { oid::TEXT } else { t })
     }
 }
 
@@ -322,7 +333,10 @@ fn select_rows(
                 always: None,
             };
             let values = row.iter().map(|c| level.value(c)).collect();
-            return Some(Rows::new(errors.clone(), errors, values, ONE));
+            return Some(Rows {
+                types: row.iter().map(|c| level.type_of(c)).collect(),
+                ..Rows::new(errors.clone(), errors, values, ONE)
+            });
         }
         let all = rows
             .iter()
@@ -391,6 +405,7 @@ fn select_rows(
     }
     Some(Rows {
         projected: source.as_ref().is_some_and(|s| s.rows.projected),
+        types: level_types(sel, level),
         ..Rows::new(all, first, values, count)
     })
 }
@@ -435,6 +450,27 @@ fn level_errors(
         values.push(level.value(val));
     }
     Some((Errors { columns, always }, values))
+}
+
+/// The type of each column `sel`'s select list yields over `level`'s
+/// source, where known.
+fn level_types(sel: &protobuf::SelectStmt, level: Level<'_>) -> Vec<Option<PgTypeOid>> {
+    let mut types = Vec::new();
+    for target in &sel.target_list {
+        let val = match target.node.as_ref() {
+            Some(node::Node::ResTarget(rt)) => rt.val.as_deref(),
+            _ => None,
+        };
+        if let (Some(source), Some(node::Node::ColumnRef(cr))) =
+            (level.source, val.and_then(|v| v.node.as_ref()))
+            && let Read::All = source.read(cr)
+        {
+            types.extend((0..source.names.len()).map(|i| source.rows.type_of(i)));
+            continue;
+        }
+        types.push(val.and_then(|v| level.type_of(v)));
+    }
+    types
 }
 
 fn is_column_ref(n: &protobuf::Node) -> bool {
@@ -607,11 +643,7 @@ impl Level<'_> {
             node::Node::NullTest(nt) => return self.error(nt.arg.as_deref()?),
             node::Node::SubLink(sl) => return self.sublink_error(sl),
             node::Node::AExpr(e) if e.kind() == protobuf::AExprKind::AexprOp => {
-                let name = match e.name.last()?.node.as_ref()? {
-                    node::Node::String(s) => s.sval.as_str(),
-                    _ => return None,
-                };
-                if evaluates_operands(self.snapshot, name)
+                if self.evaluates_operands(e)
                     && let Some(f) = e.lexpr.iter().chain(&e.rexpr).find_map(|a| self.error(a))
                 {
                     return Some(f);
@@ -639,6 +671,87 @@ impl Level<'_> {
             message: e.to_string(),
             domain: false,
         })
+    }
+
+    /// The type `n` surely has, where it is simple enough to tell: a
+    /// constant, a cast, a column of the source, an operator over such or
+    /// a scalar subquery.
+    fn type_of(&self, n: &protobuf::Node) -> Option<PgTypeOid> {
+        match n.node.as_ref()? {
+            node::Node::AConst(c) => Some(expr::literals::infer_a_const(c).ok()?.type_oid),
+            node::Node::TypeCast(tc) => {
+                crate::ddl::util::resolve_type_name(tc.type_name.as_ref()?, self.snapshot)
+            }
+            node::Node::ColumnRef(cr) => {
+                let source = self.source?;
+                match source.read(cr) {
+                    Read::Column(i) => source.rows.type_of(i),
+                    _ => None,
+                }
+            }
+            node::Node::AExpr(e) if e.kind() == protobuf::AExprKind::AexprOp => {
+                Some(self.operator(e)?.result_type_oid)
+            }
+            node::Node::SubLink(sl)
+                if sl.sub_link_type == protobuf::SubLinkType::ExprSublink as i32 =>
+            {
+                let Some(node::Node::SelectStmt(sub)) = sl.subselect.as_deref()?.node.as_ref()
+                else {
+                    return None;
+                };
+                query_rows(sub, self.snapshot, self.ctes, self.depth + 1, self.stored)?.type_of(0)
+            }
+            _ => None,
+        }
+    }
+
+    /// The operator `e` resolves to, when its operands' types are known.
+    fn operator(&self, e: &protobuf::AExpr) -> Option<crate::lookup::ResolvedOperator> {
+        let name = expr::extract_string_fields(&e.name).join(".");
+        let left = match e.lexpr.as_deref() {
+            Some(l) => Some(self.type_of(l)?),
+            None => None,
+        };
+        let right = self.type_of(e.rexpr.as_deref()?)?;
+        match self.snapshot.find_operator_detailed(&name, left, right) {
+            crate::lookup::OperatorMatch::Found(op) => Some(op),
+            _ => None,
+        }
+    }
+
+    /// The operator `e` runs a function that evaluates each of its
+    /// operands: ExecInterpExpr evaluates a call's arguments before it,
+    /// and the planner neither folds a domain's coercion
+    /// (eval_const_expressions) nor drops an argument. It may where the
+    /// function is a SQL one it inlines (whose body may ignore an
+    /// argument), or one whose support function simplifies the call
+    /// (`range_contains_elem` is false for an empty range): those, and the
+    /// functions a user could give a support function, are left alone.
+    ///
+    /// The operator is the one its operands' types resolve to; where those
+    /// aren't known, every operator of its name must qualify.
+    fn evaluates_operands(&self, e: &protobuf::AExpr) -> bool {
+        let snapshot = self.snapshot;
+        let evaluates = |code: Option<crate::oid::PgProcOid>| {
+            const SIMPLIFIED: [&str; 2] = ["range_contains_elem", "elem_contained_by_range"];
+            code.and_then(|f| snapshot.pg_proc.get(&f))
+                .is_some_and(|p| {
+                    p.prolang != crate::pg_catalog::SQL_LANGUAGE
+                        && snapshot.namespace_name(p.pronamespace) == Some("pg_catalog")
+                        && !SIMPLIFIED.contains(&p.proname.as_str())
+                })
+        };
+        if let Some(op) = self.operator(e) {
+            return evaluates(op.code);
+        }
+        let Some(node::Node::String(name)) = e.name.last().and_then(|n| n.node.as_ref()) else {
+            return false;
+        };
+        snapshot
+            .pg_operator
+            .values()
+            .filter(|o| o.oprname == name.sval)
+            .all(|o| evaluates(o.oprcode))
     }
 
     /// `NULL::d` of a domain `d` rejecting it.
@@ -788,31 +901,6 @@ impl Level<'_> {
     }
 }
 
-/// Every operator named `name` runs a built-in function that evaluates
-/// each of its operands: ExecInterpExpr evaluates a call's arguments
-/// before it, and the planner neither folds a domain's coercion
-/// (eval_const_expressions) nor drops an argument. It may where the
-/// function is a SQL one it inlines (whose body may ignore an argument),
-/// or one whose support function simplifies the call (`range_contains_elem`
-/// is false for an empty range): those, and the functions a user could
-/// give a support function, are left alone.
-fn evaluates_operands(snapshot: &PgCatalog, name: &str) -> bool {
-    const SIMPLIFIED: [&str; 2] = ["range_contains_elem", "elem_contained_by_range"];
-    snapshot
-        .pg_operator
-        .values()
-        .filter(|o| o.oprname == name)
-        .all(|o| {
-            o.oprcode
-                .and_then(|f| snapshot.pg_proc.get(&f))
-                .is_some_and(|p| {
-                    p.prolang != crate::pg_catalog::SQL_LANGUAGE
-                        && snapshot.namespace_name(p.pronamespace) == Some("pg_catalog")
-                        && !SIMPLIFIED.contains(&p.proname.as_str())
-                })
-        })
-}
-
 /// `l <op> r` of two constants, when decided: integers (a string literal
 /// against one is read as one, as its unknown type is resolved), strings
 /// and booleans by equality (the default collation is deterministic).
@@ -902,7 +990,7 @@ fn from_item_rows(
             _ => None,
         }
     };
-    // `view`: the query is a view's, stored without execution.
+    // `view`: the query is this view's, stored without execution.
     let (name, alias, query, inner_ctes, mut names, view): (
         _,
         _,
@@ -928,7 +1016,7 @@ fn from_item_rows(
                     query,
                     &ctes[i + 1..],
                     names,
-                    false,
+                    None,
                 )
             } else {
                 let schema = (!rv.schemaname.is_empty()).then_some(rv.schemaname.as_str());
@@ -952,7 +1040,7 @@ fn from_item_rows(
                     query,
                     &[][..],
                     names,
-                    true,
+                    Some(class.oid),
                 )
             }
         }
@@ -965,7 +1053,7 @@ fn from_item_rows(
                 query,
                 &[][..],
                 Vec::new(),
-                false,
+                None,
             )
         }
         _ => return None,
@@ -978,7 +1066,22 @@ fn from_item_rows(
         } else {
             inner_ctes.to_vec()
         };
-    let rows = query_rows(&query, snapshot, &inner_ctes, depth + 1, stored || view)?;
+    let mut rows = query_rows(
+        &query,
+        snapshot,
+        &inner_ctes,
+        depth + 1,
+        stored || view.is_some(),
+    )?;
+    // A view's columns have the types it was created with.
+    if let Some(view) = view {
+        rows.types = snapshot
+            .attributes_of(view)
+            .iter()
+            .filter(|a| a.attnum > 0)
+            .map(|a| Some(a.atttypid))
+            .collect();
+    }
     if names.is_empty() {
         let named = leftmost(&query);
         names = named
