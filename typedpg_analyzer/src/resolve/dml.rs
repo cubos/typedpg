@@ -137,14 +137,6 @@ fn analyze_insert_here(
 
     note_written_columns(&tgt, written.first().map_or(0, Vec::len));
 
-    // DEFAULT VALUES: every column takes its default — a row that may
-    // still go to no partition.
-    if ins.select_stmt.is_none()
-        && let Some(v) = row_violation(&tgt, &[], &|_| Known::Unknown, snapshot)
-    {
-        return Err(v.error);
-    }
-
     // The columns the INSERT leaves to their default — omitted, or
     // `DEFAULT` in some VALUES row — get the default expression, converted
     // to the column's type (rewriteTargetListIU / rewriteValuesRTE): a
@@ -173,6 +165,15 @@ fn analyze_insert_here(
                 return Err(err);
             }
         }
+    }
+
+    // DEFAULT VALUES: every column takes its default — a row that may
+    // still go to no partition. (Executing it fails after planning folded
+    // the defaults above.)
+    if ins.select_stmt.is_none()
+        && let Some(v) = row_violation(&tgt, &[], &|_| Known::Unknown, snapshot)
+    {
+        return Err(v.error);
     }
 
     let (arbiter, conflict_set_list) = match &ins.on_conflict_clause {

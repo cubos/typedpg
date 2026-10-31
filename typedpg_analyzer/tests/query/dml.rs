@@ -707,9 +707,6 @@ fn insert_row_routing_uncertain_is_accepted() {
         "INSERT INTO nodef VALUES ($1, 'x')",
         // A key that is not a constant.
         "INSERT INTO nodef VALUES (length('ab'), 'x')",
-        // A key out of its type's range: PG fails on that first.
-        "INSERT INTO sk VALUES (32767 + 1)",
-        "INSERT INTO bigk VALUES (2147483647 + 1)",
         // A domain's CHECK may reject the key first.
         "INSERT INTO dk VALUES (-5)",
         // A timestamptz literal reads in the session's time zone.
@@ -731,6 +728,21 @@ fn insert_row_routing_uncertain_is_accepted() {
          WHEN NOT MATCHED THEN INSERT VALUES (2, 'x')",
     ] {
         db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    // A key out of its type's range: planning fails on that first, before
+    // any row is routed.
+    for (sql, msg) in [
+        ("INSERT INTO sk VALUES (32767 + 1)", "smallint out of range"),
+        (
+            "INSERT INTO bigk VALUES (2147483647 + 1)",
+            "integer out of range",
+        ),
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::NumericValueOutOfRange(_),
+            msg
+        );
     }
 }
 

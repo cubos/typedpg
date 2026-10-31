@@ -2499,8 +2499,8 @@ pub(crate) fn unknown_literal_as_text(
 
 mod column_refs;
 mod conditional;
-mod folding;
 pub(crate) mod foldable;
+mod folding;
 mod func_call;
 mod indirection;
 pub(crate) mod inline;

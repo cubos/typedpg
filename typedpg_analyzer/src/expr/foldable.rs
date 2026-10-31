@@ -209,6 +209,11 @@ fn shape_here(node: &protobuf::Node, ctx: Ctx<'_>) -> Foldable {
             {
                 return Foldable::ANY;
             }
+            // A stable or volatile function is never evaluated while
+            // folding (evaluate_function).
+            if super::plan_fold::never_folded(f, ctx.snapshot) {
+                return Foldable::NEVER;
+            }
             strict(f.args.iter().map(|a| shape(a, ctx)))
         }
         node::Node::NamedArgExpr(a) => match a.arg.as_deref() {

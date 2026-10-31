@@ -49,6 +49,12 @@ impl Folded {
     pub(crate) fn may_be_const(self) -> bool {
         self != Folded::Var
     }
+
+    /// Whether the expression certainly folds to a known constant (a
+    /// boolean or NULL), which decides where folding goes next.
+    pub(crate) fn known(self) -> bool {
+        matches!(self, Folded::Bool(_) | Folded::Null)
+    }
 }
 
 /// `parse_bool_with_len`: the strings `boolin` accepts.
@@ -79,7 +85,7 @@ fn extract_names(nodes: &[protobuf::Node]) -> Vec<String> {
 
 /// Whether every function `fc` may resolve to is one the planner doesn't
 /// fold (stable or volatile).
-fn never_folded(fc: &protobuf::FuncCall, snapshot: &PgCatalog) -> bool {
+pub(crate) fn never_folded(fc: &protobuf::FuncCall, snapshot: &PgCatalog) -> bool {
     let names = extract_names(&fc.funcname);
     let (schema, name) = match names.as_slice() {
         [n] => (None, n.as_str()),
@@ -444,22 +450,22 @@ thread_local! {
 
 /// RAII marker for a query level the planner plans (a SELECT, UPDATE,
 /// DELETE), with the quals it restricts its relations by.
-pub(crate) struct PlanLevel {
-    prev_checks: Option<bool>,
-}
+pub(crate) struct PlanLevel;
 
 impl PlanLevel {
     /// Enter a level whose quals are `where_clause` and the ON clauses of
     /// the joins in `from`. A level inside one that may be proven empty —
-    /// a FROM subquery pulled up into it, a sublink — is checked no
-    /// further: it may never be planned.
+    /// a FROM subquery pulled up into it, a sublink — may be proven empty
+    /// too: its relations are not estimated. (Its constants are still
+    /// folded where the planner plans them — a pulled-up subquery's output
+    /// where the outer query reads it, see `resolve::deferred` — as
+    /// constant folding precedes relation exclusion.)
     pub(crate) fn enter(
         where_clause: Option<&protobuf::Node>,
         from: &[protobuf::Node],
         snapshot: &PgCatalog,
     ) -> Self {
         let parent_empty = LEVELS.with(|l| l.borrow().last().is_some_and(|q| q.may_be_empty));
-        let prev_checks = parent_empty.then(super::disable_plan_time_checks);
         let quals = if super::plan_time_checks() {
             let mut conjuncts = Vec::new();
             if let Some(w) = where_clause {
@@ -469,23 +475,20 @@ impl PlanLevel {
                 join_quals(f, &mut conjuncts);
             }
             LevelQuals {
-                may_be_empty: may_be_empty(&conjuncts, snapshot),
+                may_be_empty: parent_empty || may_be_empty(&conjuncts, snapshot),
                 conjuncts: conjuncts.len(),
             }
         } else {
             LevelQuals::default()
         };
         LEVELS.with(|l| l.borrow_mut().push(quals));
-        PlanLevel { prev_checks }
+        PlanLevel
     }
 }
 
 impl Drop for PlanLevel {
     fn drop(&mut self) {
         LEVELS.with(|l| l.borrow_mut().pop());
-        if let Some(prev) = self.prev_checks {
-            super::restore_plan_time_checks(prev);
-        }
     }
 }
 

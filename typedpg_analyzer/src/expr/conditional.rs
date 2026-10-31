@@ -56,9 +56,10 @@ pub(crate) fn infer_bool_expr(
             crate::clause::coerce_clause_expr(arg, arg_ctx, params, kind)
         })?;
         if and_or {
+            let folded = super::plan_fold::fold(arg, ctx.snapshot);
             dead = dead
-                || super::plan_fold::stops_after(super::plan_fold::fold(arg, ctx.snapshot), or)
-                || super::foldable::foldable(arg, ctx).value;
+                || super::plan_fold::stops_after(folded, or)
+                || (!folded.known() && super::foldable::foldable(arg, ctx).value);
         }
         any_nullable = any_nullable || t.nullable;
         if and_or {
@@ -205,9 +206,10 @@ pub(crate) fn infer_coalesce(
         args.push(super::plan_fold::unless_dead(dead, || {
             infer_expr(arg, ctx, params, TypeGoal::NONE)
         })?);
+        let folded = super::plan_fold::fold(arg, snapshot);
         dead = dead
-            || super::plan_fold::coalesce_stops_after(super::plan_fold::fold(arg, snapshot))
-            || super::foldable::foldable(arg, ctx).value;
+            || super::plan_fold::coalesce_stops_after(folded)
+            || (!folded.known() && super::foldable::foldable(arg, ctx).value);
     }
 
     // Resolve over the *full* arg list (unknowns included): the
@@ -511,8 +513,9 @@ pub(crate) fn infer_case(
                 }
             }
         }
-        may_be_skipped |=
-            super::foldable::case_test_may_fold(expr.arg.as_deref(), when.expr.as_deref(), ctx);
+        // (A WHEN folding to a known constant was followed above.)
+        may_be_skipped |= !when_fold.known()
+            && super::foldable::case_test_may_fold(expr.arg.as_deref(), when.expr.as_deref(), ctx);
         // Untyped string literals stay UNKNOWN for branch reconciliation and
         // are validated under the resolved common type in pass 2.
         if let Some(result) = &when.result {

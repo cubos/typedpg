@@ -418,9 +418,13 @@ impl Level<'_> {
         }
         let scope = Scope::default();
         let null_ctx = NullabilityContext::default();
+        // (Without the plan-time checks: what planning raises is the
+        // query's analysis' to report, where the planner plans it.)
         let infer = || {
             let ctx = Ctx::new(&scope, &null_ctx, self.snapshot);
-            expr::infer_expr(n, ctx, &mut ParamCollector::default(), TypeGoal::NONE)
+            expr::may_skip(|| {
+                expr::infer_expr(n, ctx, &mut ParamCollector::default(), TypeGoal::NONE)
+            })
         };
         // Only what execution adds: out of its query, the expression could
         // fail for other reasons.
