@@ -110,6 +110,54 @@ fn create_schema_with_table() {
     assert_eq!(snap.namespace_name(table.relnamespace), Some("myapp"));
 }
 
+#[test]
+fn on_commit_requires_a_temporary_table() {
+    // DefineRelation (PG 18, 42P16): any ON COMMIT, PRESERVE ROWS included,
+    // needs TEMP. CREATE TABLE AS tests it before the namespace lookup that
+    // makes `pg_temp.name` temporary; CREATE TABLE after it.
+    for sql in [
+        "CREATE TABLE tt2 (col) ON COMMIT DELETE ROWS AS SELECT 1;",
+        "CREATE TABLE tt3 (col) ON COMMIT PRESERVE ROWS AS SELECT 1;",
+        "CREATE TABLE pg_temp.tt4 (col) ON COMMIT DROP AS SELECT 1;",
+        "CREATE TABLE tt5 (col int) ON COMMIT DELETE ROWS;",
+    ] {
+        let err = try_apply(&[("0001.sql", sql)]).expect_err(sql);
+        assert!(
+            err.to_string()
+                .starts_with("ON COMMIT can only be used on temporary tables"),
+            "{sql}\n  got: {err}"
+        );
+    }
+    build_db(&[(
+        "0001.sql",
+        "CREATE TEMP TABLE tt6 (col) ON COMMIT DELETE ROWS AS SELECT 1;
+         CREATE TEMP TABLE tt7 ON COMMIT PRESERVE ROWS AS SELECT 1 AS x WITH NO DATA;
+         CREATE TABLE pg_temp.tt8 (col int) ON COMMIT DELETE ROWS;",
+    )]);
+}
+
+#[test]
+fn pg_temp_only_takes_temporary_relations() {
+    // RangeVarAdjustRelationPersistence (PG 18, 42P16): an UNLOGGED relation
+    // can't go in the temporary schema; a permanent one becomes temporary.
+    for sql in [
+        "CREATE UNLOGGED TABLE pg_temp.unlogged3 (a int primary key);",
+        "CREATE UNLOGGED TABLE pg_temp.u4 AS SELECT 1;",
+        "CREATE UNLOGGED SEQUENCE pg_temp.s1;",
+    ] {
+        let err = try_apply(&[("0001.sql", sql)]).expect_err(sql);
+        assert!(
+            err.to_string()
+                .starts_with("only temporary relations may be created in temporary schemas"),
+            "{sql}\n  got: {err}"
+        );
+    }
+    build_db(&[(
+        "0001.sql",
+        "CREATE TABLE pg_temp.u5 (a int); CREATE UNLOGGED TABLE u6 (a int);",
+    )]);
+}
+
 // ── No-op DDL shouldn't fail ────────────────────────────────────────────────
 
 #[test]
@@ -1091,6 +1139,876 @@ fn view_columns_keep_their_expression_collation() {
         &info,
         vec![cn("t", basic_with_collation("pg_catalog", "text", "C"))],
     );
+}
+
+#[test]
+fn create_table_as_needs_a_derived_collation() {
+    // PG 18 (42P22): a UNION ALL column whose arms carry different implicit
+    // collations has none, which a table or view column can't store. A
+    // COLLATE, or an arm with a non-conflicting collation, settles it.
+    let setup = r#"CREATE TABLE c1 (b text COLLATE "C");
+                   CREATE TABLE c2 (b text COLLATE "POSIX");
+                   CREATE TABLE c3 (b text);"#;
+    for (stmt, msg) in [
+        (
+            "CREATE TABLE test_u AS SELECT b FROM c1 UNION ALL SELECT b FROM c2;",
+            r#"no collation was derived for column "b" with collatable type text"#,
+        ),
+        (
+            "CREATE TABLE test_u AS SELECT b FROM c1 UNION ALL SELECT b FROM c2 WITH NO DATA;",
+            r#"no collation was derived for column "b" with collatable type text"#,
+        ),
+        (
+            "CREATE MATERIALIZED VIEW test_u AS SELECT b FROM c1 UNION ALL SELECT b FROM c2;",
+            r#"no collation was derived for column "b" with collatable type text"#,
+        ),
+        (
+            "CREATE TABLE test_u AS SELECT ARRAY[b] FROM c1 UNION ALL SELECT ARRAY[b] FROM c2;",
+            r#"no collation was derived for column "array" with collatable type text[]"#,
+        ),
+        (
+            "CREATE VIEW test_u AS SELECT b FROM c1 UNION ALL SELECT b FROM c2;",
+            r#"could not determine which collation to use for view column "b""#,
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            r#"CREATE TABLE t4 AS SELECT b COLLATE "C" AS b FROM c1 UNION ALL SELECT b FROM c2;
+               CREATE TABLE t5 AS SELECT b FROM c1 UNION ALL SELECT b FROM c3;
+               CREATE TABLE t7 AS (SELECT b FROM c1 UNION ALL SELECT b FROM c2)
+                                  UNION ALL SELECT b FROM c1;
+               CREATE VIEW v8 AS SELECT upper(b) FROM (SELECT b FROM c1 UNION ALL
+                                                      SELECT b FROM c2) s;"#,
+        ),
+    ]);
+}
+
+#[test]
+fn create_table_as_with_data_takes_the_planned_collation() {
+    // PG 18 (ExecCreateTableAs): CREATE TABLE AS / SELECT INTO with data,
+    // and CREATE TABLE AS EXECUTE, take their columns from the *planned*
+    // query, where eval_const_expressions has replaced a CASE with constant
+    // conditions by the result it picks, a COALESCE by its leading
+    // constant, a sublink by a Param of the planned subquery's collation —
+    // and a node over them keeps its parsed collation. A view, a
+    // materialized view and WITH NO DATA read the parsed query.
+    let setup = r#"CREATE TABLE c1 (b text COLLATE "C", v varchar(20) COLLATE "C");
+                   CREATE TABLE c2 (b text COLLATE "POSIX");
+                   CREATE FUNCTION f(a text, b text) RETURNS text LANGUAGE sql AS 'SELECT a';"#;
+    let fold = "CASE WHEN true THEN c1.b ELSE c2.b END";
+    let no_collation =
+        |ty: &str| format!(r#"no collation was derived for column "x" with collatable type {ty}"#);
+    for (stmt, msg) in [
+        (
+            format!("CREATE TABLE t AS SELECT {fold} AS x FROM c1, c2 WITH NO DATA;"),
+            no_collation("text"),
+        ),
+        (
+            format!("CREATE MATERIALIZED VIEW t AS SELECT {fold} AS x FROM c1, c2;"),
+            no_collation("text"),
+        ),
+        (
+            format!("CREATE MATERIALIZED VIEW t AS SELECT {fold} AS x FROM c1, c2 WITH NO DATA;"),
+            no_collation("text"),
+        ),
+        (
+            format!("CREATE VIEW t AS SELECT {fold} AS x FROM c1, c2;"),
+            r#"could not determine which collation to use for view column "x""#.into(),
+        ),
+        // The folded CASE is a subquery's column that has none.
+        (
+            "CREATE TABLE t AS SELECT CASE WHEN true THEN s.b ELSE 'x' END AS x \
+             FROM (SELECT c1.b || c2.b AS b FROM c1, c2) s;"
+                .into(),
+            no_collation("text"),
+        ),
+        (
+            "CREATE TABLE t AS SELECT CASE WHEN true THEN s.b ELSE 'x' END AS x \
+             FROM (SELECT b FROM c1 UNION ALL SELECT b FROM c2) s;"
+                .into(),
+            no_collation("text"),
+        ),
+        // Conditions that aren't constant keep the CASE.
+        (
+            "CREATE TABLE t AS SELECT CASE WHEN c1.b = 'a' THEN c1.b WHEN true THEN c2.b END \
+             AS x FROM c1, c2;"
+                .into(),
+            no_collation("text"),
+        ),
+        (
+            "CREATE TABLE t AS SELECT CASE WHEN c1.b IS NULL THEN c1.b ELSE c2.b END AS x \
+             FROM c1, c2;"
+                .into(),
+            no_collation("text"),
+        ),
+        (
+            "CREATE TABLE t AS SELECT CASE WHEN length(c1.b) > 1 THEN c1.b ELSE c2.b END AS x \
+             FROM c1, c2;"
+                .into(),
+            no_collation("text"),
+        ),
+        (
+            "CREATE TABLE t AS SELECT CASE c1.b WHEN 'a' THEN c1.b ELSE c2.b END AS x \
+             FROM c1, c2;"
+                .into(),
+            no_collation("text"),
+        ),
+        // COALESCE stays unless a constant leads it.
+        (
+            "CREATE TABLE t AS SELECT COALESCE(NULL, c1.b, c2.b) AS x FROM c1, c2;".into(),
+            no_collation("text"),
+        ),
+        // A node over a folded one keeps its own collation.
+        (
+            "CREATE TABLE t AS SELECT COALESCE(NULL, c1.b) || c2.b AS x FROM c1, c2;".into(),
+            no_collation("text"),
+        ),
+        (
+            format!("CREATE TABLE t AS SELECT ({fold})::varchar AS x FROM c1, c2;"),
+            no_collation("character varying"),
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", &stmt)]).expect_err(&stmt);
+        assert!(err.to_string().starts_with(&msg), "{stmt}\n  got: {err}");
+    }
+    let db = build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            &format!(
+                r#"CREATE TABLE a1 AS SELECT {fold} AS x FROM c1, c2;
+                   CREATE TABLE a2 AS SELECT {fold} AS x FROM c1, c2 WITH DATA;
+                   SELECT {fold} AS x INTO a3 FROM c1, c2;
+                   PREPARE p AS SELECT {fold} AS x FROM c1, c2;
+                   CREATE TABLE a4 AS EXECUTE p WITH NO DATA;
+                   CREATE TABLE a5 AS SELECT CASE WHEN false THEN c1.b ELSE c2.b END AS x
+                                      FROM c1, c2;
+                   CREATE TABLE a6 AS SELECT CASE WHEN NULL THEN c1.b WHEN true THEN c2.b END AS x
+                                      FROM c1, c2;
+                   CREATE TABLE a7 AS SELECT CASE WHEN false THEN c1.b || c2.b END AS x
+                                      FROM c1, c2;
+                   CREATE TABLE a8 AS SELECT CASE WHEN false THEN c1.b ELSE 'x' END AS x FROM c1;
+                   CREATE TABLE a9 AS SELECT COALESCE('a', c1.b, c2.b) AS x FROM c1, c2;
+                   CREATE TABLE a10 AS SELECT COALESCE(NULL, 'a', c1.b) AS x FROM c1, c2;
+                   CREATE TABLE a11 AS SELECT ({fold})::text AS x FROM c1, c2;
+                   CREATE TABLE a12 AS SELECT (SELECT {fold} FROM c1, c2) AS x;
+                   CREATE TABLE a13 AS SELECT CASE WHEN true THEN c1.v ELSE c2.b END AS x
+                                       FROM c1, c2;
+                   CREATE TABLE a14 AS SELECT CASE WHEN NOT (false AND c1.b = 'a') THEN c1.b
+                                       ELSE c2.b END AS x FROM c1, c2;
+                   CREATE TABLE a15 AS SELECT CASE WHEN true THEN s.b ELSE 'x' END AS x
+                                       FROM (SELECT c1.b || c2.b AS b FROM c1, c2) s
+                                       WITH NO DATA;
+                   CREATE TABLE a16 AS SELECT CASE WHEN true OR c1.b = 'a' THEN c1.b ELSE c2.b END
+                                      AS x FROM c1, c2;
+                   CREATE TABLE a17 AS SELECT ARRAY(SELECT {fold} FROM c1, c2) AS x;"#
+            ),
+        ),
+    ]);
+    let collated = |c: &str| basic_with_collation("pg_catalog", "text", c);
+    for (table, ty) in [
+        ("a1", collated("C")),
+        ("a2", collated("C")),
+        ("a3", collated("C")),
+        ("a4", collated("C")),
+        ("a5", collated("POSIX")),
+        ("a6", collated("POSIX")),
+        ("a7", text()),
+        ("a8", text()),
+        ("a9", text()),
+        ("a10", text()),
+        ("a11", collated("C")),
+        ("a12", collated("C")),
+        ("a13", collated("C")),
+        ("a14", collated("C")),
+        ("a15", text()),
+        ("a16", collated("C")),
+    ] {
+        let info = db.analyze(&format!("SELECT x FROM {table}")).unwrap();
+        assert_cols(&info, vec![cn("x", ty)]);
+    }
+    let info = db.analyze("SELECT x FROM a17").unwrap();
+    assert_cols(&info, vec![cn("x", array_of(collated("C")))]);
+    // Where PG folds what the analyzer doesn't evaluate (`1 = 1`), a
+    // pulled-up subquery or CTE, an inlined SQL function: PG accepts these
+    // (collated "C"), and so does the analyzer.
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            &format!(
+                r#"CREATE TABLE b1 AS SELECT CASE WHEN 1 = 1 THEN c1.b ELSE c2.b END AS x
+                                      FROM c1, c2;
+                   CREATE TABLE b3 AS SELECT x FROM (SELECT {fold} AS x FROM c1, c2) s;
+                   CREATE TABLE b4 AS WITH s AS (SELECT {fold} AS x FROM c1, c2) SELECT x FROM s;
+                   CREATE TABLE b5 AS SELECT (s).x FROM (SELECT {fold} AS x FROM c1, c2) s;
+                   CREATE TABLE b6 AS SELECT f(c1.b, c2.b) AS x FROM c1, c2;"#
+            ),
+        ),
+    ]);
+}
+
+#[test]
+fn create_table_as_with_data_folds_virtual_generated_columns() {
+    // PG 18 (expand_virtual_generated_columns): the planner replaces a
+    // virtual generated column by its expression, then folds it — a CASE
+    // conditioned on one whose expression is constant becomes the branch it
+    // picks. A stored generated column, or a virtual one reading a stored
+    // column, stays a Var.
+    let setup = r#"CREATE TABLE g (s int, b text COLLATE "C",
+                                   k bool GENERATED ALWAYS AS (true) VIRTUAL,
+                                   k2 bool GENERATED ALWAYS AS (s > 0) VIRTUAL,
+                                   ks bool GENERATED ALWAYS AS (true) STORED,
+                                   m int GENERATED ALWAYS AS (length(b)) VIRTUAL,
+                                   w text GENERATED ALWAYS AS ('k') VIRTUAL,
+                                   z int GENERATED ALWAYS AS (NULL::int) VIRTUAL);
+                   CREATE TABLE c2 (b text COLLATE "POSIX");"#;
+    let no_collation = r#"no collation was derived for column "x" with collatable type text"#;
+    for stmt in [
+        "CREATE TABLE t AS SELECT CASE WHEN g.k2 THEN g.b ELSE c2.b END AS x FROM g, c2;",
+        "CREATE TABLE t AS SELECT CASE WHEN g.ks THEN g.b ELSE c2.b END AS x FROM g, c2;",
+        "CREATE TABLE t AS SELECT CASE WHEN g.m > 0 THEN g.b ELSE c2.b END AS x FROM g, c2;",
+        "CREATE TABLE t AS SELECT CASE WHEN g.k AND g.s > 0 THEN g.b ELSE c2.b END AS x \
+         FROM g, c2;",
+        // A view and WITH NO DATA read the parsed query.
+        "CREATE TABLE t AS SELECT CASE WHEN g.k THEN g.b ELSE c2.b END AS x FROM g, c2 \
+         WITH NO DATA;",
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(
+            err.to_string().starts_with(no_collation),
+            "{stmt}\n  got: {err}"
+        );
+    }
+    let stmt = "CREATE VIEW t AS SELECT CASE WHEN g.k THEN g.b ELSE c2.b END AS x FROM g, c2;";
+    let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+    assert!(
+        err.to_string()
+            .starts_with(r#"could not determine which collation to use for view column "x""#),
+        "{stmt}\n  got: {err}"
+    );
+    let db = build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            r#"CREATE TABLE a1 AS SELECT CASE WHEN g.k THEN g.b ELSE c2.b END AS x FROM g, c2;
+               CREATE TABLE a2 AS SELECT CASE WHEN NOT g.k THEN c2.b ELSE g.b END AS x
+                                  FROM g, c2;
+               CREATE TABLE a3 AS SELECT COALESCE(g.k::text, g.b, c2.b) AS x FROM g, c2;
+               -- `z > 0` folds to NULL (POSIX, the ELSE), which the
+               -- analyzer doesn't evaluate: accepted, collation unknown.
+               CREATE TABLE a4 AS SELECT CASE WHEN g.z > 0 THEN g.b ELSE c2.b END AS x
+                                  FROM g, c2;
+               CREATE TABLE a5 AS SELECT CASE WHEN g.k OR g.s > 0 THEN g.b ELSE c2.b END AS x
+                                  FROM g, c2;
+               CREATE TABLE a6 AS SELECT COALESCE(g.w, g.b, c2.b) AS x FROM g, c2;"#,
+        ),
+    ]);
+    let collated = |c: &str| basic_with_collation("pg_catalog", "text", c);
+    for (table, ty) in [
+        ("a1", collated("C")),
+        ("a2", collated("C")),
+        ("a3", text()),
+        ("a5", collated("C")),
+        ("a6", text()),
+    ] {
+        let info = db.analyze(&format!("SELECT x FROM {table}")).unwrap();
+        assert_cols(&info, vec![cn("x", ty)]);
+    }
+}
+
+#[test]
+fn a_column_whose_planned_collation_is_unknown_conflicts_with_none() {
+    // PG 18: where the planner may fold what the analyzer can't evaluate
+    // (`1 = 1`), it doesn't know the collation CREATE TABLE AS stores: here
+    // PG folds the first CASE into 'x' (the default collation, although the
+    // parsed CASE has "C") and the second into c1.b ("C"). Such a column
+    // conflicts with no other collation — in a later query, an inheritance
+    // child or LIKE copy of it, ALTER TABLE INHERIT or OF — so what PG
+    // accepts, the analyzer accepts.
+    build_db(&[
+        (
+            "0001.sql",
+            r#"CREATE TABLE c1 (b text COLLATE "C");
+               CREATE TABLE c2 (b text COLLATE "POSIX");
+               CREATE TABLE t AS SELECT CASE WHEN 1 = 1 THEN 'x' ELSE c1.b END AS x FROM c1;
+               CREATE TABLE t4 AS SELECT CASE WHEN 1 = 1 THEN c1.b ELSE 'x' END AS x FROM c1;"#,
+        ),
+        (
+            "0002.sql",
+            r#"CREATE VIEW v AS SELECT t.x || c2.b AS y FROM t, c2;
+               CREATE TABLE u AS SELECT t.x || c2.b AS y FROM t, c2;
+               CREATE TABLE u2 AS SELECT t.x || c2.b AS y FROM t, c2 WITH NO DATA;
+               CREATE MATERIALIZED VIEW m AS SELECT t.x || c2.b AS y FROM t, c2;
+               CREATE TABLE t5 AS SELECT x FROM t;
+               CREATE VIEW v5 AS SELECT t5.x || c2.b AS y FROM t5, c2;
+               CREATE TABLE ch4 (x text COLLATE "C") INHERITS (t4);
+               CREATE TABLE l4 (LIKE t4);
+               CREATE TABLE ch6 (x text COLLATE "C") INHERITS (l4);
+               CREATE TABLE ch7 () INHERITS (t4);
+               CREATE TABLE p (x text COLLATE "C");
+               ALTER TABLE t4 INHERIT p;
+               CREATE TYPE ct AS (x text COLLATE "C");
+               CREATE TABLE t8 AS SELECT CASE WHEN 1 = 1 THEN c1.b ELSE 'x' END AS x FROM c1;
+               ALTER TABLE t8 OF ct;
+               CREATE VIEW vv AS SELECT x FROM t4;
+               CREATE OR REPLACE VIEW vv AS SELECT x COLLATE "C" AS x FROM t4;
+               CREATE TABLE pt (x text COLLATE "C") PARTITION BY LIST (x);
+               CREATE TABLE t9 AS SELECT CASE WHEN 1 = 1 THEN c1.b ELSE 'x' END AS x FROM c1;
+               ALTER TABLE pt ATTACH PARTITION t9 FOR VALUES IN ('b');"#,
+        ),
+    ]);
+    // ALTER COLUMN TYPE gives the column a known collation again.
+    let err = try_apply(&[(
+        "0001.sql",
+        r#"CREATE TABLE c1 (b text COLLATE "C");
+           CREATE TABLE t AS SELECT CASE WHEN 1 = 1 THEN 'x' ELSE c1.b END AS x FROM c1;
+           ALTER TABLE t ALTER COLUMN x TYPE text;
+           CREATE TABLE ch (x text COLLATE "C") INHERITS (t);"#,
+    )])
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with(r#"column "x" has a collation conflict"#),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn a_column_without_a_collation_stays_without_one() {
+    // PG 18: a column with no collation (exprCollation InvalidOid) — two
+    // conflicting implicit collations met, or a UNION ALL of them — is read
+    // through a subquery, CTE or join as a Var of strength NONE: it stays
+    // without a collation where it is passed through as is (a no-op cast,
+    // a scalar sublink, `*`), and a table, view or materialized view can't
+    // store it. A node over it with a collatable result (a function, an
+    // operator, a coercion to another type, COALESCE, ARRAY[...]) takes
+    // its type's default; any implicit collation beside it wins. A
+    // conflict, unlike it, bubbles up through every node. (A join on
+    // conflicting collations fails as it runs, so those tables are created
+    // WITH NO DATA.)
+    let setup = r#"CREATE TABLE c1 (b text COLLATE "C");
+                   CREATE TABLE c2 (b text COLLATE "POSIX");
+                   CREATE TABLE c3 (b text);
+                   CREATE DOMAIN d AS text;
+                   CREATE DOMAIN dc AS text COLLATE "C";"#;
+    let u = "(SELECT b FROM c1 UNION ALL SELECT b FROM c2)";
+    let no_collation = |column: &str, ty: &str| {
+        format!(r#"no collation was derived for column "{column}" with collatable type {ty}"#)
+    };
+    for (stmt, msg) in [
+        (
+            format!("CREATE TABLE t AS SELECT b FROM {u} s;"),
+            no_collation("b", "text"),
+        ),
+        (
+            format!("CREATE TABLE t AS WITH s AS {u} SELECT b FROM s;"),
+            no_collation("b", "text"),
+        ),
+        (
+            format!("CREATE TABLE t AS SELECT * FROM {u} s;"),
+            no_collation("b", "text"),
+        ),
+        (
+            format!("CREATE TABLE t AS SELECT (s).b FROM {u} s;"),
+            no_collation("b", "text"),
+        ),
+        (
+            format!("CREATE TABLE t AS SELECT s.b::text AS a FROM {u} s;"),
+            no_collation("a", "text"),
+        ),
+        (
+            format!("CREATE TABLE t AS SELECT s.b::d AS a FROM {u} s;"),
+            no_collation("a", "d"),
+        ),
+        (
+            format!("CREATE TABLE t AS SELECT (SELECT s.b) AS a FROM {u} s;"),
+            no_collation("a", "text"),
+        ),
+        (
+            format!("CREATE TABLE t AS SELECT b FROM {u} s GROUP BY b;"),
+            no_collation("b", "text"),
+        ),
+        (
+            format!("CREATE TABLE t AS SELECT b FROM {u} s UNION ALL SELECT b FROM {u} s2;"),
+            no_collation("b", "text"),
+        ),
+        (
+            format!("CREATE TABLE t AS SELECT b FROM {u} s UNION SELECT b FROM {u} s2;"),
+            no_collation("b", "text"),
+        ),
+        (
+            "CREATE TABLE t AS SELECT c1.b || c2.b AS x FROM c1, c2;".into(),
+            no_collation("x", "text"),
+        ),
+        (
+            "CREATE TABLE t AS SELECT x FROM (SELECT c1.b || c2.b AS x FROM c1, c2) s;".into(),
+            no_collation("x", "text"),
+        ),
+        (
+            "CREATE TABLE t AS SELECT upper(c1.b || c2.b) AS x FROM c1, c2;".into(),
+            no_collation("x", "text"),
+        ),
+        (
+            "CREATE TABLE t AS SELECT (c1.b || c2.b)::d AS x FROM c1, c2;".into(),
+            no_collation("x", "d"),
+        ),
+        (
+            "CREATE TABLE t AS SELECT NULLIF(c1.b, c2.b) AS x FROM c1, c2;".into(),
+            no_collation("x", "text"),
+        ),
+        (
+            "CREATE TABLE t AS SELECT GREATEST(c1.b, c2.b) AS x FROM c1, c2;".into(),
+            no_collation("x", "text"),
+        ),
+        (
+            "CREATE TABLE t AS SELECT CASE WHEN c1.b > '' THEN c1.b ELSE c2.b END AS x \
+             FROM c1, c2;"
+                .into(),
+            no_collation("x", "text"),
+        ),
+        (
+            "CREATE TABLE t AS SELECT ARRAY[c1.b, c2.b] AS r FROM c1, c2;".into(),
+            no_collation("r", "text[]"),
+        ),
+        (
+            "CREATE TABLE t AS SELECT (ARRAY[c1.b || c2.b])[1] AS r FROM c1, c2;".into(),
+            no_collation("r", "text"),
+        ),
+        // A plain arm's conflict beats the other arm's implicit collation.
+        (
+            "CREATE TABLE t AS SELECT c1.b || c2.b FROM c1, c2 UNION ALL SELECT b FROM c3;".into(),
+            no_collation("?column?", "text"),
+        ),
+        (
+            "CREATE TABLE t AS SELECT b FROM c1 FULL JOIN c2 USING (b) WITH NO DATA;".into(),
+            no_collation("b", "text"),
+        ),
+        (
+            "CREATE TABLE t AS VALUES ((SELECT b FROM c1)), ((SELECT b FROM c2));".into(),
+            no_collation("column1", "text"),
+        ),
+        (
+            "CREATE TABLE t AS WITH RECURSIVE r(b) AS (SELECT c1.b || c2.b FROM c1, c2 \
+             UNION ALL SELECT b FROM r WHERE false) SELECT b FROM r;"
+                .into(),
+            no_collation("b", "text"),
+        ),
+        (
+            format!("SELECT b INTO t FROM {u} s;"),
+            no_collation("b", "text"),
+        ),
+        (
+            format!("CREATE MATERIALIZED VIEW t AS SELECT b FROM {u} s;"),
+            no_collation("b", "text"),
+        ),
+        (
+            format!("CREATE VIEW t AS SELECT b FROM {u} s;"),
+            r#"could not determine which collation to use for view column "b""#.into(),
+        ),
+        (
+            "CREATE VIEW t AS SELECT c1.b || c2.b AS x FROM c1, c2;".into(),
+            r#"could not determine which collation to use for view column "x""#.into(),
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", &stmt)]).expect_err(&stmt);
+        assert!(err.to_string().starts_with(&msg), "{stmt}\n  got: {err}");
+    }
+    let db = build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            &format!(
+                r#"CREATE TABLE a1 AS SELECT upper(b) AS b FROM {u} s;
+                   CREATE TABLE a2 AS SELECT s.b::varchar AS b FROM {u} s;
+                   CREATE TABLE a3 AS SELECT COALESCE(s.b, 'x') AS b FROM {u} s;
+                   CREATE TABLE a4 AS SELECT COALESCE(s.b, s.b) AS b FROM {u} s;
+                   CREATE TABLE a5 AS SELECT ARRAY[s.b] AS b FROM {u} s;
+                   CREATE TABLE a6 AS SELECT max(s.b) AS b FROM {u} s;
+                   CREATE TABLE a7 AS SELECT s.b COLLATE "C" AS b FROM {u} s;
+                   CREATE TABLE a8 AS SELECT s.b || c1.b AS b FROM {u} s, c1;
+                   CREATE TABLE a9 AS SELECT b FROM {u} s UNION ALL SELECT b FROM c3;
+                   CREATE TABLE a10 AS SELECT s.b::dc AS b FROM {u} s;
+                   CREATE TABLE a11 AS SELECT x AS b FROM (SELECT c1.b || c2.b AS x FROM c1, c2) s
+                                       UNION ALL SELECT b FROM c1;
+                   CREATE TABLE a12 AS SELECT (c1.b || c2.b) || 'x' COLLATE "POSIX" AS b
+                                       FROM c1, c2;
+                   CREATE TABLE a13 AS SELECT b FROM c1 JOIN c2 USING (b) WITH NO DATA;
+                   CREATE TABLE a14 AS SELECT b FROM c1 RIGHT JOIN c2 USING (b) WITH NO DATA;
+                   CREATE TABLE a15 AS SELECT b FROM c1 FULL JOIN c3 USING (b);
+                   CREATE TABLE a16 AS SELECT x AS b FROM c1, LATERAL (VALUES (c1.b)) v(x);
+                   CREATE TABLE a17 AS VALUES ((SELECT b FROM c1)), ('x');
+                   CREATE VIEW a18 AS SELECT upper(c1.b) || s.b AS b FROM {u} s, c1;"#
+            ),
+        ),
+    ]);
+    let collated = |c: &str| basic_with_collation("pg_catalog", "text", c);
+    for (table, ty) in [
+        ("a1", text()),
+        ("a2", basic("pg_catalog", "varchar")),
+        ("a3", text()),
+        ("a4", text()),
+        ("a6", text()),
+        ("a7", collated("C")),
+        ("a8", collated("C")),
+        ("a9", text()),
+        ("a11", collated("C")),
+        ("a12", collated("POSIX")),
+        ("a13", collated("C")),
+        ("a14", collated("POSIX")),
+        ("a15", collated("C")),
+        ("a16", collated("C")),
+        ("a18", collated("C")),
+    ] {
+        let info = db.analyze(&format!("SELECT b FROM {table}")).unwrap();
+        assert_cols(&info, vec![cn("b", ty)]);
+    }
+    let info = db.analyze("SELECT b FROM a10").unwrap();
+    assert_eq!(info.columns.len(), 1);
+    let info = db.analyze("SELECT column1 FROM a17").unwrap();
+    assert_cols(&info, vec![cn("column1", collated("C"))]);
+}
+
+#[test]
+fn a_sublink_without_a_collation_is_an_implicit_none() {
+    // PG 18 (assign_collations_walker, T_Query): a scalar or ARRAY sublink
+    // takes its subquery's column collation at strength IMPLICIT, even when
+    // that column has none (InvalidOid). Unlike a Var of strength NONE, it
+    // beats the default collation, bubbles up through every collatable node
+    // over it (a function, an operator, a cast, CASE, COALESCE, ARRAY[...],
+    // a subscript, a VALUES column it is merged into) and conflicts with any
+    // other non-default implicit collation; only an explicit COLLATE settles
+    // it. A Var reading it through a subquery is of strength NONE, so a
+    // node over that Var takes its type's default.
+    let setup = r#"CREATE TABLE c1 (b text COLLATE "C");
+                   CREATE TABLE c2 (b text COLLATE "POSIX");
+                   CREATE DOMAIN d AS text;"#;
+    let u = "(SELECT b FROM c1 UNION ALL SELECT b FROM c2)";
+    let sub = format!("(SELECT x.b FROM {u} x LIMIT 1)");
+    let arr = format!("ARRAY(SELECT x.b FROM {u} x)");
+    let no_collation =
+        |ty: &str| format!(r#"no collation was derived for column "a" with collatable type {ty}"#);
+    for (query, ty) in [
+        (format!("SELECT unnest({arr}) AS a"), "text"),
+        (format!("SELECT * FROM unnest({arr}) AS a"), "text"),
+        (format!("SELECT {arr} || ARRAY['a'] AS a"), "text[]"),
+        (format!("SELECT {arr} AS a"), "text[]"),
+        (format!("SELECT {arr}::text[] AS a"), "text[]"),
+        (format!("SELECT ({arr})[1] AS a"), "text"),
+        (format!("SELECT array_append({arr}, 'q') AS a"), "text[]"),
+        (format!("SELECT upper({sub}) AS a"), "text"),
+        (format!("SELECT {sub} || 'q' AS a"), "text"),
+        (format!("SELECT {sub} || c1.b AS a FROM c1"), "text"),
+        (format!("SELECT {sub}::varchar AS a"), "character varying"),
+        (format!("SELECT {sub}::d AS a"), "d"),
+        // A Var reading it has strength NONE, and no collation either.
+        (format!("SELECT s.a FROM (SELECT {sub} AS a) s"), "text"),
+        (format!("SELECT COALESCE({sub}, 'q') AS a"), "text"),
+        (
+            format!("SELECT CASE WHEN true THEN {sub} ELSE 'q' END AS a"),
+            "text",
+        ),
+        (format!("SELECT ARRAY[{sub}] AS a"), "text[]"),
+        (format!("SELECT unnest(ARRAY[{sub}]) AS a"), "text"),
+        (format!("SELECT {sub} AS a UNION ALL SELECT 'q'"), "text"),
+        (format!("SELECT 'q' AS a UNION ALL SELECT {sub}"), "text"),
+        (
+            format!("SELECT v.a FROM (VALUES ({sub}), ('q')) v(a)"),
+            "text",
+        ),
+        (
+            format!("SELECT v.a FROM (VALUES ('q'), ({sub})) v(a)"),
+            "text",
+        ),
+        (
+            format!("SELECT v.a FROM (VALUES ({sub}), ('q'::text)) v(a)"),
+            "text",
+        ),
+        (
+            format!("SELECT v.a FROM (VALUES ({sub}), (NULL)) v(a)"),
+            "text",
+        ),
+        (
+            format!("SELECT v.a FROM (VALUES ({sub}), (upper('q'))) v(a)"),
+            "text",
+        ),
+        (
+            format!("SELECT v.a FROM (VALUES ({sub}), ((SELECT b FROM c1 LIMIT 1))) v(a)"),
+            "text",
+        ),
+    ] {
+        let stmt = format!("CREATE TABLE t AS {query} WITH NO DATA;");
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", &stmt)]).expect_err(&stmt);
+        assert!(
+            err.to_string().starts_with(&no_collation(ty)),
+            "{stmt}\n  got: {err}"
+        );
+    }
+    for query in [
+        format!("SELECT v.a FROM (VALUES ({sub}), ('q')) v(a)"),
+        format!("SELECT unnest({arr}) AS a"),
+    ] {
+        let stmt = format!("CREATE VIEW t AS {query};");
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", &stmt)]).expect_err(&stmt);
+        assert!(
+            err.to_string()
+                .starts_with(r#"could not determine which collation to use for view column "a""#),
+            "{stmt}\n  got: {err}"
+        );
+    }
+    let db = build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            &format!(
+                r#"CREATE TABLE a1 AS SELECT {sub} COLLATE "C" AS a WITH NO DATA;
+                   CREATE TABLE a2 AS SELECT {sub} || ('q' COLLATE "POSIX") AS a WITH NO DATA;
+                   CREATE TABLE a4 AS SELECT upper(s.a) AS a FROM (SELECT {sub} AS a) s
+                                      WITH NO DATA;
+                   CREATE TABLE a5 AS SELECT length({sub}) AS a WITH NO DATA;
+                   CREATE TABLE a6 AS SELECT unnest({arr}) COLLATE "C" AS a WITH NO DATA;
+                   CREATE TABLE a7 AS SELECT v.a FROM (VALUES ({sub} COLLATE "POSIX"), ('q')) v(a)
+                                      WITH NO DATA;
+                   CREATE TABLE a8 AS SELECT (SELECT b FROM c1 LIMIT 1) || 'q' AS a WITH NO DATA;"#
+            ),
+        ),
+    ]);
+    let collated = |c: &str| basic_with_collation("pg_catalog", "text", c);
+    for (table, ty) in [
+        ("a1", collated("C")),
+        ("a2", collated("POSIX")),
+        ("a4", text()),
+        ("a5", basic("pg_catalog", "int4")),
+        ("a6", collated("C")),
+        ("a7", collated("POSIX")),
+        ("a8", collated("C")),
+    ] {
+        let info = db.analyze(&format!("SELECT a FROM {table}")).unwrap();
+        assert_cols(&info, vec![cn("a", ty)]);
+    }
+}
+
+#[test]
+fn a_scalar_from_function_column_takes_the_calls_collation() {
+    // addRangeTableEntryForFunction (PG 18): a scalar result's column (one
+    // OUT parameter included) has exprCollation(funcexpr), the collation
+    // the call derives from its arguments — none when they conflict.
+    let setup = r#"CREATE TABLE c1 (b text COLLATE "C");
+                   CREATE TABLE c2 (b text COLLATE "POSIX");"#;
+    let stmt =
+        "CREATE TABLE t AS SELECT a FROM c1, c2, unnest(ARRAY[c1.b || c2.b]) a WITH NO DATA;";
+    let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+    assert!(
+        err.to_string()
+            .starts_with(r#"no collation was derived for column "a" with collatable type text"#),
+        "{stmt}\n  got: {err}"
+    );
+    let db = build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "CREATE TABLE f1 AS SELECT a FROM c1, unnest(ARRAY[c1.b]) a WITH NO DATA;
+             CREATE TABLE f2 AS SELECT a FROM c1, upper(c1.b) a WITH NO DATA;
+             CREATE TABLE f4 AS SELECT a FROM c1, unnest(ARRAY[c1.b], ARRAY[1]) a(a, n)
+                                WITH NO DATA;
+             CREATE TABLE f5 AS SELECT a FROM c1, regexp_split_to_table(c1.b, ',') a
+                                WITH NO DATA;
+             CREATE TABLE f6 AS SELECT a FROM c1, ROWS FROM (upper(c1.b), lower('x')) a(a, z)
+                                WITH NO DATA;
+             CREATE TABLE f7 AS SELECT a FROM c1, unnest(ARRAY[c1.b]) WITH ORDINALITY a(a, o)
+                                WITH NO DATA;
+             CREATE TABLE f8 AS SELECT lower('x') AS a FROM c1 WITH NO DATA;",
+        ),
+    ]);
+    let collated = basic_with_collation("pg_catalog", "text", "C");
+    for table in ["f1", "f2", "f4", "f5", "f6", "f7"] {
+        let info = db.analyze(&format!("SELECT a FROM {table}")).unwrap();
+        assert_cols(&info, vec![cn("a", collated.clone())]);
+    }
+    let info = db.analyze("SELECT a FROM f8").unwrap();
+    assert_cols(&info, vec![cn("a", text())]);
+}
+
+#[test]
+fn collatable_index_and_partition_expressions_need_a_collation() {
+    // ComputeIndexAttrs / ComputePartitionAttrs (PG 18): a collatable key
+    // expression without a collation can't be indexed unless the key's
+    // COLLATE clause names one; a partition key expression needs its own
+    // (CheckAttributeType runs before the clause applies).
+    let setup = r#"CREATE TABLE ix (x text COLLATE "C", y text COLLATE "POSIX");"#;
+    for (stmt, msg) in [
+        (
+            "CREATE INDEX ON ix ((x || y));",
+            "could not determine which collation to use for index expression",
+        ),
+        (
+            "CREATE INDEX ON ix (upper(x || y));",
+            "could not determine which collation to use for index expression",
+        ),
+        (
+            "ALTER TABLE ix ADD EXCLUDE USING btree ((x || y) WITH =);",
+            "could not determine which collation to use for index expression",
+        ),
+        (
+            r#"CREATE TABLE px (x text COLLATE "C", y text COLLATE "POSIX")
+               PARTITION BY RANGE ((x || y));"#,
+            "no collation was derived for partition key column 1 with collatable type text",
+        ),
+        (
+            r#"CREATE TABLE px (x text COLLATE "C", y text COLLATE "POSIX")
+               PARTITION BY RANGE (x, (x || y) COLLATE "C");"#,
+            "no collation was derived for partition key column 2 with collatable type text",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            r#"CREATE INDEX ON ix ((x || y) COLLATE "C");
+               CREATE INDEX ON ix ((x || 'a'));
+               CREATE INDEX ON ix (((x || y) COLLATE "POSIX"));
+               CREATE INDEX ON ix (length(x || y));
+               ALTER TABLE ix ADD EXCLUDE USING btree ((x || y) COLLATE "C" WITH =);
+               CREATE TABLE px (x text COLLATE "C", y text COLLATE "POSIX")
+                 PARTITION BY RANGE (((x || y) COLLATE "C"));
+               CREATE TABLE px2 (x text COLLATE "C") PARTITION BY RANGE ((x || 'a'));"#,
+        ),
+    ]);
+}
+
+#[test]
+fn inherited_storage_modes_must_agree() {
+    // MergeInheritedAttribute / MergeChildAttribute (PG 18, 42804): an
+    // inherited column's storage mode is its parent's `attstorage`, its
+    // type's default included, and two parents must agree; a LIKE ...
+    // INCLUDING STORAGE column merged with it must too. A local STORAGE
+    // clause is ignored there — not even checked — and the column keeps
+    // the inherited mode. ALTER COLUMN ... SET STORAGE reaches the
+    // descendants unless ONLY.
+    let setup = "CREATE TABLE a (x text STORAGE external);
+                 CREATE TABLE b (x text STORAGE main);
+                 CREATE TABLE d (x text);
+                 CREATE TABLE e (x text STORAGE main);";
+    let inherited = r#"inherited column "x" has a storage parameter conflict"#;
+    let local = r#"column "x" has a storage parameter conflict"#;
+    for (stmt, msg) in [
+        ("CREATE TABLE c () INHERITS (a, b);", inherited),
+        ("CREATE TABLE c () INHERITS (a, d);", inherited),
+        ("CREATE TABLE c () INHERITS (d, a);", inherited),
+        ("CREATE TABLE c (x text) INHERITS (b, a);", inherited),
+        (
+            "CREATE TABLE c (LIKE b INCLUDING STORAGE) INHERITS (a);",
+            local,
+        ),
+        ("CREATE TABLE c (LIKE d INCLUDING ALL) INHERITS (a);", local),
+        (
+            "ALTER TABLE d ALTER COLUMN x SET STORAGE main;
+             CREATE TABLE c () INHERITS (d, a);",
+            inherited,
+        ),
+        // The mode a child inherited, kept over its own STORAGE clause.
+        (
+            "CREATE TABLE k (x text STORAGE main) INHERITS (a);
+             CREATE TABLE c () INHERITS (k, b);",
+            inherited,
+        ),
+        // SET STORAGE recurses to the children, unless ONLY.
+        (
+            "CREATE TABLE k () INHERITS (d);
+             ALTER TABLE d ALTER COLUMN x SET STORAGE external;
+             CREATE TABLE c () INHERITS (k, b);",
+            inherited,
+        ),
+        (
+            "CREATE TABLE k () INHERITS (d);
+             ALTER TABLE ONLY d ALTER COLUMN x SET STORAGE external;
+             CREATE TABLE c () INHERITS (k, a);",
+            inherited,
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "CREATE TABLE a1 (x text) INHERITS (a);
+             CREATE TABLE a2 (x text STORAGE main) INHERITS (a);
+             CREATE TABLE a3 (x text STORAGE bogus) INHERITS (a);
+             CREATE TABLE a4 (LIKE b) INHERITS (a);
+             CREATE TABLE a5 () INHERITS (b, e);
+             CREATE TABLE a6 (LIKE a INCLUDING STORAGE) INHERITS (a);
+             CREATE TABLE a7 (LIKE d INCLUDING STORAGE) INHERITS (d);
+             CREATE TABLE a8 () INHERITS (a2, a);
+             CREATE TABLE a9 (LIKE b INCLUDING STORAGE);
+             CREATE TABLE a10 () INHERITS (a9, e);
+             CREATE TABLE k () INHERITS (d);
+             ALTER TABLE d ALTER COLUMN x SET STORAGE main;
+             CREATE TABLE a11 () INHERITS (k, b);
+             CREATE TABLE k2 () INHERITS (d);
+             ALTER TABLE ONLY d ALTER COLUMN x SET STORAGE external;
+             CREATE TABLE a12 () INHERITS (k2, b);",
+        ),
+    ]);
+}
+
+#[test]
+fn inherited_compression_methods_must_agree() {
+    // MergeInheritedAttribute / MergeChildAttribute (PG 18, 42804): two
+    // definitions setting different compression methods conflict — an
+    // explicit `default` too; an unset one takes the other's method.
+    let setup = "CREATE TABLE cm1 (f1 text COMPRESSION pglz);
+                 CREATE TABLE cm2 (f1 text COMPRESSION lz4);
+                 CREATE TABLE cm3 (f1 text);";
+    for stmt in [
+        "CREATE TABLE cminh () INHERITS (cm1, cm2);",
+        "CREATE TABLE cminh (f1 text) INHERITS (cm1, cm2);",
+        "CREATE TABLE cminh (f1 text COMPRESSION lz4) INHERITS (cm1);",
+        "CREATE TABLE cminh (f1 text COMPRESSION default) INHERITS (cm1);",
+        "CREATE TABLE cminh (LIKE cm2 INCLUDING COMPRESSION) INHERITS (cm1);",
+        // The method a child inherited, added or was set to later.
+        "CREATE TABLE c (f1 text COMPRESSION pglz) INHERITS (cm1, cm3);
+         CREATE TABLE cminh () INHERITS (c, cm2);",
+        "CREATE TABLE c (); ALTER TABLE c ADD COLUMN f1 text COMPRESSION lz4;
+         CREATE TABLE cminh () INHERITS (cm1, c);",
+        "CREATE TABLE p (); CREATE TABLE c () INHERITS (p);
+         ALTER TABLE p ADD COLUMN f1 text COMPRESSION lz4;
+         CREATE TABLE cminh () INHERITS (c, cm1);",
+        "ALTER TABLE cm3 ALTER COLUMN f1 SET COMPRESSION lz4;
+         CREATE TABLE cminh () INHERITS (cm1, cm3);",
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(
+            err.to_string()
+                .starts_with(r#"column "f1" has a compression method conflict"#),
+            "{stmt}\n  got: {err}"
+        );
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "CREATE TABLE a1 () INHERITS (cm1, cm3);
+             CREATE TABLE a2 () INHERITS (cm3, cm2);
+             CREATE TABLE a3 (f1 text COMPRESSION pglz) INHERITS (cm1);
+             CREATE TABLE a4 (LIKE cm2) INHERITS (cm1);
+             CREATE TABLE a5 (f1 text COMPRESSION lz4); ALTER TABLE a5 ALTER f1 TYPE text;
+             CREATE TABLE a6 () INHERITS (cm1, a5);
+             CREATE TABLE a7 (f1 text COMPRESSION lz4);
+             ALTER TABLE a7 ALTER f1 SET COMPRESSION default;
+             CREATE TABLE a8 () INHERITS (cm1, a7);
+             ALTER TABLE cm2 INHERIT cm1;",
+        ),
+    ]);
 }
 
 #[test]

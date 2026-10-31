@@ -99,6 +99,14 @@ pub fn create_view(interp: &mut PgCatalog, stmt: &ViewStmt) -> Result<(), DdlErr
         false,
     )?;
 
+    // DefineVirtualRelation: a collatable column needs a collation.
+    if let Some(col) = resolved.columns.iter().find(|c| c.no_collation) {
+        return Err(DdlError::Parse(format!(
+            "could not determine which collation to use for view column \"{}\"",
+            col.name
+        )));
+    }
+
     // DefineVirtualRelation: OR REPLACE redefines an existing *view* in
     // place (keeping its OID, so dependents stay attached); any other
     // existing relation is an error.
@@ -279,6 +287,66 @@ fn create_relation_as(
             "too many column names were specified".into(),
         ));
     }
+    // ExecCreateTableAs: a table created with data (or from EXECUTE, which
+    // always plans) takes its columns from the planned query — whose
+    // collations planning may have changed (see `Planned`); a materialized
+    // view, or WITH NO DATA, from the parsed one.
+    let is_execute = matches!(
+        query.and_then(|q| q.node.as_ref()),
+        Some(node::Node::ExecuteStmt(_))
+    );
+    if kind == RelKind::Table && (!into.skip_data || is_execute) {
+        for col in &mut resolved.columns {
+            match col.planned {
+                crate::expr::Planned::AsParsed => {}
+                // Whatever it may be, it may have one — which the
+                // analyzer doesn't know. The default collation stands in
+                // for it: it conflicts with no other implicit collation, so
+                // a query combining the column with another collated one is
+                // accepted whatever PG stored (`CASE WHEN 1 = 1 THEN 'x'
+                // ELSE c1.b END` folds to the default-collated 'x', not to
+                // the "C" the parsed CASE has).
+                crate::expr::Planned::Unknown => {
+                    col.no_collation = false;
+                    if interp_type_collation(interp, col.type_oid).is_some() {
+                        col.collation = Some(crate::expr::DEFAULT_COLLATION);
+                        col.uncertain_collation = true;
+                    }
+                }
+                crate::expr::Planned::Folded { collation, missing } => {
+                    col.no_collation = missing;
+                    col.collation = if missing {
+                        None
+                    } else {
+                        collation.or_else(|| interp_type_collation(interp, col.type_oid))
+                    };
+                }
+            }
+        }
+    }
+    // intorel_startup / create_ctas_nodata: a collatable column needs a
+    // collation.
+    if let Some(col) = resolved.columns.iter().find(|c| c.no_collation) {
+        return Err(DdlError::Parse(format!(
+            "no collation was derived for column \"{}\" with collatable type {}",
+            col.name,
+            super::util::format_type_for_message(interp, col.type_oid)
+        )));
+    }
+    // DefineRelation: ON COMMIT applies to temporary tables only — tested
+    // on the statement's TEMP, before the namespace lookup that would make
+    // a `pg_temp.name` temporary.
+    use protobuf::OnCommitAction;
+    let on_commit = OnCommitAction::try_from(into.on_commit).unwrap_or(OnCommitAction::Undefined);
+    if !matches!(
+        on_commit,
+        OnCommitAction::OncommitNoop | OnCommitAction::Undefined
+    ) && rv.relpersistence != "t"
+    {
+        return Err(DdlError::UnsupportedDdl(
+            "ON COMMIT can only be used on temporary tables".into(),
+        ));
+    }
     check_duplicate_columns(&resolved.columns)?;
     super::util::check_relation_name_free(interp, nsoid, &name)?;
     super::tables::check_tablespace_placement(&into.table_space_name)?;
@@ -307,6 +375,11 @@ fn create_relation_as(
         && let Some(oid) = oid
     {
         interp.relpersistence.insert(oid, p);
+    }
+    if on_commit == OnCommitAction::OncommitDrop
+        && let Some(oid) = oid
+    {
+        interp.on_commit_drop.push(oid);
     }
     // WITH NO DATA leaves a materialized view unpopulated.
     if kind == RelKind::MaterializedView
@@ -383,7 +456,12 @@ fn check_view_columns(
                 super::util::format_type_with_typmod(interp, new_col.type_oid, new_col.typmod),
             )));
         }
-        if old_col.attcollation != new_col.collation {
+        if old_col.attcollation != new_col.collation
+            && !new_col.uncertain_collation
+            && !interp
+                .uncertain_collations
+                .contains(&(view_oid, old_col.attnum))
+        {
             let name = |c: Option<crate::oid::PgCollationOid>| {
                 c.and_then(|c| interp.pg_collation.get(&c))
                     .map(|c| c.collname.clone())
@@ -473,6 +551,7 @@ fn replace_view(
         })
         .collect();
     interp.pg_attribute.insert(view_oid, attrs);
+    record_uncertain_collations(interp, view_oid, &columns);
     interp.remove_pg_rewrites_of(view_oid);
     let bound = bound_references(interp, &deps.references);
     interp.view_references.insert(view_oid, bound);
@@ -678,6 +757,7 @@ fn install_relation(
             attinhcount: 0,
         });
     }
+    record_uncertain_collations(interp, class_oid, &columns);
     let phys = super::types::TypePhysical::COMPOSITE;
     // An autogenerated array type named like the row type moves aside.
     super::types::claim_type_name(interp, nsoid, &name)?;
@@ -797,6 +877,14 @@ struct ResolvedColumn {
     /// The expression's collation (`exprCollation`), which PG stores as the
     /// view / CTAS column's `attcollation`.
     collation: Option<crate::oid::PgCollationOid>,
+    /// Of a collatable type, the expression has no collation (see
+    /// [`crate::resolve::RawColumn::no_collation`]).
+    no_collation: bool,
+    /// What planning makes of the collation (see [`crate::expr::Planned`]).
+    planned: crate::expr::Planned,
+    /// The analyzer doesn't know the collation PG stores (see
+    /// [`PgCatalog::uncertain_collations`]).
+    uncertain_collation: bool,
 }
 
 #[derive(Default, Clone)]
@@ -870,6 +958,19 @@ fn resolve_view_with_params(
                 collation: col
                     .collation
                     .or_else(|| interp_type_collation(snapshot, type_oid)),
+                no_collation: col.no_collation.is_some(),
+                planned: col.planned,
+                // A column read as is from one whose collation is
+                // uncertain: so is its own.
+                uncertain_collation: col.origin.as_ref().is_some_and(|o| {
+                    snapshot
+                        .attributes_of(o.relid)
+                        .iter()
+                        .find(|a| a.attname == o.column && a.attnum > 0)
+                        .is_some_and(|a| {
+                            snapshot.uncertain_collations.contains(&(o.relid, a.attnum))
+                        })
+                }),
             }
         })
         .collect();
@@ -1761,6 +1862,21 @@ pub fn rewrite_views_on_schema_rename(
 }
 
 /// The default collation of `type_oid` (`typcollation`).
+/// Record which of a view's or CREATE TABLE AS table's columns have an
+/// uncertain collation (see [`PgCatalog::uncertain_collations`]).
+fn record_uncertain_collations(
+    interp: &mut PgCatalog,
+    relid: PgClassOid,
+    columns: &[ResolvedColumn],
+) {
+    interp.uncertain_collations.retain(|(r, _)| *r != relid);
+    for (i, col) in columns.iter().enumerate() {
+        if col.uncertain_collation {
+            interp.uncertain_collations.insert((relid, (i + 1) as i16));
+        }
+    }
+}
+
 fn interp_type_collation(
     snapshot: &PgCatalog,
     type_oid: PgTypeOid,

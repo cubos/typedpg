@@ -402,28 +402,25 @@ pub(crate) fn infer_type_cast(
         let mut result = inner_type;
         let base = snapshot.unwrap_domain(result.type_oid);
         if !crate::polymorphic::passes_operand_through(target_oid) && base != result.type_oid {
-            let (collation, explicit_collation) = derive_collation([&result], base, snapshot)?;
+            let state = derive_collation([&result], base, snapshot)?;
             result = ExprType {
                 type_oid: base,
                 typmod: None,
-                collation,
-                explicit_collation,
                 ..result
-            };
+            }
+            .with_collation(state);
         }
         if result.typmod.is_some_and(|t| t >= 0) {
-            let (collation, explicit_collation) =
-                derive_collation([&result], target_oid, snapshot)?;
+            let state = derive_collation([&result], target_oid, snapshot)?;
             result = ExprType {
                 type_oid: target_oid,
                 typmod: None,
-                collation,
-                explicit_collation,
                 record_fields: None,
                 elem_nullable: None,
                 refine: Default::default(),
                 ..result
-            };
+            }
+            .with_collation(state);
         }
         return Ok(result);
     }
@@ -447,7 +444,7 @@ pub(crate) fn infer_type_cast(
         crate::nonnull::StrictNode::Cast,
         cast_func.is_none() || ctx.proc_is_strict(cast_func),
     );
-    let state = derive_collation([&inner_type], target_oid, snapshot)?;
+    let state = cast_collation(&inner_type, target_oid, written_typmod, snapshot)?;
     let nullable = inner_type.nullable
         || cast_function_can_return_null(inner_type.type_oid, target_oid, snapshot);
     // The elements of an array cast to an array type: an array literal
@@ -479,10 +476,31 @@ pub(crate) fn infer_type_cast(
         coerce::is_complex(target_oid, snapshot)
             && snapshot.unwrap_domain(inner_type.type_oid) == snapshot.unwrap_domain(target_oid)
     });
+    // What planning makes of the cast's collation (see `Planned`): a cast
+    // to the type the value already has adds no node (the value's own
+    // shows through), a cast function in `LANGUAGE sql` may be inlined, a
+    // length coercion may be planned into a relabeling of its input
+    // (`varchar_support`), collated like that; any other node keeps its
+    // collation.
+    let planned = if inner_type.type_oid == target_oid
+        && written_typmod.is_none()
+        && inner_type.typmod.is_none()
+    {
+        inner_type.planned
+    } else if cast_func
+        .and_then(|f| snapshot.pg_proc.get(&f))
+        .is_some_and(|p| p.prolang == crate::pg_catalog::SQL_LANGUAGE)
+        || (written_typmod.is_some() && inner_type.planned != super::Planned::AsParsed)
+    {
+        super::Planned::Unknown
+    } else {
+        super::Planned::AsParsed
+    };
     Ok(ExprType {
         record_fields,
         // A typed value cast to `unknown` (a CoerceViaIO) is no literal.
         unknown_value: target_oid == oid::UNKNOWN && inner_type.type_oid != oid::UNKNOWN,
+        planned,
         ..ExprType::scalar_with_typmod(target_oid, nullable, written_typmod)
             .with_collation(state)
             .with_elem_nullable(elem_nullable)
@@ -631,5 +649,40 @@ fn dummy_input_pseudo_type(t: PgTypeOid, snapshot: &PgCatalog) -> Option<bool> {
         "trigger" | "event_trigger" | "language_handler" | "fdw_handler" | "table_am_handler"
         | "index_am_handler" | "tsm_handler" => Some(false),
         _ => None,
+    }
+}
+
+/// The collation state of `inner` cast to `target` (written with
+/// `typmod`). coerce_type adds no node for a cast to the type and typmod
+/// the value already has, which keeps its state — none included; any other
+/// coercion is a node over the value, deriving its own (a value without a
+/// collation takes the type's default). A CoerceToDomain takes the
+/// domain's collation when it differs from its base type's, and passes its
+/// input's state through otherwise (assign_collations_walker).
+fn cast_collation(
+    inner: &ExprType,
+    target: PgTypeOid,
+    typmod: Option<i32>,
+    snapshot: &PgCatalog,
+) -> Result<super::DerivedCollation, AnalyzeError> {
+    if inner.type_oid == target && inner.typmod == typmod {
+        return Ok(inner.collation_state());
+    }
+    let base = snapshot.unwrap_domain(target);
+    if base == target {
+        return derive_collation([inner], target, snapshot);
+    }
+    let typcollation = |t| snapshot.get_type(t).and_then(|t| t.typcollation);
+    if typcollation(target) != typcollation(base) {
+        return Ok(super::DerivedCollation {
+            collation: typcollation(target),
+            explicit: false,
+            missing: None,
+        });
+    }
+    if inner.type_oid == base {
+        Ok(inner.collation_state())
+    } else {
+        derive_collation([inner], base, snapshot)
     }
 }

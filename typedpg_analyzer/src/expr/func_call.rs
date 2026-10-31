@@ -337,8 +337,7 @@ pub(crate) fn infer_func_call(
         ),
         _ => std::borrow::Cow::Borrowed(&args.exprs),
     };
-    let (collation, explicit_collation) =
-        derive_collation(collation_inputs.iter(), resolved.return_type_oid, snapshot)?;
+    let derived = derive_collation(collation_inputs.iter(), resolved.return_type_oid, snapshot)?;
     coerce_call_args(&mut args, &resolved, snapshot);
     // Over the arguments as written: the defaults of the functions it
     // knows are finite constants (`lag`'s offset 1 and default NULL,
@@ -392,8 +391,30 @@ pub(crate) fn infer_func_call(
         // argument's typmod (PG matching: `lower(varchar(20))` returns
         // varchar, not varchar(20)).
         typmod: None,
-        collation,
-        explicit_collation,
+        collation: derived.collation,
+        explicit_collation: derived.explicit,
+        no_collation: derived.missing,
+        // inline_function: the planner may replace a call of a `LANGUAGE
+        // sql` function by its body, collated however that is; a length
+        // coercion's support function (`varchar_support`, ...) by a
+        // relabeling of its input, collated like that.
+        planned: if !resolved.is_aggregate
+            && !resolved.is_window
+            && (snapshot
+                .pg_proc
+                .get(&resolved.oid)
+                .is_some_and(|p| p.prolang == crate::pg_catalog::SQL_LANGUAGE)
+                || (resolved.schema == "pg_catalog"
+                    && LENGTH_COERCIONS.contains(&name)
+                    && args
+                        .exprs
+                        .iter()
+                        .any(|a| a.planned != super::Planned::AsParsed)))
+        {
+            super::Planned::Unknown
+        } else {
+            super::Planned::AsParsed
+        },
         record_fields,
         // A function declared to return a domain whose CHECK keeps NULL
         // elements out: its result is coerced to the domain.
@@ -457,6 +478,22 @@ fn check_not_internal(
     }
     Ok(())
 }
+
+/// The catalog's length coercion functions, whose planner support function
+/// simplifies a call that can't change the value into a relabeling of the
+/// input (`SupportRequestSimplify`).
+const LENGTH_COERCIONS: &[&str] = &[
+    "varchar",
+    "bpchar",
+    "numeric",
+    "varbit",
+    "bit",
+    "timestamp",
+    "timestamptz",
+    "interval",
+    "time",
+    "timetz",
+];
 
 /// The call with its arguments in positional notation, for the rules that
 /// read them by parameter position: named arguments (`string_agg(delimiter
@@ -841,9 +878,9 @@ fn within_group_collation_inputs(
     };
     let mut inputs = direct[..extra].to_vec();
     for (h, (s_node, s)) in direct[extra..].iter().zip(aggregated) {
-        let (collation, explicit_collation) = derive_collation([h, &s], s.type_oid, snapshot)?;
+        let merged = derive_collation([h, &s], s.type_oid, snapshot)?;
         let non_default = |t: &ExprType| t.collation.filter(|&c| c != DEFAULT_COLLATION);
-        if collation.is_none()
+        if merged.collation.is_none()
             && let (Some(a), Some(b)) = (non_default(h), non_default(&s))
             && a != b
         {
@@ -863,8 +900,9 @@ fn within_group_collation_inputs(
         }
         if merge_sort {
             inputs.push(ExprType {
-                collation,
-                explicit_collation,
+                collation: merged.collation,
+                explicit_collation: merged.explicit,
+                no_collation: merged.missing,
                 ..s
             });
         }

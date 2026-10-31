@@ -530,3 +530,209 @@ fn set_operation_explicit_collations() {
         vec![cn("x", basic_with_collation("pg_catalog", "text", "C"))],
     );
 }
+
+/// A column without a collation (a UNION ALL of two implicit ones) read
+/// through a subquery, CTE or join is a Var of strength NONE (PG 18): no
+/// parse-time error where a sort or comparison needs a collation — those
+/// fail as they run — and any implicit collation beside it wins. An
+/// expression's conflict, unlike it, stays one: a set operation's arm
+/// that is one is 42P21 unless UNION ALL.
+#[test]
+fn a_column_without_a_collation_is_a_var_of_strength_none() {
+    let db = collation_db();
+    let u = "(SELECT sc AS b FROM tc UNION ALL SELECT sp FROM tc)";
+    for sql in [
+        format!("SELECT b FROM {u} s ORDER BY b"),
+        format!("SELECT b FROM {u} s GROUP BY b"),
+        format!("SELECT DISTINCT b FROM {u} s"),
+        format!("SELECT b FROM {u} s WHERE b < 'x'"),
+        format!("SELECT b FROM {u} s UNION SELECT b FROM {u} s2"),
+        format!("WITH s AS {u} SELECT b FROM s ORDER BY 1"),
+        "SELECT x FROM (SELECT sc || sp AS x FROM tc) s ORDER BY x".to_string(),
+        "SELECT x FROM (SELECT sc || sp AS x FROM tc) s UNION SELECT sp FROM tc".to_string(),
+        "SELECT s FROM tc t1 FULL JOIN (SELECT sp AS s FROM tc) t2 USING (s) ORDER BY s"
+            .to_string(),
+    ] {
+        db.analyze(&sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    for sql in [
+        "SELECT sc || sp AS x FROM tc UNION SELECT 'a'",
+        "SELECT sc || sp AS x FROM tc INTERSECT SELECT s FROM tc",
+        "SELECT sc || sp AS x FROM tc EXCEPT SELECT sc FROM tc",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::CollationMismatch(_),
+            "collation mismatch between implicit collations \"C\" and \"POSIX\""
+        );
+    }
+    // The collation each output column carries (attcollation of the
+    // equivalent view columns, where PG can store one).
+    let s = db
+        .analyze(&format!(
+            "SELECT s.b AS a, s.b || t.sp AS c, upper(s.b) AS d \
+             FROM {u} s, tc t ORDER BY 2"
+        ))
+        .unwrap();
+    assert_cols(
+        &s,
+        vec![
+            cn("a", text()),
+            cn("c", basic_with_collation("pg_catalog", "text", "POSIX")),
+            cn("d", text()),
+        ],
+    );
+    let s = db
+        .analyze(
+            "SELECT s, x FROM (SELECT sc AS s FROM tc) t1 JOIN (SELECT sp AS s FROM tc) t2 \
+             USING (s), LATERAL (VALUES (t2.s)) v(x)",
+        )
+        .unwrap();
+    assert_cols(
+        &s,
+        vec![
+            c("s", basic_with_collation("pg_catalog", "text", "C")),
+            c("x", basic_with_collation("pg_catalog", "text", "POSIX")),
+        ],
+    );
+}
+
+/// A sublink whose column has no collation is an implicit `InvalidOid`
+/// (assign_collations_walker, T_Query): it conflicts with another
+/// non-default implicit collation, which a set operation other than UNION
+/// ALL reports naming it `(null)` (get_collation_name's NULL).
+#[test]
+fn a_sublink_without_a_collation_conflicts_as_null() {
+    let db = collation_db();
+    let sub = "(SELECT x.b FROM (SELECT sc AS b FROM tc UNION ALL SELECT sp FROM tc) x LIMIT 1)";
+    for (sql, msg) in [
+        (
+            format!("SELECT {sub} UNION SELECT sc FROM tc"),
+            r#"collation mismatch between implicit collations "(null)" and "C""#,
+        ),
+        (
+            format!("SELECT sc FROM tc UNION SELECT {sub}"),
+            r#"collation mismatch between implicit collations "C" and "(null)""#,
+        ),
+        (
+            format!("SELECT upper({sub}) INTERSECT SELECT sp FROM tc"),
+            r#"collation mismatch between implicit collations "(null)" and "POSIX""#,
+        ),
+    ] {
+        assert_err_prefix!(db.analyze(&sql), AnalyzeError::CollationMismatch(_), msg);
+    }
+    // Beside the default collation it stays: PREPARE accepts these, the
+    // comparison fails only as it runs.
+    for sql in [
+        format!("SELECT {sub} UNION SELECT 'q'"),
+        format!("SELECT {sub} UNION ALL SELECT sc FROM tc"),
+        format!("SELECT {sub} || s AS a FROM tc"),
+    ] {
+        db.analyze(&sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    // An explicit collation beside it wins; a sublink over a collated
+    // column carries that collation.
+    let s = db
+        .analyze(&format!(
+            "SELECT {sub} || ('q' COLLATE \"POSIX\") AS a, \
+             (SELECT sc FROM tc LIMIT 1) || 'q' AS b"
+        ))
+        .unwrap();
+    assert_cols(
+        &s,
+        vec![
+            cn("a", basic_with_collation("pg_catalog", "text", "POSIX")),
+            cn("b", basic_with_collation("pg_catalog", "text", "C")),
+        ],
+    );
+}
+
+/// transformValuesClause: select_common_collation over each column's
+/// cells — two different explicit collations are 42P21.
+#[test]
+fn values_columns_merge_their_collations() {
+    let db = collation_db();
+    assert_err_prefix!(
+        db.analyze("VALUES ('a' COLLATE \"C\"), ('b' COLLATE \"POSIX\")"),
+        AnalyzeError::CollationMismatch(_),
+        "collation mismatch between explicit collations \"C\" and \"POSIX\""
+    );
+    let s = db.analyze("VALUES ('a' COLLATE \"C\"), ('b')").unwrap();
+    assert_cols(
+        &s,
+        vec![c(
+            "column1",
+            basic_with_collation("pg_catalog", "text", "C"),
+        )],
+    );
+    let s = db
+        .analyze("SELECT * FROM tc, LATERAL (VALUES (sc), (sp)) v(x)")
+        .unwrap();
+    assert_eq!(s.columns.last().unwrap().pg_type, text());
+}
+
+/// analyzeCTE (PG 18, 42P21): a recursive CTE's column collation is its
+/// non-recursive term's, and must be the one the whole UNION derives.
+#[test]
+fn recursive_cte_column_collation_must_match_overall() {
+    let db = collation_db();
+    let u = "(SELECT sc AS b FROM tc UNION ALL SELECT sp FROM tc)";
+    for (sql, msg) in [
+        (
+            "WITH RECURSIVE r(b) AS (SELECT sc FROM tc UNION ALL \
+             SELECT t.sp FROM tc t, r WHERE false) SELECT * FROM r"
+                .to_string(),
+            r#"recursive query "r" column 1 has collation "C" in non-recursive term but collation "(null)" overall"#,
+        ),
+        (
+            "WITH RECURSIVE r(b) AS (SELECT s FROM tc UNION ALL \
+             SELECT t.sc FROM tc t, r WHERE false) SELECT * FROM r"
+                .to_string(),
+            r#"recursive query "r" column 1 has collation "default" in non-recursive term but collation "C" overall"#,
+        ),
+        (
+            "WITH RECURSIVE r(b) AS (SELECT sc FROM tc UNION ALL \
+             SELECT r.b || t.sp FROM tc t, r WHERE false) SELECT * FROM r"
+                .to_string(),
+            r#"recursive query "r" column 1 has collation "C" in non-recursive term but collation "(null)" overall"#,
+        ),
+        (
+            "WITH RECURSIVE r(b) AS (SELECT sc FROM tc UNION ALL \
+             SELECT r.b COLLATE \"POSIX\" FROM r WHERE false) SELECT * FROM r"
+                .to_string(),
+            r#"recursive query "r" column 1 has collation "C" in non-recursive term but collation "POSIX" overall"#,
+        ),
+        (
+            format!(
+                "WITH RECURSIVE r(b) AS (SELECT b FROM {u} s UNION ALL \
+                 SELECT t.sc FROM tc t, r WHERE false) SELECT * FROM r"
+            ),
+            r#"recursive query "r" column 1 has collation "(null)" in non-recursive term but collation "C" overall"#,
+        ),
+        (
+            "WITH RECURSIVE r(b) AS (SELECT sc FROM tc UNION \
+             SELECT t.sp FROM tc t, r WHERE false) SELECT * FROM r"
+                .to_string(),
+            r#"collation mismatch between implicit collations "C" and "POSIX""#,
+        ),
+    ] {
+        assert_err_prefix!(db.analyze(&sql), AnalyzeError::CollationMismatch(_), msg);
+    }
+    for sql in [
+        "WITH RECURSIVE r(b) AS (SELECT sc FROM tc UNION ALL \
+         SELECT t.s FROM tc t, r WHERE false) SELECT * FROM r"
+            .to_string(),
+        "WITH RECURSIVE r(b) AS (SELECT sc COLLATE \"POSIX\" FROM tc UNION ALL \
+         SELECT t.sp FROM tc t, r WHERE false) SELECT * FROM r"
+            .to_string(),
+        format!(
+            "WITH RECURSIVE r(b) AS (SELECT b FROM {u} s UNION ALL \
+             SELECT r.b FROM r WHERE false) SELECT * FROM r"
+        ),
+        "WITH RECURSIVE r(b) AS (SELECT sc FROM tc UNION ALL \
+         SELECT 'x' FROM r WHERE false) SELECT * FROM r"
+            .to_string(),
+    ] {
+        db.analyze(&sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}

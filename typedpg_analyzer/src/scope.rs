@@ -15,6 +15,8 @@ fn system_columns_for(alias: &str) -> Vec<ScopeColumn> {
             base_not_null: true,
             typmod: None,
             collation: None,
+            no_collation: false,
+            planned_unknown: false,
             table_alias: alias.to_owned(),
             record_fields: None,
             elem_nullable: None,
@@ -38,6 +40,17 @@ pub(crate) struct ScopeColumn {
     /// `pg_attribute.attcollation` of the source column, if any. Threaded
     /// through `infer_column_ref` into `ExprType.collation`.
     pub collation: Option<crate::oid::PgCollationOid>,
+    /// Of a collatable type, the column has no collation (a subquery, CTE
+    /// or set operation column whose expression has none): a reference to
+    /// it is a Var of strength NONE (see [`crate::expr::NoCollation`]).
+    pub no_collation: bool,
+    /// Planning may replace a reference to the column by an expression
+    /// whose collation the analyzer doesn't know (see
+    /// [`crate::expr::Planned`]): a pulled-up subquery's or inlined CTE's
+    /// expression the planner folds, an inlined SQL function's column — or
+    /// the column's own collation is unknown (a table column in
+    /// `PgCatalog::uncertain_collations`).
+    pub planned_unknown: bool,
     /// The alias of the table this column belongs to.
     pub table_alias: String,
     /// Named-field structure when the column holds a record value: SRF /
@@ -52,6 +65,17 @@ pub(crate) struct ScopeColumn {
     /// The base-table column this column's value is read from, when it
     /// is one passed through unchanged (see [`Origin`]).
     pub origin: Option<Origin>,
+}
+
+impl ScopeColumn {
+    /// What planning makes of a reference to the column's collation.
+    pub(crate) fn planned(&self) -> crate::expr::Planned {
+        if self.planned_unknown {
+            crate::expr::Planned::Unknown
+        } else {
+            crate::expr::Planned::AsParsed
+        }
+    }
 }
 
 /// Where a value comes from: column `column` of base table `relid`, read
@@ -657,6 +681,12 @@ impl Scope {
                 base_not_null: snapshot.attr_never_null(c),
                 typmod: snapshot.effective_typmod(c.atttypid, c.atttypmod),
                 collation: c.attcollation,
+                no_collation: false,
+                // A column whose collation the analyzer doesn't know (see
+                // `PgCatalog::uncertain_collations`).
+                planned_unknown: snapshot
+                    .uncertain_collations
+                    .contains(&(c.attrelid, c.attnum)),
                 table_alias: alias.to_owned(),
                 record_fields: None,
                 elem_nullable: (null_free.contains(&c.attname)
@@ -749,6 +779,12 @@ impl Scope {
                 base_not_null: snapshot.attr_never_null(c) && not_null_everywhere(c),
                 typmod: snapshot.effective_typmod(c.atttypid, c.atttypmod),
                 collation: c.attcollation,
+                no_collation: false,
+                // A column whose collation the analyzer doesn't know (see
+                // `PgCatalog::uncertain_collations`).
+                planned_unknown: snapshot
+                    .uncertain_collations
+                    .contains(&(c.attrelid, c.attnum)),
                 table_alias: alias.to_owned(),
                 record_fields: None,
                 elem_nullable: (null_free.contains(&c.attname)

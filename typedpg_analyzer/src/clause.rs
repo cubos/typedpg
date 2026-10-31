@@ -402,7 +402,7 @@ pub(crate) struct CollationState {
 }
 
 impl CollationState {
-    const NONE: CollationState = CollationState {
+    pub(crate) const NONE: CollationState = CollationState {
         strength: Strength::None,
         collation: None,
         other: None,
@@ -454,15 +454,31 @@ impl CollationState {
         self
     }
 
-    /// A column value of type `t` with collation `collation` (implicit
-    /// unless `explicit`).
+    /// A value of type `t` with collation `collation` (implicit unless
+    /// `explicit`; its type's when `None`), or with none (`missing`).
     pub(crate) fn column(
         snapshot: &PgCatalog,
         t: PgTypeOid,
         collation: Option<crate::oid::PgCollationOid>,
         explicit: bool,
+        missing: Option<crate::expr::NoCollation>,
     ) -> Self {
-        Self::of_value(snapshot, t, collation, explicit)
+        match missing {
+            None => Self::of_value(snapshot, t, collation, explicit),
+            Some(crate::expr::NoCollation::Unset) => Self::NONE,
+            // An implicit `InvalidOid`: a collation of its own, as far as
+            // merge_collation_state goes.
+            Some(crate::expr::NoCollation::Implicit) => CollationState {
+                strength: Strength::Implicit,
+                collation: None,
+                other: None,
+            },
+            Some(crate::expr::NoCollation::Conflict(a, b)) => CollationState {
+                strength: Strength::Conflict,
+                collation: a,
+                other: b,
+            },
+        }
     }
 
     /// The collation, when explicit.
@@ -490,10 +506,19 @@ impl CollationState {
         if self.strength != Strength::Conflict {
             return Ok(());
         }
+        // get_collation_name(InvalidOid) is NULL, which PG's `%s` prints
+        // as `(null)`.
         let name = |c: Option<crate::oid::PgCollationOid>| {
-            c.and_then(|c| snapshot.pg_collation.get(&c))
-                .map(|c| c.collname.clone())
-                .unwrap_or_default()
+            c.map_or_else(
+                || "(null)".to_string(),
+                |c| {
+                    snapshot
+                        .pg_collation
+                        .get(&c)
+                        .map(|c| c.collname.clone())
+                        .unwrap_or_default()
+                },
+            )
         };
         Err(crate::pgmsg::collation_mismatch_implicit(
             &name(self.collation),
@@ -528,8 +553,16 @@ pub(crate) fn collation_state(
     }
     let children = crate::resolve::expr_children(node);
     if children.is_empty() {
+        // A leaf (a Var, a sublink) takes its collation as is: none for a
+        // subquery column that has none.
         return infer(node).map_or(CollationState::NONE, |t| {
-            CollationState::of_value(ctx.snapshot, t.type_oid, t.collation, t.explicit_collation)
+            CollationState::column(
+                ctx.snapshot,
+                t.type_oid,
+                t.collation,
+                t.explicit_collation,
+                t.no_collation,
+            )
         });
     }
     let mut merged = CollationState::NONE;

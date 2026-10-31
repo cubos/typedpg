@@ -74,6 +74,8 @@ pub(crate) fn analyze_cte(
         table_alias: cte.ctename.clone(),
         typmod: rc.typmod,
         collation: rc.collation,
+        no_collation: rc.no_collation.is_some(),
+        planned_unknown: rc.planned != crate::expr::Planned::AsParsed,
         record_fields: rc.record_fields,
         elem_nullable: rc.elem_nullable,
         refine: rc.refine.clone(),
@@ -184,26 +186,14 @@ pub(crate) fn analyze_cte(
                 } else {
                     None
                 };
-                let term_state = |term: &protobuf::SelectStmt, c: &RawColumn| {
-                    let explicit = term.op == SetOperation::SetopNone as i32
-                        && crate::grouping::level_info(term).is_some_and(|l| {
-                            l.explicit_collations.get(i).copied().unwrap_or(false)
-                        });
-                    crate::clause::CollationState::column(snapshot, common, c.collation, explicit)
-                };
-                let (ls, rs) = (term_state(larg, s), term_state(rarg, r));
-                if let (Some(a), Some(b)) = (ls.explicit(), rs.explicit())
-                    && a != b
-                {
-                    return Err(crate::pgmsg::collation_mismatch_explicit(
-                        &collation_name(Some(a)),
-                        &collation_name(Some(b)),
-                    ));
-                }
-                let merged = ls.merged(rs);
-                if !union_all {
-                    merged.check_determinate(snapshot, None)?;
-                }
+                let merged = super::set_ops::set_op_column_collation(
+                    (larg, s),
+                    (rarg, r),
+                    i,
+                    common,
+                    union_all,
+                    snapshot,
+                )?;
                 overall.push(Some((common, typmod, merged.collation())));
             }
             for (i, (s, o)) in seed_cols.iter().zip(overall).enumerate() {
@@ -220,10 +210,17 @@ pub(crate) fn analyze_cte(
                     )
                     .finalize_implicit());
                 }
-                // A collatable column without one recorded has the type's.
-                let seed_collation =
-                    crate::clause::CollationState::column(snapshot, s.type_oid, s.collation, false)
-                        .collation();
+                // A collatable column without one recorded has the type's;
+                // one without a collation (a conflict included) is named
+                // `(null)`.
+                let seed_collation = crate::clause::CollationState::column(
+                    snapshot,
+                    s.type_oid,
+                    s.collation,
+                    false,
+                    s.no_collation.map(|_| crate::expr::NoCollation::Unset),
+                )
+                .collation();
                 if collation != seed_collation {
                     return Err(crate::pgmsg::recursive_query_column_collation(
                         &cte.ctename,
@@ -244,14 +241,9 @@ pub(crate) fn analyze_cte(
                             crate::coerce::find_common_type(&[s.type_oid, r.type_oid], snapshot)
                                 .unwrap_or(s.type_oid);
                         let typmod = if s.typmod == r.typmod { s.typmod } else { None };
-                        // Recursive CTE arms only keep the collation when
-                        // both arms agree — otherwise PG drops it (same
-                        // shape as the typmod merge above).
-                        let collation = if s.collation == r.collation {
-                            s.collation
-                        } else {
-                            None
-                        };
+                        // The column's collation is the non-recursive
+                        // term's (checked above to be the overall one).
+                        let collation = s.collation;
                         ScopeColumn {
                             name: s.name.clone(),
                             type_oid,
@@ -260,6 +252,8 @@ pub(crate) fn analyze_cte(
                             base_not_null: !(s.nullable || r.nullable),
                             typmod,
                             collation,
+                            no_collation: s.no_collation.is_some(),
+                            planned_unknown: false,
                             table_alias: cte.ctename.clone(),
                             record_fields: crate::expr::merge_set_op_shapes(
                                 s.record_fields.as_ref(),
@@ -419,6 +413,8 @@ fn search_cycle_columns(
         table_alias: cte.ctename.clone(),
         typmod: None,
         collation: None,
+        no_collation: false,
+        planned_unknown: false,
         record_fields: None,
         elem_nullable: None,
         refine: crate::refine::Refinement::NONE,

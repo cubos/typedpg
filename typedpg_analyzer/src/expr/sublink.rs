@@ -54,11 +54,13 @@ pub(crate) fn infer_sublink(
                 // The sublink carries its column's collation, implicitly,
                 // and its value — an array's elements included (no row is
                 // NULL, not an array with other elements).
-                return Ok(
-                    ExprType::scalar_with_typmod(first.type_oid, nullable, first.typmod)
-                        .with_collation((first.collation, false))
-                        .with_elem_nullable(first.elem_nullable),
-                );
+                // Planned, it is a Param collated like the planned
+                // subquery's column (make_subplan).
+                let mut t = ExprType::scalar_with_typmod(first.type_oid, nullable, first.typmod)
+                    .with_collation(first.sublink_collation())
+                    .with_elem_nullable(first.elem_nullable);
+                t.planned = first.planned;
+                return Ok(t);
             }
             Ok(ExprType::scalar(oid::UNKNOWN, true))
         }
@@ -239,8 +241,9 @@ pub(crate) fn infer_sublink(
             // type, so they get `int2vector[]` / `oidvector[]`.
             let mut array_oid = oid::UNKNOWN;
             let mut typmod = None;
-            let mut collation = (None, false);
+            let mut collation = super::DerivedCollation::default();
             let mut elem_nullable = None;
+            let mut planned = super::Planned::AsParsed;
             if let Some(subselect) = &sub.subselect
                 && let Some(node::Node::SelectStmt(sel)) = subselect.node.as_ref()
             {
@@ -249,7 +252,8 @@ pub(crate) fn infer_sublink(
                 // ARRAY sublink is its subquery column's) and, implicitly,
                 // its collation.
                 typmod = first.typmod;
-                collation = (first.collation, false);
+                collation = first.sublink_collation();
+                planned = first.planned;
                 let elem = first.type_oid;
                 let elem_array = snapshot.array_type_of(elem);
                 // The elements are the column's values (or, for an array
@@ -265,9 +269,11 @@ pub(crate) fn infer_sublink(
                     }
                 };
             }
-            Ok(ExprType::scalar_with_typmod(array_oid, false, typmod)
+            let mut t = ExprType::scalar_with_typmod(array_oid, false, typmod)
                 .with_collation(collation)
-                .with_elem_nullable(elem_nullable))
+                .with_elem_nullable(elem_nullable);
+            t.planned = planned;
+            Ok(t)
         }
         _ => Err(crate::error::RawError::unsupported(
             format!(

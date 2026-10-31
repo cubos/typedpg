@@ -194,6 +194,8 @@ pub(crate) fn resolve_target_list_explicit(
                     nullable,
                     typmod: col.typmod,
                     collation: col.collation,
+                    no_collation: col.no_collation.then_some(crate::expr::NoCollation::Unset),
+                    planned: col.planned(),
                     record_fields: col.record_fields.clone(),
                     elem_nullable: col.elem_nullable,
                     refine: col.refine.clone(),
@@ -220,6 +222,13 @@ pub(crate) fn resolve_target_list_explicit(
                     nullable: t.nullable,
                     typmod: t.typmod,
                     collation: t.collation,
+                    no_collation: t.no_collation,
+                    // A FieldSelect keeps its collation when planned; a FROM
+                    // entry's column (a Var) may not.
+                    planned: match t.planned {
+                        crate::expr::Planned::Unknown => crate::expr::Planned::Unknown,
+                        _ => crate::expr::Planned::AsParsed,
+                    },
                     elem_nullable: t.elem_nullable,
                     refine: t.refine.clone(),
                     record_fields: t.record_fields,
@@ -287,6 +296,8 @@ pub(crate) fn resolve_target_list_explicit(
             nullable,
             typmod: expr_type.typmod,
             collation: expr_type.collation,
+            no_collation: expr_type.no_collation,
+            planned: expr_type.planned,
             record_fields,
             elem_nullable: expr_type.elem_nullable,
             refine: expr_type.refine.clone(),
@@ -447,12 +458,23 @@ pub(crate) fn analyze_values_lists(
         }
     }
 
-    // transformValuesClause: select_common_collation per column — an
-    // explicit collation wins (two different ones are an error), two
-    // different implicit ones leave the column without one.
+    // transformValuesClause: select_common_collation over each column's
+    // cells, coerced to its type (a coercion is a node over the cell, which
+    // takes the type's default when the cell has no collation). Different
+    // explicit collations are an error; a conflict leaves the column
+    // without one.
     let mut collations = Vec::with_capacity(arity);
-    for (exprs, &t) in column_exprs.iter().zip(&common) {
-        collations.push(expr::derive_collation(exprs, t, snapshot)?.0);
+    for (i, cells) in column_exprs.iter().enumerate() {
+        let mut coerced = Vec::with_capacity(cells.len());
+        for t in cells {
+            coerced.push(if t.type_oid == common[i] {
+                t.clone()
+            } else {
+                expr::ExprType::scalar(common[i], t.nullable)
+                    .with_collation(expr::derive_collation([t], common[i], snapshot)?)
+            });
+        }
+        collations.push(expr::derive_collation(&coerced, common[i], snapshot)?);
     }
 
     let columns = (0..arity)
@@ -469,7 +491,21 @@ pub(crate) fn analyze_values_lists(
                 .then(|| column_typmods[i].first().copied().flatten())
                 .flatten()
                 .filter(|m| column_typmods[i].iter().all(|x| *x == Some(*m))),
-            collation: collations[i],
+            collation: collations[i].collation,
+            // The column of the VALUES RTE a reference reads.
+            no_collation: collations[i]
+                .missing
+                .map(|_| crate::expr::NoCollation::Unset),
+            planned: if column_exprs[i].len() == 1
+                && column_exprs[i]
+                    .iter()
+                    .any(|t| t.planned != crate::expr::Planned::AsParsed)
+            {
+                // A one-row VALUES in FROM is pulled up into its Vars.
+                crate::expr::Planned::Unknown
+            } else {
+                crate::expr::Planned::AsParsed
+            },
             record_fields: None,
             elem_nullable: None,
             refine: crate::refine::Refinement::NONE,

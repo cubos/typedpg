@@ -243,6 +243,29 @@ fn alter_table_add_foreign_key_without_target_pk_is_rejected() {
     );
 }
 
+#[test]
+fn check_on_an_unknown_column_message() {
+    // PG 18: a CHECK expression's error is reported as is (42703, 42883).
+    for (sql, msg) in [
+        (
+            "CREATE TABLE atacc1 (a int);
+             ALTER TABLE atacc1 ADD CONSTRAINT c1 CHECK (test1 > 3);",
+            "column \"test1\" does not exist",
+        ),
+        (
+            "CREATE TABLE t (a int CHECK (b > 0));",
+            "column \"b\" does not exist",
+        ),
+        (
+            "CREATE TABLE t (a int, CHECK (a > nosuchfn(1)));",
+            "function nosuchfn(integer) does not exist",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", sql)]).expect_err(sql);
+        assert!(err.to_string().starts_with(msg), "{sql}\n  got: {err}");
+    }
+}
+
 // ── ALTER TABLE DROP CONSTRAINT ────────────────────────────────────────────
 
 #[test]
@@ -597,6 +620,37 @@ fn self_referencing_foreign_keys_are_accepted() {
          CREATE TABLE t2 (id int PRIMARY KEY, parent int REFERENCES t2);
          CREATE TABLE t3 (id int, u int UNIQUE, p int, FOREIGN KEY (p) REFERENCES t3(u));",
     )]);
+}
+
+#[test]
+fn self_referencing_foreign_key_to_a_key_from_like() {
+    // PG 18: transformCreateStmt expands LIKE ... INCLUDING INDEXES after the
+    // table's own keys and before its foreign keys, so a self-reference
+    // finds a key the LIKE clause copied.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE inhx (xx text DEFAULT 'text', PRIMARY KEY (xx));
+         CREATE TABLE inhz (x text REFERENCES inhz, LIKE inhx INCLUDING INDEXES);
+         CREATE TABLE src (a int, b int, UNIQUE (a, b));
+         CREATE TABLE t (LIKE src INCLUDING INDEXES, x int, y int,
+                         FOREIGN KEY (x, y) REFERENCES t (a, b));",
+    )]);
+    let mut names = db.pg_constraint_names_for_table("public", "inhz");
+    names.sort();
+    assert_eq!(names, ["inhx_xx_not_null", "inhz_pkey", "inhz_x_fkey"]);
+    let mut names = db.pg_constraint_names_for_table("public", "t");
+    names.sort();
+    assert_eq!(names, ["t_a_b_key", "t_x_y_fkey"]);
+    // Without INCLUDING INDEXES there is no key to reference.
+    assert_ddl_err!(
+        try_apply(&[(
+            "0001.sql",
+            "CREATE TABLE inhx (xx text PRIMARY KEY);
+             CREATE TABLE inhz (x text REFERENCES inhz, LIKE inhx INCLUDING CONSTRAINTS);",
+        )]),
+        DdlError::DependencyError(_),
+        "there is no primary key for referenced table \"inhz\"",
+    );
 }
 
 #[test]

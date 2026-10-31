@@ -293,6 +293,12 @@ pub(crate) struct ExprType {
     /// column. Explicit collations win over implicit ones, and two
     /// different explicit ones meeting in one expression are an error.
     pub explicit_collation: bool,
+    /// Of a collatable type, the value has no collation (PG's
+    /// `exprCollation` is `InvalidOid`); `collation` is then `None`. See
+    /// [`NoCollation`].
+    pub no_collation: Option<NoCollation>,
+    /// What planning makes of this node's collation (see [`Planned`]).
+    pub planned: Planned,
     pub record_fields: Option<RecordShape>,
     /// For an array value, whether its elements can be NULL, where known
     /// (see [`crate::types::Type::Array`]); `None` otherwise.
@@ -433,6 +439,8 @@ impl ExprType {
             typmod: None,
             collation: None,
             explicit_collation: false,
+            no_collation: None,
+            planned: Planned::AsParsed,
             record_fields: None,
             elem_nullable: None,
             refine: crate::refine::Refinement::NONE,
@@ -450,6 +458,8 @@ impl ExprType {
             typmod,
             collation: None,
             explicit_collation: false,
+            no_collation: None,
+            planned: Planned::AsParsed,
             record_fields: None,
             elem_nullable: None,
             refine: crate::refine::Refinement::NONE,
@@ -473,6 +483,8 @@ impl ExprType {
             typmod,
             collation,
             explicit_collation: false,
+            no_collation: None,
+            planned: Planned::AsParsed,
             record_fields: None,
             elem_nullable: None,
             refine: crate::refine::Refinement::NONE,
@@ -511,9 +523,45 @@ impl ExprType {
 
     /// The same value with the collation state PG's `assign_collations`
     /// derives for it (see [`derive_collation`]).
-    pub fn with_collation(mut self, state: (Option<crate::oid::PgCollationOid>, bool)) -> Self {
-        (self.collation, self.explicit_collation) = state;
+    pub fn with_collation(mut self, state: DerivedCollation) -> Self {
+        self.collation = state.collation;
+        self.explicit_collation = state.explicit;
+        self.no_collation = state.missing;
+        self.planned = Planned::AsParsed;
         self
+    }
+
+    /// What a node the planner replaces with this value ends up with: the
+    /// collation this value has once planned.
+    pub(crate) fn planned_replacement(&self) -> Planned {
+        match self.planned {
+            Planned::AsParsed => Planned::Folded {
+                collation: self.collation,
+                missing: self.no_collation.is_some(),
+            },
+            other => other,
+        }
+    }
+
+    /// This value's own collation state, as a leaf node (`Var`, `Param`,
+    /// `SubLink`) reading it carries it: its collation implicitly, or none
+    /// at all — a conflict below it is no longer one, just `InvalidOid`.
+    pub(crate) fn leaf_collation(&self) -> DerivedCollation {
+        DerivedCollation {
+            collation: self.collation,
+            explicit: false,
+            missing: self.no_collation.map(|_| NoCollation::Unset),
+        }
+    }
+
+    /// This value's collation state, unchanged (a node PG doesn't add,
+    /// such as a cast to the type the value already has).
+    pub(crate) fn collation_state(&self) -> DerivedCollation {
+        DerivedCollation {
+            collation: self.collation,
+            explicit: self.explicit_collation,
+            missing: self.no_collation,
+        }
     }
 
     /// Account for this value being implicitly coerced to `to` (a call
@@ -548,7 +596,74 @@ pub(crate) fn merge_elem_nullable(parts: impl IntoIterator<Item = Option<bool>>)
 }
 
 /// PG's `DEFAULT_COLLATION_OID`.
-const DEFAULT_COLLATION: crate::oid::PgCollationOid = crate::oid::PgCollationOid::from_raw(100);
+pub(crate) const DEFAULT_COLLATION: crate::oid::PgCollationOid =
+    crate::oid::PgCollationOid::from_raw(100);
+
+/// Why a value of a collatable type has no collation (PG's `exprCollation`
+/// is `InvalidOid`). A table or view can't store such a column, and the
+/// functions and sorts that need a collation fail on it at run time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NoCollation {
+    /// Strength NONE (parse_collate.c): a leaf — a column of a subquery, CTE
+    /// or set operation, a scalar sublink — reading a column that has none.
+    /// It is the weakest state: any implicit collation beside it wins, and
+    /// a node over it with a collatable result takes its type's default.
+    Unset,
+    /// Strength IMPLICIT, collation `InvalidOid`: a sublink whose column has
+    /// none (the subquery's column counts as an implicit collation, see
+    /// [`crate::resolve::RawColumn::sublink_collation`]), and every node over it that
+    /// inherits it. Unlike [`NoCollation::Unset`] it is not the weakest
+    /// state: like a non-default implicit collation, it beats the default
+    /// one, bubbles up through a collatable node (`upper(...)`, `||`, a
+    /// cast) and conflicts with any other non-default implicit collation.
+    Implicit,
+    /// Strength CONFLICT: two different non-default implicit collations
+    /// met (`None` for an [`NoCollation::Implicit`] one, `InvalidOid`). It
+    /// beats implicit collations and bubbles up through every node with a
+    /// collatable result, until an explicit one settles it.
+    Conflict(
+        Option<crate::oid::PgCollationOid>,
+        Option<crate::oid::PgCollationOid>,
+    ),
+}
+
+/// What planning makes of a node's collation. CREATE TABLE AS and SELECT
+/// INTO with data (`intorel_startup`, createas.c) — unlike a view, a
+/// materialized view or WITH NO DATA, which read the parsed query — take
+/// their columns' collations from the *planned* query: by then
+/// `eval_const_expressions` has replaced a CASE whose conditions are
+/// constant by the result it picks (`CASE WHEN true THEN c1.b ELSE c2.b
+/// END` is `c1.b`, collated like it, although the CASE has no collation),
+/// subqueries have been pulled up into their Vars and SQL functions
+/// inlined. The planner never re-derives a node's collation, so only a
+/// node it replaces can change.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Planned {
+    /// Planning keeps the node, and the collation parse analysis gave it.
+    #[default]
+    AsParsed,
+    /// Planning may replace the node by one whose collation the analyzer
+    /// doesn't know (a pulled-up subquery's expression it folds, an inlined
+    /// SQL function's body, a condition PG may fold that the analyzer
+    /// can't evaluate).
+    Unknown,
+    /// Planning replaces the node by one with this collation (`None` for
+    /// its type's default), or none at all (`missing`).
+    Folded {
+        collation: Option<crate::oid::PgCollationOid>,
+        missing: bool,
+    },
+}
+
+/// The collation state [`derive_collation`] assigns a node: its collation
+/// (`None` for its type's default, or for none), whether it is explicit,
+/// and why there is none when the type is collatable.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DerivedCollation {
+    pub collation: Option<crate::oid::PgCollationOid>,
+    pub explicit: bool,
+    pub missing: Option<NoCollation>,
+}
 
 /// PG's collation derivation for one expression node (`assign_collations_walker`
 /// and `merge_collation_state`, parse_collate.c), given its inputs' states
@@ -557,19 +672,42 @@ const DEFAULT_COLLATION: crate::oid::PgCollationOid = crate::oid::PgCollationOid
 /// - explicit (`COLLATE`) inputs dominate; two different ones are `collation
 ///   mismatch between explicit collations "A" and "B"` (42P21) whatever the
 ///   result type;
-/// - otherwise a non-default implicit collation beats the default one, and
-///   two different non-default ones leave the collation undetermined (PG only
-///   fails later, if a collation is actually needed);
+/// - otherwise a conflict among the inputs, or two different non-default
+///   implicit collations, is a conflict ([`NoCollation::Conflict`]: PG only
+///   fails later, if a collation is actually needed); else a non-default
+///   implicit collation beats the default one;
+/// - an input without a collation ([`NoCollation::Unset`]) counts for
+///   nothing, and a collatable result with no collated input takes its
+///   type's default;
 /// - a non-collatable result has no collation.
 pub(crate) fn derive_collation<'a>(
     inputs: impl IntoIterator<Item = &'a ExprType>,
     result_type: PgTypeOid,
     snapshot: &PgCatalog,
-) -> Result<(Option<crate::oid::PgCollationOid>, bool), AnalyzeError> {
+) -> Result<DerivedCollation, AnalyzeError> {
+    type Collation = Option<crate::oid::PgCollationOid>;
     let mut explicit: Option<crate::oid::PgCollationOid> = None;
-    let mut implicit: Option<crate::oid::PgCollationOid> = None;
-    let mut implicit_conflict = false;
+    // The non-default implicit collation seen, `Some(None)` for
+    // `InvalidOid` (an implicit one without a collation).
+    let mut implicit: Option<Collation> = None;
+    let mut conflict: Option<(Collation, Collation)> = None;
     for t in inputs {
+        match t.no_collation {
+            Some(NoCollation::Conflict(a, b)) => {
+                conflict.get_or_insert((a, b));
+                continue;
+            }
+            Some(NoCollation::Implicit) => {
+                if conflict.is_none() {
+                    match implicit {
+                        Some(Some(i)) => conflict = Some((Some(i), None)),
+                        _ => implicit = Some(None),
+                    }
+                }
+                continue;
+            }
+            Some(NoCollation::Unset) | None => {}
+        }
         let Some(c) = t.collation else {
             continue;
         };
@@ -590,10 +728,10 @@ pub(crate) fn derive_collation<'a>(
                 }
                 _ => explicit = Some(c),
             }
-        } else if c != DEFAULT_COLLATION {
+        } else if c != DEFAULT_COLLATION && conflict.is_none() {
             match implicit {
-                Some(i) if i != c => implicit_conflict = true,
-                _ => implicit = Some(c),
+                Some(i) if i != Some(c) => conflict = Some((i, Some(c))),
+                _ => implicit = Some(Some(c)),
             }
         }
     }
@@ -601,12 +739,26 @@ pub(crate) fn derive_collation<'a>(
         .get_type(result_type)
         .is_some_and(|t| t.typcollation.is_some());
     if !collatable {
-        return Ok((None, false));
+        return Ok(DerivedCollation::default());
     }
-    Ok(match explicit {
-        Some(e) => (Some(e), true),
-        None if implicit_conflict => (None, false),
-        None => (implicit, false),
+    Ok(match (explicit, conflict) {
+        (Some(e), _) => DerivedCollation {
+            collation: Some(e),
+            explicit: true,
+            missing: None,
+        },
+        (None, Some((a, b))) => DerivedCollation {
+            collation: None,
+            explicit: false,
+            missing: Some(NoCollation::Conflict(a, b)),
+        },
+        (None, None) => DerivedCollation {
+            collation: implicit.flatten(),
+            explicit: false,
+            missing: implicit
+                .is_some_and(|i| i.is_none())
+                .then_some(NoCollation::Implicit),
+        },
     })
 }
 
@@ -940,7 +1092,7 @@ fn infer_expr_unlocated(
         .as_ref()
         .ok_or_else(|| AnalyzeError::Unsupported("empty node".into()))?;
 
-    let result = match inner {
+    let mut result = match inner {
         node::Node::ColumnRef(col_ref) => infer_column_ref(col_ref, ctx, params),
         node::Node::AConst(a_const) => infer_a_const(a_const),
         node::Node::TypeCast(cast) => match passthrough_cast_operand(node, snapshot, params) {
@@ -1173,6 +1325,8 @@ fn infer_expr_unlocated(
                 typmod: None,
                 collation: None,
                 explicit_collation: false,
+                no_collation: None,
+                planned: Planned::AsParsed,
                 record_fields: Some(fields.into()),
                 elem_nullable: None,
                 refine: crate::refine::Refinement::NONE,
@@ -1358,6 +1512,7 @@ fn infer_expr_unlocated(
         )
         .finalize_implicit()),
     }?;
+    result.planned = planned_after(inner, result.planned);
 
     // PG runs the target type's input function on untyped string-literal
     // constants the moment a context coerces them to a concrete type
@@ -1441,6 +1596,35 @@ pub(crate) fn unknown_value_coercion(
         span,
     )
     .finalize_implicit())
+}
+
+/// What planning makes of the collation of a node of kind `inner`, given
+/// what its inference said (see [`Planned`]). Only a node the planner can
+/// replace — a CASE or COALESCE it folds, a Var of a pulled-up subquery, a
+/// sublink (its Param takes the planned subquery's collation), an inlined
+/// SQL function or operator, a cast that adds no node of its own (decided
+/// by `infer_type_cast`) — may change; every other node keeps the
+/// collation it was parsed with, whatever its inputs become, so what an
+/// inference copied from an input is dropped.
+fn planned_after(inner: &node::Node, inferred: Planned) -> Planned {
+    match inner {
+        node::Node::ColumnRef(_)
+        | node::Node::CaseExpr(_)
+        | node::Node::CoalesceExpr(_)
+        | node::Node::SubLink(_)
+        | node::Node::TypeCast(_)
+        | node::Node::NamedArgExpr(_) => inferred,
+        // A function or operator keeps its node unless it is inlined (a
+        // column in functional notation, `b(s)`, is a Var). A field of a
+        // FROM entry's row is its column, a Var.
+        node::Node::FuncCall(_) | node::Node::AExpr(_) | node::Node::AIndirection(_) => {
+            match inferred {
+                Planned::Unknown => Planned::Unknown,
+                _ => Planned::AsParsed,
+            }
+        }
+        _ => Planned::AsParsed,
+    }
 }
 
 /// Filter for *speculative* re-inference sites (operator / CASE / COALESCE /
@@ -2101,6 +2285,7 @@ pub(crate) fn unknown_literal_as_text(
 
 mod column_refs;
 mod conditional;
+mod folding;
 mod func_call;
 mod indirection;
 pub(crate) mod inline;

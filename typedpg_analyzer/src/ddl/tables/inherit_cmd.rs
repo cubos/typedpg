@@ -148,7 +148,11 @@ fn merge_attributes_into_existing(
                 pa.attname
             )));
         }
-        if ca.attcollation != pa.attcollation {
+        // A collation the analyzer doesn't know conflicts with none.
+        if ca.attcollation != pa.attcollation
+            && !interp.uncertain_collations.contains(&(child, ca.attnum))
+            && !interp.uncertain_collations.contains(&(parent, pa.attnum))
+        {
             return Err(DdlError::Parse(format!(
                 "child table \"{child_name}\" has different collation for column \"{}\"",
                 pa.attname

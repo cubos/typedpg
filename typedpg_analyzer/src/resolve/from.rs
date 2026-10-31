@@ -398,6 +398,8 @@ pub(crate) fn process_from_item(
                         table_alias: alias.to_owned(),
                         typmod: rc.typmod,
                         collation: rc.collation,
+                        no_collation: rc.no_collation.is_some(),
+                        planned_unknown: rc.planned != crate::expr::Planned::AsParsed,
                         record_fields: rc.record_fields,
                         elem_nullable: rc.elem_nullable,
                         refine: rc.refine.clone(),
@@ -683,6 +685,8 @@ fn process_range_function(
             table_alias: alias.to_owned(),
             typmod: None,
             collation: None,
+            no_collation: false,
+            planned_unknown: false,
             record_fields: None,
             elem_nullable: None,
             refine: crate::refine::Refinement::NONE,
@@ -1438,6 +1442,41 @@ fn output_column_names(scope: &Scope, span: SourceSpan) -> Vec<String> {
         .collect()
 }
 
+/// The collation of a JOIN USING merged column (buildMergedJoinVar): the
+/// left column's (the right one's for a RIGHT JOIN), or for a FULL JOIN
+/// the one `COALESCE(l, r)` derives — a conflict when the two carry
+/// different non-default implicit collations. A side coerced to the
+/// column's type is a node over it, which takes its type's default when
+/// the side has no collation. Returns the collation and whether there is
+/// none (a reference to the column is a Var of strength NONE).
+fn merged_column_collation(
+    l: &ScopeColumn,
+    r: &ScopeColumn,
+    type_oid: PgTypeOid,
+    typmod: Option<i32>,
+    join_type: JoinType,
+    snapshot: &PgCatalog,
+) -> (Option<crate::oid::PgCollationOid>, bool) {
+    let side = |c: &ScopeColumn| {
+        let coerced = c.type_oid != type_oid || c.typmod != typmod;
+        let mut t =
+            crate::expr::ExprType::scalar_with_collation(type_oid, false, typmod, c.collation);
+        if c.no_collation && !coerced {
+            t.no_collation = Some(crate::expr::NoCollation::Unset);
+        }
+        t
+    };
+    let state = match join_type {
+        JoinType::JoinRight => side(r).leaf_collation(),
+        JoinType::JoinFull => {
+            crate::expr::derive_collation([&side(l), &side(r)], type_oid, snapshot)
+                .unwrap_or_default()
+        }
+        _ => side(l).leaf_collation(),
+    };
+    (state.collation, state.missing.is_some())
+}
+
 /// Build the merged columns for `JOIN USING` / `NATURAL JOIN` and record
 /// the constituents in their sources' `join_hidden` so unqualified
 /// resolution and the bare `*` skip them. The caller splices the merged
@@ -1544,16 +1583,17 @@ fn merge_using_columns(
             JoinType::JoinFull => l_not_null && r_not_null,
             _ => l_not_null || r_not_null || eq_strict,
         };
+        let typmod = if l.typmod == r.typmod { l.typmod } else { None };
+        let (collation, no_collation) =
+            merged_column_collation(&l, &r, type_oid, typmod, join_type, snapshot);
         merged.push(ScopeColumn {
             name: name.clone(),
             type_oid,
             base_not_null,
-            typmod: if l.typmod == r.typmod { l.typmod } else { None },
-            collation: if l.collation == r.collation {
-                l.collation
-            } else {
-                None
-            },
+            typmod,
+            collation,
+            no_collation,
+            planned_unknown: l.planned_unknown || r.planned_unknown,
             // Set by the caller once the source's alias is known.
             table_alias: String::new(),
             record_fields: None,
@@ -2069,6 +2109,12 @@ fn function_rte_columns(
             .iter()
             .zip(&resolved.arg_types)
             .all(|(&a, &d)| arg_ctx.coercion_is_strict(a, d));
+    // inline_set_returning_function: the planner may replace a SQL
+    // function's scan by its body, collated however that is.
+    let sql_function = snapshot
+        .pg_proc
+        .get(&resolved.oid)
+        .is_some_and(|p| p.prolang == crate::pg_catalog::SQL_LANGUAGE);
     rows.min_one_row |= resolved.schema == "pg_catalog"
         && name == "generate_series"
         && !func_call.func_variadic
@@ -2085,6 +2131,13 @@ fn function_rte_columns(
         .map(|nullable| !nullable);
     let out_columns_nullable =
         srf_out_columns_nullable(&resolved).filter(|n| n.len() == resolved.out_args.len());
+    // A scalar result's column takes the call's collation, which derives
+    // from its arguments' (addRangeTableEntryForFunction: TYPEFUNC_SCALAR
+    // is exprCollation(funcexpr)) — none included.
+    let scalar_collation = || {
+        expr::derive_collation(&arg_exprs, resolved.return_type_oid, snapshot)
+            .map(|d| (d.collation, d.missing.is_some()))
+    };
 
     if !resolved.out_args.is_empty() {
         if has_coldeflist {
@@ -2093,8 +2146,10 @@ fn function_rte_columns(
         // A single OUT parameter makes the function scalar
         // (TYPEFUNC_SCALAR): a whole-row reference is its value, not a
         // record of it.
+        let mut out_collation = (None, false);
         if resolved.out_args.len() == 1 {
             *whole_row = crate::scope::WholeRow::Scalar;
+            out_collation = scalar_collation()?;
         }
         return Ok(resolved
             .out_args
@@ -2108,7 +2163,9 @@ fn function_rte_columns(
                     None => single_out_not_null.unwrap_or(f.not_null),
                 },
                 typmod: None,
-                collation: None,
+                collation: out_collation.0,
+                no_collation: out_collation.1,
+                planned_unknown: sql_function,
                 table_alias: alias.to_owned(),
                 record_fields: None,
                 elem_nullable: None,
@@ -2123,6 +2180,7 @@ fn function_rte_columns(
         alias,
         snapshot,
         whole_row,
+        sql_function,
     )? {
         return Ok(cols);
     }
@@ -2130,7 +2188,11 @@ fn function_rte_columns(
         if !has_coldeflist {
             return Err(crate::pgmsg::coldeflist_required().finalize_implicit());
         }
-        return coldeflist_columns(f.coldeflist, alias, snapshot);
+        let mut cols = coldeflist_columns(f.coldeflist, alias, snapshot)?;
+        for c in &mut cols {
+            c.planned_unknown = sql_function;
+        }
+        return Ok(cols);
     }
     if has_coldeflist {
         return Err(crate::pgmsg::coldeflist_only_for_record().finalize_implicit());
@@ -2164,13 +2226,16 @@ fn function_rte_columns(
     // with several functions each column keeps its function's name.
     let col_name = if nfuncs == 1 { alias } else { name };
     *whole_row = crate::scope::WholeRow::Scalar;
+    let (collation, no_collation) = scalar_collation()?;
     Ok(vec![ScopeColumn {
         name: col_name.to_owned(),
         type_oid: resolved.return_type_oid,
         base_not_null: not_null,
         table_alias: alias.to_owned(),
         typmod: None,
-        collation: None,
+        collation,
+        no_collation,
+        planned_unknown: sql_function,
         record_fields: None,
         elem_nullable: None,
         // `generate_series` of finite bounds and step (see
@@ -2214,9 +2279,16 @@ fn expr_rte_columns(
         .finalize_implicit());
     }
     let has_coldeflist = !f.coldeflist.is_empty();
-    if let Some(cols) =
-        composite_rte_columns(value.type_oid, has_coldeflist, alias, snapshot, whole_row)?
-    {
+    // A Var over an expression keeps its parsed collation: only an inlined
+    // SQL function's scan is replaced by planning.
+    if let Some(cols) = composite_rte_columns(
+        value.type_oid,
+        has_coldeflist,
+        alias,
+        snapshot,
+        whole_row,
+        false,
+    )? {
         return Ok(cols);
     }
     if value.type_oid == oid::RECORD {
@@ -2242,6 +2314,9 @@ fn expr_rte_columns(
         table_alias: alias.to_owned(),
         typmod: value.typmod,
         collation: value.collation,
+        no_collation: value.no_collation.is_some(),
+        // A Var over the expression: planning doesn't replace it.
+        planned_unknown: false,
         record_fields: None,
         elem_nullable: value.elem_nullable,
         refine: value.refine,
@@ -2272,13 +2347,16 @@ fn noop_cast_of_call<'a>(
 /// A function RTE item returning a composite type — named, or a domain
 /// over one (TYPEFUNC_COMPOSITE / TYPEFUNC_COMPOSITE_DOMAIN): the type's
 /// attributes are its columns, and a column definition list is redundant.
-/// `None` for any other type.
+/// `None` for any other type. `planned_unknown`: planning may replace the
+/// scan (an inlined SQL function), collating its columns however the
+/// body does.
 fn composite_rte_columns(
     type_oid: PgTypeOid,
     has_coldeflist: bool,
     alias: &str,
     snapshot: &PgCatalog,
     whole_row: &mut crate::scope::WholeRow,
+    planned_unknown: bool,
 ) -> Result<Option<Vec<ScopeColumn>>, AnalyzeError> {
     let Some(typrelid) = snapshot
         .get_type(snapshot.unwrap_domain(type_oid))
@@ -2312,6 +2390,8 @@ fn composite_rte_columns(
                 base_not_null: false,
                 typmod: snapshot.effective_typmod(f.atttypid, f.atttypmod),
                 collation: f.attcollation,
+                no_collation: false,
+                planned_unknown,
                 table_alias: alias.to_owned(),
                 record_fields: None,
                 elem_nullable: None,
@@ -2447,6 +2527,8 @@ fn coldeflist_columns(
             base_not_null: false,
             typmod: snapshot.effective_typmod(type_oid, typmod),
             collation: None,
+            no_collation: false,
+            planned_unknown: false,
             table_alias: alias.to_owned(),
             record_fields: None,
             elem_nullable: None,
@@ -2813,6 +2895,8 @@ fn json_table_columns(
             base_not_null: top_level && kind == Kind::JtcForOrdinality,
             typmod: snapshot.effective_typmod(type_oid, typmod),
             collation: None,
+            no_collation: false,
+            planned_unknown: false,
             table_alias: alias.to_owned(),
             record_fields: None,
             elem_nullable: None,

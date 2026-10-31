@@ -373,6 +373,33 @@ fn collate_on_a_non_collatable_column_is_rejected() {
     );
 }
 
+#[test]
+fn alter_column_type_converts_only_stored_values() {
+    // ATPrepAlterColumnType (PG 18): only a table or partitioned table has
+    // values to convert. A composite type's attribute or a foreign table's
+    // column changes type with no cast, and takes no USING.
+    build_db(&[(
+        "0001.sql",
+        "CREATE TYPE test_type AS (a int, b text);
+         ALTER TYPE test_type ALTER ATTRIBUTE b SET DATA TYPE integer,
+                              ALTER ATTRIBUTE a TYPE point;
+         CREATE FOREIGN DATA WRAPPER w; CREATE SERVER s FOREIGN DATA WRAPPER w;
+         CREATE FOREIGN TABLE ft (a int, b text) SERVER s;
+         ALTER FOREIGN TABLE ft ALTER COLUMN b TYPE int;",
+    )]);
+    let err = try_apply(&[(
+        "0001.sql",
+        "CREATE FOREIGN DATA WRAPPER w; CREATE SERVER s FOREIGN DATA WRAPPER w;
+         CREATE FOREIGN TABLE ft (a int, b text) SERVER s;
+         ALTER FOREIGN TABLE ft ALTER COLUMN a TYPE int USING a + 1;",
+    )])
+    .unwrap_err();
+    assert!(
+        err.to_string().starts_with("\"ft\" is not a table"),
+        "{err}"
+    );
+}
+
 // ── DROP / SET EXPRESSION, relation lookups, renames ────────────────────────
 
 #[test]
@@ -464,6 +491,39 @@ fn missing_relations_are_reported_like_pg() {
         DdlError::TableNotFound(_),
         "relation \"nosuch2\" does not exist",
     );
+}
+
+#[test]
+fn rename_column_of_a_missing_table_message() {
+    // PG 18: RENAME COLUMN / CONSTRAINT look the relation up like every
+    // other ALTER TABLE (RangeVarGetRelidExtended); IF EXISTS skips a
+    // missing relation or schema.
+    for (sql, msg) in [
+        (
+            "ALTER TABLE nonesuchrel RENAME COLUMN nonesuchatt TO newnonesuchatt;",
+            "relation \"nonesuchrel\" does not exist",
+        ),
+        (
+            "ALTER TABLE nosuch.t RENAME COLUMN a TO b;",
+            "schema \"nosuch\" does not exist",
+        ),
+        (
+            "ALTER TABLE nonesuchrel RENAME CONSTRAINT a TO b;",
+            "relation \"nonesuchrel\" does not exist",
+        ),
+        (
+            "ALTER TABLE nosuch.t RENAME CONSTRAINT a TO b;",
+            "schema \"nosuch\" does not exist",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", sql)]).expect_err(sql);
+        assert!(err.to_string().starts_with(msg), "{sql}\n  got: {err}");
+    }
+    build_db(&[(
+        "0001.sql",
+        "ALTER TABLE IF EXISTS nonesuchrel RENAME COLUMN a TO b;
+         ALTER TABLE IF EXISTS nosuch.t RENAME CONSTRAINT a TO b;",
+    )]);
 }
 
 #[test]
@@ -644,6 +704,50 @@ fn a_row_type_stored_elsewhere_pins_the_table() {
              ALTER TYPE ct DROP ATTRIBUTE y;",
         ),
     ]);
+}
+
+#[test]
+fn add_column_to_a_row_type_used_by_another_table() {
+    // PG 18: ADD COLUMN rewrites the table — and so checks
+    // find_composite_type_dependencies — only when the column gets a stored
+    // default. A DEFAULT that cooks to a null constant gets none
+    // (AddRelationNewConstraints skips it); a cast to another type, a
+    // typmod's length coercion or a domain's CoerceToDomain is no constant.
+    let setup = "CREATE DOMAIN d AS int;
+                 CREATE TABLE fullname (first text, last text);
+                 CREATE TABLE people (fn fullname, bd date);";
+    let db = build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "ALTER TABLE fullname ADD COLUMN suffix text DEFAULT NULL;",
+        ),
+    ]);
+    db.analyze("SELECT (fn).suffix FROM people").unwrap();
+    for stmt in [
+        "ALTER TABLE fullname ADD COLUMN c text DEFAULT NULL::text::text;",
+        "ALTER TABLE fullname ADD COLUMN c int DEFAULT CAST(NULL AS int);",
+        "ALTER TABLE fullname ADD COLUMN c int DEFAULT NULL::unknown;",
+        "ALTER TABLE fullname ADD COLUMN c int[] DEFAULT NULL;",
+        "ALTER TABLE fullname ADD COLUMN c interval(0) DEFAULT NULL;",
+    ] {
+        build_db(&[("0001.sql", setup), ("0002.sql", stmt)]);
+    }
+    for stmt in [
+        "ALTER TABLE fullname ADD COLUMN c text DEFAULT NULL::varchar;",
+        "ALTER TABLE fullname ADD COLUMN c int DEFAULT NULL::int8;",
+        "ALTER TABLE fullname ADD COLUMN c varchar(5) DEFAULT NULL;",
+        "ALTER TABLE fullname ADD COLUMN c d DEFAULT NULL;",
+        "ALTER TABLE fullname ADD COLUMN c int GENERATED ALWAYS AS (NULL) STORED;",
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(
+            err.to_string().starts_with(
+                "cannot alter table \"fullname\" because column \"people.fn\" uses its row type"
+            ),
+            "{stmt}\n  got: {err}"
+        );
+    }
 }
 
 #[test]

@@ -402,15 +402,22 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
         }
     }
     // BuildDescForRelation: each column definition's STORAGE and
-    // COMPRESSION, for the column's final type.
+    // COMPRESSION, for the column's final type. A STORAGE clause is only
+    // looked at when the merged definition has no storage mode of its own
+    // (an inherited column's is its parent's).
     let mut storage_clauses: Vec<(String, TypStorage)> = Vec::new();
     for elt in &stmt.table_elts {
         if let Some(node::Node::ColumnDef(cd)) = elt.node.as_ref()
             && let Some(col) = columns.iter().find(|c| c.name == cd.colname)
-            && let Some(storage) =
-                column_options::check_column_def_options(interp, cd, col.type_oid)?
         {
-            storage_clauses.push((cd.colname.clone(), storage));
+            if col.storage.is_none() && !cd.storage_name.is_empty() {
+                let storage =
+                    column_options::get_attribute_storage(interp, col.type_oid, &cd.storage_name)?;
+                storage_clauses.push((cd.colname.clone(), storage));
+            }
+            if !cd.compression.is_empty() {
+                column_options::get_attribute_compression(interp, col.type_oid, &cd.compression)?;
+            }
         }
     }
     // CheckAttributeNamesTypes (heap_create_with_catalog): no column may
@@ -431,27 +438,28 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
             attislocal: col.is_local,
             attinhcount: col.inhcount,
         });
+        if col.uncertain_collation {
+            interp
+                .uncertain_collations
+                .insert((class_oid, (i + 1) as i16));
+        }
     }
-    // attstorage: the STORAGE clause, else an inherited column's parent's
-    // (MergeAttributes), else a LIKE ... INCLUDING STORAGE source's.
+    // attstorage: the merged definition's (a parent's, a LIKE ...
+    // INCLUDING STORAGE source's), else the STORAGE clause's.
     for (i, col) in columns.iter().enumerate() {
-        let from_source = |src: PgClassOid| {
-            let attnum = interp.attribute_by_name(src, &col.name)?.attnum;
-            interp.attr_storage.get(&(src, attnum)).copied()
-        };
-        let storage = storage_clauses
-            .iter()
-            .find(|(n, _)| *n == col.name)
-            .map(|(_, s)| *s)
-            .or_else(|| parents.iter().find_map(|&p| from_source(p)))
-            .or_else(|| {
-                likes
-                    .iter()
-                    .filter(|l| l.options & merge::LIKE_STORAGE != 0)
-                    .find_map(|l| from_source(l.source))
-            });
+        let storage = col.storage.or_else(|| {
+            storage_clauses
+                .iter()
+                .find(|(n, _)| *n == col.name)
+                .map(|(_, s)| *s)
+        });
         if let Some(storage) = storage {
             column_options::record_attr_storage(interp, class_oid, (i + 1) as i16, storage);
+        }
+        // attcompression: the merged definition's method (MergeAttributes).
+        if let Some(method) = col.compression.as_deref() {
+            let method = column_options::get_attribute_compression(interp, col.type_oid, method)?;
+            column_options::record_attr_compression(interp, class_oid, (i + 1) as i16, method);
         }
     }
     let phys = crate::ddl::types::TypePhysical::COMPOSITE;
@@ -639,7 +647,20 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
                     interp, class_oid, expr, None,
                 ) {
                     Some(Err(e)) => return Err(DdlError::UnsupportedDdl(e.to_string())),
-                    Some(Ok(t)) => Some(t.type_oid),
+                    Some(Ok(t)) => {
+                        // ComputePartitionAttrs: CheckAttributeType on the
+                        // expression's type and collation, before the key's
+                        // COLLATE clause applies.
+                        if t.no_collation.is_some() {
+                            return Err(DdlError::Parse(format!(
+                                "no collation was derived for partition key column {} with \
+                                 collatable type {}",
+                                keycol + 1,
+                                crate::ddl::util::format_type_for_message(interp, t.type_oid)
+                            )));
+                        }
+                        Some(t.type_oid)
+                    }
                     None => None,
                 };
                 // ComputePartitionAttrs: the expression's type must be a
@@ -816,7 +837,7 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
     }
     // Emit pg_constraint rows so ON CONFLICT, DROP CASCADE, and FK
     // dependency checks can consult them later. FK validation runs here.
-    emit_constraints(interp, class_oid, &name, stmt, &|interp| {
+    let pending_fks = emit_constraints(interp, class_oid, &name, stmt, &|interp| {
         inherit::record_not_nulls(interp, class_oid, &columns)
     })?;
     check_inherit::inherit_parent_checks(interp, class_oid)?;
@@ -826,6 +847,7 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
     for like in &likes {
         copy_like_constraints(interp, class_oid, &name, like)?;
     }
+    constraints::add_pending_foreign_keys(interp, class_oid, pending_fks)?;
 
     Ok(())
 }
@@ -985,6 +1007,19 @@ struct ParsedColumn {
     generated: Option<AttGenerated>,
     identity: Option<AttIdentity>,
     collation: Option<crate::oid::PgCollationOid>,
+    /// The analyzer doesn't know the collation PG gives the column: it is
+    /// inherited or copied from one in `PgCatalog::uncertain_collations`.
+    uncertain_collation: bool,
+    /// The definition's compression method name, as MergeAttributes
+    /// compares them: a COMPRESSION clause's (`default` included), or a
+    /// parent's / LIKE source's method.
+    compression: Option<String>,
+    /// The definition's storage mode, as MergeAttributes compares them
+    /// (`ColumnDef.storage`): a parent's `attstorage` (its type's default
+    /// included), or a LIKE ... INCLUDING STORAGE source's. A local
+    /// definition's STORAGE clause is apart from it: it only applies when
+    /// nothing set this.
+    storage: Option<TypStorage>,
     /// Implicit sequence the column owns: `Auto` for serial columns,
     /// `Internal` for identity columns.
     owned_sequence: Option<crate::pg_catalog::DepType>,
@@ -1292,7 +1327,7 @@ fn apply_alter_subtype(
         | AlterTableType::AtSetCompression
         | AlterTableType::AtSetOptions
         | AlterTableType::AtResetOptions => {
-            column_options::alter_column_setting(interp, relid, cmd, subtype)
+            column_options::alter_column_setting(interp, relid, cmd, subtype, rec)
         }
         AlterTableType::AtClusterOn => object_refs::cluster_on(interp, relid, cmd),
         AlterTableType::AtSetLogged | AlterTableType::AtSetUnLogged => {

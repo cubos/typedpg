@@ -1125,6 +1125,8 @@ fn analyze_raw_node_once(
                     nullable: false,
                     typmod: None,
                     collation: None,
+                    no_collation: None,
+                    planned: crate::expr::Planned::AsParsed,
                     record_fields: None,
                     elem_nullable: None,
                     refine: crate::refine::Refinement::NONE,
@@ -1616,6 +1618,15 @@ pub(crate) struct RawColumn {
     /// Threaded straight from the inner [`ExprType::collation`] so the
     /// final `Type` can render the non-default name.
     pub collation: Option<crate::oid::PgCollationOid>,
+    /// The column is of a collatable type but has no collation (PG's
+    /// `exprCollation` is `InvalidOid`): a UNION ALL column whose arms
+    /// carry different implicit collations, an expression over two of them,
+    /// a subquery's column that has none. A table or view can't store such
+    /// a column (`CheckAttributeType`).
+    pub no_collation: Option<crate::expr::NoCollation>,
+    /// What planning makes of the column's collation (see
+    /// [`crate::expr::Planned`]).
+    pub planned: crate::expr::Planned,
     /// Named-field structure when this column holds a record. Sourced from
     /// SRF out_args, ROW constructors, or propagated through subqueries.
     /// Used both to surface `Type::AnonymousRecord` in the final output and
@@ -1632,6 +1643,22 @@ pub(crate) struct RawColumn {
     /// ([`crate::expr::ExprType::unknown_value`]): resolving it as `text`
     /// fails, see [`select::resolve_unknown_values`].
     pub unknown_value: bool,
+}
+
+impl RawColumn {
+    /// The collation state of an EXPR or ARRAY sublink whose subquery's
+    /// column this is: assign_collations_walker (T_Query) takes the
+    /// column's collation at strength IMPLICIT, even when it is
+    /// `InvalidOid` ([`crate::expr::NoCollation::Implicit`]).
+    pub(crate) fn sublink_collation(&self) -> crate::expr::DerivedCollation {
+        crate::expr::DerivedCollation {
+            collation: self.collation,
+            explicit: false,
+            missing: self
+                .no_collation
+                .map(|_| crate::expr::NoCollation::Implicit),
+        }
+    }
 }
 
 /// Return type for analyze_* functions: columns + optional pre-sorted params.

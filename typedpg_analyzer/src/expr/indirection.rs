@@ -223,6 +223,16 @@ pub(super) fn resolve_composite_field(
             typmod: field.ty.typmod,
             collation: field.ty.collation,
             explicit_collation: false,
+            // A field of a FROM entry's row is its column, a Var (PG's
+            // ParseComplexProjection): none when the column has none.
+            no_collation: field.ty.no_collation.map(|_| super::NoCollation::Unset),
+            // A FieldSelect keeps its collation when planned (it folds only
+            // into a field of that collation), but a FROM entry's column
+            // may not.
+            planned: match field.ty.planned {
+                super::Planned::Unknown => super::Planned::Unknown,
+                _ => super::Planned::AsParsed,
+            },
             record_fields,
             elem_nullable: field.ty.elem_nullable,
             refine: field.ty.refine.clone(),
@@ -681,6 +691,9 @@ pub(crate) fn expand_indirection_star(
                 .map(|f| {
                     let mut ty = f.ty.clone();
                     ty.nullable |= container.nullable;
+                    // A leaf as to its collation: none stays none, a
+                    // conflict below it is just none.
+                    ty.no_collation = ty.no_collation.map(|_| super::NoCollation::Unset);
                     // Each column is a FieldSelect: a record one hides
                     // its shape from PG.
                     if ty.type_oid == oid::RECORD {
@@ -968,23 +981,24 @@ pub(crate) fn transform_container_subscripts(
         )));
     }
 
+    // A SubscriptingRef derives its collation from the container's (its
+    // subscripts are integers).
     if is_slice {
         // `arr[lo:hi]` keeps the (base) array type. NULL iff the array or a
         // bound is NULL — out-of-range bounds yield an empty array.
-        Ok(ExprType::scalar_with_collation(
-            base,
-            container.nullable || any_bound_nullable,
-            typmod,
-            container.collation,
-        ))
+        Ok(
+            ExprType::scalar_with_typmod(base, container.nullable || any_bound_nullable, typmod)
+                .with_collation(derive_collation([container], base, snapshot)?),
+        )
     } else {
         // `arr[i]` is always nullable (out-of-bounds → NULL, even with a
         // non-null array and index).
-        Ok(ExprType::scalar_with_collation(
-            elem,
-            true,
-            typmod,
-            container.collation,
-        ))
+        Ok(
+            ExprType::scalar_with_typmod(elem, true, typmod).with_collation(derive_collation(
+                [container],
+                elem,
+                snapshot,
+            )?),
+        )
     }
 }

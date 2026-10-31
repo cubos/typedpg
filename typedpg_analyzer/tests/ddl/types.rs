@@ -509,6 +509,19 @@ fn composite_type_attributes_follow_alter_type() {
     )]);
 }
 
+#[test]
+fn alter_attribute_type_of_an_unused_composite() {
+    // PG 18: no column stores the type, so nothing is converted — the new
+    // type needs no cast from the old one.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TYPE test_type AS (a int, b text);
+         ALTER TYPE test_type ALTER ATTRIBUTE b SET DATA TYPE integer;",
+    )]);
+    let info = db.analyze("SELECT (NULL::test_type).b").unwrap();
+    assert_eq!(info.columns[0].pg_type, int4());
+}
+
 // ── Enum labels (EnumValuesCreate / AddEnumLabel / RenameEnumLabel) ─────────
 
 #[test]

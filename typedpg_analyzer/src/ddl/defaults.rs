@@ -117,6 +117,74 @@ pub(crate) fn record_to_complex(interp: &PgCatalog, source: PgTypeOid, target: P
     source == oid::RECORD && crate::coerce::is_complex(target, interp)
 }
 
+/// Whether the DEFAULT `expr` of a column of type `type_oid` / `typmod`
+/// cooks to a null constant, which AddRelationNewConstraints doesn't store:
+/// the column gets no default, so ADD COLUMN rewrites nothing.
+pub(crate) fn is_null_default(
+    interp: &PgCatalog,
+    expr: &protobuf::Node,
+    type_oid: PgTypeOid,
+    typmod: Option<i32>,
+) -> bool {
+    null_const_coerced(interp, null_const(interp, expr), type_oid, typmod).is_some()
+}
+
+/// The `(type, typmod)` of the null `Const` that `expr` transforms to:
+/// `NULL`, or `NULL` under casts that each stay a constant.
+fn null_const(interp: &PgCatalog, expr: &protobuf::Node) -> Option<(PgTypeOid, i32)> {
+    match expr.node.as_ref()? {
+        node::Node::AConst(c) if c.isnull => Some((oid::UNKNOWN, -1)),
+        node::Node::TypeCast(tc) => {
+            let tn = tc.type_name.as_ref()?;
+            let target = super::util::resolve_type_name(tn, interp)?;
+            let typmod = crate::typmod::encode(interp, target, tn).ok()?;
+            null_const_coerced(
+                interp,
+                null_const(interp, tc.arg.as_deref()?),
+                target,
+                typmod,
+            )
+        }
+        _ => None,
+    }
+}
+
+/// `coerce_to_target_type` of a null `Const` of `input` to `target` /
+/// `typmod`, if the result is still a `Const`: `coerce_type` turns an
+/// unknown-type literal into a `Const` of the target (applying its typmod
+/// only for interval, whose input routine takes it) and leaves a same-type
+/// node alone — any other conversion is a RelabelType, a function call or
+/// a CoerceToDomain. Then `coerce_type_typmod` adds a length coercion for a
+/// typmod the constant doesn't already have.
+fn null_const_coerced(
+    interp: &PgCatalog,
+    input: Option<(PgTypeOid, i32)>,
+    target: PgTypeOid,
+    typmod: Option<i32>,
+) -> Option<(PgTypeOid, i32)> {
+    const INTERVAL: PgTypeOid = PgTypeOid::from_raw(1186);
+    let (input_type, input_typmod) = input?;
+    let typmod = typmod.unwrap_or(-1);
+    if interp
+        .pg_type
+        .get(&target)
+        .is_some_and(|t| t.typtype == crate::pg_catalog::TypType::Domain)
+    {
+        return None;
+    }
+    let const_typmod = if input_type == target {
+        input_typmod
+    } else if input_type == oid::UNKNOWN {
+        if target == INTERVAL { typmod } else { -1 }
+    } else {
+        return None;
+    };
+    if typmod >= 0 && typmod != const_typmod {
+        return None;
+    }
+    Some((target, const_typmod))
+}
+
 /// The `EXPR_KIND_COLUMN_DEFAULT` / `EXPR_KIND_FUNCTION_DEFAULT`
 /// restrictions (`transformColumnRef`, `transformSubLink`,
 /// `check_agglevels_and_constraints`, `transformWindowFuncCall`,

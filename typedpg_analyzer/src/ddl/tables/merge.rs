@@ -16,6 +16,7 @@
 use super::*;
 
 /// `TableLikeOption` bits (`parsenodes.h`).
+pub(crate) const LIKE_COMPRESSION: u32 = 1 << 1;
 pub(crate) const LIKE_CONSTRAINTS: u32 = 1 << 2;
 pub(crate) const LIKE_DEFAULTS: u32 = 1 << 3;
 pub(crate) const LIKE_GENERATED: u32 = 1 << 4;
@@ -188,6 +189,9 @@ fn of_type_columns(
                 generated: None,
                 identity: None,
                 collation: attr.attcollation,
+                uncertain_collation: false,
+                compression: None,
+                storage: None,
                 owned_sequence: None,
                 identity_options: Vec::new(),
                 nn_local: false,
@@ -256,6 +260,13 @@ fn expand_like(
                 generated,
                 identity,
                 collation: attr.attcollation,
+                uncertain_collation: interp.uncertain_collations.contains(&(source, attr.attnum)),
+                compression: (opts & LIKE_COMPRESSION != 0)
+                    .then(|| interp.attr_compression.get(&(source, attr.attnum)))
+                    .flatten()
+                    .map(|m| (*m).to_owned()),
+                storage: (opts & LIKE_STORAGE != 0)
+                    .then(|| attr_storage(interp, source, attr.attnum, attr.atttypid)),
                 owned_sequence: identity.map(|_| crate::pg_catalog::DepType::Internal),
                 // transformTableLikeClause: the source sequence's options.
                 identity_options: identity
@@ -414,6 +425,12 @@ fn inherited_columns(
                 .attr_default_exprs
                 .get(&(parent, attr.attnum))
                 .cloned();
+            let parent_compression = interp
+                .attr_compression
+                .get(&(parent, attr.attnum))
+                .map(|m| (*m).to_owned());
+            let parent_storage = attr_storage(interp, parent, attr.attnum, attr.atttypid);
+            let uncertain_collation = interp.uncertain_collations.contains(&(parent, attr.attnum));
             if let Some(existing) = columns.iter_mut().find(|c| c.name == attr.attname) {
                 if existing.type_oid != attr.atttypid || existing.typmod != attr.atttypmod {
                     return Err(DdlError::Parse(format!(
@@ -421,12 +438,34 @@ fn inherited_columns(
                         attr.attname
                     )));
                 }
-                if existing.collation != attr.attcollation {
+                // A collation the analyzer doesn't know conflicts with
+                // none: PG either fails or merges equal ones, so the known
+                // one is the column's.
+                if existing.uncertain_collation {
+                    existing.collation = attr.attcollation;
+                    existing.uncertain_collation = uncertain_collation;
+                } else if !uncertain_collation && existing.collation != attr.attcollation {
                     return Err(DdlError::Parse(format!(
                         "inherited column \"{}\" has a collation conflict",
                         attr.attname
                     )));
                 }
+                // MergeInheritedAttribute: two parents' storage modes must
+                // be the same.
+                if let Some(prev) = existing.storage
+                    && prev != parent_storage
+                {
+                    return Err(DdlError::Parse(format!(
+                        "inherited column \"{}\" has a storage parameter conflict ({} versus {})",
+                        attr.attname,
+                        storage_name(prev),
+                        storage_name(parent_storage)
+                    )));
+                }
+                existing.storage = Some(parent_storage);
+                // MergeInheritedAttribute: a method set by two parents
+                // must be the same one.
+                merge_compression(&mut existing.compression, parent_compression, &attr.attname)?;
                 if existing.generated != attr.attgenerated {
                     return Err(DdlError::Parse(format!(
                         "inherited column \"{}\" has a generation conflict",
@@ -459,6 +498,9 @@ fn inherited_columns(
                 generated: attr.attgenerated,
                 identity,
                 collation: attr.attcollation,
+                uncertain_collation,
+                compression: parent_compression,
+                storage: Some(parent_storage),
                 owned_sequence: None,
                 identity_options: Vec::new(),
                 nn_local: false,
@@ -487,12 +529,33 @@ fn merge_child_column(inh: &mut ParsedColumn, local: ParsedColumn) -> Result<(),
             local.name
         )));
     }
-    if local.collation.is_some() && local.collation != inh.collation {
+    if local.uncertain_collation {
+        // A collation the analyzer doesn't know conflicts with none: PG
+        // either fails or keeps the same one.
+    } else if inh.uncertain_collation && local.collation.is_some() {
+        inh.collation = local.collation;
+        inh.uncertain_collation = false;
+    } else if local.collation.is_some() && local.collation != inh.collation {
         return Err(DdlError::Parse(format!(
             "column \"{}\" has a collation conflict",
             local.name
         )));
     }
+    // A local definition brings a storage mode only from a LIKE ...
+    // INCLUDING STORAGE source.
+    match (inh.storage, local.storage) {
+        (None, new) => inh.storage = new,
+        (Some(prev), Some(new)) if prev != new => {
+            return Err(DdlError::Parse(format!(
+                "column \"{}\" has a storage parameter conflict ({} versus {})",
+                local.name,
+                storage_name(prev),
+                storage_name(new)
+            )));
+        }
+        _ => {}
+    }
+    merge_compression(&mut inh.compression, local.compression.clone(), &local.name)?;
     inh.not_null |= local.not_null;
     inh.nn_local |= local.nn_local;
     inh.nn_no_inherit |= local.nn_no_inherit;
@@ -511,6 +574,56 @@ fn merge_child_column(inh: &mut ParsedColumn, local: ParsedColumn) -> Result<(),
     if local.identity.is_some() {
         inh.identity = local.identity;
         inh.owned_sequence = local.owned_sequence;
+    }
+    Ok(())
+}
+
+/// Column `relid.attnum`'s `attstorage`: the one it was set to, else its
+/// type's.
+pub(crate) fn attr_storage(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+    attnum: i16,
+    typid: PgTypeOid,
+) -> TypStorage {
+    interp
+        .attr_storage
+        .get(&(relid, attnum))
+        .copied()
+        .unwrap_or_else(|| {
+            interp
+                .pg_type
+                .get(&typid)
+                .map_or(TypStorage::Plain, |t| t.typstorage)
+        })
+}
+
+/// storage_name (tablecmds.c): a storage mode as messages spell it.
+fn storage_name(storage: TypStorage) -> &'static str {
+    match storage {
+        TypStorage::Plain => "PLAIN",
+        TypStorage::External => "EXTERNAL",
+        TypStorage::Extended => "EXTENDED",
+        TypStorage::Main => "MAIN",
+    }
+}
+
+/// MergeInheritedAttribute / MergeChildAttribute: a compression method
+/// fills an unset one and must otherwise be the same — compared by name, so
+/// an explicit `default` conflicts with a parent's method.
+fn merge_compression(
+    merged: &mut Option<String>,
+    new: Option<String>,
+    column: &str,
+) -> Result<(), DdlError> {
+    match (merged.as_ref(), new) {
+        (None, new) => *merged = new,
+        (Some(prev), Some(new)) if *prev != new => {
+            return Err(DdlError::Parse(format!(
+                "column \"{column}\" has a compression method conflict ({prev} versus {new})"
+            )));
+        }
+        _ => {}
     }
     Ok(())
 }
