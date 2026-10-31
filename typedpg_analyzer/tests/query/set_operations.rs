@@ -294,3 +294,114 @@ fn except_and_intersect_nullability_follows_the_left_arm() {
         .unwrap();
     assert_cols(&s, vec![cn("a", text())]);
 }
+
+/// Asserts each query fails with `msg` (`Some`) or analyzes (`None`).
+fn assert_outcomes(db: &PgCatalog, cases: &[(&str, Option<&str>)]) {
+    for (sql, fails) in cases {
+        match (db.analyze(sql), fails) {
+            (Err(err), Some(msg)) => {
+                assert!(err.to_string().starts_with(msg), "{sql}\n  got: {err}")
+            }
+            (Ok(_), None) => {}
+            (other, _) => panic!("{sql}: {other:?}"),
+        }
+    }
+}
+
+/// PG 18 fetches the first row of a set operation's arms whatever the
+/// plan: every plan for a UNION reads the first row of each arm (a
+/// HashAggregate or Sort reads them all, a MergeAppend primes each child),
+/// an Append runs a UNION ALL's arms in order, and EXCEPT and INTERSECT
+/// read their outer input whole, then the inner one if the outer one had a
+/// row (an EXCEPT's outer input is its left arm, an INTERSECT's the one
+/// with fewer groups). A NULL cast to a NOT NULL domain there fails every
+/// execution, under a LIMIT too.
+#[test]
+fn a_failing_first_row_of_a_set_operation_fails_every_execution() {
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE DOMAIN d AS int NOT NULL;
+         CREATE TABLE t (a int);
+         CREATE VIEW v AS SELECT NULL::d AS x, 1 AS y;",
+    )]);
+    let domain = Some("domain d does not allow null values");
+    assert_outcomes(
+        &db,
+        &[
+            ("SELECT 1 UNION SELECT NULL::d LIMIT 1", domain),
+            ("SELECT NULL::d UNION SELECT 1 LIMIT 1", domain),
+            ("SELECT 1 UNION SELECT NULL::d LIMIT 2", domain),
+            ("SELECT NULL::d UNION ALL SELECT 1 LIMIT 1", domain),
+            ("SELECT x FROM v UNION ALL SELECT 1 LIMIT 1", domain),
+            (
+                "SELECT NULL::d UNION ALL SELECT 1 UNION ALL SELECT 2 LIMIT 1",
+                domain,
+            ),
+            (
+                "SELECT 1 UNION ALL SELECT NULL::d UNION SELECT 2 LIMIT 1",
+                domain,
+            ),
+            ("SELECT (SELECT NULL::d) UNION ALL SELECT 1 LIMIT 1", domain),
+            (
+                "SELECT 1 UNION ALL SELECT NULL::d ORDER BY 1 LIMIT 1",
+                domain,
+            ),
+            (
+                "SELECT a FROM (SELECT NULL::d AS a UNION SELECT 1 LIMIT 1) s",
+                domain,
+            ),
+            ("VALUES (NULL::d), (1) LIMIT 1", domain),
+            ("SELECT NULL::d EXCEPT SELECT 1 WHERE false", domain),
+            (
+                "(SELECT 1 UNION ALL SELECT NULL::d) EXCEPT SELECT 1 WHERE false",
+                domain,
+            ),
+            ("SELECT NULL::d EXCEPT SELECT a FROM t", domain),
+            ("SELECT 1 EXCEPT SELECT NULL::d LIMIT 1", domain),
+            ("SELECT NULL::d INTERSECT SELECT 1 WHERE false", domain),
+            ("SELECT 1 INTERSECT SELECT NULL::d", domain),
+            ("SELECT NULL::d INTERSECT SELECT 1 LIMIT 1", domain),
+            ("SELECT 1 INTERSECT SELECT NULL::d LIMIT 1", domain),
+            ("SELECT NULL::d INTERSECT SELECT a FROM t", domain),
+            (
+                "SELECT NULL::d INTERSECT SELECT a FROM t WHERE false",
+                domain,
+            ),
+            ("SELECT x FROM v INTERSECT SELECT 1 WHERE false", domain),
+            // Past the first row, or an arm that may not be read.
+            ("SELECT 1 UNION ALL SELECT NULL::d LIMIT 1", None),
+            ("VALUES (1), (NULL::d) LIMIT 1", None),
+            (
+                "SELECT 1 FROM (VALUES (1), (NULL::d)) s(a) WHERE a = 1 LIMIT 1",
+                None,
+            ),
+            ("SELECT 1 WHERE false INTERSECT SELECT NULL::d", None),
+            ("SELECT 1 WHERE false EXCEPT SELECT NULL::d", None),
+            ("SELECT a FROM t EXCEPT SELECT NULL::d", None),
+            ("SELECT a FROM t WHERE false INTERSECT SELECT NULL::d", None),
+            ("SELECT 1 WHERE false INTERSECT SELECT x FROM v", None),
+            (
+                "(SELECT 1 UNION ALL SELECT NULL::d) INTERSECT SELECT 1 WHERE false",
+                None,
+            ),
+            // Each arm projects its whole row, but a WHERE above is pushed
+            // down into the arms (subquery_push_qual) and filters it first.
+            (
+                "SELECT b FROM (SELECT NULL::d AS a, 1 AS b UNION ALL SELECT 1, 2) s",
+                domain,
+            ),
+            (
+                "SELECT a FROM (SELECT NULL::d AS a, 1 AS b UNION ALL SELECT 1, 2) s WHERE b = 2",
+                None,
+            ),
+            (
+                "SELECT 1 FROM (SELECT NULL::d AS a, 1 AS b UNION ALL SELECT 1, 2) s WHERE b IS NULL",
+                None,
+            ),
+            (
+                "SELECT 1 FROM (SELECT NULL::d AS a, 1 AS b UNION SELECT 1, 2) s WHERE b IS NULL",
+                None,
+            ),
+        ],
+    );
+}
