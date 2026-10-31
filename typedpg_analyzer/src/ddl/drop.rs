@@ -5,7 +5,7 @@ use typedpg_pg_query::protobuf::{DropBehavior, DropStmt, ObjectType, node};
 use super::DdlError;
 use super::util::{extract_names, format_type_for_message, node_string, resolve_type_name};
 use super::views;
-use crate::oid::{PgCastOid, PgClassOid, PgNamespaceOid, PgOperatorOid, PgProcOid, PgTypeOid};
+use crate::oid::{PgCastOid, PgClassOid, PgOperatorOid, PgProcOid, PgTypeOid};
 use crate::pg_catalog::{
     PG_CAST_RELID, PG_CLASS_RELID, PG_EXTENSION_RELID, PG_NAMESPACE_RELID, PG_OPERATOR_RELID,
     PG_PROC_RELID, PG_TYPE_RELID, PgCatalog, PgOperator, RelKind,
@@ -983,6 +983,13 @@ fn drop_type(
     // What else pg_depend knows depends on it (a cast, a base type's
     // functions, ...).
     super::depend::drop_dependents(interp, addr, &desc, cascade)?;
+    // The array type is internal to it (DEPENDENCY_INTERNAL): what depends
+    // on the array (a `NULL::_t` cast, a `'t[]'::regtype` literal) depends
+    // on the type.
+    if let Some(array) = deps.array {
+        let array_addr = super::depend::ObjectAddress::type_(array);
+        super::depend::drop_dependents(interp, array_addr, &desc, cascade)?;
+    }
     drop_type_oid(interp, type_oid, deps);
     Ok(())
 }
@@ -1050,7 +1057,17 @@ impl TypeDependents {
             .collect();
         Self {
             typed_tables: crate::ddl::tables::typed::typed_tables_of(interp, type_oid),
-            views: views::find_views_depending_on_type(interp, type_oid),
+            // Views on the array type too (it is internal to the type).
+            views: {
+                let mut views: Vec<PgClassOid> = [Some(type_oid), array]
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|t| views::find_views_depending_on_type(interp, t))
+                    .collect();
+                views.sort();
+                views.dedup();
+                views
+            },
             own_types,
             array,
             constructors,
@@ -1071,6 +1088,10 @@ pub(crate) fn drop_type_cascade(interp: &mut PgCatalog, type_oid: PgTypeOid) {
     let addr = super::depend::ObjectAddress::type_(type_oid);
     let desc = super::depend::describe(interp, addr);
     let _ = super::depend::drop_dependents(interp, addr, &desc, true);
+    if let Some(array) = interp.array_type_of(type_oid) {
+        let array_addr = super::depend::ObjectAddress::type_(array);
+        let _ = super::depend::drop_dependents(interp, array_addr, &desc, true);
+    }
     let deps = TypeDependents::of(interp, type_oid);
     drop_type_oid(interp, type_oid, deps);
 }
@@ -1491,18 +1512,8 @@ pub(crate) fn find_operator(
     name: &str,
     matches: &dyn Fn(&PgOperator) -> bool,
 ) -> Option<PgOperatorOid> {
-    let candidate_schemas: Vec<PgNamespaceOid> = if let Some(s) = schema {
-        snapshot.namespace_oid(s).into_iter().collect()
-    } else {
-        let mut v = Vec::new();
-        if let Some(pg_oid) = snapshot.namespace_oid("pg_catalog")
-            && !snapshot.search_path.contains(&pg_oid)
-        {
-            v.push(pg_oid);
-        }
-        v.extend(snapshot.search_path.iter().copied());
-        v
-    };
+    // OpernameGetCandidates: the temporary schema only by its name.
+    let candidate_schemas = snapshot.schemas_for_function_lookup(schema);
     for nsoid in candidate_schemas {
         if let Some(oids) = snapshot.operator_by_qname.get(&(nsoid, name.to_owned())) {
             for &oid in oids {

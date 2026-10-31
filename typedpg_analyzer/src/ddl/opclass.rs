@@ -93,7 +93,11 @@ pub(crate) fn format_operator(interp: &PgCatalog, opr: PgOperatorOid) -> String 
     let Some(op) = interp.pg_operator.get(&opr) else {
         return opr.to_string();
     };
-    let name = if interp.schemas_for_lookup(None).contains(&op.oprnamespace) {
+    // OperatorIsVisible: never one in the temporary schema.
+    let name = if interp
+        .schemas_for_function_lookup(None)
+        .contains(&op.oprnamespace)
+    {
         op.oprname.clone()
     } else {
         // quote_identifier(nspname) — QualifiedName's quoting of the schema

@@ -63,7 +63,9 @@ pub fn create_statistics(interp: &mut PgCatalog, stmt: &CreateStatsStmt) -> Resu
         ));
     }
     let Some(node::Node::RangeVar(rv)) = stmt.relations[0].node.as_ref() else {
-        return Ok(());
+        return Err(DdlError::UnsupportedDdl(
+            "CREATE STATISTICS only supports relation names in the FROM clause".into(),
+        ));
     };
     let (_, relid) = super::util::lookup_relation(interp, rv)?;
     let class = interp.pg_class.get(&relid).cloned();

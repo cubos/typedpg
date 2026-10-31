@@ -127,6 +127,20 @@ impl PgCatalog {
         out
     }
 
+    /// [`Self::schemas_for_lookup`] for routines and operators: the
+    /// temporary schema is never searched for them implicitly
+    /// (FuncnameGetCandidates, OpernameGetCandidates), even when the path
+    /// lists `pg_temp`, so one there is only reached by its qualified name.
+    pub(crate) fn schemas_for_function_lookup(&self, schema: Option<&str>) -> Vec<PgNamespaceOid> {
+        let mut out = self.schemas_for_lookup(schema);
+        if schema.is_none()
+            && let Some(temp) = self.temp_namespace
+        {
+            out.retain(|&ns| ns != temp);
+        }
+        out
+    }
+
     // ── Relation / type / function lookups ──────────────────────────────
 
     /// Look up a relation by name, walking the search path when `schema` is
@@ -267,8 +281,23 @@ impl PgCatalog {
     /// within one (`load_domaintype_info`); the message names `oid`
     /// itself (`format_type_be` of the coercion's result type).
     pub(crate) fn domain_null_violation(&self, oid: PgTypeOid) -> Option<String> {
+        self.domain_null_violation_with(oid, crate::ddl::util::format_type_for_message)
+    }
+
+    /// [`Self::domain_null_violation`] raised by a statement's execution,
+    /// which names the domain under the `search_path` it runs with
+    /// ([`crate::ddl::util::format_type_at_execution`]).
+    pub(crate) fn domain_null_violation_at_execution(&self, oid: PgTypeOid) -> Option<String> {
+        self.domain_null_violation_with(oid, crate::ddl::util::format_type_at_execution)
+    }
+
+    fn domain_null_violation_with(
+        &self,
+        oid: PgTypeOid,
+        format: fn(&PgCatalog, PgTypeOid) -> String,
+    ) -> Option<String> {
         let chain = self.domain_chain(oid);
-        let target = || crate::ddl::util::format_type_for_message(self, oid);
+        let target = || format(self, oid);
         if chain
             .iter()
             .any(|d| self.pg_type.get(d).is_some_and(|t| t.typnotnull))
@@ -469,7 +498,7 @@ impl PgCatalog {
         &'a self,
         schema: Option<&'a str>,
     ) -> impl Iterator<Item = &'a str> + 'a {
-        self.schemas_for_lookup(schema)
+        self.schemas_for_function_lookup(schema)
             .into_iter()
             .flat_map(move |nsoid| {
                 self.proc_by_qname
@@ -487,7 +516,7 @@ impl PgCatalog {
     /// `pg_catalog` if not explicitly listed) are concatenated.
     pub fn find_functions(&self, schema: Option<&str>, name: &str) -> Vec<&PgProc> {
         let mut out = Vec::new();
-        for nsoid in self.schemas_for_lookup(schema) {
+        for nsoid in self.schemas_for_function_lookup(schema) {
             if let Some(oids) = self.proc_by_qname.get(&(nsoid, name.to_owned())) {
                 for &oid in oids {
                     if let Some(p) = self.pg_proc.get(&oid) {
@@ -617,6 +646,7 @@ impl PgCatalog {
             &actuals,
             &mut declared,
             result,
+            false,
             self,
         ) {
             Ok((result_type_oid, _)) => {
@@ -647,7 +677,7 @@ impl PgCatalog {
         prefix: bool,
     ) -> Vec<&PgOperator> {
         let mut out: Vec<&PgOperator> = Vec::new();
-        for nsoid in self.schemas_for_lookup(schema) {
+        for nsoid in self.schemas_for_function_lookup(schema) {
             let Some(oids) = self.operator_by_qname.get(&(nsoid, name.to_owned())) else {
                 continue;
             };

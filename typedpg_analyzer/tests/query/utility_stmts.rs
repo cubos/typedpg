@@ -72,6 +72,40 @@ fn explain_insert_and_update_produce_query_plan_column() {
     assert_params(&s, vec![p(int8()), p(text())]);
 }
 
+#[test]
+fn explain_query_plan_type_follows_format() {
+    // PG 18 ExplainResultDesc: FORMAT JSON yields a `json` column, FORMAT
+    // XML an `xml` one, TEXT and YAML `text`.
+    let db = setup();
+    for (sql, ty) in [
+        (
+            "EXPLAIN (FORMAT json) SELECT id FROM t",
+            basic("pg_catalog", "json"),
+        ),
+        (
+            "EXPLAIN (FORMAT JSON, COSTS off) SELECT id FROM t",
+            basic("pg_catalog", "json"),
+        ),
+        (
+            "EXPLAIN (FORMAT xml) SELECT id FROM t",
+            basic("pg_catalog", "xml"),
+        ),
+        ("EXPLAIN (FORMAT yaml) SELECT id FROM t", text()),
+        ("EXPLAIN (FORMAT text) SELECT id FROM t", text()),
+        (
+            "EXPLAIN (FORMAT json, FORMAT text) SELECT id FROM t",
+            text(),
+        ),
+        (
+            "EXPLAIN (ANALYZE, FORMAT json) SELECT id FROM t",
+            basic("pg_catalog", "json"),
+        ),
+    ] {
+        let s = db.analyze(sql).expect(sql);
+        assert_cols(&s, vec![c("QUERY PLAN", ty)]);
+    }
+}
+
 // ── NOTIFY / LISTEN / UNLISTEN ──────────────────────────────────────────────
 
 #[test]

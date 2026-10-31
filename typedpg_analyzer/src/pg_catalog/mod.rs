@@ -1624,7 +1624,7 @@ impl PgCatalog {
         self.invalid_indexes.remove(&oid);
         self.index_keys.remove(&oid);
         self.sequence_params.remove(&oid);
-        self.foreign_data.table_servers.remove(&oid);
+        self.foreign_data.forget_relation(oid);
         self.relpersistence.remove(&oid);
         self.toast_tables.remove(&oid);
         self.attr_storage.retain(|(relid, _), _| *relid != oid);

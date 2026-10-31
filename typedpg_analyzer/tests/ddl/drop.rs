@@ -377,6 +377,110 @@ fn drop_sequence_used_by_a_default_is_refused() {
 }
 
 #[test]
+fn reg_literals_are_dependencies_of_stored_expressions() {
+    // find_expr_references_walker records a dependency on the object each
+    // reg* constant names — in a view, a default (whose untyped literal is
+    // input as the column's type) or a generation expression. PG 18: 2BP01
+    // cannot drop ... because other objects depend on it.
+    for (setup, drop, msg) in [
+        (
+            "CREATE FUNCTION f(int) RETURNS int LANGUAGE sql AS 'select 1';
+             CREATE VIEW v AS SELECT 'f(int)'::regprocedure AS p;",
+            "DROP FUNCTION f(int);",
+            "cannot drop function f(integer) because other objects depend on it",
+        ),
+        (
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'select 1';
+             CREATE VIEW v AS SELECT 'f'::regproc AS p;",
+            "DROP FUNCTION f();",
+            "cannot drop function f() because other objects depend on it",
+        ),
+        (
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'select 1';
+             CREATE TABLE t (b regproc);
+             ALTER TABLE t ALTER b SET DEFAULT 'f';",
+            "DROP FUNCTION f();",
+            "cannot drop function f() because other objects depend on it",
+        ),
+        (
+            "CREATE FUNCTION f(int) RETURNS int LANGUAGE sql AS 'select 1';
+             CREATE TABLE t (b regprocedure GENERATED ALWAYS AS ('f(int)') STORED);",
+            "DROP FUNCTION f(int);",
+            "cannot drop function f(integer) because other objects depend on it",
+        ),
+        (
+            "CREATE FUNCTION eqx(int, int) RETURNS bool LANGUAGE sql AS 'select $1 = $2';
+             CREATE OPERATOR === (leftarg = int, rightarg = int, function = eqx);
+             CREATE VIEW v AS SELECT '===(int,int)'::regoperator AS p;",
+            "DROP OPERATOR === (int, int);",
+            "cannot drop operator ===(integer,integer) because other objects depend on it",
+        ),
+        (
+            "CREATE FUNCTION eqx(int, int) RETURNS bool LANGUAGE sql AS 'select $1 = $2';
+             CREATE OPERATOR === (leftarg = int, rightarg = int, function = eqx);
+             CREATE TABLE t (o regoper DEFAULT '===');",
+            "DROP OPERATOR === (int, int);",
+            "cannot drop operator ===(integer,integer) because other objects depend on it",
+        ),
+        (
+            "CREATE TYPE ty AS (a int);
+             CREATE VIEW v AS SELECT 'ty'::regtype AS p;",
+            "DROP TYPE ty;",
+            "cannot drop type ty because other objects depend on it",
+        ),
+        // The array type is internal to its element type: what depends on
+        // it depends on the type.
+        (
+            "CREATE TYPE ty AS (a int);
+             CREATE VIEW v AS SELECT 'ty[]'::regtype AS p;",
+            "DROP TYPE ty;",
+            "cannot drop type ty because other objects depend on it",
+        ),
+        (
+            "CREATE TYPE ty AS (a int);
+             CREATE TABLE t (b regtype DEFAULT '_ty');",
+            "DROP TYPE ty;",
+            "cannot drop type ty because other objects depend on it",
+        ),
+        (
+            "CREATE TYPE ty AS (a int);
+             CREATE VIEW v AS SELECT 1 AS p WHERE NULL::_ty IS NULL;",
+            "DROP TYPE ty;",
+            "cannot drop type ty because other objects depend on it",
+        ),
+        (
+            "CREATE TYPE ty AS ENUM ('a');
+             CREATE TABLE t (a int, CHECK (NULL::_ty IS NULL));",
+            "DROP TYPE ty;",
+            "cannot drop type ty because other objects depend on it",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", drop)]).expect_err(setup);
+        assert!(err.to_string().starts_with(msg), "{setup}\n  got: {err}");
+    }
+    // CASCADE takes the dependents along.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TYPE ty AS (a int);
+         CREATE VIEW v AS SELECT 'ty[]'::regtype AS p;
+         CREATE FUNCTION f(int) RETURNS int LANGUAGE sql AS 'select 1';
+         CREATE VIEW w AS SELECT 'f(int)'::regprocedure AS p;
+         DROP TYPE ty CASCADE;
+         DROP FUNCTION f(int) CASCADE;",
+    )]);
+    assert!(db.resolve_table(None, "v").is_none());
+    assert!(db.resolve_table(None, "w").is_none());
+    // Built-in objects are pinned: nothing is recorded on them.
+    build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (b regtype DEFAULT 'int4', p regprocedure DEFAULT 'abs(int)');
+         CREATE VIEW v AS SELECT '+(int,int)'::regoperator AS o;
+         DROP VIEW v;
+         DROP TABLE t;",
+    )]);
+}
+
+#[test]
 fn drop_type_reports_a_missing_type_like_pg() {
     // PG 18: 42704 type "nosuch" does not exist.
     assert_ddl_err!(

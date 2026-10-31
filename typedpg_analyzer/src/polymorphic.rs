@@ -307,8 +307,7 @@ impl PolyTypes {
     }
 }
 
-/// PG's `enforce_generic_type_consistency` (parse_coerce.c, with
-/// `allow_poly = false` as `ParseFuncOrColumn`/`make_op` call it): once a
+/// PG's `enforce_generic_type_consistency` (parse_coerce.c): once a
 /// candidate is chosen, resolve its polymorphic parameters from the actual
 /// argument types, rewriting `declared` in place to the concrete coercion
 /// targets (unknown actuals included — that is what types a bare `$1` in a
@@ -318,10 +317,16 @@ impl PolyTypes {
 ///
 /// `declared` may be longer than `actuals` (parameters filled in from
 /// defaults); those trailing positions contribute no actual type.
+///
+/// `allow_poly` (false for a call or an operator, true for
+/// `lookup_agg_function`): an actual that is the declared pseudo-type
+/// itself tells nothing, and a family left unbound stays polymorphic
+/// instead of failing.
 pub(crate) fn enforce_generic_type_consistency(
     actuals: &[PgTypeOid],
     declared: &mut [PgTypeOid],
     rettype: PgTypeOid,
+    allow_poly: bool,
     snapshot: &PgCatalog,
 ) -> Result<(PgTypeOid, PolyTypes), AnalyzeError> {
     use crate::pgmsg;
@@ -362,12 +367,18 @@ pub(crate) fn enforce_generic_type_consistency(
                     have_poly_unknowns = true;
                     continue;
                 }
+                if allow_poly && decl == actual {
+                    continue;
+                }
                 alike(&mut p.elem, actual, "anyelement")?;
             }
             ANYARRAY | ANYRANGE | ANYMULTIRANGE => {
                 n_poly_args += 1;
                 if actual == oid::UNKNOWN {
                     have_poly_unknowns = true;
+                    continue;
+                }
+                if allow_poly && decl == actual {
                     continue;
                 }
                 let (slot, name) = match decl {
@@ -380,14 +391,14 @@ pub(crate) fn enforce_generic_type_consistency(
             ANYCOMPATIBLE | ANYCOMPATIBLENONARRAY => {
                 have_poly_anycompatible = true;
                 have_compat_nonarray |= decl == ANYCOMPATIBLENONARRAY;
-                if actual != oid::UNKNOWN {
+                if actual != oid::UNKNOWN && !(allow_poly && decl == actual) {
                     compat_actuals.push(actual);
                 }
             }
             ANYCOMPATIBLEARRAY => {
                 have_poly_anycompatible = true;
                 have_compat_array = true;
-                if actual == oid::UNKNOWN {
+                if actual == oid::UNKNOWN || (allow_poly && decl == actual) {
                     continue;
                 }
                 let actual = base(actual);
@@ -403,7 +414,7 @@ pub(crate) fn enforce_generic_type_consistency(
             ANYCOMPATIBLERANGE => {
                 have_poly_anycompatible = true;
                 have_compat_range = true;
-                if actual == oid::UNKNOWN {
+                if actual == oid::UNKNOWN || (allow_poly && decl == actual) {
                     continue;
                 }
                 let actual = base(actual);
@@ -429,7 +440,7 @@ pub(crate) fn enforce_generic_type_consistency(
             ANYCOMPATIBLEMULTIRANGE => {
                 have_poly_anycompatible = true;
                 have_compat_multirange = true;
-                if actual == oid::UNKNOWN {
+                if actual == oid::UNKNOWN || (allow_poly && decl == actual) {
                     continue;
                 }
                 let actual = base(actual);
@@ -517,9 +528,17 @@ pub(crate) fn enforce_generic_type_consistency(
                 Some(_) => {}
             }
         }
-        // Only reachable when every family-1 argument is unknown.
-        let Some(elem) = p.elem else {
-            return Err(pgmsg::polymorphic_type_from_unknown(None));
+        // Only reachable when every family-1 argument is unknown (or, with
+        // `allow_poly`, polymorphic itself).
+        let elem = match p.elem {
+            Some(elem) => elem,
+            None if allow_poly => {
+                p.array = Some(ANYARRAY);
+                p.range = Some(ANYRANGE);
+                p.multirange = Some(ANYMULTIRANGE);
+                *p.elem.insert(ANYELEMENT)
+            }
+            None => return Err(pgmsg::polymorphic_type_from_unknown(None)),
         };
         if have_anynonarray && elem != ANYELEMENT && type_is_array_domain(elem, snapshot) {
             return Err(pgmsg::polymorphic_match_wrong_kind(
@@ -611,6 +630,11 @@ pub(crate) fn enforce_generic_type_consistency(
                 ));
             }
             p.compat = Some(common);
+        } else if allow_poly {
+            p.compat = Some(ANYCOMPATIBLE);
+            p.compat_array = Some(ANYCOMPATIBLEARRAY);
+            p.compat_range = Some(ANYCOMPATIBLERANGE);
+            p.compat_multirange = Some(ANYCOMPATIBLEMULTIRANGE);
         } else {
             // All family-2 inputs are unknown: resolve to text, like
             // `select_common_type` — which doesn't license a text range.

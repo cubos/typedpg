@@ -725,18 +725,8 @@ pub(crate) fn find_proc(
     name: &str,
     matches: &dyn Fn(&PgProc) -> bool,
 ) -> Option<(PgNamespaceOid, PgProcOid)> {
-    let candidate_schemas: Vec<PgNamespaceOid> = if let Some(s) = schema {
-        snapshot.namespace_oid(s).into_iter().collect()
-    } else {
-        let mut v = Vec::new();
-        if let Some(pg_oid) = snapshot.namespace_oid("pg_catalog")
-            && !snapshot.search_path.contains(&pg_oid)
-        {
-            v.push(pg_oid);
-        }
-        v.extend(snapshot.search_path.iter().copied());
-        v
-    };
+    // FuncnameGetCandidates: the temporary schema only by its name.
+    let candidate_schemas = snapshot.schemas_for_function_lookup(schema);
     for nsoid in candidate_schemas {
         if let Some(oids) = snapshot.proc_by_qname.get(&(nsoid, name.to_owned())) {
             for &oid in oids {

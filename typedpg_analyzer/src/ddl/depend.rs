@@ -230,11 +230,6 @@ fn push(reference: Reference) {
     });
 }
 
-/// Whether a [`collect`] is active (references are being recorded).
-pub(crate) fn collecting() -> bool {
-    COLLECTOR.with(|c| c.borrow().is_some())
-}
-
 /// The analyzer resolved a reference to `addr` (a function, operator,
 /// relation, type ...). A no-op outside [`collect`].
 pub(crate) fn note(addr: ObjectAddress) {
@@ -699,15 +694,19 @@ pub(crate) fn function_signature(interp: &PgCatalog, oid: PgProcOid) -> String {
     let Some(p) = interp.pg_proc.get(&oid) else {
         return String::new();
     };
-    let visible = interp.schemas_for_lookup(None).into_iter().find_map(|ns| {
-        interp
-            .pg_proc
-            .values()
-            .find(|q| {
-                q.pronamespace == ns && q.proname == p.proname && q.proargtypes == p.proargtypes
-            })
-            .map(|q| q.oid)
-    }) == Some(oid);
+    let visible = interp
+        .schemas_for_function_lookup(None)
+        .into_iter()
+        .find_map(|ns| {
+            interp
+                .pg_proc
+                .values()
+                .find(|q| {
+                    q.pronamespace == ns && q.proname == p.proname && q.proargtypes == p.proargtypes
+                })
+                .map(|q| q.oid)
+        })
+        == Some(oid);
     let args: Vec<String> = p
         .proargtypes
         .iter()

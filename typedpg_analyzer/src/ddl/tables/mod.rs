@@ -956,6 +956,91 @@ pub(crate) fn check_system_column_name(name: &str) -> Result<(), DdlError> {
     Ok(())
 }
 
+/// The `OPTIONS (...)` list of an ALTER TABLE subcommand.
+fn generic_options_of(cmd: &AlterTableCmd) -> &[typedpg_pg_query::protobuf::Node] {
+    match cmd.def.as_deref().and_then(|d| d.node.as_ref()) {
+        Some(node::Node::List(l)) => &l.items,
+        _ => &[],
+    }
+}
+
+/// ATExecAlterColumnGenericOptions: the column is looked up (a system
+/// column can't be altered) before its options are transformed.
+fn alter_column_generic_options(
+    interp: &mut PgCatalog,
+    relid: PgClassOid,
+    colname: &str,
+    options: &[typedpg_pg_query::protobuf::Node],
+) -> Result<(), DdlError> {
+    if options.is_empty() {
+        return Ok(());
+    }
+    let Some(attnum) = interp.attribute_by_name(relid, colname).map(|a| a.attnum) else {
+        check_not_system_column(interp, relid, colname)?;
+        return Err(DdlError::Parse(column_not_found_msg(
+            interp, relid, colname,
+        )));
+    };
+    crate::ddl::fdw::apply_generic_options(
+        interp,
+        crate::ddl::fdw::OptionsOwner::Column(relid, attnum),
+        options,
+    )
+}
+
+/// transformColumnDefinition: a new column's `OPTIONS (...)` becomes an
+/// `ALTER FOREIGN TABLE ... ALTER COLUMN ... OPTIONS` run after the
+/// relation's creation, which RangeVarCallbackForAlterRelation refuses for
+/// anything but a foreign table.
+pub(crate) fn column_generic_options_stmt(
+    interp: &mut PgCatalog,
+    relid: PgClassOid,
+    colname: &str,
+    options: &[typedpg_pg_query::protobuf::Node],
+) -> Result<(), DdlError> {
+    if options.is_empty() {
+        return Ok(());
+    }
+    if interp.pg_class.get(&relid).map(|c| c.relkind) != Some(RelKind::ForeignTable) {
+        return Err(DdlError::UnsupportedDdl(format!(
+            "\"{}\" is not a foreign table",
+            relname_of(interp, relid)
+        )));
+    }
+    alter_column_generic_options(interp, relid, colname, options)
+}
+
+/// `CREATE TABLE`, with its columns' generic options, which only a
+/// foreign table takes (transformColumnDefinition).
+pub fn create_plain_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), DdlError> {
+    let existed = stmt.relation.as_ref().and_then(|rv| {
+        let (schema, name) = range_var_names(rv, interp);
+        interp
+            .namespace_oid(&schema)
+            .and_then(|ns| interp.class_by_qname.get(&(ns, name)).copied())
+    });
+    create_table(interp, stmt)?;
+    if existed.is_some() {
+        return Ok(());
+    }
+    let Some(rv) = stmt.relation.as_ref() else {
+        return Ok(());
+    };
+    let (schema, name) = range_var_names(rv, interp);
+    let Some(relid) = interp
+        .namespace_oid(&schema)
+        .and_then(|ns| interp.class_by_qname.get(&(ns, name)).copied())
+    else {
+        return Ok(());
+    };
+    for elt in &stmt.table_elts {
+        if let Some(node::Node::ColumnDef(cd)) = elt.node.as_ref() {
+            column_generic_options_stmt(interp, relid, &cd.colname, &cd.fdwoptions)?;
+        }
+    }
+    Ok(())
+}
+
 /// `CREATE FOREIGN TABLE name (...) SERVER s`: a relation like a table
 /// (columns, NOT NULL, defaults, inheritance) with relkind 'f'. The rows live
 /// elsewhere; the server and options don't affect typing.
@@ -978,18 +1063,34 @@ pub fn create_foreign_table(
     }
     // CreateForeignTable: GetForeignServerByName.
     crate::ddl::fdw::check_server(interp, &stmt.servername)?;
-    if let Some(rv) = base.relation.as_ref() {
-        let (schema, name) = range_var_names(rv, interp);
-        if let Some(oid) = interp
-            .namespace_oid(&schema)
-            .and_then(|ns| interp.class_by_qname.get(&(ns, name)).copied())
-            && let Some(class) = interp.pg_class.get_mut(&oid)
-        {
-            class.relkind = RelKind::ForeignTable;
-            interp
-                .foreign_data
-                .table_servers
-                .insert(oid, stmt.servername.clone());
+    let Some(rv) = base.relation.as_ref() else {
+        return Ok(());
+    };
+    let (schema, name) = range_var_names(rv, interp);
+    let Some(oid) = interp
+        .namespace_oid(&schema)
+        .and_then(|ns| interp.class_by_qname.get(&(ns, name)).copied())
+    else {
+        return Ok(());
+    };
+    if let Some(class) = interp.pg_class.get_mut(&oid) {
+        class.relkind = RelKind::ForeignTable;
+    }
+    interp
+        .foreign_data
+        .table_servers
+        .insert(oid, stmt.servername.clone());
+    // The table's generic options, then (transformColumnDefinition's
+    // ALTER FOREIGN TABLE ... ALTER COLUMN ... OPTIONS, run after the
+    // creation) its columns'.
+    crate::ddl::fdw::apply_generic_options(
+        interp,
+        crate::ddl::fdw::OptionsOwner::ForeignTable(oid),
+        &stmt.options,
+    )?;
+    for elt in &base.table_elts {
+        if let Some(node::Node::ColumnDef(cd)) = elt.node.as_ref() {
+            alter_column_generic_options(interp, oid, &cd.colname, &cd.fdwoptions)?;
         }
     }
     Ok(())
@@ -1345,6 +1446,14 @@ fn apply_alter_subtype(
         }
         AlterTableType::AtSetTableSpace => check_tablespace_placement(&cmd.name),
         AlterTableType::AtAddOf => typed::add_of(interp, relid, cmd),
+        AlterTableType::AtGenericOptions => crate::ddl::fdw::apply_generic_options(
+            interp,
+            crate::ddl::fdw::OptionsOwner::ForeignTable(relid),
+            generic_options_of(cmd),
+        ),
+        AlterTableType::AtAlterColumnGenericOptions => {
+            alter_column_generic_options(interp, relid, &cmd.name, generic_options_of(cmd))
+        }
         AlterTableType::AtAddInherit => inherit_cmd::add_inherit(interp, relid, cmd),
         AlterTableType::AtDropInherit => inherit_cmd::drop_inherit(interp, relid, cmd),
         AlterTableType::AtAttachPartition if partidx::is_partitioned_index(interp, relid) => {
@@ -1601,6 +1710,11 @@ fn check_alter_target(
             "ALTER COLUMN ... SET COMPRESSION",
         ),
         At::AtAddConstraint => (table_like, "ADD CONSTRAINT"),
+        At::AtGenericOptions => (class.relkind == RelKind::ForeignTable, "OPTIONS"),
+        At::AtAlterColumnGenericOptions => (
+            class.relkind == RelKind::ForeignTable,
+            "ALTER COLUMN ... OPTIONS",
+        ),
         At::AtAddOf => (class.relkind == RelKind::Table, "OF"),
         At::AtSetAccessMethod => (
             matches!(

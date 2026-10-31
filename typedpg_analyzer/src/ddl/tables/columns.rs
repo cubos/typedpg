@@ -944,6 +944,9 @@ fn add_column_to(
             )?;
         }
         add_column_constraints(interp, relid, cd)?;
+        // transformColumnDefinition: the column's generic options are an
+        // ALTER FOREIGN TABLE ... ALTER COLUMN ... OPTIONS run afterwards.
+        super::column_generic_options_stmt(interp, relid, &cd.colname, &cd.fdwoptions)?;
     }
     Ok(())
 }
@@ -1206,6 +1209,7 @@ pub(crate) fn drop_column(
     interp.attr_default_exprs.remove(&(relid, target.attnum));
     interp.attr_storage.remove(&(relid, target.attnum));
     interp.attr_compression.remove(&(relid, target.attnum));
+    interp.foreign_data.forget_column(relid, target.attnum);
     crate::ddl::statistics::drop_column_statistics(interp, relid, target.attnum);
     crate::ddl::defaults::forget_default_dependencies(interp, relid, target.attnum);
     if let Some(attrs) = interp.pg_attribute.get_mut(&relid) {

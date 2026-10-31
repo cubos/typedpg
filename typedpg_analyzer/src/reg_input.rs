@@ -10,12 +10,19 @@
 //! - `regtype` parses a whole type name with the grammar's type-name mode
 //!   (`parseTypeString`), so its errors are the grammar's;
 //! - `regprocedure` / `regoperator` parse `name(argtypes)`
-//!   (`parseNameAndArgTypes`).
+//!   (`parseNameAndArgTypes`) and look the routine / operator up by its
+//!   exact argument types.
+//!
+//! A value that names an object is a dependency of the expression holding
+//! it (`find_expr_references_walker` records one for each reg* constant),
+//! so the lookups note what they found.
 //!
 //! Like [`crate::literal_input::validate`] this must never reject a value
 //! PG accepts: lookups of objects the snapshot doesn't model (roles, system
 //! relations outside the seed) accept.
 
+use crate::ddl::depend::{ObjectAddress, note};
+use crate::oid::PgTypeOid;
 use crate::pg_catalog::PgCatalog;
 
 /// PG's `NAMEDATALEN - 1`: identifiers are truncated to 63 bytes.
@@ -35,12 +42,12 @@ pub(crate) fn validate(typname: &str, content: &str, snapshot: &PgCatalog) -> Re
         return Err(format!("value \"{content}\" is out of range for type oid"));
     }
     match typname {
-        "regtype" => regtype_in(content, snapshot),
-        "regprocedure" | "regoperator" => {
-            name_and_arg_types(content)?;
-            note_routine_or_operator(typname, content, snapshot);
+        "regtype" => {
+            note(ObjectAddress::type_(parse_type_string(content, snapshot)?));
             Ok(())
         }
+        "regprocedure" => regprocedure_in(content, snapshot),
+        "regoperator" => regoperator_in(content, snapshot),
         _ => {
             let names = qualified_name_list(content)?;
             lookup_by_names(typname, content, &names, snapshot)
@@ -190,7 +197,6 @@ fn lookup_by_names(
             if schema.is_some_and(|s| snapshot.namespace_oid(s).is_none()) {
                 return Err(not_found(typname, content));
             }
-            use crate::ddl::depend::{ObjectAddress, note};
             let found: Vec<ObjectAddress> = if typname == "regproc" {
                 snapshot
                     .find_functions(schema, name)
@@ -198,7 +204,7 @@ fn lookup_by_names(
                     .map(|p| ObjectAddress::proc(p.oid))
                     .collect()
             } else {
-                let path = snapshot.schemas_for_lookup(schema);
+                let path = snapshot.schemas_for_function_lookup(schema);
                 snapshot
                     .pg_operator
                     .values()
@@ -303,10 +309,11 @@ fn deconstruct(names: &[String]) -> Result<(Option<&str>, &str), String> {
     }
 }
 
-/// `regtypein` → `parseTypeString`: the value must parse as a lone type
+/// `parseTypeString` (`regtypein`, and each argument type of
+/// `regprocedure` / `regoperator`): the value must parse as a lone type
 /// name (the grammar's own errors otherwise), not `SETOF`, and name an
-/// existing type with a valid modifier.
-fn regtype_in(content: &str, snapshot: &PgCatalog) -> Result<(), String> {
+/// existing type with a valid modifier — whose OID is returned.
+fn parse_type_string(content: &str, snapshot: &PgCatalog) -> Result<PgTypeOid, String> {
     use typedpg_pg_query::protobuf::node;
     // typeStringToTypeName fails an empty / all-whitespace value before
     // the grammar sees it.
@@ -368,67 +375,75 @@ fn regtype_in(content: &str, snapshot: &PgCatalog) -> Result<(), String> {
         other => other.to_string(),
     })?;
     crate::typmod::encode(snapshot, t, tn).map_err(|e| e.to_string())?;
-    // A stored constant depends on its type (find_expr_references_walker).
-    crate::ddl::depend::note(crate::ddl::depend::ObjectAddress::type_(t));
-    Ok(())
+    Ok(t)
 }
 
-/// A stored `regprocedure` / `regoperator` constant depends on the
-/// routine / operator it names (find_expr_references_walker): `content`
-/// (`name(argtypes)`) is looked up as DROP FUNCTION / OPERATOR would.
-/// Nothing is noted when it isn't found — the input itself is not
-/// validated here.
-fn note_routine_or_operator(typname: &str, content: &str, snapshot: &PgCatalog) {
-    use typedpg_pg_query::protobuf::{ObjectType, node};
-    if !crate::ddl::depend::collecting() {
-        return;
-    }
-    let keyword = if typname == "regprocedure" {
-        "ROUTINE"
-    } else {
-        "OPERATOR"
-    };
-    let Ok(parsed) = typedpg_pg_query::parse(&format!("DROP {keyword} {content}")) else {
-        return;
-    };
-    let [stmt] = parsed.protobuf.stmts.as_slice() else {
-        return;
-    };
-    let Some(node::Node::DropStmt(drop)) = stmt.stmt.as_deref().and_then(|n| n.node.as_ref())
-    else {
-        return;
-    };
-    let [object] = drop.objects.as_slice() else {
-        return;
-    };
-    let address = if typname == "regprocedure" {
-        let Some(node::Node::ObjectWithArgs(owa)) = object.node.as_ref() else {
-            return;
-        };
-        crate::ddl::functions::lookup_func_with_args(snapshot, ObjectType::ObjectRoutine, owa, true)
-            .ok()
-            .flatten()
-            .map(crate::ddl::depend::ObjectAddress::proc)
-    } else {
-        crate::ddl::drop::operator_target(snapshot, object)
-            .map(crate::ddl::depend::ObjectAddress::operator)
-    };
-    if let Some(address) = address {
-        crate::ddl::depend::note(address);
+/// `regprocedurein`: `name(type, …)` names the routine whose input
+/// argument types are exactly those (FuncnameGetCandidates without
+/// variadic or default expansion — the temporary schema only when named).
+fn regprocedure_in(content: &str, snapshot: &PgCatalog) -> Result<(), String> {
+    let (names, args) = name_and_arg_types(content, false, snapshot)?;
+    let (schema, name) = deconstruct(&names)?;
+    let found = snapshot.find_functions(schema, name).into_iter().find(|p| {
+        p.proargtypes
+            .iter()
+            .map(|&t| Some(t))
+            .eq(args.iter().copied())
+    });
+    match found {
+        Some(p) => {
+            note(ObjectAddress::proc(p.oid));
+            Ok(())
+        }
+        // regprocedurein names the input as written.
+        None => Err(format!("function \"{content}\" does not exist")),
     }
 }
 
-/// `parseNameAndArgTypes`: `name(type, …)` — the parentheses are checked
-/// and the name must split; the argument types and the lookup are not
-/// modelled (accepted).
-fn name_and_arg_types(content: &str) -> Result<(), String> {
-    // The first `(` outside double quotes.
+/// `regoperatorin`: `name(left, right)`, `NONE` for a prefix operator's
+/// missing left operand, names the operator with exactly those operand
+/// types (OpernameGetOprid — the temporary schema only when named).
+fn regoperator_in(content: &str, snapshot: &PgCatalog) -> Result<(), String> {
+    let (names, args) = name_and_arg_types(content, true, snapshot)?;
+    let (left, right) = match args.as_slice() {
+        [left, right] => (*left, *right),
+        [_] => return Err("missing argument".to_string()),
+        _ => return Err("too many arguments".to_string()),
+    };
+    let (schema, name) = deconstruct(&names)?;
+    let found = crate::ddl::drop::find_operator(snapshot, schema, name, &|o| {
+        o.oprleft == left && Some(o.oprright) == right
+    });
+    match found {
+        Some(oid) => {
+            note(ObjectAddress::operator(oid));
+            Ok(())
+        }
+        None => Err(format!("operator does not exist: {content}")),
+    }
+}
+
+/// PG's `FUNC_MAX_ARGS`.
+const FUNC_MAX_ARGS: usize = 100;
+
+/// `parseNameAndArgTypes`: split `name(type, …)` into the name list and
+/// the argument types (`None` for a `NONE` when `allow_none`), with PG's
+/// checks in its order — the left parenthesis, the name, the right
+/// parenthesis, then each type name in turn.
+fn name_and_arg_types(
+    content: &str,
+    allow_none: bool,
+    snapshot: &PgCatalog,
+) -> Result<(Vec<String>, Vec<Option<PgTypeOid>>), String> {
+    // The first `(` outside double quotes. Every delimiter scanned for
+    // here is ASCII, so byte offsets are character boundaries.
+    let bytes = content.as_bytes();
     let mut in_quote = false;
     let mut open = None;
-    for (i, c) in content.char_indices() {
-        match c {
-            '"' => in_quote = !in_quote,
-            '(' if !in_quote => {
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'"' => in_quote = !in_quote,
+            b'(' if !in_quote => {
                 open = Some(i);
                 break;
             }
@@ -438,24 +453,79 @@ fn name_and_arg_types(content: &str) -> Result<(), String> {
     let Some(open) = open else {
         return Err("expected a left parenthesis".to_string());
     };
-    let rest = content[open + 1..].trim_end_matches(is_space);
-    if !rest.ends_with(')') {
-        return Err("expected a right parenthesis".to_string());
-    }
     let names = qualified_name_list(&content[..open])?;
-    if names.len() == 3 {
-        return Err(format!(
-            "cross-database references are not implemented: {}",
-            joined(&names)
-        ));
+
+    // The trailing `)`, after trailing whitespace — PG's backwards scan
+    // stops at the first character after the `(`, which it never skips.
+    let rest = &content[open + 1..];
+    let rb = rest.as_bytes();
+    let mut close = rb.len();
+    let close = loop {
+        if close == 0 {
+            break None;
+        }
+        close -= 1;
+        if close == 0 || !is_space(rb[close] as char) {
+            break Some(close);
+        }
+    };
+    let Some(close) = close.filter(|&c| rb[c] == b')') else {
+        return Err("expected a right parenthesis".to_string());
+    };
+
+    // Comma-separated type names; a comma inside quotes, parentheses or
+    // brackets doesn't separate.
+    let args = &rest[..close];
+    let ab = args.as_bytes();
+    let mut types = Vec::new();
+    let mut p = 0;
+    let mut had_comma = false;
+    loop {
+        while p < ab.len() && is_space(ab[p] as char) {
+            p += 1;
+        }
+        if p == ab.len() {
+            if had_comma {
+                return Err("expected a type name".to_string());
+            }
+            break;
+        }
+        let start = p;
+        let mut in_quote = false;
+        let mut depth = 0i32;
+        while p < ab.len() {
+            match ab[p] {
+                b'"' => in_quote = !in_quote,
+                b',' if !in_quote && depth == 0 => break,
+                b'(' | b'[' if !in_quote => depth += 1,
+                b')' | b']' if !in_quote => depth -= 1,
+                _ => {}
+            }
+            p += 1;
+        }
+        if in_quote || depth != 0 {
+            return Err("improper type name".to_string());
+        }
+        let mut end = p;
+        had_comma = p < ab.len();
+        if had_comma {
+            p += 1;
+        }
+        while end > start && is_space(ab[end - 1] as char) {
+            end -= 1;
+        }
+        let typename = &args[start..end];
+        let typ = if allow_none && typename.eq_ignore_ascii_case("none") {
+            None
+        } else {
+            Some(parse_type_string(typename, snapshot)?)
+        };
+        if types.len() >= FUNC_MAX_ARGS {
+            return Err("too many arguments".to_string());
+        }
+        types.push(typ);
     }
-    if names.len() > 3 {
-        return Err(format!(
-            "improper qualified name (too many dotted names): {}",
-            joined(&names)
-        ));
-    }
-    Ok(())
+    Ok((names, types))
 }
 
 #[cfg(test)]

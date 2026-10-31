@@ -1599,6 +1599,119 @@ fn reg_type_literals_are_parsed_and_looked_up() {
     }
 }
 
+/// `regprocedure` / `regoperator` parse `name(argtypes)` as
+/// parseNameAndArgTypes does — each argument a whole type name — and look
+/// the routine / operator up by its exact argument types: no coercion,
+/// variadic or default expansion. Errors come in PG's order: the
+/// parentheses and the name, each type, the operand count, the qualified
+/// name's shape, the lookup.
+#[test]
+fn regprocedure_and_regoperator_look_up_exact_signatures() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE FUNCTION f(int) RETURNS int LANGUAGE sql AS 'select 1';
+         CREATE PROCEDURE p(text) LANGUAGE sql AS 'select 1';
+         CREATE FUNCTION eqx(int, int) RETURNS bool LANGUAGE sql AS 'select $1 = $2';
+         CREATE OPERATOR === (leftarg = int, rightarg = int, function = eqx);",
+    )
+    .unwrap();
+    for (sql, msg) in [
+        (
+            "SELECT 'f()'::regprocedure",
+            "function \"f()\" does not exist",
+        ),
+        (
+            "SELECT 'f(bigint)'::regprocedure",
+            "function \"f(bigint)\" does not exist",
+        ),
+        (
+            "SELECT 'abs(int, int)'::regprocedure",
+            "function \"abs(int, int)\" does not exist",
+        ),
+        // Variadic and defaulted routines match their declared arguments only.
+        (
+            "SELECT 'concat(text)'::regprocedure",
+            "function \"concat(text)\" does not exist",
+        ),
+        (
+            "SELECT 'nosuch.f(int)'::regprocedure",
+            "function \"nosuch.f(int)\" does not exist",
+        ),
+        (
+            "SELECT 'f(nosuchtype)'::regprocedure",
+            "type \"nosuchtype\" does not exist",
+        ),
+        ("SELECT 'f(int,)'::regprocedure", "expected a type name"),
+        ("SELECT 'f(\"int)'::regprocedure", "improper type name"),
+        ("SELECT 'f(int[)'::regprocedure", "improper type name"),
+        (
+            "SELECT 'f(int'::regprocedure",
+            "expected a right parenthesis",
+        ),
+        ("SELECT 'a..b(int'::regprocedure", "invalid name syntax"),
+        (
+            "SELECT 'f(setof int)'::regprocedure",
+            "invalid type name \"setof int\"",
+        ),
+        (
+            "SELECT 'f(none)'::regprocedure",
+            "syntax error at or near \"none\"",
+        ),
+        (
+            "SELECT 'x.y.f(int)'::regprocedure",
+            "cross-database references are not implemented: x.y.f",
+        ),
+        (
+            "SELECT 'a.b.c.f(int)'::regprocedure",
+            "improper qualified name (too many dotted names): a.b.c.f",
+        ),
+        ("SELECT 'f(int)'::regoperator", "missing argument"),
+        ("SELECT '+(int,int,int)'::regoperator", "too many arguments"),
+        ("SELECT '+()'::regoperator", "too many arguments"),
+        (
+            "SELECT '+(int,text)'::regoperator",
+            "operator does not exist: +(int,text)",
+        ),
+        // No postfix operators.
+        (
+            "SELECT '-(int,none)'::regoperator",
+            "operator does not exist: -(int,none)",
+        ),
+        (
+            "SELECT 'nosuch.+(int,int)'::regoperator",
+            "operator does not exist: nosuch.+(int,int)",
+        ),
+        (
+            "SELECT 'x.y.+(int,int)'::regoperator",
+            "cross-database references are not implemented: x.y.+",
+        ),
+        (
+            "SELECT '+(int,nosuchtype)'::regoperator",
+            "type \"nosuchtype\" does not exist",
+        ),
+    ] {
+        assert_first_line!(db.analyze(sql), msg);
+    }
+    for sql in [
+        "SELECT 'f(int)'::regprocedure AS v",
+        "SELECT 'public.f( integer )'::regprocedure AS v",
+        "SELECT 'p(text)'::regprocedure AS v",
+        "SELECT 'abs(numeric(10,2))'::regprocedure AS v",
+        "SELECT 'count()'::regprocedure AS v",
+        "SELECT 'concat(\"any\")'::regprocedure AS v",
+        "SELECT 'format(text, \"any\")'::regprocedure AS v",
+        "SELECT 'array_cat(anycompatiblearray,anycompatiblearray)'::regprocedure AS v",
+        "SELECT '{f(int),abs(int)}'::regprocedure[] AS v",
+        "SELECT '===(int,int)'::regoperator AS v",
+        "SELECT '+(int4, int4)'::regoperator AS v",
+        "SELECT '-(none,int)'::regoperator AS v",
+        "SELECT '-(NONE,int)'::regoperator AS v",
+        "SELECT 'pg_catalog.||(text,text)'::regoperator AS v",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
+
 /// Every coercion of an untyped literal runs the target's input function —
 /// in COALESCE, a comparison, an INSERT value or an array comparison as in
 /// an explicit cast.

@@ -23,6 +23,51 @@ pub(crate) struct ForeignData {
     /// `(user, server)`.
     user_mappings: Vec<(String, String)>,
     pub(crate) table_servers: std::collections::HashMap<PgClassOid, String>,
+    /// The generic options each object holds (their names; the values
+    /// don't matter until a wrapper validates them).
+    options: std::collections::HashMap<OptionsOwner, Vec<String>>,
+}
+
+/// An object with generic options (`fdwoptions`, `srvoptions`,
+/// `umoptions`, `ftoptions`, `attfdwoptions`).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum OptionsOwner {
+    Wrapper(String),
+    Server(String),
+    /// `(user, server)`.
+    UserMapping(String, String),
+    ForeignTable(PgClassOid),
+    /// A foreign table's column, by attnum.
+    Column(PgClassOid, i16),
+}
+
+impl ForeignData {
+    /// Forget relation `relid`'s options and its columns' (DROP).
+    pub(crate) fn forget_relation(&mut self, relid: PgClassOid) {
+        self.table_servers.remove(&relid);
+        self.options.retain(|owner, _| match owner {
+            OptionsOwner::ForeignTable(r) | OptionsOwner::Column(r, _) => *r != relid,
+            _ => true,
+        });
+    }
+
+    /// Forget column `attnum` of `relid`'s options (DROP COLUMN).
+    pub(crate) fn forget_column(&mut self, relid: PgClassOid, attnum: i16) {
+        self.options.remove(&OptionsOwner::Column(relid, attnum));
+    }
+
+    fn rekey(&mut self, rename: impl Fn(&OptionsOwner) -> Option<OptionsOwner>) {
+        let moved: Vec<(OptionsOwner, OptionsOwner)> = self
+            .options
+            .keys()
+            .filter_map(|k| Some((k.clone(), rename(k)?)))
+            .collect();
+        for (old, new) in moved {
+            if let Some(v) = self.options.remove(&old) {
+                self.options.insert(new, v);
+            }
+        }
+    }
 }
 
 fn fdw_missing(name: &str) -> DdlError {
@@ -106,6 +151,49 @@ fn check_functions(
     Ok(())
 }
 
+/// transformGenericOptions: `options` (an `OPTIONS (...)` list) applied
+/// in order to the ones `owner` holds — a plain or ADD option must be new,
+/// SET and DROP need it to be there — and stored.
+pub(crate) fn apply_generic_options(
+    interp: &mut PgCatalog,
+    owner: OptionsOwner,
+    options: &[typedpg_pg_query::protobuf::Node],
+) -> Result<(), DdlError> {
+    use typedpg_pg_query::protobuf::DefElemAction;
+    let mut result = interp
+        .foreign_data
+        .options
+        .get(&owner)
+        .cloned()
+        .unwrap_or_default();
+    for opt in options {
+        let Some(node::Node::DefElem(de)) = opt.node.as_ref() else {
+            continue;
+        };
+        let name = &de.defname;
+        let found = result.iter().position(|n| n == name);
+        match (DefElemAction::try_from(de.defaction), found) {
+            (Ok(DefElemAction::DefelemDrop), Some(i)) => {
+                result.remove(i);
+            }
+            (Ok(DefElemAction::DefelemSet), Some(_)) => {}
+            (Ok(DefElemAction::DefelemDrop | DefElemAction::DefelemSet), None) => {
+                return Err(DdlError::TypeNotFound(format!(
+                    "option \"{name}\" not found"
+                )));
+            }
+            (_, Some(_)) => {
+                return Err(DdlError::DuplicateObject(format!(
+                    "option \"{name}\" provided more than once"
+                )));
+            }
+            (_, None) => result.push(name.clone()),
+        }
+    }
+    interp.foreign_data.options.insert(owner, result);
+    Ok(())
+}
+
 pub fn create_fdw(interp: &mut PgCatalog, stmt: &CreateFdwStmt) -> Result<(), DdlError> {
     if interp.foreign_data.wrappers.contains(&stmt.fdwname) {
         return Err(DdlError::DuplicateObject(format!(
@@ -114,16 +202,26 @@ pub fn create_fdw(interp: &mut PgCatalog, stmt: &CreateFdwStmt) -> Result<(), Dd
         )));
     }
     check_functions(interp, &stmt.func_options)?;
+    apply_generic_options(
+        interp,
+        OptionsOwner::Wrapper(stmt.fdwname.clone()),
+        &stmt.options,
+    )?;
     interp.foreign_data.wrappers.push(stmt.fdwname.clone());
     Ok(())
 }
 
 pub fn alter_fdw(
-    interp: &PgCatalog,
+    interp: &mut PgCatalog,
     stmt: &typedpg_pg_query::protobuf::AlterFdwStmt,
 ) -> Result<(), DdlError> {
     check_fdw(interp, &stmt.fdwname)?;
-    check_functions(interp, &stmt.func_options)
+    check_functions(interp, &stmt.func_options)?;
+    apply_generic_options(
+        interp,
+        OptionsOwner::Wrapper(stmt.fdwname.clone()),
+        &stmt.options,
+    )
 }
 
 pub fn create_server(
@@ -145,6 +243,11 @@ pub fn create_server(
         )));
     }
     check_fdw(interp, &stmt.fdwname)?;
+    apply_generic_options(
+        interp,
+        OptionsOwner::Server(stmt.servername.clone()),
+        &stmt.options,
+    )?;
     interp
         .foreign_data
         .servers
@@ -153,10 +256,15 @@ pub fn create_server(
 }
 
 pub fn alter_server(
-    interp: &PgCatalog,
+    interp: &mut PgCatalog,
     stmt: &typedpg_pg_query::protobuf::AlterForeignServerStmt,
 ) -> Result<(), DdlError> {
-    check_server(interp, &stmt.servername)
+    check_server(interp, &stmt.servername)?;
+    apply_generic_options(
+        interp,
+        OptionsOwner::Server(stmt.servername.clone()),
+        &stmt.options,
+    )
 }
 
 /// The role a user mapping is for, as PG names it in messages.
@@ -186,12 +294,17 @@ pub fn create_user_mapping(
             stmt.servername
         )));
     }
+    apply_generic_options(
+        interp,
+        OptionsOwner::UserMapping(key.0.clone(), key.1.clone()),
+        &stmt.options,
+    )?;
     interp.foreign_data.user_mappings.push(key);
     Ok(())
 }
 
 pub fn alter_user_mapping(
-    interp: &PgCatalog,
+    interp: &mut PgCatalog,
     stmt: &typedpg_pg_query::protobuf::AlterUserMappingStmt,
 ) -> Result<(), DdlError> {
     check_server(interp, &stmt.servername)?;
@@ -206,7 +319,11 @@ pub fn alter_user_mapping(
             stmt.servername
         )));
     }
-    Ok(())
+    apply_generic_options(
+        interp,
+        OptionsOwner::UserMapping(user, stmt.servername.clone()),
+        &stmt.options,
+    )
 }
 
 pub fn drop_user_mapping(
@@ -223,6 +340,10 @@ pub fn drop_user_mapping(
     let key = (user.clone(), stmt.servername.clone());
     let before = interp.foreign_data.user_mappings.len();
     interp.foreign_data.user_mappings.retain(|m| *m != key);
+    interp
+        .foreign_data
+        .options
+        .remove(&OptionsOwner::UserMapping(key.0.clone(), key.1.clone()));
     if interp.foreign_data.user_mappings.len() == before && !stmt.missing_ok {
         return Err(DdlError::TypeNotFound(format!(
             "user mapping for \"{user}\" does not exist for server \"{}\"",
@@ -314,6 +435,11 @@ pub(crate) fn drop_foreign_object(
     let fd = &mut interp.foreign_data;
     fd.user_mappings.retain(|(_, s)| !servers.contains(s));
     fd.servers.retain(|(s, _)| !servers.contains(s));
+    fd.options.retain(|owner, _| match owner {
+        OptionsOwner::Server(s) | OptionsOwner::UserMapping(_, s) => !servers.contains(s),
+        OptionsOwner::Wrapper(w) => !wrapper || *w != name,
+        _ => true,
+    });
     if wrapper {
         fd.wrappers.retain(|w| *w != name);
     }
@@ -351,6 +477,10 @@ pub(crate) fn rename_foreign_object(
         for (_, w) in fd.servers.iter_mut().filter(|(_, w)| *w == old) {
             w.clone_from(&new);
         }
+        fd.rekey(|k| match k {
+            OptionsOwner::Wrapper(w) if *w == old => Some(OptionsOwner::Wrapper(new.clone())),
+            _ => None,
+        });
     } else {
         if !fd.servers.iter().any(|(s, _)| *s == old) {
             return Err(server_missing(&old));
@@ -369,6 +499,13 @@ pub(crate) fn rename_foreign_object(
         for s in fd.table_servers.values_mut().filter(|s| **s == old) {
             s.clone_from(&new);
         }
+        fd.rekey(|k| match k {
+            OptionsOwner::Server(s) if *s == old => Some(OptionsOwner::Server(new.clone())),
+            OptionsOwner::UserMapping(u, s) if *s == old => {
+                Some(OptionsOwner::UserMapping(u.clone(), new.clone()))
+            }
+            _ => None,
+        });
     }
     Ok(())
 }

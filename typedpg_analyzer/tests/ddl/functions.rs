@@ -79,6 +79,125 @@ fn create_function_variadic_non_array_is_rejected() {
     );
 }
 
+#[test]
+fn functions_in_pg_temp() {
+    // PG 18 QualifiedNameGetCreationNamespace: `pg_temp` names the session's
+    // temporary schema, created on first use. FuncnameGetCandidates (and
+    // OpernameGetCandidates) never search it implicitly, even when the path
+    // lists it: a temporary routine or operator is reached by its qualified
+    // name only.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE FUNCTION pg_temp.whoami() RETURNS text AS 'select 1::text' LANGUAGE sql;
+         CREATE AGGREGATE pg_temp.ag(int) (sfunc = int4pl, stype = int);
+         SELECT pg_temp.whoami(), pg_temp.ag(1);
+         CREATE TEMP TABLE tt (a int);
+         CREATE FUNCTION pg_temp.f(tt) RETURNS int AS 'select 1' LANGUAGE sql;
+         DROP FUNCTION pg_temp.whoami();
+         CREATE FUNCTION pg_temp.eqx(int, int) RETURNS bool LANGUAGE sql AS 'select $1 = $2';
+         CREATE OPERATOR pg_temp.=== (leftarg = int, rightarg = int, function = pg_temp.eqx);
+         SET search_path = pg_temp, public;
+         SELECT 1 OPERATOR(pg_temp.===) 1;
+         SELECT 'pg_temp.eqx(int, int)'::regprocedure, 'pg_temp.===(int,int)'::regoperator,
+                'pg_temp.eqx'::regproc, 'pg_temp.==='::regoper;
+         ALTER FUNCTION pg_temp.eqx(int, int) STABLE;
+         DROP OPERATOR pg_temp.=== (int, int);",
+    )]);
+    for (stmt, msg) in [
+        (
+            "CREATE FUNCTION pg_temp.whoami() RETURNS text AS 'select 1::text' LANGUAGE sql;
+             SELECT whoami();",
+            "function whoami() does not exist",
+        ),
+        (
+            "CREATE FUNCTION pg_temp.whoami() RETURNS text AS 'select 1::text' LANGUAGE sql;
+             DROP FUNCTION whoami();",
+            "function whoami() does not exist",
+        ),
+        // Not even with `pg_temp` listed on the search path.
+        (
+            "CREATE FUNCTION pg_temp.whoami() RETURNS text AS 'select 1::text' LANGUAGE sql;
+             SET search_path = pg_temp, public;
+             SELECT whoami();",
+            "function whoami() does not exist",
+        ),
+        (
+            "CREATE FUNCTION pg_temp.whoami() RETURNS text AS 'select 1::text' LANGUAGE sql;
+             SET search_path = pg_temp, public;
+             ALTER FUNCTION whoami() STABLE;",
+            "function whoami() does not exist",
+        ),
+        // CREATE TRIGGER's LookupFuncName.
+        (
+            "CREATE TABLE t (a int);
+             CREATE FUNCTION pg_temp.tf() RETURNS trigger LANGUAGE plpgsql
+                 AS 'begin return new; end';
+             SET search_path = pg_temp, public;
+             CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION tf();",
+            "function tf() does not exist",
+        ),
+        // Operators likewise (OpernameGetCandidates).
+        (
+            "CREATE FUNCTION pg_temp.eqx(int, int) RETURNS bool LANGUAGE sql AS 'select $1 = $2';
+             CREATE OPERATOR pg_temp.=== (leftarg = int, rightarg = int, function = pg_temp.eqx);
+             SELECT 1 === 1;",
+            "operator does not exist: integer === integer",
+        ),
+        (
+            "CREATE FUNCTION pg_temp.eqx(int, int) RETURNS bool LANGUAGE sql AS 'select $1 = $2';
+             CREATE OPERATOR pg_temp.=== (leftarg = int, rightarg = int, function = pg_temp.eqx);
+             SET search_path = pg_temp, public;
+             SELECT 1 === 1;",
+            "operator does not exist: integer === integer",
+        ),
+        (
+            "CREATE FUNCTION pg_temp.eqx(int, int) RETURNS bool LANGUAGE sql AS 'select $1 = $2';
+             CREATE OPERATOR pg_temp.=== (leftarg = int, rightarg = int, function = pg_temp.eqx);
+             SET search_path = pg_temp, public;
+             DROP OPERATOR === (int, int);",
+            "operator does not exist: integer === integer",
+        ),
+        // The reg* inputs look routines and operators up the same way
+        // (regprocedurein, regoperatorin, regprocin, regoperin).
+        (
+            "CREATE FUNCTION pg_temp.eqx(int, int) RETURNS bool LANGUAGE sql AS 'select $1 = $2';
+             CREATE OPERATOR pg_temp.=== (leftarg = int, rightarg = int, function = pg_temp.eqx);
+             SET search_path = pg_temp, public;
+             SELECT '===(int,int)'::regoperator;",
+            "operator does not exist: ===(int,int)",
+        ),
+        (
+            "CREATE FUNCTION pg_temp.eqx(int, int) RETURNS bool LANGUAGE sql AS 'select $1 = $2';
+             CREATE OPERATOR pg_temp.=== (leftarg = int, rightarg = int, function = pg_temp.eqx);
+             SET search_path = pg_temp, public;
+             SELECT '==='::regoper;",
+            "operator does not exist: ===",
+        ),
+        (
+            "CREATE FUNCTION pg_temp.whoami() RETURNS text AS 'select 1::text' LANGUAGE sql;
+             SET search_path = pg_temp, public;
+             SELECT 'whoami()'::regprocedure;",
+            "function \"whoami()\" does not exist",
+        ),
+        (
+            "CREATE FUNCTION pg_temp.whoami() RETURNS text AS 'select 1::text' LANGUAGE sql;
+             SET search_path = pg_temp, public;
+             SELECT 'whoami'::regproc;",
+            "function \"whoami\" does not exist",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    // The application's sessions have no temporary schema.
+    let err = db.analyze("SELECT pg_temp.ag(1)").unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("schema \"pg_temp\" does not exist"),
+        "got: {err}"
+    );
+}
+
 // ── CREATE / DROP AGGREGATE ─────────────────────────────────────────────────
 
 #[test]
@@ -689,6 +808,62 @@ fn a_routines_own_settings_apply_to_its_validation() {
         let err = try_apply(&[("0001.sql", SCHEMA), ("0002.sql", sql)]).expect_err(sql);
         assert!(err.to_string().starts_with(msg), "{sql}\n  got: {err}");
     }
+}
+
+#[test]
+fn sql_function_bodies_are_not_executed() {
+    // PG 18 fmgr_sql_validator only parses and analyzes the body: what
+    // would fail every call is accepted at CREATE FUNCTION.
+    build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int NOT NULL, b int);
+         CREATE DOMAIN d AS int NOT NULL;
+         CREATE MATERIALIZED VIEW mv AS SELECT 1 AS a;
+         CREATE FUNCTION f1() RETURNS void LANGUAGE sql AS 'insert into t values (NULL, 3)';
+         CREATE FUNCTION f2() RETURNS void LANGUAGE sql BEGIN ATOMIC UPDATE t SET a = NULL; END;
+         CREATE FUNCTION f3() RETURNS d LANGUAGE sql BEGIN ATOMIC SELECT NULL::d; END;
+         CREATE FUNCTION f4() RETURNS int[] LANGUAGE sql AS 'SELECT ARRAY[ARRAY[1], NULL]';
+         CREATE FUNCTION f5() RETURNS void LANGUAGE sql BEGIN ATOMIC INSERT INTO mv VALUES (1); END;
+         CREATE FUNCTION f6() RETURNS void LANGUAGE sql BEGIN ATOMIC INSERT INTO t VALUES (NULL::d, 1); END;
+         CREATE FUNCTION f7() RETURNS void LANGUAGE sql AS 'INSERT INTO t (b) VALUES (NULL::d)';",
+    )]);
+}
+
+#[test]
+fn window_frame_offsets_may_use_function_parameters() {
+    // PG 18 transformFrameOffset: a frame offset may not reference the
+    // query's variables, but a SQL function's parameter is a Param, not a
+    // Var, so it is a valid offset.
+    build_db(&[(
+        "0001.sql",
+        "CREATE TABLE tenk (u int);
+         CREATE FUNCTION wf(x int) RETURNS TABLE (a bigint) LANGUAGE sql
+         BEGIN ATOMIC
+             SELECT sum(u) OVER (ROWS BETWEEN x PRECEDING AND x FOLLOWING) FROM tenk;
+         END;
+         CREATE FUNCTION wg(x int) RETURNS SETOF bigint LANGUAGE sql BEGIN ATOMIC
+             SELECT sum(1) OVER w FROM tenk
+             WINDOW w AS (ORDER BY u GROUPS BETWEEN x PRECEDING AND x + 1 FOLLOWING);
+         END;
+         CREATE FUNCTION wr(x int) RETURNS SETOF bigint LANGUAGE sql BEGIN ATOMIC
+             SELECT sum(1) OVER (ORDER BY u RANGE BETWEEN wr.x PRECEDING AND CURRENT ROW)
+             FROM tenk;
+         END;",
+    )]);
+    // A column of the query is a Var, even where a parameter has its name.
+    let err = try_apply(&[(
+        "0001.sql",
+        "CREATE TABLE tenk (u int);
+         CREATE FUNCTION wf(u int) RETURNS SETOF bigint LANGUAGE sql BEGIN ATOMIC
+             SELECT sum(1) OVER (ROWS BETWEEN u PRECEDING AND CURRENT ROW) FROM tenk;
+         END;",
+    )])
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("argument of ROWS must not contain variables"),
+        "got: {err}"
+    );
 }
 
 #[test]
@@ -1450,6 +1625,60 @@ fn create_aggregate_resolves_its_final_function_like_a_call() {
     assert_eq!(q.columns[1].pg_type, int4());
     assert_eq!(q.columns[2].pg_type, int4());
     assert_eq!(q.columns[3].pg_type, int4());
+}
+
+#[test]
+fn old_style_polymorphic_aggregate() {
+    // PG 18 DefineAggregate: the old syntax's BASETYPE = anyelement makes a
+    // polymorphic aggregate like `(anyelement)` would.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE FUNCTION tfp(anyarray, anyelement) RETURNS anyarray AS 'select $1 || $2' LANGUAGE sql;
+         CREATE FUNCTION ffp(anyarray) RETURNS anyarray AS 'select $1' LANGUAGE sql;
+         CREATE AGGREGATE myaggp20a(BASETYPE = anyelement, SFUNC = tfp,
+             STYPE = anyarray, FINALFUNC = ffp, INITCOND = '{}');",
+    )]);
+    let q = db
+        .analyze("SELECT myaggp20a(x) FROM generate_series(1,3) x")
+        .unwrap();
+    assert_eq!(q.columns[0].pg_type, array_of(int4()));
+    // The same with the new syntax, and with the anycompatible family.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE FUNCTION tfp(anyarray, anyelement) RETURNS anyarray AS 'select $1 || $2' LANGUAGE sql;
+         CREATE AGGREGATE a2(anyelement) (SFUNC = tfp, STYPE = anyarray, INITCOND = '{}');
+         CREATE FUNCTION tfc(anycompatiblearray, anycompatible) RETURNS anycompatiblearray
+             AS 'select $1 || $2' LANGUAGE sql;
+         CREATE AGGREGATE ac(anycompatible) (SFUNC = tfc, STYPE = anycompatiblearray, INITCOND = '{}');
+         CREATE FUNCTION tf2(int[], anyelement) RETURNS int[] AS 'select $1' LANGUAGE sql;
+         CREATE AGGREGATE a3(anyelement) (SFUNC = tf2, STYPE = int[]);",
+    )]);
+    let q = db
+        .analyze("SELECT a2('x'::text) AS a, ac(1.5) AS b, a3('x'::text) AS c")
+        .unwrap();
+    assert_eq!(q.columns[0].pg_type, array_of(text()));
+    assert_eq!(q.columns[1].pg_type, array_of(numeric()));
+    assert_eq!(q.columns[2].pg_type, array_of(int4()));
+    // lookup_agg_function: a polymorphic input binds nothing, but a
+    // concrete one still has to agree with it.
+    let tfp = "CREATE FUNCTION tfp(anyarray, anyelement) RETURNS anyarray AS 'select $1 || $2' LANGUAGE sql;";
+    for (stmt, msg) in [
+        (
+            "CREATE AGGREGATE x(BASETYPE = int, SFUNC = tfp, STYPE = anyarray);",
+            "cannot determine transition data type",
+        ),
+        (
+            "CREATE AGGREGATE x(BASETYPE = anyelement, SFUNC = tfp, STYPE = int[]);",
+            "function tfp(integer[], anyelement) does not exist",
+        ),
+        (
+            "CREATE AGGREGATE x(anyelement) (SFUNC = tfp, STYPE = anyelement);",
+            "function tfp(anyelement, anyelement) does not exist",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", tfp), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
 }
 
 #[test]

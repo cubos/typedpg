@@ -23,6 +23,7 @@ use typedpg_pg_query::protobuf::{
 
 use super::DdlError;
 use super::reloptions::parse_bool;
+use crate::error::AnalyzeError;
 use crate::pg_catalog::PgCatalog;
 
 /// PG 18's predefined roles (`pg_authid` rows every cluster has). Any other
@@ -737,20 +738,24 @@ fn split_identifier_string(value: &str) -> Vec<String> {
 }
 
 /// `EXPLAIN [(options)] statement` (ExplainQuery): the options are
-/// validated (ParseExplainOptionList), then the statement is analyzed —
-/// and with ANALYZE, run.
+/// validated (ParseExplainOptionList), then the statement is analyzed and
+/// planned — and with ANALYZE, run (without, only its executor is
+/// started: see [`crate::resolve::planned_only`]).
 pub(crate) fn explain(
     interp: &mut PgCatalog,
     stmt: &typedpg_pg_query::protobuf::ExplainStmt,
 ) -> Result<(), DdlError> {
-    let analyze = check_explain_options(&stmt.options)?;
+    let analyze = explain_options(&stmt.options)
+        .map_err(|e| DdlError::Parse(e.to_string()))?
+        .analyze;
     let Some(query) = stmt.query.as_deref().and_then(|q| q.node.as_ref()) else {
         return Ok(());
     };
     if analyze {
         return super::apply_statement(interp, query);
     }
-    match query {
+    let interp = &*interp;
+    crate::resolve::planned_only(|| match query {
         node::Node::ExecuteStmt(e) => super::prepared::execute(interp, e),
         node::Node::CreateTableAsStmt(ctas) => {
             match ctas.query.as_deref().and_then(|q| q.node.as_ref()) {
@@ -762,7 +767,7 @@ pub(crate) fn explain(
         }
         node::Node::DeclareCursorStmt(d) => declare_cursor(interp, d),
         _ => super::dml::check_statement(interp, query),
-    }
+    })
 }
 
 /// `DECLARE name CURSOR FOR query`: the query is analyzed
@@ -894,9 +899,23 @@ fn first_lockable(item: &typedpg_pg_query::protobuf::Node, ctes: &[&str]) -> Opt
     }
 }
 
-/// ParseExplainOptionList; returns ANALYZE.
-fn check_explain_options(options: &[typedpg_pg_query::protobuf::Node]) -> Result<bool, DdlError> {
-    let boolean = |de: &typedpg_pg_query::protobuf::DefElem| -> Result<bool, DdlError> {
+/// What an EXPLAIN's options select.
+pub(crate) struct ExplainOptions {
+    /// ANALYZE: the statement is run.
+    pub(crate) analyze: bool,
+    /// The type of the `QUERY PLAN` column (ExplainResultDesc): `json`
+    /// for FORMAT JSON, `xml` for FORMAT XML, `text` otherwise.
+    pub(crate) result_type: crate::PgTypeOid,
+}
+
+/// ParseExplainOptionList, for a migration's EXPLAIN and a query's alike.
+/// An option the grammar of options rejects is a `syntax_error` (an
+/// unknown one, defGetBoolean), a value or combination it doesn't take an
+/// `invalid_parameter_value`.
+pub(crate) fn explain_options(
+    options: &[typedpg_pg_query::protobuf::Node],
+) -> Result<ExplainOptions, AnalyzeError> {
+    let boolean = |de: &typedpg_pg_query::protobuf::DefElem| -> Result<bool, AnalyzeError> {
         let value = match de.arg.as_deref().and_then(|a| a.node.as_ref()) {
             None => return Ok(true),
             Some(node::Node::Integer(i)) => match i.ival {
@@ -911,10 +930,13 @@ fn check_explain_options(options: &[typedpg_pg_query::protobuf::Node]) -> Result
                 _ => None,
             },
         };
-        value.ok_or_else(|| DdlError::Parse(format!("{} requires a Boolean value", de.defname)))
+        value.ok_or_else(|| {
+            AnalyzeError::SyntaxError(format!("{} requires a Boolean value", de.defname))
+        })
     };
     let (mut analyze, mut wal, mut generic) = (false, false, false);
     let (mut timing, mut serialize) = (None, false);
+    let mut result_type = crate::pg_catalog::oid::TEXT;
     for opt in options {
         let Some(node::Node::DefElem(de)) = opt.node.as_ref() else {
             continue;
@@ -939,7 +961,7 @@ fn check_explain_options(options: &[typedpg_pg_query::protobuf::Node]) -> Result
                     Some(v) if v == "off" || v == "none" => false,
                     Some(v) if v == "text" || v == "binary" => true,
                     Some(v) => {
-                        return Err(DdlError::Parse(format!(
+                        return Err(AnalyzeError::Invalid(format!(
                             "unrecognized value for EXPLAIN option \"serialize\": \"{v}\""
                         )));
                     }
@@ -947,21 +969,26 @@ fn check_explain_options(options: &[typedpg_pg_query::protobuf::Node]) -> Result
             }
             "format" => {
                 let v = text().unwrap_or_default();
-                if !matches!(v.as_str(), "text" | "xml" | "json" | "yaml") {
-                    return Err(DdlError::Parse(format!(
-                        "unrecognized value for EXPLAIN option \"format\": \"{v}\""
-                    )));
-                }
+                result_type = match v.as_str() {
+                    "text" | "yaml" => crate::pg_catalog::oid::TEXT,
+                    "json" => crate::PgTypeOid::from_raw(114),
+                    "xml" => crate::PgTypeOid::from_raw(142),
+                    _ => {
+                        return Err(AnalyzeError::Invalid(format!(
+                            "unrecognized value for EXPLAIN option \"format\": \"{v}\""
+                        )));
+                    }
+                };
             }
             other => {
-                return Err(DdlError::Parse(format!(
+                return Err(AnalyzeError::SyntaxError(format!(
                     "unrecognized EXPLAIN option \"{other}\""
                 )));
             }
         }
     }
     let requires_analyze = |option: &str| {
-        Err(DdlError::Parse(format!(
+        Err(AnalyzeError::Invalid(format!(
             "EXPLAIN option {option} requires ANALYZE"
         )))
     };
@@ -975,11 +1002,14 @@ fn check_explain_options(options: &[typedpg_pg_query::protobuf::Node]) -> Result
         return requires_analyze("SERIALIZE");
     }
     if generic && analyze {
-        return Err(DdlError::Parse(
+        return Err(AnalyzeError::Invalid(
             "EXPLAIN options ANALYZE and GENERIC_PLAN cannot be used together".into(),
         ));
     }
-    Ok(analyze)
+    Ok(ExplainOptions {
+        analyze,
+        result_type,
+    })
 }
 
 /// defGetString of an option value.

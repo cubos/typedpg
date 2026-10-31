@@ -1066,14 +1066,14 @@ fn analyze_raw_node_once(
             let sel = select_into.as_ref().expect("guarded by the match arm");
             let (_, p) = analyze_select(sel, snapshot, &mut params)?;
             expr::resolve_untyped_output_params(sel, snapshot, &mut params)?;
-            check_null_domain_casts(sel, snapshot)?;
+            failing_rows::check_null_domain_casts(sel, snapshot)?;
             (Vec::new(), p)
         }
         node::Node::SelectStmt(sel) => {
             let r = analyze_select(sel, snapshot, &mut params)?;
             // The statement-level `resolveTargetListUnknowns`.
             expr::resolve_untyped_output_params(sel, snapshot, &mut params)?;
-            check_null_domain_casts(sel, snapshot)?;
+            failing_rows::check_null_domain_casts(sel, snapshot)?;
             r
         }
         node::Node::InsertStmt(ins) => analyze_insert(ins, snapshot, &mut params)?,
@@ -1083,45 +1083,67 @@ fn analyze_raw_node_once(
         node::Node::CallStmt(call) => analyze_call(call, snapshot, &mut params)?,
         // `EXPLAIN <query>` — recurse into the wrapped statement so its
         // parameters are harvested into the outer `ParamCollector`, then
-        // replace the column list with PG's fixed `QUERY PLAN` row
-        // description (single text column, never NULL — even an empty
-        // plan emits at least one row).
+        // replace the column list with PG's `QUERY PLAN` row description
+        // (ExplainResultDesc: a single column, of the type FORMAT picks,
+        // never NULL — even an empty plan emits at least one row).
         node::Node::ExplainStmt(es) => {
             let inner = es
                 .query
                 .as_deref()
                 .and_then(|q| q.node.as_ref())
                 .ok_or_else(|| AnalyzeError::Unsupported("EXPLAIN with no inner query".into()))?;
+            // ExplainQuery: the options first. Without ANALYZE the
+            // statement is planned and its executor started, never run, so
+            // the errors only evaluating its rows raises are not reported.
+            let options = crate::ddl::session::explain_options(&es.options)?;
             // Dispatch into the same per-stmt analyzers we use at the top
             // level so the params collector stays shared (calling
             // `analyze_raw_node` recursively would allocate a fresh
             // collector and the outer call would see zero params).
-            let _ = match inner {
-                // transformExplainStmt runs transformOptionalSelectInto too.
-                node::Node::SelectStmt(sel) => match without_top_level_into(sel) {
-                    Some(sel) => analyze_select(&sel, snapshot, &mut params)?,
-                    None => analyze_select(sel, snapshot, &mut params)?,
-                },
-                node::Node::InsertStmt(ins) => analyze_insert(ins, snapshot, &mut params)?,
-                node::Node::UpdateStmt(upd) => analyze_update(upd, snapshot, &mut params)?,
-                node::Node::DeleteStmt(del) => analyze_delete(del, snapshot, &mut params)?,
-                node::Node::MergeStmt(merge) => analyze_merge(merge, snapshot, &mut params)?,
-                _ => {
-                    return Err(crate::error::RawError::unsupported(
-                        format!(
-                            "typedpg does not support EXPLAIN of {} yet",
-                            crate::error::statement_name(inner)
-                        ),
-                        crate::error::statement_span(),
-                        None,
-                    )
-                    .finalize_implicit());
+            let mut analyze_inner = || -> Result<(), AnalyzeError> {
+                match inner {
+                    // transformExplainStmt runs transformOptionalSelectInto too.
+                    node::Node::SelectStmt(sel) => {
+                        let stripped = without_top_level_into(sel);
+                        let sel = stripped.as_ref().unwrap_or(sel);
+                        analyze_select(sel, snapshot, &mut params)?;
+                        failing_rows::check_null_domain_casts(sel, snapshot)?;
+                    }
+                    node::Node::InsertStmt(ins) => {
+                        analyze_insert(ins, snapshot, &mut params)?;
+                    }
+                    node::Node::UpdateStmt(upd) => {
+                        analyze_update(upd, snapshot, &mut params)?;
+                    }
+                    node::Node::DeleteStmt(del) => {
+                        analyze_delete(del, snapshot, &mut params)?;
+                    }
+                    node::Node::MergeStmt(merge) => {
+                        analyze_merge(merge, snapshot, &mut params)?;
+                    }
+                    _ => {
+                        return Err(crate::error::RawError::unsupported(
+                            format!(
+                                "typedpg does not support EXPLAIN of {} yet",
+                                crate::error::statement_name(inner)
+                            ),
+                            crate::error::statement_span(),
+                            None,
+                        )
+                        .finalize_implicit());
+                    }
                 }
+                Ok(())
             };
+            if options.analyze {
+                analyze_inner()?;
+            } else {
+                planned_only(analyze_inner)?;
+            }
             (
                 vec![RawColumn {
                     name: "QUERY PLAN".to_owned(),
-                    type_oid: oid::TEXT,
+                    type_oid: options.result_type,
                     nullable: false,
                     typmod: None,
                     collation: None,
@@ -1481,67 +1503,98 @@ fn rename_column_refs(
         .unwrap_or_default()
 }
 
-/// A NULL cast to a domain that rejects it (`SELECT NULL::d` of a NOT NULL
-/// domain, `CAST(NULL AS d)` of one with `CHECK (VALUE IS NOT NULL)`) where
-/// every execution evaluates it: a select list with no FROM, WHERE,
-/// grouping or LIMIT (one row), or a VALUES row — of the statement itself,
-/// or of an arm of its set operation. The coercion fails when evaluated
-/// (`ExecEvalConstraintNotNull` / `ExecEvalConstraintCheck`), naming the
-/// domain cast to.
-fn check_null_domain_casts(
-    sel: &protobuf::SelectStmt,
-    snapshot: &PgCatalog,
-) -> Result<(), AnalyzeError> {
-    if sel.limit_count.is_some() || sel.limit_offset.is_some() {
-        return Ok(());
+/// How the statement being analyzed is run, for the errors only its
+/// execution raises.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Execution {
+    /// It runs, under the session's `search_path`.
+    Runs,
+    /// It runs under the `search_path` RestrictSearchPath sets
+    /// (`pg_catalog, pg_temp`): a materialized view's query, filled at
+    /// CREATE MATERIALIZED VIEW or REFRESH. Names were resolved before, so
+    /// only the messages execution raises render names differently.
+    RunsRestricted,
+    /// It is planned and its executor started, but no row is evaluated:
+    /// plain EXPLAIN (see [`planned_only`]).
+    Planned,
+    /// It is parsed and analyzed but not run (see [`without_execution`]).
+    NotRun,
+}
+
+thread_local! {
+    static EXECUTION: std::cell::Cell<Execution> = const { std::cell::Cell::new(Execution::Runs) };
+}
+
+/// Restores the execution mode a [`with_execution`] replaced, even when
+/// the analysis unwinds.
+struct ExecutionGuard(Execution);
+
+impl Drop for ExecutionGuard {
+    fn drop(&mut self) {
+        EXECUTION.with(|c| c.set(self.0));
     }
-    if sel.op != protobuf::SetOperation::SetopNone as i32 {
-        for arm in [&sel.larg, &sel.rarg].into_iter().flatten() {
-            check_null_domain_casts(arm, snapshot)?;
-        }
-        return Ok(());
-    }
-    let null_cast = |n: &protobuf::Node| -> Option<String> {
-        let Some(node::Node::TypeCast(tc)) = n.node.as_ref() else {
-            return None;
-        };
-        if !matches!(
-            tc.arg.as_deref().and_then(|a| a.node.as_ref()),
-            Some(node::Node::AConst(c)) if c.isnull
-        ) {
-            return None;
-        }
-        let target = crate::ddl::util::resolve_type_name(tc.type_name.as_ref()?, snapshot)?;
-        snapshot.domain_null_violation(target)
+}
+
+fn with_execution<R>(mode: Execution, f: impl FnOnce() -> R) -> R {
+    let _guard = ExecutionGuard(EXECUTION.with(|c| c.replace(mode)));
+    f()
+}
+
+/// Run `f` analyzing a statement PG parses and analyzes but doesn't run —
+/// a rule's action (transformRuleStmt), a SQL function's body
+/// (fmgr_sql_validator), a view's query (DefineView), a prepared
+/// statement (PrepareQuery), a CREATE TABLE AS / materialized view
+/// `WITH NO DATA`: the errors only its execution raises, however certain
+/// (a NULL stored into a NOT NULL column or domain, a NULL cast to a NOT
+/// NULL domain, sub-arrays that can't agree, a result relation the
+/// executor can't change), are not reported.
+pub(crate) fn without_execution<R>(f: impl FnOnce() -> R) -> R {
+    with_execution(Execution::NotRun, f)
+}
+
+/// Run `f` analyzing a materialized view's query that is run to fill it:
+/// RefreshMatViewByOid and ExecCreateTableAs restrict `search_path` to
+/// `pg_catalog, pg_temp` while it runs, so the names its execution errors
+/// print are qualified unless visible there.
+pub(crate) fn with_restricted_execution<R>(f: impl FnOnce() -> R) -> R {
+    with_execution(Execution::RunsRestricted, f)
+}
+
+/// Run `f` analyzing a statement PG plans and starts the executor for,
+/// but doesn't run: EXPLAIN without ANALYZE (ExplainOnePlan calls
+/// ExecutorStart, never ExecutorRun). The errors ExecutorStart raises (a
+/// result relation the executor can't change, CheckValidResultRel) are
+/// reported; the ones only evaluating a row raises (a NULL stored into a
+/// NOT NULL column or domain, a NULL cast to a NOT NULL domain,
+/// sub-arrays that can't agree — unless the planner folds them, which
+/// isn't followed) are not. Inside a statement that isn't run, nothing is.
+pub(crate) fn planned_only<R>(f: impl FnOnce() -> R) -> R {
+    let mode = match EXECUTION.with(std::cell::Cell::get) {
+        Execution::NotRun => Execution::NotRun,
+        _ => Execution::Planned,
     };
-    let cells: Vec<&protobuf::Node> = if !sel.values_lists.is_empty() {
-        sel.values_lists
-            .iter()
-            .filter_map(|row| match row.node.as_ref() {
-                Some(node::Node::List(l)) => Some(l.items.iter()),
-                _ => None,
-            })
-            .flatten()
-            .collect()
-    } else if sel.from_clause.is_empty()
-        && sel.where_clause.is_none()
-        && sel.group_clause.is_empty()
-        && sel.having_clause.is_none()
-    {
-        sel.target_list
-            .iter()
-            .filter_map(|t| match t.node.as_ref() {
-                Some(node::Node::ResTarget(rt)) => rt.val.as_deref(),
-                _ => None,
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-    match cells.into_iter().find_map(null_cast) {
-        Some(msg) => Err(AnalyzeError::Invalid(msg)),
-        None => Ok(()),
-    }
+    with_execution(mode, f)
+}
+
+/// Whether the statement being analyzed runs (see [`without_execution`],
+/// [`planned_only`]).
+pub(crate) fn executes() -> bool {
+    matches!(
+        EXECUTION.with(std::cell::Cell::get),
+        Execution::Runs | Execution::RunsRestricted
+    )
+}
+
+/// Whether the executor is started for the statement being analyzed, even
+/// if no row is evaluated (see [`planned_only`]).
+pub(crate) fn executor_starts() -> bool {
+    EXECUTION.with(std::cell::Cell::get) != Execution::NotRun
+}
+
+/// Whether the statement being analyzed runs under the restricted
+/// `search_path` (see [`with_restricted_execution`]).
+pub(crate) fn execution_search_path_restricted() -> bool {
+    EXECUTION.with(std::cell::Cell::get) == Execution::RunsRestricted
 }
 
 /// If assigning a literal `NULL` to `tc` would violate a NOT-NULL guarantee
@@ -1564,6 +1617,9 @@ fn null_assignment_error(
     table_relname: &str,
     op: &'static str,
 ) -> Option<AnalyzeError> {
+    if !executes() {
+        return None;
+    }
     let event = if op == "insert" {
         DmlEvent::Insert
     } else {
@@ -1576,7 +1632,7 @@ fn null_assignment_error(
     }
     // Coerced to the column's type as the row is built: a NOT NULL domain
     // (or one with a CHECK a NULL fails) rejects it.
-    if let Some(msg) = snapshot.domain_null_violation(tc.atttypid) {
+    if let Some(msg) = snapshot.domain_null_violation_at_execution(tc.atttypid) {
         return Some(AnalyzeError::Invalid(msg));
     }
     // A view's columns carry no NOT NULL of their own (their inferred
@@ -1669,6 +1725,7 @@ mod call;
 mod copy_in;
 mod cte;
 mod dml;
+mod failing_rows;
 mod from;
 mod merge;
 mod predtest;

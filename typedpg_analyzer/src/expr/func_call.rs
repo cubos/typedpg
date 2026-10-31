@@ -1813,10 +1813,21 @@ fn transform_window_def(
                 )?;
             }
         }
-        if contains_column_ref(offset) {
+        // checkExprIsVarFree: only a Var of this query level counts — a
+        // SQL function's parameter or an outer reference is fine.
+        let mut var: Option<&protobuf::Node> = None;
+        crate::resolve::visit_same_level(offset, &mut |e| {
+            if var.is_none()
+                && let Some(node::Node::ColumnRef(cr)) = e.node.as_ref()
+                && crate::resolve::references_local_column(cr, ctx.scope)
+            {
+                var = Some(e);
+            }
+        });
+        if let Some(var) = var {
             return fail(pgmsg::frame_offset_has_variables(
                 construct,
-                crate::error::node_location(offset)
+                crate::error::node_location(var)
                     .and_then(crate::error::SourceSpan::from_node_qname),
             ));
         }
@@ -1891,34 +1902,6 @@ fn in_range_offset_type(
             )
         }
         Some(t) => Ok(t),
-    }
-}
-
-/// Whether an expression references a column of the current query (PG's
-/// `contain_vars_of_level(…, 0)` as used by `checkExprIsVarFree`).
-/// Subqueries are not descended into.
-fn contains_column_ref(node: &protobuf::Node) -> bool {
-    let Some(inner) = node.node.as_ref() else {
-        return false;
-    };
-    let any = |nodes: &[protobuf::Node]| nodes.iter().any(contains_column_ref);
-    let opt = |n: &Option<Box<protobuf::Node>>| n.as_deref().is_some_and(contains_column_ref);
-    match inner {
-        node::Node::ColumnRef(_) => true,
-        node::Node::AExpr(e) => opt(&e.lexpr) || opt(&e.rexpr),
-        node::Node::FuncCall(f) => any(&f.args),
-        node::Node::TypeCast(c) => opt(&c.arg),
-        node::Node::BoolExpr(b) => any(&b.args),
-        node::Node::CoalesceExpr(c) => any(&c.args),
-        node::Node::MinMaxExpr(m) => any(&m.args),
-        node::Node::NullTest(t) => opt(&t.arg),
-        node::Node::CaseExpr(c) => opt(&c.arg) || any(&c.args) || opt(&c.defresult),
-        node::Node::CaseWhen(w) => opt(&w.expr) || opt(&w.result),
-        node::Node::AArrayExpr(a) => any(&a.elements),
-        node::Node::RowExpr(r) => any(&r.args),
-        node::Node::AIndirection(i) => opt(&i.arg),
-        node::Node::List(l) => any(&l.items),
-        _ => false,
     }
 }
 

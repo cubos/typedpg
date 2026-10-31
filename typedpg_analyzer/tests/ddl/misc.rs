@@ -269,6 +269,31 @@ fn comment_on_requires_an_existing_target() {
             "COMMENT ON FUNCTION nosuch(int) IS 'x';",
             "function nosuch(integer) does not exist",
         ),
+        // get_object_address looks routines up with LookupFuncWithArgs.
+        (
+            "COMMENT ON AGGREGATE nosuchagg (*) IS 'x';",
+            "aggregate nosuchagg(*) does not exist",
+        ),
+        (
+            "COMMENT ON AGGREGATE count (int) IS 'x';",
+            "aggregate count(integer) does not exist",
+        ),
+        (
+            "COMMENT ON AGGREGATE abs (int) IS 'x';",
+            "function abs(integer) is not an aggregate",
+        ),
+        (
+            "COMMENT ON PROCEDURE abs (int) IS 'x';",
+            "abs(integer) is not a procedure",
+        ),
+        (
+            "COMMENT ON FUNCTION nosuch(nosuchtype) IS 'x';",
+            "type \"nosuchtype\" does not exist",
+        ),
+        (
+            "COMMENT ON FUNCTION nosuchf IS 'x';",
+            "could not find a function named \"nosuchf\"",
+        ),
         (
             "COMMENT ON SCHEMA nosuch IS 'x';",
             "schema \"nosuch\" does not exist",
@@ -292,7 +317,9 @@ fn comment_on_requires_an_existing_target() {
          COMMENT ON TABLE t IS 'x';
          COMMENT ON COLUMN t.a IS NULL;
          COMMENT ON CONSTRAINT t_pkey ON t IS 'pk';
-         COMMENT ON SCHEMA public IS 'p';",
+         COMMENT ON SCHEMA public IS 'p';
+         COMMENT ON AGGREGATE count(*) IS 'c';
+         COMMENT ON FUNCTION abs(int) IS 'a';",
     )]);
 }
 
@@ -2184,6 +2211,524 @@ fn rule_returning_lists_and_the_return_rule_are_validated() {
 }
 
 #[test]
+fn a_rule_action_is_not_executed_at_create_rule() {
+    // PG 18 transformRuleStmt only parses and analyzes the actions: a
+    // literal NULL written into a NOT NULL column fails when the rule
+    // fires, not when it is created.
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int NOT NULL, b int);
+         CREATE VIEW vv AS SELECT a FROM t;
+         CREATE RULE r1 AS ON INSERT TO vv DO INSTEAD INSERT INTO t VALUES (NULL, 3) RETURNING b;
+         CREATE RULE r2 AS ON UPDATE TO vv DO INSTEAD UPDATE t SET a = NULL;
+         CREATE DOMAIN d AS int NOT NULL;
+         CREATE MATERIALIZED VIEW mv AS SELECT 1 AS a;
+         CREATE RULE r3 AS ON DELETE TO vv DO INSTEAD (
+             SELECT NULL::d, ARRAY[ARRAY[1], NULL];
+             INSERT INTO mv VALUES (1));
+         CREATE TABLE t2 (x int);
+         CREATE RULE r4 AS ON INSERT TO t2 WHERE new.x > 0 DO ALSO INSERT INTO t VALUES (NULL, new.x);
+         INSERT INTO t2 VALUES (-1);
+         CREATE TABLE t3 (x int);
+         CREATE RULE r5 AS ON INSERT TO t3 DO ALSO INSERT INTO t VALUES (NULL::d, 1);
+         CREATE TABLE t4 (x int);
+         CREATE RULE r6 AS ON INSERT TO t4 WHERE new.x > 0
+             DO ALSO INSERT INTO t VALUES (NULL::d, 1);
+         CREATE TABLE t5 (a d);
+         CREATE RULE r7 AS ON INSERT TO t5 DO INSTEAD NOTHING;
+         CREATE TABLE t6 (x int);
+         CREATE RULE r8 AS ON INSERT TO t6 DO ALSO INSERT INTO t5 VALUES (NULL::d);",
+    )]);
+    // A conditional rule's action runs only for the rows its qual accepts.
+    db.analyze("INSERT INTO t2 VALUES ($1)").unwrap();
+    db.analyze("INSERT INTO t4 VALUES ($1)").unwrap();
+    // An action a DO INSTEAD NOTHING rule replaces builds no row.
+    db.analyze("INSERT INTO t6 VALUES (1)").unwrap();
+    // An unconditional one runs with the statement firing it: the NULL
+    // cast to a NOT NULL domain fails as its row is built.
+    let err = db.analyze("INSERT INTO t3 VALUES (1)").unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("domain d does not allow null values"),
+        "got: {err}"
+    );
+    // A statement firing the rule runs its action: every execution fails —
+    // for the UPDATE, every one changing a row (PG fails only those; the
+    // oracle's empty tables would not).
+    db.skip_pg_sanity();
+    for sql in ["INSERT INTO vv VALUES (1)", "UPDATE vv SET a = 2"] {
+        let err = db.analyze(sql).expect_err(sql);
+        assert!(
+            err.to_string().starts_with(
+                "null value in column \"a\" of relation \"t\" violates not-null constraint"
+            ),
+            "{sql}\n  got: {err}"
+        );
+    }
+}
+
+#[test]
+fn a_query_is_not_executed_where_it_is_only_stored() {
+    // PG 18 DefineView, PrepareQuery and CREATE TABLE AS / MATERIALIZED
+    // VIEW ... WITH NO DATA only analyze the query: an error every run of
+    // it raises is reported where it runs — reading the view, EXECUTE,
+    // REFRESH MATERIALIZED VIEW.
+    let setup = "CREATE DOMAIN d AS int NOT NULL;
+                 CREATE TABLE t (a int NOT NULL);
+                 CREATE MATERIALIZED VIEW mv0 AS SELECT 1 AS a;
+                 CREATE VIEW v AS SELECT NULL::d AS x, 1 AS y;
+                 CREATE VIEW v2 AS SELECT ARRAY[ARRAY[1], NULL] AS a, 1 AS b;
+                 CREATE VIEW v3 AS VALUES (NULL::d, 1);
+                 CREATE VIEW v4 AS SELECT 1 AS a UNION ALL SELECT NULL::d;
+                 CREATE VIEW v5 AS SELECT 1 AS a, 2 AS b UNION ALL SELECT NULL::d, 3;
+                 CREATE VIEW v6 AS SELECT 1 AS a WHERE false INTERSECT SELECT NULL::d;
+                 CREATE VIEW v7 AS SELECT count(*) AS c, generate_series(1, 2) AS g;
+                 CREATE VIEW w AS SELECT x, y FROM v;
+                 CREATE MATERIALIZED VIEW m1 AS SELECT NULL::d AS x WITH NO DATA;
+                 CREATE MATERIALIZED VIEW m2 AS SELECT ARRAY[ARRAY[1], NULL] AS a WITH NO DATA;
+                 CREATE TABLE c1 AS SELECT NULL::d AS x WITH NO DATA;
+                 PREPARE p1 AS SELECT NULL::d;
+                 PREPARE p2 AS SELECT ARRAY[ARRAY[1], NULL];
+                 PREPARE p3 AS INSERT INTO t VALUES (NULL);
+                 PREPARE p4 AS INSERT INTO mv0 VALUES (1);
+                 PREPARE p5 AS INSERT INTO t VALUES (NULL::d);
+                 CREATE TABLE c2 AS EXECUTE p1 WITH NO DATA;
+                 REFRESH MATERIALIZED VIEW m1 WITH NO DATA;";
+    for (stmt, msg) in [
+        ("EXECUTE p1;", "domain d does not allow null values"),
+        (
+            "EXECUTE p2;",
+            "multidimensional arrays must have array expressions with matching dimensions",
+        ),
+        (
+            "EXECUTE p3;",
+            "null value in column \"a\" of relation \"t\" violates not-null constraint",
+        ),
+        ("EXECUTE p5;", "domain d does not allow null values"),
+        (
+            "CREATE TABLE c3 AS EXECUTE p1;",
+            "domain d does not allow null values",
+        ),
+        (
+            "CREATE TABLE c3 AS SELECT * FROM v;",
+            "domain d does not allow null values",
+        ),
+        // A materialized view is filled under a restricted search_path
+        // (RestrictSearchPath), which qualifies the domain's name.
+        (
+            "CREATE MATERIALIZED VIEW m3 AS SELECT NULL::d AS x;",
+            "domain public.d does not allow null values",
+        ),
+        (
+            "CREATE MATERIALIZED VIEW m3 AS SELECT * FROM v;",
+            "domain public.d does not allow null values",
+        ),
+        (
+            "REFRESH MATERIALIZED VIEW m1;",
+            "domain public.d does not allow null values",
+        ),
+        (
+            "CREATE MATERIALIZED VIEW m3 AS SELECT * FROM v2;",
+            "multidimensional arrays must have array expressions with matching dimensions",
+        ),
+        (
+            "REFRESH MATERIALIZED VIEW m2;",
+            "multidimensional arrays must have array expressions with matching dimensions",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    let db = build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "CREATE MATERIALIZED VIEW m4 AS SELECT y FROM v;
+             CREATE TABLE c4 AS SELECT * FROM v WITH NO DATA;",
+        ),
+    ]);
+    // Reading a column the view's query can't compute fails; the planner
+    // drops the columns a query doesn't read.
+    let domain = Some("domain d does not allow null values");
+    let arrays =
+        Some("multidimensional arrays must have array expressions with matching dimensions");
+    for (sql, fails) in [
+        ("SELECT * FROM v", domain),
+        ("SELECT x FROM v", domain),
+        ("SELECT v.x FROM v", domain),
+        ("SELECT v FROM v", domain),
+        ("SELECT DISTINCT x FROM v ORDER BY x", domain),
+        ("SELECT q FROM v AS vv(q)", domain),
+        ("SELECT NULL::d FROM v", domain),
+        ("SELECT * FROM w", domain),
+        ("SELECT column1 FROM v3", domain),
+        ("SELECT a FROM v4", domain),
+        // A UNION's arm is evaluated whole.
+        ("SELECT b FROM v5", domain),
+        ("SELECT x FROM v UNION ALL SELECT 1", domain),
+        ("SELECT y FROM v", None),
+        ("SELECT y FROM w", None),
+        ("SELECT count(*) FROM v", None),
+        ("SELECT column2 FROM v3", None),
+        ("SELECT x FROM v WHERE y = 2", None),
+        ("SELECT a FROM v2 LIMIT 0", None),
+        ("SELECT a FROM v2", arrays),
+        ("SELECT b FROM v2", None),
+        ("SELECT a FROM v6", None),
+        ("SELECT * FROM v7", None),
+    ] {
+        match (db.analyze(sql), fails) {
+            (Err(err), Some(msg)) => {
+                assert!(err.to_string().starts_with(msg), "{sql}\n  got: {err}")
+            }
+            (Ok(_), None) => {}
+            (other, _) => panic!("{sql}: {other:?}"),
+        }
+    }
+    // The view's column keeps the type and nullability its query gives.
+    let cols = db.analyze("SELECT y FROM v").unwrap().columns;
+    assert!(!cols[0].nullable);
+}
+
+#[test]
+fn a_null_domain_cast_fails_where_every_execution_evaluates_its_row() {
+    // PG 18 evaluates a select list for each row that reaches it: a WHERE
+    // the planner folds to true keeps the row (`y = 1` over the view's
+    // `1 AS y`), a LIMIT other than 0 returns it, an OFFSET skips it only
+    // after fetching it, and a scalar or ARRAY subquery reads its column.
+    // A WHERE that may be false, LIMIT 0, an EXISTS (whose select list
+    // the planner drops) or a FROM item whose rows are unknown leave it
+    // unevaluated.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE DOMAIN d AS int NOT NULL;
+         CREATE TABLE t (a int);
+         CREATE TABLE r (a int);
+         CREATE RULE r_nothing AS ON INSERT TO r DO INSTEAD NOTHING;
+         CREATE VIEW v AS SELECT NULL::d AS x, 1 AS y;
+         CREATE VIEW vs AS SELECT NULL::d AS x, 'a' AS y;
+         CREATE VIEW vu AS SELECT 1 AS a UNION ALL SELECT NULL::d;",
+    )]);
+    let domain = Some("domain d does not allow null values");
+    for (sql, fails) in [
+        ("SELECT x FROM v LIMIT 1", domain),
+        ("SELECT x FROM v LIMIT 2", domain),
+        ("SELECT x FROM v LIMIT ALL", domain),
+        ("SELECT x FROM v LIMIT NULL", domain),
+        ("SELECT x FROM v LIMIT 1 OFFSET 0", domain),
+        ("SELECT x FROM v OFFSET 1", domain),
+        ("SELECT x FROM v ORDER BY y LIMIT 1", domain),
+        (
+            "SELECT x FROM v ORDER BY 1 FETCH FIRST 1 ROW WITH TIES",
+            domain,
+        ),
+        ("SELECT x FROM v WHERE y = 1", domain),
+        ("SELECT x FROM v WHERE y <> 2", domain),
+        ("SELECT x FROM v WHERE y > 0 AND y < 5", domain),
+        ("SELECT x FROM v WHERE y = 1 OR y = 2", domain),
+        ("SELECT x FROM v WHERE NOT (y = 2)", domain),
+        ("SELECT x FROM v WHERE y IN (1, 2)", domain),
+        ("SELECT x FROM v WHERE y IS NOT NULL", domain),
+        ("SELECT x FROM v WHERE y = '1'", domain),
+        ("SELECT x FROM v WHERE true", domain),
+        ("SELECT x FROM v WHERE 'a' = 'a'", domain),
+        ("SELECT x FROM vs WHERE y = 'a'", domain),
+        ("SELECT x FROM v WHERE y = 1 LIMIT 1", domain),
+        ("SELECT x IS NULL FROM v", domain),
+        ("SELECT 1 FROM v WHERE x IS NULL", domain),
+        ("SELECT 1 FROM v WHERE x IS NULL AND y = 1", domain),
+        (
+            "SELECT count(*) FROM (SELECT 1 FROM v WHERE x IS NULL) s",
+            domain,
+        ),
+        ("SELECT (SELECT x FROM v)", domain),
+        ("SELECT (SELECT x FROM v) IS NULL", domain),
+        ("SELECT ARRAY(SELECT x FROM v)", domain),
+        ("SELECT ARRAY(SELECT a FROM vu)", domain),
+        ("SELECT (SELECT NULL::d)", domain),
+        ("SELECT (SELECT x FROM v LIMIT 1)", domain),
+        ("SELECT 1 FROM v WHERE (SELECT x FROM v) IS NULL", domain),
+        (
+            "WITH c AS (SELECT x FROM v) SELECT (SELECT x FROM c)",
+            domain,
+        ),
+        (
+            "SELECT x FROM (SELECT (SELECT x FROM v) AS x, 1 AS y) s",
+            domain,
+        ),
+        (
+            "SELECT x FROM (SELECT NULL::d AS x, 1 AS y) s WHERE y = 1",
+            domain,
+        ),
+        (
+            "SELECT x FROM (SELECT NULL::d AS x, 1 AS y) s LIMIT 1",
+            domain,
+        ),
+        (
+            "SELECT x FROM (SELECT NULL::d AS x, 1 AS y LIMIT 1) s",
+            domain,
+        ),
+        (
+            "SELECT x FROM (SELECT NULL::d AS x, 1 AS y WHERE 1 = 1) s",
+            domain,
+        ),
+        ("SELECT x FROM (SELECT NULL::d AS x OFFSET 1) s", domain),
+        ("SELECT 1 EXCEPT SELECT NULL::d", domain),
+        ("SELECT NULL::d INTERSECT SELECT 1", domain),
+        ("SELECT NULL::d, generate_series(1, 0)", domain),
+        (
+            "SELECT x FROM (SELECT x, generate_series(1, 0) AS g FROM v) s",
+            domain,
+        ),
+        ("SELECT x FROM v WHERE y = 2", None),
+        ("SELECT x FROM v WHERE y = 1 AND y = 2", None),
+        ("SELECT x FROM v WHERE y IN (2, 3)", None),
+        ("SELECT x FROM v WHERE NULL", None),
+        ("SELECT x FROM v WHERE y IS NULL", None),
+        ("SELECT x FROM vs WHERE y = 'b'", None),
+        ("SELECT x FROM v WHERE y = $1", None),
+        ("SELECT x FROM v LIMIT 0", None),
+        ("SELECT x FROM v LIMIT $1", None),
+        ("SELECT y FROM v LIMIT 1", None),
+        ("SELECT 1 FROM v WHERE x IS NULL AND y = 2", None),
+        ("SELECT 1 FROM v WHERE y = 2 AND x IS NULL", None),
+        ("SELECT EXISTS (SELECT x FROM v)", None),
+        ("SELECT 1 WHERE EXISTS (SELECT x FROM v)", None),
+        ("SELECT (SELECT x FROM v) FROM t", None),
+        ("SELECT (SELECT x FROM v LIMIT 0)", None),
+        ("SELECT (SELECT x FROM v WHERE y = 2)", None),
+        ("SELECT (SELECT y FROM v)", None),
+        (
+            "SELECT y FROM (SELECT (SELECT x FROM v) AS x, 1 AS y) s",
+            None,
+        ),
+        ("SELECT NULL::d FROM (SELECT 1 OFFSET 1) s", None),
+        (
+            "SELECT NULL::d FROM (SELECT generate_series(1, 0) AS g) s",
+            None,
+        ),
+        ("SELECT a FROM vu LIMIT 1", None),
+        ("SELECT 1 UNION ALL SELECT NULL::d LIMIT 1", None),
+        ("SELECT 1 WHERE false INTERSECT SELECT NULL::d", None),
+        ("SELECT 1 WHERE false EXCEPT SELECT NULL::d", None),
+        (
+            "(SELECT 1 UNION ALL SELECT NULL::d) INTERSECT SELECT 1 WHERE false",
+            None,
+        ),
+        ("INSERT INTO t SELECT x FROM v", domain),
+        ("INSERT INTO t (a) SELECT x FROM v LIMIT 1", domain),
+        ("INSERT INTO t SELECT x FROM v RETURNING a", domain),
+        ("INSERT INTO t SELECT x FROM v UNION ALL SELECT 1", domain),
+        ("INSERT INTO t SELECT (SELECT x FROM v)", domain),
+        ("INSERT INTO t SELECT NULL::d", domain),
+        ("INSERT INTO t VALUES (NULL::d)", domain),
+        (
+            "WITH c AS (SELECT x FROM v) INSERT INTO t SELECT x FROM c",
+            domain,
+        ),
+        ("INSERT INTO t SELECT y FROM v", None),
+        ("INSERT INTO t SELECT x FROM v WHERE y = 2", None),
+        ("INSERT INTO t SELECT x FROM v LIMIT 0", None),
+        ("INSERT INTO r SELECT x FROM v", None),
+        // A data-modifying WITH query runs whether read or not.
+        ("WITH i AS (INSERT INTO t SELECT x FROM v) SELECT 1", domain),
+        // A CTE named like the view hides it.
+        (
+            "WITH v AS (SELECT 1 AS x), i AS (INSERT INTO t SELECT x FROM v) SELECT 1",
+            None,
+        ),
+        ("WITH v AS (SELECT 1 AS x) SELECT (SELECT x FROM v)", None),
+    ] {
+        match (db.analyze(sql), fails) {
+            (Err(err), Some(msg)) => {
+                assert!(err.to_string().starts_with(msg), "{sql}\n  got: {err}")
+            }
+            (Ok(_), None) => {}
+            (other, _) => panic!("{sql}: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn explain_runs_its_statement_only_with_analyze() {
+    // PG 18 ExplainOnePlan: without ANALYZE the statement is planned and
+    // its executor started (ExecutorStart, where CheckValidResultRel
+    // rejects a materialized view or a sequence as result relation), but
+    // never run, so what only evaluating a row raises is not raised. With
+    // ANALYZE it runs: SELECT and INSERT alike fail as they would bare.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE DOMAIN d AS int NOT NULL;
+         CREATE TABLE t (a int);
+         CREATE TABLE tn (a int NOT NULL);
+         CREATE VIEW v AS SELECT NULL::d AS x, 1 AS y;
+         CREATE MATERIALIZED VIEW mv AS SELECT 1 AS a WITH NO DATA;
+         CREATE SEQUENCE sq;",
+    )]);
+    let domain = Some("domain d does not allow null values");
+    for (sql, fails) in [
+        ("EXPLAIN INSERT INTO t SELECT x FROM v", None),
+        (
+            "EXPLAIN WITH i AS (INSERT INTO t SELECT x FROM v) SELECT 1",
+            None,
+        ),
+        ("EXPLAIN INSERT INTO t VALUES (NULL::d)", None),
+        ("EXPLAIN INSERT INTO tn VALUES (NULL)", None),
+        ("EXPLAIN UPDATE tn SET a = NULL", None),
+        ("EXPLAIN SELECT x FROM v", None),
+        ("EXPLAIN SELECT x FROM v LIMIT 1", None),
+        ("EXPLAIN (ANALYZE false) SELECT x FROM v", None),
+        ("EXPLAIN (GENERIC_PLAN) SELECT x FROM v", None),
+        ("EXPLAIN (ANALYZE) SELECT x FROM v", domain),
+        ("EXPLAIN (ANALYZE) SELECT x FROM v LIMIT 1", domain),
+        ("EXPLAIN ANALYZE SELECT (SELECT x FROM v)", domain),
+        ("EXPLAIN (ANALYZE on) INSERT INTO t SELECT x FROM v", domain),
+        (
+            "EXPLAIN ANALYZE WITH i AS (INSERT INTO t SELECT x FROM v) SELECT 1",
+            domain,
+        ),
+        ("EXPLAIN ANALYZE INSERT INTO t VALUES (NULL::d)", domain),
+        (
+            "EXPLAIN ANALYZE INSERT INTO tn VALUES (NULL)",
+            Some("null value in column \"a\" of relation \"tn\" violates not-null constraint"),
+        ),
+        ("EXPLAIN ANALYZE SELECT y FROM v", None),
+        (
+            "EXPLAIN INSERT INTO mv VALUES (1)",
+            Some("cannot change materialized view \"mv\""),
+        ),
+        (
+            "EXPLAIN INSERT INTO sq VALUES (1)",
+            Some("cannot change sequence \"sq\""),
+        ),
+        (
+            "EXPLAIN ANALYZE INSERT INTO mv VALUES (1)",
+            Some("cannot change materialized view \"mv\""),
+        ),
+        // ParseExplainOptionList, before the statement.
+        (
+            "EXPLAIN (bogus) SELECT x FROM v",
+            Some("unrecognized EXPLAIN option \"bogus\""),
+        ),
+        (
+            "EXPLAIN (ANALYZE 'x') SELECT 1",
+            Some("analyze requires a Boolean value"),
+        ),
+        (
+            "EXPLAIN (FORMAT csv) SELECT 1",
+            Some("unrecognized value for EXPLAIN option \"format\": \"csv\""),
+        ),
+        (
+            "EXPLAIN (WAL) SELECT 1",
+            Some("EXPLAIN option WAL requires ANALYZE"),
+        ),
+        (
+            "EXPLAIN (ANALYZE, GENERIC_PLAN) SELECT 1",
+            Some("EXPLAIN options ANALYZE and GENERIC_PLAN cannot be used together"),
+        ),
+        ("EXPLAIN (ANALYZE, WAL, FORMAT json) SELECT 1", None),
+    ] {
+        match (db.analyze(sql), fails) {
+            (Err(err), Some(msg)) => {
+                assert!(err.to_string().starts_with(msg), "{sql}\n  got: {err}")
+            }
+            (Ok(_), None) => {}
+            (other, _) => panic!("{sql}: {other:?}"),
+        }
+    }
+
+    // The same in a migration: EXPLAIN EXECUTE and EXPLAIN CREATE TABLE AS
+    // plan their query without running it.
+    let setup = "CREATE DOMAIN d AS int NOT NULL;
+                 CREATE TABLE t (a int);
+                 CREATE VIEW v AS SELECT NULL::d AS x, 1 AS y;
+                 PREPARE p AS SELECT x FROM v;";
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "EXPLAIN INSERT INTO t SELECT x FROM v;
+             EXPLAIN WITH i AS (INSERT INTO t SELECT x FROM v) SELECT 1;
+             EXPLAIN SELECT x FROM v LIMIT 1;
+             EXPLAIN EXECUTE p;
+             EXPLAIN CREATE TABLE z AS SELECT x FROM v;
+             EXPLAIN CREATE TABLE z AS EXECUTE p;",
+        ),
+    ]);
+    for stmt in [
+        "EXPLAIN ANALYZE INSERT INTO t SELECT x FROM v;",
+        "EXPLAIN (ANALYZE) SELECT x FROM v LIMIT 1;",
+        "EXPLAIN ANALYZE EXECUTE p;",
+        "EXPLAIN ANALYZE CREATE TABLE z AS SELECT x FROM v;",
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(
+            err.to_string()
+                .starts_with("domain d does not allow null values"),
+            "{stmt}\n  got: {err}"
+        );
+    }
+}
+
+#[test]
+fn a_conditional_rule_qualifies_the_rules_its_action_fires() {
+    // PG 18 rewriteRuleAction ANDs a conditional rule's qualification into
+    // its action, and the action's qualification into the actions of the
+    // rules it fires in turn, and keeps it through a view's rewrite: an
+    // unconditional rule reached through a conditional one writes its NULL
+    // only for the rows the condition accepts.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int NOT NULL, b int);
+         CREATE VIEW vt AS SELECT a, b FROM t;
+         CREATE TABLE u (x int);
+         CREATE RULE r_u AS ON INSERT TO u DO ALSO INSERT INTO t VALUES (NULL, new.x);
+         CREATE TABLE cond (x int);
+         CREATE RULE r_cond AS ON INSERT TO cond WHERE new.x > 0
+             DO ALSO INSERT INTO u VALUES (new.x);
+         CREATE TABLE cond_view (x int);
+         CREATE RULE r_cond_view AS ON INSERT TO cond_view WHERE new.x > 0
+             DO ALSO INSERT INTO vt VALUES (NULL, new.x);
+         CREATE TABLE cond_instead (x int);
+         CREATE RULE r_cond_instead AS ON INSERT TO cond_instead WHERE new.x > 0
+             DO INSTEAD INSERT INTO u VALUES (new.x);
+         CREATE TABLE u2 (x int);
+         CREATE RULE r_u2 AS ON INSERT TO u2 WHERE new.x > 0
+             DO ALSO INSERT INTO t VALUES (NULL, new.x);
+         CREATE TABLE uncond_then_cond (x int);
+         CREATE RULE r_uncond_then_cond AS ON INSERT TO uncond_then_cond
+             DO ALSO INSERT INTO u2 VALUES (new.x);
+         CREATE TABLE uncond (x int);
+         CREATE RULE r_uncond AS ON INSERT TO uncond DO ALSO INSERT INTO u VALUES (new.x);
+         INSERT INTO cond VALUES (-1);
+         INSERT INTO cond_view VALUES (-1);
+         INSERT INTO cond_instead VALUES (-1);
+         INSERT INTO uncond_then_cond VALUES (-1);",
+    )]);
+    for sql in [
+        "INSERT INTO cond VALUES ($1)",
+        "INSERT INTO cond_view VALUES ($1)",
+        "INSERT INTO cond_instead VALUES ($1)",
+        "INSERT INTO uncond_then_cond VALUES ($1)",
+    ] {
+        db.analyze(sql).expect(sql);
+    }
+    // Unconditional all the way down: every execution fails.
+    for sql in [
+        "INSERT INTO uncond VALUES ($1)",
+        "INSERT INTO u VALUES ($1)",
+    ] {
+        let err = db.analyze(sql).expect_err(sql);
+        assert!(
+            err.to_string().starts_with(
+                "null value in column \"a\" of relation \"t\" violates not-null constraint"
+            ),
+            "{sql}\n  got: {err}"
+        );
+    }
+}
+
+#[test]
 fn rules_depend_on_the_relations_their_actions_name() {
     // PG 18 InsertRule records the rule's dependencies on what its actions
     // and qualification read (recordDependencyOnExpr): dropping one needs
@@ -3207,6 +3752,19 @@ fn extended_statistics_are_validated_and_tracked() {
             "CREATE STATISTICS s9 ON a FROM t;",
             "extended statistics require at least 2 columns",
         ),
+        // ProcessUtilitySlow: one FROM item, then a plain relation name.
+        (
+            "CREATE STATISTICS tst ON a FROM (VALUES (x)) AS foo;",
+            "CREATE STATISTICS only supports relation names in the FROM clause",
+        ),
+        (
+            "CREATE STATISTICS tst ON a, b FROM t JOIN u ON true;",
+            "CREATE STATISTICS only supports relation names in the FROM clause",
+        ),
+        (
+            "CREATE STATISTICS tst ON a, b FROM (VALUES (1)) AS foo, t;",
+            "only a single relation is allowed in CREATE STATISTICS",
+        ),
         (
             "CREATE STATISTICS s9 ON a, nosuch FROM t;",
             "column \"nosuch\" does not exist",
@@ -3883,6 +4441,94 @@ fn foreign_data_wrappers_servers_and_user_mappings() {
             "DROP SERVER s CASCADE; SELECT * FROM ft;",
             "relation \"ft\" does not exist",
         ),
+        // transformGenericOptions: each option once (names are folded to
+        // lower case like any identifier).
+        (
+            "CREATE FOREIGN DATA WRAPPER foo OPTIONS (testing '1', testing '2');",
+            "option \"testing\" provided more than once",
+        ),
+        (
+            "CREATE FOREIGN DATA WRAPPER foo OPTIONS (testing '1', Testing '2');",
+            "option \"testing\" provided more than once",
+        ),
+        (
+            "ALTER FOREIGN DATA WRAPPER w OPTIONS (a '1', a '2');",
+            "option \"a\" provided more than once",
+        ),
+        (
+            "CREATE SERVER s2 FOREIGN DATA WRAPPER w OPTIONS (a '1', a '2');",
+            "option \"a\" provided more than once",
+        ),
+        (
+            "ALTER SERVER s OPTIONS (ADD a '1', a '2');",
+            "option \"a\" provided more than once",
+        ),
+        (
+            "CREATE USER MAPPING FOR current_user SERVER s OPTIONS (a '1', a '2');",
+            "option \"a\" provided more than once",
+        ),
+        (
+            "ALTER USER MAPPING FOR public SERVER s OPTIONS (a '1', a '2');",
+            "option \"a\" provided more than once",
+        ),
+        (
+            "CREATE FOREIGN TABLE ft2 (a int OPTIONS (x '1', x '2')) SERVER s;",
+            "option \"x\" provided more than once",
+        ),
+        (
+            "CREATE FOREIGN TABLE ft2 (a int) SERVER s OPTIONS (x '1', x '2');",
+            "option \"x\" provided more than once",
+        ),
+        // The server is looked up first.
+        (
+            "CREATE FOREIGN TABLE ft2 (a int) SERVER nosuch OPTIONS (x '1', x '2');",
+            "server \"nosuch\" does not exist",
+        ),
+        // ALTER FOREIGN TABLE: ATExecGenericOptions and
+        // ATExecAlterColumnGenericOptions, which also takes a new column's
+        // options (transformColumnDefinition).
+        (
+            "ALTER FOREIGN TABLE ft OPTIONS (x '1', x '2');",
+            "option \"x\" provided more than once",
+        ),
+        (
+            "ALTER TABLE ft OPTIONS (ADD x '1', x '2');",
+            "option \"x\" provided more than once",
+        ),
+        (
+            "ALTER FOREIGN TABLE ft ALTER COLUMN a OPTIONS (x '1', x '2');",
+            "option \"x\" provided more than once",
+        ),
+        (
+            "ALTER FOREIGN TABLE ft ADD COLUMN b int OPTIONS (x '1', x '2');",
+            "option \"x\" provided more than once",
+        ),
+        // The column is looked up first.
+        (
+            "ALTER FOREIGN TABLE ft ALTER COLUMN nosuch OPTIONS (x '1', x '2');",
+            "column \"nosuch\" of relation \"ft\" does not exist",
+        ),
+        (
+            "ALTER FOREIGN TABLE ft ALTER COLUMN ctid OPTIONS (x '1');",
+            "cannot alter system column \"ctid\"",
+        ),
+        // Only a foreign table has them.
+        (
+            "CREATE TABLE t (a int); ALTER TABLE t OPTIONS (x '1');",
+            "ALTER action OPTIONS cannot be performed on relation \"t\"",
+        ),
+        (
+            "CREATE TABLE t (a int); ALTER TABLE t ALTER COLUMN a OPTIONS (x '1');",
+            "ALTER action ALTER COLUMN ... OPTIONS cannot be performed on relation \"t\"",
+        ),
+        (
+            "CREATE TABLE t (a int); ALTER TABLE t ADD COLUMN b int OPTIONS (x '1');",
+            "\"t\" is not a foreign table",
+        ),
+        (
+            "CREATE TABLE t (a int OPTIONS (x '1'));",
+            "\"t\" is not a foreign table",
+        ),
     ] {
         let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
         assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
@@ -3895,11 +4541,161 @@ fn foreign_data_wrappers_servers_and_user_mappings() {
              ALTER SERVER s RENAME TO s2;
              CREATE FOREIGN TABLE ft3 (a int) SERVER s2;
              ALTER SERVER s2 OPTIONS (ADD host 'x');
+             ALTER SERVER s2 OPTIONS (DROP host, ADD host 'y');
+             ALTER FOREIGN TABLE ft3 OPTIONS (ADD x '1', DROP x, ADD x '2');
+             ALTER FOREIGN TABLE ft3 ALTER COLUMN a OPTIONS (y '1'), OPTIONS (y '1');
+             ALTER FOREIGN TABLE ft3 ADD COLUMN IF NOT EXISTS a int OPTIONS (x '1', x '2');
+             ALTER FOREIGN TABLE IF EXISTS nosuch OPTIONS (x '1', x '2');
              DROP USER MAPPING IF EXISTS FOR public SERVER nosuch;
              DROP USER MAPPING FOR public SERVER s2;
              DROP SERVER IF EXISTS nosuch;
              DROP FOREIGN DATA WRAPPER w CASCADE;
              CREATE FOREIGN DATA WRAPPER w;",
+        ),
+    ]);
+}
+
+#[test]
+fn generic_options_follow_what_the_object_holds() {
+    // PG 18 transformGenericOptions applies an OPTIONS list to the options
+    // the object holds: a plain or ADD option must be new, SET and DROP
+    // need it to be there.
+    let setup = "CREATE FOREIGN DATA WRAPPER w;
+                 CREATE FOREIGN DATA WRAPPER w2 OPTIONS (k '0');
+                 CREATE SERVER s FOREIGN DATA WRAPPER w;
+                 CREATE SERVER s2 FOREIGN DATA WRAPPER w OPTIONS (a '1', b '2');
+                 CREATE USER MAPPING FOR public SERVER s2 OPTIONS (u '1');
+                 CREATE FOREIGN TABLE ft (a int OPTIONS (ca '1'), b int OPTIONS (cb '1'))
+                     SERVER s OPTIONS (fo '0');";
+    for (stmt, msg) in [
+        (
+            "ALTER SERVER s OPTIONS (SET x '1', ADD x '2');",
+            "option \"x\" not found",
+        ),
+        (
+            "ALTER SERVER s OPTIONS (SET a '1');",
+            "option \"a\" not found",
+        ),
+        ("ALTER SERVER s OPTIONS (DROP a);", "option \"a\" not found"),
+        (
+            "ALTER SERVER s2 OPTIONS (ADD a '2');",
+            "option \"a\" provided more than once",
+        ),
+        (
+            "ALTER SERVER s2 OPTIONS (SET a '3', DROP a, DROP a);",
+            "option \"a\" not found",
+        ),
+        (
+            "ALTER FOREIGN DATA WRAPPER w OPTIONS (DROP nope);",
+            "option \"nope\" not found",
+        ),
+        (
+            "ALTER FOREIGN DATA WRAPPER w2 OPTIONS (ADD k '1');",
+            "option \"k\" provided more than once",
+        ),
+        (
+            "ALTER USER MAPPING FOR public SERVER s2 OPTIONS (u '2');",
+            "option \"u\" provided more than once",
+        ),
+        (
+            "ALTER USER MAPPING FOR public SERVER s2 OPTIONS (DROP nope);",
+            "option \"nope\" not found",
+        ),
+        (
+            "ALTER FOREIGN TABLE ft OPTIONS (ADD fo '1');",
+            "option \"fo\" provided more than once",
+        ),
+        (
+            "ALTER FOREIGN TABLE ft OPTIONS (DROP nope);",
+            "option \"nope\" not found",
+        ),
+        (
+            "ALTER FOREIGN TABLE ft ALTER COLUMN a OPTIONS (ADD ca '1');",
+            "option \"ca\" provided more than once",
+        ),
+        // Each column has its own.
+        (
+            "ALTER FOREIGN TABLE ft ALTER COLUMN b OPTIONS (DROP ca);",
+            "option \"ca\" not found",
+        ),
+        // Subcommands see the ones before them.
+        (
+            "ALTER FOREIGN TABLE ft OPTIONS (ADD fo2 '1'), OPTIONS (ADD fo2 '2');",
+            "option \"fo2\" provided more than once",
+        ),
+        // A renamed server or wrapper keeps its options, and so do its
+        // user mappings.
+        (
+            "ALTER SERVER s2 RENAME TO s3; ALTER SERVER s3 OPTIONS (ADD a '1');",
+            "option \"a\" provided more than once",
+        ),
+        (
+            "ALTER FOREIGN DATA WRAPPER w2 RENAME TO w3;
+             ALTER FOREIGN DATA WRAPPER w3 OPTIONS (k '1');",
+            "option \"k\" provided more than once",
+        ),
+        (
+            "ALTER SERVER s2 RENAME TO s3;
+             ALTER USER MAPPING FOR public SERVER s3 OPTIONS (DROP nope);",
+            "option \"nope\" not found",
+        ),
+        // A dropped column's go with it; a renamed one keeps them.
+        (
+            "ALTER FOREIGN TABLE ft DROP COLUMN b;
+             ALTER FOREIGN TABLE ft ADD COLUMN b int;
+             ALTER FOREIGN TABLE ft ALTER COLUMN b OPTIONS (SET cb '2');",
+            "option \"cb\" not found",
+        ),
+        (
+            "ALTER FOREIGN TABLE ft RENAME COLUMN a TO aa;
+             ALTER FOREIGN TABLE ft ALTER COLUMN aa OPTIONS (ca '2');",
+            "option \"ca\" provided more than once",
+        ),
+        // Objects created again start without any.
+        (
+            "DROP USER MAPPING FOR public SERVER s2;
+             CREATE USER MAPPING FOR public SERVER s2;
+             ALTER USER MAPPING FOR public SERVER s2 OPTIONS (SET u '1');",
+            "option \"u\" not found",
+        ),
+        (
+            "DROP FOREIGN TABLE ft;
+             CREATE FOREIGN TABLE ft (a int) SERVER s;
+             ALTER FOREIGN TABLE ft OPTIONS (SET fo '1');",
+            "option \"fo\" not found",
+        ),
+        (
+            "DROP SERVER s2 CASCADE;
+             CREATE SERVER s2 FOREIGN DATA WRAPPER w;
+             ALTER SERVER s2 OPTIONS (DROP a);",
+            "option \"a\" not found",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "ALTER SERVER s OPTIONS (ADD a '2');
+             ALTER SERVER s2 OPTIONS (DROP a, ADD a '2');
+             ALTER SERVER s2 OPTIONS (DROP b);
+             ALTER SERVER s2 OPTIONS (b '3', SET a '4');
+             ALTER FOREIGN DATA WRAPPER w2 OPTIONS (SET k '2');
+             ALTER USER MAPPING FOR public SERVER s2 OPTIONS (SET u '1', ADD um '2');
+             ALTER USER MAPPING FOR public SERVER s2 OPTIONS (DROP um);
+             ALTER FOREIGN TABLE ft OPTIONS (SET fo '1');
+             ALTER FOREIGN TABLE ft ALTER COLUMN a OPTIONS (SET ca '2');
+             ALTER FOREIGN TABLE ft ALTER COLUMN b OPTIONS (SET cb '2', ca '1');
+             ALTER FOREIGN TABLE ft OPTIONS (DROP fo), OPTIONS (ADD fo '2');
+             ALTER FOREIGN TABLE ft ADD COLUMN c int OPTIONS (cc '1');
+             ALTER FOREIGN TABLE ft ALTER COLUMN c OPTIONS (DROP cc);
+             ALTER SERVER s2 RENAME TO s3;
+             ALTER SERVER s3 OPTIONS (SET a '1');
+             ALTER USER MAPPING FOR public SERVER s3 OPTIONS (SET u '2');
+             ALTER FOREIGN DATA WRAPPER w2 RENAME TO w3;
+             ALTER FOREIGN DATA WRAPPER w3 OPTIONS (SET k '3');",
         ),
     ]);
 }
