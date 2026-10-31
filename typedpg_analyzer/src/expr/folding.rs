@@ -131,15 +131,37 @@ fn fold(node: &protobuf::Node, ctx: Ctx<'_>, generation: bool) -> Folding {
             let Some(name) = names.last() else {
                 return Folding::Maybe;
             };
+            let args: Vec<Folding> = e
+                .lexpr
+                .iter()
+                .chain(e.rexpr.iter())
+                .map(|a| fold(a, ctx, generation))
+                .collect();
+            // evaluate_function: a strict function over a NULL constant is
+            // the NULL constant, before any inlining.
+            if K::try_from(e.kind) == Ok(K::AexprOp)
+                && args.contains(&Folding::Null)
+                && all_strict(
+                    snapshot
+                        .pg_operator
+                        .values()
+                        .filter(|o| &o.oprname == name)
+                        .map(|o| o.oprcode),
+                    snapshot,
+                )
+            {
+                return Folding::Null;
+            }
             if operator_may_inline(snapshot, name) {
                 return Folding::Maybe;
             }
-            strict_call(
-                e.lexpr
-                    .iter()
-                    .chain(e.rexpr.iter())
-                    .map(|a| fold(a, ctx, generation)),
-            )
+            if K::try_from(e.kind) == Ok(K::AexprOp)
+                && let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref())
+                && let Some(v) = integer_comparison(name, l, r)
+            {
+                return Folding::Bool(v);
+            }
+            strict_call(args.into_iter())
         }
         node::Node::BoolExpr(b) => {
             let args = b.args.iter().map(|a| fold(a, ctx, generation));
@@ -186,17 +208,73 @@ fn fold(node: &protobuf::Node, ctx: Ctx<'_>, generation: bool) -> Folding {
             {
                 return Folding::Never;
             }
-            strict_call(f.args.iter().map(|a| {
-                match a.node.as_ref() {
+            let args: Vec<Folding> = f
+                .args
+                .iter()
+                .map(|a| match a.node.as_ref() {
                     Some(node::Node::NamedArgExpr(na)) => na
                         .arg
                         .as_deref()
                         .map_or(Folding::Maybe, |a| fold(a, ctx, generation)),
                     _ => fold(a, ctx, generation),
-                }
-            }))
+                })
+                .collect();
+            // A strict function over a NULL constant (see the operators').
+            if args.contains(&Folding::Null)
+                && f.agg_order.is_empty()
+                && f.agg_filter.is_none()
+                && !f.agg_distinct
+                && !f.func_variadic
+                && candidates
+                    .iter()
+                    .all(|p| p.prokind == ProKind::Function && p.proisstrict)
+            {
+                return Folding::Null;
+            }
+            strict_call(args.into_iter())
         }
         _ => Folding::Maybe,
+    }
+}
+
+/// Whether every function in `procs` (an operator's `oprcode`) is strict
+/// — and there is one.
+fn all_strict(
+    procs: impl Iterator<Item = Option<crate::oid::PgProcOid>>,
+    snapshot: &PgCatalog,
+) -> bool {
+    let mut any = false;
+    for p in procs {
+        any = true;
+        if !p
+            .and_then(|p| snapshot.pg_proc.get(&p))
+            .is_some_and(|p| p.proisstrict)
+        {
+            return false;
+        }
+    }
+    any
+}
+
+/// The value of `l name r`, a comparison of two integer literals (`1 = 1`),
+/// as the built-in `int4` operators the planner folds it with compute it.
+fn integer_comparison(name: &str, l: &protobuf::Node, r: &protobuf::Node) -> Option<bool> {
+    let int = |n: &protobuf::Node| match n.node.as_ref()? {
+        node::Node::AConst(c) if !c.isnull => match c.val.as_ref()? {
+            a_const::Val::Ival(i) => Some(i64::from(i.ival)),
+            _ => None,
+        },
+        _ => None,
+    };
+    let (l, r) = (int(l)?, int(r)?);
+    match name {
+        "=" => Some(l == r),
+        "<>" | "!=" => Some(l != r),
+        "<" => Some(l < r),
+        ">" => Some(l > r),
+        "<=" => Some(l <= r),
+        ">=" => Some(l >= r),
+        _ => None,
     }
 }
 

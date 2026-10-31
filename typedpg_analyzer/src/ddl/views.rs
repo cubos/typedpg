@@ -2411,12 +2411,14 @@ pub(crate) fn relations_rule_recursion(
 pub(crate) fn planned_view_errors(
     snapshot: &PgCatalog,
     relid: PgClassOid,
+    kept: bool,
 ) -> Option<crate::resolve::Split> {
     /// FirstNormalObjectId (transam.h): below, what initdb made.
     const FIRST_NORMAL_OBJECT_ID: u32 = 16384;
-    if snapshot.security_barrier_views.contains(&relid) || relid.get() < FIRST_NORMAL_OBJECT_ID {
+    if relid.get() < FIRST_NORMAL_OBJECT_ID {
         return None;
     }
+    let barrier = snapshot.security_barrier_views.contains(&relid);
     let stored = snapshot.view_references.get(&relid)?;
     let query = view_query(snapshot, relid)?;
     let inner = query.node.as_ref()?;
@@ -2426,7 +2428,7 @@ pub(crate) fn planned_view_errors(
     // The query is another text: its errors keep their plain messages.
     let _barrier = crate::error::DiagContextGuard::barrier();
     let ((analyzed, references), split) = expanding_view(relid, || {
-        crate::resolve::planned_errors(sel, || {
+        crate::resolve::planned_errors(sel, snapshot, barrier, kept, || {
             super::depend::collect(|| crate::resolve::analyze_raw_node(snapshot, inner, &[]))
         })
     })??;

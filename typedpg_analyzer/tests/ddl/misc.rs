@@ -2627,6 +2627,25 @@ fn explain_runs_its_statement_only_with_analyze() {
             Some("EXPLAIN options ANALYZE and GENERIC_PLAN cannot be used together"),
         ),
         ("EXPLAIN (ANALYZE, WAL, FORMAT json) SELECT 1", None),
+        // eval_const_expressions evaluates a constant array while planning:
+        // sub-arrays that can't agree fail even unrun — where it is folded.
+        (
+            "EXPLAIN SELECT ARRAY[ARRAY[1], NULL]",
+            Some("multidimensional arrays must have array expressions with matching dimensions"),
+        ),
+        (
+            "EXPLAIN SELECT q FROM (SELECT ARRAY[ARRAY[1], NULL] AS q) s",
+            Some("multidimensional arrays must have array expressions with matching dimensions"),
+        ),
+        ("EXPLAIN SELECT ARRAY[ARRAY[a], NULL] FROM t", None),
+        (
+            "EXPLAIN SELECT 1 FROM (SELECT ARRAY[ARRAY[1], NULL] AS q) s",
+            None,
+        ),
+        (
+            "EXPLAIN SELECT CASE WHEN false THEN ARRAY[ARRAY[1], NULL] END",
+            None,
+        ),
     ] {
         match (db.analyze(sql), fails) {
             (Err(err), Some(msg)) => {
@@ -2668,6 +2687,18 @@ fn explain_runs_its_statement_only_with_analyze() {
             "{stmt}\n  got: {err}"
         );
     }
+    let stmt = "EXPLAIN SELECT ARRAY[ARRAY[1], NULL];";
+    let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+    assert!(
+        err.to_string().starts_with(
+            "multidimensional arrays must have array expressions with matching dimensions"
+        ),
+        "{stmt}\n  got: {err}"
+    );
+    build_db(&[
+        ("0001.sql", setup),
+        ("0002.sql", "EXPLAIN SELECT ARRAY[ARRAY[a], NULL] FROM t;"),
+    ]);
 }
 
 #[test]

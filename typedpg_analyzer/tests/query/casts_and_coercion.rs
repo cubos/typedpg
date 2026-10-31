@@ -608,6 +608,33 @@ fn integer_constants_assigned_out_of_range_are_rejected() {
             "INSERT INTO s (k, a) SELECT k, 40000 FROM s WHERE b > 0",
             "smallint out of range",
         ),
+        // A function that is neither aggregate, set-returning nor volatile
+        // doesn't keep it from being pulled up; a subquery it reads is
+        // pulled up in turn, its output substituted.
+        (
+            "INSERT INTO s (k, a) SELECT abs(k), 40000 FROM s",
+            "smallint out of range",
+        ),
+        (
+            "INSERT INTO s (k, a) SELECT 1, x FROM (SELECT 40000 AS x) q",
+            "smallint out of range",
+        ),
+        (
+            "INSERT INTO s (k, a) SELECT 1, x FROM (SELECT x FROM (SELECT 40000 AS x) q1) q2",
+            "smallint out of range",
+        ),
+        (
+            "INSERT INTO s (k, a) SELECT 1, x FROM (VALUES (40000)) v(x)",
+            "smallint out of range",
+        ),
+        (
+            "INSERT INTO s (k, a) SELECT s.k, q.x FROM s JOIN (SELECT 40000 AS x) q ON true",
+            "smallint out of range",
+        ),
+        (
+            "INSERT INTO s (k, a) SELECT 1, x FROM (SELECT 40000 AS x) q WHERE false",
+            "smallint out of range",
+        ),
     ] {
         assert_err_prefix!(
             db.analyze(sql),
@@ -630,6 +657,12 @@ fn integer_constants_assigned_in_range_or_never_converted_are_accepted() {
         // row, and there may be none.
         "INSERT INTO s (k, a) SELECT k, 40000 FROM s LIMIT 1",
         "INSERT INTO s (k, a, b) SELECT k, 40000, random()::int FROM s",
+        "INSERT INTO s (k, a, b) SELECT 1, 40000, generate_series(1, 0)",
+        // On the nullable side of an outer join a PlaceHolderVar keeps the
+        // pulled-up constant from being folded; an unread one never is.
+        "INSERT INTO s (k, a) SELECT s.k, q.x FROM s LEFT JOIN (SELECT 40000 AS x) q ON true",
+        "INSERT INTO s (k, a) SELECT 1, 4 FROM (SELECT 40000 AS x) q",
+        "INSERT INTO s (k, a) SELECT 1, x FROM (SELECT 4 AS x) q",
         // OVERRIDING USER VALUE discards the value unconverted.
         "INSERT INTO ident (id) OVERRIDING USER VALUE VALUES (3000000000)",
         // An INSTEAD rule replaces the statement: never planned.
@@ -924,7 +957,9 @@ fn a_subquery_output_fails_where_it_is_read() {
 fn a_view_output_fails_where_it_is_read() {
     // The rewriter puts a view's query in the statement reading it, and
     // the planner pulls it up like a FROM subquery — unless it is a
-    // security barrier.
+    // security barrier, or limited: then it plans it on its own, folding
+    // what is read of it (`remove_unused_subquery_outputs` drops the
+    // rest), unless the statement proves it empty first.
     let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE TABLE t (id int PRIMARY KEY, x int);
@@ -936,10 +971,18 @@ fn a_view_output_fails_where_it_is_read() {
          CREATE VIEW barrier WITH (security_barrier) AS SELECT x, 1 / 0 AS z FROM t;
          CREATE VIEW barrier_reset WITH (security_barrier) AS SELECT x, 1 / 0 AS z FROM t;
          ALTER VIEW barrier_reset RESET (security_barrier);
-         CREATE VIEW limited AS SELECT x, 1 / 0 AS z FROM t LIMIT 5;",
+         CREATE VIEW limited AS SELECT x, 1 / 0 AS z FROM t LIMIT 5;
+         CREATE VIEW barrier_where WITH (security_barrier) AS SELECT x FROM t WHERE 1 / 0 = 1;
+         CREATE VIEW barrier_consts WITH (security_barrier) AS SELECT 40000::int2 AS a, 1 AS b;
+         CREATE VIEW grouped AS SELECT x, count(*) AS c FROM t WHERE 1 / 0 = 1 GROUP BY x;",
     )
     .unwrap();
-    for sql in ["SELECT a FROM consts", "SELECT a FROM nested"] {
+    for sql in [
+        "SELECT a FROM consts",
+        "SELECT a FROM nested",
+        "SELECT a FROM barrier_consts",
+        "SELECT a FROM (SELECT 40000::int2 AS a, 1 AS b OFFSET 0) s",
+    ] {
         assert_err_prefix!(
             db.analyze(sql),
             AnalyzeError::NumericValueOutOfRange(_),
@@ -953,6 +996,18 @@ fn a_view_output_fails_where_it_is_read() {
         "SELECT x FROM filtered",
         "SELECT 1 FROM filtered",
         "SELECT z FROM barrier_reset",
+        "SELECT z FROM barrier",
+        "SELECT z FROM limited",
+        "SELECT 1 FROM barrier_where",
+        "SELECT 1 FROM grouped",
+        "SELECT 1 FROM (SELECT x FROM t WHERE 1 / 0 = 1 OFFSET 0) s",
+        "SELECT 1 FROM t, barrier_where WHERE false",
+        // An aggregate, window, set-returning or volatile call keeps a
+        // subquery from being pulled up too.
+        "SELECT c FROM (SELECT sum(1 / 0) AS c FROM t) s",
+        "SELECT 1 FROM (SELECT count(*) AS c FROM t WHERE 1 / 0 = 1) s",
+        "SELECT 1 FROM (SELECT random() AS r FROM t WHERE 1 / 0 = 1) s",
+        "SELECT z FROM (SELECT random() AS r, 1 / 0 AS z FROM t) s",
     ] {
         assert_err_prefix!(
             db.analyze(sql),
@@ -965,8 +1020,18 @@ fn a_view_output_fails_where_it_is_read() {
         "SELECT 1 FROM consts",
         "SELECT x FROM cols",
         "SELECT b FROM nested_ok",
-        "SELECT z FROM barrier",
+        "SELECT x FROM barrier",
+        "SELECT x FROM limited",
+        "SELECT z FROM barrier WHERE false",
         "SELECT z FROM limited WHERE false",
+        "SELECT b FROM barrier_consts",
+        "SELECT b FROM (SELECT 40000::int2 AS a, 1 AS b OFFSET 0) s",
+        "SELECT 1 FROM barrier_where WHERE false",
+        "SELECT 1 FROM grouped WHERE false",
+        "SELECT 1 FROM (SELECT count(*) AS c FROM t WHERE 1 / 0 = 1) s WHERE false",
+        "SELECT 1 FROM (SELECT random() AS r, 1 / 0 AS z FROM t) s",
+        // The nullable side of a join the planner may remove.
+        "SELECT 1 FROM t LEFT JOIN (SELECT count(*) AS c FROM t WHERE 1 / 0 = 1) s ON true",
     ] {
         db.analyze(sql)
             .unwrap_or_else(|e| panic!("{sql}: unexpected error {e}"));

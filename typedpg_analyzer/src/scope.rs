@@ -82,6 +82,37 @@ pub(crate) struct Deferred {
     /// Raised wherever the entry is (a CTE's: its body's WHERE, an output
     /// of a materialized one).
     pub entry: Option<Box<crate::error::AnalyzeError>>,
+    /// Raised wherever a reference to the entry is planned and its plan
+    /// started (see [`crate::resolve::check_values_sort`]): an inlined
+    /// CTE's VALUES whose ORDER BY the executor can't start.
+    pub started: Option<Box<crate::error::AnalyzeError>>,
+    /// What the column's collation becomes once the planner substitutes
+    /// its expression for a reference to it (see [`crate::expr::Planned`]):
+    /// a pulled-up subquery's output folded to another node. Unless
+    /// [`ScopeColumn::planned_unknown`] says it is unknown.
+    pub planned: crate::expr::Planned,
+    /// Whether the planner replaces a reference to the column by the
+    /// expression of a subquery's output.
+    pub substitution: Substitution,
+    /// That output's expression, when [`Substitution::Certain`] and known.
+    pub expr: Option<std::sync::Arc<typedpg_pg_query::protobuf::Node>>,
+}
+
+/// Whether the planner replaces a reference to a FROM entry's column by
+/// an expression (which may then fold to a constant).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum Substitution {
+    /// Never: the reference stays a Var (a table's column, the output of
+    /// a subquery planned on its own, or of one pulled up onto the
+    /// nullable side of an outer join, where a PlaceHolderVar wraps it).
+    #[default]
+    Never,
+    /// Certainly: the column is the output of a subquery pulled up where
+    /// it is never null-extended.
+    Certain,
+    /// Maybe (a subquery the planner may pull up, a view, a CTE it may
+    /// inline).
+    Maybe,
 }
 
 impl ScopeColumn {
@@ -90,7 +121,7 @@ impl ScopeColumn {
         if self.planned_unknown {
             crate::expr::Planned::Unknown
         } else {
-            crate::expr::Planned::AsParsed
+            self.deferred.planned
         }
     }
 }
