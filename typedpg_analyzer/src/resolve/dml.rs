@@ -1,5 +1,7 @@
 use super::*;
 
+mod select_row;
+
 // ──────────────────────────────────────────────────────────────────────────────
 // INSERT / UPDATE / DELETE
 // ──────────────────────────────────────────────────────────────────────────────
@@ -75,6 +77,8 @@ fn analyze_insert_here(
     // What each row writes at each target position (`None`: DEFAULT); no
     // row for DEFAULT VALUES, which writes the defaults.
     let mut written: Vec<Vec<Option<ValueInfo>>> = vec![Vec::new()];
+    // The output types of a SELECT source (not VALUES).
+    let mut select_types: Option<Vec<PgTypeOid>> = None;
     if let Some(select_node) = &ins.select_stmt
         && let Some(node::Node::SelectStmt(val_sel)) = select_node.node.as_ref()
     {
@@ -120,6 +124,9 @@ fn analyze_insert_here(
                 && let Some(e) = general_values_violation(val_sel, &tgt, &column_types, snapshot)
             {
                 return Err(e);
+            }
+            if val_sel.values_lists.is_empty() {
+                select_types = Some(column_types);
             }
             let width = selected.len();
             written = vec![selected.into_iter().map(Some).collect()];
@@ -302,6 +309,15 @@ fn analyze_insert_here(
     {
         let ctes = ins.with_clause.as_ref().map_or(&[][..], |w| &w.ctes[..]);
         super::failing_rows::check_insert_select(sel, ctes, tgt.oid, snapshot)?;
+    }
+    // Then storing the row a SELECT yields every time fails, if it does.
+    if let (Some(types), Some(node::Node::SelectStmt(sel))) = (
+        &select_types,
+        ins.select_stmt.as_deref().and_then(|s| s.node.as_ref()),
+    ) && let Some(e) =
+        select_row::sure_row_violation(sel, ins.with_clause.as_ref(), &tgt, types, snapshot)
+    {
+        return Err(e);
     }
 
     Ok((columns, None))

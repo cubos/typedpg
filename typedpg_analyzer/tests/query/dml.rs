@@ -813,6 +813,8 @@ fn insert_row_no_partition_takes_is_rejected() {
         ("INSERT INTO nodef VALUES (1 + 1, 'x')", "nodef"),
         ("INSERT INTO nodef VALUES (2.5, 'x')", "nodef"),
         ("INSERT INTO dt VALUES ('2025-01-01')", "dt"),
+        // The row a SELECT without FROM yields every time.
+        ("INSERT INTO nodef SELECT 2, 'x'", "nodef"),
     ] {
         assert_err_prefix!(
             db.analyze(sql),
@@ -882,7 +884,7 @@ fn insert_row_routing_uncertain_is_accepted() {
         // A key left to a non-NULL default.
         "INSERT INTO keydef (b) VALUES ('x')",
         // INSERT … SELECT: the rows come from the query.
-        "INSERT INTO nodef SELECT 2, 'x'",
+        "INSERT INTO nodef SELECT 2, 'x' FROM nodef",
         // HASH partitioning.
         "INSERT INTO hashed VALUES (1)",
         // A text key under a user's collation.
