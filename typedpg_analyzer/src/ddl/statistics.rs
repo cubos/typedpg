@@ -186,10 +186,34 @@ pub fn create_statistics(interp: &mut PgCatalog, stmt: &CreateStatsStmt) -> Resu
                 None => None,
             };
             if let Some(inner) = expr.node.as_ref() {
-                for (n, ..) in inner.nodes() {
-                    if let typedpg_pg_query::NodeRef::ColumnRef(cr) = n
-                        && let Some(col) = cr.fields.last().and_then(node_string)
-                    {
+                let nodes = inner.nodes();
+                // A field selection on the whole row, `(t).a`, is the
+                // column `a` (transformIndirection), not the whole row.
+                let selections: Vec<_> = nodes
+                    .iter()
+                    .filter_map(|(n, ..)| match n {
+                        typedpg_pg_query::NodeRef::AIndirection(ind) => {
+                            whole_row_field(interp, relid, ind)
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                for (n, ..) in nodes {
+                    let col = match n {
+                        typedpg_pg_query::NodeRef::ColumnRef(cr)
+                            if !selections.iter().any(|(r, _)| std::ptr::eq(*r, cr)) =>
+                        {
+                            cr.fields
+                                .last()
+                                .and_then(node_string)
+                                .map(|c| (c, cr.fields.len() == 1))
+                        }
+                        typedpg_pg_query::NodeRef::AIndirection(ind) => {
+                            whole_row_field(interp, relid, ind).map(|(_, f)| (f, false))
+                        }
+                        _ => None,
+                    };
+                    if let Some((col, bare)) = col {
                         // pull_varattnos: no system column (nor the
                         // whole row), no virtual generated column.
                         if let Some(a) = interp.attribute_by_name(relid, col) {
@@ -198,7 +222,7 @@ pub fn create_statistics(interp: &mut PgCatalog, stmt: &CreateStatsStmt) -> Resu
                             }
                             attnums.push(a.attnum);
                         } else if SYSTEM_COLUMNS.iter().any(|(n, ..)| *n == col)
-                            || (cr.fields.len() == 1 && col == class.relname)
+                            || (bare && col == class.relname)
                         {
                             return Err(system_column());
                         }
@@ -290,8 +314,18 @@ fn parenthesized_column<'a>(
     relid: PgClassOid,
     expr: &'a typedpg_pg_query::protobuf::Node,
 ) -> Option<&'a str> {
-    let Some(node::Node::ColumnRef(cr)) = expr.node.as_ref() else {
-        return None;
+    let cr = match expr.node.as_ref()? {
+        node::Node::ColumnRef(cr) => cr,
+        // `((t).a)`: the field selection is the Var of `a`.
+        node::Node::AIndirection(ind) if ind.indirection.len() == 1 => {
+            return whole_row_field(interp, relid, ind)
+                .map(|(_, f)| f)
+                .filter(|f| {
+                    interp.attribute_by_name(relid, f).is_some()
+                        || SYSTEM_COLUMNS.iter().any(|(n, ..)| n == f)
+                });
+        }
+        _ => return None,
     };
     let fields: Vec<&str> = cr.fields.iter().map(node_string).collect::<Option<_>>()?;
     let (&last, qualifiers) = fields.split_last()?;
@@ -303,6 +337,29 @@ fn parenthesized_column<'a>(
     // A single name that is no column is the table's row.
     let relname = interp.pg_class.get(&relid).map(|c| c.relname.as_str());
     (qualifiers.is_empty() && Some(last) == relname).then_some(last)
+}
+
+/// The field a selection on the table's whole row picks, `(t).a`, with the
+/// whole-row reference it reads: transformIndirection turns it into that
+/// column's Var (ParseComplexProjection's scanNSItemForColumn, which finds
+/// system columns too). `t` must name no column of its own, or it is that
+/// column.
+fn whole_row_field<'a>(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+    ind: &'a typedpg_pg_query::protobuf::AIndirection,
+) -> Option<(&'a typedpg_pg_query::protobuf::ColumnRef, &'a str)> {
+    let field = node_string(ind.indirection.first()?)?;
+    let Some(node::Node::ColumnRef(cr)) = ind.arg.as_deref()?.node.as_ref() else {
+        return None;
+    };
+    let [name] = cr.fields.as_slice() else {
+        return None;
+    };
+    let name = node_string(name)?;
+    let relname = interp.pg_class.get(&relid).map(|c| c.relname.as_str());
+    (Some(name) == relname && interp.attribute_by_name(relid, name).is_none())
+        .then_some((cr, field))
 }
 
 /// ChooseExtendedStatisticName: `<table>_<columns>_stat`, numbered when
