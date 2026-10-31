@@ -97,10 +97,11 @@ pub(crate) fn process_from_item(
 
             // Check CTEs first.
             if rv.schemaname.is_empty()
-                && let Some((cte_cols, search_cycle, expand)) =
+                && let Some((mut cte_cols, search_cycle, expand)) =
                     cte_reference_columns(cte_scopes, &rv.relname)
             {
                 check_cte_reference(cte_scopes, &rv.relname)?;
+                super::deferred::unless_planned_alone(&mut cte_cols, alias, rows_kept());
                 super::deferred::reference_cte(&cte_cols, rv.location)?;
                 if rows_kept()
                     && crate::expr::plan_time_checks()
@@ -415,7 +416,7 @@ pub(crate) fn process_from_item(
                 let plan = super::deferred::plan_of(sel, snapshot);
                 let (analyzed, correlated) = crate::nonnull::capture_correlation(sel, || {
                     let (analyzed, split) =
-                        super::deferred::analyze(plan, sel, rows_kept(), || {
+                        super::deferred::analyze(plan, sel, rows_kept(), alias, snapshot, || {
                             crate::grouping::with_visible_entries(visible, || {
                                 analyze_select_with_ctes_and_outer(
                                     sel,
@@ -482,6 +483,7 @@ pub(crate) fn process_from_item(
                                 _ => crate::scope::Substitution::Never,
                             },
                             expr: exprs.next().flatten(),
+                            alone: None,
                         },
                         name: rc.name,
                         type_oid: rc.type_oid,
@@ -531,6 +533,11 @@ pub(crate) fn process_from_item(
                     scope_cols,
                     crate::scope::SourceKind::Subquery {
                         lock_blocker: subquery_lock_blocker(sel, snapshot),
+                        // One planned on its own is removed only when it
+                        // may be proven distinct; one pulled up is its
+                        // relations, judged on their own.
+                        removable: plan != super::deferred::Plan::Separate
+                            || crate::expr::plan_fold::may_be_distinct(sel, snapshot),
                     },
                 )?;
                 if let Some(src) = scope.sources.last_mut() {

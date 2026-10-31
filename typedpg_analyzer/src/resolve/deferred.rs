@@ -124,7 +124,13 @@ fn never_simple_target_list(sel: &protobuf::SelectStmt, snapshot: &PgCatalog) ->
 /// How the level reading a subquery planned as `plan` (never
 /// null-extended there when `kept`) analyzes it: `None` when nothing in
 /// it is certain to be planned.
-fn next_level(plan: Plan, sel: &protobuf::SelectStmt, kept: bool) -> Option<NextLevel> {
+fn next_level(
+    plan: Plan,
+    sel: &protobuf::SelectStmt,
+    kept: bool,
+    alias: Option<&str>,
+    snapshot: &PgCatalog,
+) -> Option<NextLevel> {
     if !crate::expr::plan_time_checks() {
         return None;
     }
@@ -132,8 +138,14 @@ fn next_level(plan: Plan, sel: &protobuf::SelectStmt, kept: bool) -> Option<Next
         Plan::PulledUp if kept => Some(NextLevel::PulledUp),
         Plan::PulledUp => Some(NextLevel::PulledUpNullable),
         // Planned unless its relation is proven empty, or removed (the
-        // nullable side of a join).
-        Plan::Separate if kept && !crate::expr::plan_fold::level_may_be_empty() => {
+        // nullable side of a join, when it may be proven distinct).
+        Plan::Separate
+            if (kept || !crate::expr::plan_fold::may_be_distinct(sel, snapshot))
+                && !alias.map_or_else(
+                    crate::expr::plan_fold::level_may_be_empty,
+                    crate::expr::plan_fold::level_may_exclude,
+                ) =>
+        {
             Some(NextLevel::Separate {
                 // subquery_is_pushdown_safe: never into one with a LIMIT.
                 pushed_down: sel.limit_count.is_none() && sel.limit_offset.is_none(),
@@ -458,22 +470,24 @@ fn is_star(t: &protobuf::Node) -> bool {
                 matches!(f.node.as_ref(), Some(node::Node::AStar(_))))))
 }
 
-/// Analyze `sel` (with `run`) as a subquery the query reading it plans as
-/// `plan` (never null-extended there when `kept`). Under the plan-time
-/// checks, the errors of one certainly planned are captured and split; the
-/// others are analyzed without the checks.
+/// Analyze `sel` (with `run`) as a subquery, FROM item `alias`, the query
+/// reading it plans as `plan` (never null-extended there when `kept`).
+/// Under the plan-time checks, the errors of one certainly planned are
+/// captured and split; the others are analyzed without the checks.
 pub(crate) fn analyze<T>(
     plan: Plan,
     sel: &protobuf::SelectStmt,
     kept: bool,
+    alias: &str,
+    snapshot: &PgCatalog,
     run: impl FnOnce() -> T,
 ) -> (T, Split) {
     if plan == Plan::Whole {
         return (run(), Split::default());
     }
-    match next_level(plan, sel, kept) {
+    match next_level(plan, sel, kept, Some(alias), snapshot) {
         Some(next) => {
-            let (out, errors) = crate::expr::plan_fold::with_next_level(next, || {
+            let (out, errors) = crate::expr::plan_fold::with_next_item(next, alias, || {
                 crate::expr::capture_plan_time_errors(run)
             });
             (out, split(sel, errors))
@@ -483,41 +497,88 @@ pub(crate) fn analyze<T>(
     }
 }
 
+/// What planning a CTE's query raises at its references (see
+/// [`analyze_cte`]).
+#[derive(Default)]
+pub(crate) struct PlannedCte {
+    /// Each output column's: raised where the column is read.
+    pub outputs: Vec<Option<AnalyzeError>>,
+    /// The first of the others: raised wherever the CTE is referenced.
+    pub entry: Option<AnalyzeError>,
+    /// Both only where a reference is certainly planned (see
+    /// [`crate::scope::PlannedAlone`]).
+    pub alone: Option<crate::scope::PlannedAlone>,
+}
+
 /// Analyze the query of CTE `cte` (with `run`), and what its references
 /// raise when planned: a CTE the planner may inline is planned like a
-/// FROM subquery at each reference (`plan_of`); a MATERIALIZED one whole,
-/// once, wherever it is referenced at all (an unreferenced one never is).
-/// The errors go to `deferred` by output column (see
+/// FROM subquery at each reference (`plan_of`) — pulled up, or on its own
+/// when its relation is planned; one it doesn't inline (`inlined` is
+/// `Some(false)`: MATERIALIZED, referenced more than once) whole, once,
+/// wherever it is referenced at all (`SS_process_ctes`; an unreferenced
+/// one never is). The errors go to `deferred` by output column (see
 /// [`crate::scope::Deferred`]).
 pub(crate) fn analyze_cte<T>(
     cte: &protobuf::CommonTableExpr,
     recursive: bool,
+    inlined: Option<bool>,
     snapshot: &PgCatalog,
     run: impl FnOnce() -> T,
-) -> (T, Vec<Option<AnalyzeError>>, Option<AnalyzeError>) {
+) -> (T, PlannedCte) {
     let Some(node::Node::SelectStmt(sel)) = cte.ctequery.as_deref().and_then(|q| q.node.as_ref())
     else {
         // A data-modifying CTE always runs.
-        return (run(), Vec::new(), None);
+        return (run(), PlannedCte::default());
     };
-    let materialized = cte.ctematerialized == protobuf::CteMaterialize::Always as i32;
+    let scanned =
+        cte.ctematerialized == protobuf::CteMaterialize::Always as i32 || inlined == Some(false);
     let plan = match plan_of(sel, snapshot) {
         _ if recursive => Plan::Uncertain,
-        Plan::Uncertain | Plan::Separate if materialized => Plan::Whole,
-        // Inlined, it is planned with the relation it is.
-        Plan::Separate => Plan::Uncertain,
+        Plan::Uncertain | Plan::Separate | Plan::PulledUp if scanned => Plan::Whole,
         plan => plan,
     };
     if plan == Plan::Uncertain || !crate::expr::plan_time_checks() {
-        return (crate::expr::may_skip(run), Vec::new(), None);
+        return (crate::expr::may_skip(run), PlannedCte::default());
+    }
+    if plan == Plan::Separate {
+        // Inlined (or else scanned, planned wherever it is referenced at
+        // all), it is planned on its own with the relation a reference
+        // is. What that reference's level pushes down into it is checked
+        // there.
+        let (out, errors) = crate::expr::plan_fold::with_next_level(
+            NextLevel::Separate { pushed_down: false },
+            || crate::expr::capture_plan_time_errors(run),
+        );
+        let split = split(sel, errors);
+        let planned = PlannedCte {
+            outputs: split.outputs,
+            entry: split.rest.map(|(_, e)| e),
+            alone: Some(crate::scope::PlannedAlone {
+                removable: crate::expr::plan_fold::may_be_distinct(sel, snapshot),
+                // subquery_is_pushdown_safe: never into one with a LIMIT.
+                pushed_down: sel.limit_count.is_none() && sel.limit_offset.is_none(),
+            }),
+        };
+        return (out, planned);
     }
     let (out, errors) = crate::expr::capture_plan_time_errors(run);
-    if plan == Plan::Whole || materialized {
-        let first = errors.into_iter().next().map(|(_, e)| e);
-        return (out, Vec::new(), first);
+    if plan == Plan::Whole {
+        let entry = errors.into_iter().next().map(|(_, e)| e);
+        return (
+            out,
+            PlannedCte {
+                entry,
+                ..PlannedCte::default()
+            },
+        );
     }
     let split = split(sel, errors);
-    (out, split.outputs, split.rest.map(|(_, e)| e))
+    let planned = PlannedCte {
+        outputs: split.outputs,
+        entry: split.rest.map(|(_, e)| e),
+        alone: None,
+    };
+    (out, planned)
 }
 
 /// Analyze `sel` (with `run`) as a planned query the rewriter puts in
@@ -548,7 +609,7 @@ pub(crate) fn planned_errors<T>(
         };
         return Some((out, split));
     }
-    let next = next_level(plan, sel, kept)?;
+    let next = next_level(plan, sel, kept, None, snapshot)?;
     let (out, errors) = crate::expr::with_plan_time_checks(|| {
         crate::expr::plan_fold::with_next_level(next, || crate::expr::capture_plan_time_errors(run))
     });
@@ -556,18 +617,40 @@ pub(crate) fn planned_errors<T>(
 }
 
 /// Attach the errors [`analyze_cte`] found to the CTE's `columns`.
-pub(crate) fn attach_to_cte(
-    columns: &mut [crate::scope::ScopeColumn],
-    outputs: Vec<Option<AnalyzeError>>,
-    entry: Option<AnalyzeError>,
-) {
-    for (c, e) in columns.iter_mut().zip(outputs) {
+pub(crate) fn attach_to_cte(columns: &mut [crate::scope::ScopeColumn], planned: PlannedCte) {
+    for (c, e) in columns.iter_mut().zip(planned.outputs) {
         c.deferred.value = e.map(Box::new);
     }
-    if let Some(e) = entry {
+    if let Some(e) = planned.entry {
         let e = Box::new(e);
         for c in columns.iter_mut() {
             c.deferred.entry = Some(e.clone());
+        }
+    }
+    for c in columns.iter_mut() {
+        c.deferred.alone = planned.alone;
+    }
+}
+
+/// Drop from `columns`, those of a reference to a CTE (FROM item
+/// `alias`, never null-extended when `kept`), what planning the CTE
+/// raises when the reference may not be planned (see
+/// [`crate::scope::PlannedAlone`]).
+pub(crate) fn unless_planned_alone(
+    columns: &mut [crate::scope::ScopeColumn],
+    alias: &str,
+    kept: bool,
+) {
+    let Some(alone) = columns.iter().find_map(|c| c.deferred.alone) else {
+        return;
+    };
+    let planned = (kept || !alone.removable)
+        && !crate::expr::plan_fold::level_may_exclude(alias)
+        && !(alone.pushed_down && crate::expr::plan_fold::level_may_push_down());
+    if !planned {
+        for c in columns.iter_mut() {
+            c.deferred.value = None;
+            c.deferred.entry = None;
         }
     }
 }

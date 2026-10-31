@@ -211,3 +211,79 @@ fn torture_deeply_nested_cte_union_join() {
     let info = db.analyze(sql).unwrap();
     assert_cols(&info, vec![c("val", text()), cn("age", int4())]);
 }
+
+// ── CTEs planned on their own ────────────────────────────────────────────────
+//
+// A CTE the planner inlines but can't pull up (LIMIT, ORDER BY, GROUP BY,
+// ...) is a subquery it plans on its own once it plans the relation the
+// reference is — folding its WHERE, and the outputs read — unless the
+// reference's level proves that relation empty, or removes it from a join.
+// One it doesn't inline (MATERIALIZED, referenced twice) is planned whole
+// wherever it is referenced at all.
+
+fn planned_setup() -> PgCatalog {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE t (id int PRIMARY KEY, x int, s text);
+         CREATE TABLE u (id int PRIMARY KEY, x int);",
+    )
+    .unwrap();
+    db
+}
+
+#[test]
+fn an_inlined_cte_planned_on_its_own_fails_where_its_reference_is_planned() {
+    let db = planned_setup();
+    for sql in [
+        "WITH c AS (SELECT x FROM t WHERE 1 / 0 = 1 LIMIT 1) SELECT 1 FROM c",
+        "WITH c AS (SELECT x FROM t WHERE 1 / 0 = 1 ORDER BY x) SELECT 1 FROM c",
+        "WITH c AS (SELECT x FROM t WHERE 1 / 0 = 1 GROUP BY x) SELECT 1 FROM c",
+        "WITH c AS NOT MATERIALIZED (SELECT x FROM t WHERE 1 / 0 = 1 LIMIT 1) \
+         SELECT 1 FROM c a, c b",
+        // A constant qual of several relations is a gating qual.
+        "WITH c AS (SELECT x FROM t WHERE 1 / 0 = 1 LIMIT 1) SELECT 1 FROM c, u WHERE false",
+        // On a join's nullable side, removed only when it may be proven
+        // distinct.
+        "WITH c AS (SELECT x FROM t WHERE 1 / 0 = 1 LIMIT 1) SELECT 1 FROM u LEFT JOIN c ON true",
+        "WITH c AS (SELECT x FROM t WHERE 1 / 0 = 1 LIMIT 1) \
+         SELECT 1 FROM u LEFT JOIN c ON c.x = u.id",
+        // Not inlined: planned whole, its unread outputs too.
+        "WITH c AS (SELECT 1 / 0 AS x) SELECT 1 FROM c a, c b",
+        "WITH c AS (SELECT x FROM t WHERE 1 / 0 = 1) SELECT 1 FROM c a, c b",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::DivisionByZero(_),
+            "division by zero"
+        );
+    }
+    assert_err_prefix!(
+        db.analyze("WITH c AS (SELECT x FROM t WHERE s ~ '(' ORDER BY x) SELECT 1 FROM c"),
+        AnalyzeError::Invalid(_),
+        "invalid regular expression: parentheses () not balanced"
+    );
+    assert_err_prefix!(
+        db.analyze("WITH c AS (SELECT 40000::int2 AS y, x FROM t LIMIT 1) SELECT y FROM c"),
+        AnalyzeError::NumericValueOutOfRange(_),
+        "smallint out of range"
+    );
+    for sql in [
+        // A single relation: the FALSE qual proves it empty.
+        "WITH c AS (SELECT x FROM t WHERE 1 / 0 = 1 LIMIT 1) SELECT 1 FROM c WHERE false",
+        "WITH c AS (SELECT x FROM t WHERE 1 / 0 = 1 LIMIT 1) \
+         SELECT 1 FROM c, (SELECT 1) z WHERE false",
+        // Removed: distinct on the join's column.
+        "WITH c AS (SELECT DISTINCT x FROM t WHERE 1 / 0 = 1) \
+         SELECT 1 FROM u LEFT JOIN c ON c.x = u.id",
+        // An unread output is never planned.
+        "WITH c AS (SELECT 40000::int2 AS y, x FROM t LIMIT 1) SELECT x FROM c",
+        // Never referenced.
+        "WITH c AS (SELECT x FROM t WHERE 1 / 0 = 1 LIMIT 1) SELECT 1",
+        // Folded away around the reference.
+        "WITH c AS (SELECT x FROM t WHERE 1 / 0 = 1 LIMIT 1) \
+         SELECT CASE WHEN true THEN 1 ELSE (SELECT 1 FROM c) END",
+    ] {
+        db.analyze(sql)
+            .unwrap_or_else(|e| panic!("{sql}: unexpected error {e}"));
+    }
+}

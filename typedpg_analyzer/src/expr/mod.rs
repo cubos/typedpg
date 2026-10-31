@@ -1098,6 +1098,126 @@ pub(crate) fn sublink_planned(ctx: Ctx<'_>) -> bool {
     })
 }
 
+/// The expressions of the current query level being inferred, innermost
+/// last (see [`ENCLOSING`]).
+fn level_enclosing() -> Vec<*const protobuf::Node> {
+    ENCLOSING.with(|e| {
+        let e = e.borrow();
+        let start = e.iter().rposition(|p| p.is_null()).map_or(0, |i| i + 1);
+        e[start..].to_vec()
+    })
+}
+
+/// Whether `chain` (expressions, outermost first) is the level's WHERE
+/// clause and AND arguments down from it: what reaches its innermost one
+/// is a top-level AND argument of the WHERE.
+fn where_conjunction(chain: &[*const protobuf::Node]) -> bool {
+    let and = protobuf::BoolExprType::AndExpr as i32;
+    chain
+        .first()
+        .is_some_and(|&p| plan_fold::is_where_clause(p))
+        && chain.iter().all(|&p| {
+            // SAFETY: as in `sublink_planned`, each pointer is a node an
+            // `infer_expr` call still on the stack borrows.
+            let n = unsafe { &*p };
+            matches!(n.node.as_ref(), Some(node::Node::BoolExpr(b)) if b.boolop == and)
+        })
+}
+
+/// Whether sublink `sub`, a top-level AND argument of the level's WHERE,
+/// becomes a semi-join (see [`plan_fold::joined_any_sublink`]), in the
+/// scope of `ctx`.
+fn joined_sublink(sub: &protobuf::SubLink, ctx: Ctx<'_>) -> bool {
+    plan_fold::joined_any_sublink(sub, ctx.snapshot, &|cr| level_column(cr, ctx))
+}
+
+/// [`joined_sublink`] for an EXISTS (see
+/// [`plan_fold::joined_exists_sublink`]).
+fn joined_exists(sub: &protobuf::SubLink, ctx: Ctx<'_>) -> bool {
+    plan_fold::joined_exists_sublink(sub, ctx.snapshot, &|cr| level_column(cr, ctx))
+}
+
+/// Whether column `cr` is one of the level's FROM items (in the scope
+/// of `ctx`).
+fn level_column(cr: &protobuf::ColumnRef, ctx: Ctx<'_>) -> bool {
+    let parts = extract_string_fields(&cr.fields);
+    let (table, column) = match parts.as_slice() {
+        [c] if parts.len() == cr.fields.len() => (None, c.as_str()),
+        [t, c] if parts.len() == cr.fields.len() => (Some(t.as_str()), c.as_str()),
+        _ => return false,
+    };
+    ctx.scope
+        .resolve_column(table, column, None)
+        .is_ok_and(|c| ctx.scope.sources.iter().any(|s| s.alias == c.table_alias))
+}
+
+/// Whether `arg`, an argument of the AND being inferred, is a sublink
+/// `pull_up_sublinks` turns into a semi-join before the AND is folded:
+/// one folding to FALSE before it doesn't drop it.
+pub(crate) fn joined_before_folding(arg: &protobuf::Node, ctx: Ctx<'_>) -> bool {
+    plan_fold::conjunct_sublink(arg).is_some_and(|sub| {
+        where_conjunction(&level_enclosing())
+            && (joined_sublink(sub, ctx) || joined_exists(sub, ctx))
+    })
+}
+
+/// How the planner plans `sel`, the subquery of a sublink being analyzed
+/// (in the scope of `ctx`), when `pull_up_sublinks` certainly turns the
+/// sublink into a semi-join first — an IN sublink that is a top-level AND
+/// argument of the level's WHERE (see [`plan_fold::joined_any_sublink`]):
+/// as a FROM subquery of the level, whatever the WHERE folds to. `None`
+/// when that isn't certain.
+pub(crate) fn semijoin_level(
+    sel: &protobuf::SelectStmt,
+    ctx: Ctx<'_>,
+) -> Option<plan_fold::NextLevel> {
+    if !plan_time_checks() {
+        return None;
+    }
+    let enclosing = level_enclosing();
+    let (&last, mut above) = enclosing.split_last()?;
+    // SAFETY: as in `sublink_planned`, each pointer is a node an
+    // `infer_expr` call still on the stack borrows.
+    let node = |p: *const protobuf::Node| unsafe { &*p };
+    let Some(node::Node::SubLink(sub)) = node(last).node.as_ref() else {
+        return None;
+    };
+    // A NOT EXISTS is an anti-join.
+    let mut top = last;
+    if let Some((&not, rest)) = above.split_last()
+        && plan_fold::conjunct_sublink(node(not)).is_some_and(|s| std::ptr::eq(s, &**sub))
+    {
+        (top, above) = (not, rest);
+    }
+    if !(above.is_empty() && plan_fold::is_where_clause(top) || where_conjunction(above)) {
+        return None;
+    }
+    if !sub
+        .subselect
+        .as_deref()
+        .and_then(|s| s.node.as_ref())
+        .is_some_and(|s| matches!(s, node::Node::SelectStmt(s) if std::ptr::eq(&**s, sel)))
+    {
+        return None;
+    }
+    // An EXISTS's FROM items join the level, its WHERE their qual.
+    if joined_exists(sub, ctx) {
+        return Some(plan_fold::NextLevel::PulledUp);
+    }
+    if !joined_sublink(sub, ctx) {
+        return None;
+    }
+    match crate::resolve::plan_of(sel, ctx.snapshot) {
+        crate::resolve::Plan::PulledUp => Some(plan_fold::NextLevel::PulledUp),
+        crate::resolve::Plan::Separate if !plan_fold::level_may_be_empty() => {
+            Some(plan_fold::NextLevel::Separate {
+                pushed_down: sel.limit_count.is_none() && sel.limit_offset.is_none(),
+            })
+        }
+        _ => None,
+    }
+}
+
 fn infer_expr_here(
     node: &protobuf::Node,
     ctx: Ctx<'_>,
@@ -1163,7 +1283,8 @@ fn infer_expr_unlocated(
                 infer_expr(operand, ctx, params, goal.clone())
             }
             None => infer_type_cast(cast, ctx, params)
-                .and_then(|t| check_folding(node, snapshot).map(|()| t)),
+                .and_then(|t| check_folding(node, ctx).map(|()| t))
+                .and_then(|t| check_io_coercion(cast, ctx).map(|()| t)),
         },
         node::Node::FuncCall(func) => infer_func_call(func, ctx, params),
         // `name => value` only occurs as a function-call argument; its type is
@@ -1185,7 +1306,7 @@ fn infer_expr_unlocated(
             Ok(ExprType::scalar(oid::INT4, false))
         }
         node::Node::AExpr(expr) => {
-            infer_a_expr(expr, ctx, params).and_then(|t| check_folding(node, snapshot).map(|()| t))
+            infer_a_expr(expr, ctx, params).and_then(|t| check_folding(node, ctx).map(|()| t))
         }
         node::Node::BoolExpr(expr) => infer_bool_expr(expr, ctx, params),
         node::Node::NullTest(t) => {
@@ -2272,14 +2393,112 @@ pub(crate) fn capture_plan_time_errors<R>(f: impl FnOnce() -> R) -> (R, Vec<Plan
 /// or an operator, its operands already checked), under
 /// [`with_plan_time_checks`]: `40000::int2`, `2147483647 + 1`, `1 / 0`
 /// fail every execution (see [`crate::fold`]).
-fn check_folding(node: &protobuf::Node, snapshot: &PgCatalog) -> Result<(), AnalyzeError> {
+fn check_folding(node: &protobuf::Node, ctx: Ctx<'_>) -> Result<(), AnalyzeError> {
     if plan_time_checks()
-        && let Some(e) = crate::fold::error(node, snapshot)
+        && let Some(e) = crate::fold::error_in(node, ctx.snapshot, &|cr| {
+            plan_fold::substituted_column(cr, ctx)
+        })
         && let Some(e) = plan_time_error(crate::error::node_location(node), e.at(node))
     {
         return Err(e);
     }
     Ok(())
+}
+
+/// The error the planner raises folding cast `cast` of a text constant to
+/// a type without a cast function from text, under
+/// [`with_plan_time_checks`]: a conversion through the types' I/O
+/// functions (`CoerceViaIO`), which `eval_const_expressions` runs when
+/// they are immutable — `'40000'::text::int2` fails every execution with
+/// `int2in`'s error, as `'40000'::int2` fails parse analysis. Only for the
+/// built-in types whose input functions are immutable and modelled (see
+/// [`crate::literal_input`]).
+fn check_io_coercion(cast: &protobuf::TypeCast, ctx: Ctx<'_>) -> Result<(), AnalyzeError> {
+    if !plan_time_checks() {
+        return Ok(());
+    }
+    let snapshot = ctx.snapshot;
+    let Some(tn) = cast
+        .type_name
+        .as_ref()
+        .filter(|t| t.array_bounds.is_empty())
+    else {
+        return Ok(());
+    };
+    let Some(target) = crate::ddl::util::resolve_type_name(tn, snapshot) else {
+        return Ok(());
+    };
+    if !matches!(
+        target,
+        oid::INT2 | oid::INT4 | oid::INT8 | oid::NUMERIC | oid::BOOL | oid::FLOAT4 | oid::FLOAT8
+    ) {
+        return Ok(());
+    }
+    let Some(text) = cast.arg.as_deref().and_then(|a| text_constant(a, ctx)) else {
+        return Ok(());
+    };
+    // A cast function from text (a user's) isn't an I/O conversion.
+    if snapshot
+        .pg_cast
+        .values()
+        .any(|c| matches!(c.castsource, oid::TEXT | oid::VARCHAR) && c.casttarget == target)
+    {
+        return Ok(());
+    }
+    // The input function gets no typmod (a typmod is applied after).
+    match crate::literal_input::validate_with_typmod(&text, target, None, snapshot) {
+        Ok(()) => Ok(()),
+        Err(msg) => {
+            let location = cast.arg.as_deref().and_then(crate::error::node_location);
+            let span = location.and_then(crate::error::SourceSpan::from_node_token);
+            let e = crate::error::RawError::invalid_literal(msg, span).finalize_implicit();
+            plan_time_error(location, e).map_or(Ok(()), Err)
+        }
+    }
+}
+
+/// The value of `n` when it is a `text` constant once folded: a string
+/// literal cast to `text` (or `varchar` without a length), or a column the
+/// planner replaces by one (a pulled-up subquery's untyped literal output,
+/// resolved to `text`).
+fn text_constant(n: &protobuf::Node, ctx: Ctx<'_>) -> Option<String> {
+    let string = |n: &protobuf::Node| match n.node.as_ref()? {
+        node::Node::AConst(c) if !c.isnull => match c.val.as_ref()? {
+            a_const::Val::Sval(s) => Some(s.sval.clone()),
+            _ => None,
+        },
+        _ => None,
+    };
+    match n.node.as_ref()? {
+        node::Node::TypeCast(tc) => {
+            let tn = tc.type_name.as_ref()?;
+            let to = crate::ddl::util::resolve_type_name(tn, ctx.snapshot)?;
+            (tn.array_bounds.is_empty()
+                && tn.typmods.is_empty()
+                && matches!(to, oid::TEXT | oid::VARCHAR))
+            .then(|| string(tc.arg.as_deref()?))
+            .flatten()
+        }
+        node::Node::ColumnRef(cr) => {
+            let e = plan_fold::substituted_column(cr, ctx)?;
+            let parts = extract_string_fields(&cr.fields);
+            let (table, column) = match parts.as_slice() {
+                [c] => (None, c.as_str()),
+                [t, c] => (Some(t.as_str()), c.as_str()),
+                _ => return None,
+            };
+            let col = ctx.scope.resolve_column(table, column, None).ok()?;
+            if col.type_oid != oid::TEXT {
+                return None;
+            }
+            match e.node.as_ref()? {
+                node::Node::AConst(_) => string(&e),
+                node::Node::TypeCast(_) => text_constant(&e, ctx),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 /// PG's `transformExpressionList` for a `ROW(...)` constructor's arguments:

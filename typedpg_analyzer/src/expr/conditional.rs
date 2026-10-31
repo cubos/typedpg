@@ -52,7 +52,8 @@ pub(crate) fn infer_bool_expr(
             Some(n) => ctx.with_null_ctx(n),
             None => ctx,
         };
-        let t = super::plan_fold::unless_dead(dead, || {
+        let arg_dead = dead && !(!or && and_or && super::joined_before_folding(arg, ctx));
+        let t = super::plan_fold::unless_dead(arg_dead, || {
             crate::clause::coerce_clause_expr(arg, arg_ctx, params, kind)
         })?;
         if and_or {

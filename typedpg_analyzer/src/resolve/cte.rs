@@ -1107,8 +1107,8 @@ fn analyze_with_clause_here(
                 _ => None,
             }
         };
-        let (analyzed, outputs, entry) =
-            super::deferred::analyze_cte(cte, recursive[i], snapshot, || {
+        let (analyzed, planned) =
+            super::deferred::analyze_cte(cte, recursive[i], inlined, snapshot, || {
                 analyze_cte(
                     cte,
                     recursive[i],
@@ -1120,7 +1120,7 @@ fn analyze_with_clause_here(
                 )
             });
         let mut analyzed = analyzed?;
-        super::deferred::attach_to_cte(&mut analyzed.columns, outputs, entry);
+        super::deferred::attach_to_cte(&mut analyzed.columns, planned);
         // A VALUES the executor can't start: a CTE scanned on its own is
         // planned and started wherever it is referenced; an inlined one
         // where its reference is (see `check_values_sort`).

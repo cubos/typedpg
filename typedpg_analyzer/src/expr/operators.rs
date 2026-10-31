@@ -1505,7 +1505,7 @@ pub(crate) fn check_regex_restrictions(
     node: &protobuf::Node,
     ctx: Ctx<'_>,
 ) -> Result<(), AnalyzeError> {
-    if !plan_time_checks() || super::plan_fold::level_may_be_empty() {
+    if !plan_time_checks() {
         return Ok(());
     }
     regex_restrictions(node, ctx, false)
@@ -1552,6 +1552,10 @@ fn regex_restrictions(
             let Some(source) = ctx.scope.sources.iter().find(|s| s.alias == alias) else {
                 return Ok(());
             };
+            // Never estimated when proven empty first.
+            if super::plan_fold::level_may_exclude(&alias) {
+                return Ok(());
+            }
             let estimated = if matches!(source.kind, crate::scope::SourceKind::Relation) {
                 super::plan_fold::restriction_estimated(source, ctx.snapshot)
             } else {

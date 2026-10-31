@@ -12,11 +12,16 @@
 //!   after one that folds to TRUE, and the COALESCE arguments after a
 //!   non-NULL constant: what follows is never folded, nor are its sublinks
 //!   planned;
+//! - `pull_up_sublinks` first turns an IN or [NOT] EXISTS sublink that is a
+//!   top-level AND argument of WHERE into a join: its subquery is planned
+//!   with the query, whatever the WHERE then folds to;
 //! - a relation is estimated only when it isn't proven empty first
 //!   (`relation_excluded_by_constraints`: a constant FALSE / NULL
 //!   restriction, an equivalence class equating two different constants,
-//!   `col IS NULL` over a NOT NULL column; partition pruning; an inheritance
-//!   child's constraints), nor removed (`remove_useless_joins`).
+//!   `col IS NULL` over a NOT NULL column — which prove only that column's
+//!   relation empty; partition pruning; an inheritance child's
+//!   constraints), nor removed (`remove_useless_joins`, which needs a
+//!   relation it can prove distinct).
 //!
 //! Each check here errs towards *not* raising: an expression whose value
 //! the analyzer can't compute counts as one that may fold to a constant,
@@ -123,15 +128,7 @@ pub(crate) fn may_be_volatile(n: &protobuf::Node, snapshot: &PgCatalog) -> bool 
                 }
             }
             typedpg_pg_query::NodeRef::AExpr(e) => {
-                let names = extract_names(&e.name);
-                if let Some(name) = names.last()
-                    && snapshot.pg_operator.values().any(|o| {
-                        &o.oprname == name
-                            && o.oprcode
-                                .and_then(|c| snapshot.pg_proc.get(&c))
-                                .is_none_or(volatile)
-                    })
-                {
+                if operator_may_be_volatile(&e.name, snapshot) {
                     return true;
                 }
             }
@@ -151,6 +148,218 @@ pub(crate) fn may_be_volatile(n: &protobuf::Node, snapshot: &PgCatalog) -> bool 
         todo.extend(n.children());
     }
     false
+}
+
+/// Whether an operator named `name` may be a volatile one (or one whose
+/// function the analyzer can't find).
+fn operator_may_be_volatile(name: &[protobuf::Node], snapshot: &PgCatalog) -> bool {
+    let names = extract_names(name);
+    names.last().is_some_and(|name| {
+        snapshot.pg_operator.values().any(|o| {
+            &o.oprname == name
+                && o.oprcode
+                    .and_then(|c| snapshot.pg_proc.get(&c))
+                    .is_none_or(|p| p.provolatile == ProVolatile::Volatile)
+        })
+    })
+}
+
+/// Whether `pull_up_sublinks` turns `sub`, a top-level AND argument of a
+/// WHERE clause, into a semi-join (`convert_ANY_sublink_to_join`) — before
+/// the clause is folded: an `x IN (SELECT …)` (or `= ANY`) whose tested
+/// expression reads a column of the level (as `is_level_column` tells)
+/// and calls nothing volatile. Its subquery then joins the level, a FROM
+/// subquery never null-extended.
+pub(crate) fn joined_any_sublink(
+    sub: &protobuf::SubLink,
+    snapshot: &PgCatalog,
+    is_level_column: &dyn Fn(&protobuf::ColumnRef) -> bool,
+) -> bool {
+    if sub.sub_link_type != protobuf::SubLinkType::AnySublink as i32 {
+        return false;
+    }
+    let Some(test) = sub.testexpr.as_deref() else {
+        return false;
+    };
+    if may_be_volatile(test, snapshot)
+        || (!sub.oper_name.is_empty() && operator_may_be_volatile(&sub.oper_name, snapshot))
+    {
+        return false;
+    }
+    let Some(inner) = test.node.as_ref() else {
+        return false;
+    };
+    let mut todo = vec![inner.to_ref()];
+    while let Some(n) = todo.pop() {
+        match n {
+            // A sublink's columns are its own query's.
+            typedpg_pg_query::NodeRef::SubLink(_) => continue,
+            typedpg_pg_query::NodeRef::ColumnRef(cr) if is_level_column(cr) => return true,
+            _ => {}
+        }
+        todo.extend(n.children());
+    }
+    false
+}
+
+/// Whether `pull_up_sublinks` turns `sub`, an EXISTS sublink that is (or
+/// whose NOT is) a top-level AND argument of a WHERE clause, into a semi-
+/// (anti-) join before the clause is folded
+/// (`convert_EXISTS_sublink_to_join`): `simplify_EXISTS_query` can throw
+/// its select list away (no aggregate, window or set-returning function,
+/// grouping, HAVING, OFFSET, LIMIT but a positive one, locking, set
+/// operation or WITH), its
+/// FROM reads plain relations only, and its WHERE reads a column of the
+/// level (`is_level_column`, of a column named by no FROM item of the
+/// subquery) and calls nothing volatile. Its FROM items then join the
+/// level, its WHERE becomes the join's qual.
+pub(crate) fn joined_exists_sublink(
+    sub: &protobuf::SubLink,
+    snapshot: &PgCatalog,
+    is_level_column: &dyn Fn(&protobuf::ColumnRef) -> bool,
+) -> bool {
+    if sub.sub_link_type != protobuf::SubLinkType::ExistsSublink as i32 {
+        return false;
+    }
+    let Some(node::Node::SelectStmt(sel)) = sub.subselect.as_deref().and_then(|s| s.node.as_ref())
+    else {
+        return false;
+    };
+    if sel.op != protobuf::SetOperation::SetopNone as i32
+        || !sel.values_lists.is_empty()
+        || sel.with_clause.is_some()
+        || !sel.group_clause.is_empty()
+        || sel.having_clause.is_some()
+        || !sel.window_clause.is_empty()
+        || sel.limit_offset.is_some()
+        // A positive constant LIMIT is dropped.
+        || sel
+            .limit_count
+            .as_deref()
+            .is_some_and(|l| int_literal(l).is_none_or(|n| n <= 0))
+        || !sel.locking_clause.is_empty()
+    {
+        return false;
+    }
+    let mut inner = Vec::new();
+    for f in &sel.from_clause {
+        let Some(node::Node::RangeVar(rv)) = f.node.as_ref() else {
+            return false;
+        };
+        inner.push(
+            rv.alias
+                .as_ref()
+                .map_or(rv.relname.as_str(), |a| &a.aliasname),
+        );
+    }
+    // No aggregate, window or set-returning function in what the planner
+    // throws away (nor anything the analyzer can't tell of).
+    let mut todo: Vec<typedpg_pg_query::NodeRef<'_>> = sel
+        .target_list
+        .iter()
+        .chain(&sel.sort_clause)
+        .filter_map(|n| n.node.as_ref().map(node::Node::to_ref))
+        .collect();
+    while let Some(n) = todo.pop() {
+        match n {
+            typedpg_pg_query::NodeRef::SubLink(_) => continue,
+            typedpg_pg_query::NodeRef::FuncCall(fc) => {
+                let names = extract_names(&fc.funcname);
+                let (schema, name) = match names.as_slice() {
+                    [n] => (None, n.as_str()),
+                    [s, n] => (Some(s.as_str()), n.as_str()),
+                    _ => return false,
+                };
+                let candidates = snapshot.find_functions(schema, name);
+                if fc.over.is_some()
+                    || fc.agg_star
+                    || candidates.is_empty()
+                    || candidates.iter().any(|p| {
+                        p.proretset
+                            || matches!(
+                                p.prokind,
+                                crate::pg_catalog::ProKind::Aggregate
+                                    | crate::pg_catalog::ProKind::Window
+                            )
+                    })
+                {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+        todo.extend(n.children());
+    }
+    let Some(qual) = sel.where_clause.as_deref() else {
+        return false;
+    };
+    if may_be_volatile(qual, snapshot) {
+        return false;
+    }
+    let Some(qual) = qual.node.as_ref() else {
+        return false;
+    };
+    let mut todo = vec![qual.to_ref()];
+    while let Some(n) = todo.pop() {
+        match n {
+            typedpg_pg_query::NodeRef::SubLink(_) => continue,
+            typedpg_pg_query::NodeRef::ColumnRef(cr) => {
+                let names = extract_names(&cr.fields);
+                if let [t, _] = names.as_slice()
+                    && names.len() == cr.fields.len()
+                    && !inner.contains(&t.as_str())
+                    && is_level_column(cr)
+                {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        todo.extend(n.children());
+    }
+    false
+}
+
+/// The sublink `pull_up_sublinks` may turn into a join a top-level AND
+/// argument `n` of a WHERE clause holds: `n` itself, or the EXISTS a NOT
+/// negates.
+pub(crate) fn conjunct_sublink(n: &protobuf::Node) -> Option<&protobuf::SubLink> {
+    match n.node.as_ref()? {
+        node::Node::SubLink(sub) => Some(sub),
+        node::Node::BoolExpr(b) if b.boolop == protobuf::BoolExprType::NotExpr as i32 => {
+            match b.args.as_slice() {
+                [a] => match a.node.as_ref()? {
+                    node::Node::SubLink(sub)
+                        if sub.sub_link_type == protobuf::SubLinkType::ExistsSublink as i32 =>
+                    {
+                        Some(sub)
+                    }
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+thread_local! {
+    /// The WHERE clause being analyzed, at the innermost level analyzing
+    /// one (see [`with_where_clause`]).
+    static WHERE_ROOT: Cell<*const protobuf::Node> = const { Cell::new(std::ptr::null()) };
+}
+
+/// Run `f`, the analysis of WHERE clause `n`.
+pub(crate) fn with_where_clause<R>(n: &protobuf::Node, f: impl FnOnce() -> R) -> R {
+    let prev = WHERE_ROOT.with(|w| w.replace(std::ptr::from_ref(n)));
+    let out = f();
+    WHERE_ROOT.with(|w| w.set(prev));
+    out
+}
+
+/// Whether `n` is the WHERE clause being analyzed.
+pub(crate) fn is_where_clause(n: *const protobuf::Node) -> bool {
+    !n.is_null() && WHERE_ROOT.with(|w| w.get() == n)
 }
 
 /// The value of a whole-number literal.
@@ -228,6 +437,26 @@ fn qual_with(
         Folded::Null => Folded::Bool(false),
         Folded::Bool(v) => Folded::Bool(v != negated),
         other => other,
+    }
+}
+
+/// The expression the planner replaces column `cr` by, in the scope of
+/// `ctx`, before folding: the output of a subquery it certainly pulls up
+/// where it is never null-extended (see [`crate::scope::Substitution`]).
+pub(crate) fn substituted_column(
+    cr: &protobuf::ColumnRef,
+    ctx: super::Ctx<'_>,
+) -> Option<std::sync::Arc<protobuf::Node>> {
+    let parts = extract_names(&cr.fields);
+    let (table, column) = match parts.as_slice() {
+        [c] if parts.len() == cr.fields.len() => (None, c.as_str()),
+        [t, c] if parts.len() == cr.fields.len() => (Some(t.as_str()), c.as_str()),
+        _ => return None,
+    };
+    let col = ctx.scope.resolve_column(table, column, None).ok()?;
+    match col.deferred.substitution {
+        crate::scope::Substitution::Certain => col.deferred.expr.clone(),
+        _ => None,
     }
 }
 
@@ -600,12 +829,20 @@ pub(crate) fn bound_param(number: i32) -> Option<String> {
 // ─── Query levels ───────────────────────────────────────────────────────────
 
 /// What a query level's quals tell of the relations the planner estimates.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct LevelQuals {
-    /// The planner may prove a relation of the level empty (or remove it)
-    /// before estimating it: no restriction is estimated, and the
+    /// The planner may prove any relation of the level empty (or remove
+    /// it) before estimating it: no restriction is estimated, and the
     /// subqueries in FROM planned on their own may never be planned.
     may_be_empty: bool,
+    /// The FROM items of the level (by alias) the planner may prove
+    /// empty, beside: a qual over a column proves only that column's
+    /// relation empty (`relation_excluded_by_constraints` reads a
+    /// relation's own restrictions); the others are still estimated.
+    excluded: Vec<String>,
+    /// The aliases of the level's own FROM items: one [`Self::excluded`]
+    /// can't tell of (a join's alias) may be any.
+    items: Vec<String>,
     /// The plan of the level may be a dummy one — a relation, or a join
     /// with a constant FALSE qual, proven empty — whose nodes the executor
     /// never starts.
@@ -648,6 +885,9 @@ thread_local! {
     /// subquery it plans on its own (`set_subquery_pathlist`).
     static PUSHABLE: RefCell<Vec<Vec<protobuf::Node>>> = const { RefCell::new(Vec::new()) };
     static NEXT_LEVEL: Cell<NextLevel> = const { Cell::new(NextLevel::Own) };
+    /// The alias of the FROM item the next level analyzed is, in the
+    /// level around it (see [`with_next_item`]).
+    static NEXT_ITEM: RefCell<Option<String>> = const { RefCell::new(None) };
     /// Aliases of FROM items whose restrictions are not estimated (see
     /// [`skip_restrictions_on`]).
     static SKIPPED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
@@ -659,6 +899,15 @@ pub(crate) fn with_next_level<R>(next: NextLevel, f: impl FnOnce() -> R) -> R {
     let prev = NEXT_LEVEL.with(|n| n.replace(next));
     let out = f();
     NEXT_LEVEL.with(|n| n.set(prev));
+    out
+}
+
+/// [`with_next_level`] for a level that is FROM item `alias` of the level
+/// around it: what that level's quals prove of `alias` alone holds for it.
+pub(crate) fn with_next_item<R>(next: NextLevel, alias: &str, f: impl FnOnce() -> R) -> R {
+    let prev = NEXT_ITEM.with(|n| n.replace(Some(alias.to_owned())));
+    let out = with_next_level(next, f);
+    NEXT_ITEM.with(|n| *n.borrow_mut() = prev);
     out
 }
 
@@ -696,11 +945,12 @@ impl PlanLevel {
         ctes: impl IntoIterator<Item = &'a String>,
         snapshot: &PgCatalog,
     ) -> Self {
-        let mut names: Vec<&str> = ctes.into_iter().map(String::as_str).collect();
+        // (An outer WITH's CTEs are known by name only.)
+        let mut names: Vec<Cte<'_>> = ctes.into_iter().map(|n| (n.as_str(), None)).collect();
         if let Some(with) = &sel.with_clause {
             for c in &with.ctes {
                 if let Some(node::Node::CommonTableExpr(c)) = c.node.as_ref() {
-                    names.push(c.ctename.as_str());
+                    names.push((c.ctename.as_str(), Some(c)));
                 }
             }
         }
@@ -717,12 +967,13 @@ impl PlanLevel {
         where_clause: Option<&protobuf::Node>,
         from: &[protobuf::Node],
         having: Option<&protobuf::Node>,
-        ctes: &[&str],
+        ctes: &[Cte<'_>],
         snapshot: &PgCatalog,
     ) -> Self {
         let next = NEXT_LEVEL.with(|n| n.replace(NextLevel::Own));
+        let item = NEXT_ITEM.with(|n| n.replace(None));
         let parent = LEVELS
-            .with(|l| l.borrow().last().copied())
+            .with(|l| l.borrow().last().cloned())
             .unwrap_or_default();
         let quals = if super::plan_time_checks() {
             let mut conjuncts = Vec::new();
@@ -742,17 +993,32 @@ impl PlanLevel {
             let mut dummy_quals = conjuncts.clone();
             dummy_quals.extend(having_quals.iter().copied());
             let mut group = Group::default();
-            group.walk(where_clause, from, ctes, snapshot);
-            group.quals.extend(having_quals.into_iter().cloned());
+            group.walk(where_clause, from, ctes, snapshot, &Owner::Level);
+            group
+                .quals
+                .extend(having_quals.into_iter().map(|q| (q.clone(), Owner::Level)));
+            // A level inside one any relation of which may be proven
+            // empty may be, to be sure — a FROM subquery pulled up, only
+            // when its relations may be.
+            let parent_empty = match &item {
+                Some(alias)
+                    if matches!(next, NextLevel::PulledUp | NextLevel::PulledUpNullable) =>
+                {
+                    parent.excludes(alias)
+                }
+                _ => parent.may_be_empty || !parent.excluded.is_empty(),
+            };
             let (rels, inherited) = match next {
-                NextLevel::PulledUp => (group.rels.max(parent.rels), parent.may_be_empty),
+                NextLevel::PulledUp => (group.rels.max(parent.rels), parent_empty),
                 NextLevel::PulledUpNullable | NextLevel::Own | NextLevel::Subplan => {
-                    (group.rels, parent.may_be_empty)
+                    (group.rels, parent_empty)
                 }
                 NextLevel::Separate { pushed_down } => {
                     if pushed_down {
                         let pushed = PUSHABLE.with(|p| p.borrow().last().cloned());
-                        group.quals.extend(pushed.into_iter().flatten());
+                        group
+                            .quals
+                            .extend(pushed.into_iter().flatten().map(|q| (q, Owner::Level)));
                     }
                     (group.rels, false)
                 }
@@ -763,8 +1029,11 @@ impl PlanLevel {
                 .map(|c| (*c).clone())
                 .collect();
             PUSHABLE.with(|p| p.borrow_mut().push(pushable));
+            let proven = group.may_be_empty(rels, snapshot);
             LevelQuals {
-                may_be_empty: inherited || group.may_be_empty(rels, snapshot),
+                may_be_empty: inherited || proven.whole,
+                excluded: proven.aliases,
+                items: std::mem::take(&mut group.aliases),
                 may_be_dummy: (parent.may_be_dummy && next != NextLevel::Subplan)
                     || may_be_empty(&dummy_quals, snapshot),
                 conjuncts: conjuncts.len(),
@@ -793,8 +1062,14 @@ impl Drop for PlanLevel {
 /// planner may inline, a CTE it may inline) counts for none.
 #[derive(Default)]
 struct Group {
-    /// The quals the planner distributes over the level's join tree.
-    quals: Vec<protobuf::Node>,
+    /// The quals the planner distributes over the level's join tree, each
+    /// with where it comes from (see [`Owner`]).
+    quals: Vec<(protobuf::Node, Owner)>,
+    /// The aliases of the level's own FROM items (tables, subqueries,
+    /// functions — not joins), which a column proves empty.
+    aliases: Vec<String>,
+    /// The tables among them.
+    tables: Vec<crate::oid::PgClassOid>,
     /// Some quals of a subquery or CTE the planner may pull up are unknown.
     unknown_quals: bool,
     /// A reference to a column may be replaced by an expression, maybe a
@@ -815,27 +1090,85 @@ impl Group {
         &mut self,
         where_clause: Option<&protobuf::Node>,
         from: &[protobuf::Node],
-        ctes: &[&str],
+        ctes: &[Cte<'_>],
         snapshot: &PgCatalog,
+        owner: &Owner,
     ) {
         if let Some(w) = where_clause {
             let mut quals = Vec::new();
             flatten_and(w, &mut quals);
-            self.quals.extend(quals.into_iter().cloned());
+            self.quals
+                .extend(quals.into_iter().map(|q| (q.clone(), owner.clone())));
         }
         for f in from {
-            self.item(f, true, ctes, snapshot);
+            self.item(f, true, ctes, snapshot, owner);
+        }
+        // The IN sublinks `pull_up_sublinks` turns into semi-joins: their
+        // subqueries join the level (any qual in them may prove empty
+        // what can't be told).
+        if let (Some(w), Owner::Level) = (where_clause, owner) {
+            let mut quals = Vec::new();
+            flatten_and(w, &mut quals);
+            let owner = Owner::Item {
+                alias: String::new(),
+                lateral: true,
+            };
+            for q in quals {
+                let Some(sub) = conjunct_sublink(q) else {
+                    continue;
+                };
+                let Some(node::Node::SelectStmt(sel)) =
+                    sub.subselect.as_deref().and_then(|s| s.node.as_ref())
+                else {
+                    continue;
+                };
+                let level = |cr: &protobuf::ColumnRef| self.reads_level(cr, snapshot);
+                if joined_any_sublink(sub, snapshot, &level) {
+                    self.subquery(sel, true, ctes, snapshot, &owner);
+                } else if joined_exists_sublink(sub, snapshot, &level) {
+                    // Its FROM items join the level, its WHERE is their
+                    // join's qual.
+                    self.walk(
+                        sel.where_clause.as_deref(),
+                        &sel.from_clause,
+                        ctes,
+                        snapshot,
+                        &owner,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Whether column `cr` certainly is one of the level's: qualified by
+    /// one of its FROM items, or (unqualified) a column of one of its
+    /// tables.
+    fn reads_level(&self, cr: &protobuf::ColumnRef, snapshot: &PgCatalog) -> bool {
+        let names = extract_names(&cr.fields);
+        if names.len() != cr.fields.len() {
+            return false;
+        }
+        match names.as_slice() {
+            [t, _] => self.aliases.contains(t),
+            [c] => self.tables.iter().any(|r| {
+                snapshot
+                    .attributes_of(*r)
+                    .iter()
+                    .any(|a| &a.attname == c && a.attnum > 0)
+            }),
+            _ => false,
         }
     }
 
     /// A subquery (or view's query) `sel` in FROM, which may read the CTEs
-    /// `ctes`, never null-extended when `kept`.
+    /// `ctes`, never null-extended when `kept`; its quals are `owner`'s.
     fn subquery(
         &mut self,
         sel: &protobuf::SelectStmt,
         kept: bool,
-        ctes: &[&str],
+        ctes: &[Cte<'_>],
         snapshot: &PgCatalog,
+        owner: &Owner,
     ) {
         if !kept {
             return;
@@ -854,6 +1187,7 @@ impl Group {
                     &sel.from_clause,
                     ctes,
                     snapshot,
+                    owner,
                 );
             }
             crate::resolve::Plan::Separate | crate::resolve::Plan::Whole => self.rels += 1,
@@ -862,14 +1196,51 @@ impl Group {
         }
     }
 
-    /// FROM item `n`, never null-extended when `kept`.
-    fn item(&mut self, n: &protobuf::Node, kept: bool, ctes: &[&str], snapshot: &PgCatalog) {
+    /// FROM item `n`, never null-extended when `kept`, below the FROM
+    /// item of the level `owner` says (one of the level's own when
+    /// [`Owner::Level`]).
+    fn item(
+        &mut self,
+        n: &protobuf::Node,
+        kept: bool,
+        ctes: &[Cte<'_>],
+        snapshot: &PgCatalog,
+        owner: &Owner,
+    ) {
+        let level_own = matches!(owner, Owner::Level);
+        // The quals below one of the level's own FROM items are about it.
+        let own = |alias: &str, lateral: bool| match owner {
+            Owner::Level => Owner::Item {
+                alias: alias.to_owned(),
+                lateral,
+            },
+            other => other.clone(),
+        };
+        let mut record = |alias: &str| {
+            if matches!(owner, Owner::Level) {
+                self.aliases.push(alias.to_owned());
+            }
+        };
         match n.node.as_ref() {
             Some(node::Node::RangeVar(rv)) => {
-                if rv.schemaname.is_empty() && ctes.contains(&rv.relname.as_str()) {
-                    // An inlined CTE is a pulled-up subquery.
-                    self.unknown_quals |= kept;
-                    self.substitutes |= kept;
+                let alias = rv
+                    .alias
+                    .as_ref()
+                    .map_or(rv.relname.as_str(), |a| &a.aliasname);
+                record(alias);
+                let owner = &own(alias, false);
+                if rv.schemaname.is_empty()
+                    && let Some((_, cte)) = ctes.iter().rev().find(|(n, _)| *n == rv.relname)
+                {
+                    if cte.is_some_and(|c| scanned_alone(c, snapshot)) {
+                        if kept {
+                            self.rels += 1;
+                        }
+                    } else {
+                        // An inlined CTE may be a pulled-up subquery.
+                        self.unknown_quals |= kept;
+                        self.substitutes |= kept;
+                    }
                     return;
                 }
                 let schema = (!rv.schemaname.is_empty()).then_some(rv.schemaname.as_str());
@@ -881,6 +1252,9 @@ impl Group {
                     | RelKind::Partitioned
                     | RelKind::MaterializedView
                     | RelKind::ForeignTable => {
+                        if level_own {
+                            self.tables.push(class.oid);
+                        }
                         // Self-join elimination may merge two scans of
                         // one table.
                         if kept && !self.relids.contains(&class.oid) {
@@ -901,7 +1275,7 @@ impl Group {
                         // A view's query sees no CTE of the statement.
                         Some(node::Node::SelectStmt(sel)) => {
                             self.views.push(class.oid);
-                            self.subquery(&sel, kept, &[], snapshot);
+                            self.subquery(&sel, kept, &[], snapshot, owner);
                             self.views.pop();
                         }
                         _ => self.unknown_quals = true,
@@ -910,10 +1284,14 @@ impl Group {
                 }
             }
             Some(node::Node::RangeSubselect(sub)) => {
+                // (An unaliased subquery is named by nothing.)
+                let alias = sub.alias.as_ref().map_or("", |a| a.aliasname.as_str());
+                record(alias);
+                let owner = &own(alias, sub.lateral);
                 if let Some(node::Node::SelectStmt(sel)) =
                     sub.subquery.as_deref().and_then(|q| q.node.as_ref())
                 {
-                    self.subquery(sel, kept, ctes, snapshot);
+                    self.subquery(sel, kept, ctes, snapshot, owner);
                 }
             }
             Some(node::Node::JoinExpr(j)) => {
@@ -924,46 +1302,161 @@ impl Group {
                     _ => (false, false),
                 };
                 if let Some(l) = j.larg.as_deref() {
-                    self.item(l, left, ctes, snapshot);
+                    self.item(l, left, ctes, snapshot, owner);
                 }
                 if let Some(r) = j.rarg.as_deref() {
-                    self.item(r, right, ctes, snapshot);
+                    self.item(r, right, ctes, snapshot, owner);
                 }
                 if let Some(q) = j.quals.as_deref() {
                     let mut quals = Vec::new();
                     flatten_and(q, &mut quals);
-                    self.quals.extend(quals.into_iter().cloned());
+                    self.quals
+                        .extend(quals.into_iter().map(|q| (q.clone(), owner.clone())));
                 }
             }
             // A function the planner may inline as a subquery it pulls up.
-            Some(node::Node::RangeFunction(_)) => self.substitutes |= kept,
+            Some(node::Node::RangeFunction(rf)) => {
+                if let Some(a) = rf.alias.as_ref() {
+                    record(&a.aliasname);
+                }
+                self.substitutes |= kept;
+            }
             _ => {}
         }
     }
 
-    /// Whether the planner may prove a relation of the level empty: a
-    /// qual over a column proves it of that column's relation (`col IS
+    /// Which relations of the level the planner may prove empty: a qual
+    /// over a column proves it of that column's relation only (`col IS
     /// NULL` over a NOT NULL column, two constants one equivalence class
-    /// equates) — any of the level's, to be sure. A qual without columns
-    /// that may fold to a constant other than TRUE is distributed to every
-    /// relation of the level (`distribute_qual_to_rels`): with a single
-    /// one, it is that relation's restriction, which proves it empty
+    /// equates — of a single relation, or else a gating qual). A qual
+    /// without columns that may fold to a constant other than TRUE is
+    /// distributed to every relation of the level
+    /// (`distribute_qual_to_rels`): with a single one, it is that
+    /// relation's restriction, which proves it empty
     /// (`relation_excluded_by_constraints`); with several, it is a gating
     /// qual above their join, and each is still estimated.
-    fn may_be_empty(&self, rels: usize, snapshot: &PgCatalog) -> bool {
+    fn may_be_empty(&self, rels: usize, snapshot: &PgCatalog) -> Proven {
         let constant = self.unknown_quals
             || (self.substitutes && !self.quals.is_empty())
-            || self.quals.iter().any(|q| {
+            || self.quals.iter().any(|(q, _)| {
                 let folded = fold_qual(q, snapshot);
                 folded.may_be_const() && folded != Folded::Bool(true)
             });
-        let column_quals: Vec<&protobuf::Node> = self
+        let column_quals: Vec<(&protobuf::Node, &Owner)> = self
             .quals
             .iter()
-            .filter(|q| !fold_qual(q, snapshot).may_be_const())
+            .filter(|(q, _)| !fold_qual(q, snapshot).may_be_const())
+            .map(|(q, o)| (q, o))
             .collect();
-        (constant && rels < 2) || may_be_empty(&column_quals, snapshot)
+        let mut proven = Proven::default();
+        let mut equalities = Vec::new();
+        for (q, owner) in &column_quals {
+            match q.node.as_ref() {
+                Some(node::Node::NullTest(t))
+                    if t.nulltesttype == protobuf::NullTestType::IsNull as i32
+                        && matches!(
+                            t.arg.as_deref().and_then(|a| a.node.as_ref()),
+                            Some(node::Node::ColumnRef(_))
+                        ) =>
+                {
+                    self.prove_about(q, owner, &mut proven);
+                }
+                Some(node::Node::AExpr(e)) if extract_names(&e.name) == ["="] => {
+                    equalities.push((*q, *owner));
+                }
+                _ => {}
+            }
+        }
+        // An equivalence class's members may be any equality's columns.
+        let quals: Vec<&protobuf::Node> = column_quals.iter().map(|(q, _)| *q).collect();
+        if equates_constants(&quals, snapshot) {
+            for (q, owner) in equalities {
+                self.prove_about(q, owner, &mut proven);
+            }
+        }
+        proven.whole |= constant && rels < 2;
+        proven
     }
+
+    /// Record in `proven` that a qual `n` from `owner` may prove the
+    /// relations of the columns it reads empty: below one of the level's
+    /// FROM items, that item (and, under LATERAL, the level's items it
+    /// names); in the level's own quals, the item a column names — any,
+    /// when one can't be told (an unqualified column, a join's alias).
+    fn prove_about(&self, n: &protobuf::Node, owner: &Owner, proven: &mut Proven) {
+        let (outer, lateral) = match owner {
+            Owner::Level => (true, false),
+            Owner::Item { alias, lateral } => {
+                // An unaliased subquery's columns are named by no alias.
+                if alias.is_empty() {
+                    proven.whole = true;
+                    return;
+                }
+                proven.aliases.push(alias.clone());
+                (false, *lateral)
+            }
+        };
+        if !outer && !lateral {
+            return;
+        }
+        let Some(inner) = n.node.as_ref() else {
+            return;
+        };
+        let mut todo = vec![inner.to_ref()];
+        while let Some(n) = todo.pop() {
+            if let typedpg_pg_query::NodeRef::ColumnRef(cr) = n {
+                let names = extract_names(&cr.fields);
+                match names.as_slice() {
+                    [t, _] if names.len() == cr.fields.len() && self.aliases.contains(t) => {
+                        proven.aliases.push(t.clone());
+                    }
+                    // Below a LATERAL item, a column naming none of the
+                    // level's items is the item's own.
+                    [_, _] if names.len() == cr.fields.len() && !outer => {}
+                    // A join's alias, or an unqualified column.
+                    _ => proven.whole = true,
+                }
+            }
+            todo.extend(n.children());
+        }
+    }
+}
+
+/// A CTE a level may read: its name, and its definition when known.
+type Cte<'a> = (&'a str, Option<&'a protobuf::CommonTableExpr>);
+
+/// Whether a reference to CTE `cte` is a relation of its own, never pulled
+/// up: a CTE scan (MATERIALIZED, data-modifying), or a subquery the planner
+/// plans on its own once inlined.
+fn scanned_alone(cte: &protobuf::CommonTableExpr, snapshot: &PgCatalog) -> bool {
+    match cte.ctequery.as_deref().and_then(|q| q.node.as_ref()) {
+        Some(node::Node::SelectStmt(sel)) => {
+            cte.ctematerialized == protobuf::CteMaterialize::Always as i32
+                || crate::resolve::plan_of(sel, snapshot) == crate::resolve::Plan::Separate
+        }
+        Some(_) => true,
+        None => false,
+    }
+}
+
+/// Where a qual of a level comes from.
+#[derive(Debug, Clone, Default)]
+enum Owner {
+    /// The level's own WHERE or JOIN ON clauses.
+    #[default]
+    Level,
+    /// A FROM subquery or view of the level, `alias`, pulled up into it
+    /// (`lateral` when it may read the level's other items).
+    Item { alias: String, lateral: bool },
+}
+
+/// What a level's quals may prove empty.
+#[derive(Debug, Default)]
+struct Proven {
+    /// Any of its relations.
+    whole: bool,
+    /// These FROM items.
+    aliases: Vec<String>,
 }
 
 fn flatten_and<'a>(n: &'a protobuf::Node, out: &mut Vec<&'a protobuf::Node>) {
@@ -1036,22 +1529,30 @@ fn may_prove_empty(c: &protobuf::Node, snapshot: &PgCatalog) -> bool {
 /// (FALSE over a NOT NULL column), or two `expr = constant` may put two
 /// different constants in one equivalence class.
 fn may_be_empty(conjuncts: &[&protobuf::Node], snapshot: &PgCatalog) -> bool {
-    let mut equated: Vec<Option<String>> = Vec::new();
     for c in conjuncts {
         let folded = fold_qual(c, snapshot);
         if folded.may_be_const() && folded != Folded::Bool(true) {
             return true;
         }
+        if let Some(node::Node::NullTest(t)) = c.node.as_ref()
+            && t.nulltesttype == protobuf::NullTestType::IsNull as i32
+            && matches!(
+                t.arg.as_deref().and_then(|a| a.node.as_ref()),
+                Some(node::Node::ColumnRef(_))
+            )
+        {
+            return true;
+        }
+    }
+    equates_constants(conjuncts, snapshot)
+}
+
+/// Whether two `expr = constant` of `conjuncts` may put two different
+/// constants in one equivalence class.
+fn equates_constants(conjuncts: &[&protobuf::Node], snapshot: &PgCatalog) -> bool {
+    let mut equated: Vec<Option<String>> = Vec::new();
+    for c in conjuncts {
         match c.node.as_ref() {
-            Some(node::Node::NullTest(t))
-                if t.nulltesttype == protobuf::NullTestType::IsNull as i32
-                    && matches!(
-                        t.arg.as_deref().and_then(|a| a.node.as_ref()),
-                        Some(node::Node::ColumnRef(_))
-                    ) =>
-            {
-                return true;
-            }
             Some(node::Node::AExpr(e)) if extract_names(&e.name) == ["="] => {
                 let constant = match protobuf::AExprKind::try_from(e.kind) {
                     Ok(protobuf::AExprKind::AexprOp) => [&e.lexpr, &e.rexpr]
@@ -1078,15 +1579,41 @@ fn may_be_empty(conjuncts: &[&protobuf::Node], snapshot: &PgCatalog) -> bool {
         && (equated.iter().any(Option::is_none) || equated.windows(2).any(|w| w[0] != w[1]))
 }
 
-/// Whether the planner may prove the current level's relations empty.
+/// Whether the planner may prove a relation of the current level empty.
 pub(crate) fn level_may_be_empty() -> bool {
-    LEVELS.with(|l| l.borrow().last().is_some_and(|q| q.may_be_empty))
+    LEVELS.with(|l| {
+        l.borrow()
+            .last()
+            .is_some_and(|q| q.may_be_empty || !q.excluded.is_empty())
+    })
+}
+
+/// Whether the planner may prove the current level's FROM item `alias`
+/// empty (or its level's every relation).
+pub(crate) fn level_may_exclude(alias: &str) -> bool {
+    LEVELS.with(|l| l.borrow().last().is_some_and(|q| q.excludes(alias)))
+}
+
+impl LevelQuals {
+    /// Whether the planner may prove the level's FROM item `alias` empty.
+    fn excludes(&self, alias: &str) -> bool {
+        self.may_be_empty
+            || self.excluded.iter().any(|a| a == alias)
+            || (!self.excluded.is_empty() && !self.items.iter().any(|a| a == alias))
+    }
 }
 
 /// Whether the plan of the current level may be a dummy one, whose nodes
 /// the executor never starts.
 pub(crate) fn level_may_be_dummy() -> bool {
     LEVELS.with(|l| l.borrow().last().is_some_and(|q| q.may_be_dummy))
+}
+
+/// Whether the current level has a qual the planner may push down into a
+/// subquery it plans on its own and prove it empty there (see
+/// [`PUSHABLE`]).
+pub(crate) fn level_may_push_down() -> bool {
+    PUSHABLE.with(|p| p.borrow().last().is_some_and(|q| !q.is_empty()))
 }
 
 /// How many quals the current level has.
@@ -1195,8 +1722,12 @@ pub(crate) fn table_restriction_estimated(
 
 /// Whether the FROM item a JOIN's nullable side holds may be removed by
 /// `remove_useless_joins` (a relation with a unique index, or a derived
-/// one the planner may prove unique).
+/// one the planner may prove unique: `join_is_removable` needs
+/// `rel_supports_distinctness`).
 pub(crate) fn may_be_removed(source: &crate::scope::TableSource, snapshot: &PgCatalog) -> bool {
+    if let crate::scope::SourceKind::Subquery { removable, .. } = source.kind {
+        return removable;
+    }
     let Some(relid) = source.relid else {
         return true;
     };
@@ -1205,4 +1736,50 @@ pub(crate) fn may_be_removed(source: &crate::scope::TableSource, snapshot: &PgCa
             .pg_index
             .values()
             .any(|i| i.indrelid == relid && i.indisunique)
+}
+
+/// Whether `query_supports_distinctness` may hold for `sel`, a subquery
+/// the planner plans on its own: it has DISTINCT, GROUP BY, HAVING, a set
+/// operation — or may call an aggregate (a function some candidate of
+/// which is one, or one the analyzer can't find, outside sublinks).
+pub(crate) fn may_be_distinct(sel: &protobuf::SelectStmt, snapshot: &PgCatalog) -> bool {
+    if sel.op != protobuf::SetOperation::SetopNone as i32
+        || !sel.distinct_clause.is_empty()
+        || !sel.group_clause.is_empty()
+        || sel.having_clause.is_some()
+    {
+        return true;
+    }
+    let mut todo: Vec<typedpg_pg_query::NodeRef<'_>> = sel
+        .target_list
+        .iter()
+        .chain(&sel.sort_clause)
+        .filter_map(|n| n.node.as_ref().map(node::Node::to_ref))
+        .collect();
+    while let Some(n) = todo.pop() {
+        match n {
+            // A sublink's aggregates are its own query's.
+            typedpg_pg_query::NodeRef::SubLink(_) => continue,
+            typedpg_pg_query::NodeRef::FuncCall(fc) => {
+                let names = extract_names(&fc.funcname);
+                let (schema, name) = match names.as_slice() {
+                    [n] => (None, n.as_str()),
+                    [s, n] => (Some(s.as_str()), n.as_str()),
+                    _ => return true,
+                };
+                let candidates = snapshot.find_functions(schema, name);
+                if fc.agg_star
+                    || candidates.is_empty()
+                    || candidates
+                        .iter()
+                        .any(|p| p.prokind == crate::pg_catalog::ProKind::Aggregate)
+                {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        todo.extend(n.children());
+    }
+    false
 }

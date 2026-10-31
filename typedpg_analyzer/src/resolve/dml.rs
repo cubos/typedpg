@@ -2191,6 +2191,21 @@ pub(crate) fn analyze_update_with_outer_ctes(
     }
 }
 
+/// An UPDATE's or DELETE's FROM items: its target `relation`, then those
+/// of its FROM / USING clause `from`.
+fn with_target(
+    relation: Option<&protobuf::RangeVar>,
+    from: &[protobuf::Node],
+) -> Vec<protobuf::Node> {
+    relation
+        .map(|rv| protobuf::Node {
+            node: Some(node::Node::RangeVar(rv.clone())),
+        })
+        .into_iter()
+        .chain(from.iter().cloned())
+        .collect()
+}
+
 fn analyze_update_here(
     upd: &protobuf::UpdateStmt,
     snapshot: &PgCatalog,
@@ -2198,8 +2213,9 @@ fn analyze_update_here(
     outer_ctes: &HashMap<String, Vec<ScopeColumn>>,
 ) -> AnalyzeResult {
     let _level = QueryLevel::enter();
-    let _plan =
-        expr::plan_fold::PlanLevel::enter(upd.where_clause.as_deref(), &upd.from_clause, snapshot);
+    // The target is one of the level's relations.
+    let from = with_target(upd.relation.as_ref(), &upd.from_clause);
+    let _plan = expr::plan_fold::PlanLevel::enter(upd.where_clause.as_deref(), &from, snapshot);
     let relation = upd
         .relation
         .as_ref()
@@ -2446,8 +2462,9 @@ fn analyze_delete_here(
     outer_ctes: &HashMap<String, Vec<ScopeColumn>>,
 ) -> AnalyzeResult {
     let _level = QueryLevel::enter();
-    let _plan =
-        expr::plan_fold::PlanLevel::enter(del.where_clause.as_deref(), &del.using_clause, snapshot);
+    // The target is one of the level's relations.
+    let from = with_target(del.relation.as_ref(), &del.using_clause);
+    let _plan = expr::plan_fold::PlanLevel::enter(del.where_clause.as_deref(), &from, snapshot);
     let relation = del
         .relation
         .as_ref()

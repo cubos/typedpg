@@ -35,11 +35,10 @@ pub(crate) fn analyze_correlated_select(
     // it received already carry their levels'.
     // Planned only when the expression around the sublink is.
     let subplan = expr::plan_fold::next_level_is_subplan();
-    let _skipped = expr::skipped_if(!expr::sublink_planned(expr::Ctx::new(
-        outer_scope,
-        outer_null_ctx,
-        snapshot,
-    )));
+    let outer_ctx = expr::Ctx::new(outer_scope, outer_null_ctx, snapshot);
+    // Or turned into a semi-join before the expression is folded.
+    let semijoin = expr::semijoin_level(sel, outer_ctx);
+    let _skipped = expr::skipped_if(semijoin.is_none() && !expr::sublink_planned(outer_ctx));
     let mut outer: Vec<crate::scope::TableSource> =
         outer_null_ctx.bake_sources(&outer_scope.sources);
     outer.extend(outer_scope.lateral_sources.iter().cloned());
@@ -63,19 +62,25 @@ pub(crate) fn analyze_correlated_select(
         outer.push(far);
     }
     // The sublink sees the enclosing level's entries its expression does.
-    let (mut cols, p) = grouping::with_visible_entries(&outer_scope.sources, || {
-        analyze_select_with_ctes_and_outer(
-            sel,
-            snapshot,
-            params,
-            &outer_scope.ctes,
-            &[],
-            &outer,
-            // Unreferencable entries stay so inside the sublink
-            // (errorMissingRTE searches every enclosing range table).
-            &outer_scope.shadowed_sources,
-        )
-    })?;
+    let mut analyze = || {
+        grouping::with_visible_entries(&outer_scope.sources, || {
+            analyze_select_with_ctes_and_outer(
+                sel,
+                snapshot,
+                params,
+                &outer_scope.ctes,
+                &[],
+                &outer,
+                // Unreferencable entries stay so inside the sublink
+                // (errorMissingRTE searches every enclosing range table).
+                &outer_scope.shadowed_sources,
+            )
+        })
+    };
+    let (mut cols, p) = match semijoin {
+        Some(next) => expr::plan_fold::with_next_level(next, analyze),
+        None => analyze(),
+    }?;
     // A planned sublink's plan is started — a SubPlan's always, a
     // semi-join's unless the plan around it is a dummy one.
     super::check_values_sort(sel, snapshot, subplan)?;
@@ -1739,6 +1744,7 @@ fn check_locking_clause(
         for source in &locked {
             if let SourceKind::Subquery {
                 lock_blocker: Some(blocker),
+                ..
             } = source.kind
             {
                 return Err(unsupported(format!(
