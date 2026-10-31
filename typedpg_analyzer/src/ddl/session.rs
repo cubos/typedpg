@@ -825,18 +825,20 @@ pub(super) fn first_row_mark_strength(stmt: &node::Node) -> Option<&'static str>
             _ => None,
         })
         .collect();
+    // No relation or subquery to mark (`SELECT 1 FOR UPDATE`, only
+    // functions or WITH queries in FROM): no row mark at all.
     let target = match names(first).into_iter().next() {
-        Some(name) => Some(name),
+        Some(name) => name,
         None => sel
             .from_clause
             .iter()
-            .find_map(|item| first_lockable(item, &ctes)),
+            .find_map(|item| first_lockable(item, &ctes))?,
     };
     let strongest = clauses
         .iter()
         .filter(|lc| {
             let named = names(lc);
-            named.is_empty() || target.as_ref().is_some_and(|t| named.contains(t))
+            named.is_empty() || named.contains(&target)
         })
         .max_by_key(|lc| lc.strength)?;
     Some(crate::resolve::lock_strength_name(strongest))
