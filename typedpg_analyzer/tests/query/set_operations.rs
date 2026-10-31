@@ -74,7 +74,7 @@ fn set_operation_type_mismatch_message() {
             "EXCEPT could not convert type timestamp with time zone[] to integer[]",
         ),
     ] {
-        assert_err_prefix!(db.analyze(sql), AnalyzeError::Invalid(_), msg);
+        assert_err_prefix!(db.analyze(sql), AnalyzeError::CannotCoerce(_), msg);
     }
     // An implicit cast between the element types converts the arrays.
     let s = db
