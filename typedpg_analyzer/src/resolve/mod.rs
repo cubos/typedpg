@@ -804,6 +804,7 @@ pub(crate) fn analyze_executed<R>(
     analyze: impl FnOnce() -> Result<R, AnalyzeError>,
 ) -> Result<R, AnalyzeError> {
     crate::grouping::clear_values_sort_calls();
+    deferred::clear_recorded();
     let analyzed = expr::with_plan_time_checks(analyze)?;
     if let Some(e) = values_sort_exec_error(stmt, snapshot) {
         return Err(e);
@@ -826,7 +827,9 @@ pub(crate) fn analyze_executed<R>(
 /// its select list — which the planner turns into a subplan, initialized
 /// with the plan even when no row ever reaches it. Elsewhere it is dropped
 /// when the planner proves it unneeded (`WHERE false`, an unreferenced
-/// CTE, `EXISTS`, `CASE WHEN false`), and the statement then runs fine.
+/// CTE, `EXISTS`, `CASE WHEN false`), and the statement then runs fine;
+/// one read where its plan is started — a FROM subquery, a sublink, a CTE —
+/// is checked as it is analyzed ([`check_values_sort`]).
 fn values_sort_exec_error(stmt: &node::Node, snapshot: &PgCatalog) -> Option<AnalyzeError> {
     fn select(sel: &protobuf::SelectStmt, snapshot: &PgCatalog) -> Option<AnalyzeError> {
         if sel.op != SetOperation::SetopNone as i32 {
@@ -854,37 +857,7 @@ fn values_sort_exec_error(stmt: &node::Node, snapshot: &PgCatalog) -> Option<Ana
                 }
             });
         }
-        let mut location = None;
-        for n in &sel.sort_clause {
-            visit_same_level(n, &mut |e| {
-                if let Some(node::Node::FuncCall(fc)) = e.node.as_ref()
-                    && location.is_none()
-                    && is_srf_call(fc, snapshot)
-                {
-                    location = Some(fc.location);
-                }
-            });
-        }
-        if let Some(location) = location {
-            return Some(
-                crate::error::RawError::new(
-                    AnalyzeError::FeatureNotSupported(
-                        "set-valued function called in context that cannot accept a set".into(),
-                    ),
-                    crate::error::SourceSpan::from_node_qname(location),
-                    None,
-                )
-                .finalize_implicit(),
-            );
-        }
-        let (call, location) = crate::grouping::values_sort_call(sel)?;
-        Some(
-            crate::pgmsg::call_without_plan_node(
-                call.message(),
-                crate::error::SourceSpan::from_node_qname(location),
-            )
-            .finalize_implicit(),
-        )
+        values_sort_error(sel, snapshot).map(|(e, _)| e)
     }
     match stmt {
         node::Node::SelectStmt(sel) => select(sel, snapshot),
@@ -896,6 +869,72 @@ fn values_sort_exec_error(stmt: &node::Node, snapshot: &PgCatalog) -> Option<Ana
             values_sort_exec_error(es.query.as_deref()?.node.as_ref()?, snapshot)
         }
         _ => None,
+    }
+}
+
+/// The error every execution of VALUES `sel` raises starting the executor
+/// for it, when its ORDER BY has a set-returning call or a call of its
+/// own level the plan has no node for (see [`values_sort_exec_error`]),
+/// and the location of that call.
+pub(crate) fn values_sort_error(
+    sel: &protobuf::SelectStmt,
+    snapshot: &PgCatalog,
+) -> Option<(AnalyzeError, Option<i32>)> {
+    if sel.op != SetOperation::SetopNone as i32 || sel.values_lists.is_empty() {
+        return None;
+    }
+    let mut location = None;
+    for n in &sel.sort_clause {
+        visit_same_level(n, &mut |e| {
+            if let Some(node::Node::FuncCall(fc)) = e.node.as_ref()
+                && location.is_none()
+                && is_srf_call(fc, snapshot)
+            {
+                location = Some(fc.location);
+            }
+        });
+    }
+    if let Some(location) = location {
+        return Some((
+            crate::error::RawError::new(
+                AnalyzeError::FeatureNotSupported(
+                    "set-valued function called in context that cannot accept a set".into(),
+                ),
+                crate::error::SourceSpan::from_node_qname(location),
+                None,
+            )
+            .finalize_implicit(),
+            Some(location),
+        ));
+    }
+    let (call, location) = crate::grouping::values_sort_call(sel)?;
+    Some((
+        crate::pgmsg::call_without_plan_node(
+            call.message(),
+            crate::error::SourceSpan::from_node_qname(location),
+        )
+        .finalize_implicit(),
+        (location >= 0).then_some(location),
+    ))
+}
+
+/// Raise, for VALUES `sel` read where the level reading it is planned
+/// and run — a FROM subquery never null-extended, a sublink, an inlined
+/// CTE — the error starting the executor for it raises (see
+/// [`values_sort_error`]): unless the plan around it may be a dummy one,
+/// whose nodes the executor never starts (a SubPlan's, `subplan`, it
+/// starts all the same).
+pub(crate) fn check_values_sort(
+    sel: &protobuf::SelectStmt,
+    snapshot: &PgCatalog,
+    subplan: bool,
+) -> Result<(), AnalyzeError> {
+    if !expr::plan_time_checks() || (!subplan && expr::plan_fold::level_may_be_dummy()) {
+        return Ok(());
+    }
+    match values_sort_error(sel, snapshot) {
+        Some((e, location)) => expr::plan_time_result(location, Err(e)),
+        None => Ok(()),
     }
 }
 
@@ -1767,7 +1806,7 @@ pub(crate) use assign::*;
 pub(crate) use call::*;
 pub use copy_in::AnalyzedCopyIn;
 pub(crate) use cte::*;
-pub(crate) use deferred::{Split, analyze_exists, planned_errors};
+pub(crate) use deferred::{Plan, Split, analyze_exists, plan_of, planned_errors, substituted};
 pub(crate) use dml::*;
 pub(crate) use from::*;
 pub(crate) use merge::*;

@@ -46,6 +46,7 @@ fn nullability_signature(
 pub(crate) fn analyze_cte(
     cte: &protobuf::CommonTableExpr,
     recursive: bool,
+    inlined: Option<bool>,
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
     existing_ctes: &HashMap<String, Vec<ScopeColumn>>,
@@ -67,8 +68,30 @@ pub(crate) fn analyze_cte(
     // refer to it.
     let search_cycle = search_cycle_columns(cte, snapshot, params)?;
 
+    // A CTE the planner inlines and then pulls up has its outputs replace
+    // the references to them, as planned (see `Planned`); otherwise a
+    // reference stays a Var, collated as parsed.
+    let pulled_up = inlined == Some(true)
+        && matches!(cte_query, node::Node::SelectStmt(sel)
+            if super::deferred::plan_of(sel, snapshot) == super::deferred::Plan::PulledUp);
+    let planned_in = |p: crate::expr::Planned| match p {
+        crate::expr::Planned::Folded { .. } if pulled_up => Some(p),
+        _ if p == crate::expr::Planned::AsParsed || inlined == Some(false) => {
+            Some(crate::expr::Planned::AsParsed)
+        }
+        _ => None,
+    };
     let to_scope = |rc: RawColumn| ScopeColumn {
-        deferred: Default::default(),
+        deferred: crate::scope::Deferred {
+            planned: planned_in(rc.planned).unwrap_or_default(),
+            // An inlined CTE is a subquery the planner may pull up.
+            substitution: if inlined == Some(false) {
+                crate::scope::Substitution::Never
+            } else {
+                crate::scope::Substitution::Maybe
+            },
+            ..Default::default()
+        },
         name: rc.name,
         type_oid: rc.type_oid,
         base_not_null: !rc.nullable,
@@ -76,7 +99,7 @@ pub(crate) fn analyze_cte(
         typmod: rc.typmod,
         collation: rc.collation,
         no_collation: rc.no_collation.is_some(),
-        planned_unknown: rc.planned != crate::expr::Planned::AsParsed,
+        planned_unknown: planned_in(rc.planned).is_none(),
         record_fields: rc.record_fields,
         elem_nullable: rc.elem_nullable,
         refine: rc.refine.clone(),
@@ -839,6 +862,101 @@ pub(crate) fn cte_reference_columns(
     Some((columns, search_cycle, same_level))
 }
 
+thread_local! {
+    /// The statement owning each WITH clause being analyzed (see
+    /// [`with_clause_owner`]).
+    static WITH_OWNERS: std::cell::RefCell<Vec<(usize, protobuf::Node)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Run `f` (the analysis of `sel`'s WITH clause) knowing `sel` owns it:
+/// how many times the statement references a CTE decides whether the
+/// planner inlines it.
+pub(crate) fn with_clause_owner<R>(sel: &protobuf::SelectStmt, f: impl FnOnce() -> R) -> R {
+    let Some(with) = sel.with_clause.as_ref() else {
+        return f();
+    };
+    let key = std::ptr::from_ref(with) as usize;
+    let owner = protobuf::Node {
+        node: Some(node::Node::SelectStmt(Box::new(sel.clone()))),
+    };
+    WITH_OWNERS.with(|o| o.borrow_mut().push((key, owner)));
+    let out = f();
+    WITH_OWNERS.with(|o| o.borrow_mut().pop());
+    out
+}
+
+/// How many references to CTE `name` the statement owning `with` has
+/// (PG's `cterefcount`): the unqualified relations of that name in it.
+/// `None` when that may count what is no reference to it — a relation of
+/// that name a nested WITH, or (without RECURSIVE) the CTE's own body or
+/// an earlier one's, resolves elsewhere — or the owner isn't known.
+fn owner_references(with: &protobuf::WithClause, name: &str) -> Option<usize> {
+    use typedpg_pg_query::NodeRef;
+    let key = std::ptr::from_ref(with) as usize;
+    let names_it = |n: NodeRef<'_>| {
+        let mut todo = vec![n];
+        while let Some(n) = todo.pop() {
+            if let NodeRef::RangeVar(rv) = n
+                && rv.schemaname.is_empty()
+                && rv.relname == name
+            {
+                return true;
+            }
+            todo.extend(n.children());
+        }
+        false
+    };
+    if !with.recursive {
+        for c in &with.ctes {
+            let Some(node::Node::CommonTableExpr(c)) = c.node.as_ref() else {
+                continue;
+            };
+            if c.ctequery
+                .as_deref()
+                .and_then(|q| q.node.as_ref())
+                .is_some_and(|q| names_it(q.to_ref()))
+            {
+                return None;
+            }
+            if c.ctename == name {
+                break;
+            }
+        }
+    }
+    WITH_OWNERS.with(|o| {
+        let owners = o.borrow();
+        let (_, owner) = owners.iter().rev().find(|(k, _)| *k == key)?;
+        let root = owner.node.as_ref()?;
+        let own_with = match root {
+            node::Node::SelectStmt(sel) => sel.with_clause.as_ref().map(std::ptr::from_ref),
+            _ => None,
+        };
+        let mut count = 0;
+        let mut todo = vec![root.to_ref()];
+        while let Some(n) = todo.pop() {
+            match n {
+                NodeRef::RangeVar(rv) if rv.schemaname.is_empty() && rv.relname == name => {
+                    count += 1;
+                }
+                // Another WITH naming a CTE so: its references are its own.
+                NodeRef::WithClause(w)
+                    if own_with != Some(std::ptr::from_ref(w))
+                        && w.ctes.iter().any(|c| {
+                            matches!(c.node.as_ref(),
+                                Some(node::Node::CommonTableExpr(c)) if c.ctename == name)
+                        }) =>
+                {
+                    return None;
+                }
+                _ => {}
+            }
+            todo.extend(n.children());
+        }
+        Some(count)
+    })
+}
+
 /// Analyze a `WITH` clause on top of the CTEs already visible, following
 /// PG's `transformWithClause` / `analyzeCTE`: names must be unique within
 /// the clause (42712), a data-modifying CTE is only allowed on the
@@ -956,18 +1074,69 @@ fn analyze_with_clause_here(
         // A SELECT CTE nothing reads is never planned; what planning one
         // read raises is raised at its references (see `deferred`). A
         // data-modifying one always runs.
-        let (analyzed, outputs, entry) = super::deferred::analyze_cte(cte, recursive[i], || {
-            analyze_cte(
-                cte,
-                recursive[i],
-                snapshot,
-                params,
-                &cte_scopes,
-                outer_sources,
-            )
-        });
+        // inline_cte: a SELECT CTE neither MATERIALIZED nor recursive,
+        // referenced once (or NOT MATERIALIZED) and without volatile
+        // functions becomes a FROM subquery; any other is scanned as is
+        // (a CTE scan, whose Vars keep their parsed collations). `None`
+        // when the analyzer can't tell.
+        let select = matches!(
+            cte.ctequery.as_deref().and_then(|q| q.node.as_ref()),
+            Some(node::Node::SelectStmt(_))
+        );
+        let inlined = if recursive[i]
+            || !select
+            || cte.ctematerialized == protobuf::CteMaterialize::Always as i32
+        {
+            Some(false)
+        } else {
+            let once = if cte.ctematerialized == protobuf::CteMaterialize::Never as i32 {
+                Some(true)
+            } else {
+                owner_references(with, &cte.ctename).map(|n| n <= 1)
+            };
+            match once {
+                Some(false) => Some(false),
+                Some(true)
+                    if !cte
+                        .ctequery
+                        .as_deref()
+                        .is_some_and(|q| crate::expr::plan_fold::may_be_volatile(q, snapshot)) =>
+                {
+                    Some(true)
+                }
+                _ => None,
+            }
+        };
+        let (analyzed, outputs, entry) =
+            super::deferred::analyze_cte(cte, recursive[i], snapshot, || {
+                analyze_cte(
+                    cte,
+                    recursive[i],
+                    inlined,
+                    snapshot,
+                    params,
+                    &cte_scopes,
+                    outer_sources,
+                )
+            });
         let mut analyzed = analyzed?;
         super::deferred::attach_to_cte(&mut analyzed.columns, outputs, entry);
+        // A VALUES the executor can't start: a CTE scanned on its own is
+        // planned and started wherever it is referenced; an inlined one
+        // where its reference is (see `check_values_sort`).
+        if let Some(node::Node::SelectStmt(sel)) =
+            cte.ctequery.as_deref().and_then(|q| q.node.as_ref())
+            && let Some((e, _)) = super::values_sort_error(sel, snapshot)
+        {
+            let e = Box::new(e);
+            for c in &mut analyzed.columns {
+                match inlined {
+                    Some(false) if c.deferred.entry.is_none() => c.deferred.entry = Some(e.clone()),
+                    Some(true) => c.deferred.started = Some(e.clone()),
+                    _ => {}
+                }
+            }
+        }
         let marker = no_returning_marker(&cte.ctename);
         if returning == Some(false) {
             cte_scopes.insert(marker, Vec::new());

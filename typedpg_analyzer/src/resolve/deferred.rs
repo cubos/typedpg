@@ -17,6 +17,8 @@ use typedpg_pg_query::protobuf::{self, SetOperation, node};
 
 use crate::error::AnalyzeError;
 use crate::expr::PlanTimeError;
+use crate::expr::plan_fold::NextLevel;
+use crate::pg_catalog::PgCatalog;
 
 /// How the planner plans a FROM subquery (or a CTE's query) the query
 /// reading it plans.
@@ -30,10 +32,16 @@ pub(crate) enum Plan {
     /// Pulled up: its outputs where the outer query reads them, the rest
     /// with the outer query.
     PulledUp,
+    /// Certainly not pulled up (it groups, sorts, limits, ... or is a
+    /// `security_barrier` view): planned on its own once the outer query
+    /// plans the relation it is, not when that relation is proven empty
+    /// or removed first — its outputs where the outer query reads them
+    /// (`remove_unused_subquery_outputs` drops the others), the rest whole.
+    Separate,
 }
 
 /// How the planner plans `sel`, a FROM subquery or a CTE's query.
-pub(crate) fn plan_of(sel: &protobuf::SelectStmt) -> Plan {
+pub(crate) fn plan_of(sel: &protobuf::SelectStmt, snapshot: &PgCatalog) -> Plan {
     if sel.op != SetOperation::SetopNone as i32 {
         return Plan::Uncertain;
     }
@@ -51,18 +59,146 @@ pub(crate) fn plan_of(sel: &protobuf::SelectStmt) -> Plan {
             (true, _) => Plan::Whole,
         };
     }
-    if pulled_up(sel) {
+    if pulled_up_in(sel, snapshot) {
         Plan::PulledUp
+    } else if !sel.group_clause.is_empty()
+        || sel.having_clause.is_some()
+        || !sel.distinct_clause.is_empty()
+        || !sel.sort_clause.is_empty()
+        || sel.limit_count.is_some()
+        || sel.limit_offset.is_some()
+        || !sel.locking_clause.is_empty()
+        || !sel.window_clause.is_empty()
+        || sel.with_clause.is_some()
+        || never_simple_target_list(sel, snapshot)
+    {
+        Plan::Separate
     } else {
         Plan::Uncertain
     }
 }
 
+/// Whether `sel`'s select list certainly keeps the planner from pulling
+/// it up: it calls an aggregate (`count(*)`, or a name only aggregates
+/// have), a window function, or a name only set-returning or volatile
+/// functions have.
+fn never_simple_target_list(sel: &protobuf::SelectStmt, snapshot: &PgCatalog) -> bool {
+    use crate::pg_catalog::{ProKind, ProVolatile};
+    sel.target_list.iter().any(|t| {
+        t.node.as_ref().is_some_and(|inner| {
+            // Not below a sublink, whose calls are its own.
+            let mut todo = vec![inner.to_ref()];
+            while let Some(n) = todo.pop() {
+                match n {
+                    typedpg_pg_query::NodeRef::SubLink(_) => continue,
+                    typedpg_pg_query::NodeRef::FuncCall(fc) => {
+                        if fc.over.is_some() || fc.agg_star {
+                            return true;
+                        }
+                        let names = crate::expr::extract_string_fields(&fc.funcname);
+                        let (schema, name) = match names.as_slice() {
+                            [n] => (None, n.as_str()),
+                            [s, n] => (Some(s.as_str()), n.as_str()),
+                            _ => continue,
+                        };
+                        let candidates = snapshot.find_functions(schema, name);
+                        if !candidates.is_empty()
+                            && candidates.iter().all(|p| {
+                                matches!(p.prokind, ProKind::Aggregate | ProKind::Window)
+                                    || p.proretset
+                                    || p.provolatile == ProVolatile::Volatile
+                            })
+                        {
+                            return true;
+                        }
+                    }
+                    _ => {}
+                }
+                todo.extend(n.children());
+            }
+            false
+        })
+    })
+}
+
+/// How the level reading a subquery planned as `plan` (never
+/// null-extended there when `kept`) analyzes it: `None` when nothing in
+/// it is certain to be planned.
+fn next_level(plan: Plan, sel: &protobuf::SelectStmt, kept: bool) -> Option<NextLevel> {
+    if !crate::expr::plan_time_checks() {
+        return None;
+    }
+    match plan {
+        Plan::PulledUp if kept => Some(NextLevel::PulledUp),
+        Plan::PulledUp => Some(NextLevel::PulledUpNullable),
+        // Planned unless its relation is proven empty, or removed (the
+        // nullable side of a join).
+        Plan::Separate if kept && !crate::expr::plan_fold::level_may_be_empty() => {
+            Some(NextLevel::Separate {
+                // subquery_is_pushdown_safe: never into one with a LIMIT.
+                pushed_down: sel.limit_count.is_none() && sel.limit_offset.is_none(),
+            })
+        }
+        _ => None,
+    }
+}
+
 /// Whether the planner certainly pulls `sel` up into the query reading it
-/// (`is_simple_subquery`): a plain SELECT with no grouping, aggregate,
-/// window, set-returning or volatile function (no function at all, to be
-/// sure), DISTINCT, ORDER BY, LIMIT, locking or WITH.
+/// (`is_simple_subquery`): a plain SELECT with no grouping, DISTINCT,
+/// ORDER BY, LIMIT, locking or WITH, whose select list calls no
+/// aggregate, window, set-returning or volatile function (and holds no
+/// sublink, to be sure).
+pub(crate) fn pulled_up_in(sel: &protobuf::SelectStmt, snapshot: &PgCatalog) -> bool {
+    simple_shape(sel) && simple_target_list(sel, snapshot)
+}
+
+/// [`pulled_up_in`] for `sel`, a SELECT already analyzed (whose select
+/// list's calls the analysis recorded, see [`record_target_list`]).
 pub(crate) fn pulled_up(sel: &protobuf::SelectStmt) -> bool {
+    simple_shape(sel)
+        && (!calls_in_target_list(sel)
+            || SIMPLE_TARGETS.with(|m| m.borrow().get(&target_list_key(sel)).copied())
+                == Some(true))
+}
+
+thread_local! {
+    /// Per analyzed SELECT (see [`target_list_key`]): whether its select
+    /// list is one [`pulled_up_in`] accepts.
+    static SIMPLE_TARGETS: std::cell::RefCell<std::collections::HashMap<(usize, usize, i32), bool>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// A key telling an analyzed SELECT apart: its address, and its select
+/// list's length and first location (so a SELECT later allocated where a
+/// dropped one was isn't taken for it).
+fn target_list_key(sel: &protobuf::SelectStmt) -> (usize, usize, i32) {
+    let first = sel
+        .target_list
+        .first()
+        .and_then(|t| match t.node.as_ref() {
+            Some(node::Node::ResTarget(rt)) => Some(rt.location),
+            _ => None,
+        })
+        .unwrap_or(-1);
+    (
+        std::ptr::from_ref(sel) as usize,
+        sel.target_list.len(),
+        first,
+    )
+}
+
+/// Record, analyzing `sel`, whether its select list is one the planner
+/// pulls up (see [`pulled_up`]).
+pub(crate) fn record_target_list(sel: &protobuf::SelectStmt, snapshot: &PgCatalog) {
+    if calls_in_target_list(sel) {
+        let simple = simple_target_list(sel, snapshot);
+        SIMPLE_TARGETS.with(|m| m.borrow_mut().insert(target_list_key(sel), simple));
+    }
+}
+
+/// The shape `is_simple_subquery` asks of a subquery, beside its select
+/// list's calls.
+fn simple_shape(sel: &protobuf::SelectStmt) -> bool {
     sel.op == SetOperation::SetopNone as i32
         && sel.values_lists.is_empty()
         && sel.with_clause.is_none()
@@ -75,18 +211,154 @@ pub(crate) fn pulled_up(sel: &protobuf::SelectStmt) -> bool {
         && sel.locking_clause.is_empty()
         && sel.window_clause.is_empty()
         && sel.into_clause.is_none()
-        && !sel.target_list.iter().any(|t| {
-            t.node.as_ref().is_some_and(|n| {
-                n.nodes().into_iter().any(|(n, _)| {
-                    matches!(
-                        n,
-                        typedpg_pg_query::NodeRef::FuncCall(_)
-                            | typedpg_pg_query::NodeRef::SubLink(_)
-                            | typedpg_pg_query::NodeRef::GroupingFunc(_)
-                    )
-                })
+}
+
+/// Whether `sel`'s select list calls any function or operator, or holds a
+/// sublink or GROUPING.
+fn calls_in_target_list(sel: &protobuf::SelectStmt) -> bool {
+    sel.target_list.iter().any(|t| {
+        t.node.as_ref().is_some_and(|n| {
+            n.nodes().into_iter().any(|(n, _)| {
+                matches!(
+                    n,
+                    typedpg_pg_query::NodeRef::FuncCall(_)
+                        | typedpg_pg_query::NodeRef::SubLink(_)
+                        | typedpg_pg_query::NodeRef::GroupingFunc(_)
+                )
             })
         })
+    })
+}
+
+/// Whether `sel`'s select list has nothing that keeps the planner from
+/// pulling it up: no aggregate, window or set-returning call
+/// (`hasAggs`, `hasWindowFuncs`, `hasTargetSRFs`), nothing volatile
+/// (`contain_volatile_functions`), and — to be sure — no sublink nor
+/// GROUPING. A function is known by its name: every function of that
+/// name must be a plain, non-volatile, non-set-returning one.
+fn simple_target_list(sel: &protobuf::SelectStmt, snapshot: &PgCatalog) -> bool {
+    use crate::pg_catalog::{ProKind, ProVolatile};
+    let plain = |p: &crate::pg_catalog::PgProc| {
+        p.prokind == ProKind::Function && !p.proretset && p.provolatile != ProVolatile::Volatile
+    };
+    sel.target_list.iter().all(|t| {
+        let Some(inner) = t.node.as_ref() else {
+            return true;
+        };
+        inner.nodes().into_iter().all(|(n, _)| match n {
+            typedpg_pg_query::NodeRef::SubLink(_) | typedpg_pg_query::NodeRef::GroupingFunc(_) => {
+                false
+            }
+            typedpg_pg_query::NodeRef::FuncCall(fc) => {
+                if fc.over.is_some()
+                    || fc.agg_star
+                    || fc.agg_distinct
+                    || fc.agg_within_group
+                    || fc.agg_filter.is_some()
+                    || !fc.agg_order.is_empty()
+                {
+                    return false;
+                }
+                let names = crate::expr::extract_string_fields(&fc.funcname);
+                let (schema, name) = match names.as_slice() {
+                    [n] => (None, n.as_str()),
+                    [s, n] => (Some(s.as_str()), n.as_str()),
+                    _ => return false,
+                };
+                let candidates = snapshot.find_functions(schema, name);
+                !candidates.is_empty() && candidates.iter().all(|p| plain(p))
+            }
+            typedpg_pg_query::NodeRef::AExpr(e) => {
+                let names = crate::expr::extract_string_fields(&e.name);
+                names.last().is_none_or(|name| {
+                    snapshot
+                        .pg_operator
+                        .values()
+                        .filter(|o| &o.oprname == name)
+                        .all(|o| {
+                            o.oprcode
+                                .and_then(|c| snapshot.pg_proc.get(&c))
+                                .is_some_and(plain)
+                        })
+                })
+            }
+            typedpg_pg_query::NodeRef::TypeCast(_) => !snapshot.pg_cast.values().any(|c| {
+                c.castfunc
+                    .and_then(|f| snapshot.pg_proc.get(&f))
+                    .is_some_and(|p| p.provolatile == ProVolatile::Volatile)
+            }),
+            _ => true,
+        })
+    })
+}
+
+// ─── Pulled-up outputs ──────────────────────────────────────────────────────
+
+thread_local! {
+    /// The expression the planner substitutes for a select-list entry
+    /// that reads a pulled-up subquery's column (keyed by the entry's
+    /// address, with the column reference itself to tell it apart).
+    static SUBSTITUTED: std::cell::RefCell<
+        std::collections::HashMap<usize, (protobuf::ColumnRef, std::sync::Arc<protobuf::Node>)>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Forget what earlier statements recorded.
+pub(crate) fn clear_recorded() {
+    SUBSTITUTED.with(|m| m.borrow_mut().clear());
+    SIMPLE_TARGETS.with(|m| m.borrow_mut().clear());
+}
+
+/// Record that the planner substitutes `expr` for `entry`, a column
+/// reference of a select list reading a pulled-up subquery's column.
+pub(crate) fn record_substitution(entry: &protobuf::Node, expr: std::sync::Arc<protobuf::Node>) {
+    if let Some(node::Node::ColumnRef(cr)) = entry.node.as_ref() {
+        SUBSTITUTED.with(|m| {
+            m.borrow_mut()
+                .insert(std::ptr::from_ref(entry) as usize, (cr.clone(), expr));
+        });
+    }
+}
+
+/// What the planner substitutes for `entry` (see [`record_substitution`]).
+pub(crate) fn substituted(entry: &protobuf::Node) -> Option<std::sync::Arc<protobuf::Node>> {
+    let Some(node::Node::ColumnRef(cr)) = entry.node.as_ref() else {
+        return None;
+    };
+    SUBSTITUTED.with(|m| {
+        m.borrow()
+            .get(&(std::ptr::from_ref(entry) as usize))
+            .filter(|(r, _)| cr == r)
+            .map(|(_, e)| e.clone())
+    })
+}
+
+/// The expressions of `sel`'s outputs, as the planner substitutes them
+/// for references once it pulls `sel` up: each select-list entry (or the
+/// single VALUES row's item) — itself what it substitutes, when it reads
+/// a column pulled up from below. `None` past a `*`.
+pub(crate) fn output_exprs(
+    sel: &protobuf::SelectStmt,
+) -> Vec<Option<std::sync::Arc<protobuf::Node>>> {
+    let entry =
+        |n: &protobuf::Node| Some(substituted(n).unwrap_or_else(|| std::sync::Arc::new(n.clone())));
+    match sel.values_lists.as_slice() {
+        [row] => match row.node.as_ref() {
+            Some(node::Node::List(l)) => l.items.iter().map(entry).collect(),
+            _ => Vec::new(),
+        },
+        [] => sel
+            .target_list
+            .iter()
+            .map_while(|t| match t.node.as_ref() {
+                Some(node::Node::ResTarget(rt)) if !is_star(t) => {
+                    Some(rt.val.as_deref().and_then(entry))
+                }
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// The errors captured analyzing `sel`, by where they are planned.
@@ -187,20 +459,27 @@ fn is_star(t: &protobuf::Node) -> bool {
 }
 
 /// Analyze `sel` (with `run`) as a subquery the query reading it plans as
-/// `plan`. Under the plan-time checks, the errors of a pulled-up one are
-/// captured and split; an uncertain one is analyzed without the checks.
+/// `plan` (never null-extended there when `kept`). Under the plan-time
+/// checks, the errors of one certainly planned are captured and split; the
+/// others are analyzed without the checks.
 pub(crate) fn analyze<T>(
     plan: Plan,
     sel: &protobuf::SelectStmt,
+    kept: bool,
     run: impl FnOnce() -> T,
 ) -> (T, Split) {
-    match plan {
-        Plan::Uncertain => (crate::expr::may_skip(run), Split::default()),
-        Plan::PulledUp if crate::expr::plan_time_checks() => {
-            let (out, errors) = crate::expr::capture_plan_time_errors(run);
+    if plan == Plan::Whole {
+        return (run(), Split::default());
+    }
+    match next_level(plan, sel, kept) {
+        Some(next) => {
+            let (out, errors) = crate::expr::plan_fold::with_next_level(next, || {
+                crate::expr::capture_plan_time_errors(run)
+            });
             (out, split(sel, errors))
         }
-        Plan::PulledUp | Plan::Whole => (run(), Split::default()),
+        None if plan == Plan::PulledUp => (run(), Split::default()),
+        None => (crate::expr::may_skip(run), Split::default()),
     }
 }
 
@@ -213,6 +492,7 @@ pub(crate) fn analyze<T>(
 pub(crate) fn analyze_cte<T>(
     cte: &protobuf::CommonTableExpr,
     recursive: bool,
+    snapshot: &PgCatalog,
     run: impl FnOnce() -> T,
 ) -> (T, Vec<Option<AnalyzeError>>, Option<AnalyzeError>) {
     let Some(node::Node::SelectStmt(sel)) = cte.ctequery.as_deref().and_then(|q| q.node.as_ref())
@@ -221,9 +501,11 @@ pub(crate) fn analyze_cte<T>(
         return (run(), Vec::new(), None);
     };
     let materialized = cte.ctematerialized == protobuf::CteMaterialize::Always as i32;
-    let plan = match plan_of(sel) {
+    let plan = match plan_of(sel, snapshot) {
         _ if recursive => Plan::Uncertain,
-        Plan::Uncertain if materialized => Plan::Whole,
+        Plan::Uncertain | Plan::Separate if materialized => Plan::Whole,
+        // Inlined, it is planned with the relation it is.
+        Plan::Separate => Plan::Uncertain,
         plan => plan,
     };
     if plan == Plan::Uncertain || !crate::expr::plan_time_checks() {
@@ -238,28 +520,39 @@ pub(crate) fn analyze_cte<T>(
     (out, split.outputs, split.rest.map(|(_, e)| e))
 }
 
-/// Analyze `sel` (with `run`) as a planned query the planner pulls up
-/// into the one reading it (a view's), and split what planning it raises
-/// (see [`split`]); `None` when the planner may not pull it up.
+/// Analyze `sel` (with `run`) as a planned query the rewriter puts in
+/// the one reading it (a view's, never null-extended there when `kept`),
+/// and split what planning it raises (see [`split`]); `None` when nothing
+/// of it is certain to be planned. A `security_barrier` view's
+/// (`barrier`) is never pulled up.
 pub(crate) fn planned_errors<T>(
     sel: &protobuf::SelectStmt,
+    snapshot: &PgCatalog,
+    barrier: bool,
+    kept: bool,
     run: impl FnOnce() -> T,
 ) -> Option<(T, Split)> {
-    let plan = plan_of(sel);
-    if plan == Plan::Uncertain {
-        return None;
-    }
-    let (out, errors) =
-        crate::expr::with_plan_time_checks(|| crate::expr::capture_plan_time_errors(run));
-    let split = if plan == Plan::Whole {
-        Split {
+    let plan = match plan_of(sel, snapshot) {
+        _ if barrier && sel.op == SetOperation::SetopNone as i32 && sel.values_lists.is_empty() => {
+            Plan::Separate
+        }
+        _ if barrier => Plan::Uncertain,
+        plan => plan,
+    };
+    if plan == Plan::Whole {
+        let (out, errors) =
+            crate::expr::with_plan_time_checks(|| crate::expr::capture_plan_time_errors(run));
+        let split = Split {
             outputs: Vec::new(),
             rest: errors.into_iter().next(),
-        }
-    } else {
-        split(sel, errors)
-    };
-    Some((out, split))
+        };
+        return Some((out, split));
+    }
+    let next = next_level(plan, sel, kept)?;
+    let (out, errors) = crate::expr::with_plan_time_checks(|| {
+        crate::expr::plan_fold::with_next_level(next, || crate::expr::capture_plan_time_errors(run))
+    });
+    Some((out, split(sel, errors)))
 }
 
 /// Attach the errors [`analyze_cte`] found to the CTE's `columns`.

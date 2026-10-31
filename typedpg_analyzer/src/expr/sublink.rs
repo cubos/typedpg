@@ -306,13 +306,17 @@ fn single_sublink_column(
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<(crate::resolve::RawColumn, bool), AnalyzeError> {
-    let (cols, _) = crate::resolve::analyze_correlated_select(
-        sel,
-        ctx.snapshot,
-        params,
-        ctx.scope,
-        ctx.null_ctx,
-    )?;
+    // A scalar or ARRAY sublink is a SubPlan or an InitPlan.
+    let (cols, _) =
+        super::plan_fold::with_next_level(super::plan_fold::NextLevel::Subplan, || {
+            crate::resolve::analyze_correlated_select(
+                sel,
+                ctx.snapshot,
+                params,
+                ctx.scope,
+                ctx.null_ctx,
+            )
+        })?;
     let min_one_row = crate::resolve::take_level_summary().min_one_row;
     let span = crate::error::SourceSpan::from_location(sub.location);
     let mut cols = cols.into_iter();

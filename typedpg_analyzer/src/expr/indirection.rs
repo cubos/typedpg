@@ -228,10 +228,10 @@ pub(super) fn resolve_composite_field(
             no_collation: field.ty.no_collation.map(|_| super::NoCollation::Unset),
             // A FieldSelect keeps its collation when planned (it folds only
             // into a field of that collation), but a FROM entry's column
-            // may not.
+            // may not: one planning replaces may change it.
             planned: match field.ty.planned {
-                super::Planned::Unknown => super::Planned::Unknown,
-                _ => super::Planned::AsParsed,
+                super::Planned::AsParsed => super::Planned::AsParsed,
+                _ => super::Planned::Unknown,
             },
             record_fields,
             elem_nullable: field.ty.elem_nullable,
@@ -518,8 +518,18 @@ pub(crate) fn transform_array_expr(
     // ExecEvalArrayExpr builds a multidimensional array from sub-arrays of
     // one shape; a NULL or empty sub-array is allowed only when every one
     // is (the result is then empty). Sub-arrays the query fixes the shape
-    // of that can't agree fail every evaluation.
-    if multidims && crate::resolve::executes() {
+    // of that can't agree fail every evaluation — and, when they are all
+    // constants, `eval_const_expressions` evaluates the array while
+    // planning: then even a statement that is planned but not run
+    // (EXPLAIN) fails, where the planner folds it.
+    let executes = crate::resolve::executes();
+    let folded = !executes
+        && plan_time_checks()
+        && arr
+            .elements
+            .iter()
+            .all(|e| certainly_constant(e, ctx.snapshot));
+    if multidims && (executes || folded) {
         let shapes: Vec<SubArrayShape> = arr
             .elements
             .iter()
@@ -532,13 +542,17 @@ pub(crate) fn transform_array_expr(
         if let Some(first) = dims.next()
             && (dims.any(|d| d != first) || shapes.contains(&SubArrayShape::Absent))
         {
-            return Err(crate::error::RawError::invalid(
+            let e = crate::error::RawError::invalid(
                 "multidimensional arrays must have array expressions with matching dimensions"
                     .to_string(),
                 crate::error::SourceSpan::from_location(arr.location),
                 None,
             )
-            .finalize_implicit());
+            .finalize_implicit();
+            if !folded {
+                return Err(e);
+            }
+            super::plan_time_result(Some(arr.location), Err(e))?;
         }
     }
 
@@ -592,6 +606,34 @@ enum SubArrayShape {
 /// The [`SubArrayShape`] of `node`: an `ARRAY[…]` constructor (cast or not)
 /// over values — or over sub-arrays all of one fixed shape — a NULL, or an
 /// empty array literal.
+/// Whether `node`, an element of an `ARRAY[...]`, is certainly a constant
+/// once parsed and folded: a literal (NULL included), an untyped one cast
+/// to a type that is no domain (`'{1}'::int[]`, `NULL::int[]` — the
+/// literal is read as that type; a domain's check stays a node), or an
+/// `ARRAY[...]` of such, which `eval_const_expressions` evaluates.
+fn certainly_constant(node: &protobuf::Node, snapshot: &PgCatalog) -> bool {
+    match node.node.as_ref() {
+        Some(node::Node::AConst(_)) => true,
+        Some(node::Node::TypeCast(c)) => {
+            let untyped = match c.arg.as_deref().and_then(|a| a.node.as_ref()) {
+                Some(node::Node::AConst(a)) => {
+                    a.isnull || matches!(a.val, Some(a_const::Val::Sval(_)))
+                }
+                _ => false,
+            };
+            untyped
+                && c.type_name
+                    .as_ref()
+                    .and_then(|tn| crate::ddl::util::lookup_type_name(tn, snapshot).ok())
+                    .is_some_and(|t| snapshot.unwrap_domain(t) == t)
+        }
+        Some(node::Node::AArrayExpr(a)) => {
+            a.elements.iter().all(|e| certainly_constant(e, snapshot))
+        }
+        _ => false,
+    }
+}
+
 fn sub_array_shape(node: &protobuf::Node, ctx: Ctx<'_>, params: &ParamCollector) -> SubArrayShape {
     match node.node.as_ref() {
         Some(node::Node::AConst(c)) if c.isnull => SubArrayShape::Absent,

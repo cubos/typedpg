@@ -1075,9 +1075,58 @@ fn values_sort_keys_hold_no_calls_of_their_level() {
             "SELECT (VALUES (1) ORDER BY sum(1))",
             "Aggref found in non-Agg plan node",
         ),
+        // A FROM subquery, an IN sublink or a CTE the plan holds — unless
+        // it is a dummy one (see below).
+        (
+            "SELECT * FROM (VALUES (1) ORDER BY sum(1)) s",
+            "Aggref found in non-Agg plan node",
+        ),
+        (
+            "SELECT * FROM (VALUES (1) ORDER BY count(*) OVER ()) s",
+            "WindowFunc found in non-WindowAgg plan node",
+        ),
+        (
+            "SELECT 1 FROM (SELECT * FROM (VALUES (1) ORDER BY sum(1)) v) s",
+            "Aggref found in non-Agg plan node",
+        ),
+        (
+            "SELECT * FROM (VALUES (1) ORDER BY sum(1)) s LIMIT 0",
+            "Aggref found in non-Agg plan node",
+        ),
+        (
+            "SELECT * FROM a WHERE x IN (VALUES (1) ORDER BY sum(1))",
+            "Aggref found in non-Agg plan node",
+        ),
+        (
+            "WITH s AS MATERIALIZED (VALUES (1) ORDER BY sum(1)) SELECT * FROM s",
+            "Aggref found in non-Agg plan node",
+        ),
+        (
+            "WITH s AS (VALUES (1) ORDER BY sum(1)) SELECT * FROM s",
+            "Aggref found in non-Agg plan node",
+        ),
+        // A SubPlan is started even in a dummy plan, a CTE scanned on its
+        // own too.
+        (
+            "SELECT * FROM a WHERE x = (VALUES (1) ORDER BY sum(1)) AND x = 1 AND x = 2",
+            "Aggref found in non-Agg plan node",
+        ),
+        (
+            "WITH s AS MATERIALIZED (VALUES (1) ORDER BY sum(1)) SELECT * FROM s WHERE false",
+            "Aggref found in non-Agg plan node",
+        ),
+        (
+            "WITH s AS (VALUES (1) ORDER BY sum(1)) SELECT * FROM s, s s2 WHERE false",
+            "Aggref found in non-Agg plan node",
+        ),
     ] {
         assert_err_prefix!(db.analyze(sql), AnalyzeError::PgInternalError(_), message);
     }
+    assert_err_prefix!(
+        db.analyze("SELECT * FROM (VALUES (1) ORDER BY generate_series(1, 2)) s"),
+        AnalyzeError::FeatureNotSupported(_),
+        "set-valued function called in context that cannot accept a set"
+    );
     // An outer level's aggregate is a value there; a VALUES the planner
     // drops, or never runs, raises nothing.
     for sql in [
@@ -1085,6 +1134,14 @@ fn values_sort_keys_hold_no_calls_of_their_level() {
         "SELECT (VALUES (1) ORDER BY (SELECT sum(a.x))) FROM a",
         "SELECT * FROM (VALUES (1) ORDER BY sum(1)) v WHERE false",
         "SELECT EXISTS (VALUES (1) ORDER BY sum(1))",
+        // The planner proves the plan empty: a dummy one, never started.
+        "SELECT * FROM a, (VALUES (1) ORDER BY sum(1)) v WHERE false",
+        "SELECT * FROM a JOIN (VALUES (1) ORDER BY sum(1)) v(c) ON false",
+        "SELECT count(*) FROM (VALUES (1) ORDER BY sum(1)) v HAVING false",
+        "SELECT * FROM a WHERE x IN (VALUES (1) ORDER BY sum(1)) AND x = 1 AND x = 2",
+        "SELECT * FROM a WHERE EXISTS (VALUES (1) ORDER BY sum(1))",
+        "WITH s AS (VALUES (1) ORDER BY sum(1)) SELECT * FROM s WHERE false",
+        "WITH s AS (VALUES (1) ORDER BY sum(1)) SELECT 1",
     ] {
         db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
     }

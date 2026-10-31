@@ -102,6 +102,14 @@ pub(crate) fn process_from_item(
             {
                 check_cte_reference(cte_scopes, &rv.relname)?;
                 super::deferred::reference_cte(&cte_cols, rv.location)?;
+                if rows_kept()
+                    && crate::expr::plan_time_checks()
+                    && !crate::expr::plan_fold::level_may_be_dummy()
+                    && let Some(e) = cte_cols.iter().find_map(|c| c.deferred.started.as_deref())
+                    && let Some(e) = crate::expr::plan_time_error(Some(rv.location), e.clone())
+                {
+                    return Err(e);
+                }
                 let realias = |cols: Vec<ScopeColumn>| -> Vec<ScopeColumn> {
                     cols.into_iter()
                         .map(|mut c| {
@@ -148,7 +156,8 @@ pub(crate) fn process_from_item(
             if crate::expr::plan_time_checks()
                 && let Some(class) = snapshot.resolve_table(schema, &rv.relname)
                 && class.relkind == crate::pg_catalog::RelKind::View
-                && let Some(planned) = crate::ddl::views::planned_view_errors(snapshot, class.oid)
+                && let Some(planned) =
+                    crate::ddl::views::planned_view_errors(snapshot, class.oid, rows_kept())
             {
                 if let Some((_, e)) = planned.rest
                     && let Some(e) = crate::expr::plan_time_error(Some(rv.location), e)
@@ -159,6 +168,17 @@ pub(crate) fn process_from_item(
                     for (c, e) in src.columns.iter_mut().zip(planned.outputs) {
                         c.deferred.value = e.map(Box::new);
                     }
+                }
+            }
+            // A view's columns are its query's outputs, which the planner
+            // may substitute.
+            if let Some(class) = snapshot.resolve_table(schema, &rv.relname)
+                && class.relkind == crate::pg_catalog::RelKind::View
+                && !snapshot.security_barrier_views.contains(&class.oid)
+                && let Some(src) = scope.sources.last_mut()
+            {
+                for c in &mut src.columns {
+                    c.deferred.substitution = crate::scope::Substitution::Maybe;
                 }
             }
             if let Some(class) = snapshot.resolve_table(schema, &rv.relname)
@@ -392,9 +412,10 @@ pub(crate) fn process_from_item(
                 // where it plans it: an output where this level reads it
                 // (see `deferred`).
                 let mut planned = super::deferred::Split::default();
+                let plan = super::deferred::plan_of(sel, snapshot);
                 let (analyzed, correlated) = crate::nonnull::capture_correlation(sel, || {
                     let (analyzed, split) =
-                        super::deferred::analyze(super::deferred::plan_of(sel), sel, || {
+                        super::deferred::analyze(plan, sel, rows_kept(), || {
                             crate::grouping::with_visible_entries(visible, || {
                                 analyze_select_with_ctes_and_outer(
                                     sel,
@@ -416,6 +437,11 @@ pub(crate) fn process_from_item(
                 {
                     return Err(e);
                 }
+                // A subquery the join keeps is planned and its plan started
+                // (removed, never: `remove_useless_joins`).
+                if rows_kept() {
+                    super::check_values_sort(sel, snapshot, false)?;
+                }
                 let summary = take_level_summary();
                 if capture {
                     null_ctx.add_where_facts(
@@ -424,12 +450,38 @@ pub(crate) fn process_from_item(
                 }
                 resolve_unknown_outputs(sel, &mut cols, params, snapshot)?;
                 let mut outputs = planned.outputs.into_iter();
+                let pulled_up = plan == super::deferred::Plan::PulledUp && rows_kept();
+                let mut exprs = if pulled_up {
+                    super::deferred::output_exprs(sel)
+                } else {
+                    Vec::new()
+                }
+                .into_iter();
                 let mut scope_cols: Vec<ScopeColumn> = cols
                     .into_iter()
                     .map(|rc| ScopeColumn {
                         deferred: crate::scope::Deferred {
                             value: outputs.next().flatten().map(Box::new),
                             entry: None,
+                            started: None,
+                            // A pulled-up subquery's output replaces the
+                            // reference, as planned; otherwise the
+                            // reference stays a Var, collated as parsed.
+                            planned: match (plan, rc.planned) {
+                                (
+                                    super::deferred::Plan::PulledUp,
+                                    p @ crate::expr::Planned::Folded { .. },
+                                ) => p,
+                                _ => crate::expr::Planned::AsParsed,
+                            },
+                            substitution: match plan {
+                                _ if pulled_up => crate::scope::Substitution::Certain,
+                                super::deferred::Plan::Uncertain => {
+                                    crate::scope::Substitution::Maybe
+                                }
+                                _ => crate::scope::Substitution::Never,
+                            },
+                            expr: exprs.next().flatten(),
                         },
                         name: rc.name,
                         type_oid: rc.type_oid,
@@ -438,7 +490,14 @@ pub(crate) fn process_from_item(
                         typmod: rc.typmod,
                         collation: rc.collation,
                         no_collation: rc.no_collation.is_some(),
-                        planned_unknown: rc.planned != crate::expr::Planned::AsParsed,
+                        planned_unknown: !matches!(
+                            (plan, rc.planned),
+                            (_, crate::expr::Planned::AsParsed)
+                                | (
+                                    super::deferred::Plan::PulledUp,
+                                    crate::expr::Planned::Folded { .. }
+                                )
+                        ),
                         record_fields: rc.record_fields,
                         elem_nullable: rc.elem_nullable,
                         refine: rc.refine.clone(),
