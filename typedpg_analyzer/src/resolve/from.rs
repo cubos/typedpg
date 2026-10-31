@@ -2279,11 +2279,16 @@ fn expr_rte_columns(
         .finalize_implicit());
     }
     let has_coldeflist = !f.coldeflist.is_empty();
-    if let Some(cols) =
-        // A Var over an expression keeps its parsed collation: only an
-        // inlined SQL function's scan is replaced by planning.
-        composite_rte_columns(value.type_oid, has_coldeflist, alias, snapshot, whole_row, false)?
-    {
+    // A Var over an expression keeps its parsed collation: only an inlined
+    // SQL function's scan is replaced by planning.
+    if let Some(cols) = composite_rte_columns(
+        value.type_oid,
+        has_coldeflist,
+        alias,
+        snapshot,
+        whole_row,
+        false,
+    )? {
         return Ok(cols);
     }
     if value.type_oid == oid::RECORD {
