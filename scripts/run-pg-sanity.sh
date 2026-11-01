@@ -103,6 +103,8 @@ awk -F'\t' '
         for (c in errors) printf "    SQLSTATE %s: %d\n", c, errors[c]
         printf "  not executed: %d with no NOT NULL promise, %d not SELECT/DML, %d calling unsafe functions, %d lacking a parameter sample\n",
             n["no_promise"], n["not_executable"], n["unsafe_calls"], n["no_param_sample"]
+        printf "  simplified queries executed next to the written one: %d (%d scenario results compared)\n",
+            n["equivalence_checked"], n["equivalence_compared"]
         k = 0
         for (s in skips) k++
         printf "  tables the seeder could not fill: %d distinct\n", k

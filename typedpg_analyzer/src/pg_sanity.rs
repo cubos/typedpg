@@ -96,6 +96,11 @@ pub enum DivergenceKind {
     /// inferred NOT NULL (a column, an array element, a record field)
     /// came back NULL.
     Nullability,
+    /// Query: the simplified SQL the analyzer sends instead of the one
+    /// written (see `crate::simplify`) doesn't prepare to the same
+    /// columns and parameters, or returns other rows (or fails where the
+    /// original doesn't) over the adversarial data.
+    Simplification,
 }
 
 impl std::fmt::Display for Divergence {
@@ -289,6 +294,61 @@ impl PgSanityServer {
         }
     }
 
+    /// The simplification oracle: the SQL the analyzer sends (`ours.sql`)
+    /// instead of the one written (`original_sql`) must prepare to the same
+    /// columns and parameters, and return the same rows over the
+    /// adversarial data (see [`soundness::Soundness::equivalence`]).
+    fn check_simplification(
+        &mut self,
+        original_sql: &str,
+        ours: &AnalyzedQuery,
+        original: &postgres::Statement,
+        finite_params: &std::collections::HashSet<u32>,
+    ) -> Option<Divergence> {
+        let simplified = match self.query_client.prepare(&ours.sql) {
+            Ok(stmt) => stmt,
+            Err(e) => {
+                return Some(Divergence {
+                    kind: DivergenceKind::Simplification,
+                    message: format!(
+                        "pg_sanity: PG rejects the simplified query: {}\n\
+                         written:\n---\n{original_sql}\n---\nsimplified:\n---\n{}\n---",
+                        render_pg_error(&e),
+                        ours.sql
+                    ),
+                });
+            }
+        };
+        let shape = |s: &postgres::Statement| {
+            (
+                s.columns()
+                    .iter()
+                    .map(|c| (c.name().to_owned(), c.type_().oid()))
+                    .collect::<Vec<_>>(),
+                s.params().iter().map(PgType::oid).collect::<Vec<_>>(),
+            )
+        };
+        if shape(original) != shape(&simplified) {
+            return Some(Divergence {
+                kind: DivergenceKind::Simplification,
+                message: format!(
+                    "pg_sanity: the simplified query prepares to other columns or parameters.\n\
+                     written:\n---\n{original_sql}\n---\n{:?}\nsimplified:\n---\n{}\n---\n{:?}",
+                    shape(original),
+                    ours.sql,
+                    shape(&simplified)
+                ),
+            });
+        }
+        self.soundness.equivalence(
+            &mut self.query_client,
+            (original_sql, original),
+            (&ours.sql, &simplified),
+            ours,
+            finite_params,
+        )
+    }
+
     /// Non-panicking counterpart of [`Self::assert_analyze_matches`]: returns
     /// a [`Divergence`] describing the first disagreement found between our
     /// analyzer and PG's Parse+Describe (or execute-time fallback), or `None`
@@ -443,13 +503,19 @@ impl PgSanityServer {
                         });
                     }
                 }
-                self.soundness.check(
+                if let Some(d) = self.soundness.check(
                     &mut self.query_client,
                     analysis_sql,
                     ours,
                     stmt,
                     finite_params,
-                )
+                ) {
+                    return Some(d);
+                }
+                if ours.simplifications.is_empty() {
+                    return None;
+                }
+                self.check_simplification(analysis_sql, ours, stmt, finite_params)
             }
             (Err(e), Err(_)) => {
                 let our_msg = format!("{e}");
