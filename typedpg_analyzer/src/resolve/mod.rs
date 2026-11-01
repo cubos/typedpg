@@ -1208,6 +1208,7 @@ fn analyze_raw_node_once(
                     no_collation: None,
                     planned: crate::expr::Planned::AsParsed,
                     planned_top: None,
+                    scan_stays: false,
                     record_fields: None,
                     elem_nullable: None,
                     refine: crate::refine::Refinement::NONE,
@@ -1749,6 +1750,13 @@ pub(crate) struct RawColumn {
     /// (`trivial_subqueryscan`) — and the subquery's plan, with its own
     /// target list's collations, is the statement's.
     pub planned_top: Option<crate::expr::Planned>,
+    /// [`Self::planned_top`] is the parsed collation of a Var of a
+    /// SubqueryScan this level certainly keeps (see `set_planned_top`):
+    /// true only with this level as the statement's top. Pulled up into a
+    /// level reading it, the Var is that level's, and whether its scan
+    /// stays is decided by that level's flattened target list (which may
+    /// drop or reorder this level's other outputs).
+    pub scan_stays: bool,
     /// Named-field structure when this column holds a record. Sourced from
     /// SRF out_args, ROW constructors, or propagated through subqueries.
     /// Used both to surface `Type::AnonymousRecord` in the final output and

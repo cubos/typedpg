@@ -1577,6 +1577,21 @@ fn create_table_as_through_a_trivial_subquery_scan_takes_the_subquerys_planned_c
                 .into(),
             collated("C"),
         ),
+        // A WINDOW clause no call uses doesn't keep the subquery from
+        // being pulled up (is_simple_subquery checks hasWindowFuncs): its
+        // CASE folds to c1.b, whatever the outer target list.
+        (
+            "SELECT x FROM (SELECT CASE WHEN true THEN c1.b ELSE c2.b END AS x \
+             FROM c1, c2 WINDOW w AS (ORDER BY 1)) s"
+                .into(),
+            collated("C"),
+        ),
+        (
+            "SELECT x, 1 AS k FROM (SELECT CASE WHEN true THEN c1.b ELSE c2.b END AS x \
+             FROM c1, c2 WINDOW w AS (ORDER BY 1)) s"
+                .into(),
+            collated("C"),
+        ),
         // A view too: pulled up, its CASE folds to the default-collated 'x';
         // planned on its own, its plan is the statement's.
         ("SELECT x FROM vp".into(), text()),
@@ -1663,6 +1678,31 @@ fn create_table_as_through_a_trivial_subquery_scan_takes_the_subquerys_planned_c
             ),
         ]);
     }
+    // A pulled-up subquery (or inlined CTE) over one planned on its own:
+    // whether the scan stays is up to the target list the pull-up leaves
+    // (the reading level's), not the pulled-up one's. Here that is just
+    // vs's column, the scan is removed, and PG stores vs's planned,
+    // default, collation; with another output beside it (the last one),
+    // the scan stays and PG stores "C". The analyzer can't tell, and
+    // accepts what either allows.
+    let defaults = [
+        "SELECT x FROM (SELECT x, 1 AS k FROM vs) q",
+        "SELECT x FROM (SELECT y, x FROM (SELECT x, 'a'::text y FROM vs) z) q",
+        "WITH q AS (SELECT x, 1 AS k FROM vs) SELECT x FROM q",
+        "SELECT x FROM (SELECT x, 1 AS k FROM (SELECT CASE WHEN 1 = 1 THEN 'x' ELSE c1.b END AS x \
+         FROM c1 OFFSET 0) s) q",
+    ];
+    for ctas in defaults {
+        migrations(ctas, view).unwrap_or_else(|e| panic!("{ctas}\n  got: {e}"));
+        migrations(ctas, "CREATE TABLE ch (x text) INHERITS (t);")
+            .unwrap_or_else(|e| panic!("{ctas}\n  got: {e}"));
+    }
+    let ctas = "SELECT x, 2 AS j FROM (SELECT x, 1 AS k FROM vs) q";
+    migrations(
+        ctas,
+        r#"CREATE TABLE ch (x text COLLATE "C") INHERITS (t);"#,
+    )
+    .unwrap_or_else(|e| panic!("{ctas}\n  got: {e}"));
 }
 
 #[test]

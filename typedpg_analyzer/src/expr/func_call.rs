@@ -1944,7 +1944,13 @@ pub(crate) fn check_window_clause(
                     })?,
             )
         };
-        transform_window_def(wd, base, ctx, params)?;
+        // subquery_planner preprocesses every WINDOW entry (its offsets,
+        // and its keys as the target list's resjunk entries) — except in
+        // a subquery it pulls up, which takes only the outputs (no window
+        // call can use the entry there: is_simple_subquery).
+        crate::expr::plan_fold::unless_dead(crate::expr::plan_fold::level_pulled_up(), || {
+            transform_window_def(wd, base, ctx, params)
+        })?;
     }
 
     // Then the inline windows, in the order their calls were transformed:

@@ -915,6 +915,10 @@ fn a_subquery_output_fails_where_it_is_read() {
         "SELECT y.q FROM (SELECT x.q FROM (SELECT 1 / 0 AS q) x) y",
         "SELECT 1 FROM (SELECT 1 / 0 AS q) x ORDER BY x.q",
         "SELECT 1 FROM s JOIN (SELECT 1 / 0 AS q) x ON x.q = s.b",
+        // A WINDOW clause no call uses is planned (its keys as resjunk
+        // entries) at a level of its own.
+        "SELECT k FROM s WINDOW w AS (PARTITION BY 1 / 0)",
+        "SELECT x.k FROM (SELECT k FROM s WINDOW w AS (ORDER BY 1 / 0) OFFSET 0) x",
     ] {
         assert_err_prefix!(
             db.analyze(sql),
@@ -925,6 +929,7 @@ fn a_subquery_output_fails_where_it_is_read() {
     for sql in [
         "SELECT * FROM (VALUES (2147483647 + 1)) q",
         "SELECT l.z FROM s, LATERAL (SELECT 2147483647 + 1 AS z) l",
+        "SELECT x.k FROM (SELECT k FROM s WINDOW w AS (ROWS 2147483647 + 1 PRECEDING) OFFSET 0) x",
     ] {
         assert_err_prefix!(
             db.analyze(sql),
@@ -947,6 +952,12 @@ fn a_subquery_output_fails_where_it_is_read() {
         "SELECT count(*) FROM (SELECT 1 / 0 AS q) x",
         "SELECT 1 FROM (SELECT y.q FROM (SELECT 1 / 0 AS q) y) x",
         "SELECT x.k FROM (SELECT 1 / 0 AS q, k FROM s) x",
+        // A WINDOW clause no call uses keeps no subquery from being pulled
+        // up (is_simple_subquery checks hasWindowFuncs), and is dropped.
+        "SELECT x.k FROM (SELECT k FROM s WINDOW w AS (PARTITION BY 1 / 0)) x",
+        "SELECT x.k FROM (SELECT k FROM s WINDOW w AS (ORDER BY 1 / 0)) x WHERE false",
+        "SELECT x.k FROM s LEFT JOIN (SELECT k FROM s WINDOW w AS (PARTITION BY 1 / 0)) x ON true",
+        "SELECT x.k FROM (SELECT k FROM s WINDOW w AS (ROWS 2147483647 + 1 PRECEDING)) x",
     ] {
         db.analyze(sql)
             .unwrap_or_else(|e| panic!("{sql}: unexpected error {e}"));

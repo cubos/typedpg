@@ -102,7 +102,10 @@ pub(crate) fn subquery_planned_top(
     use crate::expr::Planned;
     let top = rc.planned_top.unwrap_or(rc.planned);
     match plan {
-        // Pulled up, the subquery's level is the one reading it.
+        // Pulled up, the subquery's level is the one reading it — except
+        // where the subquery's level kept a scan its own target list
+        // made non-trivial: the reading level's (flattened) one decides.
+        super::deferred::Plan::PulledUp if rc.scan_stays => Some(Planned::Unknown),
         super::deferred::Plan::PulledUp => rc.planned_top,
         // Planned on its own: a trivial scan over it leaves its plan.
         super::deferred::Plan::Separate => Some(if top == Planned::AsParsed || removable {
@@ -111,7 +114,7 @@ pub(crate) fn subquery_planned_top(
             Planned::Unknown
         }),
         super::deferred::Plan::Uncertain | super::deferred::Plan::Whole => {
-            (top != Planned::AsParsed || rc.planned != Planned::AsParsed)
+            (top != Planned::AsParsed || rc.planned != Planned::AsParsed || rc.scan_stays)
                 .then_some(Planned::Unknown)
         }
     }

@@ -727,13 +727,17 @@ fn analyze_select_here(
         params,
     )?;
     check_distinct_on_matches_order_by(sel, &columns, &scope, snapshot)?;
-    check_sort_group_keys(
-        sel,
-        &targets,
-        &columns,
-        expr::Ctx::new(&scope, &null_ctx, snapshot),
-        params,
-    )?;
+    // In a subquery the planner pulls up, the only keys are its WINDOW
+    // clause's, which it never plans (see `check_window_clause`).
+    expr::plan_fold::unless_dead(expr::plan_fold::level_pulled_up(), || {
+        check_sort_group_keys(
+            sel,
+            &targets,
+            &columns,
+            expr::Ctx::new(&scope, &null_ctx, snapshot),
+            params,
+        )
+    })?;
     if resolve_unknowns {
         resolve_unknown_values(&sel.target_list, &columns, snapshot)?;
     }
@@ -1157,10 +1161,14 @@ fn set_planned_top(sel: &protobuf::SelectStmt, scope: &Scope, columns: &mut [Raw
             || !sel.locking_clause.is_empty()
             || limit_node;
         if stays {
-            // Its Vars are the plan's.
+            // Its Vars are the plan's (as long as this level is the top:
+            // pulled up, see `RawColumn::scan_stays`).
             for (col, o) in columns.iter_mut().zip(&outputs) {
                 col.planned_top = match o {
-                    TopOutput::Var(v) if v.deferred.subquery_scan => Some(Planned::AsParsed),
+                    TopOutput::Var(v) if v.deferred.subquery_scan => {
+                        col.scan_stays = true;
+                        Some(Planned::AsParsed)
+                    }
                     TopOutput::Var(v) if differs(v) => Some(Planned::Unknown),
                     TopOutput::MaybeVar(cs) if cs.iter().any(|c| differs(c)) => {
                         Some(Planned::Unknown)
