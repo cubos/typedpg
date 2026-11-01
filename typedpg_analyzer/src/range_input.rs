@@ -163,6 +163,67 @@ pub(crate) fn validate_range(
     }
 }
 
+/// What a valid range literal of a built-in range type is, as far as
+/// `range_contains_elem_support` cares (see [`range_shape`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RangeShape {
+    /// `empty`, or bounds that canonicalize to it (`(1,2)` of an integer
+    /// range).
+    Empty,
+    /// No bound at all: `(,)`.
+    Unbounded,
+    /// Not empty, with at least one bound.
+    Bounded,
+}
+
+/// The shape of `content`, a literal of the built-in range type
+/// `range_oid` (`range_in`, then `range_serialize` and the type's
+/// canonical function): `None` where the literal fails, or where its
+/// bounds can't be ordered here. A bound written `infinity` is a bound
+/// (only a missing one is infinite, `RangeBound.infinite`).
+pub(crate) fn range_shape(
+    content: &str,
+    range_oid: PgTypeOid,
+    snapshot: &PgCatalog,
+) -> Option<RangeShape> {
+    let kind = builtin_range_kind(range_oid, snapshot)?;
+    validate_range(content, range_oid, snapshot).ok()?;
+    let parts = parse_range(content).ok()?;
+    if parts.empty {
+        return Some(RangeShape::Empty);
+    }
+    let (lower, upper) = match (&parts.lower, &parts.upper) {
+        (None, None) => return Some(RangeShape::Unbounded),
+        (Some(lower), Some(upper)) => (lower, upper),
+        // An infinite bound: the range holds every value on that side.
+        _ => return Some(RangeShape::Bounded),
+    };
+    let (lo, hi) = (BoundKey::parse(lower, kind)?, BoundKey::parse(upper, kind)?);
+    // The discrete types' canonical form `[lo, hi)` (an `infinity` date is
+    // left alone, and isn't ordered here).
+    let step = match kind {
+        Kind::Int4 | Kind::Int8 => Some(1),
+        Kind::Date => Some(86_400_000_000),
+        _ => None,
+    };
+    let empty = match (step, lo, hi) {
+        (Some(step), BoundKey::Int(lo), BoundKey::Int(hi)) => {
+            lo + i128::from(!parts.lower_inc) * step >= hi + i128::from(parts.upper_inc) * step
+        }
+        (Some(_), _, _) => return None,
+        (None, lo, hi) => match lo.cmp(&hi) {
+            Ordering::Less => false,
+            Ordering::Equal => !(parts.lower_inc && parts.upper_inc),
+            Ordering::Greater => return None,
+        },
+    };
+    Some(if empty {
+        RangeShape::Empty
+    } else {
+        RangeShape::Bounded
+    })
+}
+
 /// `int4range_canonical` / `int8range_canonical`: an exclusive lower or
 /// inclusive upper bound at the type's maximum can't be shifted by one.
 /// (`daterange_canonical` can only overflow past year 5874897 — out of the

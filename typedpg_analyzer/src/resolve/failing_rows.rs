@@ -38,6 +38,7 @@
 //! evaluation fails (sub-arrays that can't agree) are found here too.
 
 use super::*;
+use crate::range_input::{RangeShape, range_shape};
 
 /// Fail when every execution of `sel` evaluates a NULL its domain rejects.
 pub(super) fn check_null_domain_casts(
@@ -1683,6 +1684,7 @@ impl Level<'_> {
             node::Node::AExpr(e) if e.kind() == protobuf::AExprKind::AexprOp => {
                 Some(self.operator(e)?.result_type_oid)
             }
+            node::Node::FuncCall(_) => range_const(self.snapshot, n).map(|(t, _)| t),
             node::Node::SqlvalueFunction(_) => {
                 let scope = Scope::default();
                 let null_ctx = NullabilityContext::default();
@@ -1742,6 +1744,7 @@ impl Level<'_> {
                 null: is_null_const(self.snapshot, a),
                 not_null: self.not_null_const(a),
                 value: self.value(a),
+                range: range_const(self.snapshot, a).map(|(_, shape)| shape),
             })
             .collect();
         let resolved = self.operator(e).map(|op| op.code);
@@ -1785,7 +1788,7 @@ impl Level<'_> {
             {
                 true
             }
-            _ => self.error(n).is_some(),
+            _ => range_const(self.snapshot, n).is_some() || self.error(n).is_some(),
         }
     }
 
@@ -1942,8 +1945,12 @@ impl Level<'_> {
     /// (generate_base_implied_equalities_const). Equalities each of a
     /// column of the source and a constant, the constants of a column all
     /// equal, make classes of a column and one constant (`b = 3 AND b =
-    /// 3`: `3 = 3` is folded to true). Over no FROM item, a qualification
-    /// reads no Var: each conjunct is a gating qual, in no class.
+    /// 3`: `3 = 3` is folded to true). So do ones whose column is coerced
+    /// to different types (`b = 3 AND b = 3.5` over an integer `b`: `b`
+    /// and `b::numeric` are different members, of different classes —
+    /// equality operators of different input types, which no class
+    /// shares). Over no FROM item, a qualification reads no Var: each
+    /// conjunct is a gating qual, in no class.
     fn equalities_consistent(&self, conjuncts: &[&protobuf::Node]) -> bool {
         let equalities: Vec<&protobuf::AExpr> = conjuncts
             .iter()
@@ -1955,10 +1962,14 @@ impl Level<'_> {
         let Some(source) = self.source.filter(|s| !s.rows.var_free) else {
             return true;
         };
+        // A column, by the type its equality's operator takes it as.
+        type Member = (usize, Option<PgTypeOid>);
         // Constants of one column are equal when they are the same
         // literal, or the same number (`3`, `3.0`, `3::int8`, and of a
-        // column of an integer or numeric type `'3'`).
-        let column_const = |e: &protobuf::AExpr| -> Option<(usize, EqConst)> {
+        // column of an integer or numeric type `'3'`). Each equality's
+        // column is keyed by the type its operator takes it as, where the
+        // operator resolves (else it may share a class with any other).
+        let column_const = |e: &protobuf::AExpr| -> Option<(Member, EqConst)> {
             if expr::extract_string_fields(&e.name) != ["="] {
                 return None;
             }
@@ -1974,26 +1985,42 @@ impl Level<'_> {
                 _ => return None,
             };
             let l = e.lexpr.as_deref()?;
-            let (col, lit) = match (l.node.as_ref()?, r.node.as_ref()?) {
-                (node::Node::ColumnRef(cr), _) => (cr, r),
-                (_, node::Node::ColumnRef(cr)) => (cr, l),
+            let (col, lit, col_left) = match (l.node.as_ref()?, r.node.as_ref()?) {
+                (node::Node::ColumnRef(cr), _) => (cr, r, true),
+                (_, node::Node::ColumnRef(cr)) => (cr, l, false),
                 _ => return None,
             };
             let Read::Column(i) = source.read(col) else {
                 return None;
             };
-            let numeric = source
-                .rows
-                .type_of(i)
+            let column_type = source.rows.type_of(i);
+            let operand = column_type.zip(self.type_of(lit)).and_then(|(c, k)| {
+                let (left, right) = if col_left { (c, k) } else { (k, c) };
+                match self.snapshot.find_operator_detailed("=", Some(left), right) {
+                    crate::lookup::OperatorMatch::Found(op) => {
+                        let o = self.snapshot.pg_operator.get(&op.oid)?;
+                        // A polymorphic operand takes the column as it is.
+                        let t = if col_left { o.oprleft? } else { o.oprright };
+                        (!crate::polymorphic::is_polymorphic(t)).then_some(t)
+                    }
+                    _ => None,
+                }
+            });
+            let numeric = column_type
                 .is_some_and(|t| [oid::INT2, oid::INT4, oid::INT8, oid::NUMERIC].contains(&t));
-            Some((i, eq_const(lit, numeric, self.snapshot)?))
+            Some(((i, operand), eq_const(lit, numeric, self.snapshot)?))
         };
-        let pairs: Option<Vec<(usize, EqConst)>> =
+        let pairs: Option<Vec<(Member, EqConst)>> =
             equalities.iter().map(|e| column_const(e)).collect();
+        let shared =
+            |(c, s): &Member, (d, t): &Member| c == d && (s.is_none() || t.is_none() || s == t);
         pairs.is_some_and(|pairs| {
-            pairs
-                .iter()
-                .all(|(c, v)| pairs.iter().filter(|(d, _)| d == c).all(|(_, w)| w == v))
+            pairs.iter().all(|(c, v)| {
+                pairs
+                    .iter()
+                    .filter(|(d, _)| shared(c, d))
+                    .all(|(_, w)| w == v)
+            })
         })
     }
 
@@ -2389,9 +2416,9 @@ const MAX_BODY_DEPTH: usize = 8;
 /// (`like_regex_support`, `network_subset_support`), in-place
 /// modification ones (`array_append_support`), or reduce a length
 /// coercion to its first argument (`TemporalSimplify`, `numeric_support`,
-/// `varchar_support`, `varbit_support`). Another one — say
-/// `range_contains_elem_support`, which folds `elem <@ 'empty'` to false
-/// — may drop an argument.
+/// `varchar_support`, `varbit_support`). Another one may drop an
+/// argument; the range ones do only over some constants (see
+/// [`range_support_keeps`]).
 const ARGUMENT_KEEPING_SUPPORT: [&str; 14] = [
     "textlike_support",
     "texticlike_support",
@@ -2463,6 +2490,141 @@ struct Arg {
     not_null: bool,
     /// The constant it surely is.
     value: Option<Value>,
+    /// The range constant it surely is, by its shape.
+    range: Option<RangeShape>,
+}
+
+/// The support function of `p` is `range_contains_elem_support` or
+/// `elem_contained_by_range_support` (`find_simplified_clause`), and
+/// keeps the call's argument `arg`: it simplifies the call only over a
+/// non-NULL constant range — to false over an empty one, to true over one
+/// with no bound, both dropping the element; else to comparisons of the
+/// element with the bounds, which evaluate it as the call does (unless it
+/// is volatile or costly, and then the call stays). The failing argument
+/// is no constant: as the range, the call stays.
+fn range_support_keeps(
+    snapshot: &PgCatalog,
+    p: &crate::pg_catalog::PgProc,
+    arg: usize,
+    args: &[Arg],
+) -> bool {
+    let Some(f) = p.prosupport.and_then(|s| snapshot.pg_proc.get(&s)) else {
+        return false;
+    };
+    if snapshot.namespace_name(f.pronamespace) != Some("pg_catalog") {
+        return false;
+    }
+    let range = match f.proname.as_str() {
+        "range_contains_elem_support" => 0,
+        "elem_contained_by_range_support" => 1,
+        _ => return false,
+    };
+    arg == range
+        || args
+            .get(range)
+            .is_some_and(|a| a.range == Some(RangeShape::Bounded))
+}
+
+/// The range constant `n` is folded to, by its shape: a string literal
+/// cast to a built-in range type (read by `range_in`), or a call of a
+/// built-in range constructor (`int4range(1, 5)`, `numrange(1, NULL,
+/// '[]')`) over literals — immutable, folded by the planner
+/// (`evaluate_function`) into the range its bounds' text makes.
+fn range_const(snapshot: &PgCatalog, n: &protobuf::Node) -> Option<(PgTypeOid, RangeShape)> {
+    match n.node.as_ref()? {
+        node::Node::TypeCast(tc) => {
+            let Some(node::Node::AConst(c)) = tc.arg.as_deref()?.node.as_ref() else {
+                return None;
+            };
+            let Some(protobuf::a_const::Val::Sval(content)) = c.val.as_ref() else {
+                return None;
+            };
+            let t = crate::ddl::util::resolve_type_name(tc.type_name.as_ref()?, snapshot)?;
+            Some((t, range_shape(&content.sval, t, snapshot)?))
+        }
+        node::Node::FuncCall(fc)
+            if fc.agg_order.is_empty()
+                && fc.agg_filter.is_none()
+                && fc.over.is_none()
+                && !fc.agg_star
+                && !fc.agg_distinct
+                && !fc.func_variadic =>
+        {
+            let (bounds, flags) = match fc.args.as_slice() {
+                [lower, upper] => ([lower, upper], "[)"),
+                [lower, upper, flags] => {
+                    let Some(Value::Str(flags)) = literal_value(flags) else {
+                        return None;
+                    };
+                    ([lower, upper], flags_str(&flags)?)
+                }
+                _ => return None,
+            };
+            let bounds = bounds.map(|b| match b.node.as_ref() {
+                Some(node::Node::AConst(c)) if c.isnull => Some(None),
+                Some(node::Node::AConst(c)) => Some(Some(match c.val.as_ref()? {
+                    protobuf::a_const::Val::Ival(i) => i.ival.to_string(),
+                    protobuf::a_const::Val::Fval(f) => f.fval.clone(),
+                    protobuf::a_const::Val::Sval(s) => s.sval.clone(),
+                    _ => return None,
+                })),
+                _ => None,
+            });
+            let [Some(lower), Some(upper)] = bounds else {
+                return None;
+            };
+            let parts = expr::extract_string_fields(&fc.funcname);
+            let (schema, name) = match parts.as_slice() {
+                [n] => (None, n.as_str()),
+                [s, n] => (Some(s.as_str()), n.as_str()),
+                _ => return None,
+            };
+            let scope = Scope::default();
+            let null_ctx = NullabilityContext::default();
+            let arg_types: Vec<PgTypeOid> = fc
+                .args
+                .iter()
+                .map(|a| {
+                    let ctx = Ctx::new(&scope, &null_ctx, snapshot);
+                    expr::infer_expr(a, ctx, &mut ParamCollector::default(), TypeGoal::NONE)
+                        .map(|t| t.type_oid)
+                })
+                .collect::<Result<_, _>>()
+                .ok()?;
+            let notation = crate::functions::CallNotation::of(fc).ok()?;
+            let f = crate::functions::resolve_function(
+                snapshot, schema, name, &arg_types, &notation, false, None,
+            )
+            .ok()?;
+            let p = snapshot.pg_proc.get(&f.oid)?;
+            let range = p.prorettype;
+            let constructor = p.oid.get() < FIRST_NORMAL_OBJECT_ID
+                && snapshot.namespace_name(p.pronamespace) == Some("pg_catalog")
+                && snapshot
+                    .get_type(range)
+                    .is_some_and(|t| t.typname == p.proname && t.typnamespace == p.pronamespace)
+                && snapshot.range_subtype(range).is_some();
+            if !constructor {
+                return None;
+            }
+            // range_in's text of the same range: each bound quoted, as
+            // range_parse_bound reads it back.
+            let quote = |b: Option<String>| {
+                b.map_or_else(String::new, |b| {
+                    format!("\"{}\"", b.replace('\\', "\\\\").replace('"', "\"\""))
+                })
+            };
+            let (open, close) = flags.split_at(1);
+            let content = format!("{open}{},{}{close}", quote(lower), quote(upper));
+            Some((range, range_shape(&content, range, snapshot)?))
+        }
+        _ => None,
+    }
+}
+
+/// A range constructor's flags argument, as `range_constructor3` takes it.
+fn flags_str(flags: &str) -> Option<&'static str> {
+    ["[]", "[)", "(]", "()"].into_iter().find(|f| *f == flags)
 }
 
 /// `n` surely is a NULL constant once simplified: a NULL literal, or one
@@ -2547,7 +2709,7 @@ fn call_evaluates(
     args: &[Arg],
     depth: usize,
 ) -> bool {
-    if !keeps_arguments(snapshot, p) {
+    if !keeps_arguments(snapshot, p) && !range_support_keeps(snapshot, p, arg, args) {
         return false;
     }
     if p.prolang != crate::pg_catalog::SQL_LANGUAGE {
@@ -2618,7 +2780,17 @@ impl Body<'_> {
             node::Node::AExpr(e) if e.kind() == protobuf::AExprKind::AexprOp => {
                 Some(self.operator(e)?.result_type_oid)
             }
+            node::Node::FuncCall(_) => range_const(self.snapshot, n).map(|(t, _)| t),
             _ => None,
+        }
+    }
+
+    /// The range constant `n` surely is, by its shape: a parameter given
+    /// one, or one written out (see [`range_const`]).
+    fn range(&self, n: &protobuf::Node) -> Option<RangeShape> {
+        match self.param(n) {
+            Some(i) => self.args[i].range,
+            None => range_const(self.snapshot, n).map(|(_, shape)| shape),
         }
     }
 
@@ -2679,6 +2851,7 @@ impl Body<'_> {
                         null: i != operand && self.null_const(a),
                         not_null: i == operand || self.not_null_const(a),
                         value: self.value(a),
+                        range: self.range(a),
                     })
                     .collect();
                 operator_evaluates(
@@ -2787,7 +2960,7 @@ impl Body<'_> {
                         .and_then(|t| crate::ddl::util::resolve_type_name(t, self.snapshot))
                         .is_some_and(|t| builtin_casts_into(self.snapshot, t))
             }
-            _ => false,
+            _ => range_const(self.snapshot, n).is_some(),
         }
     }
 }
