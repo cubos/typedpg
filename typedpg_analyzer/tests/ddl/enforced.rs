@@ -197,6 +197,80 @@ fn alter_constraint_changes_foreign_key_enforceability() {
 }
 
 #[test]
+fn alter_constraint_enforced_keeps_a_not_valid_key_not_valid() {
+    let setup = format!(
+        "{PK} CREATE TABLE fk3 (a int);
+         ALTER TABLE fk3 ADD CONSTRAINT f FOREIGN KEY (a) REFERENCES pk NOT VALID;"
+    );
+    let f = |db: &PgCatalog| flags(db, "fk3").into_iter().find(|r| r.0 == "f").unwrap();
+    // Already enforced: ENFORCED changes nothing (ATExecAlterConstrEnforceability).
+    let mut db = build_db(&[(
+        "0001.sql",
+        &format!("{setup} ALTER TABLE fk3 ALTER CONSTRAINT f ENFORCED;"),
+    )]);
+    assert_eq!(f(&db), row("f", ConType::ForeignKey, true, false));
+    // A deferrability change rewrites the row with every attribute named,
+    // ENFORCED (validated) included, as PG 18 does.
+    db.apply_sql("ALTER TABLE fk3 ALTER CONSTRAINT f ENFORCED DEFERRABLE;")
+        .unwrap();
+    assert_eq!(f(&db), row("f", ConType::ForeignKey, true, true));
+    // NOT ENFORCED, then ENFORCED: validated.
+    let db = build_db(&[(
+        "0001.sql",
+        &format!(
+            "{setup} ALTER TABLE fk3 ALTER CONSTRAINT f NOT ENFORCED;
+             ALTER TABLE fk3 ALTER CONSTRAINT f ENFORCED;"
+        ),
+    )]);
+    assert_eq!(f(&db), row("f", ConType::ForeignKey, true, true));
+}
+
+#[test]
+fn alter_constraint_changes_foreign_key_deferrability() {
+    let setup = format!(
+        "{PK} CREATE TABLE fk4 (a int, CONSTRAINT f FOREIGN KEY (a) REFERENCES pk);
+         CREATE TABLE pc (a int NOT NULL) PARTITION BY RANGE (a);
+         CREATE TABLE pc1 PARTITION OF pc FOR VALUES FROM (0) TO (10);
+         ALTER TABLE pc ADD CONSTRAINT pf FOREIGN KEY (a) REFERENCES pk;"
+    );
+    for name in ["f", "pf"] {
+        assert_err(
+            &setup,
+            &format!("BEGIN; SET CONSTRAINTS {name} DEFERRED;"),
+            &format!("constraint \"{name}\" is not deferrable"),
+        );
+    }
+    // Made DEFERRABLE (on the partition's clone too), it can be deferred.
+    let mut db = build_db(&[(
+        "0001.sql",
+        &format!(
+            "{setup}
+             ALTER TABLE fk4 ALTER CONSTRAINT f DEFERRABLE;
+             ALTER TABLE pc ALTER CONSTRAINT pf INITIALLY DEFERRED;"
+        ),
+    )]);
+    db.apply_sql("BEGIN; SET CONSTRAINTS f, pf DEFERRED; COMMIT;")
+        .unwrap();
+    // NOT DEFERRABLE again: it can't.
+    db.apply_sql(
+        "ALTER TABLE fk4 ALTER CONSTRAINT f NOT DEFERRABLE;
+         ALTER TABLE pc ALTER CONSTRAINT pf NOT DEFERRABLE;",
+    )
+    .unwrap();
+    for name in ["f", "pf"] {
+        let err = db
+            .apply_sql(&format!("BEGIN; SET CONSTRAINTS {name} DEFERRED;"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with(&format!("constraint \"{name}\" is not deferrable")),
+            "{err}"
+        );
+        db.apply_sql("ROLLBACK;").unwrap();
+    }
+}
+
+#[test]
 fn inherited_check_constraints_merge_by_enforceability() {
     let setup = "CREATE TABLE cp (a int, CONSTRAINT cc CHECK (a > 0));
         CREATE TABLE cp2 (a int, CONSTRAINT cc CHECK (a > 0) NOT ENFORCED);";
