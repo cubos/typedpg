@@ -729,22 +729,11 @@ fn attach_or_clone(
         interp.fk_details.insert(candidate.oid, details);
         return Ok(());
     }
-    // No luck finding a good constraint to reuse; create our own, under the
-    // parent's name unless the partition uses it.
-    let name = if interp
-        .pg_constraint
-        .values()
-        .any(|c| c.conrelid == part && c.conname == parent.conname)
-    {
-        super::inherit::choose_constraint_name(
-            interp,
-            part,
-            &crate::ddl::util::index_name_addition(&names),
-            "fkey",
-        )
-    } else {
-        parent.conname.clone()
-    };
+    // No luck finding a good constraint to reuse; create our own
+    // (addFkConstraint), under the parent's name unless the partition uses
+    // it — then `name_1`, `name_2`, … the first no constraint in the schema
+    // has.
+    let name = derived_fk_name(interp, part, &parent.conname);
     let oid = PgConstraintOid::from_nonzero(interp.alloc_oid()?);
     interp.insert_pg_constraint(PgConstraint {
         oid,
