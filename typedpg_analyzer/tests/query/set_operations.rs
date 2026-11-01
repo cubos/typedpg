@@ -755,3 +755,344 @@ fn a_set_operation_read_whole_fails_every_execution() {
         ],
     );
 }
+
+/// A WHERE over a set operation whose leaves are select lists over no FROM
+/// item is pushed down into each leaf (to every one of a flattened UNION
+/// ALL, through apply_child_basequals; to another set operation's where
+/// `qual_is_pushdown_safe` lets it) with the leaf's expressions for its
+/// columns, and folded there: a conjunct folded to false leaves the leaf
+/// out, the others are its One-Time Filter, evaluated before its row is
+/// projected. A leaf whose filter surely fails fails every execution
+/// reading it (an Append runs them in order: past the rows of the leaves
+/// before it, under a LIMIT). Over a set operation a WHERE isn't pushed
+/// into, a duplicate OR arm, an IN list, or equal constants (of one
+/// number or literal) make no contradiction that would leave the scan
+/// dummy.
+#[test]
+fn a_qualification_pushed_into_set_operation_leaves_fails_every_execution() {
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE DOMAIN d AS int NOT NULL;
+         CREATE TABLE t (z int);
+         CREATE VIEW v AS SELECT NULL::d AS x, 1 AS y;",
+    )]);
+    let domain = Some("domain d does not allow null values");
+    let flat = "(SELECT NULL::d AS a, 1 AS b UNION ALL SELECT NULL::d, 2) s";
+    let union = "(SELECT NULL::d AS a, 1 AS b UNION SELECT NULL::d, 2) s";
+    let ordered = "(SELECT 1::d AS a, 1 AS b UNION ALL SELECT NULL::d, 2) s";
+    let except = "(SELECT NULL::d AS a, 1 AS b EXCEPT SELECT 1, 2) s";
+    let mismatched = "(SELECT 1 AS a UNION ALL SELECT NULL::d) s";
+    let cases: Vec<(String, Option<&str>)> = vec![
+        // Each leaf of a flattened UNION ALL.
+        (
+            format!("SELECT 1 FROM {flat} WHERE a = 1 AND b = 2"),
+            domain,
+        ),
+        (format!("SELECT 1 FROM {flat} WHERE b = 1 OR a = 1"), domain),
+        (
+            format!("SELECT 1 FROM {flat} WHERE coalesce(a, 5) = 1"),
+            domain,
+        ),
+        (
+            format!("SELECT 1 FROM {flat} WHERE s.a IS NULL OR s.b = 0"),
+            domain,
+        ),
+        (format!("SELECT 1 FROM {flat} WHERE s IS NOT NULL"), domain),
+        (format!("SELECT 1 FROM {flat} WHERE NOT (a = 1)"), domain),
+        (format!("SELECT 1 FROM {flat} WHERE a = 1 OR a = 2"), domain),
+        (
+            format!("SELECT 1 FROM {flat} WHERE a IS NOT DISTINCT FROM 1"),
+            domain,
+        ),
+        // A volatile conjunct is a One-Time Filter below the others'.
+        (
+            format!("SELECT 1 FROM {flat} WHERE a = 1 AND random() > 2"),
+            domain,
+        ),
+        (
+            "SELECT 1 FROM (SELECT 1::d AS a, 1 AS b UNION ALL SELECT 1::d, 2 \
+             UNION ALL SELECT NULL::d, 3) s WHERE b = 3 AND a = 1"
+                .into(),
+            domain,
+        ),
+        // No leaf, or every leaf left out.
+        (format!("SELECT 1 FROM {flat} WHERE a = 1 AND b = 3"), None),
+        (
+            format!("SELECT 1 FROM {flat} WHERE a = 1 AND b = 1 AND b = 2"),
+            None,
+        ),
+        (
+            format!("SELECT 1 FROM {ordered} WHERE b = 3 AND a = 1"),
+            None,
+        ),
+        // Only the columns read above are projected.
+        (
+            "SELECT b FROM (SELECT NULL::d AS a, 1 AS b UNION ALL SELECT 1::d, 2) s \
+             WHERE b = 1"
+                .into(),
+            None,
+        ),
+        // Equalities of a column contradicting each other through their
+        // equivalence class leave the scan dummy; restrictions of an
+        // appendrel member contradicting each other leave it out
+        // (relation_excluded_by_constraints), even of two columns with one
+        // expression.
+        (format!("SELECT 1 FROM {flat} WHERE a = 1 AND a = 2"), None),
+        (format!("SELECT 1 FROM {flat} WHERE a = 1 AND a > 2"), None),
+        (format!("SELECT 1 FROM {flat} WHERE a > 1 AND a < 0"), None),
+        (format!("SELECT 1 FROM {flat} WHERE a = 1 AND a <> 1"), None),
+        (
+            format!("SELECT 1 FROM {flat} WHERE a = 1 AND NOT (a = 1)"),
+            None,
+        ),
+        (
+            format!("SELECT 1 FROM {flat} WHERE a IS NULL AND a IS NOT NULL"),
+            None,
+        ),
+        (
+            format!("SELECT 1 FROM {flat} WHERE a = 1 AND a IS NULL"),
+            None,
+        ),
+        (
+            format!("SELECT 1 FROM {flat} WHERE (a = 1 AND a = 2) OR b = 5"),
+            None,
+        ),
+        (
+            "SELECT 1 FROM (SELECT NULL::d AS a, NULL::d AS c, 1 AS b UNION ALL \
+             SELECT NULL::d, NULL::d, 2) s WHERE a = 1 AND c = 2"
+                .into(),
+            None,
+        ),
+        (format!("SELECT 1 FROM {union} WHERE a = 1 AND a = 2"), None),
+        (
+            "SELECT 1 FROM (SELECT NULL::d AS a LIMIT 1) s WHERE a = 1 AND a = 2".into(),
+            None,
+        ),
+        (
+            format!("SELECT 1 FROM {flat} WHERE a = 1 AND a = 1"),
+            domain,
+        ),
+        (
+            format!("SELECT 1 FROM {flat} WHERE a = 1 AND b = 1"),
+            domain,
+        ),
+        // Another set operation's leaves are no appendrel members.
+        (
+            format!("SELECT 1 FROM {union} WHERE a = 1 AND a > 2"),
+            domain,
+        ),
+        (
+            format!("SELECT 1 FROM {union} WHERE a > 1 AND a < 0"),
+            domain,
+        ),
+        // Pulled up, a select list over no FROM item leaves no Var: each
+        // conjunct a gating qual.
+        ("SELECT 1 FROM v WHERE x = 1 AND x = 2".into(), domain),
+        (
+            "SELECT 1 FROM v WHERE x IS NULL AND x IS NOT NULL".into(),
+            domain,
+        ),
+        (
+            "SELECT 1 FROM (SELECT NULL::d AS a, NULL::d AS c) s WHERE a = 1 AND c = 2".into(),
+            domain,
+        ),
+        // The other table may be empty, or the LIMIT reached before.
+        (format!("SELECT 1 FROM {flat}, t WHERE a = 1"), None),
+        (
+            format!("SELECT * FROM {mismatched}, t WHERE a = 1 ORDER BY a LIMIT 2"),
+            None,
+        ),
+        // Pushed down into another set operation's leaves, each projects
+        // every column.
+        (format!("SELECT 1 FROM {union} WHERE a = 1"), domain),
+        (
+            format!("SELECT 1 FROM {union} WHERE b = 1 OR a = 1"),
+            domain,
+        ),
+        (
+            "SELECT b FROM (SELECT NULL::d AS a, 1 AS b UNION SELECT 1, 2) s WHERE b = 1".into(),
+            domain,
+        ),
+        (
+            "SELECT 1 FROM (SELECT NULL::d AS a, 1 AS b INTERSECT SELECT NULL::d, 2) s \
+             WHERE a = 1"
+                .into(),
+            domain,
+        ),
+        (
+            "SELECT a FROM (SELECT NULL::d AS a, 1 AS b UNION ALL SELECT 1, 2) s WHERE b = 1"
+                .into(),
+            domain,
+        ),
+        (
+            "SELECT b FROM (SELECT 1 AS b, NULL::d AS a UNION ALL SELECT 2, 1) s \
+             WHERE b = 1 LIMIT 1"
+                .into(),
+            domain,
+        ),
+        (
+            "SELECT b FROM (SELECT 1 AS b, NULL::d AS a UNION ALL SELECT 2, 1) s \
+             WHERE b = 2 LIMIT 1"
+                .into(),
+            None,
+        ),
+        (
+            "SELECT b FROM (SELECT 1 AS b, NULL::d AS a UNION SELECT 2, 1) s WHERE b = 3".into(),
+            None,
+        ),
+        // A volatile conjunct may run first in the leaf's filter.
+        (
+            format!("SELECT 1 FROM {union} WHERE a = 1 AND random() > 2"),
+            None,
+        ),
+        // An Append runs the leaves in order; a Sort reads them all.
+        (
+            format!("SELECT 1 FROM {ordered} WHERE b = 2 AND a = 1 LIMIT 1"),
+            domain,
+        ),
+        (
+            format!("SELECT * FROM {ordered} WHERE a = 1 ORDER BY b LIMIT 1"),
+            domain,
+        ),
+        (
+            format!("SELECT * FROM {ordered} WHERE a = 1 ORDER BY a LIMIT 2"),
+            domain,
+        ),
+        (
+            format!("SELECT a FROM {ordered} WHERE b IN (1, 2) LIMIT 2"),
+            domain,
+        ),
+        (format!("SELECT 1 FROM {ordered} WHERE a = 1 LIMIT 1"), None),
+        (
+            format!("SELECT * FROM {ordered} WHERE a = 1 ORDER BY a LIMIT 1"),
+            None,
+        ),
+        (
+            format!("SELECT 1 FROM {ordered} WHERE b = 2 OR a = 1 LIMIT 1"),
+            None,
+        ),
+        (format!("SELECT 1 FROM {ordered} WHERE b = 1 LIMIT 2"), None),
+        (
+            format!("SELECT a FROM {ordered} WHERE b IN (1, 2) LIMIT 1"),
+            None,
+        ),
+        (
+            "SELECT 1 FROM (SELECT 1::d AS a, 1 AS b UNION ALL SELECT 1::d, 2 \
+             UNION ALL SELECT NULL::d, 3) s WHERE b > 1 AND a = 1 LIMIT 1"
+                .into(),
+            None,
+        ),
+        // Over projected rows, an IN list or a duplicate OR arm is an
+        // equality (the Sort by `a` dropped), past the first arm's row.
+        (
+            format!("SELECT * FROM {mismatched} WHERE a IN (1) ORDER BY a LIMIT 2"),
+            domain,
+        ),
+        (
+            format!("SELECT * FROM {mismatched} WHERE a = 1 OR a = 1 ORDER BY a LIMIT 2"),
+            domain,
+        ),
+        // Equal constants contradict nothing; an OR enters no equivalence
+        // class but where its arms repeat one.
+        (
+            format!("SELECT 1 FROM {except} WHERE b = 3 AND b = 3.0"),
+            domain,
+        ),
+        (
+            format!("SELECT 1 FROM {except} WHERE b = 3 AND b = 3::int8"),
+            domain,
+        ),
+        (
+            format!("SELECT 1 FROM {except} WHERE b = 3 AND b = ' 3 '"),
+            domain,
+        ),
+        (
+            format!("SELECT 1 FROM {except} WHERE b IN (3) AND b = 3"),
+            domain,
+        ),
+        (
+            format!("SELECT 1 FROM {except} WHERE b = 3 OR b = 3"),
+            domain,
+        ),
+        (
+            format!("SELECT 1 FROM {except} WHERE b = 3 OR b = 4"),
+            domain,
+        ),
+        (
+            format!("SELECT 1 FROM {except} WHERE a = 1 OR b = 2"),
+            domain,
+        ),
+        (
+            "SELECT 1 FROM (SELECT NULL::d AS a, 1::numeric AS b EXCEPT SELECT 1, 2) s \
+             WHERE b = 3 AND b = 3.000"
+                .into(),
+            domain,
+        ),
+        (
+            "SELECT 1 FROM (SELECT NULL::d AS a, 'x'::text AS b EXCEPT SELECT 1, 'y') s \
+             WHERE b = 'x' AND b = 'x'"
+                .into(),
+            domain,
+        ),
+        (
+            format!("SELECT 1 FROM {except} WHERE (b = 3 OR b = 3) AND b = 4"),
+            None,
+        ),
+        (
+            "SELECT 1 FROM (SELECT NULL::d AS a, 'x'::text AS b EXCEPT SELECT 1, 'y') s \
+             WHERE b = '03' AND b = '3'"
+                .into(),
+            None,
+        ),
+    ];
+    let cases: Vec<(&str, Option<&str>)> = cases.iter().map(|(q, e)| (q.as_str(), *e)).collect();
+    assert_outcomes(&db, &cases);
+}
+
+/// Set operations PostgreSQL 18 reads whole on every execution, which the
+/// analyzer doesn't prove and accepts (it never rejects what it can't
+/// prove fails):
+/// - two equalities of one column with different constants that the
+///   planner puts in different equivalence classes (`b = 3` an integer
+///   one, `b = 3.5` a numeric one), so they contradict nothing;
+/// - a conjunct whose value only the execution knows (`random() < 2`,
+///   `now() > '2000-01-01'`), which shares the leaf's One-Time Filter;
+/// - an equality of two columns, whose class the planner fills with
+///   derived equalities;
+/// - two failing restrictions of a flattened UNION ALL's leaf that don't
+///   contradict each other (`a = 1 AND a = 1.0`): the analyzer doesn't
+///   tell which ones `predicate_refuted_by` proves contradictory.
+#[test]
+fn known_gaps_in_set_operations_read_whole() {
+    let db = build_db(&[("0001.sql", "CREATE DOMAIN d AS int NOT NULL;")]);
+    assert_outcomes(
+        &db,
+        &[
+            (
+                "SELECT 1 FROM (SELECT NULL::d AS a, 1 AS b EXCEPT SELECT 1, 2) s \
+                 WHERE b = 3 AND b = 3.5",
+                None,
+            ),
+            (
+                "SELECT b FROM (SELECT 1 AS b, NULL::d AS a UNION SELECT 2, 1) s \
+                 WHERE b = 1 AND random() < 2",
+                None,
+            ),
+            (
+                "SELECT 1 FROM (SELECT NULL::d AS a, 1 AS b UNION ALL SELECT NULL::d, 2) s \
+                 WHERE a = 1 AND now() > '2000-01-01'",
+                None,
+            ),
+            (
+                "SELECT 1 FROM (SELECT NULL::d AS a, 1 AS b UNION ALL SELECT NULL::d, 2) s \
+                 WHERE a = b AND a = 1",
+                None,
+            ),
+            (
+                "SELECT 1 FROM (SELECT NULL::d AS a, 1 AS b UNION ALL SELECT NULL::d, 2) s \
+                 WHERE a = 1 AND a = 1.0",
+                None,
+            ),
+        ],
+    );
+}

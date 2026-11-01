@@ -956,6 +956,11 @@ fn more_expressions_evaluate_a_null_domain_operand() {
             // coalesce(NULL, x) is x; coalesce(1, x) is 1.
             ("SELECT NULL #<<# x FROM v", domain),
             ("SELECT 1 #<<# x FROM v", None),
+            // COALESCE evaluates its first argument that isn't NULL.
+            ("SELECT coalesce(x, 1) FROM v", domain),
+            ("SELECT coalesce(NULL, x) FROM v", domain),
+            ("SELECT coalesce(1, x) FROM v", None),
+            ("SELECT coalesce(y, x) FROM v", None),
             ("SELECT y BETWEEN 1 AND 2 FROM v", None),
             ("SELECT y::text FROM v", None),
         ],

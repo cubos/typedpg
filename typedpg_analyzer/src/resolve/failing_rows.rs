@@ -13,7 +13,10 @@
 //! column), or surely fail itself, or — over a set operation — be pushed
 //! down into none of its arms, running over their projected rows, or read
 //! a column every leaf of a flattened UNION ALL computes from no FROM
-//! item, which it evaluates there. A LIMIT other than 0 keeps the row, and
+//! item, which it evaluates there — or be pushed down into leaves that are
+//! all select lists over no FROM item, where it is folded over each one's
+//! expressions: a leaf whose One-Time Filter surely fails, or that runs
+//! and projects a failing column, fails. A LIMIT other than 0 keeps the row, and
 //! of several rows the first one, which every plan fetches — and past the
 //! rows of an unsorted UNION ALL's left arm, the right one's first — and
 //! the ORDER BY keys of every row, which sorting evaluates whatever the
@@ -213,6 +216,13 @@ struct Rows {
     /// unsorted UNION ALL's Append runs its arms in order, so past the
     /// rows of its left one it fetches its right one's first row.
     fail_after: Option<(i64, Failure)>,
+    /// The leaves of a set operation a qualification above is pushed down
+    /// into, each one a select list over no FROM item (see [`Leaf`]).
+    leaves: Option<Leaves>,
+    /// A select list over no FROM item the planner pulls up into the query
+    /// reading it: a qualification there reads its expressions, no Var —
+    /// each conjunct a gating qual, in no equivalence class.
+    var_free: bool,
     /// The constant each output column surely holds.
     values: Vec<Option<Value>>,
     /// Each output column's type, where known (an operator over it is
@@ -236,6 +246,8 @@ impl Rows {
             qual_reads: Vec::new(),
             names: None,
             fail_after: None,
+            leaves: None,
+            var_free: false,
             all,
             first,
             values,
@@ -270,6 +282,52 @@ impl Rows {
         let t = self.types.get(i).copied().flatten()?;
         Some(if t == oid::UNKNOWN { oid::TEXT } else { t })
     }
+}
+
+/// A leaf of a set operation that is a select list over no FROM item: a
+/// qualification pushed down into it has its columns replaced by the
+/// leaf's expressions (a flattened UNION ALL's child gets it through
+/// apply_child_basequals, another set operation's leaf through
+/// subquery_push_qual), and is evaluated there as a gating qual (a
+/// One-Time Filter) before the leaf's row is projected.
+#[derive(Clone)]
+struct Leaf {
+    /// Its select list's expressions.
+    exprs: Vec<protobuf::Node>,
+    /// What evaluating each of them raises.
+    errors: Vec<Option<Failure>>,
+}
+
+/// How the leaves of a set operation a qualification is pushed down into
+/// are read.
+#[derive(Clone)]
+struct Leaves {
+    leaves: Vec<Leaf>,
+    /// Flattened into an append relation (is_simple_union_all): every
+    /// qualification above goes down to each leaf, its volatile conjuncts
+    /// in a One-Time Filter of their own below the others', and each leaf
+    /// projects only the columns read above. Else only a qualification
+    /// `qual_is_pushdown_safe` lets through is pushed down, as one
+    /// One-Time Filter, and each leaf projects every column.
+    flattened: bool,
+    /// An unsorted UNION ALL: an Append runs the leaves in order.
+    in_order: bool,
+    /// A UNION (not ALL) above every leaf: the first fetch reads them
+    /// all (a HashAggregate or a Sort).
+    all_at_once: bool,
+    /// The tree has an INTERSECT, which may read only one of its inputs.
+    intersect: bool,
+}
+
+/// What a leaf does with a qualification pushed down into it.
+enum LeafOutcome {
+    /// A conjunct is folded to false: the leaf is left out (dummy).
+    Dummy,
+    /// Its One-Time Filter surely raises this.
+    Fails(Failure),
+    /// Every conjunct holds: its row is projected.
+    Runs,
+    Unknown,
 }
 
 fn cte_list(nodes: &[protobuf::Node]) -> Vec<&protobuf::CommonTableExpr> {
@@ -336,6 +394,7 @@ fn limit_rows(sel: &protobuf::SelectStmt, rows: Rows) -> Option<Rows> {
     // Nor is one pushed down through it, below: its projections are
     // its own rows'.
     let mut rows = rows;
+    rows.leaves = None;
     rows.all.always = rows.all.always.take().or(rows.projection.take());
     rows.first.always = rows.first.always.take().or(rows.first_projection.take());
     // Fetching more rows than come before a failing one raises its error
@@ -550,14 +609,21 @@ fn select_rows(
     let unpushed = where_fails
         .filter(|w| level.unpushed(w))
         .map(|_| projection.clone());
+    // Pushed down into a set operation's leaves, it is evaluated in each.
+    let pushed = where_fails
+        .and_then(|w| level.pushed_down(sel, w))
+        .unwrap_or_default();
     if where_fails.is_some() {
-        if !count.at_least_one && !unpushed.as_ref().is_some_and(|(all, _)| all.is_some()) {
+        if !count.at_least_one
+            && !unpushed.as_ref().is_some_and(|(all, _)| all.is_some())
+            && pushed.all.is_none()
+        {
             return None;
         }
         count.at_least_one = false;
     }
     let unpushed = unpushed.unwrap_or((None, None));
-    let (all, values) = level_errors(sel, level, where_fails, unpushed.0)?;
+    let (all, values) = level_errors(sel, level, where_fails, unpushed.0, pushed.all.clone())?;
     // Over the source's first row, a WHERE that may not fail may let it
     // through or not: what the first fetch raises is unknown.
     let first = level_errors(
@@ -568,6 +634,7 @@ fn select_rows(
         },
         where_fails,
         unpushed.1,
+        pushed.first.clone(),
     )
     .map_or_else(Errors::default, |(e, _)| e);
     // A set-returning function in the select list may leave no row, or
@@ -586,21 +653,25 @@ fn select_rows(
     let fail_after = source
         .as_ref()
         .and_then(|s| s.rows.fail_after.clone())
-        .filter(|_| {
-            where_fails.is_none_or(|w| level.unpushed(w))
-                && super::walk::level_srf_calls(sel, snapshot).is_empty()
-        });
+        .filter(|_| where_fails.is_none_or(|w| level.unpushed(w)))
+        .or(pushed.fail_after)
+        .filter(|_| super::walk::level_srf_calls(sel, snapshot).is_empty());
     let equated = equated_exprs(sel.where_clause.as_deref(), snapshot);
+    let mut sorted_by = false;
     let ordered = sel.sort_clause.iter().find_map(|k| match k.node.as_ref() {
         Some(node::Node::SortBy(sb)) => {
             let key = sb.node.as_deref()?;
             if order_key_redundant(sel, level, key, &equated) {
                 return None;
             }
+            sorted_by = true;
             order_key_error(sel, level, &all, key)
         }
         _ => None,
     });
+    // A Sort reads every row the WHERE lets through: what filtering them
+    // all raises too.
+    let ordered = ordered.or_else(|| all.always.clone().filter(|_| sorted_by));
     // Without a WHERE, a qualification above may still be pushed down
     // through this query (pulled up) into the arms.
     let (projection, first_projection) = if where_fails.is_none() {
@@ -626,6 +697,7 @@ fn select_rows(
         },
         names: level_names(sel, level),
         fail_after,
+        var_free: plain_leaf(sel, snapshot).is_some(),
         ..Rows::new(all, first, values, count)
     })
 }
@@ -806,6 +878,69 @@ fn equated_exprs(
     equated
 }
 
+/// The equalities the conjunct `c` may leave as conjuncts of its own once
+/// simplified, for the planner to put in equivalence classes: `c` itself,
+/// an AND's, and those every arm of an OR has (find_duplicate_ors drops a
+/// duplicate arm, and pulls out what all of them AND); under a NOT or a
+/// cast, any (a NOT of `<>` is negated into `=`).
+fn promoted_equalities<'a>(
+    c: &'a protobuf::Node,
+    snapshot: &PgCatalog,
+) -> Vec<&'a protobuf::AExpr> {
+    use protobuf::BoolExprType as B;
+    match c.node.as_ref() {
+        Some(node::Node::AExpr(e)) if may_equate(e) => vec![e],
+        Some(node::Node::BoolExpr(b)) if b.boolop == B::AndExpr as i32 => b
+            .args
+            .iter()
+            .flat_map(|a| promoted_equalities(a, snapshot))
+            .collect(),
+        Some(node::Node::BoolExpr(b)) if b.boolop == B::OrExpr as i32 => {
+            let key = |e: &protobuf::AExpr| {
+                equivalence_key(
+                    &protobuf::Node {
+                        node: Some(node::Node::AExpr(Box::new(e.clone()))),
+                    },
+                    snapshot,
+                )
+            };
+            let arms: Vec<Vec<&protobuf::AExpr>> = b
+                .args
+                .iter()
+                .map(|a| promoted_equalities(a, snapshot))
+                .collect();
+            let Some((first, rest)) = arms.split_first() else {
+                return Vec::new();
+            };
+            let rest: Vec<std::collections::HashSet<String>> = rest
+                .iter()
+                .map(|arm| arm.iter().map(|e| key(e)).collect())
+                .collect();
+            first
+                .iter()
+                .copied()
+                .filter(|e| {
+                    let k = key(e);
+                    rest.iter().all(|arm| arm.contains(&k))
+                })
+                .collect()
+        }
+        Some(node::Node::AExpr(_)) => Vec::new(),
+        Some(_) => {
+            let mut all = Vec::new();
+            super::walk::visit_same_level(c, &mut |x| {
+                if let Some(node::Node::AExpr(e)) = x.node.as_ref()
+                    && may_equate(e)
+                {
+                    all.push(e.as_ref());
+                }
+            });
+            all
+        }
+        None => Vec::new(),
+    }
+}
+
 /// ORDER BY key `key` of `sel` may be one the planner drops as redundant:
 /// a constant (one reading no column), or one (through the output column
 /// the key names, by position or alias) in `equated` (see
@@ -906,13 +1041,14 @@ fn level_errors(
     level: Level<'_>,
     where_fails: Option<&protobuf::Node>,
     unpushed: Option<Failure>,
+    pushed: Option<Failure>,
 ) -> Option<(Errors, Vec<Option<Value>>)> {
     let source = level.source;
     let mut always = source.and_then(|s| s.rows.errors(level.first).always.clone());
     if let Some(w) = where_fails {
         always = match unpushed {
             Some(p) => Some(p),
-            None => always.or(Some(level.surely_fails(w)?)),
+            None => always.or(Some(level.surely_fails(w).or(pushed)?)),
         };
     }
     // The select list's own expressions are evaluated for the rows that
@@ -1182,7 +1318,58 @@ fn set_op_rows(
         } else {
             None
         };
+    // The leaves a qualification above is pushed down into, where every
+    // one is a select list over no FROM item (an EXCEPT takes none).
+    let leaves = (!unsafe_tree)
+        .then(|| {
+            let mut leaves = Vec::new();
+            for (arm, rows) in [&sel.larg, &sel.rarg].into_iter().zip(&arms) {
+                let (arm, rows) = (arm.as_deref()?, rows.as_ref()?);
+                if in_set_operation_tree(arm) {
+                    leaves.extend(rows.leaves.as_ref()?.leaves.iter().cloned());
+                } else {
+                    leaves.push(Leaf {
+                        exprs: plain_leaf(arm, snapshot)?,
+                        errors: rows.all.columns.clone(),
+                    });
+                }
+            }
+            leaves
+                .iter()
+                .all(|l| l.exprs.len() == width && l.errors.len() == width)
+                .then_some(leaves)
+        })
+        .flatten()
+        .map(|leaves| {
+            let intersect = intersect_tree(sel);
+            Leaves {
+                leaves,
+                flattened,
+                in_order: union_all_tree(sel) && sel.sort_clause.is_empty(),
+                all_at_once: !intersect
+                    && (sel.op == Op::SetopUnion as i32 && !sel.all || !sel.sort_clause.is_empty()),
+                intersect,
+            }
+        });
+    // A column's type is its leaves', where they agree.
+    let types = (0..width)
+        .map(|i| {
+            if types_differ(snapshot, &leaf_types, i) {
+                return None;
+            }
+            leaf_types.iter().find_map(|l| {
+                l.get(i).copied().flatten().filter(|&t| {
+                    snapshot
+                        .pg_type
+                        .get(&t)
+                        .is_some_and(|ty| ty.typtype != crate::pg_catalog::TypType::Pseudo)
+                })
+            })
+        })
+        .collect();
     Some(Rows {
+        types,
+        leaves,
         fail_after,
         sorted,
         projected: true,
@@ -1222,6 +1409,47 @@ fn pushdown_unsafe_tree(sel: &protobuf::SelectStmt) -> bool {
                 arm.op != protobuf::SetOperation::SetopNone as i32
             }
         })
+}
+
+/// `sel`'s tree has an INTERSECT.
+fn intersect_tree(sel: &protobuf::SelectStmt) -> bool {
+    sel.op == protobuf::SetOperation::SetopIntersect as i32
+        || [&sel.larg, &sel.rarg]
+            .into_iter()
+            .flatten()
+            .any(|arm| in_set_operation_tree(arm) && intersect_tree(arm))
+}
+
+/// The select list of `s`, a set operation's leaf that reads no FROM item
+/// and does nothing but project its one row.
+fn plain_leaf(s: &protobuf::SelectStmt, snapshot: &PgCatalog) -> Option<Vec<protobuf::Node>> {
+    let plain = s.op == protobuf::SetOperation::SetopNone as i32
+        && s.from_clause.is_empty()
+        && s.where_clause.is_none()
+        && s.group_clause.is_empty()
+        && s.having_clause.is_none()
+        && s.distinct_clause.is_empty()
+        && s.window_clause.is_empty()
+        && s.sort_clause.is_empty()
+        && s.limit_count.is_none()
+        && s.limit_offset.is_none()
+        && s.locking_clause.is_empty()
+        && s.with_clause.is_none()
+        && s.values_lists.is_empty()
+        && s.into_clause.is_none()
+        && super::walk::level_srf_calls(s, snapshot).is_empty();
+    if !plain {
+        return None;
+    }
+    s.target_list
+        .iter()
+        .map(|t| match t.node.as_ref() {
+            Some(node::Node::ResTarget(rt)) => {
+                rt.val.as_deref().filter(|v| !is_column_ref(v)).cloned()
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// `sel`'s tree is all UNION ALL, whatever its leaves
@@ -1321,6 +1549,18 @@ impl Level<'_> {
             // folded).
             node::Node::NullTest(nt) => return self.error(nt.arg.as_deref()?),
             node::Node::SubLink(sl) => return self.sublink_error(sl),
+            // COALESCE drops its NULL constant arguments, and evaluates the
+            // first one left first.
+            node::Node::CoalesceExpr(c) => {
+                if let Some(f) = c
+                    .args
+                    .iter()
+                    .find(|a| !is_null_const(self.snapshot, a))
+                    .and_then(|a| self.error(a))
+                {
+                    return Some(f);
+                }
+            }
             node::Node::AExpr(e) => {
                 if let Some(f) = self.a_expr_error(e) {
                     return Some(f);
@@ -1597,6 +1837,34 @@ impl Level<'_> {
                     _ => None,
                 }
             }
+            // An integer literal cast to an integer type it fits, or to a
+            // domain over one without CHECK constraints (its NOT NULL
+            // holds): the value is the literal's.
+            node::Node::TypeCast(tc) => {
+                let Some(Value::Int(i)) = literal_value(tc.arg.as_deref()?) else {
+                    return None;
+                };
+                let type_name = tc.type_name.as_ref()?;
+                if !type_name.typmods.is_empty() || !type_name.array_bounds.is_empty() {
+                    return None;
+                }
+                let t = crate::ddl::util::resolve_type_name(type_name, self.snapshot)?;
+                let fits = match self.snapshot.unwrap_domain(t) {
+                    oid::INT2 => i16::try_from(i).is_ok(),
+                    oid::INT4 => i32::try_from(i).is_ok(),
+                    oid::INT8 => true,
+                    _ => false,
+                };
+                let checked = self.snapshot.domain_chain(t).iter().any(|d| {
+                    self.snapshot
+                        .domain_constraints
+                        .get(d)
+                        .into_iter()
+                        .flatten()
+                        .any(|c| c.kind == crate::ddl::types::DomainConstraintKind::Check)
+                });
+                (fits && !checked).then_some(Value::Int(i))
+            }
             _ => literal_value(n),
         }
     }
@@ -1618,16 +1886,297 @@ impl Level<'_> {
         match n.node.as_ref()? {
             node::Node::BoolExpr(b) if b.boolop == protobuf::BoolExprType::AndExpr as i32 => {
                 let mut failing = None;
+                let mut left = Vec::new();
                 for a in &b.args {
                     if self.truth(a) == Some(true) {
                         continue;
                     }
                     failing = Some(self.surely_fails(a)?);
+                    left.push(a);
+                }
+                // Over a flattened UNION ALL, each leaf is an appendrel
+                // member, whose restrictions contradicting each other
+                // leave it out (relation_excluded_by_constraints).
+                let member = self
+                    .source
+                    .is_some_and(|s| s.rows.projected && !s.rows.qual_reads.is_empty());
+                let args: Vec<&protobuf::Node> = b.args.iter().collect();
+                if !self.equalities_consistent(&args) || member && refutable(&left, self.snapshot) {
+                    return None;
                 }
                 failing
             }
+            // An OR whose arguments left (the ones not folded to false
+            // nor NULL) all surely fail evaluates one of them first; one
+            // folded to true folds it away. A NOT evaluates its argument.
+            node::Node::BoolExpr(b) if b.boolop == protobuf::BoolExprType::OrExpr as i32 => {
+                let mut failing = None;
+                for a in &b.args {
+                    match self.truth(a) {
+                        Some(true) => return None,
+                        Some(false) => continue,
+                        None if is_null_const(self.snapshot, a) => continue,
+                        None => {}
+                    }
+                    let f = self.surely_fails(a)?;
+                    failing.get_or_insert(f);
+                }
+                failing
+            }
+            node::Node::BoolExpr(b) if b.boolop == protobuf::BoolExprType::NotExpr as i32 => {
+                match b.args.as_slice() {
+                    [a] => self.surely_fails(a),
+                    _ => None,
+                }
+            }
             node::Node::BoolExpr(_) => None,
             _ => level.error(n),
+        }
+    }
+
+    /// The equalities `conjuncts` may leave as conjuncts (see
+    /// [`promoted_equalities`]) contradict nothing: two of them may
+    /// contradict each other through their equivalence class (`b = 3 AND
+    /// b = 4`, or `b = c AND b = 3 AND c = 4`), and the planner derive a
+    /// constant false from it, leaving the scan dummy
+    /// (generate_base_implied_equalities_const). Equalities each of a
+    /// column of the source and a constant, the constants of a column all
+    /// equal, make classes of a column and one constant (`b = 3 AND b =
+    /// 3`: `3 = 3` is folded to true). Over no FROM item, a qualification
+    /// reads no Var: each conjunct is a gating qual, in no class.
+    fn equalities_consistent(&self, conjuncts: &[&protobuf::Node]) -> bool {
+        let equalities: Vec<&protobuf::AExpr> = conjuncts
+            .iter()
+            .flat_map(|c| promoted_equalities(c, self.snapshot))
+            .collect();
+        if equalities.len() < 2 {
+            return true;
+        }
+        let Some(source) = self.source.filter(|s| !s.rows.var_free) else {
+            return true;
+        };
+        // Constants of one column are equal when they are the same
+        // literal, or the same number (`3`, `3.0`, `3::int8`, and of a
+        // column of an integer or numeric type `'3'`).
+        let column_const = |e: &protobuf::AExpr| -> Option<(usize, EqConst)> {
+            if expr::extract_string_fields(&e.name) != ["="] {
+                return None;
+            }
+            // A single-item IN is one `=` (transformAExprIn).
+            let r = match (e.kind(), e.rexpr.as_deref().and_then(|r| r.node.as_ref())) {
+                (protobuf::AExprKind::AexprOp, _) => e.rexpr.as_deref()?,
+                (protobuf::AExprKind::AexprIn, Some(node::Node::List(l))) => {
+                    match l.items.as_slice() {
+                        [item] => item,
+                        _ => return None,
+                    }
+                }
+                _ => return None,
+            };
+            let l = e.lexpr.as_deref()?;
+            let (col, lit) = match (l.node.as_ref()?, r.node.as_ref()?) {
+                (node::Node::ColumnRef(cr), _) => (cr, r),
+                (_, node::Node::ColumnRef(cr)) => (cr, l),
+                _ => return None,
+            };
+            let Read::Column(i) = source.read(col) else {
+                return None;
+            };
+            let numeric = source
+                .rows
+                .type_of(i)
+                .is_some_and(|t| [oid::INT2, oid::INT4, oid::INT8, oid::NUMERIC].contains(&t));
+            Some((i, eq_const(lit, numeric, self.snapshot)?))
+        };
+        let pairs: Option<Vec<(usize, EqConst)>> =
+            equalities.iter().map(|e| column_const(e)).collect();
+        pairs.is_some_and(|pairs| {
+            pairs
+                .iter()
+                .all(|(c, v)| pairs.iter().filter(|(d, _)| d == c).all(|(_, w)| w == v))
+        })
+    }
+
+    /// What the WHERE `w` of `sel` raises where it is pushed down into the
+    /// leaves of the set operation `sel` reads (see [`Leaf`]): reading
+    /// every row, fetching the first one, and past how many rows.
+    fn pushed_down(&self, sel: &protobuf::SelectStmt, w: &protobuf::Node) -> Option<Pushed> {
+        let source = self.source?;
+        let leaves = source.rows.leaves.as_ref()?;
+        // Not flattened, the qualification goes down only where
+        // `qual_is_pushdown_safe` lets every conjunct through (no column
+        // that can't be, no whole row, no subquery); a volatile function
+        // could be left above, or run first in the leaf's filter.
+        let mut safe = true;
+        super::walk::visit_same_level(w, &mut |x| match x.node.as_ref() {
+            Some(node::Node::ColumnRef(cr)) => {
+                let read = source.read(cr);
+                safe &= matches!(read, Read::Column(_) | Read::WholeRow)
+                    && (leaves.flattened
+                        || matches!(read, Read::Column(_)) && !source.rows.unpushable(&read));
+            }
+            Some(node::Node::SubLink(_)) => safe = false,
+            Some(node::Node::FuncCall(_)) => safe &= leaves.flattened,
+            _ => {}
+        });
+        if !safe || !self.equalities_consistent(&conjuncts(w)) {
+            return None;
+        }
+        // The columns the select list reads (projected by a flattened
+        // UNION ALL's leaf, which computes no other).
+        let mut read = vec![false; source.names.len()];
+        for target in &sel.target_list {
+            if let Some(node::Node::ResTarget(rt)) = target.node.as_ref()
+                && let Some(node::Node::ColumnRef(cr)) =
+                    rt.val.as_deref().and_then(|v| v.node.as_ref())
+            {
+                match source.read(cr) {
+                    Read::Column(i) => read[i] = true,
+                    Read::All | Read::WholeRow => read.iter_mut().for_each(|r| *r = true),
+                    Read::Other => {}
+                }
+            }
+        }
+        let level = Level {
+            source: None,
+            first: false,
+            qual: true,
+            standalone: false,
+            ..*self
+        };
+        // What each leaf does: `Ok(None)` yields a row, `Ok(Some(f))`
+        // raises `f`; `Err(true)` is left out, `Err(false)` unknown.
+        let results: Vec<Result<Option<Failure>, bool>> = leaves
+            .leaves
+            .iter()
+            .map(|leaf| {
+                let q = substitute(w, source, leaf)?;
+                Some(match level.leaf_outcome(&q, leaves.flattened) {
+                    LeafOutcome::Dummy => Err(true),
+                    LeafOutcome::Unknown => Err(false),
+                    LeafOutcome::Fails(f) => Ok(Some(f)),
+                    LeafOutcome::Runs => Ok(leaf
+                        .errors
+                        .iter()
+                        .enumerate()
+                        .filter(|&(i, _)| !leaves.flattened || read[i])
+                        .find_map(|(_, e)| e.clone())),
+                })
+            })
+            .collect::<Option<_>>()?;
+        let raised = |r: &Result<Option<Failure>, bool>| r.clone().ok().flatten();
+        // Reading every row runs every leaf — of an INTERSECT, maybe only
+        // one input.
+        let all = if leaves.intersect {
+            results
+                .iter()
+                .map(raised)
+                .collect::<Option<Vec<_>>>()
+                .and_then(|f| f.into_iter().next())
+        } else {
+            results.iter().find_map(raised)
+        };
+        // An Append runs its leaves in order: the ones left out first, the
+        // rows of the ones that hold, up to one that raises (only a
+        // domain's failure counts: see the UNION in [`set_op_rows`]).
+        let mut fail_after = None;
+        if leaves.in_order && !leaves.all_at_once && !leaves.intersect {
+            let mut rows = 0i64;
+            for r in &results {
+                match r {
+                    Err(true) => {}
+                    Ok(None) => rows += 1,
+                    Ok(Some(f)) if f.domain => {
+                        fail_after = Some((rows, f.clone()));
+                        break;
+                    }
+                    Ok(Some(_)) | Err(false) => break,
+                }
+            }
+        }
+        let first = if leaves.all_at_once || leaves.intersect {
+            all.clone()
+        } else {
+            fail_after
+                .as_ref()
+                .filter(|(rows, _)| *rows == 0)
+                .map(|(_, f)| f.clone())
+        };
+        Some(Pushed {
+            all,
+            first,
+            fail_after,
+        })
+    }
+
+    /// The conjuncts the qualification `q` is split into once folded over
+    /// a leaf's constants: an AND's, and those of an OR left with one
+    /// argument (the others folded to false or NULL).
+    fn leaf_conjuncts<'n>(&self, q: &'n protobuf::Node, out: &mut Vec<&'n protobuf::Node>) {
+        use protobuf::BoolExprType as B;
+        match q.node.as_ref() {
+            Some(node::Node::BoolExpr(b)) if b.boolop == B::AndExpr as i32 => {
+                for a in &b.args {
+                    self.leaf_conjuncts(a, out);
+                }
+            }
+            Some(node::Node::BoolExpr(b)) if b.boolop == B::OrExpr as i32 => {
+                let left: Vec<&protobuf::Node> = b
+                    .args
+                    .iter()
+                    .filter(|a| self.truth(a) != Some(false) && !is_null_const(self.snapshot, a))
+                    .collect();
+                match left.as_slice() {
+                    [only] if self.truth(only).is_none() => self.leaf_conjuncts(only, out),
+                    _ => out.push(q),
+                }
+            }
+            _ => out.push(q),
+        }
+    }
+
+    /// What a leaf does with the qualification `q` pushed down into it (its
+    /// columns replaced by the leaf's expressions): each conjunct folded
+    /// to false or NULL leaves it out, to true is dropped; the others are
+    /// its One-Time Filter, run in an order of their costs — every one
+    /// must surely fail. Flattened, a volatile conjunct is in a filter of
+    /// its own, run after.
+    fn leaf_outcome(&self, q: &protobuf::Node, flattened: bool) -> LeafOutcome {
+        let mut failure = None;
+        let mut unknown = false;
+        let mut volatile = false;
+        let mut failing = Vec::new();
+        let mut parts = Vec::new();
+        self.leaf_conjuncts(q, &mut parts);
+        for c in parts {
+            match self.truth(c) {
+                Some(true) => continue,
+                Some(false) => return LeafOutcome::Dummy,
+                None if is_null_const(self.snapshot, c) => return LeafOutcome::Dummy,
+                None => {}
+            }
+            if flattened && surely_volatile(c, self.snapshot) {
+                volatile = true;
+                continue;
+            }
+            match self.surely_fails(c) {
+                Some(f) => {
+                    failure.get_or_insert(f);
+                    failing.push(c);
+                }
+                None => unknown = true,
+            }
+        }
+        // Flattened, the leaf is an appendrel member, left out where its
+        // restrictions contradict each other (relation_excluded_by_constraints).
+        if flattened && refutable(&failing, self.snapshot) {
+            unknown = true;
+        }
+        match failure {
+            _ if unknown => LeafOutcome::Unknown,
+            Some(f) => LeafOutcome::Fails(f),
+            None if volatile => LeafOutcome::Unknown,
+            None => LeafOutcome::Runs,
         }
     }
 
@@ -1648,49 +2197,16 @@ impl Level<'_> {
             .into_iter()
             .filter(|c| self.truth(c) != Some(true))
             .collect();
-        // Two equalities may contradict each other through their
-        // equivalence class (`b = 3 AND b = 4`, or `b = c AND b = 3 AND c
-        // = 4`): the planner derives a constant false from it, leaving the
-        // scan dummy (generate_base_implied_equalities_const).
-        // Equalities each of a column and a literal, the literals of a
-        // column all equal, make classes of a column and one constant
-        // (`b = 3 AND b = 3`: `3 = 3` is folded to true).
-        let equalities: Vec<&protobuf::AExpr> = conjuncts
-            .iter()
-            .filter_map(|c| match c.node.as_ref() {
-                Some(node::Node::AExpr(e)) if may_equate(e) => Some(e.as_ref()),
-                _ => None,
-            })
-            .collect();
-        let column_const = |e: &protobuf::AExpr| -> Option<(String, Value)> {
-            if e.kind() != protobuf::AExprKind::AexprOp
-                || expr::extract_string_fields(&e.name) != ["="]
-            {
-                return None;
-            }
-            let (l, r) = (e.lexpr.as_deref()?, e.rexpr.as_deref()?);
-            let (col, lit) = match (l.node.as_ref()?, r.node.as_ref()?) {
-                (node::Node::ColumnRef(cr), _) => (cr, r),
-                (_, node::Node::ColumnRef(cr)) => (cr, l),
-                _ => return None,
-            };
-            Some((column_name(col)?.to_owned(), literal_value(lit)?))
-        };
-        let consistent = || {
-            let pairs: Option<Vec<(String, Value)>> =
-                equalities.iter().map(|e| column_const(e)).collect();
-            pairs.is_some_and(|pairs| {
-                pairs.iter().all(|(c, v)| {
-                    pairs
-                        .iter()
-                        .filter(|(d, _)| d == c)
-                        .all(|(_, w)| compare("=", v, w) == Some(true))
-                })
-            })
-        };
-        if equalities.len() > 1 && !consistent() {
+        if !self.equalities_consistent(&conjuncts) {
             return false;
         }
+        let reads_column = |n: &protobuf::Node| {
+            let mut reads = false;
+            super::walk::visit_same_level(n, &mut |x| {
+                reads |= matches!(x.node, Some(node::Node::ColumnRef(_)));
+            });
+            reads
+        };
         conjuncts.into_iter().all(|c| {
             let mut simple = true;
             let mut reads = false;
@@ -1699,9 +2215,23 @@ impl Level<'_> {
                     reads |= source.rows.unpushable(&source.read(cr));
                 }
                 Some(node::Node::AConst(a)) => simple &= !a.isnull,
+                // An IN list of literals is one `=`, or `= ANY` of an
+                // array constant (transformAExprIn).
                 Some(node::Node::AExpr(e)) => {
-                    simple &= e.kind() == protobuf::AExprKind::AexprOp;
+                    simple &= matches!(
+                        e.kind(),
+                        protobuf::AExprKind::AexprOp | protobuf::AExprKind::AexprIn
+                    );
                 }
+                Some(node::Node::List(l)) => {
+                    simple &= l
+                        .items
+                        .iter()
+                        .all(|i| matches!(i.node, Some(node::Node::AConst(_))));
+                }
+                // Each argument reading a column, none is folded to a
+                // constant.
+                Some(node::Node::BoolExpr(b)) => simple &= b.args.iter().all(reads_column),
                 Some(node::Node::TypeCast(_) | node::Node::NullTest(_)) => {}
                 Some(node::Node::TypeName(_) | node::Node::String(_)) => {}
                 _ => simple = false,
@@ -1709,6 +2239,145 @@ impl Level<'_> {
             simple && reads
         })
     }
+}
+
+/// Restrictions `failing` may contradict each other, the planner proving
+/// it (predicate_refuted_by): two different ones, or one that is folded
+/// into several (an AND inside, or a NOT of an AND or OR, which
+/// eval_const_expressions negates into one). One alone, or repeated,
+/// refutes nothing.
+fn refutable(failing: &[&protobuf::Node], snapshot: &PgCatalog) -> bool {
+    let distinct: std::collections::HashSet<String> = failing
+        .iter()
+        .map(|c| equivalence_key(c, snapshot))
+        .collect();
+    distinct.len() > 1
+        || failing.iter().any(|c| {
+            let mut compound = false;
+            super::walk::visit_same_level(c, &mut |x| {
+                if let Some(node::Node::BoolExpr(b)) = x.node.as_ref() {
+                    compound |= b.boolop == protobuf::BoolExprType::AndExpr as i32
+                        || b.boolop == protobuf::BoolExprType::NotExpr as i32
+                            && matches!(
+                                b.args.first().and_then(|a| a.node.as_ref()),
+                                Some(node::Node::BoolExpr(_))
+                            );
+                }
+            });
+            compound
+        })
+}
+
+/// What a WHERE pushed down into a set operation's leaves surely raises
+/// (see [`Level::pushed_down`]).
+#[derive(Default)]
+struct Pushed {
+    all: Option<Failure>,
+    first: Option<Failure>,
+    fail_after: Option<(i64, Failure)>,
+}
+
+/// `n` calls a function every overload of which is volatile.
+fn surely_volatile(n: &protobuf::Node, snapshot: &PgCatalog) -> bool {
+    let mut volatile = false;
+    super::walk::visit_same_level(n, &mut |x| {
+        if let Some(node::Node::FuncCall(fc)) = x.node.as_ref() {
+            volatile |= crate::ddl::volatile::surely_volatile(fc, snapshot);
+        }
+    });
+    volatile
+}
+
+/// The qualification `n` over `source` pushed down into `leaf`: each
+/// column replaced by the leaf's expression, a whole-row NULL test by
+/// one of each column (eval_const_expressions expands a ROW's); `None`
+/// where it reads something else, or through an expression not followed.
+fn substitute(n: &protobuf::Node, source: &SourceRows, leaf: &Leaf) -> Option<protobuf::Node> {
+    let sub = |n: &protobuf::Node| substitute(n, source, leaf);
+    let subs = |ns: &[protobuf::Node]| ns.iter().map(sub).collect::<Option<Vec<_>>>();
+    let boxed = |n: &Option<Box<protobuf::Node>>| match n {
+        Some(n) => sub(n).map(|n| Some(Box::new(n))),
+        None => Some(None),
+    };
+    let wrap = |n: node::Node| protobuf::Node { node: Some(n) };
+    let inner = n.node.as_ref()?;
+    Some(match inner {
+        node::Node::ColumnRef(cr) => match source.read(cr) {
+            Read::Column(i) => leaf.exprs.get(i)?.clone(),
+            _ => return None,
+        },
+        node::Node::NullTest(nt)
+            if matches!(
+                nt.arg.as_deref().and_then(|a| a.node.as_ref()),
+                Some(node::Node::ColumnRef(cr)) if matches!(source.read(cr), Read::WholeRow)
+            ) =>
+        {
+            let tests: Vec<protobuf::Node> = leaf
+                .exprs
+                .iter()
+                .map(|e| {
+                    wrap(node::Node::NullTest(Box::new(protobuf::NullTest {
+                        arg: Some(Box::new(e.clone())),
+                        argisrow: false,
+                        ..(**nt).clone()
+                    })))
+                })
+                .collect();
+            match <[protobuf::Node; 1]>::try_from(tests) {
+                Ok([t]) => t,
+                Err(args) => wrap(node::Node::BoolExpr(Box::new(protobuf::BoolExpr {
+                    boolop: protobuf::BoolExprType::AndExpr as i32,
+                    args,
+                    location: -1,
+                    ..Default::default()
+                }))),
+            }
+        }
+        node::Node::NullTest(nt) => wrap(node::Node::NullTest(Box::new(protobuf::NullTest {
+            arg: boxed(&nt.arg)?,
+            ..(**nt).clone()
+        }))),
+        node::Node::AExpr(e) => wrap(node::Node::AExpr(Box::new(protobuf::AExpr {
+            lexpr: boxed(&e.lexpr)?,
+            rexpr: boxed(&e.rexpr)?,
+            ..(**e).clone()
+        }))),
+        node::Node::List(l) => wrap(node::Node::List(protobuf::List {
+            items: subs(&l.items)?,
+        })),
+        node::Node::BoolExpr(b) => wrap(node::Node::BoolExpr(Box::new(protobuf::BoolExpr {
+            args: subs(&b.args)?,
+            ..(**b).clone()
+        }))),
+        node::Node::TypeCast(tc) => wrap(node::Node::TypeCast(Box::new(protobuf::TypeCast {
+            arg: boxed(&tc.arg)?,
+            ..(**tc).clone()
+        }))),
+        node::Node::CoalesceExpr(c) => {
+            wrap(node::Node::CoalesceExpr(Box::new(protobuf::CoalesceExpr {
+                args: subs(&c.args)?,
+                ..(**c).clone()
+            })))
+        }
+        node::Node::FuncCall(fc)
+            if fc.agg_order.is_empty() && fc.agg_filter.is_none() && fc.over.is_none() =>
+        {
+            wrap(node::Node::FuncCall(Box::new(protobuf::FuncCall {
+                args: subs(&fc.args)?,
+                ..(**fc).clone()
+            })))
+        }
+        _ => {
+            let mut reads = false;
+            super::walk::visit_same_level(n, &mut |x| {
+                reads |= matches!(x.node, Some(node::Node::ColumnRef(_)));
+            });
+            if reads {
+                return None;
+            }
+            n.clone()
+        }
+    })
 }
 
 /// How deep [`call_evaluates`] reads SQL function bodies into the calls
@@ -2136,6 +2805,87 @@ pub(super) fn qual_truth<'a>(
     })
 }
 
+/// A constant an equality compares a column with (see [`eq_const`]).
+#[derive(PartialEq)]
+enum EqConst {
+    /// The canonical decimal form of a number.
+    Number(String),
+    Literal(Value),
+}
+
+/// The constant `n` is, compared with a column — of an integer or numeric
+/// type where `numeric`: a literal, or a number (a literal one, or one
+/// cast to such a type, maybe a string).
+fn eq_const(n: &protobuf::Node, numeric: bool, snapshot: &PgCatalog) -> Option<EqConst> {
+    // Equal numbers are one value of whatever type they are read as, a
+    // string only of a numeric one.
+    let string = matches!(
+        n.node.as_ref(),
+        Some(node::Node::AConst(protobuf::AConst {
+            val: Some(protobuf::a_const::Val::Sval(_)),
+            ..
+        }))
+    );
+    if (numeric || !string)
+        && let Some(number) = number_const(n, snapshot)
+    {
+        return Some(EqConst::Number(number));
+    }
+    literal_value(n).map(EqConst::Literal)
+}
+
+/// The canonical decimal form of the number `n` surely is.
+fn number_const(n: &protobuf::Node, snapshot: &PgCatalog) -> Option<String> {
+    match n.node.as_ref()? {
+        node::Node::AConst(c) => match c.val.as_ref()? {
+            protobuf::a_const::Val::Ival(i) => Some(i.ival.to_string()),
+            protobuf::a_const::Val::Fval(f) => canonical_decimal(&f.fval),
+            protobuf::a_const::Val::Sval(s) => canonical_decimal(&s.sval),
+            _ => None,
+        },
+        node::Node::TypeCast(tc) => {
+            let t = crate::ddl::util::resolve_type_name(tc.type_name.as_ref()?, snapshot)?;
+            if ![oid::INT2, oid::INT4, oid::INT8, oid::NUMERIC].contains(&t)
+                || tc.type_name.as_ref().is_some_and(|t| !t.typmods.is_empty())
+            {
+                return None;
+            }
+            number_const(tc.arg.as_deref()?, snapshot)
+        }
+        _ => None,
+    }
+}
+
+/// `[+-]digits[.digits]` (surrounding spaces allowed) without its sign
+/// when zero, leading zeros or trailing fractional ones.
+fn canonical_decimal(s: &str) -> Option<String> {
+    let s = s.trim();
+    let (negative, s) = match s.as_bytes().first()? {
+        b'-' => (true, &s[1..]),
+        b'+' => (false, &s[1..]),
+        _ => (false, s),
+    };
+    let (int, frac) = s.split_once('.').unwrap_or((s, ""));
+    if int.is_empty() && frac.is_empty()
+        || !int.bytes().chain(frac.bytes()).all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let int = int.trim_start_matches('0');
+    let frac = frac.trim_end_matches('0');
+    let int = if int.is_empty() { "0" } else { int };
+    let mut out = String::new();
+    if negative && (int != "0" || !frac.is_empty()) {
+        out.push('-');
+    }
+    out.push_str(int);
+    if !frac.is_empty() {
+        out.push('.');
+        out.push_str(frac);
+    }
+    Some(out)
+}
+
 /// The constant the literal `n` is.
 fn literal_value(n: &protobuf::Node) -> Option<Value> {
     match n.node.as_ref()? {
@@ -2405,6 +3155,16 @@ fn from_item_rows(
         depth + 1,
         stored || view.is_some(),
     )?;
+    // Only a subquery in FROM is surely planned as one a qualification is
+    // pushed down into (a view may be a security barrier, a CTE
+    // materialized).
+    if !matches!(item.node, Some(node::Node::RangeSubselect(_))) {
+        rows.leaves = None;
+    }
+    // A CTE read more than once is materialized: its columns are Vars.
+    if !matches!(item.node, Some(node::Node::RangeSubselect(_))) && view.is_none() {
+        rows.var_free = false;
+    }
     // A view's columns have the types it was created with.
     if let Some(view) = view {
         rows.types = snapshot

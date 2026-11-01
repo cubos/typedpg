@@ -71,6 +71,12 @@ fn funcall_volatility<'a>(
     Some((least, inline))
 }
 
+/// Every overload of the function `fc` calls that can take its arguments
+/// is VOLATILE.
+pub(crate) fn surely_volatile(fc: &protobuf::FuncCall, snapshot: &PgCatalog) -> bool {
+    funcall_volatility(fc, snapshot).is_some_and(|(v, _)| v == ProVolatile::Volatile)
+}
+
 /// Inlining depth cap: PG refuses to inline a function into itself.
 const MAX_INLINE_DEPTH: usize = 16;
 

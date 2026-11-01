@@ -238,7 +238,7 @@ impl PgCatalog {
 
     /// The domains of `oid`'s chain, outermost first (empty for a type that
     /// isn't one).
-    fn domain_chain(&self, oid: PgTypeOid) -> Vec<PgTypeOid> {
+    pub(crate) fn domain_chain(&self, oid: PgTypeOid) -> Vec<PgTypeOid> {
         let mut out = Vec::new();
         let mut current = oid;
         for _ in 0..32 {
