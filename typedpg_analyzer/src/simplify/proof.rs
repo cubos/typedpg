@@ -1051,15 +1051,29 @@ fn hidden_volatile_calls(catalog: &PgCatalog) -> bool {
 /// statement (the outermost SELECT, not a set operation, or the top-level
 /// UPDATE / DELETE), and not inside any sublink or subquery there:
 ///
-/// - its WHERE, when every FROM item of the level (UPDATE's FROM, DELETE's
-///   USING, the target relation included) is a stored table or a join of
-///   them (no subquery, function, LATERAL, VALUES, CTE, view, USING /
-///   NATURAL join), every JOIN ON condition passes [`cannot_error`] in its
-///   own join's scope, and [`siblings_cannot_error`] holds for the WHERE;
-/// - its target list (a SELECT's, or an UPDATE's SET values): evaluated
-///   only on the rows every qual let through, so nothing is reordered
-///   around it, whatever the FROM. A correlated NOT EXISTS there still
-///   gains an index probe over an unhashed NOT IN's rescans.
+/// - the WHERE of a SELECT without any locking clause (`FOR UPDATE`, `FOR
+///   NO KEY UPDATE`, `FOR SHARE`, `FOR KEY SHARE`, at any level), when
+///   every FROM item of the level is a stored table or a join of them (no
+///   subquery, function, LATERAL, VALUES, CTE, view, USING / NATURAL
+///   join), every JOIN ON condition passes [`cannot_error`] in its own
+///   join's scope, and [`siblings_cannot_error`] holds for the WHERE;
+/// - its target list (a SELECT's, locking or not, or an UPDATE's SET
+///   values): evaluated only on the rows every qual let through, so
+///   nothing is reordered around it, whatever the FROM. A correlated NOT
+///   EXISTS there still gains an index probe over an unhashed NOT IN's
+///   rescans.
+///
+/// Never an UPDATE's, DELETE's (or MERGE's) WHERE, nor a locking SELECT's:
+/// in READ COMMITTED a row a concurrent transaction updated is rechecked
+/// by EvalPlanQual, which re-evaluates a SubPlan qual on the new version
+/// but re-joins the row with the anti-join's inner side as fetched — it
+/// doesn't exclude it. With `t(id, v)` = (1, 0), (5, 0), `bn(id)` = (2),
+/// and a concurrent `UPDATE t SET id = 2 WHERE id = 1` committing while
+/// `UPDATE t SET v = 7 WHERE id NOT IN (SELECT id FROM bn) RETURNING id`
+/// waits, the written statement updates 5 only; `… WHERE NOT EXISTS
+/// (SELECT 1 FROM bn WHERE t.id = bn.id)` updates 5 and 2 (PG 18.6).
+/// A target-list or SET-value site is a SubPlan in both forms, evaluated
+/// per row: the same experiment gives the same rows and values for both.
 ///
 /// Anywhere else — HAVING (where a NOT EXISTS isn't pulled up anyway), a
 /// nested query, a CTE — it doesn't.
@@ -1088,22 +1102,11 @@ pub(crate) fn rewrite_site_is_safe(ctx: &Ctx<'_>, site_location: i32) -> bool {
         return false;
     };
     let ctes = cte_names(ctx);
-    // The WHERE of a level whose FROM is `from` (and the DML target).
-    let where_safe = |relation: Option<&typedpg_pg_query::protobuf::RangeVar>,
-                      from: &[Node],
-                      where_clause: &Node,
-                      scope: &FromScope<'_>| {
-        let relation_ok = relation.is_none_or(|rv| {
-            let schema = (!rv.schemaname.is_empty()).then_some(rv.schemaname.as_str());
-            ctx.catalog
-                .resolve_table(schema, &rv.relname)
-                .is_some_and(|c| stored_tree(ctx.catalog, c.oid))
-        });
+    // The WHERE of a level whose FROM is `from`.
+    let where_safe = |from: &[Node], where_clause: &Node, scope: &FromScope<'_>| {
         let mut quals = Vec::new();
-        relation_ok
-            && from
-                .iter()
-                .all(|f| reads_stored_tables(ctx, &ctes, f, &mut quals))
+        from.iter()
+            .all(|f| reads_stored_tables(ctx, &ctes, f, &mut quals))
             && quals.into_iter().all(|(q, join)| {
                 let sides: Vec<Node> = [&join.larg, &join.rarg]
                     .into_iter()
@@ -1114,6 +1117,12 @@ pub(crate) fn rewrite_site_is_safe(ctx: &Ctx<'_>, site_location: i32) -> bool {
             })
             && siblings_cannot_error(ctx, where_clause, site_location, scope)
     };
+    // Any row locking: EvalPlanQual rechecks a locked row it re-fetched.
+    let locks = ctx
+        .tree
+        .nodes()
+        .iter()
+        .any(|(n, _)| matches!(n, NodeRef::LockingClause(_)));
     match top {
         N::SelectStmt(s) => {
             if s.op != typedpg_pg_query::protobuf::SetOperation::SetopNone as i32 {
@@ -1123,32 +1132,16 @@ pub(crate) fn rewrite_site_is_safe(ctx: &Ctx<'_>, site_location: i32) -> bool {
                 return true;
             }
             match s.where_clause.as_deref() {
-                Some(w) if reaches_in(w) => {
+                Some(w) if !locks && reaches_in(w) => {
                     let scope = FromScope::of_select(ctx, s, None);
-                    where_safe(None, &s.from_clause, w, &scope)
+                    where_safe(&s.from_clause, w, &scope)
                 }
                 _ => false,
             }
         }
-        N::UpdateStmt(u) => {
-            if u.target_list.iter().any(reaches_in) {
-                return true;
-            }
-            match u.where_clause.as_deref() {
-                Some(w) if reaches_in(w) => {
-                    let scope = FromScope::of_dml(ctx, u.relation.as_ref(), &u.from_clause, None);
-                    where_safe(u.relation.as_ref(), &u.from_clause, w, &scope)
-                }
-                _ => false,
-            }
-        }
-        N::DeleteStmt(d) => match d.where_clause.as_deref() {
-            Some(w) if reaches_in(w) => {
-                let scope = FromScope::of_dml(ctx, d.relation.as_ref(), &d.using_clause, None);
-                where_safe(d.relation.as_ref(), &d.using_clause, w, &scope)
-            }
-            _ => false,
-        },
+        // SET values are evaluated per row to update; the WHERE is
+        // rechecked by EvalPlanQual.
+        N::UpdateStmt(u) => u.target_list.iter().any(reaches_in),
         _ => false,
     }
 }

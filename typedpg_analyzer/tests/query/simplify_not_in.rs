@@ -160,17 +160,41 @@ fn not_before_the_left_side() {
 }
 
 #[test]
-fn in_delete_and_update() {
+fn in_an_update_set_but_not_a_dml_or_locking_where() {
+    // EvalPlanQual rechecks a row a concurrent transaction updated by
+    // re-evaluating a SubPlan qual, but re-joins it with an anti-join's
+    // inner side without excluding it: a DML's or a locking SELECT's WHERE
+    // stays NOT IN.
     let db = setup();
+    for sql in [
+        "DELETE FROM customers WHERE id NOT IN (SELECT b.customer_id FROM banned b)",
+        "DELETE FROM customers WHERE id NOT IN (SELECT b.customer_id FROM banned b) RETURNING id",
+        "UPDATE customers c SET name = 'x' WHERE c.id NOT IN (SELECT customer_id FROM banned)",
+        "UPDATE customers c SET name = 'x' WHERE c.id NOT IN (SELECT customer_id FROM banned) \
+         RETURNING c.id",
+        "SELECT c.id FROM customers c WHERE c.id NOT IN (SELECT customer_id FROM banned) FOR UPDATE",
+        "SELECT c.id FROM customers c WHERE c.id NOT IN (SELECT customer_id FROM banned) \
+         FOR NO KEY UPDATE",
+        "SELECT c.id FROM customers c WHERE c.id NOT IN (SELECT customer_id FROM banned) FOR SHARE",
+        "SELECT c.id FROM customers c WHERE c.id NOT IN (SELECT customer_id FROM banned) \
+         FOR KEY SHARE",
+        "SELECT c.id FROM customers c JOIN pairs p ON p.a = c.id \
+         WHERE c.id NOT IN (SELECT customer_id FROM banned) FOR UPDATE OF p",
+    ] {
+        assert_kept(&db, sql);
+    }
+    // A SubPlan in both forms, evaluated per row: the same rows and values
+    // under a concurrent update (checked on PG 18.6).
     assert_rewritten(
         &db,
-        "DELETE FROM customers WHERE id NOT IN (SELECT b.customer_id FROM banned b)",
-        "DELETE FROM customers WHERE (NOT EXISTS (SELECT 1 FROM banned b WHERE customers.id = b.customer_id))",
+        "UPDATE customers c SET name = (c.id NOT IN (SELECT customer_id FROM banned))::text",
+        "UPDATE customers c SET name = ((NOT EXISTS (SELECT 1 FROM banned WHERE c.id = customer_id)))::text",
     );
     assert_rewritten(
         &db,
-        "UPDATE customers c SET name = 'x' WHERE c.id NOT IN (SELECT customer_id FROM banned)",
-        "UPDATE customers c SET name = 'x' WHERE (NOT EXISTS (SELECT 1 FROM banned WHERE c.id = customer_id))",
+        "SELECT c.id NOT IN (SELECT customer_id FROM banned) AS ok FROM customers c FOR UPDATE",
+        "SELECT (NOT EXISTS (SELECT 1 FROM banned WHERE c.id = customer_id)) AS ok FROM customers c \
+         FOR UPDATE",
     );
 }
 
@@ -917,14 +941,11 @@ fn a_sibling_that_can_fail_keeps_the_site() {
         &db,
         "SELECT t.a FROM t GROUP BY t.a HAVING t.a NOT IN (SELECT b FROM u) AND 10 / t.a > 1",
     );
-    // Without the sibling, each form is rewritten.
-    for sql in [
-        "SELECT t.a FROM t WHERE a NOT IN (SELECT b FROM u)",
-        "DELETE FROM t WHERE a NOT IN (SELECT b FROM u)",
-        "UPDATE t SET s = 'y' WHERE a NOT IN (SELECT b FROM u)",
-    ] {
-        assert_eq!(simplified(&db, sql).1, vec![Rule::NotIn], "{sql}");
-    }
+    // Without the sibling, it is rewritten.
+    assert_eq!(
+        simplified(&db, "SELECT t.a FROM t WHERE a NOT IN (SELECT b FROM u)").1,
+        vec![Rule::NotIn]
+    );
     // Not every harmless sibling is provable: `now()` is a function call.
     assert_kept(
         &db,
@@ -950,12 +971,6 @@ fn error_free_siblings_are_fine() {
          WHERE (c.id NOT IN (SELECT customer_id FROM banned) OR c.code = 1) AND NOT c.id < 0",
         "SELECT c.id FROM customers c \
          WHERE ((NOT EXISTS (SELECT 1 FROM banned WHERE c.id = customer_id)) OR c.code = 1) AND NOT c.id < 0",
-    );
-    assert_rewritten(
-        &db,
-        "DELETE FROM customers c WHERE c.id NOT IN (SELECT customer_id FROM banned) AND c.code = 3",
-        "DELETE FROM customers c WHERE (NOT EXISTS (SELECT 1 FROM banned WHERE c.id = customer_id)) \
-         AND c.code = 3",
     );
 }
 
@@ -1005,21 +1020,15 @@ fn only_top_level_where_and_target_list_sites() {
         "SELECT (NOT EXISTS (SELECT 1 FROM sx WHERE t.a = b)) AS ok \
          FROM t JOIN u ON t.id = u.k AND 10 / (u.z * t.a) > 1, generate_series(1, 2) g",
     );
-    // UPDATE / DELETE top-level WHERE, and an UPDATE's SET.
-    assert_rewritten(
-        &db,
-        "DELETE FROM t USING u WHERE t.id = u.k AND t.a NOT IN (SELECT b FROM sx)",
-        "DELETE FROM t USING u WHERE t.id = u.k AND (NOT EXISTS (SELECT 1 FROM sx WHERE t.a = b))",
-    );
-    assert_rewritten(
-        &db,
-        "UPDATE t SET a = 1 FROM u WHERE t.id = u.k AND t.a NOT IN (SELECT b FROM sx)",
-        "UPDATE t SET a = 1 FROM u WHERE t.id = u.k AND (NOT EXISTS (SELECT 1 FROM sx WHERE t.a = b))",
-    );
+    // A DML's WHERE never qualifies (EvalPlanQual); its SET values do.
     assert_kept(
         &db,
-        "UPDATE t SET a = 1 FROM (SELECT k FROM u WHERE 10 / z > 1) d \
-         WHERE t.id = d.k AND t.a NOT IN (SELECT b FROM sx)",
+        "DELETE FROM t USING u WHERE t.id = u.k AND t.a NOT IN (SELECT b FROM sx)",
+    );
+    assert_rewritten(
+        &db,
+        "UPDATE t SET a = (t.a NOT IN (SELECT b FROM sx))::int FROM u WHERE t.id = u.k",
+        "UPDATE t SET a = ((NOT EXISTS (SELECT 1 FROM sx WHERE t.a = b)))::int FROM u WHERE t.id = u.k",
     );
 }
 

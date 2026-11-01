@@ -20,14 +20,18 @@
 //!   same operator — a built-in one, never NULL between non-NULL
 //!   operands of built-in types. Row-wise `(a, b) NOT IN (SELECT x, y …)` compares
 //!   column by column with `=`, as PG's row comparison does.
-//! - the site is in the top-level statement's WHERE, over stored tables
-//!   joined by ON conditions that can't fail and next to nothing that can
-//!   fail, or in its target list (or an UPDATE's SET values)
+//! - the site is in the top-level SELECT's WHERE (no locking clause
+//!   anywhere), over stored tables joined by ON conditions that can't fail
+//!   and next to nothing that can fail, or in the top-level SELECT's target
+//!   list or an UPDATE's SET values
 //!   ([`super::proof::rewrite_site_is_safe`]). A sublink qual may veto a
 //!   row before a join's ON, a pulled-up subquery's qual or a sibling runs
 //!   (cost ties keep the written order); the anti-join runs above them.
-//!   So `x NOT IN (…) AND created_at > now() - interval '1 day'`, a site
-//!   in HAVING, in a CTE or in any nested query is left as written.
+//!   And EvalPlanQual, rechecking a row a concurrent transaction updated
+//!   under UPDATE, DELETE or FOR UPDATE / SHARE, re-evaluates a SubPlan
+//!   but doesn't re-run the anti-join's exclusion. So `x NOT IN (…) AND
+//!   created_at > now() - interval '1 day'`, a DML or locking SELECT's
+//!   WHERE, HAVING, a CTE or any nested query is left as written.
 //! - the subquery has no LIMIT or OFFSET: the SubPlan reads it once, an
 //!   anti-join may rescan it, and a LIMIT may return other rows then.
 //! - nothing in it is volatile (the subquery may run a different number
