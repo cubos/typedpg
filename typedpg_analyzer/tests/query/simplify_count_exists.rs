@@ -278,11 +278,55 @@ fn issue_queries() {
 
 #[test]
 fn every_count_of_a_query_is_rewritten() {
+    // In the target list, two counts are rewritten one after the other.
     assert_rewritten(
+        "SELECT id, (SELECT count(*) FROM u WHERE u.t_id = t.id) > 0 AS x, \
+         (SELECT count(*) FROM u WHERE u.c = t.a) = 0 AS y FROM t",
+        "SELECT id, EXISTS (SELECT 1 FROM u WHERE u.t_id = t.id) AS x, \
+         (NOT EXISTS (SELECT 1 FROM u WHERE u.c = t.a)) AS y FROM t",
+    );
+    // ANDed in a WHERE, each is the other's sibling sublink, whose SubPlan
+    // it may keep from running: neither is rewritten.
+    assert_kept(
         "SELECT id FROM t WHERE (SELECT count(*) FROM u WHERE u.t_id = t.id) > 0 \
          AND (SELECT count(*) FROM u WHERE u.c = t.a) = 0",
-        "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.t_id = t.id) \
-         AND (NOT EXISTS (SELECT 1 FROM u WHERE u.c = t.a))",
+    );
+}
+
+/// A cheap count SubPlan in a WHERE can veto a row before a costlier
+/// sibling conjunct runs; pulled up into a semi-join, it no longer does,
+/// and the sibling runs on every row: here `1 / min(t6.z)` on the ids
+/// whose `z` is 0, which the count filtered out (the written query
+/// returns 10 rows, the rewritten one fails with `division by zero`).
+#[test]
+fn costly_sibling_conjunct_keeps_the_count() {
+    let db = setup_with(
+        "CREATE TABLE o6 (id int PRIMARY KEY, k int NOT NULL);
+         CREATE TABLE s6 (k int NOT NULL);
+         CREATE INDEX ON s6 (k);
+         CREATE TABLE t6 (id int NOT NULL, z int NOT NULL);
+         CREATE INDEX ON t6 (id);",
+    );
+    for sql in [
+        "SELECT count(*) AS n FROM o6 WHERE (SELECT count(*) FROM s6 WHERE s6.k = o6.k) > 0 \
+         AND (SELECT 1 / min(t6.z) FROM t6 WHERE t6.id = o6.id) > 0",
+        // In HAVING and ON too.
+        "SELECT o6.k FROM o6 GROUP BY o6.k \
+         HAVING (SELECT count(*) FROM s6 WHERE s6.k = o6.k) > 0 \
+         AND (SELECT 1 / min(t6.z) FROM t6 WHERE t6.id = o6.k) > 0",
+        "SELECT o6.id FROM o6 JOIN t6 ON t6.id = o6.id \
+         AND (SELECT count(*) FROM s6 WHERE s6.k = o6.k) > 0 \
+         AND (SELECT 1 / min(t.z) FROM t6 t WHERE t.id = o6.id) > 0",
+    ] {
+        assert_kept_in(&db, sql);
+    }
+    // Cheap built-in siblings run before any SubPlan in both plans.
+    assert_rewritten_in(
+        &db,
+        "SELECT o6.id FROM o6 WHERE o6.id > 3 \
+         AND (SELECT count(*) FROM s6 WHERE s6.k = o6.k) > 0 AND o6.k <> 7",
+        "SELECT o6.id FROM o6 WHERE o6.id > 3 \
+         AND EXISTS (SELECT 1 FROM s6 WHERE s6.k = o6.k) AND o6.k <> 7",
     );
 }
 
