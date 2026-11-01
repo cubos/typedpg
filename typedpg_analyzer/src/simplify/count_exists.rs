@@ -51,7 +51,8 @@ use typedpg_pg_query::protobuf::{
 };
 
 use super::proof::{
-    FromScope, cannot_error, cheap_siblings, error_free_select, has_volatile, strictly_not_null,
+    FromScope, cannot_error, error_free_select, has_volatile, siblings_cannot_error,
+    strictly_not_null,
 };
 use super::{Candidate, Ctx, Edit, Rule};
 use crate::oid::{PgOperatorOid, PgProcOid};
@@ -547,12 +548,14 @@ impl Walker<'_, '_> {
             | NodeRef::DeleteStmt(_)
             | NodeRef::MergeStmt(_) => self.statement(node, Some(scope)),
             NodeRef::AExpr(e) => {
-                // In a WHERE, HAVING or ON, the count's SubPlan may be what
-                // keeps a costlier sibling conjunct from running on a row:
-                // pulled up into a join, it no longer does.
+                // In a WHERE, HAVING or ON, the count's SubPlan may run
+                // before a sibling conjunct (a costlier one, or one of equal
+                // cost written after it) and veto a row it would fail on:
+                // pulled up into a join, it no longer does, and the sibling
+                // runs on every row. Every sibling must be error-free.
                 let guarded = match clause {
                     Clause::Free => true,
-                    Clause::In(root) => cheap_siblings(self.ctx, root, e.location),
+                    Clause::In(root) => siblings_cannot_error(self.ctx, root, e.location, scope),
                     Clause::Unknown => false,
                 };
                 if guarded
@@ -978,7 +981,7 @@ fn top_level_form(
     plain_count(ctx, text, select, cmp.count)?;
     // `EXISTS` gets its own plan (one that stops early), which may
     // evaluate a join's conditions over other row pairs. No sibling
-    // conjunct guard ([`cheap_siblings`]) is needed: the count isn't a
+    // conjunct guard ([`siblings_cannot_error`]) is needed: the count isn't a
     // conjunct of anything — the WHERE is the counted query's own, moved
     // whole into the EXISTS, and `error_free_select` already keeps every
     // conjunct of it free of sublinks, functions and errors.

@@ -293,6 +293,31 @@ fn every_count_of_a_query_is_rewritten() {
     );
 }
 
+/// A hashed count SubPlan costs what a built-in operator does, so on the
+/// tie PG keeps the written order: the count runs first and vetoes the
+/// rows `10 / o.k` would fail on (`o.k = 0`, which `s` never matches).
+/// Pulled up into a semi-join, it no longer runs first, and the division
+/// runs on every row of `o`.
+#[test]
+fn error_capable_sibling_keeps_the_count() {
+    let db = setup_with(
+        "CREATE TABLE o (id int PRIMARY KEY, k int NOT NULL);
+         CREATE TABLE s (k int NOT NULL);",
+    );
+    for sql in [
+        "SELECT o.id FROM o WHERE (SELECT count(*) FROM s WHERE s.k = o.k) > 0 AND 10 / o.k > 1",
+        "SELECT o.k FROM o GROUP BY o.k \
+         HAVING (SELECT count(*) FROM s WHERE s.k = o.k) > 0 AND 10 / o.k > 1",
+        "SELECT o.id FROM o JOIN u ON u.id = o.id \
+         AND (SELECT count(*) FROM s WHERE s.k = o.k) > 0 AND 10 / o.k > 1",
+        // A cast is no better.
+        "SELECT o.id FROM o WHERE (SELECT count(*) FROM s WHERE s.k = o.k) = 0 \
+         AND o.k::smallint > 1",
+    ] {
+        assert_kept_in(&db, sql);
+    }
+}
+
 /// A cheap count SubPlan in a WHERE can veto a row before a costlier
 /// sibling conjunct runs; pulled up into a semi-join, it no longer does,
 /// and the sibling runs on every row: here `1 / min(t6.z)` on the ids
@@ -320,7 +345,7 @@ fn costly_sibling_conjunct_keeps_the_count() {
     ] {
         assert_kept_in(&db, sql);
     }
-    // Cheap built-in siblings run before any SubPlan in both plans.
+    // Error-free siblings may run on any row.
     assert_rewritten_in(
         &db,
         "SELECT o6.id FROM o6 WHERE o6.id > 3 \
@@ -765,12 +790,15 @@ fn not_exists_keeps_a_trailing_test_on_the_comparison() {
         "IS NOT DISTINCT FROM NULL::bool",
     ] {
         assert_rewritten(
-            &format!("SELECT id FROM t WHERE {C} = 0 {test}"),
-            &format!("SELECT id FROM t WHERE {E} {test}"),
+            &format!("SELECT id, {C} = 0 {test} AS x FROM t"),
+            &format!("SELECT id, {E} {test} AS x FROM t"),
         );
         assert_rewritten(
-            &format!("SELECT id FROM t WHERE 0 = {C} {test}"),
-            &format!("SELECT id FROM t WHERE {E} {test}"),
+            &format!("SELECT id, 0 = {C} {test} AS x FROM t"),
+            &format!("SELECT id, {E} {test} AS x FROM t"),
         );
+        // In a WHERE, a site under anything but AND / OR / NOT isn't
+        // proved: the sibling guard (`siblings_cannot_error`) refuses it.
+        assert_kept(&format!("SELECT id FROM t WHERE {C} = 0 {test}"));
     }
 }
