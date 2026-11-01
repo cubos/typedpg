@@ -765,9 +765,9 @@ fn a_set_operation_read_whole_fails_every_execution() {
 /// projected. A leaf whose filter surely fails fails every execution
 /// reading it (an Append runs them in order: past the rows of the leaves
 /// before it, under a LIMIT). Over a set operation a WHERE isn't pushed
-/// into, a duplicate OR arm, an IN list, or equal constants (of one
-/// number or literal) make no contradiction that would leave the scan
-/// dummy.
+/// into, a duplicate OR arm, an IN list, equal constants (of one number
+/// or literal), or equalities of different input types make no
+/// contradiction that would leave the scan dummy.
 #[test]
 fn a_qualification_pushed_into_set_operation_leaves_fails_every_execution() {
     let db = build_db(&[(
@@ -864,6 +864,11 @@ fn a_qualification_pushed_into_set_operation_leaves_fails_every_execution() {
             None,
         ),
         (format!("SELECT 1 FROM {union} WHERE a = 1 AND a = 2"), None),
+        // An integer and a numeric equality share no class.
+        (
+            format!("SELECT 1 FROM {union} WHERE a = 1 AND a = 1.5"),
+            domain,
+        ),
         (
             "SELECT 1 FROM (SELECT NULL::d AS a LIMIT 1) s WHERE a = 1 AND a = 2".into(),
             None,
@@ -1002,6 +1007,31 @@ fn a_qualification_pushed_into_set_operation_leaves_fails_every_execution() {
             format!("SELECT 1 FROM {except} WHERE b = 3 AND b = 3::int8"),
             domain,
         ),
+        // An integer equality and a numeric one put `b` and `b::numeric`
+        // in different equivalence classes: different constants
+        // contradict nothing.
+        (
+            format!("SELECT 1 FROM {except} WHERE b = 3 AND b = 3.5"),
+            domain,
+        ),
+        (
+            format!("SELECT 1 FROM {except} WHERE b = 3.5 AND b = 3"),
+            domain,
+        ),
+        (
+            format!("SELECT 1 FROM {except} WHERE b IN (3) AND 3.5 = b"),
+            domain,
+        ),
+        (
+            format!("SELECT 1 FROM {except} WHERE b = 3 AND b = '3.5'::numeric"),
+            domain,
+        ),
+        (
+            "SELECT 1 FROM (SELECT NULL::d AS a, 1::int2 AS b EXCEPT SELECT 1, 2::int2) s \
+             WHERE b = 3 AND b = 3.5"
+                .into(),
+            domain,
+        ),
         (
             format!("SELECT 1 FROM {except} WHERE b = 3 AND b = ' 3 '"),
             domain,
@@ -1038,6 +1068,30 @@ fn a_qualification_pushed_into_set_operation_leaves_fails_every_execution() {
             format!("SELECT 1 FROM {except} WHERE (b = 3 OR b = 3) AND b = 4"),
             None,
         ),
+        // Equalities of one input type share a class, whatever the
+        // constant's type (`int4 = int8` is of the integer family).
+        (
+            format!("SELECT 1 FROM {except} WHERE b = 3.5 AND b = 4.5"),
+            None,
+        ),
+        (
+            format!("SELECT 1 FROM {except} WHERE b = 3 AND b = 4::int8"),
+            None,
+        ),
+        (
+            format!("SELECT 1 FROM {except} WHERE b = 3 AND b = 3.5 AND b = 4"),
+            None,
+        ),
+        (
+            format!("SELECT 1 FROM {except} WHERE b = 3 AND b = 3.0 AND b = 4"),
+            None,
+        ),
+        (
+            "SELECT 1 FROM (SELECT NULL::d AS a, 1::int2 AS b EXCEPT SELECT 1, 2::int2) s \
+             WHERE b = 3 AND b = 4::int8"
+                .into(),
+            None,
+        ),
         (
             "SELECT 1 FROM (SELECT NULL::d AS a, 'x'::text AS b EXCEPT SELECT 1, 'y') s \
              WHERE b = '03' AND b = '3'"
@@ -1052,27 +1106,20 @@ fn a_qualification_pushed_into_set_operation_leaves_fails_every_execution() {
 /// Set operations PostgreSQL 18 reads whole on every execution, which the
 /// analyzer doesn't prove and accepts (it never rejects what it can't
 /// prove fails):
-/// - two equalities of one column with different constants that the
-///   planner puts in different equivalence classes (`b = 3` an integer
-///   one, `b = 3.5` a numeric one), so they contradict nothing;
 /// - a conjunct whose value only the execution knows (`random() < 2`,
 ///   `now() > '2000-01-01'`), which shares the leaf's One-Time Filter;
 /// - an equality of two columns, whose class the planner fills with
 ///   derived equalities;
 /// - two failing restrictions of a flattened UNION ALL's leaf that don't
-///   contradict each other (`a = 1 AND a = 1.0`): the analyzer doesn't
-///   tell which ones `predicate_refuted_by` proves contradictory.
+///   contradict each other (`a = 1 AND a = 1.0`, or `a = 1 AND a = 1.5`,
+///   of different operand expressions): the analyzer doesn't tell which
+///   ones `predicate_refuted_by` proves contradictory.
 #[test]
 fn known_gaps_in_set_operations_read_whole() {
     let db = build_db(&[("0001.sql", "CREATE DOMAIN d AS int NOT NULL;")]);
     assert_outcomes(
         &db,
         &[
-            (
-                "SELECT 1 FROM (SELECT NULL::d AS a, 1 AS b EXCEPT SELECT 1, 2) s \
-                 WHERE b = 3 AND b = 3.5",
-                None,
-            ),
             (
                 "SELECT b FROM (SELECT 1 AS b, NULL::d AS a UNION SELECT 2, 1) s \
                  WHERE b = 1 AND random() < 2",
@@ -1091,6 +1138,11 @@ fn known_gaps_in_set_operations_read_whole() {
             (
                 "SELECT 1 FROM (SELECT NULL::d AS a, 1 AS b UNION ALL SELECT NULL::d, 2) s \
                  WHERE a = 1 AND a = 1.0",
+                None,
+            ),
+            (
+                "SELECT 1 FROM (SELECT NULL::d AS a, 1 AS b UNION ALL SELECT NULL::d, 2) s \
+                 WHERE a = 1 AND a = 1.5",
                 None,
             ),
         ],

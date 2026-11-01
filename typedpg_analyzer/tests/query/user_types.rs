@@ -967,24 +967,66 @@ fn more_expressions_evaluate_a_null_domain_operand() {
     );
 }
 
-/// Expressions PostgreSQL 18 evaluates a NULL domain operand of on every
-/// execution, which the analyzer doesn't prove and accepts (it never
-/// rejects what it can't prove fails). Each could be rejected by a finer
-/// rule:
-/// - a range's `@>` / `<@` (`range_contains_elem_support` folds the call
-///   only over a constant empty range).
+/// A range's `@>` / `<@` over a NULL domain operand:
+/// `range_contains_elem_support` / `elem_contained_by_range_support`
+/// replace the call over a constant range — by false over an empty one,
+/// by true over one with no bound (the element is dropped), else by
+/// comparisons of the element with the bounds, which evaluate it.
 #[test]
-fn known_gaps_in_null_domain_operands() {
+fn null_domain_range_containment_operands() {
     let db = build_db(&[(
         "0001.sql",
         "CREATE DOMAIN d AS int NOT NULL;
-         CREATE VIEW v AS SELECT NULL::d AS x, 1 AS y;",
+         CREATE VIEW v AS SELECT NULL::d AS x, 1 AS y;
+         CREATE FUNCTION inr(d, int) RETURNS bool LANGUAGE sql
+             AS 'SELECT int4range(1, 5) @> $1::int';
+         CREATE OPERATOR @@@ (LEFTARG = d, RIGHTARG = int, FUNCTION = inr);
+         CREATE FUNCTION inre(d, int) RETURNS bool LANGUAGE sql
+             AS 'SELECT ''empty''::int4range @> $1::int';
+         CREATE OPERATOR @@# (LEFTARG = d, RIGHTARG = int, FUNCTION = inre);",
     )]);
+    let domain = Some("domain d does not allow null values");
     assert_outcomes(
         &db,
         &[
-            ("SELECT int4range(1, 5) @> x::int FROM v", None),
-            ("SELECT x::int <@ int4range(1, 5) FROM v", None),
+            ("SELECT int4range(1, 5) @> x::int FROM v", domain),
+            // Inlined, a SQL function's body is simplified alike.
+            ("SELECT x @@@ 5 FROM v", domain),
+            ("SELECT x @@# 5 FROM v", None),
+            ("SELECT x::int <@ int4range(1, 5) FROM v", domain),
+            ("SELECT int4range(1, 5, '[]') @> x::int FROM v", domain),
+            ("SELECT int4range(1, 2, '(]') @> x::int FROM v", domain),
+            ("SELECT x::int <@ '[1,)'::int4range FROM v", domain),
+            ("SELECT int8range(1, NULL) @> x::bigint FROM v", domain),
+            (
+                "SELECT numrange(1.5, 1.5, '[]') @> x::numeric FROM v",
+                domain,
+            ),
+            (
+                "SELECT numrange(1, 'infinity') @> x::numeric FROM v",
+                domain,
+            ),
+            (
+                "SELECT daterange('2024-01-01', '2024-01-02', '(]') \
+                 @> (x::int + date '2024-01-01') FROM v",
+                domain,
+            ),
+            // An empty range (`(1,2)` of integers canonicalizes to one)
+            // folds the call to false, one with no bound to true.
+            ("SELECT int4range(1, 2, '()') @> x::int FROM v", None),
+            ("SELECT x::int <@ 'empty'::int4range FROM v", None),
+            ("SELECT x::int <@ '(,)'::int4range FROM v", None),
+            ("SELECT int4range(NULL, NULL, '[]') @> x::int FROM v", None),
+            ("SELECT numrange(1.5, 1.5) @> x::numeric FROM v", None),
+            (
+                "SELECT daterange('2024-01-01', '2024-01-02', '()') \
+                 @> (x::int + date '2024-01-01') FROM v",
+                None,
+            ),
+            // A strict call over a NULL constant is folded to NULL.
+            ("SELECT NULL::int4range @> x::int FROM v", None),
+            // A range that isn't known constant: accepted.
+            ("SELECT int4range(y, 5) @> x::int FROM v", None),
         ],
     );
 }
