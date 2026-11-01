@@ -1131,6 +1131,7 @@ pub fn create_range(interp: &mut PgCatalog, stmt: &CreateRangeStmt) -> Result<()
             provolatile: crate::pg_catalog::ProVolatile::Immutable,
             proargdefaulttypes: Vec::new(),
             prolang: crate::pg_catalog::INTERNAL_LANGUAGE,
+            prosupport: None,
         });
     }
     // makeMultirangeConstructors: the explicit cast from the range to its

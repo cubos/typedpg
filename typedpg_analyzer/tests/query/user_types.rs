@@ -699,9 +699,11 @@ fn returning_nn_domain_column_is_nullable() {
 /// evaluates a call's arguments first, and the planner folds no domain
 /// coercion): a NULL cast to a NOT NULL domain read as one fails every
 /// execution that evaluates the operator. A SQL function the planner
-/// inlines may ignore it. The operator is the one the operands' types
-/// resolve to: `+` has SQL candidates (`integer + date`), but `x + 1` runs
-/// `int4pl`.
+/// inlines runs its body instead, which must evaluate the operand:
+/// `integer + date` is `RETURN ($2 + $1)`, `anynonarray || text`
+/// `select $1::text || $2`. A strict function over a NULL constant (a
+/// custom plan's parameter is one) is folded to NULL, its operands
+/// unevaluated. The operator is the one the operands' types resolve to.
 #[test]
 fn an_operator_evaluates_a_null_domain_operand() {
     let db = build_db(&[(
@@ -752,6 +754,18 @@ fn an_operator_evaluates_a_null_domain_operand() {
             "SELECT s || 'a' FROM w",
             Some("domain t does not allow null values"),
         ),
+        ("SELECT x || 'a' FROM v", domain),
+        ("SELECT 'a' || x FROM v", domain),
+        ("SELECT 1 FROM v WHERE x || 'a' = 'b'", domain),
+        ("SELECT x + CURRENT_DATE FROM v", domain),
+        ("SELECT CURRENT_DATE + x FROM v", domain),
+        ("SELECT x + 1::bigint FROM v", domain),
+        ("SELECT x || NULL FROM v", None),
+        ("SELECT x + NULL FROM v", None),
+        ("SELECT x = NULL FROM v", None),
+        ("SELECT x + NULL::int FROM v", None),
+        ("SELECT NULL::d + NULL", None),
+        ("SELECT x + $1 FROM v", None),
         ("SELECT 1 FROM v WHERE x + 1 > 0 AND y = 2", None),
         ("SELECT 1 FROM v WHERE x + 1 > 0 OR true", None),
         ("SELECT 1 FROM v WHERE x = 1 AND y = 2", None),
@@ -768,6 +782,177 @@ fn an_operator_evaluates_a_null_domain_operand() {
             (other, _) => panic!("{sql}: {other:?}"),
         }
     }
+}
+
+/// An operator of a user's function: one in any language but SQL
+/// evaluates its operands, unless a support function could simplify the
+/// call (pg_proc.prosupport — `textlike_support` only answers index and
+/// selectivity requests) or, strict, it has a NULL constant operand. A SQL
+/// one inlined runs its body, which must evaluate the operand in a strict
+/// position.
+#[test]
+fn an_operator_of_a_user_function_evaluates_a_null_domain_operand() {
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE DOMAIN d AS int NOT NULL;
+         CREATE VIEW v AS SELECT NULL::d AS x, 1 AS y;
+         CREATE FUNCTION pl(d, int) RETURNS bool LANGUAGE plpgsql IMMUTABLE
+             AS 'BEGIN RETURN true; END';
+         CREATE OPERATOR === (LEFTARG = d, RIGHTARG = int, FUNCTION = pl);
+         CREATE FUNCTION pl_strict(d, int) RETURNS bool LANGUAGE plpgsql IMMUTABLE STRICT
+             AS 'BEGIN RETURN true; END';
+         CREATE OPERATOR ==== (LEFTARG = d, RIGHTARG = int, FUNCTION = pl_strict);
+         CREATE FUNCTION pl_like(d, int) RETURNS bool LANGUAGE plpgsql IMMUTABLE
+             SUPPORT pg_catalog.textlike_support AS 'BEGIN RETURN true; END';
+         CREATE OPERATOR =#= (LEFTARG = d, RIGHTARG = int, FUNCTION = pl_like);
+         CREATE FUNCTION ignores(d, int) RETURNS bool LANGUAGE sql IMMUTABLE AS 'SELECT true';
+         CREATE OPERATOR =~= (LEFTARG = d, RIGHTARG = int, FUNCTION = ignores);
+         CREATE FUNCTION adds(d, int) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT $1 + $2';
+         CREATE OPERATOR <+> (LEFTARG = d, RIGHTARG = int, FUNCTION = adds);
+         CREATE FUNCTION adds_named(a d, b int) RETURNS int LANGUAGE sql IMMUTABLE
+             RETURN a + b;
+         CREATE OPERATOR <++> (LEFTARG = d, RIGHTARG = int, FUNCTION = adds_named);
+         CREATE FUNCTION picks(d, int) RETURNS int LANGUAGE sql IMMUTABLE
+             AS 'SELECT CASE WHEN $2 > 0 THEN 0 ELSE $2 END';
+         CREATE OPERATOR <%> (LEFTARG = d, RIGHTARG = int, FUNCTION = picks);",
+    )]);
+    let domain = Some("domain d does not allow null values");
+    for (sql, fails) in [
+        ("SELECT x === 1 FROM v", domain),
+        ("SELECT 1 FROM v WHERE x === 1", domain),
+        // Not strict: the NULL is passed, the operand evaluated.
+        ("SELECT x === NULL FROM v", domain),
+        ("SELECT x ==== 1 FROM v", domain),
+        ("SELECT x =#= 1 FROM v", domain),
+        ("SELECT x <+> 1 FROM v", domain),
+        ("SELECT x <++> 1 FROM v", domain),
+        ("SELECT x ==== NULL FROM v", None),
+        ("SELECT x <+> NULL FROM v", None),
+        ("SELECT x =~= 1 FROM v", None),
+        ("SELECT x <%> 1 FROM v", None),
+    ] {
+        match (db.analyze(sql), fails) {
+            (Err(err), Some(msg)) => {
+                assert!(err.to_string().starts_with(msg), "{sql}\n  got: {err}")
+            }
+            (Ok(_), None) => {}
+            (other, _) => panic!("{sql}: {other:?}"),
+        }
+    }
+}
+
+/// Asserts each query fails with `msg` (`Some`) or analyzes (`None`).
+fn assert_outcomes(db: &PgCatalog, cases: &[(&str, Option<&str>)]) {
+    for (sql, fails) in cases {
+        match (db.analyze(sql), fails) {
+            (Err(err), Some(msg)) => {
+                assert!(err.to_string().starts_with(msg), "{sql}\n  got: {err}")
+            }
+            (Ok(_), None) => {}
+            (other, _) => panic!("{sql}: {other:?}"),
+        }
+    }
+}
+
+/// More expressions evaluating a NULL domain operand on every execution:
+/// a cast (`x::text`), IS [NOT] DISTINCT FROM (folded only over
+/// constants, never inlined), `op ANY / ALL (array)` (the scalar is
+/// evaluated whatever the array), BETWEEN (its first comparison), an IN
+/// list of literals; a SQL operator both of whose operands fail alike
+/// (whichever its body evaluates first raises it); and inlined bodies
+/// evaluating the parameter through a NULL test, IS NOT DISTINCT FROM,
+/// COALESCE's first argument or an AND every argument of which reads it.
+/// An AND with another argument may be folded to a constant over the
+/// call's constant arguments (`$2 > 0` over `0`): accepted.
+#[test]
+fn more_expressions_evaluate_a_null_domain_operand() {
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE DOMAIN d AS int NOT NULL;
+         CREATE VIEW v AS SELECT NULL::d AS x, 1 AS y;
+         CREATE FUNCTION adds(d, d) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT $1 + $2';
+         CREATE OPERATOR <++> (LEFTARG = d, RIGHTARG = d, FUNCTION = adds);
+         CREATE FUNCTION isn(d, int) RETURNS bool LANGUAGE sql AS 'SELECT $1 IS NULL';
+         CREATE OPERATOR #=# (LEFTARG = d, RIGHTARG = int, FUNCTION = isn);
+         CREATE FUNCTION coal(d, int) RETURNS int LANGUAGE sql AS 'SELECT coalesce($1, $2)';
+         CREATE OPERATOR #># (LEFTARG = d, RIGHTARG = int, FUNCTION = coal);
+         CREATE FUNCTION indf(d, int) RETURNS bool LANGUAGE sql
+             AS 'SELECT $1 IS NOT DISTINCT FROM $2';
+         CREATE OPERATOR #<# (LEFTARG = d, RIGHTARG = int, FUNCTION = indf);
+         CREATE FUNCTION both_sides(d, int) RETURNS bool LANGUAGE sql
+             AS 'SELECT $1 > 0 AND $1 < 10';
+         CREATE OPERATOR %%% (LEFTARG = d, RIGHTARG = int, FUNCTION = both_sides);
+         CREATE FUNCTION andl(d, int) RETURNS bool LANGUAGE sql AS 'SELECT $1 > 0 AND $2 > 0';
+         CREATE OPERATOR %=% (LEFTARG = d, RIGHTARG = int, FUNCTION = andl);
+         CREATE FUNCTION elem(anyelement, int) RETURNS bool LANGUAGE sql AS 'SELECT $1 IS NULL';
+         CREATE OPERATOR &=& (LEFTARG = anyelement, RIGHTARG = int, FUNCTION = elem);",
+    )]);
+    let domain = Some("domain d does not allow null values");
+    assert_outcomes(
+        &db,
+        &[
+            ("SELECT x::text FROM v", domain),
+            ("SELECT x::text || 'a' FROM v", domain),
+            ("SELECT x::bigint FROM v", domain),
+            ("SELECT x IS DISTINCT FROM 1 FROM v", domain),
+            ("SELECT 1 IS DISTINCT FROM x FROM v", domain),
+            ("SELECT x IS NOT DISTINCT FROM NULL FROM v", domain),
+            ("SELECT x BETWEEN 1 AND 2 FROM v", domain),
+            ("SELECT x NOT BETWEEN 1 AND 2 FROM v", domain),
+            ("SELECT x BETWEEN SYMMETRIC 1 AND 2 FROM v", domain),
+            ("SELECT x < ALL (ARRAY[1, 2]) FROM v", domain),
+            ("SELECT x = ANY ('{}'::int[]) FROM v", domain),
+            ("SELECT x = ANY (NULL::int[]) FROM v", domain),
+            ("SELECT x IN (1, 2) FROM v", domain),
+            ("SELECT x NOT IN (1) FROM v", domain),
+            ("SELECT 1 FROM v WHERE x BETWEEN 1 AND 2", domain),
+            ("SELECT x <++> x FROM v", domain),
+            ("SELECT x #=# 1 FROM v", domain),
+            ("SELECT x #># 1 FROM v", domain),
+            ("SELECT x #<# 1 FROM v", domain),
+            ("SELECT x %%% 1 FROM v", domain),
+            ("SELECT x &=& 1 FROM v", domain),
+            // `0 > 0` folds the AND to false: x is never read.
+            ("SELECT x %=% 0 FROM v", None),
+            ("SELECT y BETWEEN 1 AND 2 FROM v", None),
+            ("SELECT y::text FROM v", None),
+        ],
+    );
+}
+
+/// Expressions PostgreSQL 18 evaluates a NULL domain operand of on every
+/// execution, which the analyzer doesn't prove and accepts (it never
+/// rejects what it can't prove fails). Each could be rejected by a finer
+/// rule:
+/// - an AND in an inlined body whose other argument is decided by the
+///   call's constant arguments (`$2 > 0` over `1` is dropped);
+/// - a range's `@>` / `<@` (`range_contains_elem_support` folds the call
+///   only over a constant empty range);
+/// - a BETWEEN with a NULL bound, whose first comparison is folded to
+///   NULL and the second one evaluated;
+/// - a SQL operator over a NULL constant, which its body (`coalesce($1,
+///   $2)`) may still evaluate the other operand of.
+#[test]
+fn known_gaps_in_null_domain_operands() {
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE DOMAIN d AS int NOT NULL;
+         CREATE VIEW v AS SELECT NULL::d AS x, 1 AS y;
+         CREATE FUNCTION andl(d, int) RETURNS bool LANGUAGE sql AS 'SELECT $1 > 0 AND $2 > 0';
+         CREATE OPERATOR %=% (LEFTARG = d, RIGHTARG = int, FUNCTION = andl);
+         CREATE FUNCTION coal(d, int) RETURNS int LANGUAGE sql AS 'SELECT coalesce($1, $2)';
+         CREATE OPERATOR #># (LEFTARG = d, RIGHTARG = int, FUNCTION = coal);",
+    )]);
+    assert_outcomes(
+        &db,
+        &[
+            ("SELECT x %=% 1 FROM v", None),
+            ("SELECT int4range(1, 5) @> x::int FROM v", None),
+            ("SELECT x::int <@ int4range(1, 5) FROM v", None),
+            ("SELECT x BETWEEN NULL AND 2 FROM v", None),
+            ("SELECT x #># NULL FROM v", None),
+        ],
+    );
 }
 
 #[test]

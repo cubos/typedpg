@@ -405,3 +405,278 @@ fn a_failing_first_row_of_a_set_operation_fails_every_execution() {
         ],
     );
 }
+
+/// Where every plan reads a set operation's arms whole. A grouped leaf of
+/// no FROM item is one group, estimated one row — an INTERSECT reads it
+/// after its one-row left input. Sorting reads every row's keys before a
+/// LIMIT returns the first, unless a WHERE equating a key to a constant
+/// drops the Sort. A qualification is pushed down into the arms
+/// only through columns every leaf yields the set operation's type of
+/// (compare_tlist_datatypes), and not into an EXCEPT, a LIMIT or through
+/// the whole row: it then runs over the projected rows. And a set
+/// operation the planner doesn't flatten into an append relation (a UNION
+/// ALL of mismatched leaves, any other) keeps every column of its arms, so
+/// reading any row projects them whole.
+#[test]
+fn a_set_operation_read_whole_fails_every_execution() {
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE DOMAIN d AS int NOT NULL;
+         CREATE TABLE t (a int);
+         CREATE VIEW v AS SELECT NULL::d AS x, 1 AS y;",
+    )]);
+    let domain = Some("domain d does not allow null values");
+    assert_outcomes(
+        &db,
+        &[
+            ("SELECT NULL::d GROUP BY 1", domain),
+            ("SELECT 1 INTERSECT SELECT NULL::d GROUP BY 1", domain),
+            ("SELECT NULL::d GROUP BY ()", domain),
+            ("SELECT 1 INTERSECT SELECT NULL::d GROUP BY ()", domain),
+            (
+                "SELECT 1 INTERSECT SELECT NULL::d GROUP BY GROUPING SETS (())",
+                domain,
+            ),
+            ("SELECT NULL::d GROUP BY GROUPING SETS ((), ())", domain),
+            ("SELECT 1 INTERSECT SELECT DISTINCT NULL::d", domain),
+            ("SELECT 1 EXCEPT SELECT NULL::d GROUP BY 1", domain),
+            (
+                "SELECT 1 INTERSECT SELECT NULL::d GROUP BY 1 HAVING false",
+                None,
+            ),
+            (
+                "SELECT * FROM (SELECT 1 AS a UNION ALL SELECT NULL::d) s ORDER BY a LIMIT 1",
+                domain,
+            ),
+            (
+                "SELECT * FROM (SELECT 1 AS a UNION ALL SELECT NULL::d) s ORDER BY 1 LIMIT 1",
+                domain,
+            ),
+            (
+                "SELECT a FROM (SELECT 1 AS a, 2 AS b UNION ALL SELECT NULL::d, 3) s \
+                 ORDER BY b LIMIT 1",
+                domain,
+            ),
+            (
+                "SELECT x FROM (SELECT x FROM v UNION ALL SELECT 1) s ORDER BY 1 LIMIT 1",
+                domain,
+            ),
+            (
+                "SELECT * FROM (SELECT 1 AS a UNION ALL SELECT NULL::d) s LIMIT 1",
+                None,
+            ),
+            // A key a WHERE equates to a constant is redundant
+            // (pathkey_is_redundant): no Sort, the Limit stops in the
+            // first arm. Any key whose columns a WHERE equality reads is
+            // taken as such, as is a constant one.
+            (
+                "SELECT * FROM (SELECT 1 AS a UNION ALL SELECT NULL::d) s \
+                 WHERE a = 1 ORDER BY a LIMIT 1",
+                None,
+            ),
+            (
+                "SELECT * FROM (SELECT 1 AS a UNION ALL SELECT NULL::d) s \
+                 WHERE a = 1 ORDER BY 1 LIMIT 1",
+                None,
+            ),
+            (
+                "SELECT 1 FROM (SELECT 1 AS a UNION ALL SELECT NULL::d) s \
+                 WHERE a = 1 ORDER BY a LIMIT 1",
+                None,
+            ),
+            (
+                "SELECT a AS z FROM (SELECT 1 AS a UNION ALL SELECT NULL::d) s \
+                 WHERE a = 1 ORDER BY z LIMIT 1",
+                None,
+            ),
+            (
+                "SELECT * FROM (SELECT 1 AS a UNION ALL SELECT NULL::d) s \
+                 WHERE a + 0 = 1 ORDER BY a + 0 LIMIT 1",
+                None,
+            ),
+            (
+                "SELECT * FROM (SELECT 1 AS a UNION ALL SELECT NULL::d) s \
+                 WHERE NOT (a <> 1) ORDER BY a LIMIT 1",
+                None,
+            ),
+            (
+                "SELECT * FROM (SELECT 1 AS a UNION ALL SELECT NULL::d) s \
+                 WHERE a = 1 ORDER BY a, 1 LIMIT 1",
+                None,
+            ),
+            (
+                "SELECT a FROM (SELECT 1 AS a, 2 AS b UNION ALL SELECT NULL::d, 2) s \
+                 WHERE b = 2 ORDER BY b LIMIT 1",
+                None,
+            ),
+            // An inequality makes no equivalence class: the Sort stays.
+            (
+                "SELECT * FROM (SELECT 1 AS a UNION ALL SELECT NULL::d) s \
+                 WHERE a > 0 ORDER BY a LIMIT 1",
+                domain,
+            ),
+            (
+                "SELECT * FROM (SELECT 1 AS a, 1 AS b UNION ALL SELECT NULL::d, 2) s \
+                 ORDER BY b OFFSET 1",
+                None,
+            ),
+            (
+                "SELECT 1 FROM (SELECT NULL::d AS a, 1 AS b UNION ALL SELECT 1, 2) s WHERE a = 1",
+                domain,
+            ),
+            (
+                "SELECT 1 FROM (SELECT NULL::d AS a, 1 AS b UNION ALL SELECT 1, 2) s \
+                 WHERE a IS NULL",
+                domain,
+            ),
+            (
+                "SELECT 1 FROM (SELECT NULL::d AS a, 1 AS b UNION SELECT 1, 2) s WHERE a = 1",
+                domain,
+            ),
+            (
+                "SELECT 1 FROM (SELECT NULL::d AS a, 1 AS b UNION ALL SELECT 1, 2) s \
+                 WHERE s IS NULL",
+                domain,
+            ),
+            (
+                "SELECT 1 FROM (SELECT NULL::d AS a, 1 AS b UNION SELECT 1, 2) s WHERE s IS NULL",
+                domain,
+            ),
+            (
+                "SELECT 1 FROM (SELECT NULL::d AS a, 1 AS b EXCEPT SELECT 1, 2) s WHERE b = 3",
+                domain,
+            ),
+            (
+                "SELECT 1 FROM (SELECT NULL::d AS a, 1 AS b EXCEPT SELECT 1, 2) s \
+                 WHERE b = 3 AND b > 2",
+                domain,
+            ),
+            // Two equalities contradicting each other through their
+            // equivalence class leave the scan dummy
+            // (generate_base_implied_equalities_const).
+            (
+                "SELECT 1 FROM (SELECT NULL::d AS a, 1 AS b EXCEPT SELECT 1, 2) s \
+                 WHERE b = 3 AND b = 4",
+                None,
+            ),
+            (
+                "SELECT 1 FROM (SELECT NULL::d AS a, 1 AS b, 2 AS c EXCEPT SELECT 1, 2, 3) s \
+                 WHERE b = c AND b = 3 AND c = 4",
+                None,
+            ),
+            (
+                "SELECT 1 FROM (SELECT NULL::d AS a, 1 AS b UNION ALL SELECT 1, 2 LIMIT 5) s \
+                 WHERE b = 3",
+                domain,
+            ),
+            (
+                "SELECT 1 FROM (SELECT NULL::d AS a, 1 AS b UNION ALL SELECT 1, 2) s",
+                domain,
+            ),
+            (
+                "SELECT 1 FROM (SELECT NULL::d AS a EXCEPT SELECT 1) s",
+                domain,
+            ),
+            (
+                "SELECT count(*) FROM (SELECT NULL::d AS a UNION SELECT 1) s",
+                domain,
+            ),
+            (
+                "SELECT (SELECT 1 FROM (SELECT NULL::d AS a UNION SELECT 1) s LIMIT 1)",
+                domain,
+            ),
+            (
+                "SELECT 1 FROM (SELECT NULL::d AS a, 1 AS b UNION ALL SELECT 1, 2) s LIMIT 1",
+                domain,
+            ),
+            // Pushed down into each arm, before its projection.
+            (
+                "SELECT 1 FROM (SELECT NULL::d AS a, 1 AS b UNION ALL SELECT 1, 2) s \
+                 WHERE a = 1 AND b = 2",
+                None,
+            ),
+            (
+                "SELECT 1 FROM (SELECT * FROM (SELECT NULL::d AS a, 1 AS b UNION ALL \
+                 SELECT 1, 2) s1) s2 WHERE b IS NULL",
+                None,
+            ),
+            (
+                "SELECT 1 FROM (SELECT NULL::d AS a, 1 AS b UNION ALL (SELECT NULL::d, 2 \
+                 UNION SELECT NULL::d, 4 ORDER BY 1)) s WHERE b = 7",
+                None,
+            ),
+            // Folded to NULL (a custom plan's parameter is a constant): no
+            // row is read.
+            (
+                "SELECT 1 FROM (SELECT NULL::d AS a, 1 AS b UNION ALL SELECT 1, 2) s \
+                 WHERE a = NULL",
+                None,
+            ),
+            (
+                "SELECT 1 FROM (SELECT NULL::d AS a, 1 AS b UNION ALL SELECT 1, 2) s \
+                 WHERE a = $1",
+                None,
+            ),
+            // Flattened, unused columns are dropped from each leaf.
+            (
+                "SELECT 1 FROM (SELECT NULL::d AS a, 1 AS b UNION ALL SELECT NULL::d, 2) s",
+                None,
+            ),
+            (
+                "SELECT b FROM (SELECT NULL::d AS a, 1 AS b UNION ALL SELECT NULL::d, 2) s",
+                None,
+            ),
+            (
+                "SELECT b FROM (SELECT NULL::d AS a, 1 AS b UNION ALL SELECT NULL::d, 2) s \
+                 ORDER BY b LIMIT 1",
+                None,
+            ),
+            (
+                "SELECT a FROM (SELECT NULL::d AS a, 1 AS b UNION ALL SELECT NULL::d, 2) s",
+                domain,
+            ),
+            (
+                "SELECT b FROM (SELECT NULL::d AS a, 1 AS b UNION SELECT NULL::d, 2) s",
+                domain,
+            ),
+        ],
+    );
+}
+
+/// Set operations PostgreSQL 18 reads whole on every execution, which the
+/// analyzer doesn't prove and accepts:
+/// - a LIMIT past the rows of the first arm, with the Sort dropped (a
+///   redundant key) or with no ORDER BY;
+/// - an ORDER BY key reading a column a WHERE equality reads only inside
+///   another expression (`a + 0 = 1` leaves `a` sortable);
+/// - two equalities that agree (`b = 3 AND b = 3`) or a Sort by a key no
+///   WHERE equality reads while the WHERE drops no arm.
+#[test]
+fn known_gaps_in_set_operations_read_whole() {
+    let db = build_db(&[("0001.sql", "CREATE DOMAIN d AS int NOT NULL;")]);
+    assert_outcomes(
+        &db,
+        &[
+            (
+                "SELECT * FROM (SELECT 1 AS a UNION ALL SELECT NULL::d) s \
+                 WHERE a = 1 ORDER BY a LIMIT 2",
+                None,
+            ),
+            (
+                "SELECT * FROM (SELECT 1 AS a UNION ALL SELECT NULL::d) s \
+                 WHERE a + 0 = 1 ORDER BY a LIMIT 1",
+                None,
+            ),
+            (
+                "SELECT 1 FROM (SELECT NULL::d AS a, 1 AS b EXCEPT SELECT 1, 2) s \
+                 WHERE b = 3 AND b = 3",
+                None,
+            ),
+            (
+                "SELECT a FROM (SELECT 1 AS a, 2 AS b UNION ALL SELECT NULL::d, 2) s \
+                 WHERE b = 2 ORDER BY a LIMIT 1",
+                None,
+            ),
+        ],
+    );
+}

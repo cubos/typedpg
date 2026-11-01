@@ -91,8 +91,9 @@ impl<'a> CommonAttributes<'a> {
 
     /// The checks `compute_function_attributes` / `AlterFunction` make once
     /// every option is read, in their order: the SET items
-    /// (`update_proconfig_value`), COST, ROWS, SUPPORT, PARALLEL.
-    fn validate(&self, interp: &PgCatalog) -> Result<(), DdlError> {
+    /// (`update_proconfig_value`), COST, ROWS, SUPPORT, PARALLEL. Returns
+    /// the support function named.
+    fn validate(&self, interp: &PgCatalog) -> Result<Option<PgProcOid>, DdlError> {
         for item in &self.set_items {
             check_set_item(interp, item)?;
         }
@@ -106,13 +107,14 @@ impl<'a> CommonAttributes<'a> {
         {
             return Err(DdlError::UnsupportedDdl("ROWS must be positive".into()));
         }
-        if let Some(support) = self.support {
-            interpret_func_support(interp, support)?;
-        }
+        let support = match self.support {
+            Some(support) => Some(interpret_func_support(interp, support)?),
+            None => None,
+        };
         if let Some(parallel) = self.parallel {
             interpret_func_parallel(parallel)?;
         }
-        Ok(())
+        Ok(support)
     }
 
     fn volatility(&self) -> Option<ProVolatile> {
@@ -137,6 +139,8 @@ struct FunctionAttributes<'a> {
     transform: Option<&'a DefElem>,
     window: bool,
     common: CommonAttributes<'a>,
+    /// `prosupport`.
+    support: Option<PgProcOid>,
 }
 
 fn compute_function_attributes<'a>(
@@ -188,7 +192,7 @@ fn compute_function_attributes<'a>(
     }
     attrs.language = language_item.and_then(def_string);
     attrs.window = window_item.and_then(def_bool).unwrap_or(false);
-    attrs.common.validate(interp)?;
+    attrs.support = attrs.common.validate(interp)?;
     Ok(attrs)
 }
 
@@ -610,6 +614,7 @@ pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Res
         provolatile: attrs.common.volatility().unwrap_or(ProVolatile::Volatile),
         proargdefaulttypes: params.default_types.clone(),
         prolang,
+        prosupport: attrs.support,
     };
     let proc = procedure_create(interp, proc, stmt.replace)?;
     // ProcedureCreate: the routine depends on its language (the pinned
@@ -1302,7 +1307,7 @@ pub fn alter_function(
         }
     }
     common.cost = None;
-    common.validate(interp)?;
+    let support = common.validate(interp)?;
     deferred_sets.validate(interp)?;
     if !deferred_sets.set_items.is_empty() {
         interp.procs_with_config.insert(oid);
@@ -1315,6 +1320,9 @@ pub fn alter_function(
         }
         if let Some(s) = strict {
             p.proisstrict = s;
+        }
+        if support.is_some() {
+            p.prosupport = support;
         }
     }
     Ok(())

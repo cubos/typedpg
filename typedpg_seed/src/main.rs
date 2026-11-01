@@ -378,6 +378,7 @@ fn export_procs(client: &mut postgres::Client) -> Result<Vec<PgProc>, postgres::
                 p.proretset, p.provariadic, p.proisstrict, p.pronargdefaults, \
                 p.proallargtypes::int4[], p.proargmodes, p.proargnames, \
                 p.provolatile, p.prolang, \
+                p.prosupport::oid, \
                 (SELECT coalesce(array_agg(t.typtype = 'p' AND t.typname LIKE 'any%' \
                                            ORDER BY u.ord), '{}') \
                    FROM unnest(p.proargtypes::oid[]) WITH ORDINALITY u(o, ord) \
@@ -419,7 +420,8 @@ fn export_procs(client: &mut postgres::Client) -> Result<Vec<PgProc>, postgres::
             let provariadic: u32 = r.get(7);
             let pronargdefaults: i16 = r.get(9);
             let prolang: u32 = r.get(14);
-            let polymorphic_args: Vec<bool> = r.get(15);
+            let prosupport: u32 = r.get(15);
+            let polymorphic_args: Vec<bool> = r.get(16);
             // The builtin defaults' types: a default of a non-polymorphic
             // parameter was coerced to the parameter's type when the
             // function was created, so its type is the declared one. A
@@ -451,6 +453,7 @@ fn export_procs(client: &mut postgres::Client) -> Result<Vec<PgProc>, postgres::
                 provolatile: char_to_provolatile(provolatile as u8 as char),
                 proargdefaulttypes,
                 prolang: PgLanguageOid::new(prolang).expect("prolang is non-zero"),
+                prosupport: PgProcOid::new(prosupport),
             }
         })
         .collect())
