@@ -3051,7 +3051,7 @@ mod tests {
         assert_eq!(
             cast_params(&analyzed),
             "SELECT a FROM t WHERE a <> ($1::pg_catalog.int4) AND (NOT EXISTS (SELECT 1 FROM u \
-             WHERE (b > ($1::pg_catalog.int4)) AND a = b))"
+             WHERE (b > ($1::pg_catalog.int4)) AND t.a = b))"
         );
         let doc = simplified_doc(&analyzed).to_string();
         assert!(doc.contains("simplified by typedpg (not_in)"), "{doc}");

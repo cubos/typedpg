@@ -82,7 +82,7 @@ fn unqualified_left_side_a_subquery_column_would_capture_is_wrapped() {
         &setup(),
         "SELECT id FROM customers WHERE id NOT IN (SELECT id FROM customers WHERE code = 1)",
         "SELECT id FROM customers WHERE (NOT EXISTS (SELECT 1 FROM (SELECT id FROM customers WHERE code = 1) \
-         AS __typedpg_s1 (__typedpg_c1) WHERE id = __typedpg_s1.__typedpg_c1))",
+         AS __typedpg_s1 (__typedpg_c1) WHERE customers.id = __typedpg_s1.__typedpg_c1))",
     );
 }
 
@@ -103,7 +103,7 @@ fn distinct_and_group_by_keep_the_subquery_whole() {
     let db = setup();
     for sub in [
         "SELECT DISTINCT customer_id FROM banned",
-        "SELECT customer_id FROM banned GROUP BY customer_id HAVING count(*) > 1",
+        "SELECT customer_id FROM banned GROUP BY customer_id HAVING customer_id > 1",
     ] {
         assert_rewritten(
             &db,
@@ -149,7 +149,7 @@ fn in_delete_and_update() {
     assert_rewritten(
         &db,
         "DELETE FROM customers WHERE id NOT IN (SELECT b.customer_id FROM banned b)",
-        "DELETE FROM customers WHERE (NOT EXISTS (SELECT 1 FROM banned b WHERE id = b.customer_id))",
+        "DELETE FROM customers WHERE (NOT EXISTS (SELECT 1 FROM banned b WHERE customers.id = b.customer_id))",
     );
     assert_rewritten(
         &db,
@@ -606,20 +606,22 @@ fn two_wrapped_sites_get_their_own_aliases() {
 }
 
 #[test]
-fn nested_wrapped_sites_are_rewritten_in_turn() {
-    // The inner site is inside the outer's subquery: a second pass
-    // rewrites it, with a new alias.
+fn a_site_whose_subquery_holds_another_is_kept() {
+    // The inner site is rewritten; the outer one's subquery then holds a
+    // sublink, which an anti-join could newly evaluate: it stays NOT IN.
     let (sent, rules) = simplified(
         &setup(),
         "SELECT c.id FROM customers c WHERE c.id NOT IN \
          (SELECT b.customer_id FROM banned b WHERE b.code NOT IN \
          (SELECT p.b FROM pairs p LIMIT 3) LIMIT 7)",
     );
-    assert_eq!(rules, vec![Rule::NotIn, Rule::NotIn], "{sent}");
-    assert!(
-        sent.contains("__typedpg_s1") && sent.contains("__typedpg_s2"),
-        "{sent}"
+    assert_eq!(
+        sent,
+        "SELECT c.id FROM customers c WHERE c.id NOT IN \
+         (SELECT b.customer_id FROM banned b WHERE (NOT EXISTS (SELECT 1 FROM (SELECT p.b FROM pairs \
+         p LIMIT 3) AS __typedpg_s1 (__typedpg_c1) WHERE b.code = __typedpg_s1.__typedpg_c1)) LIMIT 7)"
     );
+    assert_eq!(rules, vec![Rule::NotIn]);
 }
 
 #[cfg(feature = "pg_sanity")]
@@ -651,6 +653,114 @@ fn the_oracle_compares_dml_table_contents() {
              (NOT EXISTS (SELECT 1 FROM banned WHERE c.id = customer_id))::text",
         )
         .is_none()
+    );
+}
+
+#[test]
+fn a_user_implicit_cast_before_the_equality_is_not_trusted() {
+    // `int = text` resolves to the built-in `int = int` through the user's
+    // implicit cast, which may return NULL.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE FUNCTION tx2int(text) RETURNS int LANGUAGE sql IMMUTABLE \
+           AS $$SELECT CASE WHEN $1 = 'n' THEN NULL ELSE length($1) END$$;
+         CREATE CAST (text AS int) WITH FUNCTION tx2int(text) AS IMPLICIT;
+         CREATE TABLE t (a int NOT NULL, s text NOT NULL);
+         CREATE TABLE u (a int NOT NULL, s text NOT NULL);",
+    )
+    .unwrap();
+    assert_kept(&db, "SELECT t.a FROM t WHERE t.a NOT IN (SELECT s FROM u)");
+    assert_kept(
+        &db,
+        "SELECT t.a FROM t WHERE (t.a, t.s) NOT IN (SELECT u.a, u.a FROM u)",
+    );
+    // Equal types need no cast.
+    assert_rewritten(
+        &db,
+        "SELECT t.a FROM t WHERE t.a NOT IN (SELECT u.a FROM u)",
+        "SELECT t.a FROM t WHERE (NOT EXISTS (SELECT 1 FROM u WHERE t.a = u.a))",
+    );
+}
+
+#[test]
+fn a_cross_type_equality_needing_a_cast_is_kept() {
+    // `int8 = int4` has an operator of its own; `numeric = int4` casts.
+    let mut db = setup();
+    db.apply_sql("CREATE TABLE amounts (v numeric NOT NULL);")
+        .unwrap();
+    assert_kept(
+        &db,
+        "SELECT c.code FROM customers c WHERE c.code NOT IN (SELECT v FROM amounts)",
+    );
+    assert_rewritten(
+        &db,
+        "SELECT c.id FROM customers c WHERE c.id NOT IN (SELECT code FROM banned)",
+        "SELECT c.id FROM customers c WHERE (NOT EXISTS (SELECT 1 FROM banned WHERE c.id = code))",
+    );
+}
+
+#[test]
+fn a_subquery_expression_that_can_fail_is_kept() {
+    // The anti-join filters `u` by `1/u.b > 0` before looking at `t`: on
+    // a row the SubPlan never reached, it divides by zero.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE t (k int NOT NULL, a int NOT NULL);
+         CREATE TABLE u (k int NOT NULL, a int NOT NULL, b int NOT NULL, status text NOT NULL);",
+    )
+    .unwrap();
+    for sub in [
+        "SELECT a FROM u WHERE u.k = t.k AND 1/u.b > 0",
+        "SELECT a FROM u WHERE u.status LIKE 'x%'",
+        "SELECT a FROM u WHERE u.status::int > 0",
+        "SELECT a FROM u WHERE length(u.status) > 0",
+        "SELECT a FROM u ORDER BY 1/u.b LIMIT 1",
+        "SELECT a FROM u GROUP BY a HAVING count(*) > 1",
+        "SELECT a FROM u LIMIT $n",
+        "SELECT a FROM u, generate_series(1, 2)",
+        "SELECT u.a FROM u JOIN t AS t2 USING (k)",
+    ] {
+        assert_kept(&db, &format!("SELECT t.a FROM t WHERE t.a NOT IN ({sub})"));
+    }
+    // Comparisons of columns and constants can't fail.
+    assert_rewritten(
+        &db,
+        "SELECT t.a FROM t WHERE t.a NOT IN (SELECT a FROM u WHERE u.status = 'x' AND u.k = t.k)",
+        "SELECT t.a FROM t WHERE (NOT EXISTS (SELECT 1 FROM u WHERE (u.status = 'x' AND u.k = t.k) \
+         AND t.a = a))",
+    );
+    assert_rewritten(
+        &db,
+        "SELECT t.a FROM t WHERE t.a NOT IN \
+         (SELECT u.a FROM u JOIN t AS t2 ON t2.k = u.k WHERE u.b IS NOT NULL)",
+        "SELECT t.a FROM t WHERE (NOT EXISTS (SELECT 1 FROM u JOIN t AS t2 ON t2.k = u.k WHERE \
+         (u.b IS NOT NULL) AND t.a = u.a))",
+    );
+}
+
+#[test]
+fn a_unicode_escaped_reserved_name_is_kept() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE t (a int NOT NULL, \"__typedpg_c1\" int NOT NULL);
+         CREATE TABLE u (a int NOT NULL);",
+    )
+    .unwrap();
+    assert_kept(
+        &db,
+        "SELECT t.a FROM t WHERE U&\"\\005F\\005Ftypedpg_c1\" NOT IN (SELECT a FROM u LIMIT 5)",
+    );
+}
+
+#[test]
+fn the_left_side_is_qualified_where_it_moves() {
+    // Next to the wrapper the left-hand column is written with its
+    // table's name, so nothing there can capture it.
+    assert_rewritten(
+        &setup(),
+        "SELECT code FROM customers WHERE code NOT IN (SELECT code FROM banned LIMIT 5)",
+        "SELECT code FROM customers WHERE (NOT EXISTS (SELECT 1 FROM (SELECT code FROM banned LIMIT 5) \
+         AS __typedpg_s1 (__typedpg_c1) WHERE customers.code = __typedpg_s1.__typedpg_c1))",
     );
 }
 

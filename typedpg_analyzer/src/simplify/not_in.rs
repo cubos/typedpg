@@ -22,6 +22,16 @@
 //!   column by column with `=`, as PG's row comparison does.
 //! - nothing in it is volatile (the subquery may run a different number
 //!   of times), and no table read has row security.
+//! - nothing the rewrite may newly evaluate can fail: an anti-join filters
+//!   the subquery's rows by its WHERE before (or without) looking at the
+//!   outer row, where the SubPlan evaluated it per outer row, in cost
+//!   order, or not at all over an empty outer side. So the subquery reads
+//!   only stored tables, and every expression in it is a column,
+//!   constant, parameter, boolean combination, NULL / boolean test or a
+//!   comparison through a built-in operator needing no cast
+//!   ([`super::proof::error_free_select`]). A subquery with a cast,
+//!   arithmetic, a function call or a pattern match is left as written,
+//!   even where it couldn't fail on the data at hand.
 //! - the NOT IN is in a SELECT's target list, WHERE or HAVING, or in an
 //!   UPDATE / DELETE's WHERE (or SET) — where [`FromScope`] knows what
 //!   its columns are — and not repeated in a GROUP BY, ORDER BY or
@@ -42,7 +52,8 @@ use typedpg_pg_query::protobuf::{
 };
 
 use super::proof::{
-    FromScope, builtin_strict_equality, column_type, embed_source, has_volatile, strictly_not_null,
+    FromScope, builtin_strict_equality, column_type, embed_source, error_free_select, has_volatile,
+    qualified_column, strictly_not_null, written_names_use,
 };
 use super::{Candidate, Ctx, Edit, Rule};
 
@@ -58,15 +69,10 @@ pub(crate) fn candidates(ctx: &Ctx<'_>) -> Vec<Candidate> {
         matches!(n, NodeRef::SubLink(s)
             if s.sub_link_type() == SubLinkType::AnySublink && s.oper_name.is_empty())
     });
-    // The guard is on the SQL as written: the current one may hold the
-    // aliases of earlier rewrites.
-    if !has_site
-        || ctx
-            .analyzed
-            .sql
-            .to_ascii_lowercase()
-            .contains(RESERVED_PREFIX)
-    {
+    // The guard is on the names of the SQL as written (decoded: a
+    // `U&"…"` identifier too): the current SQL may hold the aliases of
+    // earlier rewrites.
+    if !has_site || written_names_use(ctx, RESERVED_PREFIX) {
         return Vec::new();
     }
     let Ok(scanned) = typedpg_pg_query::scan(ctx.sql) else {
@@ -331,6 +337,10 @@ impl Walker<'_, '_> {
         {
             return None;
         }
+        // Nothing the rewrite may newly evaluate can fail.
+        if !error_free_select(ctx, sub, &sub_scope) {
+            return None;
+        }
         // Nothing volatile, no row security.
         let sub_node = s.subselect.as_deref()?;
         if has_volatile(ctx, sub_node)
@@ -378,6 +388,14 @@ impl Walker<'_, '_> {
         let inner_start = self.tokens[inner_first].start;
         let inner_end = self.tokens[inner_last].end;
 
+        // The left-hand columns qualified by the table they read: moved
+        // into the subquery (or next to the wrapper), they can't be
+        // captured by a name there.
+        let lhs: Vec<ColumnRef> = lhs
+            .iter()
+            .map(|c| qualified_column(ctx, c, scope))
+            .collect::<Option<_>>()?;
+        let lhs: Vec<&ColumnRef> = lhs.iter().collect();
         let lhs_text: Vec<String> = lhs.iter().map(|c| render(c)).collect::<Option<_>>()?;
         let inline = self.inline_parts(sub, &sub_scope, &lhs, inner_first, inner_last);
         let text = match inline {

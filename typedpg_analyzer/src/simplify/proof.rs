@@ -163,6 +163,45 @@ impl<'a> FromScope<'a> {
         })
     }
 
+    /// The `(schema, refname)` of the table an unqualified `column` binds
+    /// to, as [`Self::resolve`] finds it: the schema only when written and
+    /// the table has no alias.
+    pub(crate) fn binding_item(
+        &self,
+        ctx: &Ctx<'_>,
+        column: &str,
+    ) -> Option<(Option<String>, String)> {
+        let mut level = Some(self);
+        while let Some(scope) = level {
+            let mut found = None;
+            for item in &scope.items {
+                match item {
+                    Item::Opaque { .. } => return None,
+                    Item::Table {
+                        schema,
+                        refname,
+                        rel,
+                        ..
+                    } => {
+                        if ctx.catalog.attribute_by_name(*rel, column).is_some()
+                            || is_system_column(column)
+                        {
+                            if found.is_some() {
+                                return None;
+                            }
+                            found = Some((schema.clone(), refname.clone()));
+                        }
+                    }
+                }
+            }
+            if found.is_some() {
+                return found;
+            }
+            level = scope.parent;
+        }
+        None
+    }
+
     /// The column `col` reads, or `None` when it isn't provably a plain
     /// column of a base table in this scope or a parent one.
     pub(crate) fn resolve(&self, ctx: &Ctx<'_>, col: &ColumnRef) -> Option<ResolvedColumn> {
@@ -425,23 +464,312 @@ fn builtin_type(catalog: &PgCatalog, t: crate::oid::PgTypeOid) -> bool {
 
 /// Whether `left = right`, between non-NULL operands of these types, is
 /// never NULL: the operator `=` resolves to is a built-in one whose
-/// function returns NULL only for a NULL argument, and both types are
-/// built-in (or domains over built-in ones). A user `=` — on a domain or a
-/// type of its own, or one the search path finds first — may return NULL
-/// for any input, where `x NOT IN (…)` and `NOT EXISTS (… x = y)` part.
+/// function returns NULL only for a NULL argument, both types are
+/// built-in (or domains over built-in ones), and the operator takes
+/// exactly those types (domains unwrapped), so PG coerces neither operand
+/// first. A user `=` — on a domain or a type of its own, or one the
+/// search path finds first — may return NULL for any input, and so may a
+/// user cast PG inserts before a built-in one: there `x NOT IN (…)` and
+/// `NOT EXISTS (… x = y)` part.
 pub(crate) fn builtin_strict_equality(
     catalog: &PgCatalog,
     left: crate::oid::PgTypeOid,
     right: crate::oid::PgTypeOid,
 ) -> bool {
-    builtin_type(catalog, left)
-        && builtin_type(catalog, right)
-        && catalog
-            .find_operator("=", Some(left), right)
-            .is_some_and(|op| {
-                op.oid.get() < FIRST_GENBKI_OBJECT_ID
-                    && op.code.is_some_and(|p| null_only_on_null_proc(catalog, p))
+    builtin_operator_exact(catalog, "=", left, right)
+        .is_some_and(|op| op.code.is_some_and(|p| null_only_on_null_proc(catalog, p)))
+}
+
+/// The built-in operator `name` resolves to between `left` and `right`
+/// (both built-in types or domains over them), when it takes exactly
+/// those types once domains are unwrapped: no coercion runs before it.
+fn builtin_operator_exact(
+    catalog: &PgCatalog,
+    name: &str,
+    left: crate::oid::PgTypeOid,
+    right: crate::oid::PgTypeOid,
+) -> Option<crate::lookup::ResolvedOperator> {
+    if !builtin_type(catalog, left) || !builtin_type(catalog, right) {
+        return None;
+    }
+    let op = catalog.find_operator(name, Some(left), right)?;
+    let declared = catalog.pg_operator.get(&op.oid)?;
+    (op.oid.get() < FIRST_GENBKI_OBJECT_ID
+        && declared.oprleft == Some(catalog.unwrap_domain(left))
+        && declared.oprright == catalog.unwrap_domain(right))
+    .then_some(op)
+}
+
+/// `unknown`: an untyped literal, which takes the other operand's type.
+const UNKNOWN: u32 = 705;
+
+/// The comparison operators [`cannot_error`] accepts.
+const COMPARISONS: &[&str] = &["=", "<>", "!=", "<", "<=", ">", ">="];
+
+/// What an operand of a comparison is, for [`cannot_error`]: its type, and
+/// its collation when it is a column.
+fn operand(
+    ctx: &Ctx<'_>,
+    node: &Node,
+    scope: &FromScope<'_>,
+) -> Option<(crate::oid::PgTypeOid, Option<crate::oid::PgCollationOid>)> {
+    use crate::oid::PgTypeOid;
+    use typedpg_pg_query::protobuf::a_const::Val;
+    match node.node.as_ref()? {
+        N::ColumnRef(c) => {
+            let r = scope.resolve(ctx, c)?;
+            let attr = ctx
+                .catalog
+                .attributes_of(r.rel)
+                .iter()
+                .find(|a| a.attnum == r.attnum)?;
+            Some((attr.atttypid, attr.attcollation))
+        }
+        N::AConst(c) if c.isnull => Some((PgTypeOid::from_raw(UNKNOWN), None)),
+        N::AConst(c) => Some((
+            PgTypeOid::from_raw(match c.val.as_ref()? {
+                Val::Ival(_) => 23,
+                Val::Fval(_) => 1700,
+                Val::Boolval(_) => 16,
+                Val::Sval(_) => UNKNOWN,
+                Val::Bsval(_) => return None,
+            }),
+            None,
+        )),
+        N::ParamRef(p) => {
+            let param = ctx
+                .analyzed
+                .params
+                .get(usize::try_from(p.number).ok()?.checked_sub(1)?)?;
+            let (schema, name) = match &param.pg_type {
+                crate::types::Type::Basic { schema, name, .. }
+                | crate::types::Type::Domain { schema, name, .. } => (schema, name),
+                _ => return None,
+            };
+            Some((
+                ctx.catalog.resolve_type_by_name(Some(schema), name)?.oid,
+                None,
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Whether evaluating `expr` in `scope` can never raise an error, whatever
+/// the rows: column references (not virtual generated ones), constants,
+/// parameters; AND / OR / NOT, IS [NOT] NULL, IS [NOT] TRUE / FALSE /
+/// UNKNOWN of such; and `= <> < <= > >=` between them through a built-in
+/// operator that takes exactly their types (no cast runs first), between
+/// columns of one collation. Anything else — a cast, arithmetic, a function
+/// call, a pattern match — may fail on some row.
+pub(crate) fn cannot_error(ctx: &Ctx<'_>, expr: &Node, scope: &FromScope<'_>) -> bool {
+    match expr.node.as_ref() {
+        Some(N::ColumnRef(c)) => scope.resolve(ctx, c).is_some_and(|r| {
+            ctx.catalog
+                .attributes_of(r.rel)
+                .iter()
+                .find(|a| a.attnum == r.attnum)
+                .is_some_and(|a| a.attgenerated != Some(crate::pg_catalog::AttGenerated::Virtual))
+        }),
+        Some(N::AConst(_) | N::ParamRef(_)) => true,
+        Some(N::BoolExpr(b)) => b.args.iter().all(|a| cannot_error(ctx, a, scope)),
+        Some(N::NullTest(t)) => t
+            .arg
+            .as_deref()
+            .is_some_and(|a| cannot_error(ctx, a, scope)),
+        Some(N::BooleanTest(t)) => t
+            .arg
+            .as_deref()
+            .is_some_and(|a| cannot_error(ctx, a, scope)),
+        Some(N::AExpr(e)) => {
+            let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) else {
+                return false;
+            };
+            let Some((None, op)) = name_parts(&e.name) else {
+                return false;
+            };
+            if e.kind() != AExprKind::AexprOp
+                || !COMPARISONS.contains(&op)
+                || !cannot_error(ctx, l, scope)
+                || !cannot_error(ctx, r, scope)
+            {
+                return false;
+            }
+            let (Some((lt, lc)), Some((rt, rc))) = (operand(ctx, l, scope), operand(ctx, r, scope))
+            else {
+                return false;
+            };
+            // An untyped literal takes the other side's type; its input
+            // function runs as the query is parsed, for both forms alike.
+            let (lt, rt) = match (lt.get() == UNKNOWN, rt.get() == UNKNOWN) {
+                (true, true) => return false,
+                (true, false) => (rt, rt),
+                (false, true) => (lt, lt),
+                (false, false) => (lt, rt),
+            };
+            let collations_agree = match (lc, rc) {
+                (Some(a), Some(b)) => a == b,
+                _ => true,
+            };
+            collations_agree && builtin_operator_exact(ctx.catalog, op, lt, rt).is_some()
+        }
+        _ => false,
+    }
+}
+
+/// Whether running `select` (a subquery, in `scope`'s level: [`FromScope::of_select`]
+/// of it) more or fewer times, or over rows it didn't reach before, can
+/// never raise an error: its FROM only reads stored tables (joined with ON
+/// conditions [`cannot_error`] accepts, in a single FROM item), and every
+/// expression of it — target list, WHERE, GROUP BY, HAVING, DISTINCT ON,
+/// ORDER BY — is one [`cannot_error`] accepts; LIMIT / OFFSET are
+/// non-negative integer constants. No WITH, window or set operation.
+pub(crate) fn error_free_select(ctx: &Ctx<'_>, select: &SelectStmt, scope: &FromScope<'_>) -> bool {
+    use typedpg_pg_query::protobuf::a_const::Val;
+    if select.op != typedpg_pg_query::protobuf::SetOperation::SetopNone as i32
+        || select.with_clause.is_some()
+        || !select.window_clause.is_empty()
+        || !select.values_lists.is_empty()
+        || !select.locking_clause.is_empty()
+    {
+        return false;
+    }
+    let ctes = cte_names(ctx);
+    let mut quals = Vec::new();
+    if !select
+        .from_clause
+        .iter()
+        .all(|f| reads_stored_tables(ctx, &ctes, f, &mut quals))
+        || (!quals.is_empty() && select.from_clause.len() != 1)
+    {
+        return false;
+    }
+    let ok = |n: &Node| cannot_error(ctx, n, scope);
+    let limit_ok = |n: Option<&Node>| match n.and_then(|n| n.node.as_ref()) {
+        None => true,
+        Some(N::AConst(c)) => c.isnull || matches!(&c.val, Some(Val::Ival(i)) if i.ival >= 0),
+        _ => false,
+    };
+    quals.into_iter().all(ok)
+        && select.target_list.iter().all(|t| match t.node.as_ref() {
+            Some(N::ResTarget(r)) => r.indirection.is_empty() && r.val.as_deref().is_some_and(ok),
+            _ => false,
+        })
+        && select.where_clause.as_deref().is_none_or(ok)
+        && select.group_clause.iter().all(ok)
+        && select.having_clause.as_deref().is_none_or(ok)
+        && select
+            .distinct_clause
+            .iter()
+            .all(|d| d.node.is_none() || ok(d))
+        && select.sort_clause.iter().all(|s| match s.node.as_ref() {
+            Some(N::SortBy(by)) => by.use_op.is_empty() && by.node.as_deref().is_some_and(ok),
+            _ => false,
+        })
+        && limit_ok(select.limit_count.as_deref())
+        && limit_ok(select.limit_offset.as_deref())
+}
+
+/// Whether a FROM item reads stored tables only (no function, subquery,
+/// CTE or view, no USING / NATURAL join, whose implicit equality may
+/// coerce), collecting its ON conditions.
+fn reads_stored_tables<'n>(
+    ctx: &Ctx<'_>,
+    ctes: &HashSet<String>,
+    from: &'n Node,
+    quals: &mut Vec<&'n Node>,
+) -> bool {
+    match from.node.as_ref() {
+        Some(N::RangeVar(rv)) => {
+            let schema = (!rv.schemaname.is_empty()).then_some(rv.schemaname.as_str());
+            !(schema.is_none() && ctes.contains(&rv.relname))
+                && ctx
+                    .catalog
+                    .resolve_table(schema, &rv.relname)
+                    .is_some_and(|c| stored_tree(ctx.catalog, c.oid))
+        }
+        Some(N::JoinExpr(j)) => {
+            if j.is_natural || !j.using_clause.is_empty() {
+                return false;
+            }
+            if let Some(q) = j.quals.as_deref() {
+                quals.push(q);
+            }
+            [&j.larg, &j.rarg].into_iter().all(|side| {
+                side.as_deref()
+                    .is_some_and(|s| reads_stored_tables(ctx, ctes, s, quals))
             })
+        }
+        _ => false,
+    }
+}
+
+/// `col` with the qualifier PG resolved it by: the alias (or name, with
+/// its schema when written) of the table it reads, so that, moved into
+/// another level, it can't be captured by a name that level adds. `None`
+/// when [`FromScope::resolve`] can't place it.
+pub(crate) fn qualified_column(
+    ctx: &Ctx<'_>,
+    col: &ColumnRef,
+    scope: &FromScope<'_>,
+) -> Option<ColumnRef> {
+    scope.resolve(ctx, col)?;
+    let fields: Vec<&str> = col
+        .fields
+        .iter()
+        .map(|f| match f.node.as_ref() {
+            Some(N::String(s)) => Some(s.sval.as_str()),
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+    if fields.len() > 1 {
+        return Some(col.clone());
+    }
+    let string = |s: &str| Node {
+        node: Some(N::String(typedpg_pg_query::protobuf::String {
+            sval: s.to_owned(),
+        })),
+    };
+    let (schema, refname) = scope.binding_item(ctx, fields[0])?;
+    let mut out: Vec<Node> = schema.iter().map(|s| string(s)).collect();
+    out.push(string(&refname));
+    out.push(string(fields[0]));
+    Some(ColumnRef {
+        fields: out,
+        location: col.location,
+    })
+}
+
+/// Whether the SQL as written uses a name starting with `prefix` (case
+/// insensitively): any identifier or string of its parse tree, decoded
+/// (`U&"\005F…"` is `_…`), and its raw text.
+pub(crate) fn written_names_use(ctx: &Ctx<'_>, prefix: &str) -> bool {
+    let sql = &ctx.analyzed.sql;
+    if sql.to_ascii_lowercase().contains(prefix) {
+        return true;
+    }
+    let Ok(parsed) = typedpg_pg_query::parse(sql) else {
+        return true;
+    };
+    let hit = |s: &str| s.to_ascii_lowercase().starts_with(prefix);
+    let alias_hit = |a: &Option<typedpg_pg_query::protobuf::Alias>| {
+        a.as_ref().is_some_and(|a| {
+            hit(&a.aliasname)
+                || a.colnames
+                    .iter()
+                    .any(|c| matches!(&c.node, Some(N::String(s)) if hit(&s.sval)))
+        })
+    };
+    parsed.protobuf.nodes().iter().any(|(n, _)| match n {
+        NodeRef::String(s) => hit(&s.sval),
+        NodeRef::RangeVar(r) => hit(&r.relname) || hit(&r.schemaname) || alias_hit(&r.alias),
+        NodeRef::RangeSubselect(r) => alias_hit(&r.alias),
+        NodeRef::RangeFunction(r) => alias_hit(&r.alias),
+        NodeRef::JoinExpr(j) => alias_hit(&j.alias) || alias_hit(&j.join_using_alias),
+        NodeRef::ResTarget(r) => hit(&r.name),
+        NodeRef::CommonTableExpr(c) => hit(&c.ctename),
+        _ => false,
+    })
 }
 
 /// The type of column `attnum` of `rel`.
