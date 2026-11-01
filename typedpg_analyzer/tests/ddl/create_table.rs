@@ -1535,6 +1535,7 @@ fn create_table_as_through_a_trivial_subquery_scan_takes_the_subquerys_planned_c
                    CREATE TABLE cq1 PARTITION OF cq FOR VALUES IN ('a') PARTITION BY LIST (b);
                    CREATE TABLE cr (b text COLLATE "C") PARTITION BY LIST (b);
                    CREATE TABLE cr1 PARTITION OF cr FOR VALUES IN ('a');
+                   CREATE TABLE u1 (id int PRIMARY KEY, b text COLLATE "C");
                    CREATE VIEW vp AS SELECT CASE WHEN 1 = 1 THEN 'x' ELSE c1.b END AS x FROM c1;
                    CREATE VIEW vs AS SELECT CASE WHEN 1 = 1 THEN 'x' ELSE c1.b END AS x
                                      FROM c1 OFFSET 0;"#;
@@ -1787,6 +1788,36 @@ fn create_table_as_through_a_trivial_subquery_scan_takes_the_subquerys_planned_c
         "SELECT x FROM (SELECT CASE WHEN true THEN b ELSE p END AS x FROM c4 OFFSET 0) s \
          ORDER BY 1"
             .into(),
+        // A key with no collation: no path of the subquery is sorted on
+        // it (an index's keys have the index's collation), whatever the
+        // indexes — a Sort, or an Incremental Sort, is above the scan.
+        "SELECT x FROM (SELECT CASE WHEN true THEN b ELSE p END AS x FROM c3 OFFSET 0) s \
+         ORDER BY 1"
+            .into(),
+        "SELECT x FROM (SELECT CASE WHEN true THEN b ELSE p END AS x FROM c3 OFFSET 0) s \
+         ORDER BY s.x DESC"
+            .into(),
+        "SELECT x FROM (SELECT CASE WHEN true THEN b ELSE p END AS x FROM c3 WHERE b > 'a' \
+         OFFSET 0) s ORDER BY x"
+            .into(),
+        "SELECT y, x FROM (SELECT b AS y, CASE WHEN true THEN b ELSE p END AS x FROM c3 \
+         OFFSET 0) s ORDER BY y, x"
+            .into(),
+        "SELECT x FROM (SELECT CASE WHEN true THEN c1.b ELSE c2.b END AS x \
+         FROM c1, c2, c3 OFFSET 0) s ORDER BY 1"
+            .into(),
+        // An outer join's nullable side `join_is_removable` can't drop:
+        // no unique index, one no clause equates, a column of it read
+        // above the join, or two tables.
+        format!("SELECT x FROM {s} LEFT JOIN c1 ON true"),
+        format!("SELECT x FROM {s} LEFT JOIN c1 ON false"),
+        format!("SELECT x FROM {s} LEFT JOIN cp ON true"),
+        format!("SELECT x FROM c1 RIGHT JOIN {s} ON true"),
+        format!("SELECT x FROM {s} LEFT JOIN u1 ON true"),
+        format!("SELECT x FROM {s} LEFT JOIN u1 ON u1.b = 'a'"),
+        format!("SELECT x, u1.b FROM {s} LEFT JOIN u1 ON u1.id = 1"),
+        format!("SELECT x FROM {s} LEFT JOIN u1 ON u1.id = 1 WHERE u1.b IS NULL"),
+        format!("SELECT x FROM {s} LEFT JOIN (c1 JOIN c2 ON true) ON true"),
         // Pulled up, s2 leaves the qual on s's scan.
         format!("SELECT x FROM (SELECT x, 1 AS k FROM {s}) s2 WHERE x IS NOT NULL"),
         // A partitioned table with no partition to scan is a dummy relation.
@@ -1844,6 +1875,10 @@ fn create_table_as_through_a_trivial_subquery_scan_takes_the_subquerys_planned_c
             .into(),
         // Pulled up, the dummy relation's Result has the folded CASE.
         "SELECT x FROM (SELECT CASE WHEN true THEN cp.b ELSE c2.b END AS x FROM cp, c2) s".into(),
+        // A nullable side proven unique (u1's key equated to a constant)
+        // and read nowhere above the join is removed, and so is the scan.
+        format!("SELECT x FROM {s} LEFT JOIN u1 ON u1.id = 1"),
+        format!("SELECT x FROM {s} LEFT JOIN u1 ON u1.id = 1 AND u1.b > 'a'"),
     ] {
         build_db(&[
             ("0001.sql", setup),

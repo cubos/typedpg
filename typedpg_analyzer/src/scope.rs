@@ -139,6 +139,13 @@ pub(crate) struct ScanFacts {
     /// child or join qual to sort on, nothing it sorts itself): an ORDER
     /// BY of the reading level puts a Sort above the scan.
     pub unsorted: bool,
+    /// Every sorted path of the subquery is sorted on collated keys (an
+    /// index's or a partition key's: the level is plain tables, with no
+    /// join qual to merge join on and nothing it sorts itself). A pathkey
+    /// matches only one of the same collation, so an ORDER BY of the
+    /// reading level on a Var with no collation puts a Sort above the
+    /// scan, whatever the indexes.
+    pub collated_sorts: bool,
 }
 
 /// An output that is a Var of a SubqueryScan (see
