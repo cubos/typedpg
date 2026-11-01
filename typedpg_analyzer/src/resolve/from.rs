@@ -1266,7 +1266,18 @@ fn process_join_expr(
         });
         // Not when a column of it is read above the join, nor a table the
         // join can't prove unique (see `join_may_prove_unique`).
+        // An inner join of two tables or more is never removed.
+        let side_node = match join_type {
+            JoinType::JoinLeft => join.rarg.as_deref(),
+            JoinType::JoinRight => join.larg.as_deref(),
+            _ => None,
+        };
+        let joined_side = side_node.is_some_and(|n| {
+            expr::plan_fold::inner_join_tables(n, snapshot, &|name| scope.ctes.contains_key(name))
+                > 0
+        });
         let removable: Vec<String> = if !semijoin_below
+            && !joined_side
             && nullable_side.iter().any(|s| {
                 expr::plan_fold::may_be_removed(s, snapshot)
                     && (!matches!(s.kind, crate::scope::SourceKind::Relation)

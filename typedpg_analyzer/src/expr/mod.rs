@@ -1201,102 +1201,19 @@ fn reads_only_available(sub: &protobuf::SubLink, ctx: Ctx<'_>, available: &[Stri
             }
         }
     }
-    let Some(query) = sub.subselect.as_deref().and_then(|s| s.node.as_ref()) else {
-        return false;
+    let other_alias = |t: &str| others.iter().any(|s| s.alias == t);
+    let other_column = |c: &str| {
+        others
+            .iter()
+            .any(|s| s.visible_columns().any(|v| v.name == c))
     };
-    let node::Node::SelectStmt(sel) = query else {
-        return false;
-    };
-    // The query's own FROM items, and the columns of its tables (`None`
-    // when one of them isn't a table the catalog tells the columns of).
-    let mut aliases: Vec<&str> = Vec::new();
-    let mut columns: Option<Vec<String>> = Some(Vec::new());
-    let cte_names: Vec<&str> = sel
-        .with_clause
-        .iter()
-        .flat_map(|w| &w.ctes)
-        .filter_map(|c| match c.node.as_ref() {
-            Some(node::Node::CommonTableExpr(c)) => Some(c.ctename.as_str()),
-            _ => None,
-        })
-        .collect();
-    let mut todo: Vec<&protobuf::Node> = sel.from_clause.iter().collect();
-    while let Some(f) = todo.pop() {
-        match f.node.as_ref() {
-            Some(node::Node::RangeVar(rv)) => {
-                aliases.push(
-                    rv.alias
-                        .as_ref()
-                        .map_or(rv.relname.as_str(), |a| &a.aliasname),
-                );
-                let schema = (!rv.schemaname.is_empty()).then_some(rv.schemaname.as_str());
-                let cte = schema.is_none()
-                    && (cte_names.contains(&rv.relname.as_str())
-                        || ctx.scope.ctes.contains_key(&rv.relname));
-                match ctx.snapshot.resolve_table(schema, &rv.relname) {
-                    Some(class)
-                        if !cte && rv.alias.as_ref().is_none_or(|a| a.colnames.is_empty()) =>
-                    {
-                        if let Some(cols) = columns.as_mut() {
-                            cols.extend(
-                                ctx.snapshot
-                                    .attributes_of(class.oid)
-                                    .iter()
-                                    .filter(|a| a.attnum > 0)
-                                    .map(|a| a.attname.clone()),
-                            );
-                        }
-                    }
-                    _ => columns = None,
-                }
-            }
-            Some(node::Node::RangeSubselect(r)) => {
-                aliases.extend(r.alias.as_ref().map(|a| a.aliasname.as_str()));
-                columns = None;
-            }
-            Some(node::Node::RangeFunction(r)) => {
-                aliases.extend(r.alias.as_ref().map(|a| a.aliasname.as_str()));
-                columns = None;
-            }
-            Some(node::Node::JoinExpr(j)) => {
-                if j.alias.is_some()
-                    || j.join_using_alias.is_some()
-                    || !j.using_clause.is_empty()
-                    || j.is_natural
-                {
-                    columns = None;
-                }
-                aliases.extend(j.alias.as_ref().map(|a| a.aliasname.as_str()));
-                todo.extend(j.larg.as_deref());
-                todo.extend(j.rarg.as_deref());
-            }
-            _ => columns = None,
-        }
-    }
-    let own_column = |c: &str| {
-        columns
-            .as_ref()
-            .is_some_and(|cols| cols.iter().any(|n| n == c))
-    };
-    let other_alias = |t: &str| !aliases.contains(&t) && others.iter().any(|s| s.alias == t);
-    query.nodes().into_iter().all(|(n, _)| match n {
-        typedpg_pg_query::NodeRef::ColumnRef(cr) => {
-            let parts = extract_string_fields(&cr.fields);
-            match parts.as_slice() {
-                // A column, or a whole-row reference.
-                [c] if parts.len() == cr.fields.len() => {
-                    own_column(c)
-                        || !(other_alias(c)
-                            || others
-                                .iter()
-                                .any(|s| s.visible_columns().any(|v| &v.name == c)))
-                }
-                [] => true,
-                [t, ..] => !other_alias(t),
-            }
-        }
-        _ => true,
-    })
+    plan_fold::subquery_reads_only(
+        sub,
+        ctx.snapshot,
+        &|name| ctx.scope.ctes.contains_key(name),
+        &other_alias,
+        &other_column,
+    )
 }
 
 /// Whether `arg`, an argument of the AND being inferred, is a sublink
