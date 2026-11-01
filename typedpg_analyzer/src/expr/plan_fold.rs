@@ -402,14 +402,46 @@ thread_local! {
     /// alike (reading only the join's sides, which is all the ON clause
     /// sees).
     static WHERE_ROOT: Cell<*const protobuf::Node> = const { Cell::new(std::ptr::null()) };
+    /// The FROM items (by alias) a sublink of [`WHERE_ROOT`] may read to
+    /// be pulled up, when that is the ON clause of a join a semi-join
+    /// below it joins only part of (see [`with_nullable_on_clause`]);
+    /// `None` for any of the level's.
+    static AVAILABLE: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
 }
 
 /// Run `f`, the analysis of WHERE clause `n` (or of such an ON clause).
 pub(crate) fn with_where_clause<R>(n: &protobuf::Node, f: impl FnOnce() -> R) -> R {
+    with_root(n, None, f)
+}
+
+/// Run `f`, the analysis of ON clause `n` of a join whose sublinks
+/// `pull_up_sublinks` turns into semi-joins on the nullable side of an
+/// outer join (`pull_up_sublinks_qual_recurse`): a LEFT (RIGHT) join's,
+/// into its right (left) side — those reading only the FROM items
+/// `available` of that side — or an inner join's below the nullable side
+/// of one, into the join (`available`, its two sides).
+pub(crate) fn with_nullable_on_clause<R>(
+    n: &protobuf::Node,
+    available: Vec<String>,
+    f: impl FnOnce() -> R,
+) -> R {
+    with_root(n, Some(available), f)
+}
+
+fn with_root<R>(n: &protobuf::Node, available: Option<Vec<String>>, f: impl FnOnce() -> R) -> R {
     let prev = WHERE_ROOT.with(|w| w.replace(std::ptr::from_ref(n)));
+    let prev_available = AVAILABLE.with(|a| a.replace(available));
     let out = f();
     WHERE_ROOT.with(|w| w.set(prev));
+    AVAILABLE.with(|a| *a.borrow_mut() = prev_available);
     out
+}
+
+/// The FROM items a sublink of the clause [`is_where_clause`] tells of
+/// may read to be pulled up, when not any of the level's (see
+/// [`with_nullable_on_clause`]).
+pub(crate) fn where_available() -> Option<Vec<String>> {
+    AVAILABLE.with(|a| a.borrow().clone())
 }
 
 /// Whether `n` is the WHERE clause being analyzed.
@@ -1643,11 +1675,15 @@ impl Group {
     /// (`relation_excluded_by_constraints`); with several, it is a gating
     /// qual above their join, and each is still estimated.
     fn may_be_empty(&self, rels: usize, snapshot: &PgCatalog) -> Proven {
+        // An outer join's ON qual (or one below its nullable side) is
+        // attached to that join (`distribute_qual_to_rels`, `ojscope`):
+        // a constant there gates the join, never the level's relations.
+        let level_wide = |owner: &Owner, top: bool| top || matches!(owner, Owner::SemiJoin);
         let constant = self.unknown_quals
-            || (self.substitutes && !self.quals.is_empty())
-            || self.quals.iter().any(|(q, _, _)| {
+            || (self.substitutes && self.quals.iter().any(|(_, o, top)| level_wide(o, *top)))
+            || self.quals.iter().any(|(q, o, top)| {
                 let folded = fold_qual(q, snapshot);
-                folded.may_be_const() && folded != Folded::Bool(true)
+                level_wide(o, *top) && folded.may_be_const() && folded != Folded::Bool(true)
             });
         let column_quals: Vec<(&protobuf::Node, &Owner, bool)> = self
             .quals

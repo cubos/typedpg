@@ -1128,18 +1128,28 @@ fn where_conjunction(chain: &[*const protobuf::Node]) -> bool {
 /// becomes a semi-join (see [`plan_fold::joined_any_sublink`]), in the
 /// scope of `ctx`.
 fn joined_sublink(sub: &protobuf::SubLink, ctx: Ctx<'_>) -> bool {
-    plan_fold::joined_any_sublink(sub, ctx.snapshot, &|cr| level_column(cr, ctx))
+    let available = plan_fold::where_available();
+    plan_fold::joined_any_sublink(sub, ctx.snapshot, &|cr| {
+        level_column(cr, ctx, available.as_deref())
+    }) && available
+        .as_deref()
+        .is_none_or(|a| reads_only_available(sub, ctx, a))
 }
 
 /// [`joined_sublink`] for an EXISTS (see
 /// [`plan_fold::joined_exists_sublink`]).
 fn joined_exists(sub: &protobuf::SubLink, ctx: Ctx<'_>) -> bool {
-    plan_fold::joined_exists_sublink(sub, ctx.snapshot, &|cr| level_column(cr, ctx))
+    let available = plan_fold::where_available();
+    plan_fold::joined_exists_sublink(sub, ctx.snapshot, &|cr| {
+        level_column(cr, ctx, available.as_deref())
+    }) && available
+        .as_deref()
+        .is_none_or(|a| reads_only_available(sub, ctx, a))
 }
 
 /// Whether column `cr` is one of the level's FROM items (in the scope
-/// of `ctx`).
-fn level_column(cr: &protobuf::ColumnRef, ctx: Ctx<'_>) -> bool {
+/// of `ctx`) — one of `available` when given.
+fn level_column(cr: &protobuf::ColumnRef, ctx: Ctx<'_>, available: Option<&[String]>) -> bool {
     let parts = extract_string_fields(&cr.fields);
     let (table, column) = match parts.as_slice() {
         [c] if parts.len() == cr.fields.len() => (None, c.as_str()),
@@ -1148,7 +1158,145 @@ fn level_column(cr: &protobuf::ColumnRef, ctx: Ctx<'_>) -> bool {
     };
     ctx.scope
         .resolve_column(table, column, None)
-        .is_ok_and(|c| ctx.scope.sources.iter().any(|s| s.alias == c.table_alias))
+        .is_ok_and(|c| {
+            ctx.scope.sources.iter().any(|s| s.alias == c.table_alias)
+                && available.is_none_or(|a| a.contains(&c.table_alias))
+        })
+}
+
+/// Whether sublink `sub` certainly reads none of the level's FROM items
+/// but `available` — neither in its tested expression nor in its query:
+/// `convert_ANY_sublink_to_join` and `convert_EXISTS_sublink_to_join`
+/// pull up only a sublink whose references to the level are a subset of
+/// the relations available where it is (`available_rels`). In its query,
+/// a column may be told the query's own when it is qualified by a FROM
+/// item of the query's, or (unqualified) a column of one of its tables;
+/// any other naming one of the level's other items may be one of theirs.
+fn reads_only_available(sub: &protobuf::SubLink, ctx: Ctx<'_>, available: &[String]) -> bool {
+    let others: Vec<&crate::scope::TableSource> = ctx
+        .scope
+        .sources
+        .iter()
+        .filter(|s| !available.contains(&s.alias))
+        .collect();
+    if let Some(test) = sub.testexpr.as_deref().and_then(|t| t.node.as_ref()) {
+        for (n, _) in test.nodes() {
+            match n {
+                // Its columns may be the level's too.
+                typedpg_pg_query::NodeRef::SubLink(_) => return false,
+                typedpg_pg_query::NodeRef::ColumnRef(cr) => {
+                    let parts = extract_string_fields(&cr.fields);
+                    let (table, column) = match parts.as_slice() {
+                        [c] if parts.len() == cr.fields.len() => (None, c.as_str()),
+                        [t, c] if parts.len() == cr.fields.len() => (Some(t.as_str()), c.as_str()),
+                        _ => return false,
+                    };
+                    match ctx.scope.resolve_column(table, column, None) {
+                        Ok(c) if others.iter().any(|s| s.alias == c.table_alias) => return false,
+                        Ok(_) => {}
+                        Err(_) => return false,
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let Some(query) = sub.subselect.as_deref().and_then(|s| s.node.as_ref()) else {
+        return false;
+    };
+    let node::Node::SelectStmt(sel) = query else {
+        return false;
+    };
+    // The query's own FROM items, and the columns of its tables (`None`
+    // when one of them isn't a table the catalog tells the columns of).
+    let mut aliases: Vec<&str> = Vec::new();
+    let mut columns: Option<Vec<String>> = Some(Vec::new());
+    let cte_names: Vec<&str> = sel
+        .with_clause
+        .iter()
+        .flat_map(|w| &w.ctes)
+        .filter_map(|c| match c.node.as_ref() {
+            Some(node::Node::CommonTableExpr(c)) => Some(c.ctename.as_str()),
+            _ => None,
+        })
+        .collect();
+    let mut todo: Vec<&protobuf::Node> = sel.from_clause.iter().collect();
+    while let Some(f) = todo.pop() {
+        match f.node.as_ref() {
+            Some(node::Node::RangeVar(rv)) => {
+                aliases.push(
+                    rv.alias
+                        .as_ref()
+                        .map_or(rv.relname.as_str(), |a| &a.aliasname),
+                );
+                let schema = (!rv.schemaname.is_empty()).then_some(rv.schemaname.as_str());
+                let cte = schema.is_none()
+                    && (cte_names.contains(&rv.relname.as_str())
+                        || ctx.scope.ctes.contains_key(&rv.relname));
+                match ctx.snapshot.resolve_table(schema, &rv.relname) {
+                    Some(class)
+                        if !cte && rv.alias.as_ref().is_none_or(|a| a.colnames.is_empty()) =>
+                    {
+                        if let Some(cols) = columns.as_mut() {
+                            cols.extend(
+                                ctx.snapshot
+                                    .attributes_of(class.oid)
+                                    .iter()
+                                    .filter(|a| a.attnum > 0)
+                                    .map(|a| a.attname.clone()),
+                            );
+                        }
+                    }
+                    _ => columns = None,
+                }
+            }
+            Some(node::Node::RangeSubselect(r)) => {
+                aliases.extend(r.alias.as_ref().map(|a| a.aliasname.as_str()));
+                columns = None;
+            }
+            Some(node::Node::RangeFunction(r)) => {
+                aliases.extend(r.alias.as_ref().map(|a| a.aliasname.as_str()));
+                columns = None;
+            }
+            Some(node::Node::JoinExpr(j)) => {
+                if j.alias.is_some()
+                    || j.join_using_alias.is_some()
+                    || !j.using_clause.is_empty()
+                    || j.is_natural
+                {
+                    columns = None;
+                }
+                aliases.extend(j.alias.as_ref().map(|a| a.aliasname.as_str()));
+                todo.extend(j.larg.as_deref());
+                todo.extend(j.rarg.as_deref());
+            }
+            _ => columns = None,
+        }
+    }
+    let own_column = |c: &str| {
+        columns
+            .as_ref()
+            .is_some_and(|cols| cols.iter().any(|n| n == c))
+    };
+    let other_alias = |t: &str| !aliases.contains(&t) && others.iter().any(|s| s.alias == t);
+    query.nodes().into_iter().all(|(n, _)| match n {
+        typedpg_pg_query::NodeRef::ColumnRef(cr) => {
+            let parts = extract_string_fields(&cr.fields);
+            match parts.as_slice() {
+                // A column, or a whole-row reference.
+                [c] if parts.len() == cr.fields.len() => {
+                    own_column(c)
+                        || !(other_alias(c)
+                            || others
+                                .iter()
+                                .any(|s| s.visible_columns().any(|v| &v.name == c)))
+                }
+                [] => true,
+                [t, ..] => !other_alias(t),
+            }
+        }
+        _ => true,
+    })
 }
 
 /// Whether `arg`, an argument of the AND being inferred, is a sublink
@@ -1159,6 +1307,28 @@ pub(crate) fn joined_before_folding(arg: &protobuf::Node, ctx: Ctx<'_>) -> bool 
         where_conjunction(&level_enclosing())
             && (joined_sublink(sub, ctx) || joined_exists(sub, ctx))
     })
+}
+
+/// Whether `pull_up_sublinks` turns a sublink that is a top-level AND
+/// argument of `quals`, the clause [`plan_fold::is_where_clause`] tells
+/// of (an ON clause, see [`plan_fold::with_nullable_on_clause`]), into a
+/// semi-join, in the scope of `ctx`.
+pub(crate) fn pulls_up_sublink(quals: &protobuf::Node, ctx: Ctx<'_>) -> bool {
+    let and = protobuf::BoolExprType::AndExpr as i32;
+    let mut todo = vec![quals];
+    while let Some(q) = todo.pop() {
+        match q.node.as_ref() {
+            Some(node::Node::BoolExpr(b)) if b.boolop == and => todo.extend(&b.args),
+            _ => {
+                if plan_fold::conjunct_sublink(q)
+                    .is_some_and(|sub| joined_sublink(sub, ctx) || joined_exists(sub, ctx))
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// How the planner plans `sel`, the subquery of a sublink being analyzed
@@ -1200,15 +1370,24 @@ pub(crate) fn semijoin_level(
     {
         return None;
     }
+    // Below the nullable side of an outer join (see
+    // `plan_fold::with_nullable_on_clause`), the semi-join is part of
+    // that side, whose relations nothing of the level proves empty: its
+    // query's quals tell of its own relations alone.
+    let pulled_up = if plan_fold::where_available().is_some() {
+        plan_fold::NextLevel::PulledUpNullable
+    } else {
+        plan_fold::NextLevel::PulledUp
+    };
     // An EXISTS's FROM items join the level, its WHERE their qual.
     if joined_exists(sub, ctx) {
-        return Some(plan_fold::NextLevel::PulledUp);
+        return Some(pulled_up);
     }
     if !joined_sublink(sub, ctx) {
         return None;
     }
     match crate::resolve::plan_of(sel, ctx.snapshot) {
-        crate::resolve::Plan::PulledUp => Some(plan_fold::NextLevel::PulledUp),
+        crate::resolve::Plan::PulledUp => Some(pulled_up),
         crate::resolve::Plan::Separate if !plan_fold::level_may_be_empty() => {
             Some(plan_fold::NextLevel::Separate {
                 pushed_down: sel.limit_count.is_none() && sel.limit_offset.is_none(),
