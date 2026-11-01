@@ -1544,3 +1544,99 @@ fn partition_foreign_key_clone_names() {
     .unwrap();
     assert_eq!(fk_names(&db, "p1c"), s(&["f"]));
 }
+
+/// A partition detached from a table whose foreign key references a
+/// partitioned table keeps the key as its own, and gets its own rows for
+/// the referenced partitions (DetachPartitionFinalize →
+/// addFkRecurseReferenced), named as PG 18.6 names them; its own
+/// partitions' keys still derive from it.
+#[test]
+fn detached_partition_gets_its_own_referenced_partition_rows() {
+    use typedpg_analyzer::ConType;
+    let rows = |db: &PgCatalog, table: &str| -> Vec<(String, String, bool, i16)> {
+        let mut rows: Vec<_> = db
+            .constraints_of_table(table)
+            .into_iter()
+            .filter(|c| c.contype == ConType::ForeignKey)
+            .map(|c| {
+                let target = c
+                    .confrelid
+                    .and_then(|r| db.pg_class().get(&r))
+                    .map(|r| r.relname.clone())
+                    .unwrap_or_default();
+                (c.conname, target, c.conislocal, c.coninhcount)
+            })
+            .collect();
+        rows.sort();
+        rows
+    };
+    let row = |name: &str, target: &str, local: bool, inh: i16| {
+        (name.to_owned(), target.to_owned(), local, inh)
+    };
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE r (id int PRIMARY KEY) PARTITION BY RANGE (id);
+         CREATE TABLE r1 PARTITION OF r FOR VALUES FROM (0) TO (10);
+         CREATE TABLE t (a int) PARTITION BY RANGE (a);
+         CREATE TABLE t2 (a int);
+         ALTER TABLE t ATTACH PARTITION t2 FOR VALUES FROM (10) TO (20);
+         ALTER TABLE t ADD CONSTRAINT f FOREIGN KEY (a) REFERENCES r;
+         ALTER TABLE t DETACH PARTITION t2;
+         -- Two levels of referenced partitions.
+         CREATE TABLE rr (id int PRIMARY KEY) PARTITION BY RANGE (id);
+         CREATE TABLE rr1 PARTITION OF rr FOR VALUES FROM (0) TO (10) PARTITION BY RANGE (id);
+         CREATE TABLE rr11 PARTITION OF rr1 FOR VALUES FROM (0) TO (5);
+         CREATE TABLE rr12 PARTITION OF rr1 FOR VALUES FROM (5) TO (10);
+         CREATE TABLE u (a int) PARTITION BY RANGE (a);
+         CREATE TABLE u2 (a int);
+         ALTER TABLE u ATTACH PARTITION u2 FOR VALUES FROM (10) TO (20);
+         ALTER TABLE u ADD CONSTRAINT g FOREIGN KEY (a) REFERENCES rr;
+         ALTER TABLE u DETACH PARTITION u2;
+         -- A partitioned partition: only it gets rows of its own.
+         CREATE TABLE v (a int) PARTITION BY RANGE (a);
+         CREATE TABLE v2 (a int) PARTITION BY RANGE (a);
+         CREATE TABLE v21 PARTITION OF v2 FOR VALUES FROM (10) TO (15);
+         ALTER TABLE v ATTACH PARTITION v2 FOR VALUES FROM (10) TO (20);
+         ALTER TABLE v ADD CONSTRAINT h FOREIGN KEY (a) REFERENCES r;
+         ALTER TABLE v DETACH PARTITION v2;",
+    )]);
+    assert_eq!(
+        rows(&db, "t"),
+        vec![row("f", "r", true, 0), row("f_1", "r1", false, 1)]
+    );
+    assert_eq!(
+        rows(&db, "t2"),
+        vec![row("f", "r", true, 0), row("f_2", "r1", false, 1)]
+    );
+    assert_eq!(
+        rows(&db, "u2"),
+        vec![
+            row("g", "rr", true, 0),
+            row("g_4", "rr1", false, 1),
+            row("g_5", "rr11", false, 1),
+            row("g_6", "rr12", false, 1),
+        ]
+    );
+    assert_eq!(
+        rows(&db, "v2"),
+        vec![row("h", "r", true, 0), row("h_2", "r1", false, 1)]
+    );
+    assert_eq!(rows(&db, "v21"), vec![row("h", "r", false, 1)]);
+    // The rows are found by name, and go with the key.
+    for (stmt, msg) in [
+        (
+            "ALTER TABLE t2 DROP CONSTRAINT f_2;",
+            "cannot drop inherited constraint \"f_2\" of relation \"t2\"",
+        ),
+        (
+            "BEGIN; SET CONSTRAINTS g_4 DEFERRED;",
+            "constraint \"g_4\" is not deferrable",
+        ),
+    ] {
+        let err = db.apply_sql(stmt).unwrap_err().to_string();
+        assert!(err.starts_with(msg), "{stmt}\n  got: {err}");
+        db.apply_sql("ROLLBACK;").unwrap();
+    }
+    db.apply_sql("ALTER TABLE t2 DROP CONSTRAINT f;").unwrap();
+    assert_eq!(rows(&db, "t2"), Vec::new());
+}

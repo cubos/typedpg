@@ -803,7 +803,11 @@ pub(super) fn clone_parent_fks(
 /// DetachPartitionFinalize: the partition's inherited foreign keys become
 /// its own, and the rows derived for it as a referenced partition go (with
 /// those derived from them).
-pub(super) fn detach_fks(interp: &mut PgCatalog, parent: PgClassOid, part: PgClassOid) {
+pub(super) fn detach_fks(
+    interp: &mut PgCatalog,
+    parent: PgClassOid,
+    part: PgClassOid,
+) -> Result<(), DdlError> {
     let referenced: Vec<PgConstraintOid> = interp
         .pg_constraint
         .values()
@@ -823,15 +827,26 @@ pub(super) fn detach_fks(interp: &mut PgCatalog, parent: PgClassOid, part: PgCla
         .filter(|c| fk_parent(interp, c.oid).is_some_and(|p| p.conrelid == parent))
         .map(|c| c.oid)
         .collect();
-    for oid in inherited {
-        if let Some(row) = interp.pg_constraint.get_mut(&oid) {
+    for oid in &inherited {
+        if let Some(row) = interp.pg_constraint.get_mut(oid) {
             row.conislocal = true;
             row.coninhcount = 0;
         }
-        if let Some(d) = interp.fk_details.get_mut(&oid) {
+        if let Some(d) = interp.fk_details.get_mut(oid) {
             d.parent = None;
         }
     }
+    // DetachPartitionFinalize: a key now standalone that references a
+    // partitioned table gets its own rows for the referenced partitions
+    // (addFkRecurseReferenced) — the parent's stay with the parent. Its
+    // own partitions' keys still derive from it, and need none.
+    for oid in inherited {
+        let Some(name) = interp.pg_constraint.get(&oid).map(|c| c.conname.clone()) else {
+            continue;
+        };
+        recurse_referenced(interp, oid, &name)?;
+    }
+    Ok(())
 }
 
 /// A partitioned table's foreign key goes with the clones in its

@@ -496,7 +496,7 @@ pub(super) fn detach_partition(
     } else {
         None
     };
-    super::foreign_keys::detach_fks(interp, parent, part);
+    super::foreign_keys::detach_fks(interp, parent, part)?;
     remove_inheritance(interp, part, parent, "partition")?;
     super::partidx::detach_partition_indexes(interp, part);
     crate::ddl::triggers::drop_cloned_triggers(interp, part);
