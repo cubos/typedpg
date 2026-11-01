@@ -79,11 +79,22 @@ fn with_nullable_side<R>(
                     if crate::expr::extract_string_fields(&e.name).last().is_some_and(|o| o == "="))
                 })
             });
+    // A column of it read above the join keeps the join.
+    let alias = match arg.node.as_ref() {
+        Some(node::Node::RangeSubselect(s)) => s.alias.as_ref().map(|a| a.aliasname.as_str()),
+        Some(node::Node::RangeVar(rv)) => Some(
+            rv.alias
+                .as_ref()
+                .map_or(rv.relname.as_str(), |a| a.aliasname.as_str()),
+        ),
+        _ => None,
+    };
     let alone = equates
         && matches!(
             arg.node,
             Some(node::Node::RangeSubselect(_) | node::Node::RangeVar(_))
-        );
+        )
+        && !alias.is_some_and(|a| crate::expr::plan_fold::read_above(a, join));
     let before = REMOVABLE_SIDE.with(|k| k.replace(alone));
     let out = f();
     REMOVABLE_SIDE.with(|k| k.set(before));
@@ -124,7 +135,8 @@ fn rows_kept() -> bool {
     ROWS_KEPT.with(|k| k.get())
 }
 
-fn with_rows_kept<R>(kept: bool, f: impl FnOnce() -> R) -> R {
+/// Run `f`, processing a FROM item never null-extended when `kept`.
+pub(crate) fn with_rows_kept<R>(kept: bool, f: impl FnOnce() -> R) -> R {
     let before = ROWS_KEPT.with(|k| k.replace(kept));
     let out = f();
     ROWS_KEPT.with(|k| k.set(before));
@@ -184,6 +196,17 @@ pub(crate) fn process_from_item(
                         })
                         .collect()
                 };
+                // An inlined CTE's outputs replace a reference to them only
+                // where it is never null-extended (a PlaceHolderVar wraps
+                // them elsewhere).
+                if !rows_kept() {
+                    for c in &mut cte_cols {
+                        if c.deferred.substitution == crate::scope::Substitution::Certain {
+                            c.deferred.substitution = crate::scope::Substitution::Maybe;
+                            c.deferred.expr = None;
+                        }
+                    }
+                }
                 // Each reference scans the CTE's rows anew.
                 let mut cte_cols = realias(cte_cols);
                 fresh_scans(&mut cte_cols);
@@ -1190,21 +1213,37 @@ fn process_join_expr(
             JoinType::JoinRight => left.sources(scope),
             _ => &[],
         };
+        // Not when a column of it is read above the join.
         let removable: Vec<String> = if nullable_side
             .iter()
             .any(|s| expr::plan_fold::may_be_removed(s, snapshot))
+            && !nullable_side
+                .iter()
+                .any(|s| expr::plan_fold::read_above(&s.alias, join))
         {
             nullable_side.iter().map(|s| s.alias.clone()).collect()
         } else {
             Vec::new()
         };
+        // `pull_up_sublinks` turns the IN / EXISTS sublinks of an inner
+        // join's ON clause reading the join's sides into semi-joins above
+        // it, like a WHERE clause's — this level's, when the join is never
+        // null-extended (see `plan_fold::Group::walk`).
+        let pulls_up = join_type == JoinType::JoinInner && kept;
         expr::plan_fold::skip_restrictions_on(removable, || {
-            crate::clause::coerce_clause_expr(
-                quals,
-                expr::Ctx::new(&on_scope, null_ctx, snapshot).logging_strictness(&log),
-                params,
-                crate::clause::ClauseKind::JoinOn,
-            )
+            let mut coerce = || {
+                crate::clause::coerce_clause_expr(
+                    quals,
+                    expr::Ctx::new(&on_scope, null_ctx, snapshot).logging_strictness(&log),
+                    params,
+                    crate::clause::ClauseKind::JoinOn,
+                )
+            };
+            if pulls_up {
+                expr::plan_fold::with_where_clause(quals, coerce)
+            } else {
+                coerce()
+            }
         })?;
         check_no_srf_in_clause(quals, snapshot, "JOIN conditions")?;
         on_facts = crate::nonnull::nonnullable(quals, true, &on_scope, &log, snapshot);

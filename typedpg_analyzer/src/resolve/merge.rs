@@ -67,7 +67,12 @@ pub(crate) fn analyze_merge_with_outer_ctes(
         if with.recursive {
             return Err(crate::pgmsg::merge_with_recursive().finalize_implicit());
         }
-        cte_scopes = analyze_with_clause(with, snapshot, params, &cte_scopes, &[])?;
+        let owner = protobuf::Node {
+            node: Some(node::Node::MergeStmt(Box::new(merge.clone()))),
+        };
+        cte_scopes = super::cte::with_statement_owner(with, owner, || {
+            analyze_with_clause(with, snapshot, params, &cte_scopes, &[])
+        })?;
     }
 
     check_unreachable_when_clauses(&merge.merge_when_clauses)?;
@@ -137,14 +142,22 @@ pub(crate) fn analyze_merge_with_outer_ctes(
     source_scope.shadowed_sources = target_scope.sources.clone();
     let target_entries = source_scope.shadowed_sources.len();
     if let Some(source_relation) = &merge.source_relation {
-        process_from_item(
-            source_relation,
-            &mut source_scope,
-            &mut null_ctx,
-            snapshot,
-            &cte_scopes,
-            params,
-        )?;
+        // transform_MERGE_to_join: the source is null-extended only for a
+        // NOT MATCHED BY SOURCE action (a LEFT or FULL join).
+        let kept = !merge.merge_when_clauses.iter().any(|w| {
+            matches!(w.node.as_ref(), Some(node::Node::MergeWhenClause(w))
+                if w.match_kind == protobuf::MergeMatchKind::MergeWhenNotMatchedBySource as i32)
+        });
+        super::from::with_rows_kept(kept, || {
+            process_from_item(
+                source_relation,
+                &mut source_scope,
+                &mut null_ctx,
+                snapshot,
+                &cte_scopes,
+                params,
+            )
+        })?;
         // transformMergeStmt: the target and the source RTE may not share a
         // name (a dedicated checkNameSpaceConflicts, 42712).
         if from_item_refname(source_relation).as_deref() == Some(target_alias.as_str()) {
@@ -647,6 +660,7 @@ fn merge_when_insert(
             {
                 return Err(err);
             }
+            super::deferred::record_read(val, ctx.scope);
             if !discards(tc)
                 && let Some(err) = crate::typmod::check_literal_assignment(
                     snapshot,

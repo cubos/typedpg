@@ -365,9 +365,21 @@ pub(crate) fn analyze_cte(
             min_one_row = summary.min_one_row;
             resolve_unknown_outputs(sel, &mut cols, params, snapshot)?;
             let cols = apply_cte_column_aliases(&cte.ctename, cols, &cte.aliascolnames)?;
-            cols.into_iter()
+            let mut columns: Vec<ScopeColumn> = cols
+                .into_iter()
                 .map(|c| to_scope(c, summary.removable_scan))
-                .collect()
+                .collect();
+            // Inlined and pulled up, its outputs replace the references to
+            // them, like a FROM subquery's (`resolve::deferred`) — where a
+            // reference is never null-extended (see `from`).
+            if pulled_up {
+                let mut exprs = super::deferred::output_exprs(sel).into_iter();
+                for c in &mut columns {
+                    c.deferred.substitution = crate::scope::Substitution::Certain;
+                    c.deferred.expr = exprs.next().flatten();
+                }
+            }
+            columns
         }
         node::Node::InsertStmt(_)
         | node::Node::UpdateStmt(_)
@@ -893,24 +905,115 @@ pub(crate) fn with_clause_owner<R>(sel: &protobuf::SelectStmt, f: impl FnOnce() 
     let Some(with) = sel.with_clause.as_ref() else {
         return f();
     };
-    let key = std::ptr::from_ref(with) as usize;
     let owner = protobuf::Node {
         node: Some(node::Node::SelectStmt(Box::new(sel.clone()))),
     };
+    with_statement_owner(with, owner, f)
+}
+
+/// [`with_clause_owner`] for `owner` (a copy of the statement), any
+/// statement owning WITH clause `with` (SELECT, INSERT, UPDATE, DELETE,
+/// MERGE). The target relation of a data-modifying statement is never a
+/// reference to a CTE (`setTargetTable` opens a table), so it isn't
+/// counted.
+pub(crate) fn with_statement_owner<R>(
+    with: &protobuf::WithClause,
+    mut owner: protobuf::Node,
+    f: impl FnOnce() -> R,
+) -> R {
+    match owner.node.as_mut() {
+        Some(node::Node::InsertStmt(s)) => s.relation = None,
+        Some(node::Node::UpdateStmt(s)) => s.relation = None,
+        Some(node::Node::DeleteStmt(s)) => s.relation = None,
+        Some(node::Node::MergeStmt(s)) => s.relation = None,
+        _ => {}
+    }
+    let key = std::ptr::from_ref(with) as usize;
     WITH_OWNERS.with(|o| o.borrow_mut().push((key, owner)));
     let out = f();
     WITH_OWNERS.with(|o| o.borrow_mut().pop());
     out
 }
 
+/// The WITH clause statement `n` owns.
+fn statement_with(n: &node::Node) -> Option<&protobuf::WithClause> {
+    match n {
+        node::Node::SelectStmt(s) => s.with_clause.as_ref(),
+        node::Node::InsertStmt(s) => s.with_clause.as_ref(),
+        node::Node::UpdateStmt(s) => s.with_clause.as_ref(),
+        node::Node::DeleteStmt(s) => s.with_clause.as_ref(),
+        node::Node::MergeStmt(s) => s.with_clause.as_ref(),
+        _ => None,
+    }
+}
+
 /// How many references to CTE `name` the statement owning `with` has
-/// (PG's `cterefcount`): the unqualified relations of that name in it.
-/// `None` when that may count what is no reference to it — a relation of
-/// that name a nested WITH, or (without RECURSIVE) the CTE's own body or
-/// an earlier one's, resolves elsewhere — or the owner isn't known.
+/// (PG's `cterefcount`), as [`references_in`] counts them; `None` when the
+/// owner isn't known (see [`with_clause_owner`]).
 fn owner_references(with: &protobuf::WithClause, name: &str) -> Option<usize> {
-    use typedpg_pg_query::NodeRef;
     let key = std::ptr::from_ref(with) as usize;
+    WITH_OWNERS.with(|o| {
+        let owners = o.borrow();
+        let (_, owner) = owners.iter().rev().find(|(k, _)| *k == key)?;
+        let root = owner.node.as_ref()?;
+        references_in(root.to_ref(), statement_with(root), name)
+    })
+}
+
+/// The alias of a reference to CTE `name` the SELECT (UPDATE, DELETE)
+/// owning `with` has among its own FROM (USING) items never null-extended (FROM-list items, sides of
+/// inner joins, a LEFT join's left side, a RIGHT join's right one).
+fn owner_kept_reference(with: &protobuf::WithClause, name: &str) -> Option<String> {
+    fn find(n: &protobuf::Node, name: &str) -> Option<String> {
+        match n.node.as_ref()? {
+            node::Node::RangeVar(rv) if rv.schemaname.is_empty() && rv.relname == name => Some(
+                rv.alias
+                    .as_ref()
+                    .map_or_else(|| rv.relname.clone(), |a| a.aliasname.clone()),
+            ),
+            node::Node::JoinExpr(j) => {
+                let (left, right) = match protobuf::JoinType::try_from(j.jointype) {
+                    Ok(protobuf::JoinType::JoinInner) => (true, true),
+                    Ok(protobuf::JoinType::JoinLeft) => (true, false),
+                    Ok(protobuf::JoinType::JoinRight) => (false, true),
+                    _ => (false, false),
+                };
+                let side = |s: &Option<Box<protobuf::Node>>, kept: bool| {
+                    s.as_deref().filter(|_| kept).and_then(|s| find(s, name))
+                };
+                side(&j.larg, left).or_else(|| side(&j.rarg, right))
+            }
+            _ => None,
+        }
+    }
+    let key = std::ptr::from_ref(with) as usize;
+    WITH_OWNERS.with(|o| {
+        let owners = o.borrow();
+        let (_, owner) = owners.iter().rev().find(|(k, _)| *k == key)?;
+        let from = match owner.node.as_ref()? {
+            node::Node::SelectStmt(sel) => &sel.from_clause,
+            node::Node::UpdateStmt(upd) => &upd.from_clause,
+            node::Node::DeleteStmt(del) => &del.using_clause,
+            _ => return None,
+        };
+        from.iter().find_map(|f| find(f, name))
+    })
+}
+
+/// How many references to CTE `name` of `with` (the WITH clause `root`
+/// owns) the statement `root` has (PG's `cterefcount`, which counts the
+/// references in the WITH's own CTE bodies too, read or not): the
+/// unqualified relations of that name in it. `None` when that may count
+/// what is no reference to it — a relation of that name a nested WITH,
+/// or (without RECURSIVE) the CTE's own body or an earlier one's,
+/// resolves elsewhere.
+pub(crate) fn references_in(
+    root: typedpg_pg_query::NodeRef<'_>,
+    with: Option<&protobuf::WithClause>,
+    name: &str,
+) -> Option<usize> {
+    use typedpg_pg_query::NodeRef;
+    let with = with?;
     let names_it = |n: NodeRef<'_>| {
         let mut todo = vec![n];
         while let Some(n) = todo.pop() {
@@ -941,37 +1044,66 @@ fn owner_references(with: &protobuf::WithClause, name: &str) -> Option<usize> {
             }
         }
     }
-    WITH_OWNERS.with(|o| {
-        let owners = o.borrow();
-        let (_, owner) = owners.iter().rev().find(|(k, _)| *k == key)?;
-        let root = owner.node.as_ref()?;
-        let own_with = match root {
-            node::Node::SelectStmt(sel) => sel.with_clause.as_ref().map(std::ptr::from_ref),
-            _ => None,
-        };
-        let mut count = 0;
-        let mut todo = vec![root.to_ref()];
-        while let Some(n) = todo.pop() {
-            match n {
-                NodeRef::RangeVar(rv) if rv.schemaname.is_empty() && rv.relname == name => {
-                    count += 1;
-                }
-                // Another WITH naming a CTE so: its references are its own.
-                NodeRef::WithClause(w)
-                    if own_with != Some(std::ptr::from_ref(w))
-                        && w.ctes.iter().any(|c| {
-                            matches!(c.node.as_ref(),
-                                Some(node::Node::CommonTableExpr(c)) if c.ctename == name)
-                        }) =>
-                {
-                    return None;
-                }
-                _ => {}
+    let own_with = std::ptr::from_ref(with);
+    let mut count = 0;
+    let mut todo = vec![root];
+    while let Some(n) = todo.pop() {
+        match n {
+            NodeRef::RangeVar(rv) if rv.schemaname.is_empty() && rv.relname == name => {
+                count += 1;
             }
-            todo.extend(n.children());
+            // Another WITH naming a CTE so: its references are its own.
+            NodeRef::WithClause(w)
+                if own_with != std::ptr::from_ref(w)
+                    && w.ctes.iter().any(|c| {
+                        matches!(c.node.as_ref(),
+                            Some(node::Node::CommonTableExpr(c)) if c.ctename == name)
+                    }) =>
+            {
+                return None;
+            }
+            _ => {}
         }
-        Some(count)
-    })
+        todo.extend(n.children());
+    }
+    Some(count)
+}
+
+/// Whether the planner inlines CTE `cte` (`SS_process_ctes` →
+/// `inline_cte`), referenced `references` times (see [`references_in`]):
+/// a SELECT neither MATERIALIZED nor recursive, referenced once (or NOT
+/// MATERIALIZED) and without volatile functions becomes a FROM subquery;
+/// any other is scanned as is. `None` when the analyzer can't tell.
+pub(crate) fn inlined(
+    cte: &protobuf::CommonTableExpr,
+    recursive: bool,
+    references: Option<usize>,
+    snapshot: &PgCatalog,
+) -> Option<bool> {
+    let select = matches!(
+        cte.ctequery.as_deref().and_then(|q| q.node.as_ref()),
+        Some(node::Node::SelectStmt(_))
+    );
+    if recursive || !select || cte.ctematerialized == protobuf::CteMaterialize::Always as i32 {
+        return Some(false);
+    }
+    let once = if cte.ctematerialized == protobuf::CteMaterialize::Never as i32 {
+        Some(true)
+    } else {
+        references.map(|n| n <= 1)
+    };
+    match once {
+        Some(false) => Some(false),
+        Some(true)
+            if !cte
+                .ctequery
+                .as_deref()
+                .is_some_and(|q| crate::expr::plan_fold::may_be_volatile(q, snapshot)) =>
+        {
+            Some(true)
+        }
+        _ => None,
+    }
 }
 
 /// Analyze a `WITH` clause on top of the CTEs already visible, following
@@ -1088,44 +1220,26 @@ fn analyze_with_clause_here(
             )
             .finalize_implicit());
         }
-        // A SELECT CTE nothing reads is never planned; what planning one
-        // read raises is raised at its references (see `deferred`). A
-        // data-modifying one always runs.
-        // inline_cte: a SELECT CTE neither MATERIALIZED nor recursive,
-        // referenced once (or NOT MATERIALIZED) and without volatile
-        // functions becomes a FROM subquery; any other is scanned as is
-        // (a CTE scan, whose Vars keep their parsed collations). `None`
-        // when the analyzer can't tell.
-        let select = matches!(
-            cte.ctequery.as_deref().and_then(|q| q.node.as_ref()),
-            Some(node::Node::SelectStmt(_))
-        );
-        let inlined = if recursive[i]
-            || !select
-            || cte.ctematerialized == protobuf::CteMaterialize::Always as i32
-        {
-            Some(false)
-        } else {
-            let once = if cte.ctematerialized == protobuf::CteMaterialize::Never as i32 {
-                Some(true)
-            } else {
-                owner_references(with, &cte.ctename).map(|n| n <= 1)
-            };
-            match once {
-                Some(false) => Some(false),
-                Some(true)
-                    if !cte
-                        .ctequery
-                        .as_deref()
-                        .is_some_and(|q| crate::expr::plan_fold::may_be_volatile(q, snapshot)) =>
-                {
-                    Some(true)
-                }
-                _ => None,
-            }
+        // A SELECT CTE nothing references is never planned; what planning
+        // one referenced raises is raised at its references (see
+        // `deferred`). A data-modifying one always runs. One the planner
+        // doesn't inline is scanned as is (a CTE scan, whose Vars keep
+        // their parsed collations).
+        let references = owner_references(with, &cte.ctename);
+        let inlined = inlined(cte, recursive[i], references, snapshot);
+        // Inlined, the CTE is a FROM subquery where its one reference is:
+        // one of the owner's own FROM items is analyzed as such.
+        let reference = match inlined {
+            Some(true) => owner_kept_reference(with, &cte.ctename),
+            _ => None,
         };
-        let (analyzed, planned) =
-            super::deferred::analyze_cte(cte, recursive[i], inlined, snapshot, || {
+        let (analyzed, planned) = super::deferred::analyze_cte(
+            cte,
+            recursive[i],
+            inlined,
+            reference.as_deref(),
+            snapshot,
+            || {
                 analyze_cte(
                     cte,
                     recursive[i],
@@ -1135,7 +1249,8 @@ fn analyze_with_clause_here(
                     &cte_scopes,
                     outer_sources,
                 )
-            });
+            },
+        );
         let mut analyzed = analyzed?;
         super::deferred::attach_to_cte(&mut analyzed.columns, planned);
         // A VALUES the executor can't start: a CTE scanned on its own is
@@ -1153,6 +1268,23 @@ fn analyze_with_clause_here(
                     _ => {}
                 }
             }
+        }
+        // SS_process_ctes plans a SELECT CTE it doesn't inline as soon as
+        // anything references it — `cterefcount` counts the references in
+        // the WITH's other CTE bodies too, planned or not (`WITH a AS (SELECT
+        // 1 / 0), b AS (SELECT * FROM a), d AS (SELECT * FROM a) SELECT 1`
+        // fails: `b` and `d` are never planned, `a` is).
+        if inlined == Some(false)
+            && returning.is_none()
+            && references.is_some_and(|n| n > 0)
+            && crate::expr::plan_time_checks()
+            && let Some(e) = analyzed
+                .columns
+                .iter()
+                .find_map(|c| c.deferred.entry.as_deref())
+            && let Some(e) = crate::expr::plan_time_error(Some(cte.location), e.clone())
+        {
+            return Err(e);
         }
         let marker = no_returning_marker(&cte.ctename);
         if returning == Some(false) {

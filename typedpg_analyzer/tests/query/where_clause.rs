@@ -857,7 +857,6 @@ fn a_column_proof_excludes_only_its_own_relation() {
     // (an unqualified column, a join's alias, a LATERAL subquery's qual).
     for sql in [
         "SELECT 1 FROM t, rt WHERE rt.s ~ '(' AND rt.id IS NULL",
-        "SELECT 1 FROM t, rt WHERE rt.s ~ '(' AND rt.id = 1 AND rt.id = 2",
         "SELECT 1 FROM t, (SELECT * FROM rt WHERE id IS NULL) q WHERE q.s ~ '('",
         "SELECT 1 FROM t, (SELECT * FROM rt WHERE s ~ '(' OFFSET 0) q WHERE q.id IS NULL",
         "SELECT 1 FROM t, LATERAL (SELECT * FROM rt WHERE t.id IS NULL) q WHERE t.s ~ '('",
@@ -994,4 +993,154 @@ fn an_exists_sublink_drops_its_group_by_window_and_null_limit() {
          GROUP BY ROLLUP (rt.id)) AND false",
     )
     .unwrap();
+}
+
+#[test]
+fn two_constants_an_equivalence_class_equates_gate_the_join_domain() {
+    // `generate_base_implied_equalities_const` derives `2 = 1` from
+    // `rt.id = 1 AND rt.id = 2` and applies it over the join domain
+    // (`process_implied_equality`): a single relation's restriction, which
+    // proves it empty — but over several relations a gating qual above
+    // their join, which proves none of them empty.
+    let db = planner_setup();
+    for sql in [
+        "SELECT 1 FROM t, rt WHERE rt.s ~ '(' AND rt.id = 1 AND rt.id = 2",
+        "SELECT 1 FROM t, rt WHERE rt.s ~ '(' AND rt.id = 1 AND t.id = 2 AND rt.id = t.id",
+        "SELECT 1 FROM t, (SELECT * FROM rt WHERE id = 1 AND id = 2) q WHERE q.s ~ '('",
+        "SELECT 1 FROM t JOIN rt ON rt.id = 1 AND rt.id = 2 WHERE rt.s ~ '('",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::Invalid(_),
+            "invalid regular expression: parentheses () not balanced"
+        );
+    }
+    for sql in [
+        "SELECT 1 FROM rt WHERE rt.s ~ '(' AND rt.id = 1 AND rt.id = 2",
+        // The nullable side of an outer join is a join domain of its own.
+        "SELECT 1 FROM t LEFT JOIN rt ON rt.s ~ '(' AND rt.id = 1 AND rt.id = 2",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
+
+#[test]
+fn an_inner_joins_on_clause_sublinks_become_joins_before_it_is_folded() {
+    // `pull_up_sublinks` turns the IN / EXISTS sublinks of an inner join's
+    // ON clause reading the join's sides into semi-joins above the join,
+    // as it does WHERE's; an EXISTS whose FROM joins plain relations on
+    // their own columns too.
+    let db = planner_setup();
+    for sql in [
+        "SELECT 1 FROM t JOIN u ON u.x IN (SELECT id FROM rt WHERE s ~ '(') AND false",
+        "SELECT 1 FROM t JOIN u ON t.x IN (SELECT id FROM rt WHERE s ~ '(') AND false",
+        "SELECT 1 FROM t JOIN u ON EXISTS (SELECT 1 FROM rt WHERE rt.id = u.id AND rt.s ~ '(') \
+         AND false",
+        "SELECT 1 FROM t WHERE EXISTS (SELECT 1 FROM rt JOIN u ON u.id = rt.id \
+         WHERE rt.id = t.id AND rt.s ~ '(') AND false",
+        "SELECT 1 FROM t WHERE EXISTS (SELECT 1 FROM rt JOIN u USING (id) \
+         WHERE rt.id = t.id AND rt.s ~ '(') AND false",
+        "SELECT 1 FROM t WHERE EXISTS (SELECT 1 FROM rt LEFT JOIN u ON u.id = rt.id \
+         WHERE rt.id = t.id AND rt.s ~ '(') AND false",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::Invalid(_),
+            "invalid regular expression: parentheses () not balanced"
+        );
+    }
+    for sql in [
+        "SELECT 1 FROM t JOIN u ON (u.x IN (SELECT id FROM rt WHERE s ~ '(') OR true)",
+        "SELECT 1 FROM t JOIN u ON 1 IN (SELECT id FROM rt WHERE s ~ '(') AND false",
+        "SELECT 1 FROM t JOIN u ON u.x IN (SELECT id FROM rt WHERE s ~ '(' AND false) AND false",
+        // A join's ON clause reading the query: not a join.
+        "SELECT 1 FROM t WHERE EXISTS (SELECT 1 FROM rt JOIN u ON u.id = t.id \
+         WHERE rt.id = t.id AND rt.s ~ '(') AND false",
+        "SELECT 1 FROM t WHERE EXISTS (SELECT 1 FROM rt JOIN u ON u.id = rt.id \
+         WHERE rt.id = t.id AND rt.s ~ '(' AND false)",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
+
+#[test]
+fn an_inlined_cte_is_estimated_as_the_from_item_it_is_pulled_up_as() {
+    // A CTE referenced once is inlined and pulled up where its reference
+    // is: its relations' restrictions are estimated unless that level
+    // proves them empty or removes them.
+    let db = planner_setup();
+    for sql in [
+        "WITH c AS (SELECT id FROM rt WHERE s ~ '(') SELECT 1 FROM c",
+        "WITH c AS (SELECT id FROM rt WHERE s ~ '(') SELECT 1 FROM rt2 JOIN c ON c.id = rt2.id",
+        "WITH c AS (SELECT id FROM rt WHERE s ~ '(') SELECT 1 FROM t, c WHERE t.id IS NULL",
+        "WITH c AS (SELECT s FROM rt) SELECT 1 FROM c WHERE c.s ~ '('",
+        "WITH c AS (SELECT id FROM rt WHERE s ~ '(') \
+         UPDATE rt2 SET s = 'x' FROM c WHERE c.id = rt2.id",
+        "WITH c AS (SELECT id FROM rt WHERE s ~ '(') DELETE FROM rt2 USING c WHERE c.id = rt2.id",
+        // A CTE named as the target is no reference to it.
+        "WITH rt2 AS (SELECT 1 AS k WHERE false) UPDATE rt2 SET s = 'x' WHERE rt2.s ~ '('",
+        // Referenced twice: scanned, planned whole.
+        "WITH c AS (SELECT id FROM rt WHERE s ~ '(') SELECT 1 FROM c, c c2",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::Invalid(_),
+            "invalid regular expression: parentheses () not balanced"
+        );
+    }
+    for sql in [
+        "WITH c AS (SELECT id FROM rt WHERE s ~ '(') SELECT 1 FROM c WHERE false",
+        "WITH c AS (SELECT id FROM rt WHERE s ~ '(') SELECT 1 FROM c WHERE c.id IS NULL",
+        "WITH c AS (SELECT id FROM rt WHERE s ~ '(') \
+         SELECT 1 FROM rt2 JOIN c ON c.id = rt2.id WHERE c.id IS NULL",
+        "WITH c AS (SELECT s FROM rt) SELECT 1 FROM c WHERE c.s ~ '(' AND false",
+        "WITH c AS (SELECT id FROM rt WHERE s ~ '(') \
+         UPDATE rt2 SET s = 'x' FROM c WHERE c.id = rt2.id AND c.id IS NULL",
+        // Pulled up, its constant FALSE qual proves the single relation
+        // beside it empty.
+        "WITH c AS (SELECT 1 AS k WHERE false) SELECT 1 FROM rt2, c WHERE rt2.s ~ '('",
+        "WITH c AS (SELECT 1 AS k WHERE false) UPDATE rt2 SET s = 'x' FROM c WHERE rt2.s ~ '('",
+        "WITH c AS (SELECT 1 AS k WHERE false) DELETE FROM rt2 USING c WHERE rt2.s ~ '('",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
+
+#[test]
+fn a_nullable_side_read_above_the_join_is_not_removed() {
+    // `join_is_removable` keeps a join whose nullable side has a column
+    // needed above it — read in the select list, ORDER BY, GROUP BY, …:
+    // that side is planned, its restrictions estimated. A read in another
+    // outer join's ON clause doesn't keep it when that join is removed
+    // first.
+    let db = planner_setup();
+    for sql in [
+        "SELECT x.id FROM rt2 LEFT JOIN (SELECT id FROM rt WHERE s ~ '(') x ON x.id = rt2.id",
+        "SELECT x.* FROM rt2 LEFT JOIN (SELECT id FROM rt WHERE s ~ '(') x ON x.id = rt2.id",
+        "SELECT 1 FROM rt2 LEFT JOIN (SELECT id FROM rt WHERE s ~ '(') x ON x.id = rt2.id \
+         GROUP BY x.id",
+        "SELECT rt.id FROM rt2 LEFT JOIN rt ON rt.id = rt2.id AND rt.s ~ '('",
+        "SELECT * FROM rt2 LEFT JOIN rt ON rt.id = rt2.id AND rt.s ~ '('",
+        "SELECT 1 FROM rt2 LEFT JOIN rt ON rt.id = rt2.id AND rt.s ~ '(' ORDER BY rt.id",
+        "SELECT count(rt.id) FROM rt2 LEFT JOIN rt ON rt.id = rt2.id AND rt.s ~ '('",
+        "WITH c AS (SELECT id FROM rt WHERE s ~ '(') \
+         SELECT c.id FROM rt2 LEFT JOIN c ON c.id = rt2.id",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::Invalid(_),
+            "invalid regular expression: parentheses () not balanced"
+        );
+    }
+    for sql in [
+        "SELECT rt2.id FROM rt2 LEFT JOIN rt ON rt.id = rt2.id AND rt.s ~ '('",
+        "SELECT rt2.id FROM rt2 LEFT JOIN (SELECT id FROM rt WHERE s ~ '(') x ON x.id = rt2.id",
+        "SELECT 1 FROM rt2 LEFT JOIN rt ON rt.id = rt2.id AND rt.s ~ '(' \
+         LEFT JOIN u ON u.id = rt.id",
+        "SELECT 1 FROM rt2 LEFT JOIN (rt LEFT JOIN u ON u.id = rt.id) \
+         ON rt.id = rt2.id AND rt.s ~ '('",
+        "WITH c AS (SELECT id FROM rt WHERE s ~ '(') SELECT 1 FROM rt2 LEFT JOIN c ON c.id = rt2.id",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
 }

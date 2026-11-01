@@ -332,6 +332,28 @@ pub(crate) fn record_substitution(entry: &protobuf::Node, expr: std::sync::Arc<p
     }
 }
 
+/// Record, for `val` — a select-list entry, or a value an UPDATE or MERGE
+/// action assigns — that reads a column (in `scope`) of a subquery the
+/// planner pulls up where it is never null-extended (a FROM subquery, an
+/// inlined CTE), the output expression the planner substitutes for it:
+/// its conversion to the type it is assigned to is folded.
+pub(crate) fn record_read(val: &protobuf::Node, scope: &crate::scope::Scope) {
+    let Some(node::Node::ColumnRef(cr)) = val.node.as_ref() else {
+        return;
+    };
+    let parts = crate::expr::extract_string_fields(&cr.fields);
+    let (table, column) = match parts.as_slice() {
+        [c] if parts.len() == cr.fields.len() => (None, c.as_str()),
+        [t, c] if parts.len() == cr.fields.len() => (Some(t.as_str()), c.as_str()),
+        _ => return,
+    };
+    if let Ok(col) = scope.resolve_column(table, column, None)
+        && let Some(e) = col.deferred.expr.clone()
+    {
+        record_substitution(val, e);
+    }
+}
+
 /// What the planner substitutes for `entry` (see [`record_substitution`]).
 pub(crate) fn substituted(entry: &protobuf::Node) -> Option<std::sync::Arc<protobuf::Node>> {
     let Some(node::Node::ColumnRef(cr)) = entry.node.as_ref() else {
@@ -568,11 +590,15 @@ pub(crate) struct PlannedCte {
 /// `Some(false)`: MATERIALIZED, referenced more than once) whole, once,
 /// wherever it is referenced at all (`SS_process_ctes`; an unreferenced
 /// one never is). The errors go to `deferred` by output column (see
-/// [`crate::scope::Deferred`]).
+/// [`crate::scope::Deferred`]). Pulled up where its one reference is
+/// `reference`, a FROM item never null-extended of the level owning the
+/// WITH, its query is that FROM item's: what that level's quals prove of
+/// it holds for it.
 pub(crate) fn analyze_cte<T>(
     cte: &protobuf::CommonTableExpr,
     recursive: bool,
     inlined: Option<bool>,
+    reference: Option<&str>,
     snapshot: &PgCatalog,
     run: impl FnOnce() -> T,
 ) -> (T, PlannedCte) {
@@ -620,11 +646,23 @@ pub(crate) fn analyze_cte<T>(
         Plan::PulledUp => removable_relation(sel, snapshot),
         _ => None,
     };
-    let ((out, errors), unless_removed) = match removable {
+    let analyze = || match removable {
         Some(inner) => crate::expr::plan_fold::record_unless_removed(vec![inner], || {
             crate::expr::capture_plan_time_errors(run)
         }),
         None => (crate::expr::capture_plan_time_errors(run), Vec::new()),
+    };
+    let ((out, errors), unless_removed) = match reference {
+        Some(alias) if plan == Plan::PulledUp => {
+            crate::expr::plan_fold::with_next_item(NextLevel::PulledUp, alias, analyze)
+        }
+        // Scanned, it is a query `SS_process_ctes` plans on its own, before
+        // and whatever the query reading it.
+        _ if plan == Plan::Whole => crate::expr::plan_fold::with_next_level(
+            NextLevel::Separate { pushed_down: false },
+            analyze,
+        ),
+        _ => analyze(),
     };
     if plan == Plan::Whole {
         let entry = errors.into_iter().next().map(|(_, e)| e);

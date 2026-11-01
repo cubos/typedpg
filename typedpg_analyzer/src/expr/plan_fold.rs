@@ -17,11 +17,12 @@
 //!   with the query, whatever the WHERE then folds to;
 //! - a relation is estimated only when it isn't proven empty first
 //!   (`relation_excluded_by_constraints`: a constant FALSE / NULL
-//!   restriction, an equivalence class equating two different constants,
-//!   `col IS NULL` over a NOT NULL column — which prove only that column's
-//!   relation empty; partition pruning; an inheritance child's
-//!   constraints), nor removed (`remove_useless_joins`, which needs a
-//!   relation it can prove distinct).
+//!   restriction, an equivalence class equating two different constants
+//!   in a join domain of that relation alone, `col IS NULL` over a NOT
+//!   NULL column — which prove only that column's relation empty;
+//!   partition pruning; an inheritance child's constraints), nor removed
+//!   (`remove_useless_joins`, which needs a relation it can prove distinct
+//!   and none of whose columns is read above the join).
 //!
 //! Each check here errs towards *not* raising: an expression whose value
 //! the analyzer can't compute counts as one that may fold to a constant,
@@ -210,7 +211,8 @@ pub(crate) fn joined_any_sublink(
 /// grouping set, HAVING, OFFSET, LIMIT but a positive or NULL one,
 /// locking, set operation or WITH) with its GROUP BY, WINDOW, DISTINCT
 /// and ORDER BY clauses, its
-/// FROM reads plain relations only, and its WHERE reads a column of the
+/// FROM reads plain relations only (maybe joined on their own columns),
+/// and its WHERE reads a column of the
 /// level (`is_level_column`, of a column named by no FROM item of the
 /// subquery) and calls nothing volatile. Its FROM items then join the
 /// level, its WHERE becomes the join's qual.
@@ -251,16 +253,56 @@ pub(crate) fn joined_exists_sublink(
     {
         return false;
     }
+    // Plain relations, maybe joined (without an alias for the join).
+    fn plain<'a>(
+        n: &'a protobuf::Node,
+        inner: &mut Vec<&'a str>,
+        on: &mut Vec<&'a protobuf::Node>,
+    ) -> bool {
+        match n.node.as_ref() {
+            Some(node::Node::RangeVar(rv)) => {
+                inner.push(
+                    rv.alias
+                        .as_ref()
+                        .map_or(rv.relname.as_str(), |a| &a.aliasname),
+                );
+                true
+            }
+            Some(node::Node::JoinExpr(j)) if j.alias.is_none() && j.join_using_alias.is_none() => {
+                on.extend(j.quals.as_deref());
+                [&j.larg, &j.rarg]
+                    .into_iter()
+                    .all(|s| s.as_deref().is_some_and(|s| plain(s, inner, on)))
+            }
+            _ => false,
+        }
+    }
     let mut inner = Vec::new();
+    let mut on = Vec::new();
     for f in &sel.from_clause {
-        let Some(node::Node::RangeVar(rv)) = f.node.as_ref() else {
+        if !plain(f, &mut inner, &mut on) {
             return false;
-        };
-        inner.push(
-            rv.alias
-                .as_ref()
-                .map_or(rv.relname.as_str(), |a| &a.aliasname),
-        );
+        }
+    }
+    // Nothing but the WHERE clause may read the level
+    // (`contain_vars_of_level`): every column of a join's ON clause is
+    // certainly one of the subquery's own, qualified by one of its FROM
+    // items, and it holds no sublink.
+    let own_columns = |q: &protobuf::Node| {
+        q.node.as_ref().is_some_and(|q| {
+            q.nodes().into_iter().all(|(n, _)| match n {
+                typedpg_pg_query::NodeRef::SubLink(_) => false,
+                typedpg_pg_query::NodeRef::ColumnRef(cr) => {
+                    let names = extract_names(&cr.fields);
+                    matches!(names.as_slice(), [t, _]
+                        if names.len() == cr.fields.len() && inner.contains(&t.as_str()))
+                }
+                _ => true,
+            })
+        })
+    };
+    if !on.into_iter().all(own_columns) {
+        return false;
     }
     // No aggregate, window or set-returning function in what the planner
     // throws away (nor anything the analyzer can't tell of).
@@ -355,11 +397,14 @@ pub(crate) fn conjunct_sublink(n: &protobuf::Node) -> Option<&protobuf::SubLink>
 
 thread_local! {
     /// The WHERE clause being analyzed, at the innermost level analyzing
-    /// one (see [`with_where_clause`]).
+    /// one (see [`with_where_clause`]) — or the ON clause of an inner join
+    /// never null-extended, whose sublinks `pull_up_sublinks` pulls up
+    /// alike (reading only the join's sides, which is all the ON clause
+    /// sees).
     static WHERE_ROOT: Cell<*const protobuf::Node> = const { Cell::new(std::ptr::null()) };
 }
 
-/// Run `f`, the analysis of WHERE clause `n`.
+/// Run `f`, the analysis of WHERE clause `n` (or of such an ON clause).
 pub(crate) fn with_where_clause<R>(n: &protobuf::Node, f: impl FnOnce() -> R) -> R {
     let prev = WHERE_ROOT.with(|w| w.replace(std::ptr::from_ref(n)));
     let out = f();
@@ -867,6 +912,9 @@ struct LevelQuals {
     /// output (its WINDOW clause, which no window call can use there) is
     /// never planned.
     pulled_up: bool,
+    /// The level's SELECT, when it is one (see [`read_above`]): the address
+    /// of a node the analysis borrows while the level is entered.
+    select: Option<*const protobuf::SelectStmt>,
 }
 
 /// How the next query level analyzed is planned (see [`with_next_level`]).
@@ -935,50 +983,70 @@ pub(crate) fn next_level_is_subplan() -> bool {
     NEXT_LEVEL.with(|n| n.get() == NextLevel::Subplan)
 }
 
+/// The statement a query level is (see [`PlanLevel`]).
+#[derive(Clone, Copy)]
+enum Level<'a> {
+    Select(&'a protobuf::SelectStmt),
+    /// An UPDATE or DELETE, whose target is at this location.
+    Dml {
+        target: Option<i32>,
+    },
+}
+
 /// RAII marker for a query level the planner plans (a SELECT, UPDATE,
 /// DELETE), with the quals it restricts its relations by.
 pub(crate) struct PlanLevel;
 
 impl PlanLevel {
-    /// Enter a level whose quals are `where_clause` and the ON clauses of
-    /// the joins in `from`. A level inside one that may be proven empty —
+    /// Enter SELECT `sel`, whose quals are its WHERE clause and the ON
+    /// clauses of the joins in its FROM, which may read the CTEs `ctes`
+    /// (and its own WITH's). A level inside one that may be proven empty —
     /// a FROM subquery pulled up into it, a sublink — may be proven empty
     /// too: its relations are not estimated. (Its constants are still
     /// folded where the planner plans them — a pulled-up subquery's output
     /// where the outer query reads it, see `resolve::deferred` — as
-    /// constant folding precedes relation exclusion.)
-    pub(crate) fn enter(
-        where_clause: Option<&protobuf::Node>,
-        from: &[protobuf::Node],
-        snapshot: &PgCatalog,
-    ) -> Self {
-        Self::enter_level(where_clause, from, None, &[], snapshot)
-    }
-
-    /// [`Self::enter`] for SELECT `sel`, whose FROM may read the CTEs
-    /// `ctes` (and its own WITH's): a constant HAVING qual is moved into
-    /// WHERE, so it too may make the plan a dummy one.
+    /// constant folding precedes relation exclusion.) A constant HAVING
+    /// qual is moved into WHERE, so it too may make the plan a dummy one.
     pub(crate) fn enter_select<'a>(
-        sel: &protobuf::SelectStmt,
+        sel: &'a protobuf::SelectStmt,
         ctes: impl IntoIterator<Item = &'a String>,
         snapshot: &PgCatalog,
     ) -> Self {
-        // (An outer WITH's CTEs are known by name only.)
-        let mut names: Vec<Cte<'_>> = ctes.into_iter().map(|n| (n.as_str(), None)).collect();
-        if let Some(with) = &sel.with_clause {
-            for c in &with.ctes {
-                if let Some(node::Node::CommonTableExpr(c)) = c.node.as_ref() {
-                    names.push((c.ctename.as_str(), Some(c)));
-                }
-            }
-        }
+        let names = cte_list(
+            ctes,
+            sel.with_clause.as_ref(),
+            typedpg_pg_query::NodeRef::SelectStmt(sel),
+            None,
+            snapshot,
+        );
         Self::enter_level(
             sel.where_clause.as_deref(),
             &sel.from_clause,
             sel.having_clause.as_deref(),
             &names,
+            Level::Select(sel),
             snapshot,
         )
+    }
+
+    /// [`Self::enter_select`] for an UPDATE or DELETE, `stmt`, of target
+    /// `target` (one of `from`, a table whatever the CTEs), whose FROM /
+    /// USING items may read the CTEs `ctes` and those of its own WITH,
+    /// `with`.
+    pub(crate) fn enter_dml<'a>(
+        where_clause: Option<&protobuf::Node>,
+        from: &[protobuf::Node],
+        target: Option<&protobuf::RangeVar>,
+        with: Option<&'a protobuf::WithClause>,
+        stmt: typedpg_pg_query::NodeRef<'_>,
+        ctes: impl IntoIterator<Item = &'a String>,
+        snapshot: &PgCatalog,
+    ) -> Self {
+        let names = cte_list(ctes, with, stmt, target, snapshot);
+        let level = Level::Dml {
+            target: target.map(|t| t.location),
+        };
+        Self::enter_level(where_clause, from, None, &names, level, snapshot)
     }
 
     fn enter_level(
@@ -986,6 +1054,7 @@ impl PlanLevel {
         from: &[protobuf::Node],
         having: Option<&protobuf::Node>,
         ctes: &[Cte<'_>],
+        level: Level<'_>,
         snapshot: &PgCatalog,
     ) -> Self {
         let next = NEXT_LEVEL.with(|n| n.replace(NextLevel::Own));
@@ -1010,11 +1079,19 @@ impl PlanLevel {
             }
             let mut dummy_quals = conjuncts.clone();
             dummy_quals.extend(having_quals.iter().copied());
-            let mut group = Group::default();
-            group.walk(where_clause, from, ctes, snapshot, &Owner::Level);
-            group
-                .quals
-                .extend(having_quals.into_iter().map(|q| (q.clone(), Owner::Level)));
+            let mut group = Group {
+                target: match level {
+                    Level::Dml { target } => target,
+                    Level::Select(_) => None,
+                },
+                ..Group::default()
+            };
+            group.walk(where_clause, from, ctes, snapshot, &Owner::Level, true);
+            group.quals.extend(
+                having_quals
+                    .into_iter()
+                    .map(|q| (q.clone(), Owner::Level, true)),
+            );
             // A level inside one any relation of which may be proven
             // empty may be, to be sure — a FROM subquery pulled up, only
             // when its relations may be.
@@ -1034,9 +1111,12 @@ impl PlanLevel {
                 NextLevel::Separate { pushed_down } => {
                     if pushed_down {
                         let pushed = PUSHABLE.with(|p| p.borrow().last().cloned());
-                        group
-                            .quals
-                            .extend(pushed.into_iter().flatten().map(|q| (q, Owner::Level)));
+                        group.quals.extend(
+                            pushed
+                                .into_iter()
+                                .flatten()
+                                .map(|q| (q, Owner::Level, true)),
+                        );
                     }
                     (group.rels, false)
                 }
@@ -1057,6 +1137,10 @@ impl PlanLevel {
                 conjuncts: conjuncts.len(),
                 rels,
                 pulled_up: matches!(next, NextLevel::PulledUp | NextLevel::PulledUpNullable),
+                select: match level {
+                    Level::Select(sel) => Some(std::ptr::from_ref(sel)),
+                    Level::Dml { .. } => None,
+                },
             }
         } else {
             PUSHABLE.with(|p| p.borrow_mut().push(Vec::new()));
@@ -1082,8 +1166,10 @@ impl Drop for PlanLevel {
 #[derive(Default)]
 struct Group {
     /// The quals the planner distributes over the level's join tree, each
-    /// with where it comes from (see [`Owner`]).
-    quals: Vec<(protobuf::Node, Owner)>,
+    /// with where it comes from (see [`Owner`]) and whether it is one of
+    /// the top join domain's (WHERE, an inner join's ON, never below the
+    /// nullable side of an outer join nor in a semi-join's condition).
+    quals: Vec<(protobuf::Node, Owner, bool)>,
     /// The aliases of the level's own FROM items (tables, subqueries,
     /// functions — not joins), which a column proves empty.
     aliases: Vec<String>,
@@ -1102,9 +1188,19 @@ struct Group {
     /// The views whose queries are being walked (a view loop is an error
     /// of its own, raised as the rewriter expands it).
     views: Vec<crate::oid::PgClassOid>,
+    /// The location of the target of the UPDATE or DELETE the level is
+    /// (one of its FROM items): a table, never a CTE of its name.
+    target: Option<i32>,
+    /// The top-level AND arguments of the ON clauses of the level's own
+    /// inner joins never null-extended, whose sublinks `pull_up_sublinks`
+    /// may turn into semi-joins (see [`Self::walk`]).
+    on_quals: Vec<protobuf::Node>,
 }
 
 impl Group {
+    /// The quals `where_clause` and FROM items `from` of a query level (or
+    /// of a subquery pulled up into it), in the top join domain when
+    /// `top`.
     fn walk(
         &mut self,
         where_clause: Option<&protobuf::Node>,
@@ -1112,49 +1208,65 @@ impl Group {
         ctes: &[Cte<'_>],
         snapshot: &PgCatalog,
         owner: &Owner,
+        top: bool,
     ) {
         if let Some(w) = where_clause {
             let mut quals = Vec::new();
             flatten_and(w, &mut quals);
             self.quals
-                .extend(quals.into_iter().map(|q| (q.clone(), owner.clone())));
+                .extend(quals.into_iter().map(|q| (q.clone(), owner.clone(), top)));
         }
+        let on_quals = self.on_quals.len();
         for f in from {
-            self.item(f, true, ctes, snapshot, owner);
+            self.item(f, true, ctes, snapshot, owner, top);
+        }
+        if !matches!(owner, Owner::Level) {
+            return;
         }
         // The IN sublinks `pull_up_sublinks` turns into semi-joins: their
         // subqueries join the level (any qual in them may prove empty
         // what can't be told).
-        if let (Some(w), Owner::Level) = (where_clause, owner) {
-            let mut quals = Vec::new();
+        let mut quals = Vec::new();
+        if let Some(w) = where_clause {
             flatten_and(w, &mut quals);
-            let owner = Owner::Item {
-                alias: String::new(),
-                lateral: true,
+        }
+        let mut joined: Vec<protobuf::Node> = quals.into_iter().cloned().collect();
+        // Those of a kept inner join's ON clause too, above that join —
+        // whose own quals don't reach their relations: they are not
+        // counted for the level.
+        let on_start = joined.len();
+        joined.extend(self.on_quals.drain(on_quals..));
+        let owner = Owner::Item {
+            alias: String::new(),
+            lateral: true,
+        };
+        for (i, q) in joined.iter().enumerate() {
+            let Some(sub) = conjunct_sublink(q) else {
+                continue;
             };
-            for q in quals {
-                let Some(sub) = conjunct_sublink(q) else {
-                    continue;
-                };
-                let Some(node::Node::SelectStmt(sel)) =
-                    sub.subselect.as_deref().and_then(|s| s.node.as_ref())
-                else {
-                    continue;
-                };
-                let level = |cr: &protobuf::ColumnRef| self.reads_level(cr, snapshot);
-                if joined_any_sublink(sub, snapshot, &level) {
-                    self.subquery(sel, true, ctes, snapshot, &owner);
-                } else if joined_exists_sublink(sub, snapshot, &level) {
-                    // Its FROM items join the level, its WHERE is their
-                    // join's qual.
-                    self.walk(
-                        sel.where_clause.as_deref(),
-                        &sel.from_clause,
-                        ctes,
-                        snapshot,
-                        &owner,
-                    );
-                }
+            let Some(node::Node::SelectStmt(sel)) =
+                sub.subselect.as_deref().and_then(|s| s.node.as_ref())
+            else {
+                continue;
+            };
+            let rels = self.rels;
+            let level = |cr: &protobuf::ColumnRef| self.reads_level(cr, snapshot);
+            if joined_any_sublink(sub, snapshot, &level) {
+                self.subquery(sel, true, ctes, snapshot, &owner, false);
+            } else if joined_exists_sublink(sub, snapshot, &level) {
+                // Its FROM items join the level, its WHERE is their
+                // join's qual.
+                self.walk(
+                    sel.where_clause.as_deref(),
+                    &sel.from_clause,
+                    ctes,
+                    snapshot,
+                    &owner,
+                    false,
+                );
+            }
+            if i >= on_start {
+                self.rels = rels;
             }
         }
     }
@@ -1179,8 +1291,9 @@ impl Group {
         }
     }
 
-    /// A subquery (or view's query) `sel` in FROM, which may read the CTEs
-    /// `ctes`, never null-extended when `kept`; its quals are `owner`'s.
+    /// A subquery (or view's query, inlined CTE's) `sel` in FROM, which
+    /// may read the CTEs `ctes`, never null-extended when `kept`; its
+    /// quals are `owner`'s, in the top join domain when `top`.
     fn subquery(
         &mut self,
         sel: &protobuf::SelectStmt,
@@ -1188,6 +1301,7 @@ impl Group {
         ctes: &[Cte<'_>],
         snapshot: &PgCatalog,
         owner: &Owner,
+        top: bool,
     ) {
         if !kept {
             return;
@@ -1207,6 +1321,7 @@ impl Group {
                     ctes,
                     snapshot,
                     owner,
+                    top,
                 );
             }
             crate::resolve::Plan::Separate | crate::resolve::Plan::Whole => self.rels += 1,
@@ -1217,7 +1332,7 @@ impl Group {
 
     /// FROM item `n`, never null-extended when `kept`, below the FROM
     /// item of the level `owner` says (one of the level's own when
-    /// [`Owner::Level`]).
+    /// [`Owner::Level`]); kept, it is in the top join domain when `top`.
     fn item(
         &mut self,
         n: &protobuf::Node,
@@ -1225,6 +1340,7 @@ impl Group {
         ctes: &[Cte<'_>],
         snapshot: &PgCatalog,
         owner: &Owner,
+        top: bool,
     ) {
         let level_own = matches!(owner, Owner::Level);
         // The quals below one of the level's own FROM items are about it.
@@ -1249,9 +1365,30 @@ impl Group {
                 record(alias);
                 let owner = &own(alias, false);
                 if rv.schemaname.is_empty()
-                    && let Some((_, cte)) = ctes.iter().rev().find(|(n, _)| *n == rv.relname)
+                    && self.target != Some(rv.location)
+                    && let Some(cte) = ctes.iter().rev().find(|c| c.name == rv.relname)
                 {
-                    if cte.is_some_and(|c| scanned_alone(c, snapshot)) {
+                    let body = match cte.def.and_then(|c| c.ctequery.as_deref()?.node.as_ref()) {
+                        Some(node::Node::SelectStmt(sel)) => Some(sel),
+                        _ => None,
+                    };
+                    if cte.inlined
+                        && let Some(sel) = body
+                        && crate::resolve::plan_of(sel, snapshot) == crate::resolve::Plan::PulledUp
+                    {
+                        // Inlined, a FROM subquery the planner pulls up
+                        // (its body sees the CTEs before it, by name).
+                        let names: Vec<Cte<'_>> = ctes
+                            .iter()
+                            .map(|c| Cte {
+                                name: c.name,
+                                def: None,
+                                inlined: false,
+                                scanned: false,
+                            })
+                            .collect();
+                        self.subquery(sel, kept, &names, snapshot, owner, top);
+                    } else if cte.scanned || cte.def.is_some_and(|c| scanned_alone(c, snapshot)) {
                         if kept {
                             self.rels += 1;
                         }
@@ -1294,7 +1431,7 @@ impl Group {
                         // A view's query sees no CTE of the statement.
                         Some(node::Node::SelectStmt(sel)) => {
                             self.views.push(class.oid);
-                            self.subquery(&sel, kept, &[], snapshot, owner);
+                            self.subquery(&sel, kept, &[], snapshot, owner, top);
                             self.views.pop();
                         }
                         _ => self.unknown_quals = true,
@@ -1310,10 +1447,11 @@ impl Group {
                 if let Some(node::Node::SelectStmt(sel)) =
                     sub.subquery.as_deref().and_then(|q| q.node.as_ref())
                 {
-                    self.subquery(sel, kept, ctes, snapshot, owner);
+                    self.subquery(sel, kept, ctes, snapshot, owner, top);
                 }
             }
             Some(node::Node::JoinExpr(j)) => {
+                let inner = j.jointype == protobuf::JoinType::JoinInner as i32;
                 let (left, right) = match protobuf::JoinType::try_from(j.jointype) {
                     Ok(protobuf::JoinType::JoinInner) => (kept, kept),
                     Ok(protobuf::JoinType::JoinLeft) => (kept, false),
@@ -1321,16 +1459,25 @@ impl Group {
                     _ => (false, false),
                 };
                 if let Some(l) = j.larg.as_deref() {
-                    self.item(l, left, ctes, snapshot, owner);
+                    self.item(l, left, ctes, snapshot, owner, top);
                 }
                 if let Some(r) = j.rarg.as_deref() {
-                    self.item(r, right, ctes, snapshot, owner);
+                    self.item(r, right, ctes, snapshot, owner, top);
                 }
                 if let Some(q) = j.quals.as_deref() {
                     let mut quals = Vec::new();
                     flatten_and(q, &mut quals);
-                    self.quals
-                        .extend(quals.into_iter().map(|q| (q.clone(), owner.clone())));
+                    // An outer join's quals are its nullable side's join
+                    // domain's.
+                    let in_top = top && kept && inner;
+                    if inner && kept && level_own {
+                        self.on_quals.extend(quals.iter().map(|q| (*q).clone()));
+                    }
+                    self.quals.extend(
+                        quals
+                            .into_iter()
+                            .map(|q| (q.clone(), owner.clone(), in_top)),
+                    );
                 }
             }
             // A function the planner may inline as a subquery it pulls up.
@@ -1357,19 +1504,19 @@ impl Group {
     fn may_be_empty(&self, rels: usize, snapshot: &PgCatalog) -> Proven {
         let constant = self.unknown_quals
             || (self.substitutes && !self.quals.is_empty())
-            || self.quals.iter().any(|(q, _)| {
+            || self.quals.iter().any(|(q, _, _)| {
                 let folded = fold_qual(q, snapshot);
                 folded.may_be_const() && folded != Folded::Bool(true)
             });
-        let column_quals: Vec<(&protobuf::Node, &Owner)> = self
+        let column_quals: Vec<(&protobuf::Node, &Owner, bool)> = self
             .quals
             .iter()
-            .filter(|(q, _)| !fold_qual(q, snapshot).may_be_const())
-            .map(|(q, o)| (q, o))
+            .filter(|(q, _, _)| !fold_qual(q, snapshot).may_be_const())
+            .map(|(q, o, top)| (q, o, *top))
             .collect();
         let mut proven = Proven::default();
         let mut equalities = Vec::new();
-        for (q, owner) in &column_quals {
+        for (q, owner, top) in &column_quals {
             match q.node.as_ref() {
                 Some(node::Node::NullTest(t))
                     if t.nulltesttype == protobuf::NullTestType::IsNull as i32
@@ -1380,14 +1527,22 @@ impl Group {
                 {
                     self.prove_about(q, owner, &mut proven);
                 }
-                Some(node::Node::AExpr(e)) if extract_names(&e.name) == ["="] => {
+                // Two constants an equivalence class of the top join domain
+                // equates make a variable-free qual applied over the
+                // domain (`generate_base_implied_equalities_const`,
+                // `process_implied_equality`): of several relations, a
+                // gating qual above their join, which proves none of them
+                // empty.
+                Some(node::Node::AExpr(e))
+                    if extract_names(&e.name) == ["="] && !(*top && rels >= 2) =>
+                {
                     equalities.push((*q, *owner));
                 }
                 _ => {}
             }
         }
         // An equivalence class's members may be any equality's columns.
-        let quals: Vec<&protobuf::Node> = column_quals.iter().map(|(q, _)| *q).collect();
+        let quals: Vec<&protobuf::Node> = equalities.iter().map(|(q, _)| *q).collect();
         if equates_constants(&quals, snapshot) {
             for (q, owner) in equalities {
                 self.prove_about(q, owner, &mut proven);
@@ -1441,8 +1596,61 @@ impl Group {
     }
 }
 
-/// A CTE a level may read: its name, and its definition when known.
-type Cte<'a> = (&'a str, Option<&'a protobuf::CommonTableExpr>);
+/// The CTEs a level may read: those of an outer WITH `outer` (known by
+/// name only), and those of `with`, the WITH clause of statement `root`
+/// (whose target, when a data-modifying one, is `target`).
+fn cte_list<'a>(
+    outer: impl IntoIterator<Item = &'a String>,
+    with: Option<&'a protobuf::WithClause>,
+    root: typedpg_pg_query::NodeRef<'_>,
+    target: Option<&protobuf::RangeVar>,
+    snapshot: &PgCatalog,
+) -> Vec<Cte<'a>> {
+    let mut names: Vec<Cte<'a>> = outer
+        .into_iter()
+        .map(|n| Cte {
+            name: n.as_str(),
+            def: None,
+            inlined: false,
+            scanned: false,
+        })
+        .collect();
+    let Some(with) = with else {
+        return names;
+    };
+    for c in &with.ctes {
+        let Some(node::Node::CommonTableExpr(c)) = c.node.as_ref() else {
+            continue;
+        };
+        // Referenced once (`cterefcount`, counted over the statement
+        // owning the WITH, but a data-modifying one's target), it is
+        // inlined.
+        let target_named =
+            target.is_some_and(|t| t.schemaname.is_empty() && t.relname == c.ctename);
+        let references = crate::resolve::references_in(root, Some(with), &c.ctename)
+            .map(|n| n.saturating_sub(usize::from(target_named)));
+        let inlined = crate::resolve::inlined(c, false, references, snapshot);
+        names.push(Cte {
+            name: c.ctename.as_str(),
+            def: Some(c),
+            inlined: !with.recursive && inlined == Some(true),
+            scanned: inlined == Some(false),
+        });
+    }
+    names
+}
+
+/// A CTE a level may read.
+#[derive(Clone, Copy)]
+struct Cte<'a> {
+    name: &'a str,
+    /// Its definition, when known.
+    def: Option<&'a protobuf::CommonTableExpr>,
+    /// The planner certainly inlines it (see [`crate::resolve::inlined`]).
+    inlined: bool,
+    /// The planner certainly doesn't: a reference to it is a CTE scan.
+    scanned: bool,
+}
 
 /// Whether a reference to CTE `cte` is a relation of its own, never pulled
 /// up: a CTE scan (MATERIALIZED, data-modifying), or a subquery the planner
@@ -1620,6 +1828,99 @@ impl LevelQuals {
             || self.excluded.iter().any(|a| a == alias)
             || (!self.excluded.is_empty() && !self.items.iter().any(|a| a == alias))
     }
+}
+
+/// Whether the current level certainly reads a column of its FROM item
+/// `alias` above `join`, the outer join whose nullable side it is — in
+/// its select list, WHERE, GROUP BY, HAVING, WINDOW, ORDER BY, DISTINCT
+/// ON or an inner join's ON clause: `join_is_removable` then keeps the
+/// join (the column is needed above it), whose nullable side is planned
+/// and its restrictions estimated. (Read in another outer join's ON
+/// clause, it may no longer be once that join is removed.) Only a
+/// reference qualified by the alias counts (`alias.col`, `alias.*`), or a
+/// `*` of the select list; none in a sublink or a FROM subquery, which
+/// may name another FROM item so.
+pub(crate) fn read_above(alias: &str, join: &protobuf::JoinExpr) -> bool {
+    let Some(sel) = LEVELS.with(|l| l.borrow().last().and_then(|q| q.select)) else {
+        return false;
+    };
+    // SAFETY: `select` is the SELECT the level was entered for, which the
+    // analysis borrows while the level (its `PlanLevel`) lives.
+    let sel = unsafe { &*sel };
+    let join: *const protobuf::JoinExpr = join;
+    let reads = |n: &protobuf::Node| {
+        let Some(inner) = n.node.as_ref() else {
+            return false;
+        };
+        let mut todo = vec![inner.to_ref()];
+        while let Some(n) = todo.pop() {
+            match n {
+                typedpg_pg_query::NodeRef::SubLink(_)
+                | typedpg_pg_query::NodeRef::SelectStmt(_) => continue,
+                typedpg_pg_query::NodeRef::ColumnRef(cr) => {
+                    if let Some(node::Node::String(t)) =
+                        cr.fields.first().and_then(|f| f.node.as_ref())
+                        && cr.fields.len() == 2
+                        && t.sval == alias
+                    {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+            todo.extend(n.children());
+        }
+        false
+    };
+    // The ON clauses of the inner joins in the FROM item `n`, but what is
+    // below `join`.
+    fn joins_read(
+        n: &protobuf::Node,
+        join: *const protobuf::JoinExpr,
+        found: &mut bool,
+        reads: &dyn Fn(&protobuf::Node) -> bool,
+    ) -> bool {
+        let Some(node::Node::JoinExpr(j)) = n.node.as_ref() else {
+            return false;
+        };
+        if std::ptr::eq(&**j, join) {
+            *found = true;
+            return false;
+        }
+        let mut read = j.jointype == protobuf::JoinType::JoinInner as i32
+            && j.quals.as_deref().is_some_and(reads);
+        for side in [&j.larg, &j.rarg].into_iter().flatten() {
+            read |= joins_read(side, join, found, reads);
+        }
+        read
+    }
+    let mut found = false;
+    let mut read = false;
+    for f in &sel.from_clause {
+        read |= joins_read(f, join, &mut found, &reads);
+    }
+    // A join the level's FROM clause doesn't hold (a view's, a CTE's):
+    // nothing is known.
+    if !found {
+        return false;
+    }
+    let star = sel.target_list.iter().any(|t| {
+        matches!(t.node.as_ref(), Some(node::Node::ResTarget(rt))
+            if matches!(rt.val.as_deref().and_then(|v| v.node.as_ref()),
+                Some(node::Node::ColumnRef(cr)) if matches!(cr.fields.as_slice(),
+                    [f] if matches!(f.node, Some(node::Node::AStar(_))))))
+    });
+    read || star
+        || sel
+            .target_list
+            .iter()
+            .chain(sel.where_clause.as_deref())
+            .chain(&sel.group_clause)
+            .chain(sel.having_clause.as_deref())
+            .chain(&sel.window_clause)
+            .chain(&sel.sort_clause)
+            .chain(&sel.distinct_clause)
+            .any(reads)
 }
 
 /// Whether the plan of the current level may be a dummy one, whose nodes
