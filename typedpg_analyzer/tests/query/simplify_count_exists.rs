@@ -257,10 +257,17 @@ fn issue_queries() {
                               total numeric NOT NULL, created_at timestamptz NOT NULL);
          CREATE INDEX ON orders (customer_id);",
     );
-    assert_rewritten_in(
+    // `numeric > integer` casts the integer side first: not proved
+    // error-free, so the issue's own spelling is kept; a numeric literal
+    // compares without a cast.
+    assert_kept_in(
         &db,
         "SELECT (SELECT count(*) FROM orders WHERE total > 10) > 0",
-        "SELECT EXISTS (SELECT 1 FROM orders WHERE total > 10) AS \"?column?\"",
+    );
+    assert_rewritten_in(
+        &db,
+        "SELECT (SELECT count(*) FROM orders WHERE total > 10.0) > 0",
+        "SELECT EXISTS (SELECT 1 FROM orders WHERE total > 10.0) AS \"?column?\"",
     );
     assert_rewritten_in(
         &db,
@@ -388,6 +395,53 @@ fn counted_expression_must_be_strictly_not_null() {
         &setup_with("ALTER TABLE t ADD CONSTRAINT b_nn NOT NULL b NOT VALID"),
         "SELECT (SELECT count(b) FROM t) > 0 AS x",
     );
+}
+
+/// The planner pulls `EXISTS` up into a semi- or anti-join and pushes the
+/// subquery's own conditions down to its scan: `1 / s.z > 0` then runs on
+/// every row of `s`, where the correlated count only ran it on the rows
+/// with `s.k = o.k` — with a `(5000, 0)` row in `s`, the written query
+/// returns every `o` and the rewritten one fails with `division by zero`.
+#[test]
+fn error_capable_subquery_pulled_up_is_kept() {
+    let db = setup_with(
+        "CREATE TABLE o (id int PRIMARY KEY, k int NOT NULL);
+         CREATE TABLE s (k int NOT NULL, z int NOT NULL);",
+    );
+    assert_kept_in(
+        &db,
+        "SELECT id FROM o WHERE (SELECT count(*) FROM s WHERE s.k = o.k AND 1 / s.z > 0) > 0",
+    );
+    assert_kept_in(
+        &db,
+        "SELECT id FROM o WHERE (SELECT count(*) FROM s WHERE s.k = o.k AND 1 / s.z > 0) = 0",
+    );
+    // The same subquery with an error-free condition is rewritten.
+    assert_rewritten_in(
+        &db,
+        "SELECT id FROM o WHERE (SELECT count(*) FROM s WHERE s.k = o.k AND s.z > 0) > 0",
+        "SELECT id FROM o WHERE EXISTS (SELECT 1 FROM s WHERE s.k = o.k AND s.z > 0)",
+    );
+}
+
+/// Anything in the counted query that may fail on some row keeps it as
+/// written.
+#[test]
+fn error_capable_counted_query_is_kept() {
+    for sql in [
+        // Arithmetic, a cast, a function call, a pattern match.
+        "SELECT id FROM t WHERE (SELECT count(*) FROM u WHERE u.t_id = t.id AND 10 / u.c > 1) > 0",
+        "SELECT id FROM t WHERE (SELECT count(*) FROM u WHERE u.t_id = t.id AND u.c::smallint = 1) > 0",
+        "SELECT id FROM t WHERE (SELECT count(*) FROM u WHERE u.t_id = t.id AND abs(u.c) = 1) = 0",
+        "SELECT (SELECT count(*) FROM u WHERE u.c::text LIKE '1%') > 0 AS x",
+        // In a join condition.
+        "SELECT (SELECT count(*) FROM u JOIN t ON t.id = u.t_id AND 1 / t.a > 0) > 0 AS x",
+        // The top-level form too: `EXISTS` gets a plan of its own.
+        "SELECT count(*) > 0 FROM u WHERE 10 / c > 1",
+        "SELECT count(*) > 0 FROM u JOIN t ON t.id = u.t_id WHERE t.a / u.c > 1",
+    ] {
+        assert_kept(sql);
+    }
 }
 
 #[test]

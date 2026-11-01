@@ -31,9 +31,18 @@
 //!   `count(outer.col)`: not the plain aggregate of this level.
 //! - A `count` or comparison operator some user object could resolve to:
 //!   only `pg_catalog.count` and the built-in `int8`/`int4` comparisons.
+//! - A counting query anything in could raise an error — a cast, an
+//!   arithmetic operator, a function call, a comparison across types or
+//!   collations ([`super::proof::error_free_select`]). `EXISTS` doesn't
+//!   just evaluate fewer rows: the planner may pull it up into a semi- or
+//!   anti-join and evaluate the subquery's conditions over rows the
+//!   correlated count never reached (`1 / s.z > 0` pushed down to every
+//!   row of `s`, not only those with `s.k = o.k`), and a top-level
+//!   `EXISTS` gets a plan of its own. A rewrite must never make a
+//!   succeeding query fail.
 //! - Anything that may call a volatile function, or reads a relation
 //!   other than a plain table (a view or a CTE may hide one; a foreign
-//!   table may do anything): `EXISTS` evaluates fewer rows.
+//!   table may do anything): how many times it runs may change.
 //! - Row security on a read table (its policies run per row, too).
 
 use typedpg_pg_query::NodeRef;
@@ -41,7 +50,7 @@ use typedpg_pg_query::protobuf::{
     self, AExprKind, Node, ResTarget, SelectStmt, SetOperation, SubLinkType, Token, node,
 };
 
-use super::proof::{FromScope, has_volatile, strictly_not_null};
+use super::proof::{FromScope, cannot_error, error_free_select, has_volatile, strictly_not_null};
 use super::{Candidate, Ctx, Edit, Rule};
 use crate::oid::{PgOperatorOid, PgProcOid};
 use crate::pg_catalog::{RelKind, oid};
@@ -297,16 +306,17 @@ pub(crate) fn candidates(ctx: &Ctx<'_>) -> Vec<Candidate> {
         })
         .collect();
 
-    let mut out = Vec::new();
-    for (n, _) in &nodes {
-        let NodeRef::AExpr(e) = n else { continue };
-        if let Some(edits) = sublink_form(ctx, &text, &cte_names, &unnamed, e) {
-            out.push(Candidate {
-                rule: Rule::CountExists,
-                edits,
-            });
-        }
+    let mut walker = Walker {
+        ctx,
+        text: &text,
+        cte_names: &cte_names,
+        unnamed: &unnamed,
+        out: Vec::new(),
+    };
+    if let Some(node) = stmt.stmt.as_deref().and_then(|n| n.node.as_ref()) {
+        walker.statement(node.to_ref(), None);
     }
+    let mut out = walker.out;
     if let Some(edits) = top_level_form(ctx, &text, &cte_names, stmt) {
         out.push(Candidate {
             rule: Rule::CountExists,
@@ -314,6 +324,213 @@ pub(crate) fn candidates(ctx: &Ctx<'_>) -> Vec<Candidate> {
         });
     }
     out
+}
+
+/// Walks the statement keeping the FROM scope each expression is evaluated
+/// in, which the error-freedom proof of a counted subquery resolves its
+/// outer references in. Where the scope isn't known, an opaque one stands
+/// in: nothing resolves, nothing is proved.
+struct Walker<'c, 'a> {
+    ctx: &'c Ctx<'a>,
+    text: &'c Text<'c>,
+    cte_names: &'c [&'c str],
+    unnamed: &'c [&'c ResTarget],
+    out: Vec<Candidate>,
+}
+
+impl Walker<'_, '_> {
+    /// A statement nested at `parent`'s level.
+    fn statement(&mut self, node: NodeRef<'_>, parent: Option<&FromScope<'_>>) {
+        let ctx = self.ctx;
+        match node {
+            NodeRef::SelectStmt(s) => self.select(s, parent),
+            NodeRef::InsertStmt(i) => {
+                self.ctes(i.with_clause.as_ref(), parent);
+                if let Some(s) = i.select_stmt.as_deref().and_then(|s| s.node.as_ref()) {
+                    self.statement(s.to_ref(), parent);
+                }
+                let scope = FromScope::of_dml(ctx, i.relation.as_ref(), &[], parent);
+                let opaque = FromScope::opaque(parent);
+                if let Some(c) = i.on_conflict_clause.as_deref() {
+                    self.children(NodeRef::OnConflictClause(c), &opaque);
+                }
+                self.returning(i.returning_clause.as_ref(), &scope);
+            }
+            NodeRef::UpdateStmt(u) => {
+                self.ctes(u.with_clause.as_ref(), parent);
+                self.walk_from_subqueries(&u.from_clause, parent);
+                let scope = FromScope::of_dml(ctx, u.relation.as_ref(), &u.from_clause, parent);
+                self.list(&u.target_list, &scope);
+                self.opt(u.where_clause.as_deref(), &scope);
+                self.returning(u.returning_clause.as_ref(), &scope);
+            }
+            NodeRef::DeleteStmt(d) => {
+                self.ctes(d.with_clause.as_ref(), parent);
+                self.walk_from_subqueries(&d.using_clause, parent);
+                let scope = FromScope::of_dml(ctx, d.relation.as_ref(), &d.using_clause, parent);
+                self.opt(d.where_clause.as_deref(), &scope);
+                self.returning(d.returning_clause.as_ref(), &scope);
+            }
+            // Anything else (MERGE, utility statements): no known scope.
+            other => {
+                let opaque = FromScope::opaque(parent);
+                self.children(other, &opaque);
+            }
+        }
+    }
+
+    fn ctes(&mut self, with: Option<&protobuf::WithClause>, parent: Option<&FromScope<'_>>) {
+        for cte in with.map(|w| w.ctes.as_slice()).unwrap_or_default() {
+            if let Some(node::Node::CommonTableExpr(c)) = cte.node.as_ref()
+                && let Some(q) = c.ctequery.as_deref().and_then(|q| q.node.as_ref())
+            {
+                self.statement(q.to_ref(), parent);
+            }
+        }
+    }
+
+    /// The non-LATERAL subqueries of a FROM list (in joins too), which see
+    /// the levels around the FROM's, not its own.
+    fn walk_from_subqueries(&mut self, from: &[Node], parent: Option<&FromScope<'_>>) {
+        for item in from {
+            match item.node.as_ref() {
+                Some(node::Node::RangeSubselect(s)) if !s.lateral => {
+                    if let Some(q) = s.subquery.as_deref().and_then(|q| q.node.as_ref()) {
+                        self.statement(q.to_ref(), parent);
+                    }
+                }
+                Some(node::Node::JoinExpr(j)) => {
+                    for side in [&j.larg, &j.rarg].into_iter().flatten() {
+                        self.walk_from_subqueries(std::slice::from_ref(&**side), parent);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The rest of a FROM list, evaluated in its level's `scope`: join
+    /// conditions, LATERAL subqueries, function calls.
+    fn walk_from_rest(&mut self, from: &[Node], scope: &FromScope<'_>) {
+        for item in from {
+            match item.node.as_ref() {
+                Some(node::Node::RangeSubselect(s)) => {
+                    if s.lateral
+                        && let Some(q) = s.subquery.as_deref().and_then(|q| q.node.as_ref())
+                    {
+                        self.statement(q.to_ref(), Some(scope));
+                    }
+                }
+                Some(node::Node::JoinExpr(j)) => {
+                    for side in [&j.larg, &j.rarg].into_iter().flatten() {
+                        self.walk_from_rest(std::slice::from_ref(&**side), scope);
+                    }
+                    self.opt(j.quals.as_deref(), scope);
+                }
+                Some(n) => self.children(n.to_ref(), scope),
+                None => {}
+            }
+        }
+    }
+
+    fn select(&mut self, s: &SelectStmt, parent: Option<&FromScope<'_>>) {
+        self.ctes(s.with_clause.as_ref(), parent);
+        if s.op != SetOperation::SetopNone as i32 {
+            for side in [&s.larg, &s.rarg].into_iter().flatten() {
+                self.select(side, parent);
+            }
+            return;
+        }
+        self.walk_from_subqueries(&s.from_clause, parent);
+        let scope = FromScope::of_select(self.ctx, s, parent);
+        self.walk_from_rest(&s.from_clause, &scope);
+        for list in [
+            &s.target_list,
+            &s.group_clause,
+            &s.window_clause,
+            &s.sort_clause,
+            &s.distinct_clause,
+            &s.values_lists,
+        ] {
+            self.list(list, &scope);
+        }
+        for n in [
+            &s.where_clause,
+            &s.having_clause,
+            &s.limit_count,
+            &s.limit_offset,
+        ] {
+            self.opt(n.as_deref(), &scope);
+        }
+    }
+
+    fn returning(&mut self, clause: Option<&protobuf::ReturningClause>, scope: &FromScope<'_>) {
+        if let Some(c) = clause {
+            self.list(&c.exprs, scope);
+        }
+    }
+
+    fn opt(&mut self, node: Option<&Node>, scope: &FromScope<'_>) {
+        if let Some(n) = node.and_then(|n| n.node.as_ref()) {
+            self.expr(n.to_ref(), scope);
+        }
+    }
+
+    fn list(&mut self, nodes: &[Node], scope: &FromScope<'_>) {
+        for n in nodes {
+            self.opt(Some(n), scope);
+        }
+    }
+
+    fn children(&mut self, node: NodeRef<'_>, scope: &FromScope<'_>) {
+        for child in node.children() {
+            self.expr(child, scope);
+        }
+    }
+
+    /// Look for count comparisons in an expression evaluated in `scope`.
+    fn expr(&mut self, node: NodeRef<'_>, scope: &FromScope<'_>) {
+        match node {
+            NodeRef::SelectStmt(_)
+            | NodeRef::InsertStmt(_)
+            | NodeRef::UpdateStmt(_)
+            | NodeRef::DeleteStmt(_)
+            | NodeRef::MergeStmt(_) => self.statement(node, Some(scope)),
+            NodeRef::AExpr(e) => {
+                if let Some(edits) =
+                    sublink_form(self.ctx, self.text, self.cte_names, self.unnamed, e, scope)
+                {
+                    self.out.push(Candidate {
+                        rule: Rule::CountExists,
+                        edits,
+                    });
+                }
+                self.children(node, scope);
+            }
+            _ => self.children(node, scope),
+        }
+    }
+}
+
+/// Whether `select`, a counting query, can be run over rows it never ran
+/// on before without raising an error ([`error_free_select`]) — its count
+/// target aside, which the rewrite drops (`count(x)`'s `x` must be
+/// error-free too).
+fn counted_error_free(ctx: &Ctx<'_>, select: &SelectStmt, scope: &FromScope<'_>) -> bool {
+    let mut without_count = select.clone();
+    without_count.target_list = vec![Node {
+        node: Some(node::Node::ResTarget(Box::new(ResTarget {
+            val: Some(Box::new(Node {
+                node: Some(node::Node::AConst(protobuf::AConst {
+                    isnull: false,
+                    location: -1,
+                    val: Some(protobuf::a_const::Val::Ival(protobuf::Integer { ival: 1 })),
+                })),
+            })),
+            ..Default::default()
+        }))),
+    }];
+    error_free_select(ctx, &without_count, scope)
 }
 
 /// The comparison `e`, split into its operator, its count side and its
@@ -433,7 +650,7 @@ fn plain_count(
             return None;
         };
         let scope = FromScope::of_select(ctx, select, None);
-        if !strictly_not_null(ctx, arg, &scope) {
+        if !strictly_not_null(ctx, arg, &scope) || !cannot_error(ctx, arg, &scope) {
             return None;
         }
     }
@@ -497,6 +714,7 @@ fn sublink_form(
     cte_names: &[&str],
     unnamed: &[&ResTarget],
     e: &protobuf::AExpr,
+    scope: &FromScope<'_>,
 ) -> Option<Vec<Edit>> {
     let cmp = comparison(ctx, text, e)?;
     let Some(node::Node::SubLink(sub)) = cmp.count.node.as_ref() else {
@@ -521,7 +739,13 @@ fn sublink_form(
         return None;
     }
     let call = plain_count(ctx, text, select, target.val.as_deref()?)?;
-    if !pure(ctx, cte_names, cmp.count) {
+    // The planner may pull `EXISTS` up into a semi- or anti-join and run
+    // the subquery's conditions over rows the correlated count never
+    // reached (`1 / s.z > 0` on every row of `s`, not just those with
+    // `s.k = o.k`): only a subquery nothing in can fail is rewritten.
+    if !pure(ctx, cte_names, cmp.count)
+        || !counted_error_free(ctx, select, &FromScope::of_select(ctx, select, Some(scope)))
+    {
         return None;
     }
 
@@ -693,7 +917,11 @@ fn top_level_form(
     };
     let cmp = comparison(ctx, text, e)?;
     plain_count(ctx, text, select, cmp.count)?;
-    if !pure(ctx, cte_names, stmt_node) {
+    // `EXISTS` gets its own plan (one that stops early), which may
+    // evaluate a join's conditions over other row pairs.
+    if !pure(ctx, cte_names, stmt_node)
+        || !counted_error_free(ctx, select, &FromScope::of_select(ctx, select, None))
+    {
         return None;
     }
     let [column] = ctx.analyzed.columns.as_slice() else {
