@@ -337,6 +337,11 @@ fn a_multidimensional_array_of_mismatched_sub_arrays_is_rejected() {
         "SELECT ARRAY['{}'::int[], ARRAY[1]] AS v",
         "SELECT ARRAY['{{1},{2}}'::int[], '{{1,2}}'::int[]] AS v",
         "SELECT ARRAY['{(1,1),(0,0);(2,2),(1,1)}'::box[], '{(1,1),(0,0)}'::box[]] AS v",
+        // A literal inside an inner ARRAY, which it makes multidimensional.
+        "SELECT ARRAY[ARRAY['{1}'::int[]], NULL] AS v",
+        "SELECT ARRAY[ARRAY['{1}'::int[]], ARRAY['{1,2}'::int[]]] AS v",
+        "SELECT ARRAY[ARRAY['{1}'::int[], '{2}'], ARRAY['{1}'::int[], '{2,3}']] AS v",
+        "SELECT ARRAY[ARRAY[ARRAY[1]], NULL] AS v",
     ] {
         assert_err_prefix!(db.analyze(sql), AnalyzeError::Invalid(_), MSG);
     }
@@ -344,6 +349,11 @@ fn a_multidimensional_array_of_mismatched_sub_arrays_is_rejected() {
     // but not run fails too.
     assert_err_prefix!(
         db.analyze("EXPLAIN SELECT ARRAY['{1}'::int[], NULL::int[]] AS v"),
+        AnalyzeError::Invalid(_),
+        MSG
+    );
+    assert_err_prefix!(
+        db.analyze("EXPLAIN SELECT ARRAY[ARRAY['{1}'::int[]], NULL] AS v"),
         AnalyzeError::Invalid(_),
         MSG
     );
@@ -376,6 +386,8 @@ fn a_multidimensional_array_of_sub_arrays_that_can_agree_is_accepted() {
         "SELECT ARRAY['{{}}'::int[], NULL] AS v",
         "SELECT ARRAY['{1}'::text::int[], ARRAY[1, 2]] AS v",
         "SELECT ARRAY['{(1,1),(0,0);(2,2),(1,1)}'::box[], '{(1,1),(0,0);(2,2),(1,1)}'::box[]] AS v",
+        "SELECT ARRAY[ARRAY['{1}'::int[]], ARRAY[ARRAY[1]]] AS v",
+        "SELECT ARRAY[ARRAY['{1}'::int[], '{2}'], ARRAY['{3}', '{4}'::int[]]] AS v",
     ] {
         db.analyze(sql).unwrap_or_else(|e| panic!("`{sql}`: {e}"));
     }

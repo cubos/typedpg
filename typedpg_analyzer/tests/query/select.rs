@@ -1164,6 +1164,73 @@ fn whole_row_field_selection_finds_system_columns() {
 }
 
 #[test]
+fn whole_row_field_selection_is_the_column_everywhere() {
+    // ParseComplexProjection makes `(t).f` — a field of a FROM entry's
+    // whole row naming one of its columns — that column's Var: grouping,
+    // DISTINCT and ORDER BY see `t.f`, whichever way either side is
+    // written. A field is looked up by the names the entry exposes.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE t (a int); CREATE TABLE n (c int NOT NULL);")
+        .unwrap();
+    for sql in [
+        "SELECT t.ctid FROM t GROUP BY (t).ctid",
+        "SELECT (t).ctid FROM t GROUP BY t.ctid",
+        "SELECT (t).xmin FROM t GROUP BY xmin",
+        "SELECT (t).ctid, count(*) FROM t GROUP BY t.ctid HAVING (t).ctid IS NOT NULL",
+        "SELECT t.a FROM t GROUP BY (t).a",
+        "SELECT (t.*).a FROM t GROUP BY a",
+        "SELECT (x).a FROM t x GROUP BY x.a",
+        "SELECT s.x FROM (SELECT 1 x) s GROUP BY (s).x",
+        "SELECT (t).a, (SELECT (t).a) FROM t GROUP BY t.a",
+        "SELECT (SELECT t.ctid) FROM t GROUP BY (t).ctid",
+        "SELECT DISTINCT t.ctid FROM t ORDER BY (t).ctid",
+        "SELECT DISTINCT (t).ctid FROM t ORDER BY t.ctid",
+        "SELECT DISTINCT ON ((t).ctid) a FROM t ORDER BY t.ctid",
+        "SELECT DISTINCT ON (t.a) a FROM t ORDER BY (t).a",
+        "SELECT (x).p FROM t AS x(p) GROUP BY x.p",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("`{sql}`: {e}"));
+    }
+    // A grouping set leaving the column out makes it NULL, spelled either way.
+    for sql in [
+        "SELECT (n).c FROM n GROUP BY ROLLUP (n.c)",
+        "SELECT n.c FROM n GROUP BY ROLLUP ((n).c)",
+        "SELECT (n).c FROM n GROUP BY CUBE (c)",
+    ] {
+        let s = db.analyze(sql).unwrap();
+        assert_cols(&s, vec![cn("c", basic("pg_catalog", "int4"))]);
+    }
+    let s = db
+        .analyze("SELECT (n).ctid FROM n GROUP BY ROLLUP (n.ctid)")
+        .unwrap();
+    assert_cols(&s, vec![cn("ctid", basic("pg_catalog", "tid"))]);
+    for (sql, msg) in [
+        // The column, not the whole row: grouping by the row doesn't cover it.
+        (
+            "SELECT (t).a FROM t GROUP BY t",
+            "column \"t.a\" must appear in the GROUP BY clause",
+        ),
+        // The alias list renames the row's fields.
+        ("SELECT (x).a FROM t AS x(p)", "column x.a does not exist"),
+    ] {
+        let err = db.analyze(sql).expect_err(sql);
+        assert!(err.to_string().starts_with(msg), "{sql}\n  got: {err}");
+    }
+    let s = db.analyze("SELECT (x).p FROM t AS x(p)").unwrap();
+    assert_cols(&s, vec![cn("p", basic("pg_catalog", "int4"))]);
+    // A qual on one spelling proves the column non-NULL for the other.
+    for sql in [
+        "SELECT t.a FROM t WHERE (t).a IS NOT NULL",
+        "SELECT (t.*).a FROM t WHERE (t).a IS NOT NULL",
+        "SELECT a FROM t WHERE (t).a > 0",
+        "SELECT (t).a FROM t WHERE (t.*).a IS NOT NULL",
+    ] {
+        let s = db.analyze(sql).unwrap();
+        assert_cols(&s, vec![c("a", basic("pg_catalog", "int4"))]);
+    }
+}
+
+#[test]
 fn a_missing_field_of_a_from_entry_row_is_a_missing_column() {
     // unknown_attribute: no such field in a FROM entry's whole-row Var —
     // a table's, a subquery's, a CTE's, a VALUES list's, a function's with

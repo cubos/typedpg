@@ -31,30 +31,10 @@ pub(crate) fn infer_indirection(
         Some(node::Node::ColumnRef(cr)) if column_ref_is_column(cr, scope)
     );
 
-    // Detect the `(alias).field` shape: arg is a single-identifier ColumnRef
-    // whose identifier is a relation alias in scope (not a column). PG emits
-    // `column alias.field does not exist` for this case (whereas
-    // `(c.col).field` produces `column "field" not found in data type T`).
-    // The alias hint only applies to the first indirection step — chained
-    // accesses past that point are no longer at the relation boundary. A
-    // name that is a column is that column (transformColumnRef), not a
-    // whole row.
-    let arg_is_bare_alias: Option<&str> = if let Some(node::Node::ColumnRef(cr)) = arg.node.as_ref()
-        && !arg_is_column
-    {
-        let parts = extract_string_fields(&cr.fields);
-        match parts.as_slice() {
-            [single] if scope.find_source(single).is_some() => {
-                cr.fields.iter().find_map(|f| match f.node.as_ref()? {
-                    node::Node::String(s) => Some(s.sval.as_str()),
-                    _ => None,
-                })
-            }
-            _ => None,
-        }
-    } else {
-        None
-    };
+    // The `(alias).field` shape: arg is a FROM entry's whole row (see
+    // [`whole_row_entry`]). Only the first indirection step is at the
+    // relation boundary.
+    let entry = whole_row_entry(ind, scope);
 
     let steps = &ind.indirection[..];
     let mut i = 0;
@@ -64,37 +44,23 @@ pub(crate) fn infer_indirection(
                 if i == 0 && arg_is_column {
                     record_var_shape_visible(&current, snapshot)?;
                 }
-                let alias_hint = if i == 0 { arg_is_bare_alias } else { None };
-                current = match resolve_composite_field(&current, &s.sval, snapshot, alias_hint) {
+                // `(t).f` is the column `t.f` (see [`entry_column`]); a name
+                // that is no column of the entry is the call `f(t)` (below).
+                let selected = match entry.filter(|_| i == 0) {
+                    Some((alias, src)) => match entry_column(alias, src, &steps[i], arg) {
+                        Some(column) => Ok(infer_expr(&column, ctx, params, TypeGoal::NONE)?),
+                        // unknown_attribute: errmsg("column %s.%s does not
+                        // exist", rte->eref->aliasname, attname) — the names
+                        // as they are, neither quoted nor escaped.
+                        None => Err(AnalyzeError::UndefinedColumn(format!(
+                            "column {alias}.{} does not exist",
+                            s.sval
+                        ))),
+                    },
+                    None => resolve_composite_field(&current, &s.sval, snapshot),
+                };
+                current = match selected {
                     Ok(field) => field,
-                    // ParseComplexProjection on a FROM entry's whole row
-                    // looks the name up as that entry's column
-                    // (scanNSItemForColumn), which finds a relation's
-                    // system columns too: `(t).ctid` is `t.ctid`.
-                    Err(_)
-                        if i == 0
-                            && arg_is_bare_alias
-                                .and_then(|alias| scope.find_source(alias))
-                                .is_some_and(|src| {
-                                    src.system_columns.iter().any(|c| c.name == s.sval)
-                                }) =>
-                    {
-                        let Some(node::Node::ColumnRef(cr)) = arg.node.as_ref() else {
-                            unreachable!("a bare alias is a ColumnRef");
-                        };
-                        let column = protobuf::Node {
-                            node: Some(node::Node::ColumnRef(protobuf::ColumnRef {
-                                fields: cr
-                                    .fields
-                                    .iter()
-                                    .cloned()
-                                    .chain([steps[i].clone()])
-                                    .collect(),
-                                location: cr.location,
-                            })),
-                        };
-                        infer_expr(&column, ctx, params, TypeGoal::NONE)?
-                    }
                     // No such field: `(x).f` is the call `f(x)`, on the
                     // value selected so far (transformIndirection).
                     Err(e) => {
@@ -169,6 +135,95 @@ pub(crate) fn infer_indirection(
     Ok(current)
 }
 
+/// The FROM entry whose whole row the argument of `ind` is — a
+/// single-name `ColumnRef` (or `t.*`) naming an entry rather than a
+/// column (transformColumnRef prefers a column) — with the alias it goes
+/// by. PG reports a missing field of such a row as `column alias.field
+/// does not exist` (whereas `(c.col).field` gives `column "field" not
+/// found in data type T`).
+pub(crate) fn whole_row_entry<'a>(
+    ind: &'a protobuf::AIndirection,
+    scope: &'a Scope,
+) -> Option<(&'a str, &'a crate::scope::TableSource)> {
+    let Some(node::Node::ColumnRef(cr)) = ind.arg.as_deref()?.node.as_ref() else {
+        return None;
+    };
+    if column_ref_is_column(cr, scope) {
+        return None;
+    }
+    let alias = match cr.fields.as_slice() {
+        [name]
+        | [
+            name,
+            protobuf::Node {
+                node: Some(node::Node::AStar(_)),
+            },
+        ] => match name.node.as_ref()? {
+            node::Node::String(s) => s.sval.as_str(),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    Some((alias, scope.find_source(alias)?))
+}
+
+/// The column `alias.field` a field selection `(alias).field` on entry
+/// `src`'s whole row (`arg`) stands for, if the entry has one of that
+/// name: ParseComplexProjection looks the name up among the entry's
+/// columns (scanNSItemForColumn) — by the names it exposes (an alias
+/// list's), a relation's system columns included — and makes it that
+/// column's Var: `(t).a` is `t.a`, `(t).ctid` is `t.ctid`. Nothing else
+/// of the row's type is reachable that way.
+pub(crate) fn entry_column(
+    alias: &str,
+    src: &crate::scope::TableSource,
+    field: &protobuf::Node,
+    arg: &protobuf::Node,
+) -> Option<protobuf::Node> {
+    let Some(node::Node::String(f)) = field.node.as_ref() else {
+        return None;
+    };
+    if !src
+        .columns
+        .iter()
+        .chain(&src.system_columns)
+        .any(|c| c.name == f.sval)
+    {
+        return None;
+    }
+    let location = match arg.node.as_ref() {
+        Some(node::Node::ColumnRef(cr)) => cr.location,
+        _ => -1,
+    };
+    Some(protobuf::Node {
+        node: Some(node::Node::ColumnRef(protobuf::ColumnRef {
+            fields: vec![
+                protobuf::Node {
+                    node: Some(node::Node::String(protobuf::String {
+                        sval: alias.to_owned(),
+                    })),
+                },
+                field.clone(),
+            ],
+            location,
+        })),
+    })
+}
+
+/// The column `t.f` that `ind`, a single field selection `(t).f` on a FROM
+/// entry's whole row, is ([`entry_column`]) — `None` for any other
+/// indirection.
+pub(crate) fn whole_row_field_column(
+    ind: &protobuf::AIndirection,
+    scope: &Scope,
+) -> Option<protobuf::Node> {
+    let [field] = ind.indirection.as_slice() else {
+        return None;
+    };
+    let (alias, src) = whole_row_entry(ind, scope)?;
+    entry_column(alias, src, field, ind.arg.as_deref()?)
+}
+
 /// Whether `cr` names a column (a Var in PG) rather than a FROM entry's
 /// whole row.
 pub(crate) fn column_ref_is_column(cr: &protobuf::ColumnRef, scope: &Scope) -> bool {
@@ -213,18 +268,12 @@ pub(crate) fn record_var_shape_visible(
 /// `(ROW(1, 'x'::text)).f2`), we use that directly — no snapshot lookup,
 /// since pseudo `record` has no `TypeKind::Composite` to consult.
 ///
-/// `relation_alias` is `Some(alias)` when the indirection's argument was a
-/// bare relation reference (`(alias).field` form). PG emits a different
-/// error wording in that case — `column alias.field does not exist` — so
-/// the analyzer mirrors it to keep `pg_sanity` aligned. For chained or
-/// composite-column accesses (`(c.col).field`, `((c).x).field`), pass
-/// `None` and the wording switches to PG's `column "f" not found in data
-/// type T`.
+/// A field of a FROM entry's whole row (`(alias).field`) is resolved as
+/// that entry's column instead ([`entry_column`]).
 pub(super) fn resolve_composite_field(
     current: &ExprType,
     field_name: &str,
     snapshot: &PgCatalog,
-    relation_alias: Option<&str>,
 ) -> Result<ExprType, AnalyzeError> {
     // Domain-over-composite needs unwrapping to see the composite fields.
     let base_oid = snapshot.unwrap_domain(current.type_oid);
@@ -233,9 +282,9 @@ pub(super) fn resolve_composite_field(
         && let Some(shape) = current.record_fields.as_ref().filter(|s| !s.hidden)
     {
         let field = shape.iter().find(|f| f.name == field_name).ok_or_else(|| {
-            missing_field(relation_alias, field_name, || {
-                format!("could not identify column \"{field_name}\" in record data type")
-            })
+            AnalyzeError::UndefinedColumn(format!(
+                "could not identify column \"{field_name}\" in record data type"
+            ))
         })?;
         // Field's full ExprType (including any nested record shape) is
         // already on `field.ty`; just OR the enclosing nullability in. A
@@ -277,9 +326,9 @@ pub(super) fn resolve_composite_field(
     // function without a column definition list): ParseFuncOrColumn finds
     // no field and reports the column, not the type (42703).
     if base_oid == oid::RECORD {
-        return Err(missing_field(relation_alias, field_name, || {
-            format!("could not identify column \"{field_name}\" in record data type")
-        }));
+        return Err(AnalyzeError::UndefinedColumn(format!(
+            "could not identify column \"{field_name}\" in record data type"
+        )));
     }
     let type_entry = snapshot.get_type(base_oid).ok_or_else(|| {
         AnalyzeError::UndefinedType(format!(
@@ -306,12 +355,10 @@ pub(super) fn resolve_composite_field(
         .iter()
         .find(|f| f.attname == field_name)
         .ok_or_else(|| {
-            missing_field(relation_alias, field_name, || {
-                format!(
-                    "column \"{field_name}\" not found in data type {}",
-                    type_entry.typname
-                )
-            })
+            AnalyzeError::UndefinedColumn(format!(
+                "column \"{field_name}\" not found in data type {}",
+                type_entry.typname
+            ))
         })?;
     crate::ddl::depend::note_column(relid, field_name);
 
@@ -320,22 +367,6 @@ pub(super) fn resolve_composite_field(
         current.nullable || composite_field_nullable(current, field_name),
         field.atttypmod,
     ))
-}
-
-/// PG's `unknown_attribute`: no field `field_name` in a FROM entry's whole
-/// row (`relation_alias`) is a missing column of that entry; in any other
-/// value, `other` words it after the value's type.
-fn missing_field(
-    relation_alias: Option<&str>,
-    field_name: &str,
-    other: impl FnOnce() -> String,
-) -> AnalyzeError {
-    AnalyzeError::UndefinedColumn(match relation_alias {
-        // errmsg("column %s.%s does not exist", rte->eref->aliasname,
-        // attname): the names as they are, neither quoted nor escaped.
-        Some(alias) => format!("column {alias}.{field_name} does not exist"),
-        None => other(),
-    })
 }
 
 /// Whether field `name` of a non-NULL composite value `value` may be NULL.
@@ -416,15 +447,7 @@ pub(crate) fn transform_array_expr(
                 _ => TypeGoal::NONE,
             };
             let t = infer_expr(elem, ctx, params, goal)?;
-            if !multidims
-                && !matches!(
-                    snapshot.get_type(t.type_oid).map(|e| e.typname.as_str()),
-                    Some("int2vector" | "oidvector")
-                )
-                && snapshot
-                    .get_type(t.type_oid)
-                    .is_some_and(|e| e.typcategory == TypCategory::Array && e.typelem.is_some())
-            {
+            if is_sub_array_type(t.type_oid, snapshot) {
                 multidims = true;
             }
             t
@@ -632,6 +655,17 @@ pub(crate) fn transform_array_expr(
         .with_elem_nullable(elem_nullable))
 }
 
+/// Whether an `ARRAY[…]` element of type `t` is a sub-array, making the
+/// constructor multidimensional (transformArrayExpr: an array type, other
+/// than `int2vector` / `oidvector`).
+fn is_sub_array_type(t: PgTypeOid, snapshot: &PgCatalog) -> bool {
+    snapshot.get_type(t).is_some_and(|e| {
+        !matches!(e.typname.as_str(), "int2vector" | "oidvector")
+            && e.typcategory == TypCategory::Array
+            && e.typelem.is_some()
+    })
+}
+
 /// What the query fixes of a sub-array of a multidimensional `ARRAY[…]`.
 #[derive(PartialEq, Eq)]
 enum SubArrayShape {
@@ -715,10 +749,16 @@ fn sub_array_shape(
                 return SubArrayShape::Absent;
             }
             let n = a.elements.len() as i64;
-            if a.elements
-                .iter()
-                .any(|e| matches!(e.node.as_ref(), Some(node::Node::AArrayExpr(_))))
-            {
+            // transformArrayExpr: a sub-ARRAY, or any element of an array
+            // type, makes it multidimensional.
+            let sub_array = |e: &protobuf::Node| {
+                matches!(e.node.as_ref(), Some(node::Node::AArrayExpr(_))) || {
+                    let mut scratch = params.clone();
+                    infer_expr(e, ctx, &mut scratch, TypeGoal::NONE)
+                        .is_ok_and(|t| is_sub_array_type(t.type_oid, ctx.snapshot))
+                }
+            };
+            if a.elements.iter().any(sub_array) {
                 // Its own sub-arrays: one shape for all of them, or (all
                 // NULL / empty) an empty array.
                 let inner: Vec<SubArrayShape> = a
@@ -860,7 +900,7 @@ pub(crate) fn expand_indirection_star(
         .iter()
         .filter(|a| a.attnum > 0)
     {
-        let mut ty = resolve_composite_field(&container, &attr.attname, snapshot, None)?;
+        let mut ty = resolve_composite_field(&container, &attr.attname, snapshot)?;
         ty.typmod = attr.atttypmod;
         out.push((attr.attname.clone(), ty));
     }
@@ -956,7 +996,7 @@ pub(crate) fn try_column_projection(
     if !has_field {
         return Ok(ColumnProjection::Not(Some(t)));
     }
-    resolve_composite_field(&t, &name.sval, snapshot, None).map(ColumnProjection::Field)
+    resolve_composite_field(&t, &name.sval, snapshot).map(ColumnProjection::Field)
 }
 
 /// What [`try_column_projection`] found a one-argument call to be.
