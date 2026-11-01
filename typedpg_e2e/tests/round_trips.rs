@@ -1,8 +1,11 @@
-//! A query whose parameter types are all built-in goes to the server in one
-//! round trip: `sql!` sends the types with it (`query_typed`), on the
-//! unnamed statement, instead of preparing it first. One whose parameters
-//! include a type with a database-specific OID (an enum) still works, sent
-//! untyped as before.
+//! A query goes to the server in one round trip: `sql!` sends its
+//! parameter types with it (`query_typed`), on the unnamed statement,
+//! instead of preparing it first — a built-in type by its OID; an enum, a
+//! domain over one or an extension's scalar type, whose OIDs are the
+//! database's own, with OID 0 ("unspecified"), for the server to infer from
+//! the placeholder's cast. One whose parameters include an array of such a
+//! type, or whose result columns include one, still works, sent untyped as
+//! before.
 //!
 //! The client talks to the server through [`Wire`], a proxy that reads the
 //! client's protocol messages: a round trip is one `Sync` (each ends an
@@ -11,8 +14,8 @@
 
 mod common;
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, NaiveDate, Utc};
 use rust_decimal::Decimal;
@@ -32,6 +35,8 @@ struct Counts {
     named_parses: AtomicUsize,
     /// `Parse` messages of the unnamed statement.
     unnamed_parses: AtomicUsize,
+    /// The parameter type OIDs of the last `Parse` (0: unspecified).
+    last_parse_oids: Mutex<Vec<u32>>,
 }
 
 /// A client connected through a counting proxy.
@@ -119,6 +124,11 @@ impl Wire {
         )
     }
 
+    /// The parameter type OIDs of the last `Parse` the client sent.
+    fn parse_oids(&self) -> Vec<u32> {
+        self.counts.last_parse_oids.lock().unwrap().clone()
+    }
+
     fn snapshot(&self) -> Sent {
         Sent {
             round_trips: self.counts.round_trips.load(Ordering::SeqCst),
@@ -178,6 +188,7 @@ fn count_messages(pending: &mut Vec<u8>, startup: &mut bool, counts: &Counts) {
                     } else {
                         &counts.unnamed_parses
                     };
+                    *counts.last_parse_oids.lock().unwrap() = parse_oids(&pending[5..total]);
                     counter.fetch_add(1, Ordering::SeqCst);
                 }
                 _ => {}
@@ -185,6 +196,27 @@ fn count_messages(pending: &mut Vec<u8>, startup: &mut bool, counts: &Counts) {
         }
         pending.drain(..total);
     }
+}
+
+/// The parameter type OIDs a `Parse` message's body declares: after the
+/// statement's name and the query, both NUL-terminated, an `Int16` count
+/// and that many `Int32` OIDs.
+fn parse_oids(body: &[u8]) -> Vec<u32> {
+    let mut rest = body;
+    for _ in 0..2 {
+        let nul = rest
+            .iter()
+            .position(|b| *b == 0)
+            .expect("a NUL-terminated string");
+        rest = &rest[nul + 1..];
+    }
+    let count = u16::from_be_bytes([rest[0], rest[1]]) as usize;
+    rest[2..2 + 4 * count]
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|oid| u32::from_be_bytes(*oid))
+        .collect()
 }
 
 /// Parameters of many built-in types, bound and returned through the typed
@@ -421,10 +453,11 @@ async fn spreads_go_in_one_round_trip() {
     assert_eq!(sent, ONE_ROUND_TRIP, "an empty list");
 }
 
-/// An enum's OID is the database's own: a query with an enum parameter (or
-/// an array of one) is sent untyped, prepared first as before — and works.
+/// An enum's OID is the database's own: a query returning an enum column,
+/// or with an enum array parameter (whose binary format embeds the
+/// element's OID), is sent untyped, prepared first as before — and works.
 #[tokio::test]
-async fn enum_parameters_fall_back_to_preparing() {
+async fn enum_columns_and_enum_arrays_fall_back_to_preparing() {
     let wire = Wire::connect().await;
     let client = &wire.client;
     let id = wire.unique_id().await;
@@ -548,4 +581,278 @@ async fn domain_parameters_go_as_their_base_type() {
     );
     assert_eq!(sent.named_parses, 0, "{sent:?}");
     assert_eq!(sent.round_trips, 1, "{sent:?}");
+}
+
+/// A row of NULLs in `unspecified_types`, at an id no other test uses.
+async fn unspecified_types_row(wire: &Wire) -> i32 {
+    let id = wire.unique_id().await;
+    wire.client
+        .simple_query(&format!("INSERT INTO unspecified_types (id) VALUES ({id})"))
+        .await
+        .expect("insert a row");
+    id
+}
+
+/// An enum's OID is the database's own, but its binary format (the label)
+/// embeds none: an enum parameter goes with OID 0, the server inferring
+/// the type from the placeholder's cast — in one round trip, on the
+/// unnamed statement, whether the enum is bound as a `String` (unmapped) or
+/// as a mapped Rust enum, in a query returning built-in columns or run
+/// through `execute`.
+#[tokio::test]
+async fn enum_parameters_go_unspecified_in_one_round_trip() {
+    let wire = Wire::connect().await;
+    let client = &wire.client;
+    let id = wire.unique_id().await;
+
+    // An INSERT through `execute`: `mood` unmapped, bound as a String.
+    let m = Some("sad".to_string());
+    let (inserted, sent) = wire
+        .sent(sql!(client, "INSERT INTO moods (id, mood) VALUES ($id, $m)").execute())
+        .await;
+    assert_eq!(inserted.expect("insert an enum"), 1);
+    assert_eq!(sent, ONE_ROUND_TRIP, "an INSERT through execute");
+    assert_eq!(wire.parse_oids(), [23, 0]);
+
+    // An UPDATE through `execute`.
+    let m = Some("ok".to_string());
+    let (updated, sent) = wire
+        .sent(sql!(client, "UPDATE moods SET mood = $m WHERE id = $id").execute())
+        .await;
+    assert_eq!(updated.expect("update an enum"), 1);
+    assert_eq!(sent, ONE_ROUND_TRIP, "an UPDATE through execute");
+    assert_eq!(wire.parse_oids(), [0, 23]);
+
+    // A SELECT returning built-in columns.
+    let m = "ok".to_string();
+    let (found, sent) = wire
+        .sent(
+            sql!(
+                client,
+                "SELECT id, mood::text AS label FROM moods WHERE id = $id AND mood = $m"
+            )
+            .fetch_all(),
+        )
+        .await;
+    let found = found.expect("select by an enum");
+    assert_eq!(sent, ONE_ROUND_TRIP, "an unmapped enum in a SELECT");
+    assert_eq!(wire.parse_oids(), [23, 0]);
+    assert_eq!(found.len(), 1);
+    assert_eq!((found[0].id, found[0].label.as_str()), (id, "ok"));
+
+    // A list spread of enums, below the threshold: unspecified per item.
+    let moods = ["sad".to_string(), "ok".to_string()];
+    let (found, sent) = wire
+        .sent(
+            sql!(
+                client,
+                "SELECT id FROM moods WHERE id = $id AND mood IN $..moods"
+            )
+            .fetch_all(),
+        )
+        .await;
+    let found = found.expect("select by a list of enums");
+    assert_eq!(sent, ONE_ROUND_TRIP, "a list spread of enums");
+    assert_eq!(wire.parse_oids(), [23, 0, 0]);
+    assert_eq!(found.iter().map(|r| r.id).collect::<Vec<_>>(), [id]);
+
+    // A mapped enum (`post_status` → `PostStatus`).
+    let id = unspecified_types_row(&wire).await;
+    let s = Some(typedpg_e2e::PostStatus::Published);
+    let (row, sent) = wire
+        .sent(
+            sql!(
+                client,
+                "UPDATE unspecified_types SET status = $s WHERE id = $id \
+                 RETURNING id, status::text AS label"
+            )
+            .fetch_one(),
+        )
+        .await;
+    let row = row.expect("update a mapped enum");
+    assert_eq!(sent, ONE_ROUND_TRIP, "a mapped enum");
+    assert_eq!(wire.parse_oids(), [0, 23]);
+    assert_eq!((row.id, row.label.as_deref()), (id, Some("published")));
+
+    let s = typedpg_e2e::PostStatus::Published;
+    let (found, sent) = wire
+        .sent(
+            sql!(
+                client,
+                "SELECT id FROM unspecified_types WHERE status = $s AND id = $id"
+            )
+            .fetch_optional(),
+        )
+        .await;
+    assert_eq!(
+        found.expect("select by a mapped enum").map(|r| r.id),
+        Some(id)
+    );
+    assert_eq!(sent, ONE_ROUND_TRIP, "a mapped enum in a SELECT");
+    assert_eq!(wire.parse_oids(), [0, 23]);
+}
+
+/// A domain parameter is cast to its base type: a domain over an enum goes
+/// as the enum, unspecified.
+#[tokio::test]
+async fn domains_over_enums_go_unspecified_in_one_round_trip() {
+    let wire = Wire::connect().await;
+    let client = &wire.client;
+    let id = wire.unique_id().await;
+
+    let m = Some("sad".to_string());
+    let (row, sent) = wire
+        .sent(
+            sql!(
+                client,
+                "INSERT INTO unspecified_types (id, mood) VALUES ($id, $m) \
+                 RETURNING id, mood::text AS label"
+            )
+            .fetch_one(),
+        )
+        .await;
+    let row = row.expect("insert a domain over an enum");
+    assert_eq!(sent, ONE_ROUND_TRIP, "a domain over an enum");
+    assert_eq!(wire.parse_oids(), [23, 0]);
+    assert_eq!((row.id, row.label.as_deref()), (id, Some("sad")));
+}
+
+/// An extension's scalar type (`citext`, mapped to `String`) has an OID of
+/// the database's own and a binary format that embeds none: it goes
+/// unspecified too — and the server compares it as `citext`, ignoring case.
+#[tokio::test]
+async fn extension_scalar_parameters_go_unspecified_in_one_round_trip() {
+    let wire = Wire::connect().await;
+    let client = &wire.client;
+    let id = unspecified_types_row(&wire).await;
+    let name = common::unique("Citext");
+
+    let n = Some(name.clone());
+    let (updated, sent) = wire
+        .sent(
+            sql!(
+                client,
+                "UPDATE unspecified_types SET name = $n WHERE id = $id"
+            )
+            .execute(),
+        )
+        .await;
+    assert_eq!(updated.expect("update a citext"), 1);
+    assert_eq!(sent, ONE_ROUND_TRIP, "a citext through execute");
+    assert_eq!(wire.parse_oids(), [0, 23]);
+
+    let n = name.to_uppercase();
+    let (found, sent) = wire
+        .sent(sql!(client, "SELECT id FROM unspecified_types WHERE name = $n").fetch_all())
+        .await;
+    let found = found.expect("select by a citext");
+    assert_eq!(sent, ONE_ROUND_TRIP, "a citext in a SELECT");
+    assert_eq!(wire.parse_oids(), [0]);
+    assert_eq!(found.iter().map(|r| r.id).collect::<Vec<_>>(), [id]);
+}
+
+/// A value the server rejects fails the same way sent unspecified as sent
+/// untyped (prepared first): the error comes from the same receive
+/// function, `enum_recv`.
+#[tokio::test]
+async fn an_invalid_enum_value_fails_as_before() {
+    let wire = Wire::connect().await;
+    let client = &wire.client;
+    let id = wire.unique_id().await;
+
+    let m = Some("zz".to_string());
+    let (result, sent) = wire
+        .sent(sql!(client, "UPDATE moods SET mood = $m WHERE id = $id").execute())
+        .await;
+    let typed = match result.expect_err("an invalid label") {
+        typedpg::Error::Database(e) => e,
+        other => panic!("not a database error: {other:?}"),
+    };
+    assert_eq!(sent, ONE_ROUND_TRIP, "sent unspecified");
+    assert_eq!(wire.parse_oids(), [0, 23]);
+
+    // The untyped path, with the SQL and parameters `sql!` sends.
+    let label = typedpg::__private::EnumString("zz".to_string());
+    let (untyped, sent) = wire
+        .sent(typedpg::__private::run_execute(
+            client,
+            "UPDATE moods SET mood = ($1::public.mood) WHERE id = ($2::pg_catalog.int4)",
+            &[&label, &id],
+            None,
+        ))
+        .await;
+    let untyped = match untyped.expect_err("an invalid label") {
+        typedpg::Error::Database(e) => e,
+        other => panic!("not a database error: {other:?}"),
+    };
+    assert!(sent.named_parses >= 1, "prepared first: {sent:?}");
+
+    for err in [&typed, &untyped] {
+        let db = err.as_db_error().expect("a server error");
+        assert_eq!(
+            db.code(),
+            &tokio_postgres::error::SqlState::INVALID_TEXT_REPRESENTATION
+        );
+        assert_eq!(db.message(), "invalid input value for enum mood: \"zz\"");
+    }
+}
+
+/// A bound value whose `ToSql` refuses the type built for an unspecified
+/// parameter (here, wanting the database's OID) fails nothing: no byte has
+/// reached the server, and the query is sent untyped, prepared first.
+#[tokio::test]
+async fn a_value_refusing_the_unspecified_type_falls_back() {
+    use tokio_postgres::types::{IsNull, ToSql, Type, to_sql_checked};
+
+    #[derive(Debug)]
+    struct WantsOid(String);
+
+    impl ToSql for WantsOid {
+        fn to_sql(
+            &self,
+            _: &Type,
+            out: &mut typedpg::__private::bytes::BytesMut,
+        ) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
+            out.extend_from_slice(self.0.as_bytes());
+            Ok(IsNull::No)
+        }
+
+        fn accepts(ty: &Type) -> bool {
+            ty.name() == "citext" && ty.oid() != 0
+        }
+
+        to_sql_checked!();
+    }
+
+    let wire = Wire::connect().await;
+    let client = &wire.client;
+    let id = unspecified_types_row(&wire).await;
+    let name = common::unique("wants-oid");
+    client
+        .simple_query(&format!(
+            "UPDATE unspecified_types SET name = '{name}' WHERE id = {id}"
+        ))
+        .await
+        .expect("set the name");
+
+    let value = WantsOid(name.to_uppercase());
+    let citext = typedpg::__private::ParamType::Unspecified {
+        schema: "public",
+        name: "citext",
+        kind: typedpg::__private::UnspecifiedKind::Simple,
+    };
+    let (rows, sent) = wire
+        .sent(typedpg::__private::run_query(
+            client,
+            "SELECT id FROM unspecified_types WHERE name = ($1::public.citext)",
+            &[&value],
+            Some(&[citext]),
+            Some(&[23]),
+        ))
+        .await;
+    let rows = rows.expect("sent untyped");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, i32>(0), id);
+    assert!(sent.named_parses >= 1, "prepared first: {sent:?}");
+    assert_eq!(sent.unnamed_parses, 0, "nothing sent typed: {sent:?}");
 }
