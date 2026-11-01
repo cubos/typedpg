@@ -431,6 +431,21 @@ pub(crate) fn assignment_error(
     crate::expr::plan_time_error(location, e)
 }
 
+/// [`check_literal_assignment`]'s error where the executor, not the
+/// planner, converts the value: an output of a subquery that isn't pulled
+/// up, assigned to its column once evaluated. Not a plan-time error, so
+/// the caller decides whether the statement runs.
+pub(crate) fn evaluated_assignment_error(
+    snapshot: &PgCatalog,
+    type_oid: PgTypeOid,
+    typmod: Option<i32>,
+    value: &Node,
+) -> Option<AnalyzeError> {
+    assignment_error_here(snapshot, type_oid, typmod, value, || {
+        crate::error::expr_span(value)
+    })
+}
+
 fn assignment_error_here(
     snapshot: &PgCatalog,
     type_oid: PgTypeOid,

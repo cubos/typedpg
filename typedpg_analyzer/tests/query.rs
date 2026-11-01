@@ -56,6 +56,8 @@ mod fact_soundness;
 mod function_aggregate_narrowing;
 #[path = "query/function_soundness.rs"]
 mod function_soundness;
+#[path = "query/insert_select_row.rs"]
+mod insert_select_row;
 #[path = "query/join_row_guarantees.rs"]
 mod join_row_guarantees;
 #[path = "query/join_rules.rs"]
