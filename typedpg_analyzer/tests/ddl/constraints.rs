@@ -1462,3 +1462,85 @@ fn a_foreign_keys_explicit_name_must_be_free() {
         assert!(err.to_string().starts_with(&msg), "{stmt}\n  got: {err}");
     }
 }
+
+/// A partition's clone of a foreign key takes the key's name unless the
+/// partition already has a constraint so named; then it is `name_1`,
+/// `name_2`, … the first no constraint in the schema has (addFkConstraint's
+/// ChooseConstraintName(name, NULL, "")) — as PG 18.6 names them.
+#[test]
+fn partition_foreign_key_clone_names() {
+    use typedpg_analyzer::ConType;
+    let fk_names = |db: &PgCatalog, table: &str| -> Vec<String> {
+        let mut names: Vec<String> = db
+            .constraints_of_table(table)
+            .into_iter()
+            .filter(|c| c.contype == ConType::ForeignKey)
+            .map(|c| c.conname)
+            .collect();
+        names.sort();
+        names
+    };
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE pk (id int PRIMARY KEY);
+         -- Detached, changed and attached again: the old clone can't be reused.
+         CREATE TABLE p1 (a int) PARTITION BY RANGE (a);
+         CREATE TABLE p1c PARTITION OF p1 FOR VALUES FROM (0) TO (10);
+         ALTER TABLE p1 ADD CONSTRAINT f FOREIGN KEY (a) REFERENCES pk;
+         ALTER TABLE p1 DETACH PARTITION p1c;
+         ALTER TABLE p1c ALTER CONSTRAINT f DEFERRABLE;
+         ALTER TABLE p1 ATTACH PARTITION p1c FOR VALUES FROM (0) TO (10);
+         -- f and f_1 both taken on the partition.
+         CREATE TABLE p2 (a int) PARTITION BY RANGE (a);
+         CREATE TABLE p2c (a int, CONSTRAINT f FOREIGN KEY (a) REFERENCES pk DEFERRABLE,
+                           CONSTRAINT f_1 CHECK (a > -1));
+         ALTER TABLE p2 ADD CONSTRAINT f FOREIGN KEY (a) REFERENCES pk;
+         ALTER TABLE p2 ATTACH PARTITION p2c FOR VALUES FROM (0) TO (10);
+         -- A CHECK of the partition named f: the schema has f_1 and f_2.
+         CREATE TABLE p3 (a int) PARTITION BY RANGE (a);
+         CREATE TABLE p3c (a int, CONSTRAINT f CHECK (a > -1));
+         ALTER TABLE p3 ADD CONSTRAINT f FOREIGN KEY (a) REFERENCES pk;
+         ALTER TABLE p3 ATTACH PARTITION p3c FOR VALUES FROM (0) TO (10);
+         -- ADD FOREIGN KEY on a partitioned table.
+         CREATE TABLE p4 (a int) PARTITION BY RANGE (a);
+         CREATE TABLE p4c PARTITION OF p4 FOR VALUES FROM (0) TO (10);
+         ALTER TABLE p4c ADD CONSTRAINT f CHECK (a > -1);
+         ALTER TABLE p4 ADD CONSTRAINT f FOREIGN KEY (a) REFERENCES pk;
+         -- A name at the length limit is shortened for the suffix.
+         CREATE TABLE p6 (a int) PARTITION BY RANGE (a);
+         CREATE TABLE p6c (a int,
+             CONSTRAINT abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij123
+             CHECK (a > -1));
+         ALTER TABLE p6 ADD CONSTRAINT
+             abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij123
+             FOREIGN KEY (a) REFERENCES pk;
+         ALTER TABLE p6 ATTACH PARTITION p6c FOR VALUES FROM (0) TO (10);
+         -- Two levels, two columns: the sub-partition keeps the clone's name.
+         CREATE TABLE pk2 (x int, y int, PRIMARY KEY (x, y));
+         CREATE TABLE p7 (a int, b int) PARTITION BY RANGE (a);
+         CREATE TABLE p7c (a int, b int, CONSTRAINT g CHECK (a > -1)) PARTITION BY RANGE (a);
+         CREATE TABLE p7cc (a int, b int, CONSTRAINT g CHECK (a > -1),
+                            CONSTRAINT g_1 CHECK (b > -1));
+         ALTER TABLE p7c ATTACH PARTITION p7cc FOR VALUES FROM (0) TO (10);
+         ALTER TABLE p7 ADD CONSTRAINT g FOREIGN KEY (a, b) REFERENCES pk2;
+         ALTER TABLE p7 ATTACH PARTITION p7c FOR VALUES FROM (0) TO (10);",
+    )]);
+    let s = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+    assert_eq!(fk_names(&db, "p1c"), s(&["f", "f_1"]));
+    assert_eq!(fk_names(&db, "p2c"), s(&["f", "f_2"]));
+    assert_eq!(fk_names(&db, "p3c"), s(&["f_3"]));
+    assert_eq!(fk_names(&db, "p4c"), s(&["f_4"]));
+    assert_eq!(
+        fk_names(&db, "p6c"),
+        s(&["abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij1_1"])
+    );
+    assert_eq!(fk_names(&db, "p7c"), s(&["g_2"]));
+    assert_eq!(fk_names(&db, "p7cc"), s(&["g_2"]));
+    // The name is what later statements find it by.
+    db.apply_sql(
+        "ALTER TABLE p1 DETACH PARTITION p1c;
+         ALTER TABLE p1c DROP CONSTRAINT f_1;",
+    )
+    .unwrap();
+    assert_eq!(fk_names(&db, "p1c"), s(&["f"]));
+}
