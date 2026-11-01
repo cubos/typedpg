@@ -95,6 +95,25 @@ impl<'a> FromScope<'a> {
         }
     }
 
+    /// The scope of a list of FROM items alone (a join's two sides, for
+    /// its ON condition), within `parent`.
+    pub(crate) fn of_items(
+        ctx: &Ctx<'_>,
+        from: &[Node],
+        parent: Option<&'a FromScope<'a>>,
+    ) -> FromScope<'a> {
+        let ctes = cte_names(ctx);
+        let mut items = Vec::new();
+        for f in from {
+            from_item(ctx, &ctes, f, false, &mut items);
+        }
+        FromScope {
+            items,
+            grouping_sets: false,
+            parent,
+        }
+    }
+
     /// The scope an UPDATE's SET and WHERE, or a DELETE's WHERE, see: the
     /// target relation and the FROM / USING items.
     pub(crate) fn of_dml(
@@ -506,13 +525,27 @@ const UNKNOWN: u32 = 705;
 /// The comparison operators [`cannot_error`] accepts.
 const COMPARISONS: &[&str] = &["=", "<>", "!=", "<", "<=", ">", ">="];
 
+/// Where an operand's collation comes from.
+#[derive(Clone, Copy)]
+enum OperandCollation {
+    /// A column: its own (`attcollation`), with implicit derivation.
+    Column(Option<crate::oid::PgCollationOid>),
+    /// A constant or parameter: its type's (`typcollation`) once coerced,
+    /// with implicit derivation too.
+    OfType,
+}
+
+/// `DEFAULT_COLLATION_OID`: the database default, which an implicit
+/// collation of the other side overrides without a conflict.
+const DEFAULT_COLLATION: u32 = 100;
+
 /// What an operand of a comparison is, for [`cannot_error`]: its type, and
-/// its collation when it is a column.
+/// where its collation comes from.
 fn operand(
     ctx: &Ctx<'_>,
     node: &Node,
     scope: &FromScope<'_>,
-) -> Option<(crate::oid::PgTypeOid, Option<crate::oid::PgCollationOid>)> {
+) -> Option<(crate::oid::PgTypeOid, OperandCollation)> {
     use crate::oid::PgTypeOid;
     use typedpg_pg_query::protobuf::a_const::Val;
     match node.node.as_ref()? {
@@ -523,9 +556,9 @@ fn operand(
                 .attributes_of(r.rel)
                 .iter()
                 .find(|a| a.attnum == r.attnum)?;
-            Some((attr.atttypid, attr.attcollation))
+            Some((attr.atttypid, OperandCollation::Column(attr.attcollation)))
         }
-        N::AConst(c) if c.isnull => Some((PgTypeOid::from_raw(UNKNOWN), None)),
+        N::AConst(c) if c.isnull => Some((PgTypeOid::from_raw(UNKNOWN), OperandCollation::OfType)),
         N::AConst(c) => Some((
             PgTypeOid::from_raw(match c.val.as_ref()? {
                 Val::Ival(_) => 23,
@@ -534,7 +567,7 @@ fn operand(
                 Val::Sval(_) => UNKNOWN,
                 Val::Bsval(_) => return None,
             }),
-            None,
+            OperandCollation::OfType,
         )),
         N::ParamRef(p) => {
             let param = ctx
@@ -548,10 +581,46 @@ fn operand(
             };
             Some((
                 ctx.catalog.resolve_type_by_name(Some(schema), name)?.oid,
-                None,
+                OperandCollation::OfType,
             ))
         }
         _ => None,
+    }
+}
+
+/// Whether comparing operands of these (coerced) types and collation
+/// sources can't hit a collation conflict at run time. Every side's
+/// derivation is implicit — a column's, and a constant's or parameter's,
+/// which is its type's collation (`name`'s is "C") — so PG merges them
+/// without complaint only when they are equal or one is the database
+/// default (which the other then overrides). Two columns must agree
+/// exactly; a collatable type whose collation can't be read is refused.
+fn collations_agree(
+    catalog: &PgCatalog,
+    left: (crate::oid::PgTypeOid, OperandCollation),
+    right: (crate::oid::PgTypeOid, OperandCollation),
+) -> bool {
+    let collatable = |t: crate::oid::PgTypeOid| catalog.get_type(t).map(|t| t.typcollation);
+    let (Some(lcoll), Some(rcoll)) = (collatable(left.0), collatable(right.0)) else {
+        return false;
+    };
+    if lcoll.is_none() && rcoll.is_none() {
+        return true;
+    }
+    let effective =
+        |(coll, source): (Option<crate::oid::PgCollationOid>, OperandCollation)| match source {
+            OperandCollation::Column(c) => c,
+            OperandCollation::OfType => coll,
+        };
+    match (left.1, right.1) {
+        (OperandCollation::Column(a), OperandCollation::Column(b)) => a.is_some() && a == b,
+        _ => {
+            let (Some(a), Some(b)) = (effective((lcoll, left.1)), effective((rcoll, right.1)))
+            else {
+                return false;
+            };
+            a == b || a.get() == DEFAULT_COLLATION || b.get() == DEFAULT_COLLATION
+        }
     }
 }
 
@@ -607,11 +676,8 @@ pub(crate) fn cannot_error(ctx: &Ctx<'_>, expr: &Node, scope: &FromScope<'_>) ->
                 (false, true) => (lt, lt),
                 (false, false) => (lt, rt),
             };
-            let collations_agree = match (lc, rc) {
-                (Some(a), Some(b)) => a == b,
-                _ => true,
-            };
-            collations_agree && builtin_operator_exact(ctx.catalog, op, lt, rt).is_some()
+            collations_agree(ctx.catalog, (lt, lc), (rt, rc))
+                && builtin_operator_exact(ctx.catalog, op, lt, rt).is_some()
         }
         _ => false,
     }
@@ -650,12 +716,19 @@ pub(crate) fn error_free_select(ctx: &Ctx<'_>, select: &SelectStmt, scope: &From
         Some(N::AConst(c)) => c.isnull || matches!(&c.val, Some(Val::Ival(i)) if i.ival >= 0),
         _ => false,
     };
-    quals.into_iter().all(ok)
-        && select.target_list.iter().all(|t| match t.node.as_ref() {
-            Some(N::ResTarget(r)) => r.indirection.is_empty() && r.val.as_deref().is_some_and(ok),
-            _ => false,
-        })
-        && select.where_clause.as_deref().is_none_or(ok)
+    // An ON condition sees its own join's items and the levels around the
+    // subquery's, not the subquery's other FROM items.
+    quals.into_iter().all(|(q, join)| {
+        let sides: Vec<Node> = [&join.larg, &join.rarg]
+            .into_iter()
+            .flatten()
+            .map(|n| (**n).clone())
+            .collect();
+        cannot_error(ctx, q, &FromScope::of_items(ctx, &sides, scope.parent))
+    }) && select.target_list.iter().all(|t| match t.node.as_ref() {
+        Some(N::ResTarget(r)) => r.indirection.is_empty() && r.val.as_deref().is_some_and(ok),
+        _ => false,
+    }) && select.where_clause.as_deref().is_none_or(ok)
         && select.group_clause.iter().all(ok)
         && select.having_clause.as_deref().is_none_or(ok)
         && select
@@ -677,7 +750,7 @@ fn reads_stored_tables<'n>(
     ctx: &Ctx<'_>,
     ctes: &HashSet<String>,
     from: &'n Node,
-    quals: &mut Vec<&'n Node>,
+    quals: &mut Vec<(&'n Node, &'n typedpg_pg_query::protobuf::JoinExpr)>,
 ) -> bool {
     match from.node.as_ref() {
         Some(N::RangeVar(rv)) => {
@@ -693,7 +766,7 @@ fn reads_stored_tables<'n>(
                 return false;
             }
             if let Some(q) = j.quals.as_deref() {
-                quals.push(q);
+                quals.push((q, j));
             }
             [&j.larg, &j.rarg].into_iter().all(|side| {
                 side.as_deref()
@@ -770,6 +843,21 @@ pub(crate) fn written_names_use(ctx: &Ctx<'_>, prefix: &str) -> bool {
         NodeRef::CommonTableExpr(c) => hit(&c.ctename),
         _ => false,
     })
+}
+
+/// The collation of column `attnum` of `rel` (`None`: not collatable),
+/// `Err` when the column doesn't exist.
+pub(crate) fn column_collation(
+    catalog: &PgCatalog,
+    rel: PgClassOid,
+    attnum: i16,
+) -> Result<Option<crate::oid::PgCollationOid>, ()> {
+    catalog
+        .attributes_of(rel)
+        .iter()
+        .find(|a| a.attnum == attnum)
+        .map(|a| a.attcollation)
+        .ok_or(())
 }
 
 /// The type of column `attnum` of `rel`.

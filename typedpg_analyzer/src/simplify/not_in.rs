@@ -52,8 +52,8 @@ use typedpg_pg_query::protobuf::{
 };
 
 use super::proof::{
-    FromScope, builtin_strict_equality, column_type, embed_source, error_free_select, has_volatile,
-    qualified_column, strictly_not_null, written_names_use,
+    FromScope, builtin_strict_equality, column_collation, column_type, embed_source,
+    error_free_select, has_volatile, qualified_column, strictly_not_null, written_names_use,
 };
 use super::{Candidate, Ctx, Edit, Rule};
 
@@ -361,6 +361,16 @@ impl Walker<'_, '_> {
                 column_type(ctx.catalog, r.rel, r.attnum)?,
             );
             if !builtin_strict_equality(ctx.catalog, lt, rt) {
+                return None;
+            }
+            // The same collation on both sides: `x = ANY (sub)` compares
+            // under the left column's or the subquery output's collation
+            // as PG merges them, but an anti-join hashes or sorts both
+            // sides, which fails outright on two different collations.
+            // (Both sides are plain columns: no COLLATE clause to weigh.)
+            if column_collation(ctx.catalog, l.rel, l.attnum)
+                != column_collation(ctx.catalog, r.rel, r.attnum)
+            {
                 return None;
             }
         }

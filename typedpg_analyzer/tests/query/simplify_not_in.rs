@@ -764,6 +764,88 @@ fn the_left_side_is_qualified_where_it_moves() {
     );
 }
 
+#[test]
+fn the_pair_must_share_a_collation() {
+    // An anti-join hashes both sides: two collations can't be hashed
+    // together, where `x = ANY (sub)` merged them.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE r1 (a text COLLATE \"C\" NOT NULL, d text NOT NULL);
+         CREATE TABLE r2 (b text COLLATE \"POSIX\" NOT NULL, c text COLLATE \"C\" NOT NULL,
+                          d text NOT NULL);",
+    )
+    .unwrap();
+    assert_kept(&db, "SELECT a FROM r1 WHERE a NOT IN (SELECT b FROM r2)");
+    assert_kept(
+        &db,
+        "SELECT a FROM r1 WHERE (a, d) NOT IN (SELECT c, b FROM r2)",
+    );
+    // Default collation on both sides, or "C" on both.
+    assert_rewritten(
+        &db,
+        "SELECT a FROM r1 WHERE r1.d NOT IN (SELECT r2.d FROM r2)",
+        "SELECT a FROM r1 WHERE (NOT EXISTS (SELECT 1 FROM r2 WHERE r1.d = r2.d))",
+    );
+    assert_rewritten(
+        &db,
+        "SELECT a FROM r1 WHERE (a, d) NOT IN (SELECT c, d FROM r2)",
+        "SELECT a FROM r1 WHERE (NOT EXISTS (SELECT 1 FROM r2 WHERE r1.a = c AND r1.d = d))",
+    );
+}
+
+#[test]
+fn a_constant_compared_under_a_conflicting_collation_is_kept() {
+    // `'ab'` against a `name` column becomes a `name`, collation "C",
+    // implicit like the column's `nd`: comparing them is a conflict on
+    // every row evaluated.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE COLLATION nd (provider = icu, locale = 'und', deterministic = false);
+         CREATE TABLE o (k int NOT NULL, g int NOT NULL);
+         CREATE TABLE s (k int NOT NULL, g int NOT NULL, nm name COLLATE nd NOT NULL,
+                         tx text COLLATE nd NOT NULL, c name NOT NULL);",
+    )
+    .unwrap();
+    assert_kept(
+        &db,
+        "SELECT o.k FROM o WHERE o.k NOT IN (SELECT s.k FROM s WHERE s.g = o.g AND s.nm = 'ab')",
+    );
+    // A text constant has the default collation, which the column's
+    // overrides; a `name` column of collation "C" agrees with the constant.
+    for cond in ["s.tx = 'ab'", "s.c = 'ab'"] {
+        assert_rewritten(
+            &db,
+            &format!("SELECT o.k FROM o WHERE o.k NOT IN (SELECT s.k FROM s WHERE {cond})"),
+            &format!(
+                "SELECT o.k FROM o WHERE (NOT EXISTS (SELECT 1 FROM s WHERE ({cond}) AND o.k = s.k))"
+            ),
+        );
+    }
+}
+
+#[test]
+fn an_on_condition_resolves_in_its_own_join() {
+    // In `a JOIN (b JOIN c ON v = 1) ON …`, `v` isn't `a.v`: the inner ON
+    // sees `b` and `c` only, so `v` is the outer `t.v` there.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE t (k int NOT NULL, v text NOT NULL);
+         CREATE TABLE a (k int NOT NULL, v int NOT NULL);
+         CREATE TABLE b (k int NOT NULL);
+         CREATE TABLE c (k int NOT NULL);",
+    )
+    .unwrap();
+    // `t.v = 1` would cast the literal to text; as `a.v` it's an int
+    // comparison. Resolved in its own scope, it is the text one, which is
+    // still fine; the point is that `a`'s columns aren't seen there.
+    let (_, rules) = simplified(
+        &db,
+        "SELECT t.k FROM t WHERE t.k NOT IN \
+         (SELECT a.k FROM a JOIN (b JOIN c ON b.k = c.k AND v = 'x') ON a.k = b.k)",
+    );
+    assert_eq!(rules, vec![Rule::NotIn]);
+}
+
 // ── Opt-outs ────────────────────────────────────────────────────────────────
 
 #[test]
