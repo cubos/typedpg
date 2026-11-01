@@ -1270,19 +1270,25 @@ pub(crate) fn check_index_columns(
         let Some(inner) = expr.node.as_ref() else {
             continue;
         };
-        for (n, ..) in inner.nodes() {
-            let typedpg_pg_query::NodeRef::ColumnRef(cr) = n else {
-                continue;
-            };
-            let Some(name) = cr.fields.last().and_then(super::util::node_string) else {
-                continue;
-            };
+        // A column by name, or selected from the whole row (`(t).a`).
+        let names = inner
+            .nodes()
+            .into_iter()
+            .filter_map(|(n, ..)| match n {
+                typedpg_pg_query::NodeRef::ColumnRef(cr) => {
+                    cr.fields.last().and_then(super::util::node_string)
+                }
+                _ => None,
+            })
+            .chain(
+                super::util::relation_row_selections(db, relid, expr)
+                    .into_iter()
+                    .map(|(_, field)| field),
+            );
+        for name in names {
             match db.attribute_by_name(relid, name) {
                 Some(attr) => read.push(attr.attnum),
-                None if crate::pg_catalog::SYSTEM_COLUMNS
-                    .iter()
-                    .any(|(n, ..)| *n == name) =>
-                {
+                None if super::util::is_system_column(name) => {
                     return Err(system());
                 }
                 None => {}

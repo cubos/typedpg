@@ -1108,6 +1108,192 @@ fn unqualified_system_columns_resolve_on_tables_only() {
 }
 
 #[test]
+fn whole_row_field_selection_finds_system_columns() {
+    // ParseComplexProjection on a FROM entry's whole-row Var looks the
+    // field up with scanNSItemForColumn, which finds a relation's system
+    // columns too: `(t).ctid` is `t.ctid`. Only on a relation's row — a
+    // view, a subquery or any other composite has none.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE t (a int);
+         CREATE TABLE u (b int);
+         CREATE VIEW v AS SELECT * FROM t;
+         CREATE TABLE w (t t);",
+    )
+    .unwrap();
+    let s = db.analyze("SELECT (t).ctid FROM t").unwrap();
+    assert_cols(&s, vec![c("ctid", basic("pg_catalog", "tid"))]);
+    let s = db
+        .analyze("SELECT (x).xmin, (x).tableoid FROM t AS x")
+        .unwrap();
+    assert_cols(
+        &s,
+        vec![
+            c("xmin", basic("pg_catalog", "xid")),
+            c("tableoid", basic("pg_catalog", "oid")),
+        ],
+    );
+    // The column of the nullable side of an outer join.
+    let s = db
+        .analyze("SELECT (t).ctid FROM u LEFT JOIN t ON a = b")
+        .unwrap();
+    assert_cols(&s, vec![cn("ctid", basic("pg_catalog", "tid"))]);
+    for (sql, msg) in [
+        ("SELECT (v).ctid FROM v", "column v.ctid does not exist"),
+        (
+            "SELECT (s).ctid FROM (SELECT 1) s",
+            "column s.ctid does not exist",
+        ),
+        (
+            "SELECT (ROW(1)).ctid",
+            "could not identify column \"ctid\" in record data type",
+        ),
+        // `t` is the column of type `t` here, not the row of `w`.
+        (
+            "SELECT (t).ctid FROM w",
+            "column \"ctid\" not found in data type t",
+        ),
+        (
+            "SELECT (t).ctid FROM w, t",
+            "column \"ctid\" not found in data type t",
+        ),
+    ] {
+        let err = db.analyze(sql).expect_err(sql);
+        assert!(err.to_string().starts_with(msg), "{sql}\n  got: {err}");
+    }
+}
+
+#[test]
+fn whole_row_field_selection_is_the_column_everywhere() {
+    // ParseComplexProjection makes `(t).f` — a field of a FROM entry's
+    // whole row naming one of its columns — that column's Var: grouping,
+    // DISTINCT and ORDER BY see `t.f`, whichever way either side is
+    // written. A field is looked up by the names the entry exposes.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE t (a int); CREATE TABLE n (c int NOT NULL);")
+        .unwrap();
+    for sql in [
+        "SELECT t.ctid FROM t GROUP BY (t).ctid",
+        "SELECT (t).ctid FROM t GROUP BY t.ctid",
+        "SELECT (t).xmin FROM t GROUP BY xmin",
+        "SELECT (t).ctid, count(*) FROM t GROUP BY t.ctid HAVING (t).ctid IS NOT NULL",
+        "SELECT t.a FROM t GROUP BY (t).a",
+        "SELECT (t.*).a FROM t GROUP BY a",
+        "SELECT (x).a FROM t x GROUP BY x.a",
+        "SELECT s.x FROM (SELECT 1 x) s GROUP BY (s).x",
+        "SELECT (t).a, (SELECT (t).a) FROM t GROUP BY t.a",
+        "SELECT (SELECT t.ctid) FROM t GROUP BY (t).ctid",
+        "SELECT DISTINCT t.ctid FROM t ORDER BY (t).ctid",
+        "SELECT DISTINCT (t).ctid FROM t ORDER BY t.ctid",
+        "SELECT DISTINCT ON ((t).ctid) a FROM t ORDER BY t.ctid",
+        "SELECT DISTINCT ON (t.a) a FROM t ORDER BY (t).a",
+        "SELECT (x).p FROM t AS x(p) GROUP BY x.p",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("`{sql}`: {e}"));
+    }
+    // A grouping set leaving the column out makes it NULL, spelled either way.
+    for sql in [
+        "SELECT (n).c FROM n GROUP BY ROLLUP (n.c)",
+        "SELECT n.c FROM n GROUP BY ROLLUP ((n).c)",
+        "SELECT (n).c FROM n GROUP BY CUBE (c)",
+    ] {
+        let s = db.analyze(sql).unwrap();
+        assert_cols(&s, vec![cn("c", basic("pg_catalog", "int4"))]);
+    }
+    let s = db
+        .analyze("SELECT (n).ctid FROM n GROUP BY ROLLUP (n.ctid)")
+        .unwrap();
+    assert_cols(&s, vec![cn("ctid", basic("pg_catalog", "tid"))]);
+    for (sql, msg) in [
+        // The column, not the whole row: grouping by the row doesn't cover it.
+        (
+            "SELECT (t).a FROM t GROUP BY t",
+            "column \"t.a\" must appear in the GROUP BY clause",
+        ),
+        // The alias list renames the row's fields.
+        ("SELECT (x).a FROM t AS x(p)", "column x.a does not exist"),
+    ] {
+        let err = db.analyze(sql).expect_err(sql);
+        assert!(err.to_string().starts_with(msg), "{sql}\n  got: {err}");
+    }
+    let s = db.analyze("SELECT (x).p FROM t AS x(p)").unwrap();
+    assert_cols(&s, vec![cn("p", basic("pg_catalog", "int4"))]);
+    // A qual on one spelling proves the column non-NULL for the other.
+    for sql in [
+        "SELECT t.a FROM t WHERE (t).a IS NOT NULL",
+        "SELECT (t.*).a FROM t WHERE (t).a IS NOT NULL",
+        "SELECT a FROM t WHERE (t).a > 0",
+        "SELECT (t).a FROM t WHERE (t.*).a IS NOT NULL",
+    ] {
+        let s = db.analyze(sql).unwrap();
+        assert_cols(&s, vec![c("a", basic("pg_catalog", "int4"))]);
+    }
+}
+
+#[test]
+fn a_missing_field_of_a_from_entry_row_is_a_missing_column() {
+    // unknown_attribute: no such field in a FROM entry's whole-row Var —
+    // a table's, a subquery's, a CTE's, a VALUES list's, a function's with
+    // a column definition list — is `column alias.field does not exist`,
+    // like errorMissingColumn for `alias.field`; both print the names
+    // as they are, unquoted.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE t (a int); CREATE TABLE u (a int);")
+        .unwrap();
+    for (sql, msg) in [
+        (
+            "SELECT (s).nope FROM (SELECT 1 x) s",
+            "column s.nope does not exist",
+        ),
+        (
+            "SELECT (\"S\").nope FROM (SELECT 1 x) \"S\"",
+            "column S.nope does not exist",
+        ),
+        (
+            "SELECT (f).nope FROM (VALUES (1)) f",
+            "column f.nope does not exist",
+        ),
+        (
+            "WITH c AS (SELECT 1 x) SELECT (c).nope FROM c",
+            "column c.nope does not exist",
+        ),
+        (
+            "SELECT (f).ctid FROM json_to_record('{}') AS f(a int)",
+            "column f.ctid does not exist",
+        ),
+        (
+            "SELECT (j).ctid FROM (t JOIN u USING (a)) AS j",
+            "column j.ctid does not exist",
+        ),
+        (
+            "SELECT (\"T\").nope FROM t AS \"T\"",
+            "column T.nope does not exist",
+        ),
+        (
+            "SELECT \"T\".nope FROM t AS \"T\"",
+            "column T.nope does not exist",
+        ),
+        (
+            "SELECT \"a.b\".nope FROM t AS \"a.b\"",
+            "column a.b.nope does not exist",
+        ),
+        // Not a FROM entry's row: worded after the value's type.
+        (
+            "SELECT (r).nope FROM (SELECT ROW(1, 2) r) s",
+            "could not identify column \"nope\" in record data type",
+        ),
+        (
+            "SELECT (f).nope FROM generate_series(1, 2) f",
+            "column notation .nope applied to type integer, which is not a composite type",
+        ),
+    ] {
+        let err = db.analyze(sql).expect_err(sql);
+        assert!(err.to_string().starts_with(msg), "{sql}\n  got: {err}");
+    }
+    db.analyze("SELECT (s).x FROM (SELECT 1 x) s").unwrap();
+}
+
+#[test]
 fn qualified_star_expands_any_visible_entry() {
     // PG's ExpandColumnRefStar resolves `t.*` like any qualifier: a LATERAL
     // or outer entry works, `schema.t.*` names the table, and an unknown

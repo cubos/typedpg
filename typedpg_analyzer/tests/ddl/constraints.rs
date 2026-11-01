@@ -893,6 +893,9 @@ fn check_constraints_read_no_system_column_but_tableoid() {
         "CREATE TABLE t (a text, CHECK (ctid::text = 'x'));",
         "CREATE TABLE t (a text CHECK (xmin::text <> ''));",
         "CREATE TABLE t (a text); ALTER TABLE t ADD CHECK (cmax::text <> '');",
+        // Selected from the whole row, it is that column.
+        "CREATE TABLE t (a text, CHECK ((t).ctid IS NOT NULL));",
+        "CREATE TABLE t (a text); ALTER TABLE t ADD CHECK ((t).xmin IS NOT NULL);",
     ] {
         let err = try_apply(&[("0001.sql", stmt)]).expect_err(stmt);
         let msg = err.to_string();
@@ -904,7 +907,8 @@ fn check_constraints_read_no_system_column_but_tableoid() {
     }
     build_db(&[(
         "0001.sql",
-        "CREATE TABLE t (a text, CHECK (tableoid::regclass::text = 't'));",
+        "CREATE TABLE t (a text, CHECK (tableoid::regclass::text = 't'),
+                         CHECK ((t).tableoid IS NOT NULL));",
     )]);
 }
 

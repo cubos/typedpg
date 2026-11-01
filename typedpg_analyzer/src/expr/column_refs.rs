@@ -225,7 +225,7 @@ fn sql_function_param(parts: &[String], snapshot: &PgCatalog) -> Option<ExprType
         };
         match field {
             None => Some(value),
-            Some(fld) => resolve_composite_field(&value, fld, snapshot, None).ok(),
+            Some(fld) => resolve_composite_field(&value, fld, snapshot).ok(),
         }
     })
 }

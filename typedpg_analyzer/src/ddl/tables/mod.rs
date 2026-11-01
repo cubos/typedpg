@@ -673,26 +673,35 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
                 // system nor generated columns.
                 let mut read: Vec<i16> = Vec::new();
                 if let Some(inner) = expr.node.as_ref() {
+                    // `(p).a` reads the column `a` (transformIndirection).
+                    let selections = super::util::relation_row_selections(interp, class_oid, expr);
                     for (n, ..) in inner.nodes() {
                         let typedpg_pg_query::NodeRef::ColumnRef(cr) = n else {
                             continue;
                         };
-                        let whole_row = match cr.fields.as_slice() {
-                            [.., last]
-                                if matches!(last.node.as_ref(), Some(node::Node::AStar(_))) =>
-                            {
-                                true
-                            }
-                            [only] => super::util::node_string(only).is_some_and(|f| {
-                                f == name && interp.attribute_by_name(class_oid, f).is_none()
-                            }),
-                            _ => false,
-                        };
+                        let selected = selections
+                            .iter()
+                            .find(|(r, _)| std::ptr::eq(*r, cr))
+                            .map(|&(_, f)| f);
+                        let whole_row = selected.is_none()
+                            && match cr.fields.as_slice() {
+                                [.., last]
+                                    if matches!(last.node.as_ref(), Some(node::Node::AStar(_))) =>
+                                {
+                                    true
+                                }
+                                [only] => super::util::node_string(only).is_some_and(|f| {
+                                    f == name && interp.attribute_by_name(class_oid, f).is_none()
+                                }),
+                                _ => false,
+                            };
                         if whole_row {
                             read.extend(interp.attributes_of(class_oid).iter().map(|a| a.attnum));
                             continue;
                         }
-                        let Some(col) = cr.fields.last().and_then(super::util::node_string) else {
+                        let Some(col) = selected
+                            .or_else(|| cr.fields.last().and_then(super::util::node_string))
+                        else {
                             continue;
                         };
                         match interp.attribute_by_name(class_oid, col) {

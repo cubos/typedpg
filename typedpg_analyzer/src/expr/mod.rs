@@ -1694,7 +1694,7 @@ fn infer_expr_unlocated(
         )
         .finalize_implicit()),
     }?;
-    result.planned = planned_after(inner, result.planned);
+    result.planned = planned_after(inner, result.planned, ctx.scope);
 
     // PG runs the target type's input function on untyped string-literal
     // constants the moment a context coerces them to a concrete type
@@ -1788,8 +1788,10 @@ pub(crate) fn unknown_value_coercion(
 /// by `infer_type_cast`) — may change; every other node keeps the
 /// collation it was parsed with, whatever its inputs become, so what an
 /// inference copied from an input is dropped.
-fn planned_after(inner: &node::Node, inferred: Planned) -> Planned {
+fn planned_after(inner: &node::Node, inferred: Planned, scope: &Scope) -> Planned {
     match inner {
+        // A field of a FROM entry's row is its column, a Var.
+        node::Node::AIndirection(ind) if whole_row_field_column(ind, scope).is_some() => inferred,
         node::Node::ColumnRef(_)
         | node::Node::CaseExpr(_)
         | node::Node::CoalesceExpr(_)
@@ -1797,8 +1799,7 @@ fn planned_after(inner: &node::Node, inferred: Planned) -> Planned {
         | node::Node::TypeCast(_)
         | node::Node::NamedArgExpr(_) => inferred,
         // A function or operator keeps its node unless it is inlined (a
-        // column in functional notation, `b(s)`, is a Var). A field of a
-        // FROM entry's row is its column, a Var.
+        // column in functional notation, `b(s)`, is a Var).
         node::Node::FuncCall(_) | node::Node::AExpr(_) | node::Node::AIndirection(_) => {
             match inferred {
                 Planned::Unknown => Planned::Unknown,
@@ -2743,7 +2744,9 @@ pub(crate) use func_call::{
     effective_frame_options,
 };
 use indirection::*;
-pub(crate) use indirection::{expand_indirection_star, transform_container_subscripts};
+pub(crate) use indirection::{
+    expand_indirection_star, transform_container_subscripts, whole_row_field_column,
+};
 pub(crate) use json::json_behaviors;
 use json::*;
 pub(crate) use literals::assignment_nullable;

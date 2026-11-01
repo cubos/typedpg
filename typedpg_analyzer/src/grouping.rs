@@ -440,26 +440,32 @@ pub(crate) const EXPR_KEY: &str = "\u{0}expr";
 /// locations or column qualifiers (`t.g + 1` and `g + 1` are one key —
 /// erring towards matching, which only makes more values nullable), its
 /// casts that are no coercion dropped ([`strip_noop_casts`]: `g::int + 1`
-/// is `g + 1` on an `int` column) and its type names resolved as the GROUP
-/// BY check compares them ([`resolve_type_names`]: `CAST(g AS bigint)` is
-/// `g::int8`).
+/// is `g + 1` on an `int` column), its whole-row field selections written
+/// as the columns they are ([`whole_row_fields`]: `(t).g` is `t.g`) and its
+/// type names resolved as the GROUP BY check compares them
+/// ([`resolve_type_names`]: `CAST(g AS bigint)` is `g::int8`).
 pub(crate) fn expr_key(node: &protobuf::Node, scope: &Scope, snapshot: &PgCatalog) -> String {
-    let node = strip_noop_casts(node, scope, snapshot, &|_| true);
+    let node = strip_noop_casts(&own_whole_row_fields(node, scope), scope, snapshot, &|_| {
+        true
+    });
     crate::resolve::node_fingerprint(&crate::resolve::predtest_unqualify(&resolve_type_names(
         &node, snapshot,
     )))
 }
 
 /// [`crate::resolve::node_fingerprint`] of `node` with its casts that are
-/// no coercion dropped ([`strip_noop_casts`]) and its type names resolved
-/// ([`resolve_type_names`]) — the same for two expressions PG's `equal()`
-/// finds equal once transformed, up to how columns are spelled.
+/// no coercion dropped ([`strip_noop_casts`]), its whole-row field
+/// selections written as columns ([`whole_row_fields`]) and its type names
+/// resolved ([`resolve_type_names`]) — the same for two expressions PG's
+/// `equal()` finds equal once transformed, up to how columns are spelled.
 pub(crate) fn typed_fingerprint(
     node: &protobuf::Node,
     scope: &Scope,
     snapshot: &PgCatalog,
 ) -> String {
-    let node = strip_noop_casts(node, scope, snapshot, &|_| true);
+    let node = strip_noop_casts(&own_whole_row_fields(node, scope), scope, snapshot, &|_| {
+        true
+    });
     crate::resolve::node_fingerprint(&resolve_type_names(&node, snapshot))
 }
 
@@ -504,13 +510,17 @@ pub(crate) fn resolve_type_names(node: &protobuf::Node, snapshot: &PgCatalog) ->
 
 /// Resolve a `GROUP BY` entry as a single column against `scope`. Returns the
 /// `(table_alias, column_name)` for a plain `ColumnRef` (or a cast of one
-/// that is no coercion, [`strip_noop_casts`]), or `None` for any other shape (expression, grouping set, select-list alias, …).
+/// that is no coercion, [`strip_noop_casts`], or a field `(t).c` of a
+/// whole row, [`whole_row_fields`]), or `None` for any other shape
+/// (expression, grouping set, select-list alias, …).
 fn resolve_group_column(
     node: &protobuf::Node,
     scope: &Scope,
     snapshot: &PgCatalog,
 ) -> Option<ColKey> {
-    let node = strip_noop_casts(node, scope, snapshot, &|_| true);
+    let node = strip_noop_casts(&own_whole_row_fields(node, scope), scope, snapshot, &|_| {
+        true
+    });
     let node::Node::ColumnRef(cr) = node.node.as_ref()? else {
         return None;
     };
@@ -1133,6 +1143,47 @@ impl Chain {
             })),
         };
         Some((f.sval.clone(), whole_row))
+    }
+
+    /// For a field selection `(t).f` (or `(t.*).f`) on an entry's whole
+    /// row where `f` is a column of the entry, the same expression written
+    /// `t.f` (any further indirection kept on it): ParseComplexProjection
+    /// makes it that column's Var (scanNSItemForColumn), so both spellings
+    /// are PG-`equal()` once transformed.
+    fn whole_row_field(&self, ind: &protobuf::AIndirection) -> Option<protobuf::Node> {
+        let (first, rest) = ind.indirection.split_first()?;
+        let Some(node::Node::String(field)) = first.node.as_ref() else {
+            return None;
+        };
+        let Some(node::Node::ColumnRef(cr)) = ind.arg.as_deref()?.node.as_ref() else {
+            return None;
+        };
+        let RefTarget {
+            level,
+            target: Some((alias, None)),
+        } = self.resolve(cr)?
+        else {
+            return None;
+        };
+        if !self.namespace(level)?.has_column(&alias, &field.sval) {
+            return None;
+        }
+        let column = protobuf::Node {
+            node: Some(node::Node::ColumnRef(protobuf::ColumnRef {
+                fields: vec![string_node(&alias), first.clone()],
+                location: cr.location,
+            })),
+        };
+        Some(if rest.is_empty() {
+            column
+        } else {
+            protobuf::Node {
+                node: Some(node::Node::AIndirection(Box::new(protobuf::AIndirection {
+                    arg: Some(Box::new(column)),
+                    indirection: rest.to_vec(),
+                }))),
+            }
+        })
     }
 
     fn enter(&mut self, ns: Rc<Namespace>) {
@@ -1774,7 +1825,7 @@ fn canonical(
     snapshot: &PgCatalog,
 ) -> protobuf::Node {
     use typedpg_pg_query::{NodeMut, NodeRef};
-    let node = &column_notation_calls(node, chain);
+    let node = &column_notation_calls(&whole_row_fields(node, chain), chain);
     let stripped;
     let node = match scope {
         Some(scope) => {
@@ -1845,6 +1896,32 @@ fn canonical(
         .and_then(|s| s.stmt)
         .map(|b| *b)
         .unwrap_or_default()
+}
+
+/// `node` with each field selection `(t).f` on an entry's whole row (not
+/// inside its sublinks) that names a column of the entry written `t.f`
+/// ([`Chain::whole_row_field`]).
+fn whole_row_fields(node: &protobuf::Node, chain: &Chain) -> protobuf::Node {
+    let mut out = node.clone();
+    out.rewrite(
+        &mut |n| !matches!(n.node, Some(node::Node::SelectStmt(_))),
+        &mut |n| {
+            if let Some(node::Node::AIndirection(ind)) = n.node.as_ref()
+                && let Some(column) = chain.whole_row_field(ind)
+            {
+                *n = column;
+            }
+        },
+    );
+    out
+}
+
+/// [`whole_row_fields`] against the entries of `scope`'s own level.
+fn own_whole_row_fields(node: &protobuf::Node, scope: &Scope) -> protobuf::Node {
+    whole_row_fields(
+        node,
+        &Chain::single(Some(Rc::new(Namespace::of(&scope.sources)))),
+    )
 }
 
 /// `node` with each column notation `t.f` of its level (not inside its
@@ -2489,7 +2566,9 @@ impl GroupExprs {
                 Some(ExpandedTarget::StarColumn { column: None, .. }) => continue,
                 None => g,
             };
-            // A cast that is no coercion is the column itself.
+            // A cast that is no coercion is the column itself, and so is a
+            // field selected from the whole row.
+            let expr = &whole_row_fields(expr, own);
             let expr = &strip_noop_casts(expr, scope, snapshot, &|cr| {
                 matches!(own.resolve(cr), Some(RefTarget { level: 0, .. }))
             });
@@ -2636,6 +2715,11 @@ impl UngroupedCheck<'_> {
                     }
                 }
                 Ok(())
+            }
+            // A field selected from a whole row reads that column only.
+            Some(node::Node::AIndirection(ind)) if chain.whole_row_field(ind).is_some() => {
+                let column = chain.whole_row_field(ind).expect("checked above");
+                self.expr(&column, depth, chain)
             }
             Some(node::Node::SubLink(sl)) => {
                 if let Some(t) = sl.testexpr.as_deref() {

@@ -218,11 +218,16 @@ pub(crate) fn cook_generation_expr(
                 .collect()
         })
         .unwrap_or_default();
-    // scanNSItemForColumn: system columns other than tableoid.
-    for cr in &column_refs {
-        let Some(name) = cr.fields.last().and_then(crate::ddl::util::node_string) else {
-            continue;
-        };
+    // A whole-row reference that a field selection (`(t).a`) turns into a
+    // plain column reference (transformIndirection).
+    let selections = crate::ddl::util::relation_row_selections(interp, relid, expr);
+    // scanNSItemForColumn: system columns other than tableoid — by name or
+    // selected from the whole row.
+    let names = column_refs
+        .iter()
+        .filter_map(|cr| cr.fields.last().and_then(crate::ddl::util::node_string))
+        .chain(selections.iter().map(|&(_, field)| field));
+    for name in names {
         if name != "tableoid"
             && interp.attribute_by_name(relid, name).is_none()
             && crate::pg_catalog::SYSTEM_COLUMNS
@@ -252,39 +257,16 @@ pub(crate) fn cook_generation_expr(
         }
     };
 
-    // A whole-row reference that a field selection (`(t).a`) turns into a
-    // plain column reference (transformIndirection).
-    let selected: Vec<*const typedpg_pg_query::protobuf::ColumnRef> = expr
-        .node
-        .as_ref()
-        .map(|inner| {
-            inner
-                .nodes()
-                .into_iter()
-                .filter_map(|(n, ..)| match n {
-                    typedpg_pg_query::NodeRef::AIndirection(ind)
-                        if matches!(
-                            ind.indirection.first().and_then(|i| i.node.as_ref()),
-                            Some(node::Node::String(_))
-                        ) =>
-                    {
-                        match ind.arg.as_deref().and_then(|a| a.node.as_ref()) {
-                            Some(node::Node::ColumnRef(cr)) => {
-                                Some(cr as *const typedpg_pg_query::protobuf::ColumnRef)
-                            }
-                            _ => None,
-                        }
-                    }
-                    _ => None,
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
     // check_nested_generated.
     let mut refs: Vec<i16> = Vec::new();
+    let selected = |cr: &typedpg_pg_query::protobuf::ColumnRef| {
+        selections
+            .iter()
+            .find(|(r, _)| std::ptr::eq(*r, cr))
+            .map(|&(_, f)| f)
+    };
     for cr in &column_refs {
-        let whole_row = !selected.contains(&(*cr as *const _))
+        let whole_row = selected(cr).is_none()
             && match cr.fields.as_slice() {
                 [.., last] if matches!(last.node.as_ref(), Some(node::Node::AStar(_))) => true,
                 [only] => crate::ddl::util::node_string(only)
@@ -298,7 +280,10 @@ pub(crate) fn cook_generation_expr(
                     .into(),
             ));
         }
-        let Some(name) = cr.fields.last().and_then(crate::ddl::util::node_string) else {
+        // `(t).a` reads the column `a`.
+        let Some(name) =
+            selected(cr).or_else(|| cr.fields.last().and_then(crate::ddl::util::node_string))
+        else {
             continue;
         };
         let Some(attr) = interp.attribute_by_name(relid, name) else {

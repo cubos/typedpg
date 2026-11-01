@@ -679,6 +679,64 @@ pub fn node_string(n: &Node) -> Option<&str> {
     }
 }
 
+/// The field selections on a relation's whole row in `expr` — `(t).a`,
+/// with the whole-row reference `t` and the field `a`. transformIndirection
+/// turns one into the Var of that column (ParseComplexProjection's
+/// scanNSItemForColumn, which finds system columns too): the column is
+/// read, not the whole row. `is_row` tells whether a single name is the
+/// relation's whole row (no column of that name: transformColumnRef
+/// prefers a column), `is_column` whether the relation has a column — a
+/// user or system one — of the field's name (else `(t).f` is the call
+/// `f(t)`, which reads the whole row).
+pub(crate) fn whole_row_selections<'a>(
+    expr: &'a Node,
+    is_row: &dyn Fn(&str) -> bool,
+    is_column: &dyn Fn(&str) -> bool,
+) -> Vec<(&'a typedpg_pg_query::protobuf::ColumnRef, &'a str)> {
+    let Some(inner) = expr.node.as_ref() else {
+        return Vec::new();
+    };
+    inner
+        .nodes()
+        .into_iter()
+        .filter_map(|(n, ..)| {
+            let typedpg_pg_query::NodeRef::AIndirection(ind) = n else {
+                return None;
+            };
+            let field = node_string(ind.indirection.first()?)?;
+            let Some(node::Node::ColumnRef(cr)) = ind.arg.as_deref()?.node.as_ref() else {
+                return None;
+            };
+            let [name] = cr.fields.as_slice() else {
+                return None;
+            };
+            (is_row(node_string(name)?) && is_column(field)).then_some((cr, field))
+        })
+        .collect()
+}
+
+/// [`whole_row_selections`] on the whole row of relation `relid`, by its
+/// name.
+pub(crate) fn relation_row_selections<'a>(
+    interp: &PgCatalog,
+    relid: crate::oid::PgClassOid,
+    expr: &'a Node,
+) -> Vec<(&'a typedpg_pg_query::protobuf::ColumnRef, &'a str)> {
+    let relname = interp.pg_class.get(&relid).map(|c| c.relname.as_str());
+    whole_row_selections(
+        expr,
+        &|n| Some(n) == relname && interp.attribute_by_name(relid, n).is_none(),
+        &|f| interp.attribute_by_name(relid, f).is_some() || is_system_column(f),
+    )
+}
+
+/// Whether `name` is a system column (of a relation that has them).
+pub(crate) fn is_system_column(name: &str) -> bool {
+    crate::pg_catalog::SYSTEM_COLUMNS
+        .iter()
+        .any(|(n, ..)| *n == name)
+}
+
 /// Register the implicit `composite_oid → record` cast PG creates for every
 /// composite type. Used by the operator resolver so that `composite =
 /// composite` reaches the polymorphic `record = record` (record_eq) operator

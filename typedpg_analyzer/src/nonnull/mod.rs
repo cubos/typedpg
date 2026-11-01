@@ -1071,8 +1071,12 @@ fn nonnullable_node(
             walk_opt(&tc.arg, false)
         }
         node::Node::CollateClause(c) => walk_opt(&c.arg, top_level),
-        // A field or an element of a NULL value is NULL.
-        node::Node::AIndirection(i) => walk_opt(&i.arg, false),
+        node::Node::AIndirection(i) => match crate::expr::whole_row_field_column(i, scope) {
+            // A field of a FROM entry's whole row is its column.
+            Some(column) => walk(&column, top_level),
+            // A field or an element of a NULL value is NULL.
+            None => walk_opt(&i.arg, false),
+        },
         node::Node::NullTest(t)
             if top_level
                 && protobuf::NullTestType::try_from(t.nulltesttype)
@@ -1474,6 +1478,10 @@ pub(crate) fn plain_column(
     n: &protobuf::Node,
     scope: &Scope,
 ) -> Option<(Col, crate::oid::PgTypeOid)> {
+    // A field of a FROM entry's whole row is its column.
+    if let Some(node::Node::AIndirection(i)) = n.node.as_ref() {
+        return plain_column(&crate::expr::whole_row_field_column(i, scope)?, scope);
+    }
     let Some(node::Node::ColumnRef(c)) = n.node.as_ref() else {
         return None;
     };

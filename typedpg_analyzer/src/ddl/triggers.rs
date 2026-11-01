@@ -131,12 +131,23 @@ fn check_when_clause(
     let Some(inner) = when.node.as_ref() else {
         return Ok(());
     };
+    // `(new).col` is the column `col` of NEW (transformIndirection).
+    let selections = super::util::whole_row_selections(
+        when,
+        &|n| (n == "old" || n == "new") && !attrs.iter().any(|a| a.attname == n),
+        &|f| attrs.iter().any(|a| a.attname == f) || super::util::is_system_column(f),
+    );
     for (n, ..) in inner.nodes() {
         let typedpg_pg_query::NodeRef::ColumnRef(cr) = n else {
             continue;
         };
         let fields: Vec<Option<&str>> = cr.fields.iter().map(super::util::node_string).collect();
+        let selected = selections
+            .iter()
+            .find(|(r, _)| std::ptr::eq(*r, cr))
+            .map(|&(_, f)| f);
         let (varno, column) = match fields.as_slice() {
+            [Some(rel)] if selected.is_some() => (*rel, selected),
             // `old` / `new` as a whole row, `old.*`, `old.col`.
             [Some(rel)]
                 if (*rel == "old" || *rel == "new") && !attrs.iter().any(|a| a.attname == *rel) =>

@@ -1419,6 +1419,7 @@ fn create_table_as_with_data_takes_the_planned_collation() {
                                       FROM c1, c2;
                    CREATE TABLE b3 AS SELECT x FROM (SELECT {fold} AS x FROM c1, c2) s;
                    CREATE TABLE b4 AS WITH s AS (SELECT {fold} AS x FROM c1, c2) SELECT x FROM s;
+                   CREATE TABLE b5 AS SELECT (s).x FROM (SELECT {fold} AS x FROM c1, c2) s;
                    CREATE TABLE b7 AS SELECT x FROM (SELECT x FROM (SELECT {fold} AS x
                                       FROM c1, c2) s1) s2;
                    CREATE TABLE b8 AS SELECT CASE WHEN 1 = 1 THEN c1.b ELSE 'x' END AS x FROM c1;
@@ -1433,6 +1434,8 @@ fn create_table_as_with_data_takes_the_planned_collation() {
         ("b2", collated("POSIX")),
         ("b3", collated("C")),
         ("b4", collated("C")),
+        // A field of the subquery's row is its column (ParseComplexProjection).
+        ("b5", collated("C")),
         ("b7", collated("C")),
         ("b8", collated("C")),
         ("b9", text()),
@@ -1503,17 +1506,15 @@ fn create_table_as_with_data_takes_the_planned_collation() {
             "{stmt}\n  got: {err}"
         );
     }
-    // Where PG folds what the analyzer doesn't follow — a field of a
-    // pulled-up subquery's row, an inlined SQL function, a subquery not
-    // pulled up whose scan the planner removes — PG accepts these
-    // (collated "C"), and so does the analyzer.
+    // Where PG folds what the analyzer doesn't follow — an inlined SQL
+    // function, a subquery not pulled up whose scan the planner removes —
+    // PG accepts these (collated "C"), and so does the analyzer.
     build_db(&[
         ("0001.sql", setup),
         (
             "0002.sql",
             &format!(
-                r#"CREATE TABLE b5 AS SELECT (s).x FROM (SELECT {fold} AS x FROM c1, c2) s;
-                   CREATE TABLE b6 AS SELECT f(c1.b, c2.b) AS x FROM c1, c2;
+                r#"CREATE TABLE b6 AS SELECT f(c1.b, c2.b) AS x FROM c1, c2;
                    CREATE TABLE b11 AS SELECT x FROM (SELECT {fold} AS x FROM c1, c2 OFFSET 0) s;"#
             ),
         ),

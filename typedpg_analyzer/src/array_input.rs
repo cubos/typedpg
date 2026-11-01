@@ -76,8 +76,9 @@ impl Parser<'_> {
     }
 
     /// `ReadArrayDimensions`: the optional `[lo:hi]…` prefix. Returns the
-    /// explicit dimension lengths (empty when there are none).
-    fn read_dimensions(&mut self) -> Result<Vec<i64>, String> {
+    /// explicit dimensions' lower bounds and lengths (empty when there are
+    /// none).
+    fn read_dimensions(&mut self) -> Result<Bounds, String> {
         let mut dims = Vec::new();
         loop {
             while scanner_isspace(self.at(self.p)) {
@@ -126,7 +127,7 @@ impl Parser<'_> {
                     "array size exceeds the maximum allowed ({MAX_ARRAY_SIZE})"
                 ));
             }
-            dims.push(len);
+            dims.push((lb, len));
         }
         Ok(dims)
     }
@@ -241,12 +242,13 @@ impl Parser<'_> {
     }
 
     /// `ReadArrayStr`: the braced body, checking nesting and dimension
-    /// consistency and handing each element to `on_elem`.
+    /// consistency and handing each element to `on_elem`. Returns the
+    /// length of each dimension.
     fn read_array_str(
         &mut self,
         explicit_dims: &[i64],
         on_elem: &mut dyn FnMut(Option<&str>) -> Result<(), String>,
-    ) -> Result<(), String> {
+    ) -> Result<Vec<i64>, String> {
         let dimensions_specified = !explicit_dims.is_empty();
         let mut ndim = explicit_dims.len();
         let mut dim = [-1i64; MAXDIM];
@@ -313,7 +315,7 @@ impl Parser<'_> {
                 }
             }
             if nest_level == 0 {
-                return Ok(());
+                return Ok(dim[..ndim].to_vec());
             }
         }
     }
@@ -328,14 +330,43 @@ pub(crate) fn parse_array(
     delim: u8,
     on_elem: &mut dyn FnMut(Option<&str>) -> Result<(), String>,
 ) -> Result<(), String> {
+    parse(content, delim, on_elem).map(|_| ())
+}
+
+/// The dimensions of the array `content` parses to under element delimiter
+/// `delim`, as `(lower bound, length)` pairs — empty for an empty array
+/// (`array_in` returns one of no dimensions whenever there is no element,
+/// whatever the braces: `{}`, `{{}}`). `None` when `content` doesn't parse.
+pub(crate) fn array_dimensions(content: &str, delim: u8) -> Option<Bounds> {
+    let (explicit, dims) = parse(content, delim, &mut |_| Ok(())).ok()?;
+    if dims.contains(&0) {
+        return Some(Vec::new());
+    }
+    // Without explicit bounds every lower bound is 1.
+    Some(match explicit.as_slice() {
+        [] => dims.into_iter().map(|len| (1, len)).collect(),
+        _ => explicit,
+    })
+}
+
+/// Dimensions as `(lower bound, length)` pairs.
+type Bounds = Vec<(i64, i64)>;
+
+/// `array_in`'s walk: the explicit `[lo:hi]` dimensions and the length of
+/// each dimension the braces give.
+fn parse(
+    content: &str,
+    delim: u8,
+    on_elem: &mut dyn FnMut(Option<&str>) -> Result<(), String>,
+) -> Result<(Bounds, Vec<i64>), String> {
     let mut p = Parser {
         b: content.as_bytes(),
         p: 0,
         delim,
         content,
     };
-    let dims = p.read_dimensions()?;
-    if dims.is_empty() {
+    let explicit = p.read_dimensions()?;
+    if explicit.is_empty() {
         if p.at(p.p) != b'{' {
             return Err(p.malformed());
         }
@@ -351,12 +382,13 @@ pub(crate) fn parse_array(
             return Err(p.malformed());
         }
     }
-    p.read_array_str(&dims, on_elem)?;
+    let lengths: Vec<i64> = explicit.iter().map(|&(_, len)| len).collect();
+    let dims = p.read_array_str(&lengths, on_elem)?;
     // Only whitespace may follow the closing brace.
     if p.b[p.p..].iter().any(|&c| !scanner_isspace(c)) {
         return Err(p.malformed());
     }
-    Ok(())
+    Ok((explicit, dims))
 }
 
 /// True unless `content` provably parses (as a `,`-delimited array) to an
@@ -392,6 +424,24 @@ mod tests {
             Ok(())
         })?;
         Ok(out)
+    }
+
+    #[test]
+    fn dimensions() {
+        let dims = |c: &str| array_dimensions(c, b',');
+        assert_eq!(dims("{1}"), Some(vec![(1, 1)]));
+        assert_eq!(dims(" {{1,2},{3,4},{5,6}} "), Some(vec![(1, 3), (1, 2)]));
+        assert_eq!(dims("[0:1]={a,b}"), Some(vec![(0, 2)]));
+        assert_eq!(dims("[-1:-1][2:3]={{a,b}}"), Some(vec![(-1, 1), (2, 2)]));
+        // No element: an empty array, of no dimension.
+        assert_eq!(dims("{}"), Some(vec![]));
+        assert_eq!(dims("{{},{}}"), Some(vec![]));
+        assert_eq!(dims("{{1},{2,3}}"), None);
+        assert_eq!(dims("1"), None);
+        assert_eq!(
+            array_dimensions("{(1,1),(0,0);(2,2),(1,1)}", b';'),
+            Some(vec![(1, 2)])
+        );
     }
 
     #[test]
