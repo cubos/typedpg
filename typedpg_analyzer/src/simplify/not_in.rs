@@ -20,12 +20,14 @@
 //!   same operator — a built-in one, never NULL between non-NULL
 //!   operands of built-in types. Row-wise `(a, b) NOT IN (SELECT x, y …)` compares
 //!   column by column with `=`, as PG's row comparison does.
-//! - in a WHERE or HAVING, everything next to the site — the other
-//!   conjuncts, the OR / NOT arms around it — can't fail either
-//!   ([`super::proof::siblings_cannot_error`]): the SubPlan may have
-//!   vetoed a row before them (cost order ties keep the written order),
-//!   the anti-join doesn't. So `x NOT IN (…) AND created_at > now() -
-//!   interval '1 day'` is left as written.
+//! - the site is in the top-level statement's WHERE, over stored tables
+//!   joined by ON conditions that can't fail and next to nothing that can
+//!   fail, or in its target list (or an UPDATE's SET values)
+//!   ([`super::proof::rewrite_site_is_safe`]). A sublink qual may veto a
+//!   row before a join's ON, a pulled-up subquery's qual or a sibling runs
+//!   (cost ties keep the written order); the anti-join runs above them.
+//!   So `x NOT IN (…) AND created_at > now() - interval '1 day'`, a site
+//!   in HAVING, in a CTE or in any nested query is left as written.
 //! - the subquery has no LIMIT or OFFSET: the SubPlan reads it once, an
 //!   anti-join may rescan it, and a LIMIT may return other rows then.
 //! - nothing in it is volatile (the subquery may run a different number
@@ -61,7 +63,7 @@ use typedpg_pg_query::protobuf::{
 
 use super::proof::{
     FromScope, builtin_strict_equality, column_collation, column_type, embed_source,
-    error_free_select, has_volatile, qualified_column, siblings_cannot_error, strictly_not_null,
+    error_free_select, has_volatile, qualified_column, rewrite_site_is_safe, strictly_not_null,
     written_names_use,
 };
 use super::{Candidate, Ctx, Edit, Rule};
@@ -106,7 +108,6 @@ pub(crate) fn candidates(ctx: &Ctx<'_>) -> Vec<Candidate> {
         tokens: &tokens,
         out: Vec::new(),
         next_alias: std::cell::Cell::new(next_alias(ctx.sql)),
-        clause: None,
     };
     for stmt in &ctx.tree.stmts {
         if let Some(node) = stmt.stmt.as_deref() {
@@ -129,9 +130,6 @@ struct Walker<'c, 'a> {
     out: Vec<Candidate>,
     /// The number of the next wrapped subquery's alias.
     next_alias: std::cell::Cell<usize>,
-    /// The WHERE or HAVING the expressions being walked are in (`None`:
-    /// a target list or SET, where no qual list orders them).
-    clause: Option<Node>,
 }
 
 /// The first `n` no `__typedpg_s<n>` of earlier rewrites in `sql` uses.
@@ -237,18 +235,14 @@ impl Walker<'_, '_> {
         }
     }
 
-    /// Walk a WHERE or HAVING: a qual list PG orders by cost.
+    /// Walk a WHERE or HAVING.
     fn qual(&mut self, node: Option<&Node>, scope: &FromScope<'_>) {
-        let outer = std::mem::replace(&mut self.clause, node.cloned());
         self.expr_opt(node, scope);
-        self.clause = outer;
     }
 
-    /// Walk a target list or SET list: values, not quals.
+    /// Walk a target list or SET list.
     fn values(&mut self, nodes: &[Node], scope: &FromScope<'_>) {
-        let outer = self.clause.take();
         self.expr_list(nodes, scope);
-        self.clause = outer;
     }
 
     fn expr_opt(&mut self, node: Option<&Node>, scope: &FromScope<'_>) {
@@ -372,12 +366,7 @@ impl Walker<'_, '_> {
         // Nothing the rewrite may newly evaluate can fail: in the
         // subquery, nor anything next to the site in its WHERE / HAVING,
         // which the site may have vetoed rows for.
-        if !error_free_select(ctx, sub, &sub_scope)
-            || self
-                .clause
-                .as_ref()
-                .is_some_and(|clause| !siblings_cannot_error(ctx, clause, not_at, scope))
-        {
+        if !error_free_select(ctx, sub, &sub_scope) || !rewrite_site_is_safe(ctx, not_at) {
             return None;
         }
         // Nothing volatile, no row security.

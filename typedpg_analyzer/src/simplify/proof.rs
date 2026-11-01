@@ -1036,6 +1036,123 @@ fn hidden_volatile_calls(catalog: &PgCatalog) -> bool {
         })
 }
 
+/// Whether a semi- or anti-join rewrite of the site at `site_location`
+/// (the rewritten expression's own node: a NOT IN's `NOT`) can't make
+/// something at its level run on rows the site used to filter out first.
+///
+/// A sublink qual is applied where the planner puts it — on a scan, below
+/// a join whose ON (or a pulled-up derived table's, view's or LATERAL
+/// item's qual, or a FROM function's argument) runs after it — and the
+/// written order wins cost ties. As a join, the site moves above all of
+/// those, and anything that can fail there now sees every row (`JOIN u ON
+/// t.id = u.k AND 10 / (u.z * t.a) > 1` dividing by zero on the row the
+/// NOT IN vetoed). The same holds for any level the site's query is pulled
+/// up into. So the site qualifies in two places only, of the top-level
+/// statement (the outermost SELECT, not a set operation, or the top-level
+/// UPDATE / DELETE), and not inside any sublink or subquery there:
+///
+/// - its WHERE, when every FROM item of the level (UPDATE's FROM, DELETE's
+///   USING, the target relation included) is a stored table or a join of
+///   them (no subquery, function, LATERAL, VALUES, CTE, view, USING /
+///   NATURAL join), every JOIN ON condition passes [`cannot_error`] in its
+///   own join's scope, and [`siblings_cannot_error`] holds for the WHERE;
+/// - its target list (a SELECT's, or an UPDATE's SET values): evaluated
+///   only on the rows every qual let through, so nothing is reordered
+///   around it, whatever the FROM. A correlated NOT EXISTS there still
+///   gains an index probe over an unhashed NOT IN's rescans.
+///
+/// Anywhere else — HAVING (where a NOT EXISTS isn't pulled up anyway), a
+/// nested query, a CTE — it doesn't.
+pub(crate) fn rewrite_site_is_safe(ctx: &Ctx<'_>, site_location: i32) -> bool {
+    fn reaches(node: NodeRef<'_>, at: i32) -> bool {
+        if node.location() == Some(at) {
+            return true;
+        }
+        if matches!(node, NodeRef::SubLink(_) | NodeRef::SelectStmt(_)) {
+            return false;
+        }
+        node.children().into_iter().any(|c| reaches(c, at))
+    }
+    let reaches_in = |n: &Node| {
+        n.node
+            .as_ref()
+            .is_some_and(|n| reaches(n.to_ref(), site_location))
+    };
+    let Some(top) = ctx
+        .tree
+        .stmts
+        .first()
+        .and_then(|s| s.stmt.as_deref())
+        .and_then(|s| s.node.as_ref())
+    else {
+        return false;
+    };
+    let ctes = cte_names(ctx);
+    // The WHERE of a level whose FROM is `from` (and the DML target).
+    let where_safe = |relation: Option<&typedpg_pg_query::protobuf::RangeVar>,
+                      from: &[Node],
+                      where_clause: &Node,
+                      scope: &FromScope<'_>| {
+        let relation_ok = relation.is_none_or(|rv| {
+            let schema = (!rv.schemaname.is_empty()).then_some(rv.schemaname.as_str());
+            ctx.catalog
+                .resolve_table(schema, &rv.relname)
+                .is_some_and(|c| stored_tree(ctx.catalog, c.oid))
+        });
+        let mut quals = Vec::new();
+        relation_ok
+            && from
+                .iter()
+                .all(|f| reads_stored_tables(ctx, &ctes, f, &mut quals))
+            && quals.into_iter().all(|(q, join)| {
+                let sides: Vec<Node> = [&join.larg, &join.rarg]
+                    .into_iter()
+                    .flatten()
+                    .map(|n| (**n).clone())
+                    .collect();
+                cannot_error(ctx, q, &FromScope::of_items(ctx, &sides, None))
+            })
+            && siblings_cannot_error(ctx, where_clause, site_location, scope)
+    };
+    match top {
+        N::SelectStmt(s) => {
+            if s.op != typedpg_pg_query::protobuf::SetOperation::SetopNone as i32 {
+                return false;
+            }
+            if s.target_list.iter().any(reaches_in) {
+                return true;
+            }
+            match s.where_clause.as_deref() {
+                Some(w) if reaches_in(w) => {
+                    let scope = FromScope::of_select(ctx, s, None);
+                    where_safe(None, &s.from_clause, w, &scope)
+                }
+                _ => false,
+            }
+        }
+        N::UpdateStmt(u) => {
+            if u.target_list.iter().any(reaches_in) {
+                return true;
+            }
+            match u.where_clause.as_deref() {
+                Some(w) if reaches_in(w) => {
+                    let scope = FromScope::of_dml(ctx, u.relation.as_ref(), &u.from_clause, None);
+                    where_safe(u.relation.as_ref(), &u.from_clause, w, &scope)
+                }
+                _ => false,
+            }
+        }
+        N::DeleteStmt(d) => match d.where_clause.as_deref() {
+            Some(w) if reaches_in(w) => {
+                let scope = FromScope::of_dml(ctx, d.relation.as_ref(), &d.using_clause, None);
+                where_safe(d.relation.as_ref(), &d.using_clause, w, &scope)
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 /// Whether everything evaluated next to a rewrite site can't fail: every
 /// expression of the site's `clause` (the WHERE, JOIN ON or HAVING it sits
 /// in) other than the site itself — the other conjuncts, and the OR / NOT

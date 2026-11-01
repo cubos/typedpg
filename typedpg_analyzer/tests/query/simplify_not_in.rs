@@ -628,21 +628,13 @@ fn two_wrapped_sites_get_their_own_aliases() {
 
 #[test]
 fn a_site_whose_subquery_holds_another_is_kept() {
-    // The inner site is rewritten; the outer one's subquery then holds a
-    // sublink, which an anti-join could newly evaluate: it stays NOT IN.
-    let (sent, rules) = simplified(
+    // The inner site is nested; the outer one's subquery holds a sublink.
+    assert_kept(
         &setup(),
         "SELECT c.id FROM customers c WHERE c.id NOT IN \
          (SELECT DISTINCT b.customer_id FROM banned b WHERE b.code NOT IN \
          (SELECT DISTINCT p.b FROM pairs p))",
     );
-    assert_eq!(
-        sent,
-        "SELECT c.id FROM customers c WHERE c.id NOT IN \
-         (SELECT DISTINCT b.customer_id FROM banned b WHERE (NOT EXISTS (SELECT 1 FROM (SELECT DISTINCT \
-         p.b FROM pairs p) AS __typedpg_s1 (__typedpg_c1) WHERE b.code = __typedpg_s1.__typedpg_c1)))"
-    );
-    assert_eq!(rules, vec![Rule::NotIn]);
 }
 
 #[cfg(feature = "pg_sanity")]
@@ -930,7 +922,6 @@ fn a_sibling_that_can_fail_keeps_the_site() {
         "SELECT t.a FROM t WHERE a NOT IN (SELECT b FROM u)",
         "DELETE FROM t WHERE a NOT IN (SELECT b FROM u)",
         "UPDATE t SET s = 'y' WHERE a NOT IN (SELECT b FROM u)",
-        "SELECT t.a FROM t GROUP BY t.a HAVING t.a NOT IN (SELECT b FROM u)",
     ] {
         assert_eq!(simplified(&db, sql).1, vec![Rule::NotIn], "{sql}");
     }
@@ -965,6 +956,70 @@ fn error_free_siblings_are_fine() {
         "DELETE FROM customers c WHERE c.id NOT IN (SELECT customer_id FROM banned) AND c.code = 3",
         "DELETE FROM customers c WHERE (NOT EXISTS (SELECT 1 FROM banned WHERE c.id = customer_id)) \
          AND c.code = 3",
+    );
+}
+
+#[test]
+fn only_top_level_where_and_target_list_sites() {
+    // A sublink qual may veto a row on a scan below a join whose ON can
+    // fail; the anti-join runs above it.
+    let mut db = setup();
+    db.apply_sql(
+        "CREATE TABLE t (id int PRIMARY KEY, a int NOT NULL);
+         CREATE TABLE u (z int NOT NULL, k int NOT NULL);
+         CREATE TABLE sx (b int NOT NULL);",
+    )
+    .unwrap();
+    for sql in [
+        // The ON can fail.
+        "SELECT t.id FROM t JOIN u ON t.id = u.k AND 10 / (u.z * t.a) > 1 \
+         WHERE t.a NOT IN (SELECT b FROM sx)",
+        "SELECT t.id FROM t LEFT JOIN u ON t.id = u.k AND 10 / (u.z * t.a) > 1 \
+         WHERE t.a NOT IN (SELECT b FROM sx)",
+        // LATERAL, a FROM function, a derived table, a CTE in FROM.
+        "SELECT t.id FROM t, LATERAL (SELECT 10 / t.a AS q) l WHERE t.a NOT IN (SELECT b FROM sx)",
+        "SELECT t.id FROM t, generate_series(1, 2) g WHERE t.a NOT IN (SELECT b FROM sx)",
+        "SELECT d.id FROM (SELECT id, a FROM t WHERE 10 / a > 1) d \
+         WHERE d.a NOT IN (SELECT b FROM sx)",
+        // Nested: in a subquery, a FROM subquery, a CTE, HAVING.
+        "SELECT u.k FROM u WHERE EXISTS (SELECT 1 FROM t WHERE t.a NOT IN (SELECT b FROM sx))",
+        "SELECT d.id FROM (SELECT t.id FROM t WHERE t.a NOT IN (SELECT b FROM sx)) d",
+        "WITH w AS (SELECT t.id FROM t WHERE t.a NOT IN (SELECT b FROM sx)) SELECT id FROM w",
+        "SELECT t.a FROM t GROUP BY t.a HAVING t.a NOT IN (SELECT b FROM sx)",
+        // A set operation's branch.
+        "SELECT t.id FROM t WHERE t.a NOT IN (SELECT b FROM sx) UNION SELECT 1",
+    ] {
+        assert_kept(&db, sql);
+    }
+    // An ON that can't fail.
+    assert_rewritten(
+        &db,
+        "SELECT t.id FROM t JOIN u ON t.id = u.k WHERE t.a NOT IN (SELECT b FROM sx)",
+        "SELECT t.id FROM t JOIN u ON t.id = u.k WHERE (NOT EXISTS (SELECT 1 FROM sx WHERE t.a = b))",
+    );
+    // The target list, whatever the FROM.
+    assert_rewritten(
+        &db,
+        "SELECT t.a NOT IN (SELECT b FROM sx) AS ok \
+         FROM t JOIN u ON t.id = u.k AND 10 / (u.z * t.a) > 1, generate_series(1, 2) g",
+        "SELECT (NOT EXISTS (SELECT 1 FROM sx WHERE t.a = b)) AS ok \
+         FROM t JOIN u ON t.id = u.k AND 10 / (u.z * t.a) > 1, generate_series(1, 2) g",
+    );
+    // UPDATE / DELETE top-level WHERE, and an UPDATE's SET.
+    assert_rewritten(
+        &db,
+        "DELETE FROM t USING u WHERE t.id = u.k AND t.a NOT IN (SELECT b FROM sx)",
+        "DELETE FROM t USING u WHERE t.id = u.k AND (NOT EXISTS (SELECT 1 FROM sx WHERE t.a = b))",
+    );
+    assert_rewritten(
+        &db,
+        "UPDATE t SET a = 1 FROM u WHERE t.id = u.k AND t.a NOT IN (SELECT b FROM sx)",
+        "UPDATE t SET a = 1 FROM u WHERE t.id = u.k AND (NOT EXISTS (SELECT 1 FROM sx WHERE t.a = b))",
+    );
+    assert_kept(
+        &db,
+        "UPDATE t SET a = 1 FROM (SELECT k FROM u WHERE 10 / z > 1) d \
+         WHERE t.id = d.k AND t.a NOT IN (SELECT b FROM sx)",
     );
 }
 
