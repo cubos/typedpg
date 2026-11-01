@@ -329,9 +329,24 @@ fn a_multidimensional_array_of_mismatched_sub_arrays_is_rejected() {
         "SELECT ARRAY[ARRAY[1], ARRAY[]::int[]] AS v",
         "SELECT ARRAY[ARRAY[1], '{}'] AS v",
         "SELECT ARRAY[ARRAY[ARRAY[1]], ARRAY[ARRAY[1, 2]]] AS v",
+        // An array literal's dimensions (and lower bounds) are known too.
+        "SELECT ARRAY['{1}'::int[], NULL::int[]] AS v",
+        "SELECT ARRAY['{1,2}'::int[], ARRAY[1]] AS v",
+        "SELECT ARRAY['[0:0]={1}'::int[], ARRAY[1]] AS v",
+        "SELECT ARRAY['{1}', ARRAY[1, 2]] AS v",
+        "SELECT ARRAY['{}'::int[], ARRAY[1]] AS v",
+        "SELECT ARRAY['{{1},{2}}'::int[], '{{1,2}}'::int[]] AS v",
+        "SELECT ARRAY['{(1,1),(0,0);(2,2),(1,1)}'::box[], '{(1,1),(0,0)}'::box[]] AS v",
     ] {
         assert_err_prefix!(db.analyze(sql), AnalyzeError::Invalid(_), MSG);
     }
+    // All constants: the planner folds the ARRAY, so a statement planned
+    // but not run fails too.
+    assert_err_prefix!(
+        db.analyze("EXPLAIN SELECT ARRAY['{1}'::int[], NULL::int[]] AS v"),
+        AnalyzeError::Invalid(_),
+        MSG
+    );
     // Over the rows of a table it fails for every row (an empty table
     // never evaluates it: the oracle's execute fallback runs on one).
     db.skip_pg_sanity();
@@ -354,6 +369,13 @@ fn a_multidimensional_array_of_sub_arrays_that_can_agree_is_accepted() {
         "SELECT ARRAY[ARRAY[ARRAY[a], ARRAY[a]], ARRAY[ARRAY[a], ARRAY[a]]] AS v FROM tm",
         // `arr` may be of one element.
         "SELECT ARRAY[ARRAY[a], arr] AS v FROM tm",
+        // Array literals of one shape, or all empty.
+        "SELECT ARRAY['{1}'::int[], ARRAY[1]] AS v",
+        "SELECT ARRAY['{1,2}', ARRAY[1, 2]] AS v",
+        "SELECT ARRAY['[0:0]={1}'::int[], '[0:0]={2}'::int[]] AS v",
+        "SELECT ARRAY['{{}}'::int[], NULL] AS v",
+        "SELECT ARRAY['{1}'::text::int[], ARRAY[1, 2]] AS v",
+        "SELECT ARRAY['{(1,1),(0,0);(2,2),(1,1)}'::box[], '{(1,1),(0,0);(2,2),(1,1)}'::box[]] AS v",
     ] {
         db.analyze(sql).unwrap_or_else(|e| panic!("`{sql}`: {e}"));
     }

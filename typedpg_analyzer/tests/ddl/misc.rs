@@ -4271,6 +4271,12 @@ fn extended_statistics_field_selection_on_the_whole_row() {
              btree operator class",
         ),
         ("CREATE STATISTICS ON ((t).ctid), b FROM t;", system),
+        // Within an expression, a system column of the whole row too.
+        ("CREATE STATISTICS ON ((t).ctid::text), a FROM t;", system),
+        (
+            "CREATE STATISTICS ON ((t).xmin::text || b), a FROM t;",
+            system,
+        ),
         ("CREATE STATISTICS ON ((t).v), b FROM t;", virt),
         ("CREATE STATISTICS ON ((t).v + 1), b FROM t;", virt),
         (

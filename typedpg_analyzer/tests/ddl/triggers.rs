@@ -138,6 +138,15 @@ fn trigger_when_conditions_reference_only_the_available_row_values() {
             "BEFORE INSERT ON p FOR EACH ROW WHEN (new.xmin::text = '1')",
             "BEFORE trigger's WHEN condition cannot reference NEW system columns",
         ),
+        // A field selected from the row is that column (transformIndirection).
+        (
+            "BEFORE UPDATE ON p FOR EACH ROW WHEN ((new).ctid IS NULL)",
+            "BEFORE trigger's WHEN condition cannot reference NEW system columns",
+        ),
+        (
+            "BEFORE INSERT ON g FOR EACH ROW WHEN ((new).c > 0)",
+            generated,
+        ),
         (
             "BEFORE INSERT ON p FOR EACH ROW WHEN (a > 0)",
             "column reference \"a\" is ambiguous",
@@ -172,7 +181,10 @@ fn trigger_when_conditions_reference_only_the_available_row_values() {
              CREATE TRIGGER t3 AFTER INSERT ON p FOR EACH ROW WHEN (new.xmin::text = '1') EXECUTE FUNCTION tf();
              CREATE TRIGGER t4 BEFORE UPDATE ON p FOR EACH ROW WHEN (old.a IS DISTINCT FROM new.a) EXECUTE FUNCTION tf();
              CREATE TRIGGER t5 BEFORE INSERT ON p FOR EACH ROW WHEN (new IS NOT NULL) EXECUTE FUNCTION tf();
-             CREATE TRIGGER t6 AFTER UPDATE ON p FOR EACH STATEMENT WHEN (true) EXECUTE FUNCTION tf();",
+             CREATE TRIGGER t6 AFTER UPDATE ON p FOR EACH STATEMENT WHEN (true) EXECUTE FUNCTION tf();
+             CREATE TRIGGER t7 BEFORE UPDATE ON p FOR EACH ROW WHEN ((old).ctid IS NULL) EXECUTE FUNCTION tf();
+             CREATE TRIGGER t8 BEFORE INSERT ON g FOR EACH ROW WHEN ((new).a > 0) EXECUTE FUNCTION tf();
+             CREATE TRIGGER t9 AFTER UPDATE ON p FOR EACH ROW WHEN ((new).ctid IS NULL) EXECUTE FUNCTION tf();",
         ),
     ]);
 }

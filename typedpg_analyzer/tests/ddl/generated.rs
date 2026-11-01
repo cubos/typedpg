@@ -96,6 +96,27 @@ fn indexes_on_system_columns_are_rejected() {
         "CREATE INDEX ON t ((xmin::text));",
         "index creation on system columns is not supported",
     );
+    // Selected from the whole row (transformIndirection), as a key or in
+    // the predicate.
+    assert_err(
+        T,
+        "CREATE INDEX ON t (((t).ctid));",
+        "index creation on system columns is not supported",
+    );
+    assert_err(
+        T,
+        "CREATE INDEX ON t (a) WHERE (t).ctid IS NOT NULL;",
+        "index creation on system columns is not supported",
+    );
+    assert_err(
+        T,
+        "CREATE INDEX ON t (((t).b));",
+        "indexes on virtual generated columns are not supported",
+    );
+    build_db(&[
+        ("0001.sql", T),
+        ("0002.sql", "CREATE INDEX ON t (((t).a));"),
+    ]);
 }
 
 #[test]
@@ -336,6 +357,11 @@ fn generation_expressions_are_checked_like_cookdefault() {
         );
         assert_err(
             "",
+            &create("(v).xmin::text::int"),
+            "cannot use system column \"xmin\" in column generation expression",
+        );
+        assert_err(
+            "",
             &create("generate_series(1, a)"),
             "set-returning functions are not allowed in column generation expressions",
         );
@@ -361,6 +387,24 @@ fn generation_expressions_are_checked_like_cookdefault() {
         "ALTER TABLE t ADD COLUMN c int GENERATED ALWAYS AS (b + 1) VIRTUAL;",
         "cannot use generated column \"b\" in column generation expression",
     );
+    // `(t).b` is the column `b`; `(t).f`, the call `f(t)`, reads the whole
+    // row.
+    assert_err(
+        "CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a) STORED);",
+        "ALTER TABLE t ADD COLUMN c int GENERATED ALWAYS AS ((t).b) STORED;",
+        "cannot use generated column \"b\" in column generation expression",
+    );
+    assert_err(
+        "CREATE TABLE t (a int);
+         CREATE FUNCTION f(t) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT 1';",
+        "ALTER TABLE t ADD COLUMN c int GENERATED ALWAYS AS ((t).f) STORED;",
+        "cannot use whole-row variable in column generation expression",
+    );
+    build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int, c int GENERATED ALWAYS AS ((t).a + 1) STORED,
+                         d text GENERATED ALWAYS AS ((t).tableoid::text) STORED);",
+    )]);
     assert_err(
         "CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a) VIRTUAL, x int);",
         "ALTER TABLE t ALTER COLUMN b SET EXPRESSION AS (b * 2);",
@@ -560,6 +604,23 @@ fn partition_keys_may_not_read_generated_columns() {
         "CREATE TABLE v (a int) PARTITION BY RANGE ((xmin::text));",
         "partition key expressions cannot contain system column references",
     );
+    // A field of the whole row is that column alone (transformIndirection).
+    assert_err(
+        "",
+        "CREATE TABLE v (a int) PARTITION BY RANGE (((v).ctid));",
+        "partition key expressions cannot contain system column references",
+    );
+    assert_err(
+        "",
+        "CREATE TABLE v (a int, b int GENERATED ALWAYS AS (a) STORED)
+         PARTITION BY RANGE (((v).b));",
+        "cannot use generated column in partition key",
+    );
+    build_db(&[(
+        "0001.sql",
+        "CREATE TABLE v (a int, b int GENERATED ALWAYS AS (a) STORED)
+         PARTITION BY RANGE (((v).a));",
+    )]);
 }
 
 // ── Inheritance and partitions ──────────────────────────────────────────────

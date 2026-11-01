@@ -36,8 +36,11 @@ pub(crate) fn infer_indirection(
     // `column alias.field does not exist` for this case (whereas
     // `(c.col).field` produces `column "field" not found in data type T`).
     // The alias hint only applies to the first indirection step — chained
-    // accesses past that point are no longer at the relation boundary.
+    // accesses past that point are no longer at the relation boundary. A
+    // name that is a column is that column (transformColumnRef), not a
+    // whole row.
     let arg_is_bare_alias: Option<&str> = if let Some(node::Node::ColumnRef(cr)) = arg.node.as_ref()
+        && !arg_is_column
     {
         let parts = extract_string_fields(&cr.fields);
         match parts.as_slice() {
@@ -64,6 +67,34 @@ pub(crate) fn infer_indirection(
                 let alias_hint = if i == 0 { arg_is_bare_alias } else { None };
                 current = match resolve_composite_field(&current, &s.sval, snapshot, alias_hint) {
                     Ok(field) => field,
+                    // ParseComplexProjection on a FROM entry's whole row
+                    // looks the name up as that entry's column
+                    // (scanNSItemForColumn), which finds a relation's
+                    // system columns too: `(t).ctid` is `t.ctid`.
+                    Err(_)
+                        if i == 0
+                            && arg_is_bare_alias
+                                .and_then(|alias| scope.find_source(alias))
+                                .is_some_and(|src| {
+                                    src.system_columns.iter().any(|c| c.name == s.sval)
+                                }) =>
+                    {
+                        let Some(node::Node::ColumnRef(cr)) = arg.node.as_ref() else {
+                            unreachable!("a bare alias is a ColumnRef");
+                        };
+                        let column = protobuf::Node {
+                            node: Some(node::Node::ColumnRef(protobuf::ColumnRef {
+                                fields: cr
+                                    .fields
+                                    .iter()
+                                    .cloned()
+                                    .chain([steps[i].clone()])
+                                    .collect(),
+                                location: cr.location,
+                            })),
+                        };
+                        infer_expr(&column, ctx, params, TypeGoal::NONE)?
+                    }
                     // No such field: `(x).f` is the call `f(x)`, on the
                     // value selected so far (transformIndirection).
                     Err(e) => {
@@ -202,9 +233,9 @@ pub(super) fn resolve_composite_field(
         && let Some(shape) = current.record_fields.as_ref().filter(|s| !s.hidden)
     {
         let field = shape.iter().find(|f| f.name == field_name).ok_or_else(|| {
-            AnalyzeError::UndefinedColumn(format!(
-                "could not identify column \"{field_name}\" in record data type"
-            ))
+            missing_field(relation_alias, field_name, || {
+                format!("could not identify column \"{field_name}\" in record data type")
+            })
         })?;
         // Field's full ExprType (including any nested record shape) is
         // already on `field.ty`; just OR the enclosing nullability in. A
@@ -246,9 +277,9 @@ pub(super) fn resolve_composite_field(
     // function without a column definition list): ParseFuncOrColumn finds
     // no field and reports the column, not the type (42703).
     if base_oid == oid::RECORD {
-        return Err(AnalyzeError::UndefinedColumn(format!(
-            "could not identify column \"{field_name}\" in record data type"
-        )));
+        return Err(missing_field(relation_alias, field_name, || {
+            format!("could not identify column \"{field_name}\" in record data type")
+        }));
     }
     let type_entry = snapshot.get_type(base_oid).ok_or_else(|| {
         AnalyzeError::UndefinedType(format!(
@@ -275,18 +306,12 @@ pub(super) fn resolve_composite_field(
         .iter()
         .find(|f| f.attname == field_name)
         .ok_or_else(|| {
-            let msg = if let Some(alias) = relation_alias {
-                format!(
-                    "column {} does not exist",
-                    crate::qualified_name::QualifiedName::new(alias, field_name),
-                )
-            } else {
+            missing_field(relation_alias, field_name, || {
                 format!(
                     "column \"{field_name}\" not found in data type {}",
                     type_entry.typname
                 )
-            };
-            AnalyzeError::UndefinedColumn(msg)
+            })
         })?;
     crate::ddl::depend::note_column(relid, field_name);
 
@@ -295,6 +320,22 @@ pub(super) fn resolve_composite_field(
         current.nullable || composite_field_nullable(current, field_name),
         field.atttypmod,
     ))
+}
+
+/// PG's `unknown_attribute`: no field `field_name` in a FROM entry's whole
+/// row (`relation_alias`) is a missing column of that entry; in any other
+/// value, `other` words it after the value's type.
+fn missing_field(
+    relation_alias: Option<&str>,
+    field_name: &str,
+    other: impl FnOnce() -> String,
+) -> AnalyzeError {
+    AnalyzeError::UndefinedColumn(match relation_alias {
+        // errmsg("column %s.%s does not exist", rte->eref->aliasname,
+        // attname): the names as they are, neither quoted nor escaped.
+        Some(alias) => format!("column {alias}.{field_name} does not exist"),
+        None => other(),
+    })
 }
 
 /// Whether field `name` of a non-NULL composite value `value` may be NULL.
@@ -533,7 +574,7 @@ pub(crate) fn transform_array_expr(
         let shapes: Vec<SubArrayShape> = arr
             .elements
             .iter()
-            .map(|e| sub_array_shape(e, ctx, params))
+            .map(|e| sub_array_shape(e, coerce_type, ctx, params))
             .collect();
         let mut dims = shapes.iter().filter_map(|s| match s {
             SubArrayShape::Dims(d) => Some(d),
@@ -596,16 +637,13 @@ pub(crate) fn transform_array_expr(
 enum SubArrayShape {
     /// NULL or an empty array, whatever the data.
     Absent,
-    /// A non-empty array of these dimensions (lower bounds 1), whatever the
-    /// data.
-    Dims(Vec<usize>),
+    /// A non-empty array of these dimensions, as `(lower bound, length)`
+    /// pairs, whatever the data.
+    Dims(Vec<(i64, i64)>),
     /// Depends on the data.
     Unknown,
 }
 
-/// The [`SubArrayShape`] of `node`: an `ARRAY[…]` constructor (cast or not)
-/// over values — or over sub-arrays all of one fixed shape — a NULL, or an
-/// empty array literal.
 /// Whether `node`, an element of an `ARRAY[...]`, is certainly a constant
 /// once parsed and folded: a literal (NULL included), an untyped one cast
 /// to a type that is no domain (`'{1}'::int[]`, `NULL::int[]` — the
@@ -634,22 +672,49 @@ fn certainly_constant(node: &protobuf::Node, snapshot: &PgCatalog) -> bool {
     }
 }
 
-fn sub_array_shape(node: &protobuf::Node, ctx: Ctx<'_>, params: &ParamCollector) -> SubArrayShape {
+/// The [`SubArrayShape`] of `node`, a sub-array of a multidimensional
+/// `ARRAY[…]` of type `array_type`: an `ARRAY[…]` constructor (cast or not)
+/// over values — or over sub-arrays all of one fixed shape — a NULL, or an
+/// array literal (untyped, read as `array_type`, or cast to an array type).
+fn sub_array_shape(
+    node: &protobuf::Node,
+    array_type: PgTypeOid,
+    ctx: Ctx<'_>,
+    params: &ParamCollector,
+) -> SubArrayShape {
     match node.node.as_ref() {
         Some(node::Node::AConst(c)) if c.isnull => SubArrayShape::Absent,
         Some(node::Node::AConst(protobuf::AConst {
             val: Some(a_const::Val::Sval(sv)),
             ..
-        })) if sv.sval.trim() == "{}" => SubArrayShape::Absent,
+        })) => array_literal_shape(&sv.sval, array_type, ctx.snapshot),
         Some(node::Node::TypeCast(c)) => match c.arg.as_deref() {
-            Some(arg) => sub_array_shape(arg, ctx, params),
+            // A literal is read by the input function of the type it is
+            // cast to — `array_in` for an array type.
+            Some(
+                arg @ protobuf::Node {
+                    node:
+                        Some(node::Node::AConst(protobuf::AConst {
+                            val: Some(a_const::Val::Sval(_)),
+                            ..
+                        })),
+                },
+            ) => match c
+                .type_name
+                .as_ref()
+                .and_then(|tn| crate::ddl::util::lookup_type_name(tn, ctx.snapshot).ok())
+            {
+                Some(t) => sub_array_shape(arg, t, ctx, params),
+                None => SubArrayShape::Unknown,
+            },
+            Some(arg) => sub_array_shape(arg, array_type, ctx, params),
             None => SubArrayShape::Unknown,
         },
         Some(node::Node::AArrayExpr(a)) => {
             if a.elements.is_empty() {
                 return SubArrayShape::Absent;
             }
-            let n = a.elements.len();
+            let n = a.elements.len() as i64;
             if a.elements
                 .iter()
                 .any(|e| matches!(e.node.as_ref(), Some(node::Node::AArrayExpr(_))))
@@ -659,14 +724,16 @@ fn sub_array_shape(node: &protobuf::Node, ctx: Ctx<'_>, params: &ParamCollector)
                 let inner: Vec<SubArrayShape> = a
                     .elements
                     .iter()
-                    .map(|e| sub_array_shape(e, ctx, params))
+                    .map(|e| sub_array_shape(e, array_type, ctx, params))
                     .collect();
                 if inner.iter().all(|s| *s == SubArrayShape::Absent) {
                     return SubArrayShape::Absent;
                 }
                 return match inner.first() {
                     Some(SubArrayShape::Dims(d)) if inner.iter().all(|s| *s == inner[0]) => {
-                        SubArrayShape::Dims(std::iter::once(n).chain(d.iter().copied()).collect())
+                        SubArrayShape::Dims(
+                            std::iter::once((1, n)).chain(d.iter().copied()).collect(),
+                        )
                     }
                     _ => SubArrayShape::Unknown,
                 };
@@ -681,12 +748,36 @@ fn sub_array_shape(node: &protobuf::Node, ctx: Ctx<'_>, params: &ParamCollector)
                 }) || matches!(e.node.as_ref(), Some(node::Node::AConst(_)))
             };
             if a.elements.iter().all(scalar) {
-                SubArrayShape::Dims(vec![n])
+                SubArrayShape::Dims(vec![(1, n)])
             } else {
                 SubArrayShape::Unknown
             }
         }
         _ => SubArrayShape::Unknown,
+    }
+}
+
+/// The [`SubArrayShape`] of the literal `content` read as `array_type`: by
+/// `array_in` when that is a true array type (no domain, whose CHECK may
+/// fail first; no `int2vector`, read by its own input function).
+fn array_literal_shape(
+    content: &str,
+    array_type: PgTypeOid,
+    snapshot: &PgCatalog,
+) -> SubArrayShape {
+    let Some(elem) = snapshot.get_type(array_type).and_then(|t| t.typelem) else {
+        return SubArrayShape::Unknown;
+    };
+    if snapshot.array_type_of(elem) != Some(array_type) {
+        return SubArrayShape::Unknown;
+    }
+    let dims = crate::literal_input::array_delimiter(elem, snapshot)
+        .and_then(|delim| crate::array_input::array_dimensions(content, delim));
+    match dims {
+        Some(d) if d.is_empty() => SubArrayShape::Absent,
+        Some(d) => SubArrayShape::Dims(d),
+        // A malformed literal fails on its own.
+        None => SubArrayShape::Unknown,
     }
 }
 

@@ -2142,26 +2142,36 @@ fn validate_bytea(content: &str) -> Result<(), String> {
 /// (an extension's, with a `DELIMITER` we don't record) only gets the
 /// opening-shape check.
 fn validate_array(content: &str, elem: PgTypeOid, snapshot: &PgCatalog) -> Result<(), String> {
-    let base = snapshot.unwrap_domain(elem);
-    let Some(base_type) = snapshot.get_type(base) else {
+    if snapshot.get_type(snapshot.unwrap_domain(elem)).is_none() {
         return Ok(());
-    };
-    let in_pg_catalog = snapshot.namespace_name(base_type.typnamespace) == Some("pg_catalog");
-    let delim = if in_pg_catalog && base_type.typname == "box" {
-        b';'
-    } else if base_type.typtype == TypType::Base && !in_pg_catalog {
+    }
+    let Some(delim) = array_delimiter(elem, snapshot) else {
         let trimmed = content.trim_start_matches(|c: char| c.is_ascii_whitespace());
         if trimmed.starts_with('{') || (trimmed.starts_with('[') && trimmed.contains("={")) {
             return Ok(());
         }
         return Err(format!("malformed array literal: \"{content}\""));
-    } else {
-        b','
     };
     crate::array_input::parse_array(content, delim, &mut |e| match e {
         Some(value) => validate(value, elem, snapshot),
         None => check_domain_accepts_null(elem, snapshot),
     })
+}
+
+/// The `typdelim` `array_in` splits an array of `elem` on: `;` for `box`,
+/// `,` for every other built-in. `None` for a base type defined outside
+/// `pg_catalog` (an extension's, with a `DELIMITER` we don't record) — or
+/// one the catalog doesn't know.
+pub(crate) fn array_delimiter(elem: PgTypeOid, snapshot: &PgCatalog) -> Option<u8> {
+    let base_type = snapshot.get_type(snapshot.unwrap_domain(elem))?;
+    let in_pg_catalog = snapshot.namespace_name(base_type.typnamespace) == Some("pg_catalog");
+    if in_pg_catalog && base_type.typname == "box" {
+        Some(b';')
+    } else if base_type.typtype == TypType::Base && !in_pg_catalog {
+        None
+    } else {
+        Some(b',')
+    }
 }
 
 /// `domain_check_input` on a NULL value: any NOT NULL constraint along the

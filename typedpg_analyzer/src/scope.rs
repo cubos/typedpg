@@ -1082,16 +1082,18 @@ impl Scope {
                 }
             }
             // The alias exists but lacks the column → PG's qualified
-            // missing-column wording, formatted through identifier quoting
-            // rules (`column t.col does not exist`, `column "T".col does
-            // not exist` when `T` needs quoting).
+            // missing-column wording (`column t.col does not exist`, and
+            // `column T.col does not exist` for `"T"`).
             let alias_exists = self.all_tiers().any(|s| s.answers_to(t));
             if alias_exists {
                 return Err(undefined_column_error(
                     self,
                     Some(t),
                     column,
-                    format!("column {} does not exist", QualifiedName::new(t, column)),
+                    // errorMissingColumn: errmsg("column %s.%s does not
+                    // exist", relname, colname) — the names as written,
+                    // neither quoted nor escaped.
+                    format!("column {t}.{column} does not exist"),
                     span,
                 ));
             }
