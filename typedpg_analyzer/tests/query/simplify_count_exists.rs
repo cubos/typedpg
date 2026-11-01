@@ -424,6 +424,54 @@ fn error_capable_subquery_pulled_up_is_kept() {
     );
 }
 
+/// A JOIN ... ON condition sees only its join's two sides (and the outer
+/// levels), a LATERAL item only the items to its left: a later sibling
+/// `c2 AS c` doesn't capture `c.t`, which is the outer `c1`'s — a column
+/// of another collation than `s.t`, so the comparison may fail, and the
+/// count isn't rewritten. Proving it with `c2`'s column would.
+#[test]
+fn from_clause_positions_resolve_in_their_own_scope() {
+    let db = setup_with(
+        "CREATE TABLE c1 (id int PRIMARY KEY, t text COLLATE \"en_US\" NOT NULL,
+                          dt text COLLATE \"en_US\" NOT NULL);
+         CREATE TABLE c2 (id int PRIMARY KEY, t text COLLATE \"C\" NOT NULL,
+                          dt text COLLATE \"C\" NOT NULL);
+         CREATE TABLE s (k int, t text COLLATE \"C\");
+         CREATE TABLE a (id int PRIMARY KEY);
+         CREATE TABLE b (id int PRIMARY KEY);",
+    );
+    for sql in [
+        // ON.
+        "SELECT c.id FROM c1 c WHERE EXISTS (SELECT 1 FROM a JOIN b ON b.id = a.id \
+         AND (SELECT count(*) FROM s WHERE s.k = a.id AND s.t = c.t) > 0, c2 AS c)",
+        // LATERAL.
+        "SELECT c.id FROM c1 c WHERE EXISTS (SELECT 1 FROM a, LATERAL (SELECT 1 FROM s \
+         WHERE (SELECT count(*) FROM s s2 WHERE s2.k = a.id AND s2.t = c.t) > 0) l, c2 AS c)",
+        // Unqualified: `dt` is the outer `c1`'s, not the later `c2`'s.
+        "SELECT c1.id FROM c1 WHERE EXISTS (SELECT 1 FROM a JOIN b ON b.id = a.id \
+         AND (SELECT count(*) FROM s WHERE s.k = a.id AND s.t = dt) > 0, c2)",
+        "SELECT c1.id FROM c1 WHERE EXISTS (SELECT 1 FROM a, LATERAL (SELECT 1 FROM s \
+         WHERE (SELECT count(*) FROM s s2 WHERE s2.k = a.id AND s2.t = dt) > 0) l, c2)",
+    ] {
+        assert_kept_in(&db, sql);
+    }
+    // Where the ON's own side is what the name means, it is rewritten.
+    assert_rewritten_in(
+        &db,
+        "SELECT a.id FROM a JOIN c2 ON c2.id = a.id \
+         AND (SELECT count(*) FROM s WHERE s.k = a.id AND s.t = c2.t) > 0",
+        "SELECT a.id FROM a JOIN c2 ON c2.id = a.id \
+         AND EXISTS (SELECT 1 FROM s WHERE s.k = a.id AND s.t = c2.t)",
+    );
+    assert_rewritten_in(
+        &db,
+        "SELECT a.id FROM c2, a, LATERAL (SELECT 1 FROM s \
+         WHERE (SELECT count(*) FROM s s2 WHERE s2.k = a.id AND s2.t = c2.t) > 0) l",
+        "SELECT a.id FROM c2, a, LATERAL (SELECT 1 FROM s \
+         WHERE EXISTS (SELECT 1 FROM s s2 WHERE s2.k = a.id AND s2.t = c2.t)) l",
+    );
+}
+
 /// Anything in the counted query that may fail on some row keeps it as
 /// written.
 #[test]

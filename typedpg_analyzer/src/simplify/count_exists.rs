@@ -409,28 +409,58 @@ impl Walker<'_, '_> {
         }
     }
 
-    /// The rest of a FROM list, evaluated in its level's `scope`: join
-    /// conditions, LATERAL subqueries, function calls.
-    fn walk_from_rest(&mut self, from: &[Node], scope: &FromScope<'_>) {
+    /// The rest of a FROM list: join conditions, LATERAL subqueries and
+    /// FROM functions, each in the scope PG gives it — an ON condition sees
+    /// its own join's two sides, a LATERAL item (a FROM function is one)
+    /// the items to its left; both see the levels around (`parent`), never
+    /// the rest of the FROM, whose names may shadow an outer one.
+    fn walk_from_rest(&mut self, from: &[Node], parent: Option<&FromScope<'_>>) {
+        let mut left: Vec<Node> = Vec::new();
         for item in from {
-            match item.node.as_ref() {
-                Some(node::Node::RangeSubselect(s)) => {
-                    if s.lateral
-                        && let Some(q) = s.subquery.as_deref().and_then(|q| q.node.as_ref())
-                    {
-                        self.statement(q.to_ref(), Some(scope));
-                    }
-                }
-                Some(node::Node::JoinExpr(j)) => {
-                    for side in [&j.larg, &j.rarg].into_iter().flatten() {
-                        self.walk_from_rest(std::slice::from_ref(&**side), scope);
-                    }
-                    self.opt(j.quals.as_deref(), scope);
-                }
-                Some(n) => self.children(n.to_ref(), scope),
-                None => {}
-            }
+            self.walk_from_item(item, &mut left, parent);
         }
+    }
+
+    /// One FROM item, `left` holding the items before it (and getting it).
+    fn walk_from_item(
+        &mut self,
+        item: &Node,
+        left: &mut Vec<Node>,
+        parent: Option<&FromScope<'_>>,
+    ) {
+        match item.node.as_ref() {
+            Some(node::Node::RangeSubselect(s)) => {
+                if s.lateral
+                    && let Some(q) = s.subquery.as_deref().and_then(|q| q.node.as_ref())
+                {
+                    let scope = FromScope::of_items(self.ctx, left, parent);
+                    self.statement(q.to_ref(), Some(&scope));
+                }
+            }
+            Some(node::Node::JoinExpr(j)) => {
+                let mark = left.len();
+                // The right side sees the left one (and what precedes the
+                // join): a LATERAL there may read it.
+                for side in [&j.larg, &j.rarg].into_iter().flatten() {
+                    self.walk_from_item(side, left, parent);
+                }
+                let sides: Vec<Node> = [&j.larg, &j.rarg]
+                    .into_iter()
+                    .flatten()
+                    .map(|s| (**s).clone())
+                    .collect();
+                let scope = FromScope::of_items(self.ctx, &sides, parent);
+                self.opt(j.quals.as_deref(), &scope);
+                left.truncate(mark);
+            }
+            Some(node::Node::RangeVar(_)) => {}
+            Some(n) => {
+                let scope = FromScope::of_items(self.ctx, left, parent);
+                self.children(n.to_ref(), &scope);
+            }
+            None => {}
+        }
+        left.push(item.clone());
     }
 
     fn select(&mut self, s: &SelectStmt, parent: Option<&FromScope<'_>>) {
@@ -443,7 +473,7 @@ impl Walker<'_, '_> {
         }
         self.walk_from_subqueries(&s.from_clause, parent);
         let scope = FromScope::of_select(self.ctx, s, parent);
-        self.walk_from_rest(&s.from_clause, &scope);
+        self.walk_from_rest(&s.from_clause, parent);
         for list in [
             &s.target_list,
             &s.group_clause,
