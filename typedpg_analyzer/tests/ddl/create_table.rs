@@ -1507,18 +1507,200 @@ fn create_table_as_with_data_takes_the_planned_collation() {
         );
     }
     // Where PG folds what the analyzer doesn't follow — an inlined SQL
-    // function, a subquery not pulled up whose scan the planner removes —
-    // PG accepts these (collated "C"), and so does the analyzer.
+    // function — PG accepts this (collated "C"), and so does the analyzer.
     build_db(&[
         ("0001.sql", setup),
         (
             "0002.sql",
-            &format!(
-                r#"CREATE TABLE b6 AS SELECT f(c1.b, c2.b) AS x FROM c1, c2;
-                   CREATE TABLE b11 AS SELECT x FROM (SELECT {fold} AS x FROM c1, c2 OFFSET 0) s;"#
-            ),
+            "CREATE TABLE b6 AS SELECT f(c1.b, c2.b) AS x FROM c1, c2;",
         ),
     ]);
+}
+
+#[test]
+fn create_table_as_through_a_trivial_subquery_scan_takes_the_subquerys_planned_collation() {
+    // PG 18 (set_subqueryscan_references, trivial_subqueryscan): a
+    // SubqueryScan whose target list is just the Vars of the subquery it
+    // scans, in order, with no qual or node above it, is removed, and the
+    // subquery's plan — its own target list, with the collations planning
+    // gave it — is the statement's. CREATE TABLE AS takes its columns from
+    // there. Where the scan stays, its Vars keep the parsed collation.
+    let setup = r#"CREATE TABLE c1 (b text COLLATE "C");
+                   CREATE TABLE c2 (b text COLLATE "POSIX");
+                   CREATE VIEW vp AS SELECT CASE WHEN 1 = 1 THEN 'x' ELSE c1.b END AS x FROM c1;
+                   CREATE VIEW vs AS SELECT CASE WHEN 1 = 1 THEN 'x' ELSE c1.b END AS x
+                                     FROM c1 OFFSET 0;"#;
+    let collated = |c: &str| basic_with_collation("pg_catalog", "text", c);
+    // Planned on its own (OFFSET 0), the subquery's CASE folds to c1.b.
+    let s = "(SELECT CASE WHEN true THEN c1.b ELSE c2.b END AS x FROM c1, c2 OFFSET 0) s";
+    let tables = [
+        (format!("SELECT x FROM {s}"), collated("C")),
+        (format!("SELECT * FROM {s}"), collated("C")),
+        (format!("SELECT s.* FROM {s}"), collated("C")),
+        // No Limit node.
+        (format!("SELECT x FROM {s} OFFSET 0"), collated("C")),
+        (format!("SELECT x FROM {s} LIMIT ALL"), collated("C")),
+        // Each level's trivial scan is removed.
+        (
+            format!("SELECT x FROM (SELECT x FROM {s} OFFSET 0) s2"),
+            collated("C"),
+        ),
+        (
+            format!("SELECT x FROM (SELECT x FROM {s}) s2"),
+            collated("C"),
+        ),
+        (
+            "SELECT x FROM (SELECT CASE WHEN true THEN c1.b ELSE c2.b END AS x \
+             FROM c1, c2 WHERE c1.b = 'a' OFFSET 0) s"
+                .into(),
+            collated("C"),
+        ),
+        // Sort keys among the outputs add no resjunk entry.
+        (
+            "SELECT x, k FROM (SELECT CASE WHEN true THEN c1.b ELSE c2.b END AS x, c1.b AS k \
+             FROM c1 LEFT JOIN c2 ON true ORDER BY 2 LIMIT 5) s"
+                .into(),
+            collated("C"),
+        ),
+        (
+            "SELECT x, k FROM (SELECT CASE WHEN true THEN c1.b ELSE c2.b END AS x, c1.b AS k \
+             FROM c1 LEFT JOIN c2 ON true ORDER BY k LIMIT 5) s"
+                .into(),
+            collated("C"),
+        ),
+        // An inlined CTE is a subquery.
+        (
+            "WITH s AS (SELECT CASE WHEN true THEN c1.b ELSE c2.b END AS x FROM c1, c2 OFFSET 0) \
+             SELECT x FROM s"
+                .into(),
+            collated("C"),
+        ),
+        // A WINDOW clause no call uses doesn't keep the subquery from
+        // being pulled up (is_simple_subquery checks hasWindowFuncs): its
+        // CASE folds to c1.b, whatever the outer target list.
+        (
+            "SELECT x FROM (SELECT CASE WHEN true THEN c1.b ELSE c2.b END AS x \
+             FROM c1, c2 WINDOW w AS (ORDER BY 1)) s"
+                .into(),
+            collated("C"),
+        ),
+        (
+            "SELECT x, 1 AS k FROM (SELECT CASE WHEN true THEN c1.b ELSE c2.b END AS x \
+             FROM c1, c2 WINDOW w AS (ORDER BY 1)) s"
+                .into(),
+            collated("C"),
+        ),
+        // A view too: pulled up, its CASE folds to the default-collated 'x';
+        // planned on its own, its plan is the statement's.
+        ("SELECT x FROM vp".into(), text()),
+        ("SELECT x FROM vs".into(), text()),
+        ("SELECT * FROM vs".into(), text()),
+        // The scan stays: its Var has the view column's collation.
+        ("SELECT x, 1 AS k FROM vs".into(), collated("C")),
+        (
+            "SELECT x, 1 AS k FROM (SELECT CASE WHEN 1 = 1 THEN 'x' ELSE c1.b END AS x \
+             FROM c1 OFFSET 0) s"
+                .into(),
+            collated("C"),
+        ),
+    ];
+    for (query, ty) in &tables {
+        let stmt = format!("CREATE TABLE t AS {query};");
+        let db = build_db(&[("0001.sql", setup), ("0002.sql", &stmt)]);
+        let info = db.analyze("SELECT x FROM t").unwrap();
+        assert_cols(&info, vec![cn("x", ty.clone())]);
+    }
+    // Which a view combining it with another collation can't settle — or
+    // can, where it is the default one.
+    let migrations = |ctas: &str, stmt: &str| {
+        try_apply(&[
+            ("0001.sql", setup),
+            ("0002.sql", &format!("CREATE TABLE t AS {ctas};")),
+            ("0003.sql", stmt),
+        ])
+    };
+    let view = "CREATE VIEW w AS SELECT t.x || c2.b AS y FROM t, c2;";
+    for ctas in [
+        format!("SELECT x FROM {s}"),
+        "SELECT x, 1 AS k FROM vs".into(),
+    ] {
+        let err = migrations(&ctas, view).expect_err(&ctas);
+        assert!(
+            err.to_string()
+                .starts_with(r#"could not determine which collation to use for view column "y""#),
+            "{ctas}\n  got: {err}"
+        );
+    }
+    for ctas in ["SELECT x FROM vp", "SELECT x FROM vs"] {
+        migrations(ctas, view).unwrap_or_else(|e| panic!("{ctas}\n  got: {e}"));
+    }
+    // The scan stays — the target list isn't the subquery's, a Limit or
+    // LockRows node is above it, or a CTE is scanned on its own — and the
+    // CASE's parsed collation, none, is the column's.
+    for query in [
+        format!("SELECT x, 1 AS k FROM {s}"),
+        format!("SELECT x FROM {s} LIMIT 5"),
+        format!("SELECT x FROM {s} OFFSET 1"),
+        format!("SELECT x FROM {s} FOR UPDATE"),
+        "WITH s AS MATERIALIZED (SELECT CASE WHEN true THEN c1.b ELSE c2.b END AS x \
+         FROM c1, c2 OFFSET 0) SELECT x FROM s"
+            .into(),
+    ] {
+        let stmt = format!("CREATE TABLE t AS {query};");
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", &stmt)]).expect_err(&stmt);
+        assert!(
+            err.to_string().starts_with(
+                r#"no collation was derived for column "x" with collatable type text"#
+            ),
+            "{stmt}\n  got: {err}"
+        );
+    }
+    // Where the analyzer can't tell whether the scan is removed (a window
+    // call's resjunk keys, a same-type cast parse analysis drops, a CASE
+    // the outer level folds to the Var, a pulled-up subquery's unread
+    // column), PG stores "C", and the analyzer accepts what that allows.
+    for query in [
+        "SELECT x, n FROM (SELECT CASE WHEN true THEN c1.b ELSE c2.b END AS x, \
+         count(*) OVER () AS n FROM c1, c2) s"
+            .to_string(),
+        format!("SELECT x::text AS x FROM {s}"),
+        format!("SELECT CASE WHEN true THEN x END AS x FROM {s}"),
+        format!("SELECT x FROM (SELECT x, 1 AS k FROM {s}) s2"),
+    ] {
+        build_db(&[
+            ("0001.sql", setup),
+            ("0002.sql", &format!("CREATE TABLE t AS {query};")),
+            (
+                "0003.sql",
+                r#"CREATE TABLE ch (x text COLLATE "C") INHERITS (t);"#,
+            ),
+        ]);
+    }
+    // A pulled-up subquery (or inlined CTE) over one planned on its own:
+    // whether the scan stays is up to the target list the pull-up leaves
+    // (the reading level's), not the pulled-up one's. Here that is just
+    // vs's column, the scan is removed, and PG stores vs's planned,
+    // default, collation; with another output beside it (the last one),
+    // the scan stays and PG stores "C". The analyzer can't tell, and
+    // accepts what either allows.
+    let defaults = [
+        "SELECT x FROM (SELECT x, 1 AS k FROM vs) q",
+        "SELECT x FROM (SELECT y, x FROM (SELECT x, 'a'::text y FROM vs) z) q",
+        "WITH q AS (SELECT x, 1 AS k FROM vs) SELECT x FROM q",
+        "SELECT x FROM (SELECT x, 1 AS k FROM (SELECT CASE WHEN 1 = 1 THEN 'x' ELSE c1.b END AS x \
+         FROM c1 OFFSET 0) s) q",
+    ];
+    for ctas in defaults {
+        migrations(ctas, view).unwrap_or_else(|e| panic!("{ctas}\n  got: {e}"));
+        migrations(ctas, "CREATE TABLE ch (x text) INHERITS (t);")
+            .unwrap_or_else(|e| panic!("{ctas}\n  got: {e}"));
+    }
+    let ctas = "SELECT x, 2 AS j FROM (SELECT x, 1 AS k FROM vs) q";
+    migrations(
+        ctas,
+        r#"CREATE TABLE ch (x text COLLATE "C") INHERITS (t);"#,
+    )
+    .unwrap_or_else(|e| panic!("{ctas}\n  got: {e}"));
 }
 
 #[test]

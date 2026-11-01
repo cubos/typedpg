@@ -312,6 +312,7 @@ fn analyze_select_here(
         grouping::finish_values_level(sel, &values_scope, &sort_sources, snapshot)?;
         set_level_summary(LevelSummary {
             min_one_row: limit_keeps_a_row(sel),
+            ..LevelSummary::default()
         });
         return Ok((columns, None));
     }
@@ -726,13 +727,17 @@ fn analyze_select_here(
         params,
     )?;
     check_distinct_on_matches_order_by(sel, &columns, &scope, snapshot)?;
-    check_sort_group_keys(
-        sel,
-        &targets,
-        &columns,
-        expr::Ctx::new(&scope, &null_ctx, snapshot),
-        params,
-    )?;
+    // In a subquery the planner pulls up, the only keys are its WINDOW
+    // clause's, which it never plans (see `check_window_clause`).
+    expr::plan_fold::unless_dead(expr::plan_fold::level_pulled_up(), || {
+        check_sort_group_keys(
+            sel,
+            &targets,
+            &columns,
+            expr::Ctx::new(&scope, &null_ctx, snapshot),
+            params,
+        )
+    })?;
     if resolve_unknowns {
         resolve_unknown_values(&sel.target_list, &columns, snapshot)?;
     }
@@ -790,15 +795,419 @@ fn analyze_select_here(
     }
 
     let has_aggs = grouping::level_info(sel).is_some_and(|l| l.has_aggs);
-    set_level_summary(finish_level(
+    let mut summary = finish_level(
         sel,
         &scope,
         has_aggs,
         input_nonempty,
         &mut columns,
         snapshot,
-    ));
+    );
+    // The level model knows when the plan-time checks are on.
+    let not_dummy = expr::plan_time_checks()
+        && !expr::plan_fold::level_may_be_empty()
+        && !expr::plan_fold::level_may_be_dummy();
+    summary.removable_scan = removable_scan(
+        sel,
+        &columns,
+        &|name| outer_ctes.contains_key(name),
+        not_dummy,
+        snapshot,
+    );
+    set_planned_top(sel, &scope, &mut columns);
+    set_level_summary(summary);
     Ok((columns, None))
+}
+
+/// See [`super::LevelSummary::removable_scan`]: whether a SubqueryScan
+/// over `sel` (with outputs `columns`, reading the CTEs `cte` names),
+/// should it be a trivial one, is certainly removed. Not when the planner
+/// may prove the level empty: unless `not_dummy` (the level model of
+/// [`expr::plan_fold`] says it can't), only a level without quals reading
+/// nothing but plain tables without row security is sure not to be; and
+/// a partitioned table read anywhere below may have no partition left
+/// once pruned. Not when its target list may carry a resjunk entry: a
+/// row mark (`FOR UPDATE`), a sort, grouping or DISTINCT ON key that is no
+/// output (an ordinal, or for ORDER BY and DISTINCT ON an output's name,
+/// is one), a window's key.
+pub(crate) fn removable_scan(
+    sel: &protobuf::SelectStmt,
+    columns: &[RawColumn],
+    cte: &dyn Fn(&str) -> bool,
+    not_dummy: bool,
+    snapshot: &PgCatalog,
+) -> bool {
+    if sel.op != SetOperation::SetopNone as i32
+        || !sel.values_lists.is_empty()
+        || !sel.locking_clause.is_empty()
+        || !sel.window_clause.is_empty()
+    {
+        return false;
+    }
+    let own_cte = |name: &str| {
+        cte(name)
+            || sel.with_clause.as_ref().is_some_and(|w| {
+                w.ctes.iter().any(|c| {
+                    matches!(c.node.as_ref(), Some(node::Node::CommonTableExpr(c))
+                        if c.ctename == name)
+                })
+            })
+    };
+    let plain_table = |n: &protobuf::Node| match n.node.as_ref() {
+        Some(node::Node::RangeVar(rv)) => {
+            let schema = (!rv.schemaname.is_empty()).then_some(rv.schemaname.as_str());
+            (schema.is_some() || !own_cte(&rv.relname))
+                && snapshot
+                    .resolve_table(schema, &rv.relname)
+                    .is_some_and(|c| {
+                        c.relkind == crate::pg_catalog::RelKind::Table
+                            && !snapshot.row_security.contains(&c.oid)
+                    })
+        }
+        _ => false,
+    };
+    if !not_dummy
+        && (sel.where_clause.is_some()
+            || sel.having_clause.is_some()
+            || !sel.from_clause.iter().all(plain_table))
+    {
+        return false;
+    }
+    let ordinal = |n: &protobuf::Node| {
+        matches!(
+            n.node.as_ref(),
+            Some(node::Node::AConst(protobuf::AConst {
+                val: Some(protobuf::a_const::Val::Ival(_)),
+                ..
+            }))
+        )
+    };
+    let output_name = |n: &protobuf::Node| match n.node.as_ref() {
+        Some(node::Node::ColumnRef(cr)) => match cr.fields.as_slice() {
+            [f] => matches!(f.node.as_ref(), Some(node::Node::String(s))
+                if columns.iter().filter(|c| c.name == s.sval).count() == 1),
+            _ => false,
+        },
+        _ => false,
+    };
+    let sort_keys_are_outputs = sel.sort_clause.iter().all(|s| match s.node.as_ref() {
+        Some(node::Node::SortBy(sb)) => sb
+            .node
+            .as_deref()
+            .is_some_and(|k| ordinal(k) || output_name(k)),
+        _ => false,
+    });
+    // A plain DISTINCT is one empty node.
+    let distinct_keys_are_outputs = sel
+        .distinct_clause
+        .iter()
+        .all(|d| d.node.is_none() || ordinal(d) || output_name(d));
+    if !sort_keys_are_outputs || !distinct_keys_are_outputs || !sel.group_clause.iter().all(ordinal)
+    {
+        return false;
+    }
+    // A window call's PARTITION BY / ORDER BY keys are resjunk entries
+    // unless outputs; a partitioned table read below (or an outer CTE,
+    // whose query this level doesn't see) may be empty.
+    let mut todo: Vec<typedpg_pg_query::NodeRef<'_>> = sel
+        .target_list
+        .iter()
+        .chain(&sel.from_clause)
+        .filter_map(|n| n.node.as_ref())
+        .map(|n| n.to_ref())
+        .collect();
+    if let Some(with) = &sel.with_clause {
+        todo.extend(
+            with.ctes
+                .iter()
+                .filter_map(|n| n.node.as_ref())
+                .map(|n| n.to_ref()),
+        );
+    }
+    while let Some(n) = todo.pop() {
+        match n {
+            typedpg_pg_query::NodeRef::FuncCall(fc) if fc.over.is_some() => return false,
+            typedpg_pg_query::NodeRef::RangeVar(rv) => {
+                if rv.schemaname.is_empty() && cte(&rv.relname) {
+                    return false;
+                }
+                let schema = (!rv.schemaname.is_empty()).then_some(rv.schemaname.as_str());
+                if let Some(class) = snapshot.resolve_table(schema, &rv.relname)
+                    && reads_partitioned(snapshot, class.oid)
+                {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+        todo.extend(n.children());
+    }
+    true
+}
+
+/// Whether relation `relid` is a partitioned table, or a view reading one
+/// (as it bound its relations), at any depth.
+fn reads_partitioned(snapshot: &PgCatalog, relid: crate::oid::PgClassOid) -> bool {
+    use crate::pg_catalog::RelKind;
+    let mut todo = vec![relid];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(rel) = todo.pop() {
+        if !seen.insert(rel) {
+            continue;
+        }
+        match snapshot.pg_class.get(&rel).map(|c| c.relkind) {
+            Some(RelKind::Partitioned) => return true,
+            Some(RelKind::View) => {
+                for r in snapshot.view_references.get(&rel).into_iter().flatten() {
+                    if let crate::ddl::depend::Reference::Object(a) = r
+                        && a.classid == crate::pg_catalog::PG_CLASS_RELID
+                    {
+                        todo.push(crate::oid::PgClassOid::from_nonzero(a.objid.into_nonzero()));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// What an output of a query level is to `trivial_subqueryscan`.
+enum TopOutput<'a> {
+    /// A Var of a FROM entry of the level.
+    Var(&'a ScopeColumn),
+    /// An expression planning may reduce to a Var (a CASE or COALESCE it
+    /// folds, a same-type cast, which parse analysis drops) of one of
+    /// these FROM entries' columns.
+    MaybeVar(Vec<&'a ScopeColumn>),
+    /// Never a Var of the level.
+    Other,
+}
+
+/// Set [`RawColumn::planned_top`] for the outputs `columns` of SELECT
+/// `sel`, whose FROM entries `scope` holds: where the level reads a single
+/// subquery, and its target list is that subquery's columns in order and
+/// nothing else, with no clause that adds a plan node or a qual above the
+/// SubqueryScan, setrefs removes the scan (`trivial_subqueryscan`) and the
+/// subquery's own target list, with the collations planning gave it, is
+/// the plan's. Where the scan certainly stays, a Var of it keeps its parsed
+/// collation; where the analyzer can't tell, the collation is unknown.
+fn set_planned_top(sel: &protobuf::SelectStmt, scope: &Scope, columns: &mut [RawColumn]) {
+    use crate::expr::Planned;
+    let local = |c: &ScopeColumn| {
+        scope
+            .sources
+            .iter()
+            .any(|s| s.columns.iter().any(|x| std::ptr::eq(x, c)))
+    };
+    // Nothing to do unless a column of the level's entries is a subquery's.
+    if !scope
+        .sources
+        .iter()
+        .flat_map(|s| &s.columns)
+        .any(|c| c.deferred.planned_top.is_some() || c.deferred.subquery_scan)
+    {
+        return;
+    }
+    let differs = |c: &ScopeColumn| c.deferred.planned_top.is_some_and(|p| p != c.planned());
+    let mut outputs: Vec<TopOutput<'_>> = Vec::new();
+    let mut opaque = false;
+    for t in &sel.target_list {
+        let Some(node::Node::ResTarget(rt)) = t.node.as_ref() else {
+            continue;
+        };
+        let Some(val) = rt.val.as_deref() else {
+            continue;
+        };
+        match val.node.as_ref() {
+            Some(node::Node::ColumnRef(cr))
+                if cr
+                    .fields
+                    .iter()
+                    .any(|f| matches!(f.node.as_ref(), Some(node::Node::AStar(_)))) =>
+            {
+                let table = cr.fields.iter().rev().find_map(|f| match f.node.as_ref()? {
+                    node::Node::String(s) => Some(s.sval.as_str()),
+                    _ => None,
+                });
+                let cols: Vec<&ScopeColumn> = match table {
+                    Some(t) => match scope.find_source(t) {
+                        Some(src) => src.columns.iter().collect(),
+                        None => {
+                            opaque = true;
+                            Vec::new()
+                        }
+                    },
+                    None => scope
+                        .sources
+                        .iter()
+                        .flat_map(|s| s.visible_columns())
+                        .collect(),
+                };
+                outputs.extend(cols.into_iter().map(|c| {
+                    if local(c) {
+                        TopOutput::Var(c)
+                    } else {
+                        TopOutput::Other
+                    }
+                }));
+            }
+            Some(node::Node::ColumnRef(cr)) => match column_ref_target(cr, scope) {
+                Some(c) if local(c) => outputs.push(TopOutput::Var(c)),
+                Some(_) => outputs.push(TopOutput::Other),
+                None => opaque = true,
+            },
+            _ => {
+                let i = outputs.len();
+                let mut cols = Vec::new();
+                let mut todo: Vec<_> = val.node.as_ref().map(|n| n.to_ref()).into_iter().collect();
+                while let Some(n) = todo.pop() {
+                    match n {
+                        // A sublink's columns are its own query's.
+                        typedpg_pg_query::NodeRef::SubLink(_) => continue,
+                        typedpg_pg_query::NodeRef::ColumnRef(cr) => {
+                            match column_ref_target(cr, scope) {
+                                Some(c) if local(c) => cols.push(c),
+                                Some(_) => {}
+                                None => opaque = true,
+                            }
+                            continue;
+                        }
+                        _ => {}
+                    }
+                    todo.extend(n.children());
+                }
+                let mut cast = val;
+                while let Some(node::Node::TypeCast(tc)) = cast.node.as_ref()
+                    && let Some(arg) = tc.arg.as_deref()
+                {
+                    cast = arg;
+                }
+                let may_be_var = matches!(cast.node.as_ref(), Some(node::Node::ColumnRef(_)))
+                    || columns
+                        .get(i)
+                        .is_some_and(|c| c.planned != Planned::AsParsed);
+                outputs.push(if cols.is_empty() || !may_be_var {
+                    TopOutput::Other
+                } else {
+                    TopOutput::MaybeVar(cols)
+                });
+            }
+        }
+    }
+    if opaque || outputs.len() != columns.len() {
+        // Which column an output reads is unknown.
+        if scope.sources.iter().flat_map(|s| &s.columns).any(differs) {
+            for c in columns.iter_mut() {
+                c.planned_top = Some(Planned::Unknown);
+            }
+        }
+        return;
+    }
+    let single = match (sel.from_clause.as_slice(), scope.sources.as_slice()) {
+        ([item], [src]) if !matches!(item.node.as_ref(), Some(node::Node::JoinExpr(_))) => {
+            Some(src)
+        }
+        _ => None,
+    };
+    // limit_needed: a NULL count, a NULL or zero offset, makes no Limit
+    // node; another constant does.
+    let constant = |n: Option<&protobuf::Node>| match n.and_then(|n| n.node.as_ref()) {
+        None => Some(None),
+        Some(node::Node::AConst(c)) if c.isnull => Some(None),
+        Some(node::Node::AConst(protobuf::AConst {
+            val: Some(protobuf::a_const::Val::Ival(i)),
+            ..
+        })) => Some(Some(i.ival)),
+        _ => None,
+    };
+    let (count, offset) = (
+        constant(sel.limit_count.as_deref()),
+        constant(sel.limit_offset.as_deref()),
+    );
+    let no_limit = count == Some(None) && matches!(offset, Some(None | Some(0)));
+    let limit_node = matches!(count, Some(Some(_))) || matches!(offset, Some(Some(o)) if o != 0);
+    let no_clauses = sel.where_clause.is_none()
+        && sel.group_clause.is_empty()
+        && sel.having_clause.is_none()
+        && sel.distinct_clause.is_empty()
+        && sel.sort_clause.is_empty()
+        && no_limit
+        && sel.locking_clause.is_empty()
+        && sel.window_clause.is_empty();
+    if let Some(src) = single {
+        let all_vars_in_order = outputs.len() == src.columns.len()
+            && outputs.iter().zip(&src.columns).all(|(o, c)| match o {
+                TopOutput::Var(v) => std::ptr::eq(*v, c),
+                _ => false,
+            });
+        if all_vars_in_order && no_clauses {
+            // The scan is trivial: removed where the subquery allows it.
+            for (col, o) in columns.iter_mut().zip(&outputs) {
+                if let TopOutput::Var(v) = o {
+                    col.planned_top = v.deferred.planned_top;
+                }
+            }
+            return;
+        }
+        // trivial_subqueryscan requires a target list as long as the
+        // subquery's, of its Vars in order (or Consts equal to its
+        // entries); a LockRows or Limit node above the scan keeps it too.
+        let stays = outputs.len() != src.columns.len()
+            || outputs.iter().enumerate().any(|(i, o)| match o {
+                TopOutput::Var(v) => src.columns.get(i).is_none_or(|c| !std::ptr::eq(*v, c)),
+                _ => false,
+            })
+            || !sel.locking_clause.is_empty()
+            || limit_node;
+        if stays {
+            // Its Vars are the plan's (as long as this level is the top:
+            // pulled up, see `RawColumn::scan_stays`).
+            for (col, o) in columns.iter_mut().zip(&outputs) {
+                col.planned_top = match o {
+                    TopOutput::Var(v) if v.deferred.subquery_scan => {
+                        col.scan_stays = true;
+                        Some(Planned::AsParsed)
+                    }
+                    TopOutput::Var(v) if differs(v) => Some(Planned::Unknown),
+                    TopOutput::MaybeVar(cs) if cs.iter().any(|c| differs(c)) => {
+                        Some(Planned::Unknown)
+                    }
+                    _ => None,
+                };
+            }
+            return;
+        }
+    }
+    // The planner may or may not leave a trivial scan.
+    for (col, o) in columns.iter_mut().zip(&outputs) {
+        let maybe = match o {
+            TopOutput::Var(c) => differs(c),
+            TopOutput::MaybeVar(cs) => cs.iter().any(|c| differs(c)),
+            TopOutput::Other => false,
+        };
+        if maybe {
+            col.planned_top = Some(Planned::Unknown);
+        }
+    }
+}
+
+/// The column a non-star column reference resolves to, if it names one
+/// (not a whole row).
+fn column_ref_target<'a>(cr: &protobuf::ColumnRef, scope: &'a Scope) -> Option<&'a ScopeColumn> {
+    let names: Vec<&str> = cr
+        .fields
+        .iter()
+        .map(|f| match f.node.as_ref() {
+            Some(node::Node::String(s)) => Some(s.sval.as_str()),
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+    match names.as_slice() {
+        [c] => scope.resolve_column(None, c, None).ok(),
+        [t, c] => scope.resolve_column(Some(t), c, None).ok(),
+        _ => None,
+    }
 }
 
 /// Whether a target list holds a `(expr).*`.

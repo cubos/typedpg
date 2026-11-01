@@ -863,6 +863,10 @@ struct LevelQuals {
     /// How many base relations, at least, the level has once the planner
     /// pulled its subqueries up (see [`Group`]).
     rels: usize,
+    /// The level is a FROM subquery the planner pulls up: what it doesn't
+    /// output (its WINDOW clause, which no window call can use there) is
+    /// never planned.
+    pulled_up: bool,
 }
 
 /// How the next query level analyzed is planned (see [`with_next_level`]).
@@ -1052,6 +1056,7 @@ impl PlanLevel {
                     || may_be_empty(&dummy_quals, snapshot),
                 conjuncts: conjuncts.len(),
                 rels,
+                pulled_up: matches!(next, NextLevel::PulledUp | NextLevel::PulledUpNullable),
             }
         } else {
             PUSHABLE.with(|p| p.borrow_mut().push(Vec::new()));
@@ -1628,6 +1633,12 @@ pub(crate) fn level_may_be_dummy() -> bool {
 /// [`PUSHABLE`]).
 pub(crate) fn level_may_push_down() -> bool {
     PUSHABLE.with(|p| p.borrow().last().is_some_and(|q| !q.is_empty()))
+}
+
+/// Whether the current level is a FROM subquery the planner pulls up
+/// (see [`NextLevel::PulledUp`]).
+pub(crate) fn level_pulled_up() -> bool {
+    LEVELS.with(|l| l.borrow().last().is_some_and(|q| q.pulled_up))
 }
 
 /// How many quals the current level has.

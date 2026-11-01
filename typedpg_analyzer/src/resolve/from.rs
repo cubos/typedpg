@@ -90,6 +90,36 @@ fn with_nullable_side<R>(
     out
 }
 
+/// [`crate::scope::Deferred::planned_top`] for output `rc` of a subquery
+/// (a FROM subquery, a view, an inlined CTE) the planner plans as `plan`,
+/// whose level summary says whether a trivial scan over it is removed
+/// (`removable`, see [`super::LevelSummary::removable_scan`]).
+pub(crate) fn subquery_planned_top(
+    plan: super::deferred::Plan,
+    rc: &RawColumn,
+    removable: bool,
+) -> Option<crate::expr::Planned> {
+    use crate::expr::Planned;
+    let top = rc.planned_top.unwrap_or(rc.planned);
+    match plan {
+        // Pulled up, the subquery's level is the one reading it — except
+        // where the subquery's level kept a scan its own target list
+        // made non-trivial: the reading level's (flattened) one decides.
+        super::deferred::Plan::PulledUp if rc.scan_stays => Some(Planned::Unknown),
+        super::deferred::Plan::PulledUp => rc.planned_top,
+        // Planned on its own: a trivial scan over it leaves its plan.
+        super::deferred::Plan::Separate => Some(if top == Planned::AsParsed || removable {
+            top
+        } else {
+            Planned::Unknown
+        }),
+        super::deferred::Plan::Uncertain | super::deferred::Plan::Whole => {
+            (top != Planned::AsParsed || rc.planned != Planned::AsParsed || rc.scan_stays)
+                .then_some(Planned::Unknown)
+        }
+    }
+}
+
 fn rows_kept() -> bool {
     ROWS_KEPT.with(|k| k.get())
 }
@@ -298,7 +328,42 @@ pub(crate) fn process_from_item(
                         }
                     }
                     if let Some(cols) = view_columns(snapshot, class) {
+                        // The rewriter makes the view a subquery, which the
+                        // planner plans like a FROM one: pulled up, its
+                        // outputs replace the references (folded, maybe,
+                        // to another collation); planned on its own, a
+                        // trivial scan over it may be removed.
+                        let query =
+                            crate::ddl::views::view_query(snapshot, class.oid).and_then(|q| q.node);
+                        let view_sel = match &query {
+                            Some(node::Node::SelectStmt(sel)) => Some(sel),
+                            _ => None,
+                        };
+                        let plan = if snapshot.security_barrier_views.contains(&class.oid) {
+                            super::deferred::Plan::Separate
+                        } else {
+                            view_sel.map_or(super::deferred::Plan::Uncertain, |sel| {
+                                super::deferred::plan_of(sel, snapshot)
+                            })
+                        };
+                        // Its query was analyzed without the plan-time
+                        // checks: no level model says it can't be empty.
+                        // (It sees no CTE of the statement.)
+                        let removable = view_sel.is_some_and(|sel| {
+                            super::select::removable_scan(sel, &cols, &|_| false, false, snapshot)
+                        });
                         for (c, rc) in src.columns.iter_mut().zip(cols) {
+                            match (plan, rc.planned) {
+                                (
+                                    super::deferred::Plan::PulledUp,
+                                    p @ crate::expr::Planned::Folded { .. },
+                                ) => c.deferred.planned = p,
+                                (super::deferred::Plan::Separate, _)
+                                | (_, crate::expr::Planned::AsParsed) => {}
+                                _ => c.planned_unknown = true,
+                            }
+                            c.deferred.planned_top = subquery_planned_top(plan, &rc, removable);
+                            c.deferred.subquery_scan = plan == super::deferred::Plan::Separate;
                             // What the query makes of it now (calls read
                             // as their bodies, see `expr::inline`) holds
                             // as well as what was found at CREATE VIEW.
@@ -532,6 +597,8 @@ pub(crate) fn process_from_item(
                             expr: exprs.next().flatten(),
                             alone: None,
                             unless_removed: None,
+                            planned_top: subquery_planned_top(plan, &rc, summary.removable_scan),
+                            subquery_scan: plan == super::deferred::Plan::Separate,
                         },
                         name: rc.name,
                         type_oid: rc.type_oid,
@@ -1772,7 +1839,13 @@ fn merge_using_columns(
         let (collation, no_collation) =
             merged_column_collation(&l, &r, type_oid, typmod, join_type, snapshot);
         merged.push(ScopeColumn {
-            deferred: Default::default(),
+            deferred: crate::scope::Deferred {
+                // One side's Var, should the planner remove the other
+                // side's relation (a LEFT JOIN it proves useless).
+                planned_top: (l.deferred.planned_top.is_some() || r.deferred.planned_top.is_some())
+                    .then_some(crate::expr::Planned::Unknown),
+                ..Default::default()
+            },
             name: name.clone(),
             type_oid,
             base_not_null,
