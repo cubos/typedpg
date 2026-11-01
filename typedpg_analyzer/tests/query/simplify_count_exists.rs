@@ -1,0 +1,436 @@
+//! A count compared with zero → `EXISTS` / `NOT EXISTS`
+//! (`Rule::CountExists`): rewritten only for the plain `pg_catalog.count`
+//! of a one-row aggregate query, compared with a literal `0` / `1` through
+//! the built-in `int8`/`int4` operators, nothing volatile read. Under
+//! `pg_sanity` every rewrite is also executed next to the original on the
+//! adversarial rows.
+
+use crate::common::*;
+use typedpg_analyzer::{Rule, SimplifyOptions};
+
+fn setup_with(extra: &str) -> PgCatalog {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE t (id bigint PRIMARY KEY, a int NOT NULL, b int);
+         CREATE TABLE u (id bigint PRIMARY KEY, t_id bigint NOT NULL, c int);",
+    )
+    .unwrap();
+    if !extra.is_empty() {
+        db.apply_sql(extra).unwrap();
+    }
+    db
+}
+
+fn setup() -> PgCatalog {
+    setup_with("")
+}
+
+#[track_caller]
+fn assert_rewritten_in(db: &PgCatalog, sql: &str, expected: &str) {
+    let a = db.analyze(sql).unwrap();
+    assert_eq!(a.sql, expected, "for {sql}");
+    assert!(
+        !a.simplifications.is_empty()
+            && a.simplifications
+                .iter()
+                .all(|s| s.rule == Rule::CountExists),
+        "for {sql}: {:?}",
+        a.simplifications
+    );
+}
+
+#[track_caller]
+fn assert_rewritten(sql: &str, expected: &str) {
+    assert_rewritten_in(&setup(), sql, expected);
+}
+
+#[track_caller]
+fn assert_kept_in(db: &PgCatalog, sql: &str) {
+    let a = db.analyze(sql).unwrap();
+    assert!(
+        a.simplifications.is_empty(),
+        "{sql} was rewritten to {}",
+        a.sql
+    );
+}
+
+#[track_caller]
+fn assert_kept(sql: &str) {
+    assert_kept_in(&setup(), sql);
+}
+
+// ── Positive shapes ─────────────────────────────────────────────────────────
+
+#[test]
+fn every_comparison_with_zero() {
+    for (sql, expected) in [
+        (
+            "SELECT (SELECT count(*) FROM t WHERE b > 3) > 0 AS x",
+            "SELECT EXISTS (SELECT 1 FROM t WHERE b > 3) AS x",
+        ),
+        (
+            "SELECT (SELECT count(*) FROM t WHERE b > 3) >= 1 AS x",
+            "SELECT EXISTS (SELECT 1 FROM t WHERE b > 3) AS x",
+        ),
+        (
+            "SELECT (SELECT count(*) FROM t WHERE b > 3) <> 0 AS x",
+            "SELECT EXISTS (SELECT 1 FROM t WHERE b > 3) AS x",
+        ),
+        (
+            "SELECT (SELECT count(*) FROM t WHERE b > 3) != 0 AS x",
+            "SELECT EXISTS (SELECT 1 FROM t WHERE b > 3) AS x",
+        ),
+        (
+            "SELECT (SELECT count(*) FROM t WHERE b > 3) = 0 AS x",
+            "SELECT NOT EXISTS (SELECT 1 FROM t WHERE b > 3) AS x",
+        ),
+    ] {
+        assert_rewritten(sql, expected);
+    }
+}
+
+#[test]
+fn mirrored_comparisons() {
+    for (sql, expected) in [
+        (
+            "SELECT 0 < (SELECT count(*) FROM t WHERE b > 3) AS x",
+            "SELECT EXISTS (SELECT 1 FROM t WHERE b > 3) AS x",
+        ),
+        (
+            "SELECT 1 <= (SELECT count(*) FROM t WHERE b > 3) AS x",
+            "SELECT EXISTS (SELECT 1 FROM t WHERE b > 3) AS x",
+        ),
+        (
+            "SELECT 0 <> (SELECT count(*) FROM t WHERE b > 3) AS x",
+            "SELECT EXISTS (SELECT 1 FROM t WHERE b > 3) AS x",
+        ),
+        (
+            "SELECT 0 = (SELECT count(*) FROM t WHERE b > 3) AS x",
+            "SELECT NOT EXISTS (SELECT 1 FROM t WHERE b > 3) AS x",
+        ),
+        (
+            "SELECT 0<(SELECT count(*) FROM t)AS x",
+            "SELECT EXISTS (SELECT 1 FROM t)AS x",
+        ),
+    ] {
+        assert_rewritten(sql, expected);
+    }
+}
+
+#[test]
+fn count_of_a_not_null_expression() {
+    for (sql, expected) in [
+        (
+            "SELECT (SELECT count(a) FROM t) > 0 AS x",
+            "SELECT EXISTS (SELECT 1 FROM t) AS x",
+        ),
+        (
+            "SELECT (SELECT count(t.id) FROM t) > 0 AS x",
+            "SELECT EXISTS (SELECT 1 FROM t) AS x",
+        ),
+        (
+            "SELECT (SELECT count(1) FROM t) > 0 AS x",
+            "SELECT EXISTS (SELECT 1 FROM t) AS x",
+        ),
+        (
+            "SELECT (SELECT count(a) FROM t) = 0 AS x",
+            "SELECT NOT EXISTS (SELECT 1 FROM t) AS x",
+        ),
+        // Distinct values: nonzero exactly when `count(a)` is.
+        (
+            "SELECT (SELECT count(DISTINCT a) FROM t) > 0 AS x",
+            "SELECT EXISTS (SELECT 1 FROM t) AS x",
+        ),
+        (
+            "SELECT (SELECT count(x.a) FROM t x JOIN u ON u.t_id = x.id) > 0 AS x",
+            "SELECT EXISTS (SELECT 1 FROM t x JOIN u ON u.t_id = x.id) AS x",
+        ),
+        (
+            "SELECT (SELECT pg_catalog.count(*) FROM t) > 0 AS x",
+            "SELECT EXISTS (SELECT 1 FROM t) AS x",
+        ),
+    ] {
+        assert_rewritten(sql, expected);
+    }
+}
+
+#[test]
+fn correlated_in_where_and_dml() {
+    for (sql, expected) in [
+        (
+            "SELECT id FROM t WHERE (SELECT count(*) FROM u WHERE u.t_id = t.id) = 0",
+            "SELECT id FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.t_id = t.id)",
+        ),
+        (
+            "SELECT id FROM t WHERE a = 1 AND(SELECT count(*) FROM u WHERE u.t_id = t.id)>0",
+            "SELECT id FROM t WHERE a = 1 AND EXISTS (SELECT 1 FROM u WHERE u.t_id = t.id)",
+        ),
+        (
+            "SELECT id FROM t WHERE NOT (SELECT count(*) FROM u WHERE u.t_id = t.id) > 0",
+            "SELECT id FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.t_id = t.id)",
+        ),
+        (
+            "SELECT (SELECT count(*) FROM t WHERE a = $1) > 0 AS x",
+            "SELECT EXISTS (SELECT 1 FROM t WHERE a = $1) AS x",
+        ),
+        (
+            "UPDATE u SET c = 1 WHERE (SELECT count(*) FROM t WHERE t.id = u.t_id) > 0",
+            "UPDATE u SET c = 1 WHERE EXISTS (SELECT 1 FROM t WHERE t.id = u.t_id)",
+        ),
+        (
+            "DELETE FROM u WHERE (SELECT count(*) FROM t WHERE t.id = u.t_id) = 0 \
+             RETURNING (SELECT count(*) FROM t) > 0",
+            "DELETE FROM u WHERE NOT EXISTS (SELECT 1 FROM t WHERE t.id = u.t_id) \
+             RETURNING EXISTS (SELECT 1 FROM t) AS \"?column?\"",
+        ),
+    ] {
+        assert_rewritten(sql, expected);
+    }
+}
+
+#[test]
+fn unnamed_output_columns_keep_their_name() {
+    for (sql, expected) in [
+        (
+            "SELECT (SELECT count(*) FROM t) > 0",
+            "SELECT EXISTS (SELECT 1 FROM t) AS \"?column?\"",
+        ),
+        (
+            "SELECT 0 < (SELECT count(*) FROM t), 1 AS one",
+            "SELECT EXISTS (SELECT 1 FROM t) AS \"?column?\", 1 AS one",
+        ),
+        (
+            "SELECT ((SELECT count(*) FROM t) > 0)",
+            "SELECT (EXISTS (SELECT 1 FROM t)) AS \"?column?\"",
+        ),
+        (
+            "SELECT (0 < ((SELECT count(*) FROM t))) FROM u",
+            "SELECT (EXISTS ((SELECT 1 FROM t))) AS \"?column?\" FROM u",
+        ),
+        // In a FROM subquery the name reaches the row's field names.
+        (
+            "SELECT row_to_json(s) AS j FROM (SELECT (SELECT count(*) FROM t) > 0) s",
+            "SELECT row_to_json(s) AS j FROM (SELECT EXISTS (SELECT 1 FROM t) AS \"?column?\") s",
+        ),
+    ] {
+        assert_rewritten(sql, expected);
+    }
+}
+
+#[test]
+fn top_level_count() {
+    for (sql, expected) in [
+        (
+            "SELECT count(*) > 0 FROM t WHERE b > 3",
+            "SELECT EXISTS (SELECT 1 FROM t WHERE b > 3) AS \"?column?\"",
+        ),
+        (
+            "SELECT count(*) = 0 AS none FROM t WHERE b > 3",
+            "SELECT NOT EXISTS (SELECT 1 FROM t WHERE b > 3) AS \"none\"",
+        ),
+        (
+            "SELECT 1 <= count(a) AS has FROM t",
+            "SELECT EXISTS (SELECT 1 FROM t) AS has",
+        ),
+        (
+            "SELECT count(*) > 0 FROM t WHERE b > 3 -- trailing\n",
+            "SELECT EXISTS (SELECT 1 FROM t WHERE b > 3) AS \"?column?\" -- trailing\n",
+        ),
+        (
+            "SELECT count(*) <> 0 AS \"Has \"\"it\"\"\" FROM t JOIN u ON u.t_id = t.id WHERE u.c = $1",
+            "SELECT EXISTS (SELECT 1 FROM t JOIN u ON u.t_id = t.id WHERE u.c = $1) \
+             AS \"Has \"\"it\"\"\"",
+        ),
+    ] {
+        assert_rewritten(sql, expected);
+    }
+}
+
+#[test]
+fn every_count_of_a_query_is_rewritten() {
+    assert_rewritten(
+        "SELECT id FROM t WHERE (SELECT count(*) FROM u WHERE u.t_id = t.id) > 0 \
+         AND (SELECT count(*) FROM u WHERE u.c = t.a) = 0",
+        "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.t_id = t.id) \
+         AND NOT EXISTS (SELECT 1 FROM u WHERE u.c = t.a)",
+    );
+}
+
+// ── Negative: each condition failing ────────────────────────────────────────
+
+#[test]
+fn comparisons_that_are_not_any_row() {
+    for sql in [
+        "SELECT (SELECT count(*) FROM t) > 1 AS x",
+        "SELECT (SELECT count(*) FROM t) >= 0 AS x",
+        "SELECT (SELECT count(*) FROM t) < 1 AS x",
+        "SELECT (SELECT count(*) FROM t) = 1 AS x",
+        "SELECT 0 > (SELECT count(*) FROM t) AS x",
+        "SELECT 1 < (SELECT count(*) FROM t) AS x",
+    ] {
+        assert_kept(sql);
+    }
+}
+
+#[test]
+fn right_side_must_be_a_literal_zero_or_one() {
+    for sql in [
+        "SELECT (SELECT count(*) FROM t) > 0::bigint AS x",
+        "SELECT (SELECT count(*) FROM t) > 00 AS x",
+        "SELECT (SELECT count(*) FROM t) > 0.0 AS x",
+        "SELECT (SELECT count(*) FROM t) > '0' AS x",
+        "SELECT (SELECT count(*) FROM t) > $1 AS x",
+        "SELECT (SELECT count(*) FROM t) > (SELECT 0) AS x",
+    ] {
+        assert_kept(sql);
+    }
+}
+
+#[test]
+fn operator_must_be_the_builtin_one() {
+    // A qualified operator is left alone, even the built-in one.
+    assert_kept("SELECT (SELECT count(*) FROM t) OPERATOR(pg_catalog.>) 0 AS x");
+}
+
+#[test]
+fn count_must_be_the_builtin_aggregate() {
+    // A user `count(int)` the call resolves to instead.
+    assert_kept_in(
+        &setup_with(
+            "CREATE AGGREGATE public.count(int) (SFUNC = int4pl, STYPE = int, INITCOND = '5')",
+        ),
+        "SELECT (SELECT count(a) FROM t) > 0 AS x",
+    );
+    // A user `count(*)` next to the built-in one.
+    assert_kept_in(
+        &setup_with(
+            "CREATE AGGREGATE public.count(*) (SFUNC = int8inc, STYPE = bigint, INITCOND = '5')",
+        ),
+        "SELECT (SELECT count(*) FROM t) > 0 AS x",
+    );
+    // More than the count in the target list.
+    assert_kept("SELECT (SELECT count(*) + 0 FROM t) > 0 AS x");
+    assert_kept("SELECT (SELECT sum(a) FROM t) > 0 AS x");
+}
+
+#[test]
+fn group_by_having_window_distinct_limit_offset() {
+    for sql in [
+        "SELECT (SELECT count(*) FROM t GROUP BY a LIMIT 1) > 0 AS x",
+        "SELECT (SELECT count(*) FROM t GROUP BY ()) > 0 AS x",
+        "SELECT (SELECT count(*) FROM t HAVING count(*) > 5) > 0 AS x",
+        "SELECT (SELECT count(*) OVER () FROM t LIMIT 1) > 0 AS x",
+        "SELECT (SELECT count(*) FROM t WINDOW w AS ()) > 0 AS x",
+        "SELECT (SELECT DISTINCT count(*) FROM t) > 0 AS x",
+        "SELECT (SELECT count(*) FROM t LIMIT 0) = 0 AS x",
+        "SELECT (SELECT count(*) FROM t OFFSET 1) = 0 AS x",
+        "SELECT (SELECT count(*) FROM t ORDER BY 1) > 0 AS x",
+        "SELECT (WITH w AS (SELECT 1) SELECT count(*) FROM t) > 0 AS x",
+        "SELECT (SELECT count(*) FROM t UNION ALL SELECT 1 LIMIT 1) > 0 AS x",
+    ] {
+        assert_kept(sql);
+    }
+}
+
+#[test]
+fn set_returning_function_in_the_target_list() {
+    assert_kept("SELECT (SELECT count(*) + 0 * generate_series(1, 2) FROM t LIMIT 1) > 0 AS x");
+}
+
+#[test]
+fn filter_and_ordered_counts() {
+    // FILTER would move its condition into the WHERE, where it may run on
+    // rows the original never evaluates it on.
+    assert_kept("SELECT (SELECT count(*) FILTER (WHERE b > 1) FROM t) > 0 AS x");
+    assert_kept("SELECT (SELECT count(a ORDER BY b) FROM t) > 0 AS x");
+    assert_kept("SELECT count(*) FILTER (WHERE b > 1) > 0 FROM t");
+}
+
+#[test]
+fn counted_expression_must_be_strictly_not_null() {
+    for sql in [
+        "SELECT (SELECT count(b) FROM t) > 0 AS x",
+        "SELECT (SELECT count(DISTINCT b) FROM t) > 0 AS x",
+        "SELECT (SELECT count(NULL::int) FROM t) > 0 AS x",
+        "SELECT (SELECT count(u.t_id) FROM t LEFT JOIN u ON u.t_id = t.id) > 0 AS x",
+        "SELECT (SELECT count(u.c) FROM t JOIN u ON u.t_id = t.id) > 0 AS x",
+        // An outer column makes the aggregate the outer query's.
+        "SELECT (SELECT count(t.a) FROM u) > 0 AS x FROM t",
+        "SELECT count(b) > 0 FROM t",
+    ] {
+        assert_kept(sql);
+    }
+    // A NOT NULL constraint not validated yet.
+    assert_kept_in(
+        &setup_with("ALTER TABLE t ADD CONSTRAINT b_nn NOT NULL b NOT VALID"),
+        "SELECT (SELECT count(b) FROM t) > 0 AS x",
+    );
+}
+
+#[test]
+fn volatile_functions() {
+    assert_kept("SELECT (SELECT count(*) FROM t WHERE random() > 0.5) > 0 AS x");
+    assert_kept("SELECT count(*) > 0 FROM t WHERE random() > 0.5");
+    assert_kept_in(
+        &setup_with("CREATE FUNCTION f() RETURNS SETOF int LANGUAGE sql VOLATILE AS 'SELECT 1'"),
+        "SELECT (SELECT count(*) FROM f()) > 0 AS x",
+    );
+}
+
+#[test]
+fn relations_that_are_not_plain_tables() {
+    // A CTE (it may hold a volatile function `EXISTS` would call less).
+    assert_kept("WITH t AS (SELECT 1 AS a) SELECT (SELECT count(*) FROM t) > 0 AS x");
+    // A view may hide anything.
+    assert_kept_in(
+        &setup_with("CREATE VIEW v AS SELECT * FROM t"),
+        "SELECT (SELECT count(*) FROM v) > 0 AS x",
+    );
+    // Row security.
+    assert_kept_in(
+        &setup_with("ALTER TABLE t ENABLE ROW LEVEL SECURITY"),
+        "SELECT (SELECT count(*) FROM t) > 0 AS x",
+    );
+}
+
+#[test]
+fn other_sublinks() {
+    assert_kept("SELECT EXISTS (SELECT count(*) FROM t) AS x");
+    assert_kept("SELECT ARRAY(SELECT count(*) FROM t) AS x");
+}
+
+#[test]
+fn top_level_conditions() {
+    for sql in [
+        // Not the only column.
+        "SELECT count(*) > 0, 1 AS one FROM t",
+        "SELECT count(*) > 0 FROM t GROUP BY a",
+        "SELECT count(*) > 0 FROM t HAVING count(*) > 1",
+        "SELECT count(*) > 0 FROM t LIMIT 0",
+        "SELECT count(*) > 0 FROM t OFFSET 1",
+        "SELECT count(*) > 0 FROM t ORDER BY 1",
+        "SELECT DISTINCT count(*) > 0 FROM t",
+        "SELECT count(*) OVER () > 0 FROM t",
+        "SELECT count(*) > 1 FROM t",
+        // No FROM: nothing to stop early on.
+        "SELECT count(*) > 0",
+        "(SELECT count(*) > 0 FROM t)",
+    ] {
+        assert_kept(sql);
+    }
+}
+
+#[test]
+fn opt_out() {
+    let mut db = setup();
+    db.set_simplify_options(SimplifyOptions {
+        enabled: true,
+        disabled: [Rule::CountExists].into(),
+    });
+    assert_kept_in(&db, "SELECT (SELECT count(*) FROM t) > 0 AS x");
+    db.set_simplify_options(SimplifyOptions {
+        enabled: false,
+        disabled: Default::default(),
+    });
+    assert_kept_in(&db, "SELECT count(*) > 0 FROM t");
+}
