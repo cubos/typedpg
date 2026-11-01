@@ -347,6 +347,17 @@ fn session_replication_role_voids_the_proof() {
     for setting in [
         "SET session_replication_role = replica; SET session_replication_role = DEFAULT;",
         "SELECT set_config('session_replication_role', 'replica', false);",
+        // set_config of a setting that isn't a constant.
+        "SELECT set_config(v.name, 'x', false) FROM (VALUES ('application_name')) v (name);",
+        "PREPARE p (text) AS SELECT set_config($1, 'x', true);",
+        // A routine running with it.
+        "CREATE FUNCTION f() RETURNS int LANGUAGE sql \
+         SET session_replication_role = replica AS 'SELECT 1';",
+        "CREATE PROCEDURE pr() LANGUAGE sql AS 'SELECT 1'; \
+         ALTER PROCEDURE pr() SET session_replication_role = replica;",
+        // A write to a system catalog.
+        "UPDATE pg_trigger SET tgenabled = 'D' WHERE false;",
+        "UPDATE pg_catalog.pg_constraint SET convalidated = true WHERE false;",
     ] {
         let mut db = PgCatalog::new().unwrap();
         db.apply_sql(tables).unwrap();
@@ -481,6 +492,56 @@ fn only_plain_queries_over_base_tables() {
             // DML.
             "DELETE FROM notes n USING orders o JOIN customers c ON c.id = o.customer_id \
              WHERE n.order_id = o.id",
+        ],
+    );
+}
+
+#[test]
+fn cuts_never_touch_a_comment() {
+    let db = setup();
+    // A cut starting right after a `--` comment would take its newline and
+    // comment out the rest of the query; one holding or touching any
+    // comment is not made.
+    assert_kept(
+        &db,
+        &[
+            // JOIN form.
+            "SELECT o.id FROM orders o -- hi\nJOIN customers c ON c.id = o.customer_id \
+             WHERE o.total < 5",
+            "SELECT o.id FROM orders o /* the parent */ JOIN customers c \
+             ON c.id = o.customer_id WHERE o.total < 5",
+            "SELECT o.id FROM orders o JOIN customers c -- WHERE c.region = 'x'\n\
+             ON c.id = o.customer_id WHERE o.total < 5",
+            "SELECT o.id FROM orders o JOIN customers c ON c.id = o.customer_id/* ; */\n\
+             WHERE o.total < 5",
+            // Comma form: the FROM item, the whole WHERE.
+            "SELECT o.id FROM orders o -- hi\n, customers c \
+             WHERE c.id = o.customer_id AND o.total < 5",
+            "SELECT o.id FROM orders o, customers c -- note\nWHERE c.id = o.customer_id",
+            // The trailing ` AND` cut.
+            "SELECT o.id FROM orders o, customers c \
+             WHERE o.total < 5 -- AND o.id = 1\nAND c.id = o.customer_id",
+            "SELECT o.id FROM orders o, customers c \
+             WHERE o.total < 5 /* AND c.region = 'x' */ AND c.id = o.customer_id",
+            // The leading `... AND` cut.
+            "SELECT o.id FROM orders o, customers c \
+             WHERE c.id = o.customer_id /* x */ AND o.total < 5",
+        ],
+    );
+    // Comments away from the cut stay as they are.
+    assert_simplified(
+        &db,
+        &[
+            (
+                "SELECT o.id -- ids\nFROM orders o JOIN customers c ON c.id = o.customer_id \
+                 -- WHERE false\nWHERE o.total < 5",
+                "SELECT o.id -- ids\nFROM orders o -- WHERE false\nWHERE o.total < 5",
+            ),
+            (
+                "SELECT o.id FROM orders o, customers c /* c */ \
+                 WHERE o.total < 5 AND c.id = o.customer_id -- end",
+                "SELECT o.id FROM orders o /* c */ WHERE o.total < 5 -- end",
+            ),
         ],
     );
 }

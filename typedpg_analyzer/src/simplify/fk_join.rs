@@ -44,7 +44,7 @@ use std::collections::BTreeSet;
 
 use typedpg_pg_query::NodeRef;
 use typedpg_pg_query::protobuf::{
-    self, AExprKind, BoolExprType, JoinType, SetOperation, node::Node,
+    self, AExprKind, BoolExprType, JoinType, SetOperation, Token, node::Node,
 };
 
 use super::proof::{column_not_null, has_volatile};
@@ -96,6 +96,7 @@ pub(crate) fn candidates(ctx: &Ctx<'_>) -> Vec<Candidate> {
         for (i, item) in sel.from_clause.iter().enumerate() {
             if let Some(Node::RangeVar(rv)) = item.node.as_ref()
                 && let Some(edits) = site.comma_site(sel, i, rv, quals)
+                && site.tokens.clear_of_comments(&edits)
             {
                 out.push(Candidate {
                     rule: Rule::FkJoin,
@@ -109,21 +110,56 @@ pub(crate) fn candidates(ctx: &Ctx<'_>) -> Vec<Candidate> {
 
 // ─── Text ─────────────────────────────────────────────────────────────────
 
-/// The SQL's lexical tokens, as `(start, end)` byte ranges.
+/// The SQL's lexical tokens, as `(start, end)` byte ranges — comments
+/// included, so a comment between the tokens a shape expects makes it not
+/// match.
 struct Tokens<'a> {
     sql: &'a str,
     spans: Vec<(usize, usize)>,
+    /// The comments among them (`--` and `/* */`).
+    comments: Vec<(usize, usize)>,
 }
 
 impl<'a> Tokens<'a> {
     fn scan(sql: &'a str) -> Option<Self> {
         let scanned = typedpg_pg_query::scan(sql).ok()?;
+        let span = |t: &protobuf::ScanToken| {
+            Some((usize::try_from(t.start).ok()?, usize::try_from(t.end).ok()?))
+        };
         let spans = scanned
             .tokens
             .iter()
-            .map(|t| Some((usize::try_from(t.start).ok()?, usize::try_from(t.end).ok()?)))
+            .map(span)
             .collect::<Option<Vec<_>>>()?;
-        Some(Tokens { sql, spans })
+        let comments = scanned
+            .tokens
+            .iter()
+            .filter(|t| matches!(t.token(), Token::SqlComment | Token::CComment))
+            .map(span)
+            .collect::<Option<Vec<_>>>()?;
+        Some(Tokens {
+            sql,
+            spans,
+            comments,
+        })
+    }
+
+    /// Token `i` is a comment.
+    fn is_comment(&self, i: usize) -> bool {
+        self.spans
+            .get(i)
+            .is_some_and(|s| self.comments.binary_search(s).is_ok())
+    }
+
+    /// No edit touches a comment: none starts or ends against one, nor
+    /// holds one. A cut starting right after a `--` comment would take the
+    /// newline ending it, and comment out what follows.
+    fn clear_of_comments(&self, edits: &[Edit]) -> bool {
+        edits.iter().all(|e| {
+            self.comments
+                .iter()
+                .all(|&(start, end)| start > e.range.end || end < e.range.start)
+        })
     }
 
     /// The index of the token starting at byte `at`.
@@ -577,7 +613,9 @@ impl Site<'_, '_> {
         for side in [j.larg.as_deref(), j.rarg.as_deref()].into_iter().flatten() {
             self.join_sites(side, out);
         }
-        if let Some(edits) = self.join_site(j) {
+        if let Some(edits) = self.join_site(j)
+            && self.tokens.clear_of_comments(&edits)
+        {
             out.push(Candidate {
                 rule: Rule::FkJoin,
                 edits,
@@ -707,9 +745,12 @@ impl Site<'_, '_> {
         let t = &self.tokens;
         let first = self.relation_first_token(rv)?;
         // The relation's last token: the one before the `,` or the WHERE
-        // that follows it (a relation holds neither).
+        // that follows it (a relation holds neither), comments aside.
         let after = (first..t.spans.len()).find(|&k| t.is(k, ",") || t.is(k, "where"))?;
-        let last = after.checked_sub(1)?;
+        let mut last = after.checked_sub(1)?;
+        while last > first && t.is_comment(last) {
+            last -= 1;
+        }
         let range = if i > 0 {
             if !t.is(first.checked_sub(1)?, ",") {
                 return None;
