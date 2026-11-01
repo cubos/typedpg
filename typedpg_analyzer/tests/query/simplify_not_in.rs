@@ -87,13 +87,29 @@ fn unqualified_left_side_a_subquery_column_would_capture_is_wrapped() {
 }
 
 #[test]
-fn limit_keeps_the_subquery_whole() {
+fn limit_or_offset_is_kept() {
+    // The written SubPlan reads the subquery once; an anti-join may rescan
+    // it per outer row, and a LIMIT (ordered or not: ties) may return other
+    // rows on a rescan.
+    let db = setup();
+    for sub in [
+        "SELECT customer_id FROM banned LIMIT 10",
+        "SELECT customer_id FROM banned ORDER BY customer_id LIMIT 10",
+        "SELECT customer_id FROM banned OFFSET 1",
+        "SELECT customer_id FROM banned ORDER BY customer_id FETCH FIRST 1 ROWS WITH TIES",
+    ] {
+        assert_kept(
+            &db,
+            &format!("SELECT c.id FROM customers c WHERE c.id NOT IN ({sub})"),
+        );
+    }
+    // An ORDER BY alone keeps the subquery whole.
     assert_rewritten(
-        &setup(),
+        &db,
         "SELECT c.id FROM customers c \
-         WHERE c.id NOT IN (SELECT customer_id FROM banned ORDER BY customer_id LIMIT 10)",
+         WHERE c.id NOT IN (SELECT customer_id FROM banned ORDER BY customer_id)",
         "SELECT c.id FROM customers c \
-         WHERE (NOT EXISTS (SELECT 1 FROM (SELECT customer_id FROM banned ORDER BY customer_id LIMIT 10) \
+         WHERE (NOT EXISTS (SELECT 1 FROM (SELECT customer_id FROM banned ORDER BY customer_id) \
          AS __typedpg_s1 (__typedpg_c1) WHERE c.id = __typedpg_s1.__typedpg_c1))",
     );
 }
@@ -200,17 +216,24 @@ fn with_parameters() {
 #[test]
 fn every_not_in_of_the_query() {
     let db = setup();
+    // One in the target list, one in the WHERE (two NOT IN conjuncts of
+    // one WHERE are each other's sibling sublinks: both stay).
     let (sent, rules) = simplified(
+        &db,
+        "SELECT c.code NOT IN (SELECT b FROM pairs) AS ok FROM customers c \
+         WHERE c.id NOT IN (SELECT customer_id FROM banned)",
+    );
+    assert_eq!(
+        sent,
+        "SELECT (NOT EXISTS (SELECT 1 FROM pairs WHERE c.code = b)) AS ok FROM customers c \
+         WHERE (NOT EXISTS (SELECT 1 FROM banned WHERE c.id = customer_id))"
+    );
+    assert_eq!(rules, vec![Rule::NotIn, Rule::NotIn]);
+    assert_kept(
         &db,
         "SELECT c.id FROM customers c WHERE c.id NOT IN (SELECT customer_id FROM banned) \
          AND c.code NOT IN (SELECT b FROM pairs)",
     );
-    assert_eq!(
-        sent,
-        "SELECT c.id FROM customers c WHERE (NOT EXISTS (SELECT 1 FROM banned WHERE c.id = customer_id)) \
-         AND (NOT EXISTS (SELECT 1 FROM pairs WHERE c.code = b))"
-    );
-    assert_eq!(rules, vec![Rule::NotIn, Rule::NotIn]);
 }
 
 // ── Negatives: one per condition ────────────────────────────────────────────
@@ -580,9 +603,9 @@ fn a_line_comment_at_the_end_of_the_subquery_stays_closed() {
     assert_rewritten(
         &db,
         "SELECT c.id FROM customers c WHERE c.id NOT IN \
-         (SELECT customer_id FROM banned LIMIT 5 -- note\n)",
-        "SELECT c.id FROM customers c WHERE (NOT EXISTS (SELECT 1 FROM (SELECT customer_id FROM \
-         banned LIMIT 5) AS __typedpg_s1 (__typedpg_c1) WHERE c.id = __typedpg_s1.__typedpg_c1))",
+         (SELECT DISTINCT customer_id FROM banned -- note\n)",
+        "SELECT c.id FROM customers c WHERE (NOT EXISTS (SELECT 1 FROM (SELECT DISTINCT customer_id FROM \
+         banned) AS __typedpg_s1 (__typedpg_c1) WHERE c.id = __typedpg_s1.__typedpg_c1))",
     );
 }
 
@@ -590,17 +613,15 @@ fn a_line_comment_at_the_end_of_the_subquery_stays_closed() {
 fn two_wrapped_sites_get_their_own_aliases() {
     let (sent, rules) = simplified(
         &setup(),
-        "SELECT c.id FROM customers c \
-         WHERE c.id NOT IN (SELECT customer_id FROM banned LIMIT 5) \
-         AND c.code NOT IN (SELECT DISTINCT code FROM banned)",
+        "SELECT c.code NOT IN (SELECT DISTINCT code FROM banned) AS ok FROM customers c \
+         WHERE c.id NOT IN (SELECT DISTINCT customer_id FROM banned)",
     );
     assert_eq!(
         sent,
-        "SELECT c.id FROM customers c \
-         WHERE (NOT EXISTS (SELECT 1 FROM (SELECT customer_id FROM banned LIMIT 5) AS __typedpg_s1 \
-         (__typedpg_c1) WHERE c.id = __typedpg_s1.__typedpg_c1)) \
-         AND (NOT EXISTS (SELECT 1 FROM (SELECT DISTINCT code FROM banned) AS __typedpg_s2 \
-         (__typedpg_c1) WHERE c.code = __typedpg_s2.__typedpg_c1))"
+        "SELECT (NOT EXISTS (SELECT 1 FROM (SELECT DISTINCT code FROM banned) AS __typedpg_s2 \
+         (__typedpg_c1) WHERE c.code = __typedpg_s2.__typedpg_c1)) AS ok FROM customers c \
+         WHERE (NOT EXISTS (SELECT 1 FROM (SELECT DISTINCT customer_id FROM banned) AS __typedpg_s1 \
+         (__typedpg_c1) WHERE c.id = __typedpg_s1.__typedpg_c1))"
     );
     assert_eq!(rules, vec![Rule::NotIn, Rule::NotIn]);
 }
@@ -612,14 +633,14 @@ fn a_site_whose_subquery_holds_another_is_kept() {
     let (sent, rules) = simplified(
         &setup(),
         "SELECT c.id FROM customers c WHERE c.id NOT IN \
-         (SELECT b.customer_id FROM banned b WHERE b.code NOT IN \
-         (SELECT p.b FROM pairs p LIMIT 3) LIMIT 7)",
+         (SELECT DISTINCT b.customer_id FROM banned b WHERE b.code NOT IN \
+         (SELECT DISTINCT p.b FROM pairs p))",
     );
     assert_eq!(
         sent,
         "SELECT c.id FROM customers c WHERE c.id NOT IN \
-         (SELECT b.customer_id FROM banned b WHERE (NOT EXISTS (SELECT 1 FROM (SELECT p.b FROM pairs \
-         p LIMIT 3) AS __typedpg_s1 (__typedpg_c1) WHERE b.code = __typedpg_s1.__typedpg_c1)) LIMIT 7)"
+         (SELECT DISTINCT b.customer_id FROM banned b WHERE (NOT EXISTS (SELECT 1 FROM (SELECT DISTINCT \
+         p.b FROM pairs p) AS __typedpg_s1 (__typedpg_c1) WHERE b.code = __typedpg_s1.__typedpg_c1)))"
     );
     assert_eq!(rules, vec![Rule::NotIn]);
 }
@@ -748,7 +769,7 @@ fn a_unicode_escaped_reserved_name_is_kept() {
     .unwrap();
     assert_kept(
         &db,
-        "SELECT t.a FROM t WHERE U&\"\\005F\\005Ftypedpg_c1\" NOT IN (SELECT a FROM u LIMIT 5)",
+        "SELECT t.a FROM t WHERE U&\"\\005F\\005Ftypedpg_c1\" NOT IN (SELECT DISTINCT a FROM u)",
     );
 }
 
@@ -758,8 +779,8 @@ fn the_left_side_is_qualified_where_it_moves() {
     // table's name, so nothing there can capture it.
     assert_rewritten(
         &setup(),
-        "SELECT code FROM customers WHERE code NOT IN (SELECT code FROM banned LIMIT 5)",
-        "SELECT code FROM customers WHERE (NOT EXISTS (SELECT 1 FROM (SELECT code FROM banned LIMIT 5) \
+        "SELECT code FROM customers WHERE code NOT IN (SELECT DISTINCT code FROM banned)",
+        "SELECT code FROM customers WHERE (NOT EXISTS (SELECT 1 FROM (SELECT DISTINCT code FROM banned) \
          AS __typedpg_s1 (__typedpg_c1) WHERE customers.code = __typedpg_s1.__typedpg_c1))",
     );
 }
@@ -844,6 +865,60 @@ fn an_on_condition_resolves_in_its_own_join() {
          (SELECT a.k FROM a JOIN (b JOIN c ON b.k = c.k AND v = 'x') ON a.k = b.k)",
     );
     assert_eq!(rules, vec![Rule::NotIn]);
+}
+
+#[test]
+fn an_expensive_sibling_conjunct_keeps_the_site() {
+    // The NOT IN SubPlan runs before a costlier sibling and can veto the
+    // row; as an anti-join it leaves the qual list and the sibling runs on
+    // every row.
+    let mut db = setup();
+    db.apply_sql(
+        "CREATE FUNCTION pricey(bigint) RETURNS bool LANGUAGE sql IMMUTABLE COST 100000 \
+           AS 'SELECT $1 > 0';",
+    )
+    .unwrap();
+    for sibling in [
+        "(SELECT 1 / min(p.b) FROM pairs p WHERE p.a = c.id) > 0",
+        "c.code IN (SELECT b FROM pairs)",
+        "pricey(c.id)",
+    ] {
+        assert_kept(
+            &db,
+            &format!(
+                "SELECT c.id FROM customers c \
+                 WHERE c.id NOT IN (SELECT customer_id FROM banned) AND {sibling}"
+            ),
+        );
+    }
+    // In HAVING too.
+    assert_kept(
+        &db,
+        "SELECT c.code FROM customers c GROUP BY c.code \
+         HAVING c.code NOT IN (SELECT code FROM banned) AND pricey(c.code)",
+    );
+}
+
+#[test]
+fn a_cheap_built_in_sibling_conjunct_is_fine() {
+    let db = setup();
+    assert_rewritten(
+        &db,
+        "SELECT c.id FROM customers c \
+         WHERE c.region = 'x' AND c.id NOT IN (SELECT customer_id FROM banned) \
+         AND length(c.name) > 2",
+        "SELECT c.id FROM customers c \
+         WHERE c.region = 'x' AND (NOT EXISTS (SELECT 1 FROM banned WHERE c.id = customer_id)) \
+         AND length(c.name) > 2",
+    );
+    // A sibling under an OR with the site is evaluated as written.
+    assert_rewritten(
+        &db,
+        "SELECT c.id FROM customers c \
+         WHERE c.id NOT IN (SELECT customer_id FROM banned) OR c.code IN (SELECT b FROM pairs)",
+        "SELECT c.id FROM customers c \
+         WHERE (NOT EXISTS (SELECT 1 FROM banned WHERE c.id = customer_id)) OR c.code IN (SELECT b FROM pairs)",
+    );
 }
 
 // ── Opt-outs ────────────────────────────────────────────────────────────────

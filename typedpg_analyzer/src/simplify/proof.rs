@@ -1036,6 +1036,122 @@ fn hidden_volatile_calls(catalog: &PgCatalog) -> bool {
         })
 }
 
+/// Whether the conjuncts next to a rewrite site can't lose the guard the
+/// site gave them. `clause` is the WHERE, JOIN ON or HAVING the site sits
+/// in; `site_location` is the location of a node of the site (the
+/// rewritten expression's own, e.g. a NOT IN's `NOT`).
+///
+/// PG evaluates a scan's (or join's) qual list in cost order, and a
+/// SubPlan is expensive: in the written query a sublink conjunct runs
+/// after the cheap conjuncts but before a more expensive sibling — another
+/// sublink, or a user function with a high COST — and can veto a row
+/// before that sibling runs. Rewritten into a semi- or anti-join, the site
+/// leaves the qual list and the sibling runs on every row, where it may
+/// fail (`(SELECT 1 / min(z) …) > 0` on a row the site would have
+/// filtered). So every other conjunct of the top-level AND list holding the
+/// site must be cheap: no sublink, and only built-in functions, operators
+/// and casts (built-in costs are 1 or 100, below any SubPlan's, so PG runs
+/// them first in both plans — an error in one of them happens in both).
+/// A schema with a user cast function or a user function in a domain
+/// CHECK (calls the parse tree doesn't show) counts as expensive
+/// everywhere. Nested ANDs under an OR or NOT are evaluated as written,
+/// left to right, and the site's own conjunct is not a sibling.
+///
+/// `false` when the site isn't found in `clause`.
+pub(crate) fn cheap_siblings(ctx: &Ctx<'_>, clause: &Node, site_location: i32) -> bool {
+    fn conjuncts<'n>(node: &'n Node, out: &mut Vec<&'n Node>) {
+        match node.node.as_ref() {
+            Some(N::BoolExpr(b)) if b.boolop() == BoolExprType::AndExpr => {
+                for a in &b.args {
+                    conjuncts(a, out);
+                }
+            }
+            _ => out.push(node),
+        }
+    }
+    let holds_site = |n: &Node| {
+        n.node.as_ref().is_some_and(|n| {
+            n.nodes()
+                .iter()
+                .any(|(n, _)| n.location() == Some(site_location))
+        })
+    };
+    let mut list = Vec::new();
+    conjuncts(clause, &mut list);
+    let Some(site) = list.iter().position(|n| holds_site(n)) else {
+        return false;
+    };
+    if list.len() == 1 {
+        return true;
+    }
+    if hidden_user_calls(ctx.catalog) {
+        return false;
+    }
+    list.iter()
+        .enumerate()
+        .all(|(i, n)| i == site || cheap(ctx, n))
+}
+
+/// Whether evaluating `node` runs only built-in code and no sublink: see
+/// [`cheap_siblings`]. Every same-named candidate counts, being unable to
+/// tell which one PG resolves.
+fn cheap(ctx: &Ctx<'_>, node: &Node) -> bool {
+    let catalog = ctx.catalog;
+    let builtin = |oid: u32| oid < FIRST_GENBKI_OBJECT_ID;
+    let operator_builtin = |name: &str| {
+        catalog
+            .pg_operator
+            .values()
+            .filter(|o| o.oprname == name)
+            .all(|o| builtin(o.oid.get()) && o.oprcode.is_none_or(|p| builtin(p.get())))
+    };
+    let Some(root) = node.node.as_ref() else {
+        return true;
+    };
+    root.nodes().iter().all(|(n, _)| match n {
+        NodeRef::SubLink(_) => false,
+        NodeRef::FuncCall(f) => name_parts(&f.funcname).is_some_and(|(schema, name)| {
+            let candidates = catalog.find_functions(schema, name);
+            !candidates.is_empty() && candidates.iter().all(|p| builtin(p.oid.get()))
+        }),
+        NodeRef::AExpr(e) => match e.kind() {
+            AExprKind::AexprBetween
+            | AExprKind::AexprNotBetween
+            | AExprKind::AexprBetweenSym
+            | AExprKind::AexprNotBetweenSym => {
+                [">=", "<=", "<", ">"].into_iter().all(operator_builtin)
+            }
+            _ => name_parts(&e.name).is_some_and(|(_, op)| operator_builtin(op)),
+        },
+        NodeRef::TypeCast(t) => t
+            .type_name
+            .as_ref()
+            .and_then(|tn| {
+                let (schema, name) = name_parts(&tn.names)?;
+                catalog.resolve_type_by_name(schema, name)
+            })
+            .is_some_and(|target| builtin(target.oid.get())),
+        _ => true,
+    })
+}
+
+/// Whether the schema has a user function PG may call where the parse
+/// tree shows none: a cast function, or a function a domain's CHECK calls.
+fn hidden_user_calls(catalog: &PgCatalog) -> bool {
+    const PG_PROC: u32 = 1255;
+    const PG_CONSTRAINT: u32 = 2606;
+    let user = |p: PgProcOid| p.get() >= FIRST_GENBKI_OBJECT_ID;
+    catalog
+        .pg_cast
+        .values()
+        .any(|c| c.castfunc.is_some_and(user))
+        || catalog.iter_pg_depend().any(|d| {
+            d.classid.get() == PG_CONSTRAINT
+                && d.refclassid.get() == PG_PROC
+                && user(PgProcOid::from_raw(d.refobjid.get()))
+        })
+}
+
 /// Whether `node` may call a volatile function or read something
 /// nondeterministic: a function or operator any same-named overload of
 /// which is VOLATILE (unknown ones included), a cast to a type that isn't

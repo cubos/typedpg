@@ -380,9 +380,11 @@ mod tests {
         db.apply_sql("CREATE TABLE t (a int NOT NULL); CREATE TABLE u (b int NOT NULL);")
             .unwrap();
         let sites: Vec<String> = (0..200)
-            .map(|i| format!("a NOT IN (SELECT b FROM u WHERE b > {i})"))
+            .map(|i| format!("a NOT IN (SELECT b FROM u WHERE b > {i}) AS c{i}"))
             .collect();
-        let sql = format!("SELECT a FROM t WHERE {}", sites.join(" AND "));
+        // In the target list: as WHERE conjuncts each would be the others'
+        // expensive sibling (see `proof::cheap_siblings`).
+        let sql = format!("SELECT {} FROM t", sites.join(", "));
         ANALYSES.with(|a| a.set(0));
         let analyzed = db.analyze(&sql).unwrap();
         assert_eq!(analyzed.simplifications.len(), 200);

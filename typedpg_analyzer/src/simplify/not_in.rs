@@ -20,6 +20,8 @@
 //!   same operator — a built-in one, never NULL between non-NULL
 //!   operands of built-in types. Row-wise `(a, b) NOT IN (SELECT x, y …)` compares
 //!   column by column with `=`, as PG's row comparison does.
+//! - the subquery has no LIMIT or OFFSET: the SubPlan reads it once, an
+//!   anti-join may rescan it, and a LIMIT may return other rows then.
 //! - nothing in it is volatile (the subquery may run a different number
 //!   of times), and no table read has row security.
 //! - nothing the rewrite may newly evaluate can fail: an anti-join filters
@@ -40,7 +42,7 @@
 //! The subquery is kept as written. A plain one (a FROM, optionally a
 //! WHERE, nothing after) is inlined — `NOT EXISTS (SELECT 1 FROM … WHERE
 //! (<where>) AND x = y)` — so PG can make an anti-join even when it is
-//! correlated; any other (LIMIT, DISTINCT, GROUP BY, …) is wrapped whole —
+//! correlated; any other (DISTINCT, GROUP BY, ORDER BY, …) is wrapped whole —
 //! `NOT EXISTS (SELECT 1 FROM (<sub>) AS __typedpg_s1 (__typedpg_c1, …)
 //! WHERE x = __typedpg_s1.__typedpg_c1)` — so its clauses still apply to
 //! it. Inlining places `x` inside the subquery's scope, so it is done only
@@ -52,8 +54,9 @@ use typedpg_pg_query::protobuf::{
 };
 
 use super::proof::{
-    FromScope, builtin_strict_equality, column_collation, column_type, embed_source,
-    error_free_select, has_volatile, qualified_column, strictly_not_null, written_names_use,
+    FromScope, builtin_strict_equality, cheap_siblings, column_collation, column_type,
+    embed_source, error_free_select, has_volatile, qualified_column, strictly_not_null,
+    written_names_use,
 };
 use super::{Candidate, Ctx, Edit, Rule};
 
@@ -97,6 +100,7 @@ pub(crate) fn candidates(ctx: &Ctx<'_>) -> Vec<Candidate> {
         tokens: &tokens,
         out: Vec::new(),
         next_alias: std::cell::Cell::new(next_alias(ctx.sql)),
+        clause: None,
     };
     for stmt in &ctx.tree.stmts {
         if let Some(node) = stmt.stmt.as_deref() {
@@ -119,6 +123,9 @@ struct Walker<'c, 'a> {
     out: Vec<Candidate>,
     /// The number of the next wrapped subquery's alias.
     next_alias: std::cell::Cell<usize>,
+    /// The WHERE or HAVING the expressions being walked are in (`None`:
+    /// a target list or SET, where no qual list orders them).
+    clause: Option<Node>,
 }
 
 /// The first `n` no `__typedpg_s<n>` of earlier rewrites in `sql` uses.
@@ -153,15 +160,15 @@ impl Walker<'_, '_> {
                 self.walk_from_subqueries(&u.from_clause, parent);
                 let scope =
                     FromScope::of_dml(self.ctx, u.relation.as_ref(), &u.from_clause, parent);
-                self.expr_list(&u.target_list, &scope);
-                self.expr_opt(u.where_clause.as_deref(), &scope);
+                self.values(&u.target_list, &scope);
+                self.qual(u.where_clause.as_deref(), &scope);
             }
             Some(N::DeleteStmt(d)) => {
                 self.ctes(d.with_clause.as_ref(), parent);
                 self.walk_from_subqueries(&d.using_clause, parent);
                 let scope =
                     FromScope::of_dml(self.ctx, d.relation.as_ref(), &d.using_clause, parent);
-                self.expr_opt(d.where_clause.as_deref(), &scope);
+                self.qual(d.where_clause.as_deref(), &scope);
             }
             _ => {}
         }
@@ -211,7 +218,7 @@ impl Walker<'_, '_> {
         }
         self.walk_from_subqueries(&s.from_clause, parent);
         let scope = FromScope::of_select(self.ctx, s, parent);
-        self.expr_opt(s.where_clause.as_deref(), &scope);
+        self.qual(s.where_clause.as_deref(), &scope);
         // A GROUP BY, ORDER BY or DISTINCT ON expression is matched against
         // the target list's: rewriting one side only would break that.
         let matched = [&s.group_clause, &s.sort_clause, &s.distinct_clause]
@@ -219,9 +226,23 @@ impl Walker<'_, '_> {
             .flatten()
             .any(contains_sublink);
         if !matched {
-            self.expr_list(&s.target_list, &scope);
-            self.expr_opt(s.having_clause.as_deref(), &scope);
+            self.values(&s.target_list, &scope);
+            self.qual(s.having_clause.as_deref(), &scope);
         }
+    }
+
+    /// Walk a WHERE or HAVING: a qual list PG orders by cost.
+    fn qual(&mut self, node: Option<&Node>, scope: &FromScope<'_>) {
+        let outer = std::mem::replace(&mut self.clause, node.cloned());
+        self.expr_opt(node, scope);
+        self.clause = outer;
+    }
+
+    /// Walk a target list or SET list: values, not quals.
+    fn values(&mut self, nodes: &[Node], scope: &FromScope<'_>) {
+        let outer = self.clause.take();
+        self.expr_list(nodes, scope);
+        self.clause = outer;
     }
 
     fn expr_opt(&mut self, node: Option<&Node>, scope: &FromScope<'_>) {
@@ -300,10 +321,15 @@ impl Walker<'_, '_> {
         let Some(N::SelectStmt(sub)) = s.subselect.as_deref()?.node.as_ref() else {
             return None;
         };
+        // No LIMIT / OFFSET: the written SubPlan reads the subquery once,
+        // the anti-join may rescan it per outer row, and a LIMIT — ordered
+        // or not, ties — can return other rows on a rescan.
         if sub.op != SetOperation::SetopNone as i32
             || !sub.values_lists.is_empty()
             || !sub.locking_clause.is_empty()
             || sub.into_clause.is_some()
+            || sub.limit_count.is_some()
+            || sub.limit_offset.is_some()
         {
             return None;
         }
@@ -337,8 +363,14 @@ impl Walker<'_, '_> {
         {
             return None;
         }
-        // Nothing the rewrite may newly evaluate can fail.
-        if !error_free_select(ctx, sub, &sub_scope) {
+        // Nothing the rewrite may newly evaluate can fail: in the
+        // subquery, nor a sibling conjunct the site guarded.
+        if !error_free_select(ctx, sub, &sub_scope)
+            || self
+                .clause
+                .as_ref()
+                .is_some_and(|clause| !cheap_siblings(ctx, clause, not_at))
+        {
             return None;
         }
         // Nothing volatile, no row security.
