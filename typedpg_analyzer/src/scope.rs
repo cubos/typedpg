@@ -114,6 +114,43 @@ pub(crate) struct Deferred {
     /// A reference to the column stays a Var of a SubqueryScan: the
     /// subquery is planned on its own (never pulled up).
     pub subquery_scan: bool,
+    /// With [`Self::subquery_scan`]: what the subquery's level says of
+    /// any SubqueryScan over it.
+    pub scan_facts: ScanFacts,
+    /// For a pulled-up subquery's output: the Var of the SubqueryScan it
+    /// is once pulled up (see [`crate::resolve::RawColumn::scan_var`]).
+    pub scan_var: Option<ScanVar>,
+}
+
+/// What a subquery planned on its own certainly makes of a SubqueryScan
+/// over it, or of the plan above that scan (`false`: maybe not).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ScanFacts {
+    /// The scan stays (or the relation reading the subquery is a dummy
+    /// one, a Result over the reading level's Vars): the subquery's plan
+    /// is certainly a dummy one, or its target list certainly has a
+    /// resjunk entry no scan's target list matches (a row mark, a sort key
+    /// that is no output).
+    pub kept: bool,
+    /// No qual of the reading level is pushed down into the subquery
+    /// (`subquery_is_pushdown_safe`: it has a LIMIT or OFFSET clause).
+    pub no_pushdown: bool,
+    /// None of the subquery's paths is sorted (no index, inheritance
+    /// child or join qual to sort on, nothing it sorts itself): an ORDER
+    /// BY of the reading level puts a Sort above the scan.
+    pub unsorted: bool,
+}
+
+/// An output that is a Var of a SubqueryScan (see
+/// [`crate::resolve::RawColumn::scan_var`]): the scan's `index`th of
+/// `len` columns, whose collation in the plan the scan's removal leaves
+/// is `planned_top` (see [`Deferred::planned_top`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ScanVar {
+    pub index: usize,
+    pub len: usize,
+    pub planned_top: Option<crate::expr::Planned>,
+    pub facts: ScanFacts,
 }
 
 /// How the planner plans an inlined CTE it doesn't pull up: on its own,

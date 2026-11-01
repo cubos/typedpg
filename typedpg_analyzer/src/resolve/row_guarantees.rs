@@ -26,6 +26,9 @@ pub(crate) struct LevelSummary {
     /// resjunk entry (a sort or grouping key not among the outputs, a row
     /// mark), which the SubqueryScan's target list doesn't match.
     pub removable_scan: bool,
+    /// What the level certainly makes of a SubqueryScan over it (see
+    /// [`crate::scope::ScanFacts`]).
+    pub scan_facts: crate::scope::ScanFacts,
 }
 
 thread_local! {
@@ -543,6 +546,7 @@ pub(crate) fn finish_level(
             && sel.locking_clause.is_empty()
             && (ungrouped_aggregate || input_nonempty),
         removable_scan: false,
+        scan_facts: Default::default(),
     }
 }
 

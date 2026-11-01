@@ -402,6 +402,16 @@ pub(crate) fn process_from_item(
                             }
                             c.deferred.planned_top = subquery_planned_top(plan, &rc, removable);
                             c.deferred.subquery_scan = plan == super::deferred::Plan::Separate;
+                            // (Analyzed without its level summary: only
+                            // what its clauses say.)
+                            c.deferred.scan_facts.no_pushdown = plan
+                                == super::deferred::Plan::Separate
+                                && view_sel.is_some_and(|sel| {
+                                    sel.limit_count.is_some() || sel.limit_offset.is_some()
+                                });
+                            c.deferred.scan_var = rc
+                                .scan_var
+                                .filter(|_| plan == super::deferred::Plan::PulledUp);
                             // What the query makes of it now (calls read
                             // as their bodies, see `expr::inline`) holds
                             // as well as what was found at CREATE VIEW.
@@ -637,6 +647,14 @@ pub(crate) fn process_from_item(
                             unless_removed: None,
                             planned_top: subquery_planned_top(plan, &rc, summary.removable_scan),
                             subquery_scan: plan == super::deferred::Plan::Separate,
+                            scan_facts: if plan == super::deferred::Plan::Separate {
+                                summary.scan_facts
+                            } else {
+                                Default::default()
+                            },
+                            scan_var: rc
+                                .scan_var
+                                .filter(|_| plan == super::deferred::Plan::PulledUp),
                         },
                         name: rc.name,
                         type_oid: rc.type_oid,

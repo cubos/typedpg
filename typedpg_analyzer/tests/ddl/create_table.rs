@@ -1527,6 +1527,14 @@ fn create_table_as_through_a_trivial_subquery_scan_takes_the_subquerys_planned_c
     // there. Where the scan stays, its Vars keep the parsed collation.
     let setup = r#"CREATE TABLE c1 (b text COLLATE "C");
                    CREATE TABLE c2 (b text COLLATE "POSIX");
+                   CREATE TABLE c3 (b text COLLATE "C", p text COLLATE "POSIX");
+                   CREATE INDEX ON c3 (b);
+                   CREATE TABLE c4 (b text COLLATE "C", p text COLLATE "POSIX");
+                   CREATE TABLE cp (b text COLLATE "C") PARTITION BY LIST (b);
+                   CREATE TABLE cq (b text COLLATE "C") PARTITION BY LIST (b);
+                   CREATE TABLE cq1 PARTITION OF cq FOR VALUES IN ('a') PARTITION BY LIST (b);
+                   CREATE TABLE cr (b text COLLATE "C") PARTITION BY LIST (b);
+                   CREATE TABLE cr1 PARTITION OF cr FOR VALUES IN ('a');
                    CREATE VIEW vp AS SELECT CASE WHEN 1 = 1 THEN 'x' ELSE c1.b END AS x FROM c1;
                    CREATE VIEW vs AS SELECT CASE WHEN 1 = 1 THEN 'x' ELSE c1.b END AS x
                                      FROM c1 OFFSET 0;"#;
@@ -1575,6 +1583,47 @@ fn create_table_as_through_a_trivial_subquery_scan_takes_the_subquerys_planned_c
                 .into(),
             collated("C"),
         ),
+        // A window call with no PARTITION BY or ORDER BY adds no resjunk
+        // key.
+        (
+            "SELECT x, n FROM (SELECT CASE WHEN true THEN c1.b ELSE c2.b END AS x, \
+             count(*) OVER () AS n FROM c1, c2) s"
+                .into(),
+            collated("C"),
+        ),
+        // Parse analysis drops a same-type cast; planning folds the CASE:
+        // both leave the Var.
+        (format!("SELECT x::text AS x FROM {s}"), collated("C")),
+        (
+            format!("SELECT CASE WHEN true THEN x END AS x FROM {s}"),
+            collated("C"),
+        ),
+        (
+            format!("SELECT CASE WHEN false THEN 'a' WHEN NULL THEN 'b' ELSE x END AS x FROM {s}"),
+            collated("C"),
+        ),
+        // Pulled up, s2 leaves the level reading s alone, its target list
+        // just s's x.
+        (
+            format!("SELECT x FROM (SELECT x, 1 AS k FROM {s}) s2"),
+            collated("C"),
+        ),
+        (
+            format!("SELECT x FROM (SELECT x FROM (SELECT x, 1 AS k FROM {s}) s2) s3"),
+            collated("C"),
+        ),
+        // Pulled up, a dummy subquery's folded CASE is the Result's.
+        (
+            "SELECT x FROM (SELECT CASE WHEN true THEN b ELSE p END AS x FROM c4 WHERE false) s"
+                .into(),
+            collated("C"),
+        ),
+        // A WHERE folding to TRUE is dropped.
+        (format!("SELECT x FROM {s} WHERE true"), collated("C")),
+        (
+            format!("SELECT x FROM {s} WHERE x IS NOT NULL OR true"),
+            collated("C"),
+        ),
         // A WINDOW clause no call uses doesn't keep the subquery from
         // being pulled up (is_simple_subquery checks hasWindowFuncs): its
         // CASE folds to c1.b, whatever the outer target list.
@@ -1597,6 +1646,46 @@ fn create_table_as_through_a_trivial_subquery_scan_takes_the_subquerys_planned_c
         ("SELECT * FROM vs".into(), text()),
         // The scan stays: its Var has the view column's collation.
         ("SELECT x, 1 AS k FROM vs".into(), collated("C")),
+        ("SELECT x FROM vs, c2".into(), collated("C")),
+        // A qual no pushdown takes, a Sort, a join, a dummy relation or a
+        // row mark keeps the parsed "C" of a CASE planning folds to the
+        // default-collated 'x'.
+        (
+            "SELECT x FROM (SELECT CASE WHEN 1 = 1 THEN 'x' ELSE c1.b END AS x \
+             FROM c1 OFFSET 0) s WHERE x IS NOT NULL"
+                .into(),
+            collated("C"),
+        ),
+        (
+            "SELECT x FROM (SELECT CASE WHEN 1 = 1 THEN 'x' ELSE c1.b END AS x \
+             FROM c1 OFFSET 0) s WHERE x = 'x'"
+                .into(),
+            collated("C"),
+        ),
+        (
+            "SELECT x FROM (SELECT CASE WHEN 1 = 1 THEN 'x' ELSE c1.b END AS x \
+             FROM c1 OFFSET 0) s ORDER BY 1"
+                .into(),
+            collated("C"),
+        ),
+        (
+            "SELECT x FROM (SELECT CASE WHEN 1 = 1 THEN 'x' ELSE c1.b END AS x \
+             FROM c1 OFFSET 0) s, c2"
+                .into(),
+            collated("C"),
+        ),
+        (
+            "SELECT x FROM (SELECT CASE WHEN 1 = 1 THEN 'x' ELSE c1.b END AS x \
+             FROM c1 WHERE false OFFSET 0) s"
+                .into(),
+            collated("C"),
+        ),
+        (
+            "SELECT x FROM (SELECT CASE WHEN 1 = 1 THEN 'x' ELSE c1.b END AS x \
+             FROM c1 FOR UPDATE) s"
+                .into(),
+            collated("C"),
+        ),
         (
             "SELECT x, 1 AS k FROM (SELECT CASE WHEN 1 = 1 THEN 'x' ELSE c1.b END AS x \
              FROM c1 OFFSET 0) s"
@@ -1623,6 +1712,12 @@ fn create_table_as_through_a_trivial_subquery_scan_takes_the_subquerys_planned_c
     for ctas in [
         format!("SELECT x FROM {s}"),
         "SELECT x, 1 AS k FROM vs".into(),
+        "SELECT x, n FROM (SELECT CASE WHEN true THEN c1.b ELSE c2.b END AS x, \
+         count(*) OVER () AS n FROM c1, c2) s"
+            .into(),
+        format!("SELECT x::text AS x FROM {s}"),
+        format!("SELECT CASE WHEN true THEN x END AS x FROM {s}"),
+        format!("SELECT x FROM (SELECT x, 1 AS k FROM {s}) s2"),
     ] {
         let err = migrations(&ctas, view).expect_err(&ctas);
         assert!(
@@ -1634,14 +1729,73 @@ fn create_table_as_through_a_trivial_subquery_scan_takes_the_subquerys_planned_c
     for ctas in ["SELECT x FROM vp", "SELECT x FROM vs"] {
         migrations(ctas, view).unwrap_or_else(|e| panic!("{ctas}\n  got: {e}"));
     }
-    // The scan stays — the target list isn't the subquery's, a Limit or
-    // LockRows node is above it, or a CTE is scanned on its own — and the
-    // CASE's parsed collation, none, is the column's.
+    // And a query combining it with a "POSIX" column fails as PG's does.
+    let db = build_db(&[
+        ("0001.sql", setup),
+        ("0002.sql", &format!("CREATE TABLE t AS SELECT x FROM {s};")),
+    ]);
+    let err = db
+        .analyze("SELECT x FROM t UNION SELECT b FROM c2")
+        .expect_err("UNION of C and POSIX");
+    assert!(
+        err.to_string()
+            .starts_with(r#"collation mismatch between implicit collations "C" and "POSIX""#),
+        "got: {err}"
+    );
+    // The scan stays — the target list isn't the subquery's; a Limit,
+    // LockRows or Sort node is above it; a qual no pushdown takes is on
+    // it; the subquery's target list has a resjunk entry (a row mark, a
+    // sort key no output is); the relation is a dummy one (a Result over
+    // the Vars); a join is above it; or a CTE is scanned on its own — and
+    // the CASE's parsed collation, none, is the column's.
     for query in [
         format!("SELECT x, 1 AS k FROM {s}"),
         format!("SELECT x FROM {s} LIMIT 5"),
         format!("SELECT x FROM {s} OFFSET 1"),
         format!("SELECT x FROM {s} FOR UPDATE"),
+        format!("SELECT x FROM {s} WHERE x IS NOT NULL"),
+        format!("SELECT x FROM {s} WHERE false"),
+        format!("SELECT x FROM {s} ORDER BY 1"),
+        format!("SELECT x FROM {s} ORDER BY x"),
+        format!("SELECT x, 1 AS k FROM {s} ORDER BY 1"),
+        format!("SELECT x FROM {s}, c1"),
+        format!("SELECT x FROM {s} JOIN c1 ON true"),
+        format!("SELECT x FROM c1 LEFT JOIN {s} ON true"),
+        "SELECT x FROM (SELECT CASE WHEN true THEN c1.b ELSE c2.b END AS x \
+         FROM c1, c2 WHERE false OFFSET 0) s"
+            .into(),
+        "SELECT x FROM (SELECT CASE WHEN true THEN c1.b ELSE c2.b END AS x \
+         FROM c1, c2, c4 WHERE NULL OFFSET 0) s"
+            .into(),
+        "SELECT x FROM (SELECT CASE WHEN true THEN b ELSE p END AS x FROM c4 WHERE false OFFSET 0) s"
+            .into(),
+        "SELECT x FROM (SELECT CASE WHEN true THEN c1.b ELSE c2.b END AS x \
+         FROM c1, c2 ORDER BY c1.b OFFSET 0) s"
+            .into(),
+        "SELECT x FROM (SELECT CASE WHEN true THEN c1.b ELSE c2.b END AS x \
+         FROM c1, c2 ORDER BY c2.b DESC OFFSET 0) s"
+            .into(),
+        "SELECT x FROM (SELECT CASE WHEN true THEN c1.b ELSE c2.b END AS x \
+         FROM c1, c2 FOR UPDATE) s"
+            .into(),
+        "SELECT x FROM (SELECT CASE WHEN true THEN c1.b ELSE c2.b END AS x \
+         FROM c1, c2 FOR UPDATE OF c1) s"
+            .into(),
+        "SELECT x FROM (SELECT CASE WHEN true THEN c1.b ELSE c2.b END AS x \
+         FROM c1, c2 LIMIT ALL) s WHERE x IS NOT NULL"
+            .into(),
+        "SELECT x FROM (SELECT CASE WHEN true THEN b ELSE p END AS x FROM c4 OFFSET 0) s \
+         ORDER BY 1"
+            .into(),
+        // Pulled up, s2 leaves the qual on s's scan.
+        format!("SELECT x FROM (SELECT x, 1 AS k FROM {s}) s2 WHERE x IS NOT NULL"),
+        // A partitioned table with no partition to scan is a dummy relation.
+        "SELECT x FROM (SELECT CASE WHEN true THEN cp.b ELSE c2.b END AS x \
+         FROM cp, c2 OFFSET 0) s"
+            .into(),
+        "SELECT x FROM (SELECT CASE WHEN true THEN cq.b ELSE c2.b END AS x \
+         FROM cq, c2 OFFSET 0) s"
+            .into(),
         "WITH s AS MATERIALIZED (SELECT CASE WHEN true THEN c1.b ELSE c2.b END AS x \
          FROM c1, c2 OFFSET 0) SELECT x FROM s"
             .into(),
@@ -1655,10 +1809,7 @@ fn create_table_as_through_a_trivial_subquery_scan_takes_the_subquerys_planned_c
             "{stmt}\n  got: {err}"
         );
     }
-    // Where the analyzer can't tell whether the scan is removed (a window
-    // call's resjunk keys, a same-type cast parse analysis drops, a CASE
-    // the outer level folds to the Var, a pulled-up subquery's unread
-    // column), PG stores "C", and the analyzer accepts what that allows.
+    // A "C" child of a table storing x as "C" agrees with it.
     for query in [
         "SELECT x, n FROM (SELECT CASE WHEN true THEN c1.b ELSE c2.b END AS x, \
          count(*) OVER () AS n FROM c1, c2) s"
@@ -1674,6 +1825,29 @@ fn create_table_as_through_a_trivial_subquery_scan_takes_the_subquerys_planned_c
                 "0003.sql",
                 r#"CREATE TABLE ch (x text COLLATE "C") INHERITS (t);"#,
             ),
+        ]);
+    }
+    // Where the analyzer can't tell whether the scan stays — an entry the
+    // planner may drop beside it, a Limit node over a dummy subquery, a
+    // subquery whose index may already sort it — it accepts (PG stores
+    // "C" for these).
+    for query in [
+        format!("SELECT x FROM {s}, (SELECT) q"),
+        // Pulled up, s2's k is the constant: the qual folds to TRUE.
+        format!("SELECT x FROM (SELECT x, 1 AS k FROM {s}) s2 WHERE k = 1"),
+        "SELECT x FROM (SELECT CASE WHEN true THEN c1.b ELSE c2.b END AS x \
+         FROM c1, c2 WHERE false OFFSET 1) s"
+            .into(),
+        "SELECT x FROM (SELECT CASE WHEN true THEN b ELSE p END AS x FROM c3 OFFSET 0) s".into(),
+        "SELECT x FROM (SELECT CASE WHEN true THEN cr.b ELSE c2.b END AS x \
+         FROM cr, c2 OFFSET 0) s"
+            .into(),
+        // Pulled up, the dummy relation's Result has the folded CASE.
+        "SELECT x FROM (SELECT CASE WHEN true THEN cp.b ELSE c2.b END AS x FROM cp, c2) s".into(),
+    ] {
+        build_db(&[
+            ("0001.sql", setup),
+            ("0002.sql", &format!("CREATE TABLE t AS {query};")),
         ]);
     }
     // A pulled-up subquery (or inlined CTE) over one planned on its own:
