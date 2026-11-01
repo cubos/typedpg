@@ -160,6 +160,9 @@ pub struct AnalyzedQuery {
     /// (INSERT/UPDATE/DELETE/MERGE …) SELECT …` — PG only accepts a
     /// data-modifying CTE at the top level, not nested in a subquery.
     pub can_run_as_subquery: bool,
+    /// The simplifications [`Self::sql`] went through, in order: the
+    /// first one's `original_sql` is the query as written (post-lex).
+    pub simplifications: Vec<crate::simplify::AppliedSimplification>,
 }
 
 /// Build a "sample" SQL for analysis when the query contains spreads.
@@ -613,6 +616,7 @@ pub(crate) fn fuse(
         values_lists,
         columns,
         can_run_as_subquery,
+        simplifications: Vec::new(),
     })
 }
 
