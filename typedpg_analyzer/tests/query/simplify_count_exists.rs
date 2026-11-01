@@ -174,18 +174,39 @@ fn correlated_in_where_and_dml() {
             "SELECT (SELECT count(*) FROM t WHERE a = $1) > 0 AS x",
             "SELECT EXISTS (SELECT 1 FROM t WHERE a = $1) AS x",
         ),
+        // An UPDATE's SET values are evaluated on the rows already chosen.
         (
-            "UPDATE u SET c = 1 WHERE (SELECT count(*) FROM t WHERE t.id = u.t_id) > 0",
-            "UPDATE u SET c = 1 WHERE EXISTS (SELECT 1 FROM t WHERE t.id = u.t_id)",
+            "UPDATE u SET c = ((SELECT count(*) FROM t WHERE t.id = u.t_id) > 0)::int",
+            "UPDATE u SET c = (EXISTS (SELECT 1 FROM t WHERE t.id = u.t_id))::int",
         ),
+        // A FOR UPDATE SELECT's target list too.
         (
-            "DELETE FROM u WHERE (SELECT count(*) FROM t WHERE t.id = u.t_id) = 0 \
-             RETURNING (SELECT count(*) FROM t) > 0",
-            "DELETE FROM u WHERE (NOT EXISTS (SELECT 1 FROM t WHERE t.id = u.t_id)) \
-             RETURNING (SELECT count(*) FROM t) > 0",
+            "SELECT id, (SELECT count(*) FROM u WHERE u.t_id = t.id) > 0 AS x FROM t FOR UPDATE",
+            "SELECT id, EXISTS (SELECT 1 FROM u WHERE u.t_id = t.id) AS x FROM t FOR UPDATE",
         ),
     ] {
         assert_rewritten(sql, expected);
+    }
+}
+
+/// Under READ COMMITTED a row a concurrent transaction updated is rechecked
+/// (EvalPlanQual) against the WHERE of an UPDATE, a DELETE or a SELECT with
+/// a locking clause; a semi- or anti-join doesn't exclude it the way the
+/// written SubPlan does, so the rewrite could return or change other rows.
+#[test]
+fn where_of_row_locking_statements_is_kept() {
+    for sql in [
+        "UPDATE u SET c = 1 WHERE (SELECT count(*) FROM t WHERE t.id = u.t_id) > 0",
+        "DELETE FROM u WHERE (SELECT count(*) FROM t WHERE t.id = u.t_id) = 0",
+        "DELETE FROM u WHERE (SELECT count(*) FROM t WHERE t.id = u.t_id) = 0 \
+         RETURNING (SELECT count(*) FROM t) > 0",
+        "SELECT id FROM t WHERE (SELECT count(*) FROM u WHERE u.t_id = t.id) > 0 FOR UPDATE",
+        "SELECT id FROM t WHERE (SELECT count(*) FROM u WHERE u.t_id = t.id) = 0 FOR SHARE",
+        "SELECT id FROM t WHERE (SELECT count(*) FROM u WHERE u.t_id = t.id) > 0 \
+         FOR NO KEY UPDATE",
+        "SELECT id FROM t WHERE (SELECT count(*) FROM u WHERE u.t_id = t.id) > 0 FOR KEY SHARE",
+    ] {
+        assert_kept(sql);
     }
 }
 

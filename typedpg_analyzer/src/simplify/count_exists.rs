@@ -46,6 +46,12 @@
 //!   moves above everything at its level, which may then run on rows the
 //!   count used to veto first. Nested queries, CTEs, HAVING, ON and
 //!   RETURNING are left as written.
+//! - The WHERE of an UPDATE, a DELETE, a MERGE or a SELECT with a locking
+//!   clause (`FOR UPDATE` / `SHARE`): under READ COMMITTED a row a
+//!   concurrent transaction updated is rechecked (EvalPlanQual), and a
+//!   semi- or anti-join doesn't exclude it the way the written SubPlan
+//!   does. An UPDATE's SET values and a locking SELECT's target list,
+//!   evaluated on the rows already chosen, are still rewritten.
 //! - Anything that may call a volatile function, or reads a relation
 //!   other than a plain table (a view or a CTE may hide one; a foreign
 //!   table may do anything): how many times it runs may change.
