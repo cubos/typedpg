@@ -32,6 +32,14 @@ const SCHEMA: &str = "
         id bigint PRIMARY KEY,
         customer_id bigint NOT NULL REFERENCES customers DEFERRABLE INITIALLY IMMEDIATE
     );
+    CREATE TABLE nv2_orders (id bigint PRIMARY KEY, customer_id bigint NOT NULL);
+    ALTER TABLE nv2_orders
+        ADD CONSTRAINT nv2_fk FOREIGN KEY (customer_id) REFERENCES customers NOT VALID;
+    ALTER TABLE nv2_orders ALTER CONSTRAINT nv2_fk ENFORCED;
+    CREATE TABLE def2_orders (
+        id bigint PRIMARY KEY, customer_id bigint NOT NULL REFERENCES customers
+    );
+    ALTER TABLE def2_orders ALTER CONSTRAINT def2_orders_customer_id_fkey DEFERRABLE;
     CREATE TABLE secret (id bigint PRIMARY KEY);
     ALTER TABLE secret ENABLE ROW LEVEL SECURITY;
     CREATE TABLE uses_secret (id bigint PRIMARY KEY, secret_id bigint NOT NULL REFERENCES secret);
@@ -310,6 +318,10 @@ fn key_must_be_validated_enforced_and_immediate() {
             "SELECT o.id FROM nv_orders o JOIN customers c ON c.id = o.customer_id",
             "SELECT o.id FROM ne_orders o JOIN customers c ON c.id = o.customer_id",
             "SELECT o.id FROM def_orders o JOIN customers c ON c.id = o.customer_id",
+            // ENFORCED on an enforced NOT VALID key leaves it NOT VALID.
+            "SELECT o.id FROM nv2_orders o JOIN customers c ON c.id = o.customer_id",
+            // Made DEFERRABLE by ALTER CONSTRAINT.
+            "SELECT o.id FROM def2_orders o JOIN customers c ON c.id = o.customer_id",
         ],
     );
 }
