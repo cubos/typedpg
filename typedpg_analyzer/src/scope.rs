@@ -96,6 +96,26 @@ pub(crate) struct Deferred {
     pub substitution: Substitution,
     /// That output's expression, when [`Substitution::Certain`] and known.
     pub expr: Option<std::sync::Arc<typedpg_pg_query::protobuf::Node>>,
+    /// Set for a CTE the planner may inline as a subquery it plans on its
+    /// own: [`Self::value`] and [`Self::entry`] are raised only where a
+    /// reference to it is certainly planned.
+    pub alone: Option<PlannedAlone>,
+    /// Raised wherever a reference to the entry is, unless it is by itself
+    /// the nullable side of a join `join_is_removable` may drop: what
+    /// estimating the restrictions of an inlined CTE's one relation,
+    /// pulled up, raises.
+    pub unless_removed: Option<Box<crate::error::AnalyzeError>>,
+}
+
+/// How the planner plans an inlined CTE it doesn't pull up: on its own,
+/// once it plans the relation a reference is — unless it proves that
+/// relation empty, or removes it (`removable`: the nullable side of a
+/// join, when it may be proven distinct). What the reference's level may
+/// push down into it (`pushed_down`) may prove it empty too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PlannedAlone {
+    pub removable: bool,
+    pub pushed_down: bool,
 }
 
 /// Whether the planner replaces a reference to a FROM entry's column by
@@ -275,7 +295,13 @@ pub(crate) enum SourceKind {
     /// A FROM subquery (`RTE_SUBQUERY`). `lock_blocker` is the first
     /// `CheckSelectLocking` violation a locking clause pushed into it would
     /// hit (`"DISTINCT clause"`, …).
-    Subquery { lock_blocker: Option<&'static str> },
+    /// `removable` unless `remove_useless_joins` certainly keeps it on
+    /// the nullable side of an outer join (see
+    /// [`crate::expr::plan_fold::may_be_removed`]).
+    Subquery {
+        lock_blocker: Option<&'static str>,
+        removable: bool,
+    },
     /// A CTE reference (`RTE_CTE`).
     Cte,
     /// A FROM function (`RTE_FUNCTION`).

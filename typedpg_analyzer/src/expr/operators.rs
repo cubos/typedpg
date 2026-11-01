@@ -1505,7 +1505,7 @@ pub(crate) fn check_regex_restrictions(
     node: &protobuf::Node,
     ctx: Ctx<'_>,
 ) -> Result<(), AnalyzeError> {
-    if !plan_time_checks() || super::plan_fold::level_may_be_empty() {
+    if !plan_time_checks() {
         return Ok(());
     }
     regex_restrictions(node, ctx, false)
@@ -1552,16 +1552,26 @@ fn regex_restrictions(
             let Some(source) = ctx.scope.sources.iter().find(|s| s.alias == alias) else {
                 return Ok(());
             };
-            let estimated = if matches!(source.kind, crate::scope::SourceKind::Relation) {
-                super::plan_fold::restriction_estimated(source, ctx.snapshot)
-            } else {
-                // A subquery the planner pulls up: its columns are the
-                // table's they pass through.
-                pulled_up_relation(l, ctx).is_some_and(|relid| {
-                    super::plan_fold::table_restriction_estimated(&alias, relid, ctx.snapshot)
-                })
+            // Never estimated when proven empty first.
+            if super::plan_fold::level_may_exclude(&alias) {
+                return Ok(());
+            }
+            let estimated = || {
+                if matches!(source.kind, crate::scope::SourceKind::Relation) {
+                    super::plan_fold::restriction_estimated(source, ctx.snapshot)
+                } else {
+                    // A subquery the planner pulls up: its columns are the
+                    // table's they pass through.
+                    pulled_up_relation(l, ctx).is_some_and(|relid| {
+                        super::plan_fold::table_restriction_estimated(&alias, relid, ctx.snapshot)
+                    })
+                }
             };
-            if !estimated {
+            // Skipped as a join may remove it, but collected for where it
+            // can't (see `record_unless_removed`).
+            let planned = estimated();
+            let unless_removed = !planned && super::plan_fold::records_skipped(&alias, estimated);
+            if !planned && !unless_removed {
                 return Ok(());
             }
             // Only the string types' regex operators (not, e.g., ltree's `~`).
@@ -1575,7 +1585,14 @@ fn regex_restrictions(
             {
                 return Ok(());
             }
-            super::plan_time_result(Some(e.location), check_regex_pattern(pattern, icase))
+            let checked = check_regex_pattern(pattern, icase);
+            if unless_removed {
+                if let Err(err) = checked {
+                    super::plan_fold::record_skipped(Some(e.location), err);
+                }
+                return Ok(());
+            }
+            super::plan_time_result(Some(e.location), checked)
         }
         _ => Ok(()),
     }

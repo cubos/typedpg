@@ -158,7 +158,12 @@ pub(crate) fn coerce_clause_expr(
     // they hold for the level to the clause's placement rule.
     let inferred = if let Some(clause) = kind.level_clause() {
         crate::grouping::with_clause(clause, || {
-            expr::infer_expr(node, ctx, params, TypeGoal::assignment(goal_oid))
+            let mut infer = || expr::infer_expr(node, ctx, params, TypeGoal::assignment(goal_oid));
+            if matches!(kind, ClauseKind::Where) {
+                expr::plan_fold::with_where_clause(node, infer)
+            } else {
+                infer()
+            }
         })
     } else {
         expr::infer_expr(node, ctx, params, TypeGoal::assignment(goal_oid))

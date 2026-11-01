@@ -68,7 +68,6 @@ pub(crate) fn plan_of(sel: &protobuf::SelectStmt, snapshot: &PgCatalog) -> Plan 
         || sel.limit_count.is_some()
         || sel.limit_offset.is_some()
         || !sel.locking_clause.is_empty()
-        || !sel.window_clause.is_empty()
         || sel.with_clause.is_some()
         || never_simple_target_list(sel, snapshot)
     {
@@ -124,7 +123,13 @@ fn never_simple_target_list(sel: &protobuf::SelectStmt, snapshot: &PgCatalog) ->
 /// How the level reading a subquery planned as `plan` (never
 /// null-extended there when `kept`) analyzes it: `None` when nothing in
 /// it is certain to be planned.
-fn next_level(plan: Plan, sel: &protobuf::SelectStmt, kept: bool) -> Option<NextLevel> {
+fn next_level(
+    plan: Plan,
+    sel: &protobuf::SelectStmt,
+    kept: bool,
+    alias: Option<&str>,
+    snapshot: &PgCatalog,
+) -> Option<NextLevel> {
     if !crate::expr::plan_time_checks() {
         return None;
     }
@@ -132,8 +137,14 @@ fn next_level(plan: Plan, sel: &protobuf::SelectStmt, kept: bool) -> Option<Next
         Plan::PulledUp if kept => Some(NextLevel::PulledUp),
         Plan::PulledUp => Some(NextLevel::PulledUpNullable),
         // Planned unless its relation is proven empty, or removed (the
-        // nullable side of a join).
-        Plan::Separate if kept && !crate::expr::plan_fold::level_may_be_empty() => {
+        // nullable side of a join, when it may be proven distinct).
+        Plan::Separate
+            if (kept || !crate::expr::plan_fold::may_be_distinct(sel, snapshot))
+                && !alias.map_or_else(
+                    crate::expr::plan_fold::level_may_be_empty,
+                    crate::expr::plan_fold::level_may_exclude,
+                ) =>
+        {
             Some(NextLevel::Separate {
                 // subquery_is_pushdown_safe: never into one with a LIMIT.
                 pushed_down: sel.limit_count.is_none() && sel.limit_offset.is_none(),
@@ -197,7 +208,9 @@ pub(crate) fn record_target_list(sel: &protobuf::SelectStmt, snapshot: &PgCatalo
 }
 
 /// The shape `is_simple_subquery` asks of a subquery, beside its select
-/// list's calls.
+/// list's calls. A WINDOW clause is no part of it: only a window function
+/// (`hasWindowFuncs`, see [`simple_target_list`]) keeps it from being
+/// pulled up.
 fn simple_shape(sel: &protobuf::SelectStmt) -> bool {
     sel.op == SetOperation::SetopNone as i32
         && sel.values_lists.is_empty()
@@ -209,7 +222,6 @@ fn simple_shape(sel: &protobuf::SelectStmt) -> bool {
         && sel.limit_count.is_none()
         && sel.limit_offset.is_none()
         && sel.locking_clause.is_empty()
-        && sel.window_clause.is_empty()
         && sel.into_clause.is_none()
 }
 
@@ -458,23 +470,30 @@ fn is_star(t: &protobuf::Node) -> bool {
                 matches!(f.node.as_ref(), Some(node::Node::AStar(_))))))
 }
 
-/// Analyze `sel` (with `run`) as a subquery the query reading it plans as
-/// `plan` (never null-extended there when `kept`). Under the plan-time
-/// checks, the errors of one certainly planned are captured and split; the
-/// others are analyzed without the checks.
+/// Analyze `sel` (with `run`) as a subquery, FROM item `alias`, the query
+/// reading it plans as `plan` (never null-extended there when `kept`; by
+/// itself the nullable side of a join that may remove it when
+/// `removable_side`).
+/// Under the plan-time checks, the errors of one certainly planned are
+/// captured and split; the others are analyzed without the checks.
 pub(crate) fn analyze<T>(
     plan: Plan,
     sel: &protobuf::SelectStmt,
     kept: bool,
+    removable_side: bool,
+    alias: &str,
+    snapshot: &PgCatalog,
     run: impl FnOnce() -> T,
 ) -> (T, Split) {
     if plan == Plan::Whole {
         return (run(), Split::default());
     }
-    match next_level(plan, sel, kept) {
+    match next_level(plan, sel, kept, Some(alias), snapshot) {
         Some(next) => {
-            let (out, errors) = crate::expr::plan_fold::with_next_level(next, || {
-                crate::expr::capture_plan_time_errors(run)
+            let (out, errors) = crate::expr::plan_fold::with_next_item(next, alias, || {
+                crate::expr::capture_plan_time_errors(|| {
+                    unless_removed(next, removable_side, sel, snapshot, run)
+                })
             });
             (out, split(sel, errors))
         }
@@ -483,53 +502,162 @@ pub(crate) fn analyze<T>(
     }
 }
 
+/// Run `run`, the analysis of `sel` planned as `next`: pulled up as a
+/// join's whole nullable side (`removable_side`), a single relation is
+/// that side, which `remove_useless_joins` may drop before its
+/// restrictions are estimated.
+fn unless_removed<T>(
+    next: NextLevel,
+    removable_side: bool,
+    sel: &protobuf::SelectStmt,
+    snapshot: &PgCatalog,
+    run: impl FnOnce() -> T,
+) -> T {
+    match next {
+        NextLevel::PulledUpNullable if removable_side => match removable_relation(sel, snapshot) {
+            Some(inner) => crate::expr::plan_fold::skip_restrictions_on(vec![inner], run),
+            None => run(),
+        },
+        _ => run(),
+    }
+}
+
+/// The alias of `sel`'s only FROM item when it is one relation
+/// `join_is_removable` may drop (one with a unique index, or a name that
+/// isn't a table's: a CTE's), as [`crate::expr::plan_fold::may_be_removed`].
+fn removable_relation(sel: &protobuf::SelectStmt, snapshot: &PgCatalog) -> Option<String> {
+    let [item] = sel.from_clause.as_slice() else {
+        return None;
+    };
+    let Some(node::Node::RangeVar(rv)) = item.node.as_ref() else {
+        return None;
+    };
+    let unique = crate::ddl::util::lookup_relation(snapshot, rv).map_or(true, |(_, relid)| {
+        snapshot
+            .pg_index
+            .values()
+            .any(|i| i.indrelid == relid && i.indisunique)
+    });
+    unique.then(|| {
+        rv.alias
+            .as_ref()
+            .map_or_else(|| rv.relname.clone(), |a| a.aliasname.clone())
+    })
+}
+
+/// What planning a CTE's query raises at its references (see
+/// [`analyze_cte`]).
+#[derive(Default)]
+pub(crate) struct PlannedCte {
+    /// Each output column's: raised where the column is read.
+    pub outputs: Vec<Option<AnalyzeError>>,
+    /// The first of the others: raised wherever the CTE is referenced.
+    pub entry: Option<AnalyzeError>,
+    /// Both only where a reference is certainly planned (see
+    /// [`crate::scope::PlannedAlone`]).
+    pub alone: Option<crate::scope::PlannedAlone>,
+    /// What estimating its one relation's restrictions raises, pulled up:
+    /// at a reference no join may remove.
+    pub unless_removed: Option<AnalyzeError>,
+}
+
 /// Analyze the query of CTE `cte` (with `run`), and what its references
 /// raise when planned: a CTE the planner may inline is planned like a
-/// FROM subquery at each reference (`plan_of`); a MATERIALIZED one whole,
-/// once, wherever it is referenced at all (an unreferenced one never is).
-/// The errors go to `deferred` by output column (see
+/// FROM subquery at each reference (`plan_of`) — pulled up, or on its own
+/// when its relation is planned; one it doesn't inline (`inlined` is
+/// `Some(false)`: MATERIALIZED, referenced more than once) whole, once,
+/// wherever it is referenced at all (`SS_process_ctes`; an unreferenced
+/// one never is). The errors go to `deferred` by output column (see
 /// [`crate::scope::Deferred`]).
 pub(crate) fn analyze_cte<T>(
     cte: &protobuf::CommonTableExpr,
     recursive: bool,
+    inlined: Option<bool>,
     snapshot: &PgCatalog,
     run: impl FnOnce() -> T,
-) -> (T, Vec<Option<AnalyzeError>>, Option<AnalyzeError>) {
+) -> (T, PlannedCte) {
     let Some(node::Node::SelectStmt(sel)) = cte.ctequery.as_deref().and_then(|q| q.node.as_ref())
     else {
         // A data-modifying CTE always runs.
-        return (run(), Vec::new(), None);
+        return (run(), PlannedCte::default());
     };
-    let materialized = cte.ctematerialized == protobuf::CteMaterialize::Always as i32;
+    let scanned =
+        cte.ctematerialized == protobuf::CteMaterialize::Always as i32 || inlined == Some(false);
     let plan = match plan_of(sel, snapshot) {
         _ if recursive => Plan::Uncertain,
-        Plan::Uncertain | Plan::Separate if materialized => Plan::Whole,
-        // Inlined, it is planned with the relation it is.
-        Plan::Separate => Plan::Uncertain,
+        Plan::Uncertain | Plan::Separate | Plan::PulledUp if scanned => Plan::Whole,
         plan => plan,
     };
     if plan == Plan::Uncertain || !crate::expr::plan_time_checks() {
-        return (crate::expr::may_skip(run), Vec::new(), None);
+        return (crate::expr::may_skip(run), PlannedCte::default());
     }
-    let (out, errors) = crate::expr::capture_plan_time_errors(run);
-    if plan == Plan::Whole || materialized {
-        let first = errors.into_iter().next().map(|(_, e)| e);
-        return (out, Vec::new(), first);
+    if plan == Plan::Separate {
+        // Inlined (or else scanned, planned wherever it is referenced at
+        // all), it is planned on its own with the relation a reference
+        // is. What that reference's level pushes down into it is checked
+        // there.
+        let (out, errors) = crate::expr::plan_fold::with_next_level(
+            NextLevel::Separate { pushed_down: false },
+            || crate::expr::capture_plan_time_errors(run),
+        );
+        let split = split(sel, errors);
+        let planned = PlannedCte {
+            outputs: split.outputs,
+            entry: split.rest.map(|(_, e)| e),
+            alone: Some(crate::scope::PlannedAlone {
+                removable: crate::expr::plan_fold::may_be_distinct(sel, snapshot),
+                // subquery_is_pushdown_safe: never into one with a LIMIT.
+                pushed_down: sel.limit_count.is_none() && sel.limit_offset.is_none(),
+            }),
+            unless_removed: None,
+        };
+        return (out, planned);
+    }
+    // Pulled up, its one relation may be a join's whole nullable side at
+    // the reference: what estimating its restrictions raises is raised
+    // only where no join may remove it.
+    let removable = match plan {
+        Plan::PulledUp => removable_relation(sel, snapshot),
+        _ => None,
+    };
+    let ((out, errors), unless_removed) = match removable {
+        Some(inner) => crate::expr::plan_fold::record_unless_removed(vec![inner], || {
+            crate::expr::capture_plan_time_errors(run)
+        }),
+        None => (crate::expr::capture_plan_time_errors(run), Vec::new()),
+    };
+    if plan == Plan::Whole {
+        let entry = errors.into_iter().next().map(|(_, e)| e);
+        return (
+            out,
+            PlannedCte {
+                entry,
+                ..PlannedCte::default()
+            },
+        );
     }
     let split = split(sel, errors);
-    (out, split.outputs, split.rest.map(|(_, e)| e))
+    let planned = PlannedCte {
+        outputs: split.outputs,
+        entry: split.rest.map(|(_, e)| e),
+        alone: None,
+        unless_removed: unless_removed.into_iter().next().map(|(_, e)| e),
+    };
+    (out, planned)
 }
 
 /// Analyze `sel` (with `run`) as a planned query the rewriter puts in
-/// the one reading it (a view's, never null-extended there when `kept`),
-/// and split what planning it raises (see [`split`]); `None` when nothing
-/// of it is certain to be planned. A `security_barrier` view's
-/// (`barrier`) is never pulled up.
+/// the one reading it (a view's, never null-extended there when `kept`;
+/// by itself the nullable side of a join that may remove it when
+/// `removable_side`), and split what planning it raises (see [`split`]);
+/// `None` when nothing of it is certain to be planned. A
+/// `security_barrier` view's (`barrier`) is never pulled up.
 pub(crate) fn planned_errors<T>(
     sel: &protobuf::SelectStmt,
     snapshot: &PgCatalog,
     barrier: bool,
     kept: bool,
+    removable_side: bool,
     run: impl FnOnce() -> T,
 ) -> Option<(T, Split)> {
     let plan = match plan_of(sel, snapshot) {
@@ -548,40 +676,76 @@ pub(crate) fn planned_errors<T>(
         };
         return Some((out, split));
     }
-    let next = next_level(plan, sel, kept)?;
+    let next = next_level(plan, sel, kept, None, snapshot)?;
     let (out, errors) = crate::expr::with_plan_time_checks(|| {
-        crate::expr::plan_fold::with_next_level(next, || crate::expr::capture_plan_time_errors(run))
+        crate::expr::plan_fold::with_next_level(next, || {
+            crate::expr::capture_plan_time_errors(|| {
+                unless_removed(next, removable_side, sel, snapshot, run)
+            })
+        })
     });
     Some((out, split(sel, errors)))
 }
 
 /// Attach the errors [`analyze_cte`] found to the CTE's `columns`.
-pub(crate) fn attach_to_cte(
-    columns: &mut [crate::scope::ScopeColumn],
-    outputs: Vec<Option<AnalyzeError>>,
-    entry: Option<AnalyzeError>,
-) {
-    for (c, e) in columns.iter_mut().zip(outputs) {
+pub(crate) fn attach_to_cte(columns: &mut [crate::scope::ScopeColumn], planned: PlannedCte) {
+    for (c, e) in columns.iter_mut().zip(planned.outputs) {
         c.deferred.value = e.map(Box::new);
     }
-    if let Some(e) = entry {
+    if let Some(e) = planned.entry {
         let e = Box::new(e);
         for c in columns.iter_mut() {
             c.deferred.entry = Some(e.clone());
         }
     }
+    let unless_removed = planned.unless_removed.map(Box::new);
+    for c in columns.iter_mut() {
+        c.deferred.alone = planned.alone;
+        c.deferred.unless_removed = unless_removed.clone();
+    }
+}
+
+/// Drop from `columns`, those of a reference to a CTE (FROM item
+/// `alias`, never null-extended when `kept`), what planning the CTE
+/// raises when the reference may not be planned (see
+/// [`crate::scope::PlannedAlone`]).
+pub(crate) fn unless_planned_alone(
+    columns: &mut [crate::scope::ScopeColumn],
+    alias: &str,
+    kept: bool,
+) {
+    let Some(alone) = columns.iter().find_map(|c| c.deferred.alone) else {
+        return;
+    };
+    let planned = (kept || !alone.removable)
+        && !crate::expr::plan_fold::level_may_exclude(alias)
+        && !(alone.pushed_down && crate::expr::plan_fold::level_may_push_down());
+    if !planned {
+        for c in columns.iter_mut() {
+            c.deferred.value = None;
+            c.deferred.entry = None;
+        }
+    }
 }
 
 /// Raise, for a reference to a CTE at `location` the query plans, what
-/// planning the CTE raises (see [`analyze_cte`]).
+/// planning the CTE raises (see [`analyze_cte`]) — but what estimating
+/// its relation's restrictions does when the reference is by itself the
+/// nullable side of a join that may remove it (`removable_side`).
 pub(crate) fn reference_cte(
     columns: &[crate::scope::ScopeColumn],
     location: i32,
+    removable_side: bool,
 ) -> Result<(), AnalyzeError> {
     if !crate::expr::plan_time_checks() {
         return Ok(());
     }
-    match columns.iter().find_map(|c| c.deferred.entry.as_deref()) {
+    let entry = columns.iter().find_map(|c| c.deferred.entry.as_deref());
+    let unless_removed = columns
+        .iter()
+        .find_map(|c| c.deferred.unless_removed.as_deref())
+        .filter(|_| !removable_side);
+    match entry.or(unless_removed) {
         Some(e) => match crate::expr::plan_time_error(Some(location), e.clone()) {
             Some(e) => Err(e),
             None => Ok(()),

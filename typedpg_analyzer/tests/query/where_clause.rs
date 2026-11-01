@@ -744,3 +744,254 @@ fn a_subquery_planned_on_its_own_estimates_its_restrictions() {
         db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
 }
+
+fn planner_setup() -> PgCatalog {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE t (id int PRIMARY KEY, x int, s text);
+         CREATE TABLE u (id int PRIMARY KEY, x int);
+         CREATE TABLE rt (id int PRIMARY KEY, s text);
+         CREATE TABLE rt2 (id int PRIMARY KEY, s text);",
+    )
+    .unwrap();
+    db
+}
+
+#[test]
+fn in_and_exists_sublinks_become_joins_before_the_where_clause_is_folded() {
+    // `pull_up_sublinks` turns an IN (`= ANY`) sublink that is a top-level
+    // AND argument of WHERE, testing a column of the query, into a
+    // semi-join before the qual is folded: its subquery joins the query,
+    // whose constant FALSE qual is then a gating qual above the join. So
+    // does it an [NOT] EXISTS whose WHERE reads the query's columns
+    // (`simplify_EXISTS_query` throwing its select list away): its FROM
+    // items join the query.
+    let db = planner_setup();
+    for sql in [
+        "SELECT 1 FROM t WHERE x IN (SELECT id FROM rt WHERE s ~ '(') AND false",
+        "SELECT 1 FROM t WHERE false AND x IN (SELECT id FROM rt WHERE s ~ '(')",
+        "SELECT 1 FROM t WHERE t.x IN (SELECT id FROM rt WHERE s ~ '(') AND NULL",
+        "SELECT 1 FROM t WHERE x = ANY (SELECT id FROM rt WHERE s ~ '(') AND false",
+        "SELECT 1 FROM t WHERE x IN (SELECT id FROM rt WHERE s ~ '(' LIMIT 3) AND false",
+        "SELECT 1 FROM t WHERE x IN (SELECT id FROM rt WHERE s ~ '(' AND rt.id = t.id) AND false",
+        "DELETE FROM t WHERE x IN (SELECT id FROM rt WHERE s ~ '(') AND false",
+        "UPDATE t SET x = 1 WHERE x IN (SELECT id FROM rt WHERE s ~ '(') AND false",
+        "SELECT 1 FROM t WHERE EXISTS (SELECT 1 FROM rt WHERE rt.id = t.id AND s ~ '(') AND false",
+        "SELECT 1 FROM t WHERE false AND EXISTS (SELECT 1 FROM rt WHERE rt.id = t.id AND s ~ '(')",
+        "SELECT 1 FROM t WHERE NOT EXISTS (SELECT 1 FROM rt WHERE rt.id = t.id AND s ~ '(') \
+         AND false",
+        "SELECT 1 FROM t WHERE EXISTS (SELECT 1 FROM rt WHERE rt.id = t.id AND s ~ '(' LIMIT 1) \
+         AND false",
+        "DELETE FROM t WHERE EXISTS (SELECT 1 FROM rt WHERE rt.id = t.id AND s ~ '(') AND false",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::Invalid(_),
+            "invalid regular expression: parentheses () not balanced"
+        );
+    }
+    for sql in [
+        "SELECT 1 FROM t WHERE x IN (SELECT 1 / 0 FROM rt) AND false",
+        "SELECT 1 FROM t WHERE x IN (SELECT id FROM rt WHERE 1 / 0 = 1) AND false",
+        "SELECT 1 FROM t WHERE EXISTS (SELECT 1 FROM rt WHERE rt.id = t.id AND 1 / 0 = 1) AND false",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::DivisionByZero(_),
+            "division by zero"
+        );
+    }
+    // Not a semi-join — under an OR, NOT IN, testing no column of the
+    // query (or a volatile expression), outside WHERE — the sublink is
+    // folded away with the qual; a semi-join's own FALSE qual proves its
+    // relation empty.
+    for sql in [
+        "SELECT 1 FROM t WHERE (x IN (SELECT id FROM rt WHERE s ~ '(') OR true)",
+        "SELECT 1 FROM t WHERE x NOT IN (SELECT id FROM rt WHERE s ~ '(') AND false",
+        "SELECT 1 FROM t WHERE 1 IN (SELECT id FROM rt WHERE s ~ '(') AND false",
+        "SELECT 1 FROM t WHERE x + random()::int IN (SELECT id FROM rt WHERE s ~ '(') AND false",
+        "SELECT x IN (SELECT id FROM rt WHERE s ~ '(') AND false FROM t",
+        "SELECT (SELECT 1 FROM u WHERE t.x IN (SELECT id FROM rt WHERE s ~ '(') AND false) FROM t",
+        "SELECT 1 FROM t WHERE x IN (SELECT id FROM rt WHERE s ~ '(' AND false) AND false",
+        "SELECT 1 FROM t WHERE x IN (SELECT id FROM rt) AND false AND t.s ~ '('",
+        // An EXISTS reading no column of the query is an InitPlan; one
+        // with an aggregate or a volatile WHERE is kept; what it selects
+        // is thrown away.
+        "SELECT 1 FROM t WHERE EXISTS (SELECT 1 FROM rt WHERE s ~ '(') AND false",
+        "SELECT 1 FROM t WHERE EXISTS (SELECT 1 FROM rt t WHERE t.id = 1 AND s ~ '(') AND false",
+        "SELECT 1 FROM t WHERE EXISTS (SELECT count(*) FROM rt WHERE rt.id = t.id AND s ~ '(') \
+         AND false",
+        "SELECT 1 FROM t WHERE EXISTS (SELECT 1 FROM rt WHERE rt.id = t.id AND s ~ '(' \
+         AND random() > 0) AND false",
+        "SELECT 1 FROM t WHERE EXISTS (SELECT 1 / 0 FROM rt WHERE rt.id = t.id) AND false",
+        "SELECT 1 FROM t WHERE (EXISTS (SELECT 1 FROM rt WHERE rt.id = t.id AND s ~ '(') OR true)",
+        "SELECT 1 FROM t WHERE EXISTS (SELECT 1 WHERE t.id = 1) AND false AND t.s ~ '('",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
+
+#[test]
+fn a_column_proof_excludes_only_its_own_relation() {
+    // `relation_excluded_by_constraints` reads a relation's own
+    // restrictions: `t.id IS NULL` (t.id NOT NULL) proves t empty, and
+    // every other relation is still estimated.
+    let db = planner_setup();
+    for sql in [
+        "SELECT 1 FROM t, u, rt WHERE rt.s ~ '(' AND t.id IS NULL",
+        "SELECT 1 FROM t, rt WHERE rt.s ~ '(' AND t.id IS NULL",
+        "SELECT 1 FROM t, rt WHERE rt.s ~ '(' AND t.x = 1 AND t.x = 2",
+        "SELECT 1 FROM t, (SELECT * FROM rt WHERE s ~ '(') q WHERE t.id IS NULL",
+        "SELECT 1 FROM t, (SELECT * FROM rt WHERE s ~ '(' OFFSET 0) q WHERE t.id IS NULL",
+        "SELECT 1 FROM t JOIN rt ON rt.s ~ '(' LEFT JOIN u ON t.id IS NULL",
+        "SELECT 1 FROM rt2 LEFT JOIN (SELECT 1 AS q FROM rt WHERE s ~ '(' OFFSET 0) x ON true \
+         WHERE rt2.id IS NULL",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::Invalid(_),
+            "invalid regular expression: parentheses () not balanced"
+        );
+    }
+    // The relation proven empty itself — or one that can't be told apart
+    // (an unqualified column, a join's alias, a LATERAL subquery's qual).
+    for sql in [
+        "SELECT 1 FROM t, rt WHERE rt.s ~ '(' AND rt.id IS NULL",
+        "SELECT 1 FROM t, rt WHERE rt.s ~ '(' AND rt.id = 1 AND rt.id = 2",
+        "SELECT 1 FROM t, (SELECT * FROM rt WHERE id IS NULL) q WHERE q.s ~ '('",
+        "SELECT 1 FROM t, (SELECT * FROM rt WHERE s ~ '(' OFFSET 0) q WHERE q.id IS NULL",
+        "SELECT 1 FROM t, LATERAL (SELECT * FROM rt WHERE t.id IS NULL) q WHERE t.s ~ '('",
+        "SELECT 1 FROM (t JOIN u USING (id)) j, rt WHERE j.id IS NULL AND rt.s ~ '('",
+        "SELECT 1 FROM t LEFT JOIN rt ON rt.s ~ '(' AND rt.id IS NULL",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
+
+#[test]
+fn a_left_join_keeps_a_subquery_it_cannot_prove_distinct() {
+    // `join_is_removable` removes a nullable side planned on its own only
+    // when `query_supports_distinctness` holds for it (DISTINCT, GROUP BY,
+    // an aggregate, a set operation): any other is planned, its
+    // restrictions estimated and its read outputs folded.
+    let db = planner_setup();
+    for sql in [
+        "SELECT 1 FROM rt2 LEFT JOIN (SELECT 1 AS q FROM rt WHERE s ~ '(' OFFSET 0) x ON true",
+        "SELECT 1 FROM rt2 LEFT JOIN (SELECT id FROM rt WHERE s ~ '(' LIMIT 5) x ON x.id = rt2.id",
+        "SELECT 1 FROM rt2 LEFT JOIN (SELECT id FROM rt WHERE s ~ '(' ORDER BY id) x \
+         ON x.id = rt2.id",
+        "SELECT 1 FROM rt2 FULL JOIN (SELECT 1 AS q FROM rt WHERE s ~ '(' OFFSET 0) x ON true",
+        "SELECT x.q FROM rt2 LEFT JOIN (SELECT 1 AS q FROM rt WHERE s ~ '(' OFFSET 0) x ON true",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::Invalid(_),
+            "invalid regular expression: parentheses () not balanced"
+        );
+    }
+    assert_err_prefix!(
+        db.analyze(
+            "SELECT x.z FROM rt2 LEFT JOIN (SELECT id, 40000::int2 AS z FROM rt OFFSET 0) x \
+             ON x.id = rt2.id"
+        ),
+        AnalyzeError::NumericValueOutOfRange(_),
+        "smallint out of range"
+    );
+    for sql in [
+        "SELECT 1 FROM rt2 LEFT JOIN (SELECT DISTINCT id FROM rt WHERE s ~ '(') x ON x.id = rt2.id",
+        "SELECT 1 FROM rt2 LEFT JOIN (SELECT count(*) AS c FROM rt WHERE s ~ '(') x ON true",
+        "SELECT 1 FROM rt2 LEFT JOIN (SELECT max(id) AS m FROM rt WHERE s ~ '(') x ON true",
+        "SELECT 1 FROM rt2 LEFT JOIN (SELECT id FROM rt WHERE s ~ '(' GROUP BY id) x \
+         ON x.id = rt2.id",
+        "SELECT 1 FROM rt2 LEFT JOIN (SELECT id, 40000::int2 AS z FROM rt OFFSET 0) x \
+         ON x.id = rt2.id",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
+
+#[test]
+fn a_pulled_up_nullable_side_the_join_removes_is_not_estimated() {
+    // A subquery (an inlined CTE, a view) pulled up as the whole nullable
+    // side of a LEFT / RIGHT join is its one relation there:
+    // `join_is_removable` drops it when the join condition equates its
+    // unique key and nothing above reads it, before its restrictions are
+    // estimated. An unused WINDOW clause doesn't keep it from being
+    // pulled up (`is_simple_subquery` asks `hasWindowFuncs`).
+    let mut db = planner_setup();
+    db.apply_sql("CREATE VIEW rv AS SELECT id FROM rt WHERE s ~ '(';")
+        .unwrap();
+    for sql in [
+        "SELECT 1 FROM rt2 LEFT JOIN (SELECT id FROM rt WHERE s ~ '(') x ON x.id = rt2.id",
+        "SELECT 1 FROM rt2 LEFT JOIN (SELECT id FROM rt WHERE s ~ '(' WINDOW w AS (ORDER BY id)) x \
+         ON x.id = rt2.id",
+        "SELECT 1 FROM rt2 LEFT JOIN (SELECT id FROM rt r WHERE r.s ~ '(') x USING (id)",
+        "SELECT 1 FROM (SELECT id FROM rt WHERE s ~ '(') x RIGHT JOIN rt2 ON x.id = rt2.id",
+        "SELECT 1 FROM rt2 LEFT JOIN rv ON rv.id = rt2.id",
+        "WITH c AS (SELECT id FROM rt WHERE s ~ '(') SELECT 1 FROM rt2 LEFT JOIN c ON c.id = rt2.id",
+        "WITH c AS (SELECT id FROM rt WHERE s ~ '(' WINDOW w AS ()) \
+         SELECT 1 FROM rt2 LEFT JOIN c ON c.id = rt2.id",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    // Kept, joined on no equality, beside another relation, or (constant
+    // folding) whatever the join: planned.
+    for sql in [
+        "SELECT 1 FROM rt2 JOIN (SELECT id FROM rt WHERE s ~ '(' WINDOW w AS (ORDER BY id)) x \
+         ON x.id = rt2.id",
+        "SELECT 1 FROM t, (SELECT id FROM rt WHERE s ~ '(' WINDOW w AS ()) x WHERE t.id IS NULL",
+        "SELECT 1 FROM rt2 LEFT JOIN (SELECT id FROM rt WHERE s ~ '(') x ON true",
+        "SELECT 1 FROM rt2 LEFT JOIN (SELECT id FROM rt WHERE s ~ '(') x ON x.id > rt2.id",
+        "SELECT 1 FROM rt2 FULL JOIN (SELECT id FROM rt WHERE s ~ '(') x ON x.id = rt2.id",
+        "SELECT 1 FROM rt2 LEFT JOIN (SELECT id, row_number() OVER w FROM rt WHERE s ~ '(' \
+         WINDOW w AS (ORDER BY id)) x ON x.id = rt2.id",
+        "SELECT 1 FROM rt2 JOIN rv ON rv.id = rt2.id",
+        "SELECT 1 FROM rt2 LEFT JOIN rv ON true",
+        "WITH c AS (SELECT id FROM rt WHERE s ~ '(') SELECT 1 FROM rt2 LEFT JOIN c ON true",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::Invalid(_),
+            "invalid regular expression: parentheses () not balanced"
+        );
+    }
+    for sql in [
+        "SELECT 1 FROM rt2 LEFT JOIN (SELECT id FROM rt WHERE 1 / 0 = 1) x ON x.id = rt2.id",
+        "WITH c AS (SELECT id FROM rt WHERE 1 / 0 = 1) SELECT 1 FROM rt2 LEFT JOIN c ON c.id = rt2.id",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::DivisionByZero(_),
+            "division by zero"
+        );
+    }
+}
+
+#[test]
+fn an_exists_sublink_drops_its_group_by_window_and_null_limit() {
+    // `simplify_EXISTS_query` throws GROUP BY, WINDOW, DISTINCT and ORDER
+    // BY away and drops a NULL (ALL) LIMIT: the EXISTS still becomes a
+    // semi-join before the FALSE qual is folded. Grouping sets keep it.
+    let db = planner_setup();
+    for sql in [
+        "SELECT 1 FROM t WHERE EXISTS (SELECT 1 FROM rt WHERE rt.id = t.id AND s ~ '(' \
+         WINDOW w AS ()) AND false",
+        "SELECT 1 FROM t WHERE EXISTS (SELECT 1 FROM rt WHERE rt.id = t.id AND s ~ '(' \
+         GROUP BY rt.id) AND false",
+        "SELECT 1 FROM t WHERE EXISTS (SELECT 1 FROM rt WHERE rt.id = t.id AND s ~ '(' \
+         LIMIT NULL) AND false",
+        "SELECT 1 FROM t WHERE EXISTS (SELECT 1 FROM rt WHERE rt.id = t.id AND s ~ '(' \
+         LIMIT ALL) AND false",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::Invalid(_),
+            "invalid regular expression: parentheses () not balanced"
+        );
+    }
+    db.analyze(
+        "SELECT 1 FROM t WHERE EXISTS (SELECT 1 FROM rt WHERE rt.id = t.id AND s ~ '(' \
+         GROUP BY ROLLUP (rt.id)) AND false",
+    )
+    .unwrap();
+}

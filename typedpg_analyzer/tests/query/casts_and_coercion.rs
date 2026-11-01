@@ -954,6 +954,144 @@ fn a_subquery_output_fails_where_it_is_read() {
 }
 
 #[test]
+fn constants_a_pulled_up_subquery_substitutes_are_folded() {
+    // `pullup_replace_vars` puts a pulled-up subquery's output in place of
+    // the outer query's reference before `eval_const_expressions` runs: a
+    // cast or operator over it folds as over the constant itself.
+    let db = folding_setup();
+    for (sql, msg) in [
+        (
+            "SELECT x::int2 FROM (SELECT 40000 AS x) q",
+            "smallint out of range",
+        ),
+        (
+            "SELECT q.x::int2 FROM s, (SELECT 40000 AS x) q",
+            "smallint out of range",
+        ),
+        (
+            "SELECT x::int2 FROM (SELECT 40000 AS x) q WHERE false",
+            "smallint out of range",
+        ),
+        (
+            "SELECT 1 FROM (SELECT 40000 AS x) q WHERE x::int2 = 1",
+            "smallint out of range",
+        ),
+        (
+            "SELECT x::int2 FROM (SELECT 40000 AS x) q GROUP BY x",
+            "smallint out of range",
+        ),
+        (
+            "SELECT (SELECT x::int2) FROM (SELECT 40000 AS x) q",
+            "smallint out of range",
+        ),
+        (
+            "SELECT (x + 1)::int2 FROM (SELECT 32767 AS x) q",
+            "smallint out of range",
+        ),
+        (
+            "SELECT x::int2 FROM (VALUES (40000)) v(x)",
+            "smallint out of range",
+        ),
+        (
+            "SELECT y::int2 FROM (SELECT x AS y FROM (SELECT 40000 AS x) a) b",
+            "smallint out of range",
+        ),
+        (
+            "SELECT x + 2147483647 FROM (SELECT 1 AS x) q",
+            "integer out of range",
+        ),
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::NumericValueOutOfRange(_),
+            msg
+        );
+    }
+    assert_err_prefix!(
+        db.analyze("SELECT x::numeric(3,1) FROM (SELECT 100 AS x) q"),
+        AnalyzeError::NumericValueOutOfRange(_),
+        "numeric field overflow"
+    );
+    assert_err_prefix!(
+        db.analyze("SELECT x / 0 FROM (SELECT 1 AS x) q"),
+        AnalyzeError::DivisionByZero(_),
+        "division by zero"
+    );
+    // A PlaceHolderVar keeps the nullable side's output from folding; a
+    // subquery planned on its own keeps its output a Var; a branch never
+    // folded is never reached.
+    for sql in [
+        "SELECT q.x::int2 FROM s LEFT JOIN (SELECT 40000 AS x) q ON true",
+        "SELECT x::int2 FROM (SELECT 40000 AS x FROM s LIMIT 1) q",
+        "SELECT CASE WHEN false THEN x::int2 END FROM (SELECT 40000 AS x) q",
+        "SELECT x::int2 FROM (SELECT 4000 AS x) q",
+        "SELECT x::int2 FROM (SELECT b AS x FROM s) q",
+    ] {
+        db.analyze(sql)
+            .unwrap_or_else(|e| panic!("{sql}: unexpected error {e}"));
+    }
+}
+
+#[test]
+fn text_constants_converted_through_io_are_folded() {
+    // A cast from `text` without a cast function is a conversion through
+    // the types' I/O functions (`CoerceViaIO`), which the planner runs on
+    // a constant when they are immutable: the target's input function
+    // fails every execution as it fails an untyped literal at parse time.
+    let db = folding_setup();
+    for (sql, msg) in [
+        (
+            "SELECT '40000'::text::int2",
+            "value \"40000\" is out of range for type smallint",
+        ),
+        (
+            "SELECT 'abc'::text::int4",
+            "invalid input syntax for type integer: \"abc\"",
+        ),
+        (
+            "SELECT 'x'::varchar::int",
+            "invalid input syntax for type integer: \"x\"",
+        ),
+        (
+            "SELECT 'x'::text::bool",
+            "invalid input syntax for type boolean: \"x\"",
+        ),
+        (
+            "SELECT 'x'::text::numeric",
+            "invalid input syntax for type numeric: \"x\"",
+        ),
+        (
+            "SELECT 'x'::text::float8",
+            "invalid input syntax for type double precision: \"x\"",
+        ),
+        (
+            "SELECT '1e400'::text::float8",
+            "\"1e400\" is out of range for type double precision",
+        ),
+        // A pulled-up subquery's untyped literal output is a text constant.
+        (
+            "SELECT x::int4 FROM (SELECT 'abc' AS x) q",
+            "invalid input syntax for type integer: \"abc\"",
+        ),
+        (
+            "SELECT x::int2 FROM (SELECT '40000'::text AS x) q",
+            "value \"40000\" is out of range for type smallint",
+        ),
+    ] {
+        assert_err_prefix!(db.analyze(sql), AnalyzeError::InvalidLiteral(_), msg);
+    }
+    for sql in [
+        "SELECT ' 12 '::text::int8",
+        "SELECT CASE WHEN false THEN 'x'::text::int END",
+        "SELECT q.x::int4 FROM s LEFT JOIN (SELECT 'abc' AS x) q ON true",
+        "SELECT x::int4 FROM (SELECT 'abc' AS x FROM s LIMIT 1) q",
+    ] {
+        db.analyze(sql)
+            .unwrap_or_else(|e| panic!("{sql}: unexpected error {e}"));
+    }
+}
+
+#[test]
 fn a_view_output_fails_where_it_is_read() {
     // The rewriter puts a view's query in the statement reading it, and
     // the planner pulls it up like a FROM subquery — unless it is a
