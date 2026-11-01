@@ -345,7 +345,8 @@ impl Soundness {
 
     /// Execute the query as written (`original`) and as simplified, both
     /// prepared, over the adversarial scenarios, and return a divergence
-    /// when the simplified one returns other rows — as multisets; in
+    /// when the simplified one leaves the tables it writes to with other
+    /// contents, or returns other rows — as multisets; in
     /// order, too, of the outermost ORDER BY's keys when they are output
     /// columns — or another row count, or fails where the original
     /// doesn't. The original failing is fine: a rewrite may evaluate less.
@@ -371,6 +372,7 @@ impl Soundness {
         let param_refs: Vec<&(dyn ToSql + Sync)> =
             params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
         let order_keys = order_keys(original.0, ours);
+        let targets = written_tables(original.0);
 
         let mut tx = client
             .transaction()
@@ -387,9 +389,16 @@ impl Soundness {
                     continue;
                 }
             }
-            let written = run(&mut tx, original.1, &param_refs);
-            let sent = run(&mut tx, simplified.1, &param_refs);
+            let (written, written_tables) = run(&mut tx, original.1, &param_refs, &targets);
+            let (sent, sent_tables) = run(&mut tx, simplified.1, &param_refs, &targets);
+            let tables_differ = !matches!(written, Outcome::Failed(_))
+                && !matches!(sent, Outcome::Failed(_))
+                && written_tables != sent_tables;
             let problem = match (&written, &sent) {
+                _ if tables_differ => Some(format!(
+                    "it leaves other table contents:\n  written:    {written_tables:?}\n  \
+                     simplified: {sent_tables:?}"
+                )),
                 (Outcome::Failed(_), _) | (Outcome::Truncated, _) | (_, Outcome::Truncated) => None,
                 (_, Outcome::Failed(e)) => Some(format!("the simplified query fails: {e}")),
                 (Outcome::Count(a), Outcome::Count(b)) => {
@@ -607,11 +616,72 @@ enum Outcome {
     Failed(String),
 }
 
-/// Run `stmt` in a savepoint rolled back afterwards.
-fn run(tx: &mut Transaction<'_>, stmt: &Statement, params: &[&(dyn ToSql + Sync)]) -> Outcome {
+/// A table's name and its rows as text, sorted.
+type TableContents = (String, Vec<Option<String>>);
+
+/// The tables `sql` writes to (its INSERT / UPDATE / DELETE / MERGE
+/// targets, in data-modifying CTEs too), as SQL names.
+fn written_tables(sql: &str) -> Vec<String> {
+    use typedpg_pg_query::NodeRef;
+    let Ok(parsed) = typedpg_pg_query::parse(sql) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = parsed
+        .protobuf
+        .nodes()
+        .iter()
+        .filter_map(|(n, _)| match n {
+            NodeRef::InsertStmt(s) => s.relation.as_ref(),
+            NodeRef::UpdateStmt(s) => s.relation.as_ref(),
+            NodeRef::DeleteStmt(s) => s.relation.as_ref(),
+            NodeRef::MergeStmt(s) => s.relation.as_ref(),
+            _ => None,
+        })
+        .map(|rv| {
+            let rel = typedpg_core::quote_identifier(&rv.relname);
+            if rv.schemaname.is_empty() {
+                rel
+            } else {
+                format!("{}.{rel}", typedpg_core::quote_identifier(&rv.schemaname))
+            }
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Run `stmt` in a savepoint rolled back afterwards, with the contents of
+/// `tables` it left (each table's rows as text, sorted) before the
+/// rollback.
+fn run(
+    tx: &mut Transaction<'_>,
+    stmt: &Statement,
+    params: &[&(dyn ToSql + Sync)],
+    tables: &[String],
+) -> (Outcome, Vec<TableContents>) {
     let mut sp = tx
         .transaction()
         .unwrap_or_else(|e| panic!("pg_sanity: SAVEPOINT failed: {e}"));
+    let outcome = run_in(&mut sp, stmt, params);
+    let mut contents = Vec::new();
+    if !matches!(outcome, Outcome::Failed(_)) {
+        for table in tables {
+            let rows = sp
+                .query(&format!("SELECT t::pg_catalog.text FROM {table} AS t"), &[])
+                .map(|rows| {
+                    let mut rows: Vec<Option<String>> = rows.iter().map(|r| r.get(0)).collect();
+                    rows.sort();
+                    rows
+                })
+                .unwrap_or_default();
+            contents.push((table.clone(), rows));
+        }
+    }
+    (outcome, contents)
+}
+
+fn run_in(sp: &mut Transaction<'_>, stmt: &Statement, params: &[&(dyn ToSql + Sync)]) -> Outcome {
     if stmt.columns().is_empty() {
         return match sp.execute(stmt, params) {
             Ok(n) => Outcome::Count(n),

@@ -17,7 +17,8 @@
 //!   the subquery's own WHERE).
 //! - `NOT IN` is `NOT (x = ANY (sub))`: the `=` written in the rewrite,
 //!   between operands of the same types and collations, resolves to the
-//!   same operator. Row-wise `(a, b) NOT IN (SELECT x, y …)` compares
+//!   same operator — a built-in one, never NULL between non-NULL
+//!   operands of built-in types. Row-wise `(a, b) NOT IN (SELECT x, y …)` compares
 //!   column by column with `=`, as PG's row comparison does.
 //! - nothing in it is volatile (the subquery may run a different number
 //!   of times), and no table read has row security.
@@ -30,8 +31,8 @@
 //! WHERE, nothing after) is inlined — `NOT EXISTS (SELECT 1 FROM … WHERE
 //! (<where>) AND x = y)` — so PG can make an anti-join even when it is
 //! correlated; any other (LIMIT, DISTINCT, GROUP BY, …) is wrapped whole —
-//! `NOT EXISTS (SELECT 1 FROM (<sub>) AS __typedpg_s (__typedpg_c1, …)
-//! WHERE x = __typedpg_s.__typedpg_c1)` — so its clauses still apply to
+//! `NOT EXISTS (SELECT 1 FROM (<sub>) AS __typedpg_s1 (__typedpg_c1, …)
+//! WHERE x = __typedpg_s1.__typedpg_c1)` — so its clauses still apply to
 //! it. Inlining places `x` inside the subquery's scope, so it is done only
 //! when none of the subquery's FROM items can capture `x`'s columns.
 
@@ -40,11 +41,15 @@ use typedpg_pg_query::protobuf::{
     BoolExprType, ColumnRef, Node, SelectStmt, SetOperation, SubLinkType, Token, node::Node as N,
 };
 
-use super::proof::{FromScope, has_volatile, strictly_not_null};
+use super::proof::{
+    FromScope, builtin_strict_equality, column_type, embed_source, has_volatile, strictly_not_null,
+};
 use super::{Candidate, Ctx, Edit, Rule};
 
-/// The names the rewrite introduces. A query that already uses the
-/// prefix is left alone, so they can't collide with its own.
+/// The names the rewrite introduces: `__typedpg_s<n>` (a new one for each
+/// wrapped subquery) and its columns `__typedpg_c<i>`. A query whose
+/// written SQL already uses the prefix is left alone, so they can't
+/// collide with its own names.
 const RESERVED_PREFIX: &str = "__typedpg";
 
 pub(crate) fn candidates(ctx: &Ctx<'_>) -> Vec<Candidate> {
@@ -53,15 +58,26 @@ pub(crate) fn candidates(ctx: &Ctx<'_>) -> Vec<Candidate> {
         matches!(n, NodeRef::SubLink(s)
             if s.sub_link_type() == SubLinkType::AnySublink && s.oper_name.is_empty())
     });
-    if !has_site || ctx.sql.to_ascii_lowercase().contains(RESERVED_PREFIX) {
+    // The guard is on the SQL as written: the current one may hold the
+    // aliases of earlier rewrites.
+    if !has_site
+        || ctx
+            .analyzed
+            .sql
+            .to_ascii_lowercase()
+            .contains(RESERVED_PREFIX)
+    {
         return Vec::new();
     }
     let Ok(scanned) = typedpg_pg_query::scan(ctx.sql) else {
         return Vec::new();
     };
+    // Comments aren't tokens of the grammar: leaving them out, a slice
+    // from one token to another never ends in one.
     let tokens: Vec<Tok> = scanned
         .tokens
         .iter()
+        .filter(|t| !matches!(t.token(), Token::SqlComment | Token::CComment))
         .filter_map(|t| {
             Some(Tok {
                 start: usize::try_from(t.start).ok()?,
@@ -74,6 +90,7 @@ pub(crate) fn candidates(ctx: &Ctx<'_>) -> Vec<Candidate> {
         ctx,
         tokens: &tokens,
         out: Vec::new(),
+        next_alias: std::cell::Cell::new(next_alias(ctx.sql)),
     };
     for stmt in &ctx.tree.stmts {
         if let Some(node) = stmt.stmt.as_deref() {
@@ -94,6 +111,23 @@ struct Walker<'c, 'a> {
     ctx: &'c Ctx<'a>,
     tokens: &'c [Tok],
     out: Vec<Candidate>,
+    /// The number of the next wrapped subquery's alias.
+    next_alias: std::cell::Cell<usize>,
+}
+
+/// The first `n` no `__typedpg_s<n>` of earlier rewrites in `sql` uses.
+fn next_alias(sql: &str) -> usize {
+    let prefix = format!("{RESERVED_PREFIX}_s");
+    sql.match_indices(&prefix)
+        .filter_map(|(at, _)| {
+            let digits: String = sql[at + prefix.len()..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            digits.parse::<usize>().ok()
+        })
+        .max()
+        .map_or(1, |n| n + 1)
 }
 
 impl Walker<'_, '_> {
@@ -305,9 +339,18 @@ impl Walker<'_, '_> {
         {
             return None;
         }
-        for c in &lhs {
-            let r = scope.resolve(ctx, c)?;
-            if ctx.catalog.row_security.contains(&r.rel) {
+        for (l, r) in lhs.iter().zip(&rhs) {
+            let l = scope.resolve(ctx, l)?;
+            let r = sub_scope.resolve(ctx, r)?;
+            if ctx.catalog.row_security.contains(&l.rel) {
+                return None;
+            }
+            // `=` must never be NULL between non-NULL operands.
+            let (lt, rt) = (
+                column_type(ctx.catalog, l.rel, l.attnum)?,
+                column_type(ctx.catalog, r.rel, r.attnum)?,
+            );
+            if !builtin_strict_equality(ctx.catalog, lt, rt) {
                 return None;
             }
         }
@@ -344,26 +387,27 @@ impl Walker<'_, '_> {
                 match where_end {
                     Some(where_end) => format!(
                         "(NOT EXISTS (SELECT 1 {} ({}) AND {eqs}))",
-                        &ctx.sql[from_start..where_end],
-                        ctx.sql[where_end..inner_end].trim()
+                        embed_source(ctx.sql, from_start..where_end),
+                        embed_source(ctx.sql, where_end..inner_end).trim_start()
                     ),
                     None => format!(
                         "(NOT EXISTS (SELECT 1 {} WHERE {eqs}))",
-                        &ctx.sql[from_start..inner_end]
+                        embed_source(ctx.sql, from_start..inner_end)
                     ),
                 }
             }
             None => {
+                let n = self.next_alias.get();
+                self.next_alias.set(n + 1);
+                let alias = format!("{RESERVED_PREFIX}_s{n}");
                 let columns: Vec<String> = (1..=rhs.len())
                     .map(|i| format!("{RESERVED_PREFIX}_c{i}"))
                     .collect();
-                let rhs_text: Vec<String> = columns
-                    .iter()
-                    .map(|c| format!("{RESERVED_PREFIX}_s.{c}"))
-                    .collect();
+                let rhs_text: Vec<String> =
+                    columns.iter().map(|c| format!("{alias}.{c}")).collect();
                 format!(
-                    "(NOT EXISTS (SELECT 1 FROM ({}) AS {RESERVED_PREFIX}_s ({}) WHERE {}))",
-                    &ctx.sql[inner_start..inner_end],
+                    "(NOT EXISTS (SELECT 1 FROM ({}) AS {alias} ({}) WHERE {}))",
+                    embed_source(ctx.sql, inner_start..inner_end),
                     columns.join(", "),
                     equalities(&lhs_text, &rhs_text)
                 )

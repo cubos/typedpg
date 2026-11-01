@@ -43,7 +43,10 @@ enum Item {
     /// Anything else (a subquery, a function, a CTE, a view, a join with
     /// an alias, a table with column aliases): its columns are unknown, so
     /// a reference that may be to it resolves to nothing. `refname` is the
-    /// name it can be qualified by, if any.
+    /// name it can be qualified by; `None` when it isn't known — PG names
+    /// an unaliased function after the function (`FROM unnest(…)` is
+    /// `unnest`), an unaliased subquery, VALUES or table function after
+    /// rules of its own — and then it may bind any qualifier.
     Opaque { refname: Option<String> },
 }
 
@@ -152,7 +155,7 @@ impl<'a> FromScope<'a> {
         };
         self.items.iter().any(|item| match (item, table) {
             (Item::Opaque { .. }, None) => true,
-            (Item::Opaque { refname }, Some(t)) => refname.as_deref() == Some(t),
+            (Item::Opaque { refname }, Some(t)) => refname.as_deref().is_none_or(|r| r == t),
             (Item::Table { refname, .. }, Some(t)) => refname == t,
             (Item::Table { rel, .. }, None) => {
                 ctx.catalog.attribute_by_name(*rel, column).is_some() || is_system_column(column)
@@ -184,7 +187,7 @@ impl<'a> FromScope<'a> {
                 let matches = match (item, table) {
                     (Item::Opaque { .. }, None) => return None,
                     (Item::Opaque { refname }, Some(t)) => {
-                        if refname.as_deref() == Some(t) {
+                        if refname.as_deref().is_none_or(|r| r == t) {
                             return None;
                         }
                         false
@@ -338,7 +341,7 @@ fn range_var(
         items.push(opaque());
         return;
     };
-    if !matches!(class.relkind, RelKind::Table | RelKind::Partitioned) {
+    if !stored_tree(ctx.catalog, class.oid) {
         items.push(opaque());
         return;
     }
@@ -348,6 +351,43 @@ fn range_var(
         rel: class.oid,
         nullable,
     });
+}
+
+/// Every relation a scan of `rel` reads: `rel` and its inheritance
+/// children and partitions, recursively.
+pub(crate) fn inheritance_tree(catalog: &PgCatalog, rel: PgClassOid) -> Vec<PgClassOid> {
+    let mut out = Vec::new();
+    let mut pending = vec![rel];
+    let mut seen = HashSet::new();
+    while let Some(r) = pending.pop() {
+        if !seen.insert(r) {
+            continue;
+        }
+        out.push(r);
+        pending.extend(
+            catalog
+                .pg_inherits
+                .iter()
+                .filter(|i| i.inhparent == r)
+                .map(|i| i.inhrelid),
+        );
+    }
+    out
+}
+
+/// Whether every relation a scan of `rel` reads ([`inheritance_tree`]) is
+/// a table or a partitioned table: what PG stores and checks there is what
+/// it declares. A foreign table (which can be an inheritance child or a
+/// partition) holds whatever its server returns — PG enforces neither its
+/// NOT NULLs nor its other constraints — and a view or anything else isn't
+/// stored at all.
+pub(crate) fn stored_tree(catalog: &PgCatalog, rel: PgClassOid) -> bool {
+    inheritance_tree(catalog, rel).into_iter().all(|r| {
+        catalog
+            .pg_class
+            .get(&r)
+            .is_some_and(|c| matches!(c.relkind, RelKind::Table | RelKind::Partitioned))
+    })
 }
 
 /// Whether column `attnum` of `rel` holds no NULL in any row a scan of
@@ -363,31 +403,78 @@ pub(crate) fn column_not_null(catalog: &PgCatalog, rel: PgClassOid, attnum: i16)
         return false;
     };
     let name = attr.attname.clone();
-    let mut pending = vec![rel];
-    let mut seen = HashSet::new();
-    while let Some(r) = pending.pop() {
-        if !seen.insert(r) {
-            continue;
-        }
-        let Some(a) = catalog.attribute_by_name(r, &name) else {
-            return false;
-        };
-        // A virtual generated column is computed as it is read: its
-        // expression, not a stored value.
-        if a.attgenerated == Some(crate::pg_catalog::AttGenerated::Virtual)
-            || !catalog.attr_proven_not_null(a)
-        {
-            return false;
-        }
-        pending.extend(
-            catalog
-                .pg_inherits
-                .iter()
-                .filter(|i| i.inhparent == r)
-                .map(|i| i.inhrelid),
-        );
+    stored_tree(catalog, rel)
+        && inheritance_tree(catalog, rel).into_iter().all(|r| {
+            catalog.attribute_by_name(r, &name).is_some_and(|a| {
+                // A virtual generated column is computed as it is read:
+                // its expression, not a stored value.
+                a.attgenerated != Some(crate::pg_catalog::AttGenerated::Virtual)
+                    && catalog.attr_proven_not_null(a)
+            })
+        })
+}
+
+/// OIDs below this are the ones PG's catalog files assign by hand
+/// (`FirstGenbkiObjectId`): the same objects in every installation.
+const FIRST_GENBKI_OBJECT_ID: u32 = 10_000;
+
+/// Whether `t` is a built-in type, or a domain over one.
+fn builtin_type(catalog: &PgCatalog, t: crate::oid::PgTypeOid) -> bool {
+    catalog.unwrap_domain(t).get() < FIRST_GENBKI_OBJECT_ID
+}
+
+/// Whether `left = right`, between non-NULL operands of these types, is
+/// never NULL: the operator `=` resolves to is a built-in one whose
+/// function returns NULL only for a NULL argument, and both types are
+/// built-in (or domains over built-in ones). A user `=` — on a domain or a
+/// type of its own, or one the search path finds first — may return NULL
+/// for any input, where `x NOT IN (…)` and `NOT EXISTS (… x = y)` part.
+pub(crate) fn builtin_strict_equality(
+    catalog: &PgCatalog,
+    left: crate::oid::PgTypeOid,
+    right: crate::oid::PgTypeOid,
+) -> bool {
+    builtin_type(catalog, left)
+        && builtin_type(catalog, right)
+        && catalog
+            .find_operator("=", Some(left), right)
+            .is_some_and(|op| {
+                op.oid.get() < FIRST_GENBKI_OBJECT_ID
+                    && op.code.is_some_and(|p| null_only_on_null_proc(catalog, p))
+            })
+}
+
+/// The type of column `attnum` of `rel`.
+pub(crate) fn column_type(
+    catalog: &PgCatalog,
+    rel: PgClassOid,
+    attnum: i16,
+) -> Option<crate::oid::PgTypeOid> {
+    catalog
+        .attributes_of(rel)
+        .iter()
+        .find(|a| a.attnum == attnum)
+        .map(|a| a.atttypid)
+}
+
+/// `sql[range]`, to embed in other SQL: with a newline after it when it
+/// ends in a `--` comment (or cut inside one), which would otherwise
+/// swallow whatever is written after it.
+pub(crate) fn embed_source(sql: &str, range: std::ops::Range<usize>) -> String {
+    let text = &sql[range];
+    let ends_in_line_comment = match typedpg_pg_query::scan(text) {
+        Ok(scanned) => scanned.tokens.last().is_some_and(|t| {
+            t.token() == typedpg_pg_query::protobuf::Token::SqlComment
+                || usize::try_from(t.end).is_ok_and(|end| text[end..].contains("--"))
+        }),
+        // Unscannable (cut inside a string or comment): be safe.
+        Err(_) => true,
+    };
+    if ends_in_line_comment {
+        format!("{text}\n")
+    } else {
+        text.to_owned()
     }
-    true
 }
 
 /// Whether `expr`, evaluated in `scope`, can never be NULL by what PG
@@ -505,6 +592,34 @@ fn null_only_on_null_function(catalog: &PgCatalog, name: &[Node]) -> bool {
             .all(|p| null_only_on_null_proc(catalog, p.oid))
 }
 
+/// Whether the schema has a volatile function PG may call where the
+/// parse tree shows no call: a cast function (an implicit or assignment
+/// cast runs unwritten, `WHERE v = 1` over a type with one), a type's
+/// support function (its input or output function runs on an I/O
+/// conversion), or one a domain's CHECK calls (it runs on every coercion
+/// to the domain). Built-in ones never are; when the schema adds one,
+/// every expression is taken to be volatile.
+fn hidden_volatile_calls(catalog: &PgCatalog) -> bool {
+    const PG_TYPE: u32 = 1247;
+    const PG_PROC: u32 = 1255;
+    const PG_CONSTRAINT: u32 = 2606;
+    let volatile = |p: PgProcOid| {
+        catalog
+            .pg_proc
+            .get(&p)
+            .is_none_or(|p| p.provolatile == ProVolatile::Volatile)
+    };
+    catalog
+        .pg_cast
+        .values()
+        .any(|c| c.castfunc.is_some_and(volatile))
+        || catalog.iter_pg_depend().any(|d| {
+            matches!(d.classid.get(), PG_TYPE | PG_CONSTRAINT)
+                && d.refclassid.get() == PG_PROC
+                && volatile(PgProcOid::from_raw(d.refobjid.get()))
+        })
+}
+
 /// Whether `node` may call a volatile function or read something
 /// nondeterministic: a function or operator any same-named overload of
 /// which is VOLATILE (unknown ones included), a cast to a type that isn't
@@ -526,6 +641,9 @@ pub(crate) fn has_volatile(ctx: &Ctx<'_>, node: &Node) -> bool {
             .values()
             .any(|o| o.oprname == name && o.oprcode.is_none_or(volatile_proc))
     };
+    if hidden_volatile_calls(catalog) {
+        return true;
+    }
     let Some(root) = node.node.as_ref() else {
         return false;
     };
@@ -576,10 +694,7 @@ pub(crate) fn has_volatile(ctx: &Ctx<'_>, node: &Node) -> bool {
             }
             let schema = (!rv.schemaname.is_empty()).then_some(rv.schemaname.as_str());
             catalog.resolve_table(schema, &rv.relname).is_none_or(|c| {
-                !matches!(
-                    c.relkind,
-                    RelKind::Table | RelKind::Partitioned | RelKind::MaterializedView
-                )
+                c.relkind != RelKind::MaterializedView && !stored_tree(catalog, c.oid)
             })
         }
         NodeRef::RangeTableSample(_) | NodeRef::LockingClause(_) => true,

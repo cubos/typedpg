@@ -82,7 +82,7 @@ fn unqualified_left_side_a_subquery_column_would_capture_is_wrapped() {
         &setup(),
         "SELECT id FROM customers WHERE id NOT IN (SELECT id FROM customers WHERE code = 1)",
         "SELECT id FROM customers WHERE (NOT EXISTS (SELECT 1 FROM (SELECT id FROM customers WHERE code = 1) \
-         AS __typedpg_s (__typedpg_c1) WHERE id = __typedpg_s.__typedpg_c1))",
+         AS __typedpg_s1 (__typedpg_c1) WHERE id = __typedpg_s1.__typedpg_c1))",
     );
 }
 
@@ -94,7 +94,7 @@ fn limit_keeps_the_subquery_whole() {
          WHERE c.id NOT IN (SELECT customer_id FROM banned ORDER BY customer_id LIMIT 10)",
         "SELECT c.id FROM customers c \
          WHERE (NOT EXISTS (SELECT 1 FROM (SELECT customer_id FROM banned ORDER BY customer_id LIMIT 10) \
-         AS __typedpg_s (__typedpg_c1) WHERE c.id = __typedpg_s.__typedpg_c1))",
+         AS __typedpg_s1 (__typedpg_c1) WHERE c.id = __typedpg_s1.__typedpg_c1))",
     );
 }
 
@@ -110,7 +110,7 @@ fn distinct_and_group_by_keep_the_subquery_whole() {
             &format!("SELECT c.id FROM customers c WHERE c.id NOT IN ({sub})"),
             &format!(
                 "SELECT c.id FROM customers c WHERE (NOT EXISTS (SELECT 1 FROM ({sub}) \
-                 AS __typedpg_s (__typedpg_c1) WHERE c.id = __typedpg_s.__typedpg_c1))"
+                 AS __typedpg_s1 (__typedpg_c1) WHERE c.id = __typedpg_s1.__typedpg_c1))"
             ),
         );
     }
@@ -437,6 +437,220 @@ fn spreads_are_skipped() {
         &setup(),
         "SELECT c.id FROM customers c WHERE c.code IN $..codes \
          AND c.id NOT IN (SELECT customer_id FROM banned)",
+    );
+}
+
+#[test]
+fn foreign_tables_in_a_tree_are_not_trusted() {
+    // PG enforces no NOT NULL on a foreign table, which can be a partition
+    // or an inheritance child of a table that has one.
+    let mut db = setup();
+    db.apply_sql(
+        "CREATE FOREIGN DATA WRAPPER dummy;
+         CREATE SERVER nowhere FOREIGN DATA WRAPPER dummy;
+         CREATE TABLE pt (id int NOT NULL, n int NOT NULL) PARTITION BY LIST (id);
+         CREATE FOREIGN TABLE pt1 PARTITION OF pt FOR VALUES IN (1) SERVER nowhere;
+         CREATE TABLE ip (n int NOT NULL);
+         CREATE FOREIGN TABLE ic (n int NOT NULL) INHERITS (ip) SERVER nowhere;
+         CREATE FOREIGN TABLE f (n int NOT NULL) SERVER nowhere;",
+    )
+    .unwrap();
+    db.skip_pg_sanity();
+    for table in ["pt", "ip", "f"] {
+        // On either side.
+        assert_kept(
+            &db,
+            &format!("SELECT c.code FROM customers c WHERE c.code NOT IN (SELECT n FROM {table})"),
+        );
+        assert_kept(
+            &db,
+            &format!("SELECT x.n FROM {table} x WHERE x.n NOT IN (SELECT code FROM banned)"),
+        );
+    }
+}
+
+#[test]
+fn an_alias_column_list_renames_by_position() {
+    // `x(b, a)`: `x.a` is the nullable `t.b`.
+    let mut db = setup();
+    db.apply_sql("CREATE TABLE t (a int NOT NULL, b int);")
+        .unwrap();
+    assert_kept(
+        &db,
+        "SELECT c.code FROM customers c WHERE c.code NOT IN (SELECT x.a FROM t AS x(b, a))",
+    );
+    assert_kept(
+        &db,
+        "SELECT x.a FROM t AS x(b, a) WHERE x.a NOT IN (SELECT code FROM banned)",
+    );
+    // A partial list too: `y(m)` renames `t.a` to `m`, `y.b` stays `t.b`.
+    assert_kept(
+        &db,
+        "SELECT c.code FROM customers c WHERE c.code NOT IN (SELECT y.m FROM t AS y(m))",
+    );
+}
+
+#[test]
+fn an_unaliased_function_in_from_binds_its_name() {
+    // `unnest(…)` without an alias is named `unnest`: in the subquery,
+    // `unnest.unnest` is the function's NULL, not the outer column.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE u (unnest int NOT NULL);
+         CREATE TABLE b (id int NOT NULL);",
+    )
+    .unwrap();
+    assert_kept(
+        &db,
+        "SELECT unnest.unnest FROM u AS unnest WHERE unnest.unnest NOT IN \
+         (SELECT unnest.unnest FROM b, unnest(ARRAY[NULL::int]))",
+    );
+    // An unaliased subquery or VALUES too (named by PG's own rules).
+    assert_kept(
+        &db,
+        "SELECT x.id FROM b AS x WHERE x.id NOT IN \
+         (SELECT x.id FROM u, (SELECT NULL::int AS id))",
+    );
+}
+
+#[test]
+fn a_user_equality_operator_is_not_trusted() {
+    // A user `=` may return NULL for non-NULL operands.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE DOMAIN d AS int;
+         CREATE FUNCTION d_eq(d, d) RETURNS bool LANGUAGE sql IMMUTABLE AS 'SELECT NULL::bool';
+         CREATE OPERATOR = (LEFTARG = d, RIGHTARG = d, FUNCTION = d_eq);
+         CREATE TABLE l (v d NOT NULL);
+         CREATE TABLE r (v d NOT NULL);
+         CREATE DOMAIN d2 AS int;
+         CREATE TABLE l2 (v d2 NOT NULL);
+         CREATE TABLE r2 (v d2 NOT NULL);",
+    )
+    .unwrap();
+    assert_kept(
+        &db,
+        "SELECT l.v FROM l WHERE l.v NOT IN (SELECT r.v FROM r)",
+    );
+    // A domain without an `=` of its own compares with its base type's.
+    assert_rewritten(
+        &db,
+        "SELECT l2.v FROM l2 WHERE l2.v NOT IN (SELECT r2.v FROM r2)",
+        "SELECT l2.v FROM l2 WHERE (NOT EXISTS (SELECT 1 FROM r2 WHERE l2.v = r2.v))",
+    );
+}
+
+#[test]
+fn a_volatile_implicit_cast_is_not_rewritten_around() {
+    let mut db = setup();
+    db.apply_sql(
+        "CREATE TYPE ct AS (x int);
+         CREATE FUNCTION vcast(ct) RETURNS int LANGUAGE sql VOLATILE AS 'SELECT 1';
+         CREATE CAST (ct AS int) WITH FUNCTION vcast(ct) AS IMPLICIT;",
+    )
+    .unwrap();
+    assert_kept(
+        &db,
+        "SELECT c.code FROM customers c WHERE c.code NOT IN (SELECT code FROM banned)",
+    );
+}
+
+#[test]
+fn a_volatile_domain_check_is_not_rewritten_around() {
+    let mut db = setup();
+    db.apply_sql(
+        "CREATE FUNCTION vcheck(int) RETURNS bool LANGUAGE sql VOLATILE AS 'SELECT true';
+         CREATE DOMAIN checked_int AS int CHECK (vcheck(VALUE));",
+    )
+    .unwrap();
+    assert_kept(
+        &db,
+        "SELECT c.code FROM customers c WHERE c.code NOT IN (SELECT code FROM banned)",
+    );
+}
+
+#[test]
+fn a_line_comment_at_the_end_of_the_subquery_stays_closed() {
+    let db = setup();
+    assert_rewritten(
+        &db,
+        "SELECT c.id FROM customers c WHERE c.id NOT IN (SELECT customer_id FROM banned -- note\n)",
+        "SELECT c.id FROM customers c WHERE (NOT EXISTS (SELECT 1 FROM banned WHERE c.id = customer_id))",
+    );
+    assert_rewritten(
+        &db,
+        "SELECT c.id FROM customers c WHERE c.id NOT IN \
+         (SELECT customer_id FROM banned LIMIT 5 -- note\n)",
+        "SELECT c.id FROM customers c WHERE (NOT EXISTS (SELECT 1 FROM (SELECT customer_id FROM \
+         banned LIMIT 5) AS __typedpg_s1 (__typedpg_c1) WHERE c.id = __typedpg_s1.__typedpg_c1))",
+    );
+}
+
+#[test]
+fn two_wrapped_sites_get_their_own_aliases() {
+    let (sent, rules) = simplified(
+        &setup(),
+        "SELECT c.id FROM customers c \
+         WHERE c.id NOT IN (SELECT customer_id FROM banned LIMIT 5) \
+         AND c.code NOT IN (SELECT DISTINCT code FROM banned)",
+    );
+    assert_eq!(
+        sent,
+        "SELECT c.id FROM customers c \
+         WHERE (NOT EXISTS (SELECT 1 FROM (SELECT customer_id FROM banned LIMIT 5) AS __typedpg_s1 \
+         (__typedpg_c1) WHERE c.id = __typedpg_s1.__typedpg_c1)) \
+         AND (NOT EXISTS (SELECT 1 FROM (SELECT DISTINCT code FROM banned) AS __typedpg_s2 \
+         (__typedpg_c1) WHERE c.code = __typedpg_s2.__typedpg_c1))"
+    );
+    assert_eq!(rules, vec![Rule::NotIn, Rule::NotIn]);
+}
+
+#[test]
+fn nested_wrapped_sites_are_rewritten_in_turn() {
+    // The inner site is inside the outer's subquery: a second pass
+    // rewrites it, with a new alias.
+    let (sent, rules) = simplified(
+        &setup(),
+        "SELECT c.id FROM customers c WHERE c.id NOT IN \
+         (SELECT b.customer_id FROM banned b WHERE b.code NOT IN \
+         (SELECT p.b FROM pairs p LIMIT 3) LIMIT 7)",
+    );
+    assert_eq!(rules, vec![Rule::NotIn, Rule::NotIn], "{sent}");
+    assert!(
+        sent.contains("__typedpg_s1") && sent.contains("__typedpg_s2"),
+        "{sent}"
+    );
+}
+
+#[cfg(feature = "pg_sanity")]
+#[test]
+fn the_oracle_compares_dml_table_contents() {
+    // A wrong rewrite of an UPDATE's SET that affects the same rows: only
+    // the table's contents tell it apart.
+    let db = setup();
+    let written = "UPDATE customers c SET region = \
+                   (c.id NOT IN (SELECT customer_id FROM banned))::text";
+    let wrong = "UPDATE customers c SET region = \
+                 (c.id IN (SELECT customer_id FROM banned))::text";
+    let divergence = db
+        .pg_sanity_check_rewrite(written, wrong)
+        .expect("the oracle sees the difference");
+    assert_eq!(
+        divergence.kind,
+        typedpg_analyzer::DivergenceKind::Simplification
+    );
+    assert!(
+        divergence.message.contains("table contents"),
+        "{divergence}"
+    );
+    // The right one passes.
+    assert!(
+        db.pg_sanity_check_rewrite(
+            written,
+            "UPDATE customers c SET region = \
+             (NOT EXISTS (SELECT 1 FROM banned WHERE c.id = customer_id))::text",
+        )
+        .is_none()
     );
 }
 

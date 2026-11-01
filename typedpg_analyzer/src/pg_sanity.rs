@@ -298,6 +298,21 @@ impl PgSanityServer {
     /// instead of the one written (`original_sql`) must prepare to the same
     /// columns and parameters, and return the same rows over the
     /// adversarial data (see [`soundness::Soundness::equivalence`]).
+    /// [`Self::check_simplification`] of `rewritten` for `written`, for the
+    /// oracle's own tests: a deliberately wrong rewrite must be caught.
+    pub(crate) fn check_rewrite(
+        &mut self,
+        written: &str,
+        ours: &AnalyzedQuery,
+        finite_params: &std::collections::HashSet<u32>,
+    ) -> Option<Divergence> {
+        let original = self
+            .query_client
+            .prepare(written)
+            .unwrap_or_else(|e| panic!("pg_sanity: the written query must prepare: {e}"));
+        self.check_simplification(written, ours, &original, finite_params)
+    }
+
     fn check_simplification(
         &mut self,
         original_sql: &str,

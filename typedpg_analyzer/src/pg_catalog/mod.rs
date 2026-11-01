@@ -1499,6 +1499,28 @@ impl PgCatalog {
         });
     }
 
+    /// Run the simplification oracle on `rewritten` as if the analyzer had
+    /// sent it for `written` (both without spreads): the mirror's
+    /// divergence, if any. For testing the oracle itself with rewrites no
+    /// rule would make.
+    #[cfg(feature = "pg_sanity")]
+    pub fn pg_sanity_check_rewrite(
+        &self,
+        written: &str,
+        rewritten: &str,
+    ) -> Option<crate::pg_sanity::Divergence> {
+        let (analysis_sql, result) = self.analyze_with_sql(written);
+        let mut ours = result.expect("the written query must analyze");
+        ours.simplifications = vec![crate::simplify::AppliedSimplification {
+            rule: crate::simplify::Rule::NotIn,
+            original_sql: analysis_sql.clone(),
+        }];
+        ours.sql = rewritten.to_owned();
+        let finite = self.finite_param_oids();
+        self.with_pg_sanity(|server| server.check_rewrite(&analysis_sql, &ours, &finite))
+            .flatten()
+    }
+
     /// Analyze `sql` and cross-check the result against the embedded PG
     /// sanity mirror **without panicking** on divergence. Returns the
     /// analyzer's own result alongside an optional [`Divergence`] describing
