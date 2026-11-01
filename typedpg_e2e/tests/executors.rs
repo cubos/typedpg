@@ -186,6 +186,23 @@ async fn default_copy_in_is_unsupported() {
         .await
         .expect("rows");
     assert_eq!(rows.len(), 3);
+    // Queries with built-in parameter types call the typed methods, whose
+    // defaults drop the types and call the required ones.
+    let tag = common::unique("query-only");
+    let found = sql!(
+        &ex,
+        "SELECT count(*) AS n FROM users WHERE name = $tag",
+        tag = tag.clone()
+    )
+    .fetch_value()
+    .await
+    .expect("typed query");
+    assert_eq!(found, 0);
+    let updated = sql!(&ex, "UPDATE users SET age = 1 WHERE name = $tag")
+        .execute()
+        .await
+        .expect("typed execute");
+    assert_eq!(updated, 0);
 
     let users = [NewUser {
         name: "unsupported".into(),

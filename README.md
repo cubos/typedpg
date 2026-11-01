@@ -525,7 +525,7 @@ An empty list is written `(SELECT NULL::<type> WHERE false)` — PostgreSQL has 
 
 Above 1000 items, a spread is bound as arrays where that is provably the same query — the analyzer analyzes the array form and offers it only if the columns and parameters come out identical: `x IN $..ids` is written `(x = ANY($1::type[]))` (`NOT IN`: `<> ALL`), and a `VALUES` made of one rows spread `SELECT * FROM unnest($1::type1[], …) AS __typedpg_rows (column1, …)`. Large lists and batches then take a parameter per field instead of one per value — faster, and past PostgreSQL's 65535-parameter limit. Not offered where the form would differ: a field that is an array (unnest would flatten it) or a composite, a `VALUES` with written rows, a column whose nullability the array would change, an enum or JSON-domain field whose values may be `None`.
 
-`id = ANY($ids)`, with an array parameter, is the same filter as a single placeholder, whatever the list's length. `sql!` prepares each query anew (tokio-postgres's `query`), so PostgreSQL plans it with the values and the two plan alike. They differ only under a generic plan — a statement prepared once and executed repeatedly, as an executor of your own might — where PostgreSQL prunes the partitions of a partitioned table only for an `IN` list, and estimates its rows from the list's length instead of assuming 10 elements. An `IN` list is one statement text per length, and at most 65535 parameters.
+`id = ANY($ids)`, with an array parameter, is the same filter as a single placeholder, whatever the list's length. `sql!` prepares each query anew, never reusing a statement, so PostgreSQL plans it with the values and the two plan alike. They differ only under a generic plan — a statement prepared once and executed repeatedly, as an executor of your own might — where PostgreSQL prunes the partitions of a partitioned table only for an `IN` list, and estimates its rows from the list's length instead of assuming 10 elements. An `IN` list is one statement text per length, and at most 65535 parameters.
 
 ## Bulk loading with `copy_in!`
 
@@ -704,6 +704,8 @@ The `Executor` trait is implemented for:
 | `bb8::Pool<PostgresConnectionManager<Tls>>` | `bb8` | Acquires a connection per query |
 | `tokio_postgres::Client` | always | Uses the raw client directly |
 | `tokio_postgres::Transaction<'_>` | always | Executes within the transaction |
+
+A query goes to the server in one round trip when every parameter's type is built-in (`int4`, `text`, `jsonb`, `timestamptz`, arrays of them, a domain over one, …) or it has none: `sql!` already knows the types, so it sends them with the query (tokio-postgres's `query_typed`) instead of asking the server first. A parameter whose type's OID is the database's own — an enum, a composite, an extension's type, or an array of one — sends the query untyped, as tokio-postgres's `query` does: prepared first, one more round trip. An `Executor` of your own runs both through `query_stream` / `execute` unless it overrides `query_typed_stream` / `execute_typed`.
 
 ## Mapping rows to your own structs
 
