@@ -1224,6 +1224,27 @@ fn query_context(analyzed: &AnalyzedQuery) -> TokenStream {
     }
 }
 
+/// The generated query builder's doc comment when the SQL sent is a
+/// simplification of the one written: the rules applied and the text sent.
+fn simplified_doc(analyzed: &AnalyzedQuery) -> TokenStream {
+    if analyzed.simplifications.is_empty() {
+        return TokenStream::new();
+    }
+    let mut rules: Vec<&str> = analyzed
+        .simplifications
+        .iter()
+        .map(|s| s.rule.name())
+        .collect();
+    rules.dedup();
+    let doc = format!(
+        "The query is sent simplified by typedpg ({}), into an equivalent one PostgreSQL \
+         plans better:\n\n```sql\n{}\n```",
+        rules.join(", "),
+        analyzed.sql
+    );
+    quote! { #[doc = #doc] }
+}
+
 /// Generate code for a regular query (no spreads).
 fn generate_regular(
     analyzed: &AnalyzedQuery,
@@ -1248,6 +1269,7 @@ fn generate_regular(
 
     let fetch_value_method = build_fetch_value_method(&analyzed.columns, config, &registry)?;
     let query_context = query_context(analyzed);
+    let simplified_doc = simplified_doc(analyzed);
     let param_types = match wire {
         Some(wire) => {
             let types = wire.params.iter().map(WireType::to_tokens);
@@ -1280,6 +1302,7 @@ fn generate_regular(
             #column_impls
 
             // ----- query builder struct -----
+            #simplified_doc
             #[allow(non_camel_case_types)]
             struct __typedpg_query<__E: typedpg::Executor> {
                 __executor: __E,
@@ -3012,9 +3035,29 @@ fn pg_type_label(ty: &Type) -> String {
 mod tests {
     use super::{
         SpreadWireTypes, WireType, WireTypes, cast_params, check_unique_columns, column_types,
-        make_field_ident, spread_param_types, user_ident, wire_types, wrap_with_limit,
+        make_field_ident, simplified_doc, spread_param_types, user_ident, wire_types,
+        wrap_with_limit,
     };
     use typedpg_analyzer::PgCatalog;
+
+    #[test]
+    fn a_simplified_query_says_so_and_casts_its_placeholders_where_they_moved() {
+        let mut db = PgCatalog::new().unwrap();
+        db.apply_sql("CREATE TABLE t (a int NOT NULL); CREATE TABLE u (b int NOT NULL);")
+            .unwrap();
+        let analyzed = db
+            .analyze("SELECT a FROM t WHERE a <> $x AND a NOT IN (SELECT b FROM u WHERE b > $x)")
+            .unwrap();
+        assert_eq!(
+            cast_params(&analyzed),
+            "SELECT a FROM t WHERE a <> ($1::pg_catalog.int4) AND (NOT EXISTS (SELECT 1 FROM u \
+             WHERE (b > ($1::pg_catalog.int4)) AND a = b))"
+        );
+        let doc = simplified_doc(&analyzed).to_string();
+        assert!(doc.contains("simplified by typedpg (not_in)"), "{doc}");
+        let plain = db.analyze("SELECT a FROM t").unwrap();
+        assert!(simplified_doc(&plain).is_empty());
+    }
 
     fn cast(sql: &str) -> String {
         let mut db = PgCatalog::new().unwrap();

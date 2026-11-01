@@ -128,6 +128,19 @@ impl Default for SimplifyOptions {
 }
 
 impl SimplifyOptions {
+    /// The options a project's configuration asks for (its names were
+    /// checked when it was read).
+    pub fn from_config(config: &typedpg_core::config::SimplifyConfig) -> Self {
+        Self {
+            enabled: config.enabled,
+            disabled: config
+                .disabled
+                .iter()
+                .filter_map(|name| Rule::from_name(name))
+                .collect(),
+        }
+    }
+
     /// Whether `rule` runs.
     pub fn runs(&self, rule: Rule) -> bool {
         self.enabled && !self.disabled.contains(&rule)
@@ -279,4 +292,32 @@ fn placeholder_offsets(sql: &str, count: usize) -> Option<Vec<Vec<usize>>> {
         offsets.get_mut(n.checked_sub(1)?)?.push(end);
     }
     Some(offsets)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rule_names_are_the_configuration_keys() {
+        let names: Vec<&str> = Rule::ALL.iter().map(|r| r.name()).collect();
+        assert_eq!(names, typedpg_core::config::SIMPLIFY_RULES);
+    }
+
+    #[test]
+    fn apply_edits_rejects_overlaps() {
+        let edit = |range: std::ops::Range<usize>, text: &str| Edit {
+            range,
+            text: text.into(),
+        };
+        assert_eq!(
+            apply_edits("abcdef", &[edit(4..5, "X"), edit(0..2, "YZ")]).as_deref(),
+            Some("YZcdXf")
+        );
+        assert_eq!(
+            apply_edits("abcdef", &[edit(0..3, ""), edit(2..4, "")]),
+            None
+        );
+        assert_eq!(apply_edits("abc", &[edit(2..9, "")]), None);
+    }
 }

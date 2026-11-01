@@ -865,6 +865,33 @@ user_role = "crate::UserRole"          # PG enum → Rust enum (Display + FromSt
 A key typedpg does not recognize is a compile error rather than silently
 ignored.
 
+### Query simplifications
+
+Where the analysis proves an equivalent query returns the same rows in
+every state the schema allows, `sql!` sends that one instead, because
+PostgreSQL plans it better. The proofs rest only on what PostgreSQL
+enforces on every statement (validated `NOT NULL`s, keys), not on CHECKs,
+`NOT VALID` or deferrable constraints. The generated query's doc comment
+shows the SQL sent and the rules applied.
+
+| Rule | Rewrite |
+|------|---------|
+| `not_in` | `x NOT IN (SELECT y …)` → `NOT EXISTS (… WHERE x = y)` when neither side can be NULL: an anti-join, instead of a SubPlan that turns quadratic once the subquery outgrows `work_mem`. |
+
+They are on by default. Turn them all off, or one by one:
+
+```toml
+[package.metadata.typedpg]
+simplify = false                   # none at all
+
+# or, instead:
+[package.metadata.typedpg.simplify]
+not_in = false                     # every other rule stays on
+```
+
+The setting applies to every database. Queries with a `$..spread` are sent
+as written.
+
 For projects with more than one database see the [Multiple databases](#multiple-databases) section above.
 
 ## How it works

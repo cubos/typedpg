@@ -239,6 +239,14 @@ impl Module<'_> {
                 let key = js_string(text);
                 match result {
                     Ok(g) => {
+                        if let Some(note) = &g.simplified {
+                            out.push_str("  /**\n");
+                            for line in note.replace("*/", "*\\/").lines() {
+                                let sep = if line.is_empty() { "" } else { " " };
+                                let _ = writeln!(out, "   *{sep}{line}");
+                            }
+                            out.push_str("   */\n");
+                        }
                         let _ = writeln!(out, "  {key}: {};", g.types);
                     }
                     Err(e) => {
@@ -297,6 +305,7 @@ mod tests {
             value: None,
             overrides: Vec::new(),
             runtime: "{\"sql\":[\"x\"]}".to_owned(),
+            simplified: None,
         })
     }
 
