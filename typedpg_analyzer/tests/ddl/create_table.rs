@@ -1512,9 +1512,7 @@ fn create_table_as_with_data_takes_the_planned_collation() {
         ("0001.sql", setup),
         (
             "0002.sql",
-            &format!(
-                r#"CREATE TABLE b6 AS SELECT f(c1.b, c2.b) AS x FROM c1, c2;"#
-            ),
+            "CREATE TABLE b6 AS SELECT f(c1.b, c2.b) AS x FROM c1, c2;",
         ),
     ]);
 }
